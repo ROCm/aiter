@@ -945,7 +945,6 @@ list_dtype = [dtypes.d_dtypes[key] for key in args.dtype]
 l_kv_dtype = [dtypes.d_dtypes[key] for key in args.kv_dtype]
 if args.nhead is not None:
     list_nhead = [args.nhead]
-
 for nhead, decode_qlen in list_nhead:
     df = []
     for dtype, kvtype, ctx_len, batch_size, max_split_per_batch in itertools.product(

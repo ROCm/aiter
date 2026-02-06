@@ -173,6 +173,35 @@ void mla_decode_stage1_asm_fwd(
     args.ptr_RP = output.data_ptr(); //final output
     
 
+    if (persistent)
+    {
+        if (work_meta_data.has_value())
+        {
+            args.ptr_STP = work_meta_data.value().data_ptr();
+        }
+        else
+        {
+            assert(work_indptr.has_value() && work_info_set.has_value());
+            assert(work_indptr.value().data_ptr() != nullptr && work_info_set.value().data_ptr() != nullptr);
+
+            uint64_t* persistent_meta_data = new uint64_t[10];
+            persistent_meta_data[0] = (uint64_t)work_indptr.value().data_ptr();
+            persistent_meta_data[1] = (uint64_t)work_info_set.value().data_ptr();
+            uint32_t* dev_PS_META_DATA;
+
+            unsigned long buf_size_META = 10 * sizeof(uint64_t);
+            hipMalloc(&dev_PS_META_DATA, buf_size_META);
+            hipMemcpy(dev_PS_META_DATA, persistent_meta_data, buf_size_META, hipMemcpyHostToDevice);
+
+            args.ptr_STP = dev_PS_META_DATA;
+        }
+    }
+    else
+    {
+        args.ptr_STP = num_kv_splits_indptr.value().data_ptr();
+    }
+	args.ptr_RP = output.data_ptr();
+
     // std::cout << "mla args" << std::endl;
     // std::cout << "ptr_R: " << args.ptr_R << std::endl;
     // std::cout << "ptr_LSE: " << args.ptr_LSE << std::endl;
@@ -339,6 +368,19 @@ void mla_decode_stage1_asm_fwd(
         gdz = 1;
     }
     // printf("gdz: %d \n", gdz);
+
+    int bdx = 256;
+    int gdx = (max_seqlen_q * gqa_ratio + sub_Q - 1) / sub_Q;
+    int gdy = batch;
+    int gdz = kv_split;
+
+    if(persistent)
+    {
+        gdx = work_indptr.value().size(0) - 1;
+        gdy = 1;
+        gdz = 1;
+    }
+    // printf("gdx: %d \n", gdx);
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,

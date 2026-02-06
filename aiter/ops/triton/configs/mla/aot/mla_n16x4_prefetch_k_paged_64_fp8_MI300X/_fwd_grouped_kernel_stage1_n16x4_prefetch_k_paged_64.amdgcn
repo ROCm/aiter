@@ -1,0 +1,2431 @@
+	.amdgcn_target "amdgcn-amd-amdhsa--gfx942"
+	.amdhsa_code_object_version 5
+	.text
+	.globl	_fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64 ; -- Begin function _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64
+	.p2align	8
+	.type	_fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64,@function
+_fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64: ; @_fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64
+.Lfunc_begin0:
+	.cfi_sections .debug_frame
+	.cfi_startproc
+; %bb.35:
+	.file	1 "/data/zanzhang/code/ticket/aiter/aiter/ops/triton/gluon" "mla_decode_mi355.py"
+	.loc	1 42 0 prologue_end             ; mla_decode_mi355.py:42:0
+	s_load_dwordx2 s[2:3], s[0:1], 0x0
+	s_load_dwordx8 s[4:11], s[0:1], 0x8
+	s_load_dwordx4 s[12:15], s[0:1], 0x28
+	s_waitcnt lgkmcnt(0)
+	s_branch .LBB0_0
+	.loc	1 0 0 is_stmt 0                 ; :0:0
+.Ltmp0:
+	.p2align	8
+; %bb.36:
+.LBB0_0:
+	s_mov_b64 s[24:25], s[2:3]
+.Ltmp1:
+	.loc	1 87 25 is_stmt 1               ; mla_decode_mi355.py:87:25
+	s_ashr_i32 s2, s16, 31
+	s_lshr_b32 s2, s2, 29
+	s_add_i32 s2, s16, s2
+	s_ashr_i32 s3, s2, 3
+	.loc	1 79 31                         ; mla_decode_mi355.py:79:31
+	s_and_b32 s6, s2, -8
+	.loc	1 87 60                         ; mla_decode_mi355.py:87:60
+	s_ashr_i32 s2, s2, 31
+	s_lshr_b32 s2, s2, 26
+	s_add_i32 s2, s3, s2
+	s_andn2_b32 s2, s2, 63
+	s_sub_i32 s28, s3, s2
+	.loc	1 90 49                         ; mla_decode_mi355.py:90:49
+	s_ashr_i32 s29, s28, 31
+	.loc	1 79 31                         ; mla_decode_mi355.py:79:31
+	s_sub_i32 s33, s16, s6
+	.loc	1 90 49                         ; mla_decode_mi355.py:90:49
+	s_lshl_b64 s[2:3], s[28:29], 2
+	s_add_u32 s2, s10, s2
+	s_addc_u32 s3, s11, s3
+	.loc	1 90 37 is_stmt 0               ; mla_decode_mi355.py:90:37
+	s_load_dwordx2 s[6:7], s[2:3], 0x0
+	.loc	1 228 47 is_stmt 1              ; mla_decode_mi355.py:228:47
+	s_waitcnt lgkmcnt(0)
+	s_sub_i32 s9, s7, s6
+.Ltmp2:
+	.file	2 "/data/zanzhang/code/triton/python/triton/language" "standard.py"
+	.loc	2 41 22                         ; standard.py:41:22 @[ mla_decode_mi355.py:229:54 ]
+	s_add_i32 s2, s9, 63
+	.loc	2 41 28 is_stmt 0               ; standard.py:41:28 @[ mla_decode_mi355.py:229:54 ]
+	s_ashr_i32 s3, s2, 31
+	s_lshr_b32 s3, s3, 26
+	s_add_i32 s2, s2, s3
+	s_ashr_i32 s10, s2, 6
+.Ltmp3:
+	.loc	2 41 22                         ; standard.py:41:22 @[ mla_decode_mi355.py:241:53 ]
+	s_add_i32 s2, s10, 7
+	.loc	2 41 28                         ; standard.py:41:28 @[ mla_decode_mi355.py:241:53 ]
+	s_lshr_b32 s3, s2, 29
+	s_add_i32 s2, s2, s3
+	s_ashr_i32 s11, s2, 3
+.Ltmp4:
+	.loc	1 242 40 is_stmt 1              ; mla_decode_mi355.py:242:40
+	s_mul_i32 s22, s11, s33
+	.loc	1 248 24                        ; mla_decode_mi355.py:248:24
+	s_lshl_b32 s30, s22, 6
+	.loc	1 248 42 is_stmt 0              ; mla_decode_mi355.py:248:42
+	s_cmp_le_i32 s30, s9
+	s_cbranch_scc0 .LBB0_34
+; %bb.1:
+	.loc	1 0 42                          ; mla_decode_mi355.py:0:42
+	s_mov_b64 s[20:21], s[14:15]
+	s_load_dwordx2 s[2:3], s[0:1], 0x40
+	s_load_dword s34, s[0:1], 0x4c
+	s_load_dword s14, s[0:1], 0x68
+	.loc	1 177 11 is_stmt 1              ; mla_decode_mi355.py:177:11
+	v_bfe_u32 v145, v0, 2, 4
+	.loc	1 197 11                        ; mla_decode_mi355.py:197:11
+	v_and_b32_e32 v149, 3, v0
+	v_lshlrev_b32_e32 v46, 4, v149
+	v_and_b32_e32 v151, 0xc0, v0
+	.loc	1 232 20                        ; mla_decode_mi355.py:232:20
+	s_waitcnt lgkmcnt(0)
+	s_mul_i32 s2, s2, s28
+	.loc	1 232 55 is_stmt 0              ; mla_decode_mi355.py:232:55
+	v_mul_lo_u32 v2, s3, v145
+	.loc	1 177 11 is_stmt 1              ; mla_decode_mi355.py:177:11
+	v_and_b32_e32 v148, 60, v0
+	.loc	1 197 11                        ; mla_decode_mi355.py:197:11
+	v_or_b32_e32 v130, v46, v151
+	.loc	1 232 32                        ; mla_decode_mi355.py:232:32
+	v_add_u32_e32 v10, s2, v2
+	.loc	1 197 11                        ; mla_decode_mi355.py:197:11
+	v_or_b32_e32 v1, 0x100, v130
+	.loc	1 234 69                        ; mla_decode_mi355.py:234:69
+	v_add_u32_e32 v3, v10, v130
+	s_mov_b32 s7, 0x27000
+	s_mov_b32 s6, 0x7ffffffe
+	.loc	1 256 8                         ; mla_decode_mi355.py:256:8
+	v_bfrev_b32_e32 v44, 1
+	.loc	1 179 24                        ; mla_decode_mi355.py:179:24
+	v_cmp_gt_u32_e64 s[2:3], 32, v148
+	.loc	1 234 69                        ; mla_decode_mi355.py:234:69
+	v_add_u32_e32 v2, v10, v1
+	.loc	1 256 8                         ; mla_decode_mi355.py:256:8
+	s_and_b32 s25, s25, 0xffff
+	s_mov_b32 s26, s6
+	s_mov_b32 s27, s7
+	v_cndmask_b32_e64 v11, v44, v3, s[2:3]
+	.loc	1 212 8                         ; mla_decode_mi355.py:212:8
+	v_lshrrev_b32_e32 v56, 2, v151
+	.loc	1 256 8                         ; mla_decode_mi355.py:256:8
+	v_cndmask_b32_e64 v12, v44, v2, s[2:3]
+	buffer_load_dwordx4 v[2:5], v11, s[24:27], 0 offen
+	buffer_load_dwordx4 v[6:9], v12, s[24:27], 0 offen
+	s_movk_i32 s15, 0x200
+	.loc	1 212 8                         ; mla_decode_mi355.py:212:8
+	v_lshl_or_b32 v11, v149, 2, v56
+	.loc	1 232 67                        ; mla_decode_mi355.py:232:67
+	v_add3_u32 v10, v10, v11, s15
+	.loc	1 261 8                         ; mla_decode_mi355.py:261:8
+	v_cndmask_b32_e64 v10, v44, v10, s[2:3]
+	buffer_load_dword v26, v10, s[24:27], 0 offen
+	.loc	1 251 47                        ; mla_decode_mi355.py:251:47
+	s_add_i32 s11, s22, s11
+	.loc	1 264 21                        ; mla_decode_mi355.py:264:21
+	s_ashr_i32 s23, s22, 31
+	.loc	1 251 65                        ; mla_decode_mi355.py:251:65
+	s_min_i32 s29, s11, s10
+	.loc	1 264 21                        ; mla_decode_mi355.py:264:21
+	s_lshl_b64 s[10:11], s[22:23], 2
+	s_add_u32 s15, s12, s10
+	.loc	1 264 50 is_stmt 0              ; mla_decode_mi355.py:264:50
+	s_mul_i32 s10, s14, s28
+	.loc	1 264 21                        ; mla_decode_mi355.py:264:21
+	s_addc_u32 s16, s13, s11
+	.loc	1 264 38                        ; mla_decode_mi355.py:264:38
+	s_ashr_i32 s11, s10, 31
+	s_lshl_b64 s[18:19], s[10:11], 2
+	s_add_u32 s10, s15, s18
+	s_addc_u32 s11, s16, s19
+	.loc	1 264 8                         ; mla_decode_mi355.py:264:8
+	s_load_dword s10, s[10:11], 0x0
+	.loc	1 274 23 is_stmt 1              ; mla_decode_mi355.py:274:23
+	v_and_b32_e32 v152, 28, v0
+	.loc	1 276 27                        ; mla_decode_mi355.py:276:27
+	v_and_b32_e32 v153, 7, v0
+	.loc	1 201 11                        ; mla_decode_mi355.py:201:11
+	v_and_b32_e32 v131, 15, v0
+	.loc	1 276 27                        ; mla_decode_mi355.py:276:27
+	v_and_b32_e32 v150, 48, v0
+	.loc	1 274 23                        ; mla_decode_mi355.py:274:23
+	v_lshlrev_b32_e32 v12, 1, v152
+	.loc	1 276 27                        ; mla_decode_mi355.py:276:27
+	v_lshlrev_b32_e32 v154, 3, v153
+	.loc	1 274 23                        ; mla_decode_mi355.py:274:23
+	v_lshlrev_b32_e32 v10, 6, v148
+	.loc	1 276 27                        ; mla_decode_mi355.py:276:27
+	v_lshlrev_b32_e32 v57, 8, v131
+	.loc	1 274 23                        ; mla_decode_mi355.py:274:23
+	v_xor_b32_e32 v13, v46, v12
+	.loc	1 276 27                        ; mla_decode_mi355.py:276:27
+	v_xor_b32_e32 v42, v154, v150
+	.loc	1 274 23                        ; mla_decode_mi355.py:274:23
+	v_or3_b32 v10, v13, v10, v151
+	.loc	1 276 27                        ; mla_decode_mi355.py:276:27
+	v_or_b32_e32 v13, v42, v57
+	.loc	1 279 22                        ; mla_decode_mi355.py:279:22
+	v_lshl_or_b32 v11, v148, 4, v11
+	.loc	1 277 27                        ; mla_decode_mi355.py:277:27
+	s_add_i32 s11, 0, 0x1000
+	.loc	1 183 11                        ; mla_decode_mi355.py:183:11
+	v_or_b32_e32 v158, 1, v148
+	v_or_b32_e32 v159, 2, v148
+	v_or_b32_e32 v160, 3, v148
+	.loc	1 274 23                        ; mla_decode_mi355.py:274:23
+	v_add_u32_e32 v14, 0, v10
+	v_xad_u32 v10, v10, 8, 0
+	.loc	1 276 27                        ; mla_decode_mi355.py:276:27
+	v_add_u32_e32 v27, 0, v13
+	v_xor_b32_e32 v15, 8, v13
+	.loc	1 279 22                        ; mla_decode_mi355.py:279:22
+	v_xad_u32 v28, v11, v12, 0
+	.loc	1 277 27                        ; mla_decode_mi355.py:277:27
+	v_add_u32_e32 v30, s11, v13
+	.loc	1 303 20                        ; mla_decode_mi355.py:303:20
+	s_waitcnt lgkmcnt(0)
+	s_lshl_b32 s23, s10, 6
+	.loc	1 276 27                        ; mla_decode_mi355.py:276:27
+	v_add_u32_e32 v29, 0, v15
+	.loc	1 277 27                        ; mla_decode_mi355.py:277:27
+	v_add_u32_e32 v31, s11, v15
+	.loc	1 303 38                        ; mla_decode_mi355.py:303:38
+	v_or_b32_e32 v32, s23, v160
+	.loc	1 304 51                        ; mla_decode_mi355.py:304:51
+	v_or_b32_e32 v34, s30, v148
+	v_or_b32_e32 v35, s30, v158
+	v_or_b32_e32 v36, s30, v159
+	.loc	1 306 52                        ; mla_decode_mi355.py:306:52
+	v_mad_u64_u32 v[32:33], s[10:11], v32, s34, v[130:131]
+	.loc	1 305 25                        ; mla_decode_mi355.py:305:25
+	v_cmp_gt_i32_e32 vcc, s9, v34
+	.loc	1 304 51                        ; mla_decode_mi355.py:304:51
+	v_or_b32_e32 v37, s30, v160
+	.loc	1 314 8                         ; mla_decode_mi355.py:314:8
+	s_and_b32 s5, s5, 0xffff
+	.loc	1 305 25                        ; mla_decode_mi355.py:305:25
+	v_cmp_gt_i32_e64 s[14:15], s9, v36
+	v_cmp_gt_i32_e64 s[16:17], s9, v37
+	.loc	1 280 28                        ; mla_decode_mi355.py:280:28
+	v_lshlrev_b32_e32 v47, 6, v131
+	v_or_b32_e32 v42, v42, v47
+	v_add_u32_e32 v155, 0, v42
+	v_xor_b32_e32 v42, 8, v42
+	v_add_u32_e32 v156, 0, v42
+	.loc	1 177 11                        ; mla_decode_mi355.py:177:11
+	v_and_b32_e32 v157, 63, v0
+	.loc	1 314 8                         ; mla_decode_mi355.py:314:8
+	v_mov_b32_e32 v98, 8
+	.loc	1 224 8                         ; mla_decode_mi355.py:224:8
+	v_or_b32_e32 v144, 0x200, v56
+	.loc	1 274 23                        ; mla_decode_mi355.py:274:23
+	s_waitcnt vmcnt(2)
+	ds_write_b64 v14, v[2:3]
+	.loc	1 275 23                        ; mla_decode_mi355.py:275:23
+	s_waitcnt vmcnt(1)
+	ds_write_b64 v14, v[6:7] offset:4096
+	.loc	1 274 23                        ; mla_decode_mi355.py:274:23
+	ds_write2st64_b64 v10, v[4:5], v[8:9] offset1:8
+	.loc	1 276 27                        ; mla_decode_mi355.py:276:27
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	ds_read2_b64 v[18:21], v27 offset1:8
+	ds_read2_b64 v[10:13], v27 offset0:16 offset1:24
+	ds_read2_b64 v[22:25], v29 offset1:8
+	ds_read2_b64 v[14:17], v29 offset0:16 offset1:24
+	.loc	1 277 27                        ; mla_decode_mi355.py:277:27
+	ds_read2_b64 v[2:5], v30 offset0:8 offset1:16
+	ds_read_b64 v[136:137], v27 offset:4096
+	ds_read_b64 v[134:135], v30 offset:192
+	.loc	1 279 22                        ; mla_decode_mi355.py:279:22
+	ds_read_b64 v[132:133], v31 offset:192
+	.loc	1 277 27                        ; mla_decode_mi355.py:277:27
+	ds_read_b64 v[138:139], v29 offset:4096
+	ds_read2_b64 v[6:9], v31 offset0:8 offset1:16
+	.loc	1 279 22                        ; mla_decode_mi355.py:279:22
+	s_waitcnt vmcnt(0)
+	ds_write_b32 v28, v26 offset:8192
+	.loc	1 303 38                        ; mla_decode_mi355.py:303:38
+	v_or_b32_e32 v26, s23, v148
+	v_or_b32_e32 v28, s23, v158
+	v_or_b32_e32 v30, s23, v159
+	.loc	1 306 52                        ; mla_decode_mi355.py:306:52
+	v_mad_u64_u32 v[26:27], s[10:11], v26, s34, v[130:131]
+	v_mad_u64_u32 v[28:29], s[10:11], v28, s34, v[130:131]
+	v_mad_u64_u32 v[30:31], s[10:11], v30, s34, v[130:131]
+	.loc	1 314 8                         ; mla_decode_mi355.py:314:8
+	v_cndmask_b32_e32 v27, v44, v26, vcc
+	.loc	1 305 25                        ; mla_decode_mi355.py:305:25
+	v_cmp_gt_i32_e64 s[10:11], s9, v35
+	.loc	1 280 28                        ; mla_decode_mi355.py:280:28
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	.loc	1 314 8                         ; mla_decode_mi355.py:314:8
+	v_cndmask_b32_e64 v29, v44, v28, s[10:11]
+	buffer_load_dwordx4 v[48:51], v27, s[4:7], 0 offen
+	buffer_load_dwordx4 v[52:55], v29, s[4:7], 0 offen
+	v_cndmask_b32_e64 v27, v44, v30, s[14:15]
+	v_cndmask_b32_e64 v29, v44, v32, s[16:17]
+	buffer_load_dwordx4 v[90:93], v27, s[4:7], 0 offen
+	buffer_load_dwordx4 v[94:97], v29, s[4:7], 0 offen
+	.loc	1 319 30                        ; mla_decode_mi355.py:319:30
+	v_add_u32_e32 v26, 0x100, v26
+	v_add_u32_e32 v34, 0x100, v28
+	v_add_u32_e32 v27, 0x100, v30
+	v_add_u32_e32 v28, 0x100, v32
+	.loc	1 320 8                         ; mla_decode_mi355.py:320:8
+	v_cndmask_b32_e32 v43, v44, v26, vcc
+	v_cndmask_b32_e64 v35, v44, v27, s[14:15]
+	v_cndmask_b32_e64 v36, v44, v28, s[16:17]
+	buffer_load_dwordx4 v[26:29], v35, s[4:7], 0 offen
+	buffer_load_dwordx4 v[30:33], v36, s[4:7], 0 offen
+	v_cndmask_b32_e64 v45, v44, v34, s[10:11]
+	buffer_load_dwordx4 v[34:37], v43, s[4:7], 0 offen
+	buffer_load_dwordx4 v[38:41], v45, s[4:7], 0 offen
+	.loc	1 280 28                        ; mla_decode_mi355.py:280:28
+	ds_read_b64 v[142:143], v155 offset:8192
+	.loc	1 303 20                        ; mla_decode_mi355.py:303:20
+	ds_read_b64 v[140:141], v156 offset:8192
+	.loc	1 314 8                         ; mla_decode_mi355.py:314:8
+	s_waitcnt vmcnt(4)
+	v_lshrrev_b32_sdwa v99, v98, v97 dst_sel:BYTE_1 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD
+	v_lshrrev_b32_e32 v100, 16, v97
+	v_lshrrev_b32_e32 v101, 24, v97
+	.loc	1 320 8                         ; mla_decode_mi355.py:320:8
+	s_waitcnt vmcnt(2)
+	v_lshrrev_b32_sdwa v102, v98, v33 dst_sel:BYTE_1 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD
+	v_lshrrev_b32_e32 v103, 16, v33
+	v_lshrrev_b32_e32 v104, 24, v33
+	; sched_barrier mask(0x00000000)
+	.loc	1 338 41                        ; mla_decode_mi355.py:338:41
+	v_or_b32_e32 v42, s23, v157
+	.loc	1 339 55                        ; mla_decode_mi355.py:339:55
+	v_mad_u64_u32 v[42:43], s[10:11], v42, s34, v[144:145]
+	.loc	1 340 51                        ; mla_decode_mi355.py:340:51
+	v_or_b32_e32 v43, s30, v157
+	.loc	1 341 28                        ; mla_decode_mi355.py:341:28
+	v_cmp_gt_i32_e32 vcc, s9, v43
+	.loc	1 335 19                        ; mla_decode_mi355.py:335:19
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	.loc	1 349 8                         ; mla_decode_mi355.py:349:8
+	v_cndmask_b32_e32 v42, v44, v42, vcc
+	buffer_load_dwordx4 v[42:45], v42, s[4:7], 0 offen
+	.loc	1 335 19                        ; mla_decode_mi355.py:335:19
+	v_lshlrev_b32_e32 v58, 4, v131
+	v_lshl_or_b32 v59, v148, 8, v58
+	v_xor_b32_e32 v59, v59, v151
+	.loc	1 361 27                        ; mla_decode_mi355.py:361:27
+	v_lshlrev_b32_e32 v105, 6, v151
+	v_xor_b32_e32 v58, v58, v150
+	.loc	1 335 19                        ; mla_decode_mi355.py:335:19
+	v_add_u32_e32 v170, 0, v59
+	v_xor_b32_e32 v60, 16, v59
+	v_xor_b32_e32 v61, 32, v59
+	v_xor_b32_e32 v59, 48, v59
+	.loc	1 336 19                        ; mla_decode_mi355.py:336:19
+	s_add_i32 s10, 0, 0x4000
+	.loc	1 361 27                        ; mla_decode_mi355.py:361:27
+	v_or3_b32 v57, v105, v58, v57
+	.loc	1 335 19                        ; mla_decode_mi355.py:335:19
+	v_add_u32_e32 v171, 0, v60
+	v_add_u32_e32 v172, 0, v61
+	v_add_u32_e32 v173, 0, v59
+	.loc	1 336 19                        ; mla_decode_mi355.py:336:19
+	v_add_u32_e32 v60, s10, v60
+	.loc	1 361 27                        ; mla_decode_mi355.py:361:27
+	v_xor_b32_e32 v58, 64, v57
+	.loc	1 335 19                        ; mla_decode_mi355.py:335:19
+	ds_write_b128 v170, v[48:51]
+	ds_write_b128 v171, v[52:55] offset:256
+	ds_write_b128 v172, v[90:93] offset:512
+	ds_write_b128 v173, v[94:97] offset:768
+	.loc	1 336 19                        ; mla_decode_mi355.py:336:19
+	s_waitcnt vmcnt(2)
+	ds_write_b128 v170, v[34:37] offset:16384
+	s_waitcnt vmcnt(1)
+	ds_write_b128 v60, v[38:41] offset:256
+	v_add_u32_e32 v60, s10, v61
+	v_add_u32_e32 v59, s10, v59
+	.loc	1 361 27                        ; mla_decode_mi355.py:361:27
+	v_add_u32_e32 v174, 0, v57
+	v_add_u32_e32 v175, 0, v58
+	v_xor_b32_e32 v58, 0x80, v57
+	v_xor_b32_e32 v57, 0xc0, v57
+	.loc	1 336 19                        ; mla_decode_mi355.py:336:19
+	ds_write_b128 v60, v[26:29] offset:512
+	ds_write_b128 v59, v[30:33] offset:768
+	.loc	1 361 27                        ; mla_decode_mi355.py:361:27
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	v_add_u32_e32 v176, 0, v58
+	v_add_u32_e32 v177, 0, v57
+	ds_read_b128 v[58:61], v174
+	.loc	1 362 27                        ; mla_decode_mi355.py:362:27
+	ds_read_b128 v[86:89], v174 offset:16384
+	.loc	1 361 27                        ; mla_decode_mi355.py:361:27
+	ds_read_b128 v[70:73], v175
+	.loc	1 362 27                        ; mla_decode_mi355.py:362:27
+	ds_read_b128 v[82:85], v175 offset:16384
+	.loc	1 361 27                        ; mla_decode_mi355.py:361:27
+	ds_read_b128 v[66:69], v176
+	.loc	1 362 27                        ; mla_decode_mi355.py:362:27
+	ds_read_b128 v[78:81], v176 offset:16384
+	.loc	1 361 27                        ; mla_decode_mi355.py:361:27
+	ds_read_b128 v[62:65], v177
+	.loc	1 362 27                        ; mla_decode_mi355.py:362:27
+	ds_read_b128 v[74:77], v177 offset:16384
+	; sched_barrier mask(0x00000000)
+	; sched_barrier mask(0x00000000)
+	.loc	1 370 19                        ; mla_decode_mi355.py:370:19
+	v_lshlrev_b32_e32 v57, 10, v149
+	v_or3_b32 v57, v57, v148, v105
+	v_lshlrev_b16_e32 v105, 8, v52
+	v_lshlrev_b16_e32 v106, 8, v94
+	s_movk_i32 s11, 0xff
+	v_or_b32_sdwa v105, v48, v105 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_or_b32_sdwa v106, v90, v106 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	s_movk_i32 s14, 0xff00
+	v_or_b32_sdwa v105, v105, v106 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_and_b32_sdwa v106, v49, s11 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v108, v98, v53 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_and_b32_sdwa v107, v53, s14 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_e32 v106, v106, v108
+	v_and_b32_e32 v108, 0xffffff00, v53
+	v_lshlrev_b16_e32 v53, 8, v53
+	v_or_b32_sdwa v107, v49, v107 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v108, v49, v108 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v49, v49, v53 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_and_b32_sdwa v53, v91, s11 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v110, v98, v95 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_and_b32_sdwa v109, v95, s14 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_sdwa v53, v53, v110 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD
+	v_and_b32_e32 v110, 0xffffff00, v95
+	v_lshlrev_b16_e32 v95, 8, v95
+	v_or_b32_sdwa v109, v91, v109 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v110, v91, v110 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v91, v91, v95 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_add_u32_e32 v178, 0, v57
+	v_or_b32_sdwa v49, v49, v91 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	ds_write2st64_b32 v178, v105, v49 offset1:1
+	v_and_b32_sdwa v49, v50, s11 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v95, v98, v54 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_and_b32_sdwa v91, v54, s14 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_e32 v49, v49, v95
+	v_and_b32_e32 v95, 0xffffff00, v54
+	v_lshlrev_b16_e32 v54, 8, v54
+	v_or_b32_sdwa v91, v50, v91 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v95, v50, v95 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v50, v50, v54 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_and_b32_sdwa v54, v92, s11 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v111, v98, v96 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_and_b32_sdwa v105, v96, s14 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_sdwa v54, v54, v111 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD
+	v_and_b32_e32 v111, 0xffffff00, v96
+	v_lshlrev_b16_e32 v96, 8, v96
+	v_or_b32_sdwa v105, v92, v105 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v111, v92, v111 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v92, v92, v96 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v112, v98, v55 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_or_b32_sdwa v50, v50, v92 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_and_b32_sdwa v92, v51, s11 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_and_b32_sdwa v96, v55, s14 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_e32 v92, v92, v112
+	v_and_b32_e32 v112, 0xffffff00, v55
+	v_lshlrev_b16_e32 v55, 8, v55
+	v_lshlrev_b16_e32 v97, 8, v97
+	v_or_b32_sdwa v96, v51, v96 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v112, v51, v112 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v51, v51, v55 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_or_b32_sdwa v97, v93, v97 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_and_b32_sdwa v113, v48, s11 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_sdwa v51, v51, v97 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v97, v98, v52 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	ds_write2st64_b32 v178, v50, v51 offset0:2 offset1:3
+	v_and_b32_sdwa v51, v52, s14 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_e32 v97, v113, v97
+	v_and_b32_e32 v52, 0xffffff00, v52
+	v_and_b32_sdwa v113, v94, s14 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v114, v98, v94 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_and_b32_e32 v94, 0xffffff00, v94
+	v_xor_b32_e32 v50, 16, v57
+	v_or_b32_sdwa v51, v48, v51 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v48, v48, v52 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_and_b32_sdwa v52, v90, s11 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_sdwa v113, v90, v113 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v90, v90, v94 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_add_u32_e32 v179, 0, v50
+	v_or_b32_sdwa v48, v48, v90 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v90, v108, v110 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	ds_write2_b32 v179, v48, v90 offset0:16 offset1:80
+	v_or_b32_sdwa v90, v93, v99 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v48, v95, v111 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v90, v112, v90 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v52, v52, v114 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD
+	ds_write2_b32 v179, v48, v90 offset0:144 offset1:208
+	v_xor_b32_e32 v48, 32, v57
+	v_add_u32_e32 v180, 0, v48
+	v_or_b32_sdwa v52, v97, v52 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v53, v106, v53 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_and_b32_sdwa v55, v93, s11 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	ds_write2_b32 v180, v52, v53 offset0:32 offset1:96
+	v_lshlrev_b16_e32 v52, 8, v100
+	v_or_b32_sdwa v52, v55, v52 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD
+	v_or_b32_sdwa v49, v49, v54 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v52, v92, v52 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	ds_write2_b32 v180, v49, v52 offset0:160 offset1:224
+	v_xor_b32_e32 v49, 48, v57
+	v_add_u32_e32 v181, 0, v49
+	v_or_b32_sdwa v51, v51, v113 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v52, v107, v109 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	ds_write2_b32 v181, v51, v52 offset0:48 offset1:112
+	v_lshlrev_b16_e32 v52, 8, v101
+	v_or_b32_sdwa v52, v93, v52 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v51, v91, v105 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v52, v96, v52 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	ds_write2_b32 v181, v51, v52 offset0:176 offset1:240
+	; sched_barrier mask(0x00000000)
+	.loc	1 376 19                        ; mla_decode_mi355.py:376:19
+	v_lshlrev_b16_e32 v51, 8, v38
+	v_lshlrev_b16_e32 v52, 8, v30
+	v_or_b32_sdwa v51, v34, v51 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_or_b32_sdwa v52, v26, v52 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v54, v98, v39 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_or_b32_sdwa v51, v51, v52 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_and_b32_sdwa v52, v35, s11 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_and_b32_sdwa v53, v39, s14 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_e32 v52, v52, v54
+	v_and_b32_e32 v54, 0xffffff00, v39
+	v_lshlrev_b16_e32 v39, 8, v39
+	ds_write_b32 v178, v51 offset:16384
+	v_add_u32_e32 v51, s10, v57
+	v_or_b32_sdwa v53, v35, v53 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v54, v35, v54 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v35, v35, v39 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_and_b32_sdwa v39, v27, s11 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v57, v98, v31 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_and_b32_sdwa v55, v31, s14 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_sdwa v39, v39, v57 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD
+	v_and_b32_e32 v57, 0xffffff00, v31
+	v_lshlrev_b16_e32 v31, 8, v31
+	v_or_b32_sdwa v55, v27, v55 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v57, v27, v57 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v27, v27, v31 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_and_b32_sdwa v31, v36, s11 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v90, v98, v40 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_or_b32_sdwa v27, v35, v27 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_and_b32_sdwa v35, v40, s14 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_e32 v31, v31, v90
+	v_and_b32_e32 v90, 0xffffff00, v40
+	v_lshlrev_b16_e32 v40, 8, v40
+	v_or_b32_sdwa v35, v36, v35 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v90, v36, v90 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v36, v36, v40 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_and_b32_sdwa v40, v28, s11 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v92, v98, v32 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_and_b32_sdwa v91, v32, s14 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_sdwa v40, v40, v92 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD
+	v_and_b32_e32 v92, 0xffffff00, v32
+	v_lshlrev_b16_e32 v32, 8, v32
+	v_or_b32_sdwa v91, v28, v91 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v92, v28, v92 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v28, v28, v32 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_lshlrev_b16_e32 v33, 8, v33
+	v_or_b32_sdwa v28, v36, v28 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_lshlrev_b16_e32 v36, 8, v41
+	v_or_b32_sdwa v36, v37, v36 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_or_b32_sdwa v33, v29, v33 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	ds_write2st64_b32 v51, v27, v28 offset0:1 offset1:2
+	v_and_b32_sdwa v27, v37, s11 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v32, v98, v41 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_or_b32_sdwa v33, v36, v33 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_and_b32_sdwa v28, v41, s14 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_e32 v27, v27, v32
+	v_and_b32_e32 v32, 0xffffff00, v41
+	ds_write_b32 v51, v33 offset:768
+	v_add_u32_e32 v33, s10, v50
+	v_lshlrev_b16_sdwa v41, v98, v38 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_and_b32_sdwa v50, v34, s11 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_and_b32_sdwa v36, v38, s14 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_e32 v41, v50, v41
+	v_and_b32_e32 v38, 0xffffff00, v38
+	v_and_b32_sdwa v50, v30, s14 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v51, v98, v30 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_and_b32_e32 v30, 0xffffff00, v30
+	v_or_b32_sdwa v36, v34, v36 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v34, v34, v38 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_and_b32_sdwa v38, v26, s11 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_sdwa v50, v26, v50 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v26, v26, v30 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v30, v54, v57 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v26, v34, v26 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v32, v37, v32 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	ds_write2_b32 v33, v26, v30 offset0:16 offset1:80
+	v_or_b32_sdwa v30, v29, v102 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v38, v38, v51 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD
+	v_or_b32_sdwa v26, v90, v92 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v30, v32, v30 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	ds_write2_b32 v33, v26, v30 offset0:144 offset1:208
+	v_add_u32_e32 v26, s10, v48
+	v_or_b32_sdwa v30, v41, v38 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v32, v52, v39 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v28, v37, v28 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_and_b32_sdwa v37, v29, s11 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	ds_write2_b32 v26, v30, v32 offset0:32 offset1:96
+	v_or_b32_sdwa v30, v31, v40 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_lshlrev_b16_e32 v31, 8, v103
+	v_or_b32_sdwa v31, v37, v31 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD
+	s_nop 0
+	v_or_b32_sdwa v27, v27, v31 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	ds_write2_b32 v26, v30, v27 offset0:160 offset1:224
+	v_add_u32_e32 v26, s10, v49
+	v_or_b32_sdwa v27, v36, v50 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v30, v53, v55 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	ds_write2_b32 v26, v27, v30 offset0:48 offset1:112
+	v_lshlrev_b16_e32 v30, 8, v104
+	v_or_b32_sdwa v29, v29, v30 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v27, v35, v91 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v28, v28, v29 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	ds_write2_b32 v26, v27, v28 offset0:176 offset1:240
+	.loc	1 378 22                        ; mla_decode_mi355.py:378:22
+	v_xor_b32_e32 v26, v46, v56
+	v_lshl_add_u32 v27, v157, 6, 0
+	v_add_u32_e32 v182, v27, v26
+	s_waitcnt vmcnt(0)
+	ds_write_b128 v182, v[42:45] offset:32768
+	; sched_barrier mask(0x00000000)
+	.loc	1 0 0 is_stmt 0                 ; mla_decode_mi355.py:0
+	s_add_i32 s22, s22, 1
+	.loc	1 387 41 is_stmt 1              ; mla_decode_mi355.py:387:41
+	s_cmp_lt_i32 s22, s29
+	v_lshlrev_b32_e32 v27, 4, v0
+	v_lshlrev_b32_e32 v26, 2, v0
+	s_cbranch_scc1 .LBB0_3
+; %bb.2:                                ; %.._crit_edge_crit_edge
+	.loc	1 505 32                        ; mla_decode_mi355.py:505:32
+	v_and_b32_e32 v28, 0xc30, v27
+	v_xor_b32_e32 v164, v28, v150
+	.loc	1 512 27                        ; mla_decode_mi355.py:512:27
+	v_or_b32_e32 v28, v47, v28
+	v_xor_b32_e32 v165, v28, v150
+	v_or_b32_e32 v166, 0x1000, v165
+	v_or_b32_e32 v167, 0x2000, v165
+	v_or_b32_e32 v168, 0x3000, v165
+.Ltmp5:
+	.loc	2 189 40                        ; standard.py:189:40 @[ mla_decode_mi355.py:526:43 ]
+	v_xor_b32_e32 v161, 0x80, v26
+	v_mul_i32_i24_e32 v162, 0xffffffd0, v131
+	s_mov_b64 s[10:11], 0
+	s_branch .LBB0_4
+.Ltmp6:
+.LBB0_3:
+	.loc	2 0 40 is_stmt 0                ; standard.py:0:40
+	s_mov_b64 s[10:11], -1
+                                        ; implicit-def: $vgpr164
+                                        ; implicit-def: $vgpr165
+                                        ; implicit-def: $vgpr166
+                                        ; implicit-def: $vgpr167
+                                        ; implicit-def: $vgpr168
+                                        ; implicit-def: $vgpr161
+                                        ; implicit-def: $vgpr162
+.LBB0_4:                                ; %Flow541
+	s_load_dwordx2 s[24:25], s[0:1], 0x38
+	v_lshrrev_b32_e32 v163, 6, v0
+	s_andn2_b64 vcc, exec, s[10:11]
+	v_add_u32_e32 v169, 0, v47
+	v_cmp_gt_u32_e64 s[16:17], 16, v157
+	v_cmp_gt_u32_e64 s[10:11], 64, v0
+	v_cmp_eq_u32_e64 s[14:15], 0, v149
+	s_cbranch_vccnz .LBB0_20
+; %bb.5:                                ; %.lr.ph
+	s_movk_i32 s23, 0xffd0
+	v_mad_i32_i24 v184, v131, s23, v169
+	.loc	1 387 41 is_stmt 1              ; mla_decode_mi355.py:387:41
+	s_ashr_i32 s23, s22, 31
+	s_and_b64 s[26:27], s[10:11], s[14:15]
+	s_lshl_b64 s[14:15], s[22:23], 2
+	v_and_b32_e32 v27, 0xc30, v27
+	v_xor_b32_e32 v161, 0x80, v26
+	v_add_u32_e32 v186, 0, v26
+	v_lshrrev_b32_e32 v26, 2, v0
+	s_add_u32 s14, s18, s14
+	v_xor_b32_e32 v164, v27, v150
+	v_or_b32_e32 v27, v47, v27
+	v_and_b32_e32 v26, 60, v26
+	s_addc_u32 s15, s19, s15
+	v_xor_b32_e32 v165, v27, v150
+	v_xor_b32_e32 v26, v154, v26
+	v_mad_u32_u24 v27, v131, 48, v184
+	v_add3_u32 v187, s30, v157, 64
+	v_add_u32_e32 v28, s30, v148
+	s_add_u32 s30, s12, s14
+	v_mov_b32_e32 v189, 0
+	v_or_b32_e32 v166, 0x1000, v165
+	v_or_b32_e32 v167, 0x2000, v165
+	v_or_b32_e32 v168, 0x3000, v165
+	v_mul_i32_i24_e32 v162, 0xffffffd0, v131
+	v_lshl_add_u32 v185, v163, 2, v184
+	v_add_u32_e32 v188, 0x43, v28
+	s_addc_u32 s31, s13, s15
+	v_mov_b32_e32 v146, 0xff800000
+	v_add_u32_e32 v190, v27, v26
+	s_movk_i32 s23, 0xff
+	s_movk_i32 s35, 0xff00
+	v_bfrev_b32_e32 v191, 1
+	v_mov_b32_e32 v192, 8
+	v_mov_b32_e32 v193, 0
+	v_mov_b32_e32 v26, 0
+	v_mov_b32_e32 v27, v189
+	v_mov_b32_e32 v28, v189
+	v_mov_b32_e32 v29, v189
+	v_mov_b32_e32 v30, 0
+	v_mov_b32_e32 v31, v189
+	v_mov_b32_e32 v32, v189
+	v_mov_b32_e32 v33, v189
+	v_mov_b32_e32 v34, 0
+	v_mov_b32_e32 v35, v189
+	v_mov_b32_e32 v36, v189
+	v_mov_b32_e32 v37, v189
+	v_mov_b32_e32 v38, 0
+	v_mov_b32_e32 v39, v189
+	v_mov_b32_e32 v40, v189
+	v_mov_b32_e32 v41, v189
+	v_mov_b32_e32 v42, 0
+	v_mov_b32_e32 v43, v189
+	v_mov_b32_e32 v44, v189
+	v_mov_b32_e32 v45, v189
+	v_mov_b32_e32 v50, 0
+	v_mov_b32_e32 v51, v189
+	v_mov_b32_e32 v52, v189
+	v_mov_b32_e32 v53, v189
+	v_mov_b32_e32 v46, 0
+	v_mov_b32_e32 v47, v189
+	v_mov_b32_e32 v48, v189
+	v_mov_b32_e32 v49, v189
+	v_mov_b32_e32 v54, 0
+	v_mov_b32_e32 v55, v189
+	v_mov_b32_e32 v56, v189
+	v_mov_b32_e32 v57, v189
+.LBB0_6:                                ; =>This Inner Loop Header: Depth=1
+	.loc	1 389 12                        ; mla_decode_mi355.py:389:12
+	global_load_dword v90, v189, s[30:31]
+	.loc	1 392 36                        ; mla_decode_mi355.py:392:36
+	v_add_u32_e32 v91, v169, v164
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	ds_read_b128 v[194:197], v91 offset:32768
+	; sched_barrier mask(0x00000000)
+	.loc	1 395 24                        ; mla_decode_mi355.py:395:24
+	s_waitcnt vmcnt(0)
+	v_lshlrev_b32_e32 v147, 6, v90
+	.loc	1 395 42 is_stmt 0              ; mla_decode_mi355.py:395:42
+	v_or_b32_e32 v90, v147, v148
+	v_or_b32_e32 v91, v147, v158
+	v_or_b32_e32 v92, v147, v159
+	v_or_b32_e32 v93, v147, v160
+	.loc	1 396 54 is_stmt 1              ; mla_decode_mi355.py:396:54
+	v_mad_u64_u32 v[94:95], s[12:13], v90, s34, v[130:131]
+	v_mad_u64_u32 v[96:97], s[12:13], v91, s34, v[130:131]
+	v_mad_u64_u32 v[98:99], s[12:13], v92, s34, v[130:131]
+	v_mad_u64_u32 v[100:101], s[12:13], v93, s34, v[130:131]
+	.loc	1 397 48                        ; mla_decode_mi355.py:397:48
+	v_add_u32_e32 v91, -2, v188
+	v_add_u32_e32 v90, -3, v188
+	v_add_u32_e32 v92, -1, v188
+	.loc	1 398 29                        ; mla_decode_mi355.py:398:29
+	v_cmp_gt_i32_e64 s[12:13], s9, v91
+	v_cmp_gt_i32_e32 vcc, s9, v90
+	v_cmp_gt_i32_e64 s[14:15], s9, v92
+	v_cmp_gt_i32_e64 s[18:19], s9, v188
+	; sched_barrier mask(0x00000000)
+	.loc	1 401 43                        ; mla_decode_mi355.py:401:43
+	v_mfma_f32_16x16x32_fp8_fp8 v[90:93], v[58:59], v[18:19], 0
+	v_mfma_f32_16x16x32_fp8_fp8 v[58:61], v[60:61], v[22:23], v[90:93]
+	v_mfma_f32_16x16x32_fp8_fp8 v[58:61], v[70:71], v[20:21], v[58:61]
+	v_mfma_f32_16x16x32_fp8_fp8 v[58:61], v[72:73], v[24:25], v[58:61]
+	v_mfma_f32_16x16x32_fp8_fp8 v[58:61], v[66:67], v[10:11], v[58:61]
+	.loc	1 405 12                        ; mla_decode_mi355.py:405:12
+	v_cndmask_b32_e32 v66, v191, v94, vcc
+	v_cndmask_b32_e64 v67, v191, v96, s[12:13]
+	buffer_load_dwordx4 v[110:113], v66, s[4:7], 0 offen
+	buffer_load_dwordx4 v[118:121], v67, s[4:7], 0 offen
+	.loc	1 401 43                        ; mla_decode_mi355.py:401:43
+	v_mfma_f32_16x16x32_fp8_fp8 v[58:61], v[68:69], v[14:15], v[58:61]
+	v_mfma_f32_16x16x32_fp8_fp8 v[58:61], v[62:63], v[12:13], v[58:61]
+	.loc	1 405 12                        ; mla_decode_mi355.py:405:12
+	v_cndmask_b32_e64 v62, v191, v98, s[14:15]
+	v_cndmask_b32_e64 v63, v191, v100, s[18:19]
+	buffer_load_dwordx4 v[106:109], v62, s[4:7], 0 offen
+	buffer_load_dwordx4 v[114:117], v63, s[4:7], 0 offen
+	.loc	1 401 43                        ; mla_decode_mi355.py:401:43
+	v_mfma_f32_16x16x32_fp8_fp8 v[58:61], v[64:65], v[16:17], v[58:61]
+	; sched_barrier mask(0x00000000)
+	.loc	1 413 34                        ; mla_decode_mi355.py:413:34
+	v_add_u32_e32 v62, 0x100, v94
+	v_add_u32_e32 v64, 0x100, v98
+	v_add_u32_e32 v63, 0x100, v96
+	v_add_u32_e32 v65, 0x100, v100
+	.loc	1 414 12                        ; mla_decode_mi355.py:414:12
+	v_cndmask_b32_e32 v62, v191, v62, vcc
+	v_cndmask_b32_e64 v64, v191, v64, s[14:15]
+	v_cndmask_b32_e64 v63, v191, v63, s[12:13]
+	v_cndmask_b32_e64 v65, v191, v65, s[18:19]
+	buffer_load_dwordx4 v[98:101], v62, s[4:7], 0 offen
+	buffer_load_dwordx4 v[102:105], v63, s[4:7], 0 offen
+	buffer_load_dwordx4 v[90:93], v64, s[4:7], 0 offen
+	buffer_load_dwordx4 v[94:97], v65, s[4:7], 0 offen
+	.loc	1 410 43                        ; mla_decode_mi355.py:410:43
+	v_mfma_f32_16x16x32_fp8_fp8 v[58:61], v[86:87], v[136:137], v[58:61]
+	.loc	1 420 31                        ; mla_decode_mi355.py:420:31
+	v_add_u32_e32 v70, 0, v165
+	.loc	1 439 32                        ; mla_decode_mi355.py:439:32
+	v_cmp_gt_i32_e32 vcc, s9, v187
+	.loc	1 410 43                        ; mla_decode_mi355.py:410:43
+	v_mfma_f32_16x16x32_fp8_fp8 v[58:61], v[88:89], v[138:139], v[58:61]
+	v_mfma_f32_16x16x32_fp8_fp8 v[58:61], v[82:83], v[2:3], v[58:61]
+	v_mfma_f32_16x16x32_fp8_fp8 v[58:61], v[84:85], v[6:7], v[58:61]
+	v_mfma_f32_16x16x32_fp8_fp8 v[58:61], v[78:79], v[4:5], v[58:61]
+	v_mfma_f32_16x16x32_fp8_fp8 v[58:61], v[80:81], v[8:9], v[58:61]
+	.loc	1 420 31                        ; mla_decode_mi355.py:420:31
+	ds_read_b128 v[126:129], v70
+	ds_read_b128 v[122:125], v70 offset:4096
+	ds_read_b128 v[84:87], v70 offset:8192
+	ds_read_b128 v[80:83], v70 offset:12288
+	.loc	1 410 43                        ; mla_decode_mi355.py:410:43
+	v_mfma_f32_16x16x32_fp8_fp8 v[58:61], v[74:75], v[134:135], v[58:61]
+	v_mfma_f32_16x16x32_fp8_fp8 v[58:61], v[76:77], v[132:133], v[58:61]
+	.loc	1 423 47                        ; mla_decode_mi355.py:423:47
+	s_waitcnt lgkmcnt(4)
+	v_mfma_f32_16x16x32_fp8_fp8 v[76:79], v[194:195], v[142:143], v[58:61]
+	.loc	1 421 31                        ; mla_decode_mi355.py:421:31
+	ds_read_b128 v[66:69], v70 offset:16384
+	s_nop 3
+	ds_read_b128 v[58:61], v70 offset:20480
+	ds_read_b128 v[62:65], v70 offset:24576
+	ds_read_b128 v[72:75], v70 offset:28672
+	.loc	1 423 47                        ; mla_decode_mi355.py:423:47
+	v_mfma_f32_16x16x32_fp8_fp8 v[76:79], v[196:197], v[140:141], v[76:79]
+	.loc	1 425 14                        ; mla_decode_mi355.py:425:14
+	s_nop 6
+	v_mul_f32_e32 v70, s8, v76
+	.loc	1 436 45                        ; mla_decode_mi355.py:436:45
+	v_or_b32_e32 v76, v147, v157
+	.loc	1 425 14                        ; mla_decode_mi355.py:425:14
+	v_mul_f32_e32 v71, s8, v77
+	v_mul_f32_e32 v88, s8, v78
+	v_mul_f32_e32 v89, s8, v79
+	.loc	1 437 59                        ; mla_decode_mi355.py:437:59
+	v_mad_u64_u32 v[76:77], s[12:13], v76, s34, v[144:145]
+	; sched_barrier mask(0x00000000)
+	.loc	1 445 12                        ; mla_decode_mi355.py:445:12
+	v_cndmask_b32_e32 v76, v191, v76, vcc
+	buffer_load_dwordx4 v[76:79], v76, s[4:7], 0 offen
+.Ltmp7:
+	.loc	2 168 27                        ; standard.py:168:27 @[ standard.py:189:40 @[ mla_decode_mi355.py:452:47 ] ]
+	v_max_f32_e32 v147, v70, v71
+	v_max3_f32 v147, v147, v88, v89
+.Ltmp8:
+	.loc	2 189 40                        ; standard.py:189:40 @[ mla_decode_mi355.py:452:47 ]
+	ds_bpermute_b32 v183, v161, v147
+.Ltmp9:
+	.loc	2 168 27                        ; standard.py:168:27 @[ standard.py:189:40 @[ mla_decode_mi355.py:452:47 ] ]
+	s_waitcnt lgkmcnt(0)
+	v_max_f32_e32 v183, v183, v183
+	v_max_f32_e32 v147, v147, v183
+.Ltmp10:
+	.loc	2 189 40                        ; standard.py:189:40 @[ mla_decode_mi355.py:452:47 ]
+	ds_swizzle_b32 v183, v147 offset:swizzle(SWAP,16)
+	s_and_saveexec_b64 s[12:13], s[16:17]
+	s_cbranch_execz .LBB0_8
+; %bb.7:                                ;   in Loop: Header=BB0_6 Depth=1
+	.loc	2 0 40 is_stmt 0                ; standard.py:0:40
+	s_waitcnt lgkmcnt(0)
+	v_max_f32_e32 v183, v183, v183
+	v_max_f32_e32 v147, v147, v147
+	v_max_f32_e32 v147, v147, v183
+	.loc	2 189 40                        ; standard.py:189:40 @[ mla_decode_mi355.py:452:47 ]
+	ds_write_b32 v185, v147 offset:37888
+.LBB0_8:                                ;   in Loop: Header=BB0_6 Depth=1
+	.loc	2 0 40                          ; standard.py:0:40
+	s_or_b64 exec, exec, s[12:13]
+	v_mov_b32_e32 v147, 0
+	.loc	2 189 40                        ; standard.py:189:40 @[ mla_decode_mi355.py:452:47 ]
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	s_and_saveexec_b64 s[12:13], s[10:11]
+; %bb.9:                                ;   in Loop: Header=BB0_6 Depth=1
+	ds_read_b32 v147, v186 offset:37888
+; %bb.10:                               ;   in Loop: Header=BB0_6 Depth=1
+	.loc	2 0 40                          ; standard.py:0:40
+	s_or_b64 exec, exec, s[12:13]
+.Ltmp11:
+	.loc	2 168 27 is_stmt 1              ; standard.py:168:27 @[ standard.py:189:40 @[ mla_decode_mi355.py:452:47 ] ]
+	s_waitcnt lgkmcnt(0)
+	v_max_f32_e32 v183, v147, v147
+.Ltmp12:
+	.loc	2 189 40                        ; standard.py:189:40 @[ mla_decode_mi355.py:452:47 ]
+	v_mov_b32_dpp v147, v147 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf
+.Ltmp13:
+	.loc	2 168 27                        ; standard.py:168:27 @[ standard.py:189:40 @[ mla_decode_mi355.py:452:47 ] ]
+	v_max_f32_e32 v147, v147, v147
+	v_max_f32_e32 v147, v183, v147
+.Ltmp14:
+	.loc	2 189 40                        ; standard.py:189:40 @[ mla_decode_mi355.py:452:47 ]
+	v_mov_b32_e32 v183, v147
+	s_nop 1
+	v_mov_b32_dpp v183, v183 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+	s_and_saveexec_b64 s[12:13], s[26:27]
+; %bb.11:                               ;   in Loop: Header=BB0_6 Depth=1
+	.loc	2 0 40 is_stmt 0                ; standard.py:0:40
+	v_max_f32_e32 v183, v183, v183
+	v_max_f32_e32 v147, v147, v147
+	v_max_f32_e32 v147, v147, v183
+	.loc	2 189 40                        ; standard.py:189:40 @[ mla_decode_mi355.py:452:47 ]
+	ds_write_b32 v186, v147 offset:37888
+; %bb.12:                               ;   in Loop: Header=BB0_6 Depth=1
+	.loc	2 0 40                          ; standard.py:0:40
+	s_or_b64 exec, exec, s[12:13]
+	.loc	2 189 40                        ; standard.py:189:40 @[ mla_decode_mi355.py:452:47 ]
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	ds_read_b32 v147, v184 offset:37888
+.Ltmp15:
+	.loc	1 453 38 is_stmt 1              ; mla_decode_mi355.py:453:38
+	v_max_f32_e32 v183, v146, v146
+	s_waitcnt lgkmcnt(0)
+	v_max_f32_e32 v147, v147, v147
+	v_max_f32_e32 v183, v147, v183
+	.loc	1 456 31                        ; mla_decode_mi355.py:456:31
+	v_sub_f32_e32 v70, v70, v183
+	v_sub_f32_e32 v71, v71, v183
+	.loc	1 456 51 is_stmt 0              ; mla_decode_mi355.py:456:51
+	v_mul_f32_e32 v70, 0x3fb8aa3b, v70
+	v_mul_f32_e32 v71, 0x3fb8aa3b, v71
+	.loc	1 456 25                        ; mla_decode_mi355.py:456:25
+	v_exp_f32_e32 v194, v70
+	v_exp_f32_e32 v71, v71
+	.loc	1 456 31                        ; mla_decode_mi355.py:456:31
+	v_sub_f32_e32 v88, v88, v183
+	v_sub_f32_e32 v89, v89, v183
+	.loc	1 456 51                        ; mla_decode_mi355.py:456:51
+	v_mul_f32_e32 v88, 0x3fb8aa3b, v88
+	v_mul_f32_e32 v70, 0x3fb8aa3b, v89
+	.loc	1 456 25                        ; mla_decode_mi355.py:456:25
+	v_exp_f32_e32 v195, v88
+	v_exp_f32_e32 v196, v70
+	.loc	1 457 26 is_stmt 1              ; mla_decode_mi355.py:457:26
+	v_cvt_pk_fp8_f32 v88, v194, v71
+	.loc	1 455 41                        ; mla_decode_mi355.py:455:41
+	v_sub_f32_e32 v70, v146, v183
+	.loc	1 455 52 is_stmt 0              ; mla_decode_mi355.py:455:52
+	v_mul_f32_e32 v70, 0x3fb8aa3b, v70
+	.loc	1 455 32                        ; mla_decode_mi355.py:455:32
+	v_exp_f32_e32 v70, v70
+	.loc	1 457 26 is_stmt 1              ; mla_decode_mi355.py:457:26
+	v_cvt_pk_fp8_f32 v88, v195, v196 op_sel:[0,0,1]
+	.loc	1 457 21 is_stmt 0              ; mla_decode_mi355.py:457:21
+	ds_write_b32 v190, v88 offset:36864
+	; sched_barrier mask(0x00000000)
+	.loc	1 460 28 is_stmt 1              ; mla_decode_mi355.py:460:28
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	ds_read_b64 v[146:147], v155 offset:36864
+	ds_read_b64 v[88:89], v156 offset:36864
+	.loc	1 468 48                        ; mla_decode_mi355.py:468:48
+	v_pk_mul_f32 v[56:57], v[56:57], v[70:71] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[54:55], v[54:55], v[70:71] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[48:49], v[48:49], v[70:71] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[46:47], v[46:47], v[70:71] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[52:53], v[52:53], v[70:71] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[50:51], v[50:51], v[70:71] op_sel_hi:[1,0]
+.Ltmp16:
+	.loc	2 261 15                        ; standard.py:261:15 @[ standard.py:291:36 @[ mla_decode_mi355.py:469:45 ] ]
+	v_add_f32_e32 v71, v194, v71
+	v_add_f32_e32 v71, v195, v71
+	v_add_f32_e32 v71, v196, v71
+.Ltmp17:
+	.loc	1 468 48                        ; mla_decode_mi355.py:468:48
+	s_waitcnt lgkmcnt(1)
+	v_mfma_f32_16x16x32_fp8_fp8 v[50:53], v[84:85], v[146:147], v[50:53]
+.Ltmp18:
+	.loc	2 291 36                        ; standard.py:291:36 @[ mla_decode_mi355.py:469:45 ]
+	ds_bpermute_b32 v84, v161, v71
+.Ltmp19:
+	.loc	1 468 48                        ; mla_decode_mi355.py:468:48
+	v_pk_mul_f32 v[44:45], v[44:45], v[70:71] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[42:43], v[42:43], v[70:71] op_sel_hi:[1,0]
+	v_mfma_f32_16x16x32_fp8_fp8 v[54:57], v[126:127], v[146:147], v[54:57]
+	.loc	1 466 23                        ; mla_decode_mi355.py:466:23
+	s_waitcnt vmcnt(8)
+	ds_write_b128 v170, v[110:113]
+.Ltmp20:
+	.loc	2 261 15                        ; standard.py:261:15 @[ standard.py:291:36 @[ mla_decode_mi355.py:469:45 ] ]
+	s_waitcnt lgkmcnt(1)
+	v_add_f32_e32 v71, v71, v84
+.Ltmp21:
+	.loc	1 466 23                        ; mla_decode_mi355.py:466:23
+	s_waitcnt vmcnt(7)
+	ds_write_b128 v171, v[118:121] offset:256
+	.loc	1 468 48                        ; mla_decode_mi355.py:468:48
+	v_mfma_f32_16x16x32_fp8_fp8 v[46:49], v[122:123], v[146:147], v[46:49]
+	.loc	1 466 23                        ; mla_decode_mi355.py:466:23
+	s_waitcnt vmcnt(6)
+	ds_write_b128 v172, v[106:109] offset:512
+	s_waitcnt vmcnt(5)
+	ds_write_b128 v173, v[114:117] offset:768
+	.loc	1 468 48                        ; mla_decode_mi355.py:468:48
+	v_mfma_f32_16x16x32_fp8_fp8 v[42:45], v[80:81], v[146:147], v[42:45]
+.Ltmp22:
+	.loc	2 291 36                        ; standard.py:291:36 @[ mla_decode_mi355.py:469:45 ]
+	ds_swizzle_b32 v80, v71 offset:swizzle(SWAP,16)
+.Ltmp23:
+	.loc	1 468 48                        ; mla_decode_mi355.py:468:48
+	v_mfma_f32_16x16x32_fp8_fp8 v[54:57], v[128:129], v[88:89], v[54:57]
+	v_mfma_f32_16x16x32_fp8_fp8 v[46:49], v[124:125], v[88:89], v[46:49]
+	v_mfma_f32_16x16x32_fp8_fp8 v[50:53], v[86:87], v[88:89], v[50:53]
+	v_mfma_f32_16x16x32_fp8_fp8 v[42:45], v[82:83], v[88:89], v[42:45]
+.Ltmp24:
+	.loc	2 291 36                        ; standard.py:291:36 @[ mla_decode_mi355.py:469:45 ]
+	s_and_saveexec_b64 s[12:13], s[16:17]
+	s_cbranch_execz .LBB0_14
+; %bb.13:                               ;   in Loop: Header=BB0_6 Depth=1
+	.loc	2 0 36 is_stmt 0                ; standard.py:0:36
+	s_waitcnt lgkmcnt(0)
+	v_add_f32_e32 v71, v71, v80
+	.loc	2 291 36                        ; standard.py:291:36 @[ mla_decode_mi355.py:469:45 ]
+	ds_write_b32 v185, v71 offset:37888
+.LBB0_14:                               ;   in Loop: Header=BB0_6 Depth=1
+	.loc	2 0 36                          ; standard.py:0:36
+	s_or_b64 exec, exec, s[12:13]
+	s_waitcnt lgkmcnt(0)
+	v_mov_b32_e32 v80, 0
+	.loc	2 291 36                        ; standard.py:291:36 @[ mla_decode_mi355.py:469:45 ]
+	s_barrier
+	s_and_saveexec_b64 s[12:13], s[10:11]
+; %bb.15:                               ;   in Loop: Header=BB0_6 Depth=1
+	ds_read_b32 v80, v186 offset:37888
+; %bb.16:                               ;   in Loop: Header=BB0_6 Depth=1
+	.loc	2 0 36                          ; standard.py:0:36
+	s_or_b64 exec, exec, s[12:13]
+	.loc	2 291 36                        ; standard.py:291:36 @[ mla_decode_mi355.py:469:45 ]
+	s_waitcnt lgkmcnt(0)
+	v_mov_b32_e32 v81, v80
+.Ltmp25:
+	.loc	1 0 0                           ; mla_decode_mi355.py:0
+	v_mov_b32_e32 v71, v70
+.Ltmp26:
+	.loc	2 291 36                        ; standard.py:291:36 @[ mla_decode_mi355.py:469:45 ]
+	s_nop 0
+	v_mov_b32_dpp v81, v81 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf
+.Ltmp27:
+	.loc	2 261 15 is_stmt 1              ; standard.py:261:15 @[ standard.py:291:36 @[ mla_decode_mi355.py:469:45 ] ]
+	v_add_f32_e32 v80, v80, v81
+.Ltmp28:
+	.loc	2 291 36                        ; standard.py:291:36 @[ mla_decode_mi355.py:469:45 ]
+	v_mov_b32_e32 v81, v80
+	s_nop 1
+	v_mov_b32_dpp v81, v81 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+	s_and_saveexec_b64 s[12:13], s[26:27]
+; %bb.17:                               ;   in Loop: Header=BB0_6 Depth=1
+	.loc	2 0 36 is_stmt 0                ; standard.py:0:36
+	v_add_f32_e32 v80, v80, v81
+	.loc	2 291 36                        ; standard.py:291:36 @[ mla_decode_mi355.py:469:45 ]
+	ds_write_b32 v186, v80 offset:37888
+.Ltmp29:
+; %bb.18:                               ;   in Loop: Header=BB0_6 Depth=1
+	.loc	2 0 36                          ; standard.py:0:36
+	s_or_b64 exec, exec, s[12:13]
+	.loc	1 473 48 is_stmt 1              ; mla_decode_mi355.py:473:48
+	v_mov_b32_e32 v80, v70
+	v_mov_b32_e32 v81, v70
+	v_pk_mul_f32 v[36:37], v[36:37], v[80:81]
+	v_pk_mul_f32 v[34:35], v[34:35], v[70:71]
+	v_pk_mul_f32 v[40:41], v[40:41], v[80:81]
+	v_pk_mul_f32 v[38:39], v[38:39], v[70:71]
+.Ltmp30:
+	.loc	2 291 36                        ; standard.py:291:36 @[ mla_decode_mi355.py:469:45 ]
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+.Ltmp31:
+	.loc	1 473 48                        ; mla_decode_mi355.py:473:48
+	v_mfma_f32_16x16x32_fp8_fp8 v[34:37], v[58:59], v[146:147], v[34:37]
+.Ltmp32:
+	.loc	2 291 36                        ; standard.py:291:36 @[ mla_decode_mi355.py:469:45 ]
+	ds_read_b32 v122, v184 offset:37888
+.Ltmp33:
+	.loc	1 473 48                        ; mla_decode_mi355.py:473:48
+	v_pk_mul_f32 v[32:33], v[32:33], v[80:81]
+	v_pk_mul_f32 v[30:31], v[30:31], v[70:71]
+	v_mfma_f32_16x16x32_fp8_fp8 v[38:41], v[66:67], v[146:147], v[38:41]
+	v_pk_mul_f32 v[28:29], v[28:29], v[80:81]
+	v_pk_mul_f32 v[26:27], v[26:27], v[70:71]
+	.loc	1 405 12                        ; mla_decode_mi355.py:405:12
+	v_lshrrev_b32_sdwa v82, v192, v117 dst_sel:BYTE_1 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD
+	.loc	1 473 48                        ; mla_decode_mi355.py:473:48
+	v_mfma_f32_16x16x32_fp8_fp8 v[30:33], v[62:63], v[146:147], v[30:33]
+	.loc	1 405 12                        ; mla_decode_mi355.py:405:12
+	v_lshrrev_b32_e32 v83, 16, v117
+	v_lshrrev_b32_e32 v123, 24, v117
+	.loc	1 414 12                        ; mla_decode_mi355.py:414:12
+	s_waitcnt vmcnt(1)
+	v_lshrrev_b32_sdwa v124, v192, v97 dst_sel:BYTE_1 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD
+	.loc	1 473 48                        ; mla_decode_mi355.py:473:48
+	v_mfma_f32_16x16x32_fp8_fp8 v[26:29], v[72:73], v[146:147], v[26:29]
+	.loc	1 414 12                        ; mla_decode_mi355.py:414:12
+	v_lshrrev_b32_e32 v125, 16, v97
+	v_lshrrev_b32_e32 v126, 24, v97
+	.loc	1 473 48                        ; mla_decode_mi355.py:473:48
+	v_mfma_f32_16x16x32_fp8_fp8 v[34:37], v[60:61], v[88:89], v[34:37]
+	.loc	1 477 31                        ; mla_decode_mi355.py:477:31
+	ds_read_b128 v[58:61], v174
+	.loc	1 471 23                        ; mla_decode_mi355.py:471:23
+	ds_write_b128 v170, v[98:101] offset:16384
+	ds_write_b128 v171, v[102:105] offset:16640
+	ds_write_b128 v172, v[90:93] offset:16896
+	ds_write_b128 v173, v[94:97] offset:17152
+	.loc	1 473 48                        ; mla_decode_mi355.py:473:48
+	v_mfma_f32_16x16x32_fp8_fp8 v[38:41], v[68:69], v[88:89], v[38:41]
+	.loc	1 469 35                        ; mla_decode_mi355.py:469:35
+	s_waitcnt lgkmcnt(5)
+	v_fmac_f32_e32 v122, v193, v70
+	.loc	1 473 48                        ; mla_decode_mi355.py:473:48
+	v_mfma_f32_16x16x32_fp8_fp8 v[30:33], v[64:65], v[88:89], v[30:33]
+	.loc	1 477 31                        ; mla_decode_mi355.py:477:31
+	ds_read_b128 v[70:73], v175
+	ds_read_b128 v[66:69], v176
+	ds_read_b128 v[62:65], v177
+	.loc	1 474 26                        ; mla_decode_mi355.py:474:26
+	s_waitcnt vmcnt(0)
+	ds_write_b128 v182, v[76:79] offset:32768
+	.loc	1 473 48                        ; mla_decode_mi355.py:473:48
+	v_mfma_f32_16x16x32_fp8_fp8 v[26:29], v[74:75], v[88:89], v[26:29]
+	; sched_barrier mask(0x00000000)
+	.loc	1 483 23                        ; mla_decode_mi355.py:483:23
+	v_lshlrev_b16_e32 v74, 8, v118
+	v_lshlrev_b16_e32 v75, 8, v114
+	v_or_b32_sdwa v74, v110, v74 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_or_b32_sdwa v75, v106, v75 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_lshlrev_b16_e32 v85, 8, v120
+	v_and_b32_sdwa v86, v108, s23 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v88, v192, v116 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_lshlrev_b16_e32 v89, 8, v116
+	v_or_b32_sdwa v74, v74, v75 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_and_b32_sdwa v75, v111, s23 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v77, v192, v119 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_and_b32_sdwa v79, v107, s23 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v81, v192, v115 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_or_b32_sdwa v85, v112, v85 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_and_b32_sdwa v87, v116, s35 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_sdwa v86, v86, v88 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD
+	v_and_b32_e32 v88, 0xffffff00, v116
+	v_or_b32_sdwa v89, v108, v89 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_and_b32_sdwa v76, v119, s35 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_e32 v75, v75, v77
+	v_and_b32_e32 v77, 0xffffff00, v119
+	v_lshlrev_b16_e32 v78, 8, v119
+	v_and_b32_sdwa v80, v115, s35 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_sdwa v79, v79, v81 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD
+	v_and_b32_e32 v81, 0xffffff00, v115
+	v_lshlrev_b16_e32 v84, 8, v115
+	v_or_b32_sdwa v87, v108, v87 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v88, v108, v88 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v85, v85, v89 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_and_b32_sdwa v89, v113, s23 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v108, v192, v121 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_or_b32_sdwa v76, v111, v76 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v77, v111, v77 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v78, v111, v78 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_or_b32_sdwa v80, v107, v80 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v81, v107, v81 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v84, v107, v84 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_and_b32_sdwa v107, v121, s35 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_e32 v89, v89, v108
+	v_and_b32_e32 v108, 0xffffff00, v121
+	v_lshlrev_b16_e32 v111, 8, v121
+	v_or_b32_sdwa v107, v113, v107 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v108, v113, v108 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v111, v113, v111 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_lshlrev_b16_e32 v113, 8, v117
+	v_or_b32_sdwa v113, v109, v113 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	s_waitcnt lgkmcnt(0)
+	v_or_b32_sdwa v111, v111, v113 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	s_barrier
+	v_or_b32_sdwa v78, v78, v84 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	ds_write2st64_b32 v178, v85, v111 offset0:2 offset1:3
+	v_lshlrev_b16_sdwa v111, v192, v118 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_and_b32_sdwa v113, v110, s23 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	ds_write2st64_b32 v178, v74, v78 offset1:1
+	v_and_b32_sdwa v74, v112, s23 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v84, v192, v120 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_and_b32_sdwa v85, v118, s35 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_e32 v111, v113, v111
+	v_and_b32_e32 v113, 0xffffff00, v118
+	v_and_b32_sdwa v115, v114, s35 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v116, v192, v114 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_and_b32_e32 v114, 0xffffff00, v114
+	v_or_b32_e32 v74, v74, v84
+	v_and_b32_e32 v84, 0xffffff00, v120
+	v_or_b32_sdwa v85, v110, v85 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v110, v110, v113 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_and_b32_sdwa v113, v106, s23 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_sdwa v115, v106, v115 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v106, v106, v114 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v84, v112, v84 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v106, v110, v106 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v77, v77, v81 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v81, v109, v82 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v113, v113, v116 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD
+	ds_write2_b32 v179, v106, v77 offset0:16 offset1:80
+	v_or_b32_sdwa v77, v84, v88 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v81, v108, v81 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_and_b32_sdwa v78, v120, s35 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	ds_write2_b32 v179, v77, v81 offset0:144 offset1:208
+	v_or_b32_sdwa v77, v111, v113 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v75, v75, v79 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v78, v112, v78 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_and_b32_sdwa v112, v109, s23 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	ds_write2_b32 v180, v77, v75 offset0:32 offset1:96
+	v_lshlrev_b16_e32 v75, 8, v83
+	v_or_b32_sdwa v75, v112, v75 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD
+	v_or_b32_sdwa v74, v74, v86 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v75, v89, v75 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	ds_write2_b32 v180, v74, v75 offset0:160 offset1:224
+	v_or_b32_sdwa v74, v85, v115 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v75, v76, v80 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	ds_write2_b32 v181, v74, v75 offset0:48 offset1:112
+	v_or_b32_sdwa v106, v78, v87 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	.loc	1 484 31                        ; mla_decode_mi355.py:484:31
+	ds_read_b128 v[86:89], v174 offset:16384
+	ds_read_b128 v[82:85], v175 offset:16384
+	ds_read_b128 v[78:81], v176 offset:16384
+	ds_read_b128 v[74:77], v177 offset:16384
+	.loc	1 483 23                        ; mla_decode_mi355.py:483:23
+	v_lshlrev_b16_e32 v108, 8, v123
+	v_or_b32_sdwa v108, v109, v108 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	s_nop 0
+	v_or_b32_sdwa v107, v107, v108 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	ds_write2_b32 v181, v106, v107 offset0:176 offset1:240
+	; sched_barrier mask(0x00000000)
+	.loc	1 490 23                        ; mla_decode_mi355.py:490:23
+	v_lshlrev_b16_e32 v106, 8, v102
+	v_lshlrev_b16_e32 v107, 8, v94
+	v_or_b32_sdwa v106, v98, v106 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_or_b32_sdwa v107, v90, v107 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v109, v192, v103 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_or_b32_sdwa v106, v106, v107 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_and_b32_sdwa v107, v99, s23 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_and_b32_sdwa v108, v103, s35 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_e32 v107, v107, v109
+	v_and_b32_e32 v109, 0xffffff00, v103
+	v_lshlrev_b16_e32 v103, 8, v103
+	v_or_b32_sdwa v108, v99, v108 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v109, v99, v109 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v99, v99, v103 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_and_b32_sdwa v103, v91, s23 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v111, v192, v95 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_and_b32_sdwa v110, v95, s35 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_sdwa v103, v103, v111 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD
+	v_and_b32_e32 v111, 0xffffff00, v95
+	v_lshlrev_b16_e32 v95, 8, v95
+	v_or_b32_sdwa v110, v91, v110 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v111, v91, v111 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v91, v91, v95 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	s_waitcnt lgkmcnt(0)
+	v_or_b32_sdwa v91, v99, v91 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	s_barrier
+	ds_write2st64_b32 v178, v106, v91 offset0:64 offset1:65
+	v_and_b32_sdwa v91, v100, s23 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v99, v192, v104 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_and_b32_sdwa v95, v104, s35 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_e32 v91, v91, v99
+	v_and_b32_e32 v99, 0xffffff00, v104
+	v_lshlrev_b16_e32 v104, 8, v104
+	v_or_b32_sdwa v95, v100, v95 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v99, v100, v99 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v100, v100, v104 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_and_b32_sdwa v104, v92, s23 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v112, v192, v96 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_and_b32_sdwa v106, v96, s35 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_sdwa v104, v104, v112 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD
+	v_and_b32_e32 v112, 0xffffff00, v96
+	v_lshlrev_b16_e32 v96, 8, v96
+	v_or_b32_sdwa v106, v92, v106 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v112, v92, v112 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v92, v92, v96 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_and_b32_sdwa v96, v101, s23 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v113, v192, v105 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_or_b32_sdwa v92, v100, v92 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_and_b32_sdwa v100, v105, s35 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_e32 v96, v96, v113
+	v_and_b32_e32 v113, 0xffffff00, v105
+	v_lshlrev_b16_e32 v105, 8, v105
+	v_lshlrev_b16_e32 v97, 8, v97
+	v_or_b32_sdwa v100, v101, v100 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v113, v101, v113 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v101, v101, v105 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_or_b32_sdwa v97, v93, v97 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:DWORD
+	v_lshlrev_b16_sdwa v114, v192, v94 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_or_b32_sdwa v97, v101, v97 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	ds_write2st64_b32 v178, v92, v97 offset0:66 offset1:67
+	v_lshlrev_b16_sdwa v97, v192, v102 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
+	v_and_b32_sdwa v101, v98, s23 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_and_b32_sdwa v92, v102, s35 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_e32 v97, v101, v97
+	v_and_b32_e32 v101, 0xffffff00, v102
+	v_and_b32_sdwa v102, v94, s35 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_and_b32_e32 v94, 0xffffff00, v94
+	v_or_b32_sdwa v92, v98, v92 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v98, v98, v101 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_and_b32_sdwa v101, v90, s23 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	v_or_b32_sdwa v102, v90, v102 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	v_or_b32_sdwa v90, v90, v94 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v94, v109, v111 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v90, v98, v90 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_add_u32_e32 v98, 64, v179
+	ds_write2st64_b32 v98, v90, v94 offset0:64 offset1:65
+	v_or_b32_sdwa v94, v93, v124 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:DWORD
+	v_or_b32_sdwa v101, v101, v114 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD
+	v_or_b32_sdwa v90, v99, v112 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v94, v113, v94 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	ds_write2st64_b32 v98, v90, v94 offset0:66 offset1:67
+	v_or_b32_sdwa v90, v97, v101 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v94, v107, v103 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_add_u32_e32 v97, 0x80, v180
+	v_and_b32_sdwa v105, v93, s23 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD
+	ds_write2st64_b32 v97, v90, v94 offset0:64 offset1:65
+	v_or_b32_sdwa v90, v91, v104 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_lshlrev_b16_e32 v91, 8, v125
+	v_or_b32_sdwa v91, v105, v91 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD
+	.loc	1 0 0 is_stmt 0                 ; mla_decode_mi355.py:0
+	s_add_i32 s22, s22, 1
+	.loc	1 490 23                        ; mla_decode_mi355.py:490:23
+	v_or_b32_sdwa v91, v96, v91 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	ds_write2st64_b32 v97, v90, v91 offset0:66 offset1:67
+	v_or_b32_sdwa v90, v92, v102 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v91, v108, v110 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_add_u32_e32 v92, 0xc0, v181
+	ds_write2st64_b32 v92, v90, v91 offset0:64 offset1:65
+	v_lshlrev_b16_e32 v91, 8, v126
+	.loc	1 387 41 is_stmt 1              ; mla_decode_mi355.py:387:41
+	s_add_u32 s30, s30, 4
+	.loc	1 490 23                        ; mla_decode_mi355.py:490:23
+	v_or_b32_sdwa v91, v93, v91 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+	.loc	1 387 41                        ; mla_decode_mi355.py:387:41
+	s_addc_u32 s31, s31, 0
+	.loc	1 490 23                        ; mla_decode_mi355.py:490:23
+	v_or_b32_sdwa v90, v95, v106 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	v_or_b32_sdwa v91, v100, v91 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:DWORD
+	.loc	1 387 41                        ; mla_decode_mi355.py:387:41
+	v_add_u32_e32 v187, 64, v187
+	s_cmp_lt_i32 s22, s29
+	v_add_u32_e32 v188, 64, v188
+	.loc	1 490 23                        ; mla_decode_mi355.py:490:23
+	ds_write2st64_b32 v92, v90, v91 offset0:66 offset1:67
+	.loc	1 387 41                        ; mla_decode_mi355.py:387:41
+	s_cbranch_scc0 .LBB0_21
+; %bb.19:                               ;   in Loop: Header=BB0_6 Depth=1
+	.loc	1 0 41 is_stmt 0                ; mla_decode_mi355.py:0:41
+	v_mov_b32_e32 v146, v183
+	v_mov_b32_e32 v193, v122
+	.loc	1 387 41                        ; mla_decode_mi355.py:387:41
+	s_branch .LBB0_6
+.LBB0_20:
+	.loc	1 0 41                          ; mla_decode_mi355.py:0:41
+	v_mov_b32_e32 v57, 0
+	v_mov_b32_e32 v183, 0xff800000
+	v_mov_b32_e32 v56, v57
+	v_mov_b32_e32 v55, v57
+	v_mov_b32_e32 v54, v57
+	v_mov_b32_e32 v49, v57
+	v_mov_b32_e32 v48, v57
+	v_mov_b32_e32 v47, v57
+	v_mov_b32_e32 v46, v57
+	v_mov_b32_e32 v53, v57
+	v_mov_b32_e32 v52, v57
+	v_mov_b32_e32 v51, v57
+	v_mov_b32_e32 v50, v57
+	v_mov_b32_e32 v45, v57
+	v_mov_b32_e32 v44, v57
+	v_mov_b32_e32 v43, v57
+	v_mov_b32_e32 v42, v57
+	v_mov_b32_e32 v41, v57
+	v_mov_b32_e32 v40, v57
+	v_mov_b32_e32 v39, v57
+	v_mov_b32_e32 v38, v57
+	v_mov_b32_e32 v37, v57
+	v_mov_b32_e32 v36, v57
+	v_mov_b32_e32 v35, v57
+	v_mov_b32_e32 v34, v57
+	v_mov_b32_e32 v33, v57
+	v_mov_b32_e32 v32, v57
+	v_mov_b32_e32 v31, v57
+	v_mov_b32_e32 v30, v57
+	v_mov_b32_e32 v29, v57
+	v_mov_b32_e32 v28, v57
+	v_mov_b32_e32 v27, v57
+	v_mov_b32_e32 v26, v57
+	v_mov_b32_e32 v122, v57
+.LBB0_21:                               ; %Flow542
+	.loc	1 502 39 is_stmt 1              ; mla_decode_mi355.py:502:39
+	v_mfma_f32_16x16x32_fp8_fp8 v[90:93], v[58:59], v[18:19], 0
+	s_load_dwordx4 s[12:15], s[0:1], 0x50
+	s_load_dwordx2 s[6:7], s[0:1], 0x60
+	.loc	1 505 32                        ; mla_decode_mi355.py:505:32
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	.loc	1 502 39                        ; mla_decode_mi355.py:502:39
+	v_mfma_f32_16x16x32_fp8_fp8 v[58:61], v[60:61], v[22:23], v[90:93]
+	.loc	1 518 37                        ; mla_decode_mi355.py:518:37
+	s_lshl_b32 s0, s29, 6
+	.loc	1 512 27                        ; mla_decode_mi355.py:512:27
+	v_add_u32_e32 v22, 0, v166
+	.loc	1 502 39                        ; mla_decode_mi355.py:502:39
+	v_mfma_f32_16x16x32_fp8_fp8 v[18:21], v[70:71], v[20:21], v[58:61]
+	.loc	1 518 37                        ; mla_decode_mi355.py:518:37
+	s_sub_i32 s0, s0, 64
+	.loc	1 512 27                        ; mla_decode_mi355.py:512:27
+	v_add_u32_e32 v71, 0, v168
+	.loc	1 502 39                        ; mla_decode_mi355.py:502:39
+	v_mfma_f32_16x16x32_fp8_fp8 v[18:21], v[72:73], v[24:25], v[18:21]
+	.loc	1 521 82                        ; mla_decode_mi355.py:521:82
+	v_mov_b32_e32 v25, 0xff800000
+	.loc	1 502 39                        ; mla_decode_mi355.py:502:39
+	v_mfma_f32_16x16x32_fp8_fp8 v[18:21], v[66:67], v[10:11], v[18:21]
+	.loc	1 518 77                        ; mla_decode_mi355.py:518:77
+	v_and_b32_e32 v67, 0xf0, v0
+	v_lshrrev_b32_e32 v70, 2, v67
+	.loc	1 502 39                        ; mla_decode_mi355.py:502:39
+	v_mov_b32_e32 v66, 0
+	v_mfma_f32_16x16x32_fp8_fp8 v[18:21], v[68:69], v[14:15], v[18:21]
+	.loc	1 505 32                        ; mla_decode_mi355.py:505:32
+	v_add_u32_e32 v14, v169, v164
+	.loc	1 512 27                        ; mla_decode_mi355.py:512:27
+	v_add_u32_e32 v69, 0, v167
+	.loc	1 502 39                        ; mla_decode_mi355.py:502:39
+	v_mfma_f32_16x16x32_fp8_fp8 v[10:13], v[62:63], v[12:13], v[18:21]
+	v_mfma_f32_16x16x32_fp8_fp8 v[10:13], v[64:65], v[16:17], v[10:13]
+	.loc	1 503 39                        ; mla_decode_mi355.py:503:39
+	v_mfma_f32_16x16x32_fp8_fp8 v[10:13], v[86:87], v[136:137], v[10:13]
+	v_mfma_f32_16x16x32_fp8_fp8 v[10:13], v[88:89], v[138:139], v[10:13]
+	v_mfma_f32_16x16x32_fp8_fp8 v[10:13], v[82:83], v[2:3], v[10:13]
+	v_mfma_f32_16x16x32_fp8_fp8 v[10:13], v[84:85], v[6:7], v[10:13]
+	.loc	1 512 27                        ; mla_decode_mi355.py:512:27
+	v_add_u32_e32 v6, 0, v165
+	.loc	1 503 39                        ; mla_decode_mi355.py:503:39
+	v_mfma_f32_16x16x32_fp8_fp8 v[2:5], v[78:79], v[4:5], v[10:13]
+	.loc	1 505 32                        ; mla_decode_mi355.py:505:32
+	s_nop 4
+	ds_read_b128 v[10:13], v14 offset:32768
+	.loc	1 512 27                        ; mla_decode_mi355.py:512:27
+	ds_read_b128 v[62:65], v6
+	.loc	1 503 39                        ; mla_decode_mi355.py:503:39
+	v_mfma_f32_16x16x32_fp8_fp8 v[14:17], v[80:81], v[8:9], v[2:5]
+	.loc	1 512 27                        ; mla_decode_mi355.py:512:27
+	ds_read_b128 v[58:61], v22
+	.loc	1 513 27                        ; mla_decode_mi355.py:513:27
+	ds_read_b128 v[6:9], v6 offset:16384
+	.loc	1 512 27                        ; mla_decode_mi355.py:512:27
+	ds_read_b128 v[18:21], v69
+	.loc	1 513 27                        ; mla_decode_mi355.py:513:27
+	ds_read_b128 v[2:5], v22 offset:16384
+	.loc	1 518 55                        ; mla_decode_mi355.py:518:55
+	v_or_b32_e32 v22, s0, v70
+	v_or_b32_e32 v23, 1, v22
+	.loc	1 503 39                        ; mla_decode_mi355.py:503:39
+	v_mfma_f32_16x16x32_fp8_fp8 v[14:17], v[74:75], v[134:135], v[14:17]
+	.loc	1 521 30                        ; mla_decode_mi355.py:521:30
+	v_cmp_gt_i32_e32 vcc, s9, v22
+	.loc	1 518 55                        ; mla_decode_mi355.py:518:55
+	v_or_b32_e32 v24, 2, v22
+	v_or_b32_e32 v72, 3, v22
+	.loc	1 503 39                        ; mla_decode_mi355.py:503:39
+	v_mfma_f32_16x16x32_fp8_fp8 v[14:17], v[76:77], v[132:133], v[14:17]
+	.loc	1 507 43                        ; mla_decode_mi355.py:507:43
+	s_waitcnt lgkmcnt(5)
+	v_mfma_f32_16x16x32_fp8_fp8 v[14:17], v[10:11], v[142:143], v[14:17]
+	v_mfma_f32_16x16x32_fp8_fp8 v[10:13], v[12:13], v[140:141], v[14:17]
+	.loc	1 515 10                        ; mla_decode_mi355.py:515:10
+	s_nop 6
+	v_mul_f32_e32 v10, s8, v10
+	v_mul_f32_e32 v11, s8, v11
+	.loc	1 521 82                        ; mla_decode_mi355.py:521:82
+	v_cndmask_b32_e32 v68, v25, v10, vcc
+	.loc	1 521 30 is_stmt 0              ; mla_decode_mi355.py:521:30
+	v_cmp_gt_i32_e32 vcc, s9, v23
+	.loc	1 515 10 is_stmt 1              ; mla_decode_mi355.py:515:10
+	v_mul_f32_e32 v12, s8, v12
+	v_mul_f32_e32 v13, s8, v13
+	.loc	1 521 82                        ; mla_decode_mi355.py:521:82
+	v_cndmask_b32_e32 v73, v25, v11, vcc
+	.loc	1 521 30 is_stmt 0              ; mla_decode_mi355.py:521:30
+	v_cmp_gt_i32_e32 vcc, s9, v24
+.Ltmp34:
+	.loc	2 168 27 is_stmt 1              ; standard.py:168:27 @[ standard.py:189:40 @[ mla_decode_mi355.py:526:43 ] ]
+	v_max_f32_e32 v10, v68, v73
+.Ltmp35:
+	.loc	1 521 82                        ; mla_decode_mi355.py:521:82
+	s_nop 0
+	v_cndmask_b32_e32 v74, v25, v12, vcc
+	.loc	1 521 30 is_stmt 0              ; mla_decode_mi355.py:521:30
+	v_cmp_gt_i32_e32 vcc, s9, v72
+	.loc	1 521 82                        ; mla_decode_mi355.py:521:82
+	s_nop 1
+	v_cndmask_b32_e32 v75, v25, v13, vcc
+.Ltmp36:
+	.loc	2 168 27 is_stmt 1              ; standard.py:168:27 @[ standard.py:189:40 @[ mla_decode_mi355.py:526:43 ] ]
+	v_max3_f32 v72, v10, v74, v75
+.Ltmp37:
+	.loc	2 189 40                        ; standard.py:189:40 @[ mla_decode_mi355.py:526:43 ]
+	ds_bpermute_b32 v76, v161, v72
+.Ltmp38:
+	.loc	1 512 27                        ; mla_decode_mi355.py:512:27
+	ds_read_b128 v[22:25], v71
+	.loc	1 513 27                        ; mla_decode_mi355.py:513:27
+	ds_read_b128 v[14:17], v69 offset:16384
+	ds_read_b128 v[10:13], v71 offset:16384
+.Ltmp39:
+	.loc	2 189 40                        ; standard.py:189:40 @[ mla_decode_mi355.py:526:43 ]
+	v_cmp_gt_u32_e32 vcc, 16, v157
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+.Ltmp40:
+	.loc	2 168 27                        ; standard.py:168:27 @[ standard.py:189:40 @[ mla_decode_mi355.py:526:43 ] ]
+	v_max_f32_e32 v69, v76, v76
+	v_max_f32_e32 v71, v72, v69
+.Ltmp41:
+	.loc	2 189 40                        ; standard.py:189:40 @[ mla_decode_mi355.py:526:43 ]
+	ds_swizzle_b32 v76, v71 offset:swizzle(SWAP,16)
+	v_add_u32_e32 v69, v169, v162
+	v_lshl_add_u32 v72, v163, 2, v69
+	s_waitcnt lgkmcnt(0)
+	s_and_saveexec_b64 s[0:1], vcc
+; %bb.22:
+	.loc	2 0 40 is_stmt 0                ; standard.py:0:40
+	v_max_f32_e32 v76, v76, v76
+	v_max_f32_e32 v71, v71, v71
+	v_max_f32_e32 v71, v71, v76
+	.loc	2 189 40                        ; standard.py:189:40 @[ mla_decode_mi355.py:526:43 ]
+	ds_write_b32 v72, v71 offset:32768
+; %bb.23:
+	.loc	2 0 40                          ; standard.py:0:40
+	s_or_b64 exec, exec, s[0:1]
+	.loc	2 189 40                        ; standard.py:189:40 @[ mla_decode_mi355.py:526:43 ]
+	v_cmp_gt_u32_e64 s[0:1], 64, v0
+	v_lshl_add_u32 v71, v0, 2, 0
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	s_and_saveexec_b64 s[4:5], s[0:1]
+; %bb.24:
+	ds_read_b32 v66, v71 offset:32768
+; %bb.25:
+	.loc	2 0 40                          ; standard.py:0:40
+	s_or_b64 exec, exec, s[4:5]
+.Ltmp42:
+	.loc	2 168 27 is_stmt 1              ; standard.py:168:27 @[ standard.py:189:40 @[ mla_decode_mi355.py:526:43 ] ]
+	s_waitcnt lgkmcnt(0)
+	v_max_f32_e32 v0, v66, v66
+.Ltmp43:
+	.loc	2 189 40                        ; standard.py:189:40 @[ mla_decode_mi355.py:526:43 ]
+	v_mov_b32_dpp v66, v66 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf
+.Ltmp44:
+	.loc	2 168 27                        ; standard.py:168:27 @[ standard.py:189:40 @[ mla_decode_mi355.py:526:43 ] ]
+	v_max_f32_e32 v66, v66, v66
+	v_max_f32_e32 v0, v0, v66
+.Ltmp45:
+	.loc	2 189 40                        ; standard.py:189:40 @[ mla_decode_mi355.py:526:43 ]
+	v_mov_b32_e32 v66, v0
+	v_cmp_eq_u32_e64 s[4:5], 0, v149
+	s_and_b64 s[4:5], s[0:1], s[4:5]
+	v_mov_b32_dpp v66, v66 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+	s_and_saveexec_b64 s[8:9], s[4:5]
+; %bb.26:
+	.loc	2 0 40 is_stmt 0                ; standard.py:0:40
+	v_max_f32_e32 v66, v66, v66
+	v_max_f32_e32 v0, v0, v0
+	v_max_f32_e32 v0, v0, v66
+	.loc	2 189 40                        ; standard.py:189:40 @[ mla_decode_mi355.py:526:43 ]
+	ds_write_b32 v71, v0 offset:32768
+; %bb.27:
+	.loc	2 0 40                          ; standard.py:0:40
+	s_or_b64 exec, exec, s[8:9]
+	.loc	2 189 40                        ; standard.py:189:40 @[ mla_decode_mi355.py:526:43 ]
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	ds_read_b32 v0, v69 offset:32768
+.Ltmp46:
+	.loc	1 528 34 is_stmt 1              ; mla_decode_mi355.py:528:34
+	v_max_f32_e32 v66, v183, v183
+	s_waitcnt lgkmcnt(0)
+	v_max_f32_e32 v0, v0, v0
+	v_max_f32_e32 v66, v0, v66
+	.loc	1 530 27                        ; mla_decode_mi355.py:530:27
+	v_sub_f32_e32 v0, v68, v66
+	v_sub_f32_e32 v68, v73, v66
+	v_sub_f32_e32 v73, v74, v66
+	.loc	1 530 47 is_stmt 0              ; mla_decode_mi355.py:530:47
+	v_mul_f32_e32 v0, 0x3fb8aa3b, v0
+	v_mul_f32_e32 v68, 0x3fb8aa3b, v68
+	.loc	1 530 27                        ; mla_decode_mi355.py:530:27
+	v_sub_f32_e32 v74, v75, v66
+	.loc	1 530 47                        ; mla_decode_mi355.py:530:47
+	v_mul_f32_e32 v73, 0x3fb8aa3b, v73
+	.loc	1 530 21                        ; mla_decode_mi355.py:530:21
+	v_exp_f32_e32 v0, v0
+	v_exp_f32_e32 v68, v68
+	.loc	1 530 47                        ; mla_decode_mi355.py:530:47
+	v_mul_f32_e32 v74, 0x3fb8aa3b, v74
+	.loc	1 530 21                        ; mla_decode_mi355.py:530:21
+	v_exp_f32_e32 v73, v73
+	v_exp_f32_e32 v74, v74
+	.loc	1 535 22 is_stmt 1              ; mla_decode_mi355.py:535:22
+	v_cvt_pk_fp8_f32 v75, v0, v68
+.Ltmp47:
+	.loc	2 261 15                        ; standard.py:261:15 @[ standard.py:291:36 @[ mla_decode_mi355.py:539:41 ] ]
+	v_add_f32_e32 v0, v0, v68
+	v_add_f32_e32 v0, v73, v0
+	v_add_f32_e32 v76, v74, v0
+.Ltmp48:
+	.loc	2 291 36                        ; standard.py:291:36 @[ mla_decode_mi355.py:539:41 ]
+	ds_bpermute_b32 v77, v161, v76
+.Ltmp49:
+	.loc	1 535 17                        ; mla_decode_mi355.py:535:17
+	v_mad_u32_u24 v68, v131, 48, v69
+	.loc	1 535 22 is_stmt 0              ; mla_decode_mi355.py:535:22
+	v_cvt_pk_fp8_f32 v75, v73, v74 op_sel:[0,0,1]
+	.loc	1 535 17                        ; mla_decode_mi355.py:535:17
+	v_xad_u32 v74, v154, v70, v68
+	.loc	1 529 37 is_stmt 1              ; mla_decode_mi355.py:529:37
+	v_sub_f32_e32 v0, v183, v66
+.Ltmp50:
+	.loc	2 261 15                        ; standard.py:261:15 @[ standard.py:291:36 @[ mla_decode_mi355.py:539:41 ] ]
+	s_waitcnt lgkmcnt(0)
+	v_add_f32_e32 v70, v76, v77
+.Ltmp51:
+	.loc	2 291 36                        ; standard.py:291:36 @[ mla_decode_mi355.py:539:41 ]
+	ds_swizzle_b32 v73, v70 offset:swizzle(SWAP,16)
+.Ltmp52:
+	.loc	1 535 17                        ; mla_decode_mi355.py:535:17
+	ds_write_b32 v74, v75 offset:36864
+.Ltmp53:
+	.loc	2 291 36                        ; standard.py:291:36 @[ mla_decode_mi355.py:539:41 ]
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	s_and_saveexec_b64 s[8:9], vcc
+; %bb.28:
+	.loc	2 0 36 is_stmt 0                ; standard.py:0:36
+	v_add_f32_e32 v70, v70, v73
+	.loc	2 291 36                        ; standard.py:291:36 @[ mla_decode_mi355.py:539:41 ]
+	ds_write_b32 v72, v70 offset:32768
+.Ltmp54:
+; %bb.29:
+	.loc	2 0 36                          ; standard.py:0:36
+	s_or_b64 exec, exec, s[8:9]
+	v_mul_f32_e32 v0, 0x3fb8aa3b, v0
+	v_mov_b32_e32 v70, 0
+.Ltmp55:
+	.loc	2 291 36                        ; standard.py:291:36 @[ mla_decode_mi355.py:539:41 ]
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	s_and_saveexec_b64 s[8:9], s[0:1]
+; %bb.30:
+	ds_read_b32 v70, v71 offset:32768
+; %bb.31:
+	.loc	2 0 36                          ; standard.py:0:36
+	s_or_b64 exec, exec, s[8:9]
+	.loc	2 291 36                        ; standard.py:291:36 @[ mla_decode_mi355.py:539:41 ]
+	s_waitcnt lgkmcnt(0)
+	v_mov_b32_e32 v72, v70
+.Ltmp56:
+	.loc	1 0 0                           ; mla_decode_mi355.py:0
+	v_exp_f32_e32 v0, v0
+.Ltmp57:
+	.loc	2 291 36                        ; standard.py:291:36 @[ mla_decode_mi355.py:539:41 ]
+	s_nop 0
+	v_mov_b32_dpp v72, v72 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf
+.Ltmp58:
+	.loc	2 261 15 is_stmt 1              ; standard.py:261:15 @[ standard.py:291:36 @[ mla_decode_mi355.py:539:41 ] ]
+	v_add_f32_e32 v70, v70, v72
+.Ltmp59:
+	.loc	2 291 36                        ; standard.py:291:36 @[ mla_decode_mi355.py:539:41 ]
+	v_mov_b32_e32 v72, v70
+	s_nop 1
+	v_mov_b32_dpp v72, v72 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+	s_and_saveexec_b64 s[8:9], s[4:5]
+; %bb.32:
+	.loc	2 0 36 is_stmt 0                ; standard.py:0:36
+	v_add_f32_e32 v70, v70, v72
+	.loc	2 291 36                        ; standard.py:291:36 @[ mla_decode_mi355.py:539:41 ]
+	ds_write_b32 v71, v70 offset:32768
+; %bb.33:
+	.loc	2 0 36                          ; standard.py:0:36
+	s_or_b64 exec, exec, s[8:9]
+	.loc	2 291 36                        ; standard.py:291:36 @[ mla_decode_mi355.py:539:41 ]
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	ds_read_b32 v69, v69 offset:32768
+.Ltmp60:
+	.loc	1 539 31 is_stmt 1              ; mla_decode_mi355.py:539:31
+	s_waitcnt lgkmcnt(0)
+	v_fmac_f32_e32 v69, v122, v0
+	; sched_barrier mask(0x00000000)
+	.loc	1 541 24                        ; mla_decode_mi355.py:541:24
+	ds_read_b64 v[70:71], v155 offset:36864
+	ds_read_b64 v[72:73], v156 offset:36864
+	.loc	1 544 44                        ; mla_decode_mi355.py:544:44
+	v_pk_mul_f32 v[52:53], v[52:53], v[0:1] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[50:51], v[50:51], v[0:1] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[44:45], v[44:45], v[0:1] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[42:43], v[42:43], v[0:1] op_sel_hi:[1,0]
+	s_waitcnt lgkmcnt(1)
+	v_mfma_f32_16x16x32_fp8_fp8 v[50:53], v[18:19], v[70:71], v[50:53]
+	.loc	1 545 44                        ; mla_decode_mi355.py:545:44
+	v_pk_mul_f32 v[40:41], v[40:41], v[0:1] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[38:39], v[38:39], v[0:1] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[36:37], v[36:37], v[0:1] op_sel_hi:[1,0]
+	.loc	1 544 44                        ; mla_decode_mi355.py:544:44
+	s_waitcnt lgkmcnt(0)
+	v_mfma_f32_16x16x32_fp8_fp8 v[18:21], v[20:21], v[72:73], v[50:53]
+	.loc	1 545 44                        ; mla_decode_mi355.py:545:44
+	v_pk_mul_f32 v[34:35], v[34:35], v[0:1] op_sel_hi:[1,0]
+	.loc	1 544 44                        ; mla_decode_mi355.py:544:44
+	v_pk_mul_f32 v[56:57], v[56:57], v[0:1] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[54:55], v[54:55], v[0:1] op_sel_hi:[1,0]
+	.loc	1 562 16                        ; mla_decode_mi355.py:562:16
+	v_div_scale_f32 v50, s[4:5], v69, v69, 1.0
+	v_rcp_f32_e32 v51, v50
+	.loc	1 544 44                        ; mla_decode_mi355.py:544:44
+	v_mfma_f32_16x16x32_fp8_fp8 v[42:45], v[22:23], v[70:71], v[42:45]
+	v_pk_mul_f32 v[48:49], v[48:49], v[0:1] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[46:47], v[46:47], v[0:1] op_sel_hi:[1,0]
+	.loc	1 545 44                        ; mla_decode_mi355.py:545:44
+	v_pk_mul_f32 v[32:33], v[32:33], v[0:1] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[30:31], v[30:31], v[0:1] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[28:29], v[28:29], v[0:1] op_sel_hi:[1,0]
+	v_pk_mul_f32 v[26:27], v[26:27], v[0:1] op_sel_hi:[1,0]
+	.loc	1 562 16                        ; mla_decode_mi355.py:562:16
+	v_fma_f32 v0, -v50, v51, 1.0
+	.loc	1 545 44                        ; mla_decode_mi355.py:545:44
+	v_mfma_f32_16x16x32_fp8_fp8 v[38:41], v[6:7], v[70:71], v[38:41]
+	.loc	1 562 16                        ; mla_decode_mi355.py:562:16
+	v_fmac_f32_e32 v51, v0, v51
+	v_div_scale_f32 v0, vcc, 1.0, v69, 1.0
+	.loc	1 545 44                        ; mla_decode_mi355.py:545:44
+	v_mfma_f32_16x16x32_fp8_fp8 v[34:37], v[2:3], v[70:71], v[34:37]
+	.loc	1 563 17                        ; mla_decode_mi355.py:563:17
+	v_lshlrev_b32_e32 v2, 5, v153
+	.loc	1 568 20                        ; mla_decode_mi355.py:568:20
+	s_mul_i32 s4, s12, s28
+	.loc	1 570 24                        ; mla_decode_mi355.py:570:24
+	s_mul_i32 s5, s14, s33
+	.loc	1 545 44                        ; mla_decode_mi355.py:545:44
+	v_mfma_f32_16x16x32_fp8_fp8 v[30:33], v[14:15], v[70:71], v[30:33]
+	.loc	1 570 10                        ; mla_decode_mi355.py:570:10
+	s_add_i32 s5, s5, s4
+	.loc	1 584 8                         ; mla_decode_mi355.py:584:8
+	s_and_b32 s21, s21, 0xffff
+	s_mov_b32 s23, 0x27000
+	.loc	1 544 44                        ; mla_decode_mi355.py:544:44
+	v_mfma_f32_16x16x32_fp8_fp8 v[22:25], v[24:25], v[72:73], v[42:45]
+	s_mov_b32 s22, 0x7ffffffe
+	s_mov_b32 s4, 0x800000
+	.loc	1 598 8                         ; mla_decode_mi355.py:598:8
+	s_and_b32 s25, s25, 0xffff
+	.loc	1 562 16                        ; mla_decode_mi355.py:562:16
+	v_mul_f32_e32 v42, v0, v51
+	.loc	1 545 44                        ; mla_decode_mi355.py:545:44
+	v_mfma_f32_16x16x32_fp8_fp8 v[26:29], v[10:11], v[70:71], v[26:29]
+	.loc	1 562 16                        ; mla_decode_mi355.py:562:16
+	v_fma_f32 v6, -v50, v42, v0
+	v_fmac_f32_e32 v42, v6, v51
+	v_fma_f32 v0, -v50, v42, v0
+	.loc	1 544 44                        ; mla_decode_mi355.py:544:44
+	v_mfma_f32_16x16x32_fp8_fp8 v[54:57], v[62:63], v[70:71], v[54:57]
+	.loc	1 562 16                        ; mla_decode_mi355.py:562:16
+	v_div_fmas_f32 v0, v0, v51, v42
+	v_div_fixup_f32 v0, v0, v69, 1.0
+	.loc	1 563 17                        ; mla_decode_mi355.py:563:17
+	v_pk_mul_f32 v[20:21], v[0:1], v[20:21] op_sel_hi:[0,1]
+	.loc	1 544 44                        ; mla_decode_mi355.py:544:44
+	v_mfma_f32_16x16x32_fp8_fp8 v[46:49], v[58:59], v[70:71], v[46:49]
+	.loc	1 563 17                        ; mla_decode_mi355.py:563:17
+	v_pk_mul_f32 v[18:19], v[0:1], v[18:19] op_sel_hi:[0,1]
+	.loc	1 595 36                        ; mla_decode_mi355.py:595:36
+	v_cmp_gt_f32_e32 vcc, s4, v0
+	s_mov_b32 s4, 0x3f317217
+	.loc	1 545 44                        ; mla_decode_mi355.py:545:44
+	v_mfma_f32_16x16x32_fp8_fp8 v[6:9], v[8:9], v[72:73], v[38:41]
+	.loc	1 598 8                         ; mla_decode_mi355.py:598:8
+	s_mov_b32 s26, s22
+	s_mov_b32 s27, s23
+	.loc	1 563 17                        ; mla_decode_mi355.py:563:17
+	s_nop 0
+	v_xor_b32_e32 v38, v2, v67
+	.loc	1 545 44                        ; mla_decode_mi355.py:545:44
+	v_mfma_f32_16x16x32_fp8_fp8 v[2:5], v[4:5], v[72:73], v[34:37]
+	.loc	1 563 17                        ; mla_decode_mi355.py:563:17
+	v_mul_u32_u24_e32 v39, 0x7c0, v131
+	v_add3_u32 v38, v68, v39, v38
+	ds_write_b128 v38, v[18:21] offset:512
+	.loc	1 545 44                        ; mla_decode_mi355.py:545:44
+	v_mfma_f32_16x16x32_fp8_fp8 v[14:17], v[16:17], v[72:73], v[30:33]
+	.loc	1 563 17                        ; mla_decode_mi355.py:563:17
+	v_pk_mul_f32 v[20:21], v[0:1], v[24:25] op_sel_hi:[0,1]
+	s_nop 1
+	v_pk_mul_f32 v[4:5], v[0:1], v[4:5] op_sel_hi:[0,1]
+	v_pk_mul_f32 v[2:3], v[0:1], v[2:3] op_sel_hi:[0,1]
+	.loc	1 545 44                        ; mla_decode_mi355.py:545:44
+	v_mfma_f32_16x16x32_fp8_fp8 v[10:13], v[12:13], v[72:73], v[26:29]
+	.loc	1 563 17                        ; mla_decode_mi355.py:563:17
+	ds_write_b128 v38, v[2:5] offset:1280
+	v_pk_mul_f32 v[4:5], v[0:1], v[16:17] op_sel_hi:[0,1]
+	v_pk_mul_f32 v[2:3], v[0:1], v[14:15] op_sel_hi:[0,1]
+	.loc	1 544 44                        ; mla_decode_mi355.py:544:44
+	v_mfma_f32_16x16x32_fp8_fp8 v[54:57], v[64:65], v[72:73], v[54:57]
+	.loc	1 563 17                        ; mla_decode_mi355.py:563:17
+	ds_write_b128 v38, v[2:5] offset:1536
+	s_nop 1
+	v_pk_mul_f32 v[4:5], v[0:1], v[12:13] op_sel_hi:[0,1]
+	v_pk_mul_f32 v[2:3], v[0:1], v[10:11] op_sel_hi:[0,1]
+	.loc	1 544 44                        ; mla_decode_mi355.py:544:44
+	v_mfma_f32_16x16x32_fp8_fp8 v[46:49], v[60:61], v[72:73], v[46:49]
+	.loc	1 563 17                        ; mla_decode_mi355.py:563:17
+	ds_write_b128 v38, v[2:5] offset:1792
+	v_pk_mul_f32 v[36:37], v[0:1], v[56:57] op_sel_hi:[0,1]
+	v_pk_mul_f32 v[34:35], v[0:1], v[54:55] op_sel_hi:[0,1]
+	.loc	1 565 24                        ; mla_decode_mi355.py:565:24
+	v_lshlrev_b32_e32 v2, 6, v149
+	v_lshlrev_b32_e32 v3, 2, v151
+	.loc	1 563 17                        ; mla_decode_mi355.py:563:17
+	ds_write_b128 v38, v[34:37]
+	s_nop 0
+	v_pk_mul_f32 v[36:37], v[0:1], v[48:49] op_sel_hi:[0,1]
+	v_pk_mul_f32 v[34:35], v[0:1], v[46:47] op_sel_hi:[0,1]
+	v_pk_mul_f32 v[18:19], v[0:1], v[22:23] op_sel_hi:[0,1]
+	.loc	1 565 24                        ; mla_decode_mi355.py:565:24
+	v_lshl_or_b32 v2, v148, 9, v2
+	v_lshl_or_b32 v3, v152, 3, v3
+	.loc	1 563 17                        ; mla_decode_mi355.py:563:17
+	ds_write_b128 v38, v[34:37] offset:256
+	ds_write_b128 v38, v[18:21] offset:768
+	.loc	1 565 24                        ; mla_decode_mi355.py:565:24
+	v_xor_b32_e32 v18, v2, v3
+	.loc	1 569 30                        ; mla_decode_mi355.py:569:30
+	v_mul_lo_u32 v34, s13, v145
+	.loc	1 563 17                        ; mla_decode_mi355.py:563:17
+	v_pk_mul_f32 v[8:9], v[0:1], v[8:9] op_sel_hi:[0,1]
+	v_pk_mul_f32 v[6:7], v[0:1], v[6:7] op_sel_hi:[0,1]
+	.loc	1 565 24                        ; mla_decode_mi355.py:565:24
+	v_add_u32_e32 v14, 0, v18
+	.loc	1 570 10                        ; mla_decode_mi355.py:570:10
+	v_add_u32_e32 v34, s5, v34
+	.loc	1 563 17                        ; mla_decode_mi355.py:563:17
+	ds_write_b128 v38, v[6:9] offset:1024
+	.loc	1 565 24                        ; mla_decode_mi355.py:565:24
+	s_waitcnt lgkmcnt(0)
+	s_barrier
+	ds_read_b128 v[2:5], v14
+	ds_read_b128 v[6:9], v14 offset:16
+	ds_read_b128 v[10:13], v14 offset:1024
+	ds_read_b128 v[14:17], v14 offset:1040
+	.loc	1 571 10                        ; mla_decode_mi355.py:571:10
+	v_add_lshl_u32 v35, v34, v130, 2
+	.loc	1 584 8                         ; mla_decode_mi355.py:584:8
+	v_bfrev_b32_e32 v36, 1
+	.loc	1 565 24                        ; mla_decode_mi355.py:565:24
+	v_xad_u32 v30, v18, 32, 0
+	.loc	1 584 8                         ; mla_decode_mi355.py:584:8
+	v_cndmask_b32_e64 v37, v36, v35, s[2:3]
+	.loc	1 565 24                        ; mla_decode_mi355.py:565:24
+	ds_read_b128 v[18:21], v30
+	ds_read_b128 v[22:25], v30 offset:16
+	ds_read_b128 v[26:29], v30 offset:1024
+	ds_read_b128 v[30:33], v30 offset:1040
+	.loc	1 584 8                         ; mla_decode_mi355.py:584:8
+	s_waitcnt lgkmcnt(7)
+	buffer_store_dwordx4 v[2:5], v37, s[20:23], 0 offen
+	v_add_lshl_u32 v1, v34, v1, 2
+	v_cndmask_b32_e64 v1, v36, v1, s[2:3]
+	v_add_u32_e32 v2, 16, v35
+	v_cndmask_b32_e64 v2, v36, v2, s[2:3]
+	s_waitcnt lgkmcnt(6)
+	buffer_store_dwordx4 v[6:9], v2, s[20:23], 0 offen
+	v_add_u32_e32 v2, 32, v35
+	v_cndmask_b32_e64 v2, v36, v2, s[2:3]
+	s_waitcnt lgkmcnt(3)
+	buffer_store_dwordx4 v[18:21], v2, s[20:23], 0 offen
+	v_add_u32_e32 v2, 48, v35
+	v_cndmask_b32_e64 v2, v36, v2, s[2:3]
+	s_waitcnt lgkmcnt(2)
+	buffer_store_dwordx4 v[22:25], v2, s[20:23], 0 offen
+	.loc	1 595 36                        ; mla_decode_mi355.py:595:36
+	v_cndmask_b32_e64 v2, 0, 32, vcc
+	v_ldexp_f32 v0, v0, v2
+	v_log_f32_e32 v0, v0
+	.loc	1 584 8                         ; mla_decode_mi355.py:584:8
+	buffer_store_dwordx4 v[10:13], v1, s[20:23], 0 offen
+	v_add_u32_e32 v1, 0x410, v35
+	v_cndmask_b32_e64 v1, v36, v1, s[2:3]
+	.loc	1 595 36                        ; mla_decode_mi355.py:595:36
+	v_mul_f32_e32 v2, 0x3f317217, v0
+	.loc	1 584 8                         ; mla_decode_mi355.py:584:8
+	buffer_store_dwordx4 v[14:17], v1, s[20:23], 0 offen
+	v_add_u32_e32 v1, 0x420, v35
+	.loc	1 595 36                        ; mla_decode_mi355.py:595:36
+	v_fma_f32 v2, v0, s4, -v2
+	.loc	1 584 8                         ; mla_decode_mi355.py:584:8
+	v_cndmask_b32_e64 v1, v36, v1, s[2:3]
+	.loc	1 595 36                        ; mla_decode_mi355.py:595:36
+	v_fmamk_f32 v2, v0, 0x3377d1cf, v2
+	s_mov_b32 s4, 0x7f800000
+	.loc	1 584 8                         ; mla_decode_mi355.py:584:8
+	s_waitcnt lgkmcnt(1)
+	buffer_store_dwordx4 v[26:29], v1, s[20:23], 0 offen
+	v_add_u32_e32 v1, 0x430, v35
+	.loc	1 595 36                        ; mla_decode_mi355.py:595:36
+	v_fmac_f32_e32 v2, 0x3f317217, v0
+	v_cmp_lt_f32_e64 s[4:5], |v0|, s4
+	.loc	1 584 8                         ; mla_decode_mi355.py:584:8
+	v_cndmask_b32_e64 v1, v36, v1, s[2:3]
+	.loc	1 588 20                        ; mla_decode_mi355.py:588:20
+	s_mul_i32 s2, s15, s28
+	.loc	1 590 24                        ; mla_decode_mi355.py:590:24
+	s_mul_i32 s3, s7, s33
+	.loc	1 595 36                        ; mla_decode_mi355.py:595:36
+	v_cndmask_b32_e64 v0, v0, v2, s[4:5]
+	v_mov_b32_e32 v2, 0x41b17218
+	.loc	1 584 8                         ; mla_decode_mi355.py:584:8
+	s_waitcnt lgkmcnt(0)
+	buffer_store_dwordx4 v[30:33], v1, s[20:23], 0 offen
+	.loc	1 589 20                        ; mla_decode_mi355.py:589:20
+	v_mul_lo_u32 v1, s6, v131
+	.loc	1 590 10                        ; mla_decode_mi355.py:590:10
+	s_add_i32 s6, s3, s2
+	.loc	1 593 25                        ; mla_decode_mi355.py:593:25
+	v_cmp_gt_u32_e64 s[2:3], 8, v131
+	.loc	1 595 36                        ; mla_decode_mi355.py:595:36
+	v_cndmask_b32_e32 v2, 0, v2, vcc
+	.loc	1 598 8                         ; mla_decode_mi355.py:598:8
+	v_cmp_eq_u32_e32 vcc, 0, v150
+	s_and_b64 s[2:3], vcc, s[2:3]
+	.loc	1 595 36                        ; mla_decode_mi355.py:595:36
+	v_sub_f32_e32 v0, v0, v2
+	.loc	1 598 8                         ; mla_decode_mi355.py:598:8
+	v_add_lshl_u32 v1, s6, v1, 2
+	s_and_b64 vcc, s[0:1], s[2:3]
+	.loc	1 595 29                        ; mla_decode_mi355.py:595:29
+	v_sub_f32_e32 v0, v66, v0
+	.loc	1 598 8                         ; mla_decode_mi355.py:598:8
+	v_cndmask_b32_e32 v1, v36, v1, vcc
+	buffer_store_dword v0, v1, s[24:27], 0 offen
+.LBB0_34:                               ; %common.ret
+	.loc	1 0 0 is_stmt 0                 ; mla_decode_mi355.py:0
+	s_endpgm
+.Ltmp61:
+	.section	.rodata,"a",@progbits
+	.p2align	6, 0x0
+	.amdhsa_kernel _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64
+		.amdhsa_group_segment_fixed_size 0
+		.amdhsa_private_segment_fixed_size 0
+		.amdhsa_kernarg_size 128
+		.amdhsa_user_sgpr_count 16
+		.amdhsa_user_sgpr_dispatch_ptr 0
+		.amdhsa_user_sgpr_queue_ptr 0
+		.amdhsa_user_sgpr_kernarg_segment_ptr 1
+		.amdhsa_user_sgpr_dispatch_id 0
+		.amdhsa_user_sgpr_kernarg_preload_length 14
+		.amdhsa_user_sgpr_kernarg_preload_offset 0
+		.amdhsa_user_sgpr_private_segment_size 0
+		.amdhsa_uses_dynamic_stack 0
+		.amdhsa_enable_private_segment 0
+		.amdhsa_system_sgpr_workgroup_id_x 1
+		.amdhsa_system_sgpr_workgroup_id_y 0
+		.amdhsa_system_sgpr_workgroup_id_z 0
+		.amdhsa_system_sgpr_workgroup_info 0
+		.amdhsa_system_vgpr_workitem_id 0
+		.amdhsa_next_free_vgpr 198
+		.amdhsa_next_free_sgpr 96
+		.amdhsa_accum_offset 200
+		.amdhsa_reserve_vcc 1
+		.amdhsa_reserve_xnack_mask 1
+		.amdhsa_float_round_mode_32 0
+		.amdhsa_float_round_mode_16_64 0
+		.amdhsa_float_denorm_mode_32 3
+		.amdhsa_float_denorm_mode_16_64 3
+		.amdhsa_dx10_clamp 1
+		.amdhsa_ieee_mode 1
+		.amdhsa_fp16_overflow 0
+		.amdhsa_tg_split 0
+		.amdhsa_exception_fp_ieee_invalid_op 0
+		.amdhsa_exception_fp_denorm_src 0
+		.amdhsa_exception_fp_ieee_div_zero 0
+		.amdhsa_exception_fp_ieee_overflow 0
+		.amdhsa_exception_fp_ieee_underflow 0
+		.amdhsa_exception_fp_ieee_inexact 0
+		.amdhsa_exception_int_div_zero 0
+	.end_amdhsa_kernel
+	.text
+.Lfunc_end0:
+	.size	_fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64, .Lfunc_end0-_fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64
+	.cfi_endproc
+                                        ; -- End function
+	.set _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64.num_vgpr, 198
+	.set _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64.num_agpr, 0
+	.set _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64.numbered_sgpr, 36
+	.set _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64.private_seg_size, 0
+	.set _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64.uses_vcc, 1
+	.set _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64.uses_flat_scratch, 0
+	.set _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64.has_dyn_sized_stack, 0
+	.set _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64.has_recursion, 0
+	.set _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64.has_indirect_call, 0
+	.section	.AMDGPU.csdata,"",@progbits
+; Kernel info:
+; codeLenInByte = 8744
+; TotalNumSgprs: 42
+; NumVgprs: 198
+; NumAgprs: 0
+; TotalNumVgprs: 198
+; ScratchSize: 0
+; MemoryBound: 0
+; FloatMode: 240
+; IeeeMode: 1
+; LDSByteSize: 0 bytes/workgroup (compile time only)
+; SGPRBlocks: 12
+; VGPRBlocks: 24
+; NumSGPRsForWavesPerEU: 102
+; NumVGPRsForWavesPerEU: 198
+; AccumOffset: 200
+; Occupancy: 2
+; WaveLimiterHint : 0
+; COMPUTE_PGM_RSRC2:SCRATCH_EN: 0
+; COMPUTE_PGM_RSRC2:USER_SGPR: 16
+; COMPUTE_PGM_RSRC2:TRAP_HANDLER: 0
+; COMPUTE_PGM_RSRC2:TGID_X_EN: 1
+; COMPUTE_PGM_RSRC2:TGID_Y_EN: 0
+; COMPUTE_PGM_RSRC2:TGID_Z_EN: 0
+; COMPUTE_PGM_RSRC2:TIDIG_COMP_CNT: 0
+; COMPUTE_PGM_RSRC3_GFX90A:ACCUM_OFFSET: 49
+; COMPUTE_PGM_RSRC3_GFX90A:TG_SPLIT: 0
+	.text
+	.p2alignl 6, 3212836864
+	.fill 256, 4, 3212836864
+	.section	.AMDGPU.gpr_maximums,"",@progbits
+	.set amdgpu.max_num_vgpr, 0
+	.set amdgpu.max_num_agpr, 0
+	.set amdgpu.max_num_sgpr, 0
+	.text
+	.section	.debug_abbrev,"",@progbits
+	.byte	1                               ; Abbreviation Code
+	.byte	17                              ; DW_TAG_compile_unit
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	37                              ; DW_AT_producer
+	.byte	14                              ; DW_FORM_strp
+	.byte	19                              ; DW_AT_language
+	.byte	5                               ; DW_FORM_data2
+	.byte	3                               ; DW_AT_name
+	.byte	14                              ; DW_FORM_strp
+	.byte	16                              ; DW_AT_stmt_list
+	.byte	23                              ; DW_FORM_sec_offset
+	.byte	27                              ; DW_AT_comp_dir
+	.byte	14                              ; DW_FORM_strp
+	.byte	17                              ; DW_AT_low_pc
+	.byte	1                               ; DW_FORM_addr
+	.byte	18                              ; DW_AT_high_pc
+	.byte	6                               ; DW_FORM_data4
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	2                               ; Abbreviation Code
+	.byte	46                              ; DW_TAG_subprogram
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	3                               ; DW_AT_name
+	.byte	14                              ; DW_FORM_strp
+	.byte	32                              ; DW_AT_inline
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	3                               ; Abbreviation Code
+	.byte	46                              ; DW_TAG_subprogram
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	17                              ; DW_AT_low_pc
+	.byte	1                               ; DW_FORM_addr
+	.byte	18                              ; DW_AT_high_pc
+	.byte	6                               ; DW_FORM_data4
+	.byte	49                              ; DW_AT_abstract_origin
+	.byte	19                              ; DW_FORM_ref4
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	4                               ; Abbreviation Code
+	.byte	29                              ; DW_TAG_inlined_subroutine
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	49                              ; DW_AT_abstract_origin
+	.byte	19                              ; DW_FORM_ref4
+	.byte	17                              ; DW_AT_low_pc
+	.byte	1                               ; DW_FORM_addr
+	.byte	18                              ; DW_AT_high_pc
+	.byte	6                               ; DW_FORM_data4
+	.byte	88                              ; DW_AT_call_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	89                              ; DW_AT_call_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	87                              ; DW_AT_call_column
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	5                               ; Abbreviation Code
+	.byte	29                              ; DW_TAG_inlined_subroutine
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	49                              ; DW_AT_abstract_origin
+	.byte	19                              ; DW_FORM_ref4
+	.byte	85                              ; DW_AT_ranges
+	.byte	23                              ; DW_FORM_sec_offset
+	.byte	88                              ; DW_AT_call_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	89                              ; DW_AT_call_line
+	.byte	5                               ; DW_FORM_data2
+	.byte	87                              ; DW_AT_call_column
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	6                               ; Abbreviation Code
+	.byte	29                              ; DW_TAG_inlined_subroutine
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	49                              ; DW_AT_abstract_origin
+	.byte	19                              ; DW_FORM_ref4
+	.byte	85                              ; DW_AT_ranges
+	.byte	23                              ; DW_FORM_sec_offset
+	.byte	88                              ; DW_AT_call_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	89                              ; DW_AT_call_line
+	.byte	11                              ; DW_FORM_data1
+	.byte	87                              ; DW_AT_call_column
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	7                               ; Abbreviation Code
+	.byte	29                              ; DW_TAG_inlined_subroutine
+	.byte	1                               ; DW_CHILDREN_yes
+	.byte	49                              ; DW_AT_abstract_origin
+	.byte	19                              ; DW_FORM_ref4
+	.byte	17                              ; DW_AT_low_pc
+	.byte	1                               ; DW_FORM_addr
+	.byte	18                              ; DW_AT_high_pc
+	.byte	6                               ; DW_FORM_data4
+	.byte	88                              ; DW_AT_call_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	89                              ; DW_AT_call_line
+	.byte	5                               ; DW_FORM_data2
+	.byte	87                              ; DW_AT_call_column
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	8                               ; Abbreviation Code
+	.byte	29                              ; DW_TAG_inlined_subroutine
+	.byte	0                               ; DW_CHILDREN_no
+	.byte	49                              ; DW_AT_abstract_origin
+	.byte	19                              ; DW_FORM_ref4
+	.byte	85                              ; DW_AT_ranges
+	.byte	23                              ; DW_FORM_sec_offset
+	.byte	88                              ; DW_AT_call_file
+	.byte	11                              ; DW_FORM_data1
+	.byte	89                              ; DW_AT_call_line
+	.byte	5                               ; DW_FORM_data2
+	.byte	87                              ; DW_AT_call_column
+	.byte	11                              ; DW_FORM_data1
+	.byte	0                               ; EOM(1)
+	.byte	0                               ; EOM(2)
+	.byte	0                               ; EOM(3)
+	.section	.debug_info,"",@progbits
+.Lcu_begin0:
+	.long	.Ldebug_info_end0-.Ldebug_info_start0 ; Length of Unit
+.Ldebug_info_start0:
+	.short	4                               ; DWARF version number
+	.long	.debug_abbrev                   ; Offset Into Abbrev. Section
+	.byte	8                               ; Address Size (in bytes)
+	.byte	1                               ; Abbrev [1] 0xb:0xd2 DW_TAG_compile_unit
+	.long	.Linfo_string0                  ; DW_AT_producer
+	.short	2                               ; DW_AT_language
+	.long	.Linfo_string1                  ; DW_AT_name
+	.long	.Lline_table_start0             ; DW_AT_stmt_list
+	.long	.Linfo_string2                  ; DW_AT_comp_dir
+	.quad	.Lfunc_begin0                   ; DW_AT_low_pc
+	.long	.Lfunc_end0-.Lfunc_begin0       ; DW_AT_high_pc
+	.byte	2                               ; Abbrev [2] 0x2a:0x6 DW_TAG_subprogram
+	.long	.Linfo_string3                  ; DW_AT_name
+	.byte	1                               ; DW_AT_inline
+	.byte	3                               ; Abbrev [3] 0x30:0xac DW_TAG_subprogram
+	.quad	.Lfunc_begin0                   ; DW_AT_low_pc
+	.long	.Lfunc_end0-.Lfunc_begin0       ; DW_AT_high_pc
+	.long	42                              ; DW_AT_abstract_origin
+	.byte	4                               ; Abbrev [4] 0x41:0x14 DW_TAG_inlined_subroutine
+	.long	42                              ; DW_AT_abstract_origin
+	.quad	.Ltmp2                          ; DW_AT_low_pc
+	.long	.Ltmp3-.Ltmp2                   ; DW_AT_high_pc
+	.byte	1                               ; DW_AT_call_file
+	.byte	229                             ; DW_AT_call_line
+	.byte	54                              ; DW_AT_call_column
+	.byte	4                               ; Abbrev [4] 0x55:0x14 DW_TAG_inlined_subroutine
+	.long	42                              ; DW_AT_abstract_origin
+	.quad	.Ltmp3                          ; DW_AT_low_pc
+	.long	.Ltmp4-.Ltmp3                   ; DW_AT_high_pc
+	.byte	1                               ; DW_AT_call_file
+	.byte	241                             ; DW_AT_call_line
+	.byte	53                              ; DW_AT_call_column
+	.byte	5                               ; Abbrev [5] 0x69:0x1a DW_TAG_inlined_subroutine
+	.long	42                              ; DW_AT_abstract_origin
+	.long	.Ldebug_ranges0                 ; DW_AT_ranges
+	.byte	1                               ; DW_AT_call_file
+	.short	526                             ; DW_AT_call_line
+	.byte	43                              ; DW_AT_call_column
+	.byte	6                               ; Abbrev [6] 0x76:0xc DW_TAG_inlined_subroutine
+	.long	42                              ; DW_AT_abstract_origin
+	.long	.Ldebug_ranges1                 ; DW_AT_ranges
+	.byte	2                               ; DW_AT_call_file
+	.byte	189                             ; DW_AT_call_line
+	.byte	40                              ; DW_AT_call_column
+	.byte	0                               ; End Of Children Mark
+	.byte	7                               ; Abbrev [7] 0x83:0x22 DW_TAG_inlined_subroutine
+	.long	42                              ; DW_AT_abstract_origin
+	.quad	.Ltmp7                          ; DW_AT_low_pc
+	.long	.Ltmp15-.Ltmp7                  ; DW_AT_high_pc
+	.byte	1                               ; DW_AT_call_file
+	.short	452                             ; DW_AT_call_line
+	.byte	47                              ; DW_AT_call_column
+	.byte	6                               ; Abbrev [6] 0x98:0xc DW_TAG_inlined_subroutine
+	.long	42                              ; DW_AT_abstract_origin
+	.long	.Ldebug_ranges2                 ; DW_AT_ranges
+	.byte	2                               ; DW_AT_call_file
+	.byte	189                             ; DW_AT_call_line
+	.byte	40                              ; DW_AT_call_column
+	.byte	0                               ; End Of Children Mark
+	.byte	5                               ; Abbrev [5] 0xa5:0x1b DW_TAG_inlined_subroutine
+	.long	42                              ; DW_AT_abstract_origin
+	.long	.Ldebug_ranges3                 ; DW_AT_ranges
+	.byte	1                               ; DW_AT_call_file
+	.short	469                             ; DW_AT_call_line
+	.byte	45                              ; DW_AT_call_column
+	.byte	8                               ; Abbrev [8] 0xb2:0xd DW_TAG_inlined_subroutine
+	.long	42                              ; DW_AT_abstract_origin
+	.long	.Ldebug_ranges4                 ; DW_AT_ranges
+	.byte	2                               ; DW_AT_call_file
+	.short	291                             ; DW_AT_call_line
+	.byte	36                              ; DW_AT_call_column
+	.byte	0                               ; End Of Children Mark
+	.byte	5                               ; Abbrev [5] 0xc0:0x1b DW_TAG_inlined_subroutine
+	.long	42                              ; DW_AT_abstract_origin
+	.long	.Ldebug_ranges5                 ; DW_AT_ranges
+	.byte	1                               ; DW_AT_call_file
+	.short	539                             ; DW_AT_call_line
+	.byte	41                              ; DW_AT_call_column
+	.byte	8                               ; Abbrev [8] 0xcd:0xd DW_TAG_inlined_subroutine
+	.long	42                              ; DW_AT_abstract_origin
+	.long	.Ldebug_ranges6                 ; DW_AT_ranges
+	.byte	2                               ; DW_AT_call_file
+	.short	291                             ; DW_AT_call_line
+	.byte	36                              ; DW_AT_call_column
+	.byte	0                               ; End Of Children Mark
+	.byte	0                               ; End Of Children Mark
+	.byte	0                               ; End Of Children Mark
+.Ldebug_info_end0:
+	.section	.debug_ranges,"",@progbits
+.Ldebug_ranges0:
+	.quad	.Ltmp5-.Lfunc_begin0
+	.quad	.Ltmp6-.Lfunc_begin0
+	.quad	.Ltmp34-.Lfunc_begin0
+	.quad	.Ltmp35-.Lfunc_begin0
+	.quad	.Ltmp36-.Lfunc_begin0
+	.quad	.Ltmp38-.Lfunc_begin0
+	.quad	.Ltmp39-.Lfunc_begin0
+	.quad	.Ltmp46-.Lfunc_begin0
+	.quad	0
+	.quad	0
+.Ldebug_ranges1:
+	.quad	.Ltmp34-.Lfunc_begin0
+	.quad	.Ltmp35-.Lfunc_begin0
+	.quad	.Ltmp36-.Lfunc_begin0
+	.quad	.Ltmp37-.Lfunc_begin0
+	.quad	.Ltmp40-.Lfunc_begin0
+	.quad	.Ltmp41-.Lfunc_begin0
+	.quad	.Ltmp42-.Lfunc_begin0
+	.quad	.Ltmp43-.Lfunc_begin0
+	.quad	.Ltmp44-.Lfunc_begin0
+	.quad	.Ltmp45-.Lfunc_begin0
+	.quad	0
+	.quad	0
+.Ldebug_ranges2:
+	.quad	.Ltmp7-.Lfunc_begin0
+	.quad	.Ltmp8-.Lfunc_begin0
+	.quad	.Ltmp9-.Lfunc_begin0
+	.quad	.Ltmp10-.Lfunc_begin0
+	.quad	.Ltmp11-.Lfunc_begin0
+	.quad	.Ltmp12-.Lfunc_begin0
+	.quad	.Ltmp13-.Lfunc_begin0
+	.quad	.Ltmp14-.Lfunc_begin0
+	.quad	0
+	.quad	0
+.Ldebug_ranges3:
+	.quad	.Ltmp16-.Lfunc_begin0
+	.quad	.Ltmp17-.Lfunc_begin0
+	.quad	.Ltmp18-.Lfunc_begin0
+	.quad	.Ltmp19-.Lfunc_begin0
+	.quad	.Ltmp20-.Lfunc_begin0
+	.quad	.Ltmp21-.Lfunc_begin0
+	.quad	.Ltmp22-.Lfunc_begin0
+	.quad	.Ltmp23-.Lfunc_begin0
+	.quad	.Ltmp24-.Lfunc_begin0
+	.quad	.Ltmp25-.Lfunc_begin0
+	.quad	.Ltmp26-.Lfunc_begin0
+	.quad	.Ltmp29-.Lfunc_begin0
+	.quad	.Ltmp30-.Lfunc_begin0
+	.quad	.Ltmp31-.Lfunc_begin0
+	.quad	.Ltmp32-.Lfunc_begin0
+	.quad	.Ltmp33-.Lfunc_begin0
+	.quad	0
+	.quad	0
+.Ldebug_ranges4:
+	.quad	.Ltmp16-.Lfunc_begin0
+	.quad	.Ltmp17-.Lfunc_begin0
+	.quad	.Ltmp20-.Lfunc_begin0
+	.quad	.Ltmp21-.Lfunc_begin0
+	.quad	.Ltmp27-.Lfunc_begin0
+	.quad	.Ltmp28-.Lfunc_begin0
+	.quad	0
+	.quad	0
+.Ldebug_ranges5:
+	.quad	.Ltmp47-.Lfunc_begin0
+	.quad	.Ltmp49-.Lfunc_begin0
+	.quad	.Ltmp50-.Lfunc_begin0
+	.quad	.Ltmp52-.Lfunc_begin0
+	.quad	.Ltmp53-.Lfunc_begin0
+	.quad	.Ltmp54-.Lfunc_begin0
+	.quad	.Ltmp55-.Lfunc_begin0
+	.quad	.Ltmp56-.Lfunc_begin0
+	.quad	.Ltmp57-.Lfunc_begin0
+	.quad	.Ltmp60-.Lfunc_begin0
+	.quad	0
+	.quad	0
+.Ldebug_ranges6:
+	.quad	.Ltmp47-.Lfunc_begin0
+	.quad	.Ltmp48-.Lfunc_begin0
+	.quad	.Ltmp50-.Lfunc_begin0
+	.quad	.Ltmp51-.Lfunc_begin0
+	.quad	.Ltmp58-.Lfunc_begin0
+	.quad	.Ltmp59-.Lfunc_begin0
+	.quad	0
+	.quad	0
+	.section	.debug_str,"MS",@progbits,1
+.Linfo_string0:
+	.asciz	"triton"                        ; string offset=0
+.Linfo_string1:
+	.asciz	"mla_decode_mi355.py"           ; string offset=7
+.Linfo_string2:
+	.asciz	"/data/zanzhang/code/ticket/aiter/aiter/ops/triton/gluon" ; string offset=27
+.Linfo_string3:
+	.asciz	"_fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64" ; string offset=83
+	.section	".note.GNU-stack","",@progbits
+	.amdgpu_metadata
+---
+amdhsa.kernels:
+  - .agpr_count:     0
+    .args:
+      - .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         16
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         24
+        .size:           4
+        .value_kind:     by_value
+      - .address_space:  global
+        .offset:         32
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         40
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         48
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         56
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         64
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         68
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         72
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         76
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         80
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         84
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         88
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         92
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         96
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         100
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         104
+        .size:           4
+        .value_kind:     by_value
+      - .address_space:  global
+        .offset:         112
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         120
+        .size:           8
+        .value_kind:     global_buffer
+    .group_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 128
+    .max_flat_workgroup_size: 256
+    .name:           _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64
+    .private_segment_fixed_size: 0
+    .sgpr_count:     42
+    .sgpr_spill_count: 0
+    .symbol:         _fwd_grouped_kernel_stage1_n16x4_prefetch_k_paged_64.kd
+    .uses_dynamic_stack: false
+    .vgpr_count:     198
+    .vgpr_spill_count: 0
+    .wavefront_size: 64
+amdhsa.target:   amdgcn-amd-amdhsa--gfx942
+amdhsa.version:
+  - 1
+  - 2
+...
+
+	.end_amdgpu_metadata
+	.section	.debug_line,"",@progbits
+.Lline_table_start0:

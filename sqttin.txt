@@ -1,0 +1,12 @@
+pmc: Wavefronts, VALUInsts, SALUInsts, SFetchInsts,
+FlatVMemInsts,
+LDSInsts, FlatLDSInsts, GDSInsts, VALUUtilization, FetchSize,
+WriteSize, L2CacheHit, VWriteInsts, GPUBusy, VALUBusy, SALUBusy,
+MemUnitStalled, WriteUnitStalled, LDSBankConflict, MemUnitBusy
+
+att: TARGET_CU=0
+SIMD_SELECT=0xF
+SE_MASK=0xFF
+BUFFER_SIZE=640
+ISA_CAPTURE_MODE=2
+DISPATCH=1819
