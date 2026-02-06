@@ -1501,16 +1501,9 @@ def paged_attention_decode_sliding_window(
                 )
             else:
                 value_tensor = gl.load(value_cache_ptr + value_block_offsets)
-            # Compute QK attention scores using MFMA (overlaps with value load)
-            attention_scores = gl.amd.cdna3.mfma(
-                query_converted, key_converted, qk_accumulator
-            )
 
             # Permute and reshape for matrix multiplication
             value_tensor = gl.permute(value_tensor, [0, 1, 3, 2])
-            value_tensor = gl.reshape(
-                value_tensor, [CONTEXT_PARTITION_SIZE, HEAD_SIZE_POW2]
-            )
         else:
             # Load values from standard cache layout
             kv_block_numbers_reshaped = gl.convert_layout(
@@ -1538,16 +1531,17 @@ def paged_attention_decode_sliding_window(
                 )
             else:
                 value_tensor = gl.load(value_cache_ptr + value_block_offsets)
-            # Compute QK attention scores using MFMA (overlaps with value load)
-            attention_scores = gl.amd.cdna3.mfma(
-                query_converted, key_converted, qk_accumulator
-            )
 
             # Permute and resape for matrix multiplication
             value_tensor = gl.permute(value_tensor, [0, 2, 1])
-            value_tensor = gl.reshape(
-                value_tensor, [CONTEXT_PARTITION_SIZE, HEAD_SIZE_POW2]
-            )
+
+        # Compute QK attention scores using MFMA (overlaps with value load)
+        attention_scores = gl.amd.cdna3.mfma(
+            query_converted, key_converted, qk_accumulator
+        )
+        value_tensor = gl.reshape(
+            value_tensor, [CONTEXT_PARTITION_SIZE, HEAD_SIZE_POW2]
+        )
 
         attention_scores = gl.reshape(
             attention_scores, [QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE]
