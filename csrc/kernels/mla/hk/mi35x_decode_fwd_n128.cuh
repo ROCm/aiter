@@ -1238,158 +1238,159 @@ class KvManagerV2
     }
 };
 
-// After loading, the elements are in the following layout:
-// [0, 0-7], [1, 0-7], [2, 0-7], [3, 0-7], (done by warp 0 thread 0)
-// [0, 8-15], [1, 8-15], [2, 8-15], [3, 8-15] (done by warp 0 thread 1)
-// ...
-// [0, 120-127], [1, 120-127], [2, 120-127], [3, 120-127] (done by warp 0 thread 15)
-// [0, 128-135], [1, 128-135], [2, 128-135], [3, 128-135] (done by warp 2 thread 0)
-// ...
-// [0, 504-511], [1, 504-511], [2, 504-511], [3, 504-511] (done by warp 6 thread 15)
-// Pad 64 bytes/16 DWORDs for avoiding bank conflicts.
-// [4, 0-7], [5, 0-7], [6, 0-7], [7, 0-7] (done by warp 0 thread 16)
-// ...
-// [4, 504-511], [5, 504-511], [6, 504-511], [7, 504-511] (done by warp 6 thread 31)
-// Pad 64 bytes/16 DWORDs
-// [8, 0-7], [9, 0-7], [10, 0-7], [11, 0-7] (done by warp 0 thread 32)
-// ...
-// [8, 504-511], [9, 504-511], [10, 504-511], [11, 504-511] (done by warp 6 thread 47)
-// Pad 64 bytes/16 DWORDs
-// [12, 0-7], [13, 0-7], [14, 0-7], [15, 0-7] (done by warp 0 thread 48)
-// ...
-// [12, 504-511], [13, 504-511], [14, 504-511], [15, 504-511] (done by warp 6 thread 63)
-// Pad 64 bytes/16 DWORDs
-// [16, 0-7], [17, 0-7], [18, 0-7], [19, 0-7] (done by warp 1 thread 0)
-// ...
-// [16, 504-511], [17, 504-511], [18, 504-511], [19, 504-511] (done by warp 7 thread 15)
-// Pad 64 bytes/16 DWORDs
-// [20, 0-7], [21, 0-7], [22, 0-7], [23, 0-7] (done by warp 1 thread 16)
-// ...
-// [20, 504-511], [21, 504-511], [22, 504-511], [23, 504-511] (done by warp 7 thread 31)
-// Pad 64 bytes/16 DWORDs
-// [24, 0-7], [25, 0-7], [26, 0-7], [27, 0-7] (done by warp 1 thread 32)
-// ...
-// [24, 504-511], [25, 504-511], [26, 504-511], [27, 504-511] (done by warp 7 thread 47)
-// Pad 64 bytes/16 DWORDs
-// [28, 0-7], [29, 0-7], [30, 0-7], [31, 0-7] (done by warp 1 thread 48)
-// ...
-// [28, 504-511], [29, 504-511], [30, 504-511], [31, 504-511] (done by warp 7 thread 63)
 template <typename T>
-__device__ __forceinline__ constexpr uint32_t get_transposed_v_lds_size_in_byte()
+class VtManagerV1
 {
+    private:
     using kv_t = T::kv_t;
 
-    // sub_block[0]: [0:3, 0:511], sub_block[1]: [4:7, 0:511], ...
-    constexpr uint32_t kNumSubBlock = 8;
-    // 8*((32/8)*512*1+16*4)=8*(4*512+64)=8*2112=16896
-    return kNumSubBlock *
-           ((T::kBlockN / kNumSubBlock) * T::kVoHeadDim * sizeof(kv_t) + 16 * sizeof(uint32_t));
-}
+    public:
+    __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
+    {
+        constexpr uint32_t kNumSubBlock = 8;
+        // 8*((32/8)*512*1+16*4)=8*(4*512+64)=8*2112=16896
+        return kNumSubBlock *
+               ((T::kBlockN / kNumSubBlock) * T::kVoHeadDim * sizeof(kv_t) + 16 * sizeof(uint32_t));
+    }
 
-template <typename T>
-__device__ __forceinline__ void store_transposed_v_to_lds(const uintptr_t p_lds_vt,
-                                                          const uint32_t warp_idx,
-                                                          const v8ui& v_transposed)
-{
-    using kv_t = T::kv_t;
+    // After loading, the elements are in the following layout:
+    // [0, 0-7], [1, 0-7], [2, 0-7], [3, 0-7], (done by warp 0 thread 0)
+    // [0, 8-15], [1, 8-15], [2, 8-15], [3, 8-15] (done by warp 0 thread 1)
+    // ...
+    // [0, 120-127], [1, 120-127], [2, 120-127], [3, 120-127] (done by warp 0 thread 15)
+    // [0, 128-135], [1, 128-135], [2, 128-135], [3, 128-135] (done by warp 2 thread 0)
+    // ...
+    // [0, 504-511], [1, 504-511], [2, 504-511], [3, 504-511] (done by warp 6 thread 15)
+    // Pad 64 bytes/16 DWORDs for avoiding bank conflicts.
+    // [4, 0-7], [5, 0-7], [6, 0-7], [7, 0-7] (done by warp 0 thread 16)
+    // ...
+    // [4, 504-511], [5, 504-511], [6, 504-511], [7, 504-511] (done by warp 6 thread 31)
+    // Pad 64 bytes/16 DWORDs
+    // [8, 0-7], [9, 0-7], [10, 0-7], [11, 0-7] (done by warp 0 thread 32)
+    // ...
+    // [8, 504-511], [9, 504-511], [10, 504-511], [11, 504-511] (done by warp 6 thread 47)
+    // Pad 64 bytes/16 DWORDs
+    // [12, 0-7], [13, 0-7], [14, 0-7], [15, 0-7] (done by warp 0 thread 48)
+    // ...
+    // [12, 504-511], [13, 504-511], [14, 504-511], [15, 504-511] (done by warp 6 thread 63)
+    // Pad 64 bytes/16 DWORDs
+    // [16, 0-7], [17, 0-7], [18, 0-7], [19, 0-7] (done by warp 1 thread 0)
+    // ...
+    // [16, 504-511], [17, 504-511], [18, 504-511], [19, 504-511] (done by warp 7 thread 15)
+    // Pad 64 bytes/16 DWORDs
+    // [20, 0-7], [21, 0-7], [22, 0-7], [23, 0-7] (done by warp 1 thread 16)
+    // ...
+    // [20, 504-511], [21, 504-511], [22, 504-511], [23, 504-511] (done by warp 7 thread 31)
+    // Pad 64 bytes/16 DWORDs
+    // [24, 0-7], [25, 0-7], [26, 0-7], [27, 0-7] (done by warp 1 thread 32)
+    // ...
+    // [24, 504-511], [25, 504-511], [26, 504-511], [27, 504-511] (done by warp 7 thread 47)
+    // Pad 64 bytes/16 DWORDs
+    // [28, 0-7], [29, 0-7], [30, 0-7], [31, 0-7] (done by warp 1 thread 48)
+    // ...
+    // [28, 504-511], [29, 504-511], [30, 504-511], [31, 504-511] (done by warp 7 thread 63)
+    __device__ __forceinline__ static void store_transposed_v_to_lds(const uintptr_t p_lds_vt,
+                                                                     const uint32_t warp_idx,
+                                                                     const v8ui& v_transposed)
+    {
+        /// TODO: These parameters should reside in Traits.
+        constexpr uint32_t kNumRowsPerThr    = 4;
+        constexpr uint32_t kNumColsPerThr    = 8;
+        constexpr uint32_t kNumElemsPerBlock = kNumRowsPerThr * kNumColsPerThr; // 4 * 8 = 32
+        constexpr uint32_t kNumBlocksPerRow  = T::kVoHeadDim / kNumColsPerThr;  // 512 / 8 = 64
+        constexpr uint32_t kNumBlocksPerRowWithPadding = kNumBlocksPerRow + 2;  // 64 + 2 = 66
 
-    /// TODO: These parameters should reside in Traits.
-    constexpr uint32_t kNumRowsPerThr              = 4;
-    constexpr uint32_t kNumColsPerThr              = 8;
-    constexpr uint32_t kNumElemsPerBlock           = kNumRowsPerThr * kNumColsPerThr; // 4 * 8 = 32
-    constexpr uint32_t kNumBlocksPerRow            = T::kVoHeadDim / kNumColsPerThr; // 512 / 8 = 64
-    constexpr uint32_t kNumBlocksPerRowWithPadding = kNumBlocksPerRow + 2;           // 64 + 2 = 66
+        const uint32_t lane_idx = ckt::get_lane_id();
 
-    const uint32_t lane_idx = ckt::get_lane_id();
+        // 4x8 block-wise row major layout. No padding between rows or columns.
+        const uint32_t row_blk = (warp_idx % 2) * 4 + lane_idx / 16;
+        const uint32_t col_blk = (lane_idx % 16) + warp_idx / 2 * 16;
+        const uint32_t block_offset =
+            (row_blk * kNumBlocksPerRowWithPadding + col_blk) * kNumElemsPerBlock * sizeof(kv_t);
+        const uintptr_t p_lds_vt_lane = p_lds_vt + block_offset;
 
-    // 4x8 block-wise row major layout. No padding between rows or columns.
-    const uint32_t row_blk = (warp_idx % 2) * 4 + lane_idx / 16;
-    const uint32_t col_blk = (lane_idx % 16) + warp_idx / 2 * 16;
-    const uint32_t block_offset =
-        (row_blk * kNumBlocksPerRowWithPadding + col_blk) * kNumElemsPerBlock * sizeof(kv_t);
-    const uintptr_t p_lds_vt_lane = p_lds_vt + block_offset;
+        hkm::ds_write_b128(p_lds_vt_lane, 0, v_transposed.lo);
+        hkm::ds_write_b128(p_lds_vt_lane, sizeof(v4ui), v_transposed.hi);
+    }
 
-    hkm::ds_write_b128(p_lds_vt_lane, 0, v_transposed.lo);
-    hkm::ds_write_b128(p_lds_vt_lane, sizeof(v4ui), v_transposed.hi);
-}
+    // load 32x32 block for each warp. Each threads takes 4x4 elements.
+    template <uint32_t kColOffset, uint32_t GPR>
+    __device__ __forceinline__ void static load_transposed_v_to_gpr(const uintptr_t p_lds_vt)
+    {
+        using kv_t = T::kv_t;
 
-// load 32x32 block for each warp. Each threads takes 4x4 elements.
-template <typename T, uint32_t kColOffset, uint32_t GPR>
-__device__ __forceinline__ void load_transpose_v_to_gpr(const uintptr_t p_lds_vt)
-{
-    using kv_t = T::kv_t;
+        /// TODO: These parameters should reside in Traits.
+        constexpr uint32_t kNumRowsPerThr    = 4;
+        constexpr uint32_t kNumColsPerThr    = 8;
+        constexpr uint32_t kNumElemsPerBlock = kNumRowsPerThr * kNumColsPerThr; // 4 * 8 = 32
+        constexpr uint32_t kNumDwPerBlock =
+            kNumElemsPerBlock / (sizeof(uint32_t) / sizeof(kv_t));             // 32 / 4 = 8
+        constexpr uint32_t kNumBlocksPerRow = T::kVoHeadDim / kNumColsPerThr;  // 512 / 8 = 64
+        constexpr uint32_t kNumBlocksPerRowWithPadding = kNumBlocksPerRow + 2; // 64 + 2 = 66
+        constexpr uint32_t kOffsetTlBl = 4 * kNumBlocksPerRowWithPadding * kNumElemsPerBlock *
+                                         sizeof(kv_t); // 4 * 66 * 32 * 1 = 8448
 
-    /// TODO: These parameters should reside in Traits.
-    constexpr uint32_t kNumRowsPerThr    = 4;
-    constexpr uint32_t kNumColsPerThr    = 8;
-    constexpr uint32_t kNumElemsPerBlock = kNumRowsPerThr * kNumColsPerThr; // 4 * 8 = 32
-    constexpr uint32_t kNumDwPerBlock =
-        kNumElemsPerBlock / (sizeof(uint32_t) / sizeof(kv_t));                       // 32 / 4 = 8
-    constexpr uint32_t kNumBlocksPerRow            = T::kVoHeadDim / kNumColsPerThr; // 512 / 8 = 64
-    constexpr uint32_t kNumBlocksPerRowWithPadding = kNumBlocksPerRow + 2;           // 64 + 2 = 66
-    constexpr uint32_t kOffsetTlBl = 4 * kNumBlocksPerRowWithPadding * kNumElemsPerBlock *
-                                     sizeof(kv_t); // 4 * 66 * 32 * 1 = 8448
+        constexpr uint32_t kFixedColBlk      = kColOffset / kNumColsPerThr;
+        constexpr uint32_t kFixedBlockOffset = kFixedColBlk * kNumElemsPerBlock * sizeof(kv_t);
 
-    constexpr uint32_t kFixedColBlk      = kColOffset / kNumColsPerThr;
-    constexpr uint32_t kFixedBlockOffset = kFixedColBlk * kNumElemsPerBlock * sizeof(kv_t);
+        static_assert(((kColOffset % 16) == 0) && (kColOffset < 512),
+                      "load_transpose_v_to_gpr(): Unsupported column offset!");
 
-    static_assert(((kColOffset % 16) == 0) && (kColOffset < 512),
-                  "load_transpose_v_to_gpr(): Unsupported column offset!");
+        const uint32_t lane_idx = ckt::get_lane_id();
 
-    const uint32_t lane_idx = ckt::get_lane_id();
+        // calculate logical coordinate of top-left dw
+        const uint32_t row_blk = lane_idx / 16; // 16: 16x16 mfma tile.
+        const uint32_t col_blk = (lane_idx % 16) / kNumColsPerThr;
+        const uint32_t block_offset =
+            (row_blk * kNumBlocksPerRowWithPadding + col_blk) * kNumElemsPerBlock * sizeof(kv_t);
 
-    // calculate logical coordinate of top-left dw
-    const uint32_t row_blk = lane_idx / 16; // 16: 16x16 mfma tile.
-    const uint32_t col_blk = (lane_idx % 16) / kNumColsPerThr;
-    const uint32_t block_offset =
-        (row_blk * kNumBlocksPerRowWithPadding + col_blk) * kNumElemsPerBlock * sizeof(kv_t);
+        const uint32_t row_inblk = lane_idx % kNumRowsPerThr;
+        const uint32_t col_inblk = ((lane_idx % kNumDwPerBlock) / kNumRowsPerThr) * kNumRowsPerThr;
+        const uint32_t inblock_offset = (row_inblk * kNumColsPerThr + col_inblk) * sizeof(kv_t);
 
-    const uint32_t row_inblk      = lane_idx % kNumRowsPerThr;
-    const uint32_t col_inblk      = ((lane_idx % kNumDwPerBlock) / kNumRowsPerThr) * kNumRowsPerThr;
-    const uint32_t inblock_offset = (row_inblk * kNumColsPerThr + col_inblk) * sizeof(kv_t);
+        const uintptr_t p_lds_vt_ul_lane = p_lds_vt + block_offset + inblock_offset;
 
-    const uintptr_t p_lds_vt_ul_lane = p_lds_vt + block_offset + inblock_offset;
+        hkm::ds_read_b32<GPR + 0>(p_lds_vt_ul_lane, kFixedBlockOffset);
+        hkm::ds_read_b32<GPR + 1>(p_lds_vt_ul_lane, kFixedBlockOffset + kOffsetTlBl);
+    }
 
-    hkm::ds_read_b32<GPR + 0>(p_lds_vt_ul_lane, kFixedBlockOffset);
-    hkm::ds_read_b32<GPR + 1>(p_lds_vt_ul_lane, kFixedBlockOffset + kOffsetTlBl);
-}
+    __device__ __forceinline__ static void transpose_v(v8ui* p_v)
+    {
+        constexpr uint32_t perm_0 = 0x05010400;
+        constexpr uint32_t perm_1 = 0x05040100;
+        constexpr uint32_t perm_2 = 0x07060302;
+        constexpr uint32_t perm_3 = 0x07030602;
 
-__device__ __forceinline__ void transpose_v(v8ui* p_v)
-{
-    constexpr uint32_t perm_0 = 0x05010400;
-    constexpr uint32_t perm_1 = 0x05040100;
-    constexpr uint32_t perm_2 = 0x07060302;
-    constexpr uint32_t perm_3 = 0x07030602;
+        const uint32_t t0_0 = __builtin_amdgcn_perm((*p_v)[2], (*p_v)[0], perm_0);
+        const uint32_t t2_0 = __builtin_amdgcn_perm((*p_v)[2], (*p_v)[0], perm_3);
+        const uint32_t t0_1 = __builtin_amdgcn_perm((*p_v)[3], (*p_v)[1], perm_0);
+        const uint32_t t2_1 = __builtin_amdgcn_perm((*p_v)[3], (*p_v)[1], perm_3);
 
-    const uint32_t t0_0 = __builtin_amdgcn_perm((*p_v)[2], (*p_v)[0], perm_0);
-    const uint32_t t2_0 = __builtin_amdgcn_perm((*p_v)[2], (*p_v)[0], perm_3);
-    const uint32_t t0_1 = __builtin_amdgcn_perm((*p_v)[3], (*p_v)[1], perm_0);
-    const uint32_t t2_1 = __builtin_amdgcn_perm((*p_v)[3], (*p_v)[1], perm_3);
+        const uint32_t t1_0 = __builtin_amdgcn_perm((*p_v)[6], (*p_v)[4], perm_0);
+        const uint32_t t3_0 = __builtin_amdgcn_perm((*p_v)[6], (*p_v)[4], perm_3);
+        const uint32_t t1_1 = __builtin_amdgcn_perm((*p_v)[7], (*p_v)[5], perm_0);
+        const uint32_t t3_1 = __builtin_amdgcn_perm((*p_v)[7], (*p_v)[5], perm_3);
 
-    const uint32_t t1_0 = __builtin_amdgcn_perm((*p_v)[6], (*p_v)[4], perm_0);
-    const uint32_t t3_0 = __builtin_amdgcn_perm((*p_v)[6], (*p_v)[4], perm_3);
-    const uint32_t t1_1 = __builtin_amdgcn_perm((*p_v)[7], (*p_v)[5], perm_0);
-    const uint32_t t3_1 = __builtin_amdgcn_perm((*p_v)[7], (*p_v)[5], perm_3);
+        const uint32_t r0_0 = __builtin_amdgcn_perm(t1_0, t0_0, perm_1);
+        const uint32_t r1_0 = __builtin_amdgcn_perm(t1_0, t0_0, perm_2);
+        const uint32_t r2_0 = __builtin_amdgcn_perm(t3_0, t2_0, perm_1);
+        const uint32_t r3_0 = __builtin_amdgcn_perm(t3_0, t2_0, perm_2);
 
-    const uint32_t r0_0 = __builtin_amdgcn_perm(t1_0, t0_0, perm_1);
-    const uint32_t r1_0 = __builtin_amdgcn_perm(t1_0, t0_0, perm_2);
-    const uint32_t r2_0 = __builtin_amdgcn_perm(t3_0, t2_0, perm_1);
-    const uint32_t r3_0 = __builtin_amdgcn_perm(t3_0, t2_0, perm_2);
+        const uint32_t r0_1 = __builtin_amdgcn_perm(t1_1, t0_1, perm_1);
+        const uint32_t r1_1 = __builtin_amdgcn_perm(t1_1, t0_1, perm_2);
+        const uint32_t r2_1 = __builtin_amdgcn_perm(t3_1, t2_1, perm_1);
+        const uint32_t r3_1 = __builtin_amdgcn_perm(t3_1, t2_1, perm_2);
 
-    const uint32_t r0_1 = __builtin_amdgcn_perm(t1_1, t0_1, perm_1);
-    const uint32_t r1_1 = __builtin_amdgcn_perm(t1_1, t0_1, perm_2);
-    const uint32_t r2_1 = __builtin_amdgcn_perm(t3_1, t2_1, perm_1);
-    const uint32_t r3_1 = __builtin_amdgcn_perm(t3_1, t2_1, perm_2);
-
-    (*p_v)[0] = r0_0;
-    (*p_v)[1] = r0_1;
-    (*p_v)[2] = r1_0;
-    (*p_v)[3] = r1_1;
-    (*p_v)[4] = r2_0;
-    (*p_v)[5] = r2_1;
-    (*p_v)[6] = r3_0;
-    (*p_v)[7] = r3_1;
-}
+        (*p_v)[0] = r0_0;
+        (*p_v)[1] = r0_1;
+        (*p_v)[2] = r1_0;
+        (*p_v)[3] = r1_1;
+        (*p_v)[4] = r2_0;
+        (*p_v)[5] = r2_1;
+        (*p_v)[6] = r3_0;
+        (*p_v)[7] = r3_1;
+    }
+};
 
 template <bool kCheckBoundary, uint32_t GPR>
 __device__ __forceinline__ void
@@ -1791,6 +1792,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
     QManagerV3<T> q_manager;
     KvManagerV2<T> kv_manager;
+    VtManagerV1<T> vt_manager;
 
     hk::art<kv_t, T::kBlockK, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_0_ranges> kv_0;
     hk::art<kv_t, T::kBlockK, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_1_ranges> kv_1;
@@ -1816,7 +1818,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     extern __shared__ int32_t p_lds[];
 
     constexpr uint32_t kSzLdsKv = kv_manager.get_lds_size_in_byte();
-    constexpr uint32_t kSzLdsTv = get_transposed_v_lds_size_in_byte<T>();
+    constexpr uint32_t kSzLdsTv = vt_manager.get_lds_size_in_byte();
 
     uintptr_t p_lds_kv_curr  = reinterpret_cast<uintptr_t>(p_lds);
     uintptr_t p_lds_kv_next  = p_lds_kv_curr + kSzLdsKv;
@@ -2022,8 +2024,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             }
 
             asm volatile("s_waitcnt lgkmcnt(0)");
-            transpose_v(&v);
-            store_transposed_v_to_lds<T>(p_lds_vt, warp_idx, v);
+            vt_manager.transpose_v(&v);
+            vt_manager.store_transposed_v_to_lds(p_lds_vt, warp_idx, v);
             __builtin_amdgcn_s_setprio(1);
 
             kv_manager.template async_load_k_tile<320, kIsLastIter, kCheckBoundaryNext>(
@@ -2105,10 +2107,12 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 constexpr uint32_t kColOffset2     = kColOffset0 + kColOffsetDelta * 2;
                 constexpr uint32_t kColOffset3     = kColOffset0 + kColOffsetDelta * 3;
 
-                load_transpose_v_to_gpr<T, kColOffset0, k_kv_0_begin>(p_lds_vt);
-                load_transpose_v_to_gpr<T, kColOffset1, k_kv_0_begin + 2>(p_lds_vt);
-                load_transpose_v_to_gpr<T, kColOffset2, k_kv_1_begin>(p_lds_vt);
-                load_transpose_v_to_gpr<T, kColOffset3, k_kv_1_begin + 2>(p_lds_vt);
+                vt_manager.template load_transposed_v_to_gpr<kColOffset0, k_kv_0_begin>(p_lds_vt);
+                vt_manager.template load_transposed_v_to_gpr<kColOffset1, k_kv_0_begin + 2>(
+                    p_lds_vt);
+                vt_manager.template load_transposed_v_to_gpr<kColOffset2, k_kv_1_begin>(p_lds_vt);
+                vt_manager.template load_transposed_v_to_gpr<kColOffset3, k_kv_1_begin + 2>(
+                    p_lds_vt);
 
                 asm volatile("s_waitcnt lgkmcnt(4)");
                 if constexpr(kIsFirstIter)
