@@ -20,6 +20,9 @@ from aiter.ops.attention import pa_decode_gluon
 from aiter.ops.triton.gluon.pa_decode_gluon import (
     get_recommended_splits,
 )
+from aiter.ops.triton.gluon.pa_decode_flydsl import (
+    pa_decode_flydsl,
+)
 from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
     pa_decode_gluon_aot,
 )
@@ -37,6 +40,7 @@ except ImportError:
         "Warning: triton.experimental.gluon or triton.experimental.gluon.language not exists, only pa_decode_gluon_aot can be used!"
     )
     pa_decode_gluon = None
+    pa_decode_flydsl = None
 
 
 TRITON_VERSION = triton.__version__
@@ -1207,7 +1211,8 @@ def run_gluon_kernel(
         )
     else:
         if pa_decode_gluon is not None:
-            torch.ops.aiter.pa_decode_gluon(
+            # torch.ops.aiter.pa_decode_gluon(
+            pa_decode_flydsl(
                 output,
                 query,
                 key_cache,
