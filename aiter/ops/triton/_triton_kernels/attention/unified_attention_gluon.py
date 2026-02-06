@@ -53,25 +53,42 @@ def find_seq_idx(
 
 
 @gluon.jit
-def create_kv_tdm_tensor_descriptors(
+def create_tdm_tensor_descriptors(
+    q_ptr,
     k_ptr,
     v_ptr,
-    stride_k_t,
-    stride_k_d,
-    stride_v_t,
-    stride_v_d,
+    stride_q_m: ttgl.int64,  # int
+    stride_q_d: ttgl.constexpr,  # int
+    stride_k_t: ttgl.int64,  # int
+    stride_k_d: ttgl.constexpr,  # int
+    stride_v_t: ttgl.int64,  # int
+    stride_v_d: ttgl.constexpr,  # int
+    q_shared_layout: ttgl.constexpr,
     k_shared_layout: ttgl.constexpr,
     v_shared_layout: ttgl.constexpr,
+    M: ttgl.constexpr,
     T: ttgl.constexpr,
+    BLOCK_M: ttgl.constexpr,
     HEAD_SIZE: ttgl.constexpr,
     TILE_SIZE: ttgl.constexpr,
     HEAD_SIZE_PADDED: ttgl.constexpr,
 ):
+    ttgl.static_assert(stride_q_d == 1, "stride_q_d must be 1")
+    ttgl.static_assert(stride_k_d == 1, "stride_k_d must be 1")
+    ttgl.static_assert(stride_v_d == 1, "stride_v_d must be 1")
+    q_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=q_ptr,
+        shape=(M, HEAD_SIZE),
+        strides=(stride_q_m, stride_q_d),
+        block_shape=(BLOCK_M, HEAD_SIZE_PADDED),
+        layout=q_shared_layout,
+    )
+
     k_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=k_ptr,
-        shape=(HEAD_SIZE, T),
-        strides=(stride_k_d, stride_k_t),
-        block_shape=(HEAD_SIZE_PADDED, TILE_SIZE),
+        shape=(T, HEAD_SIZE),
+        strides=(stride_k_t, stride_k_d),
+        block_shape=(TILE_SIZE, HEAD_SIZE_PADDED),
         layout=k_shared_layout,
     )
 
@@ -83,9 +100,10 @@ def create_kv_tdm_tensor_descriptors(
         layout=v_shared_layout,
     )
 
-    return k_desc, v_desc
+    return q_desc, k_desc, v_desc
 
 
+from triton._C.libtriton.gluon_ir import make_cga_layout
 @gluon.jit
 def gluon_kernel_unified_attention_3d_tdm_pipelined(
     segm_output_ptr,
@@ -104,6 +122,7 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
     k_scale,  # float32
     v_scale,  # float32
     softcap,  # float32
+    num_tokens, # int
     num_query_heads: ttgl.constexpr,  # int
     num_queries_per_kv: ttgl.constexpr,  # int
     block_table_stride: ttgl.int64,  # int
@@ -135,15 +154,17 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
     NUM_SEGMENTS_PER_SEQ: ttgl.constexpr,  # int
     num_warps: ttgl.constexpr,  # int
     num_stages: ttgl.constexpr,  # int
+    num_ctas: ttgl.constexpr = 1,  # int
     ALL_DECODE: ttgl.constexpr = False,  # bool
 ):
     q_block_global_idx = ttgl.program_id(0)
     kv_head_idx = ttgl.program_id(1)
     segm_idx = ttgl.program_id(2)
-    num_ctas: ttgl.constexpr = ttgl.num_ctas()
+    # num_ctas: ttgl.constexpr = ttgl.num_ctas()
     pred = 1
     pred_i32 = pred.to(ttgl.int32) if hasattr(pred, "to") else pred
-
+    
+    
     assert TILE_SIZE == BLOCK_SIZE, "TILE_SIZE must be identical to BLOCK_SIZE"
 
     # needed to use exp2 (exp2 -> exp conversion)
@@ -188,19 +209,40 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
         warps_per_cta=[1, num_warps],
         order=[0, 1],
     )
-
-    Q_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
-        vec=8, per_phase=1, max_phase=1, order=[1, 0]
-    )
-    K_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
-        vec=8, per_phase=1, max_phase=1, order=[0, 1]
-    )
-    # K_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
-    #     interval_padding_pairs= [[TILE_SIZE, 16]],
-    #     shape=(HEAD_SIZE_PADDED, TILE_SIZE),
-    #     order=[1, 0],
-    #     cga_layout=[]
+    
+    # ctas_per_cga = [1, 1]
+    # cga_layout_Q = make_cga_layout(
+    #     ctasPerCga=ctas_per_cga,
+    #     ctaSplitNum=[ctas_per_cga[0], 1],
+    #     ctaOrder=[0, 1]
     # )
+    # cga_layout_K = make_cga_layout(
+    #     ctasPerCga=ctas_per_cga,
+    #     ctaSplitNum=[1, ctas_per_cga[1]],
+    #     ctaOrder=[0, 1]
+    # )
+    # cga_layout_S = make_cga_layout(
+    #     ctasPerCga=ctas_per_cga,
+    #     ctaSplitNum=[ctas_per_cga[0], ctas_per_cga[1]],
+    #     ctaOrder=[0, 1]
+    # )
+
+    # Q_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
+    #     vec=8, per_phase=1, max_phase=1, order=[1, 0]
+    # )
+    # K_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
+    #     vec=8, per_phase=1, max_phase=1, order=[0, 1]
+    # )
+    Q_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
+        interval_padding_pairs=[[HEAD_SIZE_PADDED, 8]],
+        shape=[BLOCK_M, HEAD_SIZE_PADDED],
+        order=[1, 0]
+    )
+    K_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
+        interval_padding_pairs=[[HEAD_SIZE_PADDED, 8]],
+        shape=[TILE_SIZE, HEAD_SIZE_PADDED],
+        order=[1, 0]
+    )
     V_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
         vec=1, per_phase=1, max_phase=1, order=[1, 0]
     )
@@ -208,7 +250,7 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
     QK_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
-        warp_bases=[[1, 0]],
+        warp_bases=[[1, 0], [0, 1]],
         reg_bases=[],
         instr_shape=[16, 16, 32],
     )
@@ -222,7 +264,7 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
     PV_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
-        warp_bases=[[0, 1]],
+        warp_bases=[[0, 1], [1, 0]],
         reg_bases=[],
         instr_shape=[16, 16, 32],
     )
@@ -248,40 +290,6 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
         0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(0, Q_BLOCKED_LAYOUT)
     )
 
-    k_desc, v_desc = create_kv_tdm_tensor_descriptors(
-        key_cache_ptr,
-        value_cache_ptr,
-        stride_k_cache_1,  # stride_k_cache_1 = HEAD_SIZE * num_kv_heads
-        stride_k_cache_3,
-        stride_v_cache_1,
-        stride_v_cache_3,
-        K_SHARED_LAYOUT,
-        V_SHARED_LAYOUT,
-        NUM_BLOCKS * BLOCK_SIZE * 8,
-        HEAD_SIZE,
-        TILE_SIZE,
-        HEAD_SIZE_PADDED,
-    )
-
-    smem_Q = ttgl.allocate_shared_memory(
-        query_ptr.type.element_ty, [BLOCK_M, HEAD_SIZE_PADDED], layout=Q_SHARED_LAYOUT
-    )
-    smem_K = ttgl.allocate_shared_memory(
-        k_desc.dtype,
-        shape=k_desc.block_shape,
-        layout=k_desc.layout,
-    )
-    # smem_K = ttgl.allocate_shared_memory(
-    #     key_cache_ptr.type.element_ty,
-    #     [HEAD_SIZE_PADDED, TILE_SIZE],
-    #     layout=K_SHARED_LAYOUT,
-    # )
-    smem_V = ttgl.allocate_shared_memory(
-        value_cache_ptr.type.element_ty,
-        [TILE_SIZE, HEAD_SIZE_PADDED],
-        layout=V_SHARED_LAYOUT,
-    )
-
     query_pos = q_block_local_idx * BLOCK_Q + offs_q_m // num_queries_per_kv
 
     query_offset_0 = cur_batch_in_all_start_index + query_pos
@@ -299,6 +307,46 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
 
     query_mask_0 = query_pos < cur_batch_query_len
     query_mask_1 = query_offset_1 < num_query_heads
+
+    total_num_q_tokens = num_tokens * num_query_heads
+    total_num_kv_tokens = NUM_BLOCKS * BLOCK_SIZE * (num_query_heads // num_queries_per_kv)
+    
+    q_desc, k_desc, v_desc = create_tdm_tensor_descriptors(
+        query_ptr,
+        key_cache_ptr,
+        value_cache_ptr,
+        query_stride_1,
+        1,
+        stride_k_cache_1,  # stride_k_cache_1 = HEAD_SIZE * num_kv_heads
+        stride_k_cache_3,
+        stride_v_cache_1,
+        stride_v_cache_3,
+        Q_SHARED_LAYOUT,
+        K_SHARED_LAYOUT,
+        V_SHARED_LAYOUT,
+        total_num_q_tokens,
+        total_num_kv_tokens,
+        BLOCK_M,
+        HEAD_SIZE,
+        TILE_SIZE,
+        HEAD_SIZE_PADDED,
+    )
+
+    smem_Q = ttgl.allocate_shared_memory(
+        q_desc.dtype,
+        shape=q_desc.block_shape,
+        layout=q_desc.layout,
+    )
+    smem_K = ttgl.allocate_shared_memory(
+        k_desc.dtype,
+        shape=k_desc.block_shape,
+        layout=k_desc.layout,
+    )
+    smem_V = ttgl.allocate_shared_memory(
+        value_cache_ptr.type.element_ty,
+        [TILE_SIZE, HEAD_SIZE_PADDED],
+        layout=V_SHARED_LAYOUT,
+    )
 
     # Q_load : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = Q_BLOCKED_LAYOUT
     Q_load = ttgl.amd.cdna4.buffer_load(
@@ -392,18 +440,18 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
     ):
         # seq_k_offset : shape = (TILE_SIZE, ), layout = ttgl.SliceLayout(0, K_BLOCKED_LAYOUT)
         # seq_v_offset : shape = (TILE_SIZE, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
-        # seq_k_offset = j * TILE_SIZE + offs_k_t
+        seq_k_offset = j * TILE_SIZE + offs_k_t
         seq_v_offset = j * TILE_SIZE + offs_v_t
 
         if TILE_SIZE == BLOCK_SIZE:
-            # tile_k_mask = ttgl.full(
-            #     (1,), 1, dtype=tl.int1, layout=ttgl.SliceLayout(0, K_BLOCKED_LAYOUT)
-            # )
+            tile_k_mask = ttgl.full(
+                (1,), 1, dtype=tl.int1, layout=ttgl.SliceLayout(0, K_BLOCKED_LAYOUT)
+            )
             tile_v_mask = ttgl.full(
                 (1,), 1, dtype=tl.int1, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
             )
         else:
-            # tile_k_mask = seq_k_offset < max_seq_prefix_len
+            tile_k_mask = seq_k_offset < max_seq_prefix_len
             tile_v_mask = seq_v_offset < max_seq_prefix_len
 
         physical_block_idx = ttgl.load(block_tables_ptr + block_table_offset + j)
@@ -422,7 +470,7 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
         #     + offs_k_t[None, :] * stride_k_cache_1
         # )
 
-        # K_load : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_BLOCKED_LAYOUT
+        # # K_load : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_BLOCKED_LAYOUT
         # K_load = ttgl.amd.cdna4.buffer_load(
         #     ptr=key_cache_ptr,
         #     offsets=k_offset.to(ttgl.int32),
@@ -446,10 +494,12 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
         ttgl.amd.gfx1250.tdm.async_load(
             src=k_desc,
             offsets=[
+                # (physical_block_idx * (stride_k_cache_0 // stride_k_cache_1)).to(tl.int32),
+                # (kv_head_idx * stride_k_cache_2).to(tl.int32),
                 0,
                 offs_k_t_starts,
-            ],  # stride = [stride_k_cache_3 = 1, stride_k_cache_1 = HEAD_SIZE * num_kv_heads]
-            dest=smem_K,  # .index(producer % NUM_BUFFERS),
+            ],  # stride = [stride_k_cache_1 = HEAD_SIZE * num_kv_heads, stride_k_cache_3 = 1]
+            dest=smem_K,
             pred=pred_i32,
         )
         if num_ctas > 1:
@@ -458,7 +508,7 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
         if num_ctas > 1:
             ttgl.amd.gfx1250.cluster.wait()
         # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
-        K = smem_K.load(layout=K_DOT_LAYOUT)
+        K = smem_K.permute([1, 0]).load(layout=K_DOT_LAYOUT)
 
         if K.dtype.is_fp8() and not Q.dtype.is_fp8():
             K = (K.to(ttgl.float32) * ttgl.load(k_scale)).to(Q.dtype)
@@ -842,6 +892,7 @@ def gluon_kernel_unified_attention_3d_pipelined(
     k_scale,  # float32
     v_scale,  # float32
     softcap,  # float32
+    num_tokens, # int
     num_query_heads: ttgl.constexpr,  # int
     num_queries_per_kv: ttgl.constexpr,  # int
     block_table_stride: ttgl.int64,  # int
@@ -938,7 +989,8 @@ def gluon_kernel_unified_attention_3d_pipelined(
     QK_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
-        warp_bases=[[1, 0]],
+        # warp_bases=[[1, 0]],
+        warp_bases=[[0, 1]],
         reg_bases=[],
         instr_shape=[16, 16, 32],
     )
@@ -952,7 +1004,8 @@ def gluon_kernel_unified_attention_3d_pipelined(
     PV_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
-        warp_bases=[[0, 1]],
+        # warp_bases=[[0, 1]],
+        warp_bases=[[1, 0]],
         reg_bases=[],
         instr_shape=[16, 16, 32],
     )
@@ -1369,6 +1422,7 @@ def gluon_kernel_unified_attention_3d(
     k_scale,  # float32
     v_scale,  # float32
     softcap,  # float32
+    num_tokens, # int
     num_query_heads: ttgl.constexpr,  # int
     num_queries_per_kv: ttgl.constexpr,  # int
     block_table_stride: ttgl.int64,  # int

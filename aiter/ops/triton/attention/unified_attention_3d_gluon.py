@@ -92,6 +92,7 @@ def unified_attention(
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
 
+    num_tokens = q.shape[0]
     num_blocks = v.shape[0]
     block_size = v.shape[1]
     num_seqs = len(seqused_k)
@@ -162,13 +163,20 @@ def unified_attention(
             dtype=torch.float32,
             device=q.device,
         )
-
-        # impl = gluon_kernel_unified_attention_3d
-        # impl = gluon_kernel_unified_attention_3d_pipelined
-        impl = gluon_kernel_unified_attention_3d_tdm_pipelined
         attn_config["num_stages"] = 2
-        print(attn_config)
 
+        # Baseline kernel, num_stages does not matter
+        # impl = gluon_kernel_unified_attention_3d
+
+        # With async_copy pipelined
+        # impl = gluon_kernel_unified_attention_3d_pipelined
+
+        # With TDM async_copy pipelined        
+        impl = gluon_kernel_unified_attention_3d_tdm_pipelined
+        attn_config["num_warps"] = 4
+        
+        print(attn_config)
+        
         impl[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,
@@ -185,6 +193,7 @@ def unified_attention(
             k_scale=k_descale,
             v_scale=v_descale,
             softcap=softcap,
+            num_tokens=num_tokens,
             num_query_heads=num_query_heads,
             num_queries_per_kv=num_queries_per_kv,
             block_table_stride=block_table.stride(0),
