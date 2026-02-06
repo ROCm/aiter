@@ -453,7 +453,7 @@ class QManagerV3
 template <typename T>
 class QManagerV4
 {
-    private:
+    protected:
     using q_t = typename T::q_t;
 
     // Stores 16x64 elements per warp in LDS.
@@ -622,125 +622,18 @@ class QManagerV4
 };
 
 template <typename T>
-class QManagerV5
+class QManagerV5 : public QManagerV4<T>
 {
     private:
     using q_t = typename T::q_t;
 
-    // Stores 16x64 elements per warp in LDS.
-    // Pad 2DW per 2 rows.
-    static constexpr uint32_t kNumElemPerRow           = 64;
-    static constexpr uint32_t kNumElemPerCol           = 16;
-    static constexpr uint32_t kNumPaddingBytesPer4Rows = 4 * sizeof(uint32_t); // 4*4=16
-    static constexpr uint32_t kNumBytesPer4Rows =
-        kNumElemPerRow * 4 * sizeof(q_t) + kNumPaddingBytesPer4Rows; // 64*4*1+16=256+16=272
-
-    // All come from mfma_f32_16x16x32_fp8_fp8.
-    static constexpr uint32_t kMfmaRows = 16;
-    static constexpr uint32_t kMfmaCols = 32;
-    static constexpr uint32_t kMfmaElemPerLane =
-        kMfmaRows * kMfmaCols / ckt::get_warp_size(); // 16*32/64=8
-
-    // The input ptrs are expected to be the start address of the warp.
-    // After loading, the data layout in LDS is:
-    // (00, 00 - 07) [Lane00 - Lane01], (00, 32 - 39) [Lane02 - Lane03]
-    // (00, 08 - 15) [Lane04 - Lane05], (00, 40 - 47) [Lane06 - Lane07]
-    // (00, 16 - 23) [Lane08 - Lane09], (00, 48 - 55) [Lane10 - Lane11]
-    // (00, 24 - 31) [Lane12 - Lane13], (00, 56 - 63) [Lane14 - Lane15]
-    // (01, 00 - 07) [Lane16 - Lane17], (01, 32 - 39) [Lane18 - Lane19]
-    // (01, 08 - 15) [Lane20 - Lane21], (01, 40 - 47) [Lane22 - Lane23]
-    // (01, 16 - 23) [Lane24 - Lane25], (01, 48 - 55) [Lane26 - Lane27]
-    // (01, 24 - 31) [Lane28 - Lane29], (01, 56 - 63) [Lane30 - Lane31]
-    // (08, 00 - 07) [Lane00 - Lane01], (08, 32 - 39) [Lane02 - Lane03]
-    // (08, 08 - 15) [Lane04 - Lane05], (08, 40 - 47) [Lane06 - Lane07]
-    // (08, 16 - 23) [Lane08 - Lane09], (08, 48 - 55) [Lane10 - Lane11]
-    // (08, 24 - 31) [Lane12 - Lane13], (08, 56 - 63) [Lane14 - Lane15]
-    // (09, 00 - 07) [Lane16 - Lane17], (09, 32 - 39) [Lane18 - Lane19]
-    // (09, 08 - 15) [Lane20 - Lane21], (09, 40 - 47) [Lane22 - Lane23]
-    // (09, 16 - 23) [Lane24 - Lane25], (09, 48 - 55) [Lane26 - Lane27]
-    // (09, 24 - 31) [Lane28 - Lane29], (09, 56 - 63) [Lane30 - Lane31]
-    // Pad 4DW
-    // (02, 00 - 07) [Lane00 - Lane01], (02, 32 - 39) [Lane02 - Lane03]
-    // ...
-    template <uint32_t kColOffset>
-    __device__ __forceinline__ void vram_2_lds(const q_t* p_q_buffer, const uintptr_t p_lds)
-    {
-        constexpr uint32_t kOffsetInBytes = kColOffset * sizeof(q_t);
-
-        const uint32_t lane_idx = ckt::get_lane_id();
-
-        const uint32_t row_tmp = lane_idx / 16;
-        const uint32_t row     = (row_tmp / 2) * (kNumElemPerCol / 2) + (row_tmp % 2) * 1;
-        const uint32_t col_tmp = lane_idx % 16;
-        const uint32_t col =
-            (col_tmp / 2) % 2 * (kNumElemPerRow / 2) + (col_tmp / 4) * 8 + (col_tmp % 2) * 4;
-        constexpr uint32_t voffset_inc = 2 * T::kQkHeadDim * sizeof(q_t) - kNumBytesPer4Rows;
-
-        const hk::i32x4 srsrc = hk::make_srsrc(p_q_buffer, 0xffffffff);
-
-        uint32_t voffset = (row * T::kQkHeadDim + col) * sizeof(q_t);
-        hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
-                                            (as3_uint32_ptr)(p_lds - kOffsetInBytes),
-                                            4,
-                                            voffset,
-                                            0,
-                                            kOffsetInBytes + kNumBytesPer4Rows * 0,
-                                            0);
-        voffset += voffset_inc;
-        hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
-                                            (as3_uint32_ptr)(p_lds - kOffsetInBytes),
-                                            4,
-                                            voffset,
-                                            0,
-                                            kOffsetInBytes + kNumBytesPer4Rows * 1,
-                                            0);
-        voffset += voffset_inc;
-        hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
-                                            (as3_uint32_ptr)(p_lds - kOffsetInBytes),
-                                            4,
-                                            voffset,
-                                            0,
-                                            kOffsetInBytes + kNumBytesPer4Rows * 2,
-                                            0);
-        voffset += voffset_inc;
-        hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
-                                            (as3_uint32_ptr)(p_lds - kOffsetInBytes),
-                                            4,
-                                            voffset,
-                                            0,
-                                            kOffsetInBytes + kNumBytesPer4Rows * 3,
-                                            0);
-    }
-
-    template <uint32_t GPR_START>
-    __device__ __forceinline__ void lds_2_gpr(const uintptr_t p_lds)
-    {
-        const uint32_t lane_idx = ckt::get_lane_id();
-
-        const uint32_t row      = lane_idx % 16;
-        const uint32_t row_phy  = (row / 8) * 2 + (row % 8) / 2 * 4 + (row % 2) * 1;
-        const uint32_t col      = (lane_idx / 16) * 16;
-        const uint32_t v_offset = (row_phy / 4) * kNumBytesPer4Rows +
-                                  ((row_phy % 4) * kNumElemPerRow + col) * sizeof(q_t);
-
-        hkm::ds_read_b128<GPR_START>(p_lds + v_offset, 0);
-    }
-
-    // Get the size in bytes for a 16x64 block in LDS
-    __device__ __forceinline__ static constexpr uint32_t get_lds_size_per_block_in_byte()
-    {
-        // 16/4 * 272 = 1088
-        static_assert(kNumElemPerCol % 4 == 0, "kNumElemPerCol must be divisible by 4!");
-        return kNumElemPerCol / 4 * kNumBytesPer4Rows;
-    }
-
     public:
-    __device__ QManagerV5() {}
+    __device__ QManagerV5() : QManagerV4<T>() {}
 
     __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
     {
         // using 3 buffers
-        return 3 * T::kNumWarps * get_lds_size_per_block_in_byte();
+        return 3 * T::kNumWarps * QManagerV4<T>::get_lds_size_per_block_in_byte();
     }
 
     template <uint32_t GPR_NOPE_START, uint32_t GPR_ROPE_START>
@@ -749,41 +642,42 @@ class QManagerV5
                                                   const int32_t q_start,
                                                   const uintptr_t p_lds)
     {
-        const uint32_t lane_idx = ckt::get_lane_id();
+        const uintptr_t p_lds_warp_0 =
+            p_lds + 3 * warp_idx * QManagerV4<T>::get_lds_size_per_block_in_byte();
+        const uintptr_t p_lds_warp_1 =
+            p_lds_warp_0 + QManagerV4<T>::get_lds_size_per_block_in_byte();
+        const uintptr_t p_lds_warp_2 =
+            p_lds_warp_1 + QManagerV4<T>::get_lds_size_per_block_in_byte();
+        const q_t* p_q_buffer_warp = &q_buffer[{q_start, 0, 0, 0}] +
+                                     warp_idx * QManagerV4<T>::kNumElemPerCol * T::kQkHeadDim;
 
-        const uintptr_t p_lds_warp_0 = p_lds + 3 * warp_idx * get_lds_size_per_block_in_byte();
-        const uintptr_t p_lds_warp_1 = p_lds_warp_0 + get_lds_size_per_block_in_byte();
-        const uintptr_t p_lds_warp_2 = p_lds_warp_1 + get_lds_size_per_block_in_byte();
-        const q_t* p_q_buffer_warp =
-            &q_buffer[{q_start, 0, 0, 0}] + warp_idx * kNumElemPerCol * T::kQkHeadDim;
-
-        vram_2_lds<0>(p_q_buffer_warp, p_lds_warp_0);
-        vram_2_lds<64>(p_q_buffer_warp, p_lds_warp_1);
+        this->template vram_2_lds<0>(p_q_buffer_warp, p_lds_warp_0);
+        this->template vram_2_lds<64>(p_q_buffer_warp, p_lds_warp_1);
         asm volatile("s_waitcnt vmcnt(4)");
-        vram_2_lds<128>(p_q_buffer_warp, p_lds_warp_2);
-        lds_2_gpr<GPR_NOPE_START>(p_lds_warp_0);
+        this->template vram_2_lds<128>(p_q_buffer_warp, p_lds_warp_2);
+        this->template lds_2_gpr<GPR_NOPE_START>(p_lds_warp_0);
         asm volatile("s_waitcnt vmcnt(4), lgkmcnt(0)");
-        vram_2_lds<192>(p_q_buffer_warp, p_lds_warp_0);
-        lds_2_gpr<GPR_NOPE_START + 4>(p_lds_warp_1);
+        this->template vram_2_lds<192>(p_q_buffer_warp, p_lds_warp_0);
+        this->template lds_2_gpr<GPR_NOPE_START + 4>(p_lds_warp_1);
         asm volatile("s_waitcnt vmcnt(4), lgkmcnt(0)");
-        vram_2_lds<256>(p_q_buffer_warp, p_lds_warp_1);
-        lds_2_gpr<GPR_NOPE_START + 8>(p_lds_warp_2);
+        this->template vram_2_lds<256>(p_q_buffer_warp, p_lds_warp_1);
+        this->template lds_2_gpr<GPR_NOPE_START + 8>(p_lds_warp_2);
         asm volatile("s_waitcnt vmcnt(4), lgkmcnt(0)");
-        vram_2_lds<320>(p_q_buffer_warp, p_lds_warp_2);
-        lds_2_gpr<GPR_NOPE_START + 12>(p_lds_warp_0);
+        this->template vram_2_lds<320>(p_q_buffer_warp, p_lds_warp_2);
+        this->template lds_2_gpr<GPR_NOPE_START + 12>(p_lds_warp_0);
         asm volatile("s_waitcnt vmcnt(4), lgkmcnt(0)");
-        vram_2_lds<384>(p_q_buffer_warp, p_lds_warp_0);
-        lds_2_gpr<GPR_NOPE_START + 16>(p_lds_warp_1);
+        this->template vram_2_lds<384>(p_q_buffer_warp, p_lds_warp_0);
+        this->template lds_2_gpr<GPR_NOPE_START + 16>(p_lds_warp_1);
         asm volatile("s_waitcnt vmcnt(4), lgkmcnt(0)");
-        vram_2_lds<448>(p_q_buffer_warp, p_lds_warp_1);
-        lds_2_gpr<GPR_NOPE_START + 20>(p_lds_warp_2);
+        this->template vram_2_lds<448>(p_q_buffer_warp, p_lds_warp_1);
+        this->template lds_2_gpr<GPR_NOPE_START + 20>(p_lds_warp_2);
         asm volatile("s_waitcnt vmcnt(4), lgkmcnt(0)");
-        vram_2_lds<512>(p_q_buffer_warp, p_lds_warp_2);
-        lds_2_gpr<GPR_NOPE_START + 24>(p_lds_warp_0);
+        this->template vram_2_lds<512>(p_q_buffer_warp, p_lds_warp_2);
+        this->template lds_2_gpr<GPR_NOPE_START + 24>(p_lds_warp_0);
         asm volatile("s_waitcnt vmcnt(4)");
-        lds_2_gpr<GPR_NOPE_START + 28>(p_lds_warp_1);
+        this->template lds_2_gpr<GPR_NOPE_START + 28>(p_lds_warp_1);
         asm volatile("s_waitcnt vmcnt(0)");
-        lds_2_gpr<GPR_ROPE_START>(p_lds_warp_2);
+        this->template lds_2_gpr<GPR_ROPE_START>(p_lds_warp_2);
     }
 };
 
@@ -1244,6 +1138,12 @@ class VtManagerV1
     private:
     using kv_t = T::kv_t;
 
+    static constexpr uint32_t kNumRowsPerThr    = 4;
+    static constexpr uint32_t kNumColsPerThr    = 8;
+    static constexpr uint32_t kNumElemsPerBlock = kNumRowsPerThr * kNumColsPerThr; // 4 * 8 = 32
+    static constexpr uint32_t kNumBlocksPerRow  = T::kVoHeadDim / kNumColsPerThr;  // 512 / 8 = 64
+    static constexpr uint32_t kNumBlocksPerRowWithPadding = kNumBlocksPerRow + 2;  // 64 + 2 = 66
+
     public:
     __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
     {
@@ -1293,13 +1193,6 @@ class VtManagerV1
                                                                      const uint32_t warp_idx,
                                                                      const v8ui& v_transposed)
     {
-        /// TODO: These parameters should reside in Traits.
-        constexpr uint32_t kNumRowsPerThr    = 4;
-        constexpr uint32_t kNumColsPerThr    = 8;
-        constexpr uint32_t kNumElemsPerBlock = kNumRowsPerThr * kNumColsPerThr; // 4 * 8 = 32
-        constexpr uint32_t kNumBlocksPerRow  = T::kVoHeadDim / kNumColsPerThr;  // 512 / 8 = 64
-        constexpr uint32_t kNumBlocksPerRowWithPadding = kNumBlocksPerRow + 2;  // 64 + 2 = 66
-
         const uint32_t lane_idx = ckt::get_lane_id();
 
         // 4x8 block-wise row major layout. No padding between rows or columns.
@@ -1317,16 +1210,8 @@ class VtManagerV1
     template <uint32_t kColOffset, uint32_t GPR>
     __device__ __forceinline__ void static load_transposed_v_to_gpr(const uintptr_t p_lds_vt)
     {
-        using kv_t = T::kv_t;
-
-        /// TODO: These parameters should reside in Traits.
-        constexpr uint32_t kNumRowsPerThr    = 4;
-        constexpr uint32_t kNumColsPerThr    = 8;
-        constexpr uint32_t kNumElemsPerBlock = kNumRowsPerThr * kNumColsPerThr; // 4 * 8 = 32
         constexpr uint32_t kNumDwPerBlock =
-            kNumElemsPerBlock / (sizeof(uint32_t) / sizeof(kv_t));             // 32 / 4 = 8
-        constexpr uint32_t kNumBlocksPerRow = T::kVoHeadDim / kNumColsPerThr;  // 512 / 8 = 64
-        constexpr uint32_t kNumBlocksPerRowWithPadding = kNumBlocksPerRow + 2; // 64 + 2 = 66
+            kNumElemsPerBlock / (sizeof(uint32_t) / sizeof(kv_t)); // 32 / 4 = 8
         constexpr uint32_t kOffsetTlBl = 4 * kNumBlocksPerRowWithPadding * kNumElemsPerBlock *
                                          sizeof(kv_t); // 4 * 66 * 32 * 1 = 8448
 
