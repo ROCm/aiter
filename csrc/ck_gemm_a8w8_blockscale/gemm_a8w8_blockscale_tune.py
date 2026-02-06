@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import pandas as pd
 import torch
 import torch.nn.functional as F
@@ -12,17 +12,19 @@ from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.ops.shuffle import shuffle_weight
 from aiter.jit.utils.chip_info import get_gfx
+
 # ck
 import sys
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from ck_gemm_a8w8_blockscale_bpreshuffle.gemm_a8w8_blockscale_bpreshuffle_common import (
     kernels_list as candidate_kernels_bpreshuffle_dict,
 )
 from gemm_a8w8_blockscale_instance import candidate_kernels_dict
+
 # cktile
 from gemm_a8w8_blockscale_cktile_instance import candidate_kernels_cktile_dict
-from gemm_a8w8_blockscale_bpreshuffle_cktile_instance import candidate_kernels_bpreshuffle_cktile_dict
 
 block_shape = (128, 128)
 
@@ -71,11 +73,11 @@ def run_gemm_a8w8_blockscale_cktile(
     Run gemm a8w8 blockscale tuned kernel for ck_tile type.
     """
 
-    #if preshuffleB:
+    # if preshuffleB:
     #    return aiter.gemm_a8w8_blockscale_bpreshuffle_cktile_tune(
     #        x, weight, x_scale, w_scale, out, kernel_id, splitK
     #    )
-    #else:
+    # else:
     #    return aiter.gemm_a8w8_blockscale_cktile_tune(
     #        x, weight, x_scale, w_scale, out, kernel_id, splitK
     #    )
@@ -154,7 +156,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         self.parser.add_argument(
             "--preshuffle",
             action="store_true",
-            help="Enable B-matrix preshuffle for CK gemm a8w8 blockscale"
+            help="Enable B-matrix preshuffle for CK gemm a8w8 blockscale",
         )
 
     def calculate(self, results, bpes=(1, 1, 2)):
@@ -169,17 +171,20 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         Get the kernel name based on the kernel ID for different types.
         """
         if libType == "ck":
-            kernel_list = candidate_kernels_bpreshuffle_dict if preshuffleB else candidate_kernels_dict
+            kernel_list = (
+                candidate_kernels_bpreshuffle_dict
+                if preshuffleB
+                else candidate_kernels_dict
+            )
         elif libType == "cktile":
-            #kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
+            # kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
             kernel_list = candidate_kernels_cktile_dict
         else:
             return None
 
         if kernelId >= len(kernel_list) or kernelId < 0:
-             return None
+            return None
         return kernel_list[kernelId].name
-
 
     def get_gemm_a8w8_blockscale_cktile_tune_task(
         self,
@@ -189,16 +194,20 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         preshuffleB,
     ):
         cu_num, M, N, K = info_keys
-        #kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
+        # kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
         kernel_list = candidate_kernels_cktile_dict
         kernels_num = len(kernel_list)
-        #gemm_a8w8_idx = [0, 5 if preshuffleB else 1, 2, 3, 4]
+        # gemm_a8w8_idx = [0, 5 if preshuffleB else 1, 2, 3, 4]
         ref_data_idx = [0, 1, 2, 3]
         tasks_cktile = []
         for i in range(kernels_num):
             kernel = kernel_list[i]
-            if not get_gfx().startswith("gfx95") and (kernel.M_Warp * kernel.N_Warp * kernel.K_Warp) == 8:
-                continue
+            if not get_gfx().startswith("gfx95"):
+                if (kernel.M_Warp * kernel.N_Warp * kernel.K_Warp == 8) or (
+                    kernel.K_Warp_Tile > 64
+                ):
+                    continue
+
             maxsplitK = (
                 aiter.compute_gemm_SplitK(
                     M,
@@ -211,7 +220,6 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 if useSplitK
                 else 0
             )
-            #print("======================= gemm_a8w8_idx = ", i, kernel.M_Tile,kernel.N_Tile, kernel.K_Tile, kernel.M_Warp, kernel.N_Warp, kernel.K_Warp)
             for splitK in range(maxsplitK + 1):
                 info = (info_keys, i, splitK, "", "cktile", preshuffleB)
                 tasks_cktile.append(
@@ -221,7 +229,18 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         (M, N, K, seed),
                         run_gemm_a8w8_blockscale_cktile,
                         (
-                            [0, 5 if preshuffleB else 1, 6 if (kernel.M_Warp * kernel.N_Warp * kernel.K_Warp) == 8 else 2, 3, 4],
+                            [
+                                0,
+                                5 if preshuffleB else 1,
+                                (
+                                    6
+                                    if (kernel.M_Warp * kernel.N_Warp * kernel.K_Warp)
+                                    == 8
+                                    else 2
+                                ),
+                                3,
+                                4,
+                            ],
                             i,
                             splitK,
                             preshuffleB,
@@ -249,7 +268,11 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         preshuffleB,
     ):
         cu_num, M, N, K = info_keys
-        kernel_list = candidate_kernels_bpreshuffle_dict if preshuffleB else candidate_kernels_dict
+        kernel_list = (
+            candidate_kernels_bpreshuffle_dict
+            if preshuffleB
+            else candidate_kernels_dict
+        )
         kernels_num = len(kernel_list)
         gemm_a8w8_idx = [0, 5, 6, 3, 4] if preshuffleB else [0, 1, 2, 3, 4]
         ref_data_idx = [0, 1, 2, 3]
@@ -350,7 +373,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         ret = []
         if task:
             ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)
-        #print(ret)
+        # print(ret)
         return ret
 
     def result_to_df(self, results):

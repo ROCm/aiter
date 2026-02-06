@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
 import os
 import shutil
@@ -233,18 +233,25 @@ torch::Tensor
         """
         Codegen for tile gemm a8w8 blockscale
         """
+        default_k = default_kernels_cktile_dict.get(-1)
+        filtered_kernels = {}
+        # filter out instances that don't meet requirements and replace them with a fallback default.
+        for name, k in kernels_dict.items():
+            if not get_gfx().startswith("gfx95"):
+                if (k.M_Warp * k.N_Warp * k.K_Warp == 8) or (k.K_Warp_Tile > 64):
+                    filtered_kernels[name] = default_k
+                    continue
 
+            filtered_kernels[name] = k
         # generate instances code
-        for _, k in kernels_dict.items():
-            if not get_gfx().startswith("gfx95") and (k.M_Warp * k.N_Warp * k.K_Warp) == 8:
-                continue
+        for _, k in filtered_kernels.items():
             self.gen_tile_instance(k)
 
         # generate lookup dict for kernel instances
-        self.gen_lookup_dict(kernels_dict)
+        self.gen_lookup_dict(filtered_kernels)
 
         # generate manifest header for kernel instances
-        self.gen_manifest_head(kernels_dict)
+        self.gen_manifest_head(filtered_kernels)
 
     def run(self):
         """

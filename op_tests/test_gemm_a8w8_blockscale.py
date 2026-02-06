@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
 import sys
@@ -58,14 +58,6 @@ def run_gemm_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_blockscale_bpreshuffle(
         x, weightshuffle, x_scale, w_scale, dtype
     )
-
-#@perftest()
-#def run_gemm_cktile(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
-#    return aiter.gemm_a8w8_blockscale_cktile(x, weight, x_scale, w_scale, dtype, False)
-
-#@perftest()
-#def run_gemm_bpreshuffle_cktile(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
-#    return aiter.gemm_a8w8_blockscale_cktile(x, weightshuffle, x_scale, w_scale, dtype, True)
 
 
 @benchmark()
