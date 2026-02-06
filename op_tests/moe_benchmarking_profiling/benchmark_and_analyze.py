@@ -53,7 +53,8 @@ def run_kernel_benchmarks(config_file: str,
                           output_file: str,
                           error_log_file: str,
                           resume: bool = False,
-                          force: bool = False) -> pd.DataFrame:
+                          force: bool = False,
+                          num_gpus: int = 0) -> pd.DataFrame:
     """
     Run all kernel combinations for configurations in the input file.
     
@@ -202,7 +203,7 @@ def run_kernel_benchmarks(config_file: str,
             continue
             
         # Run all kernels
-        print("\nBenchmarking all kernels...")
+        print(f"\nBenchmarking all kernels using {num_gpus if num_gpus > 0 else 'all available'} GPU(s)...")
         from aiter.utility.mp_tuner import mp_tuner
         
         all_tasks = tasks_asm + tasks_ck + tasks_1stage
@@ -210,7 +211,7 @@ def run_kernel_benchmarks(config_file: str,
         
         try:
             results = mp_tuner(
-                all_tasks, in_data, mp_num=1, fast_mode=True,
+                all_tasks, in_data, mp_num=num_gpus, fast_mode=True,
                 shape_grouped=False, timeout=300, verbose=False
             )
         except Exception as e:
@@ -327,11 +328,13 @@ def run_kernel_benchmarks(config_file: str,
             print(f"[{status}] {kernel_type:6} {stage:12} block_m={block_m:3} "
                   f"time={us:8.2f}us err={err*100:5.1f}% {kernel_name[:50]}")
         
-        # Incremental save
+        # Incremental save - include both existing and new results
         if all_results:
-            temp_df = pd.DataFrame(all_results)
+            # Combine existing results with new results for incremental save
+            combined_for_save = existing_results + all_results
+            temp_df = pd.DataFrame(combined_for_save)
             temp_df.to_csv(output_file, index=False)
-            print(f"  Saved {len(all_results)} results so far to {output_file}")
+            print(f"  Saved {len(combined_for_save)} total results ({len(existing_results)} existing + {len(all_results)} new) to {output_file}")
     
     # Final processing
     error_log.write(f"\nCompleted: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -566,6 +569,12 @@ def main():
         action='store_true',
         help="Force re-run all configs (ignore existing results)"
     )
+    parser.add_argument(
+        "--gpus",
+        type=int,
+        default=0,
+        help="Number of GPUs to use (default: 0 = use all available GPUs)"
+    )
     
     args = parser.parse_args()
     
@@ -584,9 +593,16 @@ def main():
     print(f"  4. {error_log_file} (error log)")
     print(f"Error threshold: {args.error_threshold}%")
     
+    # Show GPU configuration
+    import torch
+    available_gpus = torch.cuda.device_count()
+    gpus_to_use = args.gpus if args.gpus > 0 else available_gpus
+    print(f"GPUs: {gpus_to_use} (available: {available_gpus})")
+    
     # STEP 1: Run benchmarks
     results_df = run_kernel_benchmarks(args.input, benchmark_file, error_log_file, 
-                                      resume=args.resume, force=args.force)
+                                      resume=args.resume, force=args.force,
+                                      num_gpus=args.gpus)
     
     if results_df is None:
         print("\nNo results generated. Check your configuration.")
