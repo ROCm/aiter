@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2018-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #include "aiter_hip_common.h"
 
@@ -74,7 +74,7 @@ CK_TILE_DEVICE fp4x2_t amd_assembly_cvt_scalef32_pk_fp4_f32(fp32_t a, fp32_t b, 
 #if defined(__gfx950__)
     int16x2_t c;
     // permute high bits and low bits to match the order of the original vector
-    asm volatile("v_cvt_scalef32_pk_fp4_f32 %0, %1, %2, %3" : "=v"(c) : "v"(b), "v"(a), "v"(scale));
+    asm volatile("v_cvt_scalef32_pk_fp4_f32 %0, %1, %2, %3" : "=v"(c) : "v"(a), "v"(b), "v"(scale));
     return bit_cast<fp4x2_t>(bit_cast<int8x2_t>(c[0])[0]);
 #else
     return fp4x2_t{};

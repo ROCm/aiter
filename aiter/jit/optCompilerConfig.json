@@ -117,6 +117,20 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_ps_metadata": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/ps_metadata_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/metadata.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v1_comm.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/metadata/v1_2_host.cuh'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_mla_asm": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mla.cu'",
@@ -127,7 +141,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "''"
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m mla --output_dir {{}}'"
     },
     "module_cache": {
         "srcs": [
@@ -430,7 +444,8 @@
         "verbose": "False",
         "blob_gen_cmd": [
             "f'{AITER_META_DIR}/hsa/codegen.py -m fmoe_2stages --output_dir {{}}'",
-            "f'{AITER_META_DIR}/hsa/codegen.py -m fmoe --output_dir {{}}'"
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmoe --output_dir {{}}'",
+            "f'{AITER_META_DIR}/hsa/codegen.py -m topksoftmax --output_dir {{}}'"
         ]
     },
     "module_moe_ck2stages": {
@@ -542,13 +557,30 @@
             "f'{AITER_CSRC_DIR}/pybind/rmsnorm_pybind.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [
             "f'{CK_DIR}/example/ck_tile/10_rmsnorm2d'"
         ],
         "verbose": "False",
         "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/10_rmsnorm2d/generate.py --api fwd --gen_blobs --working_path {{}}'"
+    },
+    "module_rmsnorm_quant": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/rmsnorm_quant_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/rmsnorm_quant_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": ["'-ffast-math'"],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/include/ck_tile'",
+            "f'{AITER_CSRC_DIR}/include/opus'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
     },
     "module_smoothquant": {
         "srcs": [
@@ -709,7 +741,8 @@
         ],
         "extra_ldflags": "None",
         "extra_include": [
-            "f'{AITER_CSRC_DIR}/include/ck_tile'"
+            "f'{AITER_CSRC_DIR}/include/ck_tile'",
+            "f'{AITER_CSRC_DIR}/include/opus'"
         ],
         "verbose": "False",
         "blob_gen_cmd": "''"
@@ -769,11 +802,11 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
-    "module_fused_mrope_rms": {
+    "module_fused_qk_norm_mrope_cache_quant_shuffle": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/fused_mrope_rms_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/fused_qk_norm_mrope_cache_quant_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
-            "f'{AITER_CSRC_DIR}/kernels/fused_mrope_rms.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/fused_qk_norm_mrope_cache_quant.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],

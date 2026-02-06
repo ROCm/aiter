@@ -1,6 +1,6 @@
 #pragma once
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #ifdef USE_ROCM
 
@@ -122,18 +122,19 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                           GemmConfig::K_Warp_Tile_v>>;
     using TilePartitioner = ck_tile::GemmTile1DPartitioner<GemmShape>;
     using GemmTraits      = ck_tile::TileGemmQuantTraits<false, // kPadM_v,
-                                                         PadN,
-                                                         PadK,
-                                                         false, // PreshuffleQuant, not support yet
-                                                         false, // PreshuffleB, not support yet
-                                                         ALayout,
-                                                         BLayout,
-                                                         CLayout,
-                                                         ck_tile::QuantType::ABQuantGrouped,
-                                                         AQLayout,
-                                                         BQLayout,
-                                                         GemmConfig::TransposeC_v,
-                                                         GemmConfig::DoubleSmemBuffer_v>;
+                                                    PadN,
+                                                    PadK,
+                                                    false, // PreshuffleQuantA, not support yet
+                                                    false, // PreshuffleQuantB, not support yet
+                                                    false, // PreshuffleB, not support yet
+                                                    ALayout,
+                                                    BLayout,
+                                                    CLayout,
+                                                    ck_tile::QuantType::ABQuantGrouped,
+                                                    AQLayout,
+                                                    BQLayout,
+                                                    GemmConfig::TransposeC_v,
+                                                    GemmConfig::DoubleSmemBuffer_v>;
 
     using GemmPipelineProblem = ck_tile::GemmPipelineProblemBase<ADataType,
                                                                  BDataType,

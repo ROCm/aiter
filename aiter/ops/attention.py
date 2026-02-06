@@ -566,6 +566,8 @@ def mla_decode_stage1_asm_fwd(
     work_indptr: Optional[torch.Tensor],
     work_info_set: Optional[torch.Tensor],
     max_seqlen_q: int,
+    page_size: int,
+    nhead_kv: int,
     softmax_scale: float,
     # [batch_size, num_kv_splits, num_heads, v_head_dim]
     splitData: torch.Tensor,
@@ -700,6 +702,92 @@ def get_pa_metadata_v1(
     ...
 
 
+def get_ps_metadata_info_v1(
+    batch_size: int,
+    num_head_k: int,
+    max_qlen: int,
+    qlen_granularity: int = 256,
+):
+    """
+    Returns:
+        1. Shape of work_metadata_ptrs followed by its scalar type.
+        2. Shape of work_indptr followed by its scalar type.
+        3. Shape of work_info followed by its scalar type.
+        4. Shape of reduce_indptr followed by its scalar type.
+        5. Shape of reduce_final_map followed by its scalar type.
+        6. Shape of reduce_partial_map followed by its scalar type.
+    """
+
+    device = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(device)
+    cu_num = device_properties.multi_processor_count
+
+    num_clusters = math.gcd(num_head_k, cu_num)
+    cus_per_cluster = cu_num // num_clusters
+
+    max_qo_split_per_batch = math.ceil(max_qlen / qlen_granularity)
+
+    qo_tile_cnt = batch_size * max_qo_split_per_batch
+    # TODO: consider split q to reduce max_works & max_partials
+    max_works = (batch_size + cus_per_cluster - 1) * max_qo_split_per_batch * num_head_k
+    max_partials = (
+        min(batch_size + cus_per_cluster - 1, (cus_per_cluster - 1) * 2)
+        * max_qo_split_per_batch
+    )
+
+    return (
+        (2, torch.uint64),  # work_metadata_ptrs
+        (cu_num + 1, torch.int32),  # work_indptr
+        ((max_works, 8), torch.int32),  # work_info
+        (qo_tile_cnt + 1, torch.int32),  # reduce_indptr
+        ((qo_tile_cnt, 2), torch.int32),  # reduce_final_map
+        (max_partials, torch.int32),  # reduce_partial_map
+    )
+
+
+@compile_ops("module_ps_metadata")
+def get_ps_metadata_v1(
+    seqlens_qo_indptr: torch.Tensor,
+    pages_kv_indptr: torch.Tensor,
+    context_lens: torch.Tensor,
+    gqa_ratio: int,
+    num_heads_k: int,
+    work_metadata_ptrs: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: torch.Tensor,
+    reduce_partial_map: torch.Tensor,
+    qhead_granularity: int = 1,
+    qlen_granularity: int = 256,
+    kvlen_granularity: int = 16,
+    block_size: int = 16,
+    is_causal: bool = True,
+) -> None: ...
+
+
+@compile_ops(MD_NAME)
+def mla_prefill_ps_asm_fwd(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    work_indptr: Optional[torch.Tensor],
+    work_info_set: Optional[torch.Tensor],
+    max_seqlen_q: int,
+    softmax_scale: float,
+    is_causal: bool,
+    splitData: torch.Tensor,
+    splitLse: torch.Tensor,
+    output: torch.Tensor,
+    q_scale: Optional[torch.Tensor] = None,
+    k_scale: Optional[torch.Tensor] = None,
+    v_scale: Optional[torch.Tensor] = None,
+) -> None: ...
+
+
 def get_mla_metadata_info_v1(
     batch_size: int,
     max_seqlen_qo: int,
@@ -768,6 +856,7 @@ def get_mla_metadata_info_v1(
 def get_mla_metadata_v1(
     seqlens_qo_indptr: torch.Tensor,
     seqlens_kv_indptr: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
     num_heads_per_head_k: int,
     num_heads_k: int,
     is_causal: bool,
@@ -777,6 +866,7 @@ def get_mla_metadata_v1(
     reduce_indptr: torch.Tensor,
     reduce_final_map: torch.Tensor,
     reduce_partial_map: torch.Tensor,
+    page_size: int = 1,
     kv_granularity: int = 16,
     max_seqlen_qo: int = -1,
     uni_seqlen_qo: int = -1,
@@ -790,12 +880,14 @@ def get_mla_metadata_v1(
     """
     Inputs:
         cumulated seqlens of q/o: (batch_size + 1), dtype torch.int32.
-        cumulated seqlens of k/v: (batch_size + 1), dtype torch.int32.
+        cumulated page indices of k/v: (batch_size + 1), dtype torch.int32.
+        Length of last page of k/v: (batch_size), dtype torch.int32.
         num_heads_per_head_k: Equals to num_heads_q // num_heads_k.
         num_heads_k: num_heads_k.
         is_causal: Whether causal mask is enabled.
         Options: Detailed settings for spliting. All of them are optional.
-            kv_granularity: default=16. The granularity on kv sequence length when cutting batch.
+            page_size: default=1. The size of a page.
+            kv_granularity: default=16. The granularity on kv page nums when cutting batch.
             max_seqlen_qo: default=-1. Used to check lds usage and save time. value less than 1 means unknown.
             uni_seqlen_qo: default=-1. Sequence length of qo is uniform across batches. value less than 1 means the
                            length is not fixed.
@@ -813,11 +905,11 @@ def get_mla_metadata_v1(
         [2.2] q_start:          (#work),            The global index in seq where q/o starts. Use global index here can
                                                     reduce memory access count in kernel.
         [2.3] q_end:            (#work),            The global index in seq where q/o ends (not included).
-        [2.4] kv_start:         (#work),            The global index in seq where k/v starts.
-        [2.5] kv_end:           (#work),            The global index in seq where k/v ends (not included). Note that
+        [2.4] kv_start:         (#work),            The global index in page where k/v starts.
+        [2.5] kv_end:           (#work),            The global index in page where k/v ends (not included). Note that
                                                     this value indicates the end of last qo sequence if there are
                                                     multiple qo sequences included in the current work and causal mask
-                                                    is enabled.
+                                                    is enabled when page_size is 1.
         [2.6] kv_offset:        (#work),            Remaining length in seq from kv_end to the end of current batch.
         [2.7] pad               (#work, 1),         Pad to 8 DWs.
         [3] reduce_indptr:      (sum(qo_seqlen_blk_count) + 1),

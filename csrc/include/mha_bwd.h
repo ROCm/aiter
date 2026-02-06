@@ -1,6 +1,6 @@
 #pragma once
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 // Include these 2 headers instead of torch/extension.h since we don't need all of the torch
 // headers.
@@ -118,7 +118,7 @@ struct mha_bwd_args
     int nhead_stride_randval;
     int nhead_stride_do;
     int nhead_stride_lsed;
-    int nhead_stride_dq_acc;
+    int64_t nhead_stride_dq_acc;
     int nhead_stride_dq;
     int nhead_stride_dk;
     int nhead_stride_dv;
@@ -131,7 +131,7 @@ struct mha_bwd_args
     int batch_stride_randval;
     int batch_stride_do;
     int batch_stride_lsed;
-    int batch_stride_dq_acc;
+    int64_t batch_stride_dq_acc;
     int batch_stride_dq;
     int batch_stride_dk;
     int batch_stride_dv;

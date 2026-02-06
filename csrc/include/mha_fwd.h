@@ -1,6 +1,6 @@
 #pragma once
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 // Include these 2 headers instead of torch/extension.h since we don't need all
 // of the torch headers.
@@ -179,6 +179,8 @@ struct mha_fwd_args
                                            // array [batch + 1]. (Used with padding)
     const void* cu_seqlen_k_ptr = nullptr; // Cumulative logical (excluding padding) sequence length
                                            // array [batch + 1]. (Used with padding)
+    const void* block_scale_seqstart_q_ptr;
+    const void* block_scale_seqstart_k_ptr;
     const void* sink_ptr;
 
     ck_tile::index_t seqlen_q;
@@ -206,6 +208,9 @@ struct mha_fwd_args
     ck_tile::index_t nhead_stride_randval;
     ck_tile::index_t nhead_stride_lse;
     ck_tile::index_t nhead_stride_o;
+    ck_tile::index_t nhead_stride_q_descale;
+    ck_tile::index_t nhead_stride_k_descale;
+    ck_tile::index_t nhead_stride_v_descale;
     ck_tile::index_t batch_stride_q;
     ck_tile::index_t batch_stride_k;
     ck_tile::index_t batch_stride_v;
@@ -213,6 +218,9 @@ struct mha_fwd_args
     ck_tile::index_t batch_stride_randval;
     ck_tile::index_t batch_stride_lse;
     ck_tile::index_t batch_stride_o;
+    ck_tile::index_t batch_stride_q_descale;
+    ck_tile::index_t batch_stride_k_descale;
+    ck_tile::index_t batch_stride_v_descale;
 
     ck_tile::index_t window_size_left;
     ck_tile::index_t window_size_right;
@@ -226,6 +234,9 @@ struct mha_fwd_args
 
     std::variant<std::pair<uint64_t, uint64_t>, std::pair<const void*, const void*>>
         drop_seed_offset;
+
+    ck_tile::index_t block_scale_size_q;
+    ck_tile::index_t block_scale_size_kv;
 };
 
 using mha_fwd_splitkv_args   = fmha_fwd_splitkv_args;
