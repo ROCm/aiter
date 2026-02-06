@@ -288,7 +288,6 @@ class CustomAllreduce:
         """
         if out is None:
             out = torch.empty_like(inp)
-        print("all_reduce: input shape ",inp.shape)
         ops.all_reduce(
             self._ptr,
             inp,
