@@ -118,7 +118,7 @@ def fused_moe(
     bias1=None,
     bias2=None,
     splitk=0,
-    use_flydsl=True,
+    use_flydsl=False,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -172,7 +172,7 @@ def fused_moe_fake(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
-    use_flydsl: bool = True,
+    use_flydsl: bool = False,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -207,7 +207,7 @@ def fused_moe_(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
-    use_flydsl: bool = True,
+    use_flydsl: bool = False,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -1155,7 +1155,7 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and activation == aiter.ActivationType.Swiglu
     ):
-        if not use_flydsl:
+        if a2.dtype != dtypes.fp8:
             a2 = a2.to(dtypes.fp8)
         a2_scale = a1_scale
     elif quant_type == QuantType.per_1x32:
@@ -1672,11 +1672,115 @@ def cktile_moe_stage1(
     )
 
     if split_k > 1:
-        if activation == ActivationType.Silu:
+        if activation == activationtype.silu:
             aiter.silu_and_mul(out, tmp_out)  # TODO: support fp32 splitk
         else:
             aiter.gelu_and_mul(out, tmp_out)
-    return out
+
+    if a1_scale is None or w1_scale is None:
+        raise RuntimeError("FlyDSL stage1 requires a1_scale and w1_scale")
+
+    is_wfp4_pipeline = w1.dtype == dtypes.fp4x2
+
+    token_num = hidden_states.shape[0]
+    E, _, model_dim_pack = w1.shape
+    model_dim = model_dim_pack * 2 if w1.dtype == dtypes.fp4x2 else model_dim_pack 
+    inter_dim = w2.shape[2] * 2 if w1.dtype == dtypes.fp4x2 else w2.shape[2]
+
+    tile_m = block_m if block_m is not None else 64
+    tile_n = 128 if not is_wfp4_pipeline else 256
+    tile_k = 128 if not is_wfp4_pipeline else 256
+
+    # import pdb;pdb.set_trace()
+    sorted_ids = sorted_token_ids.contiguous()
+    sorted_eids = sorted_expert_ids.contiguous()
+    sorted_size = sorted_ids.shape[0]
+    size_expert_ids_total = sorted_eids.shape[0]
+    blocks = sorted_eids.shape[0]
+
+    if sorted_weights is None:
+        sorted_w = torch.zeros(sorted_ids.shape, dtype=dtypes.fp32, device=sorted_ids.device)
+        doweight_stage1 = False
+    else:
+        sorted_w = sorted_weights
+        doweight_stage1 = True
+
+    debug_flydsl = os.environ.get("AITER_FLYDSL_DEBUG", "0") == "1"
+    if debug_flydsl:
+        logger.info(
+            "[flydsl] stage1 inputs: tokens=%d topk=%d model_dim=%d inter_dim=%d block_m=%d",
+            token_num,
+            topk,
+            model_dim,
+            inter_dim,
+            tile_m,
+        )
+
+    if not is_wfp4_pipeline:
+        x_q = hidden_states.contiguous().view(token_num, model_dim)
+        scale_x_1d = a1_scale.view(-1).contiguous()
+        w1_flat = w1.contiguous().view(E * (2 * inter_dim), model_dim)
+        w1_scale_1d = w1_scale.view(-1).contiguous()
+    else:
+        x_q = hidden_states.contiguous().view(token_num, model_dim)
+        scale_x_1d = a1_scale.view(-1).contiguous()
+        w1_flat = w1.contiguous()
+        w1_scale_1d = w1_scale.view(-1).contiguous()
+
+    try:
+        from flydsl.kernels.moe_gemm_2stage import compile_moe_gemm1  # type: ignore
+    except ImportError:
+        # If kernels is not in path, try to add FlyDSL root to path
+        import sys
+        import flydsl
+        flydsl_path = os.path.dirname(os.path.dirname(flydsl.__file__))
+        if flydsl_path not in sys.path:
+            sys.path.insert(0, flydsl_path)
+        from kernels.moe_gemm_2stage import compile_moe_gemm1  # type: ignore
+
+    out_dtype = "fp8" if is_wfp4_pipeline else "bf16" if dtype == torch.bfloat16 else "f16"
+    out_tmp = torch.empty((token_num, topk, D), dtype=dtypes.fp8, device=hidden_states.device)
+    # out_dtype = "bf16"
+    # out_tmp = torch.empty((token_num, topk, D), dtype=dtypes.bf16, device=hidden_states.device)
+
+    extra_w4_stage1_args = {}
+
+    exe1 = compile_moe_gemm1(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=E,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_k,
+        tile_k=tile_k,
+        x_dtype="fp8",
+        w_dtype="fp4",
+        doweight_stage1=bool(doweight_stage1),
+        out_dtype=out_dtype,
+        enable_bias=True,
+        act="swiglu" if is_wfp4_pipeline else "silu",
+        use_cshuffle_epilog=out_dtype == "fp8" if is_wfp4_pipeline else False,
+        **extra_w4_stage1_args,
+    )
+
+    exe1(
+        out_tmp,
+        x_q,
+        w1_flat,
+        scale_x_1d,
+        w1_scale_1d,
+        sorted_ids,
+        sorted_eids,
+        sorted_w,
+        num_valid_ids,
+        bias1,
+        token_num,
+        inter_dim,
+        model_dim,
+        blocks,
+        # torch.cuda.current_stream().cuda_stream,
+    )
+    return out_tmp
 
 
 def flydsl_moe_stage1(
@@ -1747,10 +1851,7 @@ def flydsl_moe_stage1(
         w1_scale_1d = w1_scale.view(-1).contiguous()
 
     try:
-        if not is_wfp4_pipeline:
-            from flydsl.kernels.moe_gemm_2stage import compile_moe_gemm1  # type: ignore
-        else:
-            from flydsl.kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1 as compile_moe_gemm1
+        from flydsl.kernels.moe_gemm_2stage import compile_moe_gemm1  # type: ignore
     except ImportError:
         # If kernels is not in path, try to add FlyDSL root to path
         import sys
@@ -1758,20 +1859,12 @@ def flydsl_moe_stage1(
         flydsl_path = os.path.dirname(os.path.dirname(flydsl.__file__))
         if flydsl_path not in sys.path:
             sys.path.insert(0, flydsl_path)
-        if not is_wfp4_pipeline:
-            from kernels.moe_gemm_2stage import compile_moe_gemm1  # type: ignore
-        else:
-            from kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1 as compile_moe_gemm1 
+        from kernels.moe_gemm_2stage import compile_moe_gemm1  # type: ignore
 
     out_dtype = "fp8" if is_wfp4_pipeline else "bf16" if dtype == torch.bfloat16 else "f16"
+    # out_dtype = "bf16"
 
     extra_w4_stage1_args = {}
-    if is_wfp4_pipeline:
-        extra_w4_stage1_args["a_dtype"] = "fp8"
-        extra_w4_stage1_args["b_dtype"] = "fp4"
-        extra_w4_stage1_args["enable_bias"] = bias1 is not None,
-    else:
-        extra_w4_stage1_args["in_dtype"] = "fp8"
 
     exe1 = compile_moe_gemm1(
         model_dim=model_dim,
@@ -1781,8 +1874,12 @@ def flydsl_moe_stage1(
         tile_m=tile_m,
         tile_n=tile_k,
         tile_k=tile_k,
+        x_dtype="fp8",
+        w_dtype="fp4",
         doweight_stage1=bool(doweight_stage1),
         out_dtype=out_dtype,
+        enable_bias=True,
+        act="swiglu" if is_wfp4_pipeline else "silu",
         use_cshuffle_epilog=out_dtype == "fp8" if is_wfp4_pipeline else False,
         **extra_w4_stage1_args,
     )
@@ -1802,7 +1899,7 @@ def flydsl_moe_stage1(
         inter_dim,
         model_dim,
         blocks,
-        torch.cuda.current_stream().cuda_stream,
+        # torch.cuda.current_stream().cuda_stream,
     )
     return out
 
@@ -1899,10 +1996,7 @@ def flydsl_moe_stage2(
         sorted_w = sorted_weights
 
     try:
-        if not is_wfp4_pipeline:
-            from flydsl.kernels.moe_gemm_2stage import compile_moe_gemm2
-        else:
-            from flydsl.kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2 as compile_moe_gemm2
+        from flydsl.kernels.moe_gemm_2stage import compile_moe_gemm2
     except ImportError:
         # If kernels is not in path, try to add FlyDSL root to path
         import sys
@@ -1910,10 +2004,7 @@ def flydsl_moe_stage2(
         flydsl_path = os.path.dirname(os.path.dirname(flydsl.__file__))
         if flydsl_path not in sys.path:
             sys.path.insert(0, flydsl_path)
-        if not is_wfp4_pipeline:
-            from kernels.moe_gemm_2stage import compile_moe_gemm2
-        else:
-            from kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1 as compile_moe_gemm2
+        from kernels.moe_gemm_2stage import compile_moe_gemm2
 
     if out.dtype == dtypes.bf16:
         out_dtype = "bf16"
@@ -1925,13 +2016,6 @@ def flydsl_moe_stage2(
         raise ValueError(
             f"FlyDSL stage2 only supports out dtype in (fp16, bf16, fp32), got {out.dtype}"
         )
-    extra_w4_stage2_args = {}
-    if is_wfp4_pipeline:
-        extra_w4_stage2_args["a_dtype"] = "fp8"
-        extra_w4_stage2_args["b_dtype"] = "fp4"
-        extra_w4_stage2_args["enable_bias"] = bias2 is not None,
-    else:
-        extra_w4_stage2_args["in_dtype"] = "fp8"
 
     exe2 = compile_moe_gemm2(
         model_dim=model_dim,
@@ -1941,9 +2025,11 @@ def flydsl_moe_stage2(
         tile_m=block_m,
         tile_n=tile_n,
         tile_k=tile_k,
+        x_dtype="fp8",
+        w_dtype="fp4",
+        enable_bias=True,
         doweight_stage2=bool(sorted_weights is not None),
         out_dtype=out_dtype,
-        **extra_w4_stage2_args,
     )
 
     exe2(
@@ -1961,7 +2047,7 @@ def flydsl_moe_stage2(
         model_dim,
         inter_dim,
         blocks,
-        torch.cuda.current_stream().cuda_stream,
+        # torch.cuda.current_stream().cuda_stream,
     )
     return out
 
