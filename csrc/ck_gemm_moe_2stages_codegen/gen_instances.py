@@ -61,7 +61,7 @@ MoeKernel moe_stage2_heuristic_dispatch(int block_m, int inter_dim, at::ScalarTy
 heuristic_dispatch_end = """
     TORCH_CHECK(
         false,
-        "Unsupported kernel config for moe heuristic dispatch");
+        "Unsupported kernel config for moe heuristic dispatch", act_op, x_dtype, w_dtype, y_dtype, quant, mul_routed_weight_stage, block_m, inter_dim);
 }}
 
 """

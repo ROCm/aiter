@@ -50,6 +50,7 @@ def test_fmoe(
     intermediate_pad=0,
     preshuffle=False,
     dsl=False,
+    reduce=False,  # FlyDSL accumulate=False + reduce mode
 ):
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
         return
@@ -256,6 +257,7 @@ def test_fmoe(
         bias1=exp_bias1_aiter,
         bias2=exp_bias2_aiter,
         use_flydsl=dsl,
+        flydsl_accumulate=not reduce,  # reduce mode: accumulate=False
         num_iters=5,
         num_warmup=2,
     )
@@ -425,6 +427,13 @@ parser.add_argument(
     help="""use DSL moe 2stage""",
 )
 
+parser.add_argument(
+    "-reduce",
+    "--reduce",
+    action="store_true",
+    help="""use FlyDSL stage2 with accumulate=False + reduce mode (requires -dsl)""",
+)
+
 args = parser.parse_args()
 if args.dtype is None:
     l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
@@ -478,6 +487,7 @@ for (
                     hidden_pad=hidden_pad,
                     intermediate_pad=intermediate_pad,
                     dsl=args.dsl,
+                    reduce=args.reduce,
                 )
                 df.append(ret)
     elif (quant_type, aq_dtype, wq_dtype) == (
@@ -503,6 +513,7 @@ for (
                     hidden_pad=hidden_pad,
                     intermediate_pad=intermediate_pad,
                     dsl=args.dsl,
+                    reduce=args.reduce,
                 )
                 df.append(ret)
     elif (quant_type, aq_dtype, wq_dtype) == (
@@ -530,6 +541,7 @@ for (
                         hidden_pad=0,
                         intermediate_pad=0,
                         dsl=args.dsl,
+                        reduce=args.reduce,
                     )
                     df.append(ret)
     else:
@@ -549,6 +561,7 @@ for (
                     use_g1u1=True,
                     doweight_stage1=doweight_stage1,
                     dsl=args.dsl,
+                    reduce=args.reduce,
                 )
                 df.append(ret)
 df = pd.DataFrame(df)

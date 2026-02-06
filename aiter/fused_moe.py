@@ -119,6 +119,7 @@ def fused_moe(
     bias2=None,
     splitk=0,
     use_flydsl=True,
+    flydsl_accumulate=True,  # FlyDSL stage2: True=atomic accumulate, False=reduce mode
 ):
     if not block_size_M:
         block_size_M = -1
@@ -145,6 +146,7 @@ def fused_moe(
         bias1=bias1,
         bias2=bias2,
         use_flydsl=use_flydsl,
+        flydsl_accumulate=flydsl_accumulate,
     )
 
 
@@ -173,6 +175,7 @@ def fused_moe_fake(
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
     use_flydsl: bool = True,
+    flydsl_accumulate: bool = True,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -208,6 +211,7 @@ def fused_moe_(
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
     use_flydsl: bool = True,
+    flydsl_accumulate: bool = True,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -326,6 +330,7 @@ def fused_moe_(
             bias1=bias1,
             bias2=bias2,
             use_flydsl=use_flydsl,
+            flydsl_accumulate=flydsl_accumulate,
         )
 
 
@@ -623,6 +628,7 @@ def get_2stage_cfgs(
     hidden_pad,
     intermediate_pad,
     use_flydsl,
+    flydsl_accumulate=True,
 ):
     def get_cfg_2stages(tune_file):
         import pandas as pd
@@ -808,12 +814,12 @@ def get_2stage_cfgs(
             use_flydsl
             and _is_flydsl_available()
             and q_type == QuantType.per_1x32
-            and q_dtype_a == dtypes.fp8
+            and (q_dtype_a == dtypes.fp8 or q_dtype_a == dtypes.fp4x2)
             and q_dtype_w == dtypes.fp4x2
             and use_g1u1
-            and activation == ActivationType.Swiglu
+            and (activation == ActivationType.Swiglu or activation == ActivationType.Silu)
         )
-        use_flydsl_stage1 = use_flydsl_stage2
+        use_flydsl_stage1 = False if q_dtype_a == dtypes.fp4x2 else use_flydsl_stage2
         flydsl_block_m = int(block_m) if block_m is not None else 64
         stage1_func = (
             functools.partial(flydsl_moe_stage1)
@@ -826,7 +832,7 @@ def get_2stage_cfgs(
             )
         )
         stage2_func = (
-            functools.partial(flydsl_moe_stage2)
+            functools.partial(flydsl_moe_stage2, accumulate=flydsl_accumulate)
             if use_flydsl_stage2
             else functools.partial(
                 cktile_moe_stage2,
@@ -837,6 +843,7 @@ def get_2stage_cfgs(
         )
 
         print("use_flydsl_stage2 = %s", use_flydsl_stage2)
+        print("flydsl_accumulate = %s", flydsl_accumulate)
         print("use_flydsl_stage1 = %s", use_flydsl_stage1)
         print("flydsl_block_m = %s", flydsl_block_m)
         print("stage1_func = %s", stage1_func)
@@ -895,13 +902,20 @@ def get_2stage_cfgs(
         use_flydsl_stage2 = (
             use_flydsl
             and _is_flydsl_available()
-            and q_type == QuantType.per_Token
-            and q_dtype_a == dtypes.fp8
-            and q_dtype_w == dtypes.fp8
+            and q_type == QuantType.per_1x32
+            and (q_dtype_a == dtypes.fp8 or q_dtype_a == dtypes.fp4x2)
+            and q_dtype_w == dtypes.fp4x2
             and use_g1u1
-            and activation == ActivationType.Silu
+            and (activation == ActivationType.Silu)
         )
-        use_flydsl_stage1 = use_flydsl_stage2
+        print("use_flydsl_stage2 = %s", use_flydsl_stage2)
+        print("q_dtype_a = %s", q_dtype_a)
+        print("q_dtype_w = %s", q_dtype_w)
+        print("activation = %s", activation)
+        print("use_g1u1 = %s", use_g1u1)
+        print("use_flydsl = %s", use_flydsl)
+        print("_is_flydsl_available() = %s", _is_flydsl_available())
+        use_flydsl_stage1 = False if q_dtype_a == dtypes.fp4x2 else use_flydsl_stage2
         flydsl_block_m = int(block_m) if block_m is not None else 64
         stage1_func = (
             functools.partial(flydsl_moe_stage1)
@@ -912,13 +926,14 @@ def get_2stage_cfgs(
                 activation=activation,
                 quant_type=q_type,
                 dtype=dtype,
-                splitk=ksplit,
+                splitk=0,
                 use_non_temporal_load=use_non_temporal_load,
             )
         )
         stage2_func = (
             functools.partial(
                 flydsl_moe_stage2,
+                accumulate=flydsl_accumulate,
             )
             if use_flydsl_stage2
             else functools.partial(
@@ -929,8 +944,9 @@ def get_2stage_cfgs(
                 use_non_temporal_load=use_non_temporal_load,
             )
         )
-        
+
         print("use_flydsl_stage2 = %s", use_flydsl_stage2)
+        print("flydsl_accumulate = %s", flydsl_accumulate)
         print("use_flydsl_stage1 = %s", use_flydsl_stage1)
         print("flydsl_block_m = %s", flydsl_block_m)
         print("stage1_func = %s", stage1_func)
@@ -942,8 +958,7 @@ def get_2stage_cfgs(
             stage1_func,
             stage2_func,
             flydsl_block_m if use_flydsl_stage1 else block_m,
-            block_m,
-            int(ksplit),
+            int(0),
             run_1stage,
         )
 
@@ -1003,6 +1018,7 @@ def fused_moe_2stages(
     bias1=None,
     bias2=None,
     use_flydsl: bool = True,
+    flydsl_accumulate: bool = True,
 ):
     quant_func = get_quant(quant_type)
     token_num_quant_moe_sort_switch = 1024
@@ -1026,6 +1042,7 @@ def fused_moe_2stages(
         hidden_pad,
         intermediate_pad,
         use_flydsl,
+        flydsl_accumulate,
     )
     a2 = None
     if (
@@ -1703,7 +1720,7 @@ def flydsl_moe_stage1(
 
     token_num = hidden_states.shape[0]
     E, _, model_dim_pack = w1.shape
-    model_dim = model_dim_pack * 2 if w1.dtype == dtypes.fp4x2 else model_dim_pack 
+    model_dim = model_dim_pack * 2 if w1.dtype == dtypes.fp4x2 else model_dim_pack
     inter_dim = w2.shape[2] * 2 if w1.dtype == dtypes.fp4x2 else w2.shape[2]
 
     tile_m = block_m if block_m is not None else 64
@@ -1761,7 +1778,7 @@ def flydsl_moe_stage1(
         if not is_wfp4_pipeline:
             from kernels.moe_gemm_2stage import compile_moe_gemm1  # type: ignore
         else:
-            from kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1 as compile_moe_gemm1 
+            from kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1 as compile_moe_gemm1
 
     out_dtype = "fp8" if is_wfp4_pipeline else "bf16" if dtype == torch.bfloat16 else "f16"
 
@@ -1769,7 +1786,7 @@ def flydsl_moe_stage1(
     if is_wfp4_pipeline:
         extra_w4_stage1_args["a_dtype"] = "fp8"
         extra_w4_stage1_args["b_dtype"] = "fp4"
-        extra_w4_stage1_args["enable_bias"] = bias1 is not None,
+        extra_w4_stage1_args["enable_bias"] = bias1 is not None
     else:
         extra_w4_stage1_args["in_dtype"] = "fp8"
 
@@ -1871,6 +1888,7 @@ def flydsl_moe_stage2(
     block_m,
     sorted_weights=None,
     bias2=None,
+    accumulate=True,  # True: ?? atomic ??; False: ?? [tokens*topk, model_dim] ?? reduce
     **_kwargs,
 ):
     if w2_scale is None or a2_scale is None:
@@ -1881,6 +1899,10 @@ def flydsl_moe_stage2(
     token_num, _, inter_dim = a2.shape
     model_dim = w2.shape[1]
     E = w2.shape[0]
+
+    if is_wfp4_pipeline:
+        inter_dim = inter_dim * 2
+        print(f"[FlyDSL-DEBUG] fp4x2: adjusted inter_dim from {inter_dim//2} to {inter_dim}")
 
     tile_m = block_m if block_m is not None else 64
     tile_n = 128
@@ -1897,22 +1919,32 @@ def flydsl_moe_stage2(
     else:
         sorted_w = sorted_weights
 
+    # Import compile_moe_gemm2
+    import sys
     try:
         if not is_wfp4_pipeline:
             from flydsl.kernels.moe_gemm_2stage import compile_moe_gemm2
         else:
             from flydsl.kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2 as compile_moe_gemm2
     except ImportError:
-        # If kernels is not in path, try to add FlyDSL root to path
-        import sys
-        import flydsl
-        flydsl_path = os.path.dirname(os.path.dirname(flydsl.__file__))
-        if flydsl_path not in sys.path:
-            sys.path.insert(0, flydsl_path)
+        # ?? flydsl.kernels ???,?? Flydsl ???? path
+        try:
+            import flydsl
+            # flydsl.__file__ = Flydsl/flydsl/src/flydsl/__init__.py
+            flydsl_root = os.path.dirname(os.path.dirname(os.path.dirname(flydsl.__file__)))
+            if flydsl_root not in sys.path:
+                sys.path.insert(0, flydsl_root)
+        except ImportError:
+            # ? aiter ??? Flydsl
+            aiter_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            flydsl_root = os.path.join(aiter_root, "Flydsl")
+            if os.path.exists(flydsl_root) and flydsl_root not in sys.path:
+                sys.path.insert(0, flydsl_root)
+
         if not is_wfp4_pipeline:
             from kernels.moe_gemm_2stage import compile_moe_gemm2
         else:
-            from kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1 as compile_moe_gemm2
+            from kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2 as compile_moe_gemm2
 
     if out.dtype == dtypes.bf16:
         out_dtype = "bf16"
@@ -1924,13 +1956,22 @@ def flydsl_moe_stage2(
         raise ValueError(
             f"FlyDSL stage2 only supports out dtype in (fp16, bf16, fp32), got {out.dtype}"
         )
+
+    # accumulate=False ??? f16/bf16 ??
+    if not accumulate and out_dtype == "f32":
+        raise ValueError("FlyDSL stage2 accumulate=False only supports out_dtype in (f16, bf16)")
+
     extra_w4_stage2_args = {}
     if is_wfp4_pipeline:
-        extra_w4_stage2_args["a_dtype"] = "fp8"
+        extra_w4_stage2_args["a_dtype"] = "fp4"
         extra_w4_stage2_args["b_dtype"] = "fp4"
-        extra_w4_stage2_args["enable_bias"] = bias2 is not None,
+        extra_w4_stage2_args["enable_bias"] = bias2 is not None
     else:
         extra_w4_stage2_args["in_dtype"] = "fp8"
+
+    # ? bias2 ? None ?,????? tensor(Flydsl ?????? None)
+    if bias2 is None:
+        bias2 = torch.empty(0, dtype=dtypes.fp32, device=a2.device)
 
     exe2 = compile_moe_gemm2(
         model_dim=model_dim,
@@ -1942,25 +1983,54 @@ def flydsl_moe_stage2(
         tile_k=tile_k,
         doweight_stage2=bool(sorted_weights is not None),
         out_dtype=out_dtype,
+        accumulate=accumulate,
         **extra_w4_stage2_args,
     )
 
-    exe2(
-        out,
-        a2,
-        w2,
-        a2_scale,
-        w2_scale,
-        sorted_ids,
-        sorted_eids,
-        sorted_w,
-        num_valid_ids,
-        bias2,
-        token_num,
-        model_dim,
-        inter_dim,
-        blocks,
-    )
+    if accumulate:
+        # ????: ???? out [tokens, model_dim]
+        exe2(
+            out,
+            a2,
+            w2,
+            a2_scale,
+            w2_scale,
+            sorted_ids,
+            sorted_eids,
+            sorted_w,
+            num_valid_ids,
+            bias2,
+            token_num,
+            model_dim,
+            inter_dim,
+            blocks,
+        )
+    else:
+        # Reduce ??: ??? [tokens * topk, model_dim],?? reduce
+        out_slots = torch.empty(
+            (token_num * topk * model_dim,),
+            device=out.device,
+            dtype=out.dtype,
+        )
+        exe2(
+            out_slots,
+            a2,
+            w2,
+            a2_scale,
+            w2_scale,
+            sorted_ids,
+            sorted_eids,
+            sorted_w,
+            num_valid_ids,
+            bias2,
+            token_num,
+            model_dim,
+            inter_dim,
+            blocks,
+        )
+        # Reduce over topk dimension using torch.sum
+        out_slots_3d = out_slots.view(token_num, topk, model_dim)
+        torch.sum(out_slots_3d, dim=1, out=out)
     return out
 
 
