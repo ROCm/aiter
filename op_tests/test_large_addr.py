@@ -23,7 +23,11 @@ import torch
 os.environ["AITER_DISABLE_V3_FWD"] = "1"
 
 import aiter
-from aiter.test_common import checkAllclose
+from aiter.test_common import checkAllclose, run_perftest
+from aiter.test_mha_common import (
+    attention_ref,
+    generate_qkv,
+)
 
 
 def get_device_arch():
@@ -59,6 +63,69 @@ def load_kernel_configs():
     return configs
 
 
+def run_torch(
+    q, k, v, dout,
+    causal=False,
+    window_size=(-1, -1),
+    upcast=True,
+    reorder_ops=False,
+):
+    """
+    Run PyTorch reference implementation (aligned with test_mha.py).
+    Uses attention_ref from aiter.test_mha_common.
+    """
+    out, _, softmax_lse = attention_ref(
+        q, k, v,
+        None,  # query_padding_mask
+        None,  # key_padding_mask
+        None,  # attn_bias
+        0.0,   # dropout_p
+        None,  # dropout_mask
+        causal=causal,
+        window_size=window_size,
+        upcast=upcast,
+        reorder_ops=reorder_ops,
+    )
+    
+    dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
+    return out, softmax_lse, dq, dk, dv
+
+
+def print_mismatch_info(name, tensor_aiter, tensor_ref, tensor_pt, tol):
+    """Print detailed mismatch information (aligned with test_mha.py)."""
+    diff = (tensor_aiter - tensor_ref).abs()
+    max_diff = diff.max().item()
+    
+    if max_diff > tol:
+        # Find max diff location
+        max_idx = torch.unravel_index(torch.argmax(diff), diff.shape)
+        coords = tuple(idx.item() for idx in max_idx)
+        print(f"\n--- {name} Mismatch Details ---")
+        print(f"  Max diff: {max_diff}")
+        print(f"  Max diff coords (batch, seq, head, dim): {coords}")
+        print(f"  Aiter value:  {tensor_aiter[max_idx].item()}")
+        print(f"  Ref value:    {tensor_ref[max_idx].item()}")
+        if tensor_pt is not None:
+            print(f"  PyTorch value: {tensor_pt[max_idx].item()}")
+            print(f"  Aiter-Ref diff: {(tensor_aiter[max_idx] - tensor_ref[max_idx]).item()}")
+            print(f"  PyTorch-Ref diff: {(tensor_pt[max_idx] - tensor_ref[max_idx]).item()}")
+        
+        # Print top 5 largest mismatches (handle large tensors)
+        flat_diff = diff.flatten()
+        top_k = 5
+        if flat_diff.numel() <= 2**31 - 1:
+            top_k = min(top_k, flat_diff.numel())
+            top_vals, top_indices = torch.topk(flat_diff, top_k)
+            print(f"  Top {top_k} mismatches:")
+            for i in range(top_k):
+                idx = torch.unravel_index(top_indices[i], diff.shape)
+                coords = tuple(ix.item() for ix in idx)
+                print(f"    [{i+1}] coords={coords}, diff={top_vals[i].item():.6f}, "
+                      f"aiter={tensor_aiter[idx].item():.6f}, ref={tensor_ref[idx].item():.6f}")
+        else:
+            print(f"  (Tensor too large for top-k analysis, showing max only)")
+
+
 def get_test_params_for_kernel(config):
     """
     Generate test parameters for a given kernel configuration.
@@ -78,15 +145,13 @@ def get_test_params_for_kernel(config):
     dtype = torch.bfloat16 if dtype_str == 'bf16' else torch.float16
     
     # Determine causal type
-    if mask == 0:
-        causal = False
-        causal_type = None
-    elif mask == 1:
-        causal = True
-        causal_type = "top_left"
-    else:  # mask == 2
-        causal = True
+    causal = mask > 0
+    if mask == 2:
         causal_type = "bottom_right"
+    elif mask == 1:
+        causal_type = "top_left"
+    else:
+        causal_type = None
     
     # deterministic=False is required to use ASM backend kernels
     # atomic32 field determines a16 vs a32 kernel via is_v3_atomic_fp32 flag
@@ -95,31 +160,15 @@ def get_test_params_for_kernel(config):
     is_v3_atomic_fp32 = (atomic32 == 1)  # 1=a32, 0=a16
     
     # Calculate sequence length to trigger 32-bit overflow
-    # Target: batch * seq * heads * hdim * sizeof(dtype) > 4GB
-    # For bf16/fp16: sizeof = 2 bytes
-    # Example: 8 * 75600 * 40 * 128 * 2 = 6.2 GB > 4GB
-    
-    # Adjust seq_k based on hdim to ensure overflow while staying within memory limits
-    if hdim_q == 64:
-        batch_size = 4
-        nheads = 32
-        seqlen_q = 256
-        seqlen_k = 100000  # Larger for smaller hdim
-    elif hdim_q == 128:
-        # batch_size = 8
-        # nheads = 40
-        # seqlen_q = 256
-        # seqlen_k = 75600
-
-        batch_size = 8
-        nheads = 40
-        seqlen_q = 256
-        seqlen_k = 75600
-    else:  # hdim_q == 192
-        batch_size = 8
-        nheads = 40
-        seqlen_q = 256
-        seqlen_k = 50000  # Smaller for larger hdim
+    # For batch=8, heads=40, hdim=128, dtype=2bytes:
+    # Total size = 8 * seqlen * 40 * 128 * 2 = 81920 * seqlen bytes
+    # Need > 4GB = 4294967296 bytes
+    # seqlen > 4294967296 / 81920 = 52428
+    # Use seqlen_k = 75600 to ensure overflow (gives ~6.2GB)
+    batch_size = 8
+    nheads = 40
+    seqlen_q = 256
+    seqlen_k = 75600  # Large enough to trigger 32-bit address overflow
     
     return {
         "batch_size": batch_size,
@@ -158,17 +207,14 @@ def run_mha_backward_test(
 ):
     """
     Run a single MHA backward test and return results.
-    
-    Returns:
-        dict with test results including max diffs and pass/fail status
+    Fully aligned with test_mha.py methodology.
     """
-    # Build equivalent command string
     dtype_str = "bf16" if dtype == torch.bfloat16 else "fp16"
     causal_flag = "" if causal else "--no-causal"
     det_flag = "--deterministic" if deterministic else "--no-deterministic"
     cmd = (f"AITER_DISABLE_V3_FWD=1 python test_mha.py -b {batch_size} -n {nheads} "
            f"-q {seqlen_q} -k {seqlen_k} -d_qk_v {hdim_q},{hdim_v} -d {dtype_str} "
-           f"{causal_flag} --no-local {det_flag} -m mha".strip())
+           f"{causal_flag} --no-local {det_flag} -m mha")
     
     print(f"\n{'='*70}")
     print(f"Test: {test_name}")
@@ -182,36 +228,38 @@ def run_mha_backward_test(
     
     device = "cuda"
     
-    # Create input tensors
+    # Set window size for causal (aligned with test_mha.py)
+    if causal:
+        if causal_type == "bottom_right":
+            window_size = (seqlen_k - seqlen_q, 0)
+        else:  # top_left
+            window_size = (-1, 0)
+    else:
+        window_size = (-1, -1)
+    
+    # Create input tensors (aligned with test_mha.py)
     q = torch.randn(batch_size, seqlen_q, nheads, hdim_q, device=device, dtype=dtype, requires_grad=True)
     k = torch.randn(batch_size, seqlen_k, nheads, hdim_q, device=device, dtype=dtype, requires_grad=True)
     v = torch.randn(batch_size, seqlen_k, nheads, hdim_v, device=device, dtype=dtype, requires_grad=True)
-    dout = torch.randn(batch_size, seqlen_q, nheads, hdim_v, device=device, dtype=dtype)
+    dout = torch.randn(batch_size, seqlen_q, nheads, hdim_v, device=device, dtype=dtype, requires_grad=True)
     
-    # Set window size for causal
-    if causal:
-        if causal_type == "bottom_right":
-            window_size_left = seqlen_k - seqlen_q
-            window_size_right = 0
-        else:  # top_left
-            window_size_left = -1
-            window_size_right = 0
-    else:
-        window_size_left = -1
-        window_size_right = -1
-    
-    # Run aiter forward + backward
+    # Run aiter forward + backward (aligned with test_mha.py's run_ck)
     try:
-        out, softmax_lse, *_ = aiter.flash_attn_func(
+        (out, softmax_lse, S_dmask), _ = run_perftest(
+            aiter.flash_attn_func,
             q, k, v,
-            dropout_p=0.0,
-            softmax_scale=None,
-            causal=causal,
-            window_size=(window_size_left, window_size_right),
-            return_lse=True,  # Required for backward pass
-            return_attn_probs=False,
-            deterministic=deterministic,
+            0.0,   # dropout_p
+            None,  # softmax_scale
+            causal,
+            window_size,
+            None,  # bias
+            None,  # alibi_slopes
+            deterministic,
+            return_lse=True,
+            return_attn_probs=True,  # Aligned with test_mha.py
+            how_v3_bf16_cvt=2,
             is_v3_atomic_fp32=is_v3_atomic_fp32,  # True=A32, False=A16
+            num_rotate_args=1,
         )
         
         # Compute gradients
@@ -224,87 +272,66 @@ def run_mha_backward_test(
         traceback.print_exc()
         return {"passed": False, "error": error_msg or "Unknown error", "co_name": co_name}
     
-    # Run PyTorch reference
-    q_ref = q.detach().clone().float().requires_grad_(True)
-    k_ref = k.detach().clone().float().requires_grad_(True)
-    v_ref = v.detach().clone().float().requires_grad_(True)
+    # Run PyTorch reference in float32 (upcast=True) - aligned with test_mha.py
+    out_ref, softmax_lse_ref, dq_ref, dk_ref, dv_ref = run_torch(
+        q, k, v, dout, causal=causal, window_size=window_size, upcast=True
+    )
     
-    # Simple attention reference in float32 for accuracy
-    scale = 1.0 / (hdim_q ** 0.5)
-    q_ref_t = q_ref.transpose(1, 2)  # B, H, S_q, D
-    k_ref_t = k_ref.transpose(1, 2)  # B, H, S_k, D
-    v_ref_t = v_ref.transpose(1, 2)  # B, H, S_k, D_v
+    # Run PyTorch in original dtype with reorder_ops (upcast=False, reorder_ops=True)
+    # This is exactly what test_mha.py does for tolerance calculation
+    out_pt, softmax_lse_pt, dq_pt, dk_pt, dv_pt = run_torch(
+        q, k, v, dout, causal=causal, window_size=window_size, upcast=False, reorder_ops=True
+    )
     
-    attn = torch.matmul(q_ref_t, k_ref_t.transpose(-2, -1)) * scale
+    # Print diff values (aligned with test_mha.py)
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Output Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
+    print(f"softmax_lse max diff: {(softmax_lse - softmax_lse_ref).abs().max().item()}")
+    print(f"softmax_lse Pytorch max diff: {(softmax_lse_pt - softmax_lse_ref).abs().max().item()}")
+    print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
+    print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
+    print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
+    print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
+    print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
+    print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
     
-    if causal:
-        # Create causal mask
-        if causal_type == "bottom_right":
-            row_idx = torch.arange(seqlen_q, device=device).unsqueeze(1)
-            col_idx = torch.arange(seqlen_k, device=device).unsqueeze(0)
-            offset = seqlen_k - seqlen_q
-            mask = col_idx <= row_idx + offset
-        else:
-            row_idx = torch.arange(seqlen_q, device=device).unsqueeze(1)
-            col_idx = torch.arange(seqlen_k, device=device).unsqueeze(0)
-            mask = col_idx <= row_idx
-        
-        attn = attn.masked_fill(~mask, float('-inf'))
+    # Tolerance calculation (aligned with test_mha.py: 10x PyTorch diff, min 0.01)
+    dq_tol = max(10 * (dq_pt - dq_ref).abs().max().item(), 0.01)
+    dk_tol = max(10 * (dk_pt - dk_ref).abs().max().item(), 0.01)
+    dv_tol = max(10 * (dv_pt - dv_ref).abs().max().item(), 0.01)
     
-    attn = torch.softmax(attn, dim=-1)
-    out_ref = torch.matmul(attn, v_ref_t)
-    out_ref = out_ref.transpose(1, 2)  # B, S_q, H, D_v
-    
-    dout_ref = dout.clone().float()
-    dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), dout_ref)
-    
-    # Convert back to original dtype for comparison
-    dq_ref = dq_ref.to(dtype)
-    dk_ref = dk_ref.to(dtype)
-    dv_ref = dv_ref.to(dtype)
-    
-    # Compare results
     dq_diff = (dq - dq_ref).abs().max().item()
     dk_diff = (dk - dk_ref).abs().max().item()
     dv_diff = (dv - dv_ref).abs().max().item()
     
-    # Tolerance based on dtype
-    if dtype == torch.bfloat16:
-        tol = 0.02  # bf16 has lower precision
-    else:  # float16
-        tol = 0.01
+    dq_passed = dq_diff <= dq_tol
+    dk_passed = dk_diff <= dk_tol
+    dv_passed = dv_diff <= dv_tol
+    passed = dq_passed and dk_passed and dv_passed
     
-    passed = dq_diff <= tol and dk_diff <= tol and dv_diff <= tol
+    status_q = '✓' if dq_passed else '✗'
+    status_k = '✓' if dk_passed else '✗'
+    status_v = '✓' if dv_passed else '✗'
     
-    status_q = '✓' if dq_diff <= tol else '✗'
-    status_k = '✓' if dk_diff <= tol else '✗'
-    status_v = '✓' if dv_diff <= tol else '✗'
-    
-    print(f"  dQ max diff: {dq_diff:.6f} {status_q}")
-    print(f"  dK max diff: {dk_diff:.6f} {status_k}")
-    print(f"  dV max diff: {dv_diff:.6f} {status_v}")
+    print(f"\nTolerance: dQ_tol={dq_tol:.6f}, dK_tol={dk_tol:.6f}, dV_tol={dv_tol:.6f}")
+    print(f"  dQ: diff={dq_diff:.6f} vs tol={dq_tol:.6f} {status_q}")
+    print(f"  dK: diff={dk_diff:.6f} vs tol={dk_tol:.6f} {status_k}")
+    print(f"  dV: diff={dv_diff:.6f} vs tol={dv_tol:.6f} {status_v}")
     print(f"  Result: {'PASSED' if passed else 'FAILED'}")
     
-    # If failed, show mismatch details
-    if not passed:
-        for name, aiter_tensor, ref_tensor in [
-            ("dQ", dq, dq_ref),
-            ("dK", dk, dk_ref),
-            ("dV", dv, dv_ref),
-        ]:
-            diff = (aiter_tensor - ref_tensor).abs()
-            max_diff = diff.max().item()
-            if max_diff > tol:
-                max_idx = torch.unravel_index(torch.argmax(diff), diff.shape)
-                coords = tuple(idx.item() for idx in max_idx)
-                print(f"  {name} max diff at {coords}: aiter={aiter_tensor[max_idx].item():.6f}, ref={ref_tensor[max_idx].item():.6f}")
+    # Print mismatch details if failed (aligned with test_mha.py)
+    print_mismatch_info("dQ", dq, dq_ref, dq_pt, dq_tol)
+    print_mismatch_info("dK", dk, dk_ref, dk_pt, dk_tol)
+    print_mismatch_info("dV", dv, dv_ref, dv_pt, dv_tol)
     
     return {
         "passed": passed,
         "dq_diff": dq_diff,
         "dk_diff": dk_diff,
         "dv_diff": dv_diff,
-        "tol": tol,
+        "dq_tol": dq_tol,
+        "dk_tol": dk_tol,
+        "dv_tol": dv_tol,
         "co_name": co_name,
     }
 
@@ -327,21 +354,14 @@ def run_mha_varlen_backward_test(
 ):
     """
     Run a single MHA varlen (group mode) backward test and return results.
-    
-    Returns:
-        dict with test results including max diffs and pass/fail status
+    Aligned with test_mha.py methodology.
     """
-    # Build equivalent command string (note: varlen tests use flash_attn_varlen_func directly)
     dtype_str = "bf16" if dtype == torch.bfloat16 else "fp16"
-    causal_flag = "" if causal else "--no-causal"
-    det_flag = "--deterministic" if deterministic else "--no-deterministic"
-    # Note: test_mha.py doesn't have --varlen flag, this test uses flash_attn_varlen_func directly
-    cmd = (f"python test_large_addr.py --kernel {co_name.replace('.co', '')}")
     
     print(f"\n{'='*70}")
     print(f"Test: {test_name} (VARLEN/GROUP MODE)")
     print(f"CO file: {co_name}")
-    print(f"Command: {cmd}")
+    print(f"Command: python test_large_addr.py --kernel {co_name.replace('.co', '')}")
     print(f"Config: batch={batch_size}, heads={nheads}, seq_q={seqlen_q}, seq_k={seqlen_k}")
     print(f"        hdim_q={hdim_q}, hdim_v={hdim_v}, dtype={dtype}")
     print(f"        causal={causal}, causal_type={causal_type}, deterministic={deterministic}")
@@ -350,47 +370,42 @@ def run_mha_varlen_backward_test(
     
     device = "cuda"
     
-    # For varlen, we create tensors in (total_tokens, nheads, hdim) format
-    # with cu_seqlens arrays to mark batch boundaries
-    total_q = batch_size * seqlen_q
-    total_k = batch_size * seqlen_k
-    
-    # Create input tensors (packed format)
-    q = torch.randn(total_q, nheads, hdim_q, device=device, dtype=dtype, requires_grad=True)
-    k = torch.randn(total_k, nheads, hdim_q, device=device, dtype=dtype, requires_grad=True)
-    v = torch.randn(total_k, nheads, hdim_v, device=device, dtype=dtype, requires_grad=True)
-    dout = torch.randn(total_q, nheads, hdim_v, device=device, dtype=dtype)
-    
-    # Create cumulative sequence length arrays
-    cu_seqlens_q = torch.arange(0, (batch_size + 1) * seqlen_q, seqlen_q, device=device, dtype=torch.int32)
-    cu_seqlens_k = torch.arange(0, (batch_size + 1) * seqlen_k, seqlen_k, device=device, dtype=torch.int32)
-    
-    max_seqlen_q = seqlen_q
-    max_seqlen_k = seqlen_k
-    
     # Set window size for causal
     if causal:
         if causal_type == "bottom_right":
-            window_size_left = seqlen_k - seqlen_q
-            window_size_right = 0
+            window_size = (seqlen_k - seqlen_q, 0)
         else:  # top_left
-            window_size_left = -1
-            window_size_right = 0
+            window_size = (-1, 0)
     else:
-        window_size_left = -1
-        window_size_right = -1
+        window_size = (-1, -1)
     
-    # Run aiter varlen forward + backward
+    # For varlen mode, create packed tensors
+    total_q = batch_size * seqlen_q
+    total_k = batch_size * seqlen_k
+    
+    # Create cumulative sequence length tensors
+    cu_seqlens_q = torch.arange(0, (batch_size + 1) * seqlen_q, seqlen_q, device=device, dtype=torch.int32)
+    cu_seqlens_k = torch.arange(0, (batch_size + 1) * seqlen_k, seqlen_k, device=device, dtype=torch.int32)
+    
+    # Create packed input tensors (no batch dimension)
+    q = torch.randn(total_q, nheads, hdim_q, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(total_k, nheads, hdim_q, device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn(total_k, nheads, hdim_v, device=device, dtype=dtype, requires_grad=True)
+    dout = torch.randn(total_q, nheads, hdim_v, device=device, dtype=dtype, requires_grad=True)
+    
+    # Run aiter forward + backward
     try:
         out, softmax_lse, *_ = aiter.flash_attn_varlen_func(
             q, k, v,
-            cu_seqlens_q, cu_seqlens_k,
-            max_seqlen_q, max_seqlen_k,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=seqlen_q,
+            max_seqlen_k=seqlen_k,
             dropout_p=0.0,
             softmax_scale=None,
             causal=causal,
-            window_size=(window_size_left, window_size_right),
-            return_lse=True,  # Required for backward pass
+            window_size=window_size,
+            return_lse=True,
             return_attn_probs=False,
             deterministic=deterministic,
             is_v3_atomic_fp32=is_v3_atomic_fp32,  # True=A32, False=A16
@@ -402,147 +417,86 @@ def run_mha_varlen_backward_test(
     except Exception as e:
         import traceback
         error_msg = str(e) if str(e) else f"{type(e).__name__}"
-        print(f"  ERROR: Aiter varlen failed with: {error_msg}")
+        print(f"  ERROR: Aiter failed with: {error_msg}")
         traceback.print_exc()
         return {"passed": False, "error": error_msg or "Unknown error", "co_name": co_name}
     
-    # Run PyTorch reference (unpack, compute, compare)
-    # Reshape to batch format for reference computation
-    q_batch = q.reshape(batch_size, seqlen_q, nheads, hdim_q)
-    k_batch = k.reshape(batch_size, seqlen_k, nheads, hdim_q)
-    v_batch = v.reshape(batch_size, seqlen_k, nheads, hdim_v)
+    # For reference, reshape to batch format and compute using attention_ref
+    q_batch = q.reshape(batch_size, seqlen_q, nheads, hdim_q).requires_grad_(True)
+    k_batch = k.reshape(batch_size, seqlen_k, nheads, hdim_q).requires_grad_(True)
+    v_batch = v.reshape(batch_size, seqlen_k, nheads, hdim_v).requires_grad_(True)
     dout_batch = dout.reshape(batch_size, seqlen_q, nheads, hdim_v)
     
-    q_ref = q_batch.detach().clone().float().requires_grad_(True)
-    k_ref = k_batch.detach().clone().float().requires_grad_(True)
-    v_ref = v_batch.detach().clone().float().requires_grad_(True)
+    # Run PyTorch reference in float32 (upcast=True)
+    out_ref, softmax_lse_ref, dq_ref_batch, dk_ref_batch, dv_ref_batch = run_torch(
+        q_batch, k_batch, v_batch, dout_batch, causal=causal, window_size=window_size, upcast=True
+    )
     
-    # Simple attention reference in float32 for accuracy
-    scale = 1.0 / (hdim_q ** 0.5)
-    q_ref_t = q_ref.transpose(1, 2)  # B, H, S_q, D
-    k_ref_t = k_ref.transpose(1, 2)  # B, H, S_k, D
-    v_ref_t = v_ref.transpose(1, 2)  # B, H, S_k, D_v
+    # Run PyTorch in original dtype with reorder_ops
+    out_pt, softmax_lse_pt, dq_pt_batch, dk_pt_batch, dv_pt_batch = run_torch(
+        q_batch, k_batch, v_batch, dout_batch, causal=causal, window_size=window_size, upcast=False, reorder_ops=True
+    )
     
-    attn = torch.matmul(q_ref_t, k_ref_t.transpose(-2, -1)) * scale
+    # Reshape reference results to match varlen format
+    dq_ref = dq_ref_batch.reshape(total_q, nheads, hdim_q)
+    dk_ref = dk_ref_batch.reshape(total_k, nheads, hdim_q)
+    dv_ref = dv_ref_batch.reshape(total_k, nheads, hdim_v)
+    dq_pt = dq_pt_batch.reshape(total_q, nheads, hdim_q)
+    dk_pt = dk_pt_batch.reshape(total_k, nheads, hdim_q)
+    dv_pt = dv_pt_batch.reshape(total_k, nheads, hdim_v)
     
-    if causal:
-        # Create causal mask
-        if causal_type == "bottom_right":
-            row_idx = torch.arange(seqlen_q, device=device).unsqueeze(1)
-            col_idx = torch.arange(seqlen_k, device=device).unsqueeze(0)
-            offset = seqlen_k - seqlen_q
-            mask = col_idx <= row_idx + offset
-        else:
-            row_idx = torch.arange(seqlen_q, device=device).unsqueeze(1)
-            col_idx = torch.arange(seqlen_k, device=device).unsqueeze(0)
-            mask = col_idx <= row_idx
-        
-        attn = attn.masked_fill(~mask, float('-inf'))
+    # Print diff values (aligned with test_mha.py)
+    print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
+    print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
+    print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
+    print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
+    print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
+    print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
     
-    attn = torch.softmax(attn, dim=-1)
-    out_ref = torch.matmul(attn, v_ref_t)
-    out_ref = out_ref.transpose(1, 2)  # B, S_q, H, D_v
+    # Tolerance calculation (aligned with test_mha.py)
+    dq_tol = max(10 * (dq_pt - dq_ref).abs().max().item(), 0.01)
+    dk_tol = max(10 * (dk_pt - dk_ref).abs().max().item(), 0.01)
+    dv_tol = max(10 * (dv_pt - dv_ref).abs().max().item(), 0.01)
     
-    dout_ref = dout_batch.clone().float()
-    dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), dout_ref)
-    
-    # Convert back to original dtype and packed format for comparison
-    # Use reshape instead of view since tensors may not be contiguous after transpose/grad
-    dq_ref = dq_ref.to(dtype).reshape(total_q, nheads, hdim_q)
-    dk_ref = dk_ref.to(dtype).reshape(total_k, nheads, hdim_q)
-    dv_ref = dv_ref.to(dtype).reshape(total_k, nheads, hdim_v)
-    
-    # Compare results
     dq_diff = (dq - dq_ref).abs().max().item()
     dk_diff = (dk - dk_ref).abs().max().item()
     dv_diff = (dv - dv_ref).abs().max().item()
     
-    # Tolerance based on dtype
-    if dtype == torch.bfloat16:
-        tol = 0.02  # bf16 has lower precision
-    else:  # float16
-        tol = 0.01
+    dq_passed = dq_diff <= dq_tol
+    dk_passed = dk_diff <= dk_tol
+    dv_passed = dv_diff <= dv_tol
+    passed = dq_passed and dk_passed and dv_passed
     
-    passed = dq_diff <= tol and dk_diff <= tol and dv_diff <= tol
+    status_q = '✓' if dq_passed else '✗'
+    status_k = '✓' if dk_passed else '✗'
+    status_v = '✓' if dv_passed else '✗'
     
-    status_q = '✓' if dq_diff <= tol else '✗'
-    status_k = '✓' if dk_diff <= tol else '✗'
-    status_v = '✓' if dv_diff <= tol else '✗'
-    
-    print(f"  dQ max diff: {dq_diff:.6f} {status_q}")
-    print(f"  dK max diff: {dk_diff:.6f} {status_k}")
-    print(f"  dV max diff: {dv_diff:.6f} {status_v}")
+    print(f"\nTolerance: dQ_tol={dq_tol:.6f}, dK_tol={dk_tol:.6f}, dV_tol={dv_tol:.6f}")
+    print(f"  dQ: diff={dq_diff:.6f} vs tol={dq_tol:.6f} {status_q}")
+    print(f"  dK: diff={dk_diff:.6f} vs tol={dk_tol:.6f} {status_k}")
+    print(f"  dV: diff={dv_diff:.6f} vs tol={dv_tol:.6f} {status_v}")
     print(f"  Result: {'PASSED' if passed else 'FAILED'}")
     
-    # If failed, show mismatch details
-    if not passed:
-        for name, aiter_tensor, ref_tensor in [
-            ("dQ", dq, dq_ref),
-            ("dK", dk, dk_ref),
-            ("dV", dv, dv_ref),
-        ]:
-            diff = (aiter_tensor - ref_tensor).abs()
-            max_diff = diff.max().item()
-            if max_diff > tol:
-                max_idx = torch.unravel_index(torch.argmax(diff), diff.shape)
-                coords = tuple(idx.item() for idx in max_idx)
-                print(f"  {name} max diff at {coords}: aiter={aiter_tensor[max_idx].item():.6f}, ref={ref_tensor[max_idx].item():.6f}")
+    # Print mismatch details if failed
+    print_mismatch_info("dQ", dq, dq_ref, dq_pt, dq_tol)
+    print_mismatch_info("dK", dk, dk_ref, dk_pt, dk_tol)
+    print_mismatch_info("dV", dv, dv_ref, dv_pt, dv_tol)
     
     return {
         "passed": passed,
         "dq_diff": dq_diff,
         "dk_diff": dk_diff,
         "dv_diff": dv_diff,
-        "tol": tol,
+        "dq_tol": dq_tol,
+        "dk_tol": dk_tol,
+        "dv_tol": dv_tol,
         "co_name": co_name,
     }
 
 
-def list_tests():
-    """List all available tests from CSV."""
-    configs = load_kernel_configs()
-    
-    print(f"\nFound {len(configs)} kernel configurations in CSV:")
-    print("-" * 100)
-    print(f"{'#':<4} {'dtype':<6} {'hdim_q':<8} {'hdim_v':<8} {'mask':<6} {'a32':<5} {'mode':<6} {'co_name'}")
-    print("-" * 100)
-    
-    for i, config in enumerate(configs):
-        mask_str = {0: "none", 1: "causal", 2: "cau_br"}.get(int(config['mask']), "?")
-        a32_str = "a32" if int(config['atomic32']) else "a16"
-        mode_str = "group" if int(config['mode']) else "normal"
-        print(f"{i+1:<4} {config['dtype']:<6} {config['hdim_q']:<8} {config['hdim_v']:<8} "
-              f"{mask_str:<6} {a32_str:<5} {mode_str:<6} {config['co_name']}")
-    
-    print("-" * 100)
-    
-    # Count by category
-    mode0_count = sum(1 for c in configs if int(c['mode']) == 0)
-    mode1_count = sum(1 for c in configs if int(c['mode']) == 1)
-    print(f"\nNormal mode: {mode0_count}")
-    print(f"Group mode (varlen API): {mode1_count}")
-    print(f"Total: {mode0_count + mode1_count}")
-
-
-def show_csv_mapping():
-    """Show the CSV to kernel mapping."""
-    configs = load_kernel_configs()
-    hsa_path = get_hsa_path()
-    
-    print(f"\nHSA path: {hsa_path}")
-    print(f"\nKernel mapping from fmha_bwd_dqdkdv.csv:")
-    print("-" * 80)
-    
-    for config in configs:
-        co_file = hsa_path / config['co_name']
-        exists = "✓" if co_file.exists() else "✗"
-        print(f"  {exists} {config['co_name']}")
-
-
-def run_tests(kernel_filter: str = None, quick: bool = False):
-    """Run all tests or filtered tests."""
-    arch = get_device_arch()
-    print(f"\nRunning on: {arch}")
+def run_all_tests(kernel_filter=None):
+    """Run all kernel tests or a filtered subset."""
+    print(f"\nRunning on: {get_device_arch()}")
     print(f"PyTorch version: {torch.__version__}")
     print(f"CUDA version: {torch.version.cuda}")
     
@@ -550,124 +504,161 @@ def run_tests(kernel_filter: str = None, quick: bool = False):
     
     if not configs:
         print("No kernel configurations found!")
-        return 1
+        return
     
-    results = {}
+    # Filter configs if requested
+    if kernel_filter:
+        filter_lower = kernel_filter.lower()
+        filtered = []
+        for c in configs:
+            co_name = c['co_name'].lower()
+            # Check if filter matches
+            if filter_lower in co_name:
+                # If filter doesn't contain 'group', exclude group kernels
+                # unless the filter is an exact match for the kernel name
+                kernel_base = co_name.replace('bwd_', '').replace('.co', '')
+                filter_base = filter_lower.replace('bwd_', '').replace('.co', '')
+                
+                if 'group' not in filter_lower and kernel_base.endswith('_group'):
+                    # Filter doesn't want group kernels, skip
+                    continue
+                filtered.append(c)
+        configs = filtered
+        if not configs:
+            print(f"No kernels matching '{kernel_filter}' found!")
+            return
+    
+    results = []
     passed = 0
     failed = 0
     skipped = 0
     
-    for i, config in enumerate(configs):
-        co_name = config['co_name']
-        
-        # Apply filter if specified
-        if kernel_filter and kernel_filter not in co_name:
-            continue
-        
-        # Get test parameters
+    for config in configs:
         params = get_test_params_for_kernel(config)
-        
         if params is None:
-            print(f"\nSkipping {co_name} (unsupported configuration)")
             skipped += 1
             continue
         
-        # For quick mode, use smaller sequences
-        if quick:
-            params['seqlen_k'] = min(params['seqlen_k'], 10000)
+        test_name = params['co_name'].replace('.co', '')
         
-        # Create test name
-        test_name = co_name.replace('.co', '').replace('bwd_', '')
-        
-        # Choose appropriate test function based on mode
-        is_varlen = params.pop('is_varlen', False)
-        test_func = run_mha_varlen_backward_test if is_varlen else run_mha_backward_test
-        
-        try:
-            result = test_func(
-                test_name=test_name,
+        # Choose test function based on mode
+        if params.get('is_varlen', False):
+            result = run_mha_varlen_backward_test(
                 **params,
+                test_name=test_name,
             )
-            results[co_name] = result
-            
-            if result.get("passed", False):
-                passed += 1
-            else:
-                failed += 1
-                
-        except Exception as e:
-            print(f"\nTest {co_name} CRASHED: {e}")
-            import traceback
-            traceback.print_exc()
-            results[co_name] = {"passed": False, "error": str(e), "co_name": co_name}
-            failed += 1
+        else:
+            result = run_mha_backward_test(
+                **params,
+                test_name=test_name,
+            )
         
-        # Clear GPU memory between tests
-        torch.cuda.empty_cache()
+        results.append(result)
+        if result.get('passed', False):
+            passed += 1
+        else:
+            failed += 1
     
-    # Summary
+    # Print summary
     print(f"\n{'='*70}")
-    print("TEST SUMMARY")
+    print(f"TEST SUMMARY")
     print(f"{'='*70}")
     print(f"  Passed:  {passed}")
     print(f"  Failed:  {failed}")
     print(f"  Skipped: {skipped}")
-    print(f"  Total:   {passed + failed + skipped}")
+    print(f"  Total:   {len(results)}")
     print(f"{'='*70}")
     
     if failed > 0:
-        print("\nFailed tests:")
-        for co_name, result in results.items():
-            if not result.get("passed", False):
-                error = result.get("error", "")
-                if error:
-                    print(f"  - {co_name}: {error}")
+        print(f"\nFailed tests:")
+        for r in results:
+            if not r.get('passed', False):
+                if 'error' in r:
+                    print(f"  - {r['co_name']}: {r['error']}")
                 else:
-                    dq = result.get('dq_diff', None)
-                    dk = result.get('dk_diff', None)
-                    dv = result.get('dv_diff', None)
-                    dq_str = f"{dq:.4f}" if isinstance(dq, (int, float)) else "?"
-                    dk_str = f"{dk:.4f}" if isinstance(dk, (int, float)) else "?"
-                    dv_str = f"{dv:.4f}" if isinstance(dv, (int, float)) else "?"
-                    print(f"  - {co_name}: dQ={dq_str}, dK={dk_str}, dV={dv_str}")
-        return 1
+                    dq = r.get('dq_diff', float('nan'))
+                    dk = r.get('dk_diff', float('nan'))
+                    dv = r.get('dv_diff', float('nan'))
+                    dq_tol = r.get('dq_tol', 0.01)
+                    dk_tol = r.get('dk_tol', 0.01)
+                    dv_tol = r.get('dv_tol', 0.01)
+                    # Format properly
+                    if isinstance(dq, (int, float)) and not (dq != dq):  # not NaN
+                        dq_str = f"dQ={dq:.4f}(tol={dq_tol:.4f})"
+                    else:
+                        dq_str = f"dQ={dq}"
+                    if isinstance(dk, (int, float)) and not (dk != dk):
+                        dk_str = f"dK={dk:.4f}(tol={dk_tol:.4f})"
+                    else:
+                        dk_str = f"dK={dk}"
+                    if isinstance(dv, (int, float)) and not (dv != dv):
+                        dv_str = f"dV={dv:.4f}(tol={dv_tol:.4f})"
+                    else:
+                        dv_str = f"dV={dv}"
+                    print(f"  - {r['co_name']}: {dq_str}, {dk_str}, {dv_str}")
+
+
+def list_tests():
+    """List all available tests."""
+    configs = load_kernel_configs()
     
-    return 0
+    print(f"\nAvailable kernel tests ({len(configs)} total):")
+    print(f"{'='*70}")
+    
+    for config in configs:
+        mode_str = "group" if config['mode'] == '1' else "batch"
+        atomic_str = "a32" if config['atomic32'] == '1' else "a16"
+        mask_str = ["none", "causal", "causal_br"][int(config['mask'])]
+        print(f"  {config['co_name']}: {config['dtype']} {atomic_str} hdim={config['hdim_q']}/{config['hdim_v']} "
+              f"mask={mask_str} mode={mode_str}")
+
+
+def show_csv():
+    """Show CSV kernel mapping."""
+    configs = load_kernel_configs()
+    
+    print(f"\nCSV kernel configurations ({len(configs)} entries):")
+    print(f"{'='*100}")
+    
+    headers = list(configs[0].keys()) if configs else []
+    print("  " + " | ".join(f"{h:>10}" for h in headers))
+    print(f"  {'-'*90}")
+    
+    for config in configs:
+        values = [config.get(h, '') for h in headers]
+        print("  " + " | ".join(f"{v:>10}" for v in values))
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Test 64-bit address fixes for FMHA backward kernels",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python test_large_addr.py                      # Run all tests
-  python test_large_addr.py --kernel hd128_bf16  # Filter by kernel name
-  python test_large_addr.py --list               # List all kernels
-  python test_large_addr.py --csv                # Show CSV mapping
-  python test_large_addr.py --quick              # Quick mode (smaller sequences)
-"""
+        description="Test 64-bit address fixes in FMHA backward kernels"
     )
-    parser.add_argument("--kernel", type=str, default=None,
-                        help="Filter tests by kernel name (substring match)")
-    parser.add_argument("--list", action="store_true",
-                        help="List all available tests")
-    parser.add_argument("--csv", action="store_true",
-                        help="Show CSV to kernel mapping")
-    parser.add_argument("--quick", action="store_true",
-                        help="Quick mode with smaller sequences (for debugging)")
+    parser.add_argument(
+        "--kernel", "-k",
+        type=str,
+        default=None,
+        help="Filter tests by kernel name substring (e.g., 'bf16_a32', 'hd128')"
+    )
+    parser.add_argument(
+        "--list", "-l",
+        action="store_true",
+        help="List all available tests"
+    )
+    parser.add_argument(
+        "--csv",
+        action="store_true",
+        help="Show CSV kernel mapping"
+    )
+    
     args = parser.parse_args()
     
     if args.list:
         list_tests()
-        return 0
-    
-    if args.csv:
-        show_csv_mapping()
-        return 0
-    
-    return run_tests(args.kernel, args.quick)
+    elif args.csv:
+        show_csv()
+    else:
+        run_all_tests(kernel_filter=args.kernel)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

@@ -1252,9 +1252,11 @@ def _flash_attn_forward(
     # mask
     window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
-    mask = causal and window_size_left == -1  # causal mask
+    mask = causal and window_size_left == -1  # causal mask (top_left)
     nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
-    swa = (window_size_left > 0) or (window_size_right > 0)
+    # swa is sliding window attention - but causal masks (including bottom_right) are NOT swa
+    # bottom_right causal has window_size_left >= 0 and window_size_right == 0
+    swa = not causal and ((window_size_left > 0) or (window_size_right > 0))
 
     def can_impl_fmha_v3_fwd():
         # basic
@@ -1375,9 +1377,11 @@ def can_impl_fmha_v3_bwd(
     # mask
     window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
-    mask = causal and window_size_left == -1  # causal mask
+    mask = causal and window_size_left == -1  # causal mask (top_left)
     nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
-    swa = (window_size_left > 0) or (window_size_right > 0)
+    # swa is sliding window attention - but causal masks (including bottom_right) are NOT swa
+    # bottom_right causal has window_size_left >= 0 and window_size_right == 0
+    swa = not causal and ((window_size_left > 0) or (window_size_right > 0))
 
     def np():
         # bwd_hd128_bf16_a16_rtne
@@ -1601,7 +1605,8 @@ def _flash_attn_backward(
     _, seqlen_q, nhead_q, hdim_q = q.shape
     _, seqlen_k, nhead_k, hdim_v = v.shape
     nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
-    swa = (window_size_left > 0) or (window_size_right > 0)
+    # swa is sliding window attention - but causal masks (including bottom_right) are NOT swa
+    swa = not causal and ((window_size_left > 0) or (window_size_right > 0))
 
     # only 1 block when sk <= 256, thus deterministic
     is_950_1block = (
@@ -1614,19 +1619,29 @@ def _flash_attn_backward(
 
     def can_impl_fmha_v3_bwd_gfx950():
         ret = get_gfx() == "gfx950"
+        print(f"[DEBUG] gfx950 check: {ret}, gfx={get_gfx()}")
         ret &= alibi_slopes is None
+        print(f"[DEBUG] alibi_slopes is None: {alibi_slopes is None}, ret={ret}")
         ret &= bias is None
+        print(f"[DEBUG] bias is None: {bias is None}, ret={ret}")
         ret &= dbias is None
+        print(f"[DEBUG] dbias is None: {dbias is None}, ret={ret}")
         ret &= dropout_p == 0.0
+        print(f"[DEBUG] dropout_p == 0.0: {dropout_p == 0.0}, ret={ret}")
         ret &= not deterministic or is_950_1block
+        print(f"[DEBUG] not deterministic or is_950_1block: {not deterministic or is_950_1block}, det={deterministic}, 1block={is_950_1block}, ret={ret}")
         ret &= nhead_q % nhead_k == 0
+        print(f"[DEBUG] nhead_q % nhead_k == 0: {nhead_q % nhead_k == 0}, nhead_q={nhead_q}, nhead_k={nhead_k}, ret={ret}")
         ret &= (
             (hdim_q > 64 and hdim_q <= 128) or (hdim_q == 192 and hdim_v == 128)
         ) and hdim_q % 8 == 0
+        print(f"[DEBUG] hdim check: hdim_q={hdim_q}, hdim_v={hdim_v}, ret={ret}")
         ret &= not swa
+        print(f"[DEBUG] not swa: {not swa}, swa={swa}, causal={causal}, window_size_left={window_size_left}, window_size_right={window_size_right}, ret={ret}")
         return ret
 
     can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950()
+    print(f"[DEBUG] Final can_impl_fmha_v3_bwd_ = {can_impl_fmha_v3_bwd_}, seqlen_q={seqlen_q}, AITER_DISABLE_V3_BWD={AITER_DISABLE_V3_BWD}")
 
     if (
         can_impl_fmha_v3_bwd_ and seqlen_q > 16 and not AITER_DISABLE_V3_BWD
@@ -1987,11 +2002,12 @@ def _flash_attn_varlen_forward(
     window_size_left = -1 if window_size_left >= max_seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= max_seqlen_k else window_size_right
     sink_size = 0 if sink_size >= max_seqlen_k else sink_size
-    mask = causal == True and window_size_left == -1  # causal mask
+    mask = causal == True and window_size_left == -1  # causal mask (top_left)
     nmask = (
         causal == False and window_size_left == -1 and window_size_right == -1
     )  # no mask
-    swa = (window_size_left > 0) or (window_size_right > 0)
+    # swa is sliding window attention - but causal masks (including bottom_right) are NOT swa
+    swa = not causal and ((window_size_left > 0) or (window_size_right > 0))
 
     def can_impl_fmha_v3_fwd():
         # basic
@@ -2126,11 +2142,12 @@ def _flash_attn_varlen_backward(
     # mask
     window_size_left = -1 if window_size_left >= max_seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= max_seqlen_k else window_size_right
-    mask = causal == True and window_size_left == -1  # causal mask
+    mask = causal == True and window_size_left == -1  # causal mask (top_left)
     nmask = (
         causal == False and window_size_left == -1 and window_size_right == -1
     )  # no mask
-    swa = (window_size_left > 0) or (window_size_right > 0)
+    # swa is sliding window attention - but causal masks (including bottom_right) are NOT swa
+    swa = not causal and ((window_size_left > 0) or (window_size_right > 0))
 
     def pssk():
         # only for hd64 a32 causal/no causal, fp16/bf16-rtne/rtna/rtz cases
