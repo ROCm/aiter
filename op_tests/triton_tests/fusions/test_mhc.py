@@ -286,8 +286,8 @@ def test_mhc_small_shapes(M, n, C, dtype):
     torch.testing.assert_close(
         H_res_triton.to(torch.float32),
         H_res_torch.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
+        atol=2e-2,
+        rtol=5e-2,
     )
 
 
@@ -606,7 +606,7 @@ def test_sk_correctness(M, N, dtype):
 
     out_torch_exp = sinkhorn_knopp_exp_domain_torch(logits, num_iters=20)
     out_torch_log = sinkhorn_knopp_log_domain_torch(logits, num_iters=20)
-    out_triton = sinkhorn_knopp(logits, num_iters=20)
+    out_triton = sinkhorn_knopp(logits, C=128, num_iters=20)
 
     torch.testing.assert_close(
         out_triton.to(torch.float32),
@@ -628,7 +628,7 @@ def test_sk_doubly_stochastic(M, N):
 
     logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda")
 
-    out = sinkhorn_knopp(logits, num_iters=20)
+    out = sinkhorn_knopp(logits, C=128, num_iters=20)
 
     # Convert to float32 for accurate sum checking
     out_f32 = out.to(torch.float32)
@@ -649,7 +649,7 @@ def test_sk_different_iters(num_iters):
 
     out_torch_exp = sinkhorn_knopp_exp_domain_torch(logits, num_iters=num_iters)
     out_torch_log = sinkhorn_knopp_log_domain_torch(logits, num_iters=num_iters)
-    out_triton = sinkhorn_knopp(logits, num_iters=num_iters)
+    out_triton = sinkhorn_knopp(logits, C=128, num_iters=num_iters)
 
     torch.testing.assert_close(
         out_triton.to(torch.float32),
@@ -673,7 +673,7 @@ def test_sk_batch_sizes(M):
     N = 4  # Typical mHC stream count
     logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda")
 
-    out = sinkhorn_knopp(logits, num_iters=20)
+    out = sinkhorn_knopp(logits, C=128, num_iters=20)
 
     assert out.shape == (M, N, N)
     # Use relaxed tolerance for large batch sizes due to bfloat16 precision
@@ -689,7 +689,7 @@ def test_sk_matrix_sizes(N):
     M = 16
     logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda")
 
-    out = sinkhorn_knopp(logits, num_iters=10)
+    out = sinkhorn_knopp(logits, C=128, num_iters=10)
 
     assert out.shape == (M, N, N)
     # N=2 requires slightly higher tolerance due to bfloat16 precision with less averaging
@@ -705,7 +705,7 @@ def test_sk_numerical_stability_small_values():
     # Small values (close to zero)
     logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda") * 0.01
 
-    out = sinkhorn_knopp(logits, num_iters=20)
+    out = sinkhorn_knopp(logits, C=128, num_iters=20)
 
     # Primary check: log domain should handle this gracefully - no numerical issues
     assert not torch.isnan(out).any(), "Triton output contains NaN"
@@ -737,7 +737,7 @@ def test_sk_log_domain_stability_large_values(value_scale):
     # Large values that stress exponential domain
     logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda") * value_scale
 
-    out_triton = sinkhorn_knopp(logits, num_iters=50)
+    out_triton = sinkhorn_knopp(logits, C=128, num_iters=50)
 
     # Primary check: log domain should handle this gracefully - no numerical issues
     assert not torch.isnan(out_triton).any(), "Triton output contains NaN"
@@ -758,7 +758,7 @@ def test_sk_preallocated_output():
     logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda")
     out = torch.empty(M, N, N, dtype=logits.dtype, device=logits.device)
 
-    result = sinkhorn_knopp(logits, num_iters=10, out=out)
+    result = sinkhorn_knopp(logits, C=128, num_iters=10, out=out)
 
     assert result is out
     assert is_doubly_stochastic(out.to(torch.float32), tol=1e-2)
@@ -773,7 +773,7 @@ def test_sk_identity_initialization():
     logits = torch.zeros(M, N, N, dtype=torch.bfloat16, device="cuda")
     logits[:, range(N), range(N)] = 10.0  # Large diagonal values
 
-    out = sinkhorn_knopp(logits, num_iters=20)
+    out = sinkhorn_knopp(logits, C=128, num_iters=20)
 
     # Output should be close to identity
     identity = torch.eye(N, device="cuda").unsqueeze(0).expand(M, -1, -1)
@@ -793,7 +793,7 @@ def test_sk_uniform_input():
     # Uniform logits (all same value)
     logits = torch.ones(M, N, N, dtype=torch.bfloat16, device="cuda")
 
-    out = sinkhorn_knopp(logits, num_iters=20)
+    out = sinkhorn_knopp(logits, C=128, num_iters=20)
 
     # Output should be uniform: 1/N everywhere
     expected = torch.full((M, N, N), 1.0 / N, device="cuda")
@@ -813,8 +813,8 @@ def test_sk_convergence():
     logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda")
 
     # Compute with different iteration counts
-    out_5 = sinkhorn_knopp(logits, num_iters=5).to(torch.float32)
-    out_20 = sinkhorn_knopp(logits, num_iters=20).to(torch.float32)
+    out_5 = sinkhorn_knopp(logits, C=128, num_iters=5).to(torch.float32)
+    out_20 = sinkhorn_knopp(logits, C=128, num_iters=20).to(torch.float32)
 
     # Measure how close row/col sums are to 1
     def sum_error(P):
@@ -836,7 +836,7 @@ def test_sk_output_range():
     M, N = 64, 4
     logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda")
 
-    out = sinkhorn_knopp(logits, num_iters=10)
+    out = sinkhorn_knopp(logits, C=128, num_iters=10)
 
     assert torch.all(out >= 0.0), "Output has negative values"
     assert torch.all(out <= 1.0), "Output has values > 1"

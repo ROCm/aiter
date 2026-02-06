@@ -179,7 +179,7 @@ def fused_mhc(
     BLOCK_M = config.pop("BLOCK_M", 64 if M >= 64 else 32)
     # BLOCK_N: Column tile size (must be power of 2 for Triton arange)
     if hres_lite_mode:        
-        min_block_n = n_factorial
+        min_block_n = max(n_factorial, n_squared)
         config_block_n = config.pop("BLOCK_N", min_block_n)
         BLOCK_N = triton.next_power_of_2(max(config_block_n, min_block_n))
     else:
@@ -614,7 +614,6 @@ def sinkhorn_knopp(
     if config is None:
         config, _ = get_mhc_config("MHC_SINKHORN", M, C)
     config = dict(config)  # Always copy to avoid mutating LRU cache
-    print(config)
     # Pop BLOCK_M for grid calculation (handle legacy BLOCK_SIZE name)
     BLOCK_M = config.pop("BLOCK_M", config.pop("BLOCK_SIZE", 8))
     
