@@ -79,10 +79,11 @@ def fused_ar_rmsnorm(
                         x, x, weight, eps
                     )
                 else:
-                    out, res_out, scale_out = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
-                        x, x, weight, eps
+                    out, res_out, scale_out = (
+                        tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+                            x, x, weight, eps
+                        )
                     )
-                    out = out.float() * scale_out
         out.fill_(0)
         res_out.fill_(0)
 
@@ -91,7 +92,10 @@ def fused_ar_rmsnorm(
             graph.replay()
 
         _, us = run_ca()
-        out = (out, us)
+        if not post_per_token_quant:
+            out = (out, us)
+        else:
+            out = (out.float() * scale_out, us)
     else:
 
         @perftest()
@@ -100,14 +104,20 @@ def fused_ar_rmsnorm(
                 out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
                     x, x, weight, eps
                 )
+                return out
             else:
-                out, res_out, scale_out = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
-                    x, x, weight, eps
+                out, res_out, scale_out = (
+                    tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+                        x, x, weight, eps
+                    )
                 )
-                out = out.float() * scale_out
-            return out
+                return out, scale_out
 
-        out = run_ca(x)
+        if not post_per_token_quant:
+            out = run_ca(x)
+        else:
+            out = run_ca(x)
+            out = (out[0][0].float() * out[0][1], out[1])
 
     # destroy
     if dist.is_initialized():
@@ -423,7 +433,9 @@ def test_fused_ar_rmsnorm(
         if not post_per_token_quant:
             checkAllclose(cpu_rslt[out.device.index], out.to(ref), msg=msg)
         else:
-            checkAllclose(cpu_rslt[out.device.index], out.to(ref), msg=msg, atol=5e-2, rtol=5e-2)
+            checkAllclose(
+                cpu_rslt[out.device.index], out.to(ref), msg=msg, atol=5e-2, rtol=5e-2
+            )
         # checkAllclose(ref, out.to(ref), msg=msg)
 
 
@@ -550,8 +562,7 @@ def acc_test_cudagraph_on(
 #         checkAllclose(cpu_rslt[i], ar_rslt[i].to(ref))
 
 l_dtype = ["fp16", "bf16"]
-# l_shape = [(13, 512), (13, 1024), (13, 2048), (17, 4096), (17, 7168), (19, 8192)]
-l_shape = [(4, 4096)]
+l_shape = [(13, 512), (13, 1024), (13, 2048), (17, 4096), (17, 7168), (19, 8192)]
 l_tp = [8]
 l_pp = [1]
 l_graph = [False, True]
@@ -648,14 +659,15 @@ if __name__ == "__main__":
             ),
             post_per_token_quant=False,
         )
-        test_fused_ar_rmsnorm(
-            tp,
-            pp,
-            shape,
-            dtype,
-            withGraph=graph_on,
-            distributed_init_method=get_distributed_init_method(
-                get_ip(), get_open_port()
-            ),
-            post_per_token_quant=True,
-        )
+        if shape[1] in [512, 1024, 2048, 4096]:
+            test_fused_ar_rmsnorm(
+                tp,
+                pp,
+                shape,
+                dtype,
+                withGraph=graph_on,
+                distributed_init_method=get_distributed_init_method(
+                    get_ip(), get_open_port()
+                ),
+                post_per_token_quant=True,
+            )
