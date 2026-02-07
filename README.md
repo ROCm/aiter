@@ -41,12 +41,14 @@ PREBUILD_KERNELS=2 GPU_ARCHS="gfx942" python3 setup.py install
 | `PREBUILD_KERNELS` | `0` — no precompilation (JIT only, default). `1` — precompile core kernels (excludes tuning and most MHA variants). `2` — precompile inference kernels (excludes backward and tuning). `3` — precompile MHA kernels only (minimal build). |
 | `MAX_JOBS` | Max parallel compilation threads (auto-calculated from CPU cores and memory if not set) |
 
-### Triton Communication Support
+### Triton Communication Support (Optional)
 
+For multi-GPU communication primitives (reduce-scatter, all-gather) using the [Iris](https://github.com/ROCm/iris) library:
 ```bash
 pip install -e .
 pip install -r requirements-triton-comms.txt
 ```
+See the [Triton Comms Guide](docs/triton_comms.md) for usage details.
 
 ## Supported Operators
 
