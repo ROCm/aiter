@@ -53,7 +53,7 @@ class CustomAllreduce:
         self,
         group: ProcessGroup,
         device: Union[int, str, torch.device],
-        max_size=8192 * 1024 * 8,
+        max_size=8192 * 1024 * 8 * 2, # In allreduce 2stage writemode, use 2x tmp buffer
     ) -> None:
         """
         Args:
@@ -266,8 +266,9 @@ class CustomAllreduce:
             return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
+        # In allreduce 2stage writemode, use 2x tmp buffer
         if self.world_size == 2 or self.fully_connected:
-            return inp_size <= self.max_size
+            return inp_size <= (self.max_size / 2)
         return False
 
     def all_reduce(
