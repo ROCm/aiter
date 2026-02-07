@@ -29,8 +29,6 @@ pip install -r requirements-triton-comms.txt
 
 ## Supported Operators
 
-Each guide covers available variants, backend support (ASM / CK / Triton), Python API examples, and performance tuning advice. Run any operator test with: `python3 op_tests/test_layernorm2d.py`
-
 | **Operator** | **Description** | **Guide** |
 |---|---|---|
 | Attention (MHA, PA) | Multi-Head Attention, Paged Attention (decode & prefill), Unified Attention, chunked prefill, GQA/MQA | [Attention Guide](docs/attention_variants_guide.md) |
@@ -44,6 +42,10 @@ Each guide covers available variants, backend support (ASM / CK / Triton), Pytho
 | Elementwise & Activations | SiLU/GELU/sigmoid/tanh, SwiGLU gates, fused activation + quantize, binary arithmetic (+−×÷) | [Elementwise Guide](docs/elementwise_activation_guide.md) |
 | Communication (AllReduce) | GPU-initiated reduce-scatter and all-gather via [Iris](https://github.com/ROCm/iris) | [Triton Comms](docs/triton_comms.md) |
 
-Additional resources:
+Each guide covers available variants, backend support (ASM / CK / Triton), Python API examples, and performance tuning advice.
+
+Run operator tests with: `python3 op_tests/<test_file>.py` (e.g. `python3 op_tests/test_pa.py`)
+
+## Additional Resources
 - [Autotuning Pipeline](docs/autotuning_pipeline.md) — CSV-based kernel selection and tuning workflow
 - [Container Setup (Non-root)](docs/aiter_container_nonroot_setup.md) — Running AITER in Docker without root
