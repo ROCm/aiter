@@ -163,6 +163,7 @@ def gemm_a8w8_blockscale_cktile(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    isBpreshuffled: bool = True,
 ) -> torch.Tensor: ...
 
 
@@ -420,7 +421,9 @@ def gemm_a8w8_ASM(
         )
         is not None
     ):
-        assert bias is not None, "Use asm gemm must give bias, please give a \
+        assert (
+            bias is not None
+        ), "Use asm gemm must give bias, please give a \
             bias=torch.zeros(n,dtype=dtypes.fp32,device='cuda')"
         splitK = asm_config["splitK"]
         kernelName = asm_config["kernelName"]
@@ -545,6 +548,7 @@ def gemm_a8w8_blockscale(
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
     isBpreshuffled: bool = False,
+    isDefaultCktile: bool = False,
 ) -> torch.Tensor:
     assert dtype in [
         dtypes.bf16,
@@ -570,7 +574,17 @@ def gemm_a8w8_blockscale(
             if libtype == "ck":
                 return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
             elif libtype == "cktile":
-                return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y)
+                x_scale_input = x_scale
+                m_warp, n_warp, k_warp = map(
+                    int, config["kernelName"].split("_")[4].split("x")
+                )
+                if m_warp * n_warp * k_warp == 8:
+                    x_scale_input = (
+                        x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
+                    )
+                return gemm_a8w8_blockscale_cktile(
+                    XQ, WQ, x_scale_input, w_scale, Y, False
+                )
             else:
                 assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
         return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
@@ -615,14 +629,35 @@ def gemm_a8w8_blockscale_bpreshuffle(
         dtypes.bf16,
         dtypes.fp16,
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
+
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
-    get_CKGEMM_config(
-        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
-    )
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-    return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+    config = get_CKGEMM_config(
+        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
+    )
+    if config is not None:
+        libtype = config["libtype"]
+        if libtype == "ck":
+            x_scale_input = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
+            return gemm_a8w8_blockscale_bpreshuffle_ck(
+                XQ, WQ, x_scale_input, w_scale, Y
+            )
+        elif libtype == "cktile":
+            x_scale_input = x_scale
+            m_warp, n_warp, k_warp = map(
+                int, config["kernelName"].split("_")[4].split("x")
+            )
+            if m_warp * n_warp * k_warp == 8:
+                x_scale_input = (
+                    x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
+                )
+            return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale_input, w_scale, Y, True)
+        else:
+            assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
+
+    return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
 
 
 def gfx950_a8w8_blockscale_ASM(
@@ -708,6 +743,7 @@ def gemm_a8w8_blockscale_cktile_tune(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
+    preshuffleB: bool = True,
 ) -> torch.Tensor: ...
 
 
