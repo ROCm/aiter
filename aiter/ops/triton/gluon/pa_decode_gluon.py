@@ -861,10 +861,10 @@ def paged_attention_decode_sliding_window(
         and supports both FP8 and BF16 data types with various quantization modes.
     """
     # ==================== VALIDATION CHECKS ====================
-    gl.static_assert(
-        KV_BLOCK_SIZE == 16 or KV_BLOCK_SIZE == 64 or KV_BLOCK_SIZE == 1024,
-        f"KV_BLOCK_SIZE={KV_BLOCK_SIZE}, Only support KV_BLOCK_SIZE in [16, 64, 1024]",
-    )
+    # gl.static_assert(
+    #     KV_BLOCK_SIZE == 16 or KV_BLOCK_SIZE == 64 or KV_BLOCK_SIZE == 1024,
+    #     f"KV_BLOCK_SIZE={KV_BLOCK_SIZE}, Only support KV_BLOCK_SIZE in [16, 64, 1024]",
+    # )
     # Data type validation
     gl.static_assert(
         query_ptr.dtype.is_fp8()
@@ -910,12 +910,9 @@ def paged_attention_decode_sliding_window(
     LOG2_E: gl.constexpr = 1.4426950408889634  # log2(e) for exponential conversion
 
     K_HEAD_SIZE_SPLITS: gl.constexpr = HEAD_SIZE_POW2 // KV_16B_ELEMENT_COUNT
-    MAX_NUM_KV_BLOCKS_PER_COMPUTE: gl.constexpr = (
-        CONTEXT_PARTITION_SIZE // KV_BLOCK_SIZE if KV_BLOCK_SIZE != 1024 else 1
-    )
-    CONTEXT_PARTITION_SIZE_PER_BLOCK: gl.constexpr = (
-        KV_BLOCK_SIZE // CONTEXT_PARTITION_SIZE if KV_BLOCK_SIZE == 1024 else 1
-    )
+    MAX_NUM_KV_BLOCKS_PER_COMPUTE: gl.constexpr = triton.cdiv(CONTEXT_PARTITION_SIZE, KV_BLOCK_SIZE)
+
+    CONTEXT_PARTITION_SIZE_PER_BLOCK: gl.constexpr = triton.cdiv(KV_BLOCK_SIZE, CONTEXT_PARTITION_SIZE)
     # ==================== MEMORY LAYOUT DEFINITIONS ====================
     # Query tensor layout - optimized for sequential access (2D)
     blocked_query_layout: gl.constexpr = gl.BlockedLayout(
@@ -944,7 +941,7 @@ def paged_attention_decode_sliding_window(
     )
 
     # Key cache layout - optimized for block-wise access patterns
-    if KV_BLOCK_SIZE == 1024:
+    if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE:
         KV_COMPUTE_BLOCK_SIZE: gl.constexpr = CONTEXT_PARTITION_SIZE
     else:
         KV_COMPUTE_BLOCK_SIZE: gl.constexpr = KV_BLOCK_SIZE
@@ -1345,7 +1342,7 @@ def paged_attention_decode_sliding_window(
     )
     kv_block_numbers = gl.amd.cdna3.buffer_load(
         ptr=block_tables_ptr + sequence_idx * stride_block_table_seq
-        + sequence_partition_start_idx * MAX_NUM_KV_BLOCKS_PER_COMPUTE// CONTEXT_PARTITION_SIZE_PER_BLOCK,
+        + sequence_partition_start_idx * MAX_NUM_KV_BLOCKS_PER_COMPUTE // CONTEXT_PARTITION_SIZE_PER_BLOCK,
         offsets=block_indices,
     ).to(gl.int64)
 
@@ -1390,7 +1387,7 @@ def paged_attention_decode_sliding_window(
         )
 
         # Optimize: Start key load, then prepare QK MFMA accumulators/query (overlaps with key load)
-        if KV_BLOCK_SIZE == 1024 and SLIDING_WINDOW > 0:
+        if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE and SLIDING_WINDOW > 0:
             kv_token_global = (
                 kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE + block_element_offsets
             )
@@ -1417,7 +1414,7 @@ def paged_attention_decode_sliding_window(
                 + (page_offset + block_element_offsets)[None, None, :, None]
             )
             # Optimize: Load both scales with VMEM scheduling, overlap with key reshape
-            if KV_BLOCK_SIZE == 1024 and SLIDING_WINDOW > 0:
+            if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE and SLIDING_WINDOW > 0:
                 key_scale_value_blocked = gl.load(
                     key_scale + key_scale_offsets,
                     mask=kv_in_window_mask[None, None, :, None],
@@ -1476,7 +1473,7 @@ def paged_attention_decode_sliding_window(
                 + value_dim2_offsets[None, None, :, None] * KV_16B_ELEMENT_COUNT
                 + value_dim3_offsets[None, None, None, :]
             )
-            if KV_BLOCK_SIZE == 1024 and SLIDING_WINDOW > 0:
+            if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE and SLIDING_WINDOW > 0:
                 value_tensor = gl.load(
                     value_cache_ptr + value_block_offsets,
                     mask=kv_in_window_mask[None, None, :, None],
@@ -1502,7 +1499,7 @@ def paged_attention_decode_sliding_window(
             )
 
             # Schedule: Start value VMEM load, then QK MFMA
-            if KV_BLOCK_SIZE == 1024 and SLIDING_WINDOW > 0:
+            if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE and SLIDING_WINDOW > 0:
                 value_token_global = (
                     kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE + value_dim2_offsets
                 )
@@ -3029,13 +3026,6 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     # PS path uses the sliding-window kernel for all KV_BLOCK_SIZE values.
     # This is required for KV_BLOCK_SIZE==1024 support in PS mode.
     if PS:
-        num_splits = grid[2]
-        # Configure waves per EU based on query group size
-        if KV_BLOCK_SIZE == 1024:
-            waves_per_eu = 1
-        else:
-            waves_per_eu = 4
-
         paged_attention_decode_sliding_window[grid](
             exp_sums_ptr,
             max_logits_ptr,
@@ -3457,11 +3447,11 @@ def pa_decode_gluon(
     assert (
         equivalent_query_group_size <= 64
     ), f"equivalent_query_group_size={equivalent_query_group_size} exceeds maximum of 64"
-    assert kv_block_size in [
-        16,
-        64,
-        1024,
-    ], f"kv_block_size == {kv_block_size} not in [16, 64, 1024]"
+    # assert kv_block_size in [
+    #     16,
+    #     64,
+    #     1024,
+    # ], f"kv_block_size == {kv_block_size} not in [16, 64, 1024]"
     assert (
         len(output.shape) == 3
     ), f"Expected 3D output tensor, but got shape {output.shape}"
