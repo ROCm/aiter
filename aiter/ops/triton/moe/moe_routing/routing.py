@@ -71,6 +71,7 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
     dtype = expt_scal.dtype
     n_tokens, n_expts_act = expt_scal.shape
     n_gates = n_tokens * n_expts_act
+    n_expts_act_pad = triton.next_power_of_2(n_expts_act)
 
     hist, partial_hist = bitmatrix.sum(partials_block_size=HIST_BLOCK_M)
     hist = hist[:n_expts_tot]
@@ -103,6 +104,7 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
         HIST_BLOCK_M,
         n_tokens % HIST_BLOCK_M == 0,
         n_expts_act,  # constants
+        n_expts_act_pad,
         hist,
         n_expts_tot,
         token_offs_raw,
@@ -136,6 +138,7 @@ def sort_tokens_fused(
     dtype = expt_scal.dtype
     n_tokens, n_expts_act = expt_scal.shape
     n_gates = n_tokens * n_expts_act
+    n_expts_act_pad = triton.next_power_of_2(n_expts_act)
 
     hist = bitmatrix.scratchpad
     hist = hist[:n_expts_tot]
@@ -169,6 +172,7 @@ def sort_tokens_fused(
         HIST_BLOCK_M,
         n_tokens % HIST_BLOCK_M == 0,
         n_expts_act,  # constants
+        n_expts_act_pad,
         n_expts_tot,
         hist,
         token_offs_raw,
@@ -235,7 +239,7 @@ def _compute_expt_data_internal(n_expts_tot, n_gates, block_m, device):
 # --------------------------
 
 
-def routing(logits, n_expts_act, sm_first=False, expt_indx=None):
+def routing(logits, n_expts_act, sm_first=False):
     HIST_BLOCK_M = 32
 
     from .topk import topk
@@ -246,7 +250,6 @@ def routing(logits, n_expts_act, sm_first=False, expt_indx=None):
         logits,
         n_expts_act,
         apply_softmax=not sm_first,
-        y_indx=expt_indx,
         HIST_BLOCK_M=HIST_BLOCK_M,
     )
 
@@ -324,16 +327,12 @@ def compute_expt_data_torch(hist, n_expts_tot, n_gates, block_m):
     return ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
 
 
-def routing_torch(logits, n_expts_act, sm_first=False, expt_indx=None):
-    has_user_provided_indx = expt_indx is not None
+def routing_torch(logits, n_expts_act, sm_first=False):
     n_gates_pad = logits.shape[0] * n_expts_act
 
-    def topk(vals, k, expt_indx):
+    def topk(vals, k):
         # topk of experts
-        if has_user_provided_indx:
-            tk_indx = expt_indx
-        else:
-            tk_indx = torch.argsort(-vals, dim=1, stable=True)[:, :k]
+        tk_indx = torch.argsort(vals, dim=1, stable=True)[:, -k:]
         tk_indx = tk_indx.long()
         tk_val = torch.take_along_dim(vals, tk_indx, dim=1)
         tk_indx = tk_indx.int()
@@ -342,13 +341,12 @@ def routing_torch(logits, n_expts_act, sm_first=False, expt_indx=None):
     _, n_expts_tot = logits.shape
     if sm_first:
         logits = torch.softmax(logits, dim=-1)
-    expt_scal, expt_indx = topk(logits, n_expts_act, expt_indx)
+    expt_scal, expt_indx = topk(logits, n_expts_act)
     if not sm_first:
         expt_scal = torch.softmax(expt_scal, dim=-1)
     # sort each token's selections by expert
-    if not has_user_provided_indx:
-        expt_indx, sort_indices = torch.sort(expt_indx, dim=1)
-        expt_scal = torch.gather(expt_scal, 1, sort_indices)
+    expt_indx, sort_indices = torch.sort(expt_indx, dim=1)
+    expt_scal = torch.gather(expt_scal, 1, sort_indices)
     # flatten topk data
     expt_scal = expt_scal.reshape(-1)
     expt_indx = expt_indx.reshape(-1).to(torch.int32)
