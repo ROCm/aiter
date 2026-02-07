@@ -11,6 +11,7 @@ on:
       - "op_tests/op_benchmarks/triton/**"
       - ".github/workflows/triton-test.yaml"
       - ".github/scripts/select_triton_tests.py"
+      - "op_tests/run_triton_tests_parallel.sh"
   workflow_dispatch:
 
 concurrency:
@@ -134,14 +135,15 @@ jobs:
           set -ex
           echo "Running Triton Tests..."
           docker exec -w /workspace triton_test mkdir -p test-reports
-          docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} --junitxml=test-reports/triton.xml
+          docker exec -w /workspace triton_test bash op_tests/run_triton_tests_parallel.sh \
+            --ngpus 1 -v --junit-dir test-reports --test-dir ${TRITON_TEST}
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: triton-test-logs
-          path: test-reports/triton.xml
+          path: test-reports/
 
       - name: Cleanup container
         if: always()
