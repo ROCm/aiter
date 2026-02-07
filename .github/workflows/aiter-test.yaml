@@ -91,14 +91,6 @@ jobs:
           IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
           docker build --network=host --no-cache -t $IMAGE_TAG -f Dockerfile.mod .
 
-      - name: Show Dependencies
-        if: ${{ !github.event.pull_request.head.repo.fork }}
-        run: |
-          docker exec \
-          -w /workspace \
-          aiter_test \
-          bash -c "pip list"
-
       - name: Push Docker image
         if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
@@ -179,7 +171,7 @@ jobs:
           -w /workspace \
           aiter_test \
           bash -c "pip show amd-aiter || true"
-      
+
       - name: Tests
         run: |
           set -ex
@@ -280,6 +272,15 @@ jobs:
           -w /workspace \
           aiter_test \
           bash -c "pip show amd-aiter || true"
+
+      - name: Show Dependencies
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        run: |
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          bash -c "pip list"
+
 
       - name: Tests
         run: |
