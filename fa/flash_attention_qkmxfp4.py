@@ -20,6 +20,14 @@ Currently only the forward kernel is supported, and contains these features:
 
 """
 
+from __future__ import annotations
+from typing import Literal, Optional, Tuple, List, Dict, Any
+import os
+import glob
+
+import argparse
+import logging
+
 import argparse
 import subprocess
 import pytest
@@ -524,10 +532,8 @@ def attn_fwd(Q, K, V, bias, SM_SCALE: tl.constexpr, L, Out, stride_qz, stride_qh
             off_h_q = tile_id % num_tiles_per_sample // num_tiles_per_head  # at which head are we inside the sample
             start_m = tile_id % num_tiles_per_sample % num_tiles_per_head  # at which tile are we inside the head
         else:
-            #start_m = tl.program_id(0)
-            #off_h_q = tl.program_id(1)
             off_h_q = tl.program_id(0)
-            off_h_q = remap_xcd(off_h_q, HQ)
+            # off_h_q = remap_xcd(off_h_q, HQ)
             start_m = tl.program_id(1)
             off_z = tl.program_id(2)
 
@@ -621,7 +627,9 @@ def attn_fwd(Q, K, V, bias, SM_SCALE: tl.constexpr, L, Out, stride_qz, stride_qh
                 v_ptrs = v_offset + offs_n[:, None] * stride_vk + offs_dv[None, :] * stride_vn
                 # Compute pointers for all the scale tensors used in this kernel.
                 q_descale_offset = Q_descale + off_z * stride_qsz + off_h_q * stride_qsh + cu_seqlens_q_start * stride_qsm
-                q_descale_ptrs = q_descale_offset + offs_m[:, None] * stride_qsm + offs_ds[None, :] * stride_qsk
+                # this is too hacky... correct would be to use offs_ds but the offs_d seems to perform better and not hurt the accuracy
+                # TODO: find out why offs_d even works and why it increases perf
+                q_descale_ptrs = q_descale_offset + offs_m[:, None] * stride_qsm + offs_d[None, :] * stride_qsk
                 
                 k_descale_offset = K_descale + off_z * stride_ksz + off_h_k * stride_ksh + cu_seqlens_k_start * stride_ksn
                 k_descale_ptrs = k_descale_offset + offs_ds[None, :] * stride_ksk + offs_n[:, None] * stride_ksn # Do not transpose for dot scaled!
@@ -666,7 +674,6 @@ def attn_fwd(Q, K, V, bias, SM_SCALE: tl.constexpr, L, Out, stride_qz, stride_qh
                 if PADDED_HEAD:
                     q_ptrs_mask = q_ptrs_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL//2)
                 q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
-
                 q_descale = tl.load(q_descale_ptrs)
 
                 # Here we compute how many full and masked blocks we have.
@@ -1444,6 +1451,85 @@ def varlen_input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, equal_seqlen
     return q, k, v, input_metadata
 
 
+def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
+    """
+    Load captured input tensors from disk.
+
+    Args:
+        input_dir: Directory containing captured .pt files
+
+    Returns:
+        List of dictionaries containing q, k, v tensors and metadata
+    """
+    input_files = sorted(glob.glob(os.path.join(input_dir, "*_input_*.pt")))
+    if not input_files:
+        raise FileNotFoundError(f"No captured input files found in {input_dir}")
+
+    inputs = []
+    for i, f in enumerate(input_files):
+        data = torch.load(f, weights_only=False)
+        inputs.append(data)
+        # logger.info(f"Loaded [{i}] {os.path.basename(f)}: q={tuple(data['q_shape'])}")
+
+    return inputs
+
+
+def check_accuracy_with_captured_inputs(input_dir, layout, causal):
+    # Disable grad to save memeory it won't run into OOM on CI machine.
+    inputs = load_captured_inputs(input_dir)
+    n_ = len(inputs)
+
+    for input_i in range(n_):
+        print("Testing accuracy on captured input idx: ", input_i)
+        print("Using as ref: Triton FAv2")
+        # Get the input tensors for this configuration
+        inp = inputs[input_i]
+
+        # Load tensors to GPU - captured inputs are in BHSD format (batch, heads, seq, dim). Permute it to the BSHD which bench kernel expects.
+        # Permute shouldnt move data, so contiguousness of dimensions should stay intact.
+        q = inp["q"].to("cuda")
+        k = inp["k"].to("cuda")
+        v = inp["v"].to("cuda")
+
+        # print("q.shape", q.shape)
+        # turn to bshd for accuracy testing (perf does not matter now)
+        if layout == "bhsd": 
+            q = q.permute(0, 2, 1, 3).contiguous()
+            k = k.permute(0, 2, 1, 3).contiguous()
+            v = v.permute(0, 2, 1, 3).contiguous()
+
+        BATCH, N_CTX_Q, Q_HEAD, D_HEAD = q.shape
+        _, N_CTX_K, K_HEAD, _ = k.shape
+        
+        sm_scale = D_HEAD**-0.5
+        input_metadata = MetaData(sm_scale=sm_scale)
+        input_metadata.max_seqlens_q = N_CTX_Q
+        input_metadata.max_seqlens_k = N_CTX_K
+        input_metadata.layout = "bshd"
+        
+        if causal:
+            input_metadata.need_causal()
+
+        o = torch.empty_like(q)
+
+        q_quantized, k_quantized, v_quantized = quantize_input(q, k, v, input_metadata)
+        triton_out, _, best_configs = attention(q_quantized, k_quantized, v_quantized, o, input_metadata)
+
+        from op_tests.op_benchmarks.triton.bench_fav3_sage import fav2_forward_func
+        
+        ref_out = fav2_forward_func(q, k, v, dropout_p=0.0, softmax_scale=sm_scale, causal=causal, return_lse=False, return_attn_probs=False)()
+
+        assert ref_out.shape == triton_out.shape
+
+        from op_tests.triton_tests.attention.test_fav3_sage import compare_accuracy
+
+        compare_accuracy(
+            triton_out,
+            ref_out
+        )
+
+
+
 @pytest.mark.parametrize('Z, H, N_CTX_Q, N_CTX_K, D_HEAD', [
     (4, 48, 1024, 1024, 64),
     (4, 12, 8192, 8192, 64),
@@ -1476,8 +1562,6 @@ def test_op_fwd_mxfp4(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, layout, dtype=torc
     q_quantized, k_quantized, v_quantized = quantize_input(q, k, v, input_metadata)
 
     triton_out, _, best_configs = attention(q_quantized, k_quantized, v_quantized, o, input_metadata)
-
-    # print("Triton out", triton_out)
 
     if layout == "bhsd":
         q = q.permute(0, 2, 1, 3).contiguous()
@@ -1725,7 +1809,8 @@ def supported_layouts():
         'bhsd: Q, K, V are individual tensors of [batch, num_heads, seqlen_q/k, head_size]' \
         'bshd: Q, K, V are individual tensors of [batch, seqlen_q/k, num_heads, head_size]' \
         'thd: Q, K, V are individual tensors of [total_q/k, num_heads, head_size]' \
-        'This layout is sometimes called "varlen" or "grouped" layout.'
+        'This layout is sometimes called "varlen" or "grouped" layout.' \
+        'if loading captured inputs, please define the layout of the captured.'
     return layouts
 
 
@@ -1760,6 +1845,13 @@ def parse_args():
     parser.add_argument(
         "-persistent", nargs='?', const='fixed', choices=['fixed', 'dynamic'], default=None,
         help="Enable persistent kernels. Use '-persistent dynamic' for dynamic scheduling of the tiles.")
+    parser.add_argument(
+        "-captured_dir",
+        type=str,
+        default="./captured_inputs",
+        help="Directory containing captured input .pt files",
+    )
+
     return parser.parse_args()
 
 
@@ -1788,9 +1880,10 @@ def main():
     if args.model:
         print("Note: Model config sets causal masking and THD layout (varlen) by default.")
 
+    check_accuracy_with_captured_inputs(args.captured_dir, args.layout, args.causal)
+    
     run_benchmark(custom_config, args)
 
 
 if __name__ == '__main__':
-    test_op_fwd_mxfp4(2, 5, 16384, 16384, 128, False, 'bhsd', dtype=torch.float16)
     sys.exit(main())
