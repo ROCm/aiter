@@ -1301,29 +1301,6 @@ class _attention(torch.autograd.Function):
 
 attention = _attention.apply
 
-INT8_MAX = 127
-
-
-def quantize_int8(tensor: torch.Tensor, dim) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    max_vals = tensor.abs().amax(dim=[i for i in range(tensor.dim()) if i != dim], keepdim=True)
-
-    # Avoid division by zero
-    max_vals[max_vals == 0] = 1e-8
-
-    # Compute scale factors for each channel
-    scale = INT8_MAX / max_vals.to(torch.float32)
-
-    # Quantize the tensor
-    tensor = tensor * scale
-    tensor = tensor.round_()
-    tensor.clamp_(-INT8_MAX, INT8_MAX)
-    tensor_quantized = tensor.to(torch.int8)
-
-    return tensor_quantized, scale, 1 / scale
-
-
-
-
 def quantize_input(
     q,
     k,
