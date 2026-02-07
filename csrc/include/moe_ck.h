@@ -21,7 +21,8 @@ void ck_moe_stage1(torch::Tensor& hidden_states, // [m, k], input token
                    int activation,
                    std::optional<int> splitk,
                    bool nt,
-                   std::optional<std::string> dst_type);
+                   std::optional<std::string> dst_type,
+                   bool is_shuffled);
 
 void ck_moe_stage2(torch::Tensor& inter_states, // [m, k], input token
                    torch::Tensor& w1, // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
@@ -40,4 +41,5 @@ void ck_moe_stage2(torch::Tensor& inter_states, // [m, k], input token
                    int activation,
                    std::optional<int> splitk,
                    bool nt,
-                   std::optional<std::string> dst_type);
+                   std::optional<std::string> dst_type,
+                   bool is_shuffled);
