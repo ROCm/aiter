@@ -4,7 +4,6 @@
 # mypy: allow-untyped-defs
 import collections
 
-
 Entry = collections.namedtuple("Entry", "version, hash")
 
 

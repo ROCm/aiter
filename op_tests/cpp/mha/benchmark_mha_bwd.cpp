@@ -558,7 +558,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
         const ck_tile::index_t nhead_stride_randval = (shape_seqlen_q * max_seqlen_k);
         const ck_tile::index_t nhead_stride_do      = (o_perm ? shape_seqlen_q * hdim_v : hdim_v);
         const ck_tile::index_t nhead_stride_lsed    = shape_seqlen_q;
-        const ck_tile::index_t nhead_stride_dq_acc  = a16_dq_acc_seq * a16_dq_acc_hdim;
+        const ck_tile::long_index_t nhead_stride_dq_acc = a16_dq_acc_seq * a16_dq_acc_hdim;
         const ck_tile::index_t nhead_stride_dbias =
             (i_perm ? shape_seqlen_q * max_seqlen_k : max_seqlen_k);
         // setup batch_stride_* arguments
@@ -573,7 +573,8 @@ bool run(const ck_tile::ArgParser& arg_parser)
         const ck_tile::index_t batch_stride_dk      = (nhead * shape_seqlen_k * hdim_q);
         const ck_tile::index_t batch_stride_dv      = (nhead * shape_seqlen_k * hdim_v);
         const ck_tile::index_t batch_stride_dbias   = (nhead * shape_seqlen_q * max_seqlen_k);
-        const ck_tile::index_t batch_stride_dq_acc  = (nhead * a16_dq_acc_seq * a16_dq_acc_hdim);
+        const ck_tile::long_index_t batch_stride_dq_acc =
+            (nhead * a16_dq_acc_seq * a16_dq_acc_hdim);
         const ck_tile::index_t split_stride_dq_acc =
             (shape_batch * nhead * shape_seqlen_q * hdim_q);
 

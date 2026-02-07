@@ -15,7 +15,6 @@ from gemm_a8w8_bpreshuffle_cktile_common import (
     default_kernels_dict,
 )
 
-
 """
 
 gemm_a8w8_bpreshuffle_cktile instance gen

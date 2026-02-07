@@ -37,8 +37,8 @@ def run_torch(
     upcast=True,
     reorder_ops=False,
 ):
-    (b, seqlen_q, _, _) = q.shape
-    (_, seqlen_k, _, _) = k.shape
+    b, seqlen_q, _, _ = q.shape
+    _, seqlen_k, _, _ = k.shape
 
     if bias is not None:
         attn_bias = bias.reshape(b, 1, seqlen_q, seqlen_k)
@@ -163,8 +163,8 @@ def run_ck(
         out = output_pad_fn(outputs)
 
     if dropout_p > 0.0 and return_attn_probs:
-        (_, seqlen_q, _, d) = q.shape
-        (_, seqlen_k, _, d) = k.shape
+        _, seqlen_q, _, d = q.shape
+        _, seqlen_k, _, d = k.shape
         S_dmask = outputs[-1]
         S_dmask = ck_randval_to_dropout_mask(S_dmask, dropout_p)
         S_dmask = pad_rearrange_dropout_mask_hts_to_bhss(
@@ -1029,7 +1029,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    (seqlen_q, seqlen_k) = args.seqlen_q_k
+    seqlen_q, seqlen_k = args.seqlen_q_k
 
     if args.causal is not None:
         l_causal = [args.causal]

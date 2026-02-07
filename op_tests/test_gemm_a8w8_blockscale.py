@@ -138,54 +138,19 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=["bf16"],
-    nargs="?",
-    const=None,
-    default=None,
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["bf16"]],
+    nargs="*",
+    default=[dtypes.d_dtypes["bf16"]],
+    metavar="{bf16}",
     help="""Data type.
     e.g.: -d bf16""",
 )
 parser.add_argument(
     "-m",
     type=int,
-    nargs="?",
-    const=None,
-    default=None,
-    help="""M of mnk.
-    e.g.: -m 32""",
-)
-parser.add_argument(
-    "-nk",
-    type=dtypes.str2tuple,
-    nargs="?",
-    const=None,
-    default=None,
-    help="""N&K of mnk.
-    e.g.: -nk 4096,512""",
-)
-parser.add_argument(
-    "--ck_preshuffle",
-    nargs="?",
-    default=[True, False],
-    help="weight ck_preshuffle or not",
-)
-
-args = parser.parse_args()
-if args.dtype is None:
-    l_dtype = [dtypes.d_dtypes[key] for key in ["bf16"]]
-else:
-    l_dtype = [dtypes.d_dtypes[args.dtype]]
-if args.m is not None:
-    l_m = [args.m]
-if args.nk is not None:
-    l_nk = [args.nk]
-l_preshuffle: List[bool] = args.ck_preshuffle
-
-df = []
-for dtype in [dtypes.bf16]:
-    # deepseek-r1
-    for m in [
+    nargs="*",
+    choices=[
         1,
         2,
         4,
@@ -213,15 +178,79 @@ for dtype in [dtypes.bf16]:
         6144,
         8192,
         10240,
-    ]:
-        for n, k in [
-            (24576, 1536),
-            # (32768, 512),
-            # (7168, 16384),
-            # (36864, 7168),
-        ]:
-            ret = test_gemm(dtype, m, n, k)
-            df.append(ret)
+    ],
+    default=[
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        96,
+        128,
+        160,
+        192,
+        224,
+        256,
+        288,
+        320,
+        352,
+        384,
+        416,
+        448,
+        480,
+        512,
+        1024,
+        2048,
+        4096,
+        6144,
+        8192,
+        10240,
+    ],
+    help="""M of mnk.
+    e.g.: -m 32""",
+)
+parser.add_argument(
+    "-nk",
+    type=dtypes.str2tuple,
+    nargs="*",
+    choices=[
+        (24576, 1536),
+        # (32768, 512),
+        # (7168, 16384),
+        # (36864, 7168),
+    ],
+    default=[
+        (24576, 1536),
+        # (32768, 512),
+        # (7168, 16384),
+        # (36864, 7168),
+    ],
+    help="""N&K of mnk.
+    e.g.: -nk 24576,1536""",
+)
+parser.add_argument(
+    "--ck_preshuffle",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[True, False],
+    help="""weight ck_preshuffle or not.
+    e.g.: --ck_preshuffle True
+        or --ck_preshuffle False
+    """,
+)
+
+args = parser.parse_args()
+
+df = []
+for dtype in args.dtype:
+    # deepseek-r1
+    for m in args.m:
+        for n, k in args.nk:
+            for ck_p in args.ck_preshuffle:
+                ret = test_gemm(dtype, m, n, k, ck_preshuffle=ck_p)
+                df.append(ret)
 df = pd.DataFrame(df)
 
 # Configure pandas to show all columns without truncation

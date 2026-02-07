@@ -179,9 +179,10 @@ a8w8_gemm1_kernels_list= {
 }
 # gemm1 blockscale out:bf16/fp16 AB:fp8/i8
 a8w8_gemm1_blockscale_kernels_list= {
-     1: kernelInstanceGEMM1(       256,       16,        128,       256,     1,       4,        1,),
-     0: kernelInstanceGEMM1(       256,       64,        128,       128,     1,       4,        3,),
-     2: kernelInstanceGEMM1(       128,       16,        128,       128,     1,       2,        1,),
+     0: kernelInstanceGEMM1(       256,       16,        128,       256,     1,       4,        1,),
+     1: kernelInstanceGEMM1(       128,       16,        128,       128,     1,       2,        1,),
+     2: kernelInstanceGEMM1(       256,       32,        128,       128,     1,       4,        1,),
+     3: kernelInstanceGEMM1(       256,       64,        128,       128,     1,       4,        3,),
      #2: kernelInstanceGEMM1(       256,      128,        128,       128,     1,       4,        3,),
 }
 
@@ -301,8 +302,9 @@ a8w8_gemm2_kernels_list= {
 # gemm2 MXDLPerWave out:bf16/fp16 AB:fp8/i8
 a8w8_gemm2_blockscale_kernels_list= {
      0: kernelInstanceGEMM2(       256,       16,        128,       256,     1,       4,        1,),
-     1: kernelInstanceGEMM2(       256,       64,        128,       128,     1,       4,        3,),
-     2: kernelInstanceGEMM2(       128,       16,        128,       128,     1,       2,        1,),
+     1: kernelInstanceGEMM2(       128,       16,        128,       128,     1,       2,        1,),
+     2: kernelInstanceGEMM2(       256,       32,        128,       128,     1,       4,        1,),
+     3: kernelInstanceGEMM2(       256,       64,        128,       128,     1,       4,        3,),
      #2: kernelInstanceGEMM2(       256,      128,        128,       128,     2,       2,        3,),
 }
 
@@ -395,6 +397,7 @@ def get_gemm1_kernels_list(
             tag = "a4w4"
         else:
             tag = "a4w4_bns"
+
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
     kernels_list = gemm1_kernels_dict[tag]
@@ -414,8 +417,10 @@ def get_gemm1_kernels_list(
                 kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscaleSplitk"
             else:
                 kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscale"
-        elif tag == "a8w8" or tag == "a4w4" or tag == "a4w4_bns":
+        elif tag == "a8w8" or tag == "a4w4_bns":
             kernel.CDEElementOp = "MulABScale"
+        elif tag == "a4w4":
+            kernel.CDEElementOp = "MulABScaleShuffled"
         elif tag == "a16w16":
             if MulRoutedWeight:
                 kernel.CDEElementOp = "TypeCastExpertWeight"
@@ -478,8 +483,10 @@ def get_gemm2_kernels_list(
             kernel.CDEElementOp = "MulABScaleExpertWeightWin4"
         elif tag == "a8w8blkscale":
             kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscale"
-        elif tag == "a8w8" or tag == "a4w4" or tag == "a4w4_bns":
+        elif tag == "a8w8" or tag == "a4w4_bns":
             kernel.CDEElementOp = "MulABScaleExpertWeight"
+        elif tag == "a4w4":
+            kernel.CDEElementOp = "MulABScaleExpertWeightShuffled"
         elif tag == "a16w16":
             if MulRoutedWeight:
                 kernel.CDEElementOp = "TypeCastExpertWeight"

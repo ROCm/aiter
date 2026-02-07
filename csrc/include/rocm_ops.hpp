@@ -57,6 +57,8 @@ namespace py = pybind11;
           py::arg("work_indptr"),              \
           py::arg("work_info_set"),            \
           py::arg("max_seqlen_q"),             \
+          py::arg("page_size"),                \
+          py::arg("nhead_kv"),                 \
           py::arg("softmax_scale"),            \
           py::arg("splitData"),                \
           py::arg("splitLse"),                 \
@@ -75,7 +77,27 @@ namespace py = pybind11;
           py::arg("max_seqlen_q"),             \
           py::arg("softmax_scale"),            \
           py::arg("splitData"),                \
-          py::arg("splitLse"));
+          py::arg("splitLse"));                \
+    m.def("mla_prefill_ps_asm_fwd",            \
+          &mla_prefill_ps_asm_fwd,             \
+          "mla_prefill_ps_asm_fwd",            \
+          py::arg("Q"),                        \
+          py::arg("K"),                        \
+          py::arg("V"),                        \
+          py::arg("qo_indptr"),                \
+          py::arg("kv_indptr"),                \
+          py::arg("kv_page_indices"),          \
+          py::arg("work_indptr"),              \
+          py::arg("work_info_set"),            \
+          py::arg("max_seqlen_q"),             \
+          py::arg("softmax_scale"),            \
+          py::arg("is_causal"),                \
+          py::arg("splitData"),                \
+          py::arg("splitLse"),                 \
+          py::arg("output"),                   \
+          py::arg("q_scale") = std::nullopt,   \
+          py::arg("k_scale") = std::nullopt,   \
+          py::arg("v_scale") = std::nullopt);
 
 #define ATTENTION_ASM_PYBIND                        \
     m.def("pa_fwd_asm",                             \
@@ -391,7 +413,8 @@ namespace py = pybind11;
           py::arg("out"),                                                                      \
           py::arg("use_new"),                                                                  \
           py::arg("open_fp8_quant"),                                                           \
-          py::arg("reg_buffer") = std::nullopt);                                               \
+          py::arg("reg_input_buffer") = std::nullopt,                                               \
+          py::arg("reg_output_buffer") = std::nullopt);                                               \
     m.def("fused_allreduce_rmsnorm",                                                           \
           &aiter::fused_allreduce_rmsnorm,                                                     \
           py::arg("_fa"),                                                                      \
@@ -401,15 +424,23 @@ namespace py = pybind11;
           py::arg("out"),                                                                      \
           py::arg("w"),                                                                        \
           py::arg("eps"),                                                                      \
-          py::arg("reg_buffer") = std::nullopt);                                               \
+          py::arg("reg_buffer") = std::nullopt,                                                \
+          py::arg("use_1stage") = false);                                                      \
     m.def("all_reduce_asm_", &all_reduce_asm, "");                                             \
     m.def("all_reduce_rmsnorm_", &all_reduce_rmsnorm, "all_reduce_rmsnorm");                   \
     m.def("all_reduce_rmsnorm_quant_", &all_reduce_rmsnorm_quant, "all_reduce_rmsnorm_quant"); \
     m.def("dispose", &aiter::dispose, py::arg("_fa"));                                         \
     m.def("meta_size", &aiter::meta_size);                                                     \
-    m.def("register_buffer",                                                                   \
-          &aiter::register_buffer,                                                             \
-          "register_buffer(int fa, Tensor t, str[] handles, int[] offsets) -> ()",             \
+    m.def("register_input_buffer",                                                                   \
+          &aiter::register_input_buffer,                                                             \
+          "register_input_buffer(int fa, Tensor t, str[] handles, int[] offsets) -> ()",             \
+          py::arg("_fa"),                                                                      \
+          py::arg("t"),                                                                        \
+          py::arg("handles"),                                                                  \
+          py::arg("offsets"));                                                                 \
+    m.def("register_output_buffer",                                                            \
+          &aiter::register_output_buffer,                                                      \
+          "register_output_buffer(int fa, Tensor t, str[] handles, int[] offsets) -> ()",      \
           py::arg("_fa"),                                                                      \
           py::arg("t"),                                                                        \
           py::arg("handles"),                                                                  \
@@ -539,6 +570,28 @@ namespace py = pybind11;
           py::arg("w_scale"),            \
           py::arg("Out"),                \
           py::arg("kernelId") = 0,       \
+          py::arg("splitK")   = 0);
+
+#define GEMM_A8W8_BLOCKSCALE_CKTILE_PYBIND \
+    m.def("gemm_a8w8_blockscale_cktile",   \
+          &gemm_a8w8_blockscale_cktile,    \
+          "fp8 blockscale gemm cktile",    \
+          py::arg("XQ"),                   \
+          py::arg("WQ"),                   \
+          py::arg("x_scale"),              \
+          py::arg("w_scale"),              \
+          py::arg("Out"));
+
+#define GEMM_A8W8_BLOCKSCALE_CKTILE_TUNE_PYBIND \
+    m.def("gemm_a8w8_blockscale_cktile_tune",   \
+          &gemm_a8w8_blockscale_cktile_tune,    \
+          "gemm_a8w8_blockscale_cktile_tune",   \
+          py::arg("XQ"),                        \
+          py::arg("WQ"),                        \
+          py::arg("x_scale"),                   \
+          py::arg("w_scale"),                   \
+          py::arg("Out"),                       \
+          py::arg("kernelId") = 0,              \
           py::arg("splitK")   = 0);
 
 #define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_PYBIND \
@@ -820,6 +873,7 @@ namespace py = pybind11;
           py::arg("q_descale")     = std::nullopt, \
           py::arg("k_descale")     = std::nullopt, \
           py::arg("v_descale")     = std::nullopt, \
+          py::arg("sink_ptr")      = std::nullopt, \
           py::arg("gen")           = std::nullopt);
 
 #define LIBMHA_FWD_PYBIND                          \
@@ -904,46 +958,50 @@ namespace py = pybind11;
           py::arg("cu_seqlens_q_padded") = std::nullopt, \
           py::arg("cu_seqlens_k_padded") = std::nullopt);
 
-#define MOE_CK_2STAGES_PYBIND                       \
-    m.def("ck_moe_stage1",                          \
-          &ck_moe_stage1,                           \
-          py::arg("hidden_states"),                 \
-          py::arg("w1"),                            \
-          py::arg("w2"),                            \
-          py::arg("sorted_token_ids"),              \
-          py::arg("sorted_expert_ids"),             \
-          py::arg("num_valid_ids"),                 \
-          py::arg("out"),                           \
-          py::arg("topk"),                          \
-          py::arg("kernelName")     = std::nullopt, \
-          py::arg("w1_scale")       = std::nullopt, \
-          py::arg("a1_scale")       = std::nullopt, \
-          py::arg("block_m")        = 32,           \
-          py::arg("sorted_weights") = std::nullopt, \
-          py::arg("quant_type")     = 0,            \
-          py::arg("activation")     = 0,            \
-          py::arg("splitk")         = 1,            \
-          py::arg("dst_type")       = std::nullopt);      \
-                                                    \
-    m.def("ck_moe_stage2",                          \
-          &ck_moe_stage2,                           \
-          py::arg("inter_states"),                  \
-          py::arg("w1"),                            \
-          py::arg("w2"),                            \
-          py::arg("sorted_token_ids"),              \
-          py::arg("sorted_expert_ids"),             \
-          py::arg("num_valid_ids"),                 \
-          py::arg("out"),                           \
-          py::arg("topk"),                          \
-          py::arg("kernelName")     = std::nullopt, \
-          py::arg("w2_scale")       = std::nullopt, \
-          py::arg("a2_scale")       = std::nullopt, \
-          py::arg("block_m")        = 32,           \
-          py::arg("sorted_weights") = std::nullopt, \
-          py::arg("quant_type")     = 0,            \
-          py::arg("activation")     = 0,            \
-          py::arg("splitk")         = 1,            \
-          py::arg("dst_type")       = std::nullopt);
+#define MOE_CK_2STAGES_PYBIND                          \
+    m.def("ck_moe_stage1",                             \
+          &ck_moe_stage1,                              \
+          py::arg("hidden_states"),                    \
+          py::arg("w1"),                               \
+          py::arg("w2"),                               \
+          py::arg("sorted_token_ids"),                 \
+          py::arg("sorted_expert_ids"),                \
+          py::arg("num_valid_ids"),                    \
+          py::arg("out"),                              \
+          py::arg("topk"),                             \
+          py::arg("kernelName")        = std::nullopt, \
+          py::arg("w1_scale")          = std::nullopt, \
+          py::arg("a1_scale")          = std::nullopt, \
+          py::arg("block_m")           = 32,           \
+          py::arg("sorted_weights")    = std::nullopt, \
+          py::arg("quant_type")        = 0,            \
+          py::arg("activation")        = 0,            \
+          py::arg("splitk")            = 1,            \
+          py::arg("non_temporal_load") = false,        \
+          py::arg("dst_type")          = std::nullopt, \
+          py::arg("is_shuffled")    = true);           \
+                                                       \
+    m.def("ck_moe_stage2",                             \
+          &ck_moe_stage2,                              \
+          py::arg("inter_states"),                     \
+          py::arg("w1"),                               \
+          py::arg("w2"),                               \
+          py::arg("sorted_token_ids"),                 \
+          py::arg("sorted_expert_ids"),                \
+          py::arg("num_valid_ids"),                    \
+          py::arg("out"),                              \
+          py::arg("topk"),                             \
+          py::arg("kernelName")        = std::nullopt, \
+          py::arg("w2_scale")          = std::nullopt, \
+          py::arg("a2_scale")          = std::nullopt, \
+          py::arg("block_m")           = 32,           \
+          py::arg("sorted_weights")    = std::nullopt, \
+          py::arg("quant_type")        = 0,            \
+          py::arg("activation")        = 0,            \
+          py::arg("splitk")            = 1,            \
+          py::arg("non_temporal_load") = false,        \
+          py::arg("dst_type")          = std::nullopt, \
+          py::arg("is_shuffled")    = true);
 
 #define MOE_CKTILE_2STAGES_PYBIND                   \
     m.def("cktile_moe_gemm1",                       \
@@ -1016,7 +1074,8 @@ namespace py = pybind11;
           py::arg("v_descale")           = std::nullopt, \
           py::arg("gen")                 = std::nullopt, \
           py::arg("cu_seqlens_q_padded") = std::nullopt, \
-          py::arg("cu_seqlens_k_padded") = std::nullopt);
+          py::arg("cu_seqlens_k_padded") = std::nullopt, \
+          py::arg("sink_ptr")            = std::nullopt);
 
 #define MHA_BATCH_PREFILL_PYBIND                       \
     m.def("mha_batch_prefill",                         \
@@ -1044,9 +1103,11 @@ namespace py = pybind11;
           py::arg("q_descale")         = std::nullopt, \
           py::arg("k_descale")         = std::nullopt, \
           py::arg("v_descale")         = std::nullopt, \
+          py::arg("kv_block_descale")  = std::nullopt, \
           py::arg("kv_last_page_lens") = std::nullopt, \
           py::arg("block_table")       = std::nullopt, \
           py::arg("seqlen_k")          = std::nullopt, \
+          py::arg("sink_ptr")          = std::nullopt, \
           py::arg("gen")               = std::nullopt);
 
 #define MOE_OP_PYBIND                                                          \
@@ -1329,10 +1390,12 @@ namespace py = pybind11;
           py::arg("input"),                                              \
           py::arg("scales"),                                             \
           py::arg("smooth_scale"),                                       \
-          py::arg("smooth_scale_map") = std::nullopt,                    \
-          py::arg("shuffle_scale")    = false,                           \
-          py::arg("num_rows")         = std::nullopt,                    \
-          py::arg("num_rows_factor")  = 1);                               \
+          py::arg("smooth_scale_map")      = std::nullopt,               \
+          py::arg("shuffle_scale")         = false,                      \
+          py::arg("num_rows")              = std::nullopt,               \
+          py::arg("num_rows_factor")       = 1,                          \
+          py::arg("smooth_scale_map_hash") = std::nullopt,               \
+          py::arg("enable_ps")             = true);                                  \
     m.def("partial_transpose",                                           \
           &aiter::partial_transpose,                                     \
           py::arg("out"),                                                \
@@ -1457,12 +1520,13 @@ namespace py = pybind11;
     m.def("rope_cached_positions_offsets_fwd_impl", &rope_cached_positions_offsets_fwd_impl); \
     m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl);
 
-#define FUSED_MROPE_RMS_PYBIND                        \
-    m.def("fused_mrope_3d_rms", &fused_mrope_3d_rms); \
-    m.def("fused_rope_rms", &fused_rope_rms);
+#define FUSED_QKNORM_MROPE_CACHE_QUANT_PYBIND \
+    m.def("fused_qk_norm_mrope_3d_cache_pts_quant_shuffle", &fused_qk_norm_mrope_3d_cache_pts_quant_shuffle);
 
-#define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND \
-    m.def("fused_qk_norm_rope_cache_quant_shuffle", &aiter::fused_qk_norm_rope_cache_quant_shuffle);
+#define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                                                                 \
+    m.def("fused_qk_norm_rope_cache_quant_shuffle", &aiter::fused_qk_norm_rope_cache_quant_shuffle);         \
+    m.def("fused_qk_norm_rope_cache_pts_quant_shuffle", &aiter::fused_qk_norm_rope_cache_pts_quant_shuffle); \
+    m.def("fused_qk_norm_rope_2way", &aiter::fused_qk_norm_rope_2way);
 
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
@@ -1607,6 +1671,7 @@ namespace py = pybind11;
           "get_mla_metadata_v1",                         \
           py::arg("seqlens_qo_indptr"),                  \
           py::arg("seqlens_kv_indptr"),                  \
+          py::arg("kv_last_page_lens"),                  \
           py::arg("num_heads_per_head_k"),               \
           py::arg("num_heads_k"),                        \
           py::arg("is_causal"),                          \
@@ -1616,6 +1681,7 @@ namespace py = pybind11;
           py::arg("reduce_indptr"),                      \
           py::arg("reduce_final_map"),                   \
           py::arg("reduce_partial_map"),                 \
+          py::arg("page_size")           = 1,            \
           py::arg("kv_granularity")      = 16,           \
           py::arg("max_seqlen_qo")       = -1,           \
           py::arg("uni_seqlen_qo")       = -1,           \
@@ -1651,6 +1717,27 @@ namespace py = pybind11;
           py::arg("topk")                = -1,   \
           py::arg("max_split_per_batch") = -1);
 
+#define PS_METADATA_PYBIND                    \
+    m.def("get_ps_metadata_v1",               \
+          &get_ps_metadata_v1,                \
+          "get_ps_metadata_v1",               \
+          py::arg("seqlens_qo_indptr"),       \
+          py::arg("pages_kv_indptr"),         \
+          py::arg("context_lens"),            \
+          py::arg("gqa_ratio"),               \
+          py::arg("num_heads_k"),             \
+          py::arg("work_metadata_ptrs"),      \
+          py::arg("work_indptr"),             \
+          py::arg("work_info"),               \
+          py::arg("reduce_indptr"),           \
+          py::arg("reduce_final_map"),        \
+          py::arg("reduce_partial_map"),      \
+          py::arg("qhead_granularity") = 1,   \
+          py::arg("qlen_granularity")  = 256, \
+          py::arg("kvlen_granularity") = 1,   \
+          py::arg("block_size")        = 1,   \
+          py::arg("is_causal")         = true);
+
 #define MLA_REDUCE_PYBIND                \
     m.def("mla_reduce_v1",               \
           &mla_reduce_v1,                \
@@ -1676,3 +1763,39 @@ namespace py = pybind11;
           py::arg("rowEnds")   = torch::Tensor(), \
           py::arg("stride0")   = -1,              \
           py::arg("stride1")   = 1);
+
+#define RMSNORM_QUANT_PYBIND                 \
+    m.def("add_rmsnorm_quant",               \
+          &aiter::add_rmsnorm_quant,         \
+          py::arg("out"),                    \
+          py::arg("input"),                  \
+          py::arg("residual_in"),            \
+          py::arg("residual_out"),           \
+          py::arg("scale"),                  \
+          py::arg("weight"),                 \
+          py::arg("epsilon"),                \
+          py::arg("group_size")    = 0,      \
+          py::arg("shuffle_scale") = false); \
+    m.def("add_rmsnorm",                     \
+          &aiter::add_rmsnorm,               \
+          py::arg("out"),                    \
+          py::arg("input"),                  \
+          py::arg("residual_in"),            \
+          py::arg("residual_out"),           \
+          py::arg("weight"),                 \
+          py::arg("epsilon"));               \
+    m.def("rmsnorm_quant",                   \
+          &aiter::rmsnorm_quant,             \
+          py::arg("out"),                    \
+          py::arg("input"),                  \
+          py::arg("scale"),                  \
+          py::arg("weight"),                 \
+          py::arg("epsilon"),                \
+          py::arg("group_size")    = 0,      \
+          py::arg("shuffle_scale") = false); \
+    m.def("rmsnorm",                         \
+          &aiter::rmsnorm,                   \
+          py::arg("out"),                    \
+          py::arg("input"),                  \
+          py::arg("weight"),                 \
+          py::arg("epsilon"));

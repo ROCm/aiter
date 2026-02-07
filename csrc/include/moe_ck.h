@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
 #include <torch/extension.h>
@@ -20,7 +20,9 @@ void ck_moe_stage1(torch::Tensor& hidden_states, // [m, k], input token
                    int quant_type,
                    int activation,
                    std::optional<int> splitk,
-                   std::optional<std::string> dst_type);
+                   bool nt,
+                   std::optional<std::string> dst_type,
+                   bool is_shuffled);
 
 void ck_moe_stage2(torch::Tensor& inter_states, // [m, k], input token
                    torch::Tensor& w1, // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
@@ -38,4 +40,6 @@ void ck_moe_stage2(torch::Tensor& inter_states, // [m, k], input token
                    int quant_type,
                    int activation,
                    std::optional<int> splitk,
-                   std::optional<std::string> dst_type);
+                   bool nt,
+                   std::optional<std::string> dst_type,
+                   bool is_shuffled);

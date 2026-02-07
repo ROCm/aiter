@@ -118,7 +118,7 @@ struct mha_bwd_args
     int nhead_stride_randval;
     int nhead_stride_do;
     int nhead_stride_lsed;
-    int nhead_stride_dq_acc;
+    int64_t nhead_stride_dq_acc;
     int nhead_stride_dq;
     int nhead_stride_dk;
     int nhead_stride_dv;
@@ -131,7 +131,7 @@ struct mha_bwd_args
     int batch_stride_randval;
     int batch_stride_do;
     int batch_stride_lsed;
-    int batch_stride_dq_acc;
+    int64_t batch_stride_dq_acc;
     int batch_stride_dq;
     int batch_stride_dk;
     int batch_stride_dv;

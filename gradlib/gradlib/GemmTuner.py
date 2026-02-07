@@ -189,7 +189,7 @@ class Gemm:
         self.outdtype = outdtype
         self.scaleAB = scaleAB
         self.nb = CACHE_INVALIDATE_BUFFERS
-        (self.inp, self.weights, _, self.bias, _, scaleA, _) = generate_data(
+        self.inp, self.weights, _, self.bias, _, scaleA, _ = generate_data(
             m, n, k, indtype, outdtype, scaleAB, is_shuffle, 0, bias
         )
         self.blob = torch.ones(128 * 1024 * 1024, dtype=dtypes.fp32, device="cuda")

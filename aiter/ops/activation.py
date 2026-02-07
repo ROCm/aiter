@@ -4,7 +4,6 @@
 from torch import Tensor
 from ..jit.core import compile_ops
 
-
 MD_NAME = "module_activation"
 
 

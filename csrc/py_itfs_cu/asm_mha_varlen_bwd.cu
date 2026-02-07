@@ -274,8 +274,8 @@ fmha_v3_varlen_bwd(const at::Tensor &dout,                  // [total_q, hq, d_v
             ck_tile::index_t nhead_stride_dv = dv_expanded.stride(1);
 
             ck_tile::index_t split_stride_dq_acc;
-            ck_tile::index_t batch_stride_dq_acc;
-            ck_tile::index_t nhead_stride_dq_acc;
+            ck_tile::long_index_t batch_stride_dq_acc;
+            ck_tile::long_index_t nhead_stride_dq_acc;
             ck_tile::index_t stride_dq_acc;
             // For atomic32, dq_acc layout is (1, num_heads, total_q, head_size_q)
             // For atomic16, dq_acc layout is (1, batch_size, num_heads, (max_seqlen_q + 15) / 16 * 16, 128)

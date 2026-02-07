@@ -7,15 +7,16 @@ import sys
 import json
 
 from setuptools import Distribution, setup
+from concurrent.futures import ThreadPoolExecutor
 
 # !!!!!!!!!!!!!!!! never import aiter
 # from aiter.jit import core
-this_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, f"{this_dir}/aiter/")
-from concurrent.futures import ThreadPoolExecutor
-
+sys.path.insert(0, f"{os.path.dirname(os.path.abspath(__file__))}/aiter/")
 from jit import core
 from jit.utils.cpp_extension import IS_HIP_EXTENSION, BuildExtension
+from jit.utils.mha_recipes import get_mha_varlen_prebuild_variants_by_names
+
+this_dir = os.path.dirname(os.path.abspath(__file__))
 
 ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
 PACKAGE_NAME = "amd-aiter"
@@ -40,12 +41,16 @@ PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
 def getMaxJobs():
     # calculate the maximum allowed NUM_JOBS based on cores
     max_num_jobs_cores = max(1, os.cpu_count() * 0.8)
-    import psutil
 
-    # calculate the maximum allowed NUM_JOBS based on free memory
-    free_memory_gb = psutil.virtual_memory().available / (1024**3)
-    # free memory in GB
-    max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
+    try:
+        import psutil
+
+        # calculate the maximum allowed NUM_JOBS based on free memory
+        free_memory_gb = psutil.virtual_memory().available / (1024**3)
+        max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
+    except ImportError:
+        # psutil may not be available during metadata extraction
+        max_num_jobs_memory = max_num_jobs_cores
 
     # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
     max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
@@ -99,12 +104,15 @@ if IS_ROCM:
 
         for module in all_modules:
             if PREBUILD_KERNELS == 1:
-                # Exclude mha, _tune, and specific module
                 if (
-                    "mha" in module
-                    or "_tune" in module
+                    "_tune" in module
                     or module == "module_gemm_mi350_a8w8_blockscale_asm"
                 ):
+                    exclude_ops.append(module)
+                if "mha" in module and module not in [
+                    "module_fmha_v3_fwd",
+                    "module_fmha_v3_varlen_fwd",
+                ]:
                     exclude_ops.append(module)
             elif PREBUILD_KERNELS == 2:
                 # Exclude _bwd, _tune, and specific module
@@ -147,6 +155,32 @@ if IS_ROCM:
             )
         else:
             all_opts_args_build, _ = core.get_args_of_build("all", exclude=exclude_ops)
+
+            if PREBUILD_KERNELS == 1:
+                extra_args_build = []
+
+                req_md_names = [
+                    "mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale",
+                    "mha_varlen_fwd_bf16_nlogits_nbias_nmask_lse_ndropout_nskip_nqscale",
+                ]
+                variants = get_mha_varlen_prebuild_variants_by_names(
+                    req_md_names, ck_dir
+                )
+                base_args = core.get_args_of_build("module_mha_varlen_fwd")
+                for v in variants:
+                    if not isinstance(base_args, dict) or not base_args.get("srcs"):
+                        continue
+                    extra_args_build.append(
+                        {
+                            "md_name": v["md_name"],
+                            "srcs": base_args["srcs"],
+                            "flags_extra_cc": base_args["flags_extra_cc"],
+                            "flags_extra_hip": base_args["flags_extra_hip"],
+                            "extra_include": base_args["extra_include"],
+                            "blob_gen_cmd": v["blob_gen_cmd"],
+                        }
+                    )
+                all_opts_args_build.extend(extra_args_build)
 
             bd = f"{core.get_user_jit_dir()}/build"
             import glob
@@ -253,6 +287,7 @@ setup(
         "pandas",
         "einops",
         "psutil",
+        "packaging",
     ],
     extras_require={
         # Triton-based communication using Iris

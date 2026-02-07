@@ -85,10 +85,8 @@ def context_attention_fwd(
     if (
         torch.finfo(k_cache.dtype).bits == 8 or torch.finfo(v_cache.dtype).bits == 8
     ) and kv_cache_dtype == "auto":
-        raise ValueError(
-            "kv_cache_dtype='auto' unsupported for\
-            FP8 KV Cache prefill kernel"
-        )
+        raise ValueError("kv_cache_dtype='auto' unsupported for\
+            FP8 KV Cache prefill kernel")
 
     # shape constraints
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]

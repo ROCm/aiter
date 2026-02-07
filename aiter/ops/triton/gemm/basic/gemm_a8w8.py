@@ -12,7 +12,6 @@ from aiter.ops.triton.utils.device_info import get_num_xcds
 
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
-
 _LOGGER = AiterTritonLogger()
 
 
