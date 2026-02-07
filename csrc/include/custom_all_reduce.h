@@ -53,6 +53,16 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              float eps,
                              std::optional<torch::Tensor> reg_buffer,
                              bool use_1stage);
+void fused_allreduce_rmsnorm_quant(fptr_t _fa,
+                                   torch::Tensor& inp,
+                                   torch::Tensor& res_inp,
+                                   torch::Tensor& res_out,
+                                   torch::Tensor& out,
+                                   torch::Tensor& scale_out,
+                                   torch::Tensor& w,
+                                   float eps,
+                                   std::optional<torch::Tensor> reg_buffer,
+                                   bool use_1stage);
 
 void dispose(fptr_t _fa);
 int64_t meta_size();
