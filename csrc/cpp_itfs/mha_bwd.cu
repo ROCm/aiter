@@ -9,21 +9,23 @@ std::tuple<int, int> get_padded_hdim(int hdim_q, int hdim_v, std::string arch_id
 {
     if(hdim_q == 192 && hdim_v == 128 && arch_id == "gfx950")
         return std::make_tuple(hdim_q, hdim_v);
-    assert(hdim_q == hdim_v);
-    if(hdim_q <= 64)
+        
+    if(hdim_q == hdim_v)
     {
-        return std::make_tuple(64, 64);
-    }
-    else if(hdim_q <= 128)
-    {
-        return std::make_tuple(128, 128);
-    }
-    else if(hdim_q <= 192)
-    {
-        return std::make_tuple(192, 192);
+        if(hdim_q <= 64)
+        {
+            return std::make_tuple(64, 64);
+        }
+        else if(hdim_q <= 128)
+        {
+            return std::make_tuple(128, 128);
+        }
+        else if(hdim_q <= 192)
+        {
+            return std::make_tuple(192, 192);
+        }
     }
 
-    assert(false);
     return std::make_tuple(hdim_q, hdim_v);
 }
 
