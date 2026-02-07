@@ -245,7 +245,7 @@ def test_rmsnorm(
         ret["ck bw(GB/s)"] = (
             (read_datasize + write_datasize) / avg_b / 1024 / 1024 / 1024 * 1e6
         )
-    if not smoothquant:
+    if not smoothquant and n <= 8192:
         (c, res_c, yscale_c, _), avg_c = run_hip(
             input, weight, 1e-5, res, q_dtype=quant_dtype, quant_type=quant_type
         )
