@@ -205,7 +205,7 @@ def reduce_scatter(
     # If ctx is accidentally a Tensor (e.g., due to misordered args in outplace_reduce_scatter), raise a more helpful error.
     if isinstance(ctx, torch.Tensor):
         raise TypeError(
-            f"reduce_scatter() expected ctx=IrisCommContext (got Tensor instead). "
+            "reduce_scatter() expected ctx=IrisCommContext (got Tensor instead). "
             "Did you accidentally pass input/output as ctx? Please check your argument order."
         )
     # Defensive: ctx should have is_initialized attribute, else error clearly.
