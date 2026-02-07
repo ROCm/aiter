@@ -20,6 +20,10 @@ Each guide covers available variants, backend support (ASM / CK / Triton), Pytho
 | [Fused MOE Variants](docs/moe_variants_guide.md) | Mixture of Experts — A8W8, A16W8, FP8 block-scale, MXFP4, 2-stage MOE, topK routing |
 | [GEMM Variants & Tuning](docs/gemm_variants_guide.md) | A8W8, A16W16, A4W4, batched GEMM, DeepGEMM, Triton FFN fusions, CSV-based tuning system |
 | [Quantization & Precision](docs/quantization_guide.md) | QuantType strategies (per-tensor/token/block), fused quant ops, FP8/MXFP4/INT4, SmoothQuant |
+| [Normalization](docs/normalization_guide.md) | RMSNorm, LayerNorm, GroupNorm — fused add/quant variants, SmoothQuant, distributed fusion |
+| [RoPE (Rotary Embedding)](docs/rope_guide.md) | SBHD/THD/2D/3D formats, NeoX & GPT-J styles, scaling methods, fused QK norm + RoPE |
+| [KV-Cache Management](docs/kv_cache_guide.md) | Paged/flash/MLA layouts, quantized cache (FP8/INT8), fused RoPE + cache write |
+| [Elementwise & Activations](docs/elementwise_activation_guide.md) | SiLU/GELU/sigmoid/tanh, SwiGLU gates, fused activation + quantize, binary arithmetic |
 
 Additional resources:
 - [Triton-based Communication (Iris)](docs/triton_comms.md) — GPU-initiated reduce-scatter and all-gather via [Iris](https://github.com/ROCm/iris)
@@ -56,10 +60,10 @@ Run any operator test with: `python3 op_tests/test_layernorm2d.py`
 | FusedMOE | Mixture of Experts | [MOE Guide](docs/moe_variants_guide.md) |
 | GEMM | Matrix multiply (A8W8, A16W16, A4W4, batched) | [GEMM Guide](docs/gemm_variants_guide.md) |
 | QUANT | BF16/FP16 to FP8/MXFP4/INT4 quantization | [Quantization Guide](docs/quantization_guide.md) |
-| RMSNORM | Root Mean Square Normalization | |
-| LAYERNORM | Layer Normalization | |
-| ROPE | Rotary Position Embedding | |
-| KVCACHE | KV-Cache management | |
+| RMSNORM | Root Mean Square Normalization | [Normalization Guide](docs/normalization_guide.md) |
+| LAYERNORM | Layer Normalization | [Normalization Guide](docs/normalization_guide.md) |
+| ROPE | Rotary Position Embedding | [RoPE Guide](docs/rope_guide.md) |
+| KVCACHE | KV-Cache management | [KV-Cache Guide](docs/kv_cache_guide.md) |
 | AllREDUCE | Reduce + Broadcast | [Triton Comms](docs/triton_comms.md) |
-| ELEMENT WISE | Element-wise ops: + - * / | |
-| SIGMOID | Sigmoid activation | |
+| ELEMENT WISE | Element-wise ops: + - * / | [Elementwise Guide](docs/elementwise_activation_guide.md) |
+| SIGMOID | Sigmoid activation | [Elementwise Guide](docs/elementwise_activation_guide.md) |
