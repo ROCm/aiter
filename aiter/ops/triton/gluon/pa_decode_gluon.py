@@ -1297,7 +1297,6 @@ def paged_attention_decode_sliding_window(
     query_shared = gl.allocate_shared_memory(
         query_tensor.dtype, query_tensor.shape, shared_query_layout, query_tensor
     )
-
     query_scale_mask = (mtp_query_len_offsets[:, None, None] < query_seq_len) & (
         mtp_query_group_size_offsets[None, :, None] < query_group_size
     )
@@ -1342,7 +1341,8 @@ def paged_attention_decode_sliding_window(
         # Per-tensor quantization
         key_scale_value = gl.load(key_scale)
         value_scale_value = gl.load(value_scale)
-    query_converted = gl.convert_layout(mtp_query_tensor, layout=qk_lhs_operand_layout)
+    
+    query_converted = query_shared.load(qk_lhs_operand_layout)
     if QUERY_QUANT_MODE < 0 and COMPUTE_TYPE.is_fp8():
         # Quantize bf16 query to fp8
         # Convert query to float32 for computation
@@ -1357,6 +1357,7 @@ def paged_attention_decode_sliding_window(
         query_converted = query_f32.to(COMPUTE_TYPE)
     else:
         query_converted = query_converted.to(COMPUTE_TYPE)
+
     block_indices = gl.arange(
         0, MAX_NUM_KV_BLOCKS_PER_COMPUTE, layout=block_id_layout
     )
@@ -1366,22 +1367,23 @@ def paged_attention_decode_sliding_window(
         offsets=block_indices,
     ).to(gl.int64)
 
-    # kv_block_numbers = sequence_partition_start_idx * MAX_NUM_KV_BLOCKS_PER_COMPUTE
+    kv_block_numbers2 = gl.zeros_like(block_indices).to(gl.int64)
     for sequence_partition_idx in range(
         sequence_partition_start_idx, sequence_partition_end_idx
     ):
+        
+        if sequence_partition_idx+1 < sequence_partition_end_idx:
+            kv_block_start_idx2 = (sequence_partition_idx+1) * MAX_NUM_KV_BLOCKS_PER_COMPUTE
+            kv_block_numbers2 = gl.amd.cdna3.buffer_load(
+                ptr=block_tables_ptr + sequence_idx * stride_block_table_seq
+                + kv_block_start_idx2 // CONTEXT_PARTITION_SIZE_PER_BLOCK,
+                offsets=block_indices,
+            ).to(gl.int64)
         kv_block_start_idx = sequence_partition_idx * MAX_NUM_KV_BLOCKS_PER_COMPUTE
-        kv_block_start_idx2 = (sequence_partition_idx+1) * MAX_NUM_KV_BLOCKS_PER_COMPUTE
         # Create mask for valid blocks
         num_kv_blocks = max_num_kv_blocks - kv_block_start_idx
         valid_block_mask = block_indices < num_kv_blocks
         kv_block_numbers = gl.where(valid_block_mask, kv_block_numbers, 0)
-    
-        kv_block_numbers2 = gl.amd.cdna3.buffer_load(
-            ptr=block_tables_ptr + sequence_idx * stride_block_table_seq
-            + kv_block_start_idx2 // CONTEXT_PARTITION_SIZE_PER_BLOCK,
-            offsets=block_indices,
-        ).to(gl.int64)
         
         # For KV_BLOCK_SIZE==1024 we process a CONTEXT_PARTITION_SIZE window inside a 1024-token page.
         # Map partition -> (page_id, page_offset) where page_offset in [0, 256, 512, 768].
@@ -1467,12 +1469,12 @@ def paged_attention_decode_sliding_window(
         # Reshape key tensor for matrix multiplication
         key_tensor = gl.permute(key_tensor, [1, 3, 0, 2])
         key_tensor = gl.reshape(key_tensor, [HEAD_SIZE_POW2, CONTEXT_PARTITION_SIZE])
-
+    
         # ==================== VALUE LOADING WITH QK MFMA OVERLAP ====================
         # Convert key layout for MFMA (query_converted and qk_accumulator already prepared above)
         key_converted = gl.convert_layout(key_tensor, layout=qk_rhs_operand_layout)
         key_converted = key_converted.to(COMPUTE_TYPE)
-
+        
         if VALUE_TRANSPOSED:
             # Load values from transposed cache layout
             kv_block_numbers_reshaped = gl.convert_layout(
@@ -1533,7 +1535,7 @@ def paged_attention_decode_sliding_window(
 
             # Permute and resape for matrix multiplication
             value_tensor = gl.permute(value_tensor, [0, 2, 1])
-
+        
         # Compute QK attention scores using MFMA (overlaps with value load)
         attention_scores = gl.amd.cdna3.mfma(
             query_converted, key_converted, qk_accumulator
@@ -1665,7 +1667,8 @@ def paged_attention_decode_sliding_window(
         else:
             attention_accumulator += attention_output
         max_logits = new_max_logits
-        kv_block_numbers = kv_block_numbers2
+        if sequence_partition_idx+1 < sequence_partition_end_idx:
+            kv_block_numbers = kv_block_numbers2
 
     # ==================== SINKS HANDLING ====================
     # Add sinks contribution to exp_sums (does not contribute to attention output)
