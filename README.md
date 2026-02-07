@@ -10,18 +10,39 @@ Some summary of the features:
 * Not just inference kernels, but also training kernels and GEMM+communication kernels—allowing for workarounds in any kernel-framework combination for any architecture limitation.
 
 ## Installation
-```
+
+```bash
 git clone --recursive https://github.com/ROCm/aiter.git
 cd aiter
-python3 setup.py develop
 ```
 
-If you happen to forget the `--recursive` during `clone`, you can use the following command after `cd aiter`
-```
+If you forgot `--recursive` during clone:
+```bash
 git submodule sync && git submodule update --init --recursive
 ```
 
-To install with Triton communication support:
+### Development Mode (JIT)
+
+Kernels are compiled on first use — fastest to get started:
+```bash
+python3 setup.py develop
+```
+
+### Install with Precompiled Kernels
+
+Precompile kernels at install time so there is no JIT overhead at runtime:
+```bash
+PREBUILD_KERNELS=2 GPU_ARCHS="gfx942" python3 setup.py install
+```
+
+| Variable | Description |
+|---|---|
+| `GPU_ARCHS` | Target GPU architecture(s), semicolon-separated. Use `"native"` to auto-detect. Common values: `gfx942` (MI300X), `gfx950` (MI350X), `gfx90a` (MI250X). Multi-target example: `"gfx942;gfx950"` |
+| `PREBUILD_KERNELS` | `0` — no precompilation (JIT only, default). `1` — precompile core kernels (excludes tuning and most MHA variants). `2` — precompile inference kernels (excludes backward and tuning). `3` — precompile MHA kernels only (minimal build). |
+| `MAX_JOBS` | Max parallel compilation threads (auto-calculated from CPU cores and memory if not set) |
+
+### Triton Communication Support
+
 ```bash
 pip install -e .
 pip install -r requirements-triton-comms.txt
