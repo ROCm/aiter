@@ -136,7 +136,7 @@ jobs:
           echo "Running Triton Tests..."
           docker exec -w /workspace triton_test mkdir -p test-reports
           docker exec -w /workspace triton_test bash op_tests/run_triton_tests_parallel.sh \
-            --ngpus 1 -v --junit-dir test-reports --test-dir ${TRITON_TEST}
+            --ngpus 1 -v --junit-dir test-reports --test-dir "${TRITON_TEST%/}"
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4

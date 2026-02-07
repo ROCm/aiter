@@ -41,6 +41,19 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Normalize TEST_DIR: strip trailing slash(es) so prefix stripping works
+TEST_DIR="${TEST_DIR%/}"
+
+# Validate numeric arguments
+if [[ -n "$NGPUS" ]] && ! [[ "$NGPUS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: --ngpus must be a positive integer, got '$NGPUS'" >&2
+    exit 1
+fi
+if ! [[ "$TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: --timeout must be a positive integer, got '$TIMEOUT'" >&2
+    exit 1
+fi
+
 # ────────────────────────────────────────────────────────────────────────────
 # Auto-detect GPUs
 # ────────────────────────────────────────────────────────────────────────────
@@ -212,6 +225,8 @@ fi
 # Run tests in parallel (one pytest per GPU)
 # ────────────────────────────────────────────────────────────────────────────
 TMPDIR_BASE=$(mktemp -d /tmp/triton_parallel.XXXXXX)
+cleanup() { rm -rf "$TMPDIR_BASE"; }
+trap cleanup EXIT INT TERM
 declare -a PIDS
 
 for ((g = 0; g < NGPUS; g++)); do
@@ -220,10 +235,15 @@ for ((g = 0; g < NGPUS; g++)); do
     fi
 
     LOGFILE="${TMPDIR_BASE}/gpu${g}.log"
-    JUNIT_ARGS=""
+
+    # Build pytest argv as a proper array to avoid word-splitting issues
+    declare -a PYTEST_ARGS=()
+    [[ -n "$VERBOSE" ]] && PYTEST_ARGS+=("$VERBOSE")
+    # shellcheck disable=SC2206  # GPU_FILES entries are find-produced paths (no spaces)
+    PYTEST_ARGS+=(${GPU_FILES[$g]})
     if [[ -n "$JUNIT_DIR" ]]; then
         mkdir -p "$JUNIT_DIR"
-        JUNIT_ARGS="--junitxml=${JUNIT_DIR}/triton_gpu${g}.xml"
+        PYTEST_ARGS+=("--junitxml=${JUNIT_DIR}/triton_gpu${g}.xml")
     fi
 
     (
@@ -232,7 +252,7 @@ for ((g = 0; g < NGPUS; g++)); do
         START_TS=$(date +%s)
 
         HIP_VISIBLE_DEVICES=$g timeout "$TIMEOUT" \
-            pytest $VERBOSE ${GPU_FILES[$g]} $JUNIT_ARGS 2>&1
+            pytest "${PYTEST_ARGS[@]}" 2>&1
 
         rc=$?
         END_TS=$(date +%s)
@@ -304,8 +324,5 @@ for ((g = 0; g < NGPUS; g++)); do
         echo "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^"
     fi
 done
-
-# Cleanup
-rm -rf "$TMPDIR_BASE"
 
 exit $OVERALL_RC
