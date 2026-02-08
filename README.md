@@ -63,12 +63,23 @@ See the [Triton Comms Guide](docs/triton_comms.md) for usage details.
 | RoPE | Rotary Position Embedding — SBHD/THD/2D/3D formats, NeoX & GPT-J styles, scaling methods | [RoPE Guide](docs/rope_guide.md) |
 | KV-Cache | Paged/flash/MLA cache layouts, quantized cache (FP8/INT8), fused RoPE + cache write | [KV-Cache Guide](docs/kv_cache_guide.md) |
 | Elementwise & Activations | SiLU/GELU/sigmoid/tanh, SwiGLU gates, fused activation + quantize, binary arithmetic (+−×÷) | [Elementwise Guide](docs/elementwise_activation_guide.md) |
-| Communication (AllReduce) | GPU-initiated reduce-scatter and all-gather via [Iris](https://github.com/ROCm/iris) | [Triton Comms](docs/triton_comms.md) |
+| Sampling | Greedy, random, mixed, top-k, top-p token sampling for LLM generation | [Sampling Guide](docs/sampling_guide.md) |
+| Top-K | Top-k selection — MOE routing (grouped, biased), radix/bitonic sort, fused softmax+topk | [Top-K Guide](docs/topk_guide.md) |
+| Communication (AllReduce) | Custom all-reduce, quick all-reduce, Iris reduce-scatter/all-gather | [Distributed Guide](docs/distributed_guide.md) |
 
 Each guide covers available variants, backend support (ASM / CK / Triton), Python API examples, and performance tuning advice.
 
 Run operator tests with: `python3 op_tests/<test_file>.py` (e.g. `python3 op_tests/test_pa.py`)
 
+## Infrastructure & Tuning
+
+| Guide | What's Inside |
+|-------|--------------|
+| [JIT Compilation System](docs/jit_system_guide.md) | `@compile_ops` decorator, module config, build flow, cache, GPU detection |
+| [GEMM Tuning & Gradlib](docs/gemm_tuning_guide.md) | CSV-based kernel dispatch, hipBLASLt/ASM tuning, gradlib framework |
+| [Distributed Infrastructure](docs/distributed_guide.md) | Tensor parallelism, custom/quick all-reduce, Iris comms, shared memory broadcast |
+
 ## Additional Resources
+- [Triton-based Communication (Iris)](docs/triton_comms.md) — GPU-initiated reduce-scatter and all-gather
 - [Autotuning Pipeline](docs/autotuning_pipeline.md) — CSV-based kernel selection and tuning workflow
 - [Container Setup (Non-root)](docs/aiter_container_nonroot_setup.md) — Running AITER in Docker without root
