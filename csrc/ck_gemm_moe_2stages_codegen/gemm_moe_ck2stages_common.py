@@ -397,6 +397,7 @@ def get_gemm1_kernels_list(
             tag = "a4w4"
         else:
             tag = "a4w4_bns"
+
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
     kernels_list = gemm1_kernels_dict[tag]
@@ -416,8 +417,10 @@ def get_gemm1_kernels_list(
                 kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscaleSplitk"
             else:
                 kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscale"
-        elif tag == "a8w8" or tag == "a4w4" or tag == "a4w4_bns":
+        elif tag == "a8w8" or tag == "a4w4_bns":
             kernel.CDEElementOp = "MulABScale"
+        elif tag == "a4w4":
+            kernel.CDEElementOp = "MulABScaleShuffled"
         elif tag == "a16w16":
             if MulRoutedWeight:
                 kernel.CDEElementOp = "TypeCastExpertWeight"
@@ -480,8 +483,10 @@ def get_gemm2_kernels_list(
             kernel.CDEElementOp = "MulABScaleExpertWeightWin4"
         elif tag == "a8w8blkscale":
             kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscale"
-        elif tag == "a8w8" or tag == "a4w4" or tag == "a4w4_bns":
+        elif tag == "a8w8" or tag == "a4w4_bns":
             kernel.CDEElementOp = "MulABScaleExpertWeight"
+        elif tag == "a4w4":
+            kernel.CDEElementOp = "MulABScaleExpertWeightShuffled"
         elif tag == "a16w16":
             if MulRoutedWeight:
                 kernel.CDEElementOp = "TypeCastExpertWeight"

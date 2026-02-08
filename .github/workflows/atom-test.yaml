@@ -73,7 +73,7 @@ jobs:
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
           RUN rm -rf /app/aiter-test
-          RUN git clone https://github.com/ROCm/aiter.git /app/aiter-test && \\
+          RUN git clone ${{ env.GITHUB_REPO_URL }} /app/aiter-test && \\
               cd /app/aiter-test && \\
               git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
               git submodule sync && git submodule update --init --recursive && \\
