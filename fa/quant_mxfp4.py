@@ -377,8 +377,31 @@ def _rot_q_kernel(
     )
     r_mat = tl.load(r_ptr)  # 32x32
 
+    # Calculate mean for the block (reduction over d within the BLOCK_M)
+    # q_mean shape: [B, H, Q_NUM_BLKS, D]
+    if q_smoothing:
+        m_row_mean = (
+            tl.sum(q_tile, axis=0) / BLOCK_M
+        )  # Sum over BLOCK_M -> shape [BLOCK_D]
+
+        q_tile -= m_row_mean[None, :]
+        # Store mean (Atomic add or structured store)
+        # For simplicity in this layout, we store the block-sum
+        # and divide by BLOCK_M in the host or final step
+        mean_ptr = (
+            Q_mean
+            + pid_b * stride_mb
+            + pid_h * stride_mh
+            + pid_m * stride_mm
+            + offs_d * stride_md
+        )
+        tl.store(mean_ptr, m_row_mean)
+    
+    
+    
+    
     # Rotate: Q_rot = Q @ R
-    q_rot_tile = tl.dot(q_tile, r_mat)
+    q_rot_tile = tl.dot(q_tile.to(r_mat.dtype), r_mat)
     if sm_scale is not None:
         q_rot_tile *= sm_scale
 
@@ -391,25 +414,7 @@ def _rot_q_kernel(
         + offs_d[None, :] * stride_qd
     )
 
-    # Calculate mean for the block (reduction over d within the BLOCK_M)
-    # q_mean shape: [B, H, Q_NUM_BLKS, D]
-    if q_smoothing:
-        m_row_mean = (
-            tl.sum(q_rot_tile, axis=0) / BLOCK_M
-        )  # Sum over BLOCK_M -> shape [BLOCK_D]
-
-        q_rot_tile -= m_row_mean[None, :]
-        # Store mean (Atomic add or structured store)
-        # For simplicity in this layout, we store the block-sum
-        # and divide by BLOCK_M in the host or final step
-        mean_ptr = (
-            Q_mean
-            + pid_b * stride_mb
-            + pid_h * stride_mh
-            + pid_m * stride_mm
-            + offs_d * stride_md
-        )
-        tl.store(mean_ptr, m_row_mean)
+    
 
     tl.store(
         rot_ptr,
@@ -481,10 +486,10 @@ def _rot_k_only_kernel(
 
 
 @triton.jit
-def _compute_delta_s_kernel(
+def _compute_bias_kernel(
     Q_mean,
     K_rot,
-    Delta_S,
+    bias,
     stride_mb,
     stride_mh,
     stride_mm,
@@ -541,9 +546,9 @@ def _compute_delta_s_kernel(
         # Compute dot product for this d-segment
         acc += tl.sum(qm_val[None, :] * kn_val, axis=1)
 
-    # Store to Delta_S [B, H, Q_BLKS, seq_k]
+    # Store to bias [B, H, Q_BLKS, seq_k]
     s_ptr = (
-        Delta_S
+        bias
         + pid_b * stride_sb
         + pid_h * stride_sh
         + pid_m_q * stride_sm
@@ -601,6 +606,8 @@ def create_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
 
 
 def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing=False, sm_scale=None, layout="bhsd"):
+    # Hadamard rotation idea: Q @ K = Q @ R @ R.T @ K and Q_rot = Q @ R and K_rot = R.T @ K contain less outliers.
+    
     # Generate Hadamard Matrix R (Rank 32)
     # TODO we might want to manually define this matrix
     R = create_hadamard_matrix(block_size, dtype=q.dtype) / (block_size**0.5)
@@ -616,21 +623,21 @@ def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing=False,
     Q_NUM_BLKS = (s_q + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
     K_NUM_BLKS = (s_k + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
 
-    # TODO check the dtypes for scales
     if q_smoothing:
         q_mean = torch.empty((b, h_q, Q_NUM_BLKS, d), dtype=torch.float32, device=q.device)
-        delta_s = torch.empty(
+        bias = torch.empty(
             (b, h_q, Q_NUM_BLKS, s_k), dtype=torch.float32, device=q.device
         )
     else:
         q_mean = None
-        delta_s = None
+        bias = None
 
     stride_qb, stride_qm, stride_qh, stride_qd = map_dims(q.stride(), bshd)
     stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k.stride(), bshd)
 
     # Launch Q Kernel
     grid_q = (b * h_q, Q_NUM_BLKS, d // block_size)
+    # smooth and rotate Q
     _rot_q_kernel[grid_q](
         q,
         Q_rot,
@@ -653,7 +660,9 @@ def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing=False,
         BLOCK_D=block_size,
     )
 
-    # 2. Rotate K (Only once!)
+    # smooth before rotate
+    k = k - k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
+    # rotate K
     grid_k = (b * h_k, K_NUM_BLKS, d // block_size)
     _rot_k_only_kernel[grid_k](
         k,
@@ -670,17 +679,15 @@ def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing=False,
         BLOCK_D=block_size,
     )
 
-    # smooth k after rotation
-    k = k - k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
-
     if q_smoothing:
-        # 3. Compute Smoothing Delta S
+        # Compute bias term that we need to add back due to smoothing
+        # softmax( (Q - qm + qm) @ R @ R.T @ (K - km + km) ) ~ softmax( Q_rot @ K_rot + qm @ K ) ~ softmax( Q @ K )
         # Grid: Each Q-block x Each K-block
         grid_delta = (b * h_k, Q_NUM_BLKS, K_NUM_BLKS)
-        _compute_delta_s_kernel[grid_delta](
+        _compute_bias_kernel[grid_delta](
             q_mean,
-            K_rot,
-            delta_s,
+            k,
+            bias,
             q_mean.stride(0),
             q_mean.stride(1),
             q_mean.stride(2),
@@ -689,14 +696,14 @@ def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing=False,
             stride_kh,
             stride_kn,
             stride_kd,
-            delta_s.stride(0),
-            delta_s.stride(1),
-            delta_s.stride(2),
-            delta_s.stride(3),
+            bias.stride(0),
+            bias.stride(1),
+            bias.stride(2),
+            bias.stride(3),
             h_k,
             s_k,
             d,
             BLOCK_N=BLOCK_SIZE_M,
         )
 
-    return Q_rot, K_rot, delta_s
+    return Q_rot, K_rot, bias

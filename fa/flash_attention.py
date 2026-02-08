@@ -2004,6 +2004,8 @@ def run_benchmark(custom, args):
         assert not (int8_kv and quantize_p)
         warmup = 25
         rep = 100
+
+        
         # TODO: Enable bias after testing.
         # if use_bias:
         #     bias = torch.randn((1, H, N_CTX, N_CTX), dtype=torch.float32, device="cuda")
@@ -2059,6 +2061,10 @@ def run_benchmark(custom, args):
             if int8:
                 q, k, v = quantize_input(q, k, v, input_metadata, quantize_p=quantize_p, int8_kv=int8_kv)
             input_metadata.set_persistent(args.persistent)
+            
+            # bias = torch.randn((1, HQ, N_CTX_Q, N_CTX_K), dtype=torch.float32, device="cuda")
+            # input_metadata.need_bias(bias, BATCH, HQ, N_CTX_Q, N_CTX_K)
+            
             fn = lambda: attention(q, k, v, o, input_metadata)
             if mode == 'bwd':
                 o, _, _ = fn()

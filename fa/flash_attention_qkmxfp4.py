@@ -91,6 +91,7 @@ class MetaData():
     dropout_p, return_encoded_softmax = 0.0, False
 
     def __init__(self, sm_scale=1.0):
+        self.config = get_fwd_configs()
         self.sm_scale = sm_scale
 
     def set_varlen_params(self, cu_seqlens_q, cu_seqlens_k):
@@ -120,11 +121,12 @@ class MetaData():
         self.int8_kv = (q_descale is None) and (k_descale is not None) and (v_descale is not None)
 
     
-    def set_mxfp4_params(self, q_descale, k_descale, v_descale):
+    def set_mxfp4_params(self, q_descale, k_descale, v_descale, bias):
         self.mxfp4 = True
         self.q_descale = q_descale
         self.k_descale = k_descale
         self.v_descale = v_descale
+        self.bias = bias
     
     def need_bias(self, bias, batch, nheads, seqlen_q, seqlen_k):
         assert bias.is_cuda
@@ -339,11 +341,11 @@ def _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stri
 
         if bias_ptrs is not None:
             bias_offs_n = start_n + tl.arange(0, BLOCK_N) if MASK_STEPS else None
-            bias = load_fn(bias_ptrs, OFFS_M, bias_offs_n, actual_seqlen_q, actual_seqlen_k)
-            # While bias is added after multiplying qk with sm_scale,
+            bias = load_fn(bias_ptrs, start_m * BLOCK_M, bias_offs_n, actual_seqlen_q, actual_seqlen_k)
+            # If bias is added after multiplying qk with sm_scale,
             # our optimization to use 2^x instead of e^x results in an additional
             # scale factor of log2(e) which we must also multiply the bias with.
-            qk += (bias * 1.44269504089 / QK_SCALE)
+            qk += bias # (bias * 1.44269504089 / QK_SCALE)
 
         if alibi_slope is not None:
             # Compute the global position of each token within the sequence
@@ -422,50 +424,12 @@ def is_rdna():
                                                                                    "gfx1102", "gfx1200", "gfx1201")
 
 
-def get_cdna_autotune_configs():
-    return [
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'waves_per_eu': 2, 'PRE_LOAD_V': False, 'GRID_CU_MULTIP': 2},
-                      num_stages=4, num_warps=8),
-    ], ['IS_CAUSAL', 'dropout_p', 'MAX_SEQLENS_Q', 'MAX_SEQLENS_K', 'ACTUAL_BLOCK_DMODEL', 'VARLEN', 'HQ', 'HK']
+def get_fwd_configs():
+    return {
+        'BLOCK_M': 256, 'BLOCK_N': 128, 'waves_per_eu': 2, 'PRE_LOAD_V': False, 'GRID_CU_MULTIP': 2, 'num_stages': 2, 'num_warps': 8
+    }
 
 
-def get_rdna_autotune_configs():
-    return [
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'waves_per_eu': 4, 'PRE_LOAD_V': False, 'GRID_CU_MULTIP': 2},
-                      num_stages=1, num_warps=2),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'waves_per_eu': 2, 'PRE_LOAD_V': False, 'GRID_CU_MULTIP': 2},
-                      num_stages=1, num_warps=2),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 16, 'waves_per_eu': 4, 'PRE_LOAD_V': False, 'GRID_CU_MULTIP': 2},
-                      num_stages=1, num_warps=2),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 16, 'waves_per_eu': 2, 'PRE_LOAD_V': False, 'GRID_CU_MULTIP': 2},
-                      num_stages=1, num_warps=2),
-        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16, 'waves_per_eu': 4, 'PRE_LOAD_V': False, 'GRID_CU_MULTIP': 2},
-                      num_stages=1, num_warps=2),
-        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16, 'waves_per_eu': 2, 'PRE_LOAD_V': False, 'GRID_CU_MULTIP': 2},
-                      num_stages=1, num_warps=2),
-        # Fall-back config.
-        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16, 'waves_per_eu': 1, 'PRE_LOAD_V': False, 'GRID_CU_MULTIP': 2},
-                      num_stages=1, num_warps=2),
-    ], ['IS_CAUSAL', 'dropout_p', 'MAX_SEQLENS_Q', 'MAX_SEQLENS_K', 'ACTUAL_BLOCK_DMODEL', 'VARLEN', 'HQ', 'HK']
-
-
-def get_autotune_configs():
-    if is_rdna():
-        return get_rdna_autotune_configs()
-    elif is_cdna():
-        return get_cdna_autotune_configs()
-    else:
-        raise ValueError("Unknown Device Type")
-
-
-autotune_configs, autotune_keys = get_autotune_configs()
-
-
-@triton.autotune(
-    configs=autotune_configs,
-    key=autotune_keys,
-    use_cuda_graph=True,
-)
 @triton.jit
 def attn_fwd(Q, K, V, bias, SM_SCALE: tl.constexpr, L, Out, stride_qz, stride_qh, stride_qm, stride_qk, stride_kz,
              stride_kh, stride_kn, stride_kk, stride_vz, stride_vh, stride_vk, stride_vn, stride_oz, stride_oh,
@@ -639,8 +603,8 @@ def attn_fwd(Q, K, V, bias, SM_SCALE: tl.constexpr, L, Out, stride_qz, stride_qh
 
                 if USE_BIAS:
                     # Note: this might get large enough to overflow on some configs
-                    bias_offset = off_h_q * stride_bh
-                    bias_ptrs = bias + bias_offset + offs_m[:, None] * stride_bm + offs_n[None, :] * stride_bn
+                    bias_offset = off_z * stride_bz + off_h_q * stride_bh
+                    bias_ptrs = bias + bias_offset + start_m * stride_bm + offs_n[None, :] * stride_bn
                 else:
                     bias_ptrs = None
 
@@ -1171,6 +1135,8 @@ class _attention(torch.autograd.Function):
         philox_offset = 0x1D4B42
 
         if metadata.bias is not None:
+            # print(metadata.bias.shape)
+            
             bias_strides = (metadata.bias.stride(0), metadata.bias.stride(1), metadata.bias.stride(2),
                             metadata.bias.stride(3))
         else:
@@ -1209,7 +1175,8 @@ class _attention(torch.autograd.Function):
                        USE_ALIBI=False if metadata.alibi_slopes is None else True, ENABLE_DROPOUT=metadata.dropout_p
                        > 0.0, RETURN_ENCODED_SOFTMAX=metadata.return_encoded_softmax,
                        PERSISTENT=metadata.persistent is not None, PERSISTENT_DYNAMIC=metadata.persistent == "dynamic",
-                       NUM_CU=NUM_CU, atomic_counter=atomic_counter, B=batch)
+                       NUM_CU=NUM_CU, atomic_counter=atomic_counter, B=batch,
+                       **metadata.config)
 
         ctx.save_for_backward(q, k, v, o, M)
         ctx.grid = grid
@@ -1222,7 +1189,7 @@ class _attention(torch.autograd.Function):
         ctx.philox_offset = philox_offset
         ctx.encoded_softmax = encoded_softmax
         ctx.return_encoded_softmax = metadata.return_encoded_softmax
-        return o, encoded_softmax, attn_fwd.best_config
+        return o, encoded_softmax
 
     @staticmethod
     def backward(ctx, *gradients):
@@ -1306,15 +1273,14 @@ def quantize_input(
     k,
     v,
     input_metadata: MetaData,
-    BLKQ=128,
-    BLKK=64,
-    sm_scale=None,
     q_smoothing=False,
 ):
     FP8_TYPE = aiter.dtypes.fp8
     FP8_MAX = torch.finfo(FP8_TYPE).max
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
     layout = input_metadata.layout
+
+    BLKK, BLKQ = input_metadata.config["BLOCK_N"], input_metadata.config["BLOCK_M"]
 
     if layout == "bhsd":
         b, h_qo, qo_len, head_dim = q.shape
@@ -1337,10 +1303,8 @@ def quantize_input(
 
     padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
 
-    if sm_scale is None:
-        sm_scale = head_dim**-0.5
 
-    q, k, _ = rotation_smooth_qk(q, k, BLKQ, block_size=padded_head_dim, q_smoothing=False, layout=layout, sm_scale=None)
+    q, k, bias = rotation_smooth_qk(q, k, BLKQ, block_size=padded_head_dim, q_smoothing=q_smoothing, layout=layout, sm_scale=None)
 
     sage_quant_v_kernel[grid](
         v,
@@ -1364,7 +1328,7 @@ def quantize_input(
     q_fp4, q_scale = downcast_to_mxfp(q, torch.uint8, axis=-1)
     k_fp4, k_scale = downcast_to_mxfp(k, torch.uint8, axis=-1)
 
-    input_metadata.set_mxfp4_params(q_descale=q_scale, k_descale=k_scale, v_descale=v_descale)
+    input_metadata.set_mxfp4_params(q_descale=q_scale, k_descale=k_scale, v_descale=v_descale, bias=bias)
     
     return q_fp4, k_fp4, v_fp8
 
@@ -1489,8 +1453,9 @@ def check_accuracy_with_captured_inputs(input_dir, layout, causal):
 
         o = torch.empty_like(q)
 
+
         q_quantized, k_quantized, v_quantized = quantize_input(q, k, v, input_metadata)
-        triton_out, _, best_configs = attention(q_quantized, k_quantized, v_quantized, o, input_metadata)
+        triton_out, _ = attention(q_quantized, k_quantized, v_quantized, o, input_metadata)
 
         from op_tests.op_benchmarks.triton.bench_fav3_sage import fav2_forward_func
         
@@ -1535,10 +1500,10 @@ def test_op_fwd_mxfp4(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, layout, dtype=torc
         input_metadata.need_causal()
 
     o = torch.empty_like(q)
+    print("config", input_metadata.config)
 
     q_quantized, k_quantized, v_quantized = quantize_input(q, k, v, input_metadata)
-
-    triton_out, _, best_configs = attention(q_quantized, k_quantized, v_quantized, o, input_metadata)
+    triton_out, _ = attention(q_quantized, k_quantized, v_quantized, o, input_metadata)
 
     if layout == "bhsd":
         q = q.permute(0, 2, 1, 3).contiguous()
@@ -1550,7 +1515,7 @@ def test_op_fwd_mxfp4(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, layout, dtype=torc
     )
     
     torch_out = attention_ref(q, k, v, dropout_p=0.0, dropout_mask=None, causal=False)
-    torch_out, attention_scores, _ = torch_out
+    torch_out, _, _ = torch_out
 
     if layout == "bhsd":
         torch_out = torch_out.permute(0, 2, 1, 3).contiguous()
@@ -1825,7 +1790,7 @@ def parse_args():
     parser.add_argument(
         "-captured_dir",
         type=str,
-        default="./captured_inputs",
+        default=None,
         help="Directory containing captured input .pt files",
     )
 
@@ -1857,8 +1822,9 @@ def main():
     if args.model:
         print("Note: Model config sets causal masking and THD layout (varlen) by default.")
 
-    check_accuracy_with_captured_inputs(args.captured_dir, args.layout, args.causal)
-    
+    if args.captured_dir is not None:
+        check_accuracy_with_captured_inputs(args.captured_dir, args.layout, args.causal)
+    # test_op_fwd_mxfp4(1, 5, 1024, 1024, 128, False, "bhsd")
     run_benchmark(custom_config, args)
 
 
