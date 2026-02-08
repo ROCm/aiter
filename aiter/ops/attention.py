@@ -752,7 +752,6 @@ def get_ps_metadata_v1(
     context_lens: torch.Tensor,
     gqa_ratio: int,
     num_heads_k: int,
-    work_metadata_ptrs: torch.Tensor,
     work_indptr: torch.Tensor,
     work_info: torch.Tensor,
     reduce_indptr: torch.Tensor,

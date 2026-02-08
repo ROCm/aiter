@@ -297,9 +297,6 @@ def test_mla_prefill(
         max_qlen=max_qlen,
         qlen_granularity=qlen_granularity,
     )
-    work_metadata_ptrs = torch.empty(
-        work_meta_data_size, dtype=work_meta_data_type, device=device
-    )
     work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type, device=device)
     work_info = torch.empty(work_info_size, dtype=work_info_type, device=device)
     reduce_indptr = torch.empty(
@@ -330,7 +327,10 @@ def test_mla_prefill(
             array = np.fromfile(file_name, dtype=np.uint32)
             meta = torch.from_numpy(array).reshape(shape)
             torch.set_printoptions(threshold=999999, linewidth=120)
-            print(f"==>load {name} from {file_name}:\n{meta}")
+            print(
+                f"==>load {name} shape {meta.shape} from {file_name}:\n{meta}",
+                flush=True,
+            )
     else:
         qo_indptr_cpu = qo_indptr.to("cpu")
         kv_indptr_cpu = kv_indptr.to("cpu")
@@ -342,7 +342,6 @@ def test_mla_prefill(
             seq_lens_kv_cpu,
             gqa_ratio,
             num_head_kv,
-            work_metadata_ptrs,
             work_indptr,
             work_info,
             reduce_indptr,
@@ -364,7 +363,6 @@ def test_mla_prefill(
             seq_lens_kv_cpu,
             gqa_ratio,
             num_head_kv,
-            work_metadata_ptrs,
             work_indptr,
             work_info,
             reduce_indptr,
@@ -384,7 +382,9 @@ def test_mla_prefill(
         for name, meta in metadata_map.items():
             file_name = f"{name}.bin"
             torch.set_printoptions(threshold=99999999, linewidth=120)
-            print(f"==>dump {name} shape {meta.shape} to {file_name}:\n{meta}")
+            print(
+                f"==>dump {name} shape {meta.shape} to {file_name}:\n{meta}", flush=True
+            )
             meta.cpu().numpy().astype(np.uint32).tofile(file_name)
 
     output = torch.empty((num_tokens, num_head_q, v_head_dim), dtype=torch.bfloat16)
