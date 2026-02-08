@@ -234,7 +234,6 @@ void get_ps_metadata_v1_2_host(const torch::Tensor& seqlens_qo_indptr, // [batch
                                const torch::Tensor& context_lens,      // [batch size]
                                const int32_t gqa_ratio,
                                const int32_t num_heads_k,
-                               torch::Tensor& work_metadata_ptrs,
                                torch::Tensor& work_indptr,
                                torch::Tensor& work_info,
                                torch::Tensor& reduce_indptr,

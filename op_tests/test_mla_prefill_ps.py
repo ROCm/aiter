@@ -299,22 +299,22 @@ def test_mla_prefill(
     )
     # Pinned CPU buffers(used for stage0: get_ps_metadata_info_v1)
     work_indptr_cpu = torch.empty(
-        work_indptr_size, dtype=work_indptr_type, device="cpu", pinned=True
+        work_indptr_size, dtype=work_indptr_type, device="cpu", pin_memory=True
     )
     work_info_cpu = torch.empty(
-        work_info_size, dtype=work_info_type, device="cpu", pinned=True
+        work_info_size, dtype=work_info_type, device="cpu", pin_memory=True
     )
     reduce_indptr_cpu = torch.empty(
-        reduce_indptr_size, dtype=reduce_indptr_type, device="cpu", pinned=True
+        reduce_indptr_size, dtype=reduce_indptr_type, device="cpu", pin_memory=True
     )
     reduce_final_map_cpu = torch.empty(
-        reduce_final_map_size, dtype=reduce_final_map_type, device="cpu", pinned=True
+        reduce_final_map_size, dtype=reduce_final_map_type, device="cpu", pin_memory=True
     )
     reduce_partial_map_cpu = torch.empty(
         reduce_partial_map_size,
         dtype=reduce_partial_map_type,
         device="cpu",
-        pinned=True,
+        pin_memory=True,
     )
     # Device buffers(used by stage1: mla_prefill_ps_asm_fwd & stage2: mla_reduce_v1)
     work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type, device=device)
@@ -352,13 +352,13 @@ def test_mla_prefill(
                 flush=True,
             )
     else:
-        # Inputs: pinned CPU (caller-allocated)
+        # Inputs: pin_memory CPU (caller-allocated)
         qo_indptr_cpu = qo_indptr.to("cpu", non_blocking=True).pin_memory()
         kv_indptr_cpu = kv_indptr.to("cpu", non_blocking=True).pin_memory()
         seq_lens_kv_cpu = seq_lens_kv.to("cpu", non_blocking=True).pin_memory()
 
         def run_get_ps_metadata_and_h2d():
-            # Kernel only generates into pinned CPU outputs; no H2D inside
+            # Kernel only generates into pin_memory CPU outputs; no H2D inside
             aiter.get_ps_metadata_v1(
                 qo_indptr_cpu,
                 kv_indptr_cpu,
@@ -383,12 +383,16 @@ def test_mla_prefill(
             reduce_final_map.copy_(reduce_final_map_cpu, non_blocking=True)
             reduce_partial_map.copy_(reduce_partial_map_cpu, non_blocking=True)
 
-        # TODO: check torch.benmark.time
-        us_metadata = torch.benchmark.timeit(
-            num_iters=10,
-            memory_format=torch.memory_format.contiguous,
-            device=device,
-        )(run_get_ps_metadata_and_h2d)
+        # Warmup: first run can be slow (allocate, build, etc.)
+        run_get_ps_metadata_and_h2d()
+        torch.cuda.synchronize()
+
+        # Benchmark metadata + H2D with torch.utils.benchmark (CUDA-synced)
+        t = torch.utils.benchmark.Timer(
+            stmt="run_get_ps_metadata_and_h2d()",
+            globals={"run_get_ps_metadata_and_h2d": run_get_ps_metadata_and_h2d},
+        )
+        us_metadata = t.timeit(10).mean * 1e6
 
     if dump_metadata:
         for name, meta in metadata_map.items():

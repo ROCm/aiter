@@ -33,23 +33,22 @@ union WorkInfo
         int32_t kv_end;
         int32_t kv_offset;
         int32_t q_head_range;
-
-#if PRINT_DBG
-        friend std::ostream& operator<<(std::ostream& os, const WorkInfo& work)
-        {
-            auto q_heads = unpack_dword(work.q_head_range);
-            os << std::setw(10) << work.batch_idx << "," << std::setw(10) << work.partial_o_loc
-               << "," << std::setw(10) << work.qo_start << "," << std::setw(10) << work.qo_end
-               << "," << std::setw(10) << work.kv_start << "," << std::setw(10) << work.kv_end
-               << "," << std::setw(10) << work.kv_offset << "," << std::setw(10)
-               << work.q_head_range << "[" << std::get<0>(q_heads) << "," << std::get<1>(q_heads)
-               << ")";
-            return os;
-        }
-#endif
     };
     uint32_t u32All[8];
 };
+
+inline std::ostream& operator<<(std::ostream& os, const WorkInfo& work)
+{
+    auto q_heads = unpack_dword(work.q_head_range);
+    os << std::setw(10) << work.batch_idx << "," << std::setw(10) << work.partial_o_loc
+       << "," << std::setw(10) << work.qo_start << "," << std::setw(10) << work.qo_end
+       << "," << std::setw(10) << work.kv_start << "," << std::setw(10) << work.kv_end
+       << "," << std::setw(10) << work.kv_offset << "," << std::setw(10)
+       << work.q_head_range << "[" << std::get<0>(q_heads) << "," << std::get<1>(q_heads)
+       << ")";
+    return os;
+}
+
 constexpr size_t kSizeWorkInfoInDw = sizeof(WorkInfo) / sizeof(uint32_t);
 static_assert(kSizeWorkInfoInDw == 8);
 
