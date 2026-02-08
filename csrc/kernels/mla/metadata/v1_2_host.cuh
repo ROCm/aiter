@@ -18,10 +18,11 @@ inline int gcd(int a, int b)
 }
 
 void generate_reduce_info(int32_t num_work,
-                          std::vector<WorkInfo>& work_info,
-                          std::vector<int32_t>& reduce_indptr,
-                          std::vector<FinalLoc>& reduce_final_map,
-                          std::vector<int32_t>& reduce_partial_map)
+                          WorkInfo* work_info,
+                          int32_t* reduce_indptr,
+                          int64_t reduce_indptr_len,
+                          FinalLoc* reduce_final_map,
+                          int32_t* reduce_partial_map)
 {
     std::map<std::vector<int32_t>, std::set<int32_t>> reduce_map; // 2d
     int32_t q_head_start, q_head_end;
@@ -46,53 +47,41 @@ void generate_reduce_info(int32_t num_work,
         const int32_t num_partials   = partial_loc_vec.size();
         reduce_indptr[final_idx + 1] = reduce_indptr[final_idx] + num_partials;
         reduce_final_map[final_idx]  = FinalLoc{final_loc[0], final_loc[1]};
-        std::copy(partial_loc_vec.begin(),
-                  partial_loc_vec.end(),
-                  reduce_partial_map.begin() + partial_idx);
+        std::copy(partial_loc_vec.begin(), partial_loc_vec.end(), reduce_partial_map + partial_idx);
         final_idx++;
         partial_idx += partial_loc_vec.size();
     }
-    for(int i = final_idx; i < reduce_indptr.size(); i++)
+    for(int64_t i = final_idx; i < reduce_indptr_len; i++)
     {
         reduce_indptr[i] = partial_idx;
     }
 }
 
-void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
-                             std::vector<int32_t>& pages_kv_indptr,
-                             std::vector<int32_t>& context_lens,
-                             const int32_t gqa_ratio,
-                             const int32_t num_heads_k,
-                             const int32_t qhead_granularity,
-                             const int32_t qlen_granularity,
-                             const int32_t kvlen_granularity,
-                             const int32_t block_size,
-                             const bool is_causal,
-                             std::vector<int32_t>& work_indptr,
-                             std::vector<WorkInfo>& work_info,
-                             const int32_t available_tgs = 256,
-                             const int32_t cluster_id    = 0,
-                             int32_t current_work_idx    = 0)
+void kn_generate_ps_metadata(const AttentionPsMetadataV1_2& params,
+                             const int32_t cluster_id,
+                             int32_t current_work_idx)
 {
-    const int32_t batch_size = seqlens_qo_indptr.size() - 1;
+    const int32_t batch_size = params.batch_size;
 
-    assert(kvlen_granularity % block_size == 0);
-    const int32_t blocks_per_unit = kvlen_granularity / block_size;
+    assert(params.kvlen_granularity % params.block_size == 0);
+    const int32_t blocks_per_unit = params.kvlen_granularity / params.block_size;
 
+    // TODO: optimize ping-pong allocate
     // Step 1: count split units
     std::vector<QTile> query_tiles;
     int32_t total_units = 0; // split units
 
     for(int32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) // parallel
     {
-        const int32_t qo_length = seqlens_qo_indptr[batch_idx + 1] - seqlens_qo_indptr[batch_idx];
-        const int32_t kv_length = context_lens[batch_idx];
+        const int32_t qo_length =
+            params.p_seqlens_qo_indptr[batch_idx + 1] - params.p_seqlens_qo_indptr[batch_idx];
+        const int32_t kv_length = params.p_context_lens[batch_idx];
         // Split query sequence into tiles
         std::vector<std::pair<int32_t, int32_t>> query_tile_ranges;
-        for(int32_t q_offset = 0; q_offset < qo_length; q_offset += qlen_granularity)
+        for(int32_t q_offset = 0; q_offset < qo_length; q_offset += params.qlen_granularity)
         {
             const int32_t local_qo_start = q_offset;
-            const int32_t local_qo_end   = std::min(q_offset + qlen_granularity, qo_length);
+            const int32_t local_qo_end   = std::min(q_offset + params.qlen_granularity, qo_length);
             query_tile_ranges.push_back({local_qo_start, local_qo_end});
         }
 
@@ -109,25 +98,24 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
             // For causal attention, each query position can only attend to
             // earlier positions, limiting the KV range
             const int32_t effective_kv_length =
-                is_causal ? std::min(kv_length - qo_length + local_qo_end, kv_length) : kv_length;
+                params.is_causal ? std::min(kv_length - qo_length + local_qo_end, kv_length)
+                                 : kv_length;
             const int32_t num_units =
-                ck_tile::integer_divide_ceil(effective_kv_length, kvlen_granularity);
-            // const int32_t num_units =
-            //     offset_div(effective_kv_length, kvlen_granularity, SPLIT_KV_OVERHEAD);
+                ck_tile::integer_divide_ceil(effective_kv_length, params.kvlen_granularity);
             query_tiles.push_back({batch_idx,
-                                   local_qo_start + seqlens_qo_indptr[batch_idx],
-                                   local_qo_end + seqlens_qo_indptr[batch_idx],
+                                   local_qo_start + params.p_seqlens_qo_indptr[batch_idx],
+                                   local_qo_end + params.p_seqlens_qo_indptr[batch_idx],
                                    num_units * blocks_per_unit,
                                    effective_kv_length});
             total_units += num_units;
         }
     }
-    const int32_t average  = total_units / available_tgs;
-    const int32_t reminder = total_units % available_tgs;
+    const int32_t average  = total_units / params.available_tgs;
+    const int32_t reminder = total_units % params.available_tgs;
 
 #if PRINT_DBG
-    std::cout << "++++num_heads_k: " << num_heads_k << std::endl
-              << "++++available_tgs: " << available_tgs << std::endl
+    std::cout << "++++num_heads_k: " << params.num_heads_k << std::endl
+              << "++++available_tgs: " << params.available_tgs << std::endl
               << "++++blocks per split unit: " << blocks_per_unit << std::endl
               << "++++total split units: " << total_units << std::endl
               << "++++average split units: " << average << std::endl
@@ -146,14 +134,14 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
     int32_t current_tile_idx  = 0; // index of query_tile
     int32_t current_block_idx = 0; // index of split blocks within a query_tile
     int32_t partial_tile_idx  = 0; // index of partial_tile for reduce
-    for(int32_t tg_idx = 0; tg_idx < available_tgs; ++tg_idx)
+    for(int32_t tg_idx = 0; tg_idx < params.available_tgs; ++tg_idx)
     {
         // dupclicate (parallal)
-        for(int32_t k_head_offset = 0; k_head_offset < num_heads_k; k_head_offset++)
+        for(int32_t k_head_offset = 0; k_head_offset < params.kheads_per_cluster; k_head_offset++)
         {
-            const int32_t k_head_idx = cluster_id * num_heads_k + k_head_offset;
-            const int32_t qhead_range =
-                pack_dword(k_head_idx * qhead_granularity, (k_head_idx + 1) * qhead_granularity);
+            const int32_t k_head_idx       = cluster_id * params.kheads_per_cluster + k_head_offset;
+            const int32_t qhead_range      = pack_dword(k_head_idx * params.qhead_granularity,
+                                                   (k_head_idx + 1) * params.qhead_granularity);
             int32_t saved_tile_idx         = current_tile_idx;
             int32_t saved_block_idx        = current_block_idx;
             int32_t saved_partial_tile_idx = partial_tile_idx;
@@ -169,12 +157,12 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
                     // OPT: add split_kvlen_overhead
                     const int32_t remaining_blocks = current_tile.num_blocks - current_block_idx;
                     const int32_t remaining_kv_len =
-                        current_tile.effective_kv_length - current_block_idx * block_size;
+                        current_tile.effective_kv_length - current_block_idx * params.block_size;
 
                     int32_t consuming_blocks = 0;
                     const int32_t kv_start =
-                        current_block_idx + pages_kv_indptr[current_tile.batch_idx];
-                    if(remaining_kv_len <= blocks_capacity * block_size + SPLIT_KV_OVERHEAD)
+                        current_block_idx + params.p_pages_kv_indptr[current_tile.batch_idx];
+                    if(remaining_kv_len <= blocks_capacity * params.block_size + SPLIT_KV_OVERHEAD)
                     {
                         consuming_blocks = remaining_blocks;
                         // This TG can process all of this qo_tile's remaining_blocks to the causal
@@ -182,19 +170,19 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
                         const int32_t partial_o_loc =
                             (current_block_idx == 0)
                                 ? -1
-                                : (qlen_granularity * partial_tile_idx++); // -1 - no split
+                                : (params.qlen_granularity * partial_tile_idx++); // -1 - no split
                         const int32_t kv_end =
                             std::min(kv_start + consuming_blocks,
-                                     pages_kv_indptr[current_tile.batch_idx + 1]);
+                                     params.p_pages_kv_indptr[current_tile.batch_idx + 1]);
 
-                        work_info[current_work_idx++] = {current_tile.batch_idx,
-                                                         partial_o_loc,
-                                                         current_tile.qo_start,
-                                                         current_tile.qo_end,
-                                                         kv_start,
-                                                         kv_end,
-                                                         0,
-                                                         qhead_range};
+                        params.p_work_info[current_work_idx++] = {current_tile.batch_idx,
+                                                                  partial_o_loc,
+                                                                  current_tile.qo_start,
+                                                                  current_tile.qo_end,
+                                                                  kv_start,
+                                                                  kv_end,
+                                                                  0,
+                                                                  qhead_range};
                         current_tile_idx++;
                         current_block_idx = 0;
                     }
@@ -203,24 +191,25 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
                         // This TG can only process part of this qotile's KV units under
                         // blocks_capacity
                         consuming_blocks            = blocks_capacity;
-                        const int32_t partial_o_loc = qlen_granularity * partial_tile_idx++;
+                        const int32_t partial_o_loc = params.qlen_granularity * partial_tile_idx++;
 
                         const int32_t kv_end =
                             std::min(kv_start + consuming_blocks,
-                                     pages_kv_indptr[current_tile.batch_idx + 1]);
-                        const int32_t kv_length = context_lens[current_tile.batch_idx];
+                                     params.p_pages_kv_indptr[current_tile.batch_idx + 1]);
+                        const int32_t kv_length = params.p_context_lens[current_tile.batch_idx];
                         const int32_t kv_offset =
                             kv_length -
-                            (kv_end - pages_kv_indptr[current_tile.batch_idx]) * block_size;
+                            (kv_end - params.p_pages_kv_indptr[current_tile.batch_idx]) *
+                                params.block_size;
 
-                        work_info[current_work_idx++] = {current_tile.batch_idx,
-                                                         partial_o_loc,
-                                                         current_tile.qo_start,
-                                                         current_tile.qo_end,
-                                                         kv_start,
-                                                         kv_end,
-                                                         kv_offset,
-                                                         qhead_range};
+                        params.p_work_info[current_work_idx++] = {current_tile.batch_idx,
+                                                                  partial_o_loc,
+                                                                  current_tile.qo_start,
+                                                                  current_tile.qo_end,
+                                                                  kv_start,
+                                                                  kv_end,
+                                                                  kv_offset,
+                                                                  qhead_range};
                         current_block_idx += consuming_blocks;
                     }
                     blocks_capacity -= consuming_blocks;
@@ -229,14 +218,14 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
 
             allocate_work();
 
-            if(k_head_offset != num_heads_k - 1)
+            if(k_head_offset != params.kheads_per_cluster - 1)
             {
                 current_tile_idx  = saved_tile_idx;
                 current_block_idx = saved_block_idx;
                 partial_tile_idx  = saved_partial_tile_idx;
             }
         }
-        work_indptr[cluster_id * available_tgs + tg_idx + 1] = current_work_idx;
+        params.p_work_indptr[cluster_id * params.available_tgs + tg_idx + 1] = current_work_idx;
     }
 }
 
@@ -257,7 +246,6 @@ void get_ps_metadata_v1_2_host(const torch::Tensor& seqlens_qo_indptr, // [batch
                                const int32_t block_size,
                                const bool is_causal)
 {
-
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
     HIP_CALL(hipGetDevice(&dev));
@@ -272,87 +260,66 @@ void get_ps_metadata_v1_2_host(const torch::Tensor& seqlens_qo_indptr, // [batch
     const int32_t tgs_per_cluster    = available_tgs / num_clusters;
     const int32_t kheads_per_cluster = num_heads_k / num_clusters;
 
-    // prepare host buffer
-    auto seqlens_qo_indptr_vec = seqlens_qo_indptr.to(at::DeviceType::CPU);
-    auto pages_kv_indptr_vec   = pages_kv_indptr.to(at::DeviceType::CPU);
-    auto context_lens_vec      = context_lens.to(at::DeviceType::CPU);
+    // prepare pointers
+    int32_t* p_seqlens_qo_indptr = seqlens_qo_indptr.data_ptr<int32_t>();
+    int32_t* p_pages_kv_indptr   = pages_kv_indptr.data_ptr<int32_t>();
+    int32_t* p_context_lens      = context_lens.data_ptr<int32_t>();
 
-    std::vector<int32_t> p_seqlens_qo_indptr = {seqlens_qo_indptr_vec.data_ptr<int32_t>(),
-                                                seqlens_qo_indptr_vec.data_ptr<int32_t>() +
-                                                    batch_size + 1};
-    std::vector<int32_t> p_pages_kv_indptr   = {pages_kv_indptr_vec.data_ptr<int32_t>(),
-                                                pages_kv_indptr_vec.data_ptr<int32_t>() + batch_size +
-                                                    1};
-    std::vector<int32_t> p_context_lens      = {context_lens_vec.data_ptr<int32_t>(),
-                                                context_lens_vec.data_ptr<int32_t>() + batch_size};
+    int32_t* p_work_indptr   = work_indptr.data_ptr<int32_t>();
+    WorkInfo* p_work_info    = reinterpret_cast<WorkInfo*>(work_info.data_ptr<int32_t>());
+    int32_t* p_reduce_indptr = reduce_indptr.data_ptr<int32_t>();
+    FinalLoc* p_reduce_final_map =
+        reinterpret_cast<FinalLoc*>(reduce_final_map.data_ptr<int32_t>());
+    int32_t* p_reduce_partial_map = reduce_partial_map.data_ptr<int32_t>();
 
-    std::vector<int32_t> work_indptr_vec(work_indptr.numel(), 0);
-    std::vector<WorkInfo> work_info_vec(work_info.numel() / kSizeWorkInfoInDw, WorkInfo());
-    std::vector<int32_t> reduce_indptr_vec(reduce_indptr.numel(), 0);
-    std::vector<FinalLoc> reduce_final_map_vec(reduce_final_map.numel() / 2, FinalLoc());
-    std::vector<int32_t> reduce_partial_map_vec(reduce_partial_map.numel(), 0);
+    AttentionPsMetadataV1_2 params = {};
+    params.batch_size              = batch_size;
+    params.gqa_ratio               = gqa_ratio;
+    params.num_heads_k             = num_heads_k;
+    params.qhead_granularity       = qhead_granularity;
+    params.qlen_granularity        = qlen_granularity;
+    params.kvlen_granularity       = kvlen_granularity;
+    params.block_size              = block_size;
+    params.is_causal               = is_causal;
+    params.available_tgs           = available_tgs;
+    params.num_clusters            = num_clusters;
+    params.tgs_per_cluster         = tgs_per_cluster;
+    params.kheads_per_cluster      = kheads_per_cluster;
+    params.p_seqlens_qo_indptr     = p_seqlens_qo_indptr;
+    params.p_pages_kv_indptr       = p_pages_kv_indptr;
+    params.p_context_lens          = p_context_lens;
+    params.p_work_indptr           = p_work_indptr;
+    params.p_work_info             = p_work_info;
+    params.p_reduce_indptr         = p_reduce_indptr;
+    params.p_reduce_final_map      = p_reduce_final_map;
+    params.p_reduce_partial_map    = p_reduce_partial_map;
 
     // 2. conquer(parallel)
     for(int32_t cluster_id = 0; cluster_id < num_clusters; cluster_id++)
     {
         // OPT: consider XCC L2 cache
-        int32_t current_work_idx = work_indptr_vec[cluster_id * tgs_per_cluster];
-        kn_generate_ps_metadata(p_seqlens_qo_indptr,
-                                p_pages_kv_indptr,
-                                p_context_lens,
-                                gqa_ratio,
-                                kheads_per_cluster,
-                                qhead_granularity,
-                                qlen_granularity,
-                                kvlen_granularity,
-                                block_size,
-                                is_causal,
-                                work_indptr_vec,
-                                work_info_vec,
-                                tgs_per_cluster,
-                                cluster_id,
-                                current_work_idx);
+        int32_t current_work_idx = p_work_indptr[cluster_id * tgs_per_cluster];
+        kn_generate_ps_metadata(params, cluster_id, current_work_idx);
     }
 
-    // TODO: fix reduce info
-    const int32_t actual_works = work_indptr_vec.back();
+    // TODO: eliminate reduce info
+    const int32_t actual_works = p_work_indptr[work_indptr.numel() - 1];
     generate_reduce_info(actual_works,
-                         work_info_vec,
-                         reduce_indptr_vec,
-                         reduce_final_map_vec,
-                         reduce_partial_map_vec);
-
-    // H2D
-    auto input_options   = work_indptr.options();
-    auto input_dtype     = torch::TensorOptions().dtype(torch::kInt32);
-    auto work_indptr_cpu = torch::from_blob(
-        work_indptr_vec.data(), {work_indptr.numel()}, input_options.device(torch::kCPU));
-    work_indptr.copy_(work_indptr_cpu);
-
-    auto work_info_cpu =
-        torch::from_blob(work_info_vec.data(),
-                         {static_cast<int64_t>(work_info_vec.size()), kSizeWorkInfoInDw},
-                         input_options.device(torch::kCPU));
-    work_info.copy_(work_info_cpu);
-
-    auto reduce_indptr_cpu = torch::from_blob(
-        reduce_indptr_vec.data(), {reduce_indptr.numel()}, input_options.device(torch::kCPU));
-    reduce_indptr.copy_(reduce_indptr_cpu);
-
-    auto reduce_final_map_cpu =
-        torch::from_blob(reduce_final_map_vec.data(),
-                         {static_cast<int64_t>(reduce_final_map_vec.size()), kSizeFinalLocInDw},
-                         input_options.device(torch::kCPU));
-    reduce_final_map.copy_(reduce_final_map_cpu);
-
-    auto reduce_partial_map_cpu = torch::from_blob(reduce_partial_map_vec.data(),
-                                                   {reduce_partial_map.numel()},
-                                                   input_options.device(torch::kCPU));
-    reduce_partial_map.copy_(reduce_partial_map_cpu);
+                         p_work_info,
+                         p_reduce_indptr,
+                         reduce_indptr.numel(),
+                         p_reduce_final_map,
+                         p_reduce_partial_map);
 
 #if PRINT_DBG
-    // print_metadata(work_indptr_vec, work_info_vec);
-    // print_reduce_info(reduce_indptr_vec, reduce_final_map_vec, reduce_partial_map_vec);
+    print_metadata(
+        p_work_indptr, work_indptr.numel(), p_work_info, work_info.numel() / kSizeWorkInfoInDw);
+    print_reduce_info(p_reduce_indptr,
+                      reduce_indptr.numel(),
+                      p_reduce_final_map,
+                      reduce_final_map.numel() / 2,
+                      p_reduce_partial_map,
+                      reduce_partial_map.numel());
 #endif
     return;
 }

@@ -297,6 +297,26 @@ def test_mla_prefill(
         max_qlen=max_qlen,
         qlen_granularity=qlen_granularity,
     )
+    # Pinned CPU buffers(used for stage0: get_ps_metadata_info_v1)
+    work_indptr_cpu = torch.empty(
+        work_indptr_size, dtype=work_indptr_type, device="cpu", pinned=True
+    )
+    work_info_cpu = torch.empty(
+        work_info_size, dtype=work_info_type, device="cpu", pinned=True
+    )
+    reduce_indptr_cpu = torch.empty(
+        reduce_indptr_size, dtype=reduce_indptr_type, device="cpu", pinned=True
+    )
+    reduce_final_map_cpu = torch.empty(
+        reduce_final_map_size, dtype=reduce_final_map_type, device="cpu", pinned=True
+    )
+    reduce_partial_map_cpu = torch.empty(
+        reduce_partial_map_size,
+        dtype=reduce_partial_map_type,
+        device="cpu",
+        pinned=True,
+    )
+    # Device buffers(used by stage1: mla_prefill_ps_asm_fwd & stage2: mla_reduce_v1)
     work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type, device=device)
     work_info = torch.empty(work_info_size, dtype=work_info_type, device=device)
     reduce_indptr = torch.empty(
@@ -332,51 +352,43 @@ def test_mla_prefill(
                 flush=True,
             )
     else:
-        qo_indptr_cpu = qo_indptr.to("cpu")
-        kv_indptr_cpu = kv_indptr.to("cpu")
-        seq_lens_kv_cpu = seq_lens_kv.to("cpu")
-        # warmup for get_ps_metadata_v1
-        aiter.get_ps_metadata_v1(
-            qo_indptr_cpu,
-            kv_indptr_cpu,
-            seq_lens_kv_cpu,
-            gqa_ratio,
-            num_head_kv,
-            work_indptr,
-            work_info,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            qhead_granularity=qhead_granularity,
-            qlen_granularity=qlen_granularity,
-            kvlen_granularity=kvlen_granularity,
-            block_size=block_size,
-            is_causal=is_causal,
-        )
-        torch.cuda.synchronize()
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
-        aiter.get_ps_metadata_v1(
-            qo_indptr_cpu,
-            kv_indptr_cpu,
-            seq_lens_kv_cpu,
-            gqa_ratio,
-            num_head_kv,
-            work_indptr,
-            work_info,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            qhead_granularity=qhead_granularity,
-            qlen_granularity=qlen_granularity,
-            kvlen_granularity=kvlen_granularity,
-            block_size=block_size,
-            is_causal=is_causal,
-        )
-        end_event.record()
-        end_event.synchronize()
-        us_metadata = start_event.elapsed_time(end_event) * 1000  # ms to us
+        # Inputs: pinned CPU (caller-allocated)
+        qo_indptr_cpu = qo_indptr.to("cpu", non_blocking=True).pin_memory()
+        kv_indptr_cpu = kv_indptr.to("cpu", non_blocking=True).pin_memory()
+        seq_lens_kv_cpu = seq_lens_kv.to("cpu", non_blocking=True).pin_memory()
+
+        def run_get_ps_metadata_and_h2d():
+            # Kernel only generates into pinned CPU outputs; no H2D inside
+            aiter.get_ps_metadata_v1(
+                qo_indptr_cpu,
+                kv_indptr_cpu,
+                seq_lens_kv_cpu,
+                gqa_ratio,
+                num_head_kv,
+                work_indptr_cpu,
+                work_info_cpu,
+                reduce_indptr_cpu,
+                reduce_final_map_cpu,
+                reduce_partial_map_cpu,
+                qhead_granularity=qhead_granularity,
+                qlen_granularity=qlen_granularity,
+                kvlen_granularity=kvlen_granularity,
+                block_size=block_size,
+                is_causal=is_causal,
+            )
+            # H2D outside kernel: async copy so caller can overlap with other kernels
+            work_indptr.copy_(work_indptr_cpu, non_blocking=True)
+            work_info.copy_(work_info_cpu, non_blocking=True)
+            reduce_indptr.copy_(reduce_indptr_cpu, non_blocking=True)
+            reduce_final_map.copy_(reduce_final_map_cpu, non_blocking=True)
+            reduce_partial_map.copy_(reduce_partial_map_cpu, non_blocking=True)
+
+        # TODO: check torch.benmark.time
+        us_metadata = torch.benchmark.timeit(
+            num_iters=10,
+            memory_format=torch.memory_format.contiguous,
+            device=device,
+        )(run_get_ps_metadata_and_h2d)
 
     if dump_metadata:
         for name, meta in metadata_map.items():

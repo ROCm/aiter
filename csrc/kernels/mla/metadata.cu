@@ -239,7 +239,6 @@ void get_ps_metadata_v1(
     const torch::Tensor& context_lens,          // [batch size]
     const int32_t        gqa_ratio,
     const int32_t        num_heads_k,
-    torch::Tensor&       work_metadata_ptrs,
     torch::Tensor&       work_indptr,
     torch::Tensor&       work_info,
     torch::Tensor&       reduce_indptr,
@@ -252,6 +251,7 @@ void get_ps_metadata_v1(
     const bool           is_causal)
 {
     // const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(pages_kv_indptr));
+    TORCH_CHECK(seqlens_qo_indptr.is_cpu() & pages_kv_indptr.is_cpu() & context_lens.is_cpu() & work_indptr.is_cpu() & work_info.is_cpu() & reduce_indptr.is_cpu() & reduce_final_map.is_cpu() & reduce_partial_map.is_cpu(), __func__, ": all inputs must be a CPU tensor");
 
     TORCH_CHECK((kvlen_granlarity & (kvlen_granlarity - 1)) == 0,
                 __func__, ": kvlen_granlarity Must be power of 2!");
@@ -270,7 +270,6 @@ void get_ps_metadata_v1(
         context_lens,
         gqa_ratio,
         num_heads_k,
-        work_metadata_ptrs,
         work_indptr,
         work_info,
         reduce_indptr,
