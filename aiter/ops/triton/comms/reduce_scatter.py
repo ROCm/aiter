@@ -197,6 +197,22 @@ def reduce_scatter(
             "Iris library is not available. Cannot perform reduce-scatter."
         )
 
+    # If ctx is not provided or is not the expected context type, try to get global context (fail fast for Tensor).
+    if ctx is None:
+        raise RuntimeError(
+            "No Iris communication context provided. Please supply ctx=... from an IrisCommContext."
+        )
+    # If ctx is accidentally a Tensor (e.g., due to misordered args in outplace_reduce_scatter), raise a more helpful error.
+    if isinstance(ctx, torch.Tensor):
+        raise TypeError(
+            "reduce_scatter() expected ctx=IrisCommContext (got Tensor instead). "
+            "Did you accidentally pass input/output as ctx? Please check your argument order."
+        )
+    # Defensive: ctx should have is_initialized attribute, else error clearly.
+    if not hasattr(ctx, "is_initialized"):
+        raise TypeError(
+            f"reduce_scatter() expected ctx=IrisCommContext, got {type(ctx)}"
+        )
     if not ctx.is_initialized:
         raise RuntimeError(
             "Iris context not initialized. Use IrisCommContext as context manager."

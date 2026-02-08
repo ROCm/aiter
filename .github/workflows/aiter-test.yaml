@@ -171,7 +171,7 @@ jobs:
           -w /workspace \
           aiter_test \
           bash -c "pip show amd-aiter || true"
-      
+
       - name: Tests
         run: |
           set -ex
@@ -208,7 +208,7 @@ jobs:
 
   multi-gpu:
     name: Multi-GPU Tests (8 GPU)
-    if: github.ref == 'refs/heads/main'
+    # if: github.ref == 'refs/heads/main'
     needs: build_aiter_image 
     strategy:
       fail-fast: false
@@ -272,6 +272,15 @@ jobs:
           -w /workspace \
           aiter_test \
           bash -c "pip show amd-aiter || true"
+
+      - name: Show Dependencies
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        run: |
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          bash -c "pip list"
+
 
       - name: Tests
         run: |
