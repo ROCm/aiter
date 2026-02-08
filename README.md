@@ -66,6 +66,9 @@ See the [Triton Comms Guide](docs/triton_comms.md) for usage details.
 | Sampling | Greedy, random, mixed, top-k, top-p token sampling for LLM generation | [Sampling Guide](docs/sampling_guide.md) |
 | Top-K | Top-k selection — MOE routing (grouped, biased), radix/bitonic sort, fused softmax+topk | [Top-K Guide](docs/topk_guide.md) |
 | Communication (AllReduce) | Custom all-reduce, quick all-reduce, Iris reduce-scatter/all-gather | [Distributed Guide](docs/distributed_guide.md) |
+| Causal Conv1D | Causal convolution for Mamba/SSM models — prefill, decode, fused QKV split, speculative decoding | [Causal Conv1D Guide](docs/causal_conv1d_guide.md) |
+| Gated Delta Net | Gated delta rule recurrence — fused recurrent, chunk-based, sigmoid gating, GVA support | [GDN Guide](docs/gated_delta_net_guide.md) |
+| Grouped GEMM | GMM (Triton) and DeepGEMM (CK) — MoE expert routing, variable-length grouped GEMM | [Grouped GEMM Guide](docs/grouped_gemm_guide.md) |
 
 Each guide covers available variants, backend support (ASM / CK / Triton), Python API examples, and performance tuning advice.
 
@@ -78,6 +81,8 @@ Run operator tests with: `python3 op_tests/<test_file>.py` (e.g. `python3 op_tes
 | [JIT Compilation System](docs/jit_system_guide.md) | `@compile_ops` decorator, module config, build flow, cache, GPU detection |
 | [GEMM Tuning & Gradlib](docs/gemm_tuning_guide.md) | CSV-based kernel dispatch, hipBLASLt/ASM tuning, gradlib framework |
 | [Distributed Infrastructure](docs/distributed_guide.md) | Tensor parallelism, custom/quick all-reduce, Iris comms, shared memory broadcast |
+| [Weight Shuffle & Preshuffle](docs/weight_shuffle_guide.md) | Weight layout transforms for CK/ASM/Triton GEMM, FP8/FP4 preshuffle |
+| [BERT Padding & Variable-Length](docs/bert_padding_guide.md) | Pad/unpad utilities, variable-length attention, cumulative sequence lengths |
 
 ## Additional Resources
 - [Triton-based Communication (Iris)](docs/triton_comms.md) — GPU-initiated reduce-scatter and all-gather
