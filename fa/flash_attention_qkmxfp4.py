@@ -44,6 +44,9 @@ from quant_mxfp4 import (
     downcast_to_mxfp
 )
 import aiter
+from op_tests.op_benchmarks.triton.bench_fav3_sage import fav3_sage_forward_func
+from op_tests.op_benchmarks.triton.bench_fav3_sage import fav2_forward_func
+from op_tests.triton_tests.attention.test_fav3_sage import compare_accuracy
 
 
 @triton.jit
@@ -86,7 +89,6 @@ class MetaData():
     persistent = None
     num_contexts = 0
     varlen = False
-    int8 = False
     layout = None
     dropout_p, return_encoded_softmax = 0.0, False
 
@@ -109,16 +111,6 @@ class MetaData():
 
     def set_persistent(self, persistent):
         self.persistent = persistent
-
-    def set_int8_params(self, q_descale, k_descale, v_descale, p_scale, p_descale):
-        self.int8 = True
-        self.q_descale = q_descale
-        self.k_descale = k_descale
-        self.v_descale = v_descale
-        self.p_scale = p_scale
-        self.p_descale = p_descale
-        self.use_p_scale = (p_scale is not None) and (p_descale is not None) and (v_descale is not None)
-        self.int8_kv = (q_descale is None) and (k_descale is not None) and (v_descale is not None)
 
     
     def set_mxfp4_params(self, q_descale, k_descale, v_descale, bias):
@@ -593,7 +585,7 @@ def attn_fwd(Q, K, V, bias, SM_SCALE: tl.constexpr, L, Out, stride_qz, stride_qh
                 q_descale_offset = Q_descale + off_z * stride_qsz + off_h_q * stride_qsh + cu_seqlens_q_start * stride_qsm
                 # this is too hacky... correct would be to use offs_ds but the offs_d seems to perform better and not hurt the accuracy
                 # TODO: find out why offs_d even works and why it increases perf
-                q_descale_ptrs = q_descale_offset + offs_m[:, None] * stride_qsm + offs_d[None, :] * stride_qsk
+                q_descale_ptrs = q_descale_offset + offs_m[:, None] * stride_qsm + offs_ds[None, :] * stride_qsk
                 
                 k_descale_offset = K_descale + off_z * stride_ksz + off_h_k * stride_ksh + cu_seqlens_k_start * stride_ksn
                 k_descale_ptrs = k_descale_offset + offs_ds[None, :] * stride_ksk + offs_n[:, None] * stride_ksn # Do not transpose for dot scaled!
@@ -733,12 +725,12 @@ def attn_fwd(Q, K, V, bias, SM_SCALE: tl.constexpr, L, Out, stride_qz, stride_qh
                 # If seqlen_q not multiple of BLOCK_M, we need to mask out the last few rows.
                 # This is only true for the last M block. For others, overflow_size will be -ve
                 overflow_size = end_m_idx - seqlen_q
-                if overflow_size > 0:
-                    boundary = tl.full((BLOCK_M, ), BLOCK_M - overflow_size, dtype=tl.int32)
-                    l_ptrs_mask = tl.arange(0, BLOCK_M) < boundary
-                    tl.store(l_ptrs, m_i + tl.math.log2(l_i), mask=l_ptrs_mask)
-                else:
-                    tl.store(l_ptrs, m_i + tl.math.log2(l_i))
+                # if overflow_size > 0:
+                #     boundary = tl.full((BLOCK_M, ), BLOCK_M - overflow_size, dtype=tl.int32)
+                #     l_ptrs_mask = tl.arange(0, BLOCK_M) < boundary
+                #     tl.store(l_ptrs, m_i + tl.math.log2(l_i), mask=l_ptrs_mask)
+                # else:
+                #     tl.store(l_ptrs, m_i + tl.math.log2(l_i))
 
                 # write back O
                 o_offset = Out + off_z * stride_oz + off_h_q * stride_oh + cu_seqlens_q_start * stride_om
@@ -1098,11 +1090,8 @@ class _attention(torch.autograd.Function):
             assert (metadata.bias.numel() < 2**31)
 
         if o is None:
-            if not metadata.int8:
-                o = torch.empty_like(q, dtype=v.dtype)
-            else:
-                o = torch.empty_like(q, dtype=torch.float16)
-
+            o = torch.empty_like(q, dtype=torch.float16)
+        
         metadata.check_args(q, k, v, o)
 
         batch, nheads_q, nheads_k, head_size = get_shape_from_layout(q, k, metadata)
@@ -1163,7 +1152,9 @@ class _attention(torch.autograd.Function):
         atomic_counter = torch.zeros([1], device=q.device, dtype=torch.int32)
 
         # test_op_fwd(Z, x_vals_list[1], x_vals_list[2], N_CTX_Q, N_CTX_K, D_HEAD, causal, use_alibi, layout, dtype=torch.float16):
-
+        # print("v.dtype", v.dtype)
+        
+        
         attn_fwd[grid](q, k, v, metadata.bias, metadata.sm_scale, M, o, *q_strides, *k_strides, *v_strides, *o_strides,
                        *bias_strides, *alibi_strides, *q_descale_strides, *k_descale_strides, *v_descale_strides, q_descale, k_descale, v_descale,
                        metadata.cu_seqlens_q, metadata.cu_seqlens_k, dropout_p=metadata.dropout_p,
@@ -1415,8 +1406,11 @@ def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
     return inputs
 
 
-def check_accuracy_with_captured_inputs(input_dir, layout, causal):
-    # Disable grad to save memeory it won't run into OOM on CI machine.
+def check_accuracy_with_captured_inputs(args):
+    input_dir = args.captured_dir
+    causal = args.causal
+    layout = args.layout
+    
     inputs = load_captured_inputs(input_dir)
     n_ = len(inputs)
 
@@ -1454,16 +1448,20 @@ def check_accuracy_with_captured_inputs(input_dir, layout, causal):
         o = torch.empty_like(q)
 
 
-        q_quantized, k_quantized, v_quantized = quantize_input(q, k, v, input_metadata)
-        triton_out, _ = attention(q_quantized, k_quantized, v_quantized, o, input_metadata)
+        if args.use_aiter:
+            fn = fav3_sage_forward_func(q,k,v,args.causal,True,"bshd",use_mxfp4_sage=False)
+        else:
+            q_quantized, k_quantized, v_quantized = quantize_input(q, k, v, input_metadata)
+            input_metadata.set_persistent(args.persistent)
+            fn = lambda: attention(q_quantized, k_quantized, v_quantized, o, input_metadata)
+        triton_out, _ = fn()
 
-        from op_tests.op_benchmarks.triton.bench_fav3_sage import fav2_forward_func
-        
+        # print("triton out", triton_out)
         ref_out = fav2_forward_func(q, k, v, dropout_p=0.0, softmax_scale=sm_scale, causal=causal, return_lse=False, return_attn_probs=False)()
 
         assert ref_out.shape == triton_out.shape
 
-        from op_tests.triton_tests.attention.test_fav3_sage import compare_accuracy
+        
 
         compare_accuracy(
             triton_out,
@@ -1500,7 +1498,6 @@ def test_op_fwd_mxfp4(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, layout, dtype=torc
         input_metadata.need_causal()
 
     o = torch.empty_like(q)
-    print("config", input_metadata.config)
 
     q_quantized, k_quantized, v_quantized = quantize_input(q, k, v, input_metadata)
     triton_out, _ = attention(q_quantized, k_quantized, v_quantized, o, input_metadata)
@@ -1612,9 +1609,6 @@ def run_benchmark(custom, args):
     mode = 'fwd'
     x_names = ['BATCH', 'HQ', 'HK', 'N_CTX_Q', 'N_CTX_K']
     causal = (args.causal == 1) if not args.model else True
-    int8 = args.int8
-    quantize_p = args.quantize_p and int8
-    int8_kv = args.int8_kv and int8
     varlen = True if args.model else args.layout == 'thd'
     configs = []
     plot_name = f'fused-attention-{mode}-d{head_size}-layout{args.layout}-causal{args.causal}'
@@ -1652,7 +1646,7 @@ def run_benchmark(custom, args):
     def bench_flash_attention(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, causal, mode, provider, device="cuda",
                               model=None):
         assert mode in ["fwd", "bwd"]
-        assert not (int8_kv and quantize_p)
+
         warmup = 25
         rep = 100
         # TODO: Enable bias after testing.
@@ -1708,9 +1702,12 @@ def run_benchmark(custom, args):
         if "triton" in provider:
             o = torch.empty_like(q)
 
-            q, k, v = quantize_input(q, k, v, input_metadata)
-            input_metadata.set_persistent(args.persistent)
-            fn = lambda: attention(q, k, v, o, input_metadata)
+            if args.use_aiter:
+                fn = fav3_sage_forward_func(q,k,v,args.causal,True,args.layout,use_mxfp4_sage=False)
+            else:
+                q, k, v = quantize_input(q, k, v, input_metadata)
+                input_metadata.set_persistent(args.persistent)
+                fn = lambda: attention(q, k, v, o, input_metadata)
             if mode == 'bwd':
                 o, _, _ = fn()
                 do = torch.randn_like(o)
@@ -1778,9 +1775,7 @@ def parse_args():
                             ' has same seqlen as sq and sk')
     parser.add_argument("-d", type=int, default=0)
     parser.add_argument("-causal", type=int, default=0)
-    parser.add_argument("-int8", action='store_true', default=False)
-    parser.add_argument("-quantize_p", action='store_true', default=False)
-    parser.add_argument("-int8_kv", action='store_true', default=False)
+    parser.add_argument("-use_aiter", action='store_true', default=False)
     parser.add_argument("-dtype", default='fp16')
     parser.add_argument("-return_time", action='store_true', default=False)
     parser.add_argument("-layout", type=str, default='bhsd', help=supported_layouts())
@@ -1823,7 +1818,7 @@ def main():
         print("Note: Model config sets causal masking and THD layout (varlen) by default.")
 
     if args.captured_dir is not None:
-        check_accuracy_with_captured_inputs(args.captured_dir, args.layout, args.causal)
+        check_accuracy_with_captured_inputs(args)
     # test_op_fwd_mxfp4(1, 5, 1024, 1024, 128, False, "bhsd")
     run_benchmark(custom_config, args)
 
