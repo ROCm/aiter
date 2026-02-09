@@ -1405,6 +1405,104 @@ class OManager16bitsV1
     }
 };
 
+// Compare with OManager32bitsV1, this version changes the layout of data in GPR via LDS on storing
+// buffer to make sure that the data in adjacent lanes are stored in the same cache line.
+template <typename T, typename out_t>
+class OManager16bitsV2
+{
+    private:
+    static_assert(sizeof(out_t) == 2, "Output type must be 16 bits");
+
+    static constexpr uint32_t kNumRows                = 16;
+    static constexpr uint32_t kNumCols                = 32;
+    static constexpr uint32_t kNumPaddingElemPer2Rows = 4;
+    static constexpr uint32_t kNumElemPerPadded2Rows  = 2 * kNumCols + kNumPaddingElemPer2Rows;
+    static constexpr uint32_t kVramStElemPerLane =
+        4 * sizeof(uint32_t) / sizeof(out_t); // use buffer_store_dwordx4
+    static constexpr uint32_t kVramStLanePerRow = kNumCols / kVramStElemPerLane; // 32/8=4
+
+    // All comes from result of mfma_f32_16x16x32_fp8_fp8
+    static constexpr uint32_t kMfmaRows = 16;
+    static constexpr uint32_t kMfmaCols = 16;
+    static constexpr uint32_t kMfmaElemPerLane =
+        kMfmaRows * kMfmaCols / ckt::get_warp_size(); // 16*16/64=4
+
+    __device__ __forceinline__ static constexpr uint32_t get_lds_size_per_warp_in_byte()
+    {
+        return (kNumRows / 2) * kNumElemPerPadded2Rows *
+               sizeof(out_t); // (16/2)*(32*2+2)*2=8*66*2=1056
+    }
+
+    public:
+    __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
+    {
+        return T::kNumWarps * get_lds_size_per_warp_in_byte(); // 8*1056=8448
+    }
+
+    // Convert 16x32 blocks of 8 float32 data and store them in VRAM.
+    // GPR_START: Starting GPR index for current 16x32 block
+    // kColOffset: Element-wise column offset in output buffer.
+    template <uint32_t GPR_START, uint32_t kColOffset>
+    __device__ __forceinline__ void output_to_vram(const out_t* p_output,
+                                                   const uint32_t warp_idx,
+                                                   const uint32_t qo_start,
+                                                   const uintptr_t p_lds)
+    {
+        static_assert((kColOffset % 32) == 0, "kColOffset must be divisible by 32");
+
+        constexpr uint32_t kOffsetInBytes = kColOffset * sizeof(out_t);
+
+        const uint32_t lane_idx = ckt::get_lane_id();
+
+        const uintptr_t p_lds_warp = p_lds + warp_idx * get_lds_size_per_warp_in_byte();
+
+        auto get_v_offset_lds = [&](const uint32_t row, const uint32_t col) -> uint32_t {
+            return ((row / 2) * kNumElemPerPadded2Rows + (row % 2) * kNumCols + col) *
+                   sizeof(out_t);
+        };
+
+        const uint32_t row_lds_st      = lane_idx % kNumRows;
+        const uint32_t col_lds_st      = (lane_idx / kNumRows) * kMfmaElemPerLane;
+        const uint32_t v_offset_lds_st = get_v_offset_lds(row_lds_st, col_lds_st);
+
+        const uint32_t row_lds_ld      = lane_idx / kVramStLanePerRow;
+        const uint32_t col_lds_ld      = (lane_idx % kVramStLanePerRow) * kVramStElemPerLane;
+        const uint32_t v_offset_lds_ld = get_v_offset_lds(row_lds_ld, col_lds_ld);
+
+        const uint32_t row_vram_st = row_lds_ld + qo_start * T::kQoNumHead + warp_idx * kNumRows;
+        const uint32_t col_vram_st = col_lds_ld;
+        const uint32_t v_offset_vram_st =
+            (row_vram_st * T::kVoHeadDim + col_vram_st) * sizeof(out_t);
+
+        const uintptr_t out_as_int = reinterpret_cast<uintptr_t>(p_output);
+        const uint64_t out_as_u64  = static_cast<uint64_t>(out_as_int);
+        const hk::buffer_resource out_br =
+            hk::make_buffer_resource(out_as_u64, 0xFFFFFFFF, 0x00020000);
+
+        v2ui b16_pair_0;
+        v2ui b16_pair_1;
+
+        if constexpr(std::is_same_v<out_t, hk::bf16>)
+        {
+            b16_pair_0[0] = float_2_bf16_pair<T::kRoundMode>(GPR_START, GPR_START + 1);
+            b16_pair_0[1] = float_2_bf16_pair<T::kRoundMode>(GPR_START + 2, GPR_START + 3);
+            b16_pair_1[0] = float_2_bf16_pair<T::kRoundMode>(GPR_START + 4, GPR_START + 5);
+            b16_pair_1[1] = float_2_bf16_pair<T::kRoundMode>(GPR_START + 6, GPR_START + 7);
+        }
+        else
+        {
+            static_assert(false, "Unsupported output type");
+        }
+
+        hkm::ds_write_b64(p_lds_warp + v_offset_lds_st, 0, b16_pair_0);
+        hkm::ds_write_b64(p_lds_warp + v_offset_lds_st, kNumCols / 2 * sizeof(out_t), b16_pair_1);
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        const v4ui data = hkm::ds_read_b128(p_lds_warp + v_offset_lds_ld, 0);
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        hkm::buffer_store_dwordx4(out_br, v_offset_vram_st, 0, kOffsetInBytes, data);
+    }
+};
+
 // Convert float32 data in pinned GPR to a 32 bits data and store in VRAM.
 template <typename T, typename out_t>
 class OManager32bitsV1
@@ -1467,6 +1565,8 @@ class OManager32bitsV1
     }
 };
 
+// Compare with OManager32bitsV1, this version changes the layout of data in GPR via LDS on storing
+// buffer to make sure that the data in adjacent lanes are stored in the same cache line.
 template <typename T, typename out_t>
 class OManager32bitsV2
 {
@@ -1477,8 +1577,9 @@ class OManager32bitsV2
     static constexpr uint32_t kNumCols              = 32;
     static constexpr uint32_t kNumPaddingElemPerRow = 4;
     static constexpr uint32_t kNumElemPerPaddedRow  = kNumCols + kNumPaddingElemPerRow; // 32+4=36
-    static constexpr uint32_t kVramStElemPerLane    = 4; // use buffer_store_dwordx4
-    static constexpr uint32_t kVramStLanePerRow     = kNumCols / kVramStElemPerLane; // 32/4=8
+    static constexpr uint32_t kVramStElemPerLane =
+        4 * sizeof(uint32_t) / sizeof(out_t); // use buffer_store_dwordx4
+    static constexpr uint32_t kVramStLanePerRow = kNumCols / kVramStElemPerLane; // 32/4=8
     static constexpr uint32_t kVramStRowsPerRnd =
         ckt::get_warp_size() / kVramStLanePerRow; // 64/8=8
     static constexpr uint32_t kLdsLdOffsetDeltaInBytes =
@@ -1500,7 +1601,7 @@ class OManager32bitsV2
     public:
     __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
     {
-        return T::kNumWarps * get_lds_size_per_warp_in_byte();
+        return T::kNumWarps * get_lds_size_per_warp_in_byte(); // 8*2304=18432
     }
 
     // Convert 16x32 blocks of 8 float32 data and store them in VRAM.
@@ -1905,7 +2006,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     QManagerV3<T> q_manager;
     KvManagerV2<T> kv_manager;
     VtManagerV1<T> vt_manager;
-    OManager16bitsV1<T, out_t> o_manager;
+    OManager16bitsV2<T, out_t> o_manager;
     OManager32bitsV2<T, split_t> split_o_manager;
 
     hk::art<kv_t, T::kBlockK, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_0_ranges> kv_0;
