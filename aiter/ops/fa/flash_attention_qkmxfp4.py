@@ -36,9 +36,9 @@ import torch
 
 import triton
 import triton.language as tl
-from .utils.benchmark_utils import get_available_models, get_model_configs
+from aiter.ops.fa.utils.benchmark_utils import get_available_models, get_model_configs
 
-from .quant_mxfp4 import (
+from aiter.ops.fa.quant_mxfp4 import (
     sage_quant_v_kernel,
     rotation_smooth_qk,
     downcast_to_mxfp
