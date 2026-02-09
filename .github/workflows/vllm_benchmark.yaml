@@ -36,7 +36,7 @@ jobs:
     name: Build vLLM Image
     if: ${{ !github.event.pull_request.head.repo.fork }}
     needs: [check-signal]
-    runs-on: aiter-k8s-build
+    runs-on: build-only-aiter
 
     steps:
       - name: Checkout aiter repo

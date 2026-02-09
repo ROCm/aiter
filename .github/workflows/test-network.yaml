@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        description: 'Runner to use for the test, e.g. aiter-mi355-1gpu, aiter-1gpu-runner, etc.'
+        description: 'Runner to use for the test, e.g. linux-aiter-mi355-1, aiter-1gpu-runner, etc.'
         required: true
-        default: 'aiter-mi355-1gpu'
+        default: 'linux-aiter-mi355-1'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   test-pypi:
-    runs-on: aiter-mi355-1gpu
+    runs-on: linux-aiter-mi355-1
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
