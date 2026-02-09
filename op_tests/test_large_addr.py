@@ -126,10 +126,15 @@ def print_mismatch_info(name, tensor_aiter, tensor_ref, tensor_pt, tol):
             print(f"  (Tensor too large for top-k analysis, showing max only)")
 
 
-def get_test_params_for_kernel(config):
+def get_test_params_for_kernel(config, large_q=False):
     """
     Generate test parameters for a given kernel configuration.
     Uses large sequence lengths to trigger 64-bit address overflow.
+    
+    Args:
+        config: kernel configuration dict from CSV
+        large_q: if True, use large seqlen_q (tests Q/dO/dQ/ODO overflow);
+                 if False, use large seqlen_k (tests K/V/dK/dV overflow)
     
     Returns dict with test parameters or None if kernel should be skipped.
     """
@@ -164,11 +169,17 @@ def get_test_params_for_kernel(config):
     # Total size = 8 * seqlen * 40 * 128 * 2 = 81920 * seqlen bytes
     # Need > 4GB = 4294967296 bytes
     # seqlen > 4294967296 / 81920 = 52428
-    # Use seqlen_k = 75600 to ensure overflow (gives ~6.2GB)
+    # Use 75600 to ensure overflow (gives ~6.2GB)
     batch_size = 8
     nheads = 40
-    seqlen_q = 256
-    seqlen_k = 75600  # Large enough to trigger 32-bit address overflow
+    if large_q:
+        # Large seqlen_q: tests Q/dO/dQ/ODO address overflow
+        seqlen_q = 75600
+        seqlen_k = 256
+    else:
+        # Large seqlen_k: tests K/V/dK/dV address overflow
+        seqlen_q = 256
+        seqlen_k = 75600
     
     return {
         "batch_size": batch_size,
@@ -229,13 +240,9 @@ def run_mha_backward_test(
     device = "cuda"
     
     # Set window size for causal (aligned with test_mha.py)
-    if causal:
-        if causal_type == "bottom_right":
-            window_size = (seqlen_k - seqlen_q, 0)
-        else:  # top_left
-            window_size = (-1, 0)
-    else:
-        window_size = (-1, -1)
+    # test_mha.py always uses (-1, -1) for window_size and just passes causal=True
+    # The C++ layer handles mask type selection internally based on seqlen_q vs seqlen_k
+    window_size = (-1, -1)
     
     # Create input tensors (aligned with test_mha.py)
     q = torch.randn(batch_size, seqlen_q, nheads, hdim_q, device=device, dtype=dtype, requires_grad=True)
@@ -270,7 +277,7 @@ def run_mha_backward_test(
         error_msg = str(e) if str(e) else f"{type(e).__name__}"
         print(f"  ERROR: Aiter failed with: {error_msg}")
         traceback.print_exc()
-        return {"passed": False, "error": error_msg or "Unknown error", "co_name": co_name}
+        return {"passed": False, "error": error_msg or "Unknown error", "co_name": co_name, "test_name": test_name}
     
     # Run PyTorch reference in float32 (upcast=True) - aligned with test_mha.py
     out_ref, softmax_lse_ref, dq_ref, dk_ref, dv_ref = run_torch(
@@ -333,6 +340,7 @@ def run_mha_backward_test(
         "dk_tol": dk_tol,
         "dv_tol": dv_tol,
         "co_name": co_name,
+        "test_name": test_name,
     }
 
 
@@ -370,14 +378,10 @@ def run_mha_varlen_backward_test(
     
     device = "cuda"
     
-    # Set window size for causal
-    if causal:
-        if causal_type == "bottom_right":
-            window_size = (seqlen_k - seqlen_q, 0)
-        else:  # top_left
-            window_size = (-1, 0)
-    else:
-        window_size = (-1, -1)
+    # Set window size for causal (aligned with test_mha.py)
+    # test_mha.py always uses (-1, -1) for window_size and just passes causal=True
+    # The C++ layer handles mask type selection internally based on seqlen_q vs seqlen_k
+    window_size = (-1, -1)
     
     # For varlen mode, create packed tensors
     total_q = batch_size * seqlen_q
@@ -419,7 +423,7 @@ def run_mha_varlen_backward_test(
         error_msg = str(e) if str(e) else f"{type(e).__name__}"
         print(f"  ERROR: Aiter failed with: {error_msg}")
         traceback.print_exc()
-        return {"passed": False, "error": error_msg or "Unknown error", "co_name": co_name}
+        return {"passed": False, "error": error_msg or "Unknown error", "co_name": co_name, "test_name": test_name}
     
     # For reference, reshape to batch format and compute using attention_ref
     q_batch = q.reshape(batch_size, seqlen_q, nheads, hdim_q).requires_grad_(True)
@@ -491,14 +495,31 @@ def run_mha_varlen_backward_test(
         "dk_tol": dk_tol,
         "dv_tol": dv_tol,
         "co_name": co_name,
+        "test_name": test_name,
     }
 
 
-def run_all_tests(kernel_filter=None):
-    """Run all kernel tests or a filtered subset."""
+def run_all_tests(kernel_filter=None, large_q=False, large_k=False):
+    """Run all kernel tests or a filtered subset.
+    
+    By default (no flags), runs BOTH large_q and large_k tests.
+    Use --large-q or --large-k to run only one mode.
+    """
     print(f"\nRunning on: {get_device_arch()}")
     print(f"PyTorch version: {torch.__version__}")
     print(f"CUDA version: {torch.version.cuda}")
+    
+    # Determine which modes to run
+    if not large_q and not large_k:
+        # Default: run both
+        modes = [
+            (False, "large_k (q=256, k=75600): tests K/V/dK/dV address overflow"),
+            (True,  "large_q (q=75600, k=256): tests Q/dO/dQ/ODO address overflow"),
+        ]
+    elif large_q:
+        modes = [(True, "large_q (q=75600, k=256): tests Q/dO/dQ/ODO address overflow")]
+    else:
+        modes = [(False, "large_k (q=256, k=75600): tests K/V/dK/dV address overflow")]
     
     configs = load_kernel_configs()
     
@@ -528,53 +549,102 @@ def run_all_tests(kernel_filter=None):
             print(f"No kernels matching '{kernel_filter}' found!")
             return
     
-    results = []
-    passed = 0
-    failed = 0
-    skipped = 0
+    all_results = []
+    total_passed = 0
+    total_failed = 0
+    total_skipped = 0
     
-    for config in configs:
-        params = get_test_params_for_kernel(config)
-        if params is None:
-            skipped += 1
-            continue
+    for is_large_q, mode_desc in modes:
+        print(f"\n{'#'*70}")
+        print(f"# Mode: {mode_desc}")
+        print(f"{'#'*70}")
         
-        test_name = params['co_name'].replace('.co', '')
+        results = []
+        passed = 0
+        failed = 0
+        skipped = 0
         
-        # Choose test function based on mode
-        if params.get('is_varlen', False):
-            result = run_mha_varlen_backward_test(
-                **params,
-                test_name=test_name,
-            )
-        else:
-            result = run_mha_backward_test(
-                **params,
-                test_name=test_name,
-            )
+        for config in configs:
+            params = get_test_params_for_kernel(config, large_q=is_large_q)
+            if params is None:
+                skipped += 1
+                continue
+            
+            suffix = "_largeQ" if is_large_q else "_largeK"
+            test_name = params['co_name'].replace('.co', '') + suffix
+            
+            # Choose test function based on mode
+            if params.get('is_varlen', False):
+                result = run_mha_varlen_backward_test(
+                    **params,
+                    test_name=test_name,
+                )
+            else:
+                result = run_mha_backward_test(
+                    **params,
+                    test_name=test_name,
+                )
+            
+            results.append(result)
+            if result.get('passed', False):
+                passed += 1
+            else:
+                failed += 1
         
-        results.append(result)
-        if result.get('passed', False):
-            passed += 1
-        else:
-            failed += 1
+        # Print per-mode summary
+        print(f"\n{'-'*70}")
+        print(f"  [{mode_desc}]  Passed: {passed}  Failed: {failed}  Skipped: {skipped}")
+        print(f"{'-'*70}")
+        
+        if failed > 0:
+            for r in results:
+                if not r.get('passed', False):
+                    if 'error' in r:
+                        print(f"    FAIL: {r.get('test_name', r['co_name'])}: {r['error']}")
+                    else:
+                        dq = r.get('dq_diff', float('nan'))
+                        dk = r.get('dk_diff', float('nan'))
+                        dv = r.get('dv_diff', float('nan'))
+                        dq_tol = r.get('dq_tol', 0.01)
+                        dk_tol = r.get('dk_tol', 0.01)
+                        dv_tol = r.get('dv_tol', 0.01)
+                        parts = []
+                        if isinstance(dq, (int, float)) and not (dq != dq):
+                            parts.append(f"dQ={dq:.4f}(tol={dq_tol:.4f})")
+                        else:
+                            parts.append(f"dQ={dq}")
+                        if isinstance(dk, (int, float)) and not (dk != dk):
+                            parts.append(f"dK={dk:.4f}(tol={dk_tol:.4f})")
+                        else:
+                            parts.append(f"dK={dk}")
+                        if isinstance(dv, (int, float)) and not (dv != dv):
+                            parts.append(f"dV={dv:.4f}(tol={dv_tol:.4f})")
+                        else:
+                            parts.append(f"dV={dv}")
+                        print(f"    FAIL: {r.get('test_name', r['co_name'])}: {', '.join(parts)}")
+        
+        all_results.extend(results)
+        total_passed += passed
+        total_failed += failed
+        total_skipped += skipped
     
-    # Print summary
+    # Print overall summary
     print(f"\n{'='*70}")
-    print(f"TEST SUMMARY")
+    print(f"OVERALL TEST SUMMARY")
     print(f"{'='*70}")
-    print(f"  Passed:  {passed}")
-    print(f"  Failed:  {failed}")
-    print(f"  Skipped: {skipped}")
-    print(f"  Total:   {len(results)}")
+    print(f"  Passed:  {total_passed}")
+    print(f"  Failed:  {total_failed}")
+    print(f"  Skipped: {total_skipped}")
+    print(f"  Total:   {len(all_results)}")
     print(f"{'='*70}")
     
-    if failed > 0:
-        print(f"\nFailed tests:")
-        for r in results:
+    if total_failed > 0:
+        print(f"\nAll failed tests:")
+        for r in all_results:
             if not r.get('passed', False):
+                name = r.get('test_name', r['co_name'])
                 if 'error' in r:
-                    print(f"  - {r['co_name']}: {r['error']}")
+                    print(f"  - {name}: {r['error']}")
                 else:
                     dq = r.get('dq_diff', float('nan'))
                     dk = r.get('dk_diff', float('nan'))
@@ -582,20 +652,20 @@ def run_all_tests(kernel_filter=None):
                     dq_tol = r.get('dq_tol', 0.01)
                     dk_tol = r.get('dk_tol', 0.01)
                     dv_tol = r.get('dv_tol', 0.01)
-                    # Format properly
-                    if isinstance(dq, (int, float)) and not (dq != dq):  # not NaN
-                        dq_str = f"dQ={dq:.4f}(tol={dq_tol:.4f})"
+                    parts = []
+                    if isinstance(dq, (int, float)) and not (dq != dq):
+                        parts.append(f"dQ={dq:.4f}(tol={dq_tol:.4f})")
                     else:
-                        dq_str = f"dQ={dq}"
+                        parts.append(f"dQ={dq}")
                     if isinstance(dk, (int, float)) and not (dk != dk):
-                        dk_str = f"dK={dk:.4f}(tol={dk_tol:.4f})"
+                        parts.append(f"dK={dk:.4f}(tol={dk_tol:.4f})")
                     else:
-                        dk_str = f"dK={dk}"
+                        parts.append(f"dK={dk}")
                     if isinstance(dv, (int, float)) and not (dv != dv):
-                        dv_str = f"dV={dv:.4f}(tol={dv_tol:.4f})"
+                        parts.append(f"dV={dv:.4f}(tol={dv_tol:.4f})")
                     else:
-                        dv_str = f"dV={dv}"
-                    print(f"  - {r['co_name']}: {dq_str}, {dk_str}, {dv_str}")
+                        parts.append(f"dV={dv}")
+                    print(f"  - {name}: {', '.join(parts)}")
 
 
 def list_tests():
@@ -649,6 +719,16 @@ def main():
         action="store_true",
         help="Show CSV kernel mapping"
     )
+    parser.add_argument(
+        "--large-q",
+        action="store_true",
+        help="Only test large seqlen_q (q=75600, k=256). Default runs both."
+    )
+    parser.add_argument(
+        "--large-k",
+        action="store_true",
+        help="Only test large seqlen_k (q=256, k=75600). Default runs both."
+    )
     
     args = parser.parse_args()
     
@@ -657,7 +737,7 @@ def main():
     elif args.csv:
         show_csv()
     else:
-        run_all_tests(kernel_filter=args.kernel)
+        run_all_tests(kernel_filter=args.kernel, large_q=args.large_q, large_k=args.large_k)
 
 
 if __name__ == "__main__":
