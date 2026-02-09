@@ -98,10 +98,9 @@ jobs:
       - name: Export test file list for this shard as env
         id: set_shard_files
         run: |
-          echo "TRITON_TEST_FILES=$(cat triton_shard_${{ matrix.shard }}.list)" >> $GITHUB_ENV
-          echo "$GITHUB_ENV"
+          echo "TRITON_TEST=$(cat triton_shard_${{ matrix.shard }}.list)" >> $GITHUB_ENV
+          echo "${ TRITON_TEST }"
 
-      # use ${{ env.TRITON_TEST_FILES }} or directly cat triton_shard_${{ matrix.shard }}.list as pytest parameters
       - name: Run the container
         run: |
           set -ex
@@ -122,15 +121,6 @@ jobs:
           -w /workspace \
           --name triton_test \
           ${{ env.DOCKER_IMAGE }}
-
-      - name: Install speedtest-cli and test network
-        run: |
-          set -ex
-          echo "Installing speedtest-cli and testing network..."
-          docker exec \
-          -w /workspace \
-          triton_test \
-          bash -c "pip install speedtest-cli && speedtest-cli --simple" || true
 
       - name: Setup pip config
         run: |
