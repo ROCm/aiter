@@ -40,12 +40,11 @@ union WorkInfo
 inline std::ostream& operator<<(std::ostream& os, const WorkInfo& work)
 {
     auto q_heads = unpack_dword(work.q_head_range);
-    os << std::setw(10) << work.batch_idx << "," << std::setw(10) << work.partial_o_loc
-       << "," << std::setw(10) << work.qo_start << "," << std::setw(10) << work.qo_end
-       << "," << std::setw(10) << work.kv_start << "," << std::setw(10) << work.kv_end
-       << "," << std::setw(10) << work.kv_offset << "," << std::setw(10)
-       << work.q_head_range << "[" << std::get<0>(q_heads) << "," << std::get<1>(q_heads)
-       << ")";
+    os << std::setw(10) << work.batch_idx << "," << std::setw(10) << work.partial_o_loc << ","
+       << std::setw(10) << work.qo_start << "," << std::setw(10) << work.qo_end << ","
+       << std::setw(10) << work.kv_start << "," << std::setw(10) << work.kv_end << ","
+       << std::setw(10) << work.kv_offset << "," << std::setw(10) << work.q_head_range << "["
+       << std::get<0>(q_heads) << "," << std::get<1>(q_heads) << ")";
     return os;
 }
 
@@ -83,8 +82,19 @@ struct QTile
 #endif
 };
 
-struct AttentionPsMetadataV1_2
+struct PsMetadataV1KernelParameter
 {
+    // Outputs
+    int32_t* p_work_indptr;
+    WorkInfo* p_work_info;
+    int32_t* p_reduce_indptr;
+    FinalLoc* p_reduce_final_map;
+    int32_t* p_reduce_partial_map;
+
+    // Inputs
+    const int32_t* p_seqlens_qo_indptr;
+    const int32_t* p_pages_kv_indptr;
+    const int32_t* p_context_lens;
     int32_t batch_size;
     int32_t gqa_ratio;
     int32_t num_heads_k;
@@ -92,19 +102,11 @@ struct AttentionPsMetadataV1_2
     int32_t qlen_granularity;
     int32_t kvlen_granularity;
     int32_t block_size;
-    bool is_causal;
     int32_t available_tgs;
     int32_t num_clusters;
     int32_t tgs_per_cluster;
     int32_t kheads_per_cluster;
-    int32_t* p_seqlens_qo_indptr;
-    int32_t* p_pages_kv_indptr;
-    int32_t* p_context_lens;
-    int32_t* p_work_indptr;
-    WorkInfo* p_work_info;
-    int32_t* p_reduce_indptr;
-    FinalLoc* p_reduce_final_map;
-    int32_t* p_reduce_partial_map;
+    bool is_causal;
 };
 
 void get_ps_metadata_v1(const torch::Tensor& seqlens_qo_indptr, // [batch size + 1]

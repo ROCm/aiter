@@ -57,7 +57,7 @@ void generate_reduce_info(int32_t num_work,
     }
 }
 
-void kn_generate_ps_metadata(const AttentionPsMetadataV1_2& params,
+void kn_generate_ps_metadata(const PsMetadataV1KernelParameter& params,
                              const int32_t cluster_id,
                              int32_t current_work_idx)
 {
@@ -89,7 +89,7 @@ void kn_generate_ps_metadata(const AttentionPsMetadataV1_2& params,
 
         for(int32_t i = 0; i < num_query_tile_ranges; ++i)
         {
-            // ping-pong allocate bwteen head & tail: 0, n-1, 1, n-2, 2, n-3, ...
+            // ping-pong allocate between head & tail: 0, n-1, 1, n-2, 2, n-3, ...
             int32_t idx = (i % 2 == 0) ? (i / 2) : (num_query_tile_ranges - 1 - i / 2);
 
             const int32_t local_qo_start = query_tile_ranges[idx].first;
@@ -134,6 +134,7 @@ void kn_generate_ps_metadata(const AttentionPsMetadataV1_2& params,
     int32_t current_tile_idx  = 0; // index of query_tile
     int32_t current_block_idx = 0; // index of split blocks within a query_tile
     int32_t partial_tile_idx  = 0; // index of partial_tile for reduce
+    int32_t final_tile_idx    = 0; // index of final_tile for reduce
     for(int32_t tg_idx = 0; tg_idx < params.available_tgs; ++tg_idx)
     {
         // dupclicate (parallal)
@@ -167,10 +168,21 @@ void kn_generate_ps_metadata(const AttentionPsMetadataV1_2& params,
                         consuming_blocks = remaining_blocks;
                         // This TG can process all of this qo_tile's remaining_blocks to the causal
                         // boundary
-                        const int32_t partial_o_loc =
-                            (current_block_idx == 0)
-                                ? -1
-                                : (params.qlen_granularity * partial_tile_idx++); // -1 - no split
+                        int32_t partial_o_loc = -1;
+                        if(current_block_idx != 0)
+                        {
+                            const int32_t partial_o_loc =
+                                params.qlen_granularity * partial_tile_idx;
+                            if(k_head_offset == 0)
+                            {
+                                params.p_reduce_indptr[final_tile_idx] += 1;
+                                params.p_reduce_final_map[final_tile_idx] =
+                                    FinalLoc{current_tile.qo_start, current_tile.qo_end};
+                                params.p_reduce_partial_map[partial_tile_idx] = partial_o_loc;
+                                final_tile_idx++;
+                            }
+                            partial_tile_idx++;
+                        }
                         const int32_t kv_end =
                             std::min(kv_start + consuming_blocks,
                                      params.p_pages_kv_indptr[current_tile.batch_idx + 1]);
@@ -190,8 +202,17 @@ void kn_generate_ps_metadata(const AttentionPsMetadataV1_2& params,
                     {
                         // This TG can only process part of this qotile's KV units under
                         // blocks_capacity
-                        consuming_blocks            = blocks_capacity;
-                        const int32_t partial_o_loc = params.qlen_granularity * partial_tile_idx++;
+                        consuming_blocks = blocks_capacity;
+
+                        const int32_t partial_o_loc = params.qlen_granularity * partial_tile_idx;
+                        if(k_head_offset == 0)
+                        {
+                            params.p_reduce_indptr[final_tile_idx] += 1;
+                            params.p_reduce_final_map[final_tile_idx] =
+                                FinalLoc{current_tile.qo_start, current_tile.qo_end};
+                            params.p_reduce_partial_map[partial_tile_idx] = partial_o_loc;
+                        }
+                        partial_tile_idx++;
 
                         const int32_t kv_end =
                             std::min(kv_start + consuming_blocks,
@@ -271,27 +292,27 @@ void get_ps_metadata_v1_2_host(const torch::Tensor& seqlens_qo_indptr, // [batch
         reinterpret_cast<FinalLoc*>(reduce_final_map.data_ptr<int32_t>());
     int32_t* p_reduce_partial_map = reduce_partial_map.data_ptr<int32_t>();
 
-    AttentionPsMetadataV1_2 params = {};
-    params.batch_size              = batch_size;
-    params.gqa_ratio               = gqa_ratio;
-    params.num_heads_k             = num_heads_k;
-    params.qhead_granularity       = qhead_granularity;
-    params.qlen_granularity        = qlen_granularity;
-    params.kvlen_granularity       = kvlen_granularity;
-    params.block_size              = block_size;
-    params.is_causal               = is_causal;
-    params.available_tgs           = available_tgs;
-    params.num_clusters            = num_clusters;
-    params.tgs_per_cluster         = tgs_per_cluster;
-    params.kheads_per_cluster      = kheads_per_cluster;
-    params.p_seqlens_qo_indptr     = p_seqlens_qo_indptr;
-    params.p_pages_kv_indptr       = p_pages_kv_indptr;
-    params.p_context_lens          = p_context_lens;
-    params.p_work_indptr           = p_work_indptr;
-    params.p_work_info             = p_work_info;
-    params.p_reduce_indptr         = p_reduce_indptr;
-    params.p_reduce_final_map      = p_reduce_final_map;
-    params.p_reduce_partial_map    = p_reduce_partial_map;
+    PsMetadataV1KernelParameter params = {};
+    params.batch_size                  = batch_size;
+    params.gqa_ratio                   = gqa_ratio;
+    params.num_heads_k                 = num_heads_k;
+    params.qhead_granularity           = qhead_granularity;
+    params.qlen_granularity            = qlen_granularity;
+    params.kvlen_granularity           = kvlen_granularity;
+    params.block_size                  = block_size;
+    params.is_causal                   = is_causal;
+    params.available_tgs               = available_tgs;
+    params.num_clusters                = num_clusters;
+    params.tgs_per_cluster             = tgs_per_cluster;
+    params.kheads_per_cluster          = kheads_per_cluster;
+    params.p_seqlens_qo_indptr         = p_seqlens_qo_indptr;
+    params.p_pages_kv_indptr           = p_pages_kv_indptr;
+    params.p_context_lens              = p_context_lens;
+    params.p_work_indptr               = p_work_indptr;
+    params.p_work_info                 = p_work_info;
+    params.p_reduce_indptr             = p_reduce_indptr;
+    params.p_reduce_final_map          = p_reduce_final_map;
+    params.p_reduce_partial_map        = p_reduce_partial_map;
 
     // 2. conquer(parallel)
     for(int32_t cluster_id = 0; cluster_id < num_clusters; cluster_id++)
@@ -301,14 +322,20 @@ void get_ps_metadata_v1_2_host(const torch::Tensor& seqlens_qo_indptr, // [batch
         kn_generate_ps_metadata(params, cluster_id, current_work_idx);
     }
 
+    // TODO: fill remaining work_indptr & reduce_indptr
+    // for(int64_t i = final_idx; i < reduce_indptr_len; i++)
+    // {
+    //     reduce_indptr[i] = partial_idx;
+    // }
+
     // TODO: eliminate reduce info
-    const int32_t actual_works = p_work_indptr[work_indptr.numel() - 1];
-    generate_reduce_info(actual_works,
-                         p_work_info,
-                         p_reduce_indptr,
-                         reduce_indptr.numel(),
-                         p_reduce_final_map,
-                         p_reduce_partial_map);
+    // const int32_t actual_works = p_work_indptr[work_indptr.numel() - 1];
+    // generate_reduce_info(actual_works,
+    //                      p_work_info,
+    //                      p_reduce_indptr,
+    //                      reduce_indptr.numel(),
+    //                      p_reduce_final_map,
+    //                      p_reduce_partial_map);
 
 #if PRINT_DBG
     print_metadata(
