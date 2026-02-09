@@ -181,6 +181,7 @@ struct mha_fwd_args
                                            // array [batch + 1]. (Used with padding)
     const void* block_scale_seqstart_q_ptr;
     const void* block_scale_seqstart_k_ptr;
+    const void* seqstart_v_scale_ptr;
     const void* sink_ptr;
 
     ck_tile::index_t seqlen_q;
@@ -201,6 +202,9 @@ struct mha_fwd_args
     ck_tile::index_t stride_bias; // if alibi, b*h need set this to h, 1*h need set this to 0
     ck_tile::index_t stride_randval;
     ck_tile::index_t stride_o;
+    ck_tile::index_t stride_q_descale;
+    ck_tile::index_t stride_k_descale;
+    ck_tile::index_t stride_v_descale;
     ck_tile::index_t nhead_stride_q;
     ck_tile::index_t nhead_stride_k;
     ck_tile::index_t nhead_stride_v;
