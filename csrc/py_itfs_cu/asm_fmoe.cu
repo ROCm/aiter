@@ -154,7 +154,7 @@ class FMoeKernel
         args.ptr_D      = w2.data_ptr();
         if constexpr(std::is_same<T, uint8_t>::value)
         {
-            args.ptr_XQ  = input_dqn.value().data_ptr();
+            args.ptr_XQ  = input_dqn.has_value() ? input_dqn.value().data_ptr() : nullptr;
             args.ptr_GUQ = w1_dqn.value().data_ptr();
             args.ptr_DQ  = w2_dqn.value().data_ptr();
             args.ptr_SMQ = w2_smooth_qnt.has_value() ? w2_smooth_qnt.value().data_ptr() : nullptr;
@@ -865,3 +865,61 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor& out,               // [token_cnt, d
     else
         TORCH_CHECK(false, __func__, "Unsupported the type for fmoe_fp8_blockscale_g1u1");
 }
+
+
+void fmoe_fp8_blockscale_with_xquant_g1u1(torch::Tensor& out,               // [token_cnt, dim]
+    torch::Tensor& input,             // [token_cnt, dim] M,K
+    torch::Tensor& gate,              // [expert, inter_dim*2, dim] N,K
+    torch::Tensor& down,              // [expert, dim, inter_dim]
+    torch::Tensor& sorted_token_ids,  // [max_num_tokens_padded]
+    torch::Tensor& sorted_weights,    // [max_num_tokens_padded]
+    torch::Tensor& sorted_expert_ids, // [max_num_m_blocks]
+    torch::Tensor& num_valid_ids,     // [1]
+    uint32_t topk,                    //
+    torch::Tensor& input_scale,       // [expert, 1, dim]
+    torch::Tensor& fc1_scale,         // [expert, 1, inter_dim]
+    torch::Tensor& fc2_scale,         // [expert, 1, dim]
+    std::string& kernel_name,
+    int fc_scale_blkn,
+    int fc_scale_blkk,
+    std::optional<torch::Tensor> fc2_smooth_scale,
+    ActivationType activation)
+{
+    FMoeKernel* impl_ptr     = nullptr;
+    CFG* config_map          = nullptr;
+    uint32_t num_cu          = get_num_cu_func();
+    int inter_dim            = down.size(2);
+    int sub_X_cnt            = sorted_expert_ids.size(0);
+    const char* enable_vskip = std::getenv("AITER_ENABLE_VSKIP");
+
+    if(out.dtype() == at::ScalarType::BFloat16 && inter_dim % 128 == 0 && fc_scale_blkn == 128 &&
+        fc_scale_blkk == 128)
+    {
+        if(activation == ActivationType::Silu)
+            config_map = &cfg_fmoe_bf16_blockscaleBf16_g1u1_silu;
+        else if(activation == ActivationType::Gelu)
+            config_map = &cfg_fmoe_bf16_blockscaleBf16_g1u1_gelu;
+        else
+            TORCH_CHECK( false, __func__, "Unsupported activation type for fmoe_bf16_blockscale_g1u1");
+
+        impl_ptr = get_heuristic_kernel(inter_dim, sorted_expert_ids.size(0), config_map, 0, kernel_name);
+        get_heuristic_kernel(inter_dim, sorted_expert_ids.size(0), config_map, 0, kernel_name);
+        impl_ptr->launch_kernel<uint8_t, uint16_t, false>(out,
+                                input,
+                                gate,
+                                down,
+                                sorted_token_ids,
+                                sorted_weights,
+                                sorted_expert_ids,
+                                num_valid_ids,
+                                topk,
+                                // quant args
+                                std::nullopt,
+                                fc1_scale,
+                                fc2_scale,
+                                fc2_smooth_scale);
+    }
+    else
+       TORCH_CHECK(false, __func__, "Unsupported the type for fmoe_bf16_blockscale_g1u1");
+}
+

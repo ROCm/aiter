@@ -1252,6 +1252,25 @@ namespace py = pybind11;
           py::arg("fc_scale_blkk")    = 128,                                   \
           py::arg("fc2_smooth_scale") = std::nullopt,                          \
           py::arg("activation")       = ActivationType::Silu);                       \
+    m.def("fmoe_fp8_blockscale_with_xquant_g1u1",                                          \
+          &fmoe_fp8_blockscale_with_xquant_g1u1,                                           \
+          py::arg("out"),                                                      \
+          py::arg("input"),                                                    \
+          py::arg("gate"),                                                     \
+          py::arg("down"),                                                     \
+          py::arg("sorted_token_ids"),                                         \
+          py::arg("sorted_weights"),                                           \
+          py::arg("sorted_expert_ids"),                                        \
+          py::arg("num_valid_ids"),                                            \
+          py::arg("topk"),                                                     \
+          py::arg("input_scale"),                                              \
+          py::arg("fc1_scale"),                                                \
+          py::arg("fc2_scale"),                                                \
+          py::arg("kernel_name"),                                              \
+          py::arg("fc_scale_blkn")    = 128,                                   \
+          py::arg("fc_scale_blkk")    = 128,                                   \
+          py::arg("fc2_smooth_scale") = std::nullopt,                          \
+          py::arg("activation")       = ActivationType::Silu);                       \
     m.def("moe_stage1_g1u1",                                                   \
           &moe_stage1_g1u1,                                                    \
           py::arg("input"),                                                    \
