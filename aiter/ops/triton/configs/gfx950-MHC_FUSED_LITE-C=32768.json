@@ -6,8 +6,7 @@
         "NUM_KSPLIT": 8,
         "num_warps": 4,
         "num_stages": 1,
-        "waves_per_eu": 0,
-        "HRES_OP": 1
+        "waves_per_eu": 0
     },
     "M_LEQ_2048": {
         "BLOCK_M": 64,
@@ -16,8 +15,7 @@
         "NUM_KSPLIT": 8,
         "num_warps": 4,
         "num_stages": 1,
-        "waves_per_eu": 0,
-        "HRES_OP": 1
+        "waves_per_eu": 0
     },
     "M_LEQ_4096": {
         "BLOCK_M": 128,
@@ -26,8 +24,7 @@
         "NUM_KSPLIT": 8,
         "num_warps": 4,
         "num_stages": 1,
-        "waves_per_eu": 2,
-        "HRES_OP": 1
+        "waves_per_eu": 2
     },
     "M_LEQ_8192": {
         "BLOCK_M": 128,
@@ -36,8 +33,7 @@
         "NUM_KSPLIT": 8,
         "num_warps": 4,
         "num_stages": 1,
-        "waves_per_eu": 2,
-        "HRES_OP": 1
+        "waves_per_eu": 2
     },
     "M_LEQ_16384": {
         "BLOCK_M": 128,
@@ -46,8 +42,7 @@
         "NUM_KSPLIT": 2,
         "num_warps": 4,
         "num_stages": 1,
-        "waves_per_eu": 2,
-        "HRES_OP": 1
+        "waves_per_eu": 2
     },
     "any": {
         "BLOCK_M": 128,
@@ -56,7 +51,6 @@
         "NUM_KSPLIT": 2,
         "num_warps": 4,
         "num_stages": 1,
-        "waves_per_eu": 2,
-        "HRES_OP": 1
+        "waves_per_eu": 2
     }
 }

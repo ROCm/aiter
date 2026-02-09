@@ -175,7 +175,6 @@ def fused_mhc(
     config = dict(config)  # Always copy to avoid mutating LRU cache
     # print(config)
     num_ksplit = config.get("NUM_KSPLIT", 1)
-    hres_op = config.pop("HRES_OP", 0)
     BLOCK_M = config.pop("BLOCK_M", 64 if M >= 64 else 32)
     # BLOCK_N: Column tile size (must be power of 2 for Triton arange)
     if hres_lite_mode:        
@@ -368,7 +367,6 @@ def fused_mhc(
             BLOCK_N=BLOCK_N,
             ACTUAL_KSPLIT=actual_ksplit,
             HRES_LITE_MODE=hres_lite_mode,
-            HRES_OP=hres_op,  # Use the value popped earlier from config
             **config,
         )
     else:
@@ -418,7 +416,6 @@ def fused_mhc(
             BLOCK_N=BLOCK_N,
             BLOCK_K=BLOCK_K,
             HRES_LITE_MODE=hres_lite_mode,
-            HRES_OP=hres_op,  # Use the value popped earlier from config
             **config,
         )
 
