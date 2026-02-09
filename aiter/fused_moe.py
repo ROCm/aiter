@@ -1981,6 +1981,7 @@ def flydsl_moe_stage1(
             use_cshuffle_epilog=bool(stage1_cshuffle),
         )
         _FLYDSL_MOE_GEMM1_CACHE[key1] = exe1
+    stream_ptr = torch.cuda.current_stream().cuda_stream
     exe1(
         out_kernel,
         x_q,
@@ -1995,6 +1996,7 @@ def flydsl_moe_stage1(
         inter_dim,
         model_dim,
         int(blocks),
+        stream_ptr,
     )
     if out_kernel is not out:
         if keep_fp16_for_stage2:
@@ -2231,6 +2233,7 @@ def flydsl_moe_stage2(
         # Check if exe2 is a wrapper (REDUCE mode) or raw kernel (ATOMIC mode)
         # The wrapper expects valid_mask, but raw kernel does not
         # aiter.logger.info(f"valid_mask: {valid_mask}")
+        stream_ptr = torch.cuda.current_stream().cuda_stream
         if mode_val == MoeGemm2Mode.REDUCE:
             # aiter.logger.info(f"use Reduce MODE")
             exe2(
@@ -2248,6 +2251,7 @@ def flydsl_moe_stage2(
                 inter_dim,  # Intermediate dimension
                 blocks,  # Number of expert blocks
                 valid_mask,  # Valid mask for EP mode (or None)
+                stream_ptr,
             )
         else:
             # ATOMIC mode: exe2 is raw compiled kernel
@@ -2266,6 +2270,7 @@ def flydsl_moe_stage2(
                 model_dim,  # Model dimension
                 inter_dim,  # Intermediate dimension
                 blocks,  # Number of expert blocks
+                stream_ptr,
             )
 
         # Handle optional fp16->bf16 conversion if scratch buffer was used
