@@ -124,6 +124,8 @@ def unified_attention(
     # Optional tensor for sinks
     sinks=None,
     use_native_fp4=None,
+    use_hadamard_rotation=None,
+    hadamard_size=32,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -134,6 +136,12 @@ def unified_attention(
     # Read MXFP4 option from environment variable if not explicitly provided
     if use_native_fp4 is None:
         use_native_fp4 = int(os.getenv('MXFP4_OPTION', '0'))
+    
+    # Read Hadamard rotation option from environment variable if not explicitly provided
+    if use_hadamard_rotation is None:
+        use_hadamard_rotation = int(os.getenv('HADAMARD_ROTATION', '0')) > 0
+    else:
+        use_hadamard_rotation = bool(use_hadamard_rotation)
 
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
@@ -198,6 +206,27 @@ def unified_attention(
         if use_native_fp4 > 0 and not mxfp4_compatible:
             print(f"Warning: MXFP4 disabled due to incompatible HEAD_SIZE_PADDED={head_size_padded}. "
                   f"MXFP4 requires HEAD_SIZE_PADDED >= 32 and divisible by 32. Falling back to original.")
+        
+        # Generate Hadamard matrix if needed
+        hadamard_matrix = None
+        if use_hadamard_rotation and effective_use_native_fp4 > 0:
+            # Import the generator from the kernel module
+            from aiter.ops.triton._triton_kernels.attention.unified_attention import generate_hadamard_matrix
+            
+            # Generate or retrieve cached Hadamard matrix
+            effective_hadamard_size = max(hadamard_size, head_size_padded)
+            # Ensure it's a power of 2
+            effective_hadamard_size = triton.next_power_of_2(effective_hadamard_size)
+            
+            try:
+                hadamard_matrix = generate_hadamard_matrix(effective_hadamard_size, device=q.device)
+                # Trim to head_size_padded if needed
+                if hadamard_matrix.shape[0] > head_size_padded:
+                    hadamard_matrix = hadamard_matrix[:head_size_padded, :head_size_padded].contiguous()
+            except Exception as e:
+                print(f"Warning: Failed to generate Hadamard matrix: {e}. Disabling Hadamard rotation.")
+                use_hadamard_rotation = False
+                hadamard_matrix = None
 
         kernel_unified_attention_2d[
             (
@@ -252,6 +281,9 @@ def unified_attention(
             fp4_scale_ptr=None,
             test_id=0,
             PACK_ALONG_K=True,
+            use_hadamard_rotation=use_hadamard_rotation and hadamard_matrix is not None,
+            hadamard_matrix_ptr=hadamard_matrix if hadamard_matrix is not None else None,
+            HADAMARD_SIZE=hadamard_matrix.shape[0] if hadamard_matrix is not None else hadamard_size,
             **config,
         )
 

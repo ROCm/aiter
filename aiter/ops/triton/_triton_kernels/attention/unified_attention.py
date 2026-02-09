@@ -10,6 +10,39 @@ import os
 e5m2_type, e4m3_type = get_fp8_dtypes()
 float8_info = torch.finfo(e4m3_dtype)
 
+# Global cache for Hadamard matrices
+_hadamard_cache = {}
+
+
+def generate_hadamard_matrix(n, device='cuda'):
+    """
+    Generate a Hadamard matrix of size n x n.
+    Uses Sylvester's construction method.
+    n must be a power of 2.
+    """
+    if n in _hadamard_cache and _hadamard_cache[n].device == torch.device(device):
+        return _hadamard_cache[n]
+    
+    if n & (n - 1) != 0:
+        raise ValueError(f"Hadamard matrix size must be a power of 2, got {n}")
+    
+    # Start with H1 = [[1]]
+    H = torch.tensor([[1.0]], dtype=torch.float32, device=device)
+    
+    # Build up using Sylvester construction: H_2n = [[H_n, H_n], [H_n, -H_n]]
+    while H.shape[0] < n:
+        H = torch.cat([
+            torch.cat([H, H], dim=1),
+            torch.cat([H, -H], dim=1)
+        ], dim=0)
+    
+    # Normalize by 1/sqrt(n) to make it orthogonal
+    H = H / (n ** 0.5)
+    
+    # Cache it
+    _hadamard_cache[n] = H
+    return H
+
 
 @triton.jit
 def fast_exp(x):
@@ -156,6 +189,42 @@ def _can_use_mxfp4(TILE_SIZE: tl.constexpr, HEAD_SIZE_PADDED: tl.constexpr) -> t
 
 
 @triton.jit
+def _apply_hadamard_rotation(
+    tensor,
+    hadamard_ptr,
+    HADAMARD_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+):
+    """
+    Apply Hadamard rotation to a tensor.
+    tensor: (M, HEAD_SIZE_PADDED)
+    hadamard_ptr: pointer to Hadamard matrix (HEAD_SIZE_PADDED, HEAD_SIZE_PADDED)
+    Returns: rotated tensor (M, HEAD_SIZE_PADDED)
+    """
+    M: tl.constexpr = tensor.shape[0]
+    
+    # Load Hadamard matrix for the head dimension
+    offs_d1 = tl.arange(0, HEAD_SIZE_PADDED)
+    offs_d2 = tl.arange(0, HEAD_SIZE_PADDED)
+    
+    # For efficiency, we'll apply rotation in chunks if needed
+    # For now, assuming HEAD_SIZE_PADDED <= HADAMARD_SIZE
+    if HEAD_SIZE_PADDED > HADAMARD_SIZE:
+        # If head size is larger than Hadamard size, apply block-wise
+        # This is a fallback - ideally HADAMARD_SIZE should be >= HEAD_SIZE_PADDED
+        return tensor
+    
+    # Load Hadamard matrix: H[HEAD_SIZE_PADDED, HEAD_SIZE_PADDED]
+    H_offset = offs_d1[:, None] * HEAD_SIZE_PADDED + offs_d2[None, :]
+    H = tl.load(hadamard_ptr + H_offset)
+    
+    # Apply rotation: result = tensor @ H
+    rotated = tl.dot(tensor, H)
+    
+    return rotated
+
+
+@triton.jit
 def kernel_unified_attention_2d(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
     query_ptr,  # [num_tokens, num_query_heads, head_size]
@@ -209,6 +278,9 @@ def kernel_unified_attention_2d(
     fp4_scale_ptr = None,
     test_id: tl.int64 = 0,
     PACK_ALONG_K: tl.constexpr = True,
+    use_hadamard_rotation: tl.constexpr = False,  # bool: enable Hadamard rotation for MXFP4
+    hadamard_matrix_ptr = None,  # pointer to Hadamard matrix [HEAD_SIZE_PADDED, HEAD_SIZE_PADDED]
+    HADAMARD_SIZE: tl.constexpr = 32,  # int: size of Hadamard matrix (default 32x32)
 ):
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
@@ -270,17 +342,23 @@ def kernel_unified_attention_2d(
     USE_MXFP4: tl.constexpr = use_native_fp4 > 0 and _can_use_mxfp4(TILE_SIZE, HEAD_SIZE_PADDED)
     
     if USE_MXFP4:
-        Q1 = tl.full(shape=Q.shape, value=1, dtype=tl.int32)
+        # Apply Hadamard rotation if enabled
+        if use_hadamard_rotation and hadamard_matrix_ptr is not None:
+            Q_rotated = _apply_hadamard_rotation(Q, hadamard_matrix_ptr, HADAMARD_SIZE, HEAD_SIZE_PADDED)
+        else:
+            Q_rotated = Q
+        
+        Q1 = tl.full(shape=Q_rotated.shape, value=1, dtype=tl.int32)
         
         if use_native_fp4 == 1:
-            q_fp4, scale_q = _compute_quant_and_scale(Q, Q1, tl.uint8, 2)
+            q_fp4, scale_q = _compute_quant_and_scale(Q_rotated, Q1, tl.uint8, 2)
         else:
             # Smoothed version: subtract average
-            q_avg = tl.sum(Q, 1) / HEAD_SIZE_PADDED
+            q_avg = tl.sum(Q_rotated, 1) / HEAD_SIZE_PADDED
             q_avg = tl.reshape(q_avg, (BLOCK_M, 1))
             ones = tl.full((1, HEAD_SIZE_PADDED), 1.0, dtype=tl.float32)
             q_avg = tl.dot(q_avg, ones)
-            Qr = Q - q_avg
+            Qr = Q_rotated - q_avg
             q_fp4, scale_q = _compute_quant_and_scale(Qr, Q1, tl.uint8, 2)
     # >>>>>>> End of Q-MXFP4 <<<<<<<<
 
@@ -425,8 +503,14 @@ def kernel_unified_attention_2d(
         
         # ****** QK-MXFP4 ******
         if USE_MXFP4:
-            K1 = tl.full(shape=K.shape, value=1, dtype=tl.int32)
-            kt = tl.trans(K)
+            # Apply Hadamard rotation to K if enabled
+            if use_hadamard_rotation and hadamard_matrix_ptr is not None:
+                K_rotated = _apply_hadamard_rotation(K, hadamard_matrix_ptr, HADAMARD_SIZE, HEAD_SIZE_PADDED)
+            else:
+                K_rotated = K
+            
+            K1 = tl.full(shape=K_rotated.shape, value=1, dtype=tl.int32)
+            kt = tl.trans(K_rotated)
             k1t = tl.trans(K1)
             
             if use_native_fp4 >= 2:
@@ -512,13 +596,19 @@ def kernel_unified_attention_2d(
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         # ****** MXFP4 PV ******
         if USE_MXFP4 and use_native_fp4 >= 3:
+            # Apply Hadamard rotation to V if enabled
+            if use_hadamard_rotation and hadamard_matrix_ptr is not None:
+                V_rotated = _apply_hadamard_rotation(V, hadamard_matrix_ptr, HADAMARD_SIZE, HEAD_SIZE_PADDED)
+            else:
+                V_rotated = V
+            
             # PV quant to fp4 - note: this can increase error significantly
             p_zoom_scale: tl.constexpr = 200.0
             P1 = tl.full(shape=P.shape, value=1, dtype=tl.int32)
             Pz = P * p_zoom_scale
             p_fp4, scale_p = _compute_quant_and_scale(Pz, P1, tl.uint8, 2)
             
-            Vt = tl.trans(V)
+            Vt = tl.trans(V_rotated)
             V1 = tl.full(shape=Vt.shape, value=1, dtype=tl.int32)
             v_fp4, scale_v = _compute_quant_and_scale(Vt, V1, tl.uint8, 2)
             
@@ -537,6 +627,13 @@ def kernel_unified_attention_2d(
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
     one_over_L = 1.0 / L[:, None]
     acc = acc * one_over_L
+    
+    # Apply inverse Hadamard rotation if enabled (only needed for PV quantization)
+    if USE_MXFP4 and use_native_fp4 >= 3 and use_hadamard_rotation and hadamard_matrix_ptr is not None:
+        # For orthogonal Hadamard matrices, inverse = transpose
+        # Since our Hadamard matrix is symmetric, H^-1 = H
+        acc = _apply_hadamard_rotation(acc, hadamard_matrix_ptr, HADAMARD_SIZE, HEAD_SIZE_PADDED)
+    
     if USE_FP8:
         acc = acc * tl.load(out_scale)
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
