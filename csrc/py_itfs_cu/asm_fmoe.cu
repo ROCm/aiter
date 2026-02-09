@@ -154,7 +154,7 @@ class FMoeKernel
         args.ptr_D      = w2.data_ptr();
         if constexpr(std::is_same<T, uint8_t>::value)
         {
-            args.ptr_XQ  = input_dqn.value().data_ptr();
+            args.ptr_XQ  = input_dqn.has_value() ? input_dqn.value().data_ptr() : nullptr;
             args.ptr_GUQ = w1_dqn.value().data_ptr();
             args.ptr_DQ  = w2_dqn.value().data_ptr();
             args.ptr_SMQ = w2_smooth_qnt.has_value() ? w2_smooth_qnt.value().data_ptr() : nullptr;
@@ -837,10 +837,12 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor& out,               // [token_cnt, d
     if(out.dtype() == at::ScalarType::BFloat16 && inter_dim % 128 == 0 && fc_scale_blkn == 128 &&
        fc_scale_blkk == 128)
     {
-        if(activation == ActivationType::Silu)
-            config_map = &cfg_fmoe_bf16_blockscaleFp8_g1u1_silu;
+
+	bool xquant = (input.scalar_type() == at::ScalarType::BFloat16);
+	if(activation == ActivationType::Silu)
+		config_map = xquant ? &cfg_fmoe_bf16_blockscaleBf16_g1u1_silu : &cfg_fmoe_bf16_blockscaleFp8_g1u1_silu;
         else if(activation == ActivationType::Gelu)
-            config_map = &cfg_fmoe_bf16_blockscaleFp8_g1u1_gelu;
+		config_map = xquant ? &cfg_fmoe_bf16_blockscaleBf16_g1u1_gelu : &cfg_fmoe_bf16_blockscaleFp8_g1u1_gelu;
         else
             TORCH_CHECK(
                 false, __func__, "Unsupported activation type for fmoe_fp8_blockscale_g1u1");
