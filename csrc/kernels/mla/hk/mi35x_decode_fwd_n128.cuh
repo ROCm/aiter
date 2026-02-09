@@ -235,6 +235,8 @@ class QManagerV1
     }
 };
 
+// Lanes loads Q from VRAM by row so as to fullfill cache line. Then, lanes exchange data via
+// ds_bpermute_b32.
 template <typename T>
 class QManagerV2
 {
@@ -389,6 +391,7 @@ class QManagerV2
     }
 };
 
+// Lanes loads Q from VRAM by row so as to fullfill cache line. Then, lanes exchange data via LDS.
 template <typename T>
 class QManagerV3
 {
@@ -517,6 +520,7 @@ class QManagerV3
     }
 };
 
+// Compared with V3, V4 uses LDS async load.
 template <typename T>
 class QManagerV4
 {
@@ -688,6 +692,7 @@ class QManagerV4
     }
 };
 
+// Compared with V4, V5 uses 3 LDS buffers to load Q to reduce barrier & waitcnt time.
 template <typename T>
 class QManagerV5 : public QManagerV4<T>
 {
