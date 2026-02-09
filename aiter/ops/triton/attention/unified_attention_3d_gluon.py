@@ -11,12 +11,193 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention_gluon import (
     gluon_reduce_segments,
 )
 
+from triton.experimental import gluon
+import triton.experimental.gluon.language as ttgl
+
+
+def make_layout_3d(
+    num_warps: int,
+    BLOCK_M: int,
+    TILE_SIZE: int,
+    HEAD_SIZE_PADDED: int,
+    use_tdm: bool,
+    use_swizzle: bool = False,
+):
+    """
+    BLOCK_M are usually 16 (QH per KVH are usually <= 16)
+    TILE_SIZE are usually 16 or 64
+    HEAD_SIZE_PADDED are usually 64 or 128
+
+    for Q @ K^T (M x N x K = BLOCK_M x TILE_SIZE x HEAD_SIZE_PADDED),
+    the M-dim can usually be completed by 1 wave, while N-dim requires multiple waves and/or cycles,
+    so the best choice for warp_bases is:
+        [[0, 1]]         for num_warps = 2, and
+
+            w0 w1 ...
+            ...
+
+        [[0, 1], [0, 2]] for num_warps = 4
+
+            w0 w1 w2 w3 ...
+            ...
+
+    for P @ V (M x N x K = BLOCK_M x HEAD_SIZE_PADDED x TILE_SIZE),
+    the M-dim can usually be completed by 1 wave, while N-dim requires multiple waves and/or cycles,
+    so the best choice for warp_bases is the same as Q @ K^T
+
+    some examples for warp_bases for num_warps = 4
+
+        warp_bases=[[0, 1], [1, 0]]
+        w0 w1 ...
+        w2 w3 ...
+        ...
+
+        warp_bases=[[1, 0], [0, 1]]
+        w0 w2 ...
+        w1 w3 ...
+        ...
+
+        warp_bases=[[0, 1], [0, 2]]
+        w0 w1 w2 w3 ...
+        ...
+
+    therefore, we construct WMMA layout with the following heuristics
+    """
+
+    # ctas_per_cga = [1, 1]
+    # cga_layout_Q = make_cga_layout(
+    #     ctasPerCga=ctas_per_cga,
+    #     ctaSplitNum=[ctas_per_cga[0], 1],
+    #     ctaOrder=[0, 1]
+    # )
+    # cga_layout_K = make_cga_layout(
+    #     ctasPerCga=ctas_per_cga,
+    #     ctaSplitNum=[1, ctas_per_cga[1]],
+    #     ctaOrder=[0, 1]
+    # )
+    # cga_layout_S = make_cga_layout(
+    #     ctasPerCga=ctas_per_cga,
+    #     ctaSplitNum=[ctas_per_cga[0], ctas_per_cga[1]],
+    #     ctaOrder=[0, 1]
+    # )
+
+    warp_bases = [(0, 1 << i) for i in range(int(math.log2(num_warps)))]
+
+    QK_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDWMMALayout(
+        version=3,
+        transposed=True,
+        warp_bases=warp_bases,
+        reg_bases=[],
+        instr_shape=[16, 16, 32],
+    )
+
+    PV_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDWMMALayout(
+        version=3,
+        transposed=True,
+        warp_bases=warp_bases,
+        reg_bases=[],
+        instr_shape=[16, 16, 32],
+    )
+
+    Q_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+        operand_index=0, parent=QK_WMMA_LAYOUT, k_width=8
+    )
+    K_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+        operand_index=1, parent=QK_WMMA_LAYOUT, k_width=8
+    )
+    P_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+        operand_index=0, parent=PV_WMMA_LAYOUT, k_width=8
+    )
+    V_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+        operand_index=1, parent=PV_WMMA_LAYOUT, k_width=8
+    )
+
+    if use_tdm or not use_swizzle:
+        Q_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
+            interval_padding_pairs=[[HEAD_SIZE_PADDED, 8]],
+            shape=[BLOCK_M, HEAD_SIZE_PADDED],
+            order=[1, 0],
+        )
+    else:
+        Q_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
+            vec=8, per_phase=1, max_phase=8, order=[1, 0]
+        )
+
+    if use_tdm or not use_swizzle:
+        K_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
+            interval_padding_pairs=[[HEAD_SIZE_PADDED, 8]],
+            shape=(
+                [TILE_SIZE, HEAD_SIZE_PADDED]
+                if use_tdm
+                else [HEAD_SIZE_PADDED, TILE_SIZE]
+            ),
+            order=[1, 0],
+        )
+    else:
+        K_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
+            vec=8, per_phase=1, max_phase=8, order=[0, 1]
+        )
+
+    if use_tdm or not use_swizzle:
+        V_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
+            interval_padding_pairs=[[HEAD_SIZE_PADDED, 8]],
+            shape=[TILE_SIZE, HEAD_SIZE_PADDED],
+            order=[1, 0],
+        )
+    else:
+        V_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
+            vec=1, per_phase=1, max_phase=1, order=[1, 0]
+        )
+
+    Q_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
+        size_per_thread=[1, 8],
+        threads_per_warp=[4, 8],
+        warps_per_cta=[num_warps, 1],
+        order=[1, 0],
+    )
+    K_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
+        size_per_thread=[8, 1],
+        threads_per_warp=[8, 4],
+        warps_per_cta=[1, num_warps],
+        order=[0, 1],
+    )
+
+    return {
+        "QK_WMMA_LAYOUT": QK_WMMA_LAYOUT,
+        "PV_WMMA_LAYOUT": PV_WMMA_LAYOUT,
+        "Q_DOT_LAYOUT": Q_DOT_LAYOUT,
+        "K_DOT_LAYOUT": K_DOT_LAYOUT,
+        "P_DOT_LAYOUT": P_DOT_LAYOUT,
+        "V_DOT_LAYOUT": V_DOT_LAYOUT,
+        "Q_SHARED_LAYOUT": Q_SHARED_LAYOUT,
+        "K_SHARED_LAYOUT": K_SHARED_LAYOUT,
+        "V_SHARED_LAYOUT": V_SHARED_LAYOUT,
+        "Q_BLOCKED_LAYOUT": Q_BLOCKED_LAYOUT,
+        "K_BLOCKED_LAYOUT": K_BLOCKED_LAYOUT,
+    }
+
 
 def select_3d_config(
-    head_size, block_size, element_size, max_seqlen_k, target_num_prgms, num_2d_prgms
+    head_size,
+    block_size,
+    element_size,
+    max_seqlen_k,
+    target_num_prgms,
+    num_2d_prgms,
+    BLOCK_M: int,
+    HEAD_SIZE_PADDED: int,
+    use_tdm: bool = False,
+    use_async: bool = True,
+    use_swizzle: bool = True,
 ):
+    """
+    if use_tdm is True, use_async and use_swizzle will be ignored
+    if use_async is True, use_swizzle will be forced to True
+    if use_tdm and use_async are False, num_stages will be ignored, use_swizzle determines whether to use PaddedSharedLayout or SwizzledSharedLayout
+    """
     reduce_num_warps = 2
     attn_warps = 2
+    # attn_warps = 4
     TILE_SIZE = block_size
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     num_segments = math.ceil(target_num_prgms / num_2d_prgms)
@@ -24,15 +205,45 @@ def select_3d_config(
     num_segments = min(num_segments, 128)
     MIN_SEGMENTS = 16 if TILE_SIZE <= 16 else 8
     num_segments = max(num_segments, MIN_SEGMENTS)
+
+    attn_stages = 2 if num_segments > 1 else 1
+
     if num_segments == MIN_SEGMENTS:
         reduce_num_warps = 1
+
+    if use_tdm:
+        # With TDM async_copy pipelined, use_swizzle will be ignored (padded smem layout is used always)
+        attn_impl = gluon_kernel_unified_attention_3d_tdm_pipelined
+        layouts = make_layout_3d(
+            attn_warps, BLOCK_M, TILE_SIZE, HEAD_SIZE_PADDED, use_tdm, use_swizzle=False
+        )
+    elif use_async:
+        # With async_copy pipelined, use_swizzle should always be True
+        attn_impl = gluon_kernel_unified_attention_3d_pipelined
+        layouts = make_layout_3d(
+            attn_warps, BLOCK_M, TILE_SIZE, HEAD_SIZE_PADDED, use_tdm, use_swizzle=True
+        )
+    else:
+        # Baseline kernel, num_stages does not matter, use_swizzle can be either True or False
+        attn_impl = gluon_kernel_unified_attention_3d
+        layouts = make_layout_3d(
+            attn_warps,
+            BLOCK_M,
+            TILE_SIZE,
+            HEAD_SIZE_PADDED,
+            use_tdm,
+            use_swizzle=use_swizzle,
+        )
+
     attn_config = {
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": attn_warps,
-        "num_stages": 1,
+        "num_stages": attn_stages,
         "waves_per_eu": 2,
+        **layouts,
     }
+
     reduce_config = {
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
@@ -40,7 +251,8 @@ def select_3d_config(
         "num_stages": 1,
         "waves_per_eu": 2,
     }
-    return attn_config, reduce_config
+
+    return attn_config, reduce_config, attn_impl
 
 
 def use_2d_kernel(
@@ -81,6 +293,7 @@ def unified_attention(
     qq_bias=None,
     # Optional tensor for sinks
     sinks=None,
+    ver=0,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -132,13 +345,40 @@ def unified_attention(
     ):
         raise NotImplementedError("2D Gluon Unified Attention is not yet implemented.")
     else:
-        attn_config, reduce_config = select_3d_config(
+        head_size_padded = triton.next_power_of_2(head_size)
+        if ver == 3:
+            # TDM:
+            use_tdm = True
+            use_async = None
+            use_swizzle = None
+        elif ver == 2:
+            # ASYNC
+            use_tdm = False
+            use_async = True
+            use_swizzle = None
+        elif ver == 1:
+            # Baseline swizzle
+            use_tdm = False
+            use_async = False
+            use_swizzle = True
+        elif ver == 0:
+            # Baseline pad
+            use_tdm = False
+            use_async = False
+            use_swizzle = False
+
+        attn_config, reduce_config, attn_impl = select_3d_config(
             head_size,
             block_size,
             q.element_size(),
             max_seqlen_k,
             target_num_prgms,
             num_2d_prgms,
+            BLOCK_M,
+            head_size_padded,
+            use_tdm,
+            use_async,
+            use_swizzle,
         )
         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
         segm_output = torch.empty(
@@ -163,21 +403,15 @@ def unified_attention(
             dtype=torch.float32,
             device=q.device,
         )
-        attn_config["num_stages"] = 2
 
-        # Baseline kernel, num_stages does not matter
-        # impl = gluon_kernel_unified_attention_3d
+        # for parm, val in attn_config.items():
+        #     print(parm, val)
+        print(attn_impl.__name__)
+        print(attn_config["Q_SHARED_LAYOUT"])
+        print(attn_config["K_SHARED_LAYOUT"])
+        print(attn_config["V_SHARED_LAYOUT"])
 
-        # With async_copy pipelined
-        # impl = gluon_kernel_unified_attention_3d_pipelined
-
-        # With TDM async_copy pipelined
-        impl = gluon_kernel_unified_attention_3d_tdm_pipelined
-        attn_config["num_warps"] = 4
-
-        print(attn_config)
-
-        impl[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
+        attn_impl[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,
             segm_expsum_ptr=segm_expsum,
@@ -203,7 +437,7 @@ def unified_attention(
             NUM_BLOCKS=num_blocks,
             BLOCK_SIZE=block_size,
             HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+            HEAD_SIZE_PADDED=head_size_padded,
             USE_ALIBI_SLOPES=use_alibi_slopes,
             USE_QQ_BIAS=use_qq_bias,
             USE_SOFTCAP=(softcap > 0),

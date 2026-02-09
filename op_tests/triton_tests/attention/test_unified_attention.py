@@ -113,6 +113,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize("soft_cap", [None])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("q_dtype", QDTYPES)
+@pytest.mark.parametrize("ver", [0, 1, 2, 3])
 @torch.inference_mode()
 def test_triton_unified_attn(
     seq_lens: list[tuple[int, int]],
@@ -124,6 +125,7 @@ def test_triton_unified_attn(
     soft_cap: Optional[float],
     num_blocks: int,
     q_dtype: Optional[torch.dtype],
+    ver: Optional[int],
 ) -> None:
     if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
         pytest.skip("block size must be at least 32 for fp8")
@@ -184,7 +186,7 @@ def test_triton_unified_attn(
 
     print()
 
-    def unified_attention_impl(impl, output_impl):
+    def unified_attention_impl(impl, output_impl, **kwargs):
         impl(
             q=maybe_quantized_query,
             k=maybe_quantized_key_cache,
@@ -203,12 +205,13 @@ def test_triton_unified_attn(
             k_descale=k_descale,
             v_descale=v_descale,
             sinks=sinks,
+            **kwargs,
         )
 
     print(f"Computing Triton")
     unified_attention_impl(unified_attention, output)
     print(f"Computing Gluon")
-    unified_attention_impl(gluon_unified_attention, output_gluon)
+    unified_attention_impl(gluon_unified_attention, output_gluon, ver=ver)
 
     print(f"Computing Reference")
     ref_output = ref_paged_attn(
