@@ -46,7 +46,7 @@ def mhc_torch(
     n: int,
     eps: float = 1e-6,
     return_with_sinkhorn: bool = True,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     PyTorch reference implementation of mHC projection mapping (Eq 14-19).
 
@@ -59,18 +59,6 @@ def mhc_torch(
     - Eq 17: H^pre = σ(H^pre) (sigmoid activation for pre-stream)
     - Eq 18: H^post = 2σ(H^post) (scaled sigmoid activation for post-stream)
     - Eq 19: H^res = Sinkhorn(H^res) (project residual stream onto doubly stochastic manifold)
-
-    Args:
-        x: Input x_l with shape (M, nC) - flattened n-stream residual
-        phi_pre: Projection φ^pre with shape (nC, n)
-        phi_post: Projection φ^post with shape (nC, n)
-        phi_res: Projection φ^res with shape (nC, n²)
-        alpha_pre: Scaling factor α^pre for pre-stream (n elements)
-        alpha_post: Scaling factor α^post for post-stream (n elements)
-        alpha_res: Scaling factor α^res for residual stream (n² elements)
-        bias: Bias vector b with shape (n² + 2n,)
-        n: Stream parameter controlling manifold dimension
-        eps: Epsilon for RMSNorm numerical stability (default: 1e-6)
 
     Returns:
         Tuple of three tensors (H_pre, H_post, H_res):
@@ -125,7 +113,6 @@ def mhc_torch(
     else:
         H_res = H_res.to(torch.float32)
     
-    # Return three separate streams
     return H_pre.to(x.dtype), H_post.to(x.dtype), H_res.to(x.dtype)
 
 
@@ -147,32 +134,11 @@ def mhc_lite_torch(
     This serves as ground truth for validating the Triton kernel implementation
     with hres_mode="lite".
 
-    Implements:
-    - Eq 14: H̃ = x̃φ (matrix multiplication)
-    - Eq 15: r = ||x̃||₂ / √(nC) (RMS normalization)
-    - Eq 16: [H^pre, H^post, H^res] = 1/r [α·H̃] + b (scaling)
-    - Eq 17: H^pre = σ(H^pre) (sigmoid activation for pre-stream)
-    - Eq 18: H^post = 2σ(H^post) (scaled sigmoid activation for post-stream)
-    - mHC-lite for H^res: softmax + convex combination of permutation matrices
-      (Birkhoff-von Neumann theorem - exact doubly stochastic by construction)
-
-    Args:
-        x: Input x_l with shape (M, nC) - flattened n-stream residual
-        phi_pre: Projection φ^pre with shape (nC, n)
-        phi_post: Projection φ^post with shape (nC, n)
-        phi_res: Projection φ^res with shape (nC, n!) - n! columns for lite mode
-        alpha_pre: Scaling factor α^pre for pre-stream
-        alpha_post: Scaling factor α^post for post-stream
-        alpha_res: Scaling factor α^res for residual stream
-        bias: Bias vector b with shape (n! + 2n,) - n! + 2n for lite mode
-        n: Stream parameter controlling manifold dimension
-        eps: Epsilon for RMSNorm numerical stability (default: 1e-6)
-
     Returns:
         Tuple of three tensors (H_pre, H_post, H_res):
         - H_pre: (M, n) manifold projection with sigmoid
         - H_post: (M, n) post-processing with 2*sigmoid
-        - H_res: (M, n²) exact doubly stochastic residual connection
+        - H_res: (M, n!) exact doubly stochastic residual connection
     """
     x_f32 = x.to(torch.float32)
     M = x.shape[0]
@@ -226,7 +192,6 @@ def mhc_lite_torch(
     H_res = torch.einsum('mk,kij->mij', alpha_coeffs, P)  # (M, n, n)
     H_res = H_res.view(M, n_squared)  # Flatten to (M, n²)
     
-    # Return three separate streams
     return H_pre.to(x.dtype), H_post.to(x.dtype), H_res.to(x.dtype)
 
 
@@ -237,11 +202,6 @@ def sinkhorn_knopp_exp_domain_torch(
 ) -> torch.Tensor:
     """
     PyTorch reference implementation of Sinkhorn-Knopp in exponential domain.
-
-    Args:
-        logits: Input raw logits with shape (M, N, N)
-        num_iters: Number of Sinkhorn iterations
-        eps: Small epsilon for numerical stability in division
 
     Returns:
         Doubly stochastic matrices with shape (M, N, N)
@@ -273,18 +233,6 @@ def sinkhorn_knopp_log_domain_torch(
 ) -> torch.Tensor:
     """
     PyTorch reference implementation of Sinkhorn-Knopp in log domain.
-
-    Algorithm:
-        1. log_A = A (input logits, already in log domain)
-        2. Initialize: log_u = 0, log_v = 0
-        3. For each iteration:
-           - log_u = -logsumexp_j(log_A + log_v)  # Row normalization
-           - log_v = -logsumexp_i(log_A + log_u)  # Column normalization
-        4. Output: P = exp(log_A + log_u + log_v)
-
-    Args:
-        logits: Input raw logits with shape (M, N, N)
-        num_iters: Number of Sinkhorn iterations
 
     Returns:
         Doubly stochastic matrices with shape (M, N, N)
@@ -321,10 +269,6 @@ def is_doubly_stochastic(P: torch.Tensor, tol: float = 1e-3) -> bool:
     """
     Check if a batch of matrices is doubly stochastic.
 
-    Args:
-        P: Tensor of shape (M, N, N)
-        tol: Tolerance for sum checks
-
     Returns:
         True if all matrices are doubly stochastic within tolerance
     """
@@ -360,14 +304,6 @@ def generate_mhc_inputs(
 ):
     """
     Generate test inputs for mHC mapping.
-
-    Args:
-        M: Batch/sequence dimension
-        n: Stream parameter (manifold dimension controller)
-        C: Hidden dimension per stream
-        dtype: Tensor dtype (bfloat16 or float16)
-        device: Device to create tensors on (default: 'cuda')
-        hres_mode: H_res computation mode - "sinkhorn" or "lite"
 
     Returns:
         Tuple of (x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n) where:
@@ -423,12 +359,6 @@ def get_test_shapes():
         M: batch/sequence dimension
         n: stream parameter (manifold dimension controller)
         C: hidden dimension per stream
-        
-    Generates comprehensive test coverage including:
-    - Various batch sizes (1 to 1024)
-    - Different stream parameters (1, 2, 4, 8)
-    - Multiple hidden dimensions (512 to 4096)
-    - Edge cases (non-power-of-2, extreme sizes)
     """
     shapes = []
 

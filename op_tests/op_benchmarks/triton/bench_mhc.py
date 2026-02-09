@@ -47,7 +47,6 @@ def get_benchmark_configs(args):
     configs = []
     
     if args.M and args.n and args.C:
-        # Single configuration from command line
         configs.append((args.M, args.n, args.C))
     else:
         # Default configurations - typical mHC usage patterns
@@ -239,7 +238,7 @@ def run_benchmark(args):
                 hres_mode="sinkhorn"
             )
             H_res_3d = H_res_input.view(M, n, n)
-            fn = lambda: sinkhorn_knopp(H_res_3d, num_iters=sinkhorn_iters, out=H_res_3d)
+            fn = lambda: sinkhorn_knopp(H_res_3d, C=C, num_iters=sinkhorn_iters, out=H_res_3d)
         
         # Benchmark
         ms = triton.testing.do_bench(fn)
