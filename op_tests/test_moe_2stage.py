@@ -19,6 +19,8 @@ from aiter.fused_moe import (
     fused_moe,
     torch_moe_stage1,
     torch_moe_stage2,
+    moe_sorting,
+    flydsl_moe_stage2_ex,
 )
 
 
@@ -282,6 +284,176 @@ def test_fmoe(
     return {"us": us2, "err": err}
 
 
+def test_stage2_only(
+    dtype,
+    token,
+    model_dim,
+    inter_dim,
+    E,
+    topk,
+    qType,
+    WQDType,
+    mode="reduce",
+    preshuffle=True,
+    doweight_stage2=True,
+):
+    """
+    Stage2-only test: directly call flydsl_moe_stage2_ex without running stage1.
+
+    This test:
+    1. Generates synthetic stage1 output (inter_states) as stage2 input
+    2. Quantizes weights and scales for A4W4
+    3. Calls moe_sorting to get routing buffers
+    4. Calls flydsl_moe_stage2_ex directly
+    5. Compares against torch_moe_stage2 reference
+    """
+    from aiter.utility import fp4_utils
+
+    # Only A4W4 (per_1x32 fp4x2) supported for now
+    if qType != aiter.QuantType.per_1x32 or WQDType != dtypes.fp4x2:
+        print(f"[test_stage2_only] Skipping: only per_1x32 fp4x2 (A4W4) supported")
+        return None
+
+    torch_quant = aiter.get_torch_quant(qType)
+
+    print(f"\n{'='*60}")
+    print(f"[test_stage2_only] STAGE2-ONLY TEST")
+    print(f"  token={token}, model_dim={model_dim}, inter_dim={inter_dim}")
+    print(f"  E={E}, topk={topk}, mode={mode}, preshuffle={preshuffle}")
+    print(f"{'='*60}")
+
+    # Use smaller init scale to avoid overflow
+    init_scale = 0.2
+
+    # Generate input for routing (hidden_states)
+    input_hidden = torch.randn((token, model_dim), dtype=dtype) * init_scale
+
+    # Generate synthetic stage1 output (inter_states) as stage2 input
+    # Shape: [token * topk, inter_dim]
+    inter_states = torch.randn((token * topk, inter_dim), dtype=dtype) * init_scale
+
+    # Generate w2 weight: [E, model_dim, inter_dim]
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) * (
+        init_scale / (inter_dim**0.5)
+    )
+
+    # Generate dummy w1 for routing (not used in stage2 computation)
+    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) * (
+        init_scale / (model_dim**0.5)
+    )
+
+    # Generate routing scores and topk
+    score = torch.randn((token, E), dtype=dtype)
+    topk_weights, topk_ids = fused_topk(input_hidden, score, topk, True)
+
+    # Quantize w2 (A4W4)
+    w2_qt, w2_scale = torch_quant(w2, quant_dtype=WQDType)
+    w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)  # Pack fp4x2
+
+    # Quantize w1 (for routing buffers, not used in stage2)
+    w1_qt, w1_scale = torch_quant(w1, quant_dtype=WQDType)
+    w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
+
+    # Pre-shuffle weights and scales
+    if preshuffle:
+        w2_qt_aiter = shuffle_weight(w2_qt, layout=(16, 16))
+    else:
+        w2_qt_aiter = w2_qt
+    w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
+    w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
+
+    # For true A4W4, stage2 input (a2) should be fp4 quantized
+    # Note: flydsl_moe_stage2_ex only supports fp4 or fp8 activation, not bf16
+    a2_bf16 = inter_states.to(dtypes.bf16)
+    # Quantize a2 to fp4
+    a2_qt, a2_scale = torch_quant(
+        a2_bf16.view(token * topk, inter_dim), quant_dtype=dtypes.fp4x2
+    )
+    a2_qt = a2_qt.view(token * topk, inter_dim // 2)  # Pack fp4x2
+
+    # Get routing buffers via moe_sorting
+    sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
+        moe_sorting(
+            topk_ids=topk_ids,
+            topk_weights=topk_weights if doweight_stage2 else None,
+            num_experts=E,
+            model_dim=model_dim,
+            moebuf_dtype=dtype,
+            block_size=64,  # Tile M
+        )
+    )
+
+    # Sort a2_scale to match routing order (critical for correctness!)
+    # The kernel expects data sorted by expert assignment
+    a2_scale_sorted = fp4_utils.moe_mxfp4_sort(
+        a2_scale.view(token, topk, -1),
+        sorted_ids=sorted_token_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=token,
+        block_size=64,
+    )
+
+    # Prepare output tensor
+    out = torch.zeros((token, model_dim), dtype=dtype, device="cuda")
+
+    # Reshape a2 for stage2_ex: [token, topk, inter_dim//2] (packed fp4x2)
+    a2_qt_3d = a2_qt.view(token, topk, inter_dim // 2)
+    a2_scale_3d = a2_scale_sorted
+
+    # Call flydsl_moe_stage2_ex with performance tracing
+    print(f"[test_stage2_only] Calling flydsl_moe_stage2_ex with mode={mode}")
+
+    _, us = run_perftest(
+        flydsl_moe_stage2_ex,
+        a2=a2_qt_3d,
+        w1=w1_qt,  # Not used but required
+        w2=w2_qt_aiter,
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        out=out,
+        topk=topk,
+        w2_scale=w2_scale_aiter,
+        a2_scale=a2_scale_3d,
+        block_m=64,
+        sorted_weights=sorted_weights if doweight_stage2 else None,
+        bias2=None,
+        mode=mode,
+        needTrace=True,
+        num_iters=10,
+        num_warmup=2,
+    )
+    print(f"[test_stage2_only] flydsl_moe_stage2_ex: {us:.2f} us")
+
+    # Compute torch reference with original (non-shuffled) data
+    # a2_qt is packed fp4x2: [token*topk, inter_dim//2]
+    # torch_moe_stage2 expects: [token, topk, inter_dim//2] for fp4x2
+    a2_for_ref = a2_qt.view(token, topk, inter_dim // 2)
+    out_ref = torch_moe_stage2(
+        a2_for_ref,
+        w1_qt,  # Not used but required by interface
+        w2_qt,  # Use original (non-shuffled) for reference
+        topk_weights,
+        topk_ids,
+        dtype=dtype,
+        quant_type=qType,
+        w2_scale=w2_scale,  # Use original (non-shuffled) for reference
+        a2_scale=a2_scale,  # Original (non-shuffled) scale for reference
+        doweight=doweight_stage2,
+    )
+
+    # Compare
+    err = checkAllclose(
+        out_ref,
+        out,
+        rtol=1e-2,
+        atol=1e-2,
+        msg=f"[stage2_only mode={mode}]",
+    )
+    print(f"[test_stage2_only] RESULT: err={err}")
+    return {"mode": mode, "err": err, "token": token}
+
+
 l_dtype = ["bf16", "fp16"][:1]
 # l_dim = [(6144, 4096)]
 l_dim = [(7168, 256)]
@@ -431,7 +603,15 @@ parser.add_argument(
     "-reduce",
     "--reduce",
     action="store_true",
-    help="""use FlyDSL stage2 with accumulate=False + reduce mode (requires -dsl)""",
+    help="""use FlyDSL reduce mode (accumulate=False). 
+    For main test: requires -dsl
+    For --stage2_only: enables reduce mode (default: atomic)""",
+)
+
+parser.add_argument(
+    "--stage2_only",
+    action="store_true",
+    help="""Run stage2-only test (skip stage1, directly test flydsl_moe_stage2_ex)""",
 )
 
 args = parser.parse_args()
@@ -457,71 +637,96 @@ if args.doweight_stage1 is not None:
 if args.preshuffle is not None:
     l_preshuffle = [args.preshuffle]
 
-df = []
-for (
-    dtype,
-    (quant_type, aq_dtype, wq_dtype),
-    (model_dim, inter_dim),
-    doweight_stage1,
-) in itertools.product(l_dtype, l_quant, l_dim, l_doweight_stage1):
-    if (quant_type, aq_dtype, wq_dtype) == (
-        aiter.QuantType.per_1x32,
-        dtypes.bf16,
-        dtypes.fp4x2,
-    ):
-        for hidden_pad, intermediate_pad in l_hidden_intermediate_pad:
-            for m in l_tokenNum:
-                ret = test_fmoe(
-                    dtype,
-                    m,
-                    model_dim,
-                    inter_dim,
-                    args.expert,
-                    args.topk,
-                    aiter.ActivationType.Swiglu,
-                    quant_type,
-                    aq_dtype,
-                    wq_dtype,
-                    use_g1u1=True,
-                    doweight_stage1=doweight_stage1,
-                    hidden_pad=hidden_pad,
-                    intermediate_pad=intermediate_pad,
-                    dsl=args.dsl,
-                    reduce=args.reduce,
-                )
-                df.append(ret)
-    elif (quant_type, aq_dtype, wq_dtype) == (
-        aiter.QuantType.per_1x32,
-        dtypes.fp8,
-        dtypes.fp4x2,
-    ):
-        for hidden_pad, intermediate_pad in l_hidden_intermediate_pad:
-            for m in l_tokenNum:
-                ret = test_fmoe(
-                    dtype,
-                    m,
-                    model_dim,
-                    inter_dim,
-                    args.expert,
-                    args.topk,
-                    aiter.ActivationType.Swiglu,
-                    quant_type,
-                    aq_dtype,
-                    wq_dtype,
-                    use_g1u1=True,
-                    doweight_stage1=doweight_stage1,
-                    hidden_pad=hidden_pad,
-                    intermediate_pad=intermediate_pad,
-                    dsl=args.dsl,
-                    reduce=args.reduce,
-                )
-                df.append(ret)
-    elif (quant_type, aq_dtype, wq_dtype) == (
-        aiter.QuantType.per_1x32,
-        dtypes.fp4x2,
-        dtypes.fp4x2,
-    ):
-        for preshuffle in l_preshuffle:
+
+if not args.stage2_only:
+    df = []
+    for (
+        dtype,
+        (quant_type, aq_dtype, wq_dtype),
+        (model_dim, inter_dim),
+        doweight_stage1,
+    ) in itertools.product(l_dtype, l_quant, l_dim, l_doweight_stage1):
+        if (quant_type, aq_dtype, wq_dtype) == (
+            aiter.QuantType.per_1x32,
+            dtypes.bf16,
+            dtypes.fp4x2,
+        ):
+            for hidden_pad, intermediate_pad in l_hidden_intermediate_pad:
+                for m in l_tokenNum:
+                    ret = test_fmoe(
+                        dtype,
+                        m,
+                        model_dim,
+                        inter_dim,
+                        args.expert,
+                        args.topk,
+                        aiter.ActivationType.Swiglu,
+                        quant_type,
+                        aq_dtype,
+                        wq_dtype,
+                        use_g1u1=True,
+                        doweight_stage1=doweight_stage1,
+                        hidden_pad=hidden_pad,
+                        intermediate_pad=intermediate_pad,
+                        dsl=args.dsl,
+                        reduce=args.reduce,
+                    )
+                    df.append(ret)
+        elif (quant_type, aq_dtype, wq_dtype) == (
+            aiter.QuantType.per_1x32,
+            dtypes.fp8,
+            dtypes.fp4x2,
+        ):
+            for hidden_pad, intermediate_pad in l_hidden_intermediate_pad:
+                for m in l_tokenNum:
+                    ret = test_fmoe(
+                        dtype,
+                        m,
+                        model_dim,
+                        inter_dim,
+                        args.expert,
+                        args.topk,
+                        aiter.ActivationType.Swiglu,
+                        quant_type,
+                        aq_dtype,
+                        wq_dtype,
+                        use_g1u1=True,
+                        doweight_stage1=doweight_stage1,
+                        hidden_pad=hidden_pad,
+                        intermediate_pad=intermediate_pad,
+                        dsl=args.dsl,
+                        reduce=args.reduce,
+                    )
+                    df.append(ret)
+        elif (quant_type, aq_dtype, wq_dtype) == (
+            aiter.QuantType.per_1x32,
+            dtypes.fp4x2,
+            dtypes.fp4x2,
+        ):
+            for preshuffle in l_preshuffle:
+                for act_type in l_act:
+                    for m in l_tokenNum:
+                        ret = test_fmoe(
+                            dtype,
+                            m,
+                            model_dim,
+                            inter_dim,
+                            args.expert,
+                            args.topk,
+                            act_type,
+                            quant_type,
+                            aq_dtype,
+                            wq_dtype,
+                            use_g1u1=True,
+                            doweight_stage1=doweight_stage1,
+                            preshuffle=preshuffle,
+                            hidden_pad=0,
+                            intermediate_pad=0,
+                            dsl=args.dsl,
+                            reduce=args.reduce,
+                        )
+                        df.append(ret)
+        else:
             for act_type in l_act:
                 for m in l_tokenNum:
                     ret = test_fmoe(
@@ -537,33 +742,54 @@ for (
                         wq_dtype,
                         use_g1u1=True,
                         doweight_stage1=doweight_stage1,
-                        preshuffle=preshuffle,
-                        hidden_pad=0,
-                        intermediate_pad=0,
                         dsl=args.dsl,
                         reduce=args.reduce,
                     )
                     df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
+
+# =============================================================================
+# Stage2-Only Test (skip stage1, directly test flydsl_moe_stage2_ex)
+# =============================================================================
+if args.stage2_only:
+    # Get dimensions from args
+    if args.dim is not None:
+        model_dim, inter_dim = args.dim
     else:
-        for act_type in l_act:
-            for m in l_tokenNum:
-                ret = test_fmoe(
-                    dtype,
-                    m,
-                    model_dim,
-                    inter_dim,
-                    args.expert,
-                    args.topk,
-                    act_type,
-                    quant_type,
-                    aq_dtype,
-                    wq_dtype,
-                    use_g1u1=True,
-                    doweight_stage1=doweight_stage1,
-                    dsl=args.dsl,
-                    reduce=args.reduce,
+        model_dim, inter_dim = 7168, 256
+
+    # Test with specified token nums or default list
+    test_tokens = l_tokenNum if args.tokenNum is None else [args.tokenNum]
+
+    # Use -reduce flag to determine mode
+    stage2_mode = "reduce" if args.reduce else "atomic"
+
+    for token in test_tokens:
+        try:
+            result = test_stage2_only(
+                dtype=torch.bfloat16,
+                token=token,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                E=args.expert,
+                topk=args.topk,
+                qType=aiter.QuantType.per_1x32,  # A4W4
+                WQDType=dtypes.fp4x2,
+                mode=stage2_mode,
+                preshuffle=(
+                    (args.preshuffle in [True, "t", "true", "True"])
+                    if args.preshuffle is not None
+                    else True
+                ),
+                doweight_stage2=True,
+            )
+            if result:
+                print(
+                    f"[Stage2-Only] token={token}, mode={stage2_mode}, err={result['err']}"
                 )
-                df.append(ret)
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
+        except Exception as e:
+            import traceback
+
+            traceback.print_exc()

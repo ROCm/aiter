@@ -21,10 +21,13 @@ from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_m
 from aiter.utility import fp4_utils
 
 BLOCK_SIZE_M = 32
+
+
 def _is_flydsl_available():
     """check flydsl validation"""
     try:
         import flydsl
+
         return True
     except ImportError:
         return False
@@ -257,6 +260,7 @@ def fused_moe_(
         hidden_pad,
         intermediate_pad,
         use_flydsl,
+        flydsl_accumulate,
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -817,8 +821,16 @@ def get_2stage_cfgs(
             and (q_dtype_a == dtypes.fp8 or q_dtype_a == dtypes.fp4x2)
             and q_dtype_w == dtypes.fp4x2
             and use_g1u1
-            and (activation == ActivationType.Swiglu or activation == ActivationType.Silu)
+            and (
+                activation == ActivationType.Swiglu or activation == ActivationType.Silu
+            )
         )
+
+        # Check for reduce mode
+        use_reduce_mode = os.environ.get("FLYDSL_STAGE2_MODE", "").lower() == "reduce"
+        if not flydsl_accumulate:
+            use_reduce_mode = True
+
         use_flydsl_stage1 = False if q_dtype_a == dtypes.fp4x2 else use_flydsl_stage2
         flydsl_block_m = int(block_m) if block_m is not None else 64
         stage1_func = (
@@ -831,19 +843,29 @@ def get_2stage_cfgs(
                 activation=activation,
             )
         )
-        stage2_func = (
-            functools.partial(flydsl_moe_stage2, accumulate=flydsl_accumulate)
-            if use_flydsl_stage2
-            else functools.partial(
+
+        # Stage2 function selection with reduce mode support
+        if use_flydsl_stage2 and use_reduce_mode:
+            stage2_func = functools.partial(
+                flydsl_moe_stage2_ex,
+                mode="reduce",
+            )
+        elif use_flydsl_stage2:
+            stage2_func = functools.partial(
+                flydsl_moe_stage2,
+                accumulate=True,
+            )
+        else:
+            stage2_func = functools.partial(
                 cktile_moe_stage2,
                 n_pad_zeros=hidden_pad // 64 * 64,
                 k_pad_zeros=intermediate_pad // 128 * 128,
                 activation=activation,
             )
-        )
 
         print("use_flydsl_stage2 = %s", use_flydsl_stage2)
         print("flydsl_accumulate = %s", flydsl_accumulate)
+        print("use_reduce_mode = %s", use_reduce_mode)
         print("use_flydsl_stage1 = %s", use_flydsl_stage1)
         print("flydsl_block_m = %s", flydsl_block_m)
         print("stage1_func = %s", stage1_func)
@@ -908,6 +930,13 @@ def get_2stage_cfgs(
             and use_g1u1
             and (activation == ActivationType.Silu)
         )
+
+        # Check for reduce mode via environment variable or flydsl_accumulate flag
+        use_reduce_mode = os.environ.get("FLYDSL_STAGE2_MODE", "").lower() == "reduce"
+        # If flydsl_accumulate is False, use reduce mode
+        if not flydsl_accumulate:
+            use_reduce_mode = True
+
         print("use_flydsl_stage2 = %s", use_flydsl_stage2)
         print("q_dtype_a = %s", q_dtype_a)
         print("q_dtype_w = %s", q_dtype_w)
@@ -915,6 +944,8 @@ def get_2stage_cfgs(
         print("use_g1u1 = %s", use_g1u1)
         print("use_flydsl = %s", use_flydsl)
         print("_is_flydsl_available() = %s", _is_flydsl_available())
+        print("use_reduce_mode = %s", use_reduce_mode)
+
         use_flydsl_stage1 = False if q_dtype_a == dtypes.fp4x2 else use_flydsl_stage2
         flydsl_block_m = int(block_m) if block_m is not None else 64
         stage1_func = (
@@ -930,23 +961,32 @@ def get_2stage_cfgs(
                 use_non_temporal_load=use_non_temporal_load,
             )
         )
-        stage2_func = (
-            functools.partial(
-                flydsl_moe_stage2,
-                accumulate=flydsl_accumulate,
+
+        # Stage2 function selection with reduce mode support
+        if use_flydsl_stage2 and use_reduce_mode:
+            # Use extended stage2 with reduce mode
+            stage2_func = functools.partial(
+                flydsl_moe_stage2_ex,
+                mode="reduce",
             )
-            if use_flydsl_stage2
-            else functools.partial(
+        elif use_flydsl_stage2:
+            # Use standard stage2 with accumulate (atomic) mode
+            stage2_func = functools.partial(
+                flydsl_moe_stage2,
+                accumulate=True,
+            )
+        else:
+            stage2_func = functools.partial(
                 aiter.ck_moe_stage2_fwd,
                 kernelName=kernelName2,
                 activation=activation,
                 quant_type=q_type,
                 use_non_temporal_load=use_non_temporal_load,
             )
-        )
 
         print("use_flydsl_stage2 = %s", use_flydsl_stage2)
         print("flydsl_accumulate = %s", flydsl_accumulate)
+        print("use_reduce_mode = %s", use_reduce_mode)
         print("use_flydsl_stage1 = %s", use_flydsl_stage1)
         print("flydsl_block_m = %s", flydsl_block_m)
         print("stage1_func = %s", stage1_func)
@@ -1735,7 +1775,9 @@ def flydsl_moe_stage1(
     blocks = sorted_eids.shape[0]
 
     if sorted_weights is None:
-        sorted_w = torch.zeros(sorted_ids.shape, dtype=dtypes.fp32, device=sorted_ids.device)
+        sorted_w = torch.zeros(
+            sorted_ids.shape, dtype=dtypes.fp32, device=sorted_ids.device
+        )
         doweight_stage1 = False
     else:
         sorted_w = sorted_weights
@@ -1763,24 +1805,25 @@ def flydsl_moe_stage1(
         w1_flat = w1.contiguous()
         w1_scale_1d = w1_scale.view(-1).contiguous()
 
-    try:
-        if not is_wfp4_pipeline:
-            from flydsl.kernels.moe_gemm_2stage import compile_moe_gemm1  # type: ignore
-        else:
-            from flydsl.kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1 as compile_moe_gemm1
-    except ImportError:
-        # If kernels is not in path, try to add FlyDSL root to path
-        import sys
-        import flydsl
-        flydsl_path = os.path.dirname(os.path.dirname(flydsl.__file__))
-        if flydsl_path not in sys.path:
-            sys.path.insert(0, flydsl_path)
-        if not is_wfp4_pipeline:
-            from kernels.moe_gemm_2stage import compile_moe_gemm1  # type: ignore
-        else:
-            from kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1 as compile_moe_gemm1
+    # Import compile_moe_gemm1
+    import sys
 
-    out_dtype = "fp8" if is_wfp4_pipeline else "bf16" if dtype == torch.bfloat16 else "f16"
+    flydsl_root = os.environ.get("DSL2_ROOT")
+    if flydsl_root is None:
+        raise ValueError("DSL2_ROOT environment variable must be set for FlyDSL")
+    if flydsl_root not in sys.path:
+        sys.path.insert(0, flydsl_root)
+
+    if not is_wfp4_pipeline:
+        from kernels.moe_gemm_2stage import compile_moe_gemm1  # type: ignore
+    else:
+        from kernels.mixed_moe_gemm_2stage import (
+            compile_mixed_moe_gemm1 as compile_moe_gemm1,
+        )
+
+    out_dtype = (
+        "fp8" if is_wfp4_pipeline else "bf16" if dtype == torch.bfloat16 else "f16"
+    )
 
     extra_w4_stage1_args = {}
     if is_wfp4_pipeline:
@@ -1902,7 +1945,7 @@ def flydsl_moe_stage2(
 
     if is_wfp4_pipeline:
         inter_dim = inter_dim * 2
-        print(f"[FlyDSL-DEBUG] fp4x2: adjusted inter_dim from {inter_dim//2} to {inter_dim}")
+        # print(f"[FlyDSL-DEBUG] fp4x2: adjusted inter_dim from {inter_dim//2} to {inter_dim}")
 
     tile_m = block_m if block_m is not None else 64
     tile_n = 128
@@ -1915,36 +1958,27 @@ def flydsl_moe_stage2(
     blocks = sorted_eids.shape[0]
 
     if sorted_weights is None:
-        sorted_w = torch.zeros(sorted_ids.shape, dtype=dtypes.fp32, device=sorted_ids.device)
+        sorted_w = torch.zeros(
+            sorted_ids.shape, dtype=dtypes.fp32, device=sorted_ids.device
+        )
     else:
         sorted_w = sorted_weights
 
     # Import compile_moe_gemm2
     import sys
-    try:
-        if not is_wfp4_pipeline:
-            from flydsl.kernels.moe_gemm_2stage import compile_moe_gemm2
-        else:
-            from flydsl.kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2 as compile_moe_gemm2
-    except ImportError:
-        # ?? flydsl.kernels ???,?? Flydsl ???? path
-        try:
-            import flydsl
-            # flydsl.__file__ = Flydsl/flydsl/src/flydsl/__init__.py
-            flydsl_root = os.path.dirname(os.path.dirname(os.path.dirname(flydsl.__file__)))
-            if flydsl_root not in sys.path:
-                sys.path.insert(0, flydsl_root)
-        except ImportError:
-            # ? aiter ??? Flydsl
-            aiter_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            flydsl_root = os.path.join(aiter_root, "Flydsl")
-            if os.path.exists(flydsl_root) and flydsl_root not in sys.path:
-                sys.path.insert(0, flydsl_root)
 
-        if not is_wfp4_pipeline:
-            from kernels.moe_gemm_2stage import compile_moe_gemm2
-        else:
-            from kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2 as compile_moe_gemm2
+    flydsl_root = os.environ.get("DSL2_ROOT")
+    if flydsl_root is None:
+        raise ValueError("DSL2_ROOT environment variable must be set for FlyDSL")
+    if flydsl_root not in sys.path:
+        sys.path.insert(0, flydsl_root)
+
+    if not is_wfp4_pipeline:
+        from kernels.moe_gemm_2stage import compile_moe_gemm2
+    else:
+        from kernels.mixed_moe_gemm_2stage import (
+            compile_mixed_moe_gemm2 as compile_moe_gemm2,
+        )
 
     if out.dtype == dtypes.bf16:
         out_dtype = "bf16"
@@ -1959,7 +1993,9 @@ def flydsl_moe_stage2(
 
     # accumulate=False ??? f16/bf16 ??
     if not accumulate and out_dtype == "f32":
-        raise ValueError("FlyDSL stage2 accumulate=False only supports out_dtype in (f16, bf16)")
+        raise ValueError(
+            "FlyDSL stage2 accumulate=False only supports out_dtype in (f16, bf16)"
+        )
 
     extra_w4_stage2_args = {}
     if is_wfp4_pipeline:
@@ -2032,6 +2068,251 @@ def flydsl_moe_stage2(
         out_slots_3d = out_slots.view(token_num, topk, model_dim)
         torch.sum(out_slots_3d, dim=1, out=out)
     return out
+
+
+def flydsl_moe_stage2_ex(
+    a2,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    w2_scale,
+    a2_scale,
+    block_m,
+    sorted_weights=None,
+    bias2=None,
+    mode: str = "auto",  # "auto", "atomic", "reduce"
+    **_kwargs,
+):
+    """FlyDSL stage2 with extended mode control (atomic vs reduce).
+
+    Args:
+        mode: Execution mode selection:
+            - "auto": Automatically select based on shape matching rules
+            - "atomic": Force atomic accumulation (original behavior)
+            - "reduce": Force non-atomic + reduce kernel
+    """
+    if w2_scale is None or a2_scale is None:
+        raise RuntimeError("FlyDSL stage2_ex requires a2_scale and w2_scale")
+
+    is_wfp4_pipeline = w2.dtype == dtypes.fp4x2
+
+    token_num, _, inter_dim = a2.shape
+    model_dim = w2.shape[1]
+    E = w2.shape[0]
+
+    if is_wfp4_pipeline:
+        inter_dim = inter_dim * 2
+    tile_m = block_m if block_m is not None else 64
+    tile_n = int(
+        os.environ.get("FLYDSL_TILE_N_STAGE2", "256" if is_wfp4_pipeline else "128")
+    )
+    tile_k = int(os.environ.get("FLYDSL_TILE_K", "256" if is_wfp4_pipeline else "128"))
+
+    sorted_ids = sorted_token_ids.contiguous()
+    sorted_eids = sorted_expert_ids.contiguous()
+    sorted_size = int(sorted_ids.numel())
+    size_expert_ids_total = int(sorted_eids.numel())
+    blocks = int(size_expert_ids_total)
+
+    if sorted_weights is None:
+        sorted_w = torch.zeros(
+            sorted_ids.shape, dtype=dtypes.fp32, device=sorted_ids.device
+        )
+    else:
+        sorted_w = sorted_weights
+
+    # Import compile_moe_gemm2_ex
+    import sys
+
+    flydsl_root = os.environ.get("DSL2_ROOT")
+    if flydsl_root is None:
+        raise ValueError("DSL2_ROOT environment variable must be set for FlyDSL")
+    if flydsl_root not in sys.path:
+        sys.path.insert(0, flydsl_root)
+
+    if is_wfp4_pipeline:
+        from kernels.mixed_moe_gemm_2stage import (
+            compile_mixed_moe_gemm2 as compile_moe_gemm2,
+        )
+    else:
+        from kernels.moe_gemm_2stage import compile_moe_gemm2_ex, MoeGemm2Mode
+
+    if out.dtype == dtypes.bf16:
+        out_dtype = "bf16"
+    elif out.dtype == dtypes.fp16:
+        out_dtype = "f16"
+    elif out.dtype == dtypes.fp32:
+        out_dtype = "f32"
+    else:
+        raise ValueError(
+            f"FlyDSL stage2_ex only supports out dtype in (fp16, bf16, fp32), got {out.dtype}"
+        )
+
+    if bias2 is None:
+        bias2 = torch.empty(0, dtype=dtypes.fp32, device=a2.device)
+
+    if is_wfp4_pipeline:
+        # For FP4 pipeline, use the existing mixed kernel with accumulate flag
+        accumulate = mode.lower() != "reduce"
+        # Determine a_dtype based on actual a2 tensor dtype
+        if a2.dtype == dtypes.fp4x2:
+            a_dtype_str = "fp4"
+        elif a2.dtype == dtypes.fp8:
+            a_dtype_str = "fp8"
+        else:
+            raise ValueError(
+                f"flydsl_moe_stage2_ex (fp4 pipeline) requires a2 dtype in (fp4x2, fp8), got {a2.dtype}"
+            )
+        extra_w4_stage2_args = {
+            "a_dtype": a_dtype_str,
+            "b_dtype": "fp4",
+            "enable_bias": bias2.numel() > 0,
+        }
+        exe2 = compile_moe_gemm2(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=E,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage2=bool(sorted_weights is not None),
+            out_dtype=out_dtype,
+            accumulate=accumulate,
+            **extra_w4_stage2_args,
+        )
+
+        if accumulate:
+            exe2(
+                out,
+                a2,
+                w2,
+                a2_scale,
+                w2_scale,
+                sorted_ids,
+                sorted_eids,
+                sorted_w,
+                num_valid_ids,
+                bias2,
+                token_num,
+                model_dim,
+                inter_dim,
+                blocks,
+            )
+        else:
+            out_slots = torch.empty(
+                (token_num * topk * model_dim,),
+                device=out.device,
+                dtype=out.dtype,
+            )
+            exe2(
+                out_slots,
+                a2,
+                w2,
+                a2_scale,
+                w2_scale,
+                sorted_ids,
+                sorted_eids,
+                sorted_w,
+                num_valid_ids,
+                bias2,
+                token_num,
+                model_dim,
+                inter_dim,
+                blocks,
+            )
+            out_slots_3d = out_slots.view(token_num, topk, model_dim)
+            flydsl_moe_reduction(
+                out_slots_3d, out, token_num, topk, model_dim, out_dtype
+            )
+    else:
+        # For FP8 pipeline, use compile_moe_gemm2_ex with mode
+        mode_map = {
+            "auto": MoeGemm2Mode.AUTO,
+            "atomic": MoeGemm2Mode.ATOMIC,
+            "reduce": MoeGemm2Mode.REDUCE,
+        }
+        mode_enum = mode_map.get(mode.lower(), MoeGemm2Mode.AUTO)
+
+        exe2 = compile_moe_gemm2_ex(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=E,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage2=bool(sorted_weights is not None),
+            in_dtype="fp8",
+            out_dtype=out_dtype,
+            mode=mode_enum,
+            tokens_hint=token_num,
+        )
+
+        stream_ptr = torch.cuda.current_stream().cuda_stream
+        exe2(
+            out,
+            a2.contiguous().view(-1),
+            w2.contiguous().view(-1),
+            a2_scale.view(-1).contiguous(),
+            w2_scale.view(-1).contiguous(),
+            sorted_ids,
+            sorted_eids,
+            sorted_w.view(-1).contiguous(),
+            num_valid_ids,
+            token_num,
+            model_dim,
+            inter_dim,
+            int(blocks),
+            stream_ptr,
+        )
+    return out
+
+
+def flydsl_moe_reduction(
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    tokens: int,
+    topk: int,
+    model_dim: int,
+    dtype_str: str = "f16",
+):
+    """FlyDSL reduce kernel that sums over the topk dimension.
+
+    Args:
+        X: Input tensor [tokens, topk, model_dim]
+        Y: Output tensor [tokens, model_dim]
+        tokens: Number of tokens
+        topk: Top-k value
+        model_dim: Model dimension
+        dtype_str: Data type string ("f16", "bf16", "f32")
+
+    Performs: Y[t, d] = sum(X[t, :, d]) for all t, d
+    Equivalent to: torch.sum(X, dim=1, out=Y)
+    """
+    import sys
+
+    flydsl_root = os.environ.get("DSL2_ROOT")
+    if flydsl_root is None:
+        raise ValueError("DSL2_ROOT environment variable must be set for FlyDSL")
+    if flydsl_root not in sys.path:
+        sys.path.insert(0, flydsl_root)
+
+    from kernels.moe_gemm_2stage import compile_moe_reduction
+
+    reduce_exe = compile_moe_reduction(
+        topk=topk,
+        model_dim=model_dim,
+        dtype_str=dtype_str,
+    )
+
+    reduce_exe(X, Y, tokens)
+
+    return Y
 
 
 def fused_topk(
