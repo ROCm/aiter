@@ -60,3 +60,12 @@ There are number of op test, you can run them with: `python3 op_tests/test_layer
 |LAYERNORM                      | x = (x - u) / (σ2 + ϵ) e*0.5                                                                                                                                      |
 |ROPE                           | Rotary Position Embedding                                                                                                                                         |
 |GEMM                           | D=αAβB+C                                                                                                                                                          |
+
+## Documentation
+
+| **Topic** | **Description** | **Guide** |
+|---|---|---|
+| Opus | Lightweight C++ template library for HIP kernel development — types, gmem/smem, MFMA, layouts | [Opus Guide](docs/opus_guide.md) |
+| MORI All2All | MoE expert parallelism dispatch/combine via MORI | [MORI All2All Guide](docs/mori_all2all_guide.md) |
+| Triton Comms | GPU-initiated communication using Iris | [Triton Comms](docs/triton_comms.md) |
+| Autotuning | CI-integrated autotuning pipeline | [Autotuning Pipeline](docs/autotuning_pipeline.md) |
