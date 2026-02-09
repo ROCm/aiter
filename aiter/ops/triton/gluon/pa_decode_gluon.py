@@ -1131,9 +1131,6 @@ def paged_attention_decode_sliding_window(
     qk_row_mask = gl.convert_layout(
         query_row_mask_1d, layout=gl.SliceLayout(1, qk_linear_layout)
     )
-    pv_row_mask = gl.convert_layout(
-        query_row_mask_1d, layout=gl.SliceLayout(1, pv_mfma_layout)
-    )
 
     # For sinks handling
     # Convert MTP layout indices to continuous indices for exp_sums/max_logits
@@ -1220,10 +1217,12 @@ def paged_attention_decode_sliding_window(
             + sequence_split_idx * stride_max_logits_part
             + max_logits_base_offsets
         )
-        max_logits_group_mask = qk_row_mask
     if ONE_SHOT:
         output_mask = mtp_query_mask
     else:
+        pv_row_mask = gl.convert_layout(
+            query_row_mask_1d, layout=gl.SliceLayout(1, pv_mfma_layout)
+        )
         output_mask = pv_row_mask[:, None] & (
             output_head_size_offsets[None, :] < head_size
         )
@@ -1243,13 +1242,13 @@ def paged_attention_decode_sliding_window(
                     stored_value=max_logits,
                     ptr=max_logits_ptr,
                     offsets=max_logits_offsets,
-                    mask=max_logits_group_mask,
+                    mask=qk_row_mask,
                 )
                 gl.amd.cdna3.buffer_store(
                     stored_value=exp_sums,
                     ptr=exp_sums_ptr,
                     offsets=max_logits_offsets,
-                    mask=max_logits_group_mask,
+                    mask=qk_row_mask,
                 )
                 gl.amd.cdna3.buffer_store(
                     stored_value=attention_accumulator.to(OUTPUT_DTYPE),
@@ -1272,13 +1271,10 @@ def paged_attention_decode_sliding_window(
     mtp_query_tensor = gl.reshape(
         mtp_query_tensor, [QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2]
     )
-    query_tensor = gl.convert_layout(mtp_query_tensor, layout=blocked_query_layout)
     query_shared = gl.allocate_shared_memory(
-        query_tensor.dtype, query_tensor.shape, shared_query_layout, query_tensor
+        mtp_query_tensor.dtype, mtp_query_tensor.shape, shared_query_layout, mtp_query_tensor
     )
-    query_scale_mask = (mtp_query_len_offsets[:, None, None] < query_seq_len) & (
-        mtp_query_group_size_offsets[None, :, None] < query_group_size
-    )
+
     # Load query quantization scales if needed
     if QUERY_QUANT_MODE == 0:
         # Per-tensor quantization
@@ -1291,7 +1287,9 @@ def paged_attention_decode_sliding_window(
             + kv_head_idx * stride_query_scale_kv_head
             + mtp_query_group_size_offsets[None, :, None]
         )
-
+        query_scale_mask = (mtp_query_len_offsets[:, None, None] < query_seq_len) & (
+            mtp_query_group_size_offsets[None, :, None] < query_group_size
+        )
         query_scale_value = gl.amd.cdna3.buffer_load(
             ptr=query_scale,
             offsets=query_scale_offsets,
@@ -1312,9 +1310,9 @@ def paged_attention_decode_sliding_window(
             sinks_ptr + kv_head_idx * query_group_size + max_logits_group_idx_in_len,
             mask=qk_row_mask,
             other=float("-inf"),
-        ).to(gl.float32)
+        )
 
-    max_num_kv_blocks = gl.cdiv(context_length, KV_COMPUTE_BLOCK_SIZE)
+    max_num_kv_blocks = gl.cdiv(context_length, KV_BLOCK_SIZE)
 
     if KV_QUANT_MODE == 0:
         # Per-tensor quantization
@@ -1344,9 +1342,9 @@ def paged_attention_decode_sliding_window(
         ptr=block_tables_ptr + sequence_idx * stride_block_table_seq
         + sequence_partition_start_idx * MAX_NUM_KV_BLOCKS_PER_COMPUTE // CONTEXT_PARTITION_SIZE_PER_BLOCK,
         offsets=block_indices,
-    ).to(gl.int64)
+    )
 
-    kv_block_numbers2 = gl.zeros_like(block_indices).to(gl.int64)
+    kv_block_numbers2 = gl.zeros_like(kv_block_numbers)
     for sequence_partition_idx in range(
         sequence_partition_start_idx, sequence_partition_end_idx
     ):
@@ -1357,7 +1355,7 @@ def paged_attention_decode_sliding_window(
                 ptr=block_tables_ptr + sequence_idx * stride_block_table_seq
                 + kv_block_start_idx2 // CONTEXT_PARTITION_SIZE_PER_BLOCK,
                 offsets=block_indices,
-            ).to(gl.int64)
+            )
         kv_block_start_idx = sequence_partition_idx * MAX_NUM_KV_BLOCKS_PER_COMPUTE
         # Create mask for valid blocks
         num_kv_blocks = max_num_kv_blocks - kv_block_start_idx
@@ -1372,12 +1370,11 @@ def paged_attention_decode_sliding_window(
         qk_column_offsets = kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE + gl.arange(
             0, CONTEXT_PARTITION_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
         )
-
-        
+        kv_block_numbers_i64 = kv_block_numbers.to(gl.int64)
         # ==================== KEY LOADING AND PROCESSING ====================
         # Calculate key cache offsets and load keys
         key_block_offsets = (
-            kv_block_numbers[:, None, None, None] * stride_key_block
+            kv_block_numbers_i64[:, None, None, None] * stride_key_block
             + kv_head_idx * stride_key_head
             + head_size_split_offsets[None, :, None, None] * stride_key_head_split
             # Use runtime stride for KV block element (may be padded for large blocks).
@@ -1409,7 +1406,7 @@ def paged_attention_decode_sliding_window(
         if KV_QUANT_MODE == 1:
             # Per-token quantization - prepare offsets while key loads
             key_scale_offsets = (
-                kv_block_numbers[:, None, None, None] * kv_scale_stride_0
+                kv_block_numbers_i64[:, None, None, None] * kv_scale_stride_0
                 + kv_head_idx * kv_scale_stride_1
                 + (page_offset + block_element_offsets)[None, None, :, None]
             )
@@ -1457,7 +1454,7 @@ def paged_attention_decode_sliding_window(
         if VALUE_TRANSPOSED:
             # Load values from transposed cache layout
             kv_block_numbers_reshaped = gl.convert_layout(
-                kv_block_numbers,
+                kv_block_numbers_i64,
                 layout=gl.SliceLayout(
                     1, gl.SliceLayout(2, gl.SliceLayout(3, blocked_value_layout))
                 ),
@@ -1487,7 +1484,7 @@ def paged_attention_decode_sliding_window(
         else:
             # Load values from standard cache layout
             kv_block_numbers_reshaped = gl.convert_layout(
-                kv_block_numbers,
+                kv_block_numbers_i64,
                 layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_value_layout)),
             )
 
@@ -1543,10 +1540,6 @@ def paged_attention_decode_sliding_window(
         # ==================== ATTENTION MASKING ====================
         # Compute query token index (0 to query_seq_len-1)
         query_token_idx = qk_row_offsets // ONE_QUERY_GROUP_SIZE_POW2
-
-        # Query positions: queries are AFTER the KV cache
-        # query_pos = context_length + query_token_idx
-        # kv_pos = qk_column_offsets
 
         # Apply causal masking if required
         if IS_CAUSAL:
@@ -1652,7 +1645,7 @@ def paged_attention_decode_sliding_window(
     # ==================== SINKS HANDLING ====================
     # Add sinks contribution to exp_sums (does not contribute to attention output)
     if ONE_SHOT and sinks_ptr is not None:
-        exp_sums += tl.math.exp2((sinks_values - max_logits) * LOG2_E)
+        exp_sums += tl.math.exp2((sinks_values.to(gl.float32) - max_logits) * LOG2_E)
 
     # ==================== OUTPUT NORMALIZATION AND STORING ====================
     # Normalize attention output by softmax denominator
@@ -1670,13 +1663,13 @@ def paged_attention_decode_sliding_window(
             stored_value=max_logits,
             ptr=max_logits_ptr,
             offsets=max_logits_offsets,
-            mask=max_logits_group_mask,
+            mask=qk_row_mask,
         )
         gl.amd.cdna3.buffer_store(
             stored_value=exp_sums,
             ptr=exp_sums_ptr,
             offsets=max_logits_offsets,
-            mask=max_logits_group_mask,
+            mask=qk_row_mask,
         )
         gl.amd.cdna3.buffer_store(
             stored_value=attention_accumulator,
