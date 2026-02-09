@@ -452,7 +452,9 @@ class CustomAllreduce:
                     input, residual_inp, w=weight, eps=eps, registered=True, use_1stage=use_1stage,
                 )
             else:
-                return torch.zeros_like(input), torch.zeros_like(input)
+                dummy_out = torch.zeros(input.shape, dtype=fp8, device=input.device)
+                dummy_scale_out = torch.zeros(input.shape[:-1] + (1,), dtype=torch.float32, device=input.device)
+                return dummy_out, torch.zeros_like(input), dummy_scale_out
         else:
             return self.fused_ar_rms(
                 input, residual_inp, w=weight, eps=eps, registered=False, use_1stage=use_1stage,
