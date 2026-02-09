@@ -34,7 +34,7 @@ jobs:
   split_triton_tests:
     runs-on: ubuntu-latest
     outputs:
-      shard_count: 5
+      shard_count: 8
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -72,6 +72,15 @@ jobs:
           - runner: aiter-1gpu-runner
             label: MI325
             shard: 4
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard: 5
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard: 6
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard: 7
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
       TRITON_TEST: "op_tests/triton_tests/"
