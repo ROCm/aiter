@@ -113,7 +113,7 @@ else:
     ## K_Tile = 256, M_Warp x N_Warp = 2 x 2, WarpTile = 32 x 32 x 16
     #22:  TileKernelInstance(   64,     128,      256,     2,        2,       1,        32,            32,           16,      "Intrawave",        False,             False,          False,             1      ),
     #23:  TileKernelInstance(  128,     128,      256,     2,        2,       1,        32,            32,           16,      "Intrawave",        False,             False,          False,             1      ),
-}
+
 
 
 default_kernels_cktile_dict = {
