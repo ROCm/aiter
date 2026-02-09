@@ -30,16 +30,48 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
 
+  # Step 1: split triton tests into 5 shards, output triton_shard_0.list ... triton_shard_4.list
+  split_triton_tests:
+    runs-on: ubuntu-latest
+    outputs:
+      shard_count: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Split Triton Tests (5 shards)
+        run: ./.github/scripts/split_triton_tests.sh --shards 5
+
+      - name: Upload test shard lists as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: triton_shards
+          path: triton_shard_*.list
+
+  # Step 2: matrix jobs consume shard file lists
   triton:
-    name: Triton Tests (1 GPU)
+    name: Triton Tests (1 GPU) / Shard ${{ matrix.shard }}
     runs-on: ${{ matrix.runner }}
-    needs: [check-signal]
+    needs: [split_triton_tests, check-signal]
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: aiter-1gpu-runner
             label: MI325
+            shard: 0
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard: 1
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard: 2
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard: 3
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard: 4
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
       TRITON_TEST: "op_tests/triton_tests/"
@@ -51,9 +83,25 @@ jobs:
           fetch-depth: 1
           submodules: 'recursive'
 
+      - name: Download test shard lists
+        uses: actions/download-artifact@v4
+        with:
+          name: triton_shards
+
+      - name: List test shard files
+        run: |
+          ls -l triton_shard_*.list
+
       - name: Docker login
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
-        
+
+      - name: Export test file list for this shard as env
+        id: set_shard_files
+        run: |
+          echo "TRITON_TEST_FILES=$(cat triton_shard_${{ matrix.shard }}.list)" >> $GITHUB_ENV
+          echo "$GITHUB_ENV"
+
+      # use ${{ env.TRITON_TEST_FILES }} or directly cat triton_shard_${{ matrix.shard }}.list as pytest parameters
       - name: Run the container
         run: |
           set -ex
@@ -109,25 +157,25 @@ jobs:
 
       # TODO: Uncomment [docker exec -w /workspace triton_test cat "${ENV_FILE}" >> "${GITHUB_ENV}"]
       #       command to enable test selection.
-      - name: Triton Test Selection Script
-        # main branch should always run the full test suite.
-        if: ${{ github.ref != 'refs/heads/main' }}
-        run: |
-          set -ex
-          git fetch --no-tags origin --depth=1 \
-            "pull/${{ github.event.pull_request.number }}/merge:pr-merge"
-          git fetch --no-tags origin --depth=1 \
-            "refs/heads/${{ github.event.pull_request.base.ref }}:target"
-          ENV_FILE=$(docker exec -w /workspace triton_test \
-            mktemp /workspace/github_env.XXXXXXXXXX.tmp)
-          docker exec -w /workspace triton_test \
-            git config --global --add safe.directory /workspace
-          docker exec -w /workspace triton_test \
-            python .github/scripts/select_triton_tests.py \
-              --source pr-merge --target target \
-              --env-var TRITON_TEST --env-file "${ENV_FILE}"
-          # docker exec -w /workspace triton_test cat "${ENV_FILE}" >> "${GITHUB_ENV}"
-          docker exec -w /workspace triton_test rm "${ENV_FILE}"
+      # - name: Triton Test Selection Script
+      #   # main branch should always run the full test suite.
+      #   if: ${{ github.ref != 'refs/heads/main' }}
+      #   run: |
+      #     set -ex
+      #     git fetch --no-tags origin --depth=1 \
+      #       "pull/${{ github.event.pull_request.number }}/merge:pr-merge"
+      #     git fetch --no-tags origin --depth=1 \
+      #       "refs/heads/${{ github.event.pull_request.base.ref }}:target"
+      #     ENV_FILE=$(docker exec -w /workspace triton_test \
+      #       mktemp /workspace/github_env.XXXXXXXXXX.tmp)
+      #     docker exec -w /workspace triton_test \
+      #       git config --global --add safe.directory /workspace
+      #     docker exec -w /workspace triton_test \
+      #       python .github/scripts/select_triton_tests.py \
+      #         --source pr-merge --target target \
+      #         --env-var TRITON_TEST --env-file "${ENV_FILE}"
+      #     # docker exec -w /workspace triton_test cat "${ENV_FILE}" >> "${GITHUB_ENV}"
+      #     docker exec -w /workspace triton_test rm "${ENV_FILE}"
 
       - name: Triton Tests
         run: |
