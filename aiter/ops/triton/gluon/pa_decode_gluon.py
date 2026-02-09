@@ -1312,7 +1312,7 @@ def paged_attention_decode_sliding_window(
             other=float("-inf"),
         )
 
-    max_num_kv_blocks = gl.cdiv(context_length, KV_BLOCK_SIZE)
+    max_num_kv_blocks = gl.cdiv(context_length, KV_COMPUTE_BLOCK_SIZE)
 
     if KV_QUANT_MODE == 0:
         # Per-tensor quantization
