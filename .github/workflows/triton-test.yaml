@@ -99,7 +99,7 @@ jobs:
         id: set_shard_files
         run: |
           echo "TRITON_TEST=$(cat triton_shard_${{ matrix.shard }}.list)" >> $GITHUB_ENV
-          echo "${ TRITON_TEST }"
+          echo "${{ env.TRITON_TEST }}"
 
       - name: Run the container
         run: |
