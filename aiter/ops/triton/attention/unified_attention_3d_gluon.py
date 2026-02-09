@@ -13,6 +13,11 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention_gluon import (
 
 from triton.experimental import gluon
 import triton.experimental.gluon.language as ttgl
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+
+DEVICE_ARCH = arch_info.get_arch()
+IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 
 
 def make_layout_3d(
@@ -81,23 +86,37 @@ def make_layout_3d(
     #     ctaOrder=[0, 1]
     # )
 
-    warp_bases = [(0, 1 << i) for i in range(int(math.log2(num_warps)))]
+    if IS_DEVICE_ARCH_GFX12:
+        warp_bases = [(0, 1 << i) for i in range(int(math.log2(num_warps)))]
 
-    QK_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDWMMALayout(
-        version=3,
-        transposed=True,
-        warp_bases=warp_bases,
-        reg_bases=[],
-        instr_shape=[16, 16, 32],
-    )
+        QK_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDWMMALayout(
+            version=3,
+            transposed=True,
+            warp_bases=warp_bases,
+            reg_bases=[],
+            instr_shape=[16, 16, 32],
+        )
 
-    PV_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDWMMALayout(
-        version=3,
-        transposed=True,
-        warp_bases=warp_bases,
-        reg_bases=[],
-        instr_shape=[16, 16, 32],
-    )
+        PV_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDWMMALayout(
+            version=3,
+            transposed=True,
+            warp_bases=warp_bases,
+            reg_bases=[],
+            instr_shape=[16, 16, 32],
+        )
+    else:
+        QK_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDMFMALayout(
+            version=4,
+            instr_shape=[16, 16, 32],
+            transposed=True,
+            warps_per_cta=[num_warps // 2, 2],
+        )
+        PV_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDMFMALayout(
+            version=4,
+            instr_shape=[16, 16, 16],
+            transposed=True,
+            warps_per_cta=[num_warps // 2, 2],
+        )
 
     Q_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
         operand_index=0, parent=QK_WMMA_LAYOUT, k_width=8
@@ -151,13 +170,16 @@ def make_layout_3d(
 
     Q_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
         size_per_thread=[1, 8],
-        threads_per_warp=[4, 8],
+        threads_per_warp=[
+            WARP_SIZE // 8,
+            8,
+        ],  # in gfx950, ttg.async_copy_global_to_local will fail if threads_per_warp=[WARP_SIZE//4, 4] is used
         warps_per_cta=[num_warps, 1],
         order=[1, 0],
     )
     K_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
         size_per_thread=[8, 1],
-        threads_per_warp=[8, 4],
+        threads_per_warp=[8, WARP_SIZE // 8],
         warps_per_cta=[1, num_warps],
         order=[0, 1],
     )
@@ -346,6 +368,10 @@ def unified_attention(
         raise NotImplementedError("2D Gluon Unified Attention is not yet implemented.")
     else:
         head_size_padded = triton.next_power_of_2(head_size)
+
+        if not IS_DEVICE_ARCH_GFX12:
+            assert ver < 3
+
         if ver == 3:
             # TDM:
             use_tdm = True
@@ -406,10 +432,10 @@ def unified_attention(
 
         # for parm, val in attn_config.items():
         #     print(parm, val)
-        print(attn_impl.__name__)
-        print(attn_config["Q_SHARED_LAYOUT"])
-        print(attn_config["K_SHARED_LAYOUT"])
-        print(attn_config["V_SHARED_LAYOUT"])
+        # print(attn_impl.__name__)
+        # print(attn_config["Q_SHARED_LAYOUT"])
+        # print(attn_config["K_SHARED_LAYOUT"])
+        # print(attn_config["V_SHARED_LAYOUT"])
 
         attn_impl[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
             segm_output_ptr=segm_output,

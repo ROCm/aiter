@@ -6,6 +6,14 @@ import torch
 from aiter.ops.triton.utils.types import e4m3_dtype
 from triton.experimental import gluon
 import triton.experimental.gluon.language as ttgl
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+
+DEVICE_ARCH = arch_info.get_arch()
+MMA_operation: ttgl.constexpr = (
+    ttgl.amd.gfx1250.wmma
+    if ttgl.constexpr(DEVICE_ARCH in ("gfx1250",))
+    else ttgl.amd.cdna4.mfma
+)
 
 float8_info = torch.finfo(e4m3_dtype)
 
@@ -173,7 +181,7 @@ def _perform_QK_wmma_and_update_L_M(
     # S : shape = (BLOCK_M, TILE_SIZE), layout = QK_WMMA_LAYOUT
     S = ttgl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32, layout=QK_WMMA_LAYOUT)
     # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
-    S = qk_scale * ttgl.amd.gfx1250.wmma(Q, K, S)
+    S = qk_scale * MMA_operation(Q, K, S)
     # S : shape = (BLOCK_M, TILE_SIZE), layout = Q_BLOCKED_LAYOUT
     S = ttgl.convert_layout(S, layout=Q_BLOCKED_LAYOUT)
 
@@ -253,7 +261,7 @@ def _perform_PV_wmma(
     # P : shape = (BLOCK_M, TILE_SIZE), layout = P_DOT_LAYOUT
     # V : shape = (TILE_SIZE, HEAD_SIZE), layout = V_DOT_LAYOUT
     # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
-    acc = ttgl.amd.gfx1250.wmma(P, V, acc)
+    acc = MMA_operation(P, V, acc)
     return acc
 
 

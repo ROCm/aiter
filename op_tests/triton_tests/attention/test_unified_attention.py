@@ -11,6 +11,9 @@ from aiter.ops.triton.attention.unified_attention_3d_gluon import (
     unified_attention as gluon_unified_attention,
 )
 from aiter.ops.triton.utils.types import e4m3_dtype
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+
+DEVICE_ARCH = arch_info.get_arch()
 
 NUM_HEADS = [(64, 8)]
 HEAD_SIZES = [64]
@@ -130,6 +133,15 @@ def test_triton_unified_attn(
     if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
         pytest.skip("block size must be at least 32 for fp8")
 
+    if DEVICE_ARCH not in (
+        "gfx950",
+        "gfx1250",
+    ):
+        pytest.skip(f"skip {DEVICE_ARCH}")
+
+    if DEVICE_ARCH not in ("gfx1250",) and ver == 3:
+        pytest.skip(f"{DEVICE_ARCH} does not have TDM")
+
     # TODO: Uncomment after pytorch adds support for manual_seed
     # torch.manual_seed(0)
     num_seqs = len(seq_lens)
@@ -184,7 +196,7 @@ def test_triton_unified_attn(
         k_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
         v_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
 
-    print()
+    # print()
 
     def unified_attention_impl(impl, output_impl, **kwargs):
         impl(
@@ -208,12 +220,12 @@ def test_triton_unified_attn(
             **kwargs,
         )
 
-    print(f"Computing Triton")
+    # print(f"Computing Triton")
     unified_attention_impl(unified_attention, output)
-    print(f"Computing Gluon")
+    # print(f"Computing Gluon")
     unified_attention_impl(gluon_unified_attention, output_gluon, ver=ver)
 
-    print(f"Computing Reference")
+    # print(f"Computing Reference")
     ref_output = ref_paged_attn(
         query=query,
         key_cache=key_cache,
@@ -227,7 +239,7 @@ def test_triton_unified_attn(
         sinks=sinks,
     )
 
-    print(f"Comparing Results")
+    # print(f"Comparing Results")
     atol, rtol = 1.5e-2, 1e-2
     if q_dtype is not None:
         atol, rtol = 1.5e-1, 1.5e-1
