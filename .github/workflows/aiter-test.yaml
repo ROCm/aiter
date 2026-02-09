@@ -31,7 +31,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   build_aiter_image:
-    runs-on: aiter-1gpu-runner
+    runs-on: build-only-aiter
     needs: check-signal
     steps:
       - name: Checkout code
@@ -110,7 +110,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: aiter-mi355-1gpu
+          - runner: linux-aiter-mi355-1
             label: MI355
           - runner: aiter-1gpu-runner
             label: MI325
@@ -214,7 +214,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: aiter-mi355-8gpu
+          - runner: linux-aiter-mi355-8
             label: MI355
           - runner: aiter-8gpu-runner
             label: MI325
