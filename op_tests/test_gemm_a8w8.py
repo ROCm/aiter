@@ -161,9 +161,9 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
         dtype == dtypes.bf16
         and quantDtype == dtypes.i8
         and bias is not None
-        and cu_num == 80
+        #and cu_num == 80
     ):
-        weightshuffle_asm = shuffle_weight(weight, layout=(32, 16))
+        weightshuffle_asm = shuffle_weight(weight, layout=(16, 16))
         bias_f32 = bias.to(dtypes.fp32)
         d, avg_d = run_gemm_asm(x, weightshuffle_asm, x_scale, w_scale, bias_f32, dtype)
         if d is not None:
