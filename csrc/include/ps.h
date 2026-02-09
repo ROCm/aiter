@@ -36,18 +36,6 @@ union WorkInfo
     };
     uint32_t u32All[8];
 };
-
-inline std::ostream& operator<<(std::ostream& os, const WorkInfo& work)
-{
-    auto q_heads = unpack_dword(work.q_head_range);
-    os << std::setw(10) << work.batch_idx << "," << std::setw(10) << work.partial_o_loc << ","
-       << std::setw(10) << work.qo_start << "," << std::setw(10) << work.qo_end << ","
-       << std::setw(10) << work.kv_start << "," << std::setw(10) << work.kv_end << ","
-       << std::setw(10) << work.kv_offset << "," << std::setw(10) << work.q_head_range << "["
-       << std::get<0>(q_heads) << "," << std::get<1>(q_heads) << ")";
-    return os;
-}
-
 constexpr size_t kSizeWorkInfoInDw = sizeof(WorkInfo) / sizeof(uint32_t);
 static_assert(kSizeWorkInfoInDw == 8);
 
@@ -70,16 +58,6 @@ struct QTile
     int32_t qo_end;   // global
     int32_t num_blocks;
     int32_t effective_kv_length;
-
-#if PRINT_DBG
-    friend std::ostream& operator<<(std::ostream& os, const QTile& qtile)
-    {
-        os << std::setw(10) << qtile.batch_idx << "," << std::setw(10) << qtile.qo_start << ","
-           << std::setw(10) << qtile.qo_end << "," << std::setw(10) << qtile.num_blocks << ","
-           << std::setw(10) << qtile.effective_kv_length;
-        return os;
-    }
-#endif
 };
 
 struct PsMetadataV1KernelParameter
@@ -124,102 +102,3 @@ void get_ps_metadata_v1(const torch::Tensor& seqlens_qo_indptr, // [batch size +
                         const int32_t kvlen_granlarity,
                         const int32_t block_size,
                         const bool is_causal);
-
-// DEBUG
-template <typename T>
-std::ostream& operator<<(std::ostream& os, const std::vector<T>& vec)
-{
-    std::ios_base::fmtflags old_flags = os.flags();
-    os << "(" << std::dec << vec.size() << ") [";
-    for(size_t i = 0; i < vec.size(); ++i)
-    {
-        os << std::dec << vec[i];
-        if(i < vec.size() - 1)
-            os << ",";
-    }
-    os << "]";
-    // os.flags(old_flags);
-    return os;
-}
-
-void print_metadata(int32_t* work_indptr,
-                    int64_t work_indptr_len,
-                    WorkInfo* work_info,
-                    int64_t work_info_len)
-{
-    std::cout << "\n=== PS Metadata ===" << std::endl;
-    const int32_t available_tgs = static_cast<int32_t>(work_indptr_len) - 1;
-    const int32_t actual_works  = work_indptr[work_indptr_len - 1];
-    std::cout << "Number of available TGs: " << available_tgs << std::endl
-              << "Number of actual work items: " << actual_works << std::endl;
-
-    std::cout << "work_indptr: (" << work_indptr_len << ") [";
-    for(int64_t i = 0; i < work_indptr_len; ++i)
-    {
-        if(i > 0)
-            std::cout << ",";
-        std::cout << std::dec << work_indptr[i];
-    }
-    std::cout << "]" << std::endl;
-
-    std::cout << std::setw(12) << "" << std::setw(11) << "batch_idx  " << std::setw(11)
-              << "partial_loc" << std::setw(11) << "[qo_start" << std::setw(11) << "qo_end)"
-              << std::setw(11) << "[kv_start" << std::setw(11) << "kv_end)" << std::setw(11)
-              << "kv_offset" << std::setw(16) << "[q_head_range)" << std::endl;
-    std::cout << "work_info: (" << work_info_len << ") [" << std::endl;
-    int32_t tg_idx    = 0;
-    int32_t kv_blocks = 0;
-    for(int32_t i = 0; i < actual_works; ++i)
-    {
-        auto work = work_info[i];
-        kv_blocks += work.kv_end - work.kv_start;
-        std::cout << "work[" << std::setw(3) << i << "]: " << work << std::endl;
-        if(i == work_indptr[tg_idx + 1] - 1)
-        {
-            std::cout << "tg:" << std::setw(2) << tg_idx << ","
-                      << " blk:" << std::setw(4) << kv_blocks << " " << std::string(90, '-')
-                      << std::endl;
-            tg_idx++;
-            kv_blocks = 0;
-        }
-    }
-    std::cout << "]" << std::endl;
-}
-
-void print_reduce_info(int32_t* reduce_indptr,
-                       int64_t reduce_indptr_len,
-                       FinalLoc* reduce_final_map,
-                       int64_t reduce_final_map_len,
-                       int32_t* reduce_partial_map,
-                       int64_t reduce_partial_map_len)
-{
-    std::cout << "\n=== PS Reduce Info ===" << std::endl;
-    std::cout << "reduce_indptr: (" << reduce_indptr_len << ") [";
-    for(int64_t i = 0; i < reduce_indptr_len; ++i)
-    {
-        if(i > 0)
-            std::cout << ",";
-        std::cout << std::dec << reduce_indptr[i];
-    }
-    std::cout << "]" << std::endl;
-
-    std::cout << std::setw(22) << "" << std::setw(13) << "[final_o_start  " << std::setw(13)
-              << "final_o_end)" << std::endl;
-    std::cout << "reduce_final_map: (" << reduce_final_map_len << ") [" << std::endl;
-    for(int64_t i = 0; i < reduce_final_map_len; ++i)
-    {
-        auto final_loc = reduce_final_map[i];
-        std::cout << "reduce_final_map[" << std::setw(3) << i << "]: " << std::setw(11)
-                  << final_loc.qo_start << "," << std::setw(11) << final_loc.qo_end << std::endl;
-    }
-    std::cout << "]" << std::endl;
-
-    std::cout << "reduce_partial_map: (" << reduce_partial_map_len << ") [";
-    for(int64_t i = 0; i < reduce_partial_map_len; ++i)
-    {
-        if(i > 0)
-            std::cout << ",";
-        std::cout << std::dec << reduce_partial_map[i];
-    }
-    std::cout << "]" << std::endl;
-}

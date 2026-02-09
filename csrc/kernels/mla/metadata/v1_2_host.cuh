@@ -17,46 +17,6 @@ inline int gcd(int a, int b)
     return a;
 }
 
-void generate_reduce_info(int32_t num_work,
-                          WorkInfo* work_info,
-                          int32_t* reduce_indptr,
-                          int64_t reduce_indptr_len,
-                          FinalLoc* reduce_final_map,
-                          int32_t* reduce_partial_map)
-{
-    std::map<std::vector<int32_t>, std::set<int32_t>> reduce_map; // 2d
-    int32_t q_head_start, q_head_end;
-    for(int32_t i = 0; i < num_work; ++i)
-    {
-        auto work = work_info[i];
-        if(work.partial_o_loc == -1)
-            continue;
-        std::tie(q_head_start, q_head_end) = unpack_dword(work.q_head_range);
-
-        auto final_loc   = std::vector<int32_t>({work.qo_start, work.qo_end});
-        auto partial_loc = work.partial_o_loc;
-        reduce_map[final_loc].insert(partial_loc);
-    }
-
-    int32_t final_idx   = 0;
-    int32_t partial_idx = 0;
-    for(auto it = reduce_map.begin(); it != reduce_map.end(); ++it)
-    {
-        auto final_loc = it->first;
-        std::vector<uint32_t> partial_loc_vec(it->second.begin(), it->second.end());
-        const int32_t num_partials   = partial_loc_vec.size();
-        reduce_indptr[final_idx + 1] = reduce_indptr[final_idx] + num_partials;
-        reduce_final_map[final_idx]  = FinalLoc{final_loc[0], final_loc[1]};
-        std::copy(partial_loc_vec.begin(), partial_loc_vec.end(), reduce_partial_map + partial_idx);
-        final_idx++;
-        partial_idx += partial_loc_vec.size();
-    }
-    for(int64_t i = final_idx; i < reduce_indptr_len; i++)
-    {
-        reduce_indptr[i] = partial_idx;
-    }
-}
-
 void kn_generate_ps_metadata(const PsMetadataV1KernelParameter& params,
                              const int32_t cluster_id,
                              int32_t current_work_idx)
@@ -66,7 +26,6 @@ void kn_generate_ps_metadata(const PsMetadataV1KernelParameter& params,
     assert(params.kvlen_granularity % params.block_size == 0);
     const int32_t blocks_per_unit = params.kvlen_granularity / params.block_size;
 
-    // TODO: optimize ping-pong allocate
     // Step 1: count split units
     std::vector<QTile> query_tiles;
     int32_t total_units = 0; // split units
@@ -77,6 +36,7 @@ void kn_generate_ps_metadata(const PsMetadataV1KernelParameter& params,
             params.p_seqlens_qo_indptr[batch_idx + 1] - params.p_seqlens_qo_indptr[batch_idx];
         const int32_t kv_length = params.p_context_lens[batch_idx];
         // Split query sequence into tiles
+        // TODO: optimize ping-pong allocate
         std::vector<std::pair<int32_t, int32_t>> query_tile_ranges;
         for(int32_t q_offset = 0; q_offset < qo_length; q_offset += params.qlen_granularity)
         {
@@ -112,23 +72,7 @@ void kn_generate_ps_metadata(const PsMetadataV1KernelParameter& params,
     }
     const int32_t average  = total_units / params.available_tgs;
     const int32_t reminder = total_units % params.available_tgs;
-
-#if PRINT_DBG
-    std::cout << "++++num_heads_k: " << params.num_heads_k << std::endl
-              << "++++available_tgs: " << params.available_tgs << std::endl
-              << "++++blocks per split unit: " << blocks_per_unit << std::endl
-              << "++++total split units: " << total_units << std::endl
-              << "++++average split units: " << average << std::endl
-              << "++++remining split units: " << reminder << std::endl;
-    std::cout << std::setw(14) << "" << std::setw(11) << "batch_idx" << std::setw(11) << "[qo_start"
-              << std::setw(11) << "qo_end)" << std::setw(11) << "num_blocks" << std::setw(11)
-              << "effect_kv" << std::endl;
-    std::cout << "query_tiles: (" << query_tiles.size() << ") [" << std::endl;
-    for(size_t qtile_idx = 0; qtile_idx < query_tiles.size(); qtile_idx++)
-        std::cout << "query_tiles[" << qtile_idx << "]:" << query_tiles[qtile_idx] << std::endl;
-    std::cout << "]" << std::endl;
-#endif
-    // OPT: sort by num_units
+    // TODO: sort by num_units
 
     // Step 2: distribute split units
     int32_t current_tile_idx  = 0; // index of query_tile
@@ -323,29 +267,5 @@ void get_ps_metadata_v1_2_host(const torch::Tensor& seqlens_qo_indptr, // [batch
     }
 
     // TODO: fill remaining work_indptr & reduce_indptr
-    // for(int64_t i = final_idx; i < reduce_indptr_len; i++)
-    // {
-    //     reduce_indptr[i] = partial_idx;
-    // }
-
-    // TODO: eliminate reduce info
-    // const int32_t actual_works = p_work_indptr[work_indptr.numel() - 1];
-    // generate_reduce_info(actual_works,
-    //                      p_work_info,
-    //                      p_reduce_indptr,
-    //                      reduce_indptr.numel(),
-    //                      p_reduce_final_map,
-    //                      p_reduce_partial_map);
-
-#if PRINT_DBG
-    print_metadata(
-        p_work_indptr, work_indptr.numel(), p_work_info, work_info.numel() / kSizeWorkInfoInDw);
-    print_reduce_info(p_reduce_indptr,
-                      reduce_indptr.numel(),
-                      p_reduce_final_map,
-                      reduce_final_map.numel() / 2,
-                      p_reduce_partial_map,
-                      reduce_partial_map.numel());
-#endif
     return;
 }
