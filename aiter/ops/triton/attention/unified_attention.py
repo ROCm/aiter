@@ -4,6 +4,7 @@ import triton
 import torch
 from aiter.ops.triton.utils.device_info import get_num_sms
 import math
+import os
 from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     kernel_unified_attention_2d,
     kernel_unified_attention_3d,
@@ -122,12 +123,17 @@ def unified_attention(
     qq_bias=None,
     # Optional tensor for sinks
     sinks=None,
+    use_native_fp4=None,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
+
+    # Read MXFP4 option from environment variable if not explicitly provided
+    if use_native_fp4 is None:
+        use_native_fp4 = int(os.getenv('MXFP4_OPTION', '0'))
 
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
@@ -182,6 +188,17 @@ def unified_attention(
         assert config["BLOCK_Q"] >= 1
         total_num_q_blocks = q.shape[0] // config["BLOCK_Q"] + num_seqs
 
+        # Check if MXFP4 is compatible with current parameters
+        head_size_padded = triton.next_power_of_2(head_size)
+        mxfp4_compatible = (head_size_padded >= 32 and head_size_padded % 32 == 0)
+        
+        # Disable MXFP4 if not compatible
+        effective_use_native_fp4 = use_native_fp4 if mxfp4_compatible else 0
+        
+        if use_native_fp4 > 0 and not mxfp4_compatible:
+            print(f"Warning: MXFP4 disabled due to incompatible HEAD_SIZE_PADDED={head_size_padded}. "
+                  f"MXFP4 requires HEAD_SIZE_PADDED >= 32 and divisible by 32. Falling back to original.")
+
         kernel_unified_attention_2d[
             (
                 num_kv_heads,
@@ -212,7 +229,7 @@ def unified_attention(
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
             BLOCK_SIZE=block_size,
             HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+            HEAD_SIZE_PADDED=head_size_padded,
             USE_ALIBI_SLOPES=use_alibi_slopes,
             USE_QQ_BIAS=use_qq_bias,
             USE_SOFTCAP=(softcap > 0),
@@ -230,6 +247,11 @@ def unified_attention(
             num_seqs=num_seqs,
             USE_FP8=output_scale is not None,
             ALL_DECODE=ALL_DECODE,
+            use_native_fp4=effective_use_native_fp4,
+            fp4_data_ptr=None,
+            fp4_scale_ptr=None,
+            test_id=0,
+            PACK_ALONG_K=True,
             **config,
         )
 
