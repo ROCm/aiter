@@ -456,3 +456,114 @@ def partial_transpose(
     input: Tensor,
     num_rows: Tensor,
 ) -> None: ...
+
+
+MODEL1_FP8Sparse = (512, 448, 64, 64, 7)
+
+
+def quantize_k_cache_ds_model1(
+    input_k_cache: torch.Tensor,  # (num_blocks, block_size, h_k, d)
+) -> torch.Tensor:
+    d, d_nope, d_rope, tile_size, num_tiles = MODEL1_FP8Sparse
+    assert input_k_cache.shape[-1] == d
+    num_blocks, block_size, h_k, _ = input_k_cache.shape
+    assert h_k == 1
+    input_k_cache = input_k_cache.squeeze(2)  # (num_blocks, block_size, d)
+    input_elem_size = input_k_cache.element_size()
+
+    ### shape definition
+    bytes_per_token = (
+        d_nope + 2 * d_rope + num_tiles + 1
+    )  ## +1 is for padding to 8 bytes alignment
+    size_per_block_padded = (block_size * bytes_per_token + 576 - 1) // 576 * 576
+    result = torch.empty(
+        (num_blocks, size_per_block_padded),
+        dtype=dtypes.fp8,
+        device=input_k_cache.device,
+    )[:, : block_size * bytes_per_token]
+    print(f"init: {result.shape=}")
+    result_k_nope_rope_part = result[:, : block_size * (d_nope + 2 * d_rope)].view(
+        num_blocks, block_size, d_nope + 2 * d_rope
+    )
+    result_k_nope = result_k_nope_rope_part[:, :, :d_nope]
+    result_k_rope = result_k_nope_rope_part[:, :, d_nope:].view(input_k_cache.dtype)
+    result_k_scale_factor = (
+        result[:, block_size * (d_nope + 2 * d_rope) :]
+        .view(num_blocks, block_size, num_tiles + 1)[:, :, :num_tiles]
+        .view(dtypes.fp8_e8m0)
+    )
+
+    def _cast_scale_inv_to_ue8m0(
+        t_input: torch.Tensor, out_dtype=torch.float32
+    ) -> torch.Tensor:
+        return torch.pow(2, torch.clamp_min(t_input, 1e-4).log2().ceil()).to(out_dtype)
+
+    result_k_rope[:] = input_k_cache[..., d_nope:]
+
+    ### quantize: bf16 -> fp8
+    for tile_idx in range(0, num_tiles):
+        cur_scale_factors_inverse = (
+            torch.abs(
+                input_k_cache[..., tile_idx * tile_size : (tile_idx + 1) * tile_size]
+            )
+            .max(dim=-1)
+            .values.float()
+            / 448.0
+        )  # [num_blocks, block_size]  448.0 
+        cur_scale_factors_inverse = _cast_scale_inv_to_ue8m0(cur_scale_factors_inverse)
+        result_k_scale_factor[:, :, tile_idx] = cur_scale_factors_inverse.to(
+            dtypes.fp8_e8m0
+        )
+
+        cur_scale_factors_inverse = cur_scale_factors_inverse.view(
+            num_blocks, block_size, 1
+        )
+        cur_quantized_nope = (
+            input_k_cache[
+                ..., tile_idx * tile_size : (tile_idx + 1) * tile_size
+            ].float()
+            / cur_scale_factors_inverse.float()
+        ).to(dtypes.fp8)
+        result_k_nope[:, :, tile_idx * tile_size : (tile_idx + 1) * tile_size] = (
+            cur_quantized_nope
+        )
+
+    result = result.view(num_blocks, block_size, 1, -1)
+
+    return result
+
+
+def dequantize_k_cache_ds_model1(
+    quant_k_cache: torch.Tensor,  # (num_blocks, block_size, 1, bytes_per_token) w/o math meaning.
+) -> torch.Tensor:
+    d, d_nope, d_rope, tile_size, num_tiles = MODEL1_FP8Sparse
+    num_blocks, block_size, h_k, _ = quant_k_cache.shape
+    assert h_k == 1
+    result = torch.empty(
+        (num_blocks, block_size, d), dtype=dtypes.bf16, device=quant_k_cache.device
+    )
+
+    quant_k_cache = quant_k_cache.view(num_blocks, -1)  # recover math meaning.
+    input_nope_rope = quant_k_cache[:, : block_size * (d_nope + 2 * d_rope)].view(
+        num_blocks, block_size, d_nope + 2 * d_rope
+    )
+    input_nope = input_nope_rope[:, :, :d_nope]
+    input_rope = input_nope_rope[:, :, d_nope:].view(dtypes.bf16)
+    input_scale = (
+        quant_k_cache[:, block_size * (d_nope + 2 * d_rope) :]
+        .view(num_blocks, block_size, num_tiles + 1)[:, :, :num_tiles]
+        .view(dtypes.fp8_e8m0)
+    )
+
+    ### dequantize: fp8 -> bf16
+    for tile_idx in range(0, num_tiles):
+        cur_nope = input_nope[
+            ..., tile_idx * tile_size : (tile_idx + 1) * tile_size
+        ].to(dtypes.bf16)
+        cur_scales = input_scale[..., tile_idx].to(dtypes.bf16).unsqueeze(-1)
+        result[..., tile_idx * tile_size : (tile_idx + 1) * tile_size] = (
+            cur_nope * cur_scales
+        )
+
+    result = result.view(num_blocks, block_size, 1, d)
+    return result
