@@ -39,8 +39,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Split Triton Tests (5 shards)
-        run: ./.github/scripts/split_triton_tests.sh --shards 5
+      - name: Split Triton Tests (8 shards)
+        run: ./.github/scripts/split_triton_tests.sh --shards 8
 
       - name: Upload test shard lists as artifact
         uses: actions/upload-artifact@v4
