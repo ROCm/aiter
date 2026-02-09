@@ -381,25 +381,28 @@ def fused_moe_1stage(
             activation,
         )
     else:
-        quant_func = get_quant(quant_type)
-        if hidden_states.dtype != q_dtype_a:
-            if quant_type == QuantType.per_1x128:
-                quant_func = functools.partial(quant_func, transpose_scale=True)
-            a1, a1_scale = quant_func(
-                hidden_states,
-                scale=a1_scale,
-                quant_dtype=q_dtype_a,
-                num_rows=num_local_tokens,
-            )
-        else:
-            assert (
-                a1_scale is not None or quant_type == QuantType.No
-            ), "a1_scale must be provided for quantized input for fused_moe"
+        skip_1x128_quant = (
+            quant_type == QuantType.per_1x128
+            and hidden_states.dtype == torch.bfloat16
+            and q_dtype_a == torch.float8_e4m3fn
+        )
+        if skip_1x128_quant:
+            # xquant happens inside the asm kernel for per_1x128
             a1 = hidden_states
-            if quant_type == QuantType.per_1x128:
-                scale_t = torch.empty_like(a1_scale)
-                aiter.partial_transpose(scale_t, a1_scale, num_rows=num_local_tokens)
-                a1_scale = scale_t
+        else:
+            quant_func = get_quant(quant_type)
+            if hidden_states.dtype != q_dtype_a:
+                a1, a1_scale = quant_func(
+                    hidden_states,
+                    scale=a1_scale,
+                    quant_dtype=q_dtype_a,
+                    num_rows=num_local_tokens,
+                )
+            else:
+                assert (
+                    a1_scale is not None or quant_type == QuantType.No
+                ), "a1_scale must be provided for quantized input for fused_moe"
+                a1 = hidden_states
 
         token_num = hidden_states.shape[0]
         E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
@@ -416,7 +419,7 @@ def fused_moe_1stage(
 
         if quant_type == QuantType.per_1x128:
             fmoe_func = functools.partial(
-                aiter.fmoe_fp8_blockscale_g1u1,
+                aiter.fmoe_fp8_blockscale_with_xquant_g1u1 if skip_1x128_quant else aiter.fmoe_fp8_blockscale_g1u1,
                 fc_scale_blkn=128,
                 fc_scale_blkk=128,
             )
@@ -440,6 +443,9 @@ def fused_moe_1stage(
                 activation=activation,
             )
             return moe_buf
+
+        if quant_type == QuantType.per_1x128 and skip_1x128_quant and a1_scale is None:
+            a1_scale = torch.empty(1, dtype=dtypes.fp32, device=hidden_states.device)
 
         fmoe_func(
             moe_buf,
