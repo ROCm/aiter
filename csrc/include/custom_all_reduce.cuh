@@ -1579,8 +1579,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1)
             tmp_smem[lane_id] = vec;
         }
         __syncthreads();
-        vec                                        = tmp_smem[lane_id];
-        *reinterpret_cast<P*>(tmps[warp_id] + idx) = vec;
+        vec                            = tmp_smem[lane_id];
+        tmps[warp_id][idx / pack_size] = vec;
     }
 
     int access_id_in_token = threadIdx.x * pack_size;
@@ -1590,7 +1590,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1)
         idx += gridDim.x * hidden_dim, tidx += gridDim.x)
     {
         A acc;
-        P vec = *reinterpret_cast<P*>(tmps[rank] + idx);
+        P vec = tmps[rank][idx / pack_size];
 #pragma unroll
         for(int v = 0; v < pack_size; ++v)
         {
