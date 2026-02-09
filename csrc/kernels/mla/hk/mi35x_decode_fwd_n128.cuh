@@ -134,6 +134,13 @@ struct HkMlaDecodeFwdParams
     void* p_dbg;
 };
 
+enum class PvGemmEpilogueType : uint32_t
+{
+    None        = 0,
+    OutputFinal = 1,
+    OutputSplit = 2,
+};
+
 template <uint32_t kRoundMode>
 __device__ __forceinline__ uint32_t float_2_bf16_pair(uint32_t src_0, uint32_t src_1)
 {
@@ -1644,6 +1651,7 @@ class OManager32bitsV2
 
         if constexpr(std::is_same_v<out_t, float>)
         {
+            // This waitcnt is not necessary but good for performance for unknown reason.
             asm volatile("s_waitcnt vmcnt(0)");
             hkm::ds_write_b128<GPR_START>(p_lds_warp + v_offset_lds_st, 0);
             hkm::ds_write_b128<GPR_START + 4>(p_lds_warp + v_offset_lds_st,
@@ -2107,10 +2115,12 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
         }
 
         auto mla_main = [&]<bool kIsFirstIter,
-                            bool kIsLastIter,
+                            PvGemmEpilogueType kEpilogueType,
                             bool kCheckBoundary,
                             bool kCheckBoundaryNext>(const int32_t kv_tile_start,
                                                      const int32_t kv_tile_end) {
+            constexpr bool kIsLastIter = (kEpilogueType != PvGemmEpilogueType::None);
+
             static_assert((kCheckBoundary == false) || (kIsLastIter == true));
             static_assert((kIsLastIter == false) || (kCheckBoundaryNext == false));
 
@@ -2224,6 +2234,10 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 p_lds_kv_next_warp, warp_idx, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
             softmax_p1<kIsFirstIter, k_p_comp_begin>(&row_sum_e, row_max, rescale);
 
+            // Prepare for output
+            const uintptr_t p_lds_o    = kIsLastIter ? p_lds_kv_curr : 0;
+            const float reci_row_sum_e = kIsLastIter ? (1.0f / row_sum_e) : .0f;
+
             kv_manager.template async_load_k_tile<256, kIsLastIter, kCheckBoundaryNext>(
                 p_lds_kv_next_warp, warp_idx, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
 
@@ -2311,6 +2325,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             // GEMM on PV
             constexpr uint32_t num_pv_iter = T::kVoHeadDim / (T::kBlockK * 2); // 512/(32*2)=8
             ckt::static_for<0, num_pv_iter, 1>{}([&](auto idx) {
+                __builtin_amdgcn_s_setprio(num_pv_iter - 1 - idx.value);
+
                 constexpr uint32_t oaccu_base = k_o_begin + idx.value * 8 * 2;
                 using oaccu_range_0           = hkdart::split_many_t<
                     hkdart::type_list<hkdart::range<oaccu_base + 0, oaccu_base + 8 - 1>>,
@@ -2346,11 +2362,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     hk::mma_ABt(oaccu_0, kv_0, p_mfma, oaccu_0);
                 }
 
-                if constexpr(idx.value == 0)
-                {
-                    __builtin_amdgcn_s_setprio(4);
-                }
-
                 asm volatile("s_waitcnt lgkmcnt(0)");
                 if constexpr(kIsFirstIter)
                 {
@@ -2361,7 +2372,29 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     hk::mma_ABt(oaccu_1, kv_1, p_mfma, oaccu_1);
                 }
 
-                if constexpr(kIsLastIter) {}
+                if constexpr(kIsLastIter)
+                {
+                    constexpr uint32_t col_offset = idx.value * (T::kBlockK * 2);
+
+                    hk::mul_vgpr_pk2(oaccu_0, oaccu_0, reci_row_sum_e);
+                    hk::mul_vgpr_pk2(oaccu_1, oaccu_1, reci_row_sum_e);
+
+                    if constexpr(kEpilogueType == PvGemmEpilogueType::OutputFinal)
+                    {
+                        o_manager.template output_to_vram<oaccu_base, col_offset>(
+                            params.final_output.raw_ptr, warp_idx, qo_start, p_lds_o);
+                        o_manager.template output_to_vram<oaccu_base + 8, col_offset + T::kBlockK>(
+                            params.final_output.raw_ptr, warp_idx, qo_start, p_lds_o);
+                    }
+                    else
+                    {
+                        split_o_manager.template output_to_vram<oaccu_base, col_offset>(
+                            params.split_output.raw_ptr, warp_idx, partial_qo_loc, p_lds_o);
+                        split_o_manager
+                            .template output_to_vram<oaccu_base + 8, col_offset + T::kBlockK>(
+                                params.split_output.raw_ptr, warp_idx, partial_qo_loc, p_lds_o);
+                    }
+                }
                 else
                 {
                     if constexpr(idx.value == 1)
@@ -2375,32 +2408,64 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     }
                 }
             });
-            __builtin_amdgcn_s_setprio(0);
 
             if constexpr(kIsLastIter == false)
             {
                 std::swap(p_lds_kv_curr, p_lds_kv_next);
             }
+            else if constexpr(kEpilogueType == PvGemmEpilogueType::OutputSplit)
+            {
+                // Output LSE for split output
+                constexpr uint32_t kMfmaResultRows = 16;
+                if(lane_idx < kMfmaResultRows)
+                {
+                    constexpr comp_t inv_log2e = 1.0 / 1.4426950408889634;
+                    const uint32_t row_idx =
+                        lane_idx % 16 + warp_idx * 16 + partial_qo_loc * T::kQoNumHead;
+                    const comp_t lse = row_max + __builtin_amdgcn_logf(row_sum_e) * inv_log2e;
+                    params.split_lse.raw_ptr[row_idx] = lse;
+                }
+            }
         };
 
         if(kv_len < T::kBlockN)
         {
-            mla_main.template operator()<true, true, true, false>(kv_start, kv_end);
+            if(partial_qo_loc < 0)
+            {
+                mla_main.template operator()<true, PvGemmEpilogueType::OutputFinal, true, false>(
+                    kv_start, kv_end);
+            }
+            else
+            {
+                mla_main.template operator()<true, PvGemmEpilogueType::OutputSplit, true, false>(
+                    kv_start, kv_end);
+            }
         }
         else if(kv_len == T::kBlockN)
         {
-            mla_main.template operator()<true, true, false, false>(kv_start, kv_end);
+            if(partial_qo_loc < 0)
+            {
+                mla_main.template operator()<true, PvGemmEpilogueType::OutputFinal, false, false>(
+                    kv_start, kv_end);
+            }
+            else
+            {
+                mla_main.template operator()<true, PvGemmEpilogueType::OutputSplit, false, false>(
+                    kv_start, kv_end);
+            }
         }
         else
         {
             const int32_t kv_1st_end = kv_start + T::kBlockN;
             if((kv_1st_end + T::kBlockN - 1) < kv_end)
             {
-                mla_main.template operator()<true, false, false, false>(kv_start, kv_1st_end);
+                mla_main.template operator()<true, PvGemmEpilogueType::None, false, false>(
+                    kv_start, kv_1st_end);
             }
             else
             {
-                mla_main.template operator()<true, false, false, true>(kv_start, kv_1st_end);
+                mla_main.template operator()<true, PvGemmEpilogueType::None, false, true>(
+                    kv_start, kv_1st_end);
             }
 
             int32_t kv_idx = kv_1st_end;
@@ -2408,69 +2473,44 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             {
                 if((kv_idx + 2 * T::kBlockN - 1) < kv_end)
                 {
-                    mla_main.template operator()<false, false, false, false>(kv_idx,
-                                                                             kv_idx + T::kBlockN);
+                    mla_main.template operator()<false, PvGemmEpilogueType::None, false, false>(
+                        kv_idx, kv_idx + T::kBlockN);
                 }
                 else
                 {
-                    mla_main.template operator()<false, false, false, true>(kv_idx,
-                                                                            kv_idx + T::kBlockN);
+                    mla_main.template operator()<false, PvGemmEpilogueType::None, false, true>(
+                        kv_idx, kv_idx + T::kBlockN);
                 }
                 kv_idx += T::kBlockN;
             }
 
             if((kv_idx + T::kBlockN) == kv_end)
             {
-                mla_main.template operator()<false, true, false, false>(kv_idx, kv_end);
+                if(partial_qo_loc < 0)
+                {
+                    mla_main
+                        .template operator()<false, PvGemmEpilogueType::OutputFinal, false, false>(
+                            kv_idx, kv_end);
+                }
+                else
+                {
+                    mla_main
+                        .template operator()<false, PvGemmEpilogueType::OutputSplit, false, false>(
+                            kv_idx, kv_end);
+                }
             }
             else
             {
-                mla_main.template operator()<false, true, true, false>(kv_idx, kv_end);
-            }
-        }
-
-        // divide sum(exp)
-        float reci_row_sum_e = 1.0f / row_sum_e;
-        hk::mul_vgpr_pk2(oaccu, oaccu, reci_row_sum_e);
-
-        ///
-        /// Outputs
-        ///
-
-        const uintptr_t p_lds_o = p_lds_kv_next; // reuse p_lds_o and p_lds_kv_next
-
-        if(partial_qo_loc < 0)
-        {
-            constexpr uint32_t kNumIter = T::kVoHeadDim / 32;
-
-            ckt::static_for<0, kNumIter, 1>{}([&](auto idx) {
-                constexpr uint32_t gpr_offset = k_o_begin + idx.value * 8;
-                constexpr uint32_t col_offset = idx.value * 32;
-                __builtin_amdgcn_s_setprio(kNumIter - 1 - idx.value);
-                o_manager.template output_to_vram<gpr_offset, col_offset>(
-                    params.final_output.raw_ptr, warp_idx, qo_start, p_lds_o);
-            });
-        }
-        else
-        {
-            constexpr uint32_t kNumIter = T::kVoHeadDim / 32;
-
-            ckt::static_for<0, kNumIter, 1>{}([&](auto idx) {
-                constexpr uint32_t gpr_offset = k_o_begin + idx.value * 8;
-                constexpr uint32_t col_offset = idx.value * 32;
-                __builtin_amdgcn_s_setprio(kNumIter - 1 - idx.value);
-                split_o_manager.template output_to_vram<gpr_offset, col_offset>(
-                    params.split_output.raw_ptr, warp_idx, partial_qo_loc, p_lds_o);
-            });
-
-            constexpr uint32_t kMfmaResultRows = 16;
-            if(lane_idx < kMfmaResultRows)
-            {
-                constexpr comp_t inv_log2e = 1.0 / 1.4426950408889634;
-                const uint32_t row_idx =
-                    lane_idx % 16 + warp_idx * 16 + partial_qo_loc * T::kQoNumHead;
-                const comp_t lse = row_max + __builtin_amdgcn_logf(row_sum_e) * inv_log2e;
-                params.split_lse.raw_ptr[row_idx] = lse;
+                if(partial_qo_loc < 0)
+                {
+                    mla_main.template
+                    operator()<false, PvGemmEpilogueType::OutputFinal, true, false>(kv_idx, kv_end);
+                }
+                else
+                {
+                    mla_main.template
+                    operator()<false, PvGemmEpilogueType::OutputSplit, true, false>(kv_idx, kv_end);
+                }
             }
         }
     }
