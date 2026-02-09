@@ -185,6 +185,27 @@ def fmoe_fp8_blockscale_g1u1(
     activation: Optional[Enum] = ActivationType.Silu.value,
 ) -> None: ...
 
+@compile_ops("module_moe_asm")
+def fmoe_fp8_blockscale_with_xquant_g1u1(
+    out: Tensor,
+    input: Tensor,
+    gate: Tensor,
+    down: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_weights: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    topk: int,
+    input_scale: Tensor,
+    fc1_scale: Tensor,
+    fc2_scale: Tensor,
+    kernelName: str,
+    fc_scale_blkn: int = 128,
+    fc_scale_blkk: int = 128,
+    fc2_smooth_scale: Optional[Tensor] = None,
+    activation: Optional[Enum] = ActivationType.Silu.value,
+) -> None: ...
+
 
 @compile_ops("module_moe_asm")
 def moe_stage1_g1u1(
