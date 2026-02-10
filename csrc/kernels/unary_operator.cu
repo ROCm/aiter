@@ -80,20 +80,20 @@ namespace aiter
         template <typename T>
         inline __device__ static T apply(T x)
         {
-            //   float y, neg_a = static_cast<float>(-x);
-            //   const uint32_t log2e_ = 0x3fb8aa3b; // log2e_v<float>;
-            //   float tmp;
-            //   asm volatile("v_mul_f32 %[v_tmp], %[s_log2e], %[v_x]    ; log2e*x\n"
-            //                "v_exp_f32 %[v_tmp], %[v_tmp]              ; emu = exp2(log2e*x)\n"
-            //                "s_nop 4                                   ; hazard for exp\n"
-            //                "v_add_f32 %[v_tmp], %[v_tmp], 1.0         ; emu+1.0f\n"
-            //                "v_rcp_f32 %[v_y], %[v_tmp]                ; 1/(emu+1.0f)\n"
-            //                "s_nop 4                                   ; hazard for rcp \n"
-            //                : [v_y] "=v"(y), [v_tmp] "+v"(tmp)
-            //                : [v_x] "v"(neg_a), [s_log2e] "n"(log2e_)
-            //                :);
-            //   return static_cast<T>(y);
-            return static_cast<T>(1.0f / (1.0f + expf(static_cast<float>(-x))));
+            // Use AMD fast math intrinsics for better performance
+            // sigmoid(x) = 1 / (1 + exp(-x))
+            // exp(x) = exp2(x * log2(e)) where log2(e) ≈ 1.442695
+            float neg_x = static_cast<float>(-x);
+            constexpr float LOG2E = 1.442695040888963407359924681001892137426645954152985934135449406931f;
+
+            // Use __builtin_amdgcn_exp2f for fast exp2 computation
+            float exp_val = __builtin_amdgcn_exp2f(neg_x * LOG2E);
+            float denom = 1.0f + exp_val;
+
+            // Use __builtin_amdgcn_rcpf for fast reciprocal
+            float result = __builtin_amdgcn_rcpf(denom);
+
+            return static_cast<T>(result);
         }
 
         static torch::Tensor compute(torch::Tensor &input)

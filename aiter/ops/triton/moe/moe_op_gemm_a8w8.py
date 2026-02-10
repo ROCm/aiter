@@ -10,7 +10,6 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w8 import (
     _reduce_grouped,
 )
 
-
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
 # -----------------------------------------------------------------------------

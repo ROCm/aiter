@@ -16,13 +16,13 @@ BWD_CODEGEN_CMD = [f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir
 
 def cmdGenFunc_mha_fwd(ck_exclude: bool):
     if ck_exclude:
-        srcs = [f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cpp"]
+        srcs = [f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu"]
         blob_gen_cmd = []
     else:
         srcs = [
-            f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cpp",
-            f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_split.cpp",
-            f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_batch_prefill.cpp",
+            f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu",
+            f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_split.cu",
+            f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_batch_prefill.cu",
         ]
         blob_gen_cmd = [
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}",

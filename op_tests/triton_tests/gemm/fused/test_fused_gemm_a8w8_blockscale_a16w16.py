@@ -18,7 +18,6 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
 )
 import torch.nn.functional as F
 
-
 block_shape = (128, 128)
 
 

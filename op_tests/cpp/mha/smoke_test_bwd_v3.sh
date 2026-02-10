@@ -147,8 +147,39 @@ run_gfx950_group_bwd_v3() {
     done
 }
 
+# This is specifically for testing the 192_128_cas_kb kernel
+run_gfx950_hd192_128_bwd_v3() {
+    echo "===== Comprehensive coverage: hdim 192+128 (batch mode) ====="
+    
+    hdim=192
+    hdim_v=128
+    
+    for prec in "bf16" "fp16" ; do
+    for v3_atomic_fp32 in 0 1 ; do
+    for mask in 0 1 2 ; do
+    for perm in 0 1 ; do
+    for batch in 1 2 3 ; do
+    for head in 1 2 4 ; do
+    for sq in 62 174 299 577 ; do
+    for sk in 65 174 299 577 ; do
+
+    $EXE -prec=$prec -b=$batch -h=$head -d=$hdim -d_v=$hdim_v -s=$sq -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -mode=0 -kname=$KNAME $COMMON_ARGS
+
+    done
+    done
+    done
+    done
+    done
+    done
+    done
+    done
+}
+
 # run_batch_mode_tests
 # run_group_mode_tests
 # run_swa_tests
 run_gfx950_group_bwd_v3
 run_gfx950_bwd_v3
+
+# hdim 192+128 tests
+run_gfx950_hd192_128_bwd_v3

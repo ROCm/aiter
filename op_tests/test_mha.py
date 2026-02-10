@@ -36,8 +36,8 @@ def run_torch(
     query_padding_mask=None,
     key_padding_mask=None,
 ):
-    (_, seqlen_q, _, _) = q.shape
-    (_, seqlen_k, _, _) = k.shape
+    _, seqlen_q, _, _ = q.shape
+    _, seqlen_k, _, _ = k.shape
 
     if bias is not None:
         attn_bias = bias
@@ -113,9 +113,9 @@ def run_ck(
     )
 
     if dropout_p > 0.0:
-        (_, seqlen_q, _, d) = q.shape
-        (_, seqlen_k, _, d) = k.shape
-        (_, seqlen_k, _, d_v) = v.shape
+        _, seqlen_q, _, d = q.shape
+        _, seqlen_k, _, d = k.shape
+        _, seqlen_k, _, d_v = v.shape
         S_dmask = ck_randval_to_dropout_mask(S_dmask, dropout_p)
         S_dmask_converted = convert_flash_attn_S_to_softmax(
             S_dmask,

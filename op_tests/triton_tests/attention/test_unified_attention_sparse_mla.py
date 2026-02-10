@@ -316,7 +316,7 @@ def test_triton_unified_attn(
         topk=top_k,
         test_performance=False,
     )
-    (cache_seqlens, q, block_table, blocked_k, abs_indices, indices_in_kvcache) = (
+    cache_seqlens, q, block_table, blocked_k, abs_indices, indices_in_kvcache = (
         generate_test_data(test_p)
     )
     ref_output = reference_torch(

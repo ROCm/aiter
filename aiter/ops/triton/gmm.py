@@ -35,7 +35,6 @@ from aiter.ops.triton._triton_kernels.gmm import (
     get_config,
 )
 
-
 # GMM PyTorch wrapper.
 # ------------------------------------------------------------------------------
 

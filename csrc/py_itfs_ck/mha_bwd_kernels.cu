@@ -152,14 +152,14 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
     at::Tensor dq_accum;
 
     if (!deterministic) {
-        dq_accum = torch::zeros({1, batch_size, seqlen_q, num_heads, head_size_q}, opts.dtype(at::kFloat));
+        dq_accum = torch::zeros({batch_size, num_heads, 1, seqlen_q, head_size_q}, opts.dtype(at::kFloat));
     } else {
         const ck_tile::index_t kN0 = head_size_q <= 128 ? 128 : 64;
         const ck_tile::index_t nsplits = ck_tile::integer_divide_ceil(seqlen_k, kN0);
         if (mask.type == mask_enum::no_mask) 
-            dq_accum = torch::empty({nsplits, batch_size, seqlen_q, num_heads, head_size_q}, opts.dtype(at::kFloat));
+            dq_accum = torch::empty({batch_size, num_heads, nsplits, seqlen_q, head_size_q}, opts.dtype(at::kFloat));
         else  // Some block may be skipped with causal mask and dq are not set to zeros
-            dq_accum = torch::zeros({nsplits, batch_size, seqlen_q, num_heads, head_size_q}, opts.dtype(at::kFloat));
+            dq_accum = torch::zeros({batch_size, num_heads, nsplits, seqlen_q, head_size_q}, opts.dtype(at::kFloat));
     }
 
     at::Tensor dk_expanded, dv_expanded;
@@ -256,11 +256,11 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
             ck_tile::index_t stride_dv = dv_expanded.stride(1);
             ck_tile::index_t nhead_stride_dv = dv_expanded.stride(2);
 
-            // dq_acc: (split, batch_size, seqlen_q, nheads, hdim_q)
-            ck_tile::index_t split_stride_dq_acc = dq_accum.stride(0);
-            ck_tile::index_t batch_stride_dq_acc = dq_accum.stride(1);
-            ck_tile::index_t stride_dq_acc = dq_accum.stride(2);
-            ck_tile::index_t nhead_stride_dq_acc = dq_accum.stride(3);
+            // dq_acc: (batch_size, nheads, split, seqlen_q, hdim_q)
+            ck_tile::long_index_t batch_stride_dq_acc = dq_accum.stride(0);
+            ck_tile::long_index_t nhead_stride_dq_acc = dq_accum.stride(1);
+            ck_tile::index_t split_stride_dq_acc = dq_accum.stride(2);
+            ck_tile::index_t stride_dq_acc = dq_accum.stride(3);
 
             float p_undrop = 1.0 - p_dropout;
 

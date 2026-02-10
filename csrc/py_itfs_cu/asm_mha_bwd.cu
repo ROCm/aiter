@@ -245,8 +245,8 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
             // TODO: if dq_acc layout do no harm to performance consider reuse this api
             // dq_acc: (split, batch_size, nheads, seqlen_q, hdim_q)
             ck_tile::index_t split_stride_dq_acc = dq_accum.stride(0);
-            ck_tile::index_t batch_stride_dq_acc = dq_accum.stride(1);
-            ck_tile::index_t nhead_stride_dq_acc = dq_accum.stride(2);
+            ck_tile::long_index_t batch_stride_dq_acc = dq_accum.stride(1);
+            ck_tile::long_index_t nhead_stride_dq_acc = dq_accum.stride(2);
             ck_tile::index_t stride_dq_acc = dq_accum.stride(3);
 
             float p_undrop = 1.0 - p_dropout;

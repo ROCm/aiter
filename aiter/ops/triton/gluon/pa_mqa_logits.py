@@ -8,7 +8,6 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-
 try:
     from triton.experimental.gluon.language.amd.cdna3 import (
         sched_barrier as _amd_iglp_sched_barrier,

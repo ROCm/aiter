@@ -5,7 +5,6 @@ from packaging.version import Version
 import importlib
 from typing import Any, Callable, Optional, Union, List, get_args, get_origin
 
-
 aiter_lib = None
 
 

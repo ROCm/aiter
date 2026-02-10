@@ -6,7 +6,6 @@ from jinja2 import Template
 from csrc.cpp_itfs.utils import compile_template_op, AITER_CORE_DIR, str_to_bool
 import math
 
-
 MD_NAME = "top_k_top_p_sampling_from_probs"
 
 with open(

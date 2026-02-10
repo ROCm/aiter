@@ -20,7 +20,6 @@ from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
-
 _LOGGER = AiterTritonLogger()
 
 

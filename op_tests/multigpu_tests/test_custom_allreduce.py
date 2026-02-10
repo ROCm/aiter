@@ -139,6 +139,13 @@ parser.add_argument(
     default=None,
     help="shape. e.g. -s 128,8192",
 )
+parser.add_argument(
+    "-g",
+    "--with-graph",
+    type=lambda x: str(x).lower() in ["true", "1", "yes"],
+    default=True,
+    help="use CUDA graph (default: True). e.g. -g true or -g false",
+)
 
 
 if __name__ == "__main__":
@@ -157,7 +164,7 @@ if __name__ == "__main__":
                 1,
                 shape,
                 dtype,
-                withGraph=True,
+                withGraph=args.with_graph,
                 distributed_init_method=get_distributed_init_method(
                     get_ip(), get_open_port()
                 ),

@@ -27,7 +27,6 @@ from op_tests.triton_tests.test_pa_decode_gluon import (
     torch_reduce_compute,
 )
 
-
 # os.environ['TRITON_CACHE_DIR'] = '/mnt/raid0/heyanguang/code/fa_triton/aiter/triton_cache'
 compile_reduce_kernel_count = 0
 TORCH_TO_TL_DTYPE = {

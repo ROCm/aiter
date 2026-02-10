@@ -420,9 +420,7 @@ def gemm_a8w8_ASM(
         )
         is not None
     ):
-        assert (
-            bias is not None
-        ), "Use asm gemm must give bias, please give a \
+        assert bias is not None, "Use asm gemm must give bias, please give a \
             bias=torch.zeros(n,dtype=dtypes.fp32,device='cuda')"
         splitK = asm_config["splitK"]
         kernelName = asm_config["kernelName"]

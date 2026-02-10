@@ -7,7 +7,6 @@ from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
-
 _fused_gemm_a8w8_blockscale_mul_add_repr = make_kernel_repr(
     "_fused_gemm_a8w8_blockscale_mul_add_kernel",
     [

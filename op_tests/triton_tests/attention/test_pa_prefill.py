@@ -8,7 +8,6 @@ import torch
 from aiter.ops.triton.attention.pa_prefill import context_attention_fwd
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
-
 NUM_HEADS = [64]
 NUM_QUERIES_PER_KV = [1, 8, 64]
 HEAD_SIZES = [128, 96, 24]

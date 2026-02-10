@@ -142,6 +142,8 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                         seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr, // seqlen_k_ptr
                         cu_seqlen_q_ptr, // cu_seqlen_q_ptr
                         cu_seqlen_k_ptr, // cu_seqlen_k_ptr
+                        nullptr, // block_scale_seqstart_q_ptr
+                        nullptr, // block_scale_seqstart_k_ptr
                         nullptr, // sink_ptr
                         total_q,
                         total_k,
@@ -166,6 +168,9 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                         nhead_stride_randval,
                         nhead_stride_lse,
                         nhead_stride_o,
+                        0, // nhead_stride_q_descale
+                        0, // nhead_stride_k_descale
+                        0, // nhead_stride_v_descale
                         batch_stride_q,
                         batch_stride_k,
                         batch_stride_v,
@@ -173,6 +178,9 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                         batch_stride_randval,
                         batch_stride_lse,
                         batch_stride_o,
+                        0, // batch_stride_q_descale
+                        0, // batch_stride_k_descale
+                        0, // batch_stride_v_descale
                         mask.left,
                         mask.right,
                         0,              // sink_size
@@ -180,7 +188,9 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                         min_seqlen_q,
                         p_dropout,
                         has_dropout_randval,
-                        drop_seed_offset};
+                        drop_seed_offset,
+                        128, // block_scale_size_q
+                        128}; // block_scale_size_kv
 }
 
 

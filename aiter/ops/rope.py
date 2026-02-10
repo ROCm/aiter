@@ -5,7 +5,6 @@ from torch import Tensor, empty, empty_like, autograd
 from typing import Tuple, Union
 from ..jit.core import compile_ops
 
-
 MD_NAME = "module_rope"
 
 

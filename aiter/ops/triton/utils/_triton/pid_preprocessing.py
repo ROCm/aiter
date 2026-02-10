@@ -78,3 +78,23 @@ def pid_grid(pid: int, num_pid_m: int, num_pid_n: int, GROUP_SIZE_M: tl.constexp
         pid_n = (pid % num_pid_in_group) // group_size_m
 
     return pid_m, pid_n
+
+
+@triton.jit
+def pid_grid_3d(pid: int, num_pid_m: int, num_pid_n: int, num_pid_k):
+    """
+    Maps 1D pid to 3D grid coords (pid_m, pid_n, pid_k).
+    Args:
+        - pid: 1D pid
+        - num_pid_m: grid m size
+        - num_pid_n: grid n size
+        - num_pid_k: grid k size
+
+    Returns:
+        - pid_m, pid_n, pid_k: 3D grid coordinates
+    """
+    pid_m = pid % num_pid_m
+    pid_n = (pid // num_pid_m) % num_pid_n
+    pid_k = pid // (num_pid_m * num_pid_n) % num_pid_k
+
+    return pid_m, pid_n, pid_k

@@ -9,7 +9,6 @@ from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 import triton
 
-
 _gemm_a16w8_blockscale_repr = make_kernel_repr(
     "_gemm_a16w8_blockscale_kernel",
     [
