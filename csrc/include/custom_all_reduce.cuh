@@ -1533,6 +1533,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1)
     constexpr int pack_size = packed_t<T>::P::size;
     constexpr int tnum_gpu  = BLOCK_SIZE / ngpus;
     using P                 = typename packed_t<T>::P;
+    using OP                = array_t<OutT, 16 / sizeof(T)>;
     using A                 = typename packed_t<T>::A;
     __shared__ P tmp_smem[tnum_gpu * ngpus];
     int warp_id = threadIdx.x / tnum_gpu;
@@ -1545,6 +1546,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1)
         ptrs[i] = (const P*)_dp->ptrs[i];
         tmps[i] = get_tmp_buf<P>(sg.signals[i]);
     }
+    A acc;
     start_sync<ngpus>(sg, self_sg, rank);
 
     for(int idx = ((blockIdx.x * ngpus + rank) * tnum_gpu + lane_id) * pack_size; idx < size;
@@ -1555,7 +1557,6 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1)
         __syncthreads();
         if(warp_id == 0)
         {
-            A acc;
 #pragma unroll
             for(int v = 0; v < pack_size; ++v)
             {
@@ -1589,18 +1590,18 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1)
     for(int idx = blockIdx.x * hidden_dim + access_id_in_token, tidx = blockIdx.x; idx < size;
         idx += gridDim.x * hidden_dim, tidx += gridDim.x)
     {
-        A acc;
         P vec = tmps[rank][idx / pack_size];
-#pragma unroll
-        for(int v = 0; v < pack_size; ++v)
-        {
-            acc.data[v] = ck_tile::type_convert<float>(vec.data[v]);
-        }
         P res = *reinterpret_cast<P*>(residual_inp + idx);
 #pragma unroll
         for(int v = 0; v < pack_size; ++v)
         {
-            acc.data[v] += ck_tile::type_convert<float>(res.data[v]);
+            vec.data[v] += res.data[v];
+        }
+        *reinterpret_cast<P*>(residual_out + idx) = vec;
+#pragma unroll
+        for(int v = 0; v < pack_size; ++v)
+        {
+            acc.data[v] = ck_tile::type_convert<float>(vec.data[v]);
         }
         ar_fusion_epilogue<P, A, T, OutT, pack_size, BLOCK_SIZE>(
             acc, weight_p, hidden_dim, eps, idx, tidx, output, scale_out);
