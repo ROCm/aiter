@@ -16,7 +16,7 @@
 #include <iostream>
 #include <cassert>
 #include <type_traits>
-#include "../../csrc/include/opus/opus.hpp"
+#include "opus/opus.hpp"
 
 // =============================================================================
 // Test Utilities
