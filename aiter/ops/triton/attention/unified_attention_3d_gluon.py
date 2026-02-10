@@ -28,65 +28,47 @@ def make_layout_3d(
     use_tdm: bool,
     use_swizzle: bool = False,
 ):
-    """
-    BLOCK_M are usually 16 (QH per KVH are usually <= 16)
-    TILE_SIZE are usually 16 or 64
-    HEAD_SIZE_PADDED are usually 64 or 128
-
-    for Q @ K^T (M x N x K = BLOCK_M x TILE_SIZE x HEAD_SIZE_PADDED),
-    the M-dim can usually be completed by 1 wave, while N-dim requires multiple waves and/or cycles,
-    so the best choice for warp_bases is:
-        [[0, 1]]         for num_warps = 2, and
-
-            w0 w1 ...
-            ...
-
-        [[0, 1], [0, 2]] for num_warps = 4
-
-            w0 w1 w2 w3 ...
-            ...
-
-    for P @ V (M x N x K = BLOCK_M x HEAD_SIZE_PADDED x TILE_SIZE),
-    the M-dim can usually be completed by 1 wave, while N-dim requires multiple waves and/or cycles,
-    so the best choice for warp_bases is the same as Q @ K^T
-
-    some examples for warp_bases for num_warps = 4
-
-        warp_bases=[[0, 1], [1, 0]]
-        w0 w1 ...
-        w2 w3 ...
-        ...
-
-        warp_bases=[[1, 0], [0, 1]]
-        w0 w2 ...
-        w1 w3 ...
-        ...
-
-        warp_bases=[[0, 1], [0, 2]]
-        w0 w1 w2 w3 ...
-        ...
-
-    therefore, we construct WMMA layout with the following heuristics
-    """
-
-    # ctas_per_cga = [1, 1]
-    # cga_layout_Q = make_cga_layout(
-    #     ctasPerCga=ctas_per_cga,
-    #     ctaSplitNum=[ctas_per_cga[0], 1],
-    #     ctaOrder=[0, 1]
-    # )
-    # cga_layout_K = make_cga_layout(
-    #     ctasPerCga=ctas_per_cga,
-    #     ctaSplitNum=[1, ctas_per_cga[1]],
-    #     ctaOrder=[0, 1]
-    # )
-    # cga_layout_S = make_cga_layout(
-    #     ctasPerCga=ctas_per_cga,
-    #     ctaSplitNum=[ctas_per_cga[0], ctas_per_cga[1]],
-    #     ctaOrder=[0, 1]
-    # )
 
     if IS_DEVICE_ARCH_GFX12:
+        # BLOCK_M are usually 16 (QH per KVH are usually <= 16)
+        # TILE_SIZE are usually 16 or 64
+        # HEAD_SIZE_PADDED are usually 64 or 128
+
+        # for Q @ K^T (M x N x K = BLOCK_M x TILE_SIZE x HEAD_SIZE_PADDED),
+        # the M-dim can usually be completed by 1 wave, while N-dim requires multiple waves and/or cycles,
+        # so the best choice for warp_bases is:
+        #     [[0, 1]]         for num_warps = 2, and
+
+        #         w0 w1 ...
+        #         ...
+
+        #     [[0, 1], [0, 2]] for num_warps = 4
+
+        #         w0 w1 w2 w3 ...
+        #         ...
+
+        # for P @ V (M x N x K = BLOCK_M x HEAD_SIZE_PADDED x TILE_SIZE),
+        # the M-dim can usually be completed by 1 wave, while N-dim requires multiple waves and/or cycles,
+        # so the best choice for warp_bases is the same as Q @ K^T
+
+        # some examples for warp_bases for num_warps = 4
+
+        #     warp_bases=[[0, 1], [1, 0]]
+        #     w0 w1 ...
+        #     w2 w3 ...
+        #     ...
+
+        #     warp_bases=[[1, 0], [0, 1]]
+        #     w0 w2 ...
+        #     w1 w3 ...
+        #     ...
+
+        #     warp_bases=[[0, 1], [0, 2]]
+        #     w0 w1 w2 w3 ...
+        #     ...
+
+        # therefore, we construct WMMA layout with the following heuristics
+
         warp_bases = [(0, 1 << i) for i in range(int(math.log2(num_warps)))]
 
         QK_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDWMMALayout(
@@ -104,12 +86,24 @@ def make_layout_3d(
             reg_bases=[],
             instr_shape=[16, 16, 32],
         )
+        Q_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+            operand_index=0, parent=QK_WMMA_LAYOUT, k_width=8
+        )
+        K_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+            operand_index=1, parent=QK_WMMA_LAYOUT, k_width=8
+        )
+        P_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+            operand_index=0, parent=PV_WMMA_LAYOUT, k_width=8
+        )
+        V_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+            operand_index=1, parent=PV_WMMA_LAYOUT, k_width=8
+        )
     else:
         QK_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDMFMALayout(
             version=4,
             instr_shape=[16, 16, 32],
             transposed=True,
-            warps_per_cta=[num_warps // 2, 2],
+            warps_per_cta=[2, num_warps // 2],
         )
         PV_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDMFMALayout(
             version=4,
@@ -117,19 +111,18 @@ def make_layout_3d(
             transposed=True,
             warps_per_cta=[num_warps // 2, 2],
         )
-
-    Q_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
-        operand_index=0, parent=QK_WMMA_LAYOUT, k_width=8
-    )
-    K_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
-        operand_index=1, parent=QK_WMMA_LAYOUT, k_width=8
-    )
-    P_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
-        operand_index=0, parent=PV_WMMA_LAYOUT, k_width=8
-    )
-    V_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
-        operand_index=1, parent=PV_WMMA_LAYOUT, k_width=8
-    )
+        Q_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+            operand_index=0, parent=QK_WMMA_LAYOUT, k_width=8
+        )
+        K_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+            operand_index=1, parent=QK_WMMA_LAYOUT, k_width=8
+        )
+        P_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+            operand_index=0, parent=PV_WMMA_LAYOUT, k_width=4
+        )
+        V_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+            operand_index=1, parent=PV_WMMA_LAYOUT, k_width=4
+        )
 
     if use_tdm or not use_swizzle:
         Q_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
@@ -137,12 +130,6 @@ def make_layout_3d(
             shape=[BLOCK_M, HEAD_SIZE_PADDED],
             order=[1, 0],
         )
-    else:
-        Q_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
-            vec=8, per_phase=1, max_phase=8, order=[1, 0]
-        )
-
-    if use_tdm or not use_swizzle:
         K_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
             interval_padding_pairs=[[HEAD_SIZE_PADDED, 8]],
             shape=(
@@ -152,37 +139,69 @@ def make_layout_3d(
             ),
             order=[1, 0],
         )
-    else:
-        K_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
-            vec=8, per_phase=1, max_phase=8, order=[0, 1]
-        )
-
-    if use_tdm or not use_swizzle:
         V_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
             interval_padding_pairs=[[HEAD_SIZE_PADDED, 8]],
             shape=[TILE_SIZE, HEAD_SIZE_PADDED],
             order=[1, 0],
         )
     else:
+        Q_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
+            vec=8, per_phase=1, max_phase=8, order=[1, 0]
+        )
+        K_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
+            vec=8, per_phase=1, max_phase=8, order=[0, 1]
+        )
         V_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
 
+    # size_per_thread along the fastest moving dimension is set to 8 (BF16)
+    size_per_thread_fastest_dim = 8
+
+    # size_per_thread * threads_per_warp along the fastest moving dimension is set to HEAD_SIZE_PADDED with only 1 warp_per_cta,
+    # therefore, threads_per_warp along the fastest moving dimension should be HEAD_SIZE_PADDED // size_per_thread_fastest_dim
+    # clamp the threads_per_warp along the fastest moving dimension to 1 ~ WARP_SIZE
+    threads_per_warp_fastest_dim = min(
+        max((HEAD_SIZE_PADDED // size_per_thread_fastest_dim), WARP_SIZE), 1
+    )
+
+    # in gfx950, ttg.async_copy_global_to_local will fail if threads_per_warp=[WARP_SIZE//4, 4] is used
     Q_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
-        size_per_thread=[1, 8],
+        size_per_thread=[1, size_per_thread_fastest_dim],
         threads_per_warp=[
-            WARP_SIZE // 8,
-            8,
-        ],  # in gfx950, ttg.async_copy_global_to_local will fail if threads_per_warp=[WARP_SIZE//4, 4] is used
+            WARP_SIZE // threads_per_warp_fastest_dim,
+            threads_per_warp_fastest_dim,
+        ],
         warps_per_cta=[num_warps, 1],
         order=[1, 0],
     )
     K_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
-        size_per_thread=[8, 1],
-        threads_per_warp=[8, WARP_SIZE // 8],
+        size_per_thread=[size_per_thread_fastest_dim, 1],
+        threads_per_warp=[
+            threads_per_warp_fastest_dim,
+            WARP_SIZE // threads_per_warp_fastest_dim,
+        ],
         warps_per_cta=[1, num_warps],
         order=[0, 1],
     )
+
+    # TODO: for future impl
+    # ctas_per_cga = [1, 1]
+    # cga_layout_Q = make_cga_layout(
+    #     ctasPerCga=ctas_per_cga,
+    #     ctaSplitNum=[ctas_per_cga[0], 1],
+    #     ctaOrder=[0, 1]
+    # )
+    # cga_layout_K = make_cga_layout(
+    #     ctasPerCga=ctas_per_cga,
+    #     ctaSplitNum=[1, ctas_per_cga[1]],
+    #     ctaOrder=[0, 1]
+    # )
+    # cga_layout_S = make_cga_layout(
+    #     ctasPerCga=ctas_per_cga,
+    #     ctaSplitNum=[ctas_per_cga[0], ctas_per_cga[1]],
+    #     ctaOrder=[0, 1]
+    # )
 
     return {
         "QK_WMMA_LAYOUT": QK_WMMA_LAYOUT,
