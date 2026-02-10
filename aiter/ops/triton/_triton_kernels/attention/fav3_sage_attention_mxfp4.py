@@ -1702,7 +1702,7 @@ def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing=False,
     )
 
     # smooth k after rotation
-    k = k - k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
+    K_rot = K_rot - K_rot.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
 
     if q_smoothing:
         # 3. Compute Smoothing Delta S
