@@ -16,6 +16,7 @@ from aiter import per_tensor_quant
 from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 from aiter.jit.utils.chip_info import get_gfx
 
+from torch.utils.benchmark import Timer
 from typing import Tuple, Optional
 
 # This test only supports gfx950, skip on gfx942
@@ -285,7 +286,7 @@ def test_mla_prefill(
     # TODO: enhance pre-allocation, current too loose for large context length
     kvlen_granularity = max(tile_kv, block_size)
     (
-        (work_meta_data_size, work_meta_data_type),
+        (_, _),
         (work_indptr_size, work_indptr_type),
         (work_info_size, work_info_type),
         (reduce_indptr_size, reduce_indptr_type),
@@ -308,7 +309,10 @@ def test_mla_prefill(
         reduce_indptr_size, dtype=reduce_indptr_type, device="cpu", pin_memory=True
     )
     reduce_final_map_cpu = torch.empty(
-        reduce_final_map_size, dtype=reduce_final_map_type, device="cpu", pin_memory=True
+        reduce_final_map_size,
+        dtype=reduce_final_map_type,
+        device="cpu",
+        pin_memory=True,
     )
     reduce_partial_map_cpu = torch.empty(
         reduce_partial_map_size,
@@ -388,11 +392,12 @@ def test_mla_prefill(
         torch.cuda.synchronize()
 
         # Benchmark metadata + H2D with torch.utils.benchmark (CUDA-synced)
-        t = torch.utils.benchmark.Timer(
+        t = Timer(
             stmt="run_get_ps_metadata_and_h2d()",
             globals={"run_get_ps_metadata_and_h2d": run_get_ps_metadata_and_h2d},
         )
         us_metadata = t.timeit(10).mean * 1e6
+        ret["us_metadata"] = us_metadata
 
     if dump_metadata:
         for name, meta in metadata_map.items():
@@ -513,7 +518,6 @@ def test_mla_prefill(
         reduce_bytes = effective_bytes
         bw_reduce = (reduce_bytes / 1e12) / (us_reduce / (1e6))
         # Store results
-        ret["us_metadata"] = us_metadata
         ret["us_mla_prefill_ps"] = us_mla_prefill_ps
         ret["us_mla_prefill_asm"] = us_mla_prefill_asm
         ret["us_mla_prefill_asm_ratio"] = us_mla_prefill_asm / us_mla_prefill_ps
@@ -595,6 +599,7 @@ l_ctx_len = [
     8192,
     10000,
     16384,
+    # 70000,
     # 90000,
 ]
 l_batch_size = [1, 4, 16]
