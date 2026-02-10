@@ -70,8 +70,8 @@ std::pair<int32_t, int32_t> kn_generate_ps_metadata(const PsMetadataV1KernelPara
             total_units += num_units;
         }
     }
-    const int32_t average  = total_units / params.available_tgs;
-    const int32_t reminder = total_units % params.available_tgs;
+    const int32_t average  = total_units / params.tgs_per_cluster;
+    const int32_t reminder = total_units % params.tgs_per_cluster;
     // TODO: sort by num_units
 
     // Step 2: distribute split units
@@ -79,7 +79,7 @@ std::pair<int32_t, int32_t> kn_generate_ps_metadata(const PsMetadataV1KernelPara
     int32_t current_block_idx = 0; // index of split blocks within a query_tile
     int32_t partial_tile_idx  = 0; // index of partial_tile for reduce
     int32_t final_tile_idx    = 0; // index of final_tile for reduce
-    for(int32_t tg_idx = 0; tg_idx < params.available_tgs; ++tg_idx)
+    for(int32_t tg_idx = 0; tg_idx < params.tgs_per_cluster; ++tg_idx)
     {
         // dupclicate (parallal)
         for(int32_t k_head_offset = 0; k_head_offset < params.kheads_per_cluster; k_head_offset++)
@@ -269,7 +269,7 @@ void get_ps_metadata_v1_2_host(const torch::Tensor& seqlens_qo_indptr, // [batch
 
     for(auto i = num_final_tiles + 1; i < reduce_indptr.size(0); i++)
     {
-        p_reduce_indptr[i] = num_partial_tiles;
+        params.p_reduce_indptr[i] = num_partial_tiles;
     }
     return;
 }
