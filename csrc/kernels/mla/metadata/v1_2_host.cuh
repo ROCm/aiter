@@ -17,9 +17,9 @@ inline int gcd(int a, int b)
     return a;
 }
 
-void kn_generate_ps_metadata(const PsMetadataV1KernelParameter& params,
-                             const int32_t cluster_id,
-                             int32_t current_work_idx)
+std::pair<int32_t, int32_t> kn_generate_ps_metadata(const PsMetadataV1KernelParameter& params,
+                                                    const int32_t cluster_id,
+                                                    int32_t current_work_idx)
 {
     const int32_t batch_size = params.batch_size;
 
@@ -115,14 +115,13 @@ void kn_generate_ps_metadata(const PsMetadataV1KernelParameter& params,
                         int32_t partial_o_loc = -1;
                         if(current_block_idx != 0)
                         {
-                            const int32_t partial_o_loc =
-                                params.qlen_granularity * partial_tile_idx;
+                            partial_o_loc = params.qlen_granularity * partial_tile_idx;
                             if(k_head_offset == 0)
                             {
-                                params.p_reduce_indptr[final_tile_idx] += 1;
+                                params.p_reduce_partial_map[partial_tile_idx] = partial_o_loc;
+                                params.p_reduce_indptr[final_tile_idx + 1] = partial_tile_idx + 1;
                                 params.p_reduce_final_map[final_tile_idx] =
                                     FinalLoc{current_tile.qo_start, current_tile.qo_end};
-                                params.p_reduce_partial_map[partial_tile_idx] = partial_o_loc;
                                 final_tile_idx++;
                             }
                             partial_tile_idx++;
@@ -151,9 +150,6 @@ void kn_generate_ps_metadata(const PsMetadataV1KernelParameter& params,
                         const int32_t partial_o_loc = params.qlen_granularity * partial_tile_idx;
                         if(k_head_offset == 0)
                         {
-                            params.p_reduce_indptr[final_tile_idx] += 1;
-                            params.p_reduce_final_map[final_tile_idx] =
-                                FinalLoc{current_tile.qo_start, current_tile.qo_end};
                             params.p_reduce_partial_map[partial_tile_idx] = partial_o_loc;
                         }
                         partial_tile_idx++;
@@ -190,8 +186,9 @@ void kn_generate_ps_metadata(const PsMetadataV1KernelParameter& params,
                 partial_tile_idx  = saved_partial_tile_idx;
             }
         }
-        params.p_work_indptr[cluster_id * params.available_tgs + tg_idx + 1] = current_work_idx;
+        params.p_work_indptr[cluster_id * params.tgs_per_cluster + tg_idx + 1] = current_work_idx;
     }
+    return std::make_pair(final_tile_idx, partial_tile_idx);
 }
 
 void get_ps_metadata_v1_2_host(const torch::Tensor& seqlens_qo_indptr, // [batch size + 1]
@@ -216,8 +213,7 @@ void get_ps_metadata_v1_2_host(const torch::Tensor& seqlens_qo_indptr, // [batch
     HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
     const int32_t available_tgs = dev_prop.multiProcessorCount;
 
-    const int32_t batch_size  = seqlens_qo_indptr.size(0) - 1;
-    const int32_t num_heads_q = num_heads_k * gqa_ratio;
+    const int32_t batch_size = context_lens.size(0);
 
     // 1. divide
     const int32_t num_clusters       = gcd(num_heads_k, available_tgs);
@@ -258,14 +254,22 @@ void get_ps_metadata_v1_2_host(const torch::Tensor& seqlens_qo_indptr, // [batch
     params.p_reduce_final_map          = p_reduce_final_map;
     params.p_reduce_partial_map        = p_reduce_partial_map;
 
+    p_work_indptr[0]          = 0;
+    p_reduce_indptr[0]        = 0;
+    int32_t num_final_tiles   = 0;
+    int32_t num_partial_tiles = 0;
     // 2. conquer(parallel)
     for(int32_t cluster_id = 0; cluster_id < num_clusters; cluster_id++)
     {
         // OPT: consider XCC L2 cache
         int32_t current_work_idx = p_work_indptr[cluster_id * tgs_per_cluster];
-        kn_generate_ps_metadata(params, cluster_id, current_work_idx);
+        std::tie(num_final_tiles, num_partial_tiles) =
+            kn_generate_ps_metadata(params, cluster_id, current_work_idx);
     }
 
-    // TODO: fill remaining work_indptr & reduce_indptr
+    for(auto i = num_final_tiles + 1; i < reduce_indptr.size(0); i++)
+    {
+        p_reduce_indptr[i] = num_partial_tiles;
+    }
     return;
 }
