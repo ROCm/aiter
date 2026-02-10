@@ -35,10 +35,11 @@ _LOGGER = AiterTritonLogger()
 # Cache for permutation matrices to avoid regenerating them
 _PERM_MATRICES_CACHE: dict[tuple[int, torch.device], torch.Tensor] = {}
 
+
 def get_permutation_matrices(n: int, device: torch.device) -> torch.Tensor:
     """
     Generate all n! permutation matrices for mHC-lite mode.
-    
+
     Returns:
         P: (n!, n, n) tensor of permutation matrices, where P[k] is the k-th
            permutation matrix with exactly one 1.0 per row and column.
@@ -96,20 +97,20 @@ def fused_mhc(
             - lite mode: exact doubly stochastic matrix
     """
 
-    assert hres_mode in ("sinkhorn", "lite"), (
-        f"hres_mode must be 'sinkhorn' or 'lite', got {hres_mode}"
-    )
+    assert hres_mode in (
+        "sinkhorn",
+        "lite",
+    ), f"hres_mode must be 'sinkhorn' or 'lite', got {hres_mode}"
     hres_lite_mode = hres_mode == "lite"
-    
+
     M, K = x.shape
     C = K // n  # Derive C from K and n
     K_pre, n_pre = phi_pre.shape
     K_post, n_post = phi_post.shape
     K_res, phi_res_cols = phi_res.shape
-    
+
     n_squared = n * n
     n_factorial = factorial(n)
-    
 
     if config is None:
         config, _ = get_mhc_config("MHC_FUSED", M, C, mode=hres_mode)
@@ -117,81 +118,94 @@ def fused_mhc(
 
     num_ksplit = config.get("NUM_KSPLIT", 1)
     BLOCK_M = config.pop("BLOCK_M", 64 if M >= 64 else 32)
-    if hres_lite_mode:        
+    if hres_lite_mode:
         min_block_n = max(n_factorial, n_squared)
         config_block_n = config.pop("BLOCK_N", min_block_n)
         BLOCK_N = triton.next_power_of_2(max(config_block_n, min_block_n))
-        
+
         n_res_expected = n_factorial
-        assert phi_res_cols == n_res_expected, (
-            f"In lite mode, phi_res must have {n_res_expected} columns (n!={n_res_expected}), got {phi_res_cols}"
-        )
-        
+        assert (
+            phi_res_cols == n_res_expected
+        ), f"In lite mode, phi_res must have {n_res_expected} columns (n!={n_res_expected}), got {phi_res_cols}"
+
         perm_matrices = get_permutation_matrices(n, x.device)
         n_blocks_res = 1
         stride_perm_k = perm_matrices.stride(0)
         stride_perm_ij = 1
     else:
         BLOCK_N = triton.next_power_of_2(config.pop("BLOCK_N", n_squared))
-        
+
         n_res_expected = n_squared
-        assert phi_res_cols == n_squared, (
-            f"In sinkhorn mode, phi_res must have {n_squared} columns (n²), got {phi_res_cols}"
-        )
-        
+        assert (
+            phi_res_cols == n_squared
+        ), f"In sinkhorn mode, phi_res must have {n_squared} columns (n²), got {phi_res_cols}"
+
         perm_matrices = torch.empty(0, device=x.device)
         n_blocks_res = triton.cdiv(n_squared, BLOCK_N)
         stride_perm_k = 0
         stride_perm_ij = 0
-        
+
     N_total_expected = n_res_expected + 2 * n  # n (pre) + n (post) + n_res
-    
+
     BLOCK_K = config.pop("BLOCK_K", 64)
     # Ensure BLOCK_K doesn't exceed K dimension
     BLOCK_K = min(BLOCK_K, triton.next_power_of_2(K))
-        
+
     _LOGGER.info(
         f"FUSED_MHC: x={tuple(x.shape)} phi_pre={tuple(phi_pre.shape)} phi_post={tuple(phi_post.shape)} "
         f"phi_res={tuple(phi_res.shape)} alpha_pre={alpha_pre} alpha_post={alpha_post} alpha_res={alpha_res} "
         f"hres_mode={hres_mode} num_ksplit={num_ksplit}"
     )
 
-    assert K == K_pre == K_post == K_res, (
-        f"Dimension mismatch: x has K={K}, but phi_pre={K_pre}, phi_post={K_post}, phi_res={K_res}"
-    )
-    assert n_pre == n, f"phi_pre shape mismatch: expected (K, {n}), got ({K_pre}, {n_pre})"
-    assert n_post == n, f"phi_post shape mismatch: expected (K, {n}), got ({K_post}, {n_post})"
-    
-    assert bias.shape[0] == N_total_expected, (
-        f"Bias shape mismatch: expected ({N_total_expected},), got {bias.shape}"
-    )
+    assert (
+        K == K_pre == K_post == K_res
+    ), f"Dimension mismatch: x has K={K}, but phi_pre={K_pre}, phi_post={K_post}, phi_res={K_res}"
+    assert (
+        n_pre == n
+    ), f"phi_pre shape mismatch: expected (K, {n}), got ({K_pre}, {n_pre})"
+    assert (
+        n_post == n
+    ), f"phi_post shape mismatch: expected (K, {n}), got ({K_post}, {n_post})"
+
+    assert (
+        bias.shape[0] == N_total_expected
+    ), f"Bias shape mismatch: expected ({N_total_expected},), got {bias.shape}"
     assert num_ksplit >= 1, f"num_ksplit must be >= 1, got {num_ksplit}"
-    
-    assert x.device == phi_pre.device == phi_post.device == phi_res.device == bias.device, (
-        "All tensors must be on the same device"
-    )
+
+    assert (
+        x.device == phi_pre.device == phi_post.device == phi_res.device == bias.device
+    ), "All tensors must be on the same device"
     assert x.device.type == "cuda", "mHC kernel requires CUDA device"
 
     N = N_total_expected
-    
+
     # Allocate outputs if not provided
     # H_res is always (M, n²) regardless of mode (lite outputs n² after perm combination)
     if out_pre is None:
         out_pre = torch.empty(M, n, dtype=x.dtype, device=x.device)
     else:
-        assert out_pre.shape == (M, n), f"out_pre shape mismatch: expected ({M}, {n}), got {out_pre.shape}"
+        assert out_pre.shape == (
+            M,
+            n,
+        ), f"out_pre shape mismatch: expected ({M}, {n}), got {out_pre.shape}"
         assert out_pre.dtype == x.dtype and out_pre.device == x.device
-    
+
     if out_post is None:
         out_post = torch.empty(M, n, dtype=x.dtype, device=x.device)
     else:
-        assert out_post.shape == (M, n), f"out_post shape mismatch: expected ({M}, {n}), got {out_post.shape}"
+        assert out_post.shape == (
+            M,
+            n,
+        ), f"out_post shape mismatch: expected ({M}, {n}), got {out_post.shape}"
         assert out_post.dtype == x.dtype and out_post.device == x.device
-    
+
     if out_res is None:
         out_res = torch.empty(M, n_squared, dtype=x.dtype, device=x.device)
     else:
-        assert out_res.shape == (M, n_squared), f"out_res shape mismatch: expected ({M}, {n_squared}), got {out_res.shape}"
+        assert out_res.shape == (
+            M,
+            n_squared,
+        ), f"out_res shape mismatch: expected ({M}, {n_squared}), got {out_res.shape}"
         assert out_res.dtype == x.dtype and out_res.device == x.device
 
     # Stream-aware grid: Each program processes exactly one stream
@@ -203,15 +217,23 @@ def fused_mhc(
         # Split-K path: use split and reduce kernels
         splitk_block_size = triton.cdiv(K, num_ksplit)
         actual_ksplit = triton.cdiv(K, splitk_block_size)
-        
+
         # Allocate intermediate buffers (float32 for precision)
         # acc_res size depends on mode: n² for sinkhorn, n! for lite
         acc_res_cols = n_res_expected
-        acc_pre_partial = torch.empty((num_ksplit, M, n), dtype=torch.float32, device=x.device)
-        acc_post_partial = torch.empty((num_ksplit, M, n), dtype=torch.float32, device=x.device)
-        acc_res_partial = torch.empty((num_ksplit, M, acc_res_cols), dtype=torch.float32, device=x.device)
-        acc_sq_partial = torch.empty((num_ksplit, M), dtype=torch.float32, device=x.device)
-        
+        acc_pre_partial = torch.empty(
+            (num_ksplit, M, n), dtype=torch.float32, device=x.device
+        )
+        acc_post_partial = torch.empty(
+            (num_ksplit, M, n), dtype=torch.float32, device=x.device
+        )
+        acc_res_partial = torch.empty(
+            (num_ksplit, M, acc_res_cols), dtype=torch.float32, device=x.device
+        )
+        acc_sq_partial = torch.empty(
+            (num_ksplit, M), dtype=torch.float32, device=x.device
+        )
+
         # Launch split kernel with 3D grid: (M_blocks, N_blocks_total, NUM_KSPLIT)
         grid_split = (triton.cdiv(M, BLOCK_M), total_n_blocks, num_ksplit)
         _mhc_fused_split_kernel[grid_split](
@@ -255,7 +277,7 @@ def fused_mhc(
             HRES_LITE_MODE=hres_lite_mode,
             **config,
         )
-        
+
         # Launch reduce kernel with 2D grid: (M_blocks, N_blocks_total)
         grid_reduce = (triton.cdiv(M, BLOCK_M), total_n_blocks)
         _mhc_fused_reduce_kernel[grid_reduce](
@@ -383,27 +405,38 @@ def mhc(
         - H_res: (M, n²) - doubly stochastic residual connection
     """
     _LOGGER.info(
-        f"MHC: calling fused_mhc() with hres_mode='lite'" if hres_mode == "lite" \
+        f"MHC: calling fused_mhc() with hres_mode='lite'"
+        if hres_mode == "lite"
         else f"MHC: calling fused_mhc() then sinkhorn_knopp() with {sinkhorn_iters} iterations"
     )
     res = fused_mhc(
-        x, phi_pre, phi_post, phi_res,
-        alpha_pre, alpha_post, alpha_res,
-        bias, n, eps, hres_mode=hres_mode,
-        out_pre=out_pre, out_post=out_post, out_res=out_res,
-        config=config
+        x,
+        phi_pre,
+        phi_post,
+        phi_res,
+        alpha_pre,
+        alpha_post,
+        alpha_res,
+        bias,
+        n,
+        eps,
+        hres_mode=hres_mode,
+        out_pre=out_pre,
+        out_post=out_post,
+        out_res=out_res,
+        config=config,
     )
 
     if hres_mode == "lite":
         return res
     else:
         out_pre, out_post, out_res = res
-        
+
         M = out_res.shape[0]
         C = x.shape[1] // n
         out_res_3d = out_res.view(M, n, n)
         sinkhorn_knopp(out_res_3d, C=C, num_iters=sinkhorn_iters, out=out_res_3d)
-        
+
         return out_pre, out_post, out_res
 
 
@@ -421,9 +454,7 @@ def sinkhorn_knopp(
         torch.Tensor: Doubly stochastic matrices with shape (M, N, N).
             Each matrix in the batch has rows and columns summing to 1.
     """
-    _LOGGER.info(
-        f"Sinkhorn-Knopp: logits={tuple(logits.shape)} num_iters={num_iters}"
-    )
+    _LOGGER.info(f"Sinkhorn-Knopp: logits={tuple(logits.shape)} num_iters={num_iters}")
 
     assert logits.dim() == 3, f"logits must be 3D (M, N, N), got {logits.dim()}D"
 
@@ -450,10 +481,10 @@ def sinkhorn_knopp(
     if config is None:
         config, _ = get_mhc_config("MHC_SINKHORN", M, C)
     config = dict(config)  # Always copy to avoid mutating LRU cache
-    
+
     # Pop BLOCK_M for grid calculation (handle legacy BLOCK_SIZE name)
     BLOCK_M = config.pop("BLOCK_M", config.pop("BLOCK_SIZE", 8))
-    
+
     # Grid: one program per batch element, need large batch size for optimal performance
     grid = (triton.cdiv(M, BLOCK_M),)
 

@@ -28,7 +28,6 @@ from itertools import permutations as itertools_permutations
 from math import factorial
 import torch
 
-
 # =============================================================================
 # PyTorch Reference Implementations
 # =============================================================================
@@ -67,9 +66,9 @@ def mhc_torch(
         - H_res: (M, n²) doubly stochastic residual connection
     """
     x_f32 = x.to(torch.float32)
-    
+
     # Eq 15: r = ||x̃||₂ / √(nC)
-    mean_sq = torch.mean(x_f32 ** 2, dim=-1, keepdim=True)
+    mean_sq = torch.mean(x_f32**2, dim=-1, keepdim=True)
     rms = torch.sqrt(mean_sq + eps)
     x_norm = x_f32 / rms
 
@@ -77,7 +76,7 @@ def mhc_torch(
     phi_pre_f32 = phi_pre.to(torch.float32)
     phi_post_f32 = phi_post.to(torch.float32)
     phi_res_f32 = phi_res.to(torch.float32)
-    
+
     H_tilde_pre = x_norm @ phi_pre_f32  # (M, n)
     H_tilde_post = x_norm @ phi_post_f32  # (M, n)
     H_tilde_res = x_norm @ phi_res_f32  # (M, n²)
@@ -85,23 +84,23 @@ def mhc_torch(
     # Split bias
     bias_f32 = bias.to(torch.float32)
     bias_pre = bias_f32[:n]
-    bias_post = bias_f32[n:2*n]
-    bias_res = bias_f32[2*n:]
+    bias_post = bias_f32[n : 2 * n]
+    bias_res = bias_f32[2 * n :]
 
     # Eq 16: Apply stream-specific scaling and bias
     # Note: normalization already applied in x_norm above
     H_pre = alpha_pre * H_tilde_pre + bias_pre
     H_post = alpha_post * H_tilde_post + bias_post
     H_res = alpha_res * H_tilde_res + bias_res
-    
+
     # Eq 17: Apply sigmoid activation to pre-stream
     # H^pre = σ(H^pre)
     H_pre = torch.sigmoid(H_pre)
-    
+
     # Eq 18: Apply scaled sigmoid activation to post-stream
     # H^post = 2σ(H^post)
     H_post = 2.0 * torch.sigmoid(H_post)
-    
+
     # Eq 19: Apply Sinkhorn-Knopp to H^res for doubly stochastic constraint
     # Reshape H_res from (M, n²) to (M, n, n) for Sinkhorn algorithm
     # Note: Use 20 iterations to match the default in the Triton mhc() implementation
@@ -112,7 +111,7 @@ def mhc_torch(
         H_res = H_res_ds.view(M, -1)  # Reshape back to (M, n²)
     else:
         H_res = H_res.to(torch.float32)
-    
+
     return H_pre.to(x.dtype), H_post.to(x.dtype), H_res.to(x.dtype)
 
 
@@ -144,9 +143,9 @@ def mhc_lite_torch(
     M = x.shape[0]
     n_factorial = factorial(n)
     n_squared = n * n
-    
+
     # Eq 15: r = ||x̃||₂ / √(nC)
-    mean_sq = torch.mean(x_f32 ** 2, dim=-1, keepdim=True)
+    mean_sq = torch.mean(x_f32**2, dim=-1, keepdim=True)
     rms = torch.sqrt(mean_sq + eps)
     x_norm = x_f32 / rms
 
@@ -154,44 +153,44 @@ def mhc_lite_torch(
     phi_pre_f32 = phi_pre.to(torch.float32)
     phi_post_f32 = phi_post.to(torch.float32)
     phi_res_f32 = phi_res.to(torch.float32)
-    
-    H_tilde_pre = x_norm @ phi_pre_f32    # (M, n)
+
+    H_tilde_pre = x_norm @ phi_pre_f32  # (M, n)
     H_tilde_post = x_norm @ phi_post_f32  # (M, n)
-    H_tilde_res = x_norm @ phi_res_f32    # (M, n!)
+    H_tilde_res = x_norm @ phi_res_f32  # (M, n!)
 
     # Split bias - for lite mode, bias_res has n! elements
     bias_f32 = bias.to(torch.float32)
     bias_pre = bias_f32[:n]
-    bias_post = bias_f32[n:2*n]
-    bias_res = bias_f32[2*n:2*n + n_factorial]
+    bias_post = bias_f32[n : 2 * n]
+    bias_res = bias_f32[2 * n : 2 * n + n_factorial]
 
     # Eq 16: Apply stream-specific scaling and bias
     H_pre = alpha_pre * H_tilde_pre + bias_pre
     H_post = alpha_post * H_tilde_post + bias_post
     H_res_weights = alpha_res * H_tilde_res + bias_res  # (M, n!)
-    
+
     # Eq 17: Apply sigmoid activation to pre-stream
     H_pre = torch.sigmoid(H_pre)
-    
+
     # Eq 18: Apply scaled sigmoid activation to post-stream
     H_post = 2.0 * torch.sigmoid(H_post)
-    
+
     # mHC-lite: softmax + permutation combination
     # Apply softmax to get convex coefficients
     alpha_coeffs = torch.softmax(H_res_weights, dim=-1)  # (M, n!)
-    
+
     # Generate all n! permutation matrices
     all_perms = list(itertools_permutations(range(n)))
     P = torch.zeros(n_factorial, n, n, device=x.device, dtype=torch.float32)
     for k, perm in enumerate(all_perms):
         for i, j in enumerate(perm):
             P[k, i, j] = 1.0
-    
+
     # Weighted sum: H_res[m] = Σ_k α[m,k] * P[k]
     # Using einsum: (M, n!) x (n!, n, n) -> (M, n, n)
-    H_res = torch.einsum('mk,kij->mij', alpha_coeffs, P)  # (M, n, n)
+    H_res = torch.einsum("mk,kij->mij", alpha_coeffs, P)  # (M, n, n)
     H_res = H_res.view(M, n_squared)  # Flatten to (M, n²)
-    
+
     return H_pre.to(x.dtype), H_post.to(x.dtype), H_res.to(x.dtype)
 
 
@@ -321,16 +320,18 @@ def generate_mhc_inputs(
         - n: stream parameter (returned for convenience)
     """
     if mode not in ("mhc", "mhc_lite", "sinkhorn_knopp_only"):
-        raise ValueError(f"Invalid mode: {mode}. Must be 'mhc', 'mhc_lite', or 'sinkhorn_knopp_only'")
-    
+        raise ValueError(
+            f"Invalid mode: {mode}. Must be 'mhc', 'mhc_lite', or 'sinkhorn_knopp_only'"
+        )
+
     nC = n * C  # Total flattened dimension
-    
+
     # Determine phi_res and bias dimensions based on mode
     if mode == "mhc_lite":
         n_res = factorial(n)  # n! columns for lite mode
     else:
         n_res = n * n  # n² columns for sinkhorn mode
-    
+
     N_total = n_res + 2 * n
 
     # flattened n-stream residual
@@ -374,11 +375,11 @@ def get_test_shapes():
                 shapes.append((M, n, C))
     # Edge cases
     shapes += [
-        (1, 4, 256),      # Minimal batch
-        (1, 16, 4096),    # Single sample, large C
-        (2048, 4, 512),   # Large batch, small C
-        (128, 4, 7168),   # Non-power-of-2 C
-        (64, 8, 2112),    # Non-power-of-2 C
+        (1, 4, 256),  # Minimal batch
+        (1, 16, 4096),  # Single sample, large C
+        (2048, 4, 512),  # Large batch, small C
+        (128, 4, 7168),  # Non-power-of-2 C
+        (64, 8, 2112),  # Non-power-of-2 C
     ]
 
     return shapes
