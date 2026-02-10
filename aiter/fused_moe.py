@@ -933,10 +933,17 @@ def get_2stage_cfgs(
             flydsl_block_m = default_flydsl_block_m
 
         def get_dsl_block_m():
+            # W4A16 (bf16 activations, elem_bytes=2) needs block_m >= 32
+            # to satisfy the 16B alignment constraint in FlyDSL stage2:
+            #   bytes_per_thread_x = block_m * tile_k * elem_bytes / total_threads
+            #   With tile_k=64, elem_bytes=2, total_threads=256:
+            #     block_m=16 -> 8 (fails 16B check), block_m=32 -> 16 (OK)
+            # fp8 (elem_bytes=1) can use block_m=16 safely.
+            min_block_m = 32 if _is_flydsl_w4a16 else 16
             if token > 128:
-                return 32
+                return max(32, min_block_m)
             else:
-                return 16
+                return min_block_m
 
         flydsl_block_m = get_dsl_block_m()
 
@@ -1375,6 +1382,7 @@ def torch_moe(
 
     inter_dim = w2.shape[2]
     # For W4A16 (packed int4), w2 last dim is inter_dim//2
+    _is_w4a16 = w1.dtype in (dtypes.i8, torch.int8)
     if _is_w4a16:
         inter_dim = inter_dim * 2
 
@@ -1776,7 +1784,7 @@ def flydsl_moe_stage1(
 
     tile_m = int(block_m) if block_m is not None else 64
     tile_n = 64 # 128
-    tile_k = 256
+    tile_k = 128 if _is_w4a16 else 256
     # Decode/small-token fix (NO kernel changes):
     # FlyDSL stage1 kernel expects CK-style preshuffled W1 layout, but model weights are not
     # preshuffled. For small tokens, only a handful of experts are actually touched.
@@ -1868,7 +1876,6 @@ def flydsl_moe_stage1(
     x_q = hidden_states.contiguous().view(token_num, model_dim)
     # FlyDSL kernels take f32 scales. Some upstream paths may provide fp16/fp8 scales;
     # For W4A16: a1_scale is not used (activations are bf16, no quant)
-    _is_w4a16 = w1.dtype in (dtypes.i8, torch.int8)
     if _is_w4a16:
         # W4A16: create dummy scale (all 1s) - kernel will use bf16 activations directly
         scale_x_1d = torch.ones(token_num, dtype=torch.float32, device=hidden_states.device)
@@ -1917,9 +1924,9 @@ def flydsl_moe_stage1(
     stream_ptr = torch.cuda.current_stream().cuda_stream
 
     # W4A16: int4 weights packed as i8, bf16 activations
-    _stage1_in_dtype = "int4_bf16" if w1.dtype in (dtypes.i8, torch.int8) else "fp8"
+    _stage1_in_dtype = "int4_bf16" if _is_w4a16 else "fp8"
 
-    thread_size = 256 if token_num > 128 else 128
+    thread_size = None if _is_w4a16 else (256 if token_num > 128 else 128)
     key1 = (
         model_dim,
         inter_dim,
@@ -1937,7 +1944,7 @@ def flydsl_moe_stage1(
     )
     exe1 = _FLYDSL_MOE_GEMM1_CACHE.get(key1)
     if exe1 is None:
-        exe1 = compile_moe_gemm1(
+        compile_kwargs = dict(
             model_dim=model_dim,
             inter_dim=inter_dim,
             experts=E,
@@ -1949,9 +1956,11 @@ def flydsl_moe_stage1(
             in_dtype=_stage1_in_dtype,
             out_dtype=out_dtype,
             use_cshuffle_epilog=False,
-            total_thread_size=thread_size,
             group_size=group_size,
         )
+        if thread_size is not None:
+            compile_kwargs["total_thread_size"] = thread_size
+        exe1 = compile_moe_gemm1(**compile_kwargs)
         _FLYDSL_MOE_GEMM1_CACHE[key1] = exe1
     exe1(
         out,
@@ -1967,7 +1976,7 @@ def flydsl_moe_stage1(
         inter_dim,
         model_dim,
         int(blocks),
-        stream_ptr,
+        stream_ptr
     )
 
     # Debug hook: run CK in parallel and diff (small tokens only).
@@ -2274,14 +2283,12 @@ def flydsl_moe_stage2(
 
     a2_qt_flat = a2.contiguous().view(-1)
     # For W4A16: a2_scale is not used (activations are bf16 from stage1)
-    _is_w4a16_s2 = w2.dtype in (dtypes.i8, torch.int8)
     if _is_w4a16_s2:
         # W4A16: create dummy scale (all 1s)
         a2_scale_1d = torch.ones(token_num * topk, dtype=torch.float32, device=a2.device)
     else:
         a2_scale_1d = a2_scale.view(-1).contiguous().to(torch.float32)
     # W4A16: int4 packed, shape is [E, model_dim, inter_dim//2]
-    _is_w4a16_s2 = w2.dtype in (dtypes.i8, torch.int8)
     if _is_w4a16_s2:
         w2_flat = w2.contiguous().view(-1)  # FlyDSL expects 1D buffer for int4
     else:
@@ -2365,9 +2372,9 @@ def flydsl_moe_stage2(
     stream_ptr = torch.cuda.current_stream().cuda_stream
 
     # W4A16: int4 weights packed as i8, bf16 activations
-    _stage2_in_dtype = "int4_bf16" if w2.dtype in (dtypes.i8, torch.int8) else "fp8"
+    _stage2_in_dtype = "int4_bf16" if _is_w4a16_s2 else "fp8"
 
-    thread_size = 256  # if token_num > 128 else 64
+    thread_size = None if _is_w4a16_s2 else 256
 
     key2 = (
         model_dim,
@@ -2386,7 +2393,7 @@ def flydsl_moe_stage2(
     )
     exe2 = _FLYDSL_MOE_GEMM2_CACHE.get(key2)
     if exe2 is None:
-        exe2 = compile_moe_gemm2_ex(
+        compile_kwargs = dict(
             model_dim=model_dim,
             inter_dim=inter_dim,
             experts=E,
@@ -2398,9 +2405,11 @@ def flydsl_moe_stage2(
             in_dtype=_stage2_in_dtype,
             out_dtype=out_dtype,
             mode=moe_mode,
-            total_thread_size=thread_size,
             group_size=group_size,
         )
+        if thread_size is not None:
+            compile_kwargs["total_thread_size"] = thread_size
+        exe2 = compile_moe_gemm2_ex(**compile_kwargs)
         _FLYDSL_MOE_GEMM2_CACHE[key2] = exe2
 
     exe2(
@@ -2417,7 +2426,7 @@ def flydsl_moe_stage2(
         model_dim,
         inter_dim,
         int(blocks),
-        stream_ptr,
+        stream_ptr
     )
     if _do_cmp:
         out_ck = out_base.clone()  # type: ignore[union-attr]
