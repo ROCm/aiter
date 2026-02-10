@@ -408,7 +408,7 @@ parser.add_argument(
     choices=[dtypes.d_dtypes["i8"], dtypes.d_dtypes["fp8"]],
     nargs="*",
     default=[dtypes.d_dtypes["i8"], dtypes.d_dtypes["fp8"]],
-    help="""Date type of quantization.
+    help="""Data type of quantization.
     e.g.: -q fp8""",
 )
 parser.add_argument(
