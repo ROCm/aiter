@@ -58,7 +58,6 @@ template <ck_tile::index_t M_Tile,
           ck_tile::index_t K_Warp_Tile,
           bool TiledMMAPermuteN                    = false,
           bool TransposeC                          = false,
-          bool PreshuffleQuantB                    = false,
           bool UsePersistentKernel                 = false,
           ck_tile::GemmPipelineScheduler Scheduler = ck_tile::GemmPipelineScheduler::Intrawave,
           int BlockPerCu                           = 1>
@@ -75,7 +74,6 @@ struct CreateTileGemmConfig
     static constexpr ck_tile::index_t K_Warp_Tile_v             = K_Warp_Tile;
     static constexpr bool TiledMMAPermuteN_v                    = TiledMMAPermuteN;
     static constexpr bool TransposeC_v                          = TransposeC;
-    static constexpr bool PreshuffleQuantB_v                    = PreshuffleQuantB;
     static constexpr bool UsePersistentKernel_v                 = UsePersistentKernel;
     static constexpr ck_tile::GemmPipelineScheduler Scheduler_v = Scheduler;
     static constexpr int BlockPerCu_v                           = BlockPerCu;
@@ -92,7 +90,6 @@ template <ck_tile::index_t M_Tile,
           ck_tile::index_t K_Warp_Tile,
           bool TiledMMAPermuteN                    = false,
           bool TransposeC                          = false,
-          bool PreshuffleQuantB                    = false,
           bool UsePersistentKernel                 = false,
           ck_tile::GemmPipelineScheduler Scheduler = ck_tile::GemmPipelineScheduler::Intrawave,
           int BlockPerCu                           = 1>
@@ -107,7 +104,6 @@ using TileGemmConfig = CreateTileGemmConfig<M_Tile,
                                             K_Warp_Tile,
                                             TiledMMAPermuteN,
                                             TransposeC,
-                                            PreshuffleQuantB,
                                             UsePersistentKernel,
                                             Scheduler,
                                             BlockPerCu>;
@@ -122,7 +118,6 @@ template <typename QDataType,
           bool UseDoubleSmemBuffer = PreshuffleB>
 void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
 {
-
     static constexpr ck_tile::QuantType QuantMode = ck_tile::QuantType::ABQuantGrouped;
     static constexpr bool transpose_c             = BQuantGroupSize::kN == 128;
     static constexpr bool eight_warps =

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import pandas as pd
 import torch
 import torch.nn.functional as F
@@ -11,11 +11,11 @@ from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BLOCKSCALE
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.ops.shuffle import shuffle_weight, shuffle_bq
-
 from aiter.jit.utils.chip_info import get_gfx
 # ck
 import sys
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from ck_gemm_a8w8_blockscale_bpreshuffle.gemm_a8w8_blockscale_bpreshuffle_common import (
     kernels_list as candidate_kernels_bpreshuffle_dict,
@@ -23,11 +23,8 @@ from ck_gemm_a8w8_blockscale_bpreshuffle.gemm_a8w8_blockscale_bpreshuffle_common
 from gemm_a8w8_blockscale_instance import candidate_kernels_dict
 # cktile
 from gemm_a8w8_blockscale_cktile_instance import candidate_kernels_cktile_dict
-# from gemm_a8w8_blockscale_bpreshuffle_cktile_instance import candidate_kernels_bpreshuffle_cktile_dict
-# # TODO:: required seperate instance files for preshuffleQuantB
-# from gemm_a8w8_blockscale_bpreshuffle_cktile_instance import (
-#     candidate_kernels_bpreshuffle_cktile_dict as candidate_kernels_bpreshuffleQuant_cktile_dict
-# )
+from gemm_a8w8_blockscale_preshuffleQuant_cktile_instance import candidate_kernels_cktile_dict_preshuffleQuant
+
 
 block_shape = (128, 128)
 
@@ -121,10 +118,12 @@ def generate_data(m, n, k, seed, device="cuda"):
     x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32, device=device)
     w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device=device)
     weight_shuffle = shuffle_weight(weight, layout=(16, 16))
-    w_scale_shuffle = shuffle_bq(w_scale, block_shape_k // 128)  #  #TODO: instead of block_shape_k it should be k_tile / group_k
+    
+    w_scale_T = w_scale.T.contiguous()
+    w_scale_shuffle = shuffle_bq(w_scale_T, block_shape_k // 128)  #TODO: instead of block_shape_k it should be k_tile / group_k
     out = torch.empty(m, n, dtype=dtypes.bf16, device=device)
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
-    return (x, weight, x_scale, w_scale, out, weight_shuffle, x_scale_t, w_scale_shuffle)
+    return (x, weight, x_scale, w_scale, out, weight_shuffle, x_scale_t, w_scale_shuffle, w_scale_T)
 
 
 class GemmA8W8BlockScaleTuner(GemmCommonTuner):
@@ -185,7 +184,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             kernel_list = candidate_kernels_bpreshuffle_dict if preshuffleB else candidate_kernels_dict
         elif libType == "cktile":
             #kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
-            kernel_list = candidate_kernels_cktile_dict
+            kernel_list = candidate_kernels_cktile_dict_preshuffleQuant if preshuffleQuantB else candidate_kernels_cktile_dict
         else:
             return None
 
@@ -204,10 +203,10 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
     ):
         cu_num, M, N, K = info_keys
         #kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
-        kernel_list = candidate_kernels_cktile_dict #TODO: fix for candidate list based on diff scenario
+        kernel_list = candidate_kernels_cktile_dict_preshuffleQuant if preshuffleQuantB else candidate_kernels_cktile_dict
         kernels_num = len(kernel_list)
         #gemm_a8w8_idx = [0, 5 if preshuffleB else 1, 2, 3, 4]
-        ref_data_idx = [0, 1, 2, 3]
+        ref_data_idx = [0, 1, 2, 8 if preshuffleQuantB else 3]
         tasks_cktile = []
         for i in range(kernels_num):
             kernel = kernel_list[i]
@@ -228,7 +227,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 if useSplitK
                 else 0
             )
-            #print("======================= gemm_a8w8_idx = ", i, kernel.M_Tile,kernel.N_Tile, kernel.K_Tile, kernel.M_Warp, kernel.N_Warp, kernel.K_Warp)
+            #print("======================= gemm_a8w8_idx = ", i, kernel.M_Tile,kernel.N_Tile, kernel.K_Tile, kernel.M_Warp, kernel.N_Warp, kernel.K_Warp, preshuffleB, preshuffleQuantB)
             for splitK in range(maxsplitK + 1):
                 info = (info_keys, i, splitK, "", "cktile", preshuffleB, preshuffleQuantB)
                 tasks_cktile.append(

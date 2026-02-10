@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices,Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices,Inc. All rights reserved.
 from dataclasses import dataclass
 import os
 import sys
@@ -78,39 +78,36 @@ class TileKernelInstance:
         )
 
 
-    #0:   TileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,            False,           False,             2      ),
-    #1:   TileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,           64,      "Intrawave",        False,            False,           False,             1      ),
-    #2:   TileKernelInstance(   192,     256,      128,     4,        2,       1,        16,            16,          128,      "Intrawave",        False,            False,           False,             1      ),
 # fmt: off
 # Candidate and default kernel instances for tile gemm a8w8 blockscale
 # These instances are used for generating the kernel code and tuning.
 kernels_list_942 = {
     #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile |   Scheduler   | TiledMMAPermuteN |  TransposeC | UsePersistentKernel | BlockPerCu |
-    0:   TileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,           64,     "Intrawave",         False,             True,           False,             1      ),
-    1:   TileKernelInstance(    16,     128,      256,     1,        4,       1,        16,            16,           64,     "Intrawave",         False,             True,           False,             1      ),
+    0:   TileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,           64,     "Intrawave",         False,            False ,           False,             1      ),
+    1:   TileKernelInstance(    16,     128,      256,     1,        4,       1,        16,            16,           64,     "Intrawave",         False,            False ,           False,             1      ),
 }
 default_kernels_dict_942 = {
     #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile |   Scheduler   | TiledMMAPermuteN |  TransposeC  | UsePersistentKernel | BlockPerCu |
-    -1:  TileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,           64,      "Intrawave",        False,             True,           False,             1      ),
+    -1:  TileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,           64,      "Intrawave",        False,            False,           False,             1      ),
 }
 
 kernels_list_95x = {
     #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile |   Scheduler   | TiledMMAPermuteN |  TransposeC | UsePersistentKernel | BlockPerCu |
-    0:   TileKernelInstance(    16,     128,      256,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             2      ),
-    1:   TileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             1      ),
-    2:   TileKernelInstance(   192,     256,      128,     4,        2,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             1      ),
-    3:   TileKernelInstance(   128,     128,      128,     2,        2,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             2      ),
+    0:   TileKernelInstance(    16,     128,      256,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,            False,           False,             2      ),
+    1:   TileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,            False,           False,             1      ),
+    2:   TileKernelInstance(   192,     256,      128,     4,        2,       1,        16,            16,          128,      "Intrawave",        False,            False,           False,             1      ),
+    3:   TileKernelInstance(   128,     128,      128,     2,        2,       1,        16,            16,          128,      "Intrawave",        False,            False,           False,             2      ),
 }
 default_kernels_dict_95x = {
     #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile |   Scheduler   | TiledMMAPermuteN |  TransposeC  | UsePersistentKernel | BlockPerCu |
-    -1:  TileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             1      ),
+    -1:  TileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,            False,           False,             1      ),
 }
 # fmt: on
 
 arch = get_gfx()
 if arch.startswith("gfx95"):
-    candidate_kernels_cktile_dict = kernels_list_95x
-    default_kernels_cktile_dict = default_kernels_dict_95x
+    candidate_kernels_cktile_dict_preshuffleQuant = kernels_list_95x
+    default_kernels_cktile_dict_preshuffleQuant = default_kernels_dict_95x
 else:
-    candidate_kernels_cktile_dict = kernels_list_942
-    default_kernels_cktile_dict = default_kernels_dict_942
+    candidate_kernels_cktile_dict_preshuffleQuant = kernels_list_942
+    default_kernels_cktile_dict_preshuffleQuant = default_kernels_dict_942

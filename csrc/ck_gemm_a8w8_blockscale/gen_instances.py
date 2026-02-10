@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-202, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
 import os
 import shutil
@@ -62,9 +62,9 @@ class gemm_a8w8_blockscale_codegen:
 
         return tune_dict
 
-    def gen_legacy_instance(self, k: KernelInstance):
+    def gen_ck_instance(self, k: KernelInstance):
         """
-        Generate kernel instance code for legacy gemm a8w8 blockscale
+        Generate kernel instance code for ck gemm a8w8 blockscale
         """
 
         LEGACY_INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
@@ -348,12 +348,12 @@ torch::Tensor
 
     def gen_code(self, kernels_dict: dict):
         """
-        Codegen for legacy gemm a8w8 blockscale
+        Codegen for ck gemm a8w8 blockscale
         """
 
         # generate instances code
         for _, k in kernels_dict.items():
-            self.gen_legacy_instance(k)
+            self.gen_ck_instance(k)
 
         # generate lookup dict for kernel instances
         self.gen_lookup_dict(kernels_dict)
@@ -374,7 +374,7 @@ torch::Tensor
             shutil.rmtree(self.instances_path)
         os.mkdir(self.instances_path)
 
-        # generate code for legacy and tile
+        # generate code for ck
         if self.istune:
             # generate code for default kernels
             self.gen_code(candidate_kernels_dict)

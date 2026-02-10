@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
 import os
 import shutil
@@ -62,7 +62,7 @@ class gemm_a8w8_blockscale_codegen:
 
         return tune_dict
 
-    def gen_tile_instance(self, k: TileKernelInstance):
+    def gen_cktile_instance(self, k: TileKernelInstance):
         """
         Generate kernel instance code for tile gemm a8w8 blockscale
         """
@@ -101,7 +101,6 @@ torch::Tensor
             {k.M_Warp_Tile}, {k.N_Warp_Tile}, {k.K_Warp_Tile},
             {str(k.TiledMMAPermuteN).lower()},
             {str(k.TransposeC).lower()},
-            {str(k.PreshuffleQuantB).lower()},
             {str(k.UsePersistentKernel).lower()},
             ck_tile::GemmPipelineScheduler::{k.Scheduler},
             {k.BlockPerCu}>;
@@ -235,27 +234,16 @@ torch::Tensor
 
     def gen_code(self, kernels_dict: dict):
         """
-        Codegen for tile gemm a8w8 blockscale
+        Codegen for cktile gemm a8w8 blockscale
         """
-        default_k = default_kernels_cktile_dict.get(-1)
-        filtered_kernels = {}
-        # filter out instances that don't meet requirements and replace them with a fallback default.
-        for name, k in kernels_dict.items():
-            if not get_gfx().startswith("gfx95"):
-                if (k.M_Warp * k.N_Warp * k.K_Warp == 8) or (k.K_Warp_Tile > 64):
-                    filtered_kernels[name] = default_k
-                    continue
-
-            filtered_kernels[name] = k
         # generate instances code
-        for _, k in filtered_kernels.items():
-            self.gen_tile_instance(k)
+        for _, k in kernels_dict.items():
+            self.gen_cktile_instance(k)
 
         # generate lookup dict for kernel instances
-        self.gen_lookup_dict(filtered_kernels)
-
+        self.gen_lookup_dict(kernels_dict)
         # generate manifest header for kernel instances
-        self.gen_manifest_head(filtered_kernels)
+        self.gen_manifest_head(kernels_dict)
 
     def run(self):
         """
@@ -270,7 +258,7 @@ torch::Tensor
             shutil.rmtree(self.instances_path)
         os.mkdir(self.instances_path)
 
-        # generate code for legacy and tile
+        # generate code for cktile
         if self.istune:
             # generate code for default kernels
             self.gen_code(candidate_kernels_cktile_dict)
