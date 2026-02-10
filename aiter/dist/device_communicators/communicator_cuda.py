@@ -233,7 +233,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self, input_, res_inp_, weight_, eps
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         total_bytes = input_.numel() * input_.element_size()
-        if total_bytes <= 512 * 1024:
+        if (
+            int(input_.shape[-1]) in [512, 1024, 2048, 4096]
+            and total_bytes <= 4096 * 1024
+        ):
             use_1stage = True if total_bytes <= 128 * 1024 else False
             out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_quant(
                 input_, res_inp_, weight_, eps, use_1stage

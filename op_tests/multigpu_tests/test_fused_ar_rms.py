@@ -659,15 +659,14 @@ if __name__ == "__main__":
             ),
             post_per_token_quant=False,
         )
-        if shape[1] in [512, 1024, 2048, 4096]:
-            test_fused_ar_rmsnorm(
-                tp,
-                pp,
-                shape,
-                dtype,
-                withGraph=graph_on,
-                distributed_init_method=get_distributed_init_method(
-                    get_ip(), get_open_port()
-                ),
-                post_per_token_quant=True,
-            )
+        test_fused_ar_rmsnorm(
+            tp,
+            pp,
+            shape,
+            dtype,
+            withGraph=graph_on,
+            distributed_init_method=get_distributed_init_method(
+                get_ip(), get_open_port()
+            ),
+            post_per_token_quant=True,
+        )
