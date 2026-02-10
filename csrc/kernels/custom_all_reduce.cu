@@ -17,12 +17,16 @@
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
 #include <torch/all.h>
+#include <torch/csrc/distributed/c10d/ParamCommsUtils.hpp>
 
 #include "custom_all_reduce.cuh"
 
 // fake pointer type, must match fptr_t type in ops.h
 using fptr_t = int64_t;
 static_assert(sizeof(void*) == sizeof(fptr_t));
+
+// Sequence counter for profiling collective operations
+static std::atomic<int64_t> aiter_collective_seq_{0};
 
 namespace aiter {
 
@@ -79,6 +83,45 @@ bool _is_weak_contiguous(torch::Tensor& t)
     return t.is_contiguous() || (t.storage().nbytes() - t.storage_offset() * t.element_size() ==
                                  t.numel() * t.element_size());
 }
+
+#define INSTRUMENTATION(kernel_name, inp, out, rank_id, world_size)         \
+  std::vector<torch::Tensor> input_tensors = {inp};                         \
+  std::vector<torch::Tensor> output_tensors = {out};                        \
+  std::vector<int64_t> inp_split_sizes;                                     \
+  std::vector<int64_t> out_split_sizes;                                     \
+  if (inp.numel() != out.numel())                                           \
+  {                                                                         \
+    if (inp.numel() > out.numel())                                          \
+    {                                                                       \
+      for (int i = 0; i < rank_id; ++i)                                     \
+      {                                                                     \
+        out_split_sizes.push_back(out.numel());                             \
+      }                                                                     \
+    }                                                                       \
+    else                                                                    \
+    {                                                                       \
+      for (int i = 0; i < rank_id; ++i)                                     \
+      {                                                                     \
+        inp_split_sizes.push_back(inp.numel());                             \
+      }                                                                     \
+    }                                                                       \
+  }                                                                         \
+  RECORD_PARAM_COMMS_DATA(                                                  \
+    std::make_tuple(static_cast<int64_t>(aiter_collective_seq_++), false),  \
+    std::make_tuple("aiter_custom", "communication_kernel"),                \
+    input_tensors,                                                          \
+    output_tensors,                                                         \
+    rank_id,                                                                \
+    kernel_name,                                                            \
+    inp.numel(),                                                            \
+    out.numel(),                                                            \
+    inp.scalar_type(),                                                      \
+    inp_split_sizes,                                                        \
+    out_split_sizes,                                                        \
+    0,                                                                      \
+    1,                                                                      \
+    world_size                                                              \
+  )
 
 void _all_reduce(
     fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, hipStream_t stream, bool use_new,
@@ -138,6 +181,10 @@ void all_reduce(fptr_t _fa,
                 std::optional<torch::Tensor> reg_input_buffer,
                 std::optional<torch::Tensor> reg_output_buffer)
 {
+    // for profiling log
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    INSTRUMENTATION("all_reduce", inp, out, fa->rank_, fa->world_size_);
+
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
@@ -256,6 +303,8 @@ void reduce_scatter(fptr_t _fa,
                 torch::Tensor& out,
                 std::optional<torch::Tensor> reg_buffer)
 {
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    INSTRUMENTATION("reduce_scatter", inp, out, fa->rank_, fa->world_size_);
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
@@ -314,6 +363,8 @@ void _all_gather(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int size, h
 
 void all_gather_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out)
 {
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    INSTRUMENTATION("all_gather", inp, out, fa->rank_, fa->world_size_);
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
@@ -322,6 +373,8 @@ void all_gather_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out)
 
 void all_gather_unreg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& reg_buffer, torch::Tensor& out)
 {
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    INSTRUMENTATION("all_gather", inp, out, fa->rank_, fa->world_size_);
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
 
@@ -335,7 +388,7 @@ void all_gather_unreg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& reg_buffer,
 }
 
 void _fused_allreduce_rmsnorm(
-    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual_inp, torch::Tensor& residual_out, torch::Tensor& out, torch::Tensor& w, int eps, int m, int n, hipStream_t stream)
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual_inp, torch::Tensor& residual_out, torch::Tensor& out, torch::Tensor& w, int eps, int m, int n, bool use_1stage, hipStream_t stream)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     TORCH_CHECK(_is_weak_contiguous(out));
@@ -348,7 +401,7 @@ void _fused_allreduce_rmsnorm(
                              reinterpret_cast<float*>(residual_out.data_ptr()),
                              reinterpret_cast<float*>(out.data_ptr()),
                              reinterpret_cast<float*>(w.data_ptr()),
-                             eps, m, n);
+                             eps, m, n, use_1stage);
         break;
     }
     case at::ScalarType::Half: {
@@ -358,7 +411,7 @@ void _fused_allreduce_rmsnorm(
                              reinterpret_cast<half*>(residual_out.data_ptr()),
                              reinterpret_cast<half*>(out.data_ptr()),
                              reinterpret_cast<half*>(w.data_ptr()),
-                             eps, m, n);
+                             eps, m, n, use_1stage);
         break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
@@ -369,7 +422,7 @@ void _fused_allreduce_rmsnorm(
                              reinterpret_cast<__hip_bfloat16*>(residual_out.data_ptr()),
                              reinterpret_cast<__hip_bfloat16*>(out.data_ptr()),
                              reinterpret_cast<__hip_bfloat16*>(w.data_ptr()),
-                             eps, m, n);
+                             eps, m, n, use_1stage);
         break;
     }
 #endif
@@ -385,8 +438,11 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                 torch::Tensor& out,
                 torch::Tensor& w,
                 float eps,
-                std::optional<torch::Tensor> reg_buffer)
+                std::optional<torch::Tensor> reg_buffer,
+                bool use_1stage)
 {
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    INSTRUMENTATION("fused_allreduce_rmsnorm", inp, out, fa->rank_, fa->world_size_);
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
@@ -406,11 +462,11 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                                 input_size,
                                 hipMemcpyDeviceToDevice,
                                 stream));
-        _fused_allreduce_rmsnorm(_fa, reg_buffer.value(), res_inp, res_out, out, w, eps, m, n, stream);
+        _fused_allreduce_rmsnorm(_fa, reg_buffer.value(), res_inp, res_out, out, w, eps, m, n, use_1stage, stream);
     }
     else
     {
-      _fused_allreduce_rmsnorm(_fa, inp, res_inp, res_out, out, w, eps, m, n, stream);
+      _fused_allreduce_rmsnorm(_fa, inp, res_inp, res_out, out, w, eps, m, n, use_1stage, stream);
     }
 }
 
