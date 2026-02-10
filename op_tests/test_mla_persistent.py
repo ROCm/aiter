@@ -689,31 +689,8 @@ def test_mla(
             kv_scale=kv_scale,
         )
 
-        # (attn_logits, attn_lse), us_asm_decode = run_perftest(
-        #     aiter.mla.mla_decode_fwd,
-        #     q_fp8 if dtype == dtypes.fp8 else q,
-        #     kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
-        #     out_asm,
-        #     qo_indptr,
-        #     kv_indptr,
-        #     kv_indices,
-        #     kv_last_page_lens,
-        #     max_seqlen_qo,
-        #     sm_scale,
-        #     num_kv_splits=max_split_per_batch,
-        #     q_scale=q_scale,
-        #     kv_scale=kv_scale,
-        #     work_meta_data=work_meta_data,
-        #     work_indptr=work_indptr,
-        #     work_info_set=work_info_set,
-        #     reduce_indptr=reduce_indptr,
-        #     reduce_final_map=reduce_final_map,
-        #     reduce_partial_map=reduce_partial_map,
-        #     intra_batch_mode=non_persistent_mode,
-        #     dbg_tr=dbg_tr,
-        # )
-
-        attn_logits, attn_lse = aiter.mla.mla_decode_fwd(
+        (attn_logits, attn_lse), us_asm_decode = run_perftest(
+            aiter.mla.mla_decode_fwd,
             q_fp8 if dtype == dtypes.fp8 else q,
             kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
             out_asm,
@@ -735,8 +712,29 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
-            dbg_tr=dbg_tr,
         )
+
+        # attn_logits, attn_lse = aiter.mla.mla_decode_fwd(
+        #     q_fp8 if dtype == dtypes.fp8 else q,
+        #     kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
+        #     out_asm,
+        #     qo_indptr,
+        #     kv_indptr,
+        #     kv_indices,
+        #     kv_last_page_lens,
+        #     max_seqlen_qo,
+        #     sm_scale,
+        #     num_kv_splits=max_split_per_batch,
+        #     q_scale=q_scale,
+        #     kv_scale=kv_scale,
+        #     work_meta_data=work_meta_data,
+        #     work_indptr=work_indptr,
+        #     work_info_set=work_info_set,
+        #     reduce_indptr=reduce_indptr,
+        #     reduce_final_map=reduce_final_map,
+        #     reduce_partial_map=reduce_partial_map,
+        #     intra_batch_mode=non_persistent_mode,
+        # )
 
         # print(f"{out_ref.view(total_q, -1)=}")
         # print(f"{out_asm.view(total_q, -1)=}")

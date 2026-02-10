@@ -998,5 +998,4 @@ def hk_mla_decode_fwd(
     # [batch_size, num_kv_splits, num_heads,  1]
     split_lse: torch.Tensor,
     final_output: torch.Tensor,
-    dbg_tr: Optional[torch.Tensor] = None,
 ) -> None: ...

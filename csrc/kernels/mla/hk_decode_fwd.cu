@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "mla.h"
-#include "hk/mi35x_decode_fwd_n128.cuh"
+#include "hk/mi3xx_v32_fwd_decode_h128_fp8_fp8.cuh"
 
 void hk_mla_decode_fwd(
     torch::Tensor& query,
@@ -17,14 +17,13 @@ void hk_mla_decode_fwd(
     const float softmax_scale,
     torch::Tensor& split_output,
     torch::Tensor& split_lse,
-    torch::Tensor& final_output,
-    std::optional<torch::Tensor>& dbg_tr)
+    torch::Tensor& final_output)
 {
     const int32_t num_head = query.size(1);
 
     if (num_head == 128)
     {
-        hk_mi35x_mla_decode_fwd_n128(
+        hk_mi3xx_mla_v32_fwd_decode_h128_fp8_fp8(
             query,
             kv_buffer,
             qo_indptr,
@@ -37,7 +36,6 @@ void hk_mla_decode_fwd(
             softmax_scale,
             split_output,
             split_lse,
-            final_output,
-            dbg_tr);
+            final_output);
     }
 }
