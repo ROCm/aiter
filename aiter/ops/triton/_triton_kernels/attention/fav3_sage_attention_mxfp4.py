@@ -1239,6 +1239,8 @@ def rotation_smooth_qk(
         BLOCK_D=block_size,
     )
 
+    k = k - k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
+
     # 2. Rotate K (Only once!)
     grid_k = (b * h_k, K_NUM_BLKS, d // block_size)
     _rot_k_only_kernel[grid_k](
@@ -1255,9 +1257,6 @@ def rotation_smooth_qk(
         BLOCK_M=BLOCK_SIZE_M,
         BLOCK_D=block_size,
     )
-
-    # smooth k after rotation
-    k = k - k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
 
     if q_smoothing:
         # 3. Compute Smoothing Delta S
