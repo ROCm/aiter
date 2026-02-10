@@ -1186,7 +1186,9 @@ def paged_attention_decode_sliding_window(
         & (mtp_query_group_size_offsets[None, :, None] < query_group_size)
         & (mtp_head_size_offsets[None, None, :] < head_size)
     )
-
+    mtp_query_tensor = gl.amd.cdna3.buffer_load(
+        ptr=query_ptr, offsets=mtp_query_offsets, mask=mtp_query_mask
+    )
     # Output shape: [batch_size, query_length, num_kv_heads, query_group_size, head_size]
     if ONE_SHOT:
         output_offsets = (
@@ -1259,9 +1261,7 @@ def paged_attention_decode_sliding_window(
     # Load query tensor with 3D MTP layout
     # Query shape: [batch_size, query_length, num_kv_heads, query_group_size, head_size]
 
-    mtp_query_tensor = gl.amd.cdna3.buffer_load(
-        ptr=query_ptr, offsets=mtp_query_offsets, mask=mtp_query_mask
-    )
+
     mtp_query_tensor = gl.reshape(
         mtp_query_tensor, [QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2]
     )
@@ -1342,8 +1342,6 @@ def paged_attention_decode_sliding_window(
     for sequence_partition_idx in range(
         sequence_partition_start_idx, sequence_partition_end_idx
     ):
-        
-        # if sequence_partition_idx+1 < sequence_partition_end_idx:
         kv_block_start_idx2 = min(sequence_partition_idx+1, sequence_partition_end_idx) * MAX_NUM_KV_BLOCKS_PER_COMPUTE
         kv_block_numbers2 = gl.amd.cdna3.buffer_load(
             ptr=block_tables_ptr + sequence_idx * stride_block_table_seq
@@ -1633,7 +1631,6 @@ def paged_attention_decode_sliding_window(
         else:
             attention_accumulator += attention_output
         max_logits = new_max_logits
-        # if sequence_partition_idx+1 < sequence_partition_end_idx:
         kv_block_numbers = kv_block_numbers2
 
     # ==================== SINKS HANDLING ====================
