@@ -1798,6 +1798,7 @@ def flydsl_moe_stage1(
         "fp8" if is_wfp4_pipeline else "bf16" if dtype == torch.bfloat16 else "f16"
     )
 
+    
     extra_w4_stage1_args = {}
     if is_wfp4_pipeline:
         extra_w4_stage1_args["a_dtype"] = "fp8"
@@ -1820,6 +1821,7 @@ def flydsl_moe_stage1(
         **extra_w4_stage1_args,
     )
 
+    stream_ptr = torch.cuda.current_stream().cuda_stream
     exe1(
         out,
         x_q,
@@ -1835,6 +1837,7 @@ def flydsl_moe_stage1(
         inter_dim,
         model_dim,
         blocks,
+        stream_ptr,
     )
     return out
 
@@ -1988,6 +1991,7 @@ def flydsl_moe_stage2(
         **extra_w4_stage2_args,
     )
 
+    stream_ptr = torch.cuda.current_stream().cuda_stream
     if accumulate:
         # ????: ???? out [tokens, model_dim]
         exe2(
@@ -2005,6 +2009,7 @@ def flydsl_moe_stage2(
             model_dim,
             inter_dim,
             blocks,
+            stream_ptr,
         )
     else:
         # Reduce ??: ??? [tokens * topk, model_dim],?? reduce
@@ -2028,6 +2033,7 @@ def flydsl_moe_stage2(
             model_dim,
             inter_dim,
             blocks,
+            stream_ptr,
         )
         # Reduce over topk dimension using torch.sum
         out_slots_3d = out_slots.view(token_num, topk, model_dim)
@@ -2145,6 +2151,7 @@ def flydsl_moe_stage2_ex(
             **extra_w4_stage2_args,
         )
 
+        stream_ptr = torch.cuda.current_stream().cuda_stream
         if accumulate:
             exe2(
                 out,
@@ -2161,6 +2168,7 @@ def flydsl_moe_stage2_ex(
                 model_dim,
                 inter_dim,
                 blocks,
+                stream_ptr,
             )
         else:
             out_slots = torch.empty(
@@ -2183,6 +2191,7 @@ def flydsl_moe_stage2_ex(
                 model_dim,
                 inter_dim,
                 blocks,
+                stream_ptr,
             )
             out_slots_3d = out_slots.view(token_num, topk, model_dim)
             flydsl_moe_reduction(
@@ -2255,13 +2264,14 @@ def flydsl_moe_reduction(
     """
     from .kernels.moe_gemm_2stage import compile_moe_reduction
 
+    stream_ptr = torch.cuda.current_stream().cuda_stream
     reduce_exe = compile_moe_reduction(
         topk=topk,
         model_dim=model_dim,
         dtype_str=dtype_str,
     )
 
-    reduce_exe(X, Y, tokens)
+    reduce_exe(X, Y, tokens, stream_ptr)
 
     return Y
 

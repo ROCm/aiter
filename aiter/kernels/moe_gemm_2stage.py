@@ -35,6 +35,7 @@ from kernels.mfma_preshuffle_pipeline import (
     tile_chunk_coord_i32,
 )
 from kernels.mfma_epilogues import c_shuffle_epilog, default_epilog, mfma_epilog
+from kernels.kernels_common import stream_ptr_to_async_token
 
 
 @functools.lru_cache(maxsize=1024)
@@ -2413,16 +2414,19 @@ def compile_moe_reduction(
             X: lambda: T.memref(DYN, topk, model_dim, _state["elem_type"]),
             Y: lambda: T.memref(DYN, model_dim, _state["elem_type"]),
             m_tokens: lambda: T.index(),
+            stream_ptr: lambda: T.i64(),  # PyTorch stream pointer
         ):
             from flydsl.dialects.ext import arith as arith_ext
             c1 = arith.as_value(arith_ext.index(1))
             gx = arith.as_value(m_tokens)
             bx = arith.as_value(arith_ext.index(BLOCK_SIZE))
+            stream_token = stream_ptr_to_async_token(stream_ptr)
             flir.gpu_ext.LaunchFuncOp(
                 [f"moe_reduction_{topk}_{model_dim}_{dtype_str}", "moe_reduction_kernel"],
                 grid_size=(gx, c1, c1),
                 block_size=(bx, c1, c1),
                 kernel_operands=[X, Y, m_tokens],
+                async_dependencies=[stream_token],
             )
 
     m = _MoeReduction()
