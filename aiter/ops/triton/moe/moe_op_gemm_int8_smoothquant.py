@@ -6,6 +6,7 @@ import torch
 import triton
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
+from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_int8_smoothquant import (
     _moe_gemm_int8_smoothquant,
     _reduce_grouped,
@@ -68,12 +69,12 @@ def allocate_output(
 def get_kernel_config(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
-    num_xcds = 8
-    xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_stages = 3
+    num_stages = 2
 
     split_k = 1
+    num_cus = get_num_sms()
+    
     if block_m == 16:
         block_n = 128
         block_k = 128
@@ -82,27 +83,14 @@ def get_kernel_config(m, n, k, routing_data):
         grid_m = routing_data.n_blocks(m, block_m)
         grid_n = triton.cdiv(n, block_n)
         grid = grid_m * grid_n * split_k
-        while block_n > 32 and grid < 256:
+        while block_n >= 64 and grid < num_cus:
             block_n = block_n // 2
             grid_m = routing_data.n_blocks(m, block_m)
             grid_n = triton.cdiv(n, block_n)
             grid = grid_m * grid_n * split_k
-    elif block_m == 32:
-        if n <= 1024:
-            block_n = 128
-            block_k = 128
-            num_warps = 4
-        elif n <= 4096:
-            block_n = 256
-            block_k = 128
-            num_warps = 8
-        else:
-            block_n = 256
-            block_k = 128
-            num_warps = 8
     else:
         # for scale preshuffling
-        block_n = 256
+        block_n = 128
         block_k = 128
         num_warps = 8
 
@@ -113,10 +101,9 @@ def get_kernel_config(m, n, k, routing_data):
         "num_warps": num_warps,
         "num_stages": num_stages,
         "group_m": group_m,
-        "xcd_swizzle": xcd_swizzle,
         "w_cache_modifier": w_cache_modifier,
         "split_k": split_k,
-        "waves_per_eu": 0,
+        "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
         "kpack": 1,
     }
@@ -323,7 +310,6 @@ def moe_gemm_int8_smoothquant(
         config["block_n"],
         config["block_k"],
         config["group_m"],
-        XCD_SWIZZLE=config["xcd_swizzle"],
         EVEN_K=K % config["block_k"] == 0,
         MASK_K_LIMIT=K % config["block_k"],
         SPLIT_K=config["split_k"],
