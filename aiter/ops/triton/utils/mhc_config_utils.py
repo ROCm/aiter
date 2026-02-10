@@ -25,6 +25,10 @@ def get_mhc_config(
     - C: Finds the largest C-specific config file threshold <= input C value.
       Available C configs are discovered from files named {arch}-{config}-C={value}.json.
     - M: Within the selected config, finds the largest M_LEQ_x threshold <= input M value.
+    
+    Architecture fallback:
+    - If configs for the current GPU architecture don't exist, falls back to gfx942 configs.
+    - This allows MHC operations to work on GPUs without tuned configs (may be suboptimal).
 
     Config file naming convention:
     - For MHC_FUSED: mode is required ("lite" or "sinkhorn")
@@ -50,6 +54,7 @@ def get_mhc_config(
         get_mhc_config._config_cache = {}
 
     dev = arch_info.get_arch()
+    fallback_dev = "gfx942"
     
     # Determine the actual config name based on mode
     if mode is not None:
@@ -62,13 +67,20 @@ def get_mhc_config(
 
     cache_key = f"{dev}_{actual_config_name}"
 
-    # Load default config (required)
+    # Load default config with fallback for unsupported architectures
     if cache_key not in get_mhc_config._config_cache:
         get_mhc_config._config_cache[cache_key] = {}
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-{actual_config_name}.json"
-        _load_config_file(
-            get_mhc_config._config_cache, cache_key, fpath, "default", fpath_should_exist=True
-        )
+        
+        # Try loading architecture-specific config first
+        if not _load_config_file(
+            get_mhc_config._config_cache, cache_key, fpath, "default", fpath_should_exist=False
+        ):
+            # Fallback to gfx942 configs if architecture-specific config doesn't exist
+            fpath_fallback = f"{AITER_TRITON_CONFIGS_PATH}/{fallback_dev}-{actual_config_name}.json"
+            _load_config_file(
+                get_mhc_config._config_cache, cache_key, fpath_fallback, "default", fpath_should_exist=True
+            )
 
     config_dict_key = "default"
     used_specialized = False
@@ -78,13 +90,27 @@ def get_mhc_config(
 
     # Discover available C-specific config files once per cache_key
     if c_thresholds_key not in get_mhc_config._config_cache:
-        pattern = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-{actual_config_name}-C=*.json"
         c_thresholds = []
+        
+        # Check architecture-specific C configs
+        pattern = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-{actual_config_name}-C=*.json"
         for fpath in glob.glob(pattern):
             basename = os.path.basename(fpath)
             match = re.search(r"-C=(\d+)\.json$", basename)
             if match:
                 c_thresholds.append(int(match.group(1)))
+        
+        # Also check fallback architecture C configs
+        if dev != fallback_dev:
+            pattern_fallback = f"{AITER_TRITON_CONFIGS_PATH}/{fallback_dev}-{actual_config_name}-C=*.json"
+            for fpath in glob.glob(pattern_fallback):
+                basename = os.path.basename(fpath)
+                match = re.search(r"-C=(\d+)\.json$", basename)
+                if match:
+                    c_val = int(match.group(1))
+                    if c_val not in c_thresholds:
+                        c_thresholds.append(c_val)
+        
         c_thresholds.sort()
         get_mhc_config._config_cache[c_thresholds_key] = c_thresholds
 
@@ -94,12 +120,18 @@ def get_mhc_config(
             c_key = f"C_{c_threshold}"
             if c_key not in get_mhc_config._config_cache[cache_key]:
                 fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-{actual_config_name}-C={c_threshold}.json"
-                _load_config_file(
-                    get_mhc_config._config_cache, cache_key, fpath, c_key
-                )
-            config_dict_key = c_key
-            used_specialized = True
-            break
+                # Try architecture-specific C config first, fallback to gfx942 if needed
+                if not _load_config_file(
+                    get_mhc_config._config_cache, cache_key, fpath, c_key, fpath_should_exist=False
+                ):
+                    fpath_fallback = f"{AITER_TRITON_CONFIGS_PATH}/{fallback_dev}-{actual_config_name}-C={c_threshold}.json"
+                    _load_config_file(
+                        get_mhc_config._config_cache, cache_key, fpath_fallback, c_key, fpath_should_exist=False
+                    )
+            if c_key in get_mhc_config._config_cache[cache_key]:
+                config_dict_key = c_key
+                used_specialized = True
+                break
 
     config_dict = get_mhc_config._config_cache[cache_key][config_dict_key]
 
