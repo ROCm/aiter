@@ -139,9 +139,9 @@ def native_to_2buff_for_asm(
             ..., tile_start:tile_end
         ]  # (num_blocks, block_size, num_heads, 64)
 
-        # scale: max(abs(tile)) / 448.0  ? 240? 480?
+        # scale: max(abs(tile)) / max of dtype
         cur_scale_inverse = (
-            torch.abs(cur_tile).max(dim=-1).values.float() / 448.0
+            torch.abs(cur_tile).max(dim=-1).values.float() / torch.finfo(dtypes.fp8).max
         )  # (num_blocks, block_size, num_heads)
 
         cur_scale_inverse = _cast_scale_inv_to_ue8m0(cur_scale_inverse)
@@ -158,15 +158,16 @@ def native_to_2buff_for_asm(
 
     return nope_scale_buff, rope_buff
 
+
 def quant_2buff_to_native(
     nope_scale_buff: torch.Tensor,  # (num_blocks, block_size, num_heads, 512) fp8
     rope_buff: torch.Tensor,  # (num_blocks, block_size, num_heads, 64) bf16
 ) -> torch.Tensor:
     """
     Reverse of native_to_2buff_for_asm: dequantize nope_scale_buff and concat with rope_buff.
-    
+
     nope_scale_buff layout: [nope(448 fp8) | scale(7 e8m0) | padding(57)]
-    
+
     Returns:
         torch.Tensor: (num_blocks, block_size, num_heads, 512) bf16
     """
@@ -176,7 +177,9 @@ def quant_2buff_to_native(
     num_blocks, block_size, num_heads, _ = nope_scale_buff.shape
 
     # extract nope (fp8) and scale (e8m0)
-    nope_part = nope_scale_buff[..., :d_nope]  # (num_blocks, block_size, num_heads, 448) fp8
+    nope_part = nope_scale_buff[
+        ..., :d_nope
+    ]  # (num_blocks, block_size, num_heads, 448) fp8
     scale_part = nope_scale_buff[..., d_nope : d_nope + num_tiles].view(
         dtypes.fp8_e8m0
     )  # (num_blocks, block_size, num_heads, 7) e8m0
@@ -218,33 +221,37 @@ def ref_sparse_attn_decode(
     """
     Reference implementation of sparse attention decode.
     Based on flash-mla/tests/ref.py ref_sparse_attn_decode.
-    
+
     Returns:
         output: (batch, s_q, h_q, d_v) bf16
         lse: (batch, h_q, s_q) logsumexp
     """
     d, d_nope, d_rope, tile_size, num_tiles = quant.MODEL1_FP8Sparse
     d_v = d_nope  # value dim = 448
-    
+
     # 1. Dequantize q and kv to bf16
     q = quant_2buff_to_native(q_nope_scale_buff, q_rope_buff)  # (batch, s_q, h_q, d)
-    kv_cache = quant_2buff_to_native(kv_nope_scale_buff, kv_rope_buff)  # (num_page, block_size, h_kv, d)
-    
+    kv_cache = quant_2buff_to_native(
+        kv_nope_scale_buff, kv_rope_buff
+    )  # (num_page, block_size, h_kv, d)
+
     batch = q.shape[0]
     s_q = q.shape[1]
     h_q = q.shape[2]
     h_kv = kv_cache.shape[2]
     num_page, block_size = kv_cache.shape[:2]
-    
+
     assert h_kv == 1, "Only single KV head supported"
-    
+
     # 2. Gather KV by page indices: select pages then flatten
     #    kv_cache: (num_page, block_size, h_kv, d) -> select by kv_indices
-    kvc = torch.index_select(kv_cache, 0, kv_indices)  # (total_kv_len, block_size, h_kv, d)
+    kvc = torch.index_select(
+        kv_cache, 0, kv_indices
+    )  # (total_kv_len, block_size, h_kv, d)
     kvc = kvc.view(-1, h_kv, d)  # (total_kv_len * block_size, h_kv, d)
     # print(f"{kvc=}")
     # print(f"{kvc.shape=}")
-    
+
     # 3. Split by batch using kv_indptr
     kv_indptr_list = (kv_indptr * block_size).tolist()
     # print(f"{kv_indptr_list=}")
@@ -255,51 +262,61 @@ def ref_sparse_attn_decode(
     # 4. Compute attention for each batch (using fp32, output bf16)
     outputs = []
     lses = []
-    
+
     for b_idx in range(batch):
         q_b = q[b_idx].float()  # (s_q, h_q, d) fp32
         kv_b = kvs[b_idx].float()  # (seq_len_k, h_kv, d) fp32
-        
+
         if kv_b.shape[0] == 0:
             # No KV tokens for this batch
-            outputs.append(torch.zeros(s_q, h_q, d_v, dtype=torch.float32, device=q.device))
-            lses.append(torch.full((s_q, h_q), float('+inf'), dtype=torch.float32, device=q.device))
+            outputs.append(
+                torch.zeros(s_q, h_q, d_v, dtype=torch.float32, device=q.device)
+            )
+            lses.append(
+                torch.full(
+                    (s_q, h_q), float("+inf"), dtype=torch.float32, device=q.device
+                )
+            )
             continue
-        
+
         # Broadcast KV head to Q heads: (seq_len_k, 1, d) -> (seq_len_k, h_q, d)
         kv_b = kv_b.expand(-1, h_q, -1)  # (seq_len_k, h_q, d)
-        
+
         # q_b: (s_q, h_q, d), kv_b: (seq_len_k, h_q, d)
         # Attention: Q @ K^T -> (s_q, h_q, seq_len_k)
-        attn_weight = torch.einsum('shd,khd->shk', q_b, kv_b)  # (s_q, h_q, seq_len_k)
+        attn_weight = torch.einsum("shd,khd->shk", q_b, kv_b)  # (s_q, h_q, seq_len_k)
         attn_weight *= sm_scale
-        
+
         # Softmax
         lse = attn_weight.logsumexp(dim=-1)  # (s_q, h_q)
-        attn_weight = torch.exp(attn_weight - lse.unsqueeze(-1))  # (s_q, h_q, seq_len_k)
-        
+        attn_weight = torch.exp(
+            attn_weight - lse.unsqueeze(-1)
+        )  # (s_q, h_q, seq_len_k)
+
         # Output: attn @ V (V is first d_v dims of kv)
         v_b = kv_b[..., :d_v]  # (seq_len_k, h_q, d_v)
-        output = torch.einsum('shk,khv->shv', attn_weight, v_b)  # (s_q, h_q, d_v)
-        
+        output = torch.einsum("shk,khv->shv", attn_weight, v_b)  # (s_q, h_q, d_v)
+
         outputs.append(output)
         lses.append(lse)
-    
+
     output = torch.stack(outputs, dim=0)  # (batch, s_q, h_q, d_v) fp32
     lse = torch.stack(lses, dim=0)  # (batch, s_q, h_q) fp32
-    
+
     # 5. Attention sink adjustment
     if attn_sink is not None:
         sink_factor = 1.0 / (1.0 + torch.exp(attn_sink.view(1, 1, h_q) - lse))
         output *= sink_factor.unsqueeze(-1)
-    
+
     # 6. Handle lonely Q (no valid K)
-    lonely_q_mask = (lse == float('-inf'))
+    lonely_q_mask = lse == float("-inf")
     output[lonely_q_mask.unsqueeze(-1).expand_as(output)] = 0.0
-    lse[lonely_q_mask] = float('+inf')
-    
+    lse[lonely_q_mask] = float("+inf")
+
     # Convert to bf16 for output
-    return output.to(dtypes.bf16), lse.transpose(1, 2).to(dtypes.bf16)  # output: (b,s_q,h_q,d_v), lse: (b,h_q,s_q)
+    return output.to(dtypes.bf16), lse.transpose(1, 2).to(
+        dtypes.bf16
+    )  # output: (b,s_q,h_q,d_v), lse: (b,h_q,s_q)
 
 
 def run_asm_sparse_attn_decode():
@@ -427,7 +444,15 @@ def test_sparse_attn_decode(
     refer: need use quantized kv cache.
 
     """
-    ref_out, ref_lse = ref_sparse_attn_decode(q_nope_scale_buff, q_rope_buff, kv_nope_scale_buff, kv_rope_buff, kv_indptr, kv_indices, kv_last_page_lens)
+    ref_out, ref_lse = ref_sparse_attn_decode(
+        q_nope_scale_buff,
+        q_rope_buff,
+        kv_nope_scale_buff,
+        kv_rope_buff,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+    )
 
     # 3. call asm implementation
     """
@@ -447,7 +472,6 @@ def test_sparse_attn_decode(
 
     Constraint: block_size must be 1
     """
-
 
     # 4. compare results
 
