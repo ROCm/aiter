@@ -1,0 +1,9 @@
+{
+    "any": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 32,
+        "NUM_BUFFERS": 2,
+        "num_warps": 8
+    }
+}

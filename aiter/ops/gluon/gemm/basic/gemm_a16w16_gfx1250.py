@@ -9,17 +9,15 @@ from triton.experimental import gluon
 import triton.experimental.gluon.language as ttgl
 
 from aiter.ops.gluon.activations import _get_activation_from_str
+from aiter.ops.gluon.utils.gemm_config_utils import get_gemm_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-DEFAULT_CONFIG = {
-    "BLOCK_M": 128,
-    "BLOCK_N": 128,
-    "BLOCK_K": 32,
-    "NUM_BUFFERS": 2,
-    "num_warps": 8,
-}
+
+def _get_config(M: int, N: int, K: int):
+    config, is_tuned = get_gemm_config("GEMM-A16W16", M, N, K)
+    return config, is_tuned
 
 
 def create_shared_layouts(BLOCK_M: ttgl.constexpr, BLOCK_N: ttgl.constexpr, 
@@ -352,16 +350,14 @@ def gemm_a16w16_gfx1250(
     if y is None:
         y = torch.empty((M, N), device=x.device, dtype=dtype)
     
-    # TODO: make this use the config like the triton file does
-    effective_config = DEFAULT_CONFIG.copy()
-    if config is not None:
-        effective_config.update(config)
+    if config is None:
+        config, _ = _get_config(M, N, K)
     
-    BLOCK_M = effective_config["BLOCK_M"]
-    BLOCK_N = effective_config["BLOCK_N"]
-    BLOCK_K = effective_config["BLOCK_K"]
-    NUM_BUFFERS = effective_config["NUM_BUFFERS"]
-    num_warps = effective_config["num_warps"]
+    BLOCK_M = config["BLOCK_M"]
+    BLOCK_N = config["BLOCK_N"]
+    BLOCK_K = config["BLOCK_K"]
+    NUM_BUFFERS = config["NUM_BUFFERS"]
+    num_warps = config["num_warps"]
         
     warp_bases = [(0, 1)]
     for i in range(int(math.log2(num_warps // 2))):
