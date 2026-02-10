@@ -648,12 +648,12 @@ head_dim = 128
 l_block_size = [1024]
 l_dtype = ["bf16"]
 l_num_heads = [
-    # (10, 1),
+    (10, 1),
     # (16, 2),
     (16, 1),
 ]
 # l_qlen = [3]
-l_qlen = [4]
+l_qlen = [1, 2, 3, 4]
 l_ctx_len = [
     7,
     109,
