@@ -916,6 +916,7 @@ def paged_attention_decode_sliding_window(
     # ==================== MEMORY LAYOUT DEFINITIONS ====================
     # Query tensor layout - optimized for sequential access (2D)
     shared_query_layout: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, order=[1, 0])
+    shared_probs_layout: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 8, order=[1, 0])
     QUERY_GROUP_SIZE_POW2: gl.constexpr = QUERY_SEQ_LEN_POW2 * ONE_QUERY_GROUP_SIZE_POW2
     # MTP Query tensor layout (3D) [QUERY_SEQ_LEN_POW2, ONE_QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2]
     if ONE_QUERY_GROUP_SIZE_POW2 <= 16:
@@ -1260,13 +1261,15 @@ def paged_attention_decode_sliding_window(
         sequence_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
     # Load query tensor with 3D MTP layout
     # Query shape: [batch_size, query_length, num_kv_heads, query_group_size, head_size]
-
-
     mtp_query_tensor = gl.reshape(
         mtp_query_tensor, [QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2]
     )
     query_shared = gl.allocate_shared_memory(
         mtp_query_tensor.dtype, mtp_query_tensor.shape, shared_query_layout, mtp_query_tensor
+    )
+
+    probs_shared = gl.allocate_shared_memory(
+        COMPUTE_TYPE, [QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE], shared_probs_layout
     )
 
     # Load query quantization scales if needed
@@ -1441,7 +1444,6 @@ def paged_attention_decode_sliding_window(
         # ==================== VALUE LOADING WITH QK MFMA OVERLAP ====================
         # Convert key layout for MFMA (query_converted and qk_accumulator already prepared above)
         key_converted = gl.convert_layout(key_tensor, layout=qk_rhs_operand_layout)
-        key_converted = key_converted.to(COMPUTE_TYPE)
         
         if VALUE_TRANSPOSED:
             # Load values from transposed cache layout
@@ -1503,7 +1505,7 @@ def paged_attention_decode_sliding_window(
 
             # Permute and resape for matrix multiplication
             value_tensor = gl.permute(value_tensor, [0, 2, 1])
-        
+        key_converted = key_converted.to(COMPUTE_TYPE)
         # Compute QK attention scores using MFMA (overlaps with value load)
         attention_scores = gl.amd.cdna3.mfma(
             query_converted, key_converted, qk_accumulator
@@ -1606,9 +1608,7 @@ def paged_attention_decode_sliding_window(
         # Convert attention probabilities to compute type for MFMA operation
         # Convert layouts for PV MFMA operation
         attention_probs = attention_probs.to(COMPUTE_TYPE)
-        probs_converted = gl.convert_layout(
-            attention_probs, layout=pv_lhs_operand_layout
-        )
+        probs_shared.store(attention_probs)
         values_converted = gl.convert_layout(value_tensor, layout=pv_rhs_operand_layout)
         values_converted = values_converted.to(COMPUTE_TYPE)
 
@@ -1622,10 +1622,10 @@ def paged_attention_decode_sliding_window(
             dtype=gl.float32,
             layout=pv_mfma_layout,
         )
+        probs_converted = probs_shared.load(pv_lhs_operand_layout)
         attention_output = gl.amd.cdna3.mfma(
             probs_converted, values_converted, pv_accumulator
         )
-
         if KV_QUANT_MODE >= 0:
             attention_accumulator += probability_scale * attention_output
         else:
