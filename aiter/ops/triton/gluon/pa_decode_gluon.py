@@ -1345,12 +1345,6 @@ def paged_attention_decode_sliding_window(
     for sequence_partition_idx in range(
         sequence_partition_start_idx, sequence_partition_end_idx
     ):
-        kv_block_start_idx2 = min(sequence_partition_idx+1, sequence_partition_end_idx) * MAX_NUM_KV_BLOCKS_PER_COMPUTE
-        kv_block_numbers2 = gl.amd.cdna3.buffer_load(
-            ptr=block_tables_ptr + sequence_idx * stride_block_table_seq
-            + kv_block_start_idx2 // CONTEXT_PARTITION_SIZE_PER_BLOCK,
-            offsets=block_indices,
-        )
         kv_block_start_idx = sequence_partition_idx * MAX_NUM_KV_BLOCKS_PER_COMPUTE
         # Create mask for valid blocks
         num_kv_blocks = max_num_kv_blocks - kv_block_start_idx
@@ -1362,9 +1356,7 @@ def paged_attention_decode_sliding_window(
         page_offset = (
             kv_block_start_idx % CONTEXT_PARTITION_SIZE_PER_BLOCK
         ) * CONTEXT_PARTITION_SIZE
-        qk_column_offsets = kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE + gl.arange(
-            0, CONTEXT_PARTITION_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
-        )
+
         kv_block_numbers_i64 = kv_block_numbers.to(gl.int64)
         # ==================== KEY LOADING AND PROCESSING ====================
         # Calculate key cache offsets and load keys
@@ -1391,6 +1383,15 @@ def paged_attention_decode_sliding_window(
             )
         else:
             key_tensor = gl.load(key_cache_ptr + key_block_offsets)
+        qk_column_offsets = kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE + gl.arange(
+            0, CONTEXT_PARTITION_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
+        )
+        kv_block_start_idx2 = min(sequence_partition_idx+1, sequence_partition_end_idx) * MAX_NUM_KV_BLOCKS_PER_COMPUTE
+        kv_block_numbers2 = gl.amd.cdna3.buffer_load(
+            ptr=block_tables_ptr + sequence_idx * stride_block_table_seq
+            + kv_block_start_idx2 // CONTEXT_PARTITION_SIZE_PER_BLOCK,
+            offsets=block_indices,
+        )
         # Prepare QK MFMA while key loads (these don't depend on key data)
         qk_accumulator = gl.zeros(
             (QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE),
