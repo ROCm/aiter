@@ -271,21 +271,20 @@ def _tdm_get_kv_offsets(
     kv_head_idx,
     block_tables_ptr,
     block_table_offset,
-    stride_k_cache_0: ttgl.int64,
-    stride_k_cache_2: ttgl.int64,
-    stride_v_cache_0: ttgl.int64,
-    stride_v_cache_2: ttgl.int64,
+    stride_k_cache_t: ttgl.int64,
+    stride_k_cache_d: ttgl.int64,
+    stride_v_cache_t: ttgl.int64,
+    stride_v_cache_d: ttgl.int64,
 ):
     physical_block_idx = ttgl.load(block_tables_ptr + block_table_offset + j)
 
-    offs_k_t_starts = (
-        physical_block_idx * stride_k_cache_0 + kv_head_idx * stride_k_cache_2
-    ).to(tl.int32)
-    offs_v_t_starts = (
-        physical_block_idx * stride_v_cache_0 + kv_head_idx * stride_v_cache_2
-    ).to(tl.int32)
+    offs_k_t = (physical_block_idx * stride_k_cache_t).to(tl.int32)
+    offs_k_d = (kv_head_idx * stride_k_cache_d).to(tl.int32)
 
-    return j + 1, offs_k_t_starts, offs_v_t_starts
+    offs_v_t = (physical_block_idx * stride_v_cache_t).to(tl.int32)
+    offs_v_d = (kv_head_idx * stride_v_cache_d).to(tl.int32)
+
+    return j + 1, offs_k_t, offs_k_d, offs_v_t, offs_v_d
 
 
 @gluon.jit
@@ -357,8 +356,8 @@ def _tdm_create_tensor_descriptors_and_allocate_lds(
     q_shared_layout: ttgl.constexpr,
     k_shared_layout: ttgl.constexpr,
     v_shared_layout: ttgl.constexpr,
-    M: ttgl.constexpr,
-    T: ttgl.constexpr,
+    NUM_BLOCKS: ttgl.constexpr,
+    NUM_KV_HEADS: ttgl.constexpr,
     BLOCK_M: ttgl.constexpr,
     HEAD_SIZE: ttgl.constexpr,
     TILE_SIZE: ttgl.constexpr,
@@ -378,7 +377,7 @@ def _tdm_create_tensor_descriptors_and_allocate_lds(
 
     k_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=k_ptr,
-        shape=(TILE_SIZE, T * HEAD_SIZE),
+        shape=(NUM_BLOCKS * TILE_SIZE, NUM_KV_HEADS * HEAD_SIZE),
         strides=(stride_k_t, stride_k_d),
         block_shape=(TILE_SIZE, HEAD_SIZE_PADDED),
         layout=k_shared_layout,
@@ -386,7 +385,7 @@ def _tdm_create_tensor_descriptors_and_allocate_lds(
 
     v_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=v_ptr,
-        shape=(TILE_SIZE, T * HEAD_SIZE),
+        shape=(NUM_BLOCKS * TILE_SIZE, NUM_KV_HEADS * HEAD_SIZE),
         strides=(stride_v_t, stride_v_d),
         block_shape=(TILE_SIZE, HEAD_SIZE_PADDED),
         layout=v_shared_layout,
@@ -549,10 +548,7 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
     query_mask_0 = query_pos < cur_batch_query_len
     query_mask_1 = query_offset_1 < num_query_heads
 
-    total_num_q_tokens = num_tokens * num_query_heads
-    total_num_kv_tokens = (
-        NUM_BLOCKS * BLOCK_SIZE * (num_query_heads // num_queries_per_kv)
-    )
+    NUM_KV_HEADS: ttgl.constexpr = num_query_heads // num_queries_per_kv
 
     k_desc, v_desc, smem_Q, smem_K, smem_V = (
         _tdm_create_tensor_descriptors_and_allocate_lds(
@@ -568,8 +564,8 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
             Q_SHARED_LAYOUT,
             K_SHARED_LAYOUT,
             V_SHARED_LAYOUT,
-            total_num_q_tokens,
-            total_num_kv_tokens,
+            NUM_BLOCKS,
+            NUM_KV_HEADS,
             BLOCK_M,
             HEAD_SIZE,
             TILE_SIZE,
@@ -647,23 +643,20 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
     )
 
     for _ in range(num_stages - 1):
-        j_producer, offs_k_t_starts, offs_v_t_starts = _tdm_get_kv_offsets(
+        j_producer, offs_k_t, offs_k_d, offs_v_t, offs_v_d = _tdm_get_kv_offsets(
             j_producer,
             kv_head_idx,
             block_tables_ptr,
             block_table_offset,
-            stride_k_cache_0,
+            stride_k_cache_0 // stride_k_cache_1,  # = BLOCK_SIZE
             stride_k_cache_2,
-            stride_v_cache_0,
+            stride_v_cache_0 // stride_v_cache_1,  # = BLOCK_SIZE
             stride_v_cache_2,
         )
         k_producer = _tdm_async_load_to_lds(
             k_producer,
             src=k_desc,
-            offsets=[
-                0,
-                offs_k_t_starts,
-            ],
+            offsets=[offs_k_t, offs_k_d],
             dest=smem_K,
             pred_i32=pred_i32,
             num_stages=num_stages,
@@ -671,10 +664,7 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
         v_producer = _tdm_async_load_to_lds(
             v_producer,
             src=v_desc,
-            offsets=[
-                0,
-                offs_v_t_starts,
-            ],
+            offsets=[offs_v_t, offs_v_d],
             dest=smem_V,
             pred_i32=pred_i32,
             num_stages=num_stages,
@@ -683,23 +673,20 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
     # iterate through tiles within current segment
     for _ in range(tiles_per_segment - (num_stages - 1)):
         if j_producer < num_tiles:
-            j_producer, offs_k_t_starts, offs_v_t_starts = _tdm_get_kv_offsets(
+            j_producer, offs_k_t, offs_k_d, offs_v_t, offs_v_d = _tdm_get_kv_offsets(
                 j_producer,
                 kv_head_idx,
                 block_tables_ptr,
                 block_table_offset,
-                stride_k_cache_0,
+                stride_k_cache_0 // stride_k_cache_1,  # = BLOCK_SIZE
                 stride_k_cache_2,
-                stride_v_cache_0,
+                stride_v_cache_0 // stride_v_cache_1,  # = BLOCK_SIZE
                 stride_v_cache_2,
             )
             k_producer = _tdm_async_load_to_lds(
                 k_producer,
                 src=k_desc,
-                offsets=[
-                    0,
-                    offs_k_t_starts,
-                ],
+                offsets=[offs_k_t, offs_k_d],
                 dest=smem_K,
                 pred_i32=pred_i32,
                 num_stages=num_stages,
@@ -707,10 +694,7 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
             v_producer = _tdm_async_load_to_lds(
                 v_producer,
                 src=v_desc,
-                offsets=[
-                    0,
-                    offs_v_t_starts,
-                ],
+                offsets=[offs_v_t, offs_v_d],
                 dest=smem_V,
                 pred_i32=pred_i32,
                 num_stages=num_stages,
