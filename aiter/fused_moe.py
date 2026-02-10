@@ -122,7 +122,7 @@ def fused_moe(
     bias2=None,
     splitk=0,
     use_flydsl=True,
-    flydsl_accumulate=True,  # FlyDSL stage2: True=atomic accumulate, False=reduce mode
+    flydsl_accumulate=False,  # FlyDSL stage2: True=atomic accumulate, False=reduce mode
 ):
     if not block_size_M:
         block_size_M = -1
@@ -632,7 +632,7 @@ def get_2stage_cfgs(
     hidden_pad,
     intermediate_pad,
     use_flydsl,
-    flydsl_accumulate=True,
+    flydsl_accumulate=False,
 ):
     def get_cfg_2stages(tune_file):
         import pandas as pd
@@ -827,9 +827,9 @@ def get_2stage_cfgs(
         )
 
         # Check for reduce mode
-        use_reduce_mode = os.environ.get("FLYDSL_STAGE2_MODE", "").lower() == "reduce"
-        if not flydsl_accumulate:
-            use_reduce_mode = True
+        use_reduce_mode = True
+        if flydsl_accumulate:
+            use_reduce_mode = False
 
         use_flydsl_stage1 = False if q_dtype_a == dtypes.fp4x2 else use_flydsl_stage2
         flydsl_block_m = int(block_m) if block_m is not None else 64
@@ -863,16 +863,6 @@ def get_2stage_cfgs(
                 activation=activation,
             )
 
-        print("use_flydsl_stage2 = %s", use_flydsl_stage2)
-        print("flydsl_accumulate = %s", flydsl_accumulate)
-        print("use_reduce_mode = %s", use_reduce_mode)
-        print("use_flydsl_stage1 = %s", use_flydsl_stage1)
-        print("flydsl_block_m = %s", flydsl_block_m)
-        print("stage1_func = %s", stage1_func)
-        print("stage2_func = %s", stage2_func)
-        print("block_m = %s", block_m)
-        print("ksplit = %s", ksplit)
-        print("run_1stage = %s", run_1stage)
         return MOEMetadata(
             stage1_func,
             stage2_func,
@@ -932,19 +922,10 @@ def get_2stage_cfgs(
         )
 
         # Check for reduce mode via environment variable or flydsl_accumulate flag
-        use_reduce_mode = os.environ.get("FLYDSL_STAGE2_MODE", "").lower() == "reduce"
         # If flydsl_accumulate is False, use reduce mode
-        if not flydsl_accumulate:
-            use_reduce_mode = True
-
-        print("use_flydsl_stage2 = %s", use_flydsl_stage2)
-        print("q_dtype_a = %s", q_dtype_a)
-        print("q_dtype_w = %s", q_dtype_w)
-        print("activation = %s", activation)
-        print("use_g1u1 = %s", use_g1u1)
-        print("use_flydsl = %s", use_flydsl)
-        print("_is_flydsl_available() = %s", _is_flydsl_available())
-        print("use_reduce_mode = %s", use_reduce_mode)
+        use_reduce_mode = True
+        if flydsl_accumulate:
+            use_reduce_mode = False
 
         use_flydsl_stage1 = False if q_dtype_a == dtypes.fp4x2 else use_flydsl_stage2
         flydsl_block_m = int(block_m) if block_m is not None else 64
@@ -963,13 +944,13 @@ def get_2stage_cfgs(
         )
 
         # Stage2 function selection with reduce mode support
-        if use_flydsl_stage2 and use_reduce_mode:
+        if use_flydsl_stage2 and use_reduce_mode and block_m >= 64:
             # Use extended stage2 with reduce mode
             stage2_func = functools.partial(
                 flydsl_moe_stage2_ex,
                 mode="reduce",
             )
-        elif use_flydsl_stage2:
+        elif use_flydsl_stage2 and block_m >= 64:
             # Use standard stage2 with accumulate (atomic) mode
             stage2_func = functools.partial(
                 flydsl_moe_stage2,
@@ -1201,7 +1182,7 @@ def fused_moe_2stages(
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
             and activation == ActivationType.Swiglu
-            or (metadata.ksplit > 1 and not _is_flydsl_available())
+            or (metadata.ksplit > 1)
         )
     ):
         a2_scale = None
