@@ -94,9 +94,14 @@ def _conv3d_std_kernel(
     out_per_g = OC // GROUPS
     co_off = pid_co * BLOCK_CO + tl.arange(0, BLOCK_CO)
 
+    # Clamp indices to valid ranges so pointer arithmetic never
+    # generates out-of-bounds addresses (even for masked-off lanes).
+    n_idx_safe = tl.where(n_idx < N, n_idx, 0)
+    co_off_safe = tl.where(co_off < out_per_g, co_off, 0)
+
     # base pointers (improve address arithmetic + help coalescing)
-    x_base = x_ptr + s_x_n * n_idx + s_x_c * (pid_g * K_C)
-    w_base = w_ptr + s_w_o * (pid_g * out_per_g + co_off)
+    x_base = x_ptr + s_x_n * n_idx_safe + s_x_c * (pid_g * K_C)
+    w_base = w_ptr + s_w_o * (pid_g * out_per_g + co_off_safe)
 
     x_ptr = x_base[:, None]
     w_ptr = w_base[None, :]
@@ -138,19 +143,19 @@ def _conv3d_std_kernel(
         )
         w_mask = (ci_off < K_C)[:, None] & (co_off < out_per_g)[None, :]
 
-        x_blk = tl.load(x_blk_ptr, mask=x_mask)
-        w_blk = tl.load(w_blk_ptr, mask=w_mask)
+        x_blk = tl.load(x_blk_ptr, mask=x_mask, other=0.0)
+        w_blk = tl.load(w_blk_ptr, mask=w_mask, other=0.0)
 
         acc += tl.dot(x_blk, w_blk, allow_tf32=False)
 
-    b_ptr += (pid_g[None] * out_per_g)[None, :] + co_off[None, :]
+    b_ptr += (pid_g * out_per_g + co_off_safe)[None, :]
     b_mask = (co_off < out_per_g)[None, :]
-    bias = tl.load(b_ptr, b_mask).to(tl.float32)
+    bias = tl.load(b_ptr, b_mask, other=0.0).to(tl.float32)
     acc += bias
 
     y_ptr += (
-        (s_y_n * n_idx)[:, None]
-        + (s_y_c * (pid_g * out_per_g + co_off))[None, :]
+        (s_y_n * n_idx_safe)[:, None]
+        + (s_y_c * (pid_g * out_per_g + co_off_safe))[None, :]
         + (s_y_d * od_idx)[:, None]
         + (s_y_h * oh_idx)[:, None]
         + (s_y_w * ow_idx)[:, None]

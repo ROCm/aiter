@@ -1,8 +1,10 @@
 import pytest
 import torch
+import time
 
 from aiter.ops.triton.conv.conv3d.conv3d_std import conv3d_std
 from aiter.ops.triton.conv.conv3d.conv3d_channel_last import conv3d_channel_last
+from aiter.ops.triton.utils.conv_common import assert_close
 
 import logging
 
@@ -123,18 +125,26 @@ def test_conv3d(
     if impl == "triton.conv3d.std":
         output = conv3d_std(*args, **kwargs)
     elif impl == "triton.conv3d.channel.last":
-        # Convert weight tensor to channels last 3d format
-        # NCDHW -> NDHWC
-        args[1].data = args[1].data.to(memory_format=torch.channels_last_3d)
-        if not args[1].is_contiguous(memory_format=torch.channels_last_3d):
+        # Convert weight to channels last 3d format
+        weight_cl = args[1].clone().to(memory_format=torch.channels_last_3d)
+        if not weight_cl.is_contiguous(memory_format=torch.channels_last_3d):
             raise ValueError(
                 "Weight tensor is not in channels last 3d format. received strides: ",
-                args[1].data.stride(),
+                weight_cl.stride(),
             )
-        output = conv3d_channel_last(*args, **kwargs)
+        output = conv3d_channel_last(args[0], weight_cl, **kwargs)
     else:
         raise ValueError(f"Unknown implementation: {impl}")
 
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
     ref = torch.nn.functional.conv3d(*args, **kwargs)
-
-    torch.testing.assert_close(ref, output, rtol=0.2, atol=0.02)
+    torch.cuda.synchronize()
+    t1 = time.perf_counter()
+    assert_close(output, ref, rtol=0.2, atol=0.02)
+    t2 = time.perf_counter()
+    print(
+        f"[TIMING] torch.conv3d: {(t1-t0)*1000:.1f} ms, "
+        f"assert_close: {(t2-t1)*1000:.1f} ms, "
+        f"shape={output.shape}"
+    )

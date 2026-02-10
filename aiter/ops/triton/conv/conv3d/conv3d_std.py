@@ -7,6 +7,9 @@ from aiter.ops.triton._triton_kernels.conv.conv3d.conv3d_std import _conv3d_std_
 from aiter.ops.triton.utils.conv_common import (
     conv3d_output_shape,
     padding_type,
+    GPUTimer,
+    conv3d_total_flops,
+    conv3d_total_bytes,
 )
 from aiter.ops.triton.utils.conv_config_utils import (
     get_default_conv3d_config,
@@ -15,7 +18,9 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER: AiterTritonLogger = AiterTritonLogger()
 
-
+@GPUTimer(warmup=5, rep=20,
+          total_flops=conv3d_total_flops,
+          total_bytes=conv3d_total_bytes)
 def conv3d_std(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -47,7 +52,7 @@ def conv3d_std(
         NotImplementedError: Kernel path not implemented yet.
     """
     _LOGGER.info(
-        f"CONV3D_STD called with x shape: {x.shape}, weight shape: {weight.shape}"
+        f"\nCONV3D_STD called with x shape: {x.shape}, weight shape: {weight.shape}"
     )
 
     # Check constraints
