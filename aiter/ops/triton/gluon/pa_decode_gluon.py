@@ -915,12 +915,6 @@ def paged_attention_decode_sliding_window(
     CONTEXT_PARTITION_SIZE_PER_BLOCK: gl.constexpr = triton.cdiv(KV_BLOCK_SIZE, CONTEXT_PARTITION_SIZE)
     # ==================== MEMORY LAYOUT DEFINITIONS ====================
     # Query tensor layout - optimized for sequential access (2D)
-    blocked_query_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
-        threads_per_warp=[4, 16],
-        warps_per_cta=[4, 1],
-        order=[1, 0],
-    )
     shared_query_layout: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, order=[1, 0])
     QUERY_GROUP_SIZE_POW2: gl.constexpr = QUERY_SEQ_LEN_POW2 * ONE_QUERY_GROUP_SIZE_POW2
     # MTP Query tensor layout (3D) [QUERY_SEQ_LEN_POW2, ONE_QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2]
@@ -1349,13 +1343,13 @@ def paged_attention_decode_sliding_window(
         sequence_partition_start_idx, sequence_partition_end_idx
     ):
         
-        if sequence_partition_idx+1 < sequence_partition_end_idx:
-            kv_block_start_idx2 = (sequence_partition_idx+1) * MAX_NUM_KV_BLOCKS_PER_COMPUTE
-            kv_block_numbers2 = gl.amd.cdna3.buffer_load(
-                ptr=block_tables_ptr + sequence_idx * stride_block_table_seq
-                + kv_block_start_idx2 // CONTEXT_PARTITION_SIZE_PER_BLOCK,
-                offsets=block_indices,
-            )
+        # if sequence_partition_idx+1 < sequence_partition_end_idx:
+        kv_block_start_idx2 = min(sequence_partition_idx+1, sequence_partition_end_idx) * MAX_NUM_KV_BLOCKS_PER_COMPUTE
+        kv_block_numbers2 = gl.amd.cdna3.buffer_load(
+            ptr=block_tables_ptr + sequence_idx * stride_block_table_seq
+            + kv_block_start_idx2 // CONTEXT_PARTITION_SIZE_PER_BLOCK,
+            offsets=block_indices,
+        )
         kv_block_start_idx = sequence_partition_idx * MAX_NUM_KV_BLOCKS_PER_COMPUTE
         # Create mask for valid blocks
         num_kv_blocks = max_num_kv_blocks - kv_block_start_idx
@@ -1639,8 +1633,8 @@ def paged_attention_decode_sliding_window(
         else:
             attention_accumulator += attention_output
         max_logits = new_max_logits
-        if sequence_partition_idx+1 < sequence_partition_end_idx:
-            kv_block_numbers = kv_block_numbers2
+        # if sequence_partition_idx+1 < sequence_partition_end_idx:
+        kv_block_numbers = kv_block_numbers2
 
     # ==================== SINKS HANDLING ====================
     # Add sinks contribution to exp_sums (does not contribute to attention output)
