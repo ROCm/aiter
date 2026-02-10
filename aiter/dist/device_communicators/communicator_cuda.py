@@ -7,7 +7,9 @@ from torch.distributed import ProcessGroup
 
 should_nccl_symm_mem_allreduce = False
 from aiter.dist.parallel_state import is_global_first_rank
-from aiter import logger
+from aiter import logger, get_hip_quant
+from aiter.utility.dtypes import fp8
+from aiter.ops.enum import QuantType
 from .base_device_communicator import DeviceCommunicatorBase
 
 
@@ -194,9 +196,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         n = input_.shape[-1]
         total_bytes = input_.numel() * input_.element_size()
         can_use_fuse_ar_rms = (
-            n <= 16384
-            and total_bytes < 8 * 1024 * 8192
-            and self.world_size != 6
+            n <= 16384 and total_bytes < 8 * 1024 * 8192 and self.world_size != 6
         )
         ca_comm = self.ca_comm
         if (
@@ -206,7 +206,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and can_use_fuse_ar_rms
         ):
             use_1stage = True if total_bytes <= 128 * 1024 else False
-            out, res_out = ca_comm.custom_fused_ar_rms(input_, res_inp_, weight_, eps, use_1stage)
+            out, res_out = ca_comm.custom_fused_ar_rms(
+                input_, res_inp_, weight_, eps, use_1stage
+            )
             assert out is not None
             assert res_out is not None
             return out, res_out
@@ -226,13 +228,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
             0,
         )
         return out, residual_out
-    
+
     def fused_allreduce_rmsnorm_quant(
         self, input_, res_inp_, weight_, eps
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         total_bytes = input_.numel() * input_.element_size()
-        use_1stage = True if total_bytes <= 128 * 1024 else False
-        out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_quant(input_, res_inp_, weight_, eps, use_1stage)
+        if total_bytes <= 512 * 1024:
+            use_1stage = True if total_bytes <= 128 * 1024 else False
+            out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_quant(
+                input_, res_inp_, weight_, eps, use_1stage
+            )
+        else:
+            out_, res_out = self.fused_allreduce_rmsnorm(input_, res_inp_, weight_, eps)
+            hip_quant = get_hip_quant(QuantType.per_Token)
+            out, scale_out = hip_quant(out_, quant_dtype=fp8)
         assert out is not None
         assert res_out is not None
         assert scale_out is not None
