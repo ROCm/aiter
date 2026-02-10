@@ -92,7 +92,7 @@ def run_gemm_a8w8_blockscale(
     """
     Run gemm a8w8 blockscale tuned kernel for ck type.
     """
-    if preshufflequantB:
+    if preshuffleQuantB:
         assert False, "PreshufflequantB is not supported by ck type"
     if preshuffleB:
         return aiter.gemm_a8w8_blockscale_bpreshuffle_tune(
