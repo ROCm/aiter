@@ -23,12 +23,13 @@ def get_sage_fwd_configs(USE_MXFP4_SAGE=False):
     if USE_MXFP4_SAGE:
         assert arch == "gfx950", f"MXFP is not supported on {arch}"
         return {
-            "BLOCK_M": 256,
-            "BLOCK_N": 128,
-            "waves_per_eu": 2,
-            "PRE_LOAD_V": False,
-            "num_stages": 3,
-            "num_warps": 8,
+            'BLOCK_M': 256,
+            'BLOCK_N': 128,
+            'waves_per_eu': 2,
+            'PRE_LOAD_V': False,
+            'GRID_CU_MULTIP': 2,
+            'num_stages': 2,
+            'num_warps': 8
         }
     if arch == "gfx950":
         return {
@@ -465,36 +466,23 @@ def fav3_sage_func(
 
     if USE_MXFP4_SAGE:
         USE_Q_SMOOTHING = delta_s is not None
-
-        if USE_Q_SMOOTHING:
-            stride_dsz, stride_dsh, stride_dsq, _ = delta_s.stride()
-        else:
-            stride_dsz, stride_dsh, stride_dsq = (None, None, None)
+        
+        # Persistent kernel configuration (disabled by default)
+        PERSISTENT = False
+        PERSISTENT_DYNAMIC = False
+        atomic_counter = torch.zeros([1], device=q.device, dtype=torch.int32)
+        
+        grid = lambda META: (nheads_q, triton.cdiv(seqlen_q, META["BLOCK_M"]), batch)
+        NUM_CU = torch.cuda.get_device_properties("cuda").multi_processor_count
 
         sage_fwd_mxfp4[grid](
             q,
             k,
             v,
-            delta_s,  # Delta smoothing tensor for MXFP4 variant
             None,  # bias (not used)
-            q_descale,
-            k_descale,
-            v_descale,
-            stride_qsz,
-            stride_qsh,
-            stride_qsm,
-            stride_ksz,
-            stride_ksh,
-            stride_ksn,
-            stride_vsz,
-            stride_vsh,
-            stride_dsz,
-            stride_dsh,
-            stride_dsq,
+            None,  # SM_SCALE (integrated into descales)
             softmax_lse,
             out,
-            None,  # SD_MASK (not used)
-            None,  # ALIBI_SLOPES (not used)
             stride_qb,
             stride_qh,
             stride_qm,
@@ -517,43 +505,45 @@ def fav3_sage_func(
             0,  # stride_bn (bias - not used)
             0,  # stride_az (alibi - not used)
             0,  # stride_ah (alibi - not used)
-            0,  # stride_sz (scores mask - not used)
-            0,  # stride_sh (scores mask - not used)
-            0,  # stride_sm (scores mask - not used)
-            0,  # stride_sn (scores mask - not used)
-            stride_lse_z,
-            stride_lse_h,
-            stride_lse_m,
+            stride_qsz,
+            stride_qsh,
+            stride_qsm,
+            1, # stride_qsk
+            stride_ksz,
+            stride_ksh,
+            stride_ksn,
+            1, # stride_ksk
+            stride_vsz,
+            stride_vsh,
+            1, # stride_vsn
+            q_descale,
+            k_descale,
+            v_descale,
             None,  # cu_seqlens_q (varlen - not used)
             None,  # cu_seqlens_k (varlen - not used)
-            None,  # seqused_q (not used)
-            None,  # seqused_k (not used)
             dropout_p=0.0,
             philox_seed=None,
+            PERSISTENT=PERSISTENT,
+            PERSISTENT_DYNAMIC=PERSISTENT_DYNAMIC,
+            atomic_counter=atomic_counter,
+            NUM_CU=NUM_CU,
+            B=batch,
             philox_offset_base=None,
-            Q_DTYPE_STR="e2m1",  # MXFP4 for now
-            K_DTYPE_STR="e2m1",  # MXFP4 for now
-            RETURN_LSE=return_lse,
+            encoded_softmax=None,
+            alibi_slopes=None,
             HQ=nheads_q,
             HK=nheads_k,
-            ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
-            ACTUAL_BLOCK_DMODEL_V=head_size_v,
+            ACTUAL_BLOCK_DMODEL=head_size_qk,
             MAX_SEQLENS_Q=seqlen_q,
             MAX_SEQLENS_K=seqlen_k,
-            IS_VARLEN=False,
+            VARLEN=False,
             IS_CAUSAL=causal,
-            USE_SLIDING_WINDOW=use_sliding_window,
-            WINDOW_SIZE_LEFT=window_size_left,
-            WINDOW_SIZE_RIGHT=window_size_right,
-            BLOCK_DMODEL_QK=padded_d_model_qk,
-            BLOCK_DMODEL_V=padded_d_model_v,
+            BLOCK_DMODEL=padded_d_model_qk,
             USE_BIAS=False,
             ENABLE_DROPOUT=False,
-            RETURN_SCORES=False,
+            RETURN_ENCODED_SOFTMAX=False,
             USE_ALIBI=False,
-            USE_EXP2=True,
-            USE_SEQUSED=False,
-            USE_Q_SMOOTHING=USE_Q_SMOOTHING,
+            RETURN_LSE=return_lse,
             **config,
         )
     else:
