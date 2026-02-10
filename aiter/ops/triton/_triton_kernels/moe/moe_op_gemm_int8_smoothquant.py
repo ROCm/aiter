@@ -35,10 +35,10 @@ def matmul_launch_metadata(grid, kernel, args):
     alpha = args.get("alpha", 0)
     act_red_n = args.get("ACTIVATION_REDUCTION_N", 1)
     if alpha != 0:
-        if act_red_n == 2:
-            ret["name"] += "_swiglu"
-        else:
+        if act_red_n == 1:
             ret["name"] += "_silu"
+        else:
+            ret["name"] += "_swiglu"
 
     fM = n_tokens
     fK = K if K is not None else n_tokens
@@ -66,29 +66,6 @@ def matmul_launch_metadata(grid, kernel, args):
     ret["bytes"] = int(n_x_bytes + n_y_bytes + n_w_bytes)
 
     return ret
-
-
-@triton.jit
-def xcd_swizzle(pid, domain_size, XCD_SWIZZLE: tl.constexpr):
-    """
-    Swizzle the program id based on integer XCD_SWIZZLE.
-    This is useful for reording how blocks are ordered. A scheduler may, for example,
-    assign sequential blocks 0, 1, 2, 3, ..., 8, 9, 10.. to its 8 hardware units 0, 1, 2, 3, ..., 0, 1, 2.
-    This pattern may not be ideal for memory access, and it may be better to swizzle so the assignment
-    becomes 0, 0, 0, 0, ..., 1, 1, 1, ... In the swizzled arrangement, sequential blocks are assigned to
-    the same hardware unit.
-    """
-    # Number of pids per group in the new arrangement
-    pids_per_group = domain_size // XCD_SWIZZLE
-    extra_pid_groups = domain_size % XCD_SWIZZLE
-
-    # Compute current current and local pid within the group
-    group = pid % XCD_SWIZZLE
-    local_pid = pid // XCD_SWIZZLE
-
-    # Calculate new pid based on the new grouping
-    new_pid = group * pids_per_group + min(group, extra_pid_groups) + local_pid
-    return new_pid
 
 
 @triton.jit
@@ -228,7 +205,6 @@ def _moe_gemm_int8_smoothquant(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
-    XCD_SWIZZLE: tl.constexpr,
     EVEN_K: tl.constexpr,
     MASK_K_LIMIT: tl.constexpr,
     SPLIT_K: tl.constexpr,
@@ -254,8 +230,8 @@ def _moe_gemm_int8_smoothquant(
 
     Activation functions:
     - alpha=0: No activation
-    - alpha!=0, ACTIVATION_REDUCTION_N=1: SiLU
-    - alpha!=0, ACTIVATION_REDUCTION_N=2: SwiGLU
+    - alpha==1, ADD_RESIDUAL=True: SiLU
+    - alpha!=0: SwiGLU
     """
     # Assume positive strides for compiler hints
     tl.assume(stride_y_k >= 0)
@@ -275,12 +251,7 @@ def _moe_gemm_int8_smoothquant(
     yN = N // ACTIVATION_REDUCTION_N
 
     pid = tl.program_id(0)
-    if ExptOffsSum is not None and XCD_SWIZZLE > 1:
-        # Determine how much padding there is on the expert data. This allows us to
-        # know the true grid size and avoid processing padding tiles.
-        padding_m = grid_m - tl.load(ExptOffsSum)
-    else:
-        padding_m: tl.constexpr = 0
+    padding_m: tl.constexpr = 0
 
     index_type: tl.constexpr = tl.int64 if UPCAST_INDICES else tl.int32
 
@@ -291,9 +262,6 @@ def _moe_gemm_int8_smoothquant(
         return
 
     pid_emnk = pid
-    if XCD_SWIZZLE != 1:
-        pid_emnk = xcd_swizzle(pid_emnk, total_actual_tiles, XCD_SWIZZLE)
-    # pid_e = pid_emnk // (unpadded_m * grid_n * SPLIT_K)
     pid_mnk = pid_emnk % (unpadded_m * grid_n * SPLIT_K)
     pid_k = pid_mnk % SPLIT_K
     pid_mn = pid_mnk // SPLIT_K
