@@ -1945,4 +1945,5 @@ def gluon_reduce_segments(
         + query_head_idx * output_stride_1
         + tl.arange(0, HEAD_SIZE_PADDED)
     )
+    acc = acc.to(output_ptr.type.element_ty)
     tl.store(output_ptr + output_offset, acc, mask=dim_mask)
