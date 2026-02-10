@@ -434,7 +434,7 @@ class QManagerV3
         v4ui data_v = {data.x, data.y, data.z, data.w};
 
         asm volatile("s_waitcnt lgkmcnt(0)");
-        hkm::ds_write_b128(p_lds + v_offset_st, 0, data_v);
+        hkm::ds_write_b128(data_v, p_lds + v_offset_st, 0);
         asm volatile("s_waitcnt lgkmcnt(0)");
         hkm::ds_read_b64<GPR_START + 0>(p_lds + v_offset_ld, 0);
         hkm::ds_read_b64<GPR_START + 2>(p_lds + v_offset_ld, kMfmaCols * sizeof(q_t));
@@ -864,7 +864,7 @@ class KvManagerV1
             {
                 const uintptr_t p_lds_kv_lane =
                     p_lds_kv_warp + kColOffset + lane_idx * kNumBytesPerThrPerRnd;
-                hkm::ds_write_b32(p_lds_kv_lane, 0, 0u);
+                hkm::ds_write_b32(0u, p_lds_kv_lane, 0);
             }
             else
             {
@@ -1083,7 +1083,7 @@ class KvManagerV2
             {
                 const uintptr_t p_lds_kv_lane =
                     p_lds_kv_warp + kColOffset + lane_idx * kNumBytesPerThrPerRnd;
-                hkm::ds_write_b32(p_lds_kv_lane, 0, 0u);
+                hkm::ds_write_b32(0u, p_lds_kv_lane, 0);
             }
             else
             {
@@ -1194,10 +1194,10 @@ class KvManagerV2
             p_lds_v + (row_phy / 4) * kNumBytesPerSubBlock + (row_phy % 4) * kNumBytesPerRow +
             (col / kNumCols) * kNumBytesPerBlock + (col % kNumCols) * sizeof(kv_t);
 
-        const uint2 pass_0 = hkm::ds_read_b64(p_lds_v_lane, 0);
-        const uint2 pass_1 = hkm::ds_read_b64(p_lds_v_lane, kNumBytesPerRow);
-        const uint2 pass_2 = hkm::ds_read_b64(p_lds_v_lane, kNumBytesPerSubBlock);
-        const uint2 pass_3 = hkm::ds_read_b64(p_lds_v_lane, kNumBytesPerSubBlock + kNumBytesPerRow);
+        const v2ui pass_0 = hkm::ds_read_b64(p_lds_v_lane, 0);
+        const v2ui pass_1 = hkm::ds_read_b64(p_lds_v_lane, kNumBytesPerRow);
+        const v2ui pass_2 = hkm::ds_read_b64(p_lds_v_lane, kNumBytesPerSubBlock);
+        const v2ui pass_3 = hkm::ds_read_b64(p_lds_v_lane, kNumBytesPerSubBlock + kNumBytesPerRow);
 
         *p_result = {
             pass_0.x, pass_0.y, pass_1.x, pass_1.y, pass_2.x, pass_2.y, pass_3.x, pass_3.y};
@@ -1274,8 +1274,8 @@ class VtManagerV1
             (row_blk * kNumBlocksPerRowWithPadding + col_blk) * kNumElemsPerBlock * sizeof(kv_t);
         const uintptr_t p_lds_vt_lane = p_lds_vt + block_offset;
 
-        hkm::ds_write_b128(p_lds_vt_lane, 0, v_transposed.lo);
-        hkm::ds_write_b128(p_lds_vt_lane, sizeof(v4ui), v_transposed.hi);
+        hkm::ds_write_b128(v_transposed.lo, p_lds_vt_lane, 0);
+        hkm::ds_write_b128(v_transposed.hi, p_lds_vt_lane, sizeof(v4ui));
     }
 
     // load 32x32 block for each warp. Each threads takes 4x4 elements.
@@ -1506,12 +1506,12 @@ class OManager16bitsV2
             static_assert(false, "Unsupported output type");
         }
 
-        hkm::ds_write_b64(p_lds_warp + v_offset_lds_st, 0, b16_pair_0);
-        hkm::ds_write_b64(p_lds_warp + v_offset_lds_st, kNumCols / 2 * sizeof(out_t), b16_pair_1);
+        hkm::ds_write_b64(b16_pair_0, p_lds_warp + v_offset_lds_st, 0);
+        hkm::ds_write_b64(b16_pair_1, p_lds_warp + v_offset_lds_st, kNumCols / 2 * sizeof(out_t));
         asm volatile("s_waitcnt lgkmcnt(0)");
         const v4ui data = hkm::ds_read_b128(p_lds_warp + v_offset_lds_ld, 0);
         asm volatile("s_waitcnt lgkmcnt(0)");
-        hkm::buffer_store_dwordx4(out_br, v_offset_vram_st, 0, kOffsetInBytes, data);
+        hkm::buffer_store_dwordx4(data, out_br, v_offset_vram_st, 0, kOffsetInBytes);
     }
 };
 
@@ -1557,18 +1557,21 @@ class OManager32bitsV1
 
         if constexpr(std::is_same_v<out_t, float>)
         {
-            asm volatile("buffer_store_dwordx4 v[%0:%1], %4, %5, 0 offen offset:%6\n\t"
-                         "buffer_store_dwordx4 v[%2:%3], %4, %5, 0 offen offset:%7"
-                         :
-                         : "i"(GPR_START),
-                           "i"(GPR_START + 3),
-                           "i"(GPR_START + 4),
-                           "i"(GPR_START + 7),
-                           "v"(offset),
-                           "s"(*(hk::i32x4*)&out_br),
-                           "i"(kOffsetInBytes0),
-                           "i"(kOffsetInBytes1)
-                         : "memory");
+            hkm::buffer_store_dwordx4<GPR_START>(out_br, offset, 0, kOffsetInBytes0);
+            hkm::buffer_store_dwordx4<GPR_START + 4>(out_br, offset, 0, kOffsetInBytes1);
+
+            // asm volatile("buffer_store_dwordx4 v[%0:%1], %4, %5, 0 offen offset:%6\n\t"
+            //              "buffer_store_dwordx4 v[%2:%3], %4, %5, 0 offen offset:%7"
+            //              :
+            //              : "i"(GPR_START),
+            //                "i"(GPR_START + 3),
+            //                "i"(GPR_START + 4),
+            //                "i"(GPR_START + 7),
+            //                "v"(offset),
+            //                "s"(*(hk::i32x4*)&out_br),
+            //                "i"(kOffsetInBytes0),
+            //                "i"(kOffsetInBytes1)
+            //              : "memory");
         }
         else
         {
@@ -1672,9 +1675,9 @@ class OManager32bitsV2
         const v4ui data_1 =
             hkm::ds_read_b128(p_lds_warp + v_offset_lds_ld, kLdsLdOffsetDeltaInBytes);
         asm volatile("s_waitcnt lgkmcnt(0)");
-        hkm::buffer_store_dwordx4(out_br, v_offset_vram_st, 0, kOffsetInBytes, data_0);
+        hkm::buffer_store_dwordx4(data_0, out_br, v_offset_vram_st, 0, kOffsetInBytes);
         hkm::buffer_store_dwordx4(
-            out_br, v_offset_vram_st + kVramStOffsetDeltaInBytes, 0, kOffsetInBytes, data_1);
+            data_1, out_br, v_offset_vram_st + kVramStOffsetDeltaInBytes, 0, kOffsetInBytes);
     }
 };
 
