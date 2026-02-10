@@ -340,22 +340,6 @@ def test_sparse_attn_decode(
     extra_block_size,
     dim_qk,
 ):
-    #     print(f"""test_sparse_attn_decode(
-    #     batch_size={batch_size},
-    #     head_num_of_q={head_num_of_q},
-    #     head_num_of_kv={head_num_of_kv},
-    #     seq_len_of_q={seq_len_of_q},
-    #     seq_len_of_k={seq_len_of_k},
-    #     varlen={varlen},
-    #     topk={topk},
-    #     var_topk={var_topk},
-    #     enable_attn_sink={enable_attn_sink},
-    #     extra_s_k={extra_s_k},
-    #     extra_topk={extra_topk},
-    #     block_size={block_size},
-    #     extra_block_size={extra_block_size},
-    #     dim_qk={dim_qk}
-    # )""")
     # 1. prepare input
     assert head_num_of_q % head_num_of_kv == 0
 
@@ -363,20 +347,12 @@ def test_sparse_attn_decode(
     q.clamp_(min=-1.0, max=1.0)
     q_nope_scale_buff, q_rope_buff = native_to_2buff_for_asm(q)
 
-    # print(f"{q=}")
-    # print(f"{q.shape=}")
-    # print(f"{q_nope_scale_buff=}")
-    # print(f"{q_nope_scale_buff.shape=}")
-    # print(f"{q_rope_buff=}")
-    # print(f"{q_rope_buff.shape=}")
-
     attn_sink = None
     if enable_attn_sink:
         attn_sink = torch.randn((head_num_of_q,), dtype=torch.float32)
         inf_mask = torch.randn((head_num_of_q,), dtype=torch.float32)
         attn_sink[inf_mask > 0.5] = float("inf")
         attn_sink[inf_mask < -0.5] = float("-inf")
-    # print(f"{attn_sink=}")
 
     def gen_one_k_scope(
         s_k: int,
@@ -426,13 +402,8 @@ def test_sparse_attn_decode(
         varlen,
         have_zero_seqlen_k,
     )
-    # print(f"{native_kv_cache.shape=}")
-    # print(f"{kv_indptr=}")
-    # print(f"{kv_indices=}")
-    # print(f"{kv_last_page_lens=}")
 
     ### quant for fp8
-
     # quant_kv_cache = quant.quantize_k_cache_ds_model1(native_kv_cache)
     # kv_nope_scale_buff, kv_rope_buff = to_2buff_for_asm(quant_kv_cache)
     # dequant_kv_cache = dequant_2buff_to_kv_cache(kv_nope_scale_buff, kv_rope_buff)
@@ -442,7 +413,6 @@ def test_sparse_attn_decode(
     # 2. call reference implementation
     """
     refer: need use quantized kv cache.
-
     """
     ref_out, ref_lse = ref_sparse_attn_decode(
         q_nope_scale_buff,
