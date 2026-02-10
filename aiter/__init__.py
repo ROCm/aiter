@@ -3,7 +3,14 @@
 
 import torch
 import os
+import sys
 import logging
+
+# Ensure aiter's directory is on sys.path so that intra-package absolute
+# imports like `from kernels.xxx import ...` work in all entry scenarios.
+_aiter_dir = os.path.dirname(os.path.abspath(__file__))
+if _aiter_dir not in sys.path:
+    sys.path.insert(0, _aiter_dir)
 
 logger = logging.getLogger("aiter")
 

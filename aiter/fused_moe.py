@@ -965,16 +965,16 @@ def get_2stage_cfgs(
                 use_non_temporal_load=use_non_temporal_load,
             )
 
-        print("use_flydsl_stage2 = %s", use_flydsl_stage2)
-        print("flydsl_accumulate = %s", flydsl_accumulate)
-        print("use_reduce_mode = %s", use_reduce_mode)
-        print("use_flydsl_stage1 = %s", use_flydsl_stage1)
-        print("flydsl_block_m = %s", flydsl_block_m)
-        print("stage1_func = %s", stage1_func)
-        print("stage2_func = %s", stage2_func)
-        print("block_m = %s", block_m)
-        print("ksplit = %s", ksplit)
-        print("run_1stage = %s", run_1stage)
+        # print("use_flydsl_stage2 = %s", use_flydsl_stage2)
+        # print("flydsl_accumulate = %s", flydsl_accumulate)
+        # print("use_reduce_mode = %s", use_reduce_mode)
+        # print("use_flydsl_stage1 = %s", use_flydsl_stage1)
+        # print("flydsl_block_m = %s", flydsl_block_m)
+        # print("stage1_func = %s", stage1_func)
+        # print("stage2_func = %s", stage2_func)
+        # print("block_m = %s", block_m)
+        # print("ksplit = %s", ksplit)
+        # print("run_1stage = %s", run_1stage)
         return MOEMetadata(
             stage1_func,
             stage2_func,
@@ -1787,18 +1787,10 @@ def flydsl_moe_stage1(
         w1_scale_1d = w1_scale.view(-1).contiguous()
 
     # Import compile_moe_gemm1
-    import sys
-
-    flydsl_root = os.environ.get("DSL2_ROOT")
-    if flydsl_root is None:
-        raise ValueError("DSL2_ROOT environment variable must be set for FlyDSL")
-    if flydsl_root not in sys.path:
-        sys.path.insert(0, flydsl_root)
-
     if not is_wfp4_pipeline:
-        from kernels.moe_gemm_2stage import compile_moe_gemm1  # type: ignore
+        from .kernels.moe_gemm_2stage import compile_moe_gemm1  # type: ignore
     else:
-        from kernels.mixed_moe_gemm_2stage import (
+        from .kernels.mixed_moe_gemm_2stage import (
             compile_mixed_moe_gemm1 as compile_moe_gemm1,
         )
 
@@ -1946,18 +1938,10 @@ def flydsl_moe_stage2(
         sorted_w = sorted_weights
 
     # Import compile_moe_gemm2
-    import sys
-
-    flydsl_root = os.environ.get("DSL2_ROOT")
-    if flydsl_root is None:
-        raise ValueError("DSL2_ROOT environment variable must be set for FlyDSL")
-    if flydsl_root not in sys.path:
-        sys.path.insert(0, flydsl_root)
-
     if not is_wfp4_pipeline:
-        from kernels.moe_gemm_2stage import compile_moe_gemm2
+        from .kernels.moe_gemm_2stage import compile_moe_gemm2
     else:
-        from kernels.mixed_moe_gemm_2stage import (
+        from .kernels.mixed_moe_gemm_2stage import (
             compile_mixed_moe_gemm2 as compile_moe_gemm2,
         )
 
@@ -2107,20 +2091,14 @@ def flydsl_moe_stage2_ex(
         sorted_w = sorted_weights
 
     # Import compile_moe_gemm2_ex
-    import sys
-
-    flydsl_root = os.environ.get("DSL2_ROOT")
-    if flydsl_root is None:
-        raise ValueError("DSL2_ROOT environment variable must be set for FlyDSL")
-    if flydsl_root not in sys.path:
-        sys.path.insert(0, flydsl_root)
+    # region agent log
 
     if is_wfp4_pipeline:
-        from kernels.mixed_moe_gemm_2stage import (
+        from .kernels.mixed_moe_gemm_2stage import (
             compile_mixed_moe_gemm2 as compile_moe_gemm2,
         )
     else:
-        from kernels.moe_gemm_2stage import compile_moe_gemm2_ex, MoeGemm2Mode
+        from .kernels.moe_gemm_2stage import compile_moe_gemm2_ex, MoeGemm2Mode
 
     if out.dtype == dtypes.bf16:
         out_dtype = "bf16"
@@ -2275,15 +2253,7 @@ def flydsl_moe_reduction(
     Performs: Y[t, d] = sum(X[t, :, d]) for all t, d
     Equivalent to: torch.sum(X, dim=1, out=Y)
     """
-    import sys
-
-    flydsl_root = os.environ.get("DSL2_ROOT")
-    if flydsl_root is None:
-        raise ValueError("DSL2_ROOT environment variable must be set for FlyDSL")
-    if flydsl_root not in sys.path:
-        sys.path.insert(0, flydsl_root)
-
-    from kernels.moe_gemm_2stage import compile_moe_reduction
+    from .kernels.moe_gemm_2stage import compile_moe_reduction
 
     reduce_exe = compile_moe_reduction(
         topk=topk,
