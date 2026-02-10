@@ -44,6 +44,7 @@ def fused_qk_norm_rope_cache_block_quant_shuffle(
     k_cache: Tensor,
     v_cache: Tensor,
     slot_mapping: Tensor,
+    cu_q_len: Tensor,
     kv_cache_dtype: str,
     k_scale: Tensor,
     v_scale: Tensor,

@@ -324,10 +324,10 @@
                      ck_tile::type_convert<kv_cache_scalar_t>(float(elements[i]) / v_scale_val);
              }
          }
-     }
- }
+    }
+}
 
- template<typename scalar_t,  typename F, int WarpSize = 64>
+template<typename scalar_t,  typename F, int WarpSize = 64>
  __device__ __forceinline__ scalar_t warp_reduce(scalar_t val, F op) {
      #pragma unroll
      for (int offset = WarpSize / 2; offset > 0; offset >>= 1) {
@@ -367,7 +367,8 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
            int num_kv_heads,
            int wg_size=64,
            vllm::Fp8KVCacheDataType kv_dt>
- __global__ void fusedQKNormRopeBlockQuantCacheShuffleKernel(
+ __global__
+ void fusedQKNormRopeBlockQuantCacheShuffleKernel(
      scalar_t* qkv_void,            // Combined QKV tensor [num_tokens, (num_heads_q+num_heads_k+num_heads_v)， head_dim]
      int const num_heads_q,         // Number of query heads
      int const num_heads_k,         // Number of key heads
@@ -382,11 +383,14 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
      kv_cache_scalar_t*
          v_cache,           // Value cache [num_blocks, num_kv_heads, block_size // x, head_size, x]
      int64_t* slot_mapping, // Slot mapping
+     int64_t const* cu_q_len, // Cu Q len tensor [0, batch0_seq_len, batch0_seq_len + batch1_seq_len, ...]
      float* k_scale,        // Key scale for quantized key cache [num_blocks, num_kv_heads]
      float* v_scale,        // Value scale for quantized value cache [num_blocks, num_kv_heads]
      int const num_tokens,  // Number of tokens
      int const page_size,   // Page size for kv cache
-     int x                  // kv cache tiling size
+     int x,                  // kv cache tiling size
+     int const batch_size, // Batch size
+     int const max_seq_len // Max sequence length
  )
  {
      // per block deal with blockSize tokens
@@ -397,58 +401,167 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
     int const globalWarpIdx = blockIdx.x * warpsPerBlock + warpId;
 
     int const num_heads    = num_heads_q + num_heads_k + num_heads_v;
-    int const tokenBlockIdx     = blockIdx.x;// / num_heads
-    int tokenIdx = tokenBlockIdx * blockDim.x + threadIdx.x;
-    int const localHeadIdx = blockIdx.y;// % num_heads;
+    int const batch_id     = blockIdx.x;  // batch index
+    int const localHeadIdx = blockIdx.z;  // head index
     float block_max  = 0.0f;
     
-    // Declare first_token_idx and slot_id - will be set based on boundary conditions
-    int64_t first_token_idx;
-    int64_t slot_id;
+    // Calculate current batch's sequence length
+    int64_t batch_start_idx = cu_q_len[batch_id];
+    int64_t batch_end_idx   = cu_q_len[batch_id + 1];
+    int64_t seq_len         = batch_end_idx - batch_start_idx;
+    
+    // Calculate first_token_idx for this GPU block
+    // Similar to cache_kernels.cu: first_token_idx = blockIdx.x * seq_len + blockIdx.y * block_size
+    // But here we use cu_q_len: first_token_idx = cu_q_len[batch_id] + blockIdx.y * block_size
+    int64_t first_token_idx = batch_start_idx + blockIdx.y * blockDim.x;
+    int64_t slot_idx;
+    int64_t block_idx;
+    int64_t block_offset;
     
     // ============================================================================
     // BOUNDARY HANDLING: Similar to cache_kernels.cu lines 504-521
-    // Handle case where GPU block extends beyond num_tokens
+    // Handle case where GPU block extends beyond current batch's sequence length
+    // Ensure one wave group only processes one cache block (page)
     // ============================================================================
-    if(blockIdx.x * blockDim.x >= num_tokens)
+    if(blockIdx.y * blockDim.x >= seq_len)
     {
-        // This GPU block starts beyond the input tokens
-        // Check if we need to process remaining tokens from a different page
+        // This GPU block is beyond the current batch's sequence length
+        // Check if we need to process remaining tokens from a different cache page
         
-        // Get the block_idx (page) of the previous GPU block's first token
-        int64_t prev_first_token_idx = blockIdx.x * blockDim.x - blockDim.x;
-        if(prev_first_token_idx < 0)
+        // Get the cache block_idx (page) of the previous GPU block's first token
+        int64_t prev_first_token_idx = batch_start_idx + (blockIdx.y - 1) * blockDim.x;
+        if(prev_first_token_idx < batch_start_idx || prev_first_token_idx >= batch_end_idx)
         {
             return;  // Invalid, just return
         }
         
-        int64_t prev_slot_id = slot_mapping[prev_first_token_idx];
-        int64_t prev_block_idx = prev_slot_id / page_size;
+        int64_t prev_slot_idx = slot_mapping[prev_first_token_idx];
+        int64_t preTg_block_idx = prev_slot_idx / page_size;
         
-        // Get the last token's block_idx (page)
-        first_token_idx = num_tokens - 1;
-        slot_id = slot_mapping[first_token_idx];
-        int64_t last_block_idx = slot_id / page_size;
-        
-        // If they are in the same page, the previous GPU block already handled it
-        if(prev_block_idx == last_block_idx)
+        // Get the last token's cache block_idx (page)
+        int64_t last_token_idx = batch_end_idx - 1;
+        slot_idx = slot_mapping[last_token_idx];
+        block_idx = slot_idx / page_size;
+
+
+        // If they are in the same cache page, the previous GPU block already handled it
+        if(preTg_block_idx == block_idx)
         {
             return;  // Already processed by previous GPU block
         }
         
-        // Otherwise, this block should process the remaining tokens
-        // first_token_idx and slot_id are already set to the last token
-        tokenIdx = first_token_idx;  // All threads in this block will work on the last token's page
-    } else
+        // Otherwise, this block should process the remaining tokens in the last cache page
+        // In boundary case, we need to find all tokens belonging to the last cache page
+        // We'll let each thread check if its token belongs to block_idx
+        // Start from prev_first_token_idx + 1 to avoid processing tokens already handled
+        block_offset = slot_idx % page_size;
+        //// Use shared memory to find the first token in the last cache page
+        //__shared__ int64_t first_token_in_page;
+        //if(threadIdx.x == 0)
+        //{
+        //    first_token_in_page = batch_end_idx;  // Initialize to invalid value
+        //    // Search from prev_first_token_idx + 1 to find first token in block_idx
+        //    for(int64_t i = prev_first_token_idx + 1; i < batch_end_idx; i++)
+        //    {
+        //        int64_t token_slot = slot_mapping[i];
+        //        if(token_slot >= 0)
+        //        {
+        //            int64_t token_block_idx = token_slot / page_size;
+        //            if(token_block_idx == block_idx)
+        //            {
+        //                first_token_in_page = i;
+        //                break;
+        //            }
+        //        }
+        //    }
+        //}
+        //__syncthreads();
+        //first_token_idx = first_token_in_page;
+        if(first_token_idx >= batch_end_idx)
+        {
+            return;  // No tokens found in the last cache page
+        }
+        // Update slot_idx and block_idx based on the found first_token_idx
+        slot_idx = slot_mapping[first_token_idx];
+        if(slot_idx < 0)
+        {
+            return;  // Invalid slot
+        }
+        block_idx = slot_idx / page_size;
+        block_offset = slot_idx % page_size;
+    }
+    else
     {
         // Normal case: GPU block starts within the valid token range
-        first_token_idx = tokenBlockIdx * blockDim.x;
-        slot_id = slot_mapping[first_token_idx];
+        slot_idx = slot_mapping[first_token_idx];
+        block_idx = slot_idx / page_size;
+        block_offset = slot_idx % page_size;
     }
-    
-    if(tokenIdx >= num_tokens)
+
+    if(slot_idx < 0)
+    {
+        // Invalid slot, skip
         return;
-     int active_tokens = num_tokens - tokenBlockIdx * blockDim.x < blockDim.x ? num_tokens - tokenBlockIdx * blockDim.x : blockDim.x;
+    }
+    if(blockIdx.y > 0 && block_offset > 0)
+    {
+        __shared__ int64_t idx_smem[2];
+        if(threadIdx.x < page_size)
+        {
+            int64_t token_idx  = first_token_idx - (threadIdx.x + 1);
+            // Check if token_idx is within current batch
+            if(token_idx >= batch_start_idx)
+            {
+                int64_t block_idx1 = slot_mapping[token_idx] / page_size;
+                int64_t slot_idx2  = slot_mapping[token_idx + 1];
+                int64_t block_idx2 = slot_idx2 / page_size;
+                if(block_idx1 != block_idx2 && block_idx2 == block_idx)
+                {
+                    idx_smem[0] = token_idx + 1;
+                    idx_smem[1] = slot_idx2;
+                }
+            }
+        }
+     
+        __syncthreads();
+        if(idx_smem[0] > 0)  // Valid value found
+        {
+            first_token_idx = idx_smem[0];
+            slot_idx        = idx_smem[1];
+            block_idx       = slot_idx / page_size;
+            block_offset    = slot_idx % page_size;
+        }
+    }
+    // Each token should compute its own slot_id and block_offset
+    int64_t actual_slot_id = -1;
+    int64_t actual_block_offset = 0;
+    int64_t actual_block_idx = -1;
+    
+    // Calculate the num_tokens that are in the same cache block (page)
+    int tokens_in_block = 0;
+    if(first_token_idx + threadIdx.x < batch_end_idx)
+    {
+        actual_slot_id = slot_mapping[first_token_idx + threadIdx.x];
+        if(actual_slot_id >= 0)
+        {
+            actual_block_idx = actual_slot_id / page_size;
+            actual_block_offset = actual_slot_id % page_size;
+            tokens_in_block = (actual_block_idx == block_idx) ? 1 : 0;
+        }
+    }
+     auto sum               = [](float a, float b) { return a + b; };
+     //int numtokens_in_block = block_reduce<int, decltype(sum), wg_size, true>(tokens_in_block, sum);
+     __shared__ float smem[wg_size / WARP_SIZE];
+    int numtokens_in_block = block_reduce<float, decltype(sum), wg_size / WARP_SIZE>(tokens_in_block, sum, 0, smem);
+   // printf("[DEBUG]batch_id=%d, blockIdx.y=%d, blockIdx.z=%d, threadIdx.x=%d, first_token_idx=%ld, slot_idx=%ld, block_idx=%ld, block_offset=%ld\n", batch_id, blockIdx.y, blockIdx.z, threadIdx.x, first_token_idx, slot_idx, block_idx, block_offset);
+    // Calculate tokenIdx for current thread
+    int tokenIdx = first_token_idx + threadIdx.x;
+    
+    // Check if tokenIdx is within valid range
+    //if(tokenIdx >= batch_end_idx)
+    //{
+    //    return;
+    //}
 
      bool const isQ                  = localHeadIdx < num_heads_q;
      bool const isK                  = (localHeadIdx < num_heads_q + num_heads_k) & !isQ;
@@ -457,11 +570,15 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
                                        : isK ? localHeadIdx - num_heads_q
                                              : localHeadIdx;
      constexpr int numElemsPerThread = head_dim;
-     scalar_t elements[numElemsPerThread];
+     
+     __shared__ scalar_t smem_elements[head_dim*wg_size]; // head dim <= 256
      constexpr int best_vec_size = sizeof(float4) / sizeof(scalar_t);
      constexpr int vec_size      = std::min(best_vec_size, numElemsPerThread);
      constexpr int load_loop_cnt = numElemsPerThread / vec_size;
+     constexpr int base_elems_per_thread = 64;
+     constexpr int base_loopcnt = base_elems_per_thread / vec_size;
      using ltype                 = ::vec_t<scalar_t, vec_size>;
+     ltype elements;
      //ltype elements;
      const float inverted_kscale = k_scale == nullptr ? 1.0f : 1 / (*k_scale);
      const float inverted_vscale = v_scale == nullptr ? 1.0f : 1 / (*v_scale);
@@ -469,104 +586,107 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
 
      // Load data first, suppose have no tail since we check the head_dim is multiple of 32 before
      // kernel launch
-
-     #pragma unroll
-     for(int i = 0; i < load_loop_cnt; i += 1)
+     auto cur_element_offset = head_dim * threadIdx.x;
+     if (tokenIdx < batch_end_idx)
      {
-         // consider stride
-         int64_t offsetWarp = (tokenIdx * num_heads * head_dim + localHeadIdx * head_dim ) /
-                              vec_size;
-         reinterpret_cast<ltype*>(elements)[i] = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i];
-     }
- 
-     
-      // If qk, we adopt RMSNorm + RoPE, so we need to compute sum of squares.
-      if(!isV)
-      {
-         // Compute norm squares
-         float sumOfSquares = 0.0f;
-        #pragma unroll
-         for(int i = 0; i < numElemsPerThread; i++)
-         {
-             sumOfSquares += static_cast<float>(elements[i]) * static_cast<float>(elements[i]);
-         }
-         auto sum_func = [](float a, float b) { return a + b; };
-         //sumOfSquares  = warpReduceSum(sum_func, sumOfSquares);
-         float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
- 
-         // Normalize elements
-         #pragma unroll
-         for(int i = 0; i < numElemsPerThread; i++)
-         {
-             int dim      = i;//laneId * numElemsPerThread + 
-             float weight = isQ ? float(q_weight[dim]) : float(k_weight[dim]);
-             elements[i]  = static_cast<scalar_t>(elements[i] * rms_rcp * weight);
-         }
- 
-         // Apply RoPE to normalized elements
- 
-         int64_t pos_id = position_ids[tokenIdx];
- 
-         // Calculate cache pointer for this position - similar to
-         // pos_encoding_kernels.cu
-         scalar_t const* cache_ptr = cos_sin_cache + pos_id * head_dim;
-         int const embed_dim       = head_dim / 2;
-         scalar_t const* cos_ptr   = cache_ptr;
-         scalar_t const* sin_ptr   = cache_ptr + embed_dim;
- 
-         if constexpr(interleave)
-         {
-             // Perform interleaving. Use pre-computed cos/sin values.
- #pragma unroll
-             for(int i = 0; i < numElemsPerThread / 2; ++i)
-             {
-                 int const idx0 = 2 * i;
-                 int const idx1 = 2 * i + 1;
- 
-                 float const val0 = elements[idx0];
-                 float const val1 = elements[idx1];
- 
-                 int const dim_idx  = idx0;//laneId * numElemsPerThread + 
-                 int const half_dim = dim_idx / 2;
-                 float cos_val      = static_cast<float>(cos_ptr[half_dim]);
-                 float sin_val      = static_cast<float>(sin_ptr[half_dim]);
- 
-                 elements[idx0] = static_cast<scalar_t>(val0 * cos_val - val1 * sin_val);
-                 elements[idx1] = static_cast<scalar_t>(val0 * sin_val + val1 * cos_val);
-             }
-         }
-         else
-         {
-             //scalar_t elements2[numElemsPerThread]; // Additional buffer required for RoPE.
-             // Before data exchange with in warp, we need to sync.
-             //__syncwarp();
-             // Get the data from the other half of the warp. Use pre-computed cos/sin
-             // values.
- #pragma unroll
-             for(int i = 0; i < numElemsPerThread / 2; i++)
-             {
-                 int const idx0 = i;
-                 int const idx1 = i + numElemsPerThread / 2;
-                 // Use pre-computed cos/sin from cache
-                 float cos_val = cos_ptr[idx0];
-                 float sin_val = sin_ptr[idx0];
-                 float const val0 = elements[idx0];
-                 float const val1 = elements[idx1];
- 
-                 elements[idx0] = static_cast<scalar_t>(val0 * cos_val - val1 * sin_val);
-                 elements[idx1] = static_cast<scalar_t>(val1 * cos_val + val0 * sin_val);
-             }
-             //__syncwarp();
-         }
-         // store q
-         #pragma unroll
-         for(int i = 0; i < load_loop_cnt; i += 1)
-         {
-             int64_t offsetWarp = (tokenIdx * num_heads * head_dim + localHeadIdx * head_dim ) /
-                                  vec_size;
-             reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i] =
-                 reinterpret_cast<ltype*>(elements)[i];
-         }
+       #pragma unroll
+       for(int i = 0; i < load_loop_cnt; i += 1)
+       {
+           // consider stride
+           int64_t offsetWarp = (tokenIdx * num_heads * head_dim + localHeadIdx * head_dim ) /
+                                vec_size;
+           elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i];
+           reinterpret_cast<ltype*>(smem_elements)[cur_element_offset / vec_size +i] = elements;
+       }
+        
+        // If qk, we adopt RMSNorm + RoPE, so we need to compute sum of squares.
+        if(!isV)
+        {
+           // Compute norm squares
+           float sumOfSquares = 0.0f;
+          #pragma unroll
+           for(int i = 0; i < numElemsPerThread; i++)
+           {
+               sumOfSquares += static_cast<float>(smem_elements[cur_element_offset + i]) * static_cast<float>(smem_elements[cur_element_offset + i]);
+           }
+           auto sum_func = [](float a, float b) { return a + b; };
+           //sumOfSquares  = warpReduceSum(sum_func, sumOfSquares);
+           float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
+   
+           // Normalize elements
+           #pragma unroll
+           for(int i = 0; i < numElemsPerThread; i++)
+           {
+               int dim      = i;//laneId * numElemsPerThread + 
+               float weight = isQ ? float(q_weight[dim]) : float(k_weight[dim]);
+               smem_elements[cur_element_offset + i]  = static_cast<scalar_t>(smem_elements[cur_element_offset + i] * rms_rcp * weight);
+           }
+   
+           // Apply RoPE to normalized elements
+   
+           int64_t pos_id = position_ids[tokenIdx];
+   
+           // Calculate cache pointer for this position - similar to
+           // pos_encoding_kernels.cu
+           scalar_t const* cache_ptr = cos_sin_cache + pos_id * head_dim;
+           int const embed_dim       = head_dim / 2;
+           scalar_t const* cos_ptr   = cache_ptr;
+           scalar_t const* sin_ptr   = cache_ptr + embed_dim;
+   
+           if constexpr(interleave)
+           {
+               // Perform interleaving. Use pre-computed cos/sin values.
+              #pragma unroll
+               for(int i = 0; i < numElemsPerThread / 2; ++i)
+               {
+                   int const idx0 = 2 * i;
+                   int const idx1 = 2 * i + 1;
+   
+                   float const val0 = smem_elements[cur_element_offset + idx0];
+                   float const val1 = smem_elements[cur_element_offset + idx1];
+   
+                   int const dim_idx  = idx0;//laneId * numElemsPerThread + 
+                   int const half_dim = dim_idx / 2;
+                   float cos_val      = static_cast<float>(cos_ptr[half_dim]);
+                   float sin_val      = static_cast<float>(sin_ptr[half_dim]);
+   
+                   smem_elements[cur_element_offset + idx0] = static_cast<scalar_t>(val0 * cos_val - val1 * sin_val);
+                   smem_elements[cur_element_offset + idx1] = static_cast<scalar_t>(val0 * sin_val + val1 * cos_val);
+               }
+           }
+           else
+           {
+               //scalar_t elements2[numElemsPerThread]; // Additional buffer required for RoPE.
+               // Before data exchange with in warp, we need to sync.
+               //__syncwarp();
+               // Get the data from the other half of the warp. Use pre-computed cos/sin
+               // values.
+              #pragma unroll
+               for(int i = 0; i < numElemsPerThread / 2; i++)
+               {
+                   int const idx0 = i;
+                   int const idx1 = i + numElemsPerThread / 2;
+                   // Use pre-computed cos/sin from cache
+                   float cos_val = cos_ptr[idx0];
+                   float sin_val = sin_ptr[idx0];
+                   float const val0 = smem_elements[cur_element_offset + idx0];
+                   float const val1 = smem_elements[cur_element_offset + idx1];
+   
+                   smem_elements[cur_element_offset + idx0] = static_cast<scalar_t>(val0 * cos_val - val1 * sin_val);
+                   smem_elements[cur_element_offset + idx1] = static_cast<scalar_t>(val1 * cos_val + val0 * sin_val);
+               }
+               //__syncwarp();
+           }
+           // store q
+           #pragma unroll
+           for(int i = 0; i < load_loop_cnt; i += 1)
+           {
+               int64_t offsetWarp = (tokenIdx * num_heads * head_dim + localHeadIdx * head_dim ) /
+                                    vec_size;
+               reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i] =
+                   reinterpret_cast<ltype*>(smem_elements)[cur_element_offset / vec_size + i];
+           }
+       }
      }
  
      if(isQ)
@@ -581,58 +701,15 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
      // This is critical for correct block-level quantization scale calculation
      // ============================================================================
      
-     // cache the kv into kv cache and quant if required
-
-     if(slot_id < 0)
-     {
-         // invalid slot, skip
-         return;
-     }
-     int64_t block_idx    = slot_id / page_size;
-     int64_t block_offset = slot_id % page_size;
-     // CHECK all tokens in the block have the same block_idx and block_offset
-     // fix first_token_idx to real block first_token_idx
-     
-     if(blockIdx.x > 0 && block_offset > 0)
-     {
-        __shared__ int64_t idx_smem[2];
-         if(threadIdx.x < page_size)
-         {
-             int64_t token_idx  = first_token_idx - (threadIdx.x + 1);
-             int64_t block_idx1 = slot_mapping[token_idx] / page_size;
-             int64_t slot_idx2  = slot_mapping[token_idx + 1];
-             int64_t block_idx2 = slot_idx2 / page_size;
-             if(block_idx1 != block_idx2 && block_idx2 == block_idx)
-             {
-                 idx_smem[0] = token_idx + 1;
-                 idx_smem[1] = slot_idx2;
-             }
-         }
-      
-         __syncthreads();
-         first_token_idx = idx_smem[0];
-         slot_id        = idx_smem[1];
-     }
-     block_offset = slot_id % page_size; // for the new block block offset set all 0 to process
-     
-     // Each token should compute its own slot_id and block_offset
-     int64_t actual_slot_id = -1;
-     int64_t actual_block_offset = 0;
-     int64_t actual_block_idx = -1;
-     
-     //  add cal the num_tokens that are in the same block
-     int tokens_in_block = 0;
-     if(first_token_idx + threadIdx.x < num_tokens)
-     {
-         actual_slot_id = slot_mapping[first_token_idx + threadIdx.x];
-         actual_block_idx = actual_slot_id / page_size;
-         actual_block_offset = actual_slot_id % page_size;
-         tokens_in_block = (actual_block_idx == block_idx) ? 1 : 0;
-     }
-     auto sum               = [](float a, float b) { return a + b; };
-     //int numtokens_in_block = block_reduce<int, decltype(sum), wg_size, true>(tokens_in_block, sum);
-     __shared__ float smem[wg_size / WARP_SIZE];
-    int numtokens_in_block = block_reduce<float, decltype(sum), wg_size / WARP_SIZE>(tokens_in_block, sum, 0, smem);
+    // cache the kv into kv cache and quant if required
+    // block_idx and block_offset are already calculated above
+    
+    // Fix first_token_idx to real block first_token_idx (similar to cache_kernels.cu lines 531-549)
+    // This ensures we process all tokens in the same cache page together
+    
+    
+    
+    //printf("[DEBUG] batch_id=%d, blockIdx.y=%d, blockIdx.z=%d, threadIdx.x=%d, numtokens_in_block=%d, block_offset=%ld\n", batch_id, blockIdx.y, blockIdx.z, threadIdx.x, numtokens_in_block, block_offset);
     float dtype_max = ck_tile::type_convert<float>(ck_tile::numeric<kv_cache_scalar_t>::max());
     
     // Debug print: only print first few threads to avoid spam
@@ -656,8 +733,9 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
              #pragma unroll
              for(int i = 0; i < numElemsPerThread ; i++)
              {
-                 block_max = f_absmax_f32(block_max, elements[i]);
+                 block_max = f_absmax_f32(block_max, smem_elements[cur_element_offset + i]);
              }
+
          }
          //warp_max = warpReduceSum(f_absmax_f32, warp_max);
  
@@ -672,7 +750,7 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
          if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
          {
              k_scale_val = block_max / dtype_max;
-             // Fix: correct scale index calculation [num_blocks, num_kv_heads]
+// Fix: correct scale index calculation [num_blocks, num_kv_heads]
              int64_t scale_offset = block_idx * num_kv_heads + headIdx;
              
              // Handle incremental updates: check for scale conflicts
@@ -725,19 +803,22 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
                                headIdx * head_dim * page_size;// + actual_block_offset * x
         // Only write if current token belongs to this block
 
-        #pragma unroll
-        for(int i = 0; i < numElemsPerThread; i++)
-        {
-            // [num_blocks, num_kv_heads, head_size // x, block_size, x]
-            int64_t offset = cache_offset + i / x * page_size * x + actual_block_offset * x + i % x;
-            if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
+        
+        if (threadIdx.x < numtokens_in_block) {
+            #pragma unroll
+            for(int i = 0; i < numElemsPerThread; i++)
             {
-                k_cache[offset] = elements[i];
-            }
-            else
-            {
-                k_cache[offset] =
-                    ck_tile::type_convert<kv_cache_scalar_t>(float(elements[i]) / k_scale_val);
+                // [num_blocks, num_kv_heads, head_size // x, block_size, x]
+                int64_t offset = cache_offset + i / x * page_size * x + actual_block_offset * x + i % x;
+                if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
+                {
+                    k_cache[offset] = smem_elements[cur_element_offset + i];
+                }
+                else
+                {
+                    k_cache[offset] =
+                        ck_tile::type_convert<kv_cache_scalar_t>(float(smem_elements[cur_element_offset + i]) / k_scale_val);
+                }
             }
         }
 
@@ -807,12 +888,12 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
                 int64_t offset = cache_offset + i * x + actual_block_offset % x;
                 if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
                 {
-                    v_cache[offset] = elements[i];
+                    v_cache[offset] = smem_elements[cur_element_offset + i];
                 }
                 else
                 {
                     v_cache[offset] =
-                        ck_tile::type_convert<kv_cache_scalar_t>(float(elements[i]) / v_scale_val);
+                        ck_tile::type_convert<kv_cache_scalar_t>(float(smem_elements[cur_element_offset + i]) / v_scale_val);
                 }
             }
         }
@@ -1002,19 +1083,22 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
                                             kv_cache_scalar_t* k_cache,
                                             kv_cache_scalar_t* v_cache,
                                             int64_t* slot_mapping,
+                                            int64_t const* cu_q_len,
                                             float* k_scale,
                                             float* v_scale,
                                             int page_size,
                                             int x,
+                                            int batch_size,
+                                            int max_seq_len,
                                             hipStream_t stream)
 {
     // Fixed blockSize to reduce template instantiations
     constexpr int blockSize = 64;
     // todo if decode  one token per block
     // int const gridSize = num_tokens;
-    int const gridSize = (num_tokens + blockSize - 1) / blockSize + 1;
-
-    dim3 gridDim(gridSize, num_heads_q + num_heads_k + num_heads_v);
+    int const gridSize = (max_seq_len + blockSize - 1) / blockSize + 1;
+    printf("[DEBUG] gridSize=%d, batch_size=%d, max_seq_len=%d\n", gridSize, batch_size, max_seq_len);
+    dim3 gridDim(batch_size, gridSize,  num_heads_q + num_heads_k + num_heads_v);
     dim3 blockDim(blockSize);
 
     switch(head_dim)
@@ -1040,11 +1124,14 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
                                                    k_cache,
                                                    v_cache,
                                                    slot_mapping,
+                                                   cu_q_len,
                                                    k_scale,
                                                    v_scale,
                                                    num_tokens,
                                                    page_size,
-                                                   x);
+                                                   x,
+                                                   batch_size,
+                                                   max_seq_len);
         });
         break;
     case 128:
@@ -1068,11 +1155,14 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
                                                    k_cache,
                                                    v_cache,
                                                    slot_mapping,
+                                                   cu_q_len,
                                                    k_scale,
                                                    v_scale,
                                                    num_tokens,
                                                    page_size,
-                                                   x);
+                                                   x,
+                                                   batch_size,
+                                                   max_seq_len);
         });
         break;
     //case 256:
@@ -1147,10 +1237,13 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
              reinterpret_cast<CACHE_T*>(k_cache.data_ptr()),               \
              reinterpret_cast<CACHE_T*>(v_cache.data_ptr()),               \
              slot_mapping.data_ptr<int64_t>(),                             \
+             cu_q_len.data_ptr<int64_t>(),                                 \
              k_scale.has_value() ? k_scale->data_ptr<float>() : nullptr,   \
              v_scale.has_value() ? v_scale->data_ptr<float>() : nullptr,   \
              page_size,                                                    \
              x,                                                            \
+             batch_size,                                                   \
+             max_seq_len,                                                  \
              stream);
 
 #define CALL_QK_NORM_ROPE_CACHE_QUANT(SRC_T, CACHE_T, KV_DTYPE)       \
@@ -1771,6 +1864,7 @@ void fused_qk_norm_rope_cache_block_quant_shuffle(
     at::Tensor& k_cache,               // k cache
     at::Tensor& v_cache,               // v cache
     at::Tensor& slot_mapping,          // slot mapping
+    at::Tensor& cu_q_len,              // cu q len tensor [0, batch0_seq_len, batch0_seq_len + batch1_seq_len, ...]
     const std::string& kv_cache_dtype, // kv cache data type
     std::optional<at::Tensor> k_scale, // k scale tensor for quantized k cache
     std::optional<at::Tensor> v_scale  // v scale tensor for quantized v cache
@@ -1778,6 +1872,7 @@ void fused_qk_norm_rope_cache_block_quant_shuffle(
  {
      // Input validation
      CHECK_INPUT(qkv);
+     CHECK_INPUT(cu_q_len);
      CHECK_INPUT(position_ids);
      CHECK_INPUT(q_weight);
      CHECK_INPUT(k_weight);
@@ -1802,12 +1897,35 @@ void fused_qk_norm_rope_cache_block_quant_shuffle(
      TORCH_CHECK(
          num_heads_k <= 32,
          "Number of key heads must be less than or equal to 32 for fused QK Norm RoPE kernel");
- 
+
+     // cu_q_len format: [0, batch0_seq_len, batch0_seq_len + batch1_seq_len, ...]
+     // batch_size = cu_q_len.size(0) - 1
+     TORCH_CHECK(cu_q_len.dim() == 1, "Cu Q len tensor must be 1D");
+     int64_t batch_size = cu_q_len.size(0) - 1;
+     TORCH_CHECK(batch_size > 0, "Batch size must be greater than 0");
+     
+     // Calculate max_seq_len: max of all batch sequence lengths
+     int64_t* cu_q_len_ptr = cu_q_len.data_ptr<int64_t>();
+     int64_t max_seq_len = 0;
+     for(int64_t i = 1; i <= batch_size; i++)
+     {
+        int64_t seq_len = cu_q_len_ptr[i] - cu_q_len_ptr[i - 1];
+        max_seq_len = std::max(max_seq_len, seq_len);
+     }
      int64_t num_tokens = qkv.size(0);
      int64_t page_size  = k_cache.size(-2);
      int64_t x          = k_cache.size(-1);
      TORCH_CHECK(position_ids.size(0) == num_tokens,
                  "Number of tokens in position_ids must match QKV");
+     // cu_q_len format: [0, batch0_seq_len, batch0_seq_len + batch1_seq_len, ...]
+     // The last element should equal num_tokens (total number of tokens)
+     int64_t cu_q_len_size = cu_q_len.size(0);
+     int64_t cu_q_len_last_idx = cu_q_len_size - 1;
+     int64_t total_tokens_from_cu_q_len = cu_q_len_ptr[cu_q_len_last_idx];
+     printf("[DEBUG] cu_q_len.size(0)=%ld, cu_q_len[%ld]=%ld, num_tokens=%ld\n", 
+            cu_q_len_size, cu_q_len_last_idx, total_tokens_from_cu_q_len, num_tokens);
+     TORCH_CHECK(total_tokens_from_cu_q_len == num_tokens, 
+                 "Cu Q len tensor's last element must match number of tokens");
  
      int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
      TORCH_CHECK(qkv.size(1) == total_heads * head_dim,
