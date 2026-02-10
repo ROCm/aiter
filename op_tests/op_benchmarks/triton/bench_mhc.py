@@ -7,9 +7,10 @@ Benchmark for mHC (manifold-constrained Hyper Connection) fused kernel.
 Measures performance of the Triton implementation across various input shapes
 and configurations, reporting time, throughput (TFLOPS), and bandwidth.
 
-Supports two hres_mode options:
-- "lite": mHC-lite mode using convex combination of permutation matrices (exact doubly stochastic)
-- "sinkhorn": Traditional Sinkhorn-Knopp iterative mode (approximate doubly stochastic)
+Supports three benchmark modes:
+- "mhc_lite": mHC-lite using convex combination of permutations (exact doubly stochastic, faster)
+- "mhc": Full mHC with Sinkhorn-Knopp iterations (approximate doubly stochastic)
+- "sinkhorn_knopp_only": Benchmark only the Sinkhorn-Knopp kernel in isolation
 """
 
 import sys
@@ -67,7 +68,6 @@ def run_benchmark(args):
     """Run mHC benchmark with specified configuration."""
     dtype = arg_to_torch_dtype[args.dtype]
     mode = args.mode
-    hres_mode = args.hres_mode
     sinkhorn_iters = args.sinkhorn_iters
     
     configs = get_benchmark_configs(args)
@@ -92,16 +92,12 @@ def run_benchmark(args):
         line_vals = [metric_map.get(args.metric, "throughput(TFLOPS)")]
     
     benchmark_name = get_caller_name_no_ext()
-    if hres_mode == "lite":
-        benchmark_name += f"_{hres_mode}"
-    else:
-        benchmark_name += f"_{hres_mode}{sinkhorn_iters}iters"
-    if mode == "full":
-        benchmark_name += f"_full"
-    elif mode == "fused":
-        benchmark_name += "_fused_only"
-    elif mode == "sinkhorn":
-        benchmark_name += f"_sinkhorn_only"
+    if mode == "mhc_lite":
+        benchmark_name += "_lite"
+    elif mode == "mhc":
+        benchmark_name += f"_sinkhorn-{sinkhorn_iters}iters"
+    elif mode == "sinkhorn_knopp_only":
+        benchmark_name += f"_sinkhorn_only-{sinkhorn_iters}iters"
     
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
@@ -118,9 +114,9 @@ def run_benchmark(args):
     @triton.testing.perf_report([benchmark])
     def bench_mhc_kernel(M, n, C, provider):
         """Benchmark mHC kernel for given configuration."""
-        # Generate inputs with appropriate hres_mode
+        # Generate inputs based on mode
         x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = \
-            generate_mhc_inputs(M, n, C, dtype, hres_mode=hres_mode)
+            generate_mhc_inputs(M, n, C, dtype, mode=mode)
         
         # Compute FLOPs for mHC or mHC-Lite operation
         nC = n * C
@@ -128,7 +124,7 @@ def run_benchmark(args):
         n_squared = n * n
         
         # Determine phi_res output dimension based on mode
-        n_res = n_factorial if hres_mode == "lite" else n_squared
+        n_res = n_factorial if mode == "mhc_lite" else n_squared
         N = n_res + 2 * n
         
         # Standard GEMM FLOPs (2*M*N*K for matrix multiply)
@@ -142,27 +138,37 @@ def run_benchmark(args):
         # sqrt(sum(x^2)/K) requires: square + sum + divide + sqrt ≈ 4*nC ops per row
         flops_rms = 4.0 * M * nC
         
-        if hres_mode == "lite":
-
+        # Eq 16: Scale and bias addition for 3 streams
+        # - Multiply by (alpha/r): M*n + M*n + M*n_res FLOPs
+        # - Add bias: M*n + M*n + M*n_res FLOPs
+        # flops_scale_bias = 2.0 * M * (2*n + n_res)
+        
+        # Eq 17 & 18: Activation functions (fused in kernel, but count FLOPs)
+        # - sigmoid(H_pre): ~10 ops per element for M*n elements
+        # - 2*sigmoid(H_post): ~11 ops per element for M*n elements  
+        # - H_res activation: softmax (lite) or none (sinkhorn)
+        # flops_activations = 10.0 * M * n + 11.0 * M * n
+        
+        # Eq 19: Sinkhorn-Knopp (separate kernel, log-domain implementation)
+        # Each iteration: 2 normalizations (row + col) on M matrices of size (n, n)
+        # Per normalization (log-domain): add, max, subtract, exp, sum, log operations
+        # Operations per iteration per matrix:
+        #   - Element-wise: add(n²) + subtract(n²) + exp(n²) ≈ 3n² (×2 for row+col)
+        #   - Reductions: max(n) + sum(n) + log(n) ≈ 3n (×2 for row+col)
+        # Total: ~(6n² + 6n) ≈ 6n² + 6n per iteration (for n=4: ~108 FLOPs)
+        # Simplified: ~10*n² per iteration (accounting for expensive exp/log ops)
+        flops_sinkhorn = 10.0 * M * n_squared * sinkhorn_iters
+        
+        # Calculate mode-specific FLOPs
+        if mode == "mhc_lite":
             # Matrix multiply: (M, n_factorial) @ (n_factorial, n_squared) = 2*M*n_factorial*n_squared
             flops_softmax = 10.0 * M * n_factorial
             flops_matmul_lite = 2.0 * M * n_factorial * n_squared
             flops_lite = flops_softmax + flops_matmul_lite
-            flops_sinkhorn = 0.0  # No Sinkhorn needed for lite mode
-        else:
-            # Sinkhorn mode
-            flops_lite = 0.0
-            # Eq 19: Sinkhorn-Knopp (separate kernel)
-            # Each iteration: 2 normalizations (row + col) on M matrices of size (n, n)
-            # Per normalization: sum + divide ≈ 2n ops per row/col
-            # Total per iteration: 2 * 2 * M * n * n = 4 * M * n * n ops
-            flops_sinkhorn = 4.0 * M * n_squared * sinkhorn_iters
-        
-        if mode == "full":
-            total_flops = flops_matmul + flops_rms + flops_lite + flops_sinkhorn
-        elif mode == "fused":
-            total_flops = flops_matmul + flops_rms + flops_lite
-        elif mode == "sinkhorn":
+            total_flops = flops_matmul + flops_rms + flops_lite #+ flops_scale_bias + flops_activations 
+        elif mode == "mhc":
+            total_flops = flops_matmul + flops_rms + flops_sinkhorn #+ flops_scale_bias + flops_activations 
+        elif mode == "sinkhorn_knopp_only":
             total_flops = flops_sinkhorn
         
         # Compute memory traffic
@@ -181,7 +187,7 @@ def run_benchmark(args):
             nC * n_res * elem_size +  # phi_res
             N * bias_size  # bias
         )
-        if hres_mode == "lite":
+        if mode == "mhc_lite":
             mem_read += n_factorial * n_squared * elem_size  # perm_matrices
         
         # Memory writes:
@@ -194,43 +200,39 @@ def run_benchmark(args):
             M * n_squared * elem_size  # out_res
         )
         
-        # Sinkhorn-Knopp memory traffic (in-place operations) - only for sinkhorn mode
-        if hres_mode == "sinkhorn":
+        # Sinkhorn-Knopp memory traffic (in-place operations)
+        if mode == "mhc":
             mem_sinkhorn = 2 * M * n_squared * elem_size * sinkhorn_iters
-        else:
-            mem_sinkhorn = 0
-        
-        if mode == "full":
             mem_read += mem_sinkhorn / 2
             mem_write += mem_sinkhorn / 2
             total_mem = mem_read + mem_write
-        elif mode == "fused":
+        elif mode == "mhc_lite":
             total_mem = mem_read + mem_write
-        elif mode == "sinkhorn":
+        elif mode == "sinkhorn_knopp_only":
             # Sinkhorn-only: read/write H_res matrix
-            total_mem = mem_sinkhorn if mem_sinkhorn > 0 else M * n_squared * elem_size
+            total_mem = 2 * M * n_squared * elem_size * sinkhorn_iters
         
         # Create benchmark function
-        if mode == "full":
+        if mode == "mhc":
             fn = lambda: mhc(
                 x, phi_pre, phi_post, phi_res,
                 alpha_pre, alpha_post, alpha_res,
                 bias, n_streams,
-                hres_mode=hres_mode,
+                hres_mode="sinkhorn",
                 sinkhorn_iters=sinkhorn_iters
             )
-        elif mode == "fused":
-            fn = lambda: fused_mhc(
+        elif mode == "mhc_lite":
+            fn = lambda: mhc(
                 x, phi_pre, phi_post, phi_res,
                 alpha_pre, alpha_post, alpha_res,
                 bias, n_streams,
-                hres_mode=hres_mode
+                hres_mode="lite"
             )
-        elif mode == "sinkhorn":
+        elif mode == "sinkhorn_knopp_only":
             # Sinkhorn-only: benchmark just the Sinkhorn-Knopp kernel
             # Pre-generate H_res for fair comparison (use sinkhorn mode for raw logits)
             x_sk, phi_pre_sk, phi_post_sk, phi_res_sk, _, _, _, bias_sk, _ = \
-                generate_mhc_inputs(M, n, C, dtype, hres_mode="sinkhorn")
+                generate_mhc_inputs(M, n, C, dtype, mode="mhc")
             _, _, H_res_input = fused_mhc(
                 x_sk, phi_pre_sk, phi_post_sk, phi_res_sk,
                 alpha_pre, alpha_post, alpha_res,
@@ -296,16 +298,9 @@ def parse_args():
     parser.add_argument(
         "--mode",
         type=str,
-        default="fused",
-        choices=["full", "fused", "sinkhorn"],
-        help="Benchmark mode: 'full' (fused+sinkhorn), 'fused' (fused kernel only), 'sinkhorn' (sinkhorn-only). Default: 'fused'"
-    )
-    parser.add_argument(
-        "--hres_mode",
-        type=str,
-        default="lite",
-        choices=["lite", "sinkhorn"],
-        help="H_res computation mode: 'lite' (exact doubly stochastic via permutations), 'sinkhorn' (approximate via iterations). Default: 'lite'"
+        default="mhc_lite",
+        choices=["mhc", "mhc_lite", "sinkhorn_knopp_only"],
+        help="Benchmark mode: 'mhc' (fused + sinkhorn_knopp), 'mhc_lite', 'sinkhorn_knopp_only'. Default: 'mhc_lite'"
     )
     parser.add_argument(
         "-sinkhorn_iters",

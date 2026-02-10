@@ -867,7 +867,7 @@ def test_mhc_lite_correctness(M, n, C, dtype):
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
-    x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C, dtype, hres_mode="lite")
+    x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C, dtype, mode="mhc_lite")
 
     H_pre_torch, H_post_torch, H_res_torch = mhc_lite_torch(
         x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams
@@ -909,7 +909,7 @@ def test_mhc_lite_doubly_stochastic(M, n, C):
     """
     torch.cuda.empty_cache()
 
-    x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C, hres_mode="lite")
+    x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C, mode="mhc_lite")
 
     _, _, H_res = mhc(
         x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams,
@@ -941,7 +941,7 @@ def test_mhc_lite_vs_sinkhorn_output_shape(M, n, C):
     x, phi_pre, phi_post, phi_res_sk, alpha_pre, alpha_post, alpha_res, bias_sk, n_streams = generate_mhc_inputs(M, n, C)
     
     # Generate inputs for lite mode
-    _, _, _, phi_res_lite, _, _, _, bias_lite, _ = generate_mhc_inputs(M, n, C, hres_mode="lite")
+    _, _, _, phi_res_lite, _, _, _, bias_lite, _ = generate_mhc_inputs(M, n, C, mode="mhc_lite")
 
     _, _, H_res_sinkhorn = mhc(
         x, phi_pre, phi_post, phi_res_sk, alpha_pre, alpha_post, alpha_res, bias_sk, n_streams,
@@ -967,7 +967,7 @@ def test_mhc_lite_output_range(M, n, C):
     """
     torch.cuda.empty_cache()
 
-    x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C, hres_mode="lite")
+    x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C, mode="mhc_lite")
 
     _, _, H_res = mhc(
         x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams,
@@ -990,7 +990,7 @@ def test_fused_mhc_lite_correctness(M, n, C):
     """
     torch.cuda.empty_cache()
 
-    x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C, hres_mode="lite")
+    x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(M, n, C, mode="mhc_lite")
 
     _, _, H_res = fused_mhc(
         x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n_streams,

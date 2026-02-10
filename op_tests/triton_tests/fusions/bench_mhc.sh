@@ -7,7 +7,7 @@ run_cmd() {
     "$@"
 }
 
-modes=("fused" "sinkhorn" "full")
+modes=("mhc" "mhc_lite" "sinkhorn_knopp_only")
 
 for mode in "${modes[@]}"; do
     echo "----------------------------------------"

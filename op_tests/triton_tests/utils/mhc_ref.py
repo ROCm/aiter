@@ -300,27 +300,33 @@ def generate_mhc_inputs(
     C: int,
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
-    hres_mode: str = "sinkhorn",
+    mode: str = "mhc",
 ):
     """
     Generate test inputs for mHC mapping.
+
+    Args:
+        mode: Benchmark mode - "mhc", "mhc_lite", or "sinkhorn_knopp_only". Default: "mhc"
 
     Returns:
         Tuple of (x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n) where:
         - x: (M, nC) flattened n-stream residual input
         - phi_pre: (nC, n) pre-stream projection matrix
         - phi_post: (nC, n) post-stream projection matrix
-        - phi_res: (nC, n²) for sinkhorn mode, (nC, n!) for lite mode
+        - phi_res: (nC, n²) for mhc/sinkhorn_knopp_only modes, (nC, n!) for mhc_lite mode
         - alpha_pre: α^pre scaling factor for pre-stream (Eq 12)
         - alpha_post: α^post scaling factor for post-stream (Eq 12)
         - alpha_res: α^res scaling factor for residual stream (Eq 12)
-        - bias: (n² + 2n,) for sinkhorn mode, (n! + 2n,) for lite mode
+        - bias: (n² + 2n,) for mhc/sinkhorn_knopp_only modes, (n! + 2n,) for mhc_lite mode
         - n: stream parameter (returned for convenience)
     """
+    if mode not in ("mhc", "mhc_lite", "sinkhorn_knopp_only"):
+        raise ValueError(f"Invalid mode: {mode}. Must be 'mhc', 'mhc_lite', or 'sinkhorn_knopp_only'")
+    
     nC = n * C  # Total flattened dimension
     
     # Determine phi_res and bias dimensions based on mode
-    if hres_mode == "lite":
+    if mode == "mhc_lite":
         n_res = factorial(n)  # n! columns for lite mode
     else:
         n_res = n * n  # n² columns for sinkhorn mode
