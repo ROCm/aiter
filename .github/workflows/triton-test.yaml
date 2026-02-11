@@ -185,7 +185,7 @@ jobs:
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
-        if: always()
+        if: success()
         with:
           name: triton-test-shard-${{ matrix.shard }}-logs
           path: test-reports/triton.xml
@@ -194,3 +194,33 @@ jobs:
         if: always()
         run: |
           docker rm -f triton_test || true
+
+  triton-test-results:
+    if: always()
+    name: Triton Test Results
+    runs-on: ubuntu-latest
+    needs: [triton]
+    steps:
+      - name: Download all test reports
+        uses: actions/download-artifact@v4
+        with:
+          name: triton-test-shard-*-logs
+      
+      - name: Check Triton Test Results
+        run: |
+          set -ex
+          echo "Checking Triton Test Results..."
+          all_passed=true
+          for shard in {0..7}; do
+            if [ ! -f triton-test-shard-${shard}-logs ]; then
+              echo "Test report for shard ${shard} not found."
+              all_passed=false
+              break
+            fi
+          done
+          if [ "$all_passed" = true ]; then
+            echo "All tests passed."
+          else
+            echo "Test failures or errors detected."
+            exit 1
+          fi
