@@ -54,26 +54,29 @@ for file in "${sharded_files[@]}"; do
         } | tee -a latest_test.log
         continue
     fi
-    # Run each test file with a 60-minute timeout, output to latest_test.log
+    # Capture start time (nanoseconds since epoch)
+    start_time_ns=$(date +%s%N)
     if ! timeout 60m python3 "$file" 2>&1 | tee -a latest_test.log; then
-        {
-            echo
-            echo "--------------------"
-            echo "❌ Test failed: $file"
-            echo "--------------------"
-            echo
-        } | tee -a latest_test.log
+        status="❌ Test failed"
         testFailed=true
         failedFiles+=("$file")
     else
-        {
-            echo
-            echo "--------------------"
-            echo "✅ Test passed: $file"
-            echo "--------------------"
-            echo
-        } | tee -a latest_test.log
+        status="✅ Test passed"
     fi
+    # Capture end time (nanoseconds since epoch)
+    end_time_ns=$(date +%s%N)
+    elapsed_ns=$((end_time_ns - start_time_ns))
+    # Convert to seconds with 3 decimals
+    elapsed_s=$(awk "BEGIN{printf \"%.3f\", ${elapsed_ns}/1000000000}")
+
+    {
+        echo
+        echo "--------------------"
+        echo "${status}: $file"
+        echo "⏱ Time elapsed: ${elapsed_s} seconds"
+        echo "--------------------"
+        echo
+    } | tee -a latest_test.log
 done
 
 if [ "$testFailed" = true ]; then
