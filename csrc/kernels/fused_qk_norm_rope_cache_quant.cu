@@ -336,23 +336,23 @@ template<typename scalar_t,  typename F, int WarpSize = 64>
      return val;
  }
 
-template<typename scalar_t, typename F, uint32_t NUM_WARPS>
-__inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t identity_element, scalar_t *smem)
-{
-    uint32_t warp_id = threadIdx.x / WARP_SIZE;
-    uint32_t lane_id = threadIdx.x % WARP_SIZE;
-    value = warp_reduce<scalar_t, F, WARP_SIZE>(value, op);
-    //__syncthreads();
-    if(lane_id == 0) {
-        smem[warp_id] = value;
-    }
-    __syncthreads();
-    value = (threadIdx.x < NUM_WARPS) ? smem[lane_id] : identity_element;
-    if(warp_id == 0) {
-        value = warp_reduce<scalar_t, F, WARP_SIZE>(value, op);
-    }
-    return value;
-}
+//template<typename scalar_t, typename F, uint32_t NUM_WARPS>
+//__inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t identity_element, scalar_t *smem)
+//{
+//    uint32_t warp_id = threadIdx.x / WARP_SIZE;
+//    uint32_t lane_id = threadIdx.x % WARP_SIZE;
+//    value = warp_reduce<scalar_t, F, WARP_SIZE>(value, op);
+//    //__syncthreads();
+//    if(lane_id == 0) {
+//        smem[warp_id] = value;
+//    }
+//    __syncthreads();
+//    value = (threadIdx.x < NUM_WARPS) ? smem[lane_id] : identity_element;
+//    if(warp_id == 0) {
+//        value = warp_reduce<scalar_t, F, WARP_SIZE>(value, op);
+//    }
+//    return value;
+//}
 
  // Perform per-head QK Norm,  RoPE in a single kernel, and group quantize the kv cache with fp8 group [blk_size, head_dim].
  // scalar_t: data type of QKV and RMSNorm weights
@@ -525,9 +525,9 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
         }
     }
      auto sum               = [](float a, float b) { return a + b; };
-     //int numtokens_in_block = block_reduce<int, decltype(sum), wg_size, true>(tokens_in_block, sum);
-     __shared__ float smem[wg_size / WARP_SIZE];
-    int numtokens_in_block = block_reduce<float, decltype(sum), wg_size / WARP_SIZE>(tokens_in_block, sum, 0, smem);
+     int numtokens_in_block = block_reduce<int, decltype(sum), wg_size, true>(tokens_in_block, sum);
+     //__shared__ float smem[wg_size / WARP_SIZE];
+    //int numtokens_in_block = block_reduce<float, decltype(sum), wg_size / WARP_SIZE>(tokens_in_block, sum, 0, smem);
     // Calculate tokenIdx for current thread
     int tokenIdx = first_token_idx + threadIdx.x;
     
@@ -703,17 +703,19 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
          }
          //warp_max = warpReduceSum(f_absmax_f32, warp_max);
  
-         //block_max = block_reduce<float, decltype(f_max_f32), wg_size, true>(block_max, f_max_f32);
-         __shared__ float smem_max[wg_size / WARP_SIZE];
-         block_max = block_reduce<float, decltype(f_max_f32), wg_size / WARP_SIZE>(block_max, f_max_f32, 0.0f, smem_max);
+         block_max = block_reduce<float, decltype(f_max_f32), wg_size, true>(block_max, f_max_f32);
+         //__shared__ float smem_max[wg_size / WARP_SIZE];
+         //block_max = block_reduce<float, decltype(f_max_f32), wg_size / WARP_SIZE>(block_max, f_max_f32, 0.0f, smem_max);
      }
 
      if(isK)
      {
          float k_scale_val = 1.0f;
+         float inv_scale_val = 1.0f;
          if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
          {
              k_scale_val = block_max / dtype_max;
+             inv_scale_val = dtype_max / block_max;
              // Fix: correct scale index calculation [num_blocks, num_kv_heads]
              int64_t scale_offset = block_idx * num_kv_heads + headIdx;
              
@@ -743,7 +745,7 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
                                           old_offset * x + x_idx;
                         
                         float tmp = ck_tile::type_convert<float>(k_cache[cache_idx]);
-                        tmp = tmp * k_scale_global / k_scale_val;
+                        tmp = tmp * k_scale_global * inv_scale_val;
                         k_cache[cache_idx] = ck_tile::type_convert<kv_cache_scalar_t>(tmp);
                     }
                      k_scale[scale_offset] = k_scale_val;
@@ -781,7 +783,7 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
                 else
                 {
                     k_cache[offset] =
-                        ck_tile::type_convert<kv_cache_scalar_t>(float(smem_elements[cur_element_offset + i]) / k_scale_val);
+                        ck_tile::type_convert<kv_cache_scalar_t>(float(smem_elements[cur_element_offset + i]) * inv_scale_val);
                 }
             }
         }
@@ -790,10 +792,12 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
      else
      {
          float v_scale_val = 1.0f;
+         float inv_scale_val = 1.0f;
          if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
          {
              v_scale_val = block_max / dtype_max;
              // Fix: correct scale index calculation [num_blocks, num_kv_heads]
+             inv_scale_val = dtype_max / block_max;
              int64_t scale_offset = block_idx * num_kv_heads + headIdx;
              
              // Handle incremental updates: check for scale conflicts
@@ -821,7 +825,7 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
                                           d * x + old_offset_modX;
                         
                         float tmp = ck_tile::type_convert<float>(v_cache[cache_idx]);
-                        tmp = tmp * v_scale_global / v_scale_val;
+                        tmp = tmp * v_scale_global * inv_scale_val;
                         v_cache[cache_idx] = ck_tile::type_convert<kv_cache_scalar_t>(tmp);
                     }
                      v_scale[scale_offset] = v_scale_val;
@@ -857,7 +861,7 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
                 else
                 {
                     v_cache[offset] =
-                        ck_tile::type_convert<kv_cache_scalar_t>(float(smem_elements[cur_element_offset + i]) / v_scale_val);
+                        ck_tile::type_convert<kv_cache_scalar_t>(float(smem_elements[cur_element_offset + i]) * inv_scale_val);
                 }
             }
         }
