@@ -10,9 +10,9 @@
 #pragma once
 
 #include <array>
+#include <initializer_list>
 #include <type_traits>
 #include <utility>
-#include <initializer_list>
 
 #ifdef __HIPCC__
 #define OPUS_H inline __host__
