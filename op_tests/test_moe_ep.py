@@ -361,7 +361,9 @@ from aiter.fused_moe import (
 def FloatMapToInt(tensor: torch.Tensor) -> torch.Tensor:
     byte_data = tensor.cpu().numpy().tobytes()
     int_array = np.frombuffer(byte_data, dtype=np.int32)
-    int_tensor = torch.from_numpy(int_array.reshape(tensor.shape)).to(torch.int32)
+    arr_rshpd = int_array.reshape(tensor.shape)
+    arr_writable = arr_rshpd.copy()
+    int_tensor = torch.from_numpy(arr_writable).to(torch.int32)
 
     return int_tensor
 
@@ -806,6 +808,7 @@ def test_fmoe_lqq(
         )
         / 10
     )
+    w2_qt, w2_scale = aiter.pertoken_quant(w2, quant_dtype=dtypes.i8, dtypeMax=7)
 
     if shared_E > 0:
         shared_E_score = 0.1
@@ -909,7 +912,9 @@ def test_fmoe_lqq(
     w1_lqq_scale_shf = moe_shuffle_4_16(w1_lqq_scale, (4, 16), use_int4=False)
     save_buffer_to_file(w1_lqq_scale_shf, "./feifei/w1_lqq_scale_shf", format="binary")
     w1_lqq_zero_uint8_shf = moe_shuffle_4_16(w1_lqq_zero_uint8, (4, 16), use_int4=False)
-    save_buffer_to_file(w1_lqq_zero_uint8_shf, "./feifei/w1_lqq_zero_uint8_shf", format="binary")
+    save_buffer_to_file(
+        w1_lqq_zero_uint8_shf, "./feifei/w1_lqq_zero_uint8_shf", format="binary"
+    )
 
     # gu quant for cpu ref
     w1_qt = moe_lqq_dequant(w1_lqq_uint4, w1_lqq_scale, w1_lqq_zero)
@@ -934,6 +939,24 @@ def test_fmoe_lqq(
     print("[FEIFEI] out1_ref = ", out1_ref.shape)
     print("[FEIFEI] out1_ref = ", out1_ref.type())
     """
+
+    out2_asm, us2 = run_perftest(
+        fused_moe,
+        a1_qt,
+        w1_lqq_uint4_pack,
+        w2_qt,
+        topk_weights,
+        topk_ids,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=a1_scale,
+        quant_type=aiter.QuantType.per_Token,
+        activation=aiter.ActivationType.Silu,
+        doweight_stage1=False,
+        dtype=dtype,
+        num_iters=5,
+        num_warmup=2,
+    )
 
 
 parser = argparse.ArgumentParser(

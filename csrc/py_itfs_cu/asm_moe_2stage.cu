@@ -248,6 +248,8 @@ void moe_stage1_g1u1(
     QuantType quant_type                  = QuantType::No,
     std::optional<torch::Tensor> a1_scale = std::nullopt, // [token_cnt, 1], token scale
     std::optional<torch::Tensor> w1_scale = std::nullopt, // [expert, 1, inter_dim], gate(up) scale
+    std::optional<torch::Tensor> w1_lqq_scale = std::nullopt,
+    std::optional<torch::Tensor> w1_lqq_zero = std::nullopt,
     std::optional<torch::Tensor> fc2_smooth_scale = std::nullopt,
     std::optional<torch::Tensor> fc2_scale        = std::nullopt,
     std::optional<torch::Tensor> sorted_weights =
@@ -280,6 +282,8 @@ void moe_stage1_g1u1(
     {
         kernelName = get_heuristic_kernel(sub_X_cnt, inter_dim, block_m, config_map, arch_id);
     }
+    printf("[FEIFEI] kernelName = %s\n", kernelName.c_str());
+    return;
 
     AiterAsmKernel* impl_ptr = nullptr;
     auto it                  = config_map->find(kernelName);
