@@ -207,17 +207,13 @@ jobs:
           pattern: triton-test-shard-*
           path: .
       
-      - name: List test reports
-        run: |
-          ls -l triton-test-shard-*
-          
       - name: Check Triton Test Results
         run: |
           set -ex
           echo "Checking Triton Test Results..."
           all_passed=true
           for shard in {0..7}; do
-            if [ ! -f triton-test-shard-${shard} ]; then
+            if [ ! -f triton-test-shard-${shard}/triton.xml ]; then
               echo "Test report for shard ${shard} not found."
               all_passed=false
               break
