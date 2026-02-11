@@ -89,6 +89,7 @@ quant_algo = [
     "int8quant",  # g1u1 support
     "fp8quant",  # g1u1 support
     "int8smoothquant",  # g1u1/g1u0 support
+    "lqq",  # g1u1 support
     "fp8smoothquant",  # g1u1 support
 ]
 
@@ -343,6 +344,377 @@ def test_fmoe_ep(
         # checkAllclose(ref2, avg_ck, rtol=0.01, atol=10)
 
 
+import os
+import struct
+import numpy as np
+from aiter.int4_utils import convert_int8_to_uint32_int4, rearrange_4bit_elements
+from aiter.utility import fp4_utils
+from typing import Optional, Tuple
+
+
+def FloatMapToInt(tensor: torch.Tensor) -> torch.Tensor:
+    byte_data = tensor.cpu().numpy().tobytes()
+    int_array = np.frombuffer(byte_data, dtype=np.int32)
+    int_tensor = torch.from_numpy(int_array.reshape(tensor.shape)).to(torch.int32)
+
+    return int_tensor
+
+
+def moe_init_lqq(
+    eprt: int = 1,
+    M: int = 128,
+    N: int = 128,
+    init_pattern: int = 0,
+    min_val: int = -128,
+    max_val: int = 127,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    qscale_buffer = torch.zeros((eprt, M, N), dtype=torch.int8)
+    qzero_buffer = torch.zeros((eprt, M, N), dtype=torch.int8)
+
+    qzero_range = max_val - min_val + 1
+
+    offsets = torch.arange(eprt * M * N).reshape(eprt, M, N)
+
+    temp_var0 = torch.zeros((eprt, M, N))
+    temp_var1 = torch.zeros((eprt, M, N))
+    d_idx = torch.arange(N).reshape(1, 1, N).expand(eprt, M, N)
+    s_idx = torch.arange(M).reshape(1, M, 1).expand(eprt, M, N)
+
+    if init_pattern == 0:
+        temp_var0 = torch.randn((eprt, M, N))
+        temp_var1 = torch.randn((eprt, M, N))
+
+    elif init_pattern == 1:
+        temp_var0 = torch.cos(offsets.float())
+        temp_var1 = temp_var0.clone()
+
+    elif init_pattern == 2:
+        temp_var0 = torch.sin(offsets.float())
+        temp_var1 = temp_var0.clone()
+
+    elif init_pattern == 3:
+        temp_var0 = torch.cos(offsets.float()) + torch.sin(offsets.float())
+        temp_var1 = temp_var0.clone()
+
+    elif init_pattern == 10:
+        temp_var0 = torch.full((eprt, M, N), 0.25)
+        temp_var1 = temp_var0.clone()
+
+    elif init_pattern == 11:
+        temp_var0 = 0.01 * d_idx.float()
+        temp_var1 = temp_var0.clone()
+
+    elif init_pattern == 12:
+        temp_var0 = 0.01 * s_idx.float()
+        temp_var1 = temp_var0.clone()
+
+    else:
+        temp_var0 = torch.zeros((eprt, M, N))
+        temp_var1 = temp_var0.clone()
+
+    temp_var0_int = FloatMapToInt(temp_var0.cpu())
+    temp_var1_int = FloatMapToInt(temp_var1.cpu())
+
+    qzero_val_int = (temp_var0_int & 0xFF) % qzero_range + min_val
+    qzero_buffer.copy_(qzero_val_int.to(torch.int8))
+
+    maxI8_lo = qzero_val_int + 16
+    maxI8_lo = torch.clamp(maxI8_lo, min_val, max_val)
+
+    range_maxI8 = 119 - maxI8_lo + 1
+    range_maxI8 = torch.clamp(range_maxI8, min=1)
+
+    maxI8_val = (temp_var1_int & 0xFF) % range_maxI8 + maxI8_lo
+    qscale_val_float = (maxI8_val - qzero_val_int).float() / 15.0
+    qscale_val_rounded = torch.round(qscale_val_float)
+
+    qscale_val_clamped = torch.clamp(qscale_val_rounded, min_val, max_val)
+    qscale_buffer.copy_(qscale_val_clamped.to(torch.int8))
+
+    return qscale_buffer.to(device), qzero_buffer.to(device)
+
+
+def moe_init_uint4(
+    eprt: int = 1,
+    M: int = 128,
+    N: int = 128,
+    init_pattern: int = 0,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> torch.Tensor:
+
+    buffer = torch.zeros((eprt, M, N), dtype=torch.int8)
+
+    offsets = torch.arange(eprt * M * N).reshape(eprt, M, N)
+
+    d_idx = torch.arange(N).reshape(1, 1, N).expand(eprt, M, N).float()
+    s_idx = torch.arange(M).reshape(1, M, 1).expand(eprt, M, N).float()
+
+    temp_var = torch.zeros((eprt, M, N), dtype=torch.float32)
+
+    if init_pattern == 0:
+        temp_var = torch.randn((eprt, M, N), dtype=torch.float32)
+
+    elif init_pattern == 1:
+        temp_var = torch.cos(offsets.float())
+
+    elif init_pattern == 2:
+        temp_var = torch.sin(offsets.float())
+
+    elif init_pattern == 3:
+        temp_var = torch.cos(offsets.float()) + torch.sin(offsets.float())
+
+    elif init_pattern == 10:
+        temp_var = torch.full((eprt, M, N), 0.25, dtype=torch.float32)
+
+    elif init_pattern == 11:
+        temp_var = 0.01 * d_idx
+
+    elif init_pattern == 12:
+        temp_var = 0.01 * s_idx
+
+    else:
+        pass
+
+    value32 = FloatMapToInt(temp_var.cpu())
+    uint4_value = value32 & 0x0F
+    buffer.copy_(uint4_value.to(torch.int8))
+
+    return buffer.to(device)
+
+
+def moe_lqq_dequant(
+    in_buffer: torch.Tensor,
+    qscale_buf: torch.Tensor,
+    qzero_buf: torch.Tensor,
+    group_in_k_lqq: int = 64,
+    output_dtype: torch.dtype = torch.int8,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> torch.Tensor:
+    eprt, M, N = in_buffer.shape
+    numGroups = N // group_in_k_lqq
+
+    assert qscale_buf.shape == (
+        eprt,
+        M,
+        numGroups,
+    ), f"qscale_buf shape mismatch: {qscale_buf.shape} != ({eprt}, {M}, {numGroups})"
+    assert qzero_buf.shape == (
+        eprt,
+        M,
+        numGroups,
+    ), f"qzero_buf shape mismatch: {qzero_buf.shape} != ({eprt}, {M}, {numGroups})"
+    assert (
+        N % group_in_k_lqq == 0
+    ), f"N={N} must be divisible by group_in_k_lqq={group_in_k_lqq}"
+
+    # 高效向量化实现
+    # 1. 扩展scale和zero缓冲区
+    scale_expanded = qscale_buf.unsqueeze(-1).expand(-1, -1, -1, group_in_k_lqq)
+    zero_expanded = qzero_buf.unsqueeze(-1).expand(-1, -1, -1, group_in_k_lqq)
+
+    # 2. 重塑输入以匹配扩展的形状
+    in_reshaped = in_buffer.view(eprt, M, numGroups, group_in_k_lqq)
+
+    # 3. 反量化计算
+    # 使用融合操作提高性能
+    out_reshaped = torch.addcmul(
+        zero_expanded.to(torch.float32),
+        in_reshaped.to(torch.float32),
+        scale_expanded.to(torch.float32),
+    )
+
+    # 4. 恢复原始形状并转换输出类型
+    out = out_reshaped.view(eprt, M, N).to(output_dtype)
+
+    return out.to(device)
+
+
+def save_buffer_to_file(
+    buffer: torch.Tensor,
+    filename: str,
+    format: str = "numpy",
+    metadata: Optional[dict] = None,
+) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(filename)), exist_ok=True)
+    base_name = os.path.splitext(filename)[0]
+
+    if buffer.device.type != "cpu":
+        buffer_cpu = buffer.cpu()
+    else:
+        buffer_cpu = buffer
+
+    if format.lower() == "numpy":
+        np.save(f"{base_name}.npy", buffer_cpu.numpy())
+
+        if metadata:
+            import json
+
+            with open(f"{base_name}_meta.json", "w") as f:
+                json.dump(metadata, f, indent=2)
+
+    elif format.lower() == "torch":
+        save_dict = {"buffer": buffer_cpu}
+        if metadata:
+            save_dict["metadata"] = metadata
+
+        torch.save(save_dict, f"{base_name}.pt")
+
+    elif format.lower() == "text":
+        with open(f"{base_name}.txt", "w") as f:
+            f.write(f"Shape: {buffer.shape}\n")
+            f.write(f"DataType: {buffer.dtype}\n")
+            f.write(f"Min: {buffer.min().item()}\n")
+            f.write(f"Max: {buffer.max().item()}\n")
+
+            if metadata:
+                f.write("\nMetadata:\n")
+                for key, value in metadata.items():
+                    f.write(f"{key}: {value}\n")
+
+            f.write("\nData:\n")
+
+            flat_data = buffer_cpu.flatten().numpy()
+            for i in range(min(100, len(flat_data))):
+                f.write(f"{flat_data[i]:4d} ")
+                if (i + 1) % 16 == 0:
+                    f.write("\n")
+
+    elif format.lower() == "binary":
+        with open(f"{base_name}.bin", "wb") as f:
+            buffer_cpu.numpy().tofile(f)
+
+
+def test_fmoe_lqq(
+    dtype,
+    token,
+    model_dim,
+    inter_dim,
+    E,
+    topk,
+    quant="No",
+    use_g1u1=False,
+    shared_E=2,
+    ep=8,
+):
+    # This gpu id in EP, this example use the last id
+    ep_id = ep - 1
+    # total_expert = unshared_expert + shared_expert + fake_expert(only use this fake expert id to mask)
+    # expert_mask = torch.randint(
+    #     0, 2, (E + shared_E + 1,), dtype=dtypes.i32, device="cuda"
+    # )
+    expert_mask = torch.zeros((E + shared_E + 1,), dtype=dtypes.i32, device="cuda")
+    expert_mask[ep_id * (E // ep) : (ep_id + 1) * E // ep] = 1
+    # # Get local expert Number in this gpu
+    local_E = torch.sum(expert_mask).item()
+    # The last expert
+    fake_expertid = expert_mask.numel() - 1
+    # Ensure fake expert to be masked
+    expert_mask[-1] = 0
+    # Ensure shared expert not to be masked
+    expert_mask[E:-1] = 1
+
+    quantAlgoId = quant_algo.index(quant)
+    if quantAlgoId not in [0, 3] and not use_g1u1:
+        print("g1u0 only could test no quant and int8smoothquant")
+        return
+
+    AQDType = dtypes.i8
+    WQDType = dtypes.i4x2
+    quantstr = quant_algo[quantAlgoId]
+    use_smooth = "smooth" in quantstr
+
+    input = torch.randn((token, model_dim), dtype=dtype, device="cuda")
+    score = torch.randn((token, E), device="cuda", dtype=dtype)
+
+    if shared_E > 0:
+        shared_E_score = 0.1
+        # init total_topk_ids, inference time you just need to fill ns_topk_ids in total_topk_ids
+        total_topk_ids = torch.empty(
+            (MAX_TOKENS, topk + shared_E + 1), dtype=dtypes.i32, device=input.device
+        )
+        ns_topk_ids, s_topk_ids = total_topk_ids.split([topk, shared_E + 1], dim=1)
+        shared_expert_ids = [E + i for i in range(shared_E + 1)]
+        s_topk_ids_list = [[fake_expertid] * (shared_E + 1)] * MAX_TOKENS
+        for i in range(ep_id, MAX_TOKENS, ep):
+            s_topk_ids_list[i] = shared_expert_ids
+        s_topk_ids[:] = torch.tensor(
+            s_topk_ids_list, dtype=dtypes.i32, device=input.device
+        )
+
+        # init total_topk_weights, inference time you just need to fill ns_topk_weights in total_topk_weights
+        total_topk_weights = torch.empty(
+            (MAX_TOKENS, topk + shared_E + 1), dtype=dtypes.fp32, device=input.device
+        )
+        ns_topk_weights, s_topk_weights = total_topk_weights.split(
+            [topk, shared_E + 1], dim=1
+        )
+        s_topk_weights[:] = shared_E_score
+
+        # inference time, use fused_topk to fill ns_topk_ids and ns_topk_weights
+        fused_topk(input, score, topk, True, ns_topk_ids, ns_topk_weights)
+        # inference time, topk_ids simply slices total_topk_ids into the number of input tokens, same for topk_weights
+        topk_ids = total_topk_ids[:token]
+        topk_weights = total_topk_weights[:token]
+
+    else:
+        topk_weights, topk_ids = fused_topk(input, score, topk, True)
+
+    # O: int8
+    # X:                 int8  -> input
+    # GU_buf:            uint4 -> w1_qt
+    # GU_buf_uint4:      uint4 -> w1_qt_uint4
+    # GU_qscale_lqq_buf: int4  -> w1_lqq_scale
+    # GU_qzero_lqq_buf:  int4  -> w1_lqq_zero
+    group_in_k_lqq = 64
+    eprt = local_E + shared_E
+    GU_dqn_k_lqq = model_dim // group_in_k_lqq
+    GU_dqn_n_lqq = inter_dim
+    GU_dqn_lqq_size = eprt * GU_dqn_k_lqq * GU_dqn_n_lqq * 2
+    sz_GU = eprt * model_dim * inter_dim * 2
+    print("model_dim(K) = ", model_dim)
+    print("inter_dim(N) = ", inter_dim)
+    print("eprt = ", eprt)
+    print("topk = ", topk)
+    print("GU_dqn_k_lqq = ", GU_dqn_k_lqq)
+    print("GU_dqn_n_lqq = ", GU_dqn_n_lqq)
+    print("GU_dqn_lqq_size = ", GU_dqn_lqq_size)
+    print("sz_GU = ", sz_GU)
+    w1_lqq_scale, w1_lqq_zero = moe_init_lqq(
+        eprt, GU_dqn_lqq_size // eprt // GU_dqn_k_lqq, GU_dqn_k_lqq, 1, -100, 100
+    )
+    save_buffer_to_file(w1_lqq_scale, "./feifei/w1_lqq_scale", format="binary")
+    save_buffer_to_file(w1_lqq_zero, "./feifei/w1_lqq_zero", format="binary")
+    w1_lqq_uint4 = moe_init_uint4(eprt, sz_GU // model_dim // eprt, model_dim, 1)
+    save_buffer_to_file(w1_lqq_uint4, "./feifei/w1_lqq_uint4", format="binary")
+    w1_qt = moe_lqq_dequant(w1_lqq_uint4, w1_lqq_scale, w1_lqq_zero)
+    save_buffer_to_file(w1_qt, "./feifei/w1_qt", format="binary")
+
+    """
+    w2_qt, fc2_scale = aiter.pertoken_quant(w2, quant_dtype=dtypes.i8, dtypeMax=7)
+    w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
+    w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
+
+    # b implement
+    # pre-shuffle
+    w1_scale_aiter = fc1_scale
+    w2_scale_aiter = fc2_scale
+    w1_qt_aiter = rearrange_4bit_elements(
+        convert_int8_to_uint32_int4(
+            shuffle_weight(w1_qt_aiter, (16, 16), use_int4=True)
+        )
+    )
+    w2_qt_aiter = rearrange_4bit_elements(
+        convert_int8_to_uint32_int4(
+            shuffle_weight(w2_qt_aiter, (16, 16), use_int4=True)
+        )
+    )
+    w1_scale_aiter = fp4_utils.e8m0_shuffle(fc1_scale)
+    w2_scale_aiter = fp4_utils.e8m0_shuffle(fc2_scale)
+    """
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="select test",
@@ -355,6 +727,7 @@ l_test = [
     "g1u0_int8smoothquant",
     "g1u1_int8smoothquant",
     "g1u1_fp8smoothquant",
+    "g1u1_lqq",
 ]
 parser.add_argument(
     "-t",
@@ -633,6 +1006,32 @@ for test in l_test:
                                 expert,
                                 topk,
                                 quant="fp8smoothquant",
+                                use_g1u1=True,
+                                shared_E=shared_E,
+                                ep=ep,
+                            )
+    elif test == "g1u1_lqq":
+        for dtype in (
+            [dtypes.bf16] if args.dtype is None else [dtypes.d_dtypes[args.dtype]]
+        ):
+            for m in [128] if args.token is None else args.token:
+                for hdim in [4096] if args.hidden_dim is None else args.hidden_dim:
+                    for idim in [1280] if args.inter_dim is None else args.inter_dim:
+                        expert = 128 if args.expert is None else args.expert
+                        topk = 6 if args.topk is None else args.topk
+                        for ep in (
+                            [8]
+                            if args.expert_parallelism is None
+                            else args.expert_parallelism
+                        ):
+                            test_fmoe_lqq(
+                                dtype,
+                                m,
+                                hdim,
+                                idim,
+                                expert,
+                                topk,
+                                quant="lqq",
                                 use_g1u1=True,
                                 shared_E=shared_E,
                                 ep=ep,
