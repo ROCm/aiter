@@ -342,7 +342,8 @@ void moe_stage1_g1u1(
                 cfg.tile_m);
 
     int stride_X  = input.stride(-2) * input.element_size();
-    int stride_GU = model_dim * w1.element_size();
+    //int stride_GU = model_dim * w1.element_size();
+    int stride_GU = w1.stride(-2) * w1.element_size();
 
     int stride_expert_GU    = stride_GU * inter_dim;
     int stride_expert_GUDQN = w1_scale.has_value() ? w1_scale.value().stride(0) * sizeof(float) : 0;

@@ -804,7 +804,9 @@ def test_fmoe_lqq(
     score = torch.randn((token, E), device="cuda", dtype=dtype)
     w2 = (
         torch.randn(
-            (local_E + shared_E, model_dim, inter_dim), dtype=dtype, device="cuda"
+            (local_E + shared_E, model_dim // 2, inter_dim),
+            dtype=dtype,
+            device="cuda",
         )
         / 10
     )
@@ -940,6 +942,10 @@ def test_fmoe_lqq(
     print("[FEIFEI] out1_ref = ", out1_ref.type())
     """
 
+    print("[debug] w1_lqq_uint4_pack shape: ", w1_lqq_uint4_pack.shape)
+    print("[debug] w1_lqq_uint4_pack element_size: ", w1_lqq_uint4_pack.element_size())
+    print("[debug] w1_lqq_uint4_pack stride: ", w1_lqq_uint4_pack.stride(-2))
+    print("[debug] w2 shape: ", w2.shape)
     out2_asm, us2 = run_perftest(
         fused_moe,
         a1_qt,
@@ -954,8 +960,8 @@ def test_fmoe_lqq(
         activation=aiter.ActivationType.Silu,
         doweight_stage1=False,
         dtype=dtype,
-        num_iters=5,
-        num_warmup=2,
+        num_iters=2,
+        num_warmup=1,
     )
 
 
