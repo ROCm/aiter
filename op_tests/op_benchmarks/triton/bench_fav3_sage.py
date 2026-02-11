@@ -305,6 +305,37 @@ def fav2_forward_func(
         return_attn_probs=return_attn_probs,
     )
 
+def fa_custom_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    layout: Literal["bshd", "bhsd"], # default bshd
+    causal: bool,
+):
+    from fa.flash_attention import MetaData, attention
+    if layout == "bhsd":  # convert to bshd
+        q = q.permute(0, 2, 1, 3).contiguous()
+        k = k.permute(0, 2, 1, 3).contiguous()
+        v = v.permute(0, 2, 1, 3).contiguous()
+
+    BATCH, N_CTX_Q, Q_HEAD, D_HEAD = q.shape
+    _, N_CTX_K, K_HEAD, _ = k.shape
+    
+    sm_scale = D_HEAD**-0.5
+    input_metadata = MetaData(sm_scale=sm_scale)
+    input_metadata.max_seqlens_q = N_CTX_Q
+    input_metadata.max_seqlens_k = N_CTX_K
+    input_metadata.layout = "bshd"
+    
+    if causal:
+        input_metadata.need_causal()
+
+    o = torch.empty_like(q)
+    def fn():
+        out, _, _ = attention(q, k, v, o, input_metadata)
+        return out
+    return fn
+
 def fa_custom_sagev2_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -564,6 +595,14 @@ def attn_forward_func(
             layout=layout,
             causal=False,
         )
+    elif func_name == "fa_custom":
+        fn = fa_custom_func(
+            q,
+            k,
+            v,
+            layout=layout,
+            causal=False,
+        )
     else:
         q, k, v = layout_preprocess(q, k, v, layout=layout, target_layout="bshd")
         if func_name == "aiter_bf16":
@@ -618,17 +657,17 @@ def bench_kernel(q, k, v, args, provider):
     # FLOPS calculation variables
     total_flops = 0.0
     total_flops += 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
-    bench_func_name = ""
-    if args.fav3_fp8:
-        bench_func_name = "fav3_fp8"
-    elif args.aiter_fp8:
-        bench_func_name = "aiter_fp8"
-    elif args.aiter_bf16:
-        bench_func_name = "aiter_bf16"
-    elif args.fa_custom_sagev2:
-        bench_func_name = "fa_custom_sagev2"
-    else:
-        bench_func_name = "fav3_sage"
+    bench_func_name = args.bench_func_name
+    #if args.fav3_fp8:
+    #    bench_func_name = "fav3_fp8"
+    #elif args.aiter_fp8:
+    #    bench_func_name = "aiter_fp8"
+    #elif args.aiter_bf16:
+    #    bench_func_name = "aiter_bf16"
+    #elif args.fa_custom_sagev2:
+    #    bench_func_name = "fa_custom_sagev2"
+    #else:
+    #    bench_func_name = "fav3_sage"
 
     use_mxfp4_sage = args.mxfp4_sage
 
@@ -840,6 +879,12 @@ def parse_args():
         action="store_true",
         default=False,
         help="Use custom fa sage v2)",
+    )
+    parser.add_argument(
+        "-bench_func_name",
+        type=str,
+        default="fav3_sage",
+        help="Use custom fa sage v2",
     )
     parser.add_argument(
         "-persistent", nargs='?', const='fixed', choices=['fixed', 'dynamic'], default=None,
