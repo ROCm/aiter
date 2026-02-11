@@ -203,6 +203,8 @@ def moe_stage1_g1u1(
     quant_type: Optional[Enum] = QuantType.No.value,
     a1_scale: Optional[Tensor] = None,
     w1_scale: Optional[Tensor] = None,
+    w1_lqq_scale: Optional[Tensor] = None,
+    w1_lqq_zero: Optional[Tensor] = None,
     fc2_smooth_scale: Optional[Tensor] = None,
     fc2_scale: Optional[Tensor] = None,
     sorted_weights: Optional[Tensor] = None,
