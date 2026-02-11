@@ -48,6 +48,7 @@ def _sage_fwd_no_mask(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     PRE_LOAD_V: tl.constexpr,
+    USE_BIAS: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     PADDED_HEAD_QK: tl.constexpr,
     PADDED_HEAD_V: tl.constexpr,
@@ -113,9 +114,12 @@ def _sage_fwd_no_mask(
         m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
 
         # scale and subtract max
-        q_shifted = tl.where(
-            m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
-        )
+        if USE_BIAS:
+            q_shifted = tl.where(
+                m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
+            )
+        else:
+            q_shifted = qk_scaled - m_ij[:, None]
 
         # Compute scaled QK and softmax probabilities
         if USE_EXP2:
@@ -175,7 +179,10 @@ def _sage_fwd_no_mask(
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
         # store the diff in maxes to adjust acc and li as we discover new maxes
-        m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
+        if USE_BIAS:
+            m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
+        else:
+            m_diff = m_i - m_ij
         if USE_EXP2:
             # alpha = tl.math.exp2(m_diff * RCP_LN2)
             alpha = tl.math.exp2(m_diff)
@@ -1246,6 +1253,7 @@ def sage_fwd(
             BLOCK_M,
             BLOCK_N,
             PRE_LOAD_V,
+            USE_BIAS,
             ENABLE_DROPOUT,
             PADDED_HEAD_QK,
             PADDED_HEAD_V,
