@@ -40,13 +40,13 @@
     "BLOCK_SIZE_N": 128,
     "BLOCK_SIZE_K": 128,
     "GROUP_SIZE_M": 1,
-    "num_warps": 4,
+    "num_warps": 2,
     "num_stages": 2,
     "waves_per_eu": 1,
-    "matrix_instr_nonkdim": 16,
+    "matrix_instr_nonkdim": 32,
     "cache_modifier": ".cg",
-    "NUM_KSPLIT": 8
-  },
+    "NUM_KSPLIT": 7
+},
   "M_LEQ_128": {
     "BLOCK_SIZE_M": 64,
     "BLOCK_SIZE_N": 256,
