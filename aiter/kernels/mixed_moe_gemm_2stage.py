@@ -386,7 +386,7 @@ def compile_mixed_moe_gemm1(
                     arg_x, max_size=False, num_records_bytes=x_nbytes_i32
                 )
                 w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False)
-                out_rsrc = buffer_ops.create_buffer_resource(arg_out, max_size=False)
+                out_rsrc = buffer_ops.create_buffer_resource(arg_out, max_size=True)
 
                 # fp16 path ignores scales completely (implicit scale=1.0).
                 sx_rsrc = None if is_f16_a else buffer_ops.create_buffer_resource(arg_scale_x, max_size=False)
@@ -2242,12 +2242,11 @@ def compile_mixed_moe_gemm2(
                         "FLIR_MOE_STAGE2_CSHUFFLE=1 but lds_out is not allocated/aliased."
                     )
 
-                # For bf16 global atomics, precompute the output base address once.
-                # (We still need an inttoptr per atomic unless we can rely on GEPOp; keep the
-                # stable path here.)
-                out_base_idx = None
-                if out_is_bf16:
-                    out_base_idx = memref.extract_aligned_pointer_as_index(arg_out)
+                # Precompute the output base address (i64 index) for ALL paths.
+                # Both accumulate=True (global atomic) and accumulate=False (global store)
+                # need 64-bit addressing to avoid i32 offset overflow when
+                # tokens * model_dim * elem_bytes > INT32_MAX (~150K tokens for model_dim=7168).
+                out_base_idx = memref.extract_aligned_pointer_as_index(arg_out)
 
                 def write_row_to_lds(
                     *,
@@ -2316,46 +2315,56 @@ def compile_mixed_moe_gemm2(
 
                     return (fused2, row_valid)
 
+                # #region agent log
+                import json as _json, time as _time
+                with open("/home/jiaxiwen/.cursor/debug.log", "a") as _f:
+                    _f.write(_json.dumps({"id": f"log_compile_{int(_time.time()*1000)}", "timestamp": int(_time.time()*1000), "location": "mixed_moe_gemm_2stage.py:store_pair_codegen", "message": "store_pair code path selection", "data": {"accumulate": bool(accumulate), "out_is_bf16": out_is_bf16, "out_is_f32": out_is_f32, "model_dim": model_dim, "topk": topk, "out_elem_bytes": out_elem_bytes, "path": "global_atomic_i64" if bool(accumulate) else "global_store_i64"}, "runId": "pre-fix", "hypothesisId": "H2"}) + "\n")
+                # #endregion
+
                 def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
                     fused = row_ctx
                     t = fused & mask24_i32
                     s = fused >> 24
-                    idx0 = t * model_i32
+                    t_idx = arith.index_cast(ir.IndexType.get(), t)
+                    s_idx = arith.index_cast(ir.IndexType.get(), s)
                     if not bool(accumulate):
-                        ts = t * topk_i32_v + s
-                        idx0 = ts * model_i32
-                    col_i32 = arith.index_cast(i32, col_g0)
-                    idx_elem = idx0 + col_i32
-                    idx_elem_even = idx_elem & mask_even_i32
-                    vv1 = vector.extract(frag, static_position=[0], dynamic_position=[])
-                    vv2 = vector.extract(frag, static_position=[0], dynamic_position=[])
-                    if out_is_bf16:
-                        if bool(accumulate):
-                            # Use global atomicrmw fadd on <2 x bf16> (CK path).
-                            # Row-valid gating is handled at the row level by c_shuffle_epilog via `precompute_row`.
-                            byte_off = idx_elem_even * c2_i32
-                            byte_off_idx = arith.index_cast(ir.IndexType.get(), byte_off)
-                            ptr_addr_idx = out_base_idx + byte_off_idx
-                            out_ptr = buffer_ops.create_llvm_ptr(ptr_addr_idx, address_space=1)
-                            out_ptr_v = out_ptr._value if hasattr(out_ptr, "_value") else out_ptr
-                            frag_v = frag._value if hasattr(frag, "_value") else frag
-                            llvm.AtomicRMWOp(
-                                llvm.AtomicBinOp.fadd,
-                                out_ptr_v,
-                                frag_v,
-                                llvm.AtomicOrdering.monotonic,
-                                syncscope="agent",
-                                alignment=4,
-                            )
-                        else:
-                            # Scatter store (no atomic): store bf16x2 directly via buffer store.
-                            buffer_ops.buffer_store(frag, out_rsrc, idx_elem_even)
+                        # ---- 64-bit global store path (avoids i32 offset overflow) ----
+                        # Compute full element offset in i64 (index type) and use global_store.
+                        ts_idx = t_idx * arith.constant(topk, index=True) + s_idx
+                        col_idx = col_g0  # already index type
+                        elem_off = ts_idx * arith.constant(model_dim, index=True) + col_idx
+                        # Align to even element boundary for <2 x bf16/f16> stores
+                        c1_idx = arith.constant(1, index=True)
+                        elem_off_even = elem_off - (elem_off & c1_idx)
+                        byte_off_idx = elem_off_even * arith.constant(out_elem_bytes, index=True)
+                        ptr_addr_idx = out_base_idx + byte_off_idx
+                        out_ptr = buffer_ops.create_llvm_ptr(ptr_addr_idx, address_space=1)
+                        out_ptr_v = out_ptr._value if hasattr(out_ptr, "_value") else out_ptr
+                        frag_v = frag._value if hasattr(frag, "_value") else frag
+                        llvm.StoreOp(frag_v, out_ptr_v, alignment=4)
                     else:
-                        byte_off = idx_elem_even * c2_i32
-                        if bool(accumulate):
-                            atomic_add_f16x2(frag, byte_off)
-                        else:
-                            buffer_ops.buffer_store(frag, out_rsrc, idx_elem_even)
+                        # ---- accumulate=True: 64-bit global atomic path ----
+                        # Avoids i32 offset overflow when tokens*model_dim*2 > INT32_MAX
+                        # (~150K tokens for model_dim=7168).
+                        # Unified bf16/f16 path using llvm.AtomicRMWOp with 64-bit pointer.
+                        col_idx = col_g0  # already index type
+                        elem_off = t_idx * arith.constant(model_dim, index=True) + col_idx
+                        # Align to even element boundary for <2 x bf16/f16> atomics
+                        c1_idx = arith.constant(1, index=True)
+                        elem_off_even = elem_off - (elem_off & c1_idx)
+                        byte_off_idx = elem_off_even * arith.constant(out_elem_bytes, index=True)
+                        ptr_addr_idx = out_base_idx + byte_off_idx
+                        out_ptr = buffer_ops.create_llvm_ptr(ptr_addr_idx, address_space=1)
+                        out_ptr_v = out_ptr._value if hasattr(out_ptr, "_value") else out_ptr
+                        frag_v = frag._value if hasattr(frag, "_value") else frag
+                        llvm.AtomicRMWOp(
+                            llvm.AtomicBinOp.fadd,
+                            out_ptr_v,
+                            frag_v,
+                            llvm.AtomicOrdering.monotonic,
+                            syncscope="agent",
+                            alignment=4,
+                        )
 
                 c_shuffle_epilog(
                     arith=arith,
