@@ -223,6 +223,50 @@ bool test_make_repeated_tuple() {
     return true;
 }
 
+bool test_merge_peepholed_tuple() {
+    using opus::operator""_I;
+
+    // merge_peepholed_tuple fills underscore (_) slots in the peepholed tuple
+    // with values from the income tuple, preserving non-underscore elements.
+    // tuple<*, *, _, *, _> + tuple<#, @> -> tuple<*, *, #, *, @>
+
+    // Case 1: Two underscores at positions 2 and 4
+    auto pt1 = opus::make_tuple(10_I, 20_I, opus::_, 40_I, opus::_);
+    auto it1 = opus::make_tuple(99_I, 77_I);
+    auto r1  = opus::merge_peepholed_tuple(pt1, it1);
+    TEST_ASSERT_EQ(opus::get<0>(r1).value, 10, "merge[0] = 10 (kept)");
+    TEST_ASSERT_EQ(opus::get<1>(r1).value, 20, "merge[1] = 20 (kept)");
+    TEST_ASSERT_EQ(opus::get<2>(r1).value, 99, "merge[2] = 99 (from income[0])");
+    TEST_ASSERT_EQ(opus::get<3>(r1).value, 40, "merge[3] = 40 (kept)");
+    TEST_ASSERT_EQ(opus::get<4>(r1).value, 77, "merge[4] = 77 (from income[1])");
+
+    // Case 2: Single underscore at position 0
+    auto pt2 = opus::make_tuple(opus::_, 5_I, 6_I);
+    auto it2 = opus::make_tuple(100_I);
+    auto r2  = opus::merge_peepholed_tuple(pt2, it2);
+    TEST_ASSERT_EQ(opus::get<0>(r2).value, 100, "merge single _[0] = 100");
+    TEST_ASSERT_EQ(opus::get<1>(r2).value, 5,   "merge single _[1] = 5");
+    TEST_ASSERT_EQ(opus::get<2>(r2).value, 6,   "merge single _[2] = 6");
+
+    // Case 3: No underscores -- returns the peepholed tuple unchanged
+    auto pt3 = opus::make_tuple(1_I, 2_I, 3_I);
+    auto it3 = opus::make_tuple();  // empty income
+    auto r3  = opus::merge_peepholed_tuple(pt3, it3);
+    TEST_ASSERT_EQ(opus::get<0>(r3).value, 1, "merge no-underscore[0]");
+    TEST_ASSERT_EQ(opus::get<1>(r3).value, 2, "merge no-underscore[1]");
+    TEST_ASSERT_EQ(opus::get<2>(r3).value, 3, "merge no-underscore[2]");
+
+    // Case 4: All underscores -- result is the income tuple
+    auto pt4 = opus::make_tuple(opus::_, opus::_, opus::_);
+    auto it4 = opus::make_tuple(7_I, 8_I, 9_I);
+    auto r4  = opus::merge_peepholed_tuple(pt4, it4);
+    TEST_ASSERT_EQ(opus::get<0>(r4).value, 7, "merge all-underscore[0]");
+    TEST_ASSERT_EQ(opus::get<1>(r4).value, 8, "merge all-underscore[1]");
+    TEST_ASSERT_EQ(opus::get<2>(r4).value, 9, "merge all-underscore[2]");
+
+    return true;
+}
+
 // =============================================================================
 // Static For Tests
 // =============================================================================
@@ -331,6 +375,7 @@ int main() {
     RUN_TEST(test_tuple_basic);
     RUN_TEST(test_tuple_concat);
     RUN_TEST(test_make_repeated_tuple);
+    RUN_TEST(test_merge_peepholed_tuple);
 
     std::cout << std::endl << "--- Static For Tests ---" << std::endl;
     RUN_TEST(test_static_for);
