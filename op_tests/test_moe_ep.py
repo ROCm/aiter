@@ -573,6 +573,137 @@ def moe_lqq_dequant(
     return out.to(device)
 
 
+def moe_shuffle_inter(
+    buffer: torch.Tensor,
+    eprt: int,
+    M: int,
+    N: int,
+    interExp: int,
+) -> torch.Tensor:
+
+    if buffer is None or buffer.numel() == 0:
+        print("Neglect moe_shuffle for NULL input")
+        return buffer
+
+    groupSize = (1 << interExp) * 2
+
+    if N % groupSize != 0:
+        raise ValueError(
+            f"N({N}) is not divisible by {groupSize} for interleave shuffle"
+        )
+
+    numGroups = N // groupSize
+
+    # Store original info
+    original_shape = buffer.shape
+    original_device = buffer.device
+    original_dtype = buffer.dtype
+
+    # Flatten and reshape to (eprt, M, N)
+    if buffer.dim() != 3:
+        buffer_flat = buffer.flatten()
+        buffer_reshaped = buffer_flat.view(eprt, M, N)
+    else:
+        buffer_reshaped = buffer
+
+    # Create shuffle pattern
+    shuffle_pattern = torch.zeros(groupSize, dtype=torch.long, device=buffer.device)
+    for k in range(groupSize):
+        shuffle_pattern[k] = (k >> 1) + ((k & 1) << interExp)
+
+    # Reshape to (eprt, M, numGroups, groupSize)
+    reshaped = buffer_reshaped.view(eprt, M, numGroups, groupSize)
+
+    # Apply shuffle using gather
+    shuffled = torch.gather(
+        reshaped, dim=-1, index=shuffle_pattern.expand_as(reshaped).to(torch.long)
+    )
+
+    # Reshape back
+    result = shuffled.view(eprt, M, N)
+
+    # Return to original shape
+    if buffer.dim() != 3:
+        result = result.view(original_shape)
+
+    return result
+
+
+def moe_shuffle_4_16(x: torch.Tensor, layout=(4, 16), use_int4=False) -> torch.Tensor:
+    x_type = x.dtype
+    if hasattr(torch, "float4_e2m1fn_x2") and x_type == torch.float4_e2m1fn_x2:
+        x = x.view(torch.uint8)
+
+    BN = 16
+    BK = 4
+    K = 1
+
+    assert (
+        x.shape[-2] % BN == 0
+    ), f"N dimension {x.shape[-2]} must be divisible by BN={BN}"
+    assert (
+        x.shape[-1] % BK == 0
+    ), f"K dimension {x.shape[-1]} must be divisible by BK={BK}"
+
+    x_ = x
+    x_ = x_.view(-1, x.shape[-2] // BN, BN, x.shape[-1] // BK, BK)
+    x_ = x_.permute(0, 1, 3, 2, 4)
+    x_ = x_.contiguous()
+    x_ = x_.view(*x.shape)
+
+    x_.is_shuffled = True
+    return x_
+
+
+def moe_pack_int4(
+    in_buffer: torch.Tensor,
+    eprt: int,
+    M: int,
+    N: int,
+) -> Optional[torch.Tensor]:
+
+    # Validate inputs
+    if in_buffer is None:
+        print("Neglect moe_init for NULL input/output")
+        return None
+
+    if in_buffer.dtype != torch.int8:
+        print(f"Expected torch.int8 but got {in_buffer.dtype}")
+        return None
+
+    # Check shape consistency
+    if tuple(in_buffer.shape) != (eprt, M, N):
+        print(f"Shape mismatch: expected ({eprt}, {M}, {N}), got {in_buffer.shape}")
+        return None
+
+    # Check even number of elements in the last dimension
+    if eprt * M * N % 2 != 0:
+        print("The element number of buffer should be even.")
+        return None
+
+    # Calculate output shape
+    total_elems = eprt * M * N
+    out_len = total_elems // 2
+
+    # Reshape input to 1D for easier processing
+    flattened = in_buffer.view(-1)
+
+    # Create output tensor
+    out_buffer = torch.empty(out_len, dtype=torch.int8, device=in_buffer.device)
+
+    # Vectorized packing
+    # Extract lower 4 bits from even indices
+    v0 = flattened[::2] & 0x0F
+    # Extract lower 4 bits from odd indices
+    v1 = flattened[1::2] & 0x0F
+
+    # Shift v1 left by 4 bits and pack with v0
+    out_buffer[:] = v0 | (v1 << 4)
+
+    # Reshape to match expected output dimensions
+    return out_buffer.view(eprt, M, N // 2)
+
+
 def save_buffer_to_file(
     buffer: torch.Tensor,
     filename: str,
@@ -624,7 +755,7 @@ def save_buffer_to_file(
                     f.write("\n")
 
     elif format.lower() == "binary":
-        with open(f"{base_name}.bin", "wb") as f:
+        with open(f"{base_name}.hex", "wb") as f:
             buffer_cpu.numpy().tofile(f)
 
 
@@ -715,9 +846,12 @@ def test_fmoe_lqq(
     # GU_buf:                 int8  -> w1_qt
     # GU_dqn_buf:             float -> w1_scale          -> dev_GU_dqn_buf
     # GU_buf_uint4:           uint4 -> w1_lqq_uint4
-    # GU_qscale_lqq_buf:      int4  -> w1_lqq_scale      -> dev_Qscl
+    # GU_buf_pack:            uint4 -> w1_lqq_uint4_pack -> dev_GU
+    # GU_qscale_lqq_buf:      int4  -> w1_lqq_scale
+    #                         int4  -> w1_lqq_scale_shf  -> dev_Qscl
     # GU_qzero_lqq_buf:       int4  -> w1_lqq_zero
-    # GU_qzero_lqq_buf_uint8: uint8 -> w1_lqq_zero_uint8 -> dev_Qzero
+    # GU_qzero_lqq_buf_uint8: uint8 -> w1_lqq_zero_uint8
+    #                         uint8 -> w1_lqq_zero_uint8_shf -> dev_Qzero
     group_in_k_lqq = 64
     eprt = local_E + shared_E
     GU_dqn_k_lqq = model_dim // group_in_k_lqq
@@ -755,14 +889,35 @@ def test_fmoe_lqq(
     w1_lqq_uint4 = moe_init_uint4(eprt, sz_GU // model_dim // eprt, model_dim, 1)
     save_buffer_to_file(w1_lqq_uint4, "./feifei/w1_lqq_uint4", format="binary")
 
+    # shuffle w1 for kernel
+    w1_lqq_uint4_shf_inter = moe_shuffle_inter(
+        w1_lqq_uint4, eprt, sz_GU // model_dim // eprt, model_dim, 6
+    )
+    save_buffer_to_file(
+        w1_lqq_uint4_shf_inter, "./feifei/w1_lqq_uint4_shf_inter", format="binary"
+    )
+    w1_lqq_uint4_shf2 = shuffle_weight(w1_lqq_uint4_shf_inter, (32, 16), use_int4=True)
+    save_buffer_to_file(
+        w1_lqq_uint4_shf2, "./feifei/w1_lqq_uint4_shf2", format="binary"
+    )
+    w1_lqq_uint4_pack = moe_pack_int4(
+        w1_lqq_uint4_shf2, eprt, sz_GU // model_dim // eprt, model_dim
+    )
+    save_buffer_to_file(
+        w1_lqq_uint4_pack, "./feifei/w1_lqq_uint4_pack", format="binary"
+    )
+    w1_lqq_scale_shf = moe_shuffle_4_16(w1_lqq_scale, (4, 16), use_int4=False)
+    save_buffer_to_file(w1_lqq_scale_shf, "./feifei/w1_lqq_scale_shf", format="binary")
+    w1_lqq_zero_uint8_shf = moe_shuffle_4_16(w1_lqq_zero_uint8, (4, 16), use_int4=False)
+    save_buffer_to_file(w1_lqq_zero_uint8_shf, "./feifei/w1_lqq_zero_uint8_shf", format="binary")
+
     # gu quant for cpu ref
     w1_qt = moe_lqq_dequant(w1_lqq_uint4, w1_lqq_scale, w1_lqq_zero)
     save_buffer_to_file(w1_qt, "./feifei/w1_qt", format="binary")
     w1_scale = moe_init_float(eprt, GU_dqn_size // eprt // GU_dqn_k, GU_dqn_k, 1)
     save_buffer_to_file(w1_scale, "./feifei/w1_scale", format="text")
 
-    print("[FEIFEI] w1_qt = ", w1_qt.shape)
-    print("[FEIFEI] w1_scale = ", w1_scale.shape)
+    """
     out1_ref = torch_moe_stage1(
         a1_qt,
         w1_qt,
@@ -776,6 +931,9 @@ def test_fmoe_lqq(
         w1_scale=w1_scale,
         doweight=False,
     )
+    print("[FEIFEI] out1_ref = ", out1_ref.shape)
+    print("[FEIFEI] out1_ref = ", out1_ref.type())
+    """
 
 
 parser = argparse.ArgumentParser(
