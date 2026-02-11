@@ -1,0 +1,17 @@
+jobs:
+    -
+        kernel_include_regex: (pa_kernel_func)
+        kernel_exclude_regex:
+        kernel_iteration_range: "[1]"
+        output_file: out
+        output_directory: thread_trace/rpf_v3
+        output_format: [csv]
+        truncate_kernels: false
+        sys_trace: false # enable for pftrace and otf2
+        advanced_thread_trace: true # enable for att and ui folder
+        att_target_cu: 1
+        att_shader_engine_mask: "0xf" # collect one CU from 4 SEs
+        att_simd_select: "0xf" # collect 4 SIMDs on single CU
+        att_buffer_size: "0x6000000"
+    -
+        pmc: [SQ_WAVES, FETCH_SIZE]

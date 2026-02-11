@@ -201,16 +201,16 @@ def compare_arrays(
         }
     )
 
-    # print("\nTop differences:")
-    # for item in result['top_k_diff']:
-    #     print(f"Position {item['position']}: arr1 = {arr1[item['position']]:.6f}, arr2 = {arr2[item['position']]:.6f}, Diff = {item['value']:.6f}")
+    print("\nTop differences:")
+    for item in result['top_k_diff']:
+        print(f"Position {item['position']}: arr1 = {arr1[item['position']]:.6f}, arr2 = {arr2[item['position']]:.6f}, Diff = {item['value']:.6f}")
 
-    # print("\nThreshold statistics:")
-    # for stat in result['threshold_stats']:
-    #     print(f"{stat['range']}: {stat['count']} ({stat['percentage']:.2f}%)")
+    print("\nThreshold statistics:")
+    for stat in result['threshold_stats']:
+        print(f"{stat['range']}: {stat['count']} ({stat['percentage']:.2f}%)")
 
-    # print("\nNaN info:")
-    # print(result["nan_info"])
+    print("\nNaN info:")
+    print(result["nan_info"])
 
     return result
 
@@ -1211,8 +1211,8 @@ def run_gluon_kernel(
         )
     else:
         if pa_decode_gluon is not None:
-            # torch.ops.aiter.pa_decode_gluon(
-            pa_decode_flydsl(
+            torch.ops.aiter.pa_decode_gluon(
+            # pa_decode_flydsl(
                 output,
                 query,
                 key_cache,
@@ -1277,6 +1277,7 @@ def run_pa_gluon_test(
     ), "Query heads must be divisible by KV heads"
 
     max_context_length = max(16384, context_length)
+    # max_context_length = max(65536, context_length)
     max_blocks_per_sequence = (max_context_length + block_size - 1) // block_size
     total_blocks = max_blocks_per_sequence * batch_size
     blocks_per_sequence = (context_length + block_size - 1) // block_size
@@ -1648,7 +1649,7 @@ def run_pa_gluon_test(
         or (block_size == 16 and query_group_size == 8 and query_length == 3)
         or (query_group_size == 5 and query_length == 3)
         or (block_size == 64)
-        or (not quant_kv)
+        # or (not quant_kv)
         or (compute_type == torch.float16 and (quant_q or quant_kv))
         or (head_size not in [128])
         or (sliding_window > 0)
@@ -1660,10 +1661,12 @@ def run_pa_gluon_test(
         key_scale_original = key_scale_factors_flat.contiguous()
         value_scale_original = value_scale_factors_flat.contiguous()
     if not skip_assembly:
+        # Assembly kernel always expects shuffled V layout [num_blocks, num_kv_heads, block_size/X, head_size, X]
+        asm_values = quantized_values if trans_v else shuffle_value_cache_layout(quantized_values)
         assembly_output, assembly_time = run_aiter_assembly_kernel(
             query,
             quantized_keys,
-            quantized_values,
+            asm_values,
             block_tables,
             context_lengths,
             block_tables.size(1),

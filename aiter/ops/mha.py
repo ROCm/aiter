@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 from typing import Any, Optional, Tuple
 
 import torch
@@ -1221,6 +1222,19 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+def _get_bf16_fwd_backend() -> str:
+    """
+    Select bf16 forward backend for flash attention.
+    - auto: prefer asm(v3) when supported, otherwise CK
+    - asm:  try asm(v3) first; fallback to CK when unsupported
+    - ck:   always use CK path
+    """
+    backend = os.getenv("AITER_BF16_FWD_BACKEND", "auto").strip().lower()
+    if backend not in {"auto", "asm", "ck"}:
+        return "auto"
+    return backend
+
+
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1264,6 +1278,8 @@ def _flash_attn_forward(
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16)
         ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
+        if _get_bf16_fwd_backend() == "ck":
+            return False
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -1623,6 +1639,8 @@ def _flash_attn_backward(
         return ret
 
     can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950()
+    if _get_bf16_fwd_backend() == "ck":
+        can_impl_fmha_v3_bwd_ = False
 
     if (
         can_impl_fmha_v3_bwd_ and seqlen_q > 16
@@ -1986,6 +2004,8 @@ def _flash_attn_varlen_forward(
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16)
         ret = ret and logits_soft_cap == 0.0
+        if _get_bf16_fwd_backend() == "ck":
+            return False
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
