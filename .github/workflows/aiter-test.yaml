@@ -251,7 +251,7 @@ jobs:
       - name: Download all test logs
         uses: actions/download-artifact@v4
         with:
-          name: standard-test-log-*-shard-*-logs
+          name: standard-test-log-*-shard-*
       
       - name: Check Standard Test Results
         run: |
@@ -260,7 +260,7 @@ jobs:
           all_passed=true
           for shard in {0..4}; do
             for runner in {linux-aiter-mi355-1,aiter-1gpu-runner}; do
-              if [ ! -f standard-test-log-${runner}-shard-${shard}-logs ]; then
+              if [ ! -f standard-test-log-${runner}-shard-${shard} ]; then
                 echo "Test report for shard ${shard} not found."
                 all_passed=false
                 break

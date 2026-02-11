@@ -187,7 +187,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: success()
         with:
-          name: triton-test-shard-${{ matrix.shard }}-logs
+          name: triton-test-shard-${{ matrix.shard }}
           path: test-reports/triton.xml
 
       - name: Cleanup container
@@ -204,7 +204,7 @@ jobs:
       - name: Download all test reports
         uses: actions/download-artifact@v4
         with:
-          name: triton-test-shard-*-logs
+          name: triton-test-shard-*
       
       - name: Check Triton Test Results
         run: |
@@ -212,7 +212,7 @@ jobs:
           echo "Checking Triton Test Results..."
           all_passed=true
           for shard in {0..7}; do
-            if [ ! -f triton-test-shard-${shard}-logs ]; then
+            if [ ! -f triton-test-shard-${shard} ]; then
               echo "Test report for shard ${shard} not found."
               all_passed=false
               break
