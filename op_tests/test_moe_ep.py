@@ -946,6 +946,9 @@ def test_fmoe_lqq(
     print("[debug] w1_lqq_uint4_pack element_size: ", w1_lqq_uint4_pack.element_size())
     print("[debug] w1_lqq_uint4_pack stride: ", w1_lqq_uint4_pack.stride(-2))
     print("[debug] w2 shape: ", w2.shape)
+    print("[debug] w1_lqq_scale_shf shape: ", w1_lqq_scale_shf.shape)
+    print("[debug] w1_lqq_scale_shf stride: ", w1_lqq_scale_shf.stride())
+    print("[debug] w1_lqq_scale_shf element_size: ", w1_lqq_scale_shf.element_size())
     out2_asm, us2 = run_perftest(
         fused_moe,
         a1_qt,
@@ -956,6 +959,8 @@ def test_fmoe_lqq(
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         a1_scale=a1_scale,
+        w1_lqq_scale=w1_lqq_scale_shf,
+        w1_lqq_zero=w1_lqq_zero_uint8_shf,
         quant_type=aiter.QuantType.per_Token,
         activation=aiter.ActivationType.Silu,
         doweight_stage1=False,

@@ -343,12 +343,13 @@ void moe_stage1_g1u1(
 
     int stride_X  = input.stride(-2) * input.element_size();
     //int stride_GU = model_dim * w1.element_size();
-    int stride_GU = w1.stride(-2) * w1.element_size();
+    int stride_GU = w1.stride(-2) * w1.element_size(); // feifei
 
     int stride_expert_GU    = stride_GU * inter_dim;
     int stride_expert_GUDQN = w1_scale.has_value() ? w1_scale.value().stride(0) * sizeof(float) : 0;
     int stride_expert_SMTDQN = inter_dim * sizeof(float);
     int stride_O             = topk * inter_dim * out.element_size();
+    int stride_expert_LQQ    = w1_lqq_scale.has_value() ? w1_lqq_scale.value().stride(0) : 0;
 
     if(inter_dim * 2 == w1.size(1))
     {
@@ -382,6 +383,11 @@ void moe_stage1_g1u1(
     args.splitk     = ksplit;
     args.activation = static_cast<int>(activation);
     args.ptr_SW     = sorted_weights.has_value() ? sorted_weights.value().data_ptr() : nullptr;
+    args.total_tgs  = 0;
+    args.ps_deno    = ((inter_dim+sub_GU-1)/sub_GU);
+    args.ptr_Qscl   = w1_lqq_scale.has_value() ? w1_lqq_scale.value().data_ptr() : nullptr;
+    args.ptr_Qzero  = w1_lqq_zero.has_value() ? w1_lqq_zero.value().data_ptr() : nullptr;
+    args.eLQQs      = stride_expert_LQQ;
 
     printf("argsize: %zu\n", arg_size);
     args.log();
