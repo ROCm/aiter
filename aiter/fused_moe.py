@@ -207,7 +207,7 @@ def fused_moe_(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
-    use_flydsl: bool = False,
+    use_flydsl: bool = True,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -631,8 +631,6 @@ def get_2stage_cfgs(
     use_flydsl=True,
 ):
 
-    use_flydsl = use_flydsl and token > int(os.environ.get("AITER_DSL_ENABLE_TOKENS", "128") )
-
     def get_cfg_2stages(tune_file):
         import pandas as pd
 
@@ -1017,6 +1015,9 @@ def fused_moe_2stages(
     quant_func = get_quant(quant_type)
     token_num_quant_moe_sort_switch = 1024
     token_num, _ = hidden_states.shape
+
+    use_flydsl = use_flydsl and token_num > int(os.environ.get("AITER_DSL_ENABLE_TOKENS", "128") )
+
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
     dtype = moe_out.dtype
     device = hidden_states.device
@@ -1720,7 +1721,7 @@ def flydsl_moe_stage1(
     inter_dim = w2.shape[2] * 2 if w1.dtype == dtypes.fp4x2 else w2.shape[2]
 
     tile_m = block_m if block_m is not None else 64
-    tile_n = 128
+    tile_n = 256
     tile_k = 128 if not is_wfp4_pipeline else 256
 
     # import pdb;pdb.set_trace()
@@ -1781,7 +1782,7 @@ def flydsl_moe_stage1(
         experts=E,
         topk=topk,
         tile_m=tile_m,
-        tile_n=tile_k,
+        tile_n=tile_n,
         tile_k=tile_k,
         x_dtype="fp8",
         w_dtype="fp4",
@@ -1890,7 +1891,7 @@ def flydsl_moe_stage2(
     E = w2.shape[0]
 
     tile_m = block_m if block_m is not None else 64
-    tile_n = 128
+    tile_n = 256
     tile_k = 128 if not is_wfp4_pipeline else 256
 
     sorted_ids = sorted_token_ids.contiguous()
@@ -1940,6 +1941,7 @@ def flydsl_moe_stage2(
         doweight_stage2=bool(sorted_weights is not None),
         out_dtype=out_dtype,
         mode=MoeGemm2Mode.ATOMIC,
+        # mode=MoeGemm2Mode.REDUCE,
     )
 
     exe2(
