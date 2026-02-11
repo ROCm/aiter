@@ -118,7 +118,7 @@ def fused_moe(
     bias1=None,
     bias2=None,
     splitk=0,
-    use_flydsl=False,
+    use_flydsl=True,
 ):
     if not block_size_M:
         block_size_M = -1
