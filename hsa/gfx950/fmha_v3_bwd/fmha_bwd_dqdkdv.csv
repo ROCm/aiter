@@ -7,6 +7,8 @@ fp16,192,128,0,0,1,1,0,3,16,192,_ZN5aiter32fmha_bwd_hd192_128_fp16_a16_psskE,bwd
 bf16,192,128,0,0,1,1,0,3,16,192,_ZN5aiter32fmha_bwd_hd192_128_bf16_a16_psskE,bwd_hd192_128_bf16_a16_pssk.co
 fp16,192,128,1,1,1,1,0,3,16,192,_ZN5aiter39fmha_bwd_hd192_128_fp16_causal_a32_psskE,bwd_hd192_128_fp16_causal_a32_pssk.co
 bf16,192,128,1,1,1,1,0,3,16,192,_ZN5aiter39fmha_bwd_hd192_128_bf16_causal_a32_psskE,bwd_hd192_128_bf16_causal_a32_pssk.co
+bf16,192,128,2,1,1,1,0,3,16,192,_ZN5aiter42fmha_bwd_hd192_128_bf16_causal_br_a32_psskE,bwd_hd192_128_bf16_causal_br_a32_pssk.co
+fp16,192,128,2,1,1,1,0,3,16,192,_ZN5aiter42fmha_bwd_hd192_128_fp16_causal_br_a32_psskE,bwd_hd192_128_fp16_causal_br_a32_pssk.co
 fp16,128,128,1,1,1,1,0,3,16,256,_ZN5aiter38fmha_bwd_hd128_fp16_causal_a32_psskddvE,bwd_hd128_fp16_causal_a32_psskddv.co
 fp16,128,128,1,1,1,1,1,3,16,256,_ZN5aiter44fmha_bwd_hd128_fp16_causal_a32_psskddv_groupE,bwd_hd128_fp16_causal_a32_psskddv_group.co
 bf16,128,128,1,1,1,1,0,3,16,256,_ZN5aiter38fmha_bwd_hd128_bf16_causal_a32_psskddvE,bwd_hd128_bf16_causal_a32_psskddv.co
@@ -27,6 +29,8 @@ bf16,128,128,2,1,1,1,0,3,16,256,_ZN5aiter41fmha_bwd_hd128_bf16_causal_br_a32_pss
 bf16,128,128,2,1,1,1,1,3,16,256,_ZN5aiter47fmha_bwd_hd128_bf16_causal_br_a32_psskddv_groupE,bwd_hd128_bf16_causal_br_a32_psskddv_group.co
 fp16,192,128,1,0,1,1,0,3,16,192,_ZN5aiter39fmha_bwd_hd192_128_fp16_causal_a16_psskE,bwd_hd192_128_fp16_causal_a16_pssk.co
 bf16,192,128,1,0,1,1,0,3,16,192,_ZN5aiter39fmha_bwd_hd192_128_bf16_causal_a16_psskE,bwd_hd192_128_bf16_causal_a16_pssk.co
+fp16,192,128,2,0,1,1,0,3,16,192,_ZN5aiter42fmha_bwd_hd192_128_fp16_causal_br_a16_psskE,bwd_hd192_128_fp16_causal_br_a16_pssk.co
+bf16,192,128,2,0,1,1,0,3,16,192,_ZN5aiter42fmha_bwd_hd192_128_bf16_causal_br_a16_psskE,bwd_hd192_128_bf16_causal_br_a16_pssk.co
 fp16,128,128,1,0,1,1,0,3,16,256,_ZN5aiter38fmha_bwd_hd128_fp16_causal_a16_psskddvE,bwd_hd128_fp16_causal_a16_psskddv.co
 fp16,128,128,1,0,1,1,1,3,16,256,_ZN5aiter44fmha_bwd_hd128_fp16_causal_a16_psskddv_groupE,bwd_hd128_fp16_causal_a16_psskddv_group.co
 bf16,128,128,1,0,1,1,0,3,16,256,_ZN5aiter38fmha_bwd_hd128_bf16_causal_a16_psskddvE,bwd_hd128_bf16_causal_a16_psskddv.co

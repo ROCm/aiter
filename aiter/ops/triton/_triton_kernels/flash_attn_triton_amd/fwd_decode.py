@@ -1,117 +1,121 @@
-import os
 import warnings
 import torch
 import triton
 import triton.language as tl
 from typing import Literal, Optional
+from .common import apply_rotary
 from .utils import (
     DEBUG,
     AUTOTUNE,
     get_arch,
     get_padded_headsize,
-    get_shape_and_strides_from_layout,
-    apply_rotary,
-    is_cdna,
+    get_shape_from_layout,
+    get_stride_from_layout,
     is_fp8,
-    get_recommended_fp8_dtype,
 )
 
+FWD_DECODE_AUTOTUNE_KEYS = [
+    "N_CTX_Q",
+    "N_CTX_K",
+    "ACTUAL_BLOCK_DMODEL",
+    "H_q",
+    "H_kv",
+    "IS_CAUSAL",
+    "IS_GQA",
+]
 
-def get_cdna_autotune_configs():
-    return [
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "waves_per_eu": 2, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=4,
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "waves_per_eu": 2, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=4,
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "waves_per_eu": 3, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=4,
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 64, "waves_per_eu": 1, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=4,
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 32, "waves_per_eu": 2, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=4,
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 1, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=4,
-        ),
-        # Fall-back config.
-        triton.Config(
-            {"BLOCK_M": 16, "BLOCK_N": 16, "waves_per_eu": 1, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=4,
-        ),
-    ], [
-        "IS_CAUSAL",
-        "dropout_p",
-        "MAX_SEQLENS_Q",
-        "MAX_SEQLENS_K",
-        "ACTUAL_BLOCK_DMODEL",
-        "VARLEN",
-        "HQ",
-        "HK",
-    ]
+# Maximum BLOCK_M across all configs (for intermediate tensor allocation)
+MAX_BLOCK_M = 64
 
 
-def get_autotune_configs():
-    if AUTOTUNE:
-        if is_cdna():
-            autotune_configs, autotune_keys = get_cdna_autotune_configs()
-            fwd_auto_tune_configs, fwd_autotune_keys = autotune_configs, autotune_keys
-            reduce_auto_tune_configs, reduce_autotune_keys = (
-                autotune_configs,
-                autotune_keys,
+def get_fwd_decode_configs(autotune: bool):
+    """
+    Returns configs for both the splitK kernel and reduce kernel.
+
+    Returns:
+        (splitk_configs, reduce_config): Tuple of config lists for each kernel
+    """
+
+    if not autotune:
+        arch = get_arch()
+
+        if arch.is_rdna:
+            return (
+                [
+                    triton.Config(
+                        {"BLOCK_M": 32, "BLOCK_N": 32},
+                        num_stages=1,
+                        num_warps=4,
+                    ),
+                ],
+                [triton.Config({}, num_stages=1, num_warps=4)],
             )
-            return (fwd_auto_tune_configs, fwd_autotune_keys), (
-                reduce_auto_tune_configs,
-                reduce_autotune_keys,
+        elif arch.is_cdna:
+            return (
+                [
+                    triton.Config(
+                        {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 1},
+                        num_stages=1,
+                        num_warps=4,
+                    ),
+                ],
+                [triton.Config({}, num_stages=1, num_warps=4)],
             )
         else:
-            raise ValueError("Unknown Device Type")
-    else:
-        autotune_configs, autotune_keys = [
-            triton.Config(
-                {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 1, "PRE_LOAD_V": False},
-                num_stages=1,
-                num_warps=4,
-            ),
-        ], [
-            "IS_CAUSAL",
-            "dropout_p",
-            "MAX_SEQLENS_Q",
-            "MAX_SEQLENS_K",
-            "ACTUAL_BLOCK_DMODEL",
-            "VARLEN",
-            "HQ",
-            "HK",
-        ]
+            # Default / fallback
+            return (
+                [
+                    triton.Config(
+                        {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 1},
+                        num_stages=1,
+                        num_warps=4,
+                    ),
+                ],
+                [triton.Config({}, num_stages=1, num_warps=4)],
+            )
 
-        fwd_auto_tune_configs, fwd_autotune_keys = autotune_configs, autotune_keys
-        reduce_auto_tune_configs, reduce_autotune_keys = autotune_configs, autotune_keys
-        return (fwd_auto_tune_configs, fwd_autotune_keys), (
-            reduce_auto_tune_configs,
-            reduce_autotune_keys,
-        )
+    # ===================== Autotune Sweep =====================
+    arch = get_arch()
+    splitk_configs = []
+
+    BLOCK_M_OPTIONS = [64, 32, 16]
+    BLOCK_N_OPTIONS = [128, 64, 32, 16]
+    NUM_WARPS_OPTIONS = [2, 4]
+    NUM_STAGES_OPTIONS = [1]
+    WAVES_PER_EU_OPTIONS = [4, 2, 1]
+
+    # Ensure BLOCK_M options don't exceed MAX_BLOCK_M
+    assert all(
+        bm <= MAX_BLOCK_M for bm in BLOCK_M_OPTIONS
+    ), f"BLOCK_M_OPTIONS {BLOCK_M_OPTIONS} exceeds MAX_BLOCK_M {MAX_BLOCK_M}"
+
+    for bm in BLOCK_M_OPTIONS:
+        for bn in BLOCK_N_OPTIONS:
+            for waves in WAVES_PER_EU_OPTIONS:
+                for nw in NUM_WARPS_OPTIONS:
+                    for ns in NUM_STAGES_OPTIONS:
+                        splitk_configs.append(
+                            triton.Config(
+                                {
+                                    "BLOCK_M": bm,
+                                    "BLOCK_N": bn,
+                                    "waves_per_eu": waves,
+                                },
+                                num_stages=ns,
+                                num_warps=nw,
+                            )
+                        )
+
+    # Reduce kernel configs - sweep num_warps
+    NUM_WARPS_REDUCE_OPTIONS = [2, 4]
+    reduce_configs = [
+        triton.Config({}, num_stages=1, num_warps=nw) for nw in NUM_WARPS_REDUCE_OPTIONS
+    ]
+
+    return splitk_configs, reduce_configs
 
 
-(fwd_auto_tune_configs, fwd_autotune_keys), (
-    reduce_auto_tune_configs,
-    reduce_autotune_keys,
-) = get_autotune_configs()
+fwd_decode_splitk_configs, fwd_decode_reduce_configs = get_fwd_decode_configs(AUTOTUNE)
 
 
 @triton.jit
@@ -128,18 +132,18 @@ def _attn_fwd_inner(
     q_descale,
     k_descale,
     v_descale,  # FP8 scaling factors
+    alibi_slope,
+    apply_col_mask,
     IS_FP8: tl.constexpr,  # FP8 flag
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     N_CTX_Q: tl.constexpr,
     N_CTX_K_FINAL: tl.constexpr,
     USE_ALIBI: tl.constexpr,
-    alibi_slope,
     USE_SLIDING_WINDOW: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     WINDOW_SIZE_LEFT: tl.constexpr,
     WINDOW_SIZE_RIGHT: tl.constexpr,
-    APPLY_COL_MASK: tl.constexpr,  # apply provided col_mask when True
 ):
     # -- compute qk ---
     qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -179,7 +183,7 @@ def _attn_fwd_inner(
                 win_ok = (col >= row + diag - WINDOW_SIZE_LEFT) & (
                     col <= row + diag + WINDOW_SIZE_RIGHT
                 )
-            mask = ~(causal_ok & win_ok)  # True ⇒ -inf
+            mask = ~(causal_ok & win_ok)  # True => -inf
         else:
             # -------- non-causal window --------
             sk, sq = N_CTX_K_FINAL, N_CTX_Q
@@ -204,7 +208,7 @@ def _attn_fwd_inner(
 
     # Column mask (tail / variable-length). Instead of recomputing an arange each time,
     # we accept a precomputed mask from the caller (col_valid_mask).
-    if APPLY_COL_MASK:
+    if apply_col_mask:
         # Expect col_mask shape: [BLOCK_N]. True where column is within sequence.
         qk = tl.where(col_mask[None, :], qk, float("-inf"))
 
@@ -235,11 +239,11 @@ def _attn_fwd_inner(
     return m_i, l_i, acc
 
 
-# @triton.autotune(
-#     configs=fwd_auto_tune_configs,
-#     key=fwd_autotune_keys,
-#     use_cuda_graph=True,
-# )
+@triton.autotune(
+    configs=fwd_decode_splitk_configs,
+    key=FWD_DECODE_AUTOTUNE_KEYS,
+    use_cuda_graph=True,
+)
 @triton.jit
 def _fwd_kernel_splitK(
     Q,
@@ -304,7 +308,7 @@ def _fwd_kernel_splitK(
     N_CTX_Q,
     N_CTX_K,
     N_CTX_NEW,
-    BLOCK_N_PER_SPLIT,
+    BLOCK_N_PER_SPLIT: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     H_q: tl.constexpr,
     H_kv: tl.constexpr,
@@ -313,7 +317,6 @@ def _fwd_kernel_splitK(
     BLOCK_DMODEL: tl.constexpr,
     ACTUAL_BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BOUNDS_CHECKS_N: tl.constexpr,
     USE_CACHE_SEQLENs: tl.constexpr,
     USE_CACHE_BATCH_IDX: tl.constexpr,
     NEW_KV: tl.constexpr,
@@ -540,22 +543,24 @@ def _fwd_kernel_splitK(
                         q_descale,
                         k_descale,
                         v_descale,
+                        alibi_slope,
+                        True,
                         IS_FP8,
                         BLOCK_M,
                         BLOCK_N,
                         N_CTX_Q,
                         N_CTX_K_FINAL,
                         USE_ALIBI,
-                        alibi_slope,
                         USE_SLIDING_WINDOW,
                         IS_CAUSAL,
                         WINDOW_SIZE_LEFT,
                         WINDOW_SIZE_RIGHT,
-                        True,
                     )
     else:
         # Non-paged attention: process KV from cache
         # Note: Cache should be updated externally before calling this kernel
+        # Compute bounds check flag once: needed if split size not aligned to BLOCK_N or variable seqlens
+        bounds_checks_n = ((BLOCK_N_PER_SPLIT % BLOCK_N) > 0) | USE_CACHE_SEQLENs
         # loop over k, v and update accumulator
         for start_n in range(lo, hi, BLOCK_N):
             kT_ptrs = (
@@ -591,18 +596,18 @@ def _fwd_kernel_splitK(
                 q_descale,
                 k_descale,
                 v_descale,
+                alibi_slope,
+                bounds_checks_n,
                 IS_FP8,
                 BLOCK_M,
                 BLOCK_N,
                 N_CTX_Q,
                 N_CTX_K_FINAL,
                 USE_ALIBI,
-                alibi_slope,
                 USE_SLIDING_WINDOW,
                 IS_CAUSAL,
                 WINDOW_SIZE_LEFT,
                 WINDOW_SIZE_RIGHT,
-                BOUNDS_CHECKS_N,
             )
 
     # write back O
@@ -623,11 +628,17 @@ def _fwd_kernel_splitK(
     tl.store(metadata_ptr + stride_m2, l_i)
 
 
-# @triton.autotune(
-#     configs=reduce_auto_tune_configs,
-#     key=reduce_autotune_keys,
-#     use_cuda_graph=True,
-# )
+FWD_DECODE_REDUCE_AUTOTUNE_KEYS = [
+    "BLOCK_DMODEL",
+    "split_k",
+]
+
+
+@triton.autotune(
+    configs=fwd_decode_reduce_configs,
+    key=FWD_DECODE_REDUCE_AUTOTUNE_KEYS,
+    use_cuda_graph=True,
+)
 @triton.jit
 def _splitK_reduce(
     Out_splitK,  # [B*H*G, split_k, Mq, K]
@@ -865,6 +876,10 @@ def attention_forward_decode_triton_impl(
     rotary_interleaved: bool = False,
     seqlens_rotary: Optional[torch.Tensor] = None,
 ):
+    # Validate layout at entry
+    if layout != "bshd":
+        raise ValueError(f"{layout} layout is not supported, only 'bshd' is supported")
+
     # apply rotary embedding
     if rotary_cos is not None and rotary_sin is not None:
         # Prefer explicitly provided rotary sequence start offsets if given; fall back to cache_seqlens.
@@ -947,13 +962,6 @@ def attention_forward_decode_triton_impl(
                 if cache_seqlens is not None:
                     cache_seqlens[b] = start_idx + seqlen_new
 
-    # triton configs
-    BLOCK_M = 16
-    BLOCK_N = 64
-    num_stages = 1
-    num_warps_fwd = 1
-    num_warps_reduce = 4
-
     # kernel_configs
     is_new_kv = False  # Cache has been updated, so no new KV in kernel
     use_alibi, (stride_az, stride_ah) = True if alibi_slopes is not None else False, (
@@ -962,16 +970,10 @@ def attention_forward_decode_triton_impl(
     use_cache_seqlens = cache_seqlens is not None
     use_sliding_window = window_size_left != -1 or window_size_right != -1
     use_block_table = block_table is not None
-    SPLIT_K = None
-    NUM_QUANT_GROUPS = 1
 
     # get shapes and strides
-    (batch_size, seqlen_q, nheads_q, dim_q), (
-        stride_qz,
-        stride_qh,
-        stride_qm,
-        stride_qd,
-    ) = get_shape_and_strides_from_layout(q, layout)
+    batch_size, seqlen_q, nheads_q, dim_q = get_shape_from_layout(q, layout)
+    stride_qz, stride_qh, stride_qm, stride_qd = get_stride_from_layout(q, layout)
 
     # Handle paged KV cache layout
     if use_block_table:
@@ -983,6 +985,7 @@ def attention_forward_decode_triton_impl(
             seqlen_kc = int(cache_seqlens.max().item())
         else:
             # Infer from block_table shape [batch_size, num_blocks_per_seq]
+            assert block_table is not None
             num_blocks_per_seq = block_table.shape[1]
             seqlen_kc = num_blocks_per_seq * block_size_k
         seqlen_vc = seqlen_kc
@@ -998,66 +1001,46 @@ def attention_forward_decode_triton_impl(
         stride_vc_h = v_cache.stride(2)
         stride_vc_d = v_cache.stride(3)
     else:
-        (_, seqlen_kc, nheads_kc, dim_kc), (
-            stride_kc_z,
-            stride_kc_h,
-            stride_kc_n,
-            stride_kc_d,
-        ) = get_shape_and_strides_from_layout(k_cache, layout)
-        (_, seqlen_vc, nheads_vc, dim_vc), (
-            stride_vc_z,
-            stride_vc_h,
-            stride_vc_n,
-            stride_vc_d,
-        ) = get_shape_and_strides_from_layout(v_cache, layout)
+        _, seqlen_kc, nheads_kc, dim_kc = get_shape_from_layout(k_cache, layout)
+        stride_kc_z, stride_kc_h, stride_kc_n, stride_kc_d = get_stride_from_layout(
+            k_cache, layout
+        )
+        _, seqlen_vc, nheads_vc, dim_vc = get_shape_from_layout(v_cache, layout)
+        stride_vc_z, stride_vc_h, stride_vc_n, stride_vc_d = get_stride_from_layout(
+            v_cache, layout
+        )
         block_size_k = 0  # Not used
     if is_new_kv:
-        (_, seqlen_kn, nheads_kn, dim_kn), (
-            stride_kn_z,
-            stride_kn_h,
-            stride_kn_n,
-            stride_kn_d,
-        ) = get_shape_and_strides_from_layout(k_new, layout)
-        (_, seqlen_vn, nheads_vn, dim_vn), (
-            stride_vn_z,
-            stride_vn_h,
-            stride_vn_n,
-            stride_vn_d,
-        ) = get_shape_and_strides_from_layout(v_new, layout)
+        _, seqlen_kn, nheads_kn, dim_kn = get_shape_from_layout(k_new, layout)
+        stride_kn_z, stride_kn_h, stride_kn_n, stride_kn_d = get_stride_from_layout(
+            k_new, layout
+        )
+        _, seqlen_vn, nheads_vn, dim_vn = get_shape_from_layout(v_new, layout)
+        stride_vn_z, stride_vn_h, stride_vn_n, stride_vn_d = get_stride_from_layout(
+            v_new, layout
+        )
     else:
-        (_, seqlen_kn, nheads_kn, dim_kn), (
-            stride_kn_z,
-            stride_kn_h,
-            stride_kn_n,
-            stride_kn_d,
-        ) = (None, None, None, None,), (None, None, None, None)
-        (_, seqlen_vn, nheads_vn, dim_vn), (
-            stride_vn_z,
-            stride_vn_h,
-            stride_vn_n,
-            stride_vn_d,
-        ) = (None, None, None, None,), (None, None, None, None)
-    (_, seqlen_o, nheads_o, dim_o), (stride_oz, stride_oh, stride_om, stride_od) = (
-        get_shape_and_strides_from_layout(out, layout)
-    )
+        _, _seqlen_kn, nheads_kn, _dim_kn = None, None, None, None
+        stride_kn_z, stride_kn_h, stride_kn_n, stride_kn_d = None, None, None, None
+        _, _seqlen_vn, nheads_vn, _dim_vn = None, None, None, None
+        stride_vn_z, stride_vn_h, stride_vn_n, stride_vn_d = None, None, None, None
+    _, seqlen_o, nheads_o, dim_o = get_shape_from_layout(out, layout)
+    stride_oz, stride_oh, stride_om, stride_od = get_stride_from_layout(out, layout)
     assert (
         dim_q == dim_kc == dim_vc
     ), f"Dimensions must match: {dim_q}, {dim_kc}, {dim_vc}"
 
     # add extra information needed by the kernels
-    if layout == "bshd":
-        (n_group_q, heads_per_group_q), stride_qg = (1, nheads_q), stride_qm
-        (n_group_k, heads_per_group_k), stride_kc_g = (1, nheads_kc), stride_kc_n
-        (n_group_v, heads_per_group_v), stride_vc_g = (1, nheads_vc), stride_vc_n
-        if is_new_kv:
-            (n_group_kn, heads_per_group_kn), stride_kn_g = (1, nheads_kn), stride_kn_n
-            (n_group_vn, heads_per_group_vn), stride_vn_g = (1, nheads_vn), stride_vn_n
-        else:
-            (n_group_kn, heads_per_group_kn), stride_kn_g = (None, None), None
-            (n_group_vn, heads_per_group_vn), stride_vn_g = (None, None), None
-        (n_group_o, heads_per_group_o), stride_og = (1, nheads_o), stride_om
+    (n_group_q, heads_per_group_q), stride_qg = (1, nheads_q), stride_qm
+    (_n_group_k, heads_per_group_k), stride_kc_g = (1, nheads_kc), stride_kc_n
+    (_n_group_v, _heads_per_group_v), stride_vc_g = (1, nheads_vc), stride_vc_n
+    if is_new_kv:
+        (_n_group_kn, _heads_per_group_kn), stride_kn_g = (1, nheads_kn), stride_kn_n
+        (_n_group_vn, _heads_per_group_vn), stride_vn_g = (1, nheads_vn), stride_vn_n
     else:
-        raise ValueError(f"{layout} layout is not supported")
+        (_n_group_kn, _heads_per_group_kn), stride_kn_g = (None, None), None
+        (_n_group_vn, _heads_per_group_vn), stride_vn_g = (None, None), None
+    (_n_group_o, _heads_per_group_o), stride_og = (1, nheads_o), stride_om
 
     # get padded size
     dim_padded = get_padded_headsize(dim_kc)
@@ -1070,29 +1053,29 @@ def attention_forward_decode_triton_impl(
     else:
         is_gqa = False
 
-    if SPLIT_K is not None:
-        split_k = SPLIT_K
+    # Use heuristics for split_k
+    if use_block_table:
+        # For paged attention, use the actual sequence length from cache_seqlens
+        max_seqlen = (
+            int(cache_seqlens.max().item())
+            if cache_seqlens is not None
+            else block_size_k
+        )
+        split_k = get_split_k(batch_size, n_group_q, heads_per_group_q, max_seqlen)
     else:
-        # Use heuristics
-        if use_block_table:
-            # For paged attention, use the actual sequence length from cache_seqlens
-            max_seqlen = (
-                int(cache_seqlens.max().item())
-                if cache_seqlens is not None
-                else block_size_k
-            )
-            split_k = get_split_k(batch_size, n_group_q, heads_per_group_q, max_seqlen)
-        else:
-            split_k = get_split_k(batch_size, n_group_q, heads_per_group_q, seqlen_kc)
+        split_k = get_split_k(batch_size, n_group_q, heads_per_group_q, seqlen_kc)
     split_size = (seqlen_kc + split_k - 1) // split_k
 
-    # setup grid
-    seqlen_q_ceil = (seqlen_q + BLOCK_M - 1) // BLOCK_M * BLOCK_M
-    grid = lambda META: (
-        triton.cdiv(seqlen_q, META["BLOCK_M"]),
-        batch_size * n_group_q * heads_per_group_q,
-        split_k,
-    )
+    # setup grid - use lambda to get BLOCK_M from autotune
+    # Use MAX_BLOCK_M for intermediate tensor allocation to ensure enough space
+    seqlen_q_ceil = (seqlen_q + MAX_BLOCK_M - 1) // MAX_BLOCK_M * MAX_BLOCK_M
+
+    def grid(META):
+        return (
+            triton.cdiv(seqlen_q, META["BLOCK_M"]),
+            batch_size * n_group_q * heads_per_group_q,
+            split_k,
+        )
 
     # create intermediate tensors
     out_splitk = torch.empty(
@@ -1122,7 +1105,7 @@ def attention_forward_decode_triton_impl(
     assert (
         softmax_lse.dtype == torch.float32
     ), f"softmax_lse must be float32, got {softmax_lse.dtype}"
-    assert softmax_lse.device == q.device, f"softmax_lse must be on same device as q"
+    assert softmax_lse.device == q.device, "softmax_lse must be on same device as q"
 
     # Create internal lse view for kernel use
     lse = softmax_lse.view(expected_h_total, -1)[:, :seqlen_q].contiguous()
@@ -1134,6 +1117,7 @@ def attention_forward_decode_triton_impl(
 
     # Block table strides
     if use_block_table:
+        assert block_table is not None
         stride_bt_b, stride_bt_s = block_table.stride()
     else:
         stride_bt_b, stride_bt_s = 0, 0
@@ -1141,13 +1125,15 @@ def attention_forward_decode_triton_impl(
     # FP8 support
     IS_FP8 = is_fp8([q, k_cache, v_cache])
     if IS_FP8:
-        rec_dtype = get_recommended_fp8_dtype(q)
+        arch = get_arch()
+        if not arch.supports_fp8:
+            raise RuntimeError(f"{arch.name} does not support FP8")
+        rec_dtype = arch.recommended_fp8_dtype(q.dtype)
         if (
             q.dtype != rec_dtype
             or k_cache.dtype != rec_dtype
             or v_cache.dtype != rec_dtype
         ):
-            arch = get_arch()
             warnings.warn(
                 f"Use {rec_dtype} data type on {arch}. Got q: {q.dtype}, k: {k_cache.dtype}, v: {v_cache.dtype}",
                 UserWarning,
@@ -1321,11 +1307,8 @@ def attention_forward_decode_triton_impl(
         N_CTX_NEW=0,  # No new KV, cache already updated
         BLOCK_N_PER_SPLIT=split_size,
         BLOCK_SIZE_K=block_size_k if use_block_table else 256,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
         BLOCK_DMODEL=dim_padded,
         ACTUAL_BLOCK_DMODEL=dim_kc,
-        BOUNDS_CHECKS_N=(split_size % BLOCK_N) > 0 or use_cache_seqlens,
         USE_CACHE_SEQLENs=use_cache_seqlens,
         USE_CACHE_BATCH_IDX=cache_batch_idx is not None,
         NEW_KV=False,  # Cache already updated
@@ -1339,8 +1322,6 @@ def attention_forward_decode_triton_impl(
         WINDOW_SIZE_RIGHT=window_size_right,
         USE_BLOCK_TABLE=use_block_table,
         IS_FP8=IS_FP8,
-        num_warps=num_warps_fwd,
-        num_stages=num_stages,
     )
 
     if DEBUG:
@@ -1358,15 +1339,15 @@ def attention_forward_decode_triton_impl(
         k_block_num = 2
     assert dim_padded % k_block_num == 0
     k_block_size = dim_padded // k_block_num
-    grid = (batch_size * n_group_q * heads_per_group_q, seqlen_q, k_block_num)
+    reduce_grid = (batch_size * n_group_q * heads_per_group_q, seqlen_q, k_block_num)
 
     if DEBUG:
         print("splitK_pow2:", splitK_pow2)
         print("k_block_num:", k_block_num)
         print("k_block_size:", k_block_size)
-        print("grid:", grid)
+        print("grid:", reduce_grid)
 
-    _splitK_reduce[grid](
+    _splitK_reduce[reduce_grid](
         out_splitk,
         metadata,
         out,
@@ -1400,5 +1381,4 @@ def attention_forward_decode_triton_impl(
         splitK_pow2=splitK_pow2,
         MASK_SPLITK=mask_split_k,
         PADDED_HEAD=is_padded_head,
-        num_warps=num_warps_reduce,
     )
