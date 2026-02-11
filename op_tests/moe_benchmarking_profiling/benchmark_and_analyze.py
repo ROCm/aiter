@@ -562,7 +562,12 @@ def main():
     parser.add_argument(
         "-i", "--input",
         default="configs/configs_for_benchmark.csv",
-        help="Input configuration CSV file (default: configs/configs_for_benchmark.csv)"
+        help="Input configuration CSV file (or use --config for single config)"
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        help="Single config as comma-separated values: token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1 (e.g., '1,4096,1536,16,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0')"
     )
     parser.add_argument(
         "-o", "--output",
@@ -599,6 +604,39 @@ def main():
     
     args = parser.parse_args()
     
+    # Handle --config argument (single config as comma-separated string)
+    if args.config:
+        # Parse comma-separated config
+        values = args.config.split(',')
+        if len(values) != 12:
+            print(f"Error: --config requires 12 comma-separated values, got {len(values)}")
+            print("Expected: token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1")
+            return
+        config_data = {
+            'config_idx': [0],
+            'token': [int(values[0])],
+            'model_dim': [int(values[1])],
+            'inter_dim': [int(values[2])],
+            'expert': [int(values[3])],
+            'topk': [int(values[4])],
+            'act_type': [values[5].strip()],
+            'dtype': [values[6].strip()],
+            'q_dtype_a': [values[7].strip()],
+            'q_dtype_w': [values[8].strip()],
+            'q_type': [values[9].strip()],
+            'use_g1u1': [int(values[10])],
+            'doweight_stage1': [int(values[11])]
+        }
+        import tempfile
+        temp_csv = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
+        temp_df = pd.DataFrame(config_data)
+        temp_df.to_csv(temp_csv.name, index=False)
+        temp_csv.close()
+        input_file = temp_csv.name
+        print("Using config from command line argument")
+    else:
+        input_file = args.input
+    
     # Generate output filenames
     benchmark_file = f"{args.output}_benchmark_results.csv"
     combinations_file = f"{args.output}_all_combinations.csv"
@@ -606,7 +644,7 @@ def main():
     error_log_file = f"{args.output}_errors.log"
     
     moe_utils.print_section_header("MOE KERNEL BENCHMARKING")
-    print(f"Input config: {args.input}")
+    print(f"Input config: {input_file}")
     print(f"Output files:")
     print(f"  1. {benchmark_file} (all benchmark results)")
     print(f"  2. {combinations_file} (all combinations)")
@@ -621,7 +659,7 @@ def main():
     print(f"GPUs: {gpus_to_use} (available: {available_gpus})")
     
     # STEP 1: Run benchmarks
-    results_df = run_kernel_benchmarks(args.input, benchmark_file, error_log_file, 
+    results_df = run_kernel_benchmarks(input_file, benchmark_file, error_log_file, 
                                       resume=args.resume, force=args.force,
                                       num_gpus=args.gpus, include_triton=args.include_triton)
     
@@ -645,6 +683,13 @@ def main():
     
     # Select best kernels
     best_kernels_df = select_best_kernels(valid_df, best_kernels_file)
+    
+    # Clean up temp file if using --config
+    if args.config:
+        try:
+            os.unlink(input_file)
+        except:
+            pass
     
     # Final summary
     moe_utils.print_section_header("PIPELINE COMPLETE")
