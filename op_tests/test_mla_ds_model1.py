@@ -6,9 +6,10 @@ import random
 import aiter
 from aiter import dtypes
 from aiter.ops import quant
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import benchmark, checkAllclose, run_perftest, perftest
 import argparse
 
+TEST_NUM_ITERS = 10
 
 def to_2buff_for_asm(quant_input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -207,6 +208,7 @@ def quant_2buff_to_native(
     return result
 
 
+@perftest(num_iters=TEST_NUM_ITERS)
 def ref_sparse_attn_decode(
     q_nope_scale_buff: torch.Tensor,  # (batch, s_q, h_q, 512) fp8
     q_rope_buff: torch.Tensor,  # (batch, s_q, h_q, 64) bf16
@@ -227,7 +229,7 @@ def ref_sparse_attn_decode(
         lse: (batch, h_q, s_q) logsumexp
     """
     d, d_nope, d_rope, tile_size, num_tiles = quant.MODEL1_FP8Sparse
-    d_v = d_nope  # value dim = 448
+    d_v = d  # value dim = 512
 
     # 1. Dequantize q and kv to bf16
     q = quant_2buff_to_native(q_nope_scale_buff, q_rope_buff)  # (batch, s_q, h_q, d)
@@ -249,8 +251,6 @@ def ref_sparse_attn_decode(
         kv_cache, 0, kv_indices
     )  # (total_kv_len, block_size, h_kv, d)
     kvc = kvc.view(-1, h_kv, d)  # (total_kv_len * block_size, h_kv, d)
-    # print(f"{kvc=}")
-    # print(f"{kvc.shape=}")
 
     # 3. Split by batch using kv_indptr
     kv_indptr_list = (kv_indptr * block_size).tolist()
@@ -322,7 +322,7 @@ def ref_sparse_attn_decode(
 def run_asm_sparse_attn_decode():
     pass
 
-
+@benchmark()
 def test_sparse_attn_decode(
     batch_size,
     head_num_of_q,
@@ -343,8 +343,11 @@ def test_sparse_attn_decode(
     # 1. prepare input
     assert head_num_of_q % head_num_of_kv == 0
 
-    q = torch.randn((batch_size, seq_len_of_q, head_num_of_q, dim_qk))
+    q = torch.randn(
+        (batch_size, seq_len_of_q, head_num_of_q, dim_qk), dtype=torch.bfloat16
+    )
     q.clamp_(min=-1.0, max=1.0)
+
     q_nope_scale_buff, q_rope_buff = native_to_2buff_for_asm(q)
 
     attn_sink = None
@@ -381,9 +384,10 @@ def test_sparse_attn_decode(
             cache_seqlens[zeros_mask] = 0
 
         kv_indptr[1 : batch_size + 1] = torch.cumsum(cache_seqlens, dim=0)
-        kv_indices = torch.randint(
-            0, num_page, (kv_indptr[-1].item(),), dtype=torch.int32
-        )
+        assert (
+            num_page >= kv_indptr[-1].item()
+        ), f"num_page={num_page} < kv_indptr[-1].item()={kv_indptr[-1].item()}"
+        kv_indices = torch.randperm(kv_indptr[-1].item(), dtype=torch.int32)
 
         kv_cache = (
             torch.randn(
