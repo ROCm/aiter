@@ -69,8 +69,14 @@ def gemm_tdm_pipelined_blockscale_kernel(a_ptr, b_ptr, c_ptr,  #
     # ttgl.static_assert(b_dtype.is_fp16(), "Only fp16 supported for B")
     ttgl.static_assert(NUM_BUFFERS >= 2, "NUM_BUFFERS must be at least 2")
 
+    # Constants
     K_WIDTH: ttgl.constexpr = 16
 
+    # Layouts
+    # 1 for WMMA
+    # shared layouts for A and B
+    # shared layouts for A scale and B scale
+    # operand layouts for A and B
     WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDWMMALayout(3, True, WARP_BASES, [], [16, 16, 32])
     shared_layouts: ttgl.constexpr = create_shared_layouts(BLOCK_M, BLOCK_N, BLOCK_K, TRANSPOSE_B)
     SHARED_LAYOUT_A: ttgl.constexpr = shared_layouts[0]
@@ -85,14 +91,14 @@ def gemm_tdm_pipelined_blockscale_kernel(a_ptr, b_ptr, c_ptr,  #
     OPERAND_LAYOUT_A: ttgl.constexpr = ttgl.DotOperandLayout(0, WMMA_LAYOUT, K_WIDTH)
     OPERAND_LAYOUT_B: ttgl.constexpr = ttgl.DotOperandLayout(1, WMMA_LAYOUT, K_WIDTH)
 
+    # Begin kernel, setup
     pid = ttgl.program_id(axis=0)
     num_pid_m = ttgl.cdiv(M, BLOCK_M)
     num_pid_n = ttgl.cdiv(N, BLOCK_N)
     pid_m = pid % num_pid_m
     pid_n = pid // num_pid_m
 
-
-
+    # Create tensors and allocate LDS for both matrices and scales
     a_desc, b_desc = create_tensor_descriptors(a_ptr, b_ptr, pid_m * BLOCK_M * stride_am, pid_n * BLOCK_N * stride_bn,
                                                stride_am, stride_ak, stride_bn, stride_bk, SHARED_LAYOUT_A,
                                                SHARED_LAYOUT_B, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, TRANSPOSE_B)
@@ -105,51 +111,52 @@ def gemm_tdm_pipelined_blockscale_kernel(a_ptr, b_ptr, c_ptr,  #
     a_scale_buffer = ttgl.allocate_shared_memory(a_scale.dtype, shape=[NUM_BUFFERS] + a_scale.block_shape, layout=a_scale.layout)
     b_scale_buffer = ttgl.allocate_shared_memory(b_scale.dtype, shape=[NUM_BUFFERS] + b_scale.block_shape, layout=b_scale.layout)
 
+    # Begin GFX1250 producer and consumer. Count one for regular matrices, and another one for scales
     producer = 0
     scale_producer = 0
     consumer = 0
     scale_consumer = 0
-    # Pass zeros each time so issue_wmma returns only this tile's product (not accumulated)
+    # Set up zeros, partial, and total accumulators
     wmma_zeros = ttgl.zeros((BLOCK_M, BLOCK_N), dtype=c_ptr.type.element_ty, layout=WMMA_LAYOUT)
     partial = ttgl.zeros((BLOCK_M, BLOCK_N), dtype=c_ptr.type.element_ty, layout=WMMA_LAYOUT)
     accumulator = ttgl.zeros((BLOCK_M, BLOCK_N), dtype=c_ptr.type.element_ty, layout=WMMA_LAYOUT)
 
-    # Prefetching buffers we load in the prologue does not make sense
+    # Prefetching buffers, this is left from base gemm that was taken for reference
     issue_l2_prefetches_prologue(L2_PREFETCH_DISTANCE, producer, a_desc, b_desc, 0, 0, BLOCK_K, NUM_BUFFERS,
                                  TRANSPOSE_B)
 
-   
+   # Issue loads into buffers for both A/B and scales
     for _ in ttgl.static_range(NUM_BUFFERS - 1):
         # issue loads probably with scales as well
         # is it apply scales then load and gemm?
         producer = issue_loads(producer, a_desc, b_desc, 0, 0, a_buffer, b_buffer, BLOCK_K, NUM_BUFFERS, TRANSPOSE_B)
         scale_producer = issue_loads(scale_producer, a_scale, b_scale, 0, 0, a_scale_buffer, b_scale_buffer, BLOCK_K, NUM_BUFFERS, TRANSPOSE_B)
     
+    # Go through the K blocks. Load tiles from the buffers, and load tiles from the scales
     for _ in range(0, ttgl.cdiv(K, BLOCK_K) - (NUM_BUFFERS - 1)):
         # Advancing through the K blocks
         producer = issue_loads(producer, a_desc, b_desc, 0, 0, a_buffer, b_buffer, BLOCK_K, NUM_BUFFERS, TRANSPOSE_B)
-        # fixthis -- loading scales into buffer
         scale_producer = issue_loads(scale_producer, a_scale, b_scale, 0, 0, a_scale_buffer, b_scale_buffer, BLOCK_K, NUM_BUFFERS, TRANSPOSE_B)
 
-        # We prefetch distance - 1 iterations ahead because producer is already incremented by 1
+        # Leftover prefetching from the original gfx1250 gemm
         issue_l2_prefetches(L2_PREFETCH_DISTANCE - 1, producer, a_desc, b_desc, 0, 0, BLOCK_K, TRANSPOSE_B)
+        
+        # WMMA the partial sum, apply scales to each tile, and store.
         consumer, partial = issue_wmma(consumer, a_buffer, OPERAND_LAYOUT_A, b_buffer, OPERAND_LAYOUT_B,
                                            wmma_zeros, (NUM_BUFFERS - 1) * 2, NUM_BUFFERS, TRANSPOSE_B)
         scale_slot = (consumer - 1) % NUM_BUFFERS
-        # TODO this is wrong too change the slice layout
-        a_scale_block = a_scale_buffer.index(scale_slot).load(layout=blocked_mk)
-        b_scale_block = b_scale_buffer.index(scale_slot).load(layout=blocked_kn)
-        cur_a_scale = ttgl.convert_layout(a_scale_block, ttgl.SliceLayout(1, WMMA_LAYOUT))   # 1D, size BLOCK_M
-        cur_b_scale = ttgl.convert_layout(b_scale_block, ttgl.SliceLayout(0, WMMA_LAYOUT))   # 1D, size BLOCK_N
+        # TODO this bit complains. slice layout seems correct and breaks, but blocked layout breaks as well.
+        cur_a_scale = a_scale_buffer.index(scale_slot).load(layout=ttgl.SliceLayout(1, WMMA_LAYOUT))
+        cur_b_scale = b_scale_buffer.index(scale_slot).load(layout=ttgl.SliceLayout(0, WMMA_LAYOUT))
         accumulator += partial * cur_a_scale[:, None] * cur_b_scale[None, :]
 
     for i in ttgl.static_range(NUM_BUFFERS - 1):
         consumer, partial = issue_wmma(consumer, a_buffer, OPERAND_LAYOUT_A, b_buffer, OPERAND_LAYOUT_B,
                                            wmma_zeros, (NUM_BUFFERS - 2 - i) * 2, NUM_BUFFERS, TRANSPOSE_B)
         scale_slot = (consumer - 1) % NUM_BUFFERS
-        # TODO this is wrong too change the slice layout
-        cur_a_scale = ttgl.reshape(a_scale_buffer.index(scale_slot).load(layout=blocked_mk), ttgl.SliceLayout(1, WMMA_LAYOUT))
-        cur_b_scale = b_scale_buffer.index(scale_slot).load(layout=blocked_kn)
+        # TODO if this is accumulating everything from the buffers do i need to scale this too
+        cur_a_scale = a_scale_buffer.index(scale_slot).load(layout=ttgl.SliceLayout(1, WMMA_LAYOUT))
+        cur_b_scale = b_scale_buffer.index(scale_slot).load(layout=ttgl.SliceLayout(0, WMMA_LAYOUT))
         accumulator += partial * cur_a_scale * cur_b_scale
 
     
