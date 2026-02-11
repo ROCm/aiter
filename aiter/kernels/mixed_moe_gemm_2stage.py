@@ -2315,11 +2315,6 @@ def compile_mixed_moe_gemm2(
 
                     return (fused2, row_valid)
 
-                # #region agent log
-                import json as _json, time as _time
-                with open("/home/jiaxiwen/.cursor/debug.log", "a") as _f:
-                    _f.write(_json.dumps({"id": f"log_compile_{int(_time.time()*1000)}", "timestamp": int(_time.time()*1000), "location": "mixed_moe_gemm_2stage.py:store_pair_codegen", "message": "store_pair code path selection", "data": {"accumulate": bool(accumulate), "out_is_bf16": out_is_bf16, "out_is_f32": out_is_f32, "model_dim": model_dim, "topk": topk, "out_elem_bytes": out_elem_bytes, "path": "global_atomic_i64" if bool(accumulate) else "global_store_i64"}, "runId": "pre-fix", "hypothesisId": "H2"}) + "\n")
-                # #endregion
 
                 def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
                     fused = row_ctx
