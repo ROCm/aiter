@@ -6,7 +6,9 @@
  * @brief OPUS MFMA kernel and host launch (no main).
  * Uses matrix_core_kernel_block_v2 style from
  * https://github.com/carlushuang/gcnasm/blob/master/matrix_core_opus/matrix_core.cc
- * Single block 32x32x8 with mfma_adaptor_swap_ab: C = B @ A^T (A 32x8, B 32x8, C 32x32).
+ * Single block 32x32x8 with mfma_adaptor_swap_ab: C = A @ B^T (A 32x8, B 32x8, C 32x32).
+ * swap_ab internally swaps A/B in the MFMA and transposes the C layout,
+ * so the net result in row-major memory is C = A @ B^T (gemm_rcr).
  */
 
 #include <hip/hip_runtime.h>
@@ -21,6 +23,10 @@
         return; \
     } \
 } while(0)
+
+// This kernel requires gfx942 (MI300) MFMA instructions.
+// The __gfx942__ macro is defined by hipcc during device compilation for that target.
+#if defined(__gfx942__) || defined(__gfx9_4_generic__) || !defined(__HIP_DEVICE_COMPILE__)
 
 // Single-block 32x32x8 kernel matching matrix_core_kernel_block_v2 (E_M=E_N=E_K=1, T_M=T_N=T_K=1, W_M=32, W_N=32, W_K=8).
 __global__ void mfma_kernel_32x32x8_f16(
@@ -86,6 +92,8 @@ __global__ void mfma_kernel_32x32x8_f16(
     auto v_c_f16 = opus::cast<opus::fp16_t>(v_c);
     g_c.store<4>(v_c_f16, u_c);
 }
+
+#endif // gfx942 guard
 
 extern "C" void run_mfma_32x32x8_f16(
     const void* d_a,

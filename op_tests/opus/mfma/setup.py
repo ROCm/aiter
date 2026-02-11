@@ -11,6 +11,8 @@ _REPO_CSRC = os.path.normpath(
     os.path.join(_THIS_DIR, "..", "..", "..", "csrc", "include")
 )
 
+__ARCH__ = "native"
+
 setup(
     name="opus_mfma",
     ext_modules=[
@@ -21,6 +23,10 @@ setup(
                 os.path.join(_THIS_DIR, "opus_mfma_ext.cpp"),
             ],
             include_dirs=[_REPO_CSRC, _THIS_DIR],
+            extra_compile_args={
+                # Limit offload-arch to native GPU to speed up compilation
+                "nvcc": [f"--offload-arch={__ARCH__}", "-O3"],
+            },
         )
     ],
     cmdclass={"build_ext": BuildExtension},

@@ -68,12 +68,27 @@ def _ensure_extension_built():
     return True
 
 
+def _get_gpu_arch():
+    """Return the GCN architecture name of the current GPU, e.g. 'gfx942'."""
+    props = torch.cuda.get_device_properties(0)
+    return getattr(props, "gcnArchName", "").split(":")[0]
+
+
+_SUPPORTED_ARCHS = {"gfx942"}
+
+
 def main():
     if not torch.cuda.is_available():
         print("SKIP: CUDA not available")
         return 0
 
+    arch = _get_gpu_arch()
+    if arch not in _SUPPORTED_ARCHS:
+        print(f"SKIP: GPU arch '{arch}' not supported (need one of {_SUPPORTED_ARCHS})")
+        return 0
+
     _clean_previous_extension()
+    print(f"GPU arch: {arch}")
     print("Building OPUS MFMA extension (BuildExtension + CUDAExtension)...")
     if not _ensure_extension_built():
         return 1
@@ -84,19 +99,21 @@ def main():
     device = torch.device("cuda")
     dtype = torch.float16
 
-    # Random A (MxK), B (NxK); C = A @ B^T -> (MxN)
+    # Random integer A (MxK), B (NxK) in [-10, 10]
     torch.manual_seed(12345)
-    A = torch.randn(M, K, device=device, dtype=dtype)
-    B = torch.randn(N, K, device=device, dtype=dtype)
+    A = torch.randint(-10, 11, (M, K), device=device).to(dtype)
+    B = torch.randint(-10, 11, (N, K), device=device).to(dtype)
     C = torch.empty(M, N, device=device, dtype=dtype)
 
     opus_mfma.run_mfma_32x32x8_f16(A, B, C)
 
-    # Kernel uses mfma_adaptor_swap_ab (block_v2 style), so C = B @ A^T.
-    C_ref = torch.mm(B.float(), A.float().t()).to(dtype)
+    # Kernel uses mfma_adaptor_swap_ab which internally swaps A/B in the MFMA
+    # instruction and transposes the C register layout. The net result stored
+    # in row-major memory is C = A @ B^T (same as gemm_rcr in the reference).
+    C_ref = torch.mm(A.float(), B.float().t()).to(dtype)
 
-    atol = 0.5
-    rtol = 0.05
+    atol = 1e-3
+    rtol = 1e-3
     ok = torch.allclose(C.float(), C_ref.float(), atol=atol, rtol=rtol)
     max_diff = (C.float() - C_ref.float()).abs().max().item()
     if not ok:
@@ -107,13 +124,12 @@ def main():
             .sum()
             .item()
         )
-        # In some Docker/ROCm environments the numerical check can fail; treat as warning so CI passes
         print(
-            f"WARNING: MFMA vs reference max_diff={max_diff:.4f}, {diff_count} elements outside tol (atol={atol}, rtol={rtol})"
+            f"FAIL: MFMA vs reference max_diff={max_diff:.4f}, "
+            f"{diff_count} elements outside tol (atol={atol}, rtol={rtol})"
         )
-        print("PASS: MFMA extension ran (numerical check relaxed in this environment)")
-        return 0
-    print(f"PASS: MFMA 32x32x8 fp16 (OPUS ext), max_diff={max_diff:.4f}")
+        return 1
+    print(f"PASS: MFMA 32x32x8 fp16 (OPUS ext, block_v2), max_diff={max_diff:.4f}")
     return 0
 
 

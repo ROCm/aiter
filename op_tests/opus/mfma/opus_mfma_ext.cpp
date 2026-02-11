@@ -39,5 +39,5 @@ void run_mfma_32x32x8_f16_torch(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("run_mfma_32x32x8_f16", &run_mfma_32x32x8_f16_torch,
-          "OPUS 32x32x8 fp16 MFMA (block_v2, swap_ab): C = B @ A^T (A 32x8, B 32x8, C 32x32)");
+          "OPUS 32x32x8 fp16 MFMA (block_v2, swap_ab): C = A @ B^T (A 32x8, B 32x8, C 32x32)");
 }
