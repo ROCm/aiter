@@ -2617,7 +2617,22 @@ def paged_attention_decode_ps_reduce_kernel(
     exp_sums = tl.load(
         exp_sums_ptr + exp_sums_offsets, mask=exp_sums_mask, other=0.0
     )
+    # Calculate output tensor offsets
+    output_offsets = (
+        sequence_idx * stride_output_bs
+        + output_len_offsets[:, None, None] * stride_output_len
+        + kv_head_idx * stride_output_kv_head
+        + output_group_offsets[None, :, None] * stride_output_group_size
+        + head_size_offsets[None, None, :]
+    )
 
+    # Create mask for valid output storage
+    output_mask = (
+        (output_len_offsets[:, None, None] < query_seq_len)
+        & (output_group_offsets[None, :, None] < query_group_size)
+        & (head_size_offsets[None, None, :] < head_size)
+    )
+    
     logits_offsets = (
         sequence_idx * stride_logits_seq
         + kv_head_idx * stride_logits_head
@@ -2656,21 +2671,7 @@ def paged_attention_decode_ps_reduce_kernel(
     final_output = tl.reshape(
         final_output, [QUERY_SEQ_LEN_POW2, ONE_QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2]
     )
-    # Calculate output tensor offsets
-    output_offsets = (
-        sequence_idx * stride_output_bs
-        + output_len_offsets[:, None, None] * stride_output_len
-        + kv_head_idx * stride_output_kv_head
-        + output_group_offsets[None, :, None] * stride_output_group_size
-        + head_size_offsets[None, None, :]
-    )
 
-    # Create mask for valid output storage
-    output_mask = (
-        (output_len_offsets[:, None, None] < query_seq_len)
-        & (output_group_offsets[None, :, None] < query_group_size)
-        & (head_size_offsets[None, None, :] < head_size)
-    )
 
     # Store final output to global memory
     tl.store(
