@@ -396,7 +396,12 @@ def test_mla(
             kv_last_page_lens.fill_(ctx_lens % page_size)
 
     # Temporarily work around for fp8/fp8 with gqa_ratio=32 kernel doesn't support bitmask
-    if nhead == 32 and decode_qlen == 4 and dtype == dtypes.fp8 and kvtype == dtypes.fp8:
+    if (
+        nhead == 32
+        and decode_qlen == 4
+        and dtype == dtypes.fp8
+        and kvtype == dtypes.fp8
+    ):
         remainder = seq_lens_kv % 64
         need_pad = remainder != 0
         if need_pad.any():
