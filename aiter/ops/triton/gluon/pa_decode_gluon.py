@@ -777,8 +777,8 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     configs=[
         triton.Config({'waves_per_eu' : wa}, num_stages=1) for wa in [0, 2]
     ],
-    key = ["COMPUTE_TYPE", "ONE_QUERY_GROUP_SIZE_POW2", "QUERY_SEQ_LEN_POW2"],
-    cache_results = True
+    key=["COMPUTE_TYPE", "ONE_QUERY_GROUP_SIZE_POW2", "QUERY_SEQ_LEN_POW2"],
+    cache_results=True
 )
 @gluon.jit
 def paged_attention_decode_sliding_window(
@@ -2576,11 +2576,6 @@ def paged_attention_decode_ps_reduce_kernel(
     # Convert MTP layout indices to continuous indices for reading from temporary_output
     query_len_idx = query_group_offsets_mtp // ONE_QUERY_GROUP_SIZE_POW2
     group_idx_in_len = query_group_offsets_mtp % ONE_QUERY_GROUP_SIZE_POW2
-    query_group_offsets = query_len_idx * query_group_size + group_idx_in_len
-    # Initialize global accumulation variables
-    global_max = tl.full((QUERY_GROUP_SIZE_POW2,), float("-inf"), dtype=tl.float32)
-    global_exp_sum = tl.zeros((QUERY_GROUP_SIZE_POW2,), dtype=tl.float32)
-    final_output = tl.zeros((QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2), dtype=tl.float32)
 
     # Calculate number of iterations needed
     query_group_mask = (output_len_offsets[:, None] < query_seq_len) & (
@@ -2596,16 +2591,12 @@ def paged_attention_decode_ps_reduce_kernel(
             mask=output_group_offsets < query_group_size,
             other=float("-inf"),
         )
-        sink_token_values = tl.broadcast_to(sink_token_values[None, :], [QUERY_SEQ_LEN_POW2, ONE_QUERY_GROUP_SIZE_POW2])
-        sink_token_values = tl.reshape(sink_token_values, [QUERY_GROUP_SIZE_POW2], can_reorder=True)
+
     # ==================== FIRST PASS: FIND GLOBAL MAX ====================
     # Loop through partitions in chunks of MAX_CONTEXT_PARTITION_NUM.
     # NOTE: We must chunk here to avoid exceeding Triton's max tensor numel.
-    # global_max_prev = global_max
-    # for iter_idx in range(num_iterations):
-    #     partition_base = iter_idx * MAX_CONTEXT_PARTITION_NUM
     partition_offsets = tl.arange(0, MAX_CONTEXT_PARTITION_NUM)
-
+    query_group_offsets = query_len_idx * query_group_size + group_idx_in_len
     # Calculate offsets for exponential sums and max logits
     exp_sums_offsets = (
         sequence_idx * stride_exp_sums_seq
@@ -2627,46 +2618,6 @@ def paged_attention_decode_ps_reduce_kernel(
         exp_sums_ptr + exp_sums_offsets, mask=exp_sums_mask, other=0.0
     )
 
-    # Update global maximum and rescale accumulated exp sums accordingly
-    chunk_max_logits = tl.max(max_logits, axis=0)
-    global_max = tl.maximum(global_max, chunk_max_logits)
-
-    exp_sums *= tl.exp(max_logits - global_max[None, :])
-    global_exp_sum = tl.sum(exp_sums, axis=0)
-    # global_max_prev = global_max
-
-    if USE_SINKS:
-        global_exp_sum += tl.exp(sink_token_values.to(tl.float32) - global_max)
-
-    # ==================== SECOND PASS: COMPUTE RESCALED EXP SUMS AND ACCUMULATE ====================
-    # for iter_idx in range(num_iterations):
-    #     partition_base = iter_idx * MAX_CONTEXT_PARTITION_NUM
-    # partition_offsets = tl.arange(0, MAX_CONTEXT_PARTITION_NUM)
-
-    # exp_sums_offsets = (
-    #     sequence_idx * stride_exp_sums_seq
-    #     + kv_head_idx * stride_exp_sums_head
-    #     + partition_offsets[:, None] * stride_exp_sums_part
-    #     + query_group_offsets[None, :]
-    # )
-    # exp_sums_mask = (
-    #     partition_offsets[:, None] < context_partition_num
-    # ) & query_group_mask[None, :]
-
-    # max_logits = tl.load(
-    #     max_logits_ptr + exp_sums_offsets, mask=exp_sums_mask, other=float("-inf")
-    # )
-    # exp_sums = tl.load(
-    #     exp_sums_ptr + exp_sums_offsets, mask=exp_sums_mask, other=0.0
-    # )
-    # exp_sums *= tl.exp(max_logits - global_max[None, :])
-
-    attention_probs = exp_sums / global_exp_sum[None, :]
-    attention_probs = tl.reshape(
-        attention_probs, (MAX_CONTEXT_PARTITION_NUM, QUERY_GROUP_SIZE_POW2, 1), can_reorder=True
-    )
-
-    # Load partial logits for this chunk: [MAX_CONTEXT_PARTITION_NUM, QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2]
     logits_offsets = (
         sequence_idx * stride_logits_seq
         + kv_head_idx * stride_logits_head
@@ -2680,9 +2631,24 @@ def paged_attention_decode_ps_reduce_kernel(
 
     partial_logits = tl.load(
         logits_ptr + logits_offsets, mask=logits_mask[:, :, None], other=0.0
-    ).to(tl.float32)
+    )
+    # Update global maximum and rescale accumulated exp sums accordingly
+    global_max = tl.max(max_logits, axis=0)
+    # global_max = tl.maximum(global_max, chunk_max_logits)
+    exp_sums *= tl.exp(max_logits - global_max[None, :])
+    global_exp_sum = tl.sum(exp_sums, axis=0)
 
-    final_output += tl.sum(partial_logits * attention_probs, axis=0)
+    if USE_SINKS:
+        sink_token_values = tl.broadcast_to(sink_token_values[None, :], [QUERY_SEQ_LEN_POW2, ONE_QUERY_GROUP_SIZE_POW2])
+        sink_token_values = tl.reshape(sink_token_values, [QUERY_GROUP_SIZE_POW2])
+        global_exp_sum += tl.exp(sink_token_values.to(tl.float32) - global_max)
+
+    # ==================== SECOND PASS: COMPUTE RESCALED EXP SUMS AND ACCUMULATE ====================
+    attention_probs = exp_sums / global_exp_sum[None, :]
+    attention_probs = tl.reshape(
+        attention_probs, (MAX_CONTEXT_PARTITION_NUM, QUERY_GROUP_SIZE_POW2, 1)
+    )
+    final_output = tl.sum(partial_logits.to(tl.float32) * attention_probs, axis=0)
 
     # ==================== FINAL OUTPUT STORING ====================
     # 3D output path
@@ -3437,7 +3403,7 @@ def pa_decode_gluon(
     is_causal = query_length > 1
     # Calculate elements per 16B load based on data type
     kv_elements_per_16b = 16 // key_cache.dtype.itemsize
-
+    
     grid = (batch_size, num_kv_heads, max_context_partition_num)
 
     assert query_length <= 4, f"query_length == {query_length} exceeds maximum of 4"
@@ -3478,7 +3444,7 @@ def pa_decode_gluon(
     assert (
         len(key_cache.shape) == 5
     ), f"Expected 5D key_cache tensor, but got shape {key_cache.shape}"
-
+    
     one_shot = max_context_partition_num <= 1
     if exp_sums is None:
         exp_sums = torch.empty(
