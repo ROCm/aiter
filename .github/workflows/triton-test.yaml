@@ -204,7 +204,9 @@ jobs:
       - name: Download all test reports
         uses: actions/download-artifact@v4
         with:
-          name: triton-test-shard-*
+          pattern: triton-test-shard-*
+          merge-multiple: true
+          path: .
       
       - name: Check Triton Test Results
         run: |
