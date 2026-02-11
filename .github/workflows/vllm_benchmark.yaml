@@ -14,12 +14,13 @@ concurrency:
 env:
   VLLM_BRANCH: "main"
   VLLM_REPOSITORY_URL: "https://github.com/vllm-project/vllm"
-  BASE_IMAGE: rocm/vllm-dev:nightly
+  BASE_IMAGE: rocm/vllm-dev:nightly@sha256:3c611f72843f172d5aea9c05a4c956294184103778d3ef179ffff775287ab89d
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
 jobs:
   check-signal:
+    if: ${{ !github.event.pull_request.head.repo.fork }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -35,7 +36,7 @@ jobs:
     name: Build vLLM Image
     if: ${{ !github.event.pull_request.head.repo.fork }}
     needs: [check-signal]
-    runs-on: aiter-k8s-build
+    runs-on: build-only-aiter
 
     steps:
       - name: Checkout aiter repo
@@ -155,10 +156,3 @@ jobs:
           docker stop aiter-ci:${{ env.GITHUB_COMMIT_SHA }} || true
           docker rm -f aiter-ci:${{ env.GITHUB_COMMIT_SHA }} || true
           docker rmi rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }} || true
-
-  skip-job:
-    if: ${{ github.event.pull_request.head.repo.fork }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Skip reason
-        run: echo "It's a fork repository, skipping tests."

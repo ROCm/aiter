@@ -954,9 +954,13 @@ def cmdGenFunc_mha_batch_prefill(
     out: Optional[Tensor] = None,
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
-    q_descale: Optional[Tensor] = None,
-    k_descale: Optional[Tensor] = None,
-    v_descale: Optional[Tensor] = None,
+    # Per-tensor descale for PERTENSOR mode (Q/K/V each have one scale value)
+    q_descale: Optional[Tensor] = None,  # [1] per-tensor Q descale
+    k_descale: Optional[Tensor] = None,  # [1] per-tensor K descale
+    v_descale: Optional[Tensor] = None,  # [1] per-tensor V descale
+    # Per-page descale for KV_BLOCKSCALE mode (Q per-tensor, K/V per-page)
+    # Mutually exclusive with k_descale/v_descale
+    kv_block_descale: Optional[Tensor] = None,  # [num_block, num_kv_head, 2]
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
     kv_last_page_lens: Optional[Tensor] = None,
@@ -1011,11 +1015,15 @@ def cmdGenFunc_mha_batch_prefill(
     else:
         md_name += "_dropout"
         filter_fwd += "_dropout*"
-    if q_descale is None or k_descale is None or v_descale is None:
+    if kv_block_descale is not None:
+        # KV_BLOCKSCALE: Q per-tensor, K/V per-page
+        md_name += "_kv_blockscale"
+        filter_fwd += "_kv_blockscale*"
+    elif q_descale is None or k_descale is None or v_descale is None:
         md_name += "_nqscale"
         filter_fwd += "_nqscale*"
     else:
-        # only support per-tensor quantization for now
+        # PERTENSOR: per-tensor quantization
         md_name += "_pertensor"
         filter_fwd += "_pertensor*"
     blob_gen_cmd = [
@@ -2618,9 +2626,12 @@ def mha_batch_prefill_fake_tensors(
     out: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
+    # Per-tensor descale for PERTENSOR mode
+    q_descale: Optional[torch.Tensor] = None,  # [1] per-tensor Q descale
+    k_descale: Optional[torch.Tensor] = None,  # [1] per-tensor K descale
+    v_descale: Optional[torch.Tensor] = None,  # [1] per-tensor V descale
+    # Per-page descale for KV_BLOCKSCALE mode (mutually exclusive with k_descale/v_descale)
+    kv_block_descale: Optional[torch.Tensor] = None,  # [num_block, num_kv_head, 2]
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
     kv_last_page_lens: Optional[torch.Tensor] = None,
@@ -2699,9 +2710,12 @@ def mha_batch_prefill(
     out: Optional[Tensor] = None,
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
+    # Per-tensor descale for PERTENSOR mode
+    q_descale: Optional[torch.Tensor] = None,  # [1] per-tensor Q descale
+    k_descale: Optional[torch.Tensor] = None,  # [1] per-tensor K descale
+    v_descale: Optional[torch.Tensor] = None,  # [1] per-tensor V descale
+    # Per-page descale for KV_BLOCKSCALE mode (mutually exclusive with k_descale/v_descale)
+    kv_block_descale: Optional[torch.Tensor] = None,  # [num_block, num_kv_head, 2]
     kv_last_page_lens: Optional[Tensor] = None,
     block_table: Optional[Tensor] = None,
     seqlen_k: Optional[Tensor] = None,
@@ -2737,6 +2751,9 @@ def _mha_batch_prefill(
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
+    kv_block_descale: Optional[
+        torch.Tensor
+    ] = None,  # [num_block, num_kv_head, 2] per-page K/V descales
     sink_ptr: Optional[Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
@@ -2765,6 +2782,7 @@ def _mha_batch_prefill(
         q_descale,
         k_descale,
         v_descale,
+        kv_block_descale,
         kv_last_page_lens,
         block_table,
         seqlen_k,
@@ -2800,6 +2818,7 @@ def mha_batch_prefill_func(
     q_descale=None,
     k_descale=None,
     v_descale=None,
+    kv_block_descale=None,  # [num_block, num_kv_head, 2] per-page K/V descales
     sink_ptr=None,
 ):
     if softmax_scale is None:
@@ -2863,6 +2882,7 @@ def mha_batch_prefill_func(
         q_descale=q_descale,
         k_descale=k_descale,
         v_descale=v_descale,
+        kv_block_descale=kv_block_descale,
         sink_ptr=sink_ptr,
     )
     out = out_padded[..., :head_size_v_og]

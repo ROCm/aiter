@@ -62,6 +62,22 @@ def fused_allreduce_rmsnorm(
     w: torch.Tensor,
     eps: float,
     reg_buffer: Optional[torch.Tensor] = None,
+    use_1stage: bool = False,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce")
+def fused_allreduce_rmsnorm_quant(
+    _fa: int,
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    res_out: torch.Tensor,
+    out: torch.Tensor,
+    scale_out: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    reg_buffer: Optional[torch.Tensor] = None,
+    use_1stage: bool = False,
 ) -> None: ...
 
 

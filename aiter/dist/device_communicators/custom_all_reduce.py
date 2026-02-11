@@ -27,6 +27,7 @@ from torch.distributed import ProcessGroup
 import aiter as ops
 from aiter.dist.parallel_state import in_the_same_node_as
 from aiter import logger
+from aiter.utility.dtypes import fp8
 
 try:
     ops.meta_size()
@@ -53,7 +54,7 @@ class CustomAllreduce:
         self,
         group: ProcessGroup,
         device: Union[int, str, torch.device],
-        max_size=8192 * 1024 * 8,
+        max_size=8192 * 1024 * 8 * 2, # In allreduce 2stage writemode, use 2x tmp buffer
     ) -> None:
         """
         Args:
@@ -266,8 +267,9 @@ class CustomAllreduce:
             return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
+        # In allreduce 2stage writemode, use 2x tmp buffer
         if self.world_size == 2 or self.fully_connected:
-            return inp_size <= self.max_size
+            return inp_size <= (self.max_size / 2)
         return False
 
     def all_reduce(
@@ -390,25 +392,48 @@ class CustomAllreduce:
         *,
         res_out: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
+        scale_out: Optional[torch.Tensor] = None,
         w: torch.Tensor,
         eps: float,
         registered: bool = False,
+        use_1stage: bool = False,
+        post_per_token_quant: bool = False,
     ):
-        if out is None:
-            out = torch.empty_like(inp)
         if res_out is None:
             res_out = torch.empty_like(inp)
-        ops.fused_allreduce_rmsnorm(
-            self._ptr,
-            inp,
-            res_inp,
-            res_out,
-            out,
-            w,
-            eps,
-            None if registered else self.input_buffer,
-        )
-        return out, res_out
+        if not post_per_token_quant:
+            if out is None:
+                out = torch.empty_like(inp)
+            ops.fused_allreduce_rmsnorm(
+                self._ptr,
+                inp,
+                res_inp,
+                res_out,
+                out,
+                w,
+                eps,
+                None if registered else self.input_buffer,
+                use_1stage,
+            )
+            return out, res_out
+        else:
+            if out is None:
+                out = torch.empty(inp.shape, dtype=fp8, device=inp.device)
+            if scale_out is None:
+                scale_out = torch.empty(inp.shape[:-1] + (1,), dtype=torch.float32, device=inp.device)
+            ops.fused_allreduce_rmsnorm_quant(
+                self._ptr,
+                inp,
+                res_inp,
+                res_out,
+                out,
+                scale_out,
+                w,
+                eps,
+                None if registered else self.input_buffer,
+                use_1stage,
+            )
+            return out, res_out, scale_out
 
     def custom_fused_ar_rms(
         self,
@@ -416,6 +441,7 @@ class CustomAllreduce:
         residual_inp: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
+        use_1stage: bool,
     ) -> Optional[torch.Tensor]:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
@@ -423,13 +449,38 @@ class CustomAllreduce:
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
                 return self.fused_ar_rms(
-                    input, residual_inp, w=weight, eps=eps, registered=True
+                    input, residual_inp, w=weight, eps=eps, registered=True, use_1stage=use_1stage,
                 )
             else:
                 return torch.zeros_like(input), torch.zeros_like(input)
         else:
             return self.fused_ar_rms(
-                input, residual_inp, w=weight, eps=eps, registered=False
+                input, residual_inp, w=weight, eps=eps, registered=False, use_1stage=use_1stage,
+            )
+    
+    def custom_fused_ar_rms_quant(
+        self,
+        input: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        use_1stage: bool,
+    ):
+        # when custom allreduce is disabled, this will be None
+        if self.disabled or not self.should_custom_ar(input):
+            return None
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.fused_ar_rms(
+                    input, residual_inp, w=weight, eps=eps, registered=True, use_1stage=use_1stage, post_per_token_quant=True,
+                )
+            else:
+                dummy_out = torch.zeros(input.shape, dtype=fp8, device=input.device)
+                dummy_scale_out = torch.zeros(input.shape[:-1] + (1,), dtype=torch.float32, device=input.device)
+                return dummy_out, torch.zeros_like(input), dummy_scale_out
+        else:
+            return self.fused_ar_rms(
+                input, residual_inp, w=weight, eps=eps, registered=False, use_1stage=use_1stage, post_per_token_quant=True,
             )
 
     def close(self):

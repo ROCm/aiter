@@ -424,7 +424,20 @@ namespace py = pybind11;
           py::arg("out"),                                                                      \
           py::arg("w"),                                                                        \
           py::arg("eps"),                                                                      \
-          py::arg("reg_buffer") = std::nullopt);                                               \
+          py::arg("reg_buffer") = std::nullopt,                                                \
+          py::arg("use_1stage") = false);                                                      \
+    m.def("fused_allreduce_rmsnorm_quant",                                                     \
+          &aiter::fused_allreduce_rmsnorm_quant,                                               \
+          py::arg("_fa"),                                                                      \
+          py::arg("inp"),                                                                      \
+          py::arg("res_inp"),                                                                  \
+          py::arg("res_out"),                                                                  \
+          py::arg("out"),                                                                      \
+          py::arg("scale_out"),                                                                \
+          py::arg("w"),                                                                        \
+          py::arg("eps"),                                                                      \
+          py::arg("reg_buffer") = std::nullopt,                                                \
+          py::arg("use_1stage") = false);                                                      \
     m.def("all_reduce_asm_", &all_reduce_asm, "");                                             \
     m.def("all_reduce_rmsnorm_", &all_reduce_rmsnorm, "all_reduce_rmsnorm");                   \
     m.def("all_reduce_rmsnorm_quant_", &all_reduce_rmsnorm_quant, "all_reduce_rmsnorm_quant"); \
@@ -977,7 +990,8 @@ namespace py = pybind11;
           py::arg("activation")        = 0,            \
           py::arg("splitk")            = 1,            \
           py::arg("non_temporal_load") = false,        \
-          py::arg("dst_type")          = std::nullopt);         \
+          py::arg("dst_type")          = std::nullopt, \
+          py::arg("is_shuffled")    = true);           \
                                                        \
     m.def("ck_moe_stage2",                             \
           &ck_moe_stage2,                              \
@@ -998,7 +1012,8 @@ namespace py = pybind11;
           py::arg("activation")        = 0,            \
           py::arg("splitk")            = 1,            \
           py::arg("non_temporal_load") = false,        \
-          py::arg("dst_type")          = std::nullopt);
+          py::arg("dst_type")          = std::nullopt, \
+          py::arg("is_shuffled")    = true);
 
 #define MOE_CKTILE_2STAGES_PYBIND                   \
     m.def("cktile_moe_gemm1",                       \
@@ -1100,6 +1115,7 @@ namespace py = pybind11;
           py::arg("q_descale")         = std::nullopt, \
           py::arg("k_descale")         = std::nullopt, \
           py::arg("v_descale")         = std::nullopt, \
+          py::arg("kv_block_descale")  = std::nullopt, \
           py::arg("kv_last_page_lens") = std::nullopt, \
           py::arg("block_table")       = std::nullopt, \
           py::arg("seqlen_k")          = std::nullopt, \
@@ -1516,12 +1532,13 @@ namespace py = pybind11;
     m.def("rope_cached_positions_offsets_fwd_impl", &rope_cached_positions_offsets_fwd_impl); \
     m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl);
 
-#define FUSED_MROPE_RMS_PYBIND                        \
-    m.def("fused_mrope_3d_rms", &fused_mrope_3d_rms); \
-    m.def("fused_rope_rms", &fused_rope_rms);
+#define FUSED_QKNORM_MROPE_CACHE_QUANT_PYBIND \
+    m.def("fused_qk_norm_mrope_3d_cache_pts_quant_shuffle", &fused_qk_norm_mrope_3d_cache_pts_quant_shuffle);
 
-#define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND \
-    m.def("fused_qk_norm_rope_cache_quant_shuffle", &aiter::fused_qk_norm_rope_cache_quant_shuffle);
+#define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                                                                 \
+    m.def("fused_qk_norm_rope_cache_quant_shuffle", &aiter::fused_qk_norm_rope_cache_quant_shuffle);         \
+    m.def("fused_qk_norm_rope_cache_pts_quant_shuffle", &aiter::fused_qk_norm_rope_cache_pts_quant_shuffle); \
+    m.def("fused_qk_norm_rope_2way", &aiter::fused_qk_norm_rope_2way);
 
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \

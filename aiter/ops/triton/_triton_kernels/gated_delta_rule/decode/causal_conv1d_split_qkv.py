@@ -341,7 +341,7 @@ def _causal_conv1d_update_split_qkv_kernel_v2(
     per_cu_batchs = batch // batch_cus
     cu_mores = batch % batch_cus
 
-    # 原理：负数的最高位为1，右移后为-1；正数右移后为0 → 取反+1后映射为1/0
+    # ??:???????1,????-1;??????0 -> ??+1????1/0
     # x = x - thresh
     # t = (x >> (x.bit_length() - 1)) ^ 1
     # r = val0 + (val1 - val0) * t
@@ -1009,7 +1009,7 @@ def causal_conv1d_update_split_qkv(
     _, width = weight.shape
     num_cache_lines, _, state_len = conv_state.size()
 
-    # 创建输出 buffer（已经是分离的！）
+    # ???? buffer(??????!)
     query = torch.empty(
         (batch, key_dim, seqlen),
         dtype=x.dtype,
