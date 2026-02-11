@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 /**
- * @file test_opus_mfma.cu
+ * @file test_mfma.cu
  * @brief OPUS MFMA kernel and host launch (no main).
  * Uses matrix_core_kernel_block_v2 style from
  * https://github.com/carlushuang/gcnasm/blob/master/matrix_core_opus/matrix_core.cc
@@ -14,7 +14,7 @@
 #include <hip/hip_runtime.h>
 #include <cstdio>
 #include "opus/opus.hpp"
-#include "test_opus_mfma.h"
+#include "test_mfma.h"
 
 #define HIP_CALL(call) do { \
     hipError_t err = (call); \

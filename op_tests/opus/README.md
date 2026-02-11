@@ -1,56 +1,159 @@
-# OPUS C++ Tests
+# OPUS Tests
 
-C++ tests for **OPUS** (AI Operator Micro Std) in this repo: a host-only test and a GPU MFMA test exposed as a **PyTorch extension** and run from Python.
+Unit tests for **OPUS** (AI Operator Micro Std). Contains a host-only C++ test and GPU device-kernel tests exposed as a single **PyTorch extension** (`opus_device_test`) and run from Python.
 
-## Test structure
+OPUS headers live under `csrc/include/opus/`; all kernel code uses `#include "opus/opus.hpp"`.
 
-| Location | Component | Description |
-|----------|-----------|-------------|
-| (root) | `test_opus_basic.cpp` | **Host test** (standalone). Built by `build.sh` into `test_opus_basic`. Covers numbers/sequences, arrays, tuples, `static_for`, type traits, layouts. No GPU. |
-| **`mfma/`** | `test_opus_mfma.cpp` | **Kernel-only** HIP code: 32×32×8 fp16 MFMA using OPUS `make_mfma`, `make_gmem`, `partition_layout_*`. No `main()`; used only by the extension. |
-| **`mfma/`** | `test_opus_mfma.h` | Declares `run_mfma_32x32x8_f16()` (C linkage) for the extension. |
-| **`mfma/`** | `opus_mfma_ext.cpp` | PyTorch C++ extension (pybind11): wraps `run_mfma_32x32x8_f16` and exposes `run_mfma_32x32x8_f16(A, B, C)` for `torch.float16` CUDA tensors (A 32×8, B 32×8, C 32×32). |
-| **`mfma/`** | `test_opus_mfma.py` | Builds the extension via `torch.utils.cpp_extension.load` (JIT), runs with random A/B, compares result to `torch` GEMM (A @ B.T). |
+## Folder structure
 
-OPUS headers live under repo `csrc/include/`; the MFMA code uses `#include "opus/opus.hpp"` with include path set from `mfma/` to `../../../csrc/include`.
+```
+op_tests/opus/
+├── test_opus_basic.cpp          # Host-only C++ test (no GPU)
+├── build.sh                     # Builds test_opus_basic
+├── device/                      # GPU kernel tests (single PyTorch extension)
+│   ├── test_mfma.cu             # MFMA 32x32x8 fp16 kernel (gfx942 only)
+│   ├── test_mfma.h              # C API header for MFMA
+│   ├── test_vector_add.cu       # Vector addition kernel using OPUS gmem
+│   ├── test_vector_add.h        # C API header for vector_add
+│   ├── opus_device_test_ext.cpp # Pybind module: binds all device kernels
+│   ├── setup.py                 # Builds the opus_device_test extension
+│   └── test_opus_device.py      # Python test: runs all device kernel tests
+├── run_tests.sh                 # Runs host test + device tests
+├── run_tests_in_docker.sh       # Runs run_tests.sh inside a ROCm Docker container
+└── README.md
+```
 
 ## Building and running
 
-- **C++ host test only**
-  ```bash
-  ./build.sh          # compile test_opus_basic
-  ./build.sh --test   # compile and run test_opus_basic
-  ./build.sh --clean  # remove test_opus_basic
-  ```
-
-- **MFMA test (PyTorch extension, needs PyTorch + ROCm/CUDA)** — run from `op_tests/opus`:
-  ```bash
-  python3 mfma/test_opus_mfma.py   # JIT-builds extension, runs test vs torch GEMM
-  ```
-
-`build.sh` uses `hipcc` (or `HIPCC`). The Python test uses `torch.utils.cpp_extension.load()` and needs PyTorch built for the same backend (ROCm or CUDA).
-
-## Running all tests
-
-From `op_tests/opus` you can run the full suite with:
+### Host-only test
 
 ```bash
-./run_tests.sh
+./build.sh          # compile test_opus_basic
+./build.sh --test   # compile and run
+./build.sh --clean  # remove binary
 ```
 
-This runs the C++ host test (`./build.sh --test`) then the MFMA PyTorch test (`mfma/test_opus_mfma.py`). Requires `hipcc` and (for the MFMA test) PyTorch + ROCm/CUDA.
+### Device kernel tests (requires PyTorch + ROCm)
 
-## Running in Docker
+```bash
+python3 device/test_opus_device.py
+```
 
-To run the same suite inside a ROCm container:
+This builds the `opus_device_test` PyTorch extension (via `setup.py`) and runs all device tests.
+
+### Full suite
+
+```bash
+./run_tests.sh              # host test + device tests
+./run_tests_in_docker.sh    # same, inside a ROCm Docker container
+```
+
+## How to add a new device test
+
+All GPU kernel tests live in `device/` and are compiled into a single PyTorch extension (`opus_device_test`). To add a new kernel test (e.g. `my_kernel`):
+
+### 1. Create the kernel source
+
+Add two files in `device/`:
+
+- **`test_my_kernel.cu`** -- HIP kernel + host launcher function. Use `extern "C"` for the launcher so it can be called from the pybind module.
+
+```cpp
+// device/test_my_kernel.cu
+#include <hip/hip_runtime.h>
+#include "opus/opus.hpp"
+#include "test_my_kernel.h"
+
+__global__ void my_kernel(...) {
+    // Use OPUS APIs: make_gmem, make_tiled_mma, partition_layout_*, etc.
+}
+
+extern "C" void run_my_kernel(const void* d_in, void* d_out, int n) {
+    // Launch kernel, check errors, synchronize
+}
+```
+
+- **`test_my_kernel.h`** -- C-linkage header declaring the launcher.
+
+```cpp
+// device/test_my_kernel.h
+#ifndef OP_TESTS_OPUS_DEVICE_TEST_MY_KERNEL_H
+#define OP_TESTS_OPUS_DEVICE_TEST_MY_KERNEL_H
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void run_my_kernel(const void* d_in, void* d_out, int n);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+### 2. Add the pybind wrapper
+
+In `device/opus_device_test_ext.cpp`:
+
+1. Include the new header:
+   ```cpp
+   #include "test_my_kernel.h"
+   ```
+
+2. Add a torch wrapper function that validates tensor properties and calls the C launcher:
+   ```cpp
+   static void run_my_kernel_torch(torch::Tensor In, torch::Tensor Out) {
+       TORCH_CHECK(In.is_cuda(), "In must be a CUDA tensor");
+       // ... more checks ...
+       run_my_kernel(In.data_ptr(), Out.data_ptr(), static_cast<int>(In.numel()));
+   }
+   ```
+
+3. Register it in the `PYBIND11_MODULE` block:
+   ```cpp
+   m.def("run_my_kernel", &run_my_kernel_torch, "Description of my_kernel");
+   ```
+
+### 3. Register the source in setup.py
+
+Add `test_my_kernel.cu` to the `sources` list in `device/setup.py`:
+
+```python
+sources=[
+    os.path.join(_THIS_DIR, "test_mfma.cu"),
+    os.path.join(_THIS_DIR, "test_vector_add.cu"),
+    os.path.join(_THIS_DIR, "test_my_kernel.cu"),      # <-- add this
+    os.path.join(_THIS_DIR, "opus_device_test_ext.cpp"),
+],
+```
+
+### 4. Add the Python test
+
+In `device/test_opus_device.py`, add a test function and call it from `main()`:
+
+```python
+def test_my_kernel(mod):
+    """Test my_kernel."""
+    # Create input tensors
+    # Call mod.run_my_kernel(...)
+    # Compare with reference
+    # Return 0 on success, 1 on failure
+
+def main():
+    # ... existing code ...
+    failures += test_my_kernel(mod)
+```
+
+### 5. Verify
 
 ```bash
 ./run_tests_in_docker.sh
 ```
 
-This starts the container, `cd`s to `op_tests/opus`, and runs `./run_tests.sh` inside it. The image must have PyTorch and ROCm (e.g. `rocm/atom`).
+All tests (including the new one) will build and run inside the Docker container.
 
-## Summary
+## Notes
 
-- **Host:** `test_opus_basic` — OPUS core types and layout (standalone executable).
-- **Device (all under `mfma/`):** MFMA kernel in `test_opus_mfma.cpp` → PyTorch extension in `opus_mfma_ext.cpp` → tested by `test_opus_mfma.py` (random A/B, compare to torch).
+- The extension compiles with `--offload-arch=native` (see `device/setup.py`) to target only the current GPU and speed up builds.
+- MFMA tests require `gfx942` (MI300); they are automatically skipped on other architectures.
+- `test_opus_device.py` does a fresh build on every run (cleans previous `.so` and `build/` dir) to ensure changes are picked up.

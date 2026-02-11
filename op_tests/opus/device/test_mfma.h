@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-#ifndef OP_TESTS_OPUS_TEST_OPUS_MFMA_H
-#define OP_TESTS_OPUS_TEST_OPUS_MFMA_H
+#ifndef OP_TESTS_OPUS_DEVICE_TEST_MFMA_H
+#define OP_TESTS_OPUS_DEVICE_TEST_MFMA_H
 
 #ifdef __cplusplus
 extern "C" {

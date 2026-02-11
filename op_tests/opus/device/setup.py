@@ -6,7 +6,6 @@ from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-# Repo csrc/include: mfma -> opus -> op_tests -> repo root -> csrc/include
 _REPO_CSRC = os.path.normpath(
     os.path.join(_THIS_DIR, "..", "..", "..", "csrc", "include")
 )
@@ -14,13 +13,14 @@ _REPO_CSRC = os.path.normpath(
 __ARCH__ = "native"
 
 setup(
-    name="opus_mfma",
+    name="opus_device_test",
     ext_modules=[
         CUDAExtension(
-            name="opus_mfma",
+            name="opus_device_test",
             sources=[
-                os.path.join(_THIS_DIR, "test_opus_mfma.cu"),
-                os.path.join(_THIS_DIR, "opus_mfma_ext.cpp"),
+                os.path.join(_THIS_DIR, "test_mfma.cu"),
+                os.path.join(_THIS_DIR, "test_vector_add.cu"),
+                os.path.join(_THIS_DIR, "opus_device_test_ext.cpp"),
             ],
             include_dirs=[_REPO_CSRC, _THIS_DIR],
             extra_compile_args={
