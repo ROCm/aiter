@@ -576,16 +576,16 @@ def gemm_a8w8_blockscale(
             if libtype == "ck":
                 return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
             elif libtype == "cktile":
-                x_scale_input = x_scale
-                m_warp, n_warp, k_warp = map(
-                    int, config["kernelName"].split("_")[4].split("x")
-                )
-                if m_warp * n_warp * k_warp == 8:
-                    x_scale_input = (
-                        x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
-                    )
+                # x_scale_input = x_scale
+                # m_warp, n_warp, k_warp = map(
+                #     int, config["kernelName"].split("_")[4].split("x")
+                # )
+                # if m_warp * n_warp * k_warp == 8:
+                #     x_scale_input = (
+                #         x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
+                #     )
                 return gemm_a8w8_blockscale_cktile(
-                    XQ, WQ, x_scale_input, w_scale, Y, False, False
+                    XQ, WQ, x_scale, w_scale, Y, False, False
                 )
             else:
                 assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
@@ -626,6 +626,8 @@ def gemm_a8w8_blockscale_bpreshuffle(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
+    preshuffleB: bool = False,
+    preshuffleQuantB: bool = False,
 ) -> Tensor:
     assert dtype in [
         dtypes.bf16,
@@ -641,19 +643,19 @@ def gemm_a8w8_blockscale_bpreshuffle(
     if config is not None:
         libtype = config["libtype"]
         if libtype == "ck":
-            x_scale_input = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
+            #x_scale_input = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
             return gemm_a8w8_blockscale_bpreshuffle_ck(
-                XQ, WQ, x_scale_input, w_scale, Y
+                XQ, WQ, x_scale, w_scale, Y
             )
         elif libtype == "cktile":
-            m_warp, n_warp, k_warp = map(
-                int, config["kernelName"].split("_")[4].split("x")
-            )
-            if m_warp * n_warp * k_warp == 8:
-                x_scale_input = (
-                    x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
-                )
-            return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale_input, w_scale, Y, True, False)
+            # m_warp, n_warp, k_warp = map(
+            #     int, config["kernelName"].split("_")[4].split("x")
+            # )
+            # if m_warp * n_warp * k_warp == 8:
+            #     x_scale_input = (
+            #         x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
+            #     )
+            return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y, preshuffleB , preshuffleQuantB)
         else:
             assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
     return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)

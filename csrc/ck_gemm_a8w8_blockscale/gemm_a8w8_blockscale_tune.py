@@ -124,8 +124,8 @@ def generate_data(m, n, k, seed, device="cuda"):
     out = torch.empty(m, n, dtype=dtypes.bf16, device=device)
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
     return (x, weight, x_scale, w_scale, out, weight_shuffle, x_scale_t, w_scale_shuffle, w_scale_T)
-
-
+            #0,  1,    2,        3,        4,        5,        6,        7,        8
+# x, weight, x_scale, w_scale, out, kernel_id, splitK, preshuffleB, preshuffleQuantB
 class GemmA8W8BlockScaleTuner(GemmCommonTuner):
     ARG_DEFAULTS = {
         **GemmCommonTuner.ARG_DEFAULTS,
@@ -240,12 +240,13 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                             [
                                 0,
                                 5 if preshuffleB else 1,
-                                (
-                                    6
-                                    if (kernel.M_Warp * kernel.N_Warp * kernel.K_Warp)
-                                    == 8
-                                    else 2
-                                ),
+                                6 if preshuffleB else 2,
+                                # (
+                                #     6
+                                #     if (kernel.M_Warp * kernel.N_Warp * kernel.K_Warp)
+                                #     == 8
+                                #     else 2
+                                # ),
                                 7 if preshuffleQuantB else 3,
                                 4,
                             ],
@@ -371,14 +372,26 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 for preshuffleB in [True, False]:
                     task.extend(
                         self.get_gemm_a8w8_blockscale_cktile_tune_task(
-                            info_keys, useSplitK, seed, preshuffleB, preshuffleQuantB
+                            info_keys, useSplitK, seed, preshuffleB, preshuffleQuantB=False
                         )
                     )
                     task.extend(
                         self.get_gemm_a8w8_blockscale_tune_task(
-                            info_keys, useSplitK, seed, preshuffleB, preshuffleQuantB
+                            info_keys, useSplitK, seed, preshuffleB, preshuffleQuantB=False
                         )
                     )
+                for preshuffleQuantB in [True, False]:
+                    task.extend(
+                        self.get_gemm_a8w8_blockscale_cktile_tune_task(
+                            info_keys, useSplitK, seed, preshuffleB=False, preshuffleQuantB
+                        )
+                    )
+                    task.extend(
+                        self.get_gemm_a8w8_blockscale_tune_task(
+                            info_keys, useSplitK, seed, preshuffleB=False, preshuffleQuantB
+                        )
+                    )
+
             total_kernel_nums = len(task)
 
             tasks_data.append((total_kernel_nums, ()))

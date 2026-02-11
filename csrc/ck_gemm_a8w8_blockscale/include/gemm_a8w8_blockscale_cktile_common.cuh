@@ -236,9 +236,10 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
             throw std::runtime_error("Wrong! Arguments not supported! Skipping gemm!\n");
         }
 
+        using k_attr_t = ck_tile::kernel_attr<eight_warps>;
         ck_tile::launch_kernel(
             ck_tile::stream_config{nullptr /*stream_id*/, false /*time_kernel*/, 1 /*log_level*/},
-            ck_tile::make_kernel<GemmConfig::BlockPerCu_v>(Kernel{}, grids, blocks, 0, kargs));
+            ck_tile::make_kernel<GemmConfig::BlockPerCu_v, k_attr_t>(Kernel{}, grids, blocks, 0, kargs));
     };
 
     BaseGemmPipeline::TailHandler(Run, has_hot_loop, tail_num);
@@ -286,10 +287,30 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     const int N = WQ.size(0);
     const int K = XQ.size(1);
 
+    const bool eight_warps =
+        BQuantGroupSize::kN == 128 &&
+        (GemmInstance::M_Warp_v * GemmInstance::N_Warp_v * GemmInstance::K_Warp_v == 8) &&
+        GemmInstance::K_Warp_Tile_v == 128;
+
     // prepare args
     ck_tile::QuantGemmHostArgs args;
     args.a_ptr  = XQ.data_ptr();
-    args.aq_ptr = x_scale.data_ptr();
+    if(eight_warps && !PreshuffleB)
+    {
+        torch::Tensor x_scale_t = x_scale.transpose(0, 1).contiguous().view(x_scale.sizes());
+        args.aq_ptr             = x_scale_t.data_ptr();
+    }
+    else if(!eight_warps && PreshuffleB)
+    {
+        torch::Tensor x_scale_t =
+            x_scale.view({x_scale.size(1), x_scale.size(0)}).transpose(0, 1).contiguous();
+        args.aq_ptr = x_scale_t.data_ptr();
+    }
+    else
+    {
+        args.aq_ptr = x_scale.data_ptr();
+    }
+    //args.aq_ptr = x_scale.data_ptr();
     args.b_ptr  = WQ.data_ptr();
     args.bq_ptr = w_scale.data_ptr();
     args.c_ptr  = Y.data_ptr();
@@ -308,7 +329,7 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     const int stride_B = K;
     const int stride_C = N;
     // const int stride_AQ = AQK;
-    const int stride_AQ = (GemmInstance::M_Warp_v * GemmInstance::N_Warp_v * GemmInstance::K_Warp_v == 8)
+    const int stride_AQ = eight_warps
                               ? M    // Col-Major
                               : AQK; // Row-Major
     const int stride_BQ = BQK;
