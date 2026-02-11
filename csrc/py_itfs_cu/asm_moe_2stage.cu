@@ -62,6 +62,31 @@ struct __attribute__((packed)) KernelArgs
     p3 _p23;
     unsigned int ps_deno;
     p3 _p24;
+    void *ptr_Qscl;
+    p2 _p25;
+    void *ptr_Qzero;
+    p2 _p26;
+    unsigned int eLQQs;
+    p3 _p27;
+    void log()
+    {
+        printf("[KARG] dim = %d\n", dim);
+        printf("[KARG] hidden_dim = %d\n", hidden_dim);
+        printf("[KARG] token_cnt = %d\n", token_cnt);
+        printf("[KARG] eprt_cnt = %d\n", eprt_cnt);
+        printf("[KARG] Xs = %d\n", Xs);
+        printf("[KARG] GUs = %d\n", GUs);
+        printf("[KARG] Os = %d\n", Os);
+        printf("[KARG] eGUs = %d\n", eGUs);
+        printf("[KARG] eGUQs = %d\n", eGUQs);
+        printf("[KARG] eSMQs = %d\n", eSMQs);
+        printf("[KARG] topk = %d\n", topk);
+        printf("[KARG] splitk = %d\n", splitk);
+        printf("[KARG] activation = %d\n", activation);
+        printf("[KARG] total_tgs = %d\n", total_tgs);
+        printf("[KARG] ps_deno = %d\n", ps_deno);
+        printf("[KARG] eLQQs = %d\n", eLQQs);
+    }
 };
 struct __attribute__((packed)) Kernel2Args
 {
@@ -283,7 +308,6 @@ void moe_stage1_g1u1(
         kernelName = get_heuristic_kernel(sub_X_cnt, inter_dim, block_m, config_map, arch_id);
     }
     printf("[FEIFEI] kernelName = %s\n", kernelName.c_str());
-    return;
 
     AiterAsmKernel* impl_ptr = nullptr;
     auto it                  = config_map->find(kernelName);
@@ -358,6 +382,8 @@ void moe_stage1_g1u1(
     args.activation = static_cast<int>(activation);
     args.ptr_SW     = sorted_weights.has_value() ? sorted_weights.value().data_ptr() : nullptr;
 
+    printf("argsize: %zu\n", arg_size);
+    args.log();
     uint32_t k_num = 1 << ksplit;
     TORCH_CHECK(model_dim % k_num == 0,
                 __func__,
@@ -403,6 +429,7 @@ void moe_stage1_g1u1(
     // std::cout << " args.ptr_SW      = " << args.ptr_SW << std::endl;
     // printf("gdx:%d, gdy:%d, gdz:%d, tgs:%d\n", gdx, gdy, gdz, sub_X_cnt * gdx * gdz);
 
+    return;
     impl_ptr->launch_kernel({&args,
                              &arg_size,
                              gdx, // gdx
