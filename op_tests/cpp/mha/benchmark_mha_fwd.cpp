@@ -469,24 +469,9 @@ bool run(const ck_tile::ArgParser& arg_parser)
     float k_dtype_max = ck_tile::type_convert<float>(ck_tile::numeric<KDataType>::max());
     float v_dtype_max = ck_tile::type_convert<float>(ck_tile::numeric<VDataType>::max());
 
-    ck_tile::HostTensor<float> q_descale_host(
-        qscale.type != quant_scale_enum::no_scale ? std::array<ck_tile::index_t, 1>{1}
-                                                   : std::array<ck_tile::index_t, 1>{0});
-    ck_tile::HostTensor<float> k_descale_host(
-        qscale.type != quant_scale_enum::no_scale ? std::array<ck_tile::index_t, 1>{1}
-                                                   : std::array<ck_tile::index_t, 1>{0});
-    ck_tile::HostTensor<float> v_descale_host(
-        qscale.type != quant_scale_enum::no_scale ? std::array<ck_tile::index_t, 1>{1}
-                                                   : std::array<ck_tile::index_t, 1>{0});
-
-    if(qscale.type == quant_scale_enum::pertensor)
-    {
-        // Use fixed qkv_max = 3.f for per-tensor quantization
-        float qkv_max     = 3.f;
-        q_descale_host(0) = qkv_max / q_dtype_max;
-        k_descale_host(0) = qkv_max / k_dtype_max;
-        v_descale_host(0) = qkv_max / v_dtype_max;
-    }
+    // Block scale sizes for blockscale quantization
+    const ck_tile::index_t block_scale_size_q_ = 128;
+    const ck_tile::index_t block_scale_size_kv_ = 128;
 
     // accumulation numbers for performance evaluation
     std::size_t flop = 0, num_byte = 0;
@@ -636,6 +621,30 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                                           ? std::array<ck_tile::index_t, 1>{batch}
                                                           : std::array<ck_tile::index_t, 1>{1});
 
+    // Calculate number of blocks for blockscale quantization
+    const ck_tile::index_t num_block_scale_q =
+        (mode == mode_enum::batch)
+            ? ck_tile::integer_divide_ceil(shape_seqlen_q, block_scale_size_q_)
+            : 0; // group mode not implemented in this benchmark
+    const ck_tile::index_t num_block_scale_kv =
+        (mode == mode_enum::batch)
+            ? ck_tile::integer_divide_ceil(shape_seqlen_k, block_scale_size_kv_)
+            : 0; // group mode not implemented in this benchmark
+
+    // Create descale tensors based on qscale type
+    ck_tile::HostTensor<float> q_descale_host(
+        qscale.type == quant_scale_enum::blockscale
+            ? std::array<ck_tile::index_t, 3>{shape_batch, nhead, num_block_scale_q}
+            : std::array<ck_tile::index_t, 3>{1, 1, 1});
+    ck_tile::HostTensor<float> k_descale_host(
+        qscale.type == quant_scale_enum::blockscale
+            ? std::array<ck_tile::index_t, 3>{shape_batch, nhead_k, num_block_scale_kv}
+            : std::array<ck_tile::index_t, 3>{1, 1, 1});
+    ck_tile::HostTensor<float> v_descale_host(
+        qscale.type == quant_scale_enum::blockscale
+            ? std::array<ck_tile::index_t, 3>{shape_batch, nhead_k, num_block_scale_kv}
+            : std::array<ck_tile::index_t, 3>{1, 1, 1});
+
     if(init_method == "ui" || init_method == "0")
     {
         ck_tile::FillUniformDistributionIntegerValue<QDataType>{-3.f, 3.f, next_seed()}(q_host);
@@ -721,6 +730,32 @@ bool run(const ck_tile::ArgParser& arg_parser)
     }
     iota_shuffle(block_table_host.begin(), block_table_host.end(), 0, random_engine);
     iota_shuffle(cache_batch_idx_host.begin(), cache_batch_idx_host.end(), 0, random_engine);
+
+    // Initialize descale values based on qscale type
+    if(qscale.type == quant_scale_enum::pertensor)
+    {
+        // Use fixed qkv_max = 3.f for per-tensor quantization
+        float qkv_max     = 3.f;
+        q_descale_host(0) = qkv_max / q_dtype_max;
+        k_descale_host(0) = qkv_max / k_dtype_max;
+        v_descale_host(0) = qkv_max / v_dtype_max;
+    }
+    else if(qscale.type == quant_scale_enum::blockscale)
+    {
+        // For blockscale, fill with uniform distribution
+        float qkv_max       = 3.f;
+        float max_descale_q = qkv_max / q_dtype_max;
+        float max_descale_k = qkv_max / k_dtype_max;
+        float max_descale_v = qkv_max / v_dtype_max;
+
+        auto next_seed_local = [n = 0]() mutable { return n++; };
+        ck_tile::FillUniformDistribution<float>{max_descale_q * 0.8f, max_descale_q, next_seed_local()}(
+            q_descale_host);
+        ck_tile::FillUniformDistribution<float>{max_descale_k * 0.8f, max_descale_k, next_seed_local()}(
+            k_descale_host);
+        ck_tile::FillUniformDistribution<float>{max_descale_v * 0.8f, max_descale_v, next_seed_local()}(
+            v_descale_host);
+    }
 
     ck_tile::DeviceMem q_buf(q_host.get_element_space_size_in_bytes());
     ck_tile::DeviceMem k_buf(k_host.get_element_space_size_in_bytes());
@@ -882,6 +917,13 @@ bool run(const ck_tile::ArgParser& arg_parser)
         const ck_tile::index_t batch_stride_o_acc = (nhead * num_splits * shape_seqlen_q * hdim_v);
         const ck_tile::index_t batch_stride_o     = (nhead * shape_seqlen_q * hdim_v);
         const ck_tile::index_t batch_stride_block_table = (max_num_page_blocks / batch);
+        // setup descale stride arguments (for blockscale quantization)
+        const ck_tile::index_t nhead_stride_q_descale  = num_block_scale_q;
+        const ck_tile::index_t nhead_stride_k_descale  = num_block_scale_kv;
+        const ck_tile::index_t nhead_stride_v_descale  = num_block_scale_kv;
+        const ck_tile::index_t batch_stride_q_descale  = num_block_scale_q * nhead;
+        const ck_tile::index_t batch_stride_k_descale  = num_block_scale_kv * nhead_k;
+        const ck_tile::index_t batch_stride_v_descale  = num_block_scale_kv * nhead_k;
         // setup split_stride_* arguments (only used in split-kv kernel)
         const ck_tile::index_t split_stride_lse_acc = (shape_seqlen_q);
         const ck_tile::index_t split_stride_o_acc   = (shape_seqlen_q * hdim_v);
@@ -996,40 +1038,62 @@ bool run(const ck_tile::ArgParser& arg_parser)
                 args.is_group_mode       = (mode == mode_enum::group);
                 args.bias_type           = static_cast<int>(bias.type);
                 args.has_lse             = lse;
-                args.qscale_type         = static_cast<int>(quant_scale_enum::no_scale);
+                args.qscale_type         = static_cast<int>(qscale.type);
                 args.has_sink            = false;
                 args.sink_size           = 0;
                 args.min_seqlen_q        = 0;
-                args.block_scale_size_q  = 128;
-                args.block_scale_size_kv = 128;
+                args.block_scale_size_q  = block_scale_size_q_;
+                args.block_scale_size_kv = block_scale_size_kv_;
 
                 // Sequence length pointers (nullptr in batch mode without padding)
                 args.cu_seqlen_q_ptr = nullptr;
                 args.cu_seqlen_k_ptr = nullptr;
-                args.block_scale_seqstart_q_ptr = nullptr;
-                args.block_scale_seqstart_k_ptr = nullptr;
                 args.sink_ptr = nullptr;
 
-                // Descale strides (set to 0 when qscale is disabled)
-                args.nhead_stride_q_descale  = 0;
-                args.nhead_stride_k_descale  = 0;
-                args.nhead_stride_v_descale  = 0;
-                args.batch_stride_q_descale  = 0;
-                args.batch_stride_k_descale  = 0;
-                args.batch_stride_v_descale  = 0;
-
-                // Set descale pointers (nullptr when qscale is disabled)
+                // Set descale pointers and strides based on qscale type
                 if(qscale.type == quant_scale_enum::no_scale)
                 {
                     args.q_descale_ptr = nullptr;
                     args.k_descale_ptr = nullptr;
                     args.v_descale_ptr = nullptr;
+                    args.block_scale_seqstart_q_ptr = nullptr;
+                    args.block_scale_seqstart_k_ptr = nullptr;
+                    args.nhead_stride_q_descale  = 0;
+                    args.nhead_stride_k_descale  = 0;
+                    args.nhead_stride_v_descale  = 0;
+                    args.batch_stride_q_descale  = 0;
+                    args.batch_stride_k_descale  = 0;
+                    args.batch_stride_v_descale  = 0;
                 }
-                else
+                else if(qscale.type == quant_scale_enum::blockscale)
+                {
+                    args.q_descale_ptr = reinterpret_cast<const float*>(q_descale_buf.GetDeviceBuffer());
+                    args.k_descale_ptr = reinterpret_cast<const float*>(k_descale_buf.GetDeviceBuffer());
+                    args.v_descale_ptr = reinterpret_cast<const float*>(v_descale_buf.GetDeviceBuffer());
+                    args.block_scale_seqstart_q_ptr =
+                        (mode == mode_enum::group ? nullptr : nullptr); // Not implemented for group mode in this benchmark
+                    args.block_scale_seqstart_k_ptr =
+                        (mode == mode_enum::group ? nullptr : nullptr); // Not implemented for group mode in this benchmark
+                    args.nhead_stride_q_descale  = nhead_stride_q_descale;
+                    args.nhead_stride_k_descale  = nhead_stride_k_descale;
+                    args.nhead_stride_v_descale  = nhead_stride_v_descale;
+                    args.batch_stride_q_descale  = batch_stride_q_descale;
+                    args.batch_stride_k_descale  = batch_stride_k_descale;
+                    args.batch_stride_v_descale  = batch_stride_v_descale;
+                }
+                else // pertensor or other types
                 {
                     args.q_descale_ptr = q_descale_buf.GetDeviceBuffer();
                     args.k_descale_ptr = k_descale_buf.GetDeviceBuffer();
                     args.v_descale_ptr = v_descale_buf.GetDeviceBuffer();
+                    args.block_scale_seqstart_q_ptr = nullptr;
+                    args.block_scale_seqstart_k_ptr = nullptr;
+                    args.nhead_stride_q_descale  = 0;
+                    args.nhead_stride_k_descale  = 0;
+                    args.nhead_stride_v_descale  = 0;
+                    args.batch_stride_q_descale  = 0;
+                    args.batch_stride_k_descale  = 0;
+                    args.batch_stride_v_descale  = 0;
                 }
             }
             else if constexpr(std::is_same_v<fmha_fwd_splitkv_args, std::decay_t<decltype(args)>>)
