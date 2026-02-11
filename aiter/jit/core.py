@@ -269,7 +269,7 @@ class AITER_CONFIG(object):
                 config_file = self.update_config_files(tuned_files, tuned_file_name)
         else:
             config_file = self.update_config_files(config_env_file, tuned_file_name)
-        print(f"get config file from environment ", config_file)
+        print("get config file from environment ", config_file)
         return config_file
 
 

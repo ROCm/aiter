@@ -102,7 +102,7 @@ kernels_list_95x = {
     10:   TileKernelInstance(   128,     128,      128,     2,        2,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             2      ),
     11:   TileKernelInstance(   192,     256,      128,     4,        2,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             1      ),
 }
-default_kernels_cktile_dict = {
+default_kernels_cktile_dict_preshuffleQuant = {
     #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile |   Scheduler   | TiledMMAPermuteN |  TransposeC  | UsePersistentKernel | BlockPerCu |
     -1:  TileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,          64,      "Intrawave",        False,             True,           False,             1      ),
 }
@@ -110,6 +110,6 @@ default_kernels_cktile_dict = {
 
 arch = get_gfx()
 if arch.startswith("gfx95"):
-    candidate_kernels_cktile_dict = kernels_list_95x
+    candidate_kernels_cktile_dict_preshuffleQuant = kernels_list_95x
 else:
-    candidate_kernels_cktile_dict = kernels_list_942
+    candidate_kernels_cktile_dict_preshuffleQuant = kernels_list_942

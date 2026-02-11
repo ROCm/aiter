@@ -383,12 +383,12 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 for preshuffleQuantB in [True, False]:
                     task.extend(
                         self.get_gemm_a8w8_blockscale_cktile_tune_task(
-                            info_keys, useSplitK, seed, preshuffleB=False, preshuffleQuantB
+                            info_keys, useSplitK, seed, preshuffleB=False, preshuffleQuantB=preshuffleQuantB
                         )
                     )
                     task.extend(
                         self.get_gemm_a8w8_blockscale_tune_task(
-                            info_keys, useSplitK, seed, preshuffleB=False, preshuffleQuantB
+                            info_keys, useSplitK, seed, preshuffleB=False, preshuffleQuantB=preshuffleQuantB
                         )
                     )
 
