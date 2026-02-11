@@ -4,6 +4,7 @@
 Test OPUS 32x32x8 fp16 MFMA via PyTorch extension: random A, B, compare with torch GEMM.
 Uses BuildExtension + CUDAExtension (see setup.py). Cleans previous build each run, then builds.
 """
+
 import glob
 import os
 import subprocess
