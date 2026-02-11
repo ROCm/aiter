@@ -395,6 +395,21 @@ def test_mla(
         else:
             kv_last_page_lens.fill_(ctx_lens % page_size)
 
+    # Temporarily work around for fp8/fp8 with gqa_ratio=32 kernel doesn't support bitmask
+    if nhead == 32 and decode_qlen == 4 and dtype == dtypes.fp8 and kvtype == dtypes.fp8:
+        remainder = seq_lens_kv % 64
+        need_pad = remainder != 0
+        if need_pad.any():
+            pad = torch.where(need_pad, 64 - remainder, torch.zeros_like(remainder))
+            seq_lens_kv += pad
+
+            kv_block_nums = (seq_lens_kv + page_size - 1) // page_size
+            kv_last_page_lens = torch.where(
+                (seq_lens_kv % page_size) == 0,
+                torch.full_like(kv_last_page_lens, page_size),
+                seq_lens_kv % page_size,
+            )
+
     kv_indptr[1 : batch_size + 1] = torch.cumsum(kv_block_nums, dim=0)
     num_page = kv_indptr[-1].item()
     kv_indices = torch.randperm(num_page, dtype=torch.int)
