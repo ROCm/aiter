@@ -624,6 +624,9 @@ def get_2stage_cfgs(
     intermediate_pad,
     use_flydsl,
 ):
+
+    use_flydsl = use_flydsl and token > int(os.environ.get("AITER_DSL_ENABLE_TOKENS", "128") )
+
     def get_cfg_2stages(tune_file):
         import pandas as pd
 
