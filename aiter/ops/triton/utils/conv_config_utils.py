@@ -1,5 +1,4 @@
 from typing import Optional
-import os
 import triton
 
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -7,39 +6,54 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER: AiterTritonLogger = AiterTritonLogger()
 
 _CONV3D_DEFAULT_KEYS = [
-        "N",
-        "D",
-        "H",
-        "W",
-        "OC",
-        "OD",
-        "OH",
-        "OW",
-        "K_C",
-        "K_D",
-        "K_H",
-        "K_W",
-        "STRIDE_D",
-        "STRIDE_H",
-        "STRIDE_W",
-        "PAD_D",
-        "PAD_H",
-        "PAD_W",
-        "DIL_D",
-        "DIL_H",
-        "DIL_W",
-        "GROUPS",
-    ]
+    "N",
+    "D",
+    "H",
+    "W",
+    "OC",
+    "OD",
+    "OH",
+    "OW",
+    "K_C",
+    "K_D",
+    "K_H",
+    "K_W",
+    "STRIDE_D",
+    "STRIDE_H",
+    "STRIDE_W",
+    "PAD_D",
+    "PAD_H",
+    "PAD_W",
+    "DIL_D",
+    "DIL_H",
+    "DIL_W",
+    "GROUPS",
+]
 
 _CONV3D_AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK_N": 32, "BLOCK_CI": 16, "BLOCK_CO": 64}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_N": 64, "BLOCK_CI": 16, "BLOCK_CO": 64}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_N": 128, "BLOCK_CI": 16, "BLOCK_CO": 64}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK_N": 64, "BLOCK_CI": 32, "BLOCK_CO": 64}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK_N": 128, "BLOCK_CI": 32, "BLOCK_CO": 64}, num_warps=8, num_stages=4),
-    triton.Config({"BLOCK_N": 64, "BLOCK_CI": 16, "BLOCK_CO": 128}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK_N": 128, "BLOCK_CI": 16, "BLOCK_CO": 128}, num_warps=8, num_stages=4),
+    triton.Config(
+        {"BLOCK_N": 32, "BLOCK_CI": 16, "BLOCK_CO": 64}, num_warps=4, num_stages=2
+    ),
+    triton.Config(
+        {"BLOCK_N": 64, "BLOCK_CI": 16, "BLOCK_CO": 64}, num_warps=4, num_stages=3
+    ),
+    triton.Config(
+        {"BLOCK_N": 128, "BLOCK_CI": 16, "BLOCK_CO": 64}, num_warps=8, num_stages=3
+    ),
+    triton.Config(
+        {"BLOCK_N": 64, "BLOCK_CI": 32, "BLOCK_CO": 64}, num_warps=8, num_stages=3
+    ),
+    triton.Config(
+        {"BLOCK_N": 128, "BLOCK_CI": 32, "BLOCK_CO": 64}, num_warps=8, num_stages=4
+    ),
+    triton.Config(
+        {"BLOCK_N": 64, "BLOCK_CI": 16, "BLOCK_CO": 128}, num_warps=8, num_stages=3
+    ),
+    triton.Config(
+        {"BLOCK_N": 128, "BLOCK_CI": 16, "BLOCK_CO": 128}, num_warps=8, num_stages=4
+    ),
 ]
+
 
 def get_default_conv3d_config(Config: Optional[dict] = None) -> dict:
     return {
@@ -50,6 +64,7 @@ def get_default_conv3d_config(Config: Optional[dict] = None) -> dict:
         "num_ctas": 1,
         "num_stages": 4,
     }
+
 
 def _print_conv3d_autotune_timings(
     kernel: triton.runtime.jit.JITFunction, config: Optional[dict]

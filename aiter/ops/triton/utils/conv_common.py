@@ -2,7 +2,7 @@ import torch
 import triton
 import math
 import functools
-from typing import Optional, Union, Callable
+from typing import Optional, Callable
 
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -161,7 +161,9 @@ def assert_close(
     """
     # Fallback to torch when not on GPU
     if not actual.is_cuda or not expected.is_cuda:
-        torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol, msg=msg or None)
+        torch.testing.assert_close(
+            actual, expected, rtol=rtol, atol=atol, msg=msg or None
+        )
         return
 
     def _flat_to_index(flat_idx: int, shape: torch.Size) -> tuple:
@@ -256,8 +258,12 @@ class GPUTimer:
         """
         self.warmup = warmup
         self.rep = max(rep, 1)
-        self._total_flops = total_flops  # callable(*kernel_args, **kernel_kwargs) -> int
-        self._total_bytes = total_bytes  # callable(*kernel_args, **kernel_kwargs) -> int
+        self._total_flops = (
+            total_flops  # callable(*kernel_args, **kernel_kwargs) -> int
+        )
+        self._total_bytes = (
+            total_bytes  # callable(*kernel_args, **kernel_kwargs) -> int
+        )
         self.total_flops: Optional[int] = None
         self.total_bytes: Optional[int] = None
         self.elapsed_ms = 0.0
