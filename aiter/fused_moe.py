@@ -217,6 +217,9 @@ def fused_moe_(
     """user API"""
     M, topk = topk_ids.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    token_num, _ = hidden_states.shape
+
+    use_flydsl = use_flydsl and token_num > int(os.environ.get("AITER_DSL_ENABLE_TOKENS", "128") )
 
     assert w1.shape[1] in [
         inter_dim,
@@ -236,7 +239,7 @@ def fused_moe_(
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
 
-    q_dtype_a = get_q_dtype_a(w1.dtype, quant_type, activation, M)
+    q_dtype_a = get_q_dtype_a(w1.dtype, quant_type, activation, M, use_flydsl)
 
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
@@ -481,9 +484,9 @@ def fused_moe_1stage(
 
 
 @functools.lru_cache(maxsize=2048)
-def get_q_dtype_a(w1_dtype, quant_type, activation, M):
+def get_q_dtype_a(w1_dtype, quant_type, activation, M, use_flydsl):
     q_dtype_a = w1_dtype if w1_dtype != torch.uint32 else dtypes.fp8
-    bf16_fp8_bound = 0 if _is_flydsl_available() else 512
+    bf16_fp8_bound = 0 if _is_flydsl_available() and use_flydsl else 512
     if quant_type == QuantType.per_1x32:
         if activation == ActivationType.Swiglu:
             if get_gfx() != "gfx950" or M < bf16_fp8_bound:
@@ -811,7 +814,7 @@ def get_2stage_cfgs(
         and activation == ActivationType.Swiglu
     ):
 
-        use_flydsl_stage2 = (
+        use_flydsl_stage1 = (
             use_flydsl
             and _is_flydsl_available()
             and q_type == QuantType.per_1x32
@@ -820,7 +823,9 @@ def get_2stage_cfgs(
             and use_g1u1
             and activation == ActivationType.Swiglu
         )
-        use_flydsl_stage1 = use_flydsl_stage2
+        # use_flydsl_stage2 = False
+        use_flydsl_stage2 = use_flydsl_stage1
+        # use_flydsl_stage1 = use_flydsl_stage2
         flydsl_block_m = int(block_m) if block_m is not None else 64
         stage1_func = (
             functools.partial(flydsl_moe_stage1)
@@ -833,9 +838,7 @@ def get_2stage_cfgs(
             )
         )
         stage2_func = (
-            functools.partial(flydsl_moe_stage2)
-            if use_flydsl_stage2
-            else functools.partial(
+            functools.partial(
                 cktile_moe_stage2,
                 n_pad_zeros=hidden_pad // 64 * 64,
                 k_pad_zeros=intermediate_pad // 128 * 128,
@@ -843,14 +846,6 @@ def get_2stage_cfgs(
             )
         )
 
-        print("use_flydsl_stage2 = %s", use_flydsl_stage2)
-        print("use_flydsl_stage1 = %s", use_flydsl_stage1)
-        print("flydsl_block_m = %s", flydsl_block_m)
-        print("stage1_func = %s", stage1_func)
-        print("stage2_func = %s", stage2_func)
-        print("block_m = %s", block_m)
-        print("ksplit = %s", ksplit)
-        print("run_1stage = %s", run_1stage)
         return MOEMetadata(
             stage1_func,
             stage2_func,
@@ -938,14 +933,6 @@ def get_2stage_cfgs(
             )
         )
         
-        print("use_flydsl_stage2 = %s", use_flydsl_stage2)
-        print("use_flydsl_stage1 = %s", use_flydsl_stage1)
-        print("flydsl_block_m = %s", flydsl_block_m)
-        print("stage1_func = %s", stage1_func)
-        print("stage2_func = %s", stage2_func)
-        print("block_m = %s", block_m)
-        print("ksplit = %s", ksplit)
-        print("run_1stage = %s", run_1stage)
         return MOEMetadata(
             stage1_func,
             stage2_func,
@@ -1063,13 +1050,15 @@ def fused_moe_2stages(
         a1 = hidden_states.to(dtypes.fp8)
         M = sorted_ids.shape[0]
         N = a1.shape[-1]
-        a1_scale = torch.ones([M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device)
         if use_flydsl and _is_flydsl_available():
             a2 = torch.empty(
                 (token_num, topk, inter_dim),
                 dtype=dtypes.fp8,
                 device=device,
             )
+        #     a1_scale = torch.empty([1], dtype=dtypes.fp8_e8m0, device=a1.device)
+        # else:
+        a1_scale = torch.ones([M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device)
     elif quant_type == QuantType.per_1x32:
         if token_num <= token_num_quant_moe_sort_switch:
             a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
@@ -1891,7 +1880,7 @@ def flydsl_moe_stage2(
     E = w2.shape[0]
 
     tile_m = block_m if block_m is not None else 64
-    tile_n = 256
+    tile_n = 128
     tile_k = 128 if not is_wfp4_pipeline else 256
 
     sorted_ids = sorted_token_ids.contiguous()
