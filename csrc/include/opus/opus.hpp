@@ -525,28 +525,13 @@ OPUS_H_D constexpr auto packed_shape_to_stride(const Shape& shape) { constexpr i
 template<typename Layout, typename Coord>
 OPUS_H_D constexpr decltype(auto) coord_to_linear(const Layout& layout, const Coord& coord) { static_assert(size<decltype(layout.stride())>() == size<Coord>()); return embed(layout.stride(), coord); }
 
-namespace impl {
-template<typename Dim, typename Shape, typename Indices, index_t C, index_t I, index_t... Is>
-OPUS_H_D constexpr auto unfold_x_coords_impl(const Dim&, const Shape& shape, const Indices& indices, number<C>, seq<I, Is...>) {
-    constexpr index_t group_size = size<decltype(get<I>(Dim{}))>();
-    auto sub_shape = slice(shape, number<C>{}, number<C + group_size>{});
-    auto sub_indices = slice(indices, number<C>{}, number<C + group_size>{});
-    auto sub_strides = packed_shape_to_stride(sub_shape);
-    auto x_val = embed(sub_strides, sub_indices);
-    auto current_tuple = opus::make_tuple(x_val);
-    if constexpr (sizeof...(Is) == 0) return current_tuple;
-    else return concat_tuple(current_tuple, unfold_x_coords_impl(Dim{}, shape, indices, number<C + group_size>{}, seq<Is...>{}));
-}
-}
-
 // Shape/Stride/Coord, they are all tuples. if Coord is not false_type, will use merge_peepholed_tuple() to construct real coord
-template<typename Shape_, typename Stride_, typename Coord_ = false_type, typename Dim_ = void>
+template<typename Shape_, typename Stride_, typename Coord_ = false_type>
 struct layout : public tuple<remove_cvref_t<Shape_>, remove_cvref_t<Stride_>, remove_cvref_t<Coord_>> {
     using base   = tuple<remove_cvref_t<Shape_>, remove_cvref_t<Stride_>, remove_cvref_t<Coord_>>;
     using Shape  = remove_cvref_t<Shape_>;
     using Stride = remove_cvref_t<Stride_>;
     using Coord  = remove_cvref_t<Coord_>;  // peepholed coord
-    using Dim    = remove_cvref_t<Dim_>;
 
     static constexpr index_t rank = Shape::size();
     static_assert(Shape::size() == Stride::size());
@@ -574,25 +559,6 @@ struct layout : public tuple<remove_cvref_t<Shape_>, remove_cvref_t<Stride_>, re
     OPUS_H_D constexpr decltype(auto) operator()(InCoord&& c) const {
         if constexpr (std::is_same_v<Coord, false_type>) return coord_to_linear(*this, c);
         else                                             return coord_to_linear(*this, merge_peepholed_tuple(coord(), c)); }
-
-    template <typename... Cs, std::enable_if_t<(!is_tuple_v<Cs> && ...), bool> = true>
-    OPUS_H_D constexpr auto x_indices(Cs&&... cs) const {
-        return this->x_indices(opus::make_tuple(std::forward<Cs>(cs)...));
-    }
-
-    template <typename InCoord, std::enable_if_t<is_tuple_v<InCoord>, bool> = true>
-    OPUS_H_D constexpr auto x_indices(InCoord&& c) const {
-        if constexpr (std::is_same_v<Dim, void>) {
-             if constexpr (std::is_same_v<Coord, false_type>) return c;
-             else return merge_peepholed_tuple(this->coord(), c);
-        } else {
-            auto full_coords = [&]() {
-                if constexpr (std::is_same_v<Coord, false_type>) return c;
-                else return merge_peepholed_tuple(this->coord(), c);
-            }();
-            return impl::unfold_x_coords_impl(Dim{}, this->shape(), full_coords, number<0>{}, make_index_seq<size<Dim>()>{});
-        }
-    }
 };
 
 template <typename Layout> struct layout_linear;
@@ -608,11 +574,6 @@ OPUS_H_D constexpr auto                       make_layout(Sx&& s, Sy&& t, Sz&& c
     if constexpr (cached_vec < 0)  return layout<Sx, Sy, Sz>(std::forward<Sx>(s), std::forward<Sy>(t), std::forward<Sz>(c));
     if constexpr (cached_vec == 0) return layout_linear<layout<Sx, Sy, Sz>>(std::forward<Sx>(s), std::forward<Sy>(t), std::forward<Sz>(c));
     else                           return layout_cached<cached_vec, layout<Sx, Sy, Sz>>(std::forward<Sx>(s), std::forward<Sy>(t), std::forward<Sz>(c)); }
-template <index_t cached_vec = 0, typename Sx, typename Sy, typename Sz, typename Sd>
-OPUS_H_D constexpr auto                       make_layout(Sx&& s, Sy&& t, Sz&& c, Sd&& d) {
-    if constexpr (cached_vec < 0)  return layout<Sx, Sy, Sz, Sd>(std::forward<Sx>(s), std::forward<Sy>(t), std::forward<Sz>(c));
-    if constexpr (cached_vec == 0) return layout_linear<layout<Sx, Sy, Sz, Sd>>(std::forward<Sx>(s), std::forward<Sy>(t), std::forward<Sz>(c));
-    else                           return layout_cached<cached_vec, layout<Sx, Sy, Sz, Sd>>(std::forward<Sx>(s), std::forward<Sy>(t), std::forward<Sz>(c)); }
 template <index_t cached_vec = 0, typename... Ts, std::enable_if_t<(!is_tuple_v<Ts> && ...), bool> = true>
 OPUS_H_D constexpr auto                       make_layout(Ts&&... ss) { return make_layout<cached_vec>(opus::make_tuple(ss...), packed_shape_to_stride(opus::make_tuple(ss...))); }
 template <index_t cached_vec = 0, typename S> OPUS_H_D constexpr auto make_layout(S&& s) { return make_layout<cached_vec>(std::forward<S>(s), packed_shape_to_stride(s)); }
@@ -1344,25 +1305,8 @@ struct gmem {
         });
     }
 
-    template<index_t vec = 1, typename LayoutG, typename LayoutS, typename Predicate, index_t aux = 0, std::enable_if_t<is_layout_v<LayoutG> && is_layout_v<LayoutS>, bool> = true>
-    OPUS_D void async_load_if(void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, const Predicate& pred, int s_os = 0, number<aux> = {}) {
-        constexpr auto issue_space = layout_to_issue_space<LayoutG>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
-        auto smem_ptr = reinterpret_cast<OPUS_LDS_ADDR scalar_type*>(reinterpret_cast<uintptr_t>(smem_base));
-
-        static_ford(issue_space_vec, [&](auto... ids) {
-            if (pred(ids...)) {
-                async_load<vec>(smem_ptr + u_smem(ids...), u_gmem(ids...), s_os, number<aux>{});
-            } else {
-                using type = vector_type<vec>;
-                type z = {0};
-                *reinterpret_cast<OPUS_LDS_ADDR type*>(smem_ptr + u_smem(ids...)) = z;
-            }
-        });
-    }
-
-    template<index_t vec = 1, typename Layout, typename Predicate, index_t aux = 0, std::enable_if_t<is_layout_v<Layout>, bool> = true>
-    OPUS_D auto load_if(const Layout& u, const Predicate& pred, int s_os = 0, number<aux> = {})
+    template<index_t vec = 1, typename Predicate, typename Layout, index_t aux = 0, std::enable_if_t<is_layout_v<Layout>, bool> = true>
+    OPUS_D auto load_if(const Predicate& pred, const Layout& u, int s_os = 0, number<aux> = {})
     {
         constexpr auto issue_space = layout_to_issue_space<Layout>();
         constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
@@ -1385,8 +1329,8 @@ struct gmem {
 #endif
     }
 
-    template<index_t vec = 1, typename V, typename Layout, typename Predicate, index_t aux = 0, std::enable_if_t<((is_array_v<V> || is_vector_v<V>) && is_layout_v<Layout>), bool> = true>
-    OPUS_D void store_if(const V& x, const Layout& u, const Predicate& pred, int s_os = 0, number<aux> = {})
+    template<index_t vec = 1, typename Predicate, typename V, typename Layout, index_t aux = 0, std::enable_if_t<((is_array_v<V> || is_vector_v<V>) && is_layout_v<Layout>), bool> = true>
+    OPUS_D void store_if(const Predicate& pred, const V& x, const Layout& u, int s_os = 0, number<aux> = {})
     {
         constexpr auto issue_space = layout_to_issue_space<Layout>();
         constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
@@ -1403,6 +1347,23 @@ struct gmem {
             if (pred(ids...)) {
                 auto v_ = slice(a_, number<u_r(ids...)>{}, number<u_r(ids...) + vec>{});
                 store<vec>(v_, u(ids...), s_os, number<aux>{});
+            }
+        });
+    }
+
+    template<index_t vec = 1, typename Predicate, typename LayoutG, typename LayoutS, index_t aux = 0, std::enable_if_t<is_layout_v<LayoutG> && is_layout_v<LayoutS>, bool> = true>
+    OPUS_D void async_load_if(const Predicate& pred, void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, int s_os = 0, number<aux> = {}) {
+        constexpr auto issue_space = layout_to_issue_space<LayoutG>();
+        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+        auto smem_ptr = reinterpret_cast<OPUS_LDS_ADDR scalar_type*>(reinterpret_cast<uintptr_t>(smem_base));
+
+        static_ford(issue_space_vec, [&](auto... ids) {
+            if (pred(ids...)) {
+                async_load<vec>(smem_ptr + u_smem(ids...), u_gmem(ids...), s_os, number<aux>{});
+            } else {
+                using type = vector_type<vec>;
+                type z = {0};
+                *reinterpret_cast<OPUS_LDS_ADDR type*>(smem_ptr + u_smem(ids...)) = z;
             }
         });
     }
@@ -1489,9 +1450,8 @@ struct smem {
         });
     }
 
-    // New method: load_if
-    template<index_t vec = 1, typename Layout, typename Predicate, std::enable_if_t<is_layout_v<Layout>, bool> = true>
-    OPUS_D auto load_if(const Layout& u, const Predicate& pred)
+    template<index_t vec = 1, typename Predicate, typename Layout, std::enable_if_t<is_layout_v<Layout>, bool> = true>
+    OPUS_D auto load_if(const Predicate& pred, const Layout& u)
     {
         constexpr auto issue_space = layout_to_issue_space<Layout>();
         constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
@@ -1514,8 +1474,8 @@ struct smem {
 #endif
     }
 
-    template<index_t vec = 1, typename V, typename Layout, typename Predicate, std::enable_if_t<((is_array_v<V> || is_dtype_v<V> || is_vector_v<V>) && is_layout_v<Layout>), bool> = true>
-    OPUS_D void store_if(const V& x, const Layout& u, const Predicate& pred)
+    template<index_t vec = 1, typename Predicate, typename V, typename Layout, std::enable_if_t<((is_array_v<V> || is_dtype_v<V> || is_vector_v<V>) && is_layout_v<Layout>), bool> = true>
+    OPUS_D void store_if(const Predicate& pred, const V& x, const Layout& u)
     {
         constexpr auto issue_space = layout_to_issue_space<Layout>();
         constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
@@ -1535,10 +1495,42 @@ struct smem {
             }
         });
     }
+
     OPUS_LDS_ADDR char* ptr; // in unit of byte
 };
 
 template<typename T_> OPUS_D decltype(auto) make_smem(T_* ptr) { return smem<T_>{ptr}; }
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+// mem type traits & free function wrappers (eliminate .template syntax in dependent context)
+template<typename>   struct is_gmem : false_type {};
+template<typename T> struct is_gmem<gmem<T>> : true_type {};
+template<typename T> constexpr bool is_gmem_v = is_gmem<remove_cvref_t<T>>::value;
+
+template<typename>   struct is_smem : false_type {};
+template<typename T> struct is_smem<smem<T>> : true_type {};
+template<typename T> constexpr bool is_smem_v = is_smem<remove_cvref_t<T>>::value;
+
+template<typename T> constexpr bool is_mem_v = is_gmem_v<T> || is_smem_v<T>;
+
+template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_mem_v<Mem>, bool> = true>
+OPUS_D auto load(Mem& mem, Args&&... args) { return mem.template load<vec>(std::forward<Args>(args)...); }
+
+template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_mem_v<Mem>, bool> = true>
+OPUS_D void store(Mem& mem, Args&&... args) { mem.template store<vec>(std::forward<Args>(args)...); }
+
+template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_mem_v<Mem>, bool> = true>
+OPUS_D auto load_if(Mem& mem, Args&&... args) { return mem.template load_if<vec>(std::forward<Args>(args)...); }
+
+template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_mem_v<Mem>, bool> = true>
+OPUS_D void store_if(Mem& mem, Args&&... args) { mem.template store_if<vec>(std::forward<Args>(args)...); }
+
+template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_gmem_v<Mem>, bool> = true>
+OPUS_D void async_load(Mem& mem, Args&&... args) { mem.template async_load<vec>(std::forward<Args>(args)...); }
+
+template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_gmem_v<Mem>, bool> = true>
+OPUS_D void async_load_if(Mem& mem, Args&&... args) { mem.template async_load_if<vec>(std::forward<Args>(args)...); }
+
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // waitcnt
 // vmcnt=0~63([15:14],[3:0]), lgkmcnt=0~15([11:8]), expcnt=0~7([6:4])
@@ -1721,17 +1713,17 @@ OPUS_D constexpr auto unfold_x_stride(const Dim&, const Shape&, const Stride& st
     template<index_t cached_vec = 0> OPUS_D constexpr auto layout_b() { return make_layout<cached_vec>(shape_b());}                         \
     template<index_t cached_vec = 0> OPUS_D constexpr auto layout_c() { return make_layout<cached_vec>(shape_c());}                         \
                                                                                                                                             \
-    template<index_t cached_vec = 0, typename S> OPUS_D constexpr auto layout_a(S&& stride) { return make_layout<cached_vec>(shape_a(), unfold_x_stride(dim_a(), shape_a(), stride), false_type{}, dim_a());} \
-    template<index_t cached_vec = 0, typename S> OPUS_D constexpr auto layout_b(S&& stride) { return make_layout<cached_vec>(shape_b(), unfold_x_stride(dim_b(), shape_b(), stride), false_type{}, dim_b());} \
-    template<index_t cached_vec = 0, typename S> OPUS_D constexpr auto layout_c(S&& stride) { return make_layout<cached_vec>(shape_c(), unfold_x_stride(dim_c(), shape_c(), stride), false_type{}, dim_c());} \
+    template<index_t cached_vec = 0, typename S> OPUS_D constexpr auto layout_a(S&& stride) { return make_layout<cached_vec>(shape_a(), unfold_x_stride(dim_a(), shape_a(), stride));} \
+    template<index_t cached_vec = 0, typename S> OPUS_D constexpr auto layout_b(S&& stride) { return make_layout<cached_vec>(shape_b(), unfold_x_stride(dim_b(), shape_b(), stride));} \
+    template<index_t cached_vec = 0, typename S> OPUS_D constexpr auto layout_c(S&& stride) { return make_layout<cached_vec>(shape_c(), unfold_x_stride(dim_c(), shape_c(), stride));} \
     /* Note, all the coord passed in must be p_coord*/                                                                                      \
-    template<index_t cached_vec = 0, typename S, typename C> OPUS_D constexpr auto layout_a(S&& stride, C&& z) { OPUS_KP_(dim_a); return make_layout<cached_vec>(shape_a(), unfold_x_stride(dim_a(), shape_a(), stride), opus::unfold_p_coord(dim_a(), z), dim_a());}  \
-    template<index_t cached_vec = 0, typename S, typename C> OPUS_D constexpr auto layout_b(S&& stride, C&& z) { OPUS_KP_(dim_b); return make_layout<cached_vec>(shape_b(), unfold_x_stride(dim_b(), shape_b(), stride), opus::unfold_p_coord(dim_b(), z), dim_b());}  \
-    template<index_t cached_vec = 0, typename S, typename C> OPUS_D constexpr auto layout_c(S&& stride, C&& z) { OPUS_KP_(dim_c); return make_layout<cached_vec>(shape_c(), unfold_x_stride(dim_c(), shape_c(), stride), opus::unfold_p_coord(dim_c(), z), dim_c());}  \
+    template<index_t cached_vec = 0, typename S, typename C> OPUS_D constexpr auto layout_a(S&& stride, C&& z) { OPUS_KP_(dim_a); return make_layout<cached_vec>(shape_a(), unfold_x_stride(dim_a(), shape_a(), stride), opus::unfold_p_coord(dim_a(), z));}  \
+    template<index_t cached_vec = 0, typename S, typename C> OPUS_D constexpr auto layout_b(S&& stride, C&& z) { OPUS_KP_(dim_b); return make_layout<cached_vec>(shape_b(), unfold_x_stride(dim_b(), shape_b(), stride), opus::unfold_p_coord(dim_b(), z));}  \
+    template<index_t cached_vec = 0, typename S, typename C> OPUS_D constexpr auto layout_c(S&& stride, C&& z) { OPUS_KP_(dim_c); return make_layout<cached_vec>(shape_c(), unfold_x_stride(dim_c(), shape_c(), stride), opus::unfold_p_coord(dim_c(), z));}  \
                                                                                                                                                                                                         \
-    template<index_t cached_vec = 0, typename C> OPUS_D constexpr auto layout_a_packed(C&& z) { OPUS_KP_(dim_a); return make_layout<cached_vec>(shape_a(), packed_shape_to_stride(shape_a()), opus::unfold_p_coord(dim_a(), z), dim_a());}   \
-    template<index_t cached_vec = 0, typename C> OPUS_D constexpr auto layout_b_packed(C&& z) { OPUS_KP_(dim_b); return make_layout<cached_vec>(shape_b(), packed_shape_to_stride(shape_b()), opus::unfold_p_coord(dim_b(), z), dim_b());}   \
-    template<index_t cached_vec = 0, typename C> OPUS_D constexpr auto layout_c_packed(C&& z) { OPUS_KP_(dim_c); return make_layout<cached_vec>(shape_c(), packed_shape_to_stride(shape_c()), opus::unfold_p_coord(dim_c(), z), dim_c());}   \
+    template<index_t cached_vec = 0, typename C> OPUS_D constexpr auto layout_a_packed(C&& z) { OPUS_KP_(dim_a); return make_layout_packed<cached_vec>(shape_a(), opus::unfold_p_coord(dim_a(), z));}   \
+    template<index_t cached_vec = 0, typename C> OPUS_D constexpr auto layout_b_packed(C&& z) { OPUS_KP_(dim_b); return make_layout_packed<cached_vec>(shape_b(), opus::unfold_p_coord(dim_b(), z));}   \
+    template<index_t cached_vec = 0, typename C> OPUS_D constexpr auto layout_c_packed(C&& z) { OPUS_KP_(dim_c); return make_layout_packed<cached_vec>(shape_c(), opus::unfold_p_coord(dim_c(), z));}   \
                                                                                                                                                                                                         \
     template<index_t cached_vec = 0, typename... Ts, std::enable_if_t<(!is_tuple_v<Ts> && ...), bool> = true> OPUS_D constexpr auto layout_a(Ts&&... strides) {return layout_a<cached_vec>(opus::make_tuple(strides...)); }  \
     template<index_t cached_vec = 0, typename... Ts, std::enable_if_t<(!is_tuple_v<Ts> && ...), bool> = true> OPUS_D constexpr auto layout_b(Ts&&... strides) {return layout_b<cached_vec>(opus::make_tuple(strides...)); }  \
@@ -1931,7 +1923,7 @@ OPUS_D decltype(auto) make_tiled_mma(ES, TS, WS, WA&& = {}, TA&& = {}) {
 template<index_t cached_vec = 0, typename L, typename D, typename S, typename C, std::enable_if_t<is_layout_v<L> && is_tuple_v<D> && is_tuple_v<S> && is_tuple_v<C>, bool> = true>
 OPUS_D constexpr auto partition_layout(L&& layout, D&& dims, S&& shapes, C&& p_coord) {
     OPUS_KP_(dims);
-    return make_layout<cached_vec>(std::forward<S>(shapes), unfold_x_stride(std::forward<D>(dims), std::forward<S>(shapes), layout.stride()), unfold_p_coord(std::forward<D>(dims), p_coord), std::forward<D>(dims));
+    return make_layout<cached_vec>(std::forward<S>(shapes), unfold_x_stride(std::forward<D>(dims), std::forward<S>(shapes), layout.stride()), unfold_p_coord(std::forward<D>(dims), p_coord));
 }
 // partition, use cached_vec to dispatch which layout implementation. cached_vec < 0 : "layout", cached_vec == 0 : "layout_linear", cached_vec > 0 : "layout_cached"
 template<index_t cached_vec = 0, typename M> OPUS_D constexpr auto partition_layout_a(M&& mma) { return mma.template layout_a<cached_vec>(); }
