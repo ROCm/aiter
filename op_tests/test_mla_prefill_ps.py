@@ -565,27 +565,6 @@ def test_mla_prefill(
     return ret
 
 
-l_dtype = ["fp8"]
-l_kv_dtype = ["fp8"]
-l_num_heads = [1, 16]
-l_ctx_len = [
-    21,
-    64,
-    256,
-    512,
-    1200,
-    3200,
-    5200,
-    8192,
-    10000,
-    16384,
-    # 90000,
-]
-l_batch_size = [1, 4, 16]
-l_block_size = [1]
-l_varlen = [False]
-l_causal = [True, False]
-
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -617,20 +596,20 @@ parser.add_argument(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=["fp8"],
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["fp8"]],
     nargs="*",
-    default=["fp8"],
+    default=[dtypes.d_dtypes["fp8"]],
     help="""Data type of Q.
     e.g.: -d fp8""",
 )
 parser.add_argument(
     "-kvd",
     "--kv_dtype",
-    type=str,
-    choices=["fp8"],
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["fp8"]],
     nargs="*",
-    default=["fp8"],
+    default=[dtypes.d_dtypes["fp8"]],
     help="""Data type of KV.
     e.g.: -kvd fp8""",
 )
@@ -638,7 +617,19 @@ parser.add_argument(
     "-c",
     "--ctx_len",
     type=int,
-    default=None,
+    default=[
+        21,
+        64,
+        256,
+        512,
+        1200,
+        3200,
+        5200,
+        8192,
+        10000,
+        16384,
+        # 90000,
+    ],
     help="""Context length(for prefill, qo_len = kv_len = context_len).
     e.g.: -c 21""",
 )
@@ -646,7 +637,7 @@ parser.add_argument(
     "-b",
     "--batch_size",
     type=int,
-    default=None,
+    default=[1, 4, 16],
     help="""Batch size.
     e.g.: -b 16""",
 )
@@ -654,21 +645,27 @@ parser.add_argument(
     "-n",
     "--num_heads",
     type=int,
-    default=None,
+    default=[1, 16],
     help="""Number of heads(for mla prefill(MHA), num_head_q = num_head_kv).
     e.g.: -n 1""",
 )
 parser.add_argument(
     "--varlen",
-    action="store_true",
-    help="""variable kv seqlens per batch. Default: False.
-    --varlen # True""",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[False],
+    help="""variable kv seqlens per batch. Default: [False].
+    e.g.: --varlen true  # [True]
+          --varlen true false  # [True, False]""",
 )
 parser.add_argument(
     "--causal",
-    action="store_true",
-    help="""enable causal mask. Default: False.
-    --causal # True""",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[True, False],
+    help="""enable causal mask. Default: [True, False].
+    e.g.: --causal true  # [True]
+          --causal false  # [False]""",
 )
 parser.add_argument(
     "--load_metadata",
@@ -696,22 +693,6 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
-if args.dtype is not None:
-    l_dtype = [dtypes.d_dtypes[key] for key in args.dtype]
-if args.kv_dtype is not None:
-    l_kvdtype = [dtypes.d_dtypes[key] for key in args.kv_dtype]
-if args.num_heads is not None:
-    l_num_heads = [args.num_heads]
-if args.ctx_len is not None:
-    l_ctx_len = [args.ctx_len]
-if args.batch_size is not None:
-    l_batch_size = [args.batch_size]
-if args.block_size is not None:
-    l_block_size = [args.block_size]
-if args.varlen is not None:
-    l_varlen = [args.varlen]
-# if args.causal is not None:
-#     l_causal = [args.causal]
 
 if args.profile:
     l_ctx_len = [16384]
@@ -729,14 +710,14 @@ for (
     block_size,
     varlen,
 ) in itertools.product(
-    l_causal,
-    l_num_heads,
-    l_dtype,
-    l_kvdtype,
-    l_ctx_len,
-    l_batch_size,
-    l_block_size,
-    l_varlen,
+    args.causal,
+    args.num_heads,
+    args.dtype,
+    args.kv_dtype,
+    args.ctx_len,
+    args.batch_size,
+    args.block_size,
+    args.varlen,
 ):
     ret = test_mla_prefill(
         ctx_len,
