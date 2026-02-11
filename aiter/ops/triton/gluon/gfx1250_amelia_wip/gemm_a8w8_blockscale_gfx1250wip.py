@@ -21,6 +21,7 @@ try:
     from .gfx1250_utils import static_profile
     from .f16_gemm_common_gfx1250 import (
         create_shared_layouts,
+        create_shared_scale_layouts,
         create_tensor_descriptors,
         issue_loads,
         issue_l2_prefetches,
@@ -33,6 +34,7 @@ except ImportError:
     from gfx1250_utils import static_profile
     from f16_gemm_common_gfx1250 import (
         create_shared_layouts,
+        create_shared_scale_layouts,
         create_tensor_descriptors,
         issue_loads,
         issue_l2_prefetches,
@@ -80,6 +82,10 @@ def gemm_tdm_pipelined_blockscale_kernel(a_ptr, b_ptr, c_ptr,  #
     shared_layouts: ttgl.constexpr = create_shared_layouts(BLOCK_M, BLOCK_N, BLOCK_K, TRANSPOSE_B)
     SHARED_LAYOUT_A: ttgl.constexpr = shared_layouts[0]
     SHARED_LAYOUT_B: ttgl.constexpr = shared_layouts[1]
+
+    scale_layouts: ttgl.constexpr = create_shared_scale_layouts(BLOCK_M, BLOCK_N, BLOCK_K//GROUP_K, TRANSPOSE_B)
+    SHARED_LAYOUT_A_SCALE: ttgl.constexpr = scale_layouts[0]
+    SHARED_LAYOUT_B_SCALE: ttgl.constexpr = scale_layouts[1]
                                         
     OPERAND_LAYOUT_A: ttgl.constexpr = ttgl.DotOperandLayout(0, WMMA_LAYOUT, K_WIDTH)
     OPERAND_LAYOUT_B: ttgl.constexpr = ttgl.DotOperandLayout(1, WMMA_LAYOUT, K_WIDTH)
@@ -98,9 +104,12 @@ def gemm_tdm_pipelined_blockscale_kernel(a_ptr, b_ptr, c_ptr,  #
     a_buffer = ttgl.allocate_shared_memory(a_desc.dtype, shape=[NUM_BUFFERS] + a_desc.block_shape, layout=a_desc.layout)
     b_buffer = ttgl.allocate_shared_memory(b_desc.dtype, shape=[NUM_BUFFERS] + b_desc.block_shape, layout=b_desc.layout)
     # allocate shared memory scales as well
-    a_scale, b_scale = create_tensor_descriptors(a_scale_ptr, b_scale_ptr, pid_m * BLOCK_M * stride_ascale_m, pid_n * BLOCK_N * stride_bscale_n,
-                                               stride_ascale_m, stride_ascale_k, stride_bscale_n, stride_bscale_k, SHARED_LAYOUT_A,
-                                               SHARED_LAYOUT_B, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, TRANSPOSE_B)
+    a_scale = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base=a_scale_ptr + pid_m * BLOCK_M * stride_ascale_m, shape=[M],
+                                                         strides=[stride_ascale_m], block_shape=[BLOCK_M],
+                                                         layout=SHARED_LAYOUT_A_SCALE)
+    b_scale = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base=b_scale_ptr + pid_n * BLOCK_N * stride_bscale_n, shape=[N],
+                                                             strides=[stride_bscale_n],
+                                                             block_shape=[BLOCK_N], layout=SHARED_LAYOUT_B_SCALE)
     a_scale_buffer = ttgl.allocate_shared_memory(a_scale.dtype, shape=[NUM_BUFFERS] + a_scale.block_shape, layout=a_scale.layout)
     b_scale_buffer = ttgl.allocate_shared_memory(b_scale.dtype, shape=[NUM_BUFFERS] + b_scale.block_shape, layout=b_scale.layout)
 
@@ -137,7 +146,7 @@ def gemm_tdm_pipelined_blockscale_kernel(a_ptr, b_ptr, c_ptr,  #
         # WMMA the partial sum, apply scales to each tile, and store.
         consumer, partial = issue_wmma(consumer, a_buffer, OPERAND_LAYOUT_A, b_buffer, OPERAND_LAYOUT_B,
                                            wmma_zeros, (NUM_BUFFERS - 1) * 2, NUM_BUFFERS, TRANSPOSE_B)
-        scale_slot = (consumer - 1) % NUM_BUFFERS
+        scale_slot = scale_consumer % NUM_BUFFERS
         # TODO this bit complains. slice layout seems correct and breaks, but blocked layout breaks as well.
         cur_a_scale = a_scale_buffer.index(scale_slot).load(layout=ttgl.SliceLayout(1, WMMA_LAYOUT))
         cur_b_scale = b_scale_buffer.index(scale_slot).load(layout=ttgl.SliceLayout(0, WMMA_LAYOUT))
@@ -151,7 +160,7 @@ def gemm_tdm_pipelined_blockscale_kernel(a_ptr, b_ptr, c_ptr,  #
         # TODO if this is accumulating everything from the buffers do i need to scale this too
         cur_a_scale = a_scale_buffer.index(scale_slot).load(layout=ttgl.SliceLayout(1, WMMA_LAYOUT))
         cur_b_scale = b_scale_buffer.index(scale_slot).load(layout=ttgl.SliceLayout(0, WMMA_LAYOUT))
-        accumulator += partial * cur_a_scale * cur_b_scale
+        accumulator += partial * cur_a_scale[:, None] * cur_b_scale[None, :]
 
     # Prep and store the totaled accumulator 
     offs_cm = pid_m * BLOCK_M + ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, WMMA_LAYOUT))
@@ -221,7 +230,7 @@ def test_runtime_gemm_tdm_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, TRAN
             NUM_BUFFERS=NUM_BUFFERS, TRANSPOSE_B=TRANSPOSE_B,  #
             num_warps=num_warps, WARP_BASES=warp_bases, waves_per_eu=num_warps // 4,
             L2_PREFETCH_DISTANCE=L2_PREFETCH_DISTANCE, 
-            GROUP_K=1)
+            GROUP_K=BLOCK_K)
         static_profile(kernel)
     else:
         # num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
