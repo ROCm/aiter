@@ -305,6 +305,39 @@ def fav2_forward_func(
         return_attn_probs=return_attn_probs,
     )
 
+def fa_custom_sagev2_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    layout: Literal["bshd", "bhsd"], # default bshd
+    causal: bool,
+):
+    from fa.flash_attention_qkmxfp4 import MetaData, attention, quantize_input
+    if layout == "bhsd": 
+        q = q.permute(0, 2, 1, 3).contiguous()
+        k = k.permute(0, 2, 1, 3).contiguous()
+        v = v.permute(0, 2, 1, 3).contiguous()
+
+    BATCH, N_CTX_Q, Q_HEAD, D_HEAD = q.shape
+    _, N_CTX_K, K_HEAD, _ = k.shape
+    
+    sm_scale = D_HEAD**-0.5
+    input_metadata = MetaData(sm_scale=sm_scale)
+    input_metadata.max_seqlens_q = N_CTX_Q
+    input_metadata.max_seqlens_k = N_CTX_K
+    input_metadata.layout = "bshd"
+    
+    if causal:
+        input_metadata.need_causal()
+
+    o = torch.empty_like(q)
+
+    q_quantized, k_quantized, v_quantized = quantize_input(q, k, v, input_metadata)
+    input_metadata.set_persistent(None)
+    def fn():
+        out, _ = attention(q_quantized, k_quantized, v_quantized, o, input_metadata)
+        return out
+    return fn
 
 def fav3_sage_forward_func(
     q: torch.Tensor,
@@ -312,7 +345,7 @@ def fav3_sage_forward_func(
     v: torch.Tensor,
     causal: bool,
     inference_mode: bool,  # not return softmax_lse
-    layout: Literal["bshd", "bhsd"],
+    layout: Literal["bshd", "bhsd"], # default bshd
     use_mxfp4_sage: bool = False,
     q_smooth: bool = False,
     include_quantization_overhead: bool = False,
@@ -510,7 +543,7 @@ def primary_output(result):
 
 
 def attn_forward_func(
-    q, k, v, func_name, softmax_scale, q_smooth, layout, dtype, use_mxfp4_sage=False
+    q, k, v, func_name, softmax_scale, q_smooth, layout, dtype, use_mxfp4_sage=False, persistent=None
 ):
     if func_name == "fav3_sage":  # fav3 sage hybrid
         fn = fav3_sage_forward_func(
@@ -522,6 +555,14 @@ def attn_forward_func(
             layout=layout,
             q_smooth=q_smooth,
             use_mxfp4_sage=use_mxfp4_sage,
+        )
+    elif func_name == "fa_custom_sagev2":
+        fn = fa_custom_sagev2_func(
+            q,
+            k,
+            v,
+            layout=layout,
+            causal=False,
         )
     else:
         q, k, v = layout_preprocess(q, k, v, layout=layout, target_layout="bshd")
@@ -584,6 +625,8 @@ def bench_kernel(q, k, v, args, provider):
         bench_func_name = "aiter_fp8"
     elif args.aiter_bf16:
         bench_func_name = "aiter_bf16"
+    elif args.fa_custom_sagev2:
+        bench_func_name = "fa_custom_sagev2"
     else:
         bench_func_name = "fav3_sage"
 
@@ -608,6 +651,11 @@ def bench_kernel(q, k, v, args, provider):
         current_primary = primary_output(current_output)
 
         if args.fav3_sage and args.layout == "bhsd":
+            current_primary = current_primary.permute(
+                0, 2, 1, 3
+            )  # we do comparison in BSHD
+
+        if args.fa_custom_sagev2 and args.layout == "bhsd":
             current_primary = current_primary.permute(
                 0, 2, 1, 3
             )  # we do comparison in BSHD
@@ -668,6 +716,7 @@ def run_benchmark_captured(args):
     Captured inputs are in BHSD format and need to be transposed to BSHD for kernels.
     """
     torch.manual_seed(20)
+    args.layout = "bhsd"  # captured inputs are in BHSD format
 
     # Load captured inputs
     inputs = load_captured_inputs(args.captured_dir)
@@ -695,7 +744,6 @@ def run_benchmark_captured(args):
 
         return bench_kernel(q, k, v, args, provider)
 
-    args.layout = "bhsd"  # captured inputs are in BHSD format
     logger.info(
         "Captured inpputs are in BHSD format. Setting args.layout to bhsd for benchmark."
     )
@@ -787,6 +835,15 @@ def parse_args():
         default=False,
         help="Use mxfp4 sage kernel with mixed precision quantization",
     )
+    parser.add_argument(
+        "-fa_custom_sagev2",
+        action="store_true",
+        default=False,
+        help="Use custom fa sage v2)",
+    )
+    parser.add_argument(
+        "-persistent", nargs='?', const='fixed', choices=['fixed', 'dynamic'], default=None,
+        help="Enable persistent kernels. Use '-persistent dynamic' for dynamic scheduling of the tiles.")
     parser.add_argument(
         "-fav3_fp8",
         action="store_true",
