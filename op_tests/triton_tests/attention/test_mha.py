@@ -813,6 +813,7 @@ def test_mha_backward_varlen(
 
 # Run PE tests with:
 # pytest op_tests/triton_tests/test_mha.py -k with_pe
+# TODO: Run PE tests on gfx942!
 
 
 @pytest.mark.parametrize("BATCH", [1, 3])
@@ -821,7 +822,7 @@ def test_mha_backward_varlen(
     [(128, 128), (32, 16), (16, 48), (4096, 4096)],
 )
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (2, 1), (128, 128)])
-@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(128, 64), (192, 128)])
+@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(192, 128), (576, 512)])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.25])
 @pytest.mark.parametrize("CAUSAL", [True, False])
 def test_mha_with_pe(
@@ -844,6 +845,9 @@ def test_mha_with_pe(
         pytest.skip(
             "Causal or Dropout use case isn't currently working with Positional Encoding on gfx942 archictecture."
         )
+
+    if HAS_DROPOUT and (HEAD_SZ_QK, HEAD_SZ_V) == (576, 512):
+        pytest.skip("Dropout exhausts LDS for PE with (DQK=512+64, DV=512).")
 
     # Generate tensors
     torch.cuda.empty_cache()
@@ -895,7 +899,7 @@ def test_mha_with_pe(
     [(16, 16), (32, 16), (64, 128), (4096, 4096)],
 )
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (16, 4), (128, 128)])
-@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(96, 64), (192, 128)])
+@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(192, 128), (576, 512)])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.17])
 @pytest.mark.parametrize("CAUSAL", [True, False])
 def test_mha_varlen_with_pe(
@@ -918,6 +922,9 @@ def test_mha_varlen_with_pe(
         pytest.skip(
             "Causal or Dropout use case isn't currently working with Positional Encoding on gfx942 archictecture."
         )
+
+    if HAS_DROPOUT and (HEAD_SZ_QK, HEAD_SZ_V) == (576, 512):
+        pytest.skip("Dropout exhausts LDS for PE with (DQK=512+64, DV=512).")
 
     # Generate tensors
     torch.cuda.empty_cache()

@@ -881,7 +881,8 @@ def _attn_fwd(
 def _get_config(
     enable_dropout: bool,
     dtype: torch.dtype,
-    has_pe: bool = False,
+    qk_head_dim: int,
+    v_head_dim: int,
 ):
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_arch()
@@ -890,14 +891,25 @@ def _get_config(
         with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict["default"] = config
+
+    assert qk_head_dim > 0, "QK head dimension must be positive."
+    assert v_head_dim > 0, "V head dimension must be positive."
+    qk_head_dim_gt_128: bool = qk_head_dim > 128
+    pe_head_dim: int = qk_head_dim - v_head_dim
+    assert pe_head_dim >= 0, "PE head dimension must be non-negative."
+    has_pe: bool = pe_head_dim > 0
+    has_dropout_or_fp32: bool = enable_dropout or dtype == torch.float32
+
     fwd_cfg = _get_config._config_dict["default"]["fwd"]
-    has_dropout_or_fp32 = enable_dropout or dtype == torch.float32
+
     # TODO: pe + dropout is not tuned
     if has_pe and has_dropout_or_fp32 and "pe_dropout_or_fp32" in fwd_cfg:
         return fwd_cfg["pe_dropout_or_fp32"]
+    elif has_pe and qk_head_dim_gt_128 and "pe_dqk_gt_128" in fwd_cfg:
+        return fwd_cfg["pe_dqk_gt_128"]
     elif has_pe and "pe" in fwd_cfg:
         return fwd_cfg["pe"]
-    elif enable_dropout or dtype == torch.float32:
+    elif has_dropout_or_fp32:
         return fwd_cfg["dropout_or_fp32"]
     else:
         return fwd_cfg["default"]
