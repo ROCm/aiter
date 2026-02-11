@@ -15,6 +15,69 @@ from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
+from triton.experimental.gluon.language.amd.gfx1250 import async_copy as cp
+from triton.language.core import _aggregate as aggregate
+
+
+@aggregate
+class AsyncCopyDescriptor:
+    """
+    Workaround descriptor for async copy when gather is used.
+    Pre-computes irregular offsets and uses async_copy instead of TDM.
+    TODO: Replace with TDM Gather once AMD hardware support is available.
+    """
+    ptr: ttgl.tensor
+    offs: ttgl.tensor  # Pre-computed offsets for each row [BLOCK_M, BLOCK_K]
+    offs_k: ttgl.tensor  # K dimension offsets [BLOCK_K]
+    step_k: ttgl.tensor  # Step size for K dimension (BLOCK_K * stride_x_k)
+    BLOCK_M: ttgl.constexpr
+    BLOCK_K: ttgl.constexpr
+    
+    @gluon.constexpr_function
+    def __init__(self, ptr, offs, offs_k, step_k, BLOCK_M, BLOCK_K):
+        self.ptr = ptr
+        self.offs = offs
+        self.offs_k = offs_k
+        self.step_k = step_k
+        self.BLOCK_M = ttgl.constexpr(BLOCK_M)
+        self.BLOCK_K = ttgl.constexpr(BLOCK_K)
+    
+    @gluon.jit
+    def initialize(ptr, gathered_m, off_k, stride_m, stride_k, BLOCK_M: ttgl.constexpr, BLOCK_K: ttgl.constexpr, BLOCKED_MK: ttgl.constexpr):
+        """
+        Initialize descriptor with gathered row indices.
+        
+        Args:
+            ptr: Base pointer to X tensor
+            gathered_m: Gathered row indices [BLOCK_M] (irregular)
+            off_k: Starting K offset
+            stride_m: Stride for M dimension
+            stride_k: Stride for K dimension
+        """
+        offs_k = off_k + ttgl.arange(0, BLOCK_K, layout=ttgl.SliceLayout(0, BLOCKED_MK))
+        step_k = BLOCK_K * stride_k
+        
+        offs = gathered_m.to(ttgl.int32)[:, None] * stride_m + offs_k .to(ttgl.int32)[None, :]* stride_k
+
+        return AsyncCopyDescriptor(ptr, offs, offs_k, step_k, BLOCK_M, BLOCK_K)
+    
+    @gluon.jit
+    def issue_async_load(self, k_idx: int, buffer, mask_k=None):
+        """
+        Issue async load for K iteration k_idx.
+        
+        Args:
+            k_idx: K iteration index (0, 1, 2, ...)
+            buffer: Shared memory buffer to load into
+            mask_k: Optional mask for K dimension (for EVEN_K=False case)
+        """
+        offs = self.offs + k_idx * self.step_k
+        
+        if mask_k is not None:
+            cp.global_to_shared(buffer, self.ptr + offs, mask=mask_k[None, :], other=0.0)
+        else:
+            cp.global_to_shared(buffer, self.ptr + offs)
+        cp.commit_group()
 
 
 @gluon.jit
@@ -162,7 +225,7 @@ def _reduce_grouped(
 
 
 @gluon.jit
-def _moe_gemm_a8w8_blockscale(
+def _moe_gemm_a8w8_blockscale_gfx1250(
     Y,
     stride_y_k,
     stride_y_m,
@@ -232,6 +295,8 @@ def _moe_gemm_a8w8_blockscale(
     UPCAST_INDICES: ttgl.constexpr = False,
     # Use per-row or 2D blockscale on X
     PER_ROW_X_SCALE: ttgl.constexpr = False,
+    # W transpose: If True, W is stored as (N, K) instead of (K, N)
+    W_TRANSPOSE: ttgl.constexpr = False,
 ):
     """
     Computes the 8 bit matmul C = A x B using the block-scale quantization approach.
@@ -291,12 +356,20 @@ def _moe_gemm_a8w8_blockscale(
     start_m = start_m.to(index_type)
     pid_n, pid_k = pid_n.to(index_type), pid_k.to(index_type)
     
+    # Allocate shared memory buffer
     a_buffer = ttgl.allocate_shared_memory(
         X.type.element_ty, [BLOCK_M, BLOCK_K], layout=SHARED_A
     )
-    b_buffer = ttgl.allocate_shared_memory(
-        W.type.element_ty, [BLOCK_K, BLOCK_N], layout=SHARED_B
-    )
+    if W_TRANSPOSE:
+        # W is stored as (N, K) in shared memory
+        b_buffer = ttgl.allocate_shared_memory(
+            W.type.element_ty, [BLOCK_N, BLOCK_K], layout=SHARED_B
+        )
+    else:
+        # W is stored as (K, N) in shared memory
+        b_buffer = ttgl.allocate_shared_memory(
+            W.type.element_ty, [BLOCK_K, BLOCK_N], layout=SHARED_B
+        )
     a_scale_buffer = ttgl.allocate_shared_memory(
         XBlockScale.type.element_ty if XBlockScale is not None else ttgl.float32,
         [BLOCK_M],
@@ -318,24 +391,8 @@ def _moe_gemm_a8w8_blockscale(
     offs_x_m = ttgl.max_contiguous(ttgl.multiple_of(offs_x_m % M, BLOCK_M), BLOCK_M)
     if GatherIndx is None:
         offs_x_m = start_m + offs_x_m
-    else:
-        GatherIndx += start_m
-        # no needs to bounds-check here because `offs_x_m` wraps around M dim
-        offs_x_m = ttgl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
-    
-    XPtrs = (
-        X
-        + offs_x_m.to(index_type)[:, None] * stride_x_m
-        + offs_ak_split.to(index_type)[None, :] * stride_x_k
-    )
-    
-    # Create tensor descriptor for X (activations) when there's no gather
-    # X is stored as (in_m, K) with strides (stride_x_m, stride_x_k)
-    # Note: We use grid_m * BLOCK_M as the M dimension (upper bound);
-    # expert-specific offsets (start_m) will be handled via offsets in async_load
-    # We only create this when GatherIndx is None (no gather/scatter)
-    if GatherIndx is None:
-        in_m = grid_m * BLOCK_M  # Total input M dimension (upper bound)
+        # Regular access: Use TDM tensor descriptor
+        in_m = grid_m * BLOCK_M 
         a_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=X,
             shape=(in_m, K),
@@ -344,9 +401,21 @@ def _moe_gemm_a8w8_blockscale(
             layout=SHARED_A
         )
     else:
-        # When gather is used, we can't use tensor descriptors easily
-        # Keep using manual pointer calculation
-        a_desc = None
+        GatherIndx += start_m
+        # no needs to bounds-check here because `offs_x_m` wraps around M dim
+        offs_x_m = ttgl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
+        # Initialize AsyncCopyDescriptor
+        # TODO: Replace with TDM Gather once AMD hardware support is available.
+        off_k_start = pid_k * splitk_block_size
+        a_desc = AsyncCopyDescriptor.initialize(
+            X, offs_x_m, off_k_start, stride_x_m, stride_x_k, BLOCK_M, BLOCK_K, BLOCKED_MK
+        )
+
+    XPtrs = (
+        X
+        + offs_x_m.to(index_type)[:, None] * stride_x_m
+        + offs_ak_split.to(index_type)[None, :] * stride_x_k
+    )
 
     # B pointers
     offs_w_n = pid_n * BLOCK_N + ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(0, BLOCKED_KN))
@@ -356,23 +425,38 @@ def _moe_gemm_a8w8_blockscale(
     )
     W += expt_id * stride_w_e
     
-    # Create tensor descriptor for W (weights)
-    # W is stored as (K, N) per expert, with strides (stride_w_k, stride_w_n)
-    # Note: We use the full K dimension here; split-K will be handled via offsets in async_load
-    b_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=W,
-        shape=(K, N),
-        strides=(stride_w_k, stride_w_n),
-        block_shape=(BLOCK_K, BLOCK_N),
-        layout=SHARED_B
-    )
+    if W_TRANSPOSE:
+        b_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=W,
+            shape=(N, K),
+            strides=(stride_w_n, stride_w_k),
+            block_shape=(BLOCK_N, BLOCK_K),
+            layout=SHARED_B
+        )
+    else:
+        b_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=W,
+            shape=(K, N),
+            strides=(stride_w_k, stride_w_n),
+            block_shape=(BLOCK_K, BLOCK_N),
+            layout=SHARED_B
+        )
     
-    offs_bk = ttgl.arange(0, BLOCK_K, layout=ttgl.SliceLayout(1, BLOCKED_KN))
-    offs_bk_split = pid_k * splitk_block_size + offs_bk
-    WPtrs = W + (
-        offs_bk_split.to(index_type)[:, None] * stride_w_k
-        + offs_w_n.to(index_type)[None, :] * stride_w_n
-    )
+    # TODO: change this to use async_load
+    if W_TRANSPOSE:
+        offs_bk = ttgl.arange(0, BLOCK_K, layout=ttgl.SliceLayout(1, BLOCKED_KN))
+        offs_bk_split = pid_k * splitk_block_size + offs_bk
+        WPtrs = W + (
+            offs_w_n.to(index_type)[:, None] * stride_w_n
+            + offs_bk_split.to(index_type)[None, :] * stride_w_k
+        )
+    else:
+        offs_bk = ttgl.arange(0, BLOCK_K, layout=ttgl.SliceLayout(1, BLOCKED_KN))
+        offs_bk_split = pid_k * splitk_block_size + offs_bk
+        WPtrs = W + (
+            offs_bk_split.to(index_type)[:, None] * stride_w_k
+            + offs_w_n.to(index_type)[None, :] * stride_w_n
+        )
     if is_x_blockscale:
         if PER_ROW_X_SCALE:
             # XScale: [M, K_blocks]
@@ -400,6 +484,8 @@ def _moe_gemm_a8w8_blockscale(
 
     offs_ks_step = BLOCK_K // BLOCKSCALE_K
     num_k_iter = ttgl.cdiv(splitk_block_size, BLOCK_K)
+    producer = 0
+    consumer = 0
     acc = ttgl.zeros((BLOCK_M, BLOCK_N), dtype=ttgl.float32, layout=WMMA_LAYOUT)
     zeros = ttgl.zeros((BLOCK_M, BLOCK_N), dtype=ttgl.float32, layout=WMMA_LAYOUT)
     # Main loop
@@ -413,12 +499,22 @@ def _moe_gemm_a8w8_blockscale(
                 mask=offs_ak[None, :] < K - k * BLOCK_K,
                 other=0.0,
             )
-            w = ttgl.load(
-                WPtrs,
-                mask=offs_bk[:, None] < K - k * BLOCK_K,
-                other=0.0,
-                cache_modifier=W_CACHE_MODIFIER
-            )
+            if W_TRANSPOSE:
+                mask_w_n = offs_w_n[:, None] < N
+                mask_w_k = offs_bk[None, :] < K - k * BLOCK_K
+                w = ttgl.load(
+                    WPtrs,
+                    mask=mask_w_n & mask_w_k,
+                    other=0.0,
+                    cache_modifier=W_CACHE_MODIFIER
+                )
+            else:
+                w = ttgl.load(
+                    WPtrs,
+                    mask=offs_bk[:, None] < K - k * BLOCK_K,
+                    other=0.0,
+                    cache_modifier=W_CACHE_MODIFIER
+                )
         
         x = ttgl.convert_layout(x, DOT_A_LAYOUT)
         w = ttgl.convert_layout(w, DOT_B_LAYOUT)
@@ -678,7 +774,7 @@ def reduce_grouped(
     return out
 
 
-def moe_gemm_a8w8_blockscale(
+def moe_gemm_a8w8_blockscale_gfx1250(
     x,
     w,
     x_block_scales=None,
@@ -698,11 +794,14 @@ def moe_gemm_a8w8_blockscale(
     unpadded_N=None,
     unpadded_K=None,
     per_row_x_scale=False,
+    preshuffled=False,
 ):
     """
     Y[:, :] = 0.
     for e in num_experts:
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
+
+    If preshuffled is True, then W is stored as (E, N, K) instead of (E, K, N)
     """
     x_has_blockscale = x_block_scales is not None
     w_has_blockscale = w_block_scales is not None
@@ -725,7 +824,13 @@ def moe_gemm_a8w8_blockscale(
 
     # determine shapes
     M = x.shape[-2] if gather_indx is None else gather_indx.shape[0]
-    K, N = x.shape[-1], w.shape[-1]
+    K = x.shape[-1]
+    if preshuffled:
+        N, K_w = w.shape[-1], w.shape[-2]
+    else:
+        K_w, N = w.shape[-1], w.shape[-2]
+    assert K == K_w, f"K dimension mismatch: x has K={K}, w has K={K_w}"
+    
     block_m = routing_data.block_m
     if unpadded_N and block_m == 16:
         N = unpadded_N
@@ -806,17 +911,35 @@ def moe_gemm_a8w8_blockscale(
         instr_shape=[16, 16, 64]
     )
     
-    shared_a = ttgl.SwizzledSharedLayout(
-        vec=16, per_phase=2, max_phase=8, order=[1, 0]
+    # Initialize shared memory layouts
+    shared_a = ttgl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_K, 16]],
+        [BLOCK_M, BLOCK_K],
+        [1, 0]
     )
-    shared_b = ttgl.SwizzledSharedLayout(
-        vec=16, per_phase=2, max_phase=8, order=[0, 1]
+    if preshuffled:
+        shared_b = ttgl.PaddedSharedLayout.with_identity_for(
+            [[BLOCK_K, 16]],
+            [BLOCK_N, BLOCK_K],
+            [0, 1]
+        )
+    else:
+        shared_b = ttgl.PaddedSharedLayout.with_identity_for(
+            [[BLOCK_N, 16]],
+            [BLOCK_K, BLOCK_N],
+            [1, 0]
+        )
+    
+    # TODO: figure out the interval and padding
+    shared_a_scale = ttgl.PaddedSharedLayout.with_identity_for(
+        [[256, 16]],
+        [BLOCK_M],
+        [0]
     )
-    shared_a_scale = ttgl.SwizzledSharedLayout(
-        vec=16, per_phase=2, max_phase=8, order=[0]
-    )
-    shared_b_scale = ttgl.SwizzledSharedLayout(
-        vec=16, per_phase=2, max_phase=8, order=[0]
+    shared_b_scale = ttgl.PaddedSharedLayout.with_identity_for(
+        [[256, 16]],
+        [BLOCK_N],
+        [0]
     )
     
     dot_a_layout = ttgl.DotOperandLayout(
@@ -827,7 +950,7 @@ def moe_gemm_a8w8_blockscale(
     )
     
     # launch kernel
-    _moe_gemm_a8w8_blockscale[(grid,)](
+    _moe_gemm_a8w8_blockscale_gfx1250[(grid,)](
         y,
         y.stride(0),
         y.stride(1),
@@ -840,8 +963,8 @@ def moe_gemm_a8w8_blockscale(
         stride_x_bs_k,
         w,
         w.stride(0),
-        w.stride(1),
-        w.stride(2),
+        w.stride(1) if not preshuffled else w.stride(2),
+        w.stride(2) if not preshuffled else w.stride(1),
         w_block_scales,
         stride_w_bs_e,
         stride_w_bs_k,
@@ -883,6 +1006,7 @@ def moe_gemm_a8w8_blockscale(
         num_stages=config["num_stages"],
         UPCAST_INDICES=should_upcast_indices(x, w, y),
         PER_ROW_X_SCALE=per_row_x_scale,
+        W_TRANSPOSE=preshuffled,
         waves_per_eu=config["waves_per_eu"],
         matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
         kpack=config["kpack"],
@@ -932,13 +1056,14 @@ if __name__ == "__main__":
     k = 128
     n_expts_tot = 8
     n_expts_act = 2
-    do_gather = False
+    do_gather = True
     do_scatter = False
     per_row_x_scale = False
     is_x_blockscale = True
     is_w_blockscale = True
     has_y_gammas = False
-    
+    preshuffled = False
+
     print(f"Configuration:")
     print(f"  Tokens: {m}")
     print(f"  Total Experts: {n_expts_tot}")
@@ -1002,7 +1127,7 @@ if __name__ == "__main__":
     # Run the Gluon kernel
     print("Running MOE GEMM with Gluon kernel...")
     try:
-        y_gluon = moe_gemm_a8w8_blockscale(
+        y_gluon = moe_gemm_a8w8_blockscale_gfx1250(
             x=x_quant,
             w=w_quant,
             x_block_scales=x_block_scales,
@@ -1018,6 +1143,7 @@ if __name__ == "__main__":
             out_dtype=torch.bfloat16,
             apply_swiglu=False,
             per_row_x_scale=per_row_x_scale,
+            preshuffled=preshuffled,
         )
         print("========= y_gluon =========")
         print(y_gluon)
