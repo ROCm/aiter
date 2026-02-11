@@ -1,5 +1,4 @@
 from typing import Optional, Union
-import os
 import triton
 import torch
 
@@ -9,9 +8,6 @@ from aiter.ops.triton._triton_kernels.conv.conv3d.conv3d_channel_last import (
 from aiter.ops.triton.utils.conv_common import (
     conv3d_output_shape,
     padding_type,
-    GPUTimer,
-    conv3d_total_flops,
-    conv3d_total_bytes,
 )
 from aiter.ops.triton.utils.conv_config_utils import (
     get_default_conv3d_config,
@@ -21,9 +17,6 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER: AiterTritonLogger = AiterTritonLogger()
 
 
-@GPUTimer(warmup=5, rep=20,
-          total_flops=conv3d_total_flops,
-          total_bytes=conv3d_total_bytes)
 def conv3d_channel_last(
     x: torch.Tensor,
     weight: torch.Tensor,

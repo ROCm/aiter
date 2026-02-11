@@ -5,15 +5,14 @@ import time
 from aiter.ops.triton.conv.conv3d.conv3d_std import conv3d_std
 from aiter.ops.triton.conv.conv3d.conv3d_channel_last import conv3d_channel_last
 from aiter.ops.triton.utils.conv_common import assert_close
-
-import logging
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(levelname)s] %(name)s: %(message)s",
-    force=True,
+from aiter.ops.triton.utils.conv_common import (
+    conv3d_total_flops,
+    conv3d_total_bytes,
+    GPUTimer,
 )
-logging.getLogger("AITER_TRITON").propagate = True
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 def gen_conv3d_input(
@@ -84,6 +83,9 @@ def gen_conv3d_input(
     "impl",
     ["triton.conv3d.std", "triton.conv3d.channel.last"],
 )
+@GPUTimer(
+    warmup=5, rep=20, total_flops=conv3d_total_flops, total_bytes=conv3d_total_bytes
+)
 def test_conv3d(
     batch_size,
     in_channels,
@@ -143,7 +145,7 @@ def test_conv3d(
     t1 = time.perf_counter()
     assert_close(output, ref, rtol=0.2, atol=0.02)
     t2 = time.perf_counter()
-    print(
+    _LOGGER.info(
         f"[TIMING] torch.conv3d: {(t1-t0)*1000:.1f} ms, "
         f"assert_close: {(t2-t1)*1000:.1f} ms, "
         f"shape={output.shape}"
