@@ -350,6 +350,12 @@ import numpy as np
 from aiter.int4_utils import convert_int8_to_uint32_int4, rearrange_4bit_elements
 from aiter.utility import fp4_utils
 from typing import Optional, Tuple
+from aiter.fused_moe import (
+    fused_topk,
+    fused_moe,
+    torch_moe_stage1,
+    torch_moe_stage2,
+)
 
 
 def FloatMapToInt(tensor: torch.Tensor) -> torch.Tensor:
@@ -484,6 +490,48 @@ def moe_init_uint4(
     return buffer.to(device)
 
 
+def moe_init_float(
+    eprt,
+    M,
+    N,
+    init_pattern=0,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+):
+    total_size = eprt * M * N
+
+    buffer = torch.zeros((eprt, M, N), dtype=torch.float32)
+    indices = np.arange(total_size)
+
+    b_indices = indices // (eprt * M * N)
+    remainder = indices % (eprt * M * N)
+    h_indices = remainder // (M * N)
+    remainder = remainder % (M * N)
+    s_indices = remainder // N
+    d_indices = remainder % N
+
+    if init_pattern == 0:
+        values = np.random.randn(total_size).astype(np.float32)
+    elif init_pattern == 1:
+        values = np.cos(indices).astype(np.float32)
+    elif init_pattern == 2:
+        values = np.sin(indices).astype(np.float32)
+    elif init_pattern == 3:
+        values = np.cos(indices).astype(np.float32) + np.sin(indices).astype(np.float32)
+    elif init_pattern == 10:
+        values = np.full(total_size, 0.25, dtype=np.float32)
+    elif init_pattern == 11:
+        values = 0.01 * d_indices.astype(np.float32)
+    elif init_pattern == 12:
+        values = 0.01 * s_indices.astype(np.float32)
+    else:
+        values = np.zeros(total_size, dtype=np.float32)
+
+    buffer = torch.from_numpy(values)
+    buffer = buffer.view(eprt, M, N).to(torch.float32)
+
+    return buffer.to(device)
+
+
 def moe_lqq_dequant(
     in_buffer: torch.Tensor,
     qscale_buf: torch.Tensor,
@@ -509,23 +557,17 @@ def moe_lqq_dequant(
         N % group_in_k_lqq == 0
     ), f"N={N} must be divisible by group_in_k_lqq={group_in_k_lqq}"
 
-    # 高效向量化实现
-    # 1. 扩展scale和zero缓冲区
     scale_expanded = qscale_buf.unsqueeze(-1).expand(-1, -1, -1, group_in_k_lqq)
     zero_expanded = qzero_buf.unsqueeze(-1).expand(-1, -1, -1, group_in_k_lqq)
 
-    # 2. 重塑输入以匹配扩展的形状
     in_reshaped = in_buffer.view(eprt, M, numGroups, group_in_k_lqq)
 
-    # 3. 反量化计算
-    # 使用融合操作提高性能
     out_reshaped = torch.addcmul(
         zero_expanded.to(torch.float32),
         in_reshaped.to(torch.float32),
         scale_expanded.to(torch.float32),
     )
 
-    # 4. 恢复原始形状并转换输出类型
     out = out_reshaped.view(eprt, M, N).to(output_dtype)
 
     return out.to(device)
@@ -576,8 +618,8 @@ def save_buffer_to_file(
             f.write("\nData:\n")
 
             flat_data = buffer_cpu.flatten().numpy()
-            for i in range(min(100, len(flat_data))):
-                f.write(f"{flat_data[i]:4d} ")
+            for i in range(len(flat_data)):
+                f.write(f"{flat_data[i]:.4f} ")
                 if (i + 1) % 16 == 0:
                     f.write("\n")
 
@@ -627,6 +669,12 @@ def test_fmoe_lqq(
 
     input = torch.randn((token, model_dim), dtype=dtype, device="cuda")
     score = torch.randn((token, E), device="cuda", dtype=dtype)
+    w2 = (
+        torch.randn(
+            (local_E + shared_E, model_dim, inter_dim), dtype=dtype, device="cuda"
+        )
+        / 10
+    )
 
     if shared_E > 0:
         shared_E_score = 0.1
@@ -662,57 +710,72 @@ def test_fmoe_lqq(
         topk_weights, topk_ids = fused_topk(input, score, topk, True)
 
     # O: int8
-    # X:                 int8  -> input
-    # GU_buf:            uint4 -> w1_qt
-    # GU_buf_uint4:      uint4 -> w1_qt_uint4
-    # GU_qscale_lqq_buf: int4  -> w1_lqq_scale
-    # GU_qzero_lqq_buf:  int4  -> w1_lqq_zero
+    # X_buf:                  int8  -> a1_qt             -> dev_X
+    # X_dqn_buf:              float -> a1_scale          -> dev_X_dqn_buf
+    # GU_buf:                 int8  -> w1_qt
+    # GU_dqn_buf:             float -> w1_scale          -> dev_GU_dqn_buf
+    # GU_buf_uint4:           uint4 -> w1_lqq_uint4
+    # GU_qscale_lqq_buf:      int4  -> w1_lqq_scale      -> dev_Qscl
+    # GU_qzero_lqq_buf:       int4  -> w1_lqq_zero
+    # GU_qzero_lqq_buf_uint8: uint8 -> w1_lqq_zero_uint8 -> dev_Qzero
     group_in_k_lqq = 64
     eprt = local_E + shared_E
     GU_dqn_k_lqq = model_dim // group_in_k_lqq
     GU_dqn_n_lqq = inter_dim
     GU_dqn_lqq_size = eprt * GU_dqn_k_lqq * GU_dqn_n_lqq * 2
     sz_GU = eprt * model_dim * inter_dim * 2
-    print("model_dim(K) = ", model_dim)
-    print("inter_dim(N) = ", inter_dim)
-    print("eprt = ", eprt)
-    print("topk = ", topk)
-    print("GU_dqn_k_lqq = ", GU_dqn_k_lqq)
-    print("GU_dqn_n_lqq = ", GU_dqn_n_lqq)
-    print("GU_dqn_lqq_size = ", GU_dqn_lqq_size)
-    print("sz_GU = ", sz_GU)
+    GU_dqn_k = 1
+    GU_dqn_n = inter_dim
+    GU_dqn_size = eprt * GU_dqn_k * GU_dqn_n * 2
+    print("[FEIFEI] model_dim(K) = ", model_dim)
+    print("[FEIFEI] inter_dim(N) = ", inter_dim)
+    print("[FEIFEI] eprt = ", eprt)
+    print("[FEIFEI] topk = ", topk)
+    print("[FEIFEI] GU_dqn_k_lqq = ", GU_dqn_k_lqq)
+    print("[FEIFEI] GU_dqn_n_lqq = ", GU_dqn_n_lqq)
+    print("[FEIFEI] GU_dqn_lqq_size = ", GU_dqn_lqq_size)
+    print("[FEIFEI] sz_GU = ", sz_GU)
+    print("[FEIFEI] GU_dqn_n = ", GU_dqn_n)
+    print("[FEIFEI] GU_dqn_n2 = ", GU_dqn_size // eprt // GU_dqn_k)
+    print("[FEIFEI] GU_dqn_size = ", GU_dqn_size)
+
+    # input quant for kernel
+    a1_qt, a1_scale = aiter.pertoken_quant(input, quant_dtype=AQDType)
+
+    # lqq init for kernel
     w1_lqq_scale, w1_lqq_zero = moe_init_lqq(
         eprt, GU_dqn_lqq_size // eprt // GU_dqn_k_lqq, GU_dqn_k_lqq, 1, -100, 100
     )
     save_buffer_to_file(w1_lqq_scale, "./feifei/w1_lqq_scale", format="binary")
     save_buffer_to_file(w1_lqq_zero, "./feifei/w1_lqq_zero", format="binary")
+    w1_lqq_zero_uint8 = (w1_lqq_zero.to(torch.int16) + 128).to(torch.uint8)
+    save_buffer_to_file(
+        w1_lqq_zero_uint8, "./feifei/w1_lqq_zero_uint8", format="binary"
+    )
     w1_lqq_uint4 = moe_init_uint4(eprt, sz_GU // model_dim // eprt, model_dim, 1)
     save_buffer_to_file(w1_lqq_uint4, "./feifei/w1_lqq_uint4", format="binary")
+
+    # gu quant for cpu ref
     w1_qt = moe_lqq_dequant(w1_lqq_uint4, w1_lqq_scale, w1_lqq_zero)
     save_buffer_to_file(w1_qt, "./feifei/w1_qt", format="binary")
+    w1_scale = moe_init_float(eprt, GU_dqn_size // eprt // GU_dqn_k, GU_dqn_k, 1)
+    save_buffer_to_file(w1_scale, "./feifei/w1_scale", format="text")
 
-    """
-    w2_qt, fc2_scale = aiter.pertoken_quant(w2, quant_dtype=dtypes.i8, dtypeMax=7)
-    w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
-    w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
-
-    # b implement
-    # pre-shuffle
-    w1_scale_aiter = fc1_scale
-    w2_scale_aiter = fc2_scale
-    w1_qt_aiter = rearrange_4bit_elements(
-        convert_int8_to_uint32_int4(
-            shuffle_weight(w1_qt_aiter, (16, 16), use_int4=True)
-        )
+    print("[FEIFEI] w1_qt = ", w1_qt.shape)
+    print("[FEIFEI] w1_scale = ", w1_scale.shape)
+    out1_ref = torch_moe_stage1(
+        a1_qt,
+        w1_qt,
+        w2,
+        topk_weights,
+        topk_ids,
+        dtype=dtype,
+        activation=aiter.ActivationType.Silu,
+        quant_type=aiter.QuantType.per_Token,
+        a1_scale=a1_scale,
+        w1_scale=w1_scale,
+        doweight=False,
     )
-    w2_qt_aiter = rearrange_4bit_elements(
-        convert_int8_to_uint32_int4(
-            shuffle_weight(w2_qt_aiter, (16, 16), use_int4=True)
-        )
-    )
-    w1_scale_aiter = fp4_utils.e8m0_shuffle(fc1_scale)
-    w2_scale_aiter = fp4_utils.e8m0_shuffle(fc2_scale)
-    """
 
 
 parser = argparse.ArgumentParser(
