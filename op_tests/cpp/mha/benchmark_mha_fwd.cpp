@@ -3,6 +3,7 @@
 #include "ck_tile/host.hpp"
 #include "ck_tile/ref/naive_attention.hpp"
 #include "mha_fwd.h"
+#include "quant.hpp"
 #include "rotary.hpp"
 #include "utils.hpp"
 
@@ -45,24 +46,13 @@ auto create_args(int argc, char* argv[])
                 "along seqlen, instead of packed. same as xformer kv_padding")
         .insert("d", "128", "head dim for q, k")
         .insert("d_v", "-1", "head dim for v, -1 means equal to d")
-        .insert("scale_s",
-                "0",
-                "scale factor of S. 0 means equal to 1/sqrt(hdim).\n"
-                "note when squant=1, this value will be modified by range_q/k")
+        .insert("scale_s", "0", "scale factor of S. 0 means equal to 1/sqrt(hdim)")
         .insert("logits_soft_cap", "0", "attention logits soft capping value.")
-        .insert("range_q", "16", "per-tensor quantization range of q. used if squant=1.")
-        .insert("range_k", "16", "per-tensor quantization range of k. used if squant=1.")
-        .insert("range_v", "16", "per-tensor quantization range of v. used if squant=1.")
-        .insert("range_p", "1", "per-tensor quantization range of p [e^(s-m)]. used if squant=1.")
-        .insert("range_o", "16", "per-tensor quantization range of o (p*v). used if squant=1.")
-        .insert("squant",
-                "auto",
-                "if using static quantization fusion or not. auto: fp8 will default use squant, "
-                "other will not\n"
-                "0: no static quant(not implemented) 1: apply scale_p and scale_o with respect to "
-                "P and O.\n"
-                "calculate scale_s, scale_p, scale_o according to range_q, range_k, range_v, "
-                "range_p, range_o")
+        .insert("qscale",
+                "n",
+                "quantization scale type\n"
+                "n or 0: no scale\n"
+                "pt or 1: per-tensor scale")
         .insert("iperm",
                 "1",
                 "permute input\n"
@@ -402,18 +392,8 @@ bool run(const ck_tile::ArgParser& arg_parser)
 
     const float logits_soft_cap = arg_parser.get_float("logits_soft_cap");
 
-    std::string squant_str = arg_parser.get_str("squant");
-    bool squant            = [&]() {
-        if(squant_str == "auto")
-        {
-            if(data_type == "fp8")
-                return true;
-            else
-                return false;
-        }
-        else
-            return atoi(squant_str.c_str()) != 0 ? true : false;
-    }();
+    std::string qscale_str = arg_parser.get_str("qscale");
+    quant_scale_info qscale = quant_scale_info::decode(qscale_str);
 
     std::string vlayout = arg_parser.get_str("vlayout");
     bool lse            = arg_parser.get_bool("lse");
@@ -484,26 +464,28 @@ bool run(const ck_tile::ArgParser& arg_parser)
     using OaccDataType          = typename TypeConfig::OaccDataType;
     using ODataType             = typename TypeConfig::ODataType;
 
-    float range_q = arg_parser.get_float("range_q");
-    float range_k = arg_parser.get_float("range_k");
-    float range_v = arg_parser.get_float("range_v");
-    float range_p = arg_parser.get_float("range_p");
-    float range_o = arg_parser.get_float("range_o");
-
+    // For FP8 quantization, we need descale values
     float q_dtype_max = ck_tile::type_convert<float>(ck_tile::numeric<QDataType>::max());
     float k_dtype_max = ck_tile::type_convert<float>(ck_tile::numeric<KDataType>::max());
     float v_dtype_max = ck_tile::type_convert<float>(ck_tile::numeric<VDataType>::max());
-    float p_dtype_max = v_dtype_max; // assume p and v is the same type
-    float o_dtype_max = ck_tile::type_convert<float>(ck_tile::numeric<ODataType>::max());
 
-    float scale_p = 1.f;
-    float scale_o = 1.f;
+    ck_tile::HostTensor<float> q_descale_host(
+        qscale.type != quant_scale_enum::no_scale ? std::array<ck_tile::index_t, 1>{1}
+                                                   : std::array<ck_tile::index_t, 1>{0});
+    ck_tile::HostTensor<float> k_descale_host(
+        qscale.type != quant_scale_enum::no_scale ? std::array<ck_tile::index_t, 1>{1}
+                                                   : std::array<ck_tile::index_t, 1>{0});
+    ck_tile::HostTensor<float> v_descale_host(
+        qscale.type != quant_scale_enum::no_scale ? std::array<ck_tile::index_t, 1>{1}
+                                                   : std::array<ck_tile::index_t, 1>{0});
 
-    if(squant)
+    if(qscale.type == quant_scale_enum::pertensor)
     {
-        scale_s = scale_s * (range_q / q_dtype_max) * (range_k / k_dtype_max);
-        scale_p = p_dtype_max / range_p;
-        scale_o = (o_dtype_max / range_o) * (range_p / p_dtype_max) * (range_v / v_dtype_max);
+        // Use fixed qkv_max = 3.f for per-tensor quantization
+        float qkv_max     = 3.f;
+        q_descale_host(0) = qkv_max / q_dtype_max;
+        k_descale_host(0) = qkv_max / k_dtype_max;
+        v_descale_host(0) = qkv_max / v_dtype_max;
     }
 
     // accumulation numbers for performance evaluation
@@ -704,6 +686,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
     else if(init_method == "ufq" || init_method == "uf:q" ||
             init_method == "3") // suitable for fp8 quantization
     {
+        float qkv_max = 3.f;  // Fixed value for quantization
         ck_tile::FillUniformDistribution<QDataType>{-q_dtype_max, q_dtype_max, next_seed()}(q_host);
         ck_tile::FillUniformDistribution<KDataType>{-k_dtype_max, k_dtype_max, next_seed()}(k_host);
         ck_tile::FillUniformDistribution<KDataType>{-k_dtype_max, k_dtype_max, next_seed()}(
@@ -712,9 +695,9 @@ bool run(const ck_tile::ArgParser& arg_parser)
         ck_tile::FillUniformDistribution<VDataType>{-v_dtype_max, v_dtype_max, next_seed()}(
             vnew_host);
 
-        // bias_fp8 = qscale_bias * bias_fp32
-        float qscale_bias = (q_dtype_max / range_q) * (k_dtype_max / range_k);
-        // Assume bias is in [-1.f, 1.f] in original fp32
+        // For FP8 bias: bias_fp8 = (q_descale * k_descale) * bias_fp32
+        // Assume bias is in [-1.f, 1.f] in original fp32, scale it by qkv_max^2 / (q_dtype_max * k_dtype_max)
+        float qscale_bias = (qkv_max / q_dtype_max) * (qkv_max / k_dtype_max);
         ck_tile::FillUniformDistribution<BiasDataType>{-qscale_bias, qscale_bias, next_seed()}(
             bias_host);
     }
@@ -745,6 +728,9 @@ bool run(const ck_tile::ArgParser& arg_parser)
     ck_tile::DeviceMem v_buf(v_host.get_element_space_size_in_bytes());
     ck_tile::DeviceMem vnew_buf(vnew_host.get_element_space_size_in_bytes());
     ck_tile::DeviceMem bias_buf(bias_host.get_element_space_size_in_bytes());
+    ck_tile::DeviceMem q_descale_buf(q_descale_host.get_element_space_size_in_bytes());
+    ck_tile::DeviceMem k_descale_buf(k_descale_host.get_element_space_size_in_bytes());
+    ck_tile::DeviceMem v_descale_buf(v_descale_host.get_element_space_size_in_bytes());
     ck_tile::DeviceMem lse_acc_buf(lse_acc_host.get_element_space_size_in_bytes());
     ck_tile::DeviceMem o_acc_buf(o_acc_host.get_element_space_size_in_bytes());
     ck_tile::DeviceMem lse_buf(lse_host.get_element_space_size_in_bytes());
@@ -772,6 +758,9 @@ bool run(const ck_tile::ArgParser& arg_parser)
     v_buf.ToDevice(v_host.data());
     vnew_buf.ToDevice(vnew_host.data());
     bias_buf.ToDevice(bias_host.data());
+    q_descale_buf.ToDevice(q_descale_host.data());
+    k_descale_buf.ToDevice(k_descale_host.data());
+    v_descale_buf.ToDevice(v_descale_host.data());
     seqstart_q.ToDevice(seqstart_q_host.data());
     seqstart_k.ToDevice(seqlen_kpads[0] < 0 ? seqstart_k_host.data()
                                             : seqstart_k_with_padding_host.data());
@@ -804,7 +793,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
               << (seqlen_kpads[0] < 0 ? ""
                                       : (std::string("(") + std::to_string(seqlen_kpads[0]) + ")"))
               << ", d:" << hdim_q << "/" << hdim_v << ", scale_s:" << scale_s << ", bias:" << bias
-              << ", p_drop:" << p_drop << ", lse:" << lse << ", squant:" << squant
+              << ", p_drop:" << p_drop << ", lse:" << lse << ", qscale:" << qscale
               << ", mask:" << mask << ", v:" << vlayout;
 
 #if CK_TILE_FMHA_FWD_SPLITKV_API
@@ -1000,15 +989,48 @@ bool run(const ck_tile::ArgParser& arg_parser)
                 {
                     args.drop_seed_offset = std::make_pair(drop_seed, drop_offset);
                 }
-                args.use_asm_v3      = fwd_v3;
-                args.how_v3_bf16_cvt = v3_bf16_cvt;
-                args.v3_api_check    = is_v3_check;
-                args.data_type       = data_type;
-                args.is_group_mode   = (mode == mode_enum::group);
-                args.bias_type       = static_cast<int>(bias.type);
-                args.has_lse         = lse;
-                args.qscale_type     = static_cast<int>(quant_scale_enum::no_scale);
-                args.has_sink        = false;
+                args.use_asm_v3          = fwd_v3;
+                args.how_v3_bf16_cvt     = v3_bf16_cvt;
+                args.v3_api_check        = is_v3_check;
+                args.data_type           = data_type;
+                args.is_group_mode       = (mode == mode_enum::group);
+                args.bias_type           = static_cast<int>(bias.type);
+                args.has_lse             = lse;
+                args.qscale_type         = static_cast<int>(quant_scale_enum::no_scale);
+                args.has_sink            = false;
+                args.sink_size           = 0;
+                args.min_seqlen_q        = 0;
+                args.block_scale_size_q  = 128;
+                args.block_scale_size_kv = 128;
+
+                // Sequence length pointers (nullptr in batch mode without padding)
+                args.cu_seqlen_q_ptr = nullptr;
+                args.cu_seqlen_k_ptr = nullptr;
+                args.block_scale_seqstart_q_ptr = nullptr;
+                args.block_scale_seqstart_k_ptr = nullptr;
+                args.sink_ptr = nullptr;
+
+                // Descale strides (set to 0 when qscale is disabled)
+                args.nhead_stride_q_descale  = 0;
+                args.nhead_stride_k_descale  = 0;
+                args.nhead_stride_v_descale  = 0;
+                args.batch_stride_q_descale  = 0;
+                args.batch_stride_k_descale  = 0;
+                args.batch_stride_v_descale  = 0;
+
+                // Set descale pointers (nullptr when qscale is disabled)
+                if(qscale.type == quant_scale_enum::no_scale)
+                {
+                    args.q_descale_ptr = nullptr;
+                    args.k_descale_ptr = nullptr;
+                    args.v_descale_ptr = nullptr;
+                }
+                else
+                {
+                    args.q_descale_ptr = q_descale_buf.GetDeviceBuffer();
+                    args.k_descale_ptr = k_descale_buf.GetDeviceBuffer();
+                    args.v_descale_ptr = v_descale_buf.GetDeviceBuffer();
+                }
             }
             else if constexpr(std::is_same_v<fmha_fwd_splitkv_args, std::decay_t<decltype(args)>>)
             {
@@ -1135,17 +1157,34 @@ bool run(const ck_tile::ArgParser& arg_parser)
     lse_buf.FromDevice(lse_host.data());
     randval_buf.FromDevice(randval_host.data());
 
+    constexpr bool supports_qscale = std::is_same_v<DataTypeConfig, FmhaFwdFp8> ||
+                                     std::is_same_v<DataTypeConfig, FmhaFwdFp8Bf16> ||
+                                     std::is_same_v<DataTypeConfig, FmhaFwdFp8Fp32>;
+
+    float scale_s_host = scale_s;
+    float scale_p_host = 1.0f;
+    float scale_o_host = 1.0f;
+
+    if(qscale.type == quant_scale_enum::pertensor)
+    {
+        scale_s_host = scale_s * q_descale_host(0) * k_descale_host(0);
+        scale_p_host = ck_tile::type_convert<float>(ck_tile::numeric<PDataType>::max());
+        scale_o_host = v_descale_host(0) / scale_p_host;
+    }
+
     auto p_compute_element_func = [&]() {
-        if constexpr(std::is_same_v<DataTypeConfig, ck_tile::fp8_t>)
-            return ck_tile::scales{scale_p};
+        if constexpr(supports_qscale)
+            return ck_tile::scales{scale_p_host};
         else
             return ck_tile::identity{};
     }();
 
     auto oacc_element_func = [&]() {
-        if constexpr(std::is_same_v<DataTypeConfig, ck_tile::fp8_t>)
-            return ck_tile::composes(ck_tile::saturates<ck_tile::fp8_t>{},
-                                     ck_tile::scales{scale_o});
+        if constexpr(std::is_same_v<ODataType, ck_tile::fp8_t> && supports_qscale)
+            return ck_tile::make_composes(ck_tile::saturates<ck_tile::fp8_t>{},
+                                          ck_tile::scales{scale_o_host});
+        else if constexpr(supports_qscale)
+            return ck_tile::scales{scale_o_host};
         else
             return ck_tile::identity{};
     }();
@@ -1255,7 +1294,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
             s_host_ref,
             ck_tile::identity{},
             ck_tile::identity{},
-            ck_tile::scales(scale_s));
+            ck_tile::scales(scale_s_host));
 
         if(0.f < logits_soft_cap)
         {
