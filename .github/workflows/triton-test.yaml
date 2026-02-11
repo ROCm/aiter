@@ -205,9 +205,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: triton-test-shard-*
-          merge-multiple: true
           path: .
       
+      - name: List test reports
+        run: |
+          ls -l triton-test-shard-*
+          
       - name: Check Triton Test Results
         run: |
           set -ex
