@@ -76,10 +76,11 @@ def gemm_tdm_pipelined_blockscale_kernel(a_ptr, b_ptr, c_ptr,  #
     SHARED_LAYOUT_A: ttgl.constexpr = shared_layouts[0]
     SHARED_LAYOUT_B: ttgl.constexpr = shared_layouts[1]
 
-    SHARED_LAYOUT_A_SCALE: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[BLOCK_K, K_WIDTH]], [BLOCK_M, BLOCK_K],
-                                                                                [1, 0])
-    SHARED_LAYOUT_B_SCALE: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[BLOCK_K, K_WIDTH]], [BLOCK_N, BLOCK_K],
-                                                                                    [1, 0])
+    SHARED_LAYOUT_A_SCALE: ttgl.constexpr = gl.SwizzledSharedLayout(
+        vec=16, per_phase=2, max_phase=8, order=[0]
+    )
+    SHARED_LAYOUT_B_SCALE: ttgl.constexpr = ttgl.SwizzledSharedLayout(
+        vec=16, per_phase=2, max_phase=8, order=[0])
                                                                                     
     OPERAND_LAYOUT_A: ttgl.constexpr = ttgl.DotOperandLayout(0, WMMA_LAYOUT, K_WIDTH)
     OPERAND_LAYOUT_B: ttgl.constexpr = ttgl.DotOperandLayout(1, WMMA_LAYOUT, K_WIDTH)
@@ -91,12 +92,6 @@ def gemm_tdm_pipelined_blockscale_kernel(a_ptr, b_ptr, c_ptr,  #
     pid_n = pid // num_pid_m
 
 
-    shared_a_scale: ttgl.constexpr = ttgl.SwizzledSharedLayout(
-        vec=16, per_phase=2, max_phase=8, order=[0, 1]
-    )
-    shared_b_scale: ttgl.constexpr = ttgl.SwizzledSharedLayout(
-        vec=16, per_phase=2, max_phase=8, order=[1, 0]
-    )
 
     a_desc, b_desc = create_tensor_descriptors(a_ptr, b_ptr, pid_m * BLOCK_M * stride_am, pid_n * BLOCK_N * stride_bn,
                                                stride_am, stride_ak, stride_bn, stride_bk, SHARED_LAYOUT_A,
@@ -109,25 +104,6 @@ def gemm_tdm_pipelined_blockscale_kernel(a_ptr, b_ptr, c_ptr,  #
                                                SHARED_LAYOUT_B_SCALE, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, TRANSPOSE_B)
     a_scale_buffer = ttgl.allocate_shared_memory(a_scale.dtype, shape=[NUM_BUFFERS] + a_scale.block_shape, layout=a_scale.layout)
     b_scale_buffer = ttgl.allocate_shared_memory(b_scale.dtype, shape=[NUM_BUFFERS] + b_scale.block_shape, layout=b_scale.layout)
-    
-    threads_per_elem_mk: gl.constexpr = triton.cdiv(
-        BLOCK_M * BLOCK_K // (num_warps * 64), K_WIDTH
-    )
-    threads_per_elem_kn: gl.constexpr = triton.cdiv(
-        BLOCK_K * BLOCK_N // (num_warps * 64), K_WIDTH
-    )
-    blocked_mk: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[threads_per_elem_mk, 16],
-        threads_per_warp=[8, 8],
-        warps_per_cta=[num_warps, 1],
-        order=[1, 0],
-    )
-    blocked_kn: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[16, threads_per_elem_kn],
-        threads_per_warp=[8, 8],
-        warps_per_cta=[1, num_warps],
-        order=[0, 1],
-    )
 
     producer = 0
     scale_producer = 0
