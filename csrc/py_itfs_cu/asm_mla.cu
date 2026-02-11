@@ -291,6 +291,14 @@ void mla_decode_stage1_asm_fwd(
                 config_max_seqlen_q = 0;
                 sub_Q = 64;
             }
+        } else if (q_type == "fp8" && kv_type == "fp8"){
+            if((max_seqlen_q == 4) && persistent){
+                config_max_seqlen_q = 4;
+                sub_Q = 128;
+            } else {
+                TORCH_CHECK(false, __func__, 
+                    ": fp8/fp8 with gqa_ratio=32 only supports decode_qlen=4 in persistent mode");
+            }
         }
     } else if (gqa_ratio == 64){
         if (q_type == "bf16" && kv_type == "bf16"){
