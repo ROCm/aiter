@@ -100,6 +100,8 @@ def fused_moe(
     w2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
+    w1_lqq_scale: Optional[torch.tensor] = None,
+    w1_lqq_zero: Optional[torch.tensor] = None,
     # following for tuning
     block_size_M=None,
     num_local_tokens: Optional[torch.tensor] = None,
@@ -128,6 +130,8 @@ def fused_moe(
         w2_scale=w2_scale,
         a1_scale=a1_scale,
         a2_scale=a2_scale,
+        w1_lqq_scale=w1_lqq_scale,
+        w1_lqq_zero=w1_lqq_zero,
         block_size_M=block_size_M,
         num_local_tokens=num_local_tokens,
         moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
@@ -188,6 +192,8 @@ def fused_moe_(
     w2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
+    w1_lqq_scale: Optional[torch.Tensor] = None,
+    w1_lqq_zero: Optional[torch.Tensor] = None,
     # following for tuning
     block_size_M: int = -1,
     num_local_tokens: Optional[torch.Tensor] = None,
@@ -206,6 +212,8 @@ def fused_moe_(
     """user API"""
     M, topk = topk_ids.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    if quant_type == QuantType.per_Token:  # feifei: use lqq enum
+        inter_dim = inter_dim // 2
 
     assert w1.shape[1] in [
         inter_dim,
@@ -313,6 +321,8 @@ def fused_moe_(
             w2_scale=w2_scale,
             a1_scale=a1_scale,
             a2_scale=a2_scale,
+            w1_lqq_scale=w1_lqq_scale,
+            w1_lqq_zero=w1_lqq_zero,
             num_local_tokens=num_local_tokens,
             # following for cktile support
             hidden_pad=hidden_pad,
@@ -699,6 +709,7 @@ def get_2stage_cfgs(
         kernelName1 = ""
         kernelName2 = ""
         run_1stage = False
+        """
         if (
             activation,
             q_type,
@@ -717,7 +728,7 @@ def get_2stage_cfgs(
                 run_1stage = token > 16
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
-
+        """
         block_m = (
             BLOCK_SIZE_M
             if run_1stage
@@ -902,6 +913,8 @@ def fused_moe_2stages(
     w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
+    w1_lqq_scale: Optional[torch.Tensor] = None,
+    w1_lqq_zero: Optional[torch.Tensor] = None,
     num_local_tokens: Optional[torch.tensor] = None,
     # following for cktile support
     hidden_pad=0,
@@ -913,6 +926,8 @@ def fused_moe_2stages(
     token_num_quant_moe_sort_switch = 1024
     token_num, _ = hidden_states.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    if quant_type == QuantType.per_Token:  # feifei: use lqq enum
+        inter_dim = inter_dim // 2
     dtype = moe_out.dtype
     device = hidden_states.device
     metadata = get_2stage_cfgs(
@@ -979,7 +994,7 @@ def fused_moe_2stages(
                 token_num=token_num,
                 block_size=block_size_M,
             )
-    elif hidden_states.dtype != q_dtype_a:
+    elif hidden_states.dtype != q_dtype_a and a1_scale is None:
         if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
             quant_func = functools.partial(quant_func, transpose_scale=True)
         a1, a1_scale = quant_func(
@@ -1000,6 +1015,14 @@ def fused_moe_2stages(
             dtype=q_dtype_a,
             device=device,
         )
+    elif quant_type == QuantType.per_Token:  # feifei: add enum lqq
+        a2 = torch.empty(
+            (token_num, topk, inter_dim),
+            dtype=dtype,
+            device=device,
+        )
+        a1 = hidden_states.repeat(topk, 1, 1)  # feifei:fix me for multiX
+        a1_scale = a1_scale.repeat(topk, 1, 1)
     else:
         a2 = torch.empty(
             (token_num, topk, inter_dim),
@@ -1031,9 +1054,12 @@ def fused_moe_2stages(
         w1_scale=(
             w1_scale.view(dtypes.fp8_e8m0) if w1.dtype == dtypes.fp4x2 else w1_scale
         ),
+        w1_lqq_scale=w1_lqq_scale,
+        w1_lqq_zero=w1_lqq_zero,
         sorted_weights=sorted_weights if doweight_stage1 else None,
         **extra_stage1_args,
     )
+    return a2  # feifei test
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
@@ -1145,6 +1171,8 @@ def asm_stage1(
     quant_type=QuantType.No,
     a1_scale=None,
     w1_scale=None,
+    w1_lqq_scale: Optional[torch.Tensor] = None,
+    w1_lqq_zero: Optional[torch.Tensor] = None,
     sorted_weights=None,
 ):
     dtype = dtypes.bf16  # out.dtype, asm only support bf16
@@ -1153,6 +1181,8 @@ def asm_stage1(
     device = out.device
     token_num, _, _ = out.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    if quant_type == QuantType.per_Token:  # feifei: use lqq enum
+        inter_dim = inter_dim // 2
 
     if quant_type == QuantType.per_Tensor:
         a1_scale = a1_scale.view(1, 1).repeat(token_num, 1)
@@ -1183,6 +1213,8 @@ def asm_stage1(
         quant_type=quant_type,
         a1_scale=a1_scale,
         w1_scale=w1_scale,
+        w1_lqq_scale=w1_lqq_scale,
+        w1_lqq_zero=w1_lqq_zero,
         sorted_weights=sorted_weights,
     )
     if ksplit > 0:

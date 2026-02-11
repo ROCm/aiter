@@ -62,6 +62,31 @@ struct __attribute__((packed)) KernelArgs
     p3 _p23;
     unsigned int ps_deno;
     p3 _p24;
+    void *ptr_Qscl;
+    p2 _p25;
+    void *ptr_Qzero;
+    p2 _p26;
+    unsigned int eLQQs;
+    p3 _p27;
+    void log()
+    {
+        printf("[KARG] dim = %d\n", dim);
+        printf("[KARG] hidden_dim = %d\n", hidden_dim);
+        printf("[KARG] token_cnt = %d\n", token_cnt);
+        printf("[KARG] eprt_cnt = %d\n", eprt_cnt);
+        printf("[KARG] Xs = %d\n", Xs);
+        printf("[KARG] GUs = %d\n", GUs);
+        printf("[KARG] Os = %d\n", Os);
+        printf("[KARG] eGUs = %d\n", eGUs);
+        printf("[KARG] eGUQs = %d\n", eGUQs);
+        printf("[KARG] eSMQs = %d\n", eSMQs);
+        printf("[KARG] topk = %d\n", topk);
+        printf("[KARG] splitk = %d\n", splitk);
+        printf("[KARG] activation = %d\n", activation);
+        printf("[KARG] total_tgs = %d\n", total_tgs);
+        printf("[KARG] ps_deno = %d\n", ps_deno);
+        printf("[KARG] eLQQs = %d\n", eLQQs);
+    }
 };
 struct __attribute__((packed)) Kernel2Args
 {
@@ -143,6 +168,11 @@ static CFG* get_cfg(torch::Tensor& inp,
             (out.scalar_type() == at::ScalarType::Char) && quant_type == QuantType::per_Token)
     {
         return &cfg_fmoe_stage1_int8_pertokenInt8_g1u1;
+    }
+    else if(inp.scalar_type() == at::ScalarType::Char && w1.scalar_type() == at::ScalarType::Int4 &&
+            (out.scalar_type() == at::ScalarType::BFloat16) && quant_type == QuantType::per_Token) // feifei : use lqq enum
+    {
+        return &cfg_fmoe_stage1_bf16_pertokenInt8_g1u1;
     }
     else
     {
@@ -232,6 +262,138 @@ std::string get_heuristic_kernel(int m_num, int N, int blockk_size, CFG* cfgs, s
     }
     return selected;
 }
+int save_int8(const char* filename, int8_t* array, size_t size) {
+    if (filename == NULL || array == NULL || size == 0) {
+        return -1;
+    }    
+    FILE* file = fopen(filename, "wb");
+    if (file == NULL) {
+        return -1;
+    }
+    
+    int8_t* ptr = new int8_t[size];
+    hipMemcpy(ptr, array, size * sizeof(int8_t), hipMemcpyDeviceToHost);
+    size_t elements_written = fwrite(ptr, sizeof(int8_t), size, file);
+    delete[] ptr;
+    
+    if (elements_written != size) {
+        fclose(file);
+        return -1;
+    }
+    
+    fclose(file);
+    return 0;
+}
+int save_int8_fmt(const char* filename, int8_t* array, size_t size)
+{
+    int items_per_line = 16;
+    if (filename == NULL || array == NULL || size == 0) {
+        return -1;
+    }
+    
+    FILE* fp = fopen(filename, "w");
+    if (fp == NULL) {
+        perror("Error opening file");
+        return -1;
+    }
+    
+    fprintf(fp, "Index | Value\n");
+    fprintf(fp, "-------------\n");
+    
+    int8_t* ptr = new int8_t[size];
+    hipMemcpy(ptr, array, size * sizeof(int8_t), hipMemcpyDeviceToHost);
+    for (size_t i = 0; i < size; i++) {
+        fprintf(fp, "%d", ptr[i]);
+        
+        if (items_per_line > 0 && (i + 1) % items_per_line == 0) {
+            fprintf(fp, "\n");
+        } else if (i < size - 1) {
+            fprintf(fp, " ");
+        }
+    }
+    delete[] ptr;
+    
+    if (items_per_line == 0 || size % items_per_line != 0) {
+        fprintf(fp, "\n");
+    }
+    
+    fclose(fp);
+    return 0;
+}
+template<typename T>
+int save_int_fmt(const char* filename, T* array, size_t size)
+{
+    int items_per_line = 16;
+    if (filename == NULL || array == NULL || size == 0) {
+        return -1;
+    }
+    
+    FILE* fp = fopen(filename, "w");
+    if (fp == NULL) {
+        perror("Error opening file");
+        return -1;
+    }
+    
+    fprintf(fp, "Index | Value | size = %zu\n", size);
+    fprintf(fp, "-------------\n");
+    
+    T* ptr = new T[size];
+    hipMemcpy(ptr, array, size * sizeof(T), hipMemcpyDeviceToHost);
+    for (size_t i = 0; i < size; i++) {
+        fprintf(fp, "%d", ptr[i]);
+        
+        if (items_per_line > 0 && (i + 1) % items_per_line == 0) {
+            fprintf(fp, "\n");
+        } else if (i < size - 1) {
+            fprintf(fp, " ");
+        }
+    }
+    delete[] ptr;
+    
+    if (items_per_line == 0 || size % items_per_line != 0) {
+        fprintf(fp, "\n");
+    }
+    
+    fclose(fp);
+    return 0;
+}
+int save_float(const char* filename, float* array, size_t size)
+{
+    int items_per_line = 16;
+    if (filename == NULL || array == NULL || size == 0) {
+        return -1;
+    }
+    
+    FILE* fp = fopen(filename, "w");
+    if (fp == NULL) {
+        perror("Error opening file");
+        return -1;
+    }
+    
+    fprintf(fp, "Index | Value\n");
+    fprintf(fp, "-------------\n");
+    
+    float* ptr = new float[size];
+    hipMemcpy(ptr, array, size * sizeof(float), hipMemcpyDeviceToHost);
+    for (size_t i = 0; i < size; i++) {
+        fprintf(fp, "%.4e", ptr[i]);
+        
+        if (items_per_line > 0 && (i + 1) % items_per_line == 0) {
+            fprintf(fp, "\n");
+        } else if (i < size - 1) {
+            fprintf(fp, " ");
+        }
+    }
+    delete[] ptr;
+    
+    if (items_per_line == 0 || size % items_per_line != 0) {
+        fprintf(fp, "\n");
+    }
+    
+    fclose(fp);
+    return 0;
+}
+
 void moe_stage1_g1u1(
     torch::Tensor& input,             // [token_cnt, model_dim] M,K
     torch::Tensor& w1,                // [expert, inter_dim*2, model_dim] N,K
@@ -248,6 +410,8 @@ void moe_stage1_g1u1(
     QuantType quant_type                  = QuantType::No,
     std::optional<torch::Tensor> a1_scale = std::nullopt, // [token_cnt, 1], token scale
     std::optional<torch::Tensor> w1_scale = std::nullopt, // [expert, 1, inter_dim], gate(up) scale
+    std::optional<torch::Tensor> w1_lqq_scale = std::nullopt, // [expert, inter_dim*2, model_dim/group_in_k_lqq] N,Klqq
+    std::optional<torch::Tensor> w1_lqq_zero = std::nullopt, // [expert, inter_dim*2, model_dim/group_in_k_lqq] N,Klqq
     std::optional<torch::Tensor> fc2_smooth_scale = std::nullopt,
     std::optional<torch::Tensor> fc2_scale        = std::nullopt,
     std::optional<torch::Tensor> sorted_weights =
@@ -289,6 +453,9 @@ void moe_stage1_g1u1(
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
 
+        printf("[KERNEL] name = %s\n", name);
+        printf("[KERNEL] co_name = %s\n", co_name);
+
         TORCH_CHECK(inter_dim % cfg.tile_n == 0,
                     "ASM kernel " + std::string(name) +
                         " is not supported for inter_dim = " + std::to_string(inter_dim));
@@ -314,12 +481,14 @@ void moe_stage1_g1u1(
                 cfg.tile_m);
 
     int stride_X  = input.stride(-2) * input.element_size();
-    int stride_GU = model_dim * w1.element_size();
+    //int stride_GU = model_dim * w1.element_size();
+    int stride_GU = w1.stride(-2) * w1.element_size(); // feifei
 
     int stride_expert_GU    = stride_GU * inter_dim;
     int stride_expert_GUDQN = w1_scale.has_value() ? w1_scale.value().stride(0) * sizeof(float) : 0;
     int stride_expert_SMTDQN = inter_dim * sizeof(float);
     int stride_O             = topk * inter_dim * out.element_size();
+    int stride_expert_LQQ    = w1_lqq_scale.has_value() ? w1_lqq_scale.value().stride(0) : 0;
 
     if(inter_dim * 2 == w1.size(1))
     {
@@ -353,6 +522,11 @@ void moe_stage1_g1u1(
     args.splitk     = ksplit;
     args.activation = static_cast<int>(activation);
     args.ptr_SW     = sorted_weights.has_value() ? sorted_weights.value().data_ptr() : nullptr;
+    args.total_tgs  = 0;
+    args.ps_deno    = ((inter_dim+sub_GU-1)/sub_GU);
+    args.ptr_Qscl   = w1_lqq_scale.has_value() ? w1_lqq_scale.value().data_ptr() : nullptr;
+    args.ptr_Qzero  = w1_lqq_zero.has_value() ? w1_lqq_zero.value().data_ptr() : nullptr;
+    args.eLQQs      = stride_expert_LQQ;
 
     uint32_t k_num = 1 << ksplit;
     TORCH_CHECK(model_dim % k_num == 0,
@@ -397,7 +571,46 @@ void moe_stage1_g1u1(
     // std::cout << " args.splitk      = " << args.splitk << std::endl;
     // std::cout << " args.activation  = " << args.activation << std::endl;
     // std::cout << " args.ptr_SW      = " << args.ptr_SW << std::endl;
-    // printf("gdx:%d, gdy:%d, gdz:%d, tgs:%d\n", gdx, gdy, gdz, sub_X_cnt * gdx * gdz);
+    args.log();
+    printf("[DEV_BUF] dev_O: out = %lu bytes\n", out.numel() * out.element_size());
+    printf("[DEV_BUF] dev_X: input = %lu bytes\n", input.numel() * input.element_size());
+    printf("[DEV_BUF] dev_GU: w1 = %lu bytes\n", w1.numel() * w1.element_size());
+    printf("[DEV_BUF] dev_XC: num_valid_ids = %lu bytes\n", num_valid_ids.numel() * num_valid_ids.element_size());
+    printf("[DEV_BUF] dev_X_dqn_buf: a1_scale = %lu bytes\n", a1_scale.has_value() ? a1_scale.value().numel() * a1_scale.value().element_size() : 0);
+    printf("[DEV_BUF] dev_GU_dqn_buf: w1_scale = %lu bytes\n", w1_scale.has_value() ? w1_scale.value().numel() * w1_scale.value().element_size() : 0);
+    printf("[DEV_BUF] dev_Smooth_qnt_buf: fc2_smooth_scale = %lu bytes\n", fc2_smooth_scale.has_value() ? fc2_smooth_scale.value().numel() * fc2_smooth_scale.value().element_size() : 0);
+    printf("[DEV_BUF] dev_STP: sorted_token_ids = %lu bytes\n", sorted_token_ids.numel() * sorted_token_ids.element_size());
+    printf("[DEV_BUF] dev_SEP: sorted_expert_ids = %lu bytes\n", sorted_expert_ids.numel() * sorted_expert_ids.element_size());
+    printf("[DEV_BUF] dev_SW: sorted_weights = %lu bytes\n", sorted_weights.has_value() ? sorted_weights.value().numel() * sorted_weights.value().element_size() : 0);
+    printf("[DEV_BUF] dev_Qscl: w1_lqq_scale = %lu bytes\n", w1_lqq_scale.has_value() ? w1_lqq_scale.value().numel() * w1_lqq_scale.value().element_size() : 0);
+    printf("[DEV_BUF] dev_Qzero: w1_lqq_zero = %lu bytes\n", w1_lqq_zero.has_value() ? w1_lqq_zero.value().numel() * w1_lqq_zero.value().element_size() : 0);
+    printf("argsize: %zu\n", arg_size);
+    printf("gdx:%d, gdy:%d, gdz:%d, bdx:%d\n", gdx, gdy, gdz, bdx);
+
+    //uint32_t group_in_k_lqq = 64;
+    //uint32_t dim = model_dim;
+    //uint32_t batch = token_cnt;
+    //uint32_t GU_dqn_k_lqq = dim/group_in_k_lqq;
+    //uint32_t GU_dqn_n_lqq = hidden_dim;
+    //uint32_t GU_dqn_lqq_size = eprt*GU_dqn_k_lqq*GU_dqn_n_lqq;
+    //save_int8_fmt("./feifei/ptr_X_fmt.hex", (int8_t*)(input.data_ptr()), token_cnt*model_dim);
+    //save_float("./feifei/X_dqn_buf.txt",  (float*)(a1_scale.value().data_ptr()), a1_scale.value().numel());
+    //save_int8("./feifei/GU_buf_pack.hex", (int8_t*)(w1.data_ptr()), w1.numel() * w1.element_size());
+    //save_float("./feifei/GU_dqn_buf.txt", (float*)(w1_scale.value().data_ptr()), w1_scale.value().numel());
+    //save_int8("./feifei/ptr_XC.hex", (int8_t*)(num_valid_ids.data_ptr()), num_valid_ids.numel() * num_valid_ids.element_size());
+    //save_int8("./feifei/ptr_STP.hex", (int8_t*)(sorted_token_ids.data_ptr()), sorted_token_ids.numel() * sorted_token_ids.element_size());
+    //save_int_fmt("./feifei/sorted_token_ids.text", (uint32_t*)(sorted_token_ids.data_ptr()), sorted_token_ids.numel());
+    //save_int8("./feifei/ptr_SEP.hex", (int8_t*)(sorted_expert_ids.data_ptr()), sorted_expert_ids.numel() * sorted_expert_ids.element_size());
+    //save_int8_fmt("./feifei/ptr_GU_fmt.hex", (int8_t*)(args.ptr_GU), w1.numel() * w1.element_size());
+    //save_int8_fmt("./feifei/ptr_Qscl_fmt.hex", (int8_t*)(args.ptr_Qscl), w1_lqq_scale.value().numel() * w1_lqq_scale.value().element_size());
+    //save_int8_fmt("./feifei/ptr_Qzero_fmt.hex", (int8_t*)(args.ptr_Qzero), w1_lqq_zero.value().numel() * w1_lqq_zero.value().element_size());
+    //save_int8("./feifei/GU_buf_uint4.hex", (int8_t*)GU_buf_uint4, sz_GU);
+    //save_int8("./feifei/GU_buf.hex", (int8_t*)GU_buf, sz_GU);
+    //save_int8("./feifei/GU_qzero_lqq_buf_uint8.hex", (int8_t*)GU_qzero_lqq_buf_uint8, GU_dqn_lqq_size);
+    //save_int8("./feifei/GU_buf_uint4_shf_inter.hex", (int8_t*)GU_buf_uint4, sz_GU);
+    //save_int8("./feifei/GU_buf_uint4_shf2.hex", (int8_t*)GU_buf_uint4, sz_GU);
+    //save_int8("./feifei/GU_qscale_lqq_buf_shf.hex", (int8_t*)GU_qscale_lqq_buf, GU_dqn_lqq_size);
+    //save_int8("./feifei/GU_qzero_lqq_buf_uint8_shf.hex", (int8_t*)GU_qzero_lqq_buf_uint8, GU_dqn_lqq_size);
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,
