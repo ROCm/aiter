@@ -353,6 +353,7 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
     }
     return value;
 }
+
  // Perform per-head QK Norm,  RoPE in a single kernel, and group quantize the kv cache with fp8 group [blk_size, head_dim].
  // scalar_t: data type of QKV and RMSNorm weights
  // kv_cache_scalar_t: data type of kv cache
@@ -389,31 +390,46 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
      int const num_tokens,  // Number of tokens
      int const page_size,   // Page size for kv cache
      int x,                  // kv cache tiling size
-     int const batch_size, // Batch size
-     int const max_seq_len // Max sequence length
+     int const batch_size // Batch size
  )
  {
-     // per block deal with blockSize tokens
-     // blockDim.x = page_size
-    int const warpsPerBlock = blockDim.x / WARP_SIZE;
-    int const warpId        = threadIdx.x / WARP_SIZE;
-    int const laneId        = threadIdx.x % WARP_SIZE;
-    int const globalWarpIdx = blockIdx.x * warpsPerBlock + warpId;
+    // per block deal with blockSize tokens
+    // gridDim = (1, gridSize, num_heads_q + num_heads_k + num_heads_v)
+    // blockIdx.y is the global block index across all batches
+    // Each batch needs ceil(seq_len/blockDim.x) + 1 blocks
+   int const laneId        = threadIdx.x % WARP_SIZE;
 
-    int const num_heads    = num_heads_q + num_heads_k + num_heads_v;
-    int const batch_id     = blockIdx.x;  // batch index
-    int const localHeadIdx = blockIdx.z;  // head index
-    float block_max  = 0.0f;
-    
-    // Calculate current batch's sequence length
+   int const num_heads    = num_heads_q + num_heads_k + num_heads_v;
+   int const localHeadIdx = blockIdx.z;  // head index
+
+    // Map blockIdx.y -> (batch_id, block_within_batch) -> first_token_idx
+    // Each batch i uses ceil(seq_len_i / blockDim.x) + 1 blocks
+    int batch_id = -1;
+    int cum_blocks = 0;
+    for(int i = 0; i < batch_size; i++)
+    {
+        int64_t seq_len_i = cu_q_len[i + 1] - cu_q_len[i];
+        int blocks_i = (seq_len_i + blockDim.x - 1) / blockDim.x + 1;
+        if(cum_blocks + blocks_i > (int)blockIdx.y)
+        {
+            batch_id = i;
+            break;
+        }
+        cum_blocks += blocks_i;
+    }
+    // Extra blocks beyond all batches — nothing to do
+    if(batch_id < 0)
+        return;
+    int block_within_batch = (int)blockIdx.y - cum_blocks;
+
+    // Calculate current batch's sequence range
     int64_t batch_start_idx = cu_q_len[batch_id];
     int64_t batch_end_idx   = cu_q_len[batch_id + 1];
     int64_t seq_len         = batch_end_idx - batch_start_idx;
+
+    // first_token_idx is relative to batch start
+    int64_t first_token_idx = batch_start_idx + block_within_batch * blockDim.x;
     
-    // Calculate first_token_idx for this GPU block
-    // Similar to cache_kernels.cu: first_token_idx = blockIdx.x * seq_len + blockIdx.y * block_size
-    // But here we use cu_q_len: first_token_idx = cu_q_len[batch_id] + blockIdx.y * block_size
-    int64_t first_token_idx = batch_start_idx + blockIdx.y * blockDim.x;
     int64_t slot_idx;
     int64_t block_idx;
     int64_t block_offset;
@@ -423,13 +439,13 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
     // Handle case where GPU block extends beyond current batch's sequence length
     // Ensure one wave group only processes one cache block (page)
     // ============================================================================
-    if(blockIdx.y * blockDim.x >= seq_len)
+    if(first_token_idx >= batch_end_idx)
     {
-        // This GPU block is beyond the current batch's sequence length
+        // This is the extra block for this batch (boundary handler)
         // Check if we need to process remaining tokens from a different cache page
         
-        // Get the cache block_idx (page) of the previous GPU block's first token
-        int64_t prev_first_token_idx = batch_start_idx + (blockIdx.y - 1) * blockDim.x;
+        // Get the previous GPU block's first token
+        int64_t prev_first_token_idx = batch_start_idx + (block_within_batch - 1) * blockDim.x;
         if(prev_first_token_idx < batch_start_idx || prev_first_token_idx >= batch_end_idx)
         {
             return;  // Invalid, just return
@@ -442,51 +458,13 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
         int64_t last_token_idx = batch_end_idx - 1;
         slot_idx = slot_mapping[last_token_idx];
         block_idx = slot_idx / page_size;
-
-
+        //printf("[DEBUG]batch_id=%d, blockIdx.y=%d, blockIdx.z=%d, threadIdx.x=%d, first_token_idx=%ld, prev_first_token_idx=%ld, preTg_block_idx=%ld, block_idx=%ld, slot_idx=%ld, batch_end_idx=%ld, block_within_batch=%ld\n", batch_id, blockIdx.y, blockIdx.z, threadIdx.x, first_token_idx, prev_first_token_idx, preTg_block_idx, block_idx, slot_idx, batch_end_idx, block_within_batch);
         // If they are in the same cache page, the previous GPU block already handled it
         if(preTg_block_idx == block_idx)
         {
             return;  // Already processed by previous GPU block
         }
-        
-        // Otherwise, this block should process the remaining tokens in the last cache page
-        // In boundary case, we need to find all tokens belonging to the last cache page
-        // We'll let each thread check if its token belongs to block_idx
-        // Start from prev_first_token_idx + 1 to avoid processing tokens already handled
-        block_offset = slot_idx % page_size;
-        //// Use shared memory to find the first token in the last cache page
-        //__shared__ int64_t first_token_in_page;
-        //if(threadIdx.x == 0)
-        //{
-        //    first_token_in_page = batch_end_idx;  // Initialize to invalid value
-        //    // Search from prev_first_token_idx + 1 to find first token in block_idx
-        //    for(int64_t i = prev_first_token_idx + 1; i < batch_end_idx; i++)
-        //    {
-        //        int64_t token_slot = slot_mapping[i];
-        //        if(token_slot >= 0)
-        //        {
-        //            int64_t token_block_idx = token_slot / page_size;
-        //            if(token_block_idx == block_idx)
-        //            {
-        //                first_token_in_page = i;
-        //                break;
-        //            }
-        //        }
-        //    }
-        //}
-        //__syncthreads();
-        //first_token_idx = first_token_in_page;
-        if(first_token_idx >= batch_end_idx)
-        {
-            return;  // No tokens found in the last cache page
-        }
-        // Update slot_idx and block_idx based on the found first_token_idx
         slot_idx = slot_mapping[first_token_idx];
-        if(slot_idx < 0)
-        {
-            return;  // Invalid slot
-        }
         block_idx = slot_idx / page_size;
         block_offset = slot_idx % page_size;
     }
@@ -503,7 +481,7 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
         // Invalid slot, skip
         return;
     }
-    if(blockIdx.y > 0 && block_offset > 0)
+    if(first_token_idx > batch_start_idx && block_offset > 0)
     {
         __shared__ int64_t idx_smem[2];
         if(threadIdx.x < page_size)
@@ -524,13 +502,10 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
         }
      
         __syncthreads();
-        if(idx_smem[0] > 0)  // Valid value found
-        {
-            first_token_idx = idx_smem[0];
-            slot_idx        = idx_smem[1];
-            block_idx       = slot_idx / page_size;
-            block_offset    = slot_idx % page_size;
-        }
+        first_token_idx = idx_smem[0];
+        slot_idx        = idx_smem[1];
+        // block_idx unchanged: idx_smem search guarantees same page (block_idx2 == block_idx)
+        block_offset    = slot_idx % page_size;
     }
     // Each token should compute its own slot_id and block_offset
     int64_t actual_slot_id = -1;
@@ -553,7 +528,6 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
      //int numtokens_in_block = block_reduce<int, decltype(sum), wg_size, true>(tokens_in_block, sum);
      __shared__ float smem[wg_size / WARP_SIZE];
     int numtokens_in_block = block_reduce<float, decltype(sum), wg_size / WARP_SIZE>(tokens_in_block, sum, 0, smem);
-   // printf("[DEBUG]batch_id=%d, blockIdx.y=%d, blockIdx.z=%d, threadIdx.x=%d, first_token_idx=%ld, slot_idx=%ld, block_idx=%ld, block_offset=%ld\n", batch_id, blockIdx.y, blockIdx.z, threadIdx.x, first_token_idx, slot_idx, block_idx, block_offset);
     // Calculate tokenIdx for current thread
     int tokenIdx = first_token_idx + threadIdx.x;
     
@@ -579,11 +553,7 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
      constexpr int base_loopcnt = base_elems_per_thread / vec_size;
      using ltype                 = ::vec_t<scalar_t, vec_size>;
      ltype elements;
-     //ltype elements;
-     const float inverted_kscale = k_scale == nullptr ? 1.0f : 1 / (*k_scale);
-     const float inverted_vscale = v_scale == nullptr ? 1.0f : 1 / (*v_scale);
  
-
      // Load data first, suppose have no tail since we check the head_dim is multiple of 32 before
      // kernel launch
      auto cur_element_offset = head_dim * threadIdx.x;
@@ -612,16 +582,6 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
            auto sum_func = [](float a, float b) { return a + b; };
            //sumOfSquares  = warpReduceSum(sum_func, sumOfSquares);
            float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
-   
-           // Normalize elements
-           #pragma unroll
-           for(int i = 0; i < numElemsPerThread; i++)
-           {
-               int dim      = i;//laneId * numElemsPerThread + 
-               float weight = isQ ? float(q_weight[dim]) : float(k_weight[dim]);
-               smem_elements[cur_element_offset + i]  = static_cast<scalar_t>(smem_elements[cur_element_offset + i] * rms_rcp * weight);
-           }
-   
            // Apply RoPE to normalized elements
    
            int64_t pos_id = position_ids[tokenIdx];
@@ -632,7 +592,8 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
            int const embed_dim       = head_dim / 2;
            scalar_t const* cos_ptr   = cache_ptr;
            scalar_t const* sin_ptr   = cache_ptr + embed_dim;
-   
+           
+           // Normalize elements and apply RoPE
            if constexpr(interleave)
            {
                // Perform interleaving. Use pre-computed cos/sin values.
@@ -640,16 +601,16 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
                for(int i = 0; i < numElemsPerThread / 2; ++i)
                {
                    int const idx0 = 2 * i;
-                   int const idx1 = 2 * i + 1;
-   
-                   float const val0 = smem_elements[cur_element_offset + idx0];
-                   float const val1 = smem_elements[cur_element_offset + idx1];
-   
+                   int const idx1 = 2 * i + 1; 
+                   float weight0 = isQ ? float(q_weight[idx0]) : float(k_weight[idx0]);
+                   float weight1 = isQ ? float(q_weight[idx1]) : float(k_weight[idx1]);
                    int const dim_idx  = idx0;//laneId * numElemsPerThread + 
                    int const half_dim = dim_idx / 2;
                    float cos_val      = static_cast<float>(cos_ptr[half_dim]);
                    float sin_val      = static_cast<float>(sin_ptr[half_dim]);
-   
+                   float const val0 = static_cast<float>(smem_elements[cur_element_offset + idx0]) * rms_rcp * weight0;
+                   float const val1 = static_cast<float>(smem_elements[cur_element_offset + idx1]) * rms_rcp * weight1;
+
                    smem_elements[cur_element_offset + idx0] = static_cast<scalar_t>(val0 * cos_val - val1 * sin_val);
                    smem_elements[cur_element_offset + idx1] = static_cast<scalar_t>(val0 * sin_val + val1 * cos_val);
                }
@@ -666,11 +627,14 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
                {
                    int const idx0 = i;
                    int const idx1 = i + numElemsPerThread / 2;
+                   float weight0 = isQ ? float(q_weight[idx0]) : float(k_weight[idx0]);
+                   float weight1 = isQ ? float(q_weight[idx1]) : float(k_weight[idx1]);
                    // Use pre-computed cos/sin from cache
-                   float cos_val = cos_ptr[idx0];
-                   float sin_val = sin_ptr[idx0];
-                   float const val0 = smem_elements[cur_element_offset + idx0];
-                   float const val1 = smem_elements[cur_element_offset + idx1];
+                   float cos_val = static_cast<float>(cos_ptr[idx0]);
+                   float sin_val = static_cast<float>(sin_ptr[idx0]);
+
+                   float const val0 = static_cast<float>(smem_elements[cur_element_offset + idx0]) * rms_rcp * weight0;
+                   float const val1 = static_cast<float>(smem_elements[cur_element_offset + idx1]) * rms_rcp * weight1;
    
                    smem_elements[cur_element_offset + idx0] = static_cast<scalar_t>(val0 * cos_val - val1 * sin_val);
                    smem_elements[cur_element_offset + idx1] = static_cast<scalar_t>(val1 * cos_val + val0 * sin_val);
@@ -716,7 +680,7 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
     
     // Check if current token belongs to the current block_idx
      bool is_token_in_block = (tokens_in_block == 1);
-     block_max  = 0;//abs(elements[0]);  // Initialize with first element's abs value
+     float block_max  = 0.0f;//abs(elements[0]);  // Initialize with first element's abs value
   
      // If quantization is required, compute the max abs value across the head_dim * num_heads
      // IMPORTANT: Only compute max for tokens that belong to the same page/block
@@ -743,14 +707,14 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
          __shared__ float smem_max[wg_size / WARP_SIZE];
          block_max = block_reduce<float, decltype(f_max_f32), wg_size / WARP_SIZE>(block_max, f_max_f32, 0.0f, smem_max);
      }
-    
+
      if(isK)
      {
          float k_scale_val = 1.0f;
          if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
          {
              k_scale_val = block_max / dtype_max;
-// Fix: correct scale index calculation [num_blocks, num_kv_heads]
+             // Fix: correct scale index calculation [num_blocks, num_kv_heads]
              int64_t scale_offset = block_idx * num_kv_heads + headIdx;
              
              // Handle incremental updates: check for scale conflicts
@@ -900,7 +864,6 @@ __inline__ __device__ scalar_t block_reduce(scalar_t value, F op, scalar_t ident
      }
  }
 
- 
  
  #define DISPATCH_KV_HEAD(num_kv_heads, ...)                             \
      if(num_kv_heads == 1)                                               \
@@ -1089,115 +1052,67 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
                                             int page_size,
                                             int x,
                                             int batch_size,
-                                            int max_seq_len,
                                             hipStream_t stream)
 {
-    // Fixed blockSize to reduce template instantiations
-    constexpr int blockSize = 64;
-    // todo if decode  one token per block
-    // int const gridSize = num_tokens;
-    int const gridSize = (max_seq_len + blockSize - 1) / blockSize + 1;
-    printf("[DEBUG] gridSize=%d, batch_size=%d, max_seq_len=%d\n", gridSize, batch_size, max_seq_len);
-    dim3 gridDim(batch_size, gridSize,  num_heads_q + num_heads_k + num_heads_v);
+    // blockSize (wg_size) selection: use page_size if it's 64/128/256, otherwise default to 64
+    int blockSize = 64;
+    if(page_size == 128) blockSize = 128;
+    else if(page_size == 256) blockSize = 256;
+    else blockSize = 64;
+
+    // Kernel uses cum_blocks: each batch needs ceil(seq_len_i/blockSize) + 1 blocks.
+    // Conservative upper bound: ceil(total/blockSize) + 2*batch_size
+    int const gridSize = (num_tokens + blockSize - 1) / blockSize + 2 * batch_size;
+
+    dim3 gridDim(1, gridSize, num_heads_q + num_heads_k + num_heads_v);
     dim3 blockDim(blockSize);
+
+#define LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, WG_SIZE)                            \
+        DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {                           \
+            fusedQKNormRopeBlockQuantCacheShuffleKernel<scalar_t,               \
+                                                       kv_cache_scalar_t,      \
+                                                       HEAD_DIM,               \
+                                                       INTERLEAVE,             \
+                                                       NUM_KV_HEADS,           \
+                                                       WG_SIZE,                \
+                                                       kv_dt>                  \
+                <<<gridDim, blockDim, 0, stream>>>(qkv,                        \
+                                                   num_heads_q,                \
+                                                   num_heads_k,                \
+                                                   num_heads_v,                \
+                                                   eps,                        \
+                                                   q_weight,                   \
+                                                   k_weight,                   \
+                                                   cos_sin_cache,              \
+                                                   position_ids,               \
+                                                   k_cache,                    \
+                                                   v_cache,                    \
+                                                   slot_mapping,               \
+                                                   cu_q_len,                   \
+                                                   k_scale,                    \
+                                                   v_scale,                    \
+                                                   num_tokens,                 \
+                                                   page_size,                  \
+                                                   x,                          \
+                                                   batch_size);                \
+        });
+
+#define DISPATCH_BLOCK_SIZE(HEAD_DIM)                                            \
+    if(blockSize == 64)       { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 64)  }      \
+    else { TORCH_CHECK(false, "Unsupported blockSize: ", blockSize); }
 
     switch(head_dim)
     {
-    case 64:
-        DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-            fusedQKNormRopeBlockQuantCacheShuffleKernel<scalar_t,
-                                                   kv_cache_scalar_t,
-                                                   64,
-                                                   INTERLEAVE,
-                                                   NUM_KV_HEADS,
-                                                   blockSize,
-                                                   kv_dt>
-                <<<gridDim, blockDim, 0, stream>>>(qkv,
-                                                   num_heads_q,
-                                                   num_heads_k,
-                                                   num_heads_v,
-                                                   eps,
-                                                   q_weight,
-                                                   k_weight,
-                                                   cos_sin_cache,
-                                                   position_ids,
-                                                   k_cache,
-                                                   v_cache,
-                                                   slot_mapping,
-                                                   cu_q_len,
-                                                   k_scale,
-                                                   v_scale,
-                                                   num_tokens,
-                                                   page_size,
-                                                   x,
-                                                   batch_size,
-                                                   max_seq_len);
-        });
-        break;
-    case 128:
-        DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-            fusedQKNormRopeBlockQuantCacheShuffleKernel<scalar_t,
-                                                   kv_cache_scalar_t,
-                                                   128,
-                                                   INTERLEAVE,
-                                                   NUM_KV_HEADS,
-                                                   blockSize,
-                                                   kv_dt>
-                <<<gridDim, blockDim, 0, stream>>>(qkv,
-                                                   num_heads_q,
-                                                   num_heads_k,
-                                                   num_heads_v,
-                                                   eps,
-                                                   q_weight,
-                                                   k_weight,
-                                                   cos_sin_cache,
-                                                   position_ids,
-                                                   k_cache,
-                                                   v_cache,
-                                                   slot_mapping,
-                                                   cu_q_len,
-                                                   k_scale,
-                                                   v_scale,
-                                                   num_tokens,
-                                                   page_size,
-                                                   x,
-                                                   batch_size,
-                                                   max_seq_len);
-        });
-        break;
-    //case 256:
-    //    DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-    //        fusedQKNormRopeBlockQuantCacheShuffleKernel<scalar_t,
-    //                                               kv_cache_scalar_t,
-    //                                               256,
-    //                                               INTERLEAVE,
-    //                                               NUM_KV_HEADS,
-    //                                               blockSize,
-    //                                               kv_dt>
-    //            <<<gridDim, blockDim, 0, stream>>>(qkv,
-    //                                               num_heads_q,
-    //                                               num_heads_k,
-    //                                               num_heads_v,
-    //                                               eps,
-    //                                               q_weight,
-    //                                               k_weight,
-    //                                               cos_sin_cache,
-    //                                               position_ids,
-    //                                               k_cache,
-    //                                               v_cache,
-    //                                               slot_mapping,
-    //                                               k_scale,
-    //                                               v_scale,
-    //                                               num_tokens,
-    //                                               page_size,
-    //                                               x);
-    //    });
-    //    break;
+    case 64:  DISPATCH_BLOCK_SIZE(64);  break;
+    case 128: DISPATCH_BLOCK_SIZE(128); break;
+    //case 256: DISPATCH_BLOCK_SIZE(256); break;
+   //else if(blockSize == 128) { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 128) }      
+#undef LAUNCH_BLOCK_QUANT_KERNEL
+#undef DISPATCH_BLOCK_SIZE
     default: TORCH_CHECK(false, "Unsupported head dimension for fusedQKNormRope: ", head_dim);
     }
 }
  } // namespace
- 
  #define CALL_QK_NORM_ROPE_CACHE_QUANT(SRC_T, CACHE_T, KV_DTYPE)       \
      launchFusedQKNormRopeQuantCacheShuffle<SRC_T, CACHE_T, KV_DTYPE>( \
          reinterpret_cast<SRC_T*>(qkv.data_ptr()),                     \
@@ -1243,7 +1158,6 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
              page_size,                                                    \
              x,                                                            \
              batch_size,                                                   \
-             max_seq_len,                                                  \
              stream);
 
 #define CALL_QK_NORM_ROPE_CACHE_QUANT(SRC_T, CACHE_T, KV_DTYPE)       \
@@ -1904,36 +1818,18 @@ void fused_qk_norm_rope_cache_block_quant_shuffle(
      int64_t batch_size = cu_q_len.size(0) - 1;
      TORCH_CHECK(batch_size > 0, "Batch size must be greater than 0");
      
-     // Calculate max_seq_len: max of all batch sequence lengths
-     int64_t* cu_q_len_ptr = cu_q_len.data_ptr<int64_t>();
-     int64_t max_seq_len = 0;
-     for(int64_t i = 1; i <= batch_size; i++)
-     {
-        int64_t seq_len = cu_q_len_ptr[i] - cu_q_len_ptr[i - 1];
-        max_seq_len = std::max(max_seq_len, seq_len);
-     }
      int64_t num_tokens = qkv.size(0);
      int64_t page_size  = k_cache.size(-2);
      int64_t x          = k_cache.size(-1);
      TORCH_CHECK(position_ids.size(0) == num_tokens,
                  "Number of tokens in position_ids must match QKV");
-     // cu_q_len format: [0, batch0_seq_len, batch0_seq_len + batch1_seq_len, ...]
-     // The last element should equal num_tokens (total number of tokens)
-     int64_t cu_q_len_size = cu_q_len.size(0);
-     int64_t cu_q_len_last_idx = cu_q_len_size - 1;
-     int64_t total_tokens_from_cu_q_len = cu_q_len_ptr[cu_q_len_last_idx];
-     printf("[DEBUG] cu_q_len.size(0)=%ld, cu_q_len[%ld]=%ld, num_tokens=%ld\n", 
-            cu_q_len_size, cu_q_len_last_idx, total_tokens_from_cu_q_len, num_tokens);
-     TORCH_CHECK(total_tokens_from_cu_q_len == num_tokens, 
-                 "Cu Q len tensor's last element must match number of tokens");
+
  
      int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
      TORCH_CHECK(qkv.size(1) == total_heads * head_dim,
                  "QKV tensor size must match total number of heads and head dimension");
  
      auto stream = at::hip::getCurrentHIPStream(qkv.get_device());
-     printf("[DEBUG] num_tokens=%ld, page_size=%ld, x=%ld\n", num_tokens, page_size, x);
      DISPATCH_BY_KV_CACHE_DTYPE(qkv.scalar_type(), kv_cache_dtype, CALL_QK_NORM_ROPE_CACHE_BLOCK_QUANT);
  }
- 
 } // namespace aiter

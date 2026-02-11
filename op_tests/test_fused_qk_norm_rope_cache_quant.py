@@ -191,7 +191,7 @@ def run_aiter_qk_norm_rope_cache_quant_shuffle(
     return q, k, v, k_cache, v_cache
 
 
-@perftest()
+@perftest(num_iters=3)
 def run_torch_qk_norm_rope_cache_block_quant_shuffle(
     qkv: Tensor,  # contiguous (num_tokens * (num_heads_q + num_heads_k + num_heads_v) * head_size)
     qw: Tensor,  #  contiguous (head_size)
@@ -256,18 +256,108 @@ def run_torch_qk_norm_rope_cache_block_quant_shuffle(
             asm_layout=True,
         )
     else:
-        k = k.view(1, num_tokens, -1, head_size)
-        v = v.view(1, num_tokens, -1, head_size)
-        reshape_and_cache_with_block_quant(
-            k, v, k_cache, v_cache, k_scale, v_scale, slot_mapping, asm_layout=True
+        # Block quant ref using pertoken_quant (same approach as test_kvcache_blockscale.py)
+        # k_cache: [num_blocks, num_heads_k, head_size // x, block_size, x]
+        # v_cache: [num_blocks, num_heads_v, block_size // x, head_size, x]
+        num_blocks = k_cache.shape[0]
+        block_size = k_cache.shape[-2]  # page_size
+        x_val = k_cache.shape[-1]
+        cache_dtype = k_cache.dtype
+
+        # Step 1: Unflatten k_cache to [num_blocks, block_size, num_heads_k, head_size]
+        # and DEQUANTIZE using old scale (multiply raw fp8 values by scale)
+        # k_cache: [num_blocks, num_heads_k, head_size//x, block_size, x]
+        #       -> permute(0, 3, 1, 2, 4) -> [num_blocks, block_size, num_heads_k, head_size//x, x]
+        #       -> view [num_blocks, block_size, num_heads_k, head_size]
+        k_cache_flat = (
+            k_cache.float()
+            .permute(0, 3, 1, 2, 4)
+            .contiguous()
+            .view(num_blocks, block_size, num_heads_k, head_size)
         )
+        # Dequantize: k_cache_flat *= k_scale[num_blocks, num_heads_k] (broadcast over block_size, head_size)
+        k_cache_flat = k_cache_flat * k_scale.view(num_blocks, 1, num_heads_k, 1)
+        k_cache_flat = k_cache_flat.view(-1, num_heads_k, head_size)
+
+        # v_cache: [num_blocks, num_heads_v, block_size//x, head_size, x]
+        #       -> permute(0, 2, 4, 1, 3) -> [num_blocks, block_size//x, x, num_heads_v, head_size]
+        #       -> view [num_blocks, block_size, num_heads_v, head_size]
+        v_cache_flat = (
+            v_cache.float()
+            .permute(0, 2, 4, 1, 3)
+            .contiguous()
+            .view(num_blocks, block_size, num_heads_v, head_size)
+        )
+        # Dequantize: v_cache_flat *= v_scale[num_blocks, num_heads_v]
+        v_cache_flat = v_cache_flat * v_scale.view(num_blocks, 1, num_heads_v, 1)
+        v_cache_flat = v_cache_flat.view(-1, num_heads_v, head_size)
+
+        # Step 2: Scatter K/V into dequantized cache
+        k_flat = k.view(-1, num_heads_k, head_size)
+        v_flat = v.view(-1, num_heads_v, head_size)
+        k_cache_flat[slot_mapping] = k_flat.float()
+        v_cache_flat[slot_mapping] = v_flat.float()
+
+        # Step 3: Reshape to [num_blocks, num_heads, block_size*head_size] and pertoken_quant
+        k_cache_for_quant = (
+            k_cache_flat.view(num_blocks, block_size, num_heads_k, head_size)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .view(num_blocks, num_heads_k, -1)
+        )
+        k_cache_q, k_scale_new = aiter.pertoken_quant(
+            k_cache_for_quant,
+            scale_dtype=torch.float32,
+            quant_dtype=cache_dtype,
+        )
+        k_scale_new = k_scale_new.view(num_blocks, num_heads_k)
+
+        v_cache_for_quant = (
+            v_cache_flat.view(num_blocks, block_size, num_heads_v, head_size)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .view(num_blocks, num_heads_v, -1)
+        )
+        v_cache_q, v_scale_new = aiter.pertoken_quant(
+            v_cache_for_quant,
+            scale_dtype=torch.float32,
+            quant_dtype=cache_dtype,
+        )
+        v_scale_new = v_scale_new.view(num_blocks, num_heads_v)
+
+        # Step 4: Reshape back to tiled layout
+        # k_cache_q: [num_blocks, num_heads_k, block_size*head_size]
+        #         -> view [num_blocks, num_heads_k, block_size, head_size//x, x]
+        #         -> permute(0, 1, 3, 2, 4) -> [num_blocks, num_heads_k, head_size//x, block_size, x]
+        k_cache.copy_(
+            k_cache_q.view(
+                num_blocks, num_heads_k, block_size, head_size // x_val, x_val
+            )
+            .permute(0, 1, 3, 2, 4)
+            .contiguous()
+        )
+
+        # v_cache_q: [num_blocks, num_heads_v, block_size*head_size]
+        #         -> view [num_blocks, num_heads_v, block_size, head_size]
+        #         -> view [num_blocks, num_heads_v, block_size//x, x, head_size]
+        #         -> permute(0, 1, 2, 4, 3) -> [num_blocks, num_heads_v, block_size//x, head_size, x]
+        v_cache.copy_(
+            v_cache_q.view(
+                num_blocks, num_heads_v, block_size // x_val, x_val, head_size
+            )
+            .permute(0, 1, 2, 4, 3)
+            .contiguous()
+        )
+
+        k_scale.copy_(k_scale_new)
+        v_scale.copy_(v_scale_new)
 
     k = k.reshape(k_shape)
     v = v.reshape(k_shape)
     return q, k, v, k_cache, v_cache
 
 
-@perftest()
+@perftest(num_iters=40)
 def run_aiter_qk_norm_rope_cache_block_quant_shuffle(
     qkv: Tensor,  # contiguous (num_tokens * (num_heads_q + num_heads_k + num_heads_v) * head_size)
     qw: Tensor,  #  contiguous (head_size)
@@ -284,6 +374,7 @@ def run_aiter_qk_norm_rope_cache_block_quant_shuffle(
     k_cache: Tensor,
     v_cache: Tensor,
     slot_mapping: Tensor,
+    cu_q_len: Tensor,
     kv_cache_dtype: str,
     k_scale: Tensor,
     v_scale: Tensor,
@@ -305,6 +396,7 @@ def run_aiter_qk_norm_rope_cache_block_quant_shuffle(
         k_cache,
         v_cache,
         slot_mapping,
+        cu_q_len,
         kv_cache_dtype,
         k_scale,
         v_scale,
@@ -642,6 +734,7 @@ def test_qk_norm_rope_2way(
     return ret
 
 
+@benchmark()
 def test_qk_norm_rope_cache_block_quant(
     dtype,
     num_tokens,
@@ -654,6 +747,7 @@ def test_qk_norm_rope_cache_block_quant(
     k_cache,
     v_cache,
     slot_mapping,
+    cu_q_len,
     kv_cache_dtype,
     k_scale,
     v_scale,
@@ -712,6 +806,7 @@ def test_qk_norm_rope_cache_block_quant(
             k_cache,
             v_cache,
             slot_mapping,
+            cu_q_len,
             kv_cache_dtype,
             k_scale,
             v_scale,
@@ -723,25 +818,40 @@ def test_qk_norm_rope_cache_block_quant(
     checkAllclose(q_ref, q, msg="q", rtol=1e-2, atol=0.05)
     checkAllclose(k_ref, k, msg="k", rtol=1e-2, atol=0.05)
     checkAllclose(v_ref, v, msg=msg, rtol=1e-2, atol=0.05)
-    # for i in range(len(slot_mapping)):
-    #    t = slot_mapping[i]
-    #    print("k_cache_ref: ", k_cache_ref[t])
-    #    print("k_cache: ", k_cache[t])
-    #    print("v_cache_ref: ", v_cache_ref[t])
-    #    print("v_cache: ", v_cache[t])
-    #    print("k_scale_ref: ", k_scale_ref[t])
-    #    print("v_scale_ref: ", v_scale_ref[t])
-    #    print("k_scale: ", k_scale[t])
-    #    print("v_scale: ", v_scale[t])
+    # Only check pages that have actual token data (via slot_mapping)
+    page_size = k_cache.shape[
+        -2
+    ]  # k_cache: [num_blocks, num_kv_heads, head_size//x, page_size, x]
+    slots_edit = torch.unique(slot_mapping // page_size)
     checkAllclose(
-        k_cache_ref.float(), k_cache.float(), msg="k_cache", rtol=1e-2, atol=0.05
+        k_cache_ref.float()[slots_edit],
+        k_cache.float()[slots_edit],
+        msg="k_cache",
+        rtol=1e-2,
+        atol=0.05,
     )
     checkAllclose(
-        v_cache_ref.float(), v_cache.float(), msg="v_cache", rtol=1e-2, atol=0.05
+        v_cache_ref.float()[slots_edit],
+        v_cache.float()[slots_edit],
+        msg="v_cache",
+        rtol=1e-2,
+        atol=0.05,
     )
 
-    checkAllclose(k_scale_ref, k_scale, msg="k_scale", rtol=1e-2, atol=0.05)
-    checkAllclose(v_scale_ref, v_scale, msg="v_scale", rtol=1e-2, atol=0.05)
+    checkAllclose(
+        k_scale_ref[slots_edit],
+        k_scale[slots_edit],
+        msg="k_scale",
+        rtol=1e-2,
+        atol=0.05,
+    )
+    checkAllclose(
+        v_scale_ref[slots_edit],
+        v_scale[slots_edit],
+        msg="v_scale",
+        rtol=1e-2,
+        atol=0.05,
+    )
     ret = {}
     ret["fused_qk_us"] = avg_cu
     ret["unfused_us"] = avg_torch
@@ -754,6 +864,283 @@ def test_qk_norm_rope_cache_block_quant(
         + num_tokens * num_heads_k * head_size * (torch.finfo(cache_dtype).bits // 8)
         + num_tokens * num_heads_v * head_size * (torch.finfo(cache_dtype).bits // 8)
     ) / (avg_cu * 1e6)
+
+    # ========== chunk-prefill part ==========
+    # Derive batch_size and page_size from cu_q_len and k_cache
+    batch_size = cu_q_len.size(0) - 1
+    page_size = k_cache.shape[
+        -2
+    ]  # k_cache: [num_blocks, num_kv_heads, head_size//x, page_size, x]
+    ctx_lens = num_tokens // batch_size  # tokens per batch from prefill
+    max_token_num_support = slot_mapping.max().item() + 1  # infer from slot_mapping
+    # Use a conservative per-batch max_token
+    max_token_per_batch = (
+        max_token_num_support // batch_size if batch_size > 0 else max_token_num_support
+    )
+    #
+    chunk_left_ctx_lens = 10
+    chunk_total_tokens = batch_size * chunk_left_ctx_lens
+    #
+    chunk_qkv = torch.randn(
+        (chunk_total_tokens, (num_heads_q + num_heads_k + num_heads_v) * head_size),
+        dtype=dtype,
+        device="cuda",
+    )
+    #
+    # slot_mapping: each batch appends after its prefill tokens
+    chunk_slot_mapping = torch.tensor(
+        [
+            (
+                int(cu_q_len[bsID].item()) * max_token_per_batch // ctx_lens
+                + ctx_lens
+                + i
+                if batch_size > 1
+                else ctx_lens + i
+            )
+            for bsID in range(batch_size)
+            for i in range(chunk_left_ctx_lens)
+        ],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    # Simpler: just append after the existing slot_mapping range
+    chunk_slot_mapping = torch.tensor(
+        [
+            int(slot_mapping[int(cu_q_len[bsID + 1].item()) - 1].item()) + 1 + i
+            for bsID in range(batch_size)
+            for i in range(chunk_left_ctx_lens)
+        ],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    #
+    print("chunk_slot_mapping: ", chunk_slot_mapping)
+    chunk_cu_q_len = torch.zeros(batch_size + 1, dtype=torch.int64, device="cuda")
+    for i in range(batch_size):
+        chunk_cu_q_len[i + 1] = chunk_cu_q_len[i] + chunk_left_ctx_lens
+    #
+    print("chunk_cu_q_len: ", chunk_cu_q_len)
+    chunk_positions = torch.randint(
+        0, max_positions, (chunk_total_tokens,), dtype=torch.int64, device="cuda"
+    )
+    #
+    k_scale_chunk_ref = k_scale_ref.clone()
+    v_scale_chunk_ref = v_scale_ref.clone()
+    k_scale_chunk = k_scale.clone()
+    v_scale_chunk = v_scale.clone()
+    #
+    (
+        q_chunk_ref,
+        k_chunk_ref,
+        v_chunk_ref,
+        k_cache_ref,
+        v_cache_ref,
+    ), avg_torch_chunk = run_torch_qk_norm_rope_cache_block_quant_shuffle(
+        chunk_qkv,
+        qw,
+        kw,
+        cos_sin,
+        chunk_positions,
+        chunk_total_tokens,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_size,
+        is_neox_style,
+        eps,
+        k_cache_ref,
+        v_cache_ref,
+        k_scale_chunk_ref,
+        v_scale_chunk_ref,
+        chunk_slot_mapping,
+        kv_cache_dtype,
+    )
+    (q_chunk, k_chunk, v_chunk, k_cache, v_cache), avg_cu_chunk = (
+        run_aiter_qk_norm_rope_cache_block_quant_shuffle(
+            chunk_qkv,
+            qw,
+            kw,
+            cos_sin,
+            chunk_positions,
+            chunk_total_tokens,
+            num_heads_q,
+            num_heads_k,
+            num_heads_v,
+            head_size,
+            is_neox_style,
+            eps,
+            k_cache,
+            v_cache,
+            chunk_slot_mapping,
+            chunk_cu_q_len,
+            kv_cache_dtype,
+            k_scale_chunk,
+            v_scale_chunk,
+        )
+    )
+    #
+    print(
+        f"chunk-prefill: torch avg: {avg_torch_chunk:.2f} us, cu avg: {avg_cu_chunk:.2f} us"
+    )
+    checkAllclose(q_chunk_ref, q_chunk, msg="chunk q", rtol=1e-2, atol=0.05)
+    checkAllclose(k_chunk_ref, k_chunk, msg="chunk k", rtol=1e-2, atol=0.05)
+    checkAllclose(v_chunk_ref, v_chunk, msg="chunk v", rtol=1e-2, atol=0.05)
+    # Combine prefill + chunk slots to check all pages with data
+    all_slots_so_far = torch.cat([slot_mapping, chunk_slot_mapping])
+    chunk_slots_edit = torch.unique(all_slots_so_far // page_size)
+    checkAllclose(
+        k_cache_ref.float()[chunk_slots_edit],
+        k_cache.float()[chunk_slots_edit],
+        msg="chunk k_cache",
+        rtol=1e-2,
+        atol=0.05,
+    )
+    checkAllclose(
+        v_cache_ref.float()[chunk_slots_edit],
+        v_cache.float()[chunk_slots_edit],
+        msg="chunk v_cache",
+        rtol=1e-2,
+        atol=0.05,
+    )
+    checkAllclose(
+        k_scale_chunk_ref[chunk_slots_edit],
+        k_scale_chunk[chunk_slots_edit],
+        msg="chunk k_scale",
+        rtol=1e-2,
+        atol=0.05,
+    )
+    checkAllclose(
+        v_scale_chunk_ref[chunk_slots_edit],
+        v_scale_chunk[chunk_slots_edit],
+        msg="chunk v_scale",
+        rtol=1e-2,
+        atol=0.05,
+    )
+    ret["chunk_fused_qk_us"] = avg_cu_chunk
+    ret["chunk_unfused_us"] = avg_torch_chunk
+    #
+    # ========== decode part ==========
+    decode_total_tokens = batch_size  # 1 token per batch
+    #
+    decode_qkv = torch.randn(
+        (decode_total_tokens, (num_heads_q + num_heads_k + num_heads_v) * head_size),
+        dtype=dtype,
+        device="cuda",
+    )
+    #
+    # slot_mapping: each batch appends 1 token after chunk-prefill
+    decode_slot_mapping = torch.tensor(
+        [
+            int(chunk_slot_mapping[(bsID + 1) * chunk_left_ctx_lens - 1].item()) + 1
+            for bsID in range(batch_size)
+        ],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    #
+    decode_cu_q_len = torch.zeros(batch_size + 1, dtype=torch.int64, device="cuda")
+    for i in range(batch_size):
+        decode_cu_q_len[i + 1] = decode_cu_q_len[i] + 1
+    #
+    decode_positions = torch.randint(
+        0, max_positions, (decode_total_tokens,), dtype=torch.int64, device="cuda"
+    )
+    #
+    k_scale_decode_ref = k_scale_chunk_ref.clone()
+    v_scale_decode_ref = v_scale_chunk_ref.clone()
+    k_scale_decode = k_scale_chunk.clone()
+    v_scale_decode = v_scale_chunk.clone()
+    #
+    (
+        q_decode_ref,
+        k_decode_ref,
+        v_decode_ref,
+        k_cache_ref,
+        v_cache_ref,
+    ), avg_torch_decode = run_torch_qk_norm_rope_cache_block_quant_shuffle(
+        decode_qkv,
+        qw,
+        kw,
+        cos_sin,
+        decode_positions,
+        decode_total_tokens,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_size,
+        is_neox_style,
+        eps,
+        k_cache_ref,
+        v_cache_ref,
+        k_scale_decode_ref,
+        v_scale_decode_ref,
+        decode_slot_mapping,
+        kv_cache_dtype,
+    )
+    (q_decode, k_decode, v_decode, k_cache, v_cache), avg_cu_decode = (
+        run_aiter_qk_norm_rope_cache_block_quant_shuffle(
+            decode_qkv,
+            qw,
+            kw,
+            cos_sin,
+            decode_positions,
+            decode_total_tokens,
+            num_heads_q,
+            num_heads_k,
+            num_heads_v,
+            head_size,
+            is_neox_style,
+            eps,
+            k_cache,
+            v_cache,
+            decode_slot_mapping,
+            decode_cu_q_len,
+            kv_cache_dtype,
+            k_scale_decode,
+            v_scale_decode,
+        )
+    )
+    #
+    print(
+        f"decode: torch avg: {avg_torch_decode:.2f} us, cu avg: {avg_cu_decode:.2f} us"
+    )
+    checkAllclose(q_decode_ref, q_decode, msg="decode q", rtol=1e-2, atol=0.05)
+    checkAllclose(k_decode_ref, k_decode, msg="decode k", rtol=1e-2, atol=0.05)
+    checkAllclose(v_decode_ref, v_decode, msg="decode v", rtol=1e-2, atol=0.05)
+    # Combine all slots (prefill + chunk + decode) to check all pages with data
+    all_slots_total = torch.cat([slot_mapping, chunk_slot_mapping, decode_slot_mapping])
+    decode_slots_edit = torch.unique(all_slots_total // page_size)
+    checkAllclose(
+        k_cache_ref.float()[decode_slots_edit],
+        k_cache.float()[decode_slots_edit],
+        msg="decode k_cache",
+        rtol=1e-2,
+        atol=0.05,
+    )
+    checkAllclose(
+        v_cache_ref.float()[decode_slots_edit],
+        v_cache.float()[decode_slots_edit],
+        msg="decode v_cache",
+        rtol=1e-2,
+        atol=0.05,
+    )
+    checkAllclose(
+        k_scale_decode_ref[decode_slots_edit],
+        k_scale_decode[decode_slots_edit],
+        msg="decode k_scale",
+        rtol=1e-2,
+        atol=0.05,
+    )
+    checkAllclose(
+        v_scale_decode_ref[decode_slots_edit],
+        v_scale_decode[decode_slots_edit],
+        msg="decode v_scale",
+        rtol=1e-2,
+        atol=0.05,
+    )
+    ret["decode_fused_qk_us"] = avg_cu_decode
+    ret["decode_unfused_us"] = avg_torch_decode
+
     return ret
 
 
@@ -889,16 +1276,18 @@ if __name__ == "__main__":
                             cache_dtype = get_dtype_fp8()
                         else:
                             cache_dtype = args.dtype
-                        k_cache = torch.randn(
+                        # Initialize cache to zeros so unused pages have zero max -> zero scale
+                        # (randn would give non-zero scales for ALL pages in ref's pertoken_quant)
+                        k_cache = torch.zeros(
                             [args.num_blocks, args.page_size, num_kv_head, head_size],
-                            dtype=args.dtype,
+                            dtype=cache_dtype,
                             device="cuda",
-                        ).to(cache_dtype)
-                        v_cache = torch.randn(
+                        )
+                        v_cache = torch.zeros(
                             [args.num_blocks, args.page_size, num_kv_head, head_size],
-                            dtype=args.dtype,
+                            dtype=cache_dtype,
                             device="cuda",
-                        ).to(cache_dtype)
+                        )
 
                         # Check for NaN values in k_cache and v_cache
                         if torch.isnan(k_cache).any():
@@ -910,9 +1299,15 @@ if __name__ == "__main__":
                                 f"v_cache contains NaN values! dtype={cache_dtype}"
                             )
 
-                        slot_mapping = torch.randperm(
-                            num_token, dtype=torch.int64, device="cuda"
+                        # slot_mapping = torch.randperm(
+                        #    num_token, dtype=torch.int64, device="cuda"
+                        # )
+                        slot_mapping = torch.tensor(
+                            [i for i in range(num_token)],
+                            dtype=torch.int64,
+                            device="cuda",
                         )
+                        # slot_mapping[2:num_token] = slot_mapping[2:num_token] + args.page_size
                         x = 16 // k_cache.element_size()
                         k_cache = (
                             k_cache.view(
@@ -943,6 +1338,17 @@ if __name__ == "__main__":
                                 .permute(0, 2, 1, 3, 4)
                                 .contiguous()
                             )
+                            batch_size = 4  # num_token // args.page_size
+                            seq_lens = [
+                                num_token // batch_size
+                            ] * batch_size  # [args.page_size] * batch_size
+                            cu_q_len = torch.zeros(
+                                batch_size + 1, dtype=torch.int64, device="cuda"
+                            )
+                            cu_q_len[0] = 0
+                            for i in range(batch_size):
+                                cu_q_len[i + 1] = cu_q_len[i] + seq_lens[i]
+
                             ret = test_qk_norm_rope_cache_block_quant(
                                 args.dtype,
                                 num_token,
@@ -955,6 +1361,7 @@ if __name__ == "__main__":
                                 k_cache,
                                 v_cache,
                                 slot_mapping,
+                                cu_q_len,
                                 kv_cache_dtype,
                                 k_scale,
                                 v_scale,
