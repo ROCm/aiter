@@ -187,6 +187,13 @@ jobs:
             bash -c "./.github/scripts/aiter_test.sh" 
           fi
 
+          # Add extra single-test shape commands here.
+          # Qwen3-VL decode test case.
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          bash -c "python op_tests/test_moe_2stage.py -q 2 -a silu -e 128 -k 8 -dim 4096,192 -t 1"
+
       - name: Collect test logs
         if: always()
         run: |
