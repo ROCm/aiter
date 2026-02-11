@@ -1,7 +1,7 @@
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.common import (
     compute_alibi_block,
 )
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
@@ -582,7 +582,7 @@ def compute_window_bounds(
 
     # Right boundary
     if IS_CAUSAL:
-        # Causal cap: col ≤ row + diag
+        # Causal cap: col <= row + diag
         right_min = tl.minimum(seqlen_k - 1, q_start + diag)
         right_max = tl.minimum(seqlen_k - 1, q_end + diag)
     else:
@@ -654,14 +654,14 @@ def handle_padded_last_block(
         # current 'full' range right edge
         full_right_block = clipped_left + n_full_blocks - 1
 
-        # If last_block is already beyond full_right_block, it's already in back-masked → nothing to do
+        # If last_block is already beyond full_right_block, it's already in back-masked -> nothing to do
         last_already_back_masked = last_block > full_right_block
         if not last_already_back_masked:
             # If the window starts past last_block, it was counted in front-masked
             if clipped_left > last_block:
                 n_front_masked_blocks = tl.maximum(0, n_front_masked_blocks - 1)
             else:
-                # Otherwise it was counted 'full' → move it out of full
+                # Otherwise it was counted 'full' -> move it out of full
                 n_full_blocks = tl.maximum(0, n_full_blocks - 1)
             # In both cases we need one more back-masked block
             n_back_masked_blocks = n_back_masked_blocks + 1
@@ -678,7 +678,7 @@ def compute_padding_info(seqlen_k, BLOCK_N: tl.constexpr):
     # K blocks visualization:
     #         Block 0         Block 1         Block 2 (last)
     #         K0 K1 K2 K3    K4 K5 K6 K7     K8 K9 ?? ??
-    #         ↑---------↑    ↑---------↑     ↑---↑ ↑---↑
+    #         ?---------?    ?---------?     ?---? ?---?
     #         full block     full block      valid  pad
     if seqlen_k < BLOCK_N:
         n_extra_tokens = BLOCK_N - seqlen_k
@@ -731,7 +731,7 @@ def compute_block_masking(
             IS_CAUSAL,
         )
 
-        # window vanishes → early exit
+        # window vanishes -> early exit
         if right_max < left_min:
             return 0, 0, 0, 0, n_extra_tokens
 
@@ -770,16 +770,16 @@ def compute_block_masking(
             # ========== CAUSAL MODE: Classify K Blocks ==========
             # Calculate causal boundary for this Q block
             #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9 ?? ??]
-            # Q0-Q3:   [ 1  0  0  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q0
-            #          [ 1  1  0  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q1
-            #          [ 1  1  1  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q2
-            #          [ 1  1  1  1] [ 1  1  0  0] [ 0  0 -- --]  ← Q3
-            #                            ↑ can see up to K5
+            # Q0-Q3:   [ 1  0  0  0] [ 0  0  0  0] [ 0  0 -- --]  <- Q0
+            #          [ 1  1  0  0] [ 0  0  0  0] [ 0  0 -- --]  <- Q1
+            #          [ 1  1  1  0] [ 0  0  0  0] [ 0  0 -- --]  <- Q2
+            #          [ 1  1  1  1] [ 1  1  0  0] [ 0  0 -- --]  <- Q3
+            #                            ? can see up to K5
             #
-            # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  0] [ 0  0 -- --]  ← Q4
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 0  0 -- --]  ← Q5
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  0 -- --]  ← Q6
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -- --]  ← Q7
+            # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  0] [ 0  0 -- --]  <- Q4
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 0  0 -- --]  <- Q5
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  0 -- --]  <- Q6
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -- --]  <- Q7
 
             # ------------------------------------------------------------
             # 1. figure out, in tokens, the right-most K position
@@ -787,7 +787,7 @@ def compute_block_masking(
             # ------------------------------------------------------------
             k_max_token = q_end + diag  # last visible K index
 
-            # this Q-block is entirely above the diagonal ⇒ nothing to do
+            # this Q-block is entirely above the diagonal => nothing to do
             if k_max_token < 0:
                 return 0, 0, 0, 0, n_extra_tokens
 
@@ -801,12 +801,12 @@ def compute_block_masking(
 
             # ------------------------------------------------------------
             # 3. classify those visible blocks
-            #    – we *never* skip or mask blocks in front, because causal
+            #    - we *never* skip or mask blocks in front, because causal
             #      attention always starts at K0
-            #    – the back side can require several masked blocks:
-            #         • intersection of the causal diagonal with K-grid
-            #           (at most  ⌈BLOCK_M / BLOCK_N⌉ blocks)
-            #         • plus one extra block if this Q-block stops in the
+            #    - the back side can require several masked blocks:
+            #         o intersection of the causal diagonal with K-grid
+            #           (at most  ?BLOCK_M / BLOCK_N? blocks)
+            #         o plus one extra block if this Q-block stops in the
             #           middle of a K-block or the last K-block is padded
             # ------------------------------------------------------------
             padded_last_k = n_extra_tokens != 0
@@ -823,15 +823,15 @@ def compute_block_masking(
             # Without causal mask, all positions can attend to all positions
             # Only need to handle the padding in the last block
             #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9 ?? ??]
-            # Q0-Q3:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+            # Q0-Q3:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
             #
-            # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+            # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
 
             n_front_skip_blocks = 0  # never skips the left side
             n_front_masked_blocks = 0  # ditto
