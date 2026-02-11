@@ -420,7 +420,9 @@ def gemm_a8w8_ASM(
         )
         is not None
     ):
-        assert bias is not None, "Use asm gemm must give bias, please give a \
+        assert (
+            bias is not None
+        ), "Use asm gemm must give bias, please give a \
             bias=torch.zeros(n,dtype=dtypes.fp32,device='cuda')"
         splitK = asm_config["splitK"]
         kernelName = asm_config["kernelName"]
@@ -501,26 +503,32 @@ def gemm_a8w8_bpreshuffle(
     #     res = gemm_a8w8_ASM(XQ, WQ, x_scale, w_scale, bias, dtype=dtype, check=check)
     #     if res is not None:
     #         return res
-    assert WQ.dtype == dtypes.fp8, "gemm_a8w8_bpreshuffle only support fp8 now"
+    assert WQ.dtype in (
+        dtypes.fp8,
+        dtypes.i8,
+    ), "gemm_a8w8_bpreshuffle only support fp8 and i8 now"
     assert bias is None, "gemm_a8w8_bpreshuffle does not support bias now"
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
-    # CKTile only supports bf16 dtype
     config = get_GEMM_config_with_quant_type(
         m,
         n,
         k,
-        dtypes.fp8,
+        WQ.dtype,
         AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
     )
     if config is not None:
         libtype = config["libtype"]
+        if libtype == "asm" and WQ.dtype == dtypes.i8:
+            # i8 bpreshuffle uses ASM kernel; ASM requires bias (use zeros)
+            bias_asm = torch.zeros(n, dtype=dtypes.fp32, device=XQ.device)
+            return gemm_a8w8_ASM(XQ, WQ, x_scale, w_scale, bias_asm, dtype)
         if libtype == "ck":
             return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
-        elif libtype == "cktile":
+        if libtype == "cktile":
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
-    else:
-        return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+    # No config or ck/cktile: use CK (for i8 C++ may not be built; then caller handles)
+    return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
 
 def gemm_a8w8_blockscale_fake(

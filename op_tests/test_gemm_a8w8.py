@@ -111,7 +111,7 @@ def init_hipblas():
 
 
 @benchmark()
-def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
+def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, only_bpreshuffle=False):
     dim = (m, n, k)
     x = torch.randn((m, k), dtype=dtype, device="cuda")
     weight = torch.randn((n, k), dtype=dtype, device="cuda")
@@ -129,53 +129,64 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
     # print(f"{x_pad.shape=}{x_pad.stride()}")
 
     a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
-    b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
 
-    shape_is_tuned = (quantDtype == dtypes.fp8) and is_shape_tuned(m, n, k, quantDtype)
-    if shape_is_tuned:
-        err_b = checkAllclose(
-            a,
-            b,
-            msg="ck (tuned): ",
-            rtol=1e-1,
-            atol=1e-1,
-            tol_err_ratio=1.0,
-            printLog=False,
+    if not only_bpreshuffle:
+        b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
+        shape_is_tuned = (quantDtype == dtypes.fp8) and is_shape_tuned(
+            m, n, k, quantDtype
         )
+        if shape_is_tuned:
+            err_b = checkAllclose(
+                a,
+                b,
+                msg="ck (tuned): ",
+                rtol=1e-1,
+                atol=1e-1,
+                tol_err_ratio=1.0,
+                printLog=False,
+            )
+        else:
+            err_b = checkAllclose(a, b, msg="ck: ", rtol=1e-2, atol=1e-2)
     else:
-        err_b = checkAllclose(a, b, msg="ck: ", rtol=1e-2, atol=1e-2)
-    if quantDtype != dtypes.i8:
+        avg_b = None
+        err_b = None
+
+    try:
         c, avg_c = run_gemm_ck_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
-        # c = c + bias
+        if quantDtype == dtypes.i8 and bias is not None:
+            c = c + bias
         err_c = checkAllclose(a, c, msg="ck bpreshuffle: ", rtol=1e-2, atol=1e-2)
-    else:
+    except Exception:
         avg_c = None
         err_c = None
 
     avg_d = None
     err_d = None
-    gpu = torch.cuda.current_device()
-    device_properties = torch.cuda.get_device_properties(gpu)
-    cu_num = device_properties.multi_processor_count
-    if (
-        dtype == dtypes.bf16
-        and quantDtype == dtypes.i8
-        and bias is not None
-        and get_gfx() == "gfx942"
-    ):
-        weightshuffle_asm = None
-        if cu_num == 80:
-            weightshuffle_asm = shuffle_weight(weight, layout=(32, 16))
-        elif cu_num == 304:
-            weightshuffle_asm = shuffle_weight(weight, layout=(16, 16))
-        else:
-            raise ValueError(f"Unsupported hw. CU count: {cu_num}")
-        bias_f32 = bias.to(dtypes.fp32)
-        d, avg_d = run_gemm_asm(x, weightshuffle_asm, x_scale, w_scale, bias_f32, dtype)
-        if d is not None:
-            err_d = checkAllclose(a, d, msg="asm: ", rtol=1e-2, atol=1e-2)
-        else:
-            avg_d = None
+    if not only_bpreshuffle:
+        gpu = torch.cuda.current_device()
+        device_properties = torch.cuda.get_device_properties(gpu)
+        cu_num = device_properties.multi_processor_count
+        if (
+            dtype == dtypes.bf16
+            and quantDtype == dtypes.i8
+            and bias is not None
+            and get_gfx() == "gfx942"
+        ):
+            weightshuffle_asm = None
+            if cu_num == 80:
+                weightshuffle_asm = shuffle_weight(weight, layout=(32, 16))
+            elif cu_num == 304:
+                weightshuffle_asm = shuffle_weight(weight, layout=(16, 16))
+            else:
+                raise ValueError(f"Unsupported hw. CU count: {cu_num}")
+            bias_f32 = bias.to(dtypes.fp32)
+            d, avg_d = run_gemm_asm(
+                x, weightshuffle_asm, x_scale, w_scale, bias_f32, dtype
+            )
+            if d is not None:
+                err_d = checkAllclose(a, d, msg="asm: ", rtol=1e-2, atol=1e-2)
+            else:
+                avg_d = None
 
     if quantDtype == dtypes.fp8 and get_gfx() == "gfx942" and dtype == dtypes.bf16:
         # hipb_mm bpreshuffle only supports bfloat16 as output type
@@ -323,12 +334,16 @@ def calculate_total_valid_points(cu_count, aligned_k):
     return total
 
 
-def test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk):
+def test_normal_gemm_a8w8_pertoken_quant(
+    l_dtype, l_quantDtype, l_mnk, only_bpreshuffle=False
+):
     df = []
     for dtype in l_dtype:
         for quantDtype in l_quantDtype:
             for m, n, k in l_mnk:
-                ret = test_gemm(dtype, m, n, k, quantDtype)
+                ret = test_gemm(
+                    dtype, m, n, k, quantDtype, only_bpreshuffle=only_bpreshuffle
+                )
                 df.append(ret)
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
@@ -393,9 +408,48 @@ def test_skinny_gemm_a8w8_pertoken_quant():
                     # test_gemm(dtype, m, n, k, quant_dtype)
 
 
+# Per-token i8 tune: (m, n, k) list for first-step tuning
+PERTOKEN_I8_TUNE_MNK = [
+    (64, 1536, 5120),
+    (128, 1536, 5120),
+    (256, 1536, 5120),
+    (512, 1536, 5120),
+    (1024, 1536, 5120),
+    (4096, 1536, 5120),
+    (8192, 1536, 5120),
+    (10240, 1536, 5120),
+    (12288, 1536, 5120),
+    (16384, 1536, 5120),
+    (20480, 1536, 5120),
+    (24576, 1536, 5120),
+    (30720, 1536, 5120),
+    (32768, 1536, 5120),
+    (40960, 1536, 5120),
+    (64, 5120, 1280),
+    (128, 5120, 1280),
+    (256, 5120, 1280),
+    (512, 5120, 1280),
+    (1024, 5120, 1280),
+    (4096, 5120, 1280),
+    (8192, 5120, 1280),
+    (10240, 5120, 1280),
+    (12288, 5120, 1280),
+    (16384, 5120, 1280),
+    (20480, 5120, 1280),
+    (24576, 5120, 1280),
+    (30720, 5120, 1280),
+    (32768, 5120, 1280),
+    (40960, 5120, 1280),
+]
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
+)
+parser.add_argument(
+    "--tune-pertoken-i8",
+    action="store_true",
+    help="Use PERTOKEN_I8_TUNE_MNK shapes and run per-token i8 quant only (bf16, i8).",
 )
 parser.add_argument(
     "-d",
@@ -416,6 +470,11 @@ parser.add_argument(
     default=[dtypes.d_dtypes["i8"], dtypes.d_dtypes["fp8"]],
     help="""Data type of quantization.
     e.g.: -q fp8""",
+)
+parser.add_argument(
+    "--only-bpreshuffle",
+    action="store_true",
+    help="Only run bpreshuffle kernels (ck bpreshuffle, hipmm bpreshuffle); skip CK and ASM.",
 )
 parser.add_argument(
     "-mnk",
@@ -465,5 +524,16 @@ parser.add_argument(
 
 args = parser.parse_args()
 
-test_normal_gemm_a8w8_pertoken_quant(args.dtype, args.quantDtype, args.mnk)
+if getattr(args, "tune_pertoken_i8", False):
+    args.mnk = PERTOKEN_I8_TUNE_MNK
+    args.quantDtype = [dtypes.i8]
+    args.dtype = [dtypes.d_dtypes["bf16"]]
+    aiter.logger.info("tune-pertoken-i8: using %d (m,n,k) shapes", len(args.mnk))
+
+test_normal_gemm_a8w8_pertoken_quant(
+    args.dtype,
+    args.quantDtype,
+    args.mnk,
+    only_bpreshuffle=getattr(args, "only_bpreshuffle", False),
+)
 test_skinny_gemm_a8w8_pertoken_quant()

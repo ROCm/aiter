@@ -1,0 +1,780 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+import torch
+import aiter
+from aiter.test_common import (
+    checkAllclose,
+    run_perftest,
+    perftest,
+)
+from aiter.fused_moe import (
+    fused_topk,
+    fused_moe,
+    torch_moe,
+)
+
+from aiter.fused_moe_bf16_asm import asm_moe
+from aiter.ops.shuffle import shuffle_weight
+from aiter import ActivationType
+from aiter import pertoken_quant
+from aiter import dtypes
+import argparse
+import pandas as pd
+import sys
+
+BLOCK_SIZE_M = 32
+MAX_TOKENS = 4096 * 4
+
+# (token, bs, ctx_lens) — input configurations for kernel sum tests
+TOKEN_BS_CTX_TABLE = [
+    (64, 64, "1"),
+    (128, 128, "1"),
+    (256, 256, "1"),
+    (512, 512, "1"),
+    (1024, 1, "1K"),
+    (4096, 1, "4K"),
+    (8192, 1, "8K"),
+    (10240, 1, "10K"),
+    (12288, 3, "4K"),
+    (16384, 2, "8K"),
+    (20480, 2, "10K"),
+    (24576, 3, "8K"),
+    (30720, 3, "10K"),
+    (32768, 4, "8K"),
+    (40960, 4, "10K"),
+]
+# Lookup (bs, ctx_lens) by token for reporting
+TOKEN_TO_BS_CTX = {t: (bs, ctx) for t, bs, ctx in TOKEN_BS_CTX_TABLE}
+
+
+@perftest(num_warmup=1, num_iters=2)
+def torch_moe_test(
+    hidden_states,
+    w1,
+    w2,
+    topk_weight,
+    topk_ids,
+    # following for int8 quant
+    fc1_scale=None,  # [expert, inter_dim, 1]
+    fc2_scale=None,  # [expert, model_dim, 1]
+    fc1_smooth_scale=None,  # [expert, 1, model_dim]
+    fc2_smooth_scale=None,  # [expert, 1, inter_dim]
+    expert_mask=None,
+):
+    return torch_moe(
+        hidden_states,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        fc1_scale,
+        fc2_scale,
+        fc1_smooth_scale,
+        fc2_smooth_scale,
+        expert_mask,
+    )
+
+
+@perftest()
+def asm_moe_test(
+    hidden_states,
+    w1,
+    w2,
+    topk_weight,
+    topk_ids,
+    # following for int8 quant
+    fc1_scale=None,  # [expert, inter_dim, 1]
+    fc2_scale=None,  # [expert, model_dim, 1]
+    fc1_smooth_scale=None,  # [expert, 1, model_dim]
+    fc2_smooth_scale=None,  # [expert, 1, inter_dim]
+    a16=False,
+    expert_mask=None,
+):
+
+    return asm_moe(
+        hidden_states,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        fc1_scale,
+        fc2_scale,
+        fc1_smooth_scale,
+        fc2_smooth_scale,
+        a16,
+        expert_mask=expert_mask,
+    )
+
+
+quant_algo = [
+    "No",  # g1u0/ck(g1ux) support
+    "int8quant",  # g1u1 support
+    "fp8quant",  # g1u1 support
+    "int8smoothquant",  # g1u1/g1u0 support
+    "fp8smoothquant",  # g1u1 support
+]
+
+
+def test_fmoe_ep(
+    dtype,
+    token,
+    model_dim,
+    inter_dim,
+    E,
+    topk,
+    quant="No",
+    use_g1u1=False,
+    shared_E=2,
+    ep=8,
+):
+    ret = {}
+    # This gpu id in EP, this example use the last id
+    ep_id = ep - 1
+    # total_expert = unshared_expert + shared_expert + fake_expert(only use this fake expert id to mask)
+    # expert_mask = torch.randint(
+    #     0, 2, (E + shared_E + 1,), dtype=dtypes.i32, device="cuda"
+    # )
+    expert_mask = torch.zeros((E + shared_E + 1,), dtype=dtypes.i32, device="cuda")
+    expert_mask[ep_id * (E // ep) : (ep_id + 1) * E // ep] = 1
+    # # Get local expert Number in this gpu
+    local_E = torch.sum(expert_mask).item()
+    # The last expert
+    fake_expertid = expert_mask.numel() - 1
+    # Ensure fake expert to be masked
+    expert_mask[-1] = 0
+    # Ensure shared expert not to be masked
+    expert_mask[E:-1] = 1
+
+    quantAlgoId = quant_algo.index(quant)
+    if quantAlgoId not in [0] and not use_g1u1:
+        print("g1u0 only could test no quant and int8smoothquant")
+        return
+
+    quantstr = quant_algo[quantAlgoId]
+    quant_dtype = dtypes.i8 if quantstr.startswith("int8") else dtypes.fp8
+    use_smooth = "smooth" in quantstr
+
+    try:
+        input = torch.randn((token, model_dim), dtype=dtype, device="cuda")
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            print(f"[Skip] OOM at token={token}, model_dim={model_dim}, dtype={dtype}")
+            return {}
+        else:
+            raise
+    if use_g1u1:
+        w1 = (
+            torch.randn(
+                (local_E + shared_E, inter_dim * 2, model_dim),
+                dtype=dtype,
+                device="cuda",
+            )
+            / 10
+        )
+    else:
+        w1 = (
+            torch.randn(
+                (local_E + shared_E, inter_dim, model_dim), dtype=dtype, device="cuda"
+            )
+            / 10
+        )
+    w2 = (
+        torch.randn(
+            (local_E + shared_E, model_dim, inter_dim), dtype=dtype, device="cuda"
+        )
+        / 10
+    )
+    asm_only = getattr(args, "asm_only", True)
+    if not asm_only:
+        score = torch.randn((token, E), device="cuda", dtype=dtype)
+
+    # if shared_E > 0:
+    shared_E_score = 0.1
+    # init total_topk_ids, inference time you just need to fill ns_topk_ids in total_topk_ids
+    try:
+        total_topk_ids = torch.empty(
+            (token, topk + shared_E + 1), dtype=dtypes.i32, device=input.device
+        )
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            print(
+                f"[Skip] OOM routing ids at token={token}, topk={topk}, shared_E={shared_E}"
+            )
+            return {}
+        else:
+            raise
+    ns_topk_ids, s_topk_ids = total_topk_ids.split([topk, shared_E + 1], dim=1)
+    shared_expert_ids = [E + i for i in range(shared_E + 1)]
+    s_topk_ids_list = [[fake_expertid] * (shared_E + 1)] * token
+    for i in range(ep_id, token, ep):
+        s_topk_ids_list[i] = shared_expert_ids
+    s_topk_ids[:] = torch.tensor(s_topk_ids_list, dtype=dtypes.i32, device=input.device)
+
+    # init total_topk_weights, inference time you just need to fill ns_topk_weights in total_topk_weights
+    try:
+        total_topk_weights = torch.empty(
+            (token, topk + shared_E + 1), dtype=dtypes.fp32, device=input.device
+        )
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            print(
+                f"[Skip] OOM routing weights at token={token}, topk={topk}, shared_E={shared_E}"
+            )
+            return {}
+        else:
+            raise
+    ns_topk_weights, s_topk_weights = total_topk_weights.split(
+        [topk, shared_E + 1], dim=1
+    )
+    s_topk_weights[:] = shared_E_score
+
+    # inference time, use fused_topk to fill ns_topk_ids and ns_topk_weights
+    if asm_only:
+        ns_topk_ids[:] = torch.randint(
+            0, E, (token, topk), dtype=dtypes.i32, device=input.device
+        )
+        ns_topk_weights[:] = torch.rand(
+            (token, topk), dtype=dtypes.fp32, device=input.device
+        )
+        ns_topk_weights[:] = ns_topk_weights / (
+            ns_topk_weights.sum(dim=1, keepdim=True) + 1e-6
+        )
+    else:
+        fused_topk(input, score, topk, True, ns_topk_ids, ns_topk_weights)
+    # inference time, topk_ids simply slices total_topk_ids into the number of input tokens, same for topk_weights
+    topk_ids = total_topk_ids[:token]
+    topk_weights = total_topk_weights[:token]
+
+    # else:
+    #     topk_ids, topk_weights = fused_topk(input, score, topk, True)
+
+    if quantAlgoId == 0:
+        # ref2 implement
+        ref2, avg_c = torch_moe_test(
+            input, w1, w2, topk_weights, topk_ids, expert_mask=expert_mask
+        )
+
+        # b implement
+        torch_quant = aiter.get_torch_quant(aiter.QuantType.No)
+        w1_qt, w1_scale = torch_quant(w1, quant_dtype=None)
+        w2_qt, w2_scale = torch_quant(w2, quant_dtype=None)
+        w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
+        w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
+        w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
+        w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
+
+        # if use_g1u1:
+        #     out_b = ref2
+        #     avg_b = 9999
+        #     print("asm g1u1 only support quant/smoothquant Now")
+        # else:
+        #     out_b, avg_b = asm_moe_test(
+        #         input,
+        #         w1_qt_aiter,
+        #         w2_qt_aiter,
+        #         topk_weights,
+        #         topk_ids,
+        #         expert_mask=expert_mask,
+        #     )
+
+        # test ck moe
+        out_ck, avg_ck = run_perftest(
+            fused_moe,
+            input,
+            w1_qt_aiter,
+            w2_qt_aiter,
+            topk_weights,
+            topk_ids,
+            expert_mask,
+            w1_scale=None,
+            w2_scale=None,
+            quant_type=aiter.QuantType.No,
+            activation=ActivationType.Silu,
+            doweight_stage1=False,
+        )
+
+        # msg = f"[perf] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us, ck_avg: {avg_ck:>8.2f} us, uplift: {avg_c/avg_b-1:.1%}"
+        # checkAllclose(ref2, out_b, rtol=0.01, atol=10, msg=msg)
+        checkAllclose(ref2, out_ck, rtol=0.01, atol=10, msg="ck check")
+
+    else:
+        w1, fc1_scale = pertoken_quant(w1, quant_dtype=quant_dtype)
+        w2, fc2_scale = pertoken_quant(w2, quant_dtype=quant_dtype)
+
+        sp1 = (local_E + shared_E, inter_dim)
+        sp2 = (local_E + shared_E, model_dim)
+
+        if not use_smooth:
+            fc1_smooth_scale = None
+            fc2_smooth_scale = None
+        else:
+            # [expert, 1, model_dim]
+            fc1_smooth_scale = torch.randn(sp2, dtype=dtypes.fp32, device="cuda")
+            # [expert, 1, inter_dim]
+            fc2_smooth_scale = torch.randn(sp1, dtype=dtypes.fp32, device="cuda")
+
+        # ref2 implement
+        # ref2, avg_c = torch_moe_test(
+        #     input,
+        #     w1,
+        #     w2,
+        #     topk_weights,
+        #     topk_ids,
+        #     fc1_scale,
+        #     fc2_scale,
+        #     fc1_smooth_scale,
+        #     fc2_smooth_scale,
+        #     expert_mask,
+        # )
+
+        # b implement
+        w1b = shuffle_weight(w1)
+        w2b = shuffle_weight(w2)
+        out_b, avg_b = asm_moe_test(
+            input,
+            w1b,
+            w2b,
+            topk_weights,
+            topk_ids,
+            fc1_scale,
+            fc2_scale,
+            fc1_smooth_scale,
+            fc2_smooth_scale,
+            expert_mask=expert_mask,
+        )
+        ref2 = out_b
+        avg_c = 0
+
+        def calculateTensorsSize(*args):
+            num_btype = 0
+            for el in args:
+                if isinstance(el, torch.Tensor):
+                    num_btype += el.element_size() * el.numel()
+            return num_btype
+
+        num_tb = calculateTensorsSize(
+            input,
+            input,
+            w1b,
+            w2b,
+            topk_weights,
+            topk_ids,
+            fc1_scale,
+            fc2_scale,
+            fc1_smooth_scale,
+            fc2_smooth_scale,
+        ) / (1024 * 1024 * 1024 * 1024.0)
+        bw = num_tb * 1e9 / avg_b
+        print(
+            f"[BW  ] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, {topk=}, dtype: {dtype}, asm_bandwidth: {bw:>8.2f}GB/s"
+        )
+
+        if use_smooth and (
+            (
+                (inter_dim % 512 == 0 or inter_dim % 320 == 0)
+                and (w1b.dtype == dtypes.fp8 and inter_dim * 2 == w1b.shape[1])
+            )
+            or (
+                (inter_dim % 256 == 0 or inter_dim % 320 == 0 or inter_dim % 384 == 0)
+                and (w1b.dtype == dtypes.i8 and inter_dim * 2 == w1b.shape[1])
+            )
+            or (
+                (inter_dim % 512 == 0)
+                and (w1b.dtype == dtypes.i8 and inter_dim == w1b.shape[1])
+            )
+        ):
+            out_b2, avg_b2 = asm_moe_test(
+                input,
+                w1b,
+                w2b,
+                topk_weights,
+                topk_ids,
+                fc1_scale,
+                fc2_scale,
+                fc1_smooth_scale,
+                fc2_smooth_scale,
+                a16=True,
+                expert_mask=expert_mask,
+            )
+            msg = f"[perf] a8w8 asm: {avg_b:>8.2f} vs a16w8 asm: {avg_b2:>8.2f} ......"
+            checkAllclose(out_b, out_b2, atol=10, msg=msg)
+
+        msg = f"[perf] {use_g1u1=} {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us ...... uplift: {avg_c/avg_b-1:.1%}"
+        checkAllclose(ref2, out_b, rtol=0.01, atol=10, msg=msg)
+        # checkAllclose(ref2, avg_ck, rtol=0.01, atol=10)
+        if token in TOKEN_TO_BS_CTX:
+            bs_val, ctx_str = TOKEN_TO_BS_CTX[token]
+        else:
+            allowed_bs = {1, 2, 3, 4, 64, 128, 256}
+            ctx_candidates = [(10240, "10K"), (8192, "8K"), (4096, "4K")]
+            bs_val = None
+            ctx_str = None
+            for ctx_val, ctx_label in ctx_candidates:
+                if token % ctx_val == 0:
+                    cand_bs = token // ctx_val
+                    if cand_bs in allowed_bs:
+                        bs_val = int(cand_bs)
+                        ctx_str = ctx_label
+                        break
+            if bs_val is None:
+                bs_val = 1
+                ctx_str = "N/A"
+        ret = {
+            "token": token,
+            "bs": bs_val,
+            "ctx_lens": ctx_str,
+            "quant": quantstr,
+            "model_dim": model_dim,
+            "inter_dim": inter_dim,
+            "E": E,
+            "shared_E": shared_E,
+            "topk": topk,
+            "ep": ep,
+            "dtype": dtype,
+            "torch_avg_us": float(avg_c),
+            "asm_avg_us": float(avg_b2),
+            "uplift": float(avg_c / avg_b2 - 1.0),
+            "asm_bandwidth": float(bw),
+        }
+    return ret
+
+
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="select test",
+)
+l_test = [
+    "test_fmoe_16_bit",
+    "g1u1_no_quant",
+    "g1u1_int8quant",
+    "g1u1_fp8quant",
+    "g1u0_int8smoothquant",
+    "g1u1_int8smoothquant",
+    "g1u1_fp8smoothquant",
+]
+parser.add_argument(
+    "-t",
+    "--test",
+    type=str,
+    choices=l_test,
+    default="g1u1_int8quant",
+    help="""Select test to run.
+    e.g.: -t g1u1_int8quant
+          or -t test_fmoe_16_bit
+          or -t g1u1_no_quant
+          or -t g1u1_int8quant
+          or -t g1u1_fp8quant
+          or -t g1u0_int8smoothquant
+          or -t g1u1_int8smoothquant
+          or -t g1u1_fp8smoothquant""",
+)
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    nargs="?",
+    default=None,
+    help="""Data type.
+    e.g.: -d bf16""",
+)
+parser.add_argument(
+    "-m",
+    "--token",
+    type=int,
+    nargs="*",
+    default=None,
+    help="""Token Num.
+    e.g.: -m 128""",
+)
+parser.add_argument(
+    "-hd",
+    "--hidden_dim",
+    type=int,
+    nargs="*",
+    default=None,
+    help="""Hidden states dim.
+    e.g.: -hd 4096""",
+)
+parser.add_argument(
+    "-id",
+    "--inter_dim",
+    type=int,
+    nargs="*",
+    default=None,
+    help="""Intermediate dim.
+    e.g.: -id 1024""",
+)
+parser.add_argument(
+    "-e",
+    "--expert",
+    type=int,
+    nargs="?",
+    default=None,
+    help="""Number of experts.
+    e.g.: -e 32""",
+)
+parser.add_argument(
+    "-k",
+    "--topk",
+    type=int,
+    nargs="?",
+    default=None,
+    help="""Top-k value.
+    e.g.: -k 5""",
+)
+parser.add_argument(
+    "-ep",
+    "--expert_parallelism",
+    type=int,
+    nargs="*",
+    default=None,
+    help="""Expert Parallelism.
+    e.g.: -ep 8""",
+)
+parser.add_argument(
+    "--asm_only",
+    action="store_true",
+    help="Run only ASM path and skip torch/CK and fused_topk gating allocation.",
+)
+
+args = parser.parse_args()
+if args.test is not None:
+    l_test = [args.test]
+if len(sys.argv) == 1:
+    args.asm_only = True
+    l_test = ["g1u1_int8quant"]
+    if args.token is None:
+        args.token = [t for t, _, _ in TOKEN_BS_CTX_TABLE]
+    if args.hidden_dim is None:
+        args.hidden_dim = [5120]
+    if args.inter_dim is None:
+        args.inter_dim = [1536]
+    if args.expert is None:
+        args.expert = 128
+    if args.topk is None:
+        args.topk = 6
+    if args.expert_parallelism is None:
+        args.expert_parallelism = [8]
+if args.asm_only:
+    l_test = ["g1u1_int8quant"]
+
+for test in l_test:
+    print(f"\nRunning test: {test}")
+    if test == "test_fmoe_16_bit":
+        print("test test_fmoe 16 bit")
+        # print("\ng1u0 no quant")
+        # for dtype in [dtypes.fp16, dtypes.bf16]:
+        #     for m in [7, 128, 256]:
+        #         for dim in [4096, 8192]:
+        #             for hdim in [1024, 1280]:
+        #                 for ep in [4, 8]:
+        #                     test_fmoe_ep(
+        #                         dtype, m, dim, hdim, 128, 6, quant="No", shared_E=2, ep=ep
+        #                     )
+
+    elif test == "g1u1_no_quant":
+        for dtype in (
+            [dtypes.fp16, dtypes.bf16]
+            if args.dtype is None
+            else [dtypes.d_dtypes[args.dtype]]
+        ):
+            for m in [7, 128, 256] if args.token is None else args.token:
+                for hdim in (
+                    [4096, 8192] if args.hidden_dim is None else args.hidden_dim
+                ):
+                    for idim in (
+                        [1024, 1280] if args.inter_dim is None else args.inter_dim
+                    ):
+                        for ep in (
+                            [4, 8]
+                            if args.expert_parallelism is None
+                            else args.expert_parallelism
+                        ):
+                            expert = 128 if args.expert is None else args.expert
+                            topk = 9 if args.topk is None else args.topk
+                            test_fmoe_ep(
+                                dtype,
+                                m,
+                                hdim,
+                                idim,
+                                expert,
+                                topk,
+                                quant="No",
+                                use_g1u1=True,
+                                shared_E=2,
+                                ep=ep,
+                            )
+    elif test == "g1u1_int8quant":
+        results = []
+        for dtype in (
+            [dtypes.bf16] if args.dtype is None else [dtypes.d_dtypes[args.dtype]]
+        ):
+            for m in (
+                [t for t, _, _ in TOKEN_BS_CTX_TABLE]
+                if args.token is None
+                else args.token
+            ):
+                # for m in [16, 32, 64, 128, 256, 512, 1024, 4096,8192,10240,12288] if args.token is None else args.token:
+                for hdim in [5120] if args.hidden_dim is None else args.hidden_dim:
+                    for idim in [1536] if args.inter_dim is None else args.inter_dim:
+                        expert = 128 if args.expert is None else args.expert
+                        topk = 6 if args.topk is None else args.topk
+                        for ep in (
+                            [8]
+                            if args.expert_parallelism is None
+                            else args.expert_parallelism
+                        ):
+                            ret = test_fmoe_ep(
+                                dtype,
+                                m,
+                                hdim,
+                                idim,
+                                expert,
+                                topk,
+                                quant="int8quant",
+                                use_g1u1=True,
+                                shared_E=2,
+                                ep=ep,
+                            )
+                            if ret:
+                                results.append(ret)
+        if results:
+            df = pd.DataFrame(results)
+            print(f"summary:\n{df}")
+    elif test == "g1u1_fp8quant":
+        for dtype in (
+            [dtypes.bf16] if args.dtype is None else [dtypes.d_dtypes[args.dtype]]
+        ):
+            for m in [128, 256] if args.token is None else args.token:
+                for hdim in (
+                    [4096, 8192] if args.hidden_dim is None else args.hidden_dim
+                ):
+                    for idim in [1024] if args.inter_dim is None else args.inter_dim:
+                        expert = 32 if args.expert is None else args.expert
+                        topk = 5 if args.topk is None else args.topk
+                        for ep in (
+                            [4, 8]
+                            if args.expert_parallelism is None
+                            else args.expert_parallelism
+                        ):
+                            test_fmoe_ep(
+                                dtype,
+                                m,
+                                hdim,
+                                idim,
+                                expert,
+                                topk,
+                                quant="fp8quant",
+                                use_g1u1=True,
+                                shared_E=2,
+                                ep=ep,
+                            )
+    elif test == "g1u0_int8smoothquant":
+        results = []
+        for dtype in (
+            [dtypes.bf16] if args.dtype is None else [dtypes.d_dtypes[args.dtype]]
+        ):
+            for m in [128] if args.token is None else args.token:
+                for hdim in (
+                    [4096, 6144, 8192] if args.hidden_dim is None else args.hidden_dim
+                ):
+                    for idim in (
+                        [512, 1024] if args.inter_dim is None else args.inter_dim
+                    ):
+                        expert = 32 if args.expert is None else args.expert
+                        topk = 5 if args.topk is None else args.topk
+                        for ep in (
+                            [4, 8]
+                            if args.expert_parallelism is None
+                            else args.expert_parallelism
+                        ):
+                            ret = test_fmoe_ep(
+                                dtype,
+                                m,
+                                hdim,
+                                idim,
+                                expert,
+                                topk,
+                                quant="int8smoothquant",
+                                use_g1u1=False,
+                                shared_E=2,
+                                ep=ep,
+                            )
+                            results.append(ret)
+        if results:
+            df = pd.DataFrame(results)
+            print(f"summary:\n{df}")
+    elif test == "g1u1_int8smoothquant":
+        results = []
+        for dtype in (
+            [dtypes.bf16] if args.dtype is None else [dtypes.d_dtypes[args.dtype]]
+        ):
+            for m in (
+                [t for t, _, _ in TOKEN_BS_CTX_TABLE]
+                if args.token is None
+                else args.token
+            ):
+                for hdim in [5120] if args.hidden_dim is None else args.hidden_dim:
+                    for idim in [1536] if args.inter_dim is None else args.inter_dim:
+                        expert = 128 if args.expert is None else args.expert
+                        topk = 6 if args.topk is None else args.topk
+                        for ep in (
+                            [8]
+                            if args.expert_parallelism is None
+                            else args.expert_parallelism
+                        ):
+                            bs_ctx = TOKEN_TO_BS_CTX.get(m, (None, "N/A"))
+                            print(
+                                f"[g1u1_int8smoothquant] token={m}, bs={bs_ctx[0]}, ctx_lens={bs_ctx[1]}, "
+                                f"hdim={hdim}, idim={idim}, expert={expert}, topk={topk}, ep={ep}, dtype={dtype}"
+                            )
+                            ret = test_fmoe_ep(
+                                dtype,
+                                m,
+                                hdim,
+                                idim,
+                                expert,
+                                topk,
+                                quant="int8smoothquant",
+                                use_g1u1=True,
+                                shared_E=2,
+                                ep=ep,
+                            )
+                            if ret:
+                                results.append(ret)
+        if results:
+            df = pd.DataFrame(results)
+            print(f"[g1u1_int8smoothquant] summary:\n{df}")
+    elif test == "g1u1_fp8smoothquant":
+        for dtype in (
+            [dtypes.bf16] if args.dtype is None else [dtypes.d_dtypes[args.dtype]]
+        ):
+            for m in [128] if args.token is None else args.token:
+                for hdim in (
+                    [4096, 6144, 8192] if args.hidden_dim is None else args.hidden_dim
+                ):
+                    for idim in (
+                        [512, 1024, 1280] if args.inter_dim is None else args.inter_dim
+                    ):
+                        expert = 32 if args.expert is None else args.expert
+                        topk = 5 if args.topk is None else args.topk
+                        for ep in (
+                            [4, 8]
+                            if args.expert_parallelism is None
+                            else args.expert_parallelism
+                        ):
+                            test_fmoe_ep(
+                                dtype,
+                                m,
+                                hdim,
+                                idim,
+                                expert,
+                                topk,
+                                quant="fp8smoothquant",
+                                use_g1u1=True,
+                                shared_E=2,
+                                ep=ep,
+                            )
+    else:
+        raise ValueError(f"Unknown test: {test}")

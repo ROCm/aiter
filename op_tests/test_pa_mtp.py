@@ -342,7 +342,17 @@ def test_pa_mtp(
     dtype: torch.dtype,
     qlen,
 ) -> dict:
-    ret = {}
+    ret = {
+        "token": batch_size * ctx_lens,
+        "bs": batch_size,
+        "ctx_len": ctx_lens,
+        "q_len": qlen,
+        "num_heads": num_heads,
+        "head_size": head_size,
+        "block_size": block_size,
+        "dtype": str(dtype),
+        "qlen": qlen,
+    }
     seed = 0
     device = "cuda:0"
     torch.set_default_device(device)
@@ -450,6 +460,17 @@ def test_pa_mtp(
     ret["us_hip_bf16"] = us_hip
     ret["err_hip_bf16"] = err_noquant
 
+    total_kv_tokens = batch_size * ctx_lens
+    total_q_tokens = batch_size * qlen
+    ret["token_kv"] = total_kv_tokens
+    ret["token_q"] = total_q_tokens
+    element_size = dtype.itemsize
+    mem_bytes_bf16 = (
+        int(total_kv_tokens) * int(num_kv_heads) * int(head_size) * int(element_size) * 2
+        + int(total_q_tokens) * int(num_query_heads) * int(head_size) * int(element_size) * 2
+    )
+    ret["bw_hip_bf16"] = mem_bytes_bf16 / (us_hip * 1e-6) / 1e9
+
     # ################## quant start ######################
     k_quant_, k_scale_, v_quant_, v_scale_, k_scale_asm, v_scale_asm = (
         pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
@@ -478,6 +499,12 @@ def test_pa_mtp(
     )
     ret["us_asm_fp8"] = us_aiter_asm
     ret["err fp8"] = err
+    mem_bytes_fp8 = (
+        int(total_kv_tokens) * int(num_kv_heads) * int(head_size) * 1 * 2
+        + int(total_q_tokens) * int(num_query_heads) * int(head_size) * 1
+        + int(total_q_tokens) * int(num_query_heads) * int(head_size) * int(element_size)
+    )
+    ret["bw_asm_fp8 GB/s"] = mem_bytes_fp8 / (us_aiter_asm * 1e-6) / 1e9
 
     q_quant, q_scale = pertoken_quant(query, quant_dtype=aiter.dtypes.fp8)
     q_scale = q_scale.squeeze(-1)
@@ -505,6 +532,7 @@ def test_pa_mtp(
     )
     ret["us_hip_fp8"] = us_hip
     ret["err_hip_fp8"] = err
+    ret["bw_hip_fp8 GB/s"] = mem_bytes_fp8 / (us_hip * 1e-6) / 1e9
 
     return ret
 
@@ -516,6 +544,35 @@ l_num_heads = [(5, 1), (8, 1), (10, 1)]
 l_qlen = [1, 2, 3, 4]
 l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097, 16384]
 l_batch_size = [128]
+
+# Input config table: (token, bs, ctx_len, q_len); token = bs * ctx_len
+# num_heads=(10,1), head_size=128, block_size=1024, dtype=bf16 for all
+PA_MTP_INPUT_TABLE = [
+    (262144, 64, 4096, 1),
+    (262144, 64, 4096, 4),
+    (524288, 64, 8192, 1),
+    (524288, 64, 8192, 4),
+    (655360, 64, 10240, 1),
+    (655360, 64, 10240, 4),
+    (524288, 128, 4096, 1),
+    (524288, 128, 4096, 4),
+    (1048576, 128, 8192, 1),
+    (1048576, 128, 8192, 4),
+    (1310720, 128, 10240, 1),
+    (1310720, 128, 10240, 4),
+    (1048576, 256, 4096, 1),
+    (1048576, 256, 4096, 4),
+    (2097152, 256, 8192, 1),
+    (2097152, 256, 8192, 4),
+    (2621440, 256, 10240, 1),
+    (2621440, 256, 10240, 4),
+    (2097152, 512, 4096, 1),
+    (2097152, 512, 4096, 4),
+    (4194304, 512, 8192, 1),
+    (4194304, 512, 8192, 4),
+    (5242880, 512, 10240, 1),
+    (5242880, 512, 10240, 4),
+]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -588,22 +645,71 @@ if args.batch_size is not None:
     l_batch_size = [args.batch_size]
 l_block_size = args.block_size
 
+# When no -c/-b/-q: run over PA_MTP_INPUT_TABLE; else run over product of l_* as before
+use_input_table = (
+    args.ctx_len is None and args.batch_size is None and args.qlen is None
+)
+
 for dtype in l_dtype:
     df = []
-    for num_heads, qlen, ctx_len, batch_size, block_size in itertools.product(
-        l_num_heads, l_qlen, l_ctx_len, l_batch_size, l_block_size
-    ):
-        ret = test_pa_mtp(
-            ctx_len,
-            batch_size,
-            num_heads,
-            head_dim,
-            block_size,
-            dtype,
-            qlen,
-        )
-        df.append(ret)
+    if use_input_table:
+        num_heads = (10, 1)
+        block_size = 1024
+        for _token, batch_size, ctx_len, qlen in PA_MTP_INPUT_TABLE:
+            ret = test_pa_mtp(
+                ctx_len,
+                batch_size,
+                num_heads,
+                head_dim,
+                block_size,
+                dtype,
+                qlen,
+            )
+            df.append(ret)
+    else:
+        for num_heads, qlen, ctx_len, batch_size, block_size in itertools.product(
+            l_num_heads, l_qlen, l_ctx_len, l_batch_size, l_block_size
+        ):
+            ret = test_pa_mtp(
+                ctx_len,
+                batch_size,
+                num_heads,
+                head_dim,
+                block_size,
+                dtype,
+                qlen,
+            )
+            df.append(ret)
     df = pd.DataFrame(df)
+    # Run ID (0-based) and column order per user spec
+    df.insert(0, "Run ID", range(0, len(df)))
+    summary_cols = [
+        "Run ID",
+        "token",
+        "bs",
+        "ctx_len",
+        "q_len",
+        "num_heads",
+        "head_size",
+        "block_size",
+        "dtype",
+        "qlen",
+        "us_hip_bf16",
+        "bw_hip_bf16",
+        "token_kv",
+        "token_q",
+        "us_asm_fp8",
+        "bw_asm_fp8 GB/s",
+        "us_hip_fp8",
+        "bw_hip_fp8 GB/s",
+    ]
+    df = df[[c for c in summary_cols if c in df.columns]]
+    # Format: token_kv in scientific notation (e.g. 2.62E+05); round float cols to 6 decimals
+    if "token_kv" in df.columns:
+        df["token_kv"] = df["token_kv"].apply(lambda x: f"{float(x):.2E}")
+    for col in ["us_hip_bf16", "bw_hip_bf16", "us_asm_fp8", "bw_asm_fp8 GB/s", "us_hip_fp8", "bw_hip_fp8 GB/s"]:
+        if col in df.columns:
+            df[col] = df[col].round(6)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("pa_mtp summary (markdown):\n%s", df_md)
-    # df.to_csv("mla_prefill.csv")
+    df.to_csv("pa.csv")
