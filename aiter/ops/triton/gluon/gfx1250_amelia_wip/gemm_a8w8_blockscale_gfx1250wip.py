@@ -74,20 +74,13 @@ def gemm_tdm_pipelined_blockscale_kernel(a_ptr, b_ptr, c_ptr,  #
 
     # Layouts
     # 1 for WMMA
-    # shared layouts for A and B
-    # shared layouts for A scale and B scale
+    # shared layouts for A and B, also used by scales
     # operand layouts for A and B
     WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDWMMALayout(3, True, WARP_BASES, [], [16, 16, 32])
     shared_layouts: ttgl.constexpr = create_shared_layouts(BLOCK_M, BLOCK_N, BLOCK_K, TRANSPOSE_B)
     SHARED_LAYOUT_A: ttgl.constexpr = shared_layouts[0]
     SHARED_LAYOUT_B: ttgl.constexpr = shared_layouts[1]
-
-    SHARED_LAYOUT_A_SCALE: ttgl.constexpr = gl.SwizzledSharedLayout(
-        vec=16, per_phase=2, max_phase=8, order=[0]
-    )
-    SHARED_LAYOUT_B_SCALE: ttgl.constexpr = ttgl.SwizzledSharedLayout(
-        vec=16, per_phase=2, max_phase=8, order=[0])
-                                                                                    
+                                        
     OPERAND_LAYOUT_A: ttgl.constexpr = ttgl.DotOperandLayout(0, WMMA_LAYOUT, K_WIDTH)
     OPERAND_LAYOUT_B: ttgl.constexpr = ttgl.DotOperandLayout(1, WMMA_LAYOUT, K_WIDTH)
 
@@ -106,8 +99,8 @@ def gemm_tdm_pipelined_blockscale_kernel(a_ptr, b_ptr, c_ptr,  #
     b_buffer = ttgl.allocate_shared_memory(b_desc.dtype, shape=[NUM_BUFFERS] + b_desc.block_shape, layout=b_desc.layout)
     # allocate shared memory scales as well
     a_scale, b_scale = create_tensor_descriptors(a_scale_ptr, b_scale_ptr, pid_m * BLOCK_M * stride_ascale_m, pid_n * BLOCK_N * stride_bscale_n,
-                                               stride_ascale_m, stride_ascale_k, stride_bscale_n, stride_bscale_k, SHARED_LAYOUT_A_SCALE,
-                                               SHARED_LAYOUT_B_SCALE, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, TRANSPOSE_B)
+                                               stride_ascale_m, stride_ascale_k, stride_bscale_n, stride_bscale_k, SHARED_LAYOUT_A,
+                                               SHARED_LAYOUT_B, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, TRANSPOSE_B)
     a_scale_buffer = ttgl.allocate_shared_memory(a_scale.dtype, shape=[NUM_BUFFERS] + a_scale.block_shape, layout=a_scale.layout)
     b_scale_buffer = ttgl.allocate_shared_memory(b_scale.dtype, shape=[NUM_BUFFERS] + b_scale.block_shape, layout=b_scale.layout)
 
@@ -150,16 +143,17 @@ def gemm_tdm_pipelined_blockscale_kernel(a_ptr, b_ptr, c_ptr,  #
         cur_b_scale = b_scale_buffer.index(scale_slot).load(layout=ttgl.SliceLayout(0, WMMA_LAYOUT))
         accumulator += partial * cur_a_scale[:, None] * cur_b_scale[None, :]
 
+    # I assume this accumulates everything from the buffers
     for i in ttgl.static_range(NUM_BUFFERS - 1):
         consumer, partial = issue_wmma(consumer, a_buffer, OPERAND_LAYOUT_A, b_buffer, OPERAND_LAYOUT_B,
                                            wmma_zeros, (NUM_BUFFERS - 2 - i) * 2, NUM_BUFFERS, TRANSPOSE_B)
-        scale_slot = (consumer - 1) % NUM_BUFFERS
+        scale_slot = scale_consumer % NUM_BUFFERS
         # TODO if this is accumulating everything from the buffers do i need to scale this too
         cur_a_scale = a_scale_buffer.index(scale_slot).load(layout=ttgl.SliceLayout(1, WMMA_LAYOUT))
         cur_b_scale = b_scale_buffer.index(scale_slot).load(layout=ttgl.SliceLayout(0, WMMA_LAYOUT))
         accumulator += partial * cur_a_scale * cur_b_scale
 
-    
+    # Prep and store the totaled accumulator 
     offs_cm = pid_m * BLOCK_M + ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, WMMA_LAYOUT))
     offs_cn = pid_n * BLOCK_N + ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(0, WMMA_LAYOUT))
     offs_c = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
