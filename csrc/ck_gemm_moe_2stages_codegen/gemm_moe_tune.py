@@ -1802,6 +1802,11 @@ class FmoeTuner(TunerCommon):
             doweight_stage1,
         ) = info
 
+        # FlyDSL only supports per_Token quantization
+        if q_type not in (QuantType.per_Token, QuantType.per_Tensor):
+            print(f"FlyDSL does not support {q_type}, skipping FlyDSL tasks")
+            return []
+
         if q_dtype_a == dtypes.fp8:
             quantDtype = "Fp8"
         elif q_dtype_a == dtypes.i8:
