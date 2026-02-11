@@ -2165,17 +2165,19 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 p_lds_kv_next_warp, warp_idx, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
 
             // GEMM on NoPE
-            ckt::static_for<k_q_nope_begin, k_q_nope_end + 1, 2 * 2>{}([&](auto idx) {
+            constexpr uint32_t num_nope_iter = (k_q_nope_end + 1 - k_q_nope_begin) / 4;
+            ckt::static_for<0, num_nope_iter, 1>{}([&](auto idx) {
+                constexpr uint32_t reg_start = idx.value * 4 + k_q_nope_begin;
                 using q_range_0 =
-                    hkdart::split_many_t<hkdart::type_list<hkdart::range<idx.value, idx.value + 1>>,
+                    hkdart::split_many_t<hkdart::type_list<hkdart::range<reg_start, reg_start + 1>>,
                                          2>;
                 using q_range_1 = hkdart::
-                    split_many_t<hkdart::type_list<hkdart::range<idx.value + 2, idx.value + 3>>, 2>;
+                    split_many_t<hkdart::type_list<hkdart::range<reg_start + 2, reg_start + 3>>, 2>;
                 hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_0> q_0;
                 hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_1> q_1;
 
                 // Load K from LDS to GPR
-                constexpr int32_t tile_idx = (idx.value - k_q_nope_begin) / 2;
+                constexpr int32_t tile_idx = (reg_start - k_q_nope_begin) / 2;
                 kv_manager.template load_k_to_gpr<0, (tile_idx + 0) * T::kBlockK>(kv_0,
                                                                                   p_lds_kv_curr);
                 kv_manager.template load_k_to_gpr<16, (tile_idx + 0) * T::kBlockK>(kv_0,
@@ -2185,7 +2187,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 kv_manager.template load_k_to_gpr<16, (tile_idx + 1) * T::kBlockK>(kv_1,
                                                                                    p_lds_kv_curr);
                 asm volatile("s_waitcnt lgkmcnt(2)");
-                if constexpr(idx.value == k_q_nope_begin)
+                if constexpr(idx.value == 0)
                 {
                     hk::mma_ABt(p_comp, kv_0, q_0);
                     __builtin_amdgcn_s_setprio(5);
@@ -2202,17 +2204,19 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 p_lds_kv_next_warp, warp_idx, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
 
             // GEMM on RoPE
-            ckt::static_for<k_q_rope_begin, k_q_rope_end + 1, 2 * 2>{}([&](auto idx) {
+            constexpr uint32_t num_rope_iter = (k_q_rope_end + 1 - k_q_rope_begin) / 4;
+            ckt::static_for<0, num_rope_iter, 1>{}([&](auto idx) {
+                constexpr uint32_t reg_start = idx.value * 4 + k_q_rope_begin;
                 using q_range_0 =
-                    hkdart::split_many_t<hkdart::type_list<hkdart::range<idx.value, idx.value + 1>>,
+                    hkdart::split_many_t<hkdart::type_list<hkdart::range<reg_start, reg_start + 1>>,
                                          2>;
                 using q_range_1 = hkdart::
-                    split_many_t<hkdart::type_list<hkdart::range<idx.value + 2, idx.value + 3>>, 2>;
+                    split_many_t<hkdart::type_list<hkdart::range<reg_start + 2, reg_start + 3>>, 2>;
                 hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_0> q_0;
                 hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_1> q_1;
 
                 // Load K from LDS to GPR
-                constexpr int32_t tile_idx = (idx.value - k_q_rope_begin) / 2;
+                constexpr int32_t tile_idx = (reg_start - k_q_rope_begin) / 2;
                 kv_manager.template load_k_to_gpr<0, (tile_idx + 0 + 16) * T::kBlockK>(
                     kv_0, p_lds_kv_curr);
                 kv_manager.template load_k_to_gpr<16, (tile_idx + 0 + 16) * T::kBlockK>(
