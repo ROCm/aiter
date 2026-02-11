@@ -1592,7 +1592,7 @@ def ck_moe_stage1(
     token_num = hidden_states.shape[0]
     is_splitk = quant_type is aiter.QuantType.per_1x128 and splitk > 1
     tmp_out = (
-        torch.zeros(
+        torch.empty(
             (token_num, topk, w1.shape[1]), dtype=dtypes.fp32, device=out.device
         )
         if is_splitk
@@ -1657,7 +1657,7 @@ def cktile_moe_stage1(
 
     out = torch.empty((token_num, topk, D), dtype=dtype, device=hidden_states.device)
     tmp_out = (
-        torch.zeros(
+        torch.empty(
             (token_num, topk, w1.shape[1]), dtype=hidden_states.dtype, device=out.device
         )
         if split_k > 1
@@ -1720,7 +1720,7 @@ def flydsl_moe_stage1(
     inter_dim = w2.shape[2] * 2 if w1.dtype == dtypes.fp4x2 else w2.shape[2]
 
     tile_m = block_m if block_m is not None else 64
-    tile_n = 128 if not is_wfp4_pipeline else 256
+    tile_n = 128
     tile_k = 128 if not is_wfp4_pipeline else 256
 
     # import pdb;pdb.set_trace()
@@ -1731,7 +1731,7 @@ def flydsl_moe_stage1(
     blocks = sorted_eids.shape[0]
 
     if sorted_weights is None:
-        sorted_w = torch.zeros(sorted_ids.shape, dtype=dtypes.fp32, device=sorted_ids.device)
+        sorted_w = torch.empty(sorted_ids.shape, dtype=dtypes.fp32, device=sorted_ids.device)
         doweight_stage1 = False
     else:
         sorted_w = sorted_weights
@@ -1890,7 +1890,7 @@ def flydsl_moe_stage2(
     E = w2.shape[0]
 
     tile_m = block_m if block_m is not None else 64
-    tile_n = 256 
+    tile_n = 128
     tile_k = 128 if not is_wfp4_pipeline else 256
 
     sorted_ids = sorted_token_ids.contiguous()
@@ -1900,7 +1900,7 @@ def flydsl_moe_stage2(
     blocks = sorted_eids.shape[0]
 
     if sorted_weights is None:
-        sorted_w = torch.zeros(sorted_ids.shape, dtype=dtypes.fp32, device=sorted_ids.device)
+        sorted_w = torch.empty(sorted_ids.shape, dtype=dtypes.fp32, device=sorted_ids.device)
     else:
         sorted_w = sorted_weights
 
@@ -1939,7 +1939,7 @@ def flydsl_moe_stage2(
         enable_bias=True,
         doweight_stage2=bool(sorted_weights is not None),
         out_dtype=out_dtype,
-        mode=MoeGemm2Mode.REDUCE,
+        mode=MoeGemm2Mode.ATOMIC,
     )
 
     exe2(
