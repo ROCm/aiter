@@ -34,27 +34,24 @@ union WorkInfo
         int32_t kv_offset;
         int32_t q_head_range;
 
-        // #if PRINT_DBG
-        //         friend std::ostream& operator<<(std::ostream& os, const WorkInfo& work)
-        //         {
-        //             auto q_heads = unpack_dword(work.q_head_range);
-        //             os << std::setw(10) << work.batch_idx << "," << std::setw(10) <<
-        //             work.partial_o_loc << ","
-        //             << std::setw(10) << work.qo_start << "," << std::setw(10) << work.qo_end <<
-        //             ","
-        //             << std::setw(10) << work.kv_start << "," << std::setw(10) << work.kv_end <<
-        //             ","
-        //             << std::setw(10) << work.kv_offset << "," << std::setw(10) <<
-        //             work.q_head_range << "["
-        //             << std::get<0>(q_heads) << "," << std::get<1>(q_heads) << ")";
-        //             return os;
-        //         }
-        // #endif
+// #if PRINT_DBG
+//         friend std::ostream& operator<<(std::ostream& os, const WorkInfo& work)
+//         {
+//             auto q_heads = unpack_dword(work.q_head_range);
+//             os << std::setw(10) << work.batch_idx << "," << std::setw(10) << work.partial_o_loc << ","
+//             << std::setw(10) << work.qo_start << "," << std::setw(10) << work.qo_end << ","
+//             << std::setw(10) << work.kv_start << "," << std::setw(10) << work.kv_end << ","
+//             << std::setw(10) << work.kv_offset << "," << std::setw(10) << work.q_head_range << "["
+//             << std::get<0>(q_heads) << "," << std::get<1>(q_heads) << ")";
+//             return os;
+//         }
+// #endif
     };
     uint32_t u32All[8];
 };
 constexpr size_t kSizeWorkInfoInDw = sizeof(WorkInfo) / sizeof(uint32_t);
 static_assert(kSizeWorkInfoInDw == 8);
+
 
 union FinalLoc
 {
@@ -67,6 +64,7 @@ union FinalLoc
 };
 constexpr size_t kSizeFinalLocInDw = sizeof(FinalLoc) / sizeof(uint32_t);
 static_assert(kSizeFinalLocInDw == 2);
+
 
 struct QTile
 {
@@ -87,22 +85,24 @@ struct QTile
 #endif
 };
 
-void get_ps_metadata_v1(const torch::Tensor& seqlens_qo_indptr, // [batch size + 1]
-                        const torch::Tensor& pages_kv_indptr,   // [batch size + 1]
-                        const torch::Tensor& context_lens,      // [batch size]
-                        const int32_t gqa_ratio,
-                        const int32_t num_heads_k,
-                        torch::Tensor& work_metadata_ptrs,
-                        torch::Tensor& work_indptr,
-                        torch::Tensor& work_info,
-                        torch::Tensor& reduce_indptr,
-                        torch::Tensor& reduce_final_map,
-                        torch::Tensor& reduce_partial_map,
-                        const int32_t qhead_granularity,
-                        const int32_t qlen_granularity,
-                        const int32_t kvlen_granlarity,
-                        const int32_t block_size,
-                        const bool is_causal);
+
+void get_ps_metadata_v1(const torch::Tensor& seqlens_qo_indptr,     // [batch size + 1]
+                        const torch::Tensor& pages_kv_indptr,       // [batch size + 1]
+                        const torch::Tensor& context_lens,          // [batch size]
+                        const int32_t        gqa_ratio,
+                        const int32_t        num_heads_k,
+                        torch::Tensor&       work_metadata_ptrs,
+                        torch::Tensor&       work_indptr,
+                        torch::Tensor&       work_info,
+                        torch::Tensor&       reduce_indptr,
+                        torch::Tensor&       reduce_final_map,
+                        torch::Tensor&       reduce_partial_map,
+                        const int32_t        qhead_granularity,
+                        const int32_t        qlen_granularity,
+                        const int32_t        kvlen_granlarity,
+                        const int32_t        block_size,
+                        const bool           is_causal);
+
 
 // DEBUG
 template <typename T>
@@ -120,6 +120,7 @@ std::ostream& operator<<(std::ostream& os, const std::vector<T>& vec)
     // os.flags(old_flags);
     return os;
 }
+
 
 // void print_metadata(std::vector<int32_t>& work_indptr, std::vector<WorkInfo>& work_info)
 // {
@@ -154,6 +155,7 @@ std::ostream& operator<<(std::ostream& os, const std::vector<T>& vec)
 //     }
 //     std::cout << "]" << std::endl;
 // }
+
 
 // void print_reduce_info(std::vector<int32_t>& reduce_indptr,
 //                        std::vector<std::vector<int32_t>>& reduce_final_map,

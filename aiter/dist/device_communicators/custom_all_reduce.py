@@ -158,9 +158,7 @@ class CustomAllreduce:
         self.input_buffer = torch.empty(max_size, dtype=torch.uint8, device=self.device)
         # This is a pre-registered IPC buffer for output. In eager mode, kernel
         # writes results to this buffer, then it's copied to the actual output
-        self.output_buffer = torch.empty(
-            max_size, dtype=torch.uint8, device=self.device
-        )
+        self.output_buffer = torch.empty(max_size, dtype=torch.uint8, device=self.device)
         # This is a buffer for storing the tuples of pointers pointing to
         # IPC buffers from all ranks. Each registered tuple has size of
         # 8*world_size bytes where world_size is at most 8. Allocating 8MB
@@ -316,7 +314,7 @@ class CustomAllreduce:
                     use_new=use_new,
                     open_fp8_quant=open_fp8_quant,
                     registered_input=True,
-                    registered_output=True,
+                    registered_output=True
                 )
             else:
                 # if warm up, mimic the allocation pattern
@@ -332,7 +330,7 @@ class CustomAllreduce:
                 use_new=use_new,
                 open_fp8_quant=open_fp8_quant,
                 registered_input=False,
-                registered_output=False,
+                registered_output=False
             )
 
     def reduce_scatter(
@@ -451,25 +449,15 @@ class CustomAllreduce:
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
                 return self.fused_ar_rms(
-                    input,
-                    residual_inp,
-                    w=weight,
-                    eps=eps,
-                    registered=True,
-                    use_1stage=use_1stage,
+                    input, residual_inp, w=weight, eps=eps, registered=True, use_1stage=use_1stage,
                 )
             else:
                 return torch.zeros_like(input), torch.zeros_like(input)
         else:
             return self.fused_ar_rms(
-                input,
-                residual_inp,
-                w=weight,
-                eps=eps,
-                registered=False,
-                use_1stage=use_1stage,
+                input, residual_inp, w=weight, eps=eps, registered=False, use_1stage=use_1stage,
             )
-    
+
     def custom_fused_ar_rms_quant(
         self,
         input: torch.Tensor,

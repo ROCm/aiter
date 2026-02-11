@@ -67,9 +67,9 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
 void dispose(fptr_t _fa);
 int64_t meta_size();
 void register_input_buffer(fptr_t _fa,
-                           torch::Tensor& t,
-                           const std::vector<torch::Tensor>& handles,
-                           const std::vector<int64_t>& offsets);
+                     torch::Tensor& t,
+                     const std::vector<torch::Tensor>& handles,
+                     const std::vector<int64_t>& offsets);
 void register_output_buffer(fptr_t _fa,
                             torch::Tensor& t,
                             const std::vector<torch::Tensor>& handles,
