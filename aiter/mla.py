@@ -12,7 +12,7 @@ import triton.language as tl
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_cu_num
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 
 
 @triton.jit
@@ -324,8 +324,16 @@ def mla_decode_fwd(
             else None
         )
 
-        if nhead == 128:
-            # if False:
+        # For gfx942, HK kernel is better or equal to asm in almost all the cases.
+        # For gfx950, HK kernel is worse than asm if the problem size is very large.
+        use_hk = (
+            nhead == 128
+            and q.dtype == dtypes.fp8
+            and kv_buffer.dtype == dtypes.fp8
+            and get_gfx() == "gfx942"
+        )
+
+        if use_hk:
             aiter.hk_mla_decode_fwd(
                 q,
                 kv_buffer,
@@ -341,18 +349,6 @@ def mla_decode_fwd(
                 attn_lse,
                 o,
             )
-
-            aiter.mla_reduce_v1(
-                logits,
-                attn_lse,
-                reduce_indptr,
-                reduce_final_map,
-                reduce_partial_map,
-                max_seqlen_q,
-                o,
-                final_lse,
-            )
-
         else:
             aiter.mla_decode_stage1_asm_fwd(
                 q,
@@ -376,16 +372,16 @@ def mla_decode_fwd(
                 kv_scale,
             )
 
-            aiter.mla_reduce_v1(
-                logits,
-                attn_lse,
-                reduce_indptr,
-                reduce_final_map,
-                reduce_partial_map,
-                max_seqlen_q,
-                o,
-                final_lse,
-            )
+        aiter.mla_reduce_v1(
+            logits,
+            attn_lse,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            max_seqlen_q,
+            o,
+            final_lse,
+        )
 
     if io_transformed:
         if return_logits:
