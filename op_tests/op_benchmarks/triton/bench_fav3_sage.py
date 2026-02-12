@@ -1,5 +1,7 @@
 from __future__ import annotations
-from typing import Literal, Optional, Tuple, List, Dict, Any
+from typing import Literal, Optional, Tuple, List, Dict, Any, Union
+import csv
+import json
 import torch
 import os
 import glob
@@ -28,6 +30,7 @@ from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_wrapper_func,
+    get_sage_fwd_configs,
 )
 from op_tests.triton_tests.attention.test_fav3_sage import compare_accuracy
 
@@ -96,6 +99,123 @@ def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
 
     logger.info(f"Loaded {len(inputs)} captured inputs for benchmarking")
     return inputs
+
+
+def _mask_array_to_tensor(mask_arr: List, device: torch.device) -> Tuple[torch.Tensor, int, int, int]:
+    """Convert a mask array (2D or 3D list) to tensor and infer BATCH, num_q_blocks, num_kv_blocks."""
+    if not mask_arr:
+        raise ValueError("mask array is empty")
+    depth = _array_ndim(mask_arr)
+    if depth == 2:
+        # list of rows -> (num_q_blocks, num_kv_blocks), batch=1
+        t = torch.tensor(mask_arr, dtype=torch.bool, device=device)
+        nqb, nkb = t.shape
+        t = t.unsqueeze(0)  # (1, num_q_blocks, num_kv_blocks)
+        return t, 1, nqb, nkb
+    elif depth == 3:
+        t = torch.tensor(mask_arr, dtype=torch.bool, device=device)
+        b, nqb, nkb = t.shape
+        return t, b, nqb, nkb
+    else:
+        raise ValueError(f"mask must be 2D or 3D, got {depth}D")
+
+
+def _array_ndim(arr) -> int:
+    """Return nesting depth of list (2 for [[...]], 3 for [[[...]]])."""
+    if not isinstance(arr, list):
+        return 0
+    if not arr:
+        return 1
+    return 1 + _array_ndim(arr[0])
+
+
+def load_block_mask_from_json(
+    path: Optional[str],
+    device: torch.device,
+) -> Union[
+    None,
+    Tuple[torch.Tensor, int, int, int],
+    List[Tuple[torch.Tensor, int, int, int]],
+]:
+    """
+    Load block mask(s) from a JSON file.
+
+    Returns:
+        - None if path is None/empty or file has no mask data.
+        - If top-level key "masks" (list): list of (mask_tensor, BATCH, num_q_blocks, num_kv_blocks).
+        - If top-level key "mask" (single): one tuple (mask_tensor, BATCH, num_q_blocks, num_kv_blocks).
+    """
+    if not path or not path.strip():
+        return None
+    path = path.strip()
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Block mask file not found: {path}")
+    with open(path) as f:
+        data = json.load(f)
+    if not data:
+        return None
+    if "masks" in data:
+        out = []
+        for item in data["masks"]:
+            if "mask" not in item:
+                raise ValueError("Each element in 'masks' must have a 'mask' key")
+            mask_t, batch, nqb, nkb = _mask_array_to_tensor(item["mask"], device)
+            if "num_q_blocks" in item and item["num_q_blocks"] != nqb:
+                raise ValueError(f"num_q_blocks mismatch: inferred {nqb}, got {item['num_q_blocks']}")
+            if "num_kv_blocks" in item and item["num_kv_blocks"] != nkb:
+                raise ValueError(f"num_kv_blocks mismatch: inferred {nkb}, got {item['num_kv_blocks']}")
+            out.append((mask_t, batch, nqb, nkb))
+        return out
+    if "mask" in data:
+        mask_t, batch, nqb, nkb = _mask_array_to_tensor(data["mask"], device)
+        if "num_q_blocks" in data and data["num_q_blocks"] != nqb:
+            raise ValueError(f"num_q_blocks mismatch: inferred {nqb}, got {data['num_q_blocks']}")
+        if "num_kv_blocks" in data and data["num_kv_blocks"] != nkb:
+            raise ValueError(f"num_kv_blocks mismatch: inferred {nkb}, got {data['num_kv_blocks']}")
+        return (mask_t, batch, nqb, nkb)
+    return None
+
+
+def make_block_attn_mask(
+    args,
+    BATCH: int,
+    N_CTX_Q: int,
+    N_CTX_K: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """
+    Build block_attn_mask for single-shape benchmark flow.
+
+    Returns None if neither block_sparsity nor block_mask_file is set, or if file contains "masks" list (use list flow instead).
+    """
+    if not getattr(args, "block_sparsity", None) and not getattr(args, "block_mask_file", None):
+        return None
+    if getattr(args, "block_mask_file", None):
+        loaded = load_block_mask_from_json(args.block_mask_file, device)
+        if loaded is None:
+            return None
+        if isinstance(loaded, list):
+            # List-of-masks flow: this helper is not used; caller uses the list.
+            return None
+        mask_t, batch, nqb, nkb = loaded
+        config = get_sage_fwd_configs()
+        BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
+        expected_nqb = (N_CTX_Q + BLOCK_M - 1) // BLOCK_M
+        expected_nkb = (N_CTX_K + BLOCK_N - 1) // BLOCK_N
+        if batch != BATCH or nqb != expected_nqb or nkb != expected_nkb:
+            raise ValueError(
+                f"Block mask shape (batch={batch}, num_q_blocks={nqb}, num_kv_blocks={nkb}) "
+                f"does not match benchmark (BATCH={BATCH}, N_CTX_Q={N_CTX_Q} -> {expected_nqb} q blocks, N_CTX_K={N_CTX_K} -> {expected_nkb} kv blocks)"
+            )
+        if batch == 1 and BATCH > 1:
+            mask_t = mask_t.expand(BATCH, -1, -1).clone()
+        return mask_t
+    # Only block_sparsity set: random mask
+    config = get_sage_fwd_configs()
+    BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
+    num_q_blocks = (N_CTX_Q + BLOCK_M - 1) // BLOCK_M
+    num_kv_blocks = (N_CTX_K + BLOCK_N - 1) // BLOCK_N
+    return (torch.rand(BATCH, num_q_blocks, num_kv_blocks, device=device) > args.block_sparsity).to(torch.bool)
 
 
 def fp8_quantize(q, k, v, scale=None):
@@ -303,6 +423,7 @@ def fav3_sage_forward_func(
     causal: bool,
     inference_mode: bool,  # not return softmax_lse
     layout: Literal["bshd", "bhsd"],
+    block_attn_mask: Optional[torch.Tensor] = None,
 ):
     head_dim = q.shape[-1]
     softmax_scale = head_dim**-0.5
@@ -315,6 +436,7 @@ def fav3_sage_forward_func(
         causal=False,
         inference_mode=True,
         layout=layout,
+        block_attn_mask=block_attn_mask,
     )
 
 
@@ -374,6 +496,65 @@ def create_benchmark_configs(args):
             args=extra_args,
         )
     )
+    return configs
+
+
+def create_benchmark_configs_masks(
+    args,
+    masks_list: List[Tuple[torch.Tensor, int, int, int]],
+):
+    """Create Benchmark configs for list-of-masks flow: one x_val per mask index."""
+    dtype = arg_to_torch_dtype[args.dtype]
+    hk = args.hq if not args.hk else args.hk
+    head_size = 128 if not args.d else args.d
+    head_size_v = head_size if not args.dv else args.dv
+    layout = args.layout if args.layout else "bshd"
+    causal = False
+
+    x_names = ["MASK_IDX"]
+    x_vals_list = [(i,) for i in range(len(masks_list))]
+    extra_args = {
+        "masks": masks_list,
+        "D_HEAD": head_size,
+        "D_HEAD_V": head_size_v,
+        "dtype": dtype,
+        "layout": layout,
+        "causal": causal,
+        "args": args,
+        "HQ": args.hq,
+        "HK": hk,
+    }
+    line_vals = [
+        "time(ms)",
+        "throughput(TFLOPS)",
+        "bandwidth(GB/s)",
+        "arithmetic_intensity(FLOP/byte)",
+    ]
+    if args.compare_to_ref or (args.metric and args.metric != "all"):
+        if args.compare_to_ref:
+            line_vals = ["time(ms)"]
+        else:
+            metric_map = {
+                "time": "time(ms)",
+                "throughput": "throughput(TFLOPS)",
+                "bandwidth": "bandwidth(GB/s)",
+                "arithmetic_intensity": "arithmetic_intensity(FLOP/byte)",
+            }
+            line_vals = [metric_map[args.metric]]
+
+    configs = [
+        triton.testing.Benchmark(
+            x_names=x_names,
+            x_vals=x_vals_list,
+            line_arg="provider",
+            line_vals=line_vals,
+            line_names=line_vals,
+            styles=[("red", "-"), ("green", "-"), ("yellow", "-"), ("blue", "-")],
+            ylabel="",
+            plot_name=get_caller_name_no_ext() + "_masks",
+            args=extra_args,
+        )
+    ]
     return configs
 
 
@@ -439,7 +620,9 @@ def primary_output(result):
     return result
 
 
-def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype):
+def attn_forward_func(
+    q, k, v, func_name, softmax_scale, k_smooth, layout, dtype, block_attn_mask=None
+):
     if func_name == "fav3_sage":  # fav3 sage hybrid
         fn = fav3_sage_forward_func(
             q,
@@ -448,6 +631,7 @@ def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype
             causal=False,
             inference_mode=True,
             layout=layout,
+            block_attn_mask=block_attn_mask,
         )
     else:
         q, k, v = layout_preprocess(q, k, v, layout=layout, target_layout="bshd")
@@ -488,7 +672,9 @@ def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype
     return fn
 
 
-def bench_kernel(q, k, v, args, provider):
+def bench_kernel(
+    q, k, v, args, provider, block_attn_mask: Optional[torch.Tensor] = None
+):
     # Default softmax scale
     if args.layout == "bshd":
         BATCH, N_CTX_Q, HQ, D_HEAD = q.shape
@@ -500,11 +686,13 @@ def bench_kernel(q, k, v, args, provider):
     softmax_scale = 1.0 / (D_HEAD**0.5)
     k_smooth = args.k_smooth
 
-    # FLOPS calculation variables
+    # FLOPS calculation variables (same OPS definition as plan)
     total_flops = 0.0
     total_flops += 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
     bench_func_name = ""
-    if args.fav3_fp8:
+    if block_attn_mask is not None:
+        bench_func_name = "fav3_sage"
+    elif args.fav3_fp8:
         bench_func_name = "fav3_fp8"
     elif args.aiter_fp8:
         bench_func_name = "aiter_fp8"
@@ -522,8 +710,11 @@ def bench_kernel(q, k, v, args, provider):
         k_smooth=k_smooth,
         layout=args.layout,
         dtype=arg_to_torch_dtype[args.dtype],
+        block_attn_mask=block_attn_mask,
     )
-    ms = triton.testing.do_bench(fn)
+    rep = getattr(args, "rep", 100)
+    warmup = getattr(args, "warmup", 25)
+    ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
 
     if args.compare_to_ref:
         current_output = fn()
@@ -535,6 +726,7 @@ def bench_kernel(q, k, v, args, provider):
                 0, 2, 1, 3
             )  # we do comparison in BSHD
 
+        ref_block_mask = block_attn_mask if args.ref == "fav3_sage" else None
         reference_primary = primary_output(
             attn_forward_func(
                 q,
@@ -545,6 +737,7 @@ def bench_kernel(q, k, v, args, provider):
                 k_smooth=k_smooth,
                 layout=args.layout,
                 dtype=arg_to_torch_dtype[args.dtype],
+                block_attn_mask=ref_block_mask,
             )()
         )
 
@@ -616,7 +809,14 @@ def run_benchmark_captured(args):
         k = inp["k"].to(device)
         v = inp["v"].to(device)
 
-        return bench_kernel(q, k, v, args, provider)
+        if args.layout == "bshd":
+            BATCH, N_CTX_Q, _, _ = q.shape
+            _, N_CTX_K, _, _ = v.shape
+        else:
+            BATCH, _, N_CTX_Q, _ = q.shape
+            _, _, N_CTX_K, _ = v.shape
+        block_attn_mask = make_block_attn_mask(args, BATCH, N_CTX_Q, N_CTX_K, device)
+        return bench_kernel(q, k, v, args, provider, block_attn_mask=block_attn_mask)
 
     args.layout = "bhsd"  # captured inputs are in BHSD format
     logger.info(
@@ -665,9 +865,153 @@ def run_benchmark(args):
         # permute does not move data so this doesnt affect the performance
         q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
 
-        return bench_kernel(q, k, v, args, provider)
+        block_attn_mask = make_block_attn_mask(args, BATCH, N_CTX_Q, N_CTX_K, device)
+        return bench_kernel(q, k, v, args, provider, block_attn_mask=block_attn_mask)
 
     bench_mha.run(save_path="." if args.o else None, print_data=True)
+
+
+def run_benchmark_block_sparse_repetitions(args):
+    """
+    When --block_sparsity and --n_repetitions are set: run n_repetitions times with
+    a new random block mask each time, report throughput statistics (median, Q1, Q3, p10, p90).
+    """
+    torch.manual_seed(20)
+    device = "cuda"
+    dtype = arg_to_torch_dtype[args.dtype]
+    layout = args.layout
+    hk = args.hq if not args.hk else args.hk
+    BATCH, HQ, N_CTX_Q, N_CTX_K = args.b, args.hq, args.sq, args.sk
+    if not args.sk:
+        N_CTX_K = args.sq
+    D_HEAD = 128 if not args.d else args.d
+    D_HEAD_V = D_HEAD if not args.dv else args.dv
+
+    q = torch.randn((BATCH, HQ, N_CTX_Q, D_HEAD), device=device, dtype=dtype)
+    k = torch.randn((BATCH, hk, N_CTX_K, D_HEAD), device=device, dtype=dtype)
+    v = torch.randn((BATCH, hk, N_CTX_K, D_HEAD_V), device=device, dtype=dtype)
+    q.requires_grad = False
+    k.requires_grad = False
+    v.requires_grad = False
+    q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
+
+    total_flops = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
+    config = get_sage_fwd_configs()
+    BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
+    num_q_blocks = (N_CTX_Q + BLOCK_M - 1) // BLOCK_M
+    num_kv_blocks = (N_CTX_K + BLOCK_N - 1) // BLOCK_N
+
+    n_rep = args.n_repetitions
+    throughputs_tflops = []
+    for _ in range(n_rep):
+        block_attn_mask = (
+            torch.rand(BATCH, num_q_blocks, num_kv_blocks, device=device) > args.block_sparsity
+        ).to(torch.bool)
+        ms = bench_kernel(q, k, v, args, "time(ms)", block_attn_mask=block_attn_mask)
+        ops_per_sec = total_flops / (ms * 1e-3)
+        tflops = ops_per_sec / 1e12
+        throughputs_tflops.append(tflops)
+
+    t = torch.tensor(throughputs_tflops)
+    median_tflops = torch.quantile(t, 0.5).item()
+    q1_tflops = torch.quantile(t, 0.25).item()
+    q3_tflops = torch.quantile(t, 0.75).item()
+    p10_tflops = torch.quantile(t, 0.1).item()
+    p90_tflops = torch.quantile(t, 0.9).item()
+
+    summary = (
+        f"block_sparsity={args.block_sparsity}, n_repetitions={n_rep}: "
+        f"median_TFLOPS={median_tflops:.4f}, Q1={q1_tflops:.4f}, Q3={q3_tflops:.4f}, "
+        f"p10={p10_tflops:.4f}, p90={p90_tflops:.4f}"
+    )
+    logger.info(summary)
+    print(summary)
+
+    if args.o:
+        csv_path = "bench_fav3_sage_block_sparse_repetitions.csv"
+        file_exists = os.path.isfile(csv_path)
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            row = [
+                BATCH,
+                HQ,
+                N_CTX_Q,
+                N_CTX_K,
+                D_HEAD,
+                D_HEAD_V,
+                args.block_sparsity,
+                n_rep,
+                median_tflops,
+                q1_tflops,
+                q3_tflops,
+                p10_tflops,
+                p90_tflops,
+            ]
+            if not file_exists:
+                writer.writerow(
+                    [
+                        "BATCH",
+                        "HQ",
+                        "N_CTX_Q",
+                        "N_CTX_K",
+                        "D_HEAD",
+                        "D_HEAD_V",
+                        "block_sparsity",
+                        "n_repetitions",
+                        "median_TFLOPS",
+                        "q1_TFLOPS",
+                        "q3_TFLOPS",
+                        "p10_TFLOPS",
+                        "p90_TFLOPS",
+                    ]
+                )
+            writer.writerow(row)
+        logger.info(f"Wrote CSV row to {csv_path}")
+
+
+def run_benchmark_masks_list(
+    args,
+    masks_list: List[Tuple[torch.Tensor, int, int, int]],
+):
+    """Run benchmark for each mask in the list; each mask defines (BATCH, N_CTX_Q, N_CTX_K) from its shape."""
+    torch.manual_seed(20)
+    device = "cuda"
+    config = get_sage_fwd_configs()
+    BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
+
+    @triton.testing.perf_report(create_benchmark_configs_masks(args, masks_list))
+    def bench_mha_masks(
+        MASK_IDX,
+        masks,
+        D_HEAD,
+        D_HEAD_V,
+        dtype,
+        layout,
+        causal,
+        args,
+        HQ,
+        HK,
+        provider,
+        device="cuda",
+    ):
+        assert not causal
+        mask_tensor, BATCH, num_q_blocks, num_kv_blocks = masks[MASK_IDX]
+        N_CTX_Q = num_q_blocks * BLOCK_M
+        N_CTX_K = num_kv_blocks * BLOCK_N
+
+        q = torch.randn((BATCH, HQ, N_CTX_Q, D_HEAD), device=device, dtype=dtype)
+        k = torch.randn((BATCH, HK, N_CTX_K, D_HEAD), device=device, dtype=dtype)
+        v = torch.randn((BATCH, HK, N_CTX_K, D_HEAD_V), device=device, dtype=dtype)
+        q.requires_grad = False
+        k.requires_grad = False
+        v.requires_grad = False
+        q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
+
+        return bench_kernel(
+            q, k, v, args, provider, block_attn_mask=mask_tensor
+        )
+
+    bench_mha_masks.run(save_path="." if args.o else None, print_data=True)
 
 
 def supported_layouts():
@@ -778,6 +1122,37 @@ def parse_args():
         default="./captured_inputs",
         help="Directory containing captured input .pt files",
     )
+    # Block-wise sparsity
+    parser.add_argument(
+        "--block_sparsity",
+        type=float,
+        default=None,
+        help="Fraction of (q_block, kv_block) pairs disallowed (0=dense, 0.5=50%% masked). Uses random mask.",
+    )
+    parser.add_argument(
+        "--block_mask_file",
+        type=str,
+        default=None,
+        help="Path to JSON file with user-defined block mask. Takes precedence over --block_sparsity.",
+    )
+    parser.add_argument(
+        "--n_repetitions",
+        type=int,
+        default=None,
+        help="When --block_sparsity is set: run this many times with new random mask each time; report throughput stats. Ignored with --block_mask_file.",
+    )
+    parser.add_argument(
+        "--rep",
+        type=int,
+        default=100,
+        help="Repetition time in ms for triton.testing.do_bench.",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=25,
+        help="Warmup time in ms for triton.testing.do_bench.",
+    )
     return parser.parse_args()
 
 
@@ -801,6 +1176,38 @@ def main():
 
     if not args.dv:
         args.dv = args.d
+
+    # Block-sparse: restrict to fav3_sage and validate
+    block_sparse = args.block_sparsity is not None or getattr(
+        args, "block_mask_file", None
+    )
+    if block_sparse:
+        args.fav3_sage = True
+        args.fav3_fp8 = args.aiter_fp8 = args.aiter_bf16 = False
+        if args.block_sparsity is not None:
+            if not (0 <= args.block_sparsity <= 1):
+                raise ValueError(
+                    f"--block_sparsity must be in [0, 1], got {args.block_sparsity}"
+                )
+        if getattr(args, "block_mask_file", None):
+            if not os.path.isfile(args.block_mask_file.strip()):
+                raise FileNotFoundError(
+                    f"Block mask file not found: {args.block_mask_file}"
+                )
+            loaded_masks = load_block_mask_from_json(
+                args.block_mask_file, torch.device("cuda")
+            )
+            if loaded_masks is None:
+                raise ValueError(
+                    "block_mask_file is empty or has no 'mask' / 'masks' key"
+                )
+            if isinstance(loaded_masks, list):
+                assert args.hq and args.d, (
+                    "For --block_mask_file with list of masks provide -hq and -d"
+                )
+                run_benchmark_masks_list(args, loaded_masks)
+                return 0
+
     assert (
         args.b and args.hq and args.sq and args.d and args.dv
     ), "If not running on captured (--load_captured) please provide \
@@ -810,6 +1217,15 @@ def main():
     assert (
         args.dtype in arg_to_torch_dtype
     ), "Only fp16, bf16 and f32 types currently supported."
+
+    # Block-sparsity with n_repetitions: throughput stats path
+    if (
+        args.block_sparsity is not None
+        and getattr(args, "n_repetitions", None) is not None
+        and not getattr(args, "block_mask_file", None)
+    ):
+        run_benchmark_block_sparse_repetitions(args)
+        return 0
 
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
