@@ -426,6 +426,18 @@ namespace py = pybind11;
           py::arg("eps"),                                                                      \
           py::arg("reg_buffer") = std::nullopt,                                                \
           py::arg("use_1stage") = false);                                                      \
+    m.def("fused_allreduce_rmsnorm_quant",                                                     \
+          &aiter::fused_allreduce_rmsnorm_quant,                                               \
+          py::arg("_fa"),                                                                      \
+          py::arg("inp"),                                                                      \
+          py::arg("res_inp"),                                                                  \
+          py::arg("res_out"),                                                                  \
+          py::arg("out"),                                                                      \
+          py::arg("scale_out"),                                                                \
+          py::arg("w"),                                                                        \
+          py::arg("eps"),                                                                      \
+          py::arg("reg_buffer") = std::nullopt,                                                \
+          py::arg("use_1stage") = false);                                                      \
     m.def("all_reduce_asm_", &all_reduce_asm, "");                                             \
     m.def("all_reduce_rmsnorm_", &all_reduce_rmsnorm, "all_reduce_rmsnorm");                   \
     m.def("all_reduce_rmsnorm_quant_", &all_reduce_rmsnorm_quant, "all_reduce_rmsnorm_quant"); \
