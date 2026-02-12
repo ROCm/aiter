@@ -271,23 +271,6 @@ def test_fmoe(
     return {"us": us2, "err": err}
 
 
-l_dtype = ["bf16", "fp16"][:1]
-# l_dim = [(6144, 4096)]
-l_dim = [(7168, 256)]
-# l_dim = [(3072, 3072)]
-l_tokenNum = [
-    1,
-    3,
-    5,
-    16,
-    32,
-    64,
-    128,
-    256,
-    1024,
-    4096,
-    163840,
-]
 l_quant = [
     (aiter.QuantType.No, None, None),  # a16w16
     (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
@@ -298,11 +281,6 @@ l_quant = [
     (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
     (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2),  # a8w4
 ]
-l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
-l_doweight_stage1 = [False, True][:1]
-# l_hidden_intermediate_pad = [(0, 0), (65, 65), (129, 191)][1:2]
-l_hidden_intermediate_pad = [(0, 0), (192, 128), (129, 191)][1:2]
-l_preshuffle = [False, True]
 
 
 parser = argparse.ArgumentParser(
@@ -312,11 +290,11 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp16"]],
+    nargs="*",
+    default=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp16"]],
+    metavar="{bf16, fp16}",
     help="""Data type.
     e.g.: -d bf16""",
 )
@@ -324,9 +302,8 @@ parser.add_argument(
 parser.add_argument(
     "-dim",
     type=dtypes.str2tuple,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    default=[(7168, 256)],
     help="""Model dimension.
     e.g.: -dim 6144,4096""",
 )
@@ -335,9 +312,20 @@ parser.add_argument(
     "-t",
     "--tokenNum",
     type=int,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    default=[
+        1,
+        3,
+        5,
+        16,
+        32,
+        64,
+        128,
+        256,
+        1024,
+        4096,
+        163840,
+    ],
     help="""Number of tokens.
     e.g.: -t 1024""",
 )
@@ -361,20 +349,20 @@ parser.add_argument(
 parser.add_argument(
     "-a",
     "--act",
-    type=str,
-    choices=["silu", "gelu"],
-    default=None,
-    help="""Select activation type.
-    e.g.: -a silu""",
+    type=dtypes.str2ActivationType,
+    nargs="*",
+    default=[aiter.ActivationType.Silu, aiter.ActivationType.Gelu],
+    help="""Select activation type. Default: [Silu, Gelu].
+    e.g.: -a silu         # [Silu]
+          -a silu gelu    # [Silu, Gelu]""",
 )
 
 parser.add_argument(
     "-s",
     "--doweight_stage1",
     type=dtypes.str2bool,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    default=[False, True],
     help="""Whether to do weight in stage 1. Default is [False, True].
     -s f    # False.
     -s t    # True.""",
@@ -402,36 +390,26 @@ parser.add_argument(
     "-p",
     "--preshuffle",
     type=dtypes.str2bool,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    default=[False, True],
     help="""Whether to use pre-shuffle weight mode. Default is [False, True].
     -p f    # False.
     -p t    # True.""",
 )
+parser.add_argument(
+    "-hip",
+    "--hidden_intermediate_pad",
+    type=dtypes.str2tuple,
+    nargs="*",
+    default=[(0, 0), (192, 128), (129, 191)],
+    help="""Hidden intermediate pad.
+    e.g.: -hip 0,0""",
+)
 
 args = parser.parse_args()
-if args.dtype is None:
-    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-else:
-    l_dtype = [dtypes.d_dtypes[args.dtype]]
-
-if args.dim is not None:
-    l_dim = [args.dim]
-
-if args.tokenNum is not None:
-    l_tokenNum = [args.tokenNum]
 
 l_quant = [l_quant[args.quant]] if args.quant is not None else l_quant
 
-if args.act is not None:
-    l_act = [getattr(aiter.ActivationType, args.act.capitalize())]
-
-if args.doweight_stage1 is not None:
-    l_doweight_stage1 = [args.doweight_stage1]
-
-if args.preshuffle is not None:
-    l_preshuffle = [args.preshuffle]
 
 df = []
 for (
@@ -439,14 +417,14 @@ for (
     (quant_type, aq_dtype, wq_dtype),
     (model_dim, inter_dim),
     doweight_stage1,
-) in itertools.product(l_dtype, l_quant, l_dim, l_doweight_stage1):
+) in itertools.product(args.dtype, l_quant, args.dim, args.doweight_stage1):
     if (quant_type, aq_dtype, wq_dtype) == (
         aiter.QuantType.per_1x32,
         dtypes.bf16,
         dtypes.fp4x2,
     ):
-        for hidden_pad, intermediate_pad in l_hidden_intermediate_pad:
-            for m in l_tokenNum:
+        for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
+            for m in args.tokenNum:
                 ret = test_fmoe(
                     dtype,
                     m,
@@ -469,8 +447,8 @@ for (
         dtypes.fp8,
         dtypes.fp4x2,
     ):
-        for hidden_pad, intermediate_pad in l_hidden_intermediate_pad:
-            for m in l_tokenNum:
+        for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
+            for m in args.tokenNum:
                 ret = test_fmoe(
                     dtype,
                     m,
@@ -493,9 +471,9 @@ for (
         dtypes.fp4x2,
         dtypes.fp4x2,
     ):
-        for preshuffle in l_preshuffle:
-            for act_type in l_act:
-                for m in l_tokenNum:
+        for preshuffle in args.preshuffle:
+            for act_type in args.act:
+                for m in args.tokenNum:
                     ret = test_fmoe(
                         dtype,
                         m,
@@ -515,8 +493,8 @@ for (
                     )
                     df.append(ret)
     else:
-        for act_type in l_act:
-            for m in l_tokenNum:
+        for act_type in args.act:
+            for m in args.tokenNum:
                 ret = test_fmoe(
                     dtype,
                     m,
