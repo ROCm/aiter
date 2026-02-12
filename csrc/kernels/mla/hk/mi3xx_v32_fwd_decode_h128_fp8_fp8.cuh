@@ -16,49 +16,6 @@ namespace hkdart = hk::ducks::art;
 namespace hkm    = hk::macros;
 namespace ckt    = ck_tile;
 
-// ================================================================
-// Temp Helper functions
-// ================================================================
-union FUI
-{
-    uint32_t ui;
-    float f32;
-    hk::fp8e4m3_4 fp8_4;
-    struct
-    {
-        ckt::fp8_t x;
-        ckt::fp8_t y;
-        ckt::fp8_t z;
-        ckt::fp8_t w;
-    };
-};
-__device__ float4 convert_fp8x4_to_float4(FUI in)
-{
-    static constexpr __hip_fp8_interpretation_t interpret =
-#if defined(__gfx950__)
-        __HIP_E4M3;
-#else
-        __HIP_E4M3_FNUZ;
-#endif
-    float4 r;
-    r.x = static_cast<float>(__half(__hip_cvt_fp8_to_halfraw(in.x, interpret)));
-    r.y = static_cast<float>(__half(__hip_cvt_fp8_to_halfraw(in.y, interpret)));
-    r.z = static_cast<float>(__half(__hip_cvt_fp8_to_halfraw(in.z, interpret)));
-    r.w = static_cast<float>(__half(__hip_cvt_fp8_to_halfraw(in.w, interpret)));
-    return r;
-}
-
-template <int GPR, int GPR_START>
-__device__ constexpr int reg_2_col_q()
-{
-    constexpr int off = GPR - GPR_START;
-    return (off % 2) * 4 + (off / 2) * 32 + (ckt::get_lane_id() / 16) * 8;
-}
-
-// ================================================================
-// Main part
-// ================================================================
-
 typedef uint32_t v2ui __attribute__((ext_vector_type(2)));
 typedef uint32_t v4ui __attribute__((ext_vector_type(4)));
 typedef uint32_t v8ui __attribute__((ext_vector_type(8)));
