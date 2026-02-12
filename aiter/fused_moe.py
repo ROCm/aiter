@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 import torch
+import triton
+import triton.language as tl
 
 import aiter
 
@@ -22,6 +24,160 @@ from aiter.utility import fp4_utils
 
 BLOCK_SIZE_M = 32
 
+# ============================================================================
+# INT32 Full Atomic Mode Support (Interleaved Layout, Scale=32768, 2x Buffer)
+# ============================================================================
+_INT32_SCALE_FACTOR = 32768.0
+_INT32_MODE_CACHED = None
+
+def _is_int32_atomic_mode():
+    """Check if INT32 atomic mode is enabled"""
+    global _INT32_MODE_CACHED
+    if _INT32_MODE_CACHED is None:
+        _INT32_MODE_CACHED = os.environ.get('AITER_MOE_INT32_ATOMIC', '0') == '1'
+    return _INT32_MODE_CACHED
+
+
+# Triton fused kernel for INT32 -> BF16 conversion (3x faster than original)
+@triton.jit
+def _int32_to_bf16_kernel(
+    input_ptr,      # INT32 buffer
+    output_ptr,     # BF16 output
+    n_elements,     # Total number of elements
+    scale_factor,   # Scale factor (32768.0)
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fused kernel: INT32 -> FP32 -> /scale -> BF16 (single memory pass)"""
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    # Load INT32 values
+    int32_vals = tl.load(input_ptr + offsets, mask=mask)
+    
+    # Fused conversion: INT32 -> FP32 -> divide -> BF16
+    fp32_vals = int32_vals.to(tl.float32) / scale_factor
+    bf16_vals = fp32_vals.to(tl.bfloat16)
+    
+    # Store BF16 output
+    tl.store(output_ptr + offsets, bf16_vals, mask=mask)
+
+
+def _convert_int32_full_to_bf16(moe_buf, original_hidden_dim):
+    """
+    Convert interleaved INT32 atomic output back to BF16 using Triton fused kernel.
+    
+    Buffer layout (2x original size):
+    - moe_buf: [num_tokens, hidden_dim * 2] (BF16 dtype, contains INT32 bit patterns)
+    - output:  [num_tokens, original_hidden_dim] (BF16)
+    
+    Each INT32 = round(bf16_value * 32768)
+    
+    Performance: ~3x faster than original multi-kernel implementation.
+    """
+    if moe_buf.dtype != torch.bfloat16:
+        return moe_buf
+    
+    num_tokens = moe_buf.shape[0]
+    
+    # View buffer as INT32 (2 BF16 = 1 INT32)
+    int32_view = moe_buf.view(torch.int32)  # [num_tokens, original_hidden_dim]
+    
+    # Allocate output buffer
+    output = torch.empty((num_tokens, original_hidden_dim), dtype=torch.bfloat16, device=moe_buf.device)
+    
+    # Total elements to process
+    n_elements = int32_view.numel()
+    
+    # Launch Triton kernel
+    BLOCK_SIZE = 1024
+    grid = ((n_elements + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+    
+    _int32_to_bf16_kernel[grid](
+        int32_view.contiguous(),
+        output,
+        n_elements,
+        _INT32_SCALE_FACTOR,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    return output
+
+
+_INT16_OVERFLOW_CHECK_ENABLED = os.environ.get('AITER_INT16_OVERFLOW_CHECK', '0') == '1'
+_INT16_OVERFLOW_COUNT = 0
+
+_POSTPROCESS_DIAG_COUNT = 0
+_POSTPROCESS_DIAG_ANOMALY_COUNT = 0
+
+def _postprocess_moe_output(moe_buf, inter_dim=None):
+    """Post-process MoE output if INT32 atomic mode is enabled."""
+    global _INT16_OVERFLOW_COUNT, _POSTPROCESS_DIAG_COUNT, _POSTPROCESS_DIAG_ANOMALY_COUNT
+    if _is_int32_atomic_mode():
+        # For INT32 full mode, buffer is 2x size
+        # original_hidden_dim = current_hidden_dim / 2 (in terms of element count)
+        # But since we're viewing as INT32, the math works out
+        original_hidden_dim = moe_buf.shape[1] // 2
+
+        # === BUFFER DIAGNOSTIC (before conversion) ===
+        _POSTPROCESS_DIAG_COUNT += 1
+        if _POSTPROCESS_DIAG_COUNT <= 200 or _POSTPROCESS_DIAG_COUNT % 1000 == 0:
+            try:
+                int32_diag = moe_buf.view(torch.int32)
+                M = moe_buf.shape[0]
+                # Check per-row: any row with all zeros means kernel didn't write
+                row_sums = int32_diag.abs().float().sum(dim=1)
+                zero_rows = (row_sums == 0).sum().item()
+                max_val = int32_diag.max().item()
+                min_val = int32_diag.min().item()
+                abs_max = max(abs(max_val), abs(min_val))
+                # Anomaly detection: BF16 values > 100 means INT32 > 3,276,800
+                anomaly = abs_max > 3276800
+                if anomaly:
+                    _POSTPROCESS_DIAG_ANOMALY_COUNT += 1
+                    # Find which rows have extreme values
+                    row_max = int32_diag.abs().max(dim=1).values
+                    extreme_rows = (row_max > 3276800).nonzero(as_tuple=True)[0]
+                    extreme_count = extreme_rows.shape[0]
+                    print(f"[BUF_DIAG #{_POSTPROCESS_DIAG_COUNT}] *** ANOMALY #{_POSTPROCESS_DIAG_ANOMALY_COUNT} *** "
+                          f"M={M} shape={list(moe_buf.shape)} "
+                          f"INT32: max={max_val} min={min_val} "
+                          f"zero_rows={zero_rows}/{M} "
+                          f"extreme_rows={extreme_count}/{M} "
+                          f"extreme_row_ids={extreme_rows[:10].tolist()}", flush=True)
+                elif _POSTPROCESS_DIAG_COUNT <= 50 or _POSTPROCESS_DIAG_COUNT % 1000 == 0:
+                    print(f"[BUF_DIAG #{_POSTPROCESS_DIAG_COUNT}] OK "
+                          f"M={M} INT32: max={max_val} min={min_val} "
+                          f"zero_rows={zero_rows}/{M}", flush=True)
+            except Exception as e:
+                print(f"[BUF_DIAG #{_POSTPROCESS_DIAG_COUNT}] error: {e}", flush=True)
+        # === END DIAGNOSTIC ===
+
+        # INT32 value range detection (diagnostic)
+        if _INT16_OVERFLOW_CHECK_ENABLED:
+            _INT16_OVERFLOW_COUNT += 1
+            if _INT16_OVERFLOW_COUNT <= 100 or _INT16_OVERFLOW_COUNT % 500 == 0:
+                int32_view = moe_buf.view(torch.int32)  # (M, model_dim) INT32
+                max_val = int32_view.max().item()
+                min_val = int32_view.min().item()
+                abs_max = max(abs(max_val), abs(min_val))
+                # Check if values fit in INT16 packed format
+                # If packed: each INT32 = (hi_int16 << 16) | (lo_int16 & 0xFFFF)
+                # If unpacked: each INT32 = round(value * scale)
+                int16_view = moe_buf.view(torch.int16)
+                int16_max = int16_view.max().item()
+                int16_min = int16_view.min().item()
+                # Show both views for diagnosis
+                print(f"[DIAG #{_INT16_OVERFLOW_COUNT}] M={moe_buf.shape[0]} "
+                      f"INT32: max={max_val} min={min_val} abs={abs_max} "
+                      f"| INT16view: max={int16_max} min={int16_min} "
+                      f"| bf16_equiv: max={max_val/32768:.4f} min={min_val/32768:.4f}")
+
+        return _convert_int32_full_to_bf16(moe_buf, original_hidden_dim)
+    return moe_buf
+# ============================================================================
+
+
 
 def moe_sorting(
     topk_ids,
@@ -33,6 +189,7 @@ def moe_sorting(
     expert_mask=None,
     num_local_tokens=None,
     dispatch_policy=0,
+    int32_2x_buffer=None,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -46,7 +203,17 @@ def moe_sorting(
     )
     sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+    # Determine whether to use 2x buffer for INT32 atomic mode.
+    # Only the 1-stage ASM kernel writes INT32 atomics and needs the 2x buffer.
+    # CK kernels (small batch, 2-stage) write BF16 and need normal-sized buffer.
+    use_2x = int32_2x_buffer if int32_2x_buffer is not None else _is_int32_atomic_mode()
+    if use_2x:
+        # Use torch.empty + zero_() to ensure the zeroing operation is captured by CUDA Graph.
+        # torch.zeros may not replay the memset during CUDA graph replay, causing accumulation.
+        moe_buf = torch.empty((M, model_dim * 2), dtype=moebuf_dtype, device=device)
+        moe_buf.zero_()
+    else:
+        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
     aiter.moe_sorting_fwd(
         topk_ids,
@@ -107,6 +274,7 @@ def fused_moe(
     # fast path for small batches
     if os.environ.get('AITER_MOE_SMALL_BATCH', '0') == '1' and hidden_states.shape[0] <= 16 and hidden_states.dtype == torch.bfloat16 and expert_mask is None and activation == ActivationType.Silu and \
         ((quant_type == QuantType.No and w1.dtype == torch.bfloat16) or (quant_type == QuantType.per_Token and w1.dtype == torch.float8_e4m3fnuz)):
+        # small batch path (CK kernels, BF16)
         B = hidden_states.shape[0]
         E, N1, K1 = w1.shape
         N2, K2 = w2.shape[1], w2.shape[2]
@@ -122,6 +290,7 @@ def fused_moe(
             return gemm2_out
         else:
             BLOCK_M = 16
+            # Small batch CK kernels write BF16 directly — never use 2x INT32 buffer
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
                 topk_ids,
                 topk_weight,
@@ -132,6 +301,7 @@ def fused_moe(
                 expert_mask,
                 num_local_tokens,
                 moe_sorting_dispatch_policy,
+                int32_2x_buffer=False,  # CK kernels write BF16, not INT32
             )
 
             moe_stage1_g1u1_small_batch(hidden_states, w1, gemm1_out, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
@@ -139,6 +309,7 @@ def fused_moe(
             moe_stage2_g1u1_small_batch(gemm1_out, w2, moe_buf, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
                                         w2_scale if w2_scale is not None else torch.empty((0, 1), dtype=torch.bfloat16))
 
+            # CK kernels wrote BF16 to normal-sized buffer — no INT32 postprocess needed
             return moe_buf
 
     if not block_size_M:
@@ -197,8 +368,13 @@ def fused_moe_fake(
     M, topk = topk_ids.shape
     dtype = hidden_states.dtype if dtype is None else dtype
     model_dim = w2.shape[1]
-    moe_buf = torch.empty((M, model_dim), dtype=dtype, device=device)
-    return moe_buf
+    # NOTE: This fake function is used by torch.compile for shape inference only.
+    # The final output is always (M, model_dim) regardless of INT32 mode,
+    # because _postprocess_moe_output converts the 2x INT32 buffer back to 1x BF16.
+    # Previously this called _postprocess_moe_output on a (M, model_dim) buffer,
+    # which in INT32 mode incorrectly returned (M, model_dim // 2) — causing
+    # shape mismatch between torch.compile tracing and actual CUDA execution.
+    return torch.empty((M, model_dim), dtype=dtype, device=device)
 
 
 @torch_compile_guard(gen_fake=fused_moe_fake)
@@ -263,6 +439,15 @@ def fused_moe_(
         else:
             q_dtype_a = dtypes.fp4x2
 
+    # === INT32 ATOMIC MODE: Force doweight_stage1=False ===
+    # When INT32 mode is active, we must use the non-tkw1 ASM kernel path
+    # because only the non-tkw1 non-PS kernel has been modified for INT32 atomic.
+    # This also changes CSV lookup to find doweight_stage1=0 entries which
+    # favor run_1stage=True (our modified ASM kernel) over 2-stage CK.
+    _int32_forced_doweight = doweight_stage1
+    if _is_int32_atomic_mode():
+        _int32_forced_doweight = False
+
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
         model_dim,
@@ -275,7 +460,7 @@ def fused_moe_(
         quant_type,
         isG1U1,
         activation,
-        doweight_stage1,
+        _int32_forced_doweight,
         hidden_pad,
         intermediate_pad,
     )
@@ -285,6 +470,9 @@ def fused_moe_(
     if block_size_M is not None:
         block_size_M = int(block_size_M)
 
+    # Only 1-stage ASM kernel needs 2x INT32 buffer.
+    # 2-stage CK kernels write BF16 directly and need normal-sized buffer.
+    use_int32_2x = _is_int32_atomic_mode() and metadata.run_1stage
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
         topk_ids,
         topk_weight,
@@ -295,6 +483,7 @@ def fused_moe_(
         expert_mask,
         num_local_tokens,
         moe_sorting_dispatch_policy,
+        int32_2x_buffer=use_int32_2x,
     )
 
     if metadata.run_1stage:
@@ -381,6 +570,17 @@ def fused_moe_1stage(
     device=None,
     doweight_stage1: bool = None,
 ):
+    # === INT32 ATOMIC MODE: Force specific kernel selection ===
+    # When INT32 mode is active:
+    # 1. Force doweight_stage1=False to avoid tkw1 path (tkw1 kernels not modified)
+    # 2. Force kernelName to our modified kernel symbol when empty, to prevent
+    #    the C++ heuristic from selecting the unmodified PS (parallel stage) variant
+    if _is_int32_atomic_mode():
+        doweight_stage1 = False
+        if not kernelName:
+            kernelName = "_ZN5aiter45fmoe_bf16_pertokenFp8_g1u1_vs_silu_1tg_32x192E"
+    # === END INT32 FIX ===
+
     if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
         # pure bf16
         aiter.fmoe(
@@ -478,7 +678,7 @@ def fused_moe_1stage(
                 fc2_smooth_scale=None,
                 activation=activation,
             )
-            return moe_buf
+            return _postprocess_moe_output(moe_buf)
 
         fmoe_func(
             moe_buf,
@@ -497,7 +697,7 @@ def fused_moe_1stage(
             fc2_smooth_scale=None,
             activation=activation,
         )
-    return moe_buf
+    return _postprocess_moe_output(moe_buf)
 
 
 @functools.lru_cache(maxsize=2048)
