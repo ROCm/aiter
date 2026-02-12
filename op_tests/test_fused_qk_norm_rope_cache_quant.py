@@ -201,13 +201,42 @@ def test_qk_norm_rope_cache_quant(
     head_size,
     is_neox_style,
     eps,
-    k_cache,
-    v_cache,
-    slot_mapping,
     kv_cache_dtype,
-    k_scale,
-    v_scale,
+    num_blocks,
+    page_size,
 ):
+    # Construct tensors inside the function
+    if kv_cache_dtype == "fp8_e4m3":
+        cache_dtype = get_dtype_fp8()
+    else:
+        cache_dtype = dtype
+
+    k_cache = torch.randn(
+        [num_blocks, page_size, num_heads_k, head_size],
+        dtype=dtype,
+        device="cuda",
+    ).to(cache_dtype)
+    v_cache = torch.randn(
+        [num_blocks, page_size, num_heads_v, head_size],
+        dtype=dtype,
+        device="cuda",
+    ).to(cache_dtype)
+
+    x = 16 // k_cache.element_size()
+    k_cache = (
+        k_cache.view([num_blocks, page_size, num_heads_k, head_size // x, x])
+        .permute(0, 2, 3, 1, 4)
+        .contiguous()
+    )
+    v_cache = v_cache.permute(0, 2, 3, 1).contiguous()
+
+    slot_mapping = torch.randperm(num_tokens, dtype=torch.int64, device="cuda")
+    k_scale = torch.zeros(
+        [num_blocks, num_heads_k, page_size], dtype=torch.float32, device="cuda"
+    )
+    v_scale = torch.zeros(
+        [num_blocks, num_heads_v, page_size], dtype=torch.float32, device="cuda"
+    )
     qkv = torch.randn(
         (num_tokens, (num_heads_q + num_heads_k + num_heads_v) * head_size),
         dtype=dtype,
@@ -662,12 +691,9 @@ if __name__ == "__main__":
                             head_size,
                             is_neox_style,
                             1e-6,
-                            k_cache,
-                            v_cache,
-                            slot_mapping,
                             kv_cache_dtype,
-                            k_scale,
-                            v_scale,
+                            args.num_blocks,
+                            args.page_size,
                         )
                         df.append(ret)
     df = pd.DataFrame(df)
