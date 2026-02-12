@@ -4,7 +4,7 @@ import triton
 import torch
 from aiter.ops.triton.utils.device_info import get_num_sms
 import math
-from aiter.ops.triton._triton_kernels.attention.unified_attention_gluon import (
+from aiter.ops.triton.gluon.unified_attention_3d_kernel import (
     gluon_kernel_unified_attention_3d,
     gluon_kernel_unified_attention_3d_pipelined,
     gluon_kernel_unified_attention_3d_tdm_pipelined,
