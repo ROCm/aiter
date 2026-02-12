@@ -449,7 +449,6 @@ void moe_stage1_g1u1(
     printf("[DEV_BUF] dev_Qzero: w1_lqq_zero = %lu bytes\n", w1_lqq_zero.has_value() ? w1_lqq_zero.value().numel() * w1_lqq_zero.value().element_size() : 0);
     printf("argsize: %zu\n", arg_size);
     printf("gdx:%d, gdy:%d, gdz:%d, tgs:%d\n", gdx, gdy, gdz, sub_X_cnt * gdx * gdz);
-    return;
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,

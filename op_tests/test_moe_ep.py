@@ -842,6 +842,7 @@ def test_fmoe_lqq(
         topk_ids = total_topk_ids[:token]
         topk_weights = total_topk_weights[:token]
 
+        _, topk = topk_ids.shape
     else:
         topk_weights, topk_ids = fused_topk(input, score, topk, True)
 
@@ -880,6 +881,26 @@ def test_fmoe_lqq(
 
     # input quant for kernel
     a1_qt, a1_scale = aiter.pertoken_quant(input, quant_dtype=AQDType)
+    a1_qt_mult = a1_qt.repeat(topk, 1, 1)
+    a1_qt_mult = a1_qt_mult.reshape(token, -1)
+    """
+    sm1_scale = a1_scale
+    a1_scale = None
+    a1_scale = torch.empty((token, topk, 1), device="cuda", dtype=dtypes.fp32)
+    a1 = torch.empty(
+        (token, topk, model_dim),
+        dtype=dtypes.i8,
+        device="cuda",
+    )
+    hidden_states = a1_qt.view(1, token, model_dim).expand(topk, -1, -1)
+    # aiter.moe_smoothquant_fwd(
+    #     a1, hidden_states, sm1_scale, topk_ids, a1_scale
+    # )
+    aiter.smooth_per_token_scaled_quant(
+        a1, hidden_states, a1_scale, sm1_scale, topk_ids
+    )
+    a1 = a1.view(-1, model_dim)
+    """
 
     # lqq init for kernel
     w1_lqq_scale, w1_lqq_zero = moe_init_lqq(
@@ -943,7 +964,7 @@ def test_fmoe_lqq(
 
     out2_asm, us2 = run_perftest(
         fused_moe,
-        a1_qt,
+        a1_qt_mult,
         w1_lqq_pack,
         w2_qt,
         topk_weights,
