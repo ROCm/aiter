@@ -192,7 +192,7 @@ jobs:
         id: set_shard_files
         run: |
           echo "AITER_TEST=$(cat aiter_shard_${{ matrix.shard_idx }}.list)" >> $GITHUB_ENV
-          echo "${{ env.AITER_TEST }}"
+          echo "$AITER_TEST"
 
       - name: Run the container
         run: |
@@ -217,6 +217,7 @@ jobs:
           --network=host \
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
+          -e AITER_TEST="${AITER_TEST}" \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name aiter_test \
