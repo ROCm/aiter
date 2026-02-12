@@ -881,8 +881,6 @@ def test_fmoe_lqq(
 
     # input quant for kernel
     a1_qt, a1_scale = aiter.pertoken_quant(input, quant_dtype=AQDType)
-    a1_qt_mult = a1_qt.repeat(topk, 1, 1)
-    a1_qt_mult = a1_qt_mult.reshape(token, -1)
     """
     sm1_scale = a1_scale
     a1_scale = None
@@ -944,7 +942,12 @@ def test_fmoe_lqq(
     w1_scale = moe_init_float(eprt, GU_dqn_size // eprt // GU_dqn_k, GU_dqn_k, 1)
     save_buffer_to_file(w1_scale, "./feifei/w1_scale", format="text")
 
-    """
+    w2 = (
+        torch.randn(
+            (local_E + shared_E, model_dim, inter_dim), dtype=dtype, device="cuda"
+        )
+        / 10
+    )
     out1_ref = torch_moe_stage1(
         a1_qt,
         w1_qt,
@@ -958,13 +961,10 @@ def test_fmoe_lqq(
         w1_scale=w1_scale,
         doweight=False,
     )
-    print("[FEIFEI] out1_ref = ", out1_ref.shape)
-    print("[FEIFEI] out1_ref = ", out1_ref.type())
-    """
 
-    out2_asm, us2 = run_perftest(
+    out1_asm, us1 = run_perftest(
         fused_moe,
-        a1_qt_mult,
+        a1_qt,
         w1_lqq_pack,
         w2_qt,
         topk_weights,
@@ -982,6 +982,9 @@ def test_fmoe_lqq(
         num_iters=2,
         num_warmup=1,
     )
+    print("[test] out1_ref = ", out1_ref.shape, out1_ref.dtype)
+    print("[test] out1_asm = ", out1_asm.shape, out1_asm.dtype)
+    checkAllclose(out1_ref, out1_asm, rtol=0.01, atol=10, msg="asm check")
 
 
 parser = argparse.ArgumentParser(

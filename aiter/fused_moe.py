@@ -1016,6 +1016,8 @@ def fused_moe_2stages(
             dtype=dtype,
             device=device,
         )
+        a1 = hidden_states.repeat(topk, 1, 1)
+        a1_scale = a1_scale.repeat(topk, 1, 1)
     else:
         a2 = torch.empty(
             (token_num, topk, inter_dim),
@@ -1052,6 +1054,7 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if doweight_stage1 else None,
         **extra_stage1_args,
     )
+    return a2  # feifei test
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
@@ -1118,7 +1121,6 @@ def fused_moe_2stages(
         )
         a2 = a2.view(token_num, topk, inter_dim)
 
-    return a2  # feifei test
     metadata.stage2(
         a2,
         w1,
