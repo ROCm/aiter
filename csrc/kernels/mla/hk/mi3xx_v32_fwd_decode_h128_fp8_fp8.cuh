@@ -1836,6 +1836,23 @@ softmax_scale_p(const uint32_t col_0_start_idx, const uint32_t kv_end, const flo
     }
 }
 
+template <uint32_t DST_GPR, uint32_t SRC_GPR, bool FRONT_PART>
+__device__ __forceinline__ void pack_4f32_to_fp8()
+{
+    if constexpr(FRONT_PART)
+    {
+        asm volatile("v_cvt_pk_fp8_f32 v[%0], v[%1], v[%2]"
+                     :
+                     : "n"(DST_GPR), "n"(SRC_GPR), "n"(SRC_GPR + 1));
+    }
+    else
+    {
+        asm volatile("v_cvt_pk_fp8_f32 v[%0], v[%1], v[%2] op_sel:[0, 0, 1]"
+                     :
+                     : "n"(DST_GPR), "n"(SRC_GPR), "n"(SRC_GPR + 1));
+    }
+}
+
 template <bool kIsFirstIter, bool kCheckBoundary, uint32_t k_p_comp_begin, typename comp_t = float>
 __device__ __forceinline__ void softmax_p0(comp_t* p_row_max,
                                            comp_t* p_rescale,
@@ -2303,24 +2320,15 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 __builtin_amdgcn_s_setprio(0);
             }
 
-            // Convert p from comp_t to kv_t
-            ckt::static_for<k_p_comp_begin, k_p_comp_end + 1, 4>{}([&](auto idx) {
-                constexpr uint32_t dst_idx = k_p_mfma_begin + (idx.value - k_p_comp_begin) / 4;
-                constexpr uint32_t src_idx = idx.value;
-                asm volatile("v_cvt_pk_fp8_f32 v[%0], v[%1], v[%2]\n\t"
-                             "v_cvt_pk_fp8_f32 v[%0], v[%3], v[%4] op_sel:[0, 0, 1]"
-                             :
-                             : "n"(dst_idx),
-                               "n"(src_idx),
-                               "n"(src_idx + 1),
-                               "n"(src_idx + 2),
-                               "n"(src_idx + 3));
-            });
-
             // Wait for transpose V to complete
             asm volatile("s_waitcnt lgkmcnt(0)");
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
+
+            pack_4f32_to_fp8<k_p_mfma_begin, k_p_comp_begin, true>();
+            pack_4f32_to_fp8<k_p_mfma_begin, k_p_comp_begin + 2, false>();
+            pack_4f32_to_fp8<k_p_mfma_begin + 1, k_p_comp_begin + 4, true>();
+            pack_4f32_to_fp8<k_p_mfma_begin + 1, k_p_comp_begin + 6, false>();
 
             // GEMM on PV
             constexpr uint32_t num_pv_iter = T::kVoHeadDim / (T::kBlockK * 2); // 512/(32*2)=8
