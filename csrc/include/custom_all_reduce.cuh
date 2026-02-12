@@ -1,7 +1,7 @@
 #pragma once
 /*
  * Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
- * Copyright (C) 2024-2025, The vLLM team.
+ * Copyright (C) 2024-2026, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -580,12 +580,12 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_write_mode(
         for(int i = 0; i < ngpus; i++)
         {
             output_ptrs[i] = (P*)_output_dp->ptrs[i];
-        }  
+        }
     }
     const P* input_ptr = (const P*)_input_dp->ptrs[rank];
     auto tmp_out = tmps[rank];
     int stage3_offset = size;
- 
+
     // stage1: write local rank data to remote rank
     int start        = warp_id * part;
     int end          = warp_id == ngpus - 1 ? size : start + part;
@@ -594,7 +594,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_write_mode(
         tmps[warp_id][rank * part + idx - start] = input_ptr[idx];
     }
     end_sync<ngpus>(sg, self_sg, rank);
- 
+
     // stage 2: reduce scatter & write result to remote rank
     end = rank != ngpus - 1 ? part : size - part * (ngpus-1);
     for(int idx = tid; idx < end; idx += stride)
@@ -1834,7 +1834,7 @@ class CustomAllreduce
                 (hipIpcMemHandle_t *)&handles[i * handle_sz], base_ptr));
             offsets[i] = ((char *)ptr) - ((char *)base_ptr);
         }
-      
+
         // Process output buffers
         for (int i = 0; i < num_output_buffers; i++)
         {
@@ -1852,7 +1852,7 @@ class CustomAllreduce
                 (hipIpcMemHandle_t *)&handles[(num_input_buffers + i) * handle_sz], base_ptr));
             offsets[num_input_buffers + i] = ((char *)ptr) - ((char *)base_ptr);
         }
-      
+
       return std::make_pair(handles, offsets);
     }
 
@@ -1990,7 +1990,7 @@ class CustomAllreduce
       auto total_buffers = num_input_buffers + num_output_buffers;
       check_rank_data_capacity(total_buffers);
       std::vector<RankData> rank_data(total_buffers);
-      
+
       // Register input buffers
       for (int i = 0; i < num_input_buffers; i++)
       {
@@ -2032,7 +2032,7 @@ class CustomAllreduce
         }
         output_buffers_[self_ptr] = d_rank_data_base_ + num_input_buffers + i;
       }
-      
+
       HIP_CALL(hipMemcpy(d_rank_data_base_, rank_data.data(),
                            sizeof(RankData) * total_buffers,
                            hipMemcpyHostToDevice));
@@ -2181,7 +2181,7 @@ class CustomAllreduce
         }
         else if(call_2stage)
         {
-            blocks = std::min(kMaxBlocks,   
+            blocks = std::min(kMaxBlocks,
                               (size / world_size_ + (threads / world_size_) - 1) /
                                   (threads / world_size_));
             if (world_size_ == 8 && bytes > 512 * 4096 * 2 && arch.find("gfx942") != std::string::npos) {

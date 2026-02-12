@@ -1,6 +1,6 @@
 """
 * Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
-* Copyright (C) 2024-2025, The vLLM team.
+* Copyright (C) 2024-2026, The vLLM team.
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -245,7 +245,7 @@ class CustomAllreduce:
     def register_input_buffer(self, inp: torch.Tensor):
         handles, offsets = self._get_ipc_meta(inp)
         ops.register_input_buffer(self._ptr, inp, handles, offsets)
-    
+
     def register_output_buffer(self, out: torch.Tensor):
         handles, offsets = self._get_ipc_meta(out)
         ops.register_output_buffer(self._ptr, out, handles, offsets)
@@ -457,7 +457,7 @@ class CustomAllreduce:
             return self.fused_ar_rms(
                 input, residual_inp, w=weight, eps=eps, registered=False, use_1stage=use_1stage,
             )
-    
+
     def custom_fused_ar_rms_quant(
         self,
         input: torch.Tensor,
