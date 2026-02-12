@@ -15,6 +15,10 @@ op_tests/opus/
 │   ├── test_mfma.h              # C API header for MFMA
 │   ├── test_vector_add.cu       # Vector addition kernel using OPUS gmem
 │   ├── test_vector_add.h        # C API header for vector_add
+│   ├── test_async_load.cu       # Async global->LDS->global copy kernel
+│   ├── test_async_load.h        # C API header for async_load
+│   ├── test_dtype_convert.cu    # FP32<->BF16/FP16/FP8 round-trip kernels
+│   ├── test_dtype_convert.h     # C API header for dtype_convert
 │   ├── opus_device_test_ext.cpp # Pybind module: binds all device kernels
 │   ├── setup.py                 # Builds the opus_device_test extension
 │   └── test_opus_device.py      # Python test: runs all device kernel tests
@@ -122,6 +126,8 @@ Add `test_my_kernel.cu` to the `sources` list in `device/setup.py`:
 sources=[
     os.path.join(_THIS_DIR, "test_mfma.cu"),
     os.path.join(_THIS_DIR, "test_vector_add.cu"),
+    os.path.join(_THIS_DIR, "test_async_load.cu"),
+    os.path.join(_THIS_DIR, "test_dtype_convert.cu"),
     os.path.join(_THIS_DIR, "test_my_kernel.cu"),      # <-- add this
     os.path.join(_THIS_DIR, "opus_device_test_ext.cpp"),
 ],
@@ -151,6 +157,17 @@ def main():
 ```
 
 All tests (including the new one) will build and run inside the Docker container.
+
+## Device test summary
+
+| Test | OPUS APIs exercised | Arch |
+|---|---|---|
+| `test_mfma` | `make_mfma`, `mfma_adaptor_swap_ab`, `make_tiled_mma`, `partition_layout_a/b/c`, `make_gmem` | gfx942 only |
+| `test_vector_add` | `make_gmem`, vectorized `load<VECTOR_SIZE>` / `store<VECTOR_SIZE>` | all |
+| `test_async_load` | `make_gmem`, `gmem::async_load`, `s_waitcnt_vmcnt` | all |
+| `test_dtype_convert` (fp32<->bf16) | `fp32_to_bf16` (truncation mode), `bf16_to_fp32` | all |
+| `test_dtype_convert` (fp32<->fp16) | `fp32_to_fp16`, `fp16_to_fp32` | all |
+| `test_dtype_convert` (fp32<->fp8) | `cast<fp8_t>(fp32x4_t)`, `cast<fp32_t>(fp8x4_t)` (packed x4) | all |
 
 ## Notes
 

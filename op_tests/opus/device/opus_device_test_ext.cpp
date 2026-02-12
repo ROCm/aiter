@@ -8,11 +8,17 @@
  * Exposes:
  *   opus_device_test.run_mfma_32x32x8_f16(A, B, C)
  *   opus_device_test.run_vector_add(A, B, Result)
+ *   opus_device_test.run_async_load(Src, Dst)
+ *   opus_device_test.run_dtype_convert_fp32_bf16(In, Out)
+ *   opus_device_test.run_dtype_convert_fp32_fp16(In, Out)
+ *   opus_device_test.run_dtype_convert_fp32_fp8(In, Out)
  */
 
 #include <torch/extension.h>
 #include "test_mfma.h"
 #include "test_vector_add.h"
+#include "test_async_load.h"
+#include "test_dtype_convert.h"
 
 // ---------- MFMA wrapper ----------
 
@@ -69,6 +75,59 @@ static void run_vector_add_torch(
     run_vector_add(A.data_ptr(), B.data_ptr(), Result.data_ptr(), n);
 }
 
+// ---------- Async-load wrapper ----------
+
+static void run_async_load_torch(
+    torch::Tensor Src,
+    torch::Tensor Dst)
+{
+    TORCH_CHECK(Src.is_cuda(), "Src must be a CUDA tensor");
+    TORCH_CHECK(Dst.is_cuda(), "Dst must be a CUDA tensor");
+    TORCH_CHECK(Src.dtype() == torch::kFloat32, "Src must be float32");
+    TORCH_CHECK(Dst.dtype() == torch::kFloat32, "Dst must be float32");
+    TORCH_CHECK(Src.is_contiguous() && Dst.is_contiguous(),
+                "Src, Dst must be contiguous");
+    TORCH_CHECK(Src.dim() == 1 && Dst.dim() == 1,
+                "Src, Dst must be 1-D");
+    int n = static_cast<int>(Src.numel());
+    TORCH_CHECK(Dst.numel() == n,
+                "Src and Dst must have the same number of elements");
+
+    run_async_load(Src.data_ptr(), Dst.data_ptr(), n);
+}
+
+// ---------- Dtype-convert wrappers ----------
+
+static void run_dtype_convert_torch(
+    torch::Tensor In,
+    torch::Tensor Out,
+    const std::string& variant)
+{
+    TORCH_CHECK(In.is_cuda(), "In must be a CUDA tensor");
+    TORCH_CHECK(Out.is_cuda(), "Out must be a CUDA tensor");
+    TORCH_CHECK(In.dtype() == torch::kFloat32, "In must be float32");
+    TORCH_CHECK(Out.dtype() == torch::kFloat32, "Out must be float32");
+    TORCH_CHECK(In.is_contiguous() && Out.is_contiguous(),
+                "In, Out must be contiguous");
+    TORCH_CHECK(In.dim() == 1 && Out.dim() == 1,
+                "In, Out must be 1-D");
+    int n = static_cast<int>(In.numel());
+    TORCH_CHECK(Out.numel() == n,
+                "In and Out must have the same number of elements");
+
+    if (variant == "fp32_bf16") {
+        run_dtype_convert_fp32_bf16(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_fp16") {
+        run_dtype_convert_fp32_fp16(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_fp8") {
+        TORCH_CHECK(n % 4 == 0,
+                     "For fp32_fp8, n must be a multiple of 4 (packed x4 conversion)");
+        run_dtype_convert_fp32_fp8(In.data_ptr(), Out.data_ptr(), n);
+    } else {
+        TORCH_CHECK(false, "Unknown dtype_convert variant: ", variant);
+    }
+}
+
 // ---------- Module ----------
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -76,4 +135,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "OPUS 32x32x8 fp16 MFMA (block_v2, swap_ab): C = A @ B^T");
     m.def("run_vector_add", &run_vector_add_torch,
           "OPUS vector addition with gmem load/store: Result = A + B");
+    m.def("run_async_load", &run_async_load_torch,
+          "OPUS async_load: copy Src -> Dst through LDS (global->LDS->global)");
+    m.def("run_dtype_convert", &run_dtype_convert_torch,
+          "OPUS dtype round-trip: In(fp32) -> lowp -> Out(fp32). "
+          "variant: 'fp32_bf16', 'fp32_fp16', or 'fp32_fp8'");
 }
