@@ -112,9 +112,12 @@ def _sage_fwd_no_mask(
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
 
         # scale and subtract max
-        q_shifted = tl.where(
-            m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
-        )
+        if bias_base_ptrs is not None:
+            q_shifted = tl.where(
+                m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
+            )
+        else:
+            q_shifted = qk - m_ij[:, None]
 
         # Compute scaled QK and softmax probabilities
         if USE_EXP2:
@@ -174,7 +177,10 @@ def _sage_fwd_no_mask(
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
         # store the diff in maxes to adjust acc and li as we discover new maxes
-        m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
+        if bias_base_ptrs is not None:
+            m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
+        else:
+            m_diff = m_i - m_ij
         if USE_EXP2:
             # alpha = tl.math.exp2(m_diff * RCP_LN2)
             alpha = tl.math.exp2(m_diff)
