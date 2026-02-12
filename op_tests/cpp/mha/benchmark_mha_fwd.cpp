@@ -135,20 +135,11 @@ auto get_elimit<FmhaFwdBf16>(std::string /*init_method*/)
 }
 
 template <>
-auto get_elimit<FmhaFwdFp8>(std::string init_method)
+auto get_elimit<FmhaFwdFp8Bf16>(std::string /*init_method*/)
 {
-    if(init_method == "ui" || init_method == "ni")
-    {
-        unsigned max_rounding_point_distance = 0;
-        double atol                          = 2e-3;
-        return ck_tile::make_tuple(max_rounding_point_distance, atol);
-    }
-    else
-    {
-        unsigned max_rounding_point_distance = 1;
-        double atol                          = 0.0625;
-        return ck_tile::make_tuple(max_rounding_point_distance, atol);
-    }
+    double rtol = 1e-2;
+    double atol = 1.8e-1;
+    return ck_tile::make_tuple(rtol, atol);
 }
 
 int num_splits_heuristic(int batch_nhead_mblocks, int num_SMs, int num_n_blocks, int max_splits)
@@ -735,10 +726,10 @@ bool run(const ck_tile::ArgParser& arg_parser)
     if(qscale.type == quant_scale_enum::pertensor)
     {
         // Use fixed qkv_max = 3.f for per-tensor quantization
-        float qkv_max     = 3.f;
-        q_descale_host(0) = qkv_max / q_dtype_max;
-        k_descale_host(0) = qkv_max / k_dtype_max;
-        v_descale_host(0) = qkv_max / v_dtype_max;
+        float qkv_max           = 3.f;
+        q_descale_host(0, 0, 0) = qkv_max / q_dtype_max;
+        k_descale_host(0, 0, 0) = qkv_max / k_dtype_max;
+        v_descale_host(0, 0, 0) = qkv_max / v_dtype_max;
     }
     else if(qscale.type == quant_scale_enum::blockscale)
     {
@@ -1231,9 +1222,9 @@ bool run(const ck_tile::ArgParser& arg_parser)
 
     if(qscale.type == quant_scale_enum::pertensor)
     {
-        scale_s_host = scale_s * q_descale_host(0) * k_descale_host(0);
+        scale_s_host = scale_s * q_descale_host(0, 0, 0) * k_descale_host(0, 0, 0);
         scale_p_host = ck_tile::type_convert<float>(ck_tile::numeric<PDataType>::max());
-        scale_o_host = v_descale_host(0) / scale_p_host;
+        scale_o_host = v_descale_host(0, 0, 0) / scale_p_host;
     }
 
     auto p_compute_element_func = [&]() {
@@ -1571,9 +1562,9 @@ int main(int argc, char* argv[])
     {
         return run<FmhaFwdBf16>(arg_parser) ? 0 : -2;
     }
-    else if(data_type == "fp8")
+    else if(data_type == "fp8bf16")
     {
-        return run<FmhaFwdFp8>(arg_parser) ? 0 : -2;
+        return run<FmhaFwdFp8Bf16>(arg_parser) ? 0 : -2;
     }
 
     return -3;
