@@ -63,7 +63,8 @@ def _sage_fwd_no_mask_mxfp4(
     Q_DTYPE_STR: tl.constexpr,
     K_DTYPE_STR: tl.constexpr,
     ACCUMULATOR_TYPE: tl.constexpr,
-    USE_Q_SMOOTHING: tl.constexpr
+    USE_Q_SMOOTHING: tl.constexpr,
+    USE_BIAS: tl.constexpr
 ):
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
@@ -126,7 +127,7 @@ def _sage_fwd_no_mask_mxfp4(
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
 
         # compute bias
-        if bias_base_ptrs is not None:
+        if USE_BIAS:
             bias_ptrs = bias_base_ptrs + start_n * stride_bn
             bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
             qk += bias
@@ -135,7 +136,7 @@ def _sage_fwd_no_mask_mxfp4(
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
 
         # scale and subtract max
-        if bias_base_ptrs is not None:
+        if USE_BIAS:
             q_shifted = tl.where(
                 m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
             )
@@ -200,7 +201,7 @@ def _sage_fwd_no_mask_mxfp4(
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
         # store the diff in maxes to adjust acc and li as we discover new maxes
-        if bias_base_ptrs is not None:
+        if USE_BIAS:
             m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
         else:
             m_diff = m_i - m_ij
@@ -281,7 +282,8 @@ def _sage_fwd_mask_mxfp4(
     Q_DTYPE_STR: tl.constexpr,
     K_DTYPE_STR: tl.constexpr,
     ACCUMULATOR_TYPE: tl.constexpr,
-    USE_Q_SMOOTHING: tl.constexpr
+    USE_Q_SMOOTHING: tl.constexpr,
+    USE_BIAS: tl.constexpr
 ):
     # seqlen diff
     seqlen_delta_qk = seqlen_k - seqlen_q
@@ -454,7 +456,7 @@ def _sage_fwd_mask_mxfp4(
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
 
         # compute bias
-        if bias_base_ptrs is not None:
+        if USE_BIAS:
             bias_ptrs = bias_base_ptrs + start_n * stride_bn
             bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
             qk += bias
@@ -671,12 +673,12 @@ def sage_fwd_mxfp4(
     Q_DTYPE_STR: tl.constexpr,
     K_DTYPE_STR: tl.constexpr,
     RETURN_LSE: tl.constexpr,
-    HQ: tl.constexpr,
-    HK: tl.constexpr,
+    HQ,
+    HK,
     ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
     ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
-    MAX_SEQLENS_Q: tl.constexpr,
-    MAX_SEQLENS_K: tl.constexpr,
+    MAX_SEQLENS_Q,
+    MAX_SEQLENS_K,
     IS_VARLEN: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     USE_SLIDING_WINDOW: tl.constexpr,
@@ -711,7 +713,7 @@ def sage_fwd_mxfp4(
     off_h_q = tl.program_id(1)
     off_z = tl.program_id(2)
     # If MQA / GQA, set the K and V head offsets appropriately.
-    GROUP_SIZE: tl.constexpr = HQ // HK
+    GROUP_SIZE = HQ // HK
     if GROUP_SIZE != 1:
         off_h_k = off_h_q // GROUP_SIZE
     else:
@@ -984,7 +986,8 @@ def sage_fwd_mxfp4(
             Q_DTYPE_STR=Q_DTYPE_STR,
             K_DTYPE_STR=K_DTYPE_STR,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
-            USE_Q_SMOOTHING=USE_Q_SMOOTHING
+            USE_Q_SMOOTHING=USE_Q_SMOOTHING,
+            USE_BIAS=USE_BIAS
         )
 
     # ========== Process FULL K Blocks (Fast Path) ==========
@@ -1042,7 +1045,8 @@ def sage_fwd_mxfp4(
             Q_DTYPE_STR=Q_DTYPE_STR,
             K_DTYPE_STR=K_DTYPE_STR,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
-            USE_Q_SMOOTHING=USE_Q_SMOOTHING
+            USE_Q_SMOOTHING=USE_Q_SMOOTHING,
+            USE_BIAS=USE_BIAS
         )
 
     # ========== Process MASKED K Blocks in the back ==========
@@ -1111,7 +1115,8 @@ def sage_fwd_mxfp4(
             Q_DTYPE_STR=Q_DTYPE_STR,
             K_DTYPE_STR=K_DTYPE_STR,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
-            USE_Q_SMOOTHING=USE_Q_SMOOTHING
+            USE_Q_SMOOTHING=USE_Q_SMOOTHING,
+            USE_BIAS=USE_BIAS
         )
 
     # ============================================================
