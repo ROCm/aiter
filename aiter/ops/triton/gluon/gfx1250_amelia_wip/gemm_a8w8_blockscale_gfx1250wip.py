@@ -104,12 +104,12 @@ def gemm_tdm_pipelined_blockscale_kernel(a_ptr, b_ptr, c_ptr,  #
     a_buffer = ttgl.allocate_shared_memory(a_desc.dtype, shape=[NUM_BUFFERS] + a_desc.block_shape, layout=a_desc.layout)
     b_buffer = ttgl.allocate_shared_memory(b_desc.dtype, shape=[NUM_BUFFERS] + b_desc.block_shape, layout=b_desc.layout)
     # allocate shared memory scales as well
-    a_scale = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base=a_scale_ptr + pid_m * BLOCK_M * stride_ascale_m, shape=[M],
-                                                         strides=[stride_ascale_m], block_shape=[BLOCK_M],
+    a_scale = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base=a_scale_ptr + pid_m * BLOCK_M * stride_ascale_m, shape=(M,1),
+                                                         strides=(stride_ascale_m, stride_ascale_k), block_shape=(BLOCK_M, 1),
                                                          layout=SHARED_LAYOUT_A_SCALE)
-    b_scale = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base=b_scale_ptr + pid_n * BLOCK_N * stride_bscale_n, shape=[N],
-                                                             strides=[stride_bscale_n],
-                                                             block_shape=[BLOCK_N], layout=SHARED_LAYOUT_B_SCALE)
+    b_scale = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base=b_scale_ptr + pid_n * BLOCK_N * stride_bscale_n, shape=(N,1),
+                                                             strides=(stride_bscale_n, stride_bscale_k),
+                                                             block_shape=(BLOCK_N,1), layout=SHARED_LAYOUT_B_SCALE)
     a_scale_buffer = ttgl.allocate_shared_memory(a_scale.dtype, shape=[NUM_BUFFERS] + a_scale.block_shape, layout=a_scale.layout)
     b_scale_buffer = ttgl.allocate_shared_memory(b_scale.dtype, shape=[NUM_BUFFERS] + b_scale.block_shape, layout=b_scale.layout)
 

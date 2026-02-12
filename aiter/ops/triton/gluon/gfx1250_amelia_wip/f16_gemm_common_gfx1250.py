@@ -80,6 +80,21 @@ def create_shared_layouts(BLOCK_M: ttgl.constexpr, BLOCK_N: ttgl.constexpr, BLOC
 
     return (SHARED_LAYOUT_A, SHARED_LAYOUT_B)
 
+@gluon.constexpr_function
+def create_shared_scale_layouts(BLOCK_M: ttgl.constexpr, BLOCK_N: ttgl.constexpr, BLOCK_K: ttgl.constexpr,
+                          TRANSPOSE_B: ttgl.constexpr):
+
+    SHARED_LAYOUT_A: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 8]], [BLOCK_M, 1],
+                                                                                [1, 0])
+    if not TRANSPOSE_B:
+        SHARED_LAYOUT_B: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[BLOCK_N, 16]], [1, BLOCK_N],
+                                                                                    [1, 0])
+    else:
+        SHARED_LAYOUT_B: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 8]], [BLOCK_N, 1],
+                                                                                    [1, 0])
+
+    return (SHARED_LAYOUT_A, SHARED_LAYOUT_B)
+
 
 def build_gemm_layouts(BLOCK_M, BLOCK_N, BLOCK_K, cga_layout_a, cga_layout_b, cga_layout_c, WARP_BASES, TRANSPOSE_B):
     """
@@ -187,13 +202,13 @@ def issue_scale_loads(producer, a_scale, b_scale, off_am, off_bn, a_buffer, b_bu
     # pred is a hardware predicate passed to async_load for conditional execution without branch divergence
     # Convert boolean pred to i32 for hardware predicate (i1 -> i32)
     pred_i32 = pred.to(ttgl.int32) if hasattr(pred, 'to') else pred
-    ttgl.amd.gfx1250.tdm.async_load(a_scale, [off_am, producer * BLOCK_K], a_buffer.index(producer % NUM_BUFFERS),
+    ttgl.amd.gfx1250.tdm.async_load(a_scale, [off_am], a_buffer.index(producer % NUM_BUFFERS),
                                     pred=pred_i32)
     if not TRANSPOSE_B:
-        ttgl.amd.gfx1250.tdm.async_load(b_scale, [producer * BLOCK_K, off_bn], b_buffer.index(producer % NUM_BUFFERS),
+        ttgl.amd.gfx1250.tdm.async_load(b_scale, [off_bn], b_buffer.index(producer % NUM_BUFFERS),
                                         pred=pred_i32)
     else:
-        ttgl.amd.gfx1250.tdm.async_load(b_desc, [off_bn, producer * BLOCK_K], b_buffer.index(producer % NUM_BUFFERS),
+        ttgl.amd.gfx1250.tdm.async_load(b_scale, [off_bn], b_buffer.index(producer % NUM_BUFFERS),
                                         pred=pred_i32)
     producer += 1
     return producer

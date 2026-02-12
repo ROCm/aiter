@@ -236,6 +236,8 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
         impl = gluon_gemm_a8w8_blockscale
     else:
         raise ValueError(f"Unknown implementation: {impl}")
+    
+    a = run_torch(x, weight, x_scale, w_scale, dtype)
 
     b = run_triton(x, weight_triton, x_scale_shuffled, w_scale, dtype, y, impl)
 
