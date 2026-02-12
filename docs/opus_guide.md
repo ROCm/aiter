@@ -40,7 +40,7 @@ fp16x4_t vec4;                      // Vector of 4 fp16 values
 
 // Compile-time constants
 auto n = 42_I;                      // number<42>
-auto s = seq<2, 4, 8>{};            // Compile-time integer sequence
+auto seq_vals = seq<2, 4, 8>{};     // Compile-time integer sequence
 
 // Containers
 auto t = make_tuple(1_I, 2_I, 3_I); // Heterogeneous tuple
@@ -58,8 +58,8 @@ g.store<4>(data, row_offset);       // Store 4 elements
 
 // Shared memory
 __shared__ fp16_t smem[1024];
-auto s = make_smem(smem);
-auto val = s.load<4>(offset);
+auto smem_view = make_smem(smem);
+auto smem_val = smem_view.load<4>(offset);
 
 // MFMA: warp-level matrix multiply
 auto mma = make_mfma<fp16_t, fp16_t, fp32_t>(32_I, 32_I, 8_I);
@@ -117,7 +117,8 @@ Opus registers GPU-compatible scalar types with the `REGISTER_DTYPE` macro, prov
 | `fp8_t` | `_BitInt(8)` | FP8 E4M3 |
 | `bf8_t` | `unsigned _BitInt(8)` | BF8 E5M2 |
 | `i32_t` / `u32_t` | `int32_t` / `uint32_t` | 32-bit integers |
-| `i16_t` / `u16_t` | `int16_t` / `uint16_t` | 16-bit integers |
+| `i16_t` | `int16_t` | 16-bit signed integer |
+| `u16_t`* | `uint16_t` | 16-bit unsigned integer (*requires `__clang_major__ >= 20`, i.e. ROCm 7+*) |
 | `i8_t` / `u8_t` | `int8_t` / `uint8_t` | 8-bit integers |
 
 ### Vector Types
@@ -393,10 +394,12 @@ g.async_load<4>(smem, u_gmem, u_smem);
 
 The `aux` parameter maps to the GLC/SLC/DLC cache hint bits in buffer instructions:
 
-| Value | Constant | Meaning |
-|-------|----------|---------|
-| 0 | `RT` | Default (return temporal) |
-| 3 | `GROUP_NT` | Group non-temporal — hints that data won't be reused |
+| Value | Meaning |
+|-------|---------|
+| 0 | Default (temporal) load/store behavior |
+| 3 | Group non-temporal — hints that data won't be reused |
+
+> **Note:** Named constants `aiter::RT` (0) and `aiter::GROUP_NT` (3) are defined in `csrc/include/aiter_opus_plus.h`, not in `opus.hpp` itself.
 
 ```cpp
 auto val = g.load<4, 3>(offset);         // Non-temporal load hint
