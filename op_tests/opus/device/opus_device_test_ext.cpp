@@ -37,29 +37,33 @@ static void run_mfma_torch(
 
     // Parse variant to determine expected input/output dtypes.
     // fp8/bf8 variants use fp8/bf8 inputs and fp32 output (raw accumulator).
-    torch::Dtype expected_in_dtype, expected_out_dtype;
+    // FP8/BF8 torch dtype is arch-dependent:
+    //   gfx942: float8_e4m3fnuz / float8_e5m2fnuz
+    //   gfx950: float8_e4m3fn   / float8_e5m2
+    torch::Dtype expected_out_dtype;
+    bool dtype_ok = false;
     std::string in_dtype_name;
 
     if (variant.find("fp8") != std::string::npos) {
-        expected_in_dtype  = torch::kFloat8_e4m3fnuz;
+        dtype_ok = (A.dtype() == torch::kFloat8_e4m3fnuz || A.dtype() == torch::kFloat8_e4m3fn);
         expected_out_dtype = torch::kFloat32;
-        in_dtype_name = "float8_e4m3fnuz";
+        in_dtype_name = "float8_e4m3fnuz or float8_e4m3fn";
     } else if (variant.find("bf8") != std::string::npos) {
-        expected_in_dtype  = torch::kFloat8_e5m2fnuz;
+        dtype_ok = (A.dtype() == torch::kFloat8_e5m2fnuz || A.dtype() == torch::kFloat8_e5m2);
         expected_out_dtype = torch::kFloat32;
-        in_dtype_name = "float8_e5m2fnuz";
+        in_dtype_name = "float8_e5m2fnuz or float8_e5m2";
     } else if (variant.find("bf16") != std::string::npos) {
-        expected_in_dtype  = torch::kBFloat16;
+        dtype_ok = (A.dtype() == torch::kBFloat16);
         expected_out_dtype = torch::kBFloat16;
         in_dtype_name = "bfloat16";
     } else {
-        expected_in_dtype  = torch::kFloat16;
+        dtype_ok = (A.dtype() == torch::kFloat16);
         expected_out_dtype = torch::kFloat16;
         in_dtype_name = "float16";
     }
 
-    TORCH_CHECK(A.dtype() == expected_in_dtype,  "A must be ", in_dtype_name, " for variant ", variant);
-    TORCH_CHECK(B.dtype() == expected_in_dtype,  "B must be ", in_dtype_name, " for variant ", variant);
+    TORCH_CHECK(dtype_ok, "A must be ", in_dtype_name, " for variant ", variant);
+    TORCH_CHECK(B.dtype() == A.dtype(), "B must have same dtype as A for variant ", variant);
     TORCH_CHECK(C.dtype() == expected_out_dtype, "C must be ", (expected_out_dtype == torch::kFloat32 ? "float32" : in_dtype_name), " for variant ", variant);
 
     int stride_a = static_cast<int>(A.stride(0));

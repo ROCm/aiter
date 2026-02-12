@@ -97,7 +97,31 @@ _MFMA_ARCHS_GFX942 = {"gfx942"}  # 32x32x8, 16x16x16
 _MFMA_ARCHS_GFX942_GFX950 = {"gfx942", "gfx950"}  # 32x32x16, 16x16x32
 
 
-_FP8_LIKE_DTYPES = {torch.float8_e4m3fnuz, torch.float8_e5m2fnuz}
+# FP8/BF8 torch dtypes differ by architecture:
+#   gfx942: float8_e4m3fnuz / float8_e5m2fnuz  (OCP "fnuz" format)
+#   gfx950: float8_e4m3fn   / float8_e5m2       (OCP non-"nuz" format)
+_FP8_LIKE_DTYPES = {
+    torch.float8_e4m3fnuz,
+    torch.float8_e5m2fnuz,
+    torch.float8_e4m3fn,
+    torch.float8_e5m2,
+}
+
+
+def _get_fp8_dtype():
+    """Return the correct FP8 (e4m3) torch dtype for the current GPU arch."""
+    arch = _get_gpu_arch()
+    if arch == "gfx950":
+        return torch.float8_e4m3fn
+    return torch.float8_e4m3fnuz  # gfx942 default
+
+
+def _get_bf8_dtype():
+    """Return the correct BF8 (e5m2) torch dtype for the current GPU arch."""
+    arch = _get_gpu_arch()
+    if arch == "gfx950":
+        return torch.float8_e5m2
+    return torch.float8_e5m2fnuz  # gfx942 default
 
 
 def _test_mfma_variant(mod, variant, M, N, K, dtype, supported_archs):
@@ -218,7 +242,7 @@ def test_mfma_32x32x16_fp8(mod):
         32,
         32,
         16,
-        torch.float8_e4m3fnuz,
+        _get_fp8_dtype(),
         _MFMA_ARCHS_GFX942_GFX950,
     )
 
@@ -231,7 +255,7 @@ def test_mfma_32x32x16_bf8(mod):
         32,
         32,
         16,
-        torch.float8_e5m2fnuz,
+        _get_bf8_dtype(),
         _MFMA_ARCHS_GFX942_GFX950,
     )
 
@@ -244,7 +268,7 @@ def test_mfma_16x16x32_fp8(mod):
         16,
         16,
         32,
-        torch.float8_e4m3fnuz,
+        _get_fp8_dtype(),
         _MFMA_ARCHS_GFX942_GFX950,
     )
 
@@ -257,7 +281,7 @@ def test_mfma_16x16x32_bf8(mod):
         16,
         16,
         32,
-        torch.float8_e5m2fnuz,
+        _get_bf8_dtype(),
         _MFMA_ARCHS_GFX942_GFX950,
     )
 
@@ -384,7 +408,7 @@ _FP8_SUPPORTED_ARCHS = {"gfx942"}
 
 
 def test_dtype_convert_fp32_fp8(mod):
-    """Test FP32 -> FP8 (e4m3fnuz) -> FP32 round-trip via OPUS packed cast (gfx942 only)."""
+    """Test FP32 -> FP8 (e4m3) -> FP32 round-trip via OPUS packed cast."""
     arch = _get_gpu_arch()
     if arch not in _FP8_SUPPORTED_ARCHS:
         print(
@@ -403,8 +427,9 @@ def test_dtype_convert_fp32_fp8(mod):
 
     mod.run_dtype_convert(In, Out, "fp32_fp8")
 
-    # Reference: PyTorch fp32 -> fp8_e4m3fnuz -> fp32 round-trip
-    Ref = In.to(torch.float8_e4m3fnuz).to(torch.float32)
+    # Reference: PyTorch fp32 -> fp8 -> fp32 round-trip (arch-dependent dtype)
+    fp8_dtype = _get_fp8_dtype()
+    Ref = In.to(fp8_dtype).to(torch.float32)
 
     # FP8 has low precision (3 mantissa bits) so tolerance is larger
     atol, rtol = 0.5, 0.25
