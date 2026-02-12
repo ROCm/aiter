@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2018-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "ck_tile/host.hpp"
 #include "ck_tile/ref/naive_attention.hpp"
 #include "mha_fwd.h"
