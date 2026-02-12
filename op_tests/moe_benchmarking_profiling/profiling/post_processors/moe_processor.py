@@ -32,11 +32,16 @@ class MoePostProcessor(PostProcessor):
         MOE kernels have different naming patterns:
         - ASM kernels: mangled names starting with _ZN containing 'fmoe'
         - CK kernels: names starting with 'moe_ck2stages'
+        - Triton kernels: JIT-compiled names containing 'e2e_moe_kernel'
         
         The actual kernel names in trace are demangled/templated, so we
         search for the characteristic substring.
         """
         kernel_name = config.kernel_name
+        
+        # Triton e2e kernels: triton_e2e_moe_... -> search for 'e2e_moe_kernel'
+        if kernel_name.startswith('triton_e2e_moe'):
+            return 'e2e_moe_kernel'
         
         # ASM fmoe kernels: _ZN5aiter...fmoe... -> search for 'aiter::fmoe'
         if kernel_name.startswith('_ZN') and 'fmoe' in kernel_name:
