@@ -354,12 +354,18 @@ def test_dtype_convert_fp32_bf16(mod):
 
     mod.run_dtype_convert(In, Out, "fp32_bf16")
 
-    # Reference: OPUS default bf16 conversion is truncation (rm=2):
-    # simply discard the lower 16 bits of the float32 representation.
-    # PyTorch .to(bfloat16) uses round-to-nearest-even which differs,
-    # so we replicate the truncation in Python via bitwise ops.
-    bits = In.view(dtype=torch.int32) & 0xFFFF0000
-    Ref = bits.view(dtype=torch.float32)
+    arch = _get_gpu_arch()
+    if arch == "gfx950":
+        # gfx950 uses native hardware bf16 conversion (round-to-nearest-even),
+        # which matches PyTorch's .to(bfloat16) behaviour.
+        Ref = In.to(torch.bfloat16).to(torch.float32)
+    else:
+        # Pre-gfx950: OPUS default bf16 conversion is truncation (rm=2):
+        # simply discard the lower 16 bits of the float32 representation.
+        # PyTorch .to(bfloat16) uses round-to-nearest-even which differs,
+        # so we replicate the truncation in Python via bitwise ops.
+        bits = In.view(dtype=torch.int32) & 0xFFFF0000
+        Ref = bits.view(dtype=torch.float32)
 
     ok = torch.equal(Out, Ref)
     if not ok:
