@@ -14,6 +14,57 @@ from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
 from aiter.ops.triton.utils._triton import arch_info
 
 
+def block_attn_mask_to_ranges(
+    block_attn_mask: torch.Tensor,
+) -> Tuple[torch.Tensor, int]:
+    """
+    Convert a dense block attention mask to contiguous (start, end) KV block ranges
+    per (batch, q_block).
+
+    block_attn_mask: (batch, num_q_blocks, num_kv_blocks) boolean.
+        True = may attend, False = must not attend.
+    Returns:
+        ranges: (batch, num_q_blocks, max_ranges, 2) int64, dtype long/int64 on same device.
+                Each entry (start_kv_block, end_kv_block) with end exclusive.
+                Unused slots are (-1, -1).
+        max_ranges: int, number of range slots per q block.
+    """
+    batch, num_q_blocks, num_kv_blocks = block_attn_mask.shape
+    device = block_attn_mask.device
+    mask_cpu = block_attn_mask.cpu()
+    all_runs = []
+    for b in range(batch):
+        for qb in range(num_q_blocks):
+            row = mask_cpu[b, qb, :].tolist()
+            runs = []
+            i = 0
+            while i < num_kv_blocks:
+                if not row[i]:
+                    i += 1
+                    continue
+                start = i
+                while i < num_kv_blocks and row[i]:
+                    i += 1
+                runs.append((start, i))
+            all_runs.append(runs)
+    max_ranges = max(len(r) for r in all_runs) if all_runs else 0
+    if max_ranges == 0:
+        out = torch.full(
+            (batch, num_q_blocks, 1, 2), -1, dtype=torch.int64, device=device
+        )
+        return out, 1
+    out = torch.full(
+        (batch, num_q_blocks, max_ranges, 2), -1, dtype=torch.int64, device=device
+    )
+    for idx, runs in enumerate(all_runs):
+        b = idx // num_q_blocks
+        qb = idx % num_q_blocks
+        for r, (s, e) in enumerate(runs):
+            out[b, qb, r, 0] = s
+            out[b, qb, r, 1] = e
+    return out, max_ranges
+
+
 def get_sage_fwd_configs():
     arch = arch_info.get_arch()
     if arch == "gfx950":
@@ -74,6 +125,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         return_lse: bool = True,
         layout: str = "bshd",
         config: Optional[dict] = None,
+        block_attn_mask: Optional[torch.Tensor] = None,
     ):
         # 1. Dimension Mapping & Config Setup
         bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
@@ -84,6 +136,25 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             config = get_sage_fwd_configs()
 
         BLKQ, BLKK = config["BLOCK_M"], config["BLOCK_N"]
+        num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
+        num_k_blocks = (seqlen_k + BLKK - 1) // BLKK
+
+        if block_attn_mask is not None:
+            if block_attn_mask.shape != (batch, num_q_blocks, num_k_blocks):
+                raise ValueError(
+                    f"block_attn_mask must have shape (batch, num_q_blocks, num_kv_blocks) "
+                    f"= ({batch}, {num_q_blocks}, {num_k_blocks}), got {block_attn_mask.shape}"
+                )
+            block_ranges, max_ranges = block_attn_mask_to_ranges(
+                block_attn_mask, num_k_blocks
+            )
+            use_block_sparse = True
+        else:
+            block_ranges = torch.zeros(
+                1, 1, 1, 2, dtype=torch.int64, device=q.device
+            )
+            max_ranges = 1
+            use_block_sparse = False
 
         # 2. Validation: Early Exit for unsupported features
         if attention_chunk not in (0, 1):
@@ -147,6 +218,9 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             return_lse,
             layout,
             config,
+            block_ranges=block_ranges,
+            max_block_ranges=max_ranges,
+            use_block_sparse=use_block_sparse,
         )
 
         # 6. Context Saving for Backward
@@ -181,6 +255,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             None,  # return_lse
             None,  # layout
             None,  # config
+            None,  # block_attn_mask
         )
 
 
@@ -198,6 +273,7 @@ def fav3_sage_wrapper_func(
     inference_mode: bool = True,
     layout: str = "bshd",
     config: Optional[dict] = None,
+    block_attn_mask: Optional[torch.Tensor] = None,
 ):
     """
     SageAttention v1 high-precision entry point.
@@ -276,6 +352,7 @@ def fav3_sage_wrapper_func(
         return_lse,
         layout,
         config,
+        block_attn_mask,
     )
 
 
@@ -295,6 +372,9 @@ def fav3_sage_func(
     return_lse: bool = False,
     layout: str = "bshd",
     config: Optional[dict] = None,
+    block_ranges: Optional[torch.Tensor] = None,
+    max_block_ranges: int = 1,
+    use_block_sparse: bool = False,
 ):
     """
     SageAttention v1.
@@ -397,6 +477,22 @@ def fav3_sage_func(
     window_size_left, window_size_right = int(window_size[0]), int(window_size[1])
     use_sliding_window = window_size_left != -1 or window_size_right != -1
 
+    if use_block_sparse:
+        if block_ranges is None:
+            raise ValueError("block_ranges must be provided when use_block_sparse=True")
+        # When block sparse, causal/window are ignored by the kernel
+        max_block_ranges_tensor = torch.full(
+            (1,), max_block_ranges, dtype=torch.int32, device=q.device
+        )
+        pass
+    else:
+        block_ranges = torch.zeros(1, 1, 1, 2, dtype=torch.int64, device=q.device)
+        max_block_ranges_tensor = torch.zeros((), dtype=torch.int32, device=q.device)
+
+    stride_br_z = block_ranges.stride(0)
+    stride_br_m = block_ranges.stride(1)
+    stride_br_r = block_ranges.stride(2)
+
     # --- 7. Kernel Launch ---
     def grid(META):
         return (triton.cdiv(seqlen_q, META["BLOCK_M"]), nheads_q, batch)
@@ -454,6 +550,11 @@ def fav3_sage_func(
         None,
         None,
         None,
+        block_ranges,
+        max_block_ranges_tensor,
+        stride_br_z,
+        stride_br_m,
+        stride_br_r,
         dropout_p=0.0,
         philox_seed=None,
         philox_offset_base=None,
@@ -478,6 +579,7 @@ def fav3_sage_func(
         USE_EXP2=True,
         RETURN_SCORES=False,
         USE_SEQUSED=False,
+        USE_BLOCK_SPARSE=use_block_sparse,
         **config,
     )
 

@@ -7,8 +7,12 @@ import numpy as np
 import math
 from aiter.test_mha_common import (
     attention_ref,
+    attention_ref_block_sparse,
 )
-from aiter.ops.triton.attention.fav3_sage import fav3_sage_wrapper_func
+from aiter.ops.triton.attention.fav3_sage import (
+    fav3_sage_wrapper_func,
+    get_sage_fwd_configs,
+)
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -260,4 +264,124 @@ def test_sage(
         atol=ATOL_fp8,
         rtol=RTOL_fp8,
         max_diff_percentage=0.5,
+    )
+
+
+@pytest.mark.parametrize("BATCH", [1, 4])
+@pytest.mark.parametrize(
+    "SEQLEN_Q, SEQLEN_K",
+    [(128, 128), (64, 128)],
+)
+@pytest.mark.parametrize(
+    "NUM_Q_HEADS, NUM_K_HEADS", [(2, 2), (16, 16)]
+)
+@pytest.mark.parametrize("HEAD_SZ", [128])
+@pytest.mark.parametrize("layout", ["bshd"])
+def test_sage_block_sparse_none(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    layout: str,
+    dtype=torch.bfloat16,
+):
+    """With block_attn_mask=None, output must match non-sparse path (backward compat)."""
+    torch.cuda.empty_cache()
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+    q, k, v = input_helper(
+        BATCH, NUM_Q_HEADS, NUM_K_HEADS, SEQLEN_Q, SEQLEN_K, HEAD_SZ, HEAD_SZ, dtype, layout
+    )
+    triton_out = fav3_sage_wrapper_func(
+        q, k, v, softmax_scale, causal=False, inference_mode=True, layout=layout, block_attn_mask=None
+    )
+    triton_out_full = fav3_sage_wrapper_func(
+        q, k, v, softmax_scale, causal=False, inference_mode=True, layout=layout
+    )
+    check_attention_outputs(
+        triton_out, triton_out_full, fp8=True, atol=ATOL_fp8, rtol=RTOL_fp8, max_diff_percentage=0.5
+    )
+
+
+@pytest.mark.parametrize("BATCH", [1, 2])
+@pytest.mark.parametrize(
+    "SEQLEN_Q, SEQLEN_K",
+    [(256, 256)],
+)
+@pytest.mark.parametrize(
+    "NUM_Q_HEADS, NUM_K_HEADS", [(4, 4)]
+)
+@pytest.mark.parametrize("HEAD_SZ", [128])
+@pytest.mark.parametrize("layout", ["bshd"])
+def test_sage_block_sparse_vs_reference(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    layout: str,
+    dtype=torch.bfloat16,
+):
+    """Block-sparse output matches reference that applies the same block mask."""
+    torch.cuda.empty_cache()
+    config = get_sage_fwd_configs()
+    BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
+    num_q_blocks = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
+    num_kv_blocks = (SEQLEN_K + BLOCK_N - 1) // BLOCK_N
+
+    q, k, v = input_helper(
+        BATCH, NUM_Q_HEADS, NUM_K_HEADS, SEQLEN_Q, SEQLEN_K, HEAD_SZ, HEAD_SZ, dtype, layout
+    )
+    # Diagonal block mask: Q block qb attends only to KV block qb (and qb-1 for a small band)
+    block_attn_mask = torch.zeros(BATCH, num_q_blocks, num_kv_blocks, dtype=torch.bool, device="cuda")
+    for qb in range(num_q_blocks):
+        for kb in range(num_kv_blocks):
+            if abs(qb - kb) <= 1:
+                block_attn_mask[:, qb, kb] = True
+
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+    triton_out = fav3_sage_wrapper_func(
+        q, k, v, softmax_scale, causal=False, inference_mode=True, layout=layout,
+        block_attn_mask=block_attn_mask,
+    )
+
+    torch_out, _, _ = attention_ref_block_sparse(
+        q, k, v, block_attn_mask, BLOCK_M, BLOCK_N
+    )
+    assert triton_out.shape == torch_out.shape
+    check_attention_outputs(
+        triton_out, torch_out, fp8=True, atol=ATOL_fp8, rtol=RTOL_fp8, max_diff_percentage=0.5
+    )
+
+
+@pytest.mark.parametrize("layout", ["bshd"])
+def test_sage_block_sparse_empty_kv_blocks(layout: str, dtype=torch.bfloat16):
+    """When a Q block has no KV blocks allowed, that block's output is zero."""
+    torch.cuda.empty_cache()
+    BATCH, SEQLEN_Q, SEQLEN_K = 1, 256, 256
+    NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ = 4, 4, 128
+    config = get_sage_fwd_configs()
+    BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
+    num_q_blocks = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
+    num_kv_blocks = (SEQLEN_K + BLOCK_N - 1) // BLOCK_N
+
+    q, k, v = input_helper(
+        BATCH, NUM_Q_HEADS, NUM_K_HEADS, SEQLEN_Q, SEQLEN_K, HEAD_SZ, HEAD_SZ, dtype, layout
+    )
+    # First Q block attends to nothing; others attend to all KV blocks
+    block_attn_mask = torch.ones(BATCH, num_q_blocks, num_kv_blocks, dtype=torch.bool, device="cuda")
+    block_attn_mask[:, 0, :] = False
+
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+    triton_out = fav3_sage_wrapper_func(
+        q, k, v, softmax_scale, causal=False, inference_mode=True, layout=layout,
+        block_attn_mask=block_attn_mask,
+    )
+    torch_out, _, _ = attention_ref_block_sparse(
+        q, k, v, block_attn_mask, BLOCK_M, BLOCK_N
+    )
+    check_attention_outputs(
+        triton_out, torch_out, fp8=True, atol=ATOL_fp8, rtol=RTOL_fp8, max_diff_percentage=0.5
     )

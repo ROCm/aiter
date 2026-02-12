@@ -905,6 +905,11 @@ def sage_fwd(
     cu_seqlens_k,
     seqused_q,
     seqused_k,  # Add seqused parameters
+    block_ranges,
+    max_block_ranges_tensor,
+    stride_br_z,
+    stride_br_m,
+    stride_br_r,
     dropout_p,
     philox_seed,
     philox_offset_base,
@@ -932,6 +937,7 @@ def sage_fwd(
     USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
     USE_SEQUSED: tl.constexpr,
+    USE_BLOCK_SPARSE: tl.constexpr,
 ):
     # set params
     ACCUMULATOR_TYPE = tl.float32  # for q*k product
@@ -1013,29 +1019,45 @@ def sage_fwd(
         seqlen_k = MAX_SEQLENS_K
 
     # figure out masking pattern
-    (
-        n_front_skip_blocks,
-        n_front_masked_blocks,
-        n_full_blocks,
-        n_back_masked_blocks,
-        n_extra_tokens,
-    ) = compute_block_masking(
-        seqlen_k,
-        seqlen_q,
-        start_m,
-        IS_CAUSAL,
-        USE_SLIDING_WINDOW,
-        WINDOW_SIZE_LEFT,
-        WINDOW_SIZE_RIGHT,
-        BLOCK_M,
-        BLOCK_N,
-    )
+    if USE_BLOCK_SPARSE:
+        total_k_blocks = tl.cdiv(seqlen_k, BLOCK_N)
+        max_block_ranges = tl.load(max_block_ranges_tensor)
+        n_extra_tokens = compute_padding_info(seqlen_k, BLOCK_N)
+        br_base = block_ranges + off_z * stride_br_z + start_m * stride_br_m
+        first_start = tl.load(br_base)
+        has_any_range = first_start >= 0
+    else:
+        (
+            n_front_skip_blocks,
+            n_front_masked_blocks,
+            n_full_blocks,
+            n_back_masked_blocks,
+            n_extra_tokens,
+        ) = compute_block_masking(
+            seqlen_k,
+            seqlen_q,
+            start_m,
+            IS_CAUSAL,
+            USE_SLIDING_WINDOW,
+            WINDOW_SIZE_LEFT,
+            WINDOW_SIZE_RIGHT,
+            BLOCK_M,
+            BLOCK_N,
+        )
+        total_k_blocks = tl.cdiv(seqlen_k, BLOCK_N)
+        has_any_range = True  # unused in this branch
 
     # ============================================================
     #          PROGRAM EARLY EXIT (All K Blocks Skipped)
     # ============================================================
-    total_visible_blocks = n_front_masked_blocks + n_full_blocks + n_back_masked_blocks
-    if total_visible_blocks == 0:
+    if not USE_BLOCK_SPARSE:
+        total_visible_blocks = n_front_masked_blocks + n_full_blocks + n_back_masked_blocks
+    # Early exit: no K blocks to process
+    if USE_BLOCK_SPARSE:
+        _no_blocks = not has_any_range
+    else:
+        _no_blocks = total_visible_blocks == 0
+    if _no_blocks:
         """
         No K blocks visible - write zeros and exit.
         """
@@ -1137,196 +1159,363 @@ def sage_fwd(
         q_ptrs_mask = q_ptrs_mask & (offs_d_qk[None, :] < ACTUAL_BLOCK_DMODEL_QK)
     q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
 
-    # ========== Process MASKED K Blocks in the front ==========
-    # NOTE: we use USE_SLIDING_WINDOW as guard because the compiler will crash other wise. front masking is only for sliding window so that is fine.
-    if n_front_masked_blocks > 0 and USE_SLIDING_WINDOW:
-        block_min = n_front_skip_blocks * BLOCK_N
-        block_max = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
+    # ========== Process K Blocks: either three-phase (causal/window) or block-sparse ranges ==========
+    if not USE_BLOCK_SPARSE:
+        # ========== Process MASKED K Blocks in the front ==========
+        # NOTE: we use USE_SLIDING_WINDOW as guard because the compiler will crash other wise. front masking is only for sliding window so that is fine.
+        if n_front_masked_blocks > 0 and USE_SLIDING_WINDOW:
+            block_min = n_front_skip_blocks * BLOCK_N
+            block_max = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
 
-        k_descale_ptr = k_descale_offset + n_front_skip_blocks * stride_ksblk
+            k_descale_ptr = k_descale_offset + n_front_skip_blocks * stride_ksblk
 
-        acc, l_i, m_i = _sage_fwd_mask(
-            acc,
-            l_i,
-            m_i,
-            q,
-            k_ptrs,
-            v_ptrs,
-            bias_ptrs,
-            stride_kn,
-            stride_vk,
-            stride_bn,
-            stride_sn,
-            stride_sm,
-            start_m,
-            seqlen_k,
-            seqlen_q,
-            dropout_p,
-            philox_seed,
-            philox_offset_base,
-            SD_MASK,
-            stride_sz,
-            stride_sh,
-            off_z,
-            off_h_q,
-            offs_m,
-            offs_n,
-            offs_d_qk,
-            offs_d_v,
-            block_min,  # Start of front masked blocks
-            block_max,  # End of front masked blocks
-            0,  # n_extra_tokens (0 for front blocks, only relevant for last block)
-            alibi_slope,
-            q_descale,
-            k_descale_ptr,
-            stride_ksblk,
-            IS_CAUSAL,
-            BLOCK_M,
-            BLOCK_N,
-            PRE_LOAD_V,
-            ENABLE_DROPOUT,
-            PADDED_HEAD_QK,
-            PADDED_HEAD_V,
-            ACTUAL_BLOCK_DMODEL_QK,
-            ACTUAL_BLOCK_DMODEL_V,
-            USE_ALIBI=USE_ALIBI,
-            USE_EXP2=USE_EXP2,
-            RETURN_SCORES=RETURN_SCORES,
-            USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
-            WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
-            WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
-            ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
-        )
+            acc, l_i, m_i = _sage_fwd_mask(
+                acc,
+                l_i,
+                m_i,
+                q,
+                k_ptrs,
+                v_ptrs,
+                bias_ptrs,
+                stride_kn,
+                stride_vk,
+                stride_bn,
+                stride_sn,
+                stride_sm,
+                start_m,
+                seqlen_k,
+                seqlen_q,
+                dropout_p,
+                philox_seed,
+                philox_offset_base,
+                SD_MASK,
+                stride_sz,
+                stride_sh,
+                off_z,
+                off_h_q,
+                offs_m,
+                offs_n,
+                offs_d_qk,
+                offs_d_v,
+                block_min,  # Start of front masked blocks
+                block_max,  # End of front masked blocks
+                0,  # n_extra_tokens (0 for front blocks, only relevant for last block)
+                alibi_slope,
+                q_descale,
+                k_descale_ptr,
+                stride_ksblk,
+                IS_CAUSAL,
+                BLOCK_M,
+                BLOCK_N,
+                PRE_LOAD_V,
+                ENABLE_DROPOUT,
+                PADDED_HEAD_QK,
+                PADDED_HEAD_V,
+                ACTUAL_BLOCK_DMODEL_QK,
+                ACTUAL_BLOCK_DMODEL_V,
+                USE_ALIBI=USE_ALIBI,
+                USE_EXP2=USE_EXP2,
+                RETURN_SCORES=RETURN_SCORES,
+                USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
+                WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
+                WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
+                ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+            )
 
-    # ========== Process FULL K Blocks (Fast Path) ==========
-    if n_full_blocks > 0:
-        block_min = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
-        block_max = (
-            n_front_skip_blocks + n_front_masked_blocks + n_full_blocks
-        ) * BLOCK_N
+        # ========== Process FULL K Blocks (Fast Path) ==========
+        if n_full_blocks > 0:
+            block_min = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
+            block_max = (
+                n_front_skip_blocks + n_front_masked_blocks + n_full_blocks
+            ) * BLOCK_N
 
-        k_descale_ptr = (
-            k_descale_offset
-            + (n_front_skip_blocks + n_front_masked_blocks) * stride_ksblk
-        )
+            k_descale_ptr = (
+                k_descale_offset
+                + (n_front_skip_blocks + n_front_masked_blocks) * stride_ksblk
+            )
 
-        acc, l_i, m_i = _sage_fwd_no_mask(
-            acc,
-            l_i,
-            m_i,
-            q,
-            k_ptrs,
-            v_ptrs,
-            bias_ptrs,
-            stride_kn,
-            stride_vk,
-            stride_bn,
-            stride_sn,
-            stride_sm,
-            start_m,
-            seqlen_k,
-            seqlen_q,
-            dropout_p,
-            philox_seed,
-            philox_offset_base,
-            SD_MASK,
-            stride_sz,
-            stride_sh,
-            off_z,
-            off_h_q,
-            offs_m,
-            offs_d_qk,
-            offs_d_v,
-            block_min,  # Start of range: 0
-            block_max,  # End of range: n_full_blocks * BLOCK_N
-            alibi_slope,
-            q_descale,
-            k_descale_ptr,
-            stride_ksblk,
-            BLOCK_M,
-            BLOCK_N,
-            PRE_LOAD_V,
-            ENABLE_DROPOUT,
-            PADDED_HEAD_QK,
-            PADDED_HEAD_V,
-            ACTUAL_BLOCK_DMODEL_QK,
-            ACTUAL_BLOCK_DMODEL_V,
-            USE_ALIBI=USE_ALIBI,
-            USE_EXP2=USE_EXP2,
-            RETURN_SCORES=RETURN_SCORES,
-            ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
-        )
+            acc, l_i, m_i = _sage_fwd_no_mask(
+                acc,
+                l_i,
+                m_i,
+                q,
+                k_ptrs,
+                v_ptrs,
+                bias_ptrs,
+                stride_kn,
+                stride_vk,
+                stride_bn,
+                stride_sn,
+                stride_sm,
+                start_m,
+                seqlen_k,
+                seqlen_q,
+                dropout_p,
+                philox_seed,
+                philox_offset_base,
+                SD_MASK,
+                stride_sz,
+                stride_sh,
+                off_z,
+                off_h_q,
+                offs_m,
+                offs_d_qk,
+                offs_d_v,
+                block_min,  # Start of range: 0
+                block_max,  # End of range: n_full_blocks * BLOCK_N
+                alibi_slope,
+                q_descale,
+                k_descale_ptr,
+                stride_ksblk,
+                BLOCK_M,
+                BLOCK_N,
+                PRE_LOAD_V,
+                ENABLE_DROPOUT,
+                PADDED_HEAD_QK,
+                PADDED_HEAD_V,
+                ACTUAL_BLOCK_DMODEL_QK,
+                ACTUAL_BLOCK_DMODEL_V,
+                USE_ALIBI=USE_ALIBI,
+                USE_EXP2=USE_EXP2,
+                RETURN_SCORES=RETURN_SCORES,
+                ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+            )
 
-    # ========== Process MASKED K Blocks in the back ==========
-    if n_back_masked_blocks > 0:
-        block_min = (
-            n_front_skip_blocks + n_front_masked_blocks + n_full_blocks
-        ) * BLOCK_N
-        block_max = (
-            n_front_skip_blocks
-            + n_front_masked_blocks
-            + n_full_blocks
-            + n_back_masked_blocks
-        ) * BLOCK_N
+        # ========== Process MASKED K Blocks in the back ==========
+        if n_back_masked_blocks > 0:
+            block_min = (
+                n_front_skip_blocks + n_front_masked_blocks + n_full_blocks
+            ) * BLOCK_N
+            block_max = (
+                n_front_skip_blocks
+                + n_front_masked_blocks
+                + n_full_blocks
+                + n_back_masked_blocks
+            ) * BLOCK_N
 
-        k_descale_ptr = (
-            k_descale_offset
-            + (n_front_skip_blocks + n_front_masked_blocks + n_full_blocks)
-            * stride_ksblk
-        )
+            k_descale_ptr = (
+                k_descale_offset
+                + (n_front_skip_blocks + n_front_masked_blocks + n_full_blocks)
+                * stride_ksblk
+            )
 
-        acc, l_i, m_i = _sage_fwd_mask(
-            acc,
-            l_i,
-            m_i,
-            q,
-            k_ptrs,
-            v_ptrs,
-            bias_ptrs,
-            stride_kn,
-            stride_vk,
-            stride_bn,
-            stride_sn,
-            stride_sm,
-            start_m,
-            seqlen_k,
-            seqlen_q,
-            dropout_p,
-            philox_seed,
-            philox_offset_base,
-            SD_MASK,
-            stride_sz,
-            stride_sh,
-            off_z,
-            off_h_q,
-            offs_m,
-            offs_n,
-            offs_d_qk,
-            offs_d_v,
-            block_min,  # Start of range: n_full_blocks * BLOCK_N
-            block_max,  # End of range: n_visible_k_blocks * BLOCK_N
-            n_extra_tokens,  # Padding tokens in last block
-            alibi_slope,
-            q_descale,
-            k_descale_ptr,
-            stride_ksblk,
-            IS_CAUSAL,  # Use actual causal flag
-            BLOCK_M,
-            BLOCK_N,
-            PRE_LOAD_V,
-            ENABLE_DROPOUT,
-            PADDED_HEAD_QK,
-            PADDED_HEAD_V,
-            ACTUAL_BLOCK_DMODEL_QK,
-            ACTUAL_BLOCK_DMODEL_V,
-            USE_ALIBI=USE_ALIBI,
-            USE_EXP2=USE_EXP2,
-            RETURN_SCORES=RETURN_SCORES,
-            USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
-            WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
-            WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
-            ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
-        )
+            acc, l_i, m_i = _sage_fwd_mask(
+                acc,
+                l_i,
+                m_i,
+                q,
+                k_ptrs,
+                v_ptrs,
+                bias_ptrs,
+                stride_kn,
+                stride_vk,
+                stride_bn,
+                stride_sn,
+                stride_sm,
+                start_m,
+                seqlen_k,
+                seqlen_q,
+                dropout_p,
+                philox_seed,
+                philox_offset_base,
+                SD_MASK,
+                stride_sz,
+                stride_sh,
+                off_z,
+                off_h_q,
+                offs_m,
+                offs_n,
+                offs_d_qk,
+                offs_d_v,
+                block_min,  # Start of range: n_full_blocks * BLOCK_N
+                block_max,  # End of range: n_visible_k_blocks * BLOCK_N
+                n_extra_tokens,  # Padding tokens in last block
+                alibi_slope,
+                q_descale,
+                k_descale_ptr,
+                stride_ksblk,
+                IS_CAUSAL,  # Use actual causal flag
+                BLOCK_M,
+                BLOCK_N,
+                PRE_LOAD_V,
+                ENABLE_DROPOUT,
+                PADDED_HEAD_QK,
+                PADDED_HEAD_V,
+                ACTUAL_BLOCK_DMODEL_QK,
+                ACTUAL_BLOCK_DMODEL_V,
+                USE_ALIBI=USE_ALIBI,
+                USE_EXP2=USE_EXP2,
+                RETURN_SCORES=RETURN_SCORES,
+                USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
+                WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
+                WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
+                ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+            )
+    else:
+        # ========== USE_BLOCK_SPARSE: process each (start_b, end_b) range ==========
+        for r in range(max_block_ranges):
+            ptr_r = br_base + r * stride_br_r
+            start_b = tl.load(ptr_r)
+            end_b = tl.load(ptr_r + 1)
+            if start_b < 0:
+                break
+            block_min = start_b * BLOCK_N
+            block_max = end_b * BLOCK_N
+            k_descale_ptr = k_descale_offset + start_b * stride_ksblk
+            last_block_is_padded = (end_b == total_k_blocks) & (n_extra_tokens != 0)
+            if last_block_is_padded and (end_b > start_b):
+                # Full part: [start_b, end_b - 1)
+                block_max_full = (end_b - 1) * BLOCK_N
+                if block_max_full > block_min:
+                    acc, l_i, m_i = _sage_fwd_no_mask(
+                        acc,
+                        l_i,
+                        m_i,
+                        q,
+                        k_ptrs,
+                        v_ptrs,
+                        bias_ptrs,
+                        stride_kn,
+                        stride_vk,
+                        stride_bn,
+                        stride_sn,
+                        stride_sm,
+                        start_m,
+                        seqlen_k,
+                        seqlen_q,
+                        dropout_p,
+                        philox_seed,
+                        philox_offset_base,
+                        SD_MASK,
+                        stride_sz,
+                        stride_sh,
+                        off_z,
+                        off_h_q,
+                        offs_m,
+                        offs_d_qk,
+                        offs_d_v,
+                        block_min,
+                        block_max_full,
+                        alibi_slope,
+                        q_descale,
+                        k_descale_ptr,
+                        stride_ksblk,
+                        BLOCK_M,
+                        BLOCK_N,
+                        PRE_LOAD_V,
+                        ENABLE_DROPOUT,
+                        PADDED_HEAD_QK,
+                        PADDED_HEAD_V,
+                        ACTUAL_BLOCK_DMODEL_QK,
+                        ACTUAL_BLOCK_DMODEL_V,
+                        USE_ALIBI=USE_ALIBI,
+                        USE_EXP2=USE_EXP2,
+                        RETURN_SCORES=RETURN_SCORES,
+                        ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+                    )
+                    k_descale_ptr = k_descale_offset + (end_b - 1) * stride_ksblk
+                # Last block with padding
+                block_min_mask = (end_b - 1) * BLOCK_N
+                block_max_mask = end_b * BLOCK_N
+                acc, l_i, m_i = _sage_fwd_mask(
+                    acc,
+                    l_i,
+                    m_i,
+                    q,
+                    k_ptrs,
+                    v_ptrs,
+                    bias_ptrs,
+                    stride_kn,
+                    stride_vk,
+                    stride_bn,
+                    stride_sn,
+                    stride_sm,
+                    start_m,
+                    seqlen_k,
+                    seqlen_q,
+                    dropout_p,
+                    philox_seed,
+                    philox_offset_base,
+                    SD_MASK,
+                    stride_sz,
+                    stride_sh,
+                    off_z,
+                    off_h_q,
+                    offs_m,
+                    offs_n,
+                    offs_d_qk,
+                    offs_d_v,
+                    block_min_mask,
+                    block_max_mask,
+                    n_extra_tokens,
+                    alibi_slope,
+                    q_descale,
+                    k_descale_ptr,
+                    stride_ksblk,
+                    False,  # IS_CAUSAL
+                    BLOCK_M,
+                    BLOCK_N,
+                    PRE_LOAD_V,
+                    ENABLE_DROPOUT,
+                    PADDED_HEAD_QK,
+                    PADDED_HEAD_V,
+                    ACTUAL_BLOCK_DMODEL_QK,
+                    ACTUAL_BLOCK_DMODEL_V,
+                    USE_ALIBI=USE_ALIBI,
+                    USE_EXP2=USE_EXP2,
+                    RETURN_SCORES=RETURN_SCORES,
+                    USE_SLIDING_WINDOW=False,
+                    WINDOW_SIZE_LEFT=0,
+                    WINDOW_SIZE_RIGHT=0,
+                    ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+                )
+            else:
+                acc, l_i, m_i = _sage_fwd_no_mask(
+                    acc,
+                    l_i,
+                    m_i,
+                    q,
+                    k_ptrs,
+                    v_ptrs,
+                    bias_ptrs,
+                    stride_kn,
+                    stride_vk,
+                    stride_bn,
+                    stride_sn,
+                    stride_sm,
+                    start_m,
+                    seqlen_k,
+                    seqlen_q,
+                    dropout_p,
+                    philox_seed,
+                    philox_offset_base,
+                    SD_MASK,
+                    stride_sz,
+                    stride_sh,
+                    off_z,
+                    off_h_q,
+                    offs_m,
+                    offs_d_qk,
+                    offs_d_v,
+                    block_min,
+                    block_max,
+                    alibi_slope,
+                    q_descale,
+                    k_descale_ptr,
+                    stride_ksblk,
+                    BLOCK_M,
+                    BLOCK_N,
+                    PRE_LOAD_V,
+                    ENABLE_DROPOUT,
+                    PADDED_HEAD_QK,
+                    PADDED_HEAD_V,
+                    ACTUAL_BLOCK_DMODEL_QK,
+                    ACTUAL_BLOCK_DMODEL_V,
+                    USE_ALIBI=USE_ALIBI,
+                    USE_EXP2=USE_EXP2,
+                    RETURN_SCORES=RETURN_SCORES,
+                    ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+                )
 
     # ============================================================
     #                        EPILOGUE
