@@ -412,7 +412,7 @@ def _sage_fwd_mask(
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
 
         # compute bias
-        if bias_base_ptrs is not None:
+        if USE_BIAS:
             bias_ptrs = bias_base_ptrs + start_n * stride_bn
             bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
             qk += bias
