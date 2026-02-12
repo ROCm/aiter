@@ -13,56 +13,46 @@ from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 
-
-def block_attn_mask_to_ranges(
+def block_attn_mask_to_lut(
     block_attn_mask: torch.Tensor,
 ) -> Tuple[torch.Tensor, int]:
     """
-    Convert a dense block attention mask to contiguous (start, end) KV block ranges
-    per (batch, q_block).
+    Convert a dense block attention mask to a look-up table of KV block indices
+    per (batch, q_block). Used for block-sparse attention with only no_mask path.
 
     block_attn_mask: (batch, num_q_blocks, num_kv_blocks) boolean.
         True = may attend, False = must not attend.
     Returns:
-        ranges: (batch, num_q_blocks, max_ranges, 2) int64, dtype long/int64 on same device.
-                Each entry (start_kv_block, end_kv_block) with end exclusive.
-                Unused slots are (-1, -1).
-        max_ranges: int, number of range slots per q block.
+        block_lut: (batch, num_q_blocks, max_lut_len) int32 on same device.
+                   Each row lists the KV block indices to attend to; unused slots are -1.
+        max_lut_len: int, number of LUT slots per (batch, q_block).
     """
-    batch, num_q_blocks, num_kv_blocks = block_attn_mask.shape
+    batch, num_q_blocks, _ = block_attn_mask.shape
     device = block_attn_mask.device
     mask_cpu = block_attn_mask.cpu()
-    all_runs = []
+    all_indices = []
     for b in range(batch):
         for qb in range(num_q_blocks):
-            row = mask_cpu[b, qb, :].tolist()
-            runs = []
-            i = 0
-            while i < num_kv_blocks:
-                if not row[i]:
-                    i += 1
-                    continue
-                start = i
-                while i < num_kv_blocks and row[i]:
-                    i += 1
-                runs.append((start, i))
-            all_runs.append(runs)
-    max_ranges = max(len(r) for r in all_runs) if all_runs else 0
-    if max_ranges == 0:
+            row = mask_cpu[b, qb, :]
+            indices = torch.nonzero(row, as_tuple=False).squeeze(-1)
+            if indices.dim() == 0:
+                indices = indices.unsqueeze(0)
+            all_indices.append(indices)
+    max_lut_len = max(ind.size(0) for ind in all_indices) if all_indices else 0
+    if max_lut_len == 0:
         out = torch.full(
-            (batch, num_q_blocks, 1, 2), -1, dtype=torch.int64, device=device
+            (batch, num_q_blocks, 1), -1, dtype=torch.int32, device=device
         )
         return out, 1
     out = torch.full(
-        (batch, num_q_blocks, max_ranges, 2), -1, dtype=torch.int64, device=device
+        (batch, num_q_blocks, max_lut_len), -1, dtype=torch.int32, device=device
     )
-    for idx, runs in enumerate(all_runs):
+    for idx, ind in enumerate(all_indices):
         b = idx // num_q_blocks
         qb = idx % num_q_blocks
-        for r, (s, e) in enumerate(runs):
-            out[b, qb, r, 0] = s
-            out[b, qb, r, 1] = e
-    return out, max_ranges
+        n = ind.size(0)
+        out[b, qb, :n] = ind.to(device)
+    return out, max_lut_len
 
 
 def get_sage_fwd_configs():
@@ -145,15 +135,13 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
                     f"block_attn_mask must have shape (batch, num_q_blocks, num_kv_blocks) "
                     f"= ({batch}, {num_q_blocks}, {num_k_blocks}), got {block_attn_mask.shape}"
                 )
-            block_ranges, max_ranges = block_attn_mask_to_ranges(
-                block_attn_mask, num_k_blocks
-            )
+            block_lut, max_lut_len = block_attn_mask_to_lut(block_attn_mask)
             use_block_sparse = True
         else:
-            block_ranges = torch.zeros(
-                1, 1, 1, 2, dtype=torch.int64, device=q.device
+            block_lut = torch.full(
+                (1, 1, 1), -1, dtype=torch.int32, device=q.device
             )
-            max_ranges = 1
+            max_lut_len = 1
             use_block_sparse = False
 
         # 2. Validation: Early Exit for unsupported features
@@ -218,8 +206,8 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             return_lse,
             layout,
             config,
-            block_ranges=block_ranges,
-            max_block_ranges=max_ranges,
+            block_lut=block_lut,
+            max_lut_len=max_lut_len,
             use_block_sparse=use_block_sparse,
         )
 
@@ -372,8 +360,8 @@ def fav3_sage_func(
     return_lse: bool = False,
     layout: str = "bshd",
     config: Optional[dict] = None,
-    block_ranges: Optional[torch.Tensor] = None,
-    max_block_ranges: int = 1,
+    block_lut: Optional[torch.Tensor] = None,
+    max_lut_len: int = 1,
     use_block_sparse: bool = False,
 ):
     """
@@ -478,20 +466,15 @@ def fav3_sage_func(
     use_sliding_window = window_size_left != -1 or window_size_right != -1
 
     if use_block_sparse:
-        if block_ranges is None:
-            raise ValueError("block_ranges must be provided when use_block_sparse=True")
-        # When block sparse, causal/window are ignored by the kernel
-        max_block_ranges_tensor = torch.full(
-            (1,), max_block_ranges, dtype=torch.int32, device=q.device
-        )
-        pass
+        if block_lut is None:
+            raise ValueError("block_lut must be provided when use_block_sparse=True")
     else:
-        block_ranges = torch.zeros(1, 1, 1, 2, dtype=torch.int64, device=q.device)
-        max_block_ranges_tensor = torch.zeros((), dtype=torch.int32, device=q.device)
+        block_lut = torch.full((1, 1, 1), -1, dtype=torch.int32, device=q.device)
+        max_lut_len = 1
 
-    stride_br_z = block_ranges.stride(0)
-    stride_br_m = block_ranges.stride(1)
-    stride_br_r = block_ranges.stride(2)
+    stride_lut_z = block_lut.stride(0)
+    stride_lut_m = block_lut.stride(1)
+    stride_lut_i = block_lut.stride(2)
 
     # --- 7. Kernel Launch ---
     def grid(META):
@@ -550,11 +533,10 @@ def fav3_sage_func(
         None,
         None,
         None,
-        block_ranges,
-        max_block_ranges_tensor,
-        stride_br_z,
-        stride_br_m,
-        stride_br_r,
+        block_lut,
+        stride_lut_z,
+        stride_lut_m,
+        stride_lut_i,
         dropout_p=0.0,
         philox_seed=None,
         philox_offset_base=None,
@@ -580,6 +562,7 @@ def fav3_sage_func(
         RETURN_SCORES=False,
         USE_SEQUSED=False,
         USE_BLOCK_SPARSE=use_block_sparse,
+        MAX_LUT_LEN=max_lut_len,
         **config,
     )
 
