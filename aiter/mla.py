@@ -331,6 +331,7 @@ def mla_decode_fwd(
             and q.dtype == dtypes.fp8
             and kv_buffer.dtype == dtypes.fp8
             and get_gfx() == "gfx942"
+            and page_size == 1
         )
 
         if use_hk:
