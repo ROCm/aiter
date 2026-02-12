@@ -63,7 +63,8 @@ def _sage_fwd_no_mask_mxfp4(
     Q_DTYPE_STR: tl.constexpr,
     K_DTYPE_STR: tl.constexpr,
     ACCUMULATOR_TYPE: tl.constexpr,
-    USE_Q_SMOOTHING: tl.constexpr
+    USE_Q_SMOOTHING: tl.constexpr,
+    USE_BIAS: tl.constexpr
 ):
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
@@ -126,7 +127,7 @@ def _sage_fwd_no_mask_mxfp4(
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
 
         # compute bias
-        if bias_base_ptrs is not None:
+        if USE_BIAS:
             bias_ptrs = bias_base_ptrs + start_n * stride_bn
             bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
             qk += bias
@@ -135,7 +136,7 @@ def _sage_fwd_no_mask_mxfp4(
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
 
         # scale and subtract max
-        if bias_base_ptrs is not None:
+        if USE_BIAS:
             q_shifted = tl.where(
                 m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
             )
@@ -200,7 +201,7 @@ def _sage_fwd_no_mask_mxfp4(
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
         # store the diff in maxes to adjust acc and li as we discover new maxes
-        if bias_base_ptrs is not None:
+        if USE_BIAS:
             m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
         else:
             m_diff = m_i - m_ij
@@ -281,7 +282,8 @@ def _sage_fwd_mask_mxfp4(
     Q_DTYPE_STR: tl.constexpr,
     K_DTYPE_STR: tl.constexpr,
     ACCUMULATOR_TYPE: tl.constexpr,
-    USE_Q_SMOOTHING: tl.constexpr
+    USE_Q_SMOOTHING: tl.constexpr,
+    USE_BIAS: tl.constexpr
 ):
     # seqlen diff
     seqlen_delta_qk = seqlen_k - seqlen_q
@@ -454,7 +456,7 @@ def _sage_fwd_mask_mxfp4(
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
 
         # compute bias
-        if bias_base_ptrs is not None:
+        if USE_BIAS:
             bias_ptrs = bias_base_ptrs + start_n * stride_bn
             bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
             qk += bias
@@ -984,7 +986,8 @@ def sage_fwd_mxfp4(
             Q_DTYPE_STR=Q_DTYPE_STR,
             K_DTYPE_STR=K_DTYPE_STR,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
-            USE_Q_SMOOTHING=USE_Q_SMOOTHING
+            USE_Q_SMOOTHING=USE_Q_SMOOTHING,
+            USE_BIAS=USE_BIAS
         )
 
     # ========== Process FULL K Blocks (Fast Path) ==========
@@ -1042,7 +1045,8 @@ def sage_fwd_mxfp4(
             Q_DTYPE_STR=Q_DTYPE_STR,
             K_DTYPE_STR=K_DTYPE_STR,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
-            USE_Q_SMOOTHING=USE_Q_SMOOTHING
+            USE_Q_SMOOTHING=USE_Q_SMOOTHING,
+            USE_BIAS=USE_BIAS
         )
 
     # ========== Process MASKED K Blocks in the back ==========
@@ -1111,7 +1115,8 @@ def sage_fwd_mxfp4(
             Q_DTYPE_STR=Q_DTYPE_STR,
             K_DTYPE_STR=K_DTYPE_STR,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
-            USE_Q_SMOOTHING=USE_Q_SMOOTHING
+            USE_Q_SMOOTHING=USE_Q_SMOOTHING,
+            USE_BIAS=USE_BIAS
         )
 
     # ============================================================
@@ -1589,6 +1594,18 @@ def _compute_delta_s_kernel(
     tl.store(s_ptr, acc, mask=offs_n < seq_k)
 
 
+def create_random_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
+    # 1. Generate the deterministic Hadamard matrix (H)
+    H = create_hadamard_matrix(block_size, dtype=dtype) / (block_size**0.5)
+    # 2. Create the random diagonal matrix D (represented as a vector for efficiency)
+    # This generates random +1 or -1 for each column
+    random_signs = torch.randint(0, 2, (block_size,), device=device, dtype=torch.int) * 2 - 1
+    # 3. Apply the random signs (H @ D)
+    # Multiplying by a diagonal matrix on the right is equivalent to scaling columns
+    H_tilde = H * random_signs
+    return H_tilde
+
+
 def create_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
     """
     Create an orthogonal Hadamard matrix of size block_size x block_size.
@@ -1640,7 +1657,8 @@ def create_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
 def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing=False, sm_scale=None, layout="bhsd"):
     # Generate Hadamard Matrix R (Rank 32)
     # TODO we might want to manually define this matrix
-    R = create_hadamard_matrix(block_size, dtype=q.dtype) / (block_size**0.5)
+    R = create_hadamard_matrix(block_size, dtype=q.dtype)
+    # R = create_random_hadamard_matrix(block_size, dtype=q.dtype)
     bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
 
     # shapes
