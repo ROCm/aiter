@@ -4,10 +4,11 @@
 
 import torch
 
+
 def get_seed_and_offset(
     increment,
-    generator = None,
-    device = "cuda",
+    generator=None,
+    device="cuda",
 ):
     # Update the generator state so that subsequent calls don't reuse the same
     # random numbers

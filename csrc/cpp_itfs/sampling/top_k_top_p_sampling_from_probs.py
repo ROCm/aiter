@@ -57,9 +57,7 @@ def top_k_top_p_sampling_from_probs(
     batch_size = indices.size(0) if indices is not None else probs.size(0)
     vocab_size = probs.size(1)
     philox_seed, philox_offset = get_seed_and_offset(
-        batch_size * 32,
-        generator,
-        probs.device
+        batch_size * 32, generator, probs.device
     )
 
     output = torch.empty(batch_size, dtype=torch.int32, device=probs.device)

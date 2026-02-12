@@ -48,9 +48,7 @@ def top_p_sampling_from_probs(
 
     batch_size = probs.size(0)
     philox_seed, philox_offset = get_seed_and_offset(
-        batch_size * 32,
-        generator,
-        probs.device
+        batch_size * 32, generator, probs.device
     )
 
     probs = probs.float()
