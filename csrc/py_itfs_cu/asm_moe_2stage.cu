@@ -307,7 +307,6 @@ void moe_stage1_g1u1(
     {
         kernelName = get_heuristic_kernel(sub_X_cnt, inter_dim, block_m, config_map, arch_id);
     }
-    printf("[FEIFEI] kernelName = %s\n", kernelName.c_str());
 
     AiterAsmKernel* impl_ptr = nullptr;
     auto it                  = config_map->find(kernelName);
@@ -316,6 +315,9 @@ void moe_stage1_g1u1(
         const auto& cfg     = it->second;
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
+
+        printf("[debug] name = %s\n", name);
+        printf("[debug] co_name = %s\n", co_name);
 
         TORCH_CHECK(inter_dim % cfg.tile_n == 0,
                     "ASM kernel " + std::string(name) +
@@ -389,8 +391,6 @@ void moe_stage1_g1u1(
     args.ptr_Qzero  = w1_lqq_zero.has_value() ? w1_lqq_zero.value().data_ptr() : nullptr;
     args.eLQQs      = stride_expert_LQQ;
 
-    printf("argsize: %zu\n", arg_size);
-    args.log();
     uint32_t k_num = 1 << ksplit;
     TORCH_CHECK(model_dim % k_num == 0,
                 __func__,
@@ -434,9 +434,10 @@ void moe_stage1_g1u1(
     // std::cout << " args.splitk      = " << args.splitk << std::endl;
     // std::cout << " args.activation  = " << args.activation << std::endl;
     // std::cout << " args.ptr_SW      = " << args.ptr_SW << std::endl;
-    // printf("gdx:%d, gdy:%d, gdz:%d, tgs:%d\n", gdx, gdy, gdz, sub_X_cnt * gdx * gdz);
+    args.log();
+    printf("argsize: %zu\n", arg_size);
+    printf("gdx:%d, gdy:%d, gdz:%d, tgs:%d\n", gdx, gdy, gdz, sub_X_cnt * gdx * gdz);
 
-    return;
     impl_ptr->launch_kernel({&args,
                              &arg_size,
                              gdx, // gdx

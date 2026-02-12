@@ -1169,8 +1169,8 @@ def asm_stage1(
     sorted_weights=None,
 ):
     dtype = dtypes.bf16  # out.dtype, asm only support bf16
-    # if quant_type == QuantType.per_Token:  # feifei: add enum lqq
-    #    dtype = dtypes.i8
+    if quant_type == QuantType.per_Token:  # feifei: add enum lqq
+        dtype = dtypes.i8
     if quant_type != QuantType.per_1x128:
         out = out.view(dtype)
     device = out.device

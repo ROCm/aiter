@@ -919,6 +919,7 @@ def test_fmoe_lqq(
     # gu quant for cpu ref
     w1_qt = moe_lqq_dequant(w1_lqq_uint4, w1_lqq_scale, w1_lqq_zero)
     save_buffer_to_file(w1_qt, "./feifei/w1_qt", format="binary")
+    # gu quant scale for cpu ref and kernel
     w1_scale = moe_init_float(eprt, GU_dqn_size // eprt // GU_dqn_k, GU_dqn_k, 1)
     save_buffer_to_file(w1_scale, "./feifei/w1_scale", format="text")
 
@@ -956,6 +957,7 @@ def test_fmoe_lqq(
         activation=aiter.ActivationType.Silu,
         doweight_stage1=False,
         dtype=dtype,
+        block_size_M=80,
         num_iters=2,
         num_warmup=1,
     )
