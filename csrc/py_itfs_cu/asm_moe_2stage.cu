@@ -435,8 +435,21 @@ void moe_stage1_g1u1(
     // std::cout << " args.activation  = " << args.activation << std::endl;
     // std::cout << " args.ptr_SW      = " << args.ptr_SW << std::endl;
     args.log();
+    printf("[DEV_BUF] dev_O: out = %lu bytes\n", out.numel() * out.element_size());
+    printf("[DEV_BUF] dev_X: input = %lu bytes\n", input.numel() * input.element_size());
+    printf("[DEV_BUF] dev_GU: w1 = %lu bytes\n", w1.numel() * w1.element_size());
+    printf("[DEV_BUF] dev_XC: num_valid_ids = %lu bytes\n", num_valid_ids.numel() * num_valid_ids.element_size());
+    printf("[DEV_BUF] dev_X_dqn_buf: a1_scale = %lu bytes\n", a1_scale.has_value() ? a1_scale.value().numel() * a1_scale.value().element_size() : 0);
+    printf("[DEV_BUF] dev_GU_dqn_buf: w1_scale = %lu bytes\n", w1_scale.has_value() ? w1_scale.value().numel() * w1_scale.value().element_size() : 0);
+    printf("[DEV_BUF] dev_Smooth_qnt_buf: fc2_smooth_scale = %lu bytes\n", fc2_smooth_scale.has_value() ? fc2_smooth_scale.value().numel() * fc2_smooth_scale.value().element_size() : 0);
+    printf("[DEV_BUF] dev_STP: sorted_token_ids = %lu bytes\n", sorted_token_ids.numel() * sorted_token_ids.element_size());
+    printf("[DEV_BUF] dev_SEP: sorted_expert_ids = %lu bytes\n", sorted_expert_ids.numel() * sorted_expert_ids.element_size());
+    printf("[DEV_BUF] dev_SW: sorted_weights = %lu bytes\n", sorted_weights.has_value() ? sorted_weights.value().numel() * sorted_weights.value().element_size() : 0);
+    printf("[DEV_BUF] dev_Qscl: w1_lqq_scale = %lu bytes\n", w1_lqq_scale.has_value() ? w1_lqq_scale.value().numel() * w1_lqq_scale.value().element_size() : 0);
+    printf("[DEV_BUF] dev_Qzero: w1_lqq_zero = %lu bytes\n", w1_lqq_zero.has_value() ? w1_lqq_zero.value().numel() * w1_lqq_zero.value().element_size() : 0);
     printf("argsize: %zu\n", arg_size);
     printf("gdx:%d, gdy:%d, gdz:%d, tgs:%d\n", gdx, gdy, gdz, sub_X_cnt * gdx * gdz);
+    return;
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,

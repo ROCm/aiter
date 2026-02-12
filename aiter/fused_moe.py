@@ -1011,11 +1011,11 @@ def fused_moe_2stages(
             device=device,
         )
     elif quant_type == QuantType.per_Token:  # feifei: add enum lqq
-        a2 = torch.empty(
-            (token_num, topk, inter_dim),
-            dtype=dtypes.i8,
-            device=device,
-        )
+        a2_sz = token_num * topk * inter_dim
+        a2_scale_sz = token_num * topk * inter_dim // 32
+        total_size = a2_sz + a2_scale_sz
+        a2 = torch.empty(total_size, dtype=q_dtype_a, device=device)
+        a2 = a2.view(token_num, topk, -1)
     else:
         a2 = torch.empty(
             (token_num, topk, inter_dim),
@@ -1052,7 +1052,6 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if doweight_stage1 else None,
         **extra_stage1_args,
     )
-    return a2  # feifei test
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
@@ -1119,6 +1118,7 @@ def fused_moe_2stages(
         )
         a2 = a2.view(token_num, topk, inter_dim)
 
+    return a2  # feifei test
     metadata.stage2(
         a2,
         w1,
