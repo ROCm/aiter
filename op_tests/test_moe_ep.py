@@ -851,7 +851,7 @@ def test_fmoe_lqq(
     # GU_buf:                 int8  -> w1_qt
     # GU_dqn_buf:             float -> w1_scale          -> dev_GU_dqn_buf
     # GU_buf_uint4:           uint4 -> w1_lqq_uint4
-    # GU_buf_pack:            uint4 -> w1_lqq_uint4_pack -> dev_GU
+    # GU_buf_pack:            uint4 -> w1_lqq_pack -> dev_GU
     # GU_qscale_lqq_buf:      int4  -> w1_lqq_scale
     #                         int4  -> w1_lqq_scale_shf  -> dev_Qscl
     # GU_qzero_lqq_buf:       int4  -> w1_lqq_zero
@@ -905,12 +905,10 @@ def test_fmoe_lqq(
     save_buffer_to_file(
         w1_lqq_uint4_shf2, "./feifei/w1_lqq_uint4_shf2", format="binary"
     )
-    w1_lqq_uint4_pack = moe_pack_int4(
+    w1_lqq_pack = moe_pack_int4(
         w1_lqq_uint4_shf2, eprt, sz_GU // model_dim // eprt, model_dim
     )
-    save_buffer_to_file(
-        w1_lqq_uint4_pack, "./feifei/w1_lqq_uint4_pack", format="binary"
-    )
+    save_buffer_to_file(w1_lqq_pack, "./feifei/w1_lqq_pack", format="binary")
     w1_lqq_scale_shf = moe_shuffle_4_16(w1_lqq_scale, (4, 16), use_int4=False)
     save_buffer_to_file(w1_lqq_scale_shf, "./feifei/w1_lqq_scale_shf", format="binary")
     w1_lqq_zero_uint8_shf = moe_shuffle_4_16(w1_lqq_zero_uint8, (4, 16), use_int4=False)
@@ -942,17 +940,10 @@ def test_fmoe_lqq(
     print("[FEIFEI] out1_ref = ", out1_ref.type())
     """
 
-    print("[debug] w1_lqq_uint4_pack shape: ", w1_lqq_uint4_pack.shape)
-    print("[debug] w1_lqq_uint4_pack element_size: ", w1_lqq_uint4_pack.element_size())
-    print("[debug] w1_lqq_uint4_pack stride: ", w1_lqq_uint4_pack.stride(-2))
-    print("[debug] w2 shape: ", w2.shape)
-    print("[debug] w1_lqq_scale_shf shape: ", w1_lqq_scale_shf.shape)
-    print("[debug] w1_lqq_scale_shf stride: ", w1_lqq_scale_shf.stride())
-    print("[debug] w1_lqq_scale_shf element_size: ", w1_lqq_scale_shf.element_size())
     out2_asm, us2 = run_perftest(
         fused_moe,
         a1_qt,
-        w1_lqq_uint4_pack,
+        w1_lqq_pack,
         w2_qt,
         topk_weights,
         topk_ids,

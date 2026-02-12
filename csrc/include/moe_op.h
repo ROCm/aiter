@@ -164,8 +164,8 @@ void moe_stage1_g1u1(
     QuantType quant_type,
     std::optional<torch::Tensor> a1_scale, // [token_cnt, 1], token scale
     std::optional<torch::Tensor> w1_scale, // [expert, 1, inter_dim], gate(up) scale
-    std::optional<torch::Tensor> w1_lqq_scale,
-    std::optional<torch::Tensor> w1_lqq_zero,
+    std::optional<torch::Tensor> w1_lqq_scale,// [expert, inter_dim*2, model_dim/group_in_k_lqq] N,Klqq
+    std::optional<torch::Tensor> w1_lqq_zero,// [expert, inter_dim*2, model_dim/group_in_k_lqq] N,Klqq
     std::optional<torch::Tensor> fc2_smooth_scale,
     std::optional<torch::Tensor> fc2_scale,
     std::optional<torch::Tensor> sorted_weights);
