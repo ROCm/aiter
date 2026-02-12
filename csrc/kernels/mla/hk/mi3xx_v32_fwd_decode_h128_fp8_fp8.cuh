@@ -1853,49 +1853,6 @@ __device__ __forceinline__ void pack_4f32_to_fp8()
     }
 }
 
-template <bool kIsFirstIter, bool kCheckBoundary, uint32_t k_p_comp_begin, typename comp_t = float>
-__device__ __forceinline__ void softmax_p0(comp_t* p_row_max,
-                                           comp_t* p_rescale,
-                                           const uint32_t kv_tile_start,
-                                           const uint32_t kv_end,
-                                           const float softmax_scale)
-{
-    constexpr comp_t log2e = 1.4426950408889634;
-
-    const uint32_t lane_idx = ckt::get_lane_id();
-
-    // Element-wise scale. Boundary problem is handled here as well.
-    const uint32_t col_0_idx = lane_idx >> 4;
-    softmax_scale_p<kCheckBoundary, k_p_comp_begin>(
-        col_0_idx * 4 + kv_tile_start, kv_end, softmax_scale);
-
-    // Get max of row
-    comp_t local_max, tmp0, tmp1;
-    asm volatile("v_max3_f32 %1, v[%3], v[%4], v[%5]\n\t"
-                 "v_max3_f32 %2, v[%6], v[%7], v[%8]\n\t"
-                 "v_max_f32_e32 %0, v[%9], v[%10]\n\t"
-                 "v_max3_f32 %0, %1, %2, %0"
-                 : "=v"(local_max), "=v"(tmp0), "=v"(tmp1)
-                 : "n"(k_p_comp_begin),
-                   "n"(k_p_comp_begin + 1),
-                   "n"(k_p_comp_begin + 2),
-                   "n"(k_p_comp_begin + 3),
-                   "n"(k_p_comp_begin + 4),
-                   "n"(k_p_comp_begin + 5),
-                   "n"(k_p_comp_begin + 6),
-                   "n"(k_p_comp_begin + 7));
-
-    constexpr int32_t reduce_range = ckt::get_warp_size();
-    constexpr int32_t stop_stride  = ckt::get_warp_size() / 4 - 1;
-    local_max =
-        aiter::warpReduce<aiter::MaxFunctor, decltype(local_max), reduce_range, stop_stride>(
-            local_max);
-
-    const comp_t new_row_max = kIsFirstIter ? local_max : ckt::max(local_max, *p_row_max);
-    *p_rescale = kIsFirstIter ? 1.0f : __builtin_amdgcn_exp2f(((*p_row_max) - new_row_max) * log2e);
-    *p_row_max = new_row_max;
-}
-
 template <bool kIsFirstIter, uint32_t k_p_comp_begin, typename comp_t = float>
 __device__ __forceinline__ void
 softmax_p1(comp_t* p_row_sum_e, const comp_t new_row_max, const comp_t rescale)
@@ -1960,6 +1917,29 @@ softmax_p1(comp_t* p_row_sum_e, const comp_t new_row_max, const comp_t rescale)
     *p_row_sum_e = kIsFirstIter ? local_sum_e : (rescale * (*p_row_sum_e) + local_sum_e);
 }
 
+template <uint32_t GPR_START, typename comp_t>
+__device__ __forceinline__ comp_t max_8()
+{
+    static_assert(std::is_same_v<comp_t, float>, "comp_t must be float");
+
+    comp_t result, tmp0, tmp1;
+    asm volatile("v_max3_f32 %1, v[%3], v[%4], v[%5]\n\t"
+                 "v_max3_f32 %2, v[%6], v[%7], v[%8]\n\t"
+                 "v_max_f32_e32 %0, v[%9], v[%10]\n\t"
+                 "v_max3_f32 %0, %1, %2, %0"
+                 : "=v"(result), "=v"(tmp0), "=v"(tmp1)
+                 : "n"(GPR_START),
+                   "n"(GPR_START + 1),
+                   "n"(GPR_START + 2),
+                   "n"(GPR_START + 3),
+                   "n"(GPR_START + 4),
+                   "n"(GPR_START + 5),
+                   "n"(GPR_START + 6),
+                   "n"(GPR_START + 7));
+
+    return result;
+}
+
 template <typename T>
 __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
     amdgpu_num_vgpr(72))) void kn_mla_v32_fwd_decode_h128_fp8_fp8(HkMlaDecodeFwdParams<T> params)
@@ -1971,6 +1951,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
     using split_t = float; // format of temp split output and lse.
 
     using G = hk::group<T::kNumWarps>;
+
+    constexpr comp_t log2e = 1.4426950408889634;
 
     const int32_t worker_idx     = blockIdx.x;
     const int32_t work_start_idx = __builtin_amdgcn_readfirstlane(params.p_work_indptr[worker_idx]);
@@ -2193,7 +2175,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 if constexpr(idx.value == 0)
                 {
                     hk::mma_ABt(p_comp, kv_0, q_0);
-                    __builtin_amdgcn_s_setprio(5);
+                    __builtin_amdgcn_s_setprio(15);
                 }
                 else
                 {
@@ -2231,7 +2213,11 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 asm volatile("s_waitcnt lgkmcnt(0)");
                 hk::mma_ABt(p_comp, kv_1, q_1, p_comp);
             });
-            __builtin_amdgcn_s_setprio(3);
+            __builtin_amdgcn_s_setprio(14);
+
+            // Transpose V
+            v8ui v;
+            kv_manager.load_v_to_gpr(&v, warp_idx, p_lds_kv_curr);
 
             if constexpr((kIsLastIter == false) && (kCheckBoundaryNext == false))
             {
@@ -2254,39 +2240,50 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 }
             }
 
-            float rescale;
-            softmax_p0<kIsFirstIter, kCheckBoundary, k_p_comp_begin>(
-                &row_max, &rescale, kv_tile_start, kv_end, params.softmax_scale);
+            // Element-wise scale. Boundary problem is handled here as well.
+            const uint32_t col_0_idx = lane_idx >> 4;
+            softmax_scale_p<kCheckBoundary, k_p_comp_begin>(
+                col_0_idx * 4 + kv_tile_start, kv_end, params.softmax_scale);
+
+            // Get max of row interleaveing with transposing V
+            comp_t local_max = max_8<k_p_comp_begin, comp_t>();
+
+            asm volatile("s_waitcnt lgkmcnt(0)"); // Wait for un-transposed V to be loaded
+            __builtin_amdgcn_sched_barrier(
+                0); // For avoiding conflict between ds_bpermute and ds_read.
+
+            constexpr int32_t reduce_range = ckt::get_warp_size();
+            constexpr int32_t stop_stride  = ckt::get_warp_size() / 4 - 1;
+            local_max                      = aiter::
+                warpReduce<aiter::MaxFunctor, decltype(local_max), reduce_range, stop_stride>(
+                    local_max);
+            vt_manager.transpose_v(&v);
+
+            const comp_t new_row_max = kIsFirstIter ? local_max : ckt::max(local_max, row_max);
+            const comp_t rescale =
+                kIsFirstIter ? 1.0f : __builtin_amdgcn_exp2f((row_max - new_row_max) * log2e);
+            row_max = new_row_max;
+
             softmax_p1<kIsFirstIter, k_p_comp_begin>(&row_sum_e, row_max, rescale);
 
             // Prepare for output
             const uintptr_t p_lds_o    = kIsLastIter ? p_lds_kv_curr : 0;
             const float reci_row_sum_e = kIsLastIter ? (1.0f / row_sum_e) : .0f;
 
-            // Transpose V
-            v8ui v;
-            kv_manager.load_v_to_gpr(&v, warp_idx, p_lds_kv_curr);
-            __builtin_amdgcn_s_setprio(2);
-
-            // For hiding LDS load latency
-            if constexpr(kIsFirstIter == false)
-            {
-                hk::bin_map_pk2<0, 0, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 1, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 2, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 3, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 4, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 5, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 6, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 7, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-            }
-
-            asm volatile("s_waitcnt lgkmcnt(0)");
-            vt_manager.transpose_v(&v);
             vt_manager.store_transposed_v_to_lds(p_lds_vt, warp_idx, v);
 
             if constexpr(kIsFirstIter == false)
             {
+                __builtin_amdgcn_s_setprio(8);
+                hk::bin_map_pk2<0, 0, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 1, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 2, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 3, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                __builtin_amdgcn_s_setprio(7);
+                hk::bin_map_pk2<0, 4, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 5, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 6, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::bin_map_pk2<0, 7, hkm::mul_vgpr>(oaccu, oaccu, rescale);
                 __builtin_amdgcn_s_setprio(6);
                 hk::bin_map_pk2<0, 8, hkm::mul_vgpr>(oaccu, oaccu, rescale);
                 hk::bin_map_pk2<0, 9, hkm::mul_vgpr>(oaccu, oaccu, rescale);
@@ -2413,7 +2410,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 constexpr uint32_t kMfmaResultRows = 16;
                 if(lane_idx < kMfmaResultRows)
                 {
-                    constexpr comp_t inv_log2e = 1.0 / 1.4426950408889634;
+                    constexpr comp_t inv_log2e = 1.0 / log2e;
                     const uint32_t row_idx =
                         lane_idx % 16 + warp_idx * 16 + partial_qo_loc * T::kQoNumHead;
                     const comp_t lse = row_max + __builtin_amdgcn_logf(row_sum_e) * inv_log2e;
