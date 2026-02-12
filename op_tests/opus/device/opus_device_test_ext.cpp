@@ -12,7 +12,8 @@
  *                                                   "16x16x32_fp8", "16x16x32_bf8", ...
  *   opus_device_test.run_vector_add(A, B, Result)
  *   opus_device_test.run_async_load(Src, Dst)
- *   opus_device_test.run_dtype_convert(In, Out, variant)
+ *   opus_device_test.run_dtype_convert(In, Out, variant)  -- variant: "fp32_bf16", "fp32_fp16",
+ *                                                          "fp32_fp8", "fp32_fp4"
  */
 
 #include <torch/extension.h>
@@ -208,6 +209,10 @@ static void run_dtype_convert_torch(
         TORCH_CHECK(n % 4 == 0,
                      "For fp32_fp8, n must be a multiple of 4 (packed x4 conversion)");
         run_dtype_convert_fp32_fp8(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_fp4") {
+        TORCH_CHECK(n % 8 == 0,
+                     "For fp32_fp4, n must be a multiple of 8 (packed x8 conversion)");
+        run_dtype_convert_fp32_fp4(In.data_ptr(), Out.data_ptr(), n);
     } else {
         TORCH_CHECK(false, "Unknown dtype_convert variant: ", variant);
     }
@@ -225,5 +230,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "OPUS async_load: copy Src -> Dst through LDS (global->LDS->global)");
     m.def("run_dtype_convert", &run_dtype_convert_torch,
           "OPUS dtype round-trip: In(fp32) -> lowp -> Out(fp32). "
-          "variant: 'fp32_bf16', 'fp32_fp16', or 'fp32_fp8'");
+          "variant: 'fp32_bf16', 'fp32_fp16', 'fp32_fp8', or 'fp32_fp4'");
 }

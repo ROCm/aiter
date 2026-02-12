@@ -12,6 +12,7 @@ Covers:
   - vector_add (all GPUs)
   - async_load (all GPUs)
   - dtype_convert: FP32<->BF16, FP32<->FP16, FP32<->FP8 round-trips (all GPUs)
+  - dtype_convert: FP32<->FP4 (e2m1) round-trip (gfx950 only, packed x8)
 """
 
 import glob
@@ -410,7 +411,8 @@ def test_dtype_convert_fp32_fp16(mod):
     return 0
 
 
-_FP8_SUPPORTED_ARCHS = {"gfx942"}
+_FP8_SUPPORTED_ARCHS = {"gfx942", "gfx950"}
+_FP4_SUPPORTED_ARCHS = {"gfx950"}
 
 
 def test_dtype_convert_fp32_fp8(mod):
@@ -452,6 +454,53 @@ def test_dtype_convert_fp32_fp8(mod):
     return 0
 
 
+def test_dtype_convert_fp32_fp4(mod):
+    """Test FP32 -> FP4 (e2m1) -> FP32 round-trip via OPUS packed cast (gfx950 only)."""
+    arch = _get_gpu_arch()
+    if arch not in _FP4_SUPPORTED_ARCHS:
+        print(
+            f"  SKIP: dtype_convert fp32<->fp4 requires {_FP4_SUPPORTED_ARCHS}, got '{arch}'"
+        )
+        return 0
+
+    # n must be a multiple of BLOCK_SIZE * 8 = 2048
+    n = 1048576  # 1M elements
+    device = torch.device("cuda")
+
+    # FP4 E2M1 representable values (with scale=1.0):
+    #   ±{0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}
+    # Use exactly representable values so the round-trip is bit-exact.
+    fp4_values = torch.tensor(
+        [-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0,
+         0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        dtype=torch.float32,
+    )
+
+    torch.manual_seed(203)
+    indices = torch.randint(0, len(fp4_values), (n,))
+    In = fp4_values[indices].to(device=device)
+    Out = torch.empty(n, device=device, dtype=torch.float32)
+
+    mod.run_dtype_convert(In, Out, "fp32_fp4")
+
+    # Reference: input values are exactly representable in FP4,
+    # so the round-trip should be bit-exact.
+    Ref = In
+
+    ok = torch.equal(Out, Ref)
+    if not ok:
+        diff = (Out - Ref).abs()
+        max_diff = diff.max().item()
+        diff_count = diff.gt(0).sum().item()
+        print(
+            f"  FAIL: dtype_convert fp32<->fp4 max_diff={max_diff:.6e}, "
+            f"{diff_count}/{n} elements differ"
+        )
+        return 1
+    print(f"  PASS: dtype_convert fp32<->fp4 (n={n}), bit-exact")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -489,6 +538,7 @@ def main():
     failures += test_dtype_convert_fp32_bf16(mod)
     failures += test_dtype_convert_fp32_fp16(mod)
     failures += test_dtype_convert_fp32_fp8(mod)
+    failures += test_dtype_convert_fp32_fp4(mod)
 
     if failures:
         print(f"\n{failures} test(s) FAILED")

@@ -23,6 +23,11 @@ void run_dtype_convert_fp32_fp16(const void* d_in, void* d_out, int n);
 // n must be a multiple of 256 * 4 (uses packed x4 conversions).
 void run_dtype_convert_fp32_fp8(const void* d_in, void* d_out, int n);
 
+// FP32 <-> FP4 (e2m1) round-trip: convert fp32 input to fp4, then back to fp32.
+// d_in: device pointer to float input, d_out: device pointer to float output.
+// n must be a multiple of 256 * 8 (uses packed x8 conversions). gfx950 only.
+void run_dtype_convert_fp32_fp4(const void* d_in, void* d_out, int n);
+
 #ifdef __cplusplus
 }
 #endif
