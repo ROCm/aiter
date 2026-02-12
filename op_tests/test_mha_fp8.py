@@ -9,6 +9,7 @@ from aiter import per_tensor_quant
 import pytest
 import pandas as pd
 import argparse
+import math
 
 benchmark = {}
 
@@ -130,9 +131,19 @@ def test_flash_attn_output(
     )
     out_ref, us_fwd = run_ck(q, k, v, causal, window_size)
 
-    max_diff = (out - out_ref).abs().max().item()
+    abs_diff = (out - out_ref).abs()
+    max_diff = abs_diff.max().item()
+
+    # calcute nrms
+    square_diff = (abs_diff/out_ref.abs()).pow(2)
+    square_diff = torch.where(out_ref==0.0, 1.0, square_diff)
+    max_item = torch.max(out.abs().max(), out_ref.abs().max())
+    nrms = square_diff.sum().sqrt() / (math.sqrt(out_ref.numel())* max_item)
+
     print(f"Output max diff: {max_diff}")
+    print(f"Output nrms: {nrms}")
     assert max_diff < 0.055
+    assert nrms < 0.01
 
     fwd_flop = (
         batch_size

@@ -279,14 +279,14 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
     TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
 
-    std::string q_dtype_str;
+    std::string dtype_str;
     if (q_dtype == torch::kFloat16) {
-        q_dtype_str = "fp16";
+        dtype_str = "fp16";
     } else if (q_dtype == torch::kBFloat16) {
-        q_dtype_str = "bf16";
+        dtype_str = "bf16";
     } else if (is_qkv_fp8) {
         if (!out_.has_value() || out_.value().dtype() == torch::kBFloat16)
-            q_dtype_str = "fp8bf16"; // only support bf16 out for fp8
+            dtype_str = "fp8bf16"; // only support bf16 out for fp8
         else
             TORCH_CHECK(false, "For FP8 input, output must have dtype BF16 for now");
     }
@@ -307,6 +307,9 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
     TORCH_CHECK(q_descale_.has_value() == k_descale_.has_value() &&
                 k_descale_.has_value() == v_descale_.has_value(),
                 "q_descale, k_descale, v_descale must be all provided or all not provided");
+    if (is_qkv_fp8) {
+        TORCH_CHECK(q_descale_.has_value(), "q_descale, k_descale, v_descale must be provided for asm fp8");
+    }
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
@@ -381,17 +384,17 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
     CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
 
     auto opts = q.options();
-
+    auto out_type = dtype_str == "fp8bf16" ? torch::kBFloat16 : q.scalar_type();
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
-        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        TORCH_CHECK(out.dtype() == out_type, "For FP16/BF16 input, output must have the same dtype as inputs. For FP8 input, output must have dtype BF16");
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, total_q, num_heads, head_size_v);
     }
     else {
-        out = torch::empty({total_q, num_heads, head_size_v}, opts.dtype(q_dtype));
+        out = torch::empty({total_q, num_heads, head_size_v}, opts.dtype(out_type));
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -478,7 +481,7 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                 logits_soft_cap,
                 p_dropout,
                 drop_seed_offset,
-                q_dtype_str,
+                dtype_str,
                 bias_type,
                 how_v3_bf16_cvt);
 

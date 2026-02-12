@@ -94,35 +94,11 @@ void init_fmha_fwd_v3_args(fmha_fwd_v3_args& args,
     {
         tune_opt = 0;
     }
-    args.ptr_o   = a.o_ptr;
-    args.ptr_q   = a.q_ptr;
-    args.ptr_k   = a.k_ptr;
-    args.ptr_v   = a.v_ptr;
-    args.ptr_lse = a.lse_ptr;
-
-    args.scalar           = a.scale_s;
-    args.s_seq_len        = a.seqlen_q;
-    args.s_Seqs           = a.stride_q * 2;
-    args.s_Ts             = ts_qo * a.stride_q * 2;
-    args.s_Hs             = a.nhead_stride_q * 2;
-    args.s_Bs             = a.batch_stride_q * 2;
-    args.s_gqa            = a.nhead_q / a.nhead_k;
-    args.s_k_Seqs         = a.stride_k * 2;
-    args.s_k_Hs           = a.nhead_stride_k * 2;
-    args.s_k_Bs           = a.batch_stride_k * 2;
-    args.s_opt            = tune_opt;
-    args.s_lse            = a.has_lse ? 1 : 0;
-    args.s_kv_seq_len     = a.seqlen_k;
-    args.s_qk_head_dim    = a.hdim_q;
-    args.s_v_head_dim     = a.hdim_v;
-    args.s_q_head_num     = a.nhead_q;
-    args.s_v_Seqs         = a.stride_v * 2;
-    args.s_v_Hs           = a.nhead_stride_v * 2;
-    args.s_v_Bs           = a.batch_stride_v * 2;
-    args.s_o_Seqs         = a.stride_o * 2;
-    args.s_o_Hs           = a.nhead_stride_o * 2;
-    args.s_o_Bs           = a.batch_stride_o * 2;
-    args.s_lse_Hs         = a.nhead_stride_lse * 4;
+    args.ptr_o            = a.o_ptr;
+    args.ptr_q            = a.q_ptr;
+    args.ptr_k            = a.k_ptr;
+    args.ptr_v            = a.v_ptr;
+    args.ptr_lse          = a.lse_ptr;
     args.ptr_qseq         = nullptr;
     args.ptr_kseq         = nullptr;
     args.ptr_qseq_padding = nullptr;
@@ -130,6 +106,46 @@ void init_fmha_fwd_v3_args(fmha_fwd_v3_args& args,
     args.ptr_q_descale    = nullptr;
     args.ptr_k_descale    = nullptr;
     args.ptr_v_descale    = nullptr;
+
+    int in_bpe = 2;
+    int out_bpe = 2;
+    if(a.data_type == "fp8bf16")
+    {
+        in_bpe = 1;
+        args.ptr_q_descale = a.q_descale_ptr;
+        args.ptr_k_descale = a.k_descale_ptr;
+        args.ptr_v_descale = a.v_descale_ptr;
+        args.s_descale_q_Bs = a.batch_stride_q_descale * 4;
+        args.s_descale_q_Hs = a.nhead_stride_q_descale * 4;
+        args.s_descale_k_Bs = a.batch_stride_k_descale * 4;
+        args.s_descale_k_Hs = a.nhead_stride_k_descale * 4;
+        args.s_descale_v_Bs = a.batch_stride_v_descale * 4;
+        args.s_descale_v_Hs = a.nhead_stride_v_descale * 4;
+    }
+
+    args.scalar           = a.scale_s;
+    args.s_seq_len        = a.seqlen_q;
+    args.s_Seqs           = a.stride_q * in_bpe;
+    args.s_Ts             = ts_qo * a.stride_q * in_bpe;
+    args.s_Hs             = a.nhead_stride_q * in_bpe;
+    args.s_Bs             = a.batch_stride_q * in_bpe;
+    args.s_gqa            = a.nhead_q / a.nhead_k;
+    args.s_k_Seqs         = a.stride_k * in_bpe;
+    args.s_k_Hs           = a.nhead_stride_k * in_bpe;
+    args.s_k_Bs           = a.batch_stride_k * in_bpe;
+    args.s_opt            = tune_opt;
+    args.s_lse            = a.has_lse ? 1 : 0;
+    args.s_kv_seq_len     = a.seqlen_k;
+    args.s_qk_head_dim    = a.hdim_q;
+    args.s_v_head_dim     = a.hdim_v;
+    args.s_q_head_num     = a.nhead_q;
+    args.s_v_Seqs         = a.stride_v * in_bpe;
+    args.s_v_Hs           = a.nhead_stride_v * in_bpe;
+    args.s_v_Bs           = a.batch_stride_v * in_bpe;
+    args.s_o_Seqs         = a.stride_o * out_bpe;
+    args.s_o_Hs           = a.nhead_stride_o * out_bpe;
+    args.s_o_Bs           = a.batch_stride_o * out_bpe;
+    args.s_lse_Hs         = a.nhead_stride_lse * 4;
     // batch mode does not support padded
     if(a.is_group_mode)
     {
@@ -151,21 +167,6 @@ void init_fmha_fwd_v3_args(fmha_fwd_v3_args& args,
         {
             args.ptr_qseq = a.seqstart_q_ptr;
         }
-    }
-    if(a.data_type == "fp8bf16")
-    {
-        // args.ptr_q_descale = a.q_descale_ptr;
-        // args.ptr_k_descale = a.k_descale_ptr;
-        // args.ptr_v_descale = a.v_descale_ptr;
-        args.ptr_q_descale = a.q_ptr;
-        args.ptr_k_descale = a.k_ptr;
-        args.ptr_v_descale = a.v_ptr;
-        args.s_descale_q_Bs = a.batch_stride_q_descale;
-        args.s_descale_q_Hs = a.nhead_stride_q_descale;
-        args.s_descale_k_Bs = a.batch_stride_k_descale;
-        args.s_descale_k_Hs = a.nhead_stride_k_descale;
-        args.s_descale_v_Bs = a.batch_stride_v_descale;
-        args.s_descale_v_Hs = a.nhead_stride_v_descale;
     }
 }
 

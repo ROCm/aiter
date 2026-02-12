@@ -1267,6 +1267,7 @@ def _flash_attn_forward(
         ret = ret and (q_descale is not None)
         # support per tensor and per head quant scale
         # ret = ret and (q_descale.dim() == 2 and q_descale.shape == (batch_size, nhead_k))
+        return False
         return ret
 
     def can_impl_fmha_v3_fwd():
@@ -1280,7 +1281,6 @@ def _flash_attn_forward(
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
         ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
-        return False
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -1297,7 +1297,7 @@ def _flash_attn_forward(
     _validate_cu("cu_seqlens_q", cu_seqlens_q)
     _validate_cu("cu_seqlens_kv", cu_seqlens_kv)
 
-    if can_impl_fmha_v3_fwd() and seqlen_q > 128:  # Prefer CK for decode cases
+    if can_impl_fmha_v3_fwd():  # Prefer CK for decode cases
         out, softmax_lse, S_dmask, rng_state = fmha_v3_fwd(
             q,
             k,
@@ -1313,6 +1313,9 @@ def _flash_attn_forward(
             None,
             bias,
             alibi_slopes,
+            q_descale,
+            k_descale,
+            v_descale,
             None,
         )
     else:
@@ -2026,7 +2029,6 @@ def _flash_attn_varlen_forward(
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
         ret = ret and logits_soft_cap == 0.0
-        return False
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -2055,6 +2057,9 @@ def _flash_attn_varlen_forward(
             block_table,
             bias,
             alibi_slopes,
+            q_descale,
+            k_descale,
+            v_descale,
             None,
             cu_seqlens_q_padded,
             cu_seqlens_k_padded,
