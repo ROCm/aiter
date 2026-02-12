@@ -48,6 +48,7 @@ def _sage_fwd_no_mask(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     PRE_LOAD_V: tl.constexpr,
+    USE_BIAS: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     PADDED_HEAD_QK: tl.constexpr,
     PADDED_HEAD_V: tl.constexpr,
@@ -90,15 +91,14 @@ def _sage_fwd_no_mask(
 
         # -- compute qk ----
         qk += tl.dot(q, k) * (q_descale * k_descale)
-        # qk_scaled = qk * SM_SCALE
-        qk_scaled = qk
+
         if USE_ALIBI:
             # compute the global position of each token within the sequence
             q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
             alibi_block = compute_alibi_block(
                 alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
             )
-            qk_scaled += alibi_block
+            qk += alibi_block
 
         # compute qk mask
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
@@ -107,15 +107,18 @@ def _sage_fwd_no_mask(
         if bias_base_ptrs is not None:
             bias_ptrs = bias_base_ptrs + start_n * stride_bn
             bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-            qk_scaled += bias
+            qk += bias
 
         # get max scores so far
-        m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
 
         # scale and subtract max
-        q_shifted = tl.where(
-            m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
-        )
+        if USE_BIAS:
+            q_shifted = tl.where(
+                m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
+            )
+        else:
+            q_shifted = qk - m_ij[:, None]
 
         # Compute scaled QK and softmax probabilities
         if USE_EXP2:
@@ -175,7 +178,10 @@ def _sage_fwd_no_mask(
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
         # store the diff in maxes to adjust acc and li as we discover new maxes
-        m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
+        if USE_BIAS:
+            m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
+        else:
+            m_diff = m_i - m_ij
         if USE_EXP2:
             # alpha = tl.math.exp2(m_diff * RCP_LN2)
             alpha = tl.math.exp2(m_diff)
@@ -299,8 +305,6 @@ def _sage_fwd_mask(
 
         # -- compute qk ----
         qk += tl.dot(q, k) * (q_descale * k_descale)
-        # qk_scaled = qk * SM_SCALE
-        qk_scaled = qk
 
         if USE_ALIBI:
             # compute the global position of each token within the sequence
@@ -308,7 +312,7 @@ def _sage_fwd_mask(
             alibi_block = compute_alibi_block(
                 alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
             )
-            qk_scaled += alibi_block
+            qk += alibi_block
 
         if USE_SLIDING_WINDOW:
             if IS_CAUSAL:
@@ -350,7 +354,7 @@ def _sage_fwd_mask(
                 mask = causal_mask | window_mask
 
                 # Apply mask
-                qk_scaled = tl.where(mask, float("-inf"), qk_scaled)
+                qk = tl.where(mask, float("-inf"), qk)
             else:
                 # ========== NON-CAUSAL SLIDING WINDOW MASKING ==========
                 # Exactly matching reference construct_local_mask:
@@ -397,12 +401,12 @@ def _sage_fwd_mask(
                     )
 
                 # Apply mask (set to -inf where mask is True)
-                qk_scaled = tl.where(mask, float("-inf"), qk_scaled)
+                qk = tl.where(mask, float("-inf"), qk)
         else:
             if IS_CAUSAL:
                 causal_boundary = start_n + offs_n - seqlen_delta_qk
                 causal_mask = offs_m[:, None] >= causal_boundary[None, :]
-                qk_scaled = tl.where(causal_mask, qk_scaled, float("-inf"))
+                qk = tl.where(causal_mask, qk, float("-inf"))
 
         # compute qk mask
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
@@ -411,23 +415,23 @@ def _sage_fwd_mask(
         if bias_base_ptrs is not None:
             bias_ptrs = bias_base_ptrs + start_n * stride_bn
             bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-            qk_scaled += bias
+            qk += bias
 
         # get max scores so far
-        m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
 
         # scale and subtract max
         # IMPORTANT: Handle the case where all values are -inf
-        # When m_ij = -inf and qk_scaled = -inf, subtraction gives NaN
+        # When m_ij = -inf and qk = -inf, subtraction gives NaN
         # We need to handle this explicitly
         if USE_SLIDING_WINDOW:
             # Check if this block has any valid values (m_ij != -inf)
             # For rows where everything is -inf, set q_shifted to -inf (not NaN)
             q_shifted = tl.where(
-                m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
+                m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
             )
         else:
-            q_shifted = qk_scaled - m_ij[:, None]
+            q_shifted = qk - m_ij[:, None]
 
         # Compute scaled QK and softmax probabilities
         if USE_EXP2:
@@ -582,7 +586,7 @@ def compute_window_bounds(
 
     # Right boundary
     if IS_CAUSAL:
-        # Causal cap: col <= row + diag
+        # Causal cap: col ≤ row + diag
         right_min = tl.minimum(seqlen_k - 1, q_start + diag)
         right_max = tl.minimum(seqlen_k - 1, q_end + diag)
     else:
@@ -654,14 +658,14 @@ def handle_padded_last_block(
         # current 'full' range right edge
         full_right_block = clipped_left + n_full_blocks - 1
 
-        # If last_block is already beyond full_right_block, it's already in back-masked -> nothing to do
+        # If last_block is already beyond full_right_block, it's already in back-masked → nothing to do
         last_already_back_masked = last_block > full_right_block
         if not last_already_back_masked:
             # If the window starts past last_block, it was counted in front-masked
             if clipped_left > last_block:
                 n_front_masked_blocks = tl.maximum(0, n_front_masked_blocks - 1)
             else:
-                # Otherwise it was counted 'full' -> move it out of full
+                # Otherwise it was counted 'full' → move it out of full
                 n_full_blocks = tl.maximum(0, n_full_blocks - 1)
             # In both cases we need one more back-masked block
             n_back_masked_blocks = n_back_masked_blocks + 1
@@ -678,7 +682,7 @@ def compute_padding_info(seqlen_k, BLOCK_N: tl.constexpr):
     # K blocks visualization:
     #         Block 0         Block 1         Block 2 (last)
     #         K0 K1 K2 K3    K4 K5 K6 K7     K8 K9 ?? ??
-    #         ?---------?    ?---------?     ?---? ?---?
+    #         ↑---------↑    ↑---------↑     ↑---↑ ↑---↑
     #         full block     full block      valid  pad
     if seqlen_k < BLOCK_N:
         n_extra_tokens = BLOCK_N - seqlen_k
@@ -731,7 +735,7 @@ def compute_block_masking(
             IS_CAUSAL,
         )
 
-        # window vanishes -> early exit
+        # window vanishes → early exit
         if right_max < left_min:
             return 0, 0, 0, 0, n_extra_tokens
 
@@ -770,16 +774,16 @@ def compute_block_masking(
             # ========== CAUSAL MODE: Classify K Blocks ==========
             # Calculate causal boundary for this Q block
             #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9 ?? ??]
-            # Q0-Q3:   [ 1  0  0  0] [ 0  0  0  0] [ 0  0 -- --]  <- Q0
-            #          [ 1  1  0  0] [ 0  0  0  0] [ 0  0 -- --]  <- Q1
-            #          [ 1  1  1  0] [ 0  0  0  0] [ 0  0 -- --]  <- Q2
-            #          [ 1  1  1  1] [ 1  1  0  0] [ 0  0 -- --]  <- Q3
-            #                            ? can see up to K5
+            # Q0-Q3:   [ 1  0  0  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q0
+            #          [ 1  1  0  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q1
+            #          [ 1  1  1  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q2
+            #          [ 1  1  1  1] [ 1  1  0  0] [ 0  0 -- --]  ← Q3
+            #                            ↑ can see up to K5
             #
-            # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  0] [ 0  0 -- --]  <- Q4
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 0  0 -- --]  <- Q5
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  0 -- --]  <- Q6
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -- --]  <- Q7
+            # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  0] [ 0  0 -- --]  ← Q4
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 0  0 -- --]  ← Q5
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  0 -- --]  ← Q6
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -- --]  ← Q7
 
             # ------------------------------------------------------------
             # 1. figure out, in tokens, the right-most K position
@@ -787,7 +791,7 @@ def compute_block_masking(
             # ------------------------------------------------------------
             k_max_token = q_end + diag  # last visible K index
 
-            # this Q-block is entirely above the diagonal => nothing to do
+            # this Q-block is entirely above the diagonal ⇒ nothing to do
             if k_max_token < 0:
                 return 0, 0, 0, 0, n_extra_tokens
 
@@ -801,12 +805,12 @@ def compute_block_masking(
 
             # ------------------------------------------------------------
             # 3. classify those visible blocks
-            #    - we *never* skip or mask blocks in front, because causal
+            #    – we *never* skip or mask blocks in front, because causal
             #      attention always starts at K0
-            #    - the back side can require several masked blocks:
-            #         o intersection of the causal diagonal with K-grid
-            #           (at most  ?BLOCK_M / BLOCK_N? blocks)
-            #         o plus one extra block if this Q-block stops in the
+            #    – the back side can require several masked blocks:
+            #         • intersection of the causal diagonal with K-grid
+            #           (at most  ⌈BLOCK_M / BLOCK_N⌉ blocks)
+            #         • plus one extra block if this Q-block stops in the
             #           middle of a K-block or the last K-block is padded
             # ------------------------------------------------------------
             padded_last_k = n_extra_tokens != 0
@@ -823,15 +827,15 @@ def compute_block_masking(
             # Without causal mask, all positions can attend to all positions
             # Only need to handle the padding in the last block
             #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9 ?? ??]
-            # Q0-Q3:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
+            # Q0-Q3:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
             #
-            # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
+            # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
 
             n_front_skip_blocks = 0  # never skips the left side
             n_front_masked_blocks = 0  # ditto
@@ -916,7 +920,6 @@ def sage_fwd(
     MAX_SEQLENS_Q: tl.constexpr,
     MAX_SEQLENS_K: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    SM_SCALE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     USE_SLIDING_WINDOW: tl.constexpr,
     WINDOW_SIZE_LEFT: tl.constexpr,
@@ -960,12 +963,9 @@ def sage_fwd(
     tl.multiple_of(offs_n, BLOCK_N),
 
     # D dimensions (MOST IMPORTANT)
-    offs_d_qk = tl.arange(0, BLOCK_DMODEL_QK)
     offs_d_qk = tl.max_contiguous(
         tl.multiple_of(offs_d_qk, BLOCK_DMODEL_QK), BLOCK_DMODEL_QK
     )
-
-    offs_d_v = tl.arange(0, BLOCK_DMODEL_V)
     offs_d_v = tl.max_contiguous(
         tl.multiple_of(offs_d_v, BLOCK_DMODEL_V), BLOCK_DMODEL_V
     )
@@ -1246,6 +1246,7 @@ def sage_fwd(
             BLOCK_M,
             BLOCK_N,
             PRE_LOAD_V,
+            USE_BIAS,
             ENABLE_DROPOUT,
             PADDED_HEAD_QK,
             PADDED_HEAD_V,

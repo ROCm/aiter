@@ -464,7 +464,6 @@ def fav3_sage_func(
         ACTUAL_BLOCK_DMODEL_V=head_size_v,
         MAX_SEQLENS_Q=seqlen_q,
         MAX_SEQLENS_K=seqlen_k,
-        SM_SCALE=softmax_scale,
         IS_CAUSAL=causal,
         USE_SLIDING_WINDOW=use_sliding_window,
         WINDOW_SIZE_LEFT=window_size_left,
