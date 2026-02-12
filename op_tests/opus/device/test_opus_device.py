@@ -249,8 +249,18 @@ def test_dtype_convert_fp32_fp16(mod):
     return 0
 
 
+_FP8_SUPPORTED_ARCHS = {"gfx942"}
+
+
 def test_dtype_convert_fp32_fp8(mod):
-    """Test FP32 -> FP8 (e4m3) -> FP32 round-trip via OPUS packed cast."""
+    """Test FP32 -> FP8 (e4m3fnuz) -> FP32 round-trip via OPUS packed cast (gfx942 only)."""
+    arch = _get_gpu_arch()
+    if arch not in _FP8_SUPPORTED_ARCHS:
+        print(
+            f"  SKIP: dtype_convert fp32<->fp8 requires {_FP8_SUPPORTED_ARCHS}, got '{arch}'"
+        )
+        return 0
+
     # n must be a multiple of BLOCK_SIZE * 4 = 1024
     n = 1048576  # 1M elements
     device = torch.device("cuda")

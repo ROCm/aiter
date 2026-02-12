@@ -5,9 +5,9 @@
  * @file test_dtype_convert.cu
  * @brief Unit test kernels for OPUS data type conversion functions.
  *
- * Tests round-trip conversions:
- *   1. FP32 -> BF16 -> FP32  (opus::fp32_to_bf16, opus::bf16_to_fp32)
- *   2. FP32 -> FP16 -> FP32  (opus::fp32_to_fp16, opus::fp16_to_fp32)
+ * Tests round-trip conversions using opus::cast<> API:
+ *   1. FP32 -> BF16 -> FP32  (opus::cast<bf16_t>, opus::cast<fp32_t>)
+ *   2. FP32 -> FP16 -> FP32  (opus::cast<fp16_t>, opus::cast<fp32_t>)
  *   3. FP32 -> FP8  -> FP32  (opus::cast<fp8_t>(fp32x4), opus::cast<fp32_t>(fp8x4))
  *
  * Each kernel reads fp32 input, converts down, converts back, writes fp32 output.
@@ -39,8 +39,8 @@ __global__ void dtype_convert_fp32_bf16_kernel(const float* __restrict__ in,
     if (gid >= n) return;
 
     opus::fp32_t val = in[gid];
-    opus::bf16_t tmp = opus::fp32_to_bf16(val);
-    out[gid] = opus::bf16_to_fp32(tmp);
+    opus::bf16_t tmp = opus::cast<opus::bf16_t>(val);
+    out[gid] = opus::cast<opus::fp32_t>(tmp);
 }
 
 extern "C" void run_dtype_convert_fp32_bf16(const void* d_in, void* d_out, int n)
@@ -67,8 +67,8 @@ __global__ void dtype_convert_fp32_fp16_kernel(const float* __restrict__ in,
     if (gid >= n) return;
 
     opus::fp32_t val = in[gid];
-    opus::fp16_t tmp = opus::fp32_to_fp16(val);
-    out[gid] = opus::fp16_to_fp32(tmp);
+    opus::fp16_t tmp = opus::cast<opus::fp16_t>(val);
+    out[gid] = opus::cast<opus::fp32_t>(tmp);
 }
 
 extern "C" void run_dtype_convert_fp32_fp16(const void* d_in, void* d_out, int n)
