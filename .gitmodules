@@ -3,4 +3,4 @@
 	url = https://github.com/ROCm/composable_kernel.git
 [submodule "3rdparty/HipKittens"]
 	path = 3rdparty/HipKittens
-	url = git@github.com:ruanjm/HipKittens.git
+	url = https://github.com/ruanjm/HipKittens.git
