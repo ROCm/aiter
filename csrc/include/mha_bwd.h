@@ -1,6 +1,6 @@
 #pragma once
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 // Include these 2 headers instead of torch/extension.h since we don't need all of the torch
 // headers.
@@ -13,7 +13,6 @@ namespace aiter {
 struct mha_bwd_args
 {
     // aiter args
-    int mask_type; // 0: no mask   1: top_left_causal   2: bottom_right_causal   3: sliding_window
     bool use_asm_v3;
     bool v3_atomic_fp32;
     int v3_bf16_cvt;
@@ -24,7 +23,7 @@ struct mha_bwd_args
     int hdim_v;
     std::string data_type;
     bool is_group_mode;
-    int ck_mask_type;
+    int mask_type;
     int bias_type; // 0:no bias, 1:elementwise bias, 2:alibi. sync with BlockAttentionBiasEnum
     bool has_dbias;
     bool has_dropout;

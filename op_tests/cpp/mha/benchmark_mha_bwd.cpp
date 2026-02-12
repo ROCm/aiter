@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2018-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "ck_tile/host.hpp"
 #include "mha_bwd.h"
 #include "utils.hpp"
@@ -506,32 +506,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
                   << " MByte memory workspace allocated" << std::endl;
     }
 
-    auto get_mask_type = [&]() {
-        if(mask.type == mask_enum::no_mask)
-        {
-            return 0;
-        }
-        else
-        {
-            if(mask.type == mask_enum::window_generic)
-            {
-                assert(false);
-                return 0;
-            }
-            else
-            {
-                if((mask.left == -1) && (mask.right == 0))
-                {
-                    return (mask.type == mask_enum::mask_top_left) ? 1 : 2;
-                }
-                else
-                {
-                    return 3;
-                }
-            }
-        }
-    };
-
     auto mha_args = [&]() {
         assert(nhead % nhead_k == 0);
         /// NOTE: we broadcast bias from [1, 1, seqlen_q, seqlen_k] to [batch, nhead, seqlen_q,
@@ -590,8 +564,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
             }
         }();
 
-        return aiter::mha_bwd_args{get_mask_type(),
-                                   bwd_v3,
+        return aiter::mha_bwd_args{bwd_v3,
                                    v3_atomic_fp32,
                                    v3_bf16_cvt,
                                    v3_api_check,
