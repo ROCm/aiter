@@ -73,7 +73,7 @@ for file in "${sharded_files[@]}"; do
         echo
         echo "--------------------"
         echo "${status}: $file"
-        echo "⏱ Time elapsed: ${elapsed_s} seconds"
+        echo "⏱ Time elapsed of $file: ${elapsed_s} seconds"
         echo "--------------------"
         echo
     } | tee -a latest_test.log
