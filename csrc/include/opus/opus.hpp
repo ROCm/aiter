@@ -1515,19 +1515,15 @@ template<typename T> constexpr bool is_mem_v = is_gmem_v<T> || is_smem_v<T>;
 
 template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_mem_v<Mem>, bool> = true>
 OPUS_D auto load(Mem& mem, Args&&... args) { return mem.template load<vec>(std::forward<Args>(args)...); }
-
 template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_mem_v<Mem>, bool> = true>
 OPUS_D void store(Mem& mem, Args&&... args) { mem.template store<vec>(std::forward<Args>(args)...); }
-
-template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_mem_v<Mem>, bool> = true>
-OPUS_D auto load_if(Mem& mem, Args&&... args) { return mem.template load_if<vec>(std::forward<Args>(args)...); }
-
-template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_mem_v<Mem>, bool> = true>
-OPUS_D void store_if(Mem& mem, Args&&... args) { mem.template store_if<vec>(std::forward<Args>(args)...); }
-
 template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_gmem_v<Mem>, bool> = true>
 OPUS_D void async_load(Mem& mem, Args&&... args) { mem.template async_load<vec>(std::forward<Args>(args)...); }
 
+template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_mem_v<Mem>, bool> = true>
+OPUS_D auto load_if(Mem& mem, Args&&... args) { return mem.template load_if<vec>(std::forward<Args>(args)...); }
+template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_mem_v<Mem>, bool> = true>
+OPUS_D void store_if(Mem& mem, Args&&... args) { mem.template store_if<vec>(std::forward<Args>(args)...); }
 template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_gmem_v<Mem>, bool> = true>
 OPUS_D void async_load_if(Mem& mem, Args&&... args) { mem.template async_load_if<vec>(std::forward<Args>(args)...); }
 
