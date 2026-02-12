@@ -907,6 +907,11 @@ def sage_fwd(
     cu_seqlens_k,
     seqused_q,
     seqused_k,  # Add seqused parameters
+    block_ranges,
+    max_block_ranges_tensor,
+    stride_br_z,
+    stride_br_m,
+    stride_br_r,
     dropout_p,
     philox_seed,
     philox_offset_base,
@@ -933,6 +938,7 @@ def sage_fwd(
     USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
     USE_SEQUSED: tl.constexpr,
+    USE_BLOCK_SPARSE: tl.constexpr,
 ):
     # set params
     ACCUMULATOR_TYPE = tl.float32  # for q*k product
@@ -1011,29 +1017,45 @@ def sage_fwd(
         seqlen_k = MAX_SEQLENS_K
 
     # figure out masking pattern
-    (
-        n_front_skip_blocks,
-        n_front_masked_blocks,
-        n_full_blocks,
-        n_back_masked_blocks,
-        n_extra_tokens,
-    ) = compute_block_masking(
-        seqlen_k,
-        seqlen_q,
-        start_m,
-        IS_CAUSAL,
-        USE_SLIDING_WINDOW,
-        WINDOW_SIZE_LEFT,
-        WINDOW_SIZE_RIGHT,
-        BLOCK_M,
-        BLOCK_N,
-    )
+    if USE_BLOCK_SPARSE:
+        total_k_blocks = tl.cdiv(seqlen_k, BLOCK_N)
+        max_block_ranges = tl.load(max_block_ranges_tensor)
+        n_extra_tokens = compute_padding_info(seqlen_k, BLOCK_N)
+        br_base = block_ranges + off_z * stride_br_z + start_m * stride_br_m
+        first_start = tl.load(br_base)
+        has_any_range = first_start >= 0
+    else:
+        (
+            n_front_skip_blocks,
+            n_front_masked_blocks,
+            n_full_blocks,
+            n_back_masked_blocks,
+            n_extra_tokens,
+        ) = compute_block_masking(
+            seqlen_k,
+            seqlen_q,
+            start_m,
+            IS_CAUSAL,
+            USE_SLIDING_WINDOW,
+            WINDOW_SIZE_LEFT,
+            WINDOW_SIZE_RIGHT,
+            BLOCK_M,
+            BLOCK_N,
+        )
+        total_k_blocks = tl.cdiv(seqlen_k, BLOCK_N)
+        has_any_range = True  # unused in this branch
 
     # ============================================================
     #          PROGRAM EARLY EXIT (All K Blocks Skipped)
     # ============================================================
-    total_visible_blocks = n_front_masked_blocks + n_full_blocks + n_back_masked_blocks
-    if total_visible_blocks == 0:
+    if not USE_BLOCK_SPARSE:
+        total_visible_blocks = n_front_masked_blocks + n_full_blocks + n_back_masked_blocks
+    # Early exit: no K blocks to process
+    if USE_BLOCK_SPARSE:
+        _no_blocks = not has_any_range
+    else:
+        _no_blocks = total_visible_blocks == 0
+    if _no_blocks:
         """
         No K blocks visible - write zeros and exit.
         """
@@ -1135,13 +1157,15 @@ def sage_fwd(
         q_ptrs_mask = q_ptrs_mask & (offs_d_qk[None, :] < ACTUAL_BLOCK_DMODEL_QK)
     q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
 
-    # ========== Process MASKED K Blocks in the front ==========
-    # NOTE: we use USE_SLIDING_WINDOW as guard because the compiler will crash other wise. front masking is only for sliding window so that is fine.
-    if n_front_masked_blocks > 0 and USE_SLIDING_WINDOW:
-        block_min = n_front_skip_blocks * BLOCK_N
-        block_max = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
+    # ========== Process K Blocks: either three-phase (causal/window) or block-sparse ranges ==========
+    if not USE_BLOCK_SPARSE:
+        # ========== Process MASKED K Blocks in the front ==========
+        # NOTE: we use USE_SLIDING_WINDOW as guard because the compiler will crash other wise. front masking is only for sliding window so that is fine.
+        if n_front_masked_blocks > 0 and USE_SLIDING_WINDOW:
+            block_min = n_front_skip_blocks * BLOCK_N
+            block_max = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
 
-        k_descale_ptr = k_descale_offset + n_front_skip_blocks * stride_ksblk
+            k_descale_ptr = k_descale_offset + n_front_skip_blocks * stride_ksblk
 
         acc, l_i, m_i = _sage_fwd_mask(
             acc,
@@ -1197,17 +1221,17 @@ def sage_fwd(
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
         )
 
-    # ========== Process FULL K Blocks (Fast Path) ==========
-    if n_full_blocks > 0:
-        block_min = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
-        block_max = (
-            n_front_skip_blocks + n_front_masked_blocks + n_full_blocks
-        ) * BLOCK_N
+        # ========== Process FULL K Blocks (Fast Path) ==========
+        if n_full_blocks > 0:
+            block_min = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
+            block_max = (
+                n_front_skip_blocks + n_front_masked_blocks + n_full_blocks
+            ) * BLOCK_N
 
-        k_descale_ptr = (
-            k_descale_offset
-            + (n_front_skip_blocks + n_front_masked_blocks) * stride_ksblk
-        )
+            k_descale_ptr = (
+                k_descale_offset
+                + (n_front_skip_blocks + n_front_masked_blocks) * stride_ksblk
+            )
 
         acc, l_i, m_i = _sage_fwd_no_mask(
             acc,
@@ -1257,23 +1281,23 @@ def sage_fwd(
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
         )
 
-    # ========== Process MASKED K Blocks in the back ==========
-    if n_back_masked_blocks > 0:
-        block_min = (
-            n_front_skip_blocks + n_front_masked_blocks + n_full_blocks
-        ) * BLOCK_N
-        block_max = (
-            n_front_skip_blocks
-            + n_front_masked_blocks
-            + n_full_blocks
-            + n_back_masked_blocks
-        ) * BLOCK_N
+        # ========== Process MASKED K Blocks in the back ==========
+        if n_back_masked_blocks > 0:
+            block_min = (
+                n_front_skip_blocks + n_front_masked_blocks + n_full_blocks
+            ) * BLOCK_N
+            block_max = (
+                n_front_skip_blocks
+                + n_front_masked_blocks
+                + n_full_blocks
+                + n_back_masked_blocks
+            ) * BLOCK_N
 
-        k_descale_ptr = (
-            k_descale_offset
-            + (n_front_skip_blocks + n_front_masked_blocks + n_full_blocks)
-            * stride_ksblk
-        )
+            k_descale_ptr = (
+                k_descale_offset
+                + (n_front_skip_blocks + n_front_masked_blocks + n_full_blocks)
+                * stride_ksblk
+            )
 
         acc, l_i, m_i = _sage_fwd_mask(
             acc,

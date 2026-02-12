@@ -7,6 +7,11 @@ import numpy as np
 import math
 from aiter.test_mha_common import (
     attention_ref,
+    attention_ref_block_sparse,
+)
+from aiter.ops.triton.attention.fav3_sage import (
+    fav3_sage_wrapper_func,
+    get_sage_fwd_configs,
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.attention.fav3_sage import fav3_sage_wrapper_func
