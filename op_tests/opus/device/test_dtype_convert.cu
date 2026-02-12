@@ -30,7 +30,14 @@
 } while(0)
 
 // ---------------------------------------------------------------------------
-// FP32 <-> BF16 round-trip
+// FP32 <-> BF16 round-trip (round-to-nearest-even on all architectures)
+//
+// FP32 -> BF16 rounding behaviour differs by GPU architecture:
+//   gfx942: opus::cast<bf16_t>(val) defaults to truncation (rm=2).
+//           Pass 0_I as 2nd argument to force round-to-nearest-even (RNE).
+//   gfx950: opus::cast<bf16_t>(val) uses hardware RNE by default,
+//           no 2nd argument needed.
+// Both paths produce the same numerical result (IEEE 754 RNE).
 // ---------------------------------------------------------------------------
 template<int BLOCK_SIZE>
 __global__ void dtype_convert_fp32_bf16_kernel(const float* __restrict__ in,
@@ -40,8 +47,15 @@ __global__ void dtype_convert_fp32_bf16_kernel(const float* __restrict__ in,
     int gid = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     if (gid >= n) return;
 
+    using opus::operator""_I;
     opus::fp32_t val = in[gid];
+#if defined(__gfx942__) || defined(__gfx9_4_generic__)
+    // gfx942: explicit RNE via 2nd parameter (0_I)
+    opus::bf16_t tmp = opus::cast<opus::bf16_t>(val, 0_I);
+#else
+    // gfx950+: hardware default is already RNE
     opus::bf16_t tmp = opus::cast<opus::bf16_t>(val);
+#endif
     out[gid] = opus::cast<opus::fp32_t>(tmp);
 }
 

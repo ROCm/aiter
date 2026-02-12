@@ -170,7 +170,7 @@ All tests (including the new one) will build and run inside the Docker container
 | `test_mfma` | 16x16x32 fp8/bf8 | (same as above) | gfx942 + gfx950 |
 | `test_vector_add` | — | `make_gmem`, vectorized `load<N>` / `store<N>` | all |
 | `test_async_load` | — | `make_gmem`, `gmem::async_load`, `s_waitcnt_vmcnt` | all |
-| `test_dtype_convert` | fp32<->bf16 | `fp32_to_bf16` (truncation on pre-gfx950, native RNE on gfx950), `bf16_to_fp32` | all |
+| `test_dtype_convert` | fp32<->bf16 | `cast<bf16_t>` with RNE: explicit `0_I` on gfx942, hardware default on gfx950 | all |
 | `test_dtype_convert` | fp32<->fp16 | `fp32_to_fp16`, `fp16_to_fp32` | all |
 | `test_dtype_convert` | fp32<->fp8 | `cast<fp8_t>(fp32x4_t)`, `cast<fp32_t>(fp8x4_t)` (packed x4) | gfx942 + gfx950 |
 | `test_dtype_convert` | fp32<->fp4 | `cast<fp4_t>(fp32x8_t)`, `cast<fp32_t>(array<fp4_t,4>)` (packed x8, e2m1) | gfx950 |
@@ -184,6 +184,10 @@ Total: **18 tests** (12 MFMA + 1 vector_add + 1 async_load + 4 dtype_convert).
   - 32x32x8 and 16x16x16 variants: gfx942 only.
   - 32x32x16 and 16x16x32 fp16/bf16 variants: gfx942 (via step-K decomposition) + gfx950 (native instruction).
   - 32x32x16 and 16x16x32 fp8/bf8 variants: gfx942 + gfx950 (native instruction on both). Output is raw fp32 accumulator.
+- **BF16 rounding**: `opus::cast<bf16_t>` default rounding mode differs by architecture:
+  - gfx942: default is truncation (rm=2). Pass `0_I` as 2nd argument to select round-to-nearest-even (RNE).
+  - gfx950: default is already RNE (hardware). No 2nd argument needed.
+  The dtype_convert bf16 test and MFMA bf16 tests both use RNE so that the kernel result matches PyTorch's `.to(bfloat16)`.
 - FP8 = `float8_e4m3fnuz` (gfx942) / `float8_e4m3fn` (gfx950), BF8 = `float8_e5m2fnuz` (gfx942) / `float8_e5m2` (gfx950).
 - FP4 = E2M1 (4-bit: 1 sign, 2 exponent, 1 mantissa). Representable values: ±{0, 0.5, 1, 1.5, 2, 3, 4, 6}. gfx950 only.
 - `test_opus_device.py` does a fresh build on every run (cleans previous `.so` and `build/` dir) to ensure changes are picked up.
