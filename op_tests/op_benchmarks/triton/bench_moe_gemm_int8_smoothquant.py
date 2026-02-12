@@ -117,7 +117,8 @@ def bench_mlp_single_weight_init(
     # -- numerics --
     w1_int8, w1_scale = quantize_weights_int8(w1)
     w2_int8, w2_scale = quantize_weights_int8(w2)
-
+    w1_int8 = w1_int8.transpose(1, 2).contiguous().transpose(1, 2)
+    w2_int8 = w2_int8.transpose(1, 2).contiguous().transpose(1, 2)
     # -- benchmark --
     reps = 100
     x = torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev)
