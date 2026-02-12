@@ -653,34 +653,6 @@ if __name__ == "__main__":
                             cache_dtype = get_dtype_fp8()
                         else:
                             cache_dtype = args.dtype
-                        k_cache = torch.randn(
-                            [args.num_blocks, args.page_size, num_kv_head, head_size],
-                            dtype=args.dtype,
-                            device="cuda",
-                        ).to(cache_dtype)
-                        v_cache = torch.randn(
-                            [args.num_blocks, args.page_size, num_kv_head, head_size],
-                            dtype=args.dtype,
-                            device="cuda",
-                        ).to(cache_dtype)
-                        slot_mapping = torch.randperm(
-                            num_token, dtype=torch.int64, device="cuda"
-                        )
-                        x = 16 // k_cache.element_size()
-                        k_cache = (
-                            k_cache.view(
-                                [
-                                    args.num_blocks,
-                                    args.page_size,
-                                    num_kv_head,
-                                    head_size // x,
-                                    x,
-                                ]
-                            )
-                            .permute(0, 2, 3, 1, 4)
-                            .contiguous()
-                        )
-                        v_cache = v_cache.permute(0, 2, 3, 1).contiguous()
 
                         ret = test_qk_norm_rope_cache_quant(
                             args.dtype,
