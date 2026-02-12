@@ -38,4 +38,11 @@ void hk_mla_decode_fwd(
             split_lse,
             final_output);
     }
+    else
+    {
+        TORCH_CHECK(
+            num_head == 128,
+            "hk_mla_decode_fwd currently supports only num_head == 128, but got num_head = ",
+            num_head);
+    }
 }

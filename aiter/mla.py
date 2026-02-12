@@ -312,12 +312,12 @@ def mla_decode_fwd(
             (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
-        ).fill_(2.33)
+        )
         attn_lse = torch.empty(
             (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, 1),
             dtype=dtypes.fp32,
             device=device,
-        ).fill_(2.33)
+        )
         final_lse = (
             torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
             if return_lse
