@@ -16,7 +16,7 @@ import aiter.ops.triton.utils._triton.arch_info as arch_info
 DEVICE_ARCH = arch_info.get_arch()
 
 NUM_HEADS = [(64, 8)]
-HEAD_SIZES = [64]
+HEAD_SIZES = [32, 64]
 BLOCK_SIZES = [16]
 
 DTYPES = [torch.bfloat16]
@@ -116,7 +116,16 @@ def ref_paged_attn(
 @pytest.mark.parametrize("soft_cap", [None])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("q_dtype", QDTYPES)
-@pytest.mark.parametrize("ver", [0, 1, 2, 3])
+@pytest.mark.parametrize(
+    "use_tdm, num_tdm_gather, use_async",
+    [
+        (False, 1, False),  # use baseline
+        (False, 1, True),  # use simple async_copy
+        (True, 1, False),  # use TDM async_copy
+        (True, 4, False),  # use TDM gather pipelined
+        (True, 8, False),  # use TDM gather pipelined
+    ],
+)
 @torch.inference_mode()
 def test_triton_unified_attn(
     seq_lens: list[tuple[int, int]],
@@ -128,7 +137,9 @@ def test_triton_unified_attn(
     soft_cap: Optional[float],
     num_blocks: int,
     q_dtype: Optional[torch.dtype],
-    ver: Optional[int],
+    use_tdm: bool,
+    num_tdm_gather: int,
+    use_async: bool,
 ) -> None:
     if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
         pytest.skip("block size must be at least 32 for fp8")
@@ -139,8 +150,15 @@ def test_triton_unified_attn(
     ):
         pytest.skip(f"skip {DEVICE_ARCH}")
 
-    if DEVICE_ARCH not in ("gfx1250",) and ver == 3:
+    if DEVICE_ARCH not in ("gfx1250",) and use_tdm == True:
         pytest.skip(f"{DEVICE_ARCH} does not have TDM")
+
+    if use_tdm and num_tdm_gather > 1:
+        if head_size > 32:
+            pytest.skip("skipping test for head size > 32 and TDM gather cases")
+    else:
+        if head_size <= 32:
+            pytest.skip("skipping test for head size <= 32 for non-TDM gather cases")
 
     # TODO: Uncomment after pytorch adds support for manual_seed
     # torch.manual_seed(0)
@@ -196,36 +214,64 @@ def test_triton_unified_attn(
         k_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
         v_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
 
-    # print()
+    unified_attention(
+        q=maybe_quantized_query,
+        k=maybe_quantized_key_cache,
+        v=maybe_quantized_value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=soft_cap if soft_cap is not None else 0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+    )
 
-    def unified_attention_impl(impl, output_impl, **kwargs):
-        impl(
-            q=maybe_quantized_query,
-            k=maybe_quantized_key_cache,
-            v=maybe_quantized_value_cache,
-            out=output_impl,
-            cu_seqlens_q=cu_query_lens,
-            seqused_k=kv_lens,
-            max_seqlen_q=max_query_len,
-            max_seqlen_k=max_kv_len,
-            softmax_scale=scale,
-            causal=True,
-            window_size=window_size,
-            block_table=block_tables,
-            softcap=soft_cap if soft_cap is not None else 0,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            sinks=sinks,
-            **kwargs,
-        )
+    if use_tdm and num_tdm_gather > 1:
+        # note: random gather is not yet hardware verified
+        # maybe_sorted_block_tables = torch.sort(block_tables, dim=-1)[0]
+        maybe_sorted_block_tables = block_tables
+        maybe_reordered_key_cache = maybe_quantized_key_cache.permute(
+            0, 2, 1, 3
+        ).contiguous()
+        maybe_reordered_value_cache = maybe_quantized_value_cache.permute(
+            0, 2, 1, 3
+        ).contiguous()
+    else:
+        maybe_sorted_block_tables = block_tables
+        maybe_reordered_key_cache = maybe_quantized_key_cache
+        maybe_reordered_value_cache = maybe_quantized_value_cache
 
-    # print(f"Computing Triton")
-    unified_attention_impl(unified_attention, output)
-    # print(f"Computing Gluon")
-    unified_attention_impl(gluon_unified_attention, output_gluon, ver=ver)
+    gluon_unified_attention(
+        q=maybe_quantized_query,
+        k=maybe_reordered_key_cache,
+        v=maybe_reordered_value_cache,
+        out=output_gluon,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=maybe_sorted_block_tables,
+        softcap=soft_cap if soft_cap is not None else 0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+        use_tdm=use_tdm,
+        num_tdm_gather=num_tdm_gather,
+        use_async=use_async,
+    )
 
-    # print(f"Computing Reference")
     ref_output = ref_paged_attn(
         query=query,
         key_cache=key_cache,
@@ -239,7 +285,6 @@ def test_triton_unified_attn(
         sinks=sinks,
     )
 
-    # print(f"Comparing Results")
     atol, rtol = 1.5e-2, 1e-2
     if q_dtype is not None:
         atol, rtol = 1.5e-1, 1.5e-1

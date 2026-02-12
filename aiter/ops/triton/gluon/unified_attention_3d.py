@@ -8,6 +8,7 @@ from aiter.ops.triton.gluon.unified_attention_3d_kernel import (
     gluon_kernel_unified_attention_3d,
     gluon_kernel_unified_attention_3d_pipelined,
     gluon_kernel_unified_attention_3d_tdm_pipelined,
+    gluon_kernel_unified_attention_3d_tdm_gather_pipelined,
     gluon_reduce_segments,
 )
 
@@ -24,9 +25,12 @@ def make_layout_3d(
     num_warps: int,
     BLOCK_M: int,
     TILE_SIZE: int,
+    BLOCK_SIZE: int,
+    NUM_BLOCKS_GATHER_PER_TILE: int,
     HEAD_SIZE_PADDED: int,
     use_tdm: bool,
     use_swizzle: bool = False,
+    use_gather: bool = False,
 ):
 
     if IS_DEVICE_ARCH_GFX12:
@@ -130,20 +134,36 @@ def make_layout_3d(
             shape=[BLOCK_M, HEAD_SIZE_PADDED],
             order=[1, 0],
         )
-        K_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
-            interval_padding_pairs=[[HEAD_SIZE_PADDED, 8]],
-            shape=(
-                [TILE_SIZE, HEAD_SIZE_PADDED]
-                if use_tdm
-                else [HEAD_SIZE_PADDED, TILE_SIZE]
-            ),
-            order=[1, 0],
-        )
-        V_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
-            interval_padding_pairs=[[HEAD_SIZE_PADDED, 8]],
-            shape=[TILE_SIZE, HEAD_SIZE_PADDED],
-            order=[1, 0],
-        )
+        if use_gather:
+            K_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
+                interval_padding_pairs=[[BLOCK_SIZE * HEAD_SIZE_PADDED, 8]],
+                shape=(
+                    [NUM_BLOCKS_GATHER_PER_TILE, BLOCK_SIZE * HEAD_SIZE_PADDED]
+                    if use_tdm
+                    else [HEAD_SIZE_PADDED, TILE_SIZE]
+                ),
+                order=[1, 0],
+            )
+            V_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
+                interval_padding_pairs=[[BLOCK_SIZE * HEAD_SIZE_PADDED, 8]],
+                shape=[NUM_BLOCKS_GATHER_PER_TILE, BLOCK_SIZE * HEAD_SIZE_PADDED],
+                order=[1, 0],
+            )
+        else:
+            K_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
+                interval_padding_pairs=[[HEAD_SIZE_PADDED, 8]],
+                shape=(
+                    [TILE_SIZE, HEAD_SIZE_PADDED]
+                    if use_tdm
+                    else [HEAD_SIZE_PADDED, TILE_SIZE]
+                ),
+                order=[1, 0],
+            )
+            V_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
+                interval_padding_pairs=[[HEAD_SIZE_PADDED, 8]],
+                shape=[TILE_SIZE, HEAD_SIZE_PADDED],
+                order=[1, 0],
+            )
     else:
         Q_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
             vec=8, per_phase=1, max_phase=8, order=[1, 0]
@@ -228,53 +248,72 @@ def select_3d_config(
     BLOCK_M: int,
     HEAD_SIZE_PADDED: int,
     use_tdm: bool = False,
+    num_tdm_gather: int = 1,
     use_async: bool = True,
     use_swizzle: bool = True,
 ):
     """
     if use_tdm is True, use_async and use_swizzle will be ignored
+    if use_tdm is False, num_tdm_gather will be ignored
     if use_async is True, use_swizzle will be forced to True
     if use_tdm and use_async are False, num_stages will be ignored, use_swizzle determines whether to use PaddedSharedLayout or SwizzledSharedLayout
     """
     reduce_num_warps = 2
     attn_warps = 2
-    # attn_warps = 4
-    TILE_SIZE = block_size
+
+    if use_tdm and num_tdm_gather > 1:
+        assert num_tdm_gather in [4, 8], "num_tdm_gather must be 4 or 8"
+    TILE_SIZE = block_size * num_tdm_gather
+
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     num_segments = math.ceil(target_num_prgms / num_2d_prgms)
+    num_segments = min(num_segments, MAX_SEGMENTS)
     num_segments = triton.next_power_of_2(num_segments)
     num_segments = min(num_segments, 128)
     MIN_SEGMENTS = 16 if TILE_SIZE <= 16 else 8
     num_segments = max(num_segments, MIN_SEGMENTS)
 
-    attn_stages = 2 if num_segments > 1 else 1
+    # TODO: needs a better way to determine num_segments for TDM gather pipelined
+    if use_tdm and num_tdm_gather > 1:
+        num_segments = 4
 
     if num_segments == MIN_SEGMENTS:
         reduce_num_warps = 1
 
+    hyper_parms = (
+        attn_warps,
+        BLOCK_M,
+        TILE_SIZE,
+        block_size,
+        num_tdm_gather,
+        HEAD_SIZE_PADDED,
+    )
     if use_tdm:
         # With TDM async_copy pipelined, use_swizzle will be ignored (padded smem layout is used always)
-        attn_impl = gluon_kernel_unified_attention_3d_tdm_pipelined
-        layouts = make_layout_3d(
-            attn_warps, BLOCK_M, TILE_SIZE, HEAD_SIZE_PADDED, use_tdm, use_swizzle=False
-        )
+        if num_tdm_gather > 1:
+            attn_impl = gluon_kernel_unified_attention_3d_tdm_gather_pipelined
+            # print(f"Using TDM gather pipelined kernel with TILE_SIZE={TILE_SIZE} and BLOCK_SIZE={block_size}")
+            layouts = make_layout_3d(
+                *hyper_parms, use_tdm, use_swizzle=False, use_gather=True
+            )
+        else:
+            attn_impl = gluon_kernel_unified_attention_3d_tdm_pipelined
+            # print(f"Using TDM async copy pipelined kernel with TILE_SIZE={TILE_SIZE} and BLOCK_SIZE={block_size}")
+            layouts = make_layout_3d(*hyper_parms, use_tdm, use_swizzle=False)
     elif use_async:
         # With async_copy pipelined, use_swizzle should always be True
         attn_impl = gluon_kernel_unified_attention_3d_pipelined
-        layouts = make_layout_3d(
-            attn_warps, BLOCK_M, TILE_SIZE, HEAD_SIZE_PADDED, use_tdm, use_swizzle=True
-        )
+        layouts = make_layout_3d(*hyper_parms, use_tdm, use_swizzle=True)
     else:
         # Baseline kernel, num_stages does not matter, use_swizzle can be either True or False
         attn_impl = gluon_kernel_unified_attention_3d
         layouts = make_layout_3d(
-            attn_warps,
-            BLOCK_M,
-            TILE_SIZE,
-            HEAD_SIZE_PADDED,
+            *hyper_parms,
             use_tdm,
             use_swizzle=use_swizzle,
         )
+
+    attn_stages = 2 if num_segments > 1 else 1
 
     attn_config = {
         "TILE_SIZE": TILE_SIZE,
@@ -334,7 +373,9 @@ def unified_attention(
     qq_bias=None,
     # Optional tensor for sinks
     sinks=None,
-    ver=0,
+    use_tdm: bool = False,
+    num_tdm_gather: int = 1,
+    use_async: bool = True,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -348,10 +389,14 @@ def unified_attention(
 
     num_tokens = q.shape[0]
     num_blocks = v.shape[0]
-    block_size = v.shape[1]
+    if use_tdm and num_tdm_gather > 1:
+        num_kv_heads = k.shape[1]
+        block_size = v.shape[2]
+    else:
+        num_kv_heads = k.shape[2]
+        block_size = v.shape[1]
     num_seqs = len(seqused_k)
     num_query_heads = q.shape[1]
-    num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
 
@@ -389,28 +434,15 @@ def unified_attention(
         head_size_padded = triton.next_power_of_2(head_size)
 
         if not IS_DEVICE_ARCH_GFX12:
-            assert ver < 3
+            assert use_tdm == False, "TDM is not supported on non-GFX12 devices"
 
-        if ver == 3:
-            # TDM:
-            use_tdm = True
+        use_swizzle = None
+        if use_tdm == True:  # TDM
             use_async = None
-            use_swizzle = None
-        elif ver == 2:
-            # ASYNC
-            use_tdm = False
-            use_async = True
-            use_swizzle = None
-        elif ver == 1:
-            # Baseline swizzle
-            use_tdm = False
-            use_async = False
+        elif use_async == True:  # ASYNC
+            pass
+        else:  # Baseline (use_swizzle can be either True or False, fix to True for now)
             use_swizzle = True
-        elif ver == 0:
-            # Baseline pad
-            use_tdm = False
-            use_async = False
-            use_swizzle = False
 
         attn_config, reduce_config, attn_impl = select_3d_config(
             head_size,
@@ -422,6 +454,7 @@ def unified_attention(
             BLOCK_M,
             head_size_padded,
             use_tdm,
+            num_tdm_gather,
             use_async,
             use_swizzle,
         )
@@ -448,13 +481,6 @@ def unified_attention(
             dtype=torch.float32,
             device=q.device,
         )
-
-        # for parm, val in attn_config.items():
-        #     print(parm, val)
-        # print(attn_impl.__name__)
-        # print(attn_config["Q_SHARED_LAYOUT"])
-        # print(attn_config["K_SHARED_LAYOUT"])
-        # print(attn_config["V_SHARED_LAYOUT"])
 
         attn_impl[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
             segm_output_ptr=segm_output,
