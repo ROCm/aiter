@@ -16,6 +16,7 @@ env:
   GPU_ARCH_LIST: "gfx942;gfx950"
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
+  AITER_TEST: "op_tests"
 
 jobs:
   check-signal:
@@ -103,6 +104,23 @@ jobs:
         run: |
           echo "Successfully prepared image: rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}"
       
+  split_aiter_tests:
+    runs-on: ubuntu-latest
+    outputs:
+      shard_count: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Split Aiter Tests (5 shards)
+        run: ./.github/scripts/split_tests.sh --shards 5 --test-type aiter
+
+      - name: Upload test shard lists as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiter_shards
+          path: aiter_shard_*.list
+
   standard:
     name: Standard Tests (1 GPU)
     needs: build_aiter_image 
@@ -161,6 +179,21 @@ jobs:
       - name: Docker login
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
       
+      - name: Download test shard lists
+        uses: actions/download-artifact@v4
+        with:
+          name: aiter_shards
+
+      - name: List test shard files
+        run: |
+          ls -l aiter_shard_*.list
+
+      - name: Export test file list for this shard as env
+        id: set_shard_files
+        run: |
+          echo "AITER_TEST=$(cat aiter_shard_${{ matrix.shard_idx }}.list)" >> $GITHUB_ENV
+          echo "${{ env.AITER_TEST }}"
+
       - name: Run the container
         run: |
           set -ex

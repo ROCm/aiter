@@ -14,8 +14,13 @@ if [[ "$MULTIGPU" == "TRUE" ]]; then
     # Recursively find all files under op_tests/multigpu_tests
     mapfile -t files < <(find op_tests/multigpu_tests -type f -name "*.py" | sort)
 else
+    if [[ ! "$AITER_TEST"]]; then
+        echo "AITER_TEST is not set"
     # Recursively find all files under op_tests, excluding op_tests/multigpu_tests
-    mapfile -t files < <(find op_tests -maxdepth 1 -type f -name "*.py" | sort)
+        mapfile -t files < <(find op_tests -maxdepth 1 -type f -name "*.py" | sort)
+    else
+        files = $AITER_TEST
+    fi
 fi
 
 skip_tests=(
