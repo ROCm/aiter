@@ -4,16 +4,8 @@
 """
 Triton-based Conv2d matching the PyTorch ``torch.nn.Conv2d`` interface.
 
-Supports:
-  - NCHW and NHWC data layouts (selected via ``layout`` parameter)
-  - arbitrary kernel sizes, strides, padding, dilation
-  - grouped convolutions (including depthwise when groups == in_channels)
-  - optional bias
-  - ``padding_mode='zeros'`` only (other modes should be applied externally)
-
-Limitations (current):
-  - forward pass only (no autograd backward)
-  - no ``padding_mode`` other than ``'zeros'``
+Supports NCHW/NHWC layouts, grouped convolutions, bias, split-K for
+full GPU occupancy on small-batch workloads.
 """
 
 from typing import Optional, Tuple, Union
@@ -24,6 +16,7 @@ import triton
 from aiter.ops.triton._triton_kernels.conv2d import (
     _conv2d_implicit_gemm_kernel,
     _conv2d_nhwc_kernel,
+    pick_conv2d_block_config,
 )
 
 
@@ -32,7 +25,6 @@ from aiter.ops.triton._triton_kernels.conv2d import (
 # -------------------------------------------------------------------
 
 def _pair(x: Union[int, Tuple[int, int]]) -> Tuple[int, int]:
-    """Normalise a scalar or 2-tuple to a 2-tuple."""
     if isinstance(x, int):
         return (x, x)
     assert len(x) == 2
@@ -49,15 +41,8 @@ def _compute_output_size(
     return oh, ow
 
 
-def _pick_block_k(K: int) -> int:
-    """Choose BLOCK_K: power-of-two, >= 16 (tl.dot minimum), <= 64."""
-    bk = min(32, K) if K > 0 else 1
-    bk = triton.next_power_of_2(bk)
-    return max(bk, 16)
-
-
 # -------------------------------------------------------------------
-# NCHW dispatch (original)
+# NCHW dispatch
 # -------------------------------------------------------------------
 
 def _launch_nchw(
@@ -71,24 +56,41 @@ def _launch_nchw(
 ) -> torch.Tensor:
     N, C_in, H_in, W_in = input.shape
     C_out, C_in_per_group, kH, kW = weight.shape
-
     H_out, W_out = _compute_output_size(H_in, W_in, kH, kW, stride, padding, dilation)
 
     input = input.contiguous()
     weight = weight.contiguous()
 
-    output = torch.empty(
-        (N, C_out, H_out, W_out), dtype=input.dtype, device=input.device
-    )
-
     M = N * H_out * W_out
     N_gemm = C_out // groups
     K = C_in_per_group * kH * kW
-    BLOCK_K = _pick_block_k(K)
+
+    BLOCK_M, BLOCK_N, BLOCK_K, num_warps, split_k = pick_conv2d_block_config(
+        M, N_gemm, K, groups
+    )
+    k_per_split = triton.cdiv(K, split_k)
+
+    # Output buffer
+    if split_k == 1:
+        output = torch.empty(
+            (N, C_out, H_out, W_out), dtype=input.dtype, device=input.device
+        )
+        split_k_stride = 0
+        out_strides = (output.stride(0), output.stride(1),
+                       output.stride(2), output.stride(3))
+    else:
+        # fp32 temp: [split_k, N_batch, C_out, H_out, W_out]
+        output = torch.empty(
+            (split_k, N, C_out, H_out, W_out), dtype=torch.float32, device=input.device
+        )
+        split_k_stride = output.stride(0)
+        out_strides = (output.stride(1), output.stride(2),
+                       output.stride(3), output.stride(4))
 
     grid = (
-        triton.cdiv(M, 64) * triton.cdiv(N_gemm, 64),
+        triton.cdiv(M, BLOCK_M) * triton.cdiv(N_gemm, BLOCK_N),
         groups,
+        split_k,
     )
 
     _conv2d_implicit_gemm_kernel[grid](
@@ -102,11 +104,21 @@ def _launch_nchw(
         dilation[0], dilation[1], groups,
         input.stride(0), input.stride(1), input.stride(2), input.stride(3),
         weight.stride(0), weight.stride(1), weight.stride(2), weight.stride(3),
-        output.stride(0), output.stride(1), output.stride(2), output.stride(3),
+        out_strides[0], out_strides[1], out_strides[2], out_strides[3],
         M, N_gemm, K, C_in_per_group,
+        k_per_split, split_k_stride,
         HAS_BIAS=bias is not None,
-        BLOCK_M=64, BLOCK_N=64, BLOCK_K=BLOCK_K,
+        SPLIT_K=split_k,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=num_warps,
     )
+
+    if split_k > 1:
+        output = output.sum(dim=0)                      # reduce split-K
+        if bias is not None:
+            output = output + bias.view(1, C_out, 1, 1)  # add bias
+        output = output.to(input.dtype)
+
     return output
 
 
@@ -123,37 +135,41 @@ def _launch_nhwc(
     dilation: Tuple[int, int],
     groups: int,
 ) -> torch.Tensor:
-    """Launch the NHWC-optimised kernel.
-
-    Parameters
-    ----------
-    input : Tensor (N, H, W, C_in) – contiguous NHWC
-    weight : Tensor (C_out, C_in/groups, kH, kW) – standard PyTorch format.
-             Permuted internally to (C_out, kH, kW, C_in/groups) for coalesced
-             weight loads.
-    """
     N, H_in, W_in, C_in = input.shape
     C_out, C_in_per_group, kH, kW = weight.shape
-
     H_out, W_out = _compute_output_size(H_in, W_in, kH, kW, stride, padding, dilation)
 
     input = input.contiguous()
-
-    # Permute weight: (Co, Ci/g, kH, kW) -> (Co, kH, kW, Ci/g) for coalesced K loads
     weight_nhwc = weight.permute(0, 2, 3, 1).contiguous()
-
-    output = torch.empty(
-        (N, H_out, W_out, C_out), dtype=input.dtype, device=input.device
-    )
 
     M = N * H_out * W_out
     N_gemm = C_out // groups
     K = C_in_per_group * kH * kW
-    BLOCK_K = _pick_block_k(K)
+
+    BLOCK_M, BLOCK_N, BLOCK_K, num_warps, split_k = pick_conv2d_block_config(
+        M, N_gemm, K, groups
+    )
+    k_per_split = triton.cdiv(K, split_k)
+
+    if split_k == 1:
+        output = torch.empty(
+            (N, H_out, W_out, C_out), dtype=input.dtype, device=input.device
+        )
+        split_k_stride = 0
+        out_strides = (output.stride(0), output.stride(1),
+                       output.stride(2), output.stride(3))
+    else:
+        output = torch.empty(
+            (split_k, N, H_out, W_out, C_out), dtype=torch.float32, device=input.device
+        )
+        split_k_stride = output.stride(0)
+        out_strides = (output.stride(1), output.stride(2),
+                       output.stride(3), output.stride(4))
 
     grid = (
-        triton.cdiv(M, 64) * triton.cdiv(N_gemm, 64),
+        triton.cdiv(M, BLOCK_M) * triton.cdiv(N_gemm, BLOCK_N),
         groups,
+        split_k,
     )
 
     _conv2d_nhwc_kernel[grid](
@@ -165,17 +181,24 @@ def _launch_nhwc(
         kH, kW,
         stride[0], stride[1], padding[0], padding[1],
         dilation[0], dilation[1], groups,
-        # Input strides (N, H, W, C)
         input.stride(0), input.stride(1), input.stride(2), input.stride(3),
-        # Weight strides (Co, kH, kW, Ci/g)
         weight_nhwc.stride(0), weight_nhwc.stride(1),
         weight_nhwc.stride(2), weight_nhwc.stride(3),
-        # Output strides (N, Ho, Wo, Co)
-        output.stride(0), output.stride(1), output.stride(2), output.stride(3),
+        out_strides[0], out_strides[1], out_strides[2], out_strides[3],
         M, N_gemm, K, C_in_per_group,
+        k_per_split, split_k_stride,
         HAS_BIAS=bias is not None,
-        BLOCK_M=64, BLOCK_N=64, BLOCK_K=BLOCK_K,
+        SPLIT_K=split_k,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=num_warps,
     )
+
+    if split_k > 1:
+        output = output.sum(dim=0)
+        if bias is not None:
+            output = output + bias.view(1, 1, 1, C_out)
+        output = output.to(input.dtype)
+
     return output
 
 
@@ -200,16 +223,11 @@ def conv2d(
     input : Tensor
         * ``layout="nchw"``: shape ``(N, C_in, H, W)`` or ``(C_in, H, W)``
         * ``layout="nhwc"``: shape ``(N, H, W, C_in)`` or ``(H, W, C_in)``
-    weight : Tensor
-        Always ``(C_out, C_in/groups, kH, kW)`` (standard PyTorch format).
-    bias : Tensor, optional – shape ``(C_out,)``
+    weight : Tensor  ``(C_out, C_in/groups, kH, kW)``
+    bias : Tensor, optional  ``(C_out,)``
     stride, padding, dilation : int or (int, int)
     groups : int
     layout : ``"nchw"`` or ``"nhwc"``
-
-    Returns
-    -------
-    Tensor – same layout as *input*.
     """
     layout = layout.lower()
     assert layout in ("nchw", "nhwc"), f"layout must be 'nchw' or 'nhwc', got '{layout}'"
@@ -218,7 +236,6 @@ def conv2d(
     padding = _pair(padding)
     dilation = _pair(dilation)
 
-    # Handle unbatched input
     unbatched = input.dim() == 3
     if unbatched:
         input = input.unsqueeze(0)
@@ -226,7 +243,6 @@ def conv2d(
     assert input.dim() == 4, f"Expected 4-D input, got {input.dim()}-D"
     assert weight.dim() == 4, f"Expected 4-D weight, got {weight.dim()}-D"
 
-    # Extract dimensions according to layout
     if layout == "nchw":
         _N, C_in, _H, _W = input.shape
     else:
@@ -247,7 +263,6 @@ def conv2d(
         f"Invalid output size ({H_out}, {W_out}). Check kernel/stride/pad/dilation."
     )
 
-    # Dispatch
     if layout == "nchw":
         output = _launch_nchw(input, weight, bias, stride, padding, dilation, groups)
     else:
@@ -268,9 +283,5 @@ def conv2d_nhwc(
     dilation: Union[int, Tuple[int, int]] = 1,
     groups: int = 1,
 ) -> torch.Tensor:
-    """Convenience shorthand for ``conv2d(..., layout='nhwc')``.
-
-    Input is ``(N, H, W, C_in)``; output is ``(N, H_out, W_out, C_out)``.
-    Weight is always ``(C_out, C_in/groups, kH, kW)``.
-    """
+    """Convenience shorthand for ``conv2d(..., layout='nhwc')``."""
     return conv2d(input, weight, bias, stride, padding, dilation, groups, layout="nhwc")
