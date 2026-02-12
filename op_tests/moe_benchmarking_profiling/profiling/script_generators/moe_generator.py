@@ -142,7 +142,9 @@ class MoeScriptGenerator(ScriptGenerator):
     
     def generate(self, config: MoeKernelConfig) -> str:
         """Generate script for the given MOE kernel configuration."""
-        if config.stage == "asm_1stage":
+        if config.kernel_type == "triton" and config.stage == "triton_1stage":
+            return self._generate_triton_1stage(config)
+        elif config.stage == "asm_1stage":
             return self._generate_asm_1stage(config)
         elif config.kernel_type == "ck" and config.stage == "stage2":
             return self._generate_ck_stage2(config)
@@ -556,6 +558,101 @@ torch.cuda.synchronize()
 
 print("\\n" + "="*80)
 print("ASM Stage1 kernel executed!")
+print(f"Output shape: {{result.shape}}")
+print("="*80)
+'''
+
+    def _generate_triton_1stage(self, config: MoeKernelConfig) -> str:
+        """Generate script for Triton e2e kernel."""
+        return f'''#!/usr/bin/env python3
+"""
+Auto-generated Triton e2e kernel profiling script.
+"""
+
+import sys
+from pathlib import Path
+
+script_dir = Path(__file__).parent
+aiter_root = script_dir
+while aiter_root.name != 'aiter' and aiter_root != aiter_root.parent:
+    aiter_root = aiter_root.parent
+if aiter_root.name != 'aiter':
+    for parent in Path(__file__).resolve().parents:
+        if parent.name == 'aiter' and (parent / 'aiter').exists():
+            aiter_root = parent
+            break
+    else:
+        aiter_root = Path(__file__).resolve().parents[3]
+
+sys.path.insert(0, str(aiter_root))
+sys.path.insert(0, str(aiter_root / "csrc/ck_gemm_moe_2stages_codegen"))
+
+import torch
+from aiter import QuantType, ActivationType, dtypes
+from gemm_moe_tune_triton import generate_data_triton_1stage, run_triton_1stage
+
+print("="*80)
+print("Triton E2E Kernel Profiling - Config {config.config_idx}")
+print("="*80)
+print("TARGET KERNEL: {config.kernel_name}")
+print("="*80)
+
+TARGET_KERNEL = "{config.kernel_name}"
+token = {config.token}
+model_dim = {config.model_dim}
+inter_dim = {config.inter_dim}
+expert = {config.expert}
+topk = {config.topk}
+dtype = {config.dtype}
+block_m = {config.block_m}
+
+print("\\nGenerating test data...")
+torch.manual_seed(42)
+torch.set_default_device('cuda')
+
+persistent = "_persistent_" in TARGET_KERNEL and "non_persistent" not in TARGET_KERNEL
+
+parts = TARGET_KERNEL.split('_')
+config = {{}}
+
+if persistent:
+    for part in parts:
+        if part.startswith('M') and '-' not in part:
+            config['BLOCK_SIZE_M'] = int(part[1:])
+        elif 'N1-' in part:
+            config['BLOCK_SIZE_N1'] = int(part.split('-')[1])
+        elif 'N2-' in part:
+            config['BLOCK_SIZE_N2'] = int(part.split('-')[1])
+        elif 'K' in part and '-' in part:
+            k_val = int(part.split('-')[1])
+            config['BLOCK_SIZE_K1'] = k_val
+            config['BLOCK_SIZE_K2'] = k_val
+else:
+    for part in parts:
+        if part.startswith('M') and '-' not in part:
+            config['BLOCK_SIZE_M'] = int(part[1:])
+        elif part.startswith('N') and part[1:].isdigit():
+            config['BLOCK_SIZE_N'] = int(part[1:])
+        elif 'K1-' in part:
+            config['BLOCK_SIZE_K1'] = int(part.split('-')[1])
+        elif 'K2-' in part:
+            config['BLOCK_SIZE_K2'] = int(part.split('-')[1])
+        elif part.startswith('GM'):
+            config['GROUP_SIZE_M'] = int(part[2:])
+
+(input, a1_qt, w1, w2, sorted_ids, topk_weights, expert_ids, num_post_pad, _, _, _, _, _, _, topk_ids) = generate_data_triton_1stage(token, model_dim, inter_dim, expert, topk, dtype, block_m)
+
+print(f"\\n{{'*'*80}}")
+print(f"*** EXECUTING TRITON E2E KERNEL (block_m={{block_m}}) ***")
+print(f"*** {{TARGET_KERNEL}}")
+print(f"{{'*'*80}}")
+
+result = run_triton_1stage(input, a1_qt, w1, w2, sorted_ids, topk_weights, expert_ids, num_post_pad, None, None, None, topk_ids, topk, config, dtype, persistent)
+
+torch.cuda.synchronize()
+
+print("\\n" + "="*80)
+print("TRITON E2E KERNEL executed!")
 print(f"Output shape: {{result.shape}}")
 print("="*80)
 '''
