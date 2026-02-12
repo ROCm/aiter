@@ -383,7 +383,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
 
     const float logits_soft_cap = arg_parser.get_float("logits_soft_cap");
 
-    std::string qscale_str = arg_parser.get_str("qscale");
+    std::string qscale_str  = arg_parser.get_str("qscale");
     quant_scale_info qscale = quant_scale_info::decode(qscale_str);
 
     std::string vlayout = arg_parser.get_str("vlayout");
@@ -461,7 +461,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
     float v_dtype_max = ck_tile::type_convert<float>(ck_tile::numeric<VDataType>::max());
 
     // Block scale sizes for blockscale quantization
-    const ck_tile::index_t block_scale_size_q_ = 128;
+    const ck_tile::index_t block_scale_size_q_  = 128;
     const ck_tile::index_t block_scale_size_kv_ = 128;
 
     // accumulation numbers for performance evaluation
@@ -686,7 +686,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
     else if(init_method == "ufq" || init_method == "uf:q" ||
             init_method == "3") // suitable for fp8 quantization
     {
-        float qkv_max = 3.f;  // Fixed value for quantization
+        float qkv_max = 3.f; // Fixed value for quantization
         ck_tile::FillUniformDistribution<QDataType>{-q_dtype_max, q_dtype_max, next_seed()}(q_host);
         ck_tile::FillUniformDistribution<KDataType>{-k_dtype_max, k_dtype_max, next_seed()}(k_host);
         ck_tile::FillUniformDistribution<KDataType>{-k_dtype_max, k_dtype_max, next_seed()}(
@@ -695,11 +695,9 @@ bool run(const ck_tile::ArgParser& arg_parser)
         ck_tile::FillUniformDistribution<VDataType>{-v_dtype_max, v_dtype_max, next_seed()}(
             vnew_host);
 
-        // For FP8 bias: bias_fp8 = (q_descale * k_descale) * bias_fp32
-        // Assume bias is in [-1.f, 1.f] in original fp32, scale it by qkv_max^2 / (q_dtype_max * k_dtype_max)
-        float qscale_bias = (qkv_max / q_dtype_max) * (qkv_max / k_dtype_max);
-        ck_tile::FillUniformDistribution<BiasDataType>{-qscale_bias, qscale_bias, next_seed()}(
-            bias_host);
+        float bias_dtype_max = ck_tile::type_convert<float>(ck_tile::numeric<BiasDataType>::max());
+        ck_tile::FillUniformDistribution<BiasDataType>{
+            -bias_dtype_max, bias_dtype_max, next_seed()}(bias_host);
     }
     if(bias.type == bias_enum::alibi)
     {
@@ -740,12 +738,12 @@ bool run(const ck_tile::ArgParser& arg_parser)
         float max_descale_v = qkv_max / v_dtype_max;
 
         auto next_seed_local = [n = 0]() mutable { return n++; };
-        ck_tile::FillUniformDistribution<float>{max_descale_q * 0.8f, max_descale_q, next_seed_local()}(
-            q_descale_host);
-        ck_tile::FillUniformDistribution<float>{max_descale_k * 0.8f, max_descale_k, next_seed_local()}(
-            k_descale_host);
-        ck_tile::FillUniformDistribution<float>{max_descale_v * 0.8f, max_descale_v, next_seed_local()}(
-            v_descale_host);
+        ck_tile::FillUniformDistribution<float>{
+            max_descale_q * 0.8f, max_descale_q, next_seed_local()}(q_descale_host);
+        ck_tile::FillUniformDistribution<float>{
+            max_descale_k * 0.8f, max_descale_k, next_seed_local()}(k_descale_host);
+        ck_tile::FillUniformDistribution<float>{
+            max_descale_v * 0.8f, max_descale_v, next_seed_local()}(v_descale_host);
     }
 
     ck_tile::DeviceMem q_buf(q_host.get_element_space_size_in_bytes());
@@ -909,12 +907,12 @@ bool run(const ck_tile::ArgParser& arg_parser)
         const ck_tile::index_t batch_stride_o     = (nhead * shape_seqlen_q * hdim_v);
         const ck_tile::index_t batch_stride_block_table = (max_num_page_blocks / batch);
         // setup descale stride arguments (for blockscale quantization)
-        const ck_tile::index_t nhead_stride_q_descale  = num_block_scale_q;
-        const ck_tile::index_t nhead_stride_k_descale  = num_block_scale_kv;
-        const ck_tile::index_t nhead_stride_v_descale  = num_block_scale_kv;
-        const ck_tile::index_t batch_stride_q_descale  = num_block_scale_q * nhead;
-        const ck_tile::index_t batch_stride_k_descale  = num_block_scale_kv * nhead_k;
-        const ck_tile::index_t batch_stride_v_descale  = num_block_scale_kv * nhead_k;
+        const ck_tile::index_t nhead_stride_q_descale = num_block_scale_q;
+        const ck_tile::index_t nhead_stride_k_descale = num_block_scale_kv;
+        const ck_tile::index_t nhead_stride_v_descale = num_block_scale_kv;
+        const ck_tile::index_t batch_stride_q_descale = num_block_scale_q * nhead;
+        const ck_tile::index_t batch_stride_k_descale = num_block_scale_kv * nhead_k;
+        const ck_tile::index_t batch_stride_v_descale = num_block_scale_kv * nhead_k;
         // setup split_stride_* arguments (only used in split-kv kernel)
         const ck_tile::index_t split_stride_lse_acc = (shape_seqlen_q);
         const ck_tile::index_t split_stride_o_acc   = (shape_seqlen_q * hdim_v);
@@ -1039,52 +1037,59 @@ bool run(const ck_tile::ArgParser& arg_parser)
                 // Sequence length pointers (nullptr in batch mode without padding)
                 args.cu_seqlen_q_ptr = nullptr;
                 args.cu_seqlen_k_ptr = nullptr;
-                args.sink_ptr = nullptr;
+                args.sink_ptr        = nullptr;
 
                 // Set descale pointers and strides based on qscale type
                 if(qscale.type == quant_scale_enum::no_scale)
                 {
-                    args.q_descale_ptr = nullptr;
-                    args.k_descale_ptr = nullptr;
-                    args.v_descale_ptr = nullptr;
+                    args.q_descale_ptr              = nullptr;
+                    args.k_descale_ptr              = nullptr;
+                    args.v_descale_ptr              = nullptr;
                     args.block_scale_seqstart_q_ptr = nullptr;
                     args.block_scale_seqstart_k_ptr = nullptr;
-                    args.nhead_stride_q_descale  = 0;
-                    args.nhead_stride_k_descale  = 0;
-                    args.nhead_stride_v_descale  = 0;
-                    args.batch_stride_q_descale  = 0;
-                    args.batch_stride_k_descale  = 0;
-                    args.batch_stride_v_descale  = 0;
+                    args.nhead_stride_q_descale     = 0;
+                    args.nhead_stride_k_descale     = 0;
+                    args.nhead_stride_v_descale     = 0;
+                    args.batch_stride_q_descale     = 0;
+                    args.batch_stride_k_descale     = 0;
+                    args.batch_stride_v_descale     = 0;
                 }
                 else if(qscale.type == quant_scale_enum::blockscale)
                 {
-                    args.q_descale_ptr = reinterpret_cast<const float*>(q_descale_buf.GetDeviceBuffer());
-                    args.k_descale_ptr = reinterpret_cast<const float*>(k_descale_buf.GetDeviceBuffer());
-                    args.v_descale_ptr = reinterpret_cast<const float*>(v_descale_buf.GetDeviceBuffer());
+                    args.q_descale_ptr =
+                        reinterpret_cast<const float*>(q_descale_buf.GetDeviceBuffer());
+                    args.k_descale_ptr =
+                        reinterpret_cast<const float*>(k_descale_buf.GetDeviceBuffer());
+                    args.v_descale_ptr =
+                        reinterpret_cast<const float*>(v_descale_buf.GetDeviceBuffer());
                     args.block_scale_seqstart_q_ptr =
-                        (mode == mode_enum::group ? nullptr : nullptr); // Not implemented for group mode in this benchmark
+                        (mode == mode_enum::group
+                             ? nullptr
+                             : nullptr); // Not implemented for group mode in this benchmark
                     args.block_scale_seqstart_k_ptr =
-                        (mode == mode_enum::group ? nullptr : nullptr); // Not implemented for group mode in this benchmark
-                    args.nhead_stride_q_descale  = nhead_stride_q_descale;
-                    args.nhead_stride_k_descale  = nhead_stride_k_descale;
-                    args.nhead_stride_v_descale  = nhead_stride_v_descale;
-                    args.batch_stride_q_descale  = batch_stride_q_descale;
-                    args.batch_stride_k_descale  = batch_stride_k_descale;
-                    args.batch_stride_v_descale  = batch_stride_v_descale;
+                        (mode == mode_enum::group
+                             ? nullptr
+                             : nullptr); // Not implemented for group mode in this benchmark
+                    args.nhead_stride_q_descale = nhead_stride_q_descale;
+                    args.nhead_stride_k_descale = nhead_stride_k_descale;
+                    args.nhead_stride_v_descale = nhead_stride_v_descale;
+                    args.batch_stride_q_descale = batch_stride_q_descale;
+                    args.batch_stride_k_descale = batch_stride_k_descale;
+                    args.batch_stride_v_descale = batch_stride_v_descale;
                 }
                 else // pertensor or other types
                 {
-                    args.q_descale_ptr = q_descale_buf.GetDeviceBuffer();
-                    args.k_descale_ptr = k_descale_buf.GetDeviceBuffer();
-                    args.v_descale_ptr = v_descale_buf.GetDeviceBuffer();
+                    args.q_descale_ptr              = q_descale_buf.GetDeviceBuffer();
+                    args.k_descale_ptr              = k_descale_buf.GetDeviceBuffer();
+                    args.v_descale_ptr              = v_descale_buf.GetDeviceBuffer();
                     args.block_scale_seqstart_q_ptr = nullptr;
                     args.block_scale_seqstart_k_ptr = nullptr;
-                    args.nhead_stride_q_descale  = 0;
-                    args.nhead_stride_k_descale  = 0;
-                    args.nhead_stride_v_descale  = 0;
-                    args.batch_stride_q_descale  = 0;
-                    args.batch_stride_k_descale  = 0;
-                    args.batch_stride_v_descale  = 0;
+                    args.nhead_stride_q_descale     = 0;
+                    args.nhead_stride_k_descale     = 0;
+                    args.nhead_stride_v_descale     = 0;
+                    args.batch_stride_q_descale     = 0;
+                    args.batch_stride_k_descale     = 0;
+                    args.batch_stride_v_descale     = 0;
                 }
             }
             else if constexpr(std::is_same_v<fmha_fwd_splitkv_args, std::decay_t<decltype(args)>>)
