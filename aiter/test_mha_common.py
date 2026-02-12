@@ -448,7 +448,7 @@ def attention_ref_block_sparse(
     scores = torch.einsum("bthd,bshd->bhts", q / math.sqrt(d), k)
     # Apply block-sparse mask: True in token mask -> -inf
     token_mask = ~block_attn_mask_to_token_mask(
-        block_attn_mask, seqlen_q, seqlen_k, BLOCK_M, BLOCK_N, batch_size, q.device
+        block_attn_mask, seqlen_q, seqlen_k, BLOCK_M, BLOCK_N, q.device
     )
     scores.masked_fill_(rearrange(token_mask, "b t s -> b 1 t s"), float("-inf"))
     if key_padding_mask is not None:
