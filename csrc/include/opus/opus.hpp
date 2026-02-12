@@ -1410,6 +1410,25 @@ template <index_t lgkmcnt> OPUS_D void s_waitcnt_lgkmcnt(number<lgkmcnt>) { s_wa
     static_for<steps - 1>([&](auto i){ tmp = inst_(slice(a, number<e_a * (i+1)>{}, number<e_a*(i+2)>{}), slice(b, number<e_b * (i+1)>{}, number<e_b * (i+2)>{}), tmp, cbsz, abid, blgp); });  \
     return tmp; }
 
+// gfx942 _1k bf16 intrinsics require short vectors; bitcast bf16 -> short before calling
+#define DISPATCH_MFMA_BF16_1K_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
+ (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
+    using _sa = short __attribute__((ext_vector_type(elem_a))); using _sb = short __attribute__((ext_vector_type(elem_b))); \
+    return inst_(__builtin_bit_cast(_sa, a), __builtin_bit_cast(_sb, b), c, cbsz, abid, blgp); }
+
+#define DISPATCH_MFMA_STEP_K_BF16_1K_(ta_, tb_, tc_, wm_, wn_, wk_, inst_k_, inst_) \
+ (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
+    constexpr index_t steps = wk_ / inst_k_;  constexpr index_t e_a = elem_a / steps; constexpr index_t e_b = elem_b / steps;   \
+    using _sa = short __attribute__((ext_vector_type(e_a))); using _sb = short __attribute__((ext_vector_type(e_b))); \
+    auto tmp = inst_(__builtin_bit_cast(_sa, slice(a, number<0>{}, number<e_a>{})), __builtin_bit_cast(_sb, slice(b, number<0>{}, number<e_b>{})), c, cbsz, abid, blgp);          \
+    static_for<steps - 1>([&](auto i){ tmp = inst_(__builtin_bit_cast(_sa, slice(a, number<e_a * (i+1)>{}, number<e_a*(i+2)>{})), __builtin_bit_cast(_sb, slice(b, number<e_b * (i+1)>{}, number<e_b * (i+2)>{})), tmp, cbsz, abid, blgp); });  \
+    return tmp; }
+
+// fp8/bf8 intrinsics expect packed long (8 x 8-bit = 64-bit); bitcast ext_vector -> long
+#define DISPATCH_MFMA_8BIT_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
+ (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
+    return inst_(__builtin_bit_cast(long, a), __builtin_bit_cast(long, b), c, cbsz, abid, blgp); }
+
 // prefer use make_mfma() to create instance, which will return impl::mfma_adaptor_xxx. In this way we can access layout info from the "mma"
 template<typename dtype_a_, typename dtype_b_, typename dtype_c_, index_t wave_m_, index_t wave_n_, index_t wave_k_, index_t warp_size_ = get_warp_size()>
 struct mfma {
@@ -1435,18 +1454,18 @@ struct mfma {
 #if defined(__gfx942__) || defined(__gfx9_4_generic__) || defined(__gfx950__)
         else if constexpr DISPATCH_MFMA_(fp16_t, fp16_t, fp32_t, 32, 32,  8, __builtin_amdgcn_mfma_f32_32x32x8f16)
         else if constexpr DISPATCH_MFMA_(fp16_t, fp16_t, fp32_t, 16, 16, 16, __builtin_amdgcn_mfma_f32_16x16x16f16)
-        else if constexpr DISPATCH_MFMA_(bf16_t, bf16_t, fp32_t, 32, 32,  8, __builtin_amdgcn_mfma_f32_32x32x8bf16)
-        else if constexpr DISPATCH_MFMA_(bf16_t, bf16_t, fp32_t, 16, 16, 16, __builtin_amdgcn_mfma_f32_16x16x16bf16)
-        else if constexpr DISPATCH_MFMA_(fp8_t , fp8_t , fp32_t, 32, 32, 16, __builtin_amdgcn_mfma_f32_32x32x16_fp8_fp8)
-        else if constexpr DISPATCH_MFMA_(fp8_t , fp8_t , fp32_t, 16, 16, 32, __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8)
-        else if constexpr DISPATCH_MFMA_(bf8_t , bf8_t , fp32_t, 32, 32, 16, __builtin_amdgcn_mfma_f32_32x32x16_bf8_bf8)
-        else if constexpr DISPATCH_MFMA_(bf8_t , bf8_t , fp32_t, 16, 16, 32, __builtin_amdgcn_mfma_f32_16x16x32_bf8_bf8)
+        else if constexpr DISPATCH_MFMA_BF16_1K_(bf16_t, bf16_t, fp32_t, 32, 32,  8, __builtin_amdgcn_mfma_f32_32x32x8bf16_1k)
+        else if constexpr DISPATCH_MFMA_BF16_1K_(bf16_t, bf16_t, fp32_t, 16, 16, 16, __builtin_amdgcn_mfma_f32_16x16x16bf16_1k)
+        else if constexpr DISPATCH_MFMA_8BIT_(fp8_t , fp8_t , fp32_t, 32, 32, 16, __builtin_amdgcn_mfma_f32_32x32x16_fp8_fp8)
+        else if constexpr DISPATCH_MFMA_8BIT_(fp8_t , fp8_t , fp32_t, 16, 16, 32, __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8)
+        else if constexpr DISPATCH_MFMA_8BIT_(bf8_t , bf8_t , fp32_t, 32, 32, 16, __builtin_amdgcn_mfma_f32_32x32x16_bf8_bf8)
+        else if constexpr DISPATCH_MFMA_8BIT_(bf8_t , bf8_t , fp32_t, 16, 16, 32, __builtin_amdgcn_mfma_f32_16x16x32_bf8_bf8)
 #endif
 #if defined(__gfx942__) || defined(__gfx9_4_generic__)
         else if constexpr DISPATCH_MFMA_STEP_K_(fp16_t, fp16_t, fp32_t, 32, 32, 16,  8, __builtin_amdgcn_mfma_f32_32x32x8f16)
         else if constexpr DISPATCH_MFMA_STEP_K_(fp16_t, fp16_t, fp32_t, 16, 16, 32, 16, __builtin_amdgcn_mfma_f32_16x16x16f16)
-        else if constexpr DISPATCH_MFMA_STEP_K_(bf16_t, bf16_t, fp32_t, 32, 32, 16,  8, __builtin_amdgcn_mfma_f32_32x32x8bf16)
-        else if constexpr DISPATCH_MFMA_STEP_K_(bf16_t, bf16_t, fp32_t, 16, 16, 32, 16, __builtin_amdgcn_mfma_f32_16x16x16bf16)
+        else if constexpr DISPATCH_MFMA_STEP_K_BF16_1K_(bf16_t, bf16_t, fp32_t, 32, 32, 16,  8, __builtin_amdgcn_mfma_f32_32x32x8bf16_1k)
+        else if constexpr DISPATCH_MFMA_STEP_K_BF16_1K_(bf16_t, bf16_t, fp32_t, 16, 16, 32, 16, __builtin_amdgcn_mfma_f32_16x16x16bf16_1k)
 #endif
 #if defined(__gfx950__)
         else if constexpr DISPATCH_MFMA_(fp16_t, fp16_t, fp32_t, 32, 32, 16, __builtin_amdgcn_mfma_f32_32x32x16_f16)
@@ -1463,6 +1482,10 @@ struct mfma {
     }
 };
 #undef DISPATCH_MFMA_
+#undef DISPATCH_MFMA_STEP_K_
+#undef DISPATCH_MFMA_BF16_1K_
+#undef DISPATCH_MFMA_STEP_K_BF16_1K_
+#undef DISPATCH_MFMA_8BIT_
 
 using mfma_f32_32x32x8_f16      = mfma<fp16_t, fp16_t, fp32_t, 32, 32,  8>;
 using mfma_f32_16x16x16_f16     = mfma<fp16_t, fp16_t, fp32_t, 16, 16, 16>;

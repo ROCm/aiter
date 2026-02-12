@@ -3,7 +3,12 @@
 """
 Test OPUS device kernels via a single PyTorch extension (opus_device_test).
 Covers:
-  - MFMA 32x32x8 fp16 (gfx942 only)
+  - MFMA 32x32x8   fp16/bf16 (gfx942 only)
+  - MFMA 16x16x16  fp16/bf16 (gfx942 only)
+  - MFMA 32x32x16  fp16/bf16 (gfx942 + gfx950)
+  - MFMA 16x16x32  fp16/bf16 (gfx942 + gfx950)
+  - MFMA 32x32x16  fp8/bf8  (gfx942 + gfx950, fp32 output)
+  - MFMA 16x16x32  fp8/bf8  (gfx942 + gfx950, fp32 output)
   - vector_add (all GPUs)
   - async_load (all GPUs)
   - dtype_convert: FP32<->BF16, FP32<->FP16, FP32<->FP8 round-trips (all GPUs)
@@ -87,29 +92,47 @@ def _get_gpu_arch():
 # Individual test functions
 # ---------------------------------------------------------------------------
 
-_MFMA_SUPPORTED_ARCHS = {"gfx942"}
+# Arch sets for runtime gating
+_MFMA_ARCHS_GFX942 = {"gfx942"}  # 32x32x8, 16x16x16
+_MFMA_ARCHS_GFX942_GFX950 = {"gfx942", "gfx950"}  # 32x32x16, 16x16x32
 
 
-def test_mfma(mod):
-    """Test MFMA 32x32x8 fp16 kernel (gfx942 only)."""
+_FP8_LIKE_DTYPES = {torch.float8_e4m3fnuz, torch.float8_e5m2fnuz}
+
+
+def _test_mfma_variant(mod, variant, M, N, K, dtype, supported_archs):
+    """Test a single MFMA variant. Returns 0 on pass, 1 on fail.
+
+    For fp8/bf8 dtypes the kernel outputs raw fp32 accumulator (no cast back),
+    so C is float32 and we compare against an fp32 reference.
+    """
     arch = _get_gpu_arch()
-    if arch not in _MFMA_SUPPORTED_ARCHS:
-        print(f"  SKIP: mfma requires {_MFMA_SUPPORTED_ARCHS}, got '{arch}'")
+    if arch not in supported_archs:
+        print(f"  SKIP: mfma_{variant} requires {supported_archs}, got '{arch}'")
         return 0
 
-    M, N, K = 32, 32, 8
     device = torch.device("cuda")
-    dtype = torch.float16
+    is_fp8_like = dtype in _FP8_LIKE_DTYPES
 
     torch.manual_seed(12345)
-    A = torch.randint(-10, 11, (M, K), device=device).to(dtype)
-    B = torch.randint(-10, 11, (N, K), device=device).to(dtype)
-    C = torch.empty(M, N, device=device, dtype=dtype)
+    if is_fp8_like:
+        # Use small integers that are exactly representable in fp8/bf8
+        A = torch.randint(-3, 4, (M, K), device=device).float().to(dtype)
+        B = torch.randint(-3, 4, (N, K), device=device).float().to(dtype)
+        out_dtype = torch.float32  # kernel stores fp32 accumulator
+    else:
+        A = torch.randint(-10, 11, (M, K), device=device).to(dtype)
+        B = torch.randint(-10, 11, (N, K), device=device).to(dtype)
+        out_dtype = dtype
 
-    mod.run_mfma_32x32x8_f16(A, B, C)
+    C = torch.empty(M, N, device=device, dtype=out_dtype)
+
+    mod.run_mfma(A, B, C, variant)
 
     # swap_ab net result in row-major memory: C = A @ B^T
-    C_ref = torch.mm(A.float(), B.float().t()).to(dtype)
+    # Kernel uses opus::cast with RNE for bf16, matching PyTorch .to(bfloat16).
+    # For fp8/bf8: inputs are exact small ints, accumulator is fp32 -> exact result.
+    C_ref = torch.mm(A.float(), B.float().t()).to(out_dtype)
 
     atol, rtol = 1e-3, 1e-3
     ok = torch.allclose(C.float(), C_ref.float(), atol=atol, rtol=rtol)
@@ -123,12 +146,120 @@ def test_mfma(mod):
             .item()
         )
         print(
-            f"  FAIL: mfma_32x32x8_f16 max_diff={max_diff:.4f}, "
+            f"  FAIL: mfma_{variant} max_diff={max_diff:.4f}, "
             f"{diff_count} elements outside tol"
         )
         return 1
-    print(f"  PASS: mfma_32x32x8_f16, max_diff={max_diff:.4f}")
+    print(f"  PASS: mfma_{variant}, max_diff={max_diff:.4f}")
     return 0
+
+
+def test_mfma_32x32x8_f16(mod):
+    """Test MFMA 32x32x8 fp16 kernel (gfx942 only)."""
+    return _test_mfma_variant(
+        mod, "32x32x8_f16", 32, 32, 8, torch.float16, _MFMA_ARCHS_GFX942
+    )
+
+
+def test_mfma_32x32x8_bf16(mod):
+    """Test MFMA 32x32x8 bf16 kernel (gfx942 only)."""
+    return _test_mfma_variant(
+        mod, "32x32x8_bf16", 32, 32, 8, torch.bfloat16, _MFMA_ARCHS_GFX942
+    )
+
+
+def test_mfma_16x16x16_f16(mod):
+    """Test MFMA 16x16x16 fp16 kernel (gfx942 only)."""
+    return _test_mfma_variant(
+        mod, "16x16x16_f16", 16, 16, 16, torch.float16, _MFMA_ARCHS_GFX942
+    )
+
+
+def test_mfma_16x16x16_bf16(mod):
+    """Test MFMA 16x16x16 bf16 kernel (gfx942 only)."""
+    return _test_mfma_variant(
+        mod, "16x16x16_bf16", 16, 16, 16, torch.bfloat16, _MFMA_ARCHS_GFX942
+    )
+
+
+def test_mfma_32x32x16_f16(mod):
+    """Test MFMA 32x32x16 fp16 kernel (gfx942 step_k + gfx950 native)."""
+    return _test_mfma_variant(
+        mod, "32x32x16_f16", 32, 32, 16, torch.float16, _MFMA_ARCHS_GFX942_GFX950
+    )
+
+
+def test_mfma_32x32x16_bf16(mod):
+    """Test MFMA 32x32x16 bf16 kernel (gfx942 step_k + gfx950 native)."""
+    return _test_mfma_variant(
+        mod, "32x32x16_bf16", 32, 32, 16, torch.bfloat16, _MFMA_ARCHS_GFX942_GFX950
+    )
+
+
+def test_mfma_16x16x32_f16(mod):
+    """Test MFMA 16x16x32 fp16 kernel (gfx942 step_k + gfx950 native)."""
+    return _test_mfma_variant(
+        mod, "16x16x32_f16", 16, 16, 32, torch.float16, _MFMA_ARCHS_GFX942_GFX950
+    )
+
+
+def test_mfma_16x16x32_bf16(mod):
+    """Test MFMA 16x16x32 bf16 kernel (gfx942 step_k + gfx950 native)."""
+    return _test_mfma_variant(
+        mod, "16x16x32_bf16", 16, 16, 32, torch.bfloat16, _MFMA_ARCHS_GFX942_GFX950
+    )
+
+
+def test_mfma_32x32x16_fp8(mod):
+    """Test MFMA 32x32x16 fp8 kernel (native, fp32 output)."""
+    return _test_mfma_variant(
+        mod,
+        "32x32x16_fp8",
+        32,
+        32,
+        16,
+        torch.float8_e4m3fnuz,
+        _MFMA_ARCHS_GFX942_GFX950,
+    )
+
+
+def test_mfma_32x32x16_bf8(mod):
+    """Test MFMA 32x32x16 bf8 kernel (native, fp32 output)."""
+    return _test_mfma_variant(
+        mod,
+        "32x32x16_bf8",
+        32,
+        32,
+        16,
+        torch.float8_e5m2fnuz,
+        _MFMA_ARCHS_GFX942_GFX950,
+    )
+
+
+def test_mfma_16x16x32_fp8(mod):
+    """Test MFMA 16x16x32 fp8 kernel (native, fp32 output)."""
+    return _test_mfma_variant(
+        mod,
+        "16x16x32_fp8",
+        16,
+        16,
+        32,
+        torch.float8_e4m3fnuz,
+        _MFMA_ARCHS_GFX942_GFX950,
+    )
+
+
+def test_mfma_16x16x32_bf8(mod):
+    """Test MFMA 16x16x32 bf8 kernel (native, fp32 output)."""
+    return _test_mfma_variant(
+        mod,
+        "16x16x32_bf8",
+        16,
+        16,
+        32,
+        torch.float8_e5m2fnuz,
+        _MFMA_ARCHS_GFX942_GFX950,
+    )
 
 
 def test_vector_add(mod):
@@ -310,7 +441,18 @@ def main():
     mod = __import__(_MODULE_NAME)
 
     failures = 0
-    failures += test_mfma(mod)
+    failures += test_mfma_32x32x8_f16(mod)
+    failures += test_mfma_32x32x8_bf16(mod)
+    failures += test_mfma_16x16x16_f16(mod)
+    failures += test_mfma_16x16x16_bf16(mod)
+    failures += test_mfma_32x32x16_f16(mod)
+    failures += test_mfma_32x32x16_bf16(mod)
+    failures += test_mfma_16x16x32_f16(mod)
+    failures += test_mfma_16x16x32_bf16(mod)
+    failures += test_mfma_32x32x16_fp8(mod)
+    failures += test_mfma_32x32x16_bf8(mod)
+    failures += test_mfma_16x16x32_fp8(mod)
+    failures += test_mfma_16x16x32_bf8(mod)
     failures += test_vector_add(mod)
     failures += test_async_load(mod)
     failures += test_dtype_convert_fp32_bf16(mod)

@@ -11,7 +11,7 @@ op_tests/opus/
 ├── test_opus_basic.cpp          # Host-only C++ test (no GPU)
 ├── build.sh                     # Builds test_opus_basic
 ├── device/                      # GPU kernel tests (single PyTorch extension)
-│   ├── test_mfma.cu             # MFMA 32x32x8 fp16 kernel (gfx942 only)
+│   ├── test_mfma.cu             # MFMA kernels: fp16/bf16/fp8/bf8 variants
 │   ├── test_mfma.h              # C API header for MFMA
 │   ├── test_vector_add.cu       # Vector addition kernel using OPUS gmem
 │   ├── test_vector_add.h        # C API header for vector_add
@@ -160,17 +160,28 @@ All tests (including the new one) will build and run inside the Docker container
 
 ## Device test summary
 
-| Test | OPUS APIs exercised | Arch |
-|---|---|---|
-| `test_mfma` | `make_mfma`, `mfma_adaptor_swap_ab`, `make_tiled_mma`, `partition_layout_a/b/c`, `make_gmem` | gfx942 only |
-| `test_vector_add` | `make_gmem`, vectorized `load<VECTOR_SIZE>` / `store<VECTOR_SIZE>` | all |
-| `test_async_load` | `make_gmem`, `gmem::async_load`, `s_waitcnt_vmcnt` | all |
-| `test_dtype_convert` (fp32<->bf16) | `fp32_to_bf16` (truncation mode), `bf16_to_fp32` | all |
-| `test_dtype_convert` (fp32<->fp16) | `fp32_to_fp16`, `fp16_to_fp32` | all |
-| `test_dtype_convert` (fp32<->fp8) | `cast<fp8_t>(fp32x4_t)`, `cast<fp32_t>(fp8x4_t)` (packed x4) | all |
+| Test | Variant | OPUS APIs exercised | Arch |
+|---|---|---|---|
+| `test_mfma` | 32x32x8 fp16/bf16 | `make_tiled_mma`, `mfma_adaptor_swap_ab`, `partition_layout_a/b/c`, `make_gmem`, `cast` | gfx942 |
+| `test_mfma` | 16x16x16 fp16/bf16 | (same as above) | gfx942 |
+| `test_mfma` | 32x32x16 fp16/bf16 | (same, uses base 32x32x8 with K-loop on gfx942; native on gfx950) | gfx942 + gfx950 |
+| `test_mfma` | 16x16x32 fp16/bf16 | (same, uses base 16x16x16 with K-loop on gfx942; native on gfx950) | gfx942 + gfx950 |
+| `test_mfma` | 32x32x16 fp8/bf8 | `make_tiled_mma`, `partition_layout_a/b/c`, `make_gmem` (fp32 output, no cast) | gfx942 + gfx950 |
+| `test_mfma` | 16x16x32 fp8/bf8 | (same as above) | gfx942 + gfx950 |
+| `test_vector_add` | — | `make_gmem`, vectorized `load<N>` / `store<N>` | all |
+| `test_async_load` | — | `make_gmem`, `gmem::async_load`, `s_waitcnt_vmcnt` | all |
+| `test_dtype_convert` | fp32<->bf16 | `fp32_to_bf16` (truncation mode), `bf16_to_fp32` | all |
+| `test_dtype_convert` | fp32<->fp16 | `fp32_to_fp16`, `fp16_to_fp32` | all |
+| `test_dtype_convert` | fp32<->fp8 | `cast<fp8_t>(fp32x4_t)`, `cast<fp32_t>(fp8x4_t)` (packed x4) | all |
+
+Total: **17 tests** (12 MFMA + 1 vector_add + 1 async_load + 3 dtype_convert).
 
 ## Notes
 
 - The extension compiles with `--offload-arch=native` (see `device/setup.py`) to target only the current GPU and speed up builds.
-- MFMA tests require `gfx942` (MI300); they are automatically skipped on other architectures.
+- MFMA tests are runtime-gated by GPU architecture (`gcnArchName`). Tests for unsupported architectures are automatically skipped.
+  - 32x32x8 and 16x16x16 variants: gfx942 only.
+  - 32x32x16 and 16x16x32 fp16/bf16 variants: gfx942 (via step-K decomposition) + gfx950 (native instruction).
+  - 32x32x16 and 16x16x32 fp8/bf8 variants: gfx942 + gfx950 (native instruction on both). Output is raw fp32 accumulator.
+- FP8 = `float8_e4m3fnuz` (AMD), BF8 = `float8_e5m2fnuz` (AMD).
 - `test_opus_device.py` does a fresh build on every run (cleans previous `.so` and `build/` dir) to ensure changes are picked up.
