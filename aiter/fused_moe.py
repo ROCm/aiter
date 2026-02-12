@@ -1011,11 +1011,11 @@ def fused_moe_2stages(
             device=device,
         )
     elif quant_type == QuantType.per_Token:  # feifei: add enum lqq
-        a2_sz = token_num * topk * inter_dim
-        a2_scale_sz = token_num * topk * inter_dim // 32
-        total_size = a2_sz + a2_scale_sz
-        a2 = torch.empty(total_size, dtype=q_dtype_a, device=device)
-        a2 = a2.view(token_num, topk, -1)
+        a2 = torch.empty(
+            (token_num, topk, inter_dim),
+            dtype=dtype,
+            device=device,
+        )
     else:
         a2 = torch.empty(
             (token_num, topk, inter_dim),
@@ -1169,8 +1169,6 @@ def asm_stage1(
     sorted_weights=None,
 ):
     dtype = dtypes.bf16  # out.dtype, asm only support bf16
-    if quant_type == QuantType.per_Token:  # feifei: add enum lqq
-        dtype = dtypes.i8
     if quant_type != QuantType.per_1x128:
         out = out.view(dtype)
     device = out.device
