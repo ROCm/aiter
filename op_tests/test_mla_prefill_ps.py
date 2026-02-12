@@ -589,7 +589,8 @@ parser.add_argument(
     "-blk",
     "--block_size",
     type=int,
-    default=1,
+    nargs="*",
+    default=[1],
     help="""Block size.
     e.g.: -blk 1""",
 )
@@ -600,6 +601,7 @@ parser.add_argument(
     choices=[dtypes.d_dtypes["fp8"]],
     nargs="*",
     default=[dtypes.d_dtypes["fp8"]],
+    metavar="{fp8}",
     help="""Data type of Q.
     e.g.: -d fp8""",
 )
@@ -610,6 +612,7 @@ parser.add_argument(
     choices=[dtypes.d_dtypes["fp8"]],
     nargs="*",
     default=[dtypes.d_dtypes["fp8"]],
+    metavar="{fp8}",
     help="""Data type of KV.
     e.g.: -kvd fp8""",
 )
@@ -617,6 +620,7 @@ parser.add_argument(
     "-c",
     "--ctx_len",
     type=int,
+    nargs="*",
     default=[
         21,
         64,
@@ -636,6 +640,7 @@ parser.add_argument(
 parser.add_argument(
     "-b",
     "--batch_size",
+    nargs="*",
     type=int,
     default=[1, 4, 16],
     help="""Batch size.
@@ -644,6 +649,7 @@ parser.add_argument(
 parser.add_argument(
     "-n",
     "--num_heads",
+    nargs="*",
     type=int,
     default=[1, 16],
     help="""Number of heads(for mla prefill(MHA), num_head_q = num_head_kv).
