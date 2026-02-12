@@ -557,7 +557,26 @@ def select_best_kernels(valid_df: pd.DataFrame, output_file: str) -> pd.DataFram
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Benchmark MOE kernels"
+        description="""
+MOE Kernel Benchmarking Tool
+
+Benchmarks ALL available MOE kernel implementations (ASM, CK, Triton) for given configurations
+and produces three analysis outputs: benchmark results, all combinations, and best kernels.
+
+Examples:
+  # Benchmark from CSV file (ASM/CK only)
+  python benchmark.py -i configs/sample.csv -o results/output
+  
+  # Include Triton kernels
+  python benchmark.py -i configs/sample.csv -o results/output --include-triton
+  
+  # Quick test with single config
+  python benchmark.py --config "1,4096,1536,16,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0" -o results/test --include-triton
+  
+  # Resume interrupted run
+  python benchmark.py -i configs/sample.csv -o results/output --resume
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
         "-i", "--input",
