@@ -945,7 +945,7 @@ def get_2stage_cfgs(
             else:
                 return min_block_m
 
-        flydsl_block_m = get_dsl_block_m()
+        if os.environ.get("AITER_FLYDSL_MOE_BLOCK_M", "") == "": flydsl_block_m = get_dsl_block_m()
 
         stage1_func = (
             functools.partial(
@@ -1784,7 +1784,7 @@ def flydsl_moe_stage1(
 
     tile_m = int(block_m) if block_m is not None else 64
     tile_n = 64 # 128
-    tile_k = 128 if _is_w4a16 else 256
+    tile_k = 64 if _is_w4a16 else 256
     # Decode/small-token fix (NO kernel changes):
     # FlyDSL stage1 kernel expects CK-style preshuffled W1 layout, but model weights are not
     # preshuffled. For small tokens, only a handful of experts are actually touched.
