@@ -20,6 +20,7 @@ setup(
             sources=[
                 os.path.join(_THIS_DIR, "test_mfma.cu"),
                 os.path.join(_THIS_DIR, "test_mxfp.cu"),
+                os.path.join(_THIS_DIR, "test_load_store_if.cu"),
                 os.path.join(_THIS_DIR, "test_vector_add.cu"),
                 os.path.join(_THIS_DIR, "test_async_load.cu"),
                 os.path.join(_THIS_DIR, "test_dtype_convert.cu"),

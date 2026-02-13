@@ -17,6 +17,9 @@ Covers:
   - async_load (all GPUs)
   - dtype_convert: FP32<->BF16, FP32<->FP16, FP32<->FP8 round-trips (all GPUs)
   - dtype_convert: FP32<->FP4 (e2m1) round-trip (gfx950 only, packed x8)
+  - predicated_copy: gmem load_if/store_if with boundary predicate (all GPUs)
+  - free_func_vector_add: opus::load/store free function API (all GPUs)
+  - predicated_async_load: gmem async_load_if with boundary predicate (all GPUs)
 """
 
 import glob
@@ -666,6 +669,119 @@ def test_dtype_convert_fp32_fp4(mod):
 
 
 # ---------------------------------------------------------------------------
+# Predicated load/store and free function API tests (all GPUs)
+# ---------------------------------------------------------------------------
+
+
+def test_predicated_copy(mod):
+    """Test gmem load_if/store_if via free function wrappers (boundary predicate)."""
+    # Use n not aligned to block*4 to create a partial boundary condition
+    n = 1001
+    BLOCK_SIZE = 256
+    ELEMS = 4
+    total_threads = (n + ELEMS - 1) // ELEMS
+    n_padded = ((total_threads + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE * ELEMS
+
+    device = torch.device("cuda")
+
+    torch.manual_seed(42)
+    Src = torch.randn(n, device=device, dtype=torch.float32)
+    Dst = torch.full((n_padded,), -1.0, device=device, dtype=torch.float32)
+
+    mod.run_predicated_copy(Src, Dst)
+
+    # In-bounds elements should match source
+    ok_data = torch.equal(Dst[:n], Src)
+    # Out-of-bounds elements should be untouched (sentinel = -1.0)
+    ok_sentinel = torch.equal(Dst[n:], torch.full((n_padded - n,), -1.0, device=device))
+
+    if not ok_data or not ok_sentinel:
+        if not ok_data:
+            diff = (Dst[:n] - Src).abs()
+            print(
+                f"  FAIL: predicated_copy data mismatch, "
+                f"max_diff={diff.max().item():.6e}, "
+                f"{diff.gt(0).sum().item()}/{n} elements differ"
+            )
+        if not ok_sentinel:
+            bad = (Dst[n:] != -1.0).sum().item()
+            print(
+                f"  FAIL: predicated_copy sentinel corrupted, "
+                f"{bad}/{n_padded - n} sentinel elements modified"
+            )
+        return 1
+    print(f"  PASS: predicated_copy (n={n}), bit-exact with boundary predicate")
+    return 0
+
+
+def test_free_func_vector_add(mod):
+    """Test opus::load / opus::store free function wrappers (vector add)."""
+    n = 1310720  # same as regular vector_add test
+    device = torch.device("cuda")
+    dtype = torch.float32
+
+    torch.manual_seed(99)
+    A = torch.randn(n, device=device, dtype=dtype)
+    B = torch.randn(n, device=device, dtype=dtype)
+    Result = torch.empty(n, device=device, dtype=dtype)
+
+    mod.run_free_func_add(A, B, Result)
+
+    Ref = A + B
+
+    atol, rtol = 1e-5, 1e-5
+    ok = torch.allclose(Result, Ref, atol=atol, rtol=rtol)
+    max_diff = (Result - Ref).abs().max().item()
+    if not ok:
+        diff_count = (Result - Ref).abs().gt(atol + rtol * Ref.abs()).sum().item()
+        print(
+            f"  FAIL: free_func_vector_add max_diff={max_diff:.6e}, "
+            f"{diff_count} elements outside tol"
+        )
+        return 1
+    print(f"  PASS: free_func_vector_add (n={n}), max_diff={max_diff:.6e}")
+    return 0
+
+
+def test_predicated_async_load(mod):
+    """Test gmem async_load_if via free function wrapper (boundary predicate)."""
+    n = 1001
+    BLOCK_SIZE = 256
+    n_padded = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE  # 1024
+
+    device = torch.device("cuda")
+
+    torch.manual_seed(77)
+    Src = torch.randn(n, device=device, dtype=torch.float32)
+    Dst = torch.full((n_padded,), -1.0, device=device, dtype=torch.float32)
+
+    mod.run_predicated_async_load(Src, Dst, n_padded)
+
+    # In-bounds: should match source
+    ok_data = torch.equal(Dst[:n], Src)
+    # Out-of-bounds: async_load_if zero-fills smem, so dst[n:] should be 0.0
+    ok_zeros = torch.equal(Dst[n:], torch.zeros(n_padded - n, device=device))
+
+    if not ok_data or not ok_zeros:
+        if not ok_data:
+            diff = (Dst[:n] - Src).abs()
+            print(
+                f"  FAIL: predicated_async_load data mismatch, "
+                f"max_diff={diff.max().item():.6e}, "
+                f"{diff.gt(0).sum().item()}/{n} elements differ"
+            )
+        if not ok_zeros:
+            bad = (Dst[n:] != 0.0).sum().item()
+            print(
+                f"  FAIL: predicated_async_load OOB not zeroed, "
+                f"{bad}/{n_padded - n} elements non-zero"
+            )
+        return 1
+    print(f"  PASS: predicated_async_load (n={n}), bit-exact with boundary predicate")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -707,6 +823,9 @@ def main():
     failures += test_dtype_convert_fp32_fp16(mod)
     failures += test_dtype_convert_fp32_fp8(mod)
     failures += test_dtype_convert_fp32_fp4(mod)
+    failures += test_predicated_copy(mod)
+    failures += test_free_func_vector_add(mod)
+    failures += test_predicated_async_load(mod)
 
     if failures:
         print(f"\n{failures} test(s) FAILED")

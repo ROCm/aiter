@@ -20,6 +20,7 @@
 #include "test_vector_add.h"
 #include "test_async_load.h"
 #include "test_dtype_convert.h"
+#include "test_load_store_if.h"
 
 // ---------- MFMA wrapper ----------
 
@@ -272,6 +273,68 @@ static void run_dtype_convert_torch(
     }
 }
 
+// ---------- Predicated load/store wrappers ----------
+
+static void run_predicated_copy_torch(
+    torch::Tensor Src,
+    torch::Tensor Dst)
+{
+    TORCH_CHECK(Src.is_cuda(), "Src must be a CUDA tensor");
+    TORCH_CHECK(Dst.is_cuda(), "Dst must be a CUDA tensor");
+    TORCH_CHECK(Src.dtype() == torch::kFloat32, "Src must be float32");
+    TORCH_CHECK(Dst.dtype() == torch::kFloat32, "Dst must be float32");
+    TORCH_CHECK(Src.is_contiguous() && Dst.is_contiguous(),
+                "Src, Dst must be contiguous");
+    TORCH_CHECK(Src.dim() == 1 && Dst.dim() == 1,
+                "Src, Dst must be 1-D");
+    int n = static_cast<int>(Src.numel());
+    TORCH_CHECK(Dst.numel() >= n, "Dst must be at least as large as Src");
+
+    run_predicated_copy(Src.data_ptr(), Dst.data_ptr(), n);
+}
+
+static void run_free_func_add_torch(
+    torch::Tensor A,
+    torch::Tensor B,
+    torch::Tensor Result)
+{
+    TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
+    TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
+    TORCH_CHECK(Result.is_cuda(), "Result must be a CUDA tensor");
+    TORCH_CHECK(A.dtype() == torch::kFloat32, "A must be float32");
+    TORCH_CHECK(B.dtype() == torch::kFloat32, "B must be float32");
+    TORCH_CHECK(Result.dtype() == torch::kFloat32, "Result must be float32");
+    TORCH_CHECK(A.is_contiguous() && B.is_contiguous() && Result.is_contiguous(),
+                "A, B, Result must be contiguous");
+    TORCH_CHECK(A.dim() == 1 && B.dim() == 1 && Result.dim() == 1,
+                "A, B, Result must be 1-D");
+    int n = static_cast<int>(A.numel());
+    TORCH_CHECK(B.numel() == n && Result.numel() == n,
+                "A, B, Result must have the same number of elements");
+
+    run_free_func_add(A.data_ptr(), B.data_ptr(), Result.data_ptr(), n);
+}
+
+static void run_predicated_async_load_torch(
+    torch::Tensor Src,
+    torch::Tensor Dst,
+    int64_t n_padded)
+{
+    TORCH_CHECK(Src.is_cuda(), "Src must be a CUDA tensor");
+    TORCH_CHECK(Dst.is_cuda(), "Dst must be a CUDA tensor");
+    TORCH_CHECK(Src.dtype() == torch::kFloat32, "Src must be float32");
+    TORCH_CHECK(Dst.dtype() == torch::kFloat32, "Dst must be float32");
+    TORCH_CHECK(Src.is_contiguous() && Dst.is_contiguous(),
+                "Src, Dst must be contiguous");
+    TORCH_CHECK(Src.dim() == 1 && Dst.dim() == 1,
+                "Src, Dst must be 1-D");
+    int n = static_cast<int>(Src.numel());
+    TORCH_CHECK(Dst.numel() >= n_padded, "Dst must be at least n_padded elements");
+    TORCH_CHECK(n_padded % 256 == 0, "n_padded must be a multiple of 256");
+
+    run_predicated_async_load(Src.data_ptr(), Dst.data_ptr(), n, static_cast<int>(n_padded));
+}
+
 // ---------- Module ----------
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -290,4 +353,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("run_dtype_convert", &run_dtype_convert_torch,
           "OPUS dtype round-trip: In(fp32) -> lowp -> Out(fp32). "
           "variant: 'fp32_bf16', 'fp32_fp16', 'fp32_fp8', or 'fp32_fp4'");
+    m.def("run_predicated_copy", &run_predicated_copy_torch,
+          "OPUS predicated copy: Dst[i] = Src[i] where i < n, via gmem load_if/store_if");
+    m.def("run_free_func_add", &run_free_func_add_torch,
+          "OPUS vector add via free function API: Result = A + B");
+    m.def("run_predicated_async_load", &run_predicated_async_load_torch,
+          "OPUS predicated async_load: copy Src -> LDS -> Dst with bounds predicate",
+          py::arg("Src"), py::arg("Dst"), py::arg("n_padded"));
 }
