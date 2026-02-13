@@ -140,7 +140,7 @@ def run_benchmark(args, defaults):
         run_shape_benchmark(args, impl)
 
 
-def parse_args():
+def parse_args(args: list[str] | None = None):
     parser = get_parser(kernel_name="A8W8 GEMM Blockscale")
     parser = add_argparse_ff(parser)
     parser.add_argument(
@@ -148,11 +148,11 @@ def parse_args():
         action="store_true",
         help="Use Gluon implementation (experimental, requires latest Triton from main)",
     )
-    return get_ff_args(parser)
+    return get_ff_args(parser, args=args)
 
 
-def main():
-    args, defaults = parse_args()
+def main(args: list[str] | None = None) -> None:
+    args, defaults = parse_args(args=args)
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
         fun = lambda: run_benchmark(args, defaults)  # noqa: E731

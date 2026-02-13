@@ -40,11 +40,13 @@ def get_parser(kernel_name: str) -> argparse.ArgumentParser:
     return parser
 
 
-def get_ff_args(parser: argparse.ArgumentParser) -> Tuple[dict, dict]:
+def get_ff_args(
+    parser: argparse.ArgumentParser, args: list[str] | None = None
+) -> Tuple[dict, dict]:
     """
     Does additional processing on parser args for feed-forward blocks.
     """
-    args = parser.parse_args()
+    args = parser.parse_args(args=args)
     if args.shape is not None:
         if len(args.shape) == 3:
             args.M, args.N, args.K = args.shape
