@@ -601,6 +601,7 @@ struct layout_linear : public remove_cvref_t<Layout>{
 
     OPUS_H_D constexpr void inc(index_t offset) { linear_offset += offset; }
     OPUS_H_D constexpr layout_linear& operator+=(index_t offset) { inc(offset); return *this; }
+    OPUS_H_D constexpr layout_linear operator+(index_t offset) const { layout_linear result(*this); result += offset; return result; }
 
     index_t linear_offset;
 };
@@ -630,6 +631,7 @@ struct layout_cached : public remove_cvref_t<Layout> {
 
     OPUS_H_D constexpr void inc(index_t offset) { static_for<num_issues>([&](auto i){ offsets[i] += offset; }); }
     OPUS_H_D constexpr layout_cached& operator+=(index_t offset) { inc(offset); return *this; }
+    OPUS_H_D constexpr layout_cached operator+(index_t offset) const { layout_cached result(*this); result += offset; return result; }
 
     array<index_t, num_issues> offsets;
 };
@@ -655,7 +657,7 @@ OPUS_H_D constexpr auto vectorize_issue_space(issue_space, number<vec> = {}) {
     static_assert(vec_from_issue_space % vec == 0, "please make sure requested vec size can be dividable of vec from issue space");
 
     constexpr auto issue_space_vec = transform_tuple_with_idx([&](auto item, auto index){           // modify the last dim, divide it by vec. Result is still a tuple
-        if constexpr (index.value == size<issue_space>() - 1) return number<item.value / vec_from_issue_space>{};
+        if constexpr (index.value == size<issue_space>() - 1) return number<item.value / vec>{};
         else                                                  return item;    }, issue_space{});
     return issue_space_vec;
 }
@@ -1303,6 +1305,69 @@ struct gmem {
         });
     }
 
+    template<index_t vec = 1, typename Predicate, typename Layout, index_t aux = 0, std::enable_if_t<is_layout_v<Layout>, bool> = true>
+    OPUS_D auto load_if(const Predicate& pred, const Layout& u, int s_os = 0, number<aux> = {})
+    {
+        constexpr auto issue_space = layout_to_issue_space<Layout>();
+        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+        constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
+
+#if OPUS_TILE_CONTAINER == 0
+        constexpr auto u_r = make_layout<-1>(issue_space);
+        vector_t<scalar_type, vec * vector_size * r_elem.value> r;
+        static_ford(issue_space_vec, [&](auto ... ids){
+            auto tmp = pred(ids...) ? load<vec>(u(ids...), s_os, number<aux>{}) : vector_type<vec>{0};
+            constexpr index_t u_rs = u_r(ids...);
+            set_slice(r, tmp, number<u_rs>{}, number<u_rs + vec>{});
+        });
+        return r;
+#elif OPUS_TILE_CONTAINER == 1
+        constexpr auto u_r = make_layout<-1>(issue_space_vec);
+        array<vector_type<vec>, r_elem.value> r;
+        static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = pred(ids...) ? load<vec>(u(ids...), s_os, number<aux>{}) : vector_type<vec>{0}; }); // issue the loading instruction multiple times
+        return r;
+#endif
+    }
+
+    template<index_t vec = 1, typename Predicate, typename V, typename Layout, index_t aux = 0, std::enable_if_t<((is_array_v<V> || is_vector_v<V>) && is_layout_v<Layout>), bool> = true>
+    OPUS_D void store_if(const Predicate& pred, const V& x, const Layout& u, int s_os = 0, number<aux> = {})
+    {
+        constexpr auto issue_space = layout_to_issue_space<Layout>();
+        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+
+        constexpr auto u_r = make_layout<-1>(issue_space);
+#if OPUS_TILE_CONTAINER == 0
+        auto a_ = [&](){ if constexpr (is_array_v<V>) return to_vector(x);
+                         else if constexpr (is_dtype_v<V>) return make_repeated_vector(x, number<get<0>(reduce_tuple_mul(issue_space)).value>{});
+                         else if constexpr (is_vector_v<V>) return x; }();
+#elif OPUS_TILE_CONTAINER == 1
+        auto a_ = to_array(x);
+#endif
+        static_ford(issue_space_vec, [&](auto ... ids){
+            if (pred(ids...)) {
+                auto v_ = slice(a_, number<u_r(ids...)>{}, number<u_r(ids...) + vec>{});
+                store<vec>(v_, u(ids...), s_os, number<aux>{});
+            }
+        });
+    }
+
+    template<index_t vec = 1, typename Predicate, typename LayoutG, typename LayoutS, index_t aux = 0, std::enable_if_t<is_layout_v<LayoutG> && is_layout_v<LayoutS>, bool> = true>
+    OPUS_D void async_load_if(const Predicate& pred, void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, int s_os = 0, number<aux> = {}) {
+        constexpr auto issue_space = layout_to_issue_space<LayoutG>();
+        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+        auto smem_ptr = reinterpret_cast<OPUS_LDS_ADDR scalar_type*>(reinterpret_cast<uintptr_t>(smem_base));
+
+        static_ford(issue_space_vec, [&](auto... ids) {
+            if (pred(ids...)) {
+                async_load<vec>(smem_ptr + u_smem(ids...), u_gmem(ids...), s_os, number<aux>{});
+            } else {
+                using type = vector_type<vec>;
+                type z = {0};
+                *reinterpret_cast<OPUS_LDS_ADDR type*>(smem_ptr + u_smem(ids...)) = z;
+            }
+        });
+    }
+
     __amdgpu_buffer_rsrc_t cached_rsrc;
 };
 
@@ -1384,10 +1449,84 @@ struct smem {
             store<vec>(v_, u(ids...));
         });
     }
+
+    template<index_t vec = 1, typename Predicate, typename Layout, std::enable_if_t<is_layout_v<Layout>, bool> = true>
+    OPUS_D auto load_if(const Predicate& pred, const Layout& u)
+    {
+        constexpr auto issue_space = layout_to_issue_space<Layout>();
+        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+        constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
+
+#if OPUS_TILE_CONTAINER == 0
+        constexpr auto u_r = make_layout<-1>(issue_space);
+        vector_t<scalar_type, vec * vector_size * r_elem.value> r;
+        static_ford(issue_space_vec, [&](auto ... ids){
+            auto tmp = pred(ids...) ? load<vec>(u(ids...)) : vector_type<vec>{0};
+            constexpr index_t u_rs = u_r(ids...);
+            set_slice(r, tmp, number<u_rs>{}, number<u_rs + vec>{});
+        });
+        return r;
+#elif OPUS_TILE_CONTAINER == 1
+        constexpr auto u_r = make_layout<-1>(issue_space_vec);
+        array<vector_type<vec>, r_elem.value> r;
+        static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = pred(ids...) ? load<vec>(u(ids...)) : vector_type<vec>{0}; });
+        return r;
+#endif
+    }
+
+    template<index_t vec = 1, typename Predicate, typename V, typename Layout, std::enable_if_t<((is_array_v<V> || is_dtype_v<V> || is_vector_v<V>) && is_layout_v<Layout>), bool> = true>
+    OPUS_D void store_if(const Predicate& pred, const V& x, const Layout& u)
+    {
+        constexpr auto issue_space = layout_to_issue_space<Layout>();
+        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+
+        constexpr auto u_r = make_layout<-1>(issue_space);
+#if OPUS_TILE_CONTAINER == 0
+        auto a_ = [&](){ if constexpr (is_array_v<V>) return to_vector(x);
+                         else if constexpr (is_dtype_v<V>) return make_repeated_vector(x, number<get<0>(reduce_tuple_mul(issue_space)).value>{});
+                         else if constexpr (is_vector_v<V>) return x; }();
+#elif OPUS_TILE_CONTAINER == 1
+        auto a_ = to_array(x);
+#endif
+        static_ford(issue_space_vec, [&](auto ... ids){
+            if (pred(ids...)) {
+                auto v_ = slice(a_, number<u_r(ids...)>{}, number<u_r(ids...) + vec>{});
+                store<vec>(v_, u(ids...));
+            }
+        });
+    }
+
     OPUS_LDS_ADDR char* ptr; // in unit of byte
 };
 
 template<typename T_> OPUS_D decltype(auto) make_smem(T_* ptr) { return smem<T_>{ptr}; }
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+// mem type traits & free function wrappers (eliminate .template syntax in dependent context)
+template<typename>   struct is_gmem : false_type {};
+template<typename T> struct is_gmem<gmem<T>> : true_type {};
+template<typename T> constexpr bool is_gmem_v = is_gmem<remove_cvref_t<T>>::value;
+
+template<typename>   struct is_smem : false_type {};
+template<typename T> struct is_smem<smem<T>> : true_type {};
+template<typename T> constexpr bool is_smem_v = is_smem<remove_cvref_t<T>>::value;
+
+template<typename T> constexpr bool is_mem_v = is_gmem_v<T> || is_smem_v<T>;
+
+template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_mem_v<Mem>, bool> = true>
+OPUS_D auto load(Mem& mem, Args&&... args) { return mem.template load<vec>(std::forward<Args>(args)...); }
+template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_mem_v<Mem>, bool> = true>
+OPUS_D void store(Mem& mem, Args&&... args) { mem.template store<vec>(std::forward<Args>(args)...); }
+template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_gmem_v<Mem>, bool> = true>
+OPUS_D void async_load(Mem& mem, Args&&... args) { mem.template async_load<vec>(std::forward<Args>(args)...); }
+
+template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_mem_v<Mem>, bool> = true>
+OPUS_D auto load_if(Mem& mem, Args&&... args) { return mem.template load_if<vec>(std::forward<Args>(args)...); }
+template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_mem_v<Mem>, bool> = true>
+OPUS_D void store_if(Mem& mem, Args&&... args) { mem.template store_if<vec>(std::forward<Args>(args)...); }
+template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_gmem_v<Mem>, bool> = true>
+OPUS_D void async_load_if(Mem& mem, Args&&... args) { mem.template async_load_if<vec>(std::forward<Args>(args)...); }
+
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // waitcnt
 // vmcnt=0~63([15:14],[3:0]), lgkmcnt=0~15([11:8]), expcnt=0~7([6:4])
