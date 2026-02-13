@@ -10,8 +10,6 @@
 #pragma once
 
 #include <array>
-#include <initializer_list>
-#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -69,7 +67,7 @@ template <class T> static constexpr bool is_constant_v = is_constant<remove_cvre
 // using opus::operator""_I; // => add this in your code to utilize the literal cast, e.g. 2_I, 3_I
 template <char... Ds>
 OPUS_H_D constexpr decltype(auto) operator""_I() {
-    constexpr auto to_number_ = []() { index_t v = 0; for (char d : {Ds...}) v = v * 10 + (d - '0'); return v; }; return number<to_number_()>{};
+    constexpr auto to_number_ = []() { index_t v = 0; ((v = v * 10 + (Ds - '0')), ...); return v; }; return number<to_number_()>{};
 }
 
 #define OPUS_LEFT_UNARY_OP(OP) template <auto x>         OPUS_H_D constexpr auto operator OP(number<x>)            { return number<(OP x)>{};   }
@@ -173,8 +171,8 @@ template <typename R, index_t I>                             struct reduce_seq_i
 template <typename R>                                        struct reduce_seq_impl<R, seq<>>  { using type = seq<>;  };
 }
 template<typename R, index_t...Xs> OPUS_H_D constexpr auto reduce_seq(seq<Xs...>) { return typename impl::reduce_seq_impl<R, seq<Xs...>>::type{}; }
-template<index_t...Xs> OPUS_H_D constexpr auto reduce_seq_sum(seq<Xs...>) { return reduce_seq<opus::plus>(seq<Xs...>{}); }
-template<index_t...Xs> OPUS_H_D constexpr auto reduce_seq_mul(seq<Xs...>) { return reduce_seq<opus::multiplies>(seq<Xs...>{}); }
+template<index_t...Xs> OPUS_H_D constexpr auto reduce_seq_sum(seq<Xs...>) { if constexpr (sizeof...(Xs) == 0) return seq<>{}; else return seq<(Xs + ...)>{}; }
+template<index_t...Xs> OPUS_H_D constexpr auto reduce_seq_mul(seq<Xs...>) { if constexpr (sizeof...(Xs) == 0) return seq<>{}; else return seq<(Xs * ...)>{}; }
 
 template<typename T> struct is_seq : false_type {};
 template<index_t... Is> struct is_seq<seq<Is...>> : true_type {};
@@ -349,10 +347,9 @@ template<typename T, index_t... Is> struct tuple_array_helper<T, seq<Is...>> { u
 }
 template<typename T, index_t N> using tuple_array = typename impl::tuple_array_helper<T, make_index_seq<N>>::type;  // alias for tuple<T, T....>, Nx Ts
 
-// get the I-th type within the tuple, recursive implementation
-template<index_t I, class T>                   struct tuple_element;
-template<index_t I, class Head, class... Tail> struct tuple_element<I, opus::tuple<Head, Tail...>> : tuple_element<I - 1, opus::tuple<Tail...>> {};
-template<class Head, class... Tail>            struct tuple_element<0, opus::tuple<Head, Tail...>> { using type = Head; };
+// get the I-th type within the tuple, O(1) via compiler intrinsic
+template<index_t I, class T>     struct tuple_element;
+template<index_t I, class... Ts> struct tuple_element<I, opus::tuple<Ts...>> { using type = __type_pack_element<I, Ts...>; };
 template<index_t I, class T> using tuple_element_t = typename tuple_element<I, T>::type;
 
 template <index_t I, class... T> OPUS_H_D constexpr decltype(auto) get(tuple<T...> const& t) { static_assert(I < sizeof...(T)); return impl::getv<I>(t); }
@@ -487,8 +484,8 @@ OPUS_H_D constexpr decltype(auto) merge_peepholed_tuple(PeepholedTuple&& pt, Inc
 namespace std {
 template <typename... Ts> struct tuple_size<opus::tuple<Ts...>>       : std::integral_constant<std::size_t, sizeof...(Ts)> {};
 template <typename... Ts> struct tuple_size<const opus::tuple<Ts...>> : std::integral_constant<std::size_t, sizeof...(Ts)> {};
-template <std::size_t I, typename... Ts> struct tuple_element<I, opus::tuple<Ts...>>       : std::tuple_element<I, std::tuple<Ts...>> {};
-template <std::size_t I, typename... Ts> struct tuple_element<I, const opus::tuple<Ts...>> : std::tuple_element<I, const std::tuple<Ts...>> {};
+template <std::size_t I, typename... Ts> struct tuple_element<I, opus::tuple<Ts...>>       { using type = __type_pack_element<I, Ts...>; };
+template <std::size_t I, typename... Ts> struct tuple_element<I, const opus::tuple<Ts...>> { using type = const __type_pack_element<I, Ts...>; };
 } // namespace std
 
 namespace opus {
