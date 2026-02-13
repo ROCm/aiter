@@ -955,6 +955,7 @@ def test_fmoe_lqq(
 
     input = torch.randn((token, model_dim), dtype=dtype, device="cuda")
     score = torch.randn((token, E), device="cuda", dtype=dtype)
+
     w2 = (
         torch.randn(
             (local_E + shared_E, model_dim // 2, inter_dim),
@@ -965,39 +966,28 @@ def test_fmoe_lqq(
     )
     w2_qt, w2_scale = aiter.pertoken_quant(w2, quant_dtype=dtypes.i8, dtypeMax=7)
 
+    topk_weights, topk_ids = fused_topk(input, score, topk, True)
+
     if shared_E > 0:
-        shared_E_score = 0.1
-        # init total_topk_ids, inference time you just need to fill ns_topk_ids in total_topk_ids
-        total_topk_ids = torch.empty(
-            (MAX_TOKENS, topk + shared_E + 1), dtype=dtypes.i32, device=input.device
+        shared_E_score = 0.5
+        s_topk_weights = torch.tensor(
+            [
+                [shared_E_score, shared_E_score],
+            ]
+            * token,
+            dtype=dtypes.fp32,
+            device=input.device,
         )
-        ns_topk_ids, s_topk_ids = total_topk_ids.split([topk, shared_E + 1], dim=1)
-        shared_expert_ids = [E + i for i in range(shared_E + 1)]
-        s_topk_ids_list = [[fake_expertid] * (shared_E + 1)] * MAX_TOKENS
-        for i in range(ep_id, MAX_TOKENS, ep):
-            s_topk_ids_list[i] = shared_expert_ids
-        s_topk_ids[:] = torch.tensor(
-            s_topk_ids_list, dtype=dtypes.i32, device=input.device
+        topk_weights = torch.cat((topk_weights, s_topk_weights), dim=1)
+        s_topk_ids = torch.tensor(
+            [
+                [E, E + 1],
+            ]
+            * token,
+            dtype=dtypes.i32,
+            device=input.device,
         )
-
-        # init total_topk_weights, inference time you just need to fill ns_topk_weights in total_topk_weights
-        total_topk_weights = torch.empty(
-            (MAX_TOKENS, topk + shared_E + 1), dtype=dtypes.fp32, device=input.device
-        )
-        ns_topk_weights, s_topk_weights = total_topk_weights.split(
-            [topk, shared_E + 1], dim=1
-        )
-        s_topk_weights[:] = shared_E_score
-
-        # inference time, use fused_topk to fill ns_topk_ids and ns_topk_weights
-        fused_topk(input, score, topk, True, ns_topk_ids, ns_topk_weights)
-        # inference time, topk_ids simply slices total_topk_ids into the number of input tokens, same for topk_weights
-        topk_ids = total_topk_ids[:token]
-        topk_weights = total_topk_weights[:token]
-
-        _, topk = topk_ids.shape
-    else:
-        topk_weights, topk_ids = fused_topk(input, score, topk, True)
+        topk_ids = torch.cat((topk_ids, s_topk_ids), dim=1)
 
     # O: int8
     # X_buf:                  int8  -> a1_qt             -> dev_X
@@ -1022,13 +1012,6 @@ def test_fmoe_lqq(
     GU_dqn_size = eprt * GU_dqn_k * GU_dqn_n * 2
     X_dqn_k = 1
     X_dqn_m = token
-    print("[FEIFEI] model_dim(K) = ", model_dim)
-    print("[FEIFEI] inter_dim(N) = ", inter_dim)
-    print("[FEIFEI] eprt = ", eprt)
-    print("[FEIFEI] topk = ", topk)
-    print("[FEIFEI] GU_dqn_k_lqq = ", GU_dqn_k_lqq)
-    print("[FEIFEI] GU_dqn_n_lqq = ", GU_dqn_n_lqq)
-    print("[FEIFEI] GU_dqn_n = ", GU_dqn_n)
 
     # input quant for kernel
     a1_qt, a1_scale = aiter.pertoken_quant(input, quant_dtype=AQDType)
@@ -1142,10 +1125,37 @@ def test_fmoe_lqq(
         dtype=dtype,
         block_size_M=80,
     )
-
     # save_buffer_to_file(out1_ref, "./feifei/out1_ref", format="text")
     # save_buffer_to_file(out1_asm, "./feifei/out1_asm", format="text")
-    checkAllclose(out1_ref, out1_asm, msg="asm check")
+    err = checkAllclose(out1_ref, out1_asm)
+
+    """
+    out1_asm, us1 = run_perftest(
+        fused_moe,
+        a1_qt,
+        w1_lqq_pack,
+        w2_qt,
+        topk_weights,
+        topk_ids,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=a1_scale,
+        w1_lqq_scale=w1_lqq_scale_shf,
+        w1_lqq_zero=w1_lqq_zero_uint8_shf,
+        quant_type=aiter.QuantType.per_Token,
+        activation=aiter.ActivationType.Silu,
+        doweight_stage1=False,
+        dtype=dtype,
+        block_size_M=80,
+        num_iters=100,
+        num_warmup=2,
+    )
+    err = checkAllclose(
+        out1_ref,
+        out1_asm,
+        msg=f"asm_moe_stage1:{us1:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us1/1000/1000:>8.2f} tflops......(quant:{AQDType})",
+    )
+    """
 
 
 parser = argparse.ArgumentParser(

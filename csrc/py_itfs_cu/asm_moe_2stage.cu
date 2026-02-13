@@ -411,8 +411,8 @@ void moe_stage1_g1u1(
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
 
-        //printf("[debug] name = %s\n", name);
-        //printf("[debug] co_name = %s\n", co_name);
+        printf("[KERNEL] name = %s\n", name);
+        printf("[KERNEL] co_name = %s\n", co_name);
 
         TORCH_CHECK(inter_dim % cfg.tile_n == 0,
                     "ASM kernel " + std::string(name) +
@@ -529,28 +529,28 @@ void moe_stage1_g1u1(
     // std::cout << " args.splitk      = " << args.splitk << std::endl;
     // std::cout << " args.activation  = " << args.activation << std::endl;
     // std::cout << " args.ptr_SW      = " << args.ptr_SW << std::endl;
-    //args.log();
-    //printf("[DEV_BUF] dev_O: out = %lu bytes\n", out.numel() * out.element_size());
-    //printf("[DEV_BUF] dev_X: input = %lu bytes\n", input.numel() * input.element_size());
-    //printf("[DEV_BUF] dev_GU: w1 = %lu bytes\n", w1.numel() * w1.element_size());
-    //printf("[DEV_BUF] dev_XC: num_valid_ids = %lu bytes\n", num_valid_ids.numel() * num_valid_ids.element_size());
-    //printf("[DEV_BUF] dev_X_dqn_buf: a1_scale = %lu bytes\n", a1_scale.has_value() ? a1_scale.value().numel() * a1_scale.value().element_size() : 0);
-    //printf("[DEV_BUF] dev_GU_dqn_buf: w1_scale = %lu bytes\n", w1_scale.has_value() ? w1_scale.value().numel() * w1_scale.value().element_size() : 0);
-    //printf("[DEV_BUF] dev_Smooth_qnt_buf: fc2_smooth_scale = %lu bytes\n", fc2_smooth_scale.has_value() ? fc2_smooth_scale.value().numel() * fc2_smooth_scale.value().element_size() : 0);
-    //printf("[DEV_BUF] dev_STP: sorted_token_ids = %lu bytes\n", sorted_token_ids.numel() * sorted_token_ids.element_size());
-    //printf("[DEV_BUF] dev_SEP: sorted_expert_ids = %lu bytes\n", sorted_expert_ids.numel() * sorted_expert_ids.element_size());
-    //printf("[DEV_BUF] dev_SW: sorted_weights = %lu bytes\n", sorted_weights.has_value() ? sorted_weights.value().numel() * sorted_weights.value().element_size() : 0);
-    //printf("[DEV_BUF] dev_Qscl: w1_lqq_scale = %lu bytes\n", w1_lqq_scale.has_value() ? w1_lqq_scale.value().numel() * w1_lqq_scale.value().element_size() : 0);
-    //printf("[DEV_BUF] dev_Qzero: w1_lqq_zero = %lu bytes\n", w1_lqq_zero.has_value() ? w1_lqq_zero.value().numel() * w1_lqq_zero.value().element_size() : 0);
-    //printf("argsize: %zu\n", arg_size);
-    //printf("gdx:%d, gdy:%d, gdz:%d, bdx:%d\n", gdx, gdy, gdz, bdx);
+    args.log();
+    printf("[DEV_BUF] dev_O: out = %lu bytes\n", out.numel() * out.element_size());
+    printf("[DEV_BUF] dev_X: input = %lu bytes\n", input.numel() * input.element_size());
+    printf("[DEV_BUF] dev_GU: w1 = %lu bytes\n", w1.numel() * w1.element_size());
+    printf("[DEV_BUF] dev_XC: num_valid_ids = %lu bytes\n", num_valid_ids.numel() * num_valid_ids.element_size());
+    printf("[DEV_BUF] dev_X_dqn_buf: a1_scale = %lu bytes\n", a1_scale.has_value() ? a1_scale.value().numel() * a1_scale.value().element_size() : 0);
+    printf("[DEV_BUF] dev_GU_dqn_buf: w1_scale = %lu bytes\n", w1_scale.has_value() ? w1_scale.value().numel() * w1_scale.value().element_size() : 0);
+    printf("[DEV_BUF] dev_Smooth_qnt_buf: fc2_smooth_scale = %lu bytes\n", fc2_smooth_scale.has_value() ? fc2_smooth_scale.value().numel() * fc2_smooth_scale.value().element_size() : 0);
+    printf("[DEV_BUF] dev_STP: sorted_token_ids = %lu bytes\n", sorted_token_ids.numel() * sorted_token_ids.element_size());
+    printf("[DEV_BUF] dev_SEP: sorted_expert_ids = %lu bytes\n", sorted_expert_ids.numel() * sorted_expert_ids.element_size());
+    printf("[DEV_BUF] dev_SW: sorted_weights = %lu bytes\n", sorted_weights.has_value() ? sorted_weights.value().numel() * sorted_weights.value().element_size() : 0);
+    printf("[DEV_BUF] dev_Qscl: w1_lqq_scale = %lu bytes\n", w1_lqq_scale.has_value() ? w1_lqq_scale.value().numel() * w1_lqq_scale.value().element_size() : 0);
+    printf("[DEV_BUF] dev_Qzero: w1_lqq_zero = %lu bytes\n", w1_lqq_zero.has_value() ? w1_lqq_zero.value().numel() * w1_lqq_zero.value().element_size() : 0);
+    printf("argsize: %zu\n", arg_size);
+    printf("gdx:%d, gdy:%d, gdz:%d, bdx:%d\n", gdx, gdy, gdz, bdx);
 
-    uint32_t group_in_k_lqq = 64;
-    uint32_t dim = model_dim;
-    uint32_t batch = token_cnt;
-    uint32_t GU_dqn_k_lqq = dim/group_in_k_lqq;
-    uint32_t GU_dqn_n_lqq = hidden_dim;
-    uint32_t GU_dqn_lqq_size = eprt*GU_dqn_k_lqq*GU_dqn_n_lqq;
+    //uint32_t group_in_k_lqq = 64;
+    //uint32_t dim = model_dim;
+    //uint32_t batch = token_cnt;
+    //uint32_t GU_dqn_k_lqq = dim/group_in_k_lqq;
+    //uint32_t GU_dqn_n_lqq = hidden_dim;
+    //uint32_t GU_dqn_lqq_size = eprt*GU_dqn_k_lqq*GU_dqn_n_lqq;
     //save_int8_fmt("./feifei/ptr_X_fmt.hex", (int8_t*)(input.data_ptr()), token_cnt*model_dim);
     //save_float("./feifei/X_dqn_buf.txt",  (float*)(a1_scale.value().data_ptr()), a1_scale.value().numel());
     //save_int8("./feifei/GU_buf_pack.hex", (int8_t*)(w1.data_ptr()), w1.numel() * w1.element_size());
