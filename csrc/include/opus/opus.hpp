@@ -11,6 +11,7 @@
 
 #include <array>
 #include <initializer_list>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -1301,7 +1302,7 @@ struct gmem {
         constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
         auto smem_ptr = reinterpret_cast<OPUS_LDS_ADDR scalar_type*>(reinterpret_cast<uintptr_t>(smem_base));
         static_ford(issue_space_vec, [&](auto... ids) {
-            async_load<vec>(smem_ptr + u_smem(ids...), u_gmem(ids...), s_os, number<aux>{});
+            async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(smem_ptr + u_smem(ids...))), u_gmem(ids...), s_os, number<aux>{});
         });
     }
 
@@ -1359,7 +1360,7 @@ struct gmem {
 
         static_ford(issue_space_vec, [&](auto... ids) {
             if (pred(ids...)) {
-                async_load<vec>(smem_ptr + u_smem(ids...), u_gmem(ids...), s_os, number<aux>{});
+                async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(smem_ptr + u_smem(ids...))), u_gmem(ids...), s_os, number<aux>{});
             } else {
                 using type = vector_type<vec>;
                 type z = {0};
