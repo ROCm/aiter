@@ -347,6 +347,7 @@ def test_fmoe_ep(
 import os
 import struct
 import numpy as np
+from ctypes import c_int8
 from aiter.int4_utils import convert_int8_to_uint32_int4, rearrange_4bit_elements
 from aiter.utility import fp4_utils
 from typing import Optional, Tuple
@@ -396,7 +397,9 @@ def moe_init_lqq(
 
     elif init_pattern == 1:
         temp_var0 = torch.cos(offsets.float())
-        temp_var1 = temp_var0.clone()
+        temp_var1 = torch.cos(offsets.float())
+        # temp_var0 = torch.full((eprt, M, N), 0.0, dtype=torch.float32)
+        # temp_var1 = torch.full((eprt, M, N), 0.0, dtype=torch.float32)
 
     elif init_pattern == 2:
         temp_var0 = torch.sin(offsets.float())
@@ -488,6 +491,54 @@ def moe_init_uint4(
     value32 = FloatMapToInt(temp_var.cpu())
     uint4_value = value32 & 0x0F
     buffer.copy_(uint4_value.to(torch.int8))
+
+    return buffer.to(device)
+
+
+def moe_init_int8(
+    eprt: int = 1,
+    M: int = 128,
+    N: int = 128,
+    init_pattern: int = 0,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> torch.Tensor:
+
+    buffer = torch.zeros((eprt, M, N), dtype=torch.int8)
+
+    offsets = torch.arange(eprt * M * N).reshape(eprt, M, N)
+
+    d_idx = torch.arange(N).reshape(1, 1, N).expand(eprt, M, N).float()
+    s_idx = torch.arange(M).reshape(1, M, 1).expand(eprt, M, N).float()
+
+    temp_var = torch.zeros((eprt, M, N), dtype=torch.float32)
+
+    if init_pattern == 0:
+        temp_var = torch.randn((eprt, M, N), dtype=torch.float32)
+
+    elif init_pattern == 1:
+        temp_var = torch.cos(offsets.float())
+
+    elif init_pattern == 2:
+        temp_var = torch.sin(offsets.float())
+
+    elif init_pattern == 3:
+        temp_var = torch.cos(offsets.float()) + torch.sin(offsets.float())
+
+    elif init_pattern == 10:
+        temp_var = torch.full((eprt, M, N), 0.25, dtype=torch.float32)
+
+    elif init_pattern == 11:
+        temp_var = 0.01 * d_idx
+
+    elif init_pattern == 12:
+        temp_var = 0.01 * s_idx
+
+    else:
+        pass
+
+    value32 = FloatMapToInt(temp_var.cpu())
+    uint8_value = value32 & 0xFF
+    buffer.copy_(uint8_value.to(torch.int8))
 
     return buffer.to(device)
 
@@ -631,6 +682,31 @@ def moe_shuffle_inter(
     return result
 
 
+def moe_shuffle_32_16(x, eprt, M, N):
+    tile_size_major = 32
+    tile_size_minor = 16
+    tile_stride = tile_size_major * tile_size_minor
+
+    assert (
+        M % tile_size_minor == 0
+    ), f"M({M}) must be divisible by tileSizeMinor({tile_size_minor})"
+    assert (
+        N % tile_size_major == 0
+    ), f"N({N}) must be divisible by tileSizeMajor({tile_size_major})"
+
+    tiles_in_M = M // tile_size_minor
+    tiles_in_N = N // tile_size_major
+    total_tiles = tiles_in_M * tiles_in_N
+
+    x = x.view(eprt, tiles_in_M, tile_size_minor, tiles_in_N, tile_size_major)
+
+    x = x.permute(0, 1, 3, 2, 4).contiguous()
+    x = x.view(eprt, total_tiles, tile_size_minor, tile_size_major)
+
+    x = x.view(eprt, M, N)
+    return x
+
+
 def moe_shuffle_4_16(x: torch.Tensor, layout=(4, 16), use_int4=False) -> torch.Tensor:
     x_type = x.dtype
     if hasattr(torch, "float4_e2m1fn_x2") and x_type == torch.float4_e2m1fn_x2:
@@ -750,15 +826,92 @@ def save_buffer_to_file(
 
             f.write("\nData:\n")
 
-            flat_data = buffer_cpu.flatten().numpy()
+            buffer_cpu_fp32 = buffer_cpu.to(torch.float32)
+            flat_data = buffer_cpu_fp32.flatten().numpy()
             for i in range(len(flat_data)):
-                f.write(f"{flat_data[i]:.4f} ")
+                f.write(f"{flat_data[i]:.4e} ")
                 if (i + 1) % 16 == 0:
                     f.write("\n")
 
     elif format.lower() == "binary":
         with open(f"{base_name}.hex", "wb") as f:
             buffer_cpu.numpy().tofile(f)
+
+
+def save_int8_to_file(
+    buffer: torch.Tensor,
+    filename: str,
+    format: str = "numpy",
+    metadata: Optional[dict] = None,
+) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(filename)), exist_ok=True)
+    base_name = os.path.splitext(filename)[0]
+
+    if buffer.device.type != "cpu":
+        buffer_cpu = buffer.cpu()
+    else:
+        buffer_cpu = buffer
+
+    if format.lower() == "numpy":
+        np.save(f"{base_name}.npy", buffer_cpu.numpy())
+
+        if metadata:
+            import json
+
+            with open(f"{base_name}_meta.json", "w") as f:
+                json.dump(metadata, f, indent=2)
+
+    elif format.lower() == "torch":
+        save_dict = {"buffer": buffer_cpu}
+        if metadata:
+            save_dict["metadata"] = metadata
+
+        torch.save(save_dict, f"{base_name}.pt")
+
+    elif format.lower() == "text":
+        with open(f"{base_name}.txt", "w") as f:
+            f.write(f"Shape: {buffer.shape}\n")
+            f.write(f"DataType: {buffer.dtype}\n")
+            f.write(f"Min: {buffer.min().item()}\n")
+            f.write(f"Max: {buffer.max().item()}\n")
+
+            if metadata:
+                f.write("\nMetadata:\n")
+                for key, value in metadata.items():
+                    f.write(f"{key}: {value}\n")
+
+            f.write("\nData:\n")
+
+            buffer_cpu_fp32 = buffer_cpu.to(torch.int8)
+            flat_data = buffer_cpu_fp32.flatten().numpy()
+            for i in range(len(flat_data)):
+                f.write(f"{flat_data[i]:d} ")
+                if (i + 1) % 16 == 0:
+                    f.write("\n")
+
+    elif format.lower() == "binary":
+        with open(f"{base_name}.hex", "wb") as f:
+            buffer_cpu.numpy().tofile(f)
+
+
+def load_binary_to_tensor(file_path, shape, dtype=torch.int8):
+    with open(file_path, "rb") as f:
+        data = f.read()
+
+    np_array = np.frombuffer(
+        data,
+        dtype={
+            torch.float32: np.float32,
+            torch.float64: np.float64,
+            torch.int32: np.int32,
+            torch.int64: np.int64,
+            torch.uint8: np.uint8,
+        }.get(dtype, np.int8),
+    )
+
+    tensor = torch.from_numpy(np_array).to(dtype)
+
+    return tensor.reshape(shape).to("cuda")
 
 
 def test_fmoe_lqq(
@@ -867,17 +1020,15 @@ def test_fmoe_lqq(
     GU_dqn_k = 1
     GU_dqn_n = inter_dim
     GU_dqn_size = eprt * GU_dqn_k * GU_dqn_n * 2
+    X_dqn_k = 1
+    X_dqn_m = token
     print("[FEIFEI] model_dim(K) = ", model_dim)
     print("[FEIFEI] inter_dim(N) = ", inter_dim)
     print("[FEIFEI] eprt = ", eprt)
     print("[FEIFEI] topk = ", topk)
     print("[FEIFEI] GU_dqn_k_lqq = ", GU_dqn_k_lqq)
     print("[FEIFEI] GU_dqn_n_lqq = ", GU_dqn_n_lqq)
-    print("[FEIFEI] GU_dqn_lqq_size = ", GU_dqn_lqq_size)
-    print("[FEIFEI] sz_GU = ", sz_GU)
     print("[FEIFEI] GU_dqn_n = ", GU_dqn_n)
-    print("[FEIFEI] GU_dqn_n2 = ", GU_dqn_size // eprt // GU_dqn_k)
-    print("[FEIFEI] GU_dqn_size = ", GU_dqn_size)
 
     # input quant for kernel
     a1_qt, a1_scale = aiter.pertoken_quant(input, quant_dtype=AQDType)
@@ -899,48 +1050,60 @@ def test_fmoe_lqq(
     )
     a1 = a1.view(-1, model_dim)
     """
+    a1_qt = moe_init_int8(1, token, model_dim, 1)
+    a1_scale = moe_init_float(1, X_dqn_m, X_dqn_k, 1)
+    a1_qt = a1_qt.reshape(token, model_dim)
+    a1_scale = a1_scale.reshape(X_dqn_m, X_dqn_k)
+    # save_buffer_to_file(a1_qt, "./feifei/a1_qt", format="binary")
+    # save_buffer_to_file(a1_scale, "./feifei/a1_scale", format="text")
 
     # lqq init for kernel
     w1_lqq_scale, w1_lqq_zero = moe_init_lqq(
         eprt, GU_dqn_lqq_size // eprt // GU_dqn_k_lqq, GU_dqn_k_lqq, 1, -100, 100
     )
-    save_buffer_to_file(w1_lqq_scale, "./feifei/w1_lqq_scale", format="binary")
-    save_buffer_to_file(w1_lqq_zero, "./feifei/w1_lqq_zero", format="binary")
+    # save_buffer_to_file(w1_lqq_scale, "./feifei/w1_lqq_scale", format="binary")
+    # save_buffer_to_file(w1_lqq_zero, "./feifei/w1_lqq_zero", format="binary")
     w1_lqq_zero_uint8 = (w1_lqq_zero.to(torch.int16) + 128).to(torch.uint8)
-    save_buffer_to_file(
-        w1_lqq_zero_uint8, "./feifei/w1_lqq_zero_uint8", format="binary"
-    )
+    # save_buffer_to_file(
+    #    w1_lqq_zero_uint8, "./feifei/w1_lqq_zero_uint8", format="binary"
+    # )
     w1_lqq_uint4 = moe_init_uint4(eprt, sz_GU // model_dim // eprt, model_dim, 1)
-    save_buffer_to_file(w1_lqq_uint4, "./feifei/w1_lqq_uint4", format="binary")
+    # save_buffer_to_file(w1_lqq_uint4, "./feifei/w1_lqq_uint4", format="binary")
 
     # shuffle w1 for kernel
     w1_lqq_uint4_shf_inter = moe_shuffle_inter(
         w1_lqq_uint4, eprt, sz_GU // model_dim // eprt, model_dim, 6
     )
-    save_buffer_to_file(
-        w1_lqq_uint4_shf_inter, "./feifei/w1_lqq_uint4_shf_inter", format="binary"
+    # save_buffer_to_file(
+    #    w1_lqq_uint4_shf_inter, "./feifei/w1_lqq_uint4_shf_inter", format="binary"
+    # )
+    # save_int8_to_file(
+    #    w1_lqq_uint4_shf_inter, "./feifei/w1_lqq_uint4_shf21", format="text"
+    # )
+    w1_lqq_uint4_shf2 = moe_shuffle_32_16(
+        w1_lqq_uint4_shf_inter, eprt, sz_GU // model_dim // eprt, model_dim
     )
-    w1_lqq_uint4_shf2 = shuffle_weight(w1_lqq_uint4_shf_inter, (32, 16), use_int4=True)
-    save_buffer_to_file(
-        w1_lqq_uint4_shf2, "./feifei/w1_lqq_uint4_shf2", format="binary"
-    )
+    # save_int8_to_file(w1_lqq_uint4_shf2, "./feifei/w1_lqq_uint4_shf22", format="text")
+    # save_buffer_to_file(
+    #    w1_lqq_uint4_shf2, "./feifei/w1_lqq_uint4_shf2", format="binary"
+    # )
     w1_lqq_pack = moe_pack_int4(
         w1_lqq_uint4_shf2, eprt, sz_GU // model_dim // eprt, model_dim
     )
-    save_buffer_to_file(w1_lqq_pack, "./feifei/w1_lqq_pack", format="binary")
+    # save_buffer_to_file(w1_lqq_pack, "./feifei/w1_lqq_pack", format="binary")
     w1_lqq_scale_shf = moe_shuffle_4_16(w1_lqq_scale, (4, 16), use_int4=False)
-    save_buffer_to_file(w1_lqq_scale_shf, "./feifei/w1_lqq_scale_shf", format="binary")
+    # save_buffer_to_file(w1_lqq_scale_shf, "./feifei/w1_lqq_scale_shf", format="binary")
     w1_lqq_zero_uint8_shf = moe_shuffle_4_16(w1_lqq_zero_uint8, (4, 16), use_int4=False)
-    save_buffer_to_file(
-        w1_lqq_zero_uint8_shf, "./feifei/w1_lqq_zero_uint8_shf", format="binary"
-    )
+    # save_buffer_to_file(
+    #    w1_lqq_zero_uint8_shf, "./feifei/w1_lqq_zero_uint8_shf", format="binary"
+    # )
 
     # gu quant for cpu ref
     w1_qt = moe_lqq_dequant(w1_lqq_uint4, w1_lqq_scale, w1_lqq_zero)
-    save_buffer_to_file(w1_qt, "./feifei/w1_qt", format="binary")
+    # save_int8_to_file(w1_qt, "./feifei/w1_qt", format="text")
     # gu quant scale for cpu ref and kernel
     w1_scale = moe_init_float(eprt, GU_dqn_size // eprt // GU_dqn_k, GU_dqn_k, 1)
-    save_buffer_to_file(w1_scale, "./feifei/w1_scale", format="text")
+    # save_buffer_to_file(w1_scale, "./feifei/w1_scale", format="text")
 
     w2 = (
         torch.randn(
@@ -962,8 +1125,7 @@ def test_fmoe_lqq(
         doweight=False,
     )
 
-    out1_asm, us1 = run_perftest(
-        fused_moe,
+    out1_asm = fused_moe(
         a1_qt,
         w1_lqq_pack,
         w2_qt,
@@ -979,12 +1141,11 @@ def test_fmoe_lqq(
         doweight_stage1=False,
         dtype=dtype,
         block_size_M=80,
-        num_iters=2,
-        num_warmup=1,
     )
-    print("[test] out1_ref = ", out1_ref.shape, out1_ref.dtype)
-    print("[test] out1_asm = ", out1_asm.shape, out1_asm.dtype)
-    checkAllclose(out1_ref, out1_asm, rtol=0.01, atol=10, msg="asm check")
+
+    # save_buffer_to_file(out1_ref, "./feifei/out1_ref", format="text")
+    # save_buffer_to_file(out1_asm, "./feifei/out1_asm", format="text")
+    checkAllclose(out1_ref, out1_asm, msg="asm check")
 
 
 parser = argparse.ArgumentParser(

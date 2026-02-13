@@ -257,6 +257,101 @@ std::string get_heuristic_kernel(int m_num, int N, int blockk_size, CFG* cfgs, s
     }
     return selected;
 }
+int save_int8(const char* filename, int8_t* array, size_t size) {
+    if (filename == NULL || array == NULL || size == 0) {
+        return -1;
+    }    
+    FILE* file = fopen(filename, "wb");
+    if (file == NULL) {
+        return -1;
+    }
+    
+    int8_t* ptr = new int8_t[size];
+    hipMemcpy(ptr, array, size * sizeof(int8_t), hipMemcpyDeviceToHost);
+    size_t elements_written = fwrite(ptr, sizeof(int8_t), size, file);
+    delete[] ptr;
+    
+    if (elements_written != size) {
+        fclose(file);
+        return -1;
+    }
+    
+    fclose(file);
+    return 0;
+}
+int save_int8_fmt(const char* filename, int8_t* array, size_t size)
+{
+    int items_per_line = 16;
+    if (filename == NULL || array == NULL || size == 0) {
+        return -1;
+    }
+    
+    FILE* fp = fopen(filename, "w");
+    if (fp == NULL) {
+        perror("Error opening file");
+        return -1;
+    }
+    
+    fprintf(fp, "Index | Value\n");
+    fprintf(fp, "-------------\n");
+    
+    int8_t* ptr = new int8_t[size];
+    hipMemcpy(ptr, array, size * sizeof(int8_t), hipMemcpyDeviceToHost);
+    for (size_t i = 0; i < size; i++) {
+        fprintf(fp, "%d", ptr[i]);
+        
+        if (items_per_line > 0 && (i + 1) % items_per_line == 0) {
+            fprintf(fp, "\n");
+        } else if (i < size - 1) {
+            fprintf(fp, " ");
+        }
+    }
+    delete[] ptr;
+    
+    if (items_per_line == 0 || size % items_per_line != 0) {
+        fprintf(fp, "\n");
+    }
+    
+    fclose(fp);
+    return 0;
+}
+int save_float(const char* filename, float* array, size_t size)
+{
+    int items_per_line = 16;
+    if (filename == NULL || array == NULL || size == 0) {
+        return -1;
+    }
+    
+    FILE* fp = fopen(filename, "w");
+    if (fp == NULL) {
+        perror("Error opening file");
+        return -1;
+    }
+    
+    fprintf(fp, "Index | Value\n");
+    fprintf(fp, "-------------\n");
+    
+    float* ptr = new float[size];
+    hipMemcpy(ptr, array, size * sizeof(float), hipMemcpyDeviceToHost);
+    for (size_t i = 0; i < size; i++) {
+        fprintf(fp, "%.4e", ptr[i]);
+        
+        if (items_per_line > 0 && (i + 1) % items_per_line == 0) {
+            fprintf(fp, "\n");
+        } else if (i < size - 1) {
+            fprintf(fp, " ");
+        }
+    }
+    delete[] ptr;
+    
+    if (items_per_line == 0 || size % items_per_line != 0) {
+        fprintf(fp, "\n");
+    }
+    
+    fclose(fp);
+    return 0;
+}
+
 void moe_stage1_g1u1(
     torch::Tensor& input,             // [token_cnt, model_dim] M,K
     torch::Tensor& w1,                // [expert, inter_dim*2, model_dim] N,K
@@ -316,8 +411,8 @@ void moe_stage1_g1u1(
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
 
-        printf("[debug] name = %s\n", name);
-        printf("[debug] co_name = %s\n", co_name);
+        //printf("[debug] name = %s\n", name);
+        //printf("[debug] co_name = %s\n", co_name);
 
         TORCH_CHECK(inter_dim % cfg.tile_n == 0,
                     "ASM kernel " + std::string(name) +
@@ -448,7 +543,31 @@ void moe_stage1_g1u1(
     printf("[DEV_BUF] dev_Qscl: w1_lqq_scale = %lu bytes\n", w1_lqq_scale.has_value() ? w1_lqq_scale.value().numel() * w1_lqq_scale.value().element_size() : 0);
     printf("[DEV_BUF] dev_Qzero: w1_lqq_zero = %lu bytes\n", w1_lqq_zero.has_value() ? w1_lqq_zero.value().numel() * w1_lqq_zero.value().element_size() : 0);
     printf("argsize: %zu\n", arg_size);
-    printf("gdx:%d, gdy:%d, gdz:%d, tgs:%d\n", gdx, gdy, gdz, sub_X_cnt * gdx * gdz);
+    printf("gdx:%d, gdy:%d, gdz:%d, bdx:%d\n", gdx, gdy, gdz, bdx);
+
+    uint32_t group_in_k_lqq = 64;
+    uint32_t dim = model_dim;
+    uint32_t batch = token_cnt;
+    uint32_t GU_dqn_k_lqq = dim/group_in_k_lqq;
+    uint32_t GU_dqn_n_lqq = hidden_dim;
+    uint32_t GU_dqn_lqq_size = eprt*GU_dqn_k_lqq*GU_dqn_n_lqq;
+    //save_int8_fmt("./feifei/ptr_X_fmt.hex", (int8_t*)(input.data_ptr()), token_cnt*model_dim);
+    //save_float("./feifei/X_dqn_buf.txt",  (float*)(a1_scale.value().data_ptr()), a1_scale.value().numel());
+    //save_int8("./feifei/GU_buf_pack.hex", (int8_t*)(w1.data_ptr()), w1.numel() * w1.element_size());
+    //save_float("./feifei/GU_dqn_buf.txt", (float*)(w1_scale.value().data_ptr()), w1_scale.value().numel());
+    //save_int8("./feifei/ptr_XC.hex", (int8_t*)(num_valid_ids.data_ptr()), num_valid_ids.numel() * num_valid_ids.element_size());
+    //save_int8("./feifei/ptr_STP.hex", (int8_t*)(sorted_token_ids.data_ptr()), sorted_token_ids.numel() * sorted_token_ids.element_size());
+    //save_int8("./feifei/ptr_SEP.hex", (int8_t*)(sorted_expert_ids.data_ptr()), sorted_expert_ids.numel() * sorted_expert_ids.element_size());
+    //save_int8_fmt("./feifei/ptr_GU_fmt.hex", (int8_t*)(args.ptr_GU), w1.numel() * w1.element_size());
+    //save_int8_fmt("./feifei/ptr_Qscl_fmt.hex", (int8_t*)(args.ptr_Qscl), w1_lqq_scale.value().numel() * w1_lqq_scale.value().element_size());
+    //save_int8_fmt("./feifei/ptr_Qzero_fmt.hex", (int8_t*)(args.ptr_Qzero), w1_lqq_zero.value().numel() * w1_lqq_zero.value().element_size());
+    //save_int8("./feifei/GU_buf_uint4.hex", (int8_t*)GU_buf_uint4, sz_GU);
+    //save_int8("./feifei/GU_buf.hex", (int8_t*)GU_buf, sz_GU);
+    //save_int8("./feifei/GU_qzero_lqq_buf_uint8.hex", (int8_t*)GU_qzero_lqq_buf_uint8, GU_dqn_lqq_size);
+    //save_int8("./feifei/GU_buf_uint4_shf_inter.hex", (int8_t*)GU_buf_uint4, sz_GU);
+    //save_int8("./feifei/GU_buf_uint4_shf2.hex", (int8_t*)GU_buf_uint4, sz_GU);
+    //save_int8("./feifei/GU_qscale_lqq_buf_shf.hex", (int8_t*)GU_qscale_lqq_buf, GU_dqn_lqq_size);
+    //save_int8("./feifei/GU_qzero_lqq_buf_uint8_shf.hex", (int8_t*)GU_qzero_lqq_buf_uint8, GU_dqn_lqq_size);
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,
