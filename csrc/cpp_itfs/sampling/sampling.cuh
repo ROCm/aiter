@@ -142,7 +142,7 @@ __device__ __forceinline__ void DeterministicInclusiveSum(
         }
     }
 
-    float warp_sum = __shfl(thread_exclusive_prefix_sum, threadIdx.x | 0xffffffff);
+    float warp_sum = __shfl(thread_exclusive_prefix_sum, (threadIdx.x & 0x3f) | 0x1f);
     if(threadIdx.x % 32 == 31)
     {
         thread_exclusive_prefix_sum = 0;
