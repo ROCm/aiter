@@ -166,7 +166,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         return_lse: bool = True,
         layout: str = "bshd",
         config: Optional[dict] = None,
-        block_attn_mask: Optional[torch.Tensor] = None,
+        block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ):
         # 1. Dimension Mapping & Config Setup
         bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
@@ -180,15 +180,8 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
         num_k_blocks = (seqlen_k + BLKK - 1) // BLKK
 
-        if block_attn_mask is not None:
-            if block_attn_mask.shape != (batch, num_q_blocks, num_k_blocks):
-                raise ValueError(
-                    f"block_attn_mask must have shape (batch, num_q_blocks, num_kv_blocks) "
-                    f"= ({batch}, {num_q_blocks}, {num_k_blocks}), got {block_attn_mask.shape}"
-                )
-            kv_block_indices, lut_start, lut_count = block_attn_mask_to_ragged_lut(
-                block_attn_mask
-            )
+        if block_lut is not None:
+            kv_block_indices, lut_start, lut_count = block_lut
             use_block_sparse = True
         else:
             kv_block_indices = lut_start = lut_count = None
@@ -294,7 +287,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             None,  # return_lse
             None,  # layout
             None,  # config
-            None,  # block_attn_mask
+            None,  # block_lut
         )
 
 
@@ -312,7 +305,7 @@ def fav3_sage_wrapper_func(
     inference_mode: bool = True,
     layout: str = "bshd",
     config: Optional[dict] = None,
-    block_attn_mask: Optional[torch.Tensor] = None,
+    block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ):
     """
     SageAttention v1 high-precision entry point.
@@ -344,6 +337,9 @@ def fav3_sage_wrapper_func(
         layout: bshd or bhsd layout for the inputs
         config: Optional kernel configuration dict with keys BLOCK_M, BLOCK_N,
                 waves_per_eu, PRE_LOAD_V, num_stages, num_warps
+        block_lut: Optional ragged LUT for block-sparse attention,
+                (kv_block_indices, lut_start, lut_count) from block_attn_mask_to_ragged_lut.
+                When None, dense attention is used.
 
     Returns:
         out: Output tensor [batch, seqlen, num_q_heads, head_dim] or [batch, num_q_heads, seqlen, head_dim] (FP32)
@@ -391,7 +387,7 @@ def fav3_sage_wrapper_func(
         return_lse,
         layout,
         config,
-        block_attn_mask,
+        block_lut,
     )
 
 

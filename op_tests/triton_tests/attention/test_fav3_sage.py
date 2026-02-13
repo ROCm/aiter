@@ -10,6 +10,7 @@ from aiter.test_mha_common import (
     attention_ref_block_sparse,
 )
 from aiter.ops.triton.attention.fav3_sage import (
+    block_attn_mask_to_ragged_lut,
     fav3_sage_wrapper_func,
     get_sage_fwd_configs,
 )
@@ -287,14 +288,14 @@ def test_sage_block_sparse_none(
     layout: str,
     dtype=torch.bfloat16,
 ):
-    """With block_attn_mask=None, output must match non-sparse path (backward compat)."""
+    """With block_lut=None, output must match non-sparse path (backward compat)."""
     torch.cuda.empty_cache()
     softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
     q, k, v = input_helper(
         BATCH, NUM_Q_HEADS, NUM_K_HEADS, SEQLEN_Q, SEQLEN_K, HEAD_SZ, HEAD_SZ, dtype, layout
     )
     triton_out = fav3_sage_wrapper_func(
-        q, k, v, softmax_scale, causal=False, inference_mode=True, layout=layout, block_attn_mask=None
+        q, k, v, softmax_scale, causal=False, inference_mode=True, layout=layout, block_lut=None
     )
     triton_out_full = fav3_sage_wrapper_func(
         q, k, v, softmax_scale, causal=False, inference_mode=True, layout=layout
@@ -341,10 +342,11 @@ def test_sage_block_sparse_vs_reference(
             if abs(qb - kb) <= 1:
                 block_attn_mask[:, qb, kb] = True
 
+    block_lut = block_attn_mask_to_ragged_lut(block_attn_mask)
     softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
     triton_out = fav3_sage_wrapper_func(
         q, k, v, softmax_scale, causal=False, inference_mode=True, layout=layout,
-        block_attn_mask=block_attn_mask,
+        block_lut=block_lut,
     )
 
     torch_out, _, _ = attention_ref_block_sparse(
@@ -374,10 +376,11 @@ def test_sage_block_sparse_empty_kv_blocks(layout: str, dtype=torch.bfloat16):
     block_attn_mask = torch.ones(BATCH, num_q_blocks, num_kv_blocks, dtype=torch.bool, device="cuda")
     block_attn_mask[:, 0, :] = False
 
+    block_lut = block_attn_mask_to_ragged_lut(block_attn_mask)
     softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
     triton_out = fav3_sage_wrapper_func(
         q, k, v, softmax_scale, causal=False, inference_mode=True, layout=layout,
-        block_attn_mask=block_attn_mask,
+        block_lut=block_lut,
     )
     torch_out, _, _ = attention_ref_block_sparse(
         q, k, v, block_attn_mask, BLOCK_M, BLOCK_N
