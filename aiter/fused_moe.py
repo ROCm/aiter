@@ -1017,7 +1017,7 @@ def fused_moe_2stages(
             dtype=dtype,
             device=device,
         )
-        a1 = hidden_states.repeat(topk, 1, 1)
+        a1 = hidden_states.repeat(topk, 1, 1)  # feifei:fix me for multiX
         a1_scale = a1_scale.repeat(topk, 1, 1)
     else:
         a2 = torch.empty(
