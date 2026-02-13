@@ -299,10 +299,15 @@ _MXFP_SUPPORTED_ARCHS = {"gfx950"}
 
 # FP4 E2M1 representable magnitudes (3-bit unsigned magnitude code)
 _FP4_MAGNITUDES = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
-_FP4_ALL_VALUES = (
-    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
-    + [-0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
-)
+_FP4_ALL_VALUES = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0] + [
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+]
 
 
 def _fp32_to_fp4_nibble(val):
@@ -342,10 +347,7 @@ def _test_mxfp8(mod, variant, M, N, K):
     """Test an MXFP8 variant. Returns 0 on pass/skip, 1 on fail."""
     arch = _get_gpu_arch()
     if arch not in _MXFP_SUPPORTED_ARCHS:
-        print(
-            f"  SKIP: {variant} requires {_MXFP_SUPPORTED_ARCHS}, "
-            f"got '{arch}'"
-        )
+        print(f"  SKIP: {variant} requires {_MXFP_SUPPORTED_ARCHS}, " f"got '{arch}'")
         return 0
 
     device = torch.device("cuda")
@@ -367,9 +369,7 @@ def _test_mxfp8(mod, variant, M, N, K):
     ok = torch.allclose(C, C_ref, atol=atol, rtol=rtol)
     max_diff = (C - C_ref).abs().max().item()
     if not ok:
-        diff_count = (
-            (C - C_ref).abs().gt(atol + rtol * C_ref.abs()).sum().item()
-        )
+        diff_count = (C - C_ref).abs().gt(atol + rtol * C_ref.abs()).sum().item()
         print(
             f"  FAIL: {variant} max_diff={max_diff:.4f}, "
             f"{diff_count} elements outside tol"
@@ -383,10 +383,7 @@ def _test_mxfp4(mod, variant, M, N, K):
     """Test an MXFP4 variant. Returns 0 on pass/skip, 1 on fail."""
     arch = _get_gpu_arch()
     if arch not in _MXFP_SUPPORTED_ARCHS:
-        print(
-            f"  SKIP: {variant} requires {_MXFP_SUPPORTED_ARCHS}, "
-            f"got '{arch}'"
-        )
+        print(f"  SKIP: {variant} requires {_MXFP_SUPPORTED_ARCHS}, " f"got '{arch}'")
         return 0
 
     device = torch.device("cuda")
@@ -412,9 +409,7 @@ def _test_mxfp4(mod, variant, M, N, K):
     ok = torch.allclose(C, C_ref, atol=atol, rtol=rtol)
     max_diff = (C - C_ref).abs().max().item()
     if not ok:
-        diff_count = (
-            (C - C_ref).abs().gt(atol + rtol * C_ref.abs()).sum().item()
-        )
+        diff_count = (C - C_ref).abs().gt(atol + rtol * C_ref.abs()).sum().item()
         print(
             f"  FAIL: {variant} max_diff={max_diff:.4f}, "
             f"{diff_count} elements outside tol"
