@@ -1429,7 +1429,29 @@ template <index_t lgkmcnt> OPUS_D void s_waitcnt_lgkmcnt(number<lgkmcnt>) { s_wa
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
     return inst_(__builtin_bit_cast(long, a), __builtin_bit_cast(long, b), c, cbsz, abid, blgp); }
 
+// scaled MFMA (f8f6f4): input always bitcast to i32x8_t (256 bits); uses format codes and runtime scale
+#define DISPATCH_MFMA_SCALE_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
+ (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
+    return inst_(__builtin_bit_cast(i32x8_t, a), __builtin_bit_cast(i32x8_t, b), c, fmt_a, fmt_b, 0, scale_a, 0, scale_b); }
+
+// Helper: resolve vtype for MFMA registers. Packed types (fp4_t etc.) use their underlying storage type
+// because ext_vector_type requires scalar types and packed types are structs.
+namespace impl {
+template<typename T, index_t N, typename = void>
+struct mfma_vtype_helper { using type = vector_t<T, N>; };
+template<typename T, index_t N>
+struct mfma_vtype_helper<T, N, std::enable_if_t<is_packs_v<T>>> { using type = vector_t<typename T::storage, N>; };
+}
+template<typename T, index_t N>
+using mfma_vtype_t = typename impl::mfma_vtype_helper<T, N>::type;
+
 // prefer use make_mfma() to create instance, which will return impl::mfma_adaptor_xxx. In this way we can access layout info from the "mma"
+//
+// Scaled MFMA (gfx950: __builtin_amdgcn_mfma_scale_f32_{32x32x64,16x16x128}_f8f6f4)
+// is also dispatched from this struct via the operator()(a, b, c, int scale_a, int scale_b) overload.
+// Input registers are always 256 bits (i32x8_t) regardless of element type; bitcast is done internally.
+// Format codes (Atype / Btype): 0=fp8(E4M3), 1=bf8(E5M2), 2=fp6(E2M3), 3=bf6(E3M2), 4=fp4(E2M1)
+// scale_a, scale_b: E8M0 exponent values (int); actual_scale = 2^(value - 127). Use 127 for no scaling.
 template<typename dtype_a_, typename dtype_b_, typename dtype_c_, index_t wave_m_, index_t wave_n_, index_t wave_k_, index_t warp_size_ = get_warp_size()>
 struct mfma {
     using dtype_a = remove_cvref_t<dtype_a_>;
@@ -1443,10 +1465,15 @@ struct mfma {
     static constexpr index_t elem_b = wave_n * wave_k / warp_size;
     static constexpr index_t elem_c = wave_m * wave_n / warp_size;
 
-    using vtype_a = vector_t<dtype_a, elem_a>;
-    using vtype_b = vector_t<dtype_b, elem_b>;
+    using vtype_a = mfma_vtype_t<dtype_a, elem_a>;
+    using vtype_b = mfma_vtype_t<dtype_b, elem_b>;
     using vtype_c = vector_t<dtype_c, elem_c>;
 
+    // Format code for scaled MFMA (f8f6f4); -1 for types that don't support scaling
+    static constexpr int fmt_a = std::is_same_v<dtype_a, fp8_t> ? 0 : std::is_same_v<dtype_a, bf8_t> ? 1 : std::is_same_v<dtype_a, fp4_t> ? 4 : -1;
+    static constexpr int fmt_b = std::is_same_v<dtype_b, fp8_t> ? 0 : std::is_same_v<dtype_b, bf8_t> ? 1 : std::is_same_v<dtype_b, fp4_t> ? 4 : -1;
+
+    // Regular MFMA dispatch (cbsz/abid/blgp are compile-time parameters)
     template<typename VA, typename VB, typename VC, index_t cbsz = 0, index_t abid = 0, index_t blgp = 0>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) -> vtype_c {
         (void)a; (void)b; (void)c; // used by DISPATCH_MFMA_ macros; suppress -Wunused-parameter on host
@@ -1480,12 +1507,33 @@ struct mfma {
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) {
         vtype_c c{0}; return operator()(a, b, c, number<cbsz>{}, number<abid>{}, number<blgp>{});
     }
+
+    // Scaled MFMA dispatch (gfx950: f8f6f4 with E8M0 block exponent scaling)
+    // scale_a, scale_b are runtime E8M0 exponent values; 127 = no scaling (2^0 = 1.0).
+    template<typename VA, typename VB, typename VC>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) -> vtype_c {
+        (void)a; (void)b; (void)c; (void)scale_a; (void)scale_b;
+        if constexpr (false) {}
+#if defined(__gfx950__)
+        else if constexpr DISPATCH_MFMA_SCALE_(fp8_t, fp8_t, fp32_t, 32, 32,  64, __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4)
+        else if constexpr DISPATCH_MFMA_SCALE_(fp8_t, fp8_t, fp32_t, 16, 16, 128, __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4)
+        else if constexpr DISPATCH_MFMA_SCALE_(fp4_t, fp4_t, fp32_t, 32, 32,  64, __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4)
+        else if constexpr DISPATCH_MFMA_SCALE_(fp4_t, fp4_t, fp32_t, 16, 16, 128, __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4)
+#endif
+        __builtin_unreachable();
+    }
+
+    template<typename VA, typename VB>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b) {
+        vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b);
+    }
 };
 #undef DISPATCH_MFMA_
 #undef DISPATCH_MFMA_STEP_K_
 #undef DISPATCH_MFMA_BF16_1K_
 #undef DISPATCH_MFMA_STEP_K_BF16_1K_
 #undef DISPATCH_MFMA_8BIT_
+#undef DISPATCH_MFMA_SCALE_
 
 using mfma_f32_32x32x8_f16      = mfma<fp16_t, fp16_t, fp32_t, 32, 32,  8>;
 using mfma_f32_16x16x16_f16     = mfma<fp16_t, fp16_t, fp32_t, 16, 16, 16>;
@@ -1499,6 +1547,16 @@ using mfma_f32_32x32x16_fp8_fp8 = mfma<fp8_t , fp8_t , fp32_t, 32, 32, 16>;
 using mfma_f32_16x16x32_fp8_fp8 = mfma<fp8_t , fp8_t , fp32_t, 16, 16, 32>;
 using mfma_f32_32x32x16_bf8_bf8 = mfma<bf8_t , bf8_t , fp32_t, 32, 32, 16>;
 using mfma_f32_16x16x32_bf8_bf8 = mfma<bf8_t , bf8_t , fp32_t, 16, 16, 32>;
+// Scaled MFMA type aliases (gfx950 only, unified into struct mfma)
+using mfma_f32_32x32x64_fp8_fp8   = mfma<fp8_t, fp8_t, fp32_t, 32, 32,  64>;
+using mfma_f32_16x16x128_fp8_fp8  = mfma<fp8_t, fp8_t, fp32_t, 16, 16, 128>;
+using mfma_f32_32x32x64_fp4_fp4   = mfma<fp4_t, fp4_t, fp32_t, 32, 32,  64>;
+using mfma_f32_16x16x128_fp4_fp4  = mfma<fp4_t, fp4_t, fp32_t, 16, 16, 128>;
+// Backward-compatible aliases (deprecated: prefer mfma_f32_* above)
+using mfma_scale_f32_32x32x64_fp8_fp8   = mfma_f32_32x32x64_fp8_fp8;
+using mfma_scale_f32_16x16x128_fp8_fp8  = mfma_f32_16x16x128_fp8_fp8;
+using mfma_scale_f32_32x32x64_fp4_fp4   = mfma_f32_32x32x64_fp4_fp4;
+using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // adaptor

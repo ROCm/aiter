@@ -19,6 +19,7 @@ setup(
             name="opus_device_test",
             sources=[
                 os.path.join(_THIS_DIR, "test_mfma.cu"),
+                os.path.join(_THIS_DIR, "test_mfma_scale.cu"),
                 os.path.join(_THIS_DIR, "test_vector_add.cu"),
                 os.path.join(_THIS_DIR, "test_async_load.cu"),
                 os.path.join(_THIS_DIR, "test_dtype_convert.cu"),

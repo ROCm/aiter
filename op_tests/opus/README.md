@@ -13,6 +13,8 @@ op_tests/opus/
 ├── device/                      # GPU kernel tests (single PyTorch extension)
 │   ├── test_mfma.cu             # MFMA kernels: fp16/bf16/fp8/bf8 variants
 │   ├── test_mfma.h              # C API header for MFMA
+│   ├── test_mfma_scale.cu       # Scaled MFMA kernels: fp8/fp4 (gfx950 only)
+│   ├── test_mfma_scale.h        # C API header for scaled MFMA
 │   ├── test_vector_add.cu       # Vector addition kernel using OPUS gmem
 │   ├── test_vector_add.h        # C API header for vector_add
 │   ├── test_async_load.cu       # Async global->LDS->global copy kernel
@@ -168,6 +170,10 @@ All tests (including the new one) will build and run inside the Docker container
 | `test_mfma` | 16x16x32 fp16/bf16 | (same, uses base 16x16x16 with K-loop on gfx942; native on gfx950) | gfx942 + gfx950 |
 | `test_mfma` | 32x32x16 fp8/bf8 | `make_tiled_mma`, `partition_layout_a/b/c`, `make_gmem` (fp32 output, no cast) | gfx942 + gfx950 |
 | `test_mfma` | 16x16x32 fp8/bf8 | (same as above) | gfx942 + gfx950 |
+| `test_mfma_scale` | 32x32x64 fp8\*fp8 | `mfma<fp8_t,fp8_t,fp32_t,32,32,64>` (scaled overload), direct data-layout load/store | gfx950 |
+| `test_mfma_scale` | 16x16x128 fp8\*fp8 | `mfma<fp8_t,fp8_t,fp32_t,16,16,128>` (scaled overload) | gfx950 |
+| `test_mfma_scale` | 32x32x64 fp4\*fp4 | `mfma<fp4_t,fp4_t,fp32_t,32,32,64>` (scaled overload), fp4x2 packed nibble handling | gfx950 |
+| `test_mfma_scale` | 16x16x128 fp4\*fp4 | `mfma<fp4_t,fp4_t,fp32_t,16,16,128>` (scaled overload) | gfx950 |
 | `test_vector_add` | — | `make_gmem`, vectorized `load<N>` / `store<N>` | all |
 | `test_async_load` | — | `make_gmem`, `gmem::async_load`, `s_waitcnt_vmcnt` | all |
 | `test_dtype_convert` | fp32<->bf16 | `cast<bf16_t>` with RNE: explicit `0_I` on gfx942, hardware default on gfx950 | all |
@@ -175,7 +181,7 @@ All tests (including the new one) will build and run inside the Docker container
 | `test_dtype_convert` | fp32<->fp8 | `cast<fp8_t>(fp32x4_t)`, `cast<fp32_t>(fp8x4_t)` (packed x4) | gfx942 + gfx950 |
 | `test_dtype_convert` | fp32<->fp4 | `cast<fp4_t>(fp32x8_t)`, `cast<fp32_t>(array<fp4_t,4>)` (packed x8, e2m1) | gfx950 |
 
-Total: **18 tests** (12 MFMA + 1 vector_add + 1 async_load + 4 dtype_convert).
+Total: **22 tests** (12 MFMA + 4 scaled MFMA + 1 vector_add + 1 async_load + 4 dtype_convert).
 
 ## Notes
 
@@ -190,4 +196,5 @@ Total: **18 tests** (12 MFMA + 1 vector_add + 1 async_load + 4 dtype_convert).
   The dtype_convert bf16 test and MFMA bf16 tests both use RNE so that the kernel result matches PyTorch's `.to(bfloat16)`.
 - FP8 = `float8_e4m3fnuz` (gfx942) / `float8_e4m3fn` (gfx950), BF8 = `float8_e5m2fnuz` (gfx942) / `float8_e5m2` (gfx950).
 - FP4 = E2M1 (4-bit: 1 sign, 2 exponent, 1 mantissa). Representable values: ±{0, 0.5, 1, 1.5, 2, 3, 4, 6}. gfx950 only.
+- **Scaled MFMA** (unified into `struct mfma`, scaled `operator()` overload): gfx950-only `__builtin_amdgcn_mfma_scale_f32_{32x32x64,16x16x128}_f8f6f4` intrinsics. Support fp8\*fp8 and fp4\*fp4 with E8M0 block exponent scaling. Tests use `scale=127` (2^0=1.0, no scaling) and verify `C = A @ B` (standard matmul, **not** swap\_ab). The data layout follows the CDNA4 Matrix Core specification.
 - `test_opus_device.py` does a fresh build on every run (cleans previous `.so` and `build/` dir) to ensure changes are picked up.

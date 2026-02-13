@@ -9,6 +9,10 @@ Covers:
   - MFMA 16x16x32  fp16/bf16 (gfx942 + gfx950)
   - MFMA 32x32x16  fp8/bf8  (gfx942 + gfx950, fp32 output)
   - MFMA 16x16x32  fp8/bf8  (gfx942 + gfx950, fp32 output)
+  - Scaled MFMA 32x32x64  fp8*fp8 (gfx950 only, fp32 output)
+  - Scaled MFMA 16x16x128 fp8*fp8 (gfx950 only, fp32 output)
+  - Scaled MFMA 32x32x64  fp4*fp4 (gfx950 only, fp32 output)
+  - Scaled MFMA 16x16x128 fp4*fp4 (gfx950 only, fp32 output)
   - vector_add (all GPUs)
   - async_load (all GPUs)
   - dtype_convert: FP32<->BF16, FP32<->FP16, FP32<->FP8 round-trips (all GPUs)
@@ -287,6 +291,159 @@ def test_mfma_16x16x32_bf8(mod):
     )
 
 
+# ---------------------------------------------------------------------------
+# Scaled MFMA tests (gfx950 only)
+# ---------------------------------------------------------------------------
+
+_MFMA_SCALE_SUPPORTED_ARCHS = {"gfx950"}
+
+# FP4 E2M1 representable magnitudes (3-bit unsigned magnitude code)
+_FP4_MAGNITUDES = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+_FP4_ALL_VALUES = (
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+    + [-0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+)
+
+
+def _fp32_to_fp4_nibble(val):
+    """Convert a single fp32 value to a 4-bit FP4 E2M1 code."""
+    sign_bit = 0
+    v = float(val)
+    if v < 0.0:
+        sign_bit = 8  # bit 3
+        v = -v
+    elif v == 0.0:
+        return 0
+    for code, mag in enumerate(_FP4_MAGNITUDES):
+        if abs(v - mag) < 1e-6:
+            return sign_bit | code
+    raise ValueError(f"Value {val} is not representable in FP4 E2M1")
+
+
+def _pack_fp4_tensor(fp32_tensor):
+    """Pack fp32 tensor of FP4-representable values into uint8 (2 fp4 per byte).
+
+    Packing is along the last dimension (which must be even):
+      byte[..., j] = fp4_encode(tensor[..., 2*j]) | (fp4_encode(tensor[..., 2*j+1]) << 4)
+    """
+    assert fp32_tensor.shape[-1] % 2 == 0, "Last dim must be even for fp4 packing"
+    flat = fp32_tensor.contiguous().view(-1).tolist()
+    packed = []
+    for i in range(0, len(flat), 2):
+        lo = _fp32_to_fp4_nibble(flat[i])
+        hi = _fp32_to_fp4_nibble(flat[i + 1])
+        packed.append(lo | (hi << 4))
+    shape = list(fp32_tensor.shape)
+    shape[-1] //= 2
+    return torch.tensor(packed, dtype=torch.uint8).reshape(shape)
+
+
+def _test_mfma_scale_fp8(mod, variant, M, N, K):
+    """Test a scaled MFMA FP8 variant. Returns 0 on pass/skip, 1 on fail."""
+    arch = _get_gpu_arch()
+    if arch not in _MFMA_SCALE_SUPPORTED_ARCHS:
+        print(
+            f"  SKIP: mfma_scale_{variant} requires {_MFMA_SCALE_SUPPORTED_ARCHS}, "
+            f"got '{arch}'"
+        )
+        return 0
+
+    device = torch.device("cuda")
+    fp8_dtype = _get_fp8_dtype()
+
+    torch.manual_seed(42)
+    # Small integers exactly representable in fp8
+    A = torch.randint(-3, 4, (M, K), device=device).float().to(fp8_dtype)
+    B = torch.randint(-3, 4, (K, N), device=device).float().to(fp8_dtype)
+    C = torch.empty(M, N, device=device, dtype=torch.float32)
+
+    # scale=127 -> 2^0 = 1.0 (no scaling)
+    mod.run_mfma_scale(A, B, C, variant, 127, 127)
+
+    # Reference: standard matmul (C = A @ B, no transpose)
+    C_ref = torch.mm(A.float(), B.float())
+
+    atol, rtol = 1e-3, 1e-3
+    ok = torch.allclose(C, C_ref, atol=atol, rtol=rtol)
+    max_diff = (C - C_ref).abs().max().item()
+    if not ok:
+        diff_count = (
+            (C - C_ref).abs().gt(atol + rtol * C_ref.abs()).sum().item()
+        )
+        print(
+            f"  FAIL: mfma_scale_{variant} max_diff={max_diff:.4f}, "
+            f"{diff_count} elements outside tol"
+        )
+        return 1
+    print(f"  PASS: mfma_scale_{variant}, max_diff={max_diff:.4f}")
+    return 0
+
+
+def _test_mfma_scale_fp4(mod, variant, M, N, K):
+    """Test a scaled MFMA FP4 variant. Returns 0 on pass/skip, 1 on fail."""
+    arch = _get_gpu_arch()
+    if arch not in _MFMA_SCALE_SUPPORTED_ARCHS:
+        print(
+            f"  SKIP: mfma_scale_{variant} requires {_MFMA_SCALE_SUPPORTED_ARCHS}, "
+            f"got '{arch}'"
+        )
+        return 0
+
+    device = torch.device("cuda")
+
+    # Generate random FP4-representable values
+    fp4_values = torch.tensor(_FP4_ALL_VALUES, dtype=torch.float32)
+    torch.manual_seed(42)
+    A_fp32 = fp4_values[torch.randint(0, len(fp4_values), (M, K))]
+    B_fp32 = fp4_values[torch.randint(0, len(fp4_values), (K, N))]
+
+    # Pack into fp4 bytes (2 values per byte)
+    A_packed = _pack_fp4_tensor(A_fp32).to(device)  # [M, K//2] uint8
+    B_packed = _pack_fp4_tensor(B_fp32).to(device)  # [K, N//2] uint8
+    C = torch.empty(M, N, device=device, dtype=torch.float32)
+
+    # scale=127 -> 2^0 = 1.0 (no scaling)
+    mod.run_mfma_scale(A_packed, B_packed, C, variant, 127, 127)
+
+    # Reference: standard matmul in fp32
+    C_ref = torch.mm(A_fp32.to(device), B_fp32.to(device))
+
+    atol, rtol = 1e-3, 1e-3
+    ok = torch.allclose(C, C_ref, atol=atol, rtol=rtol)
+    max_diff = (C - C_ref).abs().max().item()
+    if not ok:
+        diff_count = (
+            (C - C_ref).abs().gt(atol + rtol * C_ref.abs()).sum().item()
+        )
+        print(
+            f"  FAIL: mfma_scale_{variant} max_diff={max_diff:.4f}, "
+            f"{diff_count} elements outside tol"
+        )
+        return 1
+    print(f"  PASS: mfma_scale_{variant}, max_diff={max_diff:.4f}")
+    return 0
+
+
+def test_mfma_scale_32x32x64_fp8(mod):
+    """Test scaled MFMA 32x32x64 fp8*fp8 (gfx950 only)."""
+    return _test_mfma_scale_fp8(mod, "32x32x64_fp8", 32, 32, 64)
+
+
+def test_mfma_scale_16x16x128_fp8(mod):
+    """Test scaled MFMA 16x16x128 fp8*fp8 (gfx950 only)."""
+    return _test_mfma_scale_fp8(mod, "16x16x128_fp8", 16, 16, 128)
+
+
+def test_mfma_scale_32x32x64_fp4(mod):
+    """Test scaled MFMA 32x32x64 fp4*fp4 (gfx950 only)."""
+    return _test_mfma_scale_fp4(mod, "32x32x64_fp4", 32, 32, 64)
+
+
+def test_mfma_scale_16x16x128_fp4(mod):
+    """Test scaled MFMA 16x16x128 fp4*fp4 (gfx950 only)."""
+    return _test_mfma_scale_fp4(mod, "16x16x128_fp4", 16, 16, 128)
+
+
 def test_vector_add(mod):
     """Test vector addition kernel."""
     n = 1310720
@@ -545,6 +702,10 @@ def main():
     failures += test_mfma_32x32x16_bf8(mod)
     failures += test_mfma_16x16x32_fp8(mod)
     failures += test_mfma_16x16x32_bf8(mod)
+    failures += test_mfma_scale_32x32x64_fp8(mod)
+    failures += test_mfma_scale_16x16x128_fp8(mod)
+    failures += test_mfma_scale_32x32x64_fp4(mod)
+    failures += test_mfma_scale_16x16x128_fp4(mod)
     failures += test_vector_add(mod)
     failures += test_async_load(mod)
     failures += test_dtype_convert_fp32_bf16(mod)
