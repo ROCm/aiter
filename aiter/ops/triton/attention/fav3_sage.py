@@ -22,7 +22,7 @@ def get_sage_fwd_configs():
             "BLOCK_N": 128,
             "waves_per_eu": 2,
             "PRE_LOAD_V": False,
-            "num_stages": 5,
+            "num_stages": 4,
             "num_warps": 8,
         }
     elif arch == "gfx942":
@@ -464,7 +464,6 @@ def fav3_sage_func(
         ACTUAL_BLOCK_DMODEL_V=head_size_v,
         MAX_SEQLENS_Q=seqlen_q,
         MAX_SEQLENS_K=seqlen_k,
-        SM_SCALE=softmax_scale,
         IS_CAUSAL=causal,
         USE_SLIDING_WINDOW=use_sliding_window,
         WINDOW_SIZE_LEFT=window_size_left,
