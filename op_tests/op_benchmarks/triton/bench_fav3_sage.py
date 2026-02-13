@@ -29,6 +29,7 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 
 from aiter.ops.triton.attention.fav3_sage import (
+    block_attn_mask_to_ragged_lut,
     fav3_sage_wrapper_func,
     get_sage_fwd_configs,
 )
@@ -423,7 +424,7 @@ def fav3_sage_forward_func(
     causal: bool,
     inference_mode: bool,  # not return softmax_lse
     layout: Literal["bshd", "bhsd"],
-    block_attn_mask: Optional[torch.Tensor] = None,
+    block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ):
     head_dim = q.shape[-1]
     softmax_scale = head_dim**-0.5
@@ -436,7 +437,7 @@ def fav3_sage_forward_func(
         causal=False,
         inference_mode=True,
         layout=layout,
-        block_attn_mask=block_attn_mask,
+        block_lut=block_lut,
     )
 
 
@@ -621,7 +622,7 @@ def primary_output(result):
 
 
 def attn_forward_func(
-    q, k, v, func_name, softmax_scale, k_smooth, layout, dtype, block_attn_mask=None
+    q, k, v, func_name, softmax_scale, k_smooth, layout, dtype, block_lut=None
 ):
     if func_name == "fav3_sage":  # fav3 sage hybrid
         fn = fav3_sage_forward_func(
@@ -631,7 +632,7 @@ def attn_forward_func(
             causal=False,
             inference_mode=True,
             layout=layout,
-            block_attn_mask=block_attn_mask,
+            block_lut=block_lut,
         )
     else:
         q, k, v = layout_preprocess(q, k, v, layout=layout, target_layout="bshd")
@@ -673,7 +674,13 @@ def attn_forward_func(
 
 
 def bench_kernel(
-    q, k, v, args, provider, block_attn_mask: Optional[torch.Tensor] = None
+    q,
+    k,
+    v,
+    args,
+    provider,
+    block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    block_attn_mask: Optional[torch.Tensor] = None,
 ):
     # Default softmax scale
     if args.layout == "bshd":
@@ -690,7 +697,7 @@ def bench_kernel(
     total_flops = 0.0
     total_flops += 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
     bench_func_name = ""
-    if block_attn_mask is not None:
+    if block_lut is not None:
         bench_func_name = "fav3_sage"
     elif args.fav3_fp8:
         bench_func_name = "fav3_fp8"
@@ -710,7 +717,7 @@ def bench_kernel(
         k_smooth=k_smooth,
         layout=args.layout,
         dtype=arg_to_torch_dtype[args.dtype],
-        block_attn_mask=block_attn_mask,
+        block_lut=block_lut,
     )
     rep = getattr(args, "rep", 100)
     warmup = getattr(args, "warmup", 25)
@@ -726,7 +733,11 @@ def bench_kernel(
                 0, 2, 1, 3
             )  # we do comparison in BSHD
 
-        ref_block_mask = block_attn_mask if args.ref == "fav3_sage" else None
+        ref_block_lut = (
+            block_attn_mask_to_ragged_lut(block_attn_mask)
+            if args.ref == "fav3_sage" and block_attn_mask is not None
+            else None
+        )
         reference_primary = primary_output(
             attn_forward_func(
                 q,
@@ -737,7 +748,7 @@ def bench_kernel(
                 k_smooth=k_smooth,
                 layout=args.layout,
                 dtype=arg_to_torch_dtype[args.dtype],
-                block_attn_mask=ref_block_mask,
+                block_lut=ref_block_lut,
             )()
         )
 
@@ -816,7 +827,14 @@ def run_benchmark_captured(args):
             BATCH, _, N_CTX_Q, _ = q.shape
             _, _, N_CTX_K, _ = v.shape
         block_attn_mask = make_block_attn_mask(args, BATCH, N_CTX_Q, N_CTX_K, device)
-        return bench_kernel(q, k, v, args, provider, block_attn_mask=block_attn_mask)
+        block_lut = (
+            block_attn_mask_to_ragged_lut(block_attn_mask)
+            if block_attn_mask is not None
+            else None
+        )
+        return bench_kernel(
+            q, k, v, args, provider, block_lut=block_lut, block_attn_mask=block_attn_mask
+        )
 
     args.layout = "bhsd"  # captured inputs are in BHSD format
     logger.info(
@@ -866,7 +884,14 @@ def run_benchmark(args):
         q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
 
         block_attn_mask = make_block_attn_mask(args, BATCH, N_CTX_Q, N_CTX_K, device)
-        return bench_kernel(q, k, v, args, provider, block_attn_mask=block_attn_mask)
+        block_lut = (
+            block_attn_mask_to_ragged_lut(block_attn_mask)
+            if block_attn_mask is not None
+            else None
+        )
+        return bench_kernel(
+            q, k, v, args, provider, block_lut=block_lut, block_attn_mask=block_attn_mask
+        )
 
     bench_mha.run(save_path="." if args.o else None, print_data=True)
 
@@ -907,7 +932,10 @@ def run_benchmark_block_sparse_repetitions(args):
         block_attn_mask = (
             torch.rand(BATCH, num_q_blocks, num_kv_blocks, device=device) > args.block_sparsity
         ).to(torch.bool)
-        ms = bench_kernel(q, k, v, args, "time(ms)", block_attn_mask=block_attn_mask)
+        block_lut = block_attn_mask_to_ragged_lut(block_attn_mask)
+        ms = bench_kernel(
+            q, k, v, args, "time(ms)", block_lut=block_lut, block_attn_mask=block_attn_mask
+        )
         ops_per_sec = total_flops / (ms * 1e-3)
         tflops = ops_per_sec / 1e12
         throughputs_tflops.append(tflops)
@@ -1007,8 +1035,9 @@ def run_benchmark_masks_list(
         v.requires_grad = False
         q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
 
+        block_lut = block_attn_mask_to_ragged_lut(mask_tensor)
         return bench_kernel(
-            q, k, v, args, provider, block_attn_mask=mask_tensor
+            q, k, v, args, provider, block_lut=block_lut, block_attn_mask=mask_tensor
         )
 
     bench_mha_masks.run(save_path="." if args.o else None, print_data=True)

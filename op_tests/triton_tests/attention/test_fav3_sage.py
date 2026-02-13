@@ -10,6 +10,7 @@ from aiter.test_mha_common import (
     attention_ref_block_sparse,
 )
 from aiter.ops.triton.attention.fav3_sage import (
+    block_attn_mask_to_ragged_lut,
     fav3_sage_wrapper_func,
     get_sage_fwd_configs,
 )
