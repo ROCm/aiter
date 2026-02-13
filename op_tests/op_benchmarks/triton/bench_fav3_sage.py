@@ -219,6 +219,30 @@ def make_block_attn_mask(
     return (torch.rand(BATCH, num_q_blocks, num_kv_blocks, device=device) > args.block_sparsity).to(torch.bool)
 
 
+def sparse_flops_from_lut(
+    block_lut: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    BATCH: int,
+    N_CTX_Q: int,
+    N_CTX_K: int,
+    HQ: int,
+    D_HEAD: int,
+    D_HEAD_V: int,
+) -> Tuple[float, float]:
+    """Return (sparse_flops, total_flops_dense). Uses config BLOCK_M, BLOCK_N."""
+    kv_block_indices, lut_start, lut_count = block_lut
+    num_sparse_pairs = kv_block_indices.numel()
+    config = get_sage_fwd_configs()
+    BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
+    num_q_blocks = (N_CTX_Q + BLOCK_M - 1) // BLOCK_M
+    num_kv_blocks = (N_CTX_K + BLOCK_N - 1) // BLOCK_N
+    num_dense_pairs = BATCH * num_q_blocks * num_kv_blocks
+    total_flops_dense = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
+    if num_dense_pairs == 0:
+        return 0.0, total_flops_dense
+    sparse_flops = total_flops_dense * (num_sparse_pairs / num_dense_pairs)
+    return sparse_flops, total_flops_dense
+
+
 def fp8_quantize(q, k, v, scale=None):
     quant_dtype = aiter.dtypes.fp8
     # Computing "dynamic" scale before quantization improves thpt a small amount (~1-2%) for the (1, 75352, 5, 128) shape
@@ -468,6 +492,10 @@ def create_benchmark_configs(args):
         "bandwidth(GB/s)",
         "arithmetic_intensity(FLOP/byte)",
     ]
+    if getattr(args, "block_sparsity", None) is not None or getattr(
+        args, "block_mask_file", None
+    ):
+        line_vals.append("throughput_sparse(TFLOPS)")
 
     # if comparing to reference, or specific metric provided, adjust line_vals accordingly
     if args.compare_to_ref or (args.metric and args.metric != "all"):
@@ -481,6 +509,7 @@ def create_benchmark_configs(args):
                 "throughput": "throughput(TFLOPS)",
                 "bandwidth": "bandwidth(GB/s)",
                 "arithmetic_intensity": "arithmetic_intensity(FLOP/byte)",
+                "throughput_sparse": "throughput_sparse(TFLOPS)",
             }
             line_vals = [metric_map[args.metric]]
 
@@ -530,6 +559,7 @@ def create_benchmark_configs_masks(
         "throughput(TFLOPS)",
         "bandwidth(GB/s)",
         "arithmetic_intensity(FLOP/byte)",
+        "throughput_sparse(TFLOPS)",
     ]
     if args.compare_to_ref or (args.metric and args.metric != "all"):
         if args.compare_to_ref:
@@ -540,6 +570,7 @@ def create_benchmark_configs_masks(
                 "throughput": "throughput(TFLOPS)",
                 "bandwidth": "bandwidth(GB/s)",
                 "arithmetic_intensity": "arithmetic_intensity(FLOP/byte)",
+                "throughput_sparse": "throughput_sparse(TFLOPS)",
             }
             line_vals = [metric_map[args.metric]]
 
@@ -583,12 +614,17 @@ def create_benchmark_configs_from_captured(inputs: List[Dict[str, Any]], args):
             "bandwidth(GB/s)",
             "arithmetic_intensity(FLOP/byte)",
         ]
+        if getattr(args, "block_sparsity", None) is not None or getattr(
+            args, "block_mask_file", None
+        ):
+            line_vals.append("throughput_sparse(TFLOPS)")
     else:
         metric_map = {
             "time": "time(ms)",
             "throughput": "throughput(TFLOPS)",
             "bandwidth": "bandwidth(GB/s)",
             "arithmetic_intensity": "arithmetic_intensity(FLOP/byte)",
+            "throughput_sparse": "throughput_sparse(TFLOPS)",
         }
         line_vals = [metric_map.get(args.metric, "throughput(TFLOPS)")]
 
@@ -777,9 +813,19 @@ def bench_kernel(
     mem_write = o_size
     mem = mem_read + mem_write
 
+    # Sparsity-adjusted throughput when block_lut is present
+    sparse_flops = None
+    if block_lut is not None:
+        sparse_flops, _ = sparse_flops_from_lut(
+            block_lut, BATCH, N_CTX_Q, N_CTX_K, HQ, D_HEAD, D_HEAD_V
+        )
+
     # return ms
     if "ms" in provider:
         return ms
+    elif "throughput_sparse(TFLOPS)" in provider:
+        flops = sparse_flops if sparse_flops is not None else total_flops
+        return flops / ms * 1e-9
     elif "TFLOPS" in provider:
         return total_flops / ms * 1e-9
     elif "GB/s" in provider:  # GB/s
@@ -928,6 +974,8 @@ def run_benchmark_block_sparse_repetitions(args):
 
     n_rep = args.n_repetitions
     throughputs_tflops = []
+    latencies_ms = []
+    effective_tflops_list = []
     for _ in range(n_rep):
         block_attn_mask = (
             torch.rand(BATCH, num_q_blocks, num_kv_blocks, device=device) > args.block_sparsity
@@ -936,9 +984,15 @@ def run_benchmark_block_sparse_repetitions(args):
         ms = bench_kernel(
             q, k, v, args, "time(ms)", block_lut=block_lut, block_attn_mask=block_attn_mask
         )
+        latencies_ms.append(ms)
         ops_per_sec = total_flops / (ms * 1e-3)
         tflops = ops_per_sec / 1e12
         throughputs_tflops.append(tflops)
+        sparse_flops, _ = sparse_flops_from_lut(
+            block_lut, BATCH, N_CTX_Q, N_CTX_K, HQ, D_HEAD, D_HEAD_V
+        )
+        effective_tflops = (sparse_flops / (ms * 1e-3)) / 1e12
+        effective_tflops_list.append(effective_tflops)
 
     t = torch.tensor(throughputs_tflops)
     median_tflops = torch.quantile(t, 0.5).item()
@@ -947,10 +1001,28 @@ def run_benchmark_block_sparse_repetitions(args):
     p10_tflops = torch.quantile(t, 0.1).item()
     p90_tflops = torch.quantile(t, 0.9).item()
 
+    t_lat = torch.tensor(latencies_ms)
+    median_latency_ms = torch.quantile(t_lat, 0.5).item()
+    q1_latency_ms = torch.quantile(t_lat, 0.25).item()
+    q3_latency_ms = torch.quantile(t_lat, 0.75).item()
+    p10_latency_ms = torch.quantile(t_lat, 0.1).item()
+    p90_latency_ms = torch.quantile(t_lat, 0.9).item()
+
+    t_eff = torch.tensor(effective_tflops_list)
+    median_effective_tflops = torch.quantile(t_eff, 0.5).item()
+    q1_effective_tflops = torch.quantile(t_eff, 0.25).item()
+    q3_effective_tflops = torch.quantile(t_eff, 0.75).item()
+    p10_effective_tflops = torch.quantile(t_eff, 0.1).item()
+    p90_effective_tflops = torch.quantile(t_eff, 0.9).item()
+
     summary = (
         f"block_sparsity={args.block_sparsity}, n_repetitions={n_rep}: "
         f"median_TFLOPS={median_tflops:.4f}, Q1={q1_tflops:.4f}, Q3={q3_tflops:.4f}, "
-        f"p10={p10_tflops:.4f}, p90={p90_tflops:.4f}"
+        f"p10={p10_tflops:.4f}, p90={p90_tflops:.4f} | "
+        f"median_latency_ms={median_latency_ms:.4f}, Q1={q1_latency_ms:.4f}, Q3={q3_latency_ms:.4f}, "
+        f"p10={p10_latency_ms:.4f}, p90={p90_latency_ms:.4f} | "
+        f"median_effective_TFLOPS={median_effective_tflops:.4f}, Q1={q1_effective_tflops:.4f}, "
+        f"Q3={q3_effective_tflops:.4f}, p10={p10_effective_tflops:.4f}, p90={p90_effective_tflops:.4f}"
     )
     logger.info(summary)
     print(summary)
@@ -974,6 +1046,16 @@ def run_benchmark_block_sparse_repetitions(args):
                 q3_tflops,
                 p10_tflops,
                 p90_tflops,
+                median_latency_ms,
+                q1_latency_ms,
+                q3_latency_ms,
+                p10_latency_ms,
+                p90_latency_ms,
+                median_effective_tflops,
+                q1_effective_tflops,
+                q3_effective_tflops,
+                p10_effective_tflops,
+                p90_effective_tflops,
             ]
             if not file_exists:
                 writer.writerow(
@@ -991,6 +1073,16 @@ def run_benchmark_block_sparse_repetitions(args):
                         "q3_TFLOPS",
                         "p10_TFLOPS",
                         "p90_TFLOPS",
+                        "median_latency_ms",
+                        "q1_latency_ms",
+                        "q3_latency_ms",
+                        "p10_latency_ms",
+                        "p90_latency_ms",
+                        "median_effective_TFLOPS",
+                        "q1_effective_TFLOPS",
+                        "q3_effective_TFLOPS",
+                        "p10_effective_TFLOPS",
+                        "p90_effective_TFLOPS",
                     ]
                 )
             writer.writerow(row)
