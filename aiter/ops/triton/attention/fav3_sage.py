@@ -55,6 +55,57 @@ def block_attn_mask_to_lut(
     return out, max_lut_len
 
 
+def block_attn_mask_to_ragged_lut(
+    block_attn_mask: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Convert a dense block attention mask to a ragged look-up table of KV block
+    indices per (batch, q_block). Used for block-sparse attention with no
+    per-iteration branching in the kernel.
+
+    block_attn_mask: (batch, num_q_blocks, num_kv_blocks) boolean.
+        True = may attend, False = must not attend.
+    Returns:
+        kv_block_indices: 1D int32, concatenation of all KV block index lists
+            (no -1 sentinels). Length = total number of (Q block, KV block) pairs.
+        lut_start: 1D int32, length batch * num_q_blocks. For index
+            idx = batch_idx * num_q_blocks + q_block_idx, lut_start[idx] is the
+            index in kv_block_indices where this Q block's KV list begins.
+        lut_count: 1D int32, same length as lut_start. lut_count[idx] is the
+            number of KV blocks for that (batch, q_block).
+    """
+    batch, num_q_blocks, num_kv_blocks = block_attn_mask.shape
+    device = block_attn_mask.device
+    mask_cpu = block_attn_mask.cpu()
+
+    flat_indices = []
+    lut_start = []
+    lut_count = []
+
+    for b in range(batch):
+        for qb in range(num_q_blocks):
+            start = len(flat_indices)
+            row = mask_cpu[b, qb, :]
+            indices = torch.nonzero(row, as_tuple=False).squeeze(-1)
+            if indices.dim() == 0:
+                count = 0
+            else:
+                count = indices.size(0)
+                flat_indices.append(indices)
+            lut_start.append(start)
+            lut_count.append(count)
+
+    if flat_indices:
+        kv_block_indices = torch.cat(flat_indices, dim=0).to(device=device, dtype=torch.int32)
+    else:
+        kv_block_indices = torch.empty(0, dtype=torch.int32, device=device)
+
+    lut_start_t = torch.tensor(lut_start, dtype=torch.int32, device=device)
+    lut_count_t = torch.tensor(lut_count, dtype=torch.int32, device=device)
+
+    return kv_block_indices, lut_start_t, lut_count_t
+
+
 def get_sage_fwd_configs():
     arch = arch_info.get_arch()
     if arch == "gfx950":
@@ -135,13 +186,12 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
                     f"block_attn_mask must have shape (batch, num_q_blocks, num_kv_blocks) "
                     f"= ({batch}, {num_q_blocks}, {num_k_blocks}), got {block_attn_mask.shape}"
                 )
-            block_lut, max_lut_len = block_attn_mask_to_lut(block_attn_mask)
+            kv_block_indices, lut_start, lut_count = block_attn_mask_to_ragged_lut(
+                block_attn_mask
+            )
             use_block_sparse = True
         else:
-            block_lut = torch.full(
-                (1, 1, 1), -1, dtype=torch.int32, device=q.device
-            )
-            max_lut_len = 1
+            kv_block_indices = lut_start = lut_count = None
             use_block_sparse = False
 
         # 2. Validation: Early Exit for unsupported features
@@ -206,8 +256,9 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             return_lse,
             layout,
             config,
-            block_lut=block_lut,
-            max_lut_len=max_lut_len,
+            kv_block_indices=kv_block_indices,
+            lut_start=lut_start,
+            lut_count=lut_count,
             use_block_sparse=use_block_sparse,
         )
 
@@ -360,8 +411,9 @@ def fav3_sage_func(
     return_lse: bool = False,
     layout: str = "bshd",
     config: Optional[dict] = None,
-    block_lut: Optional[torch.Tensor] = None,
-    max_lut_len: int = 1,
+    kv_block_indices: Optional[torch.Tensor] = None,
+    lut_start: Optional[torch.Tensor] = None,
+    lut_count: Optional[torch.Tensor] = None,
     use_block_sparse: bool = False,
 ):
     """
@@ -466,15 +518,15 @@ def fav3_sage_func(
     use_sliding_window = window_size_left != -1 or window_size_right != -1
 
     if use_block_sparse:
-        if block_lut is None:
-            raise ValueError("block_lut must be provided when use_block_sparse=True")
+        if kv_block_indices is None or lut_start is None or lut_count is None:
+            raise ValueError(
+                "kv_block_indices, lut_start, and lut_count must be provided "
+                "when use_block_sparse=True"
+            )
     else:
-        block_lut = torch.full((1, 1, 1), -1, dtype=torch.int32, device=q.device)
-        max_lut_len = 1
-
-    stride_lut_z = block_lut.stride(0)
-    stride_lut_m = block_lut.stride(1)
-    stride_lut_i = block_lut.stride(2)
+        kv_block_indices = torch.zeros(1, dtype=torch.int32, device=q.device)
+        lut_start = torch.zeros(1, dtype=torch.int32, device=q.device)
+        lut_count = torch.zeros(1, dtype=torch.int32, device=q.device)
 
     # --- 7. Kernel Launch ---
     def grid(META):
@@ -533,10 +585,10 @@ def fav3_sage_func(
         None,
         None,
         None,
-        block_lut,
-        stride_lut_z,
-        stride_lut_m,
-        stride_lut_i,
+        kv_block_indices,
+        lut_start,
+        lut_count,
+        num_q_blocks,
         dropout_p=0.0,
         philox_seed=None,
         philox_offset_base=None,
@@ -562,7 +614,6 @@ def fav3_sage_func(
         RETURN_SCORES=False,
         USE_SEQUSED=False,
         USE_BLOCK_SPARSE=use_block_sparse,
-        MAX_LUT_LEN=max_lut_len,
         **config,
     )
 

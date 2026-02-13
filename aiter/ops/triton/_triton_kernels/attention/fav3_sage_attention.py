@@ -230,11 +230,11 @@ def _sage_fwd_blocksparse(
     q_descale,
     k_descale_offset,
     stride_ksblk,
-    lut_base,
-    stride_lut_i,
+    kv_block_indices,
+    lut_start_val,
+    n_blocks,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    MAX_LUT_LEN: tl.constexpr,
     PRE_LOAD_V: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     PADDED_HEAD_QK: tl.constexpr,
@@ -246,72 +246,59 @@ def _sage_fwd_blocksparse(
     RETURN_SCORES: tl.constexpr,
     ACCUMULATOR_TYPE,
 ):
-    for i in range(MAX_LUT_LEN):
-        start_b = tl.load(lut_base + i * stride_lut_i)
-        if start_b >= 0:
-            start_n = start_b * BLOCK_N
-            k_ptrs = k_base_ptrs + start_n * stride_kn
-            v_ptrs = v_base_ptrs + start_n * stride_vk
-            kv_offs_n = start_n + tl.arange(0, BLOCK_N)
-            k_descale_ptr_cur = k_descale_offset + start_b * stride_ksblk
-            if PADDED_HEAD_QK:
-                k_mask = offs_d_qk[:, None] < ACTUAL_BLOCK_DMODEL_QK
-                k = tl.load(k_ptrs, mask=k_mask, other=0.0)
+    for i in range(n_blocks):
+        start_b = tl.load(kv_block_indices + lut_start_val + i)
+        start_n = start_b * BLOCK_N
+        k_ptrs = k_base_ptrs + start_n * stride_kn
+        v_ptrs = v_base_ptrs + start_n * stride_vk
+        kv_offs_n = start_n + tl.arange(0, BLOCK_N)
+        k_descale_ptr_cur = k_descale_offset + start_b * stride_ksblk
+        if PADDED_HEAD_QK:
+            k_mask = offs_d_qk[:, None] < ACTUAL_BLOCK_DMODEL_QK
+            k = tl.load(k_ptrs, mask=k_mask, other=0.0)
+        else:
+            k = tl.load(k_ptrs)
+        k_descale = tl.load(k_descale_ptr_cur)
+        if PRE_LOAD_V:
+            if PADDED_HEAD_V:
+                v_mask = offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
+                v = tl.load(v_ptrs, mask=v_mask, other=0.0)
             else:
-                k = tl.load(k_ptrs)
-            k_descale = tl.load(k_descale_ptr_cur)
-            if PRE_LOAD_V:
-                if PADDED_HEAD_V:
-                    v_mask = offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
-                    v = tl.load(v_ptrs, mask=v_mask, other=0.0)
-                else:
-                    v = tl.load(v_ptrs)
-            qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
-            qk += tl.dot(q, k) * (q_descale * k_descale)
-            qk_scaled = qk
-            if USE_ALIBI:
-                q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-                alibi_block = compute_alibi_block(
-                    alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
-                )
-                qk_scaled += alibi_block
-            qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-            if bias_base_ptrs is not None:
-                bias_ptrs = bias_base_ptrs + start_n * stride_bn
-                bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-                qk_scaled += bias
-            m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
-            q_shifted = tl.where(
-                m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
+                v = tl.load(v_ptrs)
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
+        qk += tl.dot(q, k) * (q_descale * k_descale)
+        qk_scaled = qk
+        if USE_ALIBI:
+            q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            alibi_block = compute_alibi_block(
+                alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
             )
-            if USE_EXP2:
-                p = tl.math.exp2(q_shifted)
-            else:
-                p = tl.math.exp(q_shifted)
-            l_ij = tl.sum(p, 1)
-            if ENABLE_DROPOUT:
-                philox_base = philox_offset_base + off_z * stride_sz + off_h_q * stride_sh
-                philox_ptrs = (
-                    philox_base
-                    + offs_m[:, None] * stride_sm
-                    + kv_offs_n[None, :] * stride_sn
-                )
-                rng_output = tl.rand(philox_seed, philox_ptrs)
-                dropout_mask = rng_output > dropout_p
-                if RETURN_SCORES:
-                    sd_mask_value = tl.where(dropout_mask, p, -p)
-                    sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
-                    sd_mask_ptrs = (
-                        sd_mask_base
-                        + offs_m[:, None] * stride_sm
-                        + kv_offs_n[None, :] * stride_sn
-                    )
-                    sd_store_mask = (offs_m[:, None] < seqlen_q) & (
-                        kv_offs_n[None, :] < seqlen_k
-                    )
-                    tl.store(sd_mask_ptrs, sd_mask_value, mask=sd_store_mask)
-                p = tl.where(dropout_mask, p, 0.0)
-            elif RETURN_SCORES:
+            qk_scaled += alibi_block
+        qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
+        if bias_base_ptrs is not None:
+            bias_ptrs = bias_base_ptrs + start_n * stride_bn
+            bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
+            qk_scaled += bias
+        m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
+        q_shifted = tl.where(
+            m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
+        )
+        if USE_EXP2:
+            p = tl.math.exp2(q_shifted)
+        else:
+            p = tl.math.exp(q_shifted)
+        l_ij = tl.sum(p, 1)
+        if ENABLE_DROPOUT:
+            philox_base = philox_offset_base + off_z * stride_sz + off_h_q * stride_sh
+            philox_ptrs = (
+                philox_base
+                + offs_m[:, None] * stride_sm
+                + kv_offs_n[None, :] * stride_sn
+            )
+            rng_output = tl.rand(philox_seed, philox_ptrs)
+            dropout_mask = rng_output > dropout_p
+            if RETURN_SCORES:
+                sd_mask_value = tl.where(dropout_mask, p, -p)
                 sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
                 sd_mask_ptrs = (
                     sd_mask_base
@@ -321,22 +308,34 @@ def _sage_fwd_blocksparse(
                 sd_store_mask = (offs_m[:, None] < seqlen_q) & (
                     kv_offs_n[None, :] < seqlen_k
                 )
-                tl.store(sd_mask_ptrs, p, mask=sd_store_mask)
-            m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
-            if USE_EXP2:
-                alpha = tl.math.exp2(m_diff)
+                tl.store(sd_mask_ptrs, sd_mask_value, mask=sd_store_mask)
+            p = tl.where(dropout_mask, p, 0.0)
+        elif RETURN_SCORES:
+            sd_mask_base = sd_mask + off_z * stride_sz + off_h_q * stride_sh
+            sd_mask_ptrs = (
+                sd_mask_base
+                + offs_m[:, None] * stride_sm
+                + kv_offs_n[None, :] * stride_sn
+            )
+            sd_store_mask = (offs_m[:, None] < seqlen_q) & (
+                kv_offs_n[None, :] < seqlen_k
+            )
+            tl.store(sd_mask_ptrs, p, mask=sd_store_mask)
+        m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
+        if USE_EXP2:
+            alpha = tl.math.exp2(m_diff)
+        else:
+            alpha = tl.math.exp(m_diff)
+        acc = acc * alpha[:, None]
+        if not PRE_LOAD_V:
+            if PADDED_HEAD_V:
+                v_mask = offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
+                v = tl.load(v_ptrs, mask=v_mask, other=0.0)
             else:
-                alpha = tl.math.exp(m_diff)
-            acc = acc * alpha[:, None]
-            if not PRE_LOAD_V:
-                if PADDED_HEAD_V:
-                    v_mask = offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
-                    v = tl.load(v_ptrs, mask=v_mask, other=0.0)
-                else:
-                    v = tl.load(v_ptrs)
-            l_i = l_i * alpha + l_ij
-            m_i = m_ij
-            acc += tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
+                v = tl.load(v_ptrs)
+        l_i = l_i * alpha + l_ij
+        m_i = m_ij
+        acc += tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
     return acc, l_i, m_i
 
 
@@ -1047,10 +1046,10 @@ def sage_fwd(
     cu_seqlens_k,
     seqused_q,
     seqused_k,  # Add seqused parameters
-    block_lut,
-    stride_lut_z,
-    stride_lut_m,
-    stride_lut_i,
+    kv_block_indices,
+    lut_start,
+    lut_count,
+    num_q_blocks,
     dropout_p,
     philox_seed,
     philox_offset_base,
@@ -1079,7 +1078,6 @@ def sage_fwd(
     USE_EXP2: tl.constexpr,
     USE_SEQUSED: tl.constexpr,
     USE_BLOCK_SPARSE: tl.constexpr,
-    MAX_LUT_LEN: tl.constexpr,
 ):
     # set params
     ACCUMULATOR_TYPE = tl.float32  # for q*k product
@@ -1164,9 +1162,9 @@ def sage_fwd(
     if USE_BLOCK_SPARSE:
         total_k_blocks = tl.cdiv(seqlen_k, BLOCK_N)
         n_extra_tokens = compute_padding_info(seqlen_k, BLOCK_N)
-        lut_base = block_lut + off_z * stride_lut_z + start_m * stride_lut_m
-        first_start_b = tl.load(lut_base)
-        has_any_range = first_start_b >= 0
+        lut_idx = off_z * num_q_blocks + start_m
+        n_blocks = tl.load(lut_count + lut_idx)
+        has_any_range = n_blocks > 0
     else:
         (
             n_front_skip_blocks,
@@ -1494,6 +1492,7 @@ def sage_fwd(
             )
     else:
         # ========== USE_BLOCK_SPARSE: single call to _sage_fwd_blocksparse ==========
+        lut_start_val = tl.load(lut_start + lut_idx)
         acc, l_i, m_i = _sage_fwd_blocksparse(
             acc,
             l_i,
@@ -1525,11 +1524,11 @@ def sage_fwd(
             q_descale,
             k_descale_offset,
             stride_ksblk,
-            lut_base,
-            stride_lut_i,
+            kv_block_indices,
+            lut_start_val,
+            n_blocks,
             BLOCK_M,
             BLOCK_N,
-            MAX_LUT_LEN,
             PRE_LOAD_V,
             ENABLE_DROPOUT,
             PADDED_HEAD_QK,
