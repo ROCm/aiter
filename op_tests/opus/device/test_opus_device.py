@@ -9,10 +9,10 @@ Covers:
   - MFMA 16x16x32  fp16/bf16 (gfx942 + gfx950)
   - MFMA 32x32x16  fp8/bf8  (gfx942 + gfx950, fp32 output)
   - MFMA 16x16x32  fp8/bf8  (gfx942 + gfx950, fp32 output)
-  - Scaled MFMA 32x32x64  fp8*fp8 (gfx950 only, fp32 output)
-  - Scaled MFMA 16x16x128 fp8*fp8 (gfx950 only, fp32 output)
-  - Scaled MFMA 32x32x64  fp4*fp4 (gfx950 only, fp32 output)
-  - Scaled MFMA 16x16x128 fp4*fp4 (gfx950 only, fp32 output)
+  - MXFP8 32x32x64  fp8*fp8 (gfx950 only, fp32 output)
+  - MXFP8 16x16x128 fp8*fp8 (gfx950 only, fp32 output)
+  - MXFP4 32x32x64  fp4*fp4 (gfx950 only, fp32 output)
+  - MXFP4 16x16x128 fp4*fp4 (gfx950 only, fp32 output)
   - vector_add (all GPUs)
   - async_load (all GPUs)
   - dtype_convert: FP32<->BF16, FP32<->FP16, FP32<->FP8 round-trips (all GPUs)
@@ -292,10 +292,10 @@ def test_mfma_16x16x32_bf8(mod):
 
 
 # ---------------------------------------------------------------------------
-# Scaled MFMA tests (gfx950 only)
+# MXFP tests (gfx950 only)
 # ---------------------------------------------------------------------------
 
-_MFMA_SCALE_SUPPORTED_ARCHS = {"gfx950"}
+_MXFP_SUPPORTED_ARCHS = {"gfx950"}
 
 # FP4 E2M1 representable magnitudes (3-bit unsigned magnitude code)
 _FP4_MAGNITUDES = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
@@ -338,12 +338,12 @@ def _pack_fp4_tensor(fp32_tensor):
     return torch.tensor(packed, dtype=torch.uint8).reshape(shape)
 
 
-def _test_mfma_scale_fp8(mod, variant, M, N, K):
-    """Test a scaled MFMA FP8 variant. Returns 0 on pass/skip, 1 on fail."""
+def _test_mxfp8(mod, variant, M, N, K):
+    """Test an MXFP8 variant. Returns 0 on pass/skip, 1 on fail."""
     arch = _get_gpu_arch()
-    if arch not in _MFMA_SCALE_SUPPORTED_ARCHS:
+    if arch not in _MXFP_SUPPORTED_ARCHS:
         print(
-            f"  SKIP: mfma_scale_{variant} requires {_MFMA_SCALE_SUPPORTED_ARCHS}, "
+            f"  SKIP: {variant} requires {_MXFP_SUPPORTED_ARCHS}, "
             f"got '{arch}'"
         )
         return 0
@@ -358,7 +358,7 @@ def _test_mfma_scale_fp8(mod, variant, M, N, K):
     C = torch.empty(M, N, device=device, dtype=torch.float32)
 
     # scale=127 -> 2^0 = 1.0 (no scaling)
-    mod.run_mfma_scale(A, B, C, variant, 127, 127)
+    mod.run_mxfp(A, B, C, variant, 127, 127)
 
     # Reference: standard matmul (C = A @ B, no transpose)
     C_ref = torch.mm(A.float(), B.float())
@@ -371,20 +371,20 @@ def _test_mfma_scale_fp8(mod, variant, M, N, K):
             (C - C_ref).abs().gt(atol + rtol * C_ref.abs()).sum().item()
         )
         print(
-            f"  FAIL: mfma_scale_{variant} max_diff={max_diff:.4f}, "
+            f"  FAIL: {variant} max_diff={max_diff:.4f}, "
             f"{diff_count} elements outside tol"
         )
         return 1
-    print(f"  PASS: mfma_scale_{variant}, max_diff={max_diff:.4f}")
+    print(f"  PASS: {variant}, max_diff={max_diff:.4f}")
     return 0
 
 
-def _test_mfma_scale_fp4(mod, variant, M, N, K):
-    """Test a scaled MFMA FP4 variant. Returns 0 on pass/skip, 1 on fail."""
+def _test_mxfp4(mod, variant, M, N, K):
+    """Test an MXFP4 variant. Returns 0 on pass/skip, 1 on fail."""
     arch = _get_gpu_arch()
-    if arch not in _MFMA_SCALE_SUPPORTED_ARCHS:
+    if arch not in _MXFP_SUPPORTED_ARCHS:
         print(
-            f"  SKIP: mfma_scale_{variant} requires {_MFMA_SCALE_SUPPORTED_ARCHS}, "
+            f"  SKIP: {variant} requires {_MXFP_SUPPORTED_ARCHS}, "
             f"got '{arch}'"
         )
         return 0
@@ -403,7 +403,7 @@ def _test_mfma_scale_fp4(mod, variant, M, N, K):
     C = torch.empty(M, N, device=device, dtype=torch.float32)
 
     # scale=127 -> 2^0 = 1.0 (no scaling)
-    mod.run_mfma_scale(A_packed, B_packed, C, variant, 127, 127)
+    mod.run_mxfp(A_packed, B_packed, C, variant, 127, 127)
 
     # Reference: standard matmul in fp32
     C_ref = torch.mm(A_fp32.to(device), B_fp32.to(device))
@@ -416,32 +416,32 @@ def _test_mfma_scale_fp4(mod, variant, M, N, K):
             (C - C_ref).abs().gt(atol + rtol * C_ref.abs()).sum().item()
         )
         print(
-            f"  FAIL: mfma_scale_{variant} max_diff={max_diff:.4f}, "
+            f"  FAIL: {variant} max_diff={max_diff:.4f}, "
             f"{diff_count} elements outside tol"
         )
         return 1
-    print(f"  PASS: mfma_scale_{variant}, max_diff={max_diff:.4f}")
+    print(f"  PASS: {variant}, max_diff={max_diff:.4f}")
     return 0
 
 
-def test_mfma_scale_32x32x64_fp8(mod):
-    """Test scaled MFMA 32x32x64 fp8*fp8 (gfx950 only)."""
-    return _test_mfma_scale_fp8(mod, "32x32x64_fp8", 32, 32, 64)
+def test_mxfp8_32x32x64(mod):
+    """Test MXFP8 32x32x64 fp8*fp8 (gfx950 only)."""
+    return _test_mxfp8(mod, "mxfp8_32x32x64", 32, 32, 64)
 
 
-def test_mfma_scale_16x16x128_fp8(mod):
-    """Test scaled MFMA 16x16x128 fp8*fp8 (gfx950 only)."""
-    return _test_mfma_scale_fp8(mod, "16x16x128_fp8", 16, 16, 128)
+def test_mxfp8_16x16x128(mod):
+    """Test MXFP8 16x16x128 fp8*fp8 (gfx950 only)."""
+    return _test_mxfp8(mod, "mxfp8_16x16x128", 16, 16, 128)
 
 
-def test_mfma_scale_32x32x64_fp4(mod):
-    """Test scaled MFMA 32x32x64 fp4*fp4 (gfx950 only)."""
-    return _test_mfma_scale_fp4(mod, "32x32x64_fp4", 32, 32, 64)
+def test_mxfp4_32x32x64(mod):
+    """Test MXFP4 32x32x64 fp4*fp4 (gfx950 only)."""
+    return _test_mxfp4(mod, "mxfp4_32x32x64", 32, 32, 64)
 
 
-def test_mfma_scale_16x16x128_fp4(mod):
-    """Test scaled MFMA 16x16x128 fp4*fp4 (gfx950 only)."""
-    return _test_mfma_scale_fp4(mod, "16x16x128_fp4", 16, 16, 128)
+def test_mxfp4_16x16x128(mod):
+    """Test MXFP4 16x16x128 fp4*fp4 (gfx950 only)."""
+    return _test_mxfp4(mod, "mxfp4_16x16x128", 16, 16, 128)
 
 
 def test_vector_add(mod):
@@ -702,10 +702,10 @@ def main():
     failures += test_mfma_32x32x16_bf8(mod)
     failures += test_mfma_16x16x32_fp8(mod)
     failures += test_mfma_16x16x32_bf8(mod)
-    failures += test_mfma_scale_32x32x64_fp8(mod)
-    failures += test_mfma_scale_16x16x128_fp8(mod)
-    failures += test_mfma_scale_32x32x64_fp4(mod)
-    failures += test_mfma_scale_16x16x128_fp4(mod)
+    failures += test_mxfp8_32x32x64(mod)
+    failures += test_mxfp8_16x16x128(mod)
+    failures += test_mxfp4_32x32x64(mod)
+    failures += test_mxfp4_16x16x128(mod)
     failures += test_vector_add(mod)
     failures += test_async_load(mod)
     failures += test_dtype_convert_fp32_bf16(mod)

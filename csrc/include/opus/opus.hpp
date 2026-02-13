@@ -1434,16 +1434,10 @@ template <index_t lgkmcnt> OPUS_D void s_waitcnt_lgkmcnt(number<lgkmcnt>) { s_wa
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
     return inst_(__builtin_bit_cast(i32x8_t, a), __builtin_bit_cast(i32x8_t, b), c, fmt_a, fmt_b, 0, scale_a, 0, scale_b); }
 
-// Helper: resolve vtype for MFMA registers. Packed types (fp4_t etc.) use their underlying storage type
-// because ext_vector_type requires scalar types and packed types are structs.
-namespace impl {
-template<typename T, index_t N, typename = void>
-struct mfma_vtype_helper { using type = vector_t<T, N>; };
-template<typename T, index_t N>
-struct mfma_vtype_helper<T, N, std::enable_if_t<is_packs_v<T>>> { using type = vector_t<typename T::storage, N>; };
-}
-template<typename T, index_t N>
-using mfma_vtype_t = typename impl::mfma_vtype_helper<T, N>::type;
+// Helper: resolve vtype for MFMA registers. Packed types (fp4_t etc.) use underlying storage since ext_vector_type requires scalar types.
+namespace impl { template<typename T, index_t N, typename = void> struct mfma_vtype { using type = vector_t<T, N>; };
+template<typename T, index_t N> struct mfma_vtype<T, N, std::enable_if_t<is_packs_v<T>>> { using type = vector_t<typename T::storage, N>; }; }
+template<typename T, index_t N> using mfma_vtype_t = typename impl::mfma_vtype<T, N>::type;
 
 // prefer use make_mfma() to create instance, which will return impl::mfma_adaptor_xxx. In this way we can access layout info from the "mma"
 //

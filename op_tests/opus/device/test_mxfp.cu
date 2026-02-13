@@ -2,17 +2,17 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 /**
- * @file test_mfma_scale.cu
- * @brief Scaled MFMA (f8f6f4) kernel tests for gfx950.
+ * @file test_mxfp.cu
+ * @brief MXFP8/MXFP4 kernel tests for gfx950.
  *
  * Tests __builtin_amdgcn_mfma_scale_f32_{32x32x64,16x16x128}_f8f6f4
  * via the opus::mfma struct (scaled overload), with fp8*fp8 and fp4*fp4 inputs.
  *
  * Variants:
- *   1) 32x32x64  FP8*FP8  — gfx950 only
- *   2) 16x16x128 FP8*FP8  — gfx950 only
- *   3) 32x32x64  FP4*FP4  — gfx950 only
- *   4) 16x16x128 FP4*FP4  — gfx950 only
+ *   1) mxfp8_32x32x64   — gfx950 only
+ *   2) mxfp8_16x16x128  — gfx950 only
+ *   3) mxfp4_32x32x64   — gfx950 only
+ *   4) mxfp4_16x16x128  — gfx950 only
  *
  * Data layout follows the CDNA4 Matrix Core specification:
  *   A is [M,K], B is [K,N], C is [M,N]; all row-major.
@@ -23,7 +23,7 @@
 #include <cstdio>
 #include <cstring>
 #include "opus/opus.hpp"
-#include "test_mfma_scale.h"
+#include "test_mxfp.h"
 
 #define HIP_CALL(call) do { \
     hipError_t err = (call); \
@@ -44,10 +44,10 @@ __device__ inline unsigned char fp4_pack(unsigned char lo, unsigned char hi) {
 }
 
 // ==========================================================================
-// FP8 * FP8 scaled MFMA kernel
+// MXFP8: FP8 * FP8 scaled MFMA kernel
 // ==========================================================================
 template<int M, int N, int K>
-__global__ void mfma_scale_kernel_fp8(
+__global__ void mxfp8_kernel(
     const opus::fp8_t* __restrict__ ptr_a,   // A[M][K] row-major
     const opus::fp8_t* __restrict__ ptr_b,   // B[K][N] row-major
     opus::fp32_t* __restrict__ ptr_c,        // C[M][N] row-major
@@ -129,10 +129,10 @@ __global__ void mfma_scale_kernel_fp8(
 }
 
 // ==========================================================================
-// FP4 * FP4 scaled MFMA kernel
+// MXFP4: FP4 * FP4 scaled MFMA kernel
 // ==========================================================================
 template<int M, int N, int K>
-__global__ void mfma_scale_kernel_fp4(
+__global__ void mxfp4_kernel(
     const unsigned char* __restrict__ ptr_a,  // A[M][K] packed fp4x2, row-major
     const unsigned char* __restrict__ ptr_b,  // B[K][N] packed fp4x2, row-major
     opus::fp32_t* __restrict__ ptr_c,         // C[M][N] row-major
@@ -224,10 +224,10 @@ __global__ void mfma_scale_kernel_fp4(
 // Host launch functions
 // ---------------------------------------------------------------------------
 
-extern "C" void run_mfma_scale_32x32x64_fp8(
+extern "C" void run_mxfp8_32x32x64(
     const void* d_a, const void* d_b, void* d_c, int scale_a, int scale_b)
 {
-    hipLaunchKernelGGL((mfma_scale_kernel_fp8<32, 32, 64>),
+    hipLaunchKernelGGL((mxfp8_kernel<32, 32, 64>),
                        dim3(1), 64, 0, 0,
                        static_cast<const opus::fp8_t*>(d_a),
                        static_cast<const opus::fp8_t*>(d_b),
@@ -237,10 +237,10 @@ extern "C" void run_mfma_scale_32x32x64_fp8(
     HIP_CALL(hipDeviceSynchronize());
 }
 
-extern "C" void run_mfma_scale_16x16x128_fp8(
+extern "C" void run_mxfp8_16x16x128(
     const void* d_a, const void* d_b, void* d_c, int scale_a, int scale_b)
 {
-    hipLaunchKernelGGL((mfma_scale_kernel_fp8<16, 16, 128>),
+    hipLaunchKernelGGL((mxfp8_kernel<16, 16, 128>),
                        dim3(1), 64, 0, 0,
                        static_cast<const opus::fp8_t*>(d_a),
                        static_cast<const opus::fp8_t*>(d_b),
@@ -250,10 +250,10 @@ extern "C" void run_mfma_scale_16x16x128_fp8(
     HIP_CALL(hipDeviceSynchronize());
 }
 
-extern "C" void run_mfma_scale_32x32x64_fp4(
+extern "C" void run_mxfp4_32x32x64(
     const void* d_a, const void* d_b, void* d_c, int scale_a, int scale_b)
 {
-    hipLaunchKernelGGL((mfma_scale_kernel_fp4<32, 32, 64>),
+    hipLaunchKernelGGL((mxfp4_kernel<32, 32, 64>),
                        dim3(1), 64, 0, 0,
                        static_cast<const unsigned char*>(d_a),
                        static_cast<const unsigned char*>(d_b),
@@ -263,10 +263,10 @@ extern "C" void run_mfma_scale_32x32x64_fp4(
     HIP_CALL(hipDeviceSynchronize());
 }
 
-extern "C" void run_mfma_scale_16x16x128_fp4(
+extern "C" void run_mxfp4_16x16x128(
     const void* d_a, const void* d_b, void* d_c, int scale_a, int scale_b)
 {
-    hipLaunchKernelGGL((mfma_scale_kernel_fp4<16, 16, 128>),
+    hipLaunchKernelGGL((mxfp4_kernel<16, 16, 128>),
                        dim3(1), 64, 0, 0,
                        static_cast<const unsigned char*>(d_a),
                        static_cast<const unsigned char*>(d_b),

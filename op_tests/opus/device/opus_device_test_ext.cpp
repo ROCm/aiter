@@ -6,10 +6,8 @@
  * @brief Single PyTorch extension binding all OPUS device-test kernels.
  *
  * Exposes:
- *   opus_device_test.run_mfma(A, B, C, variant)   -- variant: "32x32x8_f16", "32x32x8_bf16",
- *                                                   "16x16x16_f16", "16x16x16_bf16",
- *                                                   "32x32x16_fp8", "32x32x16_bf8",
- *                                                   "16x16x32_fp8", "16x16x32_bf8", ...
+ *   opus_device_test.run_mfma(A, B, C, variant)   -- variant: "32x32x8_f16", "32x32x8_bf16", ...
+ *   opus_device_test.run_mxfp(A, B, C, variant)  -- variant: "mxfp8_32x32x64", "mxfp4_16x16x128", ...
  *   opus_device_test.run_vector_add(A, B, Result)
  *   opus_device_test.run_async_load(Src, Dst)
  *   opus_device_test.run_dtype_convert(In, Out, variant)  -- variant: "fp32_bf16", "fp32_fp16",
@@ -18,7 +16,7 @@
 
 #include <torch/extension.h>
 #include "test_mfma.h"
-#include "test_mfma_scale.h"
+#include "test_mxfp.h"
 #include "test_vector_add.h"
 #include "test_async_load.h"
 #include "test_dtype_convert.h"
@@ -138,9 +136,9 @@ static void run_mfma_torch(
     }
 }
 
-// ---------- Scaled MFMA wrapper ----------
+// ---------- MXFP wrapper ----------
 
-static void run_mfma_scale_torch(
+static void run_mxfp_torch(
     torch::Tensor A,
     torch::Tensor B,
     torch::Tensor C,
@@ -158,38 +156,38 @@ static void run_mfma_scale_torch(
     int sa = static_cast<int>(scale_a);
     int sb = static_cast<int>(scale_b);
 
-    if (variant == "32x32x64_fp8") {
+    if (variant == "mxfp8_32x32x64") {
         bool dtype_ok = (A.dtype() == torch::kFloat8_e4m3fnuz || A.dtype() == torch::kFloat8_e4m3fn);
         TORCH_CHECK(dtype_ok, "A must be float8_e4m3fnuz or float8_e4m3fn for variant ", variant);
         TORCH_CHECK(B.dtype() == A.dtype(), "B must have same dtype as A");
         TORCH_CHECK((A.sizes() == torch::IntArrayRef{32, 64}), "A must be [32,64]");
         TORCH_CHECK((B.sizes() == torch::IntArrayRef{64, 32}), "B must be [64,32]");
         TORCH_CHECK((C.sizes() == torch::IntArrayRef{32, 32}), "C must be [32,32]");
-        run_mfma_scale_32x32x64_fp8(A.data_ptr(), B.data_ptr(), C.data_ptr(), sa, sb);
-    } else if (variant == "16x16x128_fp8") {
+        run_mxfp8_32x32x64(A.data_ptr(), B.data_ptr(), C.data_ptr(), sa, sb);
+    } else if (variant == "mxfp8_16x16x128") {
         bool dtype_ok = (A.dtype() == torch::kFloat8_e4m3fnuz || A.dtype() == torch::kFloat8_e4m3fn);
         TORCH_CHECK(dtype_ok, "A must be float8_e4m3fnuz or float8_e4m3fn for variant ", variant);
         TORCH_CHECK(B.dtype() == A.dtype(), "B must have same dtype as A");
         TORCH_CHECK((A.sizes() == torch::IntArrayRef{16, 128}), "A must be [16,128]");
         TORCH_CHECK((B.sizes() == torch::IntArrayRef{128, 16}), "B must be [128,16]");
         TORCH_CHECK((C.sizes() == torch::IntArrayRef{16, 16}), "C must be [16,16]");
-        run_mfma_scale_16x16x128_fp8(A.data_ptr(), B.data_ptr(), C.data_ptr(), sa, sb);
-    } else if (variant == "32x32x64_fp4") {
+        run_mxfp8_16x16x128(A.data_ptr(), B.data_ptr(), C.data_ptr(), sa, sb);
+    } else if (variant == "mxfp4_32x32x64") {
         TORCH_CHECK(A.dtype() == torch::kUInt8, "A must be uint8 (packed fp4x2) for variant ", variant);
         TORCH_CHECK(B.dtype() == torch::kUInt8, "B must be uint8 (packed fp4x2) for variant ", variant);
         TORCH_CHECK((A.sizes() == torch::IntArrayRef{32, 32}), "A must be [32,32] (packed fp4)");
         TORCH_CHECK((B.sizes() == torch::IntArrayRef{64, 16}), "B must be [64,16] (packed fp4)");
         TORCH_CHECK((C.sizes() == torch::IntArrayRef{32, 32}), "C must be [32,32]");
-        run_mfma_scale_32x32x64_fp4(A.data_ptr(), B.data_ptr(), C.data_ptr(), sa, sb);
-    } else if (variant == "16x16x128_fp4") {
+        run_mxfp4_32x32x64(A.data_ptr(), B.data_ptr(), C.data_ptr(), sa, sb);
+    } else if (variant == "mxfp4_16x16x128") {
         TORCH_CHECK(A.dtype() == torch::kUInt8, "A must be uint8 (packed fp4x2) for variant ", variant);
         TORCH_CHECK(B.dtype() == torch::kUInt8, "B must be uint8 (packed fp4x2) for variant ", variant);
         TORCH_CHECK((A.sizes() == torch::IntArrayRef{16, 64}), "A must be [16,64] (packed fp4)");
         TORCH_CHECK((B.sizes() == torch::IntArrayRef{128, 8}), "B must be [128,8] (packed fp4)");
         TORCH_CHECK((C.sizes() == torch::IntArrayRef{16, 16}), "C must be [16,16]");
-        run_mfma_scale_16x16x128_fp4(A.data_ptr(), B.data_ptr(), C.data_ptr(), sa, sb);
+        run_mxfp4_16x16x128(A.data_ptr(), B.data_ptr(), C.data_ptr(), sa, sb);
     } else {
-        TORCH_CHECK(false, "Unknown mfma_scale variant: ", variant);
+        TORCH_CHECK(false, "Unknown mxfp variant: ", variant);
     }
 }
 
@@ -280,9 +278,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("run_mfma", &run_mfma_torch,
           "OPUS MFMA (block_v2, swap_ab): C = A @ B^T. "
           "variant: '32x32x8_f16', '32x32x8_bf16', '16x16x16_f16', '16x16x16_bf16'");
-    m.def("run_mfma_scale", &run_mfma_scale_torch,
-          "OPUS scaled MFMA (gfx950 only): C = A @ B with E8M0 block scaling. "
-          "variant: '32x32x64_fp8', '16x16x128_fp8', '32x32x64_fp4', '16x16x128_fp4'",
+    m.def("run_mxfp", &run_mxfp_torch,
+          "OPUS MXFP (gfx950 only): C = A @ B with E8M0 block scaling. "
+          "variant: 'mxfp8_32x32x64', 'mxfp8_16x16x128', 'mxfp4_32x32x64', 'mxfp4_16x16x128'",
           py::arg("A"), py::arg("B"), py::arg("C"), py::arg("variant"),
           py::arg("scale_a") = 127, py::arg("scale_b") = 127);
     m.def("run_vector_add", &run_vector_add_torch,
