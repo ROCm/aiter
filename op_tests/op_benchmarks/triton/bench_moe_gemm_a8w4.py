@@ -271,7 +271,7 @@ def roofline_mlp(
 ):
     out_path = Path(f"logs/{name}/{x_dtype}x-{w_dtype}w-TP{TP}/")
     out_path.mkdir(parents=True, exist_ok=True)
-    csv_path = compute_roofline(
+    compute_roofline(
         dim1,
         dim2,
         n_expts_tot,
@@ -288,8 +288,17 @@ def roofline_mlp(
     )  # output path
 
 
-def parse_args():
+def parse_args(args: list[str] | None = None):
     parser = argparse.ArgumentParser(prog="Benchmark MoE")
+
+    parser.add_argument(
+        "--M",
+        type=int,
+        nargs="+",
+        default=None,
+        help="MoE batch sizes M (one or more integers). "
+        "If not set, a predermined list of values will be used.",
+    )
     parser.add_argument(
         "--shape",
         type=int,
@@ -323,25 +332,28 @@ def parse_args():
         help="Number of different weight initializations to run for more stable results (default: 1). "
         "Each initialization runs 100 iterations. Use higher values (e.g., 10) for more stable benchmarks.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(args=args)
     return args
 
 
-if __name__ == "__main__":
-    args = parse_args()
+def main(args: list[str] | None = None) -> None:
+    args = parse_args(args=args)
 
     dim1, dim2 = args.shape
     total_experts, active_experts = args.experts
-    batch_ranges_moe = [
-        (1, 2, 1),
-        (2, 5, 2),
-        (8, 18, 8),
-        (32, 65, 32),
-        (128, 257, 128),
-        (1024, 1200, 200),
-        (4096, 8200, 4096),
-    ]
-    batch_sizes_moe = list(chain(*[range(*r) for r in batch_ranges_moe]))
+    if args.M is None:
+        batch_ranges_moe = [
+            (1, 2, 1),
+            (2, 5, 2),
+            (8, 18, 8),
+            (32, 65, 32),
+            (128, 257, 128),
+            (1024, 1200, 200),
+            (4096, 8200, 4096),
+        ]
+        batch_sizes_moe = list(chain(*[range(*r) for r in batch_ranges_moe]))
+    else:
+        batch_sizes_moe = args.M
     quantized_dtypes = [args.act_dtype, "mx4"]
 
     roofline_mlp(
@@ -357,3 +369,7 @@ if __name__ == "__main__":
         name="gpt-oss-x2",
         num_weight_inits=args.num_weight_inits,
     )
+
+
+if __name__ == "__main__":
+    main()

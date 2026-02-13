@@ -2,6 +2,9 @@ import sys
 import torch
 import triton
 import math
+from aiter.ops.triton.gemm.batched.batched_gemm_a8w8 import (
+    batched_gemm_a8w8 as batched_gemm_a8w8,
+)
 from op_tests.triton_tests.gemm.batched.test_batched_gemm_a8w8 import (
     generate_batched_gemm_a8w8_inputs,
 )
@@ -16,9 +19,6 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     batched_model_benchmark_shapes,
     print_vgpr,
     get_caller_name_no_ext,
-)
-from aiter.ops.triton.gemm.batched.batched_gemm_a8w8 import (
-    batched_gemm_a8w8 as batched_gemm_a8w8,
 )
 
 
@@ -130,7 +130,7 @@ def run_benchmark(args, defaults):
         run_shape_benchmark(args)
 
 
-def parse_args():
+def parse_args(args: list[str] | None = None):
     parser = get_parser("Batched A8W8 GEMM")
     parser = add_argparse_ff(parser)
     parser.add_argument(
@@ -139,11 +139,11 @@ def parse_args():
         required=False,
         help="Batch size to be used when using --model flag.",
     )
-    return get_ff_args(parser)
+    return get_ff_args(parser, args=args)
 
 
-def main():
-    args, defaults = parse_args()
+def main(args: list[str] | None = None) -> None:
+    args, defaults = parse_args(args=args)
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
         fun = lambda: run_benchmark(args, defaults)  # noqa: E731
