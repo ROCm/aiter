@@ -707,6 +707,7 @@ def get_2stage_cfgs(
         kernelName1 = ""
         kernelName2 = ""
         run_1stage = False
+        """
         if (
             activation,
             q_type,
@@ -725,7 +726,7 @@ def get_2stage_cfgs(
                 run_1stage = token > 16
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
-
+        """
         block_m = (
             BLOCK_SIZE_M
             if run_1stage
