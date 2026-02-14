@@ -30,8 +30,8 @@ This PR introduces safeguards to prevent large files from being committed in the
 
 After this PR is merged, a separate history cleanup will be performed using `git-filter-repo`:
 
-- **Expected size reduction**: 547 MB → ~130 MB (76% reduction)
-- **Git history reduction**: 420 MB → ~50 MB (88% reduction)
+- **Expected size reduction**: 547 MB → ~230 MB (58% reduction)
+- **Git history reduction**: 420 MB → ~105 MB (75% reduction)
 - **Benefits**:
   - Faster clones (60% faster)
   - Reduced CI/CD checkout time
@@ -48,15 +48,15 @@ Added exclusions for:
 - Large CSV results
 - Temporary files and debug logs
 
-### 2. Pre-Commit Hook
+### 2. File Size Guidelines
 
-Located at `.githooks/pre-commit`, this hook:
-- Checks all staged files for size
-- Rejects commits with files > 5MB
-- Provides guidance on handling large files
-- Can be bypassed with `--no-verify` if absolutely necessary
+The `.gitignore` additions help prevent large files from being committed. While a pre-commit hook for size enforcement would be beneficial, it is not included in this PR to avoid conflicts with the existing formatting hook in `.githooks/pre-commit`.
 
-**To enable**: Run `git config core.hooksPath .githooks`
+**Recommendation**: Consider adding size checks to the existing pre-commit hook in a future update, or rely on GitHub's large file warnings during push.
+
+**To enable**:
+- Recommended (matches existing workflow): `bash ./.githooks/install`
+- Alternative (global config-based): `git config core.hooksPath .githooks`
 
 ### 3. Test Data Download Script
 
@@ -100,22 +100,32 @@ When ready to execute the history cleanup:
 After the cleanup is complete:
 
 ```bash
-# 1. Save your local changes
-git stash
+# 1. Save your local changes to patch files
+git diff > ~/aiter-changes.patch
+git diff --staged > ~/aiter-staged.patch
 
-# 2. Delete old repository
+# 2. Move old repository aside (don't delete yet)
 cd ..
-rm -rf aiter
+mv aiter aiter-old
 
-# 3. Re-clone
+# 3. Clone the cleaned repository
 git clone https://github.com/rocm/aiter.git
 cd aiter
 
-# 4. Restore your changes
-git stash pop
+# 4. Apply your saved changes
+if [ -s ~/aiter-changes.patch ]; then
+    git apply ~/aiter-changes.patch
+fi
+if [ -s ~/aiter-staged.patch ]; then
+    git apply ~/aiter-staged.patch
+    git add -A
+fi
 
-# 5. Enable pre-commit hook
-git config core.hooksPath .githooks
+# 5. Enable pre-commit hook (if using existing method)
+bash ./.githooks/install
+
+# 6. After verifying everything works, delete old repository
+# rm -rf ../aiter-old
 ```
 
 ## Testing
@@ -154,6 +164,6 @@ Please comment on this PR if you have:
 
 ## References
 
-- Test results: See `aiter_cleanup_results.md` (if available)
-- Files to be removed: See `paths_to_remove.txt`
+- Test results: Detailed in the "Testing" section above
+- Files to be removed: Listed in the "Problem Statement" section (*.pt files, CSV benchmarks, *.att artifacts, debug logs)
 - Tool documentation: [git-filter-repo](https://github.com/newren/git-filter-repo)

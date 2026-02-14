@@ -30,6 +30,8 @@ echo "  - Large benchmark CSV files"
 echo ""
 echo "For most development work, these files are not required."
 echo ""
+echo "No action taken - storage location needs to be configured."
+exit 1
 
 # Example download implementation (uncomment when storage is configured):
 # download_file() {
@@ -51,4 +53,5 @@ echo ""
 # download_file "test_jenga_vsa/jenga_value.pt" "$REPO_ROOT/op_tests/test_jenga_vsa/jenga_value.pt"
 # download_file "test_jenga_vsa/jenga_key.pt" "$REPO_ROOT/op_tests/test_jenga_vsa/jenga_key.pt"
 
-echo "Done!"
+# echo "Done!"
+# exit 0
