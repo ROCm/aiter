@@ -323,6 +323,15 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         std::cout << "fmha_v3_bwd: unsupported mask type for asm kernels." << std::endl;
         return -1;
     }
+    // On gfx942, a16 (atomic32=0) has no mask_type=2 (bottom-right causal) kernels,
+    // only mask_type=1 (top-left causal). When seqlen_q == seqlen_k the two masks
+    // are mathematically equivalent, so we can safely convert 2 → 1 to hit the
+    // existing a16 causal kernels.
+    // See config: hsa/gfx942/fmha_v3_bwd/fmha_bwd_dqdkdv.csv
+    if(arch_id == "gfx942" && !a.v3_atomic_fp32 && mt == 2 && a.seqlen_q == a.seqlen_k)
+    {
+        mt = 1;  // bottom-right → top-left (equivalent when sq == sk)
+    }
 
     auto [pre_kernel, dqdkdv_kernel, post_kernel] = get_heuristic_kernel(a.data_type,
                                                                          arch_id,
