@@ -965,6 +965,9 @@ for dtype in l_dtype:
         )
         df.append(ret)
     df = pd.DataFrame(df)
+    df = df.drop(
+        columns=["load_metadata", "dump_metadata", "profile_ps"], errors="ignore"
+    )
     df_md = df.to_markdown(index=False)
     aiter.logger.info("pa_ps summary (markdown):\n%s", df_md)
     df.to_csv("pa_ps.csv")
