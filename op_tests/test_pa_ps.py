@@ -16,8 +16,6 @@ from aiter.ops.enum import QuantType
 from aiter.test_common import (
     benchmark,
     checkAllclose,
-    device_memory_profiling,
-    run_iters,
     run_perftest,
 )
 
@@ -33,64 +31,6 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_e4m3": torch.uint8,
     "fp8_e5m2": torch.uint8,
 }
-
-
-def run_rocmprof_test(
-    func,
-    *args,
-    num_iters=101,
-    num_warmup=2,
-    testGraph=False,
-    num_rotate_args=0,
-    needTrace=False,
-    **kwargs,
-):
-    @rocmprof_test(
-        num_iters=num_iters,
-        num_warmup=num_warmup,
-        testGraph=testGraph,
-        num_rotate_args=num_rotate_args,
-        needTrace=needTrace,
-    )
-    def worker(*args, **kwargs):
-        return func(*args, **kwargs)
-
-    return worker(*args, **kwargs)
-
-
-def rocmprof_test(
-    num_iters=101, num_warmup=2, testGraph=False, num_rotate_args=0, needTrace=False
-):
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            num = num_rotate_args
-            if num < 1:
-                gpu_id = torch.cuda.current_device()
-                iter_used_memory, inputSize, _, _ = device_memory_profiling(
-                    func, *args, **kwargs
-                )
-
-                properties = torch.cuda.get_device_properties(gpu_id)
-                free_memory = torch.cuda.mem_get_info(gpu_id)[0]
-                cache_size = min(
-                    getattr(properties, "L2_cache_size", 4096 * 1024) * 64 * 128,
-                    (free_memory - iter_used_memory + inputSize) * 0.9,
-                )
-                cache_size = max(cache_size, 0)
-                num = int((cache_size + inputSize - 1) // inputSize)
-            num = min(num, num_iters)
-
-            run_iters(num_warmup, func, *args, **kwargs)
-            for _ in range(num_iters):
-                data = func(*args, **kwargs)
-                torch.cuda.empty_cache()
-                # torch.cuda.ipc_collect()
-            avg = float("nan")
-            return data, avg
-
-        return wrapper
-
-    return decorator
 
 
 def get_kv_cache_torch_dtype(
@@ -378,7 +318,6 @@ def test_pa_ps(
     varlen: bool = False,
     load_metadata: bool = False,
     dump_metadata: bool = False,
-    enable_rocmprof: bool = False,
     check_nops: bool = False,
     skip_reference: bool = False,
     quant_type: QuantType = QuantType.per_Token,
@@ -403,9 +342,9 @@ def test_pa_ps(
     seq_lens_qo = torch.randint(
         1, 5, (batch_size,), dtype=torch.int, device=device
     ).fill_(qlen)
-    seq_lens_kv = torch.tensor(
-        [10240] * (batch_size - 1) + [30720], dtype=torch.int, device=device
-    )
+    # seq_lens_kv = torch.tensor(
+    #     [10240] * (batch_size - 1) + [30720], dtype=torch.int, device=device
+    # )
     # print(seq_lens_qo)
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     total_qo = qo_indptr[-1].item()
@@ -579,8 +518,7 @@ def test_pa_ps(
     v_shuffled = asm_V_shuffle(v_quant_)
     output = torch.empty_like(query)
 
-    benchmark_func = run_rocmprof_test if enable_rocmprof else run_perftest
-    _, us_pa_ps = benchmark_func(
+    _, us_pa_ps = run_perftest(
         aiter.pa_persistent_fwd,
         Q=query,
         K=k_quant_,
@@ -608,7 +546,7 @@ def test_pa_ps(
     ret["us_pa_ps"] = us_pa_ps
 
     if check_nops:
-        _, us_pa_nops = benchmark_func(
+        _, us_pa_nops = run_perftest(
             aiter.pa_fwd_asm,
             query,
             k_quant_,
@@ -758,12 +696,6 @@ parser.add_argument(
     --dump_metadata # True""",
 )
 parser.add_argument(
-    "--profile",
-    action="store_true",
-    help="""Enable performance profiling. Default: False (single run).
-    --profile # Enable detailed performance stats""",
-)
-parser.add_argument(
     "--check_nops",
     action="store_true",
     help="""Check NOPs. Default: False.
@@ -823,7 +755,6 @@ for dtype in l_dtype:
             l_varlen,
             args.load_metadata,
             args.dump_metadata,
-            args.profile,
             args.check_nops,
             args.skip_reference,
             l_quant_type,
