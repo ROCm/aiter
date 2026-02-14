@@ -1,3 +1,2 @@
 tile_m,tile_n,knl_name,co_name
-32,128,_ZN5aiter49fmoe_stage1_bf16_pertokenInt8_g1u1_32x128_3tg_pf3E,fmoe_stage1_bf16_pertokenInt8_g1u1_32x128_3tg_pf3.co
 80,128,stage1_moe_kernel_func,stage1_moe.co

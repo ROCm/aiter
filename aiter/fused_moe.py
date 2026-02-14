@@ -212,8 +212,9 @@ def fused_moe_(
     """user API"""
     M, topk = topk_ids.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    if quant_type == QuantType.per_Token:  # feifei: use lqq enum
-        inter_dim = inter_dim // 2
+    # if quant_type == QuantType.per_Token:  # feifei: use lqq enum
+    #    inter_dim = inter_dim // 2
+    # print("[debug] inter_dim:", inter_dim)
 
     assert w1.shape[1] in [
         inter_dim,
@@ -618,7 +619,7 @@ def get_2stage_cfgs(
             quant_type=q_type,
         ),
         functools.partial(
-            aiter.ck_moe_stage2_fwd,
+            asm_stage2,
             activation=activation,
             quant_type=q_type,
         ),
@@ -941,8 +942,8 @@ def fused_moe_2stages(
     token_num_quant_moe_sort_switch = 1024
     token_num, _ = hidden_states.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    if quant_type == QuantType.per_Token:  # feifei: use lqq enum
-        inter_dim = inter_dim // 2
+    # if quant_type == QuantType.per_Token:  # feifei: use lqq enum
+    #    inter_dim = inter_dim // 2
     dtype = moe_out.dtype
     device = hidden_states.device
     metadata = get_2stage_cfgs(
@@ -1145,7 +1146,7 @@ def fused_moe_2stages(
         )
         a2 = a2.view(token_num, topk, inter_dim)
 
-    return a2  # feifei test a2_qt
+    # return a2  # feifei test a2_qt
     metadata.stage2(
         a2,
         w1,
@@ -1159,7 +1160,8 @@ def fused_moe_2stages(
             w2_scale.view(dtypes.fp8_e8m0) if w2.dtype == dtypes.fp4x2 else w2_scale
         ),
         a2_scale=a2_scale,
-        block_m=block_size_M,
+        # block_m=block_size_M,
+        block_m=32,  # WORKAROUND feifei test only !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
         sorted_weights=sorted_weights if not doweight_stage1 else None,
         **extra_stage2_args,
     )
@@ -1201,8 +1203,8 @@ def asm_stage1(
     device = out.device
     token_num, _, _ = out.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    if quant_type == QuantType.per_Token:  # feifei: use lqq enum
-        inter_dim = inter_dim // 2
+    # if quant_type == QuantType.per_Token:  # feifei: use lqq enum
+    #    inter_dim = inter_dim // 2
 
     if quant_type == QuantType.per_Tensor:
         a1_scale = a1_scale.view(1, 1).repeat(token_num, 1)
@@ -1243,6 +1245,46 @@ def asm_stage1(
         else:
             aiter.gelu_and_mul(out, tmp_out.view(dtypes.fp32))
     return out
+
+
+def asm_stage2(
+    inter_states,
+    w1,
+    w2,
+    sorted_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    w2_scale,
+    a2_scale,
+    block_m: int,
+    kernelName: str = "",
+    sorted_weights=None,
+    quant_type=QuantType.No,
+    activation=ActivationType.Silu,
+    splitk=0,
+):
+    print("[debug] w2:", w2.shape, w2.dtype)
+    print("[debug] w2:", w2.stride())
+    return aiter.moe_stage2_g1u1(
+        inter_states,
+        w1,
+        w2,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        out,
+        topk,
+        kernelName,
+        block_m,
+        w2_scale,
+        a2_scale,
+        sorted_weights,
+        quant_type,
+        activation,
+        splitk,
+    )
 
 
 def torch_moe(

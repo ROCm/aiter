@@ -130,6 +130,27 @@ struct __attribute__((packed)) Kernel2Args
     p3 _p18;
     void* ptr_SWBuffer;
     p2 _p19;
+    void* ptr_DScaleBuffer;
+    p2 _p20;
+    void* ptr_DZeroBuffer;
+    p2 _p21;
+    unsigned int stride_expert_dequant_D;
+    p3 _p22;
+    void log()
+    {
+        printf("[KARG] dim = %d\n", dim);
+        printf("[KARG] hidden_dim = %d\n", hidden_dim);
+        printf("[KARG] token_cnt = %d\n", token_cnt);
+        printf("[KARG] eprt_cnt = %d\n", eprt_cnt);
+        printf("[KARG] stride_X = %d\n", stride_X);
+        printf("[KARG] stride_D = %d\n", stride_D);
+        printf("[KARG] stride_O = %d\n", stride_O);
+        printf("[KARG] stride_expert_D = %d\n", stride_expert_D);
+        printf("[KARG] stride_expert_scale_D = %d\n", stride_expert_scale_D);
+        printf("[KARG] topk = %d\n", topk);
+        printf("[KARG] splitk = %d\n", splitk);
+        printf("[KARG] stride_expert_dequant_D = %d\n", stride_expert_dequant_D);
+    }
 };
 
 static CFG* get_cfg(torch::Tensor& inp,
@@ -675,6 +696,9 @@ void moe_stage2_g1u1(
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
 
+        printf("[KERNEL] name = %s\n", name);
+        printf("[KERNEL] co_name = %s\n", co_name);
+
         auto result = impl_ptr_map.emplace(name, nullptr);
         if(result.second)
         {
@@ -774,7 +798,21 @@ void moe_stage2_g1u1(
     // printf("gdx = %d\n", gdx);
     // printf("gdy = %d\n", gdy);
     // printf("gdz = %d\n", gdz);
+    args.log();
+    //printf("[DEV_BUF] ptr_OBuffer: out = %lu bytes\n", out.numel() * out.element_size());
+    //printf("[DEV_BUF] ptr_XBuffer: inter_states = %lu bytes\n", inter_states.numel() * inter_states.element_size());
+    //printf("[DEV_BUF] ptr_DBuffer: w2 = %lu bytes\n", w2.numel() * w2.element_size());
+    //printf("[DEV_BUF] ptr_XCBuffer: num_valid_ids = %lu bytes\n", num_valid_ids.numel() * num_valid_ids.element_size());
+    //printf("[DEV_BUF] ptr_ScaleXBuffer: a2_scale = %lu bytes\n", a2_scale.has_value() ? a2_scale.value().numel() * a1_scale.value().element_size() : 0);
+    //printf("[DEV_BUF] ptr_ScaleDBuffer: w2_scale = %lu bytes\n", w2_scale.has_value() ? w2_scale.value().numel() * w1_scale.value().element_size() : 0);
+    //printf("[DEV_BUF] ptr_STPBuffer: sorted_token_ids = %lu bytes\n", sorted_token_ids.has_value() ? sorted_token_ids.value().numel() * sorted_token_ids.value().element_size() : 0);
+    //printf("[DEV_BUF] ptr_SEPBuffer: sorted_expert_ids = %lu bytes\n", sorted_expert_ids.numel() * sorted_expert_ids.element_size());
+    //printf("[DEV_BUF] dev_Qscl: w1_lqq_scale = %lu bytes\n", w1_lqq_scale.has_value() ? w1_lqq_scale.value().numel() * w1_lqq_scale.value().element_size() : 0);
+    //printf("[DEV_BUF] dev_Qzero: w1_lqq_zero = %lu bytes\n", w1_lqq_zero.has_value() ? w1_lqq_zero.value().numel() * w1_lqq_zero.value().element_size() : 0);
+    printf("argsize: %zu\n", arg_size);
+    printf("gdx:%d, gdy:%d, gdz:%d, bdx:%d\n", gdx, gdy, gdz, bdx);
 
+    return;
     impl_ptr->launch_kernel({&args,
                              &arg_size,
                              gdx, // gdx

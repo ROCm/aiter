@@ -626,6 +626,46 @@ def moe_lqq_dequant(
     return out.to(device)
 
 
+def moe_lqq_dequant_xor(
+    in_buffer: torch.Tensor,
+    qscale_buf: torch.Tensor,
+    qzero_buf: torch.Tensor,
+    group_in_k_lqq: int = 64,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> torch.Tensor:
+    eprt, M, N = in_buffer.shape
+    numGroups = N // group_in_k_lqq
+
+    if in_buffer is None or qscale_buf is None or qzero_buf is None:
+        print("Neglect moe_init_uint4 for NULL input")
+        return None
+
+    if N % group_in_k_lqq != 0:
+        print("N should be divisible by group_in_k_lqq")
+
+    numGroups = N // group_in_k_lqq
+
+    in_buffer_reshaped = in_buffer.view(eprt, M, numGroups, group_in_k_lqq)
+
+    qscale_expanded = qscale_buf.view(eprt, M, numGroups, 1)
+    qzero_expanded = qzero_buf.view(eprt, M, numGroups, 1)
+
+    qzero_int = qzero_expanded.to(torch.int32)
+
+    in_int32 = in_buffer_reshaped.to(torch.int32)
+    qscale_int32 = qscale_expanded.to(torch.int32)
+
+    result_int32 = in_int32 * qscale_int32 + qzero_int
+
+    result_int32 = torch.bitwise_xor(
+        result_int32, torch.tensor(0x80, dtype=torch.int32)
+    )
+
+    result_int8 = result_int32.to(torch.int8)
+
+    return result_int8.view(eprt, M, N)
+
+
 def moe_shuffle_inter(
     buffer: torch.Tensor,
     eprt: int,
@@ -949,7 +989,6 @@ def test_fmoe_lqq(
         return
 
     AQDType = dtypes.i8
-    W1QDType = dtypes.i4x2
     W2QDType = dtypes.i8
     quantstr = quant_algo[quantAlgoId]
     use_smooth = "smooth" in quantstr
@@ -1069,7 +1108,7 @@ def test_fmoe_lqq(
     w1_lqq_pack = moe_pack_int4(
         w1_lqq_uint4_shf2, eprt, sz_GU // model_dim // eprt, model_dim
     )
-    w1_lqq = w1_lqq_pack.view(W1QDType)
+    w1_lqq = w1_lqq_pack.view(dtypes.i4x2)
     # save_buffer_to_file(w1_lqq_pack, "./feifei/w1_lqq_pack", format="binary")
     w1_lqq_scale_shf = moe_shuffle_4_16(w1_lqq_scale, (4, 16), use_int4=False)
     # save_buffer_to_file(w1_lqq_scale_shf, "./feifei/w1_lqq_scale_shf", format="binary")
@@ -1085,15 +1124,67 @@ def test_fmoe_lqq(
     w1_scale = moe_init_float(eprt, GU_dqn_size // eprt // GU_dqn_k, GU_dqn_k, 1)
     # save_buffer_to_file(w1_scale, "./feifei/w1_scale", format="text")
 
-    w2 = (
-        torch.randn(
-            (local_E + shared_E, model_dim, inter_dim),
-            dtype=dtype,
-            device="cuda",
-        )
-        / 10
+    ######################################################################################
+    # w2 = (
+    #     torch.randn(
+    #         (local_E + shared_E, model_dim, inter_dim),
+    #         dtype=dtype,
+    #         device="cuda",
+    #     )
+    #     / 10
+    # )
+    # w2_qt, w2_scale = aiter.pertoken_quant(w2, quant_dtype=dtypes.i8, dtypeMax=7)
+    #######################################################################################
+    D_dqn_n_lqq = model_dim
+    D_dqn_k_lqq = inter_dim // group_in_k_lqq
+
+    # lqq init for kernel
+    w2_lqq_scale, w2_lqq_zero = moe_init_lqq(
+        eprt, D_dqn_n_lqq, D_dqn_k_lqq, 1, -100, 100
     )
-    w2_qt, w2_scale = aiter.pertoken_quant(w2, quant_dtype=W2QDType, dtypeMax=7)
+
+    # save_buffer_to_file(w2_lqq_scale, "./feifei/w2_lqq_scale", format="binary")
+    # save_buffer_to_file(w2_lqq_zero, "./feifei/w2_lqq_zero", format="binary")
+    w2_lqq_zero_uint8 = (w2_lqq_zero.to(torch.int16) + 128).to(torch.uint8)
+    # save_buffer_to_file(
+    #    w2_lqq_zero_uint8, "./feifei/w2_lqq_zero_uint8", format="binary"
+    # )
+    w2_lqq_uint4 = moe_init_uint4(eprt, model_dim, inter_dim, 1)
+    # save_buffer_to_file(w2_lqq_uint4, "./feifei/w2_lqq_uint4", format="binary")
+
+    # shuffle w2 for kernel
+    w2_lqq_uint4_shf_inter = moe_shuffle_inter(
+        w2_lqq_uint4, eprt, model_dim, inter_dim, 6
+    )
+    # save_buffer_to_file(
+    #    w2_lqq_uint4_shf_inter, "./feifei/w2_lqq_uint4_shf_inter", format="binary"
+    # )
+    # save_int8_to_file(
+    #    w2_lqq_uint4_shf_inter, "./feifei/w2_lqq_uint4_shf21", format="text"
+    # )
+    w2_lqq_uint4_shf2 = moe_shuffle_32_16(
+        w2_lqq_uint4_shf_inter, eprt, model_dim, inter_dim
+    )
+    # save_int8_to_file(w2_lqq_uint4_shf2, "./feifei/w2_lqq_uint4_shf22", format="text")
+    # save_buffer_to_file(
+    #    w2_lqq_uint4_shf2, "./feifei/w2_lqq_uint4_shf2", format="binary"
+    # )
+    w2_lqq_pack = moe_pack_int4(w2_lqq_uint4_shf2, eprt, model_dim, inter_dim)
+    w2_lqq = w2_lqq_pack.view(dtypes.i4x2)
+    # save_buffer_to_file(w2_lqq_pack, "./feifei/w2_lqq_pack", format="binary")
+    w2_lqq_scale_shf = moe_shuffle_4_16(w2_lqq_scale, (4, 16), use_int4=False)
+    # save_buffer_to_file(w2_lqq_scale_shf, "./feifei/w2_lqq_scale_shf", format="binary")
+    w2_lqq_zero_uint8_shf = moe_shuffle_4_16(w2_lqq_zero_uint8, (4, 16), use_int4=False)
+    # save_buffer_to_file(
+    #    w2_lqq_zero_uint8_shf, "./feifei/w2_lqq_zero_uint8_shf", format="binary"
+    # )
+
+    # gu quant for cpu ref
+    w2_qt = moe_lqq_dequant_xor(w2_lqq_uint4, w2_lqq_scale, w2_lqq_zero_uint8)
+    # save_int8_to_file(w2_qt, "./feifei/w2_qt", format="text")
+    # gu quant scale for cpu ref and kernel
+    w2_scale = moe_init_float(eprt, inter_dim, 1, 1)
+    # save_buffer_to_file(w2_scale, "./feifei/w2_scale", format="text")
 
     print("==========================================")
     print("[test] a1_qt   : ", a1_qt.shape, a1_qt.dtype)
@@ -1102,6 +1193,7 @@ def test_fmoe_lqq(
     print("[test] a1_scale: ", a1_scale.shape, a1_scale.dtype)
     print("[test] w1_scale: ", w1_scale.shape, w1_scale.dtype)
     print("[test] w2_scale: ", w2_scale.shape, w2_scale.dtype)
+
     out1_ref = torch_moe_stage1(
         a1_qt,
         w1_qt,
@@ -1116,27 +1208,28 @@ def test_fmoe_lqq(
         doweight=False,
     )
     print("[test] out1_ref: ", out1_ref.shape, out1_ref.dtype)
+
     print("------------------------------------------")
     a2_qt, a2_scale = aiter.pertoken_quant(out1_ref, quant_dtype=dtypes.i8, dtypeMax=7)
     a2_qt = a2_qt.view(token, topk, -1)
     print("[test] a2_qt   : ", a2_qt.shape, a2_qt.dtype)
     print("[test] a2_scale: ", a2_scale.shape, a2_scale.dtype)
-    out2_ref = torch_moe_stage2(
-        a2_qt,
-        w1_qt,
-        w2_qt,
-        topk_weights,
-        topk_ids,
-        dtype=dtype,
-        quant_type=aiter.QuantType.per_Token,
-        a2_scale=a2_scale,
-        w2_scale=w2_scale,
-        doweight=False,
-    )
-    print("[test] out2_ref: ", out2_ref.shape, out2_ref.dtype)
-    save_buffer_to_file(out1_ref, "./feifei/out1_ref", format="text")
-    save_int8_to_file(a2_qt, "./feifei/a2_qt", format="text")
-    save_buffer_to_file(a2_scale, "./feifei/a2_scale", format="text")
+    # out2_ref = torch_moe_stage2(
+    #    a2_qt,
+    #    w1_qt,
+    #    w2_qt,
+    #    topk_weights,
+    #    topk_ids,
+    #    dtype=dtype,
+    #    quant_type=aiter.QuantType.per_Token,
+    #    a2_scale=a2_scale,
+    #    w2_scale=w2_scale,
+    #    doweight=False,
+    # )
+    # print("[test] out2_ref: ", out2_ref.shape, out2_ref.dtype)
+    # save_buffer_to_file(out1_ref, "./feifei/out1_ref", format="text")
+    # save_int8_to_file(a2_qt, "./feifei/a2_qt", format="text")
+    # save_buffer_to_file(a2_scale, "./feifei/a2_scale", format="text")
 
     print("==========================================")
     print("[test] a1_qt       : ", a1_qt.shape, a1_qt.dtype)
@@ -1150,7 +1243,7 @@ def test_fmoe_lqq(
     out1_asm = fused_moe(
         a1_qt,
         w1_lqq,
-        w2_qt,
+        w2_lqq,
         topk_weights,
         topk_ids,
         w1_scale=w1_scale,
@@ -1166,10 +1259,11 @@ def test_fmoe_lqq(
     )
     print("[test] out1_asm    : ", out1_asm.shape, out1_asm.dtype)
     print("------------------------------------------")
-    save_buffer_to_file(out1_asm, "./feifei/out1_asm_fp32", format="text")
-    save_int8_to_file(out1_asm, "./feifei/out1_asm_int8", format="text")
+    # save_buffer_to_file(out1_asm, "./feifei/out1_asm_fp32", format="text")
+    # save_int8_to_file(out1_asm, "./feifei/out1_asm_int8", format="text")
 
     err = checkAllclose(out1_ref, out1_asm)
+    print(err)
 
     """
     out1_asm, us1 = run_perftest(
