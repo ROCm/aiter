@@ -224,6 +224,11 @@ static CFG* get_cfg_stage2(torch::Tensor& inter_states,
     {
         return &cfg_fmoe_stage2_bf16_pertokenInt8_g1u1;
     }
+    else if(inter_states.scalar_type() == at::ScalarType::Char && w2.scalar_type() == at::ScalarType::Int4 &&
+            (out.scalar_type() == at::ScalarType::BFloat16) && quant_type == QuantType::per_Token) // feifei : use lqq enum
+    {
+        return &cfg_fmoe_stage2_bf16_pertokenInt8_g1u1;
+    }
     else
     {
         TORCH_CHECK(false,
