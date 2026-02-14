@@ -2,21 +2,24 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
-import copy
 import itertools
 import numpy as np
 import random
-import time
 import torch
 import pandas as pd
 
-from torch.utils.benchmark import Timer
 from typing import List, Optional, Tuple, Union
 
 import aiter
 from aiter import dtypes, pertoken_quant
 from aiter.ops.enum import QuantType
-from aiter.test_common import benchmark, checkAllclose, perftest, device_memory_profiling, run_iters, run_perftest
+from aiter.test_common import (
+    benchmark,
+    checkAllclose,
+    device_memory_profiling,
+    run_iters,
+    run_perftest,
+)
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -77,15 +80,12 @@ def rocmprof_test(
                 num = int((cache_size + inputSize - 1) // inputSize)
             num = min(num, num_iters)
 
-            rotate_args = [
-                (copy.deepcopy(args), copy.deepcopy(kwargs)) for _ in range(num - 1)
-            ] + [(args, kwargs)]
             run_iters(num_warmup, func, *args, **kwargs)
             for _ in range(num_iters):
                 data = func(*args, **kwargs)
                 torch.cuda.empty_cache()
                 # torch.cuda.ipc_collect()
-            avg = float('nan')
+            avg = float("nan")
             return data, avg
 
         return wrapper
@@ -403,7 +403,9 @@ def test_pa_ps(
     seq_lens_qo = torch.randint(
         1, 5, (batch_size,), dtype=torch.int, device=device
     ).fill_(qlen)
-    seq_lens_kv = torch.tensor([10240] * (batch_size - 1) + [30720], dtype=torch.int, device=device)
+    seq_lens_kv = torch.tensor(
+        [10240] * (batch_size - 1) + [30720], dtype=torch.int, device=device
+    )
     # print(seq_lens_qo)
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     total_qo = qo_indptr[-1].item()
@@ -464,9 +466,14 @@ def test_pa_ps(
         k_scale_ = k_scale_asm
         v_scale_ = v_scale_asm
     else:
-        k_quant_, k_scale_, v_quant_, v_scale_, k_scale_asm, v_scale_asm = (
-            pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
-        )
+        (
+            k_quant_,
+            k_scale_,
+            v_quant_,
+            v_scale_,
+            k_scale_asm,
+            v_scale_asm,
+        ) = pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
 
     (
         (work_meta_data_size, work_meta_data_type),
@@ -504,7 +511,10 @@ def test_pa_ps(
             array = np.fromfile(file_name, dtype=np.uint32)
             meta = torch.from_numpy(array).reshape(shape)
             torch.set_printoptions(threshold=999999, linewidth=120)
-            print(f"==>load {name} shape {meta.shape} from {file_name}:\n{meta}", flush=True)
+            print(
+                f"==>load {name} shape {meta.shape} from {file_name}:\n{meta}",
+                flush=True,
+            )
     else:
         # warmup for get_pa_metadata_v1
         aiter.get_pa_metadata_v1(
@@ -560,7 +570,9 @@ def test_pa_ps(
         for name, meta in metadata_map.items():
             file_name = f"{name}.bin"
             torch.set_printoptions(threshold=999999, linewidth=120)
-            print(f"==>dump {name} shape {meta.shape} to {file_name}:\n{meta}", flush=True)
+            print(
+                f"==>dump {name} shape {meta.shape} to {file_name}:\n{meta}", flush=True
+            )
             meta.cpu().numpy().astype(np.uint32).tofile(file_name)
 
     # Benchmark PA Persistent Scheduling
