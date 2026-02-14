@@ -19,7 +19,11 @@ setup(
             name="opus_device_test",
             sources=[
                 os.path.join(_THIS_DIR, "test_mfma.cu"),
+                os.path.join(_THIS_DIR, "test_mxfp.cu"),
+                os.path.join(_THIS_DIR, "test_load_store_if.cu"),
                 os.path.join(_THIS_DIR, "test_vector_add.cu"),
+                os.path.join(_THIS_DIR, "test_async_load.cu"),
+                os.path.join(_THIS_DIR, "test_dtype_convert.cu"),
                 os.path.join(_THIS_DIR, "opus_device_test_ext.cpp"),
             ],
             include_dirs=[_REPO_CSRC, _THIS_DIR],
