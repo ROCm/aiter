@@ -212,6 +212,7 @@ def torch_mha_extend(
     o = torch.concat(os)
     return o
 
+
 def perblock_quant_kvcache_symm(
     # [num_blocks, num_heads, head_size // x, block_size, x]
     k_cache: torch.Tensor,
@@ -251,7 +252,6 @@ def perblock_quant_kvcache_symm(
     v_scale_asm = v_scale_flat.view(num_blocks, num_heads).to(scale_dtype)
 
     return k_quant, k_scale_asm, v_quant, v_scale_asm
-
 
 
 def pertoken_quant_kvcache_symm(
@@ -331,7 +331,7 @@ def run_aiter_asm_ps(
     reduce_partial_map,
     softmax_scale,
     mask,
-    quant_type=QuantType.per_Token
+    quant_type=QuantType.per_Token,
 ):
     return aiter.pa_persistent_fwd(
         Q=Q,
@@ -352,7 +352,7 @@ def run_aiter_asm_ps(
         reduce_partial_map=reduce_partial_map,
         softmax_scale=softmax_scale,
         mask=mask,
-        quant_type=quant_type
+        quant_type=quant_type,
     )
 
 
@@ -552,7 +552,7 @@ def test_pa_ps(
     else:
         k_quant_, k_scale_, v_quant_, v_scale_, k_scale_asm, v_scale_asm = (
             pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
-    )
+        )
 
     # Test case: explicitly NaN-pad unused KV cache regions to ensure kernels ignore them.
     # fill all unused kv cache with nan based on actual_blocks for seq_lens_kv and block_tables
@@ -714,7 +714,7 @@ def test_pa_ps(
         reduce_partial_map=reduce_partial_map,
         softmax_scale=scale,
         mask=1,
-        quant_type=quant_type
+        quant_type=quant_type,
     )
 
     err = checkAllclose(
