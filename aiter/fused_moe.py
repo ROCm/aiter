@@ -611,6 +611,21 @@ def get_2stage_cfgs(
     hidden_pad,
     intermediate_pad,
 ):
+    return MOEMetadata(
+        functools.partial(
+            asm_stage1,
+            activation=activation,
+            quant_type=q_type,
+        ),
+        functools.partial(
+            aiter.ck_moe_stage2_fwd,
+            activation=activation,
+            quant_type=q_type,
+        ),
+        block_m=0,
+        ksplit=0,
+    )
+
     def get_cfg_2stages(tune_file):
         import pandas as pd
 
@@ -709,7 +724,7 @@ def get_2stage_cfgs(
         kernelName1 = ""
         kernelName2 = ""
         run_1stage = False
-        """
+
         if (
             activation,
             q_type,
@@ -728,7 +743,7 @@ def get_2stage_cfgs(
                 run_1stage = token > 16
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
-        """
+
         block_m = (
             BLOCK_SIZE_M
             if run_1stage
@@ -1059,7 +1074,8 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if doweight_stage1 else None,
         **extra_stage1_args,
     )
-    return a2  # feifei test
+    return a2  # feifei test stage1
+
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
@@ -1129,7 +1145,7 @@ def fused_moe_2stages(
         )
         a2 = a2.view(token_num, topk, inter_dim)
 
-    return a2  # feifei test
+    return a2  # feifei test a2_qt
     metadata.stage2(
         a2,
         w1,
