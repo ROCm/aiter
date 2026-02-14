@@ -1116,6 +1116,9 @@ def fused_moe_2stages(
             .view(token_num, -1)
         )
         a2 = a2_v
+    elif q_dtype_a == torch.int4:
+        a2_qt, a2_scale = aiter.pertoken_quant(a2, quant_dtype=dtypes.i8, dtypeMax=7)
+        a2 = a2_qt.view(token_num, topk, -1)
     else:
         a2, a2_scale = quant_func(
             a2,
@@ -1126,6 +1129,7 @@ def fused_moe_2stages(
         )
         a2 = a2.view(token_num, topk, inter_dim)
 
+    return a2  # feifei test
     metadata.stage2(
         a2,
         w1,

@@ -1102,7 +1102,6 @@ def test_fmoe_lqq(
     print("[test] a1_scale: ", a1_scale.shape, a1_scale.dtype)
     print("[test] w1_scale: ", w1_scale.shape, w1_scale.dtype)
     print("[test] w2_scale: ", w2_scale.shape, w2_scale.dtype)
-    print("------------------------------------------")
     out1_ref = torch_moe_stage1(
         a1_qt,
         w1_qt,
@@ -1116,6 +1115,28 @@ def test_fmoe_lqq(
         w1_scale=w1_scale,
         doweight=False,
     )
+    print("[test] out1_ref: ", out1_ref.shape, out1_ref.dtype)
+    print("------------------------------------------")
+    a2_qt, a2_scale = aiter.pertoken_quant(out1_ref, quant_dtype=dtypes.i8, dtypeMax=7)
+    a2_qt = a2_qt.view(token, topk, -1)
+    print("[test] a2_qt   : ", a2_qt.shape, a2_qt.dtype)
+    print("[test] a2_scale: ", a2_scale.shape, a2_scale.dtype)
+    out2_ref = torch_moe_stage2(
+        a2_qt,
+        w1_qt,
+        w2_qt,
+        topk_weights,
+        topk_ids,
+        dtype=dtype,
+        quant_type=aiter.QuantType.per_Token,
+        a2_scale=a2_scale,
+        w2_scale=w2_scale,
+        doweight=False,
+    )
+    print("[test] out2_ref: ", out2_ref.shape, out2_ref.dtype)
+    save_buffer_to_file(out1_ref, "./feifei/out1_ref", format="text")
+    save_int8_to_file(a2_qt, "./feifei/a2_qt", format="text")
+    save_buffer_to_file(a2_scale, "./feifei/a2_scale", format="text")
 
     print("==========================================")
     print("[test] a1_qt       : ", a1_qt.shape, a1_qt.dtype)
@@ -1126,7 +1147,6 @@ def test_fmoe_lqq(
     print("[test] w1_lqq_zero : ", w1_lqq_zero.shape, w1_lqq_zero.dtype)
     print("[test] w2_qt       : ", w2_qt.shape, w2_qt.dtype)
     print("[test] w2_scale    : ", w2_scale.shape, w2_scale.dtype)
-    print("------------------------------------------")
     out1_asm = fused_moe(
         a1_qt,
         w1_lqq,
@@ -1144,8 +1164,11 @@ def test_fmoe_lqq(
         dtype=dtype,
         block_size_M=80,
     )
-    # save_buffer_to_file(out1_ref, "./feifei/out1_ref", format="text")
-    # save_buffer_to_file(out1_asm, "./feifei/out1_asm", format="text")
+    print("[test] out1_asm    : ", out1_asm.shape, out1_asm.dtype)
+    print("------------------------------------------")
+    save_buffer_to_file(out1_asm, "./feifei/out1_asm_fp32", format="text")
+    save_int8_to_file(out1_asm, "./feifei/out1_asm_int8", format="text")
+
     err = checkAllclose(out1_ref, out1_asm)
 
     """
@@ -1233,6 +1256,15 @@ parser.add_argument(
     default=None,
     help="""Hidden states dim.
     e.g.: -hd 4096""",
+)
+parser.add_argument(
+    "-md",
+    "--model_dim",
+    type=int,
+    nargs="*",
+    default=None,
+    help="""Model dim.
+    e.g.: -md 4096""",
 )
 parser.add_argument(
     "-id",
@@ -1477,7 +1509,7 @@ for test in l_test:
             [dtypes.bf16] if args.dtype is None else [dtypes.d_dtypes[args.dtype]]
         ):
             for m in [128] if args.token is None else args.token:
-                for hdim in [4096] if args.hidden_dim is None else args.hidden_dim:
+                for mdim in [4096] if args.model_dim is None else args.model_dim:
                     for idim in [1280] if args.inter_dim is None else args.inter_dim:
                         expert = 128 if args.expert is None else args.expert
                         topk = 6 if args.topk is None else args.topk
@@ -1489,7 +1521,7 @@ for test in l_test:
                             test_fmoe_lqq(
                                 dtype,
                                 m,
-                                hdim,
+                                mdim,
                                 idim,
                                 expert,
                                 topk,
