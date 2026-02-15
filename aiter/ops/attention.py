@@ -745,7 +745,6 @@ def get_ps_metadata_info_v1(
     )
 
 
-@compile_ops("module_ps_metadata")
 def get_ps_metadata_v1(
     seqlens_qo_indptr: torch.Tensor,
     pages_kv_indptr: torch.Tensor,
@@ -763,7 +762,31 @@ def get_ps_metadata_v1(
     kvlen_granularity: int = 16,
     block_size: int = 16,
     is_causal: bool = True,
-) -> None: ...
+) -> None:
+    """
+    Generate metadata for parallel-split attention.
+    
+    Triton GPU implementation (no CPU transfer needed).
+    """
+    from aiter.ops.triton.ps_metadata_v1 import get_ps_metadata_v1_triton
+    return get_ps_metadata_v1_triton(
+        seqlens_qo_indptr,
+        pages_kv_indptr,
+        context_lens,
+        gqa_ratio,
+        num_heads_k,
+        work_metadata_ptrs,
+        work_indptr,
+        work_info,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        qhead_granularity,
+        qlen_granularity,
+        kvlen_granularity,
+        block_size,
+        is_causal,
+    )
 
 
 @compile_ops(MD_NAME)
