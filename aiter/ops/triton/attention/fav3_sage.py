@@ -13,87 +13,83 @@ from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 
-def block_attn_mask_to_lut(
-    block_attn_mask: torch.Tensor,
-) -> Tuple[torch.Tensor, int]:
-    """
-    Convert a dense block attention mask to a look-up table of KV block indices
-    per (batch, q_block). Used for block-sparse attention with only no_mask path.
-
-    block_attn_mask: (batch, num_q_blocks, num_kv_blocks) boolean.
-        True = may attend, False = must not attend.
-    Returns:
-        block_lut: (batch, num_q_blocks, max_lut_len) int32 on same device.
-                   Each row lists the KV block indices to attend to; unused slots are -1.
-        max_lut_len: int, number of LUT slots per (batch, q_block).
-    """
-    batch, num_q_blocks, _ = block_attn_mask.shape
-    device = block_attn_mask.device
-    mask_cpu = block_attn_mask.cpu()
-    all_indices = []
-    for b in range(batch):
-        for qb in range(num_q_blocks):
-            row = mask_cpu[b, qb, :]
-            indices = torch.nonzero(row, as_tuple=False).squeeze(-1)
-            if indices.dim() == 0:
-                indices = indices.unsqueeze(0)
-            all_indices.append(indices)
-    max_lut_len = max(ind.size(0) for ind in all_indices) if all_indices else 0
-    if max_lut_len == 0:
-        out = torch.full(
-            (batch, num_q_blocks, 1), -1, dtype=torch.int32, device=device
-        )
-        return out, 1
-    out = torch.full(
-        (batch, num_q_blocks, max_lut_len), -1, dtype=torch.int32, device=device
-    )
-    for idx, ind in enumerate(all_indices):
-        b = idx // num_q_blocks
-        qb = idx % num_q_blocks
-        n = ind.size(0)
-        out[b, qb, :n] = ind.to(device)
-    return out, max_lut_len
-
 
 def block_attn_mask_to_ragged_lut(
     block_attn_mask: torch.Tensor,
+    num_heads: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Convert a dense block attention mask to a ragged look-up table of KV block
-    indices per (batch, q_block). Used for block-sparse attention with no
+    indices per (batch, head, q_block). Used for block-sparse attention with no
     per-iteration branching in the kernel.
 
-    block_attn_mask: (batch, num_q_blocks, num_kv_blocks) boolean.
-        True = may attend, False = must not attend.
+    block_attn_mask: Either (batch, num_q_blocks, num_kv_blocks) boolean for
+        same mask for all heads, or (batch, num_heads, num_q_blocks, num_kv_blocks)
+        for per-head masks. True = may attend, False = must not attend.
+    num_heads: Required when block_attn_mask is 3D (number of Q heads). Ignored when 4D.
     Returns:
-        kv_block_indices: 1D int32, concatenation of all KV block index lists
-            (no -1 sentinels). Length = total number of (Q block, KV block) pairs.
-        lut_start: 1D int32, length batch * num_q_blocks. For index
-            idx = batch_idx * num_q_blocks + q_block_idx, lut_start[idx] is the
-            index in kv_block_indices where this Q block's KV list begins.
-        lut_count: 1D int32, same length as lut_start. lut_count[idx] is the
-            number of KV blocks for that (batch, q_block).
+        kv_block_indices: 1D int32, concatenation of all KV block index lists.
+        lut_start: 1D int32, length batch * num_heads * num_q_blocks. Index
+            idx = batch_idx * (num_heads * num_q_blocks) + head_idx * num_q_blocks + q_block_idx.
+        lut_count: 1D int32, same length as lut_start.
     """
-    batch, num_q_blocks, num_kv_blocks = block_attn_mask.shape
     device = block_attn_mask.device
     mask_cpu = block_attn_mask.cpu()
 
+    if block_attn_mask.dim() == 3:
+        if num_heads is None:
+            raise ValueError("num_heads must be provided when block_attn_mask is 3D")
+        batch, num_q_blocks, _ = block_attn_mask.shape
+        flat_indices = []
+        lut_start_0 = []
+        lut_count_0 = []
+        for b in range(batch):
+            for qb in range(num_q_blocks):
+                start = len(flat_indices)
+                row = mask_cpu[b, qb, :]
+                indices = torch.nonzero(row, as_tuple=False).squeeze(-1)
+                if indices.dim() == 0:
+                    count = 0
+                else:
+                    count = indices.size(0)
+                    flat_indices.append(indices)
+                lut_start_0.append(start)
+                lut_count_0.append(count)
+        if flat_indices:
+            kv_block_indices = torch.cat(flat_indices, dim=0).to(device=device, dtype=torch.int32)
+        else:
+            kv_block_indices = torch.empty(0, dtype=torch.int32, device=device)
+        # Repeat same (b, qb) LUT for each head in kernel order: (b, h, qb) -> b*(num_heads*num_q_blocks) + h*num_q_blocks + qb
+        lut_start = []
+        lut_count = []
+        for b in range(batch):
+            for h in range(num_heads):
+                for qb in range(num_q_blocks):
+                    idx_0 = b * num_q_blocks + qb
+                    lut_start.append(lut_start_0[idx_0])
+                    lut_count.append(lut_count_0[idx_0])
+        lut_start_t = torch.tensor(lut_start, dtype=torch.int32, device=device)
+        lut_count_t = torch.tensor(lut_count, dtype=torch.int32, device=device)
+        return kv_block_indices, lut_start_t, lut_count_t
+
+    # 4D: (batch, num_heads, num_q_blocks, num_kv_blocks)
+    batch, num_heads, num_q_blocks, _ = block_attn_mask.shape
     flat_indices = []
     lut_start = []
     lut_count = []
-
     for b in range(batch):
-        for qb in range(num_q_blocks):
-            start = len(flat_indices)
-            row = mask_cpu[b, qb, :]
-            indices = torch.nonzero(row, as_tuple=False).squeeze(-1)
-            if indices.dim() == 0:
-                count = 0
-            else:
-                count = indices.size(0)
-                flat_indices.append(indices)
-            lut_start.append(start)
-            lut_count.append(count)
+        for h in range(num_heads):
+            for qb in range(num_q_blocks):
+                start = len(flat_indices)
+                row = mask_cpu[b, h, qb, :]
+                indices = torch.nonzero(row, as_tuple=False).squeeze(-1)
+                if indices.dim() == 0:
+                    count = 0
+                else:
+                    count = indices.size(0)
+                    flat_indices.append(indices)
+                lut_start.append(start)
+                lut_count.append(count)
 
     if flat_indices:
         kv_block_indices = torch.cat(flat_indices, dim=0).to(device=device, dtype=torch.int32)

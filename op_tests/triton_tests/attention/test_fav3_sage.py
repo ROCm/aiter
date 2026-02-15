@@ -342,7 +342,7 @@ def test_sage_block_sparse_vs_reference(
             if abs(qb - kb) <= 1:
                 block_attn_mask[:, qb, kb] = True
 
-    block_lut = block_attn_mask_to_ragged_lut(block_attn_mask)
+    block_lut = block_attn_mask_to_ragged_lut(block_attn_mask, num_heads=NUM_Q_HEADS)
     softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
     triton_out = fav3_sage_wrapper_func(
         q, k, v, softmax_scale, causal=False, inference_mode=True, layout=layout,
@@ -376,7 +376,7 @@ def test_sage_block_sparse_empty_kv_blocks(layout: str, dtype=torch.bfloat16):
     block_attn_mask = torch.ones(BATCH, num_q_blocks, num_kv_blocks, dtype=torch.bool, device="cuda")
     block_attn_mask[:, 0, :] = False
 
-    block_lut = block_attn_mask_to_ragged_lut(block_attn_mask)
+    block_lut = block_attn_mask_to_ragged_lut(block_attn_mask, num_heads=NUM_Q_HEADS)
     softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
     triton_out = fav3_sage_wrapper_func(
         q, k, v, softmax_scale, causal=False, inference_mode=True, layout=layout,

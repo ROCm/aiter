@@ -1160,9 +1160,8 @@ def sage_fwd(
 
     # figure out masking pattern
     if USE_BLOCK_SPARSE:
-        total_k_blocks = tl.cdiv(seqlen_k, BLOCK_N)
         n_extra_tokens = compute_padding_info(seqlen_k, BLOCK_N)
-        lut_idx = off_z * num_q_blocks + start_m
+        lut_idx = off_z * (HQ * num_q_blocks) + off_h_q * num_q_blocks + start_m
         n_blocks = tl.load(lut_count + lut_idx)
         has_any_range = n_blocks > 0
     else:
