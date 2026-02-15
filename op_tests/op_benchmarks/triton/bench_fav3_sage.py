@@ -210,13 +210,16 @@ def make_block_attn_mask(
             )
         if batch == 1 and BATCH > 1:
             mask_t = mask_t.expand(BATCH, -1, -1).clone()
+        # Ensure 4D (batch, num_heads, num_q_blocks, num_kv_blocks)
+        if mask_t.dim() == 3:
+            mask_t = mask_t.unsqueeze(1).expand(BATCH, args.hq, nqb, nkb).clone()
         return mask_t
-    # Only block_sparsity set: random mask
+    # Only block_sparsity set: random mask (4D)
     config = get_sage_fwd_configs()
     BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
     num_q_blocks = (N_CTX_Q + BLOCK_M - 1) // BLOCK_M
     num_kv_blocks = (N_CTX_K + BLOCK_N - 1) // BLOCK_N
-    return (torch.rand(BATCH, num_q_blocks, num_kv_blocks, device=device) > args.block_sparsity).to(torch.bool)
+    return (torch.rand(BATCH, args.hq, num_q_blocks, num_kv_blocks, device=device) > args.block_sparsity).to(torch.bool)
 
 
 def sparse_flops_from_lut(
@@ -235,7 +238,7 @@ def sparse_flops_from_lut(
     BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
     num_q_blocks = (N_CTX_Q + BLOCK_M - 1) // BLOCK_M
     num_kv_blocks = (N_CTX_K + BLOCK_N - 1) // BLOCK_N
-    num_dense_pairs = BATCH * num_q_blocks * num_kv_blocks
+    num_dense_pairs = BATCH * HQ * num_q_blocks * num_kv_blocks
     total_flops_dense = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
     if num_dense_pairs == 0:
         return 0.0, total_flops_dense
@@ -978,7 +981,7 @@ def run_benchmark_block_sparse_repetitions(args):
     effective_tflops_list = []
     for _ in range(n_rep):
         block_attn_mask = (
-            torch.rand(BATCH, num_q_blocks, num_kv_blocks, device=device) > args.block_sparsity
+            torch.rand(BATCH, HQ, num_q_blocks, num_kv_blocks, device=device) > args.block_sparsity
         ).to(torch.bool)
         block_lut = block_attn_mask_to_ragged_lut(block_attn_mask)
         ms = bench_kernel(
@@ -1116,6 +1119,10 @@ def run_benchmark_masks_list(
     ):
         assert not causal
         mask_tensor, BATCH, num_q_blocks, num_kv_blocks = masks[MASK_IDX]
+        if mask_tensor.dim() == 3:
+            mask_tensor = mask_tensor.unsqueeze(1).expand(
+                BATCH, HQ, num_q_blocks, num_kv_blocks
+            ).clone()
         N_CTX_Q = num_q_blocks * BLOCK_M
         N_CTX_K = num_kv_blocks * BLOCK_N
 
