@@ -48,7 +48,11 @@ def _sage_fwd_no_mask_mxfp4(
     alibi_slope,
     q_descale,
     k_descale_base_ptrs,
+    v_descale_base_ptrs,
+    p_descale_mockup_ptrs,
     stride_ksn,
+    stride_vsn,
+    V_N_DIM_DIVISOR: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     PRE_LOAD_V: tl.constexpr,
@@ -70,12 +74,14 @@ def _sage_fwd_no_mask_mxfp4(
     for start_n in range(block_min, block_max, BLOCK_N):
         # get ptrs
         k_ptrs = k_base_ptrs + start_n * stride_kn
-        v_ptrs = v_base_ptrs + start_n * stride_vk
+        v_ptrs = v_base_ptrs + start_n // V_N_DIM_DIVISOR * stride_vk
         k_descale_ptrs = k_descale_base_ptrs + start_n * stride_ksn
+        v_descale_ptrs = v_descale_base_ptrs + (start_n // 32) * stride_vsn
+        
         if USE_Q_SMOOTHING:
             delta_s_ptrs = delta_s_base_ptrs + start_n
 
-        kv_offs_n = start_n + tl.arange(0, BLOCK_N)
+        k_offs_n = start_n + tl.arange(0, BLOCK_N)
         # Load K
         if PADDED_HEAD_QK:
             k_mask = offs_d_k[:, None] < ACTUAL_BLOCK_DMODEL_QK
@@ -84,6 +90,8 @@ def _sage_fwd_no_mask_mxfp4(
             k = tl.load(k_ptrs)
 
         k_descale = tl.load(k_descale_ptrs)
+        v_descale = tl.load(v_descale_ptrs)
+        p_descale = tl.load(p_descale_mockup_ptrs)
         if USE_Q_SMOOTHING:
             delta_s = tl.load(delta_s_ptrs)
 
@@ -119,12 +127,12 @@ def _sage_fwd_no_mask_mxfp4(
             # compute the global position of each token within the sequence
             q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
             alibi_block = compute_alibi_block(
-                alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
+                alibi_slope, seqlen_q, seqlen_k, q_offs_m, k_offs_n
             )
             qk += alibi_block
 
         # compute qk mask
-        qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
+        qk_mask = (offs_m[:, None] < seqlen_q) & (k_offs_n[None, :] < seqlen_k)
 
         # compute bias
         if USE_BIAS:
@@ -158,7 +166,7 @@ def _sage_fwd_no_mask_mxfp4(
             philox_ptrs = (
                 philox_base
                 + offs_m[:, None] * stride_sm
-                + kv_offs_n[None, :] * stride_sn
+                + k_offs_n[None, :] * stride_sn
             )
 
             # compute dropout mask
@@ -172,12 +180,12 @@ def _sage_fwd_no_mask_mxfp4(
                 sd_mask_ptrs = (
                     sd_mask_base
                     + offs_m[:, None] * stride_sm
-                    + kv_offs_n[None, :] * stride_sn
+                    + k_offs_n[None, :] * stride_sn
                 )
 
                 # Compute mask for sd_mask storage
                 sd_store_mask = (offs_m[:, None] < seqlen_q) & (
-                    kv_offs_n[None, :] < seqlen_k
+                    k_offs_n[None, :] < seqlen_k
                 )
                 tl.store(sd_mask_ptrs, sd_mask_value, mask=sd_store_mask)
 
@@ -189,12 +197,12 @@ def _sage_fwd_no_mask_mxfp4(
             sd_mask_ptrs = (
                 sd_mask_base
                 + offs_m[:, None] * stride_sm
-                + kv_offs_n[None, :] * stride_sn
+                + k_offs_n[None, :] * stride_sn
             )
 
             # Compute mask for sd_mask storage
             sd_store_mask = (offs_m[:, None] < seqlen_q) & (
-                kv_offs_n[None, :] < seqlen_k
+                k_offs_n[None, :] < seqlen_k
             )
             tl.store(sd_mask_ptrs, p, mask=sd_store_mask)
 
@@ -222,7 +230,7 @@ def _sage_fwd_no_mask_mxfp4(
         l_i = l_i * alpha + l_ij
         m_i = m_ij
 
-        acc += tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
+        acc = tl.dot_scaled(p.to(tl.float8e4nv), p_descale, "e4m3", v, v_descale, "e2m1", acc=acc)
 
     return acc, l_i, m_i
 
@@ -263,7 +271,11 @@ def _sage_fwd_mask_mxfp4(
     alibi_slope,
     q_descale,
     k_descale_base_ptrs,
+    v_descale_base_ptrs,
+    p_descale_mockup_ptrs,
     stride_ksn,
+    stride_vsn,
+    V_N_DIM_DIVISOR: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -291,16 +303,19 @@ def _sage_fwd_mask_mxfp4(
     for start_n in range(block_min, block_max, BLOCK_N):
         # get ptrs
         k_ptrs = k_base_ptrs + start_n * stride_kn
-        v_ptrs = v_base_ptrs + start_n * stride_vk
+        v_ptrs = v_base_ptrs + start_n // V_N_DIM_DIVISOR * stride_vk
         k_descale_ptrs = k_descale_base_ptrs + start_n * stride_ksn
+        v_descale_ptrs = v_descale_base_ptrs + (start_n // 32) * stride_vsn
         if USE_Q_SMOOTHING:
             delta_s_ptrs = delta_s_base_ptrs + start_n
 
         # For padded blocks, we will overrun the tensor size if
         # we load all BLOCK_N. For others, the blocks are all within range.
-        kv_offs_n = start_n + tl.arange(0, BLOCK_N)
-        k_mask = kv_offs_n[None, :] < seqlen_k
-        v_mask = kv_offs_n[:, None] < seqlen_k
+        k_offs_n = start_n + tl.arange(0, BLOCK_N)
+        v_offs_n = (start_n // V_N_DIM_DIVISOR) + tl.arange(0, BLOCK_N // V_N_DIM_DIVISOR)
+        vs_off = tl.arange(0, BLOCK_N // 32)
+        k_mask = k_offs_n[None, :] < seqlen_k
+        v_mask = v_offs_n[:, None] < seqlen_k // V_N_DIM_DIVISOR
         if PADDED_HEAD_QK:
             k_mask = k_mask & (offs_d_k[:, None] < ACTUAL_BLOCK_DMODEL_QK)
         if PADDED_HEAD_V:
@@ -309,10 +324,15 @@ def _sage_fwd_mask_mxfp4(
         # load k and if preload_v then v
         k = tl.load(k_ptrs, mask=k_mask, other=0.0)
         k_descale = tl.load(
-            k_descale_ptrs, mask=kv_offs_n[:, None] < seqlen_k, other=0.0
+            k_descale_ptrs, mask=k_offs_n[:, None] < seqlen_k, other=0.0
         )
+        v_descale = tl.load(
+            v_descale_ptrs, mask=vs_off[None, :] < seqlen_k // V_N_DIM_DIVISOR, other=0.0
+        )
+        p_descale = tl.load(p_descale_mockup_ptrs)
+
         if USE_Q_SMOOTHING:
-            delta_s = tl.load(delta_s_ptrs, kv_offs_n < seqlen_k, other=0.0)
+            delta_s = tl.load(delta_s_ptrs, k_offs_n < seqlen_k, other=0.0)
 
         if PRE_LOAD_V:
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
@@ -354,7 +374,7 @@ def _sage_fwd_mask_mxfp4(
             # compute the global position of each token within the sequence
             q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
             alibi_block = compute_alibi_block(
-                alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
+                alibi_slope, seqlen_q, seqlen_k, q_offs_m, k_offs_n
             )
             qk += alibi_block
 
@@ -367,7 +387,7 @@ def _sage_fwd_mask_mxfp4(
 
                 # Get positions
                 row_idx = offs_m  # Query positions
-                col_idx = kv_offs_n  # Key positions
+                col_idx = k_offs_n  # Key positions
 
                 # Expand for broadcasting
                 row_idx_expanded = row_idx[:, None]  # [BLOCK_M, 1]
@@ -407,7 +427,7 @@ def _sage_fwd_mask_mxfp4(
 
                 # Get positions
                 row_idx = offs_m  # Query positions
-                col_idx = kv_offs_n  # Key positions
+                col_idx = k_offs_n  # Key positions
 
                 # sk and sq from reference (no padding masks in this test)
                 sk = seqlen_k
@@ -453,7 +473,7 @@ def _sage_fwd_mask_mxfp4(
                 qk = tl.where(causal_mask, qk, float("-inf"))
 
         # compute qk mask
-        qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
+        qk_mask = (offs_m[:, None] < seqlen_q) & (k_offs_n[None, :] < seqlen_k)
 
         # compute bias
         if USE_BIAS:
@@ -492,7 +512,7 @@ def _sage_fwd_mask_mxfp4(
             philox_ptrs = (
                 philox_base
                 + offs_m[:, None] * stride_sm
-                + kv_offs_n[None, :] * stride_sn
+                + k_offs_n[None, :] * stride_sn
             )
 
             # compute dropout mask
@@ -506,18 +526,18 @@ def _sage_fwd_mask_mxfp4(
                 sd_mask_ptrs = (
                     sd_mask_base
                     + offs_m[:, None] * stride_sm
-                    + kv_offs_n[None, :] * stride_sn
+                    + k_offs_n[None, :] * stride_sn
                 )
 
                 # Compute mask for sd_mask storage - include bounds check
                 sd_store_mask = (offs_m[:, None] < seqlen_q) & (
-                    kv_offs_n[None, :] < seqlen_k
+                    k_offs_n[None, :] < seqlen_k
                 )
 
                 # Add causal mask if applicable to prevent writing to invalid positions
                 if IS_CAUSAL:
                     seqlen_delta_qk = seqlen_k - seqlen_q
-                    causal_constraint = kv_offs_n[None, :] <= (
+                    causal_constraint = k_offs_n[None, :] <= (
                         offs_m[:, None] + seqlen_delta_qk
                     )
                     sd_store_mask = sd_store_mask & causal_constraint
@@ -527,7 +547,7 @@ def _sage_fwd_mask_mxfp4(
                     seqlen_delta_qk = seqlen_k - seqlen_q
                     if WINDOW_SIZE_LEFT < 0:
                         # Only right window constraint
-                        window_constraint = kv_offs_n[None, :] <= (
+                        window_constraint = k_offs_n[None, :] <= (
                             offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
                         )
                     else:
@@ -538,8 +558,8 @@ def _sage_fwd_mask_mxfp4(
                         right_bound = (
                             offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
                         )
-                        window_constraint = (kv_offs_n[None, :] >= left_bound) & (
-                            kv_offs_n[None, :] <= right_bound
+                        window_constraint = (k_offs_n[None, :] >= left_bound) & (
+                            k_offs_n[None, :] <= right_bound
                         )
                     sd_store_mask = sd_store_mask & window_constraint
 
@@ -553,18 +573,18 @@ def _sage_fwd_mask_mxfp4(
             sd_mask_ptrs = (
                 sd_mask_base
                 + offs_m[:, None] * stride_sm
-                + kv_offs_n[None, :] * stride_sn
+                + k_offs_n[None, :] * stride_sn
             )
 
             # Compute mask for sd_mask storage - include bounds check
             sd_store_mask = (offs_m[:, None] < seqlen_q) & (
-                kv_offs_n[None, :] < seqlen_k
+                k_offs_n[None, :] < seqlen_k
             )
 
             # Add causal mask if applicable
             if IS_CAUSAL:
                 seqlen_delta_qk = seqlen_k - seqlen_q
-                causal_constraint = kv_offs_n[None, :] <= (
+                causal_constraint = k_offs_n[None, :] <= (
                     offs_m[:, None] + seqlen_delta_qk
                 )
                 sd_store_mask = sd_store_mask & causal_constraint
@@ -574,15 +594,15 @@ def _sage_fwd_mask_mxfp4(
                 seqlen_delta_qk = seqlen_k - seqlen_q
                 if WINDOW_SIZE_LEFT < 0:
                     # Only right window constraint
-                    window_constraint = kv_offs_n[None, :] <= (
+                    window_constraint = k_offs_n[None, :] <= (
                         offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
                     )
                 else:
                     # Both left and right window constraints
                     left_bound = offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
                     right_bound = offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
-                    window_constraint = (kv_offs_n[None, :] >= left_bound) & (
-                        kv_offs_n[None, :] <= right_bound
+                    window_constraint = (k_offs_n[None, :] >= left_bound) & (
+                        k_offs_n[None, :] <= right_bound
                     )
                 sd_store_mask = sd_store_mask & window_constraint
 
@@ -604,7 +624,7 @@ def _sage_fwd_mask_mxfp4(
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
         m_i = m_ij
-        acc += tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
+        acc = tl.dot_scaled(p.to(tl.float8e4nv), p_descale, "e4m3", v, v_descale, "e2m1", acc=acc)
 
     return acc, l_i, m_i
 
@@ -619,6 +639,7 @@ def sage_fwd_mxfp4(
     Q_Descale,
     K_Descale,
     V_Descale,
+    P_Mock_Descale,
     stride_qsz,
     stride_qsh,
     stride_qsm,
@@ -627,6 +648,7 @@ def sage_fwd_mxfp4(
     stride_ksn,
     stride_vsz,
     stride_vsh,
+    stride_vsn,
     stride_dsz,
     stride_dsh,
     stride_dsq,
@@ -672,6 +694,7 @@ def sage_fwd_mxfp4(
     philox_offset_base,
     Q_DTYPE_STR: tl.constexpr,
     K_DTYPE_STR: tl.constexpr,
+    V_DTYPE_STR: tl.constexpr,
     RETURN_LSE: tl.constexpr,
     HQ: tl.constexpr,
     HK: tl.constexpr,
@@ -701,12 +724,15 @@ def sage_fwd_mxfp4(
     # set params
     Q_HEAD_DIM_DIVISOR: tl.constexpr = 2 if Q_DTYPE_STR == "e2m1" else 1
     K_HEAD_DIM_DIVISOR: tl.constexpr = 2 if K_DTYPE_STR == "e2m1" else 1
+    V_N_DIM_DIVISOR: tl.constexpr = 2 if V_DTYPE_STR == "e2m1" else 1
     SCALE_GROUP_SIZE: tl.constexpr = 32
     ACCUMULATOR_TYPE: tl.constexpr = tl.float32  # for q*k product
 
     BLOCK_DMODEL_Q: tl.constexpr = BLOCK_DMODEL_QK // Q_HEAD_DIM_DIVISOR
     BLOCK_DMODEL_K: tl.constexpr = BLOCK_DMODEL_QK // K_HEAD_DIM_DIVISOR
     BLOCK_DMODEL_QK_S: tl.constexpr = BLOCK_DMODEL_QK // SCALE_GROUP_SIZE
+    BLOCK_N_V: tl.constexpr = BLOCK_N // V_N_DIM_DIVISOR
+    BLOCK_N_V_S: tl.constexpr = BLOCK_N // SCALE_GROUP_SIZE
 
     # compute offsets
     start_m = tl.program_id(0)
@@ -724,6 +750,8 @@ def sage_fwd_mxfp4(
 
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
+    offs_n_v = tl.arange(0, BLOCK_N_V)
+    offs_n_v_s = tl.arange(0, BLOCK_N_V_S)
     offs_d_q = tl.arange(0, BLOCK_DMODEL_Q)  # we fit 2 fp4 elements per int8
     offs_d_k = tl.arange(0, BLOCK_DMODEL_K)  # we fit 2 fp4 elements per int8
     offs_d_qk_s = tl.arange(0, BLOCK_DMODEL_QK_S)
@@ -865,7 +893,7 @@ def sage_fwd_mxfp4(
     v_offset = (
         V + off_z * stride_vz + off_h_k * stride_vh + cu_seqlens_k_start * stride_vk
     )
-    v_ptrs = v_offset + offs_n[:, None] * stride_vk + offs_d_v[None, :] * stride_vn
+    v_ptrs = v_offset + offs_n_v[:, None] * stride_vk + offs_d_v[None, :] * stride_vn
     q_descale_offset = (
         Q_Descale
         + off_z * stride_qsz
@@ -884,7 +912,17 @@ def sage_fwd_mxfp4(
     k_descale_ptrs = (
         k_descale_offset + offs_n[:, None] * stride_ksn + offs_d_qk_s[None, :]
     )
-    v_descale_ptr = V_Descale + off_z * stride_vsz + off_h_k * stride_vsh + offs_d_v
+    v_descale_offset = (
+        V_Descale
+        + off_z * stride_vsz
+        + off_h_k * stride_vsh
+        + (cu_seqlens_k_start // V_N_DIM_DIVISOR) * stride_vsn
+    )
+    v_descale_ptrs = (
+        v_descale_offset + offs_n_v_s[None, :] * stride_vsn + offs_d_v[:, None]
+    )
+    p_descale_ptrs = P_Mock_Descale + offs_m[:, None] * BLOCK_N_V_S + offs_n_v_s[None, :]
+    
     if USE_Q_SMOOTHING:
         delta_s_offset = (
             Delta_S + off_z * stride_dsz + off_h_q * stride_dsh + start_m * stride_dsq
@@ -967,7 +1005,11 @@ def sage_fwd_mxfp4(
             alibi_slope,
             q_descale,
             k_descale_ptrs,
+            v_descale_ptrs,
+            p_descale_ptrs,
             stride_ksn,
+            stride_vsn,
+            V_N_DIM_DIVISOR,
             IS_CAUSAL,
             BLOCK_M,
             BLOCK_N,
@@ -1030,7 +1072,11 @@ def sage_fwd_mxfp4(
             alibi_slope,
             q_descale,
             k_descale_ptrs,
+            v_descale_ptrs,
+            p_descale_ptrs,
             stride_ksn,
+            stride_vsn,
+            V_N_DIM_DIVISOR,
             BLOCK_M,
             BLOCK_N,
             PRE_LOAD_V,
@@ -1096,7 +1142,11 @@ def sage_fwd_mxfp4(
             alibi_slope,
             q_descale,
             k_descale_ptrs,
+            v_descale_ptrs,
+            p_descale_ptrs,
             stride_ksn,
+            stride_vsn,
+            V_N_DIM_DIVISOR,
             IS_CAUSAL,  # Use actual causal flag
             BLOCK_M,
             BLOCK_N,
@@ -1135,13 +1185,7 @@ def sage_fwd_mxfp4(
         invalid_mask = None
         l_recip = 1 / l_i[:, None]
 
-    v_descale = tl.load(
-        v_descale_ptr,
-        mask=offs_d_v < ACTUAL_BLOCK_DMODEL_V,
-        other=0.0,
-    )
-
-    acc = acc * l_recip * v_descale
+    acc = acc * l_recip
     if ENABLE_DROPOUT:
         dropout_scale = 1 / (1 - dropout_p)
         acc = acc * dropout_scale
@@ -1295,31 +1339,32 @@ def sage_quant_mxfp4(
 
     q, k, delta_s = rotation_smooth_qk(q, k, BLKQ, block_size=padded_head_dim, q_smoothing=q_smoothing, layout=layout, sm_scale=(sm_scale * 1.4426950408889634))
 
-    sage_quant_v_kernel[grid](
-        v,
-        v_fp8,
-        v_scale,
-        stride_bz_k,
-        stride_h_k,
-        stride_seq_k,
-        v_scale.stride(0),
-        v_scale.stride(1),
-        b,
-        h_kv,
-        K_NUM_BLKS,
-        kv_len,
-        D=head_dim,
-        BLK_K=BLKK,
-        num_stages=3,
-        num_warps=8,
-    )
+    # sage_quant_v_kernel[grid](
+    #     v,
+    #     v_fp8,
+    #     v_scale,
+    #     stride_bz_k,
+    #     stride_h_k,
+    #     stride_seq_k,
+    #     v_scale.stride(0),
+    #     v_scale.stride(1),
+    #     b,
+    #     h_kv,
+    #     K_NUM_BLKS,
+    #     kv_len,
+    #     D=head_dim,
+    #     BLK_K=BLKK,
+    #     num_stages=3,
+    #     num_warps=8,
+    # )
 
     downcast_func = downcast_to_mxfp_rne if USE_RNE else downcast_to_mxfp
 
     q_fp4, q_scale = downcast_func(q, torch.uint8, axis=-1)
     k_fp4, k_scale = downcast_func(k, torch.uint8, axis=-1)
+    v_fp4, v_scale = downcast_func(v, torch.uint8, axis=-3 if layout == "bshd" else -2) # quantize the N dim
 
-    return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
+    return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale, delta_s
 
 
 @triton.jit

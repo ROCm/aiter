@@ -382,10 +382,13 @@ def fav3_sage_func(
     bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
 
     batch, seqlen_q, nheads_q, head_size_qk = map_dims(q.shape, bshd_map)
-    if USE_MXFP4_SAGE:
-        head_size_qk *= 2
+
     _, seqlen_k, nheads_k, _ = map_dims(k.shape, bshd_map)
     _, seqlen_v, nheads_v, head_size_v = map_dims(v.shape, bshd_map)
+
+    if USE_MXFP4_SAGE:
+        head_size_qk *= 2
+        seqlen_v *= 2
 
     # --- 2. Feature & Input Validation ---
     if attention_chunk not in (0, 1) or softcap != 0.0 or sm_margin != 0:
@@ -447,10 +450,11 @@ def fav3_sage_func(
     if USE_MXFP4_SAGE:
         stride_qsz, stride_qsm, stride_qsh, _ = map_dims(q_descale.stride(), bshd_map)
         stride_ksz, stride_ksn, stride_ksh, _ = map_dims(k_descale.stride(), bshd_map)
+        stride_vsz, stride_vsn, stride_vsh, _ = map_dims(v_descale.stride(), bshd_map)
     else:
         stride_qsz, stride_qsh, stride_qsblk = q_descale.stride()
         stride_ksz, stride_ksh, stride_ksblk = k_descale.stride()
-    stride_vsz, stride_vsh, _ = v_descale.stride()
+        stride_vsz, stride_vsh, _ = v_descale.stride()
 
     # --- 6. Padding & Metadata ---
     padded_d_model_qk = max(16, 1 << (head_size_qk - 1).bit_length())
@@ -471,6 +475,7 @@ def fav3_sage_func(
         else:
             stride_dsz, stride_dsh, stride_dsq = (None, None, None)
 
+        p_mockup_descale = torch.empty((config["BLOCK_M"], config["BLOCK_N"] // 32), dtype=torch.uint8, device=q.device).fill_(127)
         sage_fwd_mxfp4[grid](
             q,
             k,
@@ -480,6 +485,7 @@ def fav3_sage_func(
             q_descale,
             k_descale,
             v_descale,
+            p_mockup_descale,
             stride_qsz,
             stride_qsh,
             stride_qsm,
@@ -488,6 +494,7 @@ def fav3_sage_func(
             stride_ksn,
             stride_vsz,
             stride_vsh,
+            stride_vsn,
             stride_dsz,
             stride_dsh,
             stride_dsq,
@@ -533,6 +540,7 @@ def fav3_sage_func(
             philox_offset_base=None,
             Q_DTYPE_STR="e2m1",  # MXFP4 for now
             K_DTYPE_STR="e2m1",  # MXFP4 for now
+            V_DTYPE_STR="e2m1",  # MXFP4 for now
             RETURN_LSE=return_lse,
             HQ=nheads_q,
             HK=nheads_k,
