@@ -24,6 +24,7 @@ from aiter.dist.utils import get_open_port, get_distributed_init_method, get_ip
 from aiter.dist.communication_op import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_fused_allreduce_rmsnorm,
+    tensor_model_parallel_fused_allreduce_rmsnorm_quant,
 )
 from aiter.test_common import (
     checkAllclose,
@@ -47,6 +48,7 @@ def fused_ar_rmsnorm(
     eps,
     withGraph=False,
     distributed_init_method: Optional[str] = None,
+    post_per_token_quant: bool = False,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -72,9 +74,16 @@ def fused_ar_rmsnorm(
         graph = torch.cuda.CUDAGraph()
         with graph_capture() as gc:
             with torch.cuda.graph(graph, stream=gc.stream):
-                out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
-                    x, x, weight, eps
-                )
+                if not post_per_token_quant:
+                    out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
+                        x, x, weight, eps
+                    )
+                else:
+                    out, res_out, scale_out = (
+                        tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+                            x, x, weight, eps
+                        )
+                    )
         out.fill_(0)
         res_out.fill_(0)
 
@@ -83,17 +92,32 @@ def fused_ar_rmsnorm(
             graph.replay()
 
         _, us = run_ca()
-        out = (out, us)
+        if not post_per_token_quant:
+            out = (out, us)
+        else:
+            out = (out.float() * scale_out, us)
     else:
 
         @perftest()
         def run_ca(x):
-            out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
-                x, x, weight, eps
-            )
-            return out
+            if not post_per_token_quant:
+                out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
+                    x, x, weight, eps
+                )
+                return out
+            else:
+                out, res_out, scale_out = (
+                    tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+                        x, x, weight, eps
+                    )
+                )
+                return out, scale_out
 
-        out = run_ca(x)
+        if not post_per_token_quant:
+            out = run_ca(x)
+        else:
+            out = run_ca(x)
+            out = (out[0][0].float() * out[0][1], out[1])
 
     # destroy
     if dist.is_initialized():
@@ -350,6 +374,7 @@ def test_fused_ar_rmsnorm(
     dtype,
     withGraph=False,
     distributed_init_method: Optional[str] = None,
+    post_per_token_quant: bool = False,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -383,6 +408,7 @@ def test_fused_ar_rmsnorm(
                     eps,
                     withGraph,
                     distributed_init_method,
+                    post_per_token_quant,
                 ),
             )
         )
@@ -404,7 +430,12 @@ def test_fused_ar_rmsnorm(
     for out, us in rets:
         msg = f"test_fused_ar_rmsnorm: {shape=} {dtype=} {withGraph=} {us:>8.2f}"
         # print(cpu_rslt[out.device.index])
-        checkAllclose(cpu_rslt[out.device.index], out.to(ref), msg=msg)
+        if not post_per_token_quant:
+            checkAllclose(cpu_rslt[out.device.index], out.to(ref), msg=msg)
+        else:
+            checkAllclose(
+                cpu_rslt[out.device.index], out.to(ref), msg=msg, atol=5e-2, rtol=5e-2
+            )
         # checkAllclose(ref, out.to(ref), msg=msg)
 
 
@@ -626,4 +657,16 @@ if __name__ == "__main__":
             distributed_init_method=get_distributed_init_method(
                 get_ip(), get_open_port()
             ),
+            post_per_token_quant=False,
+        )
+        test_fused_ar_rmsnorm(
+            tp,
+            pp,
+            shape,
+            dtype,
+            withGraph=graph_on,
+            distributed_init_method=get_distributed_init_method(
+                get_ip(), get_open_port()
+            ),
+            post_per_token_quant=True,
         )

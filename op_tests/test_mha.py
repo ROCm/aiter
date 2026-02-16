@@ -745,20 +745,22 @@ parser.add_argument(
 parser.add_argument(
     "-c",
     "--causal",
-    action=argparse.BooleanOptionalAction,
-    default=None,
-    help="""Causal attention. Default is None.
-    -c or --causal    # enable causal attention
-    --no-causal       # disable causal attention""",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[False, True],
+    help="""Causal attention. Default is [False, True].
+    e.g. -c true # enable causal attention
+         -c false # disable causal attention""",
 )
 parser.add_argument(
     "-l",
     "--local",
-    action=argparse.BooleanOptionalAction,
-    default=None,
-    help="""Local attention. Default is None.
-        e.g. -l or --local    # enable local attention
-        --no-local        # disable local attention""",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[False, True],
+    help="""Local attention. Default is [False, True].
+        e.g. -l true # enable local attention
+             -l false # disable local attention""",
 )
 parser.add_argument(
     "-bt",
@@ -771,11 +773,12 @@ parser.add_argument(
 parser.add_argument(
     "-det",
     "--deterministic",
-    action=argparse.BooleanOptionalAction,
-    default=None,
-    help="""Deterministic attention. Default is None.
-    -det or --deterministic    # enable deterministic attention
-    --no-deterministic         # disable deterministic attention""",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[False, True],
+    help="""Deterministic attention. Default is [False, True].
+    e.g. -det true # enable deterministic attention
+         -det false # disable deterministic attention""",
 )
 parser.add_argument(
     "-m",
@@ -809,15 +812,6 @@ parser.add_argument(
 if __name__ == "__main__":
     args = parser.parse_args()
 
-    if args.causal is not None:
-        l_causal = [args.causal]
-
-    if args.local is not None:
-        l_local = [args.local]
-
-    if args.deterministic is not None:
-        l_deterministic = [args.deterministic]
-
     collected = []
     for (
         dtype,
@@ -827,7 +821,12 @@ if __name__ == "__main__":
         local,
         deterministic,
     ) in itertools.product(
-        args.dtype, args.d_qk_v, args.mha_type, l_causal, l_local, l_deterministic
+        args.dtype,
+        args.d_qk_v,
+        args.mha_type,
+        args.causal,
+        args.local,
+        args.deterministic,
     ):
         ret = flash_attn_output_benchmark(
             args.batch_size,
