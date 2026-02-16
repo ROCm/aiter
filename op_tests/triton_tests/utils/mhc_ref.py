@@ -28,6 +28,17 @@ from itertools import permutations as itertools_permutations
 from math import factorial
 import torch
 
+__all__ = [
+    "mhc_torch",
+    "mhc_lite_torch",
+    "sinkhorn_knopp_exp_domain_torch",
+    "sinkhorn_knopp_log_domain_torch",
+    "is_doubly_stochastic",
+    "generate_mhc_inputs",
+    "get_test_shapes",
+    "get_sk_test_shapes",
+]
+
 # =============================================================================
 # PyTorch Reference Implementations
 # =============================================================================

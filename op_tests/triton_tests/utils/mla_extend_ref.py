@@ -23,6 +23,11 @@ import torch
 import triton
 import triton.language as tl
 
+__all__ = [
+    "extend_attention_fwd",
+    "redundant_attention",
+]
+
 # from sglang.srt.layers.attention.triton_ops.prefill_attention import (
 #     context_attention_fwd,
 # )
