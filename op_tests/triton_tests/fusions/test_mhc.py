@@ -410,12 +410,12 @@ def test_mhc_output_range():
 
     # Res-stream (Eq 19): doubly stochastic
     n_squared = n * n
-    assert H_res.shape == (M, n_squared), f"Res-stream shape mismatch"
+    assert H_res.shape == (M, n_squared), "Res-stream shape mismatch"
 
     # Verify doubly stochastic numerical accuracy against the reference implementation.
     H_res_3d = H_res.view(M, n, n).to(torch.float32)
     assert is_doubly_stochastic(H_res_3d, tol=5e-2), (
-        f"Res-stream is not doubly stochastic. "
+        "Res-stream is not doubly stochastic. "
         f"Row sums: {H_res_3d.sum(dim=-1)}, Col sums: {H_res_3d.sum(dim=-2)}"
     )
 

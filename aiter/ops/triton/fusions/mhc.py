@@ -18,8 +18,6 @@ from math import factorial
 from typing import Optional
 import torch
 import triton
-import itertools
-import math
 
 from aiter.ops.triton._triton_kernels.fusions.mhc import (
     _mhc_fused_kernel,
@@ -405,7 +403,7 @@ def mhc(
         - H_res: (M, n²) - doubly stochastic residual connection
     """
     _LOGGER.info(
-        f"MHC: calling fused_mhc() with hres_mode='lite'"
+        "MHC: calling fused_mhc() with hres_mode='lite'"
         if hres_mode == "lite"
         else f"MHC: calling fused_mhc() then sinkhorn_knopp() with {sinkhorn_iters} iterations"
     )

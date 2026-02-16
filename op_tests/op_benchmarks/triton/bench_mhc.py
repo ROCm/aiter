@@ -20,12 +20,6 @@ from itertools import product
 from math import factorial
 import torch
 import triton
-import math
-
-# Configure logging before importing aiter modules
-logging.basicConfig(
-    level=logging.INFO, format="[%(name)s] %(levelname)s: %(message)s", force=True
-)
 
 from aiter.ops.triton.fusions.mhc import mhc, fused_mhc, sinkhorn_knopp
 from op_tests.triton_tests.utils.mhc_ref import generate_mhc_inputs
@@ -40,6 +34,10 @@ arg_to_torch_dtype = {
     "fp32": torch.float32,
 }
 
+# Configure logging before importing aiter modules
+logging.basicConfig(
+    level=logging.INFO, format="[%(name)s] %(levelname)s: %(message)s", force=True
+)
 
 def get_benchmark_configs(args):
     """Generate list of benchmark configurations based on args."""
@@ -225,32 +223,34 @@ def run_benchmark(args):
 
         # Create benchmark function
         if mode == "mhc":
-            fn = lambda: mhc(
-                x,
-                phi_pre,
-                phi_post,
-                phi_res,
-                alpha_pre,
-                alpha_post,
-                alpha_res,
-                bias,
-                n_streams,
-                hres_mode="sinkhorn",
-                sinkhorn_iters=sinkhorn_iters,
-            )
+            def fn():
+                return mhc(
+                    x,
+                    phi_pre,
+                    phi_post,
+                    phi_res,
+                    alpha_pre,
+                    alpha_post,
+                    alpha_res,
+                    bias,
+                    n_streams,
+                    hres_mode="sinkhorn",
+                    sinkhorn_iters=sinkhorn_iters,
+                )
         elif mode == "mhc_lite":
-            fn = lambda: mhc(
-                x,
-                phi_pre,
-                phi_post,
-                phi_res,
-                alpha_pre,
-                alpha_post,
-                alpha_res,
-                bias,
-                n_streams,
-                hres_mode="lite",
-            )
+            def fn():
+                return mhc(
+                    x,
+                    phi_pre,
+                    phi_post,
+                    phi_res,
+                    alpha_pre,
+                    alpha_post,
+                    alpha_res,
+                    bias,
+                    n_streams,
+                    hres_mode="lite",
+                )
         elif mode == "sinkhorn_knopp_only":
             # Sinkhorn-only: benchmark just the Sinkhorn-Knopp kernel
             # Pre-generate H_res for fair comparison (use sinkhorn mode for raw logits)
@@ -270,9 +270,10 @@ def run_benchmark(args):
                 hres_mode="sinkhorn",
             )
             H_res_3d = H_res_input.view(M, n, n)
-            fn = lambda: sinkhorn_knopp(
-                H_res_3d, C=C, num_iters=sinkhorn_iters, out=H_res_3d
-            )
+            def fn():
+                return sinkhorn_knopp(
+                    H_res_3d, C=C, num_iters=sinkhorn_iters, out=H_res_3d
+                )
 
         # Benchmark
         ms = triton.testing.do_bench(fn)
