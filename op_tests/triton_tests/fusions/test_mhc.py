@@ -942,7 +942,11 @@ def test_sk_identity_initialization():
     out = sinkhorn_knopp(logits, C=128, num_iters=20)
 
     # Output should be close to identity
-    identity = torch.eye(N, device="cuda").unsqueeze(0).expand(M, -1, -1)
+    identity = (
+        torch.eye(N, device="cuda", dtype=torch.float32)
+        .unsqueeze(0)
+        .expand(M, -1, -1)
+    )
     torch.testing.assert_close(
         out.to(torch.float32),
         identity,
@@ -962,7 +966,7 @@ def test_sk_uniform_input():
     out = sinkhorn_knopp(logits, C=128, num_iters=20)
 
     # Output should be uniform: 1/N everywhere
-    expected = torch.full((M, N, N), 1.0 / N, device="cuda")
+    expected = torch.full((M, N, N), 1.0 / N, device="cuda", dtype=torch.float32)
     torch.testing.assert_close(
         out.to(torch.float32),
         expected,
