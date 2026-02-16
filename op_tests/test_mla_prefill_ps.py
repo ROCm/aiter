@@ -16,6 +16,7 @@ from aiter import per_tensor_quant
 from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 from aiter.jit.utils.chip_info import get_gfx
 
+from torch.utils.benchmark import Timer
 from typing import Tuple, Optional
 
 # This test only supports gfx950, skip on gfx942
@@ -224,7 +225,8 @@ def run_aiter_mla_reduce(
 
 @benchmark()
 def test_mla_prefill(
-    ctx_lens: int,
+    max_qlen: int,
+    max_kvlen: int,
     batch_size: int,
     num_head: int,
     qk_head_dim: int,
@@ -251,15 +253,20 @@ def test_mla_prefill(
 
     qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
     kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+    seq_lens_qo = torch.empty(batch_size, dtype=torch.int)
     seq_lens_kv = torch.empty(batch_size, dtype=torch.int)
     if varlen:
         for i in range(batch_size):
+            seq_lens_qo[i] = max(
+                min(random.normalvariate(max_qlen, max_qlen / 2), max_qlen), 1
+            )
             seq_lens_kv[i] = max(
-                min(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens), 1
+                min(random.normalvariate(max_kvlen, max_kvlen / 2), max_kvlen), 1
             )
     else:
-        seq_lens_kv.fill_(ctx_lens)
-    seq_lens_qo = seq_lens_kv.clone()
+        seq_lens_qo.fill_(max_qlen)
+        seq_lens_kv.fill_(max_kvlen)
+    # seq_lens_qo = seq_lens_kv.clone()
     max_qlen = seq_lens_qo.max().item()
 
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
@@ -278,6 +285,7 @@ def test_mla_prefill(
     k_quant, k_scale = per_tensor_quant(K_bf16, quant_dtype=kv_dtype)
     v_quant, v_scale = per_tensor_quant(V_bf16, quant_dtype=kv_dtype)
 
+    # NOTICE: pre-allocation should be handled in framework
     tile_q = 256
     tile_kv = 128
     qhead_granularity = gqa_ratio
@@ -285,7 +293,7 @@ def test_mla_prefill(
     # TODO: enhance pre-allocation, current too loose for large context length
     kvlen_granularity = max(tile_kv, block_size)
     (
-        (work_meta_data_size, work_meta_data_type),
+        (_, _),
         (work_indptr_size, work_indptr_type),
         (work_info_size, work_info_type),
         (reduce_indptr_size, reduce_indptr_type),
@@ -293,13 +301,33 @@ def test_mla_prefill(
         (reduce_partial_map_size, reduce_partial_map_type),
     ) = aiter.get_ps_metadata_info_v1(
         batch_size=batch_size,
-        num_head_k=num_head_kv,
+        num_head_k=num_head_kv,  # NOTICE: pass by kv_heads / TP
         max_qlen=max_qlen,
         qlen_granularity=qlen_granularity,
     )
-    work_metadata_ptrs = torch.empty(
-        work_meta_data_size, dtype=work_meta_data_type, device=device
+    # Pinned CPU buffers(used for stage0: get_ps_metadata_info_v1)
+    work_indptr_cpu = torch.empty(
+        work_indptr_size, dtype=work_indptr_type, device="cpu", pin_memory=True
     )
+    work_info_cpu = torch.empty(
+        work_info_size, dtype=work_info_type, device="cpu", pin_memory=True
+    )
+    reduce_indptr_cpu = torch.empty(
+        reduce_indptr_size, dtype=reduce_indptr_type, device="cpu", pin_memory=True
+    )
+    reduce_final_map_cpu = torch.empty(
+        reduce_final_map_size,
+        dtype=reduce_final_map_type,
+        device="cpu",
+        pin_memory=True,
+    )
+    reduce_partial_map_cpu = torch.empty(
+        reduce_partial_map_size,
+        dtype=reduce_partial_map_type,
+        device="cpu",
+        pin_memory=True,
+    )
+    # Device buffers(used by stage1: mla_prefill_ps_asm_fwd & stage2: mla_reduce_v1)
     work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type, device=device)
     work_info = torch.empty(work_info_size, dtype=work_info_type, device=device)
     reduce_indptr = torch.empty(
@@ -330,61 +358,63 @@ def test_mla_prefill(
             array = np.fromfile(file_name, dtype=np.uint32)
             meta = torch.from_numpy(array).reshape(shape)
             torch.set_printoptions(threshold=999999, linewidth=120)
-            print(f"==>load {name} from {file_name}:\n{meta}")
+            print(
+                f"==>load {name} shape {meta.shape} from {file_name}:\n{meta}",
+                flush=True,
+            )
     else:
-        qo_indptr_cpu = qo_indptr.to("cpu")
-        kv_indptr_cpu = kv_indptr.to("cpu")
-        seq_lens_kv_cpu = seq_lens_kv.to("cpu")
-        # warmup for get_ps_metadata_v1
-        aiter.get_ps_metadata_v1(
-            qo_indptr_cpu,
-            kv_indptr_cpu,
-            seq_lens_kv_cpu,
-            gqa_ratio,
-            num_head_kv,
-            work_metadata_ptrs,
-            work_indptr,
-            work_info,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            qhead_granularity=qhead_granularity,
-            qlen_granularity=qlen_granularity,
-            kvlen_granularity=kvlen_granularity,
-            block_size=block_size,
-            is_causal=is_causal,
+        # Inputs: pin_memory CPU (caller-allocated)
+        qo_indptr_cpu = qo_indptr.to("cpu", non_blocking=True).pin_memory()
+        kv_indptr_cpu = kv_indptr.to("cpu", non_blocking=True).pin_memory()
+        seq_lens_kv_cpu = seq_lens_kv.to("cpu", non_blocking=True).pin_memory()
+
+        def run_get_ps_metadata_and_h2d():
+            # NOTICE: get_metadata should be called at the beginning per inference step
+            # and the attn_metadata should be shared by all attention layers
+            # the kernel only take pinned CPU buffer; no H2D inside
+            aiter.get_ps_metadata_v1(
+                qo_indptr_cpu,
+                kv_indptr_cpu,
+                seq_lens_kv_cpu,
+                gqa_ratio,
+                num_head_kv,  # NOTICE: pass by kv_heads / TP
+                work_indptr_cpu,
+                work_info_cpu,
+                reduce_indptr_cpu,
+                reduce_final_map_cpu,
+                reduce_partial_map_cpu,
+                qhead_granularity=qhead_granularity,
+                qlen_granularity=qlen_granularity,
+                kvlen_granularity=kvlen_granularity,
+                block_size=block_size,
+                is_causal=is_causal,
+            )
+            # NOTICE: the async H2D should be handled in framework
+            # if consider overlap, need use multi-streams
+            work_indptr.copy_(work_indptr_cpu, non_blocking=True)
+            work_info.copy_(work_info_cpu, non_blocking=True)
+            reduce_indptr.copy_(reduce_indptr_cpu, non_blocking=True)
+            reduce_final_map.copy_(reduce_final_map_cpu, non_blocking=True)
+            reduce_partial_map.copy_(reduce_partial_map_cpu, non_blocking=True)
+            # NOTICE: sync before the first attention kernel call per inference step
+            torch.cuda.synchronize()
+
+        # Benchmark metadata + H2D with torch.utils.benchmark (CUDA-synced)
+        t = Timer(
+            stmt="run_get_ps_metadata_and_h2d()",
+            globals={"run_get_ps_metadata_and_h2d": run_get_ps_metadata_and_h2d},
         )
-        torch.cuda.synchronize()
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
-        aiter.get_ps_metadata_v1(
-            qo_indptr_cpu,
-            kv_indptr_cpu,
-            seq_lens_kv_cpu,
-            gqa_ratio,
-            num_head_kv,
-            work_metadata_ptrs,
-            work_indptr,
-            work_info,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            qhead_granularity=qhead_granularity,
-            qlen_granularity=qlen_granularity,
-            kvlen_granularity=kvlen_granularity,
-            block_size=block_size,
-            is_causal=is_causal,
-        )
-        end_event.record()
-        end_event.synchronize()
-        us_metadata = start_event.elapsed_time(end_event) * 1000  # ms to us
+        metric_metadata = t.timeit(1)
+        us_metadata = metric_metadata.mean * 1e6
+        ret["us_metadata"] = us_metadata
 
     if dump_metadata:
         for name, meta in metadata_map.items():
             file_name = f"{name}.bin"
             torch.set_printoptions(threshold=99999999, linewidth=120)
-            print(f"==>dump {name} shape {meta.shape} to {file_name}:\n{meta}")
+            print(
+                f"==>dump {name} shape {meta.shape} to {file_name}:\n{meta}", flush=True
+            )
             meta.cpu().numpy().astype(np.uint32).tofile(file_name)
 
     output = torch.empty((num_tokens, num_head_q, v_head_dim), dtype=torch.bfloat16)
@@ -448,8 +478,8 @@ def test_mla_prefill(
             2.0
             * batch_size
             * num_head_q
-            * ctx_len
-            * (qk_head_dim * ctx_len + v_head_dim * ctx_len)
+            * max_qlen
+            * (qk_head_dim * max_kvlen + v_head_dim * max_kvlen)
         ) / g_div
         tflops_mla_prefill_asm = ops / us_mla_prefill_asm / (1e6)
         # calulate reduce kernel bandwidth
@@ -480,24 +510,10 @@ def test_mla_prefill(
             effective_final_tiles * qlen_granularity * num_head_q * (v_head_dim + 1) * 2
         )
         effective_bytes = effective_input_bytes + effective_output_bytes
-        print(
-            f"effective_partial_tiles: {effective_partial_tiles}, allocate_partial_tiles: {reduce_partial_map.numel()}"
-        )
-        print(
-            f"effective_final_tiles: {effective_final_tiles}, allocate_final_tiles: {reduce_final_map.numel()}"
-        )
-        print(
-            f"effective_input_bytes: {effective_input_bytes}, allocate_input_bytes: {allocate_input_bytes}"
-        )
-        print(
-            f"effective_output_bytes: {effective_output_bytes}, allocate_output_bytes: {allocate_output_bytes}"
-        )
-        print(f"effective_bytes: {effective_bytes}, allocate_bytes: {allocate_bytes}")
 
         reduce_bytes = effective_bytes
         bw_reduce = (reduce_bytes / 1e12) / (us_reduce / (1e6))
         # Store results
-        ret["us_metadata"] = us_metadata
         ret["us_mla_prefill_ps"] = us_mla_prefill_ps
         ret["us_mla_prefill_asm"] = us_mla_prefill_asm
         ret["us_mla_prefill_asm_ratio"] = us_mla_prefill_asm / us_mla_prefill_ps
@@ -579,6 +595,7 @@ l_ctx_len = [
     8192,
     10000,
     16384,
+    # 70000,
     # 90000,
 ]
 l_batch_size = [1, 4, 16]
@@ -639,8 +656,17 @@ parser.add_argument(
     "--ctx_len",
     type=int,
     default=None,
-    help="""Context length(for prefill, qo_len = kv_len = context_len).
+    help="""Context length(qlen = kvlen = ctx_len).
     e.g.: -c 21""",
+)
+parser.add_argument(
+    "-qkv",
+    "--qkv_len",
+    type=dtypes.str2tuple,
+    nargs="?",
+    default=None,
+    help="""qkv length pairs.
+    e.g.: -qkv 3000,60000""",
 )
 parser.add_argument(
     "-b",
@@ -702,21 +728,20 @@ if args.kv_dtype is not None:
     l_kvdtype = [dtypes.d_dtypes[key] for key in args.kv_dtype]
 if args.num_heads is not None:
     l_num_heads = [args.num_heads]
-if args.ctx_len is not None:
-    l_ctx_len = [args.ctx_len]
 if args.batch_size is not None:
     l_batch_size = [args.batch_size]
 if args.block_size is not None:
     l_block_size = [args.block_size]
 if args.varlen is not None:
     l_varlen = [args.varlen]
+if args.qkv_len is not None:
+    l_qkv_len = [args.qkv_len]
+elif args.ctx_len is not None:
+    l_qkv_len = [(args.ctx_len, args.ctx_len)]
+else:
+    l_qkv_len = [(c, c) for c in l_ctx_len]
 # if args.causal is not None:
 #     l_causal = [args.causal]
-
-if args.profile:
-    l_ctx_len = [16384]
-    l_batch_size = [4, 16]
-    l_num_heads = [1]
 
 df = []
 for (
@@ -724,7 +749,6 @@ for (
     num_head,
     dtype,
     kv_dtype,
-    ctx_len,
     batch_size,
     block_size,
     varlen,
@@ -733,28 +757,30 @@ for (
     l_num_heads,
     l_dtype,
     l_kvdtype,
-    l_ctx_len,
     l_batch_size,
     l_block_size,
     l_varlen,
 ):
-    ret = test_mla_prefill(
-        ctx_len,
-        batch_size,
-        num_head,
-        args.qk_head_dim,
-        args.v_head_dim,
-        dtype,
-        kv_dtype,
-        block_size,
-        varlen,
-        is_causal,
-        load_metadata=args.load_metadata,
-        dump_metadata=args.dump_metadata,
-        profile_ps=args.profile,
-        skip_reference=args.skip_reference,
-    )
-    df.append(ret)
+    for max_qlen, max_kvlen in l_qkv_len:
+        ret = test_mla_prefill(
+            max_qlen,
+            max_kvlen,
+            batch_size,
+            num_head,
+            args.qk_head_dim,
+            args.v_head_dim,
+            dtype,
+            kv_dtype,
+            block_size,
+            varlen,
+            is_causal,
+            load_metadata=args.load_metadata,
+            dump_metadata=args.dump_metadata,
+            profile_ps=args.profile,
+            skip_reference=args.skip_reference,
+        )
+        df.append(ret)
+
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("mla_prefill_ps summary (markdown):\n%s", df_md)

@@ -199,16 +199,14 @@ void get_pa_metadata_v1(
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(pages_kv_indptr));
 
-    TORCH_CHECK((kv_granularity & (kv_granularity - 1)) == 0,
-                __func__, ": kv_granularity Must be power of 2!");
     TORCH_CHECK(seqlens_qo_indptr.stride(0) == 1,
                 __func__, ": seqlens_qo_indptr should be continuous!");
     TORCH_CHECK(seqlens_qo_indptr.scalar_type() == at::ScalarType::Int,
                 __func__, ": seqlens_qo_indptr's element type should be int!");
     TORCH_CHECK(pages_kv_indptr.stride(0) == 1,
-                __func__, ": seqlens_kv_indptr should be continuous!");
+                __func__, ": pages_kv_indptr should be continuous!");
     TORCH_CHECK(pages_kv_indptr.scalar_type() == at::ScalarType::Int,
-                __func__, ": seqlens_kv_indptr's element type should be int!");
+                __func__, ": pages_kv_indptr's element type should be int!");
 
     get_pa_metadata_v1_2_device(
         seqlens_qo_indptr,
@@ -239,7 +237,6 @@ void get_ps_metadata_v1(
     const torch::Tensor& context_lens,          // [batch size]
     const int32_t        gqa_ratio,
     const int32_t        num_heads_k,
-    torch::Tensor&       work_metadata_ptrs,
     torch::Tensor&       work_indptr,
     torch::Tensor&       work_info,
     torch::Tensor&       reduce_indptr,
@@ -252,17 +249,24 @@ void get_ps_metadata_v1(
     const bool           is_causal)
 {
     // const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(pages_kv_indptr));
+    TORCH_CHECK(seqlens_qo_indptr.is_cpu() & pages_kv_indptr.is_cpu() & context_lens.is_cpu() & work_indptr.is_cpu() & work_info.is_cpu() & reduce_indptr.is_cpu() & reduce_final_map.is_cpu() & reduce_partial_map.is_cpu(), __func__, ": all inputs must be a CPU tensor");
 
-    TORCH_CHECK((kvlen_granlarity & (kvlen_granlarity - 1)) == 0,
-                __func__, ": kvlen_granlarity Must be power of 2!");
     TORCH_CHECK(seqlens_qo_indptr.stride(0) == 1,
                 __func__, ": seqlens_qo_indptr should be continuous!");
     TORCH_CHECK(seqlens_qo_indptr.scalar_type() == at::ScalarType::Int,
                 __func__, ": seqlens_qo_indptr's element type should be int!");
     TORCH_CHECK(pages_kv_indptr.stride(0) == 1,
-                __func__, ": seqlens_kv_indptr should be continuous!");
+                __func__, ": pages_kv_indptr should be continuous!");
     TORCH_CHECK(pages_kv_indptr.scalar_type() == at::ScalarType::Int,
-                __func__, ": seqlens_kv_indptr's element type should be int!");
+                __func__, ": pages_kv_indptr's element type should be int!");
+    TORCH_CHECK(context_lens.stride(0) == 1,
+                __func__, ": context_lens should be continuous!");
+    TORCH_CHECK(context_lens.scalar_type() == at::ScalarType::Int,
+                __func__, ": context_lens's element type should be int!");
+    TORCH_CHECK(kvlen_granlarity % block_size == 0,
+                __func__, ": kvlen_granlarity must be divisible by block_size!");
+    TORCH_CHECK(qhead_granularity % gqa_ratio == 0,
+                __func__, ": qhead_granularity must be divisible by gqa_ratio!");
 
     get_ps_metadata_v1_2_host(
         seqlens_qo_indptr,
@@ -270,7 +274,6 @@ void get_ps_metadata_v1(
         context_lens,
         gqa_ratio,
         num_heads_k,
-        work_metadata_ptrs,
         work_indptr,
         work_info,
         reduce_indptr,
