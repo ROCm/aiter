@@ -15,4 +15,10 @@ cu_num,token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,
 256,8,2048,512,512,10,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,32,0,67.89,_ZN5aiter44fmoe_bf16_blockscaleBf16_g1u1_ps_silu_32x256E,0.0%,0.0,Null,0.0%,0,1,7.41,3452.27
 256,16,2048,512,512,10,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,32,0,122.28,_ZN5aiter44fmoe_bf16_blockscaleBf16_g1u1_ps_silu_32x256E,0.0%,0.0,Null,0.0%,0,1,8.23,3833.41
 256,32,2048,512,512,10,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,32,0,163,_ZN5aiter44fmoe_bf16_blockscaleBf16_g1u1_ps_silu_32x256E,0.0%,0.0,Null,0.0%,0,1,12.35,4601.22
+256,1,2048,128,512,10,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,32,0,39.72,_ZN5aiter44fmoe_bf16_blockscaleBf16_g1u1_ps_silu_32x128E,0.0%,0.0,Null,0.0%,0,1,0.4,184.39
+256,2,2048,128,512,10,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,32,0,40.45,_ZN5aiter44fmoe_bf16_blockscaleBf16_g1u1_ps_silu_32x128E,0.0%,0.0,Null,0.0%,0,1,0.75,362.14
+256,4,2048,128,512,10,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,32,0,42.53,_ZN5aiter44fmoe_bf16_blockscaleBf16_g1u1_ps_silu_32x128E,0.0%,0.0,Null,0.0%,0,1,1.48,688.85
+256,8,2048,128,512,10,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,32,0,46.16,_ZN5aiter44fmoe_bf16_blockscaleBf16_g1u1_ps_silu_32x128E,0.0%,0.0,Null,0.0%,0,1,2.73,1269.36
+256,16,2048,128,512,10,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,32,0,44.23,_ZN5aiter44fmoe_bf16_blockscaleBf16_g1u1_ps_silu_32x128E,0.0%,0.0,Null,0.0%,0,1,5.69,2710.79
+256,32,2048,128,512,10,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,32,0,50.39,_ZN5aiter44fmoe_bf16_blockscaleBf16_g1u1_ps_silu_32x128E,0.0%,0.0,Null,0.0%,0,1,9.99,3720.97
 
