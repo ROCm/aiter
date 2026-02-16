@@ -337,7 +337,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stri
             # If bias is added after multiplying qk with sm_scale,
             # our optimization to use 2^x instead of e^x results in an additional
             # scale factor of log2(e) which we must also multiply the bias with.
-            qk += bias # (bias * 1.44269504089 / QK_SCALE)
+            qk += bias #
 
         if alibi_slope is not None:
             # Compute the global position of each token within the sequence
@@ -346,11 +346,13 @@ def _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stri
             alibi_block = compute_alibi_block(alibi_slope, actual_seqlen_q, actual_seqlen_k, global_m_positions,
                                               global_n_positions)
             qk += (alibi_block * 1.44269504089 / QK_SCALE)  # scale factor of log2(e)
-
+        
         # softmax
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        m_ij_scaled = m_ij * QK_SCALE
-        qk = qk * QK_SCALE - m_ij_scaled[:, None]
+        # before
+        # m_ij_scaled = m_ij * QK_SCALE
+        # qk = qk * QK_SCALE - m_ij_scaled[:, None]
+        qk = qk - m_ij[:, None]
         p = tl.math.exp2(qk)
 
         # CAVEAT: Must update l_ij before applying dropout
@@ -364,7 +366,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stri
         elif RETURN_ENCODED_SOFTMAX:
             tl.store(encoded_sm_ptrs, p.to(encoded_sm_ptrs.type.element_ty))
         # -- update output accumulator --
-        alpha = tl.math.exp2(m_i * QK_SCALE - m_ij_scaled)
+        alpha = tl.math.exp2(m_i - m_ij)
         acc = acc * alpha[:, None]
         if not PRE_LOAD_V:
             v = load_fn(v_ptrs, k_offs_n, k_offs_k, actual_seqlen_k, ACTUAL_BLOCK_DMODEL)
@@ -418,7 +420,7 @@ def is_rdna():
 
 def get_fwd_configs():
     return {
-        'BLOCK_M': 256, 'BLOCK_N': 128, 'waves_per_eu': 2, 'PRE_LOAD_V': False, 'GRID_CU_MULTIP': 2, 'num_stages': 2, 'num_warps': 8
+        'BLOCK_M': 256, 'BLOCK_N': 128, 'waves_per_eu': 2, 'PRE_LOAD_V': False, 'GRID_CU_MULTIP': 1, 'num_stages': 2, 'num_warps': 8
     }
 
 
@@ -430,8 +432,8 @@ def attn_fwd(Q, K, V, bias, SM_SCALE: tl.constexpr, L, Out, stride_qz, stride_qh
              stride_vsz, stride_vsh, stride_vsn,
              Q_descale, K_descale, V_descale, cu_seqlens_q, cu_seqlens_k, dropout_p, philox_seed,
              PERSISTENT: tl.constexpr, PERSISTENT_DYNAMIC: tl.constexpr, atomic_counter, NUM_CU: tl.constexpr,
-             GRID_CU_MULTIP: tl.constexpr, B: tl.constexpr, philox_offset_base, encoded_softmax, alibi_slopes,
-             HQ: tl.constexpr, HK: tl.constexpr, ACTUAL_BLOCK_DMODEL: tl.constexpr, MAX_SEQLENS_Q: tl.constexpr,
+             GRID_CU_MULTIP: tl.constexpr, B, philox_offset_base, encoded_softmax, alibi_slopes,
+             HQ: tl.constexpr, HK: tl.constexpr, ACTUAL_BLOCK_DMODEL: tl.constexpr, MAX_SEQLENS_Q,
              MAX_SEQLENS_K: tl.constexpr, VARLEN: tl.constexpr, IS_CAUSAL: tl.constexpr, BLOCK_M: tl.constexpr,
              BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr, PRE_LOAD_V: tl.constexpr, USE_BIAS: tl.constexpr,
              ENABLE_DROPOUT: tl.constexpr, RETURN_ENCODED_SOFTMAX: tl.constexpr, USE_ALIBI: tl.constexpr):
@@ -1295,7 +1297,9 @@ def quantize_input(
     padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
 
 
-    q, k, bias = rotation_smooth_qk(q, k, BLKQ, block_size=padded_head_dim, q_smoothing=q_smoothing, layout=layout, sm_scale=None)
+
+
+    q, k, bias = rotation_smooth_qk(q, k, BLKQ, block_size=padded_head_dim, q_smoothing=q_smoothing, layout=layout, sm_scale=input_metadata.sm_scale*1.44269504089)
 
     sage_quant_v_kernel[grid](
         v,
