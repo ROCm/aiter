@@ -14,6 +14,50 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_int8_smoothquant import (
 
 
 # -----------------------------------------------------------------------------
+#                    Weight Preshuffling for MFMA
+# -----------------------------------------------------------------------------
+
+
+def preshuffle_weight(w: torch.Tensor) -> torch.Tensor:
+    """
+    Preshuffle int8 weight from (E, K, N) to MFMA-friendly layout (E, N//16, K*16).
+
+    Matches the shuffle_weight pattern from aiter.ops.shuffle for INT8:
+      layout=(16, 16), BK=32, K_lane=16, BN=16
+
+    The transformation:
+      1. Transpose to (E, N, K)
+      2. View as (E, N//16, 16, K//32, 2, 16) - decompose into MFMA tile blocks
+      3. Permute to (E, N//16, K//32, 2, 16, 16) - reorder for register layout
+      4. View as (E, N//16, K*16) - flatten K dimension
+
+    Args:
+        w: int8 weight tensor of shape (E, K, N) where
+           - E = number of experts
+           - K = input dimension (must be divisible by 32)
+           - N = output dimension (must be divisible by 16)
+
+    Returns:
+        Preshuffled weight tensor of shape (E, N//16, K*16)
+    """
+    assert w.dtype == torch.int8, f"Expected int8 weights, got {w.dtype}"
+    assert w.ndim == 3, f"Expected 3D weight tensor (E, K, N), got {w.ndim}D"
+    E, K, N = w.shape
+    assert K % 32 == 0, f"K ({K}) must be divisible by 32 for MFMA preshuffling"
+    assert N % 16 == 0, f"N ({N}) must be divisible by 16 for MFMA preshuffling"
+
+    # Transpose to (E, N, K) and ensure contiguous layout
+    w_nk = w.transpose(1, 2).contiguous()
+
+    # Decompose into MFMA tile blocks and reorder for register layout
+    w_shuffled = w_nk.view(E, N // 16, 16, K // 32, 2, 16)
+    w_shuffled = w_shuffled.permute(0, 1, 3, 4, 2, 5).contiguous()
+
+    # Flatten to (E, N//16, K*16)
+    return w_shuffled.view(E, N // 16, K * 16)
+
+
+# -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
 # -----------------------------------------------------------------------------
 
@@ -32,7 +76,7 @@ def should_upcast_indices(*args):
 
 def allocate_output(
     x,
-    w,
+    N,
     out_dtype,
     reduction_n_matmul,
     reduction_n_reduction,
@@ -42,8 +86,6 @@ def allocate_output(
     block_m,
     split_k,
 ):
-    # ---- output ------
-    N = w.shape[-1]
     # by default - M is number of rows in the activations
     M = x.shape[-2]
     # if the activations are gathered, then M is number of gather indices
@@ -66,7 +108,7 @@ def allocate_output(
     return matmul_output, final_output
 
 
-def get_kernel_config(m, n, k, routing_data):
+def get_kernel_config(m, n, k, preshuffle, routing_data):
     block_m = routing_data.block_m
     group_m = 4
     w_cache_modifier = ".cg" if block_m <= 32 else None
@@ -103,9 +145,9 @@ def get_kernel_config(m, n, k, routing_data):
         "group_m": group_m,
         "w_cache_modifier": w_cache_modifier,
         "split_k": split_k,
-        "waves_per_eu": 1,
+        "waves_per_eu": 0,
         "matrix_instr_nonkdim": 16,
-        "kpack": 1,
+        "kpack": 2 if preshuffle else 1,
     }
     return ret
 
@@ -207,6 +249,7 @@ def moe_gemm_int8_smoothquant(
     add_residual: bool = False,  # DouBao doesn't use residual addition
     alpha: float = 1.0,
     limit: float = 1.0,
+    preshuffle: bool = False,
 ):
     """
     Performs MoE matrix multiplication with int8 quantized inputs:
@@ -231,9 +274,18 @@ def moe_gemm_int8_smoothquant(
 
     # determine shapes
     M = x.shape[-2] if gather_indx is None else gather_indx.shape[0]
-    K, N = x.shape[-1], w.shape[-1]
+    K = x.shape[-1]
+    if preshuffle:
+        # Preshuffled weight has shape (E, N//16, K*16)
+        N = w.shape[1] * 16
+        assert w.shape[2] == K * 16, (
+            f"Preshuffled weight K dimension mismatch: "
+            f"w.shape[2]={w.shape[2]}, expected K*16={K*16}"
+        )
+    else:
+        N = w.shape[-1]
     # compute optimization flags
-    config = get_kernel_config(M, N, K, routing_data)
+    config = get_kernel_config(M, N, K, preshuffle, routing_data)
     if apply_activation:
         if config["split_k"] > 1:
             reduction_n_matmul = 1
@@ -249,7 +301,7 @@ def moe_gemm_int8_smoothquant(
     # allocate output memory
     y, y_final = allocate_output(
         x,
-        w,
+        N,
         out_dtype,
         reduction_n_matmul,
         reduction_n_reduction,
@@ -317,6 +369,10 @@ def moe_gemm_int8_smoothquant(
         num_warps=config["num_warps"],
         num_stages=config["num_stages"],
         UPCAST_INDICES=should_upcast_indices(x, w, y),
+        PRESHUFFLE=preshuffle,
+        waves_per_eu=config["waves_per_eu"],
+        matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
+        kpack=config["kpack"],
     )
     # Build grouped reduction inputs in a uniform way
     group_indx = (

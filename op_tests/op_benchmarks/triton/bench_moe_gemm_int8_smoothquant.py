@@ -8,6 +8,7 @@ import torch
 import argparse
 from aiter.ops.triton.moe.moe_op_gemm_int8_smoothquant import (
     moe_gemm_int8_smoothquant,
+    preshuffle_weight,
 )
 from aiter.ops.triton.moe.quant_moe import (
     smoothquant_quantize,
@@ -113,12 +114,18 @@ def bench_mlp_single_weight_init(
     fc2_smooth_scale = (
         torch.randn((dim2 // TP // 2,), device=dev, dtype=torch.float32).abs() + 0.1
     )
+    USE_PRESHUFFLE = True
 
     # -- numerics --
     w1_int8, w1_scale = quantize_weights_int8(w1)
     w2_int8, w2_scale = quantize_weights_int8(w2)
-    w1_int8 = w1_int8.transpose(1, 2).contiguous().transpose(1, 2)
-    w2_int8 = w2_int8.transpose(1, 2).contiguous().transpose(1, 2)
+    # Preshuffle weights for MFMA direct-to-register optimization
+    if USE_PRESHUFFLE:
+        w1_int8_ps = preshuffle_weight(w1_int8)
+        w2_int8_ps = preshuffle_weight(w2_int8)
+    else:
+        w1_int8 = w1_int8.transpose(1, 2).contiguous().transpose(1, 2)
+        w2_int8 = w2_int8.transpose(1, 2).contiguous().transpose(1, 2)
     # -- benchmark --
     reps = 100
     x = torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev)
@@ -134,7 +141,7 @@ def bench_mlp_single_weight_init(
         x, x_scale = smoothquant_quantize(x, fc1_smooth_scale)
         x = moe_gemm_int8_smoothquant(
             x,
-            w1_int8,
+            w1_int8_ps if USE_PRESHUFFLE else w1_int8,
             x_scale,
             w1_scale,
             b1,
@@ -144,11 +151,12 @@ def bench_mlp_single_weight_init(
             out_dtype=torch.float32,
             apply_activation=True,
             add_residual=True,
+            preshuffle=USE_PRESHUFFLE,
         )
         x, x_scale = smoothquant_quantize(x, fc2_smooth_scale)
         x = moe_gemm_int8_smoothquant(
             x,
-            w2_int8,
+            w2_int8_ps if USE_PRESHUFFLE else w2_int8,
             x_scale,
             w2_scale,
             b2,
@@ -158,6 +166,7 @@ def bench_mlp_single_weight_init(
             out_dtype=torch.bfloat16,
             apply_activation=False,
             add_residual=False,
+            preshuffle=USE_PRESHUFFLE,
         )
     proton.finalize()
     return parse_profile(
@@ -266,14 +275,17 @@ if __name__ == "__main__":
 
     dim1, dim2 = args.shape
     total_experts, active_experts = args.experts
+    # batch_ranges_moe = [
+    #     (1, 2, 1),
+    #     (2, 5, 2),
+    #     (8, 18, 8),
+    #     (32, 65, 32),
+    #     (128, 257, 128),
+    #     (1024, 1200, 200),
+    #     (4096, 8200, 4096),
+    # ]
     batch_ranges_moe = [
-        (1, 2, 1),
-        (2, 5, 2),
-        (8, 18, 8),
-        (32, 65, 32),
-        (128, 257, 128),
-        (1024, 1200, 200),
-        (4096, 8200, 4096),
+        (8192, 8200, 4096)
     ]
     batch_sizes_moe = list(chain(*[range(*r) for r in batch_ranges_moe]))
     quantized_dtypes = [torch.int8, torch.int8]

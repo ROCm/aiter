@@ -210,6 +210,7 @@ def _moe_gemm_int8_smoothquant(
     SPLIT_K: tl.constexpr,
     W_CACHE_MODIFIER: tl.constexpr,
     UPCAST_INDICES: tl.constexpr = False,
+    PRESHUFFLE: tl.constexpr = False,
 ):
     """
     Int8 MoE GEMM with SmoothQuant support and per-token per-channel scaling.
@@ -299,17 +300,32 @@ def _moe_gemm_int8_smoothquant(
     )
 
     # B pointers
-    offs_w_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_w_n = tl.max_contiguous(
-        tl.multiple_of(offs_w_n % N, BLOCK_N),
-        BLOCK_N,
-    )
-    offs_w_k = BLOCK_K * pid_k + tl.arange(0, BLOCK_K)
     W += expt_id * stride_w_e
-    WPtrs = W + (
-        offs_w_k.to(index_type)[:, None] * stride_w_k
-        + offs_w_n.to(index_type)[None, :] * stride_w_n
-    )
+    if PRESHUFFLE:
+        # Preshuffled weight layout: (E, N//16, K*16) stored contiguously.
+        # stride_w_k = stride for N-block dim (= K*16)
+        # stride_w_n = stride for K-flat dim (= 1, contiguous)
+        #
+        # Load as (BLOCK_N//16, BLOCK_K*16) with K*16 contiguous for coalesced access.
+        # Then reshape/permute/trans to recover logical (BLOCK_K, BLOCK_N).
+        offs_w_nblock = pid_n * (BLOCK_N // 16) + tl.arange(0, BLOCK_N // 16)
+        offs_w_nblock = offs_w_nblock % (N // 16)
+        offs_w_kflat = tl.arange(0, BLOCK_K * 16) + BLOCK_K * pid_k * 16
+        WPtrs = W + (
+            offs_w_nblock.to(index_type)[:, None] * stride_w_k
+            + offs_w_kflat.to(index_type)[None, :] * stride_w_n
+        )
+    else:
+        offs_w_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_w_n = tl.max_contiguous(
+            tl.multiple_of(offs_w_n % N, BLOCK_N),
+            BLOCK_N,
+        )
+        offs_w_k = BLOCK_K * pid_k + tl.arange(0, BLOCK_K)
+        WPtrs = W + (
+            offs_w_k.to(index_type)[:, None] * stride_w_k
+            + offs_w_n.to(index_type)[None, :] * stride_w_n
+        )
 
     num_k_iter = tl.cdiv(K, BLOCK_K * SPLIT_K)
     if not EVEN_K:
@@ -318,23 +334,39 @@ def _moe_gemm_int8_smoothquant(
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
     for k in range(num_k_iter):
         x = tl.load(XPtrs)
-        w = tl.load(WPtrs, cache_modifier=W_CACHE_MODIFIER)
+        if PRESHUFFLE:
+            # Load as (BLOCK_N//16, BLOCK_K*16) with K*16 contiguous
+            w = tl.load(WPtrs, cache_modifier=W_CACHE_MODIFIER)
+            # Reshape to recover logical (BLOCK_K, BLOCK_N) for tl.dot
+            # This is the inverse of the preshuffle permutation
+            w = (
+                w.reshape(1, BLOCK_N // 16, BLOCK_K // 32, 2, 16, 16)
+                .permute(0, 1, 4, 2, 3, 5)
+                .reshape(BLOCK_N, BLOCK_K)
+                .trans(1, 0)
+            )
+        else:
+            w = tl.load(WPtrs, cache_modifier=W_CACHE_MODIFIER)
 
         acc += tl.dot(x, w, input_precision="ieee")
 
         XPtrs += (BLOCK_K * SPLIT_K) * stride_x_k
-        WPtrs += (BLOCK_K * SPLIT_K) * stride_w_k
+        if PRESHUFFLE:
+            WPtrs += (BLOCK_K * SPLIT_K * 16) * stride_w_n
+        else:
+            WPtrs += (BLOCK_K * SPLIT_K) * stride_w_k
 
     if not EVEN_K:
-        mask_x_k = offs_x_k < MASK_K_LIMIT
-        mask_w_k = offs_w_k < MASK_K_LIMIT
+        if not PRESHUFFLE:
+            mask_x_k = offs_x_k < MASK_K_LIMIT
+            mask_w_k = offs_w_k < MASK_K_LIMIT
 
-        x = tl.load(XPtrs, mask=mask_x_k[None, :], other=0)
-        w = tl.load(
-            WPtrs, mask=mask_w_k[:, None], other=0, cache_modifier=W_CACHE_MODIFIER
-        )
+            x = tl.load(XPtrs, mask=mask_x_k[None, :], other=0)
+            w = tl.load(
+                WPtrs, mask=mask_w_k[:, None], other=0, cache_modifier=W_CACHE_MODIFIER
+            )
 
-        acc += tl.dot(x, w, input_precision="ieee")
+            acc += tl.dot(x, w, input_precision="ieee")
 
     # per-token activation scale
     offs_m = BLOCK_M * block_id + tl.arange(0, BLOCK_M)

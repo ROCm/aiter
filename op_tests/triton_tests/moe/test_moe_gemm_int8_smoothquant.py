@@ -18,6 +18,7 @@ from aiter.ops.triton.moe.quant_moe import (
 from aiter.ops.triton.moe.moe_op_gemm_int8_smoothquant import (
     moe_gemm_int8_smoothquant,
     moe_gemm_smoothquant_torch,
+    preshuffle_weight,
 )
 
 # Target-specific utilities
@@ -210,6 +211,7 @@ class Case:
 )
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_activation", [False, True])
+@pytest.mark.parametrize("use_preshuffle", [False, True])
 def test_op(
     m,
     n,
@@ -218,11 +220,20 @@ def test_op(
     do_scatter,
     has_y_gammas,
     apply_activation,
+    use_preshuffle,
     n_expts_tot,
     n_expts_act,
     device="cuda",
 ):
     torch.manual_seed(0)
+
+    # Skip preshuffle for shapes that don't meet requirements
+    if use_preshuffle and (k % 32 != 0 or n % 16 != 0):
+        pytest.skip(f"Preshuffle requires K%32==0 and N%16==0, got K={k}, N={n}")
+
+    block_k = 128  # default block_k from config
+    if use_preshuffle and (k % block_k != 0):
+        pytest.skip(f"Preshuffle requires K%BLOCK_K==0, got K={k}, BLOCK_K={block_k}")
 
     m, rdata, gindx, sindx = init_routing_data(
         m, n_expts_tot, n_expts_act, do_gather, do_scatter, device=device
@@ -265,9 +276,15 @@ def test_op(
         add_residual=apply_activation,
     )
 
+    # Apply preshuffle to weights if requested
+    if use_preshuffle:
+        w_kernel = preshuffle_weight(w_int8_tri)
+    else:
+        w_kernel = w_int8_tri
+
     tri_y = moe_gemm_int8_smoothquant(
         x_int8_tri,
-        w_int8_tri,
+        w_kernel,
         x_scale_tri,
         w_scale_tri,
         bias_tri,
@@ -278,5 +295,6 @@ def test_op(
         out_dtype,
         apply_activation=apply_activation,
         add_residual=apply_activation,
+        preshuffle=use_preshuffle,
     )
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
