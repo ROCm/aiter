@@ -385,7 +385,7 @@ def fused_moe_1stage(
             quant_type == QuantType.per_1x128
             and hidden_states.dtype == torch.bfloat16
             and q_dtype_a == torch.float8_e4m3fn
-        )
+        ) and ('blockscaleBf16' in kernelName or '' == kernelName)
         if skip_1x128_quant:
             # xquant happens inside the asm kernel for per_1x128
             a1 = hidden_states
@@ -445,7 +445,7 @@ def fused_moe_1stage(
             return moe_buf
 
         if quant_type == QuantType.per_1x128 and skip_1x128_quant and a1_scale is None:
-            a1_scale = torch.empty(1, dtype=dtypes.fp32, device=hidden_states.device)
+            a1_scale = torch.empty(0, dtype=dtypes.fp32, device=hidden_states.device)
 
         fmoe_func(
             moe_buf,
