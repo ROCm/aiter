@@ -223,6 +223,583 @@ def run_aiter_mla_reduce(
 
 
 @benchmark()
+def test_mla_prefill_triton_metadata(
+    ctx_lens: int,
+    batch_size: int,
+    num_head: int,
+    qk_head_dim: int,
+    v_head_dim: int,
+    dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    block_size: int,
+    varlen: bool = False,
+    is_causal: bool = True,
+    load_metadata: Optional[bool] = False,
+    dump_metadata: Optional[bool] = False,
+    profile_ps: Optional[bool] = False,
+    skip_reference: Optional[bool] = False,
+    use_triton_metadata: Optional[bool] = False,
+):
+    """
+    Test MLA prefill with optional Triton metadata generation.
+    When use_triton_metadata=True, uses GPU tensors directly without CPU transfer.
+    """
+    ret = {}
+    out_dtype = torch.bfloat16
+    device = "cuda:0"
+    torch.set_default_device(device)
+    num_head_q = num_head
+    num_head_kv = num_head
+    assert num_head_q % num_head_kv == 0
+    gqa_ratio = num_head_q // num_head_kv
+    softmax_scale = 1.0 / (qk_head_dim**0.5)
+
+    qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+    kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+    seq_lens_kv = torch.empty(batch_size, dtype=torch.int)
+    if varlen:
+        for i in range(batch_size):
+            seq_lens_kv[i] = max(
+                min(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens), 1
+            )
+    else:
+        seq_lens_kv.fill_(ctx_lens)
+    seq_lens_qo = seq_lens_kv.clone()
+    max_qlen = seq_lens_qo.max().item()
+
+    qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
+    actual_blocks = (seq_lens_kv + block_size - 1) // block_size
+    kv_indptr[1 : batch_size + 1] = torch.cumsum(actual_blocks, dim=0)
+    num_blocks = kv_indptr[-1].item()
+    kv_indices = torch.randint(0, num_blocks, (num_blocks,), dtype=torch.int)
+
+    num_tokens = qo_indptr[-1].item()
+    Q_bf16 = torch.randn((num_tokens, num_head_q, qk_head_dim), dtype=torch.bfloat16)
+    # block_size = 1
+    K_bf16 = torch.randn((num_blocks, num_head_kv, qk_head_dim), dtype=torch.bfloat16)
+    V_bf16 = K_bf16[:, :, :v_head_dim].contiguous()
+
+    q_quant, q_scale = per_tensor_quant(Q_bf16, quant_dtype=dtype)
+    k_quant, k_scale = per_tensor_quant(K_bf16, quant_dtype=kv_dtype)
+    v_quant, v_scale = per_tensor_quant(V_bf16, quant_dtype=kv_dtype)
+
+    tile_q = 256
+    tile_kv = 128
+    qhead_granularity = gqa_ratio
+    qlen_granularity = tile_q // qhead_granularity
+    # TODO: enhance pre-allocation, current too loose for large context length
+    kvlen_granularity = max(tile_kv, block_size)
+    (
+        (work_meta_data_size, work_meta_data_type),
+        (work_indptr_size, work_indptr_type),
+        (work_info_size, work_info_type),
+        (reduce_indptr_size, reduce_indptr_type),
+        (reduce_final_map_size, reduce_final_map_type),
+        (reduce_partial_map_size, reduce_partial_map_type),
+    ) = aiter.get_ps_metadata_info_v1(
+        batch_size=batch_size,
+        num_head_k=num_head_kv,
+        max_qlen=max_qlen,
+        qlen_granularity=qlen_granularity,
+    )
+    work_metadata_ptrs = torch.empty(
+        work_meta_data_size, dtype=work_meta_data_type, device=device
+    )
+    work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type, device=device)
+    work_info = torch.empty(work_info_size, dtype=work_info_type, device=device)
+    reduce_indptr = torch.empty(
+        reduce_indptr_size, dtype=reduce_indptr_type, device=device
+    )
+    reduce_final_map = torch.empty(
+        reduce_final_map_size, dtype=reduce_final_map_type, device=device
+    )
+    reduce_partial_map = torch.empty(
+        reduce_partial_map_size, dtype=reduce_partial_map_type, device=device
+    )
+
+    metadata_map = {
+        "qo_indptr": qo_indptr,
+        "kv_indptr": kv_indptr,
+        "seq_lens_kv": seq_lens_kv,
+        "work_indptr": work_indptr,
+        "work_info": work_info,
+        "reduce_indptr": reduce_indptr,
+        "reduce_final_map": reduce_final_map,
+        "reduce_partial_map": reduce_partial_map,
+    }
+
+    if load_metadata:
+        for name, meta in metadata_map.items():
+            file_name = f"{name}.bin"
+            shape = meta.shape
+            array = np.fromfile(file_name, dtype=np.uint32)
+            meta = torch.from_numpy(array).reshape(shape)
+            torch.set_printoptions(threshold=999999, linewidth=120)
+            print(f"==>load {name} from {file_name}:\n{meta}")
+    else:
+        if use_triton_metadata:
+            # Use Triton implementation with GPU tensors directly (no CPU transfer)
+            aiter.logger.info("Using Triton metadata generation (GPU tensors)")
+            # warmup for get_ps_metadata_v1
+            aiter.get_ps_metadata_v1(
+                qo_indptr,
+                kv_indptr,
+                seq_lens_kv,
+                gqa_ratio,
+                num_head_kv,
+                work_metadata_ptrs,
+                work_indptr,
+                work_info,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                qhead_granularity=qhead_granularity,
+                qlen_granularity=qlen_granularity,
+                kvlen_granularity=kvlen_granularity,
+                block_size=block_size,
+                is_causal=is_causal,
+            )
+            torch.cuda.synchronize()
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            aiter.get_ps_metadata_v1(
+                qo_indptr,
+                kv_indptr,
+                seq_lens_kv,
+                gqa_ratio,
+                num_head_kv,
+                work_metadata_ptrs,
+                work_indptr,
+                work_info,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                qhead_granularity=qhead_granularity,
+                qlen_granularity=qlen_granularity,
+                kvlen_granularity=kvlen_granularity,
+                block_size=block_size,
+                is_causal=is_causal,
+            )
+            end_event.record()
+            end_event.synchronize()
+            us_metadata = start_event.elapsed_time(end_event) * 1000  # ms to us
+        else:
+            # Original implementation with CPU tensors
+            qo_indptr_cpu = qo_indptr.to("cpu")
+            kv_indptr_cpu = kv_indptr.to("cpu")
+            seq_lens_kv_cpu = seq_lens_kv.to("cpu")
+            # warmup for get_ps_metadata_v1
+            aiter.get_ps_metadata_v1(
+                qo_indptr_cpu,
+                kv_indptr_cpu,
+                seq_lens_kv_cpu,
+                gqa_ratio,
+                num_head_kv,
+                work_metadata_ptrs,
+                work_indptr,
+                work_info,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                qhead_granularity=qhead_granularity,
+                qlen_granularity=qlen_granularity,
+                kvlen_granularity=kvlen_granularity,
+                block_size=block_size,
+                is_causal=is_causal,
+            )
+            torch.cuda.synchronize()
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            aiter.get_ps_metadata_v1(
+                qo_indptr_cpu,
+                kv_indptr_cpu,
+                seq_lens_kv_cpu,
+                gqa_ratio,
+                num_head_kv,
+                work_metadata_ptrs,
+                work_indptr,
+                work_info,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                qhead_granularity=qhead_granularity,
+                qlen_granularity=qlen_granularity,
+                kvlen_granularity=kvlen_granularity,
+                block_size=block_size,
+                is_causal=is_causal,
+            )
+            end_event.record()
+            end_event.synchronize()
+            us_metadata = start_event.elapsed_time(end_event) * 1000  # ms to us
+
+    if dump_metadata:
+        for name, meta in metadata_map.items():
+            file_name = f"{name}.bin"
+            torch.set_printoptions(threshold=99999999, linewidth=120)
+            print(f"==>dump {name} shape {meta.shape} to {file_name}:\n{meta}")
+            meta.cpu().numpy().astype(np.uint32).tofile(file_name)
+
+    output = torch.empty((num_tokens, num_head_q, v_head_dim), dtype=torch.bfloat16)
+
+    if profile_ps:
+        # pre-allocate final and partial output & lse
+        total_s, nhead, v_head_dim = output.shape
+
+        tile_q = 256
+        logits = torch.empty(
+            (reduce_partial_map.size(0) * tile_q, nhead, v_head_dim),
+            dtype=dtypes.fp32,
+            device=device,
+        )
+        attn_lse = torch.empty(
+            (reduce_partial_map.size(0) * tile_q, nhead),
+            dtype=dtypes.fp32,
+            device=device,
+        )
+        final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+
+        out_mla_prefill_asm, us_mla_prefill_asm = run_aiter_mla_prefill_asm(
+            q_quant,
+            k_quant,
+            v_quant,
+            output,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            work_indptr,
+            work_info,
+            max_qlen,
+            is_causal,
+            softmax_scale,
+            logits,
+            attn_lse,
+            q_scale,
+            k_scale,
+            v_scale,
+        )
+        output, logits, attn_lse = out_mla_prefill_asm
+
+        out_reduce, us_reduce = run_aiter_mla_reduce(
+            logits,
+            attn_lse,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            tile_q,
+            output,
+            final_lse,
+        )
+        output, final_lse = out_reduce
+        output = output.view(total_s, nhead, v_head_dim)
+
+        us_mla_prefill_ps = us_mla_prefill_asm + us_reduce
+        # calculate mla_prefill_ps kernel tflops
+        # for causal, only take the lower triangle(ops/2)
+        g_div = 2 if is_causal else 1
+        ops = (
+            2.0
+            * batch_size
+            * num_head_q
+            * ctx_len
+            * (qk_head_dim * ctx_len + v_head_dim * ctx_len)
+        ) / g_div
+        tflops_mla_prefill_asm = ops / us_mla_prefill_asm / (1e6)
+        # calulate reduce kernel bandwidth
+        # input: fp32 partial_out & partial_lse + int32 reduce_indptr, reduce_final_map & reduce_partial_map
+        # output: bf16 final_out & final_lse
+        allocate_input_bytes = (
+            logits.numel() * logits.element_size()
+            + attn_lse.numel() * attn_lse.element_size()
+            + reduce_indptr.numel() * reduce_indptr.element_size()
+            + reduce_final_map.numel() * reduce_final_map.element_size()
+            + reduce_partial_map.numel() * reduce_partial_map.element_size()
+        )
+        allocate_output_bytes = (
+            output.numel() * output.element_size()
+            + final_lse.numel() * final_lse.element_size()
+        )
+        allocate_bytes = allocate_input_bytes + allocate_output_bytes
+
+        effective_final_tiles = torch.argmax(reduce_indptr).item()
+        effective_partial_tiles = reduce_indptr[-1].item()
+        effective_input_bytes = (
+            effective_partial_tiles * qlen_granularity * num_head_q * (v_head_dim + 1)
+            + (effective_final_tiles + 1)
+            + (effective_final_tiles * 2)
+            + effective_partial_tiles
+        ) * 4
+        effective_output_bytes = (
+            effective_final_tiles * qlen_granularity * num_head_q * (v_head_dim + 1) * 2
+        )
+        effective_bytes = effective_input_bytes + effective_output_bytes
+        print(
+            f"effective_partial_tiles: {effective_partial_tiles}, allocate_partial_tiles: {reduce_partial_map.numel()}"
+        )
+        print(
+            f"effective_final_tiles: {effective_final_tiles}, allocate_final_tiles: {reduce_final_map.numel()}"
+        )
+        print(
+            f"effective_input_bytes: {effective_input_bytes}, allocate_input_bytes: {allocate_input_bytes}"
+        )
+        print(
+            f"effective_output_bytes: {effective_output_bytes}, allocate_output_bytes: {allocate_output_bytes}"
+        )
+        print(f"effective_bytes: {effective_bytes}, allocate_bytes: {allocate_bytes}")
+
+        reduce_bytes = effective_bytes
+        bw_reduce = (reduce_bytes / 1e12) / (us_reduce / (1e6))
+        # Store results
+        ret["us_metadata"] = us_metadata
+        ret["us_mla_prefill_ps"] = us_mla_prefill_ps
+        ret["us_mla_prefill_asm"] = us_mla_prefill_asm
+        ret["us_mla_prefill_asm_ratio"] = us_mla_prefill_asm / us_mla_prefill_ps
+        ret["tflops_mla_prefill_asm"] = tflops_mla_prefill_asm
+        ret["us_reduce"] = us_reduce
+        ret["us_reduce_ratio"] = us_reduce / us_mla_prefill_ps
+        ret["bw_reduce(TB/s)"] = bw_reduce if effective_final_tiles > 0 else 0
+    else:
+        _, us_aiter_asm = run_perftest(
+            aiter.mla.mla_prefill_ps_fwd,
+            q_quant,
+            k_quant,
+            v_quant,
+            output,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            work_indptr,
+            work_info,
+            max_qlen,
+            is_causal,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            softmax_scale,
+            q_scale,
+            k_scale,
+            v_scale,
+        )
+
+        ret["us_mla_prefill_ps"] = us_aiter_asm
+
+    if not skip_reference:
+        # TODO: optimize reference implementation(too slow for large context length)
+        kv_buffer = K_bf16.view(-1, num_head_kv, qk_head_dim)
+        out_ref, lse_ref = torch_mla_extend(
+            Q_bf16,
+            kv_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            softmax_scale,
+            kv_lora_rank=v_head_dim,
+            qk_rope_head_dim=qk_head_dim - v_head_dim,
+            dtype=out_dtype,
+            is_causal=is_causal,
+        )
+
+        err = checkAllclose(
+            out_ref,
+            output,
+            rtol=5e-2,
+            atol=5e-2,
+            msg="mla_prefill_ps    [torch vs aiter_asm]: us......",
+        )
+        if err == 0:
+            status = "passed"
+        elif 0 < err <= 0.05:
+            status = "warning"
+        else:
+            status = "failed"
+        ret["err fp8"] = err
+        ret["acc result"] = status
+
+    return ret
+
+
+def test_triton_vs_cpu_metadata():
+    """
+    Test that compares CPU-based metadata generation with Triton GPU-based metadata generation.
+    Ensures both implementations produce identical results.
+    """
+    aiter.logger.info("="*80)
+    aiter.logger.info("Testing Triton vs CPU metadata generation")
+    aiter.logger.info("="*80)
+    
+    device = "cuda:0"
+    torch.set_default_device(device)
+    
+    # Test parameters
+    batch_size = 4
+    ctx_lens = 512
+    num_head = 16
+    qk_head_dim = 192
+    v_head_dim = 128
+    block_size = 1
+    is_causal = True
+    
+    num_head_q = num_head
+    num_head_kv = num_head
+    gqa_ratio = num_head_q // num_head_kv
+    
+    # Setup tensors
+    qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+    kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+    seq_lens_kv = torch.full((batch_size,), ctx_lens, dtype=torch.int)
+    seq_lens_qo = seq_lens_kv.clone()
+    max_qlen = seq_lens_qo.max().item()
+    
+    qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
+    actual_blocks = (seq_lens_kv + block_size - 1) // block_size
+    kv_indptr[1 : batch_size + 1] = torch.cumsum(actual_blocks, dim=0)
+    
+    tile_q = 256
+    tile_kv = 128
+    qhead_granularity = gqa_ratio
+    qlen_granularity = tile_q // qhead_granularity
+    kvlen_granularity = max(tile_kv, block_size)
+    
+    # Get buffer sizes
+    (
+        (work_meta_data_size, work_meta_data_type),
+        (work_indptr_size, work_indptr_type),
+        (work_info_size, work_info_type),
+        (reduce_indptr_size, reduce_indptr_type),
+        (reduce_final_map_size, reduce_final_map_type),
+        (reduce_partial_map_size, reduce_partial_map_type),
+    ) = aiter.get_ps_metadata_info_v1(
+        batch_size=batch_size,
+        num_head_k=num_head_kv,
+        max_qlen=max_qlen,
+        qlen_granularity=qlen_granularity,
+    )
+    
+    # Allocate buffers for CPU version
+    work_metadata_ptrs_cpu = torch.empty(work_meta_data_size, dtype=work_meta_data_type, device=device)
+    work_indptr_cpu = torch.empty(work_indptr_size, dtype=work_indptr_type, device=device)
+    work_info_cpu = torch.empty(work_info_size, dtype=work_info_type, device=device)
+    reduce_indptr_cpu = torch.empty(reduce_indptr_size, dtype=reduce_indptr_type, device=device)
+    reduce_final_map_cpu = torch.empty(reduce_final_map_size, dtype=reduce_final_map_type, device=device)
+    reduce_partial_map_cpu = torch.empty(reduce_partial_map_size, dtype=reduce_partial_map_type, device=device)
+    
+    # Allocate buffers for Triton version
+    work_metadata_ptrs_triton = torch.empty(work_meta_data_size, dtype=work_meta_data_type, device=device)
+    work_indptr_triton = torch.empty(work_indptr_size, dtype=work_indptr_type, device=device)
+    work_info_triton = torch.empty(work_info_size, dtype=work_info_type, device=device)
+    reduce_indptr_triton = torch.empty(reduce_indptr_size, dtype=reduce_indptr_type, device=device)
+    reduce_final_map_triton = torch.empty(reduce_final_map_size, dtype=reduce_final_map_type, device=device)
+    reduce_partial_map_triton = torch.empty(reduce_partial_map_size, dtype=reduce_partial_map_type, device=device)
+    
+    # Run CPU version
+    aiter.logger.info("Running CPU-based metadata generation...")
+    qo_indptr_cpu_input = qo_indptr.to("cpu")
+    kv_indptr_cpu_input = kv_indptr.to("cpu")
+    seq_lens_kv_cpu_input = seq_lens_kv.to("cpu")
+    
+    aiter.get_ps_metadata_v1(
+        qo_indptr_cpu_input,
+        kv_indptr_cpu_input,
+        seq_lens_kv_cpu_input,
+        gqa_ratio,
+        num_head_kv,
+        work_metadata_ptrs_cpu,
+        work_indptr_cpu,
+        work_info_cpu,
+        reduce_indptr_cpu,
+        reduce_final_map_cpu,
+        reduce_partial_map_cpu,
+        qhead_granularity=qhead_granularity,
+        qlen_granularity=qlen_granularity,
+        kvlen_granularity=kvlen_granularity,
+        block_size=block_size,
+        is_causal=is_causal,
+    )
+    torch.cuda.synchronize()
+    aiter.logger.info("CPU-based metadata generation completed")
+    
+    # Run Triton version (GPU tensors directly)
+    aiter.logger.info("Running Triton GPU-based metadata generation...")
+    aiter.get_ps_metadata_v1(
+        qo_indptr,  # GPU tensor
+        kv_indptr,  # GPU tensor
+        seq_lens_kv,  # GPU tensor
+        gqa_ratio,
+        num_head_kv,
+        work_metadata_ptrs_triton,
+        work_indptr_triton,
+        work_info_triton,
+        reduce_indptr_triton,
+        reduce_final_map_triton,
+        reduce_partial_map_triton,
+        qhead_granularity=qhead_granularity,
+        qlen_granularity=qlen_granularity,
+        kvlen_granularity=kvlen_granularity,
+        block_size=block_size,
+        is_causal=is_causal,
+    )
+    torch.cuda.synchronize()
+    aiter.logger.info("Triton GPU-based metadata generation completed")
+    
+    # Compare results
+    aiter.logger.info("\nComparing results...")
+    
+    err_work_indptr = checkAllclose(
+        work_indptr_cpu,
+        work_indptr_triton,
+        rtol=0,
+        atol=0,
+        msg="work_indptr [CPU vs Triton]",
+    )
+    
+    err_work_info = checkAllclose(
+        work_info_cpu,
+        work_info_triton,
+        rtol=0,
+        atol=0,
+        msg="work_info [CPU vs Triton]",
+    )
+    
+    err_reduce_indptr = checkAllclose(
+        reduce_indptr_cpu,
+        reduce_indptr_triton,
+        rtol=0,
+        atol=0,
+        msg="reduce_indptr [CPU vs Triton]",
+    )
+    
+    err_reduce_final_map = checkAllclose(
+        reduce_final_map_cpu,
+        reduce_final_map_triton,
+        rtol=0,
+        atol=0,
+        msg="reduce_final_map [CPU vs Triton]",
+    )
+    
+    err_reduce_partial_map = checkAllclose(
+        reduce_partial_map_cpu,
+        reduce_partial_map_triton,
+        rtol=0,
+        atol=0,
+        msg="reduce_partial_map [CPU vs Triton]",
+    )
+    
+    total_err = err_work_indptr + err_work_info + err_reduce_indptr + err_reduce_final_map + err_reduce_partial_map
+    
+    if total_err == 0:
+        aiter.logger.info("\n" + "="*80)
+        aiter.logger.info("✓ All metadata tensors match exactly! Triton implementation is correct.")
+        aiter.logger.info("="*80)
+        return True
+    else:
+        aiter.logger.error("\n" + "="*80)
+        aiter.logger.error("✗ Metadata tensors do not match! Total error: %f", total_err)
+        aiter.logger.error("="*80)
+        return False
+
+
+@benchmark()
 def test_mla_prefill(
     ctx_lens: int,
     batch_size: int,
@@ -239,6 +816,24 @@ def test_mla_prefill(
     profile_ps: Optional[bool] = False,
     skip_reference: Optional[bool] = False,
 ):
+    # Delegate to the new function with use_triton_metadata=False (original behavior)
+    return test_mla_prefill_triton_metadata(
+        ctx_lens,
+        batch_size,
+        num_head,
+        qk_head_dim,
+        v_head_dim,
+        dtype,
+        kv_dtype,
+        block_size,
+        varlen,
+        is_causal,
+        load_metadata,
+        dump_metadata,
+        profile_ps,
+        skip_reference,
+        use_triton_metadata=False,
+    )
     ret = {}
     out_dtype = torch.bfloat16
     device = "cuda:0"
@@ -717,6 +1312,16 @@ if args.profile:
     l_ctx_len = [16384]
     l_batch_size = [4, 16]
     l_num_heads = [1]
+
+# Run Triton vs CPU metadata comparison test first
+aiter.logger.info("\n" + "="*80)
+aiter.logger.info("Running Triton vs CPU metadata comparison test")
+aiter.logger.info("="*80 + "\n")
+triton_test_passed = test_triton_vs_cpu_metadata()
+if not triton_test_passed:
+    aiter.logger.error("Triton metadata test FAILED! Exiting...")
+    sys.exit(1)
+aiter.logger.info("\n")
 
 df = []
 for (

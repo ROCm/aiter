@@ -344,7 +344,13 @@ def get_ps_metadata_v1_triton(
     
     All operations are performed on GPU without CPU transfers.
     """
-    device = seqlens_qo_indptr.device
+    # Determine GPU device from output tensors (they should be on GPU)
+    # If input tensors are on CPU, we'll move them to the GPU device
+    device = work_indptr.device
+    if device.type == 'cpu':
+        # If outputs are on CPU too, default to cuda:0
+        device = torch.device('cuda:0')
+    
     batch_size = seqlens_qo_indptr.shape[0] - 1
     
     # Ensure all inputs are on GPU
@@ -535,16 +541,24 @@ def get_ps_metadata_v1_triton(
     final_idx = 0
     
     for (qo_start, qo_end), partial_locs in splits_map.items():
+        if final_idx >= reduce_final_map.shape[0]:
+            # Buffer overflow protection
+            break
+            
         reduce_final_map[final_idx, 0] = qo_start
         reduce_final_map[final_idx, 1] = qo_end
         
         for partial_loc in partial_locs:
+            if partial_idx >= reduce_partial_map.shape[0]:
+                # Buffer overflow protection
+                break
             reduce_partial_map[partial_idx] = partial_loc
             partial_idx += 1
         
-        reduce_indptr[final_idx + 1] = partial_idx
+        if final_idx + 1 < reduce_indptr.shape[0]:
+            reduce_indptr[final_idx + 1] = partial_idx
         final_idx += 1
     
     # Fill remaining reduce_indptr
-    for i in range(final_idx + 1, reduce_indptr.shape[0]):
+    for i in range(min(final_idx + 1, reduce_indptr.shape[0]), reduce_indptr.shape[0]):
         reduce_indptr[i] = partial_idx
