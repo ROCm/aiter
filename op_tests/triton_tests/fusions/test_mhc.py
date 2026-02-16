@@ -943,9 +943,7 @@ def test_sk_identity_initialization():
 
     # Output should be close to identity
     identity = (
-        torch.eye(N, device="cuda", dtype=torch.float32)
-        .unsqueeze(0)
-        .expand(M, -1, -1)
+        torch.eye(N, device="cuda", dtype=torch.float32).unsqueeze(0).expand(M, -1, -1)
     )
     torch.testing.assert_close(
         out.to(torch.float32),
