@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2018-2026, Advanced Micro Devices, Inc. All rights reserved.
 #!/bin/sh
 EXE="$(find . -name bwd.exe -type f | head -n 1)"
 KNAME=1
@@ -59,8 +59,7 @@ run_swa_tests() {
     for hdim in 72 96 128 ; do
     for mask in "t:-1,10" "t:15,-1" "t:15,15" "t:190,187" "b:-1,10" "b:15,-1" "b:15,15" "b:190,187" ; do
 
-    $EXE -prec=$prec -b=2 -h=4 -h_k=2 -d=$hdim -s=$seqlen_q -s_k=$seqlen_k -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -mode=0 -kname=$KNAME $COMMON_ARGS
-    $EXE -prec=$prec -b=1 -h=3 -h_k=1 -d=$hdim -s=$seqlen_q -s_k=$seqlen_k -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -mode=0 -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=$prec -b=2 -h=3 -h_k=1 -d=$hdim -s=$seqlen_q -s_k=$seqlen_k -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -mode=0 -kname=$KNAME $COMMON_ARGS
     $EXE -prec=$prec -b=2 -h=2 -d=$hdim -s=$seqlen_q -s_k=$seqlen_k -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -mode=0 -kname=$KNAME $COMMON_ARGS
 
     done
@@ -175,11 +174,11 @@ run_gfx950_hd192_128_bwd_v3() {
     done
 }
 
-# run_batch_mode_tests
-# run_group_mode_tests
-# run_swa_tests
-run_gfx950_group_bwd_v3
-run_gfx950_bwd_v3
+run_batch_mode_tests
+run_group_mode_tests
+run_swa_tests
+# run_gfx950_group_bwd_v3
+# run_gfx950_bwd_v3
 
 # hdim 192+128 tests
-run_gfx950_hd192_128_bwd_v3
+# run_gfx950_hd192_128_bwd_v3
