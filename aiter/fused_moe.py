@@ -523,9 +523,7 @@ def nextPow2(n):
 
 def get_padded_M(M):
     padded_m = M
-    if M >= 1 and M <= 16:
-        padded_m = 16
-    elif M < 1024:
+    if M < 1024:
         padded_m = nextPow2(padded_m)
     else:
         padded_m = 1024
@@ -650,7 +648,8 @@ def get_2stage_cfgs(
             doweight_stage1,
         ) in fused_moe_1stage_dict[get_gfx()]:
             if q_type == QuantType.per_1x128:
-                run_1stage = True and (inter_dim % 256 == 0)
+                # for fp8 blockscale, ck has better performance so disable assembly kernel
+                run_1stage = token > 32 and (inter_dim % 128 == 0)
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
