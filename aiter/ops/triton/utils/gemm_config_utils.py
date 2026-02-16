@@ -71,6 +71,14 @@ def _get_gemm_config_cached(
         _get_gemm_config_cached._config_cache = {}
 
     dev = arch_info.get_arch()
+
+    dev_fallback_map = {
+        "gfx1101": "gfx1100",
+        "gfx1200": "gfx1201",
+    }
+    if (dev in dev_fallback_map) and \
+        not os.path.exists(f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}.json"):
+        dev = dev_fallback_map[dev]
     cache_key = f"{dev}_{config_name}"
 
     if cache_key not in _get_gemm_config_cached._config_cache:

@@ -136,7 +136,7 @@ def gemm_afp4wfp4_(
         f"GEMM_AFPWFP4: x.shape={tuple(x.shape)} w.shape={tuple(w.shape)} x_scale={tuple(x_scales.shape)} w_scale={tuple(w_scales.shape)} "
     )
 
-    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
+    emu = arch_info.get_arch() in ("gfx1200", "gfx1201")
 
     M, K = x.shape
     N, K = w.shape
@@ -212,6 +212,7 @@ def gemm_afp4wfp4_(
         x_scales.stride(1),
         w_scales.stride(0),
         w_scales.stride(1),
+        emu,
         **config,
     )
 
