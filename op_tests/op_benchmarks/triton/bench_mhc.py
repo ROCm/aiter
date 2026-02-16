@@ -39,6 +39,7 @@ logging.basicConfig(
     level=logging.INFO, format="[%(name)s] %(levelname)s: %(message)s", force=True
 )
 
+
 def get_benchmark_configs(args):
     """Generate list of benchmark configurations based on args."""
     configs = []
@@ -223,6 +224,7 @@ def run_benchmark(args):
 
         # Create benchmark function
         if mode == "mhc":
+
             def fn():
                 return mhc(
                     x,
@@ -237,7 +239,9 @@ def run_benchmark(args):
                     hres_mode="sinkhorn",
                     sinkhorn_iters=sinkhorn_iters,
                 )
+
         elif mode == "mhc_lite":
+
             def fn():
                 return mhc(
                     x,
@@ -251,6 +255,7 @@ def run_benchmark(args):
                     n_streams,
                     hres_mode="lite",
                 )
+
         elif mode == "sinkhorn_knopp_only":
             # Sinkhorn-only: benchmark just the Sinkhorn-Knopp kernel
             # Pre-generate H_res for fair comparison (use sinkhorn mode for raw logits)
@@ -270,6 +275,7 @@ def run_benchmark(args):
                 hres_mode="sinkhorn",
             )
             H_res_3d = H_res_input.view(M, n, n)
+
             def fn():
                 return sinkhorn_knopp(
                     H_res_3d, C=C, num_iters=sinkhorn_iters, out=H_res_3d
