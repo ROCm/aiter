@@ -1657,7 +1657,7 @@ def create_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
 def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing=False, sm_scale=None, layout="bhsd"):
     # Generate Hadamard Matrix R (Rank 32)
     # TODO we might want to manually define this matrix
-    R = create_hadamard_matrix(block_size, dtype=q.dtype)
+    R = create_hadamard_matrix(block_size, dtype=q.dtype) / (block_size**0.5)
     # R = create_random_hadamard_matrix(block_size, dtype=q.dtype)
     bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
 
