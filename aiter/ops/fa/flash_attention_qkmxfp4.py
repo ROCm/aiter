@@ -321,14 +321,15 @@ def _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stri
             causal_mask = OFFS_M[:, None] >= causal_boundary[None, :]
             qk = tl.where(causal_mask, qk, float("-inf"))
         # -- compute qk in mxfp4 ----
-        qk += tl.dot_scaled(
+        qk = tl.dot_scaled(
                 q,
                 q_descale,
                 "e2m1",
                 k,
                 k_descale,
                 "e2m1",
-                fast_math=True
+                fast_math=True,
+                acc=qk
             )
 
         if bias_ptrs is not None:
