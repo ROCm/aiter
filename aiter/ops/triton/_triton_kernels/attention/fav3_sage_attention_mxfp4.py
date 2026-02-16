@@ -1599,10 +1599,11 @@ def create_random_hadamard_matrix(block_size, device="cuda", dtype=torch.float32
     H = create_hadamard_matrix(block_size, dtype=dtype) / (block_size**0.5)
     # 2. Create the random diagonal matrix D (represented as a vector for efficiency)
     # This generates random +1 or -1 for each column
-    random_signs = torch.randint(0, 2, (block_size,), device=device, dtype=torch.int) * 2 - 1
-    # 3. Apply the random signs (H @ D)
-    # Multiplying by a diagonal matrix on the right is equivalent to scaling columns
-    H_tilde = H * random_signs
+    # compute the randomized Hadamard
+    d = torch.randint(0, 2, (block_size,), device=device, dtype=dtype) * 2 - 1
+    # 3. Compute the randomized Hadamard H_tilde = H @ diag(d)
+    # Multiplying H by a diagonal matrix on the right scales the columns
+    H_tilde = H * d[None, :]
     return H_tilde
 
 
@@ -1726,7 +1727,7 @@ def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing=False,
     )
 
     # smooth k after rotation
-    K_rot = K_rot - K_rot.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
+    # K_rot = K_rot - K_rot.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
 
     if q_smoothing:
         # 3. Compute Smoothing Delta S
