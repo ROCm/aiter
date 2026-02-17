@@ -926,7 +926,7 @@ def sage_fwd_mxfp4(
     v_descale_ptrs = (
         v_descale_offset + offs_n_v_s[None, :] * stride_vsn + offs_d_v[:, None]
     )
-    p_descale_ptrs = P_Mock_Descale + offs_m[:, None] * BLOCK_N_V_S + offs_n_v_s[None, :]
+    p_descale_ptrs = P_Mock_Descale + tl.arange(0, BLOCK_M)[:, None] * BLOCK_N_V_S + offs_n_v_s[None, :]
     
     if USE_Q_SMOOTHING:
         delta_s_offset = (
