@@ -53,6 +53,7 @@ def _sage_fwd_no_mask_mxfp4(
     stride_ksn,
     stride_vsn,
     V_N_DIM_DIVISOR: tl.constexpr,
+    SCALE_GROUP_SIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     PRE_LOAD_V: tl.constexpr,
@@ -66,6 +67,7 @@ def _sage_fwd_no_mask_mxfp4(
     RETURN_SCORES: tl.constexpr,
     Q_DTYPE_STR: tl.constexpr,
     K_DTYPE_STR: tl.constexpr,
+    V_DTYPE_STR: tl.constexpr,
     ACCUMULATOR_TYPE: tl.constexpr,
     USE_Q_SMOOTHING: tl.constexpr,
     USE_BIAS: tl.constexpr
@@ -76,7 +78,7 @@ def _sage_fwd_no_mask_mxfp4(
         k_ptrs = k_base_ptrs + start_n * stride_kn
         v_ptrs = v_base_ptrs + start_n // V_N_DIM_DIVISOR * stride_vk
         k_descale_ptrs = k_descale_base_ptrs + start_n * stride_ksn
-        v_descale_ptrs = v_descale_base_ptrs + (start_n // 32) * stride_vsn
+        v_descale_ptrs = v_descale_base_ptrs + (start_n // SCALE_GROUP_SIZE) * stride_vsn
         
         if USE_Q_SMOOTHING:
             delta_s_ptrs = delta_s_base_ptrs + start_n
@@ -230,7 +232,7 @@ def _sage_fwd_no_mask_mxfp4(
         l_i = l_i * alpha + l_ij
         m_i = m_ij
 
-        acc = tl.dot_scaled(p.to(tl.float8e4nv), p_descale, "e4m3", v, v_descale, "e2m1", acc=acc, fast_math=True)
+        acc = tl.dot_scaled(p.to(tl.float8e4nv), p_descale, "e4m3", v, v_descale, V_DTYPE_STR, acc=acc, fast_math=True)
 
     return acc, l_i, m_i
 
@@ -276,6 +278,7 @@ def _sage_fwd_mask_mxfp4(
     stride_ksn,
     stride_vsn,
     V_N_DIM_DIVISOR: tl.constexpr,
+    SCALE_GROUP_SIZE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -293,6 +296,7 @@ def _sage_fwd_mask_mxfp4(
     WINDOW_SIZE_RIGHT: tl.constexpr,
     Q_DTYPE_STR: tl.constexpr,
     K_DTYPE_STR: tl.constexpr,
+    V_DTYPE_STR: tl.constexpr,
     ACCUMULATOR_TYPE: tl.constexpr,
     USE_Q_SMOOTHING: tl.constexpr,
     USE_BIAS: tl.constexpr
@@ -305,7 +309,7 @@ def _sage_fwd_mask_mxfp4(
         k_ptrs = k_base_ptrs + start_n * stride_kn
         v_ptrs = v_base_ptrs + start_n // V_N_DIM_DIVISOR * stride_vk
         k_descale_ptrs = k_descale_base_ptrs + start_n * stride_ksn
-        v_descale_ptrs = v_descale_base_ptrs + (start_n // 32) * stride_vsn
+        v_descale_ptrs = v_descale_base_ptrs + (start_n // SCALE_GROUP_SIZE) * stride_vsn
         if USE_Q_SMOOTHING:
             delta_s_ptrs = delta_s_base_ptrs + start_n
 
@@ -313,7 +317,7 @@ def _sage_fwd_mask_mxfp4(
         # we load all BLOCK_N. For others, the blocks are all within range.
         k_offs_n = start_n + tl.arange(0, BLOCK_N)
         v_offs_n = (start_n // V_N_DIM_DIVISOR) + tl.arange(0, BLOCK_N // V_N_DIM_DIVISOR)
-        vs_off = tl.arange(0, BLOCK_N // 32)
+        vs_off = tl.arange(0, BLOCK_N // SCALE_GROUP_SIZE)
         k_mask = k_offs_n[None, :] < seqlen_k
         v_mask = v_offs_n[:, None] < seqlen_k // V_N_DIM_DIVISOR
         if PADDED_HEAD_QK:
@@ -624,7 +628,7 @@ def _sage_fwd_mask_mxfp4(
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
         m_i = m_ij
-        acc = tl.dot_scaled(p.to(tl.float8e4nv), p_descale, "e4m3", v, v_descale, "e2m1", acc=acc, fast_math=True)
+        acc = tl.dot_scaled(p.to(tl.float8e4nv), p_descale, "e4m3", v, v_descale, V_DTYPE_STR, acc=acc, fast_math=True)
 
     return acc, l_i, m_i
 
@@ -1010,6 +1014,7 @@ def sage_fwd_mxfp4(
             stride_ksn,
             stride_vsn,
             V_N_DIM_DIVISOR,
+            SCALE_GROUP_SIZE,
             IS_CAUSAL,
             BLOCK_M,
             BLOCK_N,
@@ -1027,6 +1032,7 @@ def sage_fwd_mxfp4(
             WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
             Q_DTYPE_STR=Q_DTYPE_STR,
             K_DTYPE_STR=K_DTYPE_STR,
+            V_DTYPE_STR=V_DTYPE_STR,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
             USE_Q_SMOOTHING=USE_Q_SMOOTHING,
             USE_BIAS=USE_BIAS
@@ -1077,6 +1083,7 @@ def sage_fwd_mxfp4(
             stride_ksn,
             stride_vsn,
             V_N_DIM_DIVISOR,
+            SCALE_GROUP_SIZE,
             BLOCK_M,
             BLOCK_N,
             PRE_LOAD_V,
@@ -1090,6 +1097,7 @@ def sage_fwd_mxfp4(
             RETURN_SCORES=RETURN_SCORES,
             Q_DTYPE_STR=Q_DTYPE_STR,
             K_DTYPE_STR=K_DTYPE_STR,
+            V_DTYPE_STR=V_DTYPE_STR,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
             USE_Q_SMOOTHING=USE_Q_SMOOTHING,
             USE_BIAS=USE_BIAS
@@ -1147,6 +1155,7 @@ def sage_fwd_mxfp4(
             stride_ksn,
             stride_vsn,
             V_N_DIM_DIVISOR,
+            SCALE_GROUP_SIZE,
             IS_CAUSAL,  # Use actual causal flag
             BLOCK_M,
             BLOCK_N,
@@ -1164,6 +1173,7 @@ def sage_fwd_mxfp4(
             WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
             Q_DTYPE_STR=Q_DTYPE_STR,
             K_DTYPE_STR=K_DTYPE_STR,
+            V_DTYPE_STR=V_DTYPE_STR,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
             USE_Q_SMOOTHING=USE_Q_SMOOTHING,
             USE_BIAS=USE_BIAS
