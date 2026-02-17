@@ -39,6 +39,7 @@ class AttentionConfig:
     p_layout: gl.constexpr
 
     # Blocked layouts for global-to-shared loads
+    blocked_q: gl.constexpr
     blocked_k: gl.constexpr
     blocked_v: gl.constexpr
 
@@ -111,6 +112,12 @@ class AttentionConfig:
             threads_per_warp=[HEAD_SIZE_DIV, WARP_SIZE // HEAD_SIZE_DIV],
             warps_per_cta=[1, NUM_WARPS],
             order=[0, 1],
+        ))
+        self.blocked_q = gl.constexpr(gl.BlockedLayout(
+            size_per_thread=[1, 8],
+            threads_per_warp=[16, 4],
+            warps_per_cta=[NUM_WARPS, 1],
+            order=[1, 0],
         ))
 
         # Swizzled shared memory layouts for K and V
@@ -336,8 +343,8 @@ class AttentionProgram:
     @gluon.jit
     def store_output(self, out, q_block_local_idx, cur_batch_in_all_start_index, kv_head_idx, 
     cur_batch_query_len, output_stride_0, output_stride_1):
-        offs_m_out = gl.arange(0, self.cfg.BLOCK_M, layout=gl.SliceLayout(1, self.cfg.pv_layout))
-        offs_d_out = gl.arange(0, self.cfg.HEAD_SIZE, layout=gl.SliceLayout(0, self.cfg.pv_layout))
+        offs_m_out = gl.arange(0, self.cfg.BLOCK_M, layout=gl.SliceLayout(1, self.cfg.blocked_q))
+        offs_d_out = gl.arange(0, self.cfg.HEAD_SIZE, layout=gl.SliceLayout(0, self.cfg.blocked_q))
 
         query_pos_out = q_block_local_idx * self.cfg.BLOCK_Q + offs_m_out // self.cfg.NUM_QUERIES_PER_KV
         query_offset_0_out = cur_batch_in_all_start_index + query_pos_out
@@ -351,6 +358,7 @@ class AttentionProgram:
         query_mask_1_out = query_offset_1_out < self.cfg.NUM_QUERY_HEADS
         o_mask = query_mask_0_out[:, None] & query_mask_1_out[:, None]
         casted_out = out.to(self.output_ptr.dtype.element_ty)
+        casted_out = gl.convert_layout(casted_out, self.cfg.blocked_q)
         if self.cfg.USE_STORE_BUFFER_OP:
             gl.amd.cdna4.buffer_store(casted_out, self.output_ptr, o_offs, mask=o_mask)
         else:
