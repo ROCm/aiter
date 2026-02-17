@@ -304,6 +304,8 @@ def select_3d_config(
         # With async_copy pipelined, use_swizzle should always be True
         attn_impl = gluon_kernel_unified_attention_3d_async
         layouts = make_layout_3d(*hyper_parms, use_tdm, use_swizzle=True)
+        # TODO: add heuristics for use_buffer_load
+        layouts["use_buffer_load"] = False
     else:
         # Baseline kernel, num_stages does not matter, use_swizzle can be either True or False
         attn_impl = gluon_kernel_unified_attention_3d

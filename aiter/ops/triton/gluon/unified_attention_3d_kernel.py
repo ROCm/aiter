@@ -1,5 +1,6 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+from re import T
 import triton
 import triton.language as tl
 import torch
@@ -1551,20 +1552,23 @@ def _async_load_to_lds(
     mask,
     num_stages: ttgl.constexpr,
     cache_modifier: ttgl.constexpr,
+    use_buffer_load: ttgl.constexpr = False,
 ):
-    ttgl.amd.cdna4.async_copy.global_load_to_shared(
-        dest=dest.index(producer % num_stages),
-        ptr=ptr + offsets,
-        mask=mask,
-        cache_modifier=cache_modifier,
-    )
-    # ttgl.amd.cdna4.async_copy.buffer_load_to_shared(
-    #     dest=dest.index(producer % num_stages),
-    #     ptr=ptr,
-    #     offsets=offsets.to(ttgl.int32),
-    #     mask=mask,
-    #     cache_modifier=cache_modifier,
-    # )
+    if use_buffer_load:
+        ttgl.amd.cdna4.async_copy.buffer_load_to_shared(
+            dest=dest.index(producer % num_stages),
+            ptr=ptr,
+            offsets=offsets.to(ttgl.int32),
+            mask=mask,
+            cache_modifier=cache_modifier,
+        )
+    else:
+        ttgl.amd.cdna4.async_copy.global_load_to_shared(
+            dest=dest.index(producer % num_stages),
+            ptr=ptr + offsets,
+            mask=mask,
+            cache_modifier=cache_modifier,
+        )
     ttgl.amd.cdna4.async_copy.commit_group()
     return producer + 1
 
@@ -1732,6 +1736,7 @@ def gluon_kernel_unified_attention_3d_async(
     V_SHARED_LAYOUT: ttgl.constexpr,
     Q_BLOCKED_LAYOUT: ttgl.constexpr,
     K_BLOCKED_LAYOUT: ttgl.constexpr,
+    use_buffer_load: ttgl.constexpr = True,
     ALL_DECODE: ttgl.constexpr = False,  # bool
 ):
     q_block_global_idx = ttgl.program_id(0)
@@ -1924,6 +1929,7 @@ def gluon_kernel_unified_attention_3d_async(
             mask=dim_mask[:, None] & tile_k_mask[None, :],
             num_stages=num_stages,
             cache_modifier=KV_cache_modifier,
+            use_buffer_load=use_buffer_load,
         )
         v_producer = _async_load_to_lds(
             v_producer,
@@ -1933,6 +1939,7 @@ def gluon_kernel_unified_attention_3d_async(
             mask=dim_mask[None, :] & tile_v_mask[:, None],
             num_stages=num_stages,
             cache_modifier=KV_cache_modifier,
+            use_buffer_load=use_buffer_load,
         )
 
     # iterate through tiles within current segment
@@ -1971,6 +1978,7 @@ def gluon_kernel_unified_attention_3d_async(
                 mask=dim_mask[:, None] & tile_k_mask[None, :],
                 num_stages=num_stages,
                 cache_modifier=KV_cache_modifier,
+                use_buffer_load=use_buffer_load,
             )
 
             # V_load : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = Q_BLOCKED_LAYOUT
@@ -1982,6 +1990,7 @@ def gluon_kernel_unified_attention_3d_async(
                 mask=dim_mask[None, :] & tile_v_mask[:, None],
                 num_stages=num_stages,
                 cache_modifier=KV_cache_modifier,
+                use_buffer_load=use_buffer_load,
             )
 
         if j_consumer < num_tiles:
@@ -2054,7 +2063,8 @@ def gluon_kernel_unified_attention_3d_async(
                 Q.dtype,
                 smem_K,
                 layout=K_DOT_LAYOUT,
-                wait_group=(num_stages - 1) * 2 + 1,
+                wait_group=(num_stages - 2) * 2
+                + 1,  # there is no async_copy in the epilogue, hence num_stages - 2
                 num_stages=num_stages,
             )
 
@@ -2097,7 +2107,8 @@ def gluon_kernel_unified_attention_3d_async(
                 Q.dtype,
                 smem_V,
                 layout=V_DOT_LAYOUT,
-                wait_group=(num_stages - 1) * 2,
+                wait_group=(num_stages - 2)
+                * 2,  # there is no async_copy in the epilogue, hence num_stages - 2
                 num_stages=num_stages,
             )
 
