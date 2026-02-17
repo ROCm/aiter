@@ -153,6 +153,9 @@ def test_triton_unified_attn(
     if DEVICE_ARCH not in ("gfx1250",) and use_tdm == True:
         pytest.skip(f"{DEVICE_ARCH} does not have TDM")
 
+    # if head_size > 32:
+    #     pytest.skip("skip")
+
     if use_tdm and num_tdm_gather > 1:
         if head_size > 32:
             pytest.skip("skipping test for head size > 32 and TDM gather cases")
