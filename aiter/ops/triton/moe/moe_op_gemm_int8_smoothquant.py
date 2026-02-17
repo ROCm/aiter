@@ -78,6 +78,7 @@ def get_kernel_config(m, n, k, routing_data):
         block_k = 256
         num_warps = 4
         num_stages = 1
+        kpack = 2
 
         grid_m = routing_data.n_blocks(m, block_m)
         grid_n = triton.cdiv(n, block_n)
@@ -92,6 +93,7 @@ def get_kernel_config(m, n, k, routing_data):
         block_k = 128
         num_warps = 8
         num_stages = 2
+        kpack = 1
 
     ret = {
         "block_m": block_m,
@@ -104,7 +106,7 @@ def get_kernel_config(m, n, k, routing_data):
         "split_k": split_k,
         "waves_per_eu": 0,
         "matrix_instr_nonkdim": 16,
-        "kpack": 1,
+        "kpack": kpack,
     }
     return ret
 
