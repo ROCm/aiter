@@ -17,7 +17,8 @@ from aiter.ops.triton.utils._triton import arch_info
 def block_attn_mask_to_ragged_lut(
     block_attn_mask: torch.Tensor,
     num_heads: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_none_if_dense: bool = False,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """
     Convert a dense block attention mask to a ragged look-up table of KV block
     indices per (batch, head, q_block). Used for block-sparse attention with no
@@ -27,79 +28,48 @@ def block_attn_mask_to_ragged_lut(
         same mask for all heads, or (batch, num_heads, num_q_blocks, num_kv_blocks)
         for per-head masks. True = may attend, False = must not attend.
     num_heads: Required when block_attn_mask is 3D (number of Q heads). Ignored when 4D.
+    return_none_if_dense: If True and the mask is all True (dense), return None so the
+        caller can pass block_lut=None to fav3_sage_wrapper_func and use the dense path.
+        Avoids building a very large LUT that can trigger munmap_chunk on MI300X/ROCm.
     Returns:
         kv_block_indices: 1D int32, concatenation of all KV block index lists.
         lut_start: 1D int32, length batch * num_heads * num_q_blocks. Index
             idx = batch_idx * (num_heads * num_q_blocks) + head_idx * num_q_blocks + q_block_idx.
         lut_count: 1D int32, same length as lut_start.
+        When return_none_if_dense is True and the mask is all True, returns None instead.
     """
     device = block_attn_mask.device
-    mask_cpu = block_attn_mask.cpu()
 
+    # 3D -> 4D: expand and fall through to 4D path
     if block_attn_mask.dim() == 3:
         if num_heads is None:
             raise ValueError("num_heads must be provided when block_attn_mask is 3D")
-        batch, num_q_blocks, _ = block_attn_mask.shape
-        flat_indices = []
-        lut_start_0 = []
-        lut_count_0 = []
-        for b in range(batch):
-            for qb in range(num_q_blocks):
-                start = len(flat_indices)
-                row = mask_cpu[b, qb, :]
-                indices = torch.nonzero(row, as_tuple=False).squeeze(-1)
-                if indices.dim() == 0:
-                    count = 0
-                else:
-                    count = indices.size(0)
-                    flat_indices.append(indices)
-                lut_start_0.append(start)
-                lut_count_0.append(count)
-        if flat_indices:
-            kv_block_indices = torch.cat(flat_indices, dim=0).to(device=device, dtype=torch.int32)
-        else:
-            kv_block_indices = torch.empty(0, dtype=torch.int32, device=device)
-        # Repeat same (b, qb) LUT for each head in kernel order: (b, h, qb) -> b*(num_heads*num_q_blocks) + h*num_q_blocks + qb
-        lut_start = []
-        lut_count = []
-        for b in range(batch):
-            for h in range(num_heads):
-                for qb in range(num_q_blocks):
-                    idx_0 = b * num_q_blocks + qb
-                    lut_start.append(lut_start_0[idx_0])
-                    lut_count.append(lut_count_0[idx_0])
-        lut_start_t = torch.tensor(lut_start, dtype=torch.int32, device=device)
-        lut_count_t = torch.tensor(lut_count, dtype=torch.int32, device=device)
-        return kv_block_indices, lut_start_t, lut_count_t
+        batch, num_q_blocks, num_kv_blocks = block_attn_mask.shape
+        if return_none_if_dense and block_attn_mask.all():
+            return None
+        block_attn_mask = block_attn_mask.unsqueeze(1).expand(
+            batch, num_heads, num_q_blocks, num_kv_blocks
+        )
 
-    # 4D: (batch, num_heads, num_q_blocks, num_kv_blocks)
-    batch, num_heads, num_q_blocks, _ = block_attn_mask.shape
-    flat_indices = []
-    lut_start = []
-    lut_count = []
-    for b in range(batch):
-        for h in range(num_heads):
-            for qb in range(num_q_blocks):
-                start = len(flat_indices)
-                row = mask_cpu[b, h, qb, :]
-                indices = torch.nonzero(row, as_tuple=False).squeeze(-1)
-                if indices.dim() == 0:
-                    count = 0
-                else:
-                    count = indices.size(0)
-                    flat_indices.append(indices)
-                lut_start.append(start)
-                lut_count.append(count)
+    # 4D: (batch, num_heads, num_q_blocks, num_kv_blocks) — GPU vectorized path
+    batch, num_heads, num_q_blocks, num_kv_blocks = block_attn_mask.shape
+    if return_none_if_dense and block_attn_mask.all():
+        return None
 
-    if flat_indices:
-        kv_block_indices = torch.cat(flat_indices, dim=0).to(device=device, dtype=torch.int32)
-    else:
-        kv_block_indices = torch.empty(0, dtype=torch.int32, device=device)
+    counts = block_attn_mask.long().sum(dim=-1)
+    lut_count = counts.reshape(-1).to(torch.int32)
+    lut_start = (torch.cumsum(lut_count, dim=0) - lut_count).to(torch.int32)
 
-    lut_start_t = torch.tensor(lut_start, dtype=torch.int32, device=device)
-    lut_count_t = torch.tensor(lut_count, dtype=torch.int32, device=device)
+    if lut_count.sum() == 0:
+        kv_block_indices = torch.zeros(1, dtype=torch.int32, device=device)
+        return kv_block_indices, lut_start, lut_count
 
-    return kv_block_indices, lut_start_t, lut_count_t
+    b_idx, h_idx, qb_idx, kb_idx = block_attn_mask.nonzero(as_tuple=True)
+    linear = b_idx * (num_heads * num_q_blocks) + h_idx * num_q_blocks + qb_idx
+    sort_idx = linear.argsort(stable=True)
+    kv_block_indices = kb_idx[sort_idx].to(torch.int32)
+
+    return kv_block_indices, lut_start, lut_count
 
 
 def get_sage_fwd_configs():
