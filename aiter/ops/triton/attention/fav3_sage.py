@@ -476,6 +476,7 @@ def fav3_sage_func(
             stride_dsz, stride_dsh, stride_dsq = (None, None, None)
 
         p_mockup_descale = torch.empty((config["BLOCK_M"], config["BLOCK_N"] // 32), dtype=torch.uint8, device=q.device).fill_(127)
+
         sage_fwd_mxfp4[grid](
             q,
             k,

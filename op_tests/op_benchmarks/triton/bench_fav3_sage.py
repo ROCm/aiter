@@ -630,6 +630,8 @@ def bench_kernel(q, k, v, args, provider):
                 0, 2, 1, 3
             )  # we do comparison in BSHD
 
+        print("cur", current_primary.flatten()[-21:-1])
+        print("ref", reference_primary.flatten()[-21:-1])
         compare_accuracy(current_primary, reference_primary)
         check_attention_outputs(current_primary, reference_primary, fp8=False)
 

@@ -230,7 +230,7 @@ def _sage_fwd_no_mask_mxfp4(
         l_i = l_i * alpha + l_ij
         m_i = m_ij
 
-        acc = tl.dot_scaled(p.to(tl.float8e4nv), p_descale, "e4m3", v, v_descale, "e2m1", acc=acc)
+        acc = tl.dot_scaled(p.to(tl.float8e4nv), p_descale, "e4m3", v, v_descale, "e2m1", acc=acc, fast_math=True)
 
     return acc, l_i, m_i
 
@@ -624,7 +624,7 @@ def _sage_fwd_mask_mxfp4(
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
         m_i = m_ij
-        acc = tl.dot_scaled(p.to(tl.float8e4nv), p_descale, "e4m3", v, v_descale, "e2m1", acc=acc)
+        acc = tl.dot_scaled(p.to(tl.float8e4nv), p_descale, "e4m3", v, v_descale, "e2m1", acc=acc, fast_math=True)
 
     return acc, l_i, m_i
 
@@ -891,7 +891,7 @@ def sage_fwd_mxfp4(
     )
     k_ptrs = k_offset + offs_d_k[:, None] * stride_kk + offs_n[None, :] * stride_kn
     v_offset = (
-        V + off_z * stride_vz + off_h_k * stride_vh + cu_seqlens_k_start * stride_vk
+        V + off_z * stride_vz + off_h_k * stride_vh + (cu_seqlens_k_start // V_N_DIM_DIVISOR) * stride_vk
     )
     v_ptrs = v_offset + offs_n_v[:, None] * stride_vk + offs_d_v[None, :] * stride_vn
     q_descale_offset = (
