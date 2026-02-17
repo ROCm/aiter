@@ -26,7 +26,7 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=F
 
     bias_tensor = None
     if bias:
-        bias_tensor = torch.empty((N), dtype=dtype, device="cuda")
+        bias_tensor = torch.randn((N), dtype=dtype, device="cuda")
 
     y = None
     if output:
