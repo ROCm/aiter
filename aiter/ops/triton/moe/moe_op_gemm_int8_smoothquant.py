@@ -68,17 +68,16 @@ def allocate_output(
 
 def get_kernel_config(m, n, k, routing_data):
     block_m = routing_data.block_m
-    group_m = 4
+    group_m = 1
     w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_stages = 2
-
     split_k = 1
     num_cus = get_num_sms()
     
     if block_m == 16:
-        block_n = 128
-        block_k = 128
+        block_n = 64
+        block_k = 256
         num_warps = 4
+        num_stages = 1
 
         grid_m = routing_data.n_blocks(m, block_m)
         grid_n = triton.cdiv(n, block_n)
@@ -89,10 +88,10 @@ def get_kernel_config(m, n, k, routing_data):
             grid_n = triton.cdiv(n, block_n)
             grid = grid_m * grid_n * split_k
     else:
-        # for scale preshuffling
         block_n = 128
         block_k = 128
         num_warps = 8
+        num_stages = 2
 
     ret = {
         "block_m": block_m,
@@ -103,7 +102,7 @@ def get_kernel_config(m, n, k, routing_data):
         "group_m": group_m,
         "w_cache_modifier": w_cache_modifier,
         "split_k": split_k,
-        "waves_per_eu": 1,
+        "waves_per_eu": 0,
         "matrix_instr_nonkdim": 16,
         "kpack": 1,
     }
@@ -317,6 +316,9 @@ def moe_gemm_int8_smoothquant(
         num_warps=config["num_warps"],
         num_stages=config["num_stages"],
         UPCAST_INDICES=should_upcast_indices(x, w, y),
+        waves_per_eu=config["waves_per_eu"],
+        matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
+        kpack=config["kpack"],
     )
     # Build grouped reduction inputs in a uniform way
     group_indx = (

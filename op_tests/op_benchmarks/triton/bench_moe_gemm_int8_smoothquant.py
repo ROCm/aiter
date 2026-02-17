@@ -137,13 +137,14 @@ def bench_mlp_single_weight_init(
             w1_int8,
             x_scale,
             w1_scale,
-            b1,
+            None,
             rdata,
             gather_indx=gather_indx,
             scatter_indx=None,
             out_dtype=torch.float32,
             apply_activation=True,
-            add_residual=True,
+            limit=None,
+            add_residual=False,
         )
         x, x_scale = smoothquant_quantize(x, fc2_smooth_scale)
         x = moe_gemm_int8_smoothquant(
@@ -151,7 +152,7 @@ def bench_mlp_single_weight_init(
             w2_int8,
             x_scale,
             w2_scale,
-            b2,
+            None,
             rdata,
             gather_indx=None,
             scatter_indx=scatter_indx,

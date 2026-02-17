@@ -230,7 +230,7 @@ def _moe_gemm_int8_smoothquant(
 
     Activation functions:
     - alpha=0: No activation
-    - alpha==1, ADD_RESIDUAL=True: SiLU
+    - alpha==1, ADD_RESIDUAL=False: SiLU
     - alpha!=0: SwiGLU
     """
     # Assume positive strides for compiler hints
