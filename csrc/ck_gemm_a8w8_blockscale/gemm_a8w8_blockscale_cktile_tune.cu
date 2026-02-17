@@ -1,13 +1,25 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
+#include <cmath>
+#include <functional>
+#include <unordered_map>
+
+#include <torch/extension.h>
+
 #include "gemm_a8w8_blockscale_cktile_common.cuh"
 #include "gemm_a8w8_blockscale_cktile_lookup.h"
 #include "gemm_a8w8_blockscale_cktile_manifest.h"
-#include "gemm_a8w8_blockscale_common_tune.h"
+
+using BlockwiseKernel = std::function<torch::Tensor(
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, bool)>;
+
+// For certain high priority shapes, we directly use the best kernel rather
+// than use heuristics.
+using BlockwiseKernelMap = std::unordered_map<int, BlockwiseKernel>;
 
 template <typename DDataType, typename EDataType = DDataType>
-static BlockwiseKernel blockwise_dispatch_tile(int id)
+static BlockwiseKernel blockwise_dispatch_cktile(int id)
 {
     // For a given shape, either find the best kernel via lookup or heuristic.
     // For many small M shapes, we bucket them to the next largest kernel.
@@ -25,7 +37,7 @@ static BlockwiseKernel blockwise_dispatch_tile(int id)
         }
         else
         {
-            static_assert(false, "blockwise_dispatch_tile used with unsupported dtype!");
+            static_assert(false, "blockwise_dispatch_cktile used with unsupported dtype!");
         }
     }();
 
@@ -46,7 +58,8 @@ torch::Tensor gemm_a8w8_blockscale_cktile_tune(torch::Tensor& XQ,
                                                torch::Tensor& w_scale,
                                                torch::Tensor& Y,
                                                int kernelId,
-                                               int splitK)
+                                               int splitK,
+                                               bool preshuffleB)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
@@ -59,11 +72,13 @@ torch::Tensor gemm_a8w8_blockscale_cktile_tune(torch::Tensor& XQ,
 
     if(Y.dtype() == at::ScalarType::BFloat16)
     {
-        blockwise_dispatch_tile<TILE_FP32, TILE_BF16>(kernelId)(XQ, WQ, x_scale, w_scale, Y);
+        blockwise_dispatch_cktile<TILE_FP32, TILE_BF16>(kernelId)(
+            XQ, WQ, x_scale, w_scale, Y, preshuffleB);
     }
     else if(Y.dtype() == at::ScalarType::Half)
     {
-        blockwise_dispatch_tile<TILE_FP32, TILE_FP16>(kernelId)(XQ, WQ, x_scale, w_scale, Y);
+        blockwise_dispatch_cktile<TILE_FP32, TILE_FP16>(kernelId)(
+            XQ, WQ, x_scale, w_scale, Y, preshuffleB);
     }
     else
     {
