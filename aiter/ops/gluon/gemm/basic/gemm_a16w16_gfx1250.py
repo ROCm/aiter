@@ -48,6 +48,46 @@ def create_shared_layouts(BLOCK_M: ttgl.constexpr, BLOCK_N: ttgl.constexpr,
     
     return (SHARED_LAYOUT_A, SHARED_LAYOUT_B)
 
+
+@gluon.jit
+def issue_l2_prefetches(distance, producer, a_desc, b_desc, off_am, off_bn,
+                         BLOCK_K: ttgl.constexpr, PHYSICAL_MK: ttgl.constexpr,
+                         PRESHUFFLED: ttgl.constexpr, pred=True):
+    """
+    Creates L2 prefetch for iteration `producer + distance`.
+    """
+    if distance == 0:
+        return
+
+    prefetch_iteration = producer + distance
+
+    if PHYSICAL_MK:
+        ttgl.amd.gfx1250.tdm.prefetch(a_desc, [off_am, prefetch_iteration * BLOCK_K], pred=pred)
+    else:
+        ttgl.amd.gfx1250.tdm.prefetch(a_desc, [prefetch_iteration * BLOCK_K, off_am], pred=pred)
+
+    if PRESHUFFLED:
+        ttgl.amd.gfx1250.tdm.prefetch(b_desc, [off_bn, prefetch_iteration * BLOCK_K], pred=pred)
+    else:
+        ttgl.amd.gfx1250.tdm.prefetch(b_desc, [prefetch_iteration * BLOCK_K, off_bn], pred=pred)
+
+
+@gluon.jit
+def issue_l2_prefetches_prologue(distance, producer, a_desc, b_desc, off_am, off_bn,
+                                  BLOCK_K: ttgl.constexpr, NUM_BUFFERS: ttgl.constexpr,
+                                  PHYSICAL_MK: ttgl.constexpr, PRESHUFFLED: ttgl.constexpr, pred=True):
+    """
+    Creates prefetches for iterations [NUM_BUFFERS, distance - NUM_BUFFERS) or no prefetches if distance <= NUM_BUFFERS.
+    This skips iterations which are preloaded in the prologue because prefetching them does not make sense for GEMMs.
+    """
+    if distance <= NUM_BUFFERS:
+        return
+
+    for i in ttgl.static_range(distance - NUM_BUFFERS):
+        issue_l2_prefetches(NUM_BUFFERS + i, producer, a_desc, b_desc, off_am, off_bn,
+                             BLOCK_K, PHYSICAL_MK, PRESHUFFLED, pred)
+
+
 @gluon.jit
 def _gemm_a16w16_gfx1250_kernel(
     a_ptr, b_ptr, c_ptr, bias_ptr,
@@ -69,7 +109,10 @@ def _gemm_a16w16_gfx1250_kernel(
     activation: ttgl.constexpr,       
     USE_ACTIVATION: ttgl.constexpr,   
     ADD_BIAS: ttgl.constexpr,         
+    L2_PREFETCH_DISTANCE: ttgl.constexpr,
 ):
+    USE_L2_PREFETCH: ttgl.constexpr = L2_PREFETCH_DISTANCE > 0
+
     pid = ttgl.program_id(axis=0) 
     num_pid_m = ttgl.cdiv(M, BLOCK_M) 
     pid_m = pid % num_pid_m            
@@ -147,6 +190,12 @@ def _gemm_a16w16_gfx1250_kernel(
     
     accumulator = ttgl.zeros((BLOCK_M, BLOCK_N), dtype=ttgl.float32, layout=WMMA_LAYOUT)
     
+    off_am = pid_m * BLOCK_M
+    off_bn = pid_n * BLOCK_N
+
+    if USE_L2_PREFETCH:
+        issue_l2_prefetches_prologue(L2_PREFETCH_DISTANCE, producer, a_desc, b_desc, off_am, off_bn, BLOCK_K, NUM_BUFFERS, PHYSICAL_MK, PRESHUFFLED)
+
     # Fill the pipeline
     for _ in ttgl.static_range(NUM_BUFFERS - 1):
         # Load A tile
@@ -210,6 +259,9 @@ def _gemm_a16w16_gfx1250_kernel(
             )
         
         producer += 1
+
+        if USE_L2_PREFETCH:
+            issue_l2_prefetches(L2_PREFETCH_DISTANCE - 1, producer, a_desc, b_desc, off_am, off_bn, BLOCK_K, PHYSICAL_MK, PRESHUFFLED)
         
         # Wait for consumer to be ready
         # We want (NUM_BUFFERS - 1) * 2 to ensure the consumer's tile is ready while allowing next loads to proceed
@@ -358,6 +410,7 @@ def gemm_a16w16_gfx1250(
     BLOCK_K = config["BLOCK_K"]
     NUM_BUFFERS = config["NUM_BUFFERS"]
     num_warps = config["num_warps"]
+    L2_PREFETCH_DISTANCE = config.get("L2_PREFETCH_DISTANCE", 0)
         
     warp_bases = [(0, 1)]
     for i in range(int(math.log2(num_warps // 2))):
@@ -407,6 +460,7 @@ def gemm_a16w16_gfx1250(
         activation=_get_activation_from_str(activation) if activation else None,
         USE_ACTIVATION=activation is not None,
         ADD_BIAS=(bias is not None),
+        L2_PREFETCH_DISTANCE=L2_PREFETCH_DISTANCE,
         num_warps=num_warps,
     )
     
