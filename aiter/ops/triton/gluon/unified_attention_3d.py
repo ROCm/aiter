@@ -6,9 +6,9 @@ from aiter.ops.triton.utils.device_info import get_num_sms
 import math
 from aiter.ops.triton.gluon.unified_attention_3d_kernel import (
     gluon_kernel_unified_attention_3d,
-    gluon_kernel_unified_attention_3d_pipelined,
-    gluon_kernel_unified_attention_3d_tdm_pipelined,
-    gluon_kernel_unified_attention_3d_tdm_gather_pipelined,
+    gluon_kernel_unified_attention_3d_async,
+    gluon_kernel_unified_attention_3d_tdm,
+    gluon_kernel_unified_attention_3d_tdm_gather,
     gluon_reduce_segments,
 )
 
@@ -181,8 +181,8 @@ def make_layout_3d(
     # size_per_thread * threads_per_warp along the fastest moving dimension is set to HEAD_SIZE_PADDED with only 1 warp_per_cta,
     # therefore, threads_per_warp along the fastest moving dimension should be HEAD_SIZE_PADDED // size_per_thread_fastest_dim
     # clamp the threads_per_warp along the fastest moving dimension to 1 ~ WARP_SIZE
-    threads_per_warp_fastest_dim = min(
-        max((HEAD_SIZE_PADDED // size_per_thread_fastest_dim), WARP_SIZE), 1
+    threads_per_warp_fastest_dim = max(
+        min((HEAD_SIZE_PADDED // size_per_thread_fastest_dim), WARP_SIZE), 1
     )
 
     # in gfx950, ttg.async_copy_global_to_local will fail if threads_per_warp=[WARP_SIZE//4, 4] is used
@@ -291,18 +291,18 @@ def select_3d_config(
     if use_tdm:
         # With TDM async_copy pipelined, use_swizzle will be ignored (padded smem layout is used always)
         if num_tdm_gather > 1:
-            attn_impl = gluon_kernel_unified_attention_3d_tdm_gather_pipelined
+            attn_impl = gluon_kernel_unified_attention_3d_tdm_gather
             # print(f"Using TDM gather pipelined kernel with TILE_SIZE={TILE_SIZE} and BLOCK_SIZE={block_size}")
             layouts = make_layout_3d(
                 *hyper_parms, use_tdm, use_swizzle=False, use_gather=True
             )
         else:
-            attn_impl = gluon_kernel_unified_attention_3d_tdm_pipelined
+            attn_impl = gluon_kernel_unified_attention_3d_tdm
             # print(f"Using TDM async copy pipelined kernel with TILE_SIZE={TILE_SIZE} and BLOCK_SIZE={block_size}")
             layouts = make_layout_3d(*hyper_parms, use_tdm, use_swizzle=False)
     elif use_async:
         # With async_copy pipelined, use_swizzle should always be True
-        attn_impl = gluon_kernel_unified_attention_3d_pipelined
+        attn_impl = gluon_kernel_unified_attention_3d_async
         layouts = make_layout_3d(*hyper_parms, use_tdm, use_swizzle=True)
     else:
         # Baseline kernel, num_stages does not matter, use_swizzle can be either True or False
@@ -499,13 +499,13 @@ def unified_attention(
             v_scale=v_descale,
             softcap=softcap,
             num_tokens=num_tokens,
+            NUM_BLOCKS=num_blocks,
             num_query_heads=num_query_heads,
             num_queries_per_kv=num_queries_per_kv,
             block_table_stride=block_table.stride(0),
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
-            NUM_BLOCKS=num_blocks,
             BLOCK_SIZE=block_size,
             HEAD_SIZE=head_size,
             HEAD_SIZE_PADDED=head_size_padded,

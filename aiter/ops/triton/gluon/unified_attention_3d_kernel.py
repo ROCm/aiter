@@ -7,6 +7,9 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 from triton.experimental import gluon
 import triton.experimental.gluon.language as ttgl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
+# from triton._C.libtriton.gluon_ir import make_cga_layout
 
 DEVICE_ARCH = arch_info.get_arch()
 MMA_operation: ttgl.constexpr = (
@@ -356,6 +359,7 @@ def _tdm_gather_create_tensor_descriptors_and_allocate_lds(
     q_ptr,
     k_ptr,
     v_ptr,
+    NUM_BLOCKS,
     stride_q_m: ttgl.int64,  # int
     stride_q_d: ttgl.constexpr,  # int
     stride_k_t: ttgl.int64,  # int
@@ -365,7 +369,6 @@ def _tdm_gather_create_tensor_descriptors_and_allocate_lds(
     q_shared_layout: ttgl.constexpr,
     k_shared_layout: ttgl.constexpr,
     v_shared_layout: ttgl.constexpr,
-    NUM_BLOCKS: ttgl.constexpr,
     NUM_KV_HEADS: ttgl.constexpr,
     BLOCK_M: ttgl.constexpr,
     HEAD_SIZE: ttgl.constexpr,
@@ -415,8 +418,26 @@ def _tdm_gather_create_tensor_descriptors_and_allocate_lds(
     return k_desc, v_desc, smem_Q, smem_K, smem_V
 
 
-@gluon.jit
-def gluon_kernel_unified_attention_3d_tdm_gather_pipelined(
+gluon_kernel_unified_attention_3d_tdm_gather_repr = make_kernel_repr(
+    "gluon_kernel_unified_attention_3d_tdm_gather",
+    [
+        "num_query_heads",
+        "num_queries_per_kv",
+        "BLOCK_SIZE",
+        "TILE_SIZE",
+        "HEAD_SIZE",
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "cache_modifier",
+        "NUM_KSPLIT",
+    ],
+)
+
+
+@gluon.jit(repr=gluon_kernel_unified_attention_3d_tdm_gather_repr)
+def gluon_kernel_unified_attention_3d_tdm_gather(
     segm_output_ptr,
     # [num_tokens, num_query_heads, num_segments, head_size]
     segm_max_ptr,  # [num_tokens, num_query_heads, num_segments]
@@ -435,6 +456,7 @@ def gluon_kernel_unified_attention_3d_tdm_gather_pipelined(
     v_scale,  # float32
     softcap,  # float32
     num_tokens,  # int
+    NUM_BLOCKS,  # int
     num_query_heads: ttgl.constexpr,  # int
     num_queries_per_kv: ttgl.constexpr,  # int
     block_table_stride: ttgl.int64,  # int
@@ -442,7 +464,6 @@ def gluon_kernel_unified_attention_3d_tdm_gather_pipelined(
     query_stride_0: ttgl.int64,  # int
     query_stride_1: ttgl.int64,  # int, should be equal to head_size
     qq_bias_stride_0: ttgl.int64,  # int
-    NUM_BLOCKS: ttgl.constexpr,  # int
     BLOCK_SIZE: ttgl.constexpr,  # int
     TILE_SIZE: ttgl.constexpr,  # int, must be power of 2
     HEAD_SIZE: ttgl.constexpr,  # int
@@ -563,6 +584,7 @@ def gluon_kernel_unified_attention_3d_tdm_gather_pipelined(
             query_ptr,
             key_cache_ptr,
             value_cache_ptr,
+            NUM_BLOCKS,
             query_stride_1,
             1,
             stride_k_cache_1,  # stride_k_cache_1 = BLOCK_SIZE * HEAD_SIZE
@@ -572,7 +594,6 @@ def gluon_kernel_unified_attention_3d_tdm_gather_pipelined(
             Q_SHARED_LAYOUT,
             K_SHARED_LAYOUT,
             V_SHARED_LAYOUT,
-            NUM_BLOCKS,
             NUM_KV_HEADS,
             BLOCK_M,
             HEAD_SIZE,
@@ -979,6 +1000,7 @@ def _tdm_create_tensor_descriptors_and_allocate_lds(
     q_ptr,
     k_ptr,
     v_ptr,
+    NUM_BLOCKS,
     stride_q_m: ttgl.int64,  # int
     stride_q_d: ttgl.constexpr,  # int
     stride_k_t: ttgl.int64,  # int
@@ -988,7 +1010,6 @@ def _tdm_create_tensor_descriptors_and_allocate_lds(
     q_shared_layout: ttgl.constexpr,
     k_shared_layout: ttgl.constexpr,
     v_shared_layout: ttgl.constexpr,
-    NUM_BLOCKS: ttgl.constexpr,
     NUM_KV_HEADS: ttgl.constexpr,
     BLOCK_M: ttgl.constexpr,
     HEAD_SIZE: ttgl.constexpr,
@@ -1047,9 +1068,26 @@ def _tdm_create_tensor_descriptors_and_allocate_lds(
     return k_desc, v_desc, smem_Q, smem_K, smem_V
 
 
-# from triton._C.libtriton.gluon_ir import make_cga_layout
-@gluon.jit
-def gluon_kernel_unified_attention_3d_tdm_pipelined(
+gluon_kernel_unified_attention_3d_tdm_repr = make_kernel_repr(
+    "gluon_kernel_unified_attention_3d_tdm",
+    [
+        "num_query_heads",
+        "num_queries_per_kv",
+        "BLOCK_SIZE",
+        "TILE_SIZE",
+        "HEAD_SIZE",
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "cache_modifier",
+        "NUM_KSPLIT",
+    ],
+)
+
+
+@gluon.jit(repr=gluon_kernel_unified_attention_3d_tdm_repr)
+def gluon_kernel_unified_attention_3d_tdm(
     segm_output_ptr,
     # [num_tokens, num_query_heads, num_segments, head_size]
     segm_max_ptr,  # [num_tokens, num_query_heads, num_segments]
@@ -1067,13 +1105,13 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
     v_scale,  # float32
     softcap,  # float32
     num_tokens,  # int
+    NUM_BLOCKS,  # int
     num_query_heads: ttgl.constexpr,  # int
     num_queries_per_kv: ttgl.constexpr,  # int
     block_table_stride: ttgl.int64,  # int
     query_stride_0: ttgl.int64,  # int
     query_stride_1: ttgl.int64,  # int, should be equal to head_size
     qq_bias_stride_0: ttgl.int64,  # int
-    NUM_BLOCKS: ttgl.constexpr,  # int
     BLOCK_SIZE: ttgl.constexpr,  # int
     TILE_SIZE: ttgl.constexpr,  # int, must be power of 2
     HEAD_SIZE: ttgl.constexpr,  # int
@@ -1189,6 +1227,7 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
             query_ptr,
             key_cache_ptr,
             value_cache_ptr,
+            NUM_BLOCKS,
             query_stride_1,
             1,
             stride_k_cache_1,  # stride_k_cache_1 = HEAD_SIZE * num_kv_heads
@@ -1198,7 +1237,6 @@ def gluon_kernel_unified_attention_3d_tdm_pipelined(
             Q_SHARED_LAYOUT,
             K_SHARED_LAYOUT,
             V_SHARED_LAYOUT,
-            NUM_BLOCKS,
             NUM_KV_HEADS,
             BLOCK_M,
             HEAD_SIZE,
@@ -1615,8 +1653,26 @@ def _get_kv_offsets(
     return j + 1, k_offset, v_offset, tile_k_mask, tile_v_mask
 
 
-@gluon.jit
-def gluon_kernel_unified_attention_3d_pipelined(
+gluon_kernel_unified_attention_3d_async_repr = make_kernel_repr(
+    "gluon_kernel_unified_attention_3d_async",
+    [
+        "num_query_heads",
+        "num_queries_per_kv",
+        "BLOCK_SIZE",
+        "TILE_SIZE",
+        "HEAD_SIZE",
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "cache_modifier",
+        "NUM_KSPLIT",
+    ],
+)
+
+
+@gluon.jit(repr=gluon_kernel_unified_attention_3d_async_repr)
+def gluon_kernel_unified_attention_3d_async(
     segm_output_ptr,
     # [num_tokens, num_query_heads, num_segments, head_size]
     segm_max_ptr,  # [num_tokens, num_query_heads, num_segments]
@@ -1634,13 +1690,13 @@ def gluon_kernel_unified_attention_3d_pipelined(
     v_scale,  # float32
     softcap,  # float32
     num_tokens,  # int
+    NUM_BLOCKS,  # int
     num_query_heads: ttgl.constexpr,  # int
     num_queries_per_kv: ttgl.constexpr,  # int
     block_table_stride: ttgl.int64,  # int
     query_stride_0: ttgl.int64,  # int
     query_stride_1: ttgl.int64,  # int, should be equal to head_size
     qq_bias_stride_0: ttgl.int64,  # int
-    NUM_BLOCKS: ttgl.constexpr,  # int
     BLOCK_SIZE: ttgl.constexpr,  # int
     TILE_SIZE: ttgl.constexpr,  # int, must be power of 2
     HEAD_SIZE: ttgl.constexpr,  # int
@@ -2115,7 +2171,25 @@ def _buffer_load_to_reg_shuffle_via_lds(
     return smem.load(layout=layout)
 
 
-@gluon.jit
+gluon_kernel_unified_attention_3d_repr = make_kernel_repr(
+    "gluon_kernel_unified_attention_3d",
+    [
+        "num_query_heads",
+        "num_queries_per_kv",
+        "BLOCK_SIZE",
+        "TILE_SIZE",
+        "HEAD_SIZE",
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "cache_modifier",
+        "NUM_KSPLIT",
+    ],
+)
+
+
+@gluon.jit(repr=gluon_kernel_unified_attention_3d_repr)
 def gluon_kernel_unified_attention_3d(
     segm_output_ptr,
     # [num_tokens, num_query_heads, num_segments, head_size]
