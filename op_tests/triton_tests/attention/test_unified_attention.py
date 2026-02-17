@@ -13,6 +13,59 @@ from aiter.ops.triton.gluon.unified_attention_3d import (
 from aiter.ops.triton.utils.types import e4m3_dtype
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 
+
+def shuffle_kv_cache(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+):
+    """
+    Shuffle key and value cache layout for optimized memory access.
+        16x16x32 for BF16
+        16x16x64 for FP8
+    """
+    dtype = key_cache.dtype
+    dtype_v = value_cache.dtype
+    assert dtype in (torch.bfloat16,)
+    num_blocks, num_kv_heads, head_size, block_size = key_cache.shape
+    num_blocks_v, num_kv_heads_v, head_size_v, block_size_v = value_cache.shape
+    assert block_size >= 16
+    assert dtype == dtype_v
+    assert num_blocks == num_blocks_v
+    assert num_kv_heads == num_kv_heads_v
+    assert head_size == head_size_v
+    assert block_size == block_size_v
+
+    key_cache_shuffled = key_cache.view(
+        -1, block_size, num_kv_heads, head_size
+    ).permute(0, 2, 1, 3)
+    value_cache_shuffled = value_cache.view(
+        -1, block_size, num_kv_heads, head_size
+    ).permute(0, 2, 1, 3)
+
+    key_cache_shuffled = key_cache_shuffled.view(
+        -1, num_kv_heads, block_size // 16, 16, head_size // 16, 2, 8
+    )
+    key_cache_shuffled = key_cache_shuffled.permute(0, 1, 2, 4, 5, 3, 6).contiguous()
+    key_cache_shuffled = key_cache_shuffled.view(
+        -1, num_kv_heads, block_size // 16, head_size * 16
+    )
+    key_cache_shuffled.is_shuffled = True
+
+    # if block_size is 16, then we need to gather at least 2 blocks to make the dot dim 32
+    value_cache_shuffled = value_cache_shuffled.view(
+        -1, num_kv_heads, block_size // 16, 2, 8, head_size // 16, 16
+    )
+    value_cache_shuffled = value_cache_shuffled.permute(
+        0, 1, 5, 2, 3, 6, 4
+    ).contiguous()
+    value_cache_shuffled = value_cache_shuffled.view(
+        -1, num_kv_heads, head_size // 16, block_size * 16
+    )
+    value_cache_shuffled.is_shuffled = True
+
+    return key_cache_shuffled, value_cache_shuffled
+
+
 DEVICE_ARCH = arch_info.get_arch()
 
 NUM_HEADS = [(64, 8)]
@@ -106,6 +159,8 @@ def ref_paged_attn(
     "seq_lens",
     [
         [(1, 1328)],
+        [(1, 523), (1, 37), (1, 2011)],
+        [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)],
     ],
 )
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
