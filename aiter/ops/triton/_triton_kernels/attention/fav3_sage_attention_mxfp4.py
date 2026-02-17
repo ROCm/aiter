@@ -76,7 +76,7 @@ def _sage_fwd_no_mask_mxfp4(
     for start_n in range(block_min, block_max, BLOCK_N):
         # get ptrs
         k_ptrs = k_base_ptrs + start_n * stride_kn
-        v_ptrs = v_base_ptrs + start_n // V_N_DIM_DIVISOR * stride_vk
+        v_ptrs = v_base_ptrs + (start_n // V_N_DIM_DIVISOR) * stride_vk
         k_descale_ptrs = k_descale_base_ptrs + start_n * stride_ksn
         v_descale_ptrs = v_descale_base_ptrs + (start_n // SCALE_GROUP_SIZE) * stride_vsn
         
@@ -307,7 +307,7 @@ def _sage_fwd_mask_mxfp4(
     for start_n in range(block_min, block_max, BLOCK_N):
         # get ptrs
         k_ptrs = k_base_ptrs + start_n * stride_kn
-        v_ptrs = v_base_ptrs + start_n // V_N_DIM_DIVISOR * stride_vk
+        v_ptrs = v_base_ptrs + (start_n // V_N_DIM_DIVISOR) * stride_vk
         k_descale_ptrs = k_descale_base_ptrs + start_n * stride_ksn
         v_descale_ptrs = v_descale_base_ptrs + (start_n // SCALE_GROUP_SIZE) * stride_vsn
         if USE_Q_SMOOTHING:
@@ -317,9 +317,9 @@ def _sage_fwd_mask_mxfp4(
         # we load all BLOCK_N. For others, the blocks are all within range.
         k_offs_n = start_n + tl.arange(0, BLOCK_N)
         v_offs_n = (start_n // V_N_DIM_DIVISOR) + tl.arange(0, BLOCK_N // V_N_DIM_DIVISOR)
-        vs_off = tl.arange(0, BLOCK_N // SCALE_GROUP_SIZE)
+        vs_offs_n = (start_n // SCALE_GROUP_SIZE) + tl.arange(0, BLOCK_N // SCALE_GROUP_SIZE)
         k_mask = k_offs_n[None, :] < seqlen_k
-        v_mask = v_offs_n[:, None] < seqlen_k // V_N_DIM_DIVISOR
+        v_mask = v_offs_n[:, None] < (seqlen_k // V_N_DIM_DIVISOR)
         if PADDED_HEAD_QK:
             k_mask = k_mask & (offs_d_k[:, None] < ACTUAL_BLOCK_DMODEL_QK)
         if PADDED_HEAD_V:
@@ -330,8 +330,9 @@ def _sage_fwd_mask_mxfp4(
         k_descale = tl.load(
             k_descale_ptrs, mask=k_offs_n[:, None] < seqlen_k, other=0.0
         )
+        # TODO move the loading after qk. check D dim mask
         v_descale = tl.load(
-            v_descale_ptrs, mask=vs_off[None, :] < seqlen_k // V_N_DIM_DIVISOR, other=0.0
+            v_descale_ptrs, mask=vs_offs_n[None, :] < (seqlen_k // SCALE_GROUP_SIZE), other=0.0
         )
         p_descale = tl.load(p_descale_mockup_ptrs)
 
@@ -920,7 +921,7 @@ def sage_fwd_mxfp4(
         V_Descale
         + off_z * stride_vsz
         + off_h_k * stride_vsh
-        + (cu_seqlens_k_start // V_N_DIM_DIVISOR) * stride_vsn
+        + (cu_seqlens_k_start // SCALE_GROUP_SIZE) * stride_vsn
     )
     v_descale_ptrs = (
         v_descale_offset + offs_n_v_s[None, :] * stride_vsn + offs_d_v[:, None]
