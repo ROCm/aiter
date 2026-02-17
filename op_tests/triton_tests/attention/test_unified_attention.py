@@ -25,7 +25,7 @@ def shuffle_kv_cache(
     """
     dtype = key_cache.dtype
     dtype_v = value_cache.dtype
-    assert dtype in (torch.bfloat16,)
+    assert dtype in (torch.bfloat16, e4m3_dtype)
     num_blocks, num_kv_heads, head_size, block_size = key_cache.shape
     num_blocks_v, num_kv_heads_v, head_size_v, block_size_v = value_cache.shape
     assert block_size >= 16
@@ -35,6 +35,8 @@ def shuffle_kv_cache(
     assert head_size == head_size_v
     assert block_size == block_size_v
 
+    num_elements_per_thread = 16 // dtype.itemsize  # there are 16 bytes every 4 VGPRs
+
     key_cache_shuffled = key_cache.view(
         -1, block_size, num_kv_heads, head_size
     ).permute(0, 2, 1, 3)
@@ -43,7 +45,13 @@ def shuffle_kv_cache(
     ).permute(0, 2, 1, 3)
 
     key_cache_shuffled = key_cache_shuffled.view(
-        -1, num_kv_heads, block_size // 16, 16, head_size // 16, 2, 8
+        -1,
+        num_kv_heads,
+        block_size // 16,
+        16,  # there are 16 lanes in each thread group
+        head_size // (2 * num_elements_per_thread),
+        2,  # there are 2 groups of threads, t0 ~ t15 and t16 ~ t31
+        num_elements_per_thread,
     )
     key_cache_shuffled = key_cache_shuffled.permute(0, 1, 2, 4, 5, 3, 6).contiguous()
     key_cache_shuffled = key_cache_shuffled.view(
@@ -53,7 +61,13 @@ def shuffle_kv_cache(
 
     # if block_size is 16, then we need to gather at least 2 blocks to make the dot dim 32
     value_cache_shuffled = value_cache_shuffled.view(
-        -1, num_kv_heads, block_size // 16, 2, 8, head_size // 16, 16
+        -1,
+        num_kv_heads,
+        block_size // (2 * num_elements_per_thread),
+        2,
+        num_elements_per_thread,
+        head_size // 16,
+        16,
     )
     value_cache_shuffled = value_cache_shuffled.permute(
         0, 1, 5, 2, 3, 6, 4
