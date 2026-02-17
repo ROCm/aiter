@@ -186,7 +186,6 @@ def test_top_k_top_p_deterministic_controlled(scenario, batch_size):
     torch.manual_seed(42)
 
     probs_single, k, p, expected_valid = _create_controlled_probs(scenario)
-    vocab_size = probs_single.shape[0]
 
     # Expand to batch
     probs = probs_single.unsqueeze(0).expand(batch_size, -1).contiguous()
