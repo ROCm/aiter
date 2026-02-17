@@ -369,7 +369,7 @@ template<typename scalar_t,  typename F, int WarpSize = 64>
            int wg_size=64,
            vllm::Fp8KVCacheDataType kv_dt>
  __global__
- void fusedQKNormRopeBlockQuantCacheShuffleKernel(
+ void fusedQKNormRopeBlockQuantCacheShuffleGerneralKernel(
      scalar_t* qkv_void,            // Combined QKV tensor [num_tokens, (num_heads_q+num_heads_k+num_heads_v)， head_dim]
      int const num_heads_q,         // Number of query heads
      int const num_heads_k,         // Number of key heads
@@ -464,8 +464,7 @@ template<typename scalar_t,  typename F, int WarpSize = 64>
         {
             return;  // Already processed by previous GPU block
         }
-        slot_idx = slot_mapping[first_token_idx];
-        block_idx = slot_idx / page_size;
+        // Different page: keep slot_idx/block_idx from last token; set block_offset and first_token_idx (like cache_kernels.cu)
         block_offset = slot_idx % page_size;
     }
     else
@@ -530,12 +529,7 @@ template<typename scalar_t,  typename F, int WarpSize = 64>
     //int numtokens_in_block = block_reduce<float, decltype(sum), wg_size / WARP_SIZE>(tokens_in_block, sum, 0, smem);
     // Calculate tokenIdx for current thread
     int tokenIdx = first_token_idx + threadIdx.x;
-    
-    // Check if tokenIdx is within valid range
-    //if(tokenIdx >= batch_end_idx)
-    //{
-    //    return;
-    //}
+
 
      bool const isQ                  = localHeadIdx < num_heads_q;
      bool const isK                  = (localHeadIdx < num_heads_q + num_heads_k) & !isQ;
@@ -553,7 +547,6 @@ template<typename scalar_t,  typename F, int WarpSize = 64>
      constexpr int base_loopcnt = base_elems_per_thread / vec_size;
      using ltype                 = ::vec_t<scalar_t, vec_size>;
      ltype elements;
- 
      // Load data first, suppose have no tail since we check the head_dim is multiple of 32 before
      // kernel launch
      auto cur_element_offset = head_dim * threadIdx.x;
@@ -565,7 +558,7 @@ template<typename scalar_t,  typename F, int WarpSize = 64>
            // consider stride
            int64_t offsetWarp = (tokenIdx * num_heads * head_dim + localHeadIdx * head_dim ) /
                                 vec_size;
-           elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i];
+           elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i]; 
            reinterpret_cast<ltype*>(smem_elements)[cur_element_offset / vec_size +i] = elements;
        }
         
@@ -610,7 +603,6 @@ template<typename scalar_t,  typename F, int WarpSize = 64>
                    float sin_val      = static_cast<float>(sin_ptr[half_dim]);
                    float const val0 = static_cast<float>(smem_elements[cur_element_offset + idx0]) * rms_rcp * weight0;
                    float const val1 = static_cast<float>(smem_elements[cur_element_offset + idx1]) * rms_rcp * weight1;
-
                    smem_elements[cur_element_offset + idx0] = static_cast<scalar_t>(val0 * cos_val - val1 * sin_val);
                    smem_elements[cur_element_offset + idx1] = static_cast<scalar_t>(val0 * sin_val + val1 * cos_val);
                }
@@ -650,7 +642,7 @@ template<typename scalar_t,  typename F, int WarpSize = 64>
                reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i] =
                    reinterpret_cast<ltype*>(smem_elements)[cur_element_offset / vec_size + i];
            }
-       }
+        }
      }
  
      if(isQ)
@@ -659,20 +651,7 @@ template<typename scalar_t,  typename F, int WarpSize = 64>
          return;
      }
  
-     // ============================================================================
-     // TOKEN GROUPING FOR KV CACHE: Ensure all active threads process the same KV cache block
-     // Similar to cache_kernels.cu (lines 531-558)
-     // This is critical for correct block-level quantization scale calculation
-     // ============================================================================
-     
-    // cache the kv into kv cache and quant if required
-    // block_idx and block_offset are already calculated above
-    
-    // Fix first_token_idx to real block first_token_idx (similar to cache_kernels.cu lines 531-549)
-    // This ensures we process all tokens in the same cache page together
-    
-    
-    
+
     //printf("[DEBUG] batch_id=%d, blockIdx.y=%d, blockIdx.z=%d, threadIdx.x=%d, numtokens_in_block=%d, block_offset=%ld\n", batch_id, blockIdx.y, blockIdx.z, threadIdx.x, numtokens_in_block, block_offset);
     float dtype_max = ck_tile::type_convert<float>(ck_tile::numeric<kv_cache_scalar_t>::max());
     
@@ -706,7 +685,7 @@ template<typename scalar_t,  typename F, int WarpSize = 64>
          block_max = block_reduce<float, decltype(f_max_f32), wg_size, true>(block_max, f_max_f32);
          //__shared__ float smem_max[wg_size / WARP_SIZE];
          //block_max = block_reduce<float, decltype(f_max_f32), wg_size / WARP_SIZE>(block_max, f_max_f32, 0.0f, smem_max);
-     }
+     } 
 
      if(isK)
      {
@@ -867,7 +846,508 @@ template<typename scalar_t,  typename F, int WarpSize = 64>
         }
      }
  }
+ template <typename scalar_t,
+          typename kv_cache_scalar_t,
+          int head_dim,
+          bool interleave,
+          int num_kv_heads,
+          int wg_size = 64,
+          vllm::Fp8KVCacheDataType kv_dt>
+ __global__ void fusedQKNormRopeBlockQuantCacheShuffleKernel(
+    scalar_t* qkv_void,            // Combined QKV tensor [num_tokens, (num_heads_q+num_heads_k+num_heads_v), head_dim]
+    int const num_heads_q,         // Number of query heads
+    int const num_heads_k,         // Number of key heads
+    int const num_heads_v,         // Number of value heads
+    float const eps,               // Epsilon for RMS normalization
+    scalar_t const* q_weight,      // RMSNorm weights for query
+    scalar_t const* k_weight,      // RMSNorm weights for key
+    scalar_t const* cos_sin_cache, // Pre-computed cos/sin cache
+    int64_t const* position_ids,   // Position IDs for RoPE
+    kv_cache_scalar_t*
+        k_cache, // Key cache [num_blocks, num_kv_heads, head_size // x, block_size, x]
+    kv_cache_scalar_t*
+        v_cache,           // Value cache [num_blocks, num_kv_heads, block_size // x, head_size, x]
+    int64_t* slot_mapping,  // Slot mapping
+    int64_t const* cu_q_len, // Cu Q len tensor [0, batch0_seq_len, batch0_seq_len + batch1_seq_len, ...]
+    float* k_scale,        // Key scale for quantized key cache [num_blocks, num_kv_heads]
+    float* v_scale,        // Value scale for quantized value cache [num_blocks, num_kv_heads]
+    int const num_tokens,  // Number of tokens
+    int const page_size,   // Page size for kv cache
+    int x,                 // kv cache tiling size
+    int const batch_size   // Batch size
+)
+{
+    // per block deal with blockSize tokens
+    // gridDim = (1, gridSize, num_heads_q + num_heads_k + num_heads_v)
+    // blockIdx.y is the global block index across all batches
+    // Each batch needs ceil(seq_len/blockDim.x) + 1 blocks
+    int const laneId        = threadIdx.x % WARP_SIZE;
 
+    int const num_heads    = num_heads_q + num_heads_k + num_heads_v;
+    int const localHeadIdx = blockIdx.z;  // head index
+
+    // Map blockIdx.y -> (batch_id, block_within_batch) -> first_token_idx
+    // Each batch i uses ceil(seq_len_i / blockDim.x) + 1 blocks
+    int batch_id = -1;
+    int cum_blocks = 0;
+    for(int i = 0; i < batch_size; i++)
+    {
+        int64_t seq_len_i = cu_q_len[i + 1] - cu_q_len[i];
+        int blocks_i = (seq_len_i + blockDim.x - 1) / blockDim.x + 1;
+        if(cum_blocks + blocks_i > (int)blockIdx.y)
+        {
+            batch_id = i;
+            break;
+        }
+        cum_blocks += blocks_i;
+    }
+    // Extra blocks beyond all batches — nothing to do
+    if(batch_id < 0)
+        return;
+    int block_within_batch = (int)blockIdx.y - cum_blocks;
+
+    // Calculate current batch's sequence range
+    int64_t batch_start_idx = cu_q_len[batch_id];
+    int64_t batch_end_idx   = cu_q_len[batch_id + 1];
+    int64_t seq_len         = batch_end_idx - batch_start_idx;
+
+    // first_token_idx is relative to batch start
+    int64_t first_token_idx = batch_start_idx + block_within_batch * blockDim.x;
+
+    int64_t slot_idx;
+    int64_t block_idx;
+    int64_t block_offset;
+
+    // ============================================================================
+    // BOUNDARY HANDLING: Similar to cache_kernels.cu lines 504-521
+    // Handle case where GPU block extends beyond current batch's sequence length
+    // Ensure one wave group only processes one cache block (page)
+    // ============================================================================
+    if(first_token_idx >= batch_end_idx)
+    {
+        // This is the extra block for this batch (boundary handler)
+        // Check if we need to process remaining tokens from a different cache page
+
+        // Get the previous GPU block's first token
+        int64_t prev_first_token_idx = batch_start_idx + (block_within_batch - 1) * blockDim.x;
+        if(prev_first_token_idx < batch_start_idx || prev_first_token_idx >= batch_end_idx)
+        {
+            return;  // Invalid, just return
+        }
+
+        int64_t prev_slot_idx = slot_mapping[prev_first_token_idx];
+        int64_t preTg_block_idx = prev_slot_idx / page_size;
+
+        // Get the last token's cache block_idx (page)
+        int64_t last_token_idx = batch_end_idx - 1;
+        slot_idx = slot_mapping[last_token_idx];
+        block_idx = slot_idx / page_size;
+        // If they are in the same cache page, the previous GPU block already handled it
+        if(preTg_block_idx == block_idx)
+        {
+            return;  // Already processed by previous GPU block
+        }
+        // Different page: keep slot_idx/block_idx from last token; set block_offset and first_token_idx (like cache_kernels.cu)
+        block_offset = slot_idx % page_size;
+    }
+    else
+    {
+        // Normal case: GPU block starts within the valid token range
+        slot_idx = slot_mapping[first_token_idx];
+        block_idx = slot_idx / page_size;
+        block_offset = slot_idx % page_size;
+    }
+
+    if(slot_idx < 0)
+    {
+        // Invalid slot, skip
+        return;
+    }
+    if(first_token_idx > batch_start_idx && block_offset > 0)
+    {
+        __shared__ int64_t idx_smem[2];
+        if(threadIdx.x < page_size)
+        {
+            int64_t token_idx  = first_token_idx - (threadIdx.x + 1);
+            // Check if token_idx is within current batch
+            if(token_idx >= batch_start_idx)
+            {
+                int64_t block_idx1 = slot_mapping[token_idx] / page_size;
+                int64_t slot_idx2  = slot_mapping[token_idx + 1];
+                int64_t block_idx2 = slot_idx2 / page_size;
+                if(block_idx1 != block_idx2 && block_idx2 == block_idx)
+                {
+                    idx_smem[0] = token_idx + 1;
+                    idx_smem[1] = slot_idx2;
+                }
+            }
+        }
+
+        __syncthreads();
+        first_token_idx = idx_smem[0];
+        slot_idx        = idx_smem[1];
+        // block_idx unchanged: idx_smem search guarantees same page (block_idx2 == block_idx)
+        block_offset    = slot_idx % page_size;
+    }
+    // Each token should compute its own slot_id and block_offset
+    int64_t actual_slot_id = -1;
+    int64_t actual_block_offset = 0;
+    int64_t actual_block_idx = -1;
+
+    // Calculate the num_tokens that are in the same cache block (page)
+    int tokens_in_block = 0;
+    if(first_token_idx + threadIdx.x < batch_end_idx)
+    {
+        actual_slot_id = slot_mapping[first_token_idx + threadIdx.x];
+        if(actual_slot_id >= 0)
+        {
+            actual_block_idx = actual_slot_id / page_size;
+            actual_block_offset = actual_slot_id % page_size;
+            tokens_in_block = (actual_block_idx == block_idx) ? 1 : 0;
+        }
+    }
+    auto sum               = [](float a, float b) { return a + b; };
+    int numtokens_in_block = block_reduce<int, decltype(sum), wg_size, true>(tokens_in_block, sum);
+    // Calculate tokenIdx for current thread
+    int tokenIdx = first_token_idx + threadIdx.x;
+
+    bool const isQ                  = localHeadIdx < num_heads_q;
+    bool const isK                  = (localHeadIdx < num_heads_q + num_heads_k) & !isQ;
+    bool const isV                  = !isQ & !isK;
+    int const headIdx               = isV   ? localHeadIdx - num_heads_q - num_heads_k
+                                     : isK ? localHeadIdx - num_heads_q
+                                           : localHeadIdx;
+    constexpr int numElemsPerThread = head_dim;
+
+    constexpr int best_vec_size = sizeof(float4) / sizeof(scalar_t);
+    constexpr int vec_size      = std::min(best_vec_size, numElemsPerThread);
+    constexpr int load_loop_cnt = numElemsPerThread / vec_size;
+    constexpr int base_elems_per_thread = 64;
+    constexpr int base_loopcnt = base_elems_per_thread / vec_size;
+    using ltype                 = ::vec_t<scalar_t, vec_size>;
+    ltype elements;
+    ltype next_elements;
+    float block_max = 0.0f;
+    // Load data first, suppose have no tail since we check the head_dim is multiple of 32 before
+    // kernel launch
+    auto cur_element_offset = head_dim * threadIdx.x;
+    auto f_absmax_f32 = [](float v_0_, float v_1_) {
+        return __builtin_fmaxf(abs(v_0_), abs(v_1_));
+    };
+    if(tokenIdx < batch_end_idx)
+    {
+        // If qk, we adopt RMSNorm + RoPE, so we need to compute sum of squares.
+        if(isV)
+        {
+            for(int i = 0; i < load_loop_cnt; i += 1)
+            {
+                // consider stride
+                int64_t offsetWarp = (tokenIdx * num_heads * head_dim + localHeadIdx * head_dim) /
+                                    vec_size;
+                elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i];
+#pragma unroll
+                for(int j = 0; j < vec_size; j++)
+                {
+                    block_max = f_absmax_f32(block_max, static_cast<float>(elements[j]));
+                }
+            }
+        }
+        else
+        {
+            // Compute norm squares
+            float sumOfSquares = 0.0f;
+            int64_t offsetWarp = (tokenIdx * num_heads * head_dim + localHeadIdx * head_dim) /
+                                vec_size;
+            elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp];
+            int i = 1;
+            for(; i < load_loop_cnt; i++)
+            {
+                next_elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i];
+#pragma unroll
+                for(int j = 0; j < vec_size; j++)
+                {
+                    sumOfSquares += static_cast<float>(elements[j]) * static_cast<float>(elements[j]);
+                }
+                elements = next_elements;
+            }
+#pragma unroll
+            for(int j = 0; j < vec_size; j++)
+            {
+                sumOfSquares += static_cast<float>(elements[j]) * static_cast<float>(elements[j]);
+            }
+            auto sum_func = [](float a, float b) { return a + b; };
+            float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
+            // Apply RoPE to normalized elements
+            int64_t pos_id = position_ids[tokenIdx];
+
+            // Calculate cache pointer for this position - similar to
+            // pos_encoding_kernels.cu
+            scalar_t const* cache_ptr = cos_sin_cache + pos_id * head_dim;
+            int const embed_dim       = head_dim / 2;
+            scalar_t const* cos_ptr   = cache_ptr;
+            scalar_t const* sin_ptr   = cache_ptr + embed_dim;
+
+            // Normalize elements and apply RoPE
+            if constexpr(interleave)
+            {
+                // Perform interleaving with vectorized ping-pong buffer.
+                // Load vec_size elements directly from global memory (no LDS read),
+                // process RoPE pairs, write results to global memory and smem.
+                constexpr int pairs_per_vec = vec_size;
+                // Pre-load first vector from global memory
+
+                for(int i = 0; i < load_loop_cnt; i++)
+                {
+                    // Ping-pong: pre-load next vector from global memory
+                    elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i];
+                    int const base_idx = i * vec_size;
+#pragma unroll
+                    for(int k = 0; k < vec_size; k += 2)
+                    {
+                        int const local0 = base_idx + k;
+                        int const local1 = base_idx + k + 1;
+                        float weight0 = isQ ? float(q_weight[local0]) : float(k_weight[local0]);
+                        float weight1 = isQ ? float(q_weight[local1]) : float(k_weight[local1]);
+                        int const half_dim = local0 / 2;
+                        float cos_val = static_cast<float>(cos_ptr[half_dim]);
+                        float sin_val = static_cast<float>(sin_ptr[half_dim]);
+                        float const val0 = static_cast<float>(elements[k]) * rms_rcp * weight0;
+                        float const val1 = static_cast<float>(elements[k + 1]) * rms_rcp * weight1;
+                        elements[k] = static_cast<scalar_t>(val0 * cos_val - val1 * sin_val);
+                        elements[k + 1] = static_cast<scalar_t>(val0 * sin_val + val1 * cos_val);
+                        block_max = f_absmax_f32(block_max, elements[k]);
+                        block_max = f_absmax_f32(block_max, elements[k + 1]);
+                    }
+
+                    // Write processed vector directly to global memory and smem
+                    reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i] = elements;
+                }
+            }
+            else
+            {
+                for(int i = 0; i < load_loop_cnt / 2; i++)
+                {
+                    elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i];
+                    next_elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i + load_loop_cnt / 2];
+#pragma unroll
+                    for(int j = 0; j < vec_size; j++)
+                    {
+                        int const idx0 = i * vec_size + j;
+                        int const idx1 = load_loop_cnt / 2 * vec_size + idx0;
+                        float weight0 = isQ ? float(q_weight[idx0]) : float(k_weight[idx0]);
+                        float weight1 = isQ ? float(q_weight[idx1]) : float(k_weight[idx1]);
+                        // Use pre-computed cos/sin from cache
+                        // idx0 ranges [0, head_dim/2) = [0, embed_dim), so can use idx0 directly
+                        float cos_val = static_cast<float>(cos_ptr[idx0]);
+                        float sin_val = static_cast<float>(sin_ptr[idx0]);
+
+                        float const val0 = static_cast<float>(elements[j]) * rms_rcp * weight0;
+                        float const val1 = static_cast<float>(next_elements[j]) * rms_rcp * weight1;
+                        weight0 = val0 * cos_val - val1 * sin_val;
+                        weight1 = val1 * cos_val + val0 * sin_val;
+                        block_max = f_absmax_f32(block_max, weight0);
+                        block_max = f_absmax_f32(block_max, weight1);
+                        elements[j] = static_cast<scalar_t>(weight0);
+                        next_elements[j] = static_cast<scalar_t>(weight1);
+                    }
+
+                    reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i] = elements;
+                    reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i + load_loop_cnt / 2] = next_elements;
+                }
+            }
+            // store q
+        }
+    }
+
+    if(isQ)
+    {
+        // For Q, we are done.
+        return;
+    }
+
+    float dtype_max = ck_tile::type_convert<float>(ck_tile::numeric<kv_cache_scalar_t>::max());
+
+    auto f_max_f32 = [](float v_0_, float v_1_) { return __builtin_fmaxf(v_0_, v_1_); };
+    if(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
+    {
+        block_max = block_reduce<float, decltype(f_max_f32), wg_size, true>(block_max, f_max_f32);
+    }
+
+    if(isK)
+    {
+        float k_scale_val = 1.0f;
+        float inv_scale_val = 1.0f;
+        if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
+        {
+            k_scale_val = block_max / dtype_max;
+            inv_scale_val = dtype_max / block_max;
+            // Fix: correct scale index calculation [num_blocks, num_kv_heads]
+            int64_t scale_offset = block_idx * num_kv_heads + headIdx;
+
+            if(block_offset > 0)
+            {
+                float k_scale_global = k_scale[scale_offset];
+
+                if(k_scale_global < k_scale_val)
+                {
+                    // New data has larger dynamic range, need to requantize old data
+                    int64_t cache_base = block_idx * page_size * num_heads_k * head_dim +
+                                        headIdx * head_dim * page_size;
+
+                    // Requantize existing data [0, block_offset)
+                    // Flatten the loop: all threads cooperatively process block_offset * head_dim elements
+                    // [num_blocks, num_kv_heads, head_size // x, block_size, x]
+                    int total_elements = block_offset * head_dim;
+                    for(int idx = threadIdx.x; idx < total_elements; idx += blockDim.x)
+                    {
+                        int old_offset = idx / head_dim;
+                        int d = idx % head_dim;
+                        int d_idx = d / x;
+                        int x_idx = d % x;
+                        // [num_blocks, num_kv_heads, head_size // x, block_size, x]
+                        int64_t cache_idx = cache_base + d_idx * page_size * x +
+                                            old_offset * x + x_idx;
+
+                        float tmp = ck_tile::type_convert<float>(k_cache[cache_idx]);
+                        tmp = tmp * k_scale_global * inv_scale_val;
+                        k_cache[cache_idx] = ck_tile::type_convert<kv_cache_scalar_t>(tmp);
+                    }
+                    k_scale[scale_offset] = k_scale_val;
+                }
+                else
+                {
+                    // Old scale is sufficient, use it for new data
+                    k_scale_val = k_scale_global;
+                }
+            }
+            else
+            {
+                // New block, directly write scale
+                k_scale[scale_offset] = k_scale_val;
+            }
+        }
+        int64_t cache_offset = block_idx * page_size * num_heads_k * head_dim +
+                               headIdx * head_dim * page_size;
+        // Only write if current token belongs to this block
+        // [num_blocks, kv_heads, head_dim / x, block_size, x]
+        int64_t total_elements = numtokens_in_block * head_dim;
+        for(int64_t idx = threadIdx.x; idx < total_elements / vec_size; idx += blockDim.x)
+        {
+            int token_idx = first_token_idx + idx * vec_size / head_dim;
+            int head_offset = (idx * vec_size) % head_dim;
+            int64_t offsetWarp = (token_idx * num_heads * head_dim + localHeadIdx * head_dim) / vec_size;
+            elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + head_offset / vec_size];
+            int block_offset_local  = token_idx - first_token_idx + block_offset;
+            int64_t block_idx_local = block_offset_local / page_size + block_idx;
+            block_offset_local      = block_offset_local % page_size;
+
+            for(int j = 0; j < vec_size; j++)
+            {
+                int head_offset_divX = (head_offset + j) / x;
+                int head_offset_modX = (head_offset + j) % x;
+                int64_t offset = cache_offset + head_offset_divX * page_size * x + block_offset_local * x + head_offset_modX;
+
+                if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
+                {
+                    k_cache[offset] = elements[j];
+                }
+                else
+                {
+                    k_cache[offset] =
+                        ck_tile::type_convert<kv_cache_scalar_t>(float(elements[j]) * inv_scale_val);
+                }
+            }
+        }
+    }
+    else
+    {
+        float v_scale_val = 1.0f;
+        float inv_scale_val = 1.0f;
+        if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
+        {
+            v_scale_val = block_max / dtype_max;
+            // Fix: correct scale index calculation [num_blocks, num_kv_heads]
+            inv_scale_val = dtype_max / block_max;
+            int64_t scale_offset = block_idx * num_kv_heads + headIdx;
+
+            // Handle incremental updates: check for scale conflicts
+            if(block_offset > 0)
+            {
+                float v_scale_global = v_scale[scale_offset];
+
+                if(v_scale_global < v_scale_val)
+                {
+                    // New data has larger dynamic range, need to requantize old data
+                    int64_t cache_base = block_idx * page_size * num_heads_v * head_dim +
+                                        headIdx * head_dim * page_size;
+
+                    // Requantize existing data [0, block_offset)
+                    // Flatten the loop: all threads cooperatively process block_offset * head_dim elements
+                    int total_elements = block_offset * head_dim;
+                    for(int idx = threadIdx.x; idx < total_elements; idx += blockDim.x)
+                    {
+                        int old_offset = idx / head_dim;
+                        int d = idx % head_dim;
+                        int old_offset_divX = old_offset / x;
+                        int old_offset_modX = old_offset % x;
+                        // [num_blocks, num_kv_heads, block_size // x, head_size, x]
+                        int64_t cache_idx = cache_base + old_offset_divX * head_dim * x +
+                                            d * x + old_offset_modX;
+
+                        float tmp = ck_tile::type_convert<float>(v_cache[cache_idx]);
+                        tmp = tmp * v_scale_global * inv_scale_val;
+                        v_cache[cache_idx] = ck_tile::type_convert<kv_cache_scalar_t>(tmp);
+                    }
+                    v_scale[scale_offset] = v_scale_val;
+                }
+                else
+                {
+                    // Old scale is sufficient, use it for new data
+                    v_scale_val = v_scale_global;
+                }
+            }
+            else
+            {
+                // New block, directly write scale
+                v_scale[scale_offset] = v_scale_val;
+            }
+        }
+        int64_t cache_offset = block_idx * page_size * num_heads_v * head_dim +
+                               headIdx * head_dim * page_size;
+
+        // no vectorized store for v cache since its not contiguous on head_dim
+        // All threads participate in processing numtokens_in_block * head_dim elements
+        int64_t total_elements = numtokens_in_block * head_dim;
+
+        // [num_blocks, kv_heads, block_size / x, head_dim, x]
+        for(int64_t idx = threadIdx.x; idx < total_elements / vec_size; idx += blockDim.x)
+        {
+            int token_idx = first_token_idx + idx * vec_size / head_dim;
+            int head_offset = (idx * vec_size) % head_dim;
+            int64_t offsetWarp = (token_idx * num_heads * head_dim + localHeadIdx * head_dim) / vec_size;
+            elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + head_offset / vec_size];
+            int block_offset_local  = token_idx - first_token_idx + block_offset;
+            int64_t block_idx_local = block_offset_local / page_size + block_idx;
+            block_offset_local      = block_offset_local % page_size;
+            int block_offset_divX = block_offset_local / x;
+            int x_idx = block_offset_local % x;
+            for(int j = 0; j < vec_size; j++)
+            {
+                int64_t offset = cache_offset + block_offset_divX * head_dim * x + (head_offset + j) * x + x_idx;
+
+                if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
+                {
+                    v_cache[offset] = elements[j];
+                }
+                else
+                {
+                    v_cache[offset] =
+                        ck_tile::type_convert<kv_cache_scalar_t>(float(elements[j]) * inv_scale_val);
+                }
+            }
+        }
+    }
+}
  
  #define DISPATCH_KV_HEAD(num_kv_heads, ...)                             \
      if(num_kv_heads == 1)                                               \
@@ -1067,7 +1547,7 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
     // Kernel uses cum_blocks: each batch needs ceil(seq_len_i/blockSize) + 1 blocks.
     // Conservative upper bound: ceil(total/blockSize) + 2*batch_size
     int const gridSize = (num_tokens + blockSize - 1) / blockSize + 2 * batch_size;
-
+    //printf("[DEBUG] gridSize=%d, blockSize=%d, num_tokens=%d, batch_size=%d\n", gridSize, blockSize, num_tokens, batch_size);
     dim3 gridDim(1, gridSize, num_heads_q + num_heads_k + num_heads_v);
     dim3 blockDim(blockSize);
 
@@ -1103,6 +1583,8 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
 
 #define DISPATCH_BLOCK_SIZE(HEAD_DIM)                                            \
     if(blockSize == 64)       { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 64)  }      \
+    else if(blockSize == 128) { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 128) }      \
+    else if(blockSize == 256) { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 256) }      \
     else { TORCH_CHECK(false, "Unsupported blockSize: ", blockSize); }
 
     switch(head_dim)
@@ -1110,7 +1592,7 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
     case 64:  DISPATCH_BLOCK_SIZE(64);  break;
     case 128: DISPATCH_BLOCK_SIZE(128); break;
     //case 256: DISPATCH_BLOCK_SIZE(256); break;
-   //else if(blockSize == 128) { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 128) }      
+        
 #undef LAUNCH_BLOCK_QUANT_KERNEL
 #undef DISPATCH_BLOCK_SIZE
     default: TORCH_CHECK(false, "Unsupported head dimension for fusedQKNormRope: ", head_dim);
