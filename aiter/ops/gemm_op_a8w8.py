@@ -1,23 +1,25 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-from torch import Tensor
-from typing import Optional
 import functools
+from typing import Optional
+
 import pandas as pd
+import torch
 from aiter import logger
+from torch import Tensor
+from torch.library import Library
+
 from ..jit.core import (
-    compile_ops,
-    AITER_ROOT_DIR,
     AITER_CONFIGS,
     AITER_LOG_TUNED_CONFIG,
+    AITER_ROOT_DIR,
+    compile_ops,
 )
-from ..jit.utils.torch_guard import torch_compile_guard
-from ..utility import dtypes
 from ..jit.utils.chip_info import get_cu_num
-from torch.library import Library
+from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import get_padded_m
+from ..utility import dtypes
 
 aiter_lib = Library("aiter", "FRAGMENT")
 
@@ -620,7 +622,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
     n = WQ.shape[0]
     k = XQ.shape[1]
     config = get_CKGEMM_config(
-        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
+        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
     )
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     if config is not None:
