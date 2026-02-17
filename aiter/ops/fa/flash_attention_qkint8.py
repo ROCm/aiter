@@ -292,7 +292,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stri
         # load k_descale
         # k_descale_ptrs = k_descale_base_ptrs + start_n * stride_ksn
         k_descale = tl.load(k_descale_ptrs)
-        k_descale_ptrs += 1 # stride_ksn
+        k_descale_ptrs += stride_ksn
 
         if PRE_LOAD_V:
             # We can use the same offsets as k, just with dims transposed.
@@ -409,7 +409,7 @@ def is_rdna():
 
 def get_fwd_configs():
     return {
-        'BLOCK_M': 128, 'BLOCK_N': 128, 'waves_per_eu': 2, 'PRE_LOAD_V': False, 'GRID_CU_MULTIP': 1, 'num_stages': 2, 'num_warps': 8
+        'BLOCK_M': 256, 'BLOCK_N': 128, 'waves_per_eu': 2, 'PRE_LOAD_V': False, 'GRID_CU_MULTIP': 1, 'num_stages': 4, 'num_warps': 8
     }
 
 
@@ -486,9 +486,9 @@ def attn_fwd(Q, K, V, bias, SM_SCALE: tl.constexpr, L, Out, stride_qz, stride_qh
 
         offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_n = tl.arange(0, BLOCK_N)
-        offs_d = tl.arange(0, BLOCK_DMODEL//2)
+        offs_d = tl.arange(0, BLOCK_DMODEL)
         offs_dv = tl.arange(0, BLOCK_DMODEL)
-        offs_ds = tl.arange(0, 1)
+        # offs_ds = tl.arange(0, 1)
 
 
         continue_condition = True  # as we can't have return statements inside while loop in Triton
@@ -1056,16 +1056,10 @@ def get_strides_from_layout(q, k, v, o, metadata):
 
 
 def get_descale_strides_from_layout(q_descale, k_descale, v_descale, metadata):
-    if metadata.layout == 'bhsd':
-        q_descale_strides = (q_descale.stride(0), q_descale.stride(1), q_descale.stride(2), 1)
-        k_descale_strides = (k_descale.stride(0), k_descale.stride(1), k_descale.stride(2), 1)
-        v_descale_strides = (v_descale.stride(0), v_descale.stride(1), v_descale.stride(2))
-    elif metadata.layout == 'bshd':
-        q_descale_strides = (q_descale.stride(0), q_descale.stride(2), q_descale.stride(1), 1)
-        k_descale_strides = (k_descale.stride(0), k_descale.stride(2), k_descale.stride(1), 1)
-        v_descale_strides = (v_descale.stride(0), v_descale.stride(1), v_descale.stride(2))
-    else:
-        assert False, 'Got unsupported layout.'
+    q_descale_strides = (q_descale.stride(0), q_descale.stride(1), q_descale.stride(2), 1)
+    k_descale_strides = (k_descale.stride(0), k_descale.stride(1), k_descale.stride(2), 1)
+    v_descale_strides = (v_descale.stride(0), v_descale.stride(1), v_descale.stride(2))
+
     return q_descale_strides, k_descale_strides, v_descale_strides
 
 
@@ -1136,13 +1130,6 @@ class _attention(torch.autograd.Function):
             #grid = lambda META: (triton.cdiv(metadata.max_seqlens_q, META['BLOCK_M']), nheads_q, batch)
 
         atomic_counter = torch.zeros([1], device=q.device, dtype=torch.int32)
-        
-        print("q shape", q.shape)
-        print("k shape", k.shape)
-        print("v shape", v.shape)
-        print("q_descale shape", q_descale.shape)
-        print("k_descale shape", k_descale.shape)
-        print("q_descale strides", q_descale_strides)
         
         attn_fwd[grid](q, k, v, metadata.bias, metadata.sm_scale, M, o, *q_strides, *k_strides, *v_strides, *o_strides,
                        *bias_strides, *alibi_strides, *q_descale_strides, *k_descale_strides, *v_descale_strides, q_descale, k_descale, v_descale,
@@ -1255,15 +1242,15 @@ def quantize_input(
     input_metadata: MetaData
 ):
     
-    FP8_TYPE = aiter.dtypes.fp8
-    FP8_MAX = torch.finfo(FP8_TYPE).max
-    v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
+    fp8_dtype = aiter.dtypes.fp8
+    fp8_max = torch.finfo(fp8_dtype).max
+    v_fp8 = torch.empty_like(v, dtype=fp8_dtype, device=v.device)
     layout = input_metadata.layout
 
     BLKK, BLKQ = input_metadata.config["BLOCK_N"], input_metadata.config["BLOCK_M"]
     
-    # head_dim = q.shape[-1]
-    softmax_scale = input_metadata.sm_scale
+    head_dim = q.shape[-1]
+    softmax_scale = head_dim**-0.5
     
     
     q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = (
@@ -1271,8 +1258,8 @@ def quantize_input(
             q,
             k,
             v,
-            FP8_TYPE,
-            FP8_MAX,
+            fp8_dtype,
+            fp8_max,
             sm_scale=softmax_scale,
             BLKQ=BLKQ,
             BLKK=BLKK,
@@ -1416,8 +1403,7 @@ def check_accuracy_with_captured_inputs(args):
             input_metadata.set_persistent(args.persistent)
             fn = lambda: attention(q_quantized, k_quantized, v_quantized, o, input_metadata)
         triton_out, _ = fn()
-        print("Triton out", triton_out)
-        # print("triton out", triton_out)
+
         ref_out = fav2_forward_func(q, k, v, dropout_p=0.0, softmax_scale=sm_scale, causal=causal, return_lse=False, return_attn_probs=False)()
 
         assert ref_out.shape == triton_out.shape
@@ -1450,7 +1436,7 @@ def check_accuracy_with_captured_inputs(args):
 ])
 @pytest.mark.parametrize('causal', [False])
 @pytest.mark.parametrize('layout', ['bhsd'])
-def test_op_fwd_int8(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, layout, dtype=torch.float16):
+def test_op_fwd_int8(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, layout, dtype=torch.float16, torch_ref=True, use_aiter=False):
     torch.manual_seed(20)
 
     # Disable grad to save memeory it won't run into OOM on CI machine.
@@ -1460,8 +1446,11 @@ def test_op_fwd_int8(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, layout, dtype=torch
 
     o = torch.empty_like(q)
 
-    q_quantized, k_quantized, v_quantized = quantize_input(q, k, v, input_metadata)
-    triton_out, _ = attention(q_quantized, k_quantized, v_quantized, o, input_metadata)
+    if use_aiter:
+        triton_out, _ = fav3_sage_forward_func(q,k,v, causal,True,layout,use_mxfp4_sage=False)()
+    else:
+        q_quantized, k_quantized, v_quantized = quantize_input(q, k, v, input_metadata)
+        triton_out, _ = attention(q_quantized, k_quantized, v_quantized, o, input_metadata)
 
     if layout == "bhsd":
         q = q.permute(0, 2, 1, 3).contiguous()
@@ -1472,13 +1461,15 @@ def test_op_fwd_int8(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, layout, dtype=torch
         attention_ref,
     )
     
-    torch_out = attention_ref(q, k, v, dropout_p=0.0, dropout_mask=None, causal=False)
-    torch_out, _, _ = torch_out
-
+    if torch_ref:
+        ref_out = attention_ref(q, k, v, dropout_p=0.0, dropout_mask=None, causal=False)
+        ref_out, _, _ = ref_out
+    else:
+        ref_out = fav2_forward_func(q, k, v, dropout_p=0.0, softmax_scale=input_metadata.sm_scale, causal=causal, return_lse=False, return_attn_probs=False)()
+    
     if layout == "bhsd":
-        torch_out = torch_out.permute(0, 2, 1, 3).contiguous()
-
-    assert torch_out.shape == triton_out.shape
+        ref_out = ref_out.permute(0, 2, 1, 3).contiguous()
+    assert ref_out.shape == triton_out.shape
 
     from op_tests.triton_tests.attention.test_fav3_sage import check_attention_outputs, compare_accuracy
     ATOL_fp8 = 3.0e-1
@@ -1486,12 +1477,12 @@ def test_op_fwd_int8(Z, H, N_CTX_Q, N_CTX_K, D_HEAD, causal, layout, dtype=torch
 
     compare_accuracy(
         triton_out,
-        torch_out
+        ref_out
     )
 
     check_attention_outputs(
         triton_out,
-        torch_out,
+        ref_out,
         fp8=True,
         atol=ATOL_fp8,
         rtol=RTOL_fp8,
@@ -1780,7 +1771,8 @@ def main():
 
     if args.captured_dir is not None:
         check_accuracy_with_captured_inputs(args)
-    # test_op_fwd_int8(1, 5, 1024, 1024, 128, False, "bhsd")
+    else:
+        test_op_fwd_int8(args.b, args.hq, args.sq, args.sq, 128, False, "bhsd", torch_ref=False, use_aiter=args.use_aiter)
     run_benchmark(custom_config, args)
 
 
