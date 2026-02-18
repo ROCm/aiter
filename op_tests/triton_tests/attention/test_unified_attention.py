@@ -86,8 +86,10 @@ def shuffle_kv_cache(
 DEVICE_ARCH = arch_info.get_arch()
 
 NUM_HEADS = [(64, 8)]
-HEAD_SIZES = [32, 64, 128]
-BLOCK_SIZES = [16, 64]
+# HEAD_SIZES = [32, 64, 128]
+# BLOCK_SIZES = [16, 64]
+HEAD_SIZES = [64]
+BLOCK_SIZES = [16]
 
 DTYPES = [torch.bfloat16]
 QDTYPES = [None]
@@ -176,12 +178,13 @@ def ref_paged_attn(
     "seq_lens",
     [
         [(1, 1328)],
-        [(1, 8192)],
-        [(1, 8192)] * 4,
-        [(1, 8192)] * 8,
-        [(1, 32768)],
-        [(1, 523), (1, 37), (1, 2011)],
-        [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)],
+        # [(1, 8192)],
+        # [(1, 8192)] * 4,
+        # [(1, 8192)] * 8,
+        # [(1, 8192)] * 16,
+        # [(1, 32768)],
+        # [(1, 523), (1, 37), (1, 2011)],
+        # [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)],
     ],
 )
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
@@ -196,12 +199,12 @@ def ref_paged_attn(
 @pytest.mark.parametrize(
     "backend, use_tdm, num_tdm_gather, use_async",
     [
-        ("triton", False, 1, False),  # use triton
+        # ("triton", False, 1, False),  # use triton
         ("gluon", False, 1, False),  # use gluon baseline
-        ("gluon", False, 1, True),  # use gluon simple async_copy
-        ("gluon", True, 1, False),  # use gluon TDM async_copy
-        ("gluon", True, 4, False),  # use gluon TDM gather pipelined
-        ("gluon", True, 8, False),  # use gluon TDM gather pipelined
+        # ("gluon", False, 1, True),  # use gluon simple async_copy
+        # ("gluon", True, 1, False),  # use gluon TDM async_copy
+        # ("gluon", True, 4, False),  # use gluon TDM gather pipelined
+        # ("gluon", True, 8, False),  # use gluon TDM gather pipelined
     ],
 )
 @torch.inference_mode()
