@@ -1172,6 +1172,19 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_hk_mla": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mla_hk_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk_decode_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk/mi3xx_v32_fwd_decode_h128_fp8_fp8.cuh'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_topk_plain": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/topk_plain_pybind.cu'",

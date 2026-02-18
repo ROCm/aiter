@@ -12,7 +12,7 @@ import triton.language as tl
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_cu_num
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 
 
 @triton.jit
@@ -324,27 +324,54 @@ def mla_decode_fwd(
             else None
         )
 
-        aiter.mla_decode_stage1_asm_fwd(
-            q,
-            kv_buffer,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
-            num_kv_splits_indptr,
-            work_meta_data,
-            work_indptr,
-            work_info_set,
-            max_seqlen_q,
-            page_size,
-            nhead_kv,
-            sm_scale,
-            logits,
-            attn_lse,
-            o,
-            q_scale,
-            kv_scale,
+        # For gfx942, HK kernel is better or equal to asm in almost all the cases.
+        # For gfx950, HK kernel is worse than asm if the problem size is very large.
+        use_hk = (
+            nhead == 128
+            and q.dtype == dtypes.fp8
+            and kv_buffer.dtype == dtypes.fp8
+            and get_gfx() == "gfx942"
+            and page_size == 1
         )
+
+        if use_hk:
+            aiter.hk_mla_decode_fwd(
+                q,
+                kv_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                kv_last_page_lens,
+                work_indptr,
+                work_info_set,
+                max_seqlen_q,
+                sm_scale,
+                logits,
+                attn_lse,
+                o,
+            )
+        else:
+            aiter.mla_decode_stage1_asm_fwd(
+                q,
+                kv_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                kv_last_page_lens,
+                num_kv_splits_indptr,
+                work_meta_data,
+                work_indptr,
+                work_info_set,
+                max_seqlen_q,
+                page_size,
+                nhead_kv,
+                sm_scale,
+                logits,
+                attn_lse,
+                o,
+                q_scale,
+                kv_scale,
+            )
 
         aiter.mla_reduce_v1(
             logits,
