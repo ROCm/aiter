@@ -995,6 +995,15 @@ def run_benchmark_block_sparse_repetitions(args):
     num_q_blocks = (N_CTX_Q + BLOCK_M - 1) // BLOCK_M
     num_kv_blocks = (N_CTX_K + BLOCK_N - 1) // BLOCK_N
 
+    # JIT warmup: compile kernel before timed runs so reported ms is not inflated.
+    _warmup_mask = (
+        torch.rand(BATCH, HQ, num_q_blocks, num_kv_blocks, device=device) > args.block_sparsity
+    ).to(torch.bool)
+    _warmup_lut = block_attn_mask_to_ragged_lut(_warmup_mask)
+    bench_kernel(
+        q, k, v, args, "time(ms)", block_lut=_warmup_lut, block_attn_mask=_warmup_mask
+    )
+
     n_rep = args.n_repetitions
     throughputs_tflops = []
     latencies_ms = []
