@@ -108,8 +108,8 @@ def _allocate_L_M_acc(
     query_mask_1,
     RCP_LN2,
     BLOCK_M: ttgl.constexpr,
-    Q_BLOCKED_LAYOUT: ttgl.constexpr,
     HEAD_SIZE_PADDED: ttgl.constexpr,
+    QK_WMMA_LAYOUT: ttgl.constexpr,
     PV_WMMA_LAYOUT: ttgl.constexpr,
     USE_SINKS: ttgl.constexpr,
 ):
@@ -132,19 +132,19 @@ def _allocate_L_M_acc(
                 [BLOCK_M],
                 float("-inf"),
                 dtype=tl.float32,
-                layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT),
+                layout=ttgl.SliceLayout(1, QK_WMMA_LAYOUT),
             )
     else:
         M = ttgl.full(
             [BLOCK_M],
             float("-inf"),
             dtype=tl.float32,
-            layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT),
+            layout=ttgl.SliceLayout(1, QK_WMMA_LAYOUT),
         )
 
     # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
     L = ttgl.full(
-        [BLOCK_M], 1.0, dtype=tl.float32, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+        [BLOCK_M], 1.0, dtype=tl.float32, layout=ttgl.SliceLayout(1, QK_WMMA_LAYOUT)
     )
     # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
     acc = ttgl.zeros(
@@ -163,10 +163,9 @@ def _perform_QK_wmma_and_update_L_M(
     acc,
     qq_bias_row_ptrs,
     seq_offset,
-    query_mask_1,
-    query_mask_0,
-    context_len,
+    query_mask,
     query_pos,
+    context_len,
     alibi_slope,
     qq_bias_stride_0,
     qk_scale,
@@ -187,7 +186,7 @@ def _perform_QK_wmma_and_update_L_M(
     # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
     S = qk_scale * MMA_operation(Q, K, S)
     # S : shape = (BLOCK_M, TILE_SIZE), layout = Q_BLOCKED_LAYOUT
-    S = ttgl.convert_layout(S, layout=Q_BLOCKED_LAYOUT)
+    # S = ttgl.convert_layout(S, layout=Q_BLOCKED_LAYOUT)
 
     if USE_SOFTCAP:
         # softcap here uses exp2 and consumes RCP_LN2 conversion.
@@ -196,9 +195,7 @@ def _perform_QK_wmma_and_update_L_M(
 
     seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
-    S = ttgl.where(
-        query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
-    )
+    S = ttgl.where(query_mask & seq_mask, S, float("-inf"))
 
     if SLIDING_WINDOW > 0:
         S = ttgl.where(
@@ -614,15 +611,26 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
     # Q : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = Q_DOT_LAYOUT
     Q = smem_Q.load(layout=Q_DOT_LAYOUT)
 
+    offs_q_m_qk = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, QK_WMMA_LAYOUT))
+    query_pos_qk = q_block_local_idx * BLOCK_Q + offs_q_m_qk // num_queries_per_kv
+    query_offset_0_qk = cur_batch_in_all_start_index + query_pos_qk
+    query_offset_1_qk = (
+        kv_head_idx * num_queries_per_kv + offs_q_m_qk % num_queries_per_kv
+    )
+    query_mask_0_qk = query_pos_qk < cur_batch_query_len
+    query_mask_1_qk = query_offset_1_qk < num_query_heads
+    query_mask_qk = query_mask_1_qk[:, None] & query_mask_0_qk[:, None]
+    offs_seq_t = ttgl.arange(0, TILE_SIZE, layout=ttgl.SliceLayout(0, QK_WMMA_LAYOUT))
+
     L, M, acc = _allocate_L_M_acc(
         sink_ptr,
         segm_idx,
-        query_offset_1,
-        query_mask_1,
+        query_offset_1_qk,
+        query_mask_1_qk,
         RCP_LN2,
         BLOCK_M,
-        Q_BLOCKED_LAYOUT,
         HEAD_SIZE_PADDED,
+        QK_WMMA_LAYOUT,
         PV_WMMA_LAYOUT,
         USE_SINKS,
     )
@@ -631,14 +639,14 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
     alibi_slope = None
     if USE_ALIBI_SLOPES:
         alibi_slope = tl.load(
-            alibi_slopes_ptr + query_offset_1, mask=query_mask_1, other=0.0
+            alibi_slopes_ptr + query_offset_1_qk, mask=query_mask_1, other=0.0
         )
 
     # query-query attention bias
     qq_bias_row_ptrs = None
     if USE_QQ_BIAS:
         qq_bias_row_ptrs = (
-            qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
+            qq_bias_ptr + query_pos_qk[:, None] * qq_bias_stride_0
         )  # shape: [BLOCK_M]
 
     # compute the length of the longest sequence prefix spanned by any
@@ -675,7 +683,7 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
     j_producer = segm_idx * tiles_per_segment
     j_consumer = segm_idx * tiles_per_segment
     seq_offset = j_consumer * TILE_SIZE + ttgl.arange(
-        0, TILE_SIZE, layout=ttgl.SliceLayout(0, Q_BLOCKED_LAYOUT)
+        0, TILE_SIZE, layout=ttgl.SliceLayout(0, QK_WMMA_LAYOUT)
     )
 
     for _ in range(num_stages - 1):
@@ -707,175 +715,172 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
         )
 
     # iterate through tiles within current segment
-    for _ in range(tiles_per_segment - (num_stages - 1)):
-        if j_producer < num_tiles:
-            j_producer, offs_k_gather_idx, offs_v_gather_idx = (
-                _tdm_gather_get_kv_offsets(
-                    j_producer,
-                    offs_j,
-                    kv_head_idx,
-                    block_tables_ptr,
-                    block_table_offset,
-                    stride_k_cache_0 // stride_k_cache_1,  # = NUM_KV_HEADS
-                    stride_v_cache_0 // stride_v_cache_1,  # = NUM_KV_HEADS
-                    NUM_BLOCKS_GATHER_PER_TILE,
-                )
-            )
-            k_producer = _tdm_async_gather_load_to_lds(
-                k_producer,
-                desc=k_desc,
-                src_row_indices=offs_k_gather_idx,
-                src_col_offset=0,
-                dst=smem_K,
-                num_stages=num_stages,
-            )
-            v_producer = _tdm_async_gather_load_to_lds(
-                v_producer,
-                desc=v_desc,
-                src_row_indices=offs_v_gather_idx,
-                src_col_offset=0,
-                dst=smem_V,
-                num_stages=num_stages,
-            )
+    # for _ in range(tiles_per_segment - (num_stages - 1)):
+    for _ in range(
+        segm_idx * tiles_per_segment,
+        min((segm_idx + 1) * tiles_per_segment, num_tiles) - (num_stages - 1),
+    ):
+        j_producer, offs_k_gather_idx, offs_v_gather_idx = _tdm_gather_get_kv_offsets(
+            j_producer,
+            offs_j,
+            kv_head_idx,
+            block_tables_ptr,
+            block_table_offset,
+            stride_k_cache_0 // stride_k_cache_1,  # = NUM_KV_HEADS
+            stride_v_cache_0 // stride_v_cache_1,  # = NUM_KV_HEADS
+            NUM_BLOCKS_GATHER_PER_TILE,
+        )
+        k_producer = _tdm_async_gather_load_to_lds(
+            k_producer,
+            desc=k_desc,
+            src_row_indices=offs_k_gather_idx,
+            src_col_offset=0,
+            dst=smem_K,
+            num_stages=num_stages,
+        )
+        v_producer = _tdm_async_gather_load_to_lds(
+            v_producer,
+            desc=v_desc,
+            src_row_indices=offs_v_gather_idx,
+            src_col_offset=0,
+            dst=smem_V,
+            num_stages=num_stages,
+        )
 
-        if j_consumer < num_tiles:
-            # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
-            k_consumer, K = _tdm_gather_request_from_lds(
-                k_consumer,
-                k_scale,
-                Q.dtype,
-                smem_K,
-                asycn_wait=(num_stages - 1) * 2 + 1,
-                layout=K_DOT_LAYOUT,
-                transpose=True,
-                num_ctas=num_ctas,
-                num_stages=num_stages,
-                TILE_SIZE=TILE_SIZE,
-                HEAD_SIZE_PADDED=HEAD_SIZE_PADDED,
-            )
+        # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
+        k_consumer, K = _tdm_gather_request_from_lds(
+            k_consumer,
+            k_scale,
+            Q.dtype,
+            smem_K,
+            asycn_wait=(num_stages - 1) * 2 + 1,
+            layout=K_DOT_LAYOUT,
+            transpose=True,
+            num_ctas=num_ctas,
+            num_stages=num_stages,
+            TILE_SIZE=TILE_SIZE,
+            HEAD_SIZE_PADDED=HEAD_SIZE_PADDED,
+        )
 
-            # P : shape = (BLOCK_M, TILE_SIZE), layout = Q_BLOCKED_LAYOUT
-            # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
-            # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
-            # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
-            P, L, M, acc = _perform_QK_wmma_and_update_L_M(
-                Q,
-                K,
-                L,
-                M,
-                acc,
-                qq_bias_row_ptrs,
-                seq_offset,
-                query_mask_1,
-                query_mask_0,
-                context_len,
-                query_pos,
-                alibi_slope,
-                qq_bias_stride_0,
-                qk_scale,
-                softcap,
-                RCP_LN2,
-                BLOCK_M,
-                TILE_SIZE,
-                USE_SOFTCAP,
-                SLIDING_WINDOW,
-                USE_ALIBI_SLOPES,
-                USE_QQ_BIAS,
-                Q_BLOCKED_LAYOUT,
-                QK_WMMA_LAYOUT,
-                PV_WMMA_LAYOUT,
-            )
+        # P : shape = (BLOCK_M, TILE_SIZE), layout = Q_BLOCKED_LAYOUT
+        # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+        # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+        # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
+        P, L, M, acc = _perform_QK_wmma_and_update_L_M(
+            Q,
+            K,
+            L,
+            M,
+            acc,
+            qq_bias_row_ptrs,
+            seq_offset,
+            query_mask_qk,
+            query_pos_qk,
+            context_len,
+            alibi_slope,
+            qq_bias_stride_0,
+            qk_scale,
+            softcap,
+            RCP_LN2,
+            BLOCK_M,
+            TILE_SIZE,
+            USE_SOFTCAP,
+            SLIDING_WINDOW,
+            USE_ALIBI_SLOPES,
+            USE_QQ_BIAS,
+            Q_BLOCKED_LAYOUT,
+            QK_WMMA_LAYOUT,
+            PV_WMMA_LAYOUT,
+        )
 
-            # V : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = V_DOT_LAYOUT
-            v_consumer, V = _tdm_gather_request_from_lds(
-                v_consumer,
-                v_scale,
-                Q.dtype,
-                smem_V,
-                asycn_wait=(num_stages - 1) * 2,
-                layout=V_DOT_LAYOUT,
-                transpose=False,
-                num_ctas=num_ctas,
-                num_stages=num_stages,
-                TILE_SIZE=TILE_SIZE,
-                HEAD_SIZE_PADDED=HEAD_SIZE_PADDED,
-            )
+        # V : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = V_DOT_LAYOUT
+        v_consumer, V = _tdm_gather_request_from_lds(
+            v_consumer,
+            v_scale,
+            Q.dtype,
+            smem_V,
+            asycn_wait=(num_stages - 1) * 2,
+            layout=V_DOT_LAYOUT,
+            transpose=False,
+            num_ctas=num_ctas,
+            num_stages=num_stages,
+            TILE_SIZE=TILE_SIZE,
+            HEAD_SIZE_PADDED=HEAD_SIZE_PADDED,
+        )
 
-            # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
-            acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
+        # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
+        acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
 
-            j_consumer = j_consumer + 1
-            seq_offset += TILE_SIZE
+        j_consumer = j_consumer + 1
+        seq_offset += TILE_SIZE
 
     for _ in range(num_stages - 1):
-        if j_consumer < num_tiles:
-            # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
-            k_consumer, K = _tdm_gather_request_from_lds(
-                k_consumer,
-                k_scale,
-                Q.dtype,
-                smem_K,
-                asycn_wait=(num_stages - 1) * 2 + 1,
-                layout=K_DOT_LAYOUT,
-                transpose=True,
-                num_ctas=num_ctas,
-                num_stages=num_stages,
-                TILE_SIZE=TILE_SIZE,
-                HEAD_SIZE_PADDED=HEAD_SIZE_PADDED,
-            )
+        # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
+        k_consumer, K = _tdm_gather_request_from_lds(
+            k_consumer,
+            k_scale,
+            Q.dtype,
+            smem_K,
+            asycn_wait=(num_stages - 2) * 2 + 1,
+            layout=K_DOT_LAYOUT,
+            transpose=True,
+            num_ctas=num_ctas,
+            num_stages=num_stages,
+            TILE_SIZE=TILE_SIZE,
+            HEAD_SIZE_PADDED=HEAD_SIZE_PADDED,
+        )
 
-            # P : shape = (BLOCK_M, TILE_SIZE), layout = Q_BLOCKED_LAYOUT
-            # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
-            # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
-            # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
-            P, L, M, acc = _perform_QK_wmma_and_update_L_M(
-                Q,
-                K,
-                L,
-                M,
-                acc,
-                qq_bias_row_ptrs,
-                seq_offset,
-                query_mask_1,
-                query_mask_0,
-                context_len,
-                query_pos,
-                alibi_slope,
-                qq_bias_stride_0,
-                qk_scale,
-                softcap,
-                RCP_LN2,
-                BLOCK_M,
-                TILE_SIZE,
-                USE_SOFTCAP,
-                SLIDING_WINDOW,
-                USE_ALIBI_SLOPES,
-                USE_QQ_BIAS,
-                Q_BLOCKED_LAYOUT,
-                QK_WMMA_LAYOUT,
-                PV_WMMA_LAYOUT,
-            )
+        # P : shape = (BLOCK_M, TILE_SIZE), layout = Q_BLOCKED_LAYOUT
+        # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+        # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+        # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
+        P, L, M, acc = _perform_QK_wmma_and_update_L_M(
+            Q,
+            K,
+            L,
+            M,
+            acc,
+            qq_bias_row_ptrs,
+            seq_offset,
+            query_mask_qk,
+            query_pos_qk,
+            context_len,
+            alibi_slope,
+            qq_bias_stride_0,
+            qk_scale,
+            softcap,
+            RCP_LN2,
+            BLOCK_M,
+            TILE_SIZE,
+            USE_SOFTCAP,
+            SLIDING_WINDOW,
+            USE_ALIBI_SLOPES,
+            USE_QQ_BIAS,
+            Q_BLOCKED_LAYOUT,
+            QK_WMMA_LAYOUT,
+            PV_WMMA_LAYOUT,
+        )
 
-            # V : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = V_DOT_LAYOUT
-            v_consumer, V = _tdm_gather_request_from_lds(
-                v_consumer,
-                v_scale,
-                Q.dtype,
-                smem_V,
-                asycn_wait=(num_stages - 1) * 2,
-                layout=V_DOT_LAYOUT,
-                transpose=False,
-                num_ctas=num_ctas,
-                num_stages=num_stages,
-                TILE_SIZE=TILE_SIZE,
-                HEAD_SIZE_PADDED=HEAD_SIZE_PADDED,
-            )
+        # V : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = V_DOT_LAYOUT
+        v_consumer, V = _tdm_gather_request_from_lds(
+            v_consumer,
+            v_scale,
+            Q.dtype,
+            smem_V,
+            asycn_wait=(num_stages - 2) * 2,
+            layout=V_DOT_LAYOUT,
+            transpose=False,
+            num_ctas=num_ctas,
+            num_stages=num_stages,
+            TILE_SIZE=TILE_SIZE,
+            HEAD_SIZE_PADDED=HEAD_SIZE_PADDED,
+        )
 
-            # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
-            acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
+        # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
+        acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
 
-            j_consumer = j_consumer + 1
-            seq_offset += TILE_SIZE
+        j_consumer = j_consumer + 1
+        seq_offset += TILE_SIZE
 
     # store segm_output
     # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = Q_BLOCKED_LAYOUT
@@ -895,13 +900,15 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
     )
 
     # store segm_max and segm_expsum
-    # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
-    # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+    # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, QK_WMMA_LAYOUT)
+    # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, QK_WMMA_LAYOUT)
     segm_offset = (
         query_offset_0 * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
         + query_offset_1 * NUM_SEGMENTS_PER_SEQ
         + segm_idx
     )
+    L = ttgl.convert_layout(L, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT))
+    M = ttgl.convert_layout(M, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT))
     ttgl.amd.cdna4.buffer_store(
         stored_value=M,
         ptr=segm_max_ptr,
@@ -1252,15 +1259,26 @@ def gluon_kernel_unified_attention_3d_tdm(
     # Q : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = Q_DOT_LAYOUT
     Q = smem_Q.load(layout=Q_DOT_LAYOUT)
 
+    offs_q_m_qk = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, QK_WMMA_LAYOUT))
+    query_pos_qk = q_block_local_idx * BLOCK_Q + offs_q_m_qk // num_queries_per_kv
+    query_offset_0_qk = cur_batch_in_all_start_index + query_pos_qk
+    query_offset_1_qk = (
+        kv_head_idx * num_queries_per_kv + offs_q_m_qk % num_queries_per_kv
+    )
+    query_mask_0_qk = query_pos_qk < cur_batch_query_len
+    query_mask_1_qk = query_offset_1_qk < num_query_heads
+    query_mask_qk = query_mask_1_qk[:, None] & query_mask_0_qk[:, None]
+    offs_seq_t = ttgl.arange(0, TILE_SIZE, layout=ttgl.SliceLayout(0, QK_WMMA_LAYOUT))
+
     L, M, acc = _allocate_L_M_acc(
         sink_ptr,
         segm_idx,
-        query_offset_1,
-        query_mask_1,
+        query_offset_1_qk,
+        query_mask_1_qk,
         RCP_LN2,
         BLOCK_M,
-        Q_BLOCKED_LAYOUT,
         HEAD_SIZE_PADDED,
+        QK_WMMA_LAYOUT,
         PV_WMMA_LAYOUT,
         USE_SINKS,
     )
@@ -1269,14 +1287,14 @@ def gluon_kernel_unified_attention_3d_tdm(
     alibi_slope = None
     if USE_ALIBI_SLOPES:
         alibi_slope = tl.load(
-            alibi_slopes_ptr + query_offset_1, mask=query_mask_1, other=0.0
+            alibi_slopes_ptr + query_offset_1_qk, mask=query_mask_1, other=0.0
         )
 
     # query-query attention bias
     qq_bias_row_ptrs = None
     if USE_QQ_BIAS:
         qq_bias_row_ptrs = (
-            qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
+            qq_bias_ptr + query_pos_qk[:, None] * qq_bias_stride_0
         )  # shape: [BLOCK_M]
 
     # compute the length of the longest sequence prefix spanned by any
@@ -1306,7 +1324,7 @@ def gluon_kernel_unified_attention_3d_tdm(
     j_producer = segm_idx * tiles_per_segment
     j_consumer = segm_idx * tiles_per_segment
     seq_offset = j_consumer * TILE_SIZE + ttgl.arange(
-        0, TILE_SIZE, layout=ttgl.SliceLayout(0, Q_BLOCKED_LAYOUT)
+        0, TILE_SIZE, layout=ttgl.SliceLayout(0, QK_WMMA_LAYOUT)
     )
 
     for _ in range(num_stages - 1):
@@ -1338,165 +1356,164 @@ def gluon_kernel_unified_attention_3d_tdm(
         )
 
     # iterate through tiles within current segment
-    for _ in range(tiles_per_segment - (num_stages - 1)):
-        if j_producer < num_tiles:
-            j_producer, offs_k_t, offs_k_d, offs_v_t, offs_v_d = _tdm_get_kv_offsets(
-                j_producer,
-                kv_head_idx,
-                block_tables_ptr,
-                block_table_offset,
-                stride_k_cache_0 // stride_k_cache_1,  # = BLOCK_SIZE
-                stride_k_cache_2,
-                stride_v_cache_0 // stride_v_cache_1,  # = BLOCK_SIZE
-                stride_v_cache_2,
-            )
-            k_producer = _tdm_async_load_to_lds(
-                k_producer,
-                src=k_desc,
-                offsets=[offs_k_t, offs_k_d],
-                dest=smem_K,
-                pred_i32=pred_i32,
-                num_stages=num_stages,
-            )
-            v_producer = _tdm_async_load_to_lds(
-                v_producer,
-                src=v_desc,
-                offsets=[offs_v_t, offs_v_d],
-                dest=smem_V,
-                pred_i32=pred_i32,
-                num_stages=num_stages,
-            )
+    # for _ in range(tiles_per_segment - (num_stages - 1)):
+    for _ in range(
+        segm_idx * tiles_per_segment,
+        min((segm_idx + 1) * tiles_per_segment, num_tiles) - (num_stages - 1),
+    ):
+        j_producer, offs_k_t, offs_k_d, offs_v_t, offs_v_d = _tdm_get_kv_offsets(
+            j_producer,
+            kv_head_idx,
+            block_tables_ptr,
+            block_table_offset,
+            stride_k_cache_0 // stride_k_cache_1,  # = BLOCK_SIZE
+            stride_k_cache_2,
+            stride_v_cache_0 // stride_v_cache_1,  # = BLOCK_SIZE
+            stride_v_cache_2,
+        )
+        k_producer = _tdm_async_load_to_lds(
+            k_producer,
+            src=k_desc,
+            offsets=[offs_k_t, offs_k_d],
+            dest=smem_K,
+            pred_i32=pred_i32,
+            num_stages=num_stages,
+        )
+        v_producer = _tdm_async_load_to_lds(
+            v_producer,
+            src=v_desc,
+            offsets=[offs_v_t, offs_v_d],
+            dest=smem_V,
+            pred_i32=pred_i32,
+            num_stages=num_stages,
+        )
 
-        if j_consumer < num_tiles:
-            # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
-            k_consumer, K = _tdm_request_from_lds(
-                k_consumer,
-                k_scale,
-                Q.dtype,
-                smem_K,
-                asycn_wait=(num_stages - 1) * 2 + 1,
-                layout=K_DOT_LAYOUT,
-                transpose=True,
-                num_ctas=num_ctas,
-                num_stages=num_stages,
-            )
+        # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
+        k_consumer, K = _tdm_request_from_lds(
+            k_consumer,
+            k_scale,
+            Q.dtype,
+            smem_K,
+            asycn_wait=(num_stages - 1) * 2 + 1,
+            layout=K_DOT_LAYOUT,
+            transpose=True,
+            num_ctas=num_ctas,
+            num_stages=num_stages,
+        )
 
-            # P : shape = (BLOCK_M, TILE_SIZE), layout = Q_BLOCKED_LAYOUT
-            # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
-            # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
-            # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
-            P, L, M, acc = _perform_QK_wmma_and_update_L_M(
-                Q,
-                K,
-                L,
-                M,
-                acc,
-                qq_bias_row_ptrs,
-                seq_offset,
-                query_mask_1,
-                query_mask_0,
-                context_len,
-                query_pos,
-                alibi_slope,
-                qq_bias_stride_0,
-                qk_scale,
-                softcap,
-                RCP_LN2,
-                BLOCK_M,
-                TILE_SIZE,
-                USE_SOFTCAP,
-                SLIDING_WINDOW,
-                USE_ALIBI_SLOPES,
-                USE_QQ_BIAS,
-                Q_BLOCKED_LAYOUT,
-                QK_WMMA_LAYOUT,
-                PV_WMMA_LAYOUT,
-            )
+        # P : shape = (BLOCK_M, TILE_SIZE), layout = Q_BLOCKED_LAYOUT
+        # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+        # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+        # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
+        P, L, M, acc = _perform_QK_wmma_and_update_L_M(
+            Q,
+            K,
+            L,
+            M,
+            acc,
+            qq_bias_row_ptrs,
+            seq_offset,
+            query_mask_qk,
+            query_pos_qk,
+            context_len,
+            alibi_slope,
+            qq_bias_stride_0,
+            qk_scale,
+            softcap,
+            RCP_LN2,
+            BLOCK_M,
+            TILE_SIZE,
+            USE_SOFTCAP,
+            SLIDING_WINDOW,
+            USE_ALIBI_SLOPES,
+            USE_QQ_BIAS,
+            Q_BLOCKED_LAYOUT,
+            QK_WMMA_LAYOUT,
+            PV_WMMA_LAYOUT,
+        )
 
-            # V : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = V_DOT_LAYOUT
-            v_consumer, V = _tdm_request_from_lds(
-                v_consumer,
-                v_scale,
-                Q.dtype,
-                smem_V,
-                asycn_wait=(num_stages - 1) * 2,
-                layout=V_DOT_LAYOUT,
-                transpose=False,
-                num_ctas=num_ctas,
-                num_stages=num_stages,
-            )
+        # V : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = V_DOT_LAYOUT
+        v_consumer, V = _tdm_request_from_lds(
+            v_consumer,
+            v_scale,
+            Q.dtype,
+            smem_V,
+            asycn_wait=(num_stages - 1) * 2,
+            layout=V_DOT_LAYOUT,
+            transpose=False,
+            num_ctas=num_ctas,
+            num_stages=num_stages,
+        )
 
-            # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
-            acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
+        # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
+        acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
 
-            j_consumer = j_consumer + 1
-            seq_offset += TILE_SIZE
+        j_consumer = j_consumer + 1
+        seq_offset += TILE_SIZE
 
     for _ in range(num_stages - 1):
-        if j_consumer < num_tiles:
-            # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
-            k_consumer, K = _tdm_request_from_lds(
-                k_consumer,
-                k_scale,
-                Q.dtype,
-                smem_K,
-                asycn_wait=(num_stages - 1) * 2 + 1,
-                layout=K_DOT_LAYOUT,
-                transpose=True,
-                num_ctas=num_ctas,
-                num_stages=num_stages,
-            )
+        # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
+        k_consumer, K = _tdm_request_from_lds(
+            k_consumer,
+            k_scale,
+            Q.dtype,
+            smem_K,
+            asycn_wait=(num_stages - 2) * 2 + 1,
+            layout=K_DOT_LAYOUT,
+            transpose=True,
+            num_ctas=num_ctas,
+            num_stages=num_stages,
+        )
 
-            # P : shape = (BLOCK_M, TILE_SIZE), layout = Q_BLOCKED_LAYOUT
-            # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
-            # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
-            # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
-            P, L, M, acc = _perform_QK_wmma_and_update_L_M(
-                Q,
-                K,
-                L,
-                M,
-                acc,
-                qq_bias_row_ptrs,
-                seq_offset,
-                query_mask_1,
-                query_mask_0,
-                context_len,
-                query_pos,
-                alibi_slope,
-                qq_bias_stride_0,
-                qk_scale,
-                softcap,
-                RCP_LN2,
-                BLOCK_M,
-                TILE_SIZE,
-                USE_SOFTCAP,
-                SLIDING_WINDOW,
-                USE_ALIBI_SLOPES,
-                USE_QQ_BIAS,
-                Q_BLOCKED_LAYOUT,
-                QK_WMMA_LAYOUT,
-                PV_WMMA_LAYOUT,
-            )
+        # P : shape = (BLOCK_M, TILE_SIZE), layout = Q_BLOCKED_LAYOUT
+        # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+        # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+        # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
+        P, L, M, acc = _perform_QK_wmma_and_update_L_M(
+            Q,
+            K,
+            L,
+            M,
+            acc,
+            qq_bias_row_ptrs,
+            seq_offset,
+            query_mask_qk,
+            query_pos_qk,
+            context_len,
+            alibi_slope,
+            qq_bias_stride_0,
+            qk_scale,
+            softcap,
+            RCP_LN2,
+            BLOCK_M,
+            TILE_SIZE,
+            USE_SOFTCAP,
+            SLIDING_WINDOW,
+            USE_ALIBI_SLOPES,
+            USE_QQ_BIAS,
+            Q_BLOCKED_LAYOUT,
+            QK_WMMA_LAYOUT,
+            PV_WMMA_LAYOUT,
+        )
 
-            # V : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = V_DOT_LAYOUT
-            v_consumer, V = _tdm_request_from_lds(
-                v_consumer,
-                v_scale,
-                Q.dtype,
-                smem_V,
-                asycn_wait=(num_stages - 1) * 2,
-                layout=V_DOT_LAYOUT,
-                transpose=False,
-                num_ctas=num_ctas,
-                num_stages=num_stages,
-            )
+        # V : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = V_DOT_LAYOUT
+        v_consumer, V = _tdm_request_from_lds(
+            v_consumer,
+            v_scale,
+            Q.dtype,
+            smem_V,
+            asycn_wait=(num_stages - 2) * 2,
+            layout=V_DOT_LAYOUT,
+            transpose=False,
+            num_ctas=num_ctas,
+            num_stages=num_stages,
+        )
 
-            # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
-            acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
+        # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
+        acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
 
-            j_consumer = j_consumer + 1
-            seq_offset += TILE_SIZE
+        j_consumer = j_consumer + 1
+        seq_offset += TILE_SIZE
 
     # store segm_output
     # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = Q_BLOCKED_LAYOUT
@@ -1516,13 +1533,15 @@ def gluon_kernel_unified_attention_3d_tdm(
     )
 
     # store segm_max and segm_expsum
-    # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
-    # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+    # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, QK_WMMA_LAYOUT)
+    # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, QK_WMMA_LAYOUT)
     segm_offset = (
         query_offset_0 * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
         + query_offset_1 * NUM_SEGMENTS_PER_SEQ
         + segm_idx
     )
+    L = ttgl.convert_layout(L, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT))
+    M = ttgl.convert_layout(M, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT))
     ttgl.amd.cdna4.buffer_store(
         stored_value=M,
         ptr=segm_max_ptr,
@@ -1831,15 +1850,26 @@ def gluon_kernel_unified_attention_3d_async(
     # Q : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = Q_DOT_LAYOUT
     Q = smem_Q.load(layout=Q_DOT_LAYOUT)
 
+    offs_q_m_qk = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, QK_WMMA_LAYOUT))
+    query_pos_qk = q_block_local_idx * BLOCK_Q + offs_q_m_qk // num_queries_per_kv
+    query_offset_0_qk = cur_batch_in_all_start_index + query_pos_qk
+    query_offset_1_qk = (
+        kv_head_idx * num_queries_per_kv + offs_q_m_qk % num_queries_per_kv
+    )
+    query_mask_0_qk = query_pos_qk < cur_batch_query_len
+    query_mask_1_qk = query_offset_1_qk < num_query_heads
+    query_mask_qk = query_mask_1_qk[:, None] & query_mask_0_qk[:, None]
+    offs_seq_t = ttgl.arange(0, TILE_SIZE, layout=ttgl.SliceLayout(0, QK_WMMA_LAYOUT))
+
     L, M, acc = _allocate_L_M_acc(
         sink_ptr,
         segm_idx,
-        query_offset_1,
-        query_mask_1,
+        query_offset_1_qk,
+        query_mask_1_qk,
         RCP_LN2,
         BLOCK_M,
-        Q_BLOCKED_LAYOUT,
         HEAD_SIZE_PADDED,
+        QK_WMMA_LAYOUT,
         PV_WMMA_LAYOUT,
         USE_SINKS,
     )
@@ -1848,14 +1878,14 @@ def gluon_kernel_unified_attention_3d_async(
     alibi_slope = None
     if USE_ALIBI_SLOPES:
         alibi_slope = tl.load(
-            alibi_slopes_ptr + query_offset_1, mask=query_mask_1, other=0.0
+            alibi_slopes_ptr + query_offset_1_qk, mask=query_mask_1, other=0.0
         )
 
     # query-query attention bias
     qq_bias_row_ptrs = None
     if USE_QQ_BIAS:
         qq_bias_row_ptrs = (
-            qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
+            qq_bias_ptr + query_pos_qk[:, None] * qq_bias_stride_0
         )  # shape: [BLOCK_M]
 
     # compute the length of the longest sequence prefix spanned by any
@@ -1885,7 +1915,7 @@ def gluon_kernel_unified_attention_3d_async(
     j_producer = segm_idx * tiles_per_segment
     j_consumer = segm_idx * tiles_per_segment
     seq_offset = j_consumer * TILE_SIZE + ttgl.arange(
-        0, TILE_SIZE, layout=ttgl.SliceLayout(0, Q_BLOCKED_LAYOUT)
+        0, TILE_SIZE, layout=ttgl.SliceLayout(0, QK_WMMA_LAYOUT)
     )
 
     for _ in range(num_stages - 1):
@@ -2011,10 +2041,9 @@ def gluon_kernel_unified_attention_3d_async(
             acc,
             qq_bias_row_ptrs,
             seq_offset,
-            query_mask_1,
-            query_mask_0,
+            query_mask_qk,
+            query_pos_qk,
             context_len,
-            query_pos,
             alibi_slope,
             qq_bias_stride_0,
             qk_scale,
@@ -2075,10 +2104,9 @@ def gluon_kernel_unified_attention_3d_async(
             acc,
             qq_bias_row_ptrs,
             seq_offset,
-            query_mask_1,
-            query_mask_0,
+            query_mask_qk,
+            query_pos_qk,
             context_len,
-            query_pos,
             alibi_slope,
             qq_bias_stride_0,
             qk_scale,
@@ -2132,13 +2160,15 @@ def gluon_kernel_unified_attention_3d_async(
     )
 
     # store segm_max and segm_expsum
-    # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
-    # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+    # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, QK_WMMA_LAYOUT)
+    # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, QK_WMMA_LAYOUT)
     segm_offset = (
         query_offset_0 * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
         + query_offset_1 * NUM_SEGMENTS_PER_SEQ
         + segm_idx
     )
+    L = ttgl.convert_layout(L, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT))
+    M = ttgl.convert_layout(M, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT))
     ttgl.amd.cdna4.buffer_store(
         stored_value=M,
         ptr=segm_max_ptr,
@@ -2355,15 +2385,26 @@ def gluon_kernel_unified_attention_3d(
     # Q : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = Q_DOT_LAYOUT
     Q = smem_Q.load(layout=Q_DOT_LAYOUT)
 
+    offs_q_m_qk = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, QK_WMMA_LAYOUT))
+    query_pos_qk = q_block_local_idx * BLOCK_Q + offs_q_m_qk // num_queries_per_kv
+    query_offset_0_qk = cur_batch_in_all_start_index + query_pos_qk
+    query_offset_1_qk = (
+        kv_head_idx * num_queries_per_kv + offs_q_m_qk % num_queries_per_kv
+    )
+    query_mask_0_qk = query_pos_qk < cur_batch_query_len
+    query_mask_1_qk = query_offset_1_qk < num_query_heads
+    query_mask_qk = query_mask_1_qk[:, None] & query_mask_0_qk[:, None]
+    offs_seq_t = ttgl.arange(0, TILE_SIZE, layout=ttgl.SliceLayout(0, QK_WMMA_LAYOUT))
+
     L, M, acc = _allocate_L_M_acc(
         sink_ptr,
         segm_idx,
-        query_offset_1,
-        query_mask_1,
+        query_offset_1_qk,
+        query_mask_1_qk,
         RCP_LN2,
         BLOCK_M,
-        Q_BLOCKED_LAYOUT,
         HEAD_SIZE_PADDED,
+        QK_WMMA_LAYOUT,
         PV_WMMA_LAYOUT,
         USE_SINKS,
     )
@@ -2372,14 +2413,14 @@ def gluon_kernel_unified_attention_3d(
     alibi_slope = None
     if USE_ALIBI_SLOPES:
         alibi_slope = tl.load(
-            alibi_slopes_ptr + query_offset_1, mask=query_mask_1, other=0.0
+            alibi_slopes_ptr + query_offset_1_qk, mask=query_mask_1, other=0.0
         )
 
     # query-query attention bias
     qq_bias_row_ptrs = None
     if USE_QQ_BIAS:
         qq_bias_row_ptrs = (
-            qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
+            qq_bias_ptr + query_pos_qk[:, None] * qq_bias_stride_0
         )  # shape: [BLOCK_M]
 
     # compute the length of the longest sequence prefix spanned by any
@@ -2408,8 +2449,10 @@ def gluon_kernel_unified_attention_3d(
     ):
         # seq_k_offset : shape = (TILE_SIZE, ), layout = ttgl.SliceLayout(0, K_BLOCKED_LAYOUT)
         # seq_v_offset : shape = (TILE_SIZE, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+        # seq_offset : shape = (TILE_SIZE, ), layout = ttgl.SliceLayout(0, QK_WMMA_LAYOUT)
         seq_k_offset = j * TILE_SIZE + offs_k_t
         seq_v_offset = j * TILE_SIZE + offs_v_t
+        seq_offset = j * TILE_SIZE + offs_seq_t
 
         if TILE_SIZE == BLOCK_SIZE:
             tile_k_mask = ttgl.full(
@@ -2477,10 +2520,6 @@ def gluon_kernel_unified_attention_3d(
             KV_cache_modifier,
         )
 
-        seq_offset = ttgl.convert_layout(
-            seq_v_offset, layout=ttgl.SliceLayout(0, Q_BLOCKED_LAYOUT)
-        )
-
         P, L, M, acc = _perform_QK_wmma_and_update_L_M(
             Q,
             K,
@@ -2489,10 +2528,9 @@ def gluon_kernel_unified_attention_3d(
             acc,
             qq_bias_row_ptrs,
             seq_offset,
-            query_mask_1,
-            query_mask_0,
+            query_mask_qk,
+            query_pos_qk,
             context_len,
-            query_pos,
             alibi_slope,
             qq_bias_stride_0,
             qk_scale,
@@ -2530,13 +2568,15 @@ def gluon_kernel_unified_attention_3d(
     )
 
     # store segm_max and segm_expsum
-    # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
-    # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+    # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, QK_WMMA_LAYOUT)
+    # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, QK_WMMA_LAYOUT)
     segm_offset = (
         query_offset_0 * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
         + query_offset_1 * NUM_SEGMENTS_PER_SEQ
         + segm_idx
     )
+    L = ttgl.convert_layout(L, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT))
+    M = ttgl.convert_layout(M, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT))
     ttgl.amd.cdna4.buffer_store(
         stored_value=M,
         ptr=segm_max_ptr,
