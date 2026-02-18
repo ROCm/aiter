@@ -56,9 +56,7 @@ class AsyncCopyDescriptor:
         """
         offs_k = off_k + ttgl.arange(0, BLOCK_K, layout=ttgl.SliceLayout(0, BLOCKED_MK))
         step_k = BLOCK_K * stride_k
-        
         offs = gathered_m.to(ttgl.int32)[:, None] * stride_m + offs_k .to(ttgl.int32)[None, :]* stride_k
-
         return AsyncCopyDescriptor(ptr, offs, offs_k, step_k, BLOCK_M, BLOCK_K)
     
     @gluon.jit
@@ -72,9 +70,8 @@ class AsyncCopyDescriptor:
             mask_k: Optional mask for K dimension (for EVEN_K=False case)
         """
         offs = self.offs + k_idx * self.step_k
-        
         if mask_k is not None:
-            cp.global_to_shared(buffer, self.ptr + offs, mask=mask_k[None, :], other=0.0)
+            cp.global_to_shared(buffer, self.ptr + offs, mask=mask_k, other=0.0)
         else:
             cp.global_to_shared(buffer, self.ptr + offs)
         cp.commit_group()
@@ -153,10 +150,10 @@ def _reduce_grouped(
     start = pid_t * K
     
     threads_per_elem_n: ttgl.constexpr = triton.cdiv(
-        BLOCK_N // (NUM_WARPS * 64), 16
+        BLOCK_N // (NUM_WARPS * 32), 16
     )
     threads_per_elem_n_out: ttgl.constexpr = triton.cdiv(
-        BLOCK_N_OUT // (NUM_WARPS * 64), 16
+        BLOCK_N_OUT // (NUM_WARPS * 32), 16
     )
     
     blocked_n: ttgl.constexpr = ttgl.BlockedLayout(
@@ -222,6 +219,240 @@ def _reduce_grouped(
     else:
         out_n_mask = offs_n_out < Nrem
         ttgl.store(Out + offs_out, acc, mask=out_n_mask)
+
+
+@gluon.jit
+def issue_tile_loads(
+    a_desc,
+    b_desc,
+    a_scale_desc,
+    b_scale_desc,
+    GatherIndx,
+    pid_m,
+    pid_n,
+    k_offset_start,
+    producer,
+    a_buffer,
+    b_buffer,
+    BLOCK_M: ttgl.constexpr,
+    BLOCK_N: ttgl.constexpr,
+    BLOCK_K: ttgl.constexpr,
+    K: ttgl.constexpr,
+    W_TRANSPOSE: ttgl.constexpr,
+    NUM_BUFFERS: ttgl.constexpr,
+    EVEN_K: ttgl.constexpr,
+):
+    """
+    Load A, B, and scale tiles asynchronously into shared memory buffers.
+    
+    Args:
+        a_desc: Tensor descriptor or AsyncCopyDescriptor for A
+        b_desc: Tensor descriptor for B
+        GatherIndx: Gather indices (None for regular access)
+        pid_m, pid_n: Block IDs for M and N dimensions
+        k_offset_start: Starting K offset for this split-K block
+        producer: Producer index (which buffer slot to use)
+        a_buffer, b_buffer: Shared memory buffers
+        BLOCK_M, BLOCK_N, BLOCK_K: Block sizes
+        W_TRANSPOSE: Whether W is transposed
+        NUM_BUFFERS: Number of pipeline buffers
+    """
+    buffer_idx = producer % NUM_BUFFERS
+    
+    if not EVEN_K:
+        mask = k_offset_start + producer * BLOCK_K < K
+    else:
+        mask = None
+    # Load A tile
+    if GatherIndx is None:
+        ttgl.amd.gfx1250.tdm.async_load(
+            a_desc,
+            [pid_m * BLOCK_M, k_offset_start + producer * BLOCK_K],
+            a_buffer.index(buffer_idx)
+        )
+    else:
+        a_desc.issue_async_load(producer, a_buffer.index(buffer_idx), mask)
+    
+    # Load B tile
+    if W_TRANSPOSE:
+        # W is stored as (N, K)
+        ttgl.amd.gfx1250.tdm.async_load(
+            b_desc,
+            [pid_n * BLOCK_N, k_offset_start + producer * BLOCK_K],
+            b_buffer.index(buffer_idx)
+        )
+    else:
+        # W is stored as (K, N)
+        ttgl.amd.gfx1250.tdm.async_load(
+            b_desc,
+            [k_offset_start + producer * BLOCK_K, pid_n * BLOCK_N],
+            b_buffer.index(buffer_idx)
+        )
+
+
+@gluon.jit
+def create_descriptor(
+    X,
+    stride_x_m,
+    stride_x_k,
+    XBlockScale,
+    stride_x_bs_m,
+    stride_x_bs_k,
+    W,
+    stride_w_e,
+    stride_w_k,
+    stride_w_n,
+    WBlockScale,
+    stride_w_bs_e,
+    stride_w_bs_k,
+    stride_w_bs_n,
+    GatherIndx,
+    start_m,
+    block_id,
+    pid_k,
+    pid_n,
+    expt_id,
+    M,
+    N,
+    K,
+    grid_m,
+    # Constexprs
+    BLOCK_M: ttgl.constexpr,
+    BLOCK_N: ttgl.constexpr,
+    BLOCK_K: ttgl.constexpr,
+    BLOCKSCALE_M: ttgl.constexpr,
+    BLOCKSCALE_N: ttgl.constexpr,
+    BLOCKSCALE_K: ttgl.constexpr,
+    SPLIT_K: ttgl.constexpr,
+    N_EXPTS_ACT: ttgl.constexpr,
+    BLOCKED_MK: ttgl.constexpr,
+    BLOCKED_KN: ttgl.constexpr,
+    SHARED_A: ttgl.constexpr,
+    SHARED_B: ttgl.constexpr,
+    SHARED_A_SCALE: ttgl.constexpr,
+    SHARED_B_SCALE: ttgl.constexpr,
+    PER_ROW_X_SCALE: ttgl.constexpr,
+    W_TRANSPOSE: ttgl.constexpr,
+    is_x_blockscale: ttgl.constexpr,
+    is_w_blockscale: ttgl.constexpr,
+):
+    """
+    Create tensor descriptors for X, W, and their scales.
+
+    Returns:
+        a_desc: Tensor descriptor or AsyncCopyDescriptor for X
+        b_desc: Tensor descriptor for W
+        a_scale_desc: Tensor descriptor for X scales (or None)
+        b_scale_desc: Tensor descriptor for W scales (or None)
+        offs_x_m: M dimension offsets for X (used for scales)
+        offs_w_n: N dimension offsets for W (used for scales)
+    """
+    splitk_block_size = ttgl.cdiv(K, SPLIT_K)
+
+    offs_x_m = BLOCK_M * block_id + ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, BLOCKED_MK))
+    offs_x_m = ttgl.max_contiguous(ttgl.multiple_of(offs_x_m % M, BLOCK_M), BLOCK_M)
+
+    # A descriptor
+    if GatherIndx is None:
+        offs_x_m = start_m + offs_x_m
+        # Regular access: Use TDM tensor descriptor
+        in_m = grid_m * BLOCK_M 
+        a_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=X,
+            shape=(in_m, K),
+            strides=(stride_x_m, stride_x_k),
+            block_shape=(BLOCK_M, BLOCK_K),
+            layout=SHARED_A
+        )
+    else:
+        GatherIndx += start_m
+        # no needs to bounds-check here because `offs_x_m` wraps around M dim
+        offs_x_m = ttgl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
+        # Initialize AsyncCopyDescriptor
+        # TODO: Replace with TDM Gather once AMD hardware support is available.
+        off_k_start = pid_k * splitk_block_size
+        a_desc = AsyncCopyDescriptor.initialize(
+            X, offs_x_m, off_k_start, stride_x_m, stride_x_k, BLOCK_M, BLOCK_K, BLOCKED_MK
+        )
+
+    # B descriptor
+    offs_w_n = pid_n * BLOCK_N + ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(0, BLOCKED_KN))
+    offs_w_n = ttgl.max_contiguous(
+        ttgl.multiple_of(offs_w_n % N, BLOCK_N),
+        BLOCK_N,
+    )
+    W += expt_id * stride_w_e
+
+    if W_TRANSPOSE:
+        b_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=W,
+            shape=(N, K),
+            strides=(stride_w_n, stride_w_k),
+            block_shape=(BLOCK_N, BLOCK_K),
+            layout=SHARED_B
+        )
+    else:
+        b_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=W,
+            shape=(K, N),
+            strides=(stride_w_k, stride_w_n),
+            block_shape=(BLOCK_K, BLOCK_N),
+            layout=SHARED_B
+        )
+    
+    # A scale descriptor
+    a_scale_desc = None
+    if is_x_blockscale:
+        if PER_ROW_X_SCALE:
+            # XScale: [M, K_blocks]
+            if GatherIndx is None:
+                a_scale_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
+                    base=XBlockScale,
+                    shape=(M, ttgl.cdiv(K, BLOCKSCALE_K)),
+                    strides=(stride_x_bs_m, stride_x_bs_k),
+                    block_shape=(BLOCK_M, 1),
+                    layout=SHARED_A_SCALE
+                )
+            else:
+                off_k_scale_start = (pid_k * splitk_block_size) // BLOCKSCALE_K
+                a_scale_desc = AsyncCopyDescriptor.initialize(
+                    XBlockScale, offs_x_m, off_k_scale_start, stride_x_bs_m, stride_x_bs_k, 
+                    BLOCK_M, BLOCK_K, BLOCKED_MK
+                )
+        else:
+            # XScale: [M_blocks, K_blocks]
+            if GatherIndx is None:
+                a_scale_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
+                    base=XBlockScale,
+                    shape=(ttgl.cdiv(M, BLOCKSCALE_M), ttgl.cdiv(K, BLOCKSCALE_K)),
+                    strides=(stride_x_bs_m, stride_x_bs_k),
+                    block_shape=(1, 1),
+                    layout=SHARED_A_SCALE
+                )
+            else:
+                off_k_scale_start = (pid_k * splitk_block_size) // BLOCKSCALE_K
+                # Compute M block indices from gathered row indices
+                offs_x_scale_m = offs_x_m // BLOCKSCALE_M
+                a_scale_desc = AsyncCopyDescriptor.initialize(
+                    XBlockScale, offs_x_scale_m, off_k_scale_start, stride_x_bs_m, stride_x_bs_k,
+                    BLOCK_M, BLOCK_K, BLOCKED_MK
+                )
+    
+    # B scale descriptor
+    b_scale_desc = None
+    if is_w_blockscale:
+        # WScale: [K_blocks, N_blocks]
+        scale_k_blocks = ttgl.cdiv(K, BLOCKSCALE_K)
+        scale_n_blocks = ttgl.cdiv(N, BLOCKSCALE_N)
+        b_scale_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=WBlockScale,
+            shape=(scale_k_blocks, scale_n_blocks),
+            strides=(stride_w_bs_k, stride_w_bs_n),
+            block_shape=(1, 1),
+            layout=SHARED_B_SCALE
+        )
+    
+    return a_desc, b_desc, a_scale_desc, b_scale_desc
 
 
 @gluon.jit
@@ -297,6 +528,8 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
     PER_ROW_X_SCALE: ttgl.constexpr = False,
     # W transpose: If True, W is stored as (N, K) instead of (K, N)
     W_TRANSPOSE: ttgl.constexpr = False,
+    # Number of buffers to use for async_load
+    NUM_BUFFERS: ttgl.constexpr = 2,
 ):
     """
     Computes the 8 bit matmul C = A x B using the block-scale quantization approach.
@@ -358,218 +591,127 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
     
     # Allocate shared memory buffer
     a_buffer = ttgl.allocate_shared_memory(
-        X.type.element_ty, [BLOCK_M, BLOCK_K], layout=SHARED_A
+        X.type.element_ty, [NUM_BUFFERS, BLOCK_M, BLOCK_K], layout=SHARED_A
     )
     if W_TRANSPOSE:
         # W is stored as (N, K) in shared memory
         b_buffer = ttgl.allocate_shared_memory(
-            W.type.element_ty, [BLOCK_N, BLOCK_K], layout=SHARED_B
+            W.type.element_ty, [NUM_BUFFERS, BLOCK_N, BLOCK_K], layout=SHARED_B
         )
     else:
         # W is stored as (K, N) in shared memory
         b_buffer = ttgl.allocate_shared_memory(
-            W.type.element_ty, [BLOCK_K, BLOCK_N], layout=SHARED_B
+            W.type.element_ty, [NUM_BUFFERS, BLOCK_K, BLOCK_N], layout=SHARED_B
         )
     a_scale_buffer = ttgl.allocate_shared_memory(
         XBlockScale.type.element_ty if XBlockScale is not None else ttgl.float32,
-        [BLOCK_M],
+        [NUM_BUFFERS, BLOCK_M],
         layout=SHARED_A_SCALE
     )
     b_scale_buffer = ttgl.allocate_shared_memory(
         WBlockScale.type.element_ty if WBlockScale is not None else ttgl.float32,
-        [BLOCK_N],
+        [NUM_BUFFERS, BLOCK_N],
         layout=SHARED_B_SCALE
     )
     
-    # A pointers
-    splitk_block_size = ttgl.cdiv(K, SPLIT_K)
-    offs_k_scale = (pid_k * splitk_block_size) // BLOCKSCALE_K
-    offs_ak = ttgl.arange(0, BLOCK_K, layout=ttgl.SliceLayout(0, BLOCKED_MK))
-    offs_ak_split = pid_k * splitk_block_size + offs_ak
-
-    offs_x_m = BLOCK_M * block_id + ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, BLOCKED_MK))
-    offs_x_m = ttgl.max_contiguous(ttgl.multiple_of(offs_x_m % M, BLOCK_M), BLOCK_M)
-    if GatherIndx is None:
-        offs_x_m = start_m + offs_x_m
-        # Regular access: Use TDM tensor descriptor
-        in_m = grid_m * BLOCK_M 
-        a_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=X,
-            shape=(in_m, K),
-            strides=(stride_x_m, stride_x_k),
-            block_shape=(BLOCK_M, BLOCK_K),
-            layout=SHARED_A
-        )
-    else:
-        GatherIndx += start_m
-        # no needs to bounds-check here because `offs_x_m` wraps around M dim
-        offs_x_m = ttgl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
-        # Initialize AsyncCopyDescriptor
-        # TODO: Replace with TDM Gather once AMD hardware support is available.
-        off_k_start = pid_k * splitk_block_size
-        a_desc = AsyncCopyDescriptor.initialize(
-            X, offs_x_m, off_k_start, stride_x_m, stride_x_k, BLOCK_M, BLOCK_K, BLOCKED_MK
-        )
-
-    XPtrs = (
-        X
-        + offs_x_m.to(index_type)[:, None] * stride_x_m
-        + offs_ak_split.to(index_type)[None, :] * stride_x_k
+    # Create tensor descriptors
+    a_desc, b_desc, a_scale_desc, b_scale_desc = create_descriptor(
+        X, stride_x_m, stride_x_k,
+        XBlockScale, stride_x_bs_m, stride_x_bs_k,
+        W, stride_w_e, stride_w_k, stride_w_n,
+        WBlockScale, stride_w_bs_e, stride_w_bs_k, stride_w_bs_n,
+        GatherIndx, start_m, block_id, pid_k, pid_n, expt_id,
+        M, N, K, grid_m,
+        BLOCK_M, BLOCK_N, BLOCK_K,
+        BLOCKSCALE_M, BLOCKSCALE_N, BLOCKSCALE_K,
+        SPLIT_K, N_EXPTS_ACT,
+        BLOCKED_MK, BLOCKED_KN,
+        SHARED_A, SHARED_B, SHARED_A_SCALE, SHARED_B_SCALE,
+        PER_ROW_X_SCALE, W_TRANSPOSE,
+        is_x_blockscale, is_w_blockscale,
     )
-
-    # B pointers
-    offs_w_n = pid_n * BLOCK_N + ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(0, BLOCKED_KN))
-    offs_w_n = ttgl.max_contiguous(
-        ttgl.multiple_of(offs_w_n % N, BLOCK_N),
-        BLOCK_N,
-    )
-    W += expt_id * stride_w_e
     
-    if W_TRANSPOSE:
-        b_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=W,
-            shape=(N, K),
-            strides=(stride_w_n, stride_w_k),
-            block_shape=(BLOCK_N, BLOCK_K),
-            layout=SHARED_B
-        )
-    else:
-        b_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=W,
-            shape=(K, N),
-            strides=(stride_w_k, stride_w_n),
-            block_shape=(BLOCK_K, BLOCK_N),
-            layout=SHARED_B
-        )
-    
-    # TODO: change this to use async_load
-    if W_TRANSPOSE:
-        offs_bk = ttgl.arange(0, BLOCK_K, layout=ttgl.SliceLayout(1, BLOCKED_KN))
-        offs_bk_split = pid_k * splitk_block_size + offs_bk
-        WPtrs = W + (
-            offs_w_n.to(index_type)[:, None] * stride_w_n
-            + offs_bk_split.to(index_type)[None, :] * stride_w_k
-        )
-    else:
-        offs_bk = ttgl.arange(0, BLOCK_K, layout=ttgl.SliceLayout(1, BLOCKED_KN))
-        offs_bk_split = pid_k * splitk_block_size + offs_bk
-        WPtrs = W + (
-            offs_bk_split.to(index_type)[:, None] * stride_w_k
-            + offs_w_n.to(index_type)[None, :] * stride_w_n
-        )
-    if is_x_blockscale:
-        if PER_ROW_X_SCALE:
-            # XScale: [M, K_blocks]
-            XScalePtrs = (
-                XBlockScale
-                + offs_x_m.to(index_type) * stride_x_bs_m
-                + offs_k_scale * stride_x_bs_k
-            )
-        else:
-            # XScale: [M_blocks, K_blocks]
-            offs_x_scale_m = offs_x_m // BLOCKSCALE_M
-            XScalePtrs = (
-                XBlockScale
-                + offs_x_scale_m.to(index_type) * stride_x_bs_m
-                + offs_k_scale * stride_x_bs_k
-            )
-
-    if is_w_blockscale:
-        WBlockScale += expt_id * stride_w_bs_e
-        offs_w_scale_n = offs_w_n // BLOCKSCALE_N
-        # WBlockScale: [K_blocks, N_blocks]
-        WScalePtrs = (
-            WBlockScale + offs_k_scale * stride_w_bs_k + offs_w_scale_n * stride_w_bs_n
-        )
-
-    offs_ks_step = BLOCK_K // BLOCKSCALE_K
-    num_k_iter = ttgl.cdiv(splitk_block_size, BLOCK_K)
     producer = 0
     consumer = 0
     acc = ttgl.zeros((BLOCK_M, BLOCK_N), dtype=ttgl.float32, layout=WMMA_LAYOUT)
-    zeros = ttgl.zeros((BLOCK_M, BLOCK_N), dtype=ttgl.float32, layout=WMMA_LAYOUT)
+    splitk_block_size = ttgl.cdiv(K, SPLIT_K)
+    num_k_tiles = ttgl.cdiv(splitk_block_size, BLOCK_K)
+    k_offset_start = pid_k * splitk_block_size
+    
+    # prologue
+    for _ in ttgl.static_range(NUM_BUFFERS - 1):
+        issue_tile_loads(
+            a_desc, b_desc, a_scale_desc, b_scale_desc, GatherIndx,
+            pid_m, pid_n, k_offset_start, producer, 
+            a_buffer, b_buffer,
+            BLOCK_M, BLOCK_N, K, BLOCK_K, W_TRANSPOSE, NUM_BUFFERS, EVEN_K
+        )
+        producer += 1
+    
     # Main loop
-    for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
-        if EVEN_K:
-            x = ttgl.load(XPtrs)
-            w = ttgl.load(WPtrs, cache_modifier=W_CACHE_MODIFIER)
-        else:
-            x = ttgl.load(
-                XPtrs,
-                mask=offs_ak[None, :] < K - k * BLOCK_K,
-                other=0.0,
-            )
-            if W_TRANSPOSE:
-                mask_w_n = offs_w_n[:, None] < N
-                mask_w_k = offs_bk[None, :] < K - k * BLOCK_K
-                w = ttgl.load(
-                    WPtrs,
-                    mask=mask_w_n & mask_w_k,
-                    other=0.0,
-                    cache_modifier=W_CACHE_MODIFIER
-                )
-            else:
-                w = ttgl.load(
-                    WPtrs,
-                    mask=offs_bk[:, None] < K - k * BLOCK_K,
-                    other=0.0,
-                    cache_modifier=W_CACHE_MODIFIER
-                )
+    for _ in range(num_k_tiles - (NUM_BUFFERS - 1)):
+        # Load next A and B tiles
+        issue_tile_loads(
+            a_desc, b_desc, a_scale_desc, b_scale_desc, GatherIndx,
+                pid_m, pid_n, k_offset_start, producer, 
+            a_buffer, b_buffer,
+            BLOCK_M, BLOCK_N, K, BLOCK_K, W_TRANSPOSE, NUM_BUFFERS, EVEN_K
+        )
+        producer += 1
         
-        x = ttgl.convert_layout(x, DOT_A_LAYOUT)
-        w = ttgl.convert_layout(w, DOT_B_LAYOUT)
-
-        if is_x_blockscale:
-            x_scale = ttgl.load(XScalePtrs)
-            XScalePtrs += offs_ks_step * stride_x_bs_k
-        else:
-            x_scale = ttgl.full((BLOCK_M,), 1.0, dtype=ttgl.float32, layout=ttgl.SliceLayout(1, BLOCKED_MK))
-
-        if is_w_blockscale:
-            w_scale = ttgl.load(WScalePtrs)
-            WScalePtrs += offs_ks_step * stride_w_bs_k
-        else:
-            w_scale = ttgl.full((BLOCK_N,), 1.0, dtype=ttgl.float32, layout=ttgl.SliceLayout(0, BLOCKED_KN))
-
-        # Convert scales to WMMA layout for broadcasting
-        x_scale_wmma = ttgl.convert_layout(x_scale, ttgl.SliceLayout(1, WMMA_LAYOUT))
-        w_scale_wmma = ttgl.convert_layout(w_scale, ttgl.SliceLayout(0, WMMA_LAYOUT))
+        ttgl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+        cur_a = a_buffer.index(consumer % NUM_BUFFERS).load(layout=DOT_A_LAYOUT)
         
-        wmma_out = ttgl.amd.gfx1250.wmma(x, w, zeros)
-        acc += wmma_out * x_scale_wmma[:, None] * w_scale_wmma[None, :]
-
-        # if pid == 0 and pid_k == 0:
-        #     ttgl.device_print("x", x)
-            # ttgl.device_print("w", w)
-            # ttgl.device_print("wmma_out", wmma_out)
-            # ttgl.device_print("acc", acc)
+        if W_TRANSPOSE:
+            # B is stored as (N, K) but WMMA needs (K, N), so we permute
+            cur_b = b_buffer.index(consumer % NUM_BUFFERS).permute([1, 0]).load(layout=DOT_B_LAYOUT)
+        else:
+            cur_b = b_buffer.index(consumer % NUM_BUFFERS).load(layout=DOT_B_LAYOUT)
         
-        # Advance pointers
-        XPtrs += BLOCK_K * stride_x_k
-        WPtrs += BLOCK_K * stride_w_k
+        acc = ttgl.amd.gfx1250.wmma(cur_a, cur_b, acc)
+        consumer += 1
+    
+    # Epilogue
+    for i in ttgl.static_range(NUM_BUFFERS - 1):
+        ttgl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * 2)
+        cur_a = a_buffer.index(consumer % NUM_BUFFERS).load(layout=DOT_A_LAYOUT)
+        
+        if W_TRANSPOSE:
+            # B is stored as (N, K) but WMMA needs (K, N), so we permute
+            cur_b = b_buffer.index(consumer % NUM_BUFFERS).permute([1, 0]).load(layout=DOT_B_LAYOUT)
+        else:
+            cur_b = b_buffer.index(consumer % NUM_BUFFERS).load(layout=DOT_B_LAYOUT)
+        
+        acc = ttgl.amd.gfx1250.wmma(cur_a, cur_b, acc)
+        consumer += 1
+    
+    offs_m = block_id * BLOCK_M + ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, WMMA_LAYOUT))
+    offs_n = pid_n * BLOCK_N + ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(0, WMMA_LAYOUT))
+    offs_cm = start_m + offs_m
+    offs_cn = offs_n
+    mask_m = offs_m < M
+    mask_n = offs_cn < N
 
     # scalar fp8 scale
     if X_static_scale is not None:
         acc = acc * ttgl.load(X_static_scale)
     if W_static_scale is not None:
         acc = acc * ttgl.load(W_static_scale)
+
     # bias
-    offs_m = BLOCK_M * block_id + ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, WMMA_LAYOUT))
-    offs_y_n = BLOCK_N * pid_n + ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(0, WMMA_LAYOUT))
-    mask_m = offs_m < M
-    mask_n = offs_y_n < N
     if B is not None:
-        offs_bias = expt_id * stride_b_e + offs_y_n
+        offs_bias = expt_id * stride_b_e + offs_cn
         if pid_k == 0:
             bias = ttgl.load(B + offs_bias, mask=mask_n, cache_modifier=W_CACHE_MODIFIER)
         else:
             bias = ttgl.full([BLOCK_N], 0, dtype=ttgl.float32, layout=ttgl.SliceLayout(0, WMMA_LAYOUT))
         acc = acc + bias[None, :]
+
     if APPLY_SWIGLU and SPLIT_K == 1:
-        out = _swiglu(acc, alpha, limit)
+        acc = _swiglu(acc, alpha, limit)
         ttgl.static_assert(
-            out.shape[1] == OUT_BLOCK_N,
-            f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
+            acc.shape[1] == OUT_BLOCK_N,
+            f"Activation fn out.shape[1] ({acc.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
         )
         offs_y_n = OUT_BLOCK_N * pid_n + ttgl.arange(0, OUT_BLOCK_N, layout=ttgl.SliceLayout(0, WMMA_LAYOUT))
         mask_n = offs_y_n < yN
@@ -578,7 +720,7 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
             ACTIVATION_REDUCTION_N == 1,
             "Activation reduction must be 1 if no activation fn is provided",
         )
-        out = acc
+
     if Gammas is not None:
         offs_gammas = start_m + offs_m
         gammas = ttgl.load(Gammas + offs_gammas, mask=mask_m)
@@ -586,17 +728,15 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
     # quant
     if Quant_static_scale is not None:
         out = _compute_static_fp8_quant(out, ttgl.load(Quant_static_scale))
-    
     # write-back
-    Y += start_m * stride_y_m
-    offs_y_m = offs_m
-    offs_y = (
-        offs_y_m[:, None] * stride_y_m
-        + offs_y_n[None, :] * stride_y_n
+    offs_c = stride_y_m * offs_cm[:, None] + stride_y_n * offs_cn[None, :]
+    mask_c = mask_m[:, None] & mask_n[None, :]
+    ttgl.amd.gfx1250.buffer_store(
+        acc.to(Y.type.element_ty),
+        Y,
+        offs_c,
+        mask=mask_c
     )
-    mask = mask_m[:, None] & mask_n[None, :]
-    ttgl.store(Y + offs_y, out, mask=mask)
-
 
 
 def can_overflow_int32(tensor: torch.Tensor):
@@ -806,6 +946,9 @@ def moe_gemm_a8w8_blockscale_gfx1250(
     x_has_blockscale = x_block_scales is not None
     w_has_blockscale = w_block_scales is not None
 
+    assert x_has_blockscale ^ (x_static_scale is not None)
+    assert w_has_blockscale ^ (w_static_scale is not None)
+
     if x_has_blockscale:
         stride_x_bs_m = x_block_scales.stride(0)
         stride_x_bs_k = x_block_scales.stride(1)
@@ -883,8 +1026,8 @@ def moe_gemm_a8w8_blockscale_gfx1250(
     BLOCK_N = config["block_n"]
     BLOCK_K = config["block_k"]
     
-    threads_per_elem_mk = triton.cdiv(BLOCK_M * BLOCK_K // (num_warps * 64), 16)
-    threads_per_elem_kn = triton.cdiv(BLOCK_K * BLOCK_N // (num_warps * 64), 16)
+    threads_per_elem_mk = triton.cdiv(BLOCK_M * BLOCK_K // (num_warps * 32), 16)
+    threads_per_elem_kn = triton.cdiv(BLOCK_K * BLOCK_N // (num_warps * 32), 16)
     
     blocked_mk = ttgl.BlockedLayout(
         size_per_thread=[threads_per_elem_mk, 16],
@@ -1051,9 +1194,9 @@ if __name__ == "__main__":
     )
 
     # Test parameters
-    m = 128
-    n = 128
-    k = 128
+    m = 200
+    n = 200
+    k = 200
     n_expts_tot = 8
     n_expts_act = 2
     do_gather = True
