@@ -813,7 +813,6 @@ def test_mha_backward_varlen(
 
 # Run PE tests with:
 # pytest op_tests/triton_tests/attention/test_mha.py -k with_pe
-# TODO: Run PE tests on gfx942!
 
 
 @pytest.mark.parametrize("BATCH", [1, 3])
