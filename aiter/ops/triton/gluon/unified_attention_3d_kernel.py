@@ -429,10 +429,7 @@ gluon_kernel_unified_attention_3d_tdm_gather_repr = make_kernel_repr(
         "HEAD_SIZE",
         "num_warps",
         "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
         "cache_modifier",
-        "NUM_KSPLIT",
     ],
 )
 
@@ -1079,10 +1076,7 @@ gluon_kernel_unified_attention_3d_tdm_repr = make_kernel_repr(
         "HEAD_SIZE",
         "num_warps",
         "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
         "cache_modifier",
-        "NUM_KSPLIT",
     ],
 )
 
@@ -1667,10 +1661,7 @@ gluon_kernel_unified_attention_3d_async_repr = make_kernel_repr(
         "HEAD_SIZE",
         "num_warps",
         "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
         "cache_modifier",
-        "NUM_KSPLIT",
     ],
 )
 
@@ -1943,180 +1934,185 @@ def gluon_kernel_unified_attention_3d_async(
         )
 
     # iterate through tiles within current segment
-    for _ in range(tiles_per_segment - (num_stages - 1)):
-        if j_producer < num_tiles:
-            j_producer, k_offset, v_offset, tile_k_mask, tile_v_mask = _get_kv_offsets(
-                j_producer,
-                kv_head_idx,
-                block_tables_ptr,
-                block_table_offset,
-                offs_k_t,
-                offs_k_d,
-                offs_v_t,
-                offs_v_d,
-                max_seq_prefix_len,
-                stride_k_cache_0,
-                stride_k_cache_1,
-                stride_k_cache_2,
-                stride_k_cache_3,
-                stride_v_cache_0,
-                stride_v_cache_1,
-                stride_v_cache_2,
-                stride_v_cache_3,
-                K_BLOCKED_LAYOUT,
-                Q_BLOCKED_LAYOUT,
-                TILE_SIZE,
-                BLOCK_SIZE,
-            )
+    for _ in range(
+        segm_idx * tiles_per_segment,
+        min((segm_idx + 1) * tiles_per_segment, num_tiles) - (num_stages - 1),
+    ):
+        j_producer, k_offset, v_offset, tile_k_mask, tile_v_mask = _get_kv_offsets(
+            j_producer,
+            kv_head_idx,
+            block_tables_ptr,
+            block_table_offset,
+            offs_k_t,
+            offs_k_d,
+            offs_v_t,
+            offs_v_d,
+            max_seq_prefix_len,
+            stride_k_cache_0,
+            stride_k_cache_1,
+            stride_k_cache_2,
+            stride_k_cache_3,
+            stride_v_cache_0,
+            stride_v_cache_1,
+            stride_v_cache_2,
+            stride_v_cache_3,
+            K_BLOCKED_LAYOUT,
+            Q_BLOCKED_LAYOUT,
+            TILE_SIZE,
+            BLOCK_SIZE,
+        )
 
-            # K_load : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_BLOCKED_LAYOUT
-            k_producer = _async_load_to_lds(
-                k_producer,
-                dest=smem_K,
-                ptr=key_cache_ptr,
-                offsets=k_offset,
-                mask=dim_mask[:, None] & tile_k_mask[None, :],
-                num_stages=num_stages,
-                cache_modifier=KV_cache_modifier,
-                use_buffer_load=use_buffer_load,
-            )
+        # K_load : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_BLOCKED_LAYOUT
+        k_producer = _async_load_to_lds(
+            k_producer,
+            dest=smem_K,
+            ptr=key_cache_ptr,
+            offsets=k_offset,
+            mask=dim_mask[:, None] & tile_k_mask[None, :],
+            num_stages=num_stages,
+            cache_modifier=KV_cache_modifier,
+            use_buffer_load=use_buffer_load,
+        )
 
-            # V_load : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = Q_BLOCKED_LAYOUT
-            v_producer = _async_load_to_lds(
-                v_producer,
-                dest=smem_V,
-                ptr=value_cache_ptr,
-                offsets=v_offset,
-                mask=dim_mask[None, :] & tile_v_mask[:, None],
-                num_stages=num_stages,
-                cache_modifier=KV_cache_modifier,
-                use_buffer_load=use_buffer_load,
-            )
+        # V_load : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = Q_BLOCKED_LAYOUT
+        v_producer = _async_load_to_lds(
+            v_producer,
+            dest=smem_V,
+            ptr=value_cache_ptr,
+            offsets=v_offset,
+            mask=dim_mask[None, :] & tile_v_mask[:, None],
+            num_stages=num_stages,
+            cache_modifier=KV_cache_modifier,
+            use_buffer_load=use_buffer_load,
+        )
 
-        if j_consumer < num_tiles:
-            # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
-            K, k_consumer = _request_from_lds(
-                k_consumer,
-                k_scale,
-                Q.dtype,
-                smem_K,
-                layout=K_DOT_LAYOUT,
-                wait_group=(num_stages - 1) * 2 + 1,
-                num_stages=num_stages,
-            )
+        # TODO: put this before async_load and compare perf, remember to change wait_group to (num_stages - 2) * 2 + 1
+        # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
+        K, k_consumer = _request_from_lds(
+            k_consumer,
+            k_scale,
+            Q.dtype,
+            smem_K,
+            layout=K_DOT_LAYOUT,
+            wait_group=(num_stages - 1) * 2 + 1,
+            # wait_group=0,
+            num_stages=num_stages,
+        )
 
-            # P : shape = (BLOCK_M, TILE_SIZE), layout = Q_BLOCKED_LAYOUT
-            # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
-            # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
-            # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
-            P, L, M, acc = _perform_QK_wmma_and_update_L_M(
-                Q,
-                K,
-                L,
-                M,
-                acc,
-                qq_bias_row_ptrs,
-                seq_offset,
-                query_mask_1,
-                query_mask_0,
-                context_len,
-                query_pos,
-                alibi_slope,
-                qq_bias_stride_0,
-                qk_scale,
-                softcap,
-                RCP_LN2,
-                BLOCK_M,
-                TILE_SIZE,
-                USE_SOFTCAP,
-                SLIDING_WINDOW,
-                USE_ALIBI_SLOPES,
-                USE_QQ_BIAS,
-                Q_BLOCKED_LAYOUT,
-                QK_WMMA_LAYOUT,
-                PV_WMMA_LAYOUT,
-            )
+        # P : shape = (BLOCK_M, TILE_SIZE), layout = Q_BLOCKED_LAYOUT
+        # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+        # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+        # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
+        P, L, M, acc = _perform_QK_wmma_and_update_L_M(
+            Q,
+            K,
+            L,
+            M,
+            acc,
+            qq_bias_row_ptrs,
+            seq_offset,
+            query_mask_1,
+            query_mask_0,
+            context_len,
+            query_pos,
+            alibi_slope,
+            qq_bias_stride_0,
+            qk_scale,
+            softcap,
+            RCP_LN2,
+            BLOCK_M,
+            TILE_SIZE,
+            USE_SOFTCAP,
+            SLIDING_WINDOW,
+            USE_ALIBI_SLOPES,
+            USE_QQ_BIAS,
+            Q_BLOCKED_LAYOUT,
+            QK_WMMA_LAYOUT,
+            PV_WMMA_LAYOUT,
+        )
 
-            # V : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = V_DOT_LAYOUT
-            V, v_consumer = _request_from_lds(
-                v_consumer,
-                v_scale,
-                Q.dtype,
-                smem_V,
-                layout=V_DOT_LAYOUT,
-                wait_group=(num_stages - 1) * 2,
-                num_stages=num_stages,
-            )
+        # V : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = V_DOT_LAYOUT
+        V, v_consumer = _request_from_lds(
+            v_consumer,
+            v_scale,
+            Q.dtype,
+            smem_V,
+            layout=V_DOT_LAYOUT,
+            wait_group=(num_stages - 1) * 2,
+            # wait_group=0,
+            num_stages=num_stages,
+        )
 
-            # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
-            acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
+        # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
+        acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
 
-            j_consumer = j_consumer + 1
-            seq_offset += TILE_SIZE
+        j_consumer = j_consumer + 1
+        seq_offset += TILE_SIZE
 
     for _ in range(num_stages - 1):
-        if j_consumer < num_tiles:
-            # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
-            K, k_consumer = _request_from_lds(
-                k_consumer,
-                k_scale,
-                Q.dtype,
-                smem_K,
-                layout=K_DOT_LAYOUT,
-                wait_group=(num_stages - 2) * 2
-                + 1,  # there is no async_copy in the epilogue, hence num_stages - 2
-                num_stages=num_stages,
-            )
+        # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
+        K, k_consumer = _request_from_lds(
+            k_consumer,
+            k_scale,
+            Q.dtype,
+            smem_K,
+            layout=K_DOT_LAYOUT,
+            wait_group=(num_stages - 2) * 2
+            + 1,  # there is no async_copy in the epilogue, hence num_stages - 2
+            # wait_group=0,
+            num_stages=num_stages,
+        )
 
-            # P : shape = (BLOCK_M, TILE_SIZE), layout = Q_BLOCKED_LAYOUT
-            # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
-            # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
-            # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
-            P, L, M, acc = _perform_QK_wmma_and_update_L_M(
-                Q,
-                K,
-                L,
-                M,
-                acc,
-                qq_bias_row_ptrs,
-                seq_offset,
-                query_mask_1,
-                query_mask_0,
-                context_len,
-                query_pos,
-                alibi_slope,
-                qq_bias_stride_0,
-                qk_scale,
-                softcap,
-                RCP_LN2,
-                BLOCK_M,
-                TILE_SIZE,
-                USE_SOFTCAP,
-                SLIDING_WINDOW,
-                USE_ALIBI_SLOPES,
-                USE_QQ_BIAS,
-                Q_BLOCKED_LAYOUT,
-                QK_WMMA_LAYOUT,
-                PV_WMMA_LAYOUT,
-            )
+        # P : shape = (BLOCK_M, TILE_SIZE), layout = Q_BLOCKED_LAYOUT
+        # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+        # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+        # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
+        P, L, M, acc = _perform_QK_wmma_and_update_L_M(
+            Q,
+            K,
+            L,
+            M,
+            acc,
+            qq_bias_row_ptrs,
+            seq_offset,
+            query_mask_1,
+            query_mask_0,
+            context_len,
+            query_pos,
+            alibi_slope,
+            qq_bias_stride_0,
+            qk_scale,
+            softcap,
+            RCP_LN2,
+            BLOCK_M,
+            TILE_SIZE,
+            USE_SOFTCAP,
+            SLIDING_WINDOW,
+            USE_ALIBI_SLOPES,
+            USE_QQ_BIAS,
+            Q_BLOCKED_LAYOUT,
+            QK_WMMA_LAYOUT,
+            PV_WMMA_LAYOUT,
+        )
 
-            # V : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = V_DOT_LAYOUT
-            V, v_consumer = _request_from_lds(
-                v_consumer,
-                v_scale,
-                Q.dtype,
-                smem_V,
-                layout=V_DOT_LAYOUT,
-                wait_group=(num_stages - 2)
-                * 2,  # there is no async_copy in the epilogue, hence num_stages - 2
-                num_stages=num_stages,
-            )
+        # V : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = V_DOT_LAYOUT
+        V, v_consumer = _request_from_lds(
+            v_consumer,
+            v_scale,
+            Q.dtype,
+            smem_V,
+            layout=V_DOT_LAYOUT,
+            wait_group=(num_stages - 2)
+            * 2,  # there is no async_copy in the epilogue, hence num_stages - 2
+            # wait_group=0,
+            num_stages=num_stages,
+        )
 
-            # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
-            acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
+        # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
+        acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
 
-            j_consumer = j_consumer + 1
-            seq_offset += TILE_SIZE
+        j_consumer = j_consumer + 1
+        seq_offset += TILE_SIZE
 
     # store segm_output
     # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = Q_BLOCKED_LAYOUT
@@ -2192,10 +2188,7 @@ gluon_kernel_unified_attention_3d_repr = make_kernel_repr(
         "HEAD_SIZE",
         "num_warps",
         "num_stages",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
         "cache_modifier",
-        "NUM_KSPLIT",
     ],
 )
 
@@ -2262,6 +2255,7 @@ def gluon_kernel_unified_attention_3d(
     Q_BLOCKED_LAYOUT: ttgl.constexpr,
     K_BLOCKED_LAYOUT: ttgl.constexpr,
     ALL_DECODE: ttgl.constexpr = False,  # bool
+    SHUFFLED_KV_CACHE: ttgl.constexpr = False,  # bool
 ):
     q_block_global_idx = ttgl.program_id(0)
     kv_head_idx = ttgl.program_id(1)

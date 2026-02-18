@@ -305,7 +305,8 @@ def select_3d_config(
         attn_impl = gluon_kernel_unified_attention_3d_async
         layouts = make_layout_3d(*hyper_parms, use_tdm, use_swizzle=True)
         # TODO: add heuristics for use_buffer_load
-        layouts["use_buffer_load"] = False
+        # layouts["use_buffer_load"] = False
+        layouts["use_buffer_load"] = True
     else:
         # Baseline kernel, num_stages does not matter, use_swizzle can be either True or False
         attn_impl = gluon_kernel_unified_attention_3d
@@ -378,6 +379,7 @@ def unified_attention(
     use_tdm: bool = False,
     num_tdm_gather: int = 1,
     use_async: bool = True,
+    shuffled_kv_cache: bool = False,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -389,18 +391,22 @@ def unified_attention(
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
 
-    num_tokens = q.shape[0]
-    num_blocks = v.shape[0]
-    if use_tdm and num_tdm_gather > 1:
-        num_kv_heads = k.shape[1]
-        block_size = v.shape[2]
+    num_tokens, num_query_heads, head_size = q.shape
+    if shuffled_kv_cache:
+        # key_cache: num_blocks, num_kv_heads, block_size // 16, head_size * 16
+        # value_cache: num_blocks, num_kv_heads, head_size // 16, block_size * 16
+        num_blocks, num_kv_heads, block_size, _ = k.shape
+        block_size = block_size * 16
     else:
-        num_kv_heads = k.shape[2]
-        block_size = v.shape[1]
+        if use_tdm and num_tdm_gather > 1:
+            # key_cache and value_cache: num_blocks, num_kv_heads, block_size, head_size
+            num_blocks, num_kv_heads, block_size, _ = k.shape
+        else:
+            # key_cache and value_cache: num_blocks, block_size, num_kv_heads, head_size
+            num_blocks, block_size, num_kv_heads, _ = k.shape
+
     num_seqs = len(seqused_k)
-    num_query_heads = q.shape[1]
     num_queries_per_kv = num_query_heads // num_kv_heads
-    head_size = q.shape[2]
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
@@ -415,9 +421,9 @@ def unified_attention(
     #   <= \sum_i[floor(query_len[i] / BLOCK_Q) + 1]
     #    = \sum_i[floor(query_len[i] / BLOCK_Q)] + num_seqs
     #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
-    #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
+    #    = floor(num_tokens / BLOCK_Q) + num_seqs
     cu_count = get_num_sms()
-    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+    total_num_q_blocks = num_tokens // BLOCK_Q + num_seqs
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
@@ -462,7 +468,7 @@ def unified_attention(
         )
         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
         segm_output = torch.empty(
-            q.shape[0],
+            num_tokens,
             num_query_heads,
             NUM_SEGMENTS,
             triton.next_power_of_2(head_size),
@@ -470,14 +476,14 @@ def unified_attention(
             device=q.device,
         )
         segm_max = torch.empty(
-            q.shape[0],
+            num_tokens,
             num_query_heads,
             NUM_SEGMENTS,
             dtype=torch.float32,
             device=q.device,
         )
         segm_expsum = torch.empty(
-            q.shape[0],
+            num_tokens,
             num_query_heads,
             NUM_SEGMENTS,
             dtype=torch.float32,

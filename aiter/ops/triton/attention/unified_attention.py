@@ -122,6 +122,7 @@ def unified_attention(
     qq_bias=None,
     # Optional tensor for sinks
     sinks=None,
+    shuffled_kv_cache: bool = False,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -133,12 +134,18 @@ def unified_attention(
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
 
-    block_size = v.shape[1]
+    _, num_query_heads, head_size = q.shape
+    if shuffled_kv_cache:
+        # key_cache: num_blocks, num_kv_heads, block_size // 16, head_size * 16
+        # value_cache: num_blocks, num_kv_heads, head_size // 16, block_size * 16
+        _, num_kv_heads, block_size, _ = k.shape
+        block_size = block_size * 16
+    else:
+        # key_cache and value_cache: num_blocks, block_size, num_kv_heads, head_size
+        _, block_size, num_kv_heads, _ = k.shape
+
     num_seqs = len(seqused_k)
-    num_query_heads = q.shape[1]
-    num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
-    head_size = q.shape[2]
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
@@ -309,6 +316,7 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             ALL_DECODE=ALL_DECODE,
+            SHUFFLED_KV_CACHE=shuffled_kv_cache,
             **attn_config,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
