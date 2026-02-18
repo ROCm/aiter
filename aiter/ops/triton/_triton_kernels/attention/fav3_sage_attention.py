@@ -243,7 +243,6 @@ def _sage_fwd_blocksparse_nomask(
     BLOCK_N: tl.constexpr,
     PRE_LOAD_V: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
-    APPLY_QK_MASK: tl.constexpr,
     PADDED_HEAD_QK: tl.constexpr,
     PADDED_HEAD_V: tl.constexpr,
     ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
@@ -286,12 +285,8 @@ def _sage_fwd_blocksparse_nomask(
             bias_ptrs = bias_base_ptrs + start_n * stride_bn
             bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
             qk_scaled += bias
-        if APPLY_QK_MASK:
-            qk_scaled = tl.where(qk_mask, qk_scaled, float("-inf"))
         m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
-        q_shifted = tl.where(
-            m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
-        )
+        q_shifted = qk_scaled - m_ij[:, None]
         if USE_EXP2:
             p = tl.math.exp2(q_shifted)
         else:
@@ -330,7 +325,7 @@ def _sage_fwd_blocksparse_nomask(
                 kv_offs_n[None, :] < seqlen_k
             )
             tl.store(sd_mask_ptrs, p, mask=sd_store_mask)
-        m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
+        m_diff = m_i - m_ij
         if USE_EXP2:
             alpha = tl.math.exp2(m_diff)
         else:
