@@ -18,6 +18,7 @@ from aiter.ops.triton.mha import (
 
 from aiter.test_mha_common import (
     attention_ref,
+    attention_ref_block_sparse,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
@@ -772,29 +773,48 @@ def bench_kernel(
                 0, 2, 1, 3
             )  # we do comparison in BSHD
 
-        ref_block_lut = (
-            block_attn_mask_to_ragged_lut(block_attn_mask)
-            if args.ref == "fav3_sage" and block_attn_mask is not None
-            else None
-        )
-        reference_primary = primary_output(
-            attn_forward_func(
-                q,
-                k,
-                v,
-                func_name=args.ref,
-                softmax_scale=softmax_scale,
-                k_smooth=k_smooth,
-                layout=args.layout,
-                dtype=arg_to_torch_dtype[args.dtype],
-                block_lut=ref_block_lut,
-            )()
-        )
+        if block_attn_mask is not None and args.ref != "fav3_sage":
+            q_bshd, k_bshd, v_bshd = layout_preprocess(
+                q, k, v, layout=args.layout, target_layout="bshd"
+            )
+            config = get_sage_fwd_configs()
+            BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
+            ref_out = attention_ref_block_sparse(
+                q_bshd,
+                k_bshd,
+                v_bshd,
+                block_attn_mask,
+                BLOCK_M,
+                BLOCK_N,
+                dropout_p=0.0,
+                dropout_mask=None,
+                upcast=True,
+            )
+            reference_primary = ref_out[0]
+        else:
+            ref_block_lut = (
+                block_attn_mask_to_ragged_lut(block_attn_mask)
+                if args.ref == "fav3_sage" and block_attn_mask is not None
+                else None
+            )
+            reference_primary = primary_output(
+                attn_forward_func(
+                    q,
+                    k,
+                    v,
+                    func_name=args.ref,
+                    softmax_scale=softmax_scale,
+                    k_smooth=k_smooth,
+                    layout=args.layout,
+                    dtype=arg_to_torch_dtype[args.dtype],
+                    block_lut=ref_block_lut,
+                )()
+            )
 
-        if args.ref == "fav3_sage" and args.layout == "bhsd":
-            reference_primary = reference_primary.permute(
-                0, 2, 1, 3
-            )  # we do comparison in BSHD
+            if args.ref == "fav3_sage" and args.layout == "bhsd":
+                reference_primary = reference_primary.permute(
+                    0, 2, 1, 3
+                )  # we do comparison in BSHD
 
         compare_accuracy(current_primary, reference_primary)
         check_attention_outputs(current_primary, reference_primary, fp8=False)
