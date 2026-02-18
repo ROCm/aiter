@@ -58,7 +58,9 @@ def block_attn_mask_to_ragged_lut(
 
     b_idx, h_idx, qb_idx, kb_idx = block_attn_mask.nonzero(as_tuple=True)
     linear = b_idx * (num_heads * num_q_blocks) + h_idx * num_q_blocks + qb_idx
-    sort_idx = linear.argsort(stable=True)
+    # Lexicographic sort (linear, kb_idx) so last K block (max kb) is last per segment
+    sort_key = linear * (num_kv_blocks + 1) + kb_idx
+    sort_idx = sort_key.argsort(stable=True)
     kv_block_indices = kb_idx[sort_idx].to(torch.int32)
 
     return kv_block_indices, lut_start, lut_count
