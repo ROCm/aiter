@@ -8,6 +8,7 @@ import torch
 import argparse
 from aiter.ops.triton.moe.moe_op_gemm_int8_smoothquant import (
     moe_gemm_int8_smoothquant,
+    preshuffle_weights
 )
 from aiter.ops.triton.moe.quant_moe import (
     smoothquant_quantize,
@@ -89,7 +90,7 @@ def compute_roofline(
 
 
 def bench_mlp_single_weight_init(
-    batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex
+    batch, dim1, dim2, n_expts_tot, n_expts_act, preshuffled, x_dtype, w_dtype, TP, op_regex
 ):
     rank = 0
     dev = f"cuda:{rank}"
@@ -119,6 +120,9 @@ def bench_mlp_single_weight_init(
     w2_int8, w2_scale = quantize_weights_int8(w2)
     w1_int8 = w1_int8.transpose(1, 2).contiguous().transpose(1, 2)
     w2_int8 = w2_int8.transpose(1, 2).contiguous().transpose(1, 2)
+    if preshuffled:
+        w1_int8 = preshuffle_weights(w1_int8)
+        w2_int8 = preshuffle_weights(w2_int8)
     # -- benchmark --
     reps = 100
     x = torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev)
@@ -141,6 +145,7 @@ def bench_mlp_single_weight_init(
             rdata,
             gather_indx=gather_indx,
             scatter_indx=None,
+            preshuffled=preshuffled,
             out_dtype=torch.float32,
             apply_activation=True,
             limit=None,
@@ -156,6 +161,7 @@ def bench_mlp_single_weight_init(
             rdata,
             gather_indx=None,
             scatter_indx=scatter_indx,
+            preshuffled=preshuffled,
             out_dtype=torch.bfloat16,
             apply_activation=False,
             add_residual=False,
@@ -172,6 +178,7 @@ def bench_mlp(
     dim2,
     n_expts_tot,
     n_expts_act,
+    preshuffled,
     x_dtype,
     w_dtype,
     TP,
@@ -181,7 +188,7 @@ def bench_mlp(
     all_results = []
     for i in range(num_weight_inits):
         result = bench_mlp_single_weight_init(
-            batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex
+            batch, dim1, dim2, n_expts_tot, n_expts_act, preshuffled, x_dtype, w_dtype, TP, op_regex
         )
         all_results.append(result)
 
@@ -203,6 +210,7 @@ def roofline_mlp(
     dim2,
     n_expts_tot,
     n_expts_act,
+    preshuffled,
     x_dtype,
     w_dtype,
     TP,
@@ -217,6 +225,7 @@ def roofline_mlp(
         dim2,
         n_expts_tot,
         n_expts_act,
+        preshuffled,
         x_dtype,
         w_dtype,
         TP,
@@ -246,6 +255,11 @@ def parse_args():
         help="Number of total and active experts in [total experts, active experts] order.",
     )
     parser.add_argument(
+        "--preshuffled",
+        action="store_true",
+        help="Preshuffle weights.",
+    )
+    parser.add_argument(
         "--op-regex",
         type=str,
         default=".*moe_gemm.*",
@@ -267,6 +281,7 @@ if __name__ == "__main__":
 
     dim1, dim2 = args.shape
     total_experts, active_experts = args.experts
+    preshuffled = args.preshuffled
     batch_ranges_moe = [
         (1, 2, 1),
         (2, 5, 2),
@@ -285,10 +300,11 @@ if __name__ == "__main__":
         dim2,
         total_experts,
         active_experts,
+        preshuffled,
         quantized_dtypes[0],
         quantized_dtypes[1],
         TP=1,
         op_regex=args.op_regex,
         num_weight_inits=args.num_weight_inits,
-        name="gpt-oss-x2",
+        name="int8-smoothquant",
     )

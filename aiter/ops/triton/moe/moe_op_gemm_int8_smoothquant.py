@@ -30,9 +30,53 @@ def should_upcast_indices(*args):
     return any(tensor is not None and can_overflow_int32(tensor) for tensor in args)
 
 
+def preshuffle_weights(w: torch.Tensor) -> torch.Tensor:
+    """
+    Preshuffle int8 weight from (E, K, N) to MFMA-friendly layout (E, N//16, K*16).
+
+    Matches the shuffle_weight pattern from aiter.ops.shuffle for INT8:
+      layout=(16, 16), BK=32, K_lane=16, BN=16
+
+    The transformation:
+      1. Transpose to (E, N, K)
+      2. View as (E, N//16, 16, K//32, 2, 16) - decompose into MFMA tile blocks
+      3. Permute to (E, N//16, K//32, 2, 16, 16) - reorder for register layout
+      4. View as (E, N//16, K*16) - flatten K dimension
+
+    Args:
+        w: int8 weight tensor of shape (E, K, N) where
+           - E = number of experts
+           - K = input dimension (must be divisible by 32)
+           - N = output dimension (must be divisible by 16)
+
+    Returns:
+        Preshuffled weight tensor of shape (E, K * 16, N // 16)
+    """
+    assert w.dtype == torch.int8, f"Expected int8 weights, got {w.dtype}"
+    assert w.ndim == 3, f"Expected 3D weight tensor (E, K, N), got {w.ndim}D"
+    E, K, N = w.shape
+    assert K % 32 == 0, f"K ({K}) must be divisible by 32 for MFMA preshuffling"
+    assert N % 16 == 0, f"N ({N}) must be divisible by 16 for MFMA preshuffling"
+
+    # Transpose to (E, N, K)
+    w = w.transpose(1, 2)
+
+    # Preshuffle
+    w = w.view(E, N // 16, 16, K // 32, 2, 16)
+    w = w.permute(0, 1, 3, 4, 2, 5).contiguous()
+
+    # Reshape to (E, N // 16, K * 16)
+    w = w.view(E, N // 16, K * 16)
+
+    # Transpose back to (E, K, N)
+    w = w.transpose(1, 2)
+
+    return w
+
+
 def allocate_output(
-    x,
-    w,
+    M,
+    N,
     out_dtype,
     reduction_n_matmul,
     reduction_n_reduction,
@@ -41,14 +85,8 @@ def allocate_output(
     scatter_indx,
     block_m,
     split_k,
+    device
 ):
-    # ---- output ------
-    N = w.shape[-1]
-    # by default - M is number of rows in the activations
-    M = x.shape[-2]
-    # if the activations are gathered, then M is number of gather indices
-    if gather_indx is not None:
-        M = gather_indx.shape[0]
     # final output
     if routing_data.n_expts_act == 1 or scatter_indx is None:
         y_rows = M
@@ -58,9 +96,9 @@ def allocate_output(
         )  # compressed number of rows
     matmul_shape = (split_k, M, N // reduction_n_matmul)
     final_shape = (y_rows, N // reduction_n_matmul // reduction_n_reduction)
-    matmul_output = torch.empty(matmul_shape, device=x.device, dtype=out_dtype)
+    matmul_output = torch.empty(matmul_shape, device=device, dtype=out_dtype)
     if scatter_indx is not None or split_k > 1:
-        final_output = torch.empty(final_shape, device=x.device, dtype=out_dtype)
+        final_output = torch.empty(final_shape, device=device, dtype=out_dtype)
     else:
         final_output = None
     return matmul_output, final_output
@@ -77,7 +115,7 @@ def get_kernel_config(m, n, k, routing_data):
         block_n = 64
         block_k = 256
         num_warps = 4
-        num_stages = 1
+        num_stages = 2
         kpack = 2
 
         grid_m = routing_data.n_blocks(m, block_m)
@@ -203,9 +241,10 @@ def moe_gemm_int8_smoothquant(
     gather_indx: torch.Tensor = None,
     scatter_indx: torch.Tensor = None,
     gammas: torch.Tensor = None,
+    preshuffled: bool = False,
     out_dtype: torch.dtype = torch.bfloat16,
     apply_activation: bool = False,
-    add_residual: bool = False,  # DouBao doesn't use residual addition
+    add_residual: bool = False,
     alpha: float = 1.0,
     limit: float = 1.0,
 ):
@@ -233,6 +272,8 @@ def moe_gemm_int8_smoothquant(
     # determine shapes
     M = x.shape[-2] if gather_indx is None else gather_indx.shape[0]
     K, N = x.shape[-1], w.shape[-1]
+    if preshuffled:
+        N *= 16
     # compute optimization flags
     config = get_kernel_config(M, N, K, routing_data)
     if apply_activation:
@@ -249,8 +290,8 @@ def moe_gemm_int8_smoothquant(
         alpha = 0
     # allocate output memory
     y, y_final = allocate_output(
-        x,
-        w,
+        M,
+        N,
         out_dtype,
         reduction_n_matmul,
         reduction_n_reduction,
@@ -259,6 +300,7 @@ def moe_gemm_int8_smoothquant(
         scatter_indx,
         config["block_m"],
         config["split_k"],
+        x.device
     )
     stride_bias = None if bias is None else bias.stride(0)
     # moe metadata
@@ -311,6 +353,7 @@ def moe_gemm_int8_smoothquant(
         config["block_n"],
         config["block_k"],
         config["group_m"],
+        PRESHUFFLED = preshuffled,
         EVEN_K=K % config["block_k"] == 0,
         MASK_K_LIMIT=K % config["block_k"],
         SPLIT_K=config["split_k"],

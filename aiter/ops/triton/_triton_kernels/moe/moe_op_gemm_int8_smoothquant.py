@@ -93,6 +93,16 @@ def _swiglu(input, alpha, limit, ADD_RESIDUAL: tl.constexpr):
 
 
 @triton.jit
+def unshuffle_weights(w, BLOCK_N, BLOCK_K):
+    w = w.trans()
+    w = w.reshape(1, BLOCK_N // 16, BLOCK_K // 32, 2, 16, 16)
+    w = w.permute(0, 1, 4, 2, 3, 5)
+    w = w.reshape(BLOCK_N, BLOCK_K)
+    w = w.trans()
+    return w
+
+
+@triton.jit
 def _reduce_grouped(
     X,
     stride_xb: tl.uint64,
@@ -205,6 +215,7 @@ def _moe_gemm_int8_smoothquant(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
+    PRESHUFFLED: tl.constexpr,
     EVEN_K: tl.constexpr,
     MASK_K_LIMIT: tl.constexpr,
     SPLIT_K: tl.constexpr,
@@ -299,12 +310,21 @@ def _moe_gemm_int8_smoothquant(
     )
 
     # B pointers
-    offs_w_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    if PRESHUFFLED:
+        PACKED_BLOCK_N: tl.constexpr = BLOCK_N // 16
+        PACKED_BLOCK_K: tl.constexpr = BLOCK_K * 16
+        PACKED_N = N // 16
+    else:
+        PACKED_BLOCK_N: tl.constexpr = BLOCK_N
+        PACKED_BLOCK_K: tl.constexpr = BLOCK_K
+        PACKED_N = N
+
+    offs_w_n = pid_n * PACKED_BLOCK_N + tl.arange(0, PACKED_BLOCK_N)
     offs_w_n = tl.max_contiguous(
-        tl.multiple_of(offs_w_n % N, BLOCK_N),
-        BLOCK_N,
+        tl.multiple_of(offs_w_n % PACKED_N, PACKED_BLOCK_N),
+        PACKED_BLOCK_N,
     )
-    offs_w_k = BLOCK_K * pid_k + tl.arange(0, BLOCK_K)
+    offs_w_k = pid_k * PACKED_BLOCK_K + tl.arange(0, PACKED_BLOCK_K)
     W += expt_id * stride_w_e
     WPtrs = W + (
         offs_w_k.to(index_type)[:, None] * stride_w_k
@@ -316,23 +336,32 @@ def _moe_gemm_int8_smoothquant(
         num_k_iter -= 1
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+    #tl.device_print("acc", acc.shape)
     for k in range(num_k_iter):
         x = tl.load(XPtrs)
         w = tl.load(WPtrs, cache_modifier=W_CACHE_MODIFIER)
+        if PRESHUFFLED:
+            w = unshuffle_weights(w, BLOCK_N, BLOCK_K)
+            #tl.device_print("w", w.shape)
 
         acc += tl.dot(x, w, input_precision="ieee")
 
         XPtrs += (BLOCK_K * SPLIT_K) * stride_x_k
-        WPtrs += (BLOCK_K * SPLIT_K) * stride_w_k
+        WPtrs += (PACKED_BLOCK_K * SPLIT_K) * stride_w_k
 
     if not EVEN_K:
         mask_x_k = offs_x_k < MASK_K_LIMIT
-        mask_w_k = offs_w_k < MASK_K_LIMIT
+        if PRESHUFFLED:
+            mask_w_k = offs_w_k < MASK_K_LIMIT * 16
+        else:
+            mask_w_k = offs_w_k < MASK_K_LIMIT
 
         x = tl.load(XPtrs, mask=mask_x_k[None, :], other=0)
         w = tl.load(
             WPtrs, mask=mask_w_k[:, None], other=0, cache_modifier=W_CACHE_MODIFIER
         )
+        if PRESHUFFLED:
+            w = unshuffle_weights(w, BLOCK_N, BLOCK_K)
 
         acc += tl.dot(x, w, input_precision="ieee")
 
