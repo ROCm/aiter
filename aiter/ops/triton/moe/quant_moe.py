@@ -23,7 +23,7 @@ def downcast_to_static_fp8_3d(x: torch.Tensor, scale: torch.Tensor):
 
 def downcast_to_static_fp8(x: torch.Tensor, scale: torch.Tensor):
     M, N = x.shape
-    y = torch.empty((M, N), dtype=torch.float8_e4m3fn, device="cuda")
+    y = torch.empty((M, N), dtype=torch.float8_e4m3fnuz, device="cuda")
 
     BLOCK_M = min(triton.next_power_of_2(M), 128)
     if M <= 4096:
@@ -77,7 +77,7 @@ def downcast_to_mxfp(
     # downcast
     src_tensor = src_tensor.transpose(axis, src_tensor.ndim - 1)
     is_fp4 = out_quant_type == torch.uint8
-    is_fp8 = out_quant_type in (torch.float8_e4m3fn, torch.float8_e5m2)
+    is_fp8 = out_quant_type in (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2)
     assert is_fp4 or is_fp8
     divisor = 2 if is_fp4 else 1
     L = src_tensor.shape[-1]
@@ -138,7 +138,7 @@ def upcast_from_mxfp(
     assert tensor.dtype in {
         torch.uint8,
         torch.float8_e5m2,
-        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
     }, f"Invalid tensor dtype {tensor.dtype=}"
     assert scale.dtype == torch.uint8, f"Invalid scale dtype {scale.dtype=}"
     assert dtype in (torch.float16, torch.bfloat16), f"Invalid output dtype {dtype=}"
@@ -259,18 +259,12 @@ def smoothquant_quantize(
     M, K = x.shape
     device = x.device
 
-    # Allocate outputs
     x_int8 = torch.empty((M, K), dtype=torch.int8, device=device)
     x_scale = torch.empty((M,), dtype=torch.float32, device=device)
 
-    # Ensure smooth_scale is fp32 and contiguous
     smooth_scale = smooth_scale.to(torch.float32).contiguous()
 
-    # Choose kernel based on K size
-    # Use single-pass for K <= 1024, otherwise use multi-pass (iterates over K)
-    # Key insight: BLOCK_K should be small enough to fit in registers
-    MAX_SINGLE_PASS_K = 1024  # Maximum K for single-pass kernel
-
+    MAX_SINGLE_PASS_K = 1024
     BLOCK_M = min(triton.next_power_of_2(M), 32)
 
     if K <= MAX_SINGLE_PASS_K:
@@ -295,11 +289,8 @@ def smoothquant_quantize(
             num_warps=4,
         )
     else:
-        # Multi-pass: iterate over K dimension with smaller blocks
-        # Use BLOCK_K that balances parallelism and register pressure
-        BLOCK_K = 256  # Good for most GPUs
+        BLOCK_K = 256
         grid = (triton.cdiv(M, BLOCK_M),)
-
         _smoothquant_fuse_quant_kernel[grid](
             x,
             x.stride(0),
@@ -334,7 +325,7 @@ def quantize_weights_int8(
         w_scale: Per-output-channel scale [E, N] or [N] (contiguous)
     """
     if w.ndim == 2:
-        # [K, N] -> add expert dimension
+        # [K, N] -> [1, K, N]
         w = w.unsqueeze(0)
         squeeze_output = True
     else:
@@ -343,20 +334,14 @@ def quantize_weights_int8(
     E, K, N = w.shape
     device = w.device
 
-    # Compute per-channel max (along K dimension)
     w_fp32 = w.to(torch.float32)
-    w_abs_max = w_fp32.abs().max(dim=1).values  # [E, N]
-
-    # Compute scale
+    w_abs_max = w_fp32.abs().max(dim=1).values
     INT8_MAX = 127.0
-    w_scale = w_abs_max / INT8_MAX + 1e-12  # [E, N]
-
-    # Quantize
+    w_scale = w_abs_max / INT8_MAX + 1e-12
     w_scaled = w_fp32 / w_scale[:, None, :]
     w_int8 = w_scaled.round().clamp(-127, 127).to(torch.int8)
 
-    # Ensure contiguous memory layout for efficient access
-    # Layout [E, K, N] with N contiguous is optimal for the GEMM kernel
+    # Layout [E, K, N] with N contiguous
     w_int8 = w_int8.contiguous()
     w_scale = w_scale.contiguous()
 
