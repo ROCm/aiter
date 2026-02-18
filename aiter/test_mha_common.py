@@ -388,26 +388,30 @@ def block_attn_mask_to_token_mask(
     device,
 ):
     """
-    Build a token-level attention mask (True = mask out / -inf) from a block-level mask.
+    Build a token-level attention mask from a block-level mask.
 
-    block_attn_mask: (batch, num_q_blocks, num_kv_blocks) boolean.
+    block_attn_mask: 3D (batch, num_q_blocks, num_kv_blocks) or
+        4D (batch, num_heads, num_q_blocks, num_kv_blocks) boolean.
         True = may attend, False = must not attend.
     Returns:
-        mask: (batch_size, seqlen_q, seqlen_k) boolean, True where attention is disallowed.
+        3D: (batch_size, seqlen_q, seqlen_k) boolean, True = may attend.
+        4D: (batch_size, num_heads, seqlen_q, seqlen_k) boolean, True = may attend.
     """
-    num_q_blocks, num_kv_blocks = block_attn_mask.shape[1], block_attn_mask.shape[2]
-    # (batch, num_q_blocks, num_kv_blocks) -> expand to token grid
-    # token (i, j) is blocked if block_attn_mask[b, i // BLOCK_M, j // BLOCK_N] is False
+    nd = block_attn_mask.dim()
+    assert nd in (3, 4), "block_attn_mask must be 3D or 4D"
     q_block_idx = torch.arange(seqlen_q, device=device).div(
         BLOCK_M, rounding_mode="floor"
-    ).clamp(max=num_q_blocks - 1)
+    ).clamp(max=block_attn_mask.shape[nd - 2] - 1)
     k_block_idx = torch.arange(seqlen_k, device=device).div(
         BLOCK_N, rounding_mode="floor"
-    ).clamp(max=num_kv_blocks - 1)
-    # allow[b, i, j] = block_attn_mask[b, q_block_idx[i], k_block_idx[j]]
-    attn_mask = block_attn_mask[:, q_block_idx, :][:, :, k_block_idx]  # (B, seqlen_q, seqlen_k)
-
-    return attn_mask  # True where we must mask (set -inf)
+    ).clamp(max=block_attn_mask.shape[nd - 1] - 1)
+    if nd == 3:
+        num_q_blocks, num_kv_blocks = block_attn_mask.shape[1], block_attn_mask.shape[2]
+        attn_mask = block_attn_mask[:, q_block_idx, :][:, :, k_block_idx]  # (B, seqlen_q, seqlen_k)
+        return attn_mask
+    # 4D: (B, H, num_q_blocks, num_kv_blocks)
+    attn_mask = block_attn_mask[:, :, q_block_idx, :][:, :, :, k_block_idx]  # (B, H, seqlen_q, seqlen_k)
+    return attn_mask
 
 
 def attention_ref_block_sparse(
@@ -430,9 +434,11 @@ def attention_ref_block_sparse(
     with block_attn_mask[b, qb, kb] == True are allowed to attend.
 
     q, k, v: same as attention_ref (batch, seqlen_q, nheads, head_dim) in bshd.
-    block_attn_mask: (batch, num_q_blocks, num_kv_blocks) boolean.
+    block_attn_mask: 3D (batch, num_q_blocks, num_kv_blocks) or
+        4D (batch, num_heads, num_q_blocks, num_kv_blocks) boolean.
     Returns: (output, attention_scores, lse) like attention_ref.
     """
+    assert block_attn_mask.dim() in (3, 4), "block_attn_mask must be 3D or 4D"
     dtype_og = q.dtype
     if upcast:
         q, k, v = q.float(), k.float(), v.float()
@@ -446,11 +452,15 @@ def attention_ref_block_sparse(
     v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
     d = q.shape[-1]
     scores = torch.einsum("bthd,bshd->bhts", q / math.sqrt(d), k)
-    # Apply block-sparse mask: True in token mask -> -inf
-    token_mask = ~block_attn_mask_to_token_mask(
+    # Apply block-sparse mask: token_mask True = disallow -> -inf
+    allow_mask = block_attn_mask_to_token_mask(
         block_attn_mask, seqlen_q, seqlen_k, BLOCK_M, BLOCK_N, q.device
     )
-    scores.masked_fill_(rearrange(token_mask, "b t s -> b 1 t s"), float("-inf"))
+    token_mask = ~allow_mask  # True = disallow
+    if block_attn_mask.dim() == 3:
+        scores.masked_fill_(rearrange(token_mask, "b t s -> b 1 t s"), float("-inf"))
+    else:
+        scores.masked_fill_(token_mask, float("-inf"))
     if key_padding_mask is not None:
         scores.masked_fill_(
             rearrange(~key_padding_mask, "b s -> b 1 1 s"), float("-inf")
@@ -459,10 +469,13 @@ def attention_ref_block_sparse(
         scores = scores + attn_bias
     lse = torch.logsumexp(scores, dim=-1).to(v.dtype)
     attention = torch.softmax(scores, dim=-1).to(v.dtype)
-    all_masked = token_mask.all(dim=-1)  # (batch, seqlen_q)
-    attention = attention.masked_fill(
-        rearrange(all_masked, "b t -> b 1 t 1"), 0.0
-    )
+    all_masked = token_mask.all(dim=-1)  # (batch, seqlen_q) or (batch, num_heads, seqlen_q)
+    if block_attn_mask.dim() == 3:
+        attention = attention.masked_fill(
+            rearrange(all_masked, "b t -> b 1 t 1"), 0.0
+        )
+    else:
+        attention = attention.masked_fill_(all_masked.unsqueeze(-1), 0.0)
     if query_padding_mask is not None:
         attention = attention.masked_fill(
             rearrange(~query_padding_mask, "b s -> b 1 s 1"), 0.0
