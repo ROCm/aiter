@@ -43,20 +43,19 @@ class AsyncCopyDescriptor:
         self.BLOCK_K = ttgl.constexpr(BLOCK_K)
     
     @gluon.jit
-    def initialize(ptr, gathered_m, off_k, stride_m, stride_k, BLOCK_M: ttgl.constexpr, BLOCK_K: ttgl.constexpr, BLOCKED_MK: ttgl.constexpr):
+    def initialize(ptr, gathered_m, offs_k, stride_m, stride_k, BLOCK_M: ttgl.constexpr, BLOCK_K: ttgl.constexpr, BLOCKED_MK: ttgl.constexpr):
         """
         Initialize descriptor with gathered row indices.
         
         Args:
             ptr: Base pointer to X tensor
             gathered_m: Gathered row indices [BLOCK_M] (irregular)
-            off_k: Starting K offset
+            offs_k: K offsets [BLOCK_K]
             stride_m: Stride for M dimension
             stride_k: Stride for K dimension
         """
-        offs_k = off_k + ttgl.arange(0, BLOCK_K, layout=ttgl.SliceLayout(0, BLOCKED_MK))
         step_k = BLOCK_K * stride_k
-        offs = gathered_m.to(ttgl.int32)[:, None] * stride_m + offs_k .to(ttgl.int32)[None, :]* stride_k
+        offs = gathered_m * stride_m + offs_k * stride_k
         return AsyncCopyDescriptor(ptr, offs, offs_k, step_k, BLOCK_M, BLOCK_K)
     
     @gluon.jit
@@ -187,7 +186,6 @@ def _reduce_grouped(
     XPtrs = X + offs_n * stride_xn
 
     for i in ttgl.static_range(0, K):
-        # Initialize curr with the same layout as vals will have
         curr = ttgl.zeros([BLOCK_N], dtype=ttgl.float32, layout=ttgl.SliceLayout(0, blocked_n))
         
         # Iterate over split_k partial values
@@ -234,10 +232,15 @@ def issue_tile_loads(
     producer,
     a_buffer,
     b_buffer,
+    a_scale_buffer,
+    b_scale_buffer,
     BLOCK_M: ttgl.constexpr,
     BLOCK_N: ttgl.constexpr,
     BLOCK_K: ttgl.constexpr,
     K: ttgl.constexpr,
+    BLOCKSCALE_M: ttgl.constexpr,
+    BLOCKSCALE_K: ttgl.constexpr,
+    PER_ROW_X_SCALE: ttgl.constexpr,
     W_TRANSPOSE: ttgl.constexpr,
     NUM_BUFFERS: ttgl.constexpr,
     EVEN_K: ttgl.constexpr,
@@ -346,6 +349,9 @@ def create_descriptor(
         b_scale_desc: Tensor descriptor for W scales (or None)
         offs_x_m: M dimension offsets for X (used for scales)
         offs_w_n: N dimension offsets for W (used for scales)
+    
+    Notes:
+        For this kernel implementation, BLOCKSCALE_K must equal BLOCK_K.
     """
     splitk_block_size = ttgl.cdiv(K, SPLIT_K)
 
@@ -370,9 +376,10 @@ def create_descriptor(
         offs_x_m = ttgl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
         # Initialize AsyncCopyDescriptor
         # TODO: Replace with TDM Gather once AMD hardware support is available.
-        off_k_start = pid_k * splitk_block_size
+        off_k = ttgl.arange(0, BLOCK_K, layout=ttgl.SliceLayout(0, BLOCKED_MK))
+        off_k_start = pid_k * splitk_block_size + off_k
         a_desc = AsyncCopyDescriptor.initialize(
-            X, offs_x_m, off_k_start, stride_x_m, stride_x_k, BLOCK_M, BLOCK_K, BLOCKED_MK
+            X, offs_x_m.to(ttgl.int32)[:, None], off_k_start.to(ttgl.int32)[None, :], stride_x_m, stride_x_k, BLOCK_M, BLOCK_K, BLOCKED_MK
         )
 
     # B descriptor
@@ -402,6 +409,7 @@ def create_descriptor(
     
     # A scale descriptor
     a_scale_desc = None
+    off_k_scale_start = (pid_k * splitk_block_size) // BLOCKSCALE_K
     if is_x_blockscale:
         if PER_ROW_X_SCALE:
             # XScale: [M, K_blocks]
@@ -410,13 +418,12 @@ def create_descriptor(
                     base=XBlockScale,
                     shape=(M, ttgl.cdiv(K, BLOCKSCALE_K)),
                     strides=(stride_x_bs_m, stride_x_bs_k),
-                    block_shape=(BLOCK_M, 1),
+                    block_shape=(BLOCK_M, BLOCK_K // BLOCKSCALE_K), # TODO: remove block_k == blockscale_k constraint
                     layout=SHARED_A_SCALE
                 )
             else:
-                off_k_scale_start = (pid_k * splitk_block_size) // BLOCKSCALE_K
                 a_scale_desc = AsyncCopyDescriptor.initialize(
-                    XBlockScale, offs_x_m, off_k_scale_start, stride_x_bs_m, stride_x_bs_k, 
+                    XBlockScale, offs_x_m.to(ttgl.int32)[:, None], off_k_scale_start, stride_x_bs_m, stride_x_bs_k, 
                     BLOCK_M, BLOCK_K, BLOCKED_MK
                 )
         else:
@@ -426,11 +433,10 @@ def create_descriptor(
                     base=XBlockScale,
                     shape=(ttgl.cdiv(M, BLOCKSCALE_M), ttgl.cdiv(K, BLOCKSCALE_K)),
                     strides=(stride_x_bs_m, stride_x_bs_k),
-                    block_shape=(1, 1),
+                    block_shape=(BLOCK_M // BLOCKSCALE_M, BLOCK_K // BLOCKSCALE_K), # TODO: remove block_k == blockscale_k constraint
                     layout=SHARED_A_SCALE
                 )
             else:
-                off_k_scale_start = (pid_k * splitk_block_size) // BLOCKSCALE_K
                 # Compute M block indices from gathered row indices
                 offs_x_scale_m = offs_x_m // BLOCKSCALE_M
                 a_scale_desc = AsyncCopyDescriptor.initialize(
@@ -643,8 +649,9 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
         issue_tile_loads(
             a_desc, b_desc, a_scale_desc, b_scale_desc, GatherIndx,
             pid_m, pid_n, k_offset_start, producer, 
-            a_buffer, b_buffer,
-            BLOCK_M, BLOCK_N, K, BLOCK_K, W_TRANSPOSE, NUM_BUFFERS, EVEN_K
+            a_buffer, b_buffer, a_scale_buffer, b_scale_buffer,
+            BLOCK_M, BLOCK_N, K, BLOCK_K, BLOCKSCALE_M, BLOCKSCALE_K, PER_ROW_X_SCALE,
+            W_TRANSPOSE, NUM_BUFFERS, EVEN_K
         )
         producer += 1
     
@@ -653,9 +660,10 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
         # Load next A and B tiles
         issue_tile_loads(
             a_desc, b_desc, a_scale_desc, b_scale_desc, GatherIndx,
-                pid_m, pid_n, k_offset_start, producer, 
-            a_buffer, b_buffer,
-            BLOCK_M, BLOCK_N, K, BLOCK_K, W_TRANSPOSE, NUM_BUFFERS, EVEN_K
+            pid_m, pid_n, k_offset_start, producer, 
+            a_buffer, b_buffer, a_scale_buffer, b_scale_buffer,
+            BLOCK_M, BLOCK_N, K, BLOCK_K, BLOCKSCALE_M, BLOCKSCALE_K, PER_ROW_X_SCALE,
+            W_TRANSPOSE, NUM_BUFFERS, EVEN_K
         )
         producer += 1
         
@@ -1194,9 +1202,9 @@ if __name__ == "__main__":
     )
 
     # Test parameters
-    m = 200
-    n = 200
-    k = 200
+    m = 128
+    n = 128
+    k = 128
     n_expts_tot = 8
     n_expts_act = 2
     do_gather = True
