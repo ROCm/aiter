@@ -226,7 +226,7 @@ def issue_tile_loads(
     a_scale_desc,
     b_scale_desc,
     GatherIndx,
-    pid_m,
+    block_id,
     pid_n,
     k_offset_start,
     producer,
@@ -270,7 +270,7 @@ def issue_tile_loads(
     if GatherIndx is None:
         ttgl.amd.gfx1250.tdm.async_load(
             a_desc,
-            [pid_m * BLOCK_M, k_offset_start + producer * BLOCK_K],
+            [block_id * BLOCK_M, k_offset_start + producer * BLOCK_K],
             a_buffer.index(buffer_idx)
         )
     else:
@@ -364,7 +364,7 @@ def create_descriptor(
         # Regular access: Use TDM tensor descriptor
         in_m = grid_m * BLOCK_M 
         a_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=X,
+            base=X + start_m * stride_x_m,
             shape=(in_m, K),
             strides=(stride_x_m, stride_x_k),
             block_shape=(BLOCK_M, BLOCK_K),
@@ -648,7 +648,7 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
     for _ in ttgl.static_range(NUM_BUFFERS - 1):
         issue_tile_loads(
             a_desc, b_desc, a_scale_desc, b_scale_desc, GatherIndx,
-            pid_m, pid_n, k_offset_start, producer, 
+            block_id, pid_n, k_offset_start, producer, 
             a_buffer, b_buffer, a_scale_buffer, b_scale_buffer,
             BLOCK_M, BLOCK_N, K, BLOCK_K, BLOCKSCALE_M, BLOCKSCALE_K, PER_ROW_X_SCALE,
             W_TRANSPOSE, NUM_BUFFERS, EVEN_K
@@ -660,7 +660,7 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
         # Load next A and B tiles
         issue_tile_loads(
             a_desc, b_desc, a_scale_desc, b_scale_desc, GatherIndx,
-            pid_m, pid_n, k_offset_start, producer, 
+            block_id, pid_n, k_offset_start, producer, 
             a_buffer, b_buffer, a_scale_buffer, b_scale_buffer,
             BLOCK_M, BLOCK_N, K, BLOCK_K, BLOCKSCALE_M, BLOCKSCALE_K, PER_ROW_X_SCALE,
             W_TRANSPOSE, NUM_BUFFERS, EVEN_K
@@ -1207,7 +1207,7 @@ if __name__ == "__main__":
     k = 128
     n_expts_tot = 8
     n_expts_act = 2
-    do_gather = True
+    do_gather = False
     do_scatter = False
     per_row_x_scale = False
     is_x_blockscale = True
