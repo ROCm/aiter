@@ -305,8 +305,12 @@ def select_3d_config(
         attn_impl = gluon_kernel_unified_attention_3d_async
         layouts = make_layout_3d(*hyper_parms, use_tdm, use_swizzle=True)
         # TODO: add heuristics for use_buffer_load
-        # layouts["use_buffer_load"] = False
-        layouts["use_buffer_load"] = True
+        if IS_DEVICE_ARCH_GFX12:
+            layouts["use_buffer_load"] = (
+                False  # async_copy buffer_load_to_shared is buggy on gfx12 for now
+            )
+        else:
+            layouts["use_buffer_load"] = True
     else:
         # Baseline kernel, num_stages does not matter, use_swizzle can be either True or False
         attn_impl = gluon_kernel_unified_attention_3d
