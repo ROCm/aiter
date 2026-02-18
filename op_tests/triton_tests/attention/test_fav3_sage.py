@@ -8,7 +8,10 @@ import math
 from aiter.test_mha_common import (
     attention_ref,
 )
-from aiter.ops.triton.attention.fav3_sage import fav3_sage_wrapper_func
+from aiter.ops.triton.attention.fav3_sage_wrapper import fav3_sage_wrapper_func
+from aiter.ops.triton.attention.fav3_sage_v2_wrapper import (
+    fav3_sage_mxfp4_wrapper
+)
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -230,6 +233,82 @@ def test_sage(
         inference_mode=True,
         layout=layout,
     )
+
+    if DEBUG_MODE:
+        print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
+
+    if layout == "bhsd":
+        q = q.permute(0, 2, 1, 3).contiguous()
+        k = k.permute(0, 2, 1, 3).contiguous()
+        v = v.permute(0, 2, 1, 3).contiguous()
+
+    torch_out = attention_ref(q, k, v, dropout_p=0.0, dropout_mask=None, causal=False)
+    torch_out, attention_scores, _ = torch_out
+
+    if layout == "bhsd":
+        torch_out = torch_out.permute(0, 2, 1, 3).contiguous()
+
+    assert torch_out.shape == triton_out.shape
+
+    if DEBUG_MODE:
+        print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
+        print(
+            f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
+        )
+
+    check_attention_outputs(
+        triton_out,
+        torch_out,
+        fp8=True,
+        atol=ATOL_fp8,
+        rtol=RTOL_fp8,
+        max_diff_percentage=0.5,
+    )
+
+
+from aiter.ops.triton.attention.fav3_sage_v2_wrapper import (
+    fav3_sage_mxfp4_wrapper
+)
+
+@pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
+@pytest.mark.parametrize(
+    "SEQLEN_Q, SEQLEN_K",
+    [(1, 1), (4, 4), (128, 128), (2, 1), (1, 2), (32, 16), (64, 128)],
+)
+@pytest.mark.parametrize(
+    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
+)
+@pytest.mark.parametrize("HEAD_SZ", [128])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+def test_sage_mxfp4( 
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    layout: str,
+    dtype=torch.bfloat16,
+):
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+
+    triton_out = fav3_sage_mxfp4_wrapper(
+            q, k, v,
+            layout=layout,
+        )
 
     if DEBUG_MODE:
         print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")

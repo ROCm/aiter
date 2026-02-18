@@ -34,7 +34,7 @@ from op_tests.triton_tests.attention.test_fav3_sage import check_attention_outpu
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 
-from aiter.ops.triton.attention.fav3_sage import (
+from aiter.ops.triton.attention.fav3_sage_wrapper import (
     fav3_sage_wrapper_func,
     fav3_sage_func,
     get_sage_fwd_configs,

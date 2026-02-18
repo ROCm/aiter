@@ -1,0 +1,293 @@
+from __future__ import annotations
+from typing import Literal, Optional, Tuple, List, Dict, Any
+import torch
+import os
+import glob
+import sys
+import argparse
+import triton
+import logging
+
+# MXFP4 specific imports
+from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import sage_quant_mxfp4
+from aiter.ops.triton.attention.fav3_sage_v2_wrapper import (
+    fav3_sage_mxfp4_func,
+    get_sage_fwd_configs_mxfp4,
+    fav3_sage_mxfp4_wrapper
+)
+
+from op_tests.triton_tests.attention.test_fav3_sage import (
+    compare_accuracy,
+    input_helper
+)
+
+from bench_fav3_sage import fav2_forward_func
+
+# Configuration
+logging.getLogger().setLevel(logging.INFO)
+logger = logging.getLogger(__name__)
+
+arg_to_torch_dtype = {
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+    "fp32": torch.float32,
+}
+
+def layout_preprocess(q, k, v, layout: str, target_layout: str = "bshd"):
+    if layout != target_layout:
+        q = q.permute(0, 2, 1, 3).contiguous()
+        k = k.permute(0, 2, 1, 3).contiguous()
+        v = v.permute(0, 2, 1, 3).contiguous()
+    return q, k, v
+
+def fav3_sage_forward_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool,
+    inference_mode: bool,
+    layout: Literal["bshd", "bhsd"],
+    include_quantization_overhead: bool = True,
+):
+    """Execution path for MXFP4 Sage Attention."""
+    head_dim = q.shape[-1]
+    softmax_scale = head_dim**-0.5
+
+    if include_quantization_overhead:
+        return lambda: fav3_sage_mxfp4_wrapper(
+            q, k, v,
+            layout=layout,
+        )
+    
+    # Exclude quantization overhead from the benchmark loop
+    config = get_sage_fwd_configs_mxfp4()
+    BLKQ, BLKK = config["BLOCK_M"], config["BLOCK_N"]
+
+    # Perform quantization (ignore delta_s as it's removed from kernel)
+    q_q, q_d, k_q, k_d, v_q, v_d, _ = sage_quant_mxfp4(
+        q, k, v,
+        sm_scale=softmax_scale,
+        BLKQ=BLKQ, BLKK=BLKK,
+        q_smoothing=False, # Parameter pruned
+        layout=layout,
+    )
+
+    return lambda: fav3_sage_mxfp4_func(
+        q=q_q, k=k_q, v=v_q,
+        q_descale=q_d, k_descale=k_d, v_descale=v_d,
+        causal=causal,
+        window_size=(-1, -1),
+        return_lse=not inference_mode,
+        layout=layout,
+        config=config,
+    )[0]
+
+def bench_kernel(q, k, v, args, provider):
+    """Main benchmarking logic for a single configuration."""
+    if args.layout == "bshd":
+        BATCH, N_CTX_Q, HQ, D_HEAD = q.shape
+        _, N_CTX_K, HK, D_HEAD_V = v.shape
+    else:
+        BATCH, HQ, N_CTX_Q, D_HEAD = q.shape
+        _, HK, N_CTX_K, D_HEAD_V = v.shape
+
+    # MXFP4 Path Only
+    fn = fav3_sage_forward_func(
+        q, k, v,
+        causal=False,
+        inference_mode=True,
+        layout=args.layout,
+        include_quantization_overhead=False
+    )
+    
+    ms = triton.testing.do_bench(fn)
+
+    # Metrics calculation (MXFP4 treats elements as 0.5 bytes in memory traffic for Q/K)
+    total_flops = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
+    
+    if "ms" in provider: return ms
+    if "TFLOPS" in provider: return total_flops / ms * 1e-9
+    return ms
+
+def run_benchmark(args):
+    torch.manual_seed(20)
+    
+    # Define benchmark configs
+    hk = args.hq if not args.hk else args.hk
+    sk = args.sq if not args.sk else args.sk
+    x_vals_list = [(args.b, args.hq, hk, args.sq, sk)]
+    
+    @triton.testing.perf_report(
+        triton.testing.Benchmark(
+            x_names=["BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K"],
+            x_vals=x_vals_list,
+            line_arg="provider",
+            line_vals=["time(ms)", "throughput(TFLOPS)"],
+            line_names=["time(ms)", "throughput(TFLOPS)"],
+            styles=[("blue", "-"), ("green", "-")],
+            ylabel="Metric Value",
+            plot_name="MXFP4_Attention_Performance",
+            args={"D_HEAD": args.d, "D_HEAD_V": args.dv, "dtype": arg_to_torch_dtype[args.dtype], "layout": args.layout}
+        )
+    )
+    def bench_mha(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V, dtype, layout, provider, device="cuda"):
+        q = torch.randn((BATCH, HQ, N_CTX_Q, D_HEAD), device=device, dtype=dtype)
+        k = torch.randn((BATCH, HK, N_CTX_K, D_HEAD), device=device, dtype=dtype)
+        v = torch.randn((BATCH, HK, N_CTX_K, D_HEAD_V), device=device, dtype=dtype)
+        
+        q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
+        return bench_kernel(q, k, v, args, provider)
+
+    bench_mha.run(save_path="." if args.o else None, print_data=True)
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Simplified MXFP4 Attention Benchmark")
+    parser.add_argument("-b", type=int, required=True, help="Batch size")
+    parser.add_argument("-hq", type=int, required=True, help="Number of Q heads")
+    parser.add_argument("-hk", type=int, default=0, help="Number of K heads (GQA)")
+    parser.add_argument("-sq", type=int, required=True, help="Q Sequence length")
+    parser.add_argument("-sk", type=int, default=0, help="K Sequence length")
+    parser.add_argument("-d", type=int, required=True, help="Head dimension")
+    parser.add_argument("-dv", type=int, default=0, help="V head dimension")
+    parser.add_argument("-dtype", default="bf16", choices=["bf16", "fp16"])
+    parser.add_argument("-layout", type=str, default="bhsd", choices=["bshd", "bhsd"])
+    parser.add_argument("-captured_dir", type=str, default=None, help="Provide dir for captured inputs, for accuracy comparison.")
+    parser.add_argument("-o", action="store_true", help="Save results to CSV")
+    return parser.parse_args()
+
+
+def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
+    """
+    Load captured input tensors from disk.
+
+    Args:
+        input_dir: Directory containing captured .pt files
+
+    Returns:
+        List of dictionaries containing q, k, v tensors and metadata
+    """
+    input_files = sorted(glob.glob(os.path.join(input_dir, "*_input_*.pt")))
+    if not input_files:
+        raise FileNotFoundError(f"No captured input files found in {input_dir}")
+
+    inputs = []
+    for i, f in enumerate(input_files):
+        data = torch.load(f, weights_only=False)
+        inputs.append(data)
+        # logger.info(f"Loaded [{i}] {os.path.basename(f)}: q={tuple(data['q_shape'])}")
+
+    return inputs
+
+
+def test_accuracy_with_captured_inputs(args):
+    input_dir = args.captured_dir
+    layout = args.layout
+    
+    inputs = load_captured_inputs(input_dir)
+    n_ = len(inputs)
+
+    for input_i in range(n_):
+        print("Testing accuracy on captured input:")
+        
+        # Get the input tensors for this configuration
+        inp = inputs[input_i]
+
+        q = inp["q"].to("cuda")
+        k = inp["k"].to("cuda")
+        v = inp["v"].to("cuda")
+
+        print("q.shape: ", q.shape)
+        print("k.shape: ", k.shape)
+        print("v.shape: ", v.shape)
+
+        print("Assuming bhsd layout. If not matching, change -layout.")
+        if layout == "bhsd": 
+            q = q.permute(0, 2, 1, 3).contiguous()
+            k = k.permute(0, 2, 1, 3).contiguous()
+            v = v.permute(0, 2, 1, 3).contiguous()
+        
+        sm_scale = q.shape[-1]**-0.5
+        
+        triton_out = fav3_sage_forward_func(q, k, v, False, False, "bshd")()
+        
+        print("Using as ref: Triton FAv2")
+        ref_out = fav2_forward_func(q, k, v, dropout_p=0.0, softmax_scale=sm_scale, causal=False, return_lse=False, return_attn_probs=False)()
+
+        assert ref_out.shape == triton_out.shape
+
+        compare_accuracy(
+            triton_out,
+            ref_out
+        )
+
+def test_accuracy_with_shape( 
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    layout: str,
+    dtype=torch.bfloat16,
+):
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+
+    print("Testing accuracy on shape:")
+
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+
+    print("q.shape: ", q.shape)
+    print("k.shape: ", k.shape)
+    print("v.shape: ", v.shape)
+
+    triton_out = fav3_sage_mxfp4_wrapper(
+            q, k, v,
+            layout=layout,
+        )
+
+    if layout == "bhsd": 
+            q = q.permute(0, 2, 1, 3).contiguous()
+            k = k.permute(0, 2, 1, 3).contiguous()
+            v = v.permute(0, 2, 1, 3).contiguous()
+        
+    sm_scale = q.shape[-1]**-0.5
+    
+    triton_out = fav3_sage_forward_func(q, k, v, False, False, "bshd")()
+
+    # print("triton out", triton_out)
+    
+    ref_out = fav2_forward_func(q, k, v, dropout_p=0.0, softmax_scale=sm_scale, causal=False, return_lse=False, return_attn_probs=False)()
+
+    assert ref_out.shape == triton_out.shape
+
+    compare_accuracy(
+        triton_out,
+        ref_out
+    )
+
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    if not args.dv: args.dv = args.d
+    if not args.sk: args.sk = args.sq
+    if not args.hk: args.hk = args.hq
+    if args.captured_dir is not None:
+        test_accuracy_with_captured_inputs(args)
+    else:
+        test_accuracy_with_shape(args.b, args.sq, args.sk, args.hq, args.hk, args.d, args.layout)
+
+    
+    
+    run_benchmark(args)
