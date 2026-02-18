@@ -94,8 +94,8 @@ def _gemm_a8w8_blockscale_kernel(
     num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
 
-    # im sorry but im gonna have to cast it
-    # theres no wmma instructions for int8 so it'll just become fp16 i suppose
+    # NOTE: there is no instruction i can see in the shader guide for int8 or fp8 wmma so i've put a temporary cast.
+    # if i find a better way to do this that would be better, but should be noted
 
     if NUM_KSPLIT == 1:
         remap_xcd(pid, GRID_MN)
