@@ -253,18 +253,20 @@ def _sage_fwd_blocksparse(
         v_ptrs = v_base_ptrs + start_n * stride_vk
         kv_offs_n = start_n + tl.arange(0, BLOCK_N)
         k_descale_ptr_cur = k_descale_offset + start_b * stride_ksblk
+        k_n_mask = kv_offs_n[None, :] < seqlen_k
         if PADDED_HEAD_QK:
-            k_mask = offs_d_qk[:, None] < ACTUAL_BLOCK_DMODEL_QK
-            k = tl.load(k_ptrs, mask=k_mask, other=0.0)
+            k_mask = (offs_d_qk[:, None] < ACTUAL_BLOCK_DMODEL_QK) & k_n_mask
         else:
-            k = tl.load(k_ptrs)
+            k_mask = k_n_mask
+        k = tl.load(k_ptrs, mask=k_mask, other=0.0)
         k_descale = tl.load(k_descale_ptr_cur)
         if PRE_LOAD_V:
+            v_n_mask = kv_offs_n[:, None] < seqlen_k
             if PADDED_HEAD_V:
-                v_mask = offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
-                v = tl.load(v_ptrs, mask=v_mask, other=0.0)
+                v_mask = v_n_mask & (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
             else:
-                v = tl.load(v_ptrs)
+                v_mask = v_n_mask
+            v = tl.load(v_ptrs, mask=v_mask, other=0.0)
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
         qk += tl.dot(q, k) * (q_descale * k_descale)
         qk_scaled = qk
@@ -279,6 +281,7 @@ def _sage_fwd_blocksparse(
             bias_ptrs = bias_base_ptrs + start_n * stride_bn
             bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
             qk_scaled += bias
+        qk_scaled = tl.where(qk_mask, qk_scaled, float("-inf"))  # mask padding before softmax
         m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
         q_shifted = tl.where(
             m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
@@ -328,11 +331,12 @@ def _sage_fwd_blocksparse(
             alpha = tl.math.exp(m_diff)
         acc = acc * alpha[:, None]
         if not PRE_LOAD_V:
+            v_n_mask = kv_offs_n[:, None] < seqlen_k
             if PADDED_HEAD_V:
-                v_mask = offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
-                v = tl.load(v_ptrs, mask=v_mask, other=0.0)
+                v_mask = v_n_mask & (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
             else:
-                v = tl.load(v_ptrs)
+                v_mask = v_n_mask
+            v = tl.load(v_ptrs, mask=v_mask, other=0.0)
         l_i = l_i * alpha + l_ij
         m_i = m_ij
         acc += tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
@@ -1543,18 +1547,12 @@ def sage_fwd(
     # ============================================================
     #                        EPILOGUE
     # ============================================================
-    # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
-    # Instead of directly computing 1/l_i which can be inf,
-    # we check for the invalid case first
-    if USE_SLIDING_WINDOW:
-        # For rows where m_i is still -inf, no keys were valid
-        # Set l_i to 1.0 to avoid division by zero (acc is already 0)
-        invalid_mask = m_i == float("-inf")
-        l_i_safe = tl.where(invalid_mask, 1.0, l_i)
-        l_recip = 1 / l_i_safe[:, None]
-    else:
-        invalid_mask = None
-        l_recip = 1 / l_i[:, None]
+    # For rows where m_i is still -inf, no keys were valid. Use l_i_safe to avoid
+    # 1/l_i = inf and log(l_i) = -inf (and to guard l_i underflow) in all paths.
+    invalid_mask = m_i == float("-inf")
+    l_i_safe = tl.where(invalid_mask, 1.0, l_i)
+    l_i_safe = tl.maximum(l_i_safe, 1e-7)
+    l_recip = 1 / l_i_safe[:, None]
 
     v_descale = tl.load(
         v_descale_ptr,
@@ -1563,6 +1561,10 @@ def sage_fwd(
     )
 
     acc = acc * l_recip * v_descale
+    z = 0.0
+    acc = tl.where(
+        invalid_mask[:, None], z.to(acc.type.element_ty), acc
+    )
     if ENABLE_DROPOUT:
         dropout_scale = 1 / (1 - dropout_p)
         acc = acc * dropout_scale
@@ -1576,23 +1578,17 @@ def sage_fwd(
             # mi_base2 = m_i * RCP_LN2
             mi_base2 = m_i
             # For invalid rows, log(l_i) would be -inf, but we want LSE to be -inf
-            # So we handle this case explicitly
-            if USE_SLIDING_WINDOW:
-                log_l_i = tl.where(invalid_mask, 0.0, tl.math.log2(l_i))
-                softmax_lse = mi_base2 + log_l_i
-                # Ensure invalid rows have LSE = -inf
-                softmax_lse = tl.where(invalid_mask, float("-inf"), softmax_lse)
-            else:
-                softmax_lse = mi_base2 + tl.math.log2(l_i)
+            log_l_i = tl.where(invalid_mask, 0.0, tl.math.log2(l_i_safe))
+            softmax_lse = tl.where(
+                invalid_mask, float("-inf"), mi_base2 + log_l_i
+            )
             # convert back to natural units
             softmax_lse *= LN2
         else:
-            if USE_SLIDING_WINDOW:
-                log_l_i = tl.where(invalid_mask, 0.0, tl.math.log(l_i))
-                softmax_lse = m_i + log_l_i
-                softmax_lse = tl.where(invalid_mask, float("-inf"), softmax_lse)
-            else:
-                softmax_lse = m_i + tl.math.log(l_i)
+            log_l_i = tl.where(invalid_mask, 0.0, tl.math.log(l_i_safe))
+            softmax_lse = tl.where(
+                invalid_mask, float("-inf"), m_i + log_l_i
+            )
 
     # handle masking edge cases
     if USE_SLIDING_WINDOW:
