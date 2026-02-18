@@ -60,16 +60,14 @@ def _compute_hres_mhc_lite(
 @triton.jit
 def _mhc_fused_kernel(
     x_ptr,
-    phi_pre_ptr,
-    phi_post_ptr,
-    phi_res_ptr,
+    phi_ptr,  # Unified phi: (K, n + n + n_res)
+   
     alpha_pre,
     alpha_post,
     alpha_res,
     bias_ptr,
-    out_pre_ptr,
-    out_post_ptr,
-    out_res_ptr,
+    out_ptr,  # Unified output: (M, n + n + n_squared)
+   
     perm_ptr,
     M: tl.constexpr,
     K: tl.constexpr,
@@ -80,18 +78,12 @@ def _mhc_fused_kernel(
     eps: tl.constexpr,
     stride_xm,
     stride_xk,
-    stride_phi_pre_k,
-    stride_phi_pre_n,
-    stride_phi_post_k,
-    stride_phi_post_n,
-    stride_phi_res_k,
-    stride_phi_res_n,
-    stride_pre_m,
-    stride_pre_n,
-    stride_post_m,
-    stride_post_n,
-    stride_res_m,
-    stride_res_n,
+    stride_phi_k,  # Stride for K dimension
+    stride_phi_n,  # Stride for N dimension (total_cols)
+   
+    stride_out_m,  # Stride for M dimension
+    stride_out_n,  # Stride for N dimension (total_cols)
+   
     stride_perm_k,
     stride_perm_ij,
     BLOCK_M: tl.constexpr,
@@ -146,21 +138,13 @@ def _mhc_fused_kernel(
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
     acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
 
-    phi_ptr = tl.where(
+    # Compute phi column offset in unified tensor layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_res-1]
+    phi_col_start = tl.where(
         is_pre_program,
-        phi_pre_ptr,
-        tl.where(is_post_program, phi_post_ptr, phi_res_ptr),
+        0,
+        tl.where(is_post_program, n, 2 * n)
     )
-    stride_phi_k = tl.where(
-        is_pre_program,
-        stride_phi_pre_k,
-        tl.where(is_post_program, stride_phi_post_k, stride_phi_res_k),
-    )
-    stride_phi_n = tl.where(
-        is_pre_program,
-        stride_phi_pre_n,
-        tl.where(is_post_program, stride_phi_post_n, stride_phi_res_n),
-    )
+    # Unified phi tensor - strides are the same for all streams
 
     for k in range(0, K, BLOCK_K):
         rk = k + tl.arange(0, BLOCK_K)
@@ -171,8 +155,9 @@ def _mhc_fused_kernel(
             other=0.0,
         )
 
+        phi_col_offset = phi_col_start + rn_local
         phi_tile = tl.load(
-            phi_ptr + rk[:, None] * stride_phi_k + rn_local[None, :] * stride_phi_n,
+            phi_ptr + rk[:, None] * stride_phi_k + phi_col_offset[None, :] * stride_phi_n,
             mask=(rk[:, None] < K) & (rn_local[None, :] < n_out),
             other=0.0,
         )
@@ -213,24 +198,17 @@ def _mhc_fused_kernel(
         is_pre_program | is_post_program, tl.sigmoid(out) * (1.0 + is_post_f32), out_res
     )
 
-    out_ptr = tl.where(
+    # Compute output column offset in unified tensor layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_squared-1]
+    out_col_start = tl.where(
         is_pre_program,
-        out_pre_ptr,
-        tl.where(is_post_program, out_post_ptr, out_res_ptr),
+        0,
+        tl.where(is_post_program, n, 2 * n)
     )
-    stride_out_m = tl.where(
-        is_pre_program,
-        stride_pre_m,
-        tl.where(is_post_program, stride_post_m, stride_res_m),
-    )
-    stride_out_n = tl.where(
-        is_pre_program,
-        stride_pre_n,
-        tl.where(is_post_program, stride_post_n, stride_res_n),
-    )
+    # Unified output tensor - strides are the same for all streams
 
+    out_col_offset = out_col_start + rn_local
     tl.store(
-        out_ptr + rm[:, None] * stride_out_m + rn_local[None, :] * stride_out_n,
+        out_ptr + rm[:, None] * stride_out_m + out_col_offset[None, :] * stride_out_n,
         out_activated,
         mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
     )
@@ -239,9 +217,8 @@ def _mhc_fused_kernel(
 @triton.jit
 def _mhc_fused_split_kernel(
     x_ptr,
-    phi_pre_ptr,
-    phi_post_ptr,
-    phi_res_ptr,
+    phi_ptr,  # Unified phi: (K, n + n + n_res)
+   
     acc_ptr,  # Single unified output: (NUM_KSPLIT, M, n + n + n_res)
     acc_sq_ptr,
     M: tl.constexpr,
@@ -252,12 +229,9 @@ def _mhc_fused_split_kernel(
     n_factorial: tl.constexpr,
     stride_xm,
     stride_xk,
-    stride_phi_pre_k,
-    stride_phi_pre_n,
-    stride_phi_post_k,
-    stride_phi_post_n,
-    stride_phi_res_k,
-    stride_phi_res_n,
+    stride_phi_k,  # Stride for K dimension
+    stride_phi_n,  # Stride for N dimension (total_cols)
+   
     stride_acc_k,  # Stride for NUM_KSPLIT dimension
     stride_acc_m,  # Stride for M dimension
     stride_acc_n,  # Stride for N dimension (total_cols)
@@ -334,21 +308,13 @@ def _mhc_fused_split_kernel(
     compute_acc_sq = pid_n == 0
     acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
 
-    phi_ptr = tl.where(
+    # Compute phi column offset in unified tensor layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_res-1]
+    phi_col_start = tl.where(
         is_pre_program,
-        phi_pre_ptr,
-        tl.where(is_post_program, phi_post_ptr, phi_res_ptr),
+        0,
+        tl.where(is_post_program, n, 2 * n)
     )
-    stride_phi_k = tl.where(
-        is_pre_program,
-        stride_phi_pre_k,
-        tl.where(is_post_program, stride_phi_post_k, stride_phi_res_k),
-    )
-    stride_phi_n = tl.where(
-        is_pre_program,
-        stride_phi_pre_n,
-        tl.where(is_post_program, stride_phi_post_n, stride_phi_res_n),
-    )
+    # Unified phi tensor - strides are the same for all streams
 
     # Loop over this split's K range
     k_span = split_k_end - split_k_start
@@ -364,8 +330,9 @@ def _mhc_fused_split_kernel(
             other=0.0,
         )
 
+        phi_col_offset = phi_col_start + rn_local
         phi_tile = tl.load(
-            phi_ptr + rk[:, None] * stride_phi_k + rn_local[None, :] * stride_phi_n,
+            phi_ptr + rk[:, None] * stride_phi_k + phi_col_offset[None, :] * stride_phi_n,
             mask=(rk[:, None] < split_k_end) & (rn_local[None, :] < n_out),
             other=0.0,
         )
@@ -404,9 +371,8 @@ def _mhc_fused_reduce_kernel(
     alpha_post,
     alpha_res,
     bias_ptr,
-    out_pre_ptr,
-    out_post_ptr,
-    out_res_ptr,
+    out_ptr,  # Unified output: (M, n + n + n_squared)
+   
     perm_ptr,
     M: tl.constexpr,
     K: tl.constexpr,
@@ -420,12 +386,9 @@ def _mhc_fused_reduce_kernel(
     stride_acc_n,  # Stride for N dimension (total_cols)
     stride_acc_sq_k,
     stride_acc_sq_m,
-    stride_pre_m,
-    stride_pre_n,
-    stride_post_m,
-    stride_post_n,
-    stride_res_m,
-    stride_res_n,
+    stride_out_m,  # Stride for M dimension
+    stride_out_n,  # Stride for N dimension (total_cols)
+   
     stride_perm_k,
     stride_perm_ij,
     BLOCK_M: tl.constexpr,
@@ -540,24 +503,17 @@ def _mhc_fused_reduce_kernel(
         is_pre_program | is_post_program, tl.sigmoid(out) * (1.0 + is_post_f32), out_res
     )
 
-    out_ptr = tl.where(
+    # Compute output column offset in unified tensor layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_squared-1]
+    out_col_start = tl.where(
         is_pre_program,
-        out_pre_ptr,
-        tl.where(is_post_program, out_post_ptr, out_res_ptr),
+        0,
+        tl.where(is_post_program, n, 2 * n)
     )
-    stride_out_m = tl.where(
-        is_pre_program,
-        stride_pre_m,
-        tl.where(is_post_program, stride_post_m, stride_res_m),
-    )
-    stride_out_n = tl.where(
-        is_pre_program,
-        stride_pre_n,
-        tl.where(is_post_program, stride_post_n, stride_res_n),
-    )
+    # Unified output tensor - strides are the same for all streams
 
+    out_col_offset = out_col_start + rn_local
     tl.store(
-        out_ptr + rm[:, None] * stride_out_m + rn_local[None, :] * stride_out_n,
+        out_ptr + rm[:, None] * stride_out_m + out_col_offset[None, :] * stride_out_n,
         out_activated,
         mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
     )

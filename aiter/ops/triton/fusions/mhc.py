@@ -56,9 +56,8 @@ def get_permutation_matrices(n: int, device: torch.device) -> torch.Tensor:
 
 def fused_mhc(
     x: torch.Tensor,
-    phi_pre: torch.Tensor,
-    phi_post: torch.Tensor,
-    phi_res: torch.Tensor,
+    phi: torch.Tensor,  # Unified phi: (K, n + n + n_res)
+   
     alpha_pre: float,
     alpha_post: float,
     alpha_res: float,
@@ -66,11 +65,9 @@ def fused_mhc(
     n: int,
     eps: float = 1e-6,
     hres_mode: str = "sinkhorn",
-    out_pre: Optional[torch.Tensor] = None,
-    out_post: Optional[torch.Tensor] = None,
-    out_res: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,  # Unified output: (M, n + n + n_squared)
     config: Optional[dict] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """
     Fused Triton kernel interface for mHC projection mapping (equations 14-18).
 
@@ -86,13 +83,29 @@ def fused_mhc(
 
     All operations are fused in an optimized Triton kernel for maximum performance.
 
+    Args:
+        x: (M, K) input tensor where K = n*C
+        phi: (K, N) unified projection matrix where N = n + n + n_res
+             Layout: [pre | post | res] where res is n² (sinkhorn) or n! (lite)
+        alpha_pre: Scaling factor for pre-stream
+        alpha_post: Scaling factor for post-stream
+        alpha_res: Scaling factor for residual stream
+        bias: (N,) bias vector (fp32)
+        n: Stream parameter (manifold dimension)
+        eps: Epsilon for numerical stability
+        hres_mode: "sinkhorn" for raw logits or "lite" for exact doubly stochastic
+        out: Optional (M, N) pre-allocated unified output buffer
+        config: Optional kernel configuration dict
+
     Returns:
-        Tuple of three tensors (H_pre, H_post, H_res):
+        Tuple of three tensor views (H_pre, H_post, H_res):
         - H_pre: (M, n) - manifold projection with sigmoid activation
         - H_post: (M, n) - post-processing with scaled sigmoid
         - H_res: (M, n²) - residual stream:
             - sinkhorn mode: raw logits (NOT doubly stochastic)
             - lite mode: exact doubly stochastic matrix
+        
+        Note: All three tensors are views into a single contiguous output buffer.
     """
 
     assert hres_mode in (
@@ -103,9 +116,7 @@ def fused_mhc(
 
     M, K = x.shape
     C = K // n  # Derive C from K and n
-    K_pre, n_pre = phi_pre.shape
-    K_post, n_post = phi_post.shape
-    K_res, phi_res_cols = phi_res.shape
+    K_phi, total_phi_cols = phi.shape
 
     n_squared = n * n
     n_factorial = factorial(n)
@@ -122,9 +133,6 @@ def fused_mhc(
         BLOCK_N = triton.next_power_of_2(max(config_block_n, min_block_n))
 
         n_res_expected = n_factorial
-        assert (
-            phi_res_cols == n_res_expected
-        ), f"In lite mode, phi_res must have {n_res_expected} columns (n!={n_res_expected}), got {phi_res_cols}"
 
         perm_matrices = get_permutation_matrices(n, x.device)
         n_blocks_res = 1
@@ -134,9 +142,6 @@ def fused_mhc(
         BLOCK_N = triton.next_power_of_2(config.pop("BLOCK_N", n_squared))
 
         n_res_expected = n_squared
-        assert (
-            phi_res_cols == n_squared
-        ), f"In sinkhorn mode, phi_res must have {n_squared} columns (n²), got {phi_res_cols}"
 
         perm_matrices = torch.empty(0, device=x.device)
         n_blocks_res = triton.cdiv(n_squared, BLOCK_N)
@@ -150,20 +155,17 @@ def fused_mhc(
     BLOCK_K = min(BLOCK_K, triton.next_power_of_2(K))
 
     _LOGGER.info(
-        f"FUSED_MHC: x={tuple(x.shape)} phi_pre={tuple(phi_pre.shape)} phi_post={tuple(phi_post.shape)} "
-        f"phi_res={tuple(phi_res.shape)} alpha_pre={alpha_pre} alpha_post={alpha_post} alpha_res={alpha_res} "
+        f"FUSED_MHC: x={tuple(x.shape)} phi={tuple(phi.shape)} "
+        f"alpha_pre={alpha_pre} alpha_post={alpha_post} alpha_res={alpha_res} "
         f"hres_mode={hres_mode} num_ksplit={num_ksplit}"
     )
 
     assert (
-        K == K_pre == K_post == K_res
-    ), f"Dimension mismatch: x has K={K}, but phi_pre={K_pre}, phi_post={K_post}, phi_res={K_res}"
+        K == K_phi
+    ), f"Dimension mismatch: x has K={K}, but phi has K={K_phi}"
     assert (
-        n_pre == n
-    ), f"phi_pre shape mismatch: expected (K, {n}), got ({K_pre}, {n_pre})"
-    assert (
-        n_post == n
-    ), f"phi_post shape mismatch: expected (K, {n}), got ({K_post}, {n_post})"
+        total_phi_cols == N_total_expected
+    ), f"phi shape mismatch: expected (K, {N_total_expected}), got ({K_phi}, {total_phi_cols})"
 
     assert (
         bias.shape[0] == N_total_expected
@@ -171,40 +173,24 @@ def fused_mhc(
     assert num_ksplit >= 1, f"num_ksplit must be >= 1, got {num_ksplit}"
 
     assert (
-        x.device == phi_pre.device == phi_post.device == phi_res.device == bias.device
+        x.device == phi.device == bias.device
     ), "All tensors must be on the same device"
     assert x.device.type == "cuda", "mHC kernel requires CUDA device"
 
     N = N_total_expected
 
-    # Allocate outputs if not provided
-    # H_res is always (M, n²) regardless of mode (lite outputs n² after perm combination)
-    if out_pre is None:
-        out_pre = torch.empty(M, n, dtype=x.dtype, device=x.device)
+    # Allocate unified output if not provided
+    # Single contiguous tensor: (M, n + n + n_res)
+    # Layout: [pre_0...pre_{n-1}, post_0...post_{n-1}, res_0...res_{n_res-1}]
+    total_out_cols = n + n + n_res_expected
+    if out is None:
+        out = torch.empty(M, total_out_cols, dtype=x.dtype, device=x.device)
     else:
-        assert out_pre.shape == (
+        assert out.shape == (
             M,
-            n,
-        ), f"out_pre shape mismatch: expected ({M}, {n}), got {out_pre.shape}"
-        assert out_pre.dtype == x.dtype and out_pre.device == x.device
-
-    if out_post is None:
-        out_post = torch.empty(M, n, dtype=x.dtype, device=x.device)
-    else:
-        assert out_post.shape == (
-            M,
-            n,
-        ), f"out_post shape mismatch: expected ({M}, {n}), got {out_post.shape}"
-        assert out_post.dtype == x.dtype and out_post.device == x.device
-
-    if out_res is None:
-        out_res = torch.empty(M, n_squared, dtype=x.dtype, device=x.device)
-    else:
-        assert out_res.shape == (
-            M,
-            n_squared,
-        ), f"out_res shape mismatch: expected ({M}, {n_squared}), got {out_res.shape}"
-        assert out_res.dtype == x.dtype and out_res.device == x.device
+            total_out_cols,
+        ), f"out shape mismatch: expected ({M}, {total_out_cols}), got {out.shape}"
+        assert out.dtype == x.dtype and out.device == x.device
 
     # Stream-aware grid: Each program processes exactly one stream
     n_blocks_pre = triton.cdiv(n, BLOCK_N)
@@ -231,9 +217,7 @@ def fused_mhc(
         grid_split = (triton.cdiv(M, BLOCK_M), total_n_blocks, num_ksplit)
         _mhc_fused_split_kernel[grid_split](
             x,
-            phi_pre,
-            phi_post,
-            phi_res,
+            phi,
             acc_partial,
             acc_sq_partial,
             M=M,
@@ -244,12 +228,8 @@ def fused_mhc(
             n_factorial=n_res_expected,
             stride_xm=x.stride(0),
             stride_xk=x.stride(1),
-            stride_phi_pre_k=phi_pre.stride(0),
-            stride_phi_pre_n=phi_pre.stride(1),
-            stride_phi_post_k=phi_post.stride(0),
-            stride_phi_post_n=phi_post.stride(1),
-            stride_phi_res_k=phi_res.stride(0),
-            stride_phi_res_n=phi_res.stride(1),
+            stride_phi_k=phi.stride(0),
+            stride_phi_n=phi.stride(1),
             stride_acc_k=acc_partial.stride(0),
             stride_acc_m=acc_partial.stride(1),
             stride_acc_n=acc_partial.stride(2),
@@ -272,9 +252,7 @@ def fused_mhc(
             alpha_post,
             alpha_res,
             bias,
-            out_pre,
-            out_post,
-            out_res,
+            out,
             perm_matrices,
             M=M,
             K=K,
@@ -288,12 +266,8 @@ def fused_mhc(
             stride_acc_n=acc_partial.stride(2),
             stride_acc_sq_k=acc_sq_partial.stride(0),
             stride_acc_sq_m=acc_sq_partial.stride(1),
-            stride_pre_m=out_pre.stride(0),
-            stride_pre_n=out_pre.stride(1),
-            stride_post_m=out_post.stride(0),
-            stride_post_n=out_post.stride(1),
-            stride_res_m=out_res.stride(0),
-            stride_res_n=out_res.stride(1),
+            stride_out_m=out.stride(0),
+            stride_out_n=out.stride(1),
             stride_perm_k=stride_perm_k,
             stride_perm_ij=stride_perm_ij,
             BLOCK_M=BLOCK_M,
@@ -308,16 +282,12 @@ def fused_mhc(
         # Invoke the fused Triton kernel for equations 14-18
         _mhc_fused_kernel[grid](
             x,
-            phi_pre,
-            phi_post,
-            phi_res,
+            phi,
             alpha_pre,
             alpha_post,
             alpha_res,
             bias,
-            out_pre,
-            out_post,
-            out_res,
+            out,
             perm_matrices,
             M=M,
             K=K,
@@ -328,18 +298,10 @@ def fused_mhc(
             eps=eps,
             stride_xm=x.stride(0),
             stride_xk=x.stride(1),
-            stride_phi_pre_k=phi_pre.stride(0),
-            stride_phi_pre_n=phi_pre.stride(1),
-            stride_phi_post_k=phi_post.stride(0),
-            stride_phi_post_n=phi_post.stride(1),
-            stride_phi_res_k=phi_res.stride(0),
-            stride_phi_res_n=phi_res.stride(1),
-            stride_pre_m=out_pre.stride(0),
-            stride_pre_n=out_pre.stride(1),
-            stride_post_m=out_post.stride(0),
-            stride_post_n=out_post.stride(1),
-            stride_res_m=out_res.stride(0),
-            stride_res_n=out_res.stride(1),
+            stride_phi_k=phi.stride(0),
+            stride_phi_n=phi.stride(1),
+            stride_out_m=out.stride(0),
+            stride_out_n=out.stride(1),
             stride_perm_k=stride_perm_k,
             stride_perm_ij=stride_perm_ij,
             BLOCK_M=BLOCK_M,
@@ -349,14 +311,14 @@ def fused_mhc(
             **config,
         )
 
-    return out_pre, out_post, out_res
+    # Return unified output tensor
+    return out
 
 
 def mhc(
     x: torch.Tensor,
-    phi_pre: torch.Tensor,
-    phi_post: torch.Tensor,
-    phi_res: torch.Tensor,
+    phi: torch.Tensor,  # Unified phi: (K, n + n + n_res)
+   
     alpha_pre: float,
     alpha_post: float,
     alpha_res: float,
@@ -365,21 +327,37 @@ def mhc(
     eps: float = 1e-6,
     hres_mode: str = "sinkhorn",
     sinkhorn_iters: int = 20,
-    out_pre: Optional[torch.Tensor] = None,
-    out_post: Optional[torch.Tensor] = None,
-    out_res: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,  # Unified output: (M, n + n + n_res)
     config: Optional[dict] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """
-    Compute mHC projection mapping (iterative Sinkhorn-Knopp).
+    Compute mHC projection mapping (equations 14-19).
 
+    Complete mHC pipeline with optional Sinkhorn-Knopp normalization.
     All operations are fused in optimized Triton kernels for maximum performance.
 
+    Args:
+        x: (M, K) input tensor where K = n*C
+        phi: (K, N) unified projection matrix where N = n + n + n_res
+             Layout: [pre | post | res] where res is n² (sinkhorn) or n! (lite)
+        alpha_pre: Scaling factor for pre-stream
+        alpha_post: Scaling factor for post-stream
+        alpha_res: Scaling factor for residual stream
+        bias: (N,) bias vector (fp32)
+        n: Stream parameter (manifold dimension)
+        eps: Epsilon for numerical stability
+        hres_mode: "sinkhorn" for Sinkhorn-Knopp or "lite" for permutation-based
+        sinkhorn_iters: Number of Sinkhorn-Knopp iterations (if hres_mode="sinkhorn")
+        out: Optional (M, N) pre-allocated unified output buffer
+        config: Optional kernel configuration dict
+
     Returns:
-        Tuple of three tensors (H_pre, H_post, H_res):
+        Tuple of three tensor views (H_pre, H_post, H_res):
         - H_pre: (M, n) - manifold projection with sigmoid activation
         - H_post: (M, n) - post-processing with scaled sigmoid
         - H_res: (M, n²) - doubly stochastic residual connection
+        
+        Note: All three tensors are views into a single contiguous output buffer.
     """
     _LOGGER.info(
         "MHC: calling fused_mhc() with hres_mode='lite'"
@@ -388,9 +366,7 @@ def mhc(
     )
     res = fused_mhc(
         x,
-        phi_pre,
-        phi_post,
-        phi_res,
+        phi,
         alpha_pre,
         alpha_post,
         alpha_res,
@@ -398,23 +374,26 @@ def mhc(
         n,
         eps,
         hres_mode=hres_mode,
-        out_pre=out_pre,
-        out_post=out_post,
-        out_res=out_res,
+        out=out,
         config=config,
     )
 
     if hres_mode == "lite":
         return res
     else:
-        out_pre, out_post, out_res = res
-
-        M = out_res.shape[0]
+        # Apply Sinkhorn-Knopp to the residual stream in-place
+        M = res.shape[0]
         C = x.shape[1] // n
+        # Extract residual stream for sinkhorn (in-place view)
+        out_res = res[:, 2*n:]  # Shape: (M, n²)
         out_res_3d = out_res.view(M, n, n)
-        sinkhorn_knopp(out_res_3d, C=C, num_iters=sinkhorn_iters, out=out_res_3d)
-
-        return out_pre, out_post, out_res
+        result = sinkhorn_knopp(out_res_3d, C=C, num_iters=sinkhorn_iters, out=out_res_3d)
+        # Copy result back only if it's a different tensor (contiguous() created new memory)
+        if result.data_ptr() != out_res_3d.data_ptr():
+            out_res.copy_(result.view(M, -1))
+        
+        # Return unified output tensor (res is modified in-place)
+        return res
 
 
 def sinkhorn_knopp(

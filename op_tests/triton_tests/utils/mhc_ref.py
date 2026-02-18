@@ -46,9 +46,7 @@ __all__ = [
 
 def mhc_torch(
     x: torch.Tensor,
-    phi_pre: torch.Tensor,
-    phi_post: torch.Tensor,
-    phi_res: torch.Tensor,
+    phi: torch.Tensor,  # (K, n + n + n_res)
     alpha_pre: float,
     alpha_post: float,
     alpha_res: float,
@@ -56,7 +54,7 @@ def mhc_torch(
     n: int,
     eps: float = 1e-6,
     return_with_sinkhorn: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """
     PyTorch reference implementation of mHC projection mapping (Eq 14-19).
 
@@ -70,12 +68,32 @@ def mhc_torch(
     - Eq 18: H^post = 2σ(H^post) (scaled sigmoid activation for post-stream)
     - Eq 19: H^res = Sinkhorn(H^res) (project residual stream onto doubly stochastic manifold)
 
+    Args:
+        x: (M, K) input tensor where K = n × C (flattened n-stream residual)
+        phi: (K, N) unified projection matrix where N = n + n + n²
+            Layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n²-1]
+        alpha_pre: α^pre scaling factor for pre-stream (Eq 12)
+        alpha_post: α^post scaling factor for post-stream (Eq 12)
+        alpha_res: α^res scaling factor for residual stream (Eq 12)
+        bias: (N,) bias vector where N = n + n + n²
+        n: stream parameter (manifold dimension controller)
+        eps: epsilon for RMS normalization stability
+        return_with_sinkhorn: if True, apply Sinkhorn-Knopp to H_res; else return raw logits
+
     Returns:
-        Tuple of three tensors (H_pre, H_post, H_res):
-        - H_pre: (M, n) manifold projection with sigmoid
-        - H_post: (M, n) post-processing with 2*sigmoid
-        - H_res: (M, n²) doubly stochastic residual connection
+        (M, N) unified output tensor where N = n + n + n²
+        Layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n²-1]
+        
+        To extract components:
+        - H_pre = out[:, :n]
+        - H_post = out[:, n:2n]
+        - H_res = out[:, 2n:]
     """
+    # Extract individual phi components from unified tensor
+    K = phi.shape[0]
+    phi_pre = phi[:, :n]
+    phi_post = phi[:, n:2*n]
+    phi_res = phi[:, 2*n:]
     x_f32 = x.to(torch.float32)
 
     # Eq 15: r = ||x̃||₂ / √(nC)
@@ -123,33 +141,59 @@ def mhc_torch(
     else:
         H_res = H_res.to(torch.float32)
 
-    return H_pre.to(x.dtype), H_post.to(x.dtype), H_res.to(x.dtype)
+    # Unify outputs into single contiguous tensor (matches kernel implementation)
+    # Layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_res-1]
+    out = torch.cat([H_pre.to(x.dtype), H_post.to(x.dtype), H_res.to(x.dtype)], dim=1)
+    
+    # Return unified output tensor
+    return out
 
 
 def mhc_lite_torch(
     x: torch.Tensor,
-    phi_pre: torch.Tensor,
-    phi_post: torch.Tensor,
-    phi_res: torch.Tensor,
+    phi: torch.Tensor,  # Unified phi: (K, n + n + n_res)
+   
     alpha_pre: float,
     alpha_post: float,
     alpha_res: float,
     bias: torch.Tensor,
     n: int,
     eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """
     PyTorch reference implementation of mHC-lite (exact doubly stochastic).
 
     This serves as ground truth for validating the Triton kernel implementation
-    with hres_mode="lite".
+    with hres_mode="lite". Uses exact doubly stochastic matrices via convex
+    combination of all n! permutation matrices, avoiding iterative Sinkhorn.
+
+    Args:
+        x: (M, K) input tensor where K = n × C (flattened n-stream residual)
+        phi: (K, N) unified projection matrix where N = n + n + n!
+            Layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n!-1]
+        alpha_pre: α^pre scaling factor for pre-stream (Eq 12)
+        alpha_post: α^post scaling factor for post-stream (Eq 12)
+        alpha_res: α^res scaling factor for residual stream (Eq 12)
+        bias: (N,) bias vector where N = n + n + n!
+        n: stream parameter (manifold dimension controller)
+        eps: epsilon for RMS normalization stability
 
     Returns:
-        Tuple of three tensors (H_pre, H_post, H_res):
-        - H_pre: (M, n) manifold projection with sigmoid
-        - H_post: (M, n) post-processing with 2*sigmoid
-        - H_res: (M, n!) exact doubly stochastic residual connection
+        (M, N) unified output tensor where N = n + n + n²
+        Layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n²-1]
+        
+        To extract components:
+        - H_pre = out[:, :n]
+        - H_post = out[:, n:2n]
+        - H_res = out[:, 2n:]
+        
+        Note: H_res is reshaped from (M, n, n) to (M, n²) for consistency with sinkhorn mode.
     """
+    # Extract individual phi components from unified tensor
+    K = phi.shape[0]
+    phi_pre = phi[:, :n]
+    phi_post = phi[:, n:2*n]
+    phi_res = phi[:, 2*n:]
     x_f32 = x.to(torch.float32)
     M = x.shape[0]
     n_factorial = factorial(n)
@@ -202,7 +246,12 @@ def mhc_lite_torch(
     H_res = torch.einsum("mk,kij->mij", alpha_coeffs, P)  # (M, n, n)
     H_res = H_res.view(M, n_squared)  # Flatten to (M, n²)
 
-    return H_pre.to(x.dtype), H_post.to(x.dtype), H_res.to(x.dtype)
+    # Unify outputs into single contiguous tensor (matches kernel implementation)
+    # Layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_squared-1]
+    out = torch.cat([H_pre.to(x.dtype), H_post.to(x.dtype), H_res.to(x.dtype)], dim=1)
+    
+    # Return unified output tensor
+    return out
 
 
 def sinkhorn_knopp_exp_domain_torch(
@@ -319,11 +368,9 @@ def generate_mhc_inputs(
         mode: Benchmark mode - "mhc", "mhc_lite", or "sinkhorn_knopp_only". Default: "mhc"
 
     Returns:
-        Tuple of (x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n) where:
+        Tuple of (x, phi, alpha_pre, alpha_post, alpha_res, bias, n) where:
         - x: (M, nC) flattened n-stream residual input
-        - phi_pre: (nC, n) pre-stream projection matrix
-        - phi_post: (nC, n) post-stream projection matrix
-        - phi_res: (nC, n²) for mhc/sinkhorn_knopp_only modes, (nC, n!) for mhc_lite mode
+        - phi: (nC, n + n + n_res) unified projection matrix [pre | post | res]
         - alpha_pre: α^pre scaling factor for pre-stream (Eq 12)
         - alpha_post: α^post scaling factor for post-stream (Eq 12)
         - alpha_res: α^res scaling factor for residual stream (Eq 12)
@@ -348,10 +395,9 @@ def generate_mhc_inputs(
     # flattened n-stream residual
     x = torch.randn(M, nC, dtype=dtype, device=device)
 
-    # Separate projection matrices for each stream
-    phi_pre = torch.randn(nC, n, dtype=dtype, device=device) * 0.1
-    phi_post = torch.randn(nC, n, dtype=dtype, device=device) * 0.1
-    phi_res = torch.randn(nC, n_res, dtype=dtype, device=device) * 0.1
+    # Unified projection matrix (nC, n + n + n_res)
+    # Layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_res-1]
+    phi = torch.randn(nC, N_total, dtype=dtype, device=device) * 0.1
 
     # scaling factors (Eq 12)
     alpha_pre = 0.5 + torch.rand(1).item()
@@ -361,7 +407,7 @@ def generate_mhc_inputs(
     # bias (Eq 13)
     bias = torch.randn(N_total, dtype=torch.float32, device=device) * 0.1
 
-    return x, phi_pre, phi_post, phi_res, alpha_pre, alpha_post, alpha_res, bias, n
+    return x, phi, alpha_pre, alpha_post, alpha_res, bias, n
 
 
 # =============================================================================

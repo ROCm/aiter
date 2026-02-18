@@ -114,9 +114,7 @@ def run_benchmark(args):
         # Generate inputs based on mode
         (
             x,
-            phi_pre,
-            phi_post,
-            phi_res,
+            phi,
             alpha_pre,
             alpha_post,
             alpha_res,
@@ -228,9 +226,7 @@ def run_benchmark(args):
             def fn():
                 return mhc(
                     x,
-                    phi_pre,
-                    phi_post,
-                    phi_res,
+                    phi,
                     alpha_pre,
                     alpha_post,
                     alpha_res,
@@ -245,9 +241,7 @@ def run_benchmark(args):
             def fn():
                 return mhc(
                     x,
-                    phi_pre,
-                    phi_post,
-                    phi_res,
+                    phi,
                     alpha_pre,
                     alpha_post,
                     alpha_res,
@@ -259,14 +253,12 @@ def run_benchmark(args):
         elif mode == "sinkhorn_knopp_only":
             # Sinkhorn-only: benchmark just the Sinkhorn-Knopp kernel
             # Pre-generate H_res for fair comparison (use sinkhorn mode for raw logits)
-            x_sk, phi_pre_sk, phi_post_sk, phi_res_sk, _, _, _, bias_sk, _ = (
+            x_sk, phi_sk, _, _, _, bias_sk, _ = (
                 generate_mhc_inputs(M, n, C, dtype, mode="mhc")
             )
             _, _, H_res_input = fused_mhc(
                 x_sk,
-                phi_pre_sk,
-                phi_post_sk,
-                phi_res_sk,
+                phi_sk,
                 alpha_pre,
                 alpha_post,
                 alpha_res,
