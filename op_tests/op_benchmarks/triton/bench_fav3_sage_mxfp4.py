@@ -8,19 +8,16 @@ import argparse
 import triton
 import logging
 
-# MXFP4 specific imports
-from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import sage_quant_mxfp4
 from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
-    fav3_sage_mxfp4_func,
+    fav3_sage_mxfp4_wrapper,
+    sage_quant_mxfp4,
     get_sage_fwd_configs_mxfp4,
-    fav3_sage_mxfp4_wrapper
+    fav3_sage_mxfp4_func
 )
-
 from op_tests.triton_tests.attention.test_fav3_sage import (
     compare_accuracy,
     input_helper
 )
-
 from bench_fav3_sage import fav2_forward_func
 
 # Configuration
@@ -40,42 +37,6 @@ def layout_preprocess(q, k, v, layout: str, target_layout: str = "bshd"):
         v = v.permute(0, 2, 1, 3).contiguous()
     return q, k, v
 
-def fav3_sage_forward_func(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    causal: bool,
-    layout: Literal["bshd", "bhsd"],
-    include_quantization_overhead: bool = True,
-):
-    """Execution path for MXFP4 Sage Attention."""
-
-    if include_quantization_overhead:
-        return lambda: fav3_sage_mxfp4_wrapper(
-            q, k, v,
-            layout=layout,
-        )
-    
-    # Exclude quantization overhead from the benchmark loop
-    config = get_sage_fwd_configs_mxfp4()
-    BLKQ, BLKK = config["BLOCK_M"], config["BLOCK_N"]
-
-    # Perform quantization (ignore delta_s as it's removed from kernel)
-    q_q, q_d, k_q, k_d, v_q, v_d, _ = sage_quant_mxfp4(
-        q, k, v,
-        BLKQ=BLKQ, BLKK=BLKK,
-        q_smoothing=False, # Parameter pruned
-        layout=layout,
-    )
-
-    return lambda: fav3_sage_mxfp4_func(
-        q=q_q, k=k_q, v=v_q,
-        q_descale=q_d, k_descale=k_d, v_descale=v_d,
-        causal=causal,
-        layout=layout,
-        config=config,
-    )
-
 def bench_kernel(q, k, v, args, provider):
     """Main benchmarking logic for a single configuration."""
     if args.layout == "bshd":
@@ -85,13 +46,44 @@ def bench_kernel(q, k, v, args, provider):
         BATCH, HQ, N_CTX_Q, D_HEAD = q.shape
         _, HK, N_CTX_K, D_HEAD_V = v.shape
 
-    # MXFP4 Path Only
-    fn = fav3_sage_forward_func(
-        q, k, v,
-        causal=False,
-        layout=args.layout,
-        include_quantization_overhead=False
-    )
+    def return_func_call():
+        
+        config = get_sage_fwd_configs_mxfp4()
+        BLKQ, BLKK = config["BLOCK_M"], config["BLOCK_N"]
+        (
+            q_quantized,
+            q_descale,
+            k_quantized,
+            k_descale,
+            v_quantized,
+            v_descale,
+            delta_s,
+        ) = sage_quant_mxfp4(
+            q,
+            k,
+            v,
+            BLKQ=BLKQ,
+            BLKK=BLKK,
+            q_smoothing=args.qsmooth,
+            layout=args.layout,
+        )
+        return lambda: fav3_sage_mxfp4_func(
+            q=q_quantized, k=k_quantized, v=v_quantized,
+            q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+            bias=delta_s,
+            causal=False,
+            layout=args.layout,
+            config=config,
+        )
+
+    # TODO: quantization drops the perf from 1800 to 1400 TFLOPs. This is too much.
+    fn = return_func_call()
+
+    # fn = lambda: fav3_sage_mxfp4_wrapper(
+    #         q, k, v,
+    #         layout=args.layout,
+    #         q_smooth=args.qsmooth
+    #     )
     
     ms = triton.testing.do_bench(fn)
 
@@ -131,7 +123,7 @@ def run_benchmark(args):
         q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
         return bench_kernel(q, k, v, args, provider)
 
-    bench_mha.run(save_path="." if args.o else None, print_data=True)
+    bench_mha.run(save_path=None, print_data=True)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simplified MXFP4 Attention Benchmark")
@@ -145,6 +137,7 @@ def parse_args():
     parser.add_argument("-dtype", default="bf16", choices=["bf16", "fp16"])
     parser.add_argument("-layout", type=str, default="bhsd", choices=["bshd", "bhsd"])
     parser.add_argument("-captured_dir", type=str, default=None, help="Provide dir for captured inputs, for accuracy comparison.")
+    parser.add_argument("-qsmooth", action="store_true", help="Do q smoothing (Warning! Smoothing Q requires bias addition which drops the perf as of now!)")
     parser.add_argument("-o", action="store_true", help="Save results to CSV")
     return parser.parse_args()
 
@@ -164,29 +157,29 @@ def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
         raise FileNotFoundError(f"No captured input files found in {input_dir}")
 
     inputs = []
-    for i, f in enumerate(input_files):
+    for _, f in enumerate(input_files):
         data = torch.load(f, weights_only=False)
         inputs.append(data)
-        # logger.info(f"Loaded [{i}] {os.path.basename(f)}: q={tuple(data['q_shape'])}")
 
     return inputs
 
 
-def test_accuracy(q,k,v, layout):
-    triton_out = fav3_sage_forward_func(
-            q, k, v, causal=False,
-            layout=layout,
-    )()
+def test_accuracy(q,k,v,args):
+    triton_out = fav3_sage_mxfp4_wrapper(
+            q, k, v,
+            layout=args.layout,
+            q_smooth=args.qsmooth
+        )
     # permute because FAv2 assumes bshd
-    if layout == "bhsd": 
+    if args.layout == "bhsd": 
         q = q.permute(0, 2, 1, 3).contiguous()
         k = k.permute(0, 2, 1, 3).contiguous()
         v = v.permute(0, 2, 1, 3).contiguous()
-    
-    sm_scale = q.shape[-1]**-0.5
+
     print("Using as ref: Triton FAv2")
+    sm_scale = q.shape[-1]**-0.5
     ref_out = fav2_forward_func(q, k, v, dropout_p=0.0, softmax_scale=sm_scale, causal=False, return_lse=False, return_attn_probs=False)()
-    if layout == "bhsd": 
+    if args.layout == "bhsd": 
         ref_out = ref_out.permute(0, 2, 1, 3)
 
     assert ref_out.shape == triton_out.shape
@@ -198,8 +191,6 @@ def test_accuracy(q,k,v, layout):
 
 def test_accuracy_with_captured_inputs(args):
     input_dir = args.captured_dir
-    layout = args.layout
-    
     inputs = load_captured_inputs(input_dir)
     n_ = len(inputs)
 
@@ -213,36 +204,30 @@ def test_accuracy_with_captured_inputs(args):
         print("q.shape: ", q.shape)
         print("k.shape: ", k.shape)
         print("v.shape: ", v.shape)
-        test_accuracy(q,k,v, layout)
+        test_accuracy(q,k,v,args)
 
 def test_accuracy_with_shape( 
-    BATCH: int,
-    SEQLEN_Q: int,
-    SEQLEN_K: int,
-    NUM_Q_HEADS: int,
-    NUM_K_HEADS: int,
-    HEAD_SZ: int,
-    layout: str,
+    args,
     dtype=torch.bfloat16,
 ):
     torch.cuda.empty_cache()
     torch.manual_seed(20)    
     q, k, v = input_helper(
-        BATCH,
-        NUM_Q_HEADS,
-        NUM_K_HEADS,
-        SEQLEN_Q,
-        SEQLEN_K,
-        HEAD_SZ,
-        HEAD_SZ,
+        args.b,
+        args.hq,
+        args.hk,
+        args.sq,
+        args.sk,
+        args.d,
+        args.dv,
         dtype,
-        layout,
+        args.layout,
     )
     print("Testing accuracy on shape:")
     print("q.shape: ", q.shape)
     print("k.shape: ", k.shape)
     print("v.shape: ", v.shape)
-    test_accuracy(q,k,v, layout)
+    test_accuracy(q,k,v,args)
 
 if __name__ == "__main__":
     args = parse_args()
@@ -252,6 +237,6 @@ if __name__ == "__main__":
     if args.captured_dir is not None:
         test_accuracy_with_captured_inputs(args)
     else:
-        test_accuracy_with_shape(args.b, args.sq, args.sk, args.hq, args.hk, args.d, args.layout)
+        test_accuracy_with_shape(args)
 
     run_benchmark(args)
