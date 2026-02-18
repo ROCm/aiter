@@ -18,6 +18,7 @@ from aiter.ops.triton.moe.quant_moe import (
 from aiter.ops.triton.moe.moe_op_gemm_int8_smoothquant import (
     moe_gemm_int8_smoothquant,
     moe_gemm_smoothquant_torch,
+    preshuffle_weights
 )
 
 # Target-specific utilities
@@ -171,6 +172,7 @@ class Case:
     k: int
     n_expts_tot: int = 1
     n_expts_act: int = 1
+    preshuffled: bool = False
 
 
 @pytest.mark.parametrize(
@@ -182,17 +184,18 @@ class Case:
             Case(64, 512, 512, 8, 2),
             Case(128, 1024, 512, 8, 4),
             Case(256, 2048, 1024, 16, 4),
+            Case(256, 2048, 2048, 32, 2, preshuffled=True),
             Case(512, 4096, 2048, 128, 8),
             Case(1024, 7168, 4096, 64, 8),
             Case(2048, 4096, 7168, 128, 8),
             Case(300, 400, 400, 8, 2),
-            # topk=6
             Case(16, 2560, 4096, 128, 6),
+            Case(32, 2560, 4096, 128, 6, preshuffled=True),
             Case(128, 2560, 4096, 128, 6),
             Case(512, 2560, 4096, 128, 6),
             Case(2048, 2560, 4096, 128, 6),
-            # Down projection
             Case(16, 4096, 1280, 128, 6),
+            Case(16, 4096, 1280, 128, 6, preshuffled=True),
             Case(128, 4096, 1280, 128, 6),
             Case(512, 4096, 1280, 128, 6),
             Case(2048, 4096, 1280, 128, 6),
@@ -220,6 +223,7 @@ def test_op(
     apply_activation,
     n_expts_tot,
     n_expts_act,
+    preshuffled,
     device="cuda",
 ):
     torch.manual_seed(0)
@@ -246,6 +250,9 @@ def test_op(
     x_int8_ref, x_scale_ref = x_int8_tri.clone(), x_scale_tri.clone()
 
     w_int8_tri, w_scale_tri = quantize_weights_int8(w_tri)
+    w_int8_ref = w_int8_tri.clone()
+    if preshuffled:
+        w_int8_tri = preshuffle_weights(w_int8_tri)
 
     out_dtype = torch.bfloat16
     maxtol = 4e-2
@@ -254,7 +261,7 @@ def test_op(
     ref_y = moe_gemm_smoothquant_torch(
         x_int8_ref,
         x_scale_ref,
-        w_int8_tri,
+        w_int8_ref,
         w_scale_tri,
         bias_ref,
         rdata,
@@ -275,8 +282,9 @@ def test_op(
         gindx,
         sindx,
         gammas,
+        preshuffled,
         out_dtype,
         apply_activation=apply_activation,
         add_residual=apply_activation,
     )
-    assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
+    assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)    
