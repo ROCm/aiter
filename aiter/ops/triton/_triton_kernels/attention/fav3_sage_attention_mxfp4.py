@@ -420,7 +420,6 @@ def sage_quant_mxfp4(
     v,
     BLKQ=128,
     BLKK=64,
-    sm_scale=None,
     q_smoothing=False,
     layout="bshd",
     USE_RNE=False,
@@ -453,9 +452,7 @@ def sage_quant_mxfp4(
 
     padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
 
-    if sm_scale is None:
-        sm_scale = head_dim**-0.5
-
+    sm_scale = head_dim**-0.5
     q, k, delta_s = rotation_smooth_qk(q, k, BLKQ, block_size=padded_head_dim, q_smoothing=q_smoothing, layout=layout, sm_scale=(sm_scale * 1.4426950408889634))
 
     sage_quant_v_kernel[grid](

@@ -45,13 +45,10 @@ def fav3_sage_forward_func(
     k: torch.Tensor,
     v: torch.Tensor,
     causal: bool,
-    inference_mode: bool,
     layout: Literal["bshd", "bhsd"],
     include_quantization_overhead: bool = True,
 ):
     """Execution path for MXFP4 Sage Attention."""
-    head_dim = q.shape[-1]
-    softmax_scale = head_dim**-0.5
 
     if include_quantization_overhead:
         return lambda: fav3_sage_mxfp4_wrapper(
@@ -66,7 +63,6 @@ def fav3_sage_forward_func(
     # Perform quantization (ignore delta_s as it's removed from kernel)
     q_q, q_d, k_q, k_d, v_q, v_d, _ = sage_quant_mxfp4(
         q, k, v,
-        sm_scale=softmax_scale,
         BLKQ=BLKQ, BLKK=BLKK,
         q_smoothing=False, # Parameter pruned
         layout=layout,
@@ -93,7 +89,6 @@ def bench_kernel(q, k, v, args, provider):
     fn = fav3_sage_forward_func(
         q, k, v,
         causal=False,
-        inference_mode=True,
         layout=args.layout,
         include_quantization_overhead=False
     )
@@ -177,6 +172,30 @@ def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
     return inputs
 
 
+def test_accuracy(q,k,v, layout):
+    triton_out = fav3_sage_forward_func(
+            q, k, v, causal=False,
+            layout=layout,
+    )()
+    # permute because FAv2 assumes bshd
+    if layout == "bhsd": 
+        q = q.permute(0, 2, 1, 3).contiguous()
+        k = k.permute(0, 2, 1, 3).contiguous()
+        v = v.permute(0, 2, 1, 3).contiguous()
+    
+    sm_scale = q.shape[-1]**-0.5
+    print("Using as ref: Triton FAv2")
+    ref_out = fav2_forward_func(q, k, v, dropout_p=0.0, softmax_scale=sm_scale, causal=False, return_lse=False, return_attn_probs=False)()
+    if layout == "bhsd": 
+        ref_out = ref_out.permute(0, 2, 1, 3)
+
+    assert ref_out.shape == triton_out.shape
+    compare_accuracy(
+        triton_out,
+        ref_out
+    )
+
+
 def test_accuracy_with_captured_inputs(args):
     input_dir = args.captured_dir
     layout = args.layout
@@ -185,38 +204,16 @@ def test_accuracy_with_captured_inputs(args):
     n_ = len(inputs)
 
     for input_i in range(n_):
-        print("Testing accuracy on captured input:")
-        
         # Get the input tensors for this configuration
         inp = inputs[input_i]
-
         q = inp["q"].to("cuda")
         k = inp["k"].to("cuda")
         v = inp["v"].to("cuda")
-
+        print("Testing accuracy on captured input:")
         print("q.shape: ", q.shape)
         print("k.shape: ", k.shape)
         print("v.shape: ", v.shape)
-
-        print("Assuming bhsd layout. If not matching, change -layout.")
-        if layout == "bhsd": 
-            q = q.permute(0, 2, 1, 3).contiguous()
-            k = k.permute(0, 2, 1, 3).contiguous()
-            v = v.permute(0, 2, 1, 3).contiguous()
-        
-        sm_scale = q.shape[-1]**-0.5
-        
-        triton_out = fav3_sage_forward_func(q, k, v, False, False, "bshd")()
-        
-        print("Using as ref: Triton FAv2")
-        ref_out = fav2_forward_func(q, k, v, dropout_p=0.0, softmax_scale=sm_scale, causal=False, return_lse=False, return_attn_probs=False)()
-
-        assert ref_out.shape == triton_out.shape
-
-        compare_accuracy(
-            triton_out,
-            ref_out
-        )
+        test_accuracy(q,k,v, layout)
 
 def test_accuracy_with_shape( 
     BATCH: int,
@@ -229,10 +226,7 @@ def test_accuracy_with_shape(
     dtype=torch.bfloat16,
 ):
     torch.cuda.empty_cache()
-    torch.manual_seed(20)
-
-    print("Testing accuracy on shape:")
-
+    torch.manual_seed(20)    
     q, k, v = input_helper(
         BATCH,
         NUM_Q_HEADS,
@@ -244,35 +238,11 @@ def test_accuracy_with_shape(
         dtype,
         layout,
     )
-
+    print("Testing accuracy on shape:")
     print("q.shape: ", q.shape)
     print("k.shape: ", k.shape)
     print("v.shape: ", v.shape)
-
-    triton_out = fav3_sage_mxfp4_wrapper(
-            q, k, v,
-            layout=layout,
-        )
-
-    if layout == "bhsd": 
-            q = q.permute(0, 2, 1, 3).contiguous()
-            k = k.permute(0, 2, 1, 3).contiguous()
-            v = v.permute(0, 2, 1, 3).contiguous()
-        
-    sm_scale = q.shape[-1]**-0.5
-    
-    triton_out = fav3_sage_forward_func(q, k, v, False, False, "bshd")()
-
-    print("Using as ref: Triton FAv2")
-    
-    ref_out = fav2_forward_func(q, k, v, dropout_p=0.0, softmax_scale=sm_scale, causal=False, return_lse=False, return_attn_probs=False)()
-
-    assert ref_out.shape == triton_out.shape
-
-    compare_accuracy(
-        triton_out,
-        ref_out
-    )
+    test_accuracy(q,k,v, layout)
 
 if __name__ == "__main__":
     args = parse_args()

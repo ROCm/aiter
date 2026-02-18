@@ -43,7 +43,6 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
         q_smooth: bool = False,
         config: Optional[dict] = None,
     ):
-        # 1. Dimension Mapping & Config Setup
         bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
         bhsd_map = [0, 2, 1, 3] if layout == "bshd" else [0, 1, 2, 3]
         batch, seqlen_q, num_q_heads, head_dim = map_dims(q.shape, bshd_map)
@@ -54,8 +53,6 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
 
         BLKQ, BLKK = config["BLOCK_M"], config["BLOCK_N"]
 
-        # 3. MXFP4 Quantization
-        softmax_scale = (head_dim**-0.5)
 
         (
             q_quantized,
@@ -69,14 +66,12 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
             q,
             k,
             v,
-            sm_scale=softmax_scale,
             BLKQ=BLKQ,
             BLKK=BLKK,
             q_smoothing=q_smooth,
             layout=layout,
         )
 
-        # 4. Verify Descale Shapes
         qd_mapped = map_dims(q_descale.shape, bhsd_map)
         kd_mapped = map_dims(k_descale.shape, bhsd_map)
         
@@ -86,7 +81,6 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
         assert tuple(qd_mapped) == expected_q_ds, f"q_descale mismatch"
         assert tuple(kd_mapped) == expected_k_ds, f"k_descale mismatch"
 
-        # 5. Execution
         out = fav3_sage_mxfp4_func(
             q=q_quantized, k=k_quantized, v=v_quantized,
             q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
@@ -100,7 +94,7 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout: torch.Tensor):
-        # Backward remains unimplemented as per original logic
+        # Backward remains unimplemented
         assert False, "backward not implemented"
         return (None,) * 14
 
