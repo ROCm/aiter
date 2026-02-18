@@ -413,8 +413,8 @@ namespace py = pybind11;
           py::arg("out"),                                                                      \
           py::arg("use_new"),                                                                  \
           py::arg("open_fp8_quant"),                                                           \
-          py::arg("reg_input_buffer") = std::nullopt,                                               \
-          py::arg("reg_output_buffer") = std::nullopt);                                               \
+          py::arg("reg_input_buffer")  = std::nullopt,                                         \
+          py::arg("reg_output_buffer") = std::nullopt);                                        \
     m.def("fused_allreduce_rmsnorm",                                                           \
           &aiter::fused_allreduce_rmsnorm,                                                     \
           py::arg("_fa"),                                                                      \
@@ -443,9 +443,9 @@ namespace py = pybind11;
     m.def("all_reduce_rmsnorm_quant_", &all_reduce_rmsnorm_quant, "all_reduce_rmsnorm_quant"); \
     m.def("dispose", &aiter::dispose, py::arg("_fa"));                                         \
     m.def("meta_size", &aiter::meta_size);                                                     \
-    m.def("register_input_buffer",                                                                   \
-          &aiter::register_input_buffer,                                                             \
-          "register_input_buffer(int fa, Tensor t, str[] handles, int[] offsets) -> ()",             \
+    m.def("register_input_buffer",                                                             \
+          &aiter::register_input_buffer,                                                       \
+          "register_input_buffer(int fa, Tensor t, str[] handles, int[] offsets) -> ()",       \
           py::arg("_fa"),                                                                      \
           py::arg("t"),                                                                        \
           py::arg("handles"),                                                                  \
@@ -592,7 +592,8 @@ namespace py = pybind11;
           py::arg("WQ"),                   \
           py::arg("x_scale"),              \
           py::arg("w_scale"),              \
-          py::arg("Out"));
+          py::arg("Out"),                  \
+          py::arg("preshuffleB") = true);
 
 #define GEMM_A8W8_BLOCKSCALE_CKTILE_TUNE_PYBIND \
     m.def("gemm_a8w8_blockscale_cktile_tune",   \
@@ -603,8 +604,9 @@ namespace py = pybind11;
           py::arg("x_scale"),                   \
           py::arg("w_scale"),                   \
           py::arg("Out"),                       \
-          py::arg("kernelId") = 0,              \
-          py::arg("splitK")   = 0);
+          py::arg("kernelId")    = 0,           \
+          py::arg("splitK")      = 0,           \
+          py::arg("preshuffleB") = true);
 
 #define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_PYBIND \
     m.def("gemm_a8w8_blockscale_bpreshuffle",   \
@@ -991,7 +993,7 @@ namespace py = pybind11;
           py::arg("splitk")            = 1,            \
           py::arg("non_temporal_load") = false,        \
           py::arg("dst_type")          = std::nullopt, \
-          py::arg("is_shuffled")    = true);           \
+          py::arg("is_shuffled")       = true);              \
                                                        \
     m.def("ck_moe_stage2",                             \
           &ck_moe_stage2,                              \
@@ -1013,7 +1015,7 @@ namespace py = pybind11;
           py::arg("splitk")            = 1,            \
           py::arg("non_temporal_load") = false,        \
           py::arg("dst_type")          = std::nullopt, \
-          py::arg("is_shuffled")    = true);
+          py::arg("is_shuffled")       = true);
 
 #define MOE_CKTILE_2STAGES_PYBIND                   \
     m.def("cktile_moe_gemm1",                       \
@@ -1532,12 +1534,15 @@ namespace py = pybind11;
     m.def("rope_cached_positions_offsets_fwd_impl", &rope_cached_positions_offsets_fwd_impl); \
     m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl);
 
-#define FUSED_QKNORM_MROPE_CACHE_QUANT_PYBIND \
-    m.def("fused_qk_norm_mrope_3d_cache_pts_quant_shuffle", &fused_qk_norm_mrope_3d_cache_pts_quant_shuffle);
+#define FUSED_QKNORM_MROPE_CACHE_QUANT_PYBIND               \
+    m.def("fused_qk_norm_mrope_3d_cache_pts_quant_shuffle", \
+          &fused_qk_norm_mrope_3d_cache_pts_quant_shuffle);
 
-#define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                                                                 \
-    m.def("fused_qk_norm_rope_cache_quant_shuffle", &aiter::fused_qk_norm_rope_cache_quant_shuffle);         \
-    m.def("fused_qk_norm_rope_cache_pts_quant_shuffle", &aiter::fused_qk_norm_rope_cache_pts_quant_shuffle); \
+#define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                   \
+    m.def("fused_qk_norm_rope_cache_quant_shuffle",            \
+          &aiter::fused_qk_norm_rope_cache_quant_shuffle);     \
+    m.def("fused_qk_norm_rope_cache_pts_quant_shuffle",        \
+          &aiter::fused_qk_norm_rope_cache_pts_quant_shuffle); \
     m.def("fused_qk_norm_rope_2way", &aiter::fused_qk_norm_rope_2way);
 
 #define SMOOTHQUANT_PYBIND                      \
