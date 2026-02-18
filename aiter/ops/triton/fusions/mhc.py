@@ -216,17 +216,12 @@ def fused_mhc(
         splitk_block_size = triton.cdiv(K, num_ksplit)
         actual_ksplit = triton.cdiv(K, splitk_block_size)
 
-        # Allocate intermediate buffers (float32 for precision)
-        # acc_res size depends on mode: n² for sinkhorn, n! for lite
-        acc_res_cols = n_res_expected
-        acc_pre_partial = torch.empty(
-            (num_ksplit, M, n), dtype=torch.float32, device=x.device
-        )
-        acc_post_partial = torch.empty(
-            (num_ksplit, M, n), dtype=torch.float32, device=x.device
-        )
-        acc_res_partial = torch.empty(
-            (num_ksplit, M, acc_res_cols), dtype=torch.float32, device=x.device
+        # Allocate unified intermediate buffer (float32 for precision)
+        # Single contiguous tensor: (num_ksplit, M, n + n + n_res)
+        # Layout: [pre_0...pre_{n-1}, post_0...post_{n-1}, res_0...res_{n_res-1}]
+        total_cols = n + n + n_res_expected
+        acc_partial = torch.empty(
+            (num_ksplit, M, total_cols), dtype=torch.float32, device=x.device
         )
         acc_sq_partial = torch.empty(
             (num_ksplit, M), dtype=torch.float32, device=x.device
@@ -239,9 +234,7 @@ def fused_mhc(
             phi_pre,
             phi_post,
             phi_res,
-            acc_pre_partial,
-            acc_post_partial,
-            acc_res_partial,
+            acc_partial,
             acc_sq_partial,
             M=M,
             K=K,
@@ -257,15 +250,9 @@ def fused_mhc(
             stride_phi_post_n=phi_post.stride(1),
             stride_phi_res_k=phi_res.stride(0),
             stride_phi_res_n=phi_res.stride(1),
-            stride_acc_pre_k=acc_pre_partial.stride(0),
-            stride_acc_pre_m=acc_pre_partial.stride(1),
-            stride_acc_pre_n=acc_pre_partial.stride(2),
-            stride_acc_post_k=acc_post_partial.stride(0),
-            stride_acc_post_m=acc_post_partial.stride(1),
-            stride_acc_post_n=acc_post_partial.stride(2),
-            stride_acc_res_k=acc_res_partial.stride(0),
-            stride_acc_res_m=acc_res_partial.stride(1),
-            stride_acc_res_n=acc_res_partial.stride(2),
+            stride_acc_k=acc_partial.stride(0),
+            stride_acc_m=acc_partial.stride(1),
+            stride_acc_n=acc_partial.stride(2),
             stride_acc_sq_k=acc_sq_partial.stride(0),
             stride_acc_sq_m=acc_sq_partial.stride(1),
             BLOCK_M=BLOCK_M,
@@ -279,9 +266,7 @@ def fused_mhc(
         # Launch reduce kernel with 2D grid: (M_blocks, N_blocks_total)
         grid_reduce = (triton.cdiv(M, BLOCK_M), total_n_blocks)
         _mhc_fused_reduce_kernel[grid_reduce](
-            acc_pre_partial,
-            acc_post_partial,
-            acc_res_partial,
+            acc_partial,
             acc_sq_partial,
             alpha_pre,
             alpha_post,
@@ -298,15 +283,9 @@ def fused_mhc(
             n_squared=n_squared,
             n_factorial=n_res_expected,
             eps=eps,
-            stride_acc_pre_k=acc_pre_partial.stride(0),
-            stride_acc_pre_m=acc_pre_partial.stride(1),
-            stride_acc_pre_n=acc_pre_partial.stride(2),
-            stride_acc_post_k=acc_post_partial.stride(0),
-            stride_acc_post_m=acc_post_partial.stride(1),
-            stride_acc_post_n=acc_post_partial.stride(2),
-            stride_acc_res_k=acc_res_partial.stride(0),
-            stride_acc_res_m=acc_res_partial.stride(1),
-            stride_acc_res_n=acc_res_partial.stride(2),
+            stride_acc_k=acc_partial.stride(0),
+            stride_acc_m=acc_partial.stride(1),
+            stride_acc_n=acc_partial.stride(2),
             stride_acc_sq_k=acc_sq_partial.stride(0),
             stride_acc_sq_m=acc_sq_partial.stride(1),
             stride_pre_m=out_pre.stride(0),

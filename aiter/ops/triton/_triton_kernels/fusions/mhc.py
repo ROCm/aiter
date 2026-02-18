@@ -242,9 +242,7 @@ def _mhc_fused_split_kernel(
     phi_pre_ptr,
     phi_post_ptr,
     phi_res_ptr,
-    acc_pre_ptr,
-    acc_post_ptr,
-    acc_res_ptr,
+    acc_ptr,  # Single unified output: (NUM_KSPLIT, M, n + n + n_res)
     acc_sq_ptr,
     M: tl.constexpr,
     K: tl.constexpr,
@@ -260,15 +258,9 @@ def _mhc_fused_split_kernel(
     stride_phi_post_n,
     stride_phi_res_k,
     stride_phi_res_n,
-    stride_acc_pre_k,
-    stride_acc_pre_m,
-    stride_acc_pre_n,
-    stride_acc_post_k,
-    stride_acc_post_m,
-    stride_acc_post_n,
-    stride_acc_res_k,
-    stride_acc_res_m,
-    stride_acc_res_n,
+    stride_acc_k,  # Stride for NUM_KSPLIT dimension
+    stride_acc_m,  # Stride for M dimension
+    stride_acc_n,  # Stride for N dimension (total_cols)
     stride_acc_sq_k,
     stride_acc_sq_m,
     BLOCK_M: tl.constexpr,
@@ -281,8 +273,8 @@ def _mhc_fused_split_kernel(
     """
     Split-K kernel for mHC - computes partial results for equations 14-15.
 
-    Each program processes a portion of the K dimension and writes partial
-    dot products and sum-of-squares to intermediate buffers.
+    Writes all streams to unified contiguous tensor: (NUM_KSPLIT, M, n + n + n_res)
+    Memory layout: [pre_0...pre_{n-1}, post_0...post_{n-1}, res_0...res_{n_res-1}]
 
     Grid structure: (M_blocks, N_blocks_total, NUM_KSPLIT)
     - pid_m: row block index
@@ -315,7 +307,20 @@ def _mhc_fused_split_kernel(
     rn_local = local_pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
     n_out_res = tl.where(HRES_LITE_MODE, n_factorial, n_squared)
-    n_out = n + (n_out_res - n) * is_res_i32
+    
+    # Compute global column offset in unified tensor
+    # Layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_res-1]
+    stream_start = tl.where(
+        is_pre_program,
+        0,
+        tl.where(is_post_program, n, 2 * n)
+    )
+    
+    n_out = tl.where(
+        is_pre_program,
+        n,
+        tl.where(is_post_program, n, n_out_res)
+    )
 
     split_k_start = pid_k * SPLITK_BLOCK_SIZE
     split_k_end = tl.minimum(split_k_start + SPLITK_BLOCK_SIZE, K)
@@ -325,9 +330,8 @@ def _mhc_fused_split_kernel(
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
-    # Only compute acc_sq for pre-stream programs (first N-block)
-    # to avoid redundant computation since acc_sq depends only on x.
-    compute_acc_sq = is_pre_program & (local_pid_n == 0)
+    # Only compute acc_sq for first column block (shared across all streams)
+    compute_acc_sq = pid_n == 0
     acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
 
     phi_ptr = tl.where(
@@ -368,37 +372,18 @@ def _mhc_fused_split_kernel(
 
         acc += tl.dot(x_tile, phi_tile)
 
-        # Only compute acc_sq for programs that need it (saves computation for post/res streams)
         if compute_acc_sq:
             x_tile_f32 = x_tile.to(tl.float32)
             acc_sq += tl.sum(x_tile_f32 * x_tile_f32, axis=1)
 
-    acc_ptr = tl.where(
-        is_pre_program,
-        acc_pre_ptr,
-        tl.where(is_post_program, acc_post_ptr, acc_res_ptr),
-    )
-    stride_acc_k = tl.where(
-        is_pre_program,
-        stride_acc_pre_k,
-        tl.where(is_post_program, stride_acc_post_k, stride_acc_res_k),
-    )
-    stride_acc_m = tl.where(
-        is_pre_program,
-        stride_acc_pre_m,
-        tl.where(is_post_program, stride_acc_post_m, stride_acc_res_m),
-    )
-    stride_acc_n = tl.where(
-        is_pre_program,
-        stride_acc_pre_n,
-        tl.where(is_post_program, stride_acc_post_n, stride_acc_res_n),
-    )
+    # Unified contiguous write
+    col_offset = stream_start + rn_local
 
     tl.store(
         acc_ptr
         + pid_k * stride_acc_k
         + rm[:, None] * stride_acc_m
-        + rn_local[None, :] * stride_acc_n,
+        + col_offset[None, :] * stride_acc_n,
         acc,
         mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
     )
@@ -413,9 +398,7 @@ def _mhc_fused_split_kernel(
 
 @triton.jit
 def _mhc_fused_reduce_kernel(
-    acc_pre_ptr,
-    acc_post_ptr,
-    acc_res_ptr,
+    acc_ptr,  # Unified input: (NUM_KSPLIT, M, n + n + n_res)
     acc_sq_ptr,
     alpha_pre,
     alpha_post,
@@ -432,15 +415,9 @@ def _mhc_fused_reduce_kernel(
     n_squared: tl.constexpr,
     n_factorial: tl.constexpr,
     eps: tl.constexpr,
-    stride_acc_pre_k,
-    stride_acc_pre_m,
-    stride_acc_pre_n,
-    stride_acc_post_k,
-    stride_acc_post_m,
-    stride_acc_post_n,
-    stride_acc_res_k,
-    stride_acc_res_m,
-    stride_acc_res_n,
+    stride_acc_k,  # Stride for NUM_KSPLIT dimension
+    stride_acc_m,  # Stride for M dimension
+    stride_acc_n,  # Stride for N dimension (total_cols)
     stride_acc_sq_k,
     stride_acc_sq_m,
     stride_pre_m,
@@ -459,6 +436,9 @@ def _mhc_fused_reduce_kernel(
 ):
     """
     Reduce kernel for mHC - combines partial results and applies post-processing.
+
+    Reads from unified contiguous tensor (NUM_KSPLIT, M, total_cols) where
+    total_cols = n + n + n_res, laid out as: [pre, post, res].
 
     Sums partial dot products and sum-of-squares across K-splits, then applies:
     - RMS normalization (Eq 15)
@@ -491,33 +471,24 @@ def _mhc_fused_reduce_kernel(
     rn_local = local_pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
     n_out_res = tl.where(HRES_LITE_MODE, n_factorial, n_squared)
-    n_out = n + (n_out_res - n) * is_res_i32
-
-    col_offset = n * (is_post_i32 + 2 * is_res_i32)
-    rn_global = rn_local + col_offset
-
-    acc_ptr = tl.where(
+    n_out = tl.where(
         is_pre_program,
-        acc_pre_ptr,
-        tl.where(is_post_program, acc_post_ptr, acc_res_ptr),
-    )
-    stride_acc_k = tl.where(
-        is_pre_program,
-        stride_acc_pre_k,
-        tl.where(is_post_program, stride_acc_post_k, stride_acc_res_k),
-    )
-    stride_acc_m = tl.where(
-        is_pre_program,
-        stride_acc_pre_m,
-        tl.where(is_post_program, stride_acc_post_m, stride_acc_res_m),
-    )
-    stride_acc_n = tl.where(
-        is_pre_program,
-        stride_acc_pre_n,
-        tl.where(is_post_program, stride_acc_post_n, stride_acc_res_n),
+        n,
+        tl.where(is_post_program, n, n_out_res)
     )
 
-    # Sum partial results across K-splits (fused loop for better cache utilization)
+    # Global column offset in unified tensor layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_res-1]
+    stream_start = tl.where(
+        is_pre_program,
+        0,
+        tl.where(is_post_program, n, 2 * n)
+    )
+    col_offset = stream_start + rn_local
+
+    # For bias: use global column index
+    rn_bias_global = stream_start + rn_local
+
+    # Sum partial results across K-splits
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
     acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
     for ks in range(ACTUAL_KSPLIT):
@@ -525,7 +496,7 @@ def _mhc_fused_reduce_kernel(
             acc_ptr
             + ks * stride_acc_k
             + rm[:, None] * stride_acc_m
-            + rn_local[None, :] * stride_acc_n,
+            + col_offset[None, :] * stride_acc_n,
             mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
             other=0.0,
         )
@@ -541,7 +512,7 @@ def _mhc_fused_reduce_kernel(
     rms = tl.sqrt(acc_sq / K + eps)
     rsigma = 1.0 / rms
 
-    bias = tl.load(bias_ptr + rn_global, mask=rn_global < N, other=0.0).to(tl.float32)
+    bias = tl.load(bias_ptr + rn_bias_global, mask=rn_bias_global < N, other=0.0).to(tl.float32)
     alpha_val = tl.where(
         is_pre_program, alpha_pre, tl.where(is_post_program, alpha_post, alpha_res)
     )
