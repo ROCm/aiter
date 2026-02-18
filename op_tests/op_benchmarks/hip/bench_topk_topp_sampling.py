@@ -83,13 +83,13 @@ def run_single_benchmark(args):
     batch_size, vocab_size = args.shape
     k, p = args.k, args.p
 
-    print(f"\nBenchmarking top-k/top-p sampling:")
+    print("\nBenchmarking top-k/top-p sampling:")
     print(f"  batch_size={batch_size}, vocab_size={vocab_size}, k={k}, p={p}")
     print()
 
     ms, p20, p80 = bench_topk_topp_sampling_latency(batch_size, vocab_size, k, p)
 
-    print(f"Results:")
+    print("Results:")
     print(f"  Median latency: {ms:.4f} ms")
     print(f"  P20 latency:    {p20:.4f} ms")
     print(f"  P80 latency:    {p80:.4f} ms")
