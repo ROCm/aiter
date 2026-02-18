@@ -9,7 +9,7 @@ from aiter.test_mha_common import (
     attention_ref,
 )
 from aiter.ops.triton.attention.fav3_sage_wrapper import fav3_sage_wrapper_func
-from aiter.ops.triton.attention.fav3_sage_v2_wrapper import (
+from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_wrapper
 )
 
@@ -266,7 +266,7 @@ def test_sage(
     )
 
 
-from aiter.ops.triton.attention.fav3_sage_v2_wrapper import (
+from aiter.aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_wrapper
 )
 
