@@ -16,6 +16,141 @@ from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton._triton_kernels.quant.downcast_to_mxfp_rne import downcast_to_mxfp_rne
 
+@triton.jit
+def compute_padding_info(seqlen_k, BLOCK_N: tl.constexpr):
+    """Calculate padding information for the last K block."""
+    # check if we will need to do masking due either BLOCK_N being bigger than seqlen_k or seqlen_k not being a factor of BLOCK_N
+    # n_extra_tokens = 10 % 4 = 2
+    # This means the last K block has 2 valid tokens and 2 padding positions
+    # K blocks visualization:
+    #         Block 0         Block 1         Block 2 (last)
+    #         K0 K1 K2 K3    K4 K5 K6 K7     K8 K9 ?? ??
+    #         ↑---------↑    ↑---------↑     ↑---↑ ↑---↑
+    #         full block     full block      valid  pad
+    if seqlen_k < BLOCK_N:
+        n_extra_tokens = BLOCK_N - seqlen_k
+    elif seqlen_k % BLOCK_N:
+        n_extra_tokens = seqlen_k % BLOCK_N
+    else:
+        n_extra_tokens = 0
+    return n_extra_tokens
+
+
+
+@triton.jit
+def compute_block_masking(
+    seqlen_k,
+    seqlen_q,
+    start_m,
+    IS_CAUSAL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    Classify K blocks for attention computation with sliding window support.
+
+    Returns:
+        - n_front_skip_blocks: Blocks completely before the window
+        - n_front_masked_blocks: Blocks partially overlapping window front
+        - n_full_blocks: Blocks completely inside the window
+        - n_back_masked_blocks: Blocks partially overlapping window back
+        - n_extra_tokens: Padding tokens in last K block
+    """
+
+    # common
+    q_start = start_m * BLOCK_M
+    q_end = tl.minimum((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
+    diag = seqlen_k - seqlen_q
+    total_k_blocks = tl.cdiv(seqlen_k, BLOCK_N)
+    n_extra_tokens = compute_padding_info(seqlen_k, BLOCK_N)
+
+    if IS_CAUSAL:
+        # ========== CAUSAL MODE: Classify K Blocks ==========
+        # Calculate causal boundary for this Q block
+        #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9 ?? ??]
+        # Q0-Q3:   [ 1  0  0  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q0
+        #          [ 1  1  0  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q1
+        #          [ 1  1  1  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q2
+        #          [ 1  1  1  1] [ 1  1  0  0] [ 0  0 -- --]  ← Q3
+        #                            ↑ can see up to K5
+        #
+        # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  0] [ 0  0 -- --]  ← Q4
+        #          [ 1  1  1  1] [ 1  1  1  1] [ 0  0 -- --]  ← Q5
+        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  0 -- --]  ← Q6
+        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -- --]  ← Q7
+
+        # ------------------------------------------------------------
+        # 1. figure out, in tokens, the right-most K position
+        #    this Q-block may attend to
+        # ------------------------------------------------------------
+        k_max_token = q_end + diag  # last visible K index
+
+        # this Q-block is entirely above the diagonal ⇒ nothing to do
+        if k_max_token < 0:
+            return 0, 0, 0, 0, n_extra_tokens
+
+        k_max_token = tl.minimum(k_max_token, seqlen_k - 1)
+
+        # ------------------------------------------------------------
+        # 2. translate token indices into K-block indices
+        # ------------------------------------------------------------
+        last_visible_k_block = k_max_token // BLOCK_N
+        n_visible_k_blocks = tl.minimum(last_visible_k_block + 1, total_k_blocks)
+
+        # ------------------------------------------------------------
+        # 3. classify those visible blocks
+        #    – we *never* skip or mask blocks in front, because causal
+        #      attention always starts at K0
+        #    – the back side can require several masked blocks:
+        #         • intersection of the causal diagonal with K-grid
+        #           (at most  ⌈BLOCK_M / BLOCK_N⌉ blocks)
+        #         • plus one extra block if this Q-block stops in the
+        #           middle of a K-block or the last K-block is padded
+        # ------------------------------------------------------------
+        padded_last_k = n_extra_tokens != 0
+        is_modulo_mn = (not padded_last_k) & (seqlen_q % BLOCK_M == 0)
+
+        n_back_masked_blocks = BLOCK_M // BLOCK_N + tl.where(is_modulo_mn, 0, 1)
+        n_back_masked_blocks = tl.minimum(n_back_masked_blocks, n_visible_k_blocks)
+
+        n_front_skip_blocks = 0  # causal never skips the left side
+        n_front_masked_blocks = 0  # ditto
+        n_full_blocks = n_visible_k_blocks - n_back_masked_blocks
+    else:
+        # ========== NON-CAUSAL MODE ==========
+        # Without causal mask, all positions can attend to all positions
+        # Only need to handle the padding in the last block
+        #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9 ?? ??]
+        # Q0-Q3:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+        #
+        # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+
+        n_front_skip_blocks = 0  # never skips the left side
+        n_front_masked_blocks = 0  # ditto
+        if n_extra_tokens != 0:
+            n_back_masked_blocks = 1  # Last block needs padding mask
+            n_full_blocks = total_k_blocks - 1
+        else:
+            n_back_masked_blocks = 0  # All blocks are aligned
+            n_full_blocks = total_k_blocks
+
+    return (
+        n_front_skip_blocks,
+        n_front_masked_blocks,
+        n_full_blocks,
+        n_back_masked_blocks,
+        n_extra_tokens,
+    )
+
+
+
+
 
 @triton.jit
 def _sage_fwd_no_mask_mxfp4(
@@ -23,10 +158,7 @@ def _sage_fwd_no_mask_mxfp4(
     k_base_ptrs, v_base_ptrs,
     bias_base_ptrs,
     stride_kn, stride_vk, stride_bn,
-    stride_sn, stride_sm,
     seqlen_k, seqlen_q,
-    sd_mask, stride_sz, stride_sh,
-    off_z, off_h_q,
     offs_m, offs_d_k, offs_d_v,
     block_min, block_max,
     q_descale, k_descale_base_ptrs, stride_ksn,
@@ -34,7 +166,6 @@ def _sage_fwd_no_mask_mxfp4(
     PRE_LOAD_V: tl.constexpr,
     PADDED_HEAD_QK: tl.constexpr, PADDED_HEAD_V: tl.constexpr,
     ACTUAL_BLOCK_DMODEL_QK: tl.constexpr, ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
-    RETURN_SCORES: tl.constexpr,
     Q_DTYPE_STR: tl.constexpr, K_DTYPE_STR: tl.constexpr,
     ACCUMULATOR_TYPE: tl.constexpr,
     USE_BIAS: tl.constexpr
@@ -74,10 +205,6 @@ def _sage_fwd_no_mask_mxfp4(
         p = tl.math.exp2(qk - m_ij[:, None])
         l_ij = tl.sum(p, 1)
 
-        if RETURN_SCORES:
-            sd_ptr = sd_mask + off_z * stride_sz + off_h_q * stride_sh + offs_m[:, None] * stride_sm + kv_offs_n[None, :] * stride_sn
-            tl.store(sd_ptr, p, mask=qk_mask)
-
         alpha = tl.math.exp2(m_i - m_ij)
         acc = acc * alpha[:, None]
         
@@ -101,19 +228,14 @@ def _sage_fwd_mask_mxfp4(
     k_base_ptrs, v_base_ptrs,
     bias_base_ptrs,
     stride_kn, stride_vk, stride_bn,
-    stride_sn, stride_sm,
-    start_m, seqlen_k, seqlen_q,
-    sd_mask, stride_sz, stride_sh,
-    off_z, off_h_q,
+    seqlen_k, seqlen_q,
     offs_m, offs_n, offs_d_k, offs_d_v,
-    block_min, block_max, n_extra_tokens,
-    alibi_slope, q_descale, k_descale_base_ptrs, stride_ksn,
+    block_min, block_max, n_extra_tokens, q_descale, k_descale_base_ptrs, stride_ksn,
     IS_CAUSAL: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     PRE_LOAD_V: tl.constexpr,
     PADDED_HEAD_QK: tl.constexpr, PADDED_HEAD_V: tl.constexpr,
     ACTUAL_BLOCK_DMODEL_QK: tl.constexpr, ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
-    USE_ALIBI: tl.constexpr, RETURN_SCORES: tl.constexpr,
     Q_DTYPE_STR: tl.constexpr, K_DTYPE_STR: tl.constexpr,
     ACCUMULATOR_TYPE: tl.constexpr, USE_BIAS: tl.constexpr
 ):
@@ -147,8 +269,6 @@ def _sage_fwd_mask_mxfp4(
 
         qk = tl.dot_scaled(q, q_descale, Q_DTYPE_STR, k, k_descale, K_DTYPE_STR, fast_math=True, acc=qk)
 
-        if USE_ALIBI:
-            qk += compute_alibi_block(alibi_slope, seqlen_q, seqlen_k, start_m * BLOCK_M + tl.arange(0, BLOCK_M), kv_offs_n)
 
         if IS_CAUSAL:
             qk = tl.where(offs_m[:, None] >= (start_n + offs_n - seqlen_delta_qk)[None, :], qk, float("-inf"))
@@ -160,10 +280,6 @@ def _sage_fwd_mask_mxfp4(
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
         p = tl.math.exp2(qk - m_ij[:, None])
         l_ij = tl.sum(p, 1)
-
-        if RETURN_SCORES:
-            sd_ptr = sd_mask + off_z * stride_sz + off_h_q * stride_sh + offs_m[:, None] * stride_sm + kv_offs_n[None, :] * stride_sn
-            tl.store(sd_ptr, p, mask=qk_mask)
 
         alpha = tl.math.exp2(m_i - m_ij)
         acc = acc * alpha[:, None]
@@ -187,25 +303,20 @@ def sage_fwd_mxfp4(
     stride_qsz, stride_qsh, stride_qsm,
     stride_ksz, stride_ksh, stride_ksn,
     stride_vsz, stride_vsh,
-    LSE, Out, SD_MASK, ALIBI_SLOPES,
+    Out, 
     stride_qz, stride_qh, stride_qm,
     stride_kz, stride_kh, stride_kn,
     stride_vz, stride_vh, stride_vk,
     stride_oz, stride_oh, stride_om,
     stride_bz, stride_bh, stride_bm, stride_bn,
-    stride_az, stride_ah,
-    stride_sz, stride_sh, stride_sm, stride_sn,
-    stride_lse_z, stride_lse_h, stride_lse_m,
     cu_seqlens_q, cu_seqlens_k,
     Q_DTYPE_STR: tl.constexpr, K_DTYPE_STR: tl.constexpr,
-    RETURN_LSE: tl.constexpr, HQ: tl.constexpr, HK: tl.constexpr,
+    HQ: tl.constexpr, HK: tl.constexpr,
     ACTUAL_BLOCK_DMODEL_QK: tl.constexpr, ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
     MAX_SEQLENS_Q: tl.constexpr, MAX_SEQLENS_K: tl.constexpr,
     IS_VARLEN: tl.constexpr, IS_CAUSAL: tl.constexpr,
-    USE_SLIDING_WINDOW: tl.constexpr, WINDOW_SIZE_LEFT: tl.constexpr, WINDOW_SIZE_RIGHT: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_DMODEL_QK: tl.constexpr, BLOCK_DMODEL_V: tl.constexpr,
     BLOCK_N: tl.constexpr, PRE_LOAD_V: tl.constexpr, USE_BIAS: tl.constexpr,
-    RETURN_SCORES: tl.constexpr, USE_ALIBI: tl.constexpr,
 ):
     # Constants
     Q_HEAD_DIV: tl.constexpr = 2 if Q_DTYPE_STR == "e2m1" else 1
@@ -237,7 +348,7 @@ def sage_fwd_mxfp4(
         seqlen_q, seqlen_k = MAX_SEQLENS_Q, MAX_SEQLENS_K
 
     # Masking logic
-    mask_info = compute_block_masking(seqlen_k, seqlen_q, start_m, IS_CAUSAL, USE_SLIDING_WINDOW, WINDOW_SIZE_LEFT, WINDOW_SIZE_RIGHT, BLOCK_M, BLOCK_N)
+    mask_info = compute_block_masking(seqlen_k, seqlen_q, start_m, IS_CAUSAL, BLOCK_M, BLOCK_N)
     n_front_skip, n_front_masked, n_full, n_back_masked, n_extra = mask_info
 
     if (n_front_masked + n_full + n_back_masked) == 0:
@@ -256,9 +367,8 @@ def sage_fwd_mxfp4(
 
     q = tl.load(q_ptrs, mask=(offs_m[:, None] < seqlen_q), other=0.0)
     q_descale = tl.load(qd_ptrs, mask=(offs_m[:, None] < seqlen_q), other=0.0)
-    alibi_slope = tl.load(ALIBI_SLOPES + off_z * stride_az + off_h_q * stride_ah) if USE_ALIBI else None
     
-    # warning: this will
+    # Bias is delta s
     bias_ptrs = (bias + off_z * stride_bz + off_h_q * stride_bh + start_m * stride_bm + offs_n[None, :] * stride_bn).to(tl.int64) if USE_BIAS else None
 
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=ACC_TYPE)
@@ -270,12 +380,12 @@ def sage_fwd_mxfp4(
         b_max = b_min + n_full * BLOCK_N
         acc, l_i, m_i = _sage_fwd_no_mask_mxfp4(
             acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs,
-            stride_kn, stride_vk, stride_bn, stride_sn, stride_sm,
-            seqlen_k, seqlen_q, SD_MASK, stride_sz, stride_sh,
-            off_z, off_h_q, offs_m, offs_d_k, offs_d_v,
+            stride_kn, stride_vk, stride_bn,
+            seqlen_k, seqlen_q,
+            offs_m, offs_d_k, offs_d_v,
             b_min, b_max, q_descale, kd_ptrs, stride_ksn,
             BLOCK_M, BLOCK_N, PRE_LOAD_V, PADDED_HEAD_QK, PADDED_HEAD_V,
-            ACTUAL_BLOCK_DMODEL_QK, ACTUAL_BLOCK_DMODEL_V, RETURN_SCORES,
+            ACTUAL_BLOCK_DMODEL_QK, ACTUAL_BLOCK_DMODEL_V,
             Q_DTYPE_STR, K_DTYPE_STR, ACC_TYPE, USE_BIAS
         )
 
@@ -284,12 +394,12 @@ def sage_fwd_mxfp4(
         b_max = b_min + n_back_masked * BLOCK_N
         acc, l_i, m_i = _sage_fwd_mask_mxfp4(
             acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs,
-            stride_kn, stride_vk, stride_bn, stride_sn, stride_sm,
-            start_m, seqlen_k, seqlen_q, SD_MASK, stride_sz, stride_sh,
-            off_z, off_h_q, offs_m, offs_n, offs_d_k, offs_d_v,
-            b_min, b_max, n_extra, alibi_slope, q_descale, kd_ptrs, stride_ksn,
+            stride_kn, stride_vk, stride_bn,
+            seqlen_k, seqlen_q, 
+            offs_m, offs_n, offs_d_k, offs_d_v,
+            b_min, b_max, n_extra, q_descale, kd_ptrs, stride_ksn,
             IS_CAUSAL, BLOCK_M, BLOCK_N, PRE_LOAD_V, PADDED_HEAD_QK, PADDED_HEAD_V,
-            ACTUAL_BLOCK_DMODEL_QK, ACTUAL_BLOCK_DMODEL_V, USE_ALIBI, RETURN_SCORES,
+            ACTUAL_BLOCK_DMODEL_QK, ACTUAL_BLOCK_DMODEL_V,
             Q_DTYPE_STR, K_DTYPE_STR, ACC_TYPE, USE_BIAS
         )
 
@@ -297,10 +407,6 @@ def sage_fwd_mxfp4(
     l_recip = 1 / tl.where(m_i == float("-inf"), 1.0, l_i)[:, None]
     v_descale = tl.load(vd_ptr, mask=offs_d_v < ACTUAL_BLOCK_DMODEL_V, other=0.0)
     acc = acc * l_recip * v_descale
-
-    if RETURN_LSE:
-        lse_ptr = LSE + off_z * stride_lse_z + off_h_q * stride_lse_h + (q_start + offs_m) * stride_lse_m
-        tl.store(lse_ptr, (m_i + tl.math.log2(l_i)) * 0.6931471824645996, mask=(offs_m < seqlen_q))
 
     o_ptr = Out + off_z * stride_oz + off_h_q * stride_oh + (q_start + offs_m[:, None]) * stride_om + offs_d_v[None, :]
     o_mask = (offs_m[:, None] < seqlen_q)

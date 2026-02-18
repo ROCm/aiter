@@ -76,11 +76,9 @@ def fav3_sage_forward_func(
         q=q_q, k=k_q, v=v_q,
         q_descale=q_d, k_descale=k_d, v_descale=v_d,
         causal=causal,
-        window_size=(-1, -1),
-        return_lse=not inference_mode,
         layout=layout,
         config=config,
-    )[0]
+    )
 
 def bench_kernel(q, k, v, args, provider):
     """Main benchmarking logic for a single configuration."""
@@ -265,7 +263,7 @@ def test_accuracy_with_shape(
     
     triton_out = fav3_sage_forward_func(q, k, v, False, False, "bshd")()
 
-    # print("triton out", triton_out)
+    print("Using as ref: Triton FAv2")
     
     ref_out = fav2_forward_func(q, k, v, dropout_p=0.0, softmax_scale=sm_scale, causal=False, return_lse=False, return_attn_probs=False)()
 
@@ -275,8 +273,6 @@ def test_accuracy_with_shape(
         triton_out,
         ref_out
     )
-
-
 
 if __name__ == "__main__":
     args = parse_args()
@@ -288,6 +284,4 @@ if __name__ == "__main__":
     else:
         test_accuracy_with_shape(args.b, args.sq, args.sk, args.hq, args.hk, args.d, args.layout)
 
-    
-    
     run_benchmark(args)

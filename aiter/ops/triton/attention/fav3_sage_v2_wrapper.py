@@ -39,12 +39,6 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
         k: torch.Tensor,
         v: torch.Tensor,
         causal: bool,
-        window_size: Tuple[int, int],
-        attention_chunk: int,
-        softcap: float,
-        deterministic: bool,
-        sm_margin: int,
-        return_lse: bool = True,
         layout: str = "bshd",
         q_smooth: bool = False,
         config: Optional[dict] = None,
@@ -59,15 +53,6 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
             config = get_sage_fwd_configs_mxfp4()
 
         BLKQ, BLKK = config["BLOCK_M"], config["BLOCK_N"]
-
-        # 2. Validation
-        if attention_chunk not in (0, 1):
-            raise NotImplementedError("attention_chunk > 1 not supported")
-        if softcap != 0.0 or sm_margin != 0:
-            raise NotImplementedError("softcap/sm_margin not supported in MXFP4 API")
-
-        if (q.requires_grad or k.requires_grad or v.requires_grad) and not return_lse:
-            raise ValueError("return_lse must be True during training")
 
         # 3. MXFP4 Quantization
         softmax_scale = (head_dim**-0.5)
@@ -87,7 +72,7 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
             sm_scale=softmax_scale,
             BLKQ=BLKQ,
             BLKK=BLKK,
-            q_smoothing=False,
+            q_smoothing=q_smooth,
             layout=layout,
         )
 
@@ -102,27 +87,21 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
         assert tuple(kd_mapped) == expected_k_ds, f"k_descale mismatch"
 
         # 5. Execution
-        out, softmax_lse = fav3_sage_mxfp4_func(
+        out = fav3_sage_mxfp4_func(
             q=q_quantized, k=k_quantized, v=v_quantized,
             q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
             bias=delta_s,
             causal=causal,
-            window_size=(-1, -1),
-            return_lse=return_lse,
             layout=layout,
             config=config,
         )
-
-        if return_lse:
-            ctx.save_for_backward(q, k, v, out, softmax_lse)
-            ctx.softmax_scale = softmax_scale
-            ctx.layout = layout
 
         return out
 
     @staticmethod
     def backward(ctx, dout: torch.Tensor):
         # Backward remains unimplemented as per original logic
+        assert False, "backward not implemented"
         return (None,) * 14
 
 def fav3_sage_mxfp4_wrapper(
@@ -130,12 +109,6 @@ def fav3_sage_mxfp4_wrapper(
     k: torch.Tensor,
     v: torch.Tensor,
     causal: bool = False,
-    window_size: Tuple[int, int] = (-1, -1),
-    attention_chunk: int = 0,
-    softcap: float = 0.0,
-    deterministic: bool = False,
-    sm_margin: int = 0,
-    inference_mode: bool = True,
     layout: str = "bshd",
     q_smooth: bool = False,
     config: Optional[dict] = None,
@@ -146,8 +119,7 @@ def fav3_sage_mxfp4_wrapper(
             f"Expected high-precision for {name}, got {tensor.dtype}"
 
     return _FAv3SageMXFP4WrapperFunc.apply(
-        q, k, v, causal, window_size, attention_chunk, softcap, 
-        deterministic, sm_margin, not inference_mode, layout, q_smooth, config
+        q, k, v, causal, layout, q_smooth, config
     )
 
 def fav3_sage_mxfp4_func(
@@ -159,8 +131,6 @@ def fav3_sage_mxfp4_func(
     v_descale: torch.Tensor,
     bias: torch.Tensor=None,
     causal: bool = False,
-    window_size: Tuple[int, int] = (-1, -1),
-    return_lse: bool = False,
     layout: str = "bshd",
     config: Optional[dict] = None,
 ):
@@ -183,14 +153,13 @@ def fav3_sage_mxfp4_func(
     # Allocation
     out = torch.zeros((q.shape[0], q.shape[1], q.shape[2], v.shape[-1]), 
                      dtype=torch.bfloat16, device=q.device)
-    softmax_lse = torch.zeros((batch, nheads_q, seqlen_q), 
-                             device=q.device, dtype=torch.float32) if return_lse else None
 
     # Tensor Strides
     stride_qb, stride_qm, stride_qh, _ = map_dims(q.stride(), bshd_map)
     stride_kb, stride_kn, stride_kh, _ = map_dims(k.stride(), bshd_map)
     stride_vb, stride_vn, stride_vh, _ = map_dims(v.stride(), bshd_map)
     stride_ob, stride_om, stride_oh, _ = map_dims(out.stride(), bshd_map)
+    
     # delta s is the bias
     if bias is not None:
         USE_BIAS = True
@@ -203,9 +172,6 @@ def fav3_sage_mxfp4_func(
     stride_qsz, stride_qsm, stride_qsh, _ = map_dims(q_descale.stride(), bshd_map)
     stride_ksz, stride_ksn, stride_ksh, _ = map_dims(k_descale.stride(), bshd_map)
     stride_vsz, stride_vsh, _ = v_descale.stride()
-    
-    # LSE Strides
-    stride_lse_z, stride_lse_h, stride_lse_m = (softmax_lse.stride() if return_lse else (0, 0, 0))
 
     # Kernel padding logic
     padded_d_qk = max(16, 1 << (head_size_qk - 1).bit_length())
@@ -220,26 +186,21 @@ def fav3_sage_mxfp4_func(
         stride_qsz=stride_qsz, stride_qsh=stride_qsh, stride_qsm=stride_qsm,
         stride_ksz=stride_ksz, stride_ksh=stride_ksh, stride_ksn=stride_ksn,
         stride_vsz=stride_vsz, stride_vsh=stride_vsh,
-        LSE=softmax_lse, Out=out, SD_MASK=None, ALIBI_SLOPES=None,
+        Out=out,
         stride_qz=stride_qb, stride_qh=stride_qh, stride_qm=stride_qm,
         stride_kz=stride_kb, stride_kh=stride_kh, stride_kn=stride_kn,
         stride_vz=stride_vb, stride_vh=stride_vh, stride_vk=stride_vn,
         stride_oz=stride_ob, stride_oh=stride_oh, stride_om=stride_om,
         stride_bz=stride_bz, stride_bh=stride_bh, stride_bm=stride_bm, stride_bn=stride_bn, # Bias strides
-        stride_az=0, stride_ah=0,                         # Alibi strides (unused)
-        stride_sz=0, stride_sh=0, stride_sm=0, stride_sn=0, # Score strides (unused)
-        stride_lse_z=stride_lse_z, stride_lse_h=stride_lse_h, stride_lse_m=stride_lse_m,
         cu_seqlens_q=None, cu_seqlens_k=None,
         Q_DTYPE_STR="e2m1", K_DTYPE_STR="e2m1",
-        RETURN_LSE=return_lse, HQ=nheads_q, HK=nheads_k,
+        HQ=nheads_q, HK=nheads_k,
         ACTUAL_BLOCK_DMODEL_QK=head_size_qk, ACTUAL_BLOCK_DMODEL_V=head_size_v,
         MAX_SEQLENS_Q=seqlen_q, MAX_SEQLENS_K=seqlen_k,
         IS_VARLEN=False, IS_CAUSAL=causal,
-        USE_SLIDING_WINDOW=(window_size[0] != -1),
-        WINDOW_SIZE_LEFT=int(window_size[0]), WINDOW_SIZE_RIGHT=int(window_size[1]),
         BLOCK_DMODEL_QK=padded_d_qk, BLOCK_DMODEL_V=padded_d_v,
-        USE_BIAS=USE_BIAS, RETURN_SCORES=False, USE_ALIBI=False,
+        USE_BIAS=USE_BIAS,
         **config,
     )
 
-    return out, softmax_lse
+    return out
