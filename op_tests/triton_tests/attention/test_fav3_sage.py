@@ -266,9 +266,7 @@ def test_sage(
     )
 
 
-from aiter.aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
-    fav3_sage_mxfp4_wrapper
-)
+
 
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
 @pytest.mark.parametrize(
