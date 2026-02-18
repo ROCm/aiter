@@ -212,6 +212,7 @@ def test_top_k_top_p_deterministic_controlled(scenario, batch_size):
 # Statistical Equivalence Test - Verify the sampling distribution matches the expected theoretical
 # distribution using chi-squared goodness-of-fit test.
 
+
 def _compute_expected_distribution(probs, k, p, eps=1e-4):
     """
     Compute the theoretical probability distribution that the kernel should

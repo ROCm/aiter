@@ -55,7 +55,9 @@ def bench_topk_topp_sampling_latency(
         Tuple of (median, p20, p80) latency in milliseconds.
     """
     # Generate random normalized probabilities
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device=DEVICE, dtype=torch.float32)
+    pre_norm_prob = torch.rand(
+        batch_size, vocab_size, device=DEVICE, dtype=torch.float32
+    )
     probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
 
     # Clear GPU cache for consistent measurements
@@ -66,9 +68,9 @@ def bench_topk_topp_sampling_latency(
             probs,
             None,  # indices
             None,  # top_k_arr
-            k,     # top_k_val
+            k,  # top_k_val
             None,  # top_p_arr
-            p,     # top_p_val
+            p,  # top_p_val
             True,  # deterministic
         )
 
@@ -146,10 +148,14 @@ def _save_results_csv(filepath: str, results: list):
     """Save benchmark results to CSV file."""
     path = Path(filepath)
     with open(path, "w") as f:
-        f.write("batch_size,vocab_size,k,p,median_ms,p20_ms,p80_ms,throughput_samples_per_sec\n")
+        f.write(
+            "batch_size,vocab_size,k,p,median_ms,p20_ms,p80_ms,throughput_samples_per_sec\n"
+        )
         for batch_size, vocab_size, k, p, ms, p20, p80 in results:
             throughput = batch_size / ms * 1000
-            f.write(f"{batch_size},{vocab_size},{k},{p},{ms:.6f},{p20:.6f},{p80:.6f},{throughput:.2f}\n")
+            f.write(
+                f"{batch_size},{vocab_size},{k},{p},{ms:.6f},{p20:.6f},{p80:.6f},{throughput:.2f}\n"
+            )
     print(f"Results saved to {path.resolve()}")
 
 
