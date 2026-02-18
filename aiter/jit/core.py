@@ -626,11 +626,15 @@ def build_module(
         else:
             sources = exec_blob(blob_gen_cmd, op_dir, src_dir, sources)
 
-        extra_include_paths = [
-            f"{CK_HELPER_DIR}",
-            f"{CK_3RDPARTY_DIR}/include",
-            f"{CK_3RDPARTY_DIR}/library/include",
-        ]
+        extra_include_paths = []
+        if os.path.isdir(CK_3RDPARTY_DIR):
+            extra_include_paths += [
+                f"{CK_HELPER_DIR}",
+                f"{CK_3RDPARTY_DIR}/include",
+                f"{CK_3RDPARTY_DIR}/library/include",
+            ]
+        elif os.path.isdir(CK_HELPER_DIR):
+            extra_include_paths.append(CK_HELPER_DIR)
         if not hipify:
             extra_include_paths += [
                 f"{AITER_CSRC_DIR}/include",
