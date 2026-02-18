@@ -4,6 +4,7 @@ import triton
 import triton.language as tl
 import torch
 from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 float8_info = torch.finfo(e4m3_dtype)
 
@@ -377,7 +378,22 @@ def kernel_unified_attention_2d(
     )
 
 
-@triton.jit
+kernel_unified_attention_3d_repr = make_kernel_repr(
+    "kernel_unified_attention_3d",
+    [
+        "num_query_heads",
+        "num_queries_per_kv",
+        "BLOCK_SIZE",
+        "TILE_SIZE",
+        "HEAD_SIZE",
+        "num_warps",
+        "num_stages",
+        "SHUFFLED_KV_CACHE",
+    ],
+)
+
+
+@triton.jit(repr=kernel_unified_attention_3d_repr)
 def kernel_unified_attention_3d(
     segm_output_ptr,
     # [num_tokens, num_query_heads, num_segments, head_size]
@@ -423,7 +439,10 @@ def kernel_unified_attention_3d(
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
+    num_warps: tl.constexpr,  # int
+    num_stages: tl.constexpr,  # int
     ALL_DECODE: tl.constexpr = False,  # bool
+    SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -462,6 +481,13 @@ def kernel_unified_attention_3d(
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
     offs_t = tl.arange(0, TILE_SIZE)
+
+    offs_t_shfl = None
+    offs_d_shfl = None
+    if SHUFFLED_KV_CACHE:
+        offs_t_shfl = tl.arange(0, TILE_SIZE // 16)
+        offs_d_shfl = tl.arange(0, HEAD_SIZE_PADDED * 16)
+
     query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
 
     query_offset_0 = cur_batch_in_all_start_index + query_pos
@@ -547,6 +573,7 @@ def kernel_unified_attention_3d(
         min((segm_idx + 1) * tiles_per_segment, num_tiles),
     ):
         seq_offset = j * TILE_SIZE + offs_t
+
         if TILE_SIZE == BLOCK_SIZE:
             tile_mask = tl.full((1,), 1, dtype=tl.int1)
         else:
@@ -563,12 +590,24 @@ def kernel_unified_attention_3d(
             + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
         )
 
-        k_offset = (
-            physical_block_idx[None, :] * stride_k_cache_0
-            + kv_head_idx * stride_k_cache_2
-            + offs_d[:, None] * stride_k_cache_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-        )
+        if SHUFFLED_KV_CACHE:
+            seq_offset_shfl = j * TILE_SIZE + offs_t_shfl * 16
+            physical_block_idx_shfl = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset_shfl // BLOCK_SIZE
+            ).to(tl.int64)
+            k_offset = (
+                physical_block_idx_shfl[:, None] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_1
+                + offs_d_shfl[None, :] * stride_k_cache_3
+                + offs_t_shfl[:, None] * stride_k_cache_2
+            )
+        else:
+            k_offset = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d[:, None] * stride_k_cache_3
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
 
         # K : (HEAD_SIZE, TILE_SIZE)
         K_load = tl.load(
@@ -585,6 +624,20 @@ def kernel_unified_attention_3d(
                 K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
         else:
             K = K_load
+            if SHUFFLED_KV_CACHE:
+                K = (
+                    K.reshape(
+                        1,
+                        TILE_SIZE // 16,
+                        HEAD_SIZE_PADDED // 16,
+                        2,
+                        16,
+                        8,
+                    )
+                    .permute(0, 1, 4, 2, 3, 5)
+                    .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
+                    .trans(1, 0)
+                )
 
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
