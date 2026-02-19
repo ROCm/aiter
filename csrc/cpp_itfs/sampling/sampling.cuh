@@ -585,8 +585,36 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs,
                 probs_gt_pivot_1[j] = {
                     (probs_vec[j] > pivot_1) ? probs_vec[j] : 0,
                     (probs_vec[j] > pivot_1 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
-                threadlocal_aggregate_gt_pivot_0 += probs_gt_pivot_0[j];
-                threadlocal_aggregate_gt_pivot_1 += probs_gt_pivot_1[j];
+                if constexpr(VEC_SIZE == 1) {
+                    // can't exploit any instruction-level parallelism, so just sum up the values here
+                    threadlocal_aggregate_gt_pivot_0 += probs_gt_pivot_0[j];
+                    threadlocal_aggregate_gt_pivot_1 += probs_gt_pivot_1[j];
+                }
+            }
+
+            if constexpr(VEC_SIZE > 1) {
+                // the values were not summed up in the loop above, so we need to sum them up here and exploit instruction-level parallelism
+
+                ValueCount<float> local_sum_0 = {0, 0};
+                ValueCount<float> local_sum_1 = {0, 0};
+
+                if constexpr(VEC_SIZE == 2) {                    
+#pragma unroll
+                    for(uint32_t j = 0; j < VEC_SIZE; j+=2) {
+                        local_sum_0 += probs_gt_pivot_0[j] + probs_gt_pivot_0[j + 1];
+                        local_sum_1 += probs_gt_pivot_1[j] + probs_gt_pivot_1[j + 1];
+                    }
+                } else {
+                    // assume VEC_SIZE is a multiple of 4
+#pragma unroll
+                    for(uint32_t j = 0; j < VEC_SIZE; j+=4) {
+                        local_sum_0 += probs_gt_pivot_0[j] + probs_gt_pivot_0[j + 1] + probs_gt_pivot_0[j + 2] + probs_gt_pivot_0[j + 3];
+                        local_sum_1 += probs_gt_pivot_1[j] + probs_gt_pivot_1[j + 1] + probs_gt_pivot_1[j + 2] + probs_gt_pivot_1[j + 3];
+                    }
+                }
+
+                threadlocal_aggregate_gt_pivot_0 += local_sum_0;
+                threadlocal_aggregate_gt_pivot_1 += local_sum_1;
             }
         }
 
