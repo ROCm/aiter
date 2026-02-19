@@ -66,8 +66,6 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
             q,
             k,
             v,
-            BLKQ=BLKQ,
-            BLKK=BLKK,
             q_smoothing=q_smooth,
             layout=layout,
         )

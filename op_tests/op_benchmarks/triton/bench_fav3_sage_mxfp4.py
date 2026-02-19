@@ -62,8 +62,6 @@ def bench_kernel(q, k, v, args, provider):
             q,
             k,
             v,
-            BLKQ=BLKQ,
-            BLKK=BLKK,
             q_smoothing=args.qsmooth,
             layout=args.layout,
         )
@@ -77,13 +75,13 @@ def bench_kernel(q, k, v, args, provider):
         )
 
     # TODO: quantization drops the perf from 1800 to 1400 TFLOPs. This is too much.
-    fn = return_func_call()
+    # fn = return_func_call()
 
-    # fn = lambda: fav3_sage_mxfp4_wrapper(
-    #         q, k, v,
-    #         layout=args.layout,
-    #         q_smooth=args.qsmooth
-    #     )
+    fn = lambda: fav3_sage_mxfp4_wrapper(
+            q, k, v,
+            layout=args.layout,
+            q_smooth=args.qsmooth
+        )
     
     ms = triton.testing.do_bench(fn)
 

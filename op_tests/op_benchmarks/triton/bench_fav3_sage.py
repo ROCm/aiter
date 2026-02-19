@@ -352,8 +352,6 @@ def fav3_sage_forward_func(
                 fp8_dtype,
                 fp8_max,
                 sm_scale=softmax_scale,
-                BLKQ=BLKQ,
-                BLKK=BLKK,
                 q_smoothing=q_smooth,
                 layout=layout,
             )
