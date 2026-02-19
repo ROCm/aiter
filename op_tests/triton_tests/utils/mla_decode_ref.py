@@ -27,13 +27,6 @@ import triton
 import triton.language as tl
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
-__all__ = [
-    "is_hip",
-    "decode_attention_fwd_normal",
-    "decode_attention_fwd_grouped",
-    "decode_attention_fwd",
-]
-
 
 def is_hip():
     return triton.runtime.driver.active.get_current_target().backend == "hip"
