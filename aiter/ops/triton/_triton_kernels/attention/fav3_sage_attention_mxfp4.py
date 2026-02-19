@@ -2,18 +2,14 @@ import torch
 import triton
 import triton.language as tl
 import aiter
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.common import (
-    compute_alibi_block,
-)
+
 
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
     map_dims,
 )
-from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
-from aiter.ops.triton._triton_kernels.quant.downcast_to_mxfp_rne import (
-    downcast_to_mxfp_rne,
-)
+
+
 
 
 @triton.jit
@@ -597,19 +593,6 @@ def sage_fwd_mxfp4(
     if PADDED_HEAD_V:
         o_mask &= offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
     tl.store(o_ptr, acc.to(Out.dtype.element_ty), mask=o_mask)
-
-
-@triton.jit
-def _get_max_quant_val(dtype: tl.constexpr):
-    if dtype == tl.uint8:
-        return 6.0
-    elif dtype == tl.float8e5:
-        return 57344.0
-    elif dtype == tl.float8e4nv:
-        return 448.0
-    else:
-        tl.static_assert(False, f"Invalid {dtype=}")
-
 
 
 @triton.jit
