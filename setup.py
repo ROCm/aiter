@@ -265,8 +265,19 @@ class NinjaBuildExtension(build_ext):
                     list(executor.map(build_one_module, all_opts_args_build))
 
         # Triton kernel precompilation (cross-compile, no GPU required)
+        # NOTE: We register a stub 'aiter' package in sys.modules so the
+        # prebuild_triton subpackage can be imported without triggering
+        # aiter/__init__.py (which imports JIT C++ extensions not yet built).
         if PREBUILD_TRITON:
             try:
+                import types
+
+                saved_aiter = sys.modules.get("aiter")
+                stub = types.ModuleType("aiter")
+                stub.__path__ = [os.path.join(this_dir, "aiter")]
+                stub.__package__ = "aiter"
+                sys.modules["aiter"] = stub
+
                 from aiter.prebuild_triton.warmup import prebuild_triton_kernels
 
                 triton_cache_dir = os.path.join(
@@ -281,6 +292,14 @@ class NinjaBuildExtension(build_ext):
                     cache_dir=triton_cache_dir,
                     archs=triton_archs,
                 )
+
+                # Restore original aiter module (or remove stub)
+                if saved_aiter is not None:
+                    sys.modules["aiter"] = saved_aiter
+                else:
+                    for key in list(sys.modules):
+                        if key == "aiter" or key.startswith("aiter.prebuild_triton"):
+                            del sys.modules[key]
             except Exception as e:
                 print(f"[aiter] Warning: Triton precompilation failed: {e}")
 
