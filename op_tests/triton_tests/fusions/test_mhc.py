@@ -56,18 +56,13 @@ def test_mhc_correctness(M, n, C, dtype):
     )
 
     out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
-
     H_pre_torch = out_torch[:, :n_streams]
-
     H_post_torch = out_torch[:, n_streams : 2 * n_streams]
-
     H_res_torch = out_torch[:, 2 * n_streams :]
+
     out_triton = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
-
     H_pre_triton = out_triton[:, :n_streams]
-
     H_post_triton = out_triton[:, n_streams : 2 * n_streams]
-
     H_res_triton = out_triton[:, 2 * n_streams :]
 
     torch.testing.assert_close(
@@ -107,7 +102,6 @@ def test_mhc_preallocated_output(M, n, C):
     out = torch.empty(M, n + n + n_squared, dtype=x.dtype, device=x.device)
 
     out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
-
     H_pre_torch = out_torch[:, :n_streams]
     H_post_torch = out_torch[:, n_streams : 2 * n_streams]
     H_res_torch = out_torch[:, 2 * n_streams :]
@@ -177,12 +171,10 @@ def test_mhc_different_epsilon(eps, M, n, C):
         n_streams,
         eps=eps,
     )
-
     H_pre_torch = out_torch[:, :n_streams]
-
     H_post_torch = out_torch[:, n_streams : 2 * n_streams]
-
     H_res_torch = out_torch[:, 2 * n_streams :]
+
     out_triton = mhc(
         x,
         phi,
@@ -193,11 +185,8 @@ def test_mhc_different_epsilon(eps, M, n, C):
         n_streams,
         eps=eps,
     )
-
     H_pre_triton = out_triton[:, :n_streams]
-
     H_post_triton = out_triton[:, n_streams : 2 * n_streams]
-
     H_res_triton = out_triton[:, 2 * n_streams :]
 
     for torch_out, triton_out in [
@@ -228,9 +217,7 @@ def test_mhc_different_alpha(alpha_scale):
     torch.cuda.empty_cache()
 
     M, n, C = 32, 4, 1024
-    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
-        M, n, C
-    )
+    x, phi, _, _, _, bias, n_streams = generate_mhc_inputs(M, n, C)
 
     # Use same alpha for all streams, scaled by alpha_scale
     alpha_pre = alpha_scale
@@ -238,18 +225,13 @@ def test_mhc_different_alpha(alpha_scale):
     alpha_res = alpha_scale
 
     out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
-
     H_pre_torch = out_torch[:, :n_streams]
-
     H_post_torch = out_torch[:, n_streams : 2 * n_streams]
-
     H_res_torch = out_torch[:, 2 * n_streams :]
+
     out_triton = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
-
     H_pre_triton = out_triton[:, :n_streams]
-
     H_post_triton = out_triton[:, n_streams : 2 * n_streams]
-
     H_res_triton = out_triton[:, 2 * n_streams :]
 
     for torch_out, triton_out in [
@@ -291,13 +273,13 @@ def test_mhc_zero_input():
     alpha_pre = alpha_post = alpha_res = 1.0
     bias = torch.randn(N_total, dtype=torch.float32, device="cuda") * 0.1
 
-    # Reference implementation (returns unified tensor)
+    # Reference implementation
     out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
     H_pre_torch = out_torch[:, :n]
     H_post_torch = out_torch[:, n : 2 * n]
     H_res_torch = out_torch[:, 2 * n :]
 
-    # Triton implementation (returns unified tensor)
+    # Triton implementation
     out_triton = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
     H_pre_triton = out_triton[:, :n]
     H_post_triton = out_triton[:, n : 2 * n]
@@ -342,13 +324,13 @@ def test_mhc_large_values():
     alpha_pre = alpha_post = alpha_res = 1.0
     bias = torch.randn(N_total, dtype=torch.float32, device="cuda")
 
-    # Reference implementation (returns unified tensor)
+    # Reference implementation
     out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
     H_pre_torch = out_torch[:, :n]
     H_post_torch = out_torch[:, n : 2 * n]
     H_res_torch = out_torch[:, 2 * n :]
 
-    # Triton implementation (returns unified tensor)
+    # Triton implementation
     out_triton = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
     H_pre_triton = out_triton[:, :n]
     H_post_triton = out_triton[:, n : 2 * n]
@@ -388,18 +370,13 @@ def test_mhc_small_shapes(M, n, C, dtype):
     )
 
     out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
-
     H_pre_torch = out_torch[:, :n_streams]
-
     H_post_torch = out_torch[:, n_streams : 2 * n_streams]
-
     H_res_torch = out_torch[:, 2 * n_streams :]
+
     out_triton = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
-
     H_pre_triton = out_triton[:, :n_streams]
-
     H_post_triton = out_triton[:, n_streams : 2 * n_streams]
-
     H_res_triton = out_triton[:, 2 * n_streams :]
 
     for torch_out, triton_out in [
@@ -513,11 +490,8 @@ def test_split_k_correctness(M, n, C, num_ksplit, dtype):
         n_streams,
         return_with_sinkhorn=False,
     )
-
     H_pre_ref = out_ref[:, :n_streams]
-
     H_post_ref = out_ref[:, n_streams : 2 * n_streams]
-
     H_res_ref = out_ref[:, 2 * n_streams :]
 
     # Test: split-K kernel with config passed directly
@@ -531,11 +505,8 @@ def test_split_k_correctness(M, n, C, num_ksplit, dtype):
         n_streams,
         config=_make_split_k_config(num_ksplit),
     )
-
     H_pre_split = out_split[:, :n_streams]
-
     H_post_split = out_split[:, n_streams : 2 * n_streams]
-
     H_res_split = out_split[:, 2 * n_streams :]
 
     torch.testing.assert_close(
@@ -585,11 +556,8 @@ def test_split_k_mhc_full_pipeline(M, n, C, num_ksplit):
         n_streams,
         return_with_sinkhorn=True,
     )
-
     H_pre_ref = out_ref[:, :n_streams]
-
     H_post_ref = out_ref[:, n_streams : 2 * n_streams]
-
     H_res_ref = out_ref[:, 2 * n_streams :]
 
     # Test: split-K kernel with full mhc pipeline (config passed directly)
@@ -603,11 +571,8 @@ def test_split_k_mhc_full_pipeline(M, n, C, num_ksplit):
         n_streams,
         config=_make_split_k_config(num_ksplit),
     )
-
     H_pre_split = out_split[:, :n_streams]
-
     H_post_split = out_split[:, n_streams : 2 * n_streams]
-
     H_res_split = out_split[:, 2 * n_streams :]
 
     torch.testing.assert_close(
@@ -656,12 +621,9 @@ def test_split_k_various_splits(num_ksplit):
         n_streams,
         return_with_sinkhorn=False,
     )
-
     H_pre_torch = out_torch[:, :n_streams]
-
     H_post_torch = out_torch[:, n_streams : 2 * n_streams]
-
-    H_res_torch = out_torch[:, 2 * n_streams :]
+    # H_res_torch = out_torch[:, 2 * n_streams :]
 
     # Test: split-K kernel (config passed directly)
     out_split = fused_mhc(
@@ -674,12 +636,9 @@ def test_split_k_various_splits(num_ksplit):
         n_streams,
         config=_make_split_k_config(num_ksplit),
     )
-
     H_pre_split = out_split[:, :n_streams]
-
     H_post_split = out_split[:, n_streams : 2 * n_streams]
-
-    H_res_split = out_split[:, 2 * n_streams :]
+    # H_res_split = out_split[:, 2 * n_streams :]
 
     torch.testing.assert_close(
         H_pre_split.to(torch.float32),
@@ -793,11 +752,8 @@ def test_split_k_large_k():
         n_streams,
         return_with_sinkhorn=False,
     )
-
     H_pre_ref = out_ref[:, :n_streams]
-
     H_post_ref = out_ref[:, n_streams : 2 * n_streams]
-
     H_res_ref = out_ref[:, 2 * n_streams :]
 
     # Test with 4-way split (config passed directly)
@@ -811,11 +767,8 @@ def test_split_k_large_k():
         n_streams,
         config=_make_split_k_config(4),
     )
-
     H_pre_split = out_split[:, :n_streams]
-
     H_post_split = out_split[:, n_streams : 2 * n_streams]
-
     H_res_split = out_split[:, 2 * n_streams :]
 
     # Use slightly relaxed tolerance for larger K due to more accumulation steps
@@ -1128,12 +1081,10 @@ def test_mhc_lite_correctness(M, n, C, dtype):
     out_torch = mhc_lite_torch(
         x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams
     )
-
     H_pre_torch = out_torch[:, :n_streams]
-
     H_post_torch = out_torch[:, n_streams : 2 * n_streams]
-
     H_res_torch = out_torch[:, 2 * n_streams :]
+
     out_triton = mhc(
         x,
         phi,
@@ -1144,11 +1095,8 @@ def test_mhc_lite_correctness(M, n, C, dtype):
         n_streams,
         hres_mode="lite",
     )
-
     H_pre_triton = out_triton[:, :n_streams]
-
     H_post_triton = out_triton[:, n_streams : 2 * n_streams]
-
     H_res_triton = out_triton[:, 2 * n_streams :]
 
     # Pre and post streams should match closely

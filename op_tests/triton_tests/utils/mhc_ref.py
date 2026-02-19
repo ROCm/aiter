@@ -90,7 +90,6 @@ def mhc_torch(
         - H_res = out[:, 2n:]
     """
     # Extract individual phi components from unified tensor
-    # K = phi.shape[0]
     phi_pre = phi[:, :n]
     phi_post = phi[:, n : 2 * n]
     phi_res = phi[:, 2 * n :]
@@ -141,11 +140,9 @@ def mhc_torch(
     else:
         H_res = H_res.to(torch.float32)
 
-    # Unify outputs into single contiguous tensor (matches kernel implementation)
     # Layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_res-1]
     out = torch.cat([H_pre.to(x.dtype), H_post.to(x.dtype), H_res.to(x.dtype)], dim=1)
 
-    # Return unified output tensor
     return out
 
 
@@ -189,7 +186,6 @@ def mhc_lite_torch(
         Note: H_res is reshaped from (M, n, n) to (M, n²) for consistency with sinkhorn mode.
     """
     # Extract individual phi components from unified tensor
-    K = phi.shape[0]
     phi_pre = phi[:, :n]
     phi_post = phi[:, n : 2 * n]
     phi_res = phi[:, 2 * n :]
@@ -245,11 +241,9 @@ def mhc_lite_torch(
     H_res = torch.einsum("mk,kij->mij", alpha_coeffs, P)  # (M, n, n)
     H_res = H_res.view(M, n_squared)  # Flatten to (M, n²)
 
-    # Unify outputs into single contiguous tensor (matches kernel implementation)
     # Layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_squared-1]
     out = torch.cat([H_pre.to(x.dtype), H_post.to(x.dtype), H_res.to(x.dtype)], dim=1)
 
-    # Return unified output tensor
     return out
 
 

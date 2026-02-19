@@ -136,8 +136,8 @@ def _mhc_fused_kernel(
 
     # Compute phi column offset in unified tensor layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_res-1]
     phi_col_start = tl.where(is_pre_program, 0, tl.where(is_post_program, n, 2 * n))
-    # Unified phi tensor - strides are the same for all streams
 
+    # Unified phi tensor - strides are the same for all streams
     for k in range(0, K, BLOCK_K):
         rk = k + tl.arange(0, BLOCK_K)
 
@@ -194,8 +194,8 @@ def _mhc_fused_kernel(
 
     # Compute output column offset in unified tensor layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_squared-1]
     out_col_start = tl.where(is_pre_program, 0, tl.where(is_post_program, n, 2 * n))
-    # Unified output tensor - strides are the same for all streams
 
+    # Unified output tensor - strides are the same for all streams
     out_col_offset = out_col_start + rn_local
     tl.store(
         out_ptr + rm[:, None] * stride_out_m + out_col_offset[None, :] * stride_out_n,
@@ -290,7 +290,6 @@ def _mhc_fused_split_kernel(
 
     # Compute phi column offset in unified tensor layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_res-1]
     phi_col_start = tl.where(is_pre_program, 0, tl.where(is_post_program, n, 2 * n))
-    # Unified phi tensor - strides are the same for all streams
 
     # Loop over this split's K range
     k_span = split_k_end - split_k_start
@@ -475,8 +474,8 @@ def _mhc_fused_reduce_kernel(
 
     # Compute output column offset in unified tensor layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_squared-1]
     out_col_start = tl.where(is_pre_program, 0, tl.where(is_post_program, n, 2 * n))
-    # Unified output tensor - strides are the same for all streams
 
+    # Unified output tensor - strides are the same for all streams
     out_col_offset = out_col_start + rn_local
     tl.store(
         out_ptr + rm[:, None] * stride_out_m + out_col_offset[None, :] * stride_out_n,
