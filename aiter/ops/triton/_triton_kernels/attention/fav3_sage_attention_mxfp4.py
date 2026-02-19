@@ -487,11 +487,11 @@ def sage_fwd_mxfp4(
     bias_ptrs = (
         (
             bias
-            + off_z * stride_bz
-            + off_h_q * stride_bh
-            + start_m * stride_bm
+            + off_z * stride_bz.to(tl.int64)
+            + off_h_q * stride_bh.to(tl.int64)
+            + start_m * stride_bm.to(tl.int64)
             + offs_n[None, :] * stride_bn
-        ).to(tl.int64)
+        )
         if USE_BIAS
         else None
     )
@@ -940,21 +940,21 @@ def _rotate_quantize_qk_kernel(
     qk_tile = tl.load(
         qk_ptr, mask=(offs_m[:, None] < seqlen) & (offs_d[None, :] < d_model), other=0.0
     )  # (BLOCK_M, D)
+    original_dtype = qk_tile.dtype
 
-    # Calculate mean for the block (reduction over d within the BLOCK_M)
-    # q_mean shape: [B, H, Q_NUM_BLKS, D]
-    if q_smoothing:
-        m_row_mean = tl.sum(qk_tile, axis=0) / BLOCK_M  # Sum over BLOCK_M -> shape [D]
-
-        qk_tile -= m_row_mean[None, :]
-        mean_ptr = (
-            Q_mean
-            + pid_b * stride_mb
-            + pid_h * stride_mh
-            + pid_m * stride_mm
-            + offs_d * stride_md
-        )
-        tl.store(mean_ptr, m_row_mean)
+    if is_q_pid:
+        if q_smoothing:
+            m_row_mean = tl.sum(qk_tile, axis=0) / BLOCK_M  # Sum over BLOCK_M -> shape [D]
+            qk_tile -= m_row_mean[None, :]
+            qk_tile = qk_tile.to(original_dtype)
+            mean_ptr = (
+                Q_mean
+                + pid_b * stride_mb
+                + pid_h * stride_mh
+                + pid_m * stride_mm
+                + offs_d * stride_md
+            )
+            tl.store(mean_ptr, m_row_mean*sm_scale)
 
     r_mat = tl.load(r_ptr)  # BLOCK_R x BLOCK_R
 
