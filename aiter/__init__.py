@@ -5,6 +5,53 @@ import torch
 import os
 import logging
 
+
+# --- Triton prebuild cache loading ---
+# If a prebuild cache exists, point TRITON_CACHE_DIR to the arch-specific
+# subdirectory so Triton finds pre-compiled .hsaco binaries at import time
+# instead of JIT-compiling them.
+def _setup_triton_prebuild_cache():
+    _prebuild_cache = os.path.join(os.path.dirname(__file__), "prebuild_triton_cache")
+    if not os.path.isdir(_prebuild_cache):
+        return
+    # Detect current GPU arch
+    _arch = None
+    try:
+        props = torch.cuda.get_device_properties(0)
+        _arch = (
+            props.gcnArchName.split(":")[0] if hasattr(props, "gcnArchName") else None
+        )
+    except Exception:
+        pass
+    if _arch is None:
+        # Fallback: try rocm_agent_enumerator
+        try:
+            import subprocess
+
+            result = subprocess.run(
+                ["rocm_agent_enumerator"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            for line in result.stdout.strip().split("\n"):
+                line = line.strip()
+                if line.startswith("gfx"):
+                    _arch = line
+                    break
+        except Exception:
+            pass
+    if _arch is None:
+        return
+    _arch_cache = os.path.join(_prebuild_cache, _arch)
+    if os.path.isdir(_arch_cache):
+        # Use setdefault so users can override with their own TRITON_CACHE_DIR
+        os.environ.setdefault("TRITON_CACHE_DIR", _arch_cache)
+
+
+_setup_triton_prebuild_cache()
+del _setup_triton_prebuild_cache
+
 logger = logging.getLogger("aiter")
 
 
