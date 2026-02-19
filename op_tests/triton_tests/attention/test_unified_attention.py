@@ -86,10 +86,8 @@ def shuffle_kv_cache(
 DEVICE_ARCH = arch_info.get_arch()
 
 NUM_HEADS = [(64, 8)]
-# HEAD_SIZES = [32, 64, 128]
-# BLOCK_SIZES = [16, 64]
-HEAD_SIZES = [64]
-BLOCK_SIZES = [16]
+HEAD_SIZES = [32, 64, 128]
+BLOCK_SIZES = [16, 64]
 
 DTYPES = [torch.bfloat16]
 QDTYPES = [None]
@@ -163,6 +161,34 @@ def ref_paged_attn(
     return torch.cat(outputs, dim=0)
 
 
+import os
+
+if os.environ.get("SCL_BACKEND") == "0":
+    SCL_BACKEND = [
+        ("triton", False, 1, False),  # use triton
+    ]
+elif os.environ.get("SCL_BACKEND") == "1":
+    SCL_BACKEND = [
+        ("gluon", False, 1, False),  # use gluon baseline
+    ]
+elif os.environ.get("SCL_BACKEND") == "2":
+    SCL_BACKEND = [
+        ("gluon", False, 1, True),  # use gluon simple async_copy
+    ]
+elif os.environ.get("SCL_BACKEND") == "3":
+    SCL_BACKEND = [
+        ("gluon", True, 1, False),  # use gluon TDM async_copy
+    ]
+elif os.environ.get("SCL_BACKEND") == "4":
+    SCL_BACKEND = [
+        ("gluon", True, 4, False),  # use gluon TDM gather pipelined
+    ]
+elif os.environ.get("SCL_BACKEND") == "5":
+    SCL_BACKEND = [
+        ("gluon", True, 8, False),  # use gluon TDM gather pipelined
+    ]
+
+
 # @pytest.mark.parametrize(
 #     "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
 # )
@@ -178,13 +204,13 @@ def ref_paged_attn(
     "seq_lens",
     [
         [(1, 1328)],
-        # [(1, 8192)],
-        # [(1, 8192)] * 4,
+        [(1, 8192)],
+        [(1, 8192)] * 4,
         # [(1, 8192)] * 8,
         # [(1, 8192)] * 16,
         # [(1, 32768)],
-        # [(1, 523), (1, 37), (1, 2011)],
-        # [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)],
+        [(1, 523), (1, 37), (1, 2011)],
+        [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)],
     ],
 )
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
@@ -198,14 +224,15 @@ def ref_paged_attn(
 @pytest.mark.parametrize("shuffled_kv_cache", [False])
 @pytest.mark.parametrize(
     "backend, use_tdm, num_tdm_gather, use_async",
-    [
-        # ("triton", False, 1, False),  # use triton
-        ("gluon", False, 1, False),  # use gluon baseline
-        # ("gluon", False, 1, True),  # use gluon simple async_copy
-        # ("gluon", True, 1, False),  # use gluon TDM async_copy
-        # ("gluon", True, 4, False),  # use gluon TDM gather pipelined
-        # ("gluon", True, 8, False),  # use gluon TDM gather pipelined
-    ],
+    SCL_BACKEND,
+    # [
+    #     ("triton", False, 1, False),  # use triton
+    #     ("gluon", False, 1, False),  # use gluon baseline
+    #     ("gluon", False, 1, True),  # use gluon simple async_copy
+    #     ("gluon", True, 1, False),  # use gluon TDM async_copy
+    #     ("gluon", True, 4, False),  # use gluon TDM gather pipelined
+    #     ("gluon", True, 8, False),  # use gluon TDM gather pipelined
+    # ],
 )
 @torch.inference_mode()
 def test_triton_unified_attn(
@@ -309,40 +336,26 @@ def test_triton_unified_attn(
             maybe_shuffled_qnatized_key_cache = maybe_quantized_key_cache
             maybe_shuffled_quantized_value_cache = maybe_quantized_value_cache
 
-        from triton.testing import runtime
-
-        def run_profile(fn: callable, n_run: int = 250):
-            di = runtime.driver.active.get_device_interface()
-            cache = runtime.driver.active.get_empty_cache_for_benchmark()
-            for _ in range(n_run):
-                cache.zero_()
-                di.synchronize()
-                fn()
-                di.synchronize()
-
-        def func():
-            unified_attention(
-                q=maybe_quantized_query,
-                k=maybe_shuffled_qnatized_key_cache,
-                v=maybe_shuffled_quantized_value_cache,
-                out=output,
-                cu_seqlens_q=cu_query_lens,
-                seqused_k=kv_lens,
-                max_seqlen_q=max_query_len,
-                max_seqlen_k=max_kv_len,
-                softmax_scale=scale,
-                causal=True,
-                window_size=window_size,
-                block_table=block_tables,
-                softcap=soft_cap if soft_cap is not None else 0,
-                q_descale=q_descale,
-                k_descale=k_descale,
-                v_descale=v_descale,
-                sinks=sinks,
-                shuffled_kv_cache=shuffled_kv_cache,
-            )
-
-        run_profile(func)
+        unified_attention(
+            q=maybe_quantized_query,
+            k=maybe_shuffled_qnatized_key_cache,
+            v=maybe_shuffled_quantized_value_cache,
+            out=output,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=soft_cap if soft_cap is not None else 0,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            sinks=sinks,
+            shuffled_kv_cache=shuffled_kv_cache,
+        )
     else:
         if shuffled_kv_cache:
             maybe_shuffled_qnatized_key_cache, maybe_shuffled_quantized_value_cache = (
