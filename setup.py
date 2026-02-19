@@ -12,6 +12,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 PACKAGE_NAME = "amd-aiter"
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
+ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
 
 
 def getMaxJobs():
@@ -46,7 +47,12 @@ def is_develop_mode():
 # Copy source directories for packaging
 if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
     shutil.rmtree("aiter_meta")
-shutil.copytree("3rdparty", "aiter_meta/3rdparty")
+if ENABLE_CK:
+    shutil.copytree("3rdparty", "aiter_meta/3rdparty")
+else:
+    os.makedirs("aiter_meta/3rdparty", exist_ok=True)
+    if os.path.exists("3rdparty/ck_helper"):
+        shutil.copytree("3rdparty/ck_helper", "aiter_meta/3rdparty/ck_helper")
 shutil.copytree("hsa", "aiter_meta/hsa")
 shutil.copytree("gradlib", "aiter_meta/gradlib")
 shutil.copytree("csrc", "aiter_meta/csrc")
@@ -76,11 +82,12 @@ class NinjaBuildExtension(build_ext):
             raise NotImplementedError("Only ROCM is supported")
 
         ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
-        assert os.path.exists(ck_dir), (
-            "CK is needed by aiter, please make sure clone by "
-            '"git clone --recursive https://github.com/ROCm/aiter.git" or '
-            '"git submodule sync ; git submodule update --init --recursive"'
-        )
+        if ENABLE_CK:
+            assert os.path.exists(ck_dir), (
+                "CK is needed by aiter, please make sure clone by "
+                '"git clone --recursive https://github.com/ROCm/aiter.git" or '
+                '"git submodule sync ; git submodule update --init --recursive"'
+            )
 
         if is_develop_mode():
             with open("./aiter/install_mode", "w") as f:
@@ -95,14 +102,36 @@ class NinjaBuildExtension(build_ext):
                 with open(cfg_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
             except Exception:
-                return []
+                return [], {}
             if isinstance(data, dict):
-                return list(data.keys())
-            return []
+                return list(data.keys()), data
+            return [], {}
+
+        def _get_ck_dependent_modules(config_data):
+            """Identify modules that depend on CK 3rdparty or ASM codegen."""
+            ck_patterns = [
+                "CK_DIR",
+                "py_itfs_ck",
+                "gen_instances",
+                "generate.py",
+                "codegen.py",
+            ]
+            ck_modules = set()
+            for mod_name, mod_cfg in config_data.items():
+                mod_str = json.dumps(mod_cfg)
+                if any(p in mod_str for p in ck_patterns):
+                    ck_modules.add(mod_name)
+            return ck_modules
 
         def get_exclude_ops():
-            all_modules = _load_modules_from_config()
+            all_modules, config_data = _load_modules_from_config()
             exclude_ops = []
+
+            # When CK is disabled, exclude all CK/ASM-dependent modules
+            if not ENABLE_CK:
+                ck_modules = _get_ck_dependent_modules(config_data)
+                exclude_ops.extend(sorted(ck_modules))
+                return exclude_ops
 
             for module in all_modules:
                 if PREBUILD_KERNELS == 1:
@@ -165,7 +194,7 @@ class NinjaBuildExtension(build_ext):
                     "all", exclude=exclude_ops
                 )
 
-                if PREBUILD_KERNELS == 1:
+                if PREBUILD_KERNELS == 1 and ENABLE_CK:
                     extra_args_build = []
 
                     req_md_names = [
