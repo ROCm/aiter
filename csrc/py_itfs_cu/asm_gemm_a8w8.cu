@@ -257,8 +257,8 @@ torch::Tensor gemm_a8w8_asm(torch::Tensor& A,       // A:[M, K] i8
             //        k_per_split,
             //        k_per_split_aligned);
             args.ks = selectedksplit;
-            // if(selectedksplit > 1)
-            //     out.zero_();
+            if(selectedksplit > 1)
+                out.zero_();
         }
         gdx         = gdx * selectedksplit;
         auto result = impl_ptr_map.emplace(name, nullptr);
