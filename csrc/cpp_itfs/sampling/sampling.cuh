@@ -580,7 +580,7 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs,
     double low = 0, high = 1.f;
     int sampled_id;
 
-    constexpr uint32_t PRELOAD_LIMIT = 128; // the number of probabilities to preload into registers
+    constexpr uint32_t PRELOAD_LIMIT = 32; // the number of probabilities to preload into registers
     const uint32_t num_preload_iters = PRELOAD_LIMIT / VEC_SIZE;
     //preload as much data as possible into registers
     vec_t<float, VEC_SIZE> preloaded_probs[num_preload_iters];
@@ -605,7 +605,9 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs,
         // fixed set of iterations known at compile-time
 #pragma unroll
         for(uint32_t i = 0; i < num_preload_iters; ++i) {
-            // TODO: add a check to avoid unnecessary iterations when d is small 
+            if (i * BLOCK_THREADS * VEC_SIZE >= d) {
+                break;
+            }
             DeviceSamplingFromProb<VEC_SIZE,
                                     BLOCK_THREADS,
                                     SCAN_ALGORITHM,
@@ -658,6 +660,10 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs,
         //fixed set of iterations known at compile-time
 #pragma unroll
         for(uint32_t i = 0; i < num_preload_iters; ++i) {
+            if (i * BLOCK_THREADS * VEC_SIZE >= d) {
+                break;
+            }
+
             ComputePivotAggregates<VEC_SIZE, BLOCK_THREADS>(
                 preloaded_probs[i],
                 pivot_0,
