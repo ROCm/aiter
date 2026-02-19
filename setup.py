@@ -12,6 +12,8 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 PACKAGE_NAME = "amd-aiter"
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
+PREBUILD_TRITON = int(os.environ.get("PREBUILD_TRITON", "0"))
+PREBUILD_TRITON_ARCHS = os.environ.get("PREBUILD_TRITON_ARCHS", "gfx942,gfx950")
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
 
 
@@ -261,6 +263,26 @@ class NinjaBuildExtension(build_ext):
 
                 with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
                     list(executor.map(build_one_module, all_opts_args_build))
+
+        # Triton kernel precompilation (cross-compile, no GPU required)
+        if PREBUILD_TRITON:
+            try:
+                from aiter.prebuild_triton.warmup import prebuild_triton_kernels
+
+                triton_cache_dir = os.path.join(
+                    this_dir, "aiter", "prebuild_triton_cache"
+                )
+                triton_archs = [a.strip() for a in PREBUILD_TRITON_ARCHS.split(",")]
+                print(
+                    f"[aiter] Precompiling Triton kernels for: "
+                    f"{', '.join(triton_archs)}"
+                )
+                prebuild_triton_kernels(
+                    cache_dir=triton_cache_dir,
+                    archs=triton_archs,
+                )
+            except Exception as e:
+                print(f"[aiter] Warning: Triton precompilation failed: {e}")
 
         # Set MAX_JOBS for ninja
         max_jobs_env = os.environ.get("MAX_JOBS")
