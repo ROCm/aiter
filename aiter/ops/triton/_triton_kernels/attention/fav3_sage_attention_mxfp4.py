@@ -206,13 +206,12 @@ def _sage_fwd_no_mask_mxfp4(
             q, q_descale, Q_DTYPE_STR, k, k_descale, K_DTYPE_STR, fast_math=True, acc=qk
         )
 
-        # qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
         if USE_BIAS:
             bias_mask = kv_offs_n < seqlen_k
             bias = tl.load(
                 bias_base_ptrs + start_n * stride_bn, mask=bias_mask, other=0.0
             )
-            qk += bias
+            qk += bias[None, :]
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
         p = tl.math.exp2(qk - m_ij[:, None])
@@ -314,10 +313,12 @@ def _sage_fwd_mask_mxfp4(
                 float("-inf"),
             )
 
-        # qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
         if USE_BIAS:
             bias_mask = kv_offs_n < seqlen_k
-            qk += tl.load(bias_base_ptrs + start_n * stride_bn, mask=bias_mask, other=0.0)
+            bias = tl.load(
+                bias_base_ptrs + start_n * stride_bn, mask=bias_mask, other=0.0
+            )
+            qk += bias[None, :]
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
         p = tl.math.exp2(qk - m_ij[:, None])
