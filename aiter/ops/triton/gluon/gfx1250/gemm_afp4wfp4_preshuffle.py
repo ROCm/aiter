@@ -57,7 +57,6 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
     dot_b_layout = gl.DotOperandLayout(operand_index=1, parent=wmma_layout, k_width=16)
 
     a_scale_layout = gl.amd.gfx1250.get_wmma_scale_layout(dot_a_layout, [BLOCK_M, K_GROUPS], scale_factor=SCALE_GROUP_ELEMS)
-
     b_scale_layout = gl.amd.gfx1250.get_wmma_scale_layout(dot_b_layout, [BLOCK_N, K_GROUPS], scale_factor=SCALE_GROUP_ELEMS)
 
     return {
@@ -75,26 +74,6 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
     }
 
 
-# Offsets for A (packed fp4)
-@gluon.jit
-def a_tile_offsets(
-    tile_m,
-    split_k0_bytes,
-    k_tile,
-    stride_a_m,
-    stride_a_kbytes,
-    BLOCK_M: gl.constexpr,
-    BLOCK_K_BYTES: gl.constexpr,
-    blocked_mk: gl.constexpr,
-):
-    m_idx = tile_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, blocked_mk))
-    k_idx = gl.arange(0, BLOCK_K_BYTES, layout=gl.SliceLayout(0, blocked_mk))
-    k_tile0 = k_tile * BLOCK_K_BYTES
-    return (
-        m_idx[:, None] * stride_a_m
-        + (split_k0_bytes + k_tile0 + k_idx)[None, :] * stride_a_kbytes
-    )
-
 
 # Local offsets for A (per k-block); use with ptr = a_base + k_tile * BLOCK_K_BYTES * stride_a_kbytes
 @gluon.jit
@@ -109,46 +88,6 @@ def a_tile_offsets_local(
     m_idx = tile_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, blocked_mk))
     k_idx = gl.arange(0, BLOCK_K_BYTES, layout=gl.SliceLayout(0, blocked_mk))
     return m_idx[:, None] * stride_a_m + k_idx[None, :] * stride_a_kbytes
-
-
-@gluon.jit
-def a_scale_offsets(
-    tile_m,
-    split_k_id,
-    k_tile,
-    stride_as_m,
-    stride_as_k,
-    BLOCK_M: gl.constexpr,
-    K_GROUPS: gl.constexpr,
-    SPLITK_BLOCK: gl.constexpr,
-    a_scale_layout: gl.constexpr,
-):
-    # scales are [M, K_groups], where K_groups = K / 32
-    m_idx = tile_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, a_scale_layout))
-    kg_idx = gl.arange(0, K_GROUPS, layout=gl.SliceLayout(0, a_scale_layout))
-
-    split_k0_groups = split_k_id * (SPLITK_BLOCK // 32)
-    k_tile0_groups = k_tile * K_GROUPS
-
-    return (
-        m_idx[:, None] * stride_as_m
-        + (split_k0_groups + k_tile0_groups + kg_idx)[None, :] * stride_as_k
-    )
-
-
-# Local offsets for A scales; use with ptr = as_base + k_tile * K_GROUPS * stride_as_k
-@gluon.jit
-def a_scale_offsets_local(
-    tile_m,
-    stride_as_m,
-    stride_as_k,
-    BLOCK_M: gl.constexpr,
-    K_GROUPS: gl.constexpr,
-    a_scale_layout: gl.constexpr,
-):
-    m_idx = tile_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, a_scale_layout))
-    kg_idx = gl.arange(0, K_GROUPS, layout=gl.SliceLayout(0, a_scale_layout))
-    return m_idx[:, None] * stride_as_m + kg_idx[None, :] * stride_as_k
 
 
 # Offsets for A scales in *shuffled* layout: tensor is (M//32, K_groups*32).
@@ -180,24 +119,6 @@ def unshuffle_a_scales(
         .reshape(BLOCK_M, K_GROUPS)
     )
 
-
-@gluon.jit
-def b_preshuf_raw_offsets(
-    tile_n,
-    split_k0_bytes,
-    k_tile,
-    stride_b_n16,
-    stride_b_kshuf,
-    BLOCK_N: gl.constexpr,
-    BLOCK_K_BYTES: gl.constexpr,
-    blocked_kn: gl.constexpr,
-):
-    # physical: [N/16, K_BYTES*16]
-    n16_idx = tile_n * (BLOCK_N // 16) + gl.arange(0, BLOCK_N // 16, layout=gl.SliceLayout(1, blocked_kn))
-    kshuf_idx = (split_k0_bytes + k_tile * BLOCK_K_BYTES) * 16 + gl.arange(0, BLOCK_K_BYTES * 16, layout=gl.SliceLayout(0, blocked_kn))
-    return n16_idx[:, None] * stride_b_n16 + kshuf_idx[None, :] * stride_b_kshuf
-
-
 # Local offsets for B preshuf; use with ptr = b_base + k_tile * BLOCK_K_BYTES * 16 * stride_b_kshuf
 @gluon.jit
 def b_preshuf_raw_offsets_local(
@@ -227,45 +148,6 @@ def depreshuffle_b_raw_to_kn(
         .reshape(BLOCK_N, BLOCK_K_BYTES)
         .trans(1, 0)
     )
-
-
-@gluon.jit
-def b_scale_offsets(
-    tile_n,
-    split_k_id,
-    k_tile,
-    stride_bs_n,
-    stride_bs_k,
-    BLOCK_N: gl.constexpr,
-    K_GROUPS: gl.constexpr,
-    SPLITK_BLOCK: gl.constexpr,
-    b_scale_layout: gl.constexpr,
-):
-    n_idx = tile_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, b_scale_layout))
-    kg_idx = gl.arange(0, K_GROUPS, layout=gl.SliceLayout(0, b_scale_layout))
-
-    split_k0_groups = split_k_id * (SPLITK_BLOCK // 32)
-    k_tile0_groups = k_tile * K_GROUPS
-
-    return (
-        n_idx[:, None] * stride_bs_n
-        + (split_k0_groups + k_tile0_groups + kg_idx)[None, :] * stride_bs_k
-    )
-
-
-# Local offsets for B scales; use with ptr = bs_base + k_tile * K_GROUPS * stride_bs_k
-@gluon.jit
-def b_scale_offsets_local(
-    tile_n,
-    stride_bs_n,
-    stride_bs_k,
-    BLOCK_N: gl.constexpr,
-    K_GROUPS: gl.constexpr,
-    b_scale_layout: gl.constexpr,
-):
-    n_idx = tile_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, b_scale_layout))
-    kg_idx = gl.arange(0, K_GROUPS, layout=gl.SliceLayout(0, b_scale_layout))
-    return n_idx[:, None] * stride_bs_n + kg_idx[None, :] * stride_bs_k
 
 
 # Offsets for B scales in *shuffled* layout: tensor is (N//32, K_groups*32).
