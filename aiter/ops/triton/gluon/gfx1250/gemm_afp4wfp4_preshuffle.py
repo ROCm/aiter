@@ -1,4 +1,5 @@
 from typing import Optional
+
 import torch
 
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
@@ -48,29 +49,16 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
         instr_shape=[16, 16, 128],
     )
 
-    shared_A = gl.SwizzledSharedLayout(
-        vec=16, per_phase=1, max_phase=8, order=[1, 0]
-    )
-    shared_B = gl.SwizzledSharedLayout(
-        vec=16, per_phase=1, max_phase=8, order=[0, 1]
-    )
-    shared_S = gl.SwizzledSharedLayout(
-        vec=1, per_phase=1, max_phase=1, order=[1, 0]
-    )
+    shared_A = gl.SwizzledSharedLayout(vec=16, per_phase=1, max_phase=8, order=[1, 0])
+    shared_B = gl.SwizzledSharedLayout(vec=16, per_phase=1, max_phase=8, order=[0, 1])
+    shared_S = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
 
-    dot_a_layout = gl.DotOperandLayout(
-        operand_index=0, parent=wmma_layout, k_width=16
-    )
-    dot_b_layout = gl.DotOperandLayout(
-        operand_index=1, parent=wmma_layout, k_width=16
-    )
+    dot_a_layout = gl.DotOperandLayout(operand_index=0, parent=wmma_layout, k_width=16)
+    dot_b_layout = gl.DotOperandLayout(operand_index=1, parent=wmma_layout, k_width=16)
 
-    a_scale_layout = gl.amd.gfx1250.get_wmma_scale_layout(
-        dot_a_layout, [BLOCK_M, K_GROUPS], scale_factor=SCALE_GROUP_ELEMS
-    )
-    b_scale_layout = gl.amd.gfx1250.get_wmma_scale_layout(
-        dot_b_layout, [BLOCK_N, K_GROUPS], scale_factor=SCALE_GROUP_ELEMS
-    )
+    a_scale_layout = gl.amd.gfx1250.get_wmma_scale_layout(dot_a_layout, [BLOCK_M, K_GROUPS], scale_factor=SCALE_GROUP_ELEMS)
+
+    b_scale_layout = gl.amd.gfx1250.get_wmma_scale_layout(dot_b_layout, [BLOCK_N, K_GROUPS], scale_factor=SCALE_GROUP_ELEMS)
 
     return {
         "blocked_mk": blocked_mk,
@@ -99,9 +87,7 @@ def a_tile_offsets(
     BLOCK_K_BYTES: gl.constexpr,
     blocked_mk: gl.constexpr,
 ):
-    m_idx = tile_m * BLOCK_M + gl.arange(
-        0, BLOCK_M, layout=gl.SliceLayout(1, blocked_mk)
-    )
+    m_idx = tile_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, blocked_mk))
     k_idx = gl.arange(0, BLOCK_K_BYTES, layout=gl.SliceLayout(0, blocked_mk))
     k_tile0 = k_tile * BLOCK_K_BYTES
     return (
@@ -120,9 +106,7 @@ def a_tile_offsets_local(
     BLOCK_K_BYTES: gl.constexpr,
     blocked_mk: gl.constexpr,
 ):
-    m_idx = tile_m * BLOCK_M + gl.arange(
-        0, BLOCK_M, layout=gl.SliceLayout(1, blocked_mk)
-    )
+    m_idx = tile_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, blocked_mk))
     k_idx = gl.arange(0, BLOCK_K_BYTES, layout=gl.SliceLayout(0, blocked_mk))
     return m_idx[:, None] * stride_a_m + k_idx[None, :] * stride_a_kbytes
 
@@ -140,9 +124,7 @@ def a_scale_offsets(
     a_scale_layout: gl.constexpr,
 ):
     # scales are [M, K_groups], where K_groups = K / 32
-    m_idx = tile_m * BLOCK_M + gl.arange(
-        0, BLOCK_M, layout=gl.SliceLayout(1, a_scale_layout)
-    )
+    m_idx = tile_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, a_scale_layout))
     kg_idx = gl.arange(0, K_GROUPS, layout=gl.SliceLayout(0, a_scale_layout))
 
     split_k0_groups = split_k_id * (SPLITK_BLOCK // 32)
@@ -164,9 +146,7 @@ def a_scale_offsets_local(
     K_GROUPS: gl.constexpr,
     a_scale_layout: gl.constexpr,
 ):
-    m_idx = tile_m * BLOCK_M + gl.arange(
-        0, BLOCK_M, layout=gl.SliceLayout(1, a_scale_layout)
-    )
+    m_idx = tile_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, a_scale_layout))
     kg_idx = gl.arange(0, K_GROUPS, layout=gl.SliceLayout(0, a_scale_layout))
     return m_idx[:, None] * stride_as_m + kg_idx[None, :] * stride_as_k
 
@@ -182,12 +162,8 @@ def a_scale_offsets_local_shuffled(
     K_GROUPS: gl.constexpr,
     a_scale_layout: gl.constexpr,
 ):
-    m_block_idx = tile_m * (BLOCK_M // 32) + gl.arange(
-        0, BLOCK_M // 32, layout=gl.SliceLayout(1, a_scale_layout)
-    )
-    k_scale_idx = gl.arange(
-        0, K_GROUPS * 32, layout=gl.SliceLayout(0, a_scale_layout)
-    )
+    m_block_idx = tile_m * (BLOCK_M // 32) + gl.arange(0, BLOCK_M // 32, layout=gl.SliceLayout(1, a_scale_layout))
+    k_scale_idx = gl.arange(0, K_GROUPS * 32, layout=gl.SliceLayout(0, a_scale_layout))
     return m_block_idx[:, None] * stride_as_m + k_scale_idx[None, :] * stride_as_k
 
 
@@ -199,15 +175,7 @@ def unshuffle_a_scales(
 ):
     # Inverse of shuffle_scales: (BLOCK_M//32, K_GROUPS*32) -> (BLOCK_M, K_GROUPS)
     return (
-        a_scales_shuffled.reshape(
-            BLOCK_M // 32,
-            K_GROUPS // 8,
-            4,
-            16,
-            2,
-            2,
-            1,
-        )
+        a_scales_shuffled.reshape(BLOCK_M // 32, K_GROUPS // 8, 4, 16, 2, 2, 1)
         .permute(0, 5, 3, 1, 4, 2, 6)
         .reshape(BLOCK_M, K_GROUPS)
     )
@@ -225,12 +193,8 @@ def b_preshuf_raw_offsets(
     blocked_kn: gl.constexpr,
 ):
     # physical: [N/16, K_BYTES*16]
-    n16_idx = tile_n * (BLOCK_N // 16) + gl.arange(
-        0, BLOCK_N // 16, layout=gl.SliceLayout(1, blocked_kn)
-    )
-    kshuf_idx = (split_k0_bytes + k_tile * BLOCK_K_BYTES) * 16 + gl.arange(
-        0, BLOCK_K_BYTES * 16, layout=gl.SliceLayout(0, blocked_kn)
-    )
+    n16_idx = tile_n * (BLOCK_N // 16) + gl.arange(0, BLOCK_N // 16, layout=gl.SliceLayout(1, blocked_kn))
+    kshuf_idx = (split_k0_bytes + k_tile * BLOCK_K_BYTES) * 16 + gl.arange(0, BLOCK_K_BYTES * 16, layout=gl.SliceLayout(0, blocked_kn))
     return n16_idx[:, None] * stride_b_n16 + kshuf_idx[None, :] * stride_b_kshuf
 
 
@@ -244,12 +208,8 @@ def b_preshuf_raw_offsets_local(
     BLOCK_K_BYTES: gl.constexpr,
     blocked_kn: gl.constexpr,
 ):
-    n16_idx = tile_n * (BLOCK_N // 16) + gl.arange(
-        0, BLOCK_N // 16, layout=gl.SliceLayout(1, blocked_kn)
-    )
-    kshuf_idx = gl.arange(
-        0, BLOCK_K_BYTES * 16, layout=gl.SliceLayout(0, blocked_kn)
-    )
+    n16_idx = tile_n * (BLOCK_N // 16) + gl.arange(0, BLOCK_N // 16, layout=gl.SliceLayout(1, blocked_kn))
+    kshuf_idx = gl.arange(0, BLOCK_K_BYTES * 16, layout=gl.SliceLayout(0, blocked_kn))
     return n16_idx[:, None] * stride_b_n16 + kshuf_idx[None, :] * stride_b_kshuf
 
 
@@ -303,9 +263,7 @@ def b_scale_offsets_local(
     K_GROUPS: gl.constexpr,
     b_scale_layout: gl.constexpr,
 ):
-    n_idx = tile_n * BLOCK_N + gl.arange(
-        0, BLOCK_N, layout=gl.SliceLayout(1, b_scale_layout)
-    )
+    n_idx = tile_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, b_scale_layout))
     kg_idx = gl.arange(0, K_GROUPS, layout=gl.SliceLayout(0, b_scale_layout))
     return n_idx[:, None] * stride_bs_n + kg_idx[None, :] * stride_bs_k
 
@@ -321,12 +279,8 @@ def b_scale_offsets_local_shuffled(
     K_GROUPS: gl.constexpr,
     b_scale_layout: gl.constexpr,
 ):
-    n_block_idx = tile_n * (BLOCK_N // 32) + gl.arange(
-        0, BLOCK_N // 32, layout=gl.SliceLayout(1, b_scale_layout)
-    )
-    k_scale_idx = gl.arange(
-        0, K_GROUPS * 32, layout=gl.SliceLayout(0, b_scale_layout)
-    )
+    n_block_idx = tile_n * (BLOCK_N // 32) + gl.arange(0, BLOCK_N // 32, layout=gl.SliceLayout(1, b_scale_layout))
+    k_scale_idx = gl.arange(0, K_GROUPS * 32, layout=gl.SliceLayout(0, b_scale_layout))
     return n_block_idx[:, None] * stride_bs_n + k_scale_idx[None, :] * stride_bs_k
 
 
@@ -339,15 +293,7 @@ def unshuffle_b_scales(
     # Inverse of shuffle_scales: (BLOCK_N//32, K_GROUPS*32) -> (BLOCK_N, K_GROUPS)
     # Matches basic kernel: reshape(n//32, k//8, 4, 16, 2, 2, 1).permute(0,5,3,1,4,2,6).reshape(n, k)
     return (
-        b_scales_shuffled.reshape(
-            BLOCK_N // 32,
-            K_GROUPS // 8,
-            4,
-            16,
-            2,
-            2,
-            1,
-        )
+        b_scales_shuffled.reshape( BLOCK_N // 32, K_GROUPS // 8, 4, 16, 2, 2, 1)
         .permute(0, 5, 3, 1, 4, 2, 6)
         .reshape(BLOCK_N, K_GROUPS)
     )
@@ -530,27 +476,14 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
             b_ptr = b_base + k_tile * (BLOCK_K_BYTES * 16) * stride_b_kshuf
             bs_ptr = bs_base + k_tile * (K_GROUPS * 32) * stride_bs_k
 
-            a_tile = gl.amd.gfx1250.buffer_load(
-                ptr=a_ptr, offsets=offs_a, cache=cache_modifier
-            )
-            a_scales_raw = gl.amd.gfx1250.buffer_load(
-                ptr=as_ptr, offsets=offs_as, cache=cache_modifier
-            )
-            a_scales = unshuffle_a_scales(
-                a_scales_raw, BLOCK_M=BLOCK_M, K_GROUPS=K_GROUPS
-            )
-            b_raw = gl.amd.gfx1250.buffer_load(
-                ptr=b_ptr, offsets=offs_b_raw, cache=cache_modifier
-            )
-            b_tile = depreshuffle_b_raw_to_kn(
-                b_raw, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BLOCK_K_BYTES=BLOCK_K_BYTES
-            )
-            b_scales_raw = gl.amd.gfx1250.buffer_load(
-                ptr=bs_ptr, offsets=offs_bs, cache=cache_modifier
-            )
-            b_scales = unshuffle_b_scales(
-                b_scales_raw, BLOCK_N=BLOCK_N, K_GROUPS=K_GROUPS
-            )
+            a_tile = gl.amd.gfx1250.buffer_load(ptr=a_ptr, offsets=offs_a, cache=cache_modifier)
+            a_scales_raw = gl.amd.gfx1250.buffer_load(ptr=as_ptr, offsets=offs_as, cache=cache_modifier)
+            a_scales = unshuffle_a_scales(a_scales_raw, BLOCK_M=BLOCK_M, K_GROUPS=K_GROUPS)
+
+            b_raw = gl.amd.gfx1250.buffer_load(ptr=b_ptr, offsets=offs_b_raw, cache=cache_modifier)
+            b_tile = depreshuffle_b_raw_to_kn(b_raw, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BLOCK_K_BYTES=BLOCK_K_BYTES)
+            b_scales_raw = gl.amd.gfx1250.buffer_load(ptr=bs_ptr, offsets=offs_bs, cache=cache_modifier)
+            b_scales = unshuffle_b_scales(b_scales_raw, BLOCK_N=BLOCK_N, K_GROUPS=K_GROUPS)
 
             smem_A.index(slot).store(a_tile)
             smem_B.index(slot).store(b_tile)
@@ -575,17 +508,12 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
 
         a_tile = gl.amd.gfx1250.buffer_load(ptr=a_ptr, offsets=offs_a)
         a_scales_raw = gl.amd.gfx1250.buffer_load(ptr=as_ptr, offsets=offs_as)
-        a_scales = unshuffle_a_scales(
-            a_scales_raw, BLOCK_M=BLOCK_M, K_GROUPS=K_GROUPS
-        )
+        a_scales = unshuffle_a_scales(a_scales_raw, BLOCK_M=BLOCK_M, K_GROUPS=K_GROUPS)
+
         b_raw = gl.amd.gfx1250.buffer_load(ptr=b_ptr, offsets=offs_b_raw)
-        b_tile = depreshuffle_b_raw_to_kn(
-            b_raw, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BLOCK_K_BYTES=BLOCK_K_BYTES
-        )
+        b_tile = depreshuffle_b_raw_to_kn(b_raw, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BLOCK_K_BYTES=BLOCK_K_BYTES)
         b_scales_raw = gl.amd.gfx1250.buffer_load(ptr=bs_ptr, offsets=offs_bs)
-        b_scales = unshuffle_b_scales(
-            b_scales_raw, BLOCK_N=BLOCK_N, K_GROUPS=K_GROUPS
-        )
+        b_scales = unshuffle_b_scales(b_scales_raw, BLOCK_N=BLOCK_N, K_GROUPS=K_GROUPS)
 
         smem_A.index(slot).store(a_tile)
         smem_B.index(slot).store(b_tile)
@@ -672,15 +600,11 @@ def gemm_afp4wfp4_preshuffled_gfx1250(
         SPLITK_BLOCK = triton.cdiv(K_elems, NUM_KSPLIT)
         SPLITK_BLOCK = triton.cdiv(SPLITK_BLOCK, BLOCK_K) * BLOCK_K
         if y is None:
-            y = torch.empty(
-                (NUM_KSPLIT, M, N), device=x_fp4.device, dtype=torch.float32
-            )
+            y = torch.empty((NUM_KSPLIT, M, N), device=x_fp4.device, dtype=torch.float32)
         stride_c_k = y.stride(0)
 
     num_warps = config.get("num_warps", 4)
-    layouts = get_gemm_afp4wfp4_preshuffle_layouts(
-        num_warps, BLOCK_M, BLOCK_N, BLOCK_K
-    )
+    layouts = get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K)
 
     grid = (NUM_KSPLIT * triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
     gemm_afp4wfp4_preshuffle_gfx1250[grid](
