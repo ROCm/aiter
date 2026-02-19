@@ -10,16 +10,15 @@ import triton
 
 @triton.jit
 def packed_nonzero(x):
-    return  tl.inline_asm_elementwise(
-    asm="""
-    v_pk_min_u16 $1, $1, 0x00010001
-    v_pk_sub_u16 $0, $1, 0x00010001
-    """,
-    constraints=("=v,v"),
-    args=[x],
-    is_pure=True,
-    pack=1,
-    dtype=tl.uint32)
+    low = (x & 0xFFFF)
+    high = (x >> 16)
+    _1u = tl.full([],1,dtype=tl.uint16)
+    combined = tl.join(low, high).to(tl.uint16)
+    combined = tl.minimum(combined, _1u)
+    combined -= _1u
+    low, high = tl.split(combined.to(tl.uint32))
+    y = (high<<16) | low
+    return y.to(tl.uint32, bitcast=True)
 
 @triton.jit
 def dequant_fp4_bf16_with_scale(x, sc):
