@@ -13,17 +13,12 @@ activation, quantization, fusions, MoE routing). Phase 1 covers
 attention + normalization + activation + quantization + fusions.
 """
 
-import itertools
 import math
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
-
-import triton
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List
 
 from .shapes import (
     ALL_MODELS,
-    COMMON_BLOCK_SIZES,
-    COMMON_HEAD_DIMS,
     COMMON_HIDDEN_SIZES,
 )
 
@@ -78,10 +73,6 @@ def _next_power_of_2(n):
 
 def _get_rmsnorm_variants():
     """Generate variants for _rms_norm_kernel."""
-    from aiter.ops.triton._triton_kernels.normalization.rmsnorm import (
-        _rms_norm_kernel,
-    )
-
     variants = []
     # Typical hidden sizes determine BLOCK_SIZE
     for n_cols in COMMON_HIDDEN_SIZES:
@@ -114,10 +105,6 @@ def _get_rmsnorm_variants():
 
 def _get_fused_add_rmsnorm_variants():
     """Generate variants for _fused_add_rmsnorm_kernel."""
-    from aiter.ops.triton._triton_kernels.normalization.rmsnorm import (
-        _fused_add_rmsnorm_kernel,
-    )
-
     variants = []
     for n_cols in COMMON_HIDDEN_SIZES:
         block_size = min(65536 // 2, _next_power_of_2(n_cols))
@@ -151,10 +138,6 @@ def _get_fused_add_rmsnorm_variants():
 
 def _get_quant_rmsnorm_variants():
     """Generate variants for _quant_rms_norm_kernel (RMSNorm + FP8 quant)."""
-    from aiter.ops.triton._triton_kernels.normalization.rmsnorm import (
-        _quant_rms_norm_kernel,
-    )
-
     variants = []
     for n_cols in COMMON_HIDDEN_SIZES:
         block_size = min(65536 // 2, _next_power_of_2(n_cols))
@@ -194,10 +177,6 @@ def _get_quant_rmsnorm_variants():
 
 def _get_fused_rms_fp8_quant_variants():
     """Generate variants for _fused_rms_fp8_per_tensor_static_quant_kernel."""
-    from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import (
-        _fused_rms_fp8_per_tensor_static_quant_kernel,
-    )
-
     variants = []
     for n_cols in COMMON_HIDDEN_SIZES:
         block_size_n = _next_power_of_2(n_cols)
@@ -263,10 +242,6 @@ def _get_fused_rms_fp8_quant_variants():
 
 def _get_act_mxfp4_quant_variants():
     """Generate variants for _act_mul_and_dynamic_mxfp4_quant_kernel."""
-    from aiter.ops.triton._triton_kernels.activation import (
-        _act_mul_and_dynamic_mxfp4_quant_kernel,
-    )
-
     variants = []
     activations = ["silu", "silu_exp2", "gelu", "gelu_tanh"]
     block_configs = [
@@ -317,10 +292,6 @@ def _get_act_mxfp4_quant_variants():
 
 def _get_act_fp8_group_quant_variants():
     """Generate variants for _act_mul_and_dynamic_fp8_group_quant_kernel."""
-    from aiter.ops.triton._triton_kernels.activation import (
-        _act_mul_and_dynamic_fp8_group_quant_kernel,
-    )
-
     variants = []
     activations = ["silu", "silu_exp2", "gelu"]
     for activation in activations:
@@ -358,10 +329,6 @@ def _get_act_fp8_group_quant_variants():
 
 def _get_unified_attention_variants():
     """Generate variants for kernel_unified_attention_2d."""
-    from aiter.ops.triton._triton_kernels.attention.unified_attention import (
-        kernel_unified_attention_2d,
-    )
-
     variants = []
     for model in ALL_MODELS.values():
         head_dim = model["head_dim"]
@@ -453,10 +420,6 @@ def _get_unified_attention_variants():
 
 def _get_fused_rope_cache_variants():
     """Generate variants for _fused_qk_rope_reshape_and_cache_kernel."""
-    from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
-        _fused_qk_rope_reshape_and_cache_kernel,
-    )
-
     variants = []
     for model in ALL_MODELS.values():
         head_dim = model["head_dim"]
@@ -543,10 +506,6 @@ def _get_fused_rope_cache_variants():
 
 def _get_fused_mla_rope_cache_variants():
     """Generate variants for _fused_qk_rope_cat_and_cache_mla_kernel (DeepSeek MLA)."""
-    from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
-        _fused_qk_rope_cat_and_cache_mla_kernel,
-    )
-
     variants = []
     ds = ALL_MODELS.get("deepseek_v3")
     if ds is None:
@@ -634,10 +593,6 @@ def _get_fused_mla_rope_cache_variants():
 
 def _get_moe_routing_variants():
     """Generate variants for _routing_compute_indx."""
-    from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import (
-        _routing_compute_indx,
-    )
-
     variants = []
     block_ms = [32, 64, 128]
     n_expts_acts = [8, 16]

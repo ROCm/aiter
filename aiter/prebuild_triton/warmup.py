@@ -20,7 +20,6 @@ Compiled .hsaco + .json are stored in:
 """
 
 import os
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
