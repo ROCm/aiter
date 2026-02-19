@@ -12,18 +12,17 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_wrapper,
     sage_quant_mxfp4,
     get_sage_fwd_configs_mxfp4,
-    fav3_sage_mxfp4_func
+    fav3_sage_mxfp4_func,
 )
 from op_tests.triton_tests.attention.test_fav3_sage import (
     compare_accuracy,
-    input_helper
+    input_helper,
 )
 from bench_fav3_sage import fav2_forward_func
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
     get_caller_name_no_ext,
 )
-
 
 # Configuration
 logging.getLogger().setLevel(logging.INFO)
@@ -35,12 +34,14 @@ arg_to_torch_dtype = {
     "fp32": torch.float32,
 }
 
+
 def layout_preprocess(q, k, v, layout: str, target_layout: str = "bshd"):
     if layout != target_layout:
         q = q.permute(0, 2, 1, 3).contiguous()
         k = k.permute(0, 2, 1, 3).contiguous()
         v = v.permute(0, 2, 1, 3).contiguous()
     return q, k, v
+
 
 def bench_kernel(q, k, v, args, provider):
     """Main benchmarking logic for a single configuration."""
@@ -51,8 +52,8 @@ def bench_kernel(q, k, v, args, provider):
         BATCH, HQ, N_CTX_Q, D_HEAD = q.shape
         _, HK, N_CTX_K, D_HEAD_V = v.shape
 
-    def return_func_call():
-        
+    def return_only_kernel_func_call():
+
         config = get_sage_fwd_configs_mxfp4()
         (
             q_quantized,
@@ -70,41 +71,45 @@ def bench_kernel(q, k, v, args, provider):
             layout=args.layout,
         )
         return lambda: fav3_sage_mxfp4_func(
-            q=q_quantized, k=k_quantized, v=v_quantized,
-            q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+            q=q_quantized,
+            k=k_quantized,
+            v=v_quantized,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             bias=delta_s,
             causal=False,
             layout=args.layout,
             config=config,
         )
 
-    # TODO: quantization drops the perf from 1800 to 1400 TFLOPs. This is too much.
     # fn = return_func_call()
-
+    # TODO: quantization drops the perf from 1800 to 1400 TFLOPs. This is too much.
     fn = lambda: fav3_sage_mxfp4_wrapper(
-            q, k, v,
-            layout=args.layout,
-            q_smooth=args.qsmooth
-        )
-    
+        q, k, v, layout=args.layout, q_smooth=args.qsmooth
+    )
+
     ms = triton.testing.do_bench(fn)
     # print("kernel (ms)", ms)
 
     # Metrics calculation (MXFP4 treats elements as 0.5 bytes in memory traffic for Q/K)
     total_flops = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
-    
-    if "ms" in provider: return ms
-    if "TFLOPS" in provider: return total_flops / ms * 1e-9
+
+    if "ms" in provider:
+        return ms
+    if "TFLOPS" in provider:
+        return total_flops / ms * 1e-9
     return ms
+
 
 def run_benchmark(args):
     torch.manual_seed(20)
-    
+
     # Define benchmark configs
     hk = args.hq if not args.hk else args.hk
     sk = args.sq if not args.sk else args.sk
     x_vals_list = [(args.b, args.hq, hk, args.sq, sk)]
-    
+
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=["BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K"],
@@ -115,18 +120,36 @@ def run_benchmark(args):
             styles=[("blue", "-"), ("green", "-")],
             ylabel="Metric Value",
             plot_name="MXFP4_Attention_Performance",
-            args={"D_HEAD": args.d, "D_HEAD_V": args.dv, "dtype": arg_to_torch_dtype[args.dtype], "layout": args.layout}
+            args={
+                "D_HEAD": args.d,
+                "D_HEAD_V": args.dv,
+                "dtype": arg_to_torch_dtype[args.dtype],
+                "layout": args.layout,
+            },
         )
     )
-    def bench_mha(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V, dtype, layout, provider, device="cuda"):
+    def bench_mha(
+        BATCH,
+        HQ,
+        HK,
+        N_CTX_Q,
+        N_CTX_K,
+        D_HEAD,
+        D_HEAD_V,
+        dtype,
+        layout,
+        provider,
+        device="cuda",
+    ):
         q = torch.randn((BATCH, HQ, N_CTX_Q, D_HEAD), device=device, dtype=dtype)
         k = torch.randn((BATCH, HK, N_CTX_K, D_HEAD), device=device, dtype=dtype)
         v = torch.randn((BATCH, HK, N_CTX_K, D_HEAD_V), device=device, dtype=dtype)
-        
+
         q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
         return bench_kernel(q, k, v, args, provider)
 
     bench_mha.run(save_path=None, print_data=True)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simplified MXFP4 Attention Benchmark")
@@ -139,16 +162,28 @@ def parse_args():
     parser.add_argument("-dv", type=int, default=0, help="V head dimension")
     parser.add_argument("-dtype", default="bf16", choices=["bf16", "fp16"])
     parser.add_argument("-layout", type=str, default="bhsd", choices=["bshd", "bhsd"])
-    parser.add_argument("-captured_dir", type=str, default=None, help="Provide dir for captured inputs, for accuracy comparison.")
-    parser.add_argument("-qsmooth", action="store_true", help="Do q smoothing (Warning! Smoothing Q requires bias addition which drops the perf as of now!)")
-    parser.add_argument("-print_vgpr", action="store_true", help="Print VGPR usage of the called Triton kernels")
+    parser.add_argument(
+        "-captured_dir",
+        type=str,
+        default=None,
+        help="Provide dir for captured inputs, for accuracy comparison.",
+    )
+    parser.add_argument(
+        "-qsmooth",
+        action="store_true",
+        help="Do q smoothing (Warning! Smoothing Q requires bias addition which drops the perf as of now!)",
+    )
+    parser.add_argument(
+        "-print_vgpr",
+        action="store_true",
+        help="Print VGPR usage of the called Triton kernels",
+    )
     return parser.parse_args()
 
 
 def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
     """
     Load captured input tensors from disk.
-
     Args:
         input_dir: Directory containing captured .pt files
 
@@ -167,29 +202,33 @@ def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
     return inputs
 
 
-def test_accuracy(q,k,v,args):
+def test_accuracy(q, k, v, args):
     triton_out = fav3_sage_mxfp4_wrapper(
-            q, k, v,
-            layout=args.layout,
-            q_smooth=args.qsmooth
-        )
+        q, k, v, layout=args.layout, q_smooth=args.qsmooth
+    )
     # permute because FAv2 assumes bshd
-    if args.layout == "bhsd": 
+    if args.layout == "bhsd":
         q = q.permute(0, 2, 1, 3).contiguous()
         k = k.permute(0, 2, 1, 3).contiguous()
         v = v.permute(0, 2, 1, 3).contiguous()
 
     print("Using as ref: Triton FAv2")
-    sm_scale = q.shape[-1]**-0.5
-    ref_out = fav2_forward_func(q, k, v, dropout_p=0.0, softmax_scale=sm_scale, causal=False, return_lse=False, return_attn_probs=False)()
-    if args.layout == "bhsd": 
+    sm_scale = q.shape[-1] ** -0.5
+    ref_out = fav2_forward_func(
+        q,
+        k,
+        v,
+        dropout_p=0.0,
+        softmax_scale=sm_scale,
+        causal=False,
+        return_lse=False,
+        return_attn_probs=False,
+    )()
+    if args.layout == "bhsd":
         ref_out = ref_out.permute(0, 2, 1, 3)
 
     assert ref_out.shape == triton_out.shape
-    compare_accuracy(
-        triton_out,
-        ref_out
-    )
+    compare_accuracy(triton_out, ref_out)
 
 
 def test_accuracy_with_captured_inputs(args):
@@ -207,14 +246,15 @@ def test_accuracy_with_captured_inputs(args):
         print("q.shape: ", q.shape)
         print("k.shape: ", k.shape)
         print("v.shape: ", v.shape)
-        test_accuracy(q,k,v,args)
+        test_accuracy(q, k, v, args)
 
-def test_accuracy_with_shape( 
+
+def test_accuracy_with_shape(
     args,
     dtype=torch.bfloat16,
 ):
     torch.cuda.empty_cache()
-    torch.manual_seed(20)    
+    torch.manual_seed(20)
     q, k, v = input_helper(
         args.b,
         args.hq,
@@ -230,15 +270,17 @@ def test_accuracy_with_shape(
     print("q.shape: ", q.shape)
     print("k.shape: ", k.shape)
     print("v.shape: ", v.shape)
-    test_accuracy(q,k,v,args)
-
+    test_accuracy(q, k, v, args)
 
 
 def main():
     args = parse_args()
-    if not args.dv: args.dv = args.d
-    if not args.sk: args.sk = args.sq
-    if not args.hk: args.hk = args.hq
+    if not args.dv:
+        args.dv = args.d
+    if not args.sk:
+        args.sk = args.sq
+    if not args.hk:
+        args.hk = args.hq
     if args.captured_dir is not None:
         test_accuracy_with_captured_inputs(args)
     else:

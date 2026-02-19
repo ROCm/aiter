@@ -3,8 +3,10 @@ import torch
 import triton
 import triton.language as tl
 
+
 class DequantScaleRoundingMode(Enum):
     ROUND_RNE = 2
+
 
 @triton.jit
 def _get_max_quant_val(dtype: tl.constexpr):
@@ -16,6 +18,7 @@ def _get_max_quant_val(dtype: tl.constexpr):
         return 448.0
     else:
         tl.static_assert(False, f"Invalid {dtype=}")
+
 
 def downcast_to_mxfp_rne(
     src_tensor: torch.Tensor,
@@ -35,7 +38,9 @@ def downcast_to_mxfp_rne(
     in their respective formats.
     """
 
-    assert DEQUANT_SCALE_ROUNDING_MODE == DequantScaleRoundingMode.ROUND_RNE, f"DEQUANT_SCALE_ROUNDING_MODE should be {DequantScaleRoundingMode.ROUND_RNE}."
+    assert (
+        DEQUANT_SCALE_ROUNDING_MODE == DequantScaleRoundingMode.ROUND_RNE
+    ), f"DEQUANT_SCALE_ROUNDING_MODE should be {DequantScaleRoundingMode.ROUND_RNE}."
 
     ndim = src_tensor.ndim
     assert -ndim <= axis < ndim, f"Invalid axis {axis=}"
@@ -81,6 +86,7 @@ def downcast_to_mxfp_rne(
     out_quant_tensor = out_quant_tensor.transpose(axis, src_tensor.ndim - 1)
     out_scale = out_scale.transpose(axis, src_tensor.ndim - 1)
     return out_quant_tensor, out_scale
+
 
 @triton.jit
 def _downcast_to_mxfp(
@@ -177,6 +183,7 @@ def _downcast_to_mxfp(
     tl.store(mx_scale_ptr + mx_scale_offsets, scale_tensor, mask=full_scale_mask)
     tl.store(mx_tensor_ptr + mx_tensor_offsets, out_tensor, mask=full_mask_mxt)
 
+
 @triton.jit
 def _compute_mx_quant_and_scale_rne(
     src_tensor,
@@ -185,7 +192,7 @@ def _compute_mx_quant_and_scale_rne(
 ):
     """
     Compute MX quantization with RNE (Round to Nearest Even) rounding for the scale.
-    
+
     RNE is applied when converting max_abs to E8M0 format (nearest power of 2).
     This is equivalent to computing: scale = 2^(clip(floor(log2(RNE(max_abs(x)))), -127, 127) - 2)
     where RNE rounds to the nearest power of 2, with ties going to even exponent.
@@ -207,33 +214,33 @@ def _compute_mx_quant_and_scale_rne(
         abs_tensor, [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE, 32]
     )
     max_val = tl.max(abs_tensor, axis=2, keep_dims=True)
-    
+
     # RNE (Round to Nearest Even) rounding when converting max_abs to E8M0 format
     # E8M0 stores only exponent (no mantissa), so we round to nearest power of 2
     # Extract exponent and mantissa from float32
     max_val_bits = max_val.to(tl.uint32, bitcast=True)
     exponent = (max_val_bits >> 23) & 0xFF
     mantissa = max_val_bits & 0x7FFFFF
-    
+
     # RNE to nearest power of 2:
     # For value 2^n * (1 + m/2^23), the threshold is at m = 0.5 * 2^23 = 0x400000
     # - If mantissa < 0x400000: round to 2^n (keep exponent)
     # - If mantissa > 0x400000: round to 2^(n+1) (increment exponent)
     # - If mantissa == 0x400000: tie case, round to even exponent (RNE)
-    
+
     # Determine if we should round up
     should_round_up = (mantissa > 0x400000) | (
         (mantissa == 0x400000) & ((exponent & 1) == 1)
     )
-    
+
     rounded_exponent = tl.where(should_round_up, exponent + 1, exponent)
-    
+
     # Subtract 2 from exponent (divide by 4) to get final scale exponent
     # Clamp to valid E8M0 range [-127, 127] (exponent 0-254 in biased representation)
     scale_exponent = rounded_exponent - 2
     scale_exponent = tl.maximum(scale_exponent, 0)
     scale_exponent = tl.minimum(scale_exponent, 254)
-    
+
     # Construct the scale as a power of 2
     dequant_scale_exponent = (scale_exponent << 23) & 0x7F800000
     dequant_scale = dequant_scale_exponent.to(tl.float32, bitcast=True)
@@ -254,7 +261,7 @@ def _compute_mx_quant_and_scale_rne(
 
     # Extract the exponent part of the scales and store the result
     dequant_scale_exponent = (dequant_scale_exponent >> 23).to(tl.uint8)
-    
+
     # Convert the tensors to the mx format
     if is_fp8:
         out_tensor = quant_tensor.to(mx_tensor_dtype)

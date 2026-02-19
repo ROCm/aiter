@@ -11,10 +11,12 @@ from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
     compute_block_masking,
     compute_alibi_block,
     map_dims,
-
 )
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
-from aiter.ops.triton._triton_kernels.quant.downcast_to_mxfp_rne import downcast_to_mxfp_rne
+from aiter.ops.triton._triton_kernels.quant.downcast_to_mxfp_rne import (
+    downcast_to_mxfp_rne,
+)
+
 
 @triton.jit
 def compute_padding_info(seqlen_k, BLOCK_N: tl.constexpr):
@@ -34,7 +36,6 @@ def compute_padding_info(seqlen_k, BLOCK_N: tl.constexpr):
     else:
         n_extra_tokens = 0
     return n_extra_tokens
-
 
 
 @triton.jit
@@ -149,26 +150,39 @@ def compute_block_masking(
     )
 
 
-
-
-
 @triton.jit
 def _sage_fwd_no_mask_mxfp4(
-    acc, l_i, m_i, q,
-    k_base_ptrs, v_base_ptrs,
+    acc,
+    l_i,
+    m_i,
+    q,
+    k_base_ptrs,
+    v_base_ptrs,
     bias_base_ptrs,
-    stride_kn, stride_vk, stride_bn,
-    seqlen_k, seqlen_q,
-    offs_m, offs_d_k, offs_d_v,
-    block_min, block_max,
-    q_descale, k_descale_base_ptrs, stride_ksn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    stride_kn,
+    stride_vk,
+    stride_bn,
+    seqlen_k,
+    seqlen_q,
+    offs_m,
+    offs_d_k,
+    offs_d_v,
+    block_min,
+    block_max,
+    q_descale,
+    k_descale_base_ptrs,
+    stride_ksn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     PRE_LOAD_V: tl.constexpr,
-    PADDED_HEAD_QK: tl.constexpr, PADDED_HEAD_V: tl.constexpr,
-    ACTUAL_BLOCK_DMODEL_QK: tl.constexpr, ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
-    Q_DTYPE_STR: tl.constexpr, K_DTYPE_STR: tl.constexpr,
+    PADDED_HEAD_QK: tl.constexpr,
+    PADDED_HEAD_V: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
+    Q_DTYPE_STR: tl.constexpr,
+    K_DTYPE_STR: tl.constexpr,
     ACCUMULATOR_TYPE: tl.constexpr,
-    USE_BIAS: tl.constexpr
+    USE_BIAS: tl.constexpr,
 ):
     for start_n in range(block_min, block_max, BLOCK_N):
         k_ptrs = k_base_ptrs + start_n * stride_kn
@@ -182,7 +196,7 @@ def _sage_fwd_no_mask_mxfp4(
             k = tl.load(k_ptrs, mask=k_mask, other=0.0)
         else:
             k = tl.load(k_ptrs)
-            
+
         k_descale = tl.load(k_descale_ptrs)
 
         if PRE_LOAD_V:
@@ -194,11 +208,15 @@ def _sage_fwd_no_mask_mxfp4(
                 v = tl.load(v_ptrs)
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
-        qk = tl.dot_scaled(q, q_descale, Q_DTYPE_STR, k, k_descale, K_DTYPE_STR, fast_math=True, acc=qk)
+        qk = tl.dot_scaled(
+            q, q_descale, Q_DTYPE_STR, k, k_descale, K_DTYPE_STR, fast_math=True, acc=qk
+        )
 
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
         if USE_BIAS:
-            bias = tl.load(bias_base_ptrs + start_n * stride_bn, mask=qk_mask, other=0.0)
+            bias = tl.load(
+                bias_base_ptrs + start_n * stride_bn, mask=qk_mask, other=0.0
+            )
             qk += bias
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
@@ -207,7 +225,7 @@ def _sage_fwd_no_mask_mxfp4(
 
         alpha = tl.math.exp2(m_i - m_ij)
         acc = acc * alpha[:, None]
-        
+
         if not PRE_LOAD_V:
             # Refactored V Load (Lazy)
             if PADDED_HEAD_V:
@@ -222,22 +240,43 @@ def _sage_fwd_no_mask_mxfp4(
 
     return acc, l_i, m_i
 
+
 @triton.jit
 def _sage_fwd_mask_mxfp4(
-    acc, l_i, m_i, q,
-    k_base_ptrs, v_base_ptrs,
+    acc,
+    l_i,
+    m_i,
+    q,
+    k_base_ptrs,
+    v_base_ptrs,
     bias_base_ptrs,
-    stride_kn, stride_vk, stride_bn,
-    seqlen_k, seqlen_q,
-    offs_m, offs_n, offs_d_k, offs_d_v,
-    block_min, block_max, n_extra_tokens, q_descale, k_descale_base_ptrs, stride_ksn,
+    stride_kn,
+    stride_vk,
+    stride_bn,
+    seqlen_k,
+    seqlen_q,
+    offs_m,
+    offs_n,
+    offs_d_k,
+    offs_d_v,
+    block_min,
+    block_max,
+    n_extra_tokens,
+    q_descale,
+    k_descale_base_ptrs,
+    stride_ksn,
     IS_CAUSAL: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     PRE_LOAD_V: tl.constexpr,
-    PADDED_HEAD_QK: tl.constexpr, PADDED_HEAD_V: tl.constexpr,
-    ACTUAL_BLOCK_DMODEL_QK: tl.constexpr, ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
-    Q_DTYPE_STR: tl.constexpr, K_DTYPE_STR: tl.constexpr,
-    ACCUMULATOR_TYPE: tl.constexpr, USE_BIAS: tl.constexpr
+    PADDED_HEAD_QK: tl.constexpr,
+    PADDED_HEAD_V: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
+    Q_DTYPE_STR: tl.constexpr,
+    K_DTYPE_STR: tl.constexpr,
+    ACCUMULATOR_TYPE: tl.constexpr,
+    USE_BIAS: tl.constexpr,
 ):
     seqlen_delta_qk = seqlen_k - seqlen_q
     for start_n in range(block_min, block_max, BLOCK_N):
@@ -249,29 +288,36 @@ def _sage_fwd_mask_mxfp4(
         # Refactored K Load with mandatory boundary check + optional padding check
         k_mask = kv_offs_n[None, :] < seqlen_k
         if PADDED_HEAD_QK:
-            k_mask &= (offs_d_k[:, None] < ACTUAL_BLOCK_DMODEL_QK)
-        
+            k_mask &= offs_d_k[:, None] < ACTUAL_BLOCK_DMODEL_QK
+
         k = tl.load(k_ptrs, mask=k_mask, other=0.0)
-        k_descale = tl.load(k_descale_ptrs, mask=kv_offs_n[:, None] < seqlen_k, other=0.0)
+        k_descale = tl.load(
+            k_descale_ptrs, mask=kv_offs_n[:, None] < seqlen_k, other=0.0
+        )
 
         if PRE_LOAD_V:
             # Refactored V Load
             v_mask = kv_offs_n[:, None] < seqlen_k
             if PADDED_HEAD_V:
-                v_mask &= (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
+                v_mask &= offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
-        
+
         if (n_extra_tokens != 0) and (start_n + BLOCK_N == block_max):
             mask = (start_n + offs_n[None, :]) < seqlen_k
             qk = tl.where(mask, qk, float("-inf"))
 
-        qk = tl.dot_scaled(q, q_descale, Q_DTYPE_STR, k, k_descale, K_DTYPE_STR, fast_math=True, acc=qk)
-
+        qk = tl.dot_scaled(
+            q, q_descale, Q_DTYPE_STR, k, k_descale, K_DTYPE_STR, fast_math=True, acc=qk
+        )
 
         if IS_CAUSAL:
-            qk = tl.where(offs_m[:, None] >= (start_n + offs_n - seqlen_delta_qk)[None, :], qk, float("-inf"))
+            qk = tl.where(
+                offs_m[:, None] >= (start_n + offs_n - seqlen_delta_qk)[None, :],
+                qk,
+                float("-inf"),
+            )
 
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
         if USE_BIAS:
@@ -287,7 +333,7 @@ def _sage_fwd_mask_mxfp4(
             # Refactored V Load (Lazy)
             v_mask = kv_offs_n[:, None] < seqlen_k
             if PADDED_HEAD_V:
-                v_mask &= (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
+                v_mask &= offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
 
         l_i = l_i * alpha + l_ij
@@ -296,27 +342,59 @@ def _sage_fwd_mask_mxfp4(
 
     return acc, l_i, m_i
 
+
 @triton.jit
 def sage_fwd_mxfp4(
-    Q, K, V, bias,
-    Q_Descale, K_Descale, V_Descale,
-    stride_qsz, stride_qsh, stride_qsm,
-    stride_ksz, stride_ksh, stride_ksn,
-    stride_vsz, stride_vsh,
-    Out, 
-    stride_qz, stride_qh, stride_qm,
-    stride_kz, stride_kh, stride_kn,
-    stride_vz, stride_vh, stride_vk,
-    stride_oz, stride_oh, stride_om,
-    stride_bz, stride_bh, stride_bm, stride_bn,
-    cu_seqlens_q, cu_seqlens_k,
-    Q_DTYPE_STR: tl.constexpr, K_DTYPE_STR: tl.constexpr,
-    HQ: tl.constexpr, HK: tl.constexpr,
-    ACTUAL_BLOCK_DMODEL_QK: tl.constexpr, ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
-    MAX_SEQLENS_Q: tl.constexpr, MAX_SEQLENS_K: tl.constexpr,
-    IS_VARLEN: tl.constexpr, IS_CAUSAL: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_DMODEL_QK: tl.constexpr, BLOCK_DMODEL_V: tl.constexpr,
-    BLOCK_N: tl.constexpr, PRE_LOAD_V: tl.constexpr, USE_BIAS: tl.constexpr,
+    Q,
+    K,
+    V,
+    bias,
+    Q_Descale,
+    K_Descale,
+    V_Descale,
+    stride_qsz,
+    stride_qsh,
+    stride_qsm,
+    stride_ksz,
+    stride_ksh,
+    stride_ksn,
+    stride_vsz,
+    stride_vsh,
+    Out,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_vz,
+    stride_vh,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_bz,
+    stride_bh,
+    stride_bm,
+    stride_bn,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    Q_DTYPE_STR: tl.constexpr,
+    K_DTYPE_STR: tl.constexpr,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
+    ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
+    MAX_SEQLENS_Q: tl.constexpr,
+    MAX_SEQLENS_K: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_DMODEL_QK: tl.constexpr,
+    BLOCK_DMODEL_V: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    PRE_LOAD_V: tl.constexpr,
+    USE_BIAS: tl.constexpr,
 ):
     # Constants
     Q_HEAD_DIV: tl.constexpr = 2 if Q_DTYPE_STR == "e2m1" else 1
@@ -326,7 +404,7 @@ def sage_fwd_mxfp4(
 
     start_m, off_h_q, off_z = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     off_h_k = off_h_q // (HQ // HK)
-    
+
     PADDED_HEAD_QK: tl.constexpr = ACTUAL_BLOCK_DMODEL_QK != BLOCK_DMODEL_QK
     PADDED_HEAD_V: tl.constexpr = ACTUAL_BLOCK_DMODEL_V != BLOCK_DMODEL_V
 
@@ -342,34 +420,87 @@ def sage_fwd_mxfp4(
         seqlen_q = tl.load(cu_seqlens_q + off_z + 1) - q_start
         k_start = tl.load(cu_seqlens_k + off_z)
         seqlen_k = tl.load(cu_seqlens_k + off_z + 1) - k_start
-        if start_m * BLOCK_M >= seqlen_q: return
+        if start_m * BLOCK_M >= seqlen_q:
+            return
     else:
         q_start, k_start = 0, 0
         seqlen_q, seqlen_k = MAX_SEQLENS_Q, MAX_SEQLENS_K
 
     # Masking logic
-    mask_info = compute_block_masking(seqlen_k, seqlen_q, start_m, IS_CAUSAL, BLOCK_M, BLOCK_N)
+    mask_info = compute_block_masking(
+        seqlen_k, seqlen_q, start_m, IS_CAUSAL, BLOCK_M, BLOCK_N
+    )
     n_front_skip, n_front_masked, n_full, n_back_masked, n_extra = mask_info
 
     if (n_front_masked + n_full + n_back_masked) == 0:
-        o_ptr = Out + off_z * stride_oz + off_h_q * stride_oh + (q_start + offs_m[:, None]) * stride_om + offs_d_v[None, :]
-        tl.store(o_ptr, tl.zeros([BLOCK_M, BLOCK_DMODEL_V], dtype=Out.dtype.element_ty), mask=(offs_m[:, None] < seqlen_q))
+        o_ptr = (
+            Out
+            + off_z * stride_oz
+            + off_h_q * stride_oh
+            + (q_start + offs_m[:, None]) * stride_om
+            + offs_d_v[None, :]
+        )
+        tl.store(
+            o_ptr,
+            tl.zeros([BLOCK_M, BLOCK_DMODEL_V], dtype=Out.dtype.element_ty),
+            mask=(offs_m[:, None] < seqlen_q),
+        )
         return
 
     # Pointers
-    q_ptrs = Q + off_z * stride_qz + off_h_q * stride_qh + (q_start + offs_m[:, None]) * stride_qm + offs_d_q[None, :]
-    k_ptrs = K + off_z * stride_kz + off_h_k * stride_kh + (k_start + offs_n[None, :]) * stride_kn + offs_d_k[:, None]
-    v_ptrs = V + off_z * stride_vz + off_h_k * stride_vh + (k_start + offs_n[:, None]) * stride_vk + offs_d_v[None, :]
-    
-    qd_ptrs = Q_Descale + off_z * stride_qsz + off_h_q * stride_qsh + (q_start + offs_m[:, None]) * stride_qsm + offs_d_scale[None, :]
-    kd_ptrs = K_Descale + off_z * stride_ksz + off_h_k * stride_ksh + (k_start + offs_n[:, None]) * stride_ksn + offs_d_scale[None, :]
+    q_ptrs = (
+        Q
+        + off_z * stride_qz
+        + off_h_q * stride_qh
+        + (q_start + offs_m[:, None]) * stride_qm
+        + offs_d_q[None, :]
+    )
+    k_ptrs = (
+        K
+        + off_z * stride_kz
+        + off_h_k * stride_kh
+        + (k_start + offs_n[None, :]) * stride_kn
+        + offs_d_k[:, None]
+    )
+    v_ptrs = (
+        V
+        + off_z * stride_vz
+        + off_h_k * stride_vh
+        + (k_start + offs_n[:, None]) * stride_vk
+        + offs_d_v[None, :]
+    )
+
+    qd_ptrs = (
+        Q_Descale
+        + off_z * stride_qsz
+        + off_h_q * stride_qsh
+        + (q_start + offs_m[:, None]) * stride_qsm
+        + offs_d_scale[None, :]
+    )
+    kd_ptrs = (
+        K_Descale
+        + off_z * stride_ksz
+        + off_h_k * stride_ksh
+        + (k_start + offs_n[:, None]) * stride_ksn
+        + offs_d_scale[None, :]
+    )
     vd_ptr = V_Descale + off_z * stride_vsz + off_h_k * stride_vsh + offs_d_v
 
     q = tl.load(q_ptrs, mask=(offs_m[:, None] < seqlen_q), other=0.0)
     q_descale = tl.load(qd_ptrs, mask=(offs_m[:, None] < seqlen_q), other=0.0)
-    
+
     # Bias is delta s
-    bias_ptrs = (bias + off_z * stride_bz + off_h_q * stride_bh + start_m * stride_bm + offs_n[None, :] * stride_bn).to(tl.int64) if USE_BIAS else None
+    bias_ptrs = (
+        (
+            bias
+            + off_z * stride_bz
+            + off_h_q * stride_bh
+            + start_m * stride_bm
+            + offs_n[None, :] * stride_bn
+        ).to(tl.int64)
+        if USE_BIAS
+        else None
+    )
 
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=ACC_TYPE)
     l_i = tl.full([BLOCK_M], 1.0, dtype=ACC_TYPE)
@@ -379,28 +510,77 @@ def sage_fwd_mxfp4(
         b_min = (n_front_skip + n_front_masked) * BLOCK_N
         b_max = b_min + n_full * BLOCK_N
         acc, l_i, m_i = _sage_fwd_no_mask_mxfp4(
-            acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs,
-            stride_kn, stride_vk, stride_bn,
-            seqlen_k, seqlen_q,
-            offs_m, offs_d_k, offs_d_v,
-            b_min, b_max, q_descale, kd_ptrs, stride_ksn,
-            BLOCK_M, BLOCK_N, PRE_LOAD_V, PADDED_HEAD_QK, PADDED_HEAD_V,
-            ACTUAL_BLOCK_DMODEL_QK, ACTUAL_BLOCK_DMODEL_V,
-            Q_DTYPE_STR, K_DTYPE_STR, ACC_TYPE, USE_BIAS
+            acc,
+            l_i,
+            m_i,
+            q,
+            k_ptrs,
+            v_ptrs,
+            bias_ptrs,
+            stride_kn,
+            stride_vk,
+            stride_bn,
+            seqlen_k,
+            seqlen_q,
+            offs_m,
+            offs_d_k,
+            offs_d_v,
+            b_min,
+            b_max,
+            q_descale,
+            kd_ptrs,
+            stride_ksn,
+            BLOCK_M,
+            BLOCK_N,
+            PRE_LOAD_V,
+            PADDED_HEAD_QK,
+            PADDED_HEAD_V,
+            ACTUAL_BLOCK_DMODEL_QK,
+            ACTUAL_BLOCK_DMODEL_V,
+            Q_DTYPE_STR,
+            K_DTYPE_STR,
+            ACC_TYPE,
+            USE_BIAS,
         )
 
     if n_back_masked > 0:
         b_min = (n_front_skip + n_front_masked + n_full) * BLOCK_N
         b_max = b_min + n_back_masked * BLOCK_N
         acc, l_i, m_i = _sage_fwd_mask_mxfp4(
-            acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs,
-            stride_kn, stride_vk, stride_bn,
-            seqlen_k, seqlen_q, 
-            offs_m, offs_n, offs_d_k, offs_d_v,
-            b_min, b_max, n_extra, q_descale, kd_ptrs, stride_ksn,
-            IS_CAUSAL, BLOCK_M, BLOCK_N, PRE_LOAD_V, PADDED_HEAD_QK, PADDED_HEAD_V,
-            ACTUAL_BLOCK_DMODEL_QK, ACTUAL_BLOCK_DMODEL_V,
-            Q_DTYPE_STR, K_DTYPE_STR, ACC_TYPE, USE_BIAS
+            acc,
+            l_i,
+            m_i,
+            q,
+            k_ptrs,
+            v_ptrs,
+            bias_ptrs,
+            stride_kn,
+            stride_vk,
+            stride_bn,
+            seqlen_k,
+            seqlen_q,
+            offs_m,
+            offs_n,
+            offs_d_k,
+            offs_d_v,
+            b_min,
+            b_max,
+            n_extra,
+            q_descale,
+            kd_ptrs,
+            stride_ksn,
+            IS_CAUSAL,
+            BLOCK_M,
+            BLOCK_N,
+            PRE_LOAD_V,
+            PADDED_HEAD_QK,
+            PADDED_HEAD_V,
+            ACTUAL_BLOCK_DMODEL_QK,
+            ACTUAL_BLOCK_DMODEL_V,
+            Q_DTYPE_STR,
+            K_DTYPE_STR,
+            ACC_TYPE,
+            USE_BIAS,
         )
 
     # Epilogue
@@ -408,9 +588,16 @@ def sage_fwd_mxfp4(
     v_descale = tl.load(vd_ptr, mask=offs_d_v < ACTUAL_BLOCK_DMODEL_V, other=0.0)
     acc = acc * l_recip * v_descale
 
-    o_ptr = Out + off_z * stride_oz + off_h_q * stride_oh + (q_start + offs_m[:, None]) * stride_om + offs_d_v[None, :]
-    o_mask = (offs_m[:, None] < seqlen_q)
-    if PADDED_HEAD_V: o_mask &= (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
+    o_ptr = (
+        Out
+        + off_z * stride_oz
+        + off_h_q * stride_oh
+        + (q_start + offs_m[:, None]) * stride_om
+        + offs_d_v[None, :]
+    )
+    o_mask = offs_m[:, None] < seqlen_q
+    if PADDED_HEAD_V:
+        o_mask &= offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
     tl.store(o_ptr, acc.to(Out.dtype.element_ty), mask=o_mask)
 
 
@@ -424,7 +611,6 @@ def _get_max_quant_val(dtype: tl.constexpr):
         return 448.0
     else:
         tl.static_assert(False, f"Invalid {dtype=}")
-
 
 
 @triton.jit
@@ -523,9 +709,6 @@ def _compute_mx_quant_and_scale(
     return out_tensor, dequant_scale_exponent
 
 
-
-
-
 def sage_quant_mxfp4(
     q,
     k,
@@ -534,8 +717,6 @@ def sage_quant_mxfp4(
     layout="bshd",
     USE_RNE=False,
 ):
-    
-    
 
     if layout == "bhsd":
         b, h_qo, qo_len, head_dim = q.shape
@@ -550,35 +731,52 @@ def sage_quant_mxfp4(
         stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(2), k.stride(1)
     else:
         raise ValueError(f"Unknown tensor layout: {layout}")
-    
+
     padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
     sm_scale = head_dim**-0.5
     BLOCK_M = 128
     rotation_block_size = 32
-    
+
     def qk_quant():
-        return smooth_rotate_downcast_qk(q, k, BLOCK_SIZE_M=BLOCK_M, block_size=rotation_block_size, q_smoothing=q_smoothing, layout=layout, sm_scale=(sm_scale * 1.4426950408889634))
-    
+        return smooth_rotate_downcast_qk(
+            q,
+            k,
+            BLOCK_SIZE_M=BLOCK_M,
+            block_size=rotation_block_size,
+            q_smoothing=q_smoothing,
+            layout=layout,
+            sm_scale=(sm_scale * 1.4426950408889634),
+        )
+
     # ms = triton.testing.do_bench(qk_quant)
     # print("qk_quant (ms)", ms)
-    
-    q_fp4, q_scale, k_fp4, k_scale, delta_s = smooth_rotate_downcast_qk(q, k, BLOCK_SIZE_M=BLOCK_M, block_size=rotation_block_size, q_smoothing=q_smoothing, layout=layout, sm_scale=(sm_scale * 1.4426950408889634))
-    
-    
+
+    q_fp4, q_scale, k_fp4, k_scale, delta_s = smooth_rotate_downcast_qk(
+        q,
+        k,
+        BLOCK_SIZE_M=BLOCK_M,
+        block_size=rotation_block_size,
+        q_smoothing=q_smoothing,
+        layout=layout,
+        sm_scale=(sm_scale * 1.4426950408889634),
+    )
+
     FP8_TYPE = aiter.dtypes.fp8
     FP8_MAX = torch.finfo(FP8_TYPE).max
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
-    
+
     def v_quant(v_quant):
         BLOCK_K = 128
         K_NUM_BLKS = (kv_len + BLOCK_K - 1) // BLOCK_K
 
         # Apply K tensor smoothing following SageAttention approach
-        v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
+        v_scale = (
+            v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
+        )
 
         v_task_count = b * h_kv * K_NUM_BLKS
         grid = (v_task_count,)
-    
+
         sage_quant_v_kernel[grid](
             v,
             v_quant,
@@ -658,7 +856,6 @@ def sage_quant_v_kernel(
     tl.store(v_output_ptrs, v_quant, mask=offs_kn[:, None] < SEQLEN_K)
 
 
-
 @triton.jit
 def _rotate_quantize_qk_kernel(
     Q,
@@ -690,33 +887,31 @@ def _rotate_quantize_qk_kernel(
     d_model,
     q_smoothing: tl.constexpr,
     BLOCK_M: tl.constexpr,
-    BLOCK_R: tl.constexpr, # rotation block size
+    BLOCK_R: tl.constexpr,  # rotation block size
     D: tl.constexpr,  # D is 128
 ):
     SCALE_GROUP_SIZE: tl.constexpr = 32
-    
+
     q_pids = batch * heads_q * tl.cdiv(seqlen_q, BLOCK_M)
     pid = tl.program_id(0)
     is_q_pid = pid < q_pids
 
-
     if is_q_pid:
-        pid_b = pid % batch 
+        pid_b = pid % batch
         pid_h = pid // batch % heads_q
         pid_m = pid // (batch * heads_q)
-    else: # is k pid
+    else:  # is k pid
         pid -= q_pids
-        pid_b = pid % batch 
+        pid_b = pid % batch
         pid_h = pid // batch % heads_k
         pid_m = pid // (batch * heads_k)
-
 
     # Offsets
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, D)
 
-    offs_dq = tl.arange(0, D//2)
-    offs_ds = tl.arange(0, D//SCALE_GROUP_SIZE)
+    offs_dq = tl.arange(0, D // 2)
+    offs_ds = tl.arange(0, D // SCALE_GROUP_SIZE)
 
     # set pointers to either Q or K tensor, descale, quantized output
     # Q block shape: [BLOCK_M, D]
@@ -727,17 +922,16 @@ def _rotate_quantize_qk_kernel(
             + offs_m[:, None] * stride_qm
             + offs_d[None, :] * stride_qd
         )
-        descale_offset = Q_descale + (
-            pid_b * stride_qb
-            + pid_h * stride_qh
-            + offs_m[:, None] * stride_qm
-        ) // SCALE_GROUP_SIZE # we group 32 values together for quantization
+        descale_offset = (
+            Q_descale
+            + (pid_b * stride_qb + pid_h * stride_qh + offs_m[:, None] * stride_qm)
+            // SCALE_GROUP_SIZE
+        )  # we group 32 values together for quantization
         # Store rotated and quantized Q
-        quant_tensor_offset = Q_q + (
-            pid_b * stride_qb
-            + pid_h * stride_qh
-            + offs_m[:, None] * stride_qm
-        ) // 2
+        quant_tensor_offset = (
+            Q_q
+            + (pid_b * stride_qb + pid_h * stride_qh + offs_m[:, None] * stride_qm) // 2
+        )
         seqlen = seqlen_q
     else:
         tensor_offset = K + (
@@ -746,38 +940,34 @@ def _rotate_quantize_qk_kernel(
             + offs_m[:, None] * stride_km
             + offs_d[None, :] * stride_kd
         )
-        descale_offset = K_descale + (
-            pid_b * stride_kb
-            + pid_h * stride_kh
-            + offs_m[:, None] * stride_km
-        ) // SCALE_GROUP_SIZE # we group 32 values together for quantization
-        
-        quant_tensor_offset = K_q + (
-            pid_b * stride_kb
-            + pid_h * stride_kh
-            + offs_m[:, None] * stride_km
-        ) // 2
+        descale_offset = (
+            K_descale
+            + (pid_b * stride_kb + pid_h * stride_kh + offs_m[:, None] * stride_km)
+            // SCALE_GROUP_SIZE
+        )  # we group 32 values together for quantization
+
+        quant_tensor_offset = (
+            K_q
+            + (pid_b * stride_kb + pid_h * stride_kh + offs_m[:, None] * stride_km) // 2
+        )
         seqlen = seqlen_k
-    
+
     qk_ptr = tensor_offset
     qk_descale_ptr = descale_offset + offs_ds[None, :]
     qk_quant_ptr = quant_tensor_offset + offs_dq[None, :]
 
-
     r_ptr = (
         R + tl.arange(0, BLOCK_R)[:, None] * BLOCK_R + tl.arange(0, BLOCK_R)[None, :]
     )
-    
+
     qk_tile = tl.load(
         qk_ptr, mask=(offs_m[:, None] < seqlen) & (offs_d[None, :] < d_model), other=0.0
-    ) # (BLOCK_M, D)
-    
+    )  # (BLOCK_M, D)
+
     # Calculate mean for the block (reduction over d within the BLOCK_M)
     # q_mean shape: [B, H, Q_NUM_BLKS, D]
     if q_smoothing:
-        m_row_mean = (
-            tl.sum(qk_tile, axis=0) / BLOCK_M
-        )  # Sum over BLOCK_M -> shape [D]
+        m_row_mean = tl.sum(qk_tile, axis=0) / BLOCK_M  # Sum over BLOCK_M -> shape [D]
 
         qk_tile -= m_row_mean[None, :]
         mean_ptr = (
@@ -788,7 +978,7 @@ def _rotate_quantize_qk_kernel(
             + offs_d * stride_md
         )
         tl.store(mean_ptr, m_row_mean)
-    
+
     r_mat = tl.load(r_ptr)  # BLOCK_R x BLOCK_R
 
     shape0: tl.constexpr = BLOCK_M * D // BLOCK_R
@@ -796,26 +986,21 @@ def _rotate_quantize_qk_kernel(
     # Rotate: Q_rot = Q @ R
     qk_rot_tile = tl.dot(qk_tile.reshape((shape0, BLOCK_R)).to(r_mat.dtype), r_mat)
     qk_rot_tile = qk_rot_tile.reshape((BLOCK_M, D))
-    
+
     if is_q_pid:
         qk_rot_tile *= sm_scale
 
-    
-    qk_quant_tile, qk_descale = _compute_mx_quant_and_scale(qk_rot_tile.to(tl.float16), offs_m[:, None] < seqlen, tl.uint8)
-    
-    
-
-    tl.store(
-        qk_descale_ptr,
-        qk_descale,
-        mask=(offs_m[:, None] < seqlen)
+    qk_quant_tile, qk_descale = _compute_mx_quant_and_scale(
+        qk_rot_tile.to(tl.float16), offs_m[:, None] < seqlen, tl.uint8
     )
-    
+
+    tl.store(qk_descale_ptr, qk_descale, mask=(offs_m[:, None] < seqlen))
+
     tl.store(
         qk_quant_ptr,
         qk_quant_tile,
         mask=(offs_m[:, None] < seqlen),
-    ) 
+    )
 
 
 @triton.jit
@@ -839,11 +1024,11 @@ def _rotate_quantize_q_kernel(
     d_model,
     q_smoothing: tl.constexpr,
     BLOCK_M: tl.constexpr,
-    BLOCK_R: tl.constexpr, # rotation block size
+    BLOCK_R: tl.constexpr,  # rotation block size
     D: tl.constexpr,  # D is 128
 ):
     SCALE_GROUP_SIZE: tl.constexpr = 32
-    
+
     # Grid: (batch * n_heads, seq_len // BLOCK_M,)
     pid_bh = tl.program_id(0)
     pid_m = tl.program_id(1)
@@ -855,8 +1040,8 @@ def _rotate_quantize_q_kernel(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, D)
 
-    offs_dq = tl.arange(0, D//2)
-    offs_ds = tl.arange(0, D//SCALE_GROUP_SIZE)
+    offs_dq = tl.arange(0, D // 2)
+    offs_ds = tl.arange(0, D // SCALE_GROUP_SIZE)
 
     # Load Q block and R (Hadamard)
     # Q block shape: [BLOCK_M, D]
@@ -869,10 +1054,8 @@ def _rotate_quantize_q_kernel(
     )
 
     q_descale_offset = (
-        pid_b * stride_qb
-        + pid_h * stride_qh
-        + offs_m[:, None] * stride_qm
-    ) // SCALE_GROUP_SIZE # we group 32 values together for quantization
+        pid_b * stride_qb + pid_h * stride_qh + offs_m[:, None] * stride_qm
+    ) // SCALE_GROUP_SIZE  # we group 32 values together for quantization
 
     q_descale_ptr = Q_descale + q_descale_offset + offs_ds[None, :]
 
@@ -881,14 +1064,12 @@ def _rotate_quantize_q_kernel(
     )
     q_tile = tl.load(
         q_ptr, mask=(offs_m[:, None] < seq_len) & (offs_d[None, :] < d_model), other=0.0
-    ) # (BLOCK_M, D)
-    
+    )  # (BLOCK_M, D)
+
     # Calculate mean for the block (reduction over d within the BLOCK_M)
     # q_mean shape: [B, H, Q_NUM_BLKS, D]
     if q_smoothing:
-        m_row_mean = (
-            tl.sum(q_tile, axis=0) / BLOCK_M
-        )  # Sum over BLOCK_M -> shape [D]
+        m_row_mean = tl.sum(q_tile, axis=0) / BLOCK_M  # Sum over BLOCK_M -> shape [D]
 
         q_tile -= m_row_mean[None, :]
         mean_ptr = (
@@ -899,7 +1080,7 @@ def _rotate_quantize_q_kernel(
             + offs_d * stride_md
         )
         tl.store(mean_ptr, m_row_mean)
-    
+
     r_mat = tl.load(r_ptr)  # BLOCK_R x BLOCK_R
 
     shape0: tl.constexpr = BLOCK_M * D // BLOCK_R
@@ -907,35 +1088,28 @@ def _rotate_quantize_q_kernel(
     # Rotate: Q_rot = Q @ R
     q_rot_tile = tl.dot(q_tile.reshape((shape0, BLOCK_R)).to(r_mat.dtype), r_mat)
     q_rot_tile = q_rot_tile.reshape((BLOCK_M, D))
-    
+
     if sm_scale is not None:
         q_rot_tile *= sm_scale
 
-    
-    q_quant_tile, q_descale = _compute_mx_quant_and_scale(q_rot_tile.to(tl.float16), offs_m[:, None] < seq_len, tl.uint8)
-    
+    q_quant_tile, q_descale = _compute_mx_quant_and_scale(
+        q_rot_tile.to(tl.float16), offs_m[:, None] < seq_len, tl.uint8
+    )
+
     # Store rotated and quantized Q
     q_quant_offset = (
-        pid_b * stride_qb
-        + pid_h * stride_qh
-        + offs_m[:, None] * stride_qm
+        pid_b * stride_qb + pid_h * stride_qh + offs_m[:, None] * stride_qm
     ) // 2
 
     q_quant_ptr = Q_q + q_quant_offset + offs_dq[None, :]
 
-    tl.store(
-        q_descale_ptr,
-        q_descale,
-        mask=(offs_m[:, None] < seq_len)
-    )
-    
+    tl.store(q_descale_ptr, q_descale, mask=(offs_m[:, None] < seq_len))
+
     tl.store(
         q_quant_ptr,
         q_quant_tile,
         mask=(offs_m[:, None] < seq_len),
-    ) 
-
-
+    )
 
 
 @triton.jit
@@ -955,9 +1129,9 @@ def _rotate_quantize_k_kernel(
     BLOCK_R: tl.constexpr,
     D: tl.constexpr,
 ):
-    
+
     SCALE_GROUP_SIZE: tl.constexpr = 32
-    
+
     pid_bh = tl.program_id(0)
     pid_n = tl.program_id(1)
 
@@ -967,8 +1141,8 @@ def _rotate_quantize_k_kernel(
     offs_n = pid_n * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, D)
 
-    offs_dq = tl.arange(0, D//2)
-    offs_ds = tl.arange(0, D//SCALE_GROUP_SIZE)
+    offs_dq = tl.arange(0, D // 2)
+    offs_ds = tl.arange(0, D // SCALE_GROUP_SIZE)
 
     # Load K block and R
     k_ptr = (
@@ -983,13 +1157,11 @@ def _rotate_quantize_k_kernel(
     )
 
     k_descale_offset = (
-        pid_b * stride_kb
-        + pid_h * stride_kh
-        + offs_n[:, None] * stride_kn
-    ) // SCALE_GROUP_SIZE # we group 32 values together for quantization
+        pid_b * stride_kb + pid_h * stride_kh + offs_n[:, None] * stride_kn
+    ) // SCALE_GROUP_SIZE  # we group 32 values together for quantization
 
     k_descale_ptr = K_descale + k_descale_offset + offs_ds[None, :]
-    
+
     # load k tile
     k_tile = tl.load(
         k_ptr, mask=(offs_n[:, None] < seq_k) & (offs_d[None, :] < d_model), other=0.0
@@ -1000,21 +1172,17 @@ def _rotate_quantize_k_kernel(
     k_rot_tile = tl.dot(k_tile.reshape((shape0, BLOCK_R)), r_mat)
     k_rot_tile = k_rot_tile.reshape((BLOCK_M, D))
 
-    k_quant_tile, k_descale = _compute_mx_quant_and_scale(k_rot_tile.to(tl.float16), offs_n[:, None] < seq_k, tl.uint8)
+    k_quant_tile, k_descale = _compute_mx_quant_and_scale(
+        k_rot_tile.to(tl.float16), offs_n[:, None] < seq_k, tl.uint8
+    )
     # Store rotated and quantized Q
     k_quant_offset = (
-        pid_b * stride_kb
-        + pid_h * stride_kh
-        + offs_n[:, None] * stride_kn
+        pid_b * stride_kb + pid_h * stride_kh + offs_n[:, None] * stride_kn
     ) // 2
     k_quant_ptr = K_q + k_quant_offset + offs_dq[None, :]
 
-    tl.store(
-        k_descale_ptr,
-        k_descale,
-        mask=(offs_n[:, None] < seq_k)
-    )
-    
+    tl.store(k_descale_ptr, k_descale, mask=(offs_n[:, None] < seq_k))
+
     tl.store(
         k_quant_ptr,
         k_quant_tile,
@@ -1094,19 +1262,6 @@ def _compute_delta_s_kernel(
     tl.store(s_ptr, acc, mask=offs_n < seq_k)
 
 
-def create_random_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
-    # 1. Generate the deterministic Hadamard matrix (H)
-    H = create_hadamard_matrix(block_size, dtype=dtype) / (block_size**0.5)
-    # 2. Create the random diagonal matrix D (represented as a vector for efficiency)
-    # This generates random +1 or -1 for each column
-    # compute the randomized Hadamard
-    d = torch.randint(0, 2, (block_size,), device=device, dtype=dtype) * 2 - 1
-    # 3. Compute the randomized Hadamard H_tilde = H @ diag(d)
-    # Multiplying H by a diagonal matrix on the right scales the columns
-    H_tilde = H * d[None, :]
-    return H_tilde
-
-
 def create_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
     """
     Create an orthogonal Hadamard matrix of size block_size x block_size.
@@ -1156,51 +1311,1114 @@ def create_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
 
 
 def return_static_random_hadamard(device):
-    return torch.tensor([
-        [-1, -1,  1, -1, -1,  1, -1,  1, -1, -1,  1,  1,  1,  1,  1,  1, -1, -1, -1, -1, -1, -1,  1, -1, -1,  1, -1, -1,  1,  1,  1,  1],
-        [ 1, -1,  1, -1,  1, -1, -1,  1,  1, -1,  1, -1, -1, -1,  1, -1, -1,  1, -1,  1, -1,  1,  1, -1, -1,  1,  1,  1, -1, -1,  1, -1],
-        [-1, -1,  1,  1,  1, -1,  1,  1,  1,  1,  1,  1, -1,  1, -1,  1,  1,  1, -1, -1, -1, -1,  1,  1, -1, -1,  1,  1,  1, -1, -1,  1],
-        [-1, -1,  1, -1, -1, -1, -1, -1,  1,  1, -1, -1, -1, -1, -1, -1,  1, -1,  1, -1,  1, -1,  1,  1, -1,  1, -1,  1,  1,  1,  1, -1],
-        [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1,  1,  1, -1, -1,  1,  1,  1, -1, -1, -1,  1,  1,  1,  1,  1, -1,  1, -1, -1, -1, -1, -1],
-        [ 1, -1, -1, -1,  1, -1, -1,  1, -1,  1, -1,  1, -1, -1, -1,  1, -1,  1,  1,  1, -1, -1,  1, -1,  1, -1, -1, -1,  1,  1, -1, -1],
-        [ 1,  1, -1,  1, -1,  1, -1,  1, -1, -1,  1,  1, -1,  1, -1, -1, -1,  1,  1, -1,  1,  1,  1,  1, -1, -1, -1,  1,  1, -1,  1, -1],
-        [-1,  1, -1,  1, -1, -1,  1,  1,  1, -1,  1, -1, -1, -1,  1, -1, -1, -1, -1, -1, -1, -1, -1, -1,  1, -1, -1,  1,  1,  1, -1, -1],
-        [-1,  1, -1, -1,  1,  1, -1,  1, -1,  1,  1, -1,  1, -1, -1, -1,  1,  1, -1, -1, -1, -1, -1,  1,  1,  1,  1, -1,  1, -1,  1, -1],
-        [ 1, -1, -1, -1,  1,  1, -1, -1,  1, -1,  1, -1,  1,  1,  1, -1,  1,  1, -1,  1,  1, -1,  1,  1,  1, -1, -1,  1,  1,  1, -1,  1],
-        [ 1,  1,  1,  1, -1, -1, -1, -1, -1, -1,  1,  1,  1, -1, -1, -1,  1,  1,  1, -1, -1, -1,  1, -1,  1,  1,  1,  1, -1,  1, -1,  1],
-        [ 1,  1,  1,  1,  1, -1,  1, -1, -1, -1,  1,  1, -1, -1,  1,  1,  1,  1, -1,  1,  1, -1, -1,  1, -1,  1, -1, -1,  1,  1,  1, -1],
-        [-1,  1,  1, -1, -1,  1,  1,  1,  1, -1, -1,  1, -1, -1, -1, -1,  1,  1, -1,  1,  1,  1,  1, -1,  1, -1,  1, -1,  1,  1,  1,  1],
-        [ 1, -1, -1,  1, -1,  1,  1,  1,  1, -1, -1,  1,  1, -1,  1,  1,  1, -1,  1,  1, -1, -1,  1,  1,  1,  1,  1,  1,  1, -1,  1, -1],
-        [-1, -1,  1,  1, -1, -1, -1,  1,  1,  1,  1,  1,  1,  1,  1, -1,  1,  1,  1,  1,  1, -1, -1, -1,  1, -1, -1, -1, -1, -1,  1, -1],
-        [-1,  1, -1,  1,  1, -1, -1,  1,  1, -1,  1, -1,  1, -1, -1,  1, -1, -1,  1,  1,  1, -1,  1,  1, -1, -1,  1, -1, -1,  1,  1,  1],
-        [ 1,  1,  1, -1,  1, -1,  1,  1, -1, -1, -1, -1,  1,  1, -1,  1,  1, -1, -1, -1,  1, -1,  1, -1,  1, -1, -1,  1, -1, -1,  1, -1],
-        [-1,  1,  1, -1, -1, -1,  1, -1, -1,  1,  1, -1,  1,  1,  1,  1, -1,  1,  1,  1, -1,  1,  1,  1,  1, -1,  1,  1,  1,  1,  1, -1],
-        [ 1,  1,  1, -1, -1, -1, -1,  1, -1, -1, -1, -1, -1,  1,  1, -1,  1, -1,  1,  1, -1, -1, -1,  1, -1, -1,  1, -1,  1, -1, -1,  1],
-        [ 1,  1,  1, -1, -1,  1, -1, -1,  1,  1,  1,  1,  1, -1, -1,  1, -1, -1, -1,  1,  1, -1, -1, -1, -1, -1,  1,  1,  1, -1, -1, -1],
-        [-1,  1,  1, -1,  1,  1, -1,  1,  1, -1, -1,  1,  1, -1,  1,  1,  1,  1,  1, -1, -1,  1, -1,  1, -1, -1, -1,  1, -1,  1, -1, -1],
-        [ 1,  1,  1,  1, -1,  1, -1,  1,  1,  1, -1, -1, -1,  1,  1,  1, -1,  1, -1, -1,  1, -1,  1,  1,  1,  1,  1, -1, -1,  1, -1, -1],
-        [ 1, -1,  1, -1, -1, -1,  1,  1,  1, -1,  1, -1,  1, -1, -1,  1, -1,  1,  1, -1,  1,  1, -1,  1,  1,  1, -1, -1,  1, -1, -1,  1],
-        [-1,  1, -1, -1, -1, -1,  1, -1,  1, -1, -1,  1,  1,  1, -1, -1, -1,  1, -1,  1, -1, -1,  1,  1, -1,  1, -1, -1, -1, -1, -1, -1],
-        [-1,  1,  1,  1,  1, -1, -1,  1, -1,  1, -1,  1,  1, -1,  1, -1, -1, -1, -1,  1,  1,  1,  1,  1,  1,  1, -1,  1,  1, -1, -1,  1],
-        [-1, -1,  1,  1,  1,  1,  1, -1, -1, -1, -1, -1,  1, -1,  1, -1, -1,  1,  1, -1,  1, -1,  1, -1, -1, -1,  1, -1,  1, -1, -1, -1],
-        [ 1, -1, -1, -1, -1, -1,  1,  1, -1,  1, -1,  1,  1, -1,  1, -1, -1,  1, -1, -1,  1, -1, -1,  1, -1, -1,  1,  1, -1,  1,  1,  1],
-        [ 1, -1,  1,  1,  1, -1, -1, -1,  1, -1, -1,  1,  1,  1, -1, -1, -1, -1, -1, -1, -1,  1, -1,  1,  1, -1,  1, -1,  1,  1,  1, -1],
-        [-1, -1,  1,  1, -1,  1, -1, -1, -1, -1, -1, -1, -1, -1, -1,  1, -1,  1, -1,  1, -1, -1, -1,  1,  1, -1, -1,  1, -1, -1,  1,  1],
-        [-1, -1, -1,  1, -1, -1, -1,  1, -1, -1, -1, -1,  1,  1, -1,  1,  1,  1, -1,  1,  1,  1, -1, -1, -1,  1,  1,  1,  1,  1, -1, -1],
-        [ 1, -1,  1,  1, -1,  1,  1,  1, -1,  1,  1, -1,  1, -1, -1, -1,  1, -1, -1,  1, -1,  1,  1,  1, -1, -1, -1, -1, -1,  1, -1, -1],
-        [ 1,  1, -1,  1, -1, -1, -1, -1,  1,  1, -1, -1,  1, -1,  1,  1,  1,  1, -1, -1, -1,  1,  1, -1, -1, -1, -1, -1,  1, -1,  1,  1],
-    ], dtype=torch.bfloat16, device=device)
+    return torch.tensor(
+        [
+            [
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+            ],
+            [
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+            ],
+            [
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+            ],
+            [
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+            ],
+            [
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+            ],
+            [
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+            ],
+            [
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+            ],
+            [
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+            ],
+            [
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+            ],
+            [
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+            ],
+            [
+                1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+            ],
+            [
+                1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+            ],
+            [
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+            ],
+            [
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+            ],
+            [
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+            ],
+            [
+                -1,
+                1,
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+            ],
+            [
+                1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+            ],
+            [
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+            ],
+            [
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+            ],
+            [
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+            ],
+            [
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+            ],
+            [
+                1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+            ],
+            [
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+            ],
+            [
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+            ],
+            [
+                -1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+            ],
+            [
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+            ],
+            [
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+            ],
+            [
+                1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+            ],
+            [
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                1,
+            ],
+            [
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+            ],
+            [
+                1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                -1,
+            ],
+            [
+                1,
+                1,
+                -1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                1,
+                1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                1,
+                -1,
+                1,
+                1,
+            ],
+        ],
+        dtype=torch.bfloat16,
+        device=device,
+    )
 
 
-def smooth_rotate_downcast_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing=False, sm_scale=None, layout="bhsd"):
-    # Generate Hadamard Matrix R (Rank 32)
-    # TODO we might want to manually define this matrix
-    # def hadamard():
-    #     return return_static_random_hadamard(q.device) / (block_size**0.5)
-    # ms = triton.testing.do_bench(hadamard)
-    # print("hadamard (ms)", ms)
+def smooth_rotate_downcast_qk(
+    q,
+    k,
+    BLOCK_SIZE_M=256,
+    block_size=32,
+    q_smoothing=False,
+    sm_scale=None,
+    layout="bhsd",
+):
+
     R = return_static_random_hadamard(q.device) / (block_size**0.5)
-    # R = create_random_hadamard_matrix(block_size, dtype=q.dtype)
+
     bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
 
     # shapes
@@ -1210,9 +2428,10 @@ def smooth_rotate_downcast_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing
     Q_NUM_BLKS = (s_q + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
     K_NUM_BLKS = (s_k + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
 
-    # TODO check the dtypes for scales
     if q_smoothing:
-        q_mean = torch.empty((b, h_q, Q_NUM_BLKS, d), dtype=torch.float32, device=q.device)
+        q_mean = torch.empty(
+            (b, h_q, Q_NUM_BLKS, d), dtype=torch.float32, device=q.device
+        )
         delta_s = torch.empty(
             (b, h_q, Q_NUM_BLKS, s_k), dtype=torch.float32, device=q.device
         )
@@ -1223,12 +2442,14 @@ def smooth_rotate_downcast_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing
     stride_qb, stride_qm, stride_qh, stride_qd = map_dims(q.stride(), bshd)
     stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k.stride(), bshd)
 
-    
-    Q_q = torch.empty((*q.shape[:-1], d//2), dtype=torch.uint8, device=q.device)
-    Q_descale = torch.empty((*q.shape[:-1], d//32), dtype=torch.uint8, device=q.device)
-    K_q = torch.empty((*k.shape[:-1], d//2), dtype=torch.uint8, device=k.device)
-    K_descale = torch.empty((*k.shape[:-1], d//32), dtype=torch.uint8, device=k.device)
-
+    Q_q = torch.empty((*q.shape[:-1], d // 2), dtype=torch.uint8, device=q.device)
+    Q_descale = torch.empty(
+        (*q.shape[:-1], d // 32), dtype=torch.uint8, device=q.device
+    )
+    K_q = torch.empty((*k.shape[:-1], d // 2), dtype=torch.uint8, device=k.device)
+    K_descale = torch.empty(
+        (*k.shape[:-1], d // 32), dtype=torch.uint8, device=k.device
+    )
 
     grid = (b * (h_q * Q_NUM_BLKS + h_k * K_NUM_BLKS),)
     _rotate_quantize_qk_kernel[grid](
@@ -1262,57 +2483,8 @@ def smooth_rotate_downcast_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing
         q_smoothing=q_smoothing,
         BLOCK_M=BLOCK_SIZE_M,
         BLOCK_R=block_size,
-        D=d
+        D=d,
     )
-
-
-    # _rotate_quantize_q_kernel[grid_q](
-    #     q,
-    #     Q_q,
-    #     Q_descale,
-    #     q_mean,
-    #     R,
-    #     sm_scale,
-    #     stride_qb,
-    #     stride_qh,
-    #     stride_qm,
-    #     stride_qd,
-    #     q_mean.stride(0) if q_smoothing else None,
-    #     q_mean.stride(1) if q_smoothing else None,
-    #     q_mean.stride(2) if q_smoothing else None,
-    #     q_mean.stride(3) if q_smoothing else None,
-    #     h_q,
-    #     s_q,
-    #     d,
-    #     q_smoothing=q_smoothing,
-    #     BLOCK_M=BLOCK_SIZE_M,
-    #     BLOCK_R=block_size,
-    #     D=d
-    # )
-
-    # # 2. Rotate K
-    # grid_k = (b * h_k, K_NUM_BLKS)
-
-    
-    # _rotate_quantize_k_kernel[grid_k](
-    #     k,
-    #     K_q,
-    #     K_descale,
-    #     R,
-    #     stride_kb,
-    #     stride_kh,
-    #     stride_kn,
-    #     stride_kd,
-    #     h_k,
-    #     s_k,
-    #     d,
-    #     BLOCK_M=BLOCK_SIZE_M,
-    #     BLOCK_R=block_size,
-    #     D=d,
-    # )
-
-    # smooth k after rotation
-    # K_rot = K_rot - K_rot.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
 
     if q_smoothing:
         # 3. Compute Smoothing Delta S
