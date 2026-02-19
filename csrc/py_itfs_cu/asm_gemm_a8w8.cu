@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
 #include "asm_i8gemm_configs.hpp"
 #include "py_itfs_common.h"
@@ -257,8 +257,8 @@ torch::Tensor gemm_a8w8_asm(torch::Tensor& A,       // A:[M, K] i8
             //        k_per_split,
             //        k_per_split_aligned);
             args.ks = selectedksplit;
-            // if(selectedksplit > 1)
-            //     out.zero_();
+            if(selectedksplit > 1)
+                out.zero_();
         }
         gdx         = gdx * selectedksplit;
         auto result = impl_ptr_map.emplace(name, nullptr);
