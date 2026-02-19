@@ -7,6 +7,7 @@ import sys
 
 from setuptools import Distribution, setup
 from setuptools.command.build_ext import build_ext
+from setuptools.command.build_py import build_py
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 PACKAGE_NAME = "amd-aiter"
@@ -58,6 +59,57 @@ else:
 shutil.copytree("hsa", "aiter_meta/hsa")
 shutil.copytree("gradlib", "aiter_meta/gradlib")
 shutil.copytree("csrc", "aiter_meta/csrc")
+
+
+def _run_triton_prebuild():
+    """Cross-compile Triton kernels for target architectures.
+
+    Uses a stub 'aiter' module in sys.modules so prebuild_triton can be
+    imported without triggering aiter/__init__.py (which imports JIT C++
+    extensions not yet built at this point).
+    """
+    import types
+
+    saved_aiter = sys.modules.get("aiter")
+    stub = types.ModuleType("aiter")
+    stub.__path__ = [os.path.join(this_dir, "aiter")]
+    stub.__package__ = "aiter"
+    sys.modules["aiter"] = stub
+
+    try:
+        from aiter.prebuild_triton.warmup import prebuild_triton_kernels
+
+        triton_cache_dir = os.path.join(this_dir, "aiter", "prebuild_triton_cache")
+        triton_archs = [a.strip() for a in PREBUILD_TRITON_ARCHS.split(",")]
+        print(f"[aiter] Precompiling Triton kernels for: {', '.join(triton_archs)}")
+        prebuild_triton_kernels(
+            cache_dir=triton_cache_dir,
+            archs=triton_archs,
+        )
+    finally:
+        # Restore original aiter module (or remove stub)
+        if saved_aiter is not None:
+            sys.modules["aiter"] = saved_aiter
+        else:
+            for key in list(sys.modules):
+                if key == "aiter" or key.startswith("aiter.prebuild_triton"):
+                    del sys.modules[key]
+
+
+class TritonPrebuildPy(build_py):
+    """Custom build_py that runs Triton precompilation before collecting files.
+
+    This ensures prebuild_triton_cache/ exists when build_py discovers
+    package data, so the compiled .hsaco binaries are included in the wheel.
+    """
+
+    def run(self):
+        if PREBUILD_TRITON:
+            try:
+                _run_triton_prebuild()
+            except Exception as e:
+                print(f"[aiter] Warning: Triton precompilation failed: {e}")
+        super().run()
 
 
 class NinjaBuildExtension(build_ext):
@@ -264,45 +316,6 @@ class NinjaBuildExtension(build_ext):
                 with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
                     list(executor.map(build_one_module, all_opts_args_build))
 
-        # Triton kernel precompilation (cross-compile, no GPU required)
-        # NOTE: We register a stub 'aiter' package in sys.modules so the
-        # prebuild_triton subpackage can be imported without triggering
-        # aiter/__init__.py (which imports JIT C++ extensions not yet built).
-        if PREBUILD_TRITON:
-            try:
-                import types
-
-                saved_aiter = sys.modules.get("aiter")
-                stub = types.ModuleType("aiter")
-                stub.__path__ = [os.path.join(this_dir, "aiter")]
-                stub.__package__ = "aiter"
-                sys.modules["aiter"] = stub
-
-                from aiter.prebuild_triton.warmup import prebuild_triton_kernels
-
-                triton_cache_dir = os.path.join(
-                    this_dir, "aiter", "prebuild_triton_cache"
-                )
-                triton_archs = [a.strip() for a in PREBUILD_TRITON_ARCHS.split(",")]
-                print(
-                    f"[aiter] Precompiling Triton kernels for: "
-                    f"{', '.join(triton_archs)}"
-                )
-                prebuild_triton_kernels(
-                    cache_dir=triton_cache_dir,
-                    archs=triton_archs,
-                )
-
-                # Restore original aiter module (or remove stub)
-                if saved_aiter is not None:
-                    sys.modules["aiter"] = saved_aiter
-                else:
-                    for key in list(sys.modules):
-                        if key == "aiter" or key.startswith("aiter.prebuild_triton"):
-                            del sys.modules[key]
-            except Exception as e:
-                print(f"[aiter] Warning: Triton precompilation failed: {e}")
-
         # Set MAX_JOBS for ninja
         max_jobs_env = os.environ.get("MAX_JOBS")
         if max_jobs_env is None:
@@ -348,7 +361,7 @@ setup(
         "License :: OSI Approved :: BSD License",
         "Operating System :: Unix",
     ],
-    cmdclass={"build_ext": NinjaBuildExtension},
+    cmdclass={"build_py": TritonPrebuildPy, "build_ext": NinjaBuildExtension},
     python_requires=">=3.8",
     install_requires=[
         "pybind11>=3.0.1",

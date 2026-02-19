@@ -161,14 +161,23 @@ def prebuild_triton_kernels(cache_dir, archs=None, max_workers=4, verbose=True):
             f"{total_failed} failed across {len(archs)} arch(es)"
         )
 
-    # Count .hsaco files
+    # Remove intermediate IR files to keep only .hsaco + .json (runtime needs)
+    _KEEP_EXTENSIONS = {".hsaco", ".json"}
+    removed_count = 0
     hsaco_count = 0
     for root, dirs, files in os.walk(cache_dir):
         for f in files:
-            if f.endswith(".hsaco"):
+            ext = os.path.splitext(f)[1]
+            if ext == ".hsaco":
                 hsaco_count += 1
+            if ext not in _KEEP_EXTENSIONS:
+                os.remove(os.path.join(root, f))
+                removed_count += 1
     if verbose:
-        print(f"[prebuild_triton] Cache contains {hsaco_count} .hsaco files")
+        print(
+            f"[prebuild_triton] Cache contains {hsaco_count} .hsaco files "
+            f"({removed_count} intermediate IR files removed)"
+        )
 
     return total_compiled, total_failed
 
