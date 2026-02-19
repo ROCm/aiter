@@ -1,0 +1,44 @@
+{
+  "B32E8": {
+    "BLOCK_M":8,
+    "BLOCK_N":128,
+    "num_warps":8,
+    "num_stages":2
+  },
+  "B32E16": {
+    "BLOCK_M":8,
+    "BLOCK_N":128,
+    "num_warps":8,
+    "num_stages":2
+  },
+  "B128E8": {
+    "BLOCK_M":8,
+    "BLOCK_N":256,
+    "num_warps":4,
+    "num_stages":3
+  },
+  "B128E16": {
+    "BLOCK_M":8,
+    "BLOCK_N":256,
+    "num_warps":4,
+    "num_stages":3
+  },
+  "B1E8": {
+    "BLOCK_M":8,
+    "BLOCK_N":64,
+    "num_warps":2,
+    "num_stages":3
+  },
+  "B1E16": {
+    "BLOCK_M":8,
+    "BLOCK_N":64,
+    "num_warps":2,
+    "num_stages":2
+  },
+  "default": {
+    "BLOCK_M":8,
+    "BLOCK_N":128,
+    "num_warps":8,
+    "num_stages":2
+  }
+}
