@@ -8,8 +8,6 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.common import (
 
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
-    compute_block_masking,
-    compute_alibi_block,
     map_dims,
 )
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
@@ -613,13 +611,20 @@ def _get_max_quant_val(dtype: tl.constexpr):
         tl.static_assert(False, f"Invalid {dtype=}")
 
 
+
 @triton.jit
 def _compute_mx_quant_and_scale(
     src_tensor,
     valid_src_mask,
     mx_tensor_dtype: tl.constexpr,
-    DEQUANT_SCALE_ROUNDING_MODE: tl.constexpr = 0,
 ):
+    """
+    Compute MX quantization with RNE (Round to Nearest Even) rounding for the scale.
+
+    RNE is applied when converting max_abs to E8M0 format (nearest power of 2).
+    This is equivalent to computing: scale = 2^(clip(floor(log2(RNE(max_abs(x)))), -127, 127) - 2)
+    where RNE rounds to the nearest power of 2, with ties going to even exponent.
+    """
     is_fp8: tl.constexpr = (
         mx_tensor_dtype == tl.float8e4nv or mx_tensor_dtype == tl.float8e5
     )
@@ -627,7 +632,7 @@ def _compute_mx_quant_and_scale(
     BLOCK_SIZE_QUANT_DIM: tl.constexpr = src_tensor.shape[1]
     BLOCK_SIZE_QUANT_MX_SCALE: tl.constexpr = src_tensor.shape[1] // 32
 
-    # Explicit cast to fp32 since most ops are not supported on bfloat16. We avoid needless conversions to and from bf16
+    # Explicit cast to fp32 since most ops are not supported on bfloat16
     f32_tensor = src_tensor.to(tl.float32)
     abs_tensor = tl.abs(f32_tensor)
     abs_tensor = tl.where(
@@ -637,23 +642,37 @@ def _compute_mx_quant_and_scale(
         abs_tensor, [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE, 32]
     )
     max_val = tl.max(abs_tensor, axis=2, keep_dims=True)
-    dequant_scale = max_val / _get_max_quant_val(mx_tensor_dtype)
-    if DEQUANT_SCALE_ROUNDING_MODE == 0:
-        # DequantScaleRoundingMode.ROUND_UP
-        # compute 2 ** ceil(log2(dequant_scale))
-        # Adding 0x007FFFFF adds exponent by 1 unless mantissa is all zeros
-        # A corner case: exponent is 0xFF that will overflow but that's already
-        # NaN so assume we don't care.
-        dequant_scale_exponent = (
-            dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF
-        ) & 0x7F800000
-    else:
-        # DequantScaleRoundingMode.ROUND_DOWN
-        # compute 2 ** floor(log2(dequant_scale))
-        assert DEQUANT_SCALE_ROUNDING_MODE == 1
-        dequant_scale_exponent = dequant_scale.to(tl.uint32, bitcast=True) & 0x7F800000
-    dequant_scale_rounded = dequant_scale_exponent.to(tl.float32, bitcast=True)
-    quant_scale = tl.where(dequant_scale_rounded == 0, 0, 1.0 / dequant_scale_rounded)
+
+    # RNE (Round to Nearest Even) rounding when converting max_abs to E8M0 format
+    # E8M0 stores only exponent (no mantissa), so we round to nearest power of 2
+    # Extract exponent and mantissa from float32
+    max_val_bits = max_val.to(tl.uint32, bitcast=True)
+    exponent = (max_val_bits >> 23) & 0xFF
+    mantissa = max_val_bits & 0x7FFFFF
+
+    # RNE to nearest power of 2:
+    # For value 2^n * (1 + m/2^23), the threshold is at m = 0.5 * 2^23 = 0x400000
+    # - If mantissa < 0x400000: round to 2^n (keep exponent)
+    # - If mantissa > 0x400000: round to 2^(n+1) (increment exponent)
+    # - If mantissa == 0x400000: tie case, round to even exponent (RNE)
+
+    # Determine if we should round up
+    should_round_up = (mantissa > 0x400000) | (
+        (mantissa == 0x400000) & ((exponent & 1) == 1)
+    )
+
+    rounded_exponent = tl.where(should_round_up, exponent + 1, exponent)
+
+    # Subtract 2 from exponent (divide by 4) to get final scale exponent
+    # Clamp to valid E8M0 range [-127, 127] (exponent 0-254 in biased representation)
+    scale_exponent = rounded_exponent - 2
+    scale_exponent = tl.maximum(scale_exponent, 0)
+    scale_exponent = tl.minimum(scale_exponent, 254)
+
+    # Construct the scale as a power of 2
+    dequant_scale_exponent = (scale_exponent << 23) & 0x7F800000
+    dequant_scale = dequant_scale_exponent.to(tl.float32, bitcast=True)
+    quant_scale = tl.where(dequant_scale == 0, 0, 1.0 / dequant_scale)
 
     f32_tensor = tl.reshape(
         f32_tensor, [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE, 32]
@@ -662,15 +681,16 @@ def _compute_mx_quant_and_scale(
 
     # Reshape the tensors after scaling
     quant_tensor = quant_tensor.reshape([BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_DIM])
-    # Set the invalid portions of the tensor to 0. This will ensure that any padding tensors are 0 in the mx format.
+    # Set the invalid portions of the tensor to 0
     quant_tensor = tl.where(valid_src_mask, quant_tensor, 0)
     dequant_scale_exponent = dequant_scale_exponent.reshape(
         [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE]
     )
 
-    # First, we simply extract the exponent part of the scales and store the result
+    # Extract the exponent part of the scales and store the result
     dequant_scale_exponent = (dequant_scale_exponent >> 23).to(tl.uint8)
-    # Now we must convert the tensors to the mx format.
+
+    # Convert the tensors to the mx format
     if is_fp8:
         out_tensor = quant_tensor.to(mx_tensor_dtype)
     else:
@@ -707,6 +727,7 @@ def _compute_mx_quant_and_scale(
         out_tensor = evens | (odds << 4)
 
     return out_tensor, dequant_scale_exponent
+
 
 
 def sage_quant_mxfp4(
