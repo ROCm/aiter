@@ -719,7 +719,6 @@ def sage_quant_mxfp4(
     v,
     q_smoothing=False,
     layout="bshd",
-    USE_RNE=False,
 ):
 
     if layout == "bhsd":
@@ -736,24 +735,10 @@ def sage_quant_mxfp4(
     else:
         raise ValueError(f"Unknown tensor layout: {layout}")
 
-    padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
+    # padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
     sm_scale = head_dim**-0.5
     BLOCK_M = 128
     rotation_block_size = 32
-
-    def qk_quant():
-        return smooth_rotate_downcast_qk(
-            q,
-            k,
-            BLOCK_SIZE_M=BLOCK_M,
-            block_size=rotation_block_size,
-            q_smoothing=q_smoothing,
-            layout=layout,
-            sm_scale=(sm_scale * 1.4426950408889634),
-        )
-
-    # ms = triton.testing.do_bench(qk_quant)
-    # print("qk_quant (ms)", ms)
 
     q_fp4, q_scale, k_fp4, k_scale, delta_s = smooth_rotate_downcast_qk(
         q,
@@ -769,47 +754,35 @@ def sage_quant_mxfp4(
     FP8_MAX = torch.finfo(FP8_TYPE).max
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
 
-    def v_quant(v_quant):
-        BLOCK_K = 128
-        K_NUM_BLKS = (kv_len + BLOCK_K - 1) // BLOCK_K
+    BLOCK_K = 128
+    K_NUM_BLKS = (kv_len + BLOCK_K - 1) // BLOCK_K
 
-        # Apply K tensor smoothing following SageAttention approach
-        v_scale = (
-            v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
-        )
+    # Apply K tensor smoothing following SageAttention approach
+    v_scale = (
+        v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
+    )
 
-        v_task_count = b * h_kv * K_NUM_BLKS
-        grid = (v_task_count,)
+    v_task_count = b * h_kv * K_NUM_BLKS
+    grid = (v_task_count,)
 
-        sage_quant_v_kernel[grid](
-            v,
-            v_quant,
-            v_scale,
-            stride_bz_k,
-            stride_h_k,
-            stride_seq_k,
-            v_scale.stride(0),
-            v_scale.stride(1),
-            b,
-            h_kv,
-            K_NUM_BLKS,
-            kv_len,
-            D=head_dim,
-            BLK_K=BLOCK_K,
-            num_stages=3,
-            num_warps=8,
-        )
-        return v_quant, v_scale
-
-    # ms = triton.testing.do_bench(lambda: v_quant(v_fp8))
-    # print("v_quant (ms)", ms)
-
-    v_fp8, v_scale = v_quant(v_fp8)
-
-    # downcast_func = downcast_to_mxfp_rne if USE_RNE else downcast_to_mxfp
-
-    # q_fp4, q_scale = downcast_func(q, torch.uint8, axis=-1)
-    # k_fp4, k_scale = downcast_func(k, torch.uint8, axis=-1)
+    sage_quant_v_kernel[grid](
+        v,
+        v_fp8,
+        v_scale,
+        stride_bz_k,
+        stride_h_k,
+        stride_seq_k,
+        v_scale.stride(0),
+        v_scale.stride(1),
+        b,
+        h_kv,
+        K_NUM_BLKS,
+        kv_len,
+        D=head_dim,
+        BLK_K=BLOCK_K,
+        num_stages=3,
+        num_warps=8,
+    )
 
     return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
 
@@ -1008,193 +981,6 @@ def _rotate_quantize_qk_kernel(
 
 
 @triton.jit
-def _rotate_quantize_q_kernel(
-    Q,
-    Q_q,
-    Q_descale,
-    Q_mean,
-    R,  # Hadamard matrix
-    sm_scale: tl.constexpr,
-    stride_qb,
-    stride_qh,
-    stride_qm,
-    stride_qd,
-    stride_mb,
-    stride_mh,
-    stride_mm,
-    stride_md,
-    n_heads,
-    seq_len,
-    d_model,
-    q_smoothing: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_R: tl.constexpr,  # rotation block size
-    D: tl.constexpr,  # D is 128
-):
-    SCALE_GROUP_SIZE: tl.constexpr = 32
-
-    # Grid: (batch * n_heads, seq_len // BLOCK_M,)
-    pid_bh = tl.program_id(0)
-    pid_m = tl.program_id(1)
-
-    pid_h = pid_bh % n_heads
-    pid_b = pid_bh // n_heads
-
-    # Offsets
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, D)
-
-    offs_dq = tl.arange(0, D // 2)
-    offs_ds = tl.arange(0, D // SCALE_GROUP_SIZE)
-
-    # Load Q block and R (Hadamard)
-    # Q block shape: [BLOCK_M, D]
-    q_ptr = (
-        Q
-        + pid_b * stride_qb
-        + pid_h * stride_qh
-        + offs_m[:, None] * stride_qm
-        + offs_d[None, :] * stride_qd
-    )
-
-    q_descale_offset = (
-        pid_b * stride_qb + pid_h * stride_qh + offs_m[:, None] * stride_qm
-    ) // SCALE_GROUP_SIZE  # we group 32 values together for quantization
-
-    q_descale_ptr = Q_descale + q_descale_offset + offs_ds[None, :]
-
-    r_ptr = (
-        R + tl.arange(0, BLOCK_R)[:, None] * BLOCK_R + tl.arange(0, BLOCK_R)[None, :]
-    )
-    q_tile = tl.load(
-        q_ptr, mask=(offs_m[:, None] < seq_len) & (offs_d[None, :] < d_model), other=0.0
-    )  # (BLOCK_M, D)
-
-    # Calculate mean for the block (reduction over d within the BLOCK_M)
-    # q_mean shape: [B, H, Q_NUM_BLKS, D]
-    if q_smoothing:
-        m_row_mean = tl.sum(q_tile, axis=0) / BLOCK_M  # Sum over BLOCK_M -> shape [D]
-
-        q_tile -= m_row_mean[None, :]
-        mean_ptr = (
-            Q_mean
-            + pid_b * stride_mb
-            + pid_h * stride_mh
-            + pid_m * stride_mm
-            + offs_d * stride_md
-        )
-        tl.store(mean_ptr, m_row_mean)
-
-    r_mat = tl.load(r_ptr)  # BLOCK_R x BLOCK_R
-
-    shape0: tl.constexpr = BLOCK_M * D // BLOCK_R
-
-    # Rotate: Q_rot = Q @ R
-    q_rot_tile = tl.dot(q_tile.reshape((shape0, BLOCK_R)).to(r_mat.dtype), r_mat)
-    q_rot_tile = q_rot_tile.reshape((BLOCK_M, D))
-
-    if sm_scale is not None:
-        q_rot_tile *= sm_scale
-
-    q_quant_tile, q_descale = _compute_mx_quant_and_scale(
-        q_rot_tile.to(tl.float16), offs_m[:, None] < seq_len, tl.uint8
-    )
-
-    # Store rotated and quantized Q
-    q_quant_offset = (
-        pid_b * stride_qb + pid_h * stride_qh + offs_m[:, None] * stride_qm
-    ) // 2
-
-    q_quant_ptr = Q_q + q_quant_offset + offs_dq[None, :]
-
-    tl.store(q_descale_ptr, q_descale, mask=(offs_m[:, None] < seq_len))
-
-    tl.store(
-        q_quant_ptr,
-        q_quant_tile,
-        mask=(offs_m[:, None] < seq_len),
-    )
-
-
-@triton.jit
-def _rotate_quantize_k_kernel(
-    K,
-    K_q,
-    K_descale,
-    R,
-    stride_kb,
-    stride_kh,
-    stride_kn,
-    stride_kd,
-    n_heads,
-    seq_k,
-    d_model,
-    BLOCK_M: tl.constexpr,
-    BLOCK_R: tl.constexpr,
-    D: tl.constexpr,
-):
-
-    SCALE_GROUP_SIZE: tl.constexpr = 32
-
-    pid_bh = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    pid_h = pid_bh % n_heads
-    pid_b = pid_bh // n_heads
-
-    offs_n = pid_n * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, D)
-
-    offs_dq = tl.arange(0, D // 2)
-    offs_ds = tl.arange(0, D // SCALE_GROUP_SIZE)
-
-    # Load K block and R
-    k_ptr = (
-        K
-        + pid_b * stride_kb
-        + pid_h * stride_kh
-        + offs_n[:, None] * stride_kn
-        + offs_d[None, :] * stride_kd
-    )
-    r_ptr = (
-        R + tl.arange(0, BLOCK_R)[:, None] * BLOCK_R + tl.arange(0, BLOCK_R)[None, :]
-    )
-
-    k_descale_offset = (
-        pid_b * stride_kb + pid_h * stride_kh + offs_n[:, None] * stride_kn
-    ) // SCALE_GROUP_SIZE  # we group 32 values together for quantization
-
-    k_descale_ptr = K_descale + k_descale_offset + offs_ds[None, :]
-
-    # load k tile
-    k_tile = tl.load(
-        k_ptr, mask=(offs_n[:, None] < seq_k) & (offs_d[None, :] < d_model), other=0.0
-    )
-    # Rotate: Q_rot = Q @ R
-    r_mat = tl.load(r_ptr)
-    shape0: tl.constexpr = BLOCK_M * D // BLOCK_R
-    k_rot_tile = tl.dot(k_tile.reshape((shape0, BLOCK_R)), r_mat)
-    k_rot_tile = k_rot_tile.reshape((BLOCK_M, D))
-
-    k_quant_tile, k_descale = _compute_mx_quant_and_scale(
-        k_rot_tile.to(tl.float16), offs_n[:, None] < seq_k, tl.uint8
-    )
-    # Store rotated and quantized Q
-    k_quant_offset = (
-        pid_b * stride_kb + pid_h * stride_kh + offs_n[:, None] * stride_kn
-    ) // 2
-    k_quant_ptr = K_q + k_quant_offset + offs_dq[None, :]
-
-    tl.store(k_descale_ptr, k_descale, mask=(offs_n[:, None] < seq_k))
-
-    tl.store(
-        k_quant_ptr,
-        k_quant_tile,
-        mask=(offs_n[:, None] < seq_k),
-    )
-
-
-@triton.jit
 def _compute_delta_s_kernel(
     Q_mean,
     K_rot,
@@ -1312,6 +1098,117 @@ def create_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
     # H = H / (2.0 ** 0.5)  # Divide by sqrt(2) since we doubled the size
 
     return H
+
+
+def smooth_rotate_downcast_qk(
+    q,
+    k,
+    BLOCK_SIZE_M=256,
+    block_size=32,
+    q_smoothing=False,
+    sm_scale=None,
+    layout="bhsd",
+):
+
+    if block_size==32:
+        R = return_static_random_hadamard(q.device) / (block_size**0.5)
+    else:
+        R = create_hadamard_matrix(block_size, q.device) / (block_size**0.5)
+
+    bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
+
+    # shapes
+    b, s_q, h_q, d = map_dims(q.shape, bshd)
+    _, s_k, h_k, _ = map_dims(k.shape, bshd)
+
+    Q_NUM_BLKS = (s_q + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+    K_NUM_BLKS = (s_k + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+
+    if q_smoothing:
+        q_mean = torch.empty(
+            (b, h_q, Q_NUM_BLKS, d), dtype=torch.float32, device=q.device
+        )
+        delta_s = torch.empty(
+            (b, h_q, Q_NUM_BLKS, s_k), dtype=torch.float32, device=q.device
+        )
+    else:
+        q_mean = None
+        delta_s = None
+
+    stride_qb, stride_qm, stride_qh, stride_qd = map_dims(q.stride(), bshd)
+    stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k.stride(), bshd)
+
+    Q_q = torch.empty((*q.shape[:-1], d // 2), dtype=torch.uint8, device=q.device)
+    Q_descale = torch.empty(
+        (*q.shape[:-1], d // 32), dtype=torch.uint8, device=q.device
+    )
+    K_q = torch.empty((*k.shape[:-1], d // 2), dtype=torch.uint8, device=k.device)
+    K_descale = torch.empty(
+        (*k.shape[:-1], d // 32), dtype=torch.uint8, device=k.device
+    )
+
+    grid = (b * (h_q * Q_NUM_BLKS + h_k * K_NUM_BLKS),)
+    _rotate_quantize_qk_kernel[grid](
+        q,
+        Q_q,
+        Q_descale,
+        q_mean,
+        k,
+        K_q,
+        K_descale,
+        R,
+        sm_scale,
+        stride_qb,
+        stride_qh,
+        stride_qm,
+        stride_qd,
+        q_mean.stride(0) if q_smoothing else None,
+        q_mean.stride(1) if q_smoothing else None,
+        q_mean.stride(2) if q_smoothing else None,
+        q_mean.stride(3) if q_smoothing else None,
+        stride_kb,
+        stride_kh,
+        stride_kn,
+        stride_kd,
+        b,
+        h_q,
+        h_k,
+        s_q,
+        s_k,
+        d,
+        q_smoothing=q_smoothing,
+        BLOCK_M=BLOCK_SIZE_M,
+        BLOCK_R=block_size,
+        D=d,
+    )
+
+    if q_smoothing:
+        # 3. Compute Smoothing Delta S
+        # Grid: Each Q-block x Each K-block
+        grid_delta = (b * h_k, Q_NUM_BLKS, K_NUM_BLKS)
+        _compute_delta_s_kernel[grid_delta](
+            q_mean,
+            k,
+            delta_s,
+            q_mean.stride(0),
+            q_mean.stride(1),
+            q_mean.stride(2),
+            q_mean.stride(3),
+            stride_kb,
+            stride_kh,
+            stride_kn,
+            stride_kd,
+            delta_s.stride(0),
+            delta_s.stride(1),
+            delta_s.stride(2),
+            delta_s.stride(3),
+            h_k,
+            s_k,
+            d,
+            BLOCK_N=BLOCK_SIZE_M,
+        )
+
+    return Q_q, Q_descale, K_q, K_descale, delta_s
 
 
 def return_static_random_hadamard(device):
@@ -2411,109 +2308,3 @@ def return_static_random_hadamard(device):
     )
 
 
-def smooth_rotate_downcast_qk(
-    q,
-    k,
-    BLOCK_SIZE_M=256,
-    block_size=32,
-    q_smoothing=False,
-    sm_scale=None,
-    layout="bhsd",
-):
-
-    R = return_static_random_hadamard(q.device) / (block_size**0.5)
-
-    bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
-
-    # shapes
-    b, s_q, h_q, d = map_dims(q.shape, bshd)
-    _, s_k, h_k, _ = map_dims(k.shape, bshd)
-
-    Q_NUM_BLKS = (s_q + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
-    K_NUM_BLKS = (s_k + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
-
-    if q_smoothing:
-        q_mean = torch.empty(
-            (b, h_q, Q_NUM_BLKS, d), dtype=torch.float32, device=q.device
-        )
-        delta_s = torch.empty(
-            (b, h_q, Q_NUM_BLKS, s_k), dtype=torch.float32, device=q.device
-        )
-    else:
-        q_mean = None
-        delta_s = None
-
-    stride_qb, stride_qm, stride_qh, stride_qd = map_dims(q.stride(), bshd)
-    stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k.stride(), bshd)
-
-    Q_q = torch.empty((*q.shape[:-1], d // 2), dtype=torch.uint8, device=q.device)
-    Q_descale = torch.empty(
-        (*q.shape[:-1], d // 32), dtype=torch.uint8, device=q.device
-    )
-    K_q = torch.empty((*k.shape[:-1], d // 2), dtype=torch.uint8, device=k.device)
-    K_descale = torch.empty(
-        (*k.shape[:-1], d // 32), dtype=torch.uint8, device=k.device
-    )
-
-    grid = (b * (h_q * Q_NUM_BLKS + h_k * K_NUM_BLKS),)
-    _rotate_quantize_qk_kernel[grid](
-        q,
-        Q_q,
-        Q_descale,
-        q_mean,
-        k,
-        K_q,
-        K_descale,
-        R,
-        sm_scale,
-        stride_qb,
-        stride_qh,
-        stride_qm,
-        stride_qd,
-        q_mean.stride(0) if q_smoothing else None,
-        q_mean.stride(1) if q_smoothing else None,
-        q_mean.stride(2) if q_smoothing else None,
-        q_mean.stride(3) if q_smoothing else None,
-        stride_kb,
-        stride_kh,
-        stride_kn,
-        stride_kd,
-        b,
-        h_q,
-        h_k,
-        s_q,
-        s_k,
-        d,
-        q_smoothing=q_smoothing,
-        BLOCK_M=BLOCK_SIZE_M,
-        BLOCK_R=block_size,
-        D=d,
-    )
-
-    if q_smoothing:
-        # 3. Compute Smoothing Delta S
-        # Grid: Each Q-block x Each K-block
-        grid_delta = (b * h_k, Q_NUM_BLKS, K_NUM_BLKS)
-        _compute_delta_s_kernel[grid_delta](
-            q_mean,
-            k,
-            delta_s,
-            q_mean.stride(0),
-            q_mean.stride(1),
-            q_mean.stride(2),
-            q_mean.stride(3),
-            stride_kb,
-            stride_kh,
-            stride_kn,
-            stride_kd,
-            delta_s.stride(0),
-            delta_s.stride(1),
-            delta_s.stride(2),
-            delta_s.stride(3),
-            h_k,
-            s_k,
-            d,
-            BLOCK_N=BLOCK_SIZE_M,
-        )
-
-    return Q_q, Q_descale, K_q, K_descale, delta_s
