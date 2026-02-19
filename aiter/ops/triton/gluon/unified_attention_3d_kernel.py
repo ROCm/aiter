@@ -613,14 +613,12 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
 
     offs_q_m_qk = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, QK_WMMA_LAYOUT))
     query_pos_qk = q_block_local_idx * BLOCK_Q + offs_q_m_qk // num_queries_per_kv
-    query_offset_0_qk = cur_batch_in_all_start_index + query_pos_qk
     query_offset_1_qk = (
         kv_head_idx * num_queries_per_kv + offs_q_m_qk % num_queries_per_kv
     )
     query_mask_0_qk = query_pos_qk < cur_batch_query_len
     query_mask_1_qk = query_offset_1_qk < num_query_heads
     query_mask_qk = query_mask_1_qk[:, None] & query_mask_0_qk[:, None]
-    offs_seq_t = ttgl.arange(0, TILE_SIZE, layout=ttgl.SliceLayout(0, QK_WMMA_LAYOUT))
 
     L, M, acc = _allocate_L_M_acc(
         sink_ptr,
@@ -1261,14 +1259,12 @@ def gluon_kernel_unified_attention_3d_tdm(
 
     offs_q_m_qk = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, QK_WMMA_LAYOUT))
     query_pos_qk = q_block_local_idx * BLOCK_Q + offs_q_m_qk // num_queries_per_kv
-    query_offset_0_qk = cur_batch_in_all_start_index + query_pos_qk
     query_offset_1_qk = (
         kv_head_idx * num_queries_per_kv + offs_q_m_qk % num_queries_per_kv
     )
     query_mask_0_qk = query_pos_qk < cur_batch_query_len
     query_mask_1_qk = query_offset_1_qk < num_query_heads
     query_mask_qk = query_mask_1_qk[:, None] & query_mask_0_qk[:, None]
-    offs_seq_t = ttgl.arange(0, TILE_SIZE, layout=ttgl.SliceLayout(0, QK_WMMA_LAYOUT))
 
     L, M, acc = _allocate_L_M_acc(
         sink_ptr,
@@ -1852,14 +1848,12 @@ def gluon_kernel_unified_attention_3d_async(
 
     offs_q_m_qk = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, QK_WMMA_LAYOUT))
     query_pos_qk = q_block_local_idx * BLOCK_Q + offs_q_m_qk // num_queries_per_kv
-    query_offset_0_qk = cur_batch_in_all_start_index + query_pos_qk
     query_offset_1_qk = (
         kv_head_idx * num_queries_per_kv + offs_q_m_qk % num_queries_per_kv
     )
     query_mask_0_qk = query_pos_qk < cur_batch_query_len
     query_mask_1_qk = query_offset_1_qk < num_query_heads
     query_mask_qk = query_mask_1_qk[:, None] & query_mask_0_qk[:, None]
-    offs_seq_t = ttgl.arange(0, TILE_SIZE, layout=ttgl.SliceLayout(0, QK_WMMA_LAYOUT))
 
     L, M, acc = _allocate_L_M_acc(
         sink_ptr,
@@ -2387,7 +2381,6 @@ def gluon_kernel_unified_attention_3d(
 
     offs_q_m_qk = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, QK_WMMA_LAYOUT))
     query_pos_qk = q_block_local_idx * BLOCK_Q + offs_q_m_qk // num_queries_per_kv
-    query_offset_0_qk = cur_batch_in_all_start_index + query_pos_qk
     query_offset_1_qk = (
         kv_head_idx * num_queries_per_kv + offs_q_m_qk % num_queries_per_kv
     )
