@@ -158,7 +158,7 @@ def unified_attention(
     total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
-    ALL_DECODE = max_seqlen_q == 1
+    ALL_DECODE = int(max_seqlen_q == 1)
     # if batch contains a prefill
     if use_2d_kernel(
         head_size,
@@ -213,10 +213,10 @@ def unified_attention(
             BLOCK_SIZE=block_size,
             HEAD_SIZE=head_size,
             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
-            USE_ALIBI_SLOPES=use_alibi_slopes,
-            USE_QQ_BIAS=use_qq_bias,
-            USE_SOFTCAP=(softcap > 0),
-            USE_SINKS=(sinks is not None),
+            USE_ALIBI_SLOPES=int(use_alibi_slopes),
+            USE_QQ_BIAS=int(use_qq_bias),
+            USE_SOFTCAP=int(softcap > 0),
+            USE_SINKS=int(sinks is not None),
             SLIDING_WINDOW=SLIDING_WINDOW,
             stride_k_cache_0=k.stride(0),
             stride_k_cache_1=k.stride(1),
@@ -228,7 +228,7 @@ def unified_attention(
             stride_v_cache_3=v.stride(3),
             query_start_len_ptr=cu_seqlens_q,
             num_seqs=num_seqs,
-            USE_FP8=output_scale is not None,
+            USE_FP8=int(output_scale is not None),
             ALL_DECODE=ALL_DECODE,
             **config,
         )
@@ -291,10 +291,10 @@ def unified_attention(
             BLOCK_SIZE=block_size,
             HEAD_SIZE=head_size,
             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
-            USE_ALIBI_SLOPES=use_alibi_slopes,
-            USE_QQ_BIAS=use_qq_bias,
-            USE_SOFTCAP=(softcap > 0),
-            USE_SINKS=(sinks is not None),
+            USE_ALIBI_SLOPES=int(use_alibi_slopes),
+            USE_QQ_BIAS=int(use_qq_bias),
+            USE_SOFTCAP=int(softcap > 0),
+            USE_SINKS=int(sinks is not None),
             SLIDING_WINDOW=SLIDING_WINDOW,
             stride_k_cache_0=k.stride(0),
             stride_k_cache_1=k.stride(1),

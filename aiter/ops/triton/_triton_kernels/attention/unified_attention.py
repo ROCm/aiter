@@ -231,7 +231,7 @@ def kernel_unified_attention_2d(
         tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
         tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
 
-    KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
+    KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE == 1 else ""
     # iterate through tiles (now limited to the sliding window range)
     for j in range(tile_start, tile_end):
         seq_offset = j * TILE_SIZE + offs_t
@@ -540,7 +540,7 @@ def kernel_unified_attention_3d(
     # this prefix can be skipped)
     num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
-    KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
+    KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE == 1 else ""
     # iterate through tiles within current segment
     for j in range(
         segm_idx * tiles_per_segment,
