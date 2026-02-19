@@ -83,17 +83,17 @@ def mhc_torch(
     Returns:
         (M, N) unified output tensor where N = n + n + n²
         Layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n²-1]
-        
+
         To extract components:
         - H_pre = out[:, :n]
         - H_post = out[:, n:2n]
         - H_res = out[:, 2n:]
     """
     # Extract individual phi components from unified tensor
-    K = phi.shape[0]
+    # K = phi.shape[0]
     phi_pre = phi[:, :n]
-    phi_post = phi[:, n:2*n]
-    phi_res = phi[:, 2*n:]
+    phi_post = phi[:, n : 2 * n]
+    phi_res = phi[:, 2 * n :]
     x_f32 = x.to(torch.float32)
 
     # Eq 15: r = ||x̃||₂ / √(nC)
@@ -144,7 +144,7 @@ def mhc_torch(
     # Unify outputs into single contiguous tensor (matches kernel implementation)
     # Layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_res-1]
     out = torch.cat([H_pre.to(x.dtype), H_post.to(x.dtype), H_res.to(x.dtype)], dim=1)
-    
+
     # Return unified output tensor
     return out
 
@@ -152,7 +152,6 @@ def mhc_torch(
 def mhc_lite_torch(
     x: torch.Tensor,
     phi: torch.Tensor,  # Unified phi: (K, n + n + n_res)
-   
     alpha_pre: float,
     alpha_post: float,
     alpha_res: float,
@@ -181,19 +180,19 @@ def mhc_lite_torch(
     Returns:
         (M, N) unified output tensor where N = n + n + n²
         Layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n²-1]
-        
+
         To extract components:
         - H_pre = out[:, :n]
         - H_post = out[:, n:2n]
         - H_res = out[:, 2n:]
-        
+
         Note: H_res is reshaped from (M, n, n) to (M, n²) for consistency with sinkhorn mode.
     """
     # Extract individual phi components from unified tensor
     K = phi.shape[0]
     phi_pre = phi[:, :n]
-    phi_post = phi[:, n:2*n]
-    phi_res = phi[:, 2*n:]
+    phi_post = phi[:, n : 2 * n]
+    phi_res = phi[:, 2 * n :]
     x_f32 = x.to(torch.float32)
     M = x.shape[0]
     n_factorial = factorial(n)
@@ -249,7 +248,7 @@ def mhc_lite_torch(
     # Unify outputs into single contiguous tensor (matches kernel implementation)
     # Layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_squared-1]
     out = torch.cat([H_pre.to(x.dtype), H_post.to(x.dtype), H_res.to(x.dtype)], dim=1)
-    
+
     # Return unified output tensor
     return out
 

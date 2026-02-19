@@ -51,31 +51,24 @@ def test_mhc_correctness(M, n, C, dtype):
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
-    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = (
-        generate_mhc_inputs(M, n, C, dtype)
+    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
+        M, n, C, dtype
     )
 
-    out_torch = mhc_torch(
-        x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams
-    )
-
+    out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
 
     H_pre_torch = out_torch[:, :n_streams]
 
+    H_post_torch = out_torch[:, n_streams : 2 * n_streams]
 
-    H_post_torch = out_torch[:, n_streams:2*n_streams]
-
-
-    H_res_torch = out_torch[:, 2*n_streams:]
-    out_triton = mhc(
-        x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams
-    )
+    H_res_torch = out_torch[:, 2 * n_streams :]
+    out_triton = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
 
     H_pre_triton = out_triton[:, :n_streams]
 
-    H_post_triton = out_triton[:, n_streams:2*n_streams]
+    H_post_triton = out_triton[:, n_streams : 2 * n_streams]
 
-    H_res_triton = out_triton[:, 2*n_streams:]
+    H_res_triton = out_triton[:, 2 * n_streams :]
 
     torch.testing.assert_close(
         H_pre_triton.to(torch.float32),
@@ -106,27 +99,21 @@ def test_mhc_preallocated_output(M, n, C):
     """
     torch.cuda.empty_cache()
 
-    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = (
-        generate_mhc_inputs(M, n, C)
+    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
+        M, n, C
     )
     n_squared = n * n
-    out_pre = torch.empty(M, n, dtype=x.dtype, device=x.device)
-    out_post = torch.empty(M, n, dtype=x.dtype, device=x.device)
-    out_res = torch.empty(M, n_squared, dtype=x.dtype, device=x.device)
+    # Allocate unified output buffer: (M, n + n + n_squared)
+    out = torch.empty(M, n + n + n_squared, dtype=x.dtype, device=x.device)
 
-    out_torch = mhc_torch(
-        x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams
-    )
-
+    out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
 
     H_pre_torch = out_torch[:, :n_streams]
+    H_post_torch = out_torch[:, n_streams : 2 * n_streams]
+    H_res_torch = out_torch[:, 2 * n_streams :]
 
-
-    H_post_torch = out_torch[:, n_streams:2*n_streams]
-
-
-    H_res_torch = out_torch[:, 2*n_streams:]
-    result_pre, result_post, result_res = mhc(
+    # Call mhc with unified output buffer
+    result = mhc(
         x,
         phi,
         alpha_pre,
@@ -134,31 +121,33 @@ def test_mhc_preallocated_output(M, n, C):
         alpha_res,
         bias,
         n_streams,
-        out_pre=out_pre,
-        out_post=out_post,
-        out_res=out_res,
+        out=out,
     )
 
-    assert result_pre is out_pre
-    assert result_post is out_post
-    assert result_res is out_res
+    # Verify result is the same object as out (in-place modification)
+    assert result is out
+
+    # Extract streams from unified output
+    result_pre = result[:, :n]
+    result_post = result[:, n : 2 * n]
+    result_res = result[:, 2 * n :]
 
     torch.testing.assert_close(
-        out_pre.to(torch.float32),
+        result_pre.to(torch.float32),
         H_pre_torch.to(torch.float32),
         atol=1e-2,
         rtol=1e-2,
     )
     torch.testing.assert_close(
-        out_post.to(torch.float32),
+        result_post.to(torch.float32),
         H_post_torch.to(torch.float32),
         atol=1e-2,
         rtol=1e-2,
     )
     # H_res uses relaxed tolerance because Sinkhorn-Knopp is an iterative algorithm
     torch.testing.assert_close(
-        out_post.to(torch.float32),
-        H_post_torch.to(torch.float32),
+        result_res.to(torch.float32),
+        H_res_torch.to(torch.float32),
         atol=1e-2 if C < 1024 else 5e-2,
         rtol=1e-2 if C < 1024 else 5e-2,
     )
@@ -174,8 +163,8 @@ def test_mhc_different_epsilon(eps, M, n, C):
     """
     torch.cuda.empty_cache()
 
-    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = (
-        generate_mhc_inputs(M, n, C)
+    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
+        M, n, C
     )
 
     out_torch = mhc_torch(
@@ -189,14 +178,11 @@ def test_mhc_different_epsilon(eps, M, n, C):
         eps=eps,
     )
 
-
     H_pre_torch = out_torch[:, :n_streams]
 
+    H_post_torch = out_torch[:, n_streams : 2 * n_streams]
 
-    H_post_torch = out_torch[:, n_streams:2*n_streams]
-
-
-    H_res_torch = out_torch[:, 2*n_streams:]
+    H_res_torch = out_torch[:, 2 * n_streams :]
     out_triton = mhc(
         x,
         phi,
@@ -210,9 +196,9 @@ def test_mhc_different_epsilon(eps, M, n, C):
 
     H_pre_triton = out_triton[:, :n_streams]
 
-    H_post_triton = out_triton[:, n_streams:2*n_streams]
+    H_post_triton = out_triton[:, n_streams : 2 * n_streams]
 
-    H_res_triton = out_triton[:, 2*n_streams:]
+    H_res_triton = out_triton[:, 2 * n_streams :]
 
     for torch_out, triton_out in [
         (H_pre_torch, H_pre_triton),
@@ -251,27 +237,20 @@ def test_mhc_different_alpha(alpha_scale):
     alpha_post = alpha_scale
     alpha_res = alpha_scale
 
-    out_torch = mhc_torch(
-        x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams
-    )
-
+    out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
 
     H_pre_torch = out_torch[:, :n_streams]
 
+    H_post_torch = out_torch[:, n_streams : 2 * n_streams]
 
-    H_post_torch = out_torch[:, n_streams:2*n_streams]
-
-
-    H_res_torch = out_torch[:, 2*n_streams:]
-    out_triton = mhc(
-        x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams
-    )
+    H_res_torch = out_torch[:, 2 * n_streams :]
+    out_triton = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
 
     H_pre_triton = out_triton[:, :n_streams]
 
-    H_post_triton = out_triton[:, n_streams:2*n_streams]
+    H_post_triton = out_triton[:, n_streams : 2 * n_streams]
 
-    H_res_triton = out_triton[:, 2*n_streams:]
+    H_res_triton = out_triton[:, 2 * n_streams :]
 
     for torch_out, triton_out in [
         (H_pre_torch, H_pre_triton),
@@ -304,33 +283,25 @@ def test_mhc_zero_input():
     N_total = n * n + 2 * n
 
     x = torch.zeros(M, nC, dtype=torch.bfloat16, device="cuda")
-    phi_pre = torch.randn(nC, n, dtype=torch.bfloat16, device="cuda") * 0.1
-    phi_post = torch.randn(nC, n, dtype=torch.bfloat16, device="cuda") * 0.1
-    phi_res = torch.randn(nC, n * n, dtype=torch.bfloat16, device="cuda") * 0.1
+
+    # Create unified phi tensor: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n²-1]
+    n_squared = n * n
+    phi = torch.randn(nC, n + n + n_squared, dtype=torch.bfloat16, device="cuda") * 0.1
+
     alpha_pre = alpha_post = alpha_res = 1.0
     bias = torch.randn(N_total, dtype=torch.float32, device="cuda") * 0.1
 
-    out_torch = mhc_torch(
-        x, phi, alpha_pre, alpha_post, alpha_res, bias, n
-    )
+    # Reference implementation (returns unified tensor)
+    out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
+    H_pre_torch = out_torch[:, :n]
+    H_post_torch = out_torch[:, n : 2 * n]
+    H_res_torch = out_torch[:, 2 * n :]
 
-
-    H_pre_torch = out_torch[:, :n_streams]
-
-
-    H_post_torch = out_torch[:, n_streams:2*n_streams]
-
-
-    H_res_torch = out_torch[:, 2*n_streams:]
-    out_triton = mhc(
-        x, phi, alpha_pre, alpha_post, alpha_res, bias, n
-    )
-
-    H_pre_triton = out_triton[:, :n_streams]
-
-    H_post_triton = out_triton[:, n_streams:2*n_streams]
-
-    H_res_triton = out_triton[:, 2*n_streams:]
+    # Triton implementation (returns unified tensor)
+    out_triton = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
+    H_pre_triton = out_triton[:, :n]
+    H_post_triton = out_triton[:, n : 2 * n]
+    H_res_triton = out_triton[:, 2 * n :]
 
     for torch_out, triton_out in [
         (H_pre_torch, H_pre_triton),
@@ -363,33 +334,25 @@ def test_mhc_large_values():
     N_total = n * n + 2 * n
 
     x = torch.randn(M, nC, dtype=torch.bfloat16, device="cuda") * 100
-    phi_pre = torch.randn(nC, n, dtype=torch.bfloat16, device="cuda") * 0.01
-    phi_post = torch.randn(nC, n, dtype=torch.bfloat16, device="cuda") * 0.01
-    phi_res = torch.randn(nC, n * n, dtype=torch.bfloat16, device="cuda") * 0.01
+
+    # Create unified phi tensor: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n²-1]
+    n_squared = n * n
+    phi = torch.randn(nC, n + n + n_squared, dtype=torch.bfloat16, device="cuda") * 0.01
+
     alpha_pre = alpha_post = alpha_res = 1.0
     bias = torch.randn(N_total, dtype=torch.float32, device="cuda")
 
-    out_torch = mhc_torch(
-        x, phi, alpha_pre, alpha_post, alpha_res, bias, n
-    )
+    # Reference implementation (returns unified tensor)
+    out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
+    H_pre_torch = out_torch[:, :n]
+    H_post_torch = out_torch[:, n : 2 * n]
+    H_res_torch = out_torch[:, 2 * n :]
 
-
-    H_pre_torch = out_torch[:, :n_streams]
-
-
-    H_post_torch = out_torch[:, n_streams:2*n_streams]
-
-
-    H_res_torch = out_torch[:, 2*n_streams:]
-    out_triton = mhc(
-        x, phi, alpha_pre, alpha_post, alpha_res, bias, n
-    )
-
-    H_pre_triton = out_triton[:, :n_streams]
-
-    H_post_triton = out_triton[:, n_streams:2*n_streams]
-
-    H_res_triton = out_triton[:, 2*n_streams:]
+    # Triton implementation (returns unified tensor)
+    out_triton = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
+    H_pre_triton = out_triton[:, :n]
+    H_post_triton = out_triton[:, n : 2 * n]
+    H_res_triton = out_triton[:, 2 * n :]
 
     for torch_out, triton_out in [
         (H_pre_torch, H_pre_triton),
@@ -420,31 +383,24 @@ def test_mhc_small_shapes(M, n, C, dtype):
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
-    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = (
-        generate_mhc_inputs(M, n, C, dtype)
+    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
+        M, n, C, dtype
     )
 
-    out_torch = mhc_torch(
-        x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams
-    )
-
+    out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
 
     H_pre_torch = out_torch[:, :n_streams]
 
+    H_post_torch = out_torch[:, n_streams : 2 * n_streams]
 
-    H_post_torch = out_torch[:, n_streams:2*n_streams]
-
-
-    H_res_torch = out_torch[:, 2*n_streams:]
-    out_triton = mhc(
-        x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams
-    )
+    H_res_torch = out_torch[:, 2 * n_streams :]
+    out_triton = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
 
     H_pre_triton = out_triton[:, :n_streams]
 
-    H_post_triton = out_triton[:, n_streams:2*n_streams]
+    H_post_triton = out_triton[:, n_streams : 2 * n_streams]
 
-    H_res_triton = out_triton[:, 2*n_streams:]
+    H_res_triton = out_triton[:, 2 * n_streams :]
 
     for torch_out, triton_out in [
         (H_pre_torch, H_pre_triton),
@@ -476,8 +432,8 @@ def test_mhc_output_range():
     torch.cuda.empty_cache()
 
     M, n, C = 64, 4, 1024
-    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = (
-        generate_mhc_inputs(M, n, C)
+    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
+        M, n, C
     )
 
     out = mhc(
@@ -491,8 +447,8 @@ def test_mhc_output_range():
         sinkhorn_iters=50,
     )
     H_pre = out[:, :n_streams]
-    H_post = out[:, n_streams:2*n_streams]
-    H_res = out[:, 2*n_streams:]
+    H_post = out[:, n_streams : 2 * n_streams]
+    H_res = out[:, 2 * n_streams :]
 
     # Pre-stream (Eq 17): sigmoid output should be in [0, 1]
     assert torch.all(H_pre >= 0.0), "Pre-stream has values < 0"
@@ -507,7 +463,7 @@ def test_mhc_output_range():
     assert H_res.shape == (M, n_squared), "Res-stream shape mismatch"
 
     # Verify doubly stochastic numerical accuracy against the reference implementation.
-    H_res_3d = H_res.view(M, n, n).to(torch.float32)
+    H_res_3d = H_res.view(M, n_streams, n_streams).to(torch.float32)
     assert is_doubly_stochastic(H_res_3d, tol=5e-2), (
         "Res-stream is not doubly stochastic. "
         f"Row sums: {H_res_3d.sum(dim=-1)}, Col sums: {H_res_3d.sum(dim=-2)}"
@@ -542,8 +498,8 @@ def test_split_k_correctness(M, n, C, num_ksplit, dtype):
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
-    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = (
-        generate_mhc_inputs(M, n, C, dtype)
+    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
+        M, n, C, dtype
     )
 
     # Reference: PyTorch implementation
@@ -560,9 +516,9 @@ def test_split_k_correctness(M, n, C, num_ksplit, dtype):
 
     H_pre_ref = out_ref[:, :n_streams]
 
-    H_post_ref = out_ref[:, n_streams:2*n_streams]
+    H_post_ref = out_ref[:, n_streams : 2 * n_streams]
 
-    H_res_ref = out_ref[:, 2*n_streams:]
+    H_res_ref = out_ref[:, 2 * n_streams :]
 
     # Test: split-K kernel with config passed directly
     out_split = fused_mhc(
@@ -578,9 +534,9 @@ def test_split_k_correctness(M, n, C, num_ksplit, dtype):
 
     H_pre_split = out_split[:, :n_streams]
 
-    H_post_split = out_split[:, n_streams:2*n_streams]
+    H_post_split = out_split[:, n_streams : 2 * n_streams]
 
-    H_res_split = out_split[:, 2*n_streams:]
+    H_res_split = out_split[:, 2 * n_streams :]
 
     torch.testing.assert_close(
         H_pre_split.to(torch.float32),
@@ -614,8 +570,8 @@ def test_split_k_mhc_full_pipeline(M, n, C, num_ksplit):
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
-    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = (
-        generate_mhc_inputs(M, n, C)
+    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
+        M, n, C
     )
 
     # Reference: PyTorch implementation
@@ -632,9 +588,9 @@ def test_split_k_mhc_full_pipeline(M, n, C, num_ksplit):
 
     H_pre_ref = out_ref[:, :n_streams]
 
-    H_post_ref = out_ref[:, n_streams:2*n_streams]
+    H_post_ref = out_ref[:, n_streams : 2 * n_streams]
 
-    H_res_ref = out_ref[:, 2*n_streams:]
+    H_res_ref = out_ref[:, 2 * n_streams :]
 
     # Test: split-K kernel with full mhc pipeline (config passed directly)
     out_split = mhc(
@@ -650,9 +606,9 @@ def test_split_k_mhc_full_pipeline(M, n, C, num_ksplit):
 
     H_pre_split = out_split[:, :n_streams]
 
-    H_post_split = out_split[:, n_streams:2*n_streams]
+    H_post_split = out_split[:, n_streams : 2 * n_streams]
 
-    H_res_split = out_split[:, 2*n_streams:]
+    H_res_split = out_split[:, 2 * n_streams :]
 
     torch.testing.assert_close(
         H_pre_split.to(torch.float32),
@@ -685,8 +641,8 @@ def test_split_k_various_splits(num_ksplit):
     torch.cuda.empty_cache()
 
     M, n, C = 32, 4, 1024
-    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = (
-        generate_mhc_inputs(M, n, C)
+    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
+        M, n, C
     )
 
     # Reference: PyTorch implementation
@@ -703,9 +659,9 @@ def test_split_k_various_splits(num_ksplit):
 
     H_pre_torch = out_torch[:, :n_streams]
 
-    H_post_torch = out_torch[:, n_streams:2*n_streams]
+    H_post_torch = out_torch[:, n_streams : 2 * n_streams]
 
-    H_res_torch = out_torch[:, 2*n_streams:]
+    H_res_torch = out_torch[:, 2 * n_streams :]
 
     # Test: split-K kernel (config passed directly)
     out_split = fused_mhc(
@@ -721,9 +677,9 @@ def test_split_k_various_splits(num_ksplit):
 
     H_pre_split = out_split[:, :n_streams]
 
-    H_post_split = out_split[:, n_streams:2*n_streams]
+    H_post_split = out_split[:, n_streams : 2 * n_streams]
 
-    H_res_split = out_split[:, 2*n_streams:]
+    H_res_split = out_split[:, 2 * n_streams :]
 
     torch.testing.assert_close(
         H_pre_split.to(torch.float32),
@@ -748,15 +704,16 @@ def test_split_k_preallocated_output(M, n, C):
     """
     torch.cuda.empty_cache()
 
-    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = (
-        generate_mhc_inputs(M, n, C)
+    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
+        M, n, C
     )
     n_squared = n * n
-    out_pre = torch.empty(M, n, dtype=x.dtype, device=x.device)
-    out_post = torch.empty(M, n, dtype=x.dtype, device=x.device)
-    out_res = torch.empty(M, n_squared, dtype=x.dtype, device=x.device)
 
-    # Reference without split-K
+    # Create single unified pre-allocated output buffer
+    total_out_cols = n + n + n_squared
+    out = torch.empty(M, total_out_cols, dtype=x.dtype, device=x.device)
+
+    # Reference without split-K (returns unified tensor)
     out_ref = mhc_torch(
         x,
         phi,
@@ -767,15 +724,12 @@ def test_split_k_preallocated_output(M, n, C):
         n_streams,
         return_with_sinkhorn=False,
     )
-
     H_pre_ref = out_ref[:, :n_streams]
+    H_post_ref = out_ref[:, n_streams : 2 * n_streams]
+    H_res_ref = out_ref[:, 2 * n_streams :]
 
-    H_post_ref = out_ref[:, n_streams:2*n_streams]
-
-    H_res_ref = out_ref[:, 2*n_streams:]
-
-    # Test with split-K and pre-allocated outputs (config passed directly)
-    result_pre, result_post, result_res = fused_mhc(
+    # Test with split-K and pre-allocated unified output (config passed directly)
+    result = fused_mhc(
         x,
         phi,
         alpha_pre,
@@ -783,15 +737,17 @@ def test_split_k_preallocated_output(M, n, C):
         alpha_res,
         bias,
         n_streams,
-        out_pre=out_pre,
-        out_post=out_post,
-        out_res=out_res,
+        out=out,
         config=_make_split_k_config(2),
     )
 
-    assert result_pre is out_pre
-    assert result_post is out_post
-    assert result_res is out_res
+    # Verify that the returned tensor is the same object (in-place operation)
+    assert result is out
+
+    # Extract streams from unified output
+    out_pre = out[:, :n_streams]
+    out_post = out[:, n_streams : 2 * n_streams]
+    out_res = out[:, 2 * n_streams :]
 
     torch.testing.assert_close(
         out_pre.to(torch.float32),
@@ -822,8 +778,8 @@ def test_split_k_large_k():
     torch.cuda.empty_cache()
 
     M, n, C = 64, 4, 2048  # K = n * C = 8192
-    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = (
-        generate_mhc_inputs(M, n, C)
+    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
+        M, n, C
     )
 
     # Reference
@@ -840,9 +796,9 @@ def test_split_k_large_k():
 
     H_pre_ref = out_ref[:, :n_streams]
 
-    H_post_ref = out_ref[:, n_streams:2*n_streams]
+    H_post_ref = out_ref[:, n_streams : 2 * n_streams]
 
-    H_res_ref = out_ref[:, 2*n_streams:]
+    H_res_ref = out_ref[:, 2 * n_streams :]
 
     # Test with 4-way split (config passed directly)
     out_split = fused_mhc(
@@ -858,9 +814,9 @@ def test_split_k_large_k():
 
     H_pre_split = out_split[:, :n_streams]
 
-    H_post_split = out_split[:, n_streams:2*n_streams]
+    H_post_split = out_split[:, n_streams : 2 * n_streams]
 
-    H_res_split = out_split[:, 2*n_streams:]
+    H_res_split = out_split[:, 2 * n_streams :]
 
     # Use slightly relaxed tolerance for larger K due to more accumulation steps
     torch.testing.assert_close(
@@ -1165,22 +1121,19 @@ def test_mhc_lite_correctness(M, n, C, dtype):
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
-    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = (
-        generate_mhc_inputs(M, n, C, dtype, mode="mhc_lite")
+    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
+        M, n, C, dtype, mode="mhc_lite"
     )
 
     out_torch = mhc_lite_torch(
         x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams
     )
 
-
     H_pre_torch = out_torch[:, :n_streams]
 
+    H_post_torch = out_torch[:, n_streams : 2 * n_streams]
 
-    H_post_torch = out_torch[:, n_streams:2*n_streams]
-
-
-    H_res_torch = out_torch[:, 2*n_streams:]
+    H_res_torch = out_torch[:, 2 * n_streams :]
     out_triton = mhc(
         x,
         phi,
@@ -1194,9 +1147,9 @@ def test_mhc_lite_correctness(M, n, C, dtype):
 
     H_pre_triton = out_triton[:, :n_streams]
 
-    H_post_triton = out_triton[:, n_streams:2*n_streams]
+    H_post_triton = out_triton[:, n_streams : 2 * n_streams]
 
-    H_res_triton = out_triton[:, 2*n_streams:]
+    H_res_triton = out_triton[:, 2 * n_streams :]
 
     # Pre and post streams should match closely
     torch.testing.assert_close(
@@ -1230,11 +1183,11 @@ def test_mhc_lite_doubly_stochastic(M, n, C):
     """
     torch.cuda.empty_cache()
 
-    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = (
-        generate_mhc_inputs(M, n, C, mode="mhc_lite")
+    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
+        M, n, C, mode="mhc_lite"
     )
 
-    _, _, H_res = mhc(
+    out = mhc(
         x,
         phi,
         alpha_pre,
@@ -1244,9 +1197,11 @@ def test_mhc_lite_doubly_stochastic(M, n, C):
         n_streams,
         hres_mode="lite",
     )
+    # Extract H_res from unified output: layout is [pre | post | res]
+    H_res = out[:, 2 * n_streams :]
 
     # Reshape to (M, n, n) for doubly stochastic check
-    H_res_3d = H_res.view(M, n, n).to(torch.float32)
+    H_res_3d = H_res.view(M, n_streams, n_streams).to(torch.float32)
 
     # Check doubly stochastic property
     # Note: Using relaxed tolerance due to bfloat16 precision limitations in kernel
@@ -1267,28 +1222,16 @@ def test_mhc_lite_vs_sinkhorn_output_shape(M, n, C):
     torch.cuda.empty_cache()
 
     # Generate inputs for sinkhorn mode
-    (
-        x,
-        phi_pre,
-        phi_post,
-        phi_res_sk,
-        alpha_pre,
-        alpha_post,
-        alpha_res,
-        bias_sk,
-        n_streams,
-    ) = generate_mhc_inputs(M, n, C)
-
-    # Generate inputs for lite mode
-    _, _, _, phi_res_lite, _, _, _, bias_lite, _ = generate_mhc_inputs(
-        M, n, C, mode="mhc_lite"
+    x, phi_sk, alpha_pre, alpha_post, alpha_res, bias_sk, n_streams = (
+        generate_mhc_inputs(M, n, C)
     )
 
-    _, _, H_res_sinkhorn = mhc(
+    # Generate inputs for lite mode
+    _, phi_lite, _, _, _, bias_lite, _ = generate_mhc_inputs(M, n, C, mode="mhc_lite")
+
+    out_sinkhorn = mhc(
         x,
-        phi_pre,
-        phi_post,
-        phi_res_sk,
+        phi_sk,
         alpha_pre,
         alpha_post,
         alpha_res,
@@ -1296,11 +1239,9 @@ def test_mhc_lite_vs_sinkhorn_output_shape(M, n, C):
         n_streams,
         hres_mode="sinkhorn",
     )
-    _, _, H_res_lite = mhc(
+    out_lite = mhc(
         x,
-        phi_pre,
-        phi_post,
-        phi_res_lite,
+        phi_lite,
         alpha_pre,
         alpha_post,
         alpha_res,
@@ -1308,6 +1249,10 @@ def test_mhc_lite_vs_sinkhorn_output_shape(M, n, C):
         n_streams,
         hres_mode="lite",
     )
+
+    # Extract H_res from unified outputs: layout is [pre | post | res]
+    H_res_sinkhorn = out_sinkhorn[:, 2 * n_streams :]
+    H_res_lite = out_lite[:, 2 * n_streams :]
 
     # Both should have shape (M, n²)
     assert H_res_sinkhorn.shape == (
@@ -1330,11 +1275,11 @@ def test_mhc_lite_output_range(M, n, C):
     """
     torch.cuda.empty_cache()
 
-    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = (
-        generate_mhc_inputs(M, n, C, mode="mhc_lite")
+    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
+        M, n, C, mode="mhc_lite"
     )
 
-    _, _, H_res = mhc(
+    out = mhc(
         x,
         phi,
         alpha_pre,
@@ -1344,6 +1289,8 @@ def test_mhc_lite_output_range(M, n, C):
         n_streams,
         hres_mode="lite",
     )
+    # Extract H_res from unified output: layout is [pre | post | res]
+    H_res = out[:, 2 * n_streams :]
 
     H_res_f32 = H_res.to(torch.float32)
 
@@ -1365,11 +1312,11 @@ def test_fused_mhc_lite_correctness(M, n, C):
     """
     torch.cuda.empty_cache()
 
-    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = (
-        generate_mhc_inputs(M, n, C, mode="mhc_lite")
+    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
+        M, n, C, mode="mhc_lite"
     )
 
-    _, _, H_res = fused_mhc(
+    out = fused_mhc(
         x,
         phi,
         alpha_pre,
@@ -1379,10 +1326,12 @@ def test_fused_mhc_lite_correctness(M, n, C):
         n_streams,
         hres_mode="lite",
     )
+    # Extract H_res from unified output: layout is [pre | post | res]
+    H_res = out[:, 2 * n_streams :]
 
     # Reshape and check doubly stochastic
     # Note: Using relaxed tolerance due to bfloat16 precision limitations in kernel
-    H_res_3d = H_res.view(M, n, n).to(torch.float32)
+    H_res_3d = H_res.view(M, n_streams, n_streams).to(torch.float32)
 
     assert is_doubly_stochastic(
         H_res_3d, tol=5e-3

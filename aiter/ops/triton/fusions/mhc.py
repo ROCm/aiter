@@ -57,7 +57,6 @@ def get_permutation_matrices(n: int, device: torch.device) -> torch.Tensor:
 def fused_mhc(
     x: torch.Tensor,
     phi: torch.Tensor,  # Unified phi: (K, n + n + n_res)
-   
     alpha_pre: float,
     alpha_post: float,
     alpha_res: float,
@@ -104,7 +103,7 @@ def fused_mhc(
         - H_res: (M, n²) - residual stream:
             - sinkhorn mode: raw logits (NOT doubly stochastic)
             - lite mode: exact doubly stochastic matrix
-        
+
         Note: All three tensors are views into a single contiguous output buffer.
     """
 
@@ -132,7 +131,9 @@ def fused_mhc(
         config_block_n = config.pop("BLOCK_N", min_block_n)
         BLOCK_N = triton.next_power_of_2(max(config_block_n, min_block_n))
 
-        n_res_expected = n_factorial
+        # Lite mode: input phi has n! columns, but output has n² columns
+        n_res_input = n_factorial  # Input phi residual stream size
+        n_res_output = n_squared  # Output residual stream size
 
         perm_matrices = get_permutation_matrices(n, x.device)
         n_blocks_res = 1
@@ -141,14 +142,17 @@ def fused_mhc(
     else:
         BLOCK_N = triton.next_power_of_2(config.pop("BLOCK_N", n_squared))
 
-        n_res_expected = n_squared
+        # Sinkhorn mode: input and output both have n² columns
+        n_res_input = n_squared
+        n_res_output = n_squared
 
         perm_matrices = torch.empty(0, device=x.device)
         n_blocks_res = triton.cdiv(n_squared, BLOCK_N)
         stride_perm_k = 0
         stride_perm_ij = 0
 
-    N_total_expected = n_res_expected + 2 * n  # n (pre) + n (post) + n_res
+    N_total_input = n_res_input + 2 * n  # For phi and bias validation
+    N_total_output = n_res_output + 2 * n  # For output allocation
 
     BLOCK_K = config.pop("BLOCK_K", 64)
     # Ensure BLOCK_K doesn't exceed K dimension
@@ -160,16 +164,14 @@ def fused_mhc(
         f"hres_mode={hres_mode} num_ksplit={num_ksplit}"
     )
 
+    assert K == K_phi, f"Dimension mismatch: x has K={K}, but phi has K={K_phi}"
     assert (
-        K == K_phi
-    ), f"Dimension mismatch: x has K={K}, but phi has K={K_phi}"
-    assert (
-        total_phi_cols == N_total_expected
-    ), f"phi shape mismatch: expected (K, {N_total_expected}), got ({K_phi}, {total_phi_cols})"
+        total_phi_cols == N_total_input
+    ), f"phi shape mismatch: expected (K, {N_total_input}), got ({K_phi}, {total_phi_cols})"
 
     assert (
-        bias.shape[0] == N_total_expected
-    ), f"Bias shape mismatch: expected ({N_total_expected},), got {bias.shape}"
+        bias.shape[0] == N_total_input
+    ), f"Bias shape mismatch: expected ({N_total_input},), got {bias.shape}"
     assert num_ksplit >= 1, f"num_ksplit must be >= 1, got {num_ksplit}"
 
     assert (
@@ -177,12 +179,12 @@ def fused_mhc(
     ), "All tensors must be on the same device"
     assert x.device.type == "cuda", "mHC kernel requires CUDA device"
 
-    N = N_total_expected
+    N = N_total_input  # Kernel input size
 
     # Allocate unified output if not provided
-    # Single contiguous tensor: (M, n + n + n_res)
-    # Layout: [pre_0...pre_{n-1}, post_0...post_{n-1}, res_0...res_{n_res-1}]
-    total_out_cols = n + n + n_res_expected
+    # Single contiguous tensor: (M, n + n + n_res_output)
+    # Layout: [pre_0...pre_{n-1}, post_0...post_{n-1}, res_0...res_{n_res_output-1}]
+    total_out_cols = N_total_output
     if out is None:
         out = torch.empty(M, total_out_cols, dtype=x.dtype, device=x.device)
     else:
@@ -205,7 +207,7 @@ def fused_mhc(
         # Allocate unified intermediate buffer (float32 for precision)
         # Single contiguous tensor: (num_ksplit, M, n + n + n_res)
         # Layout: [pre_0...pre_{n-1}, post_0...post_{n-1}, res_0...res_{n_res-1}]
-        total_cols = n + n + n_res_expected
+        total_cols = N_total_input
         acc_partial = torch.empty(
             (num_ksplit, M, total_cols), dtype=torch.float32, device=x.device
         )
@@ -225,7 +227,7 @@ def fused_mhc(
             N=N,
             n=n,
             n_squared=n_squared,
-            n_factorial=n_res_expected,
+            n_factorial=n_res_input,
             stride_xm=x.stride(0),
             stride_xk=x.stride(1),
             stride_phi_k=phi.stride(0),
@@ -259,7 +261,7 @@ def fused_mhc(
             N=N,
             n=n,
             n_squared=n_squared,
-            n_factorial=n_res_expected,
+            n_factorial=n_res_input,
             eps=eps,
             stride_acc_k=acc_partial.stride(0),
             stride_acc_m=acc_partial.stride(1),
@@ -294,7 +296,7 @@ def fused_mhc(
             N=N,
             n=n,
             n_squared=n_squared,
-            n_factorial=n_res_expected,
+            n_factorial=n_res_input,
             eps=eps,
             stride_xm=x.stride(0),
             stride_xk=x.stride(1),
@@ -318,7 +320,6 @@ def fused_mhc(
 def mhc(
     x: torch.Tensor,
     phi: torch.Tensor,  # Unified phi: (K, n + n + n_res)
-   
     alpha_pre: float,
     alpha_post: float,
     alpha_res: float,
@@ -356,7 +357,7 @@ def mhc(
         - H_pre: (M, n) - manifold projection with sigmoid activation
         - H_post: (M, n) - post-processing with scaled sigmoid
         - H_res: (M, n²) - doubly stochastic residual connection
-        
+
         Note: All three tensors are views into a single contiguous output buffer.
     """
     _LOGGER.info(
@@ -385,13 +386,15 @@ def mhc(
         M = res.shape[0]
         C = x.shape[1] // n
         # Extract residual stream for sinkhorn (in-place view)
-        out_res = res[:, 2*n:]  # Shape: (M, n²)
+        out_res = res[:, 2 * n :]  # Shape: (M, n²)
         out_res_3d = out_res.view(M, n, n)
-        result = sinkhorn_knopp(out_res_3d, C=C, num_iters=sinkhorn_iters, out=out_res_3d)
+        result = sinkhorn_knopp(
+            out_res_3d, C=C, num_iters=sinkhorn_iters, out=out_res_3d
+        )
         # Copy result back only if it's a different tensor (contiguous() created new memory)
         if result.data_ptr() != out_res_3d.data_ptr():
             out_res.copy_(result.view(M, -1))
-        
+
         # Return unified output tensor (res is modified in-place)
         return res
 
