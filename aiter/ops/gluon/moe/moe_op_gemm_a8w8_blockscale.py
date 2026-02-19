@@ -43,34 +43,39 @@ class AsyncCopyDescriptor:
         self.BLOCK_K = ttgl.constexpr(BLOCK_K)
     
     @gluon.jit
-    def initialize(ptr, gathered_m, offs_k, stride_m, stride_k, BLOCK_M: ttgl.constexpr, BLOCK_K: ttgl.constexpr, BLOCKED_MK: ttgl.constexpr):
+    def initialize(ptr, gathered_m, off_k, stride_m, stride_k, BLOCK_M: ttgl.constexpr, BLOCK_K: ttgl.constexpr, BLOCKED_MK: ttgl.constexpr):
         """
         Initialize descriptor with gathered row indices.
         
         Args:
             ptr: Base pointer to X tensor
             gathered_m: Gathered row indices [BLOCK_M] (irregular)
-            offs_k: K offsets [BLOCK_K]
+            off_k: Starting K offset (tensor [BLOCK_K])
             stride_m: Stride for M dimension
             stride_k: Stride for K dimension
         """
         step_k = BLOCK_K * stride_k
-        offs = gathered_m * stride_m + offs_k * stride_k
-        return AsyncCopyDescriptor(ptr, offs, offs_k, step_k, BLOCK_M, BLOCK_K)
+        off_k = off_k.to(ttgl.int32)[None, :]
+        gathered_m = gathered_m.to(ttgl.int32)[:, None]
+
+        offs = gathered_m * stride_m + off_k * stride_k
+
+        return AsyncCopyDescriptor(ptr, offs, off_k, step_k, BLOCK_M, BLOCK_K)
     
     @gluon.jit
-    def issue_async_load(self, k_idx: int, buffer, mask_k=None):
+    def issue_async_load(self, k_idx: int, buffer, k_limit=None):
         """
         Issue async load for K iteration k_idx.
         
         Args:
             k_idx: K iteration index (0, 1, 2, ...)
             buffer: Shared memory buffer to load into
-            mask_k: Optional mask for K dimension (for EVEN_K=False case)
+            k_limit: Optional K limit for masking (for EVEN_K=False case)
         """
         offs = self.offs + k_idx * self.step_k
-        if mask_k is not None:
-            cp.global_to_shared(buffer, self.ptr + offs, mask=mask_k, other=0.0)
+        if k_limit is not None:
+            mask_k = (self.offs_k + k_idx * self.BLOCK_K) < k_limit
+            cp.global_to_shared(buffer, self.ptr + offs, mask=mask_k[None, :], other=0.0)
         else:
             cp.global_to_shared(buffer, self.ptr + offs)
         cp.commit_group()
@@ -262,10 +267,6 @@ def issue_tile_loads(
     """
     buffer_idx = producer % NUM_BUFFERS
     
-    if not EVEN_K:
-        mask = k_offset_start + producer * BLOCK_K < K
-    else:
-        mask = None
     # Load A tile
     if GatherIndx is None:
         ttgl.amd.gfx1250.tdm.async_load(
@@ -274,18 +275,19 @@ def issue_tile_loads(
             a_buffer.index(buffer_idx)
         )
     else:
-        a_desc.issue_async_load(producer, a_buffer.index(buffer_idx), mask)
+        k_limit = None
+        if not EVEN_K:
+            k_limit = K
+        a_desc.issue_async_load(producer, a_buffer.index(buffer_idx), k_limit)
     
     # Load B tile
     if W_TRANSPOSE:
-        # W is stored as (N, K)
         ttgl.amd.gfx1250.tdm.async_load(
             b_desc,
             [pid_n * BLOCK_N, k_offset_start + producer * BLOCK_K],
             b_buffer.index(buffer_idx)
         )
     else:
-        # W is stored as (K, N)
         ttgl.amd.gfx1250.tdm.async_load(
             b_desc,
             [k_offset_start + producer * BLOCK_K, pid_n * BLOCK_N],
@@ -361,7 +363,6 @@ def create_descriptor(
     # A descriptor
     if GatherIndx is None:
         offs_x_m = start_m + offs_x_m
-        # Regular access: Use TDM tensor descriptor
         in_m = grid_m * BLOCK_M 
         a_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=X + start_m * stride_x_m,
@@ -374,12 +375,12 @@ def create_descriptor(
         GatherIndx += start_m
         # no needs to bounds-check here because `offs_x_m` wraps around M dim
         offs_x_m = ttgl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
-        # Initialize AsyncCopyDescriptor
+
+        # Initialize AsyncCopyDescriptor, can't use TDM Gather because of irregular offsets
         # TODO: Replace with TDM Gather once AMD hardware support is available.
-        off_k = ttgl.arange(0, BLOCK_K, layout=ttgl.SliceLayout(0, BLOCKED_MK))
-        off_k_start = pid_k * splitk_block_size + off_k
+        off_k_start = pid_k * splitk_block_size + ttgl.arange(0, BLOCK_K, layout=ttgl.SliceLayout(0, BLOCKED_MK))
         a_desc = AsyncCopyDescriptor.initialize(
-            X, offs_x_m.to(ttgl.int32)[:, None], off_k_start.to(ttgl.int32)[None, :], stride_x_m, stride_x_k, BLOCK_M, BLOCK_K, BLOCKED_MK
+            X, offs_x_m, off_k_start, stride_x_m, stride_x_k, BLOCK_M, BLOCK_K, BLOCKED_MK
         )
 
     # B descriptor
@@ -409,7 +410,7 @@ def create_descriptor(
     
     # A scale descriptor
     a_scale_desc = None
-    off_k_scale_start = (pid_k * splitk_block_size) // BLOCKSCALE_K
+    off_k_scale_start = off_k_start // BLOCKSCALE_K
     if is_x_blockscale:
         if PER_ROW_X_SCALE:
             # XScale: [M, K_blocks]
@@ -422,9 +423,10 @@ def create_descriptor(
                     layout=SHARED_A_SCALE
                 )
             else:
+                scale_block_k = BLOCK_K // BLOCKSCALE_K
                 a_scale_desc = AsyncCopyDescriptor.initialize(
-                    XBlockScale, offs_x_m.to(ttgl.int32)[:, None], off_k_scale_start, stride_x_bs_m, stride_x_bs_k, 
-                    BLOCK_M, BLOCK_K, BLOCKED_MK
+                    XBlockScale, offs_x_m, off_k_scale_start, stride_x_bs_m, stride_x_bs_k, 
+                    BLOCK_M, scale_block_k, BLOCKED_MK
                 )
         else:
             # XScale: [M_blocks, K_blocks]
@@ -439,24 +441,36 @@ def create_descriptor(
             else:
                 # Compute M block indices from gathered row indices
                 offs_x_scale_m = offs_x_m // BLOCKSCALE_M
+                scale_block_k = BLOCK_K // BLOCKSCALE_K
                 a_scale_desc = AsyncCopyDescriptor.initialize(
                     XBlockScale, offs_x_scale_m, off_k_scale_start, stride_x_bs_m, stride_x_bs_k,
-                    BLOCK_M, BLOCK_K, BLOCKED_MK
+                    BLOCK_M, scale_block_k, BLOCKED_MK
                 )
     
     # B scale descriptor
     b_scale_desc = None
     if is_w_blockscale:
-        # WScale: [K_blocks, N_blocks]
+        WBlockScale += expt_id * stride_w_bs_e
         scale_k_blocks = ttgl.cdiv(K, BLOCKSCALE_K)
         scale_n_blocks = ttgl.cdiv(N, BLOCKSCALE_N)
-        b_scale_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=WBlockScale,
-            shape=(scale_k_blocks, scale_n_blocks),
-            strides=(stride_w_bs_k, stride_w_bs_n),
-            block_shape=(1, 1),
-            layout=SHARED_B_SCALE
-        )
+        if W_TRANSPOSE:
+            # WScale: [N_blocks, K_blocks]
+            b_scale_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=WBlockScale,
+                shape=(scale_n_blocks, scale_k_blocks),
+                strides=(stride_w_bs_n, stride_w_bs_k),
+                block_shape=(BLOCK_N // BLOCKSCALE_N, BLOCK_K // BLOCKSCALE_K),
+                layout=SHARED_B_SCALE
+            )
+        else:
+            # WScale: [K_blocks, N_blocks]
+            b_scale_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=WBlockScale,
+                shape=(scale_k_blocks, scale_n_blocks),
+                strides=(stride_w_bs_k, stride_w_bs_n),
+                block_shape=(BLOCK_K // BLOCKSCALE_K, BLOCK_N // BLOCKSCALE_N),
+                layout=SHARED_B_SCALE
+            )
     
     return a_desc, b_desc, a_scale_desc, b_scale_desc
 
@@ -600,12 +614,10 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
         X.type.element_ty, [NUM_BUFFERS, BLOCK_M, BLOCK_K], layout=SHARED_A
     )
     if W_TRANSPOSE:
-        # W is stored as (N, K) in shared memory
         b_buffer = ttgl.allocate_shared_memory(
             W.type.element_ty, [NUM_BUFFERS, BLOCK_N, BLOCK_K], layout=SHARED_B
         )
     else:
-        # W is stored as (K, N) in shared memory
         b_buffer = ttgl.allocate_shared_memory(
             W.type.element_ty, [NUM_BUFFERS, BLOCK_K, BLOCK_N], layout=SHARED_B
         )
@@ -671,7 +683,7 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
         cur_a = a_buffer.index(consumer % NUM_BUFFERS).load(layout=DOT_A_LAYOUT)
         
         if W_TRANSPOSE:
-            # B is stored as (N, K) but WMMA needs (K, N), so we permute
+            # B is stored as (N, K) but WMMA needs (K, N)
             cur_b = b_buffer.index(consumer % NUM_BUFFERS).permute([1, 0]).load(layout=DOT_B_LAYOUT)
         else:
             cur_b = b_buffer.index(consumer % NUM_BUFFERS).load(layout=DOT_B_LAYOUT)
@@ -685,7 +697,7 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
         cur_a = a_buffer.index(consumer % NUM_BUFFERS).load(layout=DOT_A_LAYOUT)
         
         if W_TRANSPOSE:
-            # B is stored as (N, K) but WMMA needs (K, N), so we permute
+            # B is stored as (N, K) but WMMA needs (K, N)
             cur_b = b_buffer.index(consumer % NUM_BUFFERS).permute([1, 0]).load(layout=DOT_B_LAYOUT)
         else:
             cur_b = b_buffer.index(consumer % NUM_BUFFERS).load(layout=DOT_B_LAYOUT)
@@ -1207,7 +1219,7 @@ if __name__ == "__main__":
     k = 128
     n_expts_tot = 8
     n_expts_act = 2
-    do_gather = False
+    do_gather = True
     do_scatter = False
     per_row_x_scale = False
     is_x_blockscale = True
