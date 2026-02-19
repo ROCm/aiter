@@ -487,6 +487,60 @@ __global__ void TopPSamplingFromProbKernel(DType* probs,
     }
 }
 
+template <uint32_t VEC_SIZE, uint32_t BLOCK_THREADS>
+__device__ __forceinline__ void ComputePivotAggregates(
+    const vec_t<float, VEC_SIZE>& probs_vec,
+    double pivot_0,
+    double pivot_1,
+    uint32_t i,
+    uint32_t tx,
+    uint32_t d,
+    ValueCount<float>& threadlocal_aggregate_gt_pivot_0,
+    ValueCount<float>& threadlocal_aggregate_gt_pivot_1)
+{
+    ValueCount<float> probs_gt_pivot_0[VEC_SIZE], probs_gt_pivot_1[VEC_SIZE];
+#pragma unroll
+    for(uint32_t j = 0; j < VEC_SIZE; ++j)
+    {
+        probs_gt_pivot_0[j] = {
+            (probs_vec[j] > pivot_0) ? probs_vec[j] : 0,
+            (probs_vec[j] > pivot_0 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
+        probs_gt_pivot_1[j] = {
+            (probs_vec[j] > pivot_1) ? probs_vec[j] : 0,
+            (probs_vec[j] > pivot_1 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
+        if constexpr(VEC_SIZE == 1) {
+            // can't exploit any instruction-level parallelism, so just sum up the values here
+            threadlocal_aggregate_gt_pivot_0 += probs_gt_pivot_0[j];
+            threadlocal_aggregate_gt_pivot_1 += probs_gt_pivot_1[j];
+        }
+    }
+
+    if constexpr(VEC_SIZE > 1) {
+        // the values were not summed up in the loop above, so we need to sum them up here and exploit instruction-level parallelism
+
+        ValueCount<float> local_sum_0 = {0, 0};
+        ValueCount<float> local_sum_1 = {0, 0};
+
+        if constexpr(VEC_SIZE == 2) {
+#pragma unroll
+            for(uint32_t j = 0; j < VEC_SIZE; j+=2) {
+                local_sum_0 += probs_gt_pivot_0[j] + probs_gt_pivot_0[j + 1];
+                local_sum_1 += probs_gt_pivot_1[j] + probs_gt_pivot_1[j + 1];
+            }
+        } else {
+            // assume VEC_SIZE is a multiple of 4
+#pragma unroll
+            for(uint32_t j = 0; j < VEC_SIZE; j+=4) {
+                local_sum_0 += probs_gt_pivot_0[j] + probs_gt_pivot_0[j + 1] + probs_gt_pivot_0[j + 2] + probs_gt_pivot_0[j + 3];
+                local_sum_1 += probs_gt_pivot_1[j] + probs_gt_pivot_1[j + 1] + probs_gt_pivot_1[j + 2] + probs_gt_pivot_1[j + 3];
+            }
+        }
+
+        threadlocal_aggregate_gt_pivot_0 += local_sum_0;
+        threadlocal_aggregate_gt_pivot_1 += local_sum_1;
+    }
+}
+
 template <uint32_t BLOCK_THREADS,
           BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM,
@@ -525,14 +579,48 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs,
     float q    = 1;
     double low = 0, high = 1.f;
     int sampled_id;
+
+    constexpr uint32_t PRELOAD_LIMIT = 128; // the number of probabilities to preload into registers
+    const uint32_t num_preload_iters = PRELOAD_LIMIT / VEC_SIZE;
+    //preload as much data as possible into registers
+    vec_t<float, VEC_SIZE> preloaded_probs[num_preload_iters];
+
+#pragma unroll
+    for(uint32_t i = 0; i < num_preload_iters; ++i)
+    {
+        preloaded_probs[i].fill(0);
+        if((i * BLOCK_THREADS + tx) * VEC_SIZE < d) // TODO: buffer load assembly could be used to eliminate this check
+        {
+            preloaded_probs[i].cast_load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+        }
+    }
+
     do
     {
         temp_storage.sampled_id = d;
         __syncthreads();
         float u   = hiprand_uniform(&state) * q;
         aggregate = 0;
+
+        // fixed set of iterations known at compile-time
+#pragma unroll
+        for(uint32_t i = 0; i < num_preload_iters; ++i) {
+            // TODO: add a check to avoid unnecessary iterations when d is small 
+            DeviceSamplingFromProb<VEC_SIZE,
+                                    BLOCK_THREADS,
+                                    SCAN_ALGORITHM,
+                                    REDUCE_ALGORITHM,
+                                    DETERMINISTIC>(
+                i, d, [&](float x) { return x > low; }, u, preloaded_probs[i], aggregate, &temp_storage);
+            if(aggregate > u)
+            {
+                break;
+            }
+        }
+
+        // dynamic tail loop for the remaining probabilities that are not preloaded
 #pragma unroll 2
-        for(uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i)
+        for(uint32_t i = num_preload_iters; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i)
         {
             probs_vec.fill(0);
             if((i * BLOCK_THREADS + tx) * VEC_SIZE < d)
@@ -566,8 +654,24 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs,
         ValueCount<float> aggregate_gt_pivot_0{0, 0}, aggregate_gt_pivot_1{0, 0};
         ValueCount<float> threadlocal_aggregate_gt_pivot_0{0, 0};
         ValueCount<float> threadlocal_aggregate_gt_pivot_1{0, 0};
+
+        //fixed set of iterations known at compile-time
+#pragma unroll
+        for(uint32_t i = 0; i < num_preload_iters; ++i) {
+            ComputePivotAggregates<VEC_SIZE, BLOCK_THREADS>(
+                preloaded_probs[i],
+                pivot_0,
+                pivot_1,
+                i,
+                tx,
+                d,
+                threadlocal_aggregate_gt_pivot_0,
+                threadlocal_aggregate_gt_pivot_1);
+        }
+
+        // dynamic tail loop for the remaining probabilities that are not preloaded
 #pragma unroll 2
-        for(uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i)
+        for(uint32_t i = num_preload_iters; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i)
         {
             probs_vec.fill(0);
             if((i * BLOCK_THREADS + tx) * VEC_SIZE < d)
@@ -575,47 +679,15 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs,
                 probs_vec.cast_load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
             }
 
-            ValueCount<float> probs_gt_pivot_0[VEC_SIZE], probs_gt_pivot_1[VEC_SIZE];
-#pragma unroll
-            for(uint32_t j = 0; j < VEC_SIZE; ++j)
-            {
-                probs_gt_pivot_0[j] = {
-                    (probs_vec[j] > pivot_0) ? probs_vec[j] : 0,
-                    (probs_vec[j] > pivot_0 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
-                probs_gt_pivot_1[j] = {
-                    (probs_vec[j] > pivot_1) ? probs_vec[j] : 0,
-                    (probs_vec[j] > pivot_1 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
-                if constexpr(VEC_SIZE == 1) {
-                    // can't exploit any instruction-level parallelism, so just sum up the values here
-                    threadlocal_aggregate_gt_pivot_0 += probs_gt_pivot_0[j];
-                    threadlocal_aggregate_gt_pivot_1 += probs_gt_pivot_1[j];
-                }
-            }
-
-            if constexpr(VEC_SIZE > 1) {
-                // the values were not summed up in the loop above, so we need to sum them up here and exploit instruction-level parallelism
-
-                ValueCount<float> local_sum_0 = {0, 0};
-                ValueCount<float> local_sum_1 = {0, 0};
-
-                if constexpr(VEC_SIZE == 2) {                    
-#pragma unroll
-                    for(uint32_t j = 0; j < VEC_SIZE; j+=2) {
-                        local_sum_0 += probs_gt_pivot_0[j] + probs_gt_pivot_0[j + 1];
-                        local_sum_1 += probs_gt_pivot_1[j] + probs_gt_pivot_1[j + 1];
-                    }
-                } else {
-                    // assume VEC_SIZE is a multiple of 4
-#pragma unroll
-                    for(uint32_t j = 0; j < VEC_SIZE; j+=4) {
-                        local_sum_0 += probs_gt_pivot_0[j] + probs_gt_pivot_0[j + 1] + probs_gt_pivot_0[j + 2] + probs_gt_pivot_0[j + 3];
-                        local_sum_1 += probs_gt_pivot_1[j] + probs_gt_pivot_1[j + 1] + probs_gt_pivot_1[j + 2] + probs_gt_pivot_1[j + 3];
-                    }
-                }
-
-                threadlocal_aggregate_gt_pivot_0 += local_sum_0;
-                threadlocal_aggregate_gt_pivot_1 += local_sum_1;
-            }
+            ComputePivotAggregates<VEC_SIZE, BLOCK_THREADS>(
+                probs_vec,
+                pivot_0,
+                pivot_1,
+                i,
+                tx,
+                d,
+                threadlocal_aggregate_gt_pivot_0,
+                threadlocal_aggregate_gt_pivot_1);
         }
 
         aggregate_gt_pivot_0 +=
