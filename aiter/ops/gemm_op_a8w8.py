@@ -73,6 +73,7 @@ def gemm_a8w8_bpreshuffle_ck(
     Out: torch.Tensor,
 ) -> torch.Tensor: ...
 
+
 def gen_gemm_a8w8_bpreshuffle_cktile_fake_tensors(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -203,7 +204,7 @@ def flatmm_a8w8_blockscale_asm(
     x_scale: Tensor,
     w_scale: Tensor,
     out: Tensor,
-) -> torch.Tensor: ...
+) -> Tensor: ...
 
 
 def gen_gemm_a8w8_blockscale_bpreshuffle_asm_fake_tensors(
@@ -324,10 +325,10 @@ def get_GEMM_config_with_quant_type(
     # Load file if not cached
     if tuned_file not in get_GEMM_config_with_quant_type.file_cache:
         asmGemmDictDf = pd.read_csv(tuned_file).drop_duplicates()
-        get_GEMM_config_with_quant_type.file_cache[
-            tuned_file
-        ] = asmGemmDictDf.set_index(["cu_num", "M", "N", "K", "q_dtype_w"]).to_dict(
-            "index"
+        get_GEMM_config_with_quant_type.file_cache[tuned_file] = (
+            asmGemmDictDf.set_index(["cu_num", "M", "N", "K", "q_dtype_w"]).to_dict(
+                "index"
+            )
         )
 
     cu_num = get_cu_num()
@@ -422,9 +423,7 @@ def gemm_a8w8_ASM(
         )
         is not None
     ):
-        assert (
-            bias is not None
-        ), "Use asm gemm must give bias, please give a \
+        assert bias is not None, "Use asm gemm must give bias, please give a \
             bias=torch.zeros(n,dtype=dtypes.fp32,device='cuda')"
         splitK = asm_config["splitK"]
         kernelName = asm_config["kernelName"]
@@ -753,6 +752,7 @@ def gemm_a8w8_blockscale_bpreshuffle_tune(
     splitK: int = 0,
 ) -> torch.Tensor: ...
 
+
 @compile_ops(
     "module_gemm_a8w8_bpreshuffle_cktile_tune",
     fc_name="gemm_a8w8_bpreshuffle_cktile_tune",
@@ -765,4 +765,4 @@ def gemm_a8w8_bpreshuffle_cktile_tune(
     out: Tensor,
     kernelId: int,
     splitK: int = 0,
-) -> torch.Tensor: ...
+) -> Tensor: ...
