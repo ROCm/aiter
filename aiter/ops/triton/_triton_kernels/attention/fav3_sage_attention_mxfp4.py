@@ -206,10 +206,11 @@ def _sage_fwd_no_mask_mxfp4(
             q, q_descale, Q_DTYPE_STR, k, k_descale, K_DTYPE_STR, fast_math=True, acc=qk
         )
 
-        qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
+        # qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
         if USE_BIAS:
+            bias_mask = kv_offs_n < seqlen_k
             bias = tl.load(
-                bias_base_ptrs + start_n * stride_bn, mask=qk_mask, other=0.0
+                bias_base_ptrs + start_n * stride_bn, mask=bias_mask, other=0.0
             )
             qk += bias
 
@@ -313,9 +314,10 @@ def _sage_fwd_mask_mxfp4(
                 float("-inf"),
             )
 
-        qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
+        # qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
         if USE_BIAS:
-            qk += tl.load(bias_base_ptrs + start_n * stride_bn, mask=qk_mask, other=0.0)
+            bias_mask = kv_offs_n < seqlen_k
+            qk += tl.load(bias_base_ptrs + start_n * stride_bn, mask=bias_mask, other=0.0)
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
         p = tl.math.exp2(qk - m_ij[:, None])
@@ -490,7 +492,7 @@ def sage_fwd_mxfp4(
             + off_z * stride_bz.to(tl.int64)
             + off_h_q * stride_bh.to(tl.int64)
             + start_m * stride_bm.to(tl.int64)
-            + offs_n[None, :] * stride_bn
+            + offs_n * stride_bn
         )
         if USE_BIAS
         else None
@@ -719,6 +721,7 @@ def sage_quant_mxfp4(
     v,
     q_smoothing=False,
     layout="bshd",
+    BLOCK_M=256,
 ):
 
     if layout == "bhsd":
@@ -737,7 +740,6 @@ def sage_quant_mxfp4(
 
     # padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
     sm_scale = head_dim**-0.5
-    BLOCK_M = 128
     rotation_block_size = 32
 
     q_fp4, q_scale, k_fp4, k_scale, delta_s = smooth_rotate_downcast_qk(
@@ -944,7 +946,8 @@ def _rotate_quantize_qk_kernel(
 
     if is_q_pid:
         if q_smoothing:
-            m_row_mean = tl.sum(qk_tile, axis=0) / BLOCK_M  # Sum over BLOCK_M -> shape [D]
+            ACTUAL_BLOCK_M = tl.minimum(BLOCK_M, seqlen - pid_m * BLOCK_M)
+            m_row_mean = tl.sum(qk_tile, axis=0) / ACTUAL_BLOCK_M  # Sum over BLOCK_M -> shape [D]
             qk_tile -= m_row_mean[None, :]
             qk_tile = qk_tile.to(original_dtype)
             mean_ptr = (
@@ -954,7 +957,7 @@ def _rotate_quantize_qk_kernel(
                 + pid_m * stride_mm
                 + offs_d * stride_md
             )
-            tl.store(mean_ptr, m_row_mean*sm_scale)
+            tl.store(mean_ptr, m_row_mean * sm_scale)
 
     r_mat = tl.load(r_ptr)  # BLOCK_R x BLOCK_R
 

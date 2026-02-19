@@ -69,6 +69,7 @@ def bench_kernel(q, k, v, args, provider):
             v,
             q_smoothing=args.qsmooth,
             layout=args.layout,
+            BLOCK_M=config["BLOCK_M"],
         )
         return lambda: fav3_sage_mxfp4_func(
             q=q_quantized,

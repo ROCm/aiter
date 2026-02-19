@@ -69,6 +69,7 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
             v,
             q_smoothing=q_smooth,
             layout=layout,
+            BLOCK_M=BLKQ,
         )
 
         qd_mapped = map_dims(q_descale.shape, bhsd_map)
