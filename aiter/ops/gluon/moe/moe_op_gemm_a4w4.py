@@ -401,15 +401,12 @@ def _moe_gemm_a4w4_gfx1250(
     W_CACHE_MODIFIER: ttgl.constexpr,
     # layouts
     WMMA_LAYOUT: ttgl.constexpr,
-    SHARED_LAYOUT_X: ttgl.constexpr,
-    SHARED_LAYOUT_W: ttgl.constexpr,
-    SHARED_LAYOUT_X_SCALES: ttgl.constexpr,
-    SHARED_LAYOUT_W_SCALES: ttgl.constexpr,
     DOT_LAYOUT_X: ttgl.constexpr,
     DOT_LAYOUT_W: ttgl.constexpr,
     LAYOUT_X_SCALES: ttgl.constexpr,
     LAYOUT_W_SCALES: ttgl.constexpr,
-    BLOCKED_LAYOUT: ttgl.constexpr,
+    BLOCKED_LAYOUT_MK: ttgl.constexpr,
+    BLOCKED_LAYOUT_KN: ttgl.constexpr,
     UPCAST_INDICES: ttgl.constexpr = False,
 ):
     ttgl.assume(stride_y_k >= 0)
@@ -456,6 +453,7 @@ def _moe_gemm_a4w4_gfx1250(
     OUT_BLOCK_N: ttgl.constexpr = BLOCK_N // ACTIVATION_REDUCTION_N
     yN = N // ACTIVATION_REDUCTION_N
 
+    # get program id
     pid = ttgl.program_id(0)
     if ExptOffsSum is not None and XCD_SWIZZLE > 1:
         # Determine how much padding there is on the expert data. This allows us to
@@ -466,6 +464,7 @@ def _moe_gemm_a4w4_gfx1250(
 
     index_type: ttgl.constexpr = ttgl.int64 if UPCAST_INDICES else ttgl.int32
 
+    # get unpadded grid size
     unpadded_m = grid_m - padding_m
     ttgl.assume(unpadded_m >= 0)
     total_actual_tiles = unpadded_m * grid_n * SPLIT_K
@@ -482,7 +481,7 @@ def _moe_gemm_a4w4_gfx1250(
     pid_mn = pid_mnk // SPLIT_K
     pid_m, pid_n = pid_grid(pid_mn, unpadded_m, grid_n, GROUP_M)
 
-    # For split-k, advance to the output k slice
+    # for split-k, advance to the output k slice
     if SPLIT_K > 1:
         Y += pid_k.to(index_type) * stride_y_k
 
@@ -498,6 +497,7 @@ def _moe_gemm_a4w4_gfx1250(
     start_m = start_m.to(index_type)
     pid_n, pid_k = pid_n.to(index_type), pid_k.to(index_type)
 
+    # constants
     X_M_DIVISOR: ttgl.constexpr = 1
     X_K_DIVISOR: ttgl.constexpr = 2
     W_K_DIVISOR: ttgl.constexpr = 2
@@ -508,9 +508,9 @@ def _moe_gemm_a4w4_gfx1250(
     PACKED_BLOCK_N_W: ttgl.constexpr = BLOCK_N // W_N_DIVISOR
     MX_SCALE_BLOCK_K: ttgl.constexpr = BLOCK_K // MX_PACK_DIVISOR
 
-    # A pointers: compute offs_x_k first (Gluon pass can infer make_range type when it's not the first in the block)
-    offs_x_k = PACKED_BLOCK_K_X * pid_k + ttgl.arange(0, PACKED_BLOCK_K_X, layout=ttgl.SliceLayout(0, BLOCKED_LAYOUT))
-    offs_x_m = PACKED_BLOCK_M_X * block_id + ttgl.arange(0, PACKED_BLOCK_M_X, layout=ttgl.SliceLayout(1, BLOCKED_LAYOUT))
+    # A pointers
+    offs_x_k = PACKED_BLOCK_K_X * pid_k + ttgl.arange(0, PACKED_BLOCK_K_X, layout=ttgl.SliceLayout(0, BLOCKED_LAYOUT_MK))
+    offs_x_m = PACKED_BLOCK_M_X * block_id + ttgl.arange(0, PACKED_BLOCK_M_X, layout=ttgl.SliceLayout(1, BLOCKED_LAYOUT_MK))
     offs_x_m = ttgl.max_contiguous(
         ttgl.multiple_of(offs_x_m % (M // X_M_DIVISOR), PACKED_BLOCK_M_X),
         PACKED_BLOCK_M_X,
@@ -529,14 +529,12 @@ def _moe_gemm_a4w4_gfx1250(
 
     # B scale pointers
     WMxScale += expt_id * stride_w_mx_e
-    PACKED_MX_BLOCK: ttgl.constexpr = MX_SCALE_BLOCK_K
-    SCALE_BLOCK_N: ttgl.constexpr = BLOCK_N
-    offs_w_n_scale = (pid_n * SCALE_BLOCK_N + ttgl.arange(0, SCALE_BLOCK_N, layout=ttgl.SliceLayout(1, BLOCKED_LAYOUT))) % N
+    offs_w_n_scale = (pid_n * BLOCK_N + ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(1, BLOCKED_LAYOUT_KN))) % N
     offs_w_n_scale = ttgl.max_contiguous(
-        ttgl.multiple_of(offs_w_n_scale, SCALE_BLOCK_N), SCALE_BLOCK_N
+        ttgl.multiple_of(offs_w_n_scale, BLOCK_N), BLOCK_N
     )
     # K dimension must be the last dimension for the scales
-    offs_w_k_scale = PACKED_MX_BLOCK * pid_k + ttgl.arange(0, PACKED_MX_BLOCK, layout=ttgl.SliceLayout(0, BLOCKED_LAYOUT))
+    offs_w_k_scale = MX_SCALE_BLOCK_K * pid_k + ttgl.arange(0, MX_SCALE_BLOCK_K, layout=ttgl.SliceLayout(0, BLOCKED_LAYOUT_KN))
     WMxScalePtrs = (
         WMxScale
         + offs_w_k_scale.to(index_type)[None, :] * stride_w_mx_k
@@ -544,23 +542,23 @@ def _moe_gemm_a4w4_gfx1250(
     )
 
     # B pointers
-    offs_w_n = pid_n * PACKED_BLOCK_N_W + ttgl.arange(0, PACKED_BLOCK_N_W, layout=ttgl.SliceLayout(0, BLOCKED_LAYOUT))
+    offs_w_n = pid_n * PACKED_BLOCK_N_W + ttgl.arange(0, PACKED_BLOCK_N_W, layout=ttgl.SliceLayout(0, BLOCKED_LAYOUT_KN))
     offs_w_n = ttgl.max_contiguous(
         ttgl.multiple_of(offs_w_n % (N // W_N_DIVISOR), PACKED_BLOCK_N_W),
         PACKED_BLOCK_N_W,
     )
-    offs_w_k = PACKED_BLOCK_K_W * pid_k + ttgl.arange(0, PACKED_BLOCK_K_W, layout=ttgl.SliceLayout(1, BLOCKED_LAYOUT))
+    offs_w_k = PACKED_BLOCK_K_W * pid_k + ttgl.arange(0, PACKED_BLOCK_K_W, layout=ttgl.SliceLayout(1, BLOCKED_LAYOUT_KN))
     W += expt_id * stride_w_e
     WPtrs = W + (
         offs_w_k.to(index_type)[:, None] * stride_w_k
         + offs_w_n.to(index_type)[None, :] * stride_w_n
     )
 
-    # A scales pointers
+    # A scale pointers
     if is_x_microscaled:
         if GatherIndx is None:
             XMxScale += start_m * stride_x_mx_m
-        offs_x_k_scale = MX_SCALE_BLOCK_K * pid_k + ttgl.arange(0, MX_SCALE_BLOCK_K, layout=ttgl.SliceLayout(0, BLOCKED_LAYOUT))
+        offs_x_k_scale = MX_SCALE_BLOCK_K * pid_k + ttgl.arange(0, MX_SCALE_BLOCK_K, layout=ttgl.SliceLayout(0, BLOCKED_LAYOUT_MK))
         XMxScalePtrs = (
             XMxScale
             + offs_x_m.to(index_type)[:, None] * stride_x_mx_m
@@ -594,7 +592,7 @@ def _moe_gemm_a4w4_gfx1250(
             x, x_scales, "e2m1", w, w_scales, "e2m1", acc=acc,
         )
 
-        WMxScalePtrs += (PACKED_MX_BLOCK * SPLIT_K) * stride_w_mx_k
+        WMxScalePtrs += (MX_SCALE_BLOCK_K * SPLIT_K) * stride_w_mx_k
         if is_x_microscaled:
             XMxScalePtrs += (MX_SCALE_BLOCK_K * SPLIT_K) * stride_x_mx_k
 
@@ -776,14 +774,7 @@ def moe_gemm_a4w4_gfx1250(
     BLOCK_M = config["block_m"]
     BLOCK_N = config["block_n"]
     BLOCK_K = config["block_k"]
-
     BLOCK_K_SCALE = BLOCK_K // 32
-    SCALE_KWIDTH = 4 if BLOCK_K_SCALE >= 4 else BLOCK_K_SCALE
-    PRESHUFFLE_FACTOR = 1 # TODO: add support for preshuffling
-
-    BLOCK_M_PRESHUFFLED = BLOCK_M // PRESHUFFLE_FACTOR
-    BLOCK_N_PRESHUFFLED = BLOCK_N // PRESHUFFLE_FACTOR
-    BLOCK_K_PRESHUFFLED = BLOCK_K_SCALE * PRESHUFFLE_FACTOR
     
     WMMA_LAYOUT = get_wmma_layout(num_warps, False, False)
     WMMA_LAYOUT_PACKED = get_wmma_layout(num_warps, True, False)
@@ -793,18 +784,18 @@ def moe_gemm_a4w4_gfx1250(
     LAYOUT_X_SCALES = ttgl.amd.gfx1250.get_wmma_scale_layout(DOT_LAYOUT_X, [BLOCK_M, BLOCK_K_SCALE])
     LAYOUT_W_SCALES = ttgl.amd.gfx1250.get_wmma_scale_layout(DOT_LAYOUT_W, [BLOCK_N, BLOCK_K_SCALE])
 
-    BLOCK_K_PACKED = BLOCK_K // 2
-    SHARED_LAYOUT_X = ttgl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_K_PACKED, 16]], [BLOCK_M, BLOCK_K_PACKED], [1, 0])
-    SHARED_LAYOUT_W = ttgl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_K_PACKED, 16]], [BLOCK_N, BLOCK_K_PACKED], [1, 0])
-
-    SHARED_LAYOUT_X_SCALES = ttgl.PaddedSharedLayout.with_identity_for(
-        [[256, 16]], [BLOCK_M_PRESHUFFLED, BLOCK_K_PRESHUFFLED], [1, 0])
-    SHARED_LAYOUT_W_SCALES = ttgl.PaddedSharedLayout.with_identity_for(
-        [[256, 16]], [BLOCK_N_PRESHUFFLED, BLOCK_K_PRESHUFFLED], [1, 0])
-
-    BLOCKED_LAYOUT = ttgl.BlockedLayout([1, 8], [1, 32], [num_warps // 2, 2], [1, 0])
+    BLOCKED_LAYOUT_MK = ttgl.BlockedLayout(
+        size_per_thread=[triton.cdiv(BLOCK_M, 8), triton.cdiv(BLOCK_K // 2, 4)],
+        threads_per_warp=[8, 4],
+        warps_per_cta=[2, num_warps // 2],
+        order=[1, 0],
+    )
+    BLOCKED_LAYOUT_KN = ttgl.BlockedLayout(
+        size_per_thread=[triton.cdiv(BLOCK_K // 2, 4), triton.cdiv(BLOCK_N, 8)],
+        threads_per_warp=[4, 8],
+        warps_per_cta=[num_warps // 2, 2],
+        order=[0, 1],
+    )
 
     # launch kernel
     _moe_gemm_a4w4_gfx1250[(grid,)](
@@ -856,15 +847,12 @@ def moe_gemm_a4w4_gfx1250(
         MASK_K_LIMIT=K % config["block_k"],
         W_CACHE_MODIFIER=config["w_cache_modifier"],
         WMMA_LAYOUT=WMMA_LAYOUT,
-        SHARED_LAYOUT_X=SHARED_LAYOUT_X,
-        SHARED_LAYOUT_W=SHARED_LAYOUT_W,
-        SHARED_LAYOUT_X_SCALES=SHARED_LAYOUT_X_SCALES,
-        SHARED_LAYOUT_W_SCALES=SHARED_LAYOUT_W_SCALES,
         DOT_LAYOUT_X=DOT_LAYOUT_X,
         DOT_LAYOUT_W=DOT_LAYOUT_W,
         LAYOUT_X_SCALES=LAYOUT_X_SCALES,
         LAYOUT_W_SCALES=LAYOUT_W_SCALES,
-        BLOCKED_LAYOUT=BLOCKED_LAYOUT,
+        BLOCKED_LAYOUT_MK=BLOCKED_LAYOUT_MK,
+        BLOCKED_LAYOUT_KN=BLOCKED_LAYOUT_KN,
         UPCAST_INDICES=should_upcast_indices(x, w, y),
         num_warps=config["num_warps"],
         num_stages=config["num_stages"],
@@ -910,9 +898,9 @@ if __name__ == "__main__":
 
     # test the kernel
     device = torch.device("cuda")
-    m = 32
-    n = 32
-    k = 32
+    m = 128
+    n = 128
+    k = 128
     n_expts_tot = 8
     n_expts_act = 2
     do_gather = False
