@@ -7,11 +7,15 @@ import sys
 
 from setuptools import Distribution, setup
 from setuptools.command.build_ext import build_ext
+from setuptools.command.build_py import build_py
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 PACKAGE_NAME = "amd-aiter"
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
+PREBUILD_TRITON = int(os.environ.get("PREBUILD_TRITON", "0"))
+PREBUILD_TRITON_ARCHS = os.environ.get("PREBUILD_TRITON_ARCHS", "gfx942,gfx950")
+ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
 
 
 def getMaxJobs():
@@ -46,10 +50,66 @@ def is_develop_mode():
 # Copy source directories for packaging
 if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
     shutil.rmtree("aiter_meta")
-shutil.copytree("3rdparty", "aiter_meta/3rdparty")
+if ENABLE_CK:
+    shutil.copytree("3rdparty", "aiter_meta/3rdparty")
+else:
+    os.makedirs("aiter_meta/3rdparty", exist_ok=True)
+    if os.path.exists("3rdparty/ck_helper"):
+        shutil.copytree("3rdparty/ck_helper", "aiter_meta/3rdparty/ck_helper")
 shutil.copytree("hsa", "aiter_meta/hsa")
 shutil.copytree("gradlib", "aiter_meta/gradlib")
 shutil.copytree("csrc", "aiter_meta/csrc")
+
+
+def _run_triton_prebuild():
+    """Cross-compile Triton kernels for target architectures.
+
+    Uses a stub 'aiter' module in sys.modules so prebuild_triton can be
+    imported without triggering aiter/__init__.py (which imports JIT C++
+    extensions not yet built at this point).
+    """
+    import types
+
+    saved_aiter = sys.modules.get("aiter")
+    stub = types.ModuleType("aiter")
+    stub.__path__ = [os.path.join(this_dir, "aiter")]
+    stub.__package__ = "aiter"
+    sys.modules["aiter"] = stub
+
+    try:
+        from aiter.prebuild_triton.warmup import prebuild_triton_kernels
+
+        triton_cache_dir = os.path.join(this_dir, "aiter", "prebuild_triton_cache")
+        triton_archs = [a.strip() for a in PREBUILD_TRITON_ARCHS.split(",")]
+        print(f"[aiter] Precompiling Triton kernels for: {', '.join(triton_archs)}")
+        prebuild_triton_kernels(
+            cache_dir=triton_cache_dir,
+            archs=triton_archs,
+        )
+    finally:
+        # Restore original aiter module (or remove stub)
+        if saved_aiter is not None:
+            sys.modules["aiter"] = saved_aiter
+        else:
+            for key in list(sys.modules):
+                if key == "aiter" or key.startswith("aiter.prebuild_triton"):
+                    del sys.modules[key]
+
+
+class TritonPrebuildPy(build_py):
+    """Custom build_py that runs Triton precompilation before collecting files.
+
+    This ensures prebuild_triton_cache/ exists when build_py discovers
+    package data, so the compiled .hsaco binaries are included in the wheel.
+    """
+
+    def run(self):
+        if PREBUILD_TRITON:
+            try:
+                _run_triton_prebuild()
+            except Exception as e:
+                print(f"[aiter] Warning: Triton precompilation failed: {e}")
+        super().run()
 
 
 class NinjaBuildExtension(build_ext):
@@ -76,11 +136,12 @@ class NinjaBuildExtension(build_ext):
             raise NotImplementedError("Only ROCM is supported")
 
         ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
-        assert os.path.exists(ck_dir), (
-            "CK is needed by aiter, please make sure clone by "
-            '"git clone --recursive https://github.com/ROCm/aiter.git" or '
-            '"git submodule sync ; git submodule update --init --recursive"'
-        )
+        if ENABLE_CK:
+            assert os.path.exists(ck_dir), (
+                "CK is needed by aiter, please make sure clone by "
+                '"git clone --recursive https://github.com/ROCm/aiter.git" or '
+                '"git submodule sync ; git submodule update --init --recursive"'
+            )
 
         if is_develop_mode():
             with open("./aiter/install_mode", "w") as f:
@@ -95,14 +156,36 @@ class NinjaBuildExtension(build_ext):
                 with open(cfg_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
             except Exception:
-                return []
+                return [], {}
             if isinstance(data, dict):
-                return list(data.keys())
-            return []
+                return list(data.keys()), data
+            return [], {}
+
+        def _get_ck_dependent_modules(config_data):
+            """Identify modules that depend on CK 3rdparty or ASM codegen."""
+            ck_patterns = [
+                "CK_DIR",
+                "py_itfs_ck",
+                "gen_instances",
+                "generate.py",
+                "codegen.py",
+            ]
+            ck_modules = set()
+            for mod_name, mod_cfg in config_data.items():
+                mod_str = json.dumps(mod_cfg)
+                if any(p in mod_str for p in ck_patterns):
+                    ck_modules.add(mod_name)
+            return ck_modules
 
         def get_exclude_ops():
-            all_modules = _load_modules_from_config()
+            all_modules, config_data = _load_modules_from_config()
             exclude_ops = []
+
+            # When CK is disabled, exclude all CK/ASM-dependent modules
+            if not ENABLE_CK:
+                ck_modules = _get_ck_dependent_modules(config_data)
+                exclude_ops.extend(sorted(ck_modules))
+                return exclude_ops
 
             for module in all_modules:
                 if PREBUILD_KERNELS == 1:
@@ -165,7 +248,7 @@ class NinjaBuildExtension(build_ext):
                     "all", exclude=exclude_ops
                 )
 
-                if PREBUILD_KERNELS == 1:
+                if PREBUILD_KERNELS == 1 and ENABLE_CK:
                     extra_args_build = []
 
                     req_md_names = [
@@ -278,7 +361,7 @@ setup(
         "License :: OSI Approved :: BSD License",
         "Operating System :: Unix",
     ],
-    cmdclass={"build_ext": NinjaBuildExtension},
+    cmdclass={"build_py": TritonPrebuildPy, "build_ext": NinjaBuildExtension},
     python_requires=">=3.8",
     install_requires=[
         "pybind11>=3.0.1",
