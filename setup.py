@@ -271,7 +271,16 @@ setup(
     packages=["aiter_meta", "aiter"],
     include_package_data=True,
     package_data={
-        "": ["*"],
+        "aiter": ["*"],
+        "aiter_meta": [
+            "csrc/**/*.cu",
+            "csrc/**/*.h",
+            "csrc/**/*.hpp",
+            "csrc/**/*.cpp",
+            "3rdparty/**/*",
+            "hsa/**/*",
+            "gradlib/**/*",
+        ],
     },
     classifiers=[
         "Programming Language :: Python :: 3",
