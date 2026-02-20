@@ -720,9 +720,12 @@ def sage_quant_mxfp4(
     q,
     k,
     v,
+    BLOCK_M,
+    hadamard_rotation=False,
+    R=None,
+    BLOCK_R=None,
     q_smoothing=False,
-    layout="bshd",
-    BLOCK_M=256,
+    layout="bshd"
 ):
 
     if layout == "bhsd":
@@ -741,13 +744,14 @@ def sage_quant_mxfp4(
 
     # padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
     sm_scale = head_dim**-0.5
-    rotation_block_size = 32
 
     q_fp4, q_scale, k_fp4, k_scale, delta_s = smooth_rotate_downcast_qk(
         q,
         k,
         BLOCK_SIZE_M=BLOCK_M,
-        block_size=rotation_block_size,
+        hadamard_rotation=hadamard_rotation,
+        R=R,
+        BLOCK_R=BLOCK_R,
         q_smoothing=q_smoothing,
         layout=layout,
         sm_scale=(sm_scale * 1.4426950408889634),
@@ -866,6 +870,7 @@ def _rotate_quantize_qk_kernel(
     seqlen_k,
     d_model,
     q_smoothing: tl.constexpr,
+    hadamard_rotation: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_R: tl.constexpr,  # rotation block size
     D: tl.constexpr,  # D is 128
@@ -936,9 +941,7 @@ def _rotate_quantize_qk_kernel(
     qk_descale_ptr = descale_offset + offs_ds[None, :]
     qk_quant_ptr = quant_tensor_offset + offs_dq[None, :]
 
-    r_ptr = (
-        R + tl.arange(0, BLOCK_R)[:, None] * BLOCK_R + tl.arange(0, BLOCK_R)[None, :]
-    )
+    
 
     qk_tile = tl.load(
         qk_ptr, mask=(offs_m[:, None] < seqlen) & (offs_d[None, :] < d_model), other=0.0
@@ -960,19 +963,26 @@ def _rotate_quantize_qk_kernel(
             )
             tl.store(mean_ptr, m_row_mean * sm_scale)
 
-    r_mat = tl.load(r_ptr)  # BLOCK_R x BLOCK_R
+    if hadamard_rotation:
+        r_ptr = (
+            R + tl.arange(0, BLOCK_R)[:, None] * BLOCK_R + tl.arange(0, BLOCK_R)[None, :]
+        )
+        r_mat = tl.load(r_ptr)  # BLOCK_R x BLOCK_R
 
-    shape0: tl.constexpr = BLOCK_M * D // BLOCK_R
+        shape0: tl.constexpr = BLOCK_M * D // BLOCK_R
 
-    # Rotate: Q_rot = Q @ R
-    qk_rot_tile = tl.dot(qk_tile.reshape((shape0, BLOCK_R)).to(r_mat.dtype), r_mat)
-    qk_rot_tile = qk_rot_tile.reshape((BLOCK_M, D))
+        # Rotate: Q_rot = Q @ R
+        qk_rot_tile = tl.dot(qk_tile.reshape((shape0, BLOCK_R)).to(r_mat.dtype), r_mat)
+        qk_rot_tile = qk_rot_tile.reshape((BLOCK_M, D))
+    else:
+        qk_rot_tile = qk_tile.to(tl.float32)
+
 
     if is_q_pid:
         qk_rot_tile *= sm_scale
 
     qk_quant_tile, qk_descale = _compute_mx_quant_and_scale(
-        qk_rot_tile.to(tl.float16), offs_m[:, None] < seqlen, tl.uint8
+        qk_rot_tile, offs_m[:, None] < seqlen, tl.uint8
     )
 
     tl.store(qk_descale_ptr, qk_descale, mask=(offs_m[:, None] < seqlen))
@@ -1107,17 +1117,20 @@ def create_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
 def smooth_rotate_downcast_qk(
     q,
     k,
-    BLOCK_SIZE_M=256,
-    block_size=32,
+    BLOCK_SIZE_M,
+    hadamard_rotation=False,
+    R = None,
+    BLOCK_R=None,
     q_smoothing=False,
     sm_scale=None,
     layout="bhsd",
 ):
-
-    if block_size==32:
-        R = return_static_random_hadamard(q.device) / (block_size**0.5)
-    else:
-        R = create_hadamard_matrix(block_size, q.device) / (block_size**0.5)
+    if hadamard_rotation:
+        if R is None:
+            assert BLOCK_R is not None, "if using hadamard rotation, BLOCK_R (size of the hadamard matrix) must be provided."
+            R = create_hadamard_matrix(BLOCK_R, q.device) / (BLOCK_R**0.5)
+        else:
+            BLOCK_R = R.shape[-1]
 
     bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
 
@@ -1181,8 +1194,9 @@ def smooth_rotate_downcast_qk(
         s_k,
         d,
         q_smoothing=q_smoothing,
+        hadamard_rotation=hadamard_rotation,
         BLOCK_M=BLOCK_SIZE_M,
-        BLOCK_R=block_size,
+        BLOCK_R=BLOCK_R,
         D=d,
     )
 

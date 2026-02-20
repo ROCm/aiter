@@ -43,7 +43,9 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
         causal: bool,
         layout: str = "bshd",
         q_smooth: bool = False,
+        hadamard_rotation: bool = True,
         config: Optional[dict] = None,
+        R: torch.Tensor = None,
     ):
         bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
         bhsd_map = [0, 2, 1, 3] if layout == "bshd" else [0, 1, 2, 3]
@@ -52,8 +54,6 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
 
         if config is None:
             config = get_sage_fwd_configs_mxfp4()
-
-        BLKQ, BLKK = config["BLOCK_M"], config["BLOCK_N"]
 
         (
             q_quantized,
@@ -67,9 +67,12 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
             q,
             k,
             v,
+            hadamard_rotation=hadamard_rotation,
+            R=R,
+            BLOCK_M=config["BLOCK_M"],
+            BLOCK_R=32 if R is None else R.shape[-1],
             q_smoothing=q_smooth,
-            layout=layout,
-            BLOCK_M=BLKQ,
+            layout=layout
         )
 
         qd_mapped = map_dims(q_descale.shape, bhsd_map)
@@ -107,10 +110,12 @@ def fav3_sage_mxfp4_wrapper(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    causal: bool = False,
+    causal: bool,
     layout: str = "bshd",
     q_smooth: bool = False,
+    hadamard_rotation: bool = False,
     config: Optional[dict] = None,
+    R: torch.Tensor = None,
 ):
     """High-precision entry point for MXFP4 SageAttention."""
     for tensor, name in zip([q, k, v], ["q", "k", "v"]):
@@ -120,7 +125,7 @@ def fav3_sage_mxfp4_wrapper(
             torch.float32,
         ], f"Expected high-precision for {name}, got {tensor.dtype}"
 
-    return _FAv3SageMXFP4WrapperFunc.apply(q, k, v, causal, layout, q_smooth, config)
+    return _FAv3SageMXFP4WrapperFunc.apply(q, k, v, causal, layout, q_smooth, hadamard_rotation, config, R)
 
 
 def fav3_sage_mxfp4_func(

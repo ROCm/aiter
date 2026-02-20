@@ -14,6 +14,11 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     get_sage_fwd_configs_mxfp4,
     fav3_sage_mxfp4_func,
 )
+
+from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import (
+    return_static_random_hadamard
+)
+
 from op_tests.triton_tests.attention.test_fav3_sage import (
     compare_accuracy,
     input_helper,
@@ -67,9 +72,11 @@ def bench_kernel(q, k, v, args, provider):
             q,
             k,
             v,
+            hadamard_rotation=True,
+            BLOCK_M=config["BLOCK_M"],
+            BLOCK_R=D_HEAD,
             q_smoothing=args.qsmooth,
             layout=args.layout,
-            BLOCK_M=config["BLOCK_M"],
         )
         return lambda: fav3_sage_mxfp4_func(
             q=q_quantized,
@@ -79,16 +86,18 @@ def bench_kernel(q, k, v, args, provider):
             k_descale=k_descale,
             v_descale=v_descale,
             bias=delta_s,
-            causal=False,
+            causal=args.causal,
             layout=args.layout,
             config=config,
         )
 
-    fn = return_only_kernel_func_call()
+    # fn = return_only_kernel_func_call()
     # TODO: quantization drops the perf from 1800 to 1400 TFLOPs. This is too much.
-    # fn = lambda: fav3_sage_mxfp4_wrapper(
-    #     q, k, v, layout=args.layout, q_smooth=args.qsmooth
-    # )
+    R = return_static_random_hadamard(q.device)
+    
+    fn = lambda: fav3_sage_mxfp4_wrapper(
+        q, k, v, causal=args.causal, layout=args.layout, q_smooth=args.qsmooth, hadamard_rotation=True, R=R,
+    )
 
     ms = triton.testing.do_bench(fn)
     # print("kernel (ms)", ms)
@@ -179,6 +188,11 @@ def parse_args():
         action="store_true",
         help="Print VGPR usage of the called Triton kernels",
     )
+    parser.add_argument(
+        "-causal",
+        action="store_true",
+        help="Causal masking",
+    )
     return parser.parse_args()
 
 
@@ -205,7 +219,7 @@ def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
 
 def test_accuracy(q, k, v, args):
     triton_out = fav3_sage_mxfp4_wrapper(
-        q, k, v, layout=args.layout, q_smooth=args.qsmooth
+        q, k, v, causal=args.causal, layout=args.layout, q_smooth=args.qsmooth
     )
     # permute because FAv2 assumes bshd
     if args.layout == "bhsd":
