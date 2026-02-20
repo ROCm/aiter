@@ -50,6 +50,7 @@ shutil.copytree("3rdparty", "aiter_meta/3rdparty")
 shutil.copytree("hsa", "aiter_meta/hsa")
 shutil.copytree("gradlib", "aiter_meta/gradlib")
 shutil.copytree("csrc", "aiter_meta/csrc")
+open("aiter_meta/__init__.py", "w").close()
 
 
 class NinjaBuildExtension(build_ext):
@@ -269,9 +270,9 @@ setup(
     name=PACKAGE_NAME,
     use_scm_version=True,
     packages=["aiter_meta", "aiter"],
-    include_package_data=True,
     package_data={
-        "": ["*"],
+        "aiter": ["*"],
+        "aiter_meta": ["**/*"],
     },
     classifiers=[
         "Programming Language :: Python :: 3",
