@@ -72,7 +72,7 @@ def bench_kernel(q, k, v, args, provider):
             q,
             k,
             v,
-            hadamard_rotation=True,
+            hadamard_rotation=args.hadamard_rotate,
             BLOCK_M=config["BLOCK_M"],
             BLOCK_R=D_HEAD,
             q_smoothing=args.qsmooth,
@@ -96,7 +96,7 @@ def bench_kernel(q, k, v, args, provider):
     R = return_static_random_hadamard(q.device)
     
     fn = lambda: fav3_sage_mxfp4_wrapper(
-        q, k, v, causal=args.causal, layout=args.layout, q_smooth=args.qsmooth, hadamard_rotation=True, R=R,
+        q, k, v, causal=args.causal, layout=args.layout, q_smooth=args.qsmooth, hadamard_rotation=args.hadamard_rotate, R=R,
     )
 
     ms = triton.testing.do_bench(fn)
@@ -179,6 +179,12 @@ def parse_args():
         help="Provide dir for captured inputs, for accuracy comparison.",
     )
     parser.add_argument(
+        "-hadamard_rotate",
+        type=int,
+        default=1,
+        help="whether to apply hadamard rotate (1) or not (0). Default 1.",
+    )
+    parser.add_argument(
         "-qsmooth",
         action="store_true",
         help="Do q smoothing (Warning! Smoothing Q requires bias addition which drops the perf as of now!)",
@@ -219,7 +225,7 @@ def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
 
 def test_accuracy(q, k, v, args):
     triton_out = fav3_sage_mxfp4_wrapper(
-        q, k, v, causal=args.causal, layout=args.layout, q_smooth=args.qsmooth
+        q, k, v, causal=args.causal, layout=args.layout, q_smooth=args.qsmooth, hadamard_rotation=args.hadamard_rotate
     )
     # permute because FAv2 assumes bshd
     if args.layout == "bhsd":
