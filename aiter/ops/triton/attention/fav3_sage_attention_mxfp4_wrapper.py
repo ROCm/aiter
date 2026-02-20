@@ -2,9 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from __future__ import annotations
-from typing import Optional, Tuple
+from typing import Optional
 import torch
-import aiter
 import triton
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import map_dims
 from aiter.ops.triton.utils._triton import arch_info
@@ -18,7 +17,8 @@ def get_sage_fwd_configs_mxfp4():
     """Returns tuned config for MXFP4 on supported architectures."""
     arch = arch_info.get_arch()
     # MXFP4 is primarily targeted at gfx950
-    assert arch == "gfx950", f"MXFP4 is not supported on {arch}"
+    if arch != "gfx950":
+        raise RuntimeError(f"MXFP4 is not supported on {arch}")
     return {
         "BLOCK_M": 256,
         "BLOCK_N": 128,
@@ -31,7 +31,7 @@ def get_sage_fwd_configs_mxfp4():
 
 class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
     """
-    Sage Attention v1 MXFP4 wrapper maintaining high-precision I/O.
+    Sage Attention v2 MXFP4 wrapper maintaining high-precision I/O.
     """
 
     @staticmethod
@@ -81,8 +81,8 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
         expected_q_ds = (batch, num_q_heads, seqlen_q, head_dim // 32)
         expected_k_ds = (batch, num_kv_heads, seqlen_k, head_dim // 32)
 
-        assert tuple(qd_mapped) == expected_q_ds, f"q_descale mismatch"
-        assert tuple(kd_mapped) == expected_k_ds, f"k_descale mismatch"
+        assert tuple(qd_mapped) == expected_q_ds, "q_descale mismatch"
+        assert tuple(kd_mapped) == expected_k_ds, "k_descale mismatch"
 
         out = fav3_sage_mxfp4_func(
             q=q_quantized,
@@ -103,7 +103,7 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
     def backward(ctx, dout: torch.Tensor):
         # Backward remains unimplemented
         assert False, "backward not implemented"
-        return (None,) * 14
+        return (None,) * 7
 
 
 def fav3_sage_mxfp4_wrapper(
