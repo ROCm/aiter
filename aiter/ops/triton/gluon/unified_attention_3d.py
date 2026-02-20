@@ -173,12 +173,12 @@ def make_layout_3d(
         K_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
             vec=8, per_phase=2, max_phase=8, order=[0, 1]
         )
-        # V_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
-        #     vec=4, per_phase=2, max_phase=8, order=[1, 0]
-        # )
         V_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
+        # V_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
+        #     vec=4, per_phase=2, max_phase=8, order=[1, 0]
+        # )
 
     # size_per_thread along the fastest moving dimension is set to 8 (BF16)
     size_per_thread_fastest_dim = 8

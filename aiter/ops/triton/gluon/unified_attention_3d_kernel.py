@@ -1595,7 +1595,9 @@ def _request_from_lds(
     num_stages: ttgl.constexpr,
 ):
     ttgl.amd.cdna4.async_copy.wait_group(wait_group)
-    KV = smem.index(consumer % num_stages).load(layout=layout)
+    KV = ttgl.amd.cdna4.async_copy.load_shared_relaxed(
+        smem.index(consumer % num_stages), layout=layout
+    )
     if KV.dtype.is_fp8() and not Q_dtype.is_fp8():
         KV = (KV.to(ttgl.float32) * ttgl.load(kv_scale)).to(Q_dtype)
     return KV, consumer + 1
@@ -1910,8 +1912,7 @@ def gluon_kernel_unified_attention_3d_async(
     v_producer = 0
     v_consumer = 0
     j_producer = segm_idx * tiles_per_segment
-    j_consumer = segm_idx * tiles_per_segment
-    seq_offset = j_consumer * TILE_SIZE + ttgl.arange(
+    seq_offset = j_producer * TILE_SIZE + ttgl.arange(
         0, TILE_SIZE, layout=ttgl.SliceLayout(0, QK_WMMA_LAYOUT)
     )
 
@@ -1996,7 +1997,6 @@ def gluon_kernel_unified_attention_3d_async(
             smem_K,
             layout=K_DOT_LAYOUT,
             wait_group=(num_stages - 2) * 2 + 1,
-            # wait_group=0,
             num_stages=num_stages,
         )
 
@@ -2023,19 +2023,6 @@ def gluon_kernel_unified_attention_3d_async(
             cache_modifier=KV_cache_modifier,
             use_buffer_load=use_buffer_load,
         )
-
-        # Note: load K from LDS here is a bit slower
-        # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
-        # K, k_consumer = _request_from_lds(
-        #     k_consumer,
-        #     k_scale,
-        #     Q.dtype,
-        #     smem_K,
-        #     layout=K_DOT_LAYOUT,
-        #     wait_group=(num_stages - 1) * 2 + 1,
-        #     # wait_group=0,
-        #     num_stages=num_stages,
-        # )
 
         # P : shape = (BLOCK_M, TILE_SIZE), layout = Q_BLOCKED_LAYOUT
         # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
@@ -2076,14 +2063,12 @@ def gluon_kernel_unified_attention_3d_async(
             smem_V,
             layout=V_DOT_LAYOUT,
             wait_group=(num_stages - 1) * 2,
-            # wait_group=0,
             num_stages=num_stages,
         )
 
         # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
         acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
 
-        j_consumer = j_consumer + 1
         seq_offset += TILE_SIZE
 
     for _ in range(num_stages - 1):
@@ -2147,7 +2132,6 @@ def gluon_kernel_unified_attention_3d_async(
         # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
         acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
 
-        j_consumer = j_consumer + 1
         seq_offset += TILE_SIZE
 
     # store segm_output
