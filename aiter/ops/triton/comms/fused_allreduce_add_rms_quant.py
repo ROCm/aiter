@@ -28,7 +28,7 @@ __all__ = ["fused_allreduce_add_rms_quant"]
 
 logger = logging.getLogger(__name__)
 
-ALLREDUCE_IMPL = os.environ.get("VLLM_ROCM_FUSED_ALLREDUCE")
+ALLREDUCE_IMPL = os.environ.get("VLLM_ROCM_FUSED_ALLREDUCE", "iris_opt")
 
 
 def fused_allreduce_add_rms_quant(
@@ -39,7 +39,7 @@ def fused_allreduce_add_rms_quant(
     quant_dtype: torch.dtype,
     group_name: str,
     residual: Optional[torch.Tensor] = None,
-    impl: Optional[str] = ALLREDUCE_IMPL,
+    impl: str = ALLREDUCE_IMPL,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
