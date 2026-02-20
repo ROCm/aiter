@@ -113,7 +113,7 @@ def make_layout_3d(
         )
         PV_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDMFMALayout(
             version=4,
-            instr_shape=[16, 16, 32],
+            instr_shape=[16, 16, 16 if TILE_SIZE <= 16 else 32],
             transposed=True,
             warps_per_cta=[num_warps // 2, 2],
         )
