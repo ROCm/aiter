@@ -299,6 +299,7 @@ class BenchArgs:
         args_dict: dict[str, str] = {
             "--model": "deepseek-V3",
             "--dtype": "bf16",
+            "--tensor-parallelism": str(self.tp_model.tp),
             "-b": str(self.b),
             "--seqlen": str(self.s),
         }
