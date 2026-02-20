@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Literal, Optional, Tuple, List, Dict, Any
+from typing import List, Dict, Any
 import torch
 import os
 import glob
@@ -23,10 +23,9 @@ from op_tests.triton_tests.attention.test_fav3_sage import (
     compare_accuracy,
     input_helper,
 )
-from bench_fav3_sage import fav2_forward_func
+from .bench_fav3_sage import fav2_forward_func
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
-    get_caller_name_no_ext,
 )
 
 # Configuration
@@ -95,9 +94,10 @@ def bench_kernel(q, k, v, args, provider):
     # TODO: quantization drops the perf from 1800 to 1400 TFLOPs. This is too much.
     R = return_static_random_hadamard(q.device)
     
-    fn = lambda: fav3_sage_mxfp4_wrapper(
-        q, k, v, causal=args.causal, layout=args.layout, q_smooth=args.qsmooth, hadamard_rotation=args.hadamard_rotate, R=R,
-    )
+    def fn():
+        return fav3_sage_mxfp4_wrapper(
+            q, k, v, causal=args.causal, layout=args.layout, q_smooth=args.qsmooth, hadamard_rotation=args.hadamard_rotate, R=R,
+        )
 
     ms = triton.testing.do_bench(fn)
     # print("kernel (ms)", ms)
@@ -216,7 +216,7 @@ def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
         raise FileNotFoundError(f"No captured input files found in {input_dir}")
 
     inputs = []
-    for _, f in enumerate(input_files):
+    for f in input_files:
         data = torch.load(f, weights_only=False)
         inputs.append(data)
 
