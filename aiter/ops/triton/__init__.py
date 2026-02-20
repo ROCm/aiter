@@ -7,39 +7,12 @@ from types import SimpleNamespace
 
 from . import quant
 
-# Try to import comms module (requires iris)
-try:
-    from . import comms
+# Import comms subpackage. The comms __init__.py handles iris
+# availability internally via IRIS_COMM_AVAILABLE flag.
+from . import comms
+from .comms import IRIS_COMM_AVAILABLE
 
-    # Re-export communication primitives at this level for convenience
-    from .comms import (
-        IrisCommContext,
-        reduce_scatter,
-        all_gather,
-        reduce_scatter_rmsnorm_quant_all_gather,
-        IRIS_COMM_AVAILABLE,
-    )
-
-    _COMMS_AVAILABLE = True
-except ImportError:
-    # Iris not available - comms module won't be available
-    _COMMS_AVAILABLE = False
-    IRIS_COMM_AVAILABLE = False
-    comms = None
-
-__all__ = ["quant"]
-
-if _COMMS_AVAILABLE:
-    __all__.extend(
-        [
-            "comms",
-            "IrisCommContext",
-            "reduce_scatter",
-            "all_gather",
-            "reduce_scatter_rmsnorm_quant_all_gather",
-            "IRIS_COMM_AVAILABLE",
-        ]
-    )
+__all__ = ["quant", "comms", "IRIS_COMM_AVAILABLE"]
 
 """
 These following help implement backward-compatibility
