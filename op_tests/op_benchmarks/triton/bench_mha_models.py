@@ -965,6 +965,15 @@ def main() -> None:
 
     logging.info("Benchmarking attention configurations...")
 
+    metric: Metric = args.metric
+    if metric != METRICS["time"] and any(
+        model.use_mla for model in get_models(args.model)
+    ):
+        metric = METRICS["time"]
+        logging.warning(
+            "One or more benchmarks are backed by MLA. MLA benchmark doesn't support throughput or bandwidth metrics, switching to time metric."
+        )
+
     bench_args: list[BenchArgs] = get_bench_args_from_cli(args)
     num_bench_args: int = len(bench_args)
     logging.info("Number of benchmark configurations: %d", num_bench_args)
@@ -973,15 +982,6 @@ def main() -> None:
             "There's no valid benchmark configuration for the given input combination."
         )
         return
-
-    metric: Metric = args.metric
-    if metric == METRICS["time"] and any(
-        ba.tp_model.model.use_mla for ba in bench_args
-    ):
-        metric = METRICS["time"]
-        logging.warning(
-            "One or more benchmarks are backed by MLA. MLA benchmark doesn't support throughput or bandwidth metrics, switching to time metric."
-        )
 
     global_stats = GlobalStats()
 
