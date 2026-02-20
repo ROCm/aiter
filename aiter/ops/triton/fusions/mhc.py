@@ -382,20 +382,13 @@ def mhc(
     if hres_mode == "lite":
         return res
     else:
-        # Apply Sinkhorn-Knopp to the residual stream in-place
         M = res.shape[0]
         C = x.shape[1] // n
-        # Extract residual stream for sinkhorn (in-place view)
-        out_res = res[:, 2 * n :]  # Shape: (M, n²)
-        out_res_3d = out_res.view(M, n, n)
-        result = sinkhorn_knopp(
-            out_res_3d, C=C, num_iters=sinkhorn_iters, out=out_res_3d
-        )
-        # Copy result back only if it's a different tensor (contiguous() created new memory)
-        if result.data_ptr() != out_res_3d.data_ptr():
-            out_res.copy_(result.view(M, -1))
+        out_res_3d = res[:, 2 * n :].view(M, n, n)
 
-        # Return unified output tensor (res is modified in-place)
+        # In-place on the residual view (no copy-back path needed)
+        sinkhorn_knopp(out_res_3d, C=C, num_iters=sinkhorn_iters, out=out_res_3d)
+
         return res
 
 
@@ -428,14 +421,22 @@ def sinkhorn_knopp(
 
     assert num_iters > 0, f"num_iters must be positive, got {num_iters}"
 
-    logits = logits.contiguous()
-
     # Allocate output if not provided
     if out is None:
-        out = torch.empty((M, N, N), dtype=logits.dtype, device=logits.device)
+        # Kernel uses logits strides; allocate matching layout.
+        out = torch.empty_strided(
+            size=logits.shape,
+            stride=logits.stride(),
+            dtype=logits.dtype,
+            device=logits.device,
+        )
     else:
         assert out.shape == (M, N, N), f"out.shape {out.shape} must be ({M}, {N}, {N})"
-        out = out.contiguous()
+        assert out.dtype == logits.dtype and out.device == logits.device
+        assert out.stride() == logits.stride(), (
+            f"out.stride {out.stride()} must match logits.stride {logits.stride()} "
+            "for sinkhorn kernel"
+        )
 
     if config is None:
         config, _ = get_mhc_config("MHC_SINKHORN", M, C)
