@@ -19,7 +19,7 @@ from typing import Optional
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.fusions.mhc import (
+from aiter.ops.triton._triton_kernels.fusions import (
     _mhc_fused_kernel,
     _mhc_fused_split_kernel,
     _mhc_fused_reduce_kernel,
