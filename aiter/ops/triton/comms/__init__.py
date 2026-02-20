@@ -21,7 +21,7 @@ try:
     from .fused import reduce_scatter_rmsnorm_quant_all_gather
 
     IRIS_COMM_AVAILABLE = True
-except ImportError as e:
+except Exception as e:
     _logger.warning("Iris communication primitives not available: %s", e)
     IRIS_COMM_AVAILABLE = False
 
