@@ -141,7 +141,7 @@ def run_shape_benchmark(args):
     bench_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
 
 
-def parse_args():
+def parse_args(args: list[str] | None = None):
     parser = get_parser("MXFP4 x MXFP4 GEMM")
     parser = add_argparse_ff(parser)
     parser.add_argument(
@@ -152,15 +152,15 @@ def parse_args():
         action="store_true",
         help="Use Gluon implementation",
     )
-    return get_ff_args(parser)
+    return get_ff_args(parser, args=args)
 
 
-def main():
+def main(args: list[str] | None = None) -> None:
     if not (arch_info.is_fp4_avail()):
         print("MXFP4 is not available on this architecture")
         sys.exit()
 
-    args, defaults = parse_args()
+    args, defaults = parse_args(args=args)
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
         fun = lambda: run_benchmark(args, defaults)  # noqa: E731
