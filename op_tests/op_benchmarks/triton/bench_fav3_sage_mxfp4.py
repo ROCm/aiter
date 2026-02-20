@@ -23,7 +23,7 @@ from op_tests.triton_tests.attention.test_fav3_sage import (
     compare_accuracy,
     input_helper,
 )
-from .bench_fav3_sage import fav2_forward_func
+from op_tests.op_benchmarks.triton.bench_fav3_sage import fav2_forward_func
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
 )
