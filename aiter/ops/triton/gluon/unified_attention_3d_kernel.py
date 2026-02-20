@@ -2185,7 +2185,6 @@ def _buffer_load_to_reg_shuffle_via_lds(
     ptr,
     offsets,
     mask,
-    layout: ttgl.constexpr,
     cache_modifier: ttgl.constexpr,
 ):
     X = ttgl.amd.cdna4.buffer_load(
@@ -2198,8 +2197,6 @@ def _buffer_load_to_reg_shuffle_via_lds(
     if X.dtype.is_fp8() and not Q_dtype.is_fp8():
         X = (X.to(ttgl.float32) * ttgl.load(x_scale)).to(Q_dtype)
     smem.store(X)
-    # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
-    return smem.load(layout=layout)
 
 
 gluon_kernel_unified_attention_3d_repr = make_kernel_repr(
@@ -2212,7 +2209,7 @@ gluon_kernel_unified_attention_3d_repr = make_kernel_repr(
         "HEAD_SIZE",
         "num_warps",
         "num_stages",
-        "cache_modifier",
+        "ALL_DECODE",
     ],
 )
 
@@ -2490,29 +2487,29 @@ def gluon_kernel_unified_attention_3d(
         )
 
         # K_load : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_BLOCKED_LAYOUT
-        K = _buffer_load_to_reg_shuffle_via_lds(
+        _buffer_load_to_reg_shuffle_via_lds(
             k_scale,
             Q.dtype,
             smem_K,
             key_cache_ptr,
             k_offset.to(ttgl.int32),
             dim_mask[:, None] & tile_k_mask[None, :],
-            K_DOT_LAYOUT,
             KV_cache_modifier,
         )
 
         # V_load : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = Q_BLOCKED_LAYOUT
-        V = _buffer_load_to_reg_shuffle_via_lds(
+        _buffer_load_to_reg_shuffle_via_lds(
             v_scale,
             Q.dtype,
             smem_V,
             value_cache_ptr,
             v_offset.to(ttgl.int32),
             dim_mask[None, :] & tile_v_mask[:, None],
-            V_DOT_LAYOUT,
             KV_cache_modifier,
         )
 
+        # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
+        K = smem_K.load(layout=K_DOT_LAYOUT)
         P, L, M, acc = _perform_QK_wmma_and_update_L_M(
             Q,
             K,
@@ -2540,6 +2537,8 @@ def gluon_kernel_unified_attention_3d(
             PV_WMMA_LAYOUT,
         )
 
+        # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
+        V = smem_V.load(layout=V_DOT_LAYOUT)
         # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
         acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
 
