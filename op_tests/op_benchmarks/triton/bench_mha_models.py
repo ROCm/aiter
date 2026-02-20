@@ -641,74 +641,31 @@ def get_bench_args(
         start=DEFAULT_SEQ_START, inc=DEFAULT_SEQ_INC, end=DEFAULT_SEQ_END
     ),
 ) -> list[BenchArgs]:
-    # Filter out problematic configurations:
-    def is_problematic_config(args: BenchArgs) -> tuple[bool, Optional[str]]:
-        m: Model = args.tp_model.model
-        # (kernel=bwdo, layout=bshd, model=DeepSeek R1 (Decode), hq=128, hkv=1, dqk=576, dv=512, tp=1, b=8, s=8192)
-        # causes SEGFAULT.
-        causes_segfault: bool = (
-            args.kernel == "bwdo"
-            and args.s >= 8192
-            and args.b >= 8
-            and max(m.hq, m.hkv) >= 128
-            and max(m.dqk, m.dv) >= 512
+    # MHA kernel backend:
+    bench_args: list[BenchArgs] = [
+        BenchArgs(kernel=kernel, layout=layout, tp_model=tp_model, b=b, s=s)
+        for kernel, layout, tp_model, b, s in product(
+            kernels,
+            layouts,
+            (tp_model for tp_model in tp_models if not tp_model.model.use_mla),
+            batch_range.to_range(),
+            seq_range.to_range(),
         )
-        # Fused backward implementation requires DQK = DV as a power of 2. If DQK is greater than
-        # 512, there's no way to avoid LDS exhaustion. Even with the smallest block sizes and no
-        # pipelining, LDS exhaustion happens.
-        d_too_large_for_bwdf: bool = args.kernel == "bwdf" and m.dqk > 512
-        is_problematic: bool = causes_segfault or d_too_large_for_bwdf
-        root_cause: Optional[str] = (
-            "causes segfault"
-            if causes_segfault
-            else (
-                "head dimension too large for fused backward"
-                if d_too_large_for_bwdf
-                else None
-            )
+    ]
+    # MLA kernel backend:
+    # Only forward kernel, layout option doesn't make sense.
+    if "fwd" in kernels:
+        bench_args.extend(
+            [
+                BenchArgs(kernel="fwd", layout=None, tp_model=tp_model, b=b, s=s)
+                for tp_model, b, s in product(
+                    (tp_model for tp_model in tp_models if tp_model.model.use_mla),
+                    batch_range.to_range(),
+                    seq_range.to_range(),
+                )
+            ]
         )
-        return is_problematic, root_cause
-
-    kept: list[BenchArgs] = []
-    removed_count: int = 0
-
-    for kernel, layout, tp_model, b, s in product(
-        kernels,
-        layouts,
-        tp_models,
-        batch_range.to_range(),
-        seq_range.to_range(),
-    ):
-        args: BenchArgs = BenchArgs(
-            kernel=kernel, layout=layout, tp_model=tp_model, b=b, s=s
-        )
-        is_problematic, root_cause = is_problematic_config(args)
-        if is_problematic:
-            assert (
-                root_cause is not None
-            ), "Root cause string shouldn't be None for problematic benchmark configs."
-            removed_count += 1
-            logging.warning(
-                "Removing problematic benchmark configuration (%s): %s",
-                root_cause,
-                args.to_log_str(),
-            )
-        else:
-            kept.append(args)
-
-    kept_count: int = len(kept)
-    original_count: int = kept_count + removed_count
-    if removed_count > 0:
-        logging.warning(
-            "Filtered benchmark configurations: original=%d removed=%d kept=%d",
-            original_count,
-            removed_count,
-            kept_count,
-        )
-    else:
-        logging.info("Number of benchmark configurations: %d", original_count)
-
-    return kept
+    return bench_args
 
 
 class Stats:
@@ -1009,6 +966,13 @@ def main() -> None:
     logging.info("Benchmarking attention configurations...")
 
     bench_args: list[BenchArgs] = get_bench_args_from_cli(args)
+    num_bench_args: int = len(bench_args)
+    logging.info("Number of benchmark configurations: %d", num_bench_args)
+    if num_bench_args == 0:
+        logging.warning(
+            "There's no valid benchmark configuration for the given input combination."
+        )
+        return
 
     metric: Metric = args.metric
     if metric == METRICS["time"] and any(
