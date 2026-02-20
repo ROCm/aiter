@@ -117,3 +117,13 @@ torch::Tensor gemm_a8w8_blockscale_cktile(torch::Tensor& XQ,
     }
     return Y;
 }
+
+torch::Tensor gemm_a8w8_blockscale_bpreshuffle_cktile(torch::Tensor& XQ,
+                                                      torch::Tensor& WQ,
+                                                      torch::Tensor& x_scale,
+                                                      torch::Tensor& w_scale,
+                                                      torch::Tensor& Y,
+                                                      bool preshuffleB)
+{
+    return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y, preshuffleB);
+}
