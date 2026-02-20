@@ -152,7 +152,7 @@ def benchmark(args):
     return x_vals_list, x_names, line_vals
 
 
-def parse_args():
+def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="Benchmark MLA Prefill",
         allow_abbrev=False,
@@ -204,7 +204,7 @@ def parse_args():
         default=False,
         help="Write performance results to CSV file",
     )
-    return parser.parse_args()
+    return parser.parse_args(args=args)
 
 
 def run_bench(args):
@@ -213,12 +213,12 @@ def run_bench(args):
     benchmark(args)
 
 
-def main():
-    args = parse_args()
-    if args.print_vgpr:  # print the vgpr usage of the kernel
-        print_vgpr(lambda: run_bench(args), table_start=get_caller_name_no_ext())
-        return 0
-    run_bench(args)
+def main(args: list[str] | None = None) -> None:
+    parsed_args = parse_args(args=args)
+    if parsed_args.print_vgpr:  # print the vgpr usage of the kernel
+        print_vgpr(lambda: run_bench(parsed_args), table_start=get_caller_name_no_ext())
+        return
+    run_bench(parsed_args)
 
 
 if __name__ == "__main__":
