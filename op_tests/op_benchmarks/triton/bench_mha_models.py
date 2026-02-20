@@ -23,6 +23,7 @@ def disable_logs(logger: str) -> None:
 
 disable_logs("aiter")
 from bench_mha import main as bench_mha_main  # noqa: E402
+from bench_mla_decode import main as bench_mla_main  # noqa: E402
 
 # Module-level tracking for head dimension warnings
 # Stores (model_name, kernel) tuples to ensure each warning is logged once
@@ -44,6 +45,7 @@ class Model:
     hkv: int
     dqk: int
     dv: int
+    use_mla: bool = False
 
     def __post_init__(self) -> None:
         assert self.name, "Model name must be non-empty."
@@ -57,6 +59,9 @@ class Model:
         assert (
             self.dqk >= self.dv
         ), f"Invalid head dimensions: dqk ({self.dqk}) < dv ({self.dv}). Expected dqk >= dv."
+
+    def kernel_backend_str(self) -> str:
+        return "mla" if self.use_mla else "mha"
 
     def effective_d_qk_v(self, kernel: "Kernel") -> tuple[int, int]:
         """
@@ -142,6 +147,7 @@ class ModelBuilder:
     hkv: int
     dqk: int
     dv: int
+    use_mla: bool = False
 
     def __init__(self, name: str) -> None:
         self.name = name
@@ -164,8 +170,19 @@ class ModelBuilder:
         self.dv = dv
         return self
 
+    def mla(self) -> Self:
+        self.use_mla = True
+        return self
+
     def build(self) -> Model:
-        return Model(name=self.name, hq=self.hq, hkv=self.hkv, dqk=self.dqk, dv=self.dv)
+        return Model(
+            name=self.name,
+            hq=self.hq,
+            hkv=self.hkv,
+            dqk=self.dqk,
+            dv=self.dv,
+            use_mla=self.use_mla,
+        )
 
 
 TpDegree = Literal[1, 2, 4, 8]
@@ -189,6 +206,7 @@ class TpModel:
             hkv=max(original_model.hkv // self.tp, 1),
             dqk=original_model.dqk,
             dv=original_model.dv,
+            use_mla=original_model.use_mla,
         )
 
 
@@ -229,17 +247,22 @@ METRICS: dict[str, Metric] = {
 @dataclass(kw_only=True)
 class BenchArgs:
     kernel: Kernel
-    layout: Layout
+    layout: Optional[Layout]
     tp_model: TpModel
     b: int
     s: int
 
     def __post_init__(self) -> None:
+        assert self.tp_model.model.use_mla == (
+            self.layout is None
+        ), "Layout must be absent for MLA backed models or present for MHA backed models."
         assert self.b > 0, "Batch size must be positive."
         assert self.s > 0, "Sequence length must be positive."
 
-    def to_cli_str(self, metric: Metric) -> str:
+    def to_mha_cli_str(self, metric: Metric) -> str:
         """Convert to CLI string of `bench_mha.py`."""
+        assert self.layout is not None, "Layout must be present to run MHA benchmark."
+
         m: Model = self.tp_model.model
         s: str = str(self.s)
 
@@ -269,12 +292,30 @@ class BenchArgs:
 
         return args_str
 
+    def to_mla_cli_str(self) -> str:
+        """Convert to CLI string of `bench_mla_decode.py`."""
+        assert self.kernel == "fwd", "MLA only support forward kernel."
+
+        args_dict: dict[str, str] = {
+            "--model": "deepseek-V3",
+            "--dtype": "bf16",
+            "-b": str(self.b),
+            "--seqlen": str(self.s),
+        }
+
+        args_list: list[str] = [kv for k, v in args_dict.items() for kv in (k, v)]
+        args_list.extend(("-equal_seqlens", "-causal"))
+
+        args_str: str = " ".join(args_list)
+        return args_str
+
     def to_log_str(self) -> str:
         """Convert to log string."""
         m: Model = self.tp_model.model
         log_dict: dict[str, str] = {
+            "kernel_backend": m.kernel_backend_str(),
             "kernel": self.kernel,
-            "layout": self.layout,
+            "layout": str(self.layout),
             "model": m.name,
             "hq": str(m.hq),
             "hkv": str(m.hkv),
@@ -291,6 +332,7 @@ class BenchArgs:
     def csv_header(cls, metric: Metric) -> list[str]:
         """Return CSV header as a list of strings."""
         return [
+            "kernel_backend",
             "kernel",
             "layout",
             "model",
@@ -308,6 +350,7 @@ class BenchArgs:
         """Return CSV data row as a list of mixed types."""
         m: Model = self.tp_model.model
         return [
+            m.kernel_backend_str(),
             self.kernel,
             self.layout,
             m.name,
@@ -322,9 +365,8 @@ class BenchArgs:
         ]
 
 
-def get_bench_result(
-    args: BenchArgs, metric: Metric, out: str, err: str
-) -> Optional[float]:
+def get_stdout(out: str, err: str, num_out_lines: int) -> Optional[list[list[str]]]:
+    assert num_out_lines >= 0, "Expected number of stdout lines must be non-negative."
     # Check empty stderr:
     if err:
         logging.error("Standard error stream isn't empty: [%s]", err)
@@ -334,8 +376,21 @@ def get_bench_result(
         out_line.split() for out_line in out.strip().split(sep="\n")
     ]
     # Check number of lines in stdout:
-    if len(out_lines) != 3:
-        logging.error("Standard out stream doesn't have 3 lines: [%s]", out)
+    if len(out_lines) != num_out_lines:
+        logging.error(
+            "Standard out stream doesn't have %d lines: [%s]", num_out_lines, out
+        )
+        return None
+    return out_lines
+
+
+def get_mha_bench_result(
+    args: BenchArgs, metric: Metric, out: str, err: str
+) -> Optional[float]:
+    """Get result from `bench_mha.py`."""
+    # Get preprocessed stdout:
+    out_lines: Optional[list[list[str]]] = get_stdout(out, err, num_out_lines=3)
+    if out_lines is None:
         return None
     l0: list[str]
     l1: list[str]
@@ -384,16 +439,80 @@ def get_bench_result(
         return None
 
 
-def run_bench_mha(args: BenchArgs, metric: Metric) -> Optional[float]:
+def get_mla_bench_result(args: BenchArgs, out: str, err: str) -> Optional[float]:
+    """Get result from `bench_mla_decode.py`."""
+    # Get preprocessed stdout:
+    out_lines: Optional[list[list[str]]] = get_stdout(out, err, num_out_lines=3)
+    if out_lines is None:
+        return None
+    l0: list[str]
+    l1: list[str]
+    l2: list[str]
+    l0, l1, l2 = out_lines
+    # Check stdout line #1 (benchmark name):
+    if l0 != ["bench_mla_decode:"]:
+        logging.error("Benchmark name doesn't match: %s", l0)
+        return None
+    # Check stdout line #2 (table header):
+    if l1 != [
+        "model",
+        "B",
+        "H",
+        "S",
+        "kv_lora_rank",
+        "qk_rope_head_dim",
+        "rotary_dim",
+        "num_kv_splits",
+        "mla_decode_fwd",
+        "(ms)",
+    ]:
+        logging.error("Table header doesn't match: %s", l1)
+        return None
+    # Check stdout line #3 (table data):
+    try:
+        if not all(
+            [
+                len(l2) == 10,
+                l2[0] == "0",
+                l2[1] == "deepseek-V3",
+                int(float(l2[2])) == args.b,
+                int(float(l2[3])) == args.tp_model.model.hq,
+                int(float(l2[4])) == args.s,
+                int(float(l2[5])) == 512,
+                int(float(l2[6])) == 64,
+                int(float(l2[7])) == 64,
+                # TODO: Evaluate other `num_kv_splits` values, according to TP degree.
+                int(float(l2[8])) == 32,
+            ]
+        ):
+            logging.error("Table data doesn't match: %s", l2)
+            return None
+        return float(l2[9])
+    except ValueError as e:
+        logging.error(
+            "Unexpected numeric conversion error. %s: %s", type(e).__name__, e
+        )
+        return None
+
+
+def run_bench(args: BenchArgs, metric: Metric) -> Optional[float]:
     perf: Optional[float] = None
 
     out = io.StringIO()
     err = io.StringIO()
 
     try:
-        with redirect_stdout(out), redirect_stderr(err):
-            bench_mha_main(shlex.split(args.to_cli_str(metric)))
-        perf = get_bench_result(args, metric, out.getvalue(), err.getvalue())
+        if args.tp_model.model.use_mla:
+            assert (
+                metric == METRICS["time"]
+            ), "MLA benchmark only generates performance in milliseconds."
+            with redirect_stdout(out), redirect_stderr(err):
+                bench_mla_main(shlex.split(args.to_mla_cli_str()))
+            perf = get_mla_bench_result(args, out.getvalue(), err.getvalue())
+        else:
+            with redirect_stdout(out), redirect_stderr(err):
+                bench_mha_main(shlex.split(args.to_mha_cli_str(metric)))
+            perf = get_mha_bench_result(args, metric, out.getvalue(), err.getvalue())
 
     except OutOfResources as e:
         # Parse the error message to extract required LDS and hardware limit.
@@ -430,8 +549,8 @@ def run_bench_mha(args: BenchArgs, metric: Metric) -> Optional[float]:
     return perf
 
 
-def get_models(model_filter: Optional[str] = None) -> Iterable[Model]:
-    all_models: tuple[Model, ...] = (
+def get_models(model_filter: Optional[str] = None) -> list[Model]:
+    all_models: list[Model] = [
         Model.new("Llama3 405B").h_q_vk(128, 8).d(128).build(),
         Model.new("Llama3 70B").h_q_vk(64, 8).d(128).build(),
         Model.new("Llama3 8B").h_q_vk(32, 8).d(128).build(),
@@ -439,9 +558,9 @@ def get_models(model_filter: Optional[str] = None) -> Iterable[Model]:
         Model.new("Llama4 Maverick (Vision)").h(16).d(88).build(),
         Model.new("Qwen-235B-A22B").h_q_vk(64, 4).d(128).build(),
         Model.new("GPT-OSS 120B").h_q_vk(64, 8).d(64).build(),
-        Model.new("DeepSeek R1 (Prefill)").h(128).d_qk_v(192, 128).build(),
-        Model.new("DeepSeek R1 (Decode)").h_q_vk(128, 1).d_qk_v(576, 512).build(),
-    )
+        Model.new("DeepSeek V3 (Prefill)").h(128).d_qk_v(192, 128).build(),
+        Model.new("DeepSeek V3 (Decode)").mla().h_q_vk(128, 1).d_qk_v(576, 512).build(),
+    ]
     model_names: list[str] = [model.name for model in all_models]
     assert len(model_names) == len(
         set(model_names)
@@ -464,9 +583,9 @@ def get_models(model_filter: Optional[str] = None) -> Iterable[Model]:
         )
         return all_models
 
-    filtered_models: tuple[Model, ...] = tuple(
+    filtered_models: list[Model] = [
         model for model in all_models if pattern.search(model.name)
-    )
+    ]
     logging.debug("Number of filtered models: %d", len(filtered_models))
     if not filtered_models:
         logging.warning("There are no models after filtering by model name.")
@@ -478,8 +597,9 @@ def list_models() -> None:
     logging.info("Available models:")
     for model in get_models():
         logging.info(
-            "%s hq=%d hkv=%d dqk=%d dv=%d",
+            "%s kernel_backend=%s hq=%d hkv=%d dqk=%d dv=%d",
             model.name,
+            model.kernel_backend_str(),
             model.hq,
             model.hkv,
             model.dqk,
@@ -488,10 +608,10 @@ def list_models() -> None:
 
 
 def get_tp_models(
-    models: Iterable[Model] = get_models(),
+    models: list[Model] = get_models(),
     tps: Iterable[TpDegree] = get_args(TpDegree),
-) -> Iterable[TpModel]:
-    return tuple(TpModel(model=model, tp=tp) for model, tp in product(models, tps))
+) -> list[TpModel]:
+    return [TpModel(model=model, tp=tp) for model, tp in product(models, tps)]
 
 
 @dataclass(kw_only=True)
@@ -513,14 +633,14 @@ class Range:
 def get_bench_args(
     kernels: Iterable[Kernel] = get_args(Kernel),
     layouts: Iterable[Layout] = get_args(Layout),
-    tp_models: Iterable[TpModel] = get_tp_models(),
+    tp_models: list[TpModel] = get_tp_models(),
     batch_range: Range = Range(
         start=DEFAULT_BATCH_START, inc=DEFAULT_BATCH_INC, end=DEFAULT_BATCH_END
     ),
     seq_range: Range = Range(
         start=DEFAULT_SEQ_START, inc=DEFAULT_SEQ_INC, end=DEFAULT_SEQ_END
     ),
-) -> Iterable[BenchArgs]:
+) -> list[BenchArgs]:
     # Filter out problematic configurations:
     def is_problematic_config(args: BenchArgs) -> tuple[bool, Optional[str]]:
         m: Model = args.tp_model.model
@@ -826,13 +946,13 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def get_bench_args_from_cli(args: argparse.Namespace) -> Iterable[BenchArgs]:
+def get_bench_args_from_cli(args: argparse.Namespace) -> list[BenchArgs]:
     logging.debug("Requested kernels: %s", args.kernel)
 
     logging.debug("Requested layouts: %s", args.layout)
 
     logging.debug("Requested model filter: %s", args.model)
-    filtered_models: Iterable[Model] = get_models(args.model)
+    filtered_models: list[Model] = get_models(args.model)
     model_names: list[str] = [model.name for model in filtered_models]
     logging.debug("Resolved model names: %s", model_names)
 
@@ -888,15 +1008,25 @@ def main() -> None:
 
     logging.info("Benchmarking attention configurations...")
 
+    bench_args: list[BenchArgs] = get_bench_args_from_cli(args)
+
     metric: Metric = args.metric
+    if metric == METRICS["time"] and any(
+        ba.tp_model.model.use_mla for ba in bench_args
+    ):
+        metric = METRICS["time"]
+        logging.warning(
+            "One or more benchmarks are backed by MLA. MLA benchmark doesn't support throughput or bandwidth metrics, switching to time metric."
+        )
+
     global_stats = GlobalStats()
 
     with open(args.output, mode="w", newline="") as csv_file:
         writer = csv.writer(csv_file, quoting=csv.QUOTE_NONNUMERIC)
         writer.writerow(BenchArgs.csv_header(metric))
 
-        for ba_i, ba in enumerate(get_bench_args_from_cli(args), start=1):
-            perf: Optional[float] = run_bench_mha(ba, metric)
+        for ba_i, ba in enumerate(bench_args, start=1):
+            perf: Optional[float] = run_bench(ba, metric)
             m: Model = ba.tp_model.model
             if perf is None:
                 global_stats.report_failure(ba.kernel, m.name)
