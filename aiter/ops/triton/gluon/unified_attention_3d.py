@@ -303,6 +303,10 @@ def select_3d_config(
         num_tdm_gather,
         HEAD_SIZE_PADDED,
     )
+    
+    # num_tiles_per_seq = (max_seqlen_k // num_segments + TILE_SIZE - 1) // TILE_SIZE
+
+    attn_stages = 1
     if use_tdm:
         # With TDM async_copy pipelined, use_swizzle will be ignored (padded smem layout is used always)
         if num_tdm_gather > 1:
@@ -315,6 +319,7 @@ def select_3d_config(
             attn_impl = gluon_kernel_unified_attention_3d_tdm
             # print(f"Using TDM async copy pipelined kernel with TILE_SIZE={TILE_SIZE} and BLOCK_SIZE={block_size}")
             layouts = make_layout_3d(*hyper_parms, use_tdm, use_swizzle=False)
+        attn_stages = 2
     elif use_async:
         # With async_copy pipelined, use_swizzle should always be True
         attn_impl = gluon_kernel_unified_attention_3d_async
@@ -322,6 +327,7 @@ def select_3d_config(
         # gfx12 does not have async_copy.buffer_load_to_shared
         # TODO: check KV cache size to determine if use_buffer_load is needed in gfx950
         layouts["use_buffer_load"] = not IS_DEVICE_ARCH_GFX12
+        attn_stages = 2
     else:
         # Baseline kernel, num_stages does not matter, use_swizzle can be either True or False
         attn_impl = gluon_kernel_unified_attention_3d
@@ -330,8 +336,6 @@ def select_3d_config(
             use_tdm,
             use_swizzle=use_swizzle,
         )
-
-    attn_stages = 2 if num_segments > 1 else 1
 
     attn_config = {
         "TILE_SIZE": TILE_SIZE,
