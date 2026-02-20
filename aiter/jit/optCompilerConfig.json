@@ -263,7 +263,10 @@
         "extra_include": [
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/include'"
         ],
-        "flags_extra_hip": "['-mllvm -enable-noalias-to-md-conversion=1', '-mllvm -greedy-reverse-local-assignment=1'] + (['-DCK_TILE_EIGHTWARP_SUP'] if get_gfx().startswith('gfx95') else [])",
+        "flags_extra_hip": [
+            "'-mllvm -greedy-reverse-local-assignment=1'",
+            "'-mllvm -enable-noalias-to-md-conversion=1'"
+        ],
 
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances_cktile.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE}'"
     },
@@ -570,7 +573,10 @@
             "f'{AITER_CSRC_DIR}/pybind/rmsnorm_quant_pybind.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": ["'-ffast-math'"],
+        "flags_extra_hip": [
+            "'-ffast-math'",
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [
             "f'{AITER_CSRC_DIR}/include/ck_tile'",
@@ -644,8 +650,10 @@
         "extra_include": [
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/include'"
         ],
-        "flags_extra_hip": "['-mllvm -enable-noalias-to-md-conversion=1', '-mllvm -greedy-reverse-local-assignment=1'] + (['-DCK_TILE_EIGHTWARP_SUP'] if get_gfx().startswith('gfx95') else [])",
-
+        "flags_extra_hip": [
+            "'-mllvm -greedy-reverse-local-assignment=1'",
+            "'-mllvm -enable-noalias-to-md-conversion=1'"
+        ],
 
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances_cktile.py --working_path {{}} --tune'"
     },

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "gemm_a8w8_blockscale_bpreshuffle_cktile.h"
 #include "gemm_a8w8_blockscale_cktile.h"
 #include "rocm_ops.hpp"

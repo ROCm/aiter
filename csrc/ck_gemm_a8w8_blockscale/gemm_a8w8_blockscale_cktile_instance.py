@@ -16,6 +16,7 @@ sys.path.insert(0, AITER_CORE_DIR)
 
 from chip_info import get_gfx  # noqa: E402
 
+
 @dataclass
 class TileKernelInstance:
     M_Tile: int
@@ -105,11 +106,14 @@ kernels_list_95x = {
     10:   TileKernelInstance(   128,     128,      128,     2,        2,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             2      ),
     11:   TileKernelInstance(   192,     256,      128,     4,        2,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             1      ),
 }
+
 default_kernels_cktile_dict = {
     #######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile |   Scheduler   | TiledMMAPermuteN |  TransposeC  | UsePersistentKernel | BlockPerCu |
-    -1:  TileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,          64,      "Intrawave",        False,             True,           False,             1      ),
+    -1:  TileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,           64,      "Intrawave",        False,             True,           False,             1      ),
 }
+
 # fmt: on
+
 
 arch = get_gfx()
 if arch.startswith("gfx95"):

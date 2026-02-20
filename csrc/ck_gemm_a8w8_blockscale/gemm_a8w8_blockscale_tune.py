@@ -73,11 +73,11 @@ def run_gemm_a8w8_blockscale_cktile(
     Run gemm a8w8 blockscale tuned kernel for ck_tile type.
     """
 
-    #if preshuffleB:
+    # if preshuffleB:
     #    return aiter.gemm_a8w8_blockscale_bpreshuffle_cktile_tune(
     #        x, weight, x_scale, w_scale, out, kernel_id, splitK
     #    )
-    #else:
+    # else:
     #    return aiter.gemm_a8w8_blockscale_cktile_tune(
     #        x, weight, x_scale, w_scale, out, kernel_id, splitK
     #    )
@@ -126,6 +126,7 @@ def generate_data(m, n, k, seed, device="cuda"):
     return (x, weight, x_scale, w_scale, out, weight_shuffle, x_scale_t, w_scale_shuffle, w_scale_T)
             #0,  1,    2,        3,        4,        5,        6,        7,        8
 # x, weight, x_scale, w_scale, out, kernel_id, splitK, preshuffleB, preshuffleQuantB
+
 class GemmA8W8BlockScaleTuner(GemmCommonTuner):
     ARG_DEFAULTS = {
         **GemmCommonTuner.ARG_DEFAULTS,
@@ -160,10 +161,10 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         self.parser.add_argument(
             "--preshuffle",
             action="store_true",
-            help="Enable B-matrix preshuffle for CK gemm a8w8 blockscale"
+            help="Enable B-matrix preshuffle for CK gemm a8w8 blockscale",
         )
 
-        self.parser.add_argument(
+         self.parser.add_argument(
             "--preshuffleQuantB",
             action="store_true",
             help="Enable B-matrix preshuffle quantization for CK gemm a8w8 blockscale"
@@ -181,17 +182,20 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         Get the kernel name based on the kernel ID for different types.
         """
         if libType == "ck":
-            kernel_list = candidate_kernels_bpreshuffle_dict if preshuffleB else candidate_kernels_dict
+            kernel_list = (
+                candidate_kernels_bpreshuffle_dict
+                if preshuffleB
+                else candidate_kernels_dict
+            )
         elif libType == "cktile":
-            #kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
+            # kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
             kernel_list = candidate_kernels_cktile_dict_preshuffleQuant if preshuffleQuantB else candidate_kernels_cktile_dict
         else:
             return None
 
         if kernelId >= len(kernel_list) or kernelId < 0:
-             return None
+            return None
         return kernel_list[kernelId].name
-
 
     def get_gemm_a8w8_blockscale_cktile_tune_task(
         self,
@@ -206,15 +210,17 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         kernel_list = candidate_kernels_cktile_dict_preshuffleQuant if preshuffleQuantB else candidate_kernels_cktile_dict
         kernels_num = len(kernel_list)
         #gemm_a8w8_idx = [0, 5 if preshuffleB else 1, 2, 3, 4]
+        gemm_a8w8_idx = [0, 5, 6, 3, 4] if preshuffleB else [0, 1, 2, 3, 4]
         ref_data_idx = [0, 1, 2, 8 if preshuffleQuantB else 3]
         tasks_cktile = []
         for i in range(kernels_num):
             kernel = kernel_list[i]
             if not get_gfx().startswith("gfx95"):
                 if (kernel.M_Warp * kernel.N_Warp * kernel.K_Warp == 8) or (
-                    kernel.K_Warp_Tile > 64
+                    kernel.K_Warp_Tile > 64  # gfx942 not support
                 ):
                     continue
+
             maxsplitK = (
                 aiter.compute_gemm_SplitK(
                     M,
@@ -398,7 +404,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         ret = []
         if task:
             ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)
-        #print(ret)
+        # print(ret)
         return ret
 
     def result_to_df(self, results):

@@ -1,23 +1,25 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-from torch import Tensor
-from typing import Optional
 import functools
+from typing import Optional
+
 import pandas as pd
+import torch
 from aiter import logger
+from torch import Tensor
+from torch.library import Library
+
 from ..jit.core import (
-    compile_ops,
-    AITER_ROOT_DIR,
     AITER_CONFIGS,
     AITER_LOG_TUNED_CONFIG,
+    AITER_ROOT_DIR,
+    compile_ops,
 )
-from ..jit.utils.torch_guard import torch_compile_guard
-from ..utility import dtypes
 from ..jit.utils.chip_info import get_cu_num
-from torch.library import Library
+from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import get_padded_m
+from ..utility import dtypes
 
 aiter_lib = Library("aiter", "FRAGMENT")
 
@@ -163,6 +165,7 @@ def gemm_a8w8_blockscale_cktile(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    isBpreshuffled: bool = True,
     isBpreshuffled: bool = True,
     preshuffleQuantB : bool = False,
 ) -> torch.Tensor: ...
@@ -576,14 +579,6 @@ def gemm_a8w8_blockscale(
             if libtype == "ck":
                 return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
             elif libtype == "cktile":
-                # x_scale_input = x_scale
-                # m_warp, n_warp, k_warp = map(
-                #     int, config["kernelName"].split("_")[4].split("x")
-                # )
-                # if m_warp * n_warp * k_warp == 8:
-                #     x_scale_input = (
-                #         x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
-                #     )
                 return gemm_a8w8_blockscale_cktile(
                     XQ, WQ, x_scale, w_scale, Y, False, False
                 )
@@ -626,8 +621,8 @@ def gemm_a8w8_blockscale_bpreshuffle(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
-    preshuffleB: bool = False,
-    preshuffleQuantB: bool = False,
+    preshuffleB: bool = False, //TODO not sure if this is needed
+    preshuffleQuantB: bool = False, //TODO not sure if this is needed
 ) -> Tensor:
     assert dtype in [
         dtypes.bf16,
@@ -636,29 +631,17 @@ def gemm_a8w8_blockscale_bpreshuffle(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     config = get_CKGEMM_config(
-        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
+        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
     )
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     if config is not None:
         libtype = config["libtype"]
-        if libtype == "ck":
-            #x_scale_input = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
-            return gemm_a8w8_blockscale_bpreshuffle_ck(
-                XQ, WQ, x_scale, w_scale, Y
-            )
-        elif libtype == "cktile":
-            # m_warp, n_warp, k_warp = map(
-            #     int, config["kernelName"].split("_")[4].split("x")
-            # )
-            # if m_warp * n_warp * k_warp == 8:
-            #     x_scale_input = (
-            #         x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
-            #     )
-            return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y, preshuffleB , preshuffleQuantB)
-        else:
-            assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
-    return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+        if libtype == "cktile":
+            return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y, preshuffleB, preshuffleQuantB)
+        elif libtype == "ck":
+            return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+    return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
 
 def gfx950_a8w8_blockscale_ASM(

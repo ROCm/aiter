@@ -118,6 +118,7 @@ template <typename QDataType,
           bool UseDoubleSmemBuffer = PreshuffleB>
 void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
 {
+
     static constexpr ck_tile::QuantType QuantMode = ck_tile::QuantType::ABQuantGrouped;
     static constexpr bool transpose_c             = BQuantGroupSize::kN == 128;
     static constexpr bool eight_warps =
@@ -134,21 +135,21 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
 
     using TilePartitioner = ck_tile::GemmTile1DPartitioner<GemmShape>;
 
-    using GemmTraits =
-        ck_tile::TileGemmQuantTraits<false, // PadM
-                                     PadN,
-                                     PadK,
-                                     false, // PreshuffleQuant for A, not supported yet
-                                     PreshuffleQuantB, // PreshuffleQuant for B, not supported yet (distinct from PreshuffleB below)
-                                     PreshuffleB, // PreshuffleB (weight/B matrix preshuffle), supported
-                                     ALayout,
-                                     BLayout,
-                                     CLayout,
-                                     QuantMode,
-                                     std::conditional_t<eight_warps, AQLayout_8Warps, AQLayout>,
-                                     BQLayout,
-                                     transpose_c,
-                                     UseDoubleSmemBuffer>;
+    using GemmTraits = ck_tile::TileGemmQuantTraits<
+        false, // PadM
+        PadN,
+        PadK,
+        false,       // PreshuffleQuant for A, not supported yet
+        PreshuffleQuantB,       // PreshuffleQuant for B, not supported yet (distinct from PreshuffleB below)
+        PreshuffleB, // PreshuffleB (weight/B matrix preshuffle), supported
+        ALayout,
+        BLayout,
+        CLayout,
+        QuantMode,
+        std::conditional_t<eight_warps, AQLayout_8Warps, AQLayout>,
+        BQLayout,
+        transpose_c,
+        UseDoubleSmemBuffer>;
 
     using GemmPipelineProblem = ck_tile::GemmPipelineProblemBase<ADataType,
                                                                  BDataType,
@@ -162,10 +163,10 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
         ck_tile::BaseGemmPipelineAgBgCrCompV3<GemmPipelineProblem>,
         ck_tile::BaseWeightPreshufflePipelineAGmemBGmemCRegV2<GemmPipelineProblem>>;
 
-    //const ck_tile::index_t K_split =
-    //    (args.K + GemmConfig::K_Tile_v - 1) / GemmConfig::K_Tile_v * GemmConfig::K_Tile_v;
-    //const ck_tile::index_t num_loop    = TilePartitioner::GetLoopNum(K_split);
-    //const bool has_hot_loop            = BaseGemmPipeline::BlockHasHotloop(num_loop);
+    // const ck_tile::index_t K_split =
+    //     (args.K + GemmConfig::K_Tile_v - 1) / GemmConfig::K_Tile_v * GemmConfig::K_Tile_v;
+    // const ck_tile::index_t num_loop    = TilePartitioner::GetLoopNum(K_split);
+    // const bool has_hot_loop            = BaseGemmPipeline::BlockHasHotloop(num_loop);
     const ck_tile::index_t K_split  = ck_tile::integer_least_multiple(args.K, GemmConfig::K_Tile_v);
     const ck_tile::index_t num_loop = TilePartitioner::GetLoopNum(K_split);
     const bool has_hot_loop         = BaseGemmPipeline::BlockHasHotloop(num_loop);
@@ -235,11 +236,11 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
         {
             throw std::runtime_error("Wrong! Arguments not supported! Skipping gemm!\n");
         }
-
         using k_attr_t = ck_tile::kernel_attr<eight_warps>;
         ck_tile::launch_kernel(
             ck_tile::stream_config{nullptr /*stream_id*/, false /*time_kernel*/, 1 /*log_level*/},
-            ck_tile::make_kernel<GemmConfig::BlockPerCu_v, k_attr_t>(Kernel{}, grids, blocks, 0, kargs));
+            ck_tile::make_kernel<GemmConfig::BlockPerCu_v, k_attr_t>(
+                Kernel{}, grids, blocks, 0, kargs));
     };
 
     BaseGemmPipeline::TailHandler(Run, has_hot_loop, tail_num);
@@ -294,7 +295,8 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
 
     // prepare args
     ck_tile::QuantGemmHostArgs args;
-    args.a_ptr  = XQ.data_ptr();
+    args.a_ptr = XQ.data_ptr();
+
     if(eight_warps && !PreshuffleB)
     {
         torch::Tensor x_scale_t = x_scale.transpose(0, 1).contiguous().view(x_scale.sizes());
@@ -310,7 +312,7 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     {
         args.aq_ptr = x_scale.data_ptr();
     }
-    //args.aq_ptr = x_scale.data_ptr();
+
     args.b_ptr  = WQ.data_ptr();
     args.bq_ptr = w_scale.data_ptr();
     args.c_ptr  = Y.data_ptr();
@@ -329,9 +331,8 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     const int stride_B = K;
     const int stride_C = N;
     // const int stride_AQ = AQK;
-    const int stride_AQ = eight_warps
-                              ? M    // Col-Major
-                              : AQK; // Row-Major
+    const int stride_AQ = eight_warps ? M    // Col-Major
+                                      : AQK; // Row-Major
     const int stride_BQ = BQK;
 
     args.QK_A      = AQK;
