@@ -168,13 +168,13 @@ def make_layout_3d(
             )
     else:
         Q_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
-            vec=8, per_phase=1, max_phase=8, order=[1, 0]
+            vec=8, per_phase=2, max_phase=8, order=[1, 0]
         )
         K_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
-            vec=8, per_phase=1, max_phase=8, order=[0, 1]
+            vec=8, per_phase=2, max_phase=8, order=[0, 1]
         )
         V_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
-            vec=1, per_phase=1, max_phase=1, order=[1, 0]
+            vec=4, per_phase=2, max_phase=8, order=[1, 0]
         )
 
     # size_per_thread along the fastest moving dimension is set to 8 (BF16)
@@ -493,56 +493,7 @@ def unified_attention(
             device=q.device,
         )
 
-        # attn_impl[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
-        #     segm_output_ptr=segm_output,
-        #     segm_max_ptr=segm_max,
-        #     segm_expsum_ptr=segm_expsum,
-        #     query_ptr=q,
-        #     key_cache_ptr=k,
-        #     value_cache_ptr=v,
-        #     sink_ptr=sinks,
-        #     block_tables_ptr=block_table,
-        #     seq_lens_ptr=seqused_k,
-        #     alibi_slopes_ptr=alibi_slopes,
-        #     qq_bias_ptr=qq_bias,
-        #     scale=softmax_scale,
-        #     k_scale=k_descale,
-        #     v_scale=v_descale,
-        #     softcap=softcap,
-        #     num_tokens=num_tokens,
-        #     NUM_BLOCKS=num_blocks,
-        #     num_query_heads=num_query_heads,
-        #     num_queries_per_kv=num_queries_per_kv,
-        #     block_table_stride=block_table.stride(0),
-        #     query_stride_0=q.stride(0),
-        #     query_stride_1=q.stride(1),
-        #     qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
-        #     BLOCK_SIZE=block_size,
-        #     HEAD_SIZE=head_size,
-        #     HEAD_SIZE_PADDED=head_size_padded,
-        #     USE_ALIBI_SLOPES=use_alibi_slopes,
-        #     USE_QQ_BIAS=use_qq_bias,
-        #     USE_SOFTCAP=(softcap > 0),
-        #     USE_SINKS=(sinks is not None),
-        #     SLIDING_WINDOW=SLIDING_WINDOW,
-        #     stride_k_cache_0=k.stride(0),
-        #     stride_k_cache_1=k.stride(1),
-        #     stride_k_cache_2=k.stride(2),
-        #     stride_k_cache_3=k.stride(3),
-        #     stride_v_cache_0=v.stride(0),
-        #     stride_v_cache_1=v.stride(1),
-        #     stride_v_cache_2=v.stride(2),
-        #     stride_v_cache_3=v.stride(3),
-        #     query_start_len_ptr=cu_seqlens_q,
-        #     BLOCK_Q=BLOCK_Q,
-        #     num_seqs=num_seqs,
-        #     BLOCK_M=BLOCK_M,
-        #     ALL_DECODE=ALL_DECODE,
-        #     **attn_config,
-        # )
-        kernel_unified_attention_3d_new[
-            (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
-        ](
+        attn_impl[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,
             segm_expsum_ptr=segm_expsum,
@@ -554,14 +505,21 @@ def unified_attention(
             seq_lens_ptr=seqused_k,
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
+            scale=softmax_scale,
             k_scale=k_descale,
             v_scale=v_descale,
             softcap=softcap,
-            num_seqs=num_seqs,
-            num_blocks=num_blocks,
+            num_tokens=num_tokens,
+            NUM_BLOCKS=num_blocks,
+            num_query_heads=num_query_heads,
+            num_queries_per_kv=num_queries_per_kv,
+            block_table_stride=block_table.stride(0),
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
+            BLOCK_SIZE=block_size,
+            HEAD_SIZE=head_size,
+            HEAD_SIZE_PADDED=head_size_padded,
             USE_ALIBI_SLOPES=use_alibi_slopes,
             USE_QQ_BIAS=use_qq_bias,
             USE_SOFTCAP=(softcap > 0),
@@ -575,23 +533,65 @@ def unified_attention(
             stride_v_cache_1=v.stride(1),
             stride_v_cache_2=v.stride(2),
             stride_v_cache_3=v.stride(3),
-            block_table_stride=block_table.stride(0),
             query_start_len_ptr=cu_seqlens_q,
-            SCALE=softmax_scale,
-            NUM_QUERY_HEADS=num_query_heads,
-            NUM_KV_HEADS=num_kv_heads,
-            BLOCK_SIZE=block_size,
-            HEAD_SIZE=head_size,
             BLOCK_Q=BLOCK_Q,
+            num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
-            NUM_SEGMENTS_PER_SEQ=attn_config["NUM_SEGMENTS_PER_SEQ"],
-            WARP_SIZE=32,
-            num_warps=attn_config["num_warps"],
-            waves_per_eu=attn_config["waves_per_eu"],
-            NUM_STAGES=attn_config["num_stages"],
-            NUM_BLOCKS_GATHER_PER_TILE=attn_config["TILE_SIZE"] // block_size,
             ALL_DECODE=ALL_DECODE,
+            **attn_config,
         )
+        # kernel_unified_attention_3d_new[
+        #     (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
+        # ](
+        #     segm_output_ptr=segm_output,
+        #     segm_max_ptr=segm_max,
+        #     segm_expsum_ptr=segm_expsum,
+        #     query_ptr=q,
+        #     key_cache_ptr=k,
+        #     value_cache_ptr=v,
+        #     sink_ptr=sinks,
+        #     block_tables_ptr=block_table,
+        #     seq_lens_ptr=seqused_k,
+        #     alibi_slopes_ptr=alibi_slopes,
+        #     qq_bias_ptr=qq_bias,
+        #     k_scale=k_descale,
+        #     v_scale=v_descale,
+        #     softcap=softcap,
+        #     num_seqs=num_seqs,
+        #     num_blocks=num_blocks,
+        #     query_stride_0=q.stride(0),
+        #     query_stride_1=q.stride(1),
+        #     qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
+        #     USE_ALIBI_SLOPES=use_alibi_slopes,
+        #     USE_QQ_BIAS=use_qq_bias,
+        #     USE_SOFTCAP=(softcap > 0),
+        #     USE_SINKS=(sinks is not None),
+        #     SLIDING_WINDOW=SLIDING_WINDOW,
+        #     stride_k_cache_0=k.stride(0),
+        #     stride_k_cache_1=k.stride(1),
+        #     stride_k_cache_2=k.stride(2),
+        #     stride_k_cache_3=k.stride(3),
+        #     stride_v_cache_0=v.stride(0),
+        #     stride_v_cache_1=v.stride(1),
+        #     stride_v_cache_2=v.stride(2),
+        #     stride_v_cache_3=v.stride(3),
+        #     block_table_stride=block_table.stride(0),
+        #     query_start_len_ptr=cu_seqlens_q,
+        #     SCALE=softmax_scale,
+        #     NUM_QUERY_HEADS=num_query_heads,
+        #     NUM_KV_HEADS=num_kv_heads,
+        #     BLOCK_SIZE=block_size,
+        #     HEAD_SIZE=head_size,
+        #     BLOCK_Q=BLOCK_Q,
+        #     BLOCK_M=BLOCK_M,
+        #     NUM_SEGMENTS_PER_SEQ=attn_config["NUM_SEGMENTS_PER_SEQ"],
+        #     WARP_SIZE=32,
+        #     num_warps=attn_config["num_warps"],
+        #     waves_per_eu=attn_config["waves_per_eu"],
+        #     NUM_STAGES=attn_config["num_stages"],
+        #     NUM_BLOCKS_GATHER_PER_TILE=attn_config["TILE_SIZE"] // block_size,
+        #     ALL_DECODE=ALL_DECODE,
+        # )
 
         gluon_reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
