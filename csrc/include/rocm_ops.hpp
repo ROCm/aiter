@@ -1816,3 +1816,13 @@ namespace py = pybind11;
           py::arg("input"),                  \
           py::arg("weight"),                 \
           py::arg("epsilon"));
+
+#define MHC_PYBIND                     \
+    m.def("mhc_pre_gemm_sqrsum",       \
+          &aiter::mhc_pre_gemm_sqrsum, \
+          "mhc_pre_gemm_sqrsum",       \
+          py::arg("out"),              \
+          py::arg("sqrsum"),           \
+          py::arg("x"),                \
+          py::arg("fn"),               \
+          py::arg("tile_k") = 128);

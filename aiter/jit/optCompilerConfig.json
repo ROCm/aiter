@@ -1196,5 +1196,20 @@
         "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
+    },
+    "module_mhc": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mhc_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mhc_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/include/ck_tile'",
+            "f'{AITER_CSRC_DIR}/include/opus'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
     }
 }
