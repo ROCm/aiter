@@ -113,7 +113,7 @@ def make_layout_3d(
         )
         PV_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDMFMALayout(
             version=4,
-            instr_shape=[16, 16, 16],
+            instr_shape=[16, 16, 32],
             transposed=True,
             warps_per_cta=[num_warps // 2, 2],
         )
@@ -173,8 +173,11 @@ def make_layout_3d(
         K_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
             vec=8, per_phase=2, max_phase=8, order=[0, 1]
         )
+        # V_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
+        #     vec=4, per_phase=2, max_phase=8, order=[1, 0]
+        # )
         V_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
-            vec=4, per_phase=2, max_phase=8, order=[1, 0]
+            vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
 
     # size_per_thread along the fastest moving dimension is set to 8 (BF16)
@@ -205,6 +208,15 @@ def make_layout_3d(
         ],
         warps_per_cta=[1, num_warps],
         order=[0, 1],
+    )
+    V_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
+        size_per_thread=[1, size_per_thread_fastest_dim],
+        threads_per_warp=[
+            WARP_SIZE // threads_per_warp_fastest_dim,
+            threads_per_warp_fastest_dim,
+        ],
+        warps_per_cta=[num_warps, 1],
+        order=[1, 0],
     )
 
     # TODO: for future impl
@@ -237,6 +249,7 @@ def make_layout_3d(
         "V_SHARED_LAYOUT": V_SHARED_LAYOUT,
         "Q_BLOCKED_LAYOUT": Q_BLOCKED_LAYOUT,
         "K_BLOCKED_LAYOUT": K_BLOCKED_LAYOUT,
+        "V_BLOCKED_LAYOUT": V_BLOCKED_LAYOUT,
     }
 
 

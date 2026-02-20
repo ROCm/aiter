@@ -494,6 +494,7 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
     V_SHARED_LAYOUT: ttgl.constexpr,
     Q_BLOCKED_LAYOUT: ttgl.constexpr,
     K_BLOCKED_LAYOUT: ttgl.constexpr,
+    V_BLOCKED_LAYOUT: ttgl.constexpr,
     num_ctas: ttgl.constexpr = 1,  # int
     ALL_DECODE: ttgl.constexpr = False,  # bool
 ):
@@ -1147,6 +1148,7 @@ def gluon_kernel_unified_attention_3d_tdm(
     V_SHARED_LAYOUT: ttgl.constexpr,
     Q_BLOCKED_LAYOUT: ttgl.constexpr,
     K_BLOCKED_LAYOUT: ttgl.constexpr,
+    V_BLOCKED_LAYOUT: ttgl.constexpr,
     num_ctas: ttgl.constexpr = 1,  # int
     ALL_DECODE: ttgl.constexpr = False,  # bool
 ):
@@ -1619,12 +1621,12 @@ def _get_kv_offsets(
     stride_v_cache_2: ttgl.int64,
     stride_v_cache_3: ttgl.constexpr,
     K_BLOCKED_LAYOUT: ttgl.constexpr,
-    Q_BLOCKED_LAYOUT: ttgl.constexpr,
+    V_BLOCKED_LAYOUT: ttgl.constexpr,
     TILE_SIZE: ttgl.constexpr,
     BLOCK_SIZE: ttgl.constexpr,
 ):
     # seq_k_offset : shape = (TILE_SIZE, ), layout = ttgl.SliceLayout(0, K_BLOCKED_LAYOUT)
-    # seq_v_offset : shape = (TILE_SIZE, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+    # seq_v_offset : shape = (TILE_SIZE, ), layout = ttgl.SliceLayout(1, V_BLOCKED_LAYOUT)
     seq_k_offset = j * TILE_SIZE + offs_k_t
     seq_v_offset = j * TILE_SIZE + offs_v_t
 
@@ -1633,7 +1635,7 @@ def _get_kv_offsets(
             (1,), 1, dtype=tl.int1, layout=ttgl.SliceLayout(0, K_BLOCKED_LAYOUT)
         )
         tile_v_mask = ttgl.full(
-            (1,), 1, dtype=tl.int1, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+            (1,), 1, dtype=tl.int1, layout=ttgl.SliceLayout(1, V_BLOCKED_LAYOUT)
         )
     else:
         tile_k_mask = seq_k_offset < max_seq_prefix_len
@@ -1742,6 +1744,7 @@ def gluon_kernel_unified_attention_3d_async(
     V_SHARED_LAYOUT: ttgl.constexpr,
     Q_BLOCKED_LAYOUT: ttgl.constexpr,
     K_BLOCKED_LAYOUT: ttgl.constexpr,
+    V_BLOCKED_LAYOUT: ttgl.constexpr,
     use_buffer_load: ttgl.constexpr = True,
     ALL_DECODE: ttgl.constexpr = False,  # bool
 ):
@@ -1812,9 +1815,9 @@ def gluon_kernel_unified_attention_3d_async(
         0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(1, K_BLOCKED_LAYOUT)
     )
 
-    offs_v_t = ttgl.arange(0, TILE_SIZE, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT))
+    offs_v_t = ttgl.arange(0, TILE_SIZE, layout=ttgl.SliceLayout(1, V_BLOCKED_LAYOUT))
     offs_v_d = ttgl.arange(
-        0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(0, Q_BLOCKED_LAYOUT)
+        0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(0, V_BLOCKED_LAYOUT)
     )
 
     query_pos = q_block_local_idx * BLOCK_Q + offs_q_m // num_queries_per_kv
@@ -1932,7 +1935,7 @@ def gluon_kernel_unified_attention_3d_async(
             stride_v_cache_2,
             stride_v_cache_3,
             K_BLOCKED_LAYOUT,
-            Q_BLOCKED_LAYOUT,
+            V_BLOCKED_LAYOUT,
             TILE_SIZE,
             BLOCK_SIZE,
         )
@@ -1981,9 +1984,20 @@ def gluon_kernel_unified_attention_3d_async(
             stride_v_cache_2,
             stride_v_cache_3,
             K_BLOCKED_LAYOUT,
-            Q_BLOCKED_LAYOUT,
+            V_BLOCKED_LAYOUT,
             TILE_SIZE,
             BLOCK_SIZE,
+        )
+
+        K, k_consumer = _request_from_lds(
+            k_consumer,
+            k_scale,
+            Q.dtype,
+            smem_K,
+            layout=K_DOT_LAYOUT,
+            wait_group=(num_stages - 2) * 2 + 1,
+            # wait_group=0,
+            num_stages=num_stages,
         )
 
         # K_load : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_BLOCKED_LAYOUT
@@ -2010,18 +2024,18 @@ def gluon_kernel_unified_attention_3d_async(
             use_buffer_load=use_buffer_load,
         )
 
-        # TODO: put this before async_load and compare perf, remember to change wait_group to (num_stages - 2) * 2 + 1
+        # Note: load K from LDS here is a bit slower
         # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
-        K, k_consumer = _request_from_lds(
-            k_consumer,
-            k_scale,
-            Q.dtype,
-            smem_K,
-            layout=K_DOT_LAYOUT,
-            wait_group=(num_stages - 1) * 2 + 1,
-            # wait_group=0,
-            num_stages=num_stages,
-        )
+        # K, k_consumer = _request_from_lds(
+        #     k_consumer,
+        #     k_scale,
+        #     Q.dtype,
+        #     smem_K,
+        #     layout=K_DOT_LAYOUT,
+        #     wait_group=(num_stages - 1) * 2 + 1,
+        #     # wait_group=0,
+        #     num_stages=num_stages,
+        # )
 
         # P : shape = (BLOCK_M, TILE_SIZE), layout = Q_BLOCKED_LAYOUT
         # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
@@ -2275,6 +2289,7 @@ def gluon_kernel_unified_attention_3d(
     V_SHARED_LAYOUT: ttgl.constexpr,
     Q_BLOCKED_LAYOUT: ttgl.constexpr,
     K_BLOCKED_LAYOUT: ttgl.constexpr,
+    V_BLOCKED_LAYOUT: ttgl.constexpr,
     ALL_DECODE: ttgl.constexpr = False,  # bool
     SHUFFLED_KV_CACHE: ttgl.constexpr = False,  # bool
 ):
@@ -2342,9 +2357,9 @@ def gluon_kernel_unified_attention_3d(
         0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(1, K_BLOCKED_LAYOUT)
     )
 
-    offs_v_t = ttgl.arange(0, TILE_SIZE, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT))
+    offs_v_t = ttgl.arange(0, TILE_SIZE, layout=ttgl.SliceLayout(1, V_BLOCKED_LAYOUT))
     offs_v_d = ttgl.arange(
-        0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(0, Q_BLOCKED_LAYOUT)
+        0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(0, V_BLOCKED_LAYOUT)
     )
 
     query_pos = q_block_local_idx * BLOCK_Q + offs_q_m // num_queries_per_kv
@@ -2469,7 +2484,7 @@ def gluon_kernel_unified_attention_3d(
         #
         # # 2. convert_layout from physical_block_idx_k, i.e., ttgl.SliceLayout(0, K_BLOCKED_LAYOUT) -> ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT) (see below):
         physical_block_idx_v = ttgl.convert_layout(
-            physical_block_idx_k, layout=ttgl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+            physical_block_idx_k, layout=ttgl.SliceLayout(1, V_BLOCKED_LAYOUT)
         )
 
         v_offset = (
