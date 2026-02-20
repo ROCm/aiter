@@ -26,7 +26,7 @@ def fused_add_rmsnorm_pad(
         assert M == M2, "Shape error!"
         assert N == N2, "Shape error!"
         res_out = torch.empty((M, N), dtype=res.dtype, device=res.device)
-    BLOCK_SIZE_N = 64
+    BLOCK_SIZE_N = (next_power_of_2(N), 64)
     if (BLOCK_SIZE_N == 64):
         num_warps = 2
         num_stages = 2
