@@ -8,6 +8,50 @@ from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 import triton
 
+@triton.jit
+def packed_nonzero(x):
+    low = (x & 0xFFFF)
+    high = (x >> 16)
+    _1u = tl.full([],1,dtype=tl.uint16)
+    combined = tl.join(low, high).to(tl.uint16)
+    combined = tl.minimum(combined, _1u)
+    combined -= _1u
+    low, high = tl.split(combined.to(tl.uint32))
+    y = (high<<16) | low
+    return y.to(tl.uint32, bitcast=True)
+
+@triton.jit
+def dequant_fp4_bf16_with_scale(x, sc):
+    # 'x' is a tensor of shape [W,H] and dtype uint8.
+    # 'sc' is a tensor of the same shape.
+    # We return a tensor of shape [W,2*H] and type bfloat16.
+    half_mantissa_bits = 7
+    FLOAT4_EXP_BIAS = 1
+
+    MSB = (1 << (half_mantissa_bits-1))
+    x = x.to(tl.uint32) * (MSB*0x1001) & (MSB*0xF000F)
+    y = x | (x << (12-(half_mantissa_bits-1)))
+    mask = (tl.full([],0x80008,dtype=tl.uint32) << 12) | (0x70007 * MSB)
+    y &= mask
+
+    bias = (sc - FLOAT4_EXP_BIAS)*(MSB*0x20002)
+    y += bias
+
+    mask0 = packed_nonzero(x & (MSB*0x60006))
+    mask1 = packed_nonzero(x & (MSB*0x70007))
+    signed_05 = (y & 0x80008000) | bias
+    # ?001 -> +/-0.5
+    y = (y & ~mask0) | (signed_05 & mask0)
+
+    # ?000 -> +/-0
+    y = (y & ~mask1)
+
+    low_u16 = (y & 0xFFFF).to(tl.uint16)
+    high_u16 = (y >> 16).to(tl.uint16)
+    combined = tl.join(low_u16, high_u16)
+    return combined.to(tl.bfloat16, bitcast=True)
+
+
 _gemm_afp4wfp4_repr = make_kernel_repr(
     "_gemm_afp4wfp4_kernel",
     [
@@ -53,6 +97,7 @@ def _gemm_afp4wfp4_kernel(
     stride_ask,
     stride_bsn,
     stride_bsk,
+    emu: tl.constexpr,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -161,9 +206,24 @@ def _gemm_afp4wfp4_kernel(
                     cache_modifier=cache_modifier,
                 )
 
-            accumulator = tl.dot_scaled(
-                a, a_scales, "e2m1", b, b_scales, "e2m1", accumulator
-            )
+            # Although triton promises to fall back to SW emulation in tl.dot_scaled if
+            # MXFP4 is unavailable, this is not actually always available.
+            # It's easier to do this by hand.
+            if emu:
+                a = a.reshape([BLOCK_SIZE_M, BLOCK_SIZE_K//SCALE_GROUP_SIZE, SCALE_GROUP_SIZE//2])
+                b = b.reshape([BLOCK_SIZE_K//SCALE_GROUP_SIZE, SCALE_GROUP_SIZE//2, BLOCK_SIZE_N])
+                a16 = dequant_fp4_bf16_with_scale(a, a_scales[:, :, None])
+                b16 = dequant_fp4_bf16_with_scale(b, b_scales.T[:,None,:])
+
+                b16 = b16.permute([0,1,3,2])
+                a16 = a16.reshape([BLOCK_SIZE_M, BLOCK_SIZE_K])
+                b16 = b16.reshape([BLOCK_SIZE_K, BLOCK_SIZE_N])
+
+                accumulator = tl.dot(a16, b16, accumulator)
+            else:
+                accumulator = tl.dot_scaled(
+                    a, a_scales, "e2m1", b, b_scales, "e2m1", accumulator
+                )
 
             # Advance the ptrs to the next K block.
             a_ptrs += (BLOCK_SIZE_K // 2) * stride_ak
