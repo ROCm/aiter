@@ -1,10 +1,22 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
+#include <cmath>
+#include <functional>
+#include <unordered_map>
+
+#include <torch/extension.h>
+
 #include "gemm_a8w8_blockscale_common.cuh"
-#include "gemm_a8w8_blockscale_common_tune.h"
 #include "gemm_a8w8_blockscale_lookup.h"
 #include "gemm_a8w8_blockscale_manifest.h"
+
+using BlockwiseKernel = std::function<torch::Tensor(
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&)>;
+
+// For certain high priority shapes, we directly use the best kernel rather
+// than use heuristics.
+using BlockwiseKernelMap = std::unordered_map<int, BlockwiseKernel>;
 
 template <typename DDataType, typename EDataType = DDataType>
 static BlockwiseKernel blockwise_dispatch(int id)

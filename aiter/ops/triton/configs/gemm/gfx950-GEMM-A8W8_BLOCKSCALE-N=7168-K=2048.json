@@ -13,16 +13,16 @@
   },
   "M_LEQ_16": {
     "BLOCK_SIZE_M": 16,
-    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_N": 32,
     "BLOCK_SIZE_K": 128,
     "GROUP_SIZE_M": 1,
     "num_warps": 2,
-    "num_stages": 2,
+    "num_stages": 1,
     "waves_per_eu": 2,
     "matrix_instr_nonkdim": 16,
     "cache_modifier": ".cg",
-    "NUM_KSPLIT": 14
-},
+    "NUM_KSPLIT": 4
+  },
   "M_LEQ_32": {
     "BLOCK_SIZE_M": 16,
     "BLOCK_SIZE_N": 16,
