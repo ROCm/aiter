@@ -1787,7 +1787,7 @@ void standalone_stable_radix_11bits(void* buf,
     }
     else
     {
-        int sm_cnt = get_num_cu_func();
+        int sm_cnt = get_num_cu();
 
         unsigned grid_dim = calc_grid_dim<T, IdxT, 11, block_dim, WRITE_TOPK_VALUES, phase>(
             batch_size, len, sm_cnt);
@@ -2422,7 +2422,7 @@ int64_t invokeComputeTopkLastDimWorkspaceSize(int32_t numRows, int32_t stride0)
     constexpr bool is_largest        = true;
     constexpr int k                  = 2048;
 
-    int sm_cnt = get_num_cu_func();
+    int sm_cnt = get_num_cu();
     unsigned grid_dim =
         aiter::calc_grid_dim<T, IdxT, 11, block_dim, false, phase>(numRows, stride0, sm_cnt);
 
