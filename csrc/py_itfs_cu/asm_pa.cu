@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
 #include "asm_pa_configs.hpp"
 #include "py_itfs_common.h"
@@ -8,6 +8,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <torch/all.h>
+#include "aiter_enum.h"
 
 struct __attribute__((packed)) KernelArgs
 {
@@ -103,6 +104,7 @@ std::string get_heuristic_kernel(std::string q_type,
                                  std::string arch_id,
                                  int ps,
                                  int qTile,
+                                 int quant_type,
                                  CFG* cfgs)
 {
     // # mtp * gqa <= 16
@@ -125,7 +127,7 @@ std::string get_heuristic_kernel(std::string q_type,
                 // hp is just distinct from uhp
                 if(cfg.qType == q_type && cfg.kvType == kv_type && cfg.Gqa == gqa_ &&
                    cfg.Mtp == mtp_ && cfg.Msk == msk && (cfg.Hp == hp || hp == 1) &&
-                   cfg.blkSz == block_size && cfg.ps == ps && cfg.qTile == qTile)
+                   cfg.blkSz == block_size && cfg.ps == ps && cfg.qTile == qTile && cfg.quant_type == quant_type)
 
                     return el.first;
             }
@@ -152,7 +154,9 @@ std::string get_heuristic_kernel(std::string q_type,
                 " ps:",
                 ps,
                 " qTile:",
-                qTile);
+                qTile,
+                " quant_type:",
+                quant_type);
     return "";
 }
 const float f_log2E = log2f(expf(1));
@@ -275,7 +279,7 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     std::string kernelName = kernelName_.has_value() ? arch_id + kernelName_.value() : "";
     int ps = 0;
     if (kernelName.empty())
-        kernelName = get_heuristic_kernel(q_type, kv_type, gqa_ratio, mtp, msk, hp, block_size, arch_id, ps, qTile, config_map);
+        kernelName = get_heuristic_kernel(q_type, kv_type, gqa_ratio, mtp, msk, hp, block_size, arch_id, ps, qTile, 0, config_map);
     if(kernelName.empty())
     {
         TORCH_CHECK(false, __func__, "not supported this kernel now! ");
@@ -330,7 +334,8 @@ torch::Tensor pa_ps_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     std::optional<torch::Tensor> splitLse = std::nullopt,
     int mask                               = 0,
     std::optional<int> high_precision      = 1,
-    std::optional<std::string> kernelName_ = std::nullopt)
+    std::optional<std::string> kernelName_ = std::nullopt,
+    QuantType quant_type = QuantType::per_Token)
 {
     torch::Tensor output = out_.value_or(torch::empty_like(Q));
     int batch           = qo_indptr->size(0) - 1;
@@ -455,7 +460,7 @@ torch::Tensor pa_ps_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
     std::string arch_id = get_gpu_arch();
     std::string kernelName = kernelName_.value_or(
-        get_heuristic_kernel(q_type, kv_type, gqa, mtp, msk, hp, block_size, arch_id, ps, qTile, config_map));
+        get_heuristic_kernel(q_type, kv_type, gqa, mtp, msk, hp, block_size, arch_id, ps, qTile, int(quant_type), config_map));
     if(kernelName.empty())
     {
         TORCH_CHECK(false, __func__, "not supported this kernel now! ");

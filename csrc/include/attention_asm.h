@@ -1,6 +1,7 @@
 #pragma once
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+#include "aiter_enum.h"
 #include <torch/extension.h>
 
 torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
@@ -37,4 +38,5 @@ pa_ps_fwd(torch::Tensor& Q,            //   [num_seqs, num_heads, head_size]
           std::optional<torch::Tensor> splitLse    = std::nullopt,
           int mask                                 = 0,
           std::optional<int> high_precision        = 1,
-          std::optional<std::string> kernelName_   = std::nullopt);
+          std::optional<std::string> kernelName_   = std::nullopt,
+          QuantType quant_type                     = QuantType::per_Token);
