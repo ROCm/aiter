@@ -190,12 +190,13 @@ def fused_allreduce_rmsnorm_quant_kernel(
     world_size: tl.constexpr,
     rank_start: tl.constexpr,
     rank_stride: tl.constexpr,
-    # Kernel config
+    # Explicit kernel params
+    BLOCK_SIZE_N: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+    # Autotuned params
     COMM_SMS: tl.constexpr,
     NUM_XCDS: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    HAS_RESIDUAL: tl.constexpr,
 ):
     """Fused one-shot AllReduce + RMSNorm + per-token FP8 quant.
 
