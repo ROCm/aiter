@@ -621,8 +621,8 @@ def gemm_a8w8_blockscale_bpreshuffle(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
-    preshuffleB: bool = False,       #TODO not sure if this is needed
-    preshuffleQuantB: bool = False,  #TODO not sure if this is needed
+    preshuffleB: bool = False,  
+    preshuffleQuantB: bool = False,
 ) -> Tensor:
     assert dtype in [
         dtypes.bf16,
@@ -643,7 +643,10 @@ def gemm_a8w8_blockscale_bpreshuffle(
             return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y, preshuffleB, preshuffleQuantB)
         elif libtype == "ck":
             return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
-    return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+    if preshuffleQuantB:
+        return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y, preshuffleB, True)
+    else:
+        return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
 
 def gfx950_a8w8_blockscale_ASM(
