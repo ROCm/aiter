@@ -266,12 +266,14 @@ for dtype in args.dtype:
     # deepseek-r1
     for m in args.m:
         for n, k in args.nk:
-            for ck_p in args.ck_preshuffle:
-                ret = test_gemm(dtype, m, n, k, preshuffleB=ck_p, preshuffleQuantB=False)
-                df.append(ret)
-            for ck_pq in args.ck_preshuffleQuant:
-                ret = test_gemm(dtype, m, n, k, preshuffleB=False, preshuffleQuantB=ck_pq)
-                df.append(ret)
+            if True in args.ck_preshuffle:
+                for ck_p in args.ck_preshuffle:
+                    ret = test_gemm(dtype, m, n, k, preshuffleB=ck_p, preshuffleQuantB=False)
+                    df.append(ret)
+            if True in args.ck_preshuffleQuant:
+                for ck_pq in args.ck_preshuffleQuant:
+                    ret = test_gemm(dtype, m, n, k, preshuffleB=False, preshuffleQuantB=ck_pq)
+                    df.append(ret)
 df = pd.DataFrame(df)
 
 # Configure pandas to show all columns without truncation

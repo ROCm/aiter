@@ -78,10 +78,6 @@ class TileKernelInstance:
             ]
         )
 
-
-    #0:   TileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,            False,           False,             2      ),
-    #1:   TileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,           64,      "Intrawave",        False,            False,           False,             1      ),
-    #2:   TileKernelInstance(   192,     256,      128,     4,        2,       1,        16,            16,          128,      "Intrawave",        False,            False,           False,             1      ),
 # fmt: off
 # Candidate and default kernel instances for tile gemm a8w8 blockscale
 # These instances are used for generating the kernel code and tuning.

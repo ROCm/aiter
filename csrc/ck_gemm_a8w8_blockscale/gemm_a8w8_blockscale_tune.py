@@ -164,7 +164,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             help="Enable B-matrix preshuffle for CK gemm a8w8 blockscale",
         )
 
-         self.parser.add_argument(
+        self.parser.add_argument(
             "--preshuffleQuantB",
             action="store_true",
             help="Enable B-matrix preshuffle quantization for CK gemm a8w8 blockscale"
@@ -189,7 +189,10 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             )
         elif libType == "cktile":
             # kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
-            kernel_list = candidate_kernels_cktile_dict_preshuffleQuant if preshuffleQuantB else candidate_kernels_cktile_dict
+            kernel_list = (
+                candidate_kernels_cktile_dict_preshuffleQuant 
+                if preshuffleQuantB 
+                else candidate_kernels_cktile_dict)
         else:
             return None
 
@@ -206,11 +209,15 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         preshuffleQuantB,
     ):
         cu_num, M, N, K = info_keys
-        #kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
         kernel_list = candidate_kernels_cktile_dict_preshuffleQuant if preshuffleQuantB else candidate_kernels_cktile_dict
         kernels_num = len(kernel_list)
-        #gemm_a8w8_idx = [0, 5 if preshuffleB else 1, 2, 3, 4]
-        gemm_a8w8_idx = [0, 5, 6, 3, 4] if preshuffleB else [0, 1, 2, 3, 4]
+        
+        gemm_a8w8_idx = (
+            [0, 1, 2, 7, 4] if preshuffleQuantB else
+            [0, 5, 6, 3, 4] if preshuffleB else
+            [0, 1, 2, 3, 4]
+        )
+        
         ref_data_idx = [0, 1, 2, 8 if preshuffleQuantB else 3]
         tasks_cktile = []
         for i in range(kernels_num):
@@ -243,19 +250,20 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         (M, N, K, seed),
                         run_gemm_a8w8_blockscale_cktile,
                         (
-                            [
-                                0,
-                                5 if preshuffleB else 1,
-                                6 if preshuffleB else 2,
-                                # (
-                                #     6
-                                #     if (kernel.M_Warp * kernel.N_Warp * kernel.K_Warp)
-                                #     == 8
-                                #     else 2
-                                # ),
-                                7 if preshuffleQuantB else 3,
-                                4,
-                            ],
+                            # [
+                            #     0,
+                            #     5 if preshuffleB else 1,
+                            #     6 if preshuffleB else 2,
+                            #     # (
+                            #     #     6
+                            #     #     if (kernel.M_Warp * kernel.N_Warp * kernel.K_Warp)
+                            #     #     == 8
+                            #     #     else 2
+                            #     # ),
+                            #     7 if preshuffleQuantB else 3,
+                            #     4,
+                            # ],
+                            gemm_a8w8_idx,
                             i,
                             splitK,
                             preshuffleB,

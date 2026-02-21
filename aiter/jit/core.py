@@ -251,12 +251,14 @@ class AITER_CONFIG(object):
 
         if not config_env_file:
             model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
+            print(f"model_config_dir {model_config_dir}")
             op_tuned_file_list = [
                 p
                 for p in model_config_dir.glob(f"*{tuned_file_name}*")
                 if (p.is_file() and "untuned" not in str(p))
             ]
             print(f"op_tuned_file_list {op_tuned_file_list}")
+            
             if not op_tuned_file_list:
                 config_file = default_file
             else:
