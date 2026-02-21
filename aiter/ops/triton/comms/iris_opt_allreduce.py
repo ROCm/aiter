@@ -25,7 +25,7 @@ CUDA graph compatibility:
   hipErrorStreamCaptureUnsupported on ROCm during CUDA graph capture.
 """
 
-from dataclasses import dataclass
+import os
 from typing import Any, Optional, Tuple
 
 import iris
@@ -38,6 +38,10 @@ import logging
 __all__ = ["fused_allreduce_add_rms_quant_iris_opt"]
 
 logger = logging.getLogger(__name__)
+
+AUTOTUNE = True
+if AUTOTUNE:
+    os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 
 
 # ============================================================================
@@ -85,27 +89,65 @@ def extract_group_info(
 
 
 # ============================================================================
-# Config
+# Autotune
 # ============================================================================
 
+IRIS_OPT_AUTOTUNE_KEYS = [
+    "M",
+    "N",
+    "HAS_RESIDUAL",
+]
 
-@dataclass
-class FusedOneShotConfig:
-    """Config for the fused one-shot all-reduce kernel."""
 
-    comm_sms: int = 64
-    num_xcds: Optional[int] = None
-    chunk_size: Optional[int] = None
-    swizzle_size: int = 4
+def _compute_chunk_size(comm_sms: int, num_xcds: int, swizzle_size: int = 4) -> int:
+    chunk = swizzle_size * swizzle_size
+    return min(chunk, comm_sms // num_xcds)
 
-    def __post_init__(self) -> None:
-        if self.num_xcds is None:
-            self.num_xcds = iris.hip.get_num_xcc()
-        if self.chunk_size is None:
-            self.chunk_size = self.swizzle_size * self.swizzle_size
-            self.chunk_size = min(
-                self.chunk_size, self.comm_sms // self.num_xcds
+
+def get_iris_opt_configs(autotune: bool):
+    num_xcds = iris.hip.get_num_xcc()
+
+    if not autotune:
+        comm_sms = 64
+        return [
+            triton.Config(
+                {
+                    "COMM_SMS": comm_sms,
+                    "NUM_XCDS": num_xcds,
+                    "CHUNK_SIZE": _compute_chunk_size(comm_sms, num_xcds),
+                },
+                num_warps=8,
+                num_stages=1,
+                waves_per_eu=1,
             )
+        ]
+
+    configs = []
+    COMM_SMS_OPTIONS = [32, 64, 128]
+    NUM_WARPS_OPTIONS = [4, 8, 16]
+    NUM_STAGES_OPTIONS = [1, 2]
+    WAVES_PER_EU_OPTIONS = [1, 2, 4]
+    for sms in COMM_SMS_OPTIONS:
+        chunk = _compute_chunk_size(sms, num_xcds)
+        for nw in NUM_WARPS_OPTIONS:
+            for ns in NUM_STAGES_OPTIONS:
+                for waves in WAVES_PER_EU_OPTIONS:
+                    configs.append(
+                        triton.Config(
+                            {
+                                "COMM_SMS": sms,
+                                "NUM_XCDS": num_xcds,
+                                "CHUNK_SIZE": chunk,
+                            },
+                            num_stages=ns,
+                            num_warps=nw,
+                            waves_per_eu=waves,
+                        )
+                    )
+    return configs
+
+
+iris_opt_autotune_configs = get_iris_opt_configs(AUTOTUNE)
 
 
 # ============================================================================
@@ -113,6 +155,10 @@ class FusedOneShotConfig:
 # ============================================================================
 
 
+@triton.autotune(
+    configs=iris_opt_autotune_configs,
+    key=IRIS_OPT_AUTOTUNE_KEYS,
+)
 @triton.jit
 def fused_allreduce_rmsnorm_quant_kernel(
     # Input (in symmetric heap for iris.load)
@@ -256,7 +302,6 @@ class IrisOptManager:
 
         self._shmem: Any = None
         self._heap_size: int = 2**33  # 8GB default
-        self._config: Optional[FusedOneShotConfig] = None
 
         # Pre-allocated input buffer (iris symmetric heap)
         self._input_buf: Any = None
@@ -292,7 +337,6 @@ class IrisOptManager:
         )
 
         self._shmem = iris.iris(self._heap_size)
-        self._config = FusedOneShotConfig()
 
         logger.info(
             f"Iris (opt) initialized successfully on rank {cur_rank}"
@@ -304,14 +348,6 @@ class IrisOptManager:
         if self._shmem is None:
             self.initialize()
         return self._shmem
-
-    @property
-    def config(self) -> FusedOneShotConfig:
-        """Get the fused one-shot config."""
-        if self._config is None:
-            self.initialize()
-        assert self._config is not None
-        return self._config
 
     def _get_input_buffer(
         self,
@@ -455,7 +491,6 @@ class IrisOptManager:
             scale_out is per-token: shape (M, 1).
         """
         shmem = self.shmem
-        config = self.config
         M, N = input_tensor.shape
         device = input_tensor.device
 
@@ -483,8 +518,11 @@ class IrisOptManager:
 
         BLOCK_SIZE_N = triton.next_power_of_2(N)
 
+        def grid(META):
+            return (META["COMM_SMS"],)
+
         # Launch fused kernel
-        fused_allreduce_rmsnorm_quant_kernel[(config.comm_sms,)](
+        fused_allreduce_rmsnorm_quant_kernel[grid](
             iris_input,
             allreduce_out,
             rms_out,
@@ -506,14 +544,8 @@ class IrisOptManager:
             world_size,
             rank_start,
             rank_stride,
-            config.comm_sms,
-            config.num_xcds,
-            config.chunk_size,
             BLOCK_SIZE_N,
             residual is not None,
-            num_warps=8,
-            num_stages=1,
-            waves_per_eu=1,
         )
 
         shmem.device_barrier()
