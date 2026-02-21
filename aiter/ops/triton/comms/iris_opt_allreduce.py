@@ -115,10 +115,10 @@ def get_iris_opt_configs(autotune: bool):
                     "COMM_SMS": comm_sms,
                     "NUM_XCDS": num_xcds,
                     "CHUNK_SIZE": _compute_chunk_size(comm_sms, num_xcds),
+                    "waves_per_eu": 1,
                 },
                 num_warps=8,
                 num_stages=1,
-                waves_per_eu=1,
             )
         ]
 
@@ -138,10 +138,10 @@ def get_iris_opt_configs(autotune: bool):
                                 "COMM_SMS": sms,
                                 "NUM_XCDS": num_xcds,
                                 "CHUNK_SIZE": chunk,
+                                "waves_per_eu": waves,
                             },
                             num_stages=ns,
                             num_warps=nw,
-                            waves_per_eu=waves,
                         )
                     )
     return configs
@@ -158,6 +158,7 @@ iris_opt_autotune_configs = get_iris_opt_configs(AUTOTUNE)
 @triton.autotune(
     configs=iris_opt_autotune_configs,
     key=IRIS_OPT_AUTOTUNE_KEYS,
+    use_cuda_graph=True,
 )
 @triton.jit
 def fused_allreduce_rmsnorm_quant_kernel(
