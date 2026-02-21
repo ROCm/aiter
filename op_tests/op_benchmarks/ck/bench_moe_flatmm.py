@@ -1,4 +1,5 @@
 import argparse
+import csv
 from dataclasses import dataclass
 
 import torch
@@ -87,6 +88,12 @@ def parse_args():
         type=int,
         default=-1,
         help="Run one shape case by index (0-based). Default: -1 (run all).",
+    )
+    parser.add_argument(
+        "--csv",
+        type=str,
+        default="",
+        help="Optional CSV output path for benchmark results.",
     )
     return parser.parse_args()
 
@@ -255,6 +262,7 @@ def main():
         "idx | block_m | stage1(M,N,K) | stage1_us | stage1_tflops | "
         "stage2(M,N,K) | stage2_us | stage2_tflops | total_us"
     )
+    rows = []
 
     for idx, case in selected:
         stage1_us, stage2_us, block_m = run_case(
@@ -267,6 +275,28 @@ def main():
         stage1_tflops = tflops(case.stage1_m, case.stage1_n, case.stage1_k, stage1_us)
         stage2_tflops = tflops(case.stage2_m, case.stage2_n, case.stage2_k, stage2_us)
         total_us = stage1_us + stage2_us
+        row = {
+            "idx": idx,
+            "dtype": args.dtype,
+            "block_m": block_m,
+            "topk": case.topk,
+            "expert": case.expert,
+            "stage1_m": case.stage1_m,
+            "stage1_n": case.stage1_n,
+            "stage1_k": case.stage1_k,
+            "stage1_us": stage1_us,
+            "stage1_tflops": stage1_tflops,
+            "stage2_m": case.stage2_m,
+            "stage2_n": case.stage2_n,
+            "stage2_k": case.stage2_k,
+            "stage2_us": stage2_us,
+            "stage2_tflops": stage2_tflops,
+            "total_us": total_us,
+            "seed": args.seed + idx,
+            "num_iters": args.num_iters,
+            "num_warmup": args.num_warmup,
+        }
+        rows.append(row)
         print(
             f"{idx:>3} | {block_m:>7} | "
             f"({case.stage1_m},{case.stage1_n},{case.stage1_k}) | "
@@ -274,6 +304,34 @@ def main():
             f"({case.stage2_m},{case.stage2_n},{case.stage2_k}) | "
             f"{stage2_us:>9.2f} | {stage2_tflops:>13.2f} | {total_us:>8.2f}"
         )
+
+    if args.csv:
+        fieldnames = [
+            "idx",
+            "dtype",
+            "block_m",
+            "topk",
+            "expert",
+            "stage1_m",
+            "stage1_n",
+            "stage1_k",
+            "stage1_us",
+            "stage1_tflops",
+            "stage2_m",
+            "stage2_n",
+            "stage2_k",
+            "stage2_us",
+            "stage2_tflops",
+            "total_us",
+            "seed",
+            "num_iters",
+            "num_warmup",
+        ]
+        with open(args.csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"wrote CSV: {args.csv}")
 
 
 if __name__ == "__main__":
