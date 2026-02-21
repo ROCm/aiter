@@ -17,10 +17,123 @@ from aiter.ops.triton.gluon.unified_attention_3d_kernel_tdm_new import (
 from triton.experimental import gluon
 import triton.experimental.gluon.language as ttgl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+import numpy as np
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
+
+
+def make_distributed_linear_layout(
+    shape: list[int], bases_representation: dict[str, list[str]]
+):
+    # rules:
+    #   1. shape = [X, Y]
+    #   2. x_log_2 = log2(X), y_log_2 = log2(Y)
+    #   3. there are a total of x_log_2 + y_log_2 tokens: "x0", "x1", ... "x{x_log_2 - 1}", "y0", "y1", ... "y{x_log_2 - 1}"
+    #   4. these tokens must appear exactly once in the bases_representation across "reg_bases", "lane_bases", "warp_bases" keys:
+    #
+    # example: shape = [64, 128]
+    #   available tokens: "x0", "x1", "x2", "x3", "x4", "x5", "y0", "y1", "y2", "y3", "y4", "y5", "y6", "y7"
+    #   each of the above tokens must appear once in the bases_representation across "reg_bases", "lane_bases", "warp_bases" keys
+    #
+    # note:
+    #    although this will not cause any compailation error outside gluon.jit,
+    #    you need to make sure "lane_bases" has exactly 6/5 tokens for gfx950/gfx1250, respectively, because there are 64/32 threads per warp
+    #    also you need to make sure "warp_bases" has exactly log2(num_warps) tokens, e.g., 1 token for num_warps = 2, 2 tokens for num_warps = 4, etc.
+
+    token_counter = {}
+    for i, d in [(0, "x"), (1, "y")]:
+        for lg in range(int(math.log2(shape[i]))):
+            token_counter[f"{d}{lg}"] = 0
+
+    arg = {"reg_bases": [], "lane_bases": [], "warp_bases": []}
+
+    for k in arg.keys():
+        for v in bases_representation[k]:
+            if v not in token_counter:
+                raise ValueError(
+                    f"Token {v} is invalid, it should be one of {token_counter.keys()}"
+                )
+            token_counter[v] += 1
+            d = v[0]
+            lg = int(v[1])
+            if d == "x":
+                arg[k].append([0, 2**lg])
+            else:
+                arg[k].append([2**lg, 0])
+
+    for k in token_counter.keys():
+        if token_counter[k] != 1:
+            raise ValueError(
+                f"Token {k} should appear only once, but appears {token_counter[k]} times"
+            )
+    # print(arg)
+    layout: ttgl.constexpr = ttgl.DistributedLinearLayout(
+        **arg,
+        block_bases=[],
+        shape=shape,
+    )
+    return layout
+
+
+def get_layout_view(layout, shape):
+    layout_view = layout.format_tensor_view(shape)
+    layout_array = []
+    for l in layout_view.strip("[]").strip("\n").split("\n"):
+        layout_array.append([])
+        for ll in l.strip("[]").split(","):
+            t = int(ll.strip(" ").split(":")[0][1:])
+            e = int(ll.strip(" ").split(":")[-1])
+            layout_array[-1].append([t, e])
+    return layout_view, torch.tensor(layout_array).to(torch.int32)
+
+
+def get_smem_data_layout(layout, shape, bases_representation):
+    _, layout_array = get_layout_view(layout.format_tensor_view(shape))
+    contiguous_dim = bases_representation["reg_bases"][0][0]
+    assert bases_representation["reg_bases"][0][1] == "0"
+    for log_coalesced in range(1, len(bases_representation["reg_bases"])):
+        if (
+            bases_representation["reg_bases"][log_coalesced]
+            != f"{contiguous_dim}{2**(log_coalesced - 1)}"
+        ):
+            break
+    coalesced_size = 2**log_coalesced
+    smem_data_layout = []
+    for tid in range(WARP_SIZE):
+        smem_data_layout.append([])
+        data_idx = (layout_array[:, :, 0] == tid).nonzero().T
+        element_idx = layout_array[data_idx[0], data_idx[1], 1]
+        assert (
+            len(element_idx) % coalesced_size == 0
+        ), f"There must be {coalesced_size} elements alinged per thread"
+        num_vmem_load = len(element_idx) // coalesced_size
+        for i_vmem_load in range(num_vmem_load):
+            assert torch.allclose(
+                element_idx[
+                    i_vmem_load * coalesced_size : (i_vmem_load + 1) * coalesced_size
+                ]
+                - element_idx[i_vmem_load * coalesced_size],
+                torch.arange(coalesced_size, dtype=torch.int32),
+            ), f"There must be {coalesced_size} contiguous elements per vmem load"
+        i_vmem_load_order = torch.argsort(element_idx[::coalesced_size])
+        for i_vmem_load in range(num_vmem_load):
+            idx_row = data_idx[0][
+                i_vmem_load_order[i_vmem_load]
+                * coalesced_size : (i_vmem_load_order[i_vmem_load] + 1)
+                * coalesced_size
+            ]
+            idx_col = data_idx[1][
+                i_vmem_load_order[i_vmem_load]
+                * coalesced_size : (i_vmem_load_order[i_vmem_load] + 1)
+                * coalesced_size
+            ]
+            smem_data_layout[-1].append(torch.stack((idx_row, idx_col)).T)
+        smem_data_layout[-1] = torch.stack(smem_data_layout[-1])
+    smem_data_layout = torch.stack(smem_data_layout)
+    # [num_vmem_loads, num_threads, coalesced_size, 2]
+    smem_data_layout = smem_data_layout.permute(1, 0, 2, 3)
 
 
 def make_layout_3d(
@@ -170,15 +283,63 @@ def make_layout_3d(
         Q_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
             vec=8, per_phase=2, max_phase=8, order=[1, 0]
         )
-        K_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
-            vec=8, per_phase=2, max_phase=8, order=[0, 1]
-        )
-        V_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
-            vec=1, per_phase=1, max_phase=1, order=[1, 0]
-        )
+        # K_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
+        #     vec=8, per_phase=2, max_phase=8, order=[0, 1]
+        # )
+        # V_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
+        #     vec=1, per_phase=1, max_phase=1, order=[1, 0]
+        # )
         # V_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
         #     vec=4, per_phase=2, max_phase=8, order=[1, 0]
         # )
+
+        # 64
+        # ttg.padded_shared<[512:+16] {offset = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16], [0, 1], [0, 2], [0, 32]], block = []}>
+        # 128
+        # ttg.padded_shared<[512:+16] {offset = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [0, 16], [0, 32], [0, 1], [0, 2], [0, 4], [0, 8]], block = []}>
+        K_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout(
+            interval_padding_pairs=[[512, 16]],
+            offset_bases=[
+                [1, 0],
+                [2, 0],
+                [4, 0],
+                [8, 0],
+                [16, 0],
+                [32, 0],
+                [0, 4],
+                [0, 8],
+                [0, 16],
+                [0, 1],
+                [0, 2],
+                [0, 32],
+            ],
+            cga_layout=[],
+            shape=[HEAD_SIZE_PADDED, TILE_SIZE],
+        )
+
+        # 64
+        # ttg.padded_shared<[512:+16] {offset = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [8, 0], [4, 0], [16, 0], [1, 0], [2, 0], [32, 0]], block = []}>
+        # 128
+        # ttg.padded_shared<[512:+16] {offset = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0], [1, 0], [2, 0], [8, 0], [4, 0]], block = []}>
+        V_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout(
+            interval_padding_pairs=[[512, 16]],
+            offset_bases=[
+                [0, 1],
+                [0, 2],
+                [0, 4],
+                [0, 8],
+                [0, 16],
+                [0, 32],
+                [8, 0],
+                [4, 0],
+                [16, 0],
+                [1, 0],
+                [2, 0],
+                [32, 0],
+            ],
+            cga_layout=[],
+            shape=[TILE_SIZE, HEAD_SIZE_PADDED],
+        )
 
     # size_per_thread along the fastest moving dimension is set to 8 (BF16)
     size_per_thread_fastest_dim = 8
@@ -200,23 +361,63 @@ def make_layout_3d(
         warps_per_cta=[num_warps, 1],
         order=[1, 0],
     )
-    K_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
-        size_per_thread=[size_per_thread_fastest_dim, 1],
-        threads_per_warp=[
-            threads_per_warp_fastest_dim,
-            WARP_SIZE // threads_per_warp_fastest_dim,
-        ],
-        warps_per_cta=[1, num_warps],
-        order=[0, 1],
+    # K_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
+    #     size_per_thread=[size_per_thread_fastest_dim, 1],
+    #     threads_per_warp=[
+    #         threads_per_warp_fastest_dim,
+    #         WARP_SIZE // threads_per_warp_fastest_dim,
+    #     ],
+    #     warps_per_cta=[1, num_warps],
+    #     order=[0, 1],
+    # )
+    # V_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
+    #     size_per_thread=[1, size_per_thread_fastest_dim],
+    #     threads_per_warp=[
+    #         WARP_SIZE // threads_per_warp_fastest_dim,
+    #         threads_per_warp_fastest_dim,
+    #     ],
+    #     warps_per_cta=[num_warps, 1],
+    #     order=[1, 0],
+    # )
+
+    # 64
+    # ttg.linear<{register = [[1, 0], [2, 0], [4, 0], [0, 2], [0, 32]], lane = [[8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16]], warp = [[0, 1]], block = []}>
+    # 128
+    # ttg.linear<{register = [[1, 0], [2, 0], [4, 0], [0, 2], [0, 4], [0, 8]], lane = [[8, 0], [16, 0], [32, 0], [64, 0], [0, 16], [0, 32]], warp = [[0, 1]], block = []}>
+    # K_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.DistributedLinearLayout(
+    #     reg_bases=[[1, 0], [2, 0], [4, 0], [0, 2], [0, 32]],
+    #     lane_bases=[[8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16]],
+    #     warp_bases=[[0, 1]],
+    #     block_bases=[],
+    #     shape=[HEAD_SIZE_PADDED, TILE_SIZE],
+    # )
+    bases_representation = {
+        "reg_bases": ["y0", "y1", "y2", "x1", "x5"],
+        "lane_bases": ["y3", "y4", "y5", "x2", "x3", "x4"],
+        "warp_bases": ["x0"],
+    }
+    K_BLOCKED_LAYOUT = make_distributed_linear_layout(
+        [HEAD_SIZE_PADDED, TILE_SIZE], bases_representation
     )
-    V_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
-        size_per_thread=[1, size_per_thread_fastest_dim],
-        threads_per_warp=[
-            WARP_SIZE // threads_per_warp_fastest_dim,
-            threads_per_warp_fastest_dim,
-        ],
-        warps_per_cta=[num_warps, 1],
-        order=[1, 0],
+
+    # 64
+    # ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [2, 0], [32, 0]], lane = [[0, 8], [0, 16], [0, 32], [8, 0], [4, 0], [16, 0]], warp = [[1, 0]], block = []}>
+    # 128
+    # ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [2, 0], [8, 0], [4, 0]], lane = [[0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0]], warp = [[1, 0]], block = []}>
+    # V_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.DistributedLinearLayout(
+    #     reg_bases=[[0, 1], [0, 2], [0, 4], [2, 0], [32, 0]],
+    #     lane_bases=[[0, 8], [0, 16], [0, 32], [8, 0], [4, 0], [16, 0]],
+    #     warp_bases=[[1, 0]],
+    #     block_bases=[],
+    #     shape=[TILE_SIZE, HEAD_SIZE_PADDED],
+    # )
+    bases_representation = {
+        "reg_bases": ["x0", "x1", "x2", "y1", "y5"],
+        "lane_bases": ["x3", "x4", "x5", "y3", "y2", "y4"],
+        "warp_bases": ["y0"],
+    }
+    V_BLOCKED_LAYOUT = make_distributed_linear_layout(
+        [TILE_SIZE, HEAD_SIZE_PADDED], bases_representation
     )
 
     # TODO: for future impl
@@ -303,7 +504,7 @@ def select_3d_config(
         num_tdm_gather,
         HEAD_SIZE_PADDED,
     )
-    
+
     # num_tiles_per_seq = (max_seqlen_k // num_segments + TILE_SIZE - 1) // TILE_SIZE
 
     attn_stages = 1
