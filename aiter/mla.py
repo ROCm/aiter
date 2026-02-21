@@ -280,6 +280,10 @@ def mla_decode_fwd(
             num_stages=2,
             **extra_kargs,
         )
+        # Stage2 reduces outputs across KV splits into `o`, while stage1 stores
+        # per-split LSE in `attn_lse`. Materialize the final LSE expected by
+        # callers as logsumexp over split dimension.
+        final_lse = torch.logsumexp(attn_lse.squeeze(-1), dim=1)
     else:
         if num_kv_splits is None:
             num_kv_splits = get_cu_num()

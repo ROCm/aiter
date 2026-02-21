@@ -337,7 +337,8 @@ def torch_mla_extend(
         os.append(o)
         lses.append(lse)
     o = torch.concat(os)
-    lse = torch.concat(lses).transpose(0, 1)
+    # each per-batch LSE is [nhead, q_i], concatenate along q dimension
+    lse = torch.concat(lses, dim=1).transpose(0, 1)
     return o, lse
 
 
@@ -480,6 +481,18 @@ def test_mla(
         dtype=out_dtype,
     )
 
+    def normalize_decode_lse(lse_tensor: torch.Tensor) -> torch.Tensor:
+        if lse_tensor is None:
+            raise ValueError("decode LSE is None, please enable return_lse=True")
+        if lse_tensor.ndim == 4:
+            lse_tensor = lse_tensor.squeeze(-1)
+            if lse_tensor.shape[1] == 1:
+                return lse_tensor[:, 0, :]
+            return torch.logsumexp(lse_tensor, dim=1)
+        if lse_tensor.ndim == 2:
+            return lse_tensor
+        raise ValueError(f"Unexpected LSE shape: {tuple(lse_tensor.shape)}")
+
     # It is necessary to limit the size of the tensor in the DP mode
     # so reduce the split_num in the DP mode.
     if nhead >= 128:
@@ -596,6 +609,7 @@ def test_mla(
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
             kv_scale=kv_scale,
+            return_lse=True,
         )
 
         err = checkAllclose(
@@ -603,12 +617,20 @@ def test_mla(
             out_asm,
             msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
+        lse_asm = normalize_decode_lse(attn_lse)
+        lse_err = checkAllclose(
+            lse_ref_fp8,
+            lse_asm,
+            rtol=3e-1,
+            atol=3e-1,
+            msg=f"mla_decode-lse_fp8kv [golden fp8kv vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+        )
         checkAllclose(
             out_ref_fp8,
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
-        return err, us_asm_decode
+        return err, lse_err, us_asm_decode
 
     def test_absorb_decode_bf16():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
@@ -634,6 +656,7 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
+            return_lse=True,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -641,12 +664,20 @@ def test_mla(
         # checkAllclose(logits_ref, attn_logits,
         #               msg=f'attn_logits [golden vs aiter_asm]')
         # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
+        lse_asm = normalize_decode_lse(attn_lse)
+        lse_err = checkAllclose(
+            lse_ref,
+            lse_asm,
+            rtol=2e-2,
+            atol=2e-2,
+            msg=f"mla_decode-lse    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+        )
         err = checkAllclose(
             out_ref,
             out_asm,
             msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
-        return err, us_asm_decode
+        return err, lse_err, us_asm_decode
 
     def test_absorb_decode_fp8():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
@@ -697,6 +728,7 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
+            return_lse=True,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -704,6 +736,14 @@ def test_mla(
         # checkAllclose(logits_ref, attn_logits,
         #               msg=f'attn_logits [golden vs aiter_asm]')
         # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
+        lse_asm = normalize_decode_lse(attn_lse)
+        lse_err = checkAllclose(
+            lse_ref_fp8,
+            lse_asm,
+            rtol=3e-1,
+            atol=3e-1,
+            msg=f"mla_decode-lse_fp8 [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+        )
         err = checkAllclose(
             out_ref,
             out_asm,
@@ -716,7 +756,7 @@ def test_mla(
         )
 
         cal_diff(out_ref, out_asm, "out", True)
-        return err, us_asm_decode
+        return err, lse_err, us_asm_decode
 
     def test_absorb_decode_3buffer():
 
@@ -775,8 +815,17 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
+            return_lse=True,
         )
 
+        lse_asm = normalize_decode_lse(attn_lse)
+        lse_err = checkAllclose(
+            lse_ref_fp8,
+            lse_asm,
+            rtol=3e-1,
+            atol=3e-1,
+            msg=f"mla_decode-lse_3buffer [golden 3buf vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+        )
         err = checkAllclose(
             out_ref,
             out_asm,
@@ -788,21 +837,23 @@ def test_mla(
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
         cal_diff(out_ref, out_asm, "out", True)
-        return err, us_asm_decode
+        return err, lse_err, us_asm_decode
 
     err = None
+    lse_err = None
     us_asm_decode = 1e12
 
     if paged_layout == "3BUFFER" and not non_persistent_mode:
-        err, us_asm_decode = test_absorb_decode_3buffer()
+        err, lse_err, us_asm_decode = test_absorb_decode_3buffer()
     elif dtype == torch.bfloat16 and kvtype == dtypes.fp8:
-        err, us_asm_decode = test_absorb_decode_bf16_fp8()
+        err, lse_err, us_asm_decode = test_absorb_decode_bf16_fp8()
     elif dtype == torch.bfloat16:
-        err, us_asm_decode = test_absorb_decode_bf16()
+        err, lse_err, us_asm_decode = test_absorb_decode_bf16()
     elif kvtype == dtypes.fp8:
-        err, us_asm_decode = test_absorb_decode_fp8()
+        err, lse_err, us_asm_decode = test_absorb_decode_fp8()
 
     ret["decode:err"] = err
+    ret["decode:lse_err"] = lse_err
     ret["decode:asm_576"] = us_asm_decode
 
     flops = decode_qlen * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
