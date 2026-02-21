@@ -25,7 +25,6 @@ CUDA graph compatibility:
   hipErrorStreamCaptureUnsupported on ROCm during CUDA graph capture.
 """
 
-import atexit
 import os
 from typing import Any, Optional, Tuple
 
@@ -305,7 +304,6 @@ class IrisOptManager:
 
         self._shmem: Any = None
         self._heap_size: int = 2**33  # 8GB default
-        self._m_histogram: dict[int, int] = {}
 
         # Pre-allocated input buffer (iris symmetric heap)
         self._input_buf: Any = None
@@ -341,32 +339,10 @@ class IrisOptManager:
         )
 
         self._shmem = iris.iris(self._heap_size)
-        atexit.register(self.print_m_histogram)
 
         logger.info(
             f"Iris (opt) initialized successfully on rank {cur_rank}"
         )
-
-    def print_m_histogram(self) -> None:
-        """Print histogram of M values seen during inference."""
-        if not self._m_histogram:
-            return
-        cur_rank = (
-            torch.distributed.get_rank()
-            if torch.distributed.is_initialized()
-            else 0
-        )
-        if cur_rank != 0:
-            return
-        total = sum(self._m_histogram.values())
-        print(f"\n[iris_opt] M histogram ({total} calls):")
-        for m in sorted(self._m_histogram.keys()):
-            count = self._m_histogram[m]
-            pct = 100.0 * count / total
-            print(f"  M={m:<8d}  {count:>6d} calls  ({pct:5.1f}%)")
-
-    def __del__(self) -> None:
-        self.print_m_histogram()
 
     @property
     def shmem(self) -> Any:
@@ -520,7 +496,6 @@ class IrisOptManager:
         M, N = input_tensor.shape
         device = input_tensor.device
 
-        self._m_histogram[M] = self._m_histogram.get(M, 0) + 1
 
         # Get pre-allocated buffers (views into max-size allocations)
         iris_input = self._get_input_buffer(M, N, input_tensor.dtype)
