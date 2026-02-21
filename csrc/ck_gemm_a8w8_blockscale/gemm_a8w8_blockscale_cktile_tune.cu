@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (c) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <cmath>
 #include <functional>
@@ -12,7 +12,7 @@
 #include "gemm_a8w8_blockscale_cktile_manifest.h"
 
 using BlockwiseKernel = std::function<torch::Tensor(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, bool)>;
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, bool, bool)>;
 
 // For certain high priority shapes, we directly use the best kernel rather
 // than use heuristics.
@@ -59,7 +59,8 @@ torch::Tensor gemm_a8w8_blockscale_cktile_tune(torch::Tensor& XQ,
                                                torch::Tensor& Y,
                                                int kernelId,
                                                int splitK,
-                                               bool preshuffleB)
+                                               bool preshuffleB,
+                                               bool preshuffleQuantB)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
@@ -73,12 +74,12 @@ torch::Tensor gemm_a8w8_blockscale_cktile_tune(torch::Tensor& XQ,
     if(Y.dtype() == at::ScalarType::BFloat16)
     {
         blockwise_dispatch_cktile<TILE_FP32, TILE_BF16>(kernelId)(
-            XQ, WQ, x_scale, w_scale, Y, preshuffleB);
+            XQ, WQ, x_scale, w_scale, Y, preshuffleB, preshuffleQuantB);
     }
     else if(Y.dtype() == at::ScalarType::Half)
     {
         blockwise_dispatch_cktile<TILE_FP32, TILE_FP16>(kernelId)(
-            XQ, WQ, x_scale, w_scale, Y, preshuffleB);
+            XQ, WQ, x_scale, w_scale, Y, preshuffleB, preshuffleQuantB);
     }
     else
     {

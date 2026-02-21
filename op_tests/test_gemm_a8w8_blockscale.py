@@ -16,7 +16,7 @@ from einops import repeat as eirp
 
 import aiter
 from aiter import dtypes
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.shuffle import shuffle_weight, shuffle_bq
 from aiter.test_common import benchmark, checkAllclose, perftest
 
 block_shape = (128, 128)
@@ -48,21 +48,28 @@ def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @perftest()
-def run_gemm(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
-    return aiter.gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype)
+def run_gemm(x, weight, x_scale, w_scale, dtype=dtypes.bf16, preshuffleB=False, preshuffleQuantB=False):
+    return aiter.gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype, preshuffleB, preshuffleQuantB)
 
 
 @perftest()
-def run_gemm_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
+def run_gemm_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16, preshuffleB=False, preshuffleQuantB=False):
     return aiter.gemm_a8w8_blockscale_bpreshuffle(
-        x, weightshuffle, x_scale, w_scale, dtype
+        x, weightshuffle, x_scale, w_scale, dtype, preshuffleB, preshuffleQuantB
     )
+
+#@perftest()
+#def run_gemm_cktile(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
+#    return aiter.gemm_a8w8_blockscale_cktile(x, weight, x_scale, w_scale, dtype, False)
+
+#@perftest()
+#def run_gemm_bpreshuffle_cktile(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
+#    return aiter.gemm_a8w8_blockscale_cktile(x, weightshuffle, x_scale, w_scale, dtype, True)
 
 
 @benchmark()
-def test_gemm(dtype, m, n, k, ck_preshuffle=True):
+def test_gemm(dtype, m, n, k, preshuffleB=True, preshuffleQuantB=False):
     ret = {}
-    dim = (m, n, k)
     block_shape_n, block_shape_k = block_shape
     scale_m = m
     scale_n = (n + block_shape_n - 1) // block_shape_n
@@ -71,14 +78,16 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     weight = (torch.rand((n, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
     x_scale = torch.rand([scale_m, scale_k], dtype=dtypes.fp32, device="cuda")
     w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
+    w_scale_T = w_scale.T.contiguous()
+    a, avg_a = run_torch(x, weight, x_scale, w_scale_T  if preshuffleQuantB else w_scale, dtype)
 
-    a, avg_a = run_torch(x, weight, x_scale, w_scale, dtype)
-
-    x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
-    gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
-    gemm_weight = shuffle_weight(weight, layout=(16, 16)) if ck_preshuffle else weight
-    run_func = run_gemm_bpreshuffle if ck_preshuffle else run_gemm
-    b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
+    gemm_weight = shuffle_weight(weight, layout=(16, 16)) if preshuffleB else weight
+    gemm_weight_scale = shuffle_bq(w_scale_T, block_shape_k // 128) if preshuffleQuantB else w_scale
+    if preshuffleB or preshuffleQuantB:
+        run_func = run_gemm_bpreshuffle
+    else:
+        run_func = run_gemm
+    b, avg_b = run_func(x, gemm_weight, x_scale, gemm_weight_scale, dtype, preshuffleB, preshuffleQuantB)
 
     err_ck = checkAllclose(a, b, msg="ck")
     ret["ck us"] = avg_b
@@ -86,16 +95,17 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
     ret["ck err"] = err_ck
 
-    tag = "asm"
-    weight_asm = shuffle_weight(weight, layout=(32, 16))
-    c, avg_c = run_asm(x, weight_asm, x_scale, w_scale, dtype)
+    if not preshuffleQuantB:
+        tag = "asm"
+        weight_asm = shuffle_weight(weight, layout=(32, 16))
+        c, avg_c = run_asm(x, weight_asm, x_scale, w_scale, dtype)
 
-    err_asm = checkAllclose(a, c, msg=f"{tag}")
-    ret[f"{tag} us"] = avg_c
-    ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
-    ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
-    ret[f"{tag} err"] = err_asm
-    ret["asm/ck"] = avg_c / avg_b
+        err_asm = checkAllclose(a, c, msg=f"{tag}")
+        ret[f"{tag} us"] = avg_c
+        ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
+        ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
+        ret[f"{tag} err"] = err_asm
+        ret["asm/ck"] = avg_c / avg_b
 
     return ret
 
@@ -237,17 +247,33 @@ parser.add_argument(
         or --ck_preshuffle False
     """,
 )
+parser.add_argument(
+    "--ck_preshuffleQuant",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[True, False],
+    help="""weight scale preshuffle or not.
+    e.g.: --ck_preshuffle True
+        or --ck_preshuffle False
+    """,
+)
 
 args = parser.parse_args()
-
+print(args.ck_preshuffleQuant)
+print(args.ck_preshuffle)
 df = []
 for dtype in args.dtype:
     # deepseek-r1
     for m in args.m:
         for n, k in args.nk:
-            for ck_p in args.ck_preshuffle:
-                ret = test_gemm(dtype, m, n, k, ck_preshuffle=ck_p)
-                df.append(ret)
+            if True in args.ck_preshuffle:
+                for ck_p in args.ck_preshuffle:
+                    ret = test_gemm(dtype, m, n, k, preshuffleB=ck_p, preshuffleQuantB=False)
+                    df.append(ret)
+            if True in args.ck_preshuffleQuant:
+                for ck_pq in args.ck_preshuffleQuant:
+                    ret = test_gemm(dtype, m, n, k, preshuffleB=False, preshuffleQuantB=ck_pq)
+                    df.append(ret)
 df = pd.DataFrame(df)
 
 # Configure pandas to show all columns without truncation

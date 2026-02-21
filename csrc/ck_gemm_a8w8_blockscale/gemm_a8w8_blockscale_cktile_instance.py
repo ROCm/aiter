@@ -34,7 +34,6 @@ class TileKernelInstance:
     TiledMMAPermuteN: bool
     TransposeC: bool
     UsePersistentKernel: bool
-
     BlockPerCu: int  # 1,2
 
     @property
@@ -78,7 +77,6 @@ class TileKernelInstance:
                 str(self.BlockPerCu),
             ]
         )
-
 
 # fmt: off
 # Candidate and default kernel instances for tile gemm a8w8 blockscale

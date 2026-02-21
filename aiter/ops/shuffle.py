@@ -26,6 +26,41 @@ def shuffle_weight(x: torch.Tensor, layout=(16, 16), use_int4=False) -> torch.Te
     x_.is_shuffled = True
     return x_
 
+def shuffle_bq(w_scale: torch.Tensor, block_bq_k: int) -> torch.Tensor:
+    """
+    Shuffle BQ (B quantization) scale tensor for BPreshuffleQuant optimization.
+    
+    For 2D tensor [bqk, n]:
+        - Reshape to [n, bqk/block_bq_k, block_bq_k]
+        - Permute to [bqk/block_bq_k, n, block_bq_k]
+        - Return with original shape
+    
+    Args:
+        w_scale: B quantization scale tensor, shape [bqk, n] 
+        block_bq_k: Block size for BQ K dimension (typically K_Tile / BQuantGroupSize::kK)
+    
+    Returns:
+        Shuffled scale tensor with the same shape as input
+    """
+
+    # Save original dtype
+    w_scale_type = w_scale.dtype
+
+    # Handle 2D tensor: [bqk, n]
+    bqk, n = w_scale.shape[-2], w_scale.shape[-1]
+    assert bqk % block_bq_k == 0, f"{bqk} % {block_bq_k} == {bqk % block_bq_k}"
+
+    w_ = w_scale
+    # Reshape to [..., n, bqk/block_bq_k, block_bq_k] then permute
+    # C++ does: view as [n, bqk/block_bq_k, block_bq_k], then permute {1, 0, 2}
+    w_ = w_.view(-1, n, bqk // block_bq_k, block_bq_k)
+    w_ = w_.permute(0, 2, 1, 3)
+    w_ = w_.contiguous()
+    w_ = w_.view(*w_scale.shape)
+    w_ = w_.view(w_scale_type)
+    w_.is_shuffled = True
+    return w_
+
 
 def shuffle_weight_NK(
     x: torch.Tensor, inst_N: int, inst_K: int, use_int4=False

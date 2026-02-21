@@ -79,7 +79,8 @@ torch::Tensor
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    bool preshuffleB
+    bool preshuffleB,
+    bool preshuffleQuantB
     )
 {{
     // Get M, N, K from input tensors.
@@ -104,7 +105,7 @@ torch::Tensor
             {k.BlockPerCu}>;
 
         // Run kernel instance.
-        return gemm_a8w8_blockscale_cktile_impl<DDataType, EDataType, TileGemmInstance>(XQ, WQ, x_scale, w_scale, Y, preshuffleB);
+        return gemm_a8w8_blockscale_cktile_impl<DDataType, EDataType, TileGemmInstance>(XQ, WQ, x_scale, w_scale, Y, preshuffleB, preshuffleQuantB);
 """
 
         TILE_INSTANCE_IMPL_str = TILE_INSTANCE_IMPL.replace(
@@ -127,7 +128,8 @@ template torch::Tensor
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    bool preshuffleB
+    bool preshuffleB,
+    bool preshuffleQuantB
     );
 
 """
@@ -212,7 +214,8 @@ torch::Tensor
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    bool preshuffleB);
+    bool preshuffleB,
+    bool preshuffleQuantB);
 """
         MAINFEST_end = """
 
@@ -232,14 +235,12 @@ torch::Tensor
         """
         Codegen for cktile gemm a8w8 blockscale
         """
-
         # generate instances code
         for _, k in kernels_dict.items():
             self.gen_cktile_instance(k)
 
         # generate lookup dict for kernel instances
         self.gen_lookup_dict(kernels_dict)
-
         # generate manifest header for kernel instances
         self.gen_manifest_head(kernels_dict)
 
