@@ -63,6 +63,37 @@ for file in "${files[@]}"; do
     fi
 done
 
+if [[ "$MULTIGPU" != "TRUE" ]]; then
+    extra_test_cmd="python3 op_tests/test_moe_2stage.py -q 2 -a silu -e 128 -k 8 -dim 4096,192 -t 1"
+    {
+        echo
+        echo "============================================================"
+        echo "Running extra test: ${extra_test_cmd}"
+        echo "============================================================"
+        echo
+    } | tee -a latest_test.log
+
+    if ! timeout 60m bash -c "${extra_test_cmd}" 2>&1 | tee -a latest_test.log; then
+        {
+            echo
+            echo "--------------------"
+            echo "❌ Extra test failed: ${extra_test_cmd}"
+            echo "--------------------"
+            echo
+        } | tee -a latest_test.log
+        testFailed=true
+        failedFiles+=("extra:test_moe_2stage_q2_silu_e128_k8_dim4096x192_t1")
+    else
+        {
+            echo
+            echo "--------------------"
+            echo "✅ Extra test passed: ${extra_test_cmd}"
+            echo "--------------------"
+            echo
+        } | tee -a latest_test.log
+    fi
+fi
+
 if [ "$testFailed" = true ]; then
     {
         echo "Failed test files:"
