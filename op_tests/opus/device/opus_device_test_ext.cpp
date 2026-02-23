@@ -14,7 +14,8 @@
  *                                                          "fp32_fp8", "fp32_fp4"
  */
 
-#include <torch/extension.h>
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
 #include "test_mfma.h"
 #include "test_mxfp.h"
 #include "test_vector_add.h"
