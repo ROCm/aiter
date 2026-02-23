@@ -29,13 +29,26 @@ from bench_mla_decode import main as bench_mla_main  # noqa: E402
 # Stores (model_name, kernel) tuples to ensure each warning is logged once
 _logged_hdim_warnings: set[tuple[str, str]] = set()
 
-# Default benchmark parameter values
+# Default benchmark parameter values - batch size:
 DEFAULT_BATCH_START: int = 1
 DEFAULT_BATCH_INC: int = 1
 DEFAULT_BATCH_END: int = 8
-DEFAULT_SEQ_START: int = 1024
-DEFAULT_SEQ_INC: int = 1024
-DEFAULT_SEQ_END: int = 8192
+
+# Default benchmark parameter values - sequence length:
+SEQ_K_MULTIPLIER: int = 1024
+MIN_SEQ_K: float = 1 / SEQ_K_MULTIPLIER
+
+
+def seq_k_to_token_count(seq_k: float) -> int:
+    return int(round(seq_k * SEQ_K_MULTIPLIER))
+
+
+DEFAULT_SEQ_START_K: float = 1.0
+DEFAULT_SEQ_INC_K: float = 1.0
+DEFAULT_SEQ_END_K: float = 8.0
+DEFAULT_SEQ_START: int = seq_k_to_token_count(DEFAULT_SEQ_START_K)
+DEFAULT_SEQ_INC: int = seq_k_to_token_count(DEFAULT_SEQ_INC_K)
+DEFAULT_SEQ_END: int = seq_k_to_token_count(DEFAULT_SEQ_END_K)
 
 
 @dataclass(kw_only=True)
@@ -758,6 +771,20 @@ def positive_int(value: str) -> int:
     return int_value
 
 
+def positive_seq_k_token_count(value: str) -> int:
+    try:
+        seq_k = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value} is not a float")
+    token_count: int = seq_k_to_token_count(seq_k)
+    if token_count <= 0:
+        raise argparse.ArgumentTypeError(
+            f"{value}K converts to {token_count} tokens - "
+            f"sequence length must be at least {MIN_SEQ_K:g}K (1 token)"
+        )
+    return token_count
+
+
 def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark attention kernels with configurations of popular LLM models.",
@@ -827,23 +854,32 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "-ss",
         "--seq-start",
-        type=positive_int,
+        type=positive_seq_k_token_count,
         default=DEFAULT_SEQ_START,
-        help=f"initial sequence length (inclusive, default: {DEFAULT_SEQ_START})",
+        help=(
+            "initial sequence length in K tokens (inclusive, 1K = 1024; "
+            f"default: {DEFAULT_SEQ_START_K})"
+        ),
     )
     parser.add_argument(
         "-si",
         "--seq-inc",
-        type=positive_int,
+        type=positive_seq_k_token_count,
         default=DEFAULT_SEQ_INC,
-        help=f"sequence length increment (default: {DEFAULT_SEQ_INC})",
+        help=(
+            "sequence length increment in K tokens (1K = 1024; "
+            f"default: {DEFAULT_SEQ_INC_K})"
+        ),
     )
     parser.add_argument(
         "-se",
         "--seq-end",
-        type=positive_int,
+        type=positive_seq_k_token_count,
         default=DEFAULT_SEQ_END,
-        help=f"final sequence length (inclusive, default: {DEFAULT_SEQ_END})",
+        help=(
+            "final sequence length in K tokens (inclusive, 1K = 1024; "
+            f"default: {DEFAULT_SEQ_END_K})"
+        ),
     )
     parser.add_argument(
         "-M",
