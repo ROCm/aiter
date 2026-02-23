@@ -212,7 +212,15 @@ def _sage_fwd_no_mask_mxfp4(
             qk += bias[None, :]
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        p = tl.math.exp2(qk - m_ij[:, None])
+        
+        if USE_BIAS:
+            q_shifted = tl.where(
+                m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
+            )
+        else:
+            q_shifted = qk - m_ij[:, None]
+        
+        p = tl.math.exp2(q_shifted)
         l_ij = tl.sum(p, 1)
 
         alpha = tl.math.exp2(m_i - m_ij)
@@ -319,10 +327,21 @@ def _sage_fwd_mask_mxfp4(
             qk += bias[None, :]
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        p = tl.math.exp2(qk - m_ij[:, None])
+        
+        if IS_CAUSAL:
+            q_shifted = tl.where(
+                m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
+            )
+        else:
+            q_shifted = qk - m_ij[:, None]
+        
+        
+        
+        p = tl.math.exp2(q_shifted)
         l_ij = tl.sum(p, 1)
 
-        alpha = tl.math.exp2(m_i - m_ij)
+        m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
+        alpha = tl.math.exp2(m_diff)
         acc = acc * alpha[:, None]
         if not PRE_LOAD_V:
             # Refactored V Load (Lazy)
@@ -488,10 +507,10 @@ def sage_fwd_mxfp4(
     bias_ptrs = (
         (
             bias
-            + off_z * stride_bz.to(tl.int64)
-            + off_h_q * stride_bh.to(tl.int64)
-            + start_m * stride_bm.to(tl.int64)
-            + offs_n * stride_bn
+            + off_z * stride_bz
+            + off_h_q * stride_bh
+            + start_m * stride_bm
+            + offs_n.to(tl.int64) * stride_bn
         )
         if USE_BIAS
         else None

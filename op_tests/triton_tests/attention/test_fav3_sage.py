@@ -8,6 +8,7 @@ import math
 from aiter.test_mha_common import (
     attention_ref,
 )
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.attention.fav3_sage import fav3_sage_wrapper_func
 from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_wrapper,
@@ -276,6 +277,9 @@ def test_sage(
 )
 @pytest.mark.parametrize("HEAD_SZ", [128])
 @pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("qsmooth", [False])
+@pytest.mark.parametrize("hadamard_rotate", [False])
 def test_sage_mxfp4(
     BATCH: int,
     SEQLEN_Q: int,
@@ -284,8 +288,15 @@ def test_sage_mxfp4(
     NUM_K_HEADS: int,
     HEAD_SZ: int,
     layout: str,
+    causal: bool,
+    qsmooth: bool,
+    hadamard_rotate: bool,
     dtype=torch.bfloat16,
 ):
+    
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+    
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
@@ -305,7 +316,10 @@ def test_sage_mxfp4(
         q,
         k,
         v,
+        causal=causal,
         layout=layout,
+        q_smooth=qsmooth,
+        hadamard_rotation=hadamard_rotate,
     )
 
     if DEBUG_MODE:
@@ -316,7 +330,7 @@ def test_sage_mxfp4(
         k = k.permute(0, 2, 1, 3).contiguous()
         v = v.permute(0, 2, 1, 3).contiguous()
 
-    torch_out = attention_ref(q, k, v, dropout_p=0.0, dropout_mask=None, causal=False)
+    torch_out = attention_ref(q, k, v, dropout_p=0.0, dropout_mask=None, causal=causal)
     torch_out, attention_scores, _ = torch_out
 
     if layout == "bhsd":
