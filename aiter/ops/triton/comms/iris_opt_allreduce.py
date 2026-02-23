@@ -39,7 +39,7 @@ __all__ = ["fused_allreduce_add_rms_quant_iris_opt"]
 
 logger = logging.getLogger(__name__)
 
-AUTOTUNE = True
+AUTOTUNE = False
 if AUTOTUNE:
     os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 
@@ -108,17 +108,18 @@ def get_iris_opt_configs(autotune: bool):
     num_xcds = iris.hip.get_num_xcc()
 
     if not autotune:
-        comm_sms = 64
+        # Best config from autotuning on gfx950 (8x MI355, M=512, N=8192)
+        comm_sms = 128
         return [
             triton.Config(
                 {
                     "COMM_SMS": comm_sms,
                     "NUM_XCDS": num_xcds,
                     "CHUNK_SIZE": _compute_chunk_size(comm_sms, num_xcds),
-                    "waves_per_eu": 1,
+                    "waves_per_eu": 4,
                 },
-                num_warps=8,
-                num_stages=1,
+                num_warps=16,
+                num_stages=2,
             )
         ]
 
