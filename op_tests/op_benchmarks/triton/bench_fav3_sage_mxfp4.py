@@ -16,7 +16,7 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
 )
 
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import (
-    return_static_random_hadamard
+    return_static_random_hadamard,
 )
 
 from op_tests.triton_tests.attention.test_fav3_sage import (
@@ -93,10 +93,17 @@ def bench_kernel(q, k, v, args, provider):
     # fn = return_only_kernel_func_call()
     # TODO: quantization drops the perf from 1800 to 1400 TFLOPs. This is too much.
     R = return_static_random_hadamard(q.device)
-    
+
     def fn():
         return fav3_sage_mxfp4_wrapper(
-            q, k, v, causal=args.causal, layout=args.layout, q_smooth=args.qsmooth, hadamard_rotation=args.hadamard_rotate, R=R,
+            q,
+            k,
+            v,
+            causal=args.causal,
+            layout=args.layout,
+            q_smooth=args.qsmooth,
+            hadamard_rotation=args.hadamard_rotate,
+            R=R,
         )
 
     ms = triton.testing.do_bench(fn)
@@ -225,7 +232,13 @@ def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
 
 def test_accuracy(q, k, v, args):
     triton_out = fav3_sage_mxfp4_wrapper(
-        q, k, v, causal=args.causal, layout=args.layout, q_smooth=args.qsmooth, hadamard_rotation=args.hadamard_rotate
+        q,
+        k,
+        v,
+        causal=args.causal,
+        layout=args.layout,
+        q_smooth=args.qsmooth,
+        hadamard_rotation=args.hadamard_rotate,
     )
     # permute because FAv2 assumes bshd
     if args.layout == "bhsd":

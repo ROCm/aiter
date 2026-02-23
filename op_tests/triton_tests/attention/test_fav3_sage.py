@@ -10,7 +10,7 @@ from aiter.test_mha_common import (
 )
 from aiter.ops.triton.attention.fav3_sage import fav3_sage_wrapper_func
 from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
-    fav3_sage_mxfp4_wrapper
+    fav3_sage_mxfp4_wrapper,
 )
 
 logging.basicConfig(level=logging.DEBUG)
@@ -266,8 +266,6 @@ def test_sage(
     )
 
 
-
-
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
@@ -278,7 +276,7 @@ def test_sage(
 )
 @pytest.mark.parametrize("HEAD_SZ", [128])
 @pytest.mark.parametrize("layout", ["bhsd", "bshd"])
-def test_sage_mxfp4( 
+def test_sage_mxfp4(
     BATCH: int,
     SEQLEN_Q: int,
     SEQLEN_K: int,
@@ -304,9 +302,11 @@ def test_sage_mxfp4(
     )
 
     triton_out = fav3_sage_mxfp4_wrapper(
-            q, k, v,
-            layout=layout,
-        )
+        q,
+        k,
+        v,
+        layout=layout,
+    )
 
     if DEBUG_MODE:
         print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")

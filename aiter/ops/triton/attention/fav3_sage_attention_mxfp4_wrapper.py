@@ -72,7 +72,7 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
             BLOCK_M=config["BLOCK_M"],
             BLOCK_R=32 if R is None else R.shape[-1],
             q_smoothing=q_smooth,
-            layout=layout
+            layout=layout,
         )
 
         qd_mapped = map_dims(q_descale.shape, bhsd_map)
@@ -125,7 +125,9 @@ def fav3_sage_mxfp4_wrapper(
             torch.float32,
         ], f"Expected high-precision for {name}, got {tensor.dtype}"
 
-    return _FAv3SageMXFP4WrapperFunc.apply(q, k, v, causal, layout, q_smooth, hadamard_rotation, config, R)
+    return _FAv3SageMXFP4WrapperFunc.apply(
+        q, k, v, causal, layout, q_smooth, hadamard_rotation, config, R
+    )
 
 
 def fav3_sage_mxfp4_func(

@@ -10,8 +10,6 @@ from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
 )
 
 
-
-
 @triton.jit
 def compute_padding_info(seqlen_k, BLOCK_N: tl.constexpr):
     """Calculate padding information for the last K block."""
@@ -715,7 +713,6 @@ def _compute_mx_quant_and_scale(
     return out_tensor, dequant_scale_exponent
 
 
-
 def sage_quant_mxfp4(
     q,
     k,
@@ -725,7 +722,7 @@ def sage_quant_mxfp4(
     R=None,
     BLOCK_R=None,
     q_smoothing=False,
-    layout="bshd"
+    layout="bshd",
 ):
 
     if layout == "bhsd":
@@ -765,9 +762,7 @@ def sage_quant_mxfp4(
     K_NUM_BLKS = (kv_len + BLOCK_K - 1) // BLOCK_K
 
     # Apply K tensor smoothing following SageAttention approach
-    v_scale = (
-        v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
-    )
+    v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
 
     v_task_count = b * h_kv * K_NUM_BLKS
     grid = (v_task_count,)
@@ -941,8 +936,6 @@ def _rotate_quantize_qk_kernel(
     qk_descale_ptr = descale_offset + offs_ds[None, :]
     qk_quant_ptr = quant_tensor_offset + offs_dq[None, :]
 
-    
-
     qk_tile = tl.load(
         qk_ptr, mask=(offs_m[:, None] < seqlen) & (offs_d[None, :] < d_model), other=0.0
     )  # (BLOCK_M, D)
@@ -951,7 +944,9 @@ def _rotate_quantize_qk_kernel(
     if is_q_pid:
         if q_smoothing:
             ACTUAL_BLOCK_M = tl.minimum(BLOCK_M, seqlen - pid_m * BLOCK_M)
-            m_row_mean = tl.sum(qk_tile, axis=0) / ACTUAL_BLOCK_M  # Sum over BLOCK_M -> shape [D]
+            m_row_mean = (
+                tl.sum(qk_tile, axis=0) / ACTUAL_BLOCK_M
+            )  # Sum over BLOCK_M -> shape [D]
             qk_tile -= m_row_mean[None, :]
             qk_tile = qk_tile.to(original_dtype)
             mean_ptr = (
@@ -965,7 +960,9 @@ def _rotate_quantize_qk_kernel(
 
     if hadamard_rotation:
         r_ptr = (
-            R + tl.arange(0, BLOCK_R)[:, None] * BLOCK_R + tl.arange(0, BLOCK_R)[None, :]
+            R
+            + tl.arange(0, BLOCK_R)[:, None] * BLOCK_R
+            + tl.arange(0, BLOCK_R)[None, :]
         )
         r_mat = tl.load(r_ptr)  # BLOCK_R x BLOCK_R
 
@@ -976,7 +973,6 @@ def _rotate_quantize_qk_kernel(
         qk_rot_tile = qk_rot_tile.reshape((BLOCK_M, D))
     else:
         qk_rot_tile = qk_tile.to(tl.float32)
-
 
     if is_q_pid:
         qk_rot_tile *= sm_scale
@@ -1119,7 +1115,7 @@ def smooth_rotate_downcast_qk(
     k,
     BLOCK_SIZE_M,
     hadamard_rotation=False,
-    R = None,
+    R=None,
     BLOCK_R=None,
     q_smoothing=False,
     sm_scale=None,
@@ -1127,7 +1123,9 @@ def smooth_rotate_downcast_qk(
 ):
     if hadamard_rotation:
         if R is None:
-            assert BLOCK_R is not None, "if using hadamard rotation, BLOCK_R (size of the hadamard matrix) must be provided."
+            assert (
+                BLOCK_R is not None
+            ), "if using hadamard rotation, BLOCK_R (size of the hadamard matrix) must be provided."
             R = create_hadamard_matrix(BLOCK_R, q.device) / (BLOCK_R**0.5)
         else:
             BLOCK_R = R.shape[-1]
@@ -2324,5 +2322,3 @@ def return_static_random_hadamard(device):
         dtype=torch.bfloat16,
         device=device,
     )
-
-
