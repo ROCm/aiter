@@ -11,6 +11,12 @@ extern "C" {
 // All functions: d_a, d_b, d_c are device pointers; strides in elements.
 // C = A @ B^T  (swap_ab adaptor).
 
+// --- f32 MFMA: gfx942 + gfx950 ---
+void run_mfma_32x32x2_f32(const void* d_a, const void* d_b, void* d_c,
+                           int stride_a, int stride_b, int stride_c);
+void run_mfma_16x16x4_f32(const void* d_a, const void* d_b, void* d_c,
+                           int stride_a, int stride_b, int stride_c);
+
 // --- gfx942 only ---
 void run_mfma_32x32x8_f16(const void* d_a, const void* d_b, void* d_c,
                            int stride_a, int stride_b, int stride_c);

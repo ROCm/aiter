@@ -3,6 +3,8 @@
 """
 Test OPUS device kernels via a single PyTorch extension (opus_device_test).
 Covers:
+  - MFMA 32x32x2   fp32      (gfx942 + gfx950)
+  - MFMA 16x16x4   fp32      (gfx942 + gfx950)
   - MFMA 32x32x8   fp16/bf16 (gfx942 only)
   - MFMA 16x16x16  fp16/bf16 (gfx942 only)
   - MFMA 32x32x16  fp16/bf16 (gfx942 + gfx950)
@@ -184,6 +186,20 @@ def _test_mfma_variant(mod, variant, M, N, K, dtype, supported_archs):
         return 1
     print(f"  PASS: mfma_{variant}, max_diff={max_diff:.4f}")
     return 0
+
+
+def test_mfma_32x32x2_f32(mod):
+    """Test MFMA 32x32x2 fp32 kernel (gfx942 + gfx950)."""
+    return _test_mfma_variant(
+        mod, "32x32x2_f32", 32, 32, 2, torch.float32, _MFMA_ARCHS_GFX942_GFX950
+    )
+
+
+def test_mfma_16x16x4_f32(mod):
+    """Test MFMA 16x16x4 fp32 kernel (gfx942 + gfx950)."""
+    return _test_mfma_variant(
+        mod, "16x16x4_f32", 16, 16, 4, torch.float32, _MFMA_ARCHS_GFX942_GFX950
+    )
 
 
 def test_mfma_32x32x8_f16(mod):
@@ -801,6 +817,8 @@ def main():
     mod = __import__(_MODULE_NAME)
 
     failures = 0
+    failures += test_mfma_32x32x2_f32(mod)
+    failures += test_mfma_16x16x4_f32(mod)
     failures += test_mfma_32x32x8_f16(mod)
     failures += test_mfma_32x32x8_bf16(mod)
     failures += test_mfma_16x16x16_f16(mod)

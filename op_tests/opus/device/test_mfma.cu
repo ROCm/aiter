@@ -7,19 +7,21 @@
  * Uses matrix_core_kernel_block_v2 style from
  * https://github.com/carlushuang/gcnasm/blob/master/matrix_core_opus/matrix_core.cc
  *
- * Supports 12 variants:
- *   1)  32x32x8  FP16  — gfx942 only
- *   2)  32x32x8  BF16  — gfx942 only
- *   3)  16x16x16 FP16  — gfx942 only
- *   4)  16x16x16 BF16  — gfx942 only
- *   5)  32x32x16 FP16  — gfx942 (step_k) + gfx950 (native)
- *   6)  32x32x16 BF16  — gfx942 (step_k) + gfx950 (native)
- *   7)  16x16x32 FP16  — gfx942 (step_k) + gfx950 (native)
- *   8)  16x16x32 BF16  — gfx942 (step_k) + gfx950 (native)
- *   9)  32x32x16 FP8   — gfx942 + gfx950 (native, fp32 output)
- *   10) 32x32x16 BF8   — gfx942 + gfx950 (native, fp32 output)
- *   11) 16x16x32 FP8   — gfx942 + gfx950 (native, fp32 output)
- *   12) 16x16x32 BF8   — gfx942 + gfx950 (native, fp32 output)
+ * Supports 14 variants:
+ *   1)  32x32x2  FP32  — gfx942 + gfx950 (native)
+ *   2)  16x16x4  FP32  — gfx942 + gfx950 (native)
+ *   3)  32x32x8  FP16  — gfx942 only
+ *   4)  32x32x8  BF16  — gfx942 only
+ *   5)  16x16x16 FP16  — gfx942 only
+ *   6)  16x16x16 BF16  — gfx942 only
+ *   7)  32x32x16 FP16  — gfx942 (step_k) + gfx950 (native)
+ *   8)  32x32x16 BF16  — gfx942 (step_k) + gfx950 (native)
+ *   9)  16x16x32 FP16  — gfx942 (step_k) + gfx950 (native)
+ *   10) 16x16x32 BF16  — gfx942 (step_k) + gfx950 (native)
+ *   11) 32x32x16 FP8   — gfx942 + gfx950 (native, fp32 output)
+ *   12) 32x32x16 BF8   — gfx942 + gfx950 (native, fp32 output)
+ *   13) 16x16x32 FP8   — gfx942 + gfx950 (native, fp32 output)
+ *   14) 16x16x32 BF8   — gfx942 + gfx950 (native, fp32 output)
  *
  * swap_ab internally swaps A/B in the MFMA and transposes the C layout,
  * so the net result in row-major memory is C = A @ B^T (gemm_rcr).
@@ -137,6 +139,46 @@ __global__ void mfma_kernel_generic(
 // ---------------------------------------------------------------------------
 // Host launch functions
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// FP32 variants: native 32x32x2 and 16x16x4 MFMA, fp32 input/output
+// ---------------------------------------------------------------------------
+
+extern "C" void run_mfma_32x32x2_f32(
+    const void* d_a,
+    const void* d_b,
+    void* d_c,
+    int stride_a,
+    int stride_b,
+    int stride_c)
+{
+    const auto* a = static_cast<const opus::fp32_t*>(d_a);
+    const auto* b = static_cast<const opus::fp32_t*>(d_b);
+    auto* c = static_cast<opus::fp32_t*>(d_c);
+    const int K = 2;
+    hipLaunchKernelGGL((mfma_kernel_generic<opus::fp32_t, opus::fp32_t, 32, 32, 2>),
+                       dim3(1, 1), 64, 0, 0, a, b, c, K, stride_a, stride_b, stride_c);
+    HIP_CALL(hipGetLastError());
+    HIP_CALL(hipDeviceSynchronize());
+}
+
+extern "C" void run_mfma_16x16x4_f32(
+    const void* d_a,
+    const void* d_b,
+    void* d_c,
+    int stride_a,
+    int stride_b,
+    int stride_c)
+{
+    const auto* a = static_cast<const opus::fp32_t*>(d_a);
+    const auto* b = static_cast<const opus::fp32_t*>(d_b);
+    auto* c = static_cast<opus::fp32_t*>(d_c);
+    const int K = 4;
+    hipLaunchKernelGGL((mfma_kernel_generic<opus::fp32_t, opus::fp32_t, 16, 16, 4>),
+                       dim3(1, 1), 64, 0, 0, a, b, c, K, stride_a, stride_b, stride_c);
+    HIP_CALL(hipGetLastError());
+    HIP_CALL(hipDeviceSynchronize());
+}
 
 extern "C" void run_mfma_32x32x8_f16(
     const void* d_a,
