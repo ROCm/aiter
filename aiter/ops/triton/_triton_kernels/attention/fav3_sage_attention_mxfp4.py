@@ -212,14 +212,14 @@ def _sage_fwd_no_mask_mxfp4(
             qk += bias[None, :]
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        
+
         if USE_BIAS:
             q_shifted = tl.where(
                 m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
             )
         else:
             q_shifted = qk - m_ij[:, None]
-        
+
         p = tl.math.exp2(q_shifted)
         l_ij = tl.sum(p, 1)
 
@@ -327,16 +327,14 @@ def _sage_fwd_mask_mxfp4(
             qk += bias[None, :]
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        
+
         if IS_CAUSAL:
             q_shifted = tl.where(
                 m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
             )
         else:
             q_shifted = qk - m_ij[:, None]
-        
-        
-        
+
         p = tl.math.exp2(q_shifted)
         l_ij = tl.sum(p, 1)
 

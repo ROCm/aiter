@@ -125,8 +125,6 @@ def fav3_sage_mxfp4_wrapper(
             torch.float32,
         ], f"Expected high-precision for {name}, got {tensor.dtype}"
 
-    
-    
     return _FAv3SageMXFP4WrapperFunc.apply(
         q, k, v, causal, layout, q_smooth, hadamard_rotation, config, R
     )
@@ -157,7 +155,6 @@ def fav3_sage_mxfp4_func(
     assert q.dtype == torch.uint8 and k.dtype == torch.uint8, "MXFP4 Q/K must be uint8"
     assert nheads_q % nheads_k == 0, "GQA/MQA ratio mismatch"
     assert layout in ["bhsd", "bshd"], "Only bhsd and bshd supported for now."
-    
 
     if config is None:
         config = get_sage_fwd_configs_mxfp4()

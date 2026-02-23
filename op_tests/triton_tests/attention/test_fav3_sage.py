@@ -293,10 +293,10 @@ def test_sage_mxfp4(
     hadamard_rotate: bool,
     dtype=torch.bfloat16,
 ):
-    
+
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
-    
+
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
@@ -352,5 +352,3 @@ def test_sage_mxfp4(
         rtol=RTOL_fp8,
         max_diff_percentage=1.5,
     )
-
-
