@@ -1,14 +1,11 @@
 import torch
 import triton
 from triton.experimental import gluon
-import triton.experimental.gluon.language as ttgl
-
-from aiter.ops.triton.moe.quant_moe import DequantScaleRoundingMode
-from aiter.ops.triton.moe.moe_routing.routing import RoutingData
+import triton.experimental.gluon.language as gl
 
 
 @gluon.jit
-def pid_grid(pid: int, num_pid_m: int, num_pid_n: int, GROUP_SIZE_M: ttgl.constexpr = 1):
+def pid_grid(pid: int, num_pid_m: int, num_pid_n: int, GROUP_SIZE_M: gl.constexpr = 1):
     """
     Maps 1D pid to 2D grid coords (pid_m, pid_n).
 
@@ -26,14 +23,14 @@ def pid_grid(pid: int, num_pid_m: int, num_pid_n: int, GROUP_SIZE_M: ttgl.conste
         group_id = pid // num_pid_in_group
         first_pid_m = group_id * GROUP_SIZE_M
         group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-        ttgl.assume(group_size_m >= 0)
+        gl.assume(group_size_m >= 0)
         pid_m = first_pid_m + (pid % group_size_m)
         pid_n = (pid % num_pid_in_group) // group_size_m
     return pid_m, pid_n
 
 
 @gluon.jit
-def xcd_swizzle(pid, domain_size, XCD_SWIZZLE: ttgl.constexpr):
+def xcd_swizzle(pid, domain_size, XCD_SWIZZLE: gl.constexpr):
     """
     Swizzle the program id based on integer XCD_SWIZZLE.
     This is useful for reording how blocks are ordered. A scheduler may, for example,
@@ -56,89 +53,89 @@ def xcd_swizzle(pid, domain_size, XCD_SWIZZLE: ttgl.constexpr):
 
 
 @gluon.jit
-def clip(x, limit, clip_lower: ttgl.constexpr):
-    res = ttgl.minimum(x, limit)
+def clip(x, limit, clip_lower: gl.constexpr):
+    res = gl.minimum(x, limit)
     if clip_lower:
-        res = ttgl.maximum(-limit, res)
+        res = gl.maximum(-limit, res)
     return res
 
 
 @gluon.jit
 def _swiglu(input, alpha, limit):
-    gelu, linear = ttgl.split(ttgl.reshape(input, (input.shape[0], input.shape[1] // 2, 2)))
-    gelu = gelu.to(ttgl.float32)
+    gelu, linear = gl.split(gl.reshape(input, (input.shape[0], input.shape[1] // 2, 2)))
+    gelu = gelu.to(gl.float32)
     if limit is not None:
         gelu = clip(gelu, limit, clip_lower=False)
-    linear = linear.to(ttgl.float32)
+    linear = linear.to(gl.float32)
     if limit is not None:
         linear = clip(linear, limit, clip_lower=True)
-    s = gelu / (1 + ttgl.exp2(-1.44269504089 * alpha * gelu))
-    return ttgl.fma(s, linear, s)  # (s * (linear + 1))
+    s = gelu / (1 + gl.exp2(-1.44269504089 * alpha * gelu))
+    return gl.fma(s, linear, s)  # (s * (linear + 1))
 
 
 @gluon.jit
 def _compute_static_fp8_quant(tensor, scale):
-    tensor = tensor.to(ttgl.float32)
+    tensor = tensor.to(gl.float32)
     tensor = tensor / scale
-    tensor = tensor.to(ttgl.float8e4nv)
+    tensor = tensor.to(gl.float8e4nv)
     return tensor
 
 
 @gluon.jit
 def _reduce_grouped(
     X,
-    stride_xb: ttgl.uint64,
-    stride_xm: ttgl.uint64,
+    stride_xb: gl.uint64,
+    stride_xm: gl.uint64,
     stride_xn,  #
     Out,
-    stride_om: ttgl.uint64,
+    stride_om: gl.uint64,
     stride_on,  # output tensor
     InIndx,
     B,
     N,  #
     # fused activation function
-    APPLY_SWIGLU: ttgl.constexpr,
+    APPLY_SWIGLU: gl.constexpr,
     alpha,
     limit,
-    ACTIVATION_REDUCTION_N: ttgl.constexpr,
-    K: ttgl.constexpr,
-    BLOCK_N: ttgl.constexpr,
-    EVEN_N: ttgl.constexpr,
+    ACTIVATION_REDUCTION_N: gl.constexpr,
+    K: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    EVEN_N: gl.constexpr,
 ):
-    pid_t = ttgl.program_id(1)
-    pid_n = ttgl.program_id(0)
+    pid_t = gl.program_id(1)
+    pid_n = gl.program_id(0)
 
-    BLOCK_N_OUT: ttgl.constexpr = BLOCK_N // ACTIVATION_REDUCTION_N
+    BLOCK_N_OUT: gl.constexpr = BLOCK_N // ACTIVATION_REDUCTION_N
     start = pid_t * K
     # load indices into a tuple
     if InIndx is None:
         indxs = (pid_t,)
     else:
         indxs = ()
-        for i in ttgl.static_range(0, K):
-            indxs = indxs + (ttgl.load(InIndx + start + i),)
-    XPtrs = X + (pid_n * BLOCK_N + ttgl.arange(0, BLOCK_N)) * stride_xn
-    OutPtrs = Out + (pid_n * BLOCK_N_OUT + ttgl.arange(0, BLOCK_N_OUT)) * stride_on
+        for i in gl.static_range(0, K):
+            indxs = indxs + (gl.load(InIndx + start + i),)
+    XPtrs = X + (pid_n * BLOCK_N + gl.arange(0, BLOCK_N)) * stride_xn
+    OutPtrs = Out + (pid_n * BLOCK_N_OUT + gl.arange(0, BLOCK_N_OUT)) * stride_on
 
-    acc = ttgl.zeros([BLOCK_N_OUT], dtype=ttgl.float32)
-    x_n_mask = pid_n * BLOCK_N + ttgl.arange(0, BLOCK_N) < N
+    acc = gl.zeros([BLOCK_N_OUT], dtype=gl.float32)
+    x_n_mask = pid_n * BLOCK_N + gl.arange(0, BLOCK_N) < N
     # accumulate contributions for this tile
-    for i in ttgl.static_range(0, K):
-        curr = ttgl.zeros([BLOCK_N], dtype=ttgl.float32)
+    for i in gl.static_range(0, K):
+        curr = gl.zeros([BLOCK_N], dtype=gl.float32)
         # iterate over split_k partial values
-        for b in ttgl.range(0, B):
+        for b in gl.range(0, B):
             x_row_ptr = XPtrs + indxs[i] * stride_xm + b * stride_xb
             if EVEN_N:
-                vals = ttgl.load(x_row_ptr)
+                vals = gl.load(x_row_ptr)
             else:
-                vals = ttgl.load(x_row_ptr, mask=x_n_mask, other=0.0)
-            vals = vals.to(ttgl.float32)
+                vals = gl.load(x_row_ptr, mask=x_n_mask, other=0.0)
+            vals = vals.to(gl.float32)
             curr += vals
 
         # apply nonlinearity to split-k output
         if APPLY_SWIGLU:
             curr = _swiglu(curr[None, :], alpha, limit)
-        curr = ttgl.reshape(curr, [curr.shape[-1]])
+        curr = gl.reshape(curr, [curr.shape[-1]])
         # update final accumulator
         acc += curr
 
@@ -148,10 +145,10 @@ def _reduce_grouped(
     # write-back for this tile
     out_ptr = OutPtrs + pid_t * stride_om
     if EVEN_N:
-        ttgl.store(out_ptr, acc)
+        gl.store(out_ptr, acc)
     else:
-        out_n_mask = pid_n * BLOCK_N_OUT + ttgl.arange(0, BLOCK_N_OUT) < Nrem
-        ttgl.store(out_ptr, acc, mask=out_n_mask)
+        out_n_mask = pid_n * BLOCK_N_OUT + gl.arange(0, BLOCK_N_OUT) < Nrem
+        gl.store(out_ptr, acc, mask=out_n_mask)
 
 
 def reduce_grouped(
@@ -340,7 +337,7 @@ def get_wmma_layout(num_warps, packed, scale_preshuffle):
 
     instr_shape = [16, 16, 64] if packed else [16, 16, 128]
 
-    return ttgl.amd.AMDWMMALayout(3, True, warp_bases, reg_bases, instr_shape)
+    return gl.amd.AMDWMMALayout(3, True, warp_bases, reg_bases, instr_shape)
 
 
 @gluon.jit
@@ -370,6 +367,7 @@ def _moe_gemm_a4w4_gfx1250(
     stride_b_e,
     Gammas,
     # shapes
+    num_tokens,
     N,
     K,
     # expt data
@@ -382,91 +380,88 @@ def _moe_gemm_a4w4_gfx1250(
     grid_m,
     grid_n,
     # fused activation function
-    APPLY_SWIGLU: ttgl.constexpr,
+    APPLY_SWIGLU: gl.constexpr,
     alpha,
     limit,
-    ACTIVATION_REDUCTION_N: ttgl.constexpr,
+    ACTIVATION_REDUCTION_N: gl.constexpr,
     # MoE config
-    N_EXPTS_ACT: ttgl.constexpr,
+    N_EXPTS_ACT: gl.constexpr,
     # optimization config
-    BLOCK_M: ttgl.constexpr,
-    BLOCK_N: ttgl.constexpr,
-    BLOCK_K: ttgl.constexpr,
-    GROUP_M: ttgl.constexpr,
-    XCD_SWIZZLE: ttgl.constexpr,
-    SWIZZLE_MX_SCALE: ttgl.constexpr, # TODO: add support for swizzle
-    EVEN_K: ttgl.constexpr,
-    MASK_K_LIMIT: ttgl.constexpr,
-    SPLIT_K: ttgl.constexpr,
-    W_CACHE_MODIFIER: ttgl.constexpr,
-    # layouts
-    WMMA_LAYOUT: ttgl.constexpr,
-    DOT_LAYOUT_X: ttgl.constexpr,
-    DOT_LAYOUT_W: ttgl.constexpr,
-    LAYOUT_X_SCALES: ttgl.constexpr,
-    LAYOUT_W_SCALES: ttgl.constexpr,
-    BLOCKED_LAYOUT_MK: ttgl.constexpr,
-    BLOCKED_LAYOUT_KN: ttgl.constexpr,
-    UPCAST_INDICES: ttgl.constexpr = False,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    GROUP_M: gl.constexpr,
+    XCD_SWIZZLE: gl.constexpr,
+    SWIZZLE_MX_SCALE: gl.constexpr,
+    EVEN_K: gl.constexpr,
+    MASK_K_LIMIT: gl.constexpr,
+    SPLIT_K: gl.constexpr,
+    W_CACHE_MODIFIER: gl.constexpr,
+    WMMA_LAYOUT: gl.constexpr,
+    WMMA_LAYOUT_PACKED: gl.constexpr,
+    UPCAST_INDICES: gl.constexpr = False,
 ):
-    ttgl.assume(stride_y_k >= 0)
-    ttgl.assume(stride_y_m >= 0)
-    ttgl.assume(stride_y_n >= 0)
-    ttgl.assume(stride_x_m >= 0)
-    ttgl.assume(stride_x_k >= 0)
-    ttgl.assume(stride_w_e >= 0)
-    ttgl.assume(stride_w_k >= 0)
-    ttgl.assume(stride_w_n >= 0)
+    gl.assume(stride_y_k >= 0)
+    gl.assume(stride_y_m >= 0)
+    gl.assume(stride_y_n >= 0)
+    gl.assume(stride_x_m >= 0)
+    gl.assume(stride_x_k >= 0)
+    gl.assume(stride_w_e >= 0)
+    gl.assume(stride_w_k >= 0)
+    gl.assume(stride_w_n >= 0)
     if stride_x_mx_m is not None:
-        ttgl.assume(stride_x_mx_m >= 0)
+        gl.assume(stride_x_mx_m >= 0)
     if stride_x_mx_k is not None:
-        ttgl.assume(stride_x_mx_k >= 0)
+        gl.assume(stride_x_mx_k >= 0)
     if stride_w_mx_e is not None:
-        ttgl.assume(stride_w_mx_e >= 0)
+        gl.assume(stride_w_mx_e >= 0)
     if stride_w_mx_k is not None:
-        ttgl.assume(stride_w_mx_k >= 0)
+        gl.assume(stride_w_mx_k >= 0)
     if stride_w_mx_n is not None:
-        ttgl.assume(stride_w_mx_n >= 0)
+        gl.assume(stride_w_mx_n >= 0)
     if B is not None:
-        ttgl.assume(stride_b_e >= 0)
-    ttgl.assume(grid_m >= 0)
-    ttgl.assume(grid_n >= 0)
+        gl.assume(stride_b_e >= 0)
+    gl.assume(grid_m >= 0)
+    gl.assume(grid_n >= 0)
 
-    MX_PACK_DIVISOR: ttgl.constexpr = 32
-    ttgl.static_assert(
+    NUM_BUFFERS: gl.constexpr = 2
+
+    MX_PACK_DIVISOR: gl.constexpr = 32
+    gl.static_assert(
         BLOCK_K % MX_PACK_DIVISOR == 0, "BLOCK_K must be a multiple of MX_PACK_DIVISOR"
     )
 
-    is_x_microscaled: ttgl.constexpr = XMxScale is not None
-    w_type: ttgl.constexpr = W.dtype.element_ty
-    ttgl.static_assert(w_type == ttgl.uint8, "mx_weight_ptr must be uint8 or fp8")
-    ttgl.static_assert(
-        WMxScale.dtype.element_ty == ttgl.uint8, "mx_scale_ptr must be uint8"
+    is_x_microscaled: gl.constexpr = XMxScale is not None
+    NUM_LOADS_IN_BATCH: gl.constexpr = 4 if is_x_microscaled else 3
+    w_type: gl.constexpr = W.dtype.element_ty
+    gl.static_assert(w_type == gl.uint8, "mx_weight_ptr must be uint8 or fp8")
+    gl.static_assert(
+        WMxScale.dtype.element_ty == gl.uint8, "mx_scale_ptr must be uint8"
     )
-    x_type: ttgl.constexpr = X.dtype.element_ty
+    x_type: gl.constexpr = X.dtype.element_ty
     if is_x_microscaled:
-        ttgl.static_assert(x_type == ttgl.uint8, "mx_act_ptr must be uint8")
-        ttgl.static_assert(
-            XMxScale.dtype.element_ty == ttgl.uint8, "mx_scale_ptr must be uint8"
+        gl.static_assert(x_type == gl.uint8, "mx_act_ptr must be uint8")
+        gl.static_assert(
+            XMxScale.dtype.element_ty == gl.uint8, "mx_scale_ptr must be uint8"
         )
 
-    OUT_BLOCK_N: ttgl.constexpr = BLOCK_N // ACTIVATION_REDUCTION_N
+    OUT_BLOCK_N: gl.constexpr = BLOCK_N // ACTIVATION_REDUCTION_N
     yN = N // ACTIVATION_REDUCTION_N
 
     # get program id
-    pid = ttgl.program_id(0)
+    pid = gl.program_id(0)
     if ExptOffsSum is not None and XCD_SWIZZLE > 1:
         # Determine how much padding there is on the expert data. This allows us to
         # know the true grid size and avoid processing padding tiles.
-        padding_m = grid_m - ttgl.load(ExptOffsSum)
+        padding_m = grid_m - gl.load(ExptOffsSum)
     else:
-        padding_m: ttgl.constexpr = 0
+        padding_m: gl.constexpr = 0
 
-    index_type: ttgl.constexpr = ttgl.int64 if UPCAST_INDICES else ttgl.int32
+    index_type: gl.constexpr = gl.int64 if UPCAST_INDICES else gl.int32
 
     # get unpadded grid size
     unpadded_m = grid_m - padding_m
-    ttgl.assume(unpadded_m >= 0)
+    gl.assume(unpadded_m >= 0)
     total_actual_tiles = unpadded_m * grid_n * SPLIT_K
     if padding_m > 0 and pid >= total_actual_tiles:
         return
@@ -486,180 +481,247 @@ def _moe_gemm_a4w4_gfx1250(
         Y += pid_k.to(index_type) * stride_y_k
 
     # unpack expert data
-    expt_data = ttgl.load(ExptData + pid_m)
+    expt_data = gl.load(ExptData + pid_m)
     if expt_data == -1:
         return
     expt_id = expt_data & 0x0000FFFF
     block_id = expt_data >> 16
-    M = ttgl.load(ExptHist + expt_id)
-    start_m = ttgl.load(ExptOffs + expt_id)
+    M = gl.load(ExptHist + expt_id)
+    start_m = gl.load(ExptOffs + expt_id)
     expt_id, block_id = expt_id.to(index_type), block_id.to(index_type)
     start_m = start_m.to(index_type)
     pid_n, pid_k = pid_n.to(index_type), pid_k.to(index_type)
 
     # constants
-    X_M_DIVISOR: ttgl.constexpr = 1
-    X_K_DIVISOR: ttgl.constexpr = 2
-    W_K_DIVISOR: ttgl.constexpr = 2
-    W_N_DIVISOR: ttgl.constexpr = 1
-    PACKED_BLOCK_M_X: ttgl.constexpr = BLOCK_M // X_M_DIVISOR
-    PACKED_BLOCK_K_X: ttgl.constexpr = BLOCK_K // X_K_DIVISOR
-    PACKED_BLOCK_K_W: ttgl.constexpr = BLOCK_K // W_K_DIVISOR
-    PACKED_BLOCK_N_W: ttgl.constexpr = BLOCK_N // W_N_DIVISOR
-    MX_SCALE_BLOCK_K: ttgl.constexpr = BLOCK_K // MX_PACK_DIVISOR
+    X_M_DIVISOR: gl.constexpr = 1
+    X_K_DIVISOR: gl.constexpr = 2
+    W_K_DIVISOR: gl.constexpr = 2
+    W_N_DIVISOR: gl.constexpr = 1
+    PACKED_BLOCK_M_X: gl.constexpr = BLOCK_M // X_M_DIVISOR
+    PACKED_BLOCK_K_X: gl.constexpr = BLOCK_K // X_K_DIVISOR
+    PACKED_BLOCK_K_W: gl.constexpr = BLOCK_K // W_K_DIVISOR
+    PACKED_BLOCK_N_W: gl.constexpr = BLOCK_N // W_N_DIVISOR
+    MX_SCALE_BLOCK_K: gl.constexpr = BLOCK_K // MX_PACK_DIVISOR
 
     # A pointers
-    offs_x_k = PACKED_BLOCK_K_X * pid_k + ttgl.arange(0, PACKED_BLOCK_K_X, layout=ttgl.SliceLayout(0, BLOCKED_LAYOUT_MK))
-    offs_x_m = PACKED_BLOCK_M_X * block_id + ttgl.arange(0, PACKED_BLOCK_M_X, layout=ttgl.SliceLayout(1, BLOCKED_LAYOUT_MK))
-    offs_x_m = ttgl.max_contiguous(
-        ttgl.multiple_of(offs_x_m % (M // X_M_DIVISOR), PACKED_BLOCK_M_X),
-        PACKED_BLOCK_M_X,
-    )
+    offs_x_m = PACKED_BLOCK_M_X * block_id 
     if GatherIndx is None:
         X += start_m * stride_x_m
     else:
+        IDX_BASE_LAYOUT: gl.constexpr = gl.BlockedLayout([PACKED_BLOCK_M_X, 1], [1, 32], [1, 4], [1, 0])
+        IDX_LAYOUT: gl.constexpr = gl.SliceLayout(1, IDX_BASE_LAYOUT)
+        offs_x_m = PACKED_BLOCK_M_X * block_id + gl.arange(0, PACKED_BLOCK_M_X, layout=IDX_LAYOUT)
         GatherIndx += start_m
-        # no needs to bounds-check here because `offs_x_m` wraps around M dim
-        offs_x_m = ttgl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
-    XPtrs = (
-        X
-        + offs_x_m.to(index_type)[:, None] * stride_x_m
-        + offs_x_k.to(index_type)[None, :] * stride_x_k
-    )
+        offs_x_m = gl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
 
     # B scale pointers
     WMxScale += expt_id * stride_w_mx_e
-    offs_w_n_scale = (pid_n * BLOCK_N + ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(1, BLOCKED_LAYOUT_KN))) % N
-    offs_w_n_scale = ttgl.max_contiguous(
-        ttgl.multiple_of(offs_w_n_scale, BLOCK_N), BLOCK_N
-    )
-    # K dimension must be the last dimension for the scales
-    offs_w_k_scale = MX_SCALE_BLOCK_K * pid_k + ttgl.arange(0, MX_SCALE_BLOCK_K, layout=ttgl.SliceLayout(0, BLOCKED_LAYOUT_KN))
-    WMxScalePtrs = (
-        WMxScale
-        + offs_w_k_scale.to(index_type)[None, :] * stride_w_mx_k
-        + offs_w_n_scale.to(index_type)[:, None] * stride_w_mx_n
-    )
+    if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+        gl.static_assert(stride_w_mx_k is not None)
+        gl.static_assert(stride_w_mx_n is not None)
+        SCALE_KWIDTH: gl.constexpr = 4 if MX_SCALE_BLOCK_K >= 4 else MX_SCALE_BLOCK_K
+        PRESHUFFLE_FACTOR: gl.constexpr = 128
+        PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K * PRESHUFFLE_FACTOR
+        SCALE_BLOCK_N: gl.constexpr = BLOCK_N // PRESHUFFLE_FACTOR
+    else:
+        PRESHUFFLE_FACTOR: gl.constexpr = 1
+        PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K
+        SCALE_BLOCK_N: gl.constexpr = BLOCK_N
+    offs_w_n_scale = pid_n * SCALE_BLOCK_N
 
     # B pointers
-    offs_w_n = pid_n * PACKED_BLOCK_N_W + ttgl.arange(0, PACKED_BLOCK_N_W, layout=ttgl.SliceLayout(0, BLOCKED_LAYOUT_KN))
-    offs_w_n = ttgl.max_contiguous(
-        ttgl.multiple_of(offs_w_n % (N // W_N_DIVISOR), PACKED_BLOCK_N_W),
-        PACKED_BLOCK_N_W,
-    )
-    offs_w_k = PACKED_BLOCK_K_W * pid_k + ttgl.arange(0, PACKED_BLOCK_K_W, layout=ttgl.SliceLayout(1, BLOCKED_LAYOUT_KN))
+    offs_w_n = pid_n * PACKED_BLOCK_N_W
     W += expt_id * stride_w_e
-    WPtrs = W + (
-        offs_w_k.to(index_type)[:, None] * stride_w_k
-        + offs_w_n.to(index_type)[None, :] * stride_w_n
-    )
 
     # A scale pointers
+    if is_x_microscaled and GatherIndx is None:
+        XMxScale += start_m * stride_x_mx_m
+
+    SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[PACKED_BLOCK_K_X, 16]], [BLOCK_M, PACKED_BLOCK_K_X], [1, 0])
+    SHARED_LAYOUT_W: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[PACKED_BLOCK_K_W, 16]], [BLOCK_N, PACKED_BLOCK_K_W], [1, 0])
+    SHARED_LAYOUT_X_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[256, 16]], [BLOCK_M, MX_SCALE_BLOCK_K], [1, 0])
+    SHARED_LAYOUT_W_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[256, 16]], [SCALE_BLOCK_N, PACKED_MX_BLOCK], [1, 0])
+
+    if GatherIndx is None:
+        x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=X,
+            shape=(M, K // X_K_DIVISOR),
+            strides=(stride_x_m, stride_x_k),
+            block_shape=(PACKED_BLOCK_M_X, PACKED_BLOCK_K_X),
+            layout=SHARED_LAYOUT_X,
+        )
+    else:
+        x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=X,
+            shape=(num_tokens, K // X_K_DIVISOR),
+            strides=(stride_x_m, stride_x_k),
+            block_shape=(PACKED_BLOCK_M_X, PACKED_BLOCK_K_X),
+            layout=SHARED_LAYOUT_X,
+        )
+    w_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=W,
+        shape=(N, K // W_K_DIVISOR),
+        strides=(stride_w_n, stride_w_k),
+        block_shape=(PACKED_BLOCK_N_W, PACKED_BLOCK_K_W),
+        layout=SHARED_LAYOUT_W,
+    )
     if is_x_microscaled:
         if GatherIndx is None:
-            XMxScale += start_m * stride_x_mx_m
-        offs_x_k_scale = MX_SCALE_BLOCK_K * pid_k + ttgl.arange(0, MX_SCALE_BLOCK_K, layout=ttgl.SliceLayout(0, BLOCKED_LAYOUT_MK))
-        XMxScalePtrs = (
-            XMxScale
-            + offs_x_m.to(index_type)[:, None] * stride_x_mx_m
-            + offs_x_k_scale.to(index_type)[None, :] * stride_x_mx_k
-        )
+            x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=XMxScale,
+                shape=(M, gl.cdiv(K, MX_PACK_DIVISOR)),
+                strides=(stride_x_mx_m, stride_x_mx_k),
+                block_shape=(PACKED_BLOCK_M_X, MX_SCALE_BLOCK_K),
+                layout=SHARED_LAYOUT_X_SCALES,
+            )
+        else:
+            x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=XMxScale,
+                shape=(num_tokens, gl.cdiv(K, MX_PACK_DIVISOR)),
+                strides=(stride_x_mx_m, stride_x_mx_k),
+                block_shape=(PACKED_BLOCK_M_X, MX_SCALE_BLOCK_K),
+                layout=SHARED_LAYOUT_X_SCALES,
+            )
+    w_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=WMxScale,
+        shape=(N // PRESHUFFLE_FACTOR, gl.cdiv(K, MX_PACK_DIVISOR) * PRESHUFFLE_FACTOR),
+        strides=(stride_w_mx_n, stride_w_mx_k),
+        block_shape=(SCALE_BLOCK_N, PACKED_MX_BLOCK),
+        layout=SHARED_LAYOUT_W_SCALES,
+    )
 
-    # determine number of k iterations
-    num_k_iter = ttgl.cdiv(K, BLOCK_K * SPLIT_K)
-    if not EVEN_K:
-        num_k_iter -= 1
+    DOT_LAYOUT_X: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=WMMA_LAYOUT_PACKED, k_width=16)
+    DOT_LAYOUT_W: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=WMMA_LAYOUT_PACKED, k_width=16)
+    DOT_LAYOUT_X_SCALES: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(DOT_LAYOUT_X, [BLOCK_M, MX_SCALE_BLOCK_K])
+    DOT_LAYOUT_W_SCALES: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(DOT_LAYOUT_W, [BLOCK_N, MX_SCALE_BLOCK_K])
+
+    x_buffer = gl.allocate_shared_memory(x_desc.dtype, shape=[NUM_BUFFERS] + x_desc.block_shape, layout=x_desc.layout)
+    w_buffer = gl.allocate_shared_memory(w_desc.dtype, shape=[NUM_BUFFERS] + w_desc.block_shape, layout=w_desc.layout)
+    if is_x_microscaled:
+        x_scales_buffer = gl.allocate_shared_memory(x_scales_desc.dtype, shape=[NUM_BUFFERS] + x_scales_desc.block_shape, layout=x_scales_desc.layout)
+    w_scales_buffer = gl.allocate_shared_memory(w_scales_desc.dtype, shape=[NUM_BUFFERS] + w_scales_desc.block_shape, layout=w_scales_desc.layout)
+
+    producer = 0
+    consumer = 0
+
+    # prologue
+    for _ in gl.static_range(NUM_BUFFERS - 1):
+        if GatherIndx is None:
+            gl.amd.gfx1250.tdm.async_load(x_desc, [offs_x_m, producer * PACKED_BLOCK_M_X], x_buffer.index(producer % NUM_BUFFERS))
+        else:
+            gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, producer * PACKED_BLOCK_M_X, x_buffer.index(producer % NUM_BUFFERS))
+        gl.amd.gfx1250.tdm.async_load(w_desc, [offs_w_n, producer * PACKED_BLOCK_K_W], w_buffer.index(producer % NUM_BUFFERS))
+        if is_x_microscaled:
+            if GatherIndx is None:
+                gl.amd.gfx1250.tdm.async_load(x_scales_desc, [offs_x_m, producer * MX_SCALE_BLOCK_K], x_scales_buffer.index(producer % NUM_BUFFERS))
+            else:
+                gl.amd.gfx1250.tdm.async_gather(x_scales_desc, offs_x_m, producer * MX_SCALE_BLOCK_K, x_scales_buffer.index(producer % NUM_BUFFERS))
+        gl.amd.gfx1250.tdm.async_load(w_scales_desc, [offs_w_n_scale, producer * PACKED_MX_BLOCK], w_scales_buffer.index(producer % NUM_BUFFERS))
+        producer += 1
 
     # compute output
-    acc = ttgl.zeros((BLOCK_M, BLOCK_N), dtype=ttgl.float32, layout=WMMA_LAYOUT)
-    for k in range(num_k_iter):
-        x = ttgl.load(XPtrs)
-        w = ttgl.load(WPtrs, cache_modifier=W_CACHE_MODIFIER)
-
-        x = ttgl.convert_layout(x, DOT_LAYOUT_X)
-        w = ttgl.convert_layout(w, DOT_LAYOUT_W)
-
-        if is_x_microscaled:
-            x_scales = ttgl.load(XMxScalePtrs)
+    num_k_iter = gl.cdiv(K, BLOCK_K)
+    acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
+    for k in range(num_k_iter - (NUM_BUFFERS - 1)):
+        if GatherIndx is None:
+            gl.amd.gfx1250.tdm.async_load(x_desc, [offs_x_m, producer * PACKED_BLOCK_M_X], x_buffer.index(producer % NUM_BUFFERS))
         else:
-            x_scales = ttgl.full((BLOCK_M, MX_SCALE_BLOCK_K), 127, dtype=ttgl.uint8)
-        w_scales = ttgl.load(WMxScalePtrs)
-
-        x_scales = ttgl.convert_layout(x_scales, LAYOUT_X_SCALES)
-        w_scales = ttgl.convert_layout(w_scales, LAYOUT_W_SCALES)
-
-        acc = ttgl.amd.gfx1250.wmma_scaled(
-            x, x_scales, "e2m1", w, w_scales, "e2m1", acc=acc,
-        )
-
-        WMxScalePtrs += (MX_SCALE_BLOCK_K * SPLIT_K) * stride_w_mx_k
+            gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, producer * PACKED_BLOCK_M_X, x_buffer.index(producer % NUM_BUFFERS))
+        gl.amd.gfx1250.tdm.async_load(w_desc, [offs_w_n, producer * PACKED_BLOCK_K_W], w_buffer.index(producer % NUM_BUFFERS))
         if is_x_microscaled:
-            XMxScalePtrs += (MX_SCALE_BLOCK_K * SPLIT_K) * stride_x_mx_k
+            if GatherIndx is None:
+                gl.amd.gfx1250.tdm.async_load(x_scales_desc, [offs_x_m, producer * MX_SCALE_BLOCK_K], x_scales_buffer.index(producer % NUM_BUFFERS))
+            else:
+                gl.amd.gfx1250.tdm.async_gather(x_scales_desc, offs_x_m, producer * MX_SCALE_BLOCK_K, x_scales_buffer.index(producer % NUM_BUFFERS))
+        gl.amd.gfx1250.tdm.async_load(w_scales_desc, [offs_w_n_scale, producer * PACKED_MX_BLOCK], w_scales_buffer.index(producer % NUM_BUFFERS))
+        producer += 1
 
-        XPtrs += (PACKED_BLOCK_K_X * SPLIT_K) * stride_x_k
-        WPtrs += (PACKED_BLOCK_K_W * SPLIT_K) * stride_w_k
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_LOADS_IN_BATCH)
 
-    if not EVEN_K:
-        mask_x_k = offs_x_k < (MASK_K_LIMIT // X_K_DIVISOR)
-        mask_w_k = offs_w_k < (MASK_K_LIMIT // W_K_DIVISOR)
-        if SWIZZLE_MX_SCALE is None:
-            mask_w_k_scale = offs_w_k_scale * MX_PACK_DIVISOR < MASK_K_LIMIT
+        x = x_buffer.index(consumer % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
+        w = w_buffer.index(consumer % NUM_BUFFERS).permute((1, 0)).load(layout=DOT_LAYOUT_W)
         if is_x_microscaled:
-            mask_x_k_scale = offs_x_k_scale * MX_PACK_DIVISOR < MASK_K_LIMIT
-
-        x = ttgl.load(XPtrs, mask=mask_x_k[None, :], other=0)
-        w = ttgl.load(
-            WPtrs, mask=mask_w_k[:, None], other=0, cache_modifier=W_CACHE_MODIFIER
-        )
-
-        x = ttgl.convert_layout(x, DOT_LAYOUT_X)
-        w = ttgl.convert_layout(w, DOT_LAYOUT_W)
-
+            x_scales_buffer_slice = x_scales_buffer.index(consumer % NUM_BUFFERS)
+        w_scales_buffer_slice = w_scales_buffer.index(consumer % NUM_BUFFERS)
+        if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+            w_scales_buffer_slice = w_scales_buffer_slice.reshape((
+                SCALE_BLOCK_N,
+                MX_SCALE_BLOCK_K // SCALE_KWIDTH,
+                PRESHUFFLE_FACTOR // 4,
+                4,
+                SCALE_KWIDTH,
+            )).permute((0, 3, 2, 1, 4)).reshape((BLOCK_N, MX_SCALE_BLOCK_K))
         if is_x_microscaled:
-            x_scales = ttgl.load(XMxScalePtrs, mask=mask_x_k_scale[None, :])
+            x_scales = x_scales_buffer_slice.load(layout=DOT_LAYOUT_X_SCALES)
         else:
-            x_scales = ttgl.full((BLOCK_M, MX_SCALE_BLOCK_K), 127, dtype=ttgl.uint8)
-        w_scales = ttgl.load(WMxScalePtrs, mask=mask_w_k_scale[None, :])
+            x_scales = gl.constexpr(0)
+        w_scales = w_scales_buffer_slice.load(layout=DOT_LAYOUT_W_SCALES)
 
-        x_scales = ttgl.convert_layout(x_scales, LAYOUT_X_SCALES)
-        w_scales = ttgl.convert_layout(w_scales, LAYOUT_W_SCALES)
+        acc = gl.amd.gfx1250.wmma_scaled(x, x_scales, "e2m1", w, w_scales, "e2m1", acc)
+        consumer += 1
 
-        acc = ttgl.amd.gfx1250.wmma_scaled(
-            x, x_scales, "e2m1", w, w_scales, "e2m1", acc=acc,
-        )
+    # epilogue
+    for k_ep in gl.static_range(NUM_BUFFERS - 1):
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - k_ep) * NUM_LOADS_IN_BATCH)
+
+        x = x_buffer.index(consumer % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
+        w = w_buffer.index(consumer % NUM_BUFFERS).permute((1, 0)).load(layout=DOT_LAYOUT_W)
+        if is_x_microscaled:
+            x_scales_buffer_slice = x_scales_buffer.index(consumer % NUM_BUFFERS)
+        w_scales_buffer_slice = w_scales_buffer.index(consumer % NUM_BUFFERS)
+        if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+            if GatherIndx is None:
+                x_scales_buffer_slice = x_scales_buffer_slice.reshape((
+                    BLOCK_M,
+                    MX_SCALE_BLOCK_K // SCALE_KWIDTH,
+                    PRESHUFFLE_FACTOR // 4,
+                    4,
+                    SCALE_KWIDTH,
+                )).permute((0, 3, 2, 1, 4)).reshape((BLOCK_M, MX_SCALE_BLOCK_K))
+            w_scales_buffer_slice = w_scales_buffer_slice.reshape((
+                SCALE_BLOCK_N,
+                MX_SCALE_BLOCK_K // SCALE_KWIDTH,
+                PRESHUFFLE_FACTOR // 4,
+                4,
+                SCALE_KWIDTH,
+            )).permute((0, 3, 2, 1, 4)).reshape((BLOCK_N, MX_SCALE_BLOCK_K))
+        if is_x_microscaled:
+            x_scales = x_scales_buffer_slice.load(layout=DOT_LAYOUT_X_SCALES)
+        else:
+            x_scales = gl.constexpr(0)
+        w_scales = w_scales_buffer_slice.load(layout=DOT_LAYOUT_W_SCALES)
+
+        acc = gl.amd.gfx1250.wmma_scaled(x, x_scales, "e2m1", w, w_scales, "e2m1", acc)
 
     # scalar fp8 scale
     if X_static_scale is not None:
         # should not go in here since static scale fp4 is disabled
-        ttgl.static_assert(
+        gl.static_assert(
             X_static_scale is None,
             f"Static scale is disabled for fp4 precision. got {X_static_scale}",
         )
 
     # bias
-    offs_m = BLOCK_M * block_id + ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, WMMA_LAYOUT))
-    offs_y_n = BLOCK_N * pid_n + ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(0, WMMA_LAYOUT))
+    offs_m = BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT))
+    offs_y_n = BLOCK_N * pid_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT))
     mask_m = offs_m < M
     mask_n = offs_y_n < N
     if B is not None:
-        BPtrs = B + expt_id * stride_b_e + offs_y_n
-        if pid_k == 0:
-            bias = ttgl.load(BPtrs, mask=mask_n, other=0, cache_modifier=W_CACHE_MODIFIER)
-        else:
-            bias = ttgl.full([BLOCK_N], 0, dtype=ttgl.float32, layout=ttgl.SliceLayout(0, WMMA_LAYOUT))
+        BPtrs = B + expt_id * stride_b_e
+        bias = gl.amd.gfx1250.buffer_load(BPtrs, offs_y_n, mask=mask_n)
         acc = acc + bias[None, :]
 
     # apply activation function
     if APPLY_SWIGLU and SPLIT_K == 1:
         out = _swiglu(acc, alpha, limit)
-        ttgl.static_assert(
+        gl.static_assert(
             out.shape[1] == OUT_BLOCK_N,
             f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
         )
-        offs_y_n = OUT_BLOCK_N * pid_n + ttgl.arange(0, OUT_BLOCK_N, layout=ttgl.SliceLayout(0, WMMA_LAYOUT))
+        offs_y_n = OUT_BLOCK_N * pid_n + gl.arange(0, OUT_BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT))
         mask_n = offs_y_n < yN
     else:
-        ttgl.static_assert(
+        gl.static_assert(
             ACTIVATION_REDUCTION_N == 1,
             "Activation reduction must be 1 if no activation fn is provided",
         )
@@ -667,23 +729,21 @@ def _moe_gemm_a4w4_gfx1250(
 
     # apply gammas
     if Gammas is not None:
-        gammas = ttgl.load(Gammas + start_m + offs_m, mask=mask_m, other=0.0)
+        gammas = gl.load(Gammas + start_m + offs_m, mask=mask_m, other=0.0)
         out *= gammas[:, None]
 
     # quant
     if Quant_static_scale is not None:
-        out = _compute_static_fp8_quant(out, ttgl.load(Quant_static_scale))
+        out = _compute_static_fp8_quant(out, gl.load(Quant_static_scale))
 
     # write-back
     Y += start_m * stride_y_m
     offs_y_m = offs_m
-    YPtrs = (
-        Y
-        + offs_y_m.to(index_type)[:, None] * stride_y_m
-        + offs_y_n.to(index_type)[None, :] * stride_y_n
-    )
+    offs_y = offs_y_m.to(index_type)[:, None] * stride_y_m + offs_y_n.to(index_type)[None, :] * stride_y_n
     mask = mask_m[:, None] & mask_n[None, :]
-    ttgl.store(YPtrs, out, mask=mask)
+    if Quant_static_scale is None:
+        out = out.to(gl.bfloat16)
+    gl.amd.gfx1250.buffer_store(out, Y, offs_y, mask=mask)
 
 
 def moe_gemm_a4w4_gfx1250(
@@ -694,7 +754,7 @@ def moe_gemm_a4w4_gfx1250(
     x_static_scale=None, # NOTE: not supported
     quant_static_scale=None,
     bias=None,
-    routing_data: RoutingData | None = None,
+    routing_data = None,
     gather_indx=None,
     scatter_indx=None,
     gammas=None,
@@ -717,6 +777,7 @@ def moe_gemm_a4w4_gfx1250(
         assert x.stride(-1) == 1, "'x' must be row-major when it has data-type mxfp"
 
     # determine shapes
+    num_tokens = x.shape[-2]
     M = x.shape[-2] if gather_indx is None else gather_indx.shape[0]
     K, N = x.shape[-1] * 2, w.shape[-1]
     block_m = routing_data.block_m
@@ -770,32 +831,8 @@ def moe_gemm_a4w4_gfx1250(
     grid = grid_m * grid_n * config["split_k"]
 
     # layouts
-    num_warps = config["num_warps"]
-    BLOCK_M = config["block_m"]
-    BLOCK_N = config["block_n"]
-    BLOCK_K = config["block_k"]
-    BLOCK_K_SCALE = BLOCK_K // 32
-    
-    WMMA_LAYOUT = get_wmma_layout(num_warps, False, False)
-    WMMA_LAYOUT_PACKED = get_wmma_layout(num_warps, True, False)
-
-    DOT_LAYOUT_X = ttgl.DotOperandLayout(operand_index=0, parent=WMMA_LAYOUT_PACKED, k_width=16)
-    DOT_LAYOUT_W = ttgl.DotOperandLayout(operand_index=1, parent=WMMA_LAYOUT_PACKED, k_width=16)
-    LAYOUT_X_SCALES = ttgl.amd.gfx1250.get_wmma_scale_layout(DOT_LAYOUT_X, [BLOCK_M, BLOCK_K_SCALE])
-    LAYOUT_W_SCALES = ttgl.amd.gfx1250.get_wmma_scale_layout(DOT_LAYOUT_W, [BLOCK_N, BLOCK_K_SCALE])
-
-    BLOCKED_LAYOUT_MK = ttgl.BlockedLayout(
-        size_per_thread=[triton.cdiv(BLOCK_M, 8), triton.cdiv(BLOCK_K // 2, 4)],
-        threads_per_warp=[8, 4],
-        warps_per_cta=[2, num_warps // 2],
-        order=[1, 0],
-    )
-    BLOCKED_LAYOUT_KN = ttgl.BlockedLayout(
-        size_per_thread=[triton.cdiv(BLOCK_K // 2, 4), triton.cdiv(BLOCK_N, 8)],
-        threads_per_warp=[4, 8],
-        warps_per_cta=[num_warps // 2, 2],
-        order=[0, 1],
-    )
+    WMMA_LAYOUT = get_wmma_layout(config["num_warps"], False, swizzle_mx_scale == "GFX1250_SCALE")
+    WMMA_LAYOUT_PACKED = get_wmma_layout(config["num_warps"], True, swizzle_mx_scale == "GFX1250_SCALE")
 
     # launch kernel
     _moe_gemm_a4w4_gfx1250[(grid,)](
@@ -822,6 +859,7 @@ def moe_gemm_a4w4_gfx1250(
         bias,
         bias.stride(0) if bias is not None else 0,
         gammas,
+        num_tokens,
         N,
         K,
         gather_indx,
@@ -847,12 +885,7 @@ def moe_gemm_a4w4_gfx1250(
         MASK_K_LIMIT=K % config["block_k"],
         W_CACHE_MODIFIER=config["w_cache_modifier"],
         WMMA_LAYOUT=WMMA_LAYOUT,
-        DOT_LAYOUT_X=DOT_LAYOUT_X,
-        DOT_LAYOUT_W=DOT_LAYOUT_W,
-        LAYOUT_X_SCALES=LAYOUT_X_SCALES,
-        LAYOUT_W_SCALES=LAYOUT_W_SCALES,
-        BLOCKED_LAYOUT_MK=BLOCKED_LAYOUT_MK,
-        BLOCKED_LAYOUT_KN=BLOCKED_LAYOUT_KN,
+        WMMA_LAYOUT_PACKED=WMMA_LAYOUT_PACKED,
         UPCAST_INDICES=should_upcast_indices(x, w, y),
         num_warps=config["num_warps"],
         num_stages=config["num_stages"],
@@ -882,6 +915,8 @@ def moe_gemm_a4w4_gfx1250(
 
 
 if __name__ == "__main__":
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
     from op_tests.triton_tests.moe.test_moe_gemm_a4w4 import (
         init_routing_data,
         init_compute_data,

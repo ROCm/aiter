@@ -11,9 +11,14 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
     mxfp4_quant,
-    moe_gemm_a4w4,
+    moe_gemm_a4w4 as moe_gemm_a4w4_triton,
     moe_gemm_torch,
     swizzle_scales,
+)
+
+# gluon
+from aiter.ops.gluon.moe.moe_op_gemm_a4w4 import (
+    moe_gemm_a4w4_gfx1250 as moe_gemm_a4w4_gluon,
 )
 
 # numerics utilities
@@ -214,6 +219,7 @@ class Case:
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
 @pytest.mark.parametrize("fused_quant", [False, True])
+@pytest.mark.parametrize("func", ["triton", "gluon"])
 def test_op(
     m,
     n,
@@ -226,10 +232,30 @@ def test_op(
     n_expts_tot,
     n_expts_act,
     hbm_swizzling,
+    func,
     device="cuda",
 ):
-    if get_arch() != "gfx950":
-        pytest.skip("FP4 kernels are not supported on MI300.")
+    moe_gemm_a4w4 = None
+    if func == "triton":
+        moe_gemm_a4w4 = moe_gemm_a4w4_triton
+        if get_arch() != "gfx950":
+            pytest.skip("FP4 kernels are not supported on MI300.")
+    if func == "gluon":
+        moe_gemm_a4w4 = moe_gemm_a4w4_gluon
+        if get_arch() != "gfx1250":
+            pytest.skip("Currently, only testing Gluon implementation on gfx1250.")
+        # TODO: implement gather and scatter in Gluon implementation
+        if do_gather or do_scatter:
+            pytest.skip("Gluon implementation does not support gather or scatter.")
+        # TODO: implement hbm_swizzling in Gluon implementation
+        if hbm_swizzling:
+            pytest.skip("Gluon implementation does not support hbm_swizzling.")
+        # TODO: implement apply_swiglu in Gluon implementation
+        if apply_swiglu:
+            pytest.skip("Gluon implementation does not support apply_swiglu.")
+        # TODO: implement fused_quant in Gluon implementation
+        if fused_quant:
+            pytest.skip("Gluon implementation does not support fused_quant.")
     if hbm_swizzling:
         if n % 32 != 0 or k % (32 * 8) != 0:
             pytest.skip(
@@ -285,6 +311,7 @@ def test_op(
         quant_static_scale = ref_y.abs().max().float() / 448.0
     else:
         quant_static_scale = None
+    assert moe_gemm_a4w4 is not None
     tri_y = moe_gemm_a4w4(
         x_tri,
         w_tri,
