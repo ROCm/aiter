@@ -31,6 +31,8 @@ from bench_moe_gemm_a8w8 import main as bench_moe_gemm_a8w8_main
 from bench_moe_gemm_a8w8_blockscale import main as bench_moe_gemm_a8w8_blockscale_main
 from bench_moe_gemm_a8w4 import main as bench_moe_gemm_a8w4_main
 from bench_moe_gemm_a4w4 import main as bench_moe_gemm_a4w4_main
+from bench_rmsnorm import main as bench_rmsnorm_main
+from bench_rope import main as bench_rope_main
 
 
 def disable_aiter_logs() -> None:
@@ -51,7 +53,16 @@ kernel_dict = {
     "moe_op_gemm_a8w8_blockscale": bench_moe_gemm_a8w8_blockscale_main,
     "moe_op_gemm_a8w4": bench_moe_gemm_a8w4_main,
     "moe_op_gemm_a4w4": bench_moe_gemm_a4w4_main,
+    "rmsnorm": bench_rmsnorm_main,
+    "rope": bench_rope_main,
 }
+
+
+ROPE_METRIC_NOTE = (
+    "Note: RoPE reports only total flops (TFLOP), i.e. total floating-point operations, not throughput (FLOPS). "
+    "Time and bandwidth are not available because short-running kernels cannot be measured accurately "
+    "through triton.testing.do_bench; use rocprof for accurate runtime."
+)
 
 
 def parse_M_values(raw_values: list[str], parser: argparse.ArgumentParser) -> list[int]:
@@ -124,7 +135,10 @@ def parse_args(available_models: list[str]) -> argparse.Namespace:
         type=str,
         choices=["throughput", "bandwidth", "time"],
         default="throughput",
-        help="Metric to report (throughput=TFLOPS, bandwidth=GB/s, time=ms). Default: throughput.",
+        help=(
+            "Metric to report (throughput=TFLOPS, bandwidth=GB/s, time=ms). Default: throughput. "
+            "RoPE reports total flops (TFLOP) in a separate column (see note in output)."
+        ),
     )
     parser.add_argument(
         "--models",
@@ -199,6 +213,29 @@ def parse_gemm_bench_stdout(stdout: str) -> float:
     return round(bench_result, 4)
 
 
+def parse_rmsnorm_bench_stdout(stdout: str) -> float:
+    lines = [line for line in stdout.splitlines() if line.strip()]
+    data_line = lines[-1]
+    last_row_values = list(map(float, re.findall(r"-?\d+(?:\.\d+)?", data_line)))
+    if not last_row_values:
+        raise ValueError(f"Unexpected RMSNorm bench output format: {data_line}")
+    return round(last_row_values[-1], 4)
+
+
+def parse_rope_bench_stdout(stdout: str) -> str:
+    bench_result = None
+    for line in stdout.splitlines():
+        if "Total flops" in line:
+            nums = re.findall(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", line)
+            if nums:
+                val = float(nums[0])
+                bench_result = f"{val:.6e}"
+                break
+    if bench_result is None:
+        raise ValueError(f"Unexpected RoPE bench output format: {stdout[:200]!r}")
+    return bench_result
+
+
 def parse_moe_bench_stdout(stdout: str, metric: str) -> float:
     # Get last non-empty line (the data row)
     lines = [line for line in stdout.splitlines() if line.strip()]
@@ -244,19 +281,51 @@ def moe_args(
     return args_str, shape
 
 
+def rmsnorm_args(
+    shape: dict[str, int | str], M: int, metric: str
+) -> tuple[str, dict[str, int | str]]:
+    N = shape["N"]
+    args_str = f"--shape {M} {N} --metric {metric}"
+    return args_str, shape
+
+
+def rope_args(
+    shape: dict[str, int | str], M: int, metric: str
+) -> tuple[str, dict[str, int | str]]:
+    num_heads = int(shape["num_heads"])
+    num_kv_heads = int(shape["num_kv_heads"])
+    head_dim = int(shape["head_dim"])
+    two_inputs = str(shape["two_inputs"]).lower()
+    positions = str(shape["positions"]).lower()
+    style = str(shape["style"]).lower()
+    Q = num_heads // num_kv_heads
+    args_str = (
+        f"-B 1 -S {M} -H {num_kv_heads} -Q {Q} -D {head_dim} "
+        f"--rotate_style {style} --two_inputs {two_inputs} --pos {positions} -l thd"
+    )
+    return args_str, shape
+
+
 def get_tp_shapes(
     shapes: list[dict[str, int | str]], kernel: str, TP: int
 ) -> list[dict[str, int | str]]:
     def transform(shape):
         s = shape.copy()
         if "moe" in kernel:
-            s["Dim2"] //= TP
-        else:
+            s["Dim2"] = max(s["Dim2"] // TP, 1)
+        elif "rope" == kernel:
+            s["num_heads"] = max(s["num_heads"] // TP, 1)
+            s["num_kv_heads"] = max(s["num_kv_heads"] // TP, 1)
+        elif "gemm" in kernel and "moe" not in kernel:
             if s["TP_dim"] in ("N", "K", "B"):
-                s[s["TP_dim"]] //= TP
+                key = s["TP_dim"]
+                s[key] = max(s[key] // TP, 1)
         return s
 
-    return [transform(shape) for shape in shapes]
+    if kernel == "rmsnorm":
+        return shapes
+    else:
+        return [transform(shape) for shape in shapes]
 
 
 def run_benchmarks(
@@ -282,10 +351,16 @@ def run_benchmarks(
                 for M in M_values:
                     if "moe" in kernel:
                         args_str, shape = moe_args(shape, M, metric)
-                    else:
+                    elif kernel == "rmsnorm":
+                        args_str, shape = rmsnorm_args(shape, M, metric)
+                    elif kernel == "rope":
+                        args_str, shape = rope_args(shape, M, metric)
+                    elif "gemm" in kernel and "moe" not in kernel:
                         args_str, shape = gemm_args(shape, M, metric, layout)
+                    else:
+                        raise ValueError(f"Kernel {kernel} not supported")
 
-                    stdout, stderr = call_function(bench_fn, args_str)
+                    stdout, _ = call_function(bench_fn, args_str)
 
                     if "moe" in kernel:
                         bench_result = parse_moe_bench_stdout(stdout, metric)
@@ -294,26 +369,52 @@ def run_benchmarks(
                                 "Model": model,
                                 "Kernel": kernel,
                                 "E": shape["E"],
-                                "M": M,
+                                "M/S": M,
                                 "Dim1": shape["Dim1"],
                                 "Dim2": shape["Dim2"],
                                 "TopK": shape["TopK"],
                                 metric: bench_result,
                             }
                         )
-                    else:
+                    elif kernel == "rmsnorm":
+                        bench_result = parse_rmsnorm_bench_stdout(stdout)
+                        results.append(
+                            {
+                                "Model": model,
+                                "Kernel": kernel,
+                                "M/S": M,
+                                "N": shape["N"],
+                                metric: bench_result,
+                            }
+                        )
+                    elif kernel == "rope":
+                        bench_result = parse_rope_bench_stdout(stdout)
+                        row = {
+                            "Model": model,
+                            "Kernel": kernel,
+                            "M/S": M,
+                            "Q": shape["num_heads"] // shape["num_kv_heads"],
+                            "H": shape["num_kv_heads"],
+                            "D": shape["head_dim"],
+                            "style": shape["style"],
+                            "rope_total_flops": bench_result,
+                        }
+                        results.append(row)
+                    elif "gemm" in kernel and "moe" not in kernel:
                         bench_result = parse_gemm_bench_stdout(stdout)
                         results.append(
                             {
                                 "Model": model,
                                 "Kernel": kernel,
                                 "B": shape["B"] if "B" in shape else None,
-                                "M": M,
+                                "M/S": M,
                                 "N": shape["N"],
                                 "K": shape["K"],
                                 metric: bench_result,
                             }
                         )
+                    else:
+                        raise ValueError(f"Kernel {kernel} not supported")
     return results
 
 
@@ -337,11 +438,16 @@ def main() -> None:
     # Prints results grouped by model and kernel and saves them to disk
     metric = args.metric
     df = pd.DataFrame(results)
-    cols = df.select_dtypes(include="number").columns.difference([metric])
+    # Exclude metric and rope_total_flops from Int64 conversion
+    cols = df.select_dtypes(include="number").columns.difference(
+        [metric, "rope_total_flops"]
+    )
     df[cols] = df[cols].astype("Int64")
 
     unit = {"time": "ms", "throughput": "tflops", "bandwidth": "GBps"}
     df[f"{metric}({unit[metric]})"] = df.pop(metric)
+    if "rope_total_flops" in df.columns:
+        df["total_flops(TFLOP)"] = df.pop("rope_total_flops")
 
     for model, idf in df.groupby("Model"):
         print(f"\n=== Model: {model} ===")
@@ -352,6 +458,9 @@ def main() -> None:
                 .dropna(axis=1)
                 .to_string(index=False)
             )
+
+    if (df["Kernel"] == "rope").any():
+        print(f"\n{ROPE_METRIC_NOTE}")
 
     output_path = f"{os.path.dirname(os.path.realpath(__file__))}/{output_file}.csv"
     print(f"\nSaving results to {output_path}...\n")

@@ -54,12 +54,18 @@ def run_benchmark(args):
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
 
     x_names = ["model_name", "M", "N"]
-    x_vals_list = model_benchmark_shapes(args)
+    if args.shape is not None:
+        M, N = args.shape
+        x_vals_list = [("custom", M, N)]
+    else:
+        x_vals_list = model_benchmark_shapes(args)
 
     if args.metric == "time":
         ylabel = "Time_(ms)"
     elif args.metric == "bandwidth":
         ylabel = "Bandwidth_(GB/s)"
+    elif args.metric == "throughput":
+        ylabel = "Throughput_(TFLOPS)"
     else:
         raise NotImplementedError(f"{args.metric} is not supported")
 
@@ -96,13 +102,17 @@ def run_benchmark(args):
         elif metric == "bandwidth":
             bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
             return bandwidth
+        elif metric == "throughput":
+            flops = 4 * M * N
+            tflops = flops / ms * 1e-9  # TFLOP/s
+            return tflops
         else:
             raise ValueError("Unknown metric: " + metric)
 
     bench_rmsnorm.run(save_path="." if args.o else None, print_data=True)
 
 
-def parse_args():
+def parse_args(args: list[str] | None = None):
     parser = argparse.ArgumentParser(
         prog="Benchmark RMSNorm",
         allow_abbrev=False,
@@ -137,7 +147,7 @@ def parse_args():
     parser.add_argument(
         "--metric",
         type=str,
-        choices=["time", "bandwidth"],
+        choices=["time", "bandwidth", "throughput"],
         default="bandwidth",
         help="metric to plot",
     )
@@ -150,12 +160,12 @@ def parse_args():
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
     )
-    args = parser.parse_args()
+    args = parser.parse_args(args=args)
     return args
 
 
-def main():
-    args = parse_args()
+def main(args: list[str] | None = None) -> None:
+    args = parse_args(args=args)
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
         fun = lambda: run_benchmark(args)  # noqa: E731
