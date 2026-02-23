@@ -758,7 +758,7 @@ def positive_int(value: str) -> int:
     return int_value
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark attention kernels with configurations of popular LLM models.",
         add_help=True,
@@ -875,33 +875,33 @@ def parse_args() -> argparse.Namespace:
         help="log level to enable (default: info)",
     )
 
-    args: argparse.Namespace = parser.parse_args()
+    parsed_args: argparse.Namespace = parser.parse_args(args=args)
 
     # Validate range constraints:
-    if args.batch_end < args.batch_start:
+    if parsed_args.batch_end < parsed_args.batch_start:
         parser.error("--batch-end must be greater than or equal to --batch-start")
-    if args.seq_end < args.seq_start:
+    if parsed_args.seq_end < parsed_args.seq_start:
         parser.error("--seq-end must be greater than or equal to --seq-start")
 
     # Deduplicate and sort multi-value arguments:
-    args.kernel = sorted(set(args.kernel))
-    args.layout = sorted(set(args.layout))
-    args.tensor_parallelism = sorted(set(args.tensor_parallelism))
+    parsed_args.kernel = sorted(set(parsed_args.kernel))
+    parsed_args.layout = sorted(set(parsed_args.layout))
+    parsed_args.tensor_parallelism = sorted(set(parsed_args.tensor_parallelism))
 
     # Convert metric string to metric object:
-    args.metric = METRICS[args.metric]
+    parsed_args.metric = METRICS[parsed_args.metric]
 
     # Convert string log level to numeric log level:
-    args.log_level = {
+    parsed_args.log_level = {
         "critical": logging.CRITICAL,
         "error": logging.ERROR,
         "warning": logging.WARNING,
         "info": logging.INFO,
         "debug": logging.DEBUG,
         "off": logging.CRITICAL + 1000,
-    }[args.log_level]
+    }[parsed_args.log_level]
 
-    return args
+    return parsed_args
 
 
 def get_bench_args_from_cli(args: argparse.Namespace) -> list[BenchArgs]:
@@ -952,30 +952,30 @@ def get_bench_args_from_cli(args: argparse.Namespace) -> list[BenchArgs]:
     )
 
 
-def main() -> None:
+def main(args: list[str] | None = None) -> None:
     start_timestamp: float = time.perf_counter()
 
-    args: argparse.Namespace = parse_args()
+    parsed_args: argparse.Namespace = parse_args(args=args)
 
     disable_logs("matplotlib")
-    logging.basicConfig(format="%(levelname)s|%(message)s", level=args.log_level)
+    logging.basicConfig(format="%(levelname)s|%(message)s", level=parsed_args.log_level)
 
-    if args.list_models:
+    if parsed_args.list_models:
         list_models()
         return
 
     logging.info("Benchmarking attention configurations...")
 
-    metric: Metric = args.metric
+    metric: Metric = parsed_args.metric
     if metric != METRICS["time"] and any(
-        model.use_mla for model in get_models(args.model)
+        model.use_mla for model in get_models(parsed_args.model)
     ):
         metric = METRICS["time"]
         logging.warning(
             "One or more benchmarks are backed by MLA. MLA benchmark doesn't support throughput or bandwidth metrics, switching to time metric."
         )
 
-    bench_args: list[BenchArgs] = get_bench_args_from_cli(args)
+    bench_args: list[BenchArgs] = get_bench_args_from_cli(parsed_args)
     num_bench_args: int = len(bench_args)
     logging.info("Number of benchmark configurations: %d", num_bench_args)
     if num_bench_args == 0:
@@ -986,7 +986,7 @@ def main() -> None:
 
     global_stats = GlobalStats()
 
-    with open(args.output, mode="w", newline="") as csv_file:
+    with open(parsed_args.output, mode="w", newline="") as csv_file:
         writer = csv.writer(csv_file, quoting=csv.QUOTE_NONNUMERIC)
         writer.writerow(BenchArgs.csv_header(metric))
 
