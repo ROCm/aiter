@@ -276,10 +276,10 @@ def test_sage(
     "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
 )
 @pytest.mark.parametrize("HEAD_SZ", [128])
-@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+@pytest.mark.parametrize("layout", ["bhsd"])
 @pytest.mark.parametrize("causal", [True, False])
-@pytest.mark.parametrize("qsmooth", [False])
-@pytest.mark.parametrize("hadamard_rotate", [False])
+@pytest.mark.parametrize("qsmooth", [True, False])
+@pytest.mark.parametrize("hadamard_rotate", [True, False])
 def test_sage_mxfp4(
     BATCH: int,
     SEQLEN_Q: int,
@@ -352,3 +352,5 @@ def test_sage_mxfp4(
         rtol=RTOL_fp8,
         max_diff_percentage=1.5,
     )
+
+

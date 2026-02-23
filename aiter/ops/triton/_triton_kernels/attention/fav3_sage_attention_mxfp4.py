@@ -1026,7 +1026,8 @@ def _compute_delta_s_kernel(
     stride_sh,
     stride_sm,
     stride_sn,
-    n_heads,
+    n_heads_k,
+    n_heads_q,
     seq_k,
     d_model,
     BLOCK_N: tl.constexpr,  # Number of K-tokens to process
@@ -1035,8 +1036,9 @@ def _compute_delta_s_kernel(
     pid_m_q = tl.program_id(1)  # The Q-block index
     pid_n_k = tl.program_id(2)  # The K-block index
 
-    pid_h = pid_bh % n_heads
-    pid_b = pid_bh // n_heads
+    pid_hq = pid_bh % n_heads_q
+    pid_h = pid_hq // (n_heads_q // n_heads_k)
+    pid_b = pid_bh // n_heads_q
 
     offs_n = pid_n_k * BLOCK_N + tl.arange(0, BLOCK_N)
 
@@ -1051,7 +1053,7 @@ def _compute_delta_s_kernel(
         qm_ptr = (
             Q_mean
             + pid_b * stride_mb
-            + pid_h * stride_mh
+            + pid_hq * stride_mh
             + pid_m_q * stride_mm
             + offs_d * stride_md
         )
@@ -1074,7 +1076,7 @@ def _compute_delta_s_kernel(
     s_ptr = (
         Delta_S
         + pid_b * stride_sb
-        + pid_h * stride_sh
+        + pid_hq * stride_sh
         + pid_m_q * stride_sm
         + offs_n * stride_sn
     )
@@ -1220,7 +1222,7 @@ def smooth_rotate_downcast_qk(
     if q_smoothing:
         # 3. Compute Smoothing Delta S
         # Grid: Each Q-block x Each K-block
-        grid_delta = (b * h_k, Q_NUM_BLKS, K_NUM_BLKS)
+        grid_delta = (b * h_q, Q_NUM_BLKS, K_NUM_BLKS)
         _compute_delta_s_kernel[grid_delta](
             q_mean,
             k,
@@ -1238,6 +1240,7 @@ def smooth_rotate_downcast_qk(
             delta_s.stride(2),
             delta_s.stride(3),
             h_k,
+            h_q,
             s_k,
             d,
             BLOCK_N=BLOCK_SIZE_M,
