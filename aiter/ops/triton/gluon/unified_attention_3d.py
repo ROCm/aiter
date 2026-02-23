@@ -162,6 +162,7 @@ def make_layout_3d(
     use_tdm: bool,
     use_swizzle: bool = False,
     use_gather: bool = False,
+    shuffled_kv_cache: bool = False,
 ):
 
     if IS_DEVICE_ARCH_GFX12:
@@ -299,12 +300,12 @@ def make_layout_3d(
         Q_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
             vec=8, per_phase=2, max_phase=8, order=[1, 0]
         )
-        # K_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
-        #     vec=8, per_phase=2, max_phase=8, order=[0, 1]
-        # )
-        # V_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
-        #     vec=1, per_phase=1, max_phase=1, order=[1, 0]
-        # )
+        K_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
+            vec=8, per_phase=2, max_phase=8, order=[0, 1]
+        )
+        V_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
+            vec=1, per_phase=1, max_phase=1, order=[1, 0]
+        )
         # V_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
         #     vec=4, per_phase=2, max_phase=8, order=[1, 0]
         # )
@@ -313,49 +314,49 @@ def make_layout_3d(
         # ttg.padded_shared<[512:+16] {offset = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16], [0, 1], [0, 2], [0, 32]], block = []}>
         # 128
         # ttg.padded_shared<[512:+16] {offset = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [0, 16], [0, 32], [0, 1], [0, 2], [0, 4], [0, 8]], block = []}>
-        K_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout(
-            interval_padding_pairs=[[512, 16]],
-            offset_bases=[
-                [1, 0],
-                [2, 0],
-                [4, 0],
-                [8, 0],
-                [16, 0],
-                [32, 0],
-                [0, 4],
-                [0, 8],
-                [0, 16],
-                [0, 1],
-                [0, 2],
-                [0, 32],
-            ],
-            cga_layout=[],
-            shape=[HEAD_SIZE_PADDED, TILE_SIZE],
-        )
+        # K_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout(
+        #     interval_padding_pairs=[[512, 16]],
+        #     offset_bases=[
+        #         [1, 0],
+        #         [2, 0],
+        #         [4, 0],
+        #         [8, 0],
+        #         [16, 0],
+        #         [32, 0],
+        #         [0, 4],
+        #         [0, 8],
+        #         [0, 16],
+        #         [0, 1],
+        #         [0, 2],
+        #         [0, 32],
+        #     ],
+        #     cga_layout=[],
+        #     shape=[HEAD_SIZE_PADDED, TILE_SIZE],
+        # )
 
         # 64
         # ttg.padded_shared<[512:+16] {offset = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [8, 0], [4, 0], [16, 0], [1, 0], [2, 0], [32, 0]], block = []}>
         # 128
         # ttg.padded_shared<[512:+16] {offset = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0], [1, 0], [2, 0], [8, 0], [4, 0]], block = []}>
-        V_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout(
-            interval_padding_pairs=[[512, 16]],
-            offset_bases=[
-                [0, 1],
-                [0, 2],
-                [0, 4],
-                [0, 8],
-                [0, 16],
-                [0, 32],
-                [8, 0],
-                [4, 0],
-                [16, 0],
-                [1, 0],
-                [2, 0],
-                [32, 0],
-            ],
-            cga_layout=[],
-            shape=[TILE_SIZE, HEAD_SIZE_PADDED],
-        )
+        # V_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout(
+        #     interval_padding_pairs=[[512, 16]],
+        #     offset_bases=[
+        #         [0, 1],
+        #         [0, 2],
+        #         [0, 4],
+        #         [0, 8],
+        #         [0, 16],
+        #         [0, 32],
+        #         [8, 0],
+        #         [4, 0],
+        #         [16, 0],
+        #         [1, 0],
+        #         [2, 0],
+        #         [32, 0],
+        #     ],
+        #     cga_layout=[],
+        #     shape=[TILE_SIZE, HEAD_SIZE_PADDED],
+        # )
 
     # size_per_thread along the fastest moving dimension is set to 8 (BF16)
     size_per_thread_fastest_dim = 8
@@ -368,7 +369,7 @@ def make_layout_3d(
     )
 
     # in gfx950, ttg.async_copy_global_to_local will fail if threads_per_warp=[WARP_SIZE//4, 4] is used
-    Q_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
+    Q_LOAD_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
         size_per_thread=[1, size_per_thread_fastest_dim],
         threads_per_warp=[
             WARP_SIZE // threads_per_warp_fastest_dim,
@@ -377,64 +378,73 @@ def make_layout_3d(
         warps_per_cta=[num_warps, 1],
         order=[1, 0],
     )
-    # K_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
-    #     size_per_thread=[size_per_thread_fastest_dim, 1],
-    #     threads_per_warp=[
-    #         threads_per_warp_fastest_dim,
-    #         WARP_SIZE // threads_per_warp_fastest_dim,
-    #     ],
-    #     warps_per_cta=[1, num_warps],
-    #     order=[0, 1],
-    # )
-    # V_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
-    #     size_per_thread=[1, size_per_thread_fastest_dim],
-    #     threads_per_warp=[
-    #         WARP_SIZE // threads_per_warp_fastest_dim,
-    #         threads_per_warp_fastest_dim,
-    #     ],
-    #     warps_per_cta=[num_warps, 1],
-    #     order=[1, 0],
-    # )
+    if shuffled_kv_cache:
+        K_LOAD_LAYOUT: ttgl.constexpr = ttgl.DistributedLinearLayout(
+            reg_bases=[[0, 1], [0, 2], [0, 4], [0, 512], [1, 0], [2, 0]],
+            lane_bases=[[0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [0, 256]],
+            warp_bases=[[0, 0]],
+            block_bases=[],
+            shape=[TILE_SIZE // 16, HEAD_SIZE_PADDED * 16],
+        )
+    else:
+        K_LOAD_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
+            size_per_thread=[size_per_thread_fastest_dim, 1],
+            threads_per_warp=[
+                threads_per_warp_fastest_dim,
+                WARP_SIZE // threads_per_warp_fastest_dim,
+            ],
+            warps_per_cta=[1, num_warps],
+            order=[0, 1],
+        )
+    V_LOAD_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
+        size_per_thread=[1, size_per_thread_fastest_dim],
+        threads_per_warp=[
+            WARP_SIZE // threads_per_warp_fastest_dim,
+            threads_per_warp_fastest_dim,
+        ],
+        warps_per_cta=[num_warps, 1],
+        order=[1, 0],
+    )
 
     # 64
     # ttg.linear<{register = [[1, 0], [2, 0], [4, 0], [0, 2], [0, 32]], lane = [[8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16]], warp = [[0, 1]], block = []}>
     # 128
     # ttg.linear<{register = [[1, 0], [2, 0], [4, 0], [0, 2], [0, 4], [0, 8]], lane = [[8, 0], [16, 0], [32, 0], [64, 0], [0, 16], [0, 32]], warp = [[0, 1]], block = []}>
-    # K_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.DistributedLinearLayout(
+    # K_LOAD_LAYOUT: ttgl.constexpr = ttgl.DistributedLinearLayout(
     #     reg_bases=[[1, 0], [2, 0], [4, 0], [0, 2], [0, 32]],
     #     lane_bases=[[8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16]],
     #     warp_bases=[[0, 1]],
     #     block_bases=[],
     #     shape=[HEAD_SIZE_PADDED, TILE_SIZE],
     # )
-    bases_representation = {
-        "reg_bases": ["m0", "m1", "m2", "n1", "n5"],
-        "lane_bases": ["m3", "m4", "m5", "n2", "n3", "n4"],
-        "warp_bases": ["n0"],
-    }
-    K_BLOCKED_LAYOUT = make_distributed_linear_layout(
-        [HEAD_SIZE_PADDED, TILE_SIZE], bases_representation
-    )
+    # bases_representation = {
+    #     "reg_bases": ["m0", "m1", "m2", "n1", "n5"],
+    #     "lane_bases": ["m3", "m4", "m5", "n2", "n3", "n4"],
+    #     "warp_bases": ["n0"],
+    # }
+    # K_LOAD_LAYOUT = make_distributed_linear_layout(
+    #     [HEAD_SIZE_PADDED, TILE_SIZE], bases_representation
+    # )
 
     # 64
     # ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [2, 0], [32, 0]], lane = [[0, 8], [0, 16], [0, 32], [8, 0], [4, 0], [16, 0]], warp = [[1, 0]], block = []}>
     # 128
     # ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [2, 0], [8, 0], [4, 0]], lane = [[0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0]], warp = [[1, 0]], block = []}>
-    # V_BLOCKED_LAYOUT: ttgl.constexpr = ttgl.DistributedLinearLayout(
+    # V_LOAD_LAYOUT: ttgl.constexpr = ttgl.DistributedLinearLayout(
     #     reg_bases=[[0, 1], [0, 2], [0, 4], [2, 0], [32, 0]],
     #     lane_bases=[[0, 8], [0, 16], [0, 32], [8, 0], [4, 0], [16, 0]],
     #     warp_bases=[[1, 0]],
     #     block_bases=[],
     #     shape=[TILE_SIZE, HEAD_SIZE_PADDED],
     # )
-    bases_representation = {
-        "reg_bases": ["n0", "n1", "n2", "m1", "m5"],
-        "lane_bases": ["n3", "n4", "n5", "m3", "m2", "m4"],
-        "warp_bases": ["m0"],
-    }
-    V_BLOCKED_LAYOUT = make_distributed_linear_layout(
-        [TILE_SIZE, HEAD_SIZE_PADDED], bases_representation
-    )
+    # bases_representation = {
+    #     "reg_bases": ["n0", "n1", "n2", "m1", "m5"],
+    #     "lane_bases": ["n3", "n4", "n5", "m3", "m2", "m4"],
+    #     "warp_bases": ["m0"],
+    # }
+    # V_LOAD_LAYOUT = make_distributed_linear_layout(
+    #     [TILE_SIZE, HEAD_SIZE_PADDED], bases_representation
+    # )
 
     # TODO: for future impl
     # ctas_per_cga = [1, 1]
@@ -464,9 +474,9 @@ def make_layout_3d(
         "Q_SHARED_LAYOUT": Q_SHARED_LAYOUT,
         "K_SHARED_LAYOUT": K_SHARED_LAYOUT,
         "V_SHARED_LAYOUT": V_SHARED_LAYOUT,
-        "Q_BLOCKED_LAYOUT": Q_BLOCKED_LAYOUT,
-        "K_BLOCKED_LAYOUT": K_BLOCKED_LAYOUT,
-        "V_BLOCKED_LAYOUT": V_BLOCKED_LAYOUT,
+        "Q_LOAD_LAYOUT": Q_LOAD_LAYOUT,
+        "K_LOAD_LAYOUT": K_LOAD_LAYOUT,
+        "V_LOAD_LAYOUT": V_LOAD_LAYOUT,
     }
 
 
@@ -483,6 +493,7 @@ def select_3d_config(
     num_tdm_gather: int = 1,
     use_async: bool = True,
     use_swizzle: bool = True,
+    shuffled_kv_cache: bool = False,
 ):
     """
     if use_tdm is True, use_async and use_swizzle will be ignored
@@ -530,17 +541,28 @@ def select_3d_config(
             attn_impl = gluon_kernel_unified_attention_3d_tdm_gather
             # print(f"Using TDM gather pipelined kernel with TILE_SIZE={TILE_SIZE} and BLOCK_SIZE={block_size}")
             layouts = make_layout_3d(
-                *hyper_parms, use_tdm, use_swizzle=False, use_gather=True
+                *hyper_parms,
+                use_tdm,
+                use_swizzle=False,
+                use_gather=True,
+                shuffled_kv_cache=shuffled_kv_cache,
             )
         else:
             attn_impl = gluon_kernel_unified_attention_3d_tdm
             # print(f"Using TDM async copy pipelined kernel with TILE_SIZE={TILE_SIZE} and BLOCK_SIZE={block_size}")
-            layouts = make_layout_3d(*hyper_parms, use_tdm, use_swizzle=False)
+            layouts = make_layout_3d(
+                *hyper_parms,
+                use_tdm,
+                use_swizzle=False,
+                shuffled_kv_cache=shuffled_kv_cache,
+            )
         attn_stages = 2
     elif use_async:
         # With async_copy pipelined, use_swizzle should always be True
         attn_impl = gluon_kernel_unified_attention_3d_async
-        layouts = make_layout_3d(*hyper_parms, use_tdm, use_swizzle=True)
+        layouts = make_layout_3d(
+            *hyper_parms, use_tdm, use_swizzle=True, shuffled_kv_cache=shuffled_kv_cache
+        )
         # gfx12 does not have async_copy.buffer_load_to_shared
         # TODO: check KV cache size to determine if use_buffer_load is needed in gfx950
         layouts["use_buffer_load"] = not IS_DEVICE_ARCH_GFX12
@@ -552,6 +574,7 @@ def select_3d_config(
             *hyper_parms,
             use_tdm,
             use_swizzle=use_swizzle,
+            shuffled_kv_cache=shuffled_kv_cache,
         )
 
     attn_config = {
@@ -702,6 +725,7 @@ def unified_attention(
             num_tdm_gather,
             use_async,
             use_swizzle,
+            shuffled_kv_cache,
         )
         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
         segm_output = torch.empty(
@@ -772,6 +796,7 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             ALL_DECODE=ALL_DECODE,
+            SHUFFLED_KV_CACHE=shuffled_kv_cache,
             **attn_config,
         )
         # kernel_unified_attention_3d_new[
