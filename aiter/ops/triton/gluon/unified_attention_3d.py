@@ -17,7 +17,6 @@ from aiter.ops.triton.gluon.unified_attention_3d_kernel_tdm_new import (
 from triton.experimental import gluon
 import triton.experimental.gluon.language as ttgl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-import numpy as np
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
@@ -27,23 +26,33 @@ WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 def make_distributed_linear_layout(
     shape: list[int], bases_representation: dict[str, list[str]]
 ):
-    # rules:
-    #   1. shape = [X, Y]
-    #   2. x_log_2 = log2(X), y_log_2 = log2(Y)
-    #   3. there are a total of x_log_2 + y_log_2 tokens: "x0", "x1", ... "x{x_log_2 - 1}", "y0", "y1", ... "y{x_log_2 - 1}"
-    #   4. these tokens must appear exactly once in the bases_representation across "reg_bases", "lane_bases", "warp_bases" keys:
-    #
-    # example: shape = [64, 128]
-    #   available tokens: "x0", "x1", "x2", "x3", "x4", "x5", "y0", "y1", "y2", "y3", "y4", "y5", "y6", "y7"
-    #   each of the above tokens must appear once in the bases_representation across "reg_bases", "lane_bases", "warp_bases" keys
-    #
-    # note:
-    #    although this will not cause any compailation error outside gluon.jit,
-    #    you need to make sure "lane_bases" has exactly 6/5 tokens for gfx950/gfx1250, respectively, because there are 64/32 threads per warp
-    #    also you need to make sure "warp_bases" has exactly log2(num_warps) tokens, e.g., 1 token for num_warps = 2, 2 tokens for num_warps = 4, etc.
+    """
+    rules for bases_representation:
+    1. shape = [BLOCK_M, BLOCK_N]
+    2.  bases_representation = {
+            "reg_bases": [...]
+            "lane_bases": [...]
+            "warp_bases": [...]
+        }
+        where:
+            "reg_bases": list of tokens representing the register-level distribution
+            "lane_bases": list of tokens representing the lane-level distribution
+            "warp_bases": list of tokens representing the warp-level distribution
+    3. m_log_2 = log2(BLOCK_M), n_log_2 = log2(BLOCK_N)
+    4. there are a total of m_log_2 + n_log_2 tokens: "m0", "m1", ... "m{m_log_2 - 1}", "n0", "n1", ... "n{n_log_2 - 1}"
+    5. these tokens must appear exactly once in the bases_representation across "reg_bases", "lane_bases", "warp_bases" keys:
 
+    example: shape = [64, 128]
+        available tokens: "m0", "m1", "m2", "m3", "m4", "m5", "n0", "n1", "n2", "n3", "n4", "n5", "n6", "n7"
+        each of the above tokens must appear once in the bases_representation across "reg_bases", "lane_bases", "warp_bases" keys
+
+    note:
+        although this will not cause any compailation error outside gluon.jit,
+        you need to make sure "lane_bases" has exactly 6/5 tokens for gfx950/gfx1250, respectively, because there are 64/32 threads per warp
+        also you need to make sure "warp_bases" has exactly log2(num_warps) tokens, e.g., 1 token for num_warps = 2, 2 tokens for num_warps = 4, etc.
+    """
     token_counter = {}
-    for i, d in [(0, "x"), (1, "y")]:
+    for i, d in [(0, "m"), (1, "n")]:
         for lg in range(int(math.log2(shape[i]))):
             token_counter[f"{d}{lg}"] = 0
 
@@ -58,10 +67,10 @@ def make_distributed_linear_layout(
             token_counter[v] += 1
             d = v[0]
             lg = int(v[1])
-            if d == "x":
-                arg[k].append([0, 2**lg])
-            else:
+            if d == "m":
                 arg[k].append([2**lg, 0])
+            else:
+                arg[k].append([0, 2**lg])
 
     for k in token_counter.keys():
         if token_counter[k] != 1:
@@ -90,7 +99,7 @@ def get_layout_view(layout, shape):
 
 
 def get_smem_data_layout(layout, shape, bases_representation):
-    _, layout_array = get_layout_view(layout.format_tensor_view(shape))
+    _, layout_array = get_layout_view(layout, shape)
     contiguous_dim = bases_representation["reg_bases"][0][0]
     assert bases_representation["reg_bases"][0][1] == "0"
     for log_coalesced in range(1, len(bases_representation["reg_bases"])):
@@ -99,7 +108,11 @@ def get_smem_data_layout(layout, shape, bases_representation):
             != f"{contiguous_dim}{2**(log_coalesced - 1)}"
         ):
             break
+
     coalesced_size = 2**log_coalesced
+    if contiguous_dim == "m":
+        layout_array = layout_array.permute(1, 0, 2)
+
     smem_data_layout = []
     for tid in range(WARP_SIZE):
         smem_data_layout.append([])
@@ -134,6 +147,9 @@ def get_smem_data_layout(layout, shape, bases_representation):
     smem_data_layout = torch.stack(smem_data_layout)
     # [num_vmem_loads, num_threads, coalesced_size, 2]
     smem_data_layout = smem_data_layout.permute(1, 0, 2, 3)
+    if contiguous_dim == "m":
+        smem_data_layout = smem_data_layout[..., [1, 0]]
+    return smem_data_layout
 
 
 def make_layout_3d(
@@ -392,9 +408,9 @@ def make_layout_3d(
     #     shape=[HEAD_SIZE_PADDED, TILE_SIZE],
     # )
     bases_representation = {
-        "reg_bases": ["y0", "y1", "y2", "x1", "x5"],
-        "lane_bases": ["y3", "y4", "y5", "x2", "x3", "x4"],
-        "warp_bases": ["x0"],
+        "reg_bases": ["m0", "m1", "m2", "n1", "n5"],
+        "lane_bases": ["m3", "m4", "m5", "n2", "n3", "n4"],
+        "warp_bases": ["n0"],
     }
     K_BLOCKED_LAYOUT = make_distributed_linear_layout(
         [HEAD_SIZE_PADDED, TILE_SIZE], bases_representation
@@ -412,9 +428,9 @@ def make_layout_3d(
     #     shape=[TILE_SIZE, HEAD_SIZE_PADDED],
     # )
     bases_representation = {
-        "reg_bases": ["x0", "x1", "x2", "y1", "y5"],
-        "lane_bases": ["x3", "x4", "x5", "y3", "y2", "y4"],
-        "warp_bases": ["y0"],
+        "reg_bases": ["n0", "n1", "n2", "m1", "m5"],
+        "lane_bases": ["n3", "n4", "n5", "m3", "m2", "m4"],
+        "warp_bases": ["m0"],
     }
     V_BLOCKED_LAYOUT = make_distributed_linear_layout(
         [TILE_SIZE, HEAD_SIZE_PADDED], bases_representation
