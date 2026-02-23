@@ -497,6 +497,7 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
     V_LOAD_LAYOUT: ttgl.constexpr,
     num_ctas: ttgl.constexpr = 1,  # int
     ALL_DECODE: ttgl.constexpr = False,  # bool
+    SHUFFLED_KV_CACHE: ttgl.constexpr = False,  # bool
 ):
     q_block_global_idx = ttgl.program_id(0)
     kv_head_idx = ttgl.program_id(1)
@@ -1151,6 +1152,7 @@ def gluon_kernel_unified_attention_3d_tdm(
     V_LOAD_LAYOUT: ttgl.constexpr,
     num_ctas: ttgl.constexpr = 1,  # int
     ALL_DECODE: ttgl.constexpr = False,  # bool
+    SHUFFLED_KV_CACHE: ttgl.constexpr = False,  # bool
 ):
     q_block_global_idx = ttgl.program_id(0)
     kv_head_idx = ttgl.program_id(1)
@@ -1749,6 +1751,7 @@ def gluon_kernel_unified_attention_3d_async(
     V_LOAD_LAYOUT: ttgl.constexpr,
     use_buffer_load: ttgl.constexpr = True,
     ALL_DECODE: ttgl.constexpr = False,  # bool
+    SHUFFLED_KV_CACHE: ttgl.constexpr = False,  # bool
 ):
     q_block_global_idx = ttgl.program_id(0)
     kv_head_idx = ttgl.program_id(1)
@@ -2178,20 +2181,20 @@ def gluon_kernel_unified_attention_3d_async(
 @gluon.jit
 def _unshuffle_kv_cache(
     X,
-    TILE_SIZE: ttgl.constexpr,
-    HEAD_SIZE_PADDED: ttgl.constexpr,
+    BLOCK_SIZE_N: ttgl.constexpr,
+    BLOCK_SIZE_INNER_DIM: ttgl.constexpr,
 ):
     return (
         X.reshape(
             1,
-            TILE_SIZE // 16,
-            HEAD_SIZE_PADDED // 16,
+            BLOCK_SIZE_N // 16,
+            BLOCK_SIZE_INNER_DIM // 16,
             2,
             16,
             8,
         )
         .permute(0, 1, 4, 2, 3, 5)
-        .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
+        .reshape(BLOCK_SIZE_N, BLOCK_SIZE_INNER_DIM)
         .trans(1, 0)
     )
 
@@ -2203,6 +2206,7 @@ def _buffer_load_to_reg(
     ptr,
     offsets,
     mask,
+    other,
     cache_modifier: ttgl.constexpr,
     SHUFFLED_KV_CACHE: ttgl.constexpr = False,
 ):
@@ -2210,7 +2214,7 @@ def _buffer_load_to_reg(
         ptr=ptr,
         offsets=offsets.to(ttgl.int32),
         mask=mask,
-        other=0.0,
+        other=other,
         cache=cache_modifier,
     )
     if X.dtype.is_fp8() and not Q_dtype.is_fp8():
@@ -2302,6 +2306,11 @@ def gluon_kernel_unified_attention_3d(
     kv_head_idx = ttgl.program_id(1)
     segm_idx = ttgl.program_id(2)
 
+    if SHUFFLED_KV_CACHE:
+        ttgl.static_assert(
+            TILE_SIZE == BLOCK_SIZE,
+            "TILE_SIZE must be equal to BLOCK_SIZE if SHUFFLED_KV_CACHE is True",
+        )
     # needed to use exp2 (exp2 -> exp conversion)
     RCP_LN2 = 1.4426950408889634
     qk_scale = scale * RCP_LN2
@@ -2342,17 +2351,18 @@ def gluon_kernel_unified_attention_3d(
         query_ptr.type.element_ty, [BLOCK_M, HEAD_SIZE_PADDED], layout=Q_SHARED_LAYOUT
     )
     smem_K = None
+    smem_V = None
     if not SHUFFLED_KV_CACHE:
         smem_K = ttgl.allocate_shared_memory(
             key_cache_ptr.type.element_ty,
             [HEAD_SIZE_PADDED, TILE_SIZE],
             layout=K_SHARED_LAYOUT,
         )
-    smem_V = ttgl.allocate_shared_memory(
-        value_cache_ptr.type.element_ty,
-        [TILE_SIZE, HEAD_SIZE_PADDED],
-        layout=V_SHARED_LAYOUT,
-    )
+        smem_V = ttgl.allocate_shared_memory(
+            value_cache_ptr.type.element_ty,
+            [TILE_SIZE, HEAD_SIZE_PADDED],
+            layout=V_SHARED_LAYOUT,
+        )
 
     offs_q_m = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, Q_LOAD_LAYOUT))
     offs_q_d = ttgl.arange(
@@ -2366,16 +2376,21 @@ def gluon_kernel_unified_attention_3d(
         offs_k_d = ttgl.arange(
             0, HEAD_SIZE_PADDED * 16, layout=ttgl.SliceLayout(0, K_LOAD_LAYOUT)
         )
+        offs_v_t = ttgl.arange(
+            0, TILE_SIZE * 16, layout=ttgl.SliceLayout(0, V_LOAD_LAYOUT)
+        )
+        offs_v_d = ttgl.arange(
+            0, HEAD_SIZE_PADDED // 16, layout=ttgl.SliceLayout(1, V_LOAD_LAYOUT)
+        )
     else:
         offs_k_t = ttgl.arange(0, TILE_SIZE, layout=ttgl.SliceLayout(0, K_LOAD_LAYOUT))
         offs_k_d = ttgl.arange(
             0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(1, K_LOAD_LAYOUT)
         )
-
-    offs_v_t = ttgl.arange(0, TILE_SIZE, layout=ttgl.SliceLayout(1, V_LOAD_LAYOUT))
-    offs_v_d = ttgl.arange(
-        0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(0, V_LOAD_LAYOUT)
-    )
+        offs_v_t = ttgl.arange(0, TILE_SIZE, layout=ttgl.SliceLayout(1, V_LOAD_LAYOUT))
+        offs_v_d = ttgl.arange(
+            0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(0, V_LOAD_LAYOUT)
+        )
 
     query_pos = q_block_local_idx * BLOCK_Q + offs_q_m // num_queries_per_kv
 
@@ -2476,9 +2491,10 @@ def gluon_kernel_unified_attention_3d(
         # seq_offset : shape = (TILE_SIZE, ), layout = ttgl.SliceLayout(0, QK_WMMA_LAYOUT)
         if SHUFFLED_KV_CACHE:
             seq_k_offset = j * TILE_SIZE + offs_k_t * 16
+            seq_v_offset = j * TILE_SIZE + offs_v_t // 16
         else:
             seq_k_offset = j * TILE_SIZE + offs_k_t
-        seq_v_offset = j * TILE_SIZE + offs_v_t
+            seq_v_offset = j * TILE_SIZE + offs_v_t
         seq_offset = j * TILE_SIZE + offs_seq_t
 
         if TILE_SIZE == BLOCK_SIZE:
@@ -2509,19 +2525,21 @@ def gluon_kernel_unified_attention_3d(
         #     physical_block_idx_k, layout=ttgl.SliceLayout(1, V_LOAD_LAYOUT)
         # )
 
-        v_offset = (
-            physical_block_idx_v[:, None] * stride_v_cache_0
-            + kv_head_idx * stride_v_cache_2
-            + offs_v_d[None, :] * stride_v_cache_3
-            + (seq_v_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-        )
-
+        k_mask = None
+        v_mask = None
+        other = None
         if SHUFFLED_KV_CACHE:
             k_offset = (
                 physical_block_idx_k[:, None] * stride_k_cache_0
                 + kv_head_idx * stride_k_cache_1
-                + offs_k_d[None, :] * stride_k_cache_3
                 + offs_k_t[:, None] * stride_k_cache_2
+                + offs_k_d[None, :] * stride_k_cache_3
+            )
+            v_offset = (
+                physical_block_idx_v[None, :] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_1
+                + offs_v_t[None, :] * stride_v_cache_3
+                + offs_v_d[:, None] * stride_v_cache_2
             )
         else:
             k_offset = (
@@ -2530,6 +2548,15 @@ def gluon_kernel_unified_attention_3d(
                 + offs_k_d[:, None] * stride_k_cache_3
                 + (seq_k_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
             )
+            k_mask = dim_mask[:, None] & tile_k_mask[None, :]
+            v_offset = (
+                physical_block_idx_v[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_v_d[None, :] * stride_v_cache_3
+                + (seq_v_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            )
+            v_mask = dim_mask[None, :] & tile_v_mask[:, None]
+            other = 0.0
 
         # K_load : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_LOAD_LAYOUT
         K = _buffer_load_to_reg(
@@ -2537,7 +2564,8 @@ def gluon_kernel_unified_attention_3d(
             Q.dtype,
             key_cache_ptr,
             k_offset.to(ttgl.int32),
-            dim_mask[:, None] & tile_k_mask[None, :],
+            k_mask,
+            other,
             KV_cache_modifier,
             SHUFFLED_KV_CACHE,
         )
@@ -2550,10 +2578,12 @@ def gluon_kernel_unified_attention_3d(
             Q.dtype,
             value_cache_ptr,
             v_offset.to(ttgl.int32),
-            dim_mask[None, :] & tile_v_mask[:, None],
+            v_mask,
+            other,
             KV_cache_modifier,
         )
-        smem_V.store(V)
+        if not SHUFFLED_KV_CACHE:
+            smem_V.store(V)
 
         # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
         if SHUFFLED_KV_CACHE:
@@ -2589,7 +2619,11 @@ def gluon_kernel_unified_attention_3d(
         )
 
         # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
-        V = smem_V.load(layout=V_DOT_LAYOUT)
+        if SHUFFLED_KV_CACHE:
+            V = _unshuffle_kv_cache(V, HEAD_SIZE_PADDED, TILE_SIZE)
+            V = ttgl.convert_layout(value=V, layout=V_DOT_LAYOUT, assert_trivial=True)
+        else:
+            V = smem_V.load(layout=V_DOT_LAYOUT)
         # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
         acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
 

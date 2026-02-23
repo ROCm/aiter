@@ -63,26 +63,24 @@ def shuffle_kv_cache(
         -1, num_kv_heads, block_size // 16, head_size * 16
     )
 
-    # if block_size is 16, then we need to gather at least 2 blocks to make the dot dim 32
-    # value_cache_shuffled = value_cache.view(
-    #     -1, block_size, num_kv_heads, head_size
-    # ).permute(0, 2, 1, 3)
-    # value_cache_shuffled = value_cache_shuffled.view(
-    #     -1,
-    #     num_kv_heads,
-    #     block_size // (2 * num_elements_per_thread),
-    #     2,
-    #     num_elements_per_thread,
-    #     head_size // num_lanes,
-    #     num_lanes,
-    # )
-    # value_cache_shuffled = value_cache_shuffled.permute(
-    #     0, 1, 5, 2, 3, 6, 4
-    # ).contiguous()
-    # value_cache_shuffled = value_cache_shuffled.view(
-    #     -1, num_kv_heads, head_size // 16, block_size * 16
-    # )
-    value_cache_shuffled = value_cache
+    value_cache_shuffled = value_cache.view(
+        -1, block_size, num_kv_heads, head_size
+    ).permute(0, 2, 1, 3)
+    value_cache_shuffled = value_cache_shuffled.view(
+        -1,
+        num_kv_heads,
+        block_size // (2 * num_elements_per_thread),
+        2,
+        num_elements_per_thread,
+        head_size // num_lanes,
+        num_lanes,
+    )
+    value_cache_shuffled = value_cache_shuffled.permute(
+        0, 1, 5, 2, 3, 6, 4
+    ).contiguous()
+    value_cache_shuffled = value_cache_shuffled.view(
+        -1, num_kv_heads, head_size // 16, block_size * 16
+    )
 
     return key_cache_shuffled, value_cache_shuffled
 
@@ -227,18 +225,18 @@ elif os.environ.get("SCL_BACKEND") == "5":
 @pytest.mark.parametrize("soft_cap", [None])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("q_dtype", QDTYPES)
-@pytest.mark.parametrize("shuffled_kv_cache", [False])
+@pytest.mark.parametrize("shuffled_kv_cache", [True, False])
 @pytest.mark.parametrize(
     "backend, use_tdm, num_tdm_gather, use_async",
-    SCL_BACKEND,
-    # [
-    #     ("triton", False, 1, False),  # use triton
-    #     ("gluon", False, 1, False),  # use gluon baseline
-    #     ("gluon", False, 1, True),  # use gluon simple async_copy
-    #     ("gluon", True, 1, False),  # use gluon TDM async_copy
-    #     ("gluon", True, 4, False),  # use gluon TDM gather pipelined
-    #     ("gluon", True, 8, False),  # use gluon TDM gather pipelined
-    # ],
+    # SCL_BACKEND,
+    [
+        ("triton", False, 1, False),  # use triton
+        ("gluon", False, 1, False),  # use gluon baseline
+        ("gluon", False, 1, True),  # use gluon simple async_copy
+        ("gluon", True, 1, False),  # use gluon TDM async_copy
+        ("gluon", True, 4, False),  # use gluon TDM gather pipelined
+        ("gluon", True, 8, False),  # use gluon TDM gather pipelined
+    ],
 )
 @torch.inference_mode()
 def test_triton_unified_attn(
@@ -268,6 +266,16 @@ def test_triton_unified_attn(
 
     if DEVICE_ARCH not in ("gfx1250",) and use_tdm == True:
         pytest.skip(f"{DEVICE_ARCH} does not have TDM")
+
+    if shuffled_kv_cache and backend == "gluon":
+        if block_size < 64:
+            pytest.skip(
+                "Only block size >= 64 is supported for shuffled KV cache with gluon backend"
+            )
+        if use_tdm or use_async:
+            pytest.skip(
+                "Only baseline kernel is supported for shuffled KV cache with gluon backend"
+            )
 
     if use_tdm and num_tdm_gather > 1:
         if head_size * block_size > 512:
@@ -364,6 +372,7 @@ def test_triton_unified_attn(
         )
     else:
         if shuffled_kv_cache:
+            maybe_sorted_block_tables = block_tables
             maybe_shuffled_qnatized_key_cache, maybe_shuffled_quantized_value_cache = (
                 shuffle_kv_cache(maybe_quantized_key_cache, maybe_quantized_value_cache)
             )
@@ -403,6 +412,7 @@ def test_triton_unified_attn(
             use_tdm=use_tdm,
             num_tdm_gather=num_tdm_gather,
             use_async=use_async,
+            shuffled_kv_cache=shuffled_kv_cache,
         )
 
     ref_output = ref_paged_attn(

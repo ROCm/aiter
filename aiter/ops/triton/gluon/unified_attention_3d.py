@@ -160,6 +160,38 @@ def get_smem_data_layout(layout, shape, bases_representation):
     return smem_data_layout
 
 
+def make_kv_shuffled_layout(
+    BLOCK_SIZE_N_SHFL, BLOCK_SIZE_INNER_DIM_SHFL, num_warps_log2
+):
+    BLOCK_SIZE_N_SHFL_log2 = int(math.log2(BLOCK_SIZE_N_SHFL))
+    BLOCK_SIZE_INNER_DIM_SHFL_log2 = int(math.log2(BLOCK_SIZE_INNER_DIM_SHFL))
+    coalesced_size_log2 = 3  # (8 elements per thread for BF16)
+    assert (
+        BLOCK_SIZE_INNER_DIM_SHFL_log2 > 3 + WAPR_SIZE_LOG2
+    ), "BLOCK_SIZE_INNER_DIM_SHFL_log2 must be greater than 3 + WAPR_SIZE_LOG2, please increase block_size to at least 64"
+    bases_representation = {
+        "reg_bases": [f"n{v}" for v in range(coalesced_size_log2)]
+        + [f"n{v}" for v in range(3 + WAPR_SIZE_LOG2, BLOCK_SIZE_INNER_DIM_SHFL_log2)]
+        + (
+            [f"m{v}" for v in range(num_warps_log2, BLOCK_SIZE_N_SHFL_log2)]
+            if BLOCK_SIZE_N_SHFL_log2 > num_warps_log2
+            else []
+        ),
+        "lane_bases": [
+            f"n{v}"
+            for v in range(coalesced_size_log2, coalesced_size_log2 + WAPR_SIZE_LOG2)
+        ],
+        "warp_bases": (
+            [f"m{v}" for v in range(0, num_warps_log2)]
+            if BLOCK_SIZE_N_SHFL_log2 > num_warps_log2
+            else ["z"]
+        ),
+    }
+    return make_distributed_linear_layout(
+        [BLOCK_SIZE_N_SHFL, BLOCK_SIZE_INNER_DIM_SHFL], bases_representation
+    )
+
+
 def make_layout_3d(
     num_warps: int,
     BLOCK_M: int,
@@ -262,10 +294,10 @@ def make_layout_3d(
             operand_index=1, parent=QK_WMMA_LAYOUT, k_width=8
         )
         P_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
-            operand_index=0, parent=PV_WMMA_LAYOUT, k_width=4
+            operand_index=0, parent=PV_WMMA_LAYOUT, k_width=4 if TILE_SIZE <= 16 else 8
         )
         V_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
-            operand_index=1, parent=PV_WMMA_LAYOUT, k_width=4
+            operand_index=1, parent=PV_WMMA_LAYOUT, k_width=4 if TILE_SIZE <= 16 else 8
         )
 
     if use_tdm or not use_swizzle:
@@ -388,28 +420,11 @@ def make_layout_3d(
     )
     if shuffled_kv_cache:
         num_warps_log2 = int(math.log2(num_warps))
-        tile_size_log2 = int(math.log2(TILE_SIZE // 16))
-        head_size_padded_log2 = int(math.log2(HEAD_SIZE_PADDED * 16))
-        assert head_size_padded_log2 > (
-            3 + WAPR_SIZE_LOG2
-        ), "log2(HEAD_SIZE_PADDED * 16) must be greater than (log2(WARP_SIZE * 8)) for KV cache shuffling"
-        bases_representation = {
-            "reg_bases": ["n0", "n1", "n2"]
-            + [f"n{v}" for v in range(3 + WAPR_SIZE_LOG2, head_size_padded_log2)]
-            + (
-                [f"m{v}" for v in range(num_warps_log2, tile_size_log2)]
-                if tile_size_log2 > num_warps_log2
-                else []
-            ),
-            "lane_bases": [f"n{v}" for v in range(3, 3 + WAPR_SIZE_LOG2)],
-            "warp_bases": (
-                [f"m{v}" for v in range(0, num_warps_log2)]
-                if tile_size_log2 > num_warps_log2
-                else ["z"]
-            ),
-        }
-        K_LOAD_LAYOUT = make_distributed_linear_layout(
-            [TILE_SIZE // 16, HEAD_SIZE_PADDED * 16], bases_representation
+        K_LOAD_LAYOUT = make_kv_shuffled_layout(
+            TILE_SIZE // 16, HEAD_SIZE_PADDED * 16, num_warps_log2
+        )
+        V_LOAD_LAYOUT = make_kv_shuffled_layout(
+            HEAD_SIZE_PADDED // 16, TILE_SIZE * 16, num_warps_log2
         )
     else:
         K_LOAD_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
@@ -421,15 +436,15 @@ def make_layout_3d(
             warps_per_cta=[1, num_warps],
             order=[0, 1],
         )
-    V_LOAD_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
-        size_per_thread=[1, size_per_thread_fastest_dim],
-        threads_per_warp=[
-            WARP_SIZE // threads_per_warp_fastest_dim,
-            threads_per_warp_fastest_dim,
-        ],
-        warps_per_cta=[num_warps, 1],
-        order=[1, 0],
-    )
+        V_LOAD_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
+            size_per_thread=[1, size_per_thread_fastest_dim],
+            threads_per_warp=[
+                WARP_SIZE // threads_per_warp_fastest_dim,
+                threads_per_warp_fastest_dim,
+            ],
+            warps_per_cta=[num_warps, 1],
+            order=[1, 0],
+        )
 
     # 64
     # ttg.linear<{register = [[1, 0], [2, 0], [4, 0], [0, 2], [0, 32]], lane = [[8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16]], warp = [[0, 1]], block = []}>
@@ -529,8 +544,14 @@ def select_3d_config(
     reduce_num_warps = 2
     attn_warps = 2
 
+    if shuffled_kv_cache:
+        assert (
+            block_size >= 64
+        ), "Only block_size >= 64 is supported for shuffled KV cache"
+
     if use_tdm and num_tdm_gather > 1:
         assert num_tdm_gather in [4, 8], "num_tdm_gather must be 4 or 8"
+
     TILE_SIZE = block_size * num_tdm_gather
 
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))

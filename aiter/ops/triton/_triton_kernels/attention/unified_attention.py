@@ -448,6 +448,12 @@ def kernel_unified_attention_3d(
     kv_head_idx = tl.program_id(1)
     segm_idx = tl.program_id(2)
 
+    if SHUFFLED_KV_CACHE:
+        tl.static_assert(
+            TILE_SIZE == BLOCK_SIZE,
+            "TILE_SIZE must be equal to BLOCK_SIZE if SHUFFLED_KV_CACHE is True",
+        )
+
     # needed to use exp2 (exp2 -> exp conversion)
     RCP_LN2 = 1.4426950408889634
     qk_scale = scale * RCP_LN2
@@ -482,11 +488,15 @@ def kernel_unified_attention_3d(
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
     offs_t = tl.arange(0, TILE_SIZE)
 
-    offs_t_shfl = None
-    offs_d_shfl = None
+    offs_k_t_shfl = None
+    offs_k_d_shfl = None
+    offs_v_t_shfl = None
+    offs_v_d_shfl = None
     if SHUFFLED_KV_CACHE:
-        offs_t_shfl = tl.arange(0, TILE_SIZE // 16)
-        offs_d_shfl = tl.arange(0, HEAD_SIZE_PADDED * 16)
+        offs_k_t_shfl = tl.arange(0, TILE_SIZE // 16)
+        offs_k_d_shfl = tl.arange(0, HEAD_SIZE_PADDED * 16)
+        offs_v_t_shfl = tl.arange(0, TILE_SIZE * 16)
+        offs_v_d_shfl = tl.arange(0, HEAD_SIZE_PADDED // 16)
 
     query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
 
@@ -579,41 +589,58 @@ def kernel_unified_attention_3d(
         else:
             tile_mask = seq_offset < max_seq_prefix_len
 
-        physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-        ).to(tl.int64)
-
-        v_offset = (
-            physical_block_idx[:, None] * stride_v_cache_0
-            + kv_head_idx * stride_v_cache_2
-            + offs_d[None, :] * stride_v_cache_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-        )
-
+        k_mask = None
+        v_mask = None
+        other = None
         if SHUFFLED_KV_CACHE:
-            seq_offset_shfl = j * TILE_SIZE + offs_t_shfl * 16
+            seq_offset_k_shfl = j * TILE_SIZE + offs_k_t_shfl * 16
             physical_block_idx_shfl = tl.load(
-                block_tables_ptr + block_table_offset + seq_offset_shfl // BLOCK_SIZE
+                block_tables_ptr + block_table_offset + seq_offset_k_shfl // BLOCK_SIZE
             ).to(tl.int64)
             k_offset = (
                 physical_block_idx_shfl[:, None] * stride_k_cache_0
                 + kv_head_idx * stride_k_cache_1
-                + offs_d_shfl[None, :] * stride_k_cache_3
-                + offs_t_shfl[:, None] * stride_k_cache_2
+                + offs_k_t_shfl[:, None] * stride_k_cache_2
+                + offs_k_d_shfl[None, :] * stride_k_cache_3
+            )
+
+            seq_offset_v_shfl = j * TILE_SIZE + offs_v_t_shfl // 16
+            physical_block_idx_shfl = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset_v_shfl // BLOCK_SIZE
+            ).to(tl.int64)
+            v_offset = (
+                physical_block_idx_shfl[None, :] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_1
+                + offs_v_t_shfl[None, :] * stride_v_cache_3
+                + offs_v_d_shfl[:, None] * stride_v_cache_2
             )
         else:
+            physical_block_idx = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            ).to(tl.int64)
+
             k_offset = (
                 physical_block_idx[None, :] * stride_k_cache_0
                 + kv_head_idx * stride_k_cache_2
                 + offs_d[:, None] * stride_k_cache_3
                 + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
             )
+            k_mask = dim_mask[:, None] & tile_mask[None, :]
+
+            v_offset = (
+                physical_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            )
+            v_mask = dim_mask[None, :] & tile_mask[:, None]
+            other = 0.0
 
         # K : (HEAD_SIZE, TILE_SIZE)
         K_load = tl.load(
             key_cache_ptr + k_offset,
-            mask=dim_mask[:, None] & tile_mask[None, :],
-            other=0.0,
+            mask=k_mask,
+            other=other,
             cache_modifier=KV_cache_modifier,
         )
 
@@ -642,8 +669,8 @@ def kernel_unified_attention_3d(
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
             value_cache_ptr + v_offset,
-            mask=dim_mask[None, :] & tile_mask[:, None],
-            other=0.0,
+            mask=v_mask,
+            other=other,
             cache_modifier=KV_cache_modifier,
         )
 
@@ -654,6 +681,20 @@ def kernel_unified_attention_3d(
                 V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
         else:
             V = V_load
+            if SHUFFLED_KV_CACHE:
+                V = (
+                    V.reshape(
+                        1,
+                        HEAD_SIZE_PADDED // 16,
+                        TILE_SIZE // 16,
+                        2,
+                        16,
+                        8,
+                    )
+                    .permute(0, 1, 4, 2, 3, 5)
+                    .reshape(HEAD_SIZE_PADDED, TILE_SIZE)
+                    .trans(1, 0)
+                )
 
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
