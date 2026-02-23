@@ -2407,7 +2407,11 @@ def gluon_kernel_unified_attention_3d(
     Q = smem_Q.load(layout=Q_DOT_LAYOUT)
 
     offs_q_m_qk = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, QK_WMMA_LAYOUT))
+    offs_q_d_qk = ttgl.arange(
+        0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(0, QK_WMMA_LAYOUT)
+    )
     query_pos_qk = q_block_local_idx * BLOCK_Q + offs_q_m_qk // num_queries_per_kv
+    query_offset_0_qk = cur_batch_in_all_start_index + query_pos_qk
     query_offset_1_qk = (
         kv_head_idx * num_queries_per_kv + offs_q_m_qk % num_queries_per_kv
     )
@@ -2590,43 +2594,52 @@ def gluon_kernel_unified_attention_3d(
         acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
 
     # store segm_output
-    # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = Q_LOAD_LAYOUT
-    acc = ttgl.convert_layout(acc, layout=Q_LOAD_LAYOUT)
+    # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
+    offs_q_m_pv = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, PV_WMMA_LAYOUT))
+    offs_q_d_pv = ttgl.arange(
+        0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(0, PV_WMMA_LAYOUT)
+    )
+    query_pos_pv = q_block_local_idx * BLOCK_Q + offs_q_m_pv // num_queries_per_kv
+    query_offset_0_pv = cur_batch_in_all_start_index + query_pos_pv
+    query_offset_1_pv = (
+        kv_head_idx * num_queries_per_kv + offs_q_m_pv % num_queries_per_kv
+    )
+    query_mask_0_pv = query_pos_pv < cur_batch_query_len
+    query_mask_1_pv = query_offset_1_pv < num_query_heads
+    query_mask_pv = query_mask_1_pv[:, None] & query_mask_0_pv[:, None]
     segm_output_offset = (
-        query_offset_0[:, None]
+        query_offset_0_pv[:, None]
         * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
-        + query_offset_1[:, None] * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+        + query_offset_1_pv[:, None] * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
         + segm_idx * HEAD_SIZE_PADDED
-        + offs_q_d[None, :]
+        + offs_q_d_pv[None, :]
     )
     ttgl.amd.cdna4.buffer_store(
         stored_value=acc,
         ptr=segm_output_ptr,
         offsets=segm_output_offset,
-        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+        mask=dim_mask[None, :] & query_mask_pv,
     )
 
     # store segm_max and segm_expsum
     # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, QK_WMMA_LAYOUT)
     # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, QK_WMMA_LAYOUT)
     segm_offset = (
-        query_offset_0 * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
-        + query_offset_1 * NUM_SEGMENTS_PER_SEQ
+        query_offset_0_qk * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+        + query_offset_1_qk * NUM_SEGMENTS_PER_SEQ
         + segm_idx
     )
-    L = ttgl.convert_layout(L, layout=ttgl.SliceLayout(1, Q_LOAD_LAYOUT))
-    M = ttgl.convert_layout(M, layout=ttgl.SliceLayout(1, Q_LOAD_LAYOUT))
     ttgl.amd.cdna4.buffer_store(
         stored_value=M,
         ptr=segm_max_ptr,
         offsets=segm_offset,
-        mask=query_mask_0 & query_mask_1,
+        mask=query_mask_0_qk & query_mask_1_qk,
     )
     ttgl.amd.cdna4.buffer_store(
         stored_value=L,
         ptr=segm_expsum_ptr,
         offsets=segm_offset,
-        mask=query_mask_0 & query_mask_1,
+        mask=query_mask_0_qk & query_mask_1_qk,
     )
 
 

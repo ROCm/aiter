@@ -21,6 +21,7 @@ import aiter.ops.triton.utils._triton.arch_info as arch_info
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
+WAPR_SIZE_LOG2 = int(math.log2(WARP_SIZE))
 
 
 def make_distributed_linear_layout(
@@ -45,6 +46,7 @@ def make_distributed_linear_layout(
     example: shape = [64, 128]
         available tokens: "m0", "m1", "m2", "m3", "m4", "m5", "n0", "n1", "n2", "n3", "n4", "n5", "n6", "n7"
         each of the above tokens must appear once in the bases_representation across "reg_bases", "lane_bases", "warp_bases" keys
+        warp_bases can be "z", representing [0, 0]
 
     note:
         although this will not cause any compailation error outside gluon.jit,
@@ -60,13 +62,19 @@ def make_distributed_linear_layout(
 
     for k in arg.keys():
         for v in bases_representation[k]:
+            if v == "z":
+                if k == "warp_bases":
+                    arg[k].append([0, 0])
+                else:
+                    raise ValueError(f"Token {v} should only be in warp_bases")
+                continue
             if v not in token_counter:
                 raise ValueError(
                     f"Token {v} is invalid, it should be one of {token_counter.keys()}"
                 )
             token_counter[v] += 1
             d = v[0]
-            lg = int(v[1])
+            lg = int(v[1:])
             if d == "m":
                 arg[k].append([2**lg, 0])
             else:
@@ -239,13 +247,13 @@ def make_layout_3d(
             version=4,
             instr_shape=[16, 16, 32],
             transposed=True,
-            warps_per_cta=[2, num_warps // 2],
+            warps_per_cta=[1, num_warps],
         )
         PV_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDMFMALayout(
             version=4,
             instr_shape=[16, 16, 16 if TILE_SIZE <= 16 else 32],
             transposed=True,
-            warps_per_cta=[num_warps // 2, 2],
+            warps_per_cta=[1, num_warps],
         )
         Q_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
             operand_index=0, parent=QK_WMMA_LAYOUT, k_width=8
@@ -379,12 +387,29 @@ def make_layout_3d(
         order=[1, 0],
     )
     if shuffled_kv_cache:
-        K_LOAD_LAYOUT: ttgl.constexpr = ttgl.DistributedLinearLayout(
-            reg_bases=[[0, 1], [0, 2], [0, 4], [0, 512], [1, 0], [2, 0]],
-            lane_bases=[[0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [0, 256]],
-            warp_bases=[[0, 0]],
-            block_bases=[],
-            shape=[TILE_SIZE // 16, HEAD_SIZE_PADDED * 16],
+        num_warps_log2 = int(math.log2(num_warps))
+        tile_size_log2 = int(math.log2(TILE_SIZE // 16))
+        head_size_padded_log2 = int(math.log2(HEAD_SIZE_PADDED * 16))
+        assert head_size_padded_log2 > (
+            3 + WAPR_SIZE_LOG2
+        ), "log2(HEAD_SIZE_PADDED * 16) must be greater than (log2(WARP_SIZE * 8)) for KV cache shuffling"
+        bases_representation = {
+            "reg_bases": ["n0", "n1", "n2"]
+            + [f"n{v}" for v in range(3 + WAPR_SIZE_LOG2, head_size_padded_log2)]
+            + (
+                [f"m{v}" for v in range(num_warps_log2, tile_size_log2)]
+                if tile_size_log2 > num_warps_log2
+                else []
+            ),
+            "lane_bases": [f"n{v}" for v in range(3, 3 + WAPR_SIZE_LOG2)],
+            "warp_bases": (
+                [f"m{v}" for v in range(0, num_warps_log2)]
+                if tile_size_log2 > num_warps_log2
+                else ["z"]
+            ),
+        }
+        K_LOAD_LAYOUT = make_distributed_linear_layout(
+            [TILE_SIZE // 16, HEAD_SIZE_PADDED * 16], bases_representation
         )
     else:
         K_LOAD_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
