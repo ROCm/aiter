@@ -57,6 +57,10 @@ static void run_mfma_torch(
         dtype_ok = (A.dtype() == torch::kBFloat16);
         expected_out_dtype = torch::kBFloat16;
         in_dtype_name = "bfloat16";
+    } else if (variant.find("_f32") != std::string::npos) {
+        dtype_ok = (A.dtype() == torch::kFloat32);
+        expected_out_dtype = torch::kFloat32;
+        in_dtype_name = "float32";
     } else {
         dtype_ok = (A.dtype() == torch::kFloat16);
         expected_out_dtype = torch::kFloat16;
@@ -71,7 +75,17 @@ static void run_mfma_torch(
     int stride_b = static_cast<int>(B.stride(0));
     int stride_c = static_cast<int>(C.stride(0));
 
-    if (variant == "32x32x8_f16") {
+    if (variant == "32x32x2_f32") {
+        TORCH_CHECK((A.sizes() == torch::IntArrayRef{32, 2}),  "A must be 32x2 for variant ", variant);
+        TORCH_CHECK((B.sizes() == torch::IntArrayRef{32, 2}),  "B must be 32x2 for variant ", variant);
+        TORCH_CHECK((C.sizes() == torch::IntArrayRef{32, 32}), "C must be 32x32 for variant ", variant);
+        run_mfma_32x32x2_f32(A.data_ptr(), B.data_ptr(), C.data_ptr(), stride_a, stride_b, stride_c);
+    } else if (variant == "16x16x4_f32") {
+        TORCH_CHECK((A.sizes() == torch::IntArrayRef{16, 4}),  "A must be 16x4 for variant ", variant);
+        TORCH_CHECK((B.sizes() == torch::IntArrayRef{16, 4}),  "B must be 16x4 for variant ", variant);
+        TORCH_CHECK((C.sizes() == torch::IntArrayRef{16, 16}), "C must be 16x16 for variant ", variant);
+        run_mfma_16x16x4_f32(A.data_ptr(), B.data_ptr(), C.data_ptr(), stride_a, stride_b, stride_c);
+    } else if (variant == "32x32x8_f16") {
         TORCH_CHECK((A.sizes() == torch::IntArrayRef{32, 8}),  "A must be 32x8 for variant ", variant);
         TORCH_CHECK((B.sizes() == torch::IntArrayRef{32, 8}),  "B must be 32x8 for variant ", variant);
         TORCH_CHECK((C.sizes() == torch::IntArrayRef{32, 32}), "C must be 32x32 for variant ", variant);
