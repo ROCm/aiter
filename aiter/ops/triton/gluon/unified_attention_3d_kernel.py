@@ -6,17 +6,17 @@ import triton.language as tl
 import torch
 from aiter.ops.triton.utils.types import e4m3_dtype
 from triton.experimental import gluon
-import triton.experimental.gluon.language as ttgl
+import triton.experimental.gluon.language as gl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 # from triton._C.libtriton.gluon_ir import make_cga_layout
 
 DEVICE_ARCH = arch_info.get_arch()
-MMA_operation: ttgl.constexpr = (
-    ttgl.amd.gfx1250.wmma
-    if ttgl.constexpr(DEVICE_ARCH in ("gfx1250",))
-    else ttgl.amd.cdna4.mfma
+MMA_operation: gl.constexpr = (
+    gl.amd.gfx1250.wmma
+    if gl.constexpr(DEVICE_ARCH in ("gfx1250",))
+    else gl.amd.cdna4.mfma
 )
 
 float8_info = torch.finfo(e4m3_dtype)
@@ -46,14 +46,14 @@ def _find_seq_idx(
     query_start_len_ptr,
     target_idx,
     num_seqs,
-    BLOCK_Q: ttgl.constexpr,
-    use_q_block_mode: ttgl.constexpr,
+    BLOCK_Q: gl.constexpr,
+    use_q_block_mode: gl.constexpr,
 ):
-    left: ttgl.int32 = 0
+    left: gl.int32 = 0
     right = num_seqs
     while left < right:
         mid = (left + right) // 2
-        val = ttgl.load(query_start_len_ptr + mid)
+        val = gl.load(query_start_len_ptr + mid)
         mid_val = val // BLOCK_Q + mid if use_q_block_mode else val
 
         if mid_val <= target_idx:
@@ -69,14 +69,14 @@ def _get_q_metadata(
     query_start_len_ptr,
     seq_idx,
     q_block_global_idx,
-    BLOCK_Q: ttgl.constexpr,
+    BLOCK_Q: gl.constexpr,
 ):
-    q_block_start_idx = ttgl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
+    q_block_start_idx = gl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
 
     q_block_local_idx = q_block_global_idx - q_block_start_idx
 
-    cur_batch_in_all_start_index = ttgl.load(query_start_len_ptr + seq_idx)
-    cur_batch_in_all_stop_index = ttgl.load(query_start_len_ptr + seq_idx + 1)
+    cur_batch_in_all_start_index = gl.load(query_start_len_ptr + seq_idx)
+    cur_batch_in_all_stop_index = gl.load(query_start_len_ptr + seq_idx + 1)
 
     cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
 
@@ -87,11 +87,11 @@ def _get_q_metadata(
 def _get_seq_metadata(
     seq_lens_ptr,
     seq_idx,
-    TILE_SIZE: ttgl.constexpr,
-    NUM_SEGMENTS_PER_SEQ: ttgl.constexpr,
+    TILE_SIZE: gl.constexpr,
+    NUM_SEGMENTS_PER_SEQ: gl.constexpr,
 ):
     # sequence len for this particular sequence
-    seq_len = ttgl.load(seq_lens_ptr + seq_idx)
+    seq_len = gl.load(seq_lens_ptr + seq_idx)
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
@@ -107,49 +107,47 @@ def _allocate_L_M_acc(
     query_offset_1,
     query_mask_1,
     RCP_LN2,
-    BLOCK_M: ttgl.constexpr,
-    HEAD_SIZE_PADDED: ttgl.constexpr,
-    QK_WMMA_LAYOUT: ttgl.constexpr,
-    PV_WMMA_LAYOUT: ttgl.constexpr,
-    USE_SINKS: ttgl.constexpr,
+    BLOCK_M: gl.constexpr,
+    HEAD_SIZE_PADDED: gl.constexpr,
+    QK_WMMA_LAYOUT: gl.constexpr,
+    PV_WMMA_LAYOUT: gl.constexpr,
+    USE_SINKS: gl.constexpr,
 ):
 
-    # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_LOAD_LAYOUT)
+    # M : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, Q_LOAD_LAYOUT)
     if USE_SINKS:
         if segm_idx == 0:
             # Prescale with RCP_LN2, needed for exp2
             M = (
-                ttgl.amd.cdna4.buffer_load(
+                gl.amd.cdna4.buffer_load(
                     ptr=sink_ptr,
-                    offsets=query_offset_1.to(ttgl.int32),
+                    offsets=query_offset_1.to(gl.int32),
                     mask=query_mask_1,
                     other=float("-inf"),
-                ).to(dtype=ttgl.float32)
+                ).to(dtype=gl.float32)
                 * RCP_LN2
             )
         else:
-            M = ttgl.full(
+            M = gl.full(
                 [BLOCK_M],
                 float("-inf"),
                 dtype=tl.float32,
-                layout=ttgl.SliceLayout(1, QK_WMMA_LAYOUT),
+                layout=gl.SliceLayout(1, QK_WMMA_LAYOUT),
             )
     else:
-        M = ttgl.full(
+        M = gl.full(
             [BLOCK_M],
             float("-inf"),
             dtype=tl.float32,
-            layout=ttgl.SliceLayout(1, QK_WMMA_LAYOUT),
+            layout=gl.SliceLayout(1, QK_WMMA_LAYOUT),
         )
 
-    # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_LOAD_LAYOUT)
-    L = ttgl.full(
-        [BLOCK_M], 1.0, dtype=tl.float32, layout=ttgl.SliceLayout(1, QK_WMMA_LAYOUT)
+    # L : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, Q_LOAD_LAYOUT)
+    L = gl.full(
+        [BLOCK_M], 1.0, dtype=tl.float32, layout=gl.SliceLayout(1, QK_WMMA_LAYOUT)
     )
     # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
-    acc = ttgl.zeros(
-        [BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32, layout=PV_WMMA_LAYOUT
-    )
+    acc = gl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32, layout=PV_WMMA_LAYOUT)
 
     return L, M, acc
 
@@ -171,22 +169,22 @@ def _perform_QK_wmma_and_update_L_M(
     qk_scale,
     softcap,
     RCP_LN2,
-    BLOCK_M: ttgl.constexpr,
-    TILE_SIZE: ttgl.constexpr,
-    USE_SOFTCAP: ttgl.constexpr,
-    SLIDING_WINDOW: ttgl.constexpr,
-    USE_ALIBI_SLOPES: ttgl.constexpr,
-    USE_QQ_BIAS: ttgl.constexpr,
-    Q_LOAD_LAYOUT: ttgl.constexpr,
-    QK_WMMA_LAYOUT: ttgl.constexpr,
-    PV_WMMA_LAYOUT: ttgl.constexpr,
+    BLOCK_M: gl.constexpr,
+    TILE_SIZE: gl.constexpr,
+    USE_SOFTCAP: gl.constexpr,
+    SLIDING_WINDOW: gl.constexpr,
+    USE_ALIBI_SLOPES: gl.constexpr,
+    USE_QQ_BIAS: gl.constexpr,
+    Q_LOAD_LAYOUT: gl.constexpr,
+    QK_WMMA_LAYOUT: gl.constexpr,
+    PV_WMMA_LAYOUT: gl.constexpr,
 ):
     # S : shape = (BLOCK_M, TILE_SIZE), layout = QK_WMMA_LAYOUT
-    S = ttgl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32, layout=QK_WMMA_LAYOUT)
+    S = gl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32, layout=QK_WMMA_LAYOUT)
     # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
     S = qk_scale * MMA_operation(Q, K, S)
     # S : shape = (BLOCK_M, TILE_SIZE), layout = Q_LOAD_LAYOUT
-    # S = ttgl.convert_layout(S, layout=Q_LOAD_LAYOUT)
+    # S = gl.convert_layout(S, layout=Q_LOAD_LAYOUT)
 
     if USE_SOFTCAP:
         # softcap here uses exp2 and consumes RCP_LN2 conversion.
@@ -195,10 +193,10 @@ def _perform_QK_wmma_and_update_L_M(
 
     seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
-    S = ttgl.where(query_mask & seq_mask, S, float("-inf"))
+    S = gl.where(query_mask & seq_mask, S, float("-inf"))
 
     if SLIDING_WINDOW > 0:
-        S = ttgl.where(
+        S = gl.where(
             (context_len + query_pos[:, None] - seq_offset) < SLIDING_WINDOW,
             S,
             float("-inf"),
@@ -213,7 +211,7 @@ def _perform_QK_wmma_and_update_L_M(
         key_rel_pos = seq_offset - context_len  # shape: [BLOCK_SIZE]
         # load bias only for keys that correspond to queries
         is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
-        qq_bias = ttgl.load(
+        qq_bias = gl.load(
             qq_bias_row_ptrs + key_rel_pos[None, :],
             mask=is_query_key[None, :],  # avoid OOB for context keys
             other=0.0,
@@ -222,28 +220,28 @@ def _perform_QK_wmma_and_update_L_M(
         S += qq_bias * RCP_LN2
 
     # compute running maximum
-    # m_j : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_LOAD_LAYOUT)
-    m_j = ttgl.maximum(M, ttgl.max(S, axis=1))
+    # m_j : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, Q_LOAD_LAYOUT)
+    m_j = gl.maximum(M, gl.max(S, axis=1))
 
     # For sliding window there's a chance the max is -inf due to masking of
     # the entire row. In this case we need to set m_j 0 to avoid NaN
-    m_j = ttgl.where(m_j > float("-inf"), m_j, 0.0)
+    m_j = gl.where(m_j > float("-inf"), m_j, 0.0)
 
     # P : shape = (BLOCK_M, TILE_SIZE), layout = Q_LOAD_LAYOUT
-    P = ttgl.exp2(S - m_j[:, None])
+    P = gl.exp2(S - m_j[:, None])
 
-    # l_j : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_LOAD_LAYOUT)
-    l_j = ttgl.sum(P, axis=1)
+    # l_j : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, Q_LOAD_LAYOUT)
+    l_j = gl.sum(P, axis=1)
 
-    # alpha : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_LOAD_LAYOUT)
-    alpha = ttgl.exp2(M - m_j)
+    # alpha : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, Q_LOAD_LAYOUT)
+    alpha = gl.exp2(M - m_j)
 
     # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
-    acc = acc * ttgl.convert_layout(alpha[:, None], layout=PV_WMMA_LAYOUT)
+    acc = acc * gl.convert_layout(alpha[:, None], layout=PV_WMMA_LAYOUT)
 
     # update constants
-    # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_LOAD_LAYOUT)
-    # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_LOAD_LAYOUT)
+    # L : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, Q_LOAD_LAYOUT)
+    # M : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, Q_LOAD_LAYOUT)
     L = L * alpha + l_j
     M = m_j
 
@@ -255,10 +253,10 @@ def _perform_PV_wmma(
     P,
     V,
     acc,
-    P_DOT_LAYOUT: ttgl.constexpr,
+    P_DOT_LAYOUT: gl.constexpr,
 ):
     P = P.to(V.dtype)
-    P = ttgl.convert_layout(P, layout=P_DOT_LAYOUT)
+    P = gl.convert_layout(P, layout=P_DOT_LAYOUT)
     # P : shape = (BLOCK_M, TILE_SIZE), layout = P_DOT_LAYOUT
     # V : shape = (TILE_SIZE, HEAD_SIZE), layout = V_DOT_LAYOUT
     # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
@@ -273,9 +271,9 @@ def _tdm_async_gather_load_to_lds(
     src_row_indices,
     src_col_offset,
     dst,
-    num_stages: ttgl.constexpr,
+    num_stages: gl.constexpr,
 ):
-    ttgl.amd.gfx1250.tdm.async_gather(
+    gl.amd.gfx1250.tdm.async_gather(
         desc=desc,
         src_row_indices=src_row_indices,
         src_col_offset=0,
@@ -291,19 +289,19 @@ def _tdm_gather_request_from_lds(
     kv_scale,
     Q_dtype,
     smem,
-    asycn_wait: ttgl.constexpr,
-    layout: ttgl.constexpr,
-    transpose: ttgl.constexpr,
-    num_ctas: ttgl.constexpr,
-    num_stages: ttgl.constexpr,
-    TILE_SIZE: ttgl.constexpr,
-    HEAD_SIZE_PADDED: ttgl.constexpr,
+    asycn_wait: gl.constexpr,
+    layout: gl.constexpr,
+    transpose: gl.constexpr,
+    num_ctas: gl.constexpr,
+    num_stages: gl.constexpr,
+    TILE_SIZE: gl.constexpr,
+    HEAD_SIZE_PADDED: gl.constexpr,
 ):
     if num_ctas > 1:
-        ttgl.amd.gfx1250.cluster.arrive()
-    ttgl.amd.gfx1250.tdm.async_wait(asycn_wait)
+        gl.amd.gfx1250.cluster.arrive()
+    gl.amd.gfx1250.tdm.async_wait(asycn_wait)
     if num_ctas > 1:
-        ttgl.amd.gfx1250.cluster.wait()
+        gl.amd.gfx1250.cluster.wait()
     if transpose:
         X = (
             smem.index(j % num_stages)
@@ -319,7 +317,7 @@ def _tdm_gather_request_from_lds(
         )
 
     if X.dtype.is_fp8() and not Q_dtype.is_fp8():
-        X = (X.to(ttgl.float32) * ttgl.load(kv_scale)).to(Q_dtype)
+        X = (X.to(gl.float32) * gl.load(kv_scale)).to(Q_dtype)
 
     return j + 1, X
 
@@ -331,11 +329,11 @@ def _tdm_gather_get_kv_offsets(
     kv_head_idx,
     block_tables_sorted_ptr,
     block_table_offset,
-    stride_k_cache_h: ttgl.int64,
-    stride_v_cache_h: ttgl.int64,
-    NUM_BLOCKS_GATHER_PER_TILE: ttgl.constexpr,
+    stride_k_cache_h: gl.int64,
+    stride_v_cache_h: gl.int64,
+    NUM_BLOCKS_GATHER_PER_TILE: gl.constexpr,
 ):
-    physical_block_idx = ttgl.load(
+    physical_block_idx = gl.load(
         block_tables_sorted_ptr
         + block_table_offset
         + j * NUM_BLOCKS_GATHER_PER_TILE
@@ -358,30 +356,30 @@ def _tdm_gather_create_tensor_descriptors_and_allocate_lds(
     k_ptr,
     v_ptr,
     NUM_BLOCKS,
-    stride_q_m: ttgl.int64,  # int
-    stride_q_d: ttgl.constexpr,  # int
-    stride_k_t: ttgl.int64,  # int
-    stride_k_d: ttgl.constexpr,  # int
-    stride_v_t: ttgl.int64,  # int
-    stride_v_d: ttgl.constexpr,  # int
-    q_shared_layout: ttgl.constexpr,
-    k_shared_layout: ttgl.constexpr,
-    v_shared_layout: ttgl.constexpr,
-    NUM_KV_HEADS: ttgl.constexpr,
-    BLOCK_M: ttgl.constexpr,
-    HEAD_SIZE: ttgl.constexpr,
-    BLOCK_SIZE: ttgl.constexpr,
-    TILE_SIZE: ttgl.constexpr,
-    HEAD_SIZE_PADDED: ttgl.constexpr,
-    NUM_BLOCKS_GATHER_PER_TILE: ttgl.constexpr,
-    num_stages: ttgl.constexpr,
+    stride_q_m: gl.int64,  # int
+    stride_q_d: gl.constexpr,  # int
+    stride_k_t: gl.int64,  # int
+    stride_k_d: gl.constexpr,  # int
+    stride_v_t: gl.int64,  # int
+    stride_v_d: gl.constexpr,  # int
+    q_shared_layout: gl.constexpr,
+    k_shared_layout: gl.constexpr,
+    v_shared_layout: gl.constexpr,
+    NUM_KV_HEADS: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    HEAD_SIZE: gl.constexpr,
+    BLOCK_SIZE: gl.constexpr,
+    TILE_SIZE: gl.constexpr,
+    HEAD_SIZE_PADDED: gl.constexpr,
+    NUM_BLOCKS_GATHER_PER_TILE: gl.constexpr,
+    num_stages: gl.constexpr,
 ):
-    ttgl.static_assert(stride_k_d == 1, "stride_k_d must be 1")
-    ttgl.static_assert(stride_v_d == 1, "stride_v_d must be 1")
-    # ttgl.static_assert(stride_k_t == BLOCK_SIZE * HEAD_SIZE, "stride_k_t must be BLOCK_SIZE * HEAD_SIZE")
-    # ttgl.static_assert(stride_v_t == BLOCK_SIZE * HEAD_SIZE, "stride_v_t must be BLOCK_SIZE * HEAD_SIZE")
+    gl.static_assert(stride_k_d == 1, "stride_k_d must be 1")
+    gl.static_assert(stride_v_d == 1, "stride_v_d must be 1")
+    # gl.static_assert(stride_k_t == BLOCK_SIZE * HEAD_SIZE, "stride_k_t must be BLOCK_SIZE * HEAD_SIZE")
+    # gl.static_assert(stride_v_t == BLOCK_SIZE * HEAD_SIZE, "stride_v_t must be BLOCK_SIZE * HEAD_SIZE")
 
-    k_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
+    k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=k_ptr,
         shape=(NUM_BLOCKS * NUM_KV_HEADS, BLOCK_SIZE * HEAD_SIZE),
         strides=(stride_k_t, stride_k_d),
@@ -389,7 +387,7 @@ def _tdm_gather_create_tensor_descriptors_and_allocate_lds(
         layout=k_shared_layout,
     )
 
-    v_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
+    v_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=v_ptr,
         shape=(NUM_BLOCKS * NUM_KV_HEADS, BLOCK_SIZE * HEAD_SIZE),
         strides=(stride_v_t, stride_v_d),
@@ -397,17 +395,17 @@ def _tdm_gather_create_tensor_descriptors_and_allocate_lds(
         layout=v_shared_layout,
     )
 
-    smem_Q = ttgl.allocate_shared_memory(
+    smem_Q = gl.allocate_shared_memory(
         q_ptr.type.element_ty,
         shape=[BLOCK_M, HEAD_SIZE_PADDED],
         layout=q_shared_layout,
     )
-    smem_K = ttgl.allocate_shared_memory(
+    smem_K = gl.allocate_shared_memory(
         k_desc.dtype,
         shape=[num_stages] + k_desc.block_shape,
         layout=k_desc.layout,
     )
-    smem_V = ttgl.allocate_shared_memory(
+    smem_V = gl.allocate_shared_memory(
         v_desc.dtype,
         shape=[num_stages] + v_desc.block_shape,
         layout=v_desc.layout,
@@ -452,65 +450,65 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
     softcap,  # float32
     num_tokens,  # int
     NUM_BLOCKS,  # int
-    num_query_heads: ttgl.constexpr,  # int
-    num_queries_per_kv: ttgl.constexpr,  # int
-    block_table_stride: ttgl.int64,  # int
-    # block_table_sorted_indices_stride: ttgl.int64,  # int
-    query_stride_0: ttgl.int64,  # int
-    query_stride_1: ttgl.int64,  # int, should be equal to head_size
-    qq_bias_stride_0: ttgl.int64,  # int
-    BLOCK_SIZE: ttgl.constexpr,  # int
-    TILE_SIZE: ttgl.constexpr,  # int, must be power of 2
-    HEAD_SIZE: ttgl.constexpr,  # int
-    HEAD_SIZE_PADDED: ttgl.constexpr,  # int, must be power of 2
-    USE_ALIBI_SLOPES: ttgl.constexpr,  # bool
-    USE_QQ_BIAS: ttgl.constexpr,  # bool
-    USE_SOFTCAP: ttgl.constexpr,  # bool
-    USE_SINKS: ttgl.constexpr,  # bool
-    SLIDING_WINDOW: ttgl.constexpr,  # int
-    stride_k_cache_0: ttgl.int64,  # int
-    stride_k_cache_1: ttgl.int64,  # int
-    stride_k_cache_2: ttgl.int64,  # int
-    stride_k_cache_3: ttgl.constexpr,  # int
-    stride_v_cache_0: ttgl.int64,  # int
-    stride_v_cache_1: ttgl.int64,  # int
-    stride_v_cache_2: ttgl.int64,  # int
-    stride_v_cache_3: ttgl.constexpr,  # int
+    num_query_heads: gl.constexpr,  # int
+    num_queries_per_kv: gl.constexpr,  # int
+    block_table_stride: gl.int64,  # int
+    # block_table_sorted_indices_stride: gl.int64,  # int
+    query_stride_0: gl.int64,  # int
+    query_stride_1: gl.int64,  # int, should be equal to head_size
+    qq_bias_stride_0: gl.int64,  # int
+    BLOCK_SIZE: gl.constexpr,  # int
+    TILE_SIZE: gl.constexpr,  # int, must be power of 2
+    HEAD_SIZE: gl.constexpr,  # int
+    HEAD_SIZE_PADDED: gl.constexpr,  # int, must be power of 2
+    USE_ALIBI_SLOPES: gl.constexpr,  # bool
+    USE_QQ_BIAS: gl.constexpr,  # bool
+    USE_SOFTCAP: gl.constexpr,  # bool
+    USE_SINKS: gl.constexpr,  # bool
+    SLIDING_WINDOW: gl.constexpr,  # int
+    stride_k_cache_0: gl.int64,  # int
+    stride_k_cache_1: gl.int64,  # int
+    stride_k_cache_2: gl.int64,  # int
+    stride_k_cache_3: gl.constexpr,  # int
+    stride_v_cache_0: gl.int64,  # int
+    stride_v_cache_1: gl.int64,  # int
+    stride_v_cache_2: gl.int64,  # int
+    stride_v_cache_3: gl.constexpr,  # int
     query_start_len_ptr,  # [num_seqs+1]
-    BLOCK_Q: ttgl.constexpr,  # int
-    num_seqs: ttgl.int32,
-    BLOCK_M: ttgl.constexpr,  # int
-    NUM_SEGMENTS_PER_SEQ: ttgl.constexpr,  # int
-    num_warps: ttgl.constexpr,  # int
-    num_stages: ttgl.constexpr,  # int
-    QK_WMMA_LAYOUT: ttgl.constexpr,
-    PV_WMMA_LAYOUT: ttgl.constexpr,
-    Q_DOT_LAYOUT: ttgl.constexpr,
-    K_DOT_LAYOUT: ttgl.constexpr,
-    P_DOT_LAYOUT: ttgl.constexpr,
-    V_DOT_LAYOUT: ttgl.constexpr,
-    Q_SHARED_LAYOUT: ttgl.constexpr,
-    K_SHARED_LAYOUT: ttgl.constexpr,
-    V_SHARED_LAYOUT: ttgl.constexpr,
-    Q_LOAD_LAYOUT: ttgl.constexpr,
-    K_LOAD_LAYOUT: ttgl.constexpr,
-    V_LOAD_LAYOUT: ttgl.constexpr,
-    num_ctas: ttgl.constexpr = 1,  # int
-    ALL_DECODE: ttgl.constexpr = False,  # bool
-    SHUFFLED_KV_CACHE: ttgl.constexpr = False,  # bool
+    BLOCK_Q: gl.constexpr,  # int
+    num_seqs: gl.int32,
+    BLOCK_M: gl.constexpr,  # int
+    NUM_SEGMENTS_PER_SEQ: gl.constexpr,  # int
+    num_warps: gl.constexpr,  # int
+    num_stages: gl.constexpr,  # int
+    QK_WMMA_LAYOUT: gl.constexpr,
+    PV_WMMA_LAYOUT: gl.constexpr,
+    Q_DOT_LAYOUT: gl.constexpr,
+    K_DOT_LAYOUT: gl.constexpr,
+    P_DOT_LAYOUT: gl.constexpr,
+    V_DOT_LAYOUT: gl.constexpr,
+    Q_SHARED_LAYOUT: gl.constexpr,
+    K_SHARED_LAYOUT: gl.constexpr,
+    V_SHARED_LAYOUT: gl.constexpr,
+    Q_LOAD_LAYOUT: gl.constexpr,
+    K_LOAD_LAYOUT: gl.constexpr,
+    V_LOAD_LAYOUT: gl.constexpr,
+    num_ctas: gl.constexpr = 1,  # int
+    ALL_DECODE: gl.constexpr = False,  # bool
+    SHUFFLED_KV_CACHE: gl.constexpr = False,  # bool
 ):
-    q_block_global_idx = ttgl.program_id(0)
-    kv_head_idx = ttgl.program_id(1)
-    segm_idx = ttgl.program_id(2)
-    # num_ctas: ttgl.constexpr = ttgl.num_ctas()
+    q_block_global_idx = gl.program_id(0)
+    kv_head_idx = gl.program_id(1)
+    segm_idx = gl.program_id(2)
+    # num_ctas: gl.constexpr = gl.num_ctas()
     pred = 1
-    pred_i32 = pred.to(ttgl.int32) if hasattr(pred, "to") else pred
+    pred_i32 = pred.to(gl.int32) if hasattr(pred, "to") else pred
 
-    ttgl.static_assert(
+    gl.static_assert(
         TILE_SIZE % BLOCK_SIZE == 0, "TILE_SIZE must be multiple of BLOCK_SIZE"
     )
-    NUM_BLOCKS_GATHER_PER_TILE: ttgl.constexpr = TILE_SIZE // BLOCK_SIZE
-    ttgl.static_assert(
+    NUM_BLOCKS_GATHER_PER_TILE: gl.constexpr = TILE_SIZE // BLOCK_SIZE
+    gl.static_assert(
         NUM_BLOCKS_GATHER_PER_TILE == 4 or NUM_BLOCKS_GATHER_PER_TILE == 8,
         "NUM_BLOCKS_GATHER_PER_TILE must be 4 or 8",
     )
@@ -551,10 +549,8 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
     # context length for this particular sequence
     context_len = seq_len - cur_batch_query_len
 
-    offs_q_m = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, Q_LOAD_LAYOUT))
-    offs_q_d = ttgl.arange(
-        0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(0, Q_LOAD_LAYOUT)
-    )
+    offs_q_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, Q_LOAD_LAYOUT))
+    offs_q_d = gl.arange(0, HEAD_SIZE_PADDED, layout=gl.SliceLayout(0, Q_LOAD_LAYOUT))
 
     query_pos = q_block_local_idx * BLOCK_Q + offs_q_m // num_queries_per_kv
 
@@ -569,12 +565,12 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
     if HEAD_SIZE_PADDED != HEAD_SIZE:
         dim_mask = offs_q_d < HEAD_SIZE
     else:
-        dim_mask = ttgl.full((1,), 1, dtype=tl.int1)
+        dim_mask = gl.full((1,), 1, dtype=tl.int1)
 
     query_mask_0 = query_pos < cur_batch_query_len
     query_mask_1 = query_offset_1 < num_query_heads
 
-    NUM_KV_HEADS: ttgl.constexpr = num_query_heads // num_queries_per_kv
+    NUM_KV_HEADS: gl.constexpr = num_query_heads // num_queries_per_kv
 
     k_desc, v_desc, smem_Q, smem_K, smem_V = (
         _tdm_gather_create_tensor_descriptors_and_allocate_lds(
@@ -603,9 +599,9 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
     )
 
     # Q_load : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = Q_LOAD_LAYOUT
-    Q_load = ttgl.amd.cdna4.buffer_load(
+    Q_load = gl.amd.cdna4.buffer_load(
         ptr=query_ptr,
-        offsets=query_offset.to(ttgl.int32),
+        offsets=query_offset.to(gl.int32),
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
     )
@@ -613,7 +609,7 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
     # Q : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = Q_DOT_LAYOUT
     Q = smem_Q.load(layout=Q_DOT_LAYOUT)
 
-    offs_q_m_qk = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, QK_WMMA_LAYOUT))
+    offs_q_m_qk = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, QK_WMMA_LAYOUT))
     query_pos_qk = q_block_local_idx * BLOCK_Q + offs_q_m_qk // num_queries_per_kv
     query_offset_1_qk = (
         kv_head_idx * num_queries_per_kv + offs_q_m_qk % num_queries_per_kv
@@ -660,35 +656,35 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
 
     # adjust for potential padding in the last q_block by considering the
     # actual sequence length
-    max_seq_prefix_len = ttgl.minimum(max_seq_prefix_len, seq_len)
+    max_seq_prefix_len = gl.minimum(max_seq_prefix_len, seq_len)
 
     # calculate the number of tiles that need to be processed to
     # cover the longest sequence prefix (due to causal masking, tiles beyond
     # this prefix can be skipped)
     num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
-    # KV_cache_modifier: ttgl.constexpr = ".cg" if ALL_DECODE else ""
+    # KV_cache_modifier: gl.constexpr = ".cg" if ALL_DECODE else ""
 
-    k_producer = 0
-    k_consumer = 0
-    v_producer = 0
-    v_consumer = 0
-    GATHER_LOAD_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
+    k_from_hbm = 0
+    k_from_lds = 0
+    v_from_hbm = 0
+    v_from_lds = 0
+    GATHER_LOAD_LAYOUT: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[NUM_BLOCKS_GATHER_PER_TILE],
         threads_per_warp=[32],
         warps_per_cta=[num_warps],
         order=[0],
     )
-    offs_j = ttgl.arange(0, NUM_BLOCKS_GATHER_PER_TILE, layout=GATHER_LOAD_LAYOUT)
-    j_producer = segm_idx * tiles_per_segment
-    j_consumer = segm_idx * tiles_per_segment
-    seq_offset = j_consumer * TILE_SIZE + ttgl.arange(
-        0, TILE_SIZE, layout=ttgl.SliceLayout(0, QK_WMMA_LAYOUT)
+    offs_j = gl.arange(0, NUM_BLOCKS_GATHER_PER_TILE, layout=GATHER_LOAD_LAYOUT)
+    j_from_hbm = segm_idx * tiles_per_segment
+    j_from_lds = segm_idx * tiles_per_segment
+    seq_offset = j_from_lds * TILE_SIZE + gl.arange(
+        0, TILE_SIZE, layout=gl.SliceLayout(0, QK_WMMA_LAYOUT)
     )
 
     for _ in range(num_stages - 1):
-        j_producer, offs_k_gather_idx, offs_v_gather_idx = _tdm_gather_get_kv_offsets(
-            j_producer,
+        j_from_hbm, offs_k_gather_idx, offs_v_gather_idx = _tdm_gather_get_kv_offsets(
+            j_from_hbm,
             offs_j,
             kv_head_idx,
             block_tables_ptr,
@@ -697,16 +693,16 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
             stride_v_cache_0 // stride_v_cache_1,  # = NUM_KV_HEADS
             NUM_BLOCKS_GATHER_PER_TILE,
         )
-        k_producer = _tdm_async_gather_load_to_lds(
-            k_producer,
+        k_from_hbm = _tdm_async_gather_load_to_lds(
+            k_from_hbm,
             desc=k_desc,
             src_row_indices=offs_k_gather_idx,
             src_col_offset=0,
             dst=smem_K,
             num_stages=num_stages,
         )
-        v_producer = _tdm_async_gather_load_to_lds(
-            v_producer,
+        v_from_hbm = _tdm_async_gather_load_to_lds(
+            v_from_hbm,
             desc=v_desc,
             src_row_indices=offs_v_gather_idx,
             src_col_offset=0,
@@ -720,8 +716,8 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
         segm_idx * tiles_per_segment,
         min((segm_idx + 1) * tiles_per_segment, num_tiles) - (num_stages - 1),
     ):
-        j_producer, offs_k_gather_idx, offs_v_gather_idx = _tdm_gather_get_kv_offsets(
-            j_producer,
+        j_from_hbm, offs_k_gather_idx, offs_v_gather_idx = _tdm_gather_get_kv_offsets(
+            j_from_hbm,
             offs_j,
             kv_head_idx,
             block_tables_ptr,
@@ -730,16 +726,16 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
             stride_v_cache_0 // stride_v_cache_1,  # = NUM_KV_HEADS
             NUM_BLOCKS_GATHER_PER_TILE,
         )
-        k_producer = _tdm_async_gather_load_to_lds(
-            k_producer,
+        k_from_hbm = _tdm_async_gather_load_to_lds(
+            k_from_hbm,
             desc=k_desc,
             src_row_indices=offs_k_gather_idx,
             src_col_offset=0,
             dst=smem_K,
             num_stages=num_stages,
         )
-        v_producer = _tdm_async_gather_load_to_lds(
-            v_producer,
+        v_from_hbm = _tdm_async_gather_load_to_lds(
+            v_from_hbm,
             desc=v_desc,
             src_row_indices=offs_v_gather_idx,
             src_col_offset=0,
@@ -748,8 +744,8 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
         )
 
         # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
-        k_consumer, K = _tdm_gather_request_from_lds(
-            k_consumer,
+        k_from_lds, K = _tdm_gather_request_from_lds(
+            k_from_lds,
             k_scale,
             Q.dtype,
             smem_K,
@@ -763,8 +759,8 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
         )
 
         # P : shape = (BLOCK_M, TILE_SIZE), layout = Q_LOAD_LAYOUT
-        # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_LOAD_LAYOUT)
-        # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_LOAD_LAYOUT)
+        # L : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, Q_LOAD_LAYOUT)
+        # M : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, Q_LOAD_LAYOUT)
         # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
         P, L, M, acc = _perform_QK_wmma_and_update_L_M(
             Q,
@@ -794,8 +790,8 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
         )
 
         # V : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = V_DOT_LAYOUT
-        v_consumer, V = _tdm_gather_request_from_lds(
-            v_consumer,
+        v_from_lds, V = _tdm_gather_request_from_lds(
+            v_from_lds,
             v_scale,
             Q.dtype,
             smem_V,
@@ -811,13 +807,13 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
         # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
         acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
 
-        j_consumer = j_consumer + 1
+        j_from_lds = j_from_lds + 1
         seq_offset += TILE_SIZE
 
     for _ in range(num_stages - 1):
         # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
-        k_consumer, K = _tdm_gather_request_from_lds(
-            k_consumer,
+        k_from_lds, K = _tdm_gather_request_from_lds(
+            k_from_lds,
             k_scale,
             Q.dtype,
             smem_K,
@@ -831,8 +827,8 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
         )
 
         # P : shape = (BLOCK_M, TILE_SIZE), layout = Q_LOAD_LAYOUT
-        # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_LOAD_LAYOUT)
-        # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_LOAD_LAYOUT)
+        # L : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, Q_LOAD_LAYOUT)
+        # M : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, Q_LOAD_LAYOUT)
         # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
         P, L, M, acc = _perform_QK_wmma_and_update_L_M(
             Q,
@@ -862,8 +858,8 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
         )
 
         # V : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = V_DOT_LAYOUT
-        v_consumer, V = _tdm_gather_request_from_lds(
-            v_consumer,
+        v_from_lds, V = _tdm_gather_request_from_lds(
+            v_from_lds,
             v_scale,
             Q.dtype,
             smem_V,
@@ -879,12 +875,12 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
         # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
         acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
 
-        j_consumer = j_consumer + 1
+        j_from_lds = j_from_lds + 1
         seq_offset += TILE_SIZE
 
     # store segm_output
     # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = Q_LOAD_LAYOUT
-    acc = ttgl.convert_layout(acc, layout=Q_LOAD_LAYOUT)
+    acc = gl.convert_layout(acc, layout=Q_LOAD_LAYOUT)
     segm_output_offset = (
         query_offset_0[:, None]
         * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
@@ -892,7 +888,7 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
         + segm_idx * HEAD_SIZE_PADDED
         + offs_q_d[None, :]
     )
-    ttgl.amd.cdna4.buffer_store(
+    gl.amd.cdna4.buffer_store(
         stored_value=acc,
         ptr=segm_output_ptr,
         offsets=segm_output_offset,
@@ -900,22 +896,22 @@ def gluon_kernel_unified_attention_3d_tdm_gather(
     )
 
     # store segm_max and segm_expsum
-    # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, QK_WMMA_LAYOUT)
-    # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, QK_WMMA_LAYOUT)
+    # L : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, QK_WMMA_LAYOUT)
+    # M : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, QK_WMMA_LAYOUT)
     segm_offset = (
         query_offset_0 * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
         + query_offset_1 * NUM_SEGMENTS_PER_SEQ
         + segm_idx
     )
-    L = ttgl.convert_layout(L, layout=ttgl.SliceLayout(1, Q_LOAD_LAYOUT))
-    M = ttgl.convert_layout(M, layout=ttgl.SliceLayout(1, Q_LOAD_LAYOUT))
-    ttgl.amd.cdna4.buffer_store(
+    L = gl.convert_layout(L, layout=gl.SliceLayout(1, Q_LOAD_LAYOUT))
+    M = gl.convert_layout(M, layout=gl.SliceLayout(1, Q_LOAD_LAYOUT))
+    gl.amd.cdna4.buffer_store(
         stored_value=M,
         ptr=segm_max_ptr,
         offsets=segm_offset,
         mask=query_mask_0 & query_mask_1,
     )
-    ttgl.amd.cdna4.buffer_store(
+    gl.amd.cdna4.buffer_store(
         stored_value=L,
         ptr=segm_expsum_ptr,
         offsets=segm_offset,
@@ -929,12 +925,12 @@ def _tdm_get_kv_offsets(
     kv_head_idx,
     block_tables_ptr,
     block_table_offset,
-    stride_k_cache_t: ttgl.int64,
-    stride_k_cache_d: ttgl.int64,
-    stride_v_cache_t: ttgl.int64,
-    stride_v_cache_d: ttgl.int64,
+    stride_k_cache_t: gl.int64,
+    stride_k_cache_d: gl.int64,
+    stride_v_cache_t: gl.int64,
+    stride_v_cache_d: gl.int64,
 ):
-    physical_block_idx = ttgl.load(block_tables_ptr + block_table_offset + j)
+    physical_block_idx = gl.load(block_tables_ptr + block_table_offset + j)
 
     offs_k_t = (physical_block_idx * stride_k_cache_t).to(tl.int32)
     offs_k_d = (kv_head_idx * stride_k_cache_d).to(tl.int32)
@@ -952,17 +948,17 @@ def _tdm_async_load_to_lds(
     offsets,
     dest,
     pred_i32,
-    num_stages: ttgl.constexpr,
+    num_stages: gl.constexpr,
 ):
-    # ttgl.amd.gfx1250.tdm.prefetch(
+    # gl.amd.gfx1250.tdm.prefetch(
     #     src=k_desc,
     #     offsets=[
     #         0,
     #         offs_kv_t_starts,
     #     ],
-    #     pred=pred.to(ttgl.int1)
+    #     pred=pred.to(gl.int1)
     # )
-    ttgl.amd.gfx1250.tdm.async_load(
+    gl.amd.gfx1250.tdm.async_load(
         src=src,
         offsets=offsets,
         dest=dest.index(j % num_stages),
@@ -978,24 +974,24 @@ def _tdm_request_from_lds(
     kv_scale,
     Q_dtype,
     smem,
-    asycn_wait: ttgl.constexpr,
-    layout: ttgl.constexpr,
-    transpose: ttgl.constexpr,
-    num_ctas: ttgl.constexpr,
-    num_stages: ttgl.constexpr,
+    asycn_wait: gl.constexpr,
+    layout: gl.constexpr,
+    transpose: gl.constexpr,
+    num_ctas: gl.constexpr,
+    num_stages: gl.constexpr,
 ):
     if num_ctas > 1:
-        ttgl.amd.gfx1250.cluster.arrive()
-    ttgl.amd.gfx1250.tdm.async_wait(asycn_wait)
+        gl.amd.gfx1250.cluster.arrive()
+    gl.amd.gfx1250.tdm.async_wait(asycn_wait)
     if num_ctas > 1:
-        ttgl.amd.gfx1250.cluster.wait()
+        gl.amd.gfx1250.cluster.wait()
     if transpose:
         X = smem.index(j % num_stages).permute([1, 0]).load(layout=layout)
     else:
         X = smem.index(j % num_stages).load(layout=layout)
 
     if X.dtype.is_fp8() and not Q_dtype.is_fp8():
-        X = (X.to(ttgl.float32) * ttgl.load(kv_scale)).to(Q_dtype)
+        X = (X.to(gl.float32) * gl.load(kv_scale)).to(Q_dtype)
 
     return j + 1, X
 
@@ -1006,26 +1002,26 @@ def _tdm_create_tensor_descriptors_and_allocate_lds(
     k_ptr,
     v_ptr,
     NUM_BLOCKS,
-    stride_q_m: ttgl.int64,  # int
-    stride_q_d: ttgl.constexpr,  # int
-    stride_k_t: ttgl.int64,  # int
-    stride_k_d: ttgl.constexpr,  # int
-    stride_v_t: ttgl.int64,  # int
-    stride_v_d: ttgl.constexpr,  # int
-    q_shared_layout: ttgl.constexpr,
-    k_shared_layout: ttgl.constexpr,
-    v_shared_layout: ttgl.constexpr,
-    NUM_KV_HEADS: ttgl.constexpr,
-    BLOCK_M: ttgl.constexpr,
-    HEAD_SIZE: ttgl.constexpr,
-    TILE_SIZE: ttgl.constexpr,
-    HEAD_SIZE_PADDED: ttgl.constexpr,
-    num_stages: ttgl.constexpr,
+    stride_q_m: gl.int64,  # int
+    stride_q_d: gl.constexpr,  # int
+    stride_k_t: gl.int64,  # int
+    stride_k_d: gl.constexpr,  # int
+    stride_v_t: gl.int64,  # int
+    stride_v_d: gl.constexpr,  # int
+    q_shared_layout: gl.constexpr,
+    k_shared_layout: gl.constexpr,
+    v_shared_layout: gl.constexpr,
+    NUM_KV_HEADS: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    HEAD_SIZE: gl.constexpr,
+    TILE_SIZE: gl.constexpr,
+    HEAD_SIZE_PADDED: gl.constexpr,
+    num_stages: gl.constexpr,
 ):
-    ttgl.static_assert(stride_q_d == 1, "stride_q_d must be 1")
-    ttgl.static_assert(stride_k_d == 1, "stride_k_d must be 1")
-    ttgl.static_assert(stride_v_d == 1, "stride_v_d must be 1")
-    # q_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
+    gl.static_assert(stride_q_d == 1, "stride_q_d must be 1")
+    gl.static_assert(stride_k_d == 1, "stride_k_d must be 1")
+    gl.static_assert(stride_v_d == 1, "stride_v_d must be 1")
+    # q_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
     #     base=q_ptr,
     #     shape=(M, HEAD_SIZE),
     #     strides=(stride_q_m, stride_q_d),
@@ -1033,7 +1029,7 @@ def _tdm_create_tensor_descriptors_and_allocate_lds(
     #     layout=q_shared_layout,
     # )
 
-    k_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
+    k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=k_ptr,
         shape=(NUM_BLOCKS * TILE_SIZE, NUM_KV_HEADS * HEAD_SIZE),
         strides=(stride_k_t, stride_k_d),
@@ -1041,7 +1037,7 @@ def _tdm_create_tensor_descriptors_and_allocate_lds(
         layout=k_shared_layout,
     )
 
-    v_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
+    v_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=v_ptr,
         shape=(NUM_BLOCKS * TILE_SIZE, NUM_KV_HEADS * HEAD_SIZE),
         strides=(stride_v_t, stride_v_d),
@@ -1049,22 +1045,22 @@ def _tdm_create_tensor_descriptors_and_allocate_lds(
         layout=v_shared_layout,
     )
 
-    # smem_Q = ttgl.allocate_shared_memory(
+    # smem_Q = gl.allocate_shared_memory(
     #     q_desc.dtype,
     #     shape=q_desc.block_shape,
     #     layout=q_shared_layout,
     # )
-    smem_Q = ttgl.allocate_shared_memory(
+    smem_Q = gl.allocate_shared_memory(
         q_ptr.type.element_ty,
         shape=[BLOCK_M, HEAD_SIZE_PADDED],
         layout=q_shared_layout,
     )
-    smem_K = ttgl.allocate_shared_memory(
+    smem_K = gl.allocate_shared_memory(
         k_desc.dtype,
         shape=[num_stages] + k_desc.block_shape,
         layout=k_desc.layout,
     )
-    smem_V = ttgl.allocate_shared_memory(
+    smem_V = gl.allocate_shared_memory(
         v_desc.dtype,
         shape=[num_stages] + v_desc.block_shape,
         layout=v_desc.layout,
@@ -1108,60 +1104,60 @@ def gluon_kernel_unified_attention_3d_tdm(
     softcap,  # float32
     num_tokens,  # int
     NUM_BLOCKS,  # int
-    num_query_heads: ttgl.constexpr,  # int
-    num_queries_per_kv: ttgl.constexpr,  # int
-    block_table_stride: ttgl.int64,  # int
-    query_stride_0: ttgl.int64,  # int
-    query_stride_1: ttgl.int64,  # int, should be equal to head_size
-    qq_bias_stride_0: ttgl.int64,  # int
-    BLOCK_SIZE: ttgl.constexpr,  # int
-    TILE_SIZE: ttgl.constexpr,  # int, must be power of 2
-    HEAD_SIZE: ttgl.constexpr,  # int
-    HEAD_SIZE_PADDED: ttgl.constexpr,  # int, must be power of 2
-    USE_ALIBI_SLOPES: ttgl.constexpr,  # bool
-    USE_QQ_BIAS: ttgl.constexpr,  # bool
-    USE_SOFTCAP: ttgl.constexpr,  # bool
-    USE_SINKS: ttgl.constexpr,  # bool
-    SLIDING_WINDOW: ttgl.constexpr,  # int
-    stride_k_cache_0: ttgl.int64,  # int
-    stride_k_cache_1: ttgl.int64,  # int
-    stride_k_cache_2: ttgl.int64,  # int
-    stride_k_cache_3: ttgl.constexpr,  # int
-    stride_v_cache_0: ttgl.int64,  # int
-    stride_v_cache_1: ttgl.int64,  # int
-    stride_v_cache_2: ttgl.int64,  # int
-    stride_v_cache_3: ttgl.constexpr,  # int
+    num_query_heads: gl.constexpr,  # int
+    num_queries_per_kv: gl.constexpr,  # int
+    block_table_stride: gl.int64,  # int
+    query_stride_0: gl.int64,  # int
+    query_stride_1: gl.int64,  # int, should be equal to head_size
+    qq_bias_stride_0: gl.int64,  # int
+    BLOCK_SIZE: gl.constexpr,  # int
+    TILE_SIZE: gl.constexpr,  # int, must be power of 2
+    HEAD_SIZE: gl.constexpr,  # int
+    HEAD_SIZE_PADDED: gl.constexpr,  # int, must be power of 2
+    USE_ALIBI_SLOPES: gl.constexpr,  # bool
+    USE_QQ_BIAS: gl.constexpr,  # bool
+    USE_SOFTCAP: gl.constexpr,  # bool
+    USE_SINKS: gl.constexpr,  # bool
+    SLIDING_WINDOW: gl.constexpr,  # int
+    stride_k_cache_0: gl.int64,  # int
+    stride_k_cache_1: gl.int64,  # int
+    stride_k_cache_2: gl.int64,  # int
+    stride_k_cache_3: gl.constexpr,  # int
+    stride_v_cache_0: gl.int64,  # int
+    stride_v_cache_1: gl.int64,  # int
+    stride_v_cache_2: gl.int64,  # int
+    stride_v_cache_3: gl.constexpr,  # int
     query_start_len_ptr,  # [num_seqs+1]
-    BLOCK_Q: ttgl.constexpr,  # int
-    num_seqs: ttgl.int32,
-    BLOCK_M: ttgl.constexpr,  # int
-    NUM_SEGMENTS_PER_SEQ: ttgl.constexpr,  # int
-    num_warps: ttgl.constexpr,  # int
-    num_stages: ttgl.constexpr,  # int
-    QK_WMMA_LAYOUT: ttgl.constexpr,
-    PV_WMMA_LAYOUT: ttgl.constexpr,
-    Q_DOT_LAYOUT: ttgl.constexpr,
-    K_DOT_LAYOUT: ttgl.constexpr,
-    P_DOT_LAYOUT: ttgl.constexpr,
-    V_DOT_LAYOUT: ttgl.constexpr,
-    Q_SHARED_LAYOUT: ttgl.constexpr,
-    K_SHARED_LAYOUT: ttgl.constexpr,
-    V_SHARED_LAYOUT: ttgl.constexpr,
-    Q_LOAD_LAYOUT: ttgl.constexpr,
-    K_LOAD_LAYOUT: ttgl.constexpr,
-    V_LOAD_LAYOUT: ttgl.constexpr,
-    num_ctas: ttgl.constexpr = 1,  # int
-    ALL_DECODE: ttgl.constexpr = False,  # bool
-    SHUFFLED_KV_CACHE: ttgl.constexpr = False,  # bool
+    BLOCK_Q: gl.constexpr,  # int
+    num_seqs: gl.int32,
+    BLOCK_M: gl.constexpr,  # int
+    NUM_SEGMENTS_PER_SEQ: gl.constexpr,  # int
+    num_warps: gl.constexpr,  # int
+    num_stages: gl.constexpr,  # int
+    QK_WMMA_LAYOUT: gl.constexpr,
+    PV_WMMA_LAYOUT: gl.constexpr,
+    Q_DOT_LAYOUT: gl.constexpr,
+    K_DOT_LAYOUT: gl.constexpr,
+    P_DOT_LAYOUT: gl.constexpr,
+    V_DOT_LAYOUT: gl.constexpr,
+    Q_SHARED_LAYOUT: gl.constexpr,
+    K_SHARED_LAYOUT: gl.constexpr,
+    V_SHARED_LAYOUT: gl.constexpr,
+    Q_LOAD_LAYOUT: gl.constexpr,
+    K_LOAD_LAYOUT: gl.constexpr,
+    V_LOAD_LAYOUT: gl.constexpr,
+    num_ctas: gl.constexpr = 1,  # int
+    ALL_DECODE: gl.constexpr = False,  # bool
+    SHUFFLED_KV_CACHE: gl.constexpr = False,  # bool
 ):
-    q_block_global_idx = ttgl.program_id(0)
-    kv_head_idx = ttgl.program_id(1)
-    segm_idx = ttgl.program_id(2)
-    # num_ctas: ttgl.constexpr = ttgl.num_ctas()
+    q_block_global_idx = gl.program_id(0)
+    kv_head_idx = gl.program_id(1)
+    segm_idx = gl.program_id(2)
+    # num_ctas: gl.constexpr = gl.num_ctas()
     pred = 1
-    pred_i32 = pred.to(ttgl.int32) if hasattr(pred, "to") else pred
+    pred_i32 = pred.to(gl.int32) if hasattr(pred, "to") else pred
 
-    ttgl.static_assert(
+    gl.static_assert(
         TILE_SIZE == BLOCK_SIZE, "TILE_SIZE must be the same as BLOCK_SIZE"
     )
 
@@ -1201,10 +1197,8 @@ def gluon_kernel_unified_attention_3d_tdm(
     # context length for this particular sequence
     context_len = seq_len - cur_batch_query_len
 
-    offs_q_m = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, Q_LOAD_LAYOUT))
-    offs_q_d = ttgl.arange(
-        0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(0, Q_LOAD_LAYOUT)
-    )
+    offs_q_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, Q_LOAD_LAYOUT))
+    offs_q_d = gl.arange(0, HEAD_SIZE_PADDED, layout=gl.SliceLayout(0, Q_LOAD_LAYOUT))
 
     query_pos = q_block_local_idx * BLOCK_Q + offs_q_m // num_queries_per_kv
 
@@ -1219,12 +1213,12 @@ def gluon_kernel_unified_attention_3d_tdm(
     if HEAD_SIZE_PADDED != HEAD_SIZE:
         dim_mask = offs_q_d < HEAD_SIZE
     else:
-        dim_mask = ttgl.full((1,), 1, dtype=tl.int1)
+        dim_mask = gl.full((1,), 1, dtype=tl.int1)
 
     query_mask_0 = query_pos < cur_batch_query_len
     query_mask_1 = query_offset_1 < num_query_heads
 
-    NUM_KV_HEADS: ttgl.constexpr = num_query_heads // num_queries_per_kv
+    NUM_KV_HEADS: gl.constexpr = num_query_heads // num_queries_per_kv
 
     k_desc, v_desc, smem_Q, smem_K, smem_V = (
         _tdm_create_tensor_descriptors_and_allocate_lds(
@@ -1251,9 +1245,9 @@ def gluon_kernel_unified_attention_3d_tdm(
     )
 
     # Q_load : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = Q_LOAD_LAYOUT
-    Q_load = ttgl.amd.cdna4.buffer_load(
+    Q_load = gl.amd.cdna4.buffer_load(
         ptr=query_ptr,
-        offsets=query_offset.to(ttgl.int32),
+        offsets=query_offset.to(gl.int32),
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
     )
@@ -1261,7 +1255,7 @@ def gluon_kernel_unified_attention_3d_tdm(
     # Q : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = Q_DOT_LAYOUT
     Q = smem_Q.load(layout=Q_DOT_LAYOUT)
 
-    offs_q_m_qk = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, QK_WMMA_LAYOUT))
+    offs_q_m_qk = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, QK_WMMA_LAYOUT))
     query_pos_qk = q_block_local_idx * BLOCK_Q + offs_q_m_qk // num_queries_per_kv
     query_offset_1_qk = (
         kv_head_idx * num_queries_per_kv + offs_q_m_qk % num_queries_per_kv
@@ -1308,28 +1302,28 @@ def gluon_kernel_unified_attention_3d_tdm(
 
     # adjust for potential padding in the last q_block by considering the
     # actual sequence length
-    max_seq_prefix_len = ttgl.minimum(max_seq_prefix_len, seq_len)
+    max_seq_prefix_len = gl.minimum(max_seq_prefix_len, seq_len)
 
     # calculate the number of tiles that need to be processed to
     # cover the longest sequence prefix (due to causal masking, tiles beyond
     # this prefix can be skipped)
     num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
-    # KV_cache_modifier: ttgl.constexpr = ".cg" if ALL_DECODE else ""
+    # KV_cache_modifier: gl.constexpr = ".cg" if ALL_DECODE else ""
 
-    k_producer = 0
-    k_consumer = 0
-    v_producer = 0
-    v_consumer = 0
-    j_producer = segm_idx * tiles_per_segment
-    j_consumer = segm_idx * tiles_per_segment
-    seq_offset = j_consumer * TILE_SIZE + ttgl.arange(
-        0, TILE_SIZE, layout=ttgl.SliceLayout(0, QK_WMMA_LAYOUT)
+    k_from_hbm = 0
+    k_from_lds = 0
+    v_from_hbm = 0
+    v_from_lds = 0
+    j_from_hbm = segm_idx * tiles_per_segment
+    j_from_lds = segm_idx * tiles_per_segment
+    seq_offset = j_from_lds * TILE_SIZE + gl.arange(
+        0, TILE_SIZE, layout=gl.SliceLayout(0, QK_WMMA_LAYOUT)
     )
 
     for _ in range(num_stages - 1):
-        j_producer, offs_k_t, offs_k_d, offs_v_t, offs_v_d = _tdm_get_kv_offsets(
-            j_producer,
+        j_from_hbm, offs_k_t, offs_k_d, offs_v_t, offs_v_d = _tdm_get_kv_offsets(
+            j_from_hbm,
             kv_head_idx,
             block_tables_ptr,
             block_table_offset,
@@ -1338,16 +1332,16 @@ def gluon_kernel_unified_attention_3d_tdm(
             stride_v_cache_0 // stride_v_cache_1,  # = BLOCK_SIZE
             stride_v_cache_2,
         )
-        k_producer = _tdm_async_load_to_lds(
-            k_producer,
+        k_from_hbm = _tdm_async_load_to_lds(
+            k_from_hbm,
             src=k_desc,
             offsets=[offs_k_t, offs_k_d],
             dest=smem_K,
             pred_i32=pred_i32,
             num_stages=num_stages,
         )
-        v_producer = _tdm_async_load_to_lds(
-            v_producer,
+        v_from_hbm = _tdm_async_load_to_lds(
+            v_from_hbm,
             src=v_desc,
             offsets=[offs_v_t, offs_v_d],
             dest=smem_V,
@@ -1361,8 +1355,8 @@ def gluon_kernel_unified_attention_3d_tdm(
         segm_idx * tiles_per_segment,
         min((segm_idx + 1) * tiles_per_segment, num_tiles) - (num_stages - 1),
     ):
-        j_producer, offs_k_t, offs_k_d, offs_v_t, offs_v_d = _tdm_get_kv_offsets(
-            j_producer,
+        j_from_hbm, offs_k_t, offs_k_d, offs_v_t, offs_v_d = _tdm_get_kv_offsets(
+            j_from_hbm,
             kv_head_idx,
             block_tables_ptr,
             block_table_offset,
@@ -1371,16 +1365,16 @@ def gluon_kernel_unified_attention_3d_tdm(
             stride_v_cache_0 // stride_v_cache_1,  # = BLOCK_SIZE
             stride_v_cache_2,
         )
-        k_producer = _tdm_async_load_to_lds(
-            k_producer,
+        k_from_hbm = _tdm_async_load_to_lds(
+            k_from_hbm,
             src=k_desc,
             offsets=[offs_k_t, offs_k_d],
             dest=smem_K,
             pred_i32=pred_i32,
             num_stages=num_stages,
         )
-        v_producer = _tdm_async_load_to_lds(
-            v_producer,
+        v_from_hbm = _tdm_async_load_to_lds(
+            v_from_hbm,
             src=v_desc,
             offsets=[offs_v_t, offs_v_d],
             dest=smem_V,
@@ -1389,8 +1383,8 @@ def gluon_kernel_unified_attention_3d_tdm(
         )
 
         # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
-        k_consumer, K = _tdm_request_from_lds(
-            k_consumer,
+        k_from_lds, K = _tdm_request_from_lds(
+            k_from_lds,
             k_scale,
             Q.dtype,
             smem_K,
@@ -1402,8 +1396,8 @@ def gluon_kernel_unified_attention_3d_tdm(
         )
 
         # P : shape = (BLOCK_M, TILE_SIZE), layout = Q_LOAD_LAYOUT
-        # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_LOAD_LAYOUT)
-        # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_LOAD_LAYOUT)
+        # L : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, Q_LOAD_LAYOUT)
+        # M : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, Q_LOAD_LAYOUT)
         # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
         P, L, M, acc = _perform_QK_wmma_and_update_L_M(
             Q,
@@ -1433,8 +1427,8 @@ def gluon_kernel_unified_attention_3d_tdm(
         )
 
         # V : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = V_DOT_LAYOUT
-        v_consumer, V = _tdm_request_from_lds(
-            v_consumer,
+        v_from_lds, V = _tdm_request_from_lds(
+            v_from_lds,
             v_scale,
             Q.dtype,
             smem_V,
@@ -1448,13 +1442,13 @@ def gluon_kernel_unified_attention_3d_tdm(
         # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
         acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
 
-        j_consumer = j_consumer + 1
+        j_from_lds = j_from_lds + 1
         seq_offset += TILE_SIZE
 
     for _ in range(num_stages - 1):
         # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
-        k_consumer, K = _tdm_request_from_lds(
-            k_consumer,
+        k_from_lds, K = _tdm_request_from_lds(
+            k_from_lds,
             k_scale,
             Q.dtype,
             smem_K,
@@ -1466,8 +1460,8 @@ def gluon_kernel_unified_attention_3d_tdm(
         )
 
         # P : shape = (BLOCK_M, TILE_SIZE), layout = Q_LOAD_LAYOUT
-        # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_LOAD_LAYOUT)
-        # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_LOAD_LAYOUT)
+        # L : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, Q_LOAD_LAYOUT)
+        # M : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, Q_LOAD_LAYOUT)
         # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
         P, L, M, acc = _perform_QK_wmma_and_update_L_M(
             Q,
@@ -1497,8 +1491,8 @@ def gluon_kernel_unified_attention_3d_tdm(
         )
 
         # V : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = V_DOT_LAYOUT
-        v_consumer, V = _tdm_request_from_lds(
-            v_consumer,
+        v_from_lds, V = _tdm_request_from_lds(
+            v_from_lds,
             v_scale,
             Q.dtype,
             smem_V,
@@ -1512,12 +1506,12 @@ def gluon_kernel_unified_attention_3d_tdm(
         # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
         acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
 
-        j_consumer = j_consumer + 1
+        j_from_lds = j_from_lds + 1
         seq_offset += TILE_SIZE
 
     # store segm_output
     # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = Q_LOAD_LAYOUT
-    acc = ttgl.convert_layout(acc, layout=Q_LOAD_LAYOUT)
+    acc = gl.convert_layout(acc, layout=Q_LOAD_LAYOUT)
     segm_output_offset = (
         query_offset_0[:, None]
         * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
@@ -1525,7 +1519,7 @@ def gluon_kernel_unified_attention_3d_tdm(
         + segm_idx * HEAD_SIZE_PADDED
         + offs_q_d[None, :]
     )
-    ttgl.amd.cdna4.buffer_store(
+    gl.amd.cdna4.buffer_store(
         stored_value=acc,
         ptr=segm_output_ptr,
         offsets=segm_output_offset,
@@ -1533,22 +1527,22 @@ def gluon_kernel_unified_attention_3d_tdm(
     )
 
     # store segm_max and segm_expsum
-    # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, QK_WMMA_LAYOUT)
-    # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, QK_WMMA_LAYOUT)
+    # L : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, QK_WMMA_LAYOUT)
+    # M : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, QK_WMMA_LAYOUT)
     segm_offset = (
         query_offset_0 * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
         + query_offset_1 * NUM_SEGMENTS_PER_SEQ
         + segm_idx
     )
-    L = ttgl.convert_layout(L, layout=ttgl.SliceLayout(1, Q_LOAD_LAYOUT))
-    M = ttgl.convert_layout(M, layout=ttgl.SliceLayout(1, Q_LOAD_LAYOUT))
-    ttgl.amd.cdna4.buffer_store(
+    L = gl.convert_layout(L, layout=gl.SliceLayout(1, Q_LOAD_LAYOUT))
+    M = gl.convert_layout(M, layout=gl.SliceLayout(1, Q_LOAD_LAYOUT))
+    gl.amd.cdna4.buffer_store(
         stored_value=M,
         ptr=segm_max_ptr,
         offsets=segm_offset,
         mask=query_mask_0 & query_mask_1,
     )
-    ttgl.amd.cdna4.buffer_store(
+    gl.amd.cdna4.buffer_store(
         stored_value=L,
         ptr=segm_expsum_ptr,
         offsets=segm_offset,
@@ -1558,51 +1552,51 @@ def gluon_kernel_unified_attention_3d_tdm(
 
 @gluon.jit
 def _async_load_to_lds(
-    producer,
+    from_hbm,
     dest,
     ptr,
     offsets,
     mask,
-    num_stages: ttgl.constexpr,
-    cache_modifier: ttgl.constexpr,
-    use_buffer_load: ttgl.constexpr = False,
+    num_stages: gl.constexpr,
+    cache_modifier: gl.constexpr,
+    use_buffer_load: gl.constexpr = False,
 ):
     if use_buffer_load:
-        ttgl.amd.cdna4.async_copy.buffer_load_to_shared(
-            dest=dest.index(producer % num_stages),
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            dest=dest.index(from_hbm % num_stages),
             ptr=ptr,
-            offsets=offsets.to(ttgl.int32),
+            offsets=offsets.to(gl.int32),
             mask=mask,
             cache_modifier=cache_modifier,
         )
     else:
-        ttgl.amd.cdna4.async_copy.global_load_to_shared(
-            dest=dest.index(producer % num_stages),
+        gl.amd.cdna4.async_copy.global_load_to_shared(
+            dest=dest.index(from_hbm % num_stages),
             ptr=ptr + offsets,
             mask=mask,
             cache_modifier=cache_modifier,
         )
-    ttgl.amd.cdna4.async_copy.commit_group()
-    return producer + 1
+    gl.amd.cdna4.async_copy.commit_group()
+    return from_hbm + 1
 
 
 @gluon.jit
 def _request_from_lds(
-    consumer,
+    from_lds,
     kv_scale,
     Q_dtype,
     smem,
     layout,
     wait_group,
-    num_stages: ttgl.constexpr,
+    num_stages: gl.constexpr,
 ):
-    ttgl.amd.cdna4.async_copy.wait_group(wait_group)
-    KV = ttgl.amd.cdna4.async_copy.load_shared_relaxed(
-        smem.index(consumer % num_stages), layout=layout
+    gl.amd.cdna4.async_copy.wait_group(wait_group)
+    KV = gl.amd.cdna4.async_copy.load_shared_relaxed(
+        smem.index(from_lds % num_stages), layout=layout
     )
     if KV.dtype.is_fp8() and not Q_dtype.is_fp8():
-        KV = (KV.to(ttgl.float32) * ttgl.load(kv_scale)).to(Q_dtype)
-    return KV, consumer + 1
+        KV = (KV.to(gl.float32) * gl.load(kv_scale)).to(Q_dtype)
+    return KV, from_lds + 1
 
 
 @gluon.jit
@@ -1616,43 +1610,43 @@ def _get_kv_offsets(
     offs_v_t,
     offs_v_d,
     max_seq_prefix_len,
-    stride_k_cache_0: ttgl.int64,
-    stride_k_cache_1: ttgl.int64,
-    stride_k_cache_2: ttgl.int64,
-    stride_k_cache_3: ttgl.constexpr,
-    stride_v_cache_0: ttgl.int64,
-    stride_v_cache_1: ttgl.int64,
-    stride_v_cache_2: ttgl.int64,
-    stride_v_cache_3: ttgl.constexpr,
-    K_LOAD_LAYOUT: ttgl.constexpr,
-    V_LOAD_LAYOUT: ttgl.constexpr,
-    TILE_SIZE: ttgl.constexpr,
-    BLOCK_SIZE: ttgl.constexpr,
+    stride_k_cache_0: gl.int64,
+    stride_k_cache_1: gl.int64,
+    stride_k_cache_2: gl.int64,
+    stride_k_cache_3: gl.constexpr,
+    stride_v_cache_0: gl.int64,
+    stride_v_cache_1: gl.int64,
+    stride_v_cache_2: gl.int64,
+    stride_v_cache_3: gl.constexpr,
+    K_LOAD_LAYOUT: gl.constexpr,
+    V_LOAD_LAYOUT: gl.constexpr,
+    TILE_SIZE: gl.constexpr,
+    BLOCK_SIZE: gl.constexpr,
 ):
-    # seq_k_offset : shape = (TILE_SIZE, ), layout = ttgl.SliceLayout(0, K_LOAD_LAYOUT)
-    # seq_v_offset : shape = (TILE_SIZE, ), layout = ttgl.SliceLayout(1, V_LOAD_LAYOUT)
+    # seq_k_offset : shape = (TILE_SIZE, ), layout = gl.SliceLayout(0, K_LOAD_LAYOUT)
+    # seq_v_offset : shape = (TILE_SIZE, ), layout = gl.SliceLayout(1, V_LOAD_LAYOUT)
     seq_k_offset = j * TILE_SIZE + offs_k_t
     seq_v_offset = j * TILE_SIZE + offs_v_t
 
     if TILE_SIZE == BLOCK_SIZE:
-        tile_k_mask = ttgl.full(
-            (1,), 1, dtype=tl.int1, layout=ttgl.SliceLayout(0, K_LOAD_LAYOUT)
+        tile_k_mask = gl.full(
+            (1,), 1, dtype=tl.int1, layout=gl.SliceLayout(0, K_LOAD_LAYOUT)
         )
-        tile_v_mask = ttgl.full(
-            (1,), 1, dtype=tl.int1, layout=ttgl.SliceLayout(1, V_LOAD_LAYOUT)
+        tile_v_mask = gl.full(
+            (1,), 1, dtype=tl.int1, layout=gl.SliceLayout(1, V_LOAD_LAYOUT)
         )
     else:
         tile_k_mask = seq_k_offset < max_seq_prefix_len
         tile_v_mask = seq_v_offset < max_seq_prefix_len
 
-    physical_block_idx_k = ttgl.amd.cdna4.buffer_load(
+    physical_block_idx_k = gl.amd.cdna4.buffer_load(
         ptr=block_tables_ptr,
-        offsets=(block_table_offset + seq_k_offset // BLOCK_SIZE).to(ttgl.int32),
+        offsets=(block_table_offset + seq_k_offset // BLOCK_SIZE).to(gl.int32),
     ).to(tl.int64)
 
-    physical_block_idx_v = ttgl.amd.cdna4.buffer_load(
+    physical_block_idx_v = gl.amd.cdna4.buffer_load(
         ptr=block_tables_ptr,
-        offsets=(block_table_offset + seq_v_offset // BLOCK_SIZE).to(ttgl.int32),
+        offsets=(block_table_offset + seq_v_offset // BLOCK_SIZE).to(gl.int32),
     ).to(tl.int64)
 
     v_offset = (
@@ -1707,58 +1701,58 @@ def gluon_kernel_unified_attention_3d_async(
     softcap,  # float32
     num_tokens,  # int
     NUM_BLOCKS,  # int
-    num_query_heads: ttgl.constexpr,  # int
-    num_queries_per_kv: ttgl.constexpr,  # int
-    block_table_stride: ttgl.int64,  # int
-    query_stride_0: ttgl.int64,  # int
-    query_stride_1: ttgl.int64,  # int, should be equal to head_size
-    qq_bias_stride_0: ttgl.int64,  # int
-    BLOCK_SIZE: ttgl.constexpr,  # int
-    TILE_SIZE: ttgl.constexpr,  # int, must be power of 2
-    HEAD_SIZE: ttgl.constexpr,  # int
-    HEAD_SIZE_PADDED: ttgl.constexpr,  # int, must be power of 2
-    USE_ALIBI_SLOPES: ttgl.constexpr,  # bool
-    USE_QQ_BIAS: ttgl.constexpr,  # bool
-    USE_SOFTCAP: ttgl.constexpr,  # bool
-    USE_SINKS: ttgl.constexpr,  # bool
-    SLIDING_WINDOW: ttgl.constexpr,  # int
-    stride_k_cache_0: ttgl.int64,  # int
-    stride_k_cache_1: ttgl.int64,  # int
-    stride_k_cache_2: ttgl.int64,  # int
-    stride_k_cache_3: ttgl.constexpr,  # int
-    stride_v_cache_0: ttgl.int64,  # int
-    stride_v_cache_1: ttgl.int64,  # int
-    stride_v_cache_2: ttgl.int64,  # int
-    stride_v_cache_3: ttgl.constexpr,  # int
+    num_query_heads: gl.constexpr,  # int
+    num_queries_per_kv: gl.constexpr,  # int
+    block_table_stride: gl.int64,  # int
+    query_stride_0: gl.int64,  # int
+    query_stride_1: gl.int64,  # int, should be equal to head_size
+    qq_bias_stride_0: gl.int64,  # int
+    BLOCK_SIZE: gl.constexpr,  # int
+    TILE_SIZE: gl.constexpr,  # int, must be power of 2
+    HEAD_SIZE: gl.constexpr,  # int
+    HEAD_SIZE_PADDED: gl.constexpr,  # int, must be power of 2
+    USE_ALIBI_SLOPES: gl.constexpr,  # bool
+    USE_QQ_BIAS: gl.constexpr,  # bool
+    USE_SOFTCAP: gl.constexpr,  # bool
+    USE_SINKS: gl.constexpr,  # bool
+    SLIDING_WINDOW: gl.constexpr,  # int
+    stride_k_cache_0: gl.int64,  # int
+    stride_k_cache_1: gl.int64,  # int
+    stride_k_cache_2: gl.int64,  # int
+    stride_k_cache_3: gl.constexpr,  # int
+    stride_v_cache_0: gl.int64,  # int
+    stride_v_cache_1: gl.int64,  # int
+    stride_v_cache_2: gl.int64,  # int
+    stride_v_cache_3: gl.constexpr,  # int
     query_start_len_ptr,  # [num_seqs+1]
-    BLOCK_Q: ttgl.constexpr,  # int
-    num_seqs: ttgl.int32,
-    BLOCK_M: ttgl.constexpr,  # int
-    NUM_SEGMENTS_PER_SEQ: ttgl.constexpr,  # int
-    num_warps: ttgl.constexpr,  # int
-    num_stages: ttgl.constexpr,  # int
-    QK_WMMA_LAYOUT: ttgl.constexpr,
-    PV_WMMA_LAYOUT: ttgl.constexpr,
-    Q_DOT_LAYOUT: ttgl.constexpr,
-    K_DOT_LAYOUT: ttgl.constexpr,
-    P_DOT_LAYOUT: ttgl.constexpr,
-    V_DOT_LAYOUT: ttgl.constexpr,
-    Q_SHARED_LAYOUT: ttgl.constexpr,
-    K_SHARED_LAYOUT: ttgl.constexpr,
-    V_SHARED_LAYOUT: ttgl.constexpr,
-    Q_LOAD_LAYOUT: ttgl.constexpr,
-    K_LOAD_LAYOUT: ttgl.constexpr,
-    V_LOAD_LAYOUT: ttgl.constexpr,
-    use_buffer_load: ttgl.constexpr = True,
-    ALL_DECODE: ttgl.constexpr = False,  # bool
-    SHUFFLED_KV_CACHE: ttgl.constexpr = False,  # bool
+    BLOCK_Q: gl.constexpr,  # int
+    num_seqs: gl.int32,
+    BLOCK_M: gl.constexpr,  # int
+    NUM_SEGMENTS_PER_SEQ: gl.constexpr,  # int
+    num_warps: gl.constexpr,  # int
+    num_stages: gl.constexpr,  # int
+    QK_WMMA_LAYOUT: gl.constexpr,
+    PV_WMMA_LAYOUT: gl.constexpr,
+    Q_DOT_LAYOUT: gl.constexpr,
+    K_DOT_LAYOUT: gl.constexpr,
+    P_DOT_LAYOUT: gl.constexpr,
+    V_DOT_LAYOUT: gl.constexpr,
+    Q_SHARED_LAYOUT: gl.constexpr,
+    K_SHARED_LAYOUT: gl.constexpr,
+    V_SHARED_LAYOUT: gl.constexpr,
+    Q_LOAD_LAYOUT: gl.constexpr,
+    K_LOAD_LAYOUT: gl.constexpr,
+    V_LOAD_LAYOUT: gl.constexpr,
+    use_buffer_load: gl.constexpr = True,
+    ALL_DECODE: gl.constexpr = False,  # bool
+    SHUFFLED_KV_CACHE: gl.constexpr = False,  # bool
 ):
-    q_block_global_idx = ttgl.program_id(0)
-    kv_head_idx = ttgl.program_id(1)
-    segm_idx = ttgl.program_id(2)
-    num_ctas: ttgl.constexpr = ttgl.num_ctas()
+    q_block_global_idx = gl.program_id(0)
+    kv_head_idx = gl.program_id(1)
+    segm_idx = gl.program_id(2)
+    num_ctas: gl.constexpr = gl.num_ctas()
     pred = 1
-    pred_i32 = pred.to(ttgl.int32) if hasattr(pred, "to") else pred
+    pred_i32 = pred.to(gl.int32) if hasattr(pred, "to") else pred
 
     # needed to use exp2 (exp2 -> exp conversion)
     RCP_LN2 = 1.4426950408889634
@@ -1796,34 +1790,28 @@ def gluon_kernel_unified_attention_3d_async(
     # context length for this particular sequence
     context_len = seq_len - cur_batch_query_len
 
-    smem_Q = ttgl.allocate_shared_memory(
+    smem_Q = gl.allocate_shared_memory(
         query_ptr.type.element_ty, [BLOCK_M, HEAD_SIZE_PADDED], layout=Q_SHARED_LAYOUT
     )
-    smem_K = ttgl.allocate_shared_memory(
+    smem_K = gl.allocate_shared_memory(
         key_cache_ptr.type.element_ty,
         [num_stages, HEAD_SIZE_PADDED, TILE_SIZE],
         layout=K_SHARED_LAYOUT,
     )
-    smem_V = ttgl.allocate_shared_memory(
+    smem_V = gl.allocate_shared_memory(
         value_cache_ptr.type.element_ty,
         [num_stages, TILE_SIZE, HEAD_SIZE_PADDED],
         layout=V_SHARED_LAYOUT,
     )
 
-    offs_q_m = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, Q_LOAD_LAYOUT))
-    offs_q_d = ttgl.arange(
-        0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(0, Q_LOAD_LAYOUT)
-    )
+    offs_q_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, Q_LOAD_LAYOUT))
+    offs_q_d = gl.arange(0, HEAD_SIZE_PADDED, layout=gl.SliceLayout(0, Q_LOAD_LAYOUT))
 
-    offs_k_t = ttgl.arange(0, TILE_SIZE, layout=ttgl.SliceLayout(0, K_LOAD_LAYOUT))
-    offs_k_d = ttgl.arange(
-        0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(1, K_LOAD_LAYOUT)
-    )
+    offs_k_t = gl.arange(0, TILE_SIZE, layout=gl.SliceLayout(0, K_LOAD_LAYOUT))
+    offs_k_d = gl.arange(0, HEAD_SIZE_PADDED, layout=gl.SliceLayout(1, K_LOAD_LAYOUT))
 
-    offs_v_t = ttgl.arange(0, TILE_SIZE, layout=ttgl.SliceLayout(1, V_LOAD_LAYOUT))
-    offs_v_d = ttgl.arange(
-        0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(0, V_LOAD_LAYOUT)
-    )
+    offs_v_t = gl.arange(0, TILE_SIZE, layout=gl.SliceLayout(1, V_LOAD_LAYOUT))
+    offs_v_d = gl.arange(0, HEAD_SIZE_PADDED, layout=gl.SliceLayout(0, V_LOAD_LAYOUT))
 
     query_pos = q_block_local_idx * BLOCK_Q + offs_q_m // num_queries_per_kv
 
@@ -1838,15 +1826,15 @@ def gluon_kernel_unified_attention_3d_async(
     if HEAD_SIZE_PADDED != HEAD_SIZE:
         dim_mask = offs_q_d < HEAD_SIZE
     else:
-        dim_mask = ttgl.full((1,), 1, dtype=tl.int1)
+        dim_mask = gl.full((1,), 1, dtype=tl.int1)
 
     query_mask_0 = query_pos < cur_batch_query_len
     query_mask_1 = query_offset_1 < num_query_heads
 
     # Q_load : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = Q_LOAD_LAYOUT
-    Q_load = ttgl.amd.cdna4.buffer_load(
+    Q_load = gl.amd.cdna4.buffer_load(
         ptr=query_ptr,
-        offsets=query_offset.to(ttgl.int32),
+        offsets=query_offset.to(gl.int32),
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
     )
@@ -1854,7 +1842,7 @@ def gluon_kernel_unified_attention_3d_async(
     # Q : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = Q_DOT_LAYOUT
     Q = smem_Q.load(layout=Q_DOT_LAYOUT)
 
-    offs_q_m_qk = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, QK_WMMA_LAYOUT))
+    offs_q_m_qk = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, QK_WMMA_LAYOUT))
     query_pos_qk = q_block_local_idx * BLOCK_Q + offs_q_m_qk // num_queries_per_kv
     query_offset_1_qk = (
         kv_head_idx * num_queries_per_kv + offs_q_m_qk % num_queries_per_kv
@@ -1901,27 +1889,27 @@ def gluon_kernel_unified_attention_3d_async(
 
     # adjust for potential padding in the last q_block by considering the
     # actual sequence length
-    max_seq_prefix_len = ttgl.minimum(max_seq_prefix_len, seq_len)
+    max_seq_prefix_len = gl.minimum(max_seq_prefix_len, seq_len)
 
     # calculate the number of tiles that need to be processed to
     # cover the longest sequence prefix (due to causal masking, tiles beyond
     # this prefix can be skipped)
     num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
-    KV_cache_modifier: ttgl.constexpr = ".cg" if ALL_DECODE else ""
+    KV_cache_modifier: gl.constexpr = ".cg" if ALL_DECODE else ""
 
-    k_producer = 0
-    k_consumer = 0
-    v_producer = 0
-    v_consumer = 0
-    j_producer = segm_idx * tiles_per_segment
-    seq_offset = j_producer * TILE_SIZE + ttgl.arange(
-        0, TILE_SIZE, layout=ttgl.SliceLayout(0, QK_WMMA_LAYOUT)
+    k_from_hbm = 0
+    k_from_lds = 0
+    v_from_hbm = 0
+    v_from_lds = 0
+    j_from_hbm = segm_idx * tiles_per_segment
+    seq_offset = j_from_hbm * TILE_SIZE + gl.arange(
+        0, TILE_SIZE, layout=gl.SliceLayout(0, QK_WMMA_LAYOUT)
     )
 
     for _ in range(num_stages - 1):
-        j_producer, k_offset, v_offset, tile_k_mask, tile_v_mask = _get_kv_offsets(
-            j_producer,
+        j_from_hbm, k_offset, v_offset, tile_k_mask, tile_v_mask = _get_kv_offsets(
+            j_from_hbm,
             kv_head_idx,
             block_tables_ptr,
             block_table_offset,
@@ -1943,8 +1931,8 @@ def gluon_kernel_unified_attention_3d_async(
             TILE_SIZE,
             BLOCK_SIZE,
         )
-        k_producer = _async_load_to_lds(
-            k_producer,
+        k_from_hbm = _async_load_to_lds(
+            k_from_hbm,
             dest=smem_K,
             ptr=key_cache_ptr,
             offsets=k_offset,
@@ -1953,8 +1941,8 @@ def gluon_kernel_unified_attention_3d_async(
             cache_modifier=KV_cache_modifier,
             use_buffer_load=use_buffer_load,
         )
-        v_producer = _async_load_to_lds(
-            v_producer,
+        v_from_hbm = _async_load_to_lds(
+            v_from_hbm,
             dest=smem_V,
             ptr=value_cache_ptr,
             offsets=v_offset,
@@ -1969,8 +1957,8 @@ def gluon_kernel_unified_attention_3d_async(
         segm_idx * tiles_per_segment,
         min((segm_idx + 1) * tiles_per_segment, num_tiles) - (num_stages - 1),
     ):
-        j_producer, k_offset, v_offset, tile_k_mask, tile_v_mask = _get_kv_offsets(
-            j_producer,
+        j_from_hbm, k_offset, v_offset, tile_k_mask, tile_v_mask = _get_kv_offsets(
+            j_from_hbm,
             kv_head_idx,
             block_tables_ptr,
             block_table_offset,
@@ -1993,8 +1981,8 @@ def gluon_kernel_unified_attention_3d_async(
             BLOCK_SIZE,
         )
 
-        K, k_consumer = _request_from_lds(
-            k_consumer,
+        K, k_from_lds = _request_from_lds(
+            k_from_lds,
             k_scale,
             Q.dtype,
             smem_K,
@@ -2004,8 +1992,8 @@ def gluon_kernel_unified_attention_3d_async(
         )
 
         # K_load : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_LOAD_LAYOUT
-        k_producer = _async_load_to_lds(
-            k_producer,
+        k_from_hbm = _async_load_to_lds(
+            k_from_hbm,
             dest=smem_K,
             ptr=key_cache_ptr,
             offsets=k_offset,
@@ -2016,8 +2004,8 @@ def gluon_kernel_unified_attention_3d_async(
         )
 
         # V_load : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = Q_LOAD_LAYOUT
-        v_producer = _async_load_to_lds(
-            v_producer,
+        v_from_hbm = _async_load_to_lds(
+            v_from_hbm,
             dest=smem_V,
             ptr=value_cache_ptr,
             offsets=v_offset,
@@ -2028,8 +2016,8 @@ def gluon_kernel_unified_attention_3d_async(
         )
 
         # P : shape = (BLOCK_M, TILE_SIZE), layout = Q_LOAD_LAYOUT
-        # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_LOAD_LAYOUT)
-        # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_LOAD_LAYOUT)
+        # L : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, Q_LOAD_LAYOUT)
+        # M : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, Q_LOAD_LAYOUT)
         # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
         P, L, M, acc = _perform_QK_wmma_and_update_L_M(
             Q,
@@ -2059,8 +2047,8 @@ def gluon_kernel_unified_attention_3d_async(
         )
 
         # V : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = V_DOT_LAYOUT
-        V, v_consumer = _request_from_lds(
-            v_consumer,
+        V, v_from_lds = _request_from_lds(
+            v_from_lds,
             v_scale,
             Q.dtype,
             smem_V,
@@ -2076,8 +2064,8 @@ def gluon_kernel_unified_attention_3d_async(
 
     for _ in range(num_stages - 1):
         # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
-        K, k_consumer = _request_from_lds(
-            k_consumer,
+        K, k_from_lds = _request_from_lds(
+            k_from_lds,
             k_scale,
             Q.dtype,
             smem_K,
@@ -2089,8 +2077,8 @@ def gluon_kernel_unified_attention_3d_async(
         )
 
         # P : shape = (BLOCK_M, TILE_SIZE), layout = Q_LOAD_LAYOUT
-        # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_LOAD_LAYOUT)
-        # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, Q_LOAD_LAYOUT)
+        # L : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, Q_LOAD_LAYOUT)
+        # M : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, Q_LOAD_LAYOUT)
         # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
         P, L, M, acc = _perform_QK_wmma_and_update_L_M(
             Q,
@@ -2120,8 +2108,8 @@ def gluon_kernel_unified_attention_3d_async(
         )
 
         # V : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = V_DOT_LAYOUT
-        V, v_consumer = _request_from_lds(
-            v_consumer,
+        V, v_from_lds = _request_from_lds(
+            v_from_lds,
             v_scale,
             Q.dtype,
             smem_V,
@@ -2139,7 +2127,7 @@ def gluon_kernel_unified_attention_3d_async(
 
     # store segm_output
     # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = Q_LOAD_LAYOUT
-    acc = ttgl.convert_layout(acc, layout=Q_LOAD_LAYOUT)
+    acc = gl.convert_layout(acc, layout=Q_LOAD_LAYOUT)
     segm_output_offset = (
         query_offset_0[:, None]
         * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
@@ -2147,7 +2135,7 @@ def gluon_kernel_unified_attention_3d_async(
         + segm_idx * HEAD_SIZE_PADDED
         + offs_q_d[None, :]
     )
-    ttgl.amd.cdna4.buffer_store(
+    gl.amd.cdna4.buffer_store(
         stored_value=acc,
         ptr=segm_output_ptr,
         offsets=segm_output_offset,
@@ -2155,22 +2143,22 @@ def gluon_kernel_unified_attention_3d_async(
     )
 
     # store segm_max and segm_expsum
-    # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, QK_WMMA_LAYOUT)
-    # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, QK_WMMA_LAYOUT)
+    # L : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, QK_WMMA_LAYOUT)
+    # M : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, QK_WMMA_LAYOUT)
     segm_offset = (
         query_offset_0 * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
         + query_offset_1 * NUM_SEGMENTS_PER_SEQ
         + segm_idx
     )
-    L = ttgl.convert_layout(L, layout=ttgl.SliceLayout(1, Q_LOAD_LAYOUT))
-    M = ttgl.convert_layout(M, layout=ttgl.SliceLayout(1, Q_LOAD_LAYOUT))
-    ttgl.amd.cdna4.buffer_store(
+    L = gl.convert_layout(L, layout=gl.SliceLayout(1, Q_LOAD_LAYOUT))
+    M = gl.convert_layout(M, layout=gl.SliceLayout(1, Q_LOAD_LAYOUT))
+    gl.amd.cdna4.buffer_store(
         stored_value=M,
         ptr=segm_max_ptr,
         offsets=segm_offset,
         mask=query_mask_0 & query_mask_1,
     )
-    ttgl.amd.cdna4.buffer_store(
+    gl.amd.cdna4.buffer_store(
         stored_value=L,
         ptr=segm_expsum_ptr,
         offsets=segm_offset,
@@ -2181,8 +2169,8 @@ def gluon_kernel_unified_attention_3d_async(
 @gluon.jit
 def _unshuffle_kv_cache(
     X,
-    BLOCK_SIZE_N: ttgl.constexpr,
-    BLOCK_SIZE_INNER_DIM: ttgl.constexpr,
+    BLOCK_SIZE_N: gl.constexpr,
+    BLOCK_SIZE_INNER_DIM: gl.constexpr,
 ):
     return (
         X.reshape(
@@ -2207,18 +2195,18 @@ def _buffer_load_to_reg(
     offsets,
     mask,
     other,
-    cache_modifier: ttgl.constexpr,
-    SHUFFLED_KV_CACHE: ttgl.constexpr = False,
+    cache_modifier: gl.constexpr,
+    SHUFFLED_KV_CACHE: gl.constexpr = False,
 ):
-    X = ttgl.amd.cdna4.buffer_load(
+    X = gl.amd.cdna4.buffer_load(
         ptr=ptr,
-        offsets=offsets.to(ttgl.int32),
+        offsets=offsets.to(gl.int32),
         mask=mask,
         other=other,
         cache=cache_modifier,
     )
     if X.dtype.is_fp8() and not Q_dtype.is_fp8():
-        X = (X.to(ttgl.float32) * ttgl.load(x_scale)).to(Q_dtype)
+        X = (X.to(gl.float32) * gl.load(x_scale)).to(Q_dtype)
     return X
 
 
@@ -2256,58 +2244,58 @@ def gluon_kernel_unified_attention_3d(
     v_scale,  # float32
     softcap,  # float32
     num_tokens,  # int
-    num_query_heads: ttgl.constexpr,  # int
-    num_queries_per_kv: ttgl.constexpr,  # int
-    block_table_stride: ttgl.int64,  # int
-    query_stride_0: ttgl.int64,  # int
-    query_stride_1: ttgl.int64,  # int, should be equal to head_size
-    qq_bias_stride_0: ttgl.int64,  # int
-    NUM_BLOCKS: ttgl.constexpr,  # int
-    BLOCK_SIZE: ttgl.constexpr,  # int
-    TILE_SIZE: ttgl.constexpr,  # int, must be power of 2
-    HEAD_SIZE: ttgl.constexpr,  # int
-    HEAD_SIZE_PADDED: ttgl.constexpr,  # int, must be power of 2
-    USE_ALIBI_SLOPES: ttgl.constexpr,  # bool
-    USE_QQ_BIAS: ttgl.constexpr,  # bool
-    USE_SOFTCAP: ttgl.constexpr,  # bool
-    USE_SINKS: ttgl.constexpr,  # bool
-    SLIDING_WINDOW: ttgl.constexpr,  # int
-    stride_k_cache_0: ttgl.int64,  # int
-    stride_k_cache_1: ttgl.int64,  # int
-    stride_k_cache_2: ttgl.int64,  # int
-    stride_k_cache_3: ttgl.constexpr,  # int
-    stride_v_cache_0: ttgl.int64,  # int
-    stride_v_cache_1: ttgl.int64,  # int
-    stride_v_cache_2: ttgl.int64,  # int
-    stride_v_cache_3: ttgl.constexpr,  # int
+    num_query_heads: gl.constexpr,  # int
+    num_queries_per_kv: gl.constexpr,  # int
+    block_table_stride: gl.int64,  # int
+    query_stride_0: gl.int64,  # int
+    query_stride_1: gl.int64,  # int, should be equal to head_size
+    qq_bias_stride_0: gl.int64,  # int
+    NUM_BLOCKS: gl.constexpr,  # int
+    BLOCK_SIZE: gl.constexpr,  # int
+    TILE_SIZE: gl.constexpr,  # int, must be power of 2
+    HEAD_SIZE: gl.constexpr,  # int
+    HEAD_SIZE_PADDED: gl.constexpr,  # int, must be power of 2
+    USE_ALIBI_SLOPES: gl.constexpr,  # bool
+    USE_QQ_BIAS: gl.constexpr,  # bool
+    USE_SOFTCAP: gl.constexpr,  # bool
+    USE_SINKS: gl.constexpr,  # bool
+    SLIDING_WINDOW: gl.constexpr,  # int
+    stride_k_cache_0: gl.int64,  # int
+    stride_k_cache_1: gl.int64,  # int
+    stride_k_cache_2: gl.int64,  # int
+    stride_k_cache_3: gl.constexpr,  # int
+    stride_v_cache_0: gl.int64,  # int
+    stride_v_cache_1: gl.int64,  # int
+    stride_v_cache_2: gl.int64,  # int
+    stride_v_cache_3: gl.constexpr,  # int
     query_start_len_ptr,  # [num_seqs+1]
-    BLOCK_Q: ttgl.constexpr,  # int
-    num_seqs: ttgl.int32,
-    BLOCK_M: ttgl.constexpr,  # int
-    NUM_SEGMENTS_PER_SEQ: ttgl.constexpr,  # int
-    num_warps: ttgl.constexpr,  # int
-    num_stages: ttgl.constexpr,  # int
-    QK_WMMA_LAYOUT: ttgl.constexpr,
-    PV_WMMA_LAYOUT: ttgl.constexpr,
-    Q_DOT_LAYOUT: ttgl.constexpr,
-    K_DOT_LAYOUT: ttgl.constexpr,
-    P_DOT_LAYOUT: ttgl.constexpr,
-    V_DOT_LAYOUT: ttgl.constexpr,
-    Q_SHARED_LAYOUT: ttgl.constexpr,
-    K_SHARED_LAYOUT: ttgl.constexpr,
-    V_SHARED_LAYOUT: ttgl.constexpr,
-    Q_LOAD_LAYOUT: ttgl.constexpr,
-    K_LOAD_LAYOUT: ttgl.constexpr,
-    V_LOAD_LAYOUT: ttgl.constexpr,
-    ALL_DECODE: ttgl.constexpr = False,  # bool
-    SHUFFLED_KV_CACHE: ttgl.constexpr = False,  # bool
+    BLOCK_Q: gl.constexpr,  # int
+    num_seqs: gl.int32,
+    BLOCK_M: gl.constexpr,  # int
+    NUM_SEGMENTS_PER_SEQ: gl.constexpr,  # int
+    num_warps: gl.constexpr,  # int
+    num_stages: gl.constexpr,  # int
+    QK_WMMA_LAYOUT: gl.constexpr,
+    PV_WMMA_LAYOUT: gl.constexpr,
+    Q_DOT_LAYOUT: gl.constexpr,
+    K_DOT_LAYOUT: gl.constexpr,
+    P_DOT_LAYOUT: gl.constexpr,
+    V_DOT_LAYOUT: gl.constexpr,
+    Q_SHARED_LAYOUT: gl.constexpr,
+    K_SHARED_LAYOUT: gl.constexpr,
+    V_SHARED_LAYOUT: gl.constexpr,
+    Q_LOAD_LAYOUT: gl.constexpr,
+    K_LOAD_LAYOUT: gl.constexpr,
+    V_LOAD_LAYOUT: gl.constexpr,
+    ALL_DECODE: gl.constexpr = False,  # bool
+    SHUFFLED_KV_CACHE: gl.constexpr = False,  # bool
 ):
-    q_block_global_idx = ttgl.program_id(0)
-    kv_head_idx = ttgl.program_id(1)
-    segm_idx = ttgl.program_id(2)
+    q_block_global_idx = gl.program_id(0)
+    kv_head_idx = gl.program_id(1)
+    segm_idx = gl.program_id(2)
 
     if SHUFFLED_KV_CACHE:
-        ttgl.static_assert(
+        gl.static_assert(
             TILE_SIZE == BLOCK_SIZE,
             "TILE_SIZE must be equal to BLOCK_SIZE if SHUFFLED_KV_CACHE is True",
         )
@@ -2347,49 +2335,42 @@ def gluon_kernel_unified_attention_3d(
     # context length for this particular sequence
     context_len = seq_len - cur_batch_query_len
 
-    smem_Q = ttgl.allocate_shared_memory(
+    smem_Q = gl.allocate_shared_memory(
         query_ptr.type.element_ty, [BLOCK_M, HEAD_SIZE_PADDED], layout=Q_SHARED_LAYOUT
     )
-    smem_K = None
-    smem_V = None
-    if not SHUFFLED_KV_CACHE:
-        smem_K = ttgl.allocate_shared_memory(
-            key_cache_ptr.type.element_ty,
-            [HEAD_SIZE_PADDED, TILE_SIZE],
-            layout=K_SHARED_LAYOUT,
-        )
-        smem_V = ttgl.allocate_shared_memory(
-            value_cache_ptr.type.element_ty,
-            [TILE_SIZE, HEAD_SIZE_PADDED],
-            layout=V_SHARED_LAYOUT,
-        )
-
-    offs_q_m = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, Q_LOAD_LAYOUT))
-    offs_q_d = ttgl.arange(
-        0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(0, Q_LOAD_LAYOUT)
+    smem_K = gl.allocate_shared_memory(
+        key_cache_ptr.type.element_ty,
+        [HEAD_SIZE_PADDED, TILE_SIZE],
+        layout=K_SHARED_LAYOUT,
+    )
+    smem_V = gl.allocate_shared_memory(
+        value_cache_ptr.type.element_ty,
+        [TILE_SIZE, HEAD_SIZE_PADDED],
+        layout=V_SHARED_LAYOUT,
     )
 
+    offs_q_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, Q_LOAD_LAYOUT))
+    offs_q_d = gl.arange(0, HEAD_SIZE_PADDED, layout=gl.SliceLayout(0, Q_LOAD_LAYOUT))
+
     if SHUFFLED_KV_CACHE:
-        offs_k_t = ttgl.arange(
-            0, TILE_SIZE // 16, layout=ttgl.SliceLayout(1, K_LOAD_LAYOUT)
+        offs_k_t = gl.arange(
+            0, TILE_SIZE // 16, layout=gl.SliceLayout(1, K_LOAD_LAYOUT)
         )
-        offs_k_d = ttgl.arange(
-            0, HEAD_SIZE_PADDED * 16, layout=ttgl.SliceLayout(0, K_LOAD_LAYOUT)
+        offs_k_d = gl.arange(
+            0, HEAD_SIZE_PADDED * 16, layout=gl.SliceLayout(0, K_LOAD_LAYOUT)
         )
-        offs_v_t = ttgl.arange(
-            0, TILE_SIZE * 16, layout=ttgl.SliceLayout(0, V_LOAD_LAYOUT)
-        )
-        offs_v_d = ttgl.arange(
-            0, HEAD_SIZE_PADDED // 16, layout=ttgl.SliceLayout(1, V_LOAD_LAYOUT)
+        offs_v_t = gl.arange(0, TILE_SIZE * 16, layout=gl.SliceLayout(0, V_LOAD_LAYOUT))
+        offs_v_d = gl.arange(
+            0, HEAD_SIZE_PADDED // 16, layout=gl.SliceLayout(1, V_LOAD_LAYOUT)
         )
     else:
-        offs_k_t = ttgl.arange(0, TILE_SIZE, layout=ttgl.SliceLayout(0, K_LOAD_LAYOUT))
-        offs_k_d = ttgl.arange(
-            0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(1, K_LOAD_LAYOUT)
+        offs_k_t = gl.arange(0, TILE_SIZE, layout=gl.SliceLayout(0, K_LOAD_LAYOUT))
+        offs_k_d = gl.arange(
+            0, HEAD_SIZE_PADDED, layout=gl.SliceLayout(1, K_LOAD_LAYOUT)
         )
-        offs_v_t = ttgl.arange(0, TILE_SIZE, layout=ttgl.SliceLayout(1, V_LOAD_LAYOUT))
-        offs_v_d = ttgl.arange(
-            0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(0, V_LOAD_LAYOUT)
+        offs_v_t = gl.arange(0, TILE_SIZE, layout=gl.SliceLayout(1, V_LOAD_LAYOUT))
+        offs_v_d = gl.arange(
+            0, HEAD_SIZE_PADDED, layout=gl.SliceLayout(0, V_LOAD_LAYOUT)
         )
 
     query_pos = q_block_local_idx * BLOCK_Q + offs_q_m // num_queries_per_kv
@@ -2405,15 +2386,15 @@ def gluon_kernel_unified_attention_3d(
     if HEAD_SIZE_PADDED != HEAD_SIZE:
         dim_mask = offs_q_d < HEAD_SIZE
     else:
-        dim_mask = ttgl.full((1,), 1, dtype=tl.int1)
+        dim_mask = gl.full((1,), 1, dtype=tl.int1)
 
     query_mask_0 = query_pos < cur_batch_query_len
     query_mask_1 = query_offset_1 < num_query_heads
 
     # Q_load : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = Q_LOAD_LAYOUT
-    Q_load = ttgl.amd.cdna4.buffer_load(
+    Q_load = gl.amd.cdna4.buffer_load(
         ptr=query_ptr,
-        offsets=query_offset.to(ttgl.int32),
+        offsets=query_offset.to(gl.int32),
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
     )
@@ -2421,9 +2402,9 @@ def gluon_kernel_unified_attention_3d(
     # Q : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = Q_DOT_LAYOUT
     Q = smem_Q.load(layout=Q_DOT_LAYOUT)
 
-    offs_q_m_qk = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, QK_WMMA_LAYOUT))
-    offs_q_d_qk = ttgl.arange(
-        0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(0, QK_WMMA_LAYOUT)
+    offs_q_m_qk = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, QK_WMMA_LAYOUT))
+    offs_q_d_qk = gl.arange(
+        0, HEAD_SIZE_PADDED, layout=gl.SliceLayout(0, QK_WMMA_LAYOUT)
     )
     query_pos_qk = q_block_local_idx * BLOCK_Q + offs_q_m_qk // num_queries_per_kv
     query_offset_0_qk = cur_batch_in_all_start_index + query_pos_qk
@@ -2433,7 +2414,7 @@ def gluon_kernel_unified_attention_3d(
     query_mask_0_qk = query_pos_qk < cur_batch_query_len
     query_mask_1_qk = query_offset_1_qk < num_query_heads
     query_mask_qk = query_mask_1_qk[:, None] & query_mask_0_qk[:, None]
-    offs_seq_t = ttgl.arange(0, TILE_SIZE, layout=ttgl.SliceLayout(0, QK_WMMA_LAYOUT))
+    offs_seq_t = gl.arange(0, TILE_SIZE, layout=gl.SliceLayout(0, QK_WMMA_LAYOUT))
 
     L, M, acc = _allocate_L_M_acc(
         sink_ptr,
@@ -2486,9 +2467,9 @@ def gluon_kernel_unified_attention_3d(
         segm_idx * tiles_per_segment,
         min((segm_idx + 1) * tiles_per_segment, num_tiles),
     ):
-        # seq_k_offset : shape = (TILE_SIZE if not SHUFFLED_KV_CACHE else TILE_SIZE // 16, ), layout = ttgl.SliceLayout(0 if not SHUFFLED_KV_CACHE else 1, K_LOAD_LAYOUT)
-        # seq_v_offset : shape = (TILE_SIZE, ), layout = ttgl.SliceLayout(1, Q_LOAD_LAYOUT)
-        # seq_offset : shape = (TILE_SIZE, ), layout = ttgl.SliceLayout(0, QK_WMMA_LAYOUT)
+        # seq_k_offset : shape = (TILE_SIZE if not SHUFFLED_KV_CACHE else TILE_SIZE // 16, ), layout = gl.SliceLayout(0 if not SHUFFLED_KV_CACHE else 1, K_LOAD_LAYOUT)
+        # seq_v_offset : shape = (TILE_SIZE, ), layout = gl.SliceLayout(1, Q_LOAD_LAYOUT)
+        # seq_offset : shape = (TILE_SIZE, ), layout = gl.SliceLayout(0, QK_WMMA_LAYOUT)
         if SHUFFLED_KV_CACHE:
             seq_k_offset = j * TILE_SIZE + offs_k_t * 16
             seq_v_offset = j * TILE_SIZE + offs_v_t // 16
@@ -2498,31 +2479,31 @@ def gluon_kernel_unified_attention_3d(
         seq_offset = j * TILE_SIZE + offs_seq_t
 
         if TILE_SIZE == BLOCK_SIZE:
-            tile_k_mask = ttgl.full(
-                (1,), 1, dtype=tl.int1, layout=ttgl.SliceLayout(0, K_LOAD_LAYOUT)
+            tile_k_mask = gl.full(
+                (1,), 1, dtype=tl.int1, layout=gl.SliceLayout(0, K_LOAD_LAYOUT)
             )
-            tile_v_mask = ttgl.full(
-                (1,), 1, dtype=tl.int1, layout=ttgl.SliceLayout(1, Q_LOAD_LAYOUT)
+            tile_v_mask = gl.full(
+                (1,), 1, dtype=tl.int1, layout=gl.SliceLayout(1, Q_LOAD_LAYOUT)
             )
         else:
             tile_k_mask = seq_k_offset < max_seq_prefix_len
             tile_v_mask = seq_v_offset < max_seq_prefix_len
 
-        physical_block_idx_k = ttgl.amd.cdna4.buffer_load(
+        physical_block_idx_k = gl.amd.cdna4.buffer_load(
             ptr=block_tables_ptr,
-            offsets=(block_table_offset + seq_k_offset // BLOCK_SIZE).to(ttgl.int32),
+            offsets=(block_table_offset + seq_k_offset // BLOCK_SIZE).to(gl.int32),
         ).to(tl.int64)
 
         # # At ASM level, the following two options of getting physical_block_idx_v are identical even though they are different at IR level:
-        # # 1. buffer_load directly with ttgl.SliceLayout(1, Q_LOAD_LAYOUT) layout (see below):
-        physical_block_idx_v = ttgl.amd.cdna4.buffer_load(
+        # # 1. buffer_load directly with gl.SliceLayout(1, Q_LOAD_LAYOUT) layout (see below):
+        physical_block_idx_v = gl.amd.cdna4.buffer_load(
             ptr=block_tables_ptr,
-            offsets=(block_table_offset + seq_v_offset // BLOCK_SIZE).to(ttgl.int32),
+            offsets=(block_table_offset + seq_v_offset // BLOCK_SIZE).to(gl.int32),
         ).to(tl.int64)
         #
-        # # 2. convert_layout from physical_block_idx_k, i.e., ttgl.SliceLayout(0, K_LOAD_LAYOUT) -> ttgl.SliceLayout(1, Q_LOAD_LAYOUT) (see below):
-        # physical_block_idx_v = ttgl.convert_layout(
-        #     physical_block_idx_k, layout=ttgl.SliceLayout(1, V_LOAD_LAYOUT)
+        # # 2. convert_layout from physical_block_idx_k, i.e., gl.SliceLayout(0, K_LOAD_LAYOUT) -> gl.SliceLayout(1, Q_LOAD_LAYOUT) (see below):
+        # physical_block_idx_v = gl.convert_layout(
+        #     physical_block_idx_k, layout=gl.SliceLayout(1, V_LOAD_LAYOUT)
         # )
 
         k_mask = None
@@ -2563,13 +2544,16 @@ def gluon_kernel_unified_attention_3d(
             k_scale,
             Q.dtype,
             key_cache_ptr,
-            k_offset.to(ttgl.int32),
+            k_offset.to(gl.int32),
             k_mask,
             other,
             KV_cache_modifier,
             SHUFFLED_KV_CACHE,
         )
-        if not SHUFFLED_KV_CACHE:
+        if SHUFFLED_KV_CACHE:
+            K = _unshuffle_kv_cache(K, TILE_SIZE, HEAD_SIZE_PADDED)
+            K = gl.convert_layout(value=K, layout=K_DOT_LAYOUT, assert_trivial=True)
+        else:
             smem_K.store(K)
 
         # V_load : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = Q_LOAD_LAYOUT
@@ -2577,19 +2561,18 @@ def gluon_kernel_unified_attention_3d(
             v_scale,
             Q.dtype,
             value_cache_ptr,
-            v_offset.to(ttgl.int32),
+            v_offset.to(gl.int32),
             v_mask,
             other,
             KV_cache_modifier,
         )
-        if not SHUFFLED_KV_CACHE:
+        if SHUFFLED_KV_CACHE:
+            V = _unshuffle_kv_cache(V, HEAD_SIZE_PADDED, TILE_SIZE)
+            V = gl.convert_layout(value=V, layout=V_DOT_LAYOUT, assert_trivial=True)
+        else:
             smem_V.store(V)
 
-        # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
-        if SHUFFLED_KV_CACHE:
-            K = _unshuffle_kv_cache(K, TILE_SIZE, HEAD_SIZE_PADDED)
-            K = ttgl.convert_layout(value=K, layout=K_DOT_LAYOUT, assert_trivial=True)
-        else:
+        if not SHUFFLED_KV_CACHE:
             K = smem_K.load(layout=K_DOT_LAYOUT)
         P, L, M, acc = _perform_QK_wmma_and_update_L_M(
             Q,
@@ -2618,20 +2601,16 @@ def gluon_kernel_unified_attention_3d(
             PV_WMMA_LAYOUT,
         )
 
-        # K : shape = (HEAD_SIZE_PADDED, TILE_SIZE), layout = K_DOT_LAYOUT
-        if SHUFFLED_KV_CACHE:
-            V = _unshuffle_kv_cache(V, HEAD_SIZE_PADDED, TILE_SIZE)
-            V = ttgl.convert_layout(value=V, layout=V_DOT_LAYOUT, assert_trivial=True)
-        else:
+        if not SHUFFLED_KV_CACHE:
             V = smem_V.load(layout=V_DOT_LAYOUT)
         # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
         acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
 
     # store segm_output
     # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
-    offs_q_m_pv = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, PV_WMMA_LAYOUT))
-    offs_q_d_pv = ttgl.arange(
-        0, HEAD_SIZE_PADDED, layout=ttgl.SliceLayout(0, PV_WMMA_LAYOUT)
+    offs_q_m_pv = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, PV_WMMA_LAYOUT))
+    offs_q_d_pv = gl.arange(
+        0, HEAD_SIZE_PADDED, layout=gl.SliceLayout(0, PV_WMMA_LAYOUT)
     )
     query_pos_pv = q_block_local_idx * BLOCK_Q + offs_q_m_pv // num_queries_per_kv
     query_offset_0_pv = cur_batch_in_all_start_index + query_pos_pv
@@ -2648,7 +2627,7 @@ def gluon_kernel_unified_attention_3d(
         + segm_idx * HEAD_SIZE_PADDED
         + offs_q_d_pv[None, :]
     )
-    ttgl.amd.cdna4.buffer_store(
+    gl.amd.cdna4.buffer_store(
         stored_value=acc,
         ptr=segm_output_ptr,
         offsets=segm_output_offset,
@@ -2656,20 +2635,20 @@ def gluon_kernel_unified_attention_3d(
     )
 
     # store segm_max and segm_expsum
-    # L : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, QK_WMMA_LAYOUT)
-    # M : shape = (BLOCK_M, ), layout = ttgl.SliceLayout(1, QK_WMMA_LAYOUT)
+    # L : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, QK_WMMA_LAYOUT)
+    # M : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, QK_WMMA_LAYOUT)
     segm_offset = (
         query_offset_0_qk * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
         + query_offset_1_qk * NUM_SEGMENTS_PER_SEQ
         + segm_idx
     )
-    ttgl.amd.cdna4.buffer_store(
+    gl.amd.cdna4.buffer_store(
         stored_value=M,
         ptr=segm_max_ptr,
         offsets=segm_offset,
         mask=query_mask_0_qk & query_mask_1_qk,
     )
-    ttgl.amd.cdna4.buffer_store(
+    gl.amd.cdna4.buffer_store(
         stored_value=L,
         ptr=segm_expsum_ptr,
         offsets=segm_offset,

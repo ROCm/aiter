@@ -15,7 +15,7 @@ from aiter.ops.triton.gluon.unified_attention_3d_kernel_tdm_new import (
     kernel_unified_attention_3d_new,
 )
 from triton.experimental import gluon
-import triton.experimental.gluon.language as ttgl
+import triton.experimental.gluon.language as gl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 DEVICE_ARCH = arch_info.get_arch()
@@ -86,7 +86,7 @@ def make_distributed_linear_layout(
                 f"Token {k} should appear only once, but appears {token_counter[k]} times"
             )
     # print(arg)
-    layout: ttgl.constexpr = ttgl.DistributedLinearLayout(
+    layout: gl.constexpr = gl.DistributedLinearLayout(
         **arg,
         block_bases=[],
         shape=shape,
@@ -247,7 +247,7 @@ def make_layout_3d(
 
         warp_bases = [(0, 1 << i) for i in range(int(math.log2(num_warps)))]
 
-        QK_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDWMMALayout(
+        QK_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
             version=3,
             transposed=True,
             warp_bases=warp_bases,
@@ -255,59 +255,59 @@ def make_layout_3d(
             instr_shape=[16, 16, 32],
         )
 
-        PV_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDWMMALayout(
+        PV_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
             version=3,
             transposed=True,
             warp_bases=warp_bases,
             reg_bases=[],
             instr_shape=[16, 16, 32],
         )
-        Q_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+        Q_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
             operand_index=0, parent=QK_WMMA_LAYOUT, k_width=8
         )
-        K_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+        K_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
             operand_index=1, parent=QK_WMMA_LAYOUT, k_width=8
         )
-        P_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+        P_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
             operand_index=0, parent=PV_WMMA_LAYOUT, k_width=8
         )
-        V_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+        V_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
             operand_index=1, parent=PV_WMMA_LAYOUT, k_width=8
         )
     else:
-        QK_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDMFMALayout(
+        QK_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDMFMALayout(
             version=4,
             instr_shape=[16, 16, 32],
             transposed=True,
             warps_per_cta=[1, num_warps],
         )
-        PV_WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDMFMALayout(
+        PV_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDMFMALayout(
             version=4,
             instr_shape=[16, 16, 16 if TILE_SIZE <= 16 else 32],
             transposed=True,
             warps_per_cta=[1, num_warps],
         )
-        Q_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+        Q_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
             operand_index=0, parent=QK_WMMA_LAYOUT, k_width=8
         )
-        K_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+        K_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
             operand_index=1, parent=QK_WMMA_LAYOUT, k_width=8
         )
-        P_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+        P_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
             operand_index=0, parent=PV_WMMA_LAYOUT, k_width=4 if TILE_SIZE <= 16 else 8
         )
-        V_DOT_LAYOUT: ttgl.constexpr = ttgl.DotOperandLayout(
+        V_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
             operand_index=1, parent=PV_WMMA_LAYOUT, k_width=4 if TILE_SIZE <= 16 else 8
         )
 
     if use_tdm or not use_swizzle:
-        Q_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
+        Q_SHARED_LAYOUT: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
             interval_padding_pairs=[[HEAD_SIZE_PADDED, 8]],
             shape=[BLOCK_M, HEAD_SIZE_PADDED],
             order=[1, 0],
         )
         if use_gather:
-            K_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
+            K_SHARED_LAYOUT: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
                 interval_padding_pairs=[[BLOCK_SIZE * HEAD_SIZE_PADDED, 8]],
                 shape=(
                     [NUM_BLOCKS_GATHER_PER_TILE, BLOCK_SIZE * HEAD_SIZE_PADDED]
@@ -316,13 +316,13 @@ def make_layout_3d(
                 ),
                 order=[1, 0],
             )
-            V_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
+            V_SHARED_LAYOUT: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
                 interval_padding_pairs=[[BLOCK_SIZE * HEAD_SIZE_PADDED, 8]],
                 shape=[NUM_BLOCKS_GATHER_PER_TILE, BLOCK_SIZE * HEAD_SIZE_PADDED],
                 order=[1, 0],
             )
         else:
-            K_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
+            K_SHARED_LAYOUT: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
                 interval_padding_pairs=[[HEAD_SIZE_PADDED, 8]],
                 shape=(
                     [TILE_SIZE, HEAD_SIZE_PADDED]
@@ -331,22 +331,30 @@ def make_layout_3d(
                 ),
                 order=[1, 0],
             )
-            V_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for(
+            V_SHARED_LAYOUT: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
                 interval_padding_pairs=[[HEAD_SIZE_PADDED, 8]],
                 shape=[TILE_SIZE, HEAD_SIZE_PADDED],
                 order=[1, 0],
             )
     else:
-        Q_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
+        Q_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
             vec=8, per_phase=2, max_phase=8, order=[1, 0]
         )
-        K_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
-            vec=8, per_phase=2, max_phase=8, order=[0, 1]
-        )
-        V_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
-            vec=1, per_phase=1, max_phase=1, order=[1, 0]
-        )
-        # V_SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(
+        if shuffled_kv_cache:
+            K_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
+                vec=1, per_phase=1, max_phase=1, order=[0, 1]
+            )
+            V_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
+                vec=1, per_phase=1, max_phase=1, order=[0, 1]
+            )
+        else:
+            K_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
+                vec=8, per_phase=2, max_phase=8, order=[0, 1]
+            )
+            V_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
+                vec=1, per_phase=1, max_phase=1, order=[1, 0]
+            )
+        # V_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
         #     vec=4, per_phase=2, max_phase=8, order=[1, 0]
         # )
 
@@ -354,7 +362,7 @@ def make_layout_3d(
         # ttg.padded_shared<[512:+16] {offset = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16], [0, 1], [0, 2], [0, 32]], block = []}>
         # 128
         # ttg.padded_shared<[512:+16] {offset = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [0, 16], [0, 32], [0, 1], [0, 2], [0, 4], [0, 8]], block = []}>
-        # K_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout(
+        # K_SHARED_LAYOUT: gl.constexpr = gl.PaddedSharedLayout(
         #     interval_padding_pairs=[[512, 16]],
         #     offset_bases=[
         #         [1, 0],
@@ -378,7 +386,7 @@ def make_layout_3d(
         # ttg.padded_shared<[512:+16] {offset = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [8, 0], [4, 0], [16, 0], [1, 0], [2, 0], [32, 0]], block = []}>
         # 128
         # ttg.padded_shared<[512:+16] {offset = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0], [1, 0], [2, 0], [8, 0], [4, 0]], block = []}>
-        # V_SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout(
+        # V_SHARED_LAYOUT: gl.constexpr = gl.PaddedSharedLayout(
         #     interval_padding_pairs=[[512, 16]],
         #     offset_bases=[
         #         [0, 1],
@@ -409,7 +417,7 @@ def make_layout_3d(
     )
 
     # in gfx950, ttg.async_copy_global_to_local will fail if threads_per_warp=[WARP_SIZE//4, 4] is used
-    Q_LOAD_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
+    Q_LOAD_LAYOUT: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, size_per_thread_fastest_dim],
         threads_per_warp=[
             WARP_SIZE // threads_per_warp_fastest_dim,
@@ -427,7 +435,7 @@ def make_layout_3d(
             HEAD_SIZE_PADDED // 16, TILE_SIZE * 16, num_warps_log2
         )
     else:
-        K_LOAD_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
+        K_LOAD_LAYOUT: gl.constexpr = gl.BlockedLayout(
             size_per_thread=[size_per_thread_fastest_dim, 1],
             threads_per_warp=[
                 threads_per_warp_fastest_dim,
@@ -436,7 +444,7 @@ def make_layout_3d(
             warps_per_cta=[1, num_warps],
             order=[0, 1],
         )
-        V_LOAD_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout(
+        V_LOAD_LAYOUT: gl.constexpr = gl.BlockedLayout(
             size_per_thread=[1, size_per_thread_fastest_dim],
             threads_per_warp=[
                 WARP_SIZE // threads_per_warp_fastest_dim,
@@ -450,7 +458,7 @@ def make_layout_3d(
     # ttg.linear<{register = [[1, 0], [2, 0], [4, 0], [0, 2], [0, 32]], lane = [[8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16]], warp = [[0, 1]], block = []}>
     # 128
     # ttg.linear<{register = [[1, 0], [2, 0], [4, 0], [0, 2], [0, 4], [0, 8]], lane = [[8, 0], [16, 0], [32, 0], [64, 0], [0, 16], [0, 32]], warp = [[0, 1]], block = []}>
-    # K_LOAD_LAYOUT: ttgl.constexpr = ttgl.DistributedLinearLayout(
+    # K_LOAD_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
     #     reg_bases=[[1, 0], [2, 0], [4, 0], [0, 2], [0, 32]],
     #     lane_bases=[[8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16]],
     #     warp_bases=[[0, 1]],
@@ -470,7 +478,7 @@ def make_layout_3d(
     # ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [2, 0], [32, 0]], lane = [[0, 8], [0, 16], [0, 32], [8, 0], [4, 0], [16, 0]], warp = [[1, 0]], block = []}>
     # 128
     # ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [2, 0], [8, 0], [4, 0]], lane = [[0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0]], warp = [[1, 0]], block = []}>
-    # V_LOAD_LAYOUT: ttgl.constexpr = ttgl.DistributedLinearLayout(
+    # V_LOAD_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
     #     reg_bases=[[0, 1], [0, 2], [0, 4], [2, 0], [32, 0]],
     #     lane_bases=[[0, 8], [0, 16], [0, 32], [8, 0], [4, 0], [16, 0]],
     #     warp_bases=[[1, 0]],
