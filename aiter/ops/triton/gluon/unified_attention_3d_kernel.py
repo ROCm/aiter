@@ -1,6 +1,7 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
 from re import T
+from shlex import join
 import triton
 import triton.language as tl
 import torch
@@ -2338,16 +2339,31 @@ def gluon_kernel_unified_attention_3d(
     smem_Q = gl.allocate_shared_memory(
         query_ptr.type.element_ty, [BLOCK_M, HEAD_SIZE_PADDED], layout=Q_SHARED_LAYOUT
     )
-    smem_K = gl.allocate_shared_memory(
-        key_cache_ptr.type.element_ty,
-        [HEAD_SIZE_PADDED, TILE_SIZE],
-        layout=K_SHARED_LAYOUT,
-    )
-    smem_V = gl.allocate_shared_memory(
-        value_cache_ptr.type.element_ty,
-        [TILE_SIZE, HEAD_SIZE_PADDED],
-        layout=V_SHARED_LAYOUT,
-    )
+    smem_K = None
+    smem_V = None
+    if SHUFFLED_KV_CACHE:
+        # pass
+        smem_K = gl.allocate_shared_memory(
+            key_cache_ptr.type.element_ty,
+            [TILE_SIZE // 16, HEAD_SIZE_PADDED * 16],
+            layout=K_SHARED_LAYOUT,
+        )
+        smem_V = gl.allocate_shared_memory(
+            value_cache_ptr.type.element_ty,
+            [HEAD_SIZE_PADDED // 16, TILE_SIZE * 16],
+            layout=V_SHARED_LAYOUT,
+        )
+    else:
+        smem_K = gl.allocate_shared_memory(
+            key_cache_ptr.type.element_ty,
+            [HEAD_SIZE_PADDED, TILE_SIZE],
+            layout=K_SHARED_LAYOUT,
+        )
+        smem_V = gl.allocate_shared_memory(
+            value_cache_ptr.type.element_ty,
+            [TILE_SIZE, HEAD_SIZE_PADDED],
+            layout=V_SHARED_LAYOUT,
+        )
 
     offs_q_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, Q_LOAD_LAYOUT))
     offs_q_d = gl.arange(0, HEAD_SIZE_PADDED, layout=gl.SliceLayout(0, Q_LOAD_LAYOUT))
@@ -2470,59 +2486,66 @@ def gluon_kernel_unified_attention_3d(
         # seq_k_offset : shape = (TILE_SIZE if not SHUFFLED_KV_CACHE else TILE_SIZE // 16, ), layout = gl.SliceLayout(0 if not SHUFFLED_KV_CACHE else 1, K_LOAD_LAYOUT)
         # seq_v_offset : shape = (TILE_SIZE, ), layout = gl.SliceLayout(1, Q_LOAD_LAYOUT)
         # seq_offset : shape = (TILE_SIZE, ), layout = gl.SliceLayout(0, QK_WMMA_LAYOUT)
-        if SHUFFLED_KV_CACHE:
-            seq_k_offset = j * TILE_SIZE + offs_k_t * 16
-            seq_v_offset = j * TILE_SIZE + offs_v_t // 16
-        else:
-            seq_k_offset = j * TILE_SIZE + offs_k_t
-            seq_v_offset = j * TILE_SIZE + offs_v_t
         seq_offset = j * TILE_SIZE + offs_seq_t
-
-        if TILE_SIZE == BLOCK_SIZE:
-            tile_k_mask = gl.full(
-                (1,), 1, dtype=tl.int1, layout=gl.SliceLayout(0, K_LOAD_LAYOUT)
-            )
-            tile_v_mask = gl.full(
-                (1,), 1, dtype=tl.int1, layout=gl.SliceLayout(1, Q_LOAD_LAYOUT)
-            )
-        else:
-            tile_k_mask = seq_k_offset < max_seq_prefix_len
-            tile_v_mask = seq_v_offset < max_seq_prefix_len
-
-        physical_block_idx_k = gl.amd.cdna4.buffer_load(
-            ptr=block_tables_ptr,
-            offsets=(block_table_offset + seq_k_offset // BLOCK_SIZE).to(gl.int32),
-        ).to(tl.int64)
-
-        # # At ASM level, the following two options of getting physical_block_idx_v are identical even though they are different at IR level:
-        # # 1. buffer_load directly with gl.SliceLayout(1, Q_LOAD_LAYOUT) layout (see below):
-        physical_block_idx_v = gl.amd.cdna4.buffer_load(
-            ptr=block_tables_ptr,
-            offsets=(block_table_offset + seq_v_offset // BLOCK_SIZE).to(gl.int32),
-        ).to(tl.int64)
-        #
-        # # 2. convert_layout from physical_block_idx_k, i.e., gl.SliceLayout(0, K_LOAD_LAYOUT) -> gl.SliceLayout(1, Q_LOAD_LAYOUT) (see below):
-        # physical_block_idx_v = gl.convert_layout(
-        #     physical_block_idx_k, layout=gl.SliceLayout(1, V_LOAD_LAYOUT)
-        # )
 
         k_mask = None
         v_mask = None
         other = None
         if SHUFFLED_KV_CACHE:
+            # seq_k_offset = j * TILE_SIZE + offs_k_t * 16
+            # seq_v_offset = j * TILE_SIZE + offs_v_t // 16
+            # physical_block_idx_k = gl.amd.cdna4.buffer_load(
+            #     ptr=block_tables_ptr,
+            #     offsets=(block_table_offset + seq_k_offset // BLOCK_SIZE).to(gl.int32),
+            # ).to(tl.int64)
+
+            # physical_block_idx_v = gl.amd.cdna4.buffer_load(
+            #     ptr=block_tables_ptr,
+            #     offsets=(block_table_offset + seq_v_offset // BLOCK_SIZE).to(gl.int32),
+            # ).to(tl.int64)
+            physical_block_idx = gl.load(block_tables_ptr + block_table_offset + j).to(
+                tl.int64
+            )
+
             k_offset = (
-                physical_block_idx_k[:, None] * stride_k_cache_0
+                # physical_block_idx_k[:, None] * stride_k_cache_0
+                physical_block_idx * stride_k_cache_0
                 + kv_head_idx * stride_k_cache_1
                 + offs_k_t[:, None] * stride_k_cache_2
                 + offs_k_d[None, :] * stride_k_cache_3
             )
             v_offset = (
-                physical_block_idx_v[None, :] * stride_v_cache_0
+                # physical_block_idx_v[None, :] * stride_v_cache_0
+                physical_block_idx * stride_v_cache_0
                 + kv_head_idx * stride_v_cache_1
                 + offs_v_t[None, :] * stride_v_cache_3
                 + offs_v_d[:, None] * stride_v_cache_2
             )
         else:
+            seq_k_offset = j * TILE_SIZE + offs_k_t
+            seq_v_offset = j * TILE_SIZE + offs_v_t
+
+            if TILE_SIZE == BLOCK_SIZE:
+                tile_k_mask = gl.full(
+                    (1,), 1, dtype=tl.int1, layout=gl.SliceLayout(0, K_LOAD_LAYOUT)
+                )
+                tile_v_mask = gl.full(
+                    (1,), 1, dtype=tl.int1, layout=gl.SliceLayout(1, Q_LOAD_LAYOUT)
+                )
+            else:
+                tile_k_mask = seq_k_offset < max_seq_prefix_len
+                tile_v_mask = seq_v_offset < max_seq_prefix_len
+
+            physical_block_idx_k = gl.amd.cdna4.buffer_load(
+                ptr=block_tables_ptr,
+                offsets=(block_table_offset + seq_k_offset // BLOCK_SIZE).to(gl.int32),
+            ).to(tl.int64)
+
+            physical_block_idx_v = gl.amd.cdna4.buffer_load(
+                ptr=block_tables_ptr,
+                offsets=(block_table_offset + seq_v_offset // BLOCK_SIZE).to(gl.int32),
+            ).to(tl.int64)
+
             k_offset = (
                 physical_block_idx_k[None, :] * stride_k_cache_0
                 + kv_head_idx * stride_k_cache_2
@@ -2551,8 +2574,8 @@ def gluon_kernel_unified_attention_3d(
             SHUFFLED_KV_CACHE,
         )
         if SHUFFLED_KV_CACHE:
-            K = _unshuffle_kv_cache(K, TILE_SIZE, HEAD_SIZE_PADDED)
-            K = gl.convert_layout(value=K, layout=K_DOT_LAYOUT, assert_trivial=True)
+            # smem_K.store(K)
+            pass
         else:
             smem_K.store(K)
 
@@ -2567,12 +2590,16 @@ def gluon_kernel_unified_attention_3d(
             KV_cache_modifier,
         )
         if SHUFFLED_KV_CACHE:
-            V = _unshuffle_kv_cache(V, HEAD_SIZE_PADDED, TILE_SIZE)
-            V = gl.convert_layout(value=V, layout=V_DOT_LAYOUT, assert_trivial=True)
+            # smem_V.store(V)
+            pass
         else:
             smem_V.store(V)
 
-        if not SHUFFLED_KV_CACHE:
+        if SHUFFLED_KV_CACHE:
+            # K = smem_K.load(layout=K_LOAD_LAYOUT)
+            K = _unshuffle_kv_cache(K, TILE_SIZE, HEAD_SIZE_PADDED)
+            K = gl.convert_layout(value=K, layout=K_DOT_LAYOUT, assert_trivial=True)
+        else:
             K = smem_K.load(layout=K_DOT_LAYOUT)
         P, L, M, acc = _perform_QK_wmma_and_update_L_M(
             Q,
@@ -2601,7 +2628,11 @@ def gluon_kernel_unified_attention_3d(
             PV_WMMA_LAYOUT,
         )
 
-        if not SHUFFLED_KV_CACHE:
+        if SHUFFLED_KV_CACHE:
+            # V = smem_V.load(layout=V_LOAD_LAYOUT)
+            V = _unshuffle_kv_cache(V, HEAD_SIZE_PADDED, TILE_SIZE)
+            V = gl.convert_layout(value=V, layout=V_DOT_LAYOUT, assert_trivial=True)
+        else:
             V = smem_V.load(layout=V_DOT_LAYOUT)
         # acc : shape = (BLOCK_M, HEAD_SIZE_PADDED), layout = PV_WMMA_LAYOUT
         acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)

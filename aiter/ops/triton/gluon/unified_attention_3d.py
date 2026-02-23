@@ -342,10 +342,10 @@ def make_layout_3d(
         )
         if shuffled_kv_cache:
             K_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
-                vec=1, per_phase=1, max_phase=1, order=[0, 1]
+                vec=1, per_phase=1, max_phase=1, order=[1, 0]
             )
             V_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
-                vec=1, per_phase=1, max_phase=1, order=[0, 1]
+                vec=1, per_phase=1, max_phase=1, order=[1, 0]
             )
         else:
             K_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
