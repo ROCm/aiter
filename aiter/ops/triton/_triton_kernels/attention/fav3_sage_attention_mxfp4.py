@@ -1083,24 +1083,7 @@ def _compute_delta_s_kernel(
 
 def create_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
     """
-    Create an orthogonal Hadamard matrix of size block_size x block_size.
-    Uses Sylvester's recursive construction and normalizes to be orthogonal.
-
-    Args:
-        block_size: Size of the matrix (must be a power of 2)
-
-    Returns:
-        Orthogonal Hadamard matrix of shape (block_size, block_size)
-        Satisfies: H @ H.T = I (identity matrix)
-
-    Example:
-        H_2 = [[1,  1],
-               [1, -1]] / sqrt(2)
-
-        H_4 = [[1,  1,  1,  1],
-               [1, -1,  1, -1],
-               [1,  1, -1, -1],
-               [1, -1, -1,  1]] / 2
+    Returns a Hadamard matrix of size block_size x block_size. Remember to normalize with sqrt(block_size) for it to be orthogonal.
     """
     assert (block_size & (block_size - 1)) == 0, "block_size must be power of 2"
     assert block_size > 0, "block_size must be positive"
@@ -1121,11 +1104,9 @@ def create_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
     H[half:, :half] = H_half
     H[half:, half:] = -H_half
 
-    # Normalize to make it orthogonal: H @ H.T = I
+    
     # The unnormalized matrix satisfies H_unnorm @ H_unnorm.T = block_size * I
-    # So divide by sqrt(block_size) to get orthogonal matrix
-    # H = H / (2.0 ** 0.5)  # Divide by sqrt(2) since we doubled the size
-
+    # remember to divide by sqrt(block_size) to get orthogonal matrix
     return H
 
 
