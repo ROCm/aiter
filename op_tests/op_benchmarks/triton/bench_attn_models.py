@@ -5,10 +5,12 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import time
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from itertools import product
+from pathlib import Path
 from typing import Iterable, Literal, Optional, Self, get_args
 
 import matplotlib.pyplot as plt
@@ -49,6 +51,104 @@ DEFAULT_SEQ_END_K: float = 8.0
 DEFAULT_SEQ_START: int = seq_k_to_token_count(DEFAULT_SEQ_START_K)
 DEFAULT_SEQ_INC: int = seq_k_to_token_count(DEFAULT_SEQ_INC_K)
 DEFAULT_SEQ_END: int = seq_k_to_token_count(DEFAULT_SEQ_END_K)
+
+
+class TritonCache:
+    cache_dir: Optional[Path]
+    cache_dir_initialized: bool
+    unresolved_warned: bool
+    last_cache_check_ts: Optional[float]
+
+    def __init__(self) -> None:
+        self.cache_dir = None
+        self.cache_dir_initialized = False
+        self.unresolved_warned = False
+        self.missing_warned = False
+        self.last_cache_check_ts = None
+
+    def get_cache_dir(self) -> Optional[Path]:
+        """Resolve and cache Triton cache directory."""
+        if self.cache_dir_initialized:
+            return self.cache_dir
+        triton_cache_dir: Optional[str] = os.getenv("TRITON_CACHE_DIR")
+        if triton_cache_dir:
+            self.cache_dir = Path(triton_cache_dir)
+            self.cache_dir_initialized = True
+            return self.cache_dir
+        triton_home: Optional[str] = os.getenv("TRITON_HOME")
+        if triton_home:
+            self.cache_dir = Path(triton_home) / ".triton" / "cache"
+            self.cache_dir_initialized = True
+            return self.cache_dir
+        try:
+            self.cache_dir = Path.home() / ".triton" / "cache"
+        except RuntimeError:
+            self.cache_dir = None
+        self.cache_dir_initialized = True
+        return self.cache_dir
+
+    @staticmethod
+    def get_dir_size_mb(path: Path) -> float:
+        total_bytes: int = 0
+        stack: list[Path] = [path]
+        while stack:
+            current_path: Path = stack.pop()
+            try:
+                with os.scandir(current_path) as entries:
+                    for entry in entries:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(Path(entry.path))
+                                continue
+                            total_bytes += entry.stat(follow_symlinks=False).st_size
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+        return total_bytes / (1024 * 1024)
+
+    def wipe_if_oversize(
+        self,
+        max_cache_mb: Optional[int],
+        check_interval_s: float = 60.0,
+    ) -> None:
+        if max_cache_mb is None or max_cache_mb < 0:
+            return
+        now_ts: float = time.monotonic()
+        if (
+            self.last_cache_check_ts is not None
+            and now_ts - self.last_cache_check_ts < check_interval_s
+        ):
+            return
+        self.last_cache_check_ts = now_ts
+        cache_dir: Optional[Path] = self.get_cache_dir()
+        if cache_dir is None:
+            if not self.unresolved_warned:
+                logging.warning(
+                    "Triton cache directory couldn't be determined; cache cleanup is disabled."
+                )
+                self.unresolved_warned = True
+            return
+        if not cache_dir.exists():
+            return
+        size_mb: float = self.get_dir_size_mb(cache_dir)
+        if size_mb <= max_cache_mb:
+            return
+        logging.warning(
+            "Triton cache directory is %.2f MB (max allowed: %d MB). Wiping %s.",
+            size_mb,
+            max_cache_mb,
+            cache_dir,
+        )
+        try:
+            shutil.rmtree(cache_dir)
+        except OSError as e:
+            logging.warning(
+                "Failed to wipe Triton cache directory [%s]. %s: %s",
+                cache_dir,
+                type(e).__name__,
+                e,
+            )
 
 
 @dataclass(kw_only=True)
@@ -897,6 +997,15 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         help=f"output CSV file with benchmark results (default: {default_output})",
     )
     parser.add_argument(
+        "--max-cache",
+        type=positive_int,
+        default=None,
+        help=(
+            "maximum Triton cache size in MB, "
+            "if cache exceeds this value, cache directory is wiped (default: disabled)"
+        ),
+    )
+    parser.add_argument(
         "--list-models",
         action="store_true",
         default=False,
@@ -1021,6 +1130,7 @@ def main(args: list[str] | None = None) -> None:
         return
 
     global_stats = GlobalStats()
+    triton_cache = TritonCache()
 
     with open(parsed_args.output, mode="w", newline="") as csv_file:
         writer = csv.writer(csv_file, quoting=csv.QUOTE_NONNUMERIC)
@@ -1041,6 +1151,7 @@ def main(args: list[str] | None = None) -> None:
                     metric.user_unit,
                 )
             writer.writerow(ba.csv_data(perf))
+            triton_cache.wipe_if_oversize(parsed_args.max_cache)
 
     global_stats.log_stats()
 
