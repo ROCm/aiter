@@ -451,6 +451,10 @@ void moe_stage1_g1u1(
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
     int model_dim  = input.size(-1);
     int hidden_dim = inter_dim;
+    
+    int model_dim_w1 = w1.size(2);
+    int model_dim_w2 = w2.size(1);
+    int gu_int4 = (model_dim_w2 / model_dim_w1 == 2) ? 1 : 0;
 
     int token_cnt = input.size(-2);
     int topk      = out.size(1);
@@ -507,14 +511,19 @@ void moe_stage1_g1u1(
                 cfg.tile_m);
 
     int stride_X  = input.stride(-2) * input.element_size();
-    //int stride_GU = model_dim * w1.element_size();
-    int stride_GU = w1.stride(-2) * w1.element_size(); // feifei
+    int stride_GU = model_dim * w1.element_size();
 
     int stride_expert_GU    = stride_GU * inter_dim;
     int stride_expert_GUDQN = w1_scale.has_value() ? w1_scale.value().stride(0) * sizeof(float) : 0;
     int stride_expert_SMTDQN = inter_dim * sizeof(float);
     int stride_O             = topk * inter_dim * out.element_size();
     int stride_expert_LQQ    = w1_lqq_scale.has_value() ? w1_lqq_scale.value().stride(0) : 0;
+    
+    if(gu_int4)
+    {
+        stride_GU /= 2;
+        stride_expert_GU /= 2;
+    }
 
     if(inter_dim * 2 == w1.size(1))
     {
@@ -675,6 +684,10 @@ void moe_stage2_g1u1(
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
 
     int inter_dim = inter_states.size(-1); // inter_states: [..., inter_dim]
+    
+    int model_dim_w1 = w1.size(2);
+    int model_dim_w2 = w2.size(1);
+    int isInt4 = (model_dim_w2 / model_dim_w1 == 2) ? 1 : 0;
 
     int sub_X_cnt;
     if(num_valid_ids.numel() > 0)
@@ -736,6 +749,11 @@ void moe_stage2_g1u1(
     int stride_expert_D = inter_dim * dim * w2.element_size();
 
     int stride_expert_scale_D = w2_scale.has_value() ? dim * sizeof(float) : 0;
+    
+    if (isInt4) {
+        stride_D         /= 2;
+        stride_expert_D  /= 2;
+    }
 
     int dbl_o    = (splitk > 1) ? 2 : 1;
     int stride_O = dim * out.element_size() * dbl_o;
