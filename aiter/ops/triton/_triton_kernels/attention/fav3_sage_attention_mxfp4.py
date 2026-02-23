@@ -51,7 +51,7 @@ def compute_block_masking(
     """
 
     # common
-    q_start = start_m * BLOCK_M
+    # q_start = start_m * BLOCK_M
     q_end = tl.minimum((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
     diag = seqlen_k - seqlen_q
     total_k_blocks = tl.cdiv(seqlen_k, BLOCK_N)
