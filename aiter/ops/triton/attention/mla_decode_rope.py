@@ -200,6 +200,24 @@ def decode_attention_fwd_grouped_rope(
     if config is None:
         config = _get_config()
 
+    is_fp32: bool = any(
+        float_tensor is not None and float_tensor.dtype == torch.float32
+        for float_tensor in (
+            q,
+            k_buffer,
+            v_buffer,
+            o,
+            k_pe_tokens,
+            cos_sin_cache,
+            attn_logits,
+        )
+    )
+    base_config_key: str = "fwd_grouped_kernel_stage1_rope"
+    fp32_config_key: str = f"{base_config_key}_fp32"
+    config_key: str = (
+        fp32_config_key if is_fp32 and fp32_config_key in config else base_config_key
+    )
+
     _decode_grouped_att_m_fwd_rope(
         q,
         k_buffer,
@@ -217,7 +235,7 @@ def decode_attention_fwd_grouped_rope(
         logit_cap,
         use_rope,
         is_neox_style,
-        config["fwd_grouped_kernel_stage1_rope"],
+        config[config_key],
     )
     _decode_softmax_reducev_fwd(
         attn_logits,
