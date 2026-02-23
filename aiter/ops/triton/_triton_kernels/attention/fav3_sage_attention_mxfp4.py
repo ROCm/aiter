@@ -1104,7 +1104,6 @@ def create_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
     H[half:, :half] = H_half
     H[half:, half:] = -H_half
 
-    
     # The unnormalized matrix satisfies H_unnorm @ H_unnorm.T = block_size * I
     # remember to divide by sqrt(block_size) to get orthogonal matrix
     return H
