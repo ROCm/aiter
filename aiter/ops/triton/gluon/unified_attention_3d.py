@@ -86,10 +86,12 @@ def make_distributed_linear_layout(
                 f"Token {k} should appear only once, but appears {token_counter[k]} times"
             )
     # print(arg)
-    layout: gl.constexpr = gl.DistributedLinearLayout(
-        **arg,
-        block_bases=[],
-        shape=shape,
+    layout = gl.constexpr(
+        gl.DistributedLinearLayout(
+            **arg,
+            block_bases=[],
+            shape=shape,
+        )
     )
     return layout
 
