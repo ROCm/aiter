@@ -81,6 +81,52 @@ jobs:
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
           EOF
 
+      - name: Check System health
+        run: |
+            echo -e "\n=== GPU Memory Status ==="
+            if command -v rocm-smi &> /dev/null; then
+              rocm-smi --showmeminfo vram
+              echo -e "\n=== GPU Processes ==="
+              rocm-smi --showpidgpus
+              rocm-smi --showpids
+            else
+              echo "rocm-smi not found"
+            fi
+
+            echo -e "\n=== System Memory Status ==="
+            free -h
+            echo -e "\nMemory usage by process (top 10):"
+            ps aux --sort=-%mem | head -11
+
+            echo -e "\n=== Docker Container Status ==="
+            docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Size}}"
+
+            echo -e "\n=== Python/PyTorch Processes ==="
+            ps aux | grep -E "python|torch" | grep -v grep || echo "No Python processes found"
+
+            echo -e "\n=== GPU Memory Usage ==="
+            if command -v rocm-smi &> /dev/null; then
+              gpu_mem_used=$(rocm-smi --showmeminfo vram | grep -E "GPU\[0\]" -A 3 | grep "Used" | awk '{print $3}' | sed 's/MB//')
+              gpu_mem_total=$(rocm-smi --showmeminfo vram | grep -E "GPU\[0\]" -A 3 | grep "Total" | awk '{print $3}' | sed 's/MB//')
+
+              if [ -n "$gpu_mem_used" ] && [ -n "$gpu_mem_total" ]; then
+                usage_percent=$((gpu_mem_used * 100 / gpu_mem_total))
+                echo "GPU memory usage: ${usage_percent}%"
+
+                if [ $usage_percent -gt 80 ]; then
+                  echo "WARNING: GPU memory usage is high (${usage_percent}%). Consider cleanup."
+                  echo "Suggested actions:"
+                  echo "  - Kill unnecessary GPU processes"
+                  echo "  - Clear PyTorch cache"
+                  echo "  - Restart Docker containers"
+                fi
+              fi
+            fi
+
+            echo -e "\n=== Setting Memory Management Env Vars ==="
+            echo "export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+            export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
       - name: Build the ATOM test image
         run: |
           docker build --network=host \
