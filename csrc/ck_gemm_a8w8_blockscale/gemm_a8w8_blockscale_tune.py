@@ -73,17 +73,14 @@ def run_gemm_a8w8_blockscale_cktile(
     Run gemm a8w8 blockscale tuned kernel for ck_tile type.
     """
 
-    # if preshuffleB:
-    #    return aiter.gemm_a8w8_blockscale_bpreshuffle_cktile_tune(
-    #        x, weight, x_scale, w_scale, out, kernel_id, splitK
-    #    )
-    # else:
-    #    return aiter.gemm_a8w8_blockscale_cktile_tune(
-    #        x, weight, x_scale, w_scale, out, kernel_id, splitK
-    #    )
-    return aiter.gemm_a8w8_blockscale_cktile_tune(
-        x, weight, x_scale, w_scale, out, kernel_id, splitK, preshuffleB
-    )
+    if preshuffleB:
+        return aiter.gemm_a8w8_blockscale_bpreshuffle_cktile_tune(
+            x, weight, x_scale, w_scale, out, kernel_id, splitK
+        )
+    else:
+        return aiter.gemm_a8w8_blockscale_cktile_tune(
+            x, weight, x_scale, w_scale, out, kernel_id, splitK
+        )
 
 
 def run_gemm_a8w8_blockscale(
