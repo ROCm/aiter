@@ -19,6 +19,9 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 import os
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
+PRINT_IR_TO_FILES = os.getenv("PRINT_IR_TO_FILES", "0") == "1"
+IR_NAME_PREFIX = os.getenv("IR_NAME_PREFIX", "")
+
 _LOGGER = AiterTritonLogger()
 
 global _USE_GEMM_SPLITK_BF16
@@ -214,9 +217,9 @@ def gemm_afp4wfp4_(
         **config,
     )
 
-    if getattr(gemm_afp4wfp4, "print", False) == False:
-        setattr(gemm_afp4wfp4, "print", True)
-        print_irs_to_files(kernel, "gemm_afp4wfp4")
+    if PRINT_IR_TO_FILES and getattr(gemm_afp4wfp4_, "print", False) == False:
+        setattr(gemm_afp4wfp4_, "print", True)
+        print_irs_to_files(kernel, f"{IR_NAME_PREFIX}_{M}_{N}_{K*2}_gemm_afp4wfp4")
 
     if return_y_pp:
         return y_pp
@@ -554,9 +557,9 @@ def gemm_afp4wfp4_preshuffle(
             w_scales.stride(1),
             **config,
         )
-        if getattr(gemm_afp4wfp4_preshuffle, "print", False) == False:
+        if PRINT_IR_TO_FILES and getattr(gemm_afp4wfp4_preshuffle, "print", False) == False:
             setattr(gemm_afp4wfp4_preshuffle, "print", True)
-            print_irs_to_files(kernel, f"{M}-{N}-{K*2}-gemm_afp4wfp4_preshuffle_async_1_tot_b_256")
+            print_irs_to_files(kernel, f"{IR_NAME_PREFIX}_{M}_{N}_{K*2}_gemm_afp4wfp4_preshuffle")
 
     if return_y_pp:
         return y_pp
