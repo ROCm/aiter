@@ -10,9 +10,6 @@ import logging
 
 from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_wrapper,
-    sage_quant_mxfp4,
-    get_sage_fwd_configs_mxfp4,
-    fav3_sage_mxfp4_func,
 )
 
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import (
