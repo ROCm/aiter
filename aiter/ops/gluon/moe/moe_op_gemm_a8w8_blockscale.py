@@ -91,8 +91,8 @@ def _reduce_grouped(
     BLOCK_N_OUT: gl.constexpr = BLOCK_N // ACTIVATION_REDUCTION_N
     start = pid_t * K
 
-    threads_per_elem_n: gl.constexpr = triton.cdiv(BLOCK_N // (NUM_WARPS * 32), 16)
-    threads_per_elem_n_out: gl.constexpr = triton.cdiv(
+    threads_per_elem_n: gl.constexpr = gl.cdiv(BLOCK_N // (NUM_WARPS * 32), 16)
+    threads_per_elem_n_out: gl.constexpr = gl.cdiv(
         BLOCK_N_OUT // (NUM_WARPS * 32), 16
     )
 
@@ -276,7 +276,7 @@ def consume_scaled_tile(
     else:
         cur_b = b_buffer.index(m % NUM_BUFFERS).load(layout=DOT_B_LAYOUT)
 
-    offs_k_scale = (k_offset_start // BLOCKSCALE_K) + m * triton.cdiv(
+    offs_k_scale = (k_offset_start // BLOCKSCALE_K) + m * gl.cdiv(
         BLOCK_K, BLOCKSCALE_K
     )
     if is_x_blockscale:
@@ -779,20 +779,23 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
         acc = acc + bias[None, :]
 
     if APPLY_SWIGLU and SPLIT_K == 1:
-        acc = _swiglu(acc, alpha, limit)
+        out = _swiglu(acc, alpha, limit)
         gl.static_assert(
-            acc.shape[1] == OUT_BLOCK_N,
-            f"Activation fn out.shape[1] ({acc.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
+            out.shape[1] == OUT_BLOCK_N,
+            f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
         )
+        out = gl.convert_layout(out, WMMA_LAYOUT)
         offs_y_n = OUT_BLOCK_N * pid_n + gl.arange(
             0, OUT_BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
         )
+        offs_cn = offs_y_n
         mask_n = offs_y_n < yN
     else:
         gl.static_assert(
             ACTIVATION_REDUCTION_N == 1,
             "Activation reduction must be 1 if no activation fn is provided",
         )
+        out = acc
 
     if Gammas is not None:
         offs_gammas = start_m + offs_m
@@ -804,7 +807,7 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
     # write-back
     offs_c = stride_y_m * offs_cm[:, None] + stride_y_n * offs_cn[None, :]
     mask_c = mask_m[:, None] & mask_n[None, :]
-    gl.amd.gfx1250.buffer_store(acc.to(Y.type.element_ty), Y, offs_c, mask=mask_c)
+    gl.amd.gfx1250.buffer_store(out.to(Y.type.element_ty), Y, offs_c, mask=mask_c)
 
 
 def can_overflow_int32(tensor: torch.Tensor):
@@ -874,12 +877,12 @@ def get_kernel_config(m, n, k, routing_data):
         num_warps = 4
 
         grid_m = routing_data.n_blocks(m, block_m)
-        grid_n = gluon.cdiv(n, block_n)
+        grid_n = triton.cdiv(n, block_n)
         grid = grid_m * grid_n * split_k
         while block_n >= 64 and grid < 256:
             block_n = block_n // 2
             grid_m = routing_data.n_blocks(m, block_m)
-            grid_n = gluon.cdiv(n, block_n)
+            grid_n = triton.cdiv(n, block_n)
             grid = grid_m * grid_n * split_k
     else:
         # for scale preshuffling
