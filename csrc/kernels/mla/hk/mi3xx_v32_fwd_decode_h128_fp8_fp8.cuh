@@ -460,45 +460,45 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
             if constexpr(kIsFirstIter == false)
             {
                 __builtin_amdgcn_s_setprio(8);
-                hk::bin_map_pk2<0, 0, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 1, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 2, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 3, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 0>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 1>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 2>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 3>(oaccu, oaccu, rescale);
                 __builtin_amdgcn_s_setprio(7);
-                hk::bin_map_pk2<0, 4, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 5, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 6, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 7, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 4>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 5>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 6>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 7>(oaccu, oaccu, rescale);
                 __builtin_amdgcn_s_setprio(6);
-                hk::bin_map_pk2<0, 8, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 9, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 10, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 11, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 8>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 9>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 10>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 11>(oaccu, oaccu, rescale);
                 __builtin_amdgcn_s_setprio(5);
-                hk::bin_map_pk2<0, 12, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 13, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 14, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 15, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 12>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 13>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 14>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 15>(oaccu, oaccu, rescale);
                 __builtin_amdgcn_s_setprio(4);
-                hk::bin_map_pk2<0, 16, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 17, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 18, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 19, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 16>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 17>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 18>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 19>(oaccu, oaccu, rescale);
                 __builtin_amdgcn_s_setprio(3);
-                hk::bin_map_pk2<0, 20, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 21, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 22, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 23, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 20>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 21>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 22>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 23>(oaccu, oaccu, rescale);
                 __builtin_amdgcn_s_setprio(2);
-                hk::bin_map_pk2<0, 24, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 25, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 26, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 27, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 24>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 25>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 26>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 27>(oaccu, oaccu, rescale);
                 __builtin_amdgcn_s_setprio(1);
-                hk::bin_map_pk2<0, 28, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 29, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 30, hkm::mul_vgpr>(oaccu, oaccu, rescale);
-                hk::bin_map_pk2<0, 31, hkm::mul_vgpr>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 28>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 29>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 30>(oaccu, oaccu, rescale);
+                hk::mul_vgpr<0, 31>(oaccu, oaccu, rescale);
                 __builtin_amdgcn_s_setprio(0);
             }
 
@@ -564,8 +564,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 {
                     constexpr uint32_t col_offset = idx.value * (T::kBlockK * 2);
 
-                    hk::mul_vgpr_pk2(oaccu_0, oaccu_0, reci_row_sum_e);
-                    hk::mul_vgpr_pk2(oaccu_1, oaccu_1, reci_row_sum_e);
+                    hk::mul_vgpr(oaccu_0, oaccu_0, reci_row_sum_e);
+                    hk::mul_vgpr(oaccu_1, oaccu_1, reci_row_sum_e);
 
                     if constexpr(kEpilogueType == PvGemmEpilogueType::OutputFinal)
                     {
