@@ -9,7 +9,7 @@ from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
 from aiter.ops.gluon.activations import _get_activation_from_str
 from aiter.ops.gluon.utils.gemm_config_utils import get_gemm_config
-from aiter.ops.gluon.utils.prefetch import issue_l2_prefetches, issue_l2_prefetches_prologue
+from aiter.ops.gluon.utils.prefetch import gemm_l2_prefetch, gemm_l2_prefetch_prologue
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -146,7 +146,7 @@ def _gemm_a16w16_gfx1250_kernel(
     off_bn = pid_n * BLOCK_N
 
     if USE_L2_PREFETCH:
-        issue_l2_prefetches_prologue(L2_PREFETCH_DISTANCE, load_idx, a_desc, b_desc, off_am, off_bn,
+        gemm_l2_prefetch_prologue(L2_PREFETCH_DISTANCE, load_idx, a_desc, b_desc, off_am, off_bn,
                                       BLOCK_K, NUM_BUFFERS, not PHYSICAL_MK, not PHYSICAL_KN)
 
     # Fill the pipeline
@@ -212,7 +212,7 @@ def _gemm_a16w16_gfx1250_kernel(
         load_idx += 1
 
         if USE_L2_PREFETCH:
-            issue_l2_prefetches(L2_PREFETCH_DISTANCE - 1, load_idx, a_desc, b_desc,
+            gemm_l2_prefetch(L2_PREFETCH_DISTANCE - 1, load_idx, a_desc, b_desc,
                                   off_am, off_bn, BLOCK_K, not PHYSICAL_MK, not PHYSICAL_KN)
         
         # Wait for the next tile to be ready for compute
