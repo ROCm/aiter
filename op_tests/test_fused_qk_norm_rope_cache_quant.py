@@ -779,16 +779,21 @@ def test_qk_norm_rope_cache_block_quant(
 ):
     # Initialize cache to zeros so unused pages have zero max -> zero scale
     # (randn would give non-zero scales for ALL pages in ref's pertoken_quant)
-    k_cache = torch.zeros(
+    # Construct tensors inside the function
+    if kv_cache_dtype == "fp8_e4m3":
+        cache_dtype = get_dtype_fp8()
+    else:
+        cache_dtype = dtype
+    k_cache = torch.randn(
         [num_blocks, page_size, num_heads_k, head_size],
-        dtype=cache_dtype,
+        dtype=dtype,
         device="cuda",
-    )
-    v_cache = torch.zeros(
+    ).to(cache_dtype)
+    v_cache = torch.randn(
         [num_blocks, page_size, num_heads_v, head_size],
-        dtype=cache_dtype,
+        dtype=dtype,
         device="cuda",
-    )
+    ).to(cache_dtype)
 
     # Check for NaN values in k_cache and v_cache
     if torch.isnan(k_cache).any():
@@ -899,8 +904,6 @@ def test_qk_norm_rope_cache_block_quant(
             kv_cache_dtype,
         )
     )
-    print("f num_tokens: ", num_tokens)
-    print("qkv: ", qkv.shape)
     (q, k, v, k_cache, v_cache), avg_cu = (
         run_aiter_qk_norm_rope_cache_block_quant_shuffle(
             qkv,
@@ -930,8 +933,6 @@ def test_qk_norm_rope_cache_block_quant(
     checkAllclose(q_ref[:64,], q[:64,], msg="q", rtol=1e-2, atol=0.05)
     checkAllclose(k_ref, k, msg="k", rtol=1e-2, atol=0.05)
     checkAllclose(v_ref, v, msg=msg, rtol=1e-2, atol=0.05)
-    print("f q_ref: ", q_ref)
-    print("f q: ", q)
     # Only check pages that have actual token data (via slot_mapping)
     page_size = k_cache.shape[
         -2
@@ -1028,13 +1029,9 @@ def test_qk_norm_rope_cache_block_quant(
         dtype=torch.int64,
         device="cuda",
     )
-    #
-    print("chunk_slot_mapping: ", chunk_slot_mapping)
     chunk_cu_q_len = torch.zeros(batch_size + 1, dtype=torch.int64, device="cuda")
     for i in range(batch_size):
         chunk_cu_q_len[i + 1] = chunk_cu_q_len[i] + chunk_left_ctx_lens
-    #
-    print("chunk_cu_q_len: ", chunk_cu_q_len)
     chunk_positions = torch.randint(
         0, max_positions, (chunk_total_tokens,), dtype=torch.int64, device="cuda"
     )
