@@ -163,47 +163,38 @@ def _reduce_grouped(
 
 
 @gluon.jit
-def issue_tile_loads(
+def issue_async_tile_loads(
     a_desc,
     b_desc,
-    a_scale_desc,
-    b_scale_desc,
     GatherIndx,
     gathered_m,
-    gathered_m_for_scales,
     block_id,
     pid_n,
     k_offset_start,
-    splitk_block_size,
     producer,
     a_buffer,
     b_buffer,
-    a_scale_buffer,
-    b_scale_buffer,
     BLOCK_M: ttgl.constexpr,
     BLOCK_N: ttgl.constexpr,
     BLOCK_K: ttgl.constexpr,
-    K: ttgl.constexpr,
-    BLOCKSCALE_M: ttgl.constexpr,
-    BLOCKSCALE_N: ttgl.constexpr,
-    BLOCKSCALE_K: ttgl.constexpr,
-    PER_ROW_X_SCALE: ttgl.constexpr,
     W_TRANSPOSE: ttgl.constexpr,
     NUM_BUFFERS: ttgl.constexpr,
-    EVEN_K: ttgl.constexpr,
 ):
     """
     Load A, B, and scale tiles asynchronously into shared memory buffers.
     
     Args:
-        a_desc: Tensor descriptor or AsyncCopyDescriptor for A
+        a_desc: Tensor descriptor for A
         b_desc: Tensor descriptor for B
+        a_scale_desc: Tensor descriptor for A scale
+        b_scale_desc: Tensor descriptor for B scale
         GatherIndx: Gather indices (None for regular access)
-        pid_m, pid_n: Block IDs for M and N dimensions
         k_offset_start: Starting K offset for this split-K block
         producer: Producer index (which buffer slot to use)
-        a_buffer, b_buffer: Shared memory buffers
+        a_buffer, b_buffer, a_scale_buffer, b_scale_buffer: Shared memory buffers
         BLOCK_M, BLOCK_N, BLOCK_K: Block sizes
+        BLOCKSCALE_M, BLOCKSCALE_N, BLOCKSCALE_K: Block scale sizes
+        PER_ROW_X_SCALE: Whether X scale is per-row
         W_TRANSPOSE: Whether W is transposed
         NUM_BUFFERS: Number of pipeline buffers
     """
@@ -239,48 +230,98 @@ def issue_tile_loads(
             b_buffer.index(buffer_idx)
         )
 
-    # Load A scale tile
-    # if a_scale_desc is not None:
-    #     if GatherIndx is None:
-    #         # Regular load for scales
-    #         if PER_ROW_X_SCALE:
-    #             # PER_ROW_X_SCALE: [M, K_blocks]
-    #             ttgl.amd.gfx1250.tdm.async_load(
-    #                 a_scale_desc,
-    #                 [block_id * BLOCK_M, producer * (BLOCK_K // BLOCKSCALE_K)],
-    #                 a_scale_buffer.index(buffer_idx)
-    #             )
-    #         else:
-    #             # 2D blockscale: [M_blocks, K_blocks]
-    #             ttgl.amd.gfx1250.tdm.async_load(
-    #                 a_scale_desc,
-    #                 [block_id * (BLOCK_M // BLOCKSCALE_M), producer * (BLOCK_K // BLOCKSCALE_K)],
-    #                 a_scale_buffer.index(buffer_idx)
-    #             )
-    #     else:
-    #         # Use async_gather for scales with gather indices
-    #         scale_col_offset = producer * (BLOCK_K // BLOCKSCALE_K)
-    #         ttgl.amd.gfx1250.tdm.async_gather(
-    #             a_scale_desc,
-    #             gathered_m_for_scales,  # Use gathered_m for PER_ROW_X_SCALE, gathered_m_blocks for 2D blockscale
-    #             scale_col_offset,
-    #             a_scale_buffer.index(buffer_idx)
-    #         )
 
-    # Load B scale tile
-    # if b_scale_desc is not None:
-    #     if W_TRANSPOSE:
-    #         ttgl.amd.gfx1250.tdm.async_load(
-    #             b_scale_desc,
-    #             [pid_n * (BLOCK_N // BLOCKSCALE_N), producer * (BLOCK_K // BLOCKSCALE_K)],
-    #             b_scale_buffer.index(buffer_idx)
-    #         )
-    #     else:
-    #         ttgl.amd.gfx1250.tdm.async_load(
-    #             b_scale_desc,
-    #             [producer * (BLOCK_K // BLOCKSCALE_K), pid_n * (BLOCK_N // BLOCKSCALE_N)],
-    #             b_scale_buffer.index(buffer_idx)
-    #         )
+@gluon.jit
+def consume_scaled_tile(
+    a_buffer,
+    b_buffer,
+    consumer,
+    XBlockScale,
+    stride_x_bs_m,
+    stride_x_bs_k,
+    WBlockScale,
+    stride_w_bs_e,
+    stride_w_bs_k,
+    stride_w_bs_n,
+    gathered_m,
+    expt_id,
+    pid_n,
+    N,
+    k_offset_start,
+    BLOCK_M: ttgl.constexpr,
+    BLOCK_N: ttgl.constexpr,
+    BLOCK_K: ttgl.constexpr,
+    BLOCKSCALE_M: ttgl.constexpr,
+    BLOCKSCALE_N: ttgl.constexpr,
+    BLOCKSCALE_K: ttgl.constexpr,
+    W_TRANSPOSE: ttgl.constexpr,
+    NUM_BUFFERS: ttgl.constexpr,
+    WMMA_LAYOUT: ttgl.constexpr,
+    DOT_A_LAYOUT: ttgl.constexpr,
+    DOT_B_LAYOUT: ttgl.constexpr,
+    PER_ROW_X_SCALE: ttgl.constexpr,
+    is_x_blockscale: ttgl.constexpr,
+    is_w_blockscale: ttgl.constexpr,
+):
+    cur_a = a_buffer.index(consumer % NUM_BUFFERS).load(layout=DOT_A_LAYOUT)
+
+    if W_TRANSPOSE:
+        # B is stored as (N, K) but WMMA needs (K, N)
+        cur_b = b_buffer.index(consumer % NUM_BUFFERS).permute([1, 0]).load(layout=DOT_B_LAYOUT)
+    else:
+        cur_b = b_buffer.index(consumer % NUM_BUFFERS).load(layout=DOT_B_LAYOUT)
+
+    offs_k_scale = (k_offset_start // BLOCKSCALE_K) + consumer * triton.cdiv(BLOCK_K, BLOCKSCALE_K)
+    if is_x_blockscale:
+        if PER_ROW_X_SCALE:
+            x_scale_ptrs = (
+                XBlockScale
+                + gathered_m * stride_x_bs_m
+                + offs_k_scale * stride_x_bs_k
+            )
+        else:
+            offs_x_scale_m = gathered_m // BLOCKSCALE_M
+            x_scale_ptrs = (
+                XBlockScale
+                + offs_x_scale_m * stride_x_bs_m
+                + offs_k_scale * stride_x_bs_k
+            )
+        cur_a_scale = ttgl.load(x_scale_ptrs)
+    else:
+        cur_a_scale = ttgl.full((BLOCK_M,), 1.0, dtype=ttgl.float32, layout=ttgl.SliceLayout(1, WMMA_LAYOUT))
+
+    if is_w_blockscale:
+        w_scale_base = WBlockScale + expt_id * stride_w_bs_e
+        offs_w_n = pid_n * BLOCK_N + ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(0, WMMA_LAYOUT))
+        offs_w_n = ttgl.max_contiguous(
+            ttgl.multiple_of(offs_w_n % N, BLOCK_N),
+            BLOCK_N,
+        )
+        offs_w_scale_n = offs_w_n // BLOCKSCALE_N
+        if W_TRANSPOSE:
+            # WScale: [N_blocks, K_blocks]
+            w_scale_ptrs = (
+                w_scale_base
+                + offs_w_scale_n * stride_w_bs_n
+                + offs_k_scale * stride_w_bs_k
+            )
+        else:
+            # WScale: [K_blocks, N_blocks]
+            w_scale_ptrs = (
+                w_scale_base
+                + offs_k_scale * stride_w_bs_k
+                + offs_w_scale_n * stride_w_bs_n
+            )
+        cur_b_scale = ttgl.load(w_scale_ptrs)
+    else:
+        cur_b_scale = ttgl.full((BLOCK_N,), 1.0, dtype=ttgl.float32, layout=ttgl.SliceLayout(0, WMMA_LAYOUT))
+
+    cur_a_scale = ttgl.convert_layout(cur_a_scale, ttgl.SliceLayout(1, WMMA_LAYOUT))
+    cur_b_scale = ttgl.convert_layout(cur_b_scale, ttgl.SliceLayout(0, WMMA_LAYOUT))
+
+    zeros = ttgl.zeros((BLOCK_M, BLOCK_N), dtype=ttgl.float32, layout=WMMA_LAYOUT)
+    partial = ttgl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
+    return partial * cur_a_scale[:, None] * cur_b_scale[None, :]
 
 
 @gluon.jit
@@ -288,46 +329,31 @@ def create_descriptor(
     X,
     stride_x_m,
     stride_x_k,
-    XBlockScale,
-    stride_x_bs_m,
-    stride_x_bs_k,
     W,
     stride_w_e,
     stride_w_k,
     stride_w_n,
-    WBlockScale,
-    stride_w_bs_e,
-    stride_w_bs_k,
-    stride_w_bs_n,
     GatherIndx,
     start_m,
     block_id,
-    pid_k,
     pid_n,
     expt_id,
     M,
     N,
     K,
     grid_m,
+    index_type,
     # Constexprs
     BLOCK_M: ttgl.constexpr,
     BLOCK_N: ttgl.constexpr,
     BLOCK_K: ttgl.constexpr,
-    BLOCKSCALE_M: ttgl.constexpr,
-    BLOCKSCALE_N: ttgl.constexpr,
-    BLOCKSCALE_K: ttgl.constexpr,
     SPLIT_K: ttgl.constexpr,
     N_EXPTS_ACT: ttgl.constexpr,
     BLOCKED_MK: ttgl.constexpr,
     BLOCKED_KN: ttgl.constexpr,
     SHARED_A: ttgl.constexpr,
     SHARED_B: ttgl.constexpr,
-    SHARED_A_SCALE: ttgl.constexpr,
-    SHARED_B_SCALE: ttgl.constexpr,
-    PER_ROW_X_SCALE: ttgl.constexpr,
     W_TRANSPOSE: ttgl.constexpr,
-    is_x_blockscale: ttgl.constexpr,
-    is_w_blockscale: ttgl.constexpr,
 ):
     """
     Create tensor descriptors for X, W, and their scales.
@@ -338,7 +364,6 @@ def create_descriptor(
         a_scale_desc: Tensor descriptor for X scales (or None)
         b_scale_desc: Tensor descriptor for W scales (or None)
         gathered_m: Gathered row indices [BLOCK_M] (irregular)
-        gathered_m_for_scales: Gathered row indices for scales [BLOCK_M] (irregular)
     
     Notes:
         For this kernel implementation, BLOCKSCALE_K must equal BLOCK_K.
@@ -351,7 +376,7 @@ def create_descriptor(
     # A descriptor
     in_m = grid_m * BLOCK_M
     if GatherIndx is None:
-        gathered_m = ttgl.constexpr(0)
+        gathered_m = (start_m + offs_x_m).to(index_type)
         offs_x_m = start_m + offs_x_m
         in_m = grid_m * BLOCK_M 
         a_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
@@ -373,7 +398,7 @@ def create_descriptor(
         IDX_LAYOUT: ttgl.constexpr = ttgl.SliceLayout(1, IDX_BASE_LAYOUT)
         idx_offs = BLOCK_M * block_id + ttgl.arange(0, BLOCK_M, layout=IDX_LAYOUT)
 
-        gathered_m = (ttgl.load(GatherIndx + idx_offs) // N_EXPTS_ACT).to(ttgl.int32)
+        gathered_m = (ttgl.load(GatherIndx + idx_offs) // N_EXPTS_ACT).to(index_type)
         a_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=X,
             shape=(in_m, K),
@@ -407,79 +432,7 @@ def create_descriptor(
             layout=SHARED_B
         )
     
-    # A scale descriptor
-    a_scale_desc = None
-    gathered_m_blocks = None
-    if is_x_blockscale:
-        if PER_ROW_X_SCALE:
-            # XScale: [M, K_blocks]
-            if GatherIndx is None:
-                a_scale_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
-                    base=XBlockScale,
-                    shape=(M, ttgl.cdiv(K, BLOCKSCALE_K)),
-                    strides=(stride_x_bs_m, stride_x_bs_k),
-                    block_shape=(BLOCK_M, BLOCK_K // BLOCKSCALE_K), # TODO: remove block_k == blockscale_k constraint
-                    layout=SHARED_A_SCALE
-                )
-            else:
-                a_scale_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
-                    base=XBlockScale,
-                    shape=(M, ttgl.cdiv(K, BLOCKSCALE_K)),
-                    strides=(stride_x_bs_m, stride_x_bs_k),
-                    block_shape=(BLOCK_M, BLOCK_K // BLOCKSCALE_K),
-                    layout=SHARED_A_SCALE
-                )
-        else:
-            # XScale: [M_blocks, K_blocks]
-            if GatherIndx is None:
-                a_scale_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
-                    base=XBlockScale,
-                    shape=(ttgl.cdiv(M, BLOCKSCALE_M), ttgl.cdiv(K, BLOCKSCALE_K)),
-                    strides=(stride_x_bs_m, stride_x_bs_k),
-                    block_shape=(BLOCK_M // BLOCKSCALE_M, BLOCK_K // BLOCKSCALE_K), # TODO: remove block_k == blockscale_k constraint
-                    layout=SHARED_A_SCALE
-                )
-            else:
-                gathered_m_blocks = gathered_m // BLOCKSCALE_M
-                a_scale_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
-                    base=XBlockScale,
-                    shape=(ttgl.cdiv(M, BLOCKSCALE_M), ttgl.cdiv(K, BLOCKSCALE_K)),
-                    strides=(stride_x_bs_m, stride_x_bs_k),
-                    block_shape=(BLOCK_M // BLOCKSCALE_M, BLOCK_K // BLOCKSCALE_K),
-                    layout=SHARED_A_SCALE
-                )
-    
-    # B scale descriptor
-    b_scale_desc = None
-    if is_w_blockscale:
-        WBlockScale += expt_id * stride_w_bs_e
-        scale_k_blocks = ttgl.cdiv(K, BLOCKSCALE_K)
-        scale_n_blocks = ttgl.cdiv(N, BLOCKSCALE_N)
-        if W_TRANSPOSE:
-            # WScale: [N_blocks, K_blocks]
-            b_scale_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
-                base=WBlockScale,
-                shape=(scale_n_blocks, scale_k_blocks),
-                strides=(stride_w_bs_n, stride_w_bs_k),
-                block_shape=(BLOCK_N // BLOCKSCALE_N, BLOCK_K // BLOCKSCALE_K),
-                layout=SHARED_B_SCALE
-            )
-        else:
-            # WScale: [K_blocks, N_blocks]
-            b_scale_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(
-                base=WBlockScale,
-                shape=(scale_k_blocks, scale_n_blocks),
-                strides=(stride_w_bs_k, stride_w_bs_n),
-                block_shape=(BLOCK_K // BLOCKSCALE_K, BLOCK_N // BLOCKSCALE_N),
-                layout=SHARED_B_SCALE
-            )
-    
-    if GatherIndx is not None and is_x_blockscale and not PER_ROW_X_SCALE:
-        gathered_m_for_scales = gathered_m_blocks
-    else:
-        gathered_m_for_scales = gathered_m
-
-    return a_desc, b_desc, a_scale_desc, b_scale_desc, gathered_m, gathered_m_for_scales
+    return a_desc, b_desc, gathered_m
 
 
 @gluon.jit
@@ -568,8 +521,10 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
     - x_scale: Scale tensor for A with shape (M // blockscale_m, K // blockscale_k) or (M, K // blockscale_k)
     - w_scale: Scale tensor for B with shape (K // blockscale_k, N // blockscale_n)
     - PER_ROW_X_SCALE: Determines whether we use per-row or 2D blockscale on X
+    - W_TRANSPOSE: Determines whether W is stored as (N, K) instead of (K, N)
+    - NUM_BUFFERS: Determines the number of buffers to use for async_load
 
-    For this kernel implementation, BLOCKSCALE_K must equal BLOCK_K.
+    For this kernel implementation, BLOCKSCALE_K must equal BLOCK_K. #TODO: make this configurable
     """
     is_x_blockscale: ttgl.constexpr = XBlockScale is not None
     is_w_blockscale: ttgl.constexpr = WBlockScale is not None
@@ -628,32 +583,14 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
         b_buffer = ttgl.allocate_shared_memory(
             W.type.element_ty, [NUM_BUFFERS, BLOCK_K, BLOCK_N], layout=SHARED_B
         )
-    a_scale_buffer = ttgl.allocate_shared_memory(
-        XBlockScale.type.element_ty if XBlockScale is not None else ttgl.float32,
-        [NUM_BUFFERS, BLOCK_M],
-        layout=SHARED_A_SCALE
-    )
-    b_scale_buffer = ttgl.allocate_shared_memory(
-        WBlockScale.type.element_ty if WBlockScale is not None else ttgl.float32,
-        [NUM_BUFFERS, BLOCK_N],
-        layout=SHARED_B_SCALE
-    )
-    
+
     # Create tensor descriptors
-    a_desc, b_desc, a_scale_desc, b_scale_desc, gathered_m, gathered_m_for_scales = create_descriptor(
+    a_desc, b_desc, gathered_m = create_descriptor(
         X, stride_x_m, stride_x_k,
-        XBlockScale, stride_x_bs_m, stride_x_bs_k,
         W, stride_w_e, stride_w_k, stride_w_n,
-        WBlockScale, stride_w_bs_e, stride_w_bs_k, stride_w_bs_n,
-        GatherIndx, start_m, block_id, pid_k, pid_n, expt_id,
-        M, N, K, grid_m,
-        BLOCK_M, BLOCK_N, BLOCK_K,
-        BLOCKSCALE_M, BLOCKSCALE_N, BLOCKSCALE_K,
-        SPLIT_K, N_EXPTS_ACT,
-        BLOCKED_MK, BLOCKED_KN,
-        SHARED_A, SHARED_B, SHARED_A_SCALE, SHARED_B_SCALE,
-        PER_ROW_X_SCALE, W_TRANSPOSE,
-        is_x_blockscale, is_w_blockscale,
+        GatherIndx, start_m, block_id, pid_n, expt_id,
+        M, N, K, grid_m, index_type,
+        BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, N_EXPTS_ACT, BLOCKED_MK, BLOCKED_KN, SHARED_A, SHARED_B, W_TRANSPOSE,
     )
     
     producer = 0
@@ -665,51 +602,55 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
     
     # prologue
     for _ in ttgl.static_range(NUM_BUFFERS - 1):
-        issue_tile_loads(
-            a_desc, b_desc, a_scale_desc, b_scale_desc, GatherIndx, gathered_m, gathered_m_for_scales,
-            block_id, pid_n, k_offset_start, splitk_block_size, producer,
-            a_buffer, b_buffer, a_scale_buffer, b_scale_buffer,
-            BLOCK_M, BLOCK_N, BLOCK_K, K, BLOCKSCALE_M, BLOCKSCALE_N, BLOCKSCALE_K, PER_ROW_X_SCALE,
-            W_TRANSPOSE, NUM_BUFFERS, EVEN_K
+        issue_async_tile_loads(
+            a_desc, b_desc, GatherIndx, gathered_m,
+            block_id, pid_n, k_offset_start, producer,
+            a_buffer, b_buffer,
+            BLOCK_M, BLOCK_N, BLOCK_K,
+            W_TRANSPOSE, NUM_BUFFERS
         )
         producer += 1
     
     # Main loop
     for _ in range(num_k_tiles - (NUM_BUFFERS - 1)):
         # Load next A and B tiles
-        issue_tile_loads(
-            a_desc, b_desc, a_scale_desc, b_scale_desc, GatherIndx, gathered_m, gathered_m_for_scales,
-            block_id, pid_n, k_offset_start, splitk_block_size, producer,
-            a_buffer, b_buffer, a_scale_buffer, b_scale_buffer,
-            BLOCK_M, BLOCK_N, BLOCK_K, K, BLOCKSCALE_M, BLOCKSCALE_N, BLOCKSCALE_K, PER_ROW_X_SCALE,
-            W_TRANSPOSE, NUM_BUFFERS, EVEN_K
+        issue_async_tile_loads(
+            a_desc, b_desc, GatherIndx, gathered_m,
+            block_id, pid_n, k_offset_start, producer,
+            a_buffer, b_buffer,
+            BLOCK_M, BLOCK_N, BLOCK_K,
+            W_TRANSPOSE, NUM_BUFFERS
         )
         producer += 1
         
         ttgl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
-        cur_a = a_buffer.index(consumer % NUM_BUFFERS).load(layout=DOT_A_LAYOUT)
-        
-        if W_TRANSPOSE:
-            # B is stored as (N, K) but WMMA needs (K, N)
-            cur_b = b_buffer.index(consumer % NUM_BUFFERS).permute([1, 0]).load(layout=DOT_B_LAYOUT)
-        else:
-            cur_b = b_buffer.index(consumer % NUM_BUFFERS).load(layout=DOT_B_LAYOUT)
-        
-        acc = ttgl.amd.gfx1250.wmma(cur_a, cur_b, acc)
+        acc += consume_scaled_tile(
+            a_buffer, b_buffer, consumer,
+            XBlockScale, stride_x_bs_m, stride_x_bs_k,
+            WBlockScale, stride_w_bs_e, stride_w_bs_k, stride_w_bs_n,
+            gathered_m, expt_id, pid_n, N, k_offset_start,
+            BLOCK_M, BLOCK_N, BLOCK_K,
+            BLOCKSCALE_M, BLOCKSCALE_N, BLOCKSCALE_K,
+            W_TRANSPOSE, NUM_BUFFERS,
+            WMMA_LAYOUT, DOT_A_LAYOUT, DOT_B_LAYOUT,
+            PER_ROW_X_SCALE, is_x_blockscale, is_w_blockscale,
+        )
         consumer += 1
     
     # Epilogue
     for i in ttgl.static_range(NUM_BUFFERS - 1):
         ttgl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * 2)
-        cur_a = a_buffer.index(consumer % NUM_BUFFERS).load(layout=DOT_A_LAYOUT)
-        
-        if W_TRANSPOSE:
-            # B is stored as (N, K) but WMMA needs (K, N)
-            cur_b = b_buffer.index(consumer % NUM_BUFFERS).permute([1, 0]).load(layout=DOT_B_LAYOUT)
-        else:
-            cur_b = b_buffer.index(consumer % NUM_BUFFERS).load(layout=DOT_B_LAYOUT)
-        
-        acc = ttgl.amd.gfx1250.wmma(cur_a, cur_b, acc)
+        acc += consume_scaled_tile(
+            a_buffer, b_buffer, consumer,
+            XBlockScale, stride_x_bs_m, stride_x_bs_k,
+            WBlockScale, stride_w_bs_e, stride_w_bs_k, stride_w_bs_n,
+            gathered_m, expt_id, pid_n, N, k_offset_start,
+            BLOCK_M, BLOCK_N, BLOCK_K,
+            BLOCKSCALE_M, BLOCKSCALE_N, BLOCKSCALE_K,
+            W_TRANSPOSE, NUM_BUFFERS,
+            WMMA_LAYOUT, DOT_A_LAYOUT, DOT_B_LAYOUT,
+            PER_ROW_X_SCALE, is_x_blockscale, is_w_blockscale,
+        )
         consumer += 1
     
     offs_m = block_id * BLOCK_M + ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, WMMA_LAYOUT))
@@ -1091,7 +1032,7 @@ def moe_gemm_a8w8_blockscale_gfx1250(
         shared_b = ttgl.PaddedSharedLayout.with_identity_for(
             [[BLOCK_K, 16]],
             [BLOCK_N, BLOCK_K],
-            [0, 1]
+            [1, 0]
         )
     else:
         shared_b = ttgl.PaddedSharedLayout.with_identity_for(
@@ -1100,17 +1041,34 @@ def moe_gemm_a8w8_blockscale_gfx1250(
             [1, 0]
         )
     
-    # TODO: figure out the interval and padding
+    a_scale_tile_k = triton.cdiv(BLOCK_K, config["blockscale_k"])
+    a_scale_tile_m = BLOCK_M if per_row_x_scale else triton.cdiv(BLOCK_M, config["blockscale_m"])
+    b_scale_tile_k = triton.cdiv(BLOCK_K, config["blockscale_k"])
+    b_scale_tile_n = triton.cdiv(BLOCK_N, config["blockscale_n"])
+
+    a_scale_block_shape = (a_scale_tile_m, a_scale_tile_k)
+    if preshuffled:
+        b_scale_block_shape = (b_scale_tile_n, b_scale_tile_k)
+    else:
+        b_scale_block_shape = (b_scale_tile_k, b_scale_tile_n)
+
     shared_a_scale = ttgl.PaddedSharedLayout.with_identity_for(
         [[256, 16]],
-        [BLOCK_M],
-        [0]
+        [a_scale_tile_m, a_scale_tile_k],
+        [1, 0],
     )
-    shared_b_scale = ttgl.PaddedSharedLayout.with_identity_for(
-        [[256, 16]],
-        [BLOCK_N],
-        [0]
-    )
+    if preshuffled:
+        shared_b_scale = ttgl.PaddedSharedLayout.with_identity_for(
+            [[256, 16]],
+            [b_scale_tile_n, b_scale_tile_k],
+            [1, 0],
+        )
+    else:
+        shared_b_scale = ttgl.PaddedSharedLayout.with_identity_for(
+            [[256, 16]],
+            [b_scale_tile_k, b_scale_tile_n],
+            [1, 0],
+        )
     
     dot_a_layout = ttgl.DotOperandLayout(
         operand_index=0, parent=wmma_layout, k_width=16
@@ -1219,145 +1177,3 @@ if __name__ == "__main__":
         init_compute_data,
         group_shape,
     )
-
-    # Test parameters
-    m = 128
-    n = 128
-    k = 128
-    n_expts_tot = 8
-    n_expts_act = 2
-    do_gather = True
-    do_scatter = False
-    per_row_x_scale = False
-    is_x_blockscale = True
-    is_w_blockscale = True
-    has_y_gammas = False
-    preshuffled = False
-
-    print(f"Configuration:")
-    print(f"  Tokens: {m}")
-    print(f"  Total Experts: {n_expts_tot}")
-    print(f"  Active Experts: {n_expts_act}")
-    print(f"  K: {k}, N: {n}")
-    print(f"  Group shape: {group_shape}")
-    print(f"  Per-row x scale: {per_row_x_scale}")
-    print(f"  X blockscale: {is_x_blockscale}, W blockscale: {is_w_blockscale}")
-    print()
-    
-    # Initialize routing data using test file function
-    print("Performing routing...")
-    m, routing_data, gather_indx, scatter_indx = init_routing_data(
-        m, n_expts_tot, n_expts_act, do_gather, do_scatter, device=device
-    )
-    print(f"  Routing block_m: {routing_data.block_m}")
-    print(f"  Expert histogram: {routing_data.expt_hist.tolist()}")
-    print()
-    
-    # Initialize compute data using test file function
-    print("Creating input tensors...")
-    (
-        x_quant,
-        x_block_scales,
-        x_static_scale,
-        w_quant,
-        w_block_scales,
-        w_static_scale,
-        bias,
-        gammas,
-    ) = init_compute_data(
-        m,
-        n,
-        k,
-        gather_indx,
-        scatter_indx,
-        n_expts_tot,
-        n_expts_act,
-        torch.float8_e4m3fn,
-        torch.float8_e4m3fn,
-        has_y_gammas,
-        device=device,
-        per_row_x_scale=per_row_x_scale,
-        is_x_blockscale=is_x_blockscale,
-        is_w_blockscale=is_w_blockscale,
-    )
-    
-    print(f"  X shape: {x_quant.shape}, dtype: {x_quant.dtype}")
-    print(f"  W shape: {w_quant.shape}, dtype: {w_quant.dtype}")
-    if x_block_scales is not None:
-        print(f"  X scales shape: {x_block_scales.shape} (per_row_x_scale={per_row_x_scale})")
-    else:
-        print(f"  X static scale: {x_static_scale}")
-    if w_block_scales is not None:
-        print(f"  W scales shape: {w_block_scales.shape}")
-    else:
-        print(f"  W static scale: {w_static_scale}")
-    print(f"  Bias shape: {bias.shape}")
-    print()
-    
-    # Run the Gluon kernel
-    print("Running MOE GEMM with Gluon kernel...")
-    try:
-        y_gluon = moe_gemm_a8w8_blockscale_gfx1250(
-            x=x_quant,
-            w=w_quant,
-            x_block_scales=x_block_scales,
-            w_block_scales=w_block_scales,
-            x_static_scale=x_static_scale,
-            w_static_scale=w_static_scale,
-            quant_static_scale=None,
-            bias=bias,
-            routing_data=routing_data,
-            gather_indx=gather_indx,
-            scatter_indx=scatter_indx,
-            gammas=gammas,
-            out_dtype=torch.bfloat16,
-            apply_swiglu=False,
-            per_row_x_scale=per_row_x_scale,
-            preshuffled=preshuffled,
-        )
-        print("========= y_gluon =========")
-        print(y_gluon)
-        
-    except Exception as e:
-        print(f"ERROR running Gluon kernel: {e}")
-        import traceback
-        traceback.print_exc()
-        exit(1)
-
-    from aiter.ops.triton.moe.moe_op_gemm_a8w8_blockscale import moe_gemm_a8w8_blockscale as ref_moe_gemm_a8w8_blockscale
-    
-    y_ref = ref_moe_gemm_a8w8_blockscale(
-        x_quant,
-        w_quant,
-        x_block_scales,
-        w_block_scales,
-        x_static_scale,
-        w_static_scale,
-        None,  # quant_static_scale
-        bias,
-        routing_data,
-        gather_indx,
-        scatter_indx,
-        gammas,
-        torch.bfloat16,  # out_dtype
-        False,  # apply_swiglu
-        per_row_x_scale=per_row_x_scale,
-    )
-    print("========= y_ref =========")
-    print(y_ref)
-    
-    # Compute error
-    abs_diff = torch.abs(y_gluon - y_ref)
-    rel_diff = abs_diff / (torch.abs(y_ref) + 1e-8)
-    
-    total_elements = y_gluon.numel()
-    maxtol = 0
-    rmstol = 0
-    
-    from op_tests.triton_tests.moe.test_moe_gemm_a8w8_blockscale import assert_close
-    assert_close(y_gluon, y_ref, maxtol=maxtol, rmstol=rmstol)
-    
-    print()
-    print("=" * 80)
-    print("Test complete!")
-    print("=" * 80)
