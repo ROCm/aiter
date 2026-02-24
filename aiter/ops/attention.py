@@ -575,6 +575,8 @@ def mla_decode_stage1_asm_fwd(
     splitLse: torch.Tensor,
     output: torch.Tensor,
     # [batch_size, num_heads, v_head_dim]
+    lse: Optional[torch.Tensor],
+    # [batch_size, num_heads]
     q_scale: Optional[torch.Tensor] = None,
     kv_scale: Optional[torch.Tensor] = None,
     # [1] pertensor
