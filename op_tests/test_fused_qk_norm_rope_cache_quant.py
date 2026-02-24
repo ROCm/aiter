@@ -241,7 +241,7 @@ def run_torch_qk_norm_rope_cache_block_quant_shuffle(
 
     v = v.view(num_tokens, -1, head_size)
 
-    from aiter import reshape_and_cache_with_block_quant, reshape_and_cache
+    from aiter import reshape_and_cache
 
     if kv_cache_dtype == "auto":
         reshape_and_cache(
