@@ -1,3 +1,5 @@
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -1080,7 +1082,7 @@ def _compute_delta_s_kernel(
     )
     tl.store(s_ptr, acc, mask=offs_n < seq_k)
 
-
+@functools.lru_cache(maxsize=16)
 def create_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
     """
     Returns a Hadamard matrix of size block_size x block_size. Remember to normalize with sqrt(block_size) for it to be orthogonal.
