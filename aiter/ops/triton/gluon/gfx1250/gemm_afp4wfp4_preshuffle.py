@@ -34,6 +34,7 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
         order=[0, 1],
     )
 
+    # e2m1 uses instr_shape [16,16,64] for operands
     wmma_layout = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
@@ -41,6 +42,7 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
         reg_bases=[],
         instr_shape=[16, 16, 64],
     )
+    # scaled WMMA accumulator must be [16,16,128]
     wmma_acc_layout = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
@@ -49,13 +51,16 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
         instr_shape=[16, 16, 128],
     )
 
+    # LDS layouts (shared memory layouts). These must be SharedLayout types.
     shared_A = gl.SwizzledSharedLayout(vec=16, per_phase=1, max_phase=8, order=[1, 0])
     shared_B = gl.SwizzledSharedLayout(vec=16, per_phase=1, max_phase=8, order=[0, 1])
     shared_S = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
 
+    # Dot operand layouts (register layouts expected by WMMA)
     dot_a_layout = gl.DotOperandLayout(operand_index=0, parent=wmma_layout, k_width=16)
     dot_b_layout = gl.DotOperandLayout(operand_index=1, parent=wmma_layout, k_width=16)
 
+    # Register layouts for scales used by wmma_scaled
     a_scale_layout = gl.amd.gfx1250.get_wmma_scale_layout(dot_a_layout, [BLOCK_M, K_GROUPS], scale_factor=SCALE_GROUP_ELEMS)
     b_scale_layout = gl.amd.gfx1250.get_wmma_scale_layout(dot_b_layout, [BLOCK_N, K_GROUPS], scale_factor=SCALE_GROUP_ELEMS)
 
@@ -74,8 +79,7 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
     }
 
 
-
-# Local offsets for A (per k-block); use with ptr = a_base + k_tile * BLOCK_K_BYTES * stride_a_kbytes
+# Local offsets for A (per k-block);  with ptr = a_base + k_tile * BLOCK_K_BYTES * stride_a_kbytes
 @gluon.jit
 def a_tile_offsets_local(
     tile_m,
@@ -235,6 +239,7 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
     stride_as_k,
     stride_bs_n,
     stride_bs_k,
+    
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
@@ -279,6 +284,10 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
 
     k_tiles: gl.constexpr = (SPLITK_BYTES + BLOCK_K_BYTES - 1) // BLOCK_K_BYTES
 
+    # LDS allocations:
+    #   - A is staged into LDS
+    #   - A nad B scales are staged into LDS
+    #   - B is NOT staged into LDS (bypass)
     smem_A = gl.allocate_shared_memory(
         a_fp4_ptr.type.element_ty,
         [NUM_BUFFERS, BLOCK_M, BLOCK_K_BYTES],
@@ -346,18 +355,19 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
     producer = 0
     consumer = 0
 
-    # ---- Prologue ----
+    # ---- Prologue ---- stage (NUM_BUFFERS - 1) K-tiles into LDS
     for _ in gl.static_range(NUM_BUFFERS - 1):
         if producer < k_tiles:
-            slot = producer
-            k_tile = producer
+            slot_p = producer
+            k_tile_p = producer
 
-            # Advance pointers for this k_tile
-            a_ptr = a_base + k_tile * BLOCK_K_BYTES * stride_a_kbytes
-            as_ptr = as_base + k_tile * (K_GROUPS * 32) * stride_as_k
-            b_ptr = b_base + k_tile * (BLOCK_K_BYTES * 16) * stride_b_kshuf
-            bs_ptr = bs_base + k_tile * (K_GROUPS * 32) * stride_bs_k
+            # Advance global pointers for this k_tile
+            a_ptr = a_base + k_tile_p * BLOCK_K_BYTES * stride_a_kbytes
+            as_ptr = as_base + k_tile_p * (K_GROUPS * 32) * stride_as_k
+            b_ptr = b_base + k_tile_p * (BLOCK_K_BYTES * 16) * stride_b_kshuf
+            bs_ptr = bs_base + k_tile_p * (K_GROUPS * 32) * stride_bs_k
 
+            # HBM to vGPR
             a_tile = gl.amd.gfx1250.buffer_load(ptr=a_ptr, offsets=offs_a, cache=cache_modifier)
             a_scales_raw = gl.amd.gfx1250.buffer_load(ptr=as_ptr, offsets=offs_as, cache=cache_modifier)
             a_scales = unshuffle_a_scales(a_scales_raw, BLOCK_M=BLOCK_M, K_GROUPS=K_GROUPS)
@@ -367,26 +377,29 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
             b_scales_raw = gl.amd.gfx1250.buffer_load(ptr=bs_ptr, offsets=offs_bs, cache=cache_modifier)
             b_scales = unshuffle_b_scales(b_scales_raw, BLOCK_N=BLOCK_N, K_GROUPS=K_GROUPS)
 
-            smem_A.index(slot).store(a_tile)
-            smem_B.index(slot).store(b_tile)
-            smem_AS.index(slot).store(a_scales)
-            smem_BS.index(slot).store(b_scales)
+            # vGPR to LDS
+            smem_A.index(slot_p).store(a_tile)
+            smem_B.index(slot_p).store(b_tile)
+            smem_AS.index(slot_p).store(a_scales)
+            smem_BS.index(slot_p).store(b_scales)
 
         producer += 1
 
+    # accumulator is in vGPR for the whole C tile
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=wmma_acc_layout)
 
     # ---- Main pipeline ----
     main_iters: gl.constexpr = k_tiles - (NUM_BUFFERS - 1)
     for _ in gl.static_range(main_iters):
         # Producer: advance pointers for this k_tile, reuse precomputed offsets
-        slot = producer % NUM_BUFFERS
-        k_tile = producer
+        # HBM -> vGPR -> LDS
+        slot_p = producer % NUM_BUFFERS
+        k_tile_p = producer
 
-        a_ptr = a_base + k_tile * BLOCK_K_BYTES * stride_a_kbytes
-        as_ptr = as_base + k_tile * (K_GROUPS * 32) * stride_as_k
-        b_ptr = b_base + k_tile * (BLOCK_K_BYTES * 16) * stride_b_kshuf
-        bs_ptr = bs_base + k_tile * (K_GROUPS * 32) * stride_bs_k
+        a_ptr = a_base + k_tile_p * BLOCK_K_BYTES * stride_a_kbytes
+        as_ptr = as_base + k_tile_p * (K_GROUPS * 32) * stride_as_k
+        b_ptr = b_base + k_tile_p * (BLOCK_K_BYTES * 16) * stride_b_kshuf
+        bs_ptr = bs_base + k_tile_p * (K_GROUPS * 32) * stride_bs_k
 
         a_tile = gl.amd.gfx1250.buffer_load(ptr=a_ptr, offsets=offs_a)
         a_scales_raw = gl.amd.gfx1250.buffer_load(ptr=as_ptr, offsets=offs_as)
@@ -397,21 +410,28 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
         b_scales_raw = gl.amd.gfx1250.buffer_load(ptr=bs_ptr, offsets=offs_bs)
         b_scales = unshuffle_b_scales(b_scales_raw, BLOCK_N=BLOCK_N, K_GROUPS=K_GROUPS)
 
-        smem_A.index(slot).store(a_tile)
-        smem_B.index(slot).store(b_tile)
-        smem_AS.index(slot).store(a_scales)
-        smem_BS.index(slot).store(b_scales)
+        smem_A.index(slot_p).store(a_tile)
+        smem_B.index(slot_p).store(b_tile)
+        smem_AS.index(slot_p).store(a_scales)
+        smem_BS.index(slot_p).store(b_scales)
 
         producer += 1
 
         # Consumer
-        slot = consumer % NUM_BUFFERS
+        # LDS -> vGPR, (TODO: B: HBM -> vGPR)
+        slot_c = consumer % NUM_BUFFERS
+        # k_tile_c = consumer
 
-        A = smem_A.index(slot).load(layout=dot_a_layout)
-        B = smem_B.index(slot).load(layout=dot_b_layout)
+        # LDS -> vGPR
+        A = smem_A.index(slot_c).load(layout=dot_a_layout)
+        B = smem_B.index(slot_c).load(layout=dot_b_layout)
+        AS = smem_AS.index(slot_c).load(layout=a_scale_layout)
+        BS = smem_BS.index(slot_c).load(layout=b_scale_layout)
 
-        AS = smem_AS.index(slot).load(layout=a_scale_layout)
-        BS = smem_BS.index(slot).load(layout=b_scale_layout)
+        # #HBM to vGPR
+        # b_ptr = b_base + k_tile_c * (BLOCK_K_BYTES * 16) * stride_b_kshuf
+        # b_raw = gl.amd.gfx1250.buffer_load(ptr=b_ptr, offsets=offs_b_raw, layout=dot_b_layout)
+        # B = depreshuffle_b_raw_to_kn(b_raw, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BLOCK_K_BYTES=BLOCK_K_BYTES)
 
         acc = gl.amd.gfx1250.wmma_scaled(A, AS, "e2m1", B, BS, "e2m1", acc)
         consumer += 1
@@ -419,17 +439,18 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
     # ---- Drain ----
     for _ in gl.static_range(NUM_BUFFERS - 1):
         if consumer < k_tiles:
-            slot = consumer % NUM_BUFFERS
+            slot_c = consumer % NUM_BUFFERS
 
-            A = smem_A.index(slot).load(layout=dot_a_layout)
-            B = smem_B.index(slot).load(layout=dot_b_layout)
-
-            AS = smem_AS.index(slot).load(layout=a_scale_layout)
-            BS = smem_BS.index(slot).load(layout=b_scale_layout)
+            A = smem_A.index(slot_c).load(layout=dot_a_layout)
+            B = smem_B.index(slot_c).load(layout=dot_b_layout)
+            AS = smem_AS.index(slot_c).load(layout=a_scale_layout)
+            BS = smem_BS.index(slot_c).load(layout=b_scale_layout)
 
             acc = gl.amd.gfx1250.wmma_scaled(A, AS, "e2m1", B, BS, "e2m1", acc)
+
         consumer += 1
 
+    # Store C tile
     store_c_tile(
         c_ptr=c_ptr,
         tile_m=tile_m,
