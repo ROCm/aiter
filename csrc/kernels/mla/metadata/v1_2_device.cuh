@@ -406,7 +406,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                   torch::Tensor& reduce_partial_map)
 {
     constexpr int32_t kPackedQoLenPerWg = 128;
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const hipStream_t stream            = at::hip::getCurrentHIPStream();
 
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
@@ -429,7 +429,8 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         (kv_dtype == at::ScalarType::Float8_e4m3fnuz || kv_dtype == at::ScalarType::Float8_e4m3fn);
 
     const bool natively_supported =
-        (num_heads == 16) || ((num_heads == 128) && q_is_fp8 && kv_is_fp8);
+        (num_heads == 16) || ((num_heads == 32) && q_is_fp8 && kv_is_fp8 && (max_seqlen_qo == 4)) ||
+        ((num_heads == 128) && q_is_fp8 && kv_is_fp8);
 
     if((natively_supported == false) && (num_heads % 16 == 0))
     {
@@ -438,7 +439,8 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         num_batches *= qk_batch_ratio;
     }
 
-    TORCH_CHECK((num_heads == 16) || (num_heads == 128),
+    TORCH_CHECK((num_heads == 16) || (num_heads == 128) ||
+                    ((num_heads == 32) && q_is_fp8 && kv_is_fp8),
                 __func__,
                 ": only supports #heads in [16, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
                 "N is in [2, 8).")
@@ -470,7 +472,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     params.is_causal                    = is_causal;
     params.topk                         = (topk < 0) ? topk : (topk + page_size - 1) / page_size;
     params.qk_batch_ratio               = qk_batch_ratio;
-    params.fixed_over_head_num_blocks = max(1, (16 + page_size - 1) / page_size);
+    params.fixed_over_head_num_blocks   = max(1, (16 + page_size - 1) / page_size);
 
     // launch kernel
     MLA_METADATA_DISPATCHER(

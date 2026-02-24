@@ -393,47 +393,6 @@ def test_skinny_gemm_a8w8_pertoken_quant():
                     # test_gemm(dtype, m, n, k, quant_dtype)
 
 
-l_dtype = ["bf16", "fp16"]
-l_quantDtype = ["i8", "fp8"]
-l_mnk_nm = [
-    # qkv_proj
-    (1, 1280, 8192),
-    (32, 1280, 8192),
-    (64, 1280, 8192),
-    (128, 1280, 8192),
-    (192, 1280, 8192),
-    (256, 1280, 8192),
-    (320, 1280, 8192),
-    (512, 1280, 8192),
-    (1024, 1280, 8192),
-    (2048, 1280, 8192),
-    (4096, 1280, 8192),
-    (8192, 1280, 8192),
-    (16384, 1280, 8192),
-    # attn_out
-    (1, 8192, 1024),
-    (32, 8192, 1024),
-    (64, 8192, 1024),
-    (128, 8192, 1024),
-    (192, 8192, 1024),
-    (256, 8192, 1024),
-    (320, 8192, 1024),
-    (512, 8192, 1024),
-    (1024, 8192, 1024),
-    (2048, 8192, 1024),
-    (4096, 8192, 1024),
-    (8192, 8192, 1024),
-    (16384, 8192, 1024),
-    # hipmm preshuffle
-    (16, 7424, 8192),
-    (32, 7424, 8192),
-    (48, 7424, 8192),
-    (64, 7424, 8192),
-    (4096, 7424, 8192),
-    (5120, 7424, 8192),
-    (8192, 7424, 8192),
-]
-
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -441,46 +400,70 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp16"]],
+    nargs="*",
+    default=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp16"]],
     help="""Data type.
     e.g.: -d bf16""",
 )
 parser.add_argument(
     "-q",
     "--quantDtype",
-    type=str,
-    choices=l_quantDtype,
-    nargs="?",
-    const=None,
-    default=None,
-    help="""Date type of quantization.
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["i8"], dtypes.d_dtypes["fp8"]],
+    nargs="*",
+    default=[dtypes.d_dtypes["i8"], dtypes.d_dtypes["fp8"]],
+    help="""Data type of quantization.
     e.g.: -q fp8""",
 )
 parser.add_argument(
     "-mnk",
     type=dtypes.str2tuple,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    default=[
+        # qkv_proj
+        (1, 1280, 8192),
+        (32, 1280, 8192),
+        (64, 1280, 8192),
+        (128, 1280, 8192),
+        (192, 1280, 8192),
+        (256, 1280, 8192),
+        (320, 1280, 8192),
+        (512, 1280, 8192),
+        (1024, 1280, 8192),
+        (2048, 1280, 8192),
+        (4096, 1280, 8192),
+        (8192, 1280, 8192),
+        (16384, 1280, 8192),
+        # attn_out
+        (1, 8192, 1024),
+        (32, 8192, 1024),
+        (64, 8192, 1024),
+        (128, 8192, 1024),
+        (192, 8192, 1024),
+        (256, 8192, 1024),
+        (320, 8192, 1024),
+        (512, 8192, 1024),
+        (1024, 8192, 1024),
+        (2048, 8192, 1024),
+        (4096, 8192, 1024),
+        (8192, 8192, 1024),
+        (16384, 8192, 1024),
+        # hipmm preshuffle
+        (16, 7424, 8192),
+        (32, 7424, 8192),
+        (48, 7424, 8192),
+        (64, 7424, 8192),
+        (4096, 7424, 8192),
+        (5120, 7424, 8192),
+        (8192, 7424, 8192),
+    ],
     help="""Shape of mnk.
     e.g. -mnk 1280,8192,1024""",
 )
 
 args = parser.parse_args()
-if args.dtype is None:
-    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-else:
-    l_dtype = [dtypes.d_dtypes[args.dtype]]
-if args.quantDtype is None:
-    l_quantDtype = [dtypes.d_dtypes[key] for key in l_quantDtype]
-else:
-    l_quantDtype = [dtypes.d_dtypes[args.quantDtype]]
-if args.mnk is not None:
-    l_mnk_nm = [args.mnk]
 
-test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk_nm)
+test_normal_gemm_a8w8_pertoken_quant(args.dtype, args.quantDtype, args.mnk)
 test_skinny_gemm_a8w8_pertoken_quant()

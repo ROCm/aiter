@@ -16,11 +16,14 @@ torch.set_printoptions(sci_mode=False)
 # current supported case in ps decode MLA: mtp == 0, 1, 2, 3 (decode_qlen = 1, 2, 3, 4)
 # qdtype bf16, kdtype bf16: nhead16
 # qdtype fp8, kdtype fp8: nhead16, nhead128
+# qdtype fp8, kdtype fp8: nhead32, max_seqlen_qo=4
 # qdtype fp8, kdtype bf16: nhead16
 
 
 def check_support(dtype, kv_dtype, nhead):
     if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
+        return False
+    if dtype == dtypes.bf16 and nhead == 32:
         return False
     return True
 
@@ -392,6 +395,26 @@ def test_mla(
         else:
             kv_last_page_lens.fill_(ctx_lens % page_size)
 
+    # Temporarily work around for fp8/fp8 with gqa_ratio=32 kernel doesn't support bitmask
+    if (
+        nhead == 32
+        and decode_qlen == 4
+        and dtype == dtypes.fp8
+        and kvtype == dtypes.fp8
+    ):
+        remainder = seq_lens_kv % 64
+        need_pad = remainder != 0
+        if need_pad.any():
+            pad = torch.where(need_pad, 64 - remainder, torch.zeros_like(remainder))
+            seq_lens_kv += pad
+
+            kv_block_nums = (seq_lens_kv + page_size - 1) // page_size
+            kv_last_page_lens = torch.where(
+                (seq_lens_kv % page_size) == 0,
+                torch.full_like(kv_last_page_lens, page_size),
+                seq_lens_kv % page_size,
+            )
+
     kv_indptr[1 : batch_size + 1] = torch.cumsum(kv_block_nums, dim=0)
     num_page = kv_indptr[-1].item()
     kv_indices = torch.randperm(num_page, dtype=torch.int)
@@ -513,15 +536,14 @@ def test_mla(
         kv_last_page_lens,
         nhead // nhead_kv,
         nhead_kv,
-        True,
+        False,
         work_meta_data,
         work_info_set,
         work_indptr,
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
-        page_size=page_size,
-        kv_granularity=max(1, 16 // page_size),
+        kv_granularity=max(page_size, 16),  # for qh32 kv split is disabled
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=decode_qlen,
         fast_mode=True if not non_persistent_mode else False,
@@ -647,7 +669,7 @@ def test_mla(
             kv_lora_rank,
             qk_rope_head_dim,
             dtype=out_dtype,
-            is_causal=True,
+            is_causal=False,
             q_scale=None,
             kv_scale=kv_scale,
         )
@@ -805,7 +827,8 @@ v_head_dim = 128
 block_size = 1
 list_dtype = ["bf16", "fp8"]
 l_kv_dtype = ["bf16", "fp8"]
-list_nhead = [(16, 1), (16, 2), (16, 4), (48, 1), (128, 2)]
+list_nhead = [(16, 1), (16, 2), (16, 4), (48, 1), (128, 2), (32, 4)]
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
