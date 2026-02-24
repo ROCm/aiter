@@ -161,8 +161,9 @@ def get_smem_data_layout(layout, shape, bases_representation):
 
 
 def make_kv_shuffled_layout(
-    BLOCK_SIZE_N_SHFL, BLOCK_SIZE_INNER_DIM_SHFL, num_warps_log2
+    BLOCK_SIZE_N_SHFL, BLOCK_SIZE_INNER_DIM_SHFL, fastest_dim_num_warps
 ):
+    num_warps_log2 = int(math.log2(fastest_dim_num_warps))
     BLOCK_SIZE_N_SHFL_log2 = int(math.log2(BLOCK_SIZE_N_SHFL))
     BLOCK_SIZE_INNER_DIM_SHFL_log2 = int(math.log2(BLOCK_SIZE_INNER_DIM_SHFL))
     coalesced_size_log2 = 3  # (8 elements per thread for BF16)
@@ -183,7 +184,7 @@ def make_kv_shuffled_layout(
         ],
         "warp_bases": (
             [f"m{v}" for v in range(0, num_warps_log2)]
-            if BLOCK_SIZE_N_SHFL_log2 > num_warps_log2
+            if num_warps_log2 > 0 and BLOCK_SIZE_N_SHFL_log2 > num_warps_log2
             else ["z"]
         ),
     }
@@ -200,6 +201,7 @@ def make_layout_3d(
     NUM_BLOCKS_GATHER_PER_TILE: int,
     HEAD_SIZE_PADDED: int,
     use_tdm: bool,
+    use_async: bool,
     use_swizzle: bool = False,
     use_gather: bool = False,
     shuffled_kv_cache: bool = False,
@@ -274,12 +276,15 @@ def make_layout_3d(
         V_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
             operand_index=1, parent=PV_WMMA_LAYOUT, k_width=8
         )
-    else:
+    elif shuffled_kv_cache:
+        # When shuffled KV cache has to go through LDS, using [num_warps, 1] for Key cache is faster
+        # When shuffled KV cache does not have to go through LDS, using [1, num_warps] for Key cache is faster
         QK_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDMFMALayout(
             version=4,
             instr_shape=[16, 16, 32],
             transposed=True,
-            warps_per_cta=[1, num_warps],
+            warps_per_cta=[num_warps, 1] if use_async else [1, num_warps],
+            # warps_per_cta=[1, num_warps],
         )
         PV_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDMFMALayout(
             version=4,
@@ -298,6 +303,31 @@ def make_layout_3d(
         )
         V_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
             operand_index=1, parent=PV_WMMA_LAYOUT, k_width=4 if TILE_SIZE <= 16 else 8
+        )
+    else:
+        QK_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDMFMALayout(
+            version=4,
+            instr_shape=[16, 16, 32],
+            transposed=True,
+            warps_per_cta=[num_warps, 1],
+        )
+        PV_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDMFMALayout(
+            version=4,
+            instr_shape=[16, 16, 16 if TILE_SIZE <= 16 else 32],
+            transposed=True,
+            warps_per_cta=[1, num_warps],
+        )
+        Q_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
+            operand_index=0, parent=QK_WMMA_LAYOUT, k_width=8
+        )
+        K_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
+            operand_index=1, parent=QK_WMMA_LAYOUT, k_width=8
+        )
+        P_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
+            operand_index=0, parent=PV_WMMA_LAYOUT, k_width=4
+        )
+        V_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
+            operand_index=1, parent=PV_WMMA_LAYOUT, k_width=4
         )
 
     if use_tdm or not use_swizzle:
@@ -354,9 +384,9 @@ def make_layout_3d(
             V_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
                 vec=1, per_phase=1, max_phase=1, order=[1, 0]
             )
-        # V_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
-        #     vec=4, per_phase=2, max_phase=8, order=[1, 0]
-        # )
+            # V_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
+            #     vec=4, per_phase=2, max_phase=8, order=[1, 0]
+            # )
 
         # 64
         # ttg.padded_shared<[512:+16] {offset = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16], [0, 1], [0, 2], [0, 32]], block = []}>
@@ -427,12 +457,14 @@ def make_layout_3d(
         order=[1, 0],
     )
     if shuffled_kv_cache:
-        num_warps_log2 = int(math.log2(num_warps))
         K_LOAD_LAYOUT = make_kv_shuffled_layout(
-            TILE_SIZE // 16, HEAD_SIZE_PADDED * 16, num_warps_log2
+            TILE_SIZE // 16,
+            HEAD_SIZE_PADDED * 16,
+            1 if use_async else num_warps,
+            # TILE_SIZE // 16, HEAD_SIZE_PADDED * 16, num_warps
         )
         V_LOAD_LAYOUT = make_kv_shuffled_layout(
-            HEAD_SIZE_PADDED // 16, TILE_SIZE * 16, num_warps_log2
+            HEAD_SIZE_PADDED // 16, TILE_SIZE * 16, num_warps
         )
     else:
         K_LOAD_LAYOUT: gl.constexpr = gl.BlockedLayout(
@@ -597,6 +629,7 @@ def select_3d_config(
             layouts = make_layout_3d(
                 *hyper_parms,
                 use_tdm,
+                use_async,
                 use_swizzle=False,
                 use_gather=True,
                 shuffled_kv_cache=shuffled_kv_cache,
@@ -607,6 +640,7 @@ def select_3d_config(
             layouts = make_layout_3d(
                 *hyper_parms,
                 use_tdm,
+                use_async,
                 use_swizzle=False,
                 shuffled_kv_cache=shuffled_kv_cache,
             )
@@ -615,7 +649,11 @@ def select_3d_config(
         # With async_copy pipelined, use_swizzle should always be True
         attn_impl = gluon_kernel_unified_attention_3d_async
         layouts = make_layout_3d(
-            *hyper_parms, use_tdm, use_swizzle=True, shuffled_kv_cache=shuffled_kv_cache
+            *hyper_parms,
+            use_tdm,
+            use_async,
+            use_swizzle=True,
+            shuffled_kv_cache=shuffled_kv_cache,
         )
         # gfx12 does not have async_copy.buffer_load_to_shared
         # TODO: check KV cache size to determine if use_buffer_load is needed in gfx950
@@ -627,6 +665,7 @@ def select_3d_config(
         layouts = make_layout_3d(
             *hyper_parms,
             use_tdm,
+            use_async,
             use_swizzle=use_swizzle,
             shuffled_kv_cache=shuffled_kv_cache,
         )

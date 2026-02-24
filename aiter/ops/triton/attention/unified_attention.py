@@ -71,7 +71,7 @@ def select_3d_config(
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": attn_warps,
-        "num_stages": 1,
+        "num_stages": 2,
         "waves_per_eu": 2,
     }
     reduce_config = {
