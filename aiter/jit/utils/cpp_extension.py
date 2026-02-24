@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # This file origins from pytorch:
 # https://github.com/pytorch/pytorch/blob/main/torch/utils/cpp_extension.py
@@ -930,7 +930,6 @@ def include_paths(cuda: bool = False) -> List[str]:
     if cuda and IS_HIP_EXTENSION:
         paths.append(os.path.join(lib_include, "THH"))
         paths.append(_join_rocm_home("include"))
-        paths.append(_join_rocm_home("include/hip"))
     return paths
 
 
