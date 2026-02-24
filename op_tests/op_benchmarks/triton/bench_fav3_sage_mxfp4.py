@@ -5,9 +5,6 @@ import os
 import glob
 import sys
 import argparse
-import triton
-import logging
-
 from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_wrapper,
 )
