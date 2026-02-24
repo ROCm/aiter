@@ -10,6 +10,7 @@ on:
       - "op_tests/triton_tests/**"
       - "op_tests/op_benchmarks/triton/**"
       - ".github/workflows/triton-test.yaml"
+      - ".github/scripts/build_aiter_triton.sh"
       - ".github/scripts/select_triton_tests.py"
   workflow_dispatch:
 

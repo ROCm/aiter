@@ -11,7 +11,7 @@
         "cache_modifier": ".cg",
         "NUM_KSPLIT": 1
     },
-    "M_LEQ_16": {
+    "M_LEQ_31": {
         "BLOCK_SIZE_M": 16,
         "BLOCK_SIZE_N": 64,
         "BLOCK_SIZE_K": 256,
