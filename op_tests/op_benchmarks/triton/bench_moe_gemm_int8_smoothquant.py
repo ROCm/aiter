@@ -16,7 +16,6 @@ from aiter.ops.triton.moe.quant_moe import (
 )
 from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
-from aiter.ops.triton.utils._triton.arch_info import get_arch
 import tempfile
 import inspect
 
@@ -115,8 +114,6 @@ def bench_mlp_single_weight_init(
     )
     # biases
     bg = torch.randn((n_expts_tot,), device=dev, dtype=torch.bfloat16)
-    b1 = torch.randn((n_expts_tot, dim2 // TP), device=dev, dtype=torch.float32)
-    b2 = torch.randn((n_expts_tot, dim1), device=dev, dtype=torch.float32)
 
     # smoothQuant scales
     fc1_smooth_scale = torch.randn((dim1,), device=dev, dtype=torch.float32).abs() + 0.1
@@ -238,7 +235,7 @@ def roofline_mlp(
 ):
     out_path = Path(f"logs/{name}/{x_dtype}x-{w_dtype}w-TP{TP}/")
     out_path.mkdir(parents=True, exist_ok=True)
-    csv_path = compute_roofline(
+    compute_roofline(
         dim1,
         dim2,
         n_expts_tot,

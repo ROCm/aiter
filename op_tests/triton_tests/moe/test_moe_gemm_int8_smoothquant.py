@@ -244,7 +244,7 @@ def test_op(
         has_y_gammas,
         device=device,
     )
-    x_ref, w_ref, bias_ref = x_tri.clone(), w_tri.clone(), bias_tri.clone()
+    bias_ref = bias_tri.clone()
 
     x_int8_tri, x_scale_tri = smoothquant_quantize(x_tri, smooth_scale)
     x_int8_ref, x_scale_ref = x_int8_tri.clone(), x_scale_tri.clone()

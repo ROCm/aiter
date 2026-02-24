@@ -77,7 +77,11 @@ def downcast_to_mxfp(
     # downcast
     src_tensor = src_tensor.transpose(axis, src_tensor.ndim - 1)
     is_fp4 = out_quant_type == torch.uint8
-    is_fp8 = out_quant_type in (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2)
+    is_fp8 = out_quant_type in (
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2,
+    )
     assert is_fp4 or is_fp8
     divisor = 2 if is_fp4 else 1
     L = src_tensor.shape[-1]
@@ -330,9 +334,6 @@ def quantize_weights_int8(
         squeeze_output = True
     else:
         squeeze_output = False
-
-    E, K, N = w.shape
-    device = w.device
 
     w_fp32 = w.to(torch.float32)
     w_abs_max = w_fp32.abs().max(dim=1).values

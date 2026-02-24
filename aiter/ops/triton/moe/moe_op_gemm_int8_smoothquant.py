@@ -5,7 +5,6 @@ import itertools
 import torch
 import triton
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
-from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_int8_smoothquant import (
     _moe_gemm_int8_smoothquant,
