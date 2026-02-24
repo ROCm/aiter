@@ -5,12 +5,15 @@ import os
 import glob
 import sys
 import argparse
+import triton
+import logging
+
 from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_wrapper,
 )
 
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import (
-    return_static_random_hadamard,
+    create_hadamard_matrix,
 )
 
 from op_tests.triton_tests.attention.test_fav3_sage import (
@@ -50,42 +53,8 @@ def bench_kernel(q, k, v, args, provider):
         BATCH, HQ, N_CTX_Q, D_HEAD = q.shape
         _, HK, N_CTX_K, D_HEAD_V = v.shape
 
-    # def return_only_kernel_func_call():
-
-    #     config = get_sage_fwd_configs_mxfp4()
-    #     (
-    #         q_quantized,
-    #         q_descale,
-    #         k_quantized,
-    #         k_descale,
-    #         v_quantized,
-    #         v_descale,
-    #         delta_s,
-    #     ) = sage_quant_mxfp4(
-    #         q,
-    #         k,
-    #         v,
-    #         hadamard_rotation=args.hadamard_rotate,
-    #         BLOCK_M=config["BLOCK_M"],
-    #         BLOCK_R=D_HEAD,
-    #         q_smoothing=args.qsmooth,
-    #         layout=args.layout,
-    #     )
-    #     return lambda: fav3_sage_mxfp4_func(
-    #         q=q_quantized,
-    #         k=k_quantized,
-    #         v=v_quantized,
-    #         q_descale=q_descale,
-    #         k_descale=k_descale,
-    #         v_descale=v_descale,
-    #         bias=delta_s,
-    #         causal=args.causal,
-    #         layout=args.layout,
-    #         config=config,
-    #     )
-    # fn = return_only_kernel_func_call()
-
-    R = return_static_random_hadamard(q.device)
+    BLOCK_R = args.BLOCK_R
+    R = create_hadamard_matrix(BLOCK_R, q.device) / (BLOCK_R**0.5)
 
     def fn():
         return fav3_sage_mxfp4_wrapper(
@@ -184,6 +153,13 @@ def parse_args():
         default=True,
         help="whether to apply hadamard rotate (1) or not (0). Default 1.",
     )
+
+    parser.add_argument(
+        "-BLOCK_R",
+        type=int,
+        default=128,
+        help="Hadamard matrix size. Should be <= d",
+    )
     parser.add_argument(
         "-qsmooth",
         action="store_true",
@@ -224,6 +200,10 @@ def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
 
 
 def test_accuracy(q, k, v, args):
+
+    BLOCK_R = args.BLOCK_R
+    R = create_hadamard_matrix(BLOCK_R, q.device) / (BLOCK_R**0.5)
+
     triton_out = fav3_sage_mxfp4_wrapper(
         q,
         k,
@@ -232,6 +212,7 @@ def test_accuracy(q, k, v, args):
         layout=args.layout,
         q_smooth=args.qsmooth,
         hadamard_rotation=args.hadamard_rotate,
+        R=R,
     )
     # permute because FAv2 assumes bshd
     if args.layout == "bhsd":
@@ -308,6 +289,9 @@ def main():
         args.sk = args.sq
     if not args.hk:
         args.hk = args.hq
+
+    assert args.BLOCK_R <= args.d, "Rotation block size should be <= d"
+
     if args.captured_dir is not None:
         test_accuracy_with_captured_inputs(args)
     else:

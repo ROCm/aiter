@@ -1082,6 +1082,7 @@ def _compute_delta_s_kernel(
     )
     tl.store(s_ptr, acc, mask=offs_n < seq_k)
 
+
 @functools.lru_cache(maxsize=16)
 def create_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
     """
