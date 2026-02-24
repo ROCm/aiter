@@ -143,9 +143,6 @@ def run_gemm_triton(x, w, bias, out_dtype, y, activation=None):
 def run_gemm_gluon(x, w, bias, dtype, y, activation=None):
     """
     Run the Gluon GEMM kernel.
-    
-    Note: Gluon kernel expects weights in (N, K) format with preshuffled=True,
-    which matches how the test generates weights.
     """
     if isinstance(dtype, tuple):
         out_dtype = x.dtype
@@ -157,7 +154,6 @@ def run_gemm_gluon(x, w, bias, dtype, y, activation=None):
         bias=bias,
         dtype=out_dtype,
         y=y,
-        preshuffled=True, 
         activation=activation,
     )
 
