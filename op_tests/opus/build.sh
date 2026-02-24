@@ -4,6 +4,7 @@
 #
 # Build (and optionally run) OPUS C++ tests.
 # test_opus_basic = standalone executable; test_opus_mfma is built as PyTorch ext (see test_opus_mfma.py).
+# Can be invoked from any directory.
 # Usage:
 #   ./build.sh           - compile test_opus_basic
 #   ./build.sh --test    - compile and run test_opus_basic
@@ -12,11 +13,11 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$SCRIPT_DIR"
 
 HIPCC="${HIPCC:-hipcc}"
-CXXFLAGS="-std=c++17 -O2 -Wall -Wextra -I../../csrc/include"
-OPUS_INCLUDE="../../csrc/include"
+CXXFLAGS="-std=c++17 -O2 -Wall -Wextra -I${REPO_ROOT}/csrc/include"
 
 TESTS=(test_opus_basic)
 SOURCES=(test_opus_basic.cpp)
