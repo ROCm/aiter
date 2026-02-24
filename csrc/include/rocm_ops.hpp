@@ -1767,7 +1767,6 @@ namespace py = pybind11;
           py::arg("context_lens"),            \
           py::arg("gqa_ratio"),               \
           py::arg("num_heads_k"),             \
-          py::arg("work_metadata_ptrs"),      \
           py::arg("work_indptr"),             \
           py::arg("work_info"),               \
           py::arg("reduce_indptr"),           \
