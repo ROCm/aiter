@@ -461,7 +461,7 @@ def make_layout_3d(
             TILE_SIZE // 16,
             HEAD_SIZE_PADDED * 16,
             1 if use_async else num_warps,
-            # TILE_SIZE // 16, HEAD_SIZE_PADDED * 16, num_warps
+            # num_warps
         )
         V_LOAD_LAYOUT = make_kv_shuffled_layout(
             HEAD_SIZE_PADDED // 16, TILE_SIZE * 16, num_warps
