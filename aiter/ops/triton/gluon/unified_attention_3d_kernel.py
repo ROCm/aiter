@@ -2027,6 +2027,21 @@ def gluon_kernel_unified_attention_3d_async(
         segm_idx * tiles_per_segment,
         min((segm_idx + 1) * tiles_per_segment, num_tiles) - (num_stages - 1),
     ):
+        # K, k_from_lds = _request_from_lds(
+        #     k_from_lds,
+        #     k_scale,
+        #     Q.dtype,
+        #     smem_K,
+        #     wait_group=(num_stages - 2) * 2 + 1,
+        #     LOAD_LAYOUT=K_LOAD_LAYOUT,
+        #     DOT_LAYOUT=K_DOT_LAYOUT,
+        #     SHUFFLED_KV_CACHE=SHUFFLED_KV_CACHE,
+        #     num_stages=num_stages,
+        # )
+        # if SHUFFLED_KV_CACHE:
+        #     K = _unshuffle_kv_cache(K, TILE_SIZE, HEAD_SIZE_PADDED)
+        #     K = gl.convert_layout(value=K, layout=K_DOT_LAYOUT, assert_trivial=True)
+
         j_from_hbm, k_offset, v_offset, tile_k_mask, tile_v_mask = _get_kv_offsets(
             j_from_hbm,
             kv_head_idx,
@@ -2084,6 +2099,21 @@ def gluon_kernel_unified_attention_3d_async(
             use_buffer_load=use_buffer_load,
         )
 
+        # K, k_from_lds = _request_from_lds(
+        #     k_from_lds,
+        #     k_scale,
+        #     Q.dtype,
+        #     smem_K,
+        #     wait_group=(num_stages - 1) * 2,
+        #     LOAD_LAYOUT=K_LOAD_LAYOUT,
+        #     DOT_LAYOUT=K_DOT_LAYOUT,
+        #     SHUFFLED_KV_CACHE=SHUFFLED_KV_CACHE,
+        #     num_stages=num_stages,
+        # )
+        # if SHUFFLED_KV_CACHE:
+        #     K = _unshuffle_kv_cache(K, TILE_SIZE, HEAD_SIZE_PADDED)
+        #     K = gl.convert_layout(value=K, layout=K_DOT_LAYOUT, assert_trivial=True)
+
         # V_load : shape = (TILE_SIZE, HEAD_SIZE_PADDED), layout = Q_LOAD_LAYOUT
         v_from_hbm = _async_load_to_lds(
             v_from_hbm,
@@ -2095,6 +2125,21 @@ def gluon_kernel_unified_attention_3d_async(
             cache_modifier=KV_cache_modifier,
             use_buffer_load=use_buffer_load,
         )
+
+        # K, k_from_lds = _request_from_lds(
+        #     k_from_lds,
+        #     k_scale,
+        #     Q.dtype,
+        #     smem_K,
+        #     wait_group=(num_stages - 1) * 2 + 1,
+        #     LOAD_LAYOUT=K_LOAD_LAYOUT,
+        #     DOT_LAYOUT=K_DOT_LAYOUT,
+        #     SHUFFLED_KV_CACHE=SHUFFLED_KV_CACHE,
+        #     num_stages=num_stages,
+        # )
+        # if SHUFFLED_KV_CACHE:
+        #     K = _unshuffle_kv_cache(K, TILE_SIZE, HEAD_SIZE_PADDED)
+        #     K = gl.convert_layout(value=K, layout=K_DOT_LAYOUT, assert_trivial=True)
 
         # P : shape = (BLOCK_M, TILE_SIZE), layout = Q_LOAD_LAYOUT
         # L : shape = (BLOCK_M, ), layout = gl.SliceLayout(1, Q_LOAD_LAYOUT)

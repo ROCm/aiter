@@ -283,6 +283,7 @@ def make_layout_3d(
             transposed=True,
             warps_per_cta=[num_warps, 1] if use_async else [1, num_warps],
             # warps_per_cta=[1, num_warps],
+            # warps_per_cta=[num_warps, 1],
         )
         PV_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDMFMALayout(
             version=4,
@@ -459,7 +460,8 @@ def make_layout_3d(
             TILE_SIZE // 16,
             HEAD_SIZE_PADDED * 16,
             1 if use_async else num_warps,
-            # num_warps
+            # num_warps,
+            # 1,
         )
         V_LOAD_LAYOUT = make_kv_shuffled_layout(
             HEAD_SIZE_PADDED // 16, TILE_SIZE * 16, num_warps
