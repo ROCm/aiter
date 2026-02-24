@@ -1233,14 +1233,9 @@
             "f'{AITER_CSRC_DIR}/kernels/causal_conv1d_update.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [
-            "'-ffast-math'",
-            "'-DCK_TILE_USE_BUFFER_ADDRESSING_BUILTIN=0'"
-        ],
+        "flags_extra_hip": [],
         "extra_ldflags": "None",
-        "extra_include": [
-            "f'{AITER_CSRC_DIR}/include/ck_tile'"
-        ],
+        "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
     }
