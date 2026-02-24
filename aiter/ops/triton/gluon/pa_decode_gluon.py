@@ -775,12 +775,15 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
 
 
 @triton.autotune(
-    configs=[triton.Config({"waves_per_eu": wa}, num_stages=1) for wa in [0, 2]],
+    configs=[triton.Config({"waves_per_eu": wa}, num_stages=1) for wa in range(5)],
     key=[
         "KV_BLOCK_SIZE",
+        "SLIDING_WINDOW",
         "KV_QUANT_MODE",
+        "QUERY_QUANT_MODE",
         "ONE_QUERY_GROUP_SIZE_POW2",
         "QUERY_SEQ_LEN_POW2",
+        "HEAD_SIZE_POW2",
     ],
     cache_results=True,
 )
@@ -897,7 +900,6 @@ def paged_attention_decode_sliding_window(
     kv_head_idx = gl.program_id(1)
     sequence_split_idx = gl.program_id(2)
 
-    context_length = gl.load(context_lengths_ptr + sequence_idx)
     # ==================== CONSTANTS AND CONFIGURATION ====================
     if COMPUTE_TYPE.is_fp8():
         MFMA_INSTR_K: gl.constexpr = 32
@@ -1012,7 +1014,7 @@ def paged_attention_decode_sliding_window(
         block_bases=[],
         shape=[QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE],
     )
-
+    context_length = gl.load(context_lengths_ptr + sequence_idx)
     # Value cache layout configuration based on transpose flag
     if VALUE_TRANSPOSED:
         # Transposed value layout for better memory access patterns
@@ -1154,18 +1156,6 @@ def paged_attention_decode_sliding_window(
         0, HEAD_SIZE_POW2, layout=gl.SliceLayout(0, pv_mfma_layout)
     )
 
-    max_logits_base_offsets_mtp = gl.arange(
-        0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, qk_linear_layout)
-    )
-    max_logits_query_len_idx = max_logits_base_offsets_mtp // ONE_QUERY_GROUP_SIZE_POW2
-    max_logits_group_idx_in_len = (
-        max_logits_base_offsets_mtp % ONE_QUERY_GROUP_SIZE_POW2
-    )
-
-    max_logits_base_offsets = (
-        max_logits_query_len_idx * query_group_size + max_logits_group_idx_in_len
-    )
-
     # ==================== PROGRAM ID AND INITIALIZATION ====================
 
     max_logits = gl.full(
@@ -1197,6 +1187,41 @@ def paged_attention_decode_sliding_window(
     )
     mtp_query_tensor = gl.amd.cdna3.buffer_load(
         ptr=query_ptr, offsets=mtp_query_offsets, mask=mtp_query_mask
+    )
+    if SLIDING_WINDOW > 0:
+        sequence_start_idx = context_length - SLIDING_WINDOW
+        sequence_end_idx = context_length
+        sequence_partition_start_idx = gl.maximum(
+            0, sequence_start_idx // CONTEXT_PARTITION_SIZE
+        )
+    else:
+        page_size = gl.cdiv(context_length, gl.num_programs(2))
+        sequence_start_idx = page_size * sequence_split_idx
+
+        sequence_end_idx = gl.minimum(
+            context_length, page_size * (sequence_split_idx + 1)
+        )
+        sequence_partition_start_idx = sequence_start_idx // CONTEXT_PARTITION_SIZE
+    block_indices = gl.arange(0, MAX_NUM_KV_BLOCKS_PER_COMPUTE, layout=block_id_layout)
+    max_num_kv_blocks = gl.cdiv(context_length, KV_COMPUTE_BLOCK_SIZE)
+    kv_block_start_idx = sequence_partition_start_idx * MAX_NUM_KV_BLOCKS_PER_COMPUTE
+    kv_block_numbers = gl.amd.cdna3.buffer_load(
+        ptr=block_tables_ptr
+        + sequence_idx * stride_block_table_seq
+        + kv_block_start_idx // CONTEXT_PARTITION_SIZE_PER_BLOCK,
+        offsets=block_indices,
+        mask=block_indices < (max_num_kv_blocks - kv_block_start_idx),
+    )
+    max_logits_base_offsets_mtp = gl.arange(
+        0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, qk_linear_layout)
+    )
+    max_logits_query_len_idx = max_logits_base_offsets_mtp // ONE_QUERY_GROUP_SIZE_POW2
+    max_logits_group_idx_in_len = (
+        max_logits_base_offsets_mtp % ONE_QUERY_GROUP_SIZE_POW2
+    )
+
+    max_logits_base_offsets = (
+        max_logits_query_len_idx * query_group_size + max_logits_group_idx_in_len
     )
     # Output shape: [batch_size, query_length, num_kv_heads, query_group_size, head_size]
     if ONE_SHOT:
@@ -1235,51 +1260,28 @@ def paged_attention_decode_sliding_window(
             output_head_size_offsets[None, :] < head_size
         )
 
-    if SLIDING_WINDOW > 0:
-        sequence_start_idx = context_length - SLIDING_WINDOW
-        sequence_end_idx = context_length
-        sequence_partition_start_idx = gl.maximum(
-            0, sequence_start_idx // CONTEXT_PARTITION_SIZE
-        )
-    else:
-        page_size = gl.cdiv(context_length, gl.num_programs(2))
-        sequence_start_idx = page_size * sequence_split_idx
-        if sequence_start_idx >= context_length:
-            if not ONE_SHOT:
-                gl.amd.cdna3.buffer_store(
-                    stored_value=max_logits,
-                    ptr=max_logits_ptr,
-                    offsets=max_logits_offsets,
-                    mask=qk_row_mask,
-                )
-                gl.amd.cdna3.buffer_store(
-                    stored_value=exp_sums,
-                    ptr=exp_sums_ptr,
-                    offsets=max_logits_offsets,
-                    mask=qk_row_mask,
-                )
-                gl.amd.cdna3.buffer_store(
-                    stored_value=attention_accumulator.to(OUTPUT_DTYPE),
-                    ptr=output_ptr,
-                    offsets=output_offsets,
-                    mask=output_mask,
-                )
-            return  # No computation needed for this partition
-        sequence_end_idx = gl.minimum(
-            context_length, page_size * (sequence_split_idx + 1)
-        )
-        sequence_partition_start_idx = sequence_start_idx // CONTEXT_PARTITION_SIZE
+    if sequence_start_idx >= context_length:
+        if not ONE_SHOT:
+            gl.amd.cdna3.buffer_store(
+                stored_value=max_logits,
+                ptr=max_logits_ptr,
+                offsets=max_logits_offsets,
+                mask=qk_row_mask,
+            )
+            gl.amd.cdna3.buffer_store(
+                stored_value=exp_sums,
+                ptr=exp_sums_ptr,
+                offsets=max_logits_offsets,
+                mask=qk_row_mask,
+            )
+            gl.amd.cdna3.buffer_store(
+                stored_value=attention_accumulator.to(OUTPUT_DTYPE),
+                ptr=output_ptr,
+                offsets=output_offsets,
+                mask=output_mask,
+            )
+        return  # No computation needed for this partition
 
-    block_indices = gl.arange(0, MAX_NUM_KV_BLOCKS_PER_COMPUTE, layout=block_id_layout)
-    max_num_kv_blocks = gl.cdiv(context_length, KV_COMPUTE_BLOCK_SIZE)
-    kv_block_start_idx = sequence_partition_start_idx * MAX_NUM_KV_BLOCKS_PER_COMPUTE
-    kv_block_numbers = gl.amd.cdna3.buffer_load(
-        ptr=block_tables_ptr
-        + sequence_idx * stride_block_table_seq
-        + kv_block_start_idx // CONTEXT_PARTITION_SIZE_PER_BLOCK,
-        offsets=block_indices,
-        mask=block_indices < (max_num_kv_blocks - kv_block_start_idx),
-    )
     sequence_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
 
     # Load query tensor with 3D MTP layout
