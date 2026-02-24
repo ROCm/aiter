@@ -292,7 +292,12 @@ def test_op(
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
     if hbm_swizzling:
-        swizzle_mx_scale = "CDNA4_SCALE"
+        if get_arch() != "gfx1250":
+            swizzle_mx_scale = "GFX1250_SCALE"
+        elif get_arch() == "gfx950":
+            swizzle_mx_scale = "CDNA4_SCALE"
+        else:
+            assert False, "Unsupported architecture"
         w_scale_tri = swizzle_scales(w_scale_tri)
     else:
         swizzle_mx_scale = None

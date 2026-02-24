@@ -537,9 +537,9 @@ def _moe_gemm_a4w4_gfx1250(
     if is_x_microscaled and GatherIndx is None:
         XMxScale += start_m * stride_x_mx_m
 
-    SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[PACKED_BLOCK_K_X, 16]], [BLOCK_M, PACKED_BLOCK_K_X], [1, 0])
-    SHARED_LAYOUT_W: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[PACKED_BLOCK_K_W, 16]], [BLOCK_N, PACKED_BLOCK_K_W], [1, 0])
-    SHARED_LAYOUT_X_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[256, 16]], [BLOCK_M, MX_SCALE_BLOCK_K], [1, 0])
+    SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[PACKED_BLOCK_K_X, 16]], [PACKED_BLOCK_M_X, PACKED_BLOCK_K_X], [1, 0])
+    SHARED_LAYOUT_W: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[PACKED_BLOCK_K_W, 16]], [PACKED_BLOCK_N_W, PACKED_BLOCK_K_W], [1, 0])
+    SHARED_LAYOUT_X_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[256, 16]], [PACKED_BLOCK_M_X, MX_SCALE_BLOCK_K], [1, 0])
     SHARED_LAYOUT_W_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[256, 16]], [SCALE_BLOCK_N, PACKED_MX_BLOCK], [1, 0])
 
     if GatherIndx is None:
@@ -592,8 +592,8 @@ def _moe_gemm_a4w4_gfx1250(
 
     DOT_LAYOUT_X: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=WMMA_LAYOUT_PACKED, k_width=16)
     DOT_LAYOUT_W: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=WMMA_LAYOUT_PACKED, k_width=16)
-    DOT_LAYOUT_X_SCALES: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(DOT_LAYOUT_X, [BLOCK_M, MX_SCALE_BLOCK_K])
-    DOT_LAYOUT_W_SCALES: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(DOT_LAYOUT_W, [BLOCK_N, MX_SCALE_BLOCK_K])
+    DOT_LAYOUT_X_SCALES: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(DOT_LAYOUT_X, [PACKED_BLOCK_M_X, MX_SCALE_BLOCK_K])
+    DOT_LAYOUT_W_SCALES: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(DOT_LAYOUT_W, [PACKED_BLOCK_N_W, MX_SCALE_BLOCK_K])
 
     x_buffer = gl.allocate_shared_memory(x_desc.dtype, shape=[NUM_BUFFERS] + x_desc.block_shape, layout=x_desc.layout)
     w_buffer = gl.allocate_shared_memory(w_desc.dtype, shape=[NUM_BUFFERS] + w_desc.block_shape, layout=w_desc.layout)
@@ -607,9 +607,9 @@ def _moe_gemm_a4w4_gfx1250(
     # prologue
     for _ in gl.static_range(NUM_BUFFERS - 1):
         if GatherIndx is None:
-            gl.amd.gfx1250.tdm.async_load(x_desc, [offs_x_m, producer * PACKED_BLOCK_M_X], x_buffer.index(producer % NUM_BUFFERS))
+            gl.amd.gfx1250.tdm.async_load(x_desc, [offs_x_m, producer * PACKED_BLOCK_K_X], x_buffer.index(producer % NUM_BUFFERS))
         else:
-            gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, producer * PACKED_BLOCK_M_X, x_buffer.index(producer % NUM_BUFFERS))
+            gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, producer * PACKED_BLOCK_K_X, x_buffer.index(producer % NUM_BUFFERS))
         gl.amd.gfx1250.tdm.async_load(w_desc, [offs_w_n, producer * PACKED_BLOCK_K_W], w_buffer.index(producer % NUM_BUFFERS))
         if is_x_microscaled:
             if GatherIndx is None:
@@ -624,9 +624,9 @@ def _moe_gemm_a4w4_gfx1250(
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
     for k in range(num_k_iter - (NUM_BUFFERS - 1)):
         if GatherIndx is None:
-            gl.amd.gfx1250.tdm.async_load(x_desc, [offs_x_m, producer * PACKED_BLOCK_M_X], x_buffer.index(producer % NUM_BUFFERS))
+            gl.amd.gfx1250.tdm.async_load(x_desc, [offs_x_m, producer * PACKED_BLOCK_K_X], x_buffer.index(producer % NUM_BUFFERS))
         else:
-            gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, producer * PACKED_BLOCK_M_X, x_buffer.index(producer % NUM_BUFFERS))
+            gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, producer * PACKED_BLOCK_K_X, x_buffer.index(producer % NUM_BUFFERS))
         gl.amd.gfx1250.tdm.async_load(w_desc, [offs_w_n, producer * PACKED_BLOCK_K_W], w_buffer.index(producer % NUM_BUFFERS))
         if is_x_microscaled:
             if GatherIndx is None:
@@ -654,7 +654,7 @@ def _moe_gemm_a4w4_gfx1250(
         if is_x_microscaled:
             x_scales = x_scales_buffer_slice.load(layout=DOT_LAYOUT_X_SCALES)
         else:
-            x_scales = gl.constexpr(0)
+            x_scales = gl.full((PACKED_BLOCK_M_X, MX_SCALE_BLOCK_K), 127, dtype=gl.uint8)
         w_scales = w_scales_buffer_slice.load(layout=DOT_LAYOUT_W_SCALES)
 
         acc = gl.amd.gfx1250.wmma_scaled(x, x_scales, "e2m1", w, w_scales, "e2m1", acc)
@@ -670,14 +670,6 @@ def _moe_gemm_a4w4_gfx1250(
             x_scales_buffer_slice = x_scales_buffer.index(consumer % NUM_BUFFERS)
         w_scales_buffer_slice = w_scales_buffer.index(consumer % NUM_BUFFERS)
         if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
-            if GatherIndx is None:
-                x_scales_buffer_slice = x_scales_buffer_slice.reshape((
-                    BLOCK_M,
-                    MX_SCALE_BLOCK_K // SCALE_KWIDTH,
-                    PRESHUFFLE_FACTOR // 4,
-                    4,
-                    SCALE_KWIDTH,
-                )).permute((0, 3, 2, 1, 4)).reshape((BLOCK_M, MX_SCALE_BLOCK_K))
             w_scales_buffer_slice = w_scales_buffer_slice.reshape((
                 SCALE_BLOCK_N,
                 MX_SCALE_BLOCK_K // SCALE_KWIDTH,
@@ -688,7 +680,7 @@ def _moe_gemm_a4w4_gfx1250(
         if is_x_microscaled:
             x_scales = x_scales_buffer_slice.load(layout=DOT_LAYOUT_X_SCALES)
         else:
-            x_scales = gl.constexpr(0)
+            x_scales = gl.full((PACKED_BLOCK_M_X, MX_SCALE_BLOCK_K), 127, dtype=gl.uint8)
         w_scales = w_scales_buffer_slice.load(layout=DOT_LAYOUT_W_SCALES)
 
         acc = gl.amd.gfx1250.wmma_scaled(x, x_scales, "e2m1", w, w_scales, "e2m1", acc)
