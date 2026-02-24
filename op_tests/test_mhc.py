@@ -217,7 +217,7 @@ def mhc_pre_tilelang(
         out: T.Tensor((num_tokens, hc_mult3), T.float32)
         sqrsum: T.Tensor((num_tokens), T.float32)
 
-        with T.Kernel(T.ceildiv(num_tokens, token_block)) as px:
+        with T.Kernel(T.ceildiv(num_tokens, token_block), threads=256) as px:
             out_frag = T.alloc_fragment((token_block, 32), T.float32)
             sqrsum_part = T.alloc_fragment((token_block, 4), T.float32)
             T.clear(out_frag)
@@ -409,7 +409,7 @@ def mhc_pre_hip(
     import math
 
     m = residual.size(0)
-    hc_mult = residual.size(-2)
+    hc_mult = residual.size(1)
     hc_mult3 = fn.size(0)
     hc_hidden_size = fn.size(1)
 
@@ -453,42 +453,29 @@ def mhc_pre_hip(
     out = out_pad[:, :, :hc_mult3]
     sqrsum = torch.empty(selected_splitk, m, dtype=dtypes.fp32)
     aiter.mhc_pre_gemm_sqrsum(out, sqrsum, residual, fn, selected_tile_k)
-    out = out.sum(0)
-    sqrsum = sqrsum.sum(0)
-    mixes = out * (sqrsum.unsqueeze(-1) / fn.shape[-1] + rms_eps).rsqrt()
+    # out = out.sum(0)
+    # sqrsum = sqrsum.sum(0)
 
-    hc_scale = torch.cat(
-        [
-            hc_scale[0].expand(hc_mult),
-            hc_scale[1].expand(hc_mult),
-            hc_scale[2].expand(hc_mult * hc_mult),
-        ],
-    )
-    mixes = mixes * hc_scale + hc_base
-
-    pre_mix = mixes[:, :hc_mult].sigmoid().unsqueeze(-1) + hc_pre_eps
-    post_mix = (
-        mixes[:, hc_mult : 2 * hc_mult].sigmoid() * hc_post_mult_value
-    ).unsqueeze(-1)
-    res_mix = mixes[:, 2 * hc_mult :].view(-1, hc_mult, hc_mult)
-
-    def sinkhorn_normalize_ref(
-        x: torch.Tensor, repeat: int, eps: float
-    ) -> torch.Tensor:
-        x = x.softmax(-1) + eps
-        x = x / (x.sum(-2, keepdim=True) + eps)
-        for _ in range(repeat - 1):
-            x = x / (x.sum(-1, keepdim=True) + eps)
-            x = x / (x.sum(-2, keepdim=True) + eps)
-        return x
-
-    res_mix = sinkhorn_normalize_ref(
-        res_mix, repeat=sinkhorn_repeat, eps=hc_sinkhorn_eps
+    post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32)
+    comb_mix = torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32)
+    layer_input = torch.empty(m, hidden_size, dtype=dtypes.bf16)
+    aiter.mhc_pre_big_fuse(
+        post_mix,
+        comb_mix,
+        layer_input,
+        out,
+        sqrsum,
+        hc_scale,
+        hc_base,
+        residual,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
     )
 
-    layer_input = (residual * pre_mix).sum(-2).bfloat16()
-
-    return post_mix, res_mix, layer_input
+    return post_mix, comb_mix, layer_input
 
 
 @benchmark()
@@ -497,7 +484,6 @@ def test_mhc_pre(m, hidden_size, hc_mult):
     hc_mult3 = hc_mult * 2 + hc_mult2
     hc_hidden_size = hc_mult * hidden_size
     residual = torch.randn(m, hc_mult, hidden_size, dtype=dtypes.bf16)
-    # residual[:, :2] = 0
     fn = torch.randn(hc_mult3, hc_hidden_size, dtype=dtypes.fp32)
     hc_scale = torch.randn((3,), dtype=dtypes.fp32) * 0.1
     hc_base = torch.randn((hc_mult3,), dtype=dtypes.fp32) * 0.1
@@ -508,7 +494,6 @@ def test_mhc_pre(m, hidden_size, hc_mult):
         "hc_post_mult_value": 1.0,
         "sinkhorn_repeat": 20,
     }
-    # print(f"{fn[:, :128]=}")
 
     post_mix_ref, comb_mix_ref, layer_input_ref = mhc_pre_ref(
         residual, fn, hc_scale, hc_base, **extra_args
@@ -518,17 +503,17 @@ def test_mhc_pre(m, hidden_size, hc_mult):
     )  # , num_iters=2, num_warmup=0)
 
     checkAllclose(post_mix_ref, post_mix_hip, msg="post_mix")
-    hip_err = checkAllclose(comb_mix_ref, comb_mix_hip, msg="comb_mix")
-    checkAllclose(layer_input_ref, layer_input_hip, msg="layer_input")
+    checkAllclose(comb_mix_ref, comb_mix_hip, msg="comb_mix")
+    hip_err = checkAllclose(layer_input_ref, layer_input_hip, msg="layer_input")
     ret = {}
     ret["hip_err"] = hip_err
     ret["hip_us"] = hip_us
 
     # try:
     #     (post_mix_tilelang, comb_mix_tilelang, layer_input_tilelang), tilelang_us = run_perftest(mhc_pre_tilelang, residual, fn, hc_scale, hc_base, **extra_args)
-    #     checkAllclose(post_mix_tilelang, post_mix_hip, msg="post_mix")
-    #     tilelang_err = checkAllclose(comb_mix_tilelang, comb_mix_hip, msg="comb_mix")
-    #     checkAllclose(layer_input_tilelang, layer_input_hip, msg="layer_input")
+    #     checkAllclose(post_mix_ref, post_mix_tilelang, msg="post_mix")
+    #     tilelang_err = checkAllclose(comb_mix_ref, comb_mix_tilelang, msg="comb_mix")
+    #     checkAllclose(layer_input_ref, layer_input_tilelang, msg="layer_input")
     #     ret["tilelang_err"] = tilelang_err
     #     ret["tilelang_us"] = tilelang_us
     # except Exception as e:
@@ -539,8 +524,8 @@ def test_mhc_pre(m, hidden_size, hc_mult):
 
 
 df = []
-for m in [200 * 64, 512, 1024, 2048, 8192][1:2]:
-    for hidden_size in [1280, 2560, 4096][:1]:
+for m in [512, 1024, 2048, 8192][:]:
+    for hidden_size in [1280, 2560, 4096][:]:
         for hc_mult in [4]:
             ret = test_mhc_pre(m=m, hidden_size=hidden_size, hc_mult=hc_mult)
             df.append(ret)
