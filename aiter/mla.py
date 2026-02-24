@@ -239,6 +239,7 @@ def mla_decode_fwd(
             logits,
             attn_lse,
             o,
+            None,
             q_scale,
             kv_scale,
         )
@@ -343,6 +344,7 @@ def mla_decode_fwd(
             logits,
             attn_lse,
             o,
+            final_lse,
             q_scale,
             kv_scale,
         )

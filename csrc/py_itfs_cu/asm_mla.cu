@@ -49,6 +49,8 @@ struct __attribute__((packed)) KernelArgs
     p2 _p22;
     unsigned int out_16_nosplit;
     p3 _p23;
+    void* ptr_LSEP;
+    p2 _p24;
 };
 
 std::string get_heuristic_kernel_mla(std::string q_type,
@@ -108,6 +110,7 @@ void mla_decode_stage1_asm_fwd(
     torch::Tensor& splitData, //[batch_size, num_kv_splits, num_heads, v_head_dim]
     torch::Tensor& splitLse,  //[batch_size, num_kv_splits, num_heads,  1]
     torch::Tensor& output,    //[batch_size, num_heads, v_head_dim]
+    std::optional<torch::Tensor>& lse,    //[batch_size, num_heads]
     std::optional<torch::Tensor> q_scale  = std::nullopt, //   [1]
     std::optional<torch::Tensor> kv_scale = std::nullopt  //   [1]
 )
@@ -171,7 +174,10 @@ void mla_decode_stage1_asm_fwd(
         args.ptr_STP = num_kv_splits_indptr.value().data_ptr();
     }
     args.ptr_RP = output.data_ptr(); //final output
-    
+    if (lse.has_value())
+    {
+        args.ptr_LSEP = lse.value().data_ptr(); //final lse
+    }
 
     // std::cout << "mla args" << std::endl;
     // std::cout << "ptr_R: " << args.ptr_R << std::endl;
@@ -191,6 +197,7 @@ void mla_decode_stage1_asm_fwd(
     // std::cout << "ptr_QTP: " << args.ptr_QTP << std::endl;
     // std::cout << "ptr_STP: " << args.ptr_STP << std::endl;
     // std::cout << "out_16_nosplit: " << args.out_16_nosplit << std::endl;
+    // std::cout << "ptr_LSEP: " << args.ptr_LSEP << std::endl;
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Q));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
