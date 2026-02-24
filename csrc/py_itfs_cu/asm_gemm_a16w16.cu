@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
+#include "aiter_torch_common.h"
 #include "asm_bf16gemm_configs.hpp"
 #include "py_itfs_common.h"
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <cmath>
 #include <hip/hip_runtime.h>
-#include <torch/all.h>
 
 struct __attribute__((packed)) KernelArgs
 {
