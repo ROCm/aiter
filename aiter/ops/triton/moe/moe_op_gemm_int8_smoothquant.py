@@ -11,7 +11,6 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_int8_smoothquant import (
     _reduce_grouped,
 )
 
-
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
 # -----------------------------------------------------------------------------

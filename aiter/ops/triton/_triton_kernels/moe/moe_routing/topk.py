@@ -76,7 +76,7 @@ def streaming_topk(
     acc = (acc << (y_nbits - 16)) | (acc >> 16)
     if N_EXPTS_ACT != N_EXPTS_ACT_PAD:
         mask_expts_act = tl.arange(0, N_EXPTS_ACT_PAD)[None, :] < N_EXPTS_ACT
-        acc = tl.where(mask_expts_act, acc, N_EXPTS_PAD << (y_nbits - 16)) 
+        acc = tl.where(mask_expts_act, acc, N_EXPTS_PAD << (y_nbits - 16))
     # sort in ascending order of expert (descending order of key)
     acc = tl.sort(acc, dim=1)
     # iiii0000vvvvvvvv --> 0000iiii:
@@ -151,7 +151,7 @@ def _topk(
         N_EXPTS_ACT,
         N_EXPTS_ACT_PAD,
         BLOCK_N,
-    )  
+    )
 
     # normalize selected values
     if APPLY_SOFTMAX:

@@ -39,7 +39,7 @@ def _routing_compute_indx(
     BLOCK_M: tl.constexpr,
     EVEN_M: tl.constexpr,
     N_EXPTS_ACT: tl.constexpr,
-    N_EXPTS_ACT_PAD: tl.constexpr
+    N_EXPTS_ACT_PAD: tl.constexpr,
 ):
 
     tl.static_assert(N_EXPTS_ACT_PAD * BLOCK_M <= 32768)
@@ -102,7 +102,7 @@ def _routing_compute_indx_fused(
     BLOCK_M: tl.constexpr,
     EVEN_M: tl.constexpr,
     N_EXPTS_ACT: tl.constexpr,
-    N_EXPTS_ACT_PAD: tl.constexpr
+    N_EXPTS_ACT_PAD: tl.constexpr,
 ):
 
     tl.static_assert(N_EXPTS_ACT_PAD * BLOCK_M <= 32768)
@@ -213,7 +213,7 @@ def _combined_routing(
             BLOCK_M,
             EVEN_M,
             N_EXPTS_ACT,
-            N_EXPTS_ACT_PAD
+            N_EXPTS_ACT_PAD,
         )
 
 
@@ -292,5 +292,5 @@ def _combined_routing_fused(
             BLOCK_M,
             EVEN_M,
             N_EXPTS_ACT,
-            N_EXPTS_ACT_PAD
+            N_EXPTS_ACT_PAD,
         )
