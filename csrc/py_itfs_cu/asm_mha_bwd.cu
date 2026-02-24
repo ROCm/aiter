@@ -89,23 +89,6 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
         mask = mask_info::decode(mask_identify, seqlen_q, seqlen_k); // local
     }
 
-    auto get_mask_type = [&]() {
-        if (mask.type == mask_enum::no_mask) {
-            return 0;
-        } else {
-            if (mask.type == mask_enum::window_generic) {
-                assert(false);
-                return 0;
-            } else {
-                if ((mask.left == -1) && (mask.right == 0)) {
-                    return (mask.type == mask_enum::mask_top_left) ? 1 : 2;
-                } else {
-                    return 3;
-                }
-            }
-        }
-    };
-
     // q, k, v, out had been padded in mha_fwd
     // dq_, dk_, dv_ are also padded tensor
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size_q);
@@ -264,8 +247,7 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
                 stride_alibi_slopes = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
             }
 
-            return mha_bwd_args{get_mask_type(),
-                                true,
+            return mha_bwd_args{true,
                                 is_v3_atomic_fp32,
                                 how_v3_bf16_cvt,
                                 false,

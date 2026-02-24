@@ -421,13 +421,42 @@ def test_qk_norm_rope_cache_quant(
     head_size,
     is_neox_style,
     eps,
-    k_cache,
-    v_cache,
-    slot_mapping,
     kv_cache_dtype,
-    k_scale,
-    v_scale,
+    num_blocks,
+    page_size,
 ):
+    # Construct tensors inside the function
+    if kv_cache_dtype == "fp8_e4m3":
+        cache_dtype = get_dtype_fp8()
+    else:
+        cache_dtype = dtype
+
+    k_cache = torch.randn(
+        [num_blocks, page_size, num_heads_k, head_size],
+        dtype=dtype,
+        device="cuda",
+    ).to(cache_dtype)
+    v_cache = torch.randn(
+        [num_blocks, page_size, num_heads_v, head_size],
+        dtype=dtype,
+        device="cuda",
+    ).to(cache_dtype)
+
+    x = 16 // k_cache.element_size()
+    k_cache = (
+        k_cache.view([num_blocks, page_size, num_heads_k, head_size // x, x])
+        .permute(0, 2, 3, 1, 4)
+        .contiguous()
+    )
+    v_cache = v_cache.permute(0, 2, 3, 1).contiguous()
+
+    slot_mapping = torch.randperm(num_tokens, dtype=torch.int64, device="cuda")
+    k_scale = torch.zeros(
+        [num_blocks, num_heads_k, page_size], dtype=torch.float32, device="cuda"
+    )
+    v_scale = torch.zeros(
+        [num_blocks, num_heads_v, page_size], dtype=torch.float32, device="cuda"
+    )
     qkv = torch.randn(
         (num_tokens, (num_heads_q + num_heads_k + num_heads_v) * head_size),
         dtype=dtype,
@@ -742,16 +771,100 @@ def test_qk_norm_rope_cache_block_quant(
     num_heads_k,
     num_heads_v,
     head_size,
+    num_blocks,
+    page_size,
     is_neox_style,
     eps,
-    k_cache,
-    v_cache,
-    slot_mapping,
-    cu_q_len,
     kv_cache_dtype,
     k_scale,
     v_scale,
 ):
+# Initialize cache to zeros so unused pages have zero max -> zero scale
+    # (randn would give non-zero scales for ALL pages in ref's pertoken_quant)
+    k_cache = torch.zeros(
+        [num_blocks, page_size, num_heads_k, head_size],
+        dtype=cache_dtype,
+        device="cuda",
+    )
+    v_cache = torch.zeros(
+        [num_blocks, page_size, num_heads_v, head_size],
+        dtype=cache_dtype,
+        device="cuda",
+    )
+
+    # Check for NaN values in k_cache and v_cache
+    if torch.isnan(k_cache).any():
+        aiter.logger.warning(
+            f"k_cache contains NaN values! dtype={cache_dtype}"
+        )
+    if torch.isnan(v_cache).any():
+        aiter.logger.warning(
+            f"v_cache contains NaN values! dtype={cache_dtype}"
+        )
+
+    # slot_mapping = torch.randperm(
+    #    num_token, dtype=torch.int64, device="cuda"
+    # )
+    slot_mapping = torch.tensor(
+        [i for i in range(num_token)],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    # slot_mapping[2:num_token] = slot_mapping[2:num_token] + args.page_size
+    x = 16 // k_cache.element_size()
+    k_cache = (
+        k_cache.view(
+            [
+                num_blocks,
+                page_size,
+                num_heads_k,
+                head_size // x,
+                x,
+            ]
+        )
+        .permute(0, 2, 3, 1, 4)
+        .contiguous()
+    )
+
+
+    # Value cache [num_blocks, num_kv_heads, block_size // x, head_size, x]
+    v_cache = (
+        v_cache.view(
+            [
+                num_blocks,
+                page_size // x,
+                num_heads_v,
+                head_size,
+                x,
+            ]
+        )
+        .permute(0, 2, 1, 3, 4)
+        .contiguous()
+    )
+    batch_size = 4  # num_token // args.page_size
+    # ?? num_token ?? batch_size ?????
+    base_len = num_token // batch_size
+    remainder = num_token % batch_size
+    seq_lens = [base_len + 1] * remainder + [base_len] * (
+        batch_size - remainder
+    )
+    total_len = sum(seq_lens)
+    if total_len > num_token:
+        seq_lens[-1] -= total_len - num_token
+    elif total_len < num_token:
+        seq_lens[-1] += num_token - total_len
+
+    cu_q_len = torch.zeros(
+        batch_size + 1, dtype=torch.int64, device="cuda"
+    )
+
+    cu_q_len[0] = 0
+    for i in range(batch_size):
+        cu_q_len[i + 1] = cu_q_len[i] + seq_lens[i]
+
+    assert (
+        cu_q_len[-1].item() == num_token
+    ), f"cu_q_len[-1]={cu_q_len[-1].item()} != num_token={num_token}"
     qkv = torch.randn(
         (num_tokens, (num_heads_q + num_heads_k + num_heads_v) * head_size),
         dtype=dtype,
@@ -1282,99 +1395,7 @@ if __name__ == "__main__":
                             cache_dtype = get_dtype_fp8()
                         else:
                             cache_dtype = args.dtype
-                        # Initialize cache to zeros so unused pages have zero max -> zero scale
-                        # (randn would give non-zero scales for ALL pages in ref's pertoken_quant)
-                        k_cache = torch.zeros(
-                            [args.num_blocks, args.page_size, num_kv_head, head_size],
-                            dtype=cache_dtype,
-                            device="cuda",
-                        )
-                        v_cache = torch.zeros(
-                            [args.num_blocks, args.page_size, num_kv_head, head_size],
-                            dtype=cache_dtype,
-                            device="cuda",
-                        )
-
-                        # Check for NaN values in k_cache and v_cache
-                        if torch.isnan(k_cache).any():
-                            aiter.logger.warning(
-                                f"k_cache contains NaN values! dtype={cache_dtype}"
-                            )
-                        if torch.isnan(v_cache).any():
-                            aiter.logger.warning(
-                                f"v_cache contains NaN values! dtype={cache_dtype}"
-                            )
-
-                        # slot_mapping = torch.randperm(
-                        #    num_token, dtype=torch.int64, device="cuda"
-                        # )
-                        slot_mapping = torch.tensor(
-                            [i for i in range(num_token)],
-                            dtype=torch.int64,
-                            device="cuda",
-                        )
-                        # slot_mapping[2:num_token] = slot_mapping[2:num_token] + args.page_size
-                        x = 16 // k_cache.element_size()
-                        k_cache = (
-                            k_cache.view(
-                                [
-                                    args.num_blocks,
-                                    args.page_size,
-                                    num_kv_head,
-                                    head_size // x,
-                                    x,
-                                ]
-                            )
-                            .permute(0, 2, 3, 1, 4)
-                            .contiguous()
-                        )
-
                         if args.quant_type == "block":
-                            # Value cache [num_blocks, num_kv_heads, block_size // x, head_size, x]
-                            v_cache = (
-                                v_cache.view(
-                                    [
-                                        args.num_blocks,
-                                        args.page_size // x,
-                                        num_kv_head,
-                                        head_size,
-                                        x,
-                                    ]
-                                )
-                                .permute(0, 2, 1, 3, 4)
-                                .contiguous()
-                            )
-                            batch_size = 4  # num_token // args.page_size
-                            # ?? num_token ?? batch_size ?????
-                            base_len = num_token // batch_size
-                            remainder = num_token % batch_size
-                            seq_lens = [base_len + 1] * remainder + [base_len] * (
-                                batch_size - remainder
-                            )
-
-                            # ??????? num_token,?????????
-                            total_len = sum(seq_lens)
-                            if total_len > num_token:
-                                # ??????,?????????
-                                seq_lens[-1] -= total_len - num_token
-                            elif total_len < num_token:
-                                # ??????,????????
-                                seq_lens[-1] += num_token - total_len
-
-                            cu_q_len = torch.zeros(
-                                batch_size + 1, dtype=torch.int64, device="cuda"
-                            )
-
-                            cu_q_len[0] = 0
-                            for i in range(batch_size):
-                                cu_q_len[i + 1] = cu_q_len[i] + seq_lens[i]
-
-                            # ????????? num_token
-                            assert (
-                                cu_q_len[-1].item() == num_token
-                            ), f"cu_q_len[-1]={cu_q_len[-1].item()} != num_token={num_token}"
-                            # slot_mapping[cu_q_len[1]:cu_q_len[2]] = slot_mapping[cu_q_len[1]:cu_q_len[2]] + 63
-
                             ret = test_qk_norm_rope_cache_block_quant(
                                 args.dtype,
                                 num_token,
@@ -1384,47 +1405,28 @@ if __name__ == "__main__":
                                 head_size,
                                 is_neox_style,
                                 1e-6,
-                                k_cache,
-                                v_cache,
-                                slot_mapping,
-                                cu_q_len,
                                 kv_cache_dtype,
                                 k_scale,
                                 v_scale,
                             )
-                            df.append(ret)
                         else:
-                            v_cache = v_cache.permute(0, 2, 3, 1).contiguous()
-                            ret = test_qk_norm_rope_cache_quant(
-                                args.dtype,
-                                num_token,
-                                num_head,
-                                num_kv_head,
-                                num_kv_head,
-                                head_size,
-                                is_neox_style,
-                                1e-6,
-                                k_cache,
-                                v_cache,
-                                slot_mapping,
-                                kv_cache_dtype,
-                                k_scale,
-                                v_scale,
-                            )
-                            df.append(ret)
-
-    # Create DataFrame and print summary after all tests
-    if df:
-        import pandas as pd
-
-        # Convert tensor values to shapes for better readability
-        for row in df:
-            for key, value in row.items():
-                if isinstance(value, torch.Tensor):
-                    row[key] = str(list(value.shape))
-        df = pd.DataFrame(df)
-        df_md = df.to_markdown(index=False)
-        aiter.logger.info("Test summary (markdown):\n%s", df_md)
+                           ret = test_qk_norm_rope_cache_quant(
+                            args.dtype,
+                            num_token,
+                            num_head,
+                            num_kv_head,
+                            num_kv_head,
+                            head_size,
+                            is_neox_style,
+                            1e-6,
+                            kv_cache_dtype,
+                            args.num_blocks,
+                            args.page_size,
+                        )
+                        df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("qk_norm_rope_cache_quant summary (markdown):\n%s", df_md)
 
     # dtype = torch.bfloat16
     # batch_size = 2

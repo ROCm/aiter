@@ -592,7 +592,8 @@ namespace py = pybind11;
           py::arg("WQ"),                   \
           py::arg("x_scale"),              \
           py::arg("w_scale"),              \
-          py::arg("Out"));
+          py::arg("Out"),                  \
+          py::arg("preshuffleB") = true);
 
 #define GEMM_A8W8_BLOCKSCALE_CKTILE_TUNE_PYBIND \
     m.def("gemm_a8w8_blockscale_cktile_tune",   \
@@ -603,8 +604,9 @@ namespace py = pybind11;
           py::arg("x_scale"),                   \
           py::arg("w_scale"),                   \
           py::arg("Out"),                       \
-          py::arg("kernelId") = 0,              \
-          py::arg("splitK")   = 0);
+          py::arg("kernelId")    = 0,           \
+          py::arg("splitK")      = 0,           \
+          py::arg("preshuffleB") = true);
 
 #define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_PYBIND \
     m.def("gemm_a8w8_blockscale_bpreshuffle",   \
@@ -991,7 +993,7 @@ namespace py = pybind11;
           py::arg("splitk")            = 1,            \
           py::arg("non_temporal_load") = false,        \
           py::arg("dst_type")          = std::nullopt, \
-          py::arg("is_shuffled")    = true);           \
+          py::arg("is_shuffled")       = true);              \
                                                        \
     m.def("ck_moe_stage2",                             \
           &ck_moe_stage2,                              \
@@ -1013,7 +1015,7 @@ namespace py = pybind11;
           py::arg("splitk")            = 1,            \
           py::arg("non_temporal_load") = false,        \
           py::arg("dst_type")          = std::nullopt, \
-          py::arg("is_shuffled")    = true);
+          py::arg("is_shuffled")       = true);
 
 #define MOE_CKTILE_2STAGES_PYBIND                   \
     m.def("cktile_moe_gemm1",                       \

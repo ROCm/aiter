@@ -109,23 +109,6 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
         mask = mask_info::decode(mask_identify, max_seqlen_q, max_seqlen_k); // local
     }
 
-    auto get_mask_type = [&]() {
-        if (mask.type == mask_enum::no_mask) {
-            return 0;
-        } else {
-            if (mask.type == mask_enum::window_generic) {
-                assert(false);
-                return 0;
-            } else {
-                if ((mask.left == -1) && (mask.right == 0)) {
-                    return (mask.type == mask_enum::mask_top_left) ? 1 : 2;
-                } else {
-                    return 3;
-                }
-            }
-        }
-    };
-
     // q, k, v, out had been padded in mha_fwd
     // dq_, dk_, dv_ are also padded tensor
     CHECK_SHAPE(q, total_q, num_heads, head_size_q);
@@ -311,8 +294,7 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                 seqstart_q_ptr = cu_seqlens_q.data_ptr();
             }
 
-            return mha_bwd_args{get_mask_type(),
-                                false, // use_v3
+            return mha_bwd_args{false, // use_v3
                                 false, // is_v3_atomic_fp32
                                 false, // how_v3_bf16_cvt
                                 false, // v3_api_check
