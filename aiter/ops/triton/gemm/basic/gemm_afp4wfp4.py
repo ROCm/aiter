@@ -191,7 +191,7 @@ def gemm_afp4wfp4_(
         ),
     )
 
-    _gemm_afp4wfp4_kernel[grid](
+    kernel = _gemm_afp4wfp4_kernel[grid](
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -213,6 +213,10 @@ def gemm_afp4wfp4_(
         w_scales.stride(1),
         **config,
     )
+
+    if getattr(gemm_afp4wfp4, "print", False) == False:
+        setattr(gemm_afp4wfp4, "print", True)
+        print_irs_to_files(kernel, "gemm_afp4wfp4")
 
     if return_y_pp:
         return y_pp
@@ -401,6 +405,10 @@ def gemm_afp4wfp4_preshuffled_scales(
 
     return y
 
+def print_irs_to_files(compiled_kernel, prefix):
+    for key in compiled_kernel.asm.keys():
+        with open(f"{prefix}_{key}.txt", "w") as fptr:
+            print(compiled_kernel.asm[key], file=fptr)
 
 def gemm_afp4wfp4_preshuffle(
     x: torch.Tensor,
@@ -524,7 +532,7 @@ def gemm_afp4wfp4_preshuffle(
                 **config,
             )
     else:
-        _gemm_afp4wfp4_preshuffle_kernel[grid](
+        kernel = _gemm_afp4wfp4_preshuffle_kernel[grid](
             x,
             w,
             y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -546,6 +554,9 @@ def gemm_afp4wfp4_preshuffle(
             w_scales.stride(1),
             **config,
         )
+        if getattr(gemm_afp4wfp4_preshuffle, "print", False) == False:
+            setattr(gemm_afp4wfp4_preshuffle, "print", True)
+            print_irs_to_files(kernel, f"{M}-{N}-{K*2}-gemm_afp4wfp4_preshuffle_async_1_tot_b_256")
 
     if return_y_pp:
         return y_pp
