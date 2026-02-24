@@ -277,8 +277,6 @@ def make_layout_3d(
             operand_index=1, parent=PV_WMMA_LAYOUT, k_width=8
         )
     elif shuffled_kv_cache:
-        # When shuffled KV cache has to go through LDS, using [num_warps, 1] for Key cache is faster
-        # When shuffled KV cache does not have to go through LDS, using [1, num_warps] for Key cache is faster
         QK_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDMFMALayout(
             version=4,
             instr_shape=[16, 16, 32],
