@@ -320,7 +320,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
     if (mt == -1)
     {
-        std::cout << "fmha_v3_bwd: unsupported mask type for asm kernels." << std::endl;
+        AITER_LOG_WARNING("fmha_v3_bwd: unsupported mask type for asm kernels.");
         return -1;
     }
 
