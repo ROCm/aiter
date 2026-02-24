@@ -776,7 +776,12 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
 
 @triton.autotune(
     configs=[triton.Config({"waves_per_eu": wa}, num_stages=1) for wa in [0, 2]],
-    key=["COMPUTE_TYPE", "ONE_QUERY_GROUP_SIZE_POW2", "QUERY_SEQ_LEN_POW2"],
+    key=[
+        "KV_BLOCK_SIZE",
+        "KV_QUANT_MODE",
+        "ONE_QUERY_GROUP_SIZE_POW2",
+        "QUERY_SEQ_LEN_POW2",
+    ],
     cache_results=True,
 )
 @gluon.jit
@@ -1264,7 +1269,6 @@ def paged_attention_decode_sliding_window(
             context_length, page_size * (sequence_split_idx + 1)
         )
         sequence_partition_start_idx = sequence_start_idx // CONTEXT_PARTITION_SIZE
-    sequence_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
 
     block_indices = gl.arange(0, MAX_NUM_KV_BLOCKS_PER_COMPUTE, layout=block_id_layout)
     max_num_kv_blocks = gl.cdiv(context_length, KV_COMPUTE_BLOCK_SIZE)
@@ -1276,6 +1280,8 @@ def paged_attention_decode_sliding_window(
         offsets=block_indices,
         mask=block_indices < (max_num_kv_blocks - kv_block_start_idx),
     )
+    sequence_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
+
     # Load query tensor with 3D MTP layout
     # Query shape: [batch_size, query_length, num_kv_heads, query_group_size, head_size]
     mtp_query_tensor = gl.reshape(
