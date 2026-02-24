@@ -784,6 +784,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         "ONE_QUERY_GROUP_SIZE_POW2",
         "QUERY_SEQ_LEN_POW2",
         "HEAD_SIZE_POW2",
+        "COMPUTE_TYPE",
     ],
     cache_results=True,
 )
@@ -1412,10 +1413,6 @@ def paged_attention_decode_sliding_window(
             )
             kv_in_window_mask = kv_token_global >= sequence_start_idx
 
-        qk_column_offsets = kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE + gl.arange(
-            0, CONTEXT_PARTITION_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
-        )
-
         # Prepare QK MFMA while key loads (these don't depend on key data)
         qk_accumulator = gl.zeros(
             (QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE),
@@ -1561,7 +1558,9 @@ def paged_attention_decode_sliding_window(
         # ==================== ATTENTION MASKING ====================
         # Compute query token index (0 to query_seq_len-1)
         query_token_idx = qk_row_offsets // ONE_QUERY_GROUP_SIZE_POW2
-
+        qk_column_offsets = kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE + gl.arange(
+            0, CONTEXT_PARTITION_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
+        )
         # Apply causal masking if required
         if IS_CAUSAL:
             # Compute causal mask based on sequence positions
