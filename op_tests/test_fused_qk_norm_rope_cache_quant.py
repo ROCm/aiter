@@ -776,10 +776,8 @@ def test_qk_norm_rope_cache_block_quant(
     is_neox_style,
     eps,
     kv_cache_dtype,
-    k_scale,
-    v_scale,
 ):
-# Initialize cache to zeros so unused pages have zero max -> zero scale
+    # Initialize cache to zeros so unused pages have zero max -> zero scale
     # (randn would give non-zero scales for ALL pages in ref's pertoken_quant)
     k_cache = torch.zeros(
         [num_blocks, page_size, num_heads_k, head_size],
@@ -794,13 +792,9 @@ def test_qk_norm_rope_cache_block_quant(
 
     # Check for NaN values in k_cache and v_cache
     if torch.isnan(k_cache).any():
-        aiter.logger.warning(
-            f"k_cache contains NaN values! dtype={cache_dtype}"
-        )
+        aiter.logger.warning(f"k_cache contains NaN values! dtype={cache_dtype}")
     if torch.isnan(v_cache).any():
-        aiter.logger.warning(
-            f"v_cache contains NaN values! dtype={cache_dtype}"
-        )
+        aiter.logger.warning(f"v_cache contains NaN values! dtype={cache_dtype}")
 
     # slot_mapping = torch.randperm(
     #    num_token, dtype=torch.int64, device="cuda"
@@ -825,8 +819,6 @@ def test_qk_norm_rope_cache_block_quant(
         .permute(0, 2, 3, 1, 4)
         .contiguous()
     )
-
-
     # Value cache [num_blocks, num_kv_heads, block_size // x, head_size, x]
     v_cache = (
         v_cache.view(
@@ -842,21 +834,16 @@ def test_qk_norm_rope_cache_block_quant(
         .contiguous()
     )
     batch_size = 4  # num_token // args.page_size
-    # ?? num_token ?? batch_size ?????
     base_len = num_token // batch_size
     remainder = num_token % batch_size
-    seq_lens = [base_len + 1] * remainder + [base_len] * (
-        batch_size - remainder
-    )
+    seq_lens = [base_len + 1] * remainder + [base_len] * (batch_size - remainder)
     total_len = sum(seq_lens)
     if total_len > num_token:
         seq_lens[-1] -= total_len - num_token
     elif total_len < num_token:
         seq_lens[-1] += num_token - total_len
 
-    cu_q_len = torch.zeros(
-        batch_size + 1, dtype=torch.int64, device="cuda"
-    )
+    cu_q_len = torch.zeros(batch_size + 1, dtype=torch.int64, device="cuda")
 
     cu_q_len[0] = 0
     for i in range(batch_size):
@@ -876,6 +863,16 @@ def test_qk_norm_rope_cache_block_quant(
     pos_shape = (num_tokens,)
     positions = torch.randint(
         0, max_positions, pos_shape, dtype=torch.int64, device="cuda"
+    )
+    k_scale = torch.zeros(
+        [num_blocks, num_heads_k],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    v_scale = torch.zeros(
+        [num_blocks, num_heads_v],
+        dtype=torch.float32,
+        device="cuda",
     )
     k_scale_ref = k_scale.clone()
     v_scale_ref = v_scale.clone()
@@ -989,7 +986,7 @@ def test_qk_norm_rope_cache_block_quant(
     page_size = k_cache.shape[
         -2
     ]  # k_cache: [num_blocks, num_kv_heads, head_size//x, page_size, x]
-    ctx_lens = num_tokens // batch_size  # tokens per batch from prefill
+    ctx_lens = num_tokens // batch_size if num_tokens > batch_size else num_tokens
     max_token_num_support = slot_mapping.max().item() + 1  # infer from slot_mapping
     # Use a conservative per-batch max_token
     max_token_per_batch = (
@@ -1367,28 +1364,6 @@ if __name__ == "__main__":
     for is_neox_style in args.is_neox_styles:
         for num_token in args.token:
             for num_head, num_kv_head in args.head:
-                if args.quant_type == "block":
-                    k_scale = torch.zeros(
-                        [args.num_blocks, num_kv_head],
-                        dtype=torch.float32,
-                        device="cuda",
-                    )
-                    v_scale = torch.zeros(
-                        [args.num_blocks, num_kv_head],
-                        dtype=torch.float32,
-                        device="cuda",
-                    )
-                else:
-                    k_scale = torch.zeros(
-                        [args.num_blocks, num_kv_head, args.page_size],
-                        dtype=torch.float32,
-                        device="cuda",
-                    )
-                    v_scale = torch.zeros(
-                        [args.num_blocks, num_kv_head, args.page_size],
-                        dtype=torch.float32,
-                        device="cuda",
-                    )
                 for i, head_size in enumerate(args.head_sizes):
                     for kv_cache_dtype in args.kv_cache_dtypes:
                         if kv_cache_dtype == "fp8_e4m3":
@@ -1403,26 +1378,26 @@ if __name__ == "__main__":
                                 num_kv_head,
                                 num_kv_head,
                                 head_size,
+                                args.num_blocks,
+                                args.page_size,
                                 is_neox_style,
                                 1e-6,
                                 kv_cache_dtype,
-                                k_scale,
-                                v_scale,
                             )
                         else:
-                           ret = test_qk_norm_rope_cache_quant(
-                            args.dtype,
-                            num_token,
-                            num_head,
-                            num_kv_head,
-                            num_kv_head,
-                            head_size,
-                            is_neox_style,
-                            1e-6,
-                            kv_cache_dtype,
-                            args.num_blocks,
-                            args.page_size,
-                        )
+                            ret = test_qk_norm_rope_cache_quant(
+                                args.dtype,
+                                num_token,
+                                num_head,
+                                num_kv_head,
+                                num_kv_head,
+                                head_size,
+                                is_neox_style,
+                                1e-6,
+                                kv_cache_dtype,
+                                args.num_blocks,
+                                args.page_size,
+                            )
                         df.append(ret)
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
