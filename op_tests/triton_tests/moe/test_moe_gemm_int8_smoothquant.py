@@ -21,10 +21,6 @@ from aiter.ops.triton.moe.moe_op_gemm_int8_smoothquant import (
     preshuffle_weights,
 )
 
-# Target-specific utilities
-from aiter.ops.triton.utils._triton.arch_info import get_arch
-
-
 # ---------------
 # Initialize data
 # ---------------

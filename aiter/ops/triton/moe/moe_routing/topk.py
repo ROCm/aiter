@@ -4,13 +4,14 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.topk import _topk
 from aiter.ops.triton.moe.moe_routing.bitmatrix import Bitmatrix
 
 
-def topk(
-    x, k, apply_softmax=True, dim=1, return_bitmatrix=True, HIST_BLOCK_M=32
-):
+def topk(x, k, apply_softmax=True, dim=1, return_bitmatrix=True, HIST_BLOCK_M=32):
     x_shape = [x.shape[0], x.shape[1]]
-    cdiv = lambda a, b: (a + b - 1) // b
+
+    def cdiv(a, b):
+        return (a + b - 1) // b
+
     BLOCK_M = 32
-    BLOCK_N = 128 #triton.next_power_of_2(x_shape[1])  # 128
+    BLOCK_N = 128  # triton.next_power_of_2(x_shape[1])  # 128
     BLOCK_S = 128
     BLOCK_SP = 128
     assert len(x.shape) == 2
