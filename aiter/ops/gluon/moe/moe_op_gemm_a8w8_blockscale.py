@@ -1255,14 +1255,3 @@ def moe_gemm_a8w8_blockscale_gfx1250(
         out_dtype=out_dtype,
     )
     return y_final
-
-
-if __name__ == "__main__":
-    device = torch.device("cuda")
-
-    # Import initialization functions from test file
-    from op_tests.triton_tests.moe.test_moe_gemm_a8w8_blockscale import (
-        init_routing_data,
-        init_compute_data,
-        group_shape,
-    )
