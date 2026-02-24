@@ -52,7 +52,7 @@ jobs:
           FROM ${{ env.DOCKER_IMAGE }}
 
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true
-          RUN pip uninstall -y aiter
+          RUN pip uninstall -y amd-aiter
           RUN pip install --upgrade pandas zmq einops numpy==1.26.2
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip install --upgrade "ninja>=1.11.1"
