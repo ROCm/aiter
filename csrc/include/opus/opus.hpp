@@ -9,9 +9,17 @@
  **************************************************************************************************/
 #pragma once
 
-#include <array>
+// clang-format off
 #include <type_traits>
 #include <utility>
+
+#ifndef OPUS_ENABLE_RUNTIME_QUERY
+#define OPUS_ENABLE_RUNTIME_QUERY 0
+#endif
+
+#if OPUS_ENABLE_RUNTIME_QUERY && defined(__HIPCC__) && !defined(__HIP_DEVICE_COMPILE__)
+#include <hip/hip_runtime_api.h>
+#endif
 
 #ifdef __HIPCC__
 #define OPUS_H inline __host__
@@ -35,23 +43,16 @@
 #define OPUS_TILE_CONTAINER 0 // 0:vector, 1:array of vector, 2:flattened array
 #endif
 
-// clang-format off
 namespace opus {
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // type traits
-using std::remove_reference;
-using std::remove_reference_t;
-using std::remove_cv;
-using std::remove_cv_t;
-using std::is_same;
-using std::is_same_v;
-
+using std::remove_reference; using std::remove_reference_t; using std::remove_cv; using std::remove_cv_t; using std::is_same; using std::is_same_v;
 template<typename T> struct remove_cvref { using type = remove_cv_t<remove_reference_t<T>>; };
 template<typename T> using remove_cvref_t = remove_cv_t<remove_reference_t<T>>;
-
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // constant
 using index_t = int;
+using long_index_t = int64_t;
 
 template<index_t I> struct number : public std::integral_constant<index_t, I> {};
 template<bool B>    struct bool_constant : public std::bool_constant<B> {};
@@ -73,28 +74,12 @@ OPUS_H_D constexpr decltype(auto) operator""_I() {
 #define OPUS_LEFT_UNARY_OP(OP) template <auto x>         OPUS_H_D constexpr auto operator OP(number<x>)            { return number<(OP x)>{};   }
 #define OPUS_BINARY_OP(OP)     template <auto x, auto y> OPUS_H_D constexpr auto operator OP(number<x>, number<y>) { return number<(x OP y)>{}; }
 
-OPUS_LEFT_UNARY_OP(+)
-OPUS_LEFT_UNARY_OP(-)
-OPUS_LEFT_UNARY_OP(~)
-OPUS_LEFT_UNARY_OP(!)
-OPUS_BINARY_OP(+)
-OPUS_BINARY_OP(-)
-OPUS_BINARY_OP(*)
-OPUS_BINARY_OP(/)
-OPUS_BINARY_OP(%)
-OPUS_BINARY_OP(&)
-OPUS_BINARY_OP(|)
-OPUS_BINARY_OP(^)
-OPUS_BINARY_OP(<<)
-OPUS_BINARY_OP(>>)
-OPUS_BINARY_OP(&&)
-OPUS_BINARY_OP(||)
-OPUS_BINARY_OP(==)
-OPUS_BINARY_OP(!=)
-OPUS_BINARY_OP(>)
-OPUS_BINARY_OP(<)
-OPUS_BINARY_OP(>=)
-OPUS_BINARY_OP(<=)
+OPUS_LEFT_UNARY_OP(+) OPUS_LEFT_UNARY_OP(-) OPUS_LEFT_UNARY_OP(~) OPUS_LEFT_UNARY_OP(!)
+OPUS_BINARY_OP(+)   OPUS_BINARY_OP(-)   OPUS_BINARY_OP(*)   OPUS_BINARY_OP(/)
+OPUS_BINARY_OP(%)   OPUS_BINARY_OP(&)   OPUS_BINARY_OP(|)   OPUS_BINARY_OP(^)
+OPUS_BINARY_OP(<<)  OPUS_BINARY_OP(>>)  OPUS_BINARY_OP(&&)  OPUS_BINARY_OP(||)
+OPUS_BINARY_OP(==)  OPUS_BINARY_OP(!=)  OPUS_BINARY_OP(>)   OPUS_BINARY_OP(<)
+OPUS_BINARY_OP(>=)  OPUS_BINARY_OP(<=)
 
 #undef OPUS_LEFT_UNARY_OP
 #undef OPUS_BINARY_OP
@@ -1120,6 +1105,29 @@ OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
 #undef OPUS_CAST_DEFINE
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // arch
+//
+// ---- HIPCC compilation model (clang-based)  ----
+//   hipcc compiles each translation unit in TWO passes: host pass, then device pass.
+//
+//   Host pass  : __device__ functions are fully parsed, name-resolved, template-instantiated, and constexpr/static_assert evaluated. Only machine code generation is skipped.
+//   Device pass: __host__ functions are truly skipped -- not parsed, not instantiated, not checked.
+//
+//   Key consequences:
+//     1. Architecture macros (__GFX9__, __gfx950__, etc.) are defined ONLY during the device pass. Any #if guard on them will take the #else branch during the host pass.
+//     2. __device__ constexpr variables and static_asserts inside __device__ templates are still evaluated during the host pass (since templates may be instantiated from __global__).
+//     3. If your device code relies on arch-specific preprocessor branches, consider guarding the entire implementation with #if defined(__HIP_DEVICE_COMPILE__) to skip the host pass.
+//
+// ---- get_warp_size() / get_smem_size() ----
+//   OPUS_H_D constexpr -- safe to use everywhere: template defaults, static_assert, constexpr variables, __shared__ array sizes, host launch-parameter calculations, etc.
+//   During the host pass (arch macros absent), they return safe defaults:
+//     get_warp_size() -> 64 (GFX9 default)
+//     get_smem_size() -> 65536 (64 KB, non-gfx950 default)
+//
+// ---- query_warp_size() / query_smem_size() ----
+//   OPUS_H only -- runtime HIP API queries (hipGetDeviceProperties). Use when you need the true hardware value on the host (e.g. occupancy calculations).
+//   Guarded by OPUS_ENABLE_RUNTIME_QUERY (default 0). Define OPUS_ENABLE_RUNTIME_QUERY=1 before
+//   including opus.hpp (or via compiler flag) to enable these functions and the hip_runtime_api.h include.
+//
 OPUS_H_D constexpr index_t get_warp_size()
 {
 #if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
@@ -1128,6 +1136,56 @@ OPUS_H_D constexpr index_t get_warp_size()
     return 32;
 #endif
 }
+OPUS_H_D constexpr index_t get_smem_size()
+{
+#if defined(__gfx950__)
+    return 131072;  // 128KB
+#else
+    return 65536;   // 64KB
+#endif
+}
+
+#if OPUS_ENABLE_RUNTIME_QUERY
+OPUS_H index_t query_warp_size() { int d; (void)hipGetDevice(&d); hipDeviceProp_t p; (void)hipGetDeviceProperties(&p, d); return static_cast<index_t>(p.warpSize); }
+OPUS_H index_t query_smem_size() { int d; (void)hipGetDevice(&d); hipDeviceProp_t p; (void)hipGetDeviceProperties(&p, d); return static_cast<index_t>(p.sharedMemPerBlock); }
+OPUS_H index_t query_num_cu()    { int d; (void)hipGetDevice(&d); hipDeviceProp_t p; (void)hipGetDeviceProperties(&p, d); return static_cast<index_t>(p.multiProcessorCount); }
+#endif
+
+// Requires <hip/hip_runtime.h> to be included before opus.hpp (for threadIdx, __syncthreads, atomicAdd).
+// .cu files include it by default; .cpp files must add it explicitly.
+#ifdef HIP_INCLUDE_HIP_HIP_RUNTIME_H
+struct workgroup_barrier {
+    OPUS_D workgroup_barrier(uint32_t* ptr) : base_ptr(ptr) {}
+    OPUS_D uint32_t ld(uint32_t offset = 0) { return __atomic_load_n(base_ptr + offset, __ATOMIC_RELAXED); }
+    OPUS_D void wait_eq(uint32_t value, uint32_t offset = 0) { if (threadIdx.x == 0) while (ld(offset) != value) {} __syncthreads(); }
+    OPUS_D void wait_lt(uint32_t value, uint32_t offset = 0) { if (threadIdx.x == 0) while (ld(offset) < value) {} __syncthreads(); }
+    OPUS_D void inc(uint32_t offset = 0) { __syncthreads(); if (threadIdx.x == 0) atomicAdd(base_ptr + offset, 1); }
+    uint32_t* base_ptr;
+};
+#endif
+
+// NOTE: all data in unsigned int. Prefer usage, construct a mdiv structure on host, pass the structure to kernel, and use div/divmod
+// The OPUS_D overload of div() uses __umulhi which requires <hip/hip_runtime.h>; see workgroup_barrier note above.
+struct mdiv {
+    uint32_t divisor;   uint32_t multiplier;    uint32_t shift;
+    OPUS_H_D mdiv() : divisor(0), multiplier(0), shift(0) {}
+    OPUS_H_D mdiv(uint32_t divisor_) : divisor(divisor_) {
+        uint32_t shift_u32 = 0;
+        while ((1U << shift_u32) < divisor_) shift_u32++;
+        uint64_t tmp_u64 = static_cast<uint64_t>((1UL << shift_u32) - divisor_) << 32;
+        multiplier       = static_cast<uint32_t>(tmp_u64 / divisor_ + 1);
+        shift            = shift_u32;
+    }
+#ifdef HIP_INCLUDE_HIP_HIP_RUNTIME_H
+    OPUS_D uint32_t div(uint32_t dividend) const {
+        if (__builtin_is_constant_evaluated()) { uint32_t tmp = static_cast<uint32_t>((static_cast<uint64_t>(dividend) * multiplier) >> 32); return (tmp + dividend) >> shift; }
+        else                                   { uint32_t tmp = __umulhi(dividend, multiplier); return (tmp + dividend) >> shift; }
+    }
+#endif
+    OPUS_H uint32_t div(uint32_t dividend) const { uint32_t tmp = static_cast<uint32_t>((static_cast<uint64_t>(dividend) * multiplier) >> 32); return (tmp + dividend) >> shift; }
+    OPUS_H_D void divmod(uint32_t dividend, uint32_t& quotient, uint32_t& remainder) const { quotient  = div(dividend);  remainder = dividend - (quotient * divisor); }
+    OPUS_H_D uint32_t get() const { return divisor; }
+};
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // math
 template <typename T, int dpp_i, int row_mask = 0xf, int bank_mask = 0xf, bool bound_ctrl = true>
@@ -1145,7 +1203,7 @@ template<> OPUS_D float       max<float>(const float&a, const float&b) { return 
 template<typename T> OPUS_D T min(const T&a, const T&b)                { return a > b ? b : a; }
 template<> OPUS_D float       min<float>(const float&a, const float&b) { return __builtin_fminf(a, b); }
 
-template<typename T> OPUS_D T med3(const T&a, const T&b, const T&c) { auto max_0 = max(a, b); auto min_0 = max(a, b); return max(max_0, max(min_0, c)); }
+template<typename T> OPUS_D T med3(const T&a, const T&b, const T&c) { auto max_0 = max(a, b); auto min_0 = min(a, b); return min(max_0, max(min_0, c)); }
 template<> OPUS_D float       med3<float>(const float&a, const float&b, const float&c) { return __builtin_amdgcn_fmed3f(a, b, c); }
 template<> OPUS_D fp16_t      med3<fp16_t>(const fp16_t&a, const fp16_t&b, const fp16_t&c) { return __builtin_amdgcn_fmed3h(a, b, c); }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
