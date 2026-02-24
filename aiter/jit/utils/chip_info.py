@@ -69,7 +69,7 @@ def get_gfx_custom_op_core() -> int:
             for line in output.split("\n"):
                 match = re.search(r"\b(gfx\w+)\b", line, re.IGNORECASE)
                 if match:
-                    gfx_arch = match.group(1)
+                    gfx_arch = match.group(1).lower()
                     try:
                         return gfx_mapping[gfx_arch]
                     except KeyError:
