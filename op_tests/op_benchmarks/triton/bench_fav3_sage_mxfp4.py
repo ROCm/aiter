@@ -180,8 +180,8 @@ def parse_args():
     )
     parser.add_argument(
         "-hadamard_rotate",
-        type=int,
-        default=1,
+        type=lambda v: bool(int(v)),
+        default=True,
         help="whether to apply hadamard rotate (1) or not (0). Default 1.",
     )
     parser.add_argument(
