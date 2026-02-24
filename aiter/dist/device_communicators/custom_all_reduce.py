@@ -315,8 +315,8 @@ class CustomAllreduce:
                     input,
                     use_new=use_new,
                     open_fp8_quant=open_fp8_quant,
-                    registered_input=True,
-                    registered_output=True
+                    registered_input=not self.tms_cudagraph,
+                    registered_output=not self.tms_cudagraph
                 )
             else:
                 # if warm up, mimic the allocation pattern
@@ -331,8 +331,8 @@ class CustomAllreduce:
                 input,
                 use_new=use_new,
                 open_fp8_quant=open_fp8_quant,
-                registered_input=not self.tms_cudagraph,
-                registered_output=not self.tms_cudagraph
+                registered_input=False,
+                registered_output=False
             )
 
     def reduce_scatter(
