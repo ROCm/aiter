@@ -217,7 +217,7 @@ def ref_sparse_attn_decode(
     kv_indptr: torch.Tensor,  # (batch + 1,) cumulative kv lengths
     kv_indices: torch.Tensor,  # (total_kv_len,) page indices
     kv_last_page_lens: torch.Tensor,  # (batch,) valid tokens in last page
-    sm_scale: float = 1.0,
+    sm_scale: float,
     attn_sink: torch.Tensor = None,  # (h_q,) optional attention sink
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -303,15 +303,15 @@ def ref_sparse_attn_decode(
     output = torch.stack(outputs, dim=0)  # (batch, s_q, h_q, d_v) fp32
     lse = torch.stack(lses, dim=0)  # (batch, s_q, h_q) fp32
 
-    # 5. Attention sink adjustment
-    if attn_sink is not None:
-        sink_factor = 1.0 / (1.0 + torch.exp(attn_sink.view(1, 1, h_q) - lse))
-        output *= sink_factor.unsqueeze(-1)
+    # # 5. Attention sink adjustment
+    # if attn_sink is not None:
+    #     sink_factor = 1.0 / (1.0 + torch.exp(attn_sink.view(1, 1, h_q) - lse))
+    #     output *= sink_factor.unsqueeze(-1)
 
-    # 6. Handle lonely Q (no valid K)
-    lonely_q_mask = lse == float("-inf")
-    output[lonely_q_mask.unsqueeze(-1).expand_as(output)] = 0.0
-    lse[lonely_q_mask] = float("+inf")
+    # # 6. Handle lonely Q (no valid K)
+    # lonely_q_mask = lse == float("-inf")
+    # output[lonely_q_mask.unsqueeze(-1).expand_as(output)] = 0.0
+    # lse[lonely_q_mask] = float("+inf")
 
     # Convert to bf16 for output
     return output.to(dtypes.bf16), lse.transpose(1, 2).to(
@@ -342,7 +342,7 @@ def test_sparse_attn_decode(
 ):
     # 1. prepare input
     assert head_num_of_q % head_num_of_kv == 0
-
+    sm_scale = 1.0 / (dim_qk**0.5)
     q = torch.randn(
         (batch_size, seq_len_of_q, head_num_of_q, dim_qk), dtype=torch.bfloat16
     )
@@ -426,6 +426,7 @@ def test_sparse_attn_decode(
         kv_indptr,
         kv_indices,
         kv_last_page_lens,
+        sm_scale,
     )
 
     # 3. call asm implementation
