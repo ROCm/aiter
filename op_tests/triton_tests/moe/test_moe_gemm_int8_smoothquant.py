@@ -18,7 +18,7 @@ from aiter.ops.triton.moe.quant_moe import (
 from aiter.ops.triton.moe.moe_op_gemm_int8_smoothquant import (
     moe_gemm_int8_smoothquant,
     moe_gemm_smoothquant_torch,
-    preshuffle_weights
+    preshuffle_weights,
 )
 
 # Target-specific utilities
@@ -287,4 +287,4 @@ def test_op(
         apply_activation=apply_activation,
         add_residual=apply_activation,
     )
-    assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)    
+    assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)

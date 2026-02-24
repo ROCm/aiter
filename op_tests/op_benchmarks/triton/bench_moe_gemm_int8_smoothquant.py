@@ -8,7 +8,7 @@ import torch
 import argparse
 from aiter.ops.triton.moe.moe_op_gemm_int8_smoothquant import (
     moe_gemm_int8_smoothquant,
-    preshuffle_weights
+    preshuffle_weights,
 )
 from aiter.ops.triton.moe.quant_moe import (
     smoothquant_quantize,
@@ -90,7 +90,16 @@ def compute_roofline(
 
 
 def bench_mlp_single_weight_init(
-    batch, dim1, dim2, n_expts_tot, n_expts_act, preshuffled, x_dtype, w_dtype, TP, op_regex
+    batch,
+    dim1,
+    dim2,
+    n_expts_tot,
+    n_expts_act,
+    preshuffled,
+    x_dtype,
+    w_dtype,
+    TP,
+    op_regex,
 ):
     rank = 0
     dev = f"cuda:{rank}"
@@ -188,7 +197,16 @@ def bench_mlp(
     all_results = []
     for i in range(num_weight_inits):
         result = bench_mlp_single_weight_init(
-            batch, dim1, dim2, n_expts_tot, n_expts_act, preshuffled, x_dtype, w_dtype, TP, op_regex
+            batch,
+            dim1,
+            dim2,
+            n_expts_tot,
+            n_expts_act,
+            preshuffled,
+            x_dtype,
+            w_dtype,
+            TP,
+            op_regex,
         )
         all_results.append(result)
 

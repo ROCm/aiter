@@ -44,8 +44,6 @@ def matmul_launch_metadata(grid, kernel, args):
     fK = K if K is not None else n_tokens
     ret[f"flops{nbits}"] = 2.0 * fM * N * fK
 
-    gindx = args.get("GatherIndx", None)
-    # sindx = args.get("WriteBackIndx", None)
     n_x_bytes = X.numel() * X.element_size()
     n_y_bytes = Y.numel() * Y.element_size()
     if hist is not None:
@@ -336,13 +334,11 @@ def _moe_gemm_int8_smoothquant(
         num_k_iter -= 1
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
-    #tl.device_print("acc", acc.shape)
     for k in range(num_k_iter):
         x = tl.load(XPtrs)
         w = tl.load(WPtrs, cache_modifier=W_CACHE_MODIFIER)
         if PRESHUFFLED:
             w = unshuffle_weights(w, BLOCK_N, BLOCK_K)
-            #tl.device_print("w", w.shape)
 
         acc += tl.dot(x, w, input_precision="ieee")
 

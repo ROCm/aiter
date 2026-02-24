@@ -85,7 +85,7 @@ def allocate_output(
     scatter_indx,
     block_m,
     split_k,
-    device
+    device,
 ):
     # final output
     if routing_data.n_expts_act == 1 or scatter_indx is None:
@@ -110,7 +110,7 @@ def get_kernel_config(m, n, k, routing_data):
     w_cache_modifier = ".cg" if block_m <= 32 else None
     split_k = 1
     num_cus = get_num_sms()
-    
+
     if block_m == 16:
         block_n = 64
         block_k = 256
@@ -286,7 +286,6 @@ def moe_gemm_int8_smoothquant(
     else:
         reduction_n_matmul = 1
         reduction_n_reduction = 1
-    if not apply_activation:
         alpha = 0
     # allocate output memory
     y, y_final = allocate_output(
@@ -300,7 +299,7 @@ def moe_gemm_int8_smoothquant(
         scatter_indx,
         config["block_m"],
         config["split_k"],
-        x.device
+        x.device,
     )
     stride_bias = None if bias is None else bias.stride(0)
     # moe metadata
@@ -353,7 +352,7 @@ def moe_gemm_int8_smoothquant(
         config["block_n"],
         config["block_k"],
         config["group_m"],
-        PRESHUFFLED = preshuffled,
+        PRESHUFFLED=preshuffled,
         EVEN_K=K % config["block_k"] == 0,
         MASK_K_LIMIT=K % config["block_k"],
         SPLIT_K=config["split_k"],
