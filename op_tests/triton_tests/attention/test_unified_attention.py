@@ -272,7 +272,7 @@ def test_triton_unified_attn(
             pytest.skip(
                 "Only block size >= 64 is supported for shuffled KV cache with gluon backend"
             )
-        if use_tdm or use_async:
+        if use_tdm:
             pytest.skip(
                 "Only baseline kernel is supported for shuffled KV cache with gluon backend"
             )

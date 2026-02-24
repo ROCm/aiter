@@ -249,12 +249,10 @@ def make_layout_3d(
 
         # therefore, we construct WMMA layout with the following heuristics
 
-        warp_bases = [(0, 1 << i) for i in range(int(math.log2(num_warps)))]
-
         QK_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
             version=3,
             transposed=True,
-            warp_bases=warp_bases,
+            warp_bases=[(1 << i, 0) for i in range(int(math.log2(num_warps)))],
             reg_bases=[],
             instr_shape=[16, 16, 32],
         )
@@ -262,7 +260,7 @@ def make_layout_3d(
         PV_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
             version=3,
             transposed=True,
-            warp_bases=warp_bases,
+            warp_bases=[(0, 1 << i) for i in range(int(math.log2(num_warps)))],
             reg_bases=[],
             instr_shape=[16, 16, 32],
         )
