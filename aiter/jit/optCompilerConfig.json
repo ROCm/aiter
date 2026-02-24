@@ -1170,6 +1170,9 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mla_hk_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mla/hk_decode_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk/hk_mla_utils.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk/hk_mla_buffer_managers.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk/hk_mla_softmax.cuh'",
             "f'{AITER_CSRC_DIR}/kernels/mla/hk/mi3xx_v32_fwd_decode_h128_fp8_fp8.cuh'"
         ],
         "flags_extra_cc": [],
