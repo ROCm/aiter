@@ -1547,6 +1547,10 @@ template <index_t lgkmcnt> OPUS_D void s_waitcnt_lgkmcnt(number<lgkmcnt>) { s_wa
     static_for<steps - 1>([&](auto i){ tmp = inst_(slice(a, number<e_a * (i+1)>{}, number<e_a*(i+2)>{}), slice(b, number<e_b * (i+1)>{}, number<e_b * (i+2)>{}), tmp, cbsz, abid, blgp); });  \
     return tmp; }
 
+// f32 MFMA: inputs are scalar floats (elem_a = elem_b = 1), extract via [0] from vector_t<fp32_t, 1>
+#define DISPATCH_MFMA_F32_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
+ (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { return inst_(a[0], b[0], c, cbsz, abid, blgp); }
+
 // gfx942 _1k bf16 intrinsics require short vectors; bitcast bf16 -> short before calling
 #define DISPATCH_MFMA_BF16_1K_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
@@ -1618,6 +1622,8 @@ struct mfma {
         else if constexpr DISPATCH_MFMA_8BIT_(fp8_t , fp8_t , fp32_t, 16, 16, 32, __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8)
         else if constexpr DISPATCH_MFMA_8BIT_(bf8_t , bf8_t , fp32_t, 32, 32, 16, __builtin_amdgcn_mfma_f32_32x32x16_bf8_bf8)
         else if constexpr DISPATCH_MFMA_8BIT_(bf8_t , bf8_t , fp32_t, 16, 16, 32, __builtin_amdgcn_mfma_f32_16x16x32_bf8_bf8)
+        else if constexpr DISPATCH_MFMA_F32_(fp32_t, fp32_t, fp32_t, 32, 32,  2, __builtin_amdgcn_mfma_f32_32x32x2f32)
+        else if constexpr DISPATCH_MFMA_F32_(fp32_t, fp32_t, fp32_t, 16, 16,  4, __builtin_amdgcn_mfma_f32_16x16x4f32)
 #endif
 #if defined(__gfx942__) || defined(__gfx9_4_generic__)
         else if constexpr DISPATCH_MFMA_STEP_K_(fp16_t, fp16_t, fp32_t, 32, 32, 16,  8, __builtin_amdgcn_mfma_f32_32x32x8f16)
@@ -1660,12 +1666,15 @@ struct mfma {
     }
 };
 #undef DISPATCH_MFMA_
+#undef DISPATCH_MFMA_F32_
 #undef DISPATCH_MFMA_STEP_K_
 #undef DISPATCH_MFMA_BF16_1K_
 #undef DISPATCH_MFMA_STEP_K_BF16_1K_
 #undef DISPATCH_MFMA_8BIT_
 #undef DISPATCH_MFMA_SCALE_
 
+using mfma_f32_32x32x2_f32      = mfma<fp32_t, fp32_t, fp32_t, 32, 32,  2>;
+using mfma_f32_16x16x4_f32      = mfma<fp32_t, fp32_t, fp32_t, 16, 16,  4>;
 using mfma_f32_32x32x8_f16      = mfma<fp16_t, fp16_t, fp32_t, 32, 32,  8>;
 using mfma_f32_16x16x16_f16     = mfma<fp16_t, fp16_t, fp32_t, 16, 16, 16>;
 using mfma_f32_32x32x8_bf16     = mfma<bf16_t, bf16_t, fp32_t, 32, 32,  8>;

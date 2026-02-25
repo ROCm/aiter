@@ -165,7 +165,7 @@ def gemm_a8w8_blockscale_cktile(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
-    isBpreshuffled: bool = True,
+    isBpreshuffled: bool = False,
     preshuffleQuantB: bool = False,
 ) -> torch.Tensor: ...
 
@@ -181,6 +181,22 @@ def gemm_a8w8_blockscale_bpreshuffle_ck(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+) -> torch.Tensor: ...
+
+
+@compile_ops(
+    "module_gemm_a8w8_blockscale_bpreshuffle_cktile",
+    fc_name="gemm_a8w8_blockscale_bpreshuffle_cktile",
+    gen_fake=gen_gemm_a8w8_blockscale_ck_fake_tensors,
+)
+def gemm_a8w8_blockscale_bpreshuffle_cktile(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    isBpreshuffled: bool = True,
+    preshuffleQuantB: bool = False,
 ) -> torch.Tensor: ...
 
 
@@ -280,7 +296,6 @@ _CKGEMM_CONFIG_CACHE = None
 
 @functools.lru_cache(maxsize=1024)
 def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
-    print(f"tuned_file: {tuned_file}")
     if tuned_file is None:
         tuned_file = "a8w8_tuned_gemm.csv"
     global _CKGEMM_CONFIG_CACHE
@@ -565,7 +580,9 @@ def gemm_a8w8_blockscale(
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     from aiter.jit.utils.chip_info import get_gfx
 
-    if isBpreshuffled:  # never executed as "gemm_a8w8_blockscale" is called when isBpreshuffled is False
+    if (
+        isBpreshuffled
+    ):  # never executed as "gemm_a8w8_blockscale" is called when isBpreshuffled is False
         if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:
             return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
         else:
@@ -621,7 +638,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
-    preshuffleB: bool = False,  
+    preshuffleB: bool = False,
     preshuffleQuantB: bool = False,
 ) -> Tensor:
     assert dtype in [
@@ -634,17 +651,22 @@ def gemm_a8w8_blockscale_bpreshuffle(
     config = get_CKGEMM_config(
         m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
     )
-    print(f"***********************************config: {config}***********************************")
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     if config is not None:
         libtype = config["libtype"]
-        print(f"libtype: {libtype}")
-        if libtype == "cktile":
-            return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y, preshuffleB, preshuffleQuantB)
+        if libtype == "ck" and preshuffleQuantB:
+            assert 0, "ck type does not support preshuffleQuantB"
+        elif libtype == "cktile":
+            return gemm_a8w8_blockscale_bpreshuffle_cktile(
+                XQ, WQ, x_scale, w_scale, Y, preshuffleB, preshuffleQuantB
+            )
         elif libtype == "ck":
             return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+
     if preshuffleQuantB:
-        return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y, preshuffleB, True)
+        return gemm_a8w8_blockscale_bpreshuffle_cktile(
+            XQ, WQ, x_scale, w_scale, Y, preshuffleB, preshuffleQuantB
+        )
     else:
         return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
@@ -732,7 +754,7 @@ def gemm_a8w8_blockscale_cktile_tune(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
-    preshuffleB: bool = True,
+    preshuffleB: bool = False,
     preshuffleQuantB: bool = False,
 ) -> torch.Tensor: ...
 
@@ -750,6 +772,24 @@ def gemm_a8w8_bpreshuffle_tune(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
+) -> torch.Tensor: ...
+
+
+@compile_ops(
+    "module_gemm_a8w8_blockscale_bpreshuffle_cktile_tune",
+    fc_name="gemm_a8w8_blockscale_bpreshuffle_cktile_tune",
+    gen_fake=gen_gemm_a8w8_blockscale_tune_fake_tensors,
+)
+def gemm_a8w8_blockscale_bpreshuffle_cktile_tune(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    kernelId: int = 0,
+    splitK: int = 0,
+    preshuffleB: bool = True,
+    preshuffleQuantB: bool = False,
 ) -> torch.Tensor: ...
 
 

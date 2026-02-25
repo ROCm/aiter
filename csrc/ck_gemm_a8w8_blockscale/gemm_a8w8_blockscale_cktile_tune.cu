@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <cmath>
 #include <functional>
@@ -86,4 +86,18 @@ torch::Tensor gemm_a8w8_blockscale_cktile_tune(torch::Tensor& XQ,
         TORCH_CHECK(false, "Unsupported scales/output dtype!");
     }
     return Y;
+}
+
+torch::Tensor gemm_a8w8_blockscale_bpreshuffle_cktile_tune(torch::Tensor& XQ,
+                                                           torch::Tensor& WQ,
+                                                           torch::Tensor& x_scale,
+                                                           torch::Tensor& w_scale,
+                                                           torch::Tensor& Y,
+                                                           int kernelId,
+                                                           int splitK,
+                                                           bool preshuffleB,
+                                                           bool preshuffleQuantB)
+{
+    return gemm_a8w8_blockscale_cktile_tune(
+        XQ, WQ, x_scale, w_scale, Y, kernelId, splitK, preshuffleB, preshuffleQuantB);
 }
