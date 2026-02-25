@@ -14,6 +14,7 @@ The fusion reduces memory bandwidth by avoiding intermediate writes.
 Implementations:
 1. "torch" - Pure torch reference implementation (see torch_allreduce.py)
 2. "iris_oneshot" (default) - Iris fused single-kernel allreduce+rmsnorm+quant (see iris_oneshot_allreduce.py)
+3. "iris_twoshot" - Iris two-shot reduce+broadcast allreduce+rmsnorm+quant (see iris_twoshot_allreduce.py)
 """
 
 import logging
@@ -55,8 +56,9 @@ def fused_allreduce_add_rms_quant(
         quant_dtype: Target quantization dtype (e.g., torch.float8_e4m3fn)
         group_name: TP group name for all-reduce
         residual: Optional residual tensor for fused add
-        impl: Implementation to use - "torch" (pure torch reference)
-              or "iris_oneshot" (Iris fused single-kernel, default)
+        impl: Implementation to use - "torch" (pure torch reference),
+              "iris_oneshot" (Iris fused single-kernel, default),
+              or "iris_twoshot" (Iris two-shot reduce+broadcast)
 
     Returns: (allreduce_out, rms_out, residual_out, quant_out, quant_scale_out)
              residual_out is None if residual is None
@@ -67,6 +69,15 @@ def fused_allreduce_add_rms_quant(
         )
 
         return fused_allreduce_add_rms_quant_iris_oneshot(
+            input, rms_weight, rms_eps, quant_scale, quant_dtype, group_name,
+            residual,
+        )
+    elif impl == "iris_twoshot":
+        from .iris_twoshot_allreduce import (
+            fused_allreduce_add_rms_quant_iris_twoshot,
+        )
+
+        return fused_allreduce_add_rms_quant_iris_twoshot(
             input, rms_weight, rms_eps, quant_scale, quant_dtype, group_name,
             residual,
         )
@@ -81,5 +92,6 @@ def fused_allreduce_add_rms_quant(
         )
     else:
         raise ValueError(
-            f"Unknown impl '{impl}', expected 'torch' or 'iris_oneshot'"
+            f"Unknown impl '{impl}', expected 'torch', 'iris_oneshot',"
+            f" or 'iris_twoshot'"
         )
