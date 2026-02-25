@@ -14,13 +14,16 @@
  *                                                          "fp32_fp8", "fp32_fp4"
  */
 
-#include <torch/extension.h>
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
 #include "test_mfma.h"
 #include "test_mxfp.h"
 #include "test_vector_add.h"
 #include "test_async_load.h"
 #include "test_dtype_convert.h"
 #include "test_load_store_if.h"
+#include "test_mdiv.h"
+#include "test_workgroup_barrier.h"
 
 // ---------- MFMA wrapper ----------
 
@@ -349,6 +352,66 @@ static void run_predicated_async_load_torch(
     run_predicated_async_load(Src.data_ptr(), Dst.data_ptr(), n, static_cast<int>(n_padded));
 }
 
+// ---------- mdiv wrapper ----------
+
+static void run_mdiv_torch(
+    torch::Tensor Dividends,
+    torch::Tensor OutQ,
+    torch::Tensor OutR,
+    int64_t divisor)
+{
+    TORCH_CHECK(Dividends.is_cuda(), "Dividends must be a CUDA tensor");
+    TORCH_CHECK(OutQ.is_cuda(), "OutQ must be a CUDA tensor");
+    TORCH_CHECK(OutR.is_cuda(), "OutR must be a CUDA tensor");
+    TORCH_CHECK(Dividends.dtype() == torch::kInt32, "Dividends must be int32");
+    TORCH_CHECK(OutQ.dtype() == torch::kInt32, "OutQ must be int32");
+    TORCH_CHECK(OutR.dtype() == torch::kInt32, "OutR must be int32");
+    TORCH_CHECK(Dividends.is_contiguous() && OutQ.is_contiguous() && OutR.is_contiguous(),
+                "All tensors must be contiguous");
+    TORCH_CHECK(Dividends.dim() == 1 && OutQ.dim() == 1 && OutR.dim() == 1,
+                "All tensors must be 1-D");
+    int n = static_cast<int>(Dividends.numel());
+    TORCH_CHECK(OutQ.numel() == n && OutR.numel() == n,
+                "All tensors must have the same number of elements");
+    TORCH_CHECK(divisor > 0, "divisor must be positive");
+
+    run_mdiv(Dividends.data_ptr(), OutQ.data_ptr(), OutR.data_ptr(),
+             static_cast<int>(divisor), n);
+}
+
+// ---------- workgroup_barrier wrappers ----------
+
+static void run_wb_cumulative_torch(torch::Tensor Accum, int64_t n_workgroups)
+{
+    TORCH_CHECK(Accum.is_cuda(), "Accum must be a CUDA tensor");
+    TORCH_CHECK(Accum.dtype() == torch::kInt32, "Accum must be int32");
+    TORCH_CHECK(Accum.numel() == 1, "Accum must have 1 element");
+    run_workgroup_barrier_cumulative(Accum.data_ptr(), static_cast<int>(n_workgroups));
+}
+
+static void run_wb_streamk_reduce_torch(
+    torch::Tensor Input,
+    torch::Tensor Workspace,
+    torch::Tensor Result,
+    int64_t n_chunks)
+{
+    TORCH_CHECK(Input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(Workspace.is_cuda(), "Workspace must be a CUDA tensor");
+    TORCH_CHECK(Result.is_cuda(), "Result must be a CUDA tensor");
+    TORCH_CHECK(Input.dtype() == torch::kFloat32, "Input must be float32");
+    TORCH_CHECK(Workspace.dtype() == torch::kFloat32, "Workspace must be float32");
+    TORCH_CHECK(Result.dtype() == torch::kFloat32, "Result must be float32");
+    TORCH_CHECK(Input.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(Input.numel() == 256 * n_chunks,
+                "Input must have 256 * n_chunks elements");
+    TORCH_CHECK(Workspace.numel() >= n_chunks,
+                "Workspace must have at least n_chunks elements");
+    TORCH_CHECK(Result.numel() == 1, "Result must have 1 element");
+    run_workgroup_barrier_streamk_reduce(
+        Input.data_ptr(), Workspace.data_ptr(), Result.data_ptr(),
+        static_cast<int>(n_chunks));
+}
+
 // ---------- Module ----------
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -374,4 +437,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("run_predicated_async_load", &run_predicated_async_load_torch,
           "OPUS predicated async_load: copy Src -> LDS -> Dst with bounds predicate",
           py::arg("Src"), py::arg("Dst"), py::arg("n_padded"));
+    m.def("run_mdiv", &run_mdiv_torch,
+          "OPUS mdiv: magic division. out_q[i] = dividends[i]/divisor, "
+          "out_r[i] = dividends[i]%divisor",
+          py::arg("Dividends"), py::arg("OutQ"), py::arg("OutR"), py::arg("divisor"));
+    m.def("run_wb_cumulative", &run_wb_cumulative_torch,
+          "workgroup_barrier cumulative test: N workgroups sync via wait_lt+inc",
+          py::arg("Accum"), py::arg("n_workgroups"));
+    m.def("run_wb_streamk_reduce", &run_wb_streamk_reduce_torch,
+          "workgroup_barrier stream-K reduce: N producers + 1 consumer via wait_eq+inc",
+          py::arg("Input"), py::arg("Workspace"), py::arg("Result"), py::arg("n_chunks"));
 }
