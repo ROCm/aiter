@@ -1,19 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-Iris fused AllReduce + RMSNorm + per-token FP8 Quant in a single kernel.
+Iris fused AllReduce + RMSNorm + per-tensor FP8 Quant in a single kernel.
 
 Single Triton kernel that fuses:
 1. One-shot all-reduce (gather from all ranks via iris.load)
 2. Optional residual addition
 3. RMSNorm (row-level variance + normalize)
-4. Per-token FP8 quantization (per-row scale)
+4. Per-tensor FP8 quantization (global scale across all rows)
 
-The reduced data stays in registers through RMSNorm and quantization,
-eliminating intermediate global memory traffic.
-
-Row-based processing: BLOCK_SIZE_N >= hidden_size so each iteration
-handles complete rows. Uses persistent CTAs that iterate over rows.
+Two-pass persistent kernel:
+  Pass 1: AllReduce + RMSNorm + compute per-row amax (atomic max to global)
+  Barrier: Spin-wait until all CTAs finish pass 1
+  Pass 2: Read global per-tensor scale, reload rms_out from L2, quantize
 
 CUDA graph compatibility:
 - Buffer pre-allocation: The first forward pass (warmup) sees the largest M
@@ -152,7 +151,7 @@ iris_opt_autotune_configs = get_iris_opt_configs(AUTOTUNE)
 
 
 # ============================================================================
-# Fused AllReduce + RMSNorm + Per-Token FP8 Quant kernel
+# Fused AllReduce + RMSNorm + Per-Tensor FP8 Quant kernel
 # ============================================================================
 
 
@@ -170,6 +169,9 @@ def fused_allreduce_rmsnorm_quant_kernel(
     rms_out_ptr,
     quant_out_ptr,
     scale_out_ptr,
+    # Cross-CTA synchronization for per-tensor scale
+    global_amax_ptr,
+    arrival_counter_ptr,
     # Residual (regular GPU memory; dummy ptr when HAS_RESIDUAL=False)
     residual_in_ptr,
     residual_out_ptr,
@@ -199,11 +201,12 @@ def fused_allreduce_rmsnorm_quant_kernel(
     NUM_XCDS: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
 ):
-    """Fused one-shot AllReduce + RMSNorm + per-token FP8 quant.
+    """Fused one-shot AllReduce + RMSNorm + per-tensor FP8 quant.
 
-    Row-based processing: BLOCK_SIZE_N >= hidden_size so each iteration
-    handles complete rows. The reduced data stays in registers through
-    RMSNorm and quantization — no intermediate global memory traffic.
+    Two-pass persistent kernel:
+      Pass 1: AllReduce + RMSNorm + compute per-row amax (atomic max to global)
+      Barrier: Spin-wait until all CTAs finish pass 1
+      Pass 2: Read global per-tensor scale, reload rms_out, quantize to FP8
 
     Each CTA persistently iterates over rows.
     """
@@ -220,6 +223,7 @@ def fused_allreduce_rmsnorm_quant_kernel(
         rms_weight_ptr + cols, mask=col_mask, other=0.0
     ).to(tl.float32)
 
+    # === Pass 1: AllReduce + RMSNorm + accumulate global amax ===
     for row in range(pid, M, COMM_SMS):
         in_offset = row * stride_in_m + cols * stride_in_n
         out_offset = row * N + cols
@@ -270,16 +274,38 @@ def fused_allreduce_rmsnorm_quant_kernel(
             mask=col_mask,
         )
 
-        # --- Step 4: Per-token FP8 quantization ---
-        amax = tl.max(tl.abs(normed), axis=0)
-        amax = tl.maximum(amax, 1e-12)
-        scale = amax / fp8_max
-        quantized = (normed / scale).to(quant_out_ptr.type.element_ty)
+        # --- Step 4: Per-row amax → atomic max to global ---
+        row_amax = tl.max(tl.abs(normed), axis=0)
+        tl.atomic_max(global_amax_ptr, row_amax, sem="relaxed")
 
+    # === Cross-CTA barrier: spin until all CTAs finish pass 1 ===
+    # Each CTA increments the counter. Spin until counter == COMM_SMS.
+    # atomic_add(ptr, 0) is a non-destructive atomic read.
+    tl.atomic_add(arrival_counter_ptr, 1, sem="release")
+    while tl.atomic_add(arrival_counter_ptr, 0, sem="acquire") < COMM_SMS:
+        pass
+
+    # === Pass 2: Quantize with per-tensor scale ===
+    global_amax = tl.load(global_amax_ptr)
+    global_amax = tl.maximum(global_amax, 1e-12)
+    scale = global_amax / fp8_max
+
+    # Store per-tensor scale (only one CTA needs to do this)
+    if pid == 0:
+        tl.store(scale_out_ptr, scale)
+
+    for row in range(pid, M, COMM_SMS):
+        out_offset = row * N + cols
+
+        # Reload rms_out (should be warm in L2)
+        normed = tl.load(
+            rms_out_ptr + out_offset, mask=col_mask, other=0.0
+        ).to(tl.float32)
+
+        quantized = (normed / scale).to(quant_out_ptr.type.element_ty)
         tl.store(
             quant_out_ptr + out_offset, quantized, mask=col_mask
         )
-        tl.store(scale_out_ptr + row, scale.to(tl.float32))
 
 
 # ============================================================================
@@ -319,6 +345,10 @@ class IrisOptManager:
         self._out_scale: Optional[torch.Tensor] = None
         self._out_residual: Optional[torch.Tensor] = None
         self._out_quant_dtype: Optional[torch.dtype] = None
+
+        # Cross-CTA sync buffers for per-tensor scale reduction
+        self._global_amax: Optional[torch.Tensor] = None
+        self._arrival_counter: Optional[torch.Tensor] = None
 
     def initialize(self, heap_size: Optional[int] = None) -> None:
         """Initialize Iris symmetric heap (call once at startup)."""
@@ -437,9 +467,14 @@ class IrisOptManager:
             self._out_allreduce = torch.empty((M, N), dtype=dtype, device=device)
             self._out_rms = torch.empty((M, N), dtype=dtype, device=device)
             self._out_quant = torch.empty((M, N), dtype=quant_dtype, device=device)
-            self._out_scale = torch.empty(M, dtype=torch.float32, device=device)
+            # Per-tensor scale: single scalar
+            self._out_scale = torch.empty(1, dtype=torch.float32, device=device)
             self._out_residual = torch.empty((M, N), dtype=dtype, device=device)
             self._out_quant_dtype = quant_dtype
+
+            # Cross-CTA sync buffers (fixed size, not M-dependent)
+            self._global_amax = torch.zeros(1, dtype=torch.float32, device=device)
+            self._arrival_counter = torch.zeros(1, dtype=torch.int32, device=device)
 
             cur_rank = (
                 torch.distributed.get_rank()
@@ -462,7 +497,7 @@ class IrisOptManager:
             self._out_rms[:M],
             self._out_residual[:M] if has_residual else None,
             self._out_quant[:M],
-            self._out_scale[:M],
+            self._out_scale,
         )
 
     def fused_allreduce_rmsnorm_quant(
@@ -479,7 +514,7 @@ class IrisOptManager:
         torch.Tensor,
         torch.Tensor,
     ]:
-        """Fused AllReduce + RMSNorm + per-token FP8 quant in one kernel.
+        """Fused AllReduce + RMSNorm + per-tensor FP8 quant in one kernel.
 
         Args:
             input_tensor: Input tensor (M, N) on GPU
@@ -491,12 +526,11 @@ class IrisOptManager:
         Returns:
             (allreduce_out, rms_out, residual_out, quant_out, scale_out)
             residual_out is None when residual is None.
-            scale_out is per-token: shape (M, 1).
+            scale_out is per-tensor: shape (1,).
         """
         shmem = self.shmem
         M, N = input_tensor.shape
         device = input_tensor.device
-
 
         # Get pre-allocated buffers (views into max-size allocations)
         iris_input = self._get_input_buffer(M, N, input_tensor.dtype)
@@ -522,16 +556,24 @@ class IrisOptManager:
 
         BLOCK_SIZE_N = triton.next_power_of_2(N)
 
+        # Reset sync buffers before kernel launch
+        assert self._global_amax is not None
+        assert self._arrival_counter is not None
+        self._global_amax.zero_()
+        self._arrival_counter.zero_()
+
         def grid(META):
             return (META["COMM_SMS"],)
 
-        # Launch fused kernel
+        # Launch fused kernel (two-pass: allreduce+rmsnorm+amax, then quant)
         fused_allreduce_rmsnorm_quant_kernel[grid](
             iris_input,
             allreduce_out,
             rms_out,
             quant_out,
             scale_out,
+            self._global_amax,
+            self._arrival_counter,
             # Dummy ptrs when no residual (HAS_RESIDUAL=False skips access)
             residual if residual is not None else input_tensor,
             residual_out if residual_out is not None else allreduce_out,
@@ -554,17 +596,7 @@ class IrisOptManager:
 
         shmem.device_barrier()
 
-        # The kernel computes per-token scales (M,) but the fused op contract
-        # requires per-tensor scale (1,) to match the unfused graph output.
-        # Take the max per-token scale as the per-tensor scale, then
-        # re-quantize rms_out with the per-tensor scale.
-        per_tensor_scale = scale_out.max().reshape(1)
-        fp8_max_val = torch.finfo(quant_dtype).max
-        quant_out = (rms_out.float() / per_tensor_scale).clamp(
-            -fp8_max_val, fp8_max_val
-        ).to(quant_dtype)
-
-        return allreduce_out, rms_out, residual_out, quant_out, per_tensor_scale
+        return allreduce_out, rms_out, residual_out, quant_out, scale_out
 
 
 _iris_opt_manager: Optional[IrisOptManager] = None
@@ -604,14 +636,11 @@ def fused_allreduce_add_rms_quant_iris_opt(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """Fused AllReduce + Add + RMSNorm + per-token FP8 Quant.
+    """Fused AllReduce + Add + RMSNorm + per-tensor FP8 Quant.
 
-    Single Triton kernel: one-shot all-reduce with RMSNorm and per-token
-    FP8 quantization fused into the store phase. No intermediate memory
-    traffic between the three operations.
-
-    Note: Uses per-token quantization (one scale per row) instead of
-    per-tensor quantization. scale_out shape is (M, 1).
+    Single Triton kernel: one-shot all-reduce with RMSNorm and per-tensor
+    FP8 quantization. Two-pass persistent kernel computes the global amax
+    across all rows, then quantizes with a single per-tensor scale.
     """
     iris_mgr = get_iris_opt_manager()
     return iris_mgr.fused_allreduce_rmsnorm_quant(
