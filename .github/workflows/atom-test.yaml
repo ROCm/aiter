@@ -15,6 +15,7 @@ env:
   ATOM_BRANCH: "main"
   ATOM_REPOSITORY_URL: "ROCm/ATOM"
   BASE_IMAGE: "rocm/atom-dev:latest"
+  HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/Aiter.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
