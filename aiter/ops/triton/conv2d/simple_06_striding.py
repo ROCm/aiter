@@ -36,13 +36,13 @@ def conv2d_kernel(
     # //==============start of threads===============//
     pid_h = tl.program_id(axis=0) 
     start_pid_h = (pid_h*stride_h) - pad_h
-    h_offset = (start_pid_h + tl.arange(0, BLOCK_SIZE_H))
-    # h_offset = start_pid_h
+    kernel_h_offset = tl.arange(0, BLOCK_SIZE_H)
+    h_offset = (start_pid_h + kernel_h_offset)
 
     pid_w = tl.program_id(axis=1)
     start_pid_w = (pid_w*stride_w) - pad_w
-    w_offset = (start_pid_w + tl.arange(0, BLOCK_SIZE_W))
-    # w_offset = start_pid_w
+    kernel_w_offset = tl.arange(0, BLOCK_SIZE_W)
+    w_offset = (start_pid_w + kernel_w_offset)
 
     pid_k = tl.program_id(axis=2)
     num_pid_k = tl.num_programs(axis=2)
@@ -60,10 +60,9 @@ def conv2d_kernel(
 
     #create offsets for input and kernel
     offset_input = ((h_offset[:, None]*stride_input_h) + (w_offset[None,:]*stride_input_w))
-    offset_kernel = ((tl.arange(0, BLOCK_SIZE_H)[:, None]*stride_kernel_h) + (tl.arange(0, BLOCK_SIZE_W)[None, :]*stride_kernel_w))
+    offset_kernel = ((kernel_h_offset[:, None]*stride_kernel_h) + (kernel_w_offset[None,:]*stride_kernel_w))
 
-    #create a zero tensor for the output
-    z = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_W), dtype=tl.float32)
+
     # doubel nested for loop to iterate over the batch input (N_i) and then across all the channels (C_i)
     for n in range (N_i):
         #create a zero tensor for the sum of the output that will reset for each batch
@@ -265,7 +264,7 @@ def unit_test_odd_padding_stride_conv2d():
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["N_i", "C_i", "N_k", "C_k"],
-        x_vals = [2*i for i in range(2,100, 1)],
+        x_vals = [2* i for i in range(2,100, 1)],
         line_arg='id',
         line_vals = ['triton', 'torch'],
         line_names = ["Triton", "Torch"],
@@ -305,9 +304,9 @@ if __name__ == "__main__":
     unit_test_odd_padding_stride_conv2d()
 
     #wait 3 seconds before running the benchmark
-    time.sleep(3)
-    benchmark_save_path = "/home/jrosas/workspace/conv2d/benchmark_results/conv2d_benchmark_results.png"
-    benchmark.run(show_plots=True, save_path=benchmark_save_path)
+    # time.sleep(3)
+    # benchmark_save_path = "benchmark_results/conv2d_benchmark_results.png"
+    # benchmark.run(show_plots=True, save_path=benchmark_save_path)
 
 
 
