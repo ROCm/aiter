@@ -17,6 +17,8 @@ description: Write Triton elementwise kernels, tests, and benchmarks for the ait
 | Tests | `op_tests/triton_tests/rope/`, `op_tests/triton_tests/fusions/` |
 | Benchmarks | `op_tests/op_benchmarks/triton/bench_rope*.py` |
 
+***[Cagri]: TopK is not element wise, it is better to be classfied as reduction kernel.***
+
 ## Activation Kernels
 
 ### Activation Primitives
