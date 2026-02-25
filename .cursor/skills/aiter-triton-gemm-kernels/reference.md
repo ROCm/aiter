@@ -1,5 +1,7 @@
 # Triton GEMM Kernel Reference
 
+***[Cagri]: Note needed about acc += tl.dot(..) vs acc = tl.dot(.., acc). The first approach created additional VALU to accumulate.***
+
 ## XCD Remapping Logic (AMD-specific)
 
 All GEMM kernels use XCD (Execution Compute Die) remapping for multi-chiplet AMD GPUs:
@@ -18,6 +20,8 @@ else:
 ```
 
 Use `get_num_xcds()` from `aiter.ops.triton.utils.device_info`.
+
+***[Cagri]: More XCD remapping functions and related utilities: [pid_preprocessing.py](https://github.com/ROCm/aiter/blob/main/aiter/ops/triton/utils/_triton/pid_preprocessing.py)***
 
 ## Grouped Ordering for L2 Cache Reuse
 
