@@ -1411,13 +1411,6 @@ def paged_attention_decode_sliding_window(
             + contiguous_kv_element_offsets[None, None, None, :]
         )
 
-        # Optimize: Start key load, then prepare QK MFMA accumulators/query (overlaps with key load)
-        if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE and SLIDING_WINDOW > 0:
-            kv_token_global = (
-                kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE + block_element_offsets
-            )
-            kv_in_window_mask = kv_token_global >= sequence_start_idx
-
         # Prepare QK MFMA while key loads (these don't depend on key data)
         qk_accumulator = gl.zeros(
             (QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE),
@@ -1434,6 +1427,11 @@ def paged_attention_decode_sliding_window(
             )
             # Optimize: Load both scales with VMEM scheduling, overlap with key reshape
             if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE and SLIDING_WINDOW > 0:
+                kv_token_global = (
+                    kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE + block_element_offsets
+                )
+                kv_in_window_mask = kv_token_global >= sequence_start_idx
+
                 key_scale_value_blocked = gl.load(
                     key_scale + key_scale_offsets,
                     mask=kv_in_window_mask[None, None, :, None],
@@ -1494,9 +1492,16 @@ def paged_attention_decode_sliding_window(
                 + value_dim3_offsets[None, None, None, :]
             )
             if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE and SLIDING_WINDOW > 0:
+                value_token_global = (
+                    kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE
+                    + value_dim1_offsets[None, :, None, None] * KV_16B_ELEMENT_COUNT
+                    + value_dim3_offsets[None, None, None, :]
+                )
+                value_in_window_mask = value_token_global >= sequence_start_idx
+
                 value_tensor = gl.load(
                     value_cache_ptr + value_block_offsets,
-                    mask=kv_in_window_mask[None, None, :, None],
+                    mask=value_in_window_mask,
                     other=0.0,
                 )
             else:
