@@ -35,6 +35,11 @@ from aiter.ops.triton.utils._triton.arch_info import get_arch
 # ---------------
 
 
+def is_gluon_supported():
+    arch = get_arch()
+    return arch == "gfx1250"
+
+
 def alloc_rand(shape, device, dtype):
     if dtype.itemsize == 1:
         tmp = 2 ** -(torch.randint(4, 8, shape, device=device, dtype=torch.bfloat16))
@@ -219,7 +224,7 @@ class Case:
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
 @pytest.mark.parametrize("fused_quant", [False, True])
-@pytest.mark.parametrize("func", ["triton", "gluon"])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_op(
     m,
     n,
@@ -232,24 +237,21 @@ def test_op(
     n_expts_tot,
     n_expts_act,
     hbm_swizzling,
-    func,
+    backend,
     device="cuda",
 ):
-    moe_gemm_a4w4 = None
-    if func == "triton":
-        moe_gemm_a4w4 = moe_gemm_a4w4_triton
+    moe_gemm_a4w4_impl = None
+    if backend == "triton":
+        moe_gemm_a4w4_impl = moe_gemm_a4w4_triton
         if get_arch() != "gfx950":
             pytest.skip("FP4 kernels are not supported on MI300.")
-    if func == "gluon":
-        moe_gemm_a4w4 = moe_gemm_a4w4_gluon
-        if get_arch() != "gfx1250":
+    if backend == "gluon":
+        moe_gemm_a4w4_impl = moe_gemm_a4w4_gluon
+        if is_gluon_supported():
             pytest.skip("Currently, only testing Gluon implementation on gfx1250.")
-        # TODO: implement gather and scatter in Gluon implementation
-        if do_gather or do_scatter:
+        # TODO: implement scatter in Gluon implementation
+        if do_scatter:
             pytest.skip("Gluon implementation does not support gather or scatter.")
-        # TODO: implement hbm_swizzling in Gluon implementation
-        if hbm_swizzling:
-            pytest.skip("Gluon implementation does not support hbm_swizzling.")
         # TODO: implement apply_swiglu in Gluon implementation
         if apply_swiglu:
             pytest.skip("Gluon implementation does not support apply_swiglu.")
@@ -292,7 +294,7 @@ def test_op(
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
     if hbm_swizzling:
-        if get_arch() != "gfx1250":
+        if get_arch() == "gfx1250":
             swizzle_mx_scale = "GFX1250_SCALE"
         elif get_arch() == "gfx950":
             swizzle_mx_scale = "CDNA4_SCALE"
@@ -316,8 +318,8 @@ def test_op(
         quant_static_scale = ref_y.abs().max().float() / 448.0
     else:
         quant_static_scale = None
-    assert moe_gemm_a4w4 is not None
-    tri_y = moe_gemm_a4w4(
+    assert moe_gemm_a4w4_impl is not None
+    tri_y = moe_gemm_a4w4_impl(
         x_tri,
         w_tri,
         x_mx_scales_tri,
