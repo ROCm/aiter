@@ -323,6 +323,15 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         std::cout << "fmha_v3_bwd: unsupported mask type for asm kernels." << std::endl;
         return -1;
     }
+    // On gfx942, a16 (atomic32=0) has no mask_type=2 (bottom-right causal) kernels,
+    // only mask_type=1 (top-left causal). When seqlen_q == seqlen_k the two masks
+    // are mathematically equivalent, so we can safely convert 2 → 1 to hit the
+    // existing a16 causal kernels.
+    // See config: hsa/gfx942/fmha_v3_bwd/fmha_bwd_dqdkdv.csv
+    if(arch_id == "gfx942" && !a.v3_atomic_fp32 && mt == 2 && a.seqlen_q == a.seqlen_k)
+    {
+        mt = 1;  // bottom-right → top-left (equivalent when sq == sk)
+    }
 
     auto [pre_kernel, dqdkdv_kernel, post_kernel] = get_heuristic_kernel(a.data_type,
                                                                          arch_id,
@@ -423,7 +432,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         return 1;
 
     fmha_bwd_odo_args odo_args;
-    arg_size                 = sizeof(odo_args);
+
     odo_args.ptr_o           = a.o_ptr;
     odo_args.ptr_do          = a.do_ptr;
     odo_args.ptr_d           = a.d_ptr;
@@ -440,6 +449,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
 
     auto pre_kernel_launch = [&]() {
+        arg_size = sizeof(odo_args);
         int bdx = 256;
         int gdx = (a.max_seqlen_q + ts_odo - 1) / ts_odo;
         int gdy = a.nhead_q;
@@ -527,8 +537,8 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         dqdkdv_args.mask_x = generic_mask.at(ck_tile::number<1>{});
     }
 
-    arg_size                  = sizeof(dqdkdv_args);
     auto dqdkdv_kernel_launch = [&]() {
+        arg_size                  = sizeof(dqdkdv_args);
         int bdx = 256;
         int gdx = (a.max_seqlen_k + ts_kv - 1) / ts_kv;
         int gdy = a.nhead_q;
@@ -553,7 +563,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
     int dq_acc_element_size = a.v3_atomic_fp32 ? 4 : 2;
     fmha_bwd_post_kernel_args post_args;
-    arg_size                  = sizeof(post_args);
+
     post_args.ptr_dq_acc      = a.dq_acc_ptr;
     post_args.ptr_dq          = a.dq_ptr;
     post_args.Hs_dq_acc       = a.nhead_stride_dq_acc * dq_acc_element_size;
@@ -569,6 +579,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
 
     auto post_kernel_launch = [&]() {
+        arg_size                  = sizeof(post_args);
         int bdx = 256;
         int gdx = (a.max_seqlen_q + ts_dq - 1) / ts_dq;
         int gdy = a.nhead_q;
