@@ -178,6 +178,9 @@ def _sage_fwd_no_mask_mxfp4(
     ACCUMULATOR_TYPE: tl.constexpr,
     USE_BIAS: tl.constexpr,
 ):
+    
+    threshold = -10.0
+    
     for start_n in range(block_min, block_max, BLOCK_N):
         k_ptrs = k_base_ptrs + start_n * stride_kn
         v_ptrs = v_base_ptrs + start_n * stride_vk
@@ -193,14 +196,6 @@ def _sage_fwd_no_mask_mxfp4(
 
         k_descale = tl.load(k_descale_ptrs)
 
-        if PRE_LOAD_V:
-            # Refactored V Load
-            if PADDED_HEAD_V:
-                v_mask = offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
-                v = tl.load(v_ptrs, mask=v_mask, other=0.0)
-            else:
-                v = tl.load(v_ptrs)
-
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
         qk = tl.dot_scaled(
             q, q_descale, Q_DTYPE_STR, k, k_descale, K_DTYPE_STR, fast_math=True, acc=qk
@@ -213,8 +208,11 @@ def _sage_fwd_no_mask_mxfp4(
             )
             qk += bias[None, :]
 
-        m_ij = tl.maximum(m_i, tl.max(qk, 1))
-
+        m_local = tl.max(qk, 1)
+        m_ij = tl.maximum(m_i, m_local)
+        
+        DO_PV = tl.max(m_local - m_ij) > threshold
+    
         if USE_BIAS:
             q_shifted = tl.where(
                 m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
@@ -228,17 +226,21 @@ def _sage_fwd_no_mask_mxfp4(
         alpha = tl.math.exp2(m_i - m_ij)
         acc = acc * alpha[:, None]
 
-        if not PRE_LOAD_V:
-            # Refactored V Load (Lazy)
+        if DO_PV:
             if PADDED_HEAD_V:
                 v_mask = offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
                 v = tl.load(v_ptrs, mask=v_mask, other=0.0)
             else:
                 v = tl.load(v_ptrs)
+        
+            l_i = l_i * alpha + l_ij
+            m_i = m_ij
 
-        l_i = l_i * alpha + l_ij
-        m_i = m_ij
-        acc += tl.dot(p.to(v.type.element_ty), v, out_dtype=tl.float32)
+            acc += tl.dot(p.to(v.type.element_ty), v, out_dtype=tl.float32)
+        else:
+            l_i = l_i * alpha + l_ij
+            m_i = m_ij
+
 
     return acc, l_i, m_i
 
@@ -280,6 +282,8 @@ def _sage_fwd_mask_mxfp4(
     ACCUMULATOR_TYPE: tl.constexpr,
     USE_BIAS: tl.constexpr,
 ):
+    
+    threshold: tl.constexpr = -10.0
     seqlen_delta_qk = seqlen_k - seqlen_q
     for start_n in range(block_min, block_max, BLOCK_N):
         k_ptrs = k_base_ptrs + start_n * stride_kn
@@ -296,13 +300,6 @@ def _sage_fwd_mask_mxfp4(
         k_descale = tl.load(
             k_descale_ptrs, mask=kv_offs_n[:, None] < seqlen_k, other=0.0
         )
-
-        if PRE_LOAD_V:
-            # Refactored V Load
-            v_mask = kv_offs_n[:, None] < seqlen_k
-            if PADDED_HEAD_V:
-                v_mask &= offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
-            v = tl.load(v_ptrs, mask=v_mask, other=0.0)
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
 
@@ -327,9 +324,11 @@ def _sage_fwd_mask_mxfp4(
                 bias_base_ptrs + start_n * stride_bn, mask=bias_mask, other=0.0
             )
             qk += bias[None, :]
-
-        m_ij = tl.maximum(m_i, tl.max(qk, 1))
-
+        
+        m_local = tl.max(qk, 1)
+        m_ij = tl.maximum(m_i, m_local)
+        DO_PV = tl.max(m_local - m_ij) > threshold
+        
         if IS_CAUSAL:
             q_shifted = tl.where(
                 m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
@@ -343,16 +342,21 @@ def _sage_fwd_mask_mxfp4(
         m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
         alpha = tl.math.exp2(m_diff)
         acc = acc * alpha[:, None]
-        if not PRE_LOAD_V:
-            # Refactored V Load (Lazy)
+        
+        if DO_PV:
             v_mask = kv_offs_n[:, None] < seqlen_k
             if PADDED_HEAD_V:
                 v_mask &= offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
 
-        l_i = l_i * alpha + l_ij
-        m_i = m_ij
-        acc += tl.dot(p.to(v.type.element_ty), v, out_dtype=tl.float32)
+            l_i = l_i * alpha + l_ij
+            m_i = m_ij
+
+            acc += tl.dot(p.to(v.type.element_ty), v, out_dtype=tl.float32)
+        else:
+            l_i = l_i * alpha + l_ij
+            m_i = m_ij
+
 
     return acc, l_i, m_i
 
@@ -416,7 +420,15 @@ def sage_fwd_mxfp4(
     SCALE_GROUP: tl.constexpr = 32
     ACC_TYPE: tl.constexpr = tl.float32
 
-    start_m, off_h_q, off_z = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(MAX_SEQLENS_Q, BLOCK_M)
+
+    off_h_q = pid % HQ
+    start_m = pid // HQ % num_pid_m
+    off_z = pid // (HQ * num_pid_m)
+    
+    
+    
     off_h_k = off_h_q // (HQ // HK)
 
     PADDED_HEAD_QK: tl.constexpr = ACTUAL_BLOCK_DMODEL_QK != BLOCK_DMODEL_QK

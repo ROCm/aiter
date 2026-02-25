@@ -190,7 +190,7 @@ def fav3_sage_mxfp4_func(
     padded_d_v = max(16, 1 << (head_size_v - 1).bit_length())
 
     def grid(META):
-        return (triton.cdiv(seqlen_q, META["BLOCK_M"]), nheads_q, batch)
+        return (nheads_q * triton.cdiv(seqlen_q, META["BLOCK_M"]) * batch, )
 
     sage_fwd_mxfp4[grid](
         Q=q,

@@ -88,10 +88,29 @@ def run_benchmark(args):
     hk = args.hq if not args.hk else args.hk
     sk = args.sq if not args.sk else args.sk
     x_vals_list = [(args.b, args.hq, hk, args.sq, sk)]
+    x_vals_list = []
+    if args.captured_dir:
+        input_dir = args.captured_dir
+        inputs = load_captured_inputs(input_dir)
+        n_ = len(inputs)
+        for i in range(n_):
+            inp = inputs[i]
+            q = inp["q"]
+            k = inp["k"]
+            if args.layout=="bhsd":
+                b, hq, sq, d = q.shape
+                _, hk, sk, _ = k.shape
+            else:
+                b, sq, hq, d = q.shape
+                _, sk, hk, _ = k.shape
+            x_vals_list.append((i, b, hq, hk, sq, sk))
+    else:
+        x_vals_list = [(0, args.b, args.hq, hk, args.sq, sk)]
+
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
-            x_names=["BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K"],
+            x_names=["IDX", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K"],
             x_vals=x_vals_list,
             line_arg="provider",
             line_vals=["time(ms)", "throughput(TFLOPS)"],
@@ -108,6 +127,7 @@ def run_benchmark(args):
         )
     )
     def bench_mha(
+        IDX,
         BATCH,
         HQ,
         HK,
@@ -120,11 +140,16 @@ def run_benchmark(args):
         provider,
         device="cuda",
     ):
-        q = torch.randn((BATCH, HQ, N_CTX_Q, D_HEAD), device=device, dtype=dtype)
-        k = torch.randn((BATCH, HK, N_CTX_K, D_HEAD), device=device, dtype=dtype)
-        v = torch.randn((BATCH, HK, N_CTX_K, D_HEAD_V), device=device, dtype=dtype)
-
-        q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
+        if args.captured_dir:
+            inp = inputs[i]
+            q = inp["q"].to("cuda")
+            k = inp["k"].to("cuda")
+            v = inp["v"].to("cuda")
+        else:
+            q = torch.randn((BATCH, HQ, N_CTX_Q, D_HEAD), device=device, dtype=dtype)
+            k = torch.randn((BATCH, HK, N_CTX_K, D_HEAD), device=device, dtype=dtype)
+            v = torch.randn((BATCH, HK, N_CTX_K, D_HEAD_V), device=device, dtype=dtype)
+            q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
         return bench_kernel(q, k, v, args, provider)
 
     bench_mha.run(save_path=None, print_data=True)
