@@ -245,33 +245,28 @@ class AITER_CONFIG(object):
     def get_config_file(self, env_name, default_file, tuned_file_name):
         config_env_file = os.getenv(env_name)
         # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
-        print(f"get config file from environment {env_name} {default_file} {tuned_file_name}")
-        print(f"config_env_file {config_env_file}")
         from pathlib import Path
 
         if not config_env_file:
             model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
-            print(f"model_config_dir {model_config_dir}")
             op_tuned_file_list = [
                 p
                 for p in model_config_dir.glob(f"*{tuned_file_name}*")
                 if (p.is_file() and "untuned" not in str(p))
             ]
-            print(f"op_tuned_file_list {op_tuned_file_list}")
-            
+
             if not op_tuned_file_list:
                 config_file = default_file
             else:
                 tuned_files = ":".join(str(p) for p in op_tuned_file_list)
                 tuned_files = default_file + ":" + tuned_files
-                print(f"tuned_files {tuned_files}")
                 logger.info(
                     f"merge tuned file under model_configs/ and configs/ {tuned_files}"
                 )
                 config_file = self.update_config_files(tuned_files, tuned_file_name)
         else:
             config_file = self.update_config_files(config_env_file, tuned_file_name)
-        print("get config file from environment ", config_file)
+            # print(f"get config file from environment ", config_file)
         return config_file
 
 
@@ -561,7 +556,7 @@ def build_module(
 
         sources = rename_cpp_to_cu(srcs, src_dir, hipify)
 
-        flags_cc = ["-O3", "-std=c++20"]
+        flags_cc = ["-O3", "-std=c++20", "-Wno-unknown-warning-option"]
         flags_hip = [
             "-DLEGACY_HIPBLAS_DIRECT",
             "-DUSE_PROF_API=1",

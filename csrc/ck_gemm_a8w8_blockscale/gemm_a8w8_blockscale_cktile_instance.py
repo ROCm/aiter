@@ -78,6 +78,7 @@ class TileKernelInstance:
             ]
         )
 
+
 # fmt: off
 # Candidate and default kernel instances for tile gemm a8w8 blockscale
 # These instances are used for generating the kernel code and tuning.
