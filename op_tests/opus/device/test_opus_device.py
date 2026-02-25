@@ -1150,17 +1150,11 @@ def test_numeric_limits(mod):
         ref = {}
         for field in fields:
             if field == "min":
-                ref[field] = tensor_to_bits(
-                    torch.tensor(fi.tiny, dtype=dtype), size
-                )
+                ref[field] = tensor_to_bits(torch.tensor(fi.tiny, dtype=dtype), size)
             elif field == "max":
-                ref[field] = tensor_to_bits(
-                    torch.tensor(fi.max, dtype=dtype), size
-                )
+                ref[field] = tensor_to_bits(torch.tensor(fi.max, dtype=dtype), size)
             elif field == "lowest":
-                ref[field] = tensor_to_bits(
-                    torch.tensor(fi.min, dtype=dtype), size
-                )
+                ref[field] = tensor_to_bits(torch.tensor(fi.min, dtype=dtype), size)
             elif field == "quiet_nan":
                 ref[field] = tensor_to_bits(
                     torch.tensor(float("nan"), dtype=dtype), size
@@ -1227,7 +1221,7 @@ def test_numeric_limits(mod):
     if fails:
         print(f"  numeric_limits: {fails} field(s) FAILED")
         return 1
-    print(f"  PASS: numeric_limits all types correct")
+    print("  PASS: numeric_limits all types correct")
     return 0
 
 
