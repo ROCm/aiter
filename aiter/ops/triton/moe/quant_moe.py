@@ -8,6 +8,7 @@ from aiter.ops.triton._triton_kernels.moe.quant_moe import (
     _smoothquant_fuse_quant_kernel,
     _smoothquant_fuse_quant_kernel_single_pass,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 
 def downcast_to_static_fp8_3d(x: torch.Tensor, scale: torch.Tensor):
@@ -23,7 +24,11 @@ def downcast_to_static_fp8_3d(x: torch.Tensor, scale: torch.Tensor):
 
 def downcast_to_static_fp8(x: torch.Tensor, scale: torch.Tensor):
     M, N = x.shape
-    y = torch.empty((M, N), dtype=torch.float8_e4m3fnuz, device="cuda")
+    if get_arch() != "gfx942":
+        dtype = torch.float8_e4m3fn
+    else:
+        dtype = torch.float8_e4m3fnuz
+    y = torch.empty((M, N), dtype=dtype, device="cuda")
 
     BLOCK_M = min(triton.next_power_of_2(M), 128)
     if M <= 4096:
@@ -142,6 +147,7 @@ def upcast_from_mxfp(
     assert tensor.dtype in {
         torch.uint8,
         torch.float8_e5m2,
+        torch.float8_e4m3fn,
         torch.float8_e4m3fnuz,
     }, f"Invalid tensor dtype {tensor.dtype=}"
     assert scale.dtype == torch.uint8, f"Invalid scale dtype {scale.dtype=}"
