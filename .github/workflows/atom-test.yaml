@@ -103,10 +103,8 @@ jobs:
               echo "rocm-smi not found"
             fi
 
-            echo -e "\n===== Resetting GPU ====="
-            sudo rocm-smi --gpureset -d 0
-            echo -e "\n===== GPU Reset Complete ====="
-            sudo rocm-smi --showpids
+            #echo -e "\n===== Resetting GPU ====="
+            #sudo rocm-smi --gpureset -d 0
 
             echo -e "\n===== System Memory Status ====="
             free -h
@@ -119,9 +117,9 @@ jobs:
             echo -e "\n===== Python/PyTorch Processes ====="
             ps aux | grep -E "python|torch" | grep -v grep || echo "No Python processes found"
 
-            echo -e "\n===== Setting Memory Management Env Vars ====="
-            echo "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
-            echo "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" >> $GITHUB_ENV
+            # echo -e "\n===== Setting Memory Management Env Vars ====="
+            # echo "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+            # echo "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" >> $GITHUB_ENV
 
       - name: Build the ATOM test image
         run: |
@@ -159,6 +157,7 @@ jobs:
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
           -e ATOM_DISABLE_MMAP=true \
+          -e HF_TOKEN="${HF_TOKEN:-${{ secrets.HF_TOKEN_TEST }}}" \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name atom_aiter_test \
