@@ -2,8 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import torch.nn.functional as F
-from typing import Optional
 from dataclasses import dataclass
 import pandas as pd
 import os
@@ -27,7 +25,6 @@ def moe_sorting_ck(
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
-    topk = topk_ids.shape[1]
     max_num_tokens_padded = topk_ids.numel() + num_experts * block_size - topk
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
     sorted_ids = torch.empty((max_num_tokens_padded,), dtype=dtypes.i32, device=device)
@@ -318,7 +315,7 @@ def _asm_moe_2stages_int8(
         sorted_weights if not doweight_stage1 else None,
         QuantType.per_Token.value,
         activation.value,
-        0,  # splitk
+        config.ksplit,
     )
 
     return moe_buf
@@ -347,7 +344,7 @@ def _run_asm_moe_int8(
 ):
     M, _ = topk_ids.shape
     device = topk_ids.device
-    E, model_dim, inter_dim = w2.shape
+    _, model_dim, inter_dim = w2.shape
 
     # a8w8 fmoe, opt: smooth quant
     a8_type = (
@@ -417,7 +414,7 @@ def _run_asm_moe_int8(
 
     # one stage
     if w2.shape[2] * lastdim_mul == w1.shape[1]:
-        fmoe_func = aiter.fmoe_int8_g1u0(
+        aiter.fmoe_int8_g1u0(
             moe_buf,
             a8,
             w1,
@@ -579,7 +576,6 @@ def _run_asm_moe_block_scale(
     a1_q = a1_q.view(-1, model_dim)
     a1_scale = a1_scale.squeeze(-1).t().contiguous()
 
-    scale_blk_n, scale_blk_k = block_shape
     aiter.fmoe_fp8_blockscale_g1u1(
         moe_buf,
         a1_q,
@@ -713,6 +709,7 @@ def asm_moe(
             model_dim,
         )
     else:
+        # a8 w8/4
         return _run_asm_moe_int8(
             hidden_states,
             w1,
