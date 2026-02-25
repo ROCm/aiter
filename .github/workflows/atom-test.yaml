@@ -104,7 +104,7 @@ jobs:
             fi
 
             echo -e "\n===== Resetting GPU ====="
-            sudo rocm-smi --gpureset
+            sudo rocm-smi --gpureset -d 0
             echo -e "\n===== GPU Reset Complete ====="
             sudo rocm-smi --showpids
 
