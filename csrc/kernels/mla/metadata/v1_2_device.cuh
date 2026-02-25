@@ -135,6 +135,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     int32_t partial_idx        = 0;
     int32_t tot_qo_tiles       = 0;
     int32_t last_reduce_indptr = 0;
+    bool cur_tail_done = false;
 
     for(int32_t cid = 0; cid < params.num_cu; ++cid)
     {
@@ -149,7 +150,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
             const int32_t remain_kv_blocks = num_kv_blocks - curr_kv_block;
 
             // If current cu part is able to handle this batch of seqences
-            if(remain_payload >= (remain_kv_blocks + params.fixed_over_head_num_blocks))
+            if(remain_payload >= (remain_kv_blocks + params.fixed_over_head_num_blocks) || cur_tail_done)
             {
                 const int32_t num_splits = curr_n_split_idx + 1;
 
@@ -179,6 +180,10 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                         work_info.kv_end = ck_tile::min(
                             work_info.kv_start + (remain_kv_blocks * params.kv_granularity),
                             curr_kv_end - batch_tail);
+                        if (curr_kv_end - work_info.kv_end < 4 || cur_tail_done)
+                        {
+                            work_info.kv_end = curr_kv_end;
+                        }
                         work_info.kv_offset = curr_kv_end - work_info.kv_end;
                     }
                     else
@@ -272,12 +277,14 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                         }
                         curr_kv_block    = 0;
                         curr_n_split_idx = 0;
+                        cur_tail_done = false;
                     }
                 }
                 else
                 {
                     curr_kv_block    = 0;
                     curr_n_split_idx = 0;
+                    cur_tail_done = false;
                 }
             }
             else
@@ -312,6 +319,11 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                             work_info.kv_end = ck_tile::min(
                                 work_info.kv_start + (consuming_blks * params.kv_granularity),
                                 curr_kv_end - batch_tail);
+                            if (curr_kv_end - work_info.kv_end < 4)
+                            {
+                                cur_tail_done = true;
+                                work_info.kv_end = curr_kv_end;
+                            }
                             work_info.kv_offset = curr_kv_end - work_info.kv_end;
                         }
                         else
@@ -326,18 +338,23 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                                        params.p_kv_last_page_lens[curr_batch]);
                         }
                         work_info.partial_qo_loc   = partial_idx;
-                        p_work_info_set[num_works] = work_info;
+                        if (!cur_tail_done)
+                        {
+                            p_work_info_set[num_works] = work_info;
+                        }
                     };
 
                     // record a work in work_info_set
                     fill_work_info();
+                    if (!cur_tail_done)
+                    {
+                        partial_idx += qo_tile_size;
+                        num_works += 1;
 
-                    partial_idx += qo_tile_size;
-                    num_works += 1;
-
-                    // update state
-                    curr_kv_block += consuming_blks;
-                    ++curr_n_split_idx;
+                        // update state
+                        curr_kv_block += consuming_blks;
+                        ++curr_n_split_idx;
+                    }
                 }
                 break;
             }
