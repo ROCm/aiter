@@ -134,9 +134,9 @@ void _all_reduce(
     switch(out.scalar_type())
     {
     case at::ScalarType::Float: {
-        fa->allreduce<float>(stream,
-                             reinterpret_cast<float*>(inp.data_ptr()),
-                             reinterpret_cast<float*>(out.data_ptr()),
+        fa->allreduce<opus::fp32_t>(stream,
+                             reinterpret_cast<opus::fp32_t*>(inp.data_ptr()),
+                             reinterpret_cast<opus::fp32_t*>(out.data_ptr()),
                              out.numel(), use_new, is_broadcast_reg_outptr);
         break;
     }
@@ -147,25 +147,25 @@ void _all_reduce(
          * */
         if(open_fp8_quant && out.numel() >= 128 * 2048)
         {
-            fa->runFp8QuantKernel<half>(stream,
-                                        reinterpret_cast<half*>(inp.data_ptr()),
-                                        reinterpret_cast<half*>(out.data_ptr()),
+            fa->runFp8QuantKernel<opus::fp16_t>(stream,
+                                        reinterpret_cast<opus::fp16_t*>(inp.data_ptr()),
+                                        reinterpret_cast<opus::fp16_t*>(out.data_ptr()),
                                         out.numel());
         }
         else
         {
-            fa->allreduce<half>(stream,
-                                reinterpret_cast<half*>(inp.data_ptr()),
-                                reinterpret_cast<half*>(out.data_ptr()),
+            fa->allreduce<opus::fp16_t>(stream,
+                                reinterpret_cast<opus::fp16_t*>(inp.data_ptr()),
+                                reinterpret_cast<opus::fp16_t*>(out.data_ptr()),
                                 out.numel(), use_new, is_broadcast_reg_outptr);
         }
         break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
     case at::ScalarType::BFloat16: {
-        fa->allreduce<__hip_bfloat16>(stream,
-                                      reinterpret_cast<__hip_bfloat16*>(inp.data_ptr()),
-                                      reinterpret_cast<__hip_bfloat16*>(out.data_ptr()),
+        fa->allreduce<opus::bf16_t>(stream,
+                                      reinterpret_cast<opus::bf16_t*>(inp.data_ptr()),
+                                      reinterpret_cast<opus::bf16_t*>(out.data_ptr()),
                                       out.numel(), use_new);
         break;
     }
@@ -273,24 +273,24 @@ void _reduce_scatter(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int siz
     switch(out.scalar_type())
     {
     case at::ScalarType::Float: {
-        fa->dispatchReduceScatter<float>(stream,
-                                     reinterpret_cast<float*>(inp.data_ptr()),
-                                     reinterpret_cast<float*>(out.data_ptr()),
+        fa->dispatchReduceScatter<opus::fp32_t>(stream,
+                                     reinterpret_cast<opus::fp32_t*>(inp.data_ptr()),
+                                     reinterpret_cast<opus::fp32_t*>(out.data_ptr()),
                                      size);
         break;
     }
     case at::ScalarType::Half: {
-        fa->dispatchReduceScatter<half>(stream,
-                                    reinterpret_cast<half*>(inp.data_ptr()),
-                                    reinterpret_cast<half*>(out.data_ptr()),
+        fa->dispatchReduceScatter<opus::fp16_t>(stream,
+                                    reinterpret_cast<opus::fp16_t*>(inp.data_ptr()),
+                                    reinterpret_cast<opus::fp16_t*>(out.data_ptr()),
                                     size);
         break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
     case at::ScalarType::BFloat16: {
-        fa->dispatchReduceScatter<__hip_bfloat16>(stream,
-                                              reinterpret_cast<__hip_bfloat16*>(inp.data_ptr()),
-                                              reinterpret_cast<__hip_bfloat16*>(out.data_ptr()),
+        fa->dispatchReduceScatter<opus::bf16_t>(stream,
+                                              reinterpret_cast<opus::bf16_t*>(inp.data_ptr()),
+                                              reinterpret_cast<opus::bf16_t*>(out.data_ptr()),
                                               size);
         break;
     }
@@ -336,24 +336,24 @@ void _all_gather(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int size, h
     switch(out.scalar_type())
     {
     case at::ScalarType::Float: {
-        fa->dispatchAllGather<float>(stream,
-                                     reinterpret_cast<float*>(inp.data_ptr()),
-                                     reinterpret_cast<float*>(out.data_ptr()),
+        fa->dispatchAllGather<opus::fp32_t>(stream,
+                                     reinterpret_cast<opus::fp32_t*>(inp.data_ptr()),
+                                     reinterpret_cast<opus::fp32_t*>(out.data_ptr()),
                                      size);
         break;
     }
     case at::ScalarType::Half: {
-        fa->dispatchAllGather<half>(stream,
-                                    reinterpret_cast<half*>(inp.data_ptr()),
-                                    reinterpret_cast<half*>(out.data_ptr()),
+        fa->dispatchAllGather<opus::fp16_t>(stream,
+                                    reinterpret_cast<opus::fp16_t*>(inp.data_ptr()),
+                                    reinterpret_cast<opus::fp16_t*>(out.data_ptr()),
                                     size);
         break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
     case at::ScalarType::BFloat16: {
-        fa->dispatchAllGather<__hip_bfloat16>(stream,
-                                              reinterpret_cast<__hip_bfloat16*>(inp.data_ptr()),
-                                              reinterpret_cast<__hip_bfloat16*>(out.data_ptr()),
+        fa->dispatchAllGather<opus::bf16_t>(stream,
+                                              reinterpret_cast<opus::bf16_t*>(inp.data_ptr()),
+                                              reinterpret_cast<opus::bf16_t*>(out.data_ptr()),
                                               size);
         break;
     }
@@ -440,16 +440,16 @@ void _fused_allreduce_rmsnorm(fptr_t _fa,
     switch(residual_inp.scalar_type())
     {
     case at::ScalarType::Float: {
-        DISPATCH_AR_FUSION(float)
+        DISPATCH_AR_FUSION(opus::fp32_t)
         break;
     }
     case at::ScalarType::Half: {
-        DISPATCH_AR_FUSION(half)
+        DISPATCH_AR_FUSION(opus::fp16_t)
         break;
     }
 #if(__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
     case at::ScalarType::BFloat16: {
-        DISPATCH_AR_FUSION(__hip_bfloat16)
+        DISPATCH_AR_FUSION(opus::bf16_t)
         break;
     }
 #endif

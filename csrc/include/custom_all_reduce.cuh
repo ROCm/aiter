@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 #include "aiter_hip_common.h"
-#include "ck_tile/core.hpp"
+#include "opus/opus.hpp"
 #include "communication_asm.h"
 #include "hip_float8.h"
 #include <hip/hip_bf16.h>
@@ -78,39 +78,57 @@ struct packed_t
 #define DINLINE __device__ __forceinline__
 
 // scalar cast functions
-DINLINE float upcast_s(half val) { return __half2float(val); }
-
-template <typename T>
-DINLINE T downcast_s(float val);
-template <>
-DINLINE half downcast_s(float val)
+template <typename inp_dtype>
+DINLINE opus::fp32_t upcast_s(inp_dtype val)
 {
-    return __float2half(val);
+    return opus::cast<opus::fp32_t>(val);
+}
+
+template <>
+DINLINE opus::fp32_t upcast_s<opus::fp32_t>(opus::fp32_t val)
+{
+    return val;
+}
+
+template <>
+DINLINE opus::fp32_t upcast_s<opus::fp8_t>(opus::fp8_t val)
+{
+    return float(hip_fp8(static_cast<uint8_t>(val), hip_fp8::from_bits()));
+}
+
+template <typename out_dtype>
+DINLINE out_dtype downcast_s(opus::fp32_t val)
+{
+    return opus::cast<out_dtype>(val);
+}
+
+template <>
+DINLINE opus::fp32_t downcast_s<opus::fp32_t>(opus::fp32_t val)
+{
+    return val;
+}
+
+template <>
+DINLINE opus::fp8_t downcast_s<opus::fp8_t>(opus::fp32_t val)
+{
+    return static_cast<opus::fp8_t>(hip_fp8(val).data);
 }
 
 // scalar add functions
 // for some reason when compiling with Pytorch, the + operator for half and
 // bfloat is disabled so we call the intrinsics directly
-DINLINE half& assign_add(half& a, half b)
+template <typename T>
+DINLINE T& assign_add(T& a, T b)
 {
-    a = __hadd(a, b);
+    a = downcast_s<T>(upcast_s(a) + upcast_s(b));
     return a;
 }
-DINLINE float& assign_add(float& a, float b) { return a += b; }
 
-#if(__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
-DINLINE float upcast_s(__hip_bfloat16 val) { return __bfloat162float(val); }
 template <>
-DINLINE __hip_bfloat16 downcast_s(float val)
+DINLINE opus::fp32_t& assign_add(opus::fp32_t& a, opus::fp32_t b)
 {
-    return __float2bfloat16(val);
+    return a += b;
 }
-DINLINE __hip_bfloat16& assign_add(__hip_bfloat16& a, __hip_bfloat16 b)
-{
-    a = __hadd(a, b);
-    return a;
-}
-#endif
 
 template <typename T, int N>
 DINLINE array_t<T, N>& packed_assign_add(array_t<T, N>& a, array_t<T, N> b)
@@ -431,7 +449,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
             for(int i = 0; i < pack_size; ++i)
             {
                 add_reg.data[i] =
-                    ck_tile::type_convert<float>(tmp_smem[threadIdx.x * pack_size + i]);
+                    upcast_s(tmp_smem[threadIdx.x * pack_size + i]);
             }
             constexpr int smem_gpu_loop_stride = tnum_gpu * pack_size;
 #pragma unroll
@@ -440,7 +458,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
 #pragma unroll
                 for(int j = 0; j < pack_size; ++j)
                 {
-                    add_reg.data[j] += ck_tile::type_convert<float>(
+                    add_reg.data[j] += upcast_s(
                         tmp_smem[smem_gpu_loop_stride * i + threadIdx.x * pack_size + j]);
                 }
             }
@@ -448,7 +466,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
 #pragma unroll
             for(int i = 0; i < pack_size; ++i)
             {
-                write_reg.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
+                write_reg.data[i] = downcast_s<T>(add_reg.data[i]);
             }
             ((P*)result)[idx] = write_reg;
         }
@@ -507,7 +525,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
             for(int i = 0; i < pack_size; ++i)
             {
                 add_reg.data[i] =
-                    ck_tile::type_convert<float>(tmp_smem[pack_size * threadIdx.x + i]);
+                    upcast_s(tmp_smem[pack_size * threadIdx.x + i]);
             }
             constexpr int smem_gpu_loop_stride = tnum_gpu * pack_size;
 #pragma unroll
@@ -516,7 +534,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
 #pragma unroll
                 for(int j = 0; j < pack_size; ++j)
                 {
-                    add_reg.data[j] += ck_tile::type_convert<float>(
+                    add_reg.data[j] += upcast_s(
                         tmp_smem[i * smem_gpu_loop_stride + pack_size * threadIdx.x + j]);
                 }
             }
@@ -524,7 +542,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
 #pragma unroll
             for(int i = 0; i < pack_size; ++i)
             {
-                write_reg.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
+                write_reg.data[i] = downcast_s<T>(add_reg.data[i]);
             }
             tmp_out[idx - start] = write_reg;
         }
@@ -609,7 +627,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_write_mode(
             for(int i = 0; i < pack_size; ++i)
             {
                 add_reg.data[i] =
-                    ck_tile::type_convert<float>(tmp_smem[pack_size * threadIdx.x + i]);
+                    upcast_s(tmp_smem[pack_size * threadIdx.x + i]);
             }
             constexpr int smem_gpu_loop_stride = tnum_gpu * pack_size;
 #pragma unroll
@@ -618,7 +636,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_write_mode(
 #pragma unroll
                 for(int j = 0; j < pack_size; ++j)
                 {
-                    add_reg.data[j] += ck_tile::type_convert<float>(
+                    add_reg.data[j] += upcast_s(
                         tmp_smem[i * smem_gpu_loop_stride + pack_size * threadIdx.x + j]);
                 }
             }
@@ -626,7 +644,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_write_mode(
 #pragma unroll
             for(int i = 0; i < pack_size; ++i)
             {
-                write_reg.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
+                write_reg.data[i] = downcast_s<T>(add_reg.data[i]);
             }
             *(reinterpret_cast<P*>(&res_smem[0]) + lane_id) = write_reg;
         }
@@ -755,7 +773,7 @@ struct Fp16Filter
 };
 
 template <>
-struct Fp16Filter<half>
+struct Fp16Filter<opus::fp16_t>
 {
     static const bool value = true;
 };
@@ -767,7 +785,7 @@ struct Bf16Filter
 };
 
 template <>
-struct Bf16Filter<__hip_bfloat16>
+struct Bf16Filter<opus::bf16_t>
 {
     static const bool value = true;
 };
@@ -806,28 +824,20 @@ DINLINE array_t<T, size> packOp(array_t<T, size> a, array_t<T, size> b)
 template <typename T>
 struct AddFunctor
 {
-    DINLINE T operator()(T a, T b) { return a + b; }
-};
-
-template <>
-struct AddFunctor<half>
-{
-    DINLINE half operator()(half a, half b)
+    DINLINE T operator()(T a, T b)
     {
-        float a_fp32 = ck_tile::type_convert<float>(a);
-        float b_fp32 = ck_tile::type_convert<float>(b);
-        return ck_tile::type_convert<half>(a_fp32 + b_fp32);
+        opus::fp32_t a_fp32 = upcast_s(a);
+        opus::fp32_t b_fp32 = upcast_s(b);
+        return downcast_s<T>(a_fp32 + b_fp32);
     }
 };
 
 template <>
-struct AddFunctor<__hip_bfloat16>
+struct AddFunctor<opus::fp32_t>
 {
-    DINLINE __hip_bfloat16 operator()(__hip_bfloat16 a, __hip_bfloat16 b)
+    DINLINE opus::fp32_t operator()(opus::fp32_t a, opus::fp32_t b)
     {
-        float a_fp32 = ck_tile::type_convert<float>(a);
-        float b_fp32 = ck_tile::type_convert<float>(b);
-        return ck_tile::type_convert<__hip_bfloat16>(a_fp32 + b_fp32);
+        return a + b;
     }
 };
 
@@ -849,7 +859,7 @@ struct AbsMaxFunctor
 {
     DINLINE T operator()(T a, T b)
     {
-        T zero_t = ck_tile::type_convert<T>(0.0f);
+        T zero_t = downcast_s<T>(0.0f);
         a        = a > zero_t ? a : zero_t - a;
         b        = b > zero_t ? b : zero_t - b;
         return max(a, b);
@@ -873,14 +883,13 @@ DINLINE T warpReduce(T val)
 template <typename T>
 DINLINE hip_fp8 elementQuant(T input, T scale_functor)
 {
-    return hip_fp8(ck_tile::type_convert<float>(input) /
-                   ck_tile::type_convert<float>(scale_functor));
+    return hip_fp8(upcast_s(input) / upcast_s(scale_functor));
 }
 
 template <typename T>
 DINLINE T elementDequant(hip_fp8 input, T scale_functor)
 {
-    return ck_tile::type_convert<T>(float(input) * ck_tile::type_convert<float>(scale_functor));
+    return downcast_s<T>(float(input) * upcast_s(scale_functor));
 }
 
 template <typename T, int pack_size>
@@ -915,7 +924,7 @@ DINLINE array_t<float, pack_size> packUpcast(array_t<T, pack_size> inp)
 #pragma unroll
     for(int i = 0; i < pack_size; ++i)
     {
-        ret_val.data[i] = ck_tile::type_convert<float>(inp.data[i]);
+        ret_val.data[i] = upcast_s(inp.data[i]);
     }
     return ret_val;
 }
@@ -927,7 +936,7 @@ DINLINE array_t<T, pack_size> packDowncast(array_t<float, pack_size> inp)
 #pragma unroll
     for(int i = 0; i < pack_size; ++i)
     {
-        ret_val.data[i] = ck_tile::type_convert<T>(inp.data[i]);
+        ret_val.data[i] = downcast_s<T>(inp.data[i]);
     }
     return ret_val;
 }
@@ -957,7 +966,7 @@ template <typename T, int quant_scale, int pack_size, int ngpus, FP16_FILTER>
 __global__ __forceinline__ void __launch_bounds__(512, 1) allReduceQuantFp8(
     RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size)
 {
-    float FP8_UPBOUND = ck_tile::type_convert<float>(ck_tile::numeric<ck_tile::fp8_t>::max());
+    float FP8_UPBOUND = float(hip_fp8(0x77, hip_fp8::from_bits()));
     int tid           = blockIdx.x * blockDim.x + threadIdx.x;
     int stride        = gridDim.x * blockDim.x;
     using inp_pack    = array_t<T, pack_size>;
@@ -988,7 +997,7 @@ __global__ __forceinline__ void __launch_bounds__(512, 1) allReduceQuantFp8(
         T thread_max = packReduce<AbsMaxFunctor, T, pack_size>(half8_reg);
         thread_max   = warpReduce<MaxFunctor, T, quant_scale / pack_size>(thread_max);
         T scale_factor =
-            ck_tile::type_convert<T>(ck_tile::type_convert<float>(thread_max) / FP8_UPBOUND);
+            downcast_s<T>(upcast_s(thread_max) / FP8_UPBOUND);
         tmp_out[idx - start] = packQuant<T, pack_size>(half8_reg, scale_factor);
         if(threadIdx.x % (quant_scale / pack_size) == 0)
         {
@@ -1061,7 +1070,7 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_store(
             for(int i = 0; i < pack_size; ++i)
             {
                 add_reg.data[i] =
-                    ck_tile::type_convert<float>(tmp_smem[pack_size * threadIdx.x + i]);
+                    upcast_s(tmp_smem[pack_size * threadIdx.x + i]);
             }
 #pragma unroll
             for(int i = 1; i < ngpus; ++i)
@@ -1069,7 +1078,7 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_store(
 #pragma unroll
                 for(int j = 0; j < pack_size; ++j)
                 {
-                    add_reg.data[j] += ck_tile::type_convert<float>(
+                    add_reg.data[j] += upcast_s(
                         tmp_smem[i * pack_size * tnum_gpu + pack_size * threadIdx.x + j]);
                 }
             }
@@ -1077,7 +1086,7 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_store(
 #pragma unroll
             for(int i = 0; i < pack_size; ++i)
             {
-                add_rslt.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
+                add_rslt.data[i] = downcast_s<T>(add_reg.data[i]);
             }
             *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id) = add_rslt;
         }
@@ -1154,8 +1163,8 @@ __global__ void __launch_bounds__(tnum, 1)
 #pragma unroll
             for(int i = 0; i < pack_size; ++i)
             {
-                float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
-                float ar_out  = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
+                float res_inp = upcast_s(residual_inp_pack.data[i]);
+                float ar_out  = upcast_s(reduce_out_pack.data[i]);
                 float rms_inp = res_inp + ar_out;
                 rms_inp_f32[n_iter].data[i] = rms_inp;
                 reduce_pack.data[i]         = rms_inp * rms_inp;
@@ -1176,9 +1185,9 @@ __global__ void __launch_bounds__(tnum, 1)
             for(int i = 0; i < pack_size; ++i)
             {
                 float x_f32          = rms_inp_f32[n_iter].data[i];
-                float w_f32          = ck_tile::type_convert<float>(w_arr[n_iter].data[i]);
-                rmsnorm_inp.data[i]  = ck_tile::type_convert<T>(x_f32);
-                rmsnorm_rslt.data[i] = ck_tile::type_convert<T>(x_f32 * w_f32 * denom);
+                float w_f32          = upcast_s(w_arr[n_iter].data[i]);
+                rmsnorm_inp.data[i]  = downcast_s<T>(x_f32);
+                rmsnorm_rslt.data[i] = downcast_s<T>(x_f32 * w_f32 * denom);
             }
             int write_idx = bid * n_loop * blockDim.x + n_iter * blockDim.x + threadIdx.x;
             *(reinterpret_cast<P*>(results) + write_idx)      = rmsnorm_rslt;
@@ -1226,8 +1235,8 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
 #pragma unroll
                 for(int i = 0; i < pack_size; ++i)
                 {
-                    float ar_out  = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
-                    float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
+                    float ar_out  = upcast_s(reduce_out_pack.data[i]);
+                    float res_inp = upcast_s(residual_inp_pack.data[i]);
                     float rms_inp = ar_out + res_inp;
                     rms_inp_f32[n_iter].data[i] = rms_inp;
                     reduce_pack.data[i]         = rms_inp * rms_inp;
@@ -1251,9 +1260,9 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
                 for(int i = 0; i < pack_size; ++i)
                 {
                     float x_f32          = rms_inp_f32[n_iter].data[i];
-                    float w_f32          = ck_tile::type_convert<float>(w_arr[n_iter].data[i]);
-                    rmsnorm_inp.data[i]  = ck_tile::type_convert<T>(x_f32);
-                    rmsnorm_rslt.data[i] = ck_tile::type_convert<T>(x_f32 * w_f32 * denom);
+                    float w_f32          = upcast_s(w_arr[n_iter].data[i]);
+                    rmsnorm_inp.data[i]  = downcast_s<T>(x_f32);
+                    rmsnorm_rslt.data[i] = downcast_s<T>(x_f32 * w_f32 * denom);
                 }
                 int write_idx = bid * (n / pack_size) + n_iter * tnum + threadIdx.x;
                 *(reinterpret_cast<P*>(results) + write_idx)      = rmsnorm_rslt;
@@ -1299,8 +1308,8 @@ __global__ void __launch_bounds__(256, 1)
 #pragma unroll
             for(int i = 0; i < pack_size; ++i)
             {
-                float ar_out  = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
-                float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
+                float ar_out  = upcast_s(reduce_out_pack.data[i]);
+                float res_inp = upcast_s(residual_inp_pack.data[i]);
                 float rms_inp = ar_out + res_inp;
                 rms_inp_f32[n_iter].data[i] = rms_inp;
                 reduce_pack.data[i]         = rms_inp * rms_inp;
@@ -1319,9 +1328,9 @@ __global__ void __launch_bounds__(256, 1)
             for(int i = 0; i < pack_size; ++i)
             {
                 float x_f32          = rms_inp_f32[n_iter].data[i];
-                float w_f32          = ck_tile::type_convert<float>(w_arr[n_iter].data[i]);
-                rmsnorm_inp.data[i]  = ck_tile::type_convert<T>(x_f32);
-                rmsnorm_rslt.data[i] = ck_tile::type_convert<T>(x_f32 * w_f32 * denom);
+                float w_f32          = upcast_s(w_arr[n_iter].data[i]);
+                rmsnorm_inp.data[i]  = downcast_s<T>(x_f32);
+                rmsnorm_rslt.data[i] = downcast_s<T>(x_f32 * w_f32 * denom);
             }
             int write_idx = bid * 64 * n_loop + n_iter * 64 + lane_id;
             *(reinterpret_cast<P*>(results) + write_idx)      = rmsnorm_rslt;
@@ -1355,7 +1364,7 @@ __device__ __forceinline__ void ar_fusion_epilogue_rms_norm(O &out, A &in, P &we
     float acc = 0.f;
 #pragma unroll
     for (int i = 0; i < PACK_SIZE; ++i) {
-        float v = ck_tile::type_convert<float>(in.data[i]);
+        float v = upcast_s(in.data[i]);
         acc += v * v;
     }
     acc = ar_fusion_epilogue_block_reduce<AddFunctor, float, BLOCK_SIZE, WARP_SIZE>(acc);
@@ -1365,8 +1374,8 @@ __device__ __forceinline__ void ar_fusion_epilogue_rms_norm(O &out, A &in, P &we
     __syncthreads();
 #pragma unroll
     for (int i = 0; i < PACK_SIZE; ++i) {
-        float out_ = in.data[i] * s_val * ck_tile::type_convert<float>(weight.data[i]);
-        out.data[i] = ck_tile::type_convert<OT>(out_);
+        float out_ = in.data[i] * s_val * upcast_s(weight.data[i]);
+        out.data[i] = downcast_s<OT>(out_);
     }
 }
 
@@ -1378,7 +1387,7 @@ __device__ __forceinline__ float ar_fusion_epilogue_reduce_abs_max(A &data)
     float acc = -1.f;
 #pragma unroll
     for (int i = 0; i < PACK_SIZE; ++i) {
-        float v = ck_tile::type_convert<float>(data.data[i]);
+        float v = upcast_s(data.data[i]);
         acc = fn(acc, std::abs(v));
     }
     acc = ar_fusion_epilogue_block_reduce<MaxFunctor, float, BLOCK_SIZE, WARP_SIZE>(acc);
@@ -1406,7 +1415,7 @@ __device__ __forceinline__ void ar_fusion_epilogue(
         ar_fusion_epilogue_rms_norm<P, A, P, T, PACK_SIZE, BLOCK_SIZE>(out, in, weight, eps, hidden_dim);
         *reinterpret_cast<P *>(output + idx) = out;
     } else {
-        float FP8_UPBOUND = ck_tile::type_convert<float>(ck_tile::numeric<ck_tile::fp8_t>::max());
+        float FP8_UPBOUND = float(hip_fp8(0x77, hip_fp8::from_bits()));
         using OP = array_t<OutT, PACK_SIZE>;
         OP out_quant;
         A out;
@@ -1415,8 +1424,8 @@ __device__ __forceinline__ void ar_fusion_epilogue(
         float scale = amax == 0.f ? 1.f : amax / FP8_UPBOUND;
 #pragma unroll
         for (int i = 0; i < PACK_SIZE; ++i) {
-            float out_scaled = ck_tile::type_convert<float>(out.data[i]) / scale;
-            out_quant.data[i] = ck_tile::type_convert<OutT>(out_scaled);
+            float out_scaled = upcast_s(out.data[i]) / scale;
+            out_quant.data[i] = downcast_s<OutT>(out_scaled);
         }
         *reinterpret_cast<OP *>(output + idx) = out_quant;
         if (threadIdx.x == 0)
@@ -1460,7 +1469,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1) allreduce_fusion_kernel_1stage(
     P vec = ptrs[0][idx / pack_size];
 #pragma unroll
     for (int v = 0; v < pack_size; ++v) {
-        acc.data[v] = ck_tile::type_convert<float>(vec.data[v]);
+        acc.data[v] = upcast_s(vec.data[v]);
     }
 
 #pragma unroll
@@ -1468,7 +1477,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1) allreduce_fusion_kernel_1stage(
         vec = ptrs[r][idx / pack_size];
 #pragma unroll
         for (int v = 0; v < pack_size; ++v) {
-            acc.data[v] += ck_tile::type_convert<float>(vec.data[v]);
+            acc.data[v] += upcast_s(vec.data[v]);
         }
     }
 
@@ -1476,12 +1485,12 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1) allreduce_fusion_kernel_1stage(
 
 #pragma unroll
     for (int v = 0; v < pack_size; ++v) {
-        acc.data[v] += ck_tile::type_convert<float>(res.data[v]);
+        acc.data[v] += upcast_s(res.data[v]);
     }
 
 #pragma unroll
     for (int v = 0; v < pack_size; ++v) {
-        vec.data[v] = ck_tile::type_convert<T>(acc.data[v]);
+        vec.data[v] = downcast_s<T>(acc.data[v]);
     }
 
     *reinterpret_cast<P *>(residual_out + idx) = vec;
@@ -1561,7 +1570,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1)
 #pragma unroll
             for(int v = 0; v < pack_size; ++v)
             {
-                acc.data[v] = ck_tile::type_convert<float>(vec.data[v]);
+                acc.data[v] = upcast_s(vec.data[v]);
             }
 #pragma unroll
             for(int r = 1; r < ngpus; ++r)
@@ -1570,13 +1579,13 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1)
 #pragma unroll
                 for(int v = 0; v < pack_size; ++v)
                 {
-                    acc.data[v] += ck_tile::type_convert<float>(vec.data[v]);
+                    acc.data[v] += upcast_s(vec.data[v]);
                 }
             }
 #pragma unroll
             for(int v = 0; v < pack_size; ++v)
             {
-                vec.data[v] = ck_tile::type_convert<T>(acc.data[v]);
+                vec.data[v] = downcast_s<T>(acc.data[v]);
             }
             tmp_smem[lane_id] = vec;
         }
@@ -1602,7 +1611,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1)
 #pragma unroll
         for(int v = 0; v < pack_size; ++v)
         {
-            acc.data[v] = ck_tile::type_convert<float>(vec.data[v]);
+            acc.data[v] = upcast_s(vec.data[v]);
         }
         ar_fusion_epilogue<P, A, T, OutT, pack_size, BLOCK_SIZE>(
             acc, weight_p, hidden_dim, eps, idx, tidx, output, scale_out);
@@ -1678,7 +1687,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1)
 #pragma unroll
         for(int v = 0; v < pack_size; ++v)
         {
-            acc.data[v] = ck_tile::type_convert<float>(vec.data[v]);
+            acc.data[v] = upcast_s(vec.data[v]);
         }
         ar_fusion_epilogue<P, A, T, OutT, pack_size, BLOCK_SIZE>(
             acc, weight_p, hidden_dim, eps, idx, tidx, output, scale_out);
