@@ -93,6 +93,9 @@ jobs:
         run: |
             echo -e "\n=== GPU Memory Status ==="
             if command -v rocm-smi &> /dev/null; then
+              echo -e "\n=== GPU Overview ==="
+              rocm-smi
+              echo -e "\n=== GPU Memory Status ==="
               rocm-smi --showmeminfo vram
               echo -e "\n=== GPU Processes ==="
               rocm-smi --showpidgpus
