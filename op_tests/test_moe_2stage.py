@@ -293,7 +293,7 @@ parser.add_argument(
     type=dtypes.str2Dtype,
     choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp16"]],
     nargs="*",
-    default=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp16"]],
+    default=[dtypes.d_dtypes["bf16"]],
     metavar="{bf16, fp16}",
     help="""Data type.
     e.g.: -d bf16""",
@@ -351,9 +351,9 @@ parser.add_argument(
     "--act",
     type=dtypes.str2ActivationType,
     nargs="*",
-    default=[aiter.ActivationType.Silu, aiter.ActivationType.Gelu],
-    help="""Select activation type. Default: [Silu, Gelu].
-    e.g.: -a silu         # [Silu]
+    default=[aiter.ActivationType.Silu],
+    help="""Select activation type. Default: [Silu].
+    e.g.: -a gelu        # [Gelu]
           -a silu gelu    # [Silu, Gelu]""",
 )
 
@@ -362,8 +362,8 @@ parser.add_argument(
     "--doweight_stage1",
     type=dtypes.str2bool,
     nargs="*",
-    default=[False, True],
-    help="""Whether to do weight in stage 1. Default is [False, True].
+    default=[False],
+    help="""Whether to do weight in stage 1. Default is [False].
     -s f    # False.
     -s t    # True.""",
 )
@@ -401,7 +401,7 @@ parser.add_argument(
     "--hidden_intermediate_pad",
     type=dtypes.str2tuple,
     nargs="*",
-    default=[(0, 0), (192, 128), (129, 191)],
+    default=[(192, 128)],
     help="""Hidden intermediate pad.
     e.g.: -hip 0,0""",
 )
