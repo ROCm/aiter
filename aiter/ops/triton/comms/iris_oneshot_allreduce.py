@@ -34,7 +34,7 @@ import triton.language as tl
 
 import logging
 
-__all__ = ["fused_allreduce_add_rms_quant_iris_opt"]
+__all__ = ["fused_allreduce_add_rms_quant_iris_oneshot"]
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +91,7 @@ def extract_group_info(
 # Autotune
 # ============================================================================
 
-IRIS_OPT_AUTOTUNE_KEYS = [
+IRIS_ONESHOT_AUTOTUNE_KEYS = [
     "M",
     "N",
     "HAS_RESIDUAL",
@@ -103,7 +103,7 @@ def _compute_chunk_size(comm_sms: int, num_xcds: int, swizzle_size: int = 4) -> 
     return min(chunk, comm_sms // num_xcds)
 
 
-def get_iris_opt_configs(autotune: bool):
+def get_iris_oneshot_configs(autotune: bool):
     num_xcds = iris.hip.get_num_xcc()
 
     if not autotune:
@@ -147,7 +147,7 @@ def get_iris_opt_configs(autotune: bool):
     return configs
 
 
-iris_opt_autotune_configs = get_iris_opt_configs(AUTOTUNE)
+iris_oneshot_autotune_configs = get_iris_oneshot_configs(AUTOTUNE)
 
 
 # ============================================================================
@@ -156,8 +156,8 @@ iris_opt_autotune_configs = get_iris_opt_configs(AUTOTUNE)
 
 
 @triton.autotune(
-    configs=iris_opt_autotune_configs,
-    key=IRIS_OPT_AUTOTUNE_KEYS,
+    configs=iris_oneshot_autotune_configs,
+    key=IRIS_ONESHOT_AUTOTUNE_KEYS,
     use_cuda_graph=True,
 )
 @triton.jit
@@ -313,21 +313,21 @@ def fused_allreduce_rmsnorm_quant_kernel(
 # ============================================================================
 
 
-class IrisOptManager:
+class IrisOneshotManager:
     """Singleton manager for fused one-shot AllReduce+RMSNorm+Quant."""
 
-    _instance: Optional["IrisOptManager"] = None
+    _instance: Optional["IrisOneshotManager"] = None
     _initialized: bool = False
 
-    def __new__(cls) -> "IrisOptManager":
+    def __new__(cls) -> "IrisOneshotManager":
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
 
     def __init__(self) -> None:
-        if IrisOptManager._initialized:
+        if IrisOneshotManager._initialized:
             return
-        IrisOptManager._initialized = True
+        IrisOneshotManager._initialized = True
 
         self._shmem: Any = None
         self._heap_size: int = 2**33  # 8GB default
@@ -353,7 +353,7 @@ class IrisOptManager:
     def initialize(self, heap_size: Optional[int] = None) -> None:
         """Initialize Iris symmetric heap (call once at startup)."""
         if self._shmem is not None:
-            logger.debug("Iris (opt) already initialized, skipping")
+            logger.debug("Iris (oneshot) already initialized, skipping")
             return
 
         if heap_size is not None:
@@ -365,14 +365,14 @@ class IrisOptManager:
             else 0
         )
         logger.info(
-            "Initializing Iris (opt) symmetric heap: "
+            "Initializing Iris (oneshot) symmetric heap: "
             f"rank={cur_rank}, heap_size={self._heap_size / 2**30:.1f}GB"
         )
 
         self._shmem = iris.iris(self._heap_size)
 
         logger.info(
-            f"Iris (opt) initialized successfully on rank {cur_rank}"
+            f"Iris (oneshot) initialized successfully on rank {cur_rank}"
         )
 
     @property
@@ -404,7 +404,7 @@ class IrisOptManager:
         # Need a (larger) buffer. Not safe during CUDA graph capture.
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                f"Iris (opt): input buffer too small for M={M} "
+                f"Iris (oneshot): input buffer too small for M={M} "
                 f"(allocated {self._input_M}). Cannot allocate during "
                 f"CUDA graph capture."
             )
@@ -422,7 +422,7 @@ class IrisOptManager:
             else 0
         )
         logger.info(
-            f"Iris (opt): allocated input buffer ({M}, {N}), "
+            f"Iris (oneshot): allocated input buffer ({M}, {N}), "
             f"dtype={dtype}, rank={cur_rank}"
         )
 
@@ -459,7 +459,7 @@ class IrisOptManager:
             if torch.cuda.is_current_stream_capturing():
                 existing = self._out_allreduce.shape[0] if self._out_allreduce is not None else 0
                 raise RuntimeError(
-                    f"Iris (opt): output buffers too small for M={M} "
+                    f"Iris (oneshot): output buffers too small for M={M} "
                     f"(allocated {existing}). Cannot allocate during "
                     f"CUDA graph capture."
                 )
@@ -482,7 +482,7 @@ class IrisOptManager:
                 else 0
             )
             logger.info(
-                f"Iris (opt): allocated output buffers ({M}, {N}), "
+                f"Iris (oneshot): allocated output buffers ({M}, {N}), "
                 f"dtype={dtype}, rank={cur_rank}"
             )
 
@@ -599,18 +599,18 @@ class IrisOptManager:
         return allreduce_out, rms_out, residual_out, quant_out, scale_out
 
 
-_iris_opt_manager: Optional[IrisOptManager] = None
+_iris_oneshot_manager: Optional[IrisOneshotManager] = None
 
 
-def get_iris_opt_manager() -> IrisOptManager:
-    """Get the global Iris opt manager instance."""
-    global _iris_opt_manager
-    if _iris_opt_manager is None:
-        _iris_opt_manager = IrisOptManager()
-    return _iris_opt_manager
+def get_iris_oneshot_manager() -> IrisOneshotManager:
+    """Get the global Iris oneshot manager instance."""
+    global _iris_oneshot_manager
+    if _iris_oneshot_manager is None:
+        _iris_oneshot_manager = IrisOneshotManager()
+    return _iris_oneshot_manager
 
 
-def initialize_iris_opt(heap_size: Optional[int] = None) -> None:
+def initialize_iris_oneshot(heap_size: Optional[int] = None) -> None:
     """Initialize Iris for fused all-reduce operations.
 
     Call this once at model load time before any forward passes.
@@ -618,10 +618,10 @@ def initialize_iris_opt(heap_size: Optional[int] = None) -> None:
     Args:
         heap_size: Size of symmetric heap in bytes (default: 8GB)
     """
-    get_iris_opt_manager().initialize(heap_size)
+    get_iris_oneshot_manager().initialize(heap_size)
 
 
-def fused_allreduce_add_rms_quant_iris_opt(
+def fused_allreduce_add_rms_quant_iris_oneshot(
     input: torch.Tensor,
     rms_weight: torch.Tensor,
     rms_eps: float,
@@ -642,7 +642,7 @@ def fused_allreduce_add_rms_quant_iris_opt(
     FP8 quantization. Two-pass persistent kernel computes the global amax
     across all rows, then quantizes with a single per-tensor scale.
     """
-    iris_mgr = get_iris_opt_manager()
+    iris_mgr = get_iris_oneshot_manager()
     return iris_mgr.fused_allreduce_rmsnorm_quant(
         input, rms_weight, rms_eps, quant_dtype, residual,
     )
