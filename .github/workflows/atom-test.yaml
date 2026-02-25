@@ -25,7 +25,7 @@ env:
 
 jobs:
   check-signal:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: github.event.pull_request == null || (github.event.pull_request.draft == false && github.event.action != 'ready_for_review')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -38,7 +38,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   atom_benchmark:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: github.event.pull_request == null || (github.event.pull_request.draft == false && github.event.action != 'ready_for_review')
     needs: [check-signal]
     name: ATOM Benchmark 
     strategy:

@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   check-signal:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: github.event.pull_request == null || (github.event.pull_request.draft == false && github.event.action != 'ready_for_review')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -31,7 +31,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   sglang:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: github.event.pull_request == null || (github.event.pull_request.draft == false && github.event.action != 'ready_for_review')
     name: Sglang Integration Test (1 GPU)
     needs: [check-signal]
     runs-on: ${{ matrix.runner }}
