@@ -284,7 +284,6 @@ setup(
     include_package_data=True,
     package_data={
         "": ["*"],
-        "aiter_meta": ["**/*"],
     },
     classifiers=[
         "Programming Language :: Python :: 3",
