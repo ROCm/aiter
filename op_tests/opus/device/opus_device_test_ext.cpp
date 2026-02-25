@@ -23,6 +23,7 @@
 #include "test_dtype_convert.h"
 #include "test_load_store_if.h"
 #include "test_mdiv.h"
+#include "test_numeric_limits.h"
 #include "test_workgroup_barrier.h"
 
 // ---------- MFMA wrapper ----------
@@ -405,6 +406,17 @@ static void run_mdiv_torch(
              static_cast<int>(divisor), n);
 }
 
+// ---------- numeric_limits wrapper ----------
+
+static void run_numeric_limits_torch(torch::Tensor Out)
+{
+    TORCH_CHECK(Out.is_cuda(), "Out must be a CUDA tensor");
+    TORCH_CHECK(Out.dtype() == torch::kInt32, "Out must be int32");
+    TORCH_CHECK(Out.numel() >= 55, "Out must have at least 55 elements");
+    TORCH_CHECK(Out.is_contiguous(), "Out must be contiguous");
+    run_numeric_limits(Out.data_ptr());
+}
+
 // ---------- workgroup_barrier wrappers ----------
 
 static void run_wb_cumulative_torch(torch::Tensor Accum, int64_t n_workgroups)
@@ -463,6 +475,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("run_predicated_async_load", &run_predicated_async_load_torch,
           "OPUS predicated async_load: copy Src -> LDS -> Dst with bounds predicate",
           py::arg("Src"), py::arg("Dst"), py::arg("n_padded"));
+    m.def("run_numeric_limits", &run_numeric_limits_torch,
+          "OPUS numeric_limits: writes min/max/lowest/quiet_nan/infinity bit patterns for all dtypes");
     m.def("run_mdiv", &run_mdiv_torch,
           "OPUS mdiv: magic division. out_q[i] = dividends[i]/divisor, "
           "out_r[i] = dividends[i]%divisor",

@@ -24,6 +24,7 @@ Covers:
   - predicated_copy: gmem load_if/store_if with boundary predicate (all GPUs)
   - free_func_vector_add: opus::load/store free function API (all GPUs)
   - predicated_async_load: gmem async_load_if with boundary predicate (all GPUs)
+  - numeric_limits: min/max/lowest/quiet_nan/infinity bitwise match against torch (all GPUs)
 """
 
 import glob
@@ -1118,6 +1119,118 @@ def test_mdiv(mod):
     return 0
 
 
+def test_numeric_limits(mod):
+    """Test opus::numeric_limits against torch reference values (bitwise comparison)."""
+    import struct
+
+    arch = _get_gpu_arch()
+    device = torch.device("cuda")
+
+    N = 55  # 11 types * 5 fields
+    out = torch.zeros(N, device=device, dtype=torch.int32)
+    mod.run_numeric_limits(out)
+    raw = [(out[i].item()) & 0xFFFFFFFF for i in range(N)]
+
+    fails = 0
+    fields = ["min", "max", "lowest", "quiet_nan", "infinity"]
+
+    def float_to_u32(f):
+        return struct.unpack("I", struct.pack("f", float(f)))[0]
+
+    def tensor_to_bits(t, size):
+        if size == 4:
+            return t.reshape(1).view(torch.int32).item() & 0xFFFFFFFF
+        elif size == 2:
+            return t.reshape(1).view(torch.int16).item() & 0xFFFF
+        else:
+            return t.reshape(1).view(torch.uint8).item()
+
+    def ref_float(dtype, size, has_inf):
+        fi = torch.finfo(dtype)
+        ref = {}
+        for field in fields:
+            if field == "min":
+                ref[field] = tensor_to_bits(
+                    torch.tensor(fi.tiny, dtype=dtype), size
+                )
+            elif field == "max":
+                ref[field] = tensor_to_bits(
+                    torch.tensor(fi.max, dtype=dtype), size
+                )
+            elif field == "lowest":
+                ref[field] = tensor_to_bits(
+                    torch.tensor(fi.min, dtype=dtype), size
+                )
+            elif field == "quiet_nan":
+                ref[field] = tensor_to_bits(
+                    torch.tensor(float("nan"), dtype=dtype), size
+                )
+            elif field == "infinity":
+                if not has_inf:
+                    ref[field] = 0
+                    continue
+                ref[field] = tensor_to_bits(
+                    torch.tensor(float("inf"), dtype=dtype), size
+                )
+        return ref
+
+    def ref_int(dtype, size):
+        ii = torch.iinfo(dtype)
+        mask = (1 << (size * 8)) - 1
+        return {
+            "min": ii.min & mask,
+            "max": ii.max & mask,
+            "lowest": ii.min & mask,
+            "quiet_nan": 0,
+            "infinity": 0,
+        }
+
+    fp8_dtype = _get_fp8_dtype()
+    bf8_dtype = _get_bf8_dtype()
+
+    # (name, offset, byte_size, is_float, torch_dtype, has_infinity)
+    type_table = [
+        ("fp32", 0, 4, True, torch.float32, True),
+        ("fp16", 5, 2, True, torch.float16, True),
+        ("bf16", 10, 2, True, torch.bfloat16, True),
+        ("fp8", 15, 1, True, fp8_dtype, False),
+        ("bf8", 20, 1, True, bf8_dtype, arch == "gfx950"),
+        ("i32", 25, 4, False, torch.int32, False),
+        ("i16", 35, 2, False, torch.int16, False),
+        ("i8", 45, 1, False, torch.int8, False),
+        ("u8", 50, 1, False, torch.uint8, False),
+    ]
+
+    for name, offset, size, is_float, dtype, has_inf in type_table:
+        if is_float:
+            ref = ref_float(dtype, size, has_inf)
+        else:
+            ref = ref_int(dtype, size)
+        mask = (1 << (size * 8)) - 1
+        width = size * 2
+        type_fails = 0
+        for j, field in enumerate(fields):
+            actual = raw[offset + j] & mask
+            expected = ref[field]
+            if actual != expected:
+                print(
+                    f"    {name}.{field}: 0x{actual:0{width}X} "
+                    f"!= expected 0x{expected:0{width}X}"
+                )
+                type_fails += 1
+        if type_fails == 0:
+            print(f"  PASS: numeric_limits<{name}> (all {len(fields)} fields)")
+        else:
+            print(f"  FAIL: numeric_limits<{name}> ({type_fails} field(s) wrong)")
+            fails += type_fails
+
+    if fails:
+        print(f"  numeric_limits: {fails} field(s) FAILED")
+        return 1
+    print(f"  PASS: numeric_limits all types correct")
+    return 0
+
+
 def test_wb_cumulative(mod):
     """Test workgroup_barrier wait_lt + inc: N workgroups contribute i+1 sequentially."""
     device = torch.device("cuda")
@@ -1214,6 +1327,7 @@ def main():
     failures += test_predicated_copy(mod)
     failures += test_free_func_vector_add(mod)
     failures += test_predicated_async_load(mod)
+    failures += test_numeric_limits(mod)
     failures += test_mdiv(mod)
     failures += test_wb_cumulative(mod)
     failures += test_wb_streamk_reduce(mod)
