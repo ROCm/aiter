@@ -24,10 +24,10 @@ Key design choice: `--server-extra-args` is a single string passed verbatim via 
 | `clear_caches` | Remove triton/vllm/comgr/torchinductor caches between runs |
 | `check_segfault` | Check exit code (132/134/139) and grep log for fault patterns |
 | `parse_client_output` | Grep `vllm bench serve` output for Median (preferred) or Mean metrics |
-| `start_server` | Launch `vllm serve` in background, capture PID |
+| `start_server` | Launch `vllm serve` in background, capture PID. Accepts optional trace dir arg; when provided, adds `--profiler-config` with torch profiler settings and sets `VLLM_RPC_TIMEOUT=1800000` |
 | `wait_for_server` | Poll for "Application startup complete." or `/v1/models` responding (30 min timeout) |
 | `kill_server` | SIGTERM + wait + segfault check |
-| `run_client` | Run `vllm bench serve` with given input/output/concurrency |
+| `run_client` | Run `vllm bench serve` with given input/output/concurrency. Accepts optional 5th arg (`1`/`0`) to enable `--profile` flag for trace collection |
 
 ### 3. Temp Files & EXIT Trap
 
@@ -42,13 +42,16 @@ This ensures results are always dumped, even on error or SIGTERM.
 
 Nested loop: outer over `INPUT_OUTPUT_COMBOS`, inner over `CONCURRENCIES`. Per iteration:
 1. Clear caches
-2. Start server + wait for ready
-3. Run warmup client (absorbs JIT, discarded)
-4. Run measurement client (results parsed)
-5. Kill server
-6. Append row to results CSV
+2. Compute per-config trace directory (if `--trace` enabled)
+3. Start server + wait for ready (with `--profiler-config` if tracing)
+4. Run warmup client WITHOUT `--profile` (absorbs JIT, discarded; profiling NOT active)
+5. Run measurement client WITH `--profile` if tracing (results parsed; uses `TRACE_PROMPTS_MULTIPLIER=1`)
+6. Kill server
+7. Append row to results CSV
 
 On server failure: record FAIL row, `continue` to next config.
+
+**Tracing flow detail:** The server starts with `--profiler-config '{"profiler": "torch", "torch_profiler_dir": "...", "torch_profiler_with_stack": false}'` which loads the profiler infrastructure. The warmup `vllm bench serve` run omits `--profile`, so no recording occurs. The measurement `vllm bench serve` run includes `--profile`, which signals the server to start/stop recording around the benchmark. This separation ensures warmup JIT overhead never appears in traces.
 
 ### 5. Output Format
 
@@ -113,6 +116,27 @@ case "$ENV_PRESET" in
 esac
 ```
 
+### Modifying trace collection behavior
+
+The tracing subsystem uses vLLM's built-in torch profiler support:
+
+- **Server**: `--profiler-config '{"profiler": "torch", "torch_profiler_dir": "...", ...}'` — tells vLLM to load profiler infrastructure and where to write trace files. Additional config keys control trace content (stacks, memory, shapes, FLOPs, gzip).
+- **Client**: `--profile` flag on `vllm bench serve` — signals the server to start/stop recording around the benchmark run automatically.
+- **`VLLM_RPC_TIMEOUT=1800000`**: Set when tracing to allow 30 minutes for trace flushing on large models.
+
+Key design decisions:
+1. **Per-config trace directories**: `<trace-dir>/in<I>_out<O>_conc<N>/` ensures trace files from different configs never collide.
+2. **Client-gated recording**: Warmup `vllm bench serve` runs without `--profile`, so no recording occurs. Measurement run uses `--profile` to capture only steady-state behavior.
+3. **Reduced prompts**: `TRACE_PROMPTS_MULTIPLIER=1` (hardcoded when `--trace` is active) keeps traces small. The normal `PROMPTS_MULTIPLIER` is saved/restored around the measurement run.
+4. **Minimal trace content**: `torch_profiler_with_stack: false` keeps traces lean. Can be re-enabled for debugging.
+5. **Server restart per config**: Each config gets a fresh server process, providing clean trace isolation.
+
+To customize:
+- Change `TRACE_PROMPTS_MULTIPLIER` to adjust trace size vs. representativeness.
+- Add `--trace-prompts-multiplier N` flag if you want user control over this.
+- Enable stack traces by setting `torch_profiler_with_stack: true` in the `--profiler-config` JSON (increases trace size significantly).
+- To collect traces only for specific configs, add filtering logic in the main loop before calling `run_client` with profile=1.
+
 ### Resuming a partial run
 
 To add resume support:
@@ -130,14 +154,19 @@ If the script is lost or needs a full rewrite, follow this skeleton:
 set -euo pipefail
 ulimit -c 0
 
-# 1. Parse args: --model (required), --tp, --combos, --concurrencies, etc.
+# 1. Parse args: --model (required), --tp, --combos, --concurrencies, --trace, --trace-dir, etc.
 # 2. Define: clear_caches, check_segfault, parse_client_output,
-#            start_server, wait_for_server, kill_server, run_client
+#            start_server (accepts optional trace_dir), wait_for_server, kill_server,
+#            run_client, start_profiling, stop_profiling
 # 3. Create temp files (mktemp). Register EXIT trap to dump results + cleanup.
 # 4. Write CSV header to results file.
 # 5. Nested loop: for combo in COMBOS; for conc in CONCURRENCIES:
-#      clear_caches -> start_server -> wait -> warmup -> measure -> kill -> parse -> record
-# 6. EXIT trap dumps human-readable table + saves CSV copy.
+#      trace_dir = <trace-dir>/in<I>_out<O>_conc<N> (if --trace)
+#      clear_caches -> start_server(trace_dir) -> wait ->
+#      warmup via run_client without --profile ->
+#      measure via run_client with --profile (if --trace, reduced prompts) ->
+#      kill -> parse -> record
+# 6. EXIT trap dumps human-readable table + saves CSV copy + lists trace dirs.
 ```
 
 Critical invariants:
@@ -147,3 +176,5 @@ Critical invariants:
 - **EXIT trap must always fire** to avoid losing partial results.
 - **Segfault = immediate exit** (GPU memory corruption makes further results unreliable).
 - Server ready detection: both log grep AND HTTP health check (some vLLM versions differ in log format).
+- **Tracing: warmup must never be profiled.** Only pass `--profile` to the measurement `vllm bench serve` run, never to warmup. This keeps traces clean and representative of steady-state behavior.
+- **Tracing: each config gets its own trace directory.** Never share trace dirs across configs — trace files can collide and traces from different workloads become impossible to distinguish.

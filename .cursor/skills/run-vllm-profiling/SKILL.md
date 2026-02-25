@@ -33,6 +33,14 @@ export VLLM_ROCM_USE_AITER=1
     --concurrencies "4 8 16 32 64" \
     --server-extra-args "--enable-auto-tool-choice --tool-call-parser kimi_k2 --reasoning-parser kimi_k2" \
     --output-dir /app/scripts
+
+# Benchmark + trace collection
+./run_profiling.sh \
+    --model /data/MyModel \
+    --trace \
+    --combos "1024:1024" \
+    --concurrencies "4 8" \
+    --trace-dir /app/scripts/traces
 ```
 
 ## CLI Reference
@@ -51,6 +59,8 @@ export VLLM_ROCM_USE_AITER=1
 | `--concurrencies "N ..."` | "4 8 16 32 64" | Space-separated concurrency values |
 | `--prompts-multiplier N` | 8 | num_prompts = N * concurrency |
 | `--no-warmup` | off | Skip JIT warmup run (not recommended) |
+| `--trace` | off | Enable torch profiler trace collection |
+| `--trace-dir DIR` | `<output-dir>/traces` | Directory for per-config trace output |
 | `--output-dir DIR` | script dir | Where to save the CSV |
 
 ## Running and Monitoring
@@ -79,6 +89,21 @@ export VLLM_ROCM_USE_AITER=1
 - Metrics collected: **TTFT** (ms), **TPOT** (ms), **E2EL** (ms), **Output token throughput** (tok/s), **Total token throughput** (tok/s).
 - Prefers Median values; falls back to Mean if Median unavailable.
 
+### Trace Output (when `--trace` is enabled)
+
+- Traces saved under `<trace-dir>/in<INPUT>_out<OUTPUT>_conc<N>/` per config permutation.
+- Each subdirectory contains the torch profiler `.json` trace files produced by that server run.
+- Summary of trace directories and file counts printed at completion.
+
+**How tracing works:**
+1. Server starts with `--profiler-config '{"profiler": "torch", "torch_profiler_dir": "<config_trace_dir>", ...}'` to load profiler infrastructure.
+2. Warmup `vllm bench serve` run executes **without** `--profile` (profiling inactive).
+3. Measurement `vllm bench serve` run executes **with** `--profile`, which signals the server to start/stop recording around the benchmark.
+4. Server is killed. Next config starts a fresh server.
+5. `VLLM_RPC_TIMEOUT=1800000` is set to allow time for trace flushing on large models.
+
+To keep traces small, `num_prompts` is forced to `1 * max_concurrency` during trace measurement runs, regardless of `--prompts-multiplier`. Stack traces are disabled (`torch_profiler_with_stack: false`) to further reduce trace size.
+
 ## Time Estimates
 
 Per config: server startup (3-5 min) + warmup run + measurement run.
@@ -97,3 +122,4 @@ A full 3x5 sweep with 8192-output configs can take 6-10 hours.
 - Warmup run absorbs JIT compilation overhead so measurement is clean.
 - Server killed and restarted per config for isolation.
 - Segfault detection on both server and client.
+- Trace profiling is `--profile` flag gated: warmup runs without `--profile`, so no trace data is collected. Only measurement runs produce traces.

@@ -24,6 +24,10 @@
 #   --prompts-multiplier N        num_prompts = N * max_concurrency (default: 8)
 #   --no-warmup                   Skip the JIT warmup run (not recommended)
 #
+# Tracing options:
+#   --trace                       Enable torch profiler trace collection
+#   --trace-dir DIR               Directory for traces (default: <output-dir>/traces)
+#
 # Output options:
 #   --output-dir DIR              Directory for CSV output (default: script directory)
 #
@@ -49,6 +53,9 @@ CONCURRENCIES="4 8 16 32 64"
 PROMPTS_MULTIPLIER=8
 DO_WARMUP=1
 
+DO_TRACE=0
+TRACE_DIR=""
+
 OUTPUT_DIR="$SCRIPT_DIR"
 
 # ──────────────────────── Arg parsing ────────────────────────
@@ -67,6 +74,8 @@ while [[ $# -gt 0 ]]; do
         --concurrencies)      CONCURRENCIES="$2";      shift 2 ;;
         --prompts-multiplier) PROMPTS_MULTIPLIER="$2"; shift 2 ;;
         --no-warmup)          DO_WARMUP=0;             shift ;;
+        --trace)              DO_TRACE=1;              shift ;;
+        --trace-dir)          TRACE_DIR="$2";          shift 2 ;;
         --output-dir)         OUTPUT_DIR="$2";         shift 2 ;;
         -h|--help)
             sed -n '2,/^$/{ s/^# \?//; p }' "$0"
@@ -95,6 +104,11 @@ fi
 
 ulimit -c 0
 
+if [[ "$DO_TRACE" -eq 1 ]]; then
+    [[ -z "$TRACE_DIR" ]] && TRACE_DIR="$OUTPUT_DIR/traces"
+    TRACE_PROMPTS_MULTIPLIER=1
+fi
+
 echo "============================================================"
 echo " vLLM Serving Profiler"
 echo "============================================================"
@@ -107,6 +121,7 @@ echo " Token combos:   $INPUT_OUTPUT_COMBOS"
 echo " Concurrencies:  $CONCURRENCIES"
 echo " Prompts mult:   $PROMPTS_MULTIPLIER"
 echo " Warmup:         $([ "$DO_WARMUP" -eq 1 ] && echo yes || echo no)"
+echo " Tracing:        $([ "$DO_TRACE" -eq 1 ] && echo "yes (dir: $TRACE_DIR, prompts_mult: $TRACE_PROMPTS_MULTIPLIER)" || echo no)"
 echo " Output dir:     $OUTPUT_DIR"
 if [[ -n "$SERVER_EXTRA_ARGS" ]]; then
     echo " Extra args:     $SERVER_EXTRA_ARGS"
@@ -148,7 +163,14 @@ parse_client_output() {
 }
 
 start_server() {
+    local trace_subdir="${1:-}"
     : > "$SERVER_LOG"
+    local -a profiler_args=()
+    if [[ -n "$trace_subdir" ]]; then
+        mkdir -p "$trace_subdir"
+        profiler_args=(--profiler-config "{\"profiler\": \"torch\", \"torch_profiler_dir\": \"${trace_subdir}\", \"torch_profiler_with_stack\": false}")
+        export VLLM_RPC_TIMEOUT=1800000
+    fi
     # shellcheck disable=SC2086
     vllm serve "$MODEL" \
         --host "$HOST" \
@@ -160,6 +182,7 @@ start_server() {
         --no-enable-prefix-caching \
         --max-model-len "$MAX_MODEL_LEN" \
         --gpu-memory-utilization "$GPU_MEM_UTIL" \
+        "${profiler_args[@]:+${profiler_args[@]}}" \
         $SERVER_EXTRA_ARGS \
         >> "$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
@@ -206,7 +229,12 @@ kill_server() {
 
 run_client() {
     local input_tok=$1 output_tok=$2 max_conc=$3 log_file=$4
+    local do_profile=${5:-0}
     local num_prompts=$((PROMPTS_MULTIPLIER * max_conc))
+    local -a profile_args=()
+    if [[ "$do_profile" -eq 1 ]]; then
+        profile_args=(--profile)
+    fi
     : > "$log_file"
     set +e
     vllm bench serve \
@@ -220,6 +248,7 @@ run_client() {
         --percentile-metrics ttft,tpot,itl,e2el \
         --ignore-eos \
         --trust-remote-code \
+        "${profile_args[@]:+${profile_args[@]}}" \
         >> "$log_file" 2>&1
     local exit_code=$?
     set -e
@@ -252,6 +281,16 @@ dump_results() {
     else
         echo "(No completed runs to display)"
     fi
+    if [[ "$DO_TRACE" -eq 1 ]] && [[ -d "$TRACE_DIR" ]]; then
+        echo ""
+        echo "============= TRACE OUTPUT ============= "
+        echo "Trace directory: $TRACE_DIR"
+        for d in "$TRACE_DIR"/*/; do
+            [[ -d "$d" ]] || continue
+            local_count=$(find "$d" -type f 2>/dev/null | wc -l)
+            echo "  $(basename "$d")/  ($local_count files)"
+        done
+    fi
     echo ""
     echo "============= RESULTS (CSV) ============= "
     cat "$RESULTS_FILE" 2>/dev/null || true
@@ -269,8 +308,13 @@ for combo in $INPUT_OUTPUT_COMBOS; do
     for max_concurrency in $CONCURRENCIES; do
         echo "=== Config: input_tokens=$input_tok output_tokens=$output_tok max_concurrency=$max_concurrency ==="
 
+        CURRENT_TRACE_DIR=""
+        if [[ "$DO_TRACE" -eq 1 ]]; then
+            CURRENT_TRACE_DIR="${TRACE_DIR}/in${input_tok}_out${output_tok}_conc${max_concurrency}"
+        fi
+
         clear_caches
-        start_server
+        start_server "$CURRENT_TRACE_DIR"
         wait_for_server
 
         if [[ "${SERVER_READY}" == "FAILED" ]]; then
@@ -280,12 +324,23 @@ for combo in $INPUT_OUTPUT_COMBOS; do
         fi
 
         if [[ "$DO_WARMUP" -eq 1 ]]; then
-            echo "  Warmup run..."
-            run_client "$input_tok" "$output_tok" "$max_concurrency" "$CLIENT_LOG"
+            echo "  Warmup run (profiling inactive)..."
+            run_client "$input_tok" "$output_tok" "$max_concurrency" "$CLIENT_LOG" 0
         fi
 
         echo "  Measurement run..."
-        run_client "$input_tok" "$output_tok" "$max_concurrency" "$CLIENT_LOG2"
+        if [[ "$DO_TRACE" -eq 1 ]]; then
+            local_mult=$TRACE_PROMPTS_MULTIPLIER
+            local_num_prompts=$((local_mult * max_concurrency))
+            echo "  (tracing: num_prompts=$local_num_prompts, trace_dir=$CURRENT_TRACE_DIR)"
+            PROMPTS_MULTIPLIER_SAVE=$PROMPTS_MULTIPLIER
+            PROMPTS_MULTIPLIER=$TRACE_PROMPTS_MULTIPLIER
+            run_client "$input_tok" "$output_tok" "$max_concurrency" "$CLIENT_LOG2" 1
+            PROMPTS_MULTIPLIER=$PROMPTS_MULTIPLIER_SAVE
+            echo "  Traces saved to: $CURRENT_TRACE_DIR"
+        else
+            run_client "$input_tok" "$output_tok" "$max_concurrency" "$CLIENT_LOG2" 0
+        fi
 
         kill_server
 
