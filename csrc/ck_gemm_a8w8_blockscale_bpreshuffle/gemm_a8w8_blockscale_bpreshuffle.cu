@@ -3,8 +3,8 @@
 
 #include "gemm_a8w8_blockscale_bpreshuffle_common.cuh"
 #include "gemm_a8w8_blockscale_bpreshuffle_lookup.h"
-#include "gemm_common.h"
 #include "gemm_a8w8_blockscale_bpreshuffle_manifest.h"
+#include "gemm_common.h"
 
 #include <cmath>
 
@@ -65,7 +65,7 @@ BlockwiseKernel blockscale_bpreshuffle_dispatch(int M, int N, int K)
     }
 
     int padded_m = M;
-  
+
     // Fine-grained search
     padded_m = getPaddedM(M, N, K, 0);
 
@@ -76,15 +76,15 @@ BlockwiseKernel blockscale_bpreshuffle_dispatch(int M, int N, int K)
     {
         return it->second;
     }
-  
+
     // Coarse-grained search
     padded_m = getPaddedM(M, N, K, 1);
-    it = lookup.find({padded_m, N, K});
-    if (it != lookup.end())
+    it       = lookup.find({padded_m, N, K});
+    if(it != lookup.end())
     {
-      return it->second;
+        return it->second;
     }
-  
+
     // Otherwise, use heuristics.
     return a8w8_blockscale_bpreshuffle_1x128x128_256x64x64x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x1_intrawave_v1<
         DDataType,
@@ -92,10 +92,10 @@ BlockwiseKernel blockscale_bpreshuffle_dispatch(int M, int N, int K)
 }
 
 torch::Tensor gemm_a8w8_blockscale_bpreshuffle(torch::Tensor& XQ,
-                                   torch::Tensor& WQ,
-                                   torch::Tensor& x_scale,
-                                   torch::Tensor& w_scale,
-                                   torch::Tensor& Y)
+                                               torch::Tensor& WQ,
+                                               torch::Tensor& x_scale,
+                                               torch::Tensor& w_scale,
+                                               torch::Tensor& Y)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");

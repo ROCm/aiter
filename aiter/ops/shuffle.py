@@ -26,19 +26,20 @@ def shuffle_weight(x: torch.Tensor, layout=(16, 16), use_int4=False) -> torch.Te
     x_.is_shuffled = True
     return x_
 
+
 def shuffle_bq(w_scale: torch.Tensor, block_bq_k: int) -> torch.Tensor:
     """
     Shuffle BQ (B quantization) scale tensor for BPreshuffleQuant optimization.
-    
+
     For 2D tensor [bqk, n]:
         - Reshape to [n, bqk/block_bq_k, block_bq_k]
         - Permute to [bqk/block_bq_k, n, block_bq_k]
         - Return with original shape
-    
+
     Args:
-        w_scale: B quantization scale tensor, shape [bqk, n] 
+        w_scale: B quantization scale tensor, shape [bqk, n]
         block_bq_k: Block size for BQ K dimension (typically K_Tile / BQuantGroupSize::kK)
-    
+
     Returns:
         Shuffled scale tensor with the same shape as input
     """

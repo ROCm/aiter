@@ -566,7 +566,6 @@ def gemm_a8w8_blockscale(
     dtype: torch.dtype = dtypes.bf16,
     isBpreshuffled: bool = False,
     preshuffleQuantB: bool = False,
-    isDefaultCktile: bool = False,
 ) -> torch.Tensor:
     assert dtype in [
         dtypes.bf16,
