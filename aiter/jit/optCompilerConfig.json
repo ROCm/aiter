@@ -522,6 +522,20 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_moe_sorting_opus": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/moe_sorting_opus_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/moe_sorting_opus_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DOPUS_WA_ISSUE_2028=0'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_moe_topk": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/moe_topk_pybind.cu'",

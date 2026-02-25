@@ -798,6 +798,92 @@ def test_predicated_async_load(mod):
 
 
 # ---------------------------------------------------------------------------
+# mdiv tests
+# ---------------------------------------------------------------------------
+
+
+def test_mdiv(mod):
+    """Test opus::mdiv magic division against native integer division."""
+    device = torch.device("cuda")
+
+    divisors = [1, 2, 3, 7, 13, 32, 64, 127, 255, 1024, 65537]
+    n = 100000
+
+    torch.manual_seed(99)
+    # Unsigned 32-bit range: use int32 tensor with values in [0, 2^31-1)
+    dividends = torch.randint(0, 2**31 - 1, (n,), device=device, dtype=torch.int32)
+
+    fails = 0
+    for d in divisors:
+        out_q = torch.empty(n, device=device, dtype=torch.int32)
+        out_r = torch.empty(n, device=device, dtype=torch.int32)
+        mod.run_mdiv(dividends, out_q, out_r, d)
+
+        # Reference: unsigned division via Python
+        vals = dividends.to(torch.int64)  # avoid overflow
+        ref_q = (vals // d).to(torch.int32)
+        ref_r = (vals % d).to(torch.int32)
+
+        q_ok = torch.equal(out_q, ref_q)
+        r_ok = torch.equal(out_r, ref_r)
+        if not q_ok or not r_ok:
+            q_bad = (out_q != ref_q).sum().item()
+            r_bad = (out_r != ref_r).sum().item()
+            print(f"  FAIL: mdiv divisor={d}, q_mismatch={q_bad}, r_mismatch={r_bad}")
+            fails += 1
+        else:
+            print(f"  PASS: mdiv divisor={d}")
+
+    if fails:
+        print(f"  mdiv: {fails}/{len(divisors)} divisors FAILED")
+        return 1
+    print(f"  PASS: mdiv all {len(divisors)} divisors correct")
+    return 0
+
+
+def test_wb_cumulative(mod):
+    """Test workgroup_barrier wait_lt + inc: N workgroups contribute i+1 sequentially."""
+    device = torch.device("cuda")
+    n_workgroups = 128
+    accum = torch.zeros(1, device=device, dtype=torch.int32)
+    mod.run_wb_cumulative(accum, n_workgroups)
+    expected = n_workgroups * (n_workgroups + 1) // 2
+    actual = accum.item()
+    if actual != expected:
+        print(f"  FAIL: wb_cumulative expected={expected}, got={actual}")
+        return 1
+    print(f"  PASS: wb_cumulative (n={n_workgroups}, accum={actual})")
+    return 0
+
+
+def test_wb_streamk_reduce(mod):
+    """Test workgroup_barrier stream-K reduce: N producers + 1 consumer sum an array."""
+    device = torch.device("cuda")
+    for n_chunks in [1, 4, 16, 64]:
+        n_elems = 256 * n_chunks
+        torch.manual_seed(42)
+        inp = torch.randn(n_elems, device=device, dtype=torch.float32)
+        workspace = torch.empty(n_chunks, device=device, dtype=torch.float32)
+        result = torch.empty(1, device=device, dtype=torch.float32)
+        mod.run_wb_streamk_reduce(inp, workspace, result, n_chunks)
+        expected = inp.sum().item()
+        actual = result.item()
+        rtol = 1e-4
+        if abs(expected) > 0:
+            rel_err = abs(actual - expected) / abs(expected)
+        else:
+            rel_err = abs(actual - expected)
+        if rel_err > rtol:
+            print(
+                f"  FAIL: wb_streamk_reduce n_chunks={n_chunks}, "
+                f"expected={expected:.6f}, got={actual:.6f}, rel_err={rel_err:.2e}"
+            )
+            return 1
+        print(f"  PASS: wb_streamk_reduce n_chunks={n_chunks} (rel_err={rel_err:.2e})")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -844,6 +930,9 @@ def main():
     failures += test_predicated_copy(mod)
     failures += test_free_func_vector_add(mod)
     failures += test_predicated_async_load(mod)
+    failures += test_mdiv(mod)
+    failures += test_wb_cumulative(mod)
+    failures += test_wb_streamk_reduce(mod)
 
     if failures:
         print(f"\n{failures} test(s) FAILED")

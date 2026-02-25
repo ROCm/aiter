@@ -4,7 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
   workflow_dispatch:
 
 concurrency:
@@ -20,7 +26,7 @@ env:
 
 jobs:
   check-signal:
-    if: ${{ !github.event.pull_request.head.repo.fork }}
+    if: ${{ !github.event.pull_request.head.repo.fork && (!github.event.pull_request || github.event.pull_request.draft == false) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -34,7 +40,7 @@ jobs:
 
   build_vllm_image:
     name: Build vLLM Image
-    if: ${{ !github.event.pull_request.head.repo.fork }}
+    if: ${{ !github.event.pull_request.head.repo.fork && (!github.event.pull_request || github.event.pull_request.draft == false) }}
     needs: [check-signal]
     runs-on: build-only-aiter
 
@@ -98,7 +104,7 @@ jobs:
 
   vllm_benchmark:
     name: vLLM Benchmark (8 GPU)
-    if: ${{ !github.event.pull_request.head.repo.fork }}
+    if: ${{ !github.event.pull_request.head.repo.fork && (!github.event.pull_request || github.event.pull_request.draft == false) }}
     needs: build_vllm_image
     runs-on: aiter-8gpu-runner
     strategy:
