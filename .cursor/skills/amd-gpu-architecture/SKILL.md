@@ -149,6 +149,8 @@ GEMM is compute-bound when M,N,K are large. Elementwise ops are always memory-bo
 - Avoid large `num_stages` with fused kernels (causes spills)
 - Check spills: look for `buffer_store`/`buffer_load` to scratch in assembly
 
+***[Cagri]: waves_per_eu requires more info. Register limits per thread etc. Could be backed up by other skills.***
+
 ### 5. XCD-Aware Grid Mapping
 
 Programs on the same XCD share L2 cache. For GEMM:
