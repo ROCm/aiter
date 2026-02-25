@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 import pytest
 import logging
@@ -8,7 +8,11 @@ import math
 from aiter.test_mha_common import (
     attention_ref,
 )
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.attention.fav3_sage import fav3_sage_wrapper_func
+from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
+    fav3_sage_mxfp4_wrapper,
+)
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -260,4 +264,91 @@ def test_sage(
         atol=ATOL_fp8,
         rtol=RTOL_fp8,
         max_diff_percentage=0.5,
+    )
+
+
+@pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
+@pytest.mark.parametrize(
+    "SEQLEN_Q, SEQLEN_K",
+    [(1, 1), (4, 4), (128, 128), (2, 1), (1, 2), (32, 16), (64, 128)],
+)
+@pytest.mark.parametrize(
+    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
+)
+@pytest.mark.parametrize("HEAD_SZ", [128])
+@pytest.mark.parametrize("layout", ["bhsd"])
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("qsmooth", [True, False])
+@pytest.mark.parametrize("hadamard_rotate", [True, False])
+def test_sage_mxfp4(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    layout: str,
+    causal: bool,
+    qsmooth: bool,
+    hadamard_rotate: bool,
+    dtype=torch.bfloat16,
+):
+
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+
+    triton_out = fav3_sage_mxfp4_wrapper(
+        q,
+        k,
+        v,
+        causal=causal,
+        layout=layout,
+        q_smooth=qsmooth,
+        hadamard_rotation=hadamard_rotate,
+    )
+
+    if DEBUG_MODE:
+        print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
+
+    if layout == "bhsd":
+        q = q.permute(0, 2, 1, 3).contiguous()
+        k = k.permute(0, 2, 1, 3).contiguous()
+        v = v.permute(0, 2, 1, 3).contiguous()
+
+    torch_out = attention_ref(q, k, v, dropout_p=0.0, dropout_mask=None, causal=causal)
+    torch_out, attention_scores, _ = torch_out
+
+    if layout == "bhsd":
+        torch_out = torch_out.permute(0, 2, 1, 3).contiguous()
+
+    assert torch_out.shape == triton_out.shape
+
+    if DEBUG_MODE:
+        print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
+        print(
+            f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
+        )
+
+    check_attention_outputs(
+        triton_out,
+        torch_out,
+        fp8=True,
+        atol=ATOL_fp8,
+        rtol=RTOL_fp8,
+        max_diff_percentage=1.5,
     )
