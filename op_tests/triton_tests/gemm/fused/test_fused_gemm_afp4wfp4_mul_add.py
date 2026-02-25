@@ -23,7 +23,7 @@ from op_tests.triton_tests.fusions.test_fused_mul_add import (
 
 def get_x_vals():
 
-    x_vals = [(v, 7168, 256) for v in [1, 2, 4, 8, 16, 1024]]
+    x_vals = [(v, 7168, 256) for v in [1, 2, 4, 8, 16, 31, 32, 1024]]
     # x_vals += [(1, 1, 32)]  # minimal case
     return x_vals
 
