@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import functools
 import os
 import re
@@ -67,14 +67,12 @@ def get_gfx_custom_op_core() -> int:
             )
             output = result.stdout
             for line in output.split("\n"):
-                match = re.search(r"\b(gfx\w+)\b", line, re.IGNORECASE)
-                if match:
-                    gfx_arch = match.group(1).lower()
+                if "gfx" in line.lower():
                     try:
-                        return gfx_mapping[gfx_arch]
+                        return gfx_mapping[line.split(":")[-1].strip()]
                     except KeyError:
                         raise KeyError(
-                            f"Unknown GPU architecture: {gfx_arch}. "
+                            f'Unknown GPU architecture: {line.split(":")[-1].strip()}. '
                             f"Supported architectures: {list(gfx_mapping.keys())}"
                         )
 
