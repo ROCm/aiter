@@ -1139,7 +1139,7 @@ OPUS_H_D constexpr index_t get_warp_size()
 OPUS_H_D constexpr index_t get_smem_size()
 {
 #if defined(__gfx950__)
-    return 131072;  // 128KB
+    return 163840;  // 160KB (CDNA4)
 #else
     return 65536;   // 64KB
 #endif
@@ -1151,21 +1151,19 @@ OPUS_H index_t query_smem_size() { int d; (void)hipGetDevice(&d); hipDeviceProp_
 OPUS_H index_t query_num_cu()    { int d; (void)hipGetDevice(&d); hipDeviceProp_t p; (void)hipGetDeviceProperties(&p, d); return static_cast<index_t>(p.multiProcessorCount); }
 #endif
 
-// Requires <hip/hip_runtime.h> to be included before opus.hpp (for threadIdx, __syncthreads, atomicAdd).
-// .cu files include it by default; .cpp files must add it explicitly.
-#ifdef HIP_INCLUDE_HIP_HIP_RUNTIME_H
+// Uses compiler builtins (__builtin_amdgcn_*) instead of HIP runtime APIs, so no <hip/hip_runtime.h> dependency.
+#ifdef __HIPCC__
 struct workgroup_barrier {
     OPUS_D workgroup_barrier(uint32_t* ptr) : base_ptr(ptr) {}
     OPUS_D uint32_t ld(uint32_t offset = 0) { return __atomic_load_n(base_ptr + offset, __ATOMIC_RELAXED); }
-    OPUS_D void wait_eq(uint32_t value, uint32_t offset = 0) { if (threadIdx.x == 0) while (ld(offset) != value) {} __syncthreads(); }
-    OPUS_D void wait_lt(uint32_t value, uint32_t offset = 0) { if (threadIdx.x == 0) while (ld(offset) < value) {} __syncthreads(); }
-    OPUS_D void inc(uint32_t offset = 0) { __syncthreads(); if (threadIdx.x == 0) atomicAdd(base_ptr + offset, 1); }
+    OPUS_D void wait_eq(uint32_t value, uint32_t offset = 0) { if (__builtin_amdgcn_workitem_id_x() == 0) while (ld(offset) != value) {} __builtin_amdgcn_s_barrier(); }
+    OPUS_D void wait_lt(uint32_t value, uint32_t offset = 0) { if (__builtin_amdgcn_workitem_id_x() == 0) while (ld(offset) < value) {} __builtin_amdgcn_s_barrier(); }
+    OPUS_D void inc(uint32_t offset = 0) { __builtin_amdgcn_s_barrier(); if (__builtin_amdgcn_workitem_id_x() == 0) __atomic_fetch_add(base_ptr + offset, 1u, __ATOMIC_RELAXED); }
     uint32_t* base_ptr;
 };
 #endif
 
 // NOTE: all data in unsigned int. Prefer usage, construct a mdiv structure on host, pass the structure to kernel, and use div/divmod
-// The OPUS_D overload of div() uses __umulhi which requires <hip/hip_runtime.h>; see workgroup_barrier note above.
 struct mdiv {
     uint32_t divisor;   uint32_t multiplier;    uint32_t shift;
     OPUS_H_D mdiv() : divisor(0), multiplier(0), shift(0) {}
@@ -1176,13 +1174,8 @@ struct mdiv {
         multiplier       = static_cast<uint32_t>(tmp_u64 / divisor_ + 1);
         shift            = shift_u32;
     }
-#ifdef HIP_INCLUDE_HIP_HIP_RUNTIME_H
-    OPUS_D uint32_t div(uint32_t dividend) const {
-        if (__builtin_is_constant_evaluated()) { uint32_t tmp = static_cast<uint32_t>((static_cast<uint64_t>(dividend) * multiplier) >> 32); return (tmp + dividend) >> shift; }
-        else                                   { uint32_t tmp = __umulhi(dividend, multiplier); return (tmp + dividend) >> shift; }
-    }
-#endif
-    OPUS_H uint32_t div(uint32_t dividend) const { uint32_t tmp = static_cast<uint32_t>((static_cast<uint64_t>(dividend) * multiplier) >> 32); return (tmp + dividend) >> shift; }
+    // previously we use __umulhi(), which is defined in <hip/hip_runtime.hpp>, for __device__ compilation. Today compiler is smart enough to generate s_mul_hi_u32 / v_mul_hi_u32
+    OPUS_H_D uint32_t div(uint32_t dividend) const { uint32_t tmp = static_cast<uint32_t>((static_cast<uint64_t>(dividend) * multiplier) >> 32); return (tmp + dividend) >> shift; }
     OPUS_H_D void divmod(uint32_t dividend, uint32_t& quotient, uint32_t& remainder) const { quotient  = div(dividend);  remainder = dividend - (quotient * divisor); }
     OPUS_H_D uint32_t get() const { return divisor; }
 };
