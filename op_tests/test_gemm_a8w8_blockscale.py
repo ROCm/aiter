@@ -102,6 +102,9 @@ def test_gemm(dtype, m, n, k, preshuffleB=True, preshuffleQuantB=False):
         x, weight, x_scale, w_scale_T if preshuffleQuantB else w_scale, dtype
     )
 
+    x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
+    gemm_x_scale = x_scale_t if preshuffleB else x_scale
+
     gemm_weight = shuffle_weight(weight, layout=(16, 16)) if preshuffleB else weight
     gemm_weight_scale = (
         shuffle_bq(w_scale_T, block_shape_k // 128) if preshuffleQuantB else w_scale
@@ -111,7 +114,13 @@ def test_gemm(dtype, m, n, k, preshuffleB=True, preshuffleQuantB=False):
     else:
         run_func = run_gemm
     b, avg_b = run_func(
-        x, gemm_weight, x_scale, gemm_weight_scale, dtype, preshuffleB, preshuffleQuantB
+        x,
+        gemm_weight,
+        gemm_x_scale,
+        gemm_weight_scale,
+        dtype,
+        preshuffleB,
+        preshuffleQuantB,
     )
 
     err_ck = checkAllclose(a, b, msg="ck")
@@ -273,19 +282,17 @@ parser.add_argument(
     """,
 )
 parser.add_argument(
-    "--ck_preshuffleQuant",
+    "--ck_preshuffleQuantB",
     type=dtypes.str2bool,
     nargs="*",
     default=[True, False],
     help="""weight scale preshuffle or not.
-    e.g.: --ck_preshuffle True
-        or --ck_preshuffle False
+    e.g.: --ck_preshuffleQuantB True
+        or --ck_preshuffleQuantB False
     """,
 )
 
 args = parser.parse_args()
-print(args.ck_preshuffleQuant)
-print(args.ck_preshuffle)
 df = []
 for dtype in args.dtype:
     # deepseek-r1
@@ -297,8 +304,8 @@ for dtype in args.dtype:
                         dtype, m, n, k, preshuffleB=ck_p, preshuffleQuantB=False
                     )
                     df.append(ret)
-            if True in args.ck_preshuffleQuant:
-                for ck_pq in args.ck_preshuffleQuant:
+            if True in args.ck_preshuffleQuantB:
+                for ck_pq in args.ck_preshuffleQuantB:
                     ret = test_gemm(
                         dtype, m, n, k, preshuffleB=False, preshuffleQuantB=ck_pq
                     )
