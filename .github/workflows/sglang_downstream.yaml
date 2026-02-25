@@ -4,7 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]  # Triggers on PRs targeting `main`
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
   workflow_dispatch:
 
 concurrency:
@@ -13,6 +19,7 @@ concurrency:
 
 jobs:
   check-signal:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -25,6 +32,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   sglang:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     name: Sglang Integration Test (1 GPU)
     needs: [check-signal]
     runs-on: ${{ matrix.runner }}
