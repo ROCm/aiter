@@ -15,7 +15,6 @@
 * limitations under the License.
 """
 
-import os
 from contextlib import contextmanager
 from typing import Any, List, Optional, Union
 
@@ -56,6 +55,7 @@ class CustomAllreduce:
         group: ProcessGroup,
         device: Union[int, str, torch.device],
         max_size=8192 * 1024 * 8 * 2, # In allreduce 2stage writemode, use 2x tmp buffer
+        enable_register_for_capturing: bool = True,
     ) -> None:
         """
         Args:
@@ -148,7 +148,7 @@ class CustomAllreduce:
         #     return
 
         self.disabled = False
-        self.tms_cudagraph = os.getenv("SGLANG_MEMORY_SAVER_CUDA_GRAPH", "0")
+        self.enable_register_for_capturing = enable_register_for_capturing
         # buffers memory are owned by this Python class and passed to C++
         # meta data composes of two parts: meta data for synchronization
         # (256 bytes) and a temporary buffer for storing intermediate
@@ -315,8 +315,8 @@ class CustomAllreduce:
                     input,
                     use_new=use_new,
                     open_fp8_quant=open_fp8_quant,
-                    registered_input=not self.tms_cudagraph,
-                    registered_output=not self.tms_cudagraph
+                    registered_input=self.enable_register_for_capturing,
+                    registered_output=self.enable_register_for_capturing
                 )
             else:
                 # if warm up, mimic the allocation pattern
