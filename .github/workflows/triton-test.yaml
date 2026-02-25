@@ -35,6 +35,7 @@ jobs:
 
   # Step 1: split triton tests into 5 shards, output triton_shard_0.list ... triton_shard_4.list
   split_triton_tests:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
     outputs:
       shard_count: 8
@@ -200,7 +201,7 @@ jobs:
           docker rm -f triton_test || true
 
   triton-test-results:
-    if: always()
+    if: ${{ !github.event.pull_request.draft }}
     name: Triton Test Results
     runs-on: ubuntu-latest
     needs: [triton]
