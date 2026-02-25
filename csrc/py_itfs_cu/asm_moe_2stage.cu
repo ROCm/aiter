@@ -70,23 +70,23 @@ struct __attribute__((packed)) KernelArgs
     p3 _p27;
     void log()
     {
-        printf("KernelArgs argsize: %zu\n", sizeof(KernelArgs));
-        printf("[KARG] dim = %d\n", dim);
-        printf("[KARG] hidden_dim = %d\n", hidden_dim);
-        printf("[KARG] token_cnt = %d\n", token_cnt);
-        printf("[KARG] eprt_cnt = %d\n", eprt_cnt);
-        printf("[KARG] Xs = %d\n", Xs);
-        printf("[KARG] GUs = %d\n", GUs);
-        printf("[KARG] Os = %d\n", Os);
-        printf("[KARG] eGUs = %d\n", eGUs);
-        printf("[KARG] eGUQs = %d\n", eGUQs);
-        printf("[KARG] eSMQs = %d\n", eSMQs);
-        printf("[KARG] topk = %d\n", topk);
-        printf("[KARG] splitk = %d\n", splitk);
-        printf("[KARG] activation = %d\n", activation);
-        printf("[KARG] total_tgs = %d\n", total_tgs);
-        printf("[KARG] ps_deno = %d\n", ps_deno);
-        printf("[KARG] eLQQs = %d\n", eLQQs);
+        printf("[KernelArgs] argsize: %zu\n", sizeof(KernelArgs));
+        printf("[KARG] dim                      = %d\n", dim);
+        printf("[KARG] hidden_dim               = %d\n", hidden_dim);
+        printf("[KARG] token_cnt                = %d\n", token_cnt);
+        printf("[KARG] eprt_cnt                 = %d\n", eprt_cnt);
+        printf("[KARG] Xs                       = %d\n", Xs);
+        printf("[KARG] GUs                      = %d\n", GUs);
+        printf("[KARG] Os                       = %d\n", Os);
+        printf("[KARG] eGUs                     = %d\n", eGUs);
+        printf("[KARG] eGUQs                    = %d\n", eGUQs);
+        printf("[KARG] eSMQs                    = %d\n", eSMQs);
+        printf("[KARG] topk                     = %d\n", topk);
+        printf("[KARG] splitk                   = %d\n", splitk);
+        printf("[KARG] activation               = %d\n", activation);
+        printf("[KARG] total_tgs                = %d\n", total_tgs);
+        printf("[KARG] ps_deno                  = %d\n", ps_deno);
+        printf("[KARG] eLQQs                    = %d\n", eLQQs);
     }
 };
 struct __attribute__((packed)) Kernel2Args
@@ -139,19 +139,19 @@ struct __attribute__((packed)) Kernel2Args
     p3 _p22;
     void log()
     {
-        printf("Kernel2Args argsize: %zu\n", sizeof(Kernel2Args));
-        printf("[KARG] dim = %d\n", dim);
-        printf("[KARG] hidden_dim = %d\n", hidden_dim);
-        printf("[KARG] token_cnt = %d\n", token_cnt);
-        printf("[KARG] eprt_cnt = %d\n", eprt_cnt);
-        printf("[KARG] stride_X = %d\n", stride_X);
-        printf("[KARG] stride_D = %d\n", stride_D);
-        printf("[KARG] stride_O = %d\n", stride_O);
-        printf("[KARG] stride_expert_D = %d\n", stride_expert_D);
-        printf("[KARG] stride_expert_scale_D = %d\n", stride_expert_scale_D);
-        printf("[KARG] topk = %d\n", topk);
-        printf("[KARG] splitk = %d\n", splitk);
-        printf("[KARG] stride_expert_dequant_D = %d\n", stride_expert_dequant_D);
+        printf("[Kernel2Args] argsize: %zu\n", sizeof(Kernel2Args));
+        printf("[KARG] dim                      = %d\n", dim);
+        printf("[KARG] hidden_dim               = %d\n", hidden_dim);
+        printf("[KARG] token_cnt                = %d\n", token_cnt);
+        printf("[KARG] eprt_cnt                 = %d\n", eprt_cnt);
+        printf("[KARG] stride_X                 = %d\n", stride_X);
+        printf("[KARG] stride_D                 = %d\n", stride_D);
+        printf("[KARG] stride_O                 = %d\n", stride_O);
+        printf("[KARG] stride_expert_D          = %d\n", stride_expert_D);
+        printf("[KARG] stride_expert_scale_D    = %d\n", stride_expert_scale_D);
+        printf("[KARG] topk                     = %d\n", topk);
+        printf("[KARG] splitk                   = %d\n", splitk);
+        printf("[KARG] stride_expert_dequant_D  = %d\n", stride_expert_dequant_D);
     }
 };
 
@@ -585,18 +585,18 @@ void moe_stage1_g1u1(
     int gdz = k_num;
 
     args.log();
-    printf("[DEV_BUF] dev_O: out = %lu bytes\n", out.numel() * out.element_size());
-    printf("[DEV_BUF] dev_X: input = %lu bytes\n", input.numel() * input.element_size());
-    printf("[DEV_BUF] dev_GU: w1 = %lu bytes\n", w1.numel() * w1.element_size());
-    printf("[DEV_BUF] dev_XC: num_valid_ids = %lu bytes\n", num_valid_ids.numel() * num_valid_ids.element_size());
-    printf("[DEV_BUF] dev_X_dqn_buf: a1_scale = %lu bytes\n", a1_scale.has_value() ? a1_scale.value().numel() * a1_scale.value().element_size() : 0);
-    printf("[DEV_BUF] dev_GU_dqn_buf: w1_scale = %lu bytes\n", w1_scale.has_value() ? w1_scale.value().numel() * w1_scale.value().element_size() : 0);
-    printf("[DEV_BUF] dev_Smooth_qnt_buf: fc2_smooth_scale = %lu bytes\n", fc2_smooth_scale.has_value() ? fc2_smooth_scale.value().numel() * fc2_smooth_scale.value().element_size() : 0);
-    printf("[DEV_BUF] dev_STP: sorted_token_ids = %lu bytes\n", sorted_token_ids.numel() * sorted_token_ids.element_size());
-    printf("[DEV_BUF] dev_SEP: sorted_expert_ids = %lu bytes\n", sorted_expert_ids.numel() * sorted_expert_ids.element_size());
-    printf("[DEV_BUF] dev_SW: sorted_weights = %lu bytes\n", sorted_weights.has_value() ? sorted_weights.value().numel() * sorted_weights.value().element_size() : 0);
-    printf("[DEV_BUF] dev_Qscl: w1_lqq_scale = %lu bytes\n", w1_lqq_scale.has_value() ? w1_lqq_scale.value().numel() * w1_lqq_scale.value().element_size() : 0);
-    printf("[DEV_BUF] dev_Qzero: w1_lqq_zero = %lu bytes\n", w1_lqq_zero.has_value() ? w1_lqq_zero.value().numel() * w1_lqq_zero.value().element_size() : 0);
+    printf("[DEV_BUF] ptr_O: out = %lu bytes\n", out.numel() * out.element_size());
+    printf("[DEV_BUF] ptr_X: input = %lu bytes\n", input.numel() * input.element_size());
+    printf("[DEV_BUF] ptr_GU: w1 = %lu bytes\n", w1.numel() * w1.element_size());
+    printf("[DEV_BUF] ptr_XC: num_valid_ids = %lu bytes\n", num_valid_ids.numel() * num_valid_ids.element_size());
+    printf("[DEV_BUF] ptr_XQ: a1_scale = %lu bytes\n", a1_scale.has_value() ? a1_scale.value().numel() * a1_scale.value().element_size() : 0);
+    printf("[DEV_BUF] ptr_GUQ: w1_scale = %lu bytes\n", w1_scale.has_value() ? w1_scale.value().numel() * w1_scale.value().element_size() : 0);
+    printf("[DEV_BUF] ptr_SMQ: fc2_smooth_scale = %lu bytes\n", fc2_smooth_scale.has_value() ? fc2_smooth_scale.value().numel() * fc2_smooth_scale.value().element_size() : 0);
+    printf("[DEV_BUF] ptr_STP: sorted_token_ids = %lu bytes\n", sorted_token_ids.numel() * sorted_token_ids.element_size());
+    printf("[DEV_BUF] ptr_SEP: sorted_expert_ids = %lu bytes\n", sorted_expert_ids.numel() * sorted_expert_ids.element_size());
+    printf("[DEV_BUF] ptr_SW: sorted_weights = %lu bytes\n", sorted_weights.has_value() ? sorted_weights.value().numel() * sorted_weights.value().element_size() : 0);
+    printf("[DEV_BUF] ptr_Qscl: w1_lqq_scale = %lu bytes\n", w1_lqq_scale.has_value() ? w1_lqq_scale.value().numel() * w1_lqq_scale.value().element_size() : 0);
+    printf("[DEV_BUF] ptr_Qzero: w1_lqq_zero = %lu bytes\n", w1_lqq_zero.has_value() ? w1_lqq_zero.value().numel() * w1_lqq_zero.value().element_size() : 0);
     printf("gdx:%d, gdy:%d, gdz:%d, bdx:%d\n", gdx, gdy, gdz, bdx);
 
     //uint32_t group_in_k_lqq = 64;
@@ -760,6 +760,8 @@ void moe_stage2_g1u1(
     args.splitk                = splitk;
     args.ptr_SWBuffer = sorted_weights.has_value() ? sorted_weights.value().data_ptr() : nullptr;
     args.stride_expert_dequant_D = stride_expert_dequant_D;
+    args.ptr_DScaleBuffer = w2_lqq_scale.has_value() ? w2_lqq_scale.value().data_ptr() : nullptr;
+    args.ptr_DZeroBuffer = w2_lqq_zero.has_value() ? w2_lqq_zero.value().data_ptr() : nullptr;
 
     uint32_t k_num = 1;
 
@@ -775,19 +777,19 @@ void moe_stage2_g1u1(
     int gdz = k_num;
 
     args.log();
-    //printf("[DEV_BUF] ptr_OBuffer: out = %lu bytes\n", out.numel() * out.element_size());
-    //printf("[DEV_BUF] ptr_XBuffer: inter_states = %lu bytes\n", inter_states.numel() * inter_states.element_size());
-    //printf("[DEV_BUF] ptr_DBuffer: w2 = %lu bytes\n", w2.numel() * w2.element_size());
-    //printf("[DEV_BUF] ptr_XCBuffer: num_valid_ids = %lu bytes\n", num_valid_ids.numel() * num_valid_ids.element_size());
-    //printf("[DEV_BUF] ptr_ScaleXBuffer: a2_scale = %lu bytes\n", a2_scale.has_value() ? a2_scale.value().numel() * a1_scale.value().element_size() : 0);
-    //printf("[DEV_BUF] ptr_ScaleDBuffer: w2_scale = %lu bytes\n", w2_scale.has_value() ? w2_scale.value().numel() * w1_scale.value().element_size() : 0);
-    //printf("[DEV_BUF] ptr_STPBuffer: sorted_token_ids = %lu bytes\n", sorted_token_ids.has_value() ? sorted_token_ids.value().numel() * sorted_token_ids.value().element_size() : 0);
-    //printf("[DEV_BUF] ptr_SEPBuffer: sorted_expert_ids = %lu bytes\n", sorted_expert_ids.numel() * sorted_expert_ids.element_size());
-    //printf("[DEV_BUF] dev_Qscl: w1_lqq_scale = %lu bytes\n", w1_lqq_scale.has_value() ? w1_lqq_scale.value().numel() * w1_lqq_scale.value().element_size() : 0);
-    //printf("[DEV_BUF] dev_Qzero: w1_lqq_zero = %lu bytes\n", w1_lqq_zero.has_value() ? w1_lqq_zero.value().numel() * w1_lqq_zero.value().element_size() : 0);
+    printf("[DEV_BUF] ptr_OBuffer       : out               = %lu bytes\n", out.numel() * out.element_size());
+    printf("[DEV_BUF] ptr_XBuffer       : inter_states      = %lu bytes\n", inter_states.numel() * inter_states.element_size());
+    printf("[DEV_BUF] ptr_DBuffer       : w2                = %lu bytes\n", w2.numel() * w2.element_size());
+    printf("[DEV_BUF] ptr_XCBuffer      : num_valid_ids     = %lu bytes\n", num_valid_ids.numel() * num_valid_ids.element_size());
+    printf("[DEV_BUF] ptr_ScaleXBuffer  : a2_scale          = %lu bytes\n", a2_scale.has_value() ? a2_scale.value().numel() * a2_scale.value().element_size() : 0);
+    printf("[DEV_BUF] ptr_ScaleDBuffer  : w2_scale          = %lu bytes\n", w2_scale.has_value() ? w2_scale.value().numel() * w2_scale.value().element_size() : 0);
+    printf("[DEV_BUF] ptr_STPBuffer     : sorted_token_ids  = %lu bytes\n", sorted_token_ids.numel() * sorted_token_ids.element_size());
+    printf("[DEV_BUF] ptr_SEPBuffer     : sorted_expert_ids = %lu bytes\n", sorted_expert_ids.numel() * sorted_expert_ids.element_size());
+    printf("[DEV_BUF] ptr_SWBuffer      : sorted_weights    = %lu bytes\n", sorted_weights.has_value() ? sorted_weights.value().numel() * sorted_weights.value().element_size() : 0);
+    printf("[DEV_BUF] ptr_DScaleBuffer  : w2_lqq_scale      = %lu bytes\n", w2_lqq_scale.has_value() ? w2_lqq_scale.value().numel() * w2_lqq_scale.value().element_size() : 0);
+    printf("[DEV_BUF] ptr_DZeroBuffer   : w2_lqq_zero       = %lu bytes\n", w2_lqq_zero.has_value() ? w2_lqq_zero.value().numel() * w2_lqq_zero.value().element_size() : 0);
     printf("gdx:%d, gdy:%d, gdz:%d, bdx:%d\n", gdx, gdy, gdz, bdx);
 
-    return;
     impl_ptr->launch_kernel({&args,
                              &arg_size,
                              gdx, // gdx

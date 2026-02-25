@@ -1301,7 +1301,8 @@ def asm_stage2(
         activation,
         splitk,
     )
-    return None
+
+    return out
 
 
 def torch_moe(
