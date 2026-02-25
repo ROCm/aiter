@@ -574,10 +574,10 @@ __device__ __forceinline__ int32_t get_kv_ld_row(const int32_t* p_kv_indices,
     }
     else
     {
-        const hk::i32x4 srsrc = hk::make_srsrc(p_kv_indices, 0xffffffff);
+        const __amdgpu_buffer_rsrc_t rsrc = __builtin_amdgcn_make_buffer_rsrc(
+            const_cast<void*>(static_cast<const void*>(p_kv_indices)), 0, 0xffffffff, 0x00020000);
         row_kv_ld =
-            hk::llvm_amdgcn_raw_buffer_load_i32(srsrc, row_kv_ld_idx * sizeof(int32_t), 0, 0);
-        // row_kv_ld = p_kv_indices[row_kv_ld_idx];
+            __builtin_amdgcn_raw_buffer_load_b32(rsrc, row_kv_ld_idx * sizeof(int32_t), 0, 0);
     }
 
     return row_kv_ld;
