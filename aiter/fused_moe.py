@@ -946,13 +946,9 @@ def get_2stage_cfgs(
             flydsl_block_m = default_flydsl_block_m
 
         def get_dsl_block_m():
-            # W4A16 (bf16 activations, elem_bytes=2) needs block_m >= 32
-            # to satisfy the 16B alignment constraint in FlyDSL stage2:
-            #   bytes_per_thread_x = block_m * tile_k * elem_bytes / total_threads
-            #   With tile_k=64, elem_bytes=2, total_threads=256:
-            #     block_m=16 -> 8 (fails 16B check), block_m=32 -> 16 (OK)
-            # fp8 (elem_bytes=1) can use block_m=16 safely.
-            min_block_m = 32 if (_is_flydsl_w4a16 or _is_flydsl_bf16) else 16
+            # W4A16/bf16: stage2 tile_k raised to 128 when block_m<=16,
+            # so 16B alignment holds (16*128*2/256=16).
+            min_block_m = 16
             if token > 128:
                 return max(32, min_block_m)
             else:
@@ -2303,7 +2299,7 @@ def flydsl_moe_stage2(
 
     tile_m = int(block_m) if block_m is not None else 64
     tile_n = 256
-    tile_k = 64 # 128
+    tile_k = 128 if tile_m <= 16 else 64
 
     sorted_ids = sorted_token_ids.contiguous()
     sorted_eids = sorted_expert_ids.contiguous()
