@@ -205,6 +205,7 @@ def _fused_kv_cache_kernel(
 # Combines: batch matmul + RoPE + KV cache update
 # Useful for MLA decode where QK projection + RoPE + cache happen together
 ```
+***[Cagri]: General aiter change, maybe we should pu this kernel under gemm/fused?.***
 
 ## Writing Tests
 
