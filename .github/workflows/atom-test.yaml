@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
   workflow_dispatch:
 
 concurrency:
@@ -20,6 +25,7 @@ env:
 
 jobs:
   check-signal:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -32,6 +38,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   atom_benchmark:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     needs: [check-signal]
     name: ATOM Benchmark 
     strategy:

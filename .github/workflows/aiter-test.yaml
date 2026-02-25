@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
     branches: [main]  # Triggers on PRs targeting `main`
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+
   workflow_dispatch:
 
 concurrency:
@@ -19,6 +25,7 @@ env:
 
 jobs:
   check-signal:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -31,6 +38,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   build_aiter_image:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     runs-on: build-only-aiter
     needs: check-signal
     steps:
@@ -104,6 +112,7 @@ jobs:
           echo "Successfully prepared image: rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}"
       
   standard:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     name: Standard Tests (1 GPU)
     needs: build_aiter_image 
     strategy:
