@@ -29,7 +29,6 @@ from gemm_a8w8_blockscale_preshuffleQuant_cktile_instance import (
     candidate_kernels_cktile_dict_preshuffleQuant,
 )
 
-
 block_shape = (128, 128)
 
 
