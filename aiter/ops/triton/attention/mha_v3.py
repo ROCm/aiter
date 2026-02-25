@@ -412,7 +412,7 @@ def flash_attn_with_kvcache_fake_tensor(
 
     # establish layout / varlen & max seq lens
     # https://github.com/ROCm/aiter/blob/7411c99753f0661a3eecdbdb1b36feb58539f62b/aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/interface_v3.py#L156C5-L156C47
-    if cu_seqlens_q is not None: # thd: [total_tokens, num_heads, head_dim]
+    if cu_seqlens_q is not None:  # thd: [total_tokens, num_heads, head_dim]
         total_q = q.shape[0]
         num_heads = q.shape[1]
         head_dim = q.shape[2]
@@ -428,7 +428,7 @@ def flash_attn_with_kvcache_fake_tensor(
             dtype=torch.float32,
             device=q.device,
         )
-    else: # bshd: [batch, seqlen, num_heads, head_dim]
+    else:  # bshd: [batch, seqlen, num_heads, head_dim]
         batch_size = q.shape[0]
         seqlen_q = q.shape[1]
         num_heads = q.shape[2]

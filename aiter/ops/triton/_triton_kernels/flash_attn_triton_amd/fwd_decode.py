@@ -973,7 +973,9 @@ def attention_forward_decode_triton_impl(
             # Non-paged attention: scatter new tokens directly into the dense cache.
             if cache_seqlens is not None:
                 insert_positions = cache_seqlens.long()[:, None] + token_offsets
-                batch_idx = torch.arange(batch_size, device=k_new.device, dtype=torch.long)[:, None]
+                batch_idx = torch.arange(
+                    batch_size, device=k_new.device, dtype=torch.long
+                )[:, None]
                 k_cache[batch_idx, insert_positions] = k_new
                 v_cache[batch_idx, insert_positions] = v_new
                 cache_seqlens.add_(seqlen_new)
@@ -993,18 +995,26 @@ def attention_forward_decode_triton_impl(
                 # A slot is unoccupied when block_table[b, block_idx] < 0.
                 invalid_mask = block_table < 0  # [batch, num_blocks]
                 has_invalid = invalid_mask.any(dim=1)  # [batch]
-                first_invalid_idx = invalid_mask.to(torch.int32).argmax(dim=1).long()  # [batch]
+                first_invalid_idx = (
+                    invalid_mask.to(torch.int32).argmax(dim=1).long()
+                )  # [batch]
                 start_idx = torch.where(
                     has_invalid,
                     first_invalid_idx * block_size,
-                    torch.full_like(first_invalid_idx, block_table.shape[1] * block_size),
+                    torch.full_like(
+                        first_invalid_idx, block_table.shape[1] * block_size
+                    ),
                 )
 
             insert_positions = start_idx[:, None] + token_offsets
             block_indices = insert_positions // block_size
             within_block_indices = insert_positions % block_size
-            batch_idx = torch.arange(batch_size, device=k_new.device, dtype=torch.long)[:, None]
-            physical_blocks = block_table[batch_idx, block_indices]  # [batch, seqlen_new]
+            batch_idx = torch.arange(batch_size, device=k_new.device, dtype=torch.long)[
+                :, None
+            ]
+            physical_blocks = block_table[
+                batch_idx, block_indices
+            ]  # [batch, seqlen_new]
 
             flat_phys = physical_blocks.reshape(-1)
             flat_within = within_block_indices.reshape(-1)

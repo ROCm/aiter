@@ -14,6 +14,7 @@ SEED = 0
 # adopted from
 # https://github.com/Dao-AILab/flash-attention/blob/main/hopper/test_flash_attn_triton_amd.py#L628-L959
 
+
 def construct_local_mask(
     seqlen_q,
     seqlen_k,
@@ -23,7 +24,9 @@ def construct_local_mask(
     device=None,
     key_leftpad=None,
 ):
-    row_idx = rearrange(torch.arange(seqlen_q, device=device, dtype=torch.long), "s -> s 1")
+    row_idx = rearrange(
+        torch.arange(seqlen_q, device=device, dtype=torch.long), "s -> s 1"
+    )
     col_idx = torch.arange(seqlen_k, device=device, dtype=torch.long)
     if key_leftpad is not None:
         key_leftpad = rearrange(key_leftpad, "b -> b 1 1 1")
@@ -88,7 +91,9 @@ def attention_ref(
         scores = scores.tanh()
         scores = scores * softcap
     if key_padding_mask is not None:
-        scores.masked_fill_(rearrange(~key_padding_mask, "b s -> b 1 1 s"), float("-inf"))
+        scores.masked_fill_(
+            rearrange(~key_padding_mask, "b s -> b 1 1 s"), float("-inf")
+        )
     if window_size[0] >= 0 or window_size[1] >= 0:
         local_mask = construct_local_mask(
             seqlen_q,
@@ -104,9 +109,13 @@ def attention_ref(
         scores = scores + attn_bias
     attention = torch.softmax(scores, dim=-1).to(v.dtype)
     if window_size[0] >= 0 or window_size[1] >= 0:
-        attention = attention.masked_fill(torch.all(local_mask, dim=-1, keepdim=True), 0.0)
+        attention = attention.masked_fill(
+            torch.all(local_mask, dim=-1, keepdim=True), 0.0
+        )
     if query_padding_mask is not None:
-        attention = attention.masked_fill(rearrange(~query_padding_mask, "b s -> b 1 s 1"), 0.0)
+        attention = attention.masked_fill(
+            rearrange(~query_padding_mask, "b s -> b 1 s 1"), 0.0
+        )
     dropout_scaling = 1.0 / (1 - dropout_p)
     if dropout_mask is not None:
         attention_drop = attention.masked_fill(~dropout_mask, 0.0)
@@ -208,8 +217,12 @@ def test_flash_attn_kvcache(
         k, v = None, None
 
     if paged_kv_block_size is None:
-        k_cache = torch.randn(batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype)
-        v_cache = torch.randn(batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype)
+        k_cache = torch.randn(
+            batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype
+        )
+        v_cache = torch.randn(
+            batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype
+        )
         block_table = None
     else:
         (
@@ -239,7 +252,8 @@ def test_flash_attn_kvcache(
     v_cache_ref = v_cache.clone()
     if new_kv:
         update_mask = torch.logical_and(
-            cache_seqlens_expanded <= arange, arange < cache_seqlens_expanded + seqlen_new
+            cache_seqlens_expanded <= arange,
+            arange < cache_seqlens_expanded + seqlen_new,
         )
         k_cache_ref[update_mask] = rearrange(k, "b s ... -> (b s) ...")
         v_cache_ref[update_mask] = rearrange(v, "b s ... -> (b s) ...")
@@ -291,7 +305,6 @@ def test_flash_attn_kvcache(
         reorder_ops=True,
     )
 
-
     if new_kv:
         if paged_kv_block_size is None:
             k_cache_select = k_cache
@@ -307,10 +320,12 @@ def test_flash_attn_kvcache(
                 "(b nblocks) block_size ... -> b (nblocks block_size) ...",
                 b=batch_size,
             )[:, :seqlen_k]
-        assert torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3), \
-            "k_cache was not updated correctly"
-        assert torch.equal(v_cache_select, v_cache_ref), \
-            "v_cache was not updated correctly"
+        assert torch.allclose(
+            k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3
+        ), "k_cache was not updated correctly"
+        assert torch.equal(
+            v_cache_select, v_cache_ref
+        ), "v_cache was not updated correctly"
 
     pt_max_diff = (out_pt - out_ref).abs().max().item()
     our_max_diff = (out - out_ref).abs().max().item()
@@ -319,7 +334,6 @@ def test_flash_attn_kvcache(
         f"Output max diff {our_max_diff:.6e} exceeds "
         f"{mult}x Pytorch baseline diff {pt_max_diff:.6e} + 1e-5"
     )
-
 
 
 # torch.compile tests
@@ -346,18 +360,27 @@ def test_flash_attn_kvcache_torch_compile(
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
     k_cache = torch.randn(batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype)
     v_cache = torch.randn(batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype)
-    cache_seqlens = torch.randint(1, seqlen_k + 1, (batch_size,), dtype=torch.int32, device=device)
+    cache_seqlens = torch.randint(
+        1, seqlen_k + 1, (batch_size,), dtype=torch.int32, device=device
+    )
 
     if new_kv:
-        k_new = torch.randn(batch_size, seqlen_q, nheads_k, d, device=device, dtype=dtype)
-        v_new = torch.randn(batch_size, seqlen_q, nheads_k, d, device=device, dtype=dtype)
+        k_new = torch.randn(
+            batch_size, seqlen_q, nheads_k, d, device=device, dtype=dtype
+        )
+        v_new = torch.randn(
+            batch_size, seqlen_q, nheads_k, d, device=device, dtype=dtype
+        )
     else:
         k_new, v_new = None, None
 
     def fn(q, k_cache, v_cache, k_new, v_new, cache_seqlens):
         return flash_attn_with_kvcache(
-            q, k_cache, v_cache,
-            k=k_new, v=v_new,
+            q,
+            k_cache,
+            v_cache,
+            k=k_new,
+            v=v_new,
             cache_seqlens=cache_seqlens,
             causal=causal,
         )
@@ -386,6 +409,7 @@ def test_flash_attn_kvcache_torch_compile(
 
 # Manual graph capture tests
 
+
 @pytest.mark.parametrize("new_kv", [False, True])
 @pytest.mark.parametrize("mha_type", ["mha", "gqa"])
 @pytest.mark.parametrize("d", [128])
@@ -409,8 +433,12 @@ def test_flash_attn_kvcache_hipgraph_capture(d, mha_type, new_kv):
     )
 
     if new_kv:
-        k_new = torch.randn(batch_size, seqlen_q, nheads_k, d, device=device, dtype=dtype)
-        v_new = torch.randn(batch_size, seqlen_q, nheads_k, d, device=device, dtype=dtype)
+        k_new = torch.randn(
+            batch_size, seqlen_q, nheads_k, d, device=device, dtype=dtype
+        )
+        v_new = torch.randn(
+            batch_size, seqlen_q, nheads_k, d, device=device, dtype=dtype
+        )
     else:
         k_new, v_new = None, None
 
@@ -423,8 +451,11 @@ def test_flash_attn_kvcache_hipgraph_capture(d, mha_type, new_kv):
     # warmup (Triton JIT compiles kernels on first invocation)
     for _ in range(3):
         _ = flash_attn_with_kvcache(
-            q, k_cache, v_cache,
-            k=k_new, v=v_new,
+            q,
+            k_cache,
+            v_cache,
+            k=k_new,
+            v=v_new,
             cache_seqlens=cache_seqlens,
             causal=True,
         )
@@ -443,8 +474,11 @@ def test_flash_attn_kvcache_hipgraph_capture(d, mha_type, new_kv):
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         out_graph = flash_attn_with_kvcache(
-            q, k_cache, v_cache,
-            k=k_new, v=v_new,
+            q,
+            k_cache,
+            v_cache,
+            k=k_new,
+            v=v_new,
             cache_seqlens=cache_seqlens,
             causal=True,
         )
@@ -471,8 +505,11 @@ def test_flash_attn_kvcache_hipgraph_capture(d, mha_type, new_kv):
         (batch_size,), initial_cache_len, dtype=torch.int32, device=device
     )
     out_eager = flash_attn_with_kvcache(
-        q_eager, k_cache_eager, v_cache_eager,
-        k=k_new_orig, v=v_new_orig,
+        q_eager,
+        k_cache_eager,
+        v_cache_eager,
+        k=k_new_orig,
+        v=v_new_orig,
         cache_seqlens=cache_seqlens_eager,
         causal=True,
     )
@@ -483,7 +520,9 @@ def test_flash_attn_kvcache_hipgraph_capture(d, mha_type, new_kv):
 
     assert not torch.isnan(out_graph).any(), "HIP graph replay 1 produced NaN"
     diff1 = (out_eager - out_graph).abs().max().item()
-    assert diff1 < 1e-5, f"HIP graph replay 1 vs eager max diff {diff1:.6e} exceeds 1e-5"
+    assert (
+        diff1 < 1e-5
+    ), f"HIP graph replay 1 vs eager max diff {diff1:.6e} exceeds 1e-5"
 
     # second replay with new data (simulates next decode step)
     q_new_data = torch.randn_like(q)
@@ -506,8 +545,11 @@ def test_flash_attn_kvcache_hipgraph_capture(d, mha_type, new_kv):
     out_graph_2 = out_graph.clone()
 
     out_eager_2 = flash_attn_with_kvcache(
-        q_new_data, k_cache_orig.clone(), v_cache_orig.clone(),
-        k=k_new_data, v=v_new_data,
+        q_new_data,
+        k_cache_orig.clone(),
+        v_cache_orig.clone(),
+        k=k_new_data,
+        v=v_new_data,
         cache_seqlens=torch.full(
             (batch_size,), new_cache_len, dtype=torch.int32, device=device
         ),
@@ -520,4 +562,6 @@ def test_flash_attn_kvcache_hipgraph_capture(d, mha_type, new_kv):
 
     assert not torch.isnan(out_graph_2).any(), "HIP graph replay 2 produced NaN"
     diff2 = (out_eager_2 - out_graph_2).abs().max().item()
-    assert diff2 < 1e-5, f"HIP graph replay 2 vs eager max diff {diff2:.6e} exceeds 1e-5"
+    assert (
+        diff2 < 1e-5
+    ), f"HIP graph replay 2 vs eager max diff {diff2:.6e} exceeds 1e-5"
