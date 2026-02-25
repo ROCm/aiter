@@ -92,6 +92,20 @@ jobs:
           IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
           docker build --network=host --no-cache -t $IMAGE_TAG -f Dockerfile.mod .
 
+      - name: Verify prebuilt kernels
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        run: |
+          IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
+          echo "=== Prebuilt kernel validation ==="
+          KERNEL_COUNT=$(docker run --rm $IMAGE_TAG find /aiter/aiter/jit -name "*.so" | wc -l)
+          echo "Prebuilt kernel .so files: $KERNEL_COUNT"
+          docker run --rm $IMAGE_TAG find /aiter/aiter/jit -name "*.so" | sort
+          if [ "$KERNEL_COUNT" -lt 10 ]; then
+            echo "::warning::Prebuild may have failed: expected at least 10 kernel .so files, found $KERNEL_COUNT. This can cause JIT compilation and OOM at runtime."
+          else
+            echo "Prebuild validation passed: $KERNEL_COUNT kernels compiled"
+          fi
+
       - name: Push Docker image
         if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
