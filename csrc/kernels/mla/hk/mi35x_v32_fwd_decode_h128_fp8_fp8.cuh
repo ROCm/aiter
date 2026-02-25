@@ -12,7 +12,7 @@
 
 template <typename T>
 __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
-    __attribute__((amdgpu_num_vgpr(72))) void kn_mi3xx_mla_v32_fwd_decode_h128_fp8_fp8(
+    __attribute__((amdgpu_num_vgpr(72))) void kn_mi35x_mla_v32_fwd_decode_h128_fp8_fp8(
         HkMlaDecodeFwdParams<T> params)
 {
     using q_t     = T::q_t;
@@ -579,7 +579,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 }
 
 template <typename Traits>
-void mi3xx_mla_v32_fwd_decode_h128_fp8_fp8(torch::Tensor& query,
+void mi35x_mla_v32_fwd_decode_h128_fp8_fp8(torch::Tensor& query,
                                            torch::Tensor& kv_buffer,
                                            const torch::Tensor& qo_indptr,
                                            const torch::Tensor& kv_indptr,
@@ -642,11 +642,11 @@ void mi3xx_mla_v32_fwd_decode_h128_fp8_fp8(torch::Tensor& query,
     const dim3 grid        = dim3(dev_prop.multiProcessorCount);
     const int32_t lds_size = dev_prop.maxSharedMemoryPerMultiProcessor / Traits::kOccupancy;
 
-    kn_mi3xx_mla_v32_fwd_decode_h128_fp8_fp8<Traits>
+    kn_mi35x_mla_v32_fwd_decode_h128_fp8_fp8<Traits>
         <<<grid, Traits::kNumThreads, lds_size, stream>>>(params);
 }
 
-void hk_mi3xx_mla_v32_fwd_decode_h128_fp8_fp8(torch::Tensor& query,
+void hk_mi35x_mla_v32_fwd_decode_h128_fp8_fp8(torch::Tensor& query,
                                               torch::Tensor& kv_buffer,
                                               const torch::Tensor& qo_indptr,
                                               const torch::Tensor& kv_indptr,
@@ -672,7 +672,7 @@ void hk_mi3xx_mla_v32_fwd_decode_h128_fp8_fp8(torch::Tensor& query,
     if(q_is_fp8 && kv_is_fp8)
     {
         using Traits = HkMlaDecodeFwdTraits<hk::fp8e4m3, hk::fp8e4m3, hk::bf16, 128>;
-        mi3xx_mla_v32_fwd_decode_h128_fp8_fp8<Traits>(query,
+        mi35x_mla_v32_fwd_decode_h128_fp8_fp8<Traits>(query,
                                                       kv_buffer,
                                                       qo_indptr,
                                                       kv_indptr,
@@ -689,7 +689,7 @@ void hk_mi3xx_mla_v32_fwd_decode_h128_fp8_fp8(torch::Tensor& query,
     else
     {
         TORCH_CHECK(false,
-                    "hk_mi3xx_mla_v32_fwd_decode_h128_fp8_fp8 doesn't support q type ",
+                    "hk_mi35x_mla_v32_fwd_decode_h128_fp8_fp8 doesn't support q type ",
                     toString(query.scalar_type()),
                     " and kv type",
                     toString(kv_buffer.scalar_type()),

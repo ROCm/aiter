@@ -3,6 +3,7 @@
 
 #include "mla.h"
 #include "hk/mi3xx_v32_fwd_decode_h128_fp8_fp8.cuh"
+#include "hk/mi35x_v32_fwd_decode_h128_fp8_fp8.cuh"
 
 void hk_mla_decode_fwd(
     torch::Tensor& query,
@@ -20,23 +21,44 @@ void hk_mla_decode_fwd(
     torch::Tensor& final_output)
 {
     const int32_t num_head = query.size(1);
+    const std::string arch_id = get_gpu_arch();
 
     if (num_head == 128)
     {
-        hk_mi3xx_mla_v32_fwd_decode_h128_fp8_fp8(
-            query,
-            kv_buffer,
-            qo_indptr,
-            kv_indptr,
-            kv_page_indices,
-            kv_last_page_lens,
-            work_indptr,
-            work_info_set,
-            max_seqlen_q,
-            softmax_scale,
-            split_output,
-            split_lse,
-            final_output);
+        if (arch_id == "gfx950")
+        {
+            hk_mi35x_mla_v32_fwd_decode_h128_fp8_fp8(
+                query,
+                kv_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_page_indices,
+                kv_last_page_lens,
+                work_indptr,
+                work_info_set,
+                max_seqlen_q,
+                softmax_scale,
+                split_output,
+                split_lse,
+                final_output);
+        }
+        else
+        {
+            hk_mi3xx_mla_v32_fwd_decode_h128_fp8_fp8(
+                query,
+                kv_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_page_indices,
+                kv_last_page_lens,
+                work_indptr,
+                work_info_set,
+                max_seqlen_q,
+                softmax_scale,
+                split_output,
+                split_lse,
+                final_output);
+        }
     }
     else
     {
