@@ -22,6 +22,51 @@ from aiter.utility import fp4_utils
 
 BLOCK_SIZE_M = 32
 
+_USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
+
+
+def _moe_sorting_impl(
+    topk_ids,
+    topk_weights,
+    num_experts,
+    model_dim,
+    moebuf_dtype,
+    block_size,
+    expert_mask,
+    num_local_tokens,
+    dispatch_policy,
+    use_opus,
+):
+    device = topk_ids.device
+    M, topk = topk_ids.shape
+    max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
+
+    max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
+    sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
+    sorted_weights = torch.empty(
+        max_num_tokens_padded, dtype=dtypes.fp32, device=device
+    )
+    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+
+    fwd_fn = aiter.moe_sorting_opus_fwd if use_opus else aiter.moe_sorting_fwd
+    fwd_fn(
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        num_experts,
+        int(block_size),
+        expert_mask,
+        num_local_tokens,
+        dispatch_policy,
+    )
+    return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
+
 
 def moe_sorting(
     topk_ids,
@@ -35,42 +80,28 @@ def moe_sorting(
     dispatch_policy=0,
 ):
     try:
-        device = topk_ids.device
-        M, topk = topk_ids.shape
-        max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
-
-        max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
-        sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
-        sorted_weights = torch.empty(
-            max_num_tokens_padded, dtype=dtypes.fp32, device=device
-        )
-        sorted_expert_ids = torch.empty(
-            max_num_m_blocks, dtype=dtypes.i32, device=device
-        )
-        num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
-
-        aiter.moe_sorting_fwd(
+        return _moe_sorting_impl(
             topk_ids,
             topk_weights,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            moe_buf,
             num_experts,
-            int(block_size),
+            model_dim,
+            moebuf_dtype,
+            block_size,
             expert_mask,
             num_local_tokens,
             dispatch_policy,
+            use_opus=_USE_OPUS_MOE_SORTING,
         )
     except Exception as e:
         logger.error(f"Error in moe_sorting: {e}")
+        max_num_tokens_padded = int(
+            topk_ids.numel() + num_experts * block_size - topk_ids.shape[1]
+        )
+        topk = topk_ids.shape[1]
         logger.error(
             f"Moe_sorting info: {max_num_tokens_padded=} {block_size=} {num_experts=} {topk=} {topk_ids.shape=}"
         )
         raise e
-    return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
 
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.

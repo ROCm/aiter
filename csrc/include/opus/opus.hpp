@@ -9,9 +9,17 @@
  **************************************************************************************************/
 #pragma once
 
-#include <array>
+// clang-format off
 #include <type_traits>
 #include <utility>
+
+#ifndef OPUS_ENABLE_RUNTIME_QUERY
+#define OPUS_ENABLE_RUNTIME_QUERY 0
+#endif
+
+#if OPUS_ENABLE_RUNTIME_QUERY && defined(__HIPCC__) && !defined(__HIP_DEVICE_COMPILE__)
+#include <hip/hip_runtime_api.h>
+#endif
 
 #ifdef __HIPCC__
 #define OPUS_H inline __host__
@@ -35,23 +43,16 @@
 #define OPUS_TILE_CONTAINER 0 // 0:vector, 1:array of vector, 2:flattened array
 #endif
 
-// clang-format off
 namespace opus {
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // type traits
-using std::remove_reference;
-using std::remove_reference_t;
-using std::remove_cv;
-using std::remove_cv_t;
-using std::is_same;
-using std::is_same_v;
-
+using std::remove_reference; using std::remove_reference_t; using std::remove_cv; using std::remove_cv_t; using std::is_same; using std::is_same_v;
 template<typename T> struct remove_cvref { using type = remove_cv_t<remove_reference_t<T>>; };
 template<typename T> using remove_cvref_t = remove_cv_t<remove_reference_t<T>>;
-
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // constant
 using index_t = int;
+using long_index_t = int64_t;
 
 template<index_t I> struct number : public std::integral_constant<index_t, I> {};
 template<bool B>    struct bool_constant : public std::bool_constant<B> {};
@@ -73,28 +74,12 @@ OPUS_H_D constexpr decltype(auto) operator""_I() {
 #define OPUS_LEFT_UNARY_OP(OP) template <auto x>         OPUS_H_D constexpr auto operator OP(number<x>)            { return number<(OP x)>{};   }
 #define OPUS_BINARY_OP(OP)     template <auto x, auto y> OPUS_H_D constexpr auto operator OP(number<x>, number<y>) { return number<(x OP y)>{}; }
 
-OPUS_LEFT_UNARY_OP(+)
-OPUS_LEFT_UNARY_OP(-)
-OPUS_LEFT_UNARY_OP(~)
-OPUS_LEFT_UNARY_OP(!)
-OPUS_BINARY_OP(+)
-OPUS_BINARY_OP(-)
-OPUS_BINARY_OP(*)
-OPUS_BINARY_OP(/)
-OPUS_BINARY_OP(%)
-OPUS_BINARY_OP(&)
-OPUS_BINARY_OP(|)
-OPUS_BINARY_OP(^)
-OPUS_BINARY_OP(<<)
-OPUS_BINARY_OP(>>)
-OPUS_BINARY_OP(&&)
-OPUS_BINARY_OP(||)
-OPUS_BINARY_OP(==)
-OPUS_BINARY_OP(!=)
-OPUS_BINARY_OP(>)
-OPUS_BINARY_OP(<)
-OPUS_BINARY_OP(>=)
-OPUS_BINARY_OP(<=)
+OPUS_LEFT_UNARY_OP(+) OPUS_LEFT_UNARY_OP(-) OPUS_LEFT_UNARY_OP(~) OPUS_LEFT_UNARY_OP(!)
+OPUS_BINARY_OP(+)   OPUS_BINARY_OP(-)   OPUS_BINARY_OP(*)   OPUS_BINARY_OP(/)
+OPUS_BINARY_OP(%)   OPUS_BINARY_OP(&)   OPUS_BINARY_OP(|)   OPUS_BINARY_OP(^)
+OPUS_BINARY_OP(<<)  OPUS_BINARY_OP(>>)  OPUS_BINARY_OP(&&)  OPUS_BINARY_OP(||)
+OPUS_BINARY_OP(==)  OPUS_BINARY_OP(!=)  OPUS_BINARY_OP(>)   OPUS_BINARY_OP(<)
+OPUS_BINARY_OP(>=)  OPUS_BINARY_OP(<=)
 
 #undef OPUS_LEFT_UNARY_OP
 #undef OPUS_BINARY_OP
@@ -449,18 +434,14 @@ template<typename T, std::enable_if_t<is_tuple_v<T>, bool> = true> OPUS_H_D cons
 template<typename T, std::enable_if_t<is_tuple_v<T>, bool> = true> OPUS_H_D constexpr auto reduce_tuple_mul(const T & t) { return reduce_tuple<opus::multiplies>(t); }
 
 namespace impl {
-template<typename, typename, typename> struct to_peepholed_seq;
+template<typename PT, index_t... Js>
+OPUS_H_D constexpr index_t underscore_count_in(seq<Js...>) { return ((is_underscore_v<remove_cvref_t<decltype(get<Js>(PT{}))>> ? 1 : 0) + ... + 0); }
 
-template<typename PeepholedTuple, index_t I, index_t...Is, typename max_income_num>  struct to_peepholed_seq<PeepholedTuple, seq<I, Is...>, max_income_num> {
-    template<index_t C> OPUS_H_D constexpr auto operator()(number<C>) {
-        constexpr auto next_cumulative = std::conditional_t<is_underscore_v<remove_cvref_t<decltype(get<I>(PeepholedTuple{}))>>,
-                                            number<(C+1) < max_income_num::value ? (C+1) : C>, number<C>>{};
-        return concat_seq(seq<C>{}, to_peepholed_seq<PeepholedTuple, seq<Is...>, max_income_num>{}(next_cumulative) );
-    }
-};
-template<typename PeepholedTuple, index_t I, typename max_income_num>                struct to_peepholed_seq<PeepholedTuple, seq<I>, max_income_num> {
-    template<index_t C> OPUS_H_D constexpr auto operator()(number<C>) { return seq<C>{}; }
-};
+template<typename PT, typename MaxN, index_t I>
+OPUS_H_D constexpr index_t peephole_idx() { constexpr index_t c = underscore_count_in<PT>(make_index_seq<I>{}); return c < MaxN::value ? c : MaxN::value - 1; }
+
+template<typename PT, typename MaxN, index_t... Is>
+OPUS_H_D constexpr auto to_peepholed_seq_impl(seq<Is...>) { return seq<peephole_idx<PT, MaxN, Is>()...>{}; }
 
 template<typename PeepholedTuple, typename IncomTuple, index_t...Ps,  index_t...Is>
 OPUS_H_D constexpr decltype(auto) merge_peepholed_tuple_impl(PeepholedTuple&& pt, IncomTuple&& it, seq<Ps...>, seq<Is...>) {
@@ -473,8 +454,8 @@ template<typename PeepholedTuple, typename IncomeTuple>
 OPUS_H_D constexpr decltype(auto) merge_peepholed_tuple(PeepholedTuple&& pt, IncomeTuple&& it) {
     if constexpr (tuple_count<underscore, PeepholedTuple>() == 0) return pt;
     else {
-        constexpr auto income_seq =  impl::to_peepholed_seq< remove_cvref_t<PeepholedTuple>,        make_index_seq<opus::size<PeepholedTuple>()>,
-                                                             number<opus::size<IncomeTuple>()> >{}(number<0>{});
+        constexpr auto income_seq = impl::to_peepholed_seq_impl< remove_cvref_t<PeepholedTuple>,
+                                                                 number<opus::size<IncomeTuple>()> >(make_index_seq<opus::size<PeepholedTuple>()>{});
         return impl::merge_peepholed_tuple_impl(std::forward<PeepholedTuple>(pt), std::forward<IncomeTuple>(it), make_index_seq<opus::size<PeepholedTuple>()>{}, income_seq);
     }
 }
@@ -506,19 +487,15 @@ template <typename F, typename X> OPUS_H_D constexpr auto transform_tuple_with_i
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // layout, simple linear nd layout with stride, static or dynamic supported
 namespace impl {
-template<typename, typename> struct packed_shape_to_stride_impl;
+template<typename Shape, index_t I, index_t... Js>
+OPUS_H_D constexpr auto packed_stride_at(seq<Js...>) { return (get<I + 1 + Js>(Shape{}) * ... * number<1>{}); }
 
-template<typename Shape, index_t I, index_t... Is> struct packed_shape_to_stride_impl<Shape, seq<I, Is...>>{
-    OPUS_H_D constexpr auto operator()(const Shape&shape, seq<I, Is...>) {
-        auto r = packed_shape_to_stride_impl<Shape, seq<Is...>>{}(shape, seq<Is...>{});
-        return concat_tuple(opus::make_tuple(get<I + 1>(shape) * get<0>(r)), r);
-    }
-};
-template<typename Shape, index_t I> struct packed_shape_to_stride_impl<Shape, seq<I>>{ OPUS_H_D constexpr auto operator()(const Shape& /*shape*/, seq<I>) { return opus::make_tuple(number<1>{}); } };
+template<typename Shape, index_t... Is>
+OPUS_H_D constexpr auto packed_shape_to_stride_impl(seq<Is...>) { return opus::make_tuple(packed_stride_at<Shape, Is>(make_index_seq<Shape::size() - Is - 1>{})...); }
 }
 
 template<typename Shape>
-OPUS_H_D constexpr auto packed_shape_to_stride(const Shape& shape) { constexpr index_t rank = Shape::size(); return impl::packed_shape_to_stride_impl<Shape, make_index_seq<rank>>{}(shape, make_index_seq<rank>{});     }
+OPUS_H_D constexpr auto packed_shape_to_stride(const Shape&) { return impl::packed_shape_to_stride_impl<Shape>(make_index_seq<Shape::size()>{}); }
 
 template<typename Layout, typename Coord>
 OPUS_H_D constexpr decltype(auto) coord_to_linear(const Layout& layout, const Coord& coord) { static_assert(size<decltype(layout.stride())>() == size<Coord>()); return embed(layout.stride(), coord); }
@@ -1128,6 +1105,29 @@ OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
 #undef OPUS_CAST_DEFINE
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // arch
+//
+// ---- HIPCC compilation model (clang-based)  ----
+//   hipcc compiles each translation unit in TWO passes: host pass, then device pass.
+//
+//   Host pass  : __device__ functions are fully parsed, name-resolved, template-instantiated, and constexpr/static_assert evaluated. Only machine code generation is skipped.
+//   Device pass: __host__ functions are truly skipped -- not parsed, not instantiated, not checked.
+//
+//   Key consequences:
+//     1. Architecture macros (__GFX9__, __gfx950__, etc.) are defined ONLY during the device pass. Any #if guard on them will take the #else branch during the host pass.
+//     2. __device__ constexpr variables and static_asserts inside __device__ templates are still evaluated during the host pass (since templates may be instantiated from __global__).
+//     3. If your device code relies on arch-specific preprocessor branches, consider guarding the entire implementation with #if defined(__HIP_DEVICE_COMPILE__) to skip the host pass.
+//
+// ---- get_warp_size() / get_smem_size() ----
+//   OPUS_H_D constexpr -- safe to use everywhere: template defaults, static_assert, constexpr variables, __shared__ array sizes, host launch-parameter calculations, etc.
+//   During the host pass (arch macros absent), they return safe defaults:
+//     get_warp_size() -> 64 (GFX9 default)
+//     get_smem_size() -> 65536 (64 KB, non-gfx950 default)
+//
+// ---- query_warp_size() / query_smem_size() ----
+//   OPUS_H only -- runtime HIP API queries (hipGetDeviceProperties). Use when you need the true hardware value on the host (e.g. occupancy calculations).
+//   Guarded by OPUS_ENABLE_RUNTIME_QUERY (default 0). Define OPUS_ENABLE_RUNTIME_QUERY=1 before
+//   including opus.hpp (or via compiler flag) to enable these functions and the hip_runtime_api.h include.
+//
 OPUS_H_D constexpr index_t get_warp_size()
 {
 #if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
@@ -1136,6 +1136,49 @@ OPUS_H_D constexpr index_t get_warp_size()
     return 32;
 #endif
 }
+OPUS_H_D constexpr index_t get_smem_size()
+{
+#if defined(__gfx950__)
+    return 163840;  // 160KB (CDNA4)
+#else
+    return 65536;   // 64KB
+#endif
+}
+
+#if OPUS_ENABLE_RUNTIME_QUERY
+OPUS_H index_t query_warp_size() { int d; (void)hipGetDevice(&d); hipDeviceProp_t p; (void)hipGetDeviceProperties(&p, d); return static_cast<index_t>(p.warpSize); }
+OPUS_H index_t query_smem_size() { int d; (void)hipGetDevice(&d); hipDeviceProp_t p; (void)hipGetDeviceProperties(&p, d); return static_cast<index_t>(p.sharedMemPerBlock); }
+OPUS_H index_t query_num_cu()    { int d; (void)hipGetDevice(&d); hipDeviceProp_t p; (void)hipGetDeviceProperties(&p, d); return static_cast<index_t>(p.multiProcessorCount); }
+#endif
+
+// Uses compiler builtins (__builtin_amdgcn_*) instead of HIP runtime APIs, so no <hip/hip_runtime.h> dependency.
+#ifdef __HIPCC__
+struct workgroup_barrier {
+    OPUS_D workgroup_barrier(uint32_t* ptr) : base_ptr(ptr) {}
+    OPUS_D uint32_t ld(uint32_t offset = 0) { return __atomic_load_n(base_ptr + offset, __ATOMIC_RELAXED); }
+    OPUS_D void wait_eq(uint32_t value, uint32_t offset = 0) { if (__builtin_amdgcn_workitem_id_x() == 0) while (ld(offset) != value) {} __builtin_amdgcn_s_barrier(); }
+    OPUS_D void wait_lt(uint32_t value, uint32_t offset = 0) { if (__builtin_amdgcn_workitem_id_x() == 0) while (ld(offset) < value) {} __builtin_amdgcn_s_barrier(); }
+    OPUS_D void inc(uint32_t offset = 0) { __builtin_amdgcn_s_barrier(); if (__builtin_amdgcn_workitem_id_x() == 0) __atomic_fetch_add(base_ptr + offset, 1u, __ATOMIC_RELAXED); }
+    uint32_t* base_ptr;
+};
+#endif
+
+// NOTE: all data in unsigned int. Prefer usage, construct a mdiv structure on host, pass the structure to kernel, and use div/divmod
+struct mdiv {
+    uint32_t divisor;   uint32_t multiplier;    uint32_t shift;
+    OPUS_H_D mdiv() : divisor(0), multiplier(0), shift(0) {}
+    OPUS_H_D mdiv(uint32_t divisor_) : divisor(divisor_) {
+        uint32_t shift_u32 = 0;
+        while ((1U << shift_u32) < divisor_) shift_u32++;
+        uint64_t tmp_u64 = static_cast<uint64_t>((1UL << shift_u32) - divisor_) << 32;
+        multiplier       = static_cast<uint32_t>(tmp_u64 / divisor_ + 1);
+        shift            = shift_u32;
+    }
+    // previously we use __umulhi(), which is defined in <hip/hip_runtime.hpp>, for __device__ compilation. Today compiler is smart enough to generate s_mul_hi_u32 / v_mul_hi_u32
+    OPUS_H_D uint32_t div(uint32_t dividend) const { uint32_t tmp = static_cast<uint32_t>((static_cast<uint64_t>(dividend) * multiplier) >> 32); return (tmp + dividend) >> shift; }
+    OPUS_H_D void divmod(uint32_t dividend, uint32_t& quotient, uint32_t& remainder) const { quotient  = div(dividend);  remainder = dividend - (quotient * divisor); }
+    OPUS_H_D uint32_t get() const { return divisor; }
+};
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // math
 template <typename T, int dpp_i, int row_mask = 0xf, int bank_mask = 0xf, bool bound_ctrl = true>
@@ -1153,7 +1196,7 @@ template<> OPUS_D float       max<float>(const float&a, const float&b) { return 
 template<typename T> OPUS_D T min(const T&a, const T&b)                { return a > b ? b : a; }
 template<> OPUS_D float       min<float>(const float&a, const float&b) { return __builtin_fminf(a, b); }
 
-template<typename T> OPUS_D T med3(const T&a, const T&b, const T&c) { auto max_0 = max(a, b); auto min_0 = max(a, b); return max(max_0, max(min_0, c)); }
+template<typename T> OPUS_D T med3(const T&a, const T&b, const T&c) { auto max_0 = max(a, b); auto min_0 = min(a, b); return min(max_0, max(min_0, c)); }
 template<> OPUS_D float       med3<float>(const float&a, const float&b, const float&c) { return __builtin_amdgcn_fmed3f(a, b, c); }
 template<> OPUS_D fp16_t      med3<fp16_t>(const fp16_t&a, const fp16_t&b, const fp16_t&c) { return __builtin_amdgcn_fmed3h(a, b, c); }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1710,41 +1753,44 @@ OPUS_D static constexpr auto pickup_shape_impl(const Shape&, const FDim&, Target
     return concat_tuple(std::conditional_t< std::is_same_v<decltype(get<Is>(FDim{})), remove_cvref_t<Target>>,  tuple<decltype(get<Is>(Shape{}))>,  tuple<> >{}...);
 }
 
-template<typename Shape, typename Dim, index_t SStart, index_t DIdx, index_t... Ss /* index for Dim not Shape */>
-OPUS_D constexpr auto unflatten_shape_impl(const Shape&, const Dim&, number<SStart>, number<DIdx>, seq<Ss...>) {
-    if constexpr((DIdx + 1) < size<Dim>()) return concat_tuple(opus::make_tuple(opus::make_tuple(get<SStart + Ss>(Shape{})... )),
-                                                    unflatten_shape_impl(Shape{}, Dim{}, number<SStart + sizeof...(Ss)>{}, number<DIdx + 1>{}, make_index_seq<get<DIdx + 1>(Dim{}).size()>{}));
-    else /* last one */                    return opus::make_tuple(opus::make_tuple(get<SStart + Ss>(Shape{})... ));
+template<typename Dim, index_t... Js>
+OPUS_D constexpr index_t dim_group_size_sum(seq<Js...>) { return (static_cast<index_t>(get<Js>(Dim{}).size()) + ... + 0); }
+
+template<typename Shape, typename Dim, index_t DIdx, index_t... Ss>
+OPUS_D constexpr auto unflatten_shape_group(seq<Ss...>) {
+    constexpr index_t SStart = dim_group_size_sum<Dim>(make_index_seq<DIdx>{});
+    return opus::make_tuple(get<SStart + Ss>(Shape{})...);
 }
 
-template<typename Dim, typename Coord, index_t C, index_t I>
-OPUS_D constexpr auto unfold_p_coord_impl(const Dim& /*dim*/, const Coord& coord, number<C>, seq<I>) {
-    constexpr auto is_p = std::is_same_v<remove_cvref_t<decltype(get<I>(Dim{}))>, p_dim>;
-    auto get_c = [&]() { if constexpr(is_p) return opus::make_tuple(get<C>(coord));
-                         else               return tuple<underscore>{}; };
-    return get_c();
+template<typename Shape, typename Dim, index_t... DIs>
+OPUS_D constexpr auto unflatten_shape_impl(seq<DIs...>) { return opus::make_tuple(unflatten_shape_group<Shape, Dim, DIs>(make_index_seq<get<DIs>(Dim{}).size()>{})...); }
+
+template<typename Dim, index_t... Js>
+OPUS_D constexpr index_t p_count_in(seq<Js...>) { return ((std::is_same_v<remove_cvref_t<decltype(get<Js>(Dim{}))>, p_dim> ? 1 : 0) + ... + 0); }
+
+template<typename Dim, typename Coord, index_t... Is>
+OPUS_D constexpr auto unfold_p_coord_impl(const Coord& coord, seq<Is...>) {
+    return opus::make_tuple( [&]() -> decltype(auto) {
+            if constexpr (std::is_same_v<remove_cvref_t<decltype(get<Is>(Dim{}))>, p_dim>) return get< p_count_in<Dim>(make_index_seq<Is>{}) >(coord);
+            else                                                                           return underscore{};
+        }()...
+    );
 }
 
-template<typename Dim, typename Coord, index_t C, index_t I, index_t...Is>
-OPUS_D constexpr auto unfold_p_coord_impl(const Dim&, const Coord& coord, number<C>, seq<I, Is...>) {
-    constexpr auto is_p = std::is_same_v<remove_cvref_t<decltype(get<I>(Dim{}))>, p_dim>;
-    auto get_c = [&]() { if constexpr(is_p) return opus::make_tuple(get<C>(coord));
-                         else               return tuple<underscore>{}; };
-    constexpr auto next_c = std::conditional_t<is_p, number<C+1>, number<C>>{};
-    return concat_tuple(get_c(), unfold_p_coord_impl(Dim{}, coord, next_c, seq<Is...>{}) );
-}
+template<typename Dim, index_t... Js>
+OPUS_D constexpr index_t dim_offset_sum(seq<Js...>) { return (static_cast<index_t>(size<decltype(get<Js>(Dim{}))>()) + ... + 0); }
 
-template<typename Dim, typename Shape, typename Stride, index_t C, index_t I, index_t...Is>
-OPUS_D constexpr auto unfold_x_stride_impl(const Dim&, const Shape&, const Stride & stride, number<C>, seq<I, Is...>) {
-    constexpr index_t current_x_dim_length = size<decltype( get<I>(Dim{}) )>();
-    constexpr auto current_shape = slice(Shape{}, number<C>{}, number<C+current_x_dim_length>{});
+template<typename Dim, typename Shape, typename Stride, index_t I>
+OPUS_D constexpr auto unfold_x_stride_each(const Stride& stride) {
+    constexpr index_t C = dim_offset_sum<Dim>(make_index_seq<I>{});
+    constexpr index_t len = size<decltype(get<I>(Dim{}))>();
+    constexpr auto current_shape = slice(Shape{}, number<C>{}, number<C + len>{});
     constexpr auto current_stride = packed_shape_to_stride(current_shape);
-    auto scaled_stride = transform_tuple([&](auto i_elem){
-        return i_elem * get<I>(stride);
-    }, current_stride);
-    if constexpr (sizeof...(Is) == 0) return scaled_stride; // last one
-    else return concat_tuple(scaled_stride, unfold_x_stride_impl(Dim{}, Shape{}, stride, number<C+current_x_dim_length>{}, seq<Is...>{}));
+    return transform_tuple([&](auto i_elem){ return i_elem * get<I>(stride); }, current_stride);
 }
+
+template<typename Dim, typename Shape, typename Stride, index_t... Is>
+OPUS_D constexpr auto unfold_x_stride_impl(const Stride& stride, seq<Is...>) { return concat_tuple(unfold_x_stride_each<Dim, Shape, Stride, Is>(stride)...); }
 }
 
 template<typename Shape, typename Dim, typename Target>
@@ -1755,15 +1801,16 @@ OPUS_D static constexpr auto pickup_shape(const Shape&, const Dim&, Target) { re
 // =>    : tuple<tuple<N0, N1>, tuple<N2, N3, N4>, tuple<N5>>
 template<typename Shape, typename Dim, index_t... Ds /* index for Dim not Shape */>
 OPUS_D constexpr auto unflatten_shape(const Shape&, const Dim&) {
-    return unflatten_shape_impl(Shape{}, Dim{}, number<0>{}, number<0>{}, make_index_seq<get<0>(Dim{}).size()>{});
+    return impl::unflatten_shape_impl<Shape, Dim>(make_index_seq<size<Dim>()>{});
 }
 
 // coord: tuple<a, b>, dim: tuple<tuple<p_dim, y_dim>, tuple<y_dim, p_dim, y_dim>> -> tuple <a, _, _, b, _>
 template<typename Dim, typename Coord>
 OPUS_D constexpr auto unfold_p_coord(const Dim&, const Coord& coord) {
     constexpr auto flatten_dim = flatten_tuple(Dim{});
+    using FDim = remove_cvref_t<decltype(flatten_dim)>;
     static_assert(tuple_count<opus::p_dim>(flatten_dim) == size<Coord>(), "input coord must be same size as p_dim inside Dim");
-    return unfold_p_coord_impl(flatten_dim, coord, number<0>{}, make_index_seq<size<decltype(flatten_dim)>()>{});
+    return impl::unfold_p_coord_impl<FDim, Coord>(coord, make_index_seq<size<FDim>()>{});
 }
 
 template<typename Dim, typename Shape, typename Stride>
@@ -1771,7 +1818,7 @@ OPUS_D constexpr auto unfold_x_stride(const Dim&, const Shape&, const Stride& st
     constexpr auto flatten_dim = flatten_tuple(Dim{});
     static_assert(size<Dim>() == size<Stride>(), "input stride must be same size as x_dim");
     static_assert(size<Shape>() == size<remove_cvref_t<decltype(flatten_dim)>>(), "input shape must be same size as flattened dim");
-    return unfold_x_stride_impl(Dim{}, Shape{}, stride, number<0>{}, make_index_seq<size<Dim>()>{});
+    return impl::unfold_x_stride_impl<Dim, Shape, Stride>(stride, make_index_seq<size<Dim>()>{});
 }
 
 #define OPUS_KP_(x_) static_assert(opus::tuple_count<opus::p_dim>(opus::flatten_tuple(x_ ())) == size<C>())
