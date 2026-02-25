@@ -775,7 +775,12 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
 
 
 @triton.autotune(
-    configs=[triton.Config({"waves_per_eu": wa}, num_stages=1) for wa in range(5)],
+    configs=[
+        triton.Config(
+            {"waves_per_eu": wa}, maxnreg=512 // wa if wa > 0 else None, num_stages=1
+        )
+        for wa in range(5)
+    ],
     key=[
         "KV_BLOCK_SIZE",
         "SLIDING_WINDOW",
