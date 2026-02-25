@@ -867,6 +867,8 @@ OPUS_CAST_DEFINE(fp16, fp32)
 OPUS_CAST_DEFINE(fp32, fp16)
 OPUS_CAST_DEFINE(bf16, fp32)
 OPUS_CAST_DEFINE(fp32, bf16)
+OPUS_CAST_DEFINE(fp8, fp32)
+OPUS_CAST_DEFINE(fp32, fp8)
 
 namespace impl {
 // implement a "pack" of data, storage should pad to multiple of byte(8bit)
@@ -923,6 +925,16 @@ OPUS_DEFINE_FPACKS(e8m0_t,  uint8_t, 8, 8, 0, false)    // fp4x2
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wuninitialized"
 #pragma clang diagnostic ignored "-Wc++20-extensions"
+// scalar fp8 <-> fp32: use packed intrinsics with only the lo slot
+OPUS_D constexpr auto fp32_to_fp8(const fp32_t& x) {
+    int w; w = __builtin_amdgcn_cvt_pk_fp8_f32(x, 0.0f, w, /*sel=lo*/0);
+    return __builtin_bit_cast(fp8_t, static_cast<int8_t>(w));
+}
+OPUS_D constexpr auto fp8_to_fp32(const fp8_t& x) {
+    int w = static_cast<int>(__builtin_bit_cast(uint8_t, x));
+    return __builtin_amdgcn_cvt_f32_fp8(w, /*byte=*/0);
+}
+
 template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp32_to_fp8_packed_x2(const S& s, number<sel> = {}) {
     int w ; w = __builtin_amdgcn_cvt_pk_fp8_f32(s[0], s[1], w, sel);
@@ -967,6 +979,26 @@ template<typename S, index_t fold_size, std::enable_if_t<is_tuple_v<S> || is_vec
 OPUS_D constexpr decltype(auto) fold_as_container_of_arr(const S& s, number<fold_size>) {
     static_assert(size<S>() % fold_size == 0);
     return fold_as_tuple_of_arr(s, make_index_seq<size<S>() / fold_size>{});
+}
+
+// Unfold a tuple-of-sub-results (produced by auto-fold cast) back into a flat container. Used in pair with above
+// matching the original input container type OrigS.
+//   OrigS is vector  -> flat vector_t<elem, total>
+//   OrigS is array   -> flat array<elem, total>
+//   OrigS is tuple   -> flat tuple<elem, elem, ...>
+template<typename Tup, index_t inner_n, index_t... Flat>
+OPUS_D constexpr auto unfold_as_tuple(const Tup& tup, number<inner_n>, seq<Flat...>) { return make_tuple(get<Flat % inner_n>(getv<Flat / inner_n>(tup))...); }
+
+template<typename OrigS, typename Tup, std::enable_if_t<is_tuple_v<Tup>, bool> = true>
+OPUS_D constexpr auto unfold_from_container(const Tup& tup) {
+    using inner_t = remove_cvref_t<decltype(getv<0>(tup))>;
+    using elem_t = get_value_t<inner_t>;
+    constexpr index_t outer_n = opus::size<Tup>();
+    constexpr index_t inner_n = opus::size<inner_t>();
+    constexpr index_t total_n = outer_n * inner_n;
+    if constexpr (is_vector_v<OrigS>) { vector_t<elem_t, total_n> r; static_for<total_n>([&](auto f) { r[f.value] = get<f.value % inner_n>(getv<f.value / inner_n>(tup)); }); return r; }
+    else if constexpr (is_array_v<OrigS>) { array<elem_t, total_n> r; static_for<total_n>([&](auto f) { r[f.value] = get<f.value % inner_n>(getv<f.value / inner_n>(tup)); }); return r; }
+    else { /* tuple */  return unfold_as_tuple(tup, number<inner_n>{}, make_index_seq<total_n>{}); }
 }
 } // namespace impl
 #if defined(__gfx950__)
@@ -1069,13 +1101,13 @@ template<typename D, typename S, typename... Aux, std::enable_if_t<((is_vector_v
 , bool> = true>
 OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
     if      constexpr (std::is_same_v<get_value_t<S>, fp32_t> && size<S>() % 4 == 0 && std::is_same_v<D, fp8_t>) { // fp32 -> fp8 , x4N
-                    return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...); }
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...)); }
     else if constexpr (std::is_same_v<get_value_t<S>, fp32_t> && size<S>() % 2 == 0 && std::is_same_v<D, fp8_t>) { // fp32 -> fp8 , x2N
-                    return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...); }
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...)); }
     else if constexpr (std::is_same_v<get_value_t<S>, fp8_t>  && size<S>() % 4 == 0 && std::is_same_v<D, fp32_t>) { // fp8 -> fp32, x4N
-                    return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...); }
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...)); }
     else if constexpr (std::is_same_v<get_value_t<S>, fp8_t>  && size<S>() % 2 == 0 && std::is_same_v<D, fp32_t>) { // fp8 -> fp32, x2N
-                    return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...); }
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...)); }
     else   return impl::cast_impl<D>(s, make_index_seq<size<S>()>{}, std::forward<Aux>(aux)...); }
 
 // entry point for vectorized cast(), for dpacks
@@ -1088,16 +1120,16 @@ OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
         if constexpr (is_packs_v<D>) { static_assert(size<S>() % D::num_packs == 0); return D::num_packs; } // TODO: do not support cast pack data one by one
         else                         { return get_value_t<S>::num_packs; } }();
     if      constexpr (std::is_same_v<get_value_t<S>, fp32_t> && size<S>() % 8 == 0 && std::is_same_v<D, fp4_t>) { // fp32 -> fp4 , x8N
-                    return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<8>{}), make_index_seq<size<S>() / 8>{}, std::forward<Aux>(aux)...); }
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<8>{}), make_index_seq<size<S>() / 8>{}, std::forward<Aux>(aux)...)); }
     else if constexpr (std::is_same_v<get_value_t<S>, fp32_t> && size<S>() % 4 == 0 && std::is_same_v<D, fp4_t>) { // fp32 -> fp4 , x4N
-                    return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...); }
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...)); }
     else if constexpr (std::is_same_v<get_value_t<S>, fp32_t> && size<S>() % 2 == 0 && std::is_same_v<D, fp4_t>) { // fp32 -> fp4 , x2N
-                    return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...); }
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...)); }
     else if constexpr (std::is_same_v<get_value_t<S>, fp4_t> && size<S>() % 4 == 0) { // fp4 -> fp32 , x8N
-                    return impl::cast_impl<D>(impl::fold_as_container_of_arr(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...); }
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_arr(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...)); }
     else if constexpr (std::is_same_v<get_value_t<S>, fp4_t> && size<S>() % 2 == 0) { // fp4 -> fp32 , x4N
-                    return impl::cast_impl<D>(impl::fold_as_container_of_arr(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...); }
-    else            return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<num_packs_>{}), make_index_seq<size<S>() / num_packs_>{}, std::forward<Aux>(aux)...);
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_arr(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...)); }
+    else            return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<num_packs_>{}), make_index_seq<size<S>() / num_packs_>{}, std::forward<Aux>(aux)...));
 }
 
 #undef OPUS_DEFINE_DPACKS

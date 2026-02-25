@@ -277,6 +277,8 @@ static void run_dtype_convert_torch(
         run_dtype_convert_fp32_bf16(In.data_ptr(), Out.data_ptr(), n);
     } else if (variant == "fp32_fp16") {
         run_dtype_convert_fp32_fp16(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_fp8_scalar") {
+        run_dtype_convert_fp32_fp8_scalar(In.data_ptr(), Out.data_ptr(), n);
     } else if (variant == "fp32_fp8") {
         TORCH_CHECK(n % 4 == 0,
                      "For fp32_fp8, n must be a multiple of 4 (packed x4 conversion)");
@@ -285,6 +287,30 @@ static void run_dtype_convert_torch(
         TORCH_CHECK(n % 8 == 0,
                      "For fp32_fp4, n must be a multiple of 8 (packed x8 conversion)");
         run_dtype_convert_fp32_fp4(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_bf16_vec4") {
+        TORCH_CHECK(n % 4 == 0,
+                     "For fp32_bf16_vec4, n must be a multiple of 4");
+        run_dtype_convert_fp32_bf16_vec4(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_fp16_vec4") {
+        TORCH_CHECK(n % 4 == 0,
+                     "For fp32_fp16_vec4, n must be a multiple of 4");
+        run_dtype_convert_fp32_fp16_vec4(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_fp8_x2") {
+        TORCH_CHECK(n % 2 == 0,
+                     "For fp32_fp8_x2, n must be a multiple of 2");
+        run_dtype_convert_fp32_fp8_x2(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_fp8_vec8") {
+        TORCH_CHECK(n % 8 == 0,
+                     "For fp32_fp8_vec8, n must be a multiple of 8");
+        run_dtype_convert_fp32_fp8_vec8(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_fp4_x2") {
+        TORCH_CHECK(n % 2 == 0,
+                     "For fp32_fp4_x2, n must be a multiple of 2");
+        run_dtype_convert_fp32_fp4_x2(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_fp4_x4") {
+        TORCH_CHECK(n % 4 == 0,
+                     "For fp32_fp4_x4, n must be a multiple of 4");
+        run_dtype_convert_fp32_fp4_x4(In.data_ptr(), Out.data_ptr(), n);
     } else {
         TORCH_CHECK(false, "Unknown dtype_convert variant: ", variant);
     }
