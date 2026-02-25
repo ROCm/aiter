@@ -132,8 +132,8 @@ jobs:
             fi
 
             echo -e "\n=== Setting Memory Management Env Vars ==="
-            echo "export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
-            export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+            echo "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+            echo "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" >> $GITHUB_ENV
 
       - name: Build the ATOM test image
         run: |
