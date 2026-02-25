@@ -325,6 +325,8 @@ def moe_stage2_g1u1(
     block_m: int,
     w2_scale: Optional[Tensor] = None,
     a2_scale: Optional[Tensor] = None,
+    w2_lqq_scale: Optional[Tensor] = None,
+    w2_lqq_zero: Optional[Tensor] = None,
     sorted_weights: Optional[Tensor] = None,
     quant_type: Optional[Enum] = QuantType.No.value,
     activation: Optional[Enum] = ActivationType.Silu.value,

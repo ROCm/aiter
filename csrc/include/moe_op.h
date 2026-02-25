@@ -182,6 +182,8 @@ void moe_stage2_g1u1(
     int block_m,
     std::optional<torch::Tensor> w2_scale, // [expert, 1, dim], down scale
     std::optional<torch::Tensor> a2_scale, // [token_cnt, 1], inter scale
+    std::optional<torch::Tensor> w2_lqq_scale, // [expert, inter_dim/group_in_k_lqq, model_dim] N,Klqq
+    std::optional<torch::Tensor> w2_lqq_zero, // [expert, inter_dim/group_in_k_lqq, model_dim] N,Klqq
     std::optional<torch::Tensor> sorted_weights,
     QuantType quant_type,
     ActivationType activation,

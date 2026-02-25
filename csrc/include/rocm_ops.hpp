@@ -1274,6 +1274,8 @@ namespace py = pybind11;
           py::arg("block_m"),                                                  \
           py::arg("w2_scale")       = std::nullopt,                            \
           py::arg("a2_scale")       = std::nullopt,                            \
+          py::arg("w2_lqq_scale")   = std::nullopt,                            \
+          py::arg("w2_lqq_zero")    = std::nullopt,                            \
           py::arg("sorted_weights") = std::nullopt,                            \
           py::arg("quant_type")     = QuantType::No,                           \
           py::arg("activation")     = ActivationType::Silu,                    \

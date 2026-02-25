@@ -1251,6 +1251,8 @@ def test_fmoe_lqq(
         a1_scale=a1_scale,
         w1_lqq_scale=w1_lqq_scale_shf,
         w1_lqq_zero=w1_lqq_zero_uint8_shf,
+        w2_lqq_scale=w2_lqq_scale_shf,
+        w2_lqq_zero=w2_lqq_zero_uint8_shf,
         quant_type=aiter.QuantType.per_Token,
         activation=aiter.ActivationType.Silu,
         doweight_stage1=False,

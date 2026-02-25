@@ -102,6 +102,8 @@ def fused_moe(
     a2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
     w1_lqq_scale: Optional[torch.tensor] = None,
     w1_lqq_zero: Optional[torch.tensor] = None,
+    w2_lqq_scale: Optional[torch.tensor] = None,
+    w2_lqq_zero: Optional[torch.tensor] = None,
     # following for tuning
     block_size_M=None,
     num_local_tokens: Optional[torch.tensor] = None,
@@ -132,6 +134,8 @@ def fused_moe(
         a2_scale=a2_scale,
         w1_lqq_scale=w1_lqq_scale,
         w1_lqq_zero=w1_lqq_zero,
+        w2_lqq_scale=w2_lqq_scale,
+        w2_lqq_zero=w2_lqq_zero,
         block_size_M=block_size_M,
         num_local_tokens=num_local_tokens,
         moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
@@ -194,6 +198,8 @@ def fused_moe_(
     a2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
     w1_lqq_scale: Optional[torch.Tensor] = None,
     w1_lqq_zero: Optional[torch.Tensor] = None,
+    w2_lqq_scale: Optional[torch.Tensor] = None,
+    w2_lqq_zero: Optional[torch.Tensor] = None,
     # following for tuning
     block_size_M: int = -1,
     num_local_tokens: Optional[torch.Tensor] = None,
@@ -324,6 +330,8 @@ def fused_moe_(
             a2_scale=a2_scale,
             w1_lqq_scale=w1_lqq_scale,
             w1_lqq_zero=w1_lqq_zero,
+            w2_lqq_scale=w2_lqq_scale,
+            w2_lqq_zero=w2_lqq_zero,
             num_local_tokens=num_local_tokens,
             # following for cktile support
             hidden_pad=hidden_pad,
@@ -931,6 +939,8 @@ def fused_moe_2stages(
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
     w1_lqq_scale: Optional[torch.Tensor] = None,
     w1_lqq_zero: Optional[torch.Tensor] = None,
+    w2_lqq_scale: Optional[torch.Tensor] = None,
+    w2_lqq_zero: Optional[torch.Tensor] = None,
     num_local_tokens: Optional[torch.tensor] = None,
     # following for cktile support
     hidden_pad=0,
@@ -1075,7 +1085,7 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if doweight_stage1 else None,
         **extra_stage1_args,
     )
-    return a2  # feifei test stage1
+    # return a2  # feifei test stage1
 
     if (
         quant_type == QuantType.per_1x32
@@ -1160,6 +1170,8 @@ def fused_moe_2stages(
             w2_scale.view(dtypes.fp8_e8m0) if w2.dtype == dtypes.fp4x2 else w2_scale
         ),
         a2_scale=a2_scale,
+        w2_lqq_scale=w2_lqq_scale,
+        w2_lqq_zero=w2_lqq_zero,
         # block_m=block_size_M,
         block_m=32,  # WORKAROUND feifei test only !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
         sorted_weights=sorted_weights if not doweight_stage1 else None,
@@ -1256,14 +1268,16 @@ def asm_stage2(
     num_valid_ids,
     out,
     topk,
-    w2_scale,
-    a2_scale,
     block_m: int,
     kernelName: str = "",
-    sorted_weights=None,
-    quant_type=QuantType.No,
+    splitk: int = 0,
     activation=ActivationType.Silu,
-    splitk=0,
+    quant_type=QuantType.No,
+    a2_scale=None,
+    w2_scale=None,
+    w2_lqq_scale=None,
+    w2_lqq_zero=None,
+    sorted_weights=None,
 ):
     print("[debug] w2:", w2.shape, w2.dtype)
     print("[debug] w2:", w2.stride())
@@ -1280,11 +1294,14 @@ def asm_stage2(
         block_m,
         w2_scale,
         a2_scale,
+        w2_lqq_scale,
+        w2_lqq_zero,
         sorted_weights,
         quant_type,
         activation,
         splitk,
     )
+    return None
 
 
 def torch_moe(

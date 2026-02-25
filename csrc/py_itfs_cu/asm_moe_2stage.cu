@@ -70,6 +70,7 @@ struct __attribute__((packed)) KernelArgs
     p3 _p27;
     void log()
     {
+        printf("KernelArgs argsize: %zu\n", sizeof(KernelArgs));
         printf("[KARG] dim = %d\n", dim);
         printf("[KARG] hidden_dim = %d\n", hidden_dim);
         printf("[KARG] token_cnt = %d\n", token_cnt);
@@ -138,6 +139,7 @@ struct __attribute__((packed)) Kernel2Args
     p3 _p22;
     void log()
     {
+        printf("Kernel2Args argsize: %zu\n", sizeof(Kernel2Args));
         printf("[KARG] dim = %d\n", dim);
         printf("[KARG] hidden_dim = %d\n", hidden_dim);
         printf("[KARG] token_cnt = %d\n", token_cnt);
@@ -582,30 +584,6 @@ void moe_stage1_g1u1(
     int gdy = sz_stp; // sub_X_cnt;
     int gdz = k_num;
 
-    // printf("####stage1 arg start############ \n");
-    // std::cout << " args.ptr_O       = " << args.ptr_O << std::endl;
-    // std::cout << " args.ptr_X       = " << args.ptr_X << std::endl;
-    // std::cout << " args.ptr_GU      = " << args.ptr_GU << std::endl;
-    // std::cout << " args.ptr_XC      = " << args.ptr_XC << std::endl;
-    // std::cout << " args.ptr_XQ      = " << args.ptr_XQ << std::endl;
-    // std::cout << " args.ptr_GUQ     = " << args.ptr_GUQ << std::endl;
-    // std::cout << " args.ptr_SMQ     = " << args.ptr_SMQ << std::endl;
-    // std::cout << " args.ptr_STP     = " << args.ptr_STP << std::endl;
-    // std::cout << " args.ptr_SEP     = " << args.ptr_SEP << std::endl;
-    // std::cout << " args.dim         = " << args.dim << std::endl;
-    // std::cout << " args.hidden_dim  = " << args.hidden_dim << std::endl;
-    // std::cout << " args.token_cnt   = " << args.token_cnt << std::endl;
-    // std::cout << " args.eprt_cnt    = " << args.eprt_cnt << std::endl;
-    // std::cout << " args.Xs          = " << args.Xs << std::endl;
-    // std::cout << " args.GUs         = " << args.GUs << std::endl;
-    // std::cout << " args.Os          = " << args.Os << std::endl;
-    // std::cout << " args.eGUs        = " << args.eGUs << std::endl;
-    // std::cout << " args.eGUQs       = " << args.eGUQs << std::endl;
-    // std::cout << " args.eSMQs       = " << args.eSMQs << std::endl;
-    // std::cout << " args.topk        = " << args.topk << std::endl;
-    // std::cout << " args.splitk      = " << args.splitk << std::endl;
-    // std::cout << " args.activation  = " << args.activation << std::endl;
-    // std::cout << " args.ptr_SW      = " << args.ptr_SW << std::endl;
     args.log();
     printf("[DEV_BUF] dev_O: out = %lu bytes\n", out.numel() * out.element_size());
     printf("[DEV_BUF] dev_X: input = %lu bytes\n", input.numel() * input.element_size());
@@ -619,7 +597,6 @@ void moe_stage1_g1u1(
     printf("[DEV_BUF] dev_SW: sorted_weights = %lu bytes\n", sorted_weights.has_value() ? sorted_weights.value().numel() * sorted_weights.value().element_size() : 0);
     printf("[DEV_BUF] dev_Qscl: w1_lqq_scale = %lu bytes\n", w1_lqq_scale.has_value() ? w1_lqq_scale.value().numel() * w1_lqq_scale.value().element_size() : 0);
     printf("[DEV_BUF] dev_Qzero: w1_lqq_zero = %lu bytes\n", w1_lqq_zero.has_value() ? w1_lqq_zero.value().numel() * w1_lqq_zero.value().element_size() : 0);
-    printf("argsize: %zu\n", arg_size);
     printf("gdx:%d, gdy:%d, gdz:%d, bdx:%d\n", gdx, gdy, gdz, bdx);
 
     //uint32_t group_in_k_lqq = 64;
@@ -671,6 +648,8 @@ void moe_stage2_g1u1(
     int block_m,
     std::optional<torch::Tensor> w2_scale = std::nullopt, // [expert, 1, dim], down scale
     std::optional<torch::Tensor> a2_scale = std::nullopt, // [token_cnt, 1], inter scale
+    std::optional<torch::Tensor> w2_lqq_scale = std::nullopt, // [expert, inter_dim/group_in_k_lqq, model_dim] N,Klqq
+    std::optional<torch::Tensor> w2_lqq_zero = std::nullopt, // [expert, inter_dim/group_in_k_lqq, model_dim] N,Klqq
     std::optional<torch::Tensor> sorted_weights =
         std::nullopt, // [max_num_tokens_padded], do_weight==true need
     QuantType quant_type      = QuantType::No,
@@ -741,14 +720,11 @@ void moe_stage2_g1u1(
                 cfg.tile_m);
 
     int stride_X = inter_dim * inter_states.element_size();
-
     int stride_D = inter_dim * w2.element_size();
-
     int stride_Scale_X = a2_scale.has_value() ? a2_scale.value().stride(0) * sizeof(float) : 0;
-
     int stride_expert_D = inter_dim * dim * w2.element_size();
-
     int stride_expert_scale_D = w2_scale.has_value() ? dim * sizeof(float) : 0;
+    int stride_expert_dequant_D =  w2_lqq_scale.has_value() ? w2_lqq_scale.value().stride(0) : 0;
     
     if (isInt4) {
         stride_D         /= 2;
@@ -783,6 +759,7 @@ void moe_stage2_g1u1(
     args.topk                  = topk;
     args.splitk                = splitk;
     args.ptr_SWBuffer = sorted_weights.has_value() ? sorted_weights.value().data_ptr() : nullptr;
+    args.stride_expert_dequant_D = stride_expert_dequant_D;
 
     uint32_t k_num = 1;
 
@@ -797,30 +774,6 @@ void moe_stage2_g1u1(
     int gdy = sub_X_cnt;
     int gdz = k_num;
 
-    // printf("#### stage2 arg start ############\n ");
-    // printf("args.ptr_OBuffer  = %p\n", args.ptr_OBuffer);
-    // printf("args.ptr_XBuffer  = %p\n", args.ptr_XBuffer);
-    // printf("args.ptr_DBuffer  = %p\n", args.ptr_DBuffer);
-    // printf("args.ptr_XCBuffer = %p\n", args.ptr_XCBuffer);
-    // printf("args.ptr_ScaleXBuffer = %p\n", args.ptr_ScaleXBuffer);
-    // printf("args.ptr_ScaleDBuffer = %p\n", args.ptr_ScaleDBuffer);
-    // printf("args.ptr_STPBuffer = %p\n", args.ptr_STPBuffer);
-    // printf("args.ptr_SEPBuffer = %p\n", args.ptr_SEPBuffer);
-    // printf("args.dim = %u\n", args.dim);
-    // printf("args.hidden_dim = %u\n", args.hidden_dim);
-    // printf("args.token_cnt = %u\n", args.token_cnt);
-    // printf("args.eprt_cnt = %u\n", args.eprt_cnt);
-    // printf("args.stride_X = %u\n", args.stride_X);
-    // printf("args.stride_D = %u\n", args.stride_D);
-    // printf("args.stride_O = %u\n", args.stride_O);
-    // printf("args.stride_expert_D = %u\n", args.stride_expert_D);
-    // printf("args.stride_expert_scale_D = %u\n", args.stride_expert_scale_D);
-    // printf("args.topk = %u\n", args.topk);
-    // printf("args.splitk = %u\n", args.splitk);
-    // printf("args.ptr_SWBuffer = %p\n", args.ptr_SWBuffer);
-    // printf("gdx = %d\n", gdx);
-    // printf("gdy = %d\n", gdy);
-    // printf("gdz = %d\n", gdz);
     args.log();
     //printf("[DEV_BUF] ptr_OBuffer: out = %lu bytes\n", out.numel() * out.element_size());
     //printf("[DEV_BUF] ptr_XBuffer: inter_states = %lu bytes\n", inter_states.numel() * inter_states.element_size());
@@ -832,7 +785,6 @@ void moe_stage2_g1u1(
     //printf("[DEV_BUF] ptr_SEPBuffer: sorted_expert_ids = %lu bytes\n", sorted_expert_ids.numel() * sorted_expert_ids.element_size());
     //printf("[DEV_BUF] dev_Qscl: w1_lqq_scale = %lu bytes\n", w1_lqq_scale.has_value() ? w1_lqq_scale.value().numel() * w1_lqq_scale.value().element_size() : 0);
     //printf("[DEV_BUF] dev_Qzero: w1_lqq_zero = %lu bytes\n", w1_lqq_zero.has_value() ? w1_lqq_zero.value().numel() * w1_lqq_zero.value().element_size() : 0);
-    printf("argsize: %zu\n", arg_size);
     printf("gdx:%d, gdy:%d, gdz:%d, bdx:%d\n", gdx, gdy, gdz, bdx);
 
     return;
