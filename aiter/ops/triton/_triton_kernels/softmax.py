@@ -18,6 +18,7 @@ def _softmax_kernel_online(
     output_row_stride,
     n_cols,
     BLOCK_SIZE: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
 ):
 
     row_start = tl.program_id(0)
@@ -27,7 +28,7 @@ def _softmax_kernel_online(
     m = -float("inf")  # Initial value of max
     row_sum = 0.0
     row_start_ptr = input_ptr + row_idx * input_row_stride
-    for b in tl.range(0, n_cols, BLOCK_SIZE):
+    for b in tl.range(0, n_cols, BLOCK_SIZE, num_stages=NUM_STAGES):
         col_offsets = b + tl.arange(0, BLOCK_SIZE)
         input_ptrs = row_start_ptr + col_offsets
         mask = col_offsets < n_cols
@@ -44,7 +45,7 @@ def _softmax_kernel_online(
 
     output_row_start_ptr = output_ptr + row_idx * output_row_stride
     # Loop 2
-    for b in tl.range(0, n_cols, BLOCK_SIZE):
+    for b in tl.range(0, n_cols, BLOCK_SIZE, num_stages=NUM_STAGES):
         col_offsets = b + tl.arange(0, BLOCK_SIZE)
         input_ptrs = row_start_ptr + col_offsets
         mask = col_offsets < n_cols
@@ -55,4 +56,4 @@ def _softmax_kernel_online(
         softmax_output = tl.exp(row_block - m) / row_sum
         # store
         output_ptrs = output_row_start_ptr + col_offsets
-        tl.store(output_ptrs, softmax_output, mask=mask)
+        tl.store(output_ptrs, softmax_output, mask=mask, cache_modifier=".cg")
