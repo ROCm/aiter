@@ -117,7 +117,7 @@ jobs:
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
           -e ATOM_DISABLE_MMAP=true \
-          -e HF_TOKEN=${{ secrets.HF_TOKEN_TEST }} \
+          -e HF_TOKEN="${HF_TOKEN:-${{ secrets.HF_TOKEN_TEST }}}" \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name atom_aiter_test \
