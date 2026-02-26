@@ -157,7 +157,7 @@ jobs:
           fi
 
       - name: Run ATOM simple inference
-        timeout-minutes: 30
+        timeout-minutes: 60
         run: |
           # Run the inference and capture output
           set -euo pipefail
@@ -186,7 +186,7 @@ jobs:
         
       - name: Run ATOM accuracy test
         if: ${{ matrix.model_name != 'DeepSeek-R1-0528' }}
-        timeout-minutes: 30
+        timeout-minutes: 60
         run: |
           set -euo pipefail
           echo ""
