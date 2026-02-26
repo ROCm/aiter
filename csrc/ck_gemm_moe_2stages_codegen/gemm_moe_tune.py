@@ -50,6 +50,9 @@ torch.set_default_device("cuda")
 torch.int4 = getattr(torch, "int4", torch.uint32)
 
 
+FLYDSL_FALLBACK_TAG = "flydsl_fallback"
+
+
 class FmoeTuner(TunerCommon):
 
     ARG_DEFAULTS = {
@@ -1936,9 +1939,12 @@ class FmoeTuner(TunerCommon):
         out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
 
         if a_dtype_str != "fp4":
-            get_flydsl_stage1_kernels(a_dtype_str, b_dtype_str, out_dtype_str)
+            flydsl_s1_kernels = get_flydsl_stage1_kernels(
+                a_dtype_str, b_dtype_str, out_dtype_str
+            )
         else:
-            pass
+            # TODO: stage1 support fp4
+            flydsl_s1_kernels = {}
         flydsl_s2_kernels = get_flydsl_stage2_kernels(
             a_dtype_str, b_dtype_str, out_dtype_str
         )
@@ -1946,56 +1952,56 @@ class FmoeTuner(TunerCommon):
         for blockM in blockMs:
             if blockM not in [32, 64] or not use_g1u1:
                 continue
-            # for kname, kparams in flydsl_s1_kernels.items():
-            #     if kparams["tile_m"] != blockM:
-            #         continue
-            # tasks_flydsl.append(
-            #     (
-            #         (info, "stage1", kname, blockM),
-            #         FmoeTuner.generate_data_2stages,
-            #         (
-            #             token,
-            #             model_dim,
-            #             inter_dim,
-            #             expert,
-            #             topk,
-            #             act_type,
-            #             dtype,
-            #             q_dtype_a,
-            #             q_dtype_w,
-            #             q_type,
-            #             use_g1u1,
-            #             doweight_stage1,
-            #             blockM,
-            #             1,
-            #         ),
-            #         FmoeTuner.run_flydsl_stage1_out,
-            #         (
-            #             [0, 1, 2, 5, 6, 7, 8, 15, 14],
-            #             dtype,
-            #             topk,
-            #             kname,
-            #             blockM,
-            #             q_type,
-            #             act_type,
-            #         ),
-            #         {},
-            #         FmoeTuner.run_torch_moe_stage1,
-            #         (
-            #             [0, 10, 11, 12, 13, 3, 4],
-            #             dtype,
-            #             act_type,
-            #             q_type,
-            #             doweight_stage1,
-            #             topk,
-            #         ),
-            #         {},
-            #         (None),
-            #         0.01,
-            #         0.01,
-            #         True,
-            #     )
-            # )
+            for kname, kparams in flydsl_s1_kernels.items():
+                if kparams["tile_m"] != blockM:
+                    continue
+                tasks_flydsl.append(
+                    (
+                        (info, "stage1", kname, blockM),
+                        FmoeTuner.generate_data_2stages,
+                        (
+                            token,
+                            model_dim,
+                            inter_dim,
+                            expert,
+                            topk,
+                            act_type,
+                            dtype,
+                            q_dtype_a,
+                            q_dtype_w,
+                            q_type,
+                            use_g1u1,
+                            doweight_stage1,
+                            blockM,
+                            1,
+                        ),
+                        FmoeTuner.run_flydsl_stage1_out,
+                        (
+                            [0, 1, 2, 5, 6, 7, 8, 15, 14],
+                            dtype,
+                            topk,
+                            kname,
+                            blockM,
+                            q_type,
+                            act_type,
+                        ),
+                        {},
+                        FmoeTuner.run_torch_moe_stage1,
+                        (
+                            [0, 10, 11, 12, 13, 3, 4],
+                            dtype,
+                            act_type,
+                            q_type,
+                            doweight_stage1,
+                            topk,
+                        ),
+                        {},
+                        (None),
+                        0.01,
+                        0.01,
+                        True,
+                    )
+                )
 
             for kname, kparams in flydsl_s2_kernels.items():
                 if kparams["tile_m"] != blockM:
@@ -2053,6 +2059,7 @@ class FmoeTuner(TunerCommon):
         tunedf,
         args,
     ):
+        self._flydsl_fallbacks = []
         mp_num = args.mp
         blockMs = [16, 32, 64, 128]
         keys = self.keys
@@ -2137,6 +2144,10 @@ class FmoeTuner(TunerCommon):
 
     def result_to_csv(self, results, file, concat=False):
         old_tunedf = self.get_tuned_gemm_list(file)
+        if "_tag" in old_tunedf.columns:
+            old_tunedf = old_tunedf[
+                old_tunedf["_tag"].fillna("") != FLYDSL_FALLBACK_TAG
+            ].drop(columns=["_tag"])
         resultdf = self.update_tunedf(old_tunedf, results)
         self.success = pd.concat([self.success, results], ignore_index=True)
         resultdf["run_1stage"] = resultdf["run_1stage"].astype(int)
@@ -2145,6 +2156,15 @@ class FmoeTuner(TunerCommon):
                 subset=self.keys,
                 keep="last",
             )
+        resultdf["_tag"] = ""
+        fallbacks = getattr(self, "_flydsl_fallbacks", [])
+        if fallbacks:
+            fb_df = pd.DataFrame(fallbacks, columns=self.columns)
+            fb_df["_tag"] = FLYDSL_FALLBACK_TAG
+            resultdf = pd.concat([resultdf, fb_df], ignore_index=True)
+        resultdf = resultdf.astype(str).drop_duplicates(
+            subset=self.keys + ["_tag"], keep="last"
+        )
         resultdf.to_csv(file, index=False)
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
@@ -2377,6 +2397,30 @@ class FmoeTuner(TunerCommon):
             best_one["q_dtype_a"] = str(best_one["q_dtype_a"])
             best_one["q_dtype_w"] = str(best_one["q_dtype_w"])
             bests.append(best_one)
+
+            best_has_flydsl = str(best_one.get("kernelName1", "")).startswith(
+                "flydsl_"
+            ) or str(best_one.get("kernelName2", "")).startswith("flydsl_")
+            if best_has_flydsl:
+                non_flydsl_df = profileDF[
+                    ~(
+                        profileDF["kernelName1"].astype(str).str.startswith("flydsl_")
+                        | profileDF["kernelName2"].astype(str).str.startswith("flydsl_")
+                    )
+                ]
+                if len(non_flydsl_df) > 0:
+                    fb = non_flydsl_df.loc[non_flydsl_df["us"].idxmin()].copy()
+                    fb["act_type"] = str(fb["act_type"])
+                    fb["q_type"] = str(fb["q_type"])
+                    fb["dtype"] = str(fb["dtype"])
+                    fb["q_dtype_a"] = str(fb["q_dtype_a"])
+                    fb["q_dtype_w"] = str(fb["q_dtype_w"])
+                    self._flydsl_fallbacks.append(fb)
+                    print(
+                        f"  Fallback (non-flydsl): "
+                        f"{fb['kernelName1']}, {fb['kernelName2']}, "
+                        f"{fb['us']} us"
+                    )
         if len(prorfiles) > 0:
             profile_result = pd.concat(prorfiles)
             profile_result["err"] = profile_result["err"].apply(lambda x: f"{x:.1%}")

@@ -211,19 +211,23 @@ class TunerCommon:
         for i, path in enumerate(path_list[1:]):
             if os.path.exists(path):
                 df = pd.read_csv(path)
-                ## check columns
+                base_cols = [c for c in df_list[0].columns if c != "_tag"]
+                new_cols = [c for c in df.columns if c != "_tag"]
                 assert (
-                    df.columns.tolist() == df_list[0].columns.tolist()
-                ), f"Column mismatch between {path_list[0]} and {path}, {df_list[0].columns.tolist()}, {df.columns.tolist()}"
+                    base_cols == new_cols
+                ), f"Column mismatch between {path_list[0]} and {path}, {base_cols}, {new_cols}"
 
                 df_list.append(df)
             else:
                 print(f"path {i+1}: {path} (not exist)")
         merge_df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
-        ##drop_duplicates
+        dedup_keys = self.keys
+        if "_tag" in merge_df.columns:
+            merge_df["_tag"] = merge_df["_tag"].fillna("")
+            dedup_keys = self.keys + ["_tag"]
         merge_df = (
             merge_df.sort_values("us")
-            .drop_duplicates(subset=self.keys, keep="first")
+            .drop_duplicates(subset=dedup_keys, keep="first")
             .reset_index(drop=True)
         )
         new_file_path = f"/tmp/{merge_name}.csv"
@@ -320,12 +324,15 @@ class TunerCommon:
         tunedf = pd.read_csv(tune_file)
         if issorted:
             tunedf = tunedf.sort_values(by=values)
+        dedup_keys = self.keys
+        if "_tag" in tunedf.columns:
+            tunedf["_tag"] = tunedf["_tag"].fillna("")
+            dedup_keys = self.keys + ["_tag"]
         tunedf = tunedf.drop_duplicates(
-            subset=self.keys,
+            subset=dedup_keys,
             keep="last",
         )
-        # print(tunedf)
-        tunedf.to_csv(tune_file, index=False, na_rep="Null")
+        tunedf.to_csv(tune_file, index=False)
 
     def get_cu_num(self):
         gpu = torch.cuda.current_device()
