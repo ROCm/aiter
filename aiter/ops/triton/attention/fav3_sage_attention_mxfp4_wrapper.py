@@ -46,7 +46,7 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
         hadamard_rotation: bool = True,
         config: Optional[dict] = None,
         R: torch.Tensor = None,
-        BLOCK_R: int = 32
+        BLOCK_R: int = 32,
     ):
         bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
         bhsd_map = [0, 2, 1, 3] if layout == "bshd" else [0, 1, 2, 3]
