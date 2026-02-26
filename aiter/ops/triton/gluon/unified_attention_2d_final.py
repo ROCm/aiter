@@ -6,7 +6,8 @@ import triton.experimental.gluon.language as gl
 from triton.language.core import _aggregate as aggregate
 import pytest
 from aiter.ops.triton.utils._triton import arch_info
-
+import os
+PRINT_IRS = os.environ.get("PRINT_IRS", "0") == "1"
 @aggregate
 class AsyncKVLoaderConfig:
     """Configuration for asynchronous KV loader."""
@@ -67,10 +68,10 @@ class AsyncKVLoader:
         self.k_shared = k_shared
         self.v_shared = v_shared
         self.k_base_offset = k_base_offset
-        self.v_base_offset = v_base_offset
-    
+        self.v_base_offset = v_base_offset 
     @gluon.jit
-    def initialize(cfg, key_cache_ptr, value_cache_ptr, kv_head_idx,
+    def initialize(cfg, key_cache_ptr, value_cache_ptr,
+                 kv_head_idx, num_blocks,
                  stride_k_cache_1, stride_k_cache_2, stride_k_cache_3,
                  stride_v_cache_1, stride_v_cache_2, stride_v_cache_3):
         kv_cfg = AsyncKVLoaderConfig(cfg)
@@ -173,7 +174,7 @@ class TDMKVLoader:
     stride_v_cache_2: gl.tensor
 
     @gluon.constexpr_function
-    def __init__(self, kv_cfg, key_cache_ptr, value_cache_ptr, k_shared, v_shared, k_desc, v_desc, kv_head_idx, stride_k_cache_2, stride_v_cache_2):
+    def __init__(self, kv_cfg, k_shared, v_shared, k_desc, v_desc, kv_head_idx, stride_k_cache_2, stride_v_cache_2):
         self.kv_cfg = kv_cfg
         self.k_shared = k_shared
         self.v_shared = v_shared
@@ -184,13 +185,13 @@ class TDMKVLoader:
         self.stride_v_cache_2 = stride_v_cache_2
     
     @gluon.jit
-    def initialize(cfg, key_cache_ptr, value_cache_ptr, kv_head_idx,
-                 num_blocks,
+    def initialize(cfg, key_cache_ptr, value_cache_ptr,
+                 kv_head_idx, num_blocks,
                  stride_k_cache_1, stride_k_cache_2, stride_k_cache_3,
                  stride_v_cache_1, stride_v_cache_2, stride_v_cache_3):
-        kv_cfg = AsyncKVLoaderConfig(cfg)
+        kv_cfg = TDMKVLoaderConfig(cfg)
         k_shared = gl.allocate_shared_memory(
-            key_cache_ptr.type.element_ty, [2, cfg.HEAD_SIZE, cfg.BLOCK_SIZE], layout=kv_cfg.shared_k_layout)
+            key_cache_ptr.type.element_ty, [2, cfg.BLOCK_SIZE, cfg.HEAD_SIZE], layout=kv_cfg.shared_k_layout)
         v_shared = gl.allocate_shared_memory(
             value_cache_ptr.type.element_ty, [2, cfg.BLOCK_SIZE, cfg.HEAD_SIZE], layout=kv_cfg.shared_v_layout)
         
@@ -322,10 +323,9 @@ class AttentionConfig:
 
         # Blocked layouts for global-to-shared memory loads
         HEAD_SIZE_DIV = HEAD_SIZE // 8
-        #gl.static_assert(WARP_SIZE % HEAD_SIZE_DIV == 0, "WARP_SIZE must be divisible by HEAD_SIZE_DIV")
         self.blocked_q = gl.constexpr(gl.BlockedLayout(
             size_per_thread=[1, 8],
-            threads_per_warp=[16, 4],
+            threads_per_warp=[self.WARP_SIZE // 8, 8],
             warps_per_cta=[NUM_WARPS, 1],
             order=[1, 0],
         ))
@@ -541,6 +541,7 @@ def kernel_unified_attention_2d(
     output_stride_1,
     USE_SINKS: gl.constexpr,  # bool
     SLIDING_WINDOW: gl.constexpr,  # int
+    num_blocks,
     stride_k_cache_0: gl.int32,
     stride_k_cache_1: gl.int32,
     stride_k_cache_2: gl.int32,
@@ -641,8 +642,9 @@ def kernel_unified_attention_2d(
         KVLoader: gl.constexpr = AsyncKVLoader
 
     kv_loader = KVLoader.initialize(cfg, key_cache_ptr, value_cache_ptr, kv_head_idx,
-                                            stride_k_cache_1, stride_k_cache_2, stride_k_cache_3,
-                                            stride_v_cache_1, stride_v_cache_2, stride_v_cache_3)
+                                    num_blocks,
+                                    stride_k_cache_1, stride_k_cache_2, stride_k_cache_3,
+                                    stride_v_cache_1, stride_v_cache_2, stride_v_cache_3)
         
     # Initialize accumulators
     if not USE_SINKS:
@@ -668,7 +670,9 @@ def kernel_unified_attention_2d(
     acc = gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout)
     # TODO (cagri): Assuming stride_k_cache_0 == stride_v_cache_0
     # Prologue: load first tile's block index and issue async K, V loads
-    physical_block_idx = gl.load(block_tables_ptr_shifted + pgm.tile_start) * stride_k_cache_0
+    physical_block_idx = gl.load(block_tables_ptr_shifted + pgm.tile_start)
+    if not USE_TDM:
+        physical_block_idx = physical_block_idx * stride_k_cache_0
     # rotating buffer index logic
     # TODO (cagri): Loop unrolling can get rid of this
     buffer_id: gl.int32 = 0
@@ -677,7 +681,9 @@ def kernel_unified_attention_2d(
 
     # Main attention loop over KV tiles (staged, num_stages=2)
     for j in range(pgm.tile_start, pgm.tile_end - 1):
-        next_physical_block_idx = gl.load(block_tables_ptr_shifted + j + 1) * stride_k_cache_0
+        next_physical_block_idx = gl.load(block_tables_ptr_shifted + j + 1)
+        if not USE_TDM:
+            next_physical_block_idx = next_physical_block_idx * stride_k_cache_0
         k = kv_loader.load_k_from_shared(wait_count=1, buffer_id=buffer_id)
 
         # Prefetch next tile (shared is free since k, v are in registers)
@@ -758,6 +764,7 @@ def unified_attention(q,
     BLOCK_SIZE = k.shape[1]
     BLOCK_M = 128
     SLIDING_WINDOW = 1 + window_size[0]
+    num_blocks = k.shape[0]
 
     NUM_QUERIES_PER_KV = NUM_Q_HEADS // NUM_KV_HEADS
     BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
@@ -768,10 +775,8 @@ def unified_attention(q,
     USE_TDM = ARCH_NAME == "gfx1250"
     kv_size = k.nelement() * k.element_size()
     MAX_INT32 = 2**31 - 1
-    USE_LOAD_BUFFER_OP = kv_size <= MAX_INT32# or True
+    USE_LOAD_BUFFER_OP = kv_size <= MAX_INT32
     USE_STORE_BUFFER_OP = out.nelement() * out.element_size() <= MAX_INT32
-    USE_LOAD_BUFFER_OP = False
-    USE_STORE_BUFFER_OP = False
     waves_per_eu = 4 if HEAD_SIZE < 128 else 2
     grid = (NUM_KV_HEADS, total_query_blocks)
     attn_kernel = kernel_unified_attention_2d[grid](
@@ -789,6 +794,7 @@ def unified_attention(q,
         output_stride_1=out.stride(1),
         USE_SINKS=(sinks is not None),
         SLIDING_WINDOW=SLIDING_WINDOW,
+        num_blocks=num_blocks,
         stride_k_cache_0=k.stride(0),
         stride_k_cache_1=k.stride(1),
         stride_k_cache_2=k.stride(2),
@@ -813,7 +819,7 @@ def unified_attention(q,
         num_warps=NUM_WARPS,
         USE_TDM=USE_TDM,
     )
-    if getattr(unified_attention, "print", False) == False:
+    if PRINT_IRS and getattr(unified_attention, "print", False) == False:
         setattr(unified_attention, "print", True)
         print_irs_to_files(attn_kernel, "unified_attention_2d_gluon")
     return attn_kernel
