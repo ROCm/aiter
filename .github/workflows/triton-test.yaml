@@ -201,7 +201,7 @@ jobs:
         run: |
           docker rm -f triton_test || true
 
-  triton-test-results:
+  triton-test-finish:
     if: ${{ !github.event.pull_request.draft }}
     name: Triton Test Results
     runs-on: ubuntu-latest

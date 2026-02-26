@@ -302,7 +302,7 @@ jobs:
         run: |
           docker rm -f aiter_test || true
 
-  standard-test-results:
+  standard-test-finish:
     if: ${{ !github.event.pull_request.draft }}
     name: Standard Test Results
     runs-on: ubuntu-latest
