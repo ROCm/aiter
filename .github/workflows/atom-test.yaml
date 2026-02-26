@@ -89,6 +89,38 @@ jobs:
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
           EOF
 
+      - name: Check System health
+        run: |
+            if command -v rocm-smi &> /dev/null; then
+              echo -e "\n===== ROCm GPU Overview ====="
+              sudo rocm-smi
+              echo -e "\n===== ROCm GPU Memory Status ====="
+              sudo rocm-smi --showmeminfo vram
+              echo -e "\n===== ROCm GPU Processes ====="
+              sudo rocm-smi --showpidgpus
+              sudo rocm-smi --showpids
+            else
+              echo "rocm-smi not found"
+            fi
+
+            #echo -e "\n===== Resetting GPU ====="
+            #sudo rocm-smi --gpureset -d 0
+
+            echo -e "\n===== System Memory Status ====="
+            free -h
+            echo -e "\n===== Memory usage by process (top 10) ====="
+            ps aux --sort=-%mem | head -11
+
+            echo -e "\n==== Docker Container Status ==="
+            docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Size}}"
+
+            echo -e "\n===== Python/PyTorch Processes ====="
+            ps aux | grep -E "python|torch" | grep -v grep || echo "No Python processes found"
+
+            # echo -e "\n===== Setting Memory Management Env Vars ====="
+            # echo "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+            # echo "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" >> $GITHUB_ENV
+
       - name: Build the ATOM test image
         run: |
           docker build --network=host \

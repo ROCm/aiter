@@ -25,6 +25,7 @@ setup(
                 os.path.join(_THIS_DIR, "test_async_load.cu"),
                 os.path.join(_THIS_DIR, "test_dtype_convert.cu"),
                 os.path.join(_THIS_DIR, "test_mdiv.cu"),
+                os.path.join(_THIS_DIR, "test_numeric_limits.cu"),
                 os.path.join(_THIS_DIR, "test_workgroup_barrier.cu"),
                 os.path.join(_THIS_DIR, "opus_device_test_ext.cpp"),
             ],
