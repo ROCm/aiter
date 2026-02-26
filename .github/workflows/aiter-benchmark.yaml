@@ -1,0 +1,32 @@
+name: Aiter Benchmark
+
+on:
+  pull_request: # for testing
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  aiter_benchmark:
+    name: Aiter Benchmark
+    runs-on: aiter-8gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+    
+      - name: Run benchmark
+        uses: ROCm/rocActions/atom-benchmark-workflow@atom_benchmark_workflow
+        with:
+          model: "deepseek-r1-0528"
+          model_path: "deepseek-ai/DeepSeek-R1-0528"
+          extra_args: "--kv_cache_dtype fp8 -tp 8"
+          param: "1024,1024,128,0.8"
