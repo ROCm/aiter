@@ -399,7 +399,7 @@ class AttentionConfig:
 
     USE_LOAD_BUFFER_OP: gl.constexpr
     USE_STORE_BUFFER_OP: gl.constexpr
-
+    ALL_DECODE: gl.constexpr
     @gluon.constexpr_function
     def __init__(
         self,
@@ -415,6 +415,7 @@ class AttentionConfig:
         SCALE,
         USE_LOAD_BUFFER_OP,
         USE_STORE_BUFFER_OP,
+        ALL_DECODE,
     ):
 
         # Constants
@@ -431,6 +432,7 @@ class AttentionConfig:
         self.QK_SCALE = gl.constexpr(SCALE * self.RCP_LN2)
         self.USE_LOAD_BUFFER_OP = gl.constexpr(USE_LOAD_BUFFER_OP)
         self.USE_STORE_BUFFER_OP = gl.constexpr(USE_STORE_BUFFER_OP)
+        self.ALL_DECODE = gl.constexpr(ALL_DECODE)
         self.ARCH_NAME = gl.constexpr(ARCH_NAME)
         self.WARP_SIZE = gl.constexpr(32 if ARCH_NAME == "gfx1250" else 64)
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
@@ -479,7 +481,7 @@ class AttentionConfig:
         )
 
         self.Q_CACHE_MODIFIER = gl.constexpr(".cg")
-        self.KV_CACHE_MODIFIER = gl.constexpr("")
+        self.KV_CACHE_MODIFIER = gl.constexpr(".cg") if ALL_DECODE else gl.constexpr("")
 
 
 @aggregate
@@ -796,6 +798,7 @@ def kernel_unified_attention_2d(
     USE_LOAD_BUFFER_OP: gl.constexpr = False,
     USE_STORE_BUFFER_OP: gl.constexpr = False,
     USE_TDM: gl.constexpr = False,
+    ALL_DECODE: gl.constexpr = False,
 ):
     NUM_WARPS: gl.constexpr = gl.num_warps()
     # Workgroup offsets
@@ -815,6 +818,7 @@ def kernel_unified_attention_2d(
         SCALE,
         USE_LOAD_BUFFER_OP,
         USE_STORE_BUFFER_OP,
+        ALL_DECODE,
     )
 
     # Cast strides to int64 when not using buffer ops
@@ -1051,6 +1055,7 @@ def unified_attention(
     BLOCK_M = 128
     SLIDING_WINDOW = 1 + window_size[0]
     num_blocks = k.shape[0]
+    ALL_DECODE = max_seqlen_q == 1
 
     NUM_QUERIES_PER_KV = NUM_Q_HEADS // NUM_KV_HEADS
     BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
@@ -1104,6 +1109,7 @@ def unified_attention(
         USE_STORE_BUFFER_OP=USE_STORE_BUFFER_OP,
         num_warps=NUM_WARPS,
         USE_TDM=USE_TDM,
+        ALL_DECODE=ALL_DECODE,
     )
     if PRINT_IRS and getattr(unified_attention, "print", False) == False:
         setattr(unified_attention, "print", True)
