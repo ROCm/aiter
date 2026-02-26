@@ -46,7 +46,7 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
         hadamard_rotation: bool = True,
         config: Optional[dict] = None,
         R: torch.Tensor = None,
-        BLOCK_R: int = 32,
+        BLOCK_R: int = 128,
     ):
         bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
         bhsd_map = [0, 2, 1, 3] if layout == "bshd" else [0, 1, 2, 3]
@@ -104,7 +104,7 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
     def backward(ctx, dout: torch.Tensor):
         # Backward remains unimplemented
         assert False, "backward not implemented"
-        return (None,) * 9
+        return (None,) * 10
 
 
 def fav3_sage_mxfp4_wrapper(
@@ -117,7 +117,7 @@ def fav3_sage_mxfp4_wrapper(
     hadamard_rotation: bool = False,
     config: Optional[dict] = None,
     R: torch.Tensor = None,
-    BLOCK_R: int = 32,
+    BLOCK_R: int = 128,
 ):
     """High-precision entry point for MXFP4 SageAttention."""
     for tensor, name in zip([q, k, v], ["q", "k", "v"]):
