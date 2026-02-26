@@ -2,21 +2,55 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 # adapted from triton_kernels package
 
-from typing import Optional
-import json
-import os
-import math
 import torch
 import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
-from triton.experimental.gluon.language.amd.gfx1250 import async_copy as cp
-from triton.language.core import _aggregate as aggregate
+
+
+def preshuffle_weights(w: torch.Tensor) -> torch.Tensor:
+    """
+    Preshuffle weights from (E, K, N) to (E, N//16, K*16).
+
+    1. Transpose to (E, N, K)
+    2. View as (E, N//16, 16, K//32, 2, 16)
+    3. Permute to (E, N//16, K//32, 2, 16, 16)
+    4. View as (E, N//16, K*16)
+    """
+    fp8e4_dtype = (
+        torch.float8_e4m3fn if get_arch() != "gfx942" else torch.float8_e4m3fnuz
+    )
+    assert w.dtype == fp8e4_dtype
+    assert w.ndim == 3
+    E, K, N = w.shape
+    assert K % 32 == 0
+    assert N % 16 == 0
+
+    w = w.transpose(1, 2)  # (E, N, K)
+    w = w.view(E, N // 16, 16, K // 32, 2, 16)
+    w = w.permute(0, 1, 3, 4, 2, 5).contiguous()  # (E, N//16, K//32, 2, 16, 16)
+    w = w.view(E, N // 16, K * 16)
+    return w
+
+
+@gluon.jit
+def unshuffle_b_to_kn(
+    b,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+):
+    """converts preshuffled (BLOCK_N//16, BLOCK_K*16) to logical (BLOCK_K, BLOCK_N)."""
+    return (
+        b.reshape(1, BLOCK_N // 16, BLOCK_K // 32, 2, 16, 16)
+        .permute(0, 1, 4, 2, 3, 5)
+        .reshape(BLOCK_N, BLOCK_K)
+        .trans(1, 0)
+    )
 
 
 @gluon.jit
@@ -183,26 +217,11 @@ def issue_async_tile_loads(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
-    W_TRANSPOSE: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
 ):
     """
     Load A, B, and scale tiles asynchronously into shared memory buffers.
-
-    Args:
-        a_desc: Tensor descriptor for A
-        b_desc: Tensor descriptor for B
-        a_scale_desc: Tensor descriptor for A scale
-        b_scale_desc: Tensor descriptor for B scale
-        GatherIndx: Gather indices (None for regular access)
-        k_offset_start: Starting K offset for this split-K block
-        k: k index (which buffer slot to use)
-        a_buffer, b_buffer, a_scale_buffer, b_scale_buffer: Shared memory buffers
-        BLOCK_M, BLOCK_N, BLOCK_K: Block sizes
-        BLOCKSCALE_M, BLOCKSCALE_N, BLOCKSCALE_K: Block scale sizes
-        PER_ROW_X_SCALE: Whether X scale is per-row
-        W_TRANSPOSE: Whether W is transposed
-        NUM_BUFFERS: Number of pipeline buffers
+    B is loaded in preshuffled layout into b_buffer.
     """
     buffer_idx = k % NUM_BUFFERS
 
@@ -219,19 +238,15 @@ def issue_async_tile_loads(
             a_desc, gathered_m, col_offset, a_buffer.index(buffer_idx)
         )
 
-    # Load B tile
-    if W_TRANSPOSE:
-        gl.amd.gfx1250.tdm.async_load(
-            b_desc,
-            [pid_n * BLOCK_N, k_offset_start + k * BLOCK_K],
-            b_buffer.index(buffer_idx),
-        )
-    else:
-        gl.amd.gfx1250.tdm.async_load(
-            b_desc,
-            [k_offset_start + k * BLOCK_K, pid_n * BLOCK_N],
-            b_buffer.index(buffer_idx),
-        )
+    # Load B tile (N//16, K*16)
+    gl.amd.gfx1250.tdm.async_load(
+        b_desc,
+        [
+            pid_n * (BLOCK_N // 16),
+            (k_offset_start + k * BLOCK_K) * 16,
+        ],
+        b_buffer.index(buffer_idx),
+    )
 
 
 @gluon.jit
@@ -257,24 +272,20 @@ def consume_scaled_tile(
     BLOCKSCALE_M: gl.constexpr,
     BLOCKSCALE_N: gl.constexpr,
     BLOCKSCALE_K: gl.constexpr,
-    W_TRANSPOSE: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     WMMA_LAYOUT: gl.constexpr,
     DOT_A_LAYOUT: gl.constexpr,
     DOT_B_LAYOUT: gl.constexpr,
+    BLOCKED_B: gl.constexpr,
     PER_ROW_X_SCALE: gl.constexpr,
     is_x_blockscale: gl.constexpr,
     is_w_blockscale: gl.constexpr,
 ):
     cur_a = a_buffer.index(m % NUM_BUFFERS).load(layout=DOT_A_LAYOUT)
-
-    if W_TRANSPOSE:
-        # B is stored as (N, K) but WMMA needs (K, N)
-        cur_b = (
-            b_buffer.index(m % NUM_BUFFERS).permute([1, 0]).load(layout=DOT_B_LAYOUT)
-        )
-    else:
-        cur_b = b_buffer.index(m % NUM_BUFFERS).load(layout=DOT_B_LAYOUT)
+    b_shuffled = b_buffer.index(m % NUM_BUFFERS).load(layout=BLOCKED_B)
+    cur_b = gl.convert_layout(
+        unshuffle_b_to_kn(b_shuffled, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K), DOT_B_LAYOUT
+    )
 
     offs_k_scale = (k_offset_start // BLOCKSCALE_K) + m * gl.cdiv(
         BLOCK_K, BLOCKSCALE_K
@@ -307,20 +318,12 @@ def consume_scaled_tile(
             BLOCK_N,
         )
         offs_w_scale_n = offs_w_n // BLOCKSCALE_N
-        if W_TRANSPOSE:
-            # WScale: [N_blocks, K_blocks]
-            w_scale_ptrs = (
-                w_scale_base
-                + offs_w_scale_n * stride_w_bs_n
-                + offs_k_scale * stride_w_bs_k
-            )
-        else:
-            # WScale: [K_blocks, N_blocks]
-            w_scale_ptrs = (
-                w_scale_base
-                + offs_k_scale * stride_w_bs_k
-                + offs_w_scale_n * stride_w_bs_n
-            )
+        # WScale: [K_blocks, N_blocks]
+        w_scale_ptrs = (
+            w_scale_base
+            + offs_k_scale * stride_w_bs_k
+            + offs_w_scale_n * stride_w_bs_n
+        )
         cur_b_scale = gl.load(w_scale_ptrs)
     else:
         cur_b_scale = gl.full(
@@ -364,10 +367,10 @@ def create_descriptor(
     BLOCKED_KN: gl.constexpr,
     SHARED_A: gl.constexpr,
     SHARED_B: gl.constexpr,
-    W_TRANSPOSE: gl.constexpr,
 ):
     """
     Create tensor descriptors for X, W, and their scales.
+    W is in preshuffled layout (N//16, K*16).
 
     Returns:
         a_desc: Tensor descriptor or AsyncCopyDescriptor for X
@@ -430,22 +433,14 @@ def create_descriptor(
     )
     W += expt_id * stride_w_e
 
-    if W_TRANSPOSE:
-        b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=W,
-            shape=(N, K),
-            strides=(stride_w_n, stride_w_k),
-            block_shape=(BLOCK_N, BLOCK_K),
-            layout=SHARED_B,
-        )
-    else:
-        b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=W,
-            shape=(K, N),
-            strides=(stride_w_k, stride_w_n),
-            block_shape=(BLOCK_K, BLOCK_N),
-            layout=SHARED_B,
-        )
+    # stride_w_n = n16 stride, stride_w_k = kshuf stride
+    b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=W,
+        shape=(N // 16, K * 16),
+        strides=(stride_w_n, stride_w_k),
+        block_shape=(BLOCK_N // 16, BLOCK_K * 16),
+        layout=SHARED_B,
+    )
 
     return a_desc, b_desc, gathered_m
 
@@ -514,15 +509,12 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
     WMMA_LAYOUT: gl.constexpr,
     SHARED_A: gl.constexpr,
     SHARED_B: gl.constexpr,
-    SHARED_A_SCALE: gl.constexpr,
-    SHARED_B_SCALE: gl.constexpr,
     DOT_A_LAYOUT: gl.constexpr,
     DOT_B_LAYOUT: gl.constexpr,
+    BLOCKED_B: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
     # Use per-row or 2D blockscale on X
     PER_ROW_X_SCALE: gl.constexpr = False,
-    # W transpose: If True, W is stored as (N, K) instead of (K, N)
-    W_TRANSPOSE: gl.constexpr = False,
     # Number of buffers to use for async_load
     NUM_BUFFERS: gl.constexpr = 2,
 ):
@@ -536,7 +528,6 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
     - x_scale: Scale tensor for A with shape (M // blockscale_m, K // blockscale_k) or (M, K // blockscale_k)
     - w_scale: Scale tensor for B with shape (K // blockscale_k, N // blockscale_n)
     - PER_ROW_X_SCALE: Determines whether we use per-row or 2D blockscale on X
-    - W_TRANSPOSE: Determines whether W is stored as (N, K) instead of (K, N)
     - NUM_BUFFERS: Determines the number of buffers to use for async_load
 
     For this kernel implementation, BLOCKSCALE_K must equal BLOCK_K. #TODO: make this configurable
@@ -586,18 +577,15 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
     start_m = start_m.to(index_type)
     pid_n, pid_k = pid_n.to(index_type), pid_k.to(index_type)
 
-    # Allocate shared memory buffer
+    # Allocate shared memory buffers
     a_buffer = gl.allocate_shared_memory(
         X.type.element_ty, [NUM_BUFFERS, BLOCK_M, BLOCK_K], layout=SHARED_A
     )
-    if W_TRANSPOSE:
-        b_buffer = gl.allocate_shared_memory(
-            W.type.element_ty, [NUM_BUFFERS, BLOCK_N, BLOCK_K], layout=SHARED_B
-        )
-    else:
-        b_buffer = gl.allocate_shared_memory(
-            W.type.element_ty, [NUM_BUFFERS, BLOCK_K, BLOCK_N], layout=SHARED_B
-        )
+    b_buffer = gl.allocate_shared_memory(
+        W.type.element_ty,
+        [NUM_BUFFERS, BLOCK_N // 16, BLOCK_K * 16],
+        layout=SHARED_B,
+    )
 
     # Create tensor descriptors
     a_desc, b_desc, gathered_m = create_descriptor(
@@ -627,7 +615,6 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
         BLOCKED_KN,
         SHARED_A,
         SHARED_B,
-        W_TRANSPOSE,
     )
 
     k = 0
@@ -653,14 +640,12 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
             BLOCK_M,
             BLOCK_N,
             BLOCK_K,
-            W_TRANSPOSE,
             NUM_BUFFERS,
         )
         k += 1
 
     # Main loop
     for _ in range(num_k_tiles - (NUM_BUFFERS - 1)):
-        # Load next A and B tiles
         issue_async_tile_loads(
             a_desc,
             b_desc,
@@ -675,7 +660,6 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
             BLOCK_M,
             BLOCK_N,
             BLOCK_K,
-            W_TRANSPOSE,
             NUM_BUFFERS,
         )
         k += 1
@@ -703,11 +687,11 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
             BLOCKSCALE_M,
             BLOCKSCALE_N,
             BLOCKSCALE_K,
-            W_TRANSPOSE,
             NUM_BUFFERS,
             WMMA_LAYOUT,
             DOT_A_LAYOUT,
             DOT_B_LAYOUT,
+            BLOCKED_B,
             PER_ROW_X_SCALE,
             is_x_blockscale,
             is_w_blockscale,
@@ -739,11 +723,11 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
             BLOCKSCALE_M,
             BLOCKSCALE_N,
             BLOCKSCALE_K,
-            W_TRANSPOSE,
             NUM_BUFFERS,
             WMMA_LAYOUT,
             DOT_A_LAYOUT,
             DOT_B_LAYOUT,
+            BLOCKED_B,
             PER_ROW_X_SCALE,
             is_x_blockscale,
             is_w_blockscale,
@@ -835,7 +819,8 @@ def allocate_output(
     split_k,
 ):
     # ---- output ------
-    N = w.shape[-1]
+    # W is (E, N//16, K*16)
+    N = w.shape[-2] * 16
     # by default - M is number of rows in the activations
     M = x.shape[-2]
     # if the activations are gathered, then M is number of gather indices
@@ -865,7 +850,7 @@ def get_kernel_config(m, n, k, routing_data):
     blockscale_m = 128
     blockscale_k = 128
     blockscale_n = 128
-    num_xcds = 8
+    num_xcds = 1
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_stages = 2
@@ -1005,14 +990,13 @@ def moe_gemm_a8w8_blockscale_gfx1250(
     unpadded_N=None,
     unpadded_K=None,
     per_row_x_scale=False,
-    preshuffled=False,
 ):
     """
     Y[:, :] = 0.
     for e in num_experts:
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
 
-    If preshuffled is True, then W is stored as (E, N, K) instead of (E, K, N)
+    W must be (E, N//16, K*16) from preshuffle_weights.
     """
     x_has_blockscale = x_block_scales is not None
     w_has_blockscale = w_block_scales is not None
@@ -1036,13 +1020,11 @@ def moe_gemm_a8w8_blockscale_gfx1250(
         stride_w_bs_k = 0
         stride_w_bs_n = 0
 
-    # determine shapes
+    # determine shapes; W is (E, N//16, K*16)
     M = x.shape[-2] if gather_indx is None else gather_indx.shape[0]
     K = x.shape[-1]
-    if preshuffled:  # (E, N, K)
-        N, K_w = w.shape[-2], w.shape[-1]
-    else:  # (E, K, N)
-        N, K_w = w.shape[-1], w.shape[-2]
+    N = w.shape[-2] * 16
+    K_w = w.shape[-1] // 16
     assert K == K_w, f"K dimension mismatch: x has K={K}, w has K={K_w}"
 
     block_m = routing_data.block_m
@@ -1052,6 +1034,9 @@ def moe_gemm_a8w8_blockscale_gfx1250(
         K = unpadded_K
     # compute optimization flags
     config = get_kernel_config(M, N, K, routing_data)
+    if config["block_k"] % 32 != 0:
+        config["block_k"] = triton.cdiv(config["block_k"], 32) * 32
+        config["block_k"] = max(config["block_k"], 32)
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
         reduction_n_matmul = 1
@@ -1112,6 +1097,13 @@ def moe_gemm_a8w8_blockscale_gfx1250(
         warps_per_cta=[1, num_warps],
         order=[0, 1],
     )
+    # To load with b_buffer with BLOCKED_B (BLOCK_N//16, BLOCK_K*16) layout
+    blocked_b = gl.BlockedLayout(
+        size_per_thread=[BLOCK_N // 16, 16],
+        threads_per_warp=[1, 32],
+        warps_per_cta=[1, num_warps],
+        order=[0, 1],
+    )
 
     if num_warps == 4:
         warp_bases = [[0, 1], [1, 0]]
@@ -1126,45 +1118,9 @@ def moe_gemm_a8w8_blockscale_gfx1250(
     shared_a = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_K, 16]], [BLOCK_M, BLOCK_K], [1, 0]
     )
-    if preshuffled:
-        shared_b = gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_K, 16]], [BLOCK_N, BLOCK_K], [1, 0]
-        )
-    else:
-        shared_b = gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_N, 16]], [BLOCK_K, BLOCK_N], [1, 0]
-        )
-
-    a_scale_tile_k = triton.cdiv(BLOCK_K, config["blockscale_k"])
-    a_scale_tile_m = (
-        BLOCK_M if per_row_x_scale else triton.cdiv(BLOCK_M, config["blockscale_m"])
+    shared_b = gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_K, 16]], [BLOCK_N // 16, BLOCK_K * 16], [1, 0]
     )
-    b_scale_tile_k = triton.cdiv(BLOCK_K, config["blockscale_k"])
-    b_scale_tile_n = triton.cdiv(BLOCK_N, config["blockscale_n"])
-
-    a_scale_block_shape = (a_scale_tile_m, a_scale_tile_k)
-    if preshuffled:
-        b_scale_block_shape = (b_scale_tile_n, b_scale_tile_k)
-    else:
-        b_scale_block_shape = (b_scale_tile_k, b_scale_tile_n)
-
-    shared_a_scale = gl.PaddedSharedLayout.with_identity_for(
-        [[256, 16]],
-        [a_scale_tile_m, a_scale_tile_k],
-        [1, 0],
-    )
-    if preshuffled:
-        shared_b_scale = gl.PaddedSharedLayout.with_identity_for(
-            [[256, 16]],
-            [b_scale_tile_n, b_scale_tile_k],
-            [1, 0],
-        )
-    else:
-        shared_b_scale = gl.PaddedSharedLayout.with_identity_for(
-            [[256, 16]],
-            [b_scale_tile_k, b_scale_tile_n],
-            [1, 0],
-        )
 
     dot_a_layout = gl.DotOperandLayout(operand_index=0, parent=wmma_layout, k_width=16)
     dot_b_layout = gl.DotOperandLayout(operand_index=1, parent=wmma_layout, k_width=16)
@@ -1182,9 +1138,9 @@ def moe_gemm_a8w8_blockscale_gfx1250(
         stride_x_bs_m,
         stride_x_bs_k,
         w,
-        w.stride(0),
-        w.stride(1) if not preshuffled else w.stride(2),
-        w.stride(2) if not preshuffled else w.stride(1),
+        w.stride(0), # W is (E, N//16, K*16)
+        w.stride(2),
+        w.stride(1),
         w_block_scales,
         stride_w_bs_e,
         stride_w_bs_k,
@@ -1226,7 +1182,6 @@ def moe_gemm_a8w8_blockscale_gfx1250(
         num_stages=config["num_stages"],
         UPCAST_INDICES=should_upcast_indices(x, w, y),
         PER_ROW_X_SCALE=per_row_x_scale,
-        W_TRANSPOSE=preshuffled,
         waves_per_eu=config["waves_per_eu"],
         matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
         kpack=config["kpack"],
@@ -1236,10 +1191,9 @@ def moe_gemm_a8w8_blockscale_gfx1250(
         WMMA_LAYOUT=wmma_layout,
         SHARED_A=shared_a,
         SHARED_B=shared_b,
-        SHARED_A_SCALE=shared_a_scale,
-        SHARED_B_SCALE=shared_b_scale,
         DOT_A_LAYOUT=dot_a_layout,
         DOT_B_LAYOUT=dot_b_layout,
+        BLOCKED_B=blocked_b,
     )
     # Build grouped reduction inputs in a uniform way
     group_indx = (
