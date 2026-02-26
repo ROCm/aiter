@@ -307,8 +307,14 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
     TORCH_CHECK(q_descale_.has_value() == k_descale_.has_value() &&
                 k_descale_.has_value() == v_descale_.has_value(),
                 "q_descale, k_descale, v_descale must be all provided or all not provided");
-    if (is_qkv_fp8) {
-        TORCH_CHECK(q_descale_.has_value(), "q_descale, k_descale, v_descale must be provided for asm fp8");
+    if(is_qkv_fp8)
+    {
+        TORCH_CHECK(q_descale_.has_value(),
+                    "q_descale, k_descale, v_descale must be provided for asm fp8");
+        TORCH_CHECK(q_descale_.value().dtype() == torch::kFloat32 &&
+                        k_descale_.value().dtype() == torch::kFloat32 &&
+                        v_descale_.value().dtype() == torch::kFloat32,
+                    "q_descale, k_descale, v_descale must be float32");
     }
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");

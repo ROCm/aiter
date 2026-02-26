@@ -1265,16 +1265,23 @@ def _flash_attn_forward(
     # mask
     window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
-    mask = causal and window_size_left == -1  # causal mask
-    nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
+    # mask = causal and window_size_left == -1  # causal mask
+    # nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
     swa = (window_size_left > 0) or (window_size_right > 0)
 
     def is_fmha_v3_fp8():
         ret = get_gfx() == "gfx942"
         ret = ret and (q.dtype == dtypes.fp8)
-        ret = ret and (q_descale is not None)
+        ret = ret and (
+            q_descale is not None and k_descale is not None and v_descale is not None
+        )
         # support per tensor and per head quant scale
-        ret = ret and (q_descale.shape == (1,) or q_descale.shape == (batch_size, nhead_k))
+        ret = ret and (
+            q_descale.shape == (1,) or q_descale.shape == (batch_size, nhead_k)
+        )
+        ret = ret and (
+            q_descale.shape == k_descale.shape and q_descale.shape == v_descale.shape
+        )
         return ret
 
     def can_impl_fmha_v3_fwd():
@@ -1997,7 +2004,8 @@ def _flash_attn_varlen_forward(
     sink_ptr: Optional[Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
-    batch_size, nhead_q, hdim_q = q.shape
+    _, nhead_q, hdim_q = q.shape
+    batch_size = cu_seqlens_q.numel() - 1
 
     nhead_k = v.shape[-2]
     hdim_v = v.shape[-1]
@@ -2019,9 +2027,16 @@ def _flash_attn_varlen_forward(
     def is_fmha_v3_fp8():
         ret = get_gfx() == "gfx942"
         ret = ret and (q.dtype == dtypes.fp8)
-        ret = ret and (q_descale is not None)
+        ret = ret and (
+            q_descale is not None and k_descale is not None and v_descale is not None
+        )
         # support per tensor and per head quant scale
-        ret = ret and (q_descale.shape == (1,) or q_descale.shape == (batch_size, nhead_k))
+        ret = ret and (
+            q_descale.shape == (1,) or q_descale.shape == (batch_size, nhead_k)
+        )
+        ret = ret and (
+            q_descale.shape == k_descale.shape and q_descale.shape == v_descale.shape
+        )
         return ret
 
     def can_impl_fmha_v3_fwd():
