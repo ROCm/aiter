@@ -1183,16 +1183,22 @@ def test_fmoe_lqq(
     w2_qt = moe_lqq_dequant_xor(w2_lqq_uint4, w2_lqq_scale, w2_lqq_zero_uint8)
     # save_int8_to_file(w2_qt, "./feifei/w2_qt", format="text")
     # gu quant scale for cpu ref and kernel
-    w2_scale = moe_init_float(eprt, inter_dim, 1, 1)
+    w2_scale = moe_init_float(eprt, model_dim, 1, 1)
     # save_buffer_to_file(w2_scale, "./feifei/w2_scale", format="text")
 
     print("==========================================")
-    print("[test] a1_qt   : ", a1_qt.shape, a1_qt.dtype)
-    print("[test] w1_qt   : ", w1_qt.shape, w1_qt.dtype)
-    print("[test] w2_qt   : ", w2_qt.shape, w2_qt.dtype)
-    print("[test] a1_scale: ", a1_scale.shape, a1_scale.dtype)
-    print("[test] w1_scale: ", w1_scale.shape, w1_scale.dtype)
-    print("[test] w2_scale: ", w2_scale.shape, w2_scale.dtype)
+    print("[test] a1_qt         : ", a1_qt.shape, a1_qt.dtype)
+    print("[test] a1_scale      : ", a1_scale.shape, a1_scale.dtype)
+    print("[test] w1_qt         : ", w1_qt.shape, w1_qt.dtype)
+    print("[test] w1_scale      : ", w1_scale.shape, w1_scale.dtype)
+    print("[test] w1_lqq        : ", w1_lqq.shape, w1_lqq.dtype)
+    print("[test] w1_lqq_scale  : ", w1_lqq_scale.shape, w1_lqq_scale.dtype)
+    print("[test] w1_lqq_zero   : ", w1_lqq_zero.shape, w1_lqq_zero.dtype)
+    print("[test] w2_qt         : ", w2_qt.shape, w2_qt.dtype)
+    print("[test] w2_scale      : ", w2_scale.shape, w2_scale.dtype)
+    print("[test] w2_lqq        : ", w2_lqq.shape, w2_lqq.dtype)
+    print("[test] w2_lqq_scale  : ", w2_lqq_scale.shape, w2_lqq_scale.dtype)
+    print("[test] w2_lqq_zero   : ", w2_lqq_zero.shape, w2_lqq_zero.dtype)
 
     out1_ref = torch_moe_stage1(
         a1_qt,
@@ -1214,19 +1220,19 @@ def test_fmoe_lqq(
     a2_qt = a2_qt.view(token, topk, -1)
     print("[test] a2_qt   : ", a2_qt.shape, a2_qt.dtype)
     print("[test] a2_scale: ", a2_scale.shape, a2_scale.dtype)
-    # out2_ref = torch_moe_stage2(
-    #    a2_qt,
-    #    w1_qt,
-    #    w2_qt,
-    #    topk_weights,
-    #    topk_ids,
-    #    dtype=dtype,
-    #    quant_type=aiter.QuantType.per_Token,
-    #    a2_scale=a2_scale,
-    #    w2_scale=w2_scale,
-    #    doweight=False,
-    # )
-    # print("[test] out2_ref: ", out2_ref.shape, out2_ref.dtype)
+    out2_ref = torch_moe_stage2(
+        a2_qt,
+        w1_qt,
+        w2_qt,
+        topk_weights,
+        topk_ids,
+        dtype=dtype,
+        quant_type=aiter.QuantType.per_Token,
+        a2_scale=a2_scale,
+        w2_scale=w2_scale,
+        doweight=False,
+    )
+    print("[test] out2_ref: ", out2_ref.shape, out2_ref.dtype)
     # save_buffer_to_file(out1_ref, "./feifei/out1_ref", format="text")
     # save_int8_to_file(a2_qt, "./feifei/a2_qt", format="text")
     # save_buffer_to_file(a2_scale, "./feifei/a2_scale", format="text")
@@ -1240,7 +1246,7 @@ def test_fmoe_lqq(
     print("[test] w1_lqq_zero : ", w1_lqq_zero.shape, w1_lqq_zero.dtype)
     print("[test] w2_qt       : ", w2_qt.shape, w2_qt.dtype)
     print("[test] w2_scale    : ", w2_scale.shape, w2_scale.dtype)
-    out1_asm = fused_moe(
+    out_asm = fused_moe(
         a1_qt,
         w1_lqq,
         w2_lqq,
@@ -1259,12 +1265,13 @@ def test_fmoe_lqq(
         dtype=dtype,
         block_size_M=80,
     )
-    print("[test] out1_asm    : ", out1_asm.shape, out1_asm.dtype)
+    print("[test] out_asm    : ", out_asm.shape, out_asm.dtype)
     print("------------------------------------------")
-    # save_buffer_to_file(out1_asm, "./feifei/out1_asm_fp32", format="text")
-    # save_int8_to_file(out1_asm, "./feifei/out1_asm_int8", format="text")
+    # save_buffer_to_file(out_asm, "./feifei/out_asm_fp32", format="text")
+    # save_int8_to_file(out_asm, "./feifei/out_asm_int8", format="text")
 
-    err = checkAllclose(out1_ref, out1_asm)
+    # err = checkAllclose(out1_ref, out_asm)
+    err = checkAllclose(out2_ref, out_asm)
     print(err)
 
     """

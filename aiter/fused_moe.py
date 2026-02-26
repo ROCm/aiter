@@ -1172,8 +1172,7 @@ def fused_moe_2stages(
         a2_scale=a2_scale,
         w2_lqq_scale=w2_lqq_scale,
         w2_lqq_zero=w2_lqq_zero,
-        # block_m=block_size_M,
-        block_m=32,  # WORKAROUND feifei test only !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        block_m=block_size_M,
         sorted_weights=sorted_weights if not doweight_stage1 else None,
         **extra_stage2_args,
     )
@@ -1281,6 +1280,7 @@ def asm_stage2(
 ):
     print("[debug] w2:", w2.shape, w2.dtype)
     print("[debug] w2:", w2.stride())
+    print("[debug] block_m:", block_m)
     return aiter.moe_stage2_g1u1(
         inter_states,
         w1,
