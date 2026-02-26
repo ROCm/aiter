@@ -4,7 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
   workflow_dispatch:
 
 concurrency:
@@ -20,6 +26,7 @@ env:
 
 jobs:
   check-signal:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -32,6 +39,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   atom_benchmark:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     needs: [check-signal]
     name: ATOM Benchmark 
     strategy:
@@ -81,6 +89,38 @@ jobs:
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
           EOF
 
+      - name: Check System health
+        run: |
+            if command -v rocm-smi &> /dev/null; then
+              echo -e "\n===== ROCm GPU Overview ====="
+              sudo rocm-smi
+              echo -e "\n===== ROCm GPU Memory Status ====="
+              sudo rocm-smi --showmeminfo vram
+              echo -e "\n===== ROCm GPU Processes ====="
+              sudo rocm-smi --showpidgpus
+              sudo rocm-smi --showpids
+            else
+              echo "rocm-smi not found"
+            fi
+
+            #echo -e "\n===== Resetting GPU ====="
+            #sudo rocm-smi --gpureset -d 0
+
+            echo -e "\n===== System Memory Status ====="
+            free -h
+            echo -e "\n===== Memory usage by process (top 10) ====="
+            ps aux --sort=-%mem | head -11
+
+            echo -e "\n==== Docker Container Status ==="
+            docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Size}}"
+
+            echo -e "\n===== Python/PyTorch Processes ====="
+            ps aux | grep -E "python|torch" | grep -v grep || echo "No Python processes found"
+
+            # echo -e "\n===== Setting Memory Management Env Vars ====="
+            # echo "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+            # echo "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" >> $GITHUB_ENV
+
       - name: Build the ATOM test image
         run: |
           docker build --network=host \
@@ -117,6 +157,7 @@ jobs:
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
           -e ATOM_DISABLE_MMAP=true \
+          -e HF_TOKEN="${HF_TOKEN:-${{ secrets.HF_TOKEN_TEST }}}" \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name atom_aiter_test \
@@ -148,7 +189,7 @@ jobs:
           fi
 
       - name: Run ATOM simple inference
-        timeout-minutes: 30
+        timeout-minutes: 60
         run: |
           # Run the inference and capture output
           set -euo pipefail
@@ -177,7 +218,7 @@ jobs:
         
       - name: Run ATOM accuracy test
         if: ${{ matrix.model_name != 'DeepSeek-R1-0528' }}
-        timeout-minutes: 30
+        timeout-minutes: 60
         run: |
           set -euo pipefail
           echo ""

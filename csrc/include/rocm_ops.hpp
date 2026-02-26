@@ -593,7 +593,7 @@ namespace py = pybind11;
           py::arg("x_scale"),              \
           py::arg("w_scale"),              \
           py::arg("Out"),                  \
-          py::arg("preshuffleB") = true);
+          py::arg("preshuffleB") = false);
 
 #define GEMM_A8W8_BLOCKSCALE_CKTILE_TUNE_PYBIND \
     m.def("gemm_a8w8_blockscale_cktile_tune",   \
@@ -606,7 +606,7 @@ namespace py = pybind11;
           py::arg("Out"),                       \
           py::arg("kernelId")    = 0,           \
           py::arg("splitK")      = 0,           \
-          py::arg("preshuffleB") = true);
+          py::arg("preshuffleB") = false);
 
 #define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_PYBIND \
     m.def("gemm_a8w8_blockscale_bpreshuffle",   \
@@ -629,6 +629,30 @@ namespace py = pybind11;
           py::arg("Out"),                            \
           py::arg("kernelId") = 0,                   \
           py::arg("splitK")   = 0);
+
+#define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_CKTILE_PYBIND \
+    m.def("gemm_a8w8_blockscale_bpreshuffle_cktile",   \
+          &gemm_a8w8_blockscale_bpreshuffle_cktile,    \
+          "fp8 blockscale gemm cktile",                \
+          py::arg("XQ"),                               \
+          py::arg("WQ"),                               \
+          py::arg("x_scale"),                          \
+          py::arg("w_scale"),                          \
+          py::arg("Out"),                              \
+          py::arg("preshuffleB") = true);
+
+#define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_CKTILE_TUNE_PYBIND \
+    m.def("gemm_a8w8_blockscale_bpreshuffle_cktile_tune",   \
+          &gemm_a8w8_blockscale_bpreshuffle_cktile_tune,    \
+          "gemm_a8w8_blockscale_bpreshuffle_cktile_tune",   \
+          py::arg("XQ"),                                    \
+          py::arg("WQ"),                                    \
+          py::arg("x_scale"),                               \
+          py::arg("w_scale"),                               \
+          py::arg("Out"),                                   \
+          py::arg("kernelId")    = 0,                       \
+          py::arg("splitK")      = 0,                       \
+          py::arg("preshuffleB") = true);
 
 #define GEMM_A4W4_BLOCKSCALE_TUNE_PYBIND \
     m.def("gemm_a4w4_blockscale_tune",   \
@@ -1308,6 +1332,22 @@ namespace py = pybind11;
           py::arg("unit_size"),                        \
           py::arg("local_expert_mask") = std::nullopt, \
           py::arg("num_local_tokens")  = std::nullopt, \
+          py::arg("dispatch_policy")   = 0);
+
+#define MOE_SORTING_OPUS_PYBIND                             \
+    m.def("moe_sorting_opus_fwd",                           \
+          &moe_sorting_opus_fwd,                            \
+          py::arg("topk_ids"),                              \
+          py::arg("topk_weights"),                          \
+          py::arg("sorted_token_ids"),                      \
+          py::arg("sorted_weights"),                        \
+          py::arg("sorted_expert_ids"),                     \
+          py::arg("num_valid_ids"),                         \
+          py::arg("moe_buf"),                               \
+          py::arg("num_experts"),                           \
+          py::arg("unit_size"),                             \
+          py::arg("local_expert_mask") = std::nullopt,      \
+          py::arg("num_local_tokens")  = std::nullopt,      \
           py::arg("dispatch_policy")   = 0);
 
 #define NORM_PYBIND                                               \

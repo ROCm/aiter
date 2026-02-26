@@ -421,6 +421,8 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     int32_t qk_batch_ratio = 1;
     int32_t uni_seqlen_qo  = ori_uni_seqlen_qo;
 
+    auto arch_id = get_gpu_arch();
+
     // In the following cases, we use #head=16 to simulate cases which is not natively supported by
     // mla main kernel.
     const bool q_is_fp8 =
@@ -428,9 +430,10 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     const bool kv_is_fp8 =
         (kv_dtype == at::ScalarType::Float8_e4m3fnuz || kv_dtype == at::ScalarType::Float8_e4m3fn);
 
-    const bool natively_supported =
-        (num_heads == 16) || ((num_heads == 32) && q_is_fp8 && kv_is_fp8 && (max_seqlen_qo == 4)) ||
-        ((num_heads == 128) && q_is_fp8 && kv_is_fp8);
+    const bool natively_supported = (num_heads == 16) ||
+                                    ((arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 &&
+                                     kv_is_fp8 && (max_seqlen_qo == 4)) ||
+                                    ((num_heads == 128) && q_is_fp8 && kv_is_fp8);
 
     if((natively_supported == false) && (num_heads % 16 == 0))
     {

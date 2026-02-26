@@ -14,13 +14,17 @@
  *                                                          "fp32_fp8", "fp32_fp4"
  */
 
-#include <torch/extension.h>
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
 #include "test_mfma.h"
 #include "test_mxfp.h"
 #include "test_vector_add.h"
 #include "test_async_load.h"
 #include "test_dtype_convert.h"
 #include "test_load_store_if.h"
+#include "test_mdiv.h"
+#include "test_numeric_limits.h"
+#include "test_workgroup_barrier.h"
 
 // ---------- MFMA wrapper ----------
 
@@ -57,6 +61,10 @@ static void run_mfma_torch(
         dtype_ok = (A.dtype() == torch::kBFloat16);
         expected_out_dtype = torch::kBFloat16;
         in_dtype_name = "bfloat16";
+    } else if (variant.find("_f32") != std::string::npos) {
+        dtype_ok = (A.dtype() == torch::kFloat32);
+        expected_out_dtype = torch::kFloat32;
+        in_dtype_name = "float32";
     } else {
         dtype_ok = (A.dtype() == torch::kFloat16);
         expected_out_dtype = torch::kFloat16;
@@ -71,7 +79,17 @@ static void run_mfma_torch(
     int stride_b = static_cast<int>(B.stride(0));
     int stride_c = static_cast<int>(C.stride(0));
 
-    if (variant == "32x32x8_f16") {
+    if (variant == "32x32x2_f32") {
+        TORCH_CHECK((A.sizes() == torch::IntArrayRef{32, 2}),  "A must be 32x2 for variant ", variant);
+        TORCH_CHECK((B.sizes() == torch::IntArrayRef{32, 2}),  "B must be 32x2 for variant ", variant);
+        TORCH_CHECK((C.sizes() == torch::IntArrayRef{32, 32}), "C must be 32x32 for variant ", variant);
+        run_mfma_32x32x2_f32(A.data_ptr(), B.data_ptr(), C.data_ptr(), stride_a, stride_b, stride_c);
+    } else if (variant == "16x16x4_f32") {
+        TORCH_CHECK((A.sizes() == torch::IntArrayRef{16, 4}),  "A must be 16x4 for variant ", variant);
+        TORCH_CHECK((B.sizes() == torch::IntArrayRef{16, 4}),  "B must be 16x4 for variant ", variant);
+        TORCH_CHECK((C.sizes() == torch::IntArrayRef{16, 16}), "C must be 16x16 for variant ", variant);
+        run_mfma_16x16x4_f32(A.data_ptr(), B.data_ptr(), C.data_ptr(), stride_a, stride_b, stride_c);
+    } else if (variant == "32x32x8_f16") {
         TORCH_CHECK((A.sizes() == torch::IntArrayRef{32, 8}),  "A must be 32x8 for variant ", variant);
         TORCH_CHECK((B.sizes() == torch::IntArrayRef{32, 8}),  "B must be 32x8 for variant ", variant);
         TORCH_CHECK((C.sizes() == torch::IntArrayRef{32, 32}), "C must be 32x32 for variant ", variant);
@@ -260,6 +278,8 @@ static void run_dtype_convert_torch(
         run_dtype_convert_fp32_bf16(In.data_ptr(), Out.data_ptr(), n);
     } else if (variant == "fp32_fp16") {
         run_dtype_convert_fp32_fp16(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_fp8_scalar") {
+        run_dtype_convert_fp32_fp8_scalar(In.data_ptr(), Out.data_ptr(), n);
     } else if (variant == "fp32_fp8") {
         TORCH_CHECK(n % 4 == 0,
                      "For fp32_fp8, n must be a multiple of 4 (packed x4 conversion)");
@@ -268,6 +288,30 @@ static void run_dtype_convert_torch(
         TORCH_CHECK(n % 8 == 0,
                      "For fp32_fp4, n must be a multiple of 8 (packed x8 conversion)");
         run_dtype_convert_fp32_fp4(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_bf16_vec4") {
+        TORCH_CHECK(n % 4 == 0,
+                     "For fp32_bf16_vec4, n must be a multiple of 4");
+        run_dtype_convert_fp32_bf16_vec4(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_fp16_vec4") {
+        TORCH_CHECK(n % 4 == 0,
+                     "For fp32_fp16_vec4, n must be a multiple of 4");
+        run_dtype_convert_fp32_fp16_vec4(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_fp8_x2") {
+        TORCH_CHECK(n % 2 == 0,
+                     "For fp32_fp8_x2, n must be a multiple of 2");
+        run_dtype_convert_fp32_fp8_x2(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_fp8_vec8") {
+        TORCH_CHECK(n % 8 == 0,
+                     "For fp32_fp8_vec8, n must be a multiple of 8");
+        run_dtype_convert_fp32_fp8_vec8(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_fp4_x2") {
+        TORCH_CHECK(n % 2 == 0,
+                     "For fp32_fp4_x2, n must be a multiple of 2");
+        run_dtype_convert_fp32_fp4_x2(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_fp4_x4") {
+        TORCH_CHECK(n % 4 == 0,
+                     "For fp32_fp4_x4, n must be a multiple of 4");
+        run_dtype_convert_fp32_fp4_x4(In.data_ptr(), Out.data_ptr(), n);
     } else {
         TORCH_CHECK(false, "Unknown dtype_convert variant: ", variant);
     }
@@ -335,6 +379,77 @@ static void run_predicated_async_load_torch(
     run_predicated_async_load(Src.data_ptr(), Dst.data_ptr(), n, static_cast<int>(n_padded));
 }
 
+// ---------- mdiv wrapper ----------
+
+static void run_mdiv_torch(
+    torch::Tensor Dividends,
+    torch::Tensor OutQ,
+    torch::Tensor OutR,
+    int64_t divisor)
+{
+    TORCH_CHECK(Dividends.is_cuda(), "Dividends must be a CUDA tensor");
+    TORCH_CHECK(OutQ.is_cuda(), "OutQ must be a CUDA tensor");
+    TORCH_CHECK(OutR.is_cuda(), "OutR must be a CUDA tensor");
+    TORCH_CHECK(Dividends.dtype() == torch::kInt32, "Dividends must be int32");
+    TORCH_CHECK(OutQ.dtype() == torch::kInt32, "OutQ must be int32");
+    TORCH_CHECK(OutR.dtype() == torch::kInt32, "OutR must be int32");
+    TORCH_CHECK(Dividends.is_contiguous() && OutQ.is_contiguous() && OutR.is_contiguous(),
+                "All tensors must be contiguous");
+    TORCH_CHECK(Dividends.dim() == 1 && OutQ.dim() == 1 && OutR.dim() == 1,
+                "All tensors must be 1-D");
+    int n = static_cast<int>(Dividends.numel());
+    TORCH_CHECK(OutQ.numel() == n && OutR.numel() == n,
+                "All tensors must have the same number of elements");
+    TORCH_CHECK(divisor > 0, "divisor must be positive");
+
+    run_mdiv(Dividends.data_ptr(), OutQ.data_ptr(), OutR.data_ptr(),
+             static_cast<int>(divisor), n);
+}
+
+// ---------- numeric_limits wrapper ----------
+
+static void run_numeric_limits_torch(torch::Tensor Out)
+{
+    TORCH_CHECK(Out.is_cuda(), "Out must be a CUDA tensor");
+    TORCH_CHECK(Out.dtype() == torch::kInt32, "Out must be int32");
+    TORCH_CHECK(Out.numel() >= 55, "Out must have at least 55 elements");
+    TORCH_CHECK(Out.is_contiguous(), "Out must be contiguous");
+    run_numeric_limits(Out.data_ptr());
+}
+
+// ---------- workgroup_barrier wrappers ----------
+
+static void run_wb_cumulative_torch(torch::Tensor Accum, int64_t n_workgroups)
+{
+    TORCH_CHECK(Accum.is_cuda(), "Accum must be a CUDA tensor");
+    TORCH_CHECK(Accum.dtype() == torch::kInt32, "Accum must be int32");
+    TORCH_CHECK(Accum.numel() == 1, "Accum must have 1 element");
+    run_workgroup_barrier_cumulative(Accum.data_ptr(), static_cast<int>(n_workgroups));
+}
+
+static void run_wb_streamk_reduce_torch(
+    torch::Tensor Input,
+    torch::Tensor Workspace,
+    torch::Tensor Result,
+    int64_t n_chunks)
+{
+    TORCH_CHECK(Input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(Workspace.is_cuda(), "Workspace must be a CUDA tensor");
+    TORCH_CHECK(Result.is_cuda(), "Result must be a CUDA tensor");
+    TORCH_CHECK(Input.dtype() == torch::kFloat32, "Input must be float32");
+    TORCH_CHECK(Workspace.dtype() == torch::kFloat32, "Workspace must be float32");
+    TORCH_CHECK(Result.dtype() == torch::kFloat32, "Result must be float32");
+    TORCH_CHECK(Input.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(Input.numel() == 256 * n_chunks,
+                "Input must have 256 * n_chunks elements");
+    TORCH_CHECK(Workspace.numel() >= n_chunks,
+                "Workspace must have at least n_chunks elements");
+    TORCH_CHECK(Result.numel() == 1, "Result must have 1 element");
+    run_workgroup_barrier_streamk_reduce(
+        Input.data_ptr(), Workspace.data_ptr(), Result.data_ptr(),
+        static_cast<int>(n_chunks));
+}
+
 // ---------- Module ----------
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -360,4 +475,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("run_predicated_async_load", &run_predicated_async_load_torch,
           "OPUS predicated async_load: copy Src -> LDS -> Dst with bounds predicate",
           py::arg("Src"), py::arg("Dst"), py::arg("n_padded"));
+    m.def("run_numeric_limits", &run_numeric_limits_torch,
+          "OPUS numeric_limits: writes min/max/lowest/quiet_nan/infinity bit patterns for all dtypes");
+    m.def("run_mdiv", &run_mdiv_torch,
+          "OPUS mdiv: magic division. out_q[i] = dividends[i]/divisor, "
+          "out_r[i] = dividends[i]%divisor",
+          py::arg("Dividends"), py::arg("OutQ"), py::arg("OutR"), py::arg("divisor"));
+    m.def("run_wb_cumulative", &run_wb_cumulative_torch,
+          "workgroup_barrier cumulative test: N workgroups sync via wait_lt+inc",
+          py::arg("Accum"), py::arg("n_workgroups"));
+    m.def("run_wb_streamk_reduce", &run_wb_streamk_reduce_torch,
+          "workgroup_barrier stream-K reduce: N producers + 1 consumer via wait_eq+inc",
+          py::arg("Input"), py::arg("Workspace"), py::arg("Result"), py::arg("n_chunks"));
 }
