@@ -574,7 +574,7 @@ def kernel_unified_attention_2d(
                           SCALE, USE_LOAD_BUFFER_OP, USE_STORE_BUFFER_OP)
     
     # Cast strides to int64 when not using buffer ops
-    if not USE_LOAD_BUFFER_OP:
+    if not USE_LOAD_BUFFER_OP and not USE_TDM:
         stride_k_cache_0 = stride_k_cache_0.to(gl.int64)
         stride_k_cache_1 = stride_k_cache_1.to(gl.int64)
         stride_k_cache_2 = stride_k_cache_2.to(gl.int64)
@@ -686,7 +686,7 @@ def kernel_unified_attention_2d(
 
         # Compute attention for current tile
         S = pgm.compute_qk(k)
-        if j >= pgm.safe_tile_end:
+        if j >= pgm.safe_tile_end or SLIDING_WINDOW > 0:
             S = pgm.apply_mask_qk(S, j)
         p, alpha, M = pgm.softmax_part0(S, M)
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha)

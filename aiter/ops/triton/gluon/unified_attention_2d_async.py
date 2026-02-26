@@ -542,7 +542,7 @@ def kernel_unified_attention_2d(
 
         # Compute attention for current tile
         S = pgm.compute_qk(k)
-        if j >= pgm.safe_tile_end:
+        if j >= pgm.safe_tile_end or SLIDING_WINDOW > 0:
             S = pgm.apply_mask_qk(S, j)
         p, alpha, M = pgm.softmax_part0(S, M)
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
