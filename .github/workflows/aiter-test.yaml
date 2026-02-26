@@ -131,6 +131,7 @@ jobs:
   split_aiter_tests:
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
+    needs: [check-signal, build_aiter_image]
     outputs:
       shard_count: 5
     steps:
