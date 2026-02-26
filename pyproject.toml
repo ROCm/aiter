@@ -8,10 +8,8 @@ requires = [
     "psutil",
     "ninja",
     "pandas",
+    "flydsl==0.0.1.dev95158637"
 ]
-
-[project.optional-dependencies]
-flydsl = ["flydsl==0.0.1.dev95158637"]
 
 [tool.setuptools_scm]
 write_to = "aiter/_version.py"
