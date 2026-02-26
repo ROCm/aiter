@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
+# import hip
+# hip.hip.hipInit(0)
 from typing import Optional
 
 import pytest
@@ -9,6 +10,9 @@ import torch
 from aiter.ops.triton.attention.unified_attention import unified_attention
 from aiter.ops.triton.gluon.unified_attention_3d import (
     unified_attention as gluon_unified_attention,
+)
+from aiter.ops.triton.gluon.unified_attention_2d_final import (
+    unified_attention as gluon_unified_attention_2d,
 )
 from aiter.ops.triton.utils.types import e4m3_dtype
 import aiter.ops.triton.utils._triton.arch_info as arch_info
@@ -23,7 +27,7 @@ DTYPES = [torch.bfloat16]
 QDTYPES = [None]
 # one value large enough to test overflow in index calculation.
 # one value small enough to test the schema op check
-NUM_BLOCKS = [128]
+NUM_BLOCKS = [4096,]
 SLIDING_WINDOWS = [None]
 
 
@@ -297,3 +301,123 @@ def test_triton_unified_attn(
     # torch.testing.assert_close(
     #     output_gluon, output, atol=atol, rtol=rtol
     # ), f"{torch.max(torch.abs(output_gluon - output))}"
+
+@pytest.mark.parametrize(
+    "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
+)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("block_size", [64,16])
+@pytest.mark.parametrize("sliding_window", [None, 256])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("soft_cap", [None,])
+@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
+@pytest.mark.parametrize("q_dtype", QDTYPES)
+@torch.inference_mode()
+def test_gluon_unified_attn_2d(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    sliding_window: Optional[int],
+    dtype: torch.dtype,
+    block_size: int,
+    soft_cap: Optional[float],
+    num_blocks: int,
+    q_dtype: Optional[torch.dtype],
+) -> None:
+    if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
+        pytest.skip("block size must be at least 32 for fp8")
+    torch.manual_seed(0)
+    num_seqs = len(seq_lens)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens = [x[1] for x in seq_lens]
+    num_query_heads = num_heads[0]
+    num_kv_heads = num_heads[1]
+    assert num_query_heads % num_kv_heads == 0
+    max_query_len = max(query_lens)
+    max_kv_len = max(kv_lens)
+    window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
+    scale = head_size**-0.5
+
+    query = torch.randn(
+        sum(query_lens), num_query_heads, head_size, dtype=dtype, device="cpu"
+    )
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cpu"
+    )
+    value_cache = torch.randn_like(key_cache)
+    cu_query_lens = torch.tensor(
+        [0] + query_lens, dtype=torch.int32, device="cpu"
+    ).cumsum(dim=0, dtype=torch.int32)
+    kv_lens = torch.tensor(kv_lens, dtype=torch.int32, device="cpu")
+
+    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    max_num_blocks_per_seq = min(max_num_blocks_per_seq * num_seqs, num_blocks) // num_seqs
+
+    block_tables = torch.randint(
+        0,
+        num_blocks,
+        (num_seqs, max_num_blocks_per_seq),
+        dtype=torch.int32,
+        device="cpu",
+    )
+    sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cpu")
+    output = torch.empty_like(query)
+
+    maybe_quantized_query = query
+    maybe_quantized_key_cache = key_cache
+    maybe_quantized_value_cache = value_cache
+    q_descale = None
+    k_descale = None
+    v_descale = None
+    if q_dtype is not None:
+        # QKV are drawn from N(0, 1): no need for a fp8 scaling factor
+        maybe_quantized_query = query.to(q_dtype)
+        maybe_quantized_key_cache = key_cache.to(q_dtype)
+        maybe_quantized_value_cache = value_cache.to(q_dtype)
+
+        scale_shape = (num_seqs, num_kv_heads)
+        q_descale = None  # Not yet supported
+        k_descale = torch.rand(scale_shape, dtype=torch.float32, device="cpu")
+        v_descale = torch.rand(scale_shape, dtype=torch.float32, device="cpu")
+
+    output_cuda = output.cuda()
+    gluon_unified_attention_2d(
+        q=maybe_quantized_query.cuda(),
+        k=maybe_quantized_key_cache.cuda(),
+        v=maybe_quantized_value_cache.cuda(),
+        out=output_cuda,
+        cu_seqlens_q=cu_query_lens.cuda(),
+        seqused_k=kv_lens.cuda(),
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables.cuda(),
+        softcap=soft_cap if soft_cap is not None else 0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks.cuda(),
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        sinks=sinks,
+    )
+    atol, rtol = 1.5e-2, 1e-2
+    if q_dtype is not None:
+        atol, rtol = 1.5e-1, 1.5e-1
+    output = output_cuda.cpu()
+    torch.testing.assert_close(
+        output, ref_output, atol=atol, rtol=rtol
+    ), f"{torch.max(torch.abs(output - ref_output))}"
