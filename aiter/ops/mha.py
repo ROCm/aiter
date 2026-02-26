@@ -1271,6 +1271,7 @@ def _flash_attn_forward(
 
     def is_fmha_v3_fp8():
         ret = get_gfx() == "gfx942"
+        ret = ret and (hdim_q == 128)
         ret = ret and (q.dtype == dtypes.fp8)
         ret = ret and (
             q_descale is not None and k_descale is not None and v_descale is not None
@@ -2026,6 +2027,7 @@ def _flash_attn_varlen_forward(
 
     def is_fmha_v3_fp8():
         ret = get_gfx() == "gfx942"
+        ret = ret and (hdim_q == 128)
         ret = ret and (q.dtype == dtypes.fp8)
         ret = ret and (
             q_descale is not None and k_descale is not None and v_descale is not None
