@@ -18,15 +18,8 @@ concurrency:
 jobs:
   aiter_benchmark:
     name: Aiter Benchmark
-    runs-on: aiter-8gpu-runner
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-    
-      - name: Run benchmark
-        uses: ROCm/rocActions/atom-benchmark-workflow@atom_benchmark_workflow
-        with:
-          model: "deepseek-r1-0528"
-          model_path: "deepseek-ai/DeepSeek-R1-0528"
-          extra_args: "--kv_cache_dtype fp8 -tp 8"
-          param: "1024,1024,128,0.8"
+    uses: ROCm/ATOM/.github/workflows/atom-benchmark.yaml@atom_benchmark_expose
+    with:
+      deepseek-r1-0528: true
+      extra_args: "--kv_cache_dtype fp8 -tp 8"
+      param_list: "1024,1024,128,0.8"
