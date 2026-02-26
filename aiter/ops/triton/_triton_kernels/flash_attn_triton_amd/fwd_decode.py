@@ -900,77 +900,15 @@ def attention_forward_decode_triton_impl(
             seqlen_offsets=seqlen_offsets,
         )
 
-    # # handle cache updates
-    # if k_new is not None and v_new is not None:
-    #     # Update cache with new KV values
-    #     if block_table is None:
-    #         # Non-paged attention: update cache directly
-    #         batch_size = k_new.shape[0]
-    #         seqlen_new = k_new.shape[1]
-
-    #         if cache_seqlens is not None:
-    #             # Use cache_seqlens to determine where to insert new KV
-    #             for b in range(batch_size):
-    #                 start_idx = int(cache_seqlens[b].item())
-    #                 end_idx = start_idx + seqlen_new
-    #                 k_cache[b, start_idx:end_idx] = k_new[b]
-    #                 v_cache[b, start_idx:end_idx] = v_new[b]
-    #                 cache_seqlens[b] = end_idx
-    #         else:
-    #             # Append at the end of existing cache
-    #             seqlen_cache = k_cache.shape[1]
-    #             k_cache[:, seqlen_cache - seqlen_new :] = k_new
-    #             v_cache[:, seqlen_cache - seqlen_new :] = v_new
-    #     else:
-    #         # Paged attention: update cache using block table
-    #         batch_size = k_new.shape[0]
-    #         seqlen_new = k_new.shape[1]
-    #         block_size = k_cache.shape[
-    #             1
-    #         ]  # k_cache shape: [num_blocks, block_size, nheads, head_dim]
-
-    #         # Update cache for each batch element
-    #         for b in range(batch_size):
-    #             if cache_seqlens is not None:
-    #                 start_idx = int(cache_seqlens[b].item())
-    #             else:
-    #                 # If no cache_seqlens, assume we're appending at the end
-    #                 # Find the last used position from block table
-    #                 start_idx = 0
-    #                 for block_idx in range(block_table.shape[1]):
-    #                     if block_table[b, block_idx] >= 0:
-    #                         start_idx = (block_idx + 1) * block_size
-    #                     else:
-    #                         start_idx = block_idx * block_size
-    #                         break
-
-    #             # Copy new KV values into the paged cache
-    #             for i in range(seqlen_new):
-    #                 pos = start_idx + i
-    #                 block_idx = pos // block_size
-    #                 within_block_idx = pos % block_size
-
-    #                 # Get the physical block number from block table
-    #                 if block_idx < block_table.shape[1]:
-    #                     physical_block = int(block_table[b, block_idx].item())
-
-    #                     # Update k_cache and v_cache at the physical block location
-    #                     k_cache[physical_block, within_block_idx] = k_new[b, i]
-    #                     v_cache[physical_block, within_block_idx] = v_new[b, i]
-
-    #             # Update cache_seqlens if provided
-    #             if cache_seqlens is not None:
-    #                 cache_seqlens[b] = start_idx + seqlen_new
-
     # handle cache updates
     if k_new is not None and v_new is not None:
         batch_size = k_new.shape[0]
         seqlen_new = k_new.shape[1]
-        # [seqlen_new] — shared offset within the new block for every batch element
+        # shared offset within the new block for every batch element
         token_offsets = torch.arange(seqlen_new, device=k_new.device, dtype=torch.long)
 
         if block_table is None:
-            # Non-paged attention: scatter new tokens directly into the dense cache.
+            # Non-paged attention
             if cache_seqlens is not None:
                 insert_positions = cache_seqlens.long()[:, None] + token_offsets
                 batch_idx = torch.arange(
@@ -980,24 +918,23 @@ def attention_forward_decode_triton_impl(
                 v_cache[batch_idx, insert_positions] = v_new
                 cache_seqlens.add_(seqlen_new)
             else:
-                # Append at the end of existing cache (already vectorized, no .item() needed)
+                # Append at the end of existing cache
                 seqlen_cache = k_cache.shape[1]
                 k_cache[:, seqlen_cache - seqlen_new :] = k_new
                 v_cache[:, seqlen_cache - seqlen_new :] = v_new
         else:
-            # Paged attention: k_cache shape [num_blocks, block_size, nheads, head_dim]
+            # Paged attention
             block_size = k_cache.shape[1]
 
             if cache_seqlens is not None:
-                start_idx = cache_seqlens.long()  # [batch]
+                start_idx = cache_seqlens.long()
             else:
                 # Find the first unoccupied position per batch from the block table.
-                # A slot is unoccupied when block_table[b, block_idx] < 0.
-                invalid_mask = block_table < 0  # [batch, num_blocks]
-                has_invalid = invalid_mask.any(dim=1)  # [batch]
+                invalid_mask = block_table < 0
+                has_invalid = invalid_mask.any(dim=1)
                 first_invalid_idx = (
                     invalid_mask.to(torch.int32).argmax(dim=1).long()
-                )  # [batch]
+                )
                 start_idx = torch.where(
                     has_invalid,
                     first_invalid_idx * block_size,
@@ -1014,7 +951,7 @@ def attention_forward_decode_triton_impl(
             ]
             physical_blocks = block_table[
                 batch_idx, block_indices
-            ]  # [batch, seqlen_new]
+            ]
 
             flat_phys = physical_blocks.reshape(-1)
             flat_within = within_block_indices.reshape(-1)
