@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-from dataclasses import dataclass
-import pandas as pd
 import os
+from dataclasses import dataclass
+from typing import Optional
+
+import pandas as pd
+import torch
+
 import aiter
-from aiter import logger
-from aiter import pertoken_quant, get_hip_quant
-from aiter import ActivationType, QuantType, dtypes
+from aiter import ActivationType, QuantType, dtypes, get_hip_quant, logger, pertoken_quant
 from aiter.fused_moe import fused_moe
 
 BLOCK_SIZE_M = 32
