@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-# For gfx1250, gemm_a8w8_blockscale. TODO: refactor specifically for gfx1250. this is more intensive than it would seem at first!
-
 from typing import Optional
 import functools
 import json
 import os
 import torch
 import triton
+import math
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
@@ -66,10 +65,11 @@ def _gemm_a8w8_blockscale_kernel(
     EVEN_K: gl.constexpr,
     GRID_MN: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    warp_bases: gl.constexpr,
     cache_modifier: gl.constexpr,
 ):
     """
-    Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8_blockscale function
+    Note: this is Triton jited function and not meant to be called direcgly. Call gemm_a8w8_blockscale function
     below
 
     Computes the 8 bit matmul C = A x B using the block-scale quantization approach.
@@ -94,6 +94,8 @@ def _gemm_a8w8_blockscale_kernel(
     num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
 
+    # NOTE: cast to fp16 to be able to use wmma
+
     if NUM_KSPLIT == 1:
         remap_xcd(pid, GRID_MN)
 
@@ -110,23 +112,18 @@ def _gemm_a8w8_blockscale_kernel(
     )
     blocked_mk: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[threads_per_elem_mk, 16],
-        threads_per_warp=[8, 8],
+        threads_per_warp=[8, 4],
         warps_per_cta=[NUM_WARPS, 1],
         order=[1, 0],
     )
     blocked_kn: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[16, threads_per_elem_kn],
-        threads_per_warp=[8, 8],
+        threads_per_warp=[4, 8],
         warps_per_cta=[1, NUM_WARPS],
         order=[0, 1],
     )
-    wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
-        version=3,
-        instr_shape=[16, 16, 32],  # V_MFMA_F32_16X16X32_FP8_FP8 instruction
-        transposed=True,
-        warps_per_cta=[NUM_WARPS // 2, 2],
-    )
-    #WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDWMMALayout(3, True, WARP_BASES, [], [16, 16, 32])
+
+    wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(3, True, warp_bases, [], [16, 16, 32])
 
     shared_a: gl.constexpr = gl.SwizzledSharedLayout(
         vec=16, per_phase=2, max_phase=8, order=[1, 0]
@@ -152,11 +149,11 @@ def _gemm_a8w8_blockscale_kernel(
         num_k_iter = gl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
 
         smem_a = gl.allocate_shared_memory(
-            a_ptr.type.element_ty, [BLOCK_SIZE_M, BLOCK_SIZE_K], layout=shared_a
+            gl.float16, [BLOCK_SIZE_M, BLOCK_SIZE_K], layout=shared_a
         )
 
         smem_b = gl.allocate_shared_memory(
-            b_ptr.type.element_ty, [BLOCK_SIZE_K, BLOCK_SIZE_N], layout=shared_b
+            gl.float16, [BLOCK_SIZE_K, BLOCK_SIZE_N], layout=shared_b
         )
 
         # Create pointers for first block of A and B input matrices
@@ -166,11 +163,11 @@ def _gemm_a8w8_blockscale_kernel(
         offs_bk_split = pid_k * SPLITK_BLOCK_SIZE + offs_bk
 
         smem_scale_a = gl.allocate_shared_memory(
-            a_scale_ptr.type.element_ty, [BLOCK_SIZE_M], layout=shared_a_scale
+            gl.float16, [BLOCK_SIZE_M], layout=shared_a_scale
         )
 
         smem_scale_b = gl.allocate_shared_memory(
-            b_scale_ptr.type.element_ty, [BLOCK_SIZE_N], layout=shared_b_scale
+            gl.float16, [BLOCK_SIZE_N], layout=shared_b_scale
         )
 
         offs_am = pid_m * BLOCK_SIZE_M + gl.arange(
@@ -192,7 +189,7 @@ def _gemm_a8w8_blockscale_kernel(
                 offsets=offs_a,
                 mask=offs_am[:, None] < M,
                 cache=cache_modifier,
-            )
+            ).to(gl.float16)
         else:
             a = gl.amd.cdna4.buffer_load(
                 ptr=a_ptr,
@@ -200,12 +197,12 @@ def _gemm_a8w8_blockscale_kernel(
                 mask=(offs_ak[None, :] < K - (pid_k * num_k_iter * BLOCK_SIZE_K))
                 & (offs_am[:, None] < M),
                 cache=cache_modifier,
-            )
+            ).to(gl.float16)
         a_scale = gl.amd.cdna4.buffer_load(
             ptr=a_scale_ptr,
             offsets=offs_a_scale,
             cache=cache_modifier,
-        )
+        ).to(gl.float16)
 
         offs_b = offs_bk_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
         offs_b_scale_n = offs_bn // GROUP_N
@@ -217,7 +214,7 @@ def _gemm_a8w8_blockscale_kernel(
                 offsets=offs_b,
                 mask=offs_bn[None, :] < N,
                 cache=cache_modifier,
-            )
+            ).to(gl.float16)
         else:
             b = gl.amd.cdna4.buffer_load(
                 ptr=b_ptr,
@@ -225,12 +222,12 @@ def _gemm_a8w8_blockscale_kernel(
                 mask=(offs_bk[:, None] < K - (pid_k * num_k_iter * BLOCK_SIZE_K))
                 & (offs_bn[None, :] < N),
                 cache=cache_modifier,
-            )
+            ).to(gl.float16)
         b_scale = gl.amd.cdna4.buffer_load(
             ptr=b_scale_ptr,
             offsets=offs_b_scale,
             cache=cache_modifier,
-        )
+        ).to(gl.float16)
         smem_scale_a.store(a_scale)
         smem_a.store(a)
 
@@ -259,7 +256,7 @@ def _gemm_a8w8_blockscale_kernel(
                     offsets=offs_a,
                     mask=offs_am[:, None] < M,
                     cache=cache_modifier,
-                )
+                ).to(gl.float16)
             else:
                 a = gl.amd.cdna4.buffer_load(
                     ptr=a_ptr,
@@ -267,7 +264,7 @@ def _gemm_a8w8_blockscale_kernel(
                     mask=(offs_ak[None, :] < K - (k + 1) * BLOCK_SIZE_K)
                     & (offs_am[:, None] < M),
                     cache=cache_modifier,
-                )
+                ).to(gl.float16)
             smem_b.store(b)
             smem_scale_b.store(b_scale)
             cur_a = smem_a.load(layout=dot_a_layout)
@@ -276,7 +273,7 @@ def _gemm_a8w8_blockscale_kernel(
                 ptr=a_scale_ptr,
                 offsets=offs_a_scale,
                 cache=cache_modifier,
-            )
+            ).to(gl.float16)
             cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
             if EVEN_K:
                 b = gl.amd.cdna4.buffer_load(
@@ -284,7 +281,7 @@ def _gemm_a8w8_blockscale_kernel(
                     offsets=offs_b,
                     mask=offs_bn[None, :] < N,
                     cache=cache_modifier,
-                )
+                ).to(gl.float16)
             else:
                 b = gl.amd.cdna4.buffer_load(
                     ptr=b_ptr,
@@ -292,15 +289,15 @@ def _gemm_a8w8_blockscale_kernel(
                     mask=(offs_bk[:, None] < K - (k + 1) * BLOCK_SIZE_K)
                     & (offs_bn[None, :] < N),
                     cache=cache_modifier,
-                )
+                ).to(gl.float16)
             b_scale = gl.amd.cdna4.buffer_load(
                 ptr=b_scale_ptr,
                 offsets=offs_b_scale,
                 cache=cache_modifier,
-            )
+            ).to(gl.float16)
             cur_b = smem_b.load(layout=dot_b_layout)
 
-            wmma_out = gl.amd.cdna4.wmma(cur_a, cur_b, zeros)
+            wmma_out = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
             acc += wmma_out * cur_a_scale[:, None] * cur_b_scale[None, :]
 
             smem_a.store(a)
@@ -314,7 +311,7 @@ def _gemm_a8w8_blockscale_kernel(
         cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
         cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
 
-        zeros = gl.amd.cdna4.wmma(cur_a, cur_b, zeros)
+        zeros = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
         acc += zeros * cur_a_scale[:, None] * cur_b_scale[None, :]
 
         c = acc.to(c_ptr.type.element_ty)
@@ -436,7 +433,7 @@ def _get_config(
             )
         _get_config._config_dict = {}
         fpath = (
-            f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8_BLOCKSCALE.json"
+            f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/gfx950-GEMM-A8W8_BLOCKSCALE.json"
         )
         with open(fpath, "r") as file:
             config = json.load(file)
@@ -551,6 +548,11 @@ def gemm_a8w8_blockscale(
             * triton.cdiv(N, META["BLOCK_SIZE_N"])
         ),
     )
+    NUM_WARPS=config["num_warps"]
+    warp_bases = [(0, 1)]
+    for i in range(int(math.log2(NUM_WARPS // 2))):
+        warp_bases.append((1 << i, 0))
+    warp_bases = tuple(warp_bases)
     _gemm_a8w8_blockscale_kernel[grid](
         x,
         w,
@@ -572,8 +574,10 @@ def gemm_a8w8_blockscale(
         w_scale.stride(0),
         w_scale.stride(1),
         NUM_WARPS=config["num_warps"],
+        warp_bases=warp_bases,
         **config,
     )
+    print("complete")
 
     if config["NUM_KSPLIT"] > 1:
         REDUCE_BLOCK_SIZE_M = 32
