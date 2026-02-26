@@ -338,15 +338,6 @@ class FmoeTuner(TunerCommon):
         mode = parsed["mode"]
         accumulate = mode != "reduce"
 
-        # #region agent log
-        import json as _json, time as _time
-        try:
-            with open("/root/.cursor/debug.log", "a") as _f:
-                _f.write(_json.dumps({"id": f"log_{_time.time()}", "timestamp": int(_time.time()*1000), "location": "gemm_moe_tune.py:run_flydsl_stage2_out", "message": "entry", "data": {"kernelName": kernelName, "mode": mode, "accumulate": accumulate, "token_num": token_num, "E": E, "model_dim": model_dim, "inter_dim": inter_dim, "a2_shape": list(a2_qt.shape), "w2_shape": list(w2_qt.shape), "a2_dtype": str(a2_qt.dtype), "w2_dtype": str(w2_qt.dtype), "w2_scale_shape": list(w2_scale.shape), "a2_scale_shape": list(a2_scale.shape), "blockM": blockM}, "runId": "run1", "hypothesisId": "A"}) + "\n")
-        except Exception:
-            pass
-        # #endregion
-
         if a2_qt.dtype == torch.float4_e2m1fn_x2:
             a_dtype_str = "fp4"
             inter_dim = inter_dim * 2
@@ -381,7 +372,9 @@ class FmoeTuner(TunerCommon):
         )
 
         if sorted_weights is None:
-            sorted_w = torch.zeros(sorted_ids.shape, dtype=torch.float32, device=a2_qt.device)
+            sorted_w = torch.zeros(
+                sorted_ids.shape, dtype=torch.float32, device=a2_qt.device
+            )
         else:
             sorted_w = sorted_weights
 
@@ -438,13 +431,6 @@ class FmoeTuner(TunerCommon):
             )
             reduce_exe(out_slots_3d, out, token_num, stream_ptr)
 
-        # #region agent log
-        try:
-            with open("/root/.cursor/debug.log", "a") as _f:
-                _f.write(_json.dumps({"id": f"log_{_time.time()}", "timestamp": int(_time.time()*1000), "location": "gemm_moe_tune.py:run_flydsl_stage2_out:exit", "message": "completed", "data": {"mode": mode, "out_shape": list(out.shape), "out_abs_max": float(out.abs().max()), "out_abs_mean": float(out.abs().mean())}, "runId": "run1", "hypothesisId": "A"}) + "\n")
-        except Exception:
-            pass
-        # #endregion
         return out
 
     @staticmethod
@@ -1945,10 +1931,14 @@ class FmoeTuner(TunerCommon):
         out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
 
         if a_dtype_str != "fp4":
-            flydsl_s1_kernels = get_flydsl_stage1_kernels(a_dtype_str, b_dtype_str, out_dtype_str)
+            flydsl_s1_kernels = get_flydsl_stage1_kernels(
+                a_dtype_str, b_dtype_str, out_dtype_str
+            )
         else:
             flydsl_s1_kernels = {}
-        flydsl_s2_kernels = get_flydsl_stage2_kernels(a_dtype_str, b_dtype_str, out_dtype_str)
+        flydsl_s2_kernels = get_flydsl_stage2_kernels(
+            a_dtype_str, b_dtype_str, out_dtype_str
+        )
 
         for blockM in blockMs:
             if blockM not in [32, 64] or not use_g1u1:
@@ -1956,53 +1946,53 @@ class FmoeTuner(TunerCommon):
             # for kname, kparams in flydsl_s1_kernels.items():
             #     if kparams["tile_m"] != blockM:
             #         continue
-                # tasks_flydsl.append(
-                #     (
-                #         (info, "stage1", kname, blockM),
-                #         FmoeTuner.generate_data_2stages,
-                #         (
-                #             token,
-                #             model_dim,
-                #             inter_dim,
-                #             expert,
-                #             topk,
-                #             act_type,
-                #             dtype,
-                #             q_dtype_a,
-                #             q_dtype_w,
-                #             q_type,
-                #             use_g1u1,
-                #             doweight_stage1,
-                #             blockM,
-                #             1,
-                #         ),
-                #         FmoeTuner.run_flydsl_stage1_out,
-                #         (
-                #             [0, 1, 2, 5, 6, 7, 8, 15, 14],
-                #             dtype,
-                #             topk,
-                #             kname,
-                #             blockM,
-                #             q_type,
-                #             act_type,
-                #         ),
-                #         {},
-                #         FmoeTuner.run_torch_moe_stage1,
-                #         (
-                #             [0, 10, 11, 12, 13, 3, 4],
-                #             dtype,
-                #             act_type,
-                #             q_type,
-                #             doweight_stage1,
-                #             topk,
-                #         ),
-                #         {},
-                #         (None),
-                #         0.01,
-                #         0.01,
-                #         True,
-                #     )
-                # )
+            # tasks_flydsl.append(
+            #     (
+            #         (info, "stage1", kname, blockM),
+            #         FmoeTuner.generate_data_2stages,
+            #         (
+            #             token,
+            #             model_dim,
+            #             inter_dim,
+            #             expert,
+            #             topk,
+            #             act_type,
+            #             dtype,
+            #             q_dtype_a,
+            #             q_dtype_w,
+            #             q_type,
+            #             use_g1u1,
+            #             doweight_stage1,
+            #             blockM,
+            #             1,
+            #         ),
+            #         FmoeTuner.run_flydsl_stage1_out,
+            #         (
+            #             [0, 1, 2, 5, 6, 7, 8, 15, 14],
+            #             dtype,
+            #             topk,
+            #             kname,
+            #             blockM,
+            #             q_type,
+            #             act_type,
+            #         ),
+            #         {},
+            #         FmoeTuner.run_torch_moe_stage1,
+            #         (
+            #             [0, 10, 11, 12, 13, 3, 4],
+            #             dtype,
+            #             act_type,
+            #             q_type,
+            #             doweight_stage1,
+            #             topk,
+            #         ),
+            #         {},
+            #         (None),
+            #         0.01,
+            #         0.01,
+            #         True,
+            #     )
+            # )
 
             for kname, kparams in flydsl_s2_kernels.items():
                 if kparams["tile_m"] != blockM:

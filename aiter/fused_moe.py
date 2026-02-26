@@ -617,15 +617,6 @@ def flydsl_moe_stage2(
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
 
-    # #region agent log
-    import json as _json, time as _time
-    try:
-        with open("/root/.cursor/debug.log", "a") as _f:
-            _f.write(_json.dumps({"id": f"log_{_time.time()}", "timestamp": int(_time.time()*1000), "location": "fused_moe.py:flydsl_moe_stage2", "message": "called", "data": {"kernelName": kernelName, "parsed": parsed, "a2_shape": list(inter_states.shape), "w2_shape": list(w2.shape), "out_shape": list(out.shape), "a2_dtype": str(inter_states.dtype), "w2_dtype": str(w2.dtype), "topk": topk, "block_m": block_m}, "runId": "run1", "hypothesisId": "A"}) + "\n")
-    except Exception:
-        pass
-    # #endregion
-
     mode = parsed["mode"]
     accumulate = mode != "reduce"
 
@@ -669,7 +660,9 @@ def flydsl_moe_stage2(
     )
 
     if sorted_weights is None:
-        sorted_w = torch.zeros(sorted_token_ids.shape, dtype=torch.float32, device=inter_states.device)
+        sorted_w = torch.zeros(
+            sorted_token_ids.shape, dtype=torch.float32, device=inter_states.device
+        )
     else:
         sorted_w = sorted_weights
 
