@@ -81,7 +81,8 @@ jobs:
            && cd aiter \
            && git checkout ${{ env.GITHUB_COMMIT_SHA }} \
            && git submodule update --init --recursive \
-           && PREBUILD_KERNELS=1 GPU_ARCHS=${{ env.GPU_ARCH }} python setup.py develop
+           && PREBUILD_KERNELS=1 GPU_ARCHS=${{ env.GPU_ARCH }} python setup.py build_ext --inplace \
+           && pip install -e .
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
           EOF
