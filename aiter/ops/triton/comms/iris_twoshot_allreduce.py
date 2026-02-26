@@ -86,6 +86,58 @@ def _translate_ptr(ptr, from_rank, to_rank, heap_bases):
     return translated_ptr
 
 
+@triton.jit
+def _inlined_device_barrier(
+    raw_pid,
+    barrier_flags_ptr,
+    barrier_epoch,
+    barrier_done_ptr,
+    heap_bases: tl.tensor,
+    iris_rank: tl.constexpr,
+    world_size: tl.constexpr,
+    rank_start: tl.constexpr,
+    rank_stride: tl.constexpr,
+):
+    """Cross-rank device barrier for use inside persistent kernels.
+
+    Same protocol as iris._distributed_helpers._device_barrier_kernel:
+    CTA 0 signals own readiness, polls remote ranks, then signals
+    other CTAs via barrier_done_ptr.
+    """
+    target_epoch = barrier_epoch + 1
+
+    if raw_pid == 0:
+        own_flag_ptr = barrier_flags_ptr + iris_rank
+        own_translated = _translate_ptr(
+            own_flag_ptr, iris_rank, iris_rank, heap_bases
+        )
+        tl.atomic_xchg(own_translated, target_epoch, sem="release", scope="sys")
+
+        for i in range(world_size):
+            remote_rank = rank_start + i * rank_stride
+            if remote_rank != iris_rank:
+                remote_flag_ptr = barrier_flags_ptr + remote_rank
+                remote_translated = _translate_ptr(
+                    remote_flag_ptr, iris_rank, remote_rank, heap_bases
+                )
+                while (
+                    tl.atomic_cas(
+                        remote_translated,
+                        target_epoch,
+                        target_epoch,
+                        sem="acquire",
+                        scope="sys",
+                    )
+                    != target_epoch
+                ):
+                    pass
+
+        tl.atomic_add(barrier_done_ptr, 1, sem="release")
+    else:
+        while tl.atomic_add(barrier_done_ptr, 0, sem="acquire") < 1:
+            pass
+
+
 def extract_group_info(
     shmem: Any,
 ) -> Tuple[int, int, int, int, int]:
@@ -287,51 +339,20 @@ def fused_twoshot_allreduce_rmsnorm_quant_kernel(
                 )
 
     # ================================================================
-    # Step 2: Inlined device barrier (cross-rank synchronization)
-    #
-    # CTA 0 performs the inter-rank handshake (same protocol as
-    # iris._distributed_helpers._device_barrier_kernel):
-    #   1. Signal own readiness via atomic_xchg on own flag slot
-    #   2. Poll all remote ranks' flag slots via atomic_cas
-    # Then CTA 0 signals all other CTAs via barrier_done_ptr.
+    # Step 2: Cross-rank device barrier
     # ================================================================
 
-    target_epoch = barrier_epoch + 1
-
-    if raw_pid == 0:
-        # Signal own readiness
-        own_flag_ptr = barrier_flags_ptr + iris_rank
-        own_translated = _translate_ptr(
-            own_flag_ptr, iris_rank, iris_rank, heap_bases
-        )
-        tl.atomic_xchg(own_translated, target_epoch, sem="release", scope="sys")
-
-        # Poll all remote ranks
-        for i in range(world_size):
-            remote_rank = rank_start + i * rank_stride
-            if remote_rank != iris_rank:
-                remote_flag_ptr = barrier_flags_ptr + remote_rank
-                remote_translated = _translate_ptr(
-                    remote_flag_ptr, iris_rank, remote_rank, heap_bases
-                )
-                while (
-                    tl.atomic_cas(
-                        remote_translated,
-                        target_epoch,
-                        target_epoch,
-                        sem="acquire",
-                        scope="sys",
-                    )
-                    != target_epoch
-                ):
-                    pass
-
-        # Signal other CTAs that barrier is complete
-        tl.atomic_add(barrier_done_ptr, 1, sem="release")
-    else:
-        # Wait for CTA 0 to complete the cross-rank barrier
-        while tl.atomic_add(barrier_done_ptr, 0, sem="acquire") < 1:
-            pass
+    _inlined_device_barrier(
+        raw_pid,
+        barrier_flags_ptr,
+        barrier_epoch,
+        barrier_done_ptr,
+        heap_bases,
+        iris_rank,
+        world_size,
+        rank_start,
+        rank_stride,
+    )
 
     # ================================================================
     # Step 3: Residual Add + RMSNorm + amax (all rows, all CTAs)
