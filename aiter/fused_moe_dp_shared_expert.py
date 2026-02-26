@@ -10,12 +10,17 @@ import aiter
 from aiter import logger
 from aiter import ActivationType, QuantType, dtypes
 from aiter.utility import fp4_utils
-from aiter.jit.utils.chip_info import get_gfx
 
 # from aiter import get_torch_quant as get_quant
 from aiter import get_hip_quant as get_quant
 from aiter.utility.fp4_utils import moe_mxfp4_sort
-from aiter.jit.core import AITER_ROOT_DIR, AITER_CSRC_DIR, PY, get_asm_dir, bd_dir, mp_lock
+from aiter.jit.core import (
+    AITER_ROOT_DIR,
+    AITER_CSRC_DIR,
+    PY,
+    bd_dir,
+    mp_lock,
+)
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.fused_moe import moe_sorting
 

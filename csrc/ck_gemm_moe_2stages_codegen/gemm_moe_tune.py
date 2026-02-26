@@ -7,7 +7,12 @@ import pandas as pd
 import os
 import sys
 from aiter import QuantType
-from aiter.jit.core import get_asm_dir, AITER_CSRC_DIR, AITER_CONFIG_FMOE, AITER_ROOT_DIR
+from aiter.jit.core import (
+    get_asm_dir,
+    AITER_CSRC_DIR,
+    AITER_CONFIG_FMOE,
+    AITER_ROOT_DIR,
+)
 from aiter.fused_moe import (
     fused_topk,
     moe_sorting,
