@@ -813,6 +813,7 @@ def _moe_gemm_a4w4_gfx1250(
     # apply activation function
     if APPLY_SWIGLU and SPLIT_K == 1:
         out = _swiglu(acc, alpha, limit)
+        out = gl.convert_layout(out, WMMA_LAYOUT)
         gl.static_assert(
             out.shape[1] == OUT_BLOCK_N,
             f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
