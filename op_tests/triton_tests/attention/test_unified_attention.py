@@ -287,7 +287,7 @@ def test_triton_unified_attn(
             * head_size
             * (torch.finfo(dtype).bits // 8)
         )
-        if kv_cache_shared_mem_size > 32768:
+        if kv_cache_shared_mem_size > 327680:
             pytest.skip(
                 f"skipping test for KV cache LDS required memory = {kv_cache_shared_mem_size/1024} kB > 320 kB"
             )
