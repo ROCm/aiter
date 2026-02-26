@@ -2,7 +2,7 @@ name: Aiter Benchmark
 
 on:
   pull_request: # for testing
-    types: [opened, synchronize, reopened, ready_for_review]
+    # types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
     paths-ignore:
       - '**/*.md'
