@@ -3,7 +3,7 @@
 
 import torch
 import pytest
-from aiter.ops.triton.gluon.gfx12_gemma8w8_blockscale.gemma8w8_1250_v1 import (
+from aiter.ops.triton.gluon.gemm_a8w8_blockscale_gfx12 import (
     gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
 )
 from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
