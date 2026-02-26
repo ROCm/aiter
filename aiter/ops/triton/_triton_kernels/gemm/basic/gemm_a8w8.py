@@ -3,7 +3,8 @@
 
 import triton.language as tl
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config, compute_splitk_params
 
 import triton
 
@@ -77,13 +78,10 @@ def _gemm_a8w8_kernel(
     The conversion scale is received in the form of two 1D tensors that are multiplied to form a
     2D one before being applied.
 
-    Supports split-K parallelism via NUM_KSPLIT > 1, where the K dimension is partitioned
-    across multiple thread blocks whose partial results are later reduced.
-
     Key parameters:
     - A: Matrix A with shape (M, K).
     - B: Matrix B with shape (K, N).
-    - C: Matrix C with shape (M, N) when NUM_KSPLIT==1, or (NUM_KSPLIT, M, N) otherwise.
+    - C: Matrix C with shape (M, N) if NUM_KSPLIT==1, (NUM_KSPLIT, M, N) otherwise.
     - A_scale: First scale tensor with shape (M, 1).
     - B_scale: Second scale tensor with shape (1, N).
     - Bias: Bias tensor with shape (1, N).
@@ -96,54 +94,22 @@ def _gemm_a8w8_kernel(
     tl.assume(stride_cm > 0)
     tl.assume(stride_cn > 0)
 
-    TOTAL_PIDS = GRID_MN * NUM_KSPLIT
+    GRID_MN = tl.cdiv(M, BLOCK_SIZE_M) * tl.cdiv(N, BLOCK_SIZE_N)
 
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
     pid_unified = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-
-    ## pid remapping on xcds
-    # Number of pids per XCD in the new arrangement
-    pids_per_xcd = (TOTAL_PIDS + NUM_XCDS - 1) // NUM_XCDS
-    # When TOTAL_PIDS cannot divide NUM_XCDS, some xcds will have
-    # pids_per_xcd pids, the other will have pids_per_xcd - 1 pids.
-    # We calculate the number of xcds that have pids_per_xcd pids as
-    # tall_xcds
-    tall_xcds = TOTAL_PIDS % NUM_XCDS
-    tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
-    # Compute current XCD and local pid within the XCD
-    xcd = pid_unified % NUM_XCDS
-    local_pid = pid_unified // NUM_XCDS
-    # Calculate new pid based on the new grouping
-    # Note that we need to consider the following two cases:
-    # 1. the current pid is on a tall xcd
-    # 2. the current pid is on a short xcd
-    if xcd < tall_xcds:
-        pid_unified = xcd * pids_per_xcd + local_pid
-    else:
-        pid_unified = (
-            tall_xcds * pids_per_xcd
-            + (xcd - tall_xcds) * (pids_per_xcd - 1)
-            + local_pid
-        )
+    # remap so that XCDs get continous chunks of pids (of CHUNK_SIZE).
+    pid_unified = remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=8)
 
     pid_k = pid_unified % NUM_KSPLIT
     pid = pid_unified // NUM_KSPLIT
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
-        if GROUP_SIZE_M == 1:
-            pid_m = pid // num_pid_n
-            pid_n = pid % num_pid_n
-        else:
-            num_pid_in_group = GROUP_SIZE_M * num_pid_n
-            group_id = pid // num_pid_in_group
-            first_pid_m = group_id * GROUP_SIZE_M
-            group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-            pid_m = first_pid_m + (pid % group_size_m)
-            pid_n = (pid % num_pid_in_group) // group_size_m
+        pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
         pid_m = pid // num_pid_n
         pid_n = pid % num_pid_n
@@ -283,5 +249,5 @@ def _get_config(
     N: int,
     K: int,
 ):
-
-    return get_gemm_config("GEMM-A8W8", M, N, K)
+    config, is_tunned = get_gemm_config("GEMM-A8W8", M, N, K)
+    return compute_splitk_params(config, K), is_tunned
