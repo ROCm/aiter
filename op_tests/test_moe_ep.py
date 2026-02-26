@@ -1230,7 +1230,7 @@ def test_fmoe_lqq(
         quant_type=aiter.QuantType.per_Token,
         a2_scale=a2_scale,
         w2_scale=w2_scale,
-        doweight=False,
+        doweight=True,
     )
     print("[test] out2_ref: ", out2_ref.shape, out2_ref.dtype)
     # save_buffer_to_file(out1_ref, "./feifei/out1_ref", format="text")
@@ -1273,6 +1273,20 @@ def test_fmoe_lqq(
     # err = checkAllclose(out1_ref, out_asm)
     err = checkAllclose(out2_ref, out_asm)
     print(err)
+
+    def calc_diff(x: torch.Tensor, y: torch.Tensor):
+        x, y = x.double(), y.double()
+        denominator = (x * x + y * y).sum()
+        sim = 2 * (x * y).sum() / denominator
+        return 1 - sim
+
+    logits_diff = calc_diff(out2_ref, out_asm)
+    if logits_diff > 1e-3:
+        print(
+            f"logits_diff: {logits_diff} is too large, please check the implementation"
+        )
+    else:
+        print(f"logits_diff: {logits_diff} is acceptable")
 
     """
     out1_asm, us1 = run_perftest(

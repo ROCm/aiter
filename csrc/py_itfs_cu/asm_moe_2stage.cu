@@ -71,22 +71,22 @@ struct __attribute__((packed)) KernelArgs
     void log()
     {
         printf("[KernelArgs] argsize: %zu\n", sizeof(KernelArgs));
-        printf("[KARG] dim                      = %d\n", dim);
-        printf("[KARG] hidden_dim               = %d\n", hidden_dim);
-        printf("[KARG] token_cnt                = %d\n", token_cnt);
-        printf("[KARG] eprt_cnt                 = %d\n", eprt_cnt);
-        printf("[KARG] Xs                       = %d\n", Xs);
-        printf("[KARG] GUs                      = %d\n", GUs);
-        printf("[KARG] Os                       = %d\n", Os);
-        printf("[KARG] eGUs                     = %d\n", eGUs);
-        printf("[KARG] eGUQs                    = %d\n", eGUQs);
-        printf("[KARG] eSMQs                    = %d\n", eSMQs);
-        printf("[KARG] topk                     = %d\n", topk);
-        printf("[KARG] splitk                   = %d\n", splitk);
-        printf("[KARG] activation               = %d\n", activation);
-        printf("[KARG] total_tgs                = %d\n", total_tgs);
-        printf("[KARG] ps_deno                  = %d\n", ps_deno);
-        printf("[KARG] eLQQs                    = %d\n", eLQQs);
+        printf("[KARG] dim          @ 0x%04lX   = %d\n", offsetof(KernelArgs, dim), dim);
+        printf("[KARG] hidden_dim   @ 0x%04lX   = %d\n", offsetof(KernelArgs, hidden_dim), hidden_dim);
+        printf("[KARG] token_cnt    @ 0x%04lX   = %d\n", offsetof(KernelArgs, token_cnt), token_cnt);
+        printf("[KARG] eprt_cnt     @ 0x%04lX   = %d\n", offsetof(KernelArgs, eprt_cnt), eprt_cnt);
+        printf("[KARG] Xs           @ 0x%04lX   = %d\n", offsetof(KernelArgs, Xs), Xs);
+        printf("[KARG] GUs          @ 0x%04lX   = %d\n", offsetof(KernelArgs, GUs), GUs);
+        printf("[KARG] Os           @ 0x%04lX   = %d\n", offsetof(KernelArgs, Os), Os);
+        printf("[KARG] eGUs         @ 0x%04lX   = %d\n", offsetof(KernelArgs, eGUs), eGUs);
+        printf("[KARG] eGUQs        @ 0x%04lX   = %d\n", offsetof(KernelArgs, eGUQs), eGUQs);
+        printf("[KARG] eSMQs        @ 0x%04lX   = %d\n", offsetof(KernelArgs, eSMQs), eSMQs);
+        printf("[KARG] topk         @ 0x%04lX   = %d\n", offsetof(KernelArgs, topk), topk);
+        printf("[KARG] splitk       @ 0x%04lX   = %d\n", offsetof(KernelArgs, splitk), splitk);
+        printf("[KARG] activation   @ 0x%04lX   = %d\n", offsetof(KernelArgs, activation), activation);
+        printf("[KARG] total_tgs    @ 0x%04lX   = %d\n", offsetof(KernelArgs, total_tgs), total_tgs);
+        printf("[KARG] ps_deno      @ 0x%04lX   = %d\n", offsetof(KernelArgs, ps_deno), ps_deno);
+        printf("[KARG] eLQQs        @ 0x%04lX   = %d\n", offsetof(KernelArgs, eLQQs), eLQQs);
     }
 };
 struct __attribute__((packed)) Kernel2Args
@@ -140,18 +140,18 @@ struct __attribute__((packed)) Kernel2Args
     void log()
     {
         printf("[Kernel2Args] argsize: %zu\n", sizeof(Kernel2Args));
-        printf("[KARG] dim                      = %d\n", dim);
-        printf("[KARG] hidden_dim               = %d\n", hidden_dim);
-        printf("[KARG] token_cnt                = %d\n", token_cnt);
-        printf("[KARG] eprt_cnt                 = %d\n", eprt_cnt);
-        printf("[KARG] stride_X                 = %d\n", stride_X);
-        printf("[KARG] stride_D                 = %d\n", stride_D);
-        printf("[KARG] stride_O                 = %d\n", stride_O);
-        printf("[KARG] stride_expert_D          = %d\n", stride_expert_D);
-        printf("[KARG] stride_expert_scale_D    = %d\n", stride_expert_scale_D);
-        printf("[KARG] topk                     = %d\n", topk);
-        printf("[KARG] splitk                   = %d\n", splitk);
-        printf("[KARG] stride_expert_dequant_D  = %d\n", stride_expert_dequant_D);
+        printf("[KARG] dim                      @ 0x%04lX   = %d\n", offsetof(Kernel2Args, dim), dim);
+        printf("[KARG] hidden_dim               @ 0x%04lX   = %d\n", offsetof(Kernel2Args, hidden_dim), hidden_dim);
+        printf("[KARG] token_cnt                @ 0x%04lX   = %d\n", offsetof(Kernel2Args, token_cnt), token_cnt);
+        printf("[KARG] eprt_cnt                 @ 0x%04lX   = %d\n", offsetof(Kernel2Args, eprt_cnt), eprt_cnt);
+        printf("[KARG] stride_X                 @ 0x%04lX   = %d\n", offsetof(Kernel2Args, stride_X), stride_X);
+        printf("[KARG] stride_D                 @ 0x%04lX   = %d\n", offsetof(Kernel2Args, stride_D), stride_D);
+        printf("[KARG] stride_O                 @ 0x%04lX   = %d\n", offsetof(Kernel2Args, stride_O), stride_O);
+        printf("[KARG] stride_expert_D          @ 0x%04lX   = %d\n", offsetof(Kernel2Args, stride_expert_D), stride_expert_D);
+        printf("[KARG] stride_expert_scale_D    @ 0x%04lX   = %d\n", offsetof(Kernel2Args, stride_expert_scale_D), stride_expert_scale_D);
+        printf("[KARG] topk                     @ 0x%04lX   = %d\n", offsetof(Kernel2Args, topk), topk);
+        printf("[KARG] splitk                   @ 0x%04lX   = %d\n", offsetof(Kernel2Args, splitk), splitk);
+        printf("[KARG] stride_expert_dequant_D  @ 0x%04lX   = %d\n", offsetof(Kernel2Args, stride_expert_dequant_D), stride_expert_dequant_D);
     }
 };
 
@@ -290,7 +290,9 @@ std::string get_heuristic_kernel(int m_num, int N, int blockk_size, CFG* cfgs, s
     }
     return selected;
 }
-int save_int8(const char* filename, int8_t* array, size_t size) {
+
+template<typename T>
+static int save_dev_hex(const char* filename, T* array, size_t size) {
     if (filename == NULL || array == NULL || size == 0) {
         return -1;
     }    
@@ -299,9 +301,9 @@ int save_int8(const char* filename, int8_t* array, size_t size) {
         return -1;
     }
     
-    int8_t* ptr = new int8_t[size];
-    hipMemcpy(ptr, array, size * sizeof(int8_t), hipMemcpyDeviceToHost);
-    size_t elements_written = fwrite(ptr, sizeof(int8_t), size, file);
+    T* ptr = new T[size];
+    hipMemcpy(ptr, array, size * sizeof(T), hipMemcpyDeviceToHost);
+    size_t elements_written = fwrite(ptr, sizeof(T), size, file);
     delete[] ptr;
     
     if (elements_written != size) {
@@ -312,44 +314,8 @@ int save_int8(const char* filename, int8_t* array, size_t size) {
     fclose(file);
     return 0;
 }
-int save_int8_fmt(const char* filename, int8_t* array, size_t size)
-{
-    int items_per_line = 16;
-    if (filename == NULL || array == NULL || size == 0) {
-        return -1;
-    }
-    
-    FILE* fp = fopen(filename, "w");
-    if (fp == NULL) {
-        perror("Error opening file");
-        return -1;
-    }
-    
-    fprintf(fp, "Index | Value\n");
-    fprintf(fp, "-------------\n");
-    
-    int8_t* ptr = new int8_t[size];
-    hipMemcpy(ptr, array, size * sizeof(int8_t), hipMemcpyDeviceToHost);
-    for (size_t i = 0; i < size; i++) {
-        fprintf(fp, "%d", ptr[i]);
-        
-        if (items_per_line > 0 && (i + 1) % items_per_line == 0) {
-            fprintf(fp, "\n");
-        } else if (i < size - 1) {
-            fprintf(fp, " ");
-        }
-    }
-    delete[] ptr;
-    
-    if (items_per_line == 0 || size % items_per_line != 0) {
-        fprintf(fp, "\n");
-    }
-    
-    fclose(fp);
-    return 0;
-}
 template<typename T>
-int save_int_fmt(const char* filename, T* array, size_t size)
+static int save_dev_int(const char* filename, T* array, size_t size)
 {
     int items_per_line = 16;
     if (filename == NULL || array == NULL || size == 0) {
@@ -378,14 +344,10 @@ int save_int_fmt(const char* filename, T* array, size_t size)
     }
     delete[] ptr;
     
-    if (items_per_line == 0 || size % items_per_line != 0) {
-        fprintf(fp, "\n");
-    }
-    
     fclose(fp);
     return 0;
 }
-int save_float(const char* filename, float* array, size_t size)
+static int save_dev_float(const char* filename, float* array, size_t size)
 {
     int items_per_line = 16;
     if (filename == NULL || array == NULL || size == 0) {
@@ -398,7 +360,7 @@ int save_float(const char* filename, float* array, size_t size)
         return -1;
     }
     
-    fprintf(fp, "Index | Value\n");
+    fprintf(fp, "Index | Value | size = %zu\n", size);
     fprintf(fp, "-------------\n");
     
     float* ptr = new float[size];
@@ -413,11 +375,7 @@ int save_float(const char* filename, float* array, size_t size)
         }
     }
     delete[] ptr;
-    
-    if (items_per_line == 0 || size % items_per_line != 0) {
-        fprintf(fp, "\n");
-    }
-    
+        
     fclose(fp);
     return 0;
 }
@@ -585,44 +543,19 @@ void moe_stage1_g1u1(
     int gdz = k_num;
 
     args.log();
-    printf("[DEV_BUF] ptr_O: out = %lu bytes\n", out.numel() * out.element_size());
-    printf("[DEV_BUF] ptr_X: input = %lu bytes\n", input.numel() * input.element_size());
-    printf("[DEV_BUF] ptr_GU: w1 = %lu bytes\n", w1.numel() * w1.element_size());
-    printf("[DEV_BUF] ptr_XC: num_valid_ids = %lu bytes\n", num_valid_ids.numel() * num_valid_ids.element_size());
-    printf("[DEV_BUF] ptr_XQ: a1_scale = %lu bytes\n", a1_scale.has_value() ? a1_scale.value().numel() * a1_scale.value().element_size() : 0);
-    printf("[DEV_BUF] ptr_GUQ: w1_scale = %lu bytes\n", w1_scale.has_value() ? w1_scale.value().numel() * w1_scale.value().element_size() : 0);
-    printf("[DEV_BUF] ptr_SMQ: fc2_smooth_scale = %lu bytes\n", fc2_smooth_scale.has_value() ? fc2_smooth_scale.value().numel() * fc2_smooth_scale.value().element_size() : 0);
-    printf("[DEV_BUF] ptr_STP: sorted_token_ids = %lu bytes\n", sorted_token_ids.numel() * sorted_token_ids.element_size());
-    printf("[DEV_BUF] ptr_SEP: sorted_expert_ids = %lu bytes\n", sorted_expert_ids.numel() * sorted_expert_ids.element_size());
-    printf("[DEV_BUF] ptr_SW: sorted_weights = %lu bytes\n", sorted_weights.has_value() ? sorted_weights.value().numel() * sorted_weights.value().element_size() : 0);
-    printf("[DEV_BUF] ptr_Qscl: w1_lqq_scale = %lu bytes\n", w1_lqq_scale.has_value() ? w1_lqq_scale.value().numel() * w1_lqq_scale.value().element_size() : 0);
-    printf("[DEV_BUF] ptr_Qzero: w1_lqq_zero = %lu bytes\n", w1_lqq_zero.has_value() ? w1_lqq_zero.value().numel() * w1_lqq_zero.value().element_size() : 0);
+    printf("[DEV_BUF] ptr_O     : out               = %lu bytes\n", out.numel() * out.element_size());
+    printf("[DEV_BUF] ptr_X     : input             = %lu bytes\n", input.numel() * input.element_size());
+    printf("[DEV_BUF] ptr_GU    : w1                = %lu bytes\n", w1.numel() * w1.element_size());
+    printf("[DEV_BUF] ptr_XC    : num_valid_ids     = %lu bytes\n", num_valid_ids.numel() * num_valid_ids.element_size());
+    printf("[DEV_BUF] ptr_XQ    : a1_scale          = %lu bytes\n", a1_scale.has_value() ? a1_scale.value().numel() * a1_scale.value().element_size() : 0);
+    printf("[DEV_BUF] ptr_GUQ   : w1_scale          = %lu bytes\n", w1_scale.has_value() ? w1_scale.value().numel() * w1_scale.value().element_size() : 0);
+    printf("[DEV_BUF] ptr_SMQ   : fc2_smooth_scale  = %lu bytes\n", fc2_smooth_scale.has_value() ? fc2_smooth_scale.value().numel() * fc2_smooth_scale.value().element_size() : 0);
+    printf("[DEV_BUF] ptr_STP   : sorted_token_ids  = %lu bytes\n", sorted_token_ids.numel() * sorted_token_ids.element_size());
+    printf("[DEV_BUF] ptr_SEP   : sorted_expert_ids = %lu bytes\n", sorted_expert_ids.numel() * sorted_expert_ids.element_size());
+    printf("[DEV_BUF] ptr_SW    : sorted_weights    = %lu bytes\n", sorted_weights.has_value() ? sorted_weights.value().numel() * sorted_weights.value().element_size() : 0);
+    printf("[DEV_BUF] ptr_Qscl  : w1_lqq_scale      = %lu bytes\n", w1_lqq_scale.has_value() ? w1_lqq_scale.value().numel() * w1_lqq_scale.value().element_size() : 0);
+    printf("[DEV_BUF] ptr_Qzero : w1_lqq_zero       = %lu bytes\n", w1_lqq_zero.has_value() ? w1_lqq_zero.value().numel() * w1_lqq_zero.value().element_size() : 0);
     printf("gdx:%d, gdy:%d, gdz:%d, bdx:%d\n", gdx, gdy, gdz, bdx);
-
-    //uint32_t group_in_k_lqq = 64;
-    //uint32_t dim = model_dim;
-    //uint32_t batch = token_cnt;
-    //uint32_t GU_dqn_k_lqq = dim/group_in_k_lqq;
-    //uint32_t GU_dqn_n_lqq = hidden_dim;
-    //uint32_t GU_dqn_lqq_size = eprt*GU_dqn_k_lqq*GU_dqn_n_lqq;
-    //save_int8_fmt("./feifei/ptr_X_fmt.hex", (int8_t*)(input.data_ptr()), token_cnt*model_dim);
-    //save_float("./feifei/X_dqn_buf.txt",  (float*)(a1_scale.value().data_ptr()), a1_scale.value().numel());
-    //save_int8("./feifei/GU_buf_pack.hex", (int8_t*)(w1.data_ptr()), w1.numel() * w1.element_size());
-    //save_float("./feifei/GU_dqn_buf.txt", (float*)(w1_scale.value().data_ptr()), w1_scale.value().numel());
-    //save_int8("./feifei/ptr_XC.hex", (int8_t*)(num_valid_ids.data_ptr()), num_valid_ids.numel() * num_valid_ids.element_size());
-    //save_int8("./feifei/ptr_STP.hex", (int8_t*)(sorted_token_ids.data_ptr()), sorted_token_ids.numel() * sorted_token_ids.element_size());
-    //save_int_fmt("./feifei/sorted_token_ids.text", (uint32_t*)(sorted_token_ids.data_ptr()), sorted_token_ids.numel());
-    //save_int8("./feifei/ptr_SEP.hex", (int8_t*)(sorted_expert_ids.data_ptr()), sorted_expert_ids.numel() * sorted_expert_ids.element_size());
-    //save_int8_fmt("./feifei/ptr_GU_fmt.hex", (int8_t*)(args.ptr_GU), w1.numel() * w1.element_size());
-    //save_int8_fmt("./feifei/ptr_Qscl_fmt.hex", (int8_t*)(args.ptr_Qscl), w1_lqq_scale.value().numel() * w1_lqq_scale.value().element_size());
-    //save_int8_fmt("./feifei/ptr_Qzero_fmt.hex", (int8_t*)(args.ptr_Qzero), w1_lqq_zero.value().numel() * w1_lqq_zero.value().element_size());
-    //save_int8("./feifei/GU_buf_uint4.hex", (int8_t*)GU_buf_uint4, sz_GU);
-    //save_int8("./feifei/GU_buf.hex", (int8_t*)GU_buf, sz_GU);
-    //save_int8("./feifei/GU_qzero_lqq_buf_uint8.hex", (int8_t*)GU_qzero_lqq_buf_uint8, GU_dqn_lqq_size);
-    //save_int8("./feifei/GU_buf_uint4_shf_inter.hex", (int8_t*)GU_buf_uint4, sz_GU);
-    //save_int8("./feifei/GU_buf_uint4_shf2.hex", (int8_t*)GU_buf_uint4, sz_GU);
-    //save_int8("./feifei/GU_qscale_lqq_buf_shf.hex", (int8_t*)GU_qscale_lqq_buf, GU_dqn_lqq_size);
-    //save_int8("./feifei/GU_qzero_lqq_buf_uint8_shf.hex", (int8_t*)GU_qzero_lqq_buf_uint8, GU_dqn_lqq_size);
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,
@@ -788,6 +721,9 @@ void moe_stage2_g1u1(
     printf("[DEV_BUF] ptr_SWBuffer      : sorted_weights    = %lu bytes\n", sorted_weights.has_value() ? sorted_weights.value().numel() * sorted_weights.value().element_size() : 0);
     printf("[DEV_BUF] ptr_DScaleBuffer  : w2_lqq_scale      = %lu bytes\n", w2_lqq_scale.has_value() ? w2_lqq_scale.value().numel() * w2_lqq_scale.value().element_size() : 0);
     printf("[DEV_BUF] ptr_DZeroBuffer   : w2_lqq_zero       = %lu bytes\n", w2_lqq_zero.has_value() ? w2_lqq_zero.value().numel() * w2_lqq_zero.value().element_size() : 0);
+    save_dev_int<int32_t>("./feifei/ptr_XCBuffer.txt",  (int32_t*)(args.ptr_XCBuffer),  num_valid_ids.numel());
+    save_dev_int<int32_t>("./feifei/ptr_STPBuffer.txt", (int32_t*)(args.ptr_STPBuffer), sorted_token_ids.numel());
+    save_dev_int<int32_t>("./feifei/ptr_SEPBuffer.txt", (int32_t*)(args.ptr_SEPBuffer), sorted_expert_ids.numel());
     printf("gdx:%d, gdy:%d, gdz:%d, bdx:%d\n", gdx, gdy, gdz, bdx);
 
     impl_ptr->launch_kernel({&args,
