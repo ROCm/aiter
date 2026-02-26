@@ -827,6 +827,106 @@ REGISTER_DTYPE(u16 , uint16_t)
 REGISTER_DTYPE(i8  , int8_t)
 REGISTER_DTYPE(u8  , uint8_t)
 
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
+// numeric_limits — min/max/lowest/quiet_nan/infinity for all registered dtypes
+template<typename T> struct numeric_limits;
+
+template<> struct numeric_limits<fp32_t> {
+    static constexpr uint32_t bin_min = 0x00800000, bin_max = 0x7F7FFFFF, bin_lowest = 0xFF7FFFFF, bin_qnan = 0x7FC00000, bin_inf = 0x7F800000;
+    OPUS_H_D static constexpr fp32_t min()       { return __builtin_bit_cast(fp32_t, bin_min); }
+    OPUS_H_D static constexpr fp32_t max()       { return __builtin_bit_cast(fp32_t, bin_max); }
+    OPUS_H_D static constexpr fp32_t lowest()    { return __builtin_bit_cast(fp32_t, bin_lowest); }
+    OPUS_H_D static constexpr fp32_t quiet_nan() { return __builtin_bit_cast(fp32_t, bin_qnan); }
+    OPUS_H_D static constexpr fp32_t infinity()  { return __builtin_bit_cast(fp32_t, bin_inf); }
+};
+template<> struct numeric_limits<fp16_t> {
+    static constexpr uint16_t bin_min = 0x0400, bin_max = 0x7BFF, bin_lowest = 0xFBFF, bin_qnan = 0x7E00, bin_inf = 0x7C00;
+    OPUS_H_D static constexpr fp16_t min()       { return __builtin_bit_cast(fp16_t, bin_min); }
+    OPUS_H_D static constexpr fp16_t max()       { return __builtin_bit_cast(fp16_t, bin_max); }
+    OPUS_H_D static constexpr fp16_t lowest()    { return __builtin_bit_cast(fp16_t, bin_lowest); }
+    OPUS_H_D static constexpr fp16_t quiet_nan() { return __builtin_bit_cast(fp16_t, bin_qnan); }
+    OPUS_H_D static constexpr fp16_t infinity()  { return __builtin_bit_cast(fp16_t, bin_inf); }
+};
+template<> struct numeric_limits<bf16_t> {
+    static constexpr uint16_t bin_min = 0x0080, bin_max = 0x7F7F, bin_lowest = 0xFF7F, bin_qnan = 0x7FC0, bin_inf = 0x7F80;
+    OPUS_H_D static constexpr bf16_t min()       { return __builtin_bit_cast(bf16_t, bin_min); }
+    OPUS_H_D static constexpr bf16_t max()       { return __builtin_bit_cast(bf16_t, bin_max); }
+    OPUS_H_D static constexpr bf16_t lowest()    { return __builtin_bit_cast(bf16_t, bin_lowest); }
+    OPUS_H_D static constexpr bf16_t quiet_nan() { return __builtin_bit_cast(bf16_t, bin_qnan); }
+    OPUS_H_D static constexpr bf16_t infinity()  { return __builtin_bit_cast(bf16_t, bin_inf); }
+};
+// fp8 E4M3: gfx950=OCP(ieee-like, NaN=0x7F), gfx942=fnuz(NaN=0x80). No infinity in either format.
+// NOTE: __builtin_bit_cast with _BitInt(8) is not yet constexpr in clang, so use static_cast via int8_t.
+template<> struct numeric_limits<fp8_t> {
+#if defined(__gfx950__)
+    static constexpr uint8_t bin_min = 0x08, bin_max = 0x7E, bin_lowest = 0xFE, bin_qnan = 0x7F, bin_inf = 0x00;
+#else
+    static constexpr uint8_t bin_min = 0x08, bin_max = 0x7F, bin_lowest = 0xFF, bin_qnan = 0x80, bin_inf = 0x00;
+#endif
+    OPUS_H_D static constexpr fp8_t min()       { return static_cast<fp8_t>(static_cast<int8_t>(bin_min)); }
+    OPUS_H_D static constexpr fp8_t max()       { return static_cast<fp8_t>(static_cast<int8_t>(bin_max)); }
+    OPUS_H_D static constexpr fp8_t lowest()    { return static_cast<fp8_t>(static_cast<int8_t>(bin_lowest)); }
+    OPUS_H_D static constexpr fp8_t quiet_nan() { return static_cast<fp8_t>(static_cast<int8_t>(bin_qnan)); }
+    OPUS_H_D static constexpr fp8_t infinity()  { return static_cast<fp8_t>(static_cast<int8_t>(bin_inf)); }
+};
+// bf8 E5M2: gfx950=OCP(ieee, has inf=0x7C, NaN=0x7E), gfx942=fnuz(no inf, NaN=0x80)
+template<> struct numeric_limits<bf8_t> {
+#if defined(__gfx950__)
+    static constexpr uint8_t bin_min = 0x04, bin_max = 0x7B, bin_lowest = 0xFB, bin_qnan = 0x7F, bin_inf = 0x7C;
+#else
+    static constexpr uint8_t bin_min = 0x04, bin_max = 0x7F, bin_lowest = 0xFF, bin_qnan = 0x80, bin_inf = 0x00;
+#endif
+    OPUS_H_D static constexpr bf8_t min()       { return static_cast<bf8_t>(bin_min); }
+    OPUS_H_D static constexpr bf8_t max()       { return static_cast<bf8_t>(bin_max); }
+    OPUS_H_D static constexpr bf8_t lowest()    { return static_cast<bf8_t>(bin_lowest); }
+    OPUS_H_D static constexpr bf8_t quiet_nan() { return static_cast<bf8_t>(bin_qnan); }
+    OPUS_H_D static constexpr bf8_t infinity()  { return static_cast<bf8_t>(bin_inf); }
+};
+template<> struct numeric_limits<i32_t> {
+    OPUS_H_D static constexpr i32_t min()       { return -2147483647 - 1; }
+    OPUS_H_D static constexpr i32_t max()       { return  2147483647; }
+    OPUS_H_D static constexpr i32_t lowest()    { return -2147483647 - 1; }
+    OPUS_H_D static constexpr i32_t quiet_nan() { return 0; }
+    OPUS_H_D static constexpr i32_t infinity()  { return 0; }
+};
+template<> struct numeric_limits<u32_t> {
+    OPUS_H_D static constexpr u32_t min()       { return 0; }
+    OPUS_H_D static constexpr u32_t max()       { return 4294967295U; }
+    OPUS_H_D static constexpr u32_t lowest()    { return 0; }
+    OPUS_H_D static constexpr u32_t quiet_nan() { return 0; }
+    OPUS_H_D static constexpr u32_t infinity()  { return 0; }
+};
+template<> struct numeric_limits<i16_t> {
+    OPUS_H_D static constexpr i16_t min()       { return -32768; }
+    OPUS_H_D static constexpr i16_t max()       { return  32767; }
+    OPUS_H_D static constexpr i16_t lowest()    { return -32768; }
+    OPUS_H_D static constexpr i16_t quiet_nan() { return 0; }
+    OPUS_H_D static constexpr i16_t infinity()  { return 0; }
+};
+#if __clang_major__ >= 20
+template<> struct numeric_limits<u16_t> {
+    OPUS_H_D static constexpr u16_t min()       { return 0; }
+    OPUS_H_D static constexpr u16_t max()       { return 65535; }
+    OPUS_H_D static constexpr u16_t lowest()    { return 0; }
+    OPUS_H_D static constexpr u16_t quiet_nan() { return 0; }
+    OPUS_H_D static constexpr u16_t infinity()  { return 0; }
+};
+#endif
+template<> struct numeric_limits<i8_t> {
+    OPUS_H_D static constexpr i8_t min()       { return -128; }
+    OPUS_H_D static constexpr i8_t max()       { return  127; }
+    OPUS_H_D static constexpr i8_t lowest()    { return -128; }
+    OPUS_H_D static constexpr i8_t quiet_nan() { return 0; }
+    OPUS_H_D static constexpr i8_t infinity()  { return 0; }
+};
+template<> struct numeric_limits<u8_t> {
+    OPUS_H_D static constexpr u8_t min()       { return 0; }
+    OPUS_H_D static constexpr u8_t max()       { return 255; }
+    OPUS_H_D static constexpr u8_t lowest()    { return 0; }
+    OPUS_H_D static constexpr u8_t quiet_nan() { return 0; }
+    OPUS_H_D static constexpr u8_t infinity()  { return 0; }
+};
+
 template<typename C, typename... S, std::enable_if_t<is_dtype_v<C> && (is_constant_v<S> && ...), bool> = true>
 OPUS_H_D constexpr auto slice(C&& container, S&&.../*ss*/) { return container; }    // TODO: fallback slice a normal value does nonthing
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -861,12 +961,31 @@ OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) {
 }
 #endif
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wuninitialized"
+#pragma clang diagnostic ignored "-Wc++20-extensions"
+// scalar fp8 <-> fp32 via packed intrinsics (lo slot only). NOT constexpr: clang eagerly rejects non-template
+// constexpr functions containing GPU builtins (__builtin_amdgcn_cvt_*) that can never be compile-time evaluated.
+// Template constexpr (packed variants, OPUS_CAST_DEFINE) survives because the check is deferred to instantiation.
+// TODO: we may remove constexpr from cast in the future
+OPUS_D auto fp32_to_fp8(const fp32_t& x) {
+    int w; w = __builtin_amdgcn_cvt_pk_fp8_f32(x, 0.0f, w, /*sel=lo*/0);
+    return __builtin_bit_cast(fp8_t, static_cast<int8_t>(w));
+}
+OPUS_D auto fp8_to_fp32(const fp8_t& x) {
+    int w = static_cast<int>(__builtin_bit_cast(uint8_t, x));
+    return __builtin_amdgcn_cvt_f32_fp8(w, /*byte=*/0);
+}
+#pragma clang diagnostic pop
+
 #define OPUS_CAST_DEFINE(d_, s_) template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, s_ ## _t> && std::is_same_v<D, d_ ## _t>, bool> = true> \
                                     OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return s_ ## _to_ ## d_(s, std::forward<Aux>(aux)...); }
 OPUS_CAST_DEFINE(fp16, fp32)
 OPUS_CAST_DEFINE(fp32, fp16)
 OPUS_CAST_DEFINE(bf16, fp32)
 OPUS_CAST_DEFINE(fp32, bf16)
+OPUS_CAST_DEFINE(fp8, fp32)
+OPUS_CAST_DEFINE(fp32, fp8)
 
 namespace impl {
 // implement a "pack" of data, storage should pad to multiple of byte(8bit)
@@ -967,6 +1086,26 @@ template<typename S, index_t fold_size, std::enable_if_t<is_tuple_v<S> || is_vec
 OPUS_D constexpr decltype(auto) fold_as_container_of_arr(const S& s, number<fold_size>) {
     static_assert(size<S>() % fold_size == 0);
     return fold_as_tuple_of_arr(s, make_index_seq<size<S>() / fold_size>{});
+}
+
+// Unfold a tuple-of-sub-results (produced by auto-fold cast) back into a flat container. Used in pair with above
+// matching the original input container type OrigS.
+//   OrigS is vector  -> flat vector_t<elem, total>
+//   OrigS is array   -> flat array<elem, total>
+//   OrigS is tuple   -> flat tuple<elem, elem, ...>
+template<typename Tup, index_t inner_n, index_t... Flat>
+OPUS_D constexpr auto unfold_as_tuple(const Tup& tup, number<inner_n>, seq<Flat...>) { return make_tuple(get<Flat % inner_n>(getv<Flat / inner_n>(tup))...); }
+
+template<typename OrigS, typename Tup, std::enable_if_t<is_tuple_v<Tup>, bool> = true>
+OPUS_D constexpr auto unfold_from_container(const Tup& tup) {
+    using inner_t = remove_cvref_t<decltype(getv<0>(tup))>;
+    using elem_t = get_value_t<inner_t>;
+    constexpr index_t outer_n = opus::size<Tup>();
+    constexpr index_t inner_n = opus::size<inner_t>();
+    constexpr index_t total_n = outer_n * inner_n;
+    if constexpr (is_vector_v<OrigS>) { vector_t<elem_t, total_n> r; static_for<total_n>([&](auto f) { r[f.value] = get<f.value % inner_n>(getv<f.value / inner_n>(tup)); }); return r; }
+    else if constexpr (is_array_v<OrigS>) { array<elem_t, total_n> r; static_for<total_n>([&](auto f) { r[f.value] = get<f.value % inner_n>(getv<f.value / inner_n>(tup)); }); return r; }
+    else { /* tuple */  return unfold_as_tuple(tup, number<inner_n>{}, make_index_seq<total_n>{}); }
 }
 } // namespace impl
 #if defined(__gfx950__)
@@ -1069,13 +1208,13 @@ template<typename D, typename S, typename... Aux, std::enable_if_t<((is_vector_v
 , bool> = true>
 OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
     if      constexpr (std::is_same_v<get_value_t<S>, fp32_t> && size<S>() % 4 == 0 && std::is_same_v<D, fp8_t>) { // fp32 -> fp8 , x4N
-                    return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...); }
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...)); }
     else if constexpr (std::is_same_v<get_value_t<S>, fp32_t> && size<S>() % 2 == 0 && std::is_same_v<D, fp8_t>) { // fp32 -> fp8 , x2N
-                    return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...); }
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...)); }
     else if constexpr (std::is_same_v<get_value_t<S>, fp8_t>  && size<S>() % 4 == 0 && std::is_same_v<D, fp32_t>) { // fp8 -> fp32, x4N
-                    return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...); }
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...)); }
     else if constexpr (std::is_same_v<get_value_t<S>, fp8_t>  && size<S>() % 2 == 0 && std::is_same_v<D, fp32_t>) { // fp8 -> fp32, x2N
-                    return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...); }
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...)); }
     else   return impl::cast_impl<D>(s, make_index_seq<size<S>()>{}, std::forward<Aux>(aux)...); }
 
 // entry point for vectorized cast(), for dpacks
@@ -1088,16 +1227,16 @@ OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
         if constexpr (is_packs_v<D>) { static_assert(size<S>() % D::num_packs == 0); return D::num_packs; } // TODO: do not support cast pack data one by one
         else                         { return get_value_t<S>::num_packs; } }();
     if      constexpr (std::is_same_v<get_value_t<S>, fp32_t> && size<S>() % 8 == 0 && std::is_same_v<D, fp4_t>) { // fp32 -> fp4 , x8N
-                    return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<8>{}), make_index_seq<size<S>() / 8>{}, std::forward<Aux>(aux)...); }
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<8>{}), make_index_seq<size<S>() / 8>{}, std::forward<Aux>(aux)...)); }
     else if constexpr (std::is_same_v<get_value_t<S>, fp32_t> && size<S>() % 4 == 0 && std::is_same_v<D, fp4_t>) { // fp32 -> fp4 , x4N
-                    return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...); }
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...)); }
     else if constexpr (std::is_same_v<get_value_t<S>, fp32_t> && size<S>() % 2 == 0 && std::is_same_v<D, fp4_t>) { // fp32 -> fp4 , x2N
-                    return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...); }
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...)); }
     else if constexpr (std::is_same_v<get_value_t<S>, fp4_t> && size<S>() % 4 == 0) { // fp4 -> fp32 , x8N
-                    return impl::cast_impl<D>(impl::fold_as_container_of_arr(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...); }
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_arr(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...)); }
     else if constexpr (std::is_same_v<get_value_t<S>, fp4_t> && size<S>() % 2 == 0) { // fp4 -> fp32 , x4N
-                    return impl::cast_impl<D>(impl::fold_as_container_of_arr(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...); }
-    else            return impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<num_packs_>{}), make_index_seq<size<S>() / num_packs_>{}, std::forward<Aux>(aux)...);
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_arr(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...)); }
+    else            return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<num_packs_>{}), make_index_seq<size<S>() / num_packs_>{}, std::forward<Aux>(aux)...));
 }
 
 #undef OPUS_DEFINE_DPACKS

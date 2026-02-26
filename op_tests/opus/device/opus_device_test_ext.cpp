@@ -23,6 +23,7 @@
 #include "test_dtype_convert.h"
 #include "test_load_store_if.h"
 #include "test_mdiv.h"
+#include "test_numeric_limits.h"
 #include "test_workgroup_barrier.h"
 
 // ---------- MFMA wrapper ----------
@@ -277,6 +278,8 @@ static void run_dtype_convert_torch(
         run_dtype_convert_fp32_bf16(In.data_ptr(), Out.data_ptr(), n);
     } else if (variant == "fp32_fp16") {
         run_dtype_convert_fp32_fp16(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_fp8_scalar") {
+        run_dtype_convert_fp32_fp8_scalar(In.data_ptr(), Out.data_ptr(), n);
     } else if (variant == "fp32_fp8") {
         TORCH_CHECK(n % 4 == 0,
                      "For fp32_fp8, n must be a multiple of 4 (packed x4 conversion)");
@@ -285,6 +288,30 @@ static void run_dtype_convert_torch(
         TORCH_CHECK(n % 8 == 0,
                      "For fp32_fp4, n must be a multiple of 8 (packed x8 conversion)");
         run_dtype_convert_fp32_fp4(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_bf16_vec4") {
+        TORCH_CHECK(n % 4 == 0,
+                     "For fp32_bf16_vec4, n must be a multiple of 4");
+        run_dtype_convert_fp32_bf16_vec4(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_fp16_vec4") {
+        TORCH_CHECK(n % 4 == 0,
+                     "For fp32_fp16_vec4, n must be a multiple of 4");
+        run_dtype_convert_fp32_fp16_vec4(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_fp8_x2") {
+        TORCH_CHECK(n % 2 == 0,
+                     "For fp32_fp8_x2, n must be a multiple of 2");
+        run_dtype_convert_fp32_fp8_x2(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_fp8_vec8") {
+        TORCH_CHECK(n % 8 == 0,
+                     "For fp32_fp8_vec8, n must be a multiple of 8");
+        run_dtype_convert_fp32_fp8_vec8(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_fp4_x2") {
+        TORCH_CHECK(n % 2 == 0,
+                     "For fp32_fp4_x2, n must be a multiple of 2");
+        run_dtype_convert_fp32_fp4_x2(In.data_ptr(), Out.data_ptr(), n);
+    } else if (variant == "fp32_fp4_x4") {
+        TORCH_CHECK(n % 4 == 0,
+                     "For fp32_fp4_x4, n must be a multiple of 4");
+        run_dtype_convert_fp32_fp4_x4(In.data_ptr(), Out.data_ptr(), n);
     } else {
         TORCH_CHECK(false, "Unknown dtype_convert variant: ", variant);
     }
@@ -379,6 +406,17 @@ static void run_mdiv_torch(
              static_cast<int>(divisor), n);
 }
 
+// ---------- numeric_limits wrapper ----------
+
+static void run_numeric_limits_torch(torch::Tensor Out)
+{
+    TORCH_CHECK(Out.is_cuda(), "Out must be a CUDA tensor");
+    TORCH_CHECK(Out.dtype() == torch::kInt32, "Out must be int32");
+    TORCH_CHECK(Out.numel() >= 55, "Out must have at least 55 elements");
+    TORCH_CHECK(Out.is_contiguous(), "Out must be contiguous");
+    run_numeric_limits(Out.data_ptr());
+}
+
 // ---------- workgroup_barrier wrappers ----------
 
 static void run_wb_cumulative_torch(torch::Tensor Accum, int64_t n_workgroups)
@@ -437,6 +475,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("run_predicated_async_load", &run_predicated_async_load_torch,
           "OPUS predicated async_load: copy Src -> LDS -> Dst with bounds predicate",
           py::arg("Src"), py::arg("Dst"), py::arg("n_padded"));
+    m.def("run_numeric_limits", &run_numeric_limits_torch,
+          "OPUS numeric_limits: writes min/max/lowest/quiet_nan/infinity bit patterns for all dtypes");
     m.def("run_mdiv", &run_mdiv_torch,
           "OPUS mdiv: magic division. out_q[i] = dividends[i]/divisor, "
           "out_r[i] = dividends[i]%divisor",
