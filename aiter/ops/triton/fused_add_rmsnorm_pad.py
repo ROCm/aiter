@@ -26,15 +26,18 @@ def fused_add_rmsnorm_pad(
         assert M == M2, "Shape error!"
         assert N == N2, "Shape error!"
         res_out = torch.empty((M, N), dtype=res.dtype, device=res.device)
-    BLOCK_SIZE_N = (next_power_of_2(N), 64)
+    BLOCK_SIZE_N = max(triton.next_power_of_2(N), 64)
     if (BLOCK_SIZE_N == 64):
-        num_warps = 2
+        num_warps = 1
         num_stages = 2
     elif (BLOCK_SIZE_N == 128):
-        num_warps = 4
+        num_warps = 2
         num_stages = 2
     elif (BLOCK_SIZE_N == 256):
         num_warps = 4
+        num_stages = 4
+    else:
+        num_warps = 6
         num_stages = 4
     _fused_add_rmsnorm_pad[(M,)](
         x,

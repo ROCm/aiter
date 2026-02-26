@@ -36,10 +36,11 @@ def _fused_add_rmsnorm_pad(
 ):
     tl.assume(x_stride_m > 0)
     tl.assume(x_stride_n > 0)
-    tl.assume(res_stride_m > 0)
-    tl.assume(res_stride_n > 0)
     tl.assume(out_stride_m > 0)
     tl.assume(out_stride_n > 0)
+    if HAS_RES:
+        tl.assume(res_stride_m > 0)
+        tl.assume(res_stride_n > 0)
 
     pid_m = tl.program_id(0)
     tl.assume(pid_m >= 0)
