@@ -7,6 +7,7 @@ import torch
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+from aiter.jit.utils.torch_guard import torch_compile_guard
 
 
 class _FlashAttnV3Func(torch.autograd.Function):
