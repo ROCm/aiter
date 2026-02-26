@@ -242,19 +242,25 @@ class AttentionConfig:
             self.GATHER_BLOCKED_LAYOUT = gl.constexpr(None)
         else:
             self.K_SHARED_LAYOUT = gl.constexpr(
-                gl.PaddedSharedLayout.with_identity_for(
-                    interval_padding_pairs=[[BLOCK_SIZE * HEAD_SIZE, 8]],
-                    shape=([NUM_BLOCKS_GATHER_PER_TILE, BLOCK_SIZE * HEAD_SIZE]),
-                    order=[1, 0],
-                )
+                gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
             )
             self.V_SHARED_LAYOUT = gl.constexpr(
-                gl.PaddedSharedLayout.with_identity_for(
-                    interval_padding_pairs=[[BLOCK_SIZE * HEAD_SIZE, 8]],
-                    shape=[NUM_BLOCKS_GATHER_PER_TILE, BLOCK_SIZE * HEAD_SIZE],
-                    order=[1, 0],
-                )
+                gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
             )
+            # self.K_SHARED_LAYOUT = gl.constexpr(
+            #     gl.PaddedSharedLayout.with_identity_for(
+            #         interval_padding_pairs=[[BLOCK_SIZE * HEAD_SIZE, 8]],
+            #         shape=([NUM_BLOCKS_GATHER_PER_TILE, BLOCK_SIZE * HEAD_SIZE]),
+            #         order=[1, 0],
+            #     )
+            # )
+            # self.V_SHARED_LAYOUT = gl.constexpr(
+            #     gl.PaddedSharedLayout.with_identity_for(
+            #         interval_padding_pairs=[[BLOCK_SIZE * HEAD_SIZE, 8]],
+            #         shape=[NUM_BLOCKS_GATHER_PER_TILE, BLOCK_SIZE * HEAD_SIZE],
+            #         order=[1, 0],
+            #     )
+            # )
             self.GATHER_BLOCKED_LAYOUT = gl.constexpr(
                 gl.BlockedLayout(
                     size_per_thread=[NUM_BLOCKS_GATHER_PER_TILE],
@@ -285,18 +291,22 @@ class AttentionConfig:
             )
         )
         if self.SHUFFLED_KV_CACHE:
-            # self.K_LOAD_LAYOUT = self.make_kv_cache_shuffled_layout(
-            #     self.TILE_SIZE // 16,
-            #     self.HEAD_SIZE * 16,
-            #     1,
-            # )
-            # self.V_LOAD_LAYOUT = self.make_kv_cache_shuffled_layout(
-            #     self.HEAD_SIZE // 16,
-            #     self.TILE_SIZE * 16,
-            #     NUM_WARPS,
-            # )
-            self.K_LOAD_LAYOUT = gl.constexpr(None)
-            self.V_LOAD_LAYOUT = gl.constexpr(None)
+            if self.NUM_BLOCKS_GATHER_PER_TILE == 1:
+                # self.K_LOAD_LAYOUT = self.make_kv_cache_shuffled_layout(
+                #     self.TILE_SIZE // 16,
+                #     self.HEAD_SIZE * 16,
+                #     1,
+                # )
+                # self.V_LOAD_LAYOUT = self.make_kv_cache_shuffled_layout(
+                #     self.HEAD_SIZE // 16,
+                #     self.TILE_SIZE * 16,
+                #     NUM_WARPS,
+                # )
+                self.K_LOAD_LAYOUT = gl.constexpr(None)
+                self.V_LOAD_LAYOUT = gl.constexpr(None)
+            else:
+                self.K_LOAD_LAYOUT = gl.constexpr(None)
+                self.V_LOAD_LAYOUT = gl.constexpr(None)
         else:
             self.K_LOAD_LAYOUT = gl.constexpr(None)
             self.V_LOAD_LAYOUT = gl.constexpr(None)
@@ -895,11 +905,10 @@ class AttentionProgram:
     def lds_unshuffle_k(self, buffer_id):
         return (
             self.k_shared.index(buffer_id)
-            .reshape((self.cfg.TILE_SIZE, self.cfg.HEAD_SIZE))
             .reshape(
                 (
-                    1,
-                    self.cfg.TILE_SIZE // 16,
+                    self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
+                    self.cfg.BLOCK_SIZE // 16,
                     self.cfg.HEAD_SIZE // 16,
                     2,
                     16,
@@ -915,18 +924,25 @@ class AttentionProgram:
     def lds_unshuffle_v(self, buffer_id):
         return (
             self.v_shared.index(buffer_id)
-            .reshape((self.cfg.HEAD_SIZE, self.cfg.TILE_SIZE))
             .reshape(
                 (
-                    1,
+                    self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
                     self.cfg.HEAD_SIZE // 16,
-                    self.cfg.TILE_SIZE // 16,
+                    self.cfg.BLOCK_SIZE // 16,
                     2,
                     16,
                     8,
                 )
             )
             .permute((0, 1, 4, 2, 3, 5))
+            .reshape(
+                (
+                    self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
+                    self.cfg.HEAD_SIZE,
+                    self.cfg.BLOCK_SIZE,
+                )
+            )
+            .permute((1, 0, 2))
             .reshape((self.cfg.HEAD_SIZE, self.cfg.TILE_SIZE))
             .permute((1, 0))
         )

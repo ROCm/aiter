@@ -7,11 +7,9 @@ import math
 from aiter.ops.triton.gluon.unified_attention_3d_kernel import (
     gluon_kernel_unified_attention_3d,
     gluon_kernel_unified_attention_3d_async,
-    # gluon_kernel_unified_attention_3d_tdm,
-    # gluon_kernel_unified_attention_3d_tdm_gather,
     gluon_reduce_segments,
 )
-from aiter.ops.triton.gluon.unified_attention_3d_kernel_tdm_new import (
+from aiter.ops.triton.gluon.unified_attention_3d_kernel_tdm import (
     gluon_kernel_unified_attention_3d_tdm,
 )
 from triton.experimental import gluon

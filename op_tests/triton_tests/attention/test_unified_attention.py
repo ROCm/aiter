@@ -88,10 +88,8 @@ def shuffle_kv_cache(
 DEVICE_ARCH = arch_info.get_arch()
 
 NUM_HEADS = [(64, 8)]
-HEAD_SIZES = [32, 64, 128]
+HEAD_SIZES = [64, 128]
 BLOCK_SIZES = [16, 64]
-HEAD_SIZES = [64]
-BLOCK_SIZES = [256]
 
 
 DTYPES = [torch.bfloat16]
@@ -229,7 +227,7 @@ elif os.environ.get("SCL_BACKEND") == "5":
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("q_dtype", QDTYPES)
 # @pytest.mark.parametrize("shuffled_kv_cache", [True, False])
-@pytest.mark.parametrize("shuffled_kv_cache", [True])
+@pytest.mark.parametrize("shuffled_kv_cache", [True, False])
 @pytest.mark.parametrize(
     "backend, use_tdm, num_tdm_gather, use_async",
     SCL_BACKEND,
@@ -276,18 +274,6 @@ def test_triton_unified_attn(
             if block_size < 64:
                 pytest.skip(
                     "Only block size >= 64 is supported for shuffled KV cache with gluon backend"
-                )
-
-        if use_tdm and num_tdm_gather > 1:
-            pass
-            # if head_size * block_size > 512:
-            #     pytest.skip(
-            #         "skipping test for head_size * block_size > 512 and TDM gather cases"
-            #     )
-        else:
-            if head_size * block_size <= 512 or head_size < 64:
-                pytest.skip(
-                    "skipping test for head_size * block_size <= 512 or head_size < 64 for non-TDM gather cases"
                 )
 
     # TODO: Uncomment after pytorch adds support for manual_seed
