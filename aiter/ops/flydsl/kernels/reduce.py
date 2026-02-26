@@ -3,6 +3,7 @@
 These helpers build MLIR ops (flir/gpu/scf/vector/etc). They are extracted from
 softmax/layernorm/rmsnorm kernels to de-duplicate code without changing codegen.
 """
+
 from __future__ import annotations
 
 from flydsl.dialects.ext.python_control_flow import lower_range_for_loops
@@ -15,6 +16,7 @@ def reduce_vec_max(vec_val, *, VEC_WIDTH, compute_type, vector):
     # The vector dialect expects a raw MLIR Value, not wrapper objects.
     try:
         from flydsl.dialects.ext import arith as _arith
+
         vec_val = _arith.as_value(vec_val)
     except Exception:
         pass
@@ -26,13 +28,29 @@ def reduce_vec_sum(vec_val, *, VEC_WIDTH, compute_type, vector, fm_fast):
         return vector.extract(vec_val, static_position=[0], dynamic_position=[])
     try:
         from flydsl.dialects.ext import arith as _arith
+
         vec_val = _arith.as_value(vec_val)
     except Exception:
         pass
     return vector.reduction(compute_type, "add", vec_val, fastmath=fm_fast)
 
 
-def make_block_reduce(*, tid, BLOCK_SIZE, compute_type, arith, gpu, flir, s_red_tv, T, ir, c_zero, c_neg_inf, c_zero_idx, fm_fast):
+def make_block_reduce(
+    *,
+    tid,
+    BLOCK_SIZE,
+    compute_type,
+    arith,
+    gpu,
+    flir,
+    s_red_tv,
+    T,
+    ir,
+    c_zero,
+    c_neg_inf,
+    c_zero_idx,
+    fm_fast,
+):
     """Return a `block_reduce(val, reduce_op_name)` function (softmax-style)."""
 
     def block_reduce(val, reduce_op_name):
@@ -59,18 +77,24 @@ def make_block_reduce(*, tid, BLOCK_SIZE, compute_type, arith, gpu, flir, s_red_
         # Intra-wave reduction via xor shuffle
         for sh in [32, 16, 8, 4, 2, 1]:
             off = arith.as_value(arith.constant(sh, type=T.i32()))
-            peer = arith.as_value(gpu.ShuffleOp(arith.as_value(w), off, width_i32, mode="xor").shuffleResult)
+            peer = arith.as_value(
+                gpu.ShuffleOp(
+                    arith.as_value(w), off, width_i32, mode="xor"
+                ).shuffleResult
+            )
             if reduce_op_name == "max":
                 w = flir.arith.MaximumFOp(arith.as_value(w), peer).result
             else:
                 w = flir.arith.AddFOp(arith.as_value(w), peer, fastmath=fm_fast).result
 
         # lane0 writes per-wave partial into LDS s_red[wave_id]
-        is_lane0 = arith.as_value(flir.arith.CmpIOp(
-            flir.arith.CmpIPredicate.eq,
-            lane_i32,
-            arith.as_value(arith.constant(0, type=T.i32())),
-        ).result)
+        is_lane0 = arith.as_value(
+            flir.arith.CmpIOp(
+                flir.arith.CmpIPredicate.eq,
+                lane_i32,
+                arith.as_value(arith.constant(0, type=T.i32())),
+            ).result
+        )
         if is_lane0:
             wave_idx = flir.arith.IndexCastOp(T.index(), wave_i32).result
             red_idx = flir.crd2idx(flir.make_coord(wave_idx), layout_red)
@@ -78,22 +102,30 @@ def make_block_reduce(*, tid, BLOCK_SIZE, compute_type, arith, gpu, flir, s_red_
         gpu.barrier()
 
         # wave0 reduces NUM_WAVES partials (still using shuffle)
-        is_wave0 = arith.as_value(flir.arith.CmpIOp(
-            flir.arith.CmpIPredicate.eq,
-            wave_i32,
-            arith.as_value(arith.constant(0, type=T.i32())),
-        ).result)
+        is_wave0 = arith.as_value(
+            flir.arith.CmpIOp(
+                flir.arith.CmpIPredicate.eq,
+                wave_i32,
+                arith.as_value(arith.constant(0, type=T.i32())),
+            ).result
+        )
         if is_wave0:
-            in_range = arith.as_value(flir.arith.CmpIOp(
-                flir.arith.CmpIPredicate.ult,
-                lane_i32,
-                arith.as_value(arith.constant(NUM_WAVES, type=T.i32())),
-            ).result)
+            in_range = arith.as_value(
+                flir.arith.CmpIOp(
+                    flir.arith.CmpIPredicate.ult,
+                    lane_i32,
+                    arith.as_value(arith.constant(NUM_WAVES, type=T.i32())),
+                ).result
+            )
 
             # Predicated load: clamp lane index to 0 when out-of-range, then select.
             c0_i32 = arith.as_value(arith.constant(0, type=T.i32()))
-            lane_safe_i32 = arith.as_value(flir.arith.SelectOp(in_range, lane_i32, c0_i32).result)
-            lane_safe_idx = arith.as_value(flir.arith.IndexCastOp(T.index(), lane_safe_i32).result)
+            lane_safe_i32 = arith.as_value(
+                flir.arith.SelectOp(in_range, lane_i32, c0_i32).result
+            )
+            lane_safe_idx = arith.as_value(
+                flir.arith.IndexCastOp(T.index(), lane_safe_i32).result
+            )
             red_idx = flir.crd2idx(flir.make_coord(lane_safe_idx), layout_red)
             v = arith.as_value(s_red_tv[red_idx])
             neutral = arith.as_value(c_neg_inf if reduce_op_name == "max" else c_zero)
@@ -101,18 +133,26 @@ def make_block_reduce(*, tid, BLOCK_SIZE, compute_type, arith, gpu, flir, s_red_
 
             for sh in [32, 16, 8, 4, 2, 1]:
                 off = arith.as_value(arith.constant(sh, type=T.i32()))
-                peer = arith.as_value(gpu.ShuffleOp(arith.as_value(ww), off, width_i32, mode="xor").shuffleResult)
+                peer = arith.as_value(
+                    gpu.ShuffleOp(
+                        arith.as_value(ww), off, width_i32, mode="xor"
+                    ).shuffleResult
+                )
                 if reduce_op_name == "max":
                     ww = flir.arith.MaximumFOp(arith.as_value(ww), peer).result
                 else:
-                    ww = flir.arith.AddFOp(arith.as_value(ww), peer, fastmath=fm_fast).result
+                    ww = flir.arith.AddFOp(
+                        arith.as_value(ww), peer, fastmath=fm_fast
+                    ).result
 
             # lane0 writes final to s_red[0]
-            is_lane0_2 = arith.as_value(flir.arith.CmpIOp(
-                flir.arith.CmpIPredicate.eq,
-                lane_i32,
-                arith.as_value(arith.constant(0, type=T.i32())),
-            ).result)
+            is_lane0_2 = arith.as_value(
+                flir.arith.CmpIOp(
+                    flir.arith.CmpIPredicate.eq,
+                    lane_i32,
+                    arith.as_value(arith.constant(0, type=T.i32())),
+                ).result
+            )
             if is_lane0_2:
                 red_idx0 = flir.crd2idx(flir.make_coord(c_zero_idx), layout_red)
                 s_red_tv[red_idx0] = ww
@@ -127,7 +167,21 @@ def make_block_reduce(*, tid, BLOCK_SIZE, compute_type, arith, gpu, flir, s_red_
         return block_reduce
 
 
-def make_block_reduce_add(*, tid, fm_fast, WARP_SIZE, RED_SLOTS, gpu, arith, arith_ops, flir, T, ir, zero_idx, scratch_tv_shape_stride=(None, None)):
+def make_block_reduce_add(
+    *,
+    tid,
+    fm_fast,
+    WARP_SIZE,
+    RED_SLOTS,
+    gpu,
+    arith,
+    arith_ops,
+    flir,
+    T,
+    ir,
+    zero_idx,
+    scratch_tv_shape_stride=(None, None),
+):
     """Return a `block_reduce_add(val_f32, scratch_memref)` function (norm-style)."""
     shape_unused, stride_unused = scratch_tv_shape_stride
     _ = shape_unused
@@ -141,8 +195,14 @@ def make_block_reduce_add(*, tid, fm_fast, WARP_SIZE, RED_SLOTS, gpu, arith, ari
             w = arith.as_value(val_f32)
             for sh in [32, 16, 8, 4, 2, 1]:
                 off = arith.as_value(arith.constant(sh, type=T.i32()))
-                peer = arith.as_value(gpu.ShuffleOp(arith.as_value(w), off, width_i32, mode="xor").shuffleResult)
-                w = arith.as_value(arith_ops.AddFOp(arith.as_value(w), peer, fastmath=fm_fast).result)
+                peer = arith.as_value(
+                    gpu.ShuffleOp(
+                        arith.as_value(w), off, width_i32, mode="xor"
+                    ).shuffleResult
+                )
+                w = arith.as_value(
+                    arith_ops.AddFOp(arith.as_value(w), peer, fastmath=fm_fast).result
+                )
             return w
 
         scratch_tv = flir.make_tensor(scratch_memref, shape=(RED_SLOTS,), strides=(1,))
@@ -163,14 +223,22 @@ def make_block_reduce_add(*, tid, fm_fast, WARP_SIZE, RED_SLOTS, gpu, arith, ari
         w = arith.as_value(val_f32)
         for sh in [32, 16, 8, 4, 2, 1]:
             off = arith.as_value(arith.constant(sh, type=T.i32()))
-            peer = arith.as_value(gpu.ShuffleOp(arith.as_value(w), off, width_i32, mode="xor").shuffleResult)
-            w = arith.as_value(arith_ops.AddFOp(arith.as_value(w), peer, fastmath=fm_fast).result)
+            peer = arith.as_value(
+                gpu.ShuffleOp(
+                    arith.as_value(w), off, width_i32, mode="xor"
+                ).shuffleResult
+            )
+            w = arith.as_value(
+                arith_ops.AddFOp(arith.as_value(w), peer, fastmath=fm_fast).result
+            )
 
-        is_lane0 = arith.as_value(arith_ops.CmpIOp(
-            arith_ops.CmpIPredicate.eq,
-            lane_i32,
-            arith.as_value(arith.constant(0, type=T.i32())),
-        ).result)
+        is_lane0 = arith.as_value(
+            arith_ops.CmpIOp(
+                arith_ops.CmpIPredicate.eq,
+                lane_i32,
+                arith.as_value(arith.constant(0, type=T.i32())),
+            ).result
+        )
         if is_lane0:
             wave_idx = arith_ops.IndexCastOp(T.index(), wave_i32).result
             red_idx = flir.crd2idx(flir.make_coord(wave_idx), layout_red)
@@ -178,22 +246,30 @@ def make_block_reduce_add(*, tid, fm_fast, WARP_SIZE, RED_SLOTS, gpu, arith, ari
         gpu.barrier()
 
         NUM_WAVES = RED_SLOTS
-        is_wave0 = arith.as_value(arith_ops.CmpIOp(
-            arith_ops.CmpIPredicate.eq,
-            wave_i32,
-            arith.as_value(arith.constant(0, type=T.i32())),
-        ).result)
+        is_wave0 = arith.as_value(
+            arith_ops.CmpIOp(
+                arith_ops.CmpIPredicate.eq,
+                wave_i32,
+                arith.as_value(arith.constant(0, type=T.i32())),
+            ).result
+        )
         # Only wave0 does final reduction and writes scratch[0].
         if is_wave0:
-            in_range = arith.as_value(arith_ops.CmpIOp(
-                arith_ops.CmpIPredicate.ult,
-                lane_i32,
-                arith.as_value(arith.constant(NUM_WAVES, type=T.i32())),
-            ).result)
+            in_range = arith.as_value(
+                arith_ops.CmpIOp(
+                    arith_ops.CmpIPredicate.ult,
+                    lane_i32,
+                    arith.as_value(arith.constant(NUM_WAVES, type=T.i32())),
+                ).result
+            )
 
             c0_i32 = arith.as_value(arith.constant(0, type=T.i32()))
-            lane_safe_i32 = arith.as_value(flir.arith.SelectOp(in_range, lane_i32, c0_i32).result)
-            lane_safe_idx = arith.as_value(arith_ops.IndexCastOp(T.index(), lane_safe_i32).result)
+            lane_safe_i32 = arith.as_value(
+                flir.arith.SelectOp(in_range, lane_i32, c0_i32).result
+            )
+            lane_safe_idx = arith.as_value(
+                arith_ops.IndexCastOp(T.index(), lane_safe_i32).result
+            )
             red_idx = flir.crd2idx(flir.make_coord(lane_safe_idx), layout_red)
             v = scratch_tv[red_idx]
             z = arith.as_value(arith.constant(0.0, type=T.f32()))
@@ -201,14 +277,22 @@ def make_block_reduce_add(*, tid, fm_fast, WARP_SIZE, RED_SLOTS, gpu, arith, ari
 
             for sh in [32, 16, 8, 4, 2, 1]:
                 off = arith.as_value(arith.constant(sh, type=T.i32()))
-                peer = arith.as_value(gpu.ShuffleOp(arith.as_value(ww), off, width_i32, mode="xor").shuffleResult)
-                ww = arith.as_value(arith_ops.AddFOp(arith.as_value(ww), peer, fastmath=fm_fast).result)
+                peer = arith.as_value(
+                    gpu.ShuffleOp(
+                        arith.as_value(ww), off, width_i32, mode="xor"
+                    ).shuffleResult
+                )
+                ww = arith.as_value(
+                    arith_ops.AddFOp(arith.as_value(ww), peer, fastmath=fm_fast).result
+                )
 
-            is_lane0_2 = arith.as_value(arith_ops.CmpIOp(
-                arith_ops.CmpIPredicate.eq,
-                lane_i32,
-                arith.as_value(arith.constant(0, type=T.i32())),
-            ).result)
+            is_lane0_2 = arith.as_value(
+                arith_ops.CmpIOp(
+                    arith_ops.CmpIPredicate.eq,
+                    lane_i32,
+                    arith.as_value(arith.constant(0, type=T.i32())),
+                ).result
+            )
             if is_lane0_2:
                 red_idx0 = flir.crd2idx(flir.make_coord(zero_idx), layout_red)
                 scratch_tv[red_idx0] = ww
@@ -223,7 +307,9 @@ def make_block_reduce_add(*, tid, fm_fast, WARP_SIZE, RED_SLOTS, gpu, arith, ari
         return block_reduce_add
 
 
-def make_block_reduce_add2(*, tid, fm_fast, WARP_SIZE, RED_SLOTS, gpu, arith, arith_ops, flir, T, ir, zero_idx):
+def make_block_reduce_add2(
+    *, tid, fm_fast, WARP_SIZE, RED_SLOTS, gpu, arith, arith_ops, flir, T, ir, zero_idx
+):
     """Return a `block_reduce_add2(a_f32, b_f32, scratch_a, scratch_b)` function.
 
     This is NOT pair-reduce: it reduces two independent scalars but shares the same
@@ -237,9 +323,13 @@ def make_block_reduce_add2(*, tid, fm_fast, WARP_SIZE, RED_SLOTS, gpu, arith, ar
         for sh in [32, 16, 8, 4, 2, 1]:
             off = arith.as_value(arith.constant(sh, type=T.i32()))
             peer = arith.as_value(
-                gpu.ShuffleOp(arith.as_value(w), off, width_i32, mode="xor").shuffleResult
+                gpu.ShuffleOp(
+                    arith.as_value(w), off, width_i32, mode="xor"
+                ).shuffleResult
             )
-            w = arith.as_value(arith_ops.AddFOp(arith.as_value(w), peer, fastmath=fm_fast).result)
+            w = arith.as_value(
+                arith_ops.AddFOp(arith.as_value(w), peer, fastmath=fm_fast).result
+            )
         return w
 
     def block_reduce_add2(val0_f32, val1_f32, scratch0_memref, scratch1_memref):
@@ -247,8 +337,12 @@ def make_block_reduce_add2(*, tid, fm_fast, WARP_SIZE, RED_SLOTS, gpu, arith, ar
         if RED_SLOTS == 1:
             return _wave_reduce_add(val0_f32), _wave_reduce_add(val1_f32)
 
-        scratch0_tv = flir.make_tensor(scratch0_memref, shape=(RED_SLOTS,), strides=(1,))
-        scratch1_tv = flir.make_tensor(scratch1_memref, shape=(RED_SLOTS,), strides=(1,))
+        scratch0_tv = flir.make_tensor(
+            scratch0_memref, shape=(RED_SLOTS,), strides=(1,)
+        )
+        scratch1_tv = flir.make_tensor(
+            scratch1_memref, shape=(RED_SLOTS,), strides=(1,)
+        )
 
         tid_v = tid.value if hasattr(tid, "value") else tid
         tid_v = arith.as_value(tid_v)
@@ -301,8 +395,12 @@ def make_block_reduce_add2(*, tid, fm_fast, WARP_SIZE, RED_SLOTS, gpu, arith, ar
             )
 
             c0_i32 = arith.as_value(arith.constant(0, type=T.i32()))
-            lane_safe_i32 = arith.as_value(flir.arith.SelectOp(in_range, lane_i32, c0_i32).result)
-            lane_safe_idx = arith.as_value(arith_ops.IndexCastOp(T.index(), lane_safe_i32).result)
+            lane_safe_i32 = arith.as_value(
+                flir.arith.SelectOp(in_range, lane_i32, c0_i32).result
+            )
+            lane_safe_idx = arith.as_value(
+                arith_ops.IndexCastOp(T.index(), lane_safe_i32).result
+            )
             red_idx = flir.crd2idx(flir.make_coord(lane_safe_idx), layout_red)
             v0 = scratch0_tv[red_idx]
             v1 = scratch1_tv[red_idx]

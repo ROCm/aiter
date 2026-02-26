@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from _mlir import ir
 
+
 @dataclass(frozen=True)
 class PreshuffleBLayout:
     """Container returned by `make_preshuffle_b_layout`."""
@@ -59,7 +60,11 @@ def make_preshuffle_b_layout(
     n0 = c_n / c16
 
     # Layout is expressed in ELEMENT units (not bytes). Convert KPackBytes -> KPackElems.
-    c_kpack_elems = c_kpack if elem_bytes == 1 else (c_kpack / arith.constant(int(elem_bytes), index=True))
+    c_kpack_elems = (
+        c_kpack
+        if elem_bytes == 1
+        else (c_kpack / arith.constant(int(elem_bytes), index=True))
+    )
 
     # Strides derived from the layout shape:
     # - KPack stride = 1
@@ -72,10 +77,10 @@ def make_preshuffle_b_layout(
     stride_n0 = c_k0 * stride_k0
 
     stride_b = (
-        stride_n0,      # n0
-        stride_k0,      # k0
-        stride_klane,   # k1 (KLane)
-        stride_nlane,   # n1
+        stride_n0,  # n0
+        stride_k0,  # k0
+        stride_klane,  # k1 (KLane)
+        stride_nlane,  # n1
         arith.constant(1, index=True),  # k2
     )
     layout_b = flir.make_layout((n0, c_k0, c4, c16, c_kpack_elems), stride=stride_b)
@@ -112,7 +117,9 @@ def make_preshuffle_scale_layout(
 
     # We keep the same 64B K0 "macro-step" used by CK/aiter preshuffle.
     if elem_bytes != mn_pack * k_pack:
-        raise ValueError(f"elem_bytes of scale must be {mn_pack} * {k_pack}, got {elem_bytes!r}")
+        raise ValueError(
+            f"elem_bytes of scale must be {mn_pack} * {k_pack}, got {elem_bytes!r}"
+        )
 
     # Strides derived from the layout shape:
     # - KPack stride = 1
@@ -125,10 +132,10 @@ def make_preshuffle_scale_layout(
     stride_n0 = c_k1 * stride_k0
 
     stride_b_scale = (
-        stride_n0,      # n0
-        stride_k0,      # k0
-        stride_klane,   # KLane
-        stride_nlane,   # NLane
+        stride_n0,  # n0
+        stride_k0,  # k0
+        stride_klane,  # KLane
+        stride_nlane,  # NLane
     )
     layout_b = flir.make_layout((c_mn1, c_k1, c4, c16), stride=stride_b_scale)
     return layout_b
@@ -375,7 +382,11 @@ def lds_store_16b_xor16(
         raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
     col_local_bytes = col_local_i32 * tx_c4
     col_swz_bytes = flir.swizzle_xor16(row_local, col_local_bytes, k_blocks16)
-    col_swz = col_swz_bytes if elem_bytes == 1 else (col_swz_bytes / arith.constant(2, index=True))
+    col_swz = (
+        col_swz_bytes
+        if elem_bytes == 1
+        else (col_swz_bytes / arith.constant(2, index=True))
+    )
     coord_store = flir.make_coord(row_local, col_swz)
     idx0 = flir.crd2idx(coord_store, layout_lds)
     idx0 = idx0 + lds_base
@@ -414,7 +425,11 @@ def lds_store_8b_xor16(
         raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
     col_local_bytes = col_local_i32 * tx_c4
     col_swz_bytes = flir.swizzle_xor16(row_local, col_local_bytes, k_blocks16)
-    col_swz = col_swz_bytes if elem_bytes == 1 else (col_swz_bytes / arith.constant(2, index=True))
+    col_swz = (
+        col_swz_bytes
+        if elem_bytes == 1
+        else (col_swz_bytes / arith.constant(2, index=True))
+    )
     coord_store = flir.make_coord(row_local, col_swz)
     idx0 = flir.crd2idx(coord_store, layout_lds)
     idx0 = idx0 + lds_base
@@ -453,7 +468,11 @@ def lds_store_4b_xor16(
         raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
     col_local_bytes = col_local_i32 * tx_c4
     col_swz_bytes = flir.swizzle_xor16(row_local, col_local_bytes, k_blocks16)
-    col_swz = col_swz_bytes if elem_bytes == 1 else (col_swz_bytes / arith.constant(2, index=True))
+    col_swz = (
+        col_swz_bytes
+        if elem_bytes == 1
+        else (col_swz_bytes / arith.constant(2, index=True))
+    )
     coord_store = flir.make_coord(row_local, col_swz)
     idx0 = flir.crd2idx(coord_store, layout_lds)
     idx0 = idx0 + lds_base
@@ -522,4 +541,3 @@ __all__ = [
     "load_b_pack_k32",
     "tile_chunk_coord_i32",
 ]
-

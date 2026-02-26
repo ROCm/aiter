@@ -140,6 +140,7 @@ def c_shuffle_epilog(
             num_acc_n=num_acc_n,
             lds_out=lds_out,
         )
+
     # Ensure all LDS reads finished before the lds write.
     gpu.barrier()
     default_epilog(
@@ -179,7 +180,9 @@ def c_shuffle_epilog(
         row = bx_m_v + row_local
 
         row_ctx_raw = (
-            precompute_row(row_local=row_local, row=row) if precompute_row is not None else None
+            precompute_row(row_local=row_local, row=row)
+            if precompute_row is not None
+            else None
         )
 
         # Optional row-level predicate: if `precompute_row` returns `(ctx, pred_i1)` and `scf`
@@ -288,4 +291,3 @@ def mfma_epilog(
         precompute_row=precompute_row,
         store_pair=store_pair,
     )
-
