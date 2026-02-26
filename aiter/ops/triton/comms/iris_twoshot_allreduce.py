@@ -691,9 +691,6 @@ class IrisTwoshotManager:
 
         # Copy input to symmetric heap
         iris_input.copy_(input_tensor)
-        shmem.device_barrier()
-        # Account for the device_barrier epoch consumed above
-        self._barrier_epoch += 1
 
         # FP8 max value
         fp8_max = torch.finfo(quant_dtype).max
@@ -750,11 +747,7 @@ class IrisTwoshotManager:
             residual is not None,
         )
 
-        # Advance epoch for the inlined barrier we just consumed
-        self._barrier_epoch += 1
-
-        # Post-kernel device barrier (ensure all ranks finished)
-        shmem.device_barrier()
+        # Advance epoch for the inlined barrier consumed by the kernel
         self._barrier_epoch += 1
 
         # Return allreduce_out as a view from the heap buffer
