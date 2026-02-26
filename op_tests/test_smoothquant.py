@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
@@ -62,19 +62,28 @@ def run_ck_moe_smoothquant(
     return output, y_scale
 
 
-@perftest(num_iters=2)
+@perftest()
 def run_hip(
-    input, x_scale, y_scale_dtype=dtypes.fp32, quant_dtype=dtypes.i8, topk_id=None
+    input,
+    x_scale,
+    y_scale_dtype=dtypes.fp32,
+    quant_dtype=dtypes.i8,
+    topk_id=None,
+    transpose_mk=False,
 ):
     output = torch.empty(
         input.shape,
         dtype=quant_dtype,
         device=input.device,
     )
+    if transpose_mk and input.dim() == 3:
+        output = output.view(input.shape[1], input.shape[0], -1).transpose(0, 1)
     y_scale = torch.empty((*input.shape[:-1], 1), device="cuda", dtype=y_scale_dtype)
     aiter.smooth_per_token_scaled_quant(
         output, input, y_scale, x_scale, smooth_scale_map=topk_id
     )
+    if transpose_mk and input.dim() == 3:
+        output = output.transpose(0, 1).view(input.shape)
     return output, y_scale
 
 
@@ -116,10 +125,10 @@ def test_topK_Smoothquant_instance(
 
 @benchmark()
 def test_moe_Smoothquant_instance(
-    dtype, m, n, xscaleType, quant_dtype, topk=2, expert=2
+    dtype, m, n, xscaleType, quant_dtype, topk=3, expert=3
 ):
     dim = (m, 1, n)
-    input = torch.ones(dim, dtype=dtype, device="cuda")
+    input = torch.randn(dim, dtype=dtype, device="cuda")
     xscale = torch.randn((expert, n), dtype=xscaleType, device="cuda")
     # topk_id = torch.randint(0, expert, (m, topk), dtype=dtypes.i32, device="cuda")
     topk_id = torch.tensor([list(range(0, topk))] * m, dtype=dtypes.i32, device="cuda")
@@ -131,17 +140,17 @@ def test_moe_Smoothquant_instance(
         x_scale=xscale,
         topk_id=topk_id,
         quant_dtype=quant_dtype,
+        transpose_mk=True,
     )
     (c, yscale_c), avg_c = run_ck_moe_smoothquant(
         input, x_scale=xscale, topk_id=topk_id, quant_dtype=quant_dtype
     )
 
+    a = a.transpose(0, 1).contiguous().view(m, topk, -1)
+    yscale_a = yscale_a.view(m, topk, 1).transpose(0, 1).contiguous().view(m, topk, -1)
+
     err_b = checkAllclose(a.to(dtypes.fp32), b.to(dtypes.fp32), rtol=0.01, atol=0.01)
     checkAllclose(yscale_a, yscale_b, rtol=1e-3, atol=1e-3)
-
-    _, ids = torch.sort(topk_id.view(-1))
-    a = a.view(-1, n)[ids].view(m, topk, n)
-    yscale_a = yscale_a.view(-1, 1)[ids].view(m, topk, 1)
 
     err_c = checkAllclose(a.to(dtypes.fp32), c.to(dtypes.fp32), rtol=0.01, atol=0.01)
     checkAllclose(yscale_a, yscale_c, rtol=1e-3, atol=1e-3)

@@ -65,10 +65,10 @@ def rmsnorm2d_fwd(
     epsilon: float,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> Tensor:
-    out = torch.empty_like(input, dtype=input.dtype, device=input.device)
     if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
-        rmsnorm2d_fwd_ck(out, input, weight, epsilon, use_model_sensitive_rmsnorm)
+        out = rmsnorm2d_fwd_ck(input, weight, epsilon, use_model_sensitive_rmsnorm)
     else:
+        out = torch.empty_like(input, dtype=input.dtype, device=input.device)
         rmsnorm(out, input, weight, epsilon)
     return out
 

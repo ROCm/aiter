@@ -1,6 +1,5 @@
 import torch
-import os
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 from .fwd_prefill import attention_forward_prefill_triton_impl
 from .fwd_decode import attention_forward_decode_triton_impl
 from .bwd import attention_backward_triton_impl
@@ -29,7 +28,7 @@ def fwd(
     softcap: float,
     return_softmax: bool,
     gen_: Optional[torch.Tensor] = None,
-):
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
 
     # Reject FP8 tensors (FA2 AMD path does not support FP8)
     if str(q.dtype).startswith("torch.float8"):
@@ -50,7 +49,7 @@ def fwd(
         print("k:", k.shape)
         print("v:", v.shape)
         print("out:", out.shape if out is not None else None)
-        print("alibi_slopes:", alibi_slopes)
+        print("alibi_slopes:", alibi_slopes.shape if alibi_slopes is not None else None)
         print("dropout_p:", dropout_p)
         print("softmax_scale:", softmax_scale)
         print("causal:", causal)
@@ -65,7 +64,7 @@ def fwd(
         out.zero_()
 
     # Layout / shapes
-    layout = "bshd"
+    layout: Literal["bshd", "bhsd", "thd"] = "bshd"
     max_seqlen_q = q.shape[1]
     max_seqlen_k = k.shape[1]
     batch, _, nheads_q, _ = q.shape
@@ -161,8 +160,8 @@ def fwd(
 
     if DEBUG:
         print("flash_attn_triton_amd.py::fwd outputs")
-        print("o:", out.shape if out is not None else None)
-        print("softmax_lse:", softmax_lse.shape if softmax_lse is not None else None)
+        print("out:", out.shape)
+        print("softmax_lse:", softmax_lse.shape)
         print("sd_mask:", sd_mask.shape if sd_mask is not None else None)
         print("rng_state:", rng_state)
 
@@ -226,16 +225,25 @@ def bwd(
     deterministic: bool,
     gen_: Optional[torch.Tensor] = None,
     rng_state: Optional[torch.Tensor] = None,
-):
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if softcap != 0.0:
         raise NotImplementedError(
             "softcap is not supported in the AMD Triton FA2 interface (expected 0.0)."
         )
 
+    # Check for sliding window - backward doesn't support it yet
+    is_sliding_window = (window_size_left >= 0) or (window_size_right >= 0)
+    if is_sliding_window:
+        raise NotImplementedError(
+            f"Sliding window attention is not yet supported in the AMD Triton backward pass "
+            f"(window_size_left={window_size_left}, window_size_right={window_size_right}). "
+            f"Use window_size=(-1, -1) for full attention."
+        )
+
     if DEBUG:
         print()
         print("flash_attn_triton_amd.py::bwd inputs")
-        print("dout:", dout, dout.shape)
+        print("dout:", dout.shape)
         print("q:", q.shape)
         print("k:", k.shape)
         print("v:", v.shape)
@@ -244,15 +252,13 @@ def bwd(
         print("dq:", dq.shape if dq is not None else None)
         print("dk:", dk.shape if dk is not None else None)
         print("dv:", dv.shape if dv is not None else None)
-        print("alibi_slopes:", alibi_slopes)
+        print("alibi_slopes:", alibi_slopes.shape if alibi_slopes is not None else None)
         print("dropout_p:", dropout_p)
-        print("out:", out)
         print("softmax_scale:", softmax_scale)
         print("causal:", causal)
         print("window_size_left:", window_size_left)
         print("window_size_right:", window_size_right)
         print("deterministic:", deterministic)
-        print("gen_:", gen_)
         print("rng_state:", rng_state)
 
     dq = torch.zeros_like(q) if dq is None else dq.zero_()
@@ -322,9 +328,9 @@ def bwd(
 
     if DEBUG:
         print("flash_attn_triton_amd.py::bwd outputs")
-        print("dv:", dv, dv.shape)
-        print("dk:", dk, dk.shape)
-        print("dq:", dq, dq.shape)
+        print("dq:", dq.shape)
+        print("dk:", dk.shape)
+        print("dv:", dv.shape)
     # --- Assertions ---
     assert dq.shape == q.shape, f"[bwd] dq shape {dq.shape} != q shape {q.shape}"
     assert dk.shape == k.shape, f"[bwd] dk shape {dk.shape} != k shape {k.shape}"
@@ -362,7 +368,7 @@ def varlen_fwd(
     softcap: float,
     return_softmax: bool,
     gen_: Optional[torch.Tensor] = None,
-):
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
 
     if str(q.dtype).startswith("torch.float8"):
         raise NotImplementedError(
@@ -406,7 +412,7 @@ def varlen_fwd(
     out = torch.zeros_like(q) if out is None else out.zero_()
 
     # Layout and basic info for varlen
-    layout = "thd"
+    layout: Literal["bshd", "bhsd", "thd"] = "thd"
     batch = len(cu_seqlens_q) - 1
     total_q, nheads_q, _ = q.shape
 
@@ -557,7 +563,7 @@ def varlen_bwd(
     deterministic: bool,
     gen_: Optional[torch.Tensor] = None,
     rng_state: Optional[torch.Tensor] = None,
-):
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if str(q.dtype).startswith("torch.float8"):
         raise NotImplementedError(
             "FP8 tensors are not supported in the AMD Triton FA2 interface (varlen_bwd). Use the FA3 path instead."
@@ -682,7 +688,7 @@ def fwd_kvcache(
     v_cache: torch.Tensor,
     k: Optional[torch.Tensor],
     v: Optional[torch.Tensor],
-    cache_seqlens: Optional[Union[(int, torch.Tensor)]],
+    cache_seqlens: Optional[Union[int, torch.Tensor]],
     rotary_cos: Optional[torch.Tensor],
     rotary_sin: Optional[torch.Tensor],
     cache_batch_idx: Optional[torch.Tensor],
@@ -697,7 +703,7 @@ def fwd_kvcache(
     softcap: float,
     rotary_interleaved: bool,
     num_splits: int,
-):
+) -> tuple[torch.Tensor, torch.Tensor]:
 
     if softcap != 0.0:
         raise NotImplementedError(
@@ -736,9 +742,9 @@ def fwd_kvcache(
     out = torch.zeros_like(q) if out is None else out.zero_()
 
     # Basic layout info for decode path
-    layout = "bshd"
-    max_seqlen_q = q.shape[1]
-    max_seqlen_k = k_cache.shape[1]
+    layout: Literal["bshd"] = "bshd"
+    q.shape[1]
+    k_cache.shape[1]
     cache_seqlens_tensor = (
         torch.tensor(cache_seqlens, device=q.device)
         if isinstance(cache_seqlens, int)
