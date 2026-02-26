@@ -11,16 +11,17 @@ import aiter.ops.triton.utils._triton.arch_info as arch_info
 from triton.language.core import _aggregate as aggregate
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-# from aiter.ops.triton.gluon.unified_attention_3d import make_kv_shuffled_layout
+import math
 
 # from triton._C.libtriton.gluon_ir import make_cga_layout
 
 DEVICE_ARCH = arch_info.get_arch()
+IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 MMA_operation: gl.constexpr = (
-    gl.amd.gfx1250.wmma
-    if gl.constexpr(DEVICE_ARCH in ("gfx1250",))
-    else gl.amd.cdna4.mfma
+    gl.amd.gfx1250.wmma if gl.constexpr(IS_DEVICE_ARCH_GFX12) else gl.amd.cdna4.mfma
 )
+WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
+WAPR_SIZE_LOG2 = int(math.log2(WARP_SIZE))
 
 float8_info = torch.finfo(e4m3_dtype)
 
@@ -140,9 +141,11 @@ class AttentionConfig:
         assert NUM_WARPS == 2 or NUM_WARPS == 4
 
         if NUM_WARPS == 2:
-            warp_bases = [(0, 1)]
+            warp_bases_qk = [(1, 0)]
+            warp_bases_pv = [(0, 1)]
         elif NUM_WARPS == 4:
-            warp_bases = [(0, 1), (0, 2)]
+            warp_bases_qk = [(1, 0), (2, 0)]
+            warp_bases_pv = [(0, 1), (0, 2)]
 
         # gl.static_assert(
         #     WARP_SIZE == 32 or WARP_SIZE == 64, "WARP_SIZE must be 32 or 64"
@@ -153,7 +156,8 @@ class AttentionConfig:
             gl.amd.AMDWMMALayout(
                 version=3,
                 transposed=True,
-                warp_bases=warp_bases,
+                warp_bases=warp_bases_qk,
+                # warp_bases=[(1 << i, 0) for i in range(int(math.log2(NUM_WARPS)))],
                 reg_bases=[],
                 instr_shape=[16, 16, 32],
             )
@@ -163,7 +167,8 @@ class AttentionConfig:
             gl.amd.AMDWMMALayout(
                 version=3,
                 transposed=True,
-                warp_bases=warp_bases,
+                warp_bases=warp_bases_pv,
+                # warp_bases=[(0, 1 << i) for i in range(int(math.log2(NUM_WARPS)))],
                 reg_bases=[],
                 instr_shape=[16, 16, 32],
             )
@@ -280,22 +285,94 @@ class AttentionConfig:
             )
         )
         if self.SHUFFLED_KV_CACHE:
-            self.K_LOAD_LAYOUT = make_kv_shuffled_layout(
-                self.TILE_SIZE // 16,
-                self.HEAD_SIZE * 16,
-                NUM_WARPS,
-            )
-            self.V_LOAD_LAYOUT = make_kv_shuffled_layout(
-                self.HEAD_SIZE // 16,
-                self.TILE_SIZE * 16,
-                NUM_WARPS,
-            )
+            # self.K_LOAD_LAYOUT = self.make_kv_cache_shuffled_layout(
+            #     self.TILE_SIZE // 16,
+            #     self.HEAD_SIZE * 16,
+            #     1,
+            # )
+            # self.V_LOAD_LAYOUT = self.make_kv_cache_shuffled_layout(
+            #     self.HEAD_SIZE // 16,
+            #     self.TILE_SIZE * 16,
+            #     NUM_WARPS,
+            # )
+            self.K_LOAD_LAYOUT = gl.constexpr(None)
+            self.V_LOAD_LAYOUT = gl.constexpr(None)
         else:
             self.K_LOAD_LAYOUT = gl.constexpr(None)
             self.V_LOAD_LAYOUT = gl.constexpr(None)
 
         self.q_cache_modifier = gl.constexpr(".cg")
         self.kv_cache_modifier = gl.constexpr("")
+
+    @gluon.constexpr_function
+    def make_kv_cache_shuffled_layout(
+        self,
+        BLOCK_SIZE_N_SHFL,
+        BLOCK_SIZE_INNER_DIM_SHFL,
+        fastest_dim_num_warps,
+        dtype=torch.bfloat16,
+    ):
+        num_warps_log2 = int(math.log2(fastest_dim_num_warps))
+        BLOCK_SIZE_N_SHFL_log2 = int(math.log2(BLOCK_SIZE_N_SHFL))
+        BLOCK_SIZE_INNER_DIM_SHFL_log2 = int(math.log2(BLOCK_SIZE_INNER_DIM_SHFL))
+        # TODO: support e4m3_dtype and mxfp4x2
+        # assert dtype in [torch.bfloat16, e4m3_dtype, torch.uint8], f"Unsupported dtype: {dtype} for making linear layout for shuffled weights"
+        assert dtype in [
+            torch.bfloat16
+        ], f"Unsupported dtype: {dtype} for making linear layout for shuffled weights"
+        if dtype == torch.bfloat16:
+            # (8 elements per thread for BF16)
+            coalesced_size_log2 = 3
+        elif dtype == e4m3_dtype:
+            # (16 elements per thread for e4m3_dtype)
+            coalesced_size_log2 = 4
+        else:
+            # (16*2 elements per thread for mxfp4x2)
+            coalesced_size_log2 = 4
+        assert (
+            BLOCK_SIZE_INNER_DIM_SHFL_log2 > coalesced_size_log2 + WAPR_SIZE_LOG2
+        ), "BLOCK_SIZE_INNER_DIM_SHFL_log2 must be greater than coalesced_size_log2 + WAPR_SIZE_LOG2, please increase block_size to at least 64"
+        reg_bases = (
+            [[0, 1 << v] for v in range(coalesced_size_log2)]
+            + [
+                [0, 1 << v]
+                for v in range(
+                    coalesced_size_log2 + WAPR_SIZE_LOG2, BLOCK_SIZE_INNER_DIM_SHFL_log2
+                )
+            ]
+            + [
+                [0, 1 << v]
+                for v in range(
+                    num_warps_log2 + BLOCK_SIZE_INNER_DIM_SHFL_log2,
+                    BLOCK_SIZE_INNER_DIM_SHFL_log2 + BLOCK_SIZE_N_SHFL_log2,
+                )
+            ]
+        )
+        lane_bases = [
+            [0, 1 << v]
+            for v in range(coalesced_size_log2, coalesced_size_log2 + WAPR_SIZE_LOG2)
+        ]
+        if num_warps_log2 > 0:
+            warp_bases = [
+                [0, 1 << v]
+                for v in range(
+                    BLOCK_SIZE_INNER_DIM_SHFL_log2,
+                    num_warps_log2 + BLOCK_SIZE_INNER_DIM_SHFL_log2,
+                )
+            ]
+        else:
+            warp_bases = [[0, 0]]
+
+        layout = gl.constexpr(
+            gl.DistributedLinearLayout(
+                reg_bases=reg_bases,
+                lane_bases=lane_bases,
+                warp_bases=warp_bases,
+                block_bases=[],
+                shape=[1, BLOCK_SIZE_N_SHFL * BLOCK_SIZE_INNER_DIM_SHFL],
+            )
+        )
+        return layout
 
 
 @aggregate
@@ -328,6 +405,10 @@ class AttentionProgram:
     query_offset_1_qk: gl.tensor
     query_mask_0_qk: gl.tensor
     query_mask_1_qk: gl.tensor
+    query_offset_0_pv: gl.tensor
+    query_offset_1_pv: gl.tensor
+    query_mask_0_pv: gl.tensor
+    query_mask_1_pv: gl.tensor
 
     k_desc: gl.amd.gfx1250.tdm.tensor_descriptor
     v_desc: gl.amd.gfx1250.tdm.tensor_descriptor
@@ -367,6 +448,10 @@ class AttentionProgram:
         query_offset_1_qk,
         query_mask_0_qk,
         query_mask_1_qk,
+        query_offset_0_pv,
+        query_offset_1_pv,
+        query_mask_0_pv,
+        query_mask_1_pv,
         k_desc,
         v_desc,
         stride_k_cache_0,
@@ -402,6 +487,10 @@ class AttentionProgram:
         self.query_offset_1_qk = query_offset_1_qk
         self.query_mask_0_qk = query_mask_0_qk
         self.query_mask_1_qk = query_mask_1_qk
+        self.query_offset_0_pv = query_offset_0_pv
+        self.query_offset_1_pv = query_offset_1_pv
+        self.query_mask_0_pv = query_mask_0_pv
+        self.query_mask_1_pv = query_mask_1_pv
         self.kv_head_idx = kv_head_idx
         self.stride_k_cache_0 = stride_k_cache_0
         self.stride_k_cache_1 = stride_k_cache_1
@@ -435,6 +524,10 @@ class AttentionProgram:
         query_offset_1_qk,
         query_mask_0_qk,
         query_mask_1_qk,
+        query_offset_0_pv,
+        query_offset_1_pv,
+        query_mask_0_pv,
+        query_mask_1_pv,
         segm_idx,
         tiles_per_segment,
         stride_k_cache_0,
@@ -463,41 +556,51 @@ class AttentionProgram:
         #     gl.static_assert(stride_v_cache_0 // stride_v_cache_1 == cfg.NUM_KV_HEADS)
 
         if cfg.SHUFFLED_KV_CACHE:
-            total_num_rows = num_blocks * cfg.NUM_KV_HEADS
-            row_size = cfg.BLOCK_SIZE * cfg.HEAD_SIZE
             if cfg.NUM_BLOCKS_GATHER_PER_TILE == 1:
                 k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                     base=key_cache_ptr,
-                    shape=(total_num_rows, row_size),
-                    strides=(stride_k_cache_1, stride_k_cache_3),
-                    block_shape=(1, row_size),
+                    shape=(
+                        num_blocks * cfg.NUM_KV_HEADS,
+                        cfg.BLOCK_SIZE * cfg.HEAD_SIZE,
+                    ),
+                    strides=(stride_k_cache_1, 1),
+                    block_shape=(gl.constexpr(1), cfg.BLOCK_SIZE * cfg.HEAD_SIZE),
                     layout=cfg.K_SHARED_LAYOUT,
                 )
                 v_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                     base=value_cache_ptr,
-                    shape=(total_num_rows, row_size),
-                    strides=(stride_v_cache_1, stride_v_cache_3),
-                    block_shape=(1, row_size),
+                    shape=(
+                        num_blocks * cfg.NUM_KV_HEADS,
+                        cfg.HEAD_SIZE * cfg.BLOCK_SIZE,
+                    ),
+                    strides=(stride_v_cache_1, 1),
+                    block_shape=(gl.constexpr(1), cfg.HEAD_SIZE * cfg.BLOCK_SIZE),
                     layout=cfg.V_SHARED_LAYOUT,
                 )
             else:
                 k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                     base=key_cache_ptr,
-                    shape=(total_num_rows, row_size),
-                    strides=(stride_k_cache_1, stride_k_cache_3),
+                    shape=(
+                        num_blocks * cfg.NUM_KV_HEADS,
+                        cfg.BLOCK_SIZE * cfg.HEAD_SIZE,
+                    ),
+                    strides=(stride_k_cache_1, 1),
                     block_shape=(
                         cfg.NUM_BLOCKS_GATHER_PER_TILE,
-                        row_size,
+                        cfg.BLOCK_SIZE * cfg.HEAD_SIZE,
                     ),
                     layout=cfg.K_SHARED_LAYOUT,
                 )
                 v_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                     base=value_cache_ptr,
-                    shape=(total_num_rows, row_size),
-                    strides=(stride_k_cache_1, stride_k_cache_3),
+                    shape=(
+                        num_blocks * cfg.NUM_KV_HEADS,
+                        cfg.HEAD_SIZE * cfg.BLOCK_SIZE,
+                    ),
+                    strides=(stride_v_cache_1, 1),
                     block_shape=(
                         cfg.NUM_BLOCKS_GATHER_PER_TILE,
-                        row_size,
+                        cfg.HEAD_SIZE * cfg.BLOCK_SIZE,
                     ),
                     layout=cfg.V_SHARED_LAYOUT,
                 )
@@ -505,37 +608,35 @@ class AttentionProgram:
             k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 base=key_cache_ptr,
                 shape=(num_blocks * cfg.BLOCK_SIZE, cfg.NUM_KV_HEADS * cfg.HEAD_SIZE),
-                strides=(stride_k_cache_1, stride_k_cache_3),
+                strides=(stride_k_cache_1, 1),
                 block_shape=(cfg.BLOCK_SIZE, cfg.HEAD_SIZE),
                 layout=cfg.K_SHARED_LAYOUT,
             )
             v_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 base=value_cache_ptr,
                 shape=(num_blocks * cfg.BLOCK_SIZE, cfg.NUM_KV_HEADS * cfg.HEAD_SIZE),
-                strides=(stride_v_cache_1, stride_v_cache_3),
+                strides=(stride_v_cache_1, 1),
                 block_shape=(cfg.BLOCK_SIZE, cfg.HEAD_SIZE),
                 layout=cfg.V_SHARED_LAYOUT,
             )
         else:
-            total_num_rows = num_blocks * cfg.NUM_KV_HEADS
-            row_size = cfg.BLOCK_SIZE * cfg.HEAD_SIZE
             k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 base=key_cache_ptr,
-                shape=(total_num_rows, row_size),
-                strides=(stride_k_cache_1, stride_k_cache_3),
+                shape=(num_blocks * cfg.NUM_KV_HEADS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE),
+                strides=(stride_k_cache_1, 1),
                 block_shape=(
                     cfg.NUM_BLOCKS_GATHER_PER_TILE,
-                    row_size,
+                    cfg.BLOCK_SIZE * cfg.HEAD_SIZE,
                 ),
                 layout=cfg.K_SHARED_LAYOUT,
             )
             v_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 base=value_cache_ptr,
-                shape=(total_num_rows, row_size),
-                strides=(stride_k_cache_1, stride_k_cache_3),
+                shape=(num_blocks * cfg.NUM_KV_HEADS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE),
+                strides=(stride_v_cache_1, 1),
                 block_shape=(
                     cfg.NUM_BLOCKS_GATHER_PER_TILE,
-                    row_size,
+                    cfg.BLOCK_SIZE * cfg.HEAD_SIZE,
                 ),
                 layout=cfg.V_SHARED_LAYOUT,
             )
@@ -605,6 +706,10 @@ class AttentionProgram:
             query_offset_1_qk,
             query_mask_0_qk,
             query_mask_1_qk,
+            query_offset_0_pv,
+            query_offset_1_pv,
+            query_mask_0_pv,
+            query_mask_1_pv,
             k_desc,
             v_desc,
             stride_k_cache_0,
@@ -651,21 +756,21 @@ class AttentionProgram:
                     [self.cfg.BLOCK_M],
                     float("-inf"),
                     dtype=tl.float32,
-                    layout=gl.SliceLayout(1, self.cfg.PV_WMMA_LAYOUT),
+                    layout=gl.SliceLayout(1, self.cfg.QK_WMMA_LAYOUT),
                 )
         else:
             M = gl.full(
                 [self.cfg.BLOCK_M],
                 float("-inf"),
                 dtype=tl.float32,
-                layout=gl.SliceLayout(1, self.cfg.PV_WMMA_LAYOUT),
+                layout=gl.SliceLayout(1, self.cfg.QK_WMMA_LAYOUT),
             )
 
         L = gl.full(
             [self.cfg.BLOCK_M],
             1.0,
             dtype=tl.float32,
-            layout=gl.SliceLayout(1, self.cfg.PV_WMMA_LAYOUT),
+            layout=gl.SliceLayout(1, self.cfg.QK_WMMA_LAYOUT),
         )
         acc = gl.zeros(
             [self.cfg.BLOCK_M, self.cfg.HEAD_SIZE],
@@ -787,11 +892,53 @@ class AttentionProgram:
         )
 
     @gluon.jit
+    def lds_unshuffle_k(self, buffer_id):
+        return (
+            self.k_shared.index(buffer_id)
+            .reshape((self.cfg.TILE_SIZE, self.cfg.HEAD_SIZE))
+            .reshape(
+                (
+                    1,
+                    self.cfg.TILE_SIZE // 16,
+                    self.cfg.HEAD_SIZE // 16,
+                    2,
+                    16,
+                    8,
+                )
+            )
+            .permute((0, 1, 4, 2, 3, 5))
+            .reshape((self.cfg.TILE_SIZE, self.cfg.HEAD_SIZE))
+            .permute((1, 0))
+        )
+
+    @gluon.jit
+    def lds_unshuffle_v(self, buffer_id):
+        return (
+            self.v_shared.index(buffer_id)
+            .reshape((self.cfg.HEAD_SIZE, self.cfg.TILE_SIZE))
+            .reshape(
+                (
+                    1,
+                    self.cfg.HEAD_SIZE // 16,
+                    self.cfg.TILE_SIZE // 16,
+                    2,
+                    16,
+                    8,
+                )
+            )
+            .permute((0, 1, 4, 2, 3, 5))
+            .reshape((self.cfg.HEAD_SIZE, self.cfg.TILE_SIZE))
+            .permute((1, 0))
+        )
+
+    @gluon.jit
     def tdm_shared_load_k(self, wait_count, buffer_id):
         gl.amd.gfx1250.tdm.async_wait(wait_count)
         if self.cfg.SHUFFLED_KV_CACHE:
-            K = self.k_shared.index(buffer_id).load(layout=self.cfg.K_LOAD_LAYOUT)
-            return self.unshuffle_k(K)
+            return self.lds_unshuffle_k(buffer_id).load(layout=self.cfg.K_DOT_LAYOUT)
+            # K = self.k_shared.index(buffer_id).load(layout=self.cfg.K_LOAD_LAYOUT)
+            # return self.unshuffle_k(K)
+
         elif self.cfg.NUM_BLOCKS_GATHER_PER_TILE == 1:
             return (
                 self.k_shared.index(buffer_id)
@@ -810,8 +957,9 @@ class AttentionProgram:
     def tdm_shared_load_v(self, wait_count, buffer_id):
         gl.amd.gfx1250.tdm.async_wait(wait_count)
         if self.cfg.SHUFFLED_KV_CACHE:
-            V = self.v_shared.index(buffer_id).load(layout=self.cfg.V_LOAD_LAYOUT)
-            return self.unshuffle_v(V)
+            return self.lds_unshuffle_v(buffer_id).load(layout=self.cfg.V_DOT_LAYOUT)
+            # V = self.v_shared.index(buffer_id).load(layout=self.cfg.V_LOAD_LAYOUT)
+            # return self.unshuffle_v(V)
         else:
             if self.cfg.NUM_BLOCKS_GATHER_PER_TILE == 1:
                 return self.v_shared.index(buffer_id).load(layout=self.cfg.V_DOT_LAYOUT)
@@ -826,7 +974,10 @@ class AttentionProgram:
     def tdm_load_global_to_shared_k(self, block_idx, buffer_id):
         if self.cfg.NUM_BLOCKS_GATHER_PER_TILE == 1:
             if self.cfg.SHUFFLED_KV_CACHE:
-                offsets = [(self.kv_head_idx * self.stride_k_cache_2).to(gl.int32), 0]
+                offsets = [
+                    (block_idx * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(gl.int32),
+                    0,
+                ]
                 gl.amd.gfx1250.tdm.async_load(
                     self.k_desc, offsets, self.k_shared.index(buffer_id)
                 )
@@ -854,7 +1005,10 @@ class AttentionProgram:
     def tdm_load_global_to_shared_v(self, block_idx, buffer_id):
         if self.cfg.NUM_BLOCKS_GATHER_PER_TILE == 1:
             if self.cfg.SHUFFLED_KV_CACHE:
-                offsets = [(self.kv_head_idx * self.stride_v_cache_2).to(gl.int32), 0]
+                offsets = [
+                    (block_idx * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(gl.int32),
+                    0,
+                ]
                 gl.amd.gfx1250.tdm.async_load(
                     self.v_desc, offsets, self.v_shared.index(buffer_id)
                 )
@@ -959,7 +1113,7 @@ class AttentionProgram:
     @gluon.jit
     def softmax_part1(self, p, L, acc, alpha):
         l_ij = gl.sum(p, 1)
-        acc = acc * alpha[:, None]
+        acc = acc * gl.convert_layout(alpha[:, None], layout=self.cfg.PV_WMMA_LAYOUT)
         p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
         L = L * alpha + l_ij
         return p, L, acc
@@ -978,13 +1132,13 @@ class AttentionProgram:
         dim_mask = gl.full((1,), 1, dtype=tl.int1)
 
         segm_output_offset = (
-            self.query_offset_0_qk[:, None]
+            self.query_offset_0_pv[:, None]
             * (
                 self.cfg.NUM_QUERY_HEADS
                 * self.cfg.NUM_SEGMENTS_PER_SEQ
                 * self.cfg.HEAD_SIZE
             )
-            + self.query_offset_1_qk[:, None]
+            + self.query_offset_1_pv[:, None]
             * (self.cfg.NUM_SEGMENTS_PER_SEQ * self.cfg.HEAD_SIZE)
             + segm_idx * self.cfg.HEAD_SIZE
             + offs_q_d[None, :]
@@ -995,16 +1149,16 @@ class AttentionProgram:
                 ptr=self.output_ptr,
                 offsets=segm_output_offset,
                 mask=dim_mask[None, :]
-                & self.query_mask_0_qk[:, None]
-                & self.query_mask_1_qk[:, None],
+                & self.query_mask_0_pv[:, None]
+                & self.query_mask_1_pv[:, None],
             )
         else:
             gl.store(
                 self.output_ptr + segm_output_offset.to(gl.int64),
                 acc,
                 mask=dim_mask[None, :]
-                & self.query_mask_0_qk[:, None]
-                & self.query_mask_1_qk[:, None],
+                & self.query_mask_0_pv[:, None]
+                & self.query_mask_1_pv[:, None],
             )
 
         segm_offset = (
@@ -1013,8 +1167,8 @@ class AttentionProgram:
             + self.query_offset_1_qk * self.cfg.NUM_SEGMENTS_PER_SEQ
             + segm_idx
         )
-        L = gl.convert_layout(L, layout=gl.SliceLayout(1, self.cfg.PV_WMMA_LAYOUT))
-        M = gl.convert_layout(M, layout=gl.SliceLayout(1, self.cfg.PV_WMMA_LAYOUT))
+        L = gl.convert_layout(L, layout=gl.SliceLayout(1, self.cfg.QK_WMMA_LAYOUT))
+        M = gl.convert_layout(M, layout=gl.SliceLayout(1, self.cfg.QK_WMMA_LAYOUT))
 
         if self.cfg.USE_STORE_BUFFER_OP:
             gl.amd.cdna4.buffer_store(
@@ -1149,9 +1303,8 @@ def get_seq_metadata(
 
 
 @gluon.jit
-def kernel_unified_attention_3d_new(
-    segm_output_ptr,
-    # [num_tokens, num_query_heads, num_segments, head_size]
+def gluon_kernel_unified_attention_3d_tdm(
+    segm_output_ptr,  # [num_tokens, num_query_heads, num_segments, head_size]
     segm_max_ptr,  # [num_tokens, num_query_heads, num_segments]
     segm_expsum_ptr,  # [num_tokens, num_query_heads, num_segments]
     query_ptr,  # [num_tokens, num_query_heads, head_size]
@@ -1165,7 +1318,7 @@ def kernel_unified_attention_3d_new(
     k_scale,  # float32
     v_scale,  # float32
     softcap,  # float32
-    num_seqs,  # int
+    num_seqs: gl.int32,  # int
     num_blocks: gl.int32,  # int
     query_stride_0: gl.int32,  # int
     query_stride_1: gl.int32,  # int, should be equal to head_size
@@ -1196,13 +1349,13 @@ def kernel_unified_attention_3d_new(
     WARP_SIZE: gl.constexpr,  # int
     num_warps: gl.constexpr,  # int
     waves_per_eu: gl.constexpr,  # int
-    NUM_STAGES: gl.constexpr,  # int
+    num_stages: gl.constexpr,  # int
     num_ctas: gl.constexpr = 1,  # int
     NUM_BLOCKS_GATHER_PER_TILE: gl.constexpr = 1,  # int NUM_BLOCKS_GATHER_PER_TILE > 1 for TDM gather mode
     ALL_DECODE: gl.constexpr = False,  # bool
+    SHUFFLED_KV_CACHE: gl.constexpr = False,  # bool
     USE_LOAD_BUFFER_OP: gl.constexpr = False,  # bool
     USE_STORE_BUFFER_OP: gl.constexpr = False,  # bool
-    SHUFFLED_KV_CACHE: gl.constexpr = False,  # bool
 ):
     # Build config with all layouts and derived constants
     cfg = AttentionConfig(
@@ -1217,7 +1370,7 @@ def kernel_unified_attention_3d_new(
         SLIDING_WINDOW,
         num_warps,
         WARP_SIZE,
-        NUM_STAGES,
+        num_stages,
         SCALE,
         USE_ALIBI_SLOPES,
         USE_QQ_BIAS,
@@ -1313,6 +1466,19 @@ def kernel_unified_attention_3d_new(
     query_mask_1_qk = query_offset_1_qk < cfg.NUM_QUERY_HEADS
     query_mask_qk = query_mask_1_qk[:, None] & query_mask_0_qk[:, None]
 
+    query_offset_0_pv = gl.convert_layout(
+        query_offset_0_qk, layout=gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT)
+    )
+    query_offset_1_pv = gl.convert_layout(
+        query_offset_1_qk, layout=gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT)
+    )
+    query_mask_0_pv = gl.convert_layout(
+        query_mask_0_qk, layout=gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT)
+    )
+    query_mask_1_pv = gl.convert_layout(
+        query_mask_1_qk, layout=gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT)
+    )
+
     # compute the length of the longest sequence prefix spanned by any
     # query token in the current q_block (q_block_local_idx)
     max_seq_prefix_len = (
@@ -1345,6 +1511,10 @@ def kernel_unified_attention_3d_new(
         query_offset_1_qk,
         query_mask_0_qk,
         query_mask_1_qk,
+        query_offset_0_pv,
+        query_offset_1_pv,
+        query_mask_0_pv,
+        query_mask_1_pv,
         segm_idx,  # for 2D, segm_idx = 0
         tiles_per_segment,  # for 2D, tiles_per_segment = num_tiles = (max_seq_prefix_len + cfg.BLOCK_SIZE - 1) // cfg.BLOCK_SIZE
         stride_k_cache_0,
@@ -1422,6 +1592,7 @@ def kernel_unified_attention_3d_new(
         v = pgm.tdm_shared_load_v(
             wait_count=(cfg.NUM_STAGES - 1) * 2, buffer_id=buffer_id
         )
+        p = p.to(v.dtype)
         acc = pgm.compute_pv(p, v, acc)
 
         buffer_id = next_buffer_id
@@ -1444,6 +1615,7 @@ def kernel_unified_attention_3d_new(
         v = pgm.tdm_shared_load_v(
             wait_count=(cfg.NUM_STAGES - 2) * 2, buffer_id=buffer_id
         )
+        p = p.to(v.dtype)
         acc = pgm.compute_pv(p, v, acc)
 
         seq_offset += cfg.TILE_SIZE

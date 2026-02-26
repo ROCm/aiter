@@ -7,12 +7,12 @@ import math
 from aiter.ops.triton.gluon.unified_attention_3d_kernel import (
     gluon_kernel_unified_attention_3d,
     gluon_kernel_unified_attention_3d_async,
-    gluon_kernel_unified_attention_3d_tdm,
-    gluon_kernel_unified_attention_3d_tdm_gather,
+    # gluon_kernel_unified_attention_3d_tdm,
+    # gluon_kernel_unified_attention_3d_tdm_gather,
     gluon_reduce_segments,
 )
 from aiter.ops.triton.gluon.unified_attention_3d_kernel_tdm_new import (
-    kernel_unified_attention_3d_new,
+    gluon_kernel_unified_attention_3d_tdm,
 )
 from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
@@ -22,177 +22,64 @@ DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 WAPR_SIZE_LOG2 = int(math.log2(WARP_SIZE))
+from aiter.ops.triton.utils.types import e4m3_dtype
 
 
-def make_distributed_linear_layout(
-    shape: list[int], bases_representation: dict[str, list[str]]
-):
-    """
-    rules for bases_representation:
-    1. shape = [BLOCK_M, BLOCK_N]
-    2.  bases_representation = {
-            "reg_bases": [...]
-            "lane_bases": [...]
-            "warp_bases": [...]
-        }
-        where:
-            "reg_bases": list of tokens representing the register-level distribution
-            "lane_bases": list of tokens representing the lane-level distribution
-            "warp_bases": list of tokens representing the warp-level distribution
-    3. m_log_2 = log2(BLOCK_M), n_log_2 = log2(BLOCK_N)
-    4. there are a total of m_log_2 + n_log_2 tokens: "m0", "m1", ... "m{m_log_2 - 1}", "n0", "n1", ... "n{n_log_2 - 1}"
-    5. these tokens must appear exactly once in the bases_representation across "reg_bases", "lane_bases", "warp_bases" keys:
-
-    example: shape = [64, 128]
-        available tokens: "m0", "m1", "m2", "m3", "m4", "m5", "n0", "n1", "n2", "n3", "n4", "n5", "n6", "n7"
-        each of the above tokens must appear once in the bases_representation across "reg_bases", "lane_bases", "warp_bases" keys
-        warp_bases can be "z", representing [0, 0]
-
-    note:
-        although this will not cause any compailation error outside gluon.jit,
-        you need to make sure "lane_bases" has exactly 6/5 tokens for gfx950/gfx1250, respectively, because there are 64/32 threads per warp
-        also you need to make sure "warp_bases" has exactly log2(num_warps) tokens, e.g., 1 token for num_warps = 2, 2 tokens for num_warps = 4, etc.
-    """
-    token_counter = {}
-    for i, d in [(0, "m"), (1, "n")]:
-        for lg in range(int(math.log2(shape[i]))):
-            token_counter[f"{d}{lg}"] = 0
-
-    arg = {"reg_bases": [], "lane_bases": [], "warp_bases": []}
-
-    for k in arg.keys():
-        for v in bases_representation[k]:
-            if v == "z":
-                if k == "warp_bases":
-                    arg[k].append([0, 0])
-                else:
-                    raise ValueError(f"Token {v} should only be in warp_bases")
-                continue
-            if v not in token_counter:
-                raise ValueError(
-                    f"Token {v} is invalid, it should be one of {token_counter.keys()}"
-                )
-            token_counter[v] += 1
-            d = v[0]
-            lg = int(v[1:])
-            if d == "m":
-                arg[k].append([2**lg, 0])
-            else:
-                arg[k].append([0, 2**lg])
-
-    for k in token_counter.keys():
-        if token_counter[k] != 1:
-            raise ValueError(
-                f"Token {k} should appear only once, but appears {token_counter[k]} times"
-            )
-    # print(arg)
-    layout = gl.constexpr(
-        gl.DistributedLinearLayout(
-            **arg,
-            block_bases=[],
-            shape=shape,
-        )
-    )
-    return layout
-
-
-def get_layout_view(layout, shape):
-    layout_view = layout.format_tensor_view(shape)
-    layout_array = []
-    for l in layout_view.strip("[]").strip("\n").split("\n"):
-        layout_array.append([])
-        for ll in l.strip("[]").split(","):
-            t = int(ll.strip(" ").split(":")[0][1:])
-            e = int(ll.strip(" ").split(":")[-1])
-            layout_array[-1].append([t, e])
-    return layout_view, torch.tensor(layout_array).to(torch.int32)
-
-
-def get_smem_data_layout(layout, shape, bases_representation):
-    _, layout_array = get_layout_view(layout, shape)
-    contiguous_dim = bases_representation["reg_bases"][0][0]
-    assert bases_representation["reg_bases"][0][1] == "0"
-    for log_coalesced in range(1, len(bases_representation["reg_bases"])):
-        if (
-            bases_representation["reg_bases"][log_coalesced]
-            != f"{contiguous_dim}{2**(log_coalesced - 1)}"
-        ):
-            break
-
-    coalesced_size = 2**log_coalesced
-    if contiguous_dim == "m":
-        layout_array = layout_array.permute(1, 0, 2)
-
-    smem_data_layout = []
-    for tid in range(WARP_SIZE):
-        smem_data_layout.append([])
-        data_idx = (layout_array[:, :, 0] == tid).nonzero().T
-        element_idx = layout_array[data_idx[0], data_idx[1], 1]
-        assert (
-            len(element_idx) % coalesced_size == 0
-        ), f"There must be {coalesced_size} elements alinged per thread"
-        num_vmem_load = len(element_idx) // coalesced_size
-        for i_vmem_load in range(num_vmem_load):
-            assert torch.allclose(
-                element_idx[
-                    i_vmem_load * coalesced_size : (i_vmem_load + 1) * coalesced_size
-                ]
-                - element_idx[i_vmem_load * coalesced_size],
-                torch.arange(coalesced_size, dtype=torch.int32),
-            ), f"There must be {coalesced_size} contiguous elements per vmem load"
-        i_vmem_load_order = torch.argsort(element_idx[::coalesced_size])
-        for i_vmem_load in range(num_vmem_load):
-            idx_row = data_idx[0][
-                i_vmem_load_order[i_vmem_load]
-                * coalesced_size : (i_vmem_load_order[i_vmem_load] + 1)
-                * coalesced_size
-            ]
-            idx_col = data_idx[1][
-                i_vmem_load_order[i_vmem_load]
-                * coalesced_size : (i_vmem_load_order[i_vmem_load] + 1)
-                * coalesced_size
-            ]
-            smem_data_layout[-1].append(torch.stack((idx_row, idx_col)).T)
-        smem_data_layout[-1] = torch.stack(smem_data_layout[-1])
-    smem_data_layout = torch.stack(smem_data_layout)
-    # [num_vmem_loads, num_threads, coalesced_size, 2]
-    smem_data_layout = smem_data_layout.permute(1, 0, 2, 3)
-    if contiguous_dim == "m":
-        smem_data_layout = smem_data_layout[..., [1, 0]]
-    return smem_data_layout
-
-
-def make_kv_shuffled_layout(
-    BLOCK_SIZE_N_SHFL, BLOCK_SIZE_INNER_DIM_SHFL, fastest_dim_num_warps
+def make_kv_cache_shuffled_layout(
+    BLOCK_SIZE_N_SHFL,
+    BLOCK_SIZE_INNER_DIM_SHFL,
+    fastest_dim_num_warps,
+    dtype=torch.bfloat16,
 ):
     num_warps_log2 = int(math.log2(fastest_dim_num_warps))
     BLOCK_SIZE_N_SHFL_log2 = int(math.log2(BLOCK_SIZE_N_SHFL))
     BLOCK_SIZE_INNER_DIM_SHFL_log2 = int(math.log2(BLOCK_SIZE_INNER_DIM_SHFL))
-    coalesced_size_log2 = 3  # (8 elements per thread for BF16)
+    # TODO: support e4m3_dtype and mxfp4x2
+    # assert dtype in [torch.bfloat16, e4m3_dtype, torch.uint8], f"Unsupported dtype: {dtype} for making linear layout for shuffled weights"
+    assert dtype in [
+        torch.bfloat16
+    ], f"Unsupported dtype: {dtype} for making linear layout for shuffled weights"
+    if dtype == torch.bfloat16:
+        # (8 elements per thread for BF16)
+        coalesced_size_log2 = 3
+    elif dtype == e4m3_dtype:
+        # (16 elements per thread for e4m3_dtype)
+        coalesced_size_log2 = 4
+    else:
+        # (16*2 elements per thread for mxfp4x2)
+        coalesced_size_log2 = 4
     assert (
-        BLOCK_SIZE_INNER_DIM_SHFL_log2 > 3 + WAPR_SIZE_LOG2
-    ), "BLOCK_SIZE_INNER_DIM_SHFL_log2 must be greater than 3 + WAPR_SIZE_LOG2, please increase block_size to at least 64"
-    bases_representation = {
-        "reg_bases": [f"n{v}" for v in range(coalesced_size_log2)]
-        + [f"n{v}" for v in range(3 + WAPR_SIZE_LOG2, BLOCK_SIZE_INNER_DIM_SHFL_log2)]
-        + (
-            [f"m{v}" for v in range(num_warps_log2, BLOCK_SIZE_N_SHFL_log2)]
-            if BLOCK_SIZE_N_SHFL_log2 > num_warps_log2
-            else []
-        ),
-        "lane_bases": [
-            f"n{v}"
-            for v in range(coalesced_size_log2, coalesced_size_log2 + WAPR_SIZE_LOG2)
-        ],
-        "warp_bases": (
-            [f"m{v}" for v in range(0, num_warps_log2)]
-            if num_warps_log2 > 0 and BLOCK_SIZE_N_SHFL_log2 > num_warps_log2
-            else ["z"]
-        ),
-    }
-    return make_distributed_linear_layout(
-        [BLOCK_SIZE_N_SHFL, BLOCK_SIZE_INNER_DIM_SHFL], bases_representation
+        BLOCK_SIZE_INNER_DIM_SHFL_log2 > coalesced_size_log2 + WAPR_SIZE_LOG2
+    ), "BLOCK_SIZE_INNER_DIM_SHFL_log2 must be greater than coalesced_size_log2 + WAPR_SIZE_LOG2, please increase block_size to at least 64"
+    reg_bases = (
+        [[0, 1 << v] for v in range(coalesced_size_log2)]
+        + [
+            [0, 1 << v]
+            for v in range(
+                coalesced_size_log2 + WAPR_SIZE_LOG2, BLOCK_SIZE_INNER_DIM_SHFL_log2
+            )
+        ]
+        + [[1 << v, 0] for v in range(num_warps_log2, BLOCK_SIZE_N_SHFL_log2)]
     )
+    lane_bases = [
+        [0, 1 << v]
+        for v in range(coalesced_size_log2, coalesced_size_log2 + WAPR_SIZE_LOG2)
+    ]
+    if num_warps_log2 > 0:
+        warp_bases = [[1 << v, 0] for v in range(0, num_warps_log2)]
+    else:
+        warp_bases = [[0, 0]]
+
+    layout = gl.constexpr(
+        gl.DistributedLinearLayout(
+            reg_bases=reg_bases,
+            lane_bases=lane_bases,
+            warp_bases=warp_bases,
+            block_bases=[],
+            shape=[BLOCK_SIZE_N_SHFL, BLOCK_SIZE_INNER_DIM_SHFL],
+        )
+    )
+    return layout
 
 
 def make_layout_3d(
@@ -202,53 +89,15 @@ def make_layout_3d(
     BLOCK_SIZE: int,
     NUM_BLOCKS_GATHER_PER_TILE: int,
     HEAD_SIZE_PADDED: int,
+    shuffled_kv_cache: bool,
+    kv_cache_dtype: torch.dtype,
     use_tdm: bool,
     use_async: bool,
     use_swizzle: bool = False,
     use_gather: bool = False,
-    shuffled_kv_cache: bool = False,
 ):
 
     if IS_DEVICE_ARCH_GFX12:
-        # BLOCK_M are usually 16 (QH per KVH are usually <= 16)
-        # TILE_SIZE are usually 16 or 64
-        # HEAD_SIZE_PADDED are usually 64 or 128
-
-        # for Q @ K^T (M x N x K = BLOCK_M x TILE_SIZE x HEAD_SIZE_PADDED),
-        # the M-dim can usually be completed by 1 wave, while N-dim requires multiple waves and/or cycles,
-        # so the best choice for warp_bases is:
-        #     [[0, 1]]         for num_warps = 2, and
-
-        #         w0 w1 ...
-        #         ...
-
-        #     [[0, 1], [0, 2]] for num_warps = 4
-
-        #         w0 w1 w2 w3 ...
-        #         ...
-
-        # for P @ V (M x N x K = BLOCK_M x HEAD_SIZE_PADDED x TILE_SIZE),
-        # the M-dim can usually be completed by 1 wave, while N-dim requires multiple waves and/or cycles,
-        # so the best choice for warp_bases is the same as Q @ K^T
-
-        # some examples for warp_bases for num_warps = 4
-
-        #     warp_bases=[[0, 1], [1, 0]]
-        #     w0 w1 ...
-        #     w2 w3 ...
-        #     ...
-
-        #     warp_bases=[[1, 0], [0, 1]]
-        #     w0 w2 ...
-        #     w1 w3 ...
-        #     ...
-
-        #     warp_bases=[[0, 1], [0, 2]]
-        #     w0 w1 w2 w3 ...
-        #     ...
-
-        # therefore, we construct WMMA layout with the following heuristics
-
         QK_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
             version=3,
             transposed=True,
@@ -383,57 +232,6 @@ def make_layout_3d(
             V_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
                 vec=1, per_phase=1, max_phase=1, order=[1, 0]
             )
-            # V_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
-            #     vec=4, per_phase=2, max_phase=8, order=[1, 0]
-            # )
-
-        # 64
-        # ttg.padded_shared<[512:+16] {offset = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16], [0, 1], [0, 2], [0, 32]], block = []}>
-        # 128
-        # ttg.padded_shared<[512:+16] {offset = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [0, 16], [0, 32], [0, 1], [0, 2], [0, 4], [0, 8]], block = []}>
-        # K_SHARED_LAYOUT: gl.constexpr = gl.PaddedSharedLayout(
-        #     interval_padding_pairs=[[512, 16]],
-        #     offset_bases=[
-        #         [1, 0],
-        #         [2, 0],
-        #         [4, 0],
-        #         [8, 0],
-        #         [16, 0],
-        #         [32, 0],
-        #         [0, 4],
-        #         [0, 8],
-        #         [0, 16],
-        #         [0, 1],
-        #         [0, 2],
-        #         [0, 32],
-        #     ],
-        #     cga_layout=[],
-        #     shape=[HEAD_SIZE_PADDED, TILE_SIZE],
-        # )
-
-        # 64
-        # ttg.padded_shared<[512:+16] {offset = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [8, 0], [4, 0], [16, 0], [1, 0], [2, 0], [32, 0]], block = []}>
-        # 128
-        # ttg.padded_shared<[512:+16] {offset = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0], [1, 0], [2, 0], [8, 0], [4, 0]], block = []}>
-        # V_SHARED_LAYOUT: gl.constexpr = gl.PaddedSharedLayout(
-        #     interval_padding_pairs=[[512, 16]],
-        #     offset_bases=[
-        #         [0, 1],
-        #         [0, 2],
-        #         [0, 4],
-        #         [0, 8],
-        #         [0, 16],
-        #         [0, 32],
-        #         [8, 0],
-        #         [4, 0],
-        #         [16, 0],
-        #         [1, 0],
-        #         [2, 0],
-        #         [32, 0],
-        #     ],
-        #     cga_layout=[],
-        #     shape=[TILE_SIZE, HEAD_SIZE_PADDED],
-        # )
 
     # size_per_thread along the fastest moving dimension is set to 8 (BF16)
     size_per_thread_fastest_dim = 8
@@ -456,14 +254,12 @@ def make_layout_3d(
         order=[1, 0],
     )
     if shuffled_kv_cache:
-        K_LOAD_LAYOUT = make_kv_shuffled_layout(
+        K_LOAD_LAYOUT = make_kv_cache_shuffled_layout(
             TILE_SIZE // 16,
             HEAD_SIZE_PADDED * 16,
-            1 if use_async else num_warps,
-            # num_warps,
-            # 1,
+            1 if (use_async or IS_DEVICE_ARCH_GFX12) else num_warps,
         )
-        V_LOAD_LAYOUT = make_kv_shuffled_layout(
+        V_LOAD_LAYOUT = make_kv_cache_shuffled_layout(
             HEAD_SIZE_PADDED // 16, TILE_SIZE * 16, num_warps
         )
     else:
@@ -569,6 +365,7 @@ def select_3d_config(
     num_2d_prgms,
     BLOCK_M: int,
     HEAD_SIZE_PADDED: int,
+    kv_cache_dtype: torch.dtype,
     use_tdm: bool = False,
     num_tdm_gather: int = 1,
     use_async: bool = True,
@@ -609,13 +406,17 @@ def select_3d_config(
     if num_segments == MIN_SEGMENTS:
         reduce_num_warps = 1
 
-    hyper_parms = (
+    config_parms = (
         attn_warps,
         BLOCK_M,
         TILE_SIZE,
         block_size,
         num_tdm_gather,
         HEAD_SIZE_PADDED,
+        shuffled_kv_cache,
+        kv_cache_dtype,
+        use_tdm,
+        use_async,
     )
 
     # num_tiles_per_seq = (max_seqlen_k // num_segments + TILE_SIZE - 1) // TILE_SIZE
@@ -623,60 +424,37 @@ def select_3d_config(
     attn_stages = 1
     if use_tdm:
         # With TDM async_copy pipelined, use_swizzle will be ignored (padded smem layout is used always)
-        if num_tdm_gather > 1:
-            attn_impl = gluon_kernel_unified_attention_3d_tdm_gather
-            # print(f"Using TDM gather pipelined kernel with TILE_SIZE={TILE_SIZE} and BLOCK_SIZE={block_size}")
-            layouts = make_layout_3d(
-                *hyper_parms,
-                use_tdm,
-                use_async,
-                use_swizzle=False,
-                use_gather=True,
-                shuffled_kv_cache=shuffled_kv_cache,
-            )
-        else:
-            attn_impl = gluon_kernel_unified_attention_3d_tdm
-            # print(f"Using TDM async copy pipelined kernel with TILE_SIZE={TILE_SIZE} and BLOCK_SIZE={block_size}")
-            layouts = make_layout_3d(
-                *hyper_parms,
-                use_tdm,
-                use_async,
-                use_swizzle=False,
-                shuffled_kv_cache=shuffled_kv_cache,
-            )
-        attn_stages = 2
-    elif use_async:
-        # With async_copy pipelined, use_swizzle should always be True
-        attn_impl = gluon_kernel_unified_attention_3d_async
-        layouts = make_layout_3d(
-            *hyper_parms,
-            use_tdm,
-            use_async,
-            use_swizzle=True,
-            shuffled_kv_cache=shuffled_kv_cache,
-        )
-        # gfx12 does not have async_copy.buffer_load_to_shared
-        # TODO: check KV cache size to determine if use_buffer_load is needed in gfx950
-        layouts["use_buffer_load"] = not IS_DEVICE_ARCH_GFX12
+        attn_impl = gluon_kernel_unified_attention_3d_tdm
+        layout_configs = {"NUM_BLOCKS_GATHER_PER_TILE": num_tdm_gather}
         attn_stages = 2
     else:
-        # Baseline kernel, num_stages does not matter, use_swizzle can be either True or False
-        attn_impl = gluon_kernel_unified_attention_3d
-        layouts = make_layout_3d(
-            *hyper_parms,
-            use_tdm,
-            use_async,
-            use_swizzle=use_swizzle,
-            shuffled_kv_cache=shuffled_kv_cache,
-        )
+        if use_async:
+            # With async_copy pipelined, use_swizzle should always be True
+            attn_impl = gluon_kernel_unified_attention_3d_async
+            layout_configs = make_layout_3d(
+                *config_parms,
+                use_swizzle=True,
+            )
+            # gfx12 does not have async_copy.buffer_load_to_shared
+            # TODO: check KV cache size to determine if use_buffer_load is needed in gfx950
+            layout_configs["USE_LOAD_BUFFER_OP"] = not IS_DEVICE_ARCH_GFX12
+            attn_stages = 2
+        else:
+            # Baseline kernel, num_stages does not matter, use_swizzle can be either True or False
+            attn_impl = gluon_kernel_unified_attention_3d
+            layout_configs = make_layout_3d(
+                *config_parms,
+                use_swizzle=use_swizzle,
+            )
+        layout_configs["TILE_SIZE"] = TILE_SIZE
 
     attn_config = {
-        "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
+        "WARP_SIZE": WARP_SIZE,
         "num_warps": attn_warps,
         "num_stages": attn_stages,
         "waves_per_eu": 2,
-        **layouts,
+        **layout_configs,
     }
 
     reduce_config = {
@@ -744,6 +522,7 @@ def unified_attention(
     SLIDING_WINDOW = 1 + window_size[0]
 
     num_tokens, num_query_heads, head_size = q.shape
+    kv_cache_dtype = k.dtype
     if shuffled_kv_cache:
         # key_cache: num_blocks, num_kv_heads, block_size // 16, head_size * 16
         # value_cache: num_blocks, num_kv_heads, head_size // 16, block_size * 16
@@ -814,6 +593,7 @@ def unified_attention(
             num_2d_prgms,
             BLOCK_M,
             head_size_padded,
+            kv_cache_dtype,
             use_tdm,
             num_tdm_gather,
             use_async,
@@ -856,21 +636,17 @@ def unified_attention(
             seq_lens_ptr=seqused_k,
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
-            scale=softmax_scale,
             k_scale=k_descale,
             v_scale=v_descale,
             softcap=softcap,
-            num_tokens=num_tokens,
-            NUM_BLOCKS=num_blocks,
-            num_query_heads=num_query_heads,
-            num_queries_per_kv=num_queries_per_kv,
+            num_seqs=num_seqs,
+            num_blocks=num_blocks,
             block_table_stride=block_table.stride(0),
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
             BLOCK_SIZE=block_size,
             HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=head_size_padded,
             USE_ALIBI_SLOPES=use_alibi_slopes,
             USE_QQ_BIAS=use_qq_bias,
             USE_SOFTCAP=(softcap > 0),
@@ -885,65 +661,15 @@ def unified_attention(
             stride_v_cache_2=v.stride(2),
             stride_v_cache_3=v.stride(3),
             query_start_len_ptr=cu_seqlens_q,
+            SCALE=softmax_scale,
+            NUM_QUERY_HEADS=num_query_heads,
+            NUM_KV_HEADS=num_kv_heads,
             BLOCK_Q=BLOCK_Q,
-            num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             ALL_DECODE=ALL_DECODE,
             SHUFFLED_KV_CACHE=shuffled_kv_cache,
             **attn_config,
         )
-        # kernel_unified_attention_3d_new[
-        #     (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
-        # ](
-        #     segm_output_ptr=segm_output,
-        #     segm_max_ptr=segm_max,
-        #     segm_expsum_ptr=segm_expsum,
-        #     query_ptr=q,
-        #     key_cache_ptr=k,
-        #     value_cache_ptr=v,
-        #     sink_ptr=sinks,
-        #     block_tables_ptr=block_table,
-        #     seq_lens_ptr=seqused_k,
-        #     alibi_slopes_ptr=alibi_slopes,
-        #     qq_bias_ptr=qq_bias,
-        #     k_scale=k_descale,
-        #     v_scale=v_descale,
-        #     softcap=softcap,
-        #     num_seqs=num_seqs,
-        #     num_blocks=num_blocks,
-        #     query_stride_0=q.stride(0),
-        #     query_stride_1=q.stride(1),
-        #     qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
-        #     USE_ALIBI_SLOPES=use_alibi_slopes,
-        #     USE_QQ_BIAS=use_qq_bias,
-        #     USE_SOFTCAP=(softcap > 0),
-        #     USE_SINKS=(sinks is not None),
-        #     SLIDING_WINDOW=SLIDING_WINDOW,
-        #     stride_k_cache_0=k.stride(0),
-        #     stride_k_cache_1=k.stride(1),
-        #     stride_k_cache_2=k.stride(2),
-        #     stride_k_cache_3=k.stride(3),
-        #     stride_v_cache_0=v.stride(0),
-        #     stride_v_cache_1=v.stride(1),
-        #     stride_v_cache_2=v.stride(2),
-        #     stride_v_cache_3=v.stride(3),
-        #     block_table_stride=block_table.stride(0),
-        #     query_start_len_ptr=cu_seqlens_q,
-        #     SCALE=softmax_scale,
-        #     NUM_QUERY_HEADS=num_query_heads,
-        #     NUM_KV_HEADS=num_kv_heads,
-        #     BLOCK_SIZE=block_size,
-        #     HEAD_SIZE=head_size,
-        #     BLOCK_Q=BLOCK_Q,
-        #     BLOCK_M=BLOCK_M,
-        #     NUM_SEGMENTS_PER_SEQ=attn_config["NUM_SEGMENTS_PER_SEQ"],
-        #     WARP_SIZE=32,
-        #     num_warps=attn_config["num_warps"],
-        #     waves_per_eu=attn_config["waves_per_eu"],
-        #     NUM_STAGES=attn_config["num_stages"],
-        #     NUM_BLOCKS_GATHER_PER_TILE=attn_config["TILE_SIZE"] // block_size,
-        #     ALL_DECODE=ALL_DECODE,
-        # )
 
         gluon_reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
@@ -958,7 +684,6 @@ def unified_attention(
             output_stride_1=out.stride(1),
             block_table_stride=block_table.stride(0),
             HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
             USE_FP8=output_scale is not None,
