@@ -60,7 +60,7 @@ def run_gemm_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @benchmark()
-def test_gemm(dtype, m, n, k, ck_preshuffle=True):
+def test_gemm(dtype, m, n, k, ck_preshuffle=True, asm_kernel=None):
     ret = {}
     dim = (m, n, k)
     block_shape_n, block_shape_k = block_shape
@@ -87,8 +87,8 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     ret["ck err"] = err_ck
 
     tag = "asm"
-    weight_asm = shuffle_weight(weight, layout=(32, 16))
-    c, avg_c = run_asm(x, weight_asm, x_scale, w_scale, dtype)
+    weight_asm = shuffle_weight(weight, layout=(16, 16))
+    c, avg_c = run_asm(x, weight_asm, x_scale_t, w_scale, dtype, kernel_name=asm_kernel)
 
     err_asm = checkAllclose(a, c, msg=f"{tag}")
     ret[f"{tag} us"] = avg_c
@@ -125,7 +125,9 @@ def run_asm(x, weight, x_scale, w_scale, dtype=dtypes.bf16, kernel_name=None):
     m, k = x.shape
     n, _ = weight.shape
     out = torch.empty((m, n), dtype=dtype, device=x.device)
-    return aiter.gemm_a8w8_blockscale_bpreshuffle_asm(x, weight, out, x_scale, w_scale)
+    return aiter.gemm_a8w8_blockscale_bpreshuffle_asm(
+        x, weight, out, x_scale, w_scale, kernelName=kernel_name
+    )
 
 
 parser = argparse.ArgumentParser(
@@ -231,11 +233,18 @@ parser.add_argument(
     "--ck_preshuffle",
     type=dtypes.str2bool,
     nargs="*",
-    default=[True, False],
+    default=[True],
     help="""weight ck_preshuffle or not.
     e.g.: --ck_preshuffle True
         or --ck_preshuffle False
     """,
+)
+parser.add_argument(
+    "--asm_kernel",
+    type=str,
+    default=None,
+    help="""ASM kernel name override.
+    e.g.: --asm_kernel _ZN5aiter42fp8gemm_bf16_blockscale_BpreShuffle_32x128E""",
 )
 
 args = parser.parse_args()
@@ -246,7 +255,9 @@ for dtype in args.dtype:
     for m in args.m:
         for n, k in args.nk:
             for ck_p in args.ck_preshuffle:
-                ret = test_gemm(dtype, m, n, k, ck_preshuffle=ck_p)
+                ret = test_gemm(
+                    dtype, m, n, k, ck_preshuffle=ck_p, asm_kernel=args.asm_kernel
+                )
                 df.append(ret)
 df = pd.DataFrame(df)
 
