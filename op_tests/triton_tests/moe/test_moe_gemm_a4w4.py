@@ -252,12 +252,6 @@ def test_op(
         # TODO: implement scatter in Gluon implementation
         if do_scatter:
             pytest.skip("Gluon implementation does not support gather or scatter.")
-        # TODO: implement apply_swiglu in Gluon implementation
-        if apply_swiglu:
-            pytest.skip("Gluon implementation does not support apply_swiglu.")
-        # TODO: implement fused_quant in Gluon implementation
-        if fused_quant:
-            pytest.skip("Gluon implementation does not support fused_quant.")
     if hbm_swizzling:
         if n % 32 != 0 or k % (32 * 8) != 0:
             pytest.skip(
