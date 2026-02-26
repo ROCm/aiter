@@ -277,28 +277,26 @@ def fused_twoshot_allreduce_rmsnorm_row_quant_kernel(
     # ================================================================
 
     for row in range(pid, M, COMM_SMS):
-        # Skip rows this rank already processed in Step 1
-        if row >= my_start and row < my_end:
-            continue
+        # Only process rows NOT assigned to this rank (already done in Step 1)
+        if row < my_start or row >= my_end:
+            ar_offset = row * stride_ar_m + cols * stride_ar_n
+            out_offset = row * N + cols
 
-        ar_offset = row * stride_ar_m + cols * stride_ar_n
-        out_offset = row * N + cols
+            # Load allreduce result (received via broadcast from owning rank)
+            ar_val = tl.load(
+                allreduce_out_ptr + ar_offset, mask=col_mask, other=0.0
+            ).to(tl.float32)
 
-        # Load allreduce result (received via broadcast from owning rank)
-        ar_val = tl.load(
-            allreduce_out_ptr + ar_offset, mask=col_mask, other=0.0
-        ).to(tl.float32)
-
-        _rmsnorm_row_quant(
-            ar_val, rms_w, rms_eps, fp8_max,
-            rms_out_ptr, quant_out_ptr, scale_out_ptr,
-            residual_in_ptr, residual_out_ptr,
-            out_offset, row, N, col_mask,
-            rms_out_ptr.type.element_ty,
-            quant_out_ptr.type.element_ty,
-            residual_out_ptr.type.element_ty,
-            HAS_RESIDUAL,
-        )
+            _rmsnorm_row_quant(
+                ar_val, rms_w, rms_eps, fp8_max,
+                rms_out_ptr, quant_out_ptr, scale_out_ptr,
+                residual_in_ptr, residual_out_ptr,
+                out_offset, row, N, col_mask,
+                rms_out_ptr.type.element_ty,
+                quant_out_ptr.type.element_ty,
+                residual_out_ptr.type.element_ty,
+                HAS_RESIDUAL,
+            )
 
 
 # ============================================================================
