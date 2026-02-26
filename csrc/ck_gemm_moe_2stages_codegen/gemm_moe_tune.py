@@ -31,14 +31,19 @@ from einops import rearrange
 from aiter.utility.base_tuner import TunerCommon
 from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import moe_mxfp4_sort
-from aiter.ops.flydsl.flydsl_moe_utils import (
-    flydsl_kernel_name,
-    parse_flydsl_kernel_name,
-    get_flydsl_stage1_kernels,
-    get_flydsl_stage2_kernels,
-    compile_flydsl_moe_stage1,
-    compile_flydsl_moe_stage2,
-)
+
+
+from aiter.ops.flydsl.utils import is_flydsl_available
+
+if is_flydsl_available():
+    from aiter.ops.flydsl.moe_kernels import (
+        flydsl_kernel_name,
+        parse_flydsl_kernel_name,
+        get_flydsl_stage1_kernels,
+        get_flydsl_stage2_kernels,
+        compile_flydsl_moe_stage1,
+        compile_flydsl_moe_stage2,
+    )
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/")
 from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list
@@ -1901,6 +1906,8 @@ class FmoeTuner(TunerCommon):
 
     def gen_flydsl_2stages_task(self, info, blockMs):
         tasks_flydsl = []
+        if not is_flydsl_available():
+            return tasks_flydsl
         (
             cu_num,
             token,

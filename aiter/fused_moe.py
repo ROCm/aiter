@@ -20,6 +20,9 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
 from aiter.utility import fp4_utils
 
+
+from aiter.ops.flydsl.utils import is_flydsl_available
+
 BLOCK_SIZE_M = 32
 
 
@@ -608,7 +611,7 @@ def flydsl_moe_stage2(
     use_non_temporal_load=False,
     **_kwargs,
 ):
-    from aiter.ops.flydsl.flydsl_moe_utils import parse_flydsl_kernel_name
+    from aiter.ops.flydsl.moe_kernels import parse_flydsl_kernel_name
     from aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
     from aiter.ops.flydsl.kernels.moe_gemm_2stage import compile_moe_reduction
     from aiter.ops.shuffle import shuffle_weight
@@ -972,7 +975,7 @@ def get_2stage_cfgs(
             ]
         )
     ):
-        if kernelName2 and kernelName2.startswith("flydsl_"):
+        if kernelName2 and kernelName2.startswith("flydsl_") and is_flydsl_available():
             stage2_func = functools.partial(
                 flydsl_moe_stage2,
                 kernelName=kernelName2,
