@@ -22,6 +22,51 @@ from aiter.utility import fp4_utils
 
 BLOCK_SIZE_M = 32
 
+_USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
+
+
+def _moe_sorting_impl(
+    topk_ids,
+    topk_weights,
+    num_experts,
+    model_dim,
+    moebuf_dtype,
+    block_size,
+    expert_mask,
+    num_local_tokens,
+    dispatch_policy,
+    use_opus,
+):
+    device = topk_ids.device
+    M, topk = topk_ids.shape
+    max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
+
+    max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
+    sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
+    sorted_weights = torch.empty(
+        max_num_tokens_padded, dtype=dtypes.fp32, device=device
+    )
+    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+
+    fwd_fn = aiter.moe_sorting_opus_fwd if use_opus else aiter.moe_sorting_fwd
+    fwd_fn(
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        num_experts,
+        int(block_size),
+        expert_mask,
+        num_local_tokens,
+        dispatch_policy,
+    )
+    return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
+
 
 def moe_sorting(
     topk_ids,
@@ -35,42 +80,28 @@ def moe_sorting(
     dispatch_policy=0,
 ):
     try:
-        device = topk_ids.device
-        M, topk = topk_ids.shape
-        max_num_tokens_padded = topk_ids.numel() + num_experts * block_size - topk
-
-        max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
-        sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
-        sorted_weights = torch.empty(
-            max_num_tokens_padded, dtype=dtypes.fp32, device=device
-        )
-        sorted_expert_ids = torch.empty(
-            max_num_m_blocks, dtype=dtypes.i32, device=device
-        )
-        num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
-
-        aiter.moe_sorting_fwd(
+        return _moe_sorting_impl(
             topk_ids,
             topk_weights,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            moe_buf,
             num_experts,
+            model_dim,
+            moebuf_dtype,
             block_size,
             expert_mask,
             num_local_tokens,
             dispatch_policy,
+            use_opus=_USE_OPUS_MOE_SORTING,
         )
     except Exception as e:
         logger.error(f"Error in moe_sorting: {e}")
+        max_num_tokens_padded = int(
+            topk_ids.numel() + num_experts * block_size - topk_ids.shape[1]
+        )
+        topk = topk_ids.shape[1]
         logger.error(
             f"Moe_sorting info: {max_num_tokens_padded=} {block_size=} {num_experts=} {topk=} {topk_ids.shape=}"
         )
         raise e
-    return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
 
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
@@ -212,6 +243,7 @@ def fused_moe_(
         inter_dim * 2,
     ], f"Invalid MoE weight: {w1.shape=} {w2.shape=}"
     isG1U1 = inter_dim != w1.shape[1]
+    isShuffled = getattr(w1, "is_shuffled", False)
 
     global_E = E
     if expert_mask is not None:
@@ -249,9 +281,13 @@ def fused_moe_(
         doweight_stage1,
         hidden_pad,
         intermediate_pad,
+        isShuffled,
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
+    # Ensure block_size_M is int (metadata.block_m from CSV may be float)
+    if block_size_M is not None:
+        block_size_M = int(block_size_M)
 
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
         topk_ids,
@@ -600,6 +636,7 @@ def get_2stage_cfgs(
     doweight_stage1,
     hidden_pad,
     intermediate_pad,
+    is_shuffled=True,
 ):
     def get_cfg_2stages(tune_file):
         import pandas as pd
@@ -799,6 +836,7 @@ def get_2stage_cfgs(
         and q_type == QuantType.per_1x32
         and q_dtype_w in [dtypes.fp4x2]
         and ksplit > 1
+        and is_shuffled
     ):
         return MOEMetadata(
             functools.partial(
@@ -915,6 +953,7 @@ def fused_moe_2stages(
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
     dtype = moe_out.dtype
     device = hidden_states.device
+    is_shuffled = getattr(w1, "is_shuffled", False)
     metadata = get_2stage_cfgs(
         get_padded_M(token_num),  # consider token_num > 1024 as prefill
         model_dim,
@@ -930,6 +969,7 @@ def fused_moe_2stages(
         doweight_stage1,
         hidden_pad,
         intermediate_pad,
+        is_shuffled,
     )
     if (
         quant_type == QuantType.per_1x32
@@ -938,7 +978,7 @@ def fused_moe_2stages(
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
             and activation == ActivationType.Swiglu
-            or (q_dtype_a in [dtypes.fp4x2] and metadata.ksplit > 1)
+            or (q_dtype_a in [dtypes.fp4x2] and metadata.ksplit > 1 and is_shuffled)
         )
     ):
         a1 = hidden_states.to(dtype)
@@ -1041,7 +1081,7 @@ def fused_moe_2stages(
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
             and activation == ActivationType.Swiglu
-            or metadata.ksplit > 1
+            or (metadata.ksplit > 1 and is_shuffled)
         )
     ):
         a2_scale = None
@@ -1474,11 +1514,12 @@ def ck_moe_stage1(
     dtype=None,
 ):
     token_num = hidden_states.shape[0]
+    is_splitk = quant_type is aiter.QuantType.per_1x128 and splitk > 1
     tmp_out = (
         torch.zeros(
             (token_num, topk, w1.shape[1]), dtype=dtypes.fp32, device=out.device
         )
-        if splitk > 1
+        if is_splitk
         else out
     )
     aiter.ck_moe_stage1_fwd(
@@ -1497,11 +1538,11 @@ def ck_moe_stage1(
         sorted_weights,
         quant_type,
         activation,
-        splitk,
+        splitk if is_splitk else 0,
         use_non_temporal_load,
         out.dtype,
     )
-    if splitk > 1:
+    if is_splitk:
         if activation == ActivationType.Silu:
             aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32))
         else:

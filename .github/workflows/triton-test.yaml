@@ -4,12 +4,14 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
     paths:
       - "aiter/ops/triton/**"
       - "op_tests/triton_tests/**"
       - "op_tests/op_benchmarks/triton/**"
       - ".github/workflows/triton-test.yaml"
+      - ".github/scripts/build_aiter_triton.sh"
       - ".github/scripts/select_triton_tests.py"
   workflow_dispatch:
 
@@ -19,6 +21,7 @@ concurrency:
 
 jobs:
   check-signal:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -31,6 +34,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   triton:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     name: Triton Tests (1 GPU)
     runs-on: ${{ matrix.runner }}
     needs: [check-signal]
@@ -51,6 +55,9 @@ jobs:
           fetch-depth: 1
           submodules: 'recursive'
 
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+        
       - name: Run the container
         run: |
           set -ex
