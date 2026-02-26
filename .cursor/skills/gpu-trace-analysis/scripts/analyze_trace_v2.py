@@ -6,8 +6,11 @@ Analyzes prefill vs decode sections, disambiguates kernels, and measures GPU idl
 
 Usage: python3 analyze_trace_v2.py <trace_file.json.gz>
 """
+import argparse
+import csv
 import json
 import gzip
+import os
 import sys
 import re
 import bisect
@@ -944,8 +947,363 @@ def analyze(trace_path):
     print("\nDone.")
 
 
+# ────────────────────────────────────────────────────────────
+# Batch mode: analyze multiple traces and produce summary CSV
+# ────────────────────────────────────────────────────────────
+
+def analyze_for_batch(trace_path):
+    """Run the same analysis as analyze() but return structured data instead of printing."""
+    data = load_trace(trace_path)
+    events = data['traceEvents']
+
+    framework = detect_framework(events)
+
+    if framework == 'annotation':
+        sections = find_sections_annotation(events)
+    elif framework == 'atom':
+        sections = find_sections_atom(events)
+    else:
+        sections = find_sections_annotation(events)
+        if not sections:
+            return None
+
+    if framework == 'annotation':
+        fwd_kernels, unassigned = map_kernels_annotation(events, sections)
+    else:
+        fwd_kernels, unassigned = map_kernels_atom(events, sections)
+
+    total_gpu_events = sum(1 for e in events if e.get('cat') in ('kernel', 'gpu_memcpy', 'gpu_memset'))
+    assigned_total = sum(len(v) for v in fwd_kernels.values())
+
+    decode_secs = [s for s in sections if s['type'] == 'decode']
+    prefill_secs = [s for s in sections if s['type'] == 'prefill']
+    mixed_secs = [s for s in sections if s['type'] == 'mixed']
+    non_decode_secs = [s for s in sections if s['type'] != 'decode']
+
+    warmup_idxs = set()
+    if framework == 'atom':
+        for s in decode_secs:
+            if len(fwd_kernels.get(s['idx'], [])) < 100:
+                warmup_idxs.add(s['idx'])
+    steady_decode_secs = [s for s in decode_secs if s['idx'] not in warmup_idxs]
+
+    global_stats, idle_by_type, all_gaps, per_section_idle = \
+        compute_idle_global(fwd_kernels, sections, events)
+
+    result = {
+        'framework': framework,
+        'total_gpu_events': total_gpu_events,
+        'assigned_events': assigned_total,
+        'unassigned_events': len(unassigned),
+        'gpu_utilization_pct': global_stats.get('utilization', 0),
+        'gpu_active_us': global_stats.get('total_active', 0),
+        'gpu_idle_us': global_stats.get('total_idle', 0),
+        'gpu_span_us': global_stats.get('total_span', 0),
+    }
+
+    section_groups = {
+        'prefill': non_decode_secs,
+        'decode': steady_decode_secs,
+        'mixed': mixed_secs,
+    }
+    for stype, slist in section_groups.items():
+        if not slist:
+            result[f'{stype}_iters'] = 0
+            continue
+        n_iters = len(slist)
+        durs = [s['dur'] for s in slist]
+        all_k = []
+        for s in slist:
+            all_k.extend(fwd_kernels.get(s['idx'], []))
+        total_gpu = sum(k['dur'] for k in all_k)
+
+        result[f'{stype}_iters'] = n_iters
+        result[f'{stype}_avg_wall_us'] = sum(durs) / n_iters
+        result[f'{stype}_avg_gpu_us'] = total_gpu / n_iters
+        result[f'{stype}_total_gpu_us'] = total_gpu
+
+        variants = detect_kernel_variants(fwd_kernels, slist)
+        kernel_rows = []
+        for kname, var_list in variants.items():
+            for v in var_list:
+                pct = v['total'] / total_gpu * 100 if total_gpu else 0
+                vlabel = f" [{v['label']}]" if v['label'] else ''
+                kernel_rows.append({
+                    'kernel': f"{kname}{vlabel}",
+                    'variant': v['label'] or '',
+                    'calls_per_iter': v['calls_per_iter'],
+                    'total_count': v['total_count'],
+                    'total_us': v['total'],
+                    'avg_us': v['avg'],
+                    'min_us': v['min'],
+                    'max_us': v['max'],
+                    'pct_gpu': pct,
+                })
+        kernel_rows.sort(key=lambda r: -r['total_us'])
+        result[f'{stype}_kernels'] = kernel_rows
+
+    return result
+
+
+def extract_config_from_dirname(dirname):
+    m = re.match(r'in(\d+)_out(\d+)_conc(\d+)', dirname)
+    if m:
+        return {'input_tokens': int(m[1]), 'output_tokens': int(m[2]), 'concurrency': int(m[3])}
+    return None
+
+
+def find_rank0_trace(folder):
+    for f in sorted(os.listdir(folder)):
+        if 'rank-0' in f and f.endswith('.pt.trace.json.gz'):
+            return os.path.join(folder, f)
+    return None
+
+
+def batch_analyze(traces_dir, output_csv=None):
+    """Analyze rank-0 traces from all config subdirectories."""
+    subdirs = sorted([
+        d for d in os.listdir(traces_dir)
+        if os.path.isdir(os.path.join(traces_dir, d)) and extract_config_from_dirname(d)
+    ])
+    if not subdirs:
+        print(f'No config subdirectories found in {traces_dir}', file=sys.stderr)
+        return
+
+    all_results = []
+    summary_rows = []
+    kernel_rows = []
+
+    for dirname in subdirs:
+        config = extract_config_from_dirname(dirname)
+        folder = os.path.join(traces_dir, dirname)
+        trace_path = find_rank0_trace(folder)
+        if not trace_path:
+            print(f'  SKIP {dirname}: no rank-0 trace found', file=sys.stderr)
+            continue
+
+        print(f'Analyzing {dirname}...', file=sys.stderr)
+        try:
+            result = analyze_for_batch(trace_path)
+        except Exception as exc:
+            print(f'  ERROR {dirname}: {exc}', file=sys.stderr)
+            continue
+        if result is None:
+            print(f'  SKIP {dirname}: no sections found', file=sys.stderr)
+            continue
+
+        all_results.append((dirname, config, result))
+
+        srow = {
+            'config': dirname,
+            'input_tokens': config['input_tokens'],
+            'output_tokens': config['output_tokens'],
+            'concurrency': config['concurrency'],
+            'gpu_util_pct': round(result['gpu_utilization_pct'], 1),
+            'gpu_active_ms': round(result['gpu_active_us'] / 1000, 2),
+            'gpu_idle_ms': round(result['gpu_idle_us'] / 1000, 2),
+            'gpu_span_ms': round(result['gpu_span_us'] / 1000, 2),
+            'total_gpu_events': result['total_gpu_events'],
+            'assigned_events': result['assigned_events'],
+        }
+        for stype in ('prefill', 'decode', 'mixed'):
+            srow[f'{stype}_iters'] = result.get(f'{stype}_iters', 0)
+            if result.get(f'{stype}_iters', 0) > 0:
+                srow[f'{stype}_avg_gpu_ms'] = round(result[f'{stype}_avg_gpu_us'] / 1000, 2)
+                srow[f'{stype}_avg_wall_ms'] = round(result[f'{stype}_avg_wall_us'] / 1000, 2)
+                srow[f'{stype}_total_gpu_ms'] = round(result[f'{stype}_total_gpu_us'] / 1000, 2)
+
+        summary_rows.append(srow)
+
+        for stype in ('prefill', 'decode', 'mixed'):
+            for kr in result.get(f'{stype}_kernels', []):
+                kernel_rows.append({
+                    'config': dirname,
+                    'input_tokens': config['input_tokens'],
+                    'output_tokens': config['output_tokens'],
+                    'concurrency': config['concurrency'],
+                    'section_type': stype,
+                    'kernel': kr['kernel'],
+                    'variant': kr['variant'],
+                    'calls_per_iter': kr['calls_per_iter'],
+                    'total_count': kr['total_count'],
+                    'total_us': round(kr['total_us'], 2),
+                    'avg_us': round(kr['avg_us'], 2),
+                    'min_us': round(kr['min_us'], 2),
+                    'max_us': round(kr['max_us'], 2),
+                    'pct_gpu': round(kr['pct_gpu'], 2),
+                })
+
+    if not summary_rows:
+        print('No traces analyzed successfully.', file=sys.stderr)
+        return
+
+    base = output_csv or os.path.join(traces_dir, 'trace_analysis')
+    if base.endswith('.csv'):
+        base = base[:-4]
+    summary_csv = base + '_summary.csv'
+    kernel_csv = base + '_kernels.csv'
+
+    _write_csv(summary_csv, summary_rows)
+    _write_csv(kernel_csv, kernel_rows)
+
+    print(f'\nSummary CSV: {summary_csv}', file=sys.stderr)
+    print(f'Kernel CSV:  {kernel_csv}', file=sys.stderr)
+
+    top5_txt = base + '_top5.txt'
+    _write_top5(top5_txt, all_results)
+    print(f'Top-5 TXT:   {top5_txt}', file=sys.stderr)
+
+    _print_batch_summary(summary_rows)
+    _print_batch_top5(all_results)
+    _print_batch_decode_kernels(all_results)
+
+
+def _write_csv(path, rows):
+    if not rows:
+        return
+    keys = list(rows[0].keys())
+    for r in rows[1:]:
+        for k in r:
+            if k not in keys:
+                keys.append(k)
+    with open(path, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        w.writerows(rows)
+
+
+def _format_top5_lines(all_results):
+    """Build top-5 kernel summary lines for each section type and config."""
+    lines = []
+    config_order = [(d, c, r) for d, c, r in all_results]
+
+    for stype in ('prefill', 'decode', 'mixed'):
+        has_data = False
+        for dirname, config, result in config_order:
+            kernels = result.get(f'{stype}_kernels', [])
+            n_iters = result.get(f'{stype}_iters', 0)
+            if n_iters == 0 or not kernels:
+                continue
+            top5 = kernels[:5]
+            if not has_data:
+                lines.append('')
+                lines.append('=' * 140)
+                lines.append(f' TOP-5 {stype.upper()} KERNELS PER CONFIG')
+                lines.append('=' * 140)
+                has_data = True
+            avg_gpu_ms = result.get(f'{stype}_avg_gpu_us', 0) / 1000
+            lines.append('')
+            lines.append(f'  {dirname}  ({stype} iters: {n_iters}, avg GPU/iter: {avg_gpu_ms:.2f} ms)')
+            lines.append(f'  {"Kernel":<55} {"Var":>3} {"#/It":>5} {"Count":>7} {"Total":>10} {"Avg":>9} {"% GPU":>6}')
+            lines.append(f'  {"-"*98}')
+            for kr in top5:
+                kname = kr['kernel']
+                if ' [' in kname:
+                    kname = kname.split(' [')[0]
+                if len(kname) > 55:
+                    kname = kname[:52] + '...'
+                var = kr['variant'] if kr['variant'] else '-'
+                lines.append(f'  {kname:<55} {var:>3} {kr["calls_per_iter"]:>5} {kr["total_count"]:>7}'
+                             f' {fmt_us(kr["total_us"]):>10} {fmt_us(kr["avg_us"]):>9} {kr["pct_gpu"]:>5.1f}%')
+    lines.append('')
+    return lines
+
+
+def _print_batch_top5(all_results):
+    for line in _format_top5_lines(all_results):
+        print(line)
+
+
+def _write_top5(path, all_results):
+    lines = _format_top5_lines(all_results)
+    with open(path, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+
+
+def _print_batch_summary(rows):
+    W = 140
+    print()
+    print('=' * W)
+    print('TRACE ANALYSIS SUMMARY')
+    print('=' * W)
+    hdr = (f"{'Config':<30} {'GPU%':>5} {'PF_it':>5} {'PF_GPU_ms':>10} {'PF_Wall_ms':>11}"
+           f" {'DC_it':>6} {'DC_GPU_ms':>10} {'DC_Wall_ms':>11} {'MX_it':>5} {'Events':>9}")
+    print(hdr)
+    print('-' * W)
+    for r in rows:
+        pf_gpu = r.get('prefill_avg_gpu_ms', '-')
+        pf_wall = r.get('prefill_avg_wall_ms', '-')
+        dc_gpu = r.get('decode_avg_gpu_ms', '-')
+        dc_wall = r.get('decode_avg_wall_ms', '-')
+        print(f"{r['config']:<30} {r['gpu_util_pct']:>5} {r['prefill_iters']:>5} {pf_gpu:>10} {pf_wall:>11}"
+              f" {r['decode_iters']:>6} {dc_gpu:>10} {dc_wall:>11}"
+              f" {r.get('mixed_iters',0):>5} {r['total_gpu_events']:>9}")
+    print('=' * W)
+    print('PF = Prefill (incl. mixed), DC = Decode (steady-state), MX = Mixed')
+    print('GPU_ms = avg kernel time/iter, Wall_ms = avg annotation dur/iter, GPU% = utilization')
+    print()
+
+
+def _print_batch_decode_kernels(all_results):
+    W = 120
+    print('=' * W)
+    print('DECODE KERNEL BREAKDOWN (all kernels, with disambiguation)')
+    print('=' * W)
+    for dirname, config, result in all_results:
+        dc_kernels = result.get('decode_kernels', [])
+        dc_iters = result.get('decode_iters', 0)
+        if dc_iters == 0 or not dc_kernels:
+            continue
+        dc_avg = result.get('decode_avg_gpu_us', 0) / 1000
+        print(f"\n  {dirname}  (decode iters: {dc_iters}, avg GPU/iter: {dc_avg:.2f} ms)")
+        print(f"  {'Kernel':<45} {'Var':>3} {'#/It':>5} {'Cnt':>7} {'Total':>10} {'Avg':>9} {'%GPU':>6}")
+        print(f"  {'─' * 88}")
+        for kr in dc_kernels:
+            if kr['pct_gpu'] < 0.1:
+                continue
+            total_str = fmt_us(kr['total_us'])
+            avg_str = fmt_us(kr['avg_us'])
+            var_str = kr['variant'] if kr['variant'] else '—'
+            kname = kr['kernel'].split(' [')[0] if ' [' in kr['kernel'] else kr['kernel']
+            print(f"  {kname:<45} {var_str:>3} {kr['calls_per_iter']:>5} {kr['total_count']:>7}"
+                  f" {total_str:>10} {avg_str:>9} {kr['pct_gpu']:>5.1f}%")
+
+    print()
+    print('=' * W)
+    print('PREFILL KERNEL BREAKDOWN (all kernels, with disambiguation)')
+    print('=' * W)
+    for dirname, config, result in all_results:
+        pf_kernels = result.get('prefill_kernels', [])
+        pf_iters = result.get('prefill_iters', 0)
+        if pf_iters == 0 or not pf_kernels:
+            continue
+        pf_avg = result.get('prefill_avg_gpu_us', 0) / 1000
+        print(f"\n  {dirname}  (prefill iters: {pf_iters}, avg GPU/iter: {pf_avg:.2f} ms)")
+        print(f"  {'Kernel':<45} {'Var':>3} {'#/It':>5} {'Cnt':>7} {'Total':>10} {'Avg':>9} {'%GPU':>6}")
+        print(f"  {'─' * 88}")
+        for kr in pf_kernels:
+            if kr['pct_gpu'] < 0.1:
+                continue
+            total_str = fmt_us(kr['total_us'])
+            avg_str = fmt_us(kr['avg_us'])
+            var_str = kr['variant'] if kr['variant'] else '—'
+            kname = kr['kernel'].split(' [')[0] if ' [' in kr['kernel'] else kr['kernel']
+            print(f"  {kname:<45} {var_str:>3} {kr['calls_per_iter']:>5} {kr['total_count']:>7}"
+                  f" {total_str:>10} {avg_str:>9} {kr['pct_gpu']:>5.1f}%")
+    print()
+
+
 if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print("Usage: python3 analyze_trace_v2.py <trace_file.json.gz>")
-        sys.exit(1)
-    analyze(sys.argv[1])
+    parser = argparse.ArgumentParser(
+        description='GPU Kernel Trace Analyzer for ML Serving Frameworks')
+    parser.add_argument('path', help='Trace file (.json.gz) or directory for --batch')
+    parser.add_argument('--batch', action='store_true',
+                        help='Batch mode: analyze rank-0 traces from all subdirs')
+    parser.add_argument('--output-csv', default=None,
+                        help='Output CSV base path (batch mode); _summary.csv and _kernels.csv appended')
+    args = parser.parse_args()
+
+    if args.batch:
+        batch_analyze(args.path, args.output_csv)
+    else:
+        analyze(args.path)
