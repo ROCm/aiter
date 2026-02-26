@@ -319,7 +319,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                             work_info.kv_end = ck_tile::min(
                                 work_info.kv_start + (consuming_blks * params.kv_granularity),
                                 curr_kv_end - batch_tail);
-                            if (curr_kv_end - work_info.kv_end < 4 && curr_kv_end - work_info.kv_end > 0)
+                            if (curr_kv_end - work_info.kv_end < 4)
                             {
                                 cur_tail_done = true;
                                 work_info.kv_end = curr_kv_end;
@@ -356,7 +356,10 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                         ++curr_n_split_idx;
                     }
                 }
-                break;
+                if (!cur_tail_done)
+                {
+                    break;
+                }
             }
         }
 
