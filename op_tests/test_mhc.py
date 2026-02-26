@@ -12,10 +12,7 @@ import aiter
 from aiter import dtypes
 import argparse
 import pandas as pd
-import logging
-from aiter.jit.utils.chip_info import get_cu_num
 
-logging.getLogger("KernelCache").disabled = True
 
 torch.set_default_device("cuda")
 # torch.cuda.manual_seed_all(0)
@@ -406,76 +403,17 @@ def mhc_pre_hip(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    import math
-
-    m = residual.size(0)
-    hc_mult = residual.size(1)
-    hc_mult3 = fn.size(0)
-    hc_hidden_size = fn.size(1)
-
-    prefetch_stages = 2
-    tile_m = 16 * 4
-    tile_k_tg_dict = {
-        128: 2,
-        64: 4,
-    }
-    num_cu = get_cu_num()
-    selected_splitk = 1
-    selected_tile_k = 128
-    num_tg_m = (m + tile_m - 1) // tile_m
-    selected_score = num_tg_m / (num_cu * tile_k_tg_dict[selected_tile_k])
-    selected_score = selected_score / math.ceil(selected_score)
-    for tile_k, tg_per_cu in tile_k_tg_dict.items():
-        if (hc_hidden_size % tile_k) != 0:
-            continue
-        meanwhile_tg = num_cu * tg_per_cu
-        for splitk in range(1, 17):
-            if hc_hidden_size % (splitk * tile_k) != 0 or (hc_hidden_size // splitk) < (
-                tile_k * prefetch_stages
-            ):
-                continue
-            num_tg = num_tg_m * splitk
-            if num_tg > meanwhile_tg * 4:
-                selected_splitk = splitk
-                selected_tile_k = tile_k
-                break
-            score = num_tg / meanwhile_tg
-            score = score / math.ceil(score)
-            # print(f"{selected_score=}, {score=} {splitk=} {tile_k=}")
-            if selected_score < score:
-                selected_splitk = splitk
-                selected_tile_k = tile_k
-                selected_score = score
-
-    out_pad = torch.empty(
-        selected_splitk, m, (hc_mult3 + 31) // 32 * 32, dtype=dtypes.fp32
-    )
-    out = out_pad[:, :, :hc_mult3]
-    sqrsum = torch.empty(selected_splitk, m, dtype=dtypes.fp32)
-    aiter.mhc_pre_gemm_sqrsum(out, sqrsum, residual, fn, selected_tile_k)
-    # out = out.sum(0)
-    # sqrsum = sqrsum.sum(0)
-
-    post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32)
-    comb_mix = torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32)
-    layer_input = torch.empty(m, hidden_size, dtype=dtypes.bf16)
-    aiter.mhc_pre_big_fuse(
-        post_mix,
-        comb_mix,
-        layer_input,
-        out,
-        sqrsum,
+    return aiter.mhc_pre(
+        residual,
+        fn,
         hc_scale,
         hc_base,
-        residual,
         rms_eps,
         hc_pre_eps,
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
     )
-
-    return post_mix, comb_mix, layer_input
 
 
 @benchmark()
@@ -499,8 +437,8 @@ def test_mhc_pre(m, hidden_size, hc_mult):
         residual, fn, hc_scale, hc_base, **extra_args
     )
     (post_mix_hip, comb_mix_hip, layer_input_hip), hip_us = run_perftest(
-        mhc_pre_hip, residual, fn, hc_scale, hc_base, **extra_args
-    )  # , num_iters=2, num_warmup=0)
+        mhc_pre_hip, residual, fn, hc_scale, hc_base, **extra_args,)
+        # num_iters=2, num_warmup=0)
 
     checkAllclose(post_mix_ref, post_mix_hip, msg="post_mix")
     checkAllclose(comb_mix_ref, comb_mix_hip, msg="comb_mix")
@@ -508,7 +446,8 @@ def test_mhc_pre(m, hidden_size, hc_mult):
     ret = {}
     ret["hip_err"] = hip_err
     ret["hip_us"] = hip_us
-
+    # ret["FLOPS / T"] = 2.0 * m * hidden_size * hc_mult * hc_mult3 / 1e6
+    # ret["GB / T"] = (m * hc_mult3 * dtypes.fp32.itemsize + (m * hc_mult + m) * hidden_size * dtypes.bf16.itemsize) / 1e6
     # try:
     #     (post_mix_tilelang, comb_mix_tilelang, layer_input_tilelang), tilelang_us = run_perftest(mhc_pre_tilelang, residual, fn, hc_scale, hc_base, **extra_args)
     #     checkAllclose(post_mix_ref, post_mix_tilelang, msg="post_mix")
@@ -523,12 +462,49 @@ def test_mhc_pre(m, hidden_size, hc_mult):
     return ret
 
 
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["fp16"], dtypes.d_dtypes["bf16"]],
+    nargs="*",
+    metavar="{fp16, bf16}",
+    default=["bf16"],
+    help="""Data type.
+    e.g.: -d bf16""",
+)
+parser.add_argument(
+    "-m",
+    type=int,
+    nargs="*",
+    default=[512, 1024, 2048, 8192, 65536],
+    help="""M.
+    e.g.: -m 32""",
+)
+parser.add_argument(
+    "-n",
+    "--hidden_size",
+    type=int,
+    nargs="*",
+    choices=[1280, 2560, 4096],
+    default=[1280, 2560, 4096],
+    help="""hidden_size.
+    e.g.: -hidden_size 1024""",
+)
+
+args = parser.parse_args()
+
 df = []
-for m in [512, 1024, 2048, 8192][:]:
-    for hidden_size in [1280, 2560, 4096][:]:
-        for hc_mult in [4]:
-            ret = test_mhc_pre(m=m, hidden_size=hidden_size, hc_mult=hc_mult)
-            df.append(ret)
+for dtype in args.dtype:
+    for m in args.m:
+        for hidden_size in args.hidden_size:
+            for hc_mult in [4]:
+                ret = test_mhc_pre(m=m, hidden_size=hidden_size, hc_mult=hc_mult)
+                df.append(ret)
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("mhc summary (markdown):\n%s", df_md)
