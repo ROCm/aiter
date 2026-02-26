@@ -10,7 +10,6 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8 import (
     _get_config,
 )
 from aiter.ops.triton.utils.device_info import get_num_xcds
-from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
 
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -26,8 +25,7 @@ def gemm_a8w8(
     dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
-    num_ksplit: int = 1,
-    skip_reduce: bool = False,
+    skip_reduce: Optional[bool] = False,
 ):
     """
     Computes 8 bit matrix multiplication Y = (X @ W^T) * (x_scale * w_scale) with optional bias.
@@ -42,10 +40,10 @@ def gemm_a8w8(
         dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
         y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
         config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
-            BLOCK_SIZE_K, GROUP_SIZE_M).
-        num_ksplit (int): Number of K-dimension splits for split-K GEMM. Default 1 (no split).
-        skip_reduce (bool): If True and num_ksplit > 1, return partial results of shape
-            (NUM_KSPLIT, M, N) without reducing.
+            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
+        skip_reduce (Optional[bool]): Skip reduction of split-K partial results.
+            Enables kernel fusion with downstream operations (FP8/FP4 quantization,
+            RMSNorm). Returns shape (NUM_KSPLIT, M, N) instead of (M, N).
 
     Returns:
         torch.Tensor: Output with shape (M, N) or (NUM_KSPLIT, M, N) if skip_reduce=True.
@@ -65,18 +63,12 @@ def gemm_a8w8(
     if config is None:
         config, _ = _get_config(M, N, K)
 
-    if num_ksplit > 1:
-        config["NUM_KSPLIT"] = num_ksplit
-        compute_splitk_params(config, K)
-
-    NUM_KSPLIT = config["NUM_KSPLIT"]
-
-    if y is None and (NUM_KSPLIT == 1 or not skip_reduce):
+    if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-    if NUM_KSPLIT > 1:
+    if config["NUM_KSPLIT"] > 1:
         y_pp = torch.empty(
-            (NUM_KSPLIT, M, N),
+            (config["NUM_KSPLIT"], M, N),
             dtype=torch.float32,
             device=y.device if y is not None else x.device,
         )
@@ -99,7 +91,7 @@ def gemm_a8w8(
         x_scale,
         w_scale,
         bias,
-        y if NUM_KSPLIT == 1 else y_pp,
+        y if config["NUM_KSPLIT"] == 1 else y_pp,
         M,
         N,
         K,
@@ -107,15 +99,15 @@ def gemm_a8w8(
         x.stride(1),
         w.stride(0),
         w.stride(1),
-        0 if NUM_KSPLIT == 1 else y_pp.stride(0),
-        y.stride(0) if NUM_KSPLIT == 1 else y_pp.stride(1),
-        y.stride(1) if NUM_KSPLIT == 1 else y_pp.stride(2),
-        (bias is not None) and (NUM_KSPLIT == 1),
+        0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+        y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+        y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+        (bias is not None) and (config["NUM_KSPLIT"] == 1),
         NUM_XCDS=get_num_xcds(),
         **config,
     )
 
-    if NUM_KSPLIT > 1:
+    if config["NUM_KSPLIT"] > 1:
         if skip_reduce:
             return y_pp
 
@@ -142,7 +134,7 @@ def gemm_a8w8(
             BLOCK_SIZE_M=REDUCE_BLOCK_SIZE_M,
             BLOCK_SIZE_N=REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT=ACTUAL_KSPLIT,
-            MAX_KSPLIT=triton.next_power_of_2(NUM_KSPLIT),
+            MAX_KSPLIT=triton.next_power_of_2(config["NUM_KSPLIT"]),
         )
 
     return y
