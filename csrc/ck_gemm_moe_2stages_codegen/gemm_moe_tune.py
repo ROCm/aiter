@@ -37,12 +37,10 @@ from aiter.ops.flydsl.utils import is_flydsl_available
 
 if is_flydsl_available():
     from aiter.ops.flydsl.moe_kernels import (
-        flydsl_kernel_name,
         parse_flydsl_kernel_name,
         get_flydsl_stage1_kernels,
         get_flydsl_stage2_kernels,
         compile_flydsl_moe_stage1,
-        compile_flydsl_moe_stage2,
     )
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/")
@@ -1562,7 +1560,7 @@ class FmoeTuner(TunerCommon):
             doweight_stage1,
         ) = info
         ## asm moe 1 stage tuning
-        chip_name = get_gfx()
+        get_gfx()
         key = (act_type, q_type, dtype, q_dtype_a, q_dtype_w, use_g1u1)
         acti_dir = ""
         if act_type == ActivationType.Silu:
@@ -1938,11 +1936,9 @@ class FmoeTuner(TunerCommon):
         out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
 
         if a_dtype_str != "fp4":
-            flydsl_s1_kernels = get_flydsl_stage1_kernels(
-                a_dtype_str, b_dtype_str, out_dtype_str
-            )
+            get_flydsl_stage1_kernels(a_dtype_str, b_dtype_str, out_dtype_str)
         else:
-            flydsl_s1_kernels = {}
+            pass
         flydsl_s2_kernels = get_flydsl_stage2_kernels(
             a_dtype_str, b_dtype_str, out_dtype_str
         )
