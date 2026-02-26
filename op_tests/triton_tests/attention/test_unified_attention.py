@@ -90,8 +90,6 @@ DEVICE_ARCH = arch_info.get_arch()
 NUM_HEADS = [(64, 8)]
 HEAD_SIZES = [64, 128]
 BLOCK_SIZES = [16, 64]
-HEAD_SIZES = [128]
-BLOCK_SIZES = [64]
 
 
 DTYPES = [torch.bfloat16]
@@ -168,34 +166,6 @@ def ref_paged_attn(
     return torch.cat(outputs, dim=0)
 
 
-import os
-
-if os.environ.get("SCL_BACKEND") == "0":
-    SCL_BACKEND = [
-        ("triton", False, 1, False),  # use triton
-    ]
-elif os.environ.get("SCL_BACKEND") == "1":
-    SCL_BACKEND = [
-        ("gluon", False, 1, False),  # use gluon baseline
-    ]
-elif os.environ.get("SCL_BACKEND") == "2":
-    SCL_BACKEND = [
-        ("gluon", False, 1, True),  # use gluon simple async_copy
-    ]
-elif os.environ.get("SCL_BACKEND") == "3":
-    SCL_BACKEND = [
-        ("gluon", True, 1, False),  # use gluon TDM async_copy
-    ]
-elif os.environ.get("SCL_BACKEND") == "4":
-    SCL_BACKEND = [
-        ("gluon", True, 4, False),  # use gluon TDM gather pipelined
-    ]
-elif os.environ.get("SCL_BACKEND") == "5":
-    SCL_BACKEND = [
-        ("gluon", True, 8, False),  # use gluon TDM gather pipelined
-    ]
-
-
 # @pytest.mark.parametrize(
 #     "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
 # )
@@ -228,19 +198,17 @@ elif os.environ.get("SCL_BACKEND") == "5":
 @pytest.mark.parametrize("soft_cap", [None])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("q_dtype", QDTYPES)
-# @pytest.mark.parametrize("shuffled_kv_cache", [True, False])
 @pytest.mark.parametrize("shuffled_kv_cache", [True, False])
 @pytest.mark.parametrize(
     "backend, use_tdm, num_tdm_gather, use_async",
-    SCL_BACKEND,
-    # [
-    #     ("triton", False, 1, False),  # use triton
-    #     ("gluon", False, 1, False),  # use gluon baseline
-    #     ("gluon", False, 1, True),  # use gluon simple async_copy
-    #     ("gluon", True, 1, False),  # use gluon TDM async_copy
-    #     ("gluon", True, 4, False),  # use gluon TDM gather pipelined
-    #     ("gluon", True, 8, False),  # use gluon TDM gather pipelined
-    # ],
+    [
+        ("triton", False, 1, False),  # use triton
+        ("gluon", False, 1, False),  # use gluon baseline
+        ("gluon", False, 1, True),  # use gluon simple async_copy
+        ("gluon", True, 1, False),  # use gluon TDM async_copy
+        ("gluon", True, 4, False),  # use gluon TDM gather pipelined
+        ("gluon", True, 8, False),  # use gluon TDM gather pipelined
+    ],
 )
 @torch.inference_mode()
 def test_triton_unified_attn(
