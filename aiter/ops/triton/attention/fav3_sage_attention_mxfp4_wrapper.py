@@ -70,7 +70,7 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
             hadamard_rotation=hadamard_rotation,
             R=R,
             BLOCK_M=config["BLOCK_M"],
-            BLOCK_R=128 if R is None else R.shape[-1],
+            BLOCK_R=32 if R is None else R.shape[-1],
             q_smoothing=q_smooth,
             layout=layout,
         )
