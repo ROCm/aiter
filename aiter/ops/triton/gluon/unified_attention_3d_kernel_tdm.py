@@ -247,6 +247,7 @@ class AttentionConfig:
             self.V_SHARED_LAYOUT = gl.constexpr(
                 gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
             )
+            # TODO Disabled PaddedSharedLayout for now
             # self.K_SHARED_LAYOUT = gl.constexpr(
             #     gl.PaddedSharedLayout.with_identity_for(
             #         interval_padding_pairs=[[BLOCK_SIZE * HEAD_SIZE, 8]],

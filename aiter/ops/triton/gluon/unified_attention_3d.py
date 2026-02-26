@@ -280,46 +280,6 @@ def make_layout_3d(
             order=[1, 0],
         )
 
-    # 64
-    # ttg.linear<{register = [[1, 0], [2, 0], [4, 0], [0, 2], [0, 32]], lane = [[8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16]], warp = [[0, 1]], block = []}>
-    # 128
-    # ttg.linear<{register = [[1, 0], [2, 0], [4, 0], [0, 2], [0, 4], [0, 8]], lane = [[8, 0], [16, 0], [32, 0], [64, 0], [0, 16], [0, 32]], warp = [[0, 1]], block = []}>
-    # K_LOAD_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
-    #     reg_bases=[[1, 0], [2, 0], [4, 0], [0, 2], [0, 32]],
-    #     lane_bases=[[8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16]],
-    #     warp_bases=[[0, 1]],
-    #     block_bases=[],
-    #     shape=[HEAD_SIZE_PADDED, TILE_SIZE],
-    # )
-    # bases_representation = {
-    #     "reg_bases": ["m0", "m1", "m2", "n1", "n5"],
-    #     "lane_bases": ["m3", "m4", "m5", "n2", "n3", "n4"],
-    #     "warp_bases": ["n0"],
-    # }
-    # K_LOAD_LAYOUT = make_distributed_linear_layout(
-    #     [HEAD_SIZE_PADDED, TILE_SIZE], bases_representation
-    # )
-
-    # 64
-    # ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [2, 0], [32, 0]], lane = [[0, 8], [0, 16], [0, 32], [8, 0], [4, 0], [16, 0]], warp = [[1, 0]], block = []}>
-    # 128
-    # ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [2, 0], [8, 0], [4, 0]], lane = [[0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0]], warp = [[1, 0]], block = []}>
-    # V_LOAD_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
-    #     reg_bases=[[0, 1], [0, 2], [0, 4], [2, 0], [32, 0]],
-    #     lane_bases=[[0, 8], [0, 16], [0, 32], [8, 0], [4, 0], [16, 0]],
-    #     warp_bases=[[1, 0]],
-    #     block_bases=[],
-    #     shape=[TILE_SIZE, HEAD_SIZE_PADDED],
-    # )
-    # bases_representation = {
-    #     "reg_bases": ["n0", "n1", "n2", "m1", "m5"],
-    #     "lane_bases": ["n3", "n4", "n5", "m3", "m2", "m4"],
-    #     "warp_bases": ["m0"],
-    # }
-    # V_LOAD_LAYOUT = make_distributed_linear_layout(
-    #     [TILE_SIZE, HEAD_SIZE_PADDED], bases_representation
-    # )
-
     # TODO: for future impl
     # ctas_per_cga = [1, 1]
     # cga_layout_Q = make_cga_layout(
