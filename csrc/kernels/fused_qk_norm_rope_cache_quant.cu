@@ -278,7 +278,6 @@
          }
          int64_t cache_offset = block_idx * page_size * num_heads_k * head_dim +
                                 headIdx * head_dim * page_size + block_offset * x;
- 
  #pragma unroll
          for(int i = 0; i < numElemsPerThread; i++)
          {
@@ -308,7 +307,6 @@
          int64_t cache_offset = block_idx * page_size * num_heads_v * head_dim +
                                 headIdx * head_dim * page_size + block_offset / x * head_dim * x +
                                 block_offset % x;
- 
          // no vectorized store for v cache since its not contiguous on head_dim
  #pragma unroll
          for(int i = 0; i < numElemsPerThread; i++)
@@ -327,15 +325,6 @@
     }
 }
 
-template<typename scalar_t,  typename F, int WarpSize = 64>
- __device__ __forceinline__ scalar_t warp_reduce(scalar_t val, F op) {
-     #pragma unroll
-     for (int offset = WarpSize / 2; offset > 0; offset >>= 1) {
-         val = op(val, __shfl_xor(val, offset, WarpSize));
-     }
-     return val;
- }
- 
  template <typename scalar_t,
           typename kv_cache_scalar_t,
           int head_dim,
@@ -497,7 +486,13 @@ template<typename scalar_t,  typename F, int WarpSize = 64>
         }
     }
     auto sum               = [](float a, float b) { return a + b; };
-    int numtokens_in_block = block_reduce<int, decltype(sum), wg_size, true>(tokens_in_block, sum);
+    int numtokens_in_block = 0;
+    if constexpr (wg_size < WARP_SIZE) {
+        numtokens_in_block = multithread_reduce<int, decltype(sum), wg_size, true>(tokens_in_block, sum, blockDim.x);
+    } else {
+        numtokens_in_block = block_reduce<int, decltype(sum), wg_size, true>(tokens_in_block, sum);
+    }
+    
     // Calculate tokenIdx for current thread
     int tokenIdx = first_token_idx + threadIdx.x;
 
@@ -527,6 +522,7 @@ template<typename scalar_t,  typename F, int WarpSize = 64>
         // If qk, we adopt RMSNorm + RoPE, so we need to compute sum of squares.
         if(isV)
         {
+            #pragma unroll
             for(int i = 0; i < load_loop_cnt; i += 1)
             {
                 // consider stride
@@ -656,7 +652,11 @@ template<typename scalar_t,  typename F, int WarpSize = 64>
     auto f_max_f32 = [](float v_0_, float v_1_) { return __builtin_fmaxf(v_0_, v_1_); };
     if(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
     {
-        block_max = block_reduce<float, decltype(f_max_f32), wg_size, true>(block_max, f_max_f32);
+        if constexpr (wg_size < 64) {
+            block_max = multithread_reduce<float, decltype(f_max_f32), wg_size, true>(block_max, f_max_f32, blockDim.x);
+        } else {
+            block_max = block_reduce<float, decltype(f_max_f32), wg_size, true>(block_max, f_max_f32);
+        }
     }
 
     if(isK)
@@ -684,12 +684,14 @@ template<typename scalar_t,  typename F, int WarpSize = 64>
                     // Flatten the loop: all threads cooperatively process block_offset * head_dim elements
                     // [num_blocks, num_kv_heads, head_size // x, block_size, x]
                     int total_elements = block_offset * head_dim;
+                    int x_mask         = x - 1;
+                    int x_shift        = __builtin_ctz(x);
                     for(int idx = threadIdx.x; idx < total_elements; idx += blockDim.x)
                     {
                         int old_offset = idx / head_dim;
-                        int d = idx % head_dim;
-                        int d_idx = d / x;
-                        int x_idx = d % x;
+                        int d          = idx % head_dim;
+                        int d_idx      = d >> x_shift;
+                        int x_idx      = d & x_mask;
                         // [num_blocks, num_kv_heads, head_size // x, block_size, x]
                         int64_t cache_idx = cache_base + d_idx * page_size * x +
                                             old_offset * x + x_idx;
@@ -703,7 +705,8 @@ template<typename scalar_t,  typename F, int WarpSize = 64>
                 else
                 {
                     // Old scale is sufficient, use it for new data
-                    k_scale_val = k_scale_global;
+                    k_scale_val   = k_scale_global;
+                    inv_scale_val = 1.0f / k_scale_global;  // Must use global scale for quant
                 }
             }
             else
@@ -717,6 +720,7 @@ template<typename scalar_t,  typename F, int WarpSize = 64>
         // Only write if current token belongs to this block
         // [num_blocks, kv_heads, head_dim / x, block_size, x]
         int64_t total_elements = numtokens_in_block * head_dim;
+        
         for(int64_t idx = threadIdx.x; idx < total_elements / vec_size; idx += blockDim.x)
         {
             int token_idx = first_token_idx + idx * vec_size / head_dim;
@@ -727,10 +731,13 @@ template<typename scalar_t,  typename F, int WarpSize = 64>
             int64_t block_idx_local = block_offset_local / page_size + block_idx;
             block_offset_local      = block_offset_local % page_size;
 
+            int x_mask  = x - 1;
+            int x_shift = __builtin_ctz(x);
             for(int j = 0; j < vec_size; j++)
             {
-                int head_offset_divX = (head_offset + j) / x;
-                int head_offset_modX = (head_offset + j) % x;
+                int ho            = head_offset + j;
+                int head_offset_divX = ho >> x_shift;
+                int head_offset_modX = ho & x_mask;
                 int64_t offset = cache_offset + head_offset_divX * page_size * x + block_offset_local * x + head_offset_modX;
 
                 if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
@@ -770,12 +777,14 @@ template<typename scalar_t,  typename F, int WarpSize = 64>
                     // Requantize existing data [0, block_offset)
                     // Flatten the loop: all threads cooperatively process block_offset * head_dim elements
                     int total_elements = block_offset * head_dim;
+                    int x_mask        = x - 1;
+                    int x_shift        = __builtin_ctz(x);
                     for(int idx = threadIdx.x; idx < total_elements; idx += blockDim.x)
                     {
                         int old_offset = idx / head_dim;
-                        int d = idx % head_dim;
-                        int old_offset_divX = old_offset / x;
-                        int old_offset_modX = old_offset % x;
+                        int d          = idx % head_dim;
+                        int old_offset_divX = old_offset >> x_shift;
+                        int old_offset_modX = old_offset & x_mask;
                         // [num_blocks, num_kv_heads, block_size // x, head_size, x]
                         int64_t cache_idx = cache_base + old_offset_divX * head_dim * x +
                                             d * x + old_offset_modX;
@@ -789,7 +798,8 @@ template<typename scalar_t,  typename F, int WarpSize = 64>
                 else
                 {
                     // Old scale is sufficient, use it for new data
-                    v_scale_val = v_scale_global;
+                    v_scale_val   = v_scale_global;
+                    inv_scale_val = 1.0f / v_scale_global;  // Must use global scale for quant
                 }
             }
             else
@@ -815,8 +825,10 @@ template<typename scalar_t,  typename F, int WarpSize = 64>
             int block_offset_local  = token_idx - first_token_idx + block_offset;
             int64_t block_idx_local = block_offset_local / page_size + block_idx;
             block_offset_local      = block_offset_local % page_size;
-            int block_offset_divX = block_offset_local / x;
-            int x_idx = block_offset_local % x;
+            int v_x_mask  = x - 1;
+            int v_x_shift = __builtin_ctz(x);
+            int block_offset_divX = block_offset_local >> v_x_shift;
+            int x_idx = block_offset_local & v_x_mask;
             for(int j = 0; j < vec_size; j++)
             {
                 int64_t offset = cache_offset + block_offset_divX * head_dim * x + (head_offset + j) * x + x_idx;
@@ -1025,10 +1037,7 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
                                             hipStream_t stream)
 {
     // blockSize (wg_size) selection: use page_size if it's 64/128/256, otherwise default to 64
-    int blockSize = 64;
-    if(page_size == 128) blockSize = 128;
-    else if(page_size == 256) blockSize = 256;
-    else blockSize = 64;
+    int blockSize = page_size;
 
     // Kernel uses cum_blocks: each batch needs ceil(seq_len_i/blockSize) + 1 blocks.
     // Conservative upper bound: ceil(total/blockSize) + 2*batch_size
@@ -1067,7 +1076,8 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
         });
 
 #define DISPATCH_BLOCK_SIZE(HEAD_DIM)                                            \
-    if(blockSize == 64)       { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 64)  }      \
+    if (blockSize == 16)      { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 16)  }      \
+    else if(blockSize == 64)       { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 64)  } \
     else if(blockSize == 128) { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 128) }      \
     else if(blockSize == 256) { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 256) }      \
     else { TORCH_CHECK(false, "Unsupported blockSize: ", blockSize); }
@@ -1792,6 +1802,8 @@ void fused_qk_norm_rope_cache_block_quant_shuffle(
      int64_t num_tokens = qkv.size(0);
      int64_t page_size  = k_cache.size(-2);
      int64_t x          = k_cache.size(-1);
+     TORCH_CHECK(x > 0 && (x & (x - 1)) == 0,
+                 "KV cache tiling size (x) must be a power of two, got ", x);
      TORCH_CHECK(position_ids.size(0) == num_tokens,
                  "Number of tokens in position_ids must match QKV");
 

@@ -1035,7 +1035,7 @@ def test_qk_norm_rope_cache_block_quant(
     chunk_positions = torch.randint(
         0, max_positions, (chunk_total_tokens,), dtype=torch.int64, device="cuda"
     )
-    #
+
     k_scale_chunk_ref = k_scale_ref.clone()
     v_scale_chunk_ref = v_scale_ref.clone()
     k_scale_chunk = k_scale.clone()
@@ -1345,8 +1345,9 @@ parser.add_argument(
     "-q",
     "--quant_type",
     type=str,
+    nargs="*",
     choices=["block", "per_head"],
-    default="per_head",
+    default=["block", "per_head"],
     help="""Quantization type.
     e.g.: -q per_head""",
 )
@@ -1354,10 +1355,10 @@ parser.add_argument(
 if __name__ == "__main__":
     args = parser.parse_args()
     max_positions = args.max_positions
-    print("args: ", args)
     df = []
     # rope
-    df = []
+    block_df = []
+
     for is_neox_style in args.is_neox_styles:
         for num_token in args.token:
             for num_head, num_kv_head in args.head:
@@ -1367,38 +1368,45 @@ if __name__ == "__main__":
                             cache_dtype = get_dtype_fp8()
                         else:
                             cache_dtype = args.dtype
-                        if args.quant_type == "block":
-                            ret = test_qk_norm_rope_cache_block_quant(
-                                args.dtype,
-                                num_token,
-                                num_head,
-                                num_kv_head,
-                                num_kv_head,
-                                head_size,
-                                args.num_blocks,
-                                args.page_size,
-                                is_neox_style,
-                                1e-6,
-                                kv_cache_dtype,
-                            )
-                        else:
-                            ret = test_qk_norm_rope_cache_quant(
-                                args.dtype,
-                                num_token,
-                                num_head,
-                                num_kv_head,
-                                num_kv_head,
-                                head_size,
-                                is_neox_style,
-                                1e-6,
-                                kv_cache_dtype,
-                                args.num_blocks,
-                                args.page_size,
-                            )
-                        df.append(ret)
+                        for quant_type in args.quant_type:
+                            if quant_type == "block":
+                                ret = test_qk_norm_rope_cache_block_quant(
+                                    args.dtype,
+                                    num_token,
+                                    num_head,
+                                    num_kv_head,
+                                    num_kv_head,
+                                    head_size,
+                                    args.num_blocks,
+                                    args.page_size,
+                                    is_neox_style,
+                                    1e-6,
+                                    kv_cache_dtype,
+                                )
+                                block_df.append(ret)
+                            else:
+                                ret = test_qk_norm_rope_cache_quant(
+                                    args.dtype,
+                                    num_token,
+                                    num_head,
+                                    num_kv_head,
+                                    num_kv_head,
+                                    head_size,
+                                    is_neox_style,
+                                    1e-6,
+                                    kv_cache_dtype,
+                                    args.num_blocks,
+                                    args.page_size,
+                                )
+                                df.append(ret)
     df = pd.DataFrame(df)
+    block_df = pd.DataFrame(block_df)
     df_md = df.to_markdown(index=False)
+    block_df_md = block_df.to_markdown(index=False)
     aiter.logger.info("qk_norm_rope_cache_quant summary (markdown):\n%s", df_md)
+    aiter.logger.info(
+        "qk_norm_rope_cache_block_quant summary (markdown):\n%s", block_df_md
+    )
 
     # dtype = torch.bfloat16
     # batch_size = 2
@@ -1407,20 +1415,20 @@ if __name__ == "__main__":
     # num_heads_k = 25
     # df = []
     # for head_size in args.head_sizes:
-    #    for num_tokens0 in args.token:
-    #        for is_neox_styles in args.is_neox_styles:
-    #            ret = test_qk_norm_rope_2way(
-    #                dtype,
-    #                batch_size,
-    #                num_tokens0,
-    #                num_tokens1,
-    #                num_heads_q,
-    #                num_heads_k,
-    #                head_size,
-    #                not is_neox_styles,
-    #                eps=1e-6,
-    #            )
-    #            df.append(ret)
+    #   for num_tokens0 in args.token:
+    #       for is_neox_styles in args.is_neox_styles:
+    #           ret = test_qk_norm_rope_2way(
+    #               dtype,
+    #               batch_size,
+    #               num_tokens0,
+    #               num_tokens1,
+    #               num_heads_q,
+    #               num_heads_k,
+    #               head_size,
+    #               not is_neox_styles,
+    #               eps=1e-6,
+    #           )
+    #           df.append(ret)
     # df = pd.DataFrame(df)
     # df_md = df.to_markdown(index=False)
     # aiter.logger.info("qk_norm_rope_2way summary (markdown):\n%s", df_md)
