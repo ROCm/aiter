@@ -178,15 +178,22 @@ All tests (including the new one) will build and run inside the Docker container
 | `test_mxfp` | mxfp4_16x16x128 | `mfma<fp4_t,fp4_t,fp32_t,16,16,128>` (scaled overload) | gfx950 |
 | `test_vector_add` | — | `make_gmem`, vectorized `load<N>` / `store<N>` | all |
 | `test_async_load` | — | `make_gmem`, `gmem::async_load`, `s_waitcnt_vmcnt` | all |
-| `test_dtype_convert` | fp32<->bf16 | `cast<bf16_t>` with RNE: explicit `0_I` on gfx942, hardware default on gfx950 | all |
-| `test_dtype_convert` | fp32<->fp16 | `fp32_to_fp16`, `fp16_to_fp32` | all |
-| `test_dtype_convert` | fp32<->fp8 | `cast<fp8_t>(fp32x4_t)`, `cast<fp32_t>(fp8x4_t)` (packed x4) | gfx942 + gfx950 |
-| `test_dtype_convert` | fp32<->fp4 | `cast<fp4_t>(fp32x8_t)`, `cast<fp32_t>(array<fp4_t,4>)` (packed x8, e2m1) | gfx950 |
+| `test_dtype_convert` | fp32<->bf16 scalar | `cast<bf16_t>(fp32_t)` RNE (explicit `0_I` on gfx942, hw default on gfx950) | all |
+| `test_dtype_convert` | fp32<->bf16 x4 vec | `cast<bf16_t>(fp32x4_t)` generic vectorized | all |
+| `test_dtype_convert` | fp32<->fp16 scalar | `cast<fp16_t>(fp32_t)` / `cast<fp32_t>(fp16_t)` | all |
+| `test_dtype_convert` | fp32<->fp16 x4 vec | `cast<fp16_t>(fp32x4_t)` generic vectorized | all |
+| `test_dtype_convert` | fp32<->fp8 scalar | `cast<fp8_t>(fp32_t)` via `cvt_pk_fp8_f32` lo / `cvt_f32_fp8` | gfx942 + gfx950 |
+| `test_dtype_convert` | fp32<->fp8 x2 pk | `cast<fp8_t>(fp32x2_t)` packed x2 | gfx942 + gfx950 |
+| `test_dtype_convert` | fp32<->fp8 x4 pk | `cast<fp8_t>(fp32x4_t)` packed x4 | gfx942 + gfx950 |
+| `test_dtype_convert` | fp32<->fp8 x8 fold | `cast<fp8_t>(fp32x8_t)` auto-fold 2x4 + `unfold_from_container` | gfx942 + gfx950 |
+| `test_dtype_convert` | fp32<->fp4 x2 pk | `cast<fp4_t>(fp32x2_t)` packed x2, e2m1 | gfx950 |
+| `test_dtype_convert` | fp32<->fp4 x4 pk | `cast<fp4_t>(fp32x4_t)` packed x4, e2m1 | gfx950 |
+| `test_dtype_convert` | fp32<->fp4 x8 pk | `cast<fp4_t>(fp32x8_t)` packed x8, e2m1 | gfx950 |
 | `test_load_store_if` | predicated_copy | `gmem::load_if`, `gmem::store_if`, free functions `opus::load_if`/`opus::store_if`, `layout_linear::operator+` | all |
 | `test_load_store_if` | free_func_vector_add | Free functions `opus::load`/`opus::store`, `is_gmem_v`/`is_mem_v` type traits | all |
 | `test_load_store_if` | predicated_async_load | `gmem::async_load_if`, free function `opus::async_load_if`, `layout_linear::operator+` | all |
 
-Total: **25 tests** (12 MFMA + 4 MXFP + 1 vector_add + 1 async_load + 4 dtype_convert + 3 load_store_if).
+Total: **37 test calls** (14 MFMA + 4 MXFP + 1 vector_add + 1 async_load + 11 dtype_convert + 3 load_store_if + 1 mdiv + 2 workgroup_barrier).
 
 ## Notes
 
