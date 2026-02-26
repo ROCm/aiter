@@ -26,7 +26,6 @@ from flydsl.dialects.ext import arith, gpu, buffer_ops, llvm, vector, rocdl, scf
 
 from flydsl.kernels.mfma_preshuffle_pipeline import (
     buffer_copy_gmem16_dwordx4,
-    lds_load_pack_k32,
     lds_store_4b_xor16,
     lds_store_8b_xor16,
     lds_store_16b_xor16,
@@ -75,8 +74,11 @@ def compile_moe_gemm1(
     elem_bytes = 2 if is_f16 else 1
     if out_dtype not in ("f16", "bf16"):
         raise ValueError(f"out_dtype must be 'f16' or 'bf16', got {out_dtype!r}")
+
     # NOTE: don't materialize MLIR types outside an active MLIR Context.
-    out_mlir = lambda: (T.f16() if out_dtype == "f16" else T.bf16())
+    def out_mlir():
+        return T.f16() if out_dtype == "f16" else T.bf16()
+
     tile_k_bytes = int(tile_k) * int(elem_bytes)
     # K64-byte micro-step: always 64 bytes per `ku`. For fp16 this is 32 elements.
     if (tile_k_bytes % 64) != 0:
@@ -100,16 +102,12 @@ def compile_moe_gemm1(
             )
 
     DYN = ir.ShapedType.get_dynamic_size()
-    size_out = DYN
-    size_x = DYN
     # W is packed int4 for W4A8: 2 values per byte.
-    size_w = (
+    (
         (experts * (2 * inter_dim) * model_dim) // 2
         if is_int4
         else (experts * (2 * inter_dim) * model_dim)
     )
-    size_sorted = DYN
-    size_expert_ids = DYN
 
     total_threads = 256
     bytes_x_per_tile = int(tile_m) * int(tile_k) * int(elem_bytes)
@@ -241,7 +239,7 @@ def compile_moe_gemm1(
             )
 
             # Layouts
-            layout_x = flir.make_layout((tokens_in, k_in), stride=(k_in, 1))
+            flir.make_layout((tokens_in, k_in), stride=(k_in, 1))
 
             # B preshuffle layout: match GEMM test helper exactly.
             c_n_total = arith.constant(experts * (2 * inter_dim), index=True)
@@ -255,9 +253,7 @@ def compile_moe_gemm1(
                 elem_bytes=elem_bytes,
             )
             layout_b = b_layout.layout_b
-            c_k0 = (k_in * arith.constant(int(elem_bytes), index=True)) / arith.index(
-                64
-            )
+            (k_in * arith.constant(int(elem_bytes), index=True)) / arith.index(64)
 
             shape_lds = flir.make_shape(tile_m, tile_k)
             stride_lds = flir.make_stride(lds_stride, 1)
@@ -402,9 +398,7 @@ def compile_moe_gemm1(
                 c_k_div4 = (
                     k_in * arith.constant(int(elem_bytes), index=True)
                 ) / arith.index(4)
-                layout_x_div4 = flir.make_layout(
-                    (tokens_in, c_k_div4), stride=(c_k_div4, 1)
-                )
+                flir.make_layout((tokens_in, c_k_div4), stride=(c_k_div4, 1))
                 tile_k_dwords = (int(tile_k) * int(elem_bytes)) // 4
                 layout_x_tile_div4 = flir.make_layout(
                     (tile_m, tile_k_dwords), stride=(tile_k_dwords, 1)
@@ -946,7 +940,6 @@ def compile_moe_gemm1(
 
                 # Store epilogue to out[t, slot, inter]
                 expert_off = expert_off_idx
-                bx_m0 = bx_m
                 tokens_i32_v = tokens_i32
                 topk_i32_v = topk_i32
                 inter_i32_v = arith.i32(inter_dim)
@@ -981,7 +974,7 @@ def compile_moe_gemm1(
                 for ni in range_constexpr(num_acc_n):
                     col_i32_list.append(arith.index_cast(i32, col_g_list[ni]))
 
-                lane_div_16_mul4 = lane_div_16 * arith.index(4)
+                lane_div_16 * arith.index(4)
                 inter_i32_local = inter_i32_v
 
                 # Uses EVec=4 (buffer store "x4" of fp16 elements).
@@ -1135,7 +1128,7 @@ def compile_moe_gemm1(
                         )
                     )
                     sx = sx0
-                    zero_out = arith.constant(0.0, type=out_mlir())
+                    arith.constant(0.0, type=out_mlir())
 
                     # out linear index base = ((t*topk + s)*inter_dim) (invariant across ni)
                     idx0 = (t2 * topk_i32_v + s2) * inter_i32_local
@@ -1451,8 +1444,8 @@ def compile_moe_gemm2(
             i64 = I.i64
             vec4_f32 = I.vec(4, f32)
             vec4_i32 = I.vec(4, i32)
-            vec1_f16 = I.vec(1, f16)
-            vec2_f16 = I.vec(2, f16)
+            I.vec(1, f16)
+            I.vec(2, f16)
             vec4_f16 = I.vec(4, f16)
             vec16_elems = 16 if elem_bytes == 1 else 8
             vec8_elems = 8 if elem_bytes == 1 else 4
@@ -1471,7 +1464,7 @@ def compile_moe_gemm2(
             # A2 layout (flatten token-slot -> M).
             topk_idx = arith.constant(topk, index=True)
             m_in = tokens_in * topk_idx
-            layout_x = flir.make_layout((m_in, k_in), stride=(k_in, 1))
+            flir.make_layout((m_in, k_in), stride=(k_in, 1))
 
             # B preshuffle layout: [experts*model_dim, inter_dim]
             c_n_total = arith.constant(experts * model_dim, index=True)
@@ -1485,9 +1478,7 @@ def compile_moe_gemm2(
                 elem_bytes=elem_bytes,
             )
             layout_b = b_layout.layout_b
-            c_k0 = (k_in * arith.constant(int(elem_bytes), index=True)) / arith.index(
-                64
-            )
+            (k_in * arith.constant(int(elem_bytes), index=True)) / arith.index(64)
 
             shape_lds = flir.make_shape(tile_m, tile_k)
             stride_lds = flir.make_stride(lds_stride, 1)
@@ -1510,7 +1501,7 @@ def compile_moe_gemm2(
             atom_x_g2r4 = flir.make_copy_atom(x_elem, vector_size=vec4_elems)
             layout_tx_wave_lane = flir.make_layout((4, 64), stride=(64, 1))
             layout_lane16 = flir.make_layout((4, 16), stride=(16, 1))
-            layout_lin_rowcol = flir.make_layout((tile_m, tile_k), stride=(tile_k, 1))
+            flir.make_layout((tile_m, tile_k), stride=(tile_k, 1))
 
             base_ptr = allocator.get_base()
             lds_x_ptr = _state["lds_x_decl"](base_ptr)
@@ -1646,7 +1637,7 @@ def compile_moe_gemm2(
                 c_k_div4 = (
                     k_in * arith.constant(int(elem_bytes), index=True)
                 ) / arith.index(4)
-                layout_x_div4 = flir.make_layout((m_in, c_k_div4), stride=(c_k_div4, 1))
+                flir.make_layout((m_in, c_k_div4), stride=(c_k_div4, 1))
                 tile_k_dwords = (int(tile_k) * int(elem_bytes)) // 4
                 layout_x_tile_div4 = flir.make_layout(
                     (tile_m, tile_k_dwords), stride=(tile_k_dwords, 1)

@@ -105,7 +105,7 @@ def make_preshuffle_scale_layout(
     Shape: (N1, K1, KLane, NLane, [K_Pack, N_Pack]) = (N/32, K/8, 4, 16, [2, 2])
     """
     c16 = arith.constant(16, index=True)
-    c32 = arith.constant(32, index=True)
+    arith.constant(32, index=True)
     c4 = arith.constant(4, index=True)
 
     c_mn_pack = arith.constant(mn_pack, index=True)
