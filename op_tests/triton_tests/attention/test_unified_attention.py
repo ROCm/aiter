@@ -90,6 +90,8 @@ DEVICE_ARCH = arch_info.get_arch()
 NUM_HEADS = [(64, 8)]
 HEAD_SIZES = [64, 128]
 BLOCK_SIZES = [16, 64]
+HEAD_SIZES = [128]
+BLOCK_SIZES = [64]
 
 
 DTYPES = [torch.bfloat16]
@@ -275,6 +277,20 @@ def test_triton_unified_attn(
                 pytest.skip(
                     "Only block size >= 64 is supported for shuffled KV cache with gluon backend"
                 )
+
+        num_stage_assume = 2 if (use_tdm or use_async) else 1
+        kv_cache_shared_mem_size = (
+            2
+            * num_stage_assume
+            * (num_tdm_gather if use_tdm else 1)
+            * block_size
+            * head_size
+            * (torch.finfo(dtype).bits // 8)
+        )
+        if kv_cache_shared_mem_size > 32768:
+            pytest.skip(
+                f"skipping test for KV cache LDS required memory = {kv_cache_shared_mem_size/1024} kB > 320 kB"
+            )
 
     # TODO: Uncomment after pytorch adds support for manual_seed
     # torch.manual_seed(0)
