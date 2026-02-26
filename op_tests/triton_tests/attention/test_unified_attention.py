@@ -27,7 +27,9 @@ DTYPES = [torch.bfloat16]
 QDTYPES = [None]
 # one value large enough to test overflow in index calculation.
 # one value small enough to test the schema op check
-NUM_BLOCKS = [4096,]
+NUM_BLOCKS = [
+    4096,
+]
 SLIDING_WINDOWS = [None]
 
 
@@ -302,15 +304,21 @@ def test_triton_unified_attn(
     #     output_gluon, output, atol=atol, rtol=rtol
     # ), f"{torch.max(torch.abs(output_gluon - output))}"
 
+
 @pytest.mark.parametrize(
     "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
 )
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
-@pytest.mark.parametrize("block_size", [64,16])
+@pytest.mark.parametrize("block_size", [64, 16])
 @pytest.mark.parametrize("sliding_window", [None, 256])
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("soft_cap", [None,])
+@pytest.mark.parametrize(
+    "soft_cap",
+    [
+        None,
+    ],
+)
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("q_dtype", QDTYPES)
 @torch.inference_mode()
@@ -352,7 +360,9 @@ def test_gluon_unified_attn_2d(
     kv_lens = torch.tensor(kv_lens, dtype=torch.int32, device="cpu")
 
     max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
-    max_num_blocks_per_seq = min(max_num_blocks_per_seq * num_seqs, num_blocks) // num_seqs
+    max_num_blocks_per_seq = (
+        min(max_num_blocks_per_seq * num_seqs, num_blocks) // num_seqs
+    )
 
     block_tables = torch.randint(
         0,
