@@ -2,7 +2,7 @@
 set -euo pipefail
 
 MULTIGPU=${MULTIGPU:-FALSE}
-SHARD_TOTAL=5
+SHARD_TOTAL=${SHARD_TOTAL:-5}
 SHARD_IDX=${SHARD_IDX:-0}
 
 files=()

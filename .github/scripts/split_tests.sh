@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# split_triton_tests.sh — shards tests in op_tests/triton_tests
+# split_tests.sh — shards tests in op_tests/triton_tests
 # N shards, shards with similar total test time
 
 # Usage:
-#   bash .github/scripts/split_triton_tests.sh --shards N [--test-dir DIR]
+#   bash .github/scripts/split_tests.sh --shards N [--test-dir DIR]
 #
 # Parameters:
 #   --shards N     number of shards (required)
