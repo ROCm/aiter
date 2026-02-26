@@ -589,6 +589,145 @@ class MOEMetadata:
     use_non_temporal_load: bool = True
 
 
+def flydsl_moe_stage2(
+    inter_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    kernelName="",
+    w2_scale=None,
+    a2_scale=None,
+    block_m=32,
+    sorted_weights=None,
+    quant_type=QuantType.No,
+    activation=ActivationType.Silu,
+    use_non_temporal_load=False,
+    **_kwargs,
+):
+    from aiter.ops.flydsl.flydsl_moe_utils import parse_flydsl_kernel_name
+    from aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
+    from aiter.ops.flydsl.kernels.moe_gemm_2stage import compile_moe_reduction
+    from aiter.ops.shuffle import shuffle_weight
+
+    parsed = parse_flydsl_kernel_name(kernelName)
+    if parsed is None:
+        raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
+
+    # #region agent log
+    import json as _json, time as _time
+    try:
+        with open("/root/.cursor/debug.log", "a") as _f:
+            _f.write(_json.dumps({"id": f"log_{_time.time()}", "timestamp": int(_time.time()*1000), "location": "fused_moe.py:flydsl_moe_stage2", "message": "called", "data": {"kernelName": kernelName, "parsed": parsed, "a2_shape": list(inter_states.shape), "w2_shape": list(w2.shape), "out_shape": list(out.shape), "a2_dtype": str(inter_states.dtype), "w2_dtype": str(w2.dtype), "topk": topk, "block_m": block_m}, "runId": "run1", "hypothesisId": "A"}) + "\n")
+    except Exception:
+        pass
+    # #endregion
+
+    mode = parsed["mode"]
+    accumulate = mode != "reduce"
+
+    token_num = inter_states.shape[0]
+    inter_dim = inter_states.shape[2]
+    E = w2.shape[0]
+    model_dim = w2.shape[1]
+
+    is_wfp4 = w2.dtype == dtypes.fp4x2
+    if is_wfp4:
+        inter_dim = inter_dim * 2
+
+    if inter_states.dtype == dtypes.fp4x2:
+        a_dtype_str = "fp4"
+    elif inter_states.dtype == dtypes.fp8:
+        a_dtype_str = "fp8"
+    else:
+        raise ValueError(f"Unsupported a2 dtype: {inter_states.dtype}")
+
+    out_dtype_str = "bf16" if out.dtype == dtypes.bf16 else "f16"
+
+    if getattr(w2, "is_shuffled", False):
+        w2_shuffled = w2
+    else:
+        w2_shuffled = shuffle_weight(w2, layout=(16, 16))
+        w2_scale = fp4_utils.e8m0_shuffle(w2_scale)
+
+    exe2 = compile_mixed_moe_gemm2(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=E,
+        topk=topk,
+        tile_m=parsed["tile_m"],
+        tile_n=parsed["tile_n"],
+        tile_k=parsed["tile_k"],
+        doweight_stage2=(sorted_weights is not None),
+        a_dtype=a_dtype_str,
+        b_dtype="fp4",
+        out_dtype=out_dtype_str,
+        accumulate=accumulate,
+    )
+
+    if sorted_weights is None:
+        sorted_w = torch.zeros(sorted_token_ids.shape, dtype=torch.float32, device=inter_states.device)
+    else:
+        sorted_w = sorted_weights
+
+    empty_bias = torch.empty(0, dtype=torch.float32, device=inter_states.device)
+    blocks = int(sorted_expert_ids.numel())
+    stream_ptr = torch.cuda.current_stream().cuda_stream
+
+    if accumulate:
+        out.zero_()
+        exe2(
+            out,
+            inter_states,
+            w2_shuffled,
+            a2_scale,
+            w2_scale,
+            sorted_token_ids,
+            sorted_expert_ids,
+            sorted_w,
+            num_valid_ids,
+            empty_bias,
+            token_num,
+            model_dim,
+            inter_dim,
+            blocks,
+            stream_ptr,
+        )
+    else:
+        out_slots = torch.empty(
+            (token_num * topk * model_dim,),
+            device=out.device,
+            dtype=out.dtype,
+        )
+        exe2(
+            out_slots,
+            inter_states,
+            w2_shuffled,
+            a2_scale,
+            w2_scale,
+            sorted_token_ids,
+            sorted_expert_ids,
+            sorted_w,
+            num_valid_ids,
+            empty_bias,
+            token_num,
+            model_dim,
+            inter_dim,
+            blocks,
+            stream_ptr,
+        )
+        out_slots_3d = out_slots.view(token_num, topk, model_dim)
+        reduce_exe = compile_moe_reduction(
+            topk=topk,
+            model_dim=model_dim,
+            dtype_str=out_dtype_str,
+        )
+        reduce_exe(out_slots_3d, out, token_num, stream_ptr)
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -840,6 +979,21 @@ def get_2stage_cfgs(
             ]
         )
     ):
+        if kernelName2 and kernelName2.startswith("flydsl_"):
+            stage2_func = functools.partial(
+                flydsl_moe_stage2,
+                kernelName=kernelName2,
+                activation=activation,
+                quant_type=q_type,
+            )
+        else:
+            stage2_func = functools.partial(
+                aiter.ck_moe_stage2_fwd,
+                kernelName=kernelName2,
+                activation=activation,
+                quant_type=q_type,
+                use_non_temporal_load=use_non_temporal_load,
+            )
         return MOEMetadata(
             functools.partial(
                 ck_moe_stage1,
@@ -850,13 +1004,7 @@ def get_2stage_cfgs(
                 splitk=ksplit,
                 use_non_temporal_load=use_non_temporal_load,
             ),
-            functools.partial(
-                aiter.ck_moe_stage2_fwd,
-                kernelName=kernelName2,
-                activation=activation,
-                quant_type=q_type,
-                use_non_temporal_load=use_non_temporal_load,
-            ),
+            stage2_func,
             block_m,
             int(ksplit),
             run_1stage,

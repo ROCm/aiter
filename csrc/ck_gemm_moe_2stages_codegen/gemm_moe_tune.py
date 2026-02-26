@@ -31,6 +31,14 @@ from einops import rearrange
 from aiter.utility.base_tuner import TunerCommon
 from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import moe_mxfp4_sort
+from aiter.ops.flydsl.flydsl_moe_utils import (
+    flydsl_kernel_name,
+    parse_flydsl_kernel_name,
+    get_flydsl_stage1_kernels,
+    get_flydsl_stage2_kernels,
+    compile_flydsl_moe_stage1,
+    compile_flydsl_moe_stage2,
+)
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/")
 from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list
@@ -207,6 +215,237 @@ class FmoeTuner(TunerCommon):
             q_type,
             act_type,
         )
+
+    @staticmethod
+    def run_flydsl_stage1_out(
+        a1_qt,
+        w1_qt_shffle_ck,
+        w2_qt_shffle_ck,
+        sorted_ids,
+        sorted_expert_ids,
+        sorted_weights,
+        num_valid_ids,
+        w1_scale,
+        a1_scale,
+        dtype,
+        topk,
+        kernelName,
+        blockM,
+        q_type,
+        act_type,
+    ):
+        parsed = parse_flydsl_kernel_name(kernelName)
+        if parsed is None:
+            raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
+        token_num = a1_qt.shape[0]
+        E = w1_qt_shffle_ck.shape[0]
+        inter_dim = w1_qt_shffle_ck.shape[1] // 2
+        model_dim = a1_qt.shape[1]
+        if parsed["a_dtype"] == "fp4":
+            model_dim = model_dim * 2
+
+        exe = compile_flydsl_moe_stage1(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=E,
+            topk=topk,
+            tile_m=parsed["tile_m"],
+            tile_n=parsed["tile_n"],
+            tile_k=parsed["tile_k"],
+            doweight_stage1=(sorted_weights is not None),
+            a_dtype=parsed["a_dtype"],
+            b_dtype=parsed["b_dtype"],
+            out_dtype=parsed["out_dtype"],
+        )
+        out = torch.empty(
+            (token_num, topk, inter_dim),
+            dtype=dtype,
+            device=a1_qt.device,
+        )
+        n_in = inter_dim * 2
+        k_in = model_dim
+        size_expert_ids_in = sorted_expert_ids.shape[0]
+        if parsed["b_dtype"] == "fp4":
+            flat_w1 = w1_qt_shffle_ck.view(-1)
+            flat_a1 = a1_qt.view(-1)
+        else:
+            flat_w1 = w1_qt_shffle_ck.view(-1)
+            flat_a1 = a1_qt.view(-1)
+        if w1_scale is not None:
+            flat_w1_scale = w1_scale.view(-1)
+        else:
+            flat_w1_scale = torch.empty(0, device=a1_qt.device)
+        if a1_scale is not None:
+            flat_a1_scale = a1_scale.view(-1)
+        else:
+            flat_a1_scale = torch.empty(0, device=a1_qt.device)
+        if sorted_weights is None:
+            sorted_weights = torch.empty(0, device=a1_qt.device, dtype=torch.float32)
+        empty_bias = torch.empty(0, device=a1_qt.device, dtype=torch.float32)
+
+        stream = torch.cuda.current_stream().cuda_stream
+        exe(
+            out.view(-1),
+            flat_a1,
+            flat_w1,
+            flat_a1_scale,
+            flat_w1_scale,
+            sorted_ids,
+            sorted_expert_ids,
+            sorted_weights,
+            num_valid_ids,
+            empty_bias,
+            token_num,
+            n_in,
+            k_in,
+            size_expert_ids_in,
+            stream,
+        )
+        return out
+
+    @staticmethod
+    def run_flydsl_stage2_out(
+        a2_qt,
+        w1_qt,
+        w2_qt,
+        sorted_ids,
+        sorted_expert_ids,
+        sorted_weights,
+        num_valid_ids,
+        w2_scale,
+        a2_scale,
+        dtype,
+        topk,
+        kernelName,
+        blockM,
+        q_type,
+        act_type,
+    ):
+        from aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage import (
+            compile_mixed_moe_gemm2,
+        )
+        from aiter.ops.flydsl.kernels.moe_gemm_2stage import compile_moe_reduction
+        from aiter.ops.shuffle import shuffle_weight
+
+        parsed = parse_flydsl_kernel_name(kernelName)
+        if parsed is None:
+            raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
+
+        token_num = a2_qt.shape[0]
+        E = w2_qt.shape[0]
+        model_dim = w2_qt.shape[1]
+        inter_dim = a2_qt.shape[2]
+        mode = parsed["mode"]
+        accumulate = mode != "reduce"
+
+        # #region agent log
+        import json as _json, time as _time
+        try:
+            with open("/root/.cursor/debug.log", "a") as _f:
+                _f.write(_json.dumps({"id": f"log_{_time.time()}", "timestamp": int(_time.time()*1000), "location": "gemm_moe_tune.py:run_flydsl_stage2_out", "message": "entry", "data": {"kernelName": kernelName, "mode": mode, "accumulate": accumulate, "token_num": token_num, "E": E, "model_dim": model_dim, "inter_dim": inter_dim, "a2_shape": list(a2_qt.shape), "w2_shape": list(w2_qt.shape), "a2_dtype": str(a2_qt.dtype), "w2_dtype": str(w2_qt.dtype), "w2_scale_shape": list(w2_scale.shape), "a2_scale_shape": list(a2_scale.shape), "blockM": blockM}, "runId": "run1", "hypothesisId": "A"}) + "\n")
+        except Exception:
+            pass
+        # #endregion
+
+        if a2_qt.dtype == torch.float4_e2m1fn_x2:
+            a_dtype_str = "fp4"
+            inter_dim = inter_dim * 2
+        elif a2_qt.dtype == torch.float8_e4m3fnuz:
+            a_dtype_str = "fp8"
+        else:
+            raise ValueError(f"Unsupported a2 dtype: {a2_qt.dtype}")
+
+        out_dtype_str = "bf16" if dtype == torch.bfloat16 else "f16"
+
+        out = torch.zeros(
+            (token_num, model_dim),
+            dtype=dtype,
+            device=a2_qt.device,
+        )
+
+        w2_shuffled = shuffle_weight(w2_qt, layout=(16, 16))
+
+        exe2 = compile_mixed_moe_gemm2(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=E,
+            topk=topk,
+            tile_m=parsed["tile_m"],
+            tile_n=parsed["tile_n"],
+            tile_k=parsed["tile_k"],
+            doweight_stage2=(sorted_weights is not None),
+            a_dtype=a_dtype_str,
+            b_dtype="fp4",
+            out_dtype=out_dtype_str,
+            accumulate=accumulate,
+        )
+
+        if sorted_weights is None:
+            sorted_w = torch.zeros(sorted_ids.shape, dtype=torch.float32, device=a2_qt.device)
+        else:
+            sorted_w = sorted_weights
+
+        empty_bias = torch.empty(0, dtype=torch.float32, device=a2_qt.device)
+        blocks = int(sorted_expert_ids.numel())
+        stream_ptr = torch.cuda.current_stream().cuda_stream
+
+        if accumulate:
+            exe2(
+                out,
+                a2_qt,
+                w2_shuffled,
+                a2_scale,
+                w2_scale,
+                sorted_ids,
+                sorted_expert_ids,
+                sorted_w,
+                num_valid_ids,
+                empty_bias,
+                token_num,
+                model_dim,
+                inter_dim,
+                blocks,
+                stream_ptr,
+            )
+        else:
+            out_slots = torch.empty(
+                (token_num * topk * model_dim,),
+                device=out.device,
+                dtype=out.dtype,
+            )
+            exe2(
+                out_slots,
+                a2_qt,
+                w2_shuffled,
+                a2_scale,
+                w2_scale,
+                sorted_ids,
+                sorted_expert_ids,
+                sorted_w,
+                num_valid_ids,
+                empty_bias,
+                token_num,
+                model_dim,
+                inter_dim,
+                blocks,
+                stream_ptr,
+            )
+            out_slots_3d = out_slots.view(token_num, topk, model_dim)
+            reduce_exe = compile_moe_reduction(
+                topk=topk,
+                model_dim=model_dim,
+                dtype_str=out_dtype_str,
+            )
+            reduce_exe(out_slots_3d, out, token_num, stream_ptr)
+
+        # #region agent log
+        try:
+            with open("/root/.cursor/debug.log", "a") as _f:
+                _f.write(_json.dumps({"id": f"log_{_time.time()}", "timestamp": int(_time.time()*1000), "location": "gemm_moe_tune.py:run_flydsl_stage2_out:exit", "message": "completed", "data": {"mode": mode, "out_shape": list(out.shape), "out_abs_max": float(out.abs().max()), "out_abs_mean": float(out.abs().mean())}, "runId": "run1", "hypothesisId": "A"}) + "\n")
+        except Exception:
+            pass
+        # #endregion
+        return out
 
     @staticmethod
     def run_asm_stage1(
@@ -1674,6 +1913,147 @@ class FmoeTuner(TunerCommon):
                     )
         return tasks_ck
 
+    def gen_flydsl_2stages_task(self, info, blockMs):
+        tasks_flydsl = []
+        (
+            cu_num,
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            act_type,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            q_type,
+            use_g1u1,
+            doweight_stage1,
+        ) = info
+
+        if q_type != QuantType.per_1x32 or q_dtype_w != dtypes.fp4x2:
+            return tasks_flydsl
+
+        _a_dtype_map = {
+            dtypes.fp8: "fp8",
+            dtypes.fp4x2: "fp4",
+            dtypes.fp16: "fp16",
+            dtypes.bf16: "fp16",
+        }
+        a_dtype_str = _a_dtype_map.get(q_dtype_a, "fp8")
+        b_dtype_str = "fp4"
+        out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
+
+        if a_dtype_str != "fp4":
+            flydsl_s1_kernels = get_flydsl_stage1_kernels(a_dtype_str, b_dtype_str, out_dtype_str)
+        else:
+            flydsl_s1_kernels = {}
+        flydsl_s2_kernels = get_flydsl_stage2_kernels(a_dtype_str, b_dtype_str, out_dtype_str)
+
+        for blockM in blockMs:
+            if blockM not in [32, 64] or not use_g1u1:
+                continue
+            # for kname, kparams in flydsl_s1_kernels.items():
+            #     if kparams["tile_m"] != blockM:
+            #         continue
+                # tasks_flydsl.append(
+                #     (
+                #         (info, "stage1", kname, blockM),
+                #         FmoeTuner.generate_data_2stages,
+                #         (
+                #             token,
+                #             model_dim,
+                #             inter_dim,
+                #             expert,
+                #             topk,
+                #             act_type,
+                #             dtype,
+                #             q_dtype_a,
+                #             q_dtype_w,
+                #             q_type,
+                #             use_g1u1,
+                #             doweight_stage1,
+                #             blockM,
+                #             1,
+                #         ),
+                #         FmoeTuner.run_flydsl_stage1_out,
+                #         (
+                #             [0, 1, 2, 5, 6, 7, 8, 15, 14],
+                #             dtype,
+                #             topk,
+                #             kname,
+                #             blockM,
+                #             q_type,
+                #             act_type,
+                #         ),
+                #         {},
+                #         FmoeTuner.run_torch_moe_stage1,
+                #         (
+                #             [0, 10, 11, 12, 13, 3, 4],
+                #             dtype,
+                #             act_type,
+                #             q_type,
+                #             doweight_stage1,
+                #             topk,
+                #         ),
+                #         {},
+                #         (None),
+                #         0.01,
+                #         0.01,
+                #         True,
+                #     )
+                # )
+
+            for kname, kparams in flydsl_s2_kernels.items():
+                if kparams["tile_m"] != blockM:
+                    continue
+                tasks_flydsl.append(
+                    (
+                        (info, "stage2", kname, blockM),
+                        FmoeTuner.generate_data_2stages,
+                        (
+                            token,
+                            model_dim,
+                            inter_dim,
+                            expert,
+                            topk,
+                            act_type,
+                            dtype,
+                            q_dtype_a,
+                            q_dtype_w,
+                            q_type,
+                            use_g1u1,
+                            doweight_stage1,
+                            blockM,
+                            2,
+                        ),
+                        FmoeTuner.run_flydsl_stage2_out,
+                        (
+                            [0, 10, 11, 5, 6, 7, 8, 15, 14],
+                            dtype,
+                            topk,
+                            kname,
+                            blockM,
+                            q_type,
+                            act_type,
+                        ),
+                        {},
+                        FmoeTuner.run_torch_moe_stage2,
+                        (
+                            [0, 10, 11, 12, 13, 3, 4],
+                            dtype,
+                            q_type,
+                            doweight_stage1,
+                        ),
+                        {},
+                        (None),
+                        0.01,
+                        0.01,
+                        True,
+                    )
+                )
+        return tasks_flydsl
+
     def tune(
         self,
         untunedf,
@@ -1735,6 +2115,7 @@ class FmoeTuner(TunerCommon):
             )
             tasks.extend(self.gen_2stages_asm1_task(info, blockMs))
             tasks_ck.extend(self.gen_2stages_task(info, blockMs))
+            tasks_ck.extend(self.gen_flydsl_2stages_task(info, blockMs))
             task_1stage.extend(self.gen_1stage_asm_task(info))
             if tasks is None and tasks_ck is None and task_1stage is None:
                 print("no moe solution can tune for ", line)
