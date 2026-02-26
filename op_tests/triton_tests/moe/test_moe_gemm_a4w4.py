@@ -247,7 +247,7 @@ def test_op(
             pytest.skip("FP4 kernels are not supported on MI300.")
     if backend == "gluon":
         moe_gemm_a4w4_impl = moe_gemm_a4w4_gluon
-        if is_gluon_supported():
+        if not is_gluon_supported():
             pytest.skip("Currently, only testing Gluon implementation on gfx1250.")
         # TODO: implement scatter in Gluon implementation
         if do_scatter:

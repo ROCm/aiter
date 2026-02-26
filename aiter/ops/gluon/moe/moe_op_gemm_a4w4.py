@@ -399,6 +399,7 @@ def _moe_gemm_a4w4_gfx1250(
     W_CACHE_MODIFIER: gl.constexpr,
     WMMA_LAYOUT: gl.constexpr,
     WMMA_LAYOUT_PACKED: gl.constexpr,
+    IDX_LAYOUT: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
 ):
     gl.assume(stride_y_k >= 0)
@@ -508,8 +509,6 @@ def _moe_gemm_a4w4_gfx1250(
     if GatherIndx is None:
         X += start_m * stride_x_m
     else:
-        IDX_BASE_LAYOUT: gl.constexpr = gl.BlockedLayout([PACKED_BLOCK_M_X, 1], [1, 32], [1, 4], [1, 0])
-        IDX_LAYOUT: gl.constexpr = gl.SliceLayout(1, IDX_BASE_LAYOUT)
         offs_x_m = PACKED_BLOCK_M_X * block_id + gl.arange(0, PACKED_BLOCK_M_X, layout=IDX_LAYOUT)
         GatherIndx += start_m
         offs_x_m = gl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
@@ -825,6 +824,7 @@ def moe_gemm_a4w4_gfx1250(
     # layouts
     WMMA_LAYOUT = get_wmma_layout(config["num_warps"], False, swizzle_mx_scale == "GFX1250_SCALE")
     WMMA_LAYOUT_PACKED = get_wmma_layout(config["num_warps"], True, swizzle_mx_scale == "GFX1250_SCALE")
+    IDX_LAYOUT = gl.BlockedLayout([config["block_m"]], [32], [config["num_warps"]], [0])
 
     # launch kernel
     _moe_gemm_a4w4_gfx1250[(grid,)](
@@ -878,6 +878,7 @@ def moe_gemm_a4w4_gfx1250(
         W_CACHE_MODIFIER=config["w_cache_modifier"],
         WMMA_LAYOUT=WMMA_LAYOUT,
         WMMA_LAYOUT_PACKED=WMMA_LAYOUT_PACKED,
+        IDX_LAYOUT=IDX_LAYOUT,
         UPCAST_INDICES=should_upcast_indices(x, w, y),
         num_warps=config["num_warps"],
         num_stages=config["num_stages"],
