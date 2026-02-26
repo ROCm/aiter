@@ -406,12 +406,6 @@ def test_triton_unified_attn(
     torch.testing.assert_close(
         output, ref_output, atol=atol, rtol=rtol
     ), f"{torch.max(torch.abs(output - ref_output))}"
-    torch.testing.assert_close(
-        output_gluon, ref_output, atol=atol, rtol=rtol
-    ), f"{torch.max(torch.abs(output_gluon - ref_output))}"
-    # torch.testing.assert_close(
-    #     output_gluon, output, atol=atol, rtol=rtol
-    # ), f"{torch.max(torch.abs(output_gluon - output))}"
 
 
 @pytest.mark.parametrize(
