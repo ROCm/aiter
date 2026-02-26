@@ -628,49 +628,49 @@ def _moe_gemm_a4w4_gfx1250(
         layout=w_scales_desc.layout,
     )
 
-    producer = 0
-    consumer = 0
+    load_idx = 0
+    wmma_idx = 0
 
     # prologue
     for _ in gl.static_range(NUM_BUFFERS - 1):
         if GatherIndx is None:
             gl.amd.gfx1250.tdm.async_load(
                 x_desc,
-                [offs_x_m, producer * PACKED_BLOCK_K_X],
-                x_buffer.index(producer % NUM_BUFFERS),
+                [offs_x_m, load_idx * PACKED_BLOCK_K_X],
+                x_buffer.index(load_idx % NUM_BUFFERS),
             )
         else:
             gl.amd.gfx1250.tdm.async_gather(
                 x_desc,
                 offs_x_m,
-                producer * PACKED_BLOCK_K_X,
-                x_buffer.index(producer % NUM_BUFFERS),
+                load_idx * PACKED_BLOCK_K_X,
+                x_buffer.index(load_idx % NUM_BUFFERS),
             )
         gl.amd.gfx1250.tdm.async_load(
             w_desc,
-            [offs_w_n, producer * PACKED_BLOCK_K_W],
-            w_buffer.index(producer % NUM_BUFFERS),
+            [offs_w_n, load_idx * PACKED_BLOCK_K_W],
+            w_buffer.index(load_idx % NUM_BUFFERS),
         )
         if is_x_microscaled:
             if GatherIndx is None:
                 gl.amd.gfx1250.tdm.async_load(
                     x_scales_desc,
-                    [offs_x_m, producer * MX_SCALE_BLOCK_K],
-                    x_scales_buffer.index(producer % NUM_BUFFERS),
+                    [offs_x_m, load_idx * MX_SCALE_BLOCK_K],
+                    x_scales_buffer.index(load_idx % NUM_BUFFERS),
                 )
             else:
                 gl.amd.gfx1250.tdm.async_gather(
                     x_scales_desc,
                     offs_x_m,
-                    producer * MX_SCALE_BLOCK_K,
-                    x_scales_buffer.index(producer % NUM_BUFFERS),
+                    load_idx * MX_SCALE_BLOCK_K,
+                    x_scales_buffer.index(load_idx % NUM_BUFFERS),
                 )
         gl.amd.gfx1250.tdm.async_load(
             w_scales_desc,
-            [offs_w_n_scale, producer * PACKED_MX_BLOCK],
-            w_scales_buffer.index(producer % NUM_BUFFERS),
+            [offs_w_n_scale, load_idx * PACKED_MX_BLOCK],
+            w_scales_buffer.index(load_idx % NUM_BUFFERS),
         )
-        producer += 1
+        load_idx += 1
 
     # compute output
     num_k_iter = gl.cdiv(K, BLOCK_K)
@@ -679,53 +679,53 @@ def _moe_gemm_a4w4_gfx1250(
         if GatherIndx is None:
             gl.amd.gfx1250.tdm.async_load(
                 x_desc,
-                [offs_x_m, producer * PACKED_BLOCK_K_X],
-                x_buffer.index(producer % NUM_BUFFERS),
+                [offs_x_m, load_idx * PACKED_BLOCK_K_X],
+                x_buffer.index(load_idx % NUM_BUFFERS),
             )
         else:
             gl.amd.gfx1250.tdm.async_gather(
                 x_desc,
                 offs_x_m,
-                producer * PACKED_BLOCK_K_X,
-                x_buffer.index(producer % NUM_BUFFERS),
+                load_idx * PACKED_BLOCK_K_X,
+                x_buffer.index(load_idx % NUM_BUFFERS),
             )
         gl.amd.gfx1250.tdm.async_load(
             w_desc,
-            [offs_w_n, producer * PACKED_BLOCK_K_W],
-            w_buffer.index(producer % NUM_BUFFERS),
+            [offs_w_n, load_idx * PACKED_BLOCK_K_W],
+            w_buffer.index(load_idx % NUM_BUFFERS),
         )
         if is_x_microscaled:
             if GatherIndx is None:
                 gl.amd.gfx1250.tdm.async_load(
                     x_scales_desc,
-                    [offs_x_m, producer * MX_SCALE_BLOCK_K],
-                    x_scales_buffer.index(producer % NUM_BUFFERS),
+                    [offs_x_m, load_idx * MX_SCALE_BLOCK_K],
+                    x_scales_buffer.index(load_idx % NUM_BUFFERS),
                 )
             else:
                 gl.amd.gfx1250.tdm.async_gather(
                     x_scales_desc,
                     offs_x_m,
-                    producer * MX_SCALE_BLOCK_K,
-                    x_scales_buffer.index(producer % NUM_BUFFERS),
+                    load_idx * MX_SCALE_BLOCK_K,
+                    x_scales_buffer.index(load_idx % NUM_BUFFERS),
                 )
         gl.amd.gfx1250.tdm.async_load(
             w_scales_desc,
-            [offs_w_n_scale, producer * PACKED_MX_BLOCK],
-            w_scales_buffer.index(producer % NUM_BUFFERS),
+            [offs_w_n_scale, load_idx * PACKED_MX_BLOCK],
+            w_scales_buffer.index(load_idx % NUM_BUFFERS),
         )
-        producer += 1
+        load_idx += 1
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_LOADS_IN_BATCH)
 
-        x = x_buffer.index(consumer % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
+        x = x_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
         w = (
-            w_buffer.index(consumer % NUM_BUFFERS)
+            w_buffer.index(wmma_idx % NUM_BUFFERS)
             .permute((1, 0))
             .load(layout=DOT_LAYOUT_W)
         )
         if is_x_microscaled:
-            x_scales_buffer_slice = x_scales_buffer.index(consumer % NUM_BUFFERS)
-        w_scales_buffer_slice = w_scales_buffer.index(consumer % NUM_BUFFERS)
+            x_scales_buffer_slice = x_scales_buffer.index(wmma_idx % NUM_BUFFERS)
+        w_scales_buffer_slice = w_scales_buffer.index(wmma_idx % NUM_BUFFERS)
         if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
             w_scales_buffer_slice = (
                 w_scales_buffer_slice.reshape(
@@ -749,21 +749,21 @@ def _moe_gemm_a4w4_gfx1250(
         w_scales = w_scales_buffer_slice.load(layout=DOT_LAYOUT_W_SCALES)
 
         acc = gl.amd.gfx1250.wmma_scaled(x, x_scales, "e2m1", w, w_scales, "e2m1", acc)
-        consumer += 1
+        wmma_idx += 1
 
     # epilogue
     for k_ep in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - k_ep) * NUM_LOADS_IN_BATCH)
 
-        x = x_buffer.index(consumer % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
+        x = x_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
         w = (
-            w_buffer.index(consumer % NUM_BUFFERS)
+            w_buffer.index(wmma_idx % NUM_BUFFERS)
             .permute((1, 0))
             .load(layout=DOT_LAYOUT_W)
         )
         if is_x_microscaled:
-            x_scales_buffer_slice = x_scales_buffer.index(consumer % NUM_BUFFERS)
-        w_scales_buffer_slice = w_scales_buffer.index(consumer % NUM_BUFFERS)
+            x_scales_buffer_slice = x_scales_buffer.index(wmma_idx % NUM_BUFFERS)
+        w_scales_buffer_slice = w_scales_buffer.index(wmma_idx % NUM_BUFFERS)
         if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
             w_scales_buffer_slice = (
                 w_scales_buffer_slice.reshape(
