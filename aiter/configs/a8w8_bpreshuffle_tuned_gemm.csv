@@ -1,5 +1,4 @@
 cu_num,M,N,K,q_dtype_w,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
-cu_num,M,N,K,q_dtype_w,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
 80,192,1536,5120,torch.float8_e4m3fnuz,cktile,9,0,18.9229,a8w8_bpreshuffle_cktile_0x0x8x4x1x0x0x0x0x1_32x64x512_1x4x1_16x16x64_default,159.59,498.72,0.0
 80,1,512,7168,torch.float8_e4m3fnuz,ck,10,0,11.9109,a8w8_bpreshuffle_128x16x32x512_16x16_16x16_32x4x1_32x4x1_1x16x1x8_4x4x1_1x1_intrawave_v1,0.62,308.81,0.0
 80,1,1280,8192,torch.float8_e4m3fnuz,ck,10,0,13.5348,a8w8_bpreshuffle_128x16x32x512_16x16_16x16_32x4x1_32x4x1_1x16x1x8_4x4x1_1x1_intrawave_v1,1.55,775.52,0.0
