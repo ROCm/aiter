@@ -140,7 +140,7 @@ __global__ void mxfp4_kernel(
 {
 #if defined(__gfx950__)
     using namespace opus;
-    int lane = static_cast<int>(threadIdx.x);
+    int lane = static_cast<int>(__builtin_amdgcn_workitem_id_x());
     constexpr int A_BYTES_PER_ROW = K / 2;  // 2 fp4 values packed per byte
     constexpr int B_BYTES_PER_ROW = N / 2;
 
