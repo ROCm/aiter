@@ -1525,8 +1525,8 @@ class KvManagerV4
         const uint32_t lane_idx = ckt::get_lane_id();
 
         // logical row and col indices
-        const uint32_t row = kRowOffset + lane_idx % kMfmaRows;
-        const uint32_t col = kColOffset + lane_idx / kMfmaRows * kMfmaElemPerThr;
+        const uint32_t row = lane_idx % kMfmaRows;
+        const uint32_t col = lane_idx / kMfmaRows * kMfmaElemPerThr;
 
         const uint32_t sub_block_idx = (row % 16) / 4;
         const uint32_t num_dual_pad  = sub_block_idx / 2;
