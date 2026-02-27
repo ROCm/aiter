@@ -138,6 +138,22 @@ def swizzle_scales(data):
     return data.transpose(-1, -2)
 
 
+def swizzle_scales_gfx1250(data):
+    NON_K_PRESHUFFLE_BLOCK_SIZE = 128
+    block_shape = data.shape
+    SCALE_K = block_shape[-2]
+    N = block_shape[-1]
+    num_chunk_m = N // NON_K_PRESHUFFLE_BLOCK_SIZE
+    SCALE_KWIDTH = 4 if SCALE_K >= 4 else SCALE_K
+    num_chunk_k = SCALE_K // SCALE_KWIDTH
+    data = data.transpose(-1, -2)
+    data = data.view(-1, num_chunk_m, 4, NON_K_PRESHUFFLE_BLOCK_SIZE // 4, num_chunk_k, SCALE_KWIDTH)
+    data = data.permute(0, 1, 4, 3, 2, 5).contiguous()
+    E = block_shape[0]
+    data = data.view(E, N // NON_K_PRESHUFFLE_BLOCK_SIZE, SCALE_K * NON_K_PRESHUFFLE_BLOCK_SIZE)
+    return data.transpose(-1, -2)
+
+
 def reduce_grouped(
     x: torch.Tensor,
     indx: torch.Tensor,

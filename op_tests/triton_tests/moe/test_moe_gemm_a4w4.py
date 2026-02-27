@@ -14,6 +14,7 @@ from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
     moe_gemm_a4w4,
     moe_gemm_torch,
     swizzle_scales,
+    swizzle_scales_gfx1250,
 )
 
 # numerics utilities
@@ -268,11 +269,12 @@ def test_op(
     if hbm_swizzling:
         if get_arch() == "gfx1250":
             swizzle_mx_scale = "GFX1250_SCALE"
+            w_scale_tri = swizzle_scales_gfx1250(w_scale_tri)
         elif get_arch() == "gfx950":
             swizzle_mx_scale = "CDNA4_SCALE"
+            w_scale_tri = swizzle_scales(w_scale_tri)
         else:
             assert False, "Unsupported architecture"
-        w_scale_tri = swizzle_scales(w_scale_tri)
     else:
         swizzle_mx_scale = None
 
