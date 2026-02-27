@@ -5,6 +5,7 @@
 #include <hip/hip_runtime.h>
 #include <torch/torch.h>
 
+#include <memory>
 #include <string>
 
 namespace aiter {
@@ -20,9 +21,16 @@ namespace aiter {
         }                                                                  \
     } while (0)
 
+struct HipModuleGuard {
+    hipModule_t module = nullptr;
+    ~HipModuleGuard() {
+        if (module) (void)hipModuleUnload(module);
+    }
+};
+
 struct CachedKernel {
     hipFunction_t function = nullptr;
-    hipModule_t   module   = nullptr;
+    std::shared_ptr<HipModuleGuard> module_guard;
     int shared_mem  = 0;
     int num_warps   = 0;
 };

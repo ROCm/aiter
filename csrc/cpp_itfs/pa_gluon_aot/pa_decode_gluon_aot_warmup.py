@@ -3,7 +3,6 @@
 
 import torch
 import triton
-import triton.language as tl
 
 import aiter
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
@@ -11,7 +10,6 @@ from aiter.ops.triton.gluon.pa_decode_gluon import (
     paged_attention_decode_v2_gluon_dot_kernel,
     paged_attention_decode_v2_gluon_large_block_dot_kernel,
     paged_attention_decode_v2_reduce_kernel,
-    get_cdna_version,
 )
 
 TORCH_TO_TL_DTYPE_SIG = {
@@ -29,10 +27,12 @@ _DTYPE_MAP = {
 
 def _get_hsaco(compiled_kernel):
     try:
+        # Triton >= 3.x: HSACO stored in asm dict
         return compiled_kernel.asm["hsaco"]
     except (AttributeError, KeyError, TypeError):
         pass
     try:
+        # Triton 2.x: HSACO exposed as .kernel attribute
         return compiled_kernel.kernel
     except AttributeError:
         pass
@@ -41,10 +41,12 @@ def _get_hsaco(compiled_kernel):
 
 def _get_kernel_name(compiled_kernel):
     try:
+        # Triton >= 3.x: name is a direct attribute
         return compiled_kernel.name
     except AttributeError:
         pass
     try:
+        # Triton 2.x: name nested under metadata
         return compiled_kernel.metadata.name
     except AttributeError:
         pass
@@ -124,39 +126,65 @@ def warmup_pa_decode(
     num_blocks = num_seqs * max_num_blocks_per_seq
 
     exp_sums = torch.empty(
-        num_seqs, num_kv_heads, max_context_partition_num,
+        num_seqs,
+        num_kv_heads,
+        max_context_partition_num,
         equivalent_query_group_size,
-        dtype=torch.float32, device=device,
+        dtype=torch.float32,
+        device=device,
     )
     max_logits = torch.empty_like(exp_sums)
     temporary_output = torch.empty(
-        num_seqs, num_kv_heads, max_context_partition_num,
-        equivalent_query_group_size, head_size,
-        dtype=data_type, device=device,
+        num_seqs,
+        num_kv_heads,
+        max_context_partition_num,
+        equivalent_query_group_size,
+        head_size,
+        dtype=data_type,
+        device=device,
     )
     query_5d = torch.empty(
-        num_seqs, query_seq_len, num_kv_heads, one_query_group_size, head_size,
-        dtype=query_dtype, device=device,
+        num_seqs,
+        query_seq_len,
+        num_kv_heads,
+        one_query_group_size,
+        head_size,
+        dtype=query_dtype,
+        device=device,
     )
     key_cache = torch.empty(
-        num_blocks, num_kv_heads,
-        head_size // kv_elements_per_vector, kv_block_size, kv_elements_per_vector,
-        dtype=kv_dtype, device=device,
+        num_blocks,
+        num_kv_heads,
+        head_size // kv_elements_per_vector,
+        kv_block_size,
+        kv_elements_per_vector,
+        dtype=kv_dtype,
+        device=device,
     )
     if value_transposed:
         value_cache = torch.empty(
-            num_blocks, num_kv_heads,
-            kv_block_size // kv_elements_per_vector, head_size, kv_elements_per_vector,
-            dtype=kv_dtype, device=device,
+            num_blocks,
+            num_kv_heads,
+            kv_block_size // kv_elements_per_vector,
+            head_size,
+            kv_elements_per_vector,
+            dtype=kv_dtype,
+            device=device,
         )
     else:
         value_cache = torch.empty(
-            num_blocks, num_kv_heads, head_size, kv_block_size,
-            dtype=kv_dtype, device=device,
+            num_blocks,
+            num_kv_heads,
+            head_size,
+            kv_block_size,
+            dtype=kv_dtype,
+            device=device,
         )
     block_tables = torch.empty(
-        num_seqs, max_num_blocks_per_seq,
-        dtype=torch.int32, device=device,
+        num_seqs,
+        max_num_blocks_per_seq,
+        dtype=torch.int32,
+        device=device,
     )
     context_lengths = torch.empty(num_seqs, dtype=torch.int32, device=device)
 
@@ -164,8 +192,13 @@ def warmup_pa_decode(
         query_scale = torch.empty(1, dtype=torch.float32, device=device)
     elif query_quant_mode == 1:
         query_scale = torch.empty(
-            num_seqs, query_seq_len, num_kv_heads, one_query_group_size, 1,
-            dtype=torch.float32, device=device,
+            num_seqs,
+            query_seq_len,
+            num_kv_heads,
+            one_query_group_size,
+            1,
+            dtype=torch.float32,
+            device=device,
         )
     else:
         query_scale = torch.empty(1, dtype=torch.float32, device=device)
@@ -175,8 +208,12 @@ def warmup_pa_decode(
         value_scale = torch.empty(1, dtype=torch.float32, device=device)
     elif kv_quant_mode == 1:
         key_scale = torch.empty(
-            num_blocks, num_kv_heads, kv_block_size, 1,
-            dtype=torch.float32, device=device,
+            num_blocks,
+            num_kv_heads,
+            kv_block_size,
+            1,
+            dtype=torch.float32,
+            device=device,
         )
         value_scale = torch.empty_like(key_scale)
     else:
@@ -185,13 +222,16 @@ def warmup_pa_decode(
 
     if use_sinks:
         sinks = torch.empty(
-            num_seqs, num_kv_heads, equivalent_query_group_size,
-            dtype=torch.float32, device=device,
+            num_seqs,
+            num_kv_heads,
+            equivalent_query_group_size,
+            dtype=torch.float32,
+            device=device,
         )
     else:
         sinks = torch.empty(1, dtype=torch.int32, device=device)
 
-    softmax_scale = 1.0 / (head_size ** 0.5)
+    softmax_scale = 1.0 / (head_size**0.5)
 
     stride_query_scale_bs = 0
     stride_query_scale_qlen = 0
@@ -215,21 +255,46 @@ def warmup_pa_decode(
     attn_grid = (num_seqs, num_kv_heads, max_context_partition_num)
 
     attn_compiled = attention_kernel.warmup(
-        exp_sums, max_logits, temporary_output, query_5d,
-        key_cache, value_cache, block_tables, context_lengths,
-        softmax_scale, query_scale, key_scale, value_scale,
-        exp_sums.stride(0), exp_sums.stride(1), exp_sums.stride(2),
-        temporary_output.stride(0), temporary_output.stride(1),
-        temporary_output.stride(2), temporary_output.stride(3),
-        query_5d.stride(0), query_5d.stride(1),
-        query_5d.stride(2), query_5d.stride(3),
-        key_cache.stride(0), key_cache.stride(1),
-        key_cache.stride(2), key_cache.stride(3),
-        value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+        exp_sums,
+        max_logits,
+        temporary_output,
+        query_5d,
+        key_cache,
+        value_cache,
+        block_tables,
+        context_lengths,
+        softmax_scale,
+        query_scale,
+        key_scale,
+        value_scale,
+        exp_sums.stride(0),
+        exp_sums.stride(1),
+        exp_sums.stride(2),
+        temporary_output.stride(0),
+        temporary_output.stride(1),
+        temporary_output.stride(2),
+        temporary_output.stride(3),
+        query_5d.stride(0),
+        query_5d.stride(1),
+        query_5d.stride(2),
+        query_5d.stride(3),
+        key_cache.stride(0),
+        key_cache.stride(1),
+        key_cache.stride(2),
+        key_cache.stride(3),
+        value_cache.stride(0),
+        value_cache.stride(1),
+        value_cache.stride(2),
         block_tables.stride(0),
-        stride_query_scale_bs, stride_query_scale_qlen, stride_query_scale_kv_head,
-        kv_scale_stride_0, kv_scale_stride_1,
-        head_size, num_seqs, num_kv_heads, max_context_partition_num,
+        stride_query_scale_bs,
+        stride_query_scale_qlen,
+        stride_query_scale_kv_head,
+        kv_scale_stride_0,
+        kv_scale_stride_1,
+        head_size,
+        num_seqs,
+        num_kv_heads,
+        max_context_partition_num,
         COMPUTE_TYPE=compute_type_tl,
         QUERY_SEQ_LEN=query_seq_len,
         ONE_QUERY_GROUP_SIZE=one_query_group_size,
@@ -250,20 +315,37 @@ def warmup_pa_decode(
     )
 
     output_5d = torch.empty(
-        num_seqs, query_seq_len, num_kv_heads, one_query_group_size, head_size,
-        dtype=data_type, device=device,
+        num_seqs,
+        query_seq_len,
+        num_kv_heads,
+        one_query_group_size,
+        head_size,
+        dtype=data_type,
+        device=device,
     )
     reduce_grid = (num_seqs, num_kv_heads, 1)
 
     reduce_compiled = paged_attention_decode_v2_reduce_kernel.warmup(
-        output_5d, exp_sums, max_logits, temporary_output,
-        context_lengths, sinks,
-        output_5d.stride(0), output_5d.stride(1),
-        output_5d.stride(2), output_5d.stride(3),
-        exp_sums.stride(0), exp_sums.stride(1), exp_sums.stride(2),
-        temporary_output.stride(0), temporary_output.stride(1),
-        temporary_output.stride(2), temporary_output.stride(3),
-        head_size, num_seqs, num_kv_heads,
+        output_5d,
+        exp_sums,
+        max_logits,
+        temporary_output,
+        context_lengths,
+        sinks,
+        output_5d.stride(0),
+        output_5d.stride(1),
+        output_5d.stride(2),
+        output_5d.stride(3),
+        exp_sums.stride(0),
+        exp_sums.stride(1),
+        exp_sums.stride(2),
+        temporary_output.stride(0),
+        temporary_output.stride(1),
+        temporary_output.stride(2),
+        temporary_output.stride(3),
+        head_size,
+        num_seqs,
+        num_kv_heads,
         OUTPUT_SEQ_LEN=query_seq_len,
         ONE_OUTPUT_GROUP_SIZE=one_query_group_size,
         HEAD_SIZE_POW2=head_size_pow2,

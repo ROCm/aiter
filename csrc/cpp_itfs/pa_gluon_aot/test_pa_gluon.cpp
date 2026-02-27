@@ -134,5 +134,7 @@ int main() {
 
     std::cout << "All tests passed!" << std::endl;
 
+    // Use _exit() to avoid double-free from conflicting destruction order
+    // between pybind11's scoped_interpreter and HIP/CUDA runtime static cleanup.
     _exit(0);
 }

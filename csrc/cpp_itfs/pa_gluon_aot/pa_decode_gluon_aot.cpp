@@ -35,10 +35,12 @@ static CachedKernel load_cached_kernel(
 
     std::string hsaco_data = static_cast<std::string>(hsaco_bytes);
 
-    HIP_CHECK(hipModuleLoadData(&cached.module,
+    auto guard = std::make_shared<HipModuleGuard>();
+    HIP_CHECK(hipModuleLoadData(&guard->module,
               reinterpret_cast<const void*>(hsaco_data.data())));
-    HIP_CHECK(hipModuleGetFunction(&cached.function, cached.module,
+    HIP_CHECK(hipModuleGetFunction(&cached.function, guard->module,
               kernel_name.c_str()));
+    cached.module_guard = guard;
     return cached;
 }
 
@@ -182,23 +184,18 @@ void pa_decode_gluon_aot(
 
     PaDecodeCacheEntry cache_entry;
     {
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
         PaDecodeCacheEntry* entry_ptr = g_kernel_cache->get(key);
         if (entry_ptr != nullptr) {
             cache_entry = *entry_ptr;
         } else {
-            std::lock_guard<std::mutex> lock(g_cache_mutex);
-            entry_ptr = g_kernel_cache->get(key);
-            if (entry_ptr != nullptr) {
-                cache_entry = *entry_ptr;
-            } else {
-                cache_entry = warmup_and_load(
-                    compute_type_str, query_length, query_group_size, head_size,
-                    kv_block_size, context_partition_size, query_quant_mode,
-                    kv_quant_mode, fp8_max_val, static_cast<int>(value_transposed),
-                    static_cast<int>(is_causal), static_cast<int>(use_sinks_flag),
-                    cdna_ver);
-                g_kernel_cache->put(key, cache_entry);
-            }
+            cache_entry = warmup_and_load(
+                compute_type_str, query_length, query_group_size, head_size,
+                kv_block_size, context_partition_size, query_quant_mode,
+                kv_quant_mode, fp8_max_val, static_cast<int>(value_transposed),
+                static_cast<int>(is_causal), static_cast<int>(use_sinks_flag),
+                cdna_ver);
+            g_kernel_cache->put(key, cache_entry);
         }
     }
 
