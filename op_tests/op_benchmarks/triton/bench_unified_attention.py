@@ -29,7 +29,6 @@ from einops import repeat
 from typing import Optional
 
 import pytest
-import triton
 from aiter.ops.triton.unified_attention import unified_attention
 
 
