@@ -3,6 +3,141 @@
 #include "asm_fmha_v3_bwd_configs.hpp"
 #include <memory>
 #include <string>
+#include <cstdlib>
+
+namespace {
+
+static bool env_is_set(const char* name)
+{
+    const char* v = std::getenv(name);
+    return v && std::string(v) == "1";
+}
+
+__device__ __forceinline__ float bf16_to_f32(uint16_t v)
+{
+    union { uint32_t u; float f; } t;
+    t.u = uint32_t(v) << 16;
+    return t.f;
+}
+
+__device__ __forceinline__ uint16_t f32_to_bf16_rtz(float v)
+{
+    union { float f; uint32_t u; } t;
+    t.f = v;
+    return uint16_t(t.u >> 16);
+}
+
+__device__ __forceinline__ float fp16_to_f32(uint16_t v)
+{
+    _Float16 h;
+    __builtin_memcpy(&h, &v, 2);
+    return static_cast<float>(h);
+}
+
+__device__ __forceinline__ uint16_t f32_to_fp16(float v)
+{
+    _Float16 h = static_cast<_Float16>(v);
+    uint16_t r;
+    __builtin_memcpy(&r, &h, 2);
+    return r;
+}
+
+// D[b][h][s] = sum_d( O[b][h][s][d] * dO[b][h][s][d] )
+__global__ void fallback_odo_kernel(
+    const uint16_t* __restrict__ ptr_o,
+    const uint16_t* __restrict__ ptr_do,
+    float* __restrict__ ptr_d,
+    int seqlen_q,
+    int head_dim,
+    int64_t stride_o,
+    int64_t nhead_stride_o,
+    int64_t batch_stride_o,
+    int64_t stride_do,
+    int64_t nhead_stride_do,
+    int64_t batch_stride_do,
+    int64_t nhead_stride_d,
+    int64_t batch_stride_d,
+    int is_bf16)
+{
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    int h = blockIdx.y;
+    int b = blockIdx.z;
+    if(s >= seqlen_q)
+        return;
+
+    const uint16_t* o  = ptr_o  + b * batch_stride_o  + h * nhead_stride_o  + s * stride_o;
+    const uint16_t* d_o = ptr_do + b * batch_stride_do + h * nhead_stride_do + s * stride_do;
+
+    float sum = 0.0f;
+    for(int d = 0; d < head_dim; d++)
+    {
+        float ov  = is_bf16 ? bf16_to_f32(o[d])  : fp16_to_f32(o[d]);
+        float dov = is_bf16 ? bf16_to_f32(d_o[d]) : fp16_to_f32(d_o[d]);
+        sum += ov * dov;
+    }
+    ptr_d[b * batch_stride_d + h * nhead_stride_d + s] = sum;
+}
+
+// dQ[b][h][s][d] = convert( dQ_acc[b][h][s][d] )
+__global__ void fallback_dq_convert_kernel(
+    const float* __restrict__ dq_acc,
+    uint16_t* __restrict__ dq,
+    int seqlen_q,
+    int head_dim,
+    int64_t stride_dq_acc,
+    int64_t nhead_stride_dq_acc,
+    int64_t batch_stride_dq_acc,
+    int64_t stride_dq,
+    int64_t nhead_stride_dq,
+    int64_t batch_stride_dq,
+    int is_bf16)
+{
+    int d = threadIdx.x;
+    int s = blockIdx.x;
+    int h = blockIdx.y;
+    int b = blockIdx.z;
+    if(d >= head_dim || s >= seqlen_q)
+        return;
+
+    float val = dq_acc[b * batch_stride_dq_acc + h * nhead_stride_dq_acc +
+                       s * stride_dq_acc + d];
+    uint16_t out = is_bf16 ? f32_to_bf16_rtz(val) : f32_to_fp16(val);
+    dq[b * batch_stride_dq + h * nhead_stride_dq + s * stride_dq + d] = out;
+}
+
+void launch_fallback_odo(const aiter::mha_bwd_args& a, hipStream_t stream)
+{
+    int is_bf16 = (a.data_type == "bf16") ? 1 : 0;
+    int bdx = 256;
+    dim3 grid((a.max_seqlen_q + bdx - 1) / bdx, a.nhead_q, a.batch);
+    dim3 block(bdx);
+    hipLaunchKernelGGL(fallback_odo_kernel, grid, block, 0, stream,
+        reinterpret_cast<const uint16_t*>(a.o_ptr),
+        reinterpret_cast<const uint16_t*>(a.do_ptr),
+        reinterpret_cast<float*>(a.d_ptr),
+        a.seqlen_q, a.hdim_q,
+        a.stride_o, a.nhead_stride_o, a.batch_stride_o,
+        a.stride_do, a.nhead_stride_do, a.batch_stride_do,
+        a.nhead_stride_lsed, a.batch_stride_lsed,
+        is_bf16);
+}
+
+void launch_fallback_dq_convert(const aiter::mha_bwd_args& a, hipStream_t stream)
+{
+    int is_bf16 = (a.data_type == "bf16") ? 1 : 0;
+    int bdx = (a.hdim_q <= 256) ? a.hdim_q : 256;
+    dim3 grid(a.max_seqlen_q, a.nhead_q, a.batch);
+    dim3 block(bdx);
+    hipLaunchKernelGGL(fallback_dq_convert_kernel, grid, block, 0, stream,
+        reinterpret_cast<const float*>(a.dq_acc_ptr),
+        reinterpret_cast<uint16_t*>(a.dq_ptr),
+        a.seqlen_q, a.hdim_q,
+        a.stride_dq_acc, a.nhead_stride_dq_acc, a.batch_stride_dq_acc,
+        a.stride_dq, a.nhead_stride_dq, a.batch_stride_dq,
+        is_bf16);
+}
+
+} // anonymous namespace
 
 namespace aiter {
 std::tuple<int, int> get_padded_hdim(int hdim_q, int hdim_v, std::string arch_id)
@@ -249,6 +384,9 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         return -1;
     }
 
+    static bool use_ck_odo        = env_is_set("AITER_V3_BWD_CK_ODO");
+    static bool use_ck_dq_convert = env_is_set("AITER_V3_BWD_CK_DQ_CONVERT");
+
     auto pre_cfgs    = &cfg_fmha_bwd_odo;
     auto dqdkdv_cfgs = &cfg_fmha_bwd_dqdkdv;
     auto post_cfgs   = [&]() {
@@ -293,14 +431,16 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
                                                                          dqdkdv_cfgs,
                                                                          post_cfgs);
 
-    if((pre_kernel == "") || (dqdkdv_kernel == "") || (need_post_processing && (post_kernel == "")))
+    if((!use_ck_odo && pre_kernel == "") ||
+       (dqdkdv_kernel == "") ||
+       (need_post_processing && !use_ck_dq_convert && post_kernel == ""))
     {
         return -1;
     }
 
-    int ts_odo;
+    int ts_odo = 0;
     int ts_kv;
-    int ts_dq;
+    int ts_dq = 0;
     int arg_size;
 
     AiterAsmKernel* impl_ptr_pre    = nullptr;
@@ -308,25 +448,32 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     AiterAsmKernel* impl_ptr_post   = nullptr;
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
 
-    auto it_pre = pre_cfgs->find(pre_kernel);
-    if(it_pre != pre_cfgs->end())
+    if(!use_ck_odo)
     {
-        const auto& cfg     = it_pre->second;
-        const char* name    = cfg.knl_name.c_str();
-        const char* co_name = cfg.co_name.c_str();
-        ts_odo              = cfg.ts;
-
-        auto result = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
+        auto it_pre = pre_cfgs->find(pre_kernel);
+        if(it_pre != pre_cfgs->end())
         {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
+            const auto& cfg     = it_pre->second;
+            const char* name    = cfg.knl_name.c_str();
+            const char* co_name = cfg.co_name.c_str();
+            ts_odo              = cfg.ts;
 
-        impl_ptr_pre = result.first->second.get();
+            auto result = impl_ptr_map.emplace(name, nullptr);
+            if(result.second)
+            {
+                result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
+            }
+
+            impl_ptr_pre = result.first->second.get();
+        }
+        else
+        {
+            return -1;
+        }
     }
     else
     {
-        return -1;
+        std::cout << "[aiter] BWD ODO: using fallback HIP kernel" << std::endl;
     }
 
     auto it_dqdkdv = dqdkdv_cfgs->find(dqdkdv_kernel);
@@ -354,7 +501,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         return -1;
     }
 
-    if(need_post_processing)
+    if(need_post_processing && !use_ck_dq_convert)
     {
         auto it_post = post_cfgs->find(post_kernel);
         if(it_post != post_cfgs->end())
@@ -377,34 +524,47 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
             return -1;
         }
     }
+    else if(need_post_processing)
+    {
+        std::cout << "[aiter] BWD dQ_convert: using fallback HIP kernel" << std::endl;
+    }
 
     if(a.v3_api_check)
         return 1;
 
     fmha_bwd_odo_args odo_args;
-    arg_size                 = sizeof(odo_args);
-    odo_args.ptr_o           = a.o_ptr;
-    odo_args.ptr_do          = a.do_ptr;
-    odo_args.ptr_d           = a.d_ptr;
-    odo_args.Hs_odo          = a.nhead_stride_o * 2;
-    odo_args.BAs_odo         = a.batch_stride_o * 2;
-    odo_args.Seqs_odo        = a.stride_o * 2;
-    odo_args.Hs_d            = a.nhead_stride_lsed * 4;
-    odo_args.BAs_d           = a.batch_stride_lsed * 4;
-    odo_args.Seqs_d          = 1 * 4;
-    odo_args.seqlen_q        = a.seqlen_q;
-    odo_args.head_dim        = a.hdim_q;
-    odo_args.ptr_qseq_padded = a.seqstart_q_ptr;
-    odo_args.ptr_qseq =
-        (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
+    if(!use_ck_odo)
+    {
+        arg_size                 = sizeof(odo_args);
+        odo_args.ptr_o           = a.o_ptr;
+        odo_args.ptr_do          = a.do_ptr;
+        odo_args.ptr_d           = a.d_ptr;
+        odo_args.Hs_odo          = a.nhead_stride_o * 2;
+        odo_args.BAs_odo         = a.batch_stride_o * 2;
+        odo_args.Seqs_odo        = a.stride_o * 2;
+        odo_args.Hs_d            = a.nhead_stride_lsed * 4;
+        odo_args.BAs_d           = a.batch_stride_lsed * 4;
+        odo_args.Seqs_d          = 1 * 4;
+        odo_args.seqlen_q        = a.seqlen_q;
+        odo_args.head_dim        = a.hdim_q;
+        odo_args.ptr_qseq_padded = a.seqstart_q_ptr;
+        odo_args.ptr_qseq =
+            (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
+    }
 
     auto pre_kernel_launch = [&]() {
-        int bdx = 256;
-        int gdx = (a.max_seqlen_q + ts_odo - 1) / ts_odo;
-        int gdy = a.nhead_q;
-        int gdz = a.batch;
-
-        impl_ptr_pre->launch_kernel({&odo_args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, s.stream_id_});
+        if(use_ck_odo)
+        {
+            launch_fallback_odo(a, s.stream_id_);
+        }
+        else
+        {
+            int bdx = 256;
+            int gdx = (a.max_seqlen_q + ts_odo - 1) / ts_odo;
+            int gdy = a.nhead_q;
+            int gdz = a.batch;
+            impl_ptr_pre->launch_kernel({&odo_args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, s.stream_id_});
+        }
     };
 
     fmha_bwd_dqdkdv_args dqdkdv_args;
@@ -512,29 +672,38 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
     int dq_acc_element_size = a.v3_atomic_fp32 ? 4 : 2;
     fmha_bwd_post_kernel_args post_args;
-    arg_size                  = sizeof(post_args);
-    post_args.ptr_dq_acc      = a.dq_acc_ptr;
-    post_args.ptr_dq          = a.dq_ptr;
-    post_args.Hs_dq_acc       = a.nhead_stride_dq_acc * dq_acc_element_size;
-    post_args.BAs_dq_acc      = a.batch_stride_dq_acc * dq_acc_element_size;
-    post_args.Seqs_dq_acc     = a.stride_dq_acc * dq_acc_element_size;
-    post_args.Hs_dq           = a.nhead_stride_dq * 2;
-    post_args.BAs_dq          = a.batch_stride_dq * 2;
-    post_args.Seqs_dq         = a.stride_dq * 2;
-    post_args.seqlen_q        = a.seqlen_q;
-    post_args.head_dim        = a.hdim_q;
-    post_args.ptr_qseq_padded = a.seqstart_q_ptr;
-    post_args.ptr_qseq =
-        (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
+    if(!use_ck_dq_convert)
+    {
+        arg_size                  = sizeof(post_args);
+        post_args.ptr_dq_acc      = a.dq_acc_ptr;
+        post_args.ptr_dq          = a.dq_ptr;
+        post_args.Hs_dq_acc       = a.nhead_stride_dq_acc * dq_acc_element_size;
+        post_args.BAs_dq_acc      = a.batch_stride_dq_acc * dq_acc_element_size;
+        post_args.Seqs_dq_acc     = a.stride_dq_acc * dq_acc_element_size;
+        post_args.Hs_dq           = a.nhead_stride_dq * 2;
+        post_args.BAs_dq          = a.batch_stride_dq * 2;
+        post_args.Seqs_dq         = a.stride_dq * 2;
+        post_args.seqlen_q        = a.seqlen_q;
+        post_args.head_dim        = a.hdim_q;
+        post_args.ptr_qseq_padded = a.seqstart_q_ptr;
+        post_args.ptr_qseq =
+            (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
+    }
 
     auto post_kernel_launch = [&]() {
-        int bdx = 256;
-        int gdx = (a.max_seqlen_q + ts_dq - 1) / ts_dq;
-        int gdy = a.nhead_q;
-        int gdz = a.batch;
-
-        impl_ptr_post->launch_kernel(
-            {&post_args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, s.stream_id_});
+        if(use_ck_dq_convert)
+        {
+            launch_fallback_dq_convert(a, s.stream_id_);
+        }
+        else
+        {
+            int bdx = 256;
+            int gdx = (a.max_seqlen_q + ts_dq - 1) / ts_dq;
+            int gdy = a.nhead_q;
+            int gdz = a.batch;
+            impl_ptr_post->launch_kernel(
+                {&post_args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, s.stream_id_});
+        }
     };
     return ck_tile::launch_kernel(
         s,

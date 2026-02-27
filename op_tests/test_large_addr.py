@@ -14,8 +14,11 @@ Usage:
 
 import argparse
 import csv
+import io
 import os
 import sys
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 import torch
 
@@ -28,6 +31,51 @@ from aiter.test_mha_common import (
     attention_ref,
     generate_qkv,
 )
+
+
+@contextmanager
+def capture_cpp_stdout():
+    """Capture C-level stdout (from C++ std::cout) during kernel launches."""
+    sys.stdout.flush()
+    old_fd = os.dup(1)
+    tmp = tempfile.TemporaryFile(mode='w+b')
+    os.dup2(tmp.fileno(), 1)
+    try:
+        yield tmp
+    finally:
+        sys.stdout.flush()
+        os.fsync(1)
+        os.dup2(old_fd, 1)
+        os.close(old_fd)
+        tmp.seek(0)
+        tmp._captured = tmp.read().decode('utf-8', errors='replace')
+        tmp.seek(0)
+
+
+def parse_kernel_info(captured_text):
+    """Parse captured C++ output to determine which kernels were used."""
+    info = {
+        "odo": "CK (fallback)",
+        "dqdkdv": "CK (fallback)",
+        "dq_convert": "CK (fallback)",
+        "raw_output": captured_text.strip(),
+    }
+    for line in captured_text.splitlines():
+        line = line.strip()
+        if "[aiter] BWD kernel selected:" in line:
+            co_part = line.split("[aiter] BWD kernel selected:")[-1].strip()
+            info["dqdkdv"] = f"ASM ({co_part})"
+        elif "[aiter] hipModuleLoad:" in line and "odo" in line.lower():
+            co_part = line.split("hipModuleLoad:")[-1].strip().split()[0]
+            info["odo"] = f"ASM ({co_part})"
+        elif "[aiter] hipModuleLoad:" in line and "dq_convert" in line.lower():
+            co_part = line.split("hipModuleLoad:")[-1].strip().split()[0]
+            info["dq_convert"] = f"ASM ({co_part})"
+        elif "BWD ODO: using fallback" in line:
+            info["odo"] = "CK (fallback HIP)"
+        elif "BWD dQ_convert: using fallback" in line:
+            info["dq_convert"] = "CK (fallback HIP)"
+    return info
 
 
 def get_device_arch():
@@ -143,6 +191,8 @@ def get_test_params_for_kernel(config, large_q=False):
     hdim_v = int(config['hdim_v'])
     mask = int(config['mask'])  # 0=no mask, 1=causal, 2=causal_br
     atomic32 = int(config['atomic32'])  # 0=a16, 1=a32
+    pssk = int(config['pssk'])
+    pddv = int(config['pddv'])
     mode = int(config['mode'])  # 0=normal, 1=group/varlen
     co_name = config['co_name']
     
@@ -164,14 +214,38 @@ def get_test_params_for_kernel(config, large_q=False):
     deterministic = False
     is_v3_atomic_fp32 = (atomic32 == 1)  # 1=a32, 0=a16
     
-    # Calculate sequence length to trigger 32-bit overflow
-    # For batch=8, heads=40, hdim=128, dtype=2bytes:
-    # Total size = 8 * seqlen * 40 * 128 * 2 = 81920 * seqlen bytes
-    # Need > 4GB = 4294967296 bytes
-    # seqlen > 4294967296 / 81920 = 52428
-    # Use 75600 to ensure overflow (gives ~6.2GB)
+    # For pddv=1 kernels, use actual hdim < padded hdim (e.g., 72 pads to 128)
+    actual_hdim_q = hdim_q
+    actual_hdim_v = hdim_v
+    if pddv == 1:
+        if hdim_q == 128:
+            actual_hdim_q = 72
+            actual_hdim_v = 72
+        elif hdim_q == 64:
+            actual_hdim_q = 48
+            actual_hdim_v = 48
+        elif hdim_q == 192:
+            actual_hdim_q = 160
+            actual_hdim_v = 160
+    
     batch_size = 8
     nheads = 40
+    
+    # ts_kv alignment: A16 on gfx942 uses 64, A32 uses ts from CSV
+    ts_kv_align = 64 if (atomic32 == 0) else int(config.get('ts', '192'))
+
+    # if pssk == 0:
+    #     # pssk=0 requires seqlen_q == seqlen_k AND seqlen_k % ts_kv == 0
+    #     # Both seqlens must be large enough for 64-bit overflow:
+    #     #   batch_stride = nheads * seqlen * actual_hdim * 2
+    #     #   need batch_stride * (batch-1) > 2^32
+    #     stride_per_seq = nheads * actual_hdim_q * 2
+    #     min_seqlen = (2**32 // (stride_per_seq * (batch_size - 1))) + 1
+    #     # Round up to multiple of ts_kv_align
+    #     seqlen = ((min_seqlen + ts_kv_align - 1) // ts_kv_align) * ts_kv_align
+    #     seqlen_q = seqlen
+    #     seqlen_k = seqlen
+    # elif 
     if large_q:
         # Large seqlen_q: tests Q/dO/dQ/ODO address overflow
         seqlen_q = 75600
@@ -186,8 +260,8 @@ def get_test_params_for_kernel(config, large_q=False):
         "nheads": nheads,
         "seqlen_q": seqlen_q,
         "seqlen_k": seqlen_k,
-        "hdim_q": hdim_q,
-        "hdim_v": hdim_v,
+        "hdim_q": actual_hdim_q,
+        "hdim_v": actual_hdim_v,
         "dtype": dtype,
         "causal": causal,
         "causal_type": causal_type,
@@ -252,25 +326,34 @@ def run_mha_backward_test(
     
     # Run aiter forward + backward (aligned with test_mha.py's run_ck)
     try:
-        (out, softmax_lse, S_dmask), _ = run_perftest(
-            aiter.flash_attn_func,
-            q, k, v,
-            0.0,   # dropout_p
-            None,  # softmax_scale
-            causal,
-            window_size,
-            None,  # bias
-            None,  # alibi_slopes
-            deterministic,
-            return_lse=True,
-            return_attn_probs=True,  # Aligned with test_mha.py
-            how_v3_bf16_cvt=2,
-            is_v3_atomic_fp32=is_v3_atomic_fp32,  # True=A32, False=A16
-            num_rotate_args=1,
-        )
+        with capture_cpp_stdout() as cap:
+            (out, softmax_lse, S_dmask), _ = run_perftest(
+                aiter.flash_attn_func,
+                q, k, v,
+                0.0,   # dropout_p
+                None,  # softmax_scale
+                causal,
+                window_size,
+                None,  # bias
+                None,  # alibi_slopes
+                deterministic,
+                return_lse=True,
+                return_attn_probs=True,  # Aligned with test_mha.py
+                how_v3_bf16_cvt=2,
+                is_v3_atomic_fp32=is_v3_atomic_fp32,  # True=A32, False=A16
+                num_rotate_args=1,
+            )
+            
+            # Compute gradients
+            dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
         
-        # Compute gradients
-        dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
+        kernel_info = parse_kernel_info(cap._captured)
+        print(f"\n  Kernel dispatch info:")
+        print(f"    ODO:        {kernel_info['odo']}")
+        print(f"    dQdKdV:     {kernel_info['dqdkdv']}")
+        print(f"    dQ_convert: {kernel_info['dq_convert']}")
+        if kernel_info['raw_output']:
+            print(f"    [raw C++ output]: {kernel_info['raw_output']}")
         
     except Exception as e:
         import traceback
@@ -399,24 +482,33 @@ def run_mha_varlen_backward_test(
     
     # Run aiter forward + backward
     try:
-        out, softmax_lse, *_ = aiter.flash_attn_varlen_func(
-            q, k, v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=seqlen_q,
-            max_seqlen_k=seqlen_k,
-            dropout_p=0.0,
-            softmax_scale=None,
-            causal=causal,
-            window_size=window_size,
-            return_lse=True,
-            return_attn_probs=False,
-            deterministic=deterministic,
-            is_v3_atomic_fp32=is_v3_atomic_fp32,  # True=A32, False=A16
-        )
+        with capture_cpp_stdout() as cap:
+            out, softmax_lse, *_ = aiter.flash_attn_varlen_func(
+                q, k, v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=seqlen_q,
+                max_seqlen_k=seqlen_k,
+                dropout_p=0.0,
+                softmax_scale=None,
+                causal=causal,
+                window_size=window_size,
+                return_lse=True,
+                return_attn_probs=False,
+                deterministic=deterministic,
+                is_v3_atomic_fp32=is_v3_atomic_fp32,  # True=A32, False=A16
+            )
+            
+            # Compute gradients
+            dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
         
-        # Compute gradients
-        dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
+        kernel_info = parse_kernel_info(cap._captured)
+        print(f"\n  Kernel dispatch info:")
+        print(f"    ODO:        {kernel_info['odo']}")
+        print(f"    dQdKdV:     {kernel_info['dqdkdv']}")
+        print(f"    dQ_convert: {kernel_info['dq_convert']}")
+        if kernel_info['raw_output']:
+            print(f"    [raw C++ output]: {kernel_info['raw_output']}")
         
     except Exception as e:
         import traceback
@@ -565,12 +657,24 @@ def run_all_tests(kernel_filter=None, large_q=False, large_k=False):
         skipped = 0
         
         for config in configs:
+            cfg_pssk = int(config['pssk'])
+            
+            # pssk=0 kernels use equal seqlens - only run once (in large_k pass)
+            if cfg_pssk == 0 and is_large_q:
+                skipped += 1
+                continue
+            
             params = get_test_params_for_kernel(config, large_q=is_large_q)
             if params is None:
                 skipped += 1
                 continue
             
-            suffix = "_largeQ" if is_large_q else "_largeK"
+            if cfg_pssk == 0:
+                suffix = "_equalSeqlen"
+            elif is_large_q:
+                suffix = "_largeQ"
+            else:
+                suffix = "_largeK"
             test_name = params['co_name'].replace('.co', '') + suffix
             
             # Choose test function based on mode
