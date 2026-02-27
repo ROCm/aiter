@@ -517,128 +517,117 @@
     auto f_absmax_f32 = [](float v_0_, float v_1_) {
         return __builtin_fmaxf(abs(v_0_), abs(v_1_));
     };
-    if(tokenIdx < batch_end_idx)
+    // V: only valid tokens; Q/K: ALL threads must participate (avoids __syncthreads deadlock in block_reduce)
+    if(isV)
     {
-        // If qk, we adopt RMSNorm + RoPE, so we need to compute sum of squares.
-        if(isV)
+        int64_t total_elements = numtokens_in_block * head_dim;
+        for(int idx = threadIdx.x; idx < total_elements / vec_size; idx += blockDim.x)
         {
-            #pragma unroll
-            for(int i = 0; i < load_loop_cnt; i += 1)
-            {
-                // consider stride
-                int64_t offsetWarp = (tokenIdx * num_heads * head_dim + localHeadIdx * head_dim) /
-                                    vec_size;
-                elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i];
-#pragma unroll
-                for(int j = 0; j < vec_size; j++)
-                {
-                    block_max = f_absmax_f32(block_max, static_cast<float>(elements[j]));
-                }
-            }
-        }
-        else
-        {
-            // Compute norm squares
-            float sumOfSquares = 0.0f;
-            int64_t offsetWarp = (tokenIdx * num_heads * head_dim + localHeadIdx * head_dim) /
+            int token_idx          = first_token_idx + idx * vec_size / head_dim;
+            int64_t offsetWarp = (token_idx * num_heads * head_dim + localHeadIdx * head_dim) /
                                 vec_size;
-            elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp];
-            int i = 1;
-            for(; i < load_loop_cnt; i++)
-            {
-                next_elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i];
-#pragma unroll
-                for(int j = 0; j < vec_size; j++)
-                {
-                    sumOfSquares += static_cast<float>(elements[j]) * static_cast<float>(elements[j]);
-                }
-                elements = next_elements;
-            }
-#pragma unroll
+            int vec_slot = idx % (head_dim / vec_size);
+            elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + vec_slot];
+            #pragma unroll
             for(int j = 0; j < vec_size; j++)
             {
-                sumOfSquares += static_cast<float>(elements[j]) * static_cast<float>(elements[j]);
+                block_max = f_absmax_f32(block_max, static_cast<float>(elements[j]));
             }
-            auto sum_func = [](float a, float b) { return a + b; };
-            float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
-            // Apply RoPE to normalized elements
-            int64_t pos_id = position_ids[tokenIdx];
-
-            // Calculate cache pointer for this position - similar to
-            // pos_encoding_kernels.cu
-            scalar_t const* cache_ptr = cos_sin_cache + pos_id * head_dim;
-            int const embed_dim       = head_dim / 2;
-            scalar_t const* cos_ptr   = cache_ptr;
-            scalar_t const* sin_ptr   = cache_ptr + embed_dim;
-
-            // Normalize elements and apply RoPE
-            if constexpr(interleave)
-            {
-                // Perform interleaving with vectorized ping-pong buffer.
-                // Load vec_size elements directly from global memory (no LDS read),
-                // process RoPE pairs, write results to global memory and smem.
-                constexpr int pairs_per_vec = vec_size;
-
-                for(int i = 0; i < load_loop_cnt; i++)
+         }
+    }
+    else
+    {
+            constexpr int64_t head_thread = head_dim / vec_size;
+            int64_t total_elements = numtokens_in_block * head_dim;
+            auto sum_op = [](float a, float b) { return a + b; };
+            if constexpr(interleave) {
+                for(int idx = threadIdx.x; idx < total_elements / vec_size; idx += blockDim.x)
                 {
-                    elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i];
-                    int const base_idx = i * vec_size;
-#pragma unroll
+                    int token_local = idx / head_thread;
+                    int vec_slot    = idx % head_thread;
+                    int token_idx   = first_token_idx + token_local;
+                    if(token_idx >= batch_end_idx) continue;
+                    int64_t offsetWarp = (token_idx * num_heads * head_dim + localHeadIdx * head_dim) / vec_size;
+                    elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + vec_slot];
+                    float partial_sum = 0.0f;
+                    #pragma unroll
+                    for(int j = 0; j < vec_size; j++)
+                        partial_sum += static_cast<float>(elements[j]) * static_cast<float>(elements[j]);
+                    float sumOfSquares = wave_reduce<float, decltype(sum_op), head_thread, true>(partial_sum, sum_op);
+                    float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
+                    int64_t pos_id  = position_ids[token_idx];
+                    scalar_t const* cache_ptr = cos_sin_cache + pos_id * head_dim;
+                    scalar_t const* cos_ptr  = cache_ptr;
+                    scalar_t const* sin_ptr  = cache_ptr + head_dim / 2;
+
+                    int const base_idx = vec_slot * vec_size;
+                    #pragma unroll
                     for(int k = 0; k < vec_size; k += 2)
                     {
-                        int const local0 = base_idx + k;
-                        int const local1 = base_idx + k + 1;
-                        float weight0 = isQ ? float(q_weight[local0]) : float(k_weight[local0]);
-                        float weight1 = isQ ? float(q_weight[local1]) : float(k_weight[local1]);
+                        int const local0   = base_idx + k;
+                        int const local1   = base_idx + k + 1;
+                        float weight0      = isQ ? float(q_weight[local0]) : float(k_weight[local0]);
+                        float weight1      = isQ ? float(q_weight[local1]) : float(k_weight[local1]);
                         int const half_dim = local0 / 2;
-                        float cos_val = static_cast<float>(cos_ptr[half_dim]);
-                        float sin_val = static_cast<float>(sin_ptr[half_dim]);
-                        float const val0 = static_cast<float>(elements[k]) * rms_rcp * weight0;
-                        float const val1 = static_cast<float>(elements[k + 1]) * rms_rcp * weight1;
-                        elements[k] = static_cast<scalar_t>(val0 * cos_val - val1 * sin_val);
-                        elements[k + 1] = static_cast<scalar_t>(val0 * sin_val + val1 * cos_val);
-                        block_max = f_absmax_f32(block_max, elements[k]);
-                        block_max = f_absmax_f32(block_max, elements[k + 1]);
+                        float cos_val     = static_cast<float>(cos_ptr[half_dim]);
+                        float sin_val     = static_cast<float>(sin_ptr[half_dim]);
+                        float const val0  = static_cast<float>(elements[k]) * rms_rcp * weight0;
+                        float const val1  = static_cast<float>(elements[k + 1]) * rms_rcp * weight1;
+                        elements[k]       = static_cast<scalar_t>(val0 * cos_val - val1 * sin_val);
+                        elements[k + 1]   = static_cast<scalar_t>(val0 * sin_val + val1 * cos_val);
+                        block_max          = f_absmax_f32(block_max, elements[k]);
+                        block_max          = f_absmax_f32(block_max, elements[k + 1]);
                     }
-
-                    // Write processed vector directly to global memory and smem
-                    reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i] = elements;
+                    reinterpret_cast<ltype*>(qkv_void)[offsetWarp + vec_slot] = elements;
                 }
-            }
-            else
-            {
-                for(int i = 0; i < load_loop_cnt / 2; i++)
+            } else {
+                constexpr int64_t head_thread_half = head_dim / vec_size / 2;
+
+                for(int idx = threadIdx.x; idx < total_elements / vec_size; idx += blockDim.x)
                 {
-                    elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i];
-                    next_elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i + load_loop_cnt / 2];
-#pragma unroll
+                    int token_local = idx / head_thread;
+                    int vec_slot    = idx % head_thread;
+                    int token_idx   = first_token_idx + token_local;
+                    if(token_idx >= batch_end_idx) continue;
+                    if(vec_slot >= head_thread_half) continue;
+                    int pair_slot   = vec_slot + head_thread_half;
+                    int64_t offsetWarp = (token_idx * num_heads * head_dim + localHeadIdx * head_dim) / vec_size;
+                    elements      = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + vec_slot];
+                    next_elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + pair_slot];
+                    int64_t pos_id = position_ids[token_idx];
+                    scalar_t const* cache_ptr = cos_sin_cache + pos_id * head_dim;
+                    scalar_t const* cos_ptr  = cache_ptr;
+                    scalar_t const* sin_ptr  = cache_ptr + head_dim / 2;
+                    float partial_sum = 0.0f;
+                    #pragma unroll
+                    for(int j = 0; j < vec_size; j++)
+                        partial_sum += static_cast<float>(elements[j]) * static_cast<float>(elements[j])
+                                     + static_cast<float>(next_elements[j]) * static_cast<float>(next_elements[j]);
+                    float sumOfSquares = wave_reduce<float, decltype(sum_op), head_thread_half, true>(partial_sum, sum_op);
+                    float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
+                    #pragma unroll
                     for(int j = 0; j < vec_size; j++)
                     {
-                        int const idx0 = i * vec_size + j;
-                        int const idx1 = load_loop_cnt / 2 * vec_size + idx0;
+                        int const idx0 = vec_slot * vec_size + j;
+                        int const idx1 = pair_slot * vec_size + j;
                         float weight0 = isQ ? float(q_weight[idx0]) : float(k_weight[idx0]);
                         float weight1 = isQ ? float(q_weight[idx1]) : float(k_weight[idx1]);
-                        // Use pre-computed cos/sin from cache
-                        // idx0 ranges [0, head_dim/2) = [0, embed_dim), so can use idx0 directly
                         float cos_val = static_cast<float>(cos_ptr[idx0]);
                         float sin_val = static_cast<float>(sin_ptr[idx0]);
-
                         float const val0 = static_cast<float>(elements[j]) * rms_rcp * weight0;
                         float const val1 = static_cast<float>(next_elements[j]) * rms_rcp * weight1;
-                        weight0 = val0 * cos_val - val1 * sin_val;
-                        weight1 = val1 * cos_val + val0 * sin_val;
-                        block_max = f_absmax_f32(block_max, weight0);
-                        block_max = f_absmax_f32(block_max, weight1);
-                        elements[j] = static_cast<scalar_t>(weight0);
-                        next_elements[j] = static_cast<scalar_t>(weight1);
+                        float out0 = val0 * cos_val - val1 * sin_val;
+                        float out1 = val1 * cos_val + val0 * sin_val;
+                        block_max = f_absmax_f32(block_max, out0);
+                        block_max = f_absmax_f32(block_max, out1);
+                        elements[j]      = static_cast<scalar_t>(out0);
+                        next_elements[j] = static_cast<scalar_t>(out1);
                     }
-
-                    reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i] = elements;
-                    reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i + load_loop_cnt / 2] = next_elements;
+                    reinterpret_cast<ltype*>(qkv_void)[offsetWarp + vec_slot]  = elements;
+                    reinterpret_cast<ltype*>(qkv_void)[offsetWarp + pair_slot]  = next_elements;
                 }
             }
             // store q
-        }
     }
 
     if(isQ)
@@ -717,29 +706,27 @@
         }
         int64_t cache_offset = block_idx * page_size * num_heads_k * head_dim +
                                headIdx * head_dim * page_size;
-        // Only write if current token belongs to this block
-        // [num_blocks, kv_heads, head_dim / x, block_size, x]
         int64_t total_elements = numtokens_in_block * head_dim;
-        
+        int const x_mask       = x - 1;
+        int const x_shift      = __builtin_ctz(x);
+        int const k_row_stride = page_size * x;
+
         for(int64_t idx = threadIdx.x; idx < total_elements / vec_size; idx += blockDim.x)
         {
-            int token_idx = first_token_idx + idx * vec_size / head_dim;
-            int head_offset = (idx * vec_size) % head_dim;
+            int token_idx          = first_token_idx + idx * vec_size / head_dim;
+            int head_offset        = (idx * vec_size) % head_dim;
+            int block_offset_local = (token_idx - first_token_idx + block_offset) % wg_size;
+            int head_divX          = head_offset >> x_shift;
+            int head_modX          = head_offset & x_mask;
+            int64_t k_base         = cache_offset + head_divX * k_row_stride + block_offset_local * x + head_modX;
+
             int64_t offsetWarp = (token_idx * num_heads * head_dim + localHeadIdx * head_dim) / vec_size;
             elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + head_offset / vec_size];
-            int block_offset_local  = token_idx - first_token_idx + block_offset;
-            int64_t block_idx_local = block_offset_local / page_size + block_idx;
-            block_offset_local      = block_offset_local % page_size;
 
-            int x_mask  = x - 1;
-            int x_shift = __builtin_ctz(x);
+#pragma unroll
             for(int j = 0; j < vec_size; j++)
             {
-                int ho            = head_offset + j;
-                int head_offset_divX = ho >> x_shift;
-                int head_offset_modX = ho & x_mask;
-                int64_t offset = cache_offset + head_offset_divX * page_size * x + block_offset_local * x + head_offset_modX;
-
+                int64_t offset = k_base + j;
                 if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
                 {
                     k_cache[offset] = elements[j];
@@ -810,29 +797,26 @@
         }
         int64_t cache_offset = block_idx * page_size * num_heads_v * head_dim +
                                headIdx * head_dim * page_size;
-
-        // no vectorized store for v cache since its not contiguous on head_dim
-        // All threads participate in processing numtokens_in_block * head_dim elements
         int64_t total_elements = numtokens_in_block * head_dim;
+        int const v_x_mask     = x - 1;
+        int const v_x_shift    = __builtin_ctz(x);
 
-        // [num_blocks, kv_heads, block_size / x, head_dim, x]
         for(int64_t idx = threadIdx.x; idx < total_elements / vec_size; idx += blockDim.x)
         {
-            int token_idx = first_token_idx + idx * vec_size / head_dim;
-            int head_offset = (idx * vec_size) % head_dim;
+            int token_idx          = first_token_idx + idx * vec_size / head_dim;
+            int head_offset        = (idx * vec_size) % head_dim;
+            int block_offset_local = (token_idx - first_token_idx + block_offset) % wg_size;
+            int block_offset_divX  = block_offset_local >> v_x_shift;
+            int x_idx              = block_offset_local & v_x_mask;
+            int64_t v_base         = cache_offset + block_offset_divX * head_dim * x + head_offset * x + x_idx;
+
             int64_t offsetWarp = (token_idx * num_heads * head_dim + localHeadIdx * head_dim) / vec_size;
             elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + head_offset / vec_size];
-            int block_offset_local  = token_idx - first_token_idx + block_offset;
-            int64_t block_idx_local = block_offset_local / page_size + block_idx;
-            block_offset_local      = block_offset_local % page_size;
-            int v_x_mask  = x - 1;
-            int v_x_shift = __builtin_ctz(x);
-            int block_offset_divX = block_offset_local >> v_x_shift;
-            int x_idx = block_offset_local & v_x_mask;
+
+#pragma unroll
             for(int j = 0; j < vec_size; j++)
             {
-                int64_t offset = cache_offset + block_offset_divX * head_dim * x + (head_offset + j) * x + x_idx;
-
+                int64_t offset = v_base + j * x;
                 if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
                 {
                     v_cache[offset] = elements[j];
@@ -846,7 +830,7 @@
         }
     }
 }
- 
+
  #define DISPATCH_KV_HEAD(num_kv_heads, ...)                             \
      if(num_kv_heads == 1)                                               \
      {                                                                   \
@@ -1815,4 +1799,5 @@ void fused_qk_norm_rope_cache_block_quant_shuffle(
      auto stream = at::hip::getCurrentHIPStream(qkv.get_device());
      DISPATCH_BY_KV_CACHE_DTYPE(qkv.scalar_type(), kv_cache_dtype, CALL_QK_NORM_ROPE_CACHE_BLOCK_QUANT);
  }
+
 } // namespace aiter
