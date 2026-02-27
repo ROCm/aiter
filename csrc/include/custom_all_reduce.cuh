@@ -797,6 +797,16 @@ struct AddFunctor<opus::fp32_t>
     }
 };
 
+// MLA metadata used this specialisation
+template <>
+struct AddFunctor<int>
+{
+    DINLINE int operator()(int a, int b)
+    {
+        return a + b;
+    }
+};
+
 template <typename T>
 struct MaxFunctor
 {
