@@ -10,11 +10,83 @@
  *         1 consumer waits for all producers then sums partial results.
  */
 
-#include <hip/hip_runtime.h>
-#include <cstdio>
-#include <cstdint>
+#ifdef __HIP_DEVICE_COMPILE__
+// ── Device pass ─────────────────────────────────────────────────────────────
 #include "opus/opus.hpp"
-#include "test_workgroup_barrier.h"
+
+constexpr int BLOCK_SIZE = 256;
+
+__global__ void cumulative_barrier_kernel(unsigned int* sem, int* accumulator, int n_workgroups)
+{
+    opus::workgroup_barrier wb{sem};
+    int i = __builtin_amdgcn_workgroup_id_x();
+    if (i >= n_workgroups) return;
+
+    wb.wait_lt(static_cast<unsigned int>(i));
+    if (__builtin_amdgcn_workitem_id_x() == 0)
+        __atomic_fetch_add(accumulator, i + 1, __ATOMIC_RELAXED);
+    wb.inc();
+}
+
+__global__ void streamk_reduce_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ workspace,
+    float* __restrict__ result,
+    unsigned int* sem,
+    int n_chunks)
+{
+    int bid = __builtin_amdgcn_workgroup_id_x();
+    int tid = __builtin_amdgcn_workitem_id_x();
+
+    if (bid < n_chunks) {
+        const float* chunk = input + bid * BLOCK_SIZE;
+        float val = chunk[tid];
+
+        __shared__ float smem[BLOCK_SIZE];
+        smem[tid] = val;
+        __builtin_amdgcn_s_barrier();
+
+        for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+            if (tid < stride)
+                smem[tid] += smem[tid + stride];
+            __builtin_amdgcn_s_barrier();
+        }
+
+        if (tid == 0)
+            workspace[bid] = smem[0];
+
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+
+        opus::workgroup_barrier wb{sem};
+        wb.inc();
+    }
+    else {
+        opus::workgroup_barrier wb{sem};
+        wb.wait_eq(static_cast<unsigned int>(n_chunks));
+
+        __shared__ float smem[BLOCK_SIZE];
+        float local_sum = 0.0f;
+        for (int i = tid; i < n_chunks; i += BLOCK_SIZE)
+            local_sum += workspace[i];
+        smem[tid] = local_sum;
+        __builtin_amdgcn_s_barrier();
+
+        for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+            if (tid < stride)
+                smem[tid] += smem[tid + stride];
+            __builtin_amdgcn_s_barrier();
+        }
+
+        if (tid == 0)
+            *result = smem[0];
+    }
+}
+
+#else
+// ── Host pass ───────────────────────────────────────────────────────────────
+// #include <hip/hip_runtime.h>   // replaced by hip_host_minimal.h for faster builds
+#include "hip_host_minimal.h"
+#include <cstdio>
 
 #define HIP_CALL(call) do { \
     hipError_t err = (call); \
@@ -24,26 +96,22 @@
     } \
 } while(0)
 
-// ---------------------------------------------------------------------------
-// Test 1: cumulative barrier (wait_lt + inc)
-// ---------------------------------------------------------------------------
-__global__ void cumulative_barrier_kernel(uint32_t* sem, int* accumulator, int n_workgroups)
-{
-    opus::workgroup_barrier wb{sem};
-    int i = blockIdx.x;
-    if (i >= n_workgroups) return;
+constexpr int BLOCK_SIZE = 256;
 
-    wb.wait_lt(static_cast<uint32_t>(i));
-    if (threadIdx.x == 0)
-        atomicAdd(accumulator, i + 1);
-    wb.inc();
-}
+__global__ void cumulative_barrier_kernel(unsigned int* sem, int* accumulator, int n_workgroups) {}
+
+__global__ void streamk_reduce_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ workspace,
+    float* __restrict__ result,
+    unsigned int* sem,
+    int n_chunks) {}
 
 extern "C" void run_workgroup_barrier_cumulative(void* d_accumulator, int n_workgroups)
 {
-    uint32_t* d_sem = nullptr;
-    HIP_CALL(hipMalloc(&d_sem, sizeof(uint32_t)));
-    HIP_CALL(hipMemset(d_sem, 0, sizeof(uint32_t)));
+    unsigned int* d_sem = nullptr;
+    HIP_CALL(hipMalloc(&d_sem, sizeof(unsigned int)));
+    HIP_CALL(hipMemset(d_sem, 0, sizeof(unsigned int)));
     HIP_CALL(hipMemset(d_accumulator, 0, sizeof(int)));
 
     hipLaunchKernelGGL(
@@ -55,78 +123,15 @@ extern "C" void run_workgroup_barrier_cumulative(void* d_accumulator, int n_work
     HIP_CALL(hipFree(d_sem));
 }
 
-// ---------------------------------------------------------------------------
-// Test 2: stream-K style reduce (wait_eq + inc)
-// ---------------------------------------------------------------------------
-constexpr int BLOCK_SIZE = 256;
-
-__global__ void streamk_reduce_kernel(
-    const float* __restrict__ input,
-    float* __restrict__ workspace,
-    float* __restrict__ result,
-    uint32_t* sem,
-    int n_chunks)
-{
-    int bid = blockIdx.x;
-
-    if (bid < n_chunks) {
-        // Producer: reduce 256 elements starting at input[bid * 256]
-        const float* chunk = input + bid * BLOCK_SIZE;
-        float val = chunk[threadIdx.x];
-
-        // Tree reduction in shared memory
-        __shared__ float smem[BLOCK_SIZE];
-        smem[threadIdx.x] = val;
-        __syncthreads();
-
-        for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
-            if (threadIdx.x < stride)
-                smem[threadIdx.x] += smem[threadIdx.x + stride];
-            __syncthreads();
-        }
-
-        if (threadIdx.x == 0)
-            workspace[bid] = smem[0];
-
-        // Ensure workspace write is globally visible before signaling the consumer.
-        __threadfence();
-
-        opus::workgroup_barrier wb{sem};
-        wb.inc();
-    }
-    else {
-        // Consumer: wait for all N producers, then sum workspace[0..N-1]
-        opus::workgroup_barrier wb{sem};
-        wb.wait_eq(static_cast<uint32_t>(n_chunks));
-
-        // Use threads cooperatively to load workspace into smem, then reduce
-        __shared__ float smem[BLOCK_SIZE];
-        float local_sum = 0.0f;
-        for (int i = threadIdx.x; i < n_chunks; i += BLOCK_SIZE)
-            local_sum += workspace[i];
-        smem[threadIdx.x] = local_sum;
-        __syncthreads();
-
-        for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
-            if (threadIdx.x < stride)
-                smem[threadIdx.x] += smem[threadIdx.x + stride];
-            __syncthreads();
-        }
-
-        if (threadIdx.x == 0)
-            *result = smem[0];
-    }
-}
-
 extern "C" void run_workgroup_barrier_streamk_reduce(
     const void* d_input,
     void* d_workspace,
     void* d_result,
     int n_chunks)
 {
-    uint32_t* d_sem = nullptr;
-    HIP_CALL(hipMalloc(&d_sem, sizeof(uint32_t)));
-    HIP_CALL(hipMemset(d_sem, 0, sizeof(uint32_t)));
+    unsigned int* d_sem = nullptr;
+    HIP_CALL(hipMalloc(&d_sem, sizeof(unsigned int)));
+    HIP_CALL(hipMemset(d_sem, 0, sizeof(unsigned int)));
 
     hipLaunchKernelGGL(
         streamk_reduce_kernel,
@@ -140,3 +145,4 @@ extern "C" void run_workgroup_barrier_streamk_reduce(
     HIP_CALL(hipDeviceSynchronize());
     HIP_CALL(hipFree(d_sem));
 }
+#endif
