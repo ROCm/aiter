@@ -1356,26 +1356,6 @@ def paged_attention_decode_sliding_window_head_1(
     ):
         # ==================== KEY LOADING AND PROCESSING ====================
         # Calculate key cache offsets and load keys
-        kv_block_start_idx2 = (
-            kv_block_start_idx
-            + MAX_NUM_KV_BLOCKS_PER_COMPUTE * CONTEXT_PARTITION_SIZE_PER_BLOCK
-        )
-        kv_block_numbers2 = gl.amd.cdna3.buffer_load(
-            ptr=block_tables_ptr
-            + sequence_idx * stride_block_table_seq
-            + kv_block_start_idx2 // CONTEXT_PARTITION_SIZE_PER_BLOCK,
-            offsets=block_indices,
-            mask=block_indices < (max_num_kv_blocks - kv_block_start_idx2),
-        )
-        kv_block_numbers2 = kv_block_numbers2.to(gl.int64)
-        key_block_offsets2 = (
-            kv_block_numbers2[:, None, None, None] * stride_key_block
-            + head_size_split_offsets[None, :, None, None] * stride_key_head_split
-            # Use runtime stride for KV block element (may be padded for large blocks).
-            + (page_offset + block_element_offsets)[None, None, :, None]
-            * stride_key_block_elem
-            + contiguous_kv_element_offsets[None, None, None, :]
-        )
 
         # Prepare QK MFMA while key loads (these don't depend on key data)
         qk_accumulator = gl.zeros(
@@ -1561,7 +1541,17 @@ def paged_attention_decode_sliding_window_head_1(
                 causal_mask = causal_mask & (
                     qk_column_offsets[None, :] >= sequence_start_idx
                 )
-
+        kv_block_start_idx2 = (
+            kv_block_start_idx
+            + MAX_NUM_KV_BLOCKS_PER_COMPUTE * CONTEXT_PARTITION_SIZE_PER_BLOCK
+        )
+        kv_block_numbers2 = gl.amd.cdna3.buffer_load(
+            ptr=block_tables_ptr
+            + sequence_idx * stride_block_table_seq
+            + kv_block_start_idx2 // CONTEXT_PARTITION_SIZE_PER_BLOCK,
+            offsets=block_indices,
+            mask=block_indices < (max_num_kv_blocks - kv_block_start_idx2),
+        )
         boundary_mask = qk_row_mask[:, None] & causal_mask
 
         # Apply masking to attention scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
@@ -1579,6 +1569,16 @@ def paged_attention_decode_sliding_window_head_1(
         )
 
         exp_sums = accumulator_scale * exp_sums + gl.sum(attention_probs, axis=1)
+        kv_block_numbers2 = kv_block_numbers2.to(gl.int64)
+        key_block_offsets2 = (
+            kv_block_numbers2[:, None, None, None] * stride_key_block
+            + head_size_split_offsets[None, :, None, None] * stride_key_head_split
+            # Use runtime stride for KV block element (may be padded for large blocks).
+            + (page_offset + block_element_offsets)[None, None, :, None]
+            * stride_key_block_elem
+            + contiguous_kv_element_offsets[None, None, None, :]
+        )
+
         # ==================== VALUE ACCUMULATION ====================
         # Handle value quantization scaling for FP8
         if KV_QUANT_MODE >= 0:
