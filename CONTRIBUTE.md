@@ -66,11 +66,16 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install --upgrade pip
 ```
 
+Note that this virtual environment needs to also have pytorch and triton installed. See for example: [PyTorch on ROCm installation](https://rocm.docs.amd.com/projects/install-on-linux/en/develop/install/3rd-party/pytorch-install.html).
+
 ### 3. Install AITER from Source
 
 For Python-only development:
 
 ```bash
+# Install base dependencies
+pip install -r requirements.txt
+
 # Install with precompiled kernels
 PREBUILD_KERNELS=1 GPU_ARCHS="gfx942;gfx950" python setup.py develop
 ```
