@@ -15,7 +15,7 @@ from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 import tempfile
-from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
+from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 import inspect
 
 

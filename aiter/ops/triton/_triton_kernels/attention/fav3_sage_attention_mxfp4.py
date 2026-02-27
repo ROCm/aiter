@@ -869,6 +869,14 @@ def _rotate_quantize_qk_kernel(
     stride_qh,
     stride_qm,
     stride_qd,
+    stride_qqb,
+    stride_qqm,
+    stride_qqh,
+    stride_qqd,
+    stride_qsb,
+    stride_qsm,
+    stride_qsh,
+    stride_qsd,
     stride_mb,
     stride_mh,
     stride_mm,
@@ -877,6 +885,14 @@ def _rotate_quantize_qk_kernel(
     stride_kh,
     stride_km,
     stride_kd,
+    stride_kqb,
+    stride_kqn,
+    stride_kqh,
+    stride_kqd,
+    stride_ksb,
+    stride_ksn,
+    stride_ksh,
+    stride_ksd,
     batch,
     heads_q,
     heads_k,
@@ -921,15 +937,18 @@ def _rotate_quantize_qk_kernel(
             + offs_m[:, None] * stride_qm
             + offs_d[None, :] * stride_qd
         )
-        descale_offset = (
-            Q_descale
-            + (pid_b * stride_qb + pid_h * stride_qh + offs_m[:, None] * stride_qm)
-            // SCALE_GROUP_SIZE
+        descale_offset = Q_descale + (
+            pid_b * stride_qsb
+            + pid_h * stride_qsh
+            + offs_m[:, None] * stride_qsm
+            + offs_ds[None, :] * stride_qsd
         )  # we group 32 values together for quantization
         # Store rotated and quantized Q
-        quant_tensor_offset = (
-            Q_q
-            + (pid_b * stride_qb + pid_h * stride_qh + offs_m[:, None] * stride_qm) // 2
+        quant_tensor_offset = Q_q + (
+            pid_b * stride_qqb
+            + pid_h * stride_qqh
+            + offs_m[:, None] * stride_qqm
+            + offs_dq[None, :] * stride_qqd
         )
         seqlen = seqlen_q
     else:
@@ -939,21 +958,24 @@ def _rotate_quantize_qk_kernel(
             + offs_m[:, None] * stride_km
             + offs_d[None, :] * stride_kd
         )
-        descale_offset = (
-            K_descale
-            + (pid_b * stride_kb + pid_h * stride_kh + offs_m[:, None] * stride_km)
-            // SCALE_GROUP_SIZE
+        descale_offset = K_descale + (
+            pid_b * stride_ksb
+            + pid_h * stride_ksh
+            + offs_m[:, None] * stride_ksn
+            + offs_ds[None, :] * stride_ksd
         )  # we group 32 values together for quantization
 
-        quant_tensor_offset = (
-            K_q
-            + (pid_b * stride_kb + pid_h * stride_kh + offs_m[:, None] * stride_km) // 2
+        quant_tensor_offset = K_q + (
+            pid_b * stride_kqb
+            + pid_h * stride_kqh
+            + offs_m[:, None] * stride_kqn
+            + offs_dq[None, :] * stride_kqd
         )
         seqlen = seqlen_k
 
     qk_ptr = tensor_offset
-    qk_descale_ptr = descale_offset + offs_ds[None, :]
-    qk_quant_ptr = quant_tensor_offset + offs_dq[None, :]
+    qk_descale_ptr = descale_offset
+    qk_quant_ptr = quant_tensor_offset
 
     qk_tile = tl.load(
         qk_ptr, mask=(offs_m[:, None] < seqlen) & (offs_d[None, :] < d_model), other=0.0
@@ -1164,6 +1186,12 @@ def smooth_rotate_downcast_qk(
         (*k.shape[:-1], d // 32), dtype=torch.uint8, device=k.device
     )
 
+    stride_qqb, stride_qqm, stride_qqh, stride_qqd = map_dims(Q_q.stride(), bshd)
+    stride_kqb, stride_kqn, stride_kqh, stride_kqd = map_dims(K_q.stride(), bshd)
+
+    stride_qsb, stride_qsm, stride_qsh, stride_qsd = map_dims(Q_descale.stride(), bshd)
+    stride_ksb, stride_ksn, stride_ksh, stride_ksd = map_dims(K_descale.stride(), bshd)
+
     grid = (b * (h_q * Q_NUM_BLKS + h_k * K_NUM_BLKS),)
     _rotate_quantize_qk_kernel[grid](
         q,
@@ -1179,6 +1207,14 @@ def smooth_rotate_downcast_qk(
         stride_qh,
         stride_qm,
         stride_qd,
+        stride_qqb,
+        stride_qqm,
+        stride_qqh,
+        stride_qqd,
+        stride_qsb,
+        stride_qsm,
+        stride_qsh,
+        stride_qsd,
         q_mean.stride(0) if q_smoothing else None,
         q_mean.stride(1) if q_smoothing else None,
         q_mean.stride(2) if q_smoothing else None,
@@ -1187,6 +1223,14 @@ def smooth_rotate_downcast_qk(
         stride_kh,
         stride_kn,
         stride_kd,
+        stride_kqb,
+        stride_kqn,
+        stride_kqh,
+        stride_kqd,
+        stride_ksb,
+        stride_ksn,
+        stride_ksh,
+        stride_ksd,
         b,
         h_q,
         h_k,
