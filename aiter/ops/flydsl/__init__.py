@@ -1,5 +1,25 @@
-"""Reusable FLIR Python examples and kernel builders.
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-This directory is a Python package so tests can import kernel builders via:
-`from kernels.layernorm_kernel import build_layernorm_module`.
+"""FlyDSL -- high-performance GPU kernels implemented using FlyDSL.
+
+Kernel compilation and public APIs are only available when the ``flydsl``
+package is installed.  Use ``is_flydsl_available()`` to check at runtime.
 """
+
+from .utils import is_flydsl_available
+
+__all__ = [
+    "is_flydsl_available",
+]
+
+if is_flydsl_available():
+    from .moe_kernels import (
+        flydsl_moe_stage1,
+        flydsl_moe_stage2,
+    )
+
+    __all__ += [
+        "flydsl_moe_stage1",
+        "flydsl_moe_stage2",
+    ]

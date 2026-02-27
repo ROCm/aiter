@@ -611,117 +611,34 @@ def flydsl_moe_stage2(
     use_non_temporal_load=False,
     **_kwargs,
 ):
-    from aiter.ops.flydsl.moe_kernels import parse_flydsl_kernel_name
-    from aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
-    from aiter.ops.flydsl.kernels.moe_gemm_2stage import compile_moe_reduction
-    from aiter.ops.shuffle import shuffle_weight
+    from aiter.ops.flydsl.moe_kernels import (
+        flydsl_moe_stage2 as _flydsl_moe_stage2,
+        parse_flydsl_kernel_name,
+    )
 
     parsed = parse_flydsl_kernel_name(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
 
-    mode = parsed["mode"]
-    accumulate = mode != "reduce"
-
-    token_num = inter_states.shape[0]
-    inter_dim = inter_states.shape[2]
-    E = w2.shape[0]
-    model_dim = w2.shape[1]
-
-    is_wfp4 = w2.dtype == dtypes.fp4x2
-    if is_wfp4:
-        inter_dim = inter_dim * 2
-
-    if inter_states.dtype == dtypes.fp4x2:
-        a_dtype_str = "fp4"
-    elif inter_states.dtype == dtypes.fp8:
-        a_dtype_str = "fp8"
-    else:
-        raise ValueError(f"Unsupported a2 dtype: {inter_states.dtype}")
-
-    out_dtype_str = "bf16" if out.dtype == dtypes.bf16 else "f16"
-
-    if getattr(w2, "is_shuffled", False):
-        w2_shuffled = w2
-    else:
-        w2_shuffled = shuffle_weight(w2, layout=(16, 16))
-        w2_scale = fp4_utils.e8m0_shuffle(w2_scale)
-
-    exe2 = compile_mixed_moe_gemm2(
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        experts=E,
+    _flydsl_moe_stage2(
+        inter_states=inter_states,
+        w2=w2,
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        out=out,
         topk=topk,
         tile_m=parsed["tile_m"],
         tile_n=parsed["tile_n"],
         tile_k=parsed["tile_k"],
-        doweight_stage2=(sorted_weights is not None),
-        a_dtype=a_dtype_str,
-        b_dtype="fp4",
-        out_dtype=out_dtype_str,
-        accumulate=accumulate,
+        a_dtype=parsed["a_dtype"],
+        b_dtype=parsed["b_dtype"],
+        out_dtype=parsed["out_dtype"],
+        mode=parsed.get("mode", "atomic"),
+        w2_scale=w2_scale,
+        a2_scale=a2_scale,
+        sorted_weights=sorted_weights,
     )
-
-    if sorted_weights is None:
-        sorted_w = torch.zeros(
-            sorted_token_ids.shape, dtype=torch.float32, device=inter_states.device
-        )
-    else:
-        sorted_w = sorted_weights
-
-    empty_bias = torch.empty(0, dtype=torch.float32, device=inter_states.device)
-    blocks = int(sorted_expert_ids.numel())
-    stream_ptr = torch.cuda.current_stream().cuda_stream
-
-    if accumulate:
-        out.zero_()
-        exe2(
-            out,
-            inter_states,
-            w2_shuffled,
-            a2_scale,
-            w2_scale,
-            sorted_token_ids,
-            sorted_expert_ids,
-            sorted_w,
-            num_valid_ids,
-            empty_bias,
-            token_num,
-            model_dim,
-            inter_dim,
-            blocks,
-            stream_ptr,
-        )
-    else:
-        out_slots = torch.empty(
-            (token_num * topk * model_dim,),
-            device=out.device,
-            dtype=out.dtype,
-        )
-        exe2(
-            out_slots,
-            inter_states,
-            w2_shuffled,
-            a2_scale,
-            w2_scale,
-            sorted_token_ids,
-            sorted_expert_ids,
-            sorted_w,
-            num_valid_ids,
-            empty_bias,
-            token_num,
-            model_dim,
-            inter_dim,
-            blocks,
-            stream_ptr,
-        )
-        out_slots_3d = out_slots.view(token_num, topk, model_dim)
-        reduce_exe = compile_moe_reduction(
-            topk=topk,
-            model_dim=model_dim,
-            dtype_str=out_dtype_str,
-        )
-        reduce_exe(out_slots_3d, out, token_num, stream_ptr)
 
 
 @functools.lru_cache(maxsize=2048)
