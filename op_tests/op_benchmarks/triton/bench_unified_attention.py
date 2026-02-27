@@ -23,6 +23,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
     get_caller_name_no_ext,
 )
+from einops import repeat
 
 
 from typing import Optional
@@ -301,9 +302,6 @@ def create_benchmark_configs(custom, args):
         )
     )
     return configs
-
-
-from einops import repeat
 
 
 def generate_exact_padding_mask(seqlens, device):
