@@ -29,7 +29,7 @@ __all__ = ["fused_allreduce_add_rms_quant"]
 
 logger = logging.getLogger(__name__)
 
-ALLREDUCE_IMPL = os.environ.get("VLLM_ROCM_FUSED_ALLREDUCE", "iris_twoshot_row")
+ALLREDUCE_IMPL = os.environ.get("VLLM_ROCM_FUSED_ALLREDUCE", "iris_twoshot")
 
 
 def fused_allreduce_add_rms_quant(
@@ -40,7 +40,6 @@ def fused_allreduce_add_rms_quant(
     quant_dtype: torch.dtype,
     group_name: str,
     residual: Optional[torch.Tensor] = None,
-    impl: str = ALLREDUCE_IMPL,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -58,15 +57,11 @@ def fused_allreduce_add_rms_quant(
         quant_dtype: Target quantization dtype (e.g., torch.float8_e4m3fn)
         group_name: TP group name for all-reduce
         residual: Optional residual tensor for fused add
-        impl: Implementation to use - "torch" (pure torch reference),
-              "iris_oneshot" (Iris fused single-kernel),
-              "iris_twoshot" (two-shot reduce+broadcast, per-tensor quant),
-              "iris_twoshot_row" (two-shot, per-row quant),
-              or "iris_twoshot_delayed" (two-shot, delayed scaling)
 
     Returns: (allreduce_out, rms_out, residual_out, quant_out, quant_scale_out)
              residual_out is None if residual is None
     """
+    impl = ALLREDUCE_IMPL
     if impl == "iris_oneshot":
         from .iris_oneshot_allreduce import (
             fused_allreduce_add_rms_quant_iris_oneshot,
