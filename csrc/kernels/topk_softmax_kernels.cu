@@ -2,7 +2,7 @@
  * Copyright © Advanced Micro Devices, Inc. All rights reserved.
  * Adapted from
  * https://github.com/NVIDIA/TensorRT-LLM/blob/v0.7.1/cpp/tensorrt_llm/kernels/mixtureOfExperts/moe_kernels.cu
- * Copyright (C) 2024-2025, The vLLM team.
+ * Copyright (C) 2024-2026, The vLLM team.
  * SPDX-FileCopyrightText: Copyright (c) 1993-2023 NVIDIA CORPORATION & AFFILIATES. All rights
  * reserved. SPDX-License-Identifier: Apache-2.0
  *
@@ -223,7 +223,8 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
                            const int start_expert,
                            const int end_expert,
                            const int output_stride,
-                           const int indices_stride)
+                           const int indices_stride,
+                           const int input_stride)
 {
     // We begin by enforcing compile time assertions and setting up compile time constants.
     static_assert(VPT == (VPT & -VPT), "VPT must be power of 2");
@@ -281,7 +282,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
 
     // We finally start setting up the read pointers for each thread. First, each thread jumps to
     // the start of the row it will read.
-    const DTYPE* thread_row_ptr = input + thread_row * ELTS_PER_ROW;
+    const DTYPE* thread_row_ptr = input + thread_row * input_stride;
 
     // Now, we compute the group each thread belong to in order to determine the first column to
     // start loads.
@@ -485,6 +486,7 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
                                      const int end_expert,
                                      const int output_stride,
                                      const int indices_stride,
+                                     const int input_stride,
                                      const bool need_renorm,
                                      hipStream_t stream)
 {
@@ -511,7 +513,8 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
                                                    start_expert,
                                                    end_expert,
                                                    output_stride,
-                                                   indices_stride);
+                                                   indices_stride,
+                                                   input_stride);
     }
     else
     {
@@ -526,7 +529,8 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
                                                    start_expert,
                                                    end_expert,
                                                    output_stride,
-                                                   indices_stride);
+                                                   indices_stride,
+                                                   input_stride);
     }
 }
 
@@ -542,6 +546,7 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
                                                                       num_experts,          \
                                                                       topk_weights_stride,  \
                                                                       topk_id_stride,       \
+                                                                      gating_token_stride,  \
                                                                       need_renorm,          \
                                                                       stream);
 
@@ -556,6 +561,7 @@ void topkGatingSoftmaxKernelLauncher(const DTYPE* gating_output,
                                      const int topk,
                                      const int topk_weights_stride,
                                      const int topk_id_stride,
+                                     const int gating_token_stride,
                                      const bool need_renorm,
                                      hipStream_t stream)
 {
@@ -627,6 +633,7 @@ void topk_softmax(torch::Tensor& topk_weights,         // [num_tokens, topk]
     const int topk                = topk_weights.size(-1);
     const int topk_weights_stride = topk_weights.stride(0);
     const int topk_id_stride      = topk_indices.stride(0);
+    const int gating_token_stride = gating_output.stride(0);
 
     const bool is_pow_2          = (num_experts != 0) && ((num_experts & (num_experts - 1)) == 0);
     const bool needs_workspace   = !is_pow_2 || num_experts > 256;
@@ -649,6 +656,7 @@ void topk_softmax(torch::Tensor& topk_weights,         // [num_tokens, topk]
             topk,
             topk_weights_stride,
             topk_id_stride,
+            gating_token_stride,
             need_renorm,
             stream);
     });
