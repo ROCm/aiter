@@ -126,9 +126,7 @@ def _reduce_grouped(
     start = pid_t * K
 
     threads_per_elem_n: gl.constexpr = gl.cdiv(BLOCK_N // (NUM_WARPS * 32), 16)
-    threads_per_elem_n_out: gl.constexpr = gl.cdiv(
-        BLOCK_N_OUT // (NUM_WARPS * 32), 16
-    )
+    threads_per_elem_n_out: gl.constexpr = gl.cdiv(BLOCK_N_OUT // (NUM_WARPS * 32), 16)
 
     blocked_n: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[threads_per_elem_n, 16],
@@ -190,7 +188,6 @@ def _reduce_grouped(
         curr = gl.convert_layout(curr, gl.SliceLayout(0, blocked_n_out))
         # update final accumulator
         acc += curr
-    # Compute per-32-col MXFP scales for this tile if requested
     Nrem = N // ACTIVATION_REDUCTION_N
 
     # Write-back
@@ -287,9 +284,7 @@ def consume_scaled_tile(
         unshuffle_b_to_kn(b_shuffled, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K), DOT_B_LAYOUT
     )
 
-    offs_k_scale = (k_offset_start // BLOCKSCALE_K) + m * gl.cdiv(
-        BLOCK_K, BLOCKSCALE_K
-    )
+    offs_k_scale = (k_offset_start // BLOCKSCALE_K) + m * gl.cdiv(BLOCK_K, BLOCKSCALE_K)
     if is_x_blockscale:
         if PER_ROW_X_SCALE:
             x_scale_ptrs = (
@@ -320,9 +315,7 @@ def consume_scaled_tile(
         offs_w_scale_n = offs_w_n // BLOCKSCALE_N
         # WScale: [K_blocks, N_blocks]
         w_scale_ptrs = (
-            w_scale_base
-            + offs_k_scale * stride_w_bs_k
-            + offs_w_scale_n * stride_w_bs_n
+            w_scale_base + offs_k_scale * stride_w_bs_k + offs_w_scale_n * stride_w_bs_n
         )
         cur_b_scale = gl.load(w_scale_ptrs)
     else:
@@ -433,7 +426,6 @@ def create_descriptor(
     )
     W += expt_id * stride_w_e
 
-    # stride_w_n = n16 stride, stride_w_k = kshuf stride
     b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=W,
         shape=(N // 16, K * 16),
@@ -497,7 +489,6 @@ def _moe_gemm_a8w8_blockscale_gfx1250(
     BLOCKSCALE_M: gl.constexpr,
     BLOCKSCALE_N: gl.constexpr,
     BLOCKSCALE_K: gl.constexpr,
-    NUM_WARPS: gl.constexpr,
     XCD_SWIZZLE: gl.constexpr,
     EVEN_K: gl.constexpr,
     MASK_K_LIMIT: gl.constexpr,
@@ -851,6 +842,7 @@ def get_kernel_config(m, n, k, routing_data):
     blockscale_k = 128
     blockscale_n = 128
     num_xcds = 1
+    num_buffers = 2
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_stages = 2
@@ -891,6 +883,7 @@ def get_kernel_config(m, n, k, routing_data):
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
         "kpack": 1,
+        "num_buffers": num_buffers,
     }
     return ret
 
@@ -1138,7 +1131,7 @@ def moe_gemm_a8w8_blockscale_gfx1250(
         stride_x_bs_m,
         stride_x_bs_k,
         w,
-        w.stride(0), # W is (E, N//16, K*16)
+        w.stride(0),  # W is (E, N//16, K*16)
         w.stride(2),
         w.stride(1),
         w_block_scales,
@@ -1172,20 +1165,18 @@ def moe_gemm_a8w8_blockscale_gfx1250(
         BLOCKSCALE_M=config["blockscale_m"],
         BLOCKSCALE_N=config["blockscale_n"],
         BLOCKSCALE_K=config["blockscale_k"],
-        NUM_WARPS=config["num_warps"],
         XCD_SWIZZLE=config["xcd_swizzle"],
-        SPLIT_K=config["split_k"],
         EVEN_K=K % config["block_k"] == 0,
         MASK_K_LIMIT=K % config["block_k"],
+        SPLIT_K=config["split_k"],
         W_CACHE_MODIFIER=config["w_cache_modifier"],
         num_warps=config["num_warps"],
         num_stages=config["num_stages"],
         UPCAST_INDICES=should_upcast_indices(x, w, y),
-        PER_ROW_X_SCALE=per_row_x_scale,
         waves_per_eu=config["waves_per_eu"],
         matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
         kpack=config["kpack"],
-        # Layouts (computed in wrapper)
+        # Layouts
         BLOCKED_MK=blocked_mk,
         BLOCKED_KN=blocked_kn,
         WMMA_LAYOUT=wmma_layout,
@@ -1194,6 +1185,10 @@ def moe_gemm_a8w8_blockscale_gfx1250(
         DOT_A_LAYOUT=dot_a_layout,
         DOT_B_LAYOUT=dot_b_layout,
         BLOCKED_B=blocked_b,
+        # Use per-row or 2D blockscale on X
+        PER_ROW_X_SCALE=per_row_x_scale,
+        # Number of buffers to use for async_load
+        NUM_BUFFERS=config["num_buffers"],
     )
     # Build grouped reduction inputs in a uniform way
     group_indx = (

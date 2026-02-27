@@ -342,7 +342,7 @@ class Case:
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
 @pytest.mark.parametrize("fused_quant", [False, True])
-@pytest.mark.parametrize("backend", ["gluon"])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_op(
     m,
     n,
