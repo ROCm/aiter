@@ -4,7 +4,7 @@
 
 from jinja2 import Template
 from csrc.cpp_itfs.utils import compile_template_op, AITER_CORE_DIR
-
+import math
 
 MD_NAME = "top_k_renorm_probs"
 
@@ -16,7 +16,7 @@ with open(
 
 
 def compile(
-    d: int,
+    vec_size: int,
     folder: str = None,
 ):
     return compile_template_op(
@@ -27,7 +27,7 @@ def compile(
             f"{AITER_CORE_DIR}/csrc/cpp_itfs/sampling/sampling.cuh",
             f"{AITER_CORE_DIR}/csrc/cpp_itfs/sampling/vec_dtypes.cuh",
         ],
-        d=d,
+        vec_size=vec_size,
         folder=folder,
     )
 
@@ -46,16 +46,17 @@ def top_k_renorm_probs(
 
     batch_size = probs.size(0)
     vocab_size = probs.size(1)
-
+    vec_size = math.gcd(16 // probs.element_size(), vocab_size)
     renorm_probs = torch.empty_like(probs)
 
-    func = compile(vocab_size)
+    func = compile(vec_size)
     (
         probs_ptr,
         renorm_probs_ptr,
         top_k_arr_ptr,
         top_k_val,
         batch_size,
+        vocab_size,
         stream,
     ) = torch_to_c_types(
         probs,
@@ -63,6 +64,7 @@ def top_k_renorm_probs(
         maybe_top_k_arr,
         top_k_val,
         batch_size,
+        vocab_size,
         torch.cuda.current_stream(),
     )
     func(
@@ -71,6 +73,7 @@ def top_k_renorm_probs(
         top_k_arr_ptr,
         batch_size,
         top_k_val,
+        vocab_size,
         stream,
     )
     return renorm_probs

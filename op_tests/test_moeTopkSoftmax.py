@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
@@ -109,9 +109,8 @@ def test_topk_softmax(dtype, token, E, topk, renormalize=True):
     ret = {}
     for tag, func in func_dict.items():
         if tag == "asm" and not (
-            get_gfx() == "gfx942"
-            and (E, topk) in [(128, 6), (128, 8), (256, 6), (256, 8)]
-            and dtype == dtypes.fp32
+            (E, topk) in [(128, 4), (128, 6), (128, 8), (256, 6), (256, 8)]
+            and dtype in [dtypes.bf16, dtypes.fp32]
         ):
             continue
         (topk_weights, topk_ids), us = func(gating_output, topk, renormalize)
@@ -409,29 +408,6 @@ def test_grouped_topk(
     return {"err": err, "us": us_aiter}
 
 
-l_dtype = ["fp32", "bf16", "fp16"]
-l_expert = [128, 256]
-l_topk = 8
-l_token = [
-    1,
-    2,
-    5,
-    8,
-    16,
-    32,
-    64,
-    128,
-    256,
-    512,
-    1024,
-    2048,
-    4096,
-    10000,
-    16384,
-    65536,
-    163840,
-]
-
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -439,11 +415,11 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["fp32"], dtypes.d_dtypes["bf16"]],
+    nargs="*",
+    metavar="{fp32, bf16}",
+    default=[dtypes.d_dtypes["fp32"], dtypes.d_dtypes["bf16"]],
     help="""Data type.
     e.g.: -d bf16""",
 )
@@ -451,10 +427,8 @@ parser.add_argument(
     "-e",
     "--expert",
     type=int,
-    # choices=l_expert,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    default=[128, 256],
     help="""Number of experts.
     e.g.: -e 64""",
 )
@@ -463,43 +437,51 @@ parser.add_argument(
     "--token",
     type=int,
     # choices=l_token,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    default=[
+        1,
+        2,
+        5,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        10000,
+        16384,
+        65536,
+        163840,
+    ],
     help="""Number of tokens.
     e.g.: -t 64""",
 )
 parser.add_argument(
     "-k",
     type=int,
-    default=None,
+    default=8,
     help="""Number of topk.
     e.g.: -k 8""",
 )
 
 args = parser.parse_args()
-if args.dtype is None:
-    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-else:
-    l_dtype = [dtypes.d_dtypes[args.dtype]]
-if args.expert is not None:
-    l_expert = [args.expert]
-if args.token is not None:
-    l_token = [args.token]
-if args.k is not None:
-    l_topk = args.k
 
 df = []
-for dtype in l_dtype:
-    for e in l_expert:
-        for m in l_token:
-            ret = test_topk_softmax(dtype, m, e, l_topk)
+for dtype in args.dtype:
+    for e in args.expert:
+        for m in args.token:
+            ret = test_topk_softmax(dtype, m, e, args.k)
             df.append(ret)
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("moeTopkSoftmax summary (markdown):\n%s", df_md)
 
 df = []
-for token in l_token:
+for token in args.token:
     # DeepSeek-R1
     topk = 8
     group = 8
@@ -512,10 +494,11 @@ for token in l_token:
     )
     df.append(ret)
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("moeTopkSoftmax_biased_grouped_topk summary (markdown):\n%s", df_md)
 
 df = []
-for token in l_token:
+for token in args.token:
     for scoring_func in ["softmax", "sigmoid"]:
         # DeepSeek-R1
         topk = 8
@@ -537,4 +520,5 @@ for token in l_token:
         )
         df.append(ret)
 df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("moeTopkSoftmax_grouped_topk summary (markdown):\n%s", df_md)

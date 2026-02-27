@@ -2,8 +2,8 @@ import sys
 import torch
 import triton
 import math
-from aiter.ops.triton.gemm_a16w16_gated import gemm_a16w16_gated
-from op_tests.triton_tests.test_gemm_a16w16_gated import (
+from aiter.ops.triton.gemm.basic.gemm_a16w16_gated import gemm_a16w16_gated
+from op_tests.triton_tests.gemm.basic.test_gemm_a16w16_gated import (
     generate_gemm_a16w16_gated_inputs,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (

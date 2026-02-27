@@ -25,6 +25,23 @@ If you happen to forget the `--recursive` during `clone`, you can use the follow
 git submodule sync && git submodule update --init --recursive
 ```
 
+
+### Triton-based Communication (Iris)
+
+AITER supports GPU-initiated communication using the [Iris library](https://github.com/ROCm/iris). This enables high-performance Triton-based communication primitives like reduce-scatter and all-gather.
+
+**Installation**
+
+Install with Triton communication support:
+
+```bash
+# Install AITER with Triton communication dependencies
+pip install -e .
+pip install -r requirements-triton-comms.txt
+ ```
+
+For more details, see [docs/triton_comms.md](docs/triton_comms.md).
+
 ## Run operators supported by aiter
 
 There are number of op test, you can run them with: `python3 op_tests/test_layernorm2d.py`

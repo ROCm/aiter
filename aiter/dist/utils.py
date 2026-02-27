@@ -696,8 +696,26 @@ def get_distributed_init_method(ip: str, port: int) -> str:
     return f"tcp://[{ip}]:{port}" if ":" in ip else f"tcp://{ip}:{port}"
 
 
+USE_SCHED_YIELD = (sys.version_info[:3] >= (3, 11, 1)) or (
+    sys.version_info[:2] == (3, 10) and sys.version_info[2] >= 8
+)
+import time
+
+
+def sched_yield():
+    if USE_SCHED_YIELD:
+        os.sched_yield()
+    else:
+        time.sleep(0)
+
+
+@lru_cache()
+def get_zmq_base_path() -> str:
+    return tempfile.gettempdir()
+
+
 def get_open_zmq_ipc_path() -> str:
-    base_rpc_path = envs.VLLM_RPC_BASE_PATH
+    base_rpc_path = get_zmq_base_path()
     return f"ipc://{base_rpc_path}/{uuid4()}"
 
 

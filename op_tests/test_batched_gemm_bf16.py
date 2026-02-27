@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import torch.nn.functional as F
@@ -39,37 +39,6 @@ def test_gemm(dtype, b, m, n, k):
     checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
 
 
-l_dtype = ["bf16"]
-l_b = [16]
-l_mnk = [
-    # qkv_proj
-    (1, 1280, 8192),
-    (32, 1280, 8192),
-    (64, 1280, 8192),
-    (128, 1280, 8192),
-    (192, 1280, 8192),
-    (256, 1280, 8192),
-    (320, 1280, 8192),
-    (512, 1280, 8192),
-    (1024, 1280, 8192),
-    (2048, 1280, 8192),
-    (4096, 1280, 8192),
-    (8192, 1280, 8192),
-    # attn_out
-    (1, 8192, 1024),
-    (32, 8192, 1024),
-    (64, 8192, 1024),
-    (128, 8192, 1024),
-    (192, 8192, 1024),
-    (256, 8192, 1024),
-    (320, 8192, 1024),
-    (512, 8192, 1024),
-    (1024, 8192, 1024),
-    (2048, 8192, 1024),
-    (4096, 8192, 1024),
-    (8192, 8192, 1024),
-]
-
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -77,11 +46,11 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["bf16"]],
+    nargs="*",
+    default="bf16,",
+    metavar="{bf16}",
     help="""Data type.
     e.g.: -d bf16""",
 )
@@ -89,10 +58,9 @@ parser.add_argument(
     "-b",
     "--batch",
     type=int,
-    choices=l_b,
-    nargs="?",
-    const=None,
-    default=None,
+    choices=[16],
+    nargs="*",
+    default=[16],
     help="""Batch size.
     e.g.: -b 16""",
 )
@@ -100,25 +68,43 @@ parser.add_argument(
     "-s",
     "--mnk",
     type=dtypes.str2tuple,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    default=[
+        # qkv_proj
+        (1, 1280, 8192),
+        (32, 1280, 8192),
+        (64, 1280, 8192),
+        (128, 1280, 8192),
+        (192, 1280, 8192),
+        (256, 1280, 8192),
+        (320, 1280, 8192),
+        (512, 1280, 8192),
+        (1024, 1280, 8192),
+        (2048, 1280, 8192),
+        (4096, 1280, 8192),
+        (8192, 1280, 8192),
+        # attn_out
+        (1, 8192, 1024),
+        (32, 8192, 1024),
+        (64, 8192, 1024),
+        (128, 8192, 1024),
+        (192, 8192, 1024),
+        (256, 8192, 1024),
+        (320, 8192, 1024),
+        (512, 8192, 1024),
+        (1024, 8192, 1024),
+        (2048, 8192, 1024),
+        (4096, 8192, 1024),
+        (8192, 8192, 1024),
+    ],
     help="""Shape of mnk.
-    e.g.    -s 1024,8192,1024
-            --mnk 1024,8192,1024""",
+    e.g.:   -s 1,1280,8192
+            --mnk 1,1280,8192""",
 )
 args = parser.parse_args()
-if args.dtype is None:
-    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-else:
-    l_dtype = [dtypes.d_dtypes[args.dtype]]
-if args.batch is not None:
-    l_b = [args.batch]
-if args.mnk is not None:
-    l_mnk = [args.mnk]
 
 
-for dtype in l_dtype:
-    for b in l_b:
-        for m, n, k in l_mnk:
+for dtype in args.dtype:
+    for b in args.batch:
+        for m, n, k in args.mnk:
             test_gemm(dtype, b, m, n, k)

@@ -2,7 +2,7 @@ import sys
 import torch
 import triton
 import math
-from op_tests.triton_tests.test_batched_gemm_bf16 import (
+from op_tests.triton_tests.gemm.batched.test_batched_gemm_bf16 import (
     generate_batched_gemm_a16w16_inputs,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
@@ -17,7 +17,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
     get_caller_name_no_ext,
 )
-from aiter.ops.triton.batched_gemm_bf16 import batched_gemm_bf16
+from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import batched_gemm_bf16
 
 
 def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str):

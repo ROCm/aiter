@@ -292,4 +292,5 @@ for padding_token in l_padding_token:
                         )
                         df.append(ret)
             df = pd.DataFrame(df)
-            aiter.logger.info(f"summary:\n{df}")
+            df_md = df.to_markdown(index=False)
+            aiter.logger.info("moe_sorting summary (markdown):\n%s", df_md)

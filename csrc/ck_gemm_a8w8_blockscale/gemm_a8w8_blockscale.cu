@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+#include <cmath>
+#include <functional>
+#include <unordered_map>
+
+#include <torch/extension.h>
+
+#include "gemm_common.h"
+
 #include "gemm_a8w8_blockscale_common.cuh"
 #include "gemm_a8w8_blockscale_lookup.h"
-#include "gemm_common.h"
 #include "gemm_a8w8_blockscale_manifest.h"
-
-#include <cmath>
 
 using BlockwiseKernel = std::function<torch::Tensor(
     torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&)>;
@@ -26,29 +31,21 @@ struct IntTupleHash
 using BlockwiseKernelMap =
     std::unordered_map<std::tuple<int, int, int>, BlockwiseKernel, IntTupleHash>;
 
-// Helper function to return the next largest power of 2
-static constexpr int nextPow2(unsigned int num)
-{
-    if(num <= 1)
-        return 1;
-    return 1 << (CHAR_BIT * sizeof(num) - __builtin_clz(num - 1));
-}
-
 template <typename DDataType, typename EDataType = DDataType>
-BlockwiseKernel blockscale_dispatch(int M, int N, int K)
+static BlockwiseKernel blockscale_dispatch(int M, int N, int K)
 {
     // For a given shape, either find the best kernel via lookup or heuristic.
     // For many small M shapes, we bucket them to the next largest kernel.
     // This is fine since kernels are padded anyway.
 
     static const auto lookup = [] {
-        if constexpr(std::is_same_v<EDataType, F16>)
+        if constexpr(std::is_same_v<EDataType, FP16>)
         {
-            return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(DDataType, F16)};
+            return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(DDataType, FP16)};
         }
-        else if constexpr(std::is_same_v<EDataType, B16>)
+        else if constexpr(std::is_same_v<EDataType, BF16>)
         {
-            return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(DDataType, B16)};
+            return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(DDataType, BF16)};
         }
         else
         {
@@ -65,7 +62,7 @@ BlockwiseKernel blockscale_dispatch(int M, int N, int K)
     }
 
     int padded_m = M;
-  
+
     // Fine-grained search
     padded_m = getPaddedM(M, N, K, 0);
 
@@ -76,17 +73,17 @@ BlockwiseKernel blockscale_dispatch(int M, int N, int K)
     {
         return it->second;
     }
-  
+
     // Coarse-grained search
     padded_m = getPaddedM(M, N, K, 1);
-    it = lookup.find({padded_m, N, K});
-    if (it != lookup.end())
+    it       = lookup.find({padded_m, N, K});
+    if(it != lookup.end())
     {
-      return it->second;
+        return it->second;
     }
-  
-    // Otherwise, use heuristics.
-    return a8w8_blockscale_1x128x128_256x16x128x256_16x16_16x16_16x16x1_16x16x1_1x16x1x16_8_1x2_intrawave_v1<
+
+    // Default legacy kernel
+    return a8w8_blockscale_1x128x128_256x16x128x256_16x16_16x16_1x2_16x16x1_16x16x1_1x16x1x16_8_1x2_intrawave_v1<
         DDataType,
         EDataType>;
 }
@@ -106,11 +103,11 @@ torch::Tensor gemm_a8w8_blockscale(torch::Tensor& XQ,
 
     if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
     {
-        blockscale_dispatch<F32, F16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
+        blockscale_dispatch<FP32, FP16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
     }
     else if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
     {
-        blockscale_dispatch<F32, B16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
+        blockscale_dispatch<FP32, BF16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
     }
     else
     {

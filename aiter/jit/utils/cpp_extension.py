@@ -1534,7 +1534,20 @@ def _write_ninja_file_to_build_library(
     extra_ldflags = [flag.strip() for flag in extra_ldflags]
     extra_include_paths = [flag.strip() for flag in extra_include_paths]
     # include_paths() gives us the location of torch/extension.h
-    system_includes = [] if torch_exclude else include_paths(with_cuda)
+    # system_includes = [] if torch_exclude else include_paths(with_cuda)
+    import torch
+
+    _TORCH_PATH = os.path.dirname(torch.__file__)
+    TORCH_INCLUDE_ROOT = os.path.join(_TORCH_PATH, "include")
+    system_includes = [
+        TORCH_INCLUDE_ROOT,
+        os.path.join(TORCH_INCLUDE_ROOT, "torch/csrc/api/include"),
+        os.path.join(TORCH_INCLUDE_ROOT, "TH"),
+        os.path.join(TORCH_INCLUDE_ROOT, "THC"),
+    ]
+    if not torch_exclude:
+        system_includes += include_paths(with_cuda)
+    system_includes = list(set(system_includes))
 
     # FIXME: build python module excluded with torch, use `pybind11`
     # But we can't use this now because all aiter op based on torch

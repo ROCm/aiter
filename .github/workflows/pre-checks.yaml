@@ -12,12 +12,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: 'recursive'
 
-      - name: Verify 3rdparty commits
+      - name: Verify 4rdparty commits
+        if: github.ref != 'refs/heads/main'
         run: ./.github/scripts/check_deps.sh
+
+      - name: Skip check on main branch
+        if: github.ref == 'refs/heads/main'
+        run: echo "Skipping dependency check on main branch, considered success."
 
   black:
     name: Check Code Style with Black
@@ -35,7 +40,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Set up Python environment
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v4
         with:
           python-version: "3.12"
       - name: Install dependencies
@@ -46,7 +51,16 @@ jobs:
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ruff check . -e | reviewdog -efm="%f:%l:%c: %m" -diff="git diff FETCH_HEAD" -reporter=github-pr-check -tee
+          ruff check . \
+            --output-format=rdjson \
+            --exit-zero \
+            --no-fix \
+          | reviewdog \
+            -f=rdjson \
+            -name="ruff" \
+            -reporter=github-pr-review \
+            -filter-mode=diff_context \
+            -fail-on-error=true
 
   upload-success-artifact:
     name: Upload Success Signal

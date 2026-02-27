@@ -126,6 +126,7 @@ def fused_allreduce_rmsnorm_fake(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.empty_like(res_inp), torch.empty_like(inp)
 
+
 @torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_fake)
 def fused_allreduce_rmsnorm_(
     inp: torch.Tensor,
@@ -141,6 +142,31 @@ def fused_allreduce_rmsnorm_(
     return group._fused_allreduce_rmsnorm_out_place(inp, res_inp, w, eps)
 
 
+def fused_allreduce_rmsnorm_quant_fake(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return torch.empty_like(res_inp), torch.empty_like(inp), torch.empty(inp.shape[:-1] + (1,), dtype=torch.float32, device=inp.device())
+
+
+@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_fake)
+def fused_allreduce_rmsnorm_quant_(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_allreduce_rmsnorm_quant_out_place(inp, res_inp, w, eps)
+
+
 if supports_custom_op():
 
     # @torch.library.custom_op("aiter::outplace_all_gather", mutates_args=[])
@@ -150,6 +176,15 @@ if supports_custom_op():
         if group is None:
             raise ValueError(f"Group {group_name} is destroyed.")
         return group._all_gather_out_place(input)
+
+    def outplace_reduce_scatter(
+        input: torch.Tensor, output: torch.Tensor, group_name: str, dim: int
+    ) -> torch.Tensor:
+        assert group_name in _groups, f"Group {group_name} is not found."
+        group = _groups[group_name]()
+        if group is None:
+            raise ValueError(f"Group {group_name} is destroyed.")
+        return group._reduce_scatter_out_place(input, output, dim)
 
 
 class GroupCoordinator:
@@ -320,7 +355,7 @@ class GroupCoordinator:
             yield graph_capture_context
 
     def all_reduce(
-        self, input_: torch.Tensor, ca_use_new: bool = False, ca_fp8_quant: bool = False
+        self, input_: torch.Tensor, ca_use_new: bool = True, ca_fp8_quant: bool = False
     ) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the
@@ -364,6 +399,17 @@ class GroupCoordinator:
         return fused_allreduce_rmsnorm_(
             input_, residual_inp_, weight_, eps, group_name=self.unique_name
         )
+    
+    def fused_allreduce_rmsnorm_quant(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return fused_allreduce_rmsnorm_quant_(
+            input_, residual_inp_, weight_, eps, group_name=self.unique_name
+        )
 
     def _fused_allreduce_rmsnorm_out_place(
         self,
@@ -375,6 +421,19 @@ class GroupCoordinator:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.fused_allreduce_rmsnorm(
+            input_, residual_inp_, weight_, eps
+        )
+    
+    def _fused_allreduce_rmsnorm_quant_out_place(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_rmsnorm_quant(
             input_, residual_inp_, weight_, eps
         )
 
@@ -389,10 +448,39 @@ class GroupCoordinator:
     def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor:
         return outplace_all_gather(input_, group_name=self.unique_name)
 
-    def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
+    # didn't support dim in custom reduce_scatter
+    def _reduce_scatter_out_place(
+        self, input_: torch.Tensor, output_: torch.Tensor, dim: int = 0
+    ):
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.reduce_scatter(input_, dim)
+        return self.device_communicator.reduce_scatter(input_, output_, dim)
+
+    def reduce_scatter_tensor(
+        self, input_: torch.Tensor, use_custom: bool = True, dim: int = 0
+    ):
+        # return outplace_reduce_scatter(input_, group_name=self.unique_name, dim=dim)
+        world_size = self.world_size
+        assert world_size > 1, "error! world_size = 1"
+        assert (
+            input_.numel() % world_size == 0
+        ), "input shape error, input.numel() % world_size should equals to 0"
+        if input_.shape[0] % world_size == 0:
+            out_dim0 = input_.shape[0] // world_size
+            out_shape = (out_dim0,) + input_.shape[1:]
+        else:
+            out_shape = (input_.numel() // world_size,)
+
+        output_ = torch.empty(out_shape, dtype=input_.dtype, device=input_.device)
+        if use_custom:
+            outplace_reduce_scatter(
+                input_, output_, group_name=self.unique_name, dim=dim
+            )
+        else:
+            torch.distributed.reduce_scatter_tensor(
+                output_, input_, group=self.device_group
+            )
+        return output_
 
     def all_gather(
         self, input_: torch.Tensor, use_custom: bool = False, dim: int = -1

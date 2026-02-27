@@ -1,6 +1,6 @@
 #pragma once
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #ifdef USE_ROCM
 
@@ -12,11 +12,11 @@
 #include <iostream>
 #include <numeric>
 
+#include "flatmm_basic.hpp"
 #include <ATen/ATen.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
 #include <torch/extension.h>
-#include "flatmm_basic.hpp"
 
 using F16         = ck_tile::half_t;
 using BF16        = ck_tile::bf16_t;
@@ -100,13 +100,10 @@ float flatmm_calc(const ck_tile::ScaleFlatmmHostArgs<ScaleM, ScaleN>& args,
     const ck_tile::TailNumber tail_num = BaseGemmPipeline::GetBlockLoopTailNum(num_loop);
     float ave_time{0};
 
-    const auto Run = [&](const auto has_hot_loop_,
-                         const auto tail_number_,
-                         const auto memory_operation_) {
-        constexpr bool has_hot_loop_v   = has_hot_loop_.value;
-        constexpr auto tail_number_v    = tail_number_.value;
-        constexpr auto scheduler        = FlatmmConfig::Scheduler;
-        constexpr auto memory_operation = memory_operation_.value;
+    const auto Run = [&](const auto has_hot_loop_, const auto tail_number_) {
+        constexpr bool has_hot_loop_v = has_hot_loop_.value;
+        constexpr auto tail_number_v  = tail_number_.value;
+        constexpr auto scheduler      = FlatmmConfig::Scheduler;
 
         using CodegenPipelineProblem = ck_tile::FlatmmPipelineProblem<ADataType,
                                                                       BDataType,
@@ -137,7 +134,6 @@ float flatmm_calc(const ck_tile::ScaleFlatmmHostArgs<ScaleM, ScaleN>& args,
                                              FlatmmConfig::N_Warp_Tile,
                                              FlatmmConfig::K_Warp_Tile,
                                              CodegenPipelineProblem::TransposeC,
-                                             memory_operation,
                                              FlatmmConfig::NumWaveGroups,
                                              false,
                                              1,
@@ -211,23 +207,7 @@ float flatmm_calc(const ck_tile::ScaleFlatmmHostArgs<ScaleM, ScaleN>& args,
         return ave_time;
     };
 
-    const auto RunSplitk = [&](const auto has_hot_loop_, const auto tail_number_) {
-        if(args.k_batch == 1)
-        {
-            Run(has_hot_loop_,
-                tail_number_,
-                ck_tile::integral_constant<ck_tile::memory_operation_enum,
-                                           ck_tile::memory_operation_enum::set>{});
-        }
-        else
-        {
-            Run(has_hot_loop_,
-                tail_number_,
-                ck_tile::integral_constant<ck_tile::memory_operation_enum,
-                                           ck_tile::memory_operation_enum::atomic_add>{});
-        }
-    };
-    BaseGemmPipeline::TailHandler(RunSplitk, has_hot_loop, tail_num);
+    BaseGemmPipeline::TailHandler(Run, has_hot_loop, tail_num);
     return ave_time;
 }
 template <bool sTransposeC,
@@ -330,7 +310,7 @@ gemm_a8w8_bpreshuffle_cktile_impl(torch::Tensor& XQ,
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
     using ADataType      = typename GemmBasicTypeConfig<ck_tile::fp8_t>::ADataType;
     using BDataType      = typename GemmBasicTypeConfig<ck_tile::fp8_t>::BDataType;
-    using CDataType      = ck_tile::bf16_t;;
+    using CDataType      = EDataType;
     using AccDataType    = typename GemmBasicTypeConfig<ck_tile::fp8_t>::AccDataType;
     using DsDataType     = ck_tile::tuple<>;
     using ALayout        = ck_tile::tensor_layout::gemm::RowMajor;
@@ -342,15 +322,16 @@ gemm_a8w8_bpreshuffle_cktile_impl(torch::Tensor& XQ,
     int n                = out.size(1);
     int k                = XQ.size(1);
 
-    using ScaleM       = typename ck_tile::FlatmmScalePointer<1>;
-    using ScaleN       = typename ck_tile::FlatmmScalePointer<1>;
-
+    using ScaleM = typename ck_tile::FlatmmScalePointer<1>;
+    using ScaleN = typename ck_tile::FlatmmScalePointer<1>;
 
     ck_tile::ScaleFlatmmHostArgs<ScaleM, ScaleN> args;
     args.a_ptr = (void*)XQ.data_ptr();
     args.b_ptr = (void*)WQ.data_ptr();
-    args.scale_m = ck_tile::FlatmmScalePointer<1>{reinterpret_cast<AccDataType*>(x_scale.data_ptr()),m};
-    args.scale_n = ck_tile::FlatmmScalePointer<1>{reinterpret_cast<AccDataType*>(w_scale.data_ptr()),n};
+    args.scale_m =
+        ck_tile::FlatmmScalePointer<1>{reinterpret_cast<AccDataType*>(x_scale.data_ptr()), m};
+    args.scale_n =
+        ck_tile::FlatmmScalePointer<1>{reinterpret_cast<AccDataType*>(w_scale.data_ptr()), n};
     args.e_ptr = (void*)out.data_ptr();
 
     args.k_batch  = 1;

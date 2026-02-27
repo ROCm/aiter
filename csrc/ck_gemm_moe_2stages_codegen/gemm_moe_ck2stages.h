@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #include "ck/ck.hpp"
 #include "ck/library/utility/check_err.hpp"
@@ -323,14 +323,66 @@ struct MulABScaleExpertWeightA8W8blkscale
     __host__ __device__ constexpr void
     operator()<F16, float, float>(F16& e, const float& c, const float& d2) const
     {
-        (void)d2;
         e = ck::type_convert<F16>(c);
     }
     template <>
     __host__ __device__ constexpr void
     operator()<B16, float, float>(B16& e, const float& c, const float& d2) const
     {
+        e = ck::type_convert<B16>(c);
+    }
+};
+
+struct MulABScaleExpertWeightA8W8blkscaleSplitk
+{
+    template <typename E, typename C, typename D2>
+    __host__ __device__ constexpr void operator()(E& e, const C& c, const D2& d2) const;
+    template <>
+    __host__ __device__ constexpr void
+    operator()<float, float, float>(float& e, const float& c, const float& d2) const
+    {
         (void)d2;
+        e = ck::type_convert<F16>(c);
+    }
+};
+
+struct MulABScaleShuffled
+{
+    template <typename E, typename C, typename D0, typename D1, typename D2>
+    __host__ __device__ constexpr void
+    operator()(E& e, const C& c, const D0& d0, const D1& d1, const D2& d2) const;
+
+    template <>
+    __host__ __device__ constexpr void operator()<F16, float, float, float, float>(
+        F16& e, const float& c, const float& d0, const float& d1, const float& d2) const
+    {
+        e = ck::type_convert<F16>(c);
+    }
+
+    template <>
+    __host__ __device__ constexpr void operator()<B16, float, float, float, float>(
+        B16& e, const float& c, const float& d0, const float& d1, const float& d2) const
+    {
+        e = ck::type_convert<B16>(c);
+    }
+};
+
+struct MulABScaleExpertWeightShuffled
+{
+    template <typename E, typename C, typename D0, typename D1, typename D2>
+    __host__ __device__ constexpr void
+    operator()(E& e, const C& c, const D0& d0, const D1& d1, const D2& d2) const;
+    template <>
+    __host__ __device__ constexpr void operator()<F16, float, float, float, float>(
+        F16& e, const float& c, const float& d0, const float& d1, const float& d2) const
+    {
+        e = ck::type_convert<F16>(c);
+    }
+
+    template <>
+    __host__ __device__ constexpr void operator()<B16, float, float, float, float>(
+        B16& e, const float& c, const float& d0, const float& d1, const float& d2) const
+    {
         e = ck::type_convert<B16>(c);
     }
 };
@@ -350,7 +402,9 @@ using MoeKernel = std::function<void(const hipStream_t& stream,
                                      void*&,
                                      void*&,
                                      std::optional<void*>,
-                                     std::optional<void*>)>;
+                                     std::optional<void*>,
+                                     std::optional<int>,
+                                     std::optional<bool>)>;
 
 template <typename A0DataType,
           typename B0DataType,
@@ -383,8 +437,9 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                         void*& num_valid_ids,     // [1]
                         void*& out,               // [max_num_tokens_padded, inter_dim]
                         std::optional<void*> w1_scale = std::nullopt, // [e, 1, n], gate(up) scale
-                        std::optional<void*> a1_scale = std::nullopt  // [m, 1], token scale
-);
+                        std::optional<void*> a1_scale = std::nullopt, // [m, 1], token scale
+                        std::optional<int> splitk     = 1,            // splitk
+                        std::optional<bool> nt        = false);
 
 template <typename A0DataType,
           typename B0DataType,
@@ -418,5 +473,6 @@ void ck_moe_stage2_gemm(
     void*& num_valid_ids,     //[1]
     void*& out,               // [m, out_dim]
     std::optional<void*> w2_scale = std::nullopt, // [e, 1, n], gate(up) scale
-    std::optional<void*> a2_scale = std::nullopt  // [max_num_tokens_padded, 1], token scale
-);
+    std::optional<void*> a2_scale = std::nullopt, // [max_num_tokens_padded, 1], token scale
+    std::optional<int> splitk     = 1,            // splitk
+    std::optional<bool> bt        = false);

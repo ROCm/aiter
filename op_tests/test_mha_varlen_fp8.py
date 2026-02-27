@@ -4,18 +4,17 @@
 import torch
 import aiter
 from aiter import dtypes
+from aiter.test_common import run_perftest
 from aiter import per_tensor_quant
 from aiter.test_mha_common import (
-    attention_ref,
-    attn_bias_from_alibi_slopes,
-    ck_randval_to_dropout_mask,
-    convert_flash_attn_S_to_softmax,
     generate_qkv,
     generate_random_padding_mask,
-    pad_rearrange_dropout_mask_hts_to_bhss,
 )
 import pytest
+import pandas as pd
 import argparse
+
+benchmark = {}
 
 
 def run_ck(
@@ -34,7 +33,8 @@ def run_ck(
     v_descale=None,
 ):
     if q.dtype == dtypes.fp8 and k.dtype == dtypes.fp8 and v.dtype == dtypes.fp8:
-        return aiter.flash_attn_varlen_fp8_pertensor_func(
+        return run_perftest(
+            aiter.flash_attn_varlen_fp8_pertensor_func,
             q,
             k,
             v,
@@ -50,7 +50,8 @@ def run_ck(
             window_size=window_size,
         )
     else:
-        return aiter.flash_attn_varlen_func(
+        return run_perftest(
+            aiter.flash_attn_varlen_func,
             q,
             k,
             v,
@@ -167,7 +168,7 @@ def test_flash_attn_varlen_output(
     k_quant, k_descale = per_tensor_quant(k, quant_dtype=quant_dtype)
     v_quant, v_descale = per_tensor_quant(v, quant_dtype=quant_dtype)
 
-    out = run_ck(
+    out, us_quant_fwd = run_ck(
         q_quant,
         k_quant,
         v_quant,
@@ -183,7 +184,7 @@ def test_flash_attn_varlen_output(
         v_descale,
     )
 
-    out_ref = run_ck(
+    out_ref, us_fwd = run_ck(
         q,
         k,
         v,
@@ -199,6 +200,39 @@ def test_flash_attn_varlen_output(
     max_diff = (out - out_ref).abs().max().item()
     print(f"Output max diff: {max_diff}")
     assert max_diff < 0.055
+
+    fwd_flop = 0
+    dtype_bytes = torch.finfo(dtype).bits // 8
+    quant_dtype_bytes = torch.finfo(quant_dtype).bits // 8
+    fwd_num_bytes = 0
+    quant_fwd_num_bytes = 0
+    for i in range(len(cu_seqlens_q) - 1):
+        real_seqlen_q = cu_seqlens_q[i + 1].item() - cu_seqlens_q[i].item()
+        real_seqlen_k = cu_seqlens_k[i + 1].item() - cu_seqlens_k[i].item()
+        fwd_flop = (
+            fwd_flop
+            + nheads * 2 * real_seqlen_q * real_seqlen_k * d
+            + nheads * 2 * real_seqlen_q * real_seqlen_k * d_v
+        )
+        fwd_num_bytes = fwd_num_bytes + nheads * dtype_bytes * (
+            real_seqlen_q * d
+            + real_seqlen_k * d
+            + real_seqlen_k * d_v
+            + real_seqlen_q * d_v
+        )
+        quant_fwd_num_bytes = fwd_num_bytes + nheads * quant_dtype_bytes * (
+            real_seqlen_q * d
+            + real_seqlen_k * d
+            + real_seqlen_k * d_v
+            + real_seqlen_q * d_v
+        )
+
+    benchmark["quant_fwd_us"] = us_quant_fwd
+    benchmark["quant_fwd_tflops"] = (fwd_flop) / 1.0e6 / us_quant_fwd
+    benchmark["quant_fwd_gb_per_sec"] = (quant_fwd_num_bytes) / 1.0e3 / us_quant_fwd
+    benchmark["fwd_us"] = us_fwd
+    benchmark["fwd_tflops"] = (fwd_flop) / 1.0e6 / us_fwd
+    benchmark["fwd_gb_per_sec"] = (fwd_num_bytes) / 1.0e3 / us_fwd
 
 
 parser = argparse.ArgumentParser(
@@ -225,8 +259,8 @@ parser.add_argument(
     "-nk",
     "--nheads_k",
     type=int,
-    default=5,
-    help="""Number of heads. Default is 5.
+    default=-1,
+    help="""Number of heads. -1 means equal to n (nheads).
     e.g.: -nk 1""",
 )
 parser.add_argument(
@@ -241,17 +275,25 @@ parser.add_argument(
     "-k",
     "--seqlen_k",
     type=int,
-    default=512,
-    help="""Sequence length for key. Default is 512.
+    default=-1,
+    help="""Sequence length for key. -1 means equal to q (seqlen_q).
     e.g.: -k 1024""",
 )
 parser.add_argument(
     "-d",
-    "--d_qkv",
+    "--d_qk",
     type=int,
     default=128,
     help="""Dimension of query and key. Default is 128.
     e.g.: -d 128""",
+)
+parser.add_argument(
+    "-dv",
+    "--d_v",
+    type=int,
+    default=-1,
+    help="""Dimension of query and key. -1 means equal to d (d_qk).
+    e.g.: -dv 128""",
 )
 parser.add_argument(
     "-msq",
@@ -279,15 +321,25 @@ parser.add_argument(
 
 if __name__ == "__main__":
     args = parser.parse_args()
+
+    nheads_k = args.nheads_k if args.nheads_k > 0 else args.nheads
+    seqlen_k = args.seqlen_k if args.seqlen_k > 0 else args.seqlen_q
+    d_v = args.d_v if args.d_v > 0 else args.d_qk
+
+    collected = []
     test_flash_attn_varlen_output(
         args.batch_size,
         args.nheads,
-        args.nheads_k,
+        nheads_k,
         args.seqlen_q,
-        args.seqlen_k,
-        args.d_qkv,
-        args.d_qkv,
+        seqlen_k,
+        args.d_qk,
+        d_v,
         args.min_seqlen_q,
         args.causal,
         args.local,
     )
+    collected.append(benchmark)
+
+    df = pd.DataFrame(collected)
+    aiter.logger.info(f"mha summary:\n{df}")

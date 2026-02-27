@@ -51,45 +51,45 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids,
 
     extern __shared__ int32_t shared_mem[];
 
-    int32_t* tokens_cnts = shared_mem; // 2d tensor with shape (num_experts + 1, num_experts)
-    int32_t* cumsum =
-        shared_mem + (num_experts + 1) * num_experts; // 1d tensor with shape (num_experts + 1)
+    // Optimized shared memory layout using only O(num_experts):
+    // expert_token_counts[num_experts] - total tokens per expert
+    // cumsum[num_experts + 1] - prefix sum for block offsets
+    // write_positions[num_experts] - current write position per expert (for atomic writes)
+    int32_t* expert_token_counts = shared_mem;
+    int32_t* cumsum = shared_mem + num_experts;
+    int32_t* write_positions = cumsum + (num_experts + 1);
 
-    for(int i = 0; i < num_experts; ++i)
+    // Initialize expert token counts
+    if(threadIdx.x < num_experts)
     {
-        tokens_cnts[index(num_experts, threadIdx.x + 1, i)] = 0;
+        expert_token_counts[threadIdx.x] = 0;
     }
+    __syncthreads();
 
     /**
-     * In the first step we compute token_cnts[thread_index + 1][expert_index],
-     * which counts how many tokens in the token shard of thread_index are
-     * assigned to expert expert_index.
+     * Pass 1: Count tokens per expert using atomic operations
+     * Each thread processes its shard and atomically increments expert counts
      */
     for(int i = start_idx; i < numel && i < start_idx + tokens_per_thread; ++i)
     {
-        ++tokens_cnts[index(num_experts, threadIdx.x + 1, topk_ids[i])];
+        int32_t expert_id = topk_ids[i];
+        atomicAdd(&expert_token_counts[expert_id], 1);
     }
 
     __syncthreads();
 
-    // For each expert we accumulate the token counts from the different threads.
-    tokens_cnts[index(num_experts, 0, threadIdx.x)] = 0;
-    for(int i = 1; i <= blockDim.x; ++i)
-    {
-        tokens_cnts[index(num_experts, i, threadIdx.x)] +=
-            tokens_cnts[index(num_experts, i - 1, threadIdx.x)];
-    }
-
-    __syncthreads();
-
-    // We accumulate the token counts of all experts in thread 0.
+    /**
+     * Pass 2: Compute cumsum and initialize write positions
+     * Thread 0 computes the prefix sum and initializes atomic write counters
+     */
     if(threadIdx.x == 0)
     {
         cumsum[0] = 0;
-        for(int i = 1; i <= num_experts; ++i)
+        for(int i = 0; i < num_experts; ++i)
         {
-            cumsum[i] = cumsum[i - 1] +
-                        CEILDIV(tokens_cnts[index(num_experts, blockDim.x, i - 1)], block_size);
+            int32_t num_blocks = CEILDIV(expert_token_counts[i], block_size);
+            cumsum[i + 1] = cumsum[i] + num_blocks;
+            write_positions[i] = cumsum[i] * block_size; // Initialize write position
         }
         *total_tokens_post_pad = cumsum[num_experts] * block_size;
     }
@@ -97,37 +97,32 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids,
     __syncthreads();
 
     /**
-     * For each expert, each thread processes the tokens of the corresponding
-     * blocks and stores the corresponding expert_id for each block.
+     * Pass 3: Write expert metadata
+     * Each thread handles one expert (if threadIdx.x < num_experts)
      */
-    auto num = tokens_cnts[index(num_experts, blockDim.x, threadIdx.x)];
-    for(int i = cumsum[threadIdx.x]; i < cumsum[threadIdx.x + 1]; i++)
+    if(threadIdx.x < num_experts)
     {
-        expert_ids[i] = threadIdx.x;
-        token_nums[i] = num;
-        num -= block_size;
+        int32_t num_tokens = expert_token_counts[threadIdx.x];
+        for(int i = cumsum[threadIdx.x]; i < cumsum[threadIdx.x + 1]; i++)
+        {
+            expert_ids[i] = threadIdx.x;
+            token_nums[i] = num_tokens;
+            num_tokens -= block_size;
+        }
     }
 
+    __syncthreads();
+
     /**
-     * Each thread processes a token shard, calculating the index of each token
-     * after sorting by expert number. Given the example topk_ids =
-     * [0,1,2,1,2,3,0,3,4] and block_size = 4, then the output would be [0, 6, *,
-     * *, 1, 3, *, *, 2, 4, *, *, 5, 7, *, *, 8, *, *, *], where * represents a
-     * padding value(preset in python).
+     * Pass 4: Assign tokens to output positions
+     * Each thread processes its shard and uses atomic operations to get write positions
      */
     for(int i = start_idx; i < numel && i < start_idx + tokens_per_thread; ++i)
     {
         int32_t expert_id = topk_ids[i];
-        /** The cumsum[expert_id] stores the starting index of the tokens that the
-         * expert with expert_id needs to process, and
-         * tokens_cnts[threadIdx.x][expert_id] stores the indices of the tokens
-         * processed by the expert with expert_id within the current thread's token
-         * shard.
-         */
-        int32_t rank_post_pad = tokens_cnts[index(num_experts, threadIdx.x, expert_id)] +
-                                cumsum[expert_id] * block_size;
+        // Atomically get the next write position for this expert
+        int32_t rank_post_pad = atomicAdd(&write_positions[expert_id], 1);
         sorted_token_ids[rank_post_pad] = i;
-        ++tokens_cnts[index(num_experts, threadIdx.x, expert_id)];
     }
 }
 } // namespace vllm
@@ -145,10 +140,9 @@ void moe_align_block_size(torch::Tensor topk_ids,
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(topk_ids));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     VLLM_DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
-        // calc needed amount of shared mem for `tokens_cnts` and `cumsum`
-        // tensors
-        const int32_t shared_mem =
-            ((num_experts + 1) * num_experts + (num_experts + 1)) * sizeof(int32_t);
+        // Optimized shared memory: O(num_experts) instead of O(num_experts^2)
+        // expert_token_counts[num_experts] + cumsum[num_experts + 1] + write_positions[num_experts]
+        const int32_t shared_mem = (3 * num_experts + 1) * sizeof(int32_t);
 
         // set dynamic shared mem
         auto kernel = vllm::moe_align_block_size_kernel<scalar_t>;

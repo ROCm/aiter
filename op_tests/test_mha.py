@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
 import itertools
@@ -36,8 +36,8 @@ def run_torch(
     query_padding_mask=None,
     key_padding_mask=None,
 ):
-    (_, seqlen_q, _, _) = q.shape
-    (_, seqlen_k, _, _) = k.shape
+    _, seqlen_q, _, _ = q.shape
+    _, seqlen_k, _, _ = k.shape
 
     if bias is not None:
         attn_bias = bias
@@ -106,16 +106,16 @@ def run_ck(
         deterministic,
         return_lse=return_lse,
         return_attn_probs=return_attn_probs,
-        how_v3_bf16_cvt=1,
+        how_v3_bf16_cvt=2,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_kv=cu_seqlens_kv,
         num_rotate_args=1,
     )
 
     if dropout_p > 0.0:
-        (_, seqlen_q, _, d) = q.shape
-        (_, seqlen_k, _, d) = k.shape
-        (_, seqlen_k, _, d_v) = v.shape
+        _, seqlen_q, _, d = q.shape
+        _, seqlen_k, _, d = k.shape
+        _, seqlen_k, _, d_v = v.shape
         S_dmask = ck_randval_to_dropout_mask(S_dmask, dropout_p)
         S_dmask_converted = convert_flash_attn_S_to_softmax(
             S_dmask,
@@ -678,10 +678,6 @@ def test_flash_attn_seq_padding(
     assert diff <= out_tol
 
 
-l_causal = [False, True]
-l_local = [False, True]
-l_deterministic = [False, True]
-
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -745,20 +741,22 @@ parser.add_argument(
 parser.add_argument(
     "-c",
     "--causal",
-    action=argparse.BooleanOptionalAction,
-    default=None,
-    help="""Causal attention. Default is None.
-    -c or --causal    # enable causal attention
-    --no-causal       # disable causal attention""",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[False, True],
+    help="""Causal attention. Default is [False, True].
+    e.g. -c true # enable causal attention
+         -c false # disable causal attention""",
 )
 parser.add_argument(
     "-l",
     "--local",
-    action=argparse.BooleanOptionalAction,
-    default=None,
-    help="""Local attention. Default is None.
-        e.g. -l or --local    # enable local attention
-        --no-local        # disable local attention""",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[False, True],
+    help="""Local attention. Default is [False, True].
+        e.g. -l true # enable local attention
+             -l false # disable local attention""",
 )
 parser.add_argument(
     "-bt",
@@ -771,11 +769,12 @@ parser.add_argument(
 parser.add_argument(
     "-det",
     "--deterministic",
-    action=argparse.BooleanOptionalAction,
-    default=None,
-    help="""Deterministic attention. Default is None.
-    -det or --deterministic    # enable deterministic attention
-    --no-deterministic         # disable deterministic attention""",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[False, True],
+    help="""Deterministic attention. Default is [False, True].
+    e.g. -det true # enable deterministic attention
+         -det false # disable deterministic attention""",
 )
 parser.add_argument(
     "-m",
@@ -809,15 +808,6 @@ parser.add_argument(
 if __name__ == "__main__":
     args = parser.parse_args()
 
-    if args.causal is not None:
-        l_causal = [args.causal]
-
-    if args.local is not None:
-        l_local = [args.local]
-
-    if args.deterministic is not None:
-        l_deterministic = [args.deterministic]
-
     collected = []
     for (
         dtype,
@@ -827,7 +817,12 @@ if __name__ == "__main__":
         local,
         deterministic,
     ) in itertools.product(
-        args.dtype, args.d_qk_v, args.mha_type, l_causal, l_local, l_deterministic
+        args.dtype,
+        args.d_qk_v,
+        args.mha_type,
+        args.causal,
+        args.local,
+        args.deterministic,
     ):
         ret = flash_attn_output_benchmark(
             args.batch_size,

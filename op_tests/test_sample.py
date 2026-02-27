@@ -238,4 +238,5 @@ for test_func in list_sample_func:
                 ret = test_func(m, n, dtype)
                 df.append(ret)
     df = pd.DataFrame(df)
-    aiter.logger.info(f"summary:\n{df}")
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("sample summary (markdown):\n%s", df_md)
