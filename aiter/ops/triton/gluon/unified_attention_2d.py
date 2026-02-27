@@ -1068,7 +1068,7 @@ def unified_attention(
     MAX_INT32 = 2**31 - 1
     USE_LOAD_BUFFER_OP = kv_size <= MAX_INT32
     USE_STORE_BUFFER_OP = out.nelement() * out.element_size() <= MAX_INT32
-    waves_per_eu = 4 if HEAD_SIZE < 128 else 2
+    waves_per_eu = 2 if HEAD_SIZE < 128 else 2
     grid = (NUM_KV_HEADS, total_query_blocks)
     attn_kernel = kernel_unified_attention_2d[grid](
         query_ptr=q,
