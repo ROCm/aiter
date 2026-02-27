@@ -92,6 +92,8 @@ def asm_moe_stage2(
         block_m,
         w2_scale,
         a2_scale,
+        None,
+        None,
         sorted_weights,
         quant_type,
         activation,
@@ -247,7 +249,7 @@ def get_asm_int8_config(
     return config
 
 
-def _asm_moe_2stages_int8(
+def _asm_moe_2stages_a8(
     M,
     topk,
     inter_dim,
@@ -305,7 +307,7 @@ def _asm_moe_2stages_int8(
 
     num_scales = inter_dim // 128
     a2_scale = scale_view.view(M, topk, num_scales)
-
+    assert(0)
     # Stage 2: ASM Kernel
     # moe_buf is initialized as [M, model_dim] in moe_sorting_ck
     asm_moe_stage2(
@@ -401,7 +403,7 @@ def _run_asm_moe_int8(
             a8, a8_scale = aiter.pertoken_quant(hidden_states, quant_dtype=w1.dtype)
     # two stage
     if config.run_2stage:
-        return _asm_moe_2stages_int8(
+        return _asm_moe_2stages_a8(
             M,
             topk,
             inter_dim,

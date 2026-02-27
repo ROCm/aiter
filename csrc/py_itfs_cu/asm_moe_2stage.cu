@@ -68,7 +68,6 @@ struct __attribute__((packed)) KernelArgs
     p2 _p26;
     unsigned int eLQQs;
     p3 _p27;
-    void log()
 };
 
 struct __attribute__((packed)) Kernel2Args
@@ -416,31 +415,31 @@ void moe_stage1_g1u1(
     int gdy = sz_stp; // sub_X_cnt;
     int gdz = k_num;
 
-    // printf("####stage1 arg start############ \n");
-    // std::cout << " args.ptr_O       = " << args.ptr_O << std::endl;
-    // std::cout << " args.ptr_X       = " << args.ptr_X << std::endl;
-    // std::cout << " args.ptr_GU      = " << args.ptr_GU << std::endl;
-    // std::cout << " args.ptr_XC      = " << args.ptr_XC << std::endl;
-    // std::cout << " args.ptr_XQ      = " << args.ptr_XQ << std::endl;
-    // std::cout << " args.ptr_GUQ     = " << args.ptr_GUQ << std::endl;
-    // std::cout << " args.ptr_SMQ     = " << args.ptr_SMQ << std::endl;
-    // std::cout << " args.ptr_STP     = " << args.ptr_STP << std::endl;
-    // std::cout << " args.ptr_SEP     = " << args.ptr_SEP << std::endl;
-    // std::cout << " args.dim         = " << args.dim << std::endl;
-    // std::cout << " args.hidden_dim  = " << args.hidden_dim << std::endl;
-    // std::cout << " args.token_cnt   = " << args.token_cnt << std::endl;
-    // std::cout << " args.eprt_cnt    = " << args.eprt_cnt << std::endl;
-    // std::cout << " args.Xs          = " << args.Xs << std::endl;
-    // std::cout << " args.GUs         = " << args.GUs << std::endl;
-    // std::cout << " args.Os          = " << args.Os << std::endl;
-    // std::cout << " args.eGUs        = " << args.eGUs << std::endl;
-    // std::cout << " args.eGUQs       = " << args.eGUQs << std::endl;
-    // std::cout << " args.eSMQs       = " << args.eSMQs << std::endl;
-    // std::cout << " args.topk        = " << args.topk << std::endl;
-    // std::cout << " args.splitk      = " << args.splitk << std::endl;
-    // std::cout << " args.activation  = " << args.activation << std::endl;
-    // std::cout << " args.ptr_SW      = " << args.ptr_SW << std::endl;
-    // printf("gdx:%d, gdy:%d, gdz:%d, tgs:%d\n", gdx, gdy, gdz, sub_X_cnt * gdx * gdz);
+    printf("####stage1 arg start############ \n");
+    std::cout << " args.ptr_O       = " << args.ptr_O << std::endl;
+    std::cout << " args.ptr_X       = " << args.ptr_X << std::endl;
+    std::cout << " args.ptr_GU      = " << args.ptr_GU << std::endl;
+    std::cout << " args.ptr_XC      = " << args.ptr_XC << std::endl;
+    std::cout << " args.ptr_XQ      = " << args.ptr_XQ << std::endl;
+    std::cout << " args.ptr_GUQ     = " << args.ptr_GUQ << std::endl;
+    std::cout << " args.ptr_SMQ     = " << args.ptr_SMQ << std::endl;
+    std::cout << " args.ptr_STP     = " << args.ptr_STP << std::endl;
+    std::cout << " args.ptr_SEP     = " << args.ptr_SEP << std::endl;
+    std::cout << " args.dim         = " << args.dim << std::endl;
+    std::cout << " args.hidden_dim  = " << args.hidden_dim << std::endl;
+    std::cout << " args.token_cnt   = " << args.token_cnt << std::endl;
+    std::cout << " args.eprt_cnt    = " << args.eprt_cnt << std::endl;
+    std::cout << " args.Xs          = " << args.Xs << std::endl;
+    std::cout << " args.GUs         = " << args.GUs << std::endl;
+    std::cout << " args.Os          = " << args.Os << std::endl;
+    std::cout << " args.eGUs        = " << args.eGUs << std::endl;
+    std::cout << " args.eGUQs       = " << args.eGUQs << std::endl;
+    std::cout << " args.eSMQs       = " << args.eSMQs << std::endl;
+    std::cout << " args.topk        = " << args.topk << std::endl;
+    std::cout << " args.splitk      = " << args.splitk << std::endl;
+    std::cout << " args.activation  = " << args.activation << std::endl;
+    std::cout << " args.ptr_SW      = " << args.ptr_SW << std::endl;
+    printf("gdx:%d, gdy:%d, gdz:%d, tgs:%d\n", gdx, gdy, gdz, sub_X_cnt * gdx * gdz);
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,
@@ -587,30 +586,30 @@ void moe_stage2_g1u1(
     int gdy = sub_X_cnt;
     int gdz = k_num;
 
-    // printf("#### stage2 arg start ############\n ");
-    // printf("args.ptr_OBuffer  = %p\n", args.ptr_OBuffer);
-    // printf("args.ptr_XBuffer  = %p\n", args.ptr_XBuffer);
-    // printf("args.ptr_DBuffer  = %p\n", args.ptr_DBuffer);
-    // printf("args.ptr_XCBuffer = %p\n", args.ptr_XCBuffer);
-    // printf("args.ptr_ScaleXBuffer = %p\n", args.ptr_ScaleXBuffer);
-    // printf("args.ptr_ScaleDBuffer = %p\n", args.ptr_ScaleDBuffer);
-    // printf("args.ptr_STPBuffer = %p\n", args.ptr_STPBuffer);
-    // printf("args.ptr_SEPBuffer = %p\n", args.ptr_SEPBuffer);
-    // printf("args.dim = %u\n", args.dim);
-    // printf("args.hidden_dim = %u\n", args.hidden_dim);
-    // printf("args.token_cnt = %u\n", args.token_cnt);
-    // printf("args.eprt_cnt = %u\n", args.eprt_cnt);
-    // printf("args.stride_X = %u\n", args.stride_X);
-    // printf("args.stride_D = %u\n", args.stride_D);
-    // printf("args.stride_O = %u\n", args.stride_O);
-    // printf("args.stride_expert_D = %u\n", args.stride_expert_D);
-    // printf("args.stride_expert_scale_D = %u\n", args.stride_expert_scale_D);
-    // printf("args.topk = %u\n", args.topk);
-    // printf("args.splitk = %u\n", args.splitk);
-    // printf("args.ptr_SWBuffer = %p\n", args.ptr_SWBuffer);
-    // printf("gdx = %d\n", gdx);
-    // printf("gdy = %d\n", gdy);
-    // printf("gdz = %d\n", gdz);
+    printf("#### stage2 arg start ############\n ");
+    printf("args.ptr_OBuffer  = %p\n", args.ptr_OBuffer);
+    printf("args.ptr_XBuffer  = %p\n", args.ptr_XBuffer);
+    printf("args.ptr_DBuffer  = %p\n", args.ptr_DBuffer);
+    printf("args.ptr_XCBuffer = %p\n", args.ptr_XCBuffer);
+    printf("args.ptr_ScaleXBuffer = %p\n", args.ptr_ScaleXBuffer);
+    printf("args.ptr_ScaleDBuffer = %p\n", args.ptr_ScaleDBuffer);
+    printf("args.ptr_STPBuffer = %p\n", args.ptr_STPBuffer);
+    printf("args.ptr_SEPBuffer = %p\n", args.ptr_SEPBuffer);
+    printf("args.dim = %u\n", args.dim);
+    printf("args.hidden_dim = %u\n", args.hidden_dim);
+    printf("args.token_cnt = %u\n", args.token_cnt);
+    printf("args.eprt_cnt = %u\n", args.eprt_cnt);
+    printf("args.stride_X = %u\n", args.stride_X);
+    printf("args.stride_D = %u\n", args.stride_D);
+    printf("args.stride_O = %u\n", args.stride_O);
+    printf("args.stride_expert_D = %u\n", args.stride_expert_D);
+    printf("args.stride_expert_scale_D = %u\n", args.stride_expert_scale_D);
+    printf("args.topk = %u\n", args.topk);
+    printf("args.splitk = %u\n", args.splitk);
+    printf("args.ptr_SWBuffer = %p\n", args.ptr_SWBuffer);
+    printf("gdx = %d\n", gdx);
+    printf("gdy = %d\n", gdy);
+    printf("gdz = %d\n", gdz);
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,
