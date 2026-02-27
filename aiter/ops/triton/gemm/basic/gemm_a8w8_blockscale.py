@@ -193,6 +193,9 @@ def gemm_a8w8_blockscale_preshuffle(
     N = N * 16
     K = K // 16
 
+    # assert N % 16 == 0, f"{N=} has to be divisible by 16"
+    assert K % 128 == 0, f"{K=} has to be divisible by 128"
+
     # Check constraints.
     assert x.shape[1] == w.shape[1] // 16, "Incompatible dimensions!!!"
 

@@ -4,6 +4,7 @@
 from typing import Optional
 import torch
 import triton
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
     _fused_gemm_afp4wfp4_split_cat,
     _fused_gemm_afp4wfp4_preshuffle_split_cat,
@@ -57,6 +58,8 @@ def fused_gemm_afp4wfp4_split_cat(
     _LOGGER.info(
         f"FUSED_GEMM_AFP4WFP4_SPLIT_CAT: x={tuple(x.shape)} w={tuple(w.shape)} y={tuple(y.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
     )
+
+    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
 
     M, K = x.shape
     N, K = w.shape
@@ -238,11 +241,16 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
         f"FUSED_GEMM_AFP4WFP4_PRESHUFFLE_SPLIT_CAT: x={tuple(x.shape)} w={tuple(w.shape)} y={tuple(y.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
     )
 
+    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
+
     M, K = x.shape
     N, K = w.shape
     N = N * 16
     K = K // 16
     M, D, S3 = y.shape
+
+    assert N % 32 == 0, f"{N=} has to be divisible by 32"
+    assert K % (256 // 2) == 0, f"{K=} has to be divisible by (256 // 2)"
 
     # Check constraints.
     assert x.shape[1] == w.shape[1] // 16, "Incompatible dimensions!!!"
