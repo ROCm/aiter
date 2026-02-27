@@ -282,16 +282,6 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
         [NUM_BUFFERS, BLOCK_N // 32, K_GROUPS * 32],
         layout=shared_S,
     )
-    smem_AS = gl.allocate_shared_memory(
-        a_scale_ptr.type.element_ty,
-        [NUM_BUFFERS, BLOCK_M, K_GROUPS],
-        layout=shared_S,
-    )
-    smem_BS = gl.allocate_shared_memory(
-        b_scale_ptr.type.element_ty,
-        [NUM_BUFFERS, BLOCK_N, K_GROUPS],
-        layout=shared_S,
-    )
 
     # Base pointers for this split-K slice; advance by k_tile each iteration
     split_k0_groups = split_k_id * (SPLITK_BLOCK // 32)
@@ -419,22 +409,14 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
             ),
             layout=dot_b_layout,
         )
-        # scales: raw shuffled -> unshuffle -> store to LDS -> load with wmma scale layouts
+        # scales: raw shuffled -> unshuffle -> load with wmma scale layouts
         AS_raw = smem_ASraw.index(slot_c).load(layout=as_raw_reg_layout)
         BS_raw = smem_BSraw.index(slot_c).load(layout=bs_raw_reg_layout)
 
-        smem_AS.index(slot_c).store(
-            unshuffle_a_scales(AS_raw, BLOCK_M=BLOCK_M, K_GROUPS=K_GROUPS)
-        )
-        smem_BS.index(slot_c).store(
-            unshuffle_b_scales(BS_raw, BLOCK_N=BLOCK_N, K_GROUPS=K_GROUPS)
-        )
-
         gl.barrier()
 
-        AS = smem_AS.index(slot_c).load(layout=a_scale_layout)
-        BS = smem_BS.index(slot_c).load(layout=b_scale_layout)
-
+        AS = gl.convert_layout(unshuffle_a_scales(AS_raw, BLOCK_M=BLOCK_M, K_GROUPS=K_GROUPS), layout=a_scale_layout)
+        BS = gl.convert_layout(unshuffle_b_scales(BS_raw, BLOCK_N=BLOCK_N, K_GROUPS=K_GROUPS), layout=b_scale_layout)
 
         acc = gl.amd.gfx1250.wmma_scaled(A, AS, "e2m1", B, BS, "e2m1", acc)
         consumer += 1
@@ -458,21 +440,14 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
                 ),
                 layout=dot_b_layout,
             )
-            # scales: raw shuffled -> unshuffle -> store to LDS -> load with wmma scale layouts
+            # scales: raw shuffled -> unshuffle -> load with wmma scale layouts
             AS_raw = smem_ASraw.index(slot_c).load(layout=as_raw_reg_layout)
             BS_raw = smem_BSraw.index(slot_c).load(layout=bs_raw_reg_layout)
 
-            smem_AS.index(slot_c).store(
-                unshuffle_a_scales(AS_raw, BLOCK_M=BLOCK_M, K_GROUPS=K_GROUPS)
-            )
-            smem_BS.index(slot_c).store(
-                unshuffle_b_scales(BS_raw, BLOCK_N=BLOCK_N, K_GROUPS=K_GROUPS)
-            )
-
             gl.barrier()
 
-            AS = smem_AS.index(slot_c).load(layout=a_scale_layout)
-            BS = smem_BS.index(slot_c).load(layout=b_scale_layout)
+            AS = gl.convert_layout(unshuffle_a_scales(AS_raw, BLOCK_M=BLOCK_M, K_GROUPS=K_GROUPS), layout=a_scale_layout)
+            BS = gl.convert_layout(unshuffle_b_scales(BS_raw, BLOCK_N=BLOCK_N, K_GROUPS=K_GROUPS), layout=b_scale_layout)
 
             acc = gl.amd.gfx1250.wmma_scaled(A, AS, "e2m1", B, BS, "e2m1", acc)
 
