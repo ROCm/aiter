@@ -1,5 +1,5 @@
 {
-    "Llama-3-405B": {
+    "Llama3 405B": {
         "gemm_a8w8_per_token_scale": [
             {
                 "N": 106496,
@@ -60,7 +60,7 @@
             }
         ]
     },
-    "Llama-3-70B": {
+    "Llama3 70B": {
         "gemm_a8w8_per_token_scale": [
             {
                 "N": 57344,
@@ -121,7 +121,7 @@
             }
         ]
     },
-    "Llama-3-8B": {
+    "Llama3 8B": {
         "gemm_a8w8_per_token_scale": [
             {
                 "N": 28672,
@@ -182,7 +182,7 @@
             }
         ]
     },
-    "GPT-OSS-120B": {
+    "GPT-OSS 120B": {
         "gemm_a16w16": [
             {
                 "N": 128,
@@ -390,7 +390,7 @@
             }
         ]
     },
-    "Llama-4-Maverick": {
+    "Llama4 Maverick": {
         "gemm_a8w8_per_token_scale": [
             {
                 "N": 32768,

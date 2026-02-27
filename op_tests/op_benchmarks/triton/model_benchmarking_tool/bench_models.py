@@ -11,22 +11,39 @@ import re
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 import matplotlib.pyplot as plt
 import argparse
-import sys
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
-from bench_gemm_a16w16 import main as bench_gemm_a16w16_main
-from bench_gemm_a8w8_per_token_scale import main as bench_gemm_a8w8_per_token_scale_main
-from bench_gemm_a8w8_blockscale import main as bench_gemm_a8w8_blockscale_main
-from bench_gemm_afp4wfp4 import main as bench_gemm_afp4wfp4_main
-from bench_batched_gemm_a8w8 import main as bench_batched_gemm_a8w8_main
-from bench_batched_gemm_afp4wfp4 import main as bench_batched_gemm_afp4wfp4_main
-from bench_moe_gemm_a8w8 import main as bench_moe_gemm_a8w8_main
-from bench_moe_gemm_a8w8_blockscale import main as bench_moe_gemm_a8w8_blockscale_main
-from bench_moe_gemm_a8w4 import main as bench_moe_gemm_a8w4_main
-from bench_moe_gemm_a4w4 import main as bench_moe_gemm_a4w4_main
-from bench_rmsnorm import main as bench_rmsnorm_main
-from bench_rope import main as bench_rope_main
+from op_tests.op_benchmarks.triton.bench_gemm_a16w16 import (
+    main as bench_gemm_a16w16_main,
+)
+from op_tests.op_benchmarks.triton.bench_gemm_a8w8_per_token_scale import (
+    main as bench_gemm_a8w8_per_token_scale_main,
+)
+from op_tests.op_benchmarks.triton.bench_gemm_a8w8_blockscale import (
+    main as bench_gemm_a8w8_blockscale_main,
+)
+from op_tests.op_benchmarks.triton.bench_gemm_afp4wfp4 import (
+    main as bench_gemm_afp4wfp4_main,
+)
+from op_tests.op_benchmarks.triton.bench_batched_gemm_a8w8 import (
+    main as bench_batched_gemm_a8w8_main,
+)
+from op_tests.op_benchmarks.triton.bench_batched_gemm_afp4wfp4 import (
+    main as bench_batched_gemm_afp4wfp4_main,
+)
+from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w8 import (
+    main as bench_moe_gemm_a8w8_main,
+)
+from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w8_blockscale import (
+    main as bench_moe_gemm_a8w8_blockscale_main,
+)
+from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w4 import (
+    main as bench_moe_gemm_a8w4_main,
+)
+from op_tests.op_benchmarks.triton.bench_moe_gemm_a4w4 import (
+    main as bench_moe_gemm_a4w4_main,
+)
+from op_tests.op_benchmarks.triton.bench_rmsnorm import main as bench_rmsnorm_main
+from op_tests.op_benchmarks.triton.bench_rope import main as bench_rope_main
 
 
 def disable_aiter_logs() -> None:
@@ -35,7 +52,7 @@ def disable_aiter_logs() -> None:
 
 disable_aiter_logs()
 
-kernel_dict: dict[str, Callable[[list[str]], None]] = {
+KERNEL_DICT: dict[str, Callable[[list[str]], None]] = {
     "gemm_a16w16": bench_gemm_a16w16_main,
     "gemm_a8w8_per_token_scale": bench_gemm_a8w8_per_token_scale_main,
     "gemm_a8w8_blockscale": bench_gemm_a8w8_blockscale_main,
@@ -134,7 +151,7 @@ class GemmKernelHandler(KernelHandler):
         last_row_values = list(map(float, re.findall(r"-?\d+(?:\.\d+)?", data_line)))
         if len(last_row_values) not in (5, 6):
             raise ValueError(f"Unexpected GEMM bench output format: {last_row_values}")
-        return round(last_row_values[-1], 4)
+        return last_row_values[-1]
 
     def build_result_row(self, bench_result: float | str) -> ResultRow:
         shape = self._shape
@@ -179,7 +196,7 @@ class MoeKernelHandler(KernelHandler):
             bench_result = data["TBPS"] * 1e3  # Convert from TBps to GBps
         else:
             raise ValueError(f"Unknown metric: {metric}")
-        return round(bench_result, 4)
+        return bench_result
 
     def build_result_row(self, bench_result: float | str) -> ResultRow:
         shape = self._shape
@@ -211,7 +228,7 @@ class RmsnormKernelHandler(KernelHandler):
         last_row_values = list(map(float, re.findall(r"-?\d+(?:\.\d+)?", data_line)))
         if not last_row_values:
             raise ValueError(f"Unexpected RMSNorm bench output format: {data_line}")
-        return round(last_row_values[-1], 4)
+        return last_row_values[-1]
 
     def build_result_row(self, bench_result: float | str) -> ResultRow:
         shape = self._shape
@@ -290,7 +307,14 @@ def _get_handler(kernel: str) -> KernelHandler:
 
 def read_json(json_path: str) -> ModelShapesData:
     script_dir = os.path.dirname(os.path.realpath(__file__))
-    with open(script_dir + json_path, "r") as f:
+    full_path = os.path.join(script_dir, json_path)
+    if not os.path.isfile(full_path):
+        raise FileNotFoundError(
+            f"Required file not found: {json_path!r}. "
+            f"bench_models.py depends on this file for model shape definitions. "
+            f"Expected path: {full_path}"
+        )
+    with open(full_path, "r") as f:
         data: ModelShapesData = json.load(f)
     return data
 
@@ -325,7 +349,7 @@ def print_and_save_results(
     unit = {"time": "ms", "throughput": "tflops", "bandwidth": "GBps"}
     df[f"{metric}({unit[metric]})"] = df.pop(metric)
     if "rope_total_flops" in df.columns:
-        df["total_flops(TFLOP)"] = df.pop("rope_total_flops")
+        df["total_flops(tflops)"] = df.pop("rope_total_flops")
 
     # Print results grouped by model and kernel
     for model, idf in df.groupby("Model"):
@@ -342,7 +366,9 @@ def print_and_save_results(
         print(f"\n{ROPE_METRIC_NOTE}")
 
     # Save results to CSV file
-    output_path = f"{os.path.dirname(os.path.realpath(__file__))}/{output_file}.csv"
+    output_path = (
+        f"{os.path.join(os.path.dirname(os.path.realpath(__file__)), output_file)}.csv"
+    )
     print(f"\nSaving results to {output_path}...\n")
     df.to_csv(output_path, index=False)
 
@@ -360,7 +386,7 @@ def run_benchmarks(
         for kernel, shapes in kernels.items():
             if "fp4" in kernel and not arch_info.is_fp4_avail():
                 continue
-            bench_fn = kernel_dict[kernel]
+            bench_fn = KERNEL_DICT[kernel]
             handler = _get_handler(kernel)
             handler.set_run(model, kernel, metric, layout)
             tp_shapes = handler.get_tp_shapes(shapes, TP)
@@ -417,14 +443,14 @@ def parse_args(available_models: list[str]) -> argparse.Namespace:
         "--M",
         type=str,
         nargs="+",
-        default=["512"],
+        default=["4096"],
         help=(
-            "Input size M. Accepts:\n"
+            "Input size M (seq_len for RoPE). Accepts:\n"
             "  Single value:            --M 512\n"
             "  Multiple values:         --M 256 512 1024\n"
             "  Range start:stop:step:   --M 128:1024:128\n"
             "  Combinations of values and ranges are also accepted.\n"
-            "Default: 512."
+            "Default: 4096."
         ),
     )
     parser.add_argument(
@@ -441,18 +467,18 @@ def parse_args(available_models: list[str]) -> argparse.Namespace:
         default="throughput",
         help=(
             "Metric to report (throughput=TFLOPS, bandwidth=GB/s, time=ms). Default: throughput. "
-            "RoPE reports total flops (TFLOP) in a separate column (see note in output)."
+            "RoPE reports total flops (total floating-point operations) in a separate column (see note in output)."
         ),
     )
     parser.add_argument(
-        "--models",
-        type=str,
-        nargs="+",
-        choices=["all"] + available_models,
-        default=["all"],
+        "--model",
+        default=None,
         help=(
-            "Model(s) to benchmark. "
-            "Use 'all' to benchmark all available models. Default: all."
+            "model name filter: case-insensitive regex matched against model name (default: all models). "
+            "e.g. 'llama3' to include only Llama3 family, "
+            "'llama|qwen' to include both Llama and Qwen families, "
+            "'^(?!.*deepseek)' to exclude DeepSeek family."
+            f"\nAvailable models: {', '.join(available_models)}."
         ),
     )
     parser.add_argument(
@@ -471,26 +497,34 @@ def parse_args(available_models: list[str]) -> argparse.Namespace:
 
     args = parser.parse_args()
     args.M = parse_M_values(args.M, parser)
-    if "all" in args.models and len(args.models) > 1:
-        parser.error("'all' cannot be combined with other models.")
 
     return args
 
 
 def main() -> None:
-    data = read_json("/model_shapes.json")
+    data = read_json("model_shapes.json")
     available_models = list(data.keys())
     args = parse_args(available_models)
 
-    models = args.models
+    models = args.model
     M_values = args.M
     TP = args.TP
     metric = args.metric
     layout = args.layout
     output_file = args.output_file
 
-    if "all" not in models:
-        data = {m: data[m] for m in models}
+    if models is not None:
+        try:
+            pattern: re.Pattern[str] = re.compile(models, re.IGNORECASE)
+            data = {m: data[m] for m in available_models if pattern.search(m)}
+            if not data:
+                print("There are no models after filtering by model name.")
+                return
+        except re.error:
+            print(
+                f"Invalid model filter regex: {models} - running all models.",
+                models,
+            )
 
     results = run_benchmarks(data, M_values, TP, layout, metric)
 
