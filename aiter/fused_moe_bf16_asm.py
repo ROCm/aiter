@@ -300,6 +300,8 @@ def _asm_moe_2stages_a8(
         QuantType.per_Token,  # Input is A8
         a8_scale,
         w1_scale,
+        None,
+        None,
         fc2_smooth_scale,
         w2_scale,
         sorted_weights if doweight_stage1 else None,
@@ -307,7 +309,6 @@ def _asm_moe_2stages_a8(
 
     num_scales = inter_dim // 128
     a2_scale = scale_view.view(M, topk, num_scales)
-    assert(0)
     # Stage 2: ASM Kernel
     # moe_buf is initialized as [M, model_dim] in moe_sorting_ck
     asm_moe_stage2(
