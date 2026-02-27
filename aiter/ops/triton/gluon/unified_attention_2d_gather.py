@@ -1,4 +1,3 @@
-from typing import Optional, Union
 
 import torch
 from triton.experimental import gluon
@@ -108,12 +107,12 @@ class AsyncKVLoader:
         kv_cfg = AsyncKVLoaderConfig(cfg)
         k_shared = gl.allocate_shared_memory(
             key_cache_ptr.type.element_ty,
-            [2, cfg.HEAD_SIZE, cfg.BLOCK_SIZE],
+            [2, cfg.HEAD_SIZE, cfg.TILE_SIZE],
             layout=kv_cfg.shared_k_layout,
         )
         v_shared = gl.allocate_shared_memory(
             value_cache_ptr.type.element_ty,
-            [2, cfg.BLOCK_SIZE, cfg.HEAD_SIZE],
+            [2, cfg.TILE_SIZE, cfg.HEAD_SIZE],
             layout=kv_cfg.shared_v_layout,
         )
 
@@ -122,7 +121,7 @@ class AsyncKVLoader:
             0, cfg.HEAD_SIZE, layout=gl.SliceLayout(1, kv_cfg.blocked_k)
         )[:, None]
         offs_n_k = gl.arange(
-            0, cfg.BLOCK_SIZE, layout=gl.SliceLayout(0, kv_cfg.blocked_k)
+            0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, kv_cfg.blocked_k)
         )[None, :]
         k_base_offset = (
             kv_head_idx * stride_k_cache_2
@@ -134,7 +133,7 @@ class AsyncKVLoader:
             0, cfg.HEAD_SIZE, layout=gl.SliceLayout(0, kv_cfg.blocked_v)
         )[None, :]
         offs_n_v = gl.arange(
-            0, cfg.BLOCK_SIZE, layout=gl.SliceLayout(1, kv_cfg.blocked_v)
+            0, cfg.TILE_SIZE, layout=gl.SliceLayout(1, kv_cfg.blocked_v)
         )[:, None]
         v_base_offset = (
             kv_head_idx * stride_v_cache_2
@@ -362,6 +361,180 @@ class TDMKVLoader:
         gl.amd.gfx1250.tdm.async_wait(wait_count)
         return self.v_shared.index(buffer_id).load(layout=self.kv_cfg.v_reg_layout)
 
+@aggregate
+class TDMGatherKVLoaderConfig:
+    """Configuration for TDM KV loader."""
+
+    shared_k_layout: gl.constexpr
+    shared_v_layout: gl.constexpr
+    USE_LOAD_BUFFER_OP: gl.constexpr
+    KV_CACHE_MODIFIER: gl.constexpr
+
+    k_reg_layout: gl.constexpr
+    v_reg_layout: gl.constexpr
+    BLOCK_SIZE: gl.constexpr
+    HEAD_SIZE: gl.constexpr
+    NUM_KV_HEADS: gl.constexpr
+    NUM_KV_BLOCKS: gl.constexpr
+    TILE_SIZE: gl.constexpr
+    gather_ids_layout: gl.constexpr
+    @gluon.constexpr_function
+    def __init__(self, cfg):
+        # Swizzled shared memory layouts for K and V
+        self.shared_k_layout = gl.constexpr(
+            gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0]))
+        self.shared_v_layout = gl.constexpr(
+            gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0]))
+
+        self.KV_CACHE_MODIFIER = cfg.KV_CACHE_MODIFIER
+        self.USE_LOAD_BUFFER_OP = cfg.USE_LOAD_BUFFER_OP
+
+        self.k_reg_layout = gl.constexpr(cfg.k_layout)
+        self.v_reg_layout = gl.constexpr(cfg.v_layout)
+        self.BLOCK_SIZE = gl.constexpr(cfg.BLOCK_SIZE)
+        self.HEAD_SIZE = gl.constexpr(cfg.HEAD_SIZE)
+        self.NUM_KV_BLOCKS = gl.constexpr(cfg.NUM_KV_BLOCKS)
+        self.TILE_SIZE = gl.constexpr(cfg.TILE_SIZE)
+        self.NUM_KV_HEADS = gl.constexpr(cfg.NUM_KV_HEADS)
+
+        self.gather_ids_layout = gl.constexpr(
+            gl.BlockedLayout(
+                size_per_thread=[cfg.NUM_KV_BLOCKS],
+                threads_per_warp=[cfg.WARP_SIZE],
+                warps_per_cta=[cfg.NUM_WARPS],
+                order=[0],
+            )
+        )
+@aggregate
+class TDMGatherKVLoader:
+    kv_cfg: TDMGatherKVLoaderConfig
+    k_shared: gl.shared_memory_descriptor
+    v_shared: gl.shared_memory_descriptor
+    k_desc: gl.amd.gfx1250.tdm.tensor_descriptor
+    v_desc: gl.amd.gfx1250.tdm.tensor_descriptor
+    kv_head_idx: gl.tensor
+    stride_k_cache_2: gl.tensor
+    stride_v_cache_2: gl.tensor
+    block_tables_ptr_shifted: gl.tensor
+    @gluon.constexpr_function
+    def __init__(
+        self,
+        kv_cfg,
+        k_shared,
+        v_shared,
+        k_desc,
+        v_desc,
+        block_tables_ptr_shifted,
+        kv_head_idx,
+        stride_k_cache_2,
+        stride_v_cache_2,
+    ):
+        self.kv_cfg = kv_cfg
+        self.k_shared = k_shared
+        self.v_shared = v_shared
+        self.k_desc = k_desc
+        self.v_desc = v_desc
+        self.block_tables_ptr_shifted = block_tables_ptr_shifted
+        self.kv_head_idx = kv_head_idx
+        self.stride_k_cache_2 = stride_k_cache_2
+        self.stride_v_cache_2 = stride_v_cache_2
+
+    @gluon.jit
+    def initialize(
+        cfg,
+        key_cache_ptr,
+        value_cache_ptr,
+        kv_head_idx,
+        num_blocks,
+        stride_k_cache_1,
+        stride_k_cache_2,
+        stride_k_cache_3,
+        stride_v_cache_1,
+        stride_v_cache_2,
+        stride_v_cache_3,
+        block_tables_ptr_shifted,
+    ):
+        kv_cfg = TDMGatherKVLoaderConfig(cfg)
+        k_shared = gl.allocate_shared_memory(
+            key_cache_ptr.type.element_ty,
+            [2, cfg.NUM_KV_BLOCKS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE],
+            layout=kv_cfg.shared_k_layout,
+        )
+        v_shared = gl.allocate_shared_memory(
+            value_cache_ptr.type.element_ty,
+            [2, cfg.NUM_KV_BLOCKS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE],
+            layout=kv_cfg.shared_v_layout,
+        )
+
+        k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=key_cache_ptr,
+            shape=(num_blocks * cfg.NUM_KV_HEADS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE),
+            strides=(stride_k_cache_1, stride_k_cache_3),
+            block_shape=(cfg.NUM_KV_BLOCKS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE),
+            layout=kv_cfg.shared_k_layout,
+        )
+        v_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=value_cache_ptr,
+            shape=(num_blocks * cfg.NUM_KV_HEADS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE),
+            strides=(stride_v_cache_1, stride_v_cache_3),
+            block_shape=(cfg.NUM_KV_BLOCKS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE),
+            layout=kv_cfg.shared_v_layout,
+        )
+
+        return TDMGatherKVLoader(
+            kv_cfg,
+            k_shared,
+            v_shared,
+            k_desc,
+            v_desc,
+            block_tables_ptr_shifted,
+            kv_head_idx,
+            stride_k_cache_2,
+            stride_v_cache_2,
+        )
+
+    @gluon.jit
+    def load_k_to_shared(self, k_offset, buffer_id):
+        src_row_indices = (k_offset * self.kv_cfg.NUM_KV_HEADS + self.kv_head_idx).to(
+            gl.int32
+        )
+
+        gl.amd.gfx1250.tdm.async_gather(
+            self.k_desc, src_row_indices, 0, self.k_shared.index(buffer_id)
+        )
+
+    @gluon.jit
+    def load_v_to_shared(self, v_offset, buffer_id):
+        src_row_indices = (v_offset * self.kv_cfg.NUM_KV_HEADS + self.kv_head_idx).to(
+            gl.int32
+        )
+        gl.amd.gfx1250.tdm.async_gather(
+            self.v_desc, src_row_indices, 0, self.v_shared.index(buffer_id)
+        )
+
+    @gluon.jit
+    def load_k_from_shared(self, wait_count, buffer_id):
+        gl.amd.gfx1250.tdm.async_wait(wait_count)
+        return (
+            self.k_shared.index(buffer_id)
+            .reshape([self.kv_cfg.TILE_SIZE, self.kv_cfg.HEAD_SIZE])
+            .permute([1, 0])
+            .load(layout=self.kv_cfg.k_reg_layout)
+        )
+
+    @gluon.jit
+    def load_v_from_shared(self, wait_count, buffer_id):
+        gl.amd.gfx1250.tdm.async_wait(wait_count)
+        return (self.v_shared.index(buffer_id)
+                .reshape([self.kv_cfg.TILE_SIZE, self.kv_cfg.HEAD_SIZE])
+                .load(layout=self.kv_cfg.v_reg_layout)
+        )
+
+    @gluon.jit
+    def load_block_ids(self, i):
+        offs = gl.arange(0, self.kv_cfg.NUM_KV_BLOCKS, layout=self.kv_cfg.gather_ids_layout)
+        return gl.load(self.block_tables_ptr_shifted + i * self.kv_cfg.NUM_KV_BLOCKS + offs)
+
 
 @aggregate
 class AttentionConfig:
@@ -372,6 +545,8 @@ class AttentionConfig:
     HEAD_SIZE: gl.constexpr
     BLOCK_SIZE: gl.constexpr
     BLOCK_M: gl.constexpr
+    TILE_SIZE: gl.constexpr
+    NUM_KV_BLOCKS: gl.constexpr
     NUM_QUERY_HEADS: gl.constexpr
     NUM_KV_HEADS: gl.constexpr
     SLIDING_WINDOW: gl.constexpr
@@ -399,7 +574,7 @@ class AttentionConfig:
 
     USE_LOAD_BUFFER_OP: gl.constexpr
     USE_STORE_BUFFER_OP: gl.constexpr
-
+    ALL_DECODE: gl.constexpr
     @gluon.constexpr_function
     def __init__(
         self,
@@ -407,6 +582,7 @@ class AttentionConfig:
         NUM_WARPS,
         HEAD_SIZE,
         BLOCK_SIZE,
+        TILE_SIZE,
         BLOCK_M,
         BLOCK_Q,
         NUM_QUERY_HEADS,
@@ -415,6 +591,7 @@ class AttentionConfig:
         SCALE,
         USE_LOAD_BUFFER_OP,
         USE_STORE_BUFFER_OP,
+        ALL_DECODE,
     ):
 
         # Constants
@@ -427,10 +604,13 @@ class AttentionConfig:
         # Derived constants
         self.NUM_QUERIES_PER_KV = gl.constexpr(NUM_QUERY_HEADS // NUM_KV_HEADS)
         self.BLOCK_Q = gl.constexpr(BLOCK_Q)
+        self.NUM_KV_BLOCKS = gl.constexpr(TILE_SIZE // BLOCK_SIZE)
+        self.TILE_SIZE = gl.constexpr(TILE_SIZE)
         self.RCP_LN2 = gl.constexpr(1.4426950408889634)
         self.QK_SCALE = gl.constexpr(SCALE * self.RCP_LN2)
         self.USE_LOAD_BUFFER_OP = gl.constexpr(USE_LOAD_BUFFER_OP)
         self.USE_STORE_BUFFER_OP = gl.constexpr(USE_STORE_BUFFER_OP)
+        self.ALL_DECODE = gl.constexpr(ALL_DECODE)
         self.ARCH_NAME = gl.constexpr(ARCH_NAME)
         self.WARP_SIZE = gl.constexpr(32 if ARCH_NAME == "gfx1250" else 64)
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
@@ -477,9 +657,8 @@ class AttentionConfig:
                 order=[1, 0],
             )
         )
-
         self.Q_CACHE_MODIFIER = gl.constexpr(".cg")
-        self.KV_CACHE_MODIFIER = gl.constexpr("")
+        self.KV_CACHE_MODIFIER = gl.constexpr(".cg") if ALL_DECODE else gl.constexpr("")
 
 
 @aggregate
@@ -501,7 +680,7 @@ class AttentionProgram:
     query_mask_qk: gl.tensor
     # context_len: gl.tensor
     context_len_q_pos_qk: gl.tensor
-
+    
     @gluon.constexpr_function
     def __init__(
         self,
@@ -542,7 +721,7 @@ class AttentionProgram:
         query_mask,
     ):
         # Calculate tile range
-        num_tiles = (max_seq_prefix_len + cfg.BLOCK_SIZE - 1) // cfg.BLOCK_SIZE
+        num_tiles = (max_seq_prefix_len + cfg.TILE_SIZE - 1) // cfg.TILE_SIZE
         tile_start = 0
         tile_end = num_tiles
         if cfg.SLIDING_WINDOW > 0:
@@ -553,8 +732,8 @@ class AttentionProgram:
             )
             first_allowed_key = context_len + qpos_lo - cfg.SLIDING_WINDOW + 1
             last_allowed_key = context_len + qpos_hi
-            tile_start = gl.maximum(0, first_allowed_key // cfg.BLOCK_SIZE)
-            tile_end = gl.minimum((last_allowed_key // cfg.BLOCK_SIZE) + 1, num_tiles)
+            tile_start = gl.maximum(0, first_allowed_key // cfg.TILE_SIZE)
+            tile_end = gl.minimum((last_allowed_key // cfg.TILE_SIZE) + 1, num_tiles)
 
         query_pos_qk = gl.convert_layout(query_pos, gl.SliceLayout(1, cfg.qk_layout))[
             :, None
@@ -568,7 +747,7 @@ class AttentionProgram:
         # Tiles j < safe_tile_end have all KV positions within causal range
         # for every query row, so apply_mask_qk can be skipped.
         min_causal_pos = context_len + q_block_local_idx * cfg.BLOCK_Q
-        safe_tile_end = (min_causal_pos + 1) // cfg.BLOCK_SIZE
+        safe_tile_end = (min_causal_pos + 1) // cfg.TILE_SIZE
         safe_tile_end = gl.minimum(safe_tile_end, tile_end)
         safe_tile_end = gl.maximum(safe_tile_end, tile_start)
 
@@ -584,6 +763,7 @@ class AttentionProgram:
             query_mask_qk,
             context_len_q_pos_qk,
         )
+
 
     @gluon.jit
     def load_q_from_global(
@@ -641,7 +821,7 @@ class AttentionProgram:
     @gluon.jit
     def compute_qk(self, k):
         S = gl.zeros(
-            [self.cfg.BLOCK_M, self.cfg.BLOCK_SIZE],
+            [self.cfg.BLOCK_M, self.cfg.TILE_SIZE],
             dtype=gl.float32,
             layout=self.cfg.qk_layout,
         )
@@ -653,9 +833,9 @@ class AttentionProgram:
     @gluon.jit
     def apply_mask_qk(self, S, j):
         seq_offset = (
-            j * self.cfg.BLOCK_SIZE
+            j * self.cfg.TILE_SIZE
             + gl.arange(
-                0, self.cfg.BLOCK_SIZE, layout=gl.SliceLayout(0, self.cfg.qk_layout)
+                0, self.cfg.TILE_SIZE, layout=gl.SliceLayout(0, self.cfg.qk_layout)
             )[None, :]
         )
 
@@ -789,6 +969,7 @@ def kernel_unified_attention_2d(
     NUM_QUERY_HEADS: gl.constexpr,
     NUM_KV_HEADS: gl.constexpr,
     BLOCK_SIZE: gl.constexpr,
+    TILE_SIZE: gl.constexpr,
     HEAD_SIZE: gl.constexpr,
     BLOCK_Q: gl.constexpr,
     BLOCK_M: gl.constexpr,
@@ -796,6 +977,7 @@ def kernel_unified_attention_2d(
     USE_LOAD_BUFFER_OP: gl.constexpr = False,
     USE_STORE_BUFFER_OP: gl.constexpr = False,
     USE_TDM: gl.constexpr = False,
+    ALL_DECODE: gl.constexpr = False,
 ):
     NUM_WARPS: gl.constexpr = gl.num_warps()
     # Workgroup offsets
@@ -807,6 +989,7 @@ def kernel_unified_attention_2d(
         NUM_WARPS,
         HEAD_SIZE,
         BLOCK_SIZE,
+        TILE_SIZE,
         BLOCK_M,
         BLOCK_Q,
         NUM_QUERY_HEADS,
@@ -815,6 +998,7 @@ def kernel_unified_attention_2d(
         SCALE,
         USE_LOAD_BUFFER_OP,
         USE_STORE_BUFFER_OP,
+        ALL_DECODE,
     )
 
     # Cast strides to int64 when not using buffer ops
@@ -899,11 +1083,11 @@ def kernel_unified_attention_2d(
         query_pos,
         query_mask,
     )
-    if USE_TDM:
-        KVLoader: gl.constexpr = TDMKVLoader
-    else:
-        KVLoader: gl.constexpr = AsyncKVLoader
-
+    # if USE_TDM:
+    #     KVLoader: gl.constexpr = TDMKVLoader
+    # else:
+    #     KVLoader: gl.constexpr = AsyncKVLoader
+    KVLoader: gl.constexpr = TDMGatherKVLoader
     kv_loader = KVLoader.initialize(
         cfg,
         key_cache_ptr,
@@ -916,6 +1100,7 @@ def kernel_unified_attention_2d(
         stride_v_cache_1,
         stride_v_cache_2,
         stride_v_cache_3,
+        block_tables_ptr_shifted,
     )
 
     # Initialize accumulators
@@ -948,20 +1133,17 @@ def kernel_unified_attention_2d(
     acc = gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout)
     # TODO (cagri): Assuming stride_k_cache_0 == stride_v_cache_0
     # Prologue: load first tile's block index and issue async K, V loads
-    physical_block_idx = gl.load(block_tables_ptr_shifted + pgm.tile_start)
-    if not USE_TDM:
-        physical_block_idx = physical_block_idx * stride_k_cache_0
+    physical_block_idx = kv_loader.load_block_ids(pgm.tile_start)
+
     # rotating buffer index logic
     # TODO (cagri): Loop unrolling can get rid of this
     buffer_id: gl.int32 = 0
     kv_loader.load_k_to_shared(physical_block_idx, buffer_id=buffer_id)
     kv_loader.load_v_to_shared(physical_block_idx, buffer_id=buffer_id)
-
     # Main attention loop over KV tiles (staged, num_stages=2)
     for j in range(pgm.tile_start, pgm.tile_end - 1):
-        next_physical_block_idx = gl.load(block_tables_ptr_shifted + j + 1)
-        if not USE_TDM:
-            next_physical_block_idx = next_physical_block_idx * stride_k_cache_0
+        next_physical_block_idx = kv_loader.load_block_ids(j + 1)
+
         k = kv_loader.load_k_from_shared(wait_count=1, buffer_id=buffer_id)
 
         # Prefetch next tile (shared is free since k, v are in registers)
@@ -1051,11 +1233,12 @@ def unified_attention(
     BLOCK_M = 128
     SLIDING_WINDOW = 1 + window_size[0]
     num_blocks = k.shape[0]
+    ALL_DECODE = max_seqlen_q == 1
 
     NUM_QUERIES_PER_KV = NUM_Q_HEADS // NUM_KV_HEADS
     BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
     total_query_blocks = q.shape[0] // BLOCK_Q + NUM_SEQS
-
+    TILE_SIZE = 256
     ARCH_NAME = arch_info.get_arch()
     NUM_WARPS = 4
     USE_TDM = ARCH_NAME == "gfx1250"
@@ -1063,8 +1246,11 @@ def unified_attention(
     MAX_INT32 = 2**31 - 1
     USE_LOAD_BUFFER_OP = kv_size <= MAX_INT32
     USE_STORE_BUFFER_OP = out.nelement() * out.element_size() <= MAX_INT32
-    waves_per_eu = 4 if HEAD_SIZE < 128 else 2
+    waves_per_eu = 2 if HEAD_SIZE < 128 else 2
     grid = (NUM_KV_HEADS, total_query_blocks)
+
+    k = k.cpu().permute(0, 2, 1, 3).contiguous().cuda()
+    v = v.cpu().permute(0, 2, 1, 3).contiguous().cuda()
     attn_kernel = kernel_unified_attention_2d[grid](
         query_ptr=q,
         key_cache_ptr=k,
@@ -1095,6 +1281,7 @@ def unified_attention(
         NUM_QUERY_HEADS=NUM_Q_HEADS,
         NUM_KV_HEADS=NUM_KV_HEADS,
         BLOCK_SIZE=BLOCK_SIZE,
+        TILE_SIZE=TILE_SIZE,
         HEAD_SIZE=HEAD_SIZE,
         BLOCK_Q=BLOCK_Q,
         BLOCK_M=BLOCK_M,
@@ -1104,6 +1291,7 @@ def unified_attention(
         USE_STORE_BUFFER_OP=USE_STORE_BUFFER_OP,
         num_warps=NUM_WARPS,
         USE_TDM=USE_TDM,
+        ALL_DECODE=ALL_DECODE,
     )
     if PRINT_IRS and getattr(unified_attention, "print", False) == False:
         setattr(unified_attention, "print", True)

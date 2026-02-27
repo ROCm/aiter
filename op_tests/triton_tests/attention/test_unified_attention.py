@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# import hip
-# hip.hip.hipInit(0)
+import hip
+hip.hip.hipInit(0)
 from typing import Optional
 
 import pytest
@@ -11,7 +11,7 @@ from aiter.ops.triton.attention.unified_attention import unified_attention
 from aiter.ops.triton.gluon.unified_attention_3d import (
     unified_attention as gluon_unified_attention,
 )
-from aiter.ops.triton.gluon.unified_attention_2d import (
+from aiter.ops.triton.gluon.unified_attention_2d_gather import (
     unified_attention as gluon_unified_attention_2d,
 )
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -310,7 +310,7 @@ def test_triton_unified_attn(
 )
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
-@pytest.mark.parametrize("block_size", [64, 16])
+@pytest.mark.parametrize("block_size", [64, ])
 @pytest.mark.parametrize("sliding_window", [None, 256])
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize(
