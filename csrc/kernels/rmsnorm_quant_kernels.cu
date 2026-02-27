@@ -143,7 +143,12 @@ __global__ void add_rmsnorm_quant_kernel(
             vec2_f* thread_data_float2 = reinterpret_cast<vec2_f*>(&thread_data_float);
             for(int i = 0; i < thread_data_size / 2; i++)
             {
+#if defined(__gfx11__) || defined(__gfx12__)
+                thread_data_float[2*i] *= rcp[0];
+                thread_data_float[2*i+1] *= rcp[1];
+#else
                 asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(thread_data_float2[i]) : "v"(thread_data_float2[i]), "v"(rcp));
+#endif
             }
             
             float* thread_data_weight2 = reinterpret_cast<float*>(&thread_data_weight);
@@ -154,23 +159,47 @@ __global__ void add_rmsnorm_quant_kernel(
                 // thread_data_weight_float2[1] = ck_tile::type_convert<float>(thread_data_weight[2 * i + 1]);
                 if constexpr(std::is_same_v<DTYPE_I, ck_tile::bf16_t>)
                 {
+#if defined(__gfx11__) || defined(__gfx12__)
+                    // RDNA: Use bit_cast + shift to unpack bf16 from packed storage
+                    uint32_t w = ck_tile::bit_cast<uint32_t>(thread_data_weight2[i]);
+                    uint16_t lo = static_cast<uint16_t>(w & 0xFFFF);
+                    uint16_t hi = static_cast<uint16_t>(w >> 16);
+                    thread_data_weight_float2[0] = ck_tile::type_convert<float>(ck_tile::bit_cast<ck_tile::bf16_t>(lo));
+                    thread_data_weight_float2[1] = ck_tile::type_convert<float>(ck_tile::bit_cast<ck_tile::bf16_t>(hi));
+#else
                     asm volatile(
-                        "v_lshlrev_b32_e32 %0, 16 %2\n"
-                        "v_and_b32_e32 %1 0xffff0000 %2\n"
+                        "v_lshlrev_b32_e32 %0, 16, %2\n"
+                        "v_and_b32_e32 %1, 0xffff0000, %2\n"
                         : "=v"(thread_data_weight_float2[0]), "=v"(thread_data_weight_float2[1])
                         : "v"(thread_data_weight2[i])
                     );
+#endif
                 }
                 else
                 {
+#if defined(__gfx11__) || defined(__gfx12__)
+                    // RDNA: Use bit_cast + shift to unpack fp16 from packed storage
+                    uint32_t w = ck_tile::bit_cast<uint32_t>(thread_data_weight2[i]);
+                    uint16_t lo = static_cast<uint16_t>(w & 0xFFFF);
+                    uint16_t hi = static_cast<uint16_t>(w >> 16);
+                    thread_data_weight_float2[0] = ck_tile::type_convert<float>(ck_tile::bit_cast<ck_tile::fp16_t>(lo));
+                    thread_data_weight_float2[1] = ck_tile::type_convert<float>(ck_tile::bit_cast<ck_tile::fp16_t>(hi));
+#else
+                    // CDNA: Use SDWA to select high/low 16 bits
                     asm volatile(
-                        "v_cvt_f32_f16_e32 %0 %2\n"
-                        "v_cvt_f32_f16_sdwa %1 %2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1\n"
+                        "v_cvt_f32_f16_e32 %0, %2\n"
+                        "v_cvt_f32_f16_sdwa %1, %2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1\n"
                         : "=v"(thread_data_weight_float2[0]), "=v"(thread_data_weight_float2[1])
                         : "v"(thread_data_weight2[i])
                     );
+#endif
                 }
+#if defined(__gfx11__) || defined(__gfx12__)
+                thread_data_float[2*i] *= thread_data_weight_float2[0];
+                thread_data_float[2*i+1] *= thread_data_weight_float2[1];
+#else
                 asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(thread_data_float2[i]) : "v"(thread_data_float2[i]), "v"(thread_data_weight_float2));
+#endif
             }
 
             if constexpr(FUSE_QUANT)
