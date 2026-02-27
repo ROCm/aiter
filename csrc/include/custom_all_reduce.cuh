@@ -458,89 +458,188 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
     // end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
-template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
-__global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _input_dp,
-                                                                     RankData* _output_dp,
-                                                                     RankSignals sg,
+template <typename T, int ngpus, bool is_broadcast_reg_outptr = false, bool UseDoubleBuffer = true>
+__global__ void __launch_bounds__(512, 1)
+cross_device_reduce_2stage(RankData* _input_dp,
+                           RankData* _output_dp,
+                           RankSignals sg,
 #ifndef USE_ROCM
-                                                                     volatile
+                           volatile
 #endif
-                                                                     Signal* self_sg,
-                                                                     T* __restrict__ result,
-                                                                     int rank,
-                                                                     int size)
+                           Signal* self_sg,
+                           T* __restrict__ result,
+                           int rank,
+                           int size)
 {
     constexpr int pack_size = packed_t<T>::P::size;
     constexpr int tnum_gpu  = THREAD_NUM / ngpus;
-    using P                 = typename packed_t<T>::P;
-    using A                 = typename packed_t<T>::A;
-    __shared__ T tmp_smem[tnum_gpu * ngpus * pack_size];
-    int warp_id      = threadIdx.x / tnum_gpu;
-    int lane_id      = threadIdx.x % tnum_gpu;
-    int tid          = blockIdx.x * tnum_gpu + lane_id;
+    using P                 = typename packed_t<T>::P; // vectorized pack of T
+    using A                 = typename packed_t<T>::A; // accumulator (float) pack
+
+    // Shared memory layout:
+    //   - Each "tile" holds data for all ngpus groups for all threads in the block:
+    //       tile_elems_T = tnum_gpu * ngpus * pack_size  (in T elements)
+    //   - When UseDoubleBuffer is true, we allocate 2 tiles (ping-pong).
+    constexpr int tile_elems_T = tnum_gpu * ngpus * pack_size;
+    __shared__ T tmp_smem[(UseDoubleBuffer ? 2 : 1)][tile_elems_T];
+
+    // Thread organization:
+    int warp_id      = threadIdx.x / tnum_gpu; // which GPU-group this thread belongs to (0..ngpus-1)
+    int lane_id      = threadIdx.x % tnum_gpu; // lane within that group
+    int tid          = blockIdx.x * tnum_gpu + lane_id; // logical per-group thread id across blocks
     int stride       = gridDim.x * tnum_gpu;
+
+    // Rank partitioning:
     int part         = size / ngpus;
     int start        = rank * part;
-    int end          = rank == ngpus - 1 ? size : start + part;
+    int end          = (rank == ngpus - 1) ? size : (start + part);
     int largest_part = part + size % ngpus;
+
+    // Build source pointers per GPU and per-device temporary output buffers.
     const P* ptrs[ngpus];
-    P* tmps[ngpus];
+    P*       tmps[ngpus];
 #pragma unroll
-    for(int i = 0; i < ngpus; i++)
+    for (int i = 0; i < ngpus; ++i)
     {
         int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_input_dp->ptrs[target];
+        ptrs[i]    = reinterpret_cast<const P*>(_input_dp->ptrs[target]);
         tmps[i]    = get_tmp_buf<P>(sg.signals[target]);
     }
     auto tmp_out = tmps[0];
+
+    // Synchronize across devices before starting.
     start_sync<ngpus>(sg, self_sg, rank);
-    // stage 1: reduce scatter
-    for(int idx = start + tid; idx < end; idx += stride)
+
+    // ------------------------------
+    // Stage 1: reduce-scatter (with optional double buffering)
+    // ------------------------------
+
+    constexpr int smem_gpu_loop_stride = tnum_gpu * pack_size;
+
+    if constexpr (UseDoubleBuffer)
     {
-        *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = ptrs[warp_id][idx];
-        __syncthreads();
-        // cal add in first 64 threads
-        if(warp_id == 0)
+        // Preload first tile into buffer 0 by ALL groups
+        int first_idx = start + tid;
+        if (first_idx < end)
         {
-            A add_reg;
-#pragma unroll
-            for(int i = 0; i < pack_size; ++i)
-            {
-                add_reg.data[i] =
-                    ck_tile::type_convert<float>(tmp_smem[pack_size * threadIdx.x + i]);
-            }
-            constexpr int smem_gpu_loop_stride = tnum_gpu * pack_size;
-#pragma unroll
-            for(int i = 1; i < ngpus; ++i)
-            {
-#pragma unroll
-                for(int j = 0; j < pack_size; ++j)
-                {
-                    add_reg.data[j] += ck_tile::type_convert<float>(
-                        tmp_smem[i * smem_gpu_loop_stride + pack_size * threadIdx.x + j]);
-                }
-            }
-            P write_reg;
-#pragma unroll
-            for(int i = 0; i < pack_size; ++i)
-            {
-                write_reg.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
-            }
-            tmp_out[idx - start] = write_reg;
+            // Each thread writes its pack to shared memory as P
+            *(reinterpret_cast<P*>(&tmp_smem[0][0]) + threadIdx.x) = ptrs[warp_id][first_idx];
         }
         __syncthreads();
+
+        int cur = 0;
+        int nxt = 1;
+
+        for (int idx = first_idx; idx < end; /* increment inside */)
+        {
+            // Compute next index for pipelining
+            int next_idx = idx + stride;
+
+            // While group 0 reduces 'cur' buffer, other groups prefetch next tile into 'nxt'
+            if (warp_id == 0)
+            {
+                // --- reduction on current buffer ---
+                A add_reg;
+#pragma unroll
+                for (int i = 0; i < pack_size; ++i)
+                {
+                    add_reg.data[i] =
+                        ck_tile::type_convert<float>(tmp_smem[cur][pack_size * threadIdx.x + i]);
+                }
+#pragma unroll
+                for (int g = 1; g < ngpus; ++g)
+                {
+#pragma unroll
+                    for (int j = 0; j < pack_size; ++j)
+                    {
+                        add_reg.data[j] += ck_tile::type_convert<float>(
+                            tmp_smem[cur][g * smem_gpu_loop_stride + pack_size * threadIdx.x + j]);
+                    }
+                }
+                P write_reg;
+#pragma unroll
+                for (int i = 0; i < pack_size; ++i)
+                {
+                    write_reg.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
+                }
+                // Write local reduced result into this rank's tmp buffer (scatter)
+                tmp_out[idx - start] = write_reg;
+            }
+            else
+            {
+                // --- prefetch for next iteration (other groups only) ---
+                if (next_idx < end)
+                {
+                    *(reinterpret_cast<P*>(&tmp_smem[nxt][0]) + threadIdx.x) = ptrs[warp_id][next_idx];
+                }
+            }
+
+            // Group 0 now loads its own contribution for the next tile
+            if (warp_id == 0 && next_idx < end)
+            {
+                *(reinterpret_cast<P*>(&tmp_smem[nxt][0]) + threadIdx.x) = ptrs[warp_id][next_idx];
+            }
+
+            // Barrier: ensure the next tile is fully populated before next loop
+            __syncthreads();
+
+            // Advance
+            idx = next_idx;
+            cur ^= 1;
+            nxt ^= 1;
+        }
     }
+    else
+    {
+        // Single-buffer path 
+        for (int idx = start + tid; idx < end; idx += stride)
+        {
+            // Load current tile for ALL groups into the single buffer
+            *(reinterpret_cast<P*>(&tmp_smem[0][0]) + threadIdx.x) = ptrs[warp_id][idx];
+            __syncthreads();
+
+            // group 0 reduces across groups
+            if (warp_id == 0)
+            {
+                A add_reg;
+#pragma unroll
+                for (int i = 0; i < pack_size; ++i)
+                {
+                    add_reg.data[i] =
+                        ck_tile::type_convert<float>(tmp_smem[0][pack_size * threadIdx.x + i]);
+                }
+#pragma unroll
+                for (int g = 1; g < ngpus; ++g)
+                {
+#pragma unroll
+                    for (int j = 0; j < pack_size; ++j)
+                    {
+                        add_reg.data[j] += ck_tile::type_convert<float>(
+                            tmp_smem[0][g * smem_gpu_loop_stride + pack_size * threadIdx.x + j]);
+                    }
+                }
+                P write_reg;
+#pragma unroll
+                for (int i = 0; i < pack_size; ++i)
+                {
+                    write_reg.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
+                }
+                tmp_out[idx - start] = write_reg;
+            }
+            __syncthreads();
+        }
+    }
+
+    // Cross-device end-of-stage sync.
     end_sync<ngpus>(sg, self_sg, rank);
 
-    // stage 2: allgather. Note: it's important to match the tid between
-    // the two stages, because visibility across devices is only guaranteed
-    // between threads that have the same tid. If thread i computes the sum of
-    // start + i in the first stage, then thread i also gathers start + i from all
-    // ranks.
-    for(int idx = tid; idx < largest_part; idx += stride)
+    // ------------------------------
+    // Stage 2: allgather 
+    // ------------------------------
+    for (int idx = tid; idx < largest_part; idx += stride)
     {
-        int dst_idx           = (warp_id + rank) % ngpus * part + idx;
-        ((P*)result)[dst_idx] = tmps[warp_id][idx];
+        int dst_idx           = ((warp_id + rank) % ngpus) * part + idx;
+        reinterpret_cast<P*>(result)[dst_idx] = tmps[warp_id][idx];
     }
 }
 
