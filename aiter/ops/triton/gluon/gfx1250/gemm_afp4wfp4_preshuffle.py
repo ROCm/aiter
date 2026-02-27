@@ -52,8 +52,8 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
     )
 
     # LDS layouts (shared memory layouts). These must be SharedLayout types.
-    shared_A = gl.SwizzledSharedLayout(vec=16, per_phase=1, max_phase=8, order=[1, 0])
-    shared_B = gl.SwizzledSharedLayout(vec=16, per_phase=1, max_phase=8, order=[0, 1])
+    shared_A = gl.SwizzledSharedLayout(vec=16, per_phase=1, max_phase=1, order=[1, 0])
+    shared_B = gl.SwizzledSharedLayout(vec=16, per_phase=1, max_phase=1, order=[0, 1])
     shared_S = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
 
     # Dot operand layouts (register layouts expected by WMMA)
@@ -79,35 +79,35 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
     }
 
 
-# Local offsets for A (per k-block);  with ptr = a_base + k_tile * BLOCK_K_BYTES * stride_a_kbytes
-@gluon.jit
-def a_tile_offsets_local(
-    tile_m,
-    stride_a_m,
-    stride_a_kbytes,
-    BLOCK_M: gl.constexpr,
-    BLOCK_K_BYTES: gl.constexpr,
-    blocked_mk: gl.constexpr,
-):
-    m_idx = tile_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, blocked_mk))
-    k_idx = gl.arange(0, BLOCK_K_BYTES, layout=gl.SliceLayout(0, blocked_mk))
-    return m_idx[:, None] * stride_a_m + k_idx[None, :] * stride_a_kbytes
+# # Local offsets for A (per k-block);  with ptr = a_base + k_tile * BLOCK_K_BYTES * stride_a_kbytes
+# @gluon.jit
+# def a_tile_offsets_local(
+#     tile_m,
+#     stride_a_m,
+#     stride_a_kbytes,
+#     BLOCK_M: gl.constexpr,
+#     BLOCK_K_BYTES: gl.constexpr,
+#     blocked_mk: gl.constexpr,
+# ):
+#     m_idx = tile_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, blocked_mk))
+#     k_idx = gl.arange(0, BLOCK_K_BYTES, layout=gl.SliceLayout(0, blocked_mk))
+#     return m_idx[:, None] * stride_a_m + k_idx[None, :] * stride_a_kbytes
 
 
-# Offsets for A scales in *shuffled* layout: tensor is (M//32, K_groups*32).
-# Load (BLOCK_M//32, K_GROUPS*32) then unshuffle to (BLOCK_M, K_GROUPS).
-@gluon.jit
-def a_scale_offsets_local_shuffled(
-    tile_m,
-    stride_as_m,
-    stride_as_k,
-    BLOCK_M: gl.constexpr,
-    K_GROUPS: gl.constexpr,
-    a_scale_layout: gl.constexpr,
-):
-    m_block_idx = tile_m * (BLOCK_M // 32) + gl.arange(0, BLOCK_M // 32, layout=gl.SliceLayout(1, a_scale_layout))
-    k_scale_idx = gl.arange(0, K_GROUPS * 32, layout=gl.SliceLayout(0, a_scale_layout))
-    return m_block_idx[:, None] * stride_as_m + k_scale_idx[None, :] * stride_as_k
+# # Offsets for A scales in *shuffled* layout: tensor is (M//32, K_groups*32).
+# # Load (BLOCK_M//32, K_GROUPS*32) then unshuffle to (BLOCK_M, K_GROUPS).
+# @gluon.jit
+# def a_scale_offsets_local_shuffled(
+#     tile_m,
+#     stride_as_m,
+#     stride_as_k,
+#     BLOCK_M: gl.constexpr,
+#     K_GROUPS: gl.constexpr,
+#     a_scale_layout: gl.constexpr,
+# ):
+#     m_block_idx = tile_m * (BLOCK_M // 32) + gl.arange(0, BLOCK_M // 32, layout=gl.SliceLayout(1, a_scale_layout))
+#     k_scale_idx = gl.arange(0, K_GROUPS * 32, layout=gl.SliceLayout(0, a_scale_layout))
+#     return m_block_idx[:, None] * stride_as_m + k_scale_idx[None, :] * stride_as_k
 
 
 @gluon.jit
@@ -123,19 +123,19 @@ def unshuffle_a_scales(
         .reshape(BLOCK_M, K_GROUPS)
     )
 
-# Local offsets for B preshuf; use with ptr = b_base + k_tile * BLOCK_K_BYTES * 16 * stride_b_kshuf
-@gluon.jit
-def b_preshuf_raw_offsets_local(
-    tile_n,
-    stride_b_n16,
-    stride_b_kshuf,
-    BLOCK_N: gl.constexpr,
-    BLOCK_K_BYTES: gl.constexpr,
-    blocked_kn: gl.constexpr,
-):
-    n16_idx = tile_n * (BLOCK_N // 16) + gl.arange(0, BLOCK_N // 16, layout=gl.SliceLayout(1, blocked_kn))
-    kshuf_idx = gl.arange(0, BLOCK_K_BYTES * 16, layout=gl.SliceLayout(0, blocked_kn))
-    return n16_idx[:, None] * stride_b_n16 + kshuf_idx[None, :] * stride_b_kshuf
+# # Local offsets for B preshuf; use with ptr = b_base + k_tile * BLOCK_K_BYTES * 16 * stride_b_kshuf
+# @gluon.jit
+# def b_preshuf_raw_offsets_local(
+#     tile_n,
+#     stride_b_n16,
+#     stride_b_kshuf,
+#     BLOCK_N: gl.constexpr,
+#     BLOCK_K_BYTES: gl.constexpr,
+#     blocked_kn: gl.constexpr,
+# ):
+#     n16_idx = tile_n * (BLOCK_N // 16) + gl.arange(0, BLOCK_N // 16, layout=gl.SliceLayout(1, blocked_kn))
+#     kshuf_idx = gl.arange(0, BLOCK_K_BYTES * 16, layout=gl.SliceLayout(0, blocked_kn))
+#     return n16_idx[:, None] * stride_b_n16 + kshuf_idx[None, :] * stride_b_kshuf
 
 
 @gluon.jit
@@ -154,20 +154,20 @@ def depreshuffle_b_raw_to_kn(
     )
 
 
-# Offsets for B scales in *shuffled* layout: tensor is (N//32, K_groups*32).
-# Load (BLOCK_N//32, K_GROUPS*32) then unshuffle to (BLOCK_N, K_GROUPS).
-@gluon.jit
-def b_scale_offsets_local_shuffled(
-    tile_n,
-    stride_bs_n,
-    stride_bs_k,
-    BLOCK_N: gl.constexpr,
-    K_GROUPS: gl.constexpr,
-    b_scale_layout: gl.constexpr,
-):
-    n_block_idx = tile_n * (BLOCK_N // 32) + gl.arange(0, BLOCK_N // 32, layout=gl.SliceLayout(1, b_scale_layout))
-    k_scale_idx = gl.arange(0, K_GROUPS * 32, layout=gl.SliceLayout(0, b_scale_layout))
-    return n_block_idx[:, None] * stride_bs_n + k_scale_idx[None, :] * stride_bs_k
+# # Offsets for B scales in *shuffled* layout: tensor is (N//32, K_groups*32).
+# # Load (BLOCK_N//32, K_GROUPS*32) then unshuffle to (BLOCK_N, K_GROUPS).
+# @gluon.jit
+# def b_scale_offsets_local_shuffled(
+#     tile_n,
+#     stride_bs_n,
+#     stride_bs_k,
+#     BLOCK_N: gl.constexpr,
+#     K_GROUPS: gl.constexpr,
+#     b_scale_layout: gl.constexpr,
+# ):
+#     n_block_idx = tile_n * (BLOCK_N // 32) + gl.arange(0, BLOCK_N // 32, layout=gl.SliceLayout(1, b_scale_layout))
+#     k_scale_idx = gl.arange(0, K_GROUPS * 32, layout=gl.SliceLayout(0, b_scale_layout))
+#     return n_block_idx[:, None] * stride_bs_n + k_scale_idx[None, :] * stride_bs_k
 
 
 @gluon.jit
@@ -295,8 +295,20 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
     )
     smem_B = gl.allocate_shared_memory(
         b_preshuf_ptr.type.element_ty,
-        [NUM_BUFFERS, BLOCK_K_BYTES, BLOCK_N],
+        [NUM_BUFFERS, BLOCK_N // 16, BLOCK_K_BYTES * 16],
+        # [NUM_BUFFERS, BLOCK_K_BYTES, BLOCK_N],
         layout=shared_B,
+    )
+    # scales: raw shuffled blocks into LDS via TDM, then unshuffle and re-store into LDS for layouted loads
+    smem_ASraw = gl.allocate_shared_memory(
+        a_scale_ptr.type.element_ty,
+        [NUM_BUFFERS, BLOCK_M // 32, K_GROUPS * 32],
+        layout=shared_S,
+    )
+    smem_BSraw = gl.allocate_shared_memory(
+        b_scale_ptr.type.element_ty,
+        [NUM_BUFFERS, BLOCK_N // 32, K_GROUPS * 32],
+        layout=shared_S,
     )
     smem_AS = gl.allocate_shared_memory(
         a_scale_ptr.type.element_ty,
@@ -311,49 +323,94 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
 
     # Base pointers for this split-K slice; advance by k_tile each iteration
     split_k0_groups = split_k_id * (SPLITK_BLOCK // 32)
-    a_base = a_fp4_ptr + split_k0_bytes * stride_a_kbytes
-    # Shuffled A scales layout is (M//32, K_groups*32); second dim in element units
-    as_base = a_scale_ptr + (split_k0_groups * 32) * stride_as_k
-    b_base = b_preshuf_ptr + (split_k0_bytes * 16) * stride_b_kshuf
-    # Shuffled B scales layout is (N//32, K_groups*32); second dim in element units
-    bs_base = b_scale_ptr + (split_k0_groups * 32) * stride_bs_k
+    K_groups_total = K_elems // 32
 
-    # Offsets computed once (local to current k-block); used with ptr = base + k_tile * step
-    offs_a = a_tile_offsets_local(
-        tile_m,
-        stride_a_m,
-        stride_a_kbytes,
-        BLOCK_M=BLOCK_M,
-        BLOCK_K_BYTES=BLOCK_K_BYTES,
-        blocked_mk=blocked_mk,
+    # a_base = a_fp4_ptr + split_k0_bytes * stride_a_kbytes
+    # # Shuffled A scales layout is (M//32, K_groups*32); second dim in element units
+    # as_base = a_scale_ptr + (split_k0_groups * 32) * stride_as_k
+    # b_base = b_preshuf_ptr + (split_k0_bytes * 16) * stride_b_kshuf
+    # # Shuffled B scales layout is (N//32, K_groups*32); second dim in element units
+    # bs_base = b_scale_ptr + (split_k0_groups * 32) * stride_bs_k
+
+    # # Offsets computed once (local to current k-block); used with ptr = base + k_tile * step
+    # offs_a = a_tile_offsets_local(
+    #     tile_m,
+    #     stride_a_m,
+    #     stride_a_kbytes,
+    #     BLOCK_M=BLOCK_M,
+    #     BLOCK_K_BYTES=BLOCK_K_BYTES,
+    #     blocked_mk=blocked_mk,
+    # )
+    # offs_as = a_scale_offsets_local_shuffled(
+    #     tile_m,
+    #     stride_as_m,
+    #     stride_as_k,
+    #     BLOCK_M=BLOCK_M,
+    #     K_GROUPS=K_GROUPS,
+    #     a_scale_layout=a_scale_layout,
+    # )
+    # offs_b_raw = b_preshuf_raw_offsets_local(
+    #     tile_n,
+    #     stride_b_n16,
+    #     stride_b_kshuf,
+    #     BLOCK_N=BLOCK_N,
+    #     BLOCK_K_BYTES=BLOCK_K_BYTES,
+    #     blocked_kn=blocked_kn,
+    # )
+    # offs_bs = b_scale_offsets_local_shuffled(
+    #     tile_n,
+    #     stride_bs_n,
+    #     stride_bs_k,
+    #     BLOCK_N=BLOCK_N,
+    #     K_GROUPS=K_GROUPS,
+    #     b_scale_layout=b_scale_layout,
+    # )
+
+    # -------------------- TDM descriptors --------------------
+    grid_m = gl.cdiv(M, BLOCK_M) * BLOCK_M
+    a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=a_fp4_ptr,
+        shape=(grid_m, K_bytes),
+        strides=(stride_a_m, stride_a_kbytes),
+        block_shape=(BLOCK_M, BLOCK_K_BYTES),
+        layout=shared_A,
     )
-    offs_as = a_scale_offsets_local_shuffled(
-        tile_m,
-        stride_as_m,
-        stride_as_k,
-        BLOCK_M=BLOCK_M,
-        K_GROUPS=K_GROUPS,
-        a_scale_layout=a_scale_layout,
+
+    grid_n16 = gl.cdiv(N, 16)
+    b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=b_preshuf_ptr,
+        shape=(grid_n16, K_bytes * 16),
+        strides=(stride_b_n16, stride_b_kshuf),
+        block_shape=(BLOCK_N // 16, BLOCK_K_BYTES * 16),
+        layout=shared_B,
     )
-    offs_b_raw = b_preshuf_raw_offsets_local(
-        tile_n,
-        stride_b_n16,
-        stride_b_kshuf,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K_BYTES=BLOCK_K_BYTES,
-        blocked_kn=blocked_kn,
+
+    # shuffled scales are:
+    #   A_scales: (M//32, K_groups_total*32)
+    #   B_scales: (N//32, K_groups_total*32)
+    grid_m32 = gl.cdiv(M, 32)
+    grid_n32 = gl.cdiv(N, 32)
+
+    as_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=a_scale_ptr,
+        shape=(grid_m32, K_groups_total * 32),
+        strides=(stride_as_m, stride_as_k),
+        block_shape=(BLOCK_M // 32, K_GROUPS * 32),
+        layout=shared_S,
     )
-    offs_bs = b_scale_offsets_local_shuffled(
-        tile_n,
-        stride_bs_n,
-        stride_bs_k,
-        BLOCK_N=BLOCK_N,
-        K_GROUPS=K_GROUPS,
-        b_scale_layout=b_scale_layout,
+    bs_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=b_scale_ptr,
+        shape=(grid_n32, K_groups_total * 32),
+        strides=(stride_bs_n, stride_bs_k),
+        block_shape=(BLOCK_N // 32, K_GROUPS * 32),
+        layout=shared_S,
     )
 
     producer = 0
     consumer = 0
+
+    # Each k-tile issues 4 async ops: A, Braw, ASraw, BSraw
+    OUTSTANDING_CAP: gl.constexpr = (NUM_BUFFERS - 1) * 4
 
     # ---- Prologue ---- stage (NUM_BUFFERS - 1) K-tiles into LDS
     for _ in gl.static_range(NUM_BUFFERS - 1):
@@ -361,29 +418,53 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
             slot_p = producer
             k_tile_p = producer
 
-            # Advance global pointers for this k_tile
-            a_ptr = a_base + k_tile_p * BLOCK_K_BYTES * stride_a_kbytes
-            as_ptr = as_base + k_tile_p * (K_GROUPS * 32) * stride_as_k
-            b_ptr = b_base + k_tile_p * (BLOCK_K_BYTES * 16) * stride_b_kshuf
-            bs_ptr = bs_base + k_tile_p * (K_GROUPS * 32) * stride_bs_k
+            # A/B offsets (bytes-domain for A_fp4 and B_preshuf raw)
+            a_offs = [tile_m * BLOCK_M, split_k0_bytes + k_tile_p * BLOCK_K_BYTES]
+            b_offs = [
+                tile_n * (BLOCK_N // 16),
+                (split_k0_bytes + k_tile_p * BLOCK_K_BYTES) * 16,
+            ]
 
-            # HBM to vGPR
-            a_tile = gl.amd.gfx1250.buffer_load(ptr=a_ptr, offsets=offs_a, cache=cache_modifier)
-            a_scales_raw = gl.amd.gfx1250.buffer_load(ptr=as_ptr, offsets=offs_as, cache=cache_modifier)
-            a_scales = unshuffle_a_scales(a_scales_raw, BLOCK_M=BLOCK_M, K_GROUPS=K_GROUPS)
+            # Scale offsets are in groups-domain -> element-domain (groups*32)
+            g0 = split_k0_groups + k_tile_p * K_GROUPS
+            as_offs = [tile_m * (BLOCK_M // 32), g0 * 32]
+            bs_offs = [tile_n * (BLOCK_N // 32), g0 * 32]
 
-            b_raw = gl.amd.gfx1250.buffer_load(ptr=b_ptr, offsets=offs_b_raw, cache=cache_modifier)
-            b_tile = depreshuffle_b_raw_to_kn(b_raw, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BLOCK_K_BYTES=BLOCK_K_BYTES)
-            b_scales_raw = gl.amd.gfx1250.buffer_load(ptr=bs_ptr, offsets=offs_bs, cache=cache_modifier)
-            b_scales = unshuffle_b_scales(b_scales_raw, BLOCK_N=BLOCK_N, K_GROUPS=K_GROUPS)
+            gl.amd.gfx1250.tdm.async_load(a_desc, a_offs, smem_A.index(slot_p), pred=1)
+            gl.amd.gfx1250.tdm.async_load(
+                b_desc, b_offs, smem_B.index(slot_p), pred=1
+            )
+            gl.amd.gfx1250.tdm.async_load(
+                as_desc, as_offs, smem_ASraw.index(slot_p), pred=1
+            )
+            gl.amd.gfx1250.tdm.async_load(
+                bs_desc, bs_offs, smem_BSraw.index(slot_p), pred=1
+            )
 
-            # vGPR to LDS
-            smem_A.index(slot_p).store(a_tile)
-            smem_B.index(slot_p).store(b_tile)
-            smem_AS.index(slot_p).store(a_scales)
-            smem_BS.index(slot_p).store(b_scales)
+            # # Advance global pointers for this k_tile
+            # a_ptr = a_base + k_tile_p * BLOCK_K_BYTES * stride_a_kbytes
+            # as_ptr = as_base + k_tile_p * (K_GROUPS * 32) * stride_as_k
+            # b_ptr = b_base + k_tile_p * (BLOCK_K_BYTES * 16) * stride_b_kshuf
+            # bs_ptr = bs_base + k_tile_p * (K_GROUPS * 32) * stride_bs_k
+
+            # # HBM to vGPR
+            # a_tile = gl.amd.gfx1250.buffer_load(ptr=a_ptr, offsets=offs_a, cache=cache_modifier)
+            # a_scales_raw = gl.amd.gfx1250.buffer_load(ptr=as_ptr, offsets=offs_as, cache=cache_modifier)
+            # a_scales = unshuffle_a_scales(a_scales_raw, BLOCK_M=BLOCK_M, K_GROUPS=K_GROUPS)
+
+            # b_raw = gl.amd.gfx1250.buffer_load(ptr=b_ptr, offsets=offs_b_raw, cache=cache_modifier)
+            # b_tile = depreshuffle_b_raw_to_kn(b_raw, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BLOCK_K_BYTES=BLOCK_K_BYTES)
+            # b_scales_raw = gl.amd.gfx1250.buffer_load(ptr=bs_ptr, offsets=offs_bs, cache=cache_modifier)
+            # b_scales = unshuffle_b_scales(b_scales_raw, BLOCK_N=BLOCK_N, K_GROUPS=K_GROUPS)
+
+            # # vGPR to LDS
+            # smem_A.index(slot_p).store(a_tile)
+            # smem_B.index(slot_p).store(b_tile)
+            # smem_AS.index(slot_p).store(a_scales)
+            # smem_BS.index(slot_p).store(b_scales)
 
         producer += 1
+    gl.amd.gfx1250.tdm.async_wait(OUTSTANDING_CAP)
 
     # accumulator is in vGPR for the whole C tile
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=wmma_acc_layout)
@@ -396,35 +477,56 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
         slot_p = producer % NUM_BUFFERS
         k_tile_p = producer
 
-        a_ptr = a_base + k_tile_p * BLOCK_K_BYTES * stride_a_kbytes
-        as_ptr = as_base + k_tile_p * (K_GROUPS * 32) * stride_as_k
-        b_ptr = b_base + k_tile_p * (BLOCK_K_BYTES * 16) * stride_b_kshuf
-        bs_ptr = bs_base + k_tile_p * (K_GROUPS * 32) * stride_bs_k
+        a_offs = [tile_m * BLOCK_M, split_k0_bytes + k_tile_p * BLOCK_K_BYTES]
+        b_offs = [
+            tile_n * (BLOCK_N // 16),
+            (split_k0_bytes + k_tile_p * BLOCK_K_BYTES) * 16,
+        ]
+        g0 = split_k0_groups + k_tile_p * K_GROUPS
+        as_offs = [tile_m * (BLOCK_M // 32), g0 * 32]
+        bs_offs = [tile_n * (BLOCK_N // 32), g0 * 32]
 
-        a_tile = gl.amd.gfx1250.buffer_load(ptr=a_ptr, offsets=offs_a)
-        a_scales_raw = gl.amd.gfx1250.buffer_load(ptr=as_ptr, offsets=offs_as)
-        a_scales = unshuffle_a_scales(a_scales_raw, BLOCK_M=BLOCK_M, K_GROUPS=K_GROUPS)
-
-        b_raw = gl.amd.gfx1250.buffer_load(ptr=b_ptr, offsets=offs_b_raw)
-        b_tile = depreshuffle_b_raw_to_kn(b_raw, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BLOCK_K_BYTES=BLOCK_K_BYTES)
-        b_scales_raw = gl.amd.gfx1250.buffer_load(ptr=bs_ptr, offsets=offs_bs)
-        b_scales = unshuffle_b_scales(b_scales_raw, BLOCK_N=BLOCK_N, K_GROUPS=K_GROUPS)
-
-        smem_A.index(slot_p).store(a_tile)
-        smem_B.index(slot_p).store(b_tile)
-        smem_AS.index(slot_p).store(a_scales)
-        smem_BS.index(slot_p).store(b_scales)
+        gl.amd.gfx1250.tdm.async_load(a_desc, a_offs, smem_A.index(slot_p), pred=1)
+        gl.amd.gfx1250.tdm.async_load(b_desc, b_offs, smem_B.index(slot_p), pred=1)
+        gl.amd.gfx1250.tdm.async_load(
+            as_desc, as_offs, smem_ASraw.index(slot_p), pred=1
+        )
+        gl.amd.gfx1250.tdm.async_load(
+            bs_desc, bs_offs, smem_BSraw.index(slot_p), pred=1
+        )
 
         producer += 1
 
-        # Consumer
-        # LDS -> vGPR, (TODO: B: HBM -> vGPR)
+        gl.amd.gfx1250.tdm.async_wait(OUTSTANDING_CAP)
+
+        # Consumer: wait for data we’re about to use
+        gl.amd.gfx1250.tdm.async_wait(0)
+        gl.barrier()
+
         slot_c = consumer % NUM_BUFFERS
         # k_tile_c = consumer
 
         # LDS -> vGPR
         A = smem_A.index(slot_c).load(layout=dot_a_layout)
-        B = smem_B.index(slot_c).load(layout=dot_b_layout)
+
+        # B operand (raw in LDS -> depreshuffle -> logical)
+        B_raw = smem_B.index(slot_c).load(layout=shared_B)
+        B = gl.convert_layout(depreshuffle_b_raw_to_kn(
+            B_raw, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BLOCK_K_BYTES=BLOCK_K_BYTES
+        ), layout=dot_b_layout)
+        # scales: raw shuffled -> unshuffle -> store to LDS -> load with wmma scale layouts
+        AS_raw = smem_ASraw.index(slot_c).load(layout=a_scale_layout)
+        BS_raw = smem_BSraw.index(slot_c).load(layout=b_scale_layout)
+
+        smem_AS.index(slot_c).store(
+            unshuffle_a_scales(AS_raw, BLOCK_M=BLOCK_M, K_GROUPS=K_GROUPS)
+        )
+        smem_BS.index(slot_c).store(
+            unshuffle_b_scales(BS_raw, BLOCK_N=BLOCK_N, K_GROUPS=K_GROUPS)
+        )
+
+        gl.barrier()
+
         AS = smem_AS.index(slot_c).load(layout=a_scale_layout)
         BS = smem_BS.index(slot_c).load(layout=b_scale_layout)
 
@@ -441,8 +543,33 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
         if consumer < k_tiles:
             slot_c = consumer % NUM_BUFFERS
 
+            gl.amd.gfx1250.tdm.async_wait(0)
+            gl.barrier()
+
+            slot_c = consumer % NUM_BUFFERS
+
             A = smem_A.index(slot_c).load(layout=dot_a_layout)
-            B = smem_B.index(slot_c).load(layout=dot_b_layout)
+
+            B_raw = smem_B.index(slot_c).load(layout=shared_B)
+            B = gl.convert_layout(
+                depreshuffle_b_raw_to_kn(
+                    B_raw, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BLOCK_K_BYTES=BLOCK_K_BYTES
+                ),
+                layout=dot_b_layout,
+            )
+
+            AS_raw = smem_ASraw.index(slot_c).load(layout=a_scale_layout)
+            BS_raw = smem_BSraw.index(slot_c).load(layout=b_scale_layout)
+
+            smem_AS.index(slot_c).store(
+                unshuffle_a_scales(AS_raw, BLOCK_M=BLOCK_M, K_GROUPS=K_GROUPS)
+            )
+            smem_BS.index(slot_c).store(
+                unshuffle_b_scales(BS_raw, BLOCK_N=BLOCK_N, K_GROUPS=K_GROUPS)
+            )
+
+            gl.barrier()
+
             AS = smem_AS.index(slot_c).load(layout=a_scale_layout)
             BS = smem_BS.index(slot_c).load(layout=b_scale_layout)
 
