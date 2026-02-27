@@ -112,14 +112,28 @@ __device__ constexpr T wave_reduce(T local, F reduce_op)
 
     if constexpr(WarpSize > 16)
     {
+// DPP broadcasts (0x142, 0x143) are not supported on GFX10+ (gfx12 included)
+// Use ds_bpermute instead for cross-lane communication
+#if defined(__gfx12__)
+        // Use shuffle for gfx12 instead of DPP broadcast
+        T v_remote = rocprim::warp_shuffle(local, 15, WarpSize);
+        local      = reduce_op(v_remote, local);
+#else
         // row_bcast:15
         local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x142>(local), local);
+#endif
     }
 
     if constexpr(WarpSize > 32)
     {
+#if defined(__gfx12__)
+        // Use shuffle for gfx12 instead of DPP broadcast
+        T v_remote = rocprim::warp_shuffle(local, 31, WarpSize);
+        local      = reduce_op(v_remote, local);
+#else
         // row_bcast:31
         local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x143>(local), local);
+#endif
     }
 
     if constexpr(threadBroadcast && WarpSize > 4)
@@ -151,14 +165,25 @@ __device__ constexpr T multithread_reduce(T data, F reduce_op, int thread_num)
     {
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0xb1>(data), data);
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x4e>(data), data);
+#if defined(__gfx12__)
+        // DPP broadcast 0x141 not supported on gfx12, use shuffle
+        data = reduce_op(rocprim::warp_shuffle(data, 7, WarpSize), data);
+#else
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x141>(data), data);
+#endif
     }
     else if(thread_num == 16)
     {
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0xb1>(data), data);
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x4e>(data), data);
+#if defined(__gfx12__)
+        // DPP broadcasts not supported on gfx12, use shuffle
+        data = reduce_op(rocprim::warp_shuffle(data, 7, WarpSize), data);
+        data = reduce_op(rocprim::warp_shuffle(data, 3, WarpSize), data);
+#else
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x141>(data), data);
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x140>(data), data);
+#endif
     }
     else if(thread_num == 32)
     {
@@ -166,7 +191,12 @@ __device__ constexpr T multithread_reduce(T data, F reduce_op, int thread_num)
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x4e>(data), data);
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x124>(data), data);
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x128>(data), data);
+#if defined(__gfx12__)
+        // DPP broadcast 0x142 not supported on gfx12, use shuffle
+        data = reduce_op(rocprim::warp_shuffle(data, 15, WarpSize), data);
+#else
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x142, 0xa>(data), data);
+#endif
         if constexpr(threadBroadcast)
         {
             data = rocprim::warp_shuffle(data, thread_num - 1, thread_num);
@@ -179,8 +209,14 @@ __device__ constexpr T multithread_reduce(T data, F reduce_op, int thread_num)
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x4e>(data), data);
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x124>(data), data);
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x128>(data), data);
+#if defined(__gfx12__)
+        // DPP broadcasts not supported on gfx12, use shuffle
+        data = reduce_op(rocprim::warp_shuffle(data, 15, WarpSize), data);
+        data = reduce_op(rocprim::warp_shuffle(data, 31, WarpSize), data);
+#else
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x142>(data), data);
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x143>(data), data);
+#endif
         if constexpr(threadBroadcast)
         {
             data = rocprim::warp_shuffle(data, thread_num - 1, thread_num);

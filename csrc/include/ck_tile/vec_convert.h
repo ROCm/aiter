@@ -43,6 +43,13 @@ CK_TILE_DEVICE fp32x2_v amd_assembly_pk_mul_f32(fp32x2_v a, fp32x2_t b)
     asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(c) : "v"(a), "v"(b));
     return c;
 }
+// use scalar math for RDNA4/3 without v_pk_mul_f32
+CK_TILE_DEVICE fp32x2_v amd_scalar_mul_f32(fp32x2_v a, fp32x2_t b){
+    fp32x2_v c;
+    c[0] = a[0] * b[0];
+    c[1] = a[1] * b[1];
+    return c;
+}
 CK_TILE_DEVICE fp8x2_v amd_assembly_cvt_pk_fp8_f32(fp32_t a, fp32_t b)
 {
     int16x2_t c;
@@ -145,7 +152,12 @@ CK_TILE_HOST_DEVICE constexpr fp8x2_v fp32x2_t_to_fp8x2_t(fp32x2_v x, fp32_t inv
     using vec_ti             = vector_traits<fp32x2_v>;
     constexpr int vec_size   = vec_ti::vector_size;
     constexpr auto interpret = numeric_traits<fp8_t>::f8_interpret;
-    fp32x2_v tmp             = amd_assembly_pk_mul_f32(x, fp32x2_t{inverted_scale, inverted_scale});
+    fp32x2_v tmp;
+#if defined(__gfx11__) || defined(__gfx12__)
+    tmp = amd_scalar_mul_f32(x, fp32x2_t{inverted_scale, inverted_scale});
+#else
+    tmp = amd_assembly_pk_mul_f32(x, fp32x2_t{inverted_scale, inverted_scale});
+#endif
 
     return (interpret == fp8_interpretation::E4M3_FNUZ) ||
                    (interpret == fp8_interpretation::E4M3_OCP)
@@ -155,7 +167,12 @@ CK_TILE_HOST_DEVICE constexpr fp8x2_v fp32x2_t_to_fp8x2_t(fp32x2_v x, fp32_t inv
 // fp32x2 -> int8x2
 CK_TILE_HOST_DEVICE constexpr int8x2_v fp32x2_t_to_int8x2_t(fp32x2_v x, fp32_t inverted_scale)
 {
-    fp32x2_v tmp = amd_assembly_pk_mul_f32(x, fp32x2_t{inverted_scale, inverted_scale});
+    fp32x2_v tmp;
+#if defined(__gfx11__) || defined(__gfx12__)
+    tmp = amd_scalar_mul_f32(x, fp32x2_t{inverted_scale, inverted_scale});
+#else
+    tmp = amd_assembly_pk_mul_f32(x, fp32x2_t{inverted_scale, inverted_scale});
+#endif
 
     int8x2_v out;
     out[0] = static_cast<int8_t>(tmp[0]);

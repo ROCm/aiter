@@ -1382,7 +1382,8 @@ struct gmem {
     template<index_t vec = 1, index_t aux = 0>   // os in unit of byte
     OPUS_D void _async_load(OPUS_LDS_ADDR void* dst, int v_os, int s_os = 0, number<aux> = {}) {
         using type = vector_type<vec>;
-#if __clang_major__ >= 20   // start from rocm 7.0,introduced by https://github.com/llvm/llvm-project/pull/132048, 133055, 132957
+// gfx12 (RDNA4) and gfx11(RDNA3 & 3.5) doesn't support vmem-to-lds-load-insts, so use old code path, refer to https://github.com/llvm/llvm-project/pull/132048, 
+#if __clang_major__ >= 20 && !defined(__gfx12__) && !defined(__gfx11__)  // start from rocm 7.0,introduced by https://github.com/llvm/llvm-project/pull/132048, 133055, 132957
         if      constexpr (sizeof(type) == 1)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  1, v_os, s_os, 0, aux); }
         else if constexpr (sizeof(type) == 2)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  2, v_os, s_os, 0, aux); }
         else if constexpr (sizeof(type) == 4)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  4, v_os, s_os, 0, aux); }
@@ -1390,15 +1391,40 @@ struct gmem {
         else if constexpr (sizeof(type) == 12) { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst, 12, v_os, s_os, 0, aux); }
         else if constexpr (sizeof(type) == 16) { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst, 16, v_os, s_os, 0, aux); }
 #endif
-#else
+#elif !defined(__gfx12__)
         i32x4_t cached_rsrc_;
         __builtin_memcpy(&cached_rsrc_, &cached_rsrc, sizeof(i32x4_t));   // builtin memcpy, __builtin_bit_cast() can not use here due to __amdgpu_buffer_rsrc_t is non copyable
-        if      constexpr (sizeof(type) == 1)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  1, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 2)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  2, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 4)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  4, v_os, s_os, 0, aux); }
+        if      constexpr (sizeof(type) == 1)  {ck_tile::llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  1, v_os, s_os, 0, aux); }
+        else if constexpr (sizeof(type) == 2)  {ck_tile::llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  2, v_os, s_os, 0, aux); }
+        else if constexpr (sizeof(type) == 4)  {ck_tile::llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  4, v_os, s_os, 0, aux); }
 #if  defined(__gfx950__)
-        else if constexpr (sizeof(type) == 12) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst), 12, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 16) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst), 16, v_os, s_os, 0, aux); }
+        else if constexpr (sizeof(type) == 12) {ck_tile::llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst), 12, v_os, s_os, 0, aux); }
+        else if constexpr (sizeof(type) == 16) {ck_tile::llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst), 16, v_os, s_os, 0, aux); }
+#endif
+#else
+        // gfx12: raw buffer load to LDS not supported, use VGPR load then LDS store
+        // Load from buffer to VGPR first, then write to LDS
+        if      constexpr (sizeof(type) == 1)  { 
+            type tmp = load<vec>(v_os, s_os, number<aux>{});
+            *reinterpret_cast<OPUS_LDS_ADDR type*>(dst) = tmp;
+        }
+        else if constexpr (sizeof(type) == 2)  { 
+            type tmp = load<vec>(v_os, s_os, number<aux>{});
+            *reinterpret_cast<OPUS_LDS_ADDR type*>(dst) = tmp;
+        }
+        else if constexpr (sizeof(type) == 4)  { 
+            type tmp = load<vec>(v_os, s_os, number<aux>{});
+            *reinterpret_cast<OPUS_LDS_ADDR type*>(dst) = tmp;
+        }
+#if  defined(__gfx950__)
+        else if constexpr (sizeof(type) == 12) { 
+            type tmp = load<vec>(v_os, s_os, number<aux>{});
+            *reinterpret_cast<OPUS_LDS_ADDR type*>(dst) = tmp;
+        }
+        else if constexpr (sizeof(type) == 16) { 
+            type tmp = load<vec>(v_os, s_os, number<aux>{});
+            *reinterpret_cast<OPUS_LDS_ADDR type*>(dst) = tmp;
+        }
 #endif
 #endif
     }
