@@ -10,7 +10,14 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter import ActivationType, QuantType, dtypes, get_hip_quant, logger, pertoken_quant
+from aiter import (
+    ActivationType,
+    QuantType,
+    dtypes,
+    get_hip_quant,
+    logger,
+    pertoken_quant,
+)
 from aiter.fused_moe import fused_moe
 
 BLOCK_SIZE_M = 32
@@ -693,6 +700,7 @@ def asm_moe(
             inter_dim,
         )
     elif block_shape is not None:
+        # a:fp8
         _run_asm_moe_block_scale(
             moe_buf,
             hidden_states,
@@ -711,7 +719,7 @@ def asm_moe(
             model_dim,
         )
     else:
-        # a8 w8/4
+        # a:int8 w8/4
         return _run_asm_moe_int8(
             hidden_states,
             w1,
