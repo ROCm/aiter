@@ -19,6 +19,7 @@ struct MlaMetadataV12Traits
     static constexpr int32_t kUniSeqlenQo  = kUniSeqlenQo_;
     static constexpr int32_t kIsSparse     = kIsSparse_;
     static constexpr int32_t kLdsBatchInfo = kLdsBatchInfo_;
+    static constexpr int32_t kTailDoneThreshold = 4;
 };
 
 template <typename Traits>
@@ -180,7 +181,8 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                         work_info.kv_end = ck_tile::min(
                             work_info.kv_start + (remain_kv_blocks * params.kv_granularity),
                             curr_kv_end - batch_tail);
-                        if ((curr_kv_end - work_info.kv_end < 4 && curr_kv_end - work_info.kv_end > 0) || cur_tail_done)
+                        if ((curr_kv_end - work_info.kv_end < Traits::kTailDoneThreshold &&
+                            curr_kv_end - work_info.kv_end > 0) || cur_tail_done)
                         {
                             work_info.kv_end = curr_kv_end;
                         }
@@ -319,7 +321,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                             work_info.kv_end = ck_tile::min(
                                 work_info.kv_start + (consuming_blks * params.kv_granularity),
                                 curr_kv_end - batch_tail);
-                            if (curr_kv_end - work_info.kv_end < 4)
+                            if (curr_kv_end - work_info.kv_end < Traits::kTailDoneThreshold)
                             {
                                 cur_tail_done = true;
                                 work_info.kv_end = curr_kv_end;
