@@ -300,11 +300,11 @@ def parse_args(args: list[str] | None = None):
 
 
 def main(args: list[str] | None = None) -> None:
-    args = parse_args(args=args)
+    parsed_args = parse_args(args=args)
 
-    dim1, dim2 = args.shape
-    total_experts, active_experts = args.experts
-    if args.M is None:
+    dim1, dim2 = parsed_args.shape
+    total_experts, active_experts = parsed_args.experts
+    if parsed_args.M is None:
         batch_ranges_moe = [
             (1, 2, 1),
             (2, 5, 2),
@@ -316,7 +316,7 @@ def main(args: list[str] | None = None) -> None:
         ]
         batch_sizes_moe = list(chain(*[range(*r) for r in batch_ranges_moe]))
     else:
-        batch_sizes_moe = args.M
+        batch_sizes_moe = parsed_args.M
     quantized_dtypes = ["mx4", "mx4"]
 
     roofline_mlp(
@@ -328,8 +328,8 @@ def main(args: list[str] | None = None) -> None:
         quantized_dtypes[0],
         quantized_dtypes[1],
         TP=1,
-        op_regex=args.op_regex,
-        num_weight_inits=args.num_weight_inits,
+        op_regex=parsed_args.op_regex,
+        num_weight_inits=parsed_args.num_weight_inits,
         name="gpt-oss-x2",
     )
 

@@ -156,14 +156,14 @@ def main(args: list[str] | None = None) -> None:
         print("MXFP4 is not available on this architecture")
         sys.exit()
 
-    args, defaults = parse_args(args=args)
-    if args.print_vgpr:
+    parsed_args, defaults = parse_args(args=args)
+    if parsed_args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args, defaults)  # noqa: E731
+        fun = lambda: run_benchmark(parsed_args, defaults)  # noqa: E731
         print_vgpr(fun, get_caller_name_no_ext())
-        return 0
-    run_benchmark(args, defaults)
+        return
+    run_benchmark(parsed_args, defaults)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

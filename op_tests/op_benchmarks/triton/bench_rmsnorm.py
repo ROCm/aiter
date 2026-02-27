@@ -1,5 +1,4 @@
 import argparse
-import sys
 import torch
 import triton
 from aiter.ops.triton.normalization.rmsnorm import rms_norm
@@ -165,14 +164,14 @@ def parse_args(args: list[str] | None = None):
 
 
 def main(args: list[str] | None = None) -> None:
-    args = parse_args(args=args)
-    if args.print_vgpr:
+    parsed_args = parse_args(args=args)
+    if parsed_args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args)  # noqa: E731
+        fun = lambda: run_benchmark(parsed_args)  # noqa: E731
         print_vgpr(fun, get_caller_name_no_ext())
-        return 0
-    run_benchmark(args)
+        return
+    run_benchmark(parsed_args)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

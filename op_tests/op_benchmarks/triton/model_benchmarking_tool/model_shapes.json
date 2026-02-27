@@ -54,9 +54,9 @@
                 "num_heads": 128,
                 "num_kv_heads": 8,
                 "head_dim": 128,
-                "two_inputs": true,
-                "positions": true,
-                "style": "neox"
+                "two_inputs": "true",
+                "positions": "true",
+                "rotate_style": "neox"
             }
         ]
     },
@@ -115,9 +115,9 @@
                 "num_heads": 64,
                 "num_kv_heads": 8,
                 "head_dim": 128,
-                "two_inputs": true,
-                "positions": true,
-                "style": "neox"
+                "two_inputs": "true",
+                "positions": "true",
+                "rotate_style": "neox"
             }
         ]
     },
@@ -176,9 +176,9 @@
                 "num_heads": 32,
                 "num_kv_heads": 8,
                 "head_dim": 128,
-                "two_inputs": true,
-                "positions": true,
-                "style": "neox"
+                "two_inputs": "true",
+                "positions": "true",
+                "rotate_style": "neox"
             }
         ]
     },
@@ -218,9 +218,9 @@
                 "num_heads": 64,
                 "num_kv_heads": 8,
                 "head_dim": 64,
-                "two_inputs": true,
-                "positions": true,
-                "style": "neox"
+                "two_inputs": "true",
+                "positions": "true",
+                "rotate_style": "neox"
             }
         ]
     },
@@ -376,17 +376,17 @@
                 "num_heads": 128,
                 "num_kv_heads": 128,
                 "head_dim": 64,
-                "two_inputs": true,
-                "positions": true,
-                "style": "gptj"
+                "two_inputs": "true",
+                "positions": "true",
+                "rotate_style": "gptj"
             },
             {
                 "num_heads": 128,
                 "num_kv_heads": 1,
                 "head_dim": 64,
-                "two_inputs": true,
-                "positions": true,
-                "style": "gptj"
+                "two_inputs": "true",
+                "positions": "true",
+                "rotate_style": "gptj"
             }
         ]
     },
@@ -448,9 +448,9 @@
                 "num_heads": 40,
                 "num_kv_heads": 8,
                 "head_dim": 128,
-                "two_inputs": true,
-                "positions": true,
-                "style": "neox"
+                "two_inputs": "true",
+                "positions": "true",
+                "rotate_style": "neox"
             }
         ]
     },
@@ -495,9 +495,9 @@
                 "num_heads": 64,
                 "num_kv_heads": 4,
                 "head_dim": 128,
-                "two_inputs": true,
-                "positions": true,
-                "style": "neox"
+                "two_inputs": "true",
+                "positions": "true",
+                "rotate_style": "neox"
             }
         ]
     }

@@ -1,5 +1,4 @@
 import argparse
-import sys
 import torch
 from triton.testing import runtime
 from aiter.ops.triton.rope.rope import RotateStyle
@@ -608,9 +607,9 @@ def parse_args(args: list[str] | None = None):
 
 
 def main(args: list[str] | None = None) -> None:
-    args = parse_args(args=args)
-    run_benchmark(args)
+    parsed_args = parse_args(args=args)
+    run_benchmark(parsed_args)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
