@@ -9,8 +9,6 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8 import (
     _gemm_a8w8_reduce_kernel,
     _get_config,
 )
-from aiter.ops.triton.utils.device_info import get_num_xcds
-
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -32,8 +30,8 @@ def gemm_a8w8(
     INT8 inputs are scaled back to higher precision using per-tensor scale factors.
 
     Args:
-        x (torch.Tensor): INT8 input matrix with shape (M, K).
-        w (torch.Tensor): INT8 weight matrix with shape (N, K), internally transposed.
+        x (torch.Tensor): Input matrix with shape (M, K).
+        w (torch.Tensor): Weight matrix with shape (N, K), internally transposed.
         x_scale (torch.Tensor): Scale factor for x with shape (M, 1) or (M,).
         w_scale (torch.Tensor): Scale factor for w with shape (1, N) or (N,).
         bias (Optional[torch.Tensor]): Bias vector with shape (N,).
@@ -75,8 +73,6 @@ def gemm_a8w8(
     else:
         y_pp = None
 
-    config.pop("cache_modifier", None)
-
     grid = lambda META: (  # noqa: E731
         (
             META["NUM_KSPLIT"]
@@ -103,7 +99,6 @@ def gemm_a8w8(
         y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
         y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
         (bias is not None) and (config["NUM_KSPLIT"] == 1),
-        NUM_XCDS=get_num_xcds(),
         **config,
     )
 
