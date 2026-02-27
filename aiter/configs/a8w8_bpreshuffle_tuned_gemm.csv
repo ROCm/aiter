@@ -699,7 +699,8 @@ cu_num,M,N,K,q_dtype_w,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
 80,4096,1280,8192,torch.int8,asm,161,1,251.3328,_ZN5aiter42I8gemm_bf16_perTokenI8_BpreShuffle_192x128E,341.78,216.95,0.0021
 80,8192,1280,8192,torch.int8,asm,161,1,496.6916,_ZN5aiter42I8gemm_bf16_perTokenI8_BpreShuffle_192x128E,345.89,198.45,0.0016
 80,16384,1280,8192,torch.int8,asm,161,1,906.8273,_ZN5aiter42I8gemm_bf16_perTokenI8_BpreShuffle_192x128E,378.9,205.82,0.0021
-80,192,8192,5120,torch.int8,asm,161,1,60.0426,_ZN5aiter42I8gemm_bf16_perTokenI8_BpreShuffle_192x128E,268.25,767.32,0.0026304,64,1536,5120,torch.int8,asm,0,1,16.7759,_ZN5aiter41I8gemm_bf16_perTokenI8_BpreShuffle_16x128E,60.0,500.04,0.0
+80,192,8192,5120,torch.int8,asm,161,1,60.0426,_ZN5aiter42I8gemm_bf16_perTokenI8_BpreShuffle_192x128E,268.25,767.32,0.0026
+304,64,1536,5120,torch.int8,asm,0,1,16.7759,_ZN5aiter41I8gemm_bf16_perTokenI8_BpreShuffle_16x128E,60.0,500.04,0.0
 304,128,1536,5120,torch.int8,asm,0,1,17.9602,_ZN5aiter41I8gemm_bf16_perTokenI8_BpreShuffle_16x128E,112.1,496.26,0.0
 304,256,1536,5120,torch.int8,asm,0,1,17.6791,_ZN5aiter41I8gemm_bf16_perTokenI8_BpreShuffle_16x128E,227.76,563.46,0.0
 304,512,1536,5120,torch.int8,asm,1,1,18.7067,_ZN5aiter41I8gemm_bf16_perTokenI8_BpreShuffle_32x128E,430.49,644.62,0.0
