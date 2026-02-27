@@ -37,10 +37,16 @@ def get_occupancy():
     return 2
 
 
-def get_recommended_splits(num_sequences, num_kv_heads):
+def get_recommended_splits(
+    num_sequences, num_kv_heads, block_size, context_partition_size
+):
     props = torch.cuda.get_device_properties()
     num_sm = props.multi_processor_count * get_occupancy()
-    max_context_partition_num = triton.cdiv(num_sm, num_sequences * num_kv_heads)
+    split_blocks = triton.cdiv(block_size, context_partition_size)
+    max_context_partition_num = triton.cdiv(
+        num_sm, num_sequences * num_kv_heads * split_blocks
+    )
+    max_context_partition_num *= split_blocks
     return min(max_context_partition_num, 8)
 
 
@@ -793,7 +799,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
 #     cache_results=True,
 # )
 @gluon.jit
-def paged_attention_decode_sliding_window_mtp(
+def paged_attention_decode_sliding_window_head_1(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
     max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
     output_ptr,  # [batch_size, query_length, num_kv_heads, query_group_size, head_size]
@@ -903,7 +909,7 @@ def paged_attention_decode_sliding_window_mtp(
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
     sequence_idx = gl.program_id(0)
     mtp_idx = gl.program_id(1)
-    sequence_split_idx = gl.program_id(2)
+    split_idx = gl.program_id(2)
 
     # ==================== CONSTANTS AND CONFIGURATION ====================
     if COMPUTE_TYPE.is_fp8():
@@ -936,6 +942,8 @@ def paged_attention_decode_sliding_window_mtp(
     CONTEXT_PARTITION_SIZE_PER_BLOCK: gl.constexpr = triton.cdiv(
         KV_BLOCK_SIZE, CONTEXT_PARTITION_SIZE
     )
+    sequence_split_idx = split_idx // CONTEXT_PARTITION_SIZE_PER_BLOCK
+    block_split_idx = split_idx % CONTEXT_PARTITION_SIZE_PER_BLOCK
     # ==================== MEMORY LAYOUT DEFINITIONS ====================
     # Query tensor layout - optimized for sequential access (2D)
     shared_query_layout: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, order=[1, 0])
@@ -1179,7 +1187,9 @@ def paged_attention_decode_sliding_window_mtp(
             0, sequence_start_idx // CONTEXT_PARTITION_SIZE
         )
     else:
-        page_size = gl.cdiv(context_length, gl.num_programs(2))
+        page_size = gl.cdiv(
+            context_length, gl.num_programs(2) // CONTEXT_PARTITION_SIZE_PER_BLOCK
+        )
         sequence_start_idx = page_size * sequence_split_idx
 
         sequence_end_idx = gl.minimum(
@@ -1212,14 +1222,14 @@ def paged_attention_decode_sliding_window_mtp(
     else:
         output_offsets = sequence_idx * stride_output_bs
         output_offsets += (
-            sequence_split_idx * stride_output_kv_head
+            split_idx * stride_output_kv_head
             + output_group_offsets[:, None] * stride_output_group_size
             + output_head_size_offsets[None, :]
         )
 
         max_logits_offsets = (
             sequence_idx * stride_max_logits_seq
-            + sequence_split_idx * stride_max_logits_part
+            + split_idx * stride_max_logits_part
             + max_logits_base_offsets
         )
     qk_row_mask = gl.convert_layout(
@@ -1326,10 +1336,7 @@ def paged_attention_decode_sliding_window_mtp(
         query_tensor = query_tensor.to(COMPUTE_TYPE)
 
     query_shared.store(query_tensor)
-
-    page_offset = (
-        kv_block_start_idx % CONTEXT_PARTITION_SIZE_PER_BLOCK
-    ) * CONTEXT_PARTITION_SIZE
+    page_offset = block_split_idx * CONTEXT_PARTITION_SIZE
 
     kv_block_numbers = kv_block_numbers.to(gl.int64)
     key_block_offsets = (
@@ -1343,11 +1350,16 @@ def paged_attention_decode_sliding_window_mtp(
     key_tensor = gl.load(key_cache_ptr + key_block_offsets)
     query_converted = query_shared.load(qk_lhs_operand_layout)
     for sequence_partition_idx in range(
-        sequence_partition_start_idx, sequence_partition_end_idx
+        sequence_partition_start_idx,
+        sequence_partition_end_idx,
+        CONTEXT_PARTITION_SIZE_PER_BLOCK,
     ):
         # ==================== KEY LOADING AND PROCESSING ====================
         # Calculate key cache offsets and load keys
-        kv_block_start_idx2 = kv_block_start_idx + MAX_NUM_KV_BLOCKS_PER_COMPUTE
+        kv_block_start_idx2 = (
+            kv_block_start_idx
+            + MAX_NUM_KV_BLOCKS_PER_COMPUTE * CONTEXT_PARTITION_SIZE_PER_BLOCK
+        )
         kv_block_numbers2 = gl.amd.cdna3.buffer_load(
             ptr=block_tables_ptr
             + sequence_idx * stride_block_table_seq
@@ -1355,18 +1367,12 @@ def paged_attention_decode_sliding_window_mtp(
             offsets=block_indices,
             mask=block_indices < (max_num_kv_blocks - kv_block_start_idx2),
         )
-
-        page_offset2 = (
-            kv_block_start_idx2 % CONTEXT_PARTITION_SIZE_PER_BLOCK
-        ) * CONTEXT_PARTITION_SIZE
-
-        # kv_block_numbers2_i32 = gl.where(valid_block_mask, kv_block_numbers2_i32, 0)
         kv_block_numbers2 = kv_block_numbers2.to(gl.int64)
         key_block_offsets2 = (
             kv_block_numbers2[:, None, None, None] * stride_key_block
             + head_size_split_offsets[None, :, None, None] * stride_key_head_split
             # Use runtime stride for KV block element (may be padded for large blocks).
-            + (page_offset2 + block_element_offsets)[None, None, :, None]
+            + (page_offset + block_element_offsets)[None, None, :, None]
             * stride_key_block_elem
             + contiguous_kv_element_offsets[None, None, None, :]
         )
@@ -1565,19 +1571,6 @@ def paged_attention_decode_sliding_window_mtp(
         # Update running maximum for numerical stability
         current_max_logits = gl.max(attention_scores, axis=1)
         new_max_logits = gl.maximum(max_logits, current_max_logits)
-        if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE and SLIDING_WINDOW > 0:
-            kv_token_global2 = (
-                kv_block_start_idx2 * KV_COMPUTE_BLOCK_SIZE + block_element_offsets
-            )
-            kv_in_window_mask2 = kv_token_global2 >= sequence_start_idx
-
-            key_tensor2 = gl.load(
-                key_cache_ptr + key_block_offsets2,
-                mask=kv_in_window_mask2[None, None, :, None],
-                other=0.0,
-            )
-        else:
-            key_tensor2 = gl.load(key_cache_ptr + key_block_offsets2)
 
         accumulator_scale = tl.math.exp2((max_logits - new_max_logits) * LOG2_E)
         # Compute attention probabilities
@@ -1630,6 +1623,20 @@ def paged_attention_decode_sliding_window_mtp(
             layout=pv_mfma_layout,
         )
         probs_converted = probs_shared.load(pv_lhs_operand_layout)
+        if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE and SLIDING_WINDOW > 0:
+            kv_token_global2 = (
+                kv_block_start_idx2 * KV_COMPUTE_BLOCK_SIZE + block_element_offsets
+            )
+            kv_in_window_mask2 = kv_token_global2 >= sequence_start_idx
+
+            key_tensor2 = gl.load(
+                key_cache_ptr + key_block_offsets2,
+                mask=kv_in_window_mask2[None, None, :, None],
+                other=0.0,
+            )
+        else:
+            key_tensor2 = gl.load(key_cache_ptr + key_block_offsets2)
+
         attention_output = gl.amd.cdna3.mfma(
             probs_converted, values_converted, pv_accumulator
         )
@@ -1638,11 +1645,13 @@ def paged_attention_decode_sliding_window_mtp(
         else:
             attention_accumulator += attention_output
         max_logits = new_max_logits
-        if sequence_partition_idx + 1 < sequence_partition_end_idx:
+        if (
+            sequence_partition_idx + CONTEXT_PARTITION_SIZE_PER_BLOCK
+            < sequence_partition_end_idx
+        ):
             kv_block_numbers = kv_block_numbers2
             key_tensor = key_tensor2
             kv_block_start_idx = kv_block_start_idx2
-            page_offset = page_offset2
 
     # ==================== SINKS HANDLING ====================
     # Add sinks contribution to exp_sums (does not contribute to attention output)
@@ -2536,19 +2545,6 @@ def paged_attention_decode_sliding_window(
         # Update running maximum for numerical stability
         current_max_logits = gl.max(attention_scores, axis=1)
         new_max_logits = gl.maximum(max_logits, current_max_logits)
-        if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE and SLIDING_WINDOW > 0:
-            kv_token_global2 = (
-                kv_block_start_idx2 * KV_COMPUTE_BLOCK_SIZE + block_element_offsets
-            )
-            kv_in_window_mask2 = kv_token_global2 >= sequence_start_idx
-
-            key_tensor2 = gl.load(
-                key_cache_ptr + key_block_offsets2,
-                mask=kv_in_window_mask2[None, None, :, None],
-                other=0.0,
-            )
-        else:
-            key_tensor2 = gl.load(key_cache_ptr + key_block_offsets2)
 
         accumulator_scale = tl.math.exp2((max_logits - new_max_logits) * LOG2_E)
         # Compute attention probabilities
@@ -2601,6 +2597,20 @@ def paged_attention_decode_sliding_window(
             layout=pv_mfma_layout,
         )
         probs_converted = probs_shared.load(pv_lhs_operand_layout)
+        if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE and SLIDING_WINDOW > 0:
+            kv_token_global2 = (
+                kv_block_start_idx2 * KV_COMPUTE_BLOCK_SIZE + block_element_offsets
+            )
+            kv_in_window_mask2 = kv_token_global2 >= sequence_start_idx
+
+            key_tensor2 = gl.load(
+                key_cache_ptr + key_block_offsets2,
+                mask=kv_in_window_mask2[None, None, :, None],
+                other=0.0,
+            )
+        else:
+            key_tensor2 = gl.load(key_cache_ptr + key_block_offsets2)
+
         attention_output = gl.amd.cdna3.mfma(
             probs_converted, values_converted, pv_accumulator
         )
@@ -3957,7 +3967,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     if PS:
         ONE_SHOT = num_splits <= 1
         if num_kv_heads == 1:
-            paged_attention_kernel = paged_attention_decode_sliding_window_mtp
+            paged_attention_kernel = paged_attention_decode_sliding_window_head_1
             grid = (num_sequences, query_seq_len, num_splits)
         else:
             paged_attention_kernel = paged_attention_decode_sliding_window
