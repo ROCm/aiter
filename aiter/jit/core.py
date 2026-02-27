@@ -192,9 +192,7 @@ class AITER_CONFIG(object):
         for i, path in enumerate(path_list[1:]):
             if os.path.exists(path):
                 df = pd.read_csv(path)
-                base_cols = [
-                    c for c in df_list[0].columns if c != "_tag"
-                ]
+                base_cols = [c for c in df_list[0].columns if c != "_tag"]
                 new_cols = [c for c in df.columns if c != "_tag"]
                 assert (
                     base_cols == new_cols
