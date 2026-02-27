@@ -895,7 +895,7 @@ template <typename T, int quant_scale, int pack_size, int ngpus, FP16_FILTER>
 __global__ __forceinline__ void __launch_bounds__(512, 1) allReduceQuantFp8(
     RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size)
 {
-    float FP8_UPBOUND = float(hip_fp8(0x77, hip_fp8::from_bits()));
+    float FP8_UPBOUND = opus::cast<opus::fp32_t>(opus::numeric_limits<opus::fp8_t>::max());
     int tid           = blockIdx.x * blockDim.x + threadIdx.x;
     int stride        = gridDim.x * blockDim.x;
     using inp_pack    = opus::vector_t<T, pack_size>;
@@ -1344,7 +1344,7 @@ __device__ __forceinline__ void ar_fusion_epilogue(
         ar_fusion_epilogue_rms_norm<P, A, P, T, PACK_SIZE, BLOCK_SIZE>(out, in, weight, eps, hidden_dim);
         *reinterpret_cast<P *>(output + idx) = out;
     } else {
-        float FP8_UPBOUND = float(hip_fp8(0x77, hip_fp8::from_bits()));
+        float FP8_UPBOUND = opus::cast<opus::fp32_t>(opus::numeric_limits<opus::fp8_t>::max());
         using OP = opus::vector_t<OutT, PACK_SIZE>;
         OP out_quant;
         A out;
