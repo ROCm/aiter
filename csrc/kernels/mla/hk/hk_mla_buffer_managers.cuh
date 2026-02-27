@@ -1559,11 +1559,11 @@ class KvManagerV4
         const uint32_t row = (warp_idx % 2) * 16 + lane_idx / 16 * 4;
         const uint32_t col = (lane_idx % 16) * 8 + warp_idx / 2 * 128;
 
-        const uint32_t sub_block_idx = (row % 16) / 4;
+        const uint32_t sub_block_idx = (row % 16) / 4 + (col / 32) * 4;
         const uint32_t num_dual_pad  = sub_block_idx / 2;
         const uint32_t num_pad       = sub_block_idx - num_dual_pad;
-        const uint32_t row_inblk     = row % 4;
-        const uint32_t off_inblk     = row_inblk * 16 + col % 16 * 1 + (col / 16) * 8 * 16;
+        const uint32_t row_inblk     = row % 4 + (row / 16) * 4;
+        const uint32_t off_inblk     = row_inblk * 16 + col % 16 * 1 + ((col % 32) / 16) * 8 * 16;
 
         const uintptr_t p_lds_v_lane =
             p_lds_v + num_pad * 8 + num_dual_pad * 56 + sub_block_idx * 256 + off_inblk;
