@@ -11,14 +11,9 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
     mxfp4_quant,
-    moe_gemm_a4w4 as moe_gemm_a4w4_triton,
+    moe_gemm_a4w4,
     moe_gemm_torch,
     swizzle_scales,
-)
-
-# gluon
-from aiter.ops.gluon.moe.moe_op_gemm_a4w4 import (
-    moe_gemm_a4w4_gfx1250 as moe_gemm_a4w4_gluon,
 )
 
 # numerics utilities
@@ -33,11 +28,6 @@ from aiter.ops.triton.utils._triton.arch_info import get_arch
 # ---------------
 # initialize data
 # ---------------
-
-
-def is_gluon_supported():
-    arch = get_arch()
-    return arch == "gfx1250"
 
 
 def alloc_rand(shape, device, dtype):
@@ -240,18 +230,6 @@ def test_op(
     backend,
     device="cuda",
 ):
-    moe_gemm_a4w4_impl = None
-    if backend == "triton":
-        moe_gemm_a4w4_impl = moe_gemm_a4w4_triton
-        if get_arch() != "gfx950":
-            pytest.skip("FP4 kernels are not supported on MI300.")
-    if backend == "gluon":
-        moe_gemm_a4w4_impl = moe_gemm_a4w4_gluon
-        if not is_gluon_supported():
-            pytest.skip("Currently, only testing Gluon implementation on gfx1250.")
-        # TODO: implement scatter in Gluon implementation
-        if do_scatter:
-            pytest.skip("Gluon implementation does not support gather or scatter.")
     if hbm_swizzling:
         if n % 32 != 0 or k % (32 * 8) != 0:
             pytest.skip(
@@ -312,8 +290,9 @@ def test_op(
         quant_static_scale = ref_y.abs().max().float() / 448.0
     else:
         quant_static_scale = None
-    assert moe_gemm_a4w4_impl is not None
-    tri_y = moe_gemm_a4w4_impl(
+
+    # run kernel
+    tri_y = moe_gemm_a4w4(
         x_tri,
         w_tri,
         x_mx_scales_tri,
@@ -328,6 +307,7 @@ def test_op(
         swizzle_mx_scale,
         out_dtype,
         apply_swiglu,
+        backend=backend,
     )
     if not act_mxfp4 and fused_quant:
         tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)

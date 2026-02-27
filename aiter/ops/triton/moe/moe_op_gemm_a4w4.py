@@ -2,14 +2,30 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
 import itertools
+from typing import Literal, Optional
 import torch
 import triton
+from triton.experimental import gluon
+import triton.experimental.gluon.language as gl
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a4w4 import (
     _mxfp4_quant_kernel,
     _moe_gemm_a4w4,
     _reduce_grouped,
 )
+from aiter.ops.triton._gluon_kernels.moe.moe_op_gemm_a4w4 import (
+    _moe_gemm_a4w4_gfx1250,
+    _reduce_grouped_gfx1250,
+)
+
+GLUON_SUPPORTED_ARCHS = set(["gfx1250"])
+
+
+def is_gluon_supported():
+    arch = get_arch()
+    return arch in GLUON_SUPPORTED_ARCHS
+
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
@@ -130,7 +146,8 @@ def reduce_grouped(
     alpha=1.0,
     limit=1.0,
     reduction_n=1,
-    out_dtype: bool = None,
+    backend: Optional[Literal["triton", "gluon"]] = None,
+    out_dtype: Optional[torch.dtype] = None,
 ):
     """
     In-place grouped row reduction.
@@ -172,28 +189,80 @@ def reduce_grouped(
     assert x.shape[-1] % reduction_n == 0
     BLOCK_N = 512
     num_blocks = triton.cdiv(x.shape[-1], BLOCK_N)
+    num_warps = 2
 
-    _reduce_grouped[(num_blocks, num_groups)](
-        x,
-        x.stride(0),
-        x.stride(1),
-        x.stride(2),  #
-        out,
-        out.stride(0),
-        out.stride(1),  #
-        indx,  #
-        x.shape[0],
-        x.shape[-1],  #
-        apply_swiglu,
-        alpha,
-        limit,
-        reduction_n,
-        BLOCK_N=BLOCK_N,
-        EVEN_N=(x.shape[-1] % BLOCK_N == 0),
-        K=K,  #
-        num_warps=2,  #
-    )
+    if backend == "gluon" and get_arch() == "gfx1250":
+        BLOCKED_LAYOUT_N: gl.constexpr = gl.BlockedLayout(
+            [BLOCK_N], [32], [num_warps], [0]
+        )
+        BLOCKED_LAYOUT_N_OUT: gl.constexpr = gl.BlockedLayout(
+            [BLOCK_N // reduction_n], [32], [num_warps], [0]
+        )
+        _reduce_grouped_gfx1250[(num_blocks, num_groups)](
+            x,
+            x.stride(0),
+            x.stride(1),
+            x.stride(2),  #
+            out,
+            out.stride(0),
+            out.stride(1),  #
+            indx,  #
+            x.shape[0],
+            x.shape[-1],  #
+            apply_swiglu,
+            alpha,
+            limit,
+            reduction_n,
+            BLOCK_N=BLOCK_N,
+            EVEN_N=(x.shape[-1] % BLOCK_N == 0),
+            K=K,  #
+            BLOCKED_LAYOUT_N=BLOCKED_LAYOUT_N,
+            BLOCKED_LAYOUT_N_OUT=BLOCKED_LAYOUT_N_OUT,
+            num_warps=num_warps,  #
+        )
+    else:
+        _reduce_grouped[(num_blocks, num_groups)](
+            x,
+            x.stride(0),
+            x.stride(1),
+            x.stride(2),  #
+            out,
+            out.stride(0),
+            out.stride(1),  #
+            indx,  #
+            x.shape[0],
+            x.shape[-1],  #
+            apply_swiglu,
+            alpha,
+            limit,
+            reduction_n,
+            BLOCK_N=BLOCK_N,
+            EVEN_N=(x.shape[-1] % BLOCK_N == 0),
+            K=K,  #
+            num_warps=num_warps,  #
+        )
     return out
+
+
+@gluon.constexpr_function
+def get_wmma_layout(num_warps, packed, scale_preshuffle):
+    assert num_warps in (4, 8)
+    if scale_preshuffle:
+        reg_bases = [[0, 1], [1, 0]]
+        tiles_per_warp = 2
+    else:
+        reg_bases = []
+        tiles_per_warp = 1
+
+    # [NUM_WARPS // 2, 2]
+    if num_warps == 4:
+        warp_bases = [[0, tiles_per_warp], [tiles_per_warp, 0]]
+    else:
+        warp_bases = [[0, tiles_per_warp], [0, tiles_per_warp * 2], [tiles_per_warp, 0]]
+
+    instr_shape = [16, 16, 64] if packed else [16, 16, 128]
+
+    return gl.amd.AMDWMMALayout(3, True, warp_bases, reg_bases, instr_shape)
 
 
 # -----------------------------------------------------------------------------
@@ -275,12 +344,23 @@ def moe_gemm_a4w4(
     limit=1.0,
     unpadded_N=None,
     unpadded_K=None,
+    backend: Optional[Literal["triton", "gluon"]] = None,
 ):
     """
     Y[:, :] = 0.
     for e in num_experts:
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
     """
+    backend = (
+        backend
+        if backend is not None
+        else ("gluon" if is_gluon_supported() else "triton")
+    )
+    assert backend in ["triton", "gluon"], f"Invalid backend: {backend}"
+    if backend == "gluon":
+        assert (
+            is_gluon_supported()
+        ), f"Gluon backend is not supported on this architecture: {get_arch()}"
     assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
     x_has_mx = x_scales is not None
     if x_has_mx:
@@ -292,6 +372,7 @@ def moe_gemm_a4w4(
         stride_x_mx_m = 0
         stride_x_mx_k = 0
     # determine shapes
+    num_tokens = x.shape[-2]
     M = x.shape[-2] if gather_indx is None else gather_indx.shape[0]
     K, N = x.shape[-1] * 2, w.shape[-1]
     block_m = routing_data.block_m
@@ -341,61 +422,132 @@ def moe_gemm_a4w4(
     grid_n = triton.cdiv(N, config["block_n"])
     grid = grid_m * grid_n * config["split_k"]
     # launch kernel
-    _moe_gemm_a4w4[(grid,)](
-        y,
-        y.stride(0),
-        y.stride(1),
-        y.stride(2),
-        x,
-        x.stride(0),
-        x.stride(1),
-        x_scales,
-        stride_x_mx_m,
-        stride_x_mx_k,
-        w,
-        w.stride(0),
-        w.stride(1),
-        w.stride(2),
-        w_scales,
-        w_scales.stride(0),
-        w_scales.stride(1),
-        w_scales.stride(2),
-        x_static_scale,
-        quant_static_scale,
-        bias,
-        stride_bias,
-        gammas,
-        N,
-        K,
-        gather_indx,
-        expt_hist,
-        expt_token_offs_raw,
-        expt_hist_sum,
-        expt_block_pid_map,
-        grid_m,
-        grid_n,
-        apply_swiglu_matmul,
-        alpha,
-        limit,
-        reduction_n_matmul,
-        routing_data.n_expts_act,
-        config["block_m"],
-        config["block_n"],
-        config["block_k"],
-        config["group_m"],
-        XCD_SWIZZLE=config["xcd_swizzle"],
-        SWIZZLE_MX_SCALE=swizzle_mx_scale,
-        SPLIT_K=config["split_k"],
-        EVEN_K=K % config["block_k"] == 0,
-        MASK_K_LIMIT=K % config["block_k"],
-        W_CACHE_MODIFIER=config["w_cache_modifier"],
-        num_warps=config["num_warps"],
-        num_stages=config["num_stages"],
-        UPCAST_INDICES=should_upcast_indices(x, w, y),
-        waves_per_eu=config["waves_per_eu"],
-        matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
-        kpack=config["kpack"],
-    )
+    if backend == "gluon" and get_arch() == "gfx1250":
+        # layouts
+        WMMA_LAYOUT = get_wmma_layout(
+            config["num_warps"], False, swizzle_mx_scale == "GFX1250_SCALE"
+        )
+        WMMA_LAYOUT_PACKED = get_wmma_layout(
+            config["num_warps"], True, swizzle_mx_scale == "GFX1250_SCALE"
+        )
+        IDX_LAYOUT = gl.BlockedLayout(
+            [config["block_m"]], [32], [config["num_warps"]], [0]
+        )
+        _moe_gemm_a4w4_gfx1250[(grid,)](
+            y,
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            x,
+            x.stride(0),
+            x.stride(1),
+            x_scales,
+            stride_x_mx_m,
+            stride_x_mx_k,
+            w,
+            w.stride(0),
+            w.stride(1),
+            w.stride(2),
+            w_scales,
+            w_scales.stride(0),
+            w_scales.stride(1),
+            w_scales.stride(2),
+            x_static_scale,
+            quant_static_scale,
+            bias,
+            stride_bias,
+            gammas,
+            num_tokens,
+            N,
+            K,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_hist_sum,
+            expt_block_pid_map,
+            grid_m,
+            grid_n,
+            apply_swiglu_matmul,
+            alpha,
+            limit,
+            reduction_n_matmul,
+            routing_data.n_expts_act,
+            config["block_m"],
+            config["block_n"],
+            config["block_k"],
+            config["group_m"],
+            XCD_SWIZZLE=config["xcd_swizzle"],
+            SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            SPLIT_K=config["split_k"],
+            EVEN_K=K % config["block_k"] == 0,
+            MASK_K_LIMIT=K % config["block_k"],
+            W_CACHE_MODIFIER=config["w_cache_modifier"],
+            WMMA_LAYOUT=WMMA_LAYOUT,
+            WMMA_LAYOUT_PACKED=WMMA_LAYOUT_PACKED,
+            IDX_LAYOUT=IDX_LAYOUT,
+            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            num_warps=config["num_warps"],
+            num_stages=config["num_stages"],
+            waves_per_eu=config["waves_per_eu"],
+            matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
+            kpack=config["kpack"],
+        )
+    else:
+        _moe_gemm_a4w4[(grid,)](
+            y,
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            x,
+            x.stride(0),
+            x.stride(1),
+            x_scales,
+            stride_x_mx_m,
+            stride_x_mx_k,
+            w,
+            w.stride(0),
+            w.stride(1),
+            w.stride(2),
+            w_scales,
+            w_scales.stride(0),
+            w_scales.stride(1),
+            w_scales.stride(2),
+            x_static_scale,
+            quant_static_scale,
+            bias,
+            stride_bias,
+            gammas,
+            N,
+            K,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_hist_sum,
+            expt_block_pid_map,
+            grid_m,
+            grid_n,
+            apply_swiglu_matmul,
+            alpha,
+            limit,
+            reduction_n_matmul,
+            routing_data.n_expts_act,
+            config["block_m"],
+            config["block_n"],
+            config["block_k"],
+            config["group_m"],
+            XCD_SWIZZLE=config["xcd_swizzle"],
+            SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            SPLIT_K=config["split_k"],
+            EVEN_K=K % config["block_k"] == 0,
+            MASK_K_LIMIT=K % config["block_k"],
+            W_CACHE_MODIFIER=config["w_cache_modifier"],
+            num_warps=config["num_warps"],
+            num_stages=config["num_stages"],
+            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            waves_per_eu=config["waves_per_eu"],
+            matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
+            kpack=config["kpack"],
+        )
     # Build grouped reduction inputs in a uniform way
     group_indx = (
         None
@@ -410,6 +562,7 @@ def moe_gemm_a4w4(
         alpha,
         limit,
         reduction_n_reduction,
+        backend=backend,
         out_dtype=out_dtype,
     )
     return y_final
