@@ -99,6 +99,7 @@ _BACKWARD_COMPAT_MAP = {
     "unified_attention_sparse_mla": "attention.unified_attention_sparse_mla",
     "unified_attention": "attention.unified_attention",
     # Fusions modules (fusions/)
+    "fused_attn_output_rmsnorm": "fusions.fused_attn_output_rmsnorm",
     "fused_kv_cache": "fusions.fused_kv_cache",
     "fused_mul_add": "fusions.fused_mul_add",
     "fused_qk_concat": "fusions.fused_qk_concat",
