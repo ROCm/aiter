@@ -9,10 +9,10 @@ import torch
 from aiter.ops.triton.moe.moe_routing.routing import routing
 
 # matmul utilities
-from aiter.ops.triton.moe.moe_op_gemm_a8w4_gluon import (
+from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
     moe_gemm_a8w4,
     moe_gemm_torch,
-    swizzle_scales,
+    swizzle_scales_gfx1250,
 )
 
 # numerics utilities
@@ -285,7 +285,7 @@ def test_op(
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
     if hbm_swizzling:
         swizzle_mx_scale = "GFX1250_SCALE"
-        w_scale_tri = swizzle_scales(w_scale_tri)
+        w_scale_tri = swizzle_scales_gfx1250(w_scale_tri)
     else:
         swizzle_mx_scale = None
 

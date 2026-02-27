@@ -228,20 +228,14 @@ def _moe_gemm_a8w4(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
-    GROUP_M: gl.constexpr,
-    XCD_SWIZZLE: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
     # One of ["GFX1250", None]
     SWIZZLE_MX_SCALE: gl.constexpr,
     EVEN_K: gl.constexpr,
     MASK_K_LIMIT: gl.constexpr,
-    SPLIT_K: gl.constexpr,
     W_CACHE_MODIFIER: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
 ):
-
-    NUM_BUFFERS: gl.constexpr = 2
-    MAX_NUM_INDICES: gl.constexpr = 16
-    NUM_GATHER_LOADS: gl.constexpr = BLOCK_M // MAX_NUM_INDICES
 
     is_x_microscaled: gl.constexpr = XMxScale is not None
     MX_PACK_DIVISOR: gl.constexpr = 32
@@ -274,17 +268,14 @@ def _moe_gemm_a8w4(
     index_type: tl.constexpr = gl.int64 if UPCAST_INDICES else gl.int32
 
     unpadded_m = grid_m - padding_m
-    total_actual_tiles = unpadded_m * grid_n * SPLIT_K
+    total_actual_tiles = unpadded_m * grid_n 
     if padding_m > 0 and pid >= total_actual_tiles:
         return
 
-    # swizzle program ids
-    pid_emnk = pid
-    # pid_e = pid_emnk // (unpadded_m * grid_n * SPLIT_K)
-    pid_mnk = pid_emnk % (unpadded_m * grid_n * SPLIT_K)
-    pid_k = pid_mnk % SPLIT_K
-    pid_mn = pid_mnk // SPLIT_K
-    pid_m, pid_n = pid_grid(pid_mn, unpadded_m, grid_n, GROUP_M)
+    pid_emn = pid
+    pid_mn = pid_emn % (unpadded_m * grid_n)
+    pid_mn = pid_mn
+    pid_m, pid_n = pid_grid(pid_mn, unpadded_m, grid_n, 1)
     # unpack expert data
     expt_data = gl.load(ExptData + pid_m)
     if expt_data == -1:
@@ -295,23 +286,21 @@ def _moe_gemm_a8w4(
     start_m = gl.load(ExptOffs + expt_id)
     expt_id, block_id = expt_id.to(index_type), block_id.to(index_type)
     start_m = start_m.to(index_type)
-    pid_n, pid_k = pid_n.to(index_type), pid_k.to(index_type)
+    pid_n = pid_n.to(index_type)
 
     # A pointers
     off_x_m = BLOCK_M * block_id 
     if GatherIndx is None:
         X += start_m * stride_x_m
     else:
-        IDX_BASE_LAYOUT: gl.constexpr = gl.BlockedLayout([BLOCK_M, 1], [1, 32], [1, 4], [1, 0])
-        IDX_LAYOUT: gl.constexpr = gl.SliceLayout(1, IDX_BASE_LAYOUT)
+        IDX_LAYOUT: gl.constexpr = gl.SliceLayout(1, gl.BlockedLayout([BLOCK_M, 1], [1, 32], [1, 4], [1, 0]))
         offs_x_m = BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=IDX_LAYOUT)
         GatherIndx += start_m
         offs_x_m = gl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
 
     W_K_DIVISOR: gl.constexpr = 2
-    W_N_DIVISOR: gl.constexpr = 1
     PACKED_BLOCK_K_W: gl.constexpr = BLOCK_K // W_K_DIVISOR
-    PACKED_BLOCK_N_W: gl.constexpr = BLOCK_N // W_N_DIVISOR
+    PACKED_BLOCK_N_W: gl.constexpr = BLOCK_N
     MX_SCALE_BLOCK_K: gl.constexpr = BLOCK_K // MX_PACK_DIVISOR
 
     WMxScale += expt_id * stride_w_mx_e
@@ -335,7 +324,7 @@ def _moe_gemm_a8w4(
     if is_x_microscaled:
         if GatherIndx is None:
             XMxScale += start_m * stride_x_mx_m
-        offs_x_k_scale = MX_SCALE_BLOCK_K * pid_k + tl.arange(0, MX_SCALE_BLOCK_K)
+        offs_x_k_scale = tl.arange(0, MX_SCALE_BLOCK_K)
         XMxScalePtrs = (
             XMxScale
             + offs_x_m.to(index_type)[:, None] * stride_x_mx_m
@@ -375,34 +364,34 @@ def _moe_gemm_a8w4(
     w_buffer = gl.allocate_shared_memory(w_desc.dtype, shape=[NUM_BUFFERS] + w_desc.block_shape, layout=w_desc.layout)
     w_scales_buffer = gl.allocate_shared_memory(w_scales_desc.dtype, shape=[NUM_BUFFERS] + w_scales_desc.block_shape, layout=w_scales_desc.layout)
 
-    producer = 0
-    consumer = 0
+    read_idx = 0
+    write_idx = 0
     for _ in gl.static_range(NUM_BUFFERS - 1):
         if GatherIndx is None:
-            gl.amd.gfx1250.tdm.async_load(x_desc, [off_x_m, producer * BLOCK_K], x_buffer.index(producer % NUM_BUFFERS))
+            gl.amd.gfx1250.tdm.async_load(x_desc, [off_x_m, write_idx * BLOCK_K], x_buffer.index(write_idx % NUM_BUFFERS))
         else:
-            gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, producer * BLOCK_K, x_buffer.index(producer % NUM_BUFFERS)) 
-        gl.amd.gfx1250.tdm.async_load(w_desc, [off_w_n, producer * PACKED_BLOCK_K_W], w_buffer.index(producer % NUM_BUFFERS))
-        gl.amd.gfx1250.tdm.async_load(w_scales_desc, [off_w_n_scale, producer * PACKED_MX_BLOCK], w_scales_buffer.index(producer % NUM_BUFFERS))
-        producer += 1
+            gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, write_idx * BLOCK_K, x_buffer.index(write_idx % NUM_BUFFERS)) 
+        gl.amd.gfx1250.tdm.async_load(w_desc, [off_w_n, write_idx * PACKED_BLOCK_K_W], w_buffer.index(write_idx % NUM_BUFFERS))
+        gl.amd.gfx1250.tdm.async_load(w_scales_desc, [off_w_n_scale, write_idx * PACKED_MX_BLOCK], w_scales_buffer.index(write_idx % NUM_BUFFERS))
+        write_idx += 1
 
     # compute output
     num_k_iter = tl.cdiv(K, BLOCK_K)
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
     for k in range(num_k_iter - (NUM_BUFFERS - 1)):
         if GatherIndx is None:
-            gl.amd.gfx1250.tdm.async_load(x_desc, [off_x_m, producer * BLOCK_K], x_buffer.index(producer % NUM_BUFFERS))
+            gl.amd.gfx1250.tdm.async_load(x_desc, [off_x_m, write_idx * BLOCK_K], x_buffer.index(write_idx % NUM_BUFFERS))
         else:
-            gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, producer * BLOCK_K, x_buffer.index(producer % NUM_BUFFERS)) 
-        gl.amd.gfx1250.tdm.async_load(w_desc, [off_w_n, producer * PACKED_BLOCK_K_W], w_buffer.index(producer % NUM_BUFFERS))
-        gl.amd.gfx1250.tdm.async_load(w_scales_desc, [off_w_n_scale, producer * PACKED_MX_BLOCK], w_scales_buffer.index(producer % NUM_BUFFERS))
-        producer += 1
+            gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, write_idx * BLOCK_K, x_buffer.index(write_idx % NUM_BUFFERS)) 
+        gl.amd.gfx1250.tdm.async_load(w_desc, [off_w_n, write_idx * PACKED_BLOCK_K_W], w_buffer.index(write_idx % NUM_BUFFERS))
+        gl.amd.gfx1250.tdm.async_load(w_scales_desc, [off_w_n_scale, write_idx * PACKED_MX_BLOCK], w_scales_buffer.index(write_idx % NUM_BUFFERS))
+        write_idx += 1
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 3)
 
-        x = x_buffer.index(consumer % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
-        w = w_buffer.index(consumer % NUM_BUFFERS).permute((1, 0)).load(layout=DOT_LAYOUT_W)
-        w_scales_buffer_slice = w_scales_buffer.index(consumer % NUM_BUFFERS) #.load(layout=DOT_LAYOUT_W_SCALES)
+        x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
+        w = w_buffer.index(read_idx % NUM_BUFFERS).permute((1, 0)).load(layout=DOT_LAYOUT_W)
+        w_scales_buffer_slice = w_scales_buffer.index(read_idx % NUM_BUFFERS) 
         if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
             w_scales_buffer_slice = w_scales_buffer_slice.reshape((
                 SCALE_BLOCK_N, 
@@ -411,17 +400,16 @@ def _moe_gemm_a8w4(
                 4, 
                 SCALE_KWIDTH)).permute((0, 3, 2, 1, 4)).reshape((BLOCK_N, MX_SCALE_BLOCK_K))
         w_scales = w_scales_buffer_slice.load(layout=DOT_LAYOUT_W_SCALES)
+        read_idx += 1
 
         acc = gl.amd.gfx1250.wmma_scaled(x, 0, "e4m3", w, w_scales, "e2m1", acc)
-
-        consumer += 1
 
     for k_ep in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - k_ep) * 3)
 
-        x = x_buffer.index(consumer % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
-        w = w_buffer.index(consumer % NUM_BUFFERS).permute((1, 0)).load(layout=DOT_LAYOUT_W)
-        w_scales_buffer_slice = w_scales_buffer.index(consumer % NUM_BUFFERS)
+        x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
+        w = w_buffer.index(read_idx % NUM_BUFFERS).permute((1, 0)).load(layout=DOT_LAYOUT_W)
+        w_scales_buffer_slice = w_scales_buffer.index(read_idx % NUM_BUFFERS)
         if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
             w_scales_buffer_slice = w_scales_buffer_slice.reshape((
                 SCALE_BLOCK_N, 
@@ -442,8 +430,7 @@ def _moe_gemm_a8w4(
     mask_m = offs_m < M
     mask_n = offs_y_n < N
     if B is not None:
-        BPtrs = B + expt_id * stride_b_e #+ offs_y_n
-        #bias = gl.load(BPtrs, mask=mask_n, other=0)
+        BPtrs = B + expt_id * stride_b_e
         bias = gl.amd.gfx1250.buffer_load(BPtrs, offs_y_n, mask=mask_n)
         acc = acc + bias[None, :]
     if APPLY_SWIGLU:
