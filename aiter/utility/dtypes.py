@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 from ..jit.utils.chip_info import get_gfx
-from ..ops.enum import QuantType
+from ..ops.enum import QuantType, ActivationType
 import argparse
 
 defaultDtypes = {
@@ -95,3 +95,8 @@ def str2Dtype(v):
         return tuple(_convert(p) for p in parts)
     except Exception as e:
         raise argparse.ArgumentTypeError(f"invalid format of type: {v}") from e
+
+
+def str2ActivationType(s):
+    """Convert string to ActivationType."""
+    return getattr(ActivationType, s.capitalize())

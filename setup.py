@@ -43,13 +43,30 @@ def is_develop_mode():
     return False
 
 
-# Copy source directories for packaging
-if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
-    shutil.rmtree("aiter_meta")
-shutil.copytree("3rdparty", "aiter_meta/3rdparty")
-shutil.copytree("hsa", "aiter_meta/hsa")
-shutil.copytree("gradlib", "aiter_meta/gradlib")
-shutil.copytree("csrc", "aiter_meta/csrc")
+def write_install_mode():
+    """Write install_mode so core.py uses aiter_meta/ (install) vs repo root (develop).
+
+    Called here so the file exists when setuptools resolves package_data,
+    and again in build_ext.run() to ensure it's written for develop mode too.
+    """
+    mode = "develop" if is_develop_mode() else "install"
+    with open("./aiter/install_mode", "w") as f:
+        f.write(mode)
+
+
+def prepare_packaging():
+    """Copy source directories and create package metadata for non-editable installs."""
+    if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
+        shutil.rmtree("aiter_meta")
+    shutil.copytree("3rdparty", "aiter_meta/3rdparty")
+    shutil.copytree("hsa", "aiter_meta/hsa")
+    shutil.copytree("gradlib", "aiter_meta/gradlib")
+    shutil.copytree("csrc", "aiter_meta/csrc")
+    open("aiter_meta/__init__.py", "w").close()
+    write_install_mode()
+
+
+prepare_packaging()
 
 
 class NinjaBuildExtension(build_ext):
@@ -82,12 +99,7 @@ class NinjaBuildExtension(build_ext):
             '"git submodule sync ; git submodule update --init --recursive"'
         )
 
-        if is_develop_mode():
-            with open("./aiter/install_mode", "w") as f:
-                f.write("develop")
-        else:
-            with open("./aiter/install_mode", "w") as f:
-                f.write("install")
+        write_install_mode()
 
         def _load_modules_from_config():
             cfg_path = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
