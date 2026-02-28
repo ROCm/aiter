@@ -1,76 +1,79 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-// Lightweight torch header for aiter.
+// Torch header for aiter.
 // Use this instead of <torch/all.h> or <torch/extension.h> to reduce
-// compile time and minimize torch version coupling.
+// compile time and avoid pulling in pybind11 / torch/library.h.
 
 #pragma once
 
-// Minimal torch headers - lighter than torch/types.h
-// Provides at::Tensor + torch:: namespace aliases + HIP stream/guard
-// #include <ATen/Tensor.h>
-// #include <ATen/Functions.h>
+#if __has_include(<torch/types.h>)
 #include <torch/types.h>
+#else
+#include <ATen/Tensor.h>
+#include <ATen/Functions.h>
+#include <c10/core/ScalarType.h>
+namespace torch {
+
+    // NOTE [ Exposing declarations in `at::` to `torch::` ]
+    //
+    // The following line `using namespace at;` is responsible for exposing all
+    // declarations in `at::` namespace to `torch::` namespace.
+    //
+    // According to the rules laid out in
+    // https://en.cppreference.com/w/cpp/language/qualified_lookup, section
+    // "Namespace members":
+    // ```
+    // Qualified lookup within the scope of a namespace N first considers all
+    // declarations that are located in N and all declarations that are located in
+    // the inline namespace members of N (and, transitively, in their inline
+    // namespace members). If there are no declarations in that set then it
+    // considers declarations in all namespaces named by using-directives found in N
+    // and in all transitive inline namespace members of N.
+    // ```
+    //
+    // This means that if both `at::` and `torch::` namespaces have a function with
+    // the same signature (e.g. both `at::func()` and `torch::func()` exist), after
+    // `namespace torch { using namespace at; }`, when we call `torch::func()`, the
+    // `func()` function defined in `torch::` namespace will always be called, and
+    // the `func()` function defined in `at::` namespace is always hidden.
+    using namespace at; // NOLINT
+    
+    #if !defined(FBCODE_CAFFE2) && !defined(C10_NODEPRECATED)
+    using std::nullopt; // NOLINT
+    using std::optional; // NOLINT
+    #endif
+    
+    using Dtype = at::ScalarType;
+    
+    /// Fixed width dtypes.
+    constexpr auto kUInt8 = at::kByte;
+    constexpr auto kInt8 = at::kChar;
+    constexpr auto kInt16 = at::kShort;
+    constexpr auto kInt32 = at::kInt;
+    constexpr auto kInt64 = at::kLong;
+    constexpr auto kUInt16 = at::kUInt16;
+    constexpr auto kUInt32 = at::kUInt32;
+    constexpr auto kUInt64 = at::kUInt64;
+    constexpr auto kFloat16 = at::kHalf;
+    constexpr auto kFloat32 = at::kFloat;
+    constexpr auto kFloat64 = at::kDouble;
+    
+    /// Rust-style short dtypes.
+    constexpr auto kU8 = kUInt8;
+    constexpr auto kU16 = kUInt16;
+    constexpr auto kU32 = kUInt32;
+    constexpr auto kU64 = kUInt64;
+    constexpr auto kI8 = kInt8;
+    constexpr auto kI16 = kInt16;
+    constexpr auto kI32 = kInt32;
+    constexpr auto kI64 = kInt64;
+    constexpr auto kF16 = kFloat16;
+    constexpr auto kF32 = kFloat32;
+    constexpr auto kF64 = kFloat64;
+    } // namespace torch
+
+#endif
+
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-
-// namespace torch {
-
-//     // NOTE [ Exposing declarations in `at::` to `torch::` ]
-//     //
-//     // The following line `using namespace at;` is responsible for exposing all
-//     // declarations in `at::` namespace to `torch::` namespace.
-//     //
-//     // According to the rules laid out in
-//     // https://en.cppreference.com/w/cpp/language/qualified_lookup, section
-//     // "Namespace members":
-//     // ```
-//     // Qualified lookup within the scope of a namespace N first considers all
-//     // declarations that are located in N and all declarations that are located in
-//     // the inline namespace members of N (and, transitively, in their inline
-//     // namespace members). If there are no declarations in that set then it
-//     // considers declarations in all namespaces named by using-directives found in N
-//     // and in all transitive inline namespace members of N.
-//     // ```
-//     //
-//     // This means that if both `at::` and `torch::` namespaces have a function with
-//     // the same signature (e.g. both `at::func()` and `torch::func()` exist), after
-//     // `namespace torch { using namespace at; }`, when we call `torch::func()`, the
-//     // `func()` function defined in `torch::` namespace will always be called, and
-//     // the `func()` function defined in `at::` namespace is always hidden.
-//     using namespace at; // NOLINT
-    
-//     #if !defined(FBCODE_CAFFE2) && !defined(C10_NODEPRECATED)
-//     using std::nullopt; // NOLINT
-//     using std::optional; // NOLINT
-//     #endif
-    
-//     using Dtype = at::ScalarType;
-    
-//     /// Fixed width dtypes.
-//     constexpr auto kUInt8 = at::kByte;
-//     constexpr auto kInt8 = at::kChar;
-//     constexpr auto kInt16 = at::kShort;
-//     constexpr auto kInt32 = at::kInt;
-//     constexpr auto kInt64 = at::kLong;
-//     constexpr auto kUInt16 = at::kUInt16;
-//     constexpr auto kUInt32 = at::kUInt32;
-//     constexpr auto kUInt64 = at::kUInt64;
-//     constexpr auto kFloat16 = at::kHalf;
-//     constexpr auto kFloat32 = at::kFloat;
-//     constexpr auto kFloat64 = at::kDouble;
-    
-//     /// Rust-style short dtypes.
-//     constexpr auto kU8 = kUInt8;
-//     constexpr auto kU16 = kUInt16;
-//     constexpr auto kU32 = kUInt32;
-//     constexpr auto kU64 = kUInt64;
-//     constexpr auto kI8 = kInt8;
-//     constexpr auto kI16 = kInt16;
-//     constexpr auto kI32 = kInt32;
-//     constexpr auto kI64 = kInt64;
-//     constexpr auto kF16 = kFloat16;
-//     constexpr auto kF32 = kFloat32;
-//     constexpr auto kF64 = kFloat64;
-//     } // namespace torch
