@@ -715,7 +715,7 @@
         {
             int token_idx          = first_token_idx + idx * vec_size / head_dim;
             int head_offset        = (idx * vec_size) % head_dim;
-            int block_offset_local = (token_idx - first_token_idx + block_offset) % wg_size;
+            int block_offset_local = (token_idx - first_token_idx + block_offset) % page_size;
             int head_divX          = head_offset >> x_shift;
             int head_modX          = head_offset & x_mask;
             int64_t k_base         = cache_offset + head_divX * k_row_stride + block_offset_local * x + head_modX;
@@ -805,7 +805,7 @@
         {
             int token_idx          = first_token_idx + idx * vec_size / head_dim;
             int head_offset        = (idx * vec_size) % head_dim;
-            int block_offset_local = (token_idx - first_token_idx + block_offset) % wg_size;
+            int block_offset_local = (token_idx - first_token_idx + block_offset) % page_size;
             int block_offset_divX  = block_offset_local >> v_x_shift;
             int x_idx              = block_offset_local & v_x_mask;
             int64_t v_base         = cache_offset + block_offset_divX * head_dim * x + head_offset * x + x_idx;
@@ -1021,7 +1021,7 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
                                             hipStream_t stream)
 {
     // blockSize (wg_size) selection: use page_size if it's 64/128/256, otherwise default to 64
-    int blockSize = page_size;
+    int blockSize = page_size >= 64 ? page_size : 64;
 
     // Kernel uses cum_blocks: each batch needs ceil(seq_len_i/blockSize) + 1 blocks.
     // Conservative upper bound: ceil(total/blockSize) + 2*batch_size
@@ -1060,8 +1060,7 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
         });
 
 #define DISPATCH_BLOCK_SIZE(HEAD_DIM)                                            \
-    if (blockSize == 16)      { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 16)  }      \
-    else if(blockSize == 64)       { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 64)  } \
+    if(blockSize == 64)       { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 64)  } \
     else if(blockSize == 128) { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 128) }      \
     else if(blockSize == 256) { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 256) }      \
     else { TORCH_CHECK(false, "Unsupported blockSize: ", blockSize); }
