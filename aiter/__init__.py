@@ -74,6 +74,7 @@ from .ops.custom_all_reduce import *  # noqa: F403,E402
 from .ops.quick_all_reduce import *  # noqa: F403,E402
 from .ops.moe_op import *  # noqa: F403,E402
 from .ops.moe_sorting import *  # noqa: F403,E402
+from .ops.moe_sorting_opus import *  # noqa: F403,E402
 from .ops.pos_encoding import *  # noqa: F403,E402
 from .ops.cache import *  # noqa: F403,E402
 from .ops.rmsnorm import *  # noqa: F403,E402

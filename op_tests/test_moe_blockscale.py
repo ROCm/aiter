@@ -288,9 +288,6 @@ def test_fmoe(
     checkAllclose(out_ref, out_asm, rtol=0.05, atol=0.05, msg=msg)
 
 
-l_dtype = ["bf16"]
-l_m = [1, 2, 5, 16, 32, 163840]
-
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -298,11 +295,9 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
+    type=dtypes.str2Dtype,
+    nargs="*",
+    default=[dtypes.d_dtypes["bf16"]],
     help="""Data type.
     e.g.: -d bf16""",
 )
@@ -310,9 +305,8 @@ parser.add_argument(
 parser.add_argument(
     "-m",
     type=int,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    default=[1, 2, 5, 16, 32, 163840],
     help="""M of mnk.
     e.g.: -m 32""",
 )
@@ -350,16 +344,9 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
-if args.dtype is None:
-    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-else:
-    l_dtype = [dtypes.d_dtypes[args.dtype]]
 
-if args.m is not None:
-    l_m = [args.m]
-
-for dtype in l_dtype:
-    for m in l_m:
+for dtype in args.dtype:
+    for m in args.m:
         for dim in [args.dim]:
             for idim in [args.idim]:
                 scale_blks = (128, 128)

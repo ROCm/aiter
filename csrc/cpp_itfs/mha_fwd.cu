@@ -94,39 +94,64 @@ void init_fmha_fwd_v3_args(fmha_fwd_v3_args& args,
     {
         tune_opt = 0;
     }
-    args.ptr_o   = a.o_ptr;
-    args.ptr_q   = a.q_ptr;
-    args.ptr_k   = a.k_ptr;
-    args.ptr_v   = a.v_ptr;
-    args.ptr_lse = a.lse_ptr;
+    args.ptr_o            = a.o_ptr;
+    args.ptr_q            = a.q_ptr;
+    args.ptr_k            = a.k_ptr;
+    args.ptr_v            = a.v_ptr;
+    args.ptr_lse          = a.lse_ptr;
+    args.ptr_qseq         = nullptr;
+    args.ptr_kseq         = nullptr;
+    args.ptr_qseq_padding = nullptr;
+    args.ptr_kseq_padding = nullptr;
+    args.ptr_q_descale    = nullptr;
+    args.ptr_k_descale    = nullptr;
+    args.ptr_v_descale    = nullptr;
+    args.s_descale_q_Bs   = 0;
+    args.s_descale_q_Hs   = 0;
+    args.s_descale_k_Bs   = 0;
+    args.s_descale_k_Hs   = 0;
+    args.s_descale_v_Bs   = 0;
+    args.s_descale_v_Hs   = 0;
+
+    int in_bpe = 2;
+    int out_bpe = 2;
+    if(a.data_type == "fp8bf16")
+    {
+        in_bpe = 1;
+        args.ptr_q_descale = a.q_descale_ptr;
+        args.ptr_k_descale = a.k_descale_ptr;
+        args.ptr_v_descale = a.v_descale_ptr;
+        args.s_descale_q_Bs = a.batch_stride_q_descale * 4;
+        args.s_descale_q_Hs = a.nhead_stride_q_descale * 4;
+        args.s_descale_k_Bs = a.batch_stride_k_descale * 4;
+        args.s_descale_k_Hs = a.nhead_stride_k_descale * 4;
+        args.s_descale_v_Bs = a.batch_stride_v_descale * 4;
+        args.s_descale_v_Hs = a.nhead_stride_v_descale * 4;
+    }
 
     args.scalar           = a.scale_s;
     args.s_seq_len        = a.seqlen_q;
-    args.s_Seqs           = a.stride_q * 2;
-    args.s_Ts             = ts_qo * a.stride_q * 2;
-    args.s_Hs             = a.nhead_stride_q * 2;
-    args.s_Bs             = a.batch_stride_q * 2;
+    args.s_Seqs           = a.stride_q * in_bpe;
+    args.s_Ts             = ts_qo * a.stride_q * in_bpe;
+    args.s_Hs             = a.nhead_stride_q * in_bpe;
+    args.s_Bs             = a.batch_stride_q * in_bpe;
     args.s_gqa            = a.nhead_q / a.nhead_k;
-    args.s_k_Seqs         = a.stride_k * 2;
-    args.s_k_Hs           = a.nhead_stride_k * 2;
-    args.s_k_Bs           = a.batch_stride_k * 2;
+    args.s_k_Seqs         = a.stride_k * in_bpe;
+    args.s_k_Hs           = a.nhead_stride_k * in_bpe;
+    args.s_k_Bs           = a.batch_stride_k * in_bpe;
     args.s_opt            = tune_opt;
     args.s_lse            = a.has_lse ? 1 : 0;
     args.s_kv_seq_len     = a.seqlen_k;
     args.s_qk_head_dim    = a.hdim_q;
     args.s_v_head_dim     = a.hdim_v;
     args.s_q_head_num     = a.nhead_q;
-    args.s_v_Seqs         = a.stride_v * 2;
-    args.s_v_Hs           = a.nhead_stride_v * 2;
-    args.s_v_Bs           = a.batch_stride_v * 2;
-    args.s_o_Seqs         = a.stride_o * 2;
-    args.s_o_Hs           = a.nhead_stride_o * 2;
-    args.s_o_Bs           = a.batch_stride_o * 2;
+    args.s_v_Seqs         = a.stride_v * in_bpe;
+    args.s_v_Hs           = a.nhead_stride_v * in_bpe;
+    args.s_v_Bs           = a.batch_stride_v * in_bpe;
+    args.s_o_Seqs         = a.stride_o * out_bpe;
+    args.s_o_Hs           = a.nhead_stride_o * out_bpe;
+    args.s_o_Bs           = a.batch_stride_o * out_bpe;
     args.s_lse_Hs         = a.nhead_stride_lse * 4;
-    args.ptr_qseq         = nullptr;
-    args.ptr_kseq         = nullptr;
-    args.ptr_qseq_padding = nullptr;
-    args.ptr_kseq_padding = nullptr;
     // batch mode does not support padded
     if(a.is_group_mode)
     {
@@ -186,10 +211,11 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     std::string arch_id = get_gpu_arch();
 
     if((!a.use_asm_v3) || (a.hdim_q != 192 && a.hdim_q != 128) || (a.hdim_v != 128) ||
-       (a.data_type != "bf16") || (a.bias_type != 0) || (a.p_drop > 0.f) ||
+       (a.data_type != "bf16" && a.data_type != "fp8bf16") || (a.bias_type != 0) || (a.p_drop > 0.f) ||
        ((arch_id != "gfx942") && (arch_id != "gfx950")))
     {
         std::cout << "[Warning]unsupported condition in fwd_v3!!!" << std::endl;
+        std::cout << "data type" << a.data_type <<std::endl;
         return -1;
     }
 
