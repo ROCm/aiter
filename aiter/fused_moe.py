@@ -592,7 +592,7 @@ class MOEMetadata:
     use_non_temporal_load: bool = True
 
 
-def _flydsl_stage2_dispatch(
+def _flydsl_stage2_wrapper(
     inter_states,
     w1,
     w2,
@@ -601,20 +601,17 @@ def _flydsl_stage2_dispatch(
     num_valid_ids,
     out,
     topk,
+    kernelName="",
     w2_scale=None,
     a2_scale=None,
     sorted_weights=None,
-    _impl=None,
-    _tile_m=32,
-    _tile_n=128,
-    _tile_k=256,
-    _a_dtype="fp8",
-    _b_dtype="fp4",
-    _out_dtype="bf16",
-    _mode="atomic",
     **_kwargs,
 ):
-    _impl(
+
+    parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
+    if parsed is None:
+        raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
+    aiter.ops.flydsl.flydsl_moe_stage2(
         inter_states=inter_states,
         w2=w2,
         sorted_token_ids=sorted_token_ids,
@@ -622,13 +619,13 @@ def _flydsl_stage2_dispatch(
         num_valid_ids=num_valid_ids,
         out=out,
         topk=topk,
-        tile_m=_tile_m,
-        tile_n=_tile_n,
-        tile_k=_tile_k,
-        a_dtype=_a_dtype,
-        b_dtype=_b_dtype,
-        out_dtype=_out_dtype,
-        mode=_mode,
+        tile_m=parsed["tile_m"],
+        tile_n=parsed["tile_n"],
+        tile_k=parsed["tile_k"],
+        a_dtype=parsed["a_dtype"],
+        b_dtype=parsed["b_dtype"],
+        out_dtype=parsed["out_dtype"],
+        mode=parsed.get("mode", "atomic"),
         w2_scale=w2_scale,
         a2_scale=a2_scale,
         sorted_weights=sorted_weights,
@@ -930,24 +927,9 @@ def get_2stage_cfgs(
         )
     ):
         if kernelName2 and kernelName2.startswith("flydsl_") and is_flydsl_available():
-            from aiter.ops.flydsl.moe_kernels import (
-                flydsl_moe_stage2 as _flydsl_s2_impl,
-                get_flydsl_kernel_params,
-            )
-
-            parsed = get_flydsl_kernel_params(kernelName2)
-            if parsed is None:
-                raise ValueError(f"Invalid FlyDSL kernel name: {kernelName2}")
             stage2_func = functools.partial(
-                _flydsl_stage2_dispatch,
-                _impl=_flydsl_s2_impl,
-                _tile_m=parsed["tile_m"],
-                _tile_n=parsed["tile_n"],
-                _tile_k=parsed["tile_k"],
-                _a_dtype=parsed["a_dtype"],
-                _b_dtype=parsed["b_dtype"],
-                _out_dtype=parsed["out_dtype"],
-                _mode=parsed.get("mode", "atomic"),
+                _flydsl_stage2_wrapper,
+                kernelName=kernelName2,
             )
         else:
             stage2_func = functools.partial(
