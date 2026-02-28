@@ -100,6 +100,14 @@ parser.add_argument(
     e.g.: -d bf16""",
 )
 parser.add_argument(
+    "-dim",
+    type=int,
+    nargs="*",
+    default=[4096, 6144, 8192],
+    help="""Model dimension.
+    e.g.: -dim 4096""",
+)
+parser.add_argument(
     "-e",
     "--expert",
     type=int,
