@@ -9,36 +9,36 @@
 
 namespace aiter {
 
-// Log levels matching Python's logging module
-static constexpr int LOG_DEBUG   = 10;
-static constexpr int LOG_INFO    = 20;
-static constexpr int LOG_WARNING = 30;
-static constexpr int LOG_ERROR   = 40;
+    // Log levels matching Python's logging module
+    static constexpr int LOG_DEBUG   = 10;
+    static constexpr int LOG_INFO    = 20;
+    static constexpr int LOG_WARNING = 30;
+    static constexpr int LOG_ERROR   = 40;
 
-inline int get_log_level()
-{
-    const char* level_str = std::getenv("AITER_LOG_LEVEL");
-    if(level_str == nullptr)
-        return LOG_INFO; // default matches Python
-    std::string level(level_str);
-    for(auto& c : level)
-        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    if(level == "DEBUG")
-        return LOG_DEBUG;
-    if(level == "INFO")
-        return LOG_INFO;
-    if(level == "WARNING")
-        return LOG_WARNING;
-    if(level == "ERROR")
-        return LOG_ERROR;
-    return LOG_INFO; // unknown level defaults to INFO
-}
+    inline int get_log_level()
+    {
+        const char* level_str = std::getenv("AITER_LOG_LEVEL");
+        if(level_str == nullptr)
+            return LOG_INFO; // default matches Python
+        std::string level(level_str);
+        for(auto& c : level)
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if(level == "DEBUG")
+            return LOG_DEBUG;
+        if(level == "INFO")
+            return LOG_INFO;
+        if(level == "WARNING")
+            return LOG_WARNING;
+        if(level == "ERROR")
+            return LOG_ERROR;
+        return LOG_INFO; // unknown level defaults to INFO
+    }
 
-inline int current_log_level()
-{
-    static const int level = get_log_level();
-    return level;
-}
+    inline int current_log_level()
+    {
+        static const int level = get_log_level();
+        return level;
+    }
 
 } // namespace aiter
 
