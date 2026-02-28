@@ -7,7 +7,12 @@ import pandas as pd
 import os
 import sys
 from aiter import QuantType
-from aiter.jit.core import get_asm_dir, AITER_CSRC_DIR, AITER_CONFIG_FMOE
+from aiter.jit.core import (
+    get_asm_dir,
+    AITER_CSRC_DIR,
+    AITER_CONFIG_FMOE,
+    AITER_ROOT_DIR,
+)
 from aiter.fused_moe import (
     fused_topk,
     moe_sorting,
@@ -45,7 +50,7 @@ class FmoeTuner(TunerCommon):
         **TunerCommon.ARG_DEFAULTS,
         "verbose": False,
         "tune_file": f"{AITER_CONFIG_FMOE}",
-        "untune_file": "aiter/configs/untuned_fmoe.csv",
+        "untune_file": f"{AITER_ROOT_DIR}/aiter/configs/untuned_fmoe.csv",
         "errRatio": 0.5,
         "batch": 100,
         "profile_file": "",  # for all results
@@ -2006,7 +2011,7 @@ class FmoeTuner(TunerCommon):
         if len(prorfiles) > 0:
             profile_result = pd.concat(prorfiles)
             profile_result["err"] = profile_result["err"].apply(lambda x: f"{x:.1%}")
-            profile_file = "aiter/configs/profile_fmoe.csv"
+            profile_file = f"{AITER_ROOT_DIR}/aiter/configs/profile_fmoe.csv"
             old_profile = self.get_tuned_gemm_list(
                 profile_file, profile_result.columns.tolist()
             )

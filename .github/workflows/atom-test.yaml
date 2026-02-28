@@ -55,7 +55,7 @@ jobs:
           - model_name: "gpt-oss-120b"
             label: MI355
             model_path: "openai/gpt-oss-120b"
-            extraArgs: "--kv_cache_dtype fp8"
+            extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3"
             env_vars: |
               ATOM_GPT_OSS_MODEL=1
             runner: linux-aiter-mi355-1
@@ -170,6 +170,12 @@ jobs:
             model_path="${{ matrix.model_path }}"
           fi
           echo "Model path: $model_path"
+
+          echo "========= Runner debug logs ==============="
+          rocm-smi --showmemuse
+          rocm-smi --showpids
+          ps aux
+          docker ps -a
 
           docker exec atom_aiter_test bash -lc "
             set -euo pipefail

@@ -23,6 +23,7 @@ env:
   GPU_ARCH_LIST: "gfx942;gfx950"
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
+  AITER_TEST: "op_tests"
 
 jobs:
   check-signal:
@@ -127,6 +128,25 @@ jobs:
         run: |
           echo "Successfully prepared image: rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}"
       
+  split_aiter_tests:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    runs-on: ubuntu-latest
+    needs: [check-signal, build_aiter_image]
+    outputs:
+      shard_count: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Split Aiter Tests (5 shards)
+        run: ./.github/scripts/split_tests.sh --shards 5 --test-type aiter
+
+      - name: Upload test shard lists as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiter_shards
+          path: aiter_shard_*.list
+
   standard:
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     name: Standard Tests (1 GPU)
@@ -137,8 +157,44 @@ jobs:
         include:
           - runner: linux-aiter-mi355-1
             label: MI355
+            shard_total: 5
+            shard_idx: 0
+          - runner: linux-aiter-mi355-1
+            label: MI355
+            shard_total: 5
+            shard_idx: 1
+          - runner: linux-aiter-mi355-1
+            label: MI355
+            shard_total: 5
+            shard_idx: 2
+          - runner: linux-aiter-mi355-1
+            label: MI355
+            shard_total: 5
+            shard_idx: 3
+          - runner: linux-aiter-mi355-1
+            label: MI355
+            shard_total: 5
+            shard_idx: 4
           - runner: aiter-1gpu-runner
             label: MI325
+            shard_total: 5
+            shard_idx: 0
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard_total: 5
+            shard_idx: 1
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard_total: 5
+            shard_idx: 2
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard_total: 5
+            shard_idx: 3
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard_total: 5
+            shard_idx: 4
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -150,6 +206,21 @@ jobs:
       - name: Docker login
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
       
+      - name: Download test shard lists
+        uses: actions/download-artifact@v4
+        with:
+          name: aiter_shards
+
+      - name: List test shard files
+        run: |
+          ls -l aiter_shard_*.list
+
+      - name: Export test file list for this shard as env
+        id: set_shard_files
+        run: |
+          echo "AITER_TEST=$(cat aiter_shard_${{ matrix.shard_idx }}.list)" >> $GITHUB_ENV
+          echo "$AITER_TEST"
+
       - name: Run the container
         run: |
           set -ex
@@ -173,6 +244,7 @@ jobs:
           --network=host \
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
+          -e AITER_TEST="${AITER_TEST}" \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name aiter_test \
@@ -204,12 +276,12 @@ jobs:
             docker exec \
             -w /workspace \
             aiter_test \
-            bash -c "MAX_JOBS=20 ./.github/scripts/aiter_test.sh" 
+            bash -c "MAX_JOBS=20 SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh" 
           else
             docker exec \
             -w /workspace \
             aiter_test \
-            bash -c "./.github/scripts/aiter_test.sh" 
+            bash -c "SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh" 
           fi
 
       - name: Collect test logs
@@ -221,15 +293,52 @@ jobs:
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
-        if: always()
+        if: success()
         with:
-          name: standard-test-log-${{ matrix.runner }}
+          name: standard-test-log-${{ matrix.runner }}-shard-${{ matrix.shard_idx }}
           path: latest_test.log
 
       - name: Cleanup container
         if: always()
         run: |
           docker rm -f aiter_test || true
+
+  standard-test-finish:
+    if: ${{ !github.event.pull_request.draft }}
+    name: Standard Test Results
+    runs-on: ubuntu-latest
+    needs: [standard]
+    steps:
+      - name: Download all test logs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: standard-test-log-*-shard-*
+          path: .
+      
+      - name: List test logs
+        run: |
+          ls -l standard-test-log-*
+
+      - name: Check Standard Test Results
+        run: |
+          set -ex
+          echo "Checking Standard Test Results..."
+          all_passed=true
+          for shard in {0..4}; do
+            for runner in {linux-aiter-mi355-1,aiter-1gpu-runner}; do
+              if [ ! -f standard-test-log-${runner}-shard-${shard}/latest_test.log ]; then
+                echo "Test report for ${runner} shard ${shard} not found."
+                all_passed=false
+                break
+              fi
+            done
+          done
+          if [ "$all_passed" = true ]; then
+            echo "All tests passed."
+          else
+            echo "Test failures or errors detected."
+            exit 1
+          fi
 
   multi-gpu:
     name: Multi-GPU Tests (8 GPU)
