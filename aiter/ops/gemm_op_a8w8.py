@@ -5,6 +5,8 @@ import torch
 from torch import Tensor
 from typing import Optional
 import functools
+import os
+import sys
 import pandas as pd
 from aiter import logger
 from ..jit.core import (
@@ -20,6 +22,116 @@ from torch.library import Library
 from ..ops.gemm_op_common import get_padded_m
 
 aiter_lib = Library("aiter", "FRAGMENT")
+
+# ---------------------------------------------------------------------------
+# FlyDSL preshuffle GEMM integration
+# ---------------------------------------------------------------------------
+_flydsl_compile_fn = None
+_flydsl_import_done = False
+_flydsl_kernel_cache: dict = {}
+
+
+def _flydsl_get_compile_fn():
+    """Lazy-import compile_preshuffle_gemm_a8 so the module loads even without FlyDSL."""
+    global _flydsl_compile_fn, _flydsl_import_done
+    if _flydsl_import_done:
+        return _flydsl_compile_fn
+    _flydsl_import_done = True
+    try:
+        DSL2_ROOT = os.environ.get("DSL2_ROOT", None)
+        if not DSL2_ROOT:
+            raise RuntimeError(
+                "FlyDSL path not found. Please set environment variable, e.g. "
+                "`export DSL2_ROOT=/path/to/FlyDSL`"
+            )
+        if DSL2_ROOT not in sys.path:
+            sys.path.insert(0, DSL2_ROOT)
+        from kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
+        _flydsl_compile_fn = compile_preshuffle_gemm_a8
+        logger.info(f"[FlyDSL] loaded from {DSL2_ROOT}")
+    except Exception as e:
+        logger.info(f"[FlyDSL] not available, will fall back to CK/CKTile: {e}")
+    return _flydsl_compile_fn
+
+
+def _flydsl_select_tiles(M: int, N: int, K: int):
+    """Pick (tile_m, tile_n, tile_k) satisfying kernel divisibility constraints.
+
+    Returns a tuple or *None* when no valid tiling exists.
+    """
+    for tile_n in (256, 128, 64):
+        if N % tile_n == 0:
+            break
+    else:
+        return None
+    for tile_k in (512, 256, 128):
+        if K % tile_k == 0:
+            break
+    else:
+        return None
+    if M <= 16:
+        tile_m = 16
+    elif M <= 64:
+        tile_m = 32
+    elif M <= 256:
+        tile_m = 64
+    else:
+        tile_m = 128
+    return tile_m, tile_n, tile_k
+
+
+def _flydsl_preshuffle_gemm_a8(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> Optional[Tensor]:
+
+    compile_fn = _flydsl_get_compile_fn()
+    if compile_fn is None:
+        return None
+
+    m, k = XQ.shape[0], XQ.shape[-1]
+    n = WQ.shape[0]
+
+    if XQ.dtype == dtypes.fp8:
+        in_dtype = "fp8"
+    elif XQ.dtype == torch.int8:
+        in_dtype = "int8"
+    else:
+        return None
+
+    tiles = _flydsl_select_tiles(m, n, k)
+    if tiles is None:
+        return None
+    tile_m, tile_n, tile_k = tiles
+
+    cache_key = (m, n, k, in_dtype, tile_m, tile_n, tile_k)
+    if cache_key not in _flydsl_kernel_cache:
+        try:
+            exe = compile_fn(
+                M=m, N=n, K=k,
+                tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+                in_dtype=in_dtype,
+            )
+            _flydsl_kernel_cache[cache_key] = exe
+        except Exception as e:
+            logger.warning(f"[FlyDSL] compile failed ({m},{n},{k} {in_dtype}): {e}")
+            _flydsl_kernel_cache[cache_key] = None
+
+    exe = _flydsl_kernel_cache[cache_key]
+    if exe is None:
+        return None
+
+    c_out = torch.empty(m, n, dtype=torch.float16, device=XQ.device)
+    stream_ptr = torch.cuda.current_stream().cuda_stream
+    exe(c_out, XQ, WQ, x_scale, w_scale, m, n, k, stream_ptr)
+    logger.info(f"[FlyDSL] executed preshuffle GEMM ({m},{n},{k} {in_dtype} tile={tile_m}x{tile_n}x{tile_k})")
+
+    if out_dtype != torch.float16:
+        c_out = c_out.to(out_dtype)
+    return c_out
 
 
 def gen_gemm_a8w8_ck_fake_tensors(
@@ -485,9 +597,7 @@ def gemm_a8w8_bpreshuffle(
     #         return res
     assert WQ.dtype == dtypes.fp8, "gemm_a8w8_bpreshuffle only support fp8 now"
     assert bias is None, "gemm_a8w8_bpreshuffle does not support bias now"
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
-    # CKTile only supports bf16 dtype
     config = get_bpreshuffle_GEMM_config(
         m,
         n,
@@ -495,12 +605,24 @@ def gemm_a8w8_bpreshuffle(
         dtypes.fp8,
         AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
     )
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     if config is not None:
         libtype = config["libtype"]
         if libtype == "ck":
             return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
         elif libtype == "cktile":
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
+        elif libtype == "flydsl":
+            flydsl = _flydsl_preshuffle_gemm_a8(
+                XQ.contiguous(), WQ.contiguous(), x_scale, w_scale, out_dtype=dtype
+            )
+            if flydsl is not None:
+                return flydsl
+            logger.warning(
+                f"[FlyDSL] tuned config selected flydsl but unavailable, "
+                f"falling back to ck for ({m},{n},{k})"
+            )
+            return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
     else:
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
