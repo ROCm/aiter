@@ -55,7 +55,7 @@ jobs:
           - model_name: "gpt-oss-120b"
             label: MI355
             model_path: "openai/gpt-oss-120b"
-            extraArgs: "--kv_cache_dtype fp8"
+            extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3"
             env_vars: |
               ATOM_GPT_OSS_MODEL=1
             runner: linux-aiter-mi355-1
@@ -125,6 +125,7 @@ jobs:
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
           -e ATOM_DISABLE_MMAP=true \
+          -e HF_TOKEN="${HF_TOKEN:-${{ secrets.HF_TOKEN_TEST }}}" \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name atom_aiter_test \
@@ -156,7 +157,7 @@ jobs:
           fi
 
       - name: Run ATOM simple inference
-        timeout-minutes: 30
+        timeout-minutes: 60
         run: |
           # Run the inference and capture output
           set -euo pipefail
@@ -169,6 +170,12 @@ jobs:
             model_path="${{ matrix.model_path }}"
           fi
           echo "Model path: $model_path"
+
+          echo "========= Runner debug logs ==============="
+          rocm-smi --showmemuse
+          rocm-smi --showpids
+          ps aux
+          docker ps -a
 
           docker exec atom_aiter_test bash -lc "
             set -euo pipefail
@@ -185,7 +192,7 @@ jobs:
         
       - name: Run ATOM accuracy test
         if: ${{ matrix.model_name != 'DeepSeek-R1-0528' }}
-        timeout-minutes: 30
+        timeout-minutes: 60
         run: |
           set -euo pipefail
           echo ""

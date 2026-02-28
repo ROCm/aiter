@@ -33,17 +33,60 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
 
+  # Step 1: split triton tests into 8 shards, output triton_shard_0.list ... triton_shard_7.list
+  split_triton_tests:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    runs-on: ubuntu-latest
+    needs: [check-signal]
+    outputs:
+      shard_count: 8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Split Triton Tests (8 shards)
+        run: ./.github/scripts/split_tests.sh --shards 8 --test-type triton
+
+      - name: Upload test shard lists as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: triton_shards
+          path: triton_shard_*.list
+
+  # Step 2: matrix jobs consume shard file lists
   triton:
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
-    name: Triton Tests (1 GPU)
+    name: Triton Tests (1 GPU) / Shard ${{ matrix.shard }}
     runs-on: ${{ matrix.runner }}
-    needs: [check-signal]
+    needs: [split_triton_tests, check-signal]
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: aiter-1gpu-runner
             label: MI325
+            shard: 0
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard: 1
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard: 2
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard: 3
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard: 4
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard: 5
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard: 6
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard: 7
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
       TRITON_TEST: "op_tests/triton_tests/"
@@ -55,9 +98,25 @@ jobs:
           fetch-depth: 1
           submodules: 'recursive'
 
+      - name: Download test shard lists
+        uses: actions/download-artifact@v4
+        with:
+          name: triton_shards
+
+      - name: List test shard files
+        run: |
+          ls -l triton_shard_*.list
+
       - name: Docker login
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
-        
+
+      - name: Export test file list for this shard as env
+        id: set_shard_files
+        run: |
+          TRITON_TEST=$(cat triton_shard_${{ matrix.shard }}.list)
+          echo "$TRITON_TEST"
+          echo "TRITON_TEST=$TRITON_TEST" >> $GITHUB_ENV
+
       - name: Run the container
         run: |
           set -ex
@@ -78,15 +137,6 @@ jobs:
           -w /workspace \
           --name triton_test \
           ${{ env.DOCKER_IMAGE }}
-
-      - name: Install speedtest-cli and test network
-        run: |
-          set -ex
-          echo "Installing speedtest-cli and testing network..."
-          docker exec \
-          -w /workspace \
-          triton_test \
-          bash -c "pip install speedtest-cli && speedtest-cli --simple" || true
 
       - name: Setup pip config
         run: |
@@ -113,25 +163,25 @@ jobs:
 
       # TODO: Uncomment [docker exec -w /workspace triton_test cat "${ENV_FILE}" >> "${GITHUB_ENV}"]
       #       command to enable test selection.
-      - name: Triton Test Selection Script
-        # main branch should always run the full test suite.
-        if: ${{ github.ref != 'refs/heads/main' }}
-        run: |
-          set -ex
-          git fetch --no-tags origin --depth=1 \
-            "pull/${{ github.event.pull_request.number }}/merge:pr-merge"
-          git fetch --no-tags origin --depth=1 \
-            "refs/heads/${{ github.event.pull_request.base.ref }}:target"
-          ENV_FILE=$(docker exec -w /workspace triton_test \
-            mktemp /workspace/github_env.XXXXXXXXXX.tmp)
-          docker exec -w /workspace triton_test \
-            git config --global --add safe.directory /workspace
-          docker exec -w /workspace triton_test \
-            python .github/scripts/select_triton_tests.py \
-              --source pr-merge --target target \
-              --env-var TRITON_TEST --env-file "${ENV_FILE}"
-          # docker exec -w /workspace triton_test cat "${ENV_FILE}" >> "${GITHUB_ENV}"
-          docker exec -w /workspace triton_test rm "${ENV_FILE}"
+      # - name: Triton Test Selection Script
+      #   # main branch should always run the full test suite.
+      #   if: ${{ github.ref != 'refs/heads/main' }}
+      #   run: |
+      #     set -ex
+      #     git fetch --no-tags origin --depth=1 \
+      #       "pull/${{ github.event.pull_request.number }}/merge:pr-merge"
+      #     git fetch --no-tags origin --depth=1 \
+      #       "refs/heads/${{ github.event.pull_request.base.ref }}:target"
+      #     ENV_FILE=$(docker exec -w /workspace triton_test \
+      #       mktemp /workspace/github_env.XXXXXXXXXX.tmp)
+      #     docker exec -w /workspace triton_test \
+      #       git config --global --add safe.directory /workspace
+      #     docker exec -w /workspace triton_test \
+      #       python .github/scripts/select_triton_tests.py \
+      #         --source pr-merge --target target \
+      #         --env-var TRITON_TEST --env-file "${ENV_FILE}"
+      #     # docker exec -w /workspace triton_test cat "${ENV_FILE}" >> "${GITHUB_ENV}"
+      #     docker exec -w /workspace triton_test rm "${ENV_FILE}"
 
       - name: Triton Tests
         run: |
@@ -142,12 +192,43 @@ jobs:
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
-        if: always()
+        if: success()
         with:
-          name: triton-test-logs
+          name: triton-test-shard-${{ matrix.shard }}
           path: test-reports/triton.xml
 
       - name: Cleanup container
         if: always()
         run: |
           docker rm -f triton_test || true
+
+  triton-test-finish:
+    if: ${{ !github.event.pull_request.draft }}
+    name: Triton Test Results
+    runs-on: ubuntu-latest
+    needs: [triton]
+    steps:
+      - name: Download all test reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: triton-test-shard-*
+          path: .
+      
+      - name: Check Triton Test Results
+        run: |
+          set -ex
+          echo "Checking Triton Test Results..."
+          all_passed=true
+          for shard in {0..7}; do
+            if [ ! -f triton-test-shard-${shard}/triton.xml ]; then
+              echo "Test report for shard ${shard} not found."
+              all_passed=false
+              break
+            fi
+          done
+          if [ "$all_passed" = true ]; then
+            echo "All tests passed."
+          else
+            echo "Test failures or errors detected."
+            exit 1
+          fi
