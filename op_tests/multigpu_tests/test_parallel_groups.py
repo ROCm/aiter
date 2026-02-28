@@ -222,7 +222,7 @@ def test_parallel_groups(
     if all_pass:
         print(f"\n  [ALL PASS] tp={tp_size}, dp={dp_size}, pp={pp_size}, ep={ep_size}")
     else:
-        print(f"\n  [FAIL] Some checks failed!")
+        print("\n  [FAIL] Some checks failed!")
     print()
 
 
