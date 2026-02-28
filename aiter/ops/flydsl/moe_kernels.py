@@ -4,14 +4,11 @@
 """FlyDSL MOE kernel management: naming, compilation, and high-level API."""
 
 import functools
-import re
 from typing import Dict, Optional
 
 import torch
 
-_KERNEL_NAME_RE = re.compile(
-    r"flydsl_moe(\d+)_a(\w+)_w(\w+)_(\w+)_t(\d+)x(\d+)x(\d+)(?:_(\w+))?"
-)
+_KERNEL_PARAMS: Dict[str, Dict] = {}
 
 
 def flydsl_kernel_name(
@@ -31,23 +28,9 @@ def flydsl_kernel_name(
     return name
 
 
-def parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
-    """Parse kernel name into component parameters, or return None."""
-    if not name or not name.startswith("flydsl_moe"):
-        return None
-    m = _KERNEL_NAME_RE.match(name)
-    if not m:
-        return None
-    return {
-        "stage": int(m.group(1)),
-        "a_dtype": m.group(2),
-        "b_dtype": m.group(3),
-        "out_dtype": m.group(4),
-        "tile_m": int(m.group(5)),
-        "tile_n": int(m.group(6)),
-        "tile_k": int(m.group(7)),
-        "mode": m.group(8) or "",
-    }
+def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
+    """Lookup kernel params by name (O(1))."""
+    return _KERNEL_PARAMS.get(name)
 
 
 def get_flydsl_stage1_kernels(
@@ -107,6 +90,18 @@ def get_flydsl_stage2_kernels(
                         "MPerBlock": tm,
                     }
     return kernels
+
+
+def _register_all_configs():
+    """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
+    for a in ("fp8", "fp4", "fp16"):
+        for b in ("fp4",):
+            for out in ("bf16", "f16"):
+                _KERNEL_PARAMS.update(get_flydsl_stage1_kernels(a, b, out))
+                _KERNEL_PARAMS.update(get_flydsl_stage2_kernels(a, b, out))
+
+
+_register_all_configs()
 
 
 def compile_flydsl_moe_stage1(
@@ -411,21 +406,6 @@ def _get_compiled_stage2(
 
 
 # Public API
-
-_DTYPE_TO_A_STR = {
-    torch.float4_e2m1fn_x2: "fp4",
-    torch.float8_e4m3fnuz: "fp8",
-    torch.float8_e4m3fn: "fp8",
-    torch.float16: "fp16",
-    torch.bfloat16: "bf16",
-}
-
-
-def _infer_a_dtype(t: torch.Tensor) -> str:
-    s = _DTYPE_TO_A_STR.get(t.dtype)
-    if s is None:
-        raise ValueError(f"Unsupported activation dtype: {t.dtype}")
-    return s
 
 
 def flydsl_moe_stage1(
