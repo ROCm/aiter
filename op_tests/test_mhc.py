@@ -13,7 +13,6 @@ from aiter import dtypes
 import argparse
 import pandas as pd
 
-
 torch.set_default_device("cuda")
 # torch.cuda.manual_seed_all(0)
 # torch.set_printoptions(precision=3, linewidth=200, sci_mode=False)
@@ -350,8 +349,6 @@ def mhc_pre_ref(
     sinkhorn_repeat: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     hc_mult = residual.shape[-2]
-    hc_mult3 = fn.shape[0]
-    hc_hidden_size = fn.shape[1]
 
     residual_flat = residual.flatten(-2, -1).float()
     sqrsum = residual_flat.square().sum(-1)
@@ -512,4 +509,4 @@ for dtype in args.dtype:
                 df.append(ret)
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
-aiter.logger.info("mhc summary (markdown):\n%s", df_md)
+aiter.logger.info("mhc_pre summary (markdown):\n%s", df_md)

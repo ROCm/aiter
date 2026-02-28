@@ -4,7 +4,6 @@
 import torch
 import math
 from torch import Tensor
-from typing import Optional
 from aiter import dtypes
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num
