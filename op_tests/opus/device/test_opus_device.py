@@ -1,46 +1,32 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """
-Test OPUS device kernels via a single PyTorch extension (opus_device_test).
+Test OPUS device kernels via a ctypes wrapper around opus_device_test.so.
+
+The .so is built by setup.py using hipcc directly (no torch/pybind11 headers
+needed at compile time). Python loads it via ctypes and calls the extern "C"
+launcher functions, passing device pointers obtained from torch tensors.
+
 Covers:
-  - MFMA 32x32x2   fp32      (gfx942 + gfx950)
-  - MFMA 16x16x4   fp32      (gfx942 + gfx950)
-  - MFMA 32x32x8   fp16/bf16 (gfx942 only)
-  - MFMA 16x16x16  fp16/bf16 (gfx942 only)
-  - MFMA 32x32x16  fp16/bf16 (gfx942 + gfx950)
-  - MFMA 16x16x32  fp16/bf16 (gfx942 + gfx950)
-  - MFMA 32x32x16  fp8/bf8  (gfx942 + gfx950, fp32 output)
-  - MFMA 16x16x32  fp8/bf8  (gfx942 + gfx950, fp32 output)
-  - MXFP8 32x32x64  fp8*fp8 (gfx950 only, fp32 output)
-  - MXFP8 16x16x128 fp8*fp8 (gfx950 only, fp32 output)
-  - MXFP4 32x32x64  fp4*fp4 (gfx950 only, fp32 output)
-  - MXFP4 16x16x128 fp4*fp4 (gfx950 only, fp32 output)
-  - vector_add (all GPUs)
-  - async_load (all GPUs)
-  - dtype_convert: FP32<->BF16, FP32<->FP16 scalar round-trips (all GPUs)
-  - dtype_convert: FP32x4<->BF16x4, FP32x4<->FP16x4 vectorized round-trips (all GPUs)
-  - dtype_convert: FP32<->FP8 scalar, packed x4, x2, and auto-fold x8 round-trips (all GPUs)
-  - dtype_convert: FP32<->FP4 packed x8, x4, x2 round-trips (gfx950 only)
-  - predicated_copy: gmem load_if/store_if with boundary predicate (all GPUs)
-  - free_func_vector_add: opus::load/store free function API (all GPUs)
-  - predicated_async_load: gmem async_load_if with boundary predicate (all GPUs)
-  - numeric_limits: min/max/lowest/quiet_nan/infinity bitwise match against torch (all GPUs)
+  - MFMA variants (fp32, fp16, bf16, fp8, bf8)
+  - MXFP variants (fp8, fp4) -- gfx950 only
+  - vector_add, async_load, dtype_convert, predicated_copy, free_func_add,
+    predicated_async_load, numeric_limits, mdiv, workgroup_barrier
 """
 
-import glob
+import ctypes
 import os
 import subprocess
 import sys
 
 try:
     import torch
-    from torch.utils.cpp_extension import BuildExtension, CUDAExtension  # noqa: F401
 except ImportError as e:
-    print(f"SKIP: PyTorch or C++ extension support not available ({e})")
+    print(f"SKIP: PyTorch not available ({e})")
     sys.exit(0)
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_MODULE_NAME = "opus_device_test"
+_SO_NAME = "opus_device_test.so"
 
 
 # ---------------------------------------------------------------------------
@@ -48,51 +34,138 @@ _MODULE_NAME = "opus_device_test"
 # ---------------------------------------------------------------------------
 
 
-def _clean_previous_extension():
-    """Remove previously built extension and build dir for a fresh build."""
-    removed = []
-    for pattern in (f"{_MODULE_NAME}*.so", f"{_MODULE_NAME}*.pyd"):
-        for path in glob.glob(os.path.join(_THIS_DIR, pattern)):
-            try:
-                os.remove(path)
-                removed.append(path)
-            except OSError as e:
-                print(f"WARNING: could not remove {path}: {e}", file=sys.stderr)
-    build_dir = os.path.join(_THIS_DIR, "build")
-    if os.path.isdir(build_dir):
-        try:
-            import shutil
-
-            shutil.rmtree(build_dir)
-            removed.append(build_dir)
-        except OSError as e:
-            print(f"WARNING: could not remove {build_dir}: {e}", file=sys.stderr)
-    if removed:
-        print(
-            "Cleaned previous extension:",
-            " ".join(os.path.basename(p) for p in removed),
-        )
-
-
-def _ensure_extension_built():
-    """Build extension with setup.py if not already importable."""
-    try:
-        __import__(_MODULE_NAME)
-        return True
-    except ModuleNotFoundError:
-        pass
-    if _THIS_DIR not in sys.path:
-        sys.path.insert(0, _THIS_DIR)
+def _build_so():
+    """Build opus_device_test.so via setup.py (hipcc, no torch/pybind11)."""
+    so_path = os.path.join(_THIS_DIR, _SO_NAME)
     try:
         subprocess.run(
-            [sys.executable, "setup.py", "build_ext", "--inplace"],
+            [sys.executable, "setup.py"],
             cwd=_THIS_DIR,
             check=True,
         )
     except subprocess.CalledProcessError as e:
         print(f"FAIL: Build exited with code {e.returncode}", file=sys.stderr)
-        return False
-    return True
+        return None
+    if not os.path.isfile(so_path):
+        print(f"FAIL: {_SO_NAME} not found after build", file=sys.stderr)
+        return None
+    return so_path
+
+
+# ---------------------------------------------------------------------------
+# ctypes wrapper -- same interface as the old pybind11 module
+# ---------------------------------------------------------------------------
+
+_VP = ctypes.c_void_p
+_I = ctypes.c_int
+
+
+class OpusDeviceLib:
+    """Thin ctypes wrapper that provides the same call interface as the old
+    pybind11 module so test functions don't need to change."""
+
+    def __init__(self, so_path):
+        self._lib = ctypes.CDLL(so_path)
+
+    @staticmethod
+    def _ptr(tensor):
+        return ctypes.c_void_p(tensor.data_ptr())
+
+    # -- MFMA --
+    def run_mfma(self, A, B, C, variant):
+        fn = getattr(self._lib, f"run_mfma_{variant}")
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _VP, _I, _I, _I]
+        fn(
+            self._ptr(A),
+            self._ptr(B),
+            self._ptr(C),
+            int(A.stride(0)),
+            int(B.stride(0)),
+            int(C.stride(0)),
+        )
+
+    # -- MXFP --
+    def run_mxfp(self, A, B, C, variant, scale_a=127, scale_b=127):
+        fn = getattr(self._lib, f"run_{variant}")
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _VP, _I, _I]
+        fn(self._ptr(A), self._ptr(B), self._ptr(C), int(scale_a), int(scale_b))
+
+    # -- vector_add --
+    def run_vector_add(self, A, B, Result):
+        fn = self._lib.run_vector_add
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _VP, _I]
+        fn(self._ptr(A), self._ptr(B), self._ptr(Result), int(A.numel()))
+
+    # -- async_load --
+    def run_async_load(self, Src, Dst):
+        fn = self._lib.run_async_load
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _I]
+        fn(self._ptr(Src), self._ptr(Dst), int(Src.numel()))
+
+    # -- dtype_convert --
+    def run_dtype_convert(self, In, Out, variant):
+        fn = getattr(self._lib, f"run_dtype_convert_{variant}")
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _I]
+        fn(self._ptr(In), self._ptr(Out), int(In.numel()))
+
+    # -- predicated_copy --
+    def run_predicated_copy(self, Src, Dst):
+        fn = self._lib.run_predicated_copy
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _I]
+        fn(self._ptr(Src), self._ptr(Dst), int(Src.numel()))
+
+    # -- free_func_add --
+    def run_free_func_add(self, A, B, Result):
+        fn = self._lib.run_free_func_add
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _VP, _I]
+        fn(self._ptr(A), self._ptr(B), self._ptr(Result), int(A.numel()))
+
+    # -- predicated_async_load --
+    def run_predicated_async_load(self, Src, Dst, n_padded):
+        fn = self._lib.run_predicated_async_load
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _I, _I]
+        fn(self._ptr(Src), self._ptr(Dst), int(Src.numel()), int(n_padded))
+
+    # -- numeric_limits --
+    def run_numeric_limits(self, Out):
+        fn = self._lib.run_numeric_limits
+        fn.restype = None
+        fn.argtypes = [_VP]
+        fn(self._ptr(Out))
+
+    # -- mdiv --
+    def run_mdiv(self, Dividends, OutQ, OutR, divisor):
+        fn = self._lib.run_mdiv
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _VP, _I, _I]
+        fn(
+            self._ptr(Dividends),
+            self._ptr(OutQ),
+            self._ptr(OutR),
+            int(divisor),
+            int(Dividends.numel()),
+        )
+
+    # -- workgroup_barrier --
+    def run_wb_cumulative(self, Accum, n_workgroups):
+        fn = self._lib.run_workgroup_barrier_cumulative
+        fn.restype = None
+        fn.argtypes = [_VP, _I]
+        fn(self._ptr(Accum), int(n_workgroups))
+
+    def run_wb_streamk_reduce(self, Input, Workspace, Result, n_chunks):
+        fn = self._lib.run_workgroup_barrier_streamk_reduce
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _VP, _I]
+        fn(self._ptr(Input), self._ptr(Workspace), self._ptr(Result), int(n_chunks))
 
 
 def _get_gpu_arch():
@@ -1277,14 +1350,14 @@ def main():
         print("SKIP: CUDA not available")
         return 0
 
-    _clean_previous_extension()
     arch = _get_gpu_arch()
     print(f"GPU arch: {arch}")
-    print(f"Building {_MODULE_NAME} extension ...")
-    if not _ensure_extension_built():
+    print(f"Building {_SO_NAME} ...")
+    so_path = _build_so()
+    if so_path is None:
         return 1
 
-    mod = __import__(_MODULE_NAME)
+    mod = OpusDeviceLib(so_path)
 
     failures = 0
     failures += test_mfma_32x32x2_f32(mod)

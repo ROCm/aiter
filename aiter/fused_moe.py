@@ -1696,6 +1696,7 @@ def fused_topk(
         (128, 8),
         (256, 6),
         (256, 8),
+        (384, 8),
     ] and gating_output.dtype in [dtypes.bf16, dtypes.fp32]:
         if topk_weights is None:
             topk_weights = torch.empty(

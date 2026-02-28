@@ -109,7 +109,7 @@ def test_topk_softmax(dtype, token, E, topk, renormalize=True):
     ret = {}
     for tag, func in func_dict.items():
         if tag == "asm" and not (
-            (E, topk) in [(128, 4), (128, 6), (128, 8), (256, 6), (256, 8)]
+            (E, topk) in [(128, 4), (128, 6), (128, 8), (256, 6), (256, 8), (384, 8)]
             and dtype in [dtypes.bf16, dtypes.fp32]
         ):
             continue
