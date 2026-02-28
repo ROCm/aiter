@@ -1,31 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL MOE kernel management utilities.
-
-Provides:
-
-**Kernel name utilities**
-
-- ``flydsl_kernel_name``         -- construct kernel name from compile parameters
-- ``parse_flydsl_kernel_name``   -- parse kernel name back to parameters
-- ``get_flydsl_stage1_kernels``  -- enumerate valid stage1 configurations
-- ``get_flydsl_stage2_kernels``  -- enumerate valid stage2 configurations
-
-**Low-level compile helpers**  (return raw ``exe`` callable)
-
-- ``compile_flydsl_moe_stage1``  -- compile stage1 kernel
-- ``compile_flydsl_moe_stage2``  -- compile stage2 kernel
-
-**High-level public API**  (FlashInfer-style, handles alloc / dtype / shuffle)
-
-- ``flydsl_moe_stage1``          -- fused gate+up GEMM (stage1)
-- ``flydsl_moe_stage2``          -- down-projection GEMM (stage2)
-"""
+"""FlyDSL MOE kernel management: naming, compilation, and high-level API."""
 
 import functools
 import re
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import torch
 
@@ -44,20 +24,7 @@ def flydsl_kernel_name(
     tile_k: int,
     mode: str = "",
 ) -> str:
-    """Construct a FlyDSL MOE kernel name encoding compile parameters.
-
-    Format: flydsl_moe{stage}_a{a_dtype}_w{b_dtype}_{out_dtype}_t{tile_m}x{tile_n}x{tile_k}[_{mode}]
-
-    Args:
-        stage: 1 or 2
-        a_dtype: activation dtype ("fp8", "fp4", "fp16", etc.)
-        b_dtype: weight dtype ("fp4", "fp8", "fp16", etc.)
-        out_dtype: output dtype ("bf16", "f16", "fp8", etc.)
-        tile_m: M tile size (block_m)
-        tile_n: N tile size
-        tile_k: K tile size
-        mode: optional mode suffix for stage2 ("reduce", "atomic")
-    """
+    """Construct kernel name: flydsl_moe{stage}_a{a}_w{b}_{out}_t{M}x{N}x{K}[_{mode}]."""
     name = f"flydsl_moe{stage}_a{a_dtype}_w{b_dtype}_{out_dtype}_t{tile_m}x{tile_n}x{tile_k}"
     if mode:
         name += f"_{mode}"
@@ -65,10 +32,7 @@ def flydsl_kernel_name(
 
 
 def parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
-    """Parse a FlyDSL kernel name into its component parameters.
-
-    Returns None if the name is not a valid FlyDSL kernel name.
-    """
+    """Parse kernel name into component parameters, or return None."""
     if not name or not name.startswith("flydsl_moe"):
         return None
     m = _KERNEL_NAME_RE.match(name)
@@ -89,7 +53,7 @@ def parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
 def get_flydsl_stage1_kernels(
     a_dtype: str, b_dtype: str, out_dtype: str
 ) -> Dict[str, Dict]:
-    """Return a dict of kernelName -> params for all supported FlyDSL stage1 configs."""
+    """Return {kernelName: params} for all supported stage1 configs."""
     kernels = {}
     is_fp4 = b_dtype == "fp4"
     tile_ns = [256] if is_fp4 else [128]
@@ -116,7 +80,7 @@ def get_flydsl_stage1_kernels(
 def get_flydsl_stage2_kernels(
     a_dtype: str, b_dtype: str, out_dtype: str
 ) -> Dict[str, Dict]:
-    """Return a dict of kernelName -> params for all supported FlyDSL stage2 configs."""
+    """Return {kernelName: params} for all supported stage2 configs."""
     kernels = {}
     is_fp4 = b_dtype == "fp4"
     tile_ns = [128, 256] if is_fp4 else [128]
@@ -158,7 +122,7 @@ def compile_flydsl_moe_stage1(
     b_dtype: str,
     out_dtype: str,
 ):
-    """Compile FlyDSL stage1 kernel (or return cached via underlying lru_cache)."""
+    """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
 
@@ -207,7 +171,7 @@ def compile_flydsl_moe_stage2(
     out_dtype: str,
     accumulate: bool = True,
 ):
-    """Compile FlyDSL stage2 kernel (or return cached via underlying lru_cache)."""
+    """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
 
@@ -243,9 +207,7 @@ def compile_flydsl_moe_stage2(
         )
 
 
-# ---------------------------------------------------------------------------
-# Private: compiled kernel closures  (similar to FlashInfer _get_compiled_kernel)
-# ---------------------------------------------------------------------------
+# Private: compiled kernel closures
 
 
 @functools.cache
@@ -262,7 +224,7 @@ def _get_compiled_stage1(
     b_dtype: str,
     out_dtype: str,
 ):
-    """Compile and cache a stage1 kernel, return a ``tensor_api`` closure."""
+    """Compile and cache stage1 kernel, return a tensor_api closure."""
     exe = compile_flydsl_moe_stage1(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -348,7 +310,7 @@ def _get_compiled_stage2(
     out_dtype: str,
     accumulate: bool = True,
 ):
-    """Compile and cache a stage2 kernel, return a ``tensor_api`` closure."""
+    """Compile and cache stage2 kernel, return a tensor_api closure."""
     exe = compile_flydsl_moe_stage2(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -448,9 +410,7 @@ def _get_compiled_stage2(
     return tensor_api
 
 
-# ---------------------------------------------------------------------------
-# Public API  (similar to FlashInfer rmsnorm_fp4quant)
-# ---------------------------------------------------------------------------
+# Public API
 
 _DTYPE_TO_A_STR = {
     torch.float4_e2m1fn_x2: "fp4",
@@ -487,44 +447,10 @@ def flydsl_moe_stage1(
     a1_scale: Optional[torch.Tensor] = None,
     sorted_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Fused gate+up GEMM (MOE stage1) using FlyDSL.
+    """Fused gate+up GEMM (MOE stage1).
 
-    Parameters
-    ----------
-    a : torch.Tensor
-        Activation tensor, shape ``(token_num, model_dim)``.
-    w1 : torch.Tensor
-        Gate+up weight, shape ``(E, 2*inter_dim, model_dim)`` (pre-shuffled).
-    sorted_token_ids : torch.Tensor
-        Sorted token IDs from moe_sorting.
-    sorted_expert_ids : torch.Tensor
-        Sorted expert IDs (one per M-tile block).
-    num_valid_ids : torch.Tensor
-        Number of valid token IDs.
-    out : torch.Tensor, optional
-        Output tensor ``(token_num, topk, inter_dim)``.
-        If ``None``, will be allocated automatically.
-    topk : int
-        Number of experts per token.
-    tile_m, tile_n, tile_k : int
-        Tile sizes for the kernel.
-    a_dtype : str
-        Activation dtype (``"fp8"``, ``"fp4"``, ``"fp16"``, etc.).
-    b_dtype : str
-        Weight dtype (``"fp4"``, ``"fp8"``, etc.).
-    out_dtype : str
-        Output dtype (``"bf16"``, ``"f16"``).
-    w1_scale : torch.Tensor, optional
-        Weight scale factors.
-    a1_scale : torch.Tensor, optional
-        Activation scale factors.
-    sorted_weights : torch.Tensor, optional
-        Per-token expert weights (for weighted MOE).
-
-    Returns
-    -------
-    torch.Tensor
-        Stage1 output of shape ``(token_num, topk, inter_dim)``.
+    a: (token_num, model_dim), w1: (E, 2*inter_dim, model_dim) pre-shuffled.
+    Returns (token_num, topk, inter_dim).
     """
     token_num = a.shape[0]
     E = w1.shape[0]
@@ -604,51 +530,10 @@ def flydsl_moe_stage2(
     a2_scale: Optional[torch.Tensor] = None,
     sorted_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Down-projection GEMM (MOE stage2) using FlyDSL.
+    """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
-    Supports ``atomic`` and ``reduce`` modes.  For reduce mode a temporary
-    buffer is allocated internally and a reduction kernel produces the final
-    output, avoiding atomic contention.
-
-    Parameters
-    ----------
-    inter_states : torch.Tensor
-        Intermediate activations from stage1, shape ``(token_num, topk, inter_dim)``.
-    w2 : torch.Tensor
-        Down-projection weight, shape ``(E, model_dim, inter_dim)``,
-        must be pre-shuffled via ``shuffle_weight(w2, layout=(16,16))``.
-    sorted_token_ids : torch.Tensor
-        Sorted token IDs from moe_sorting.
-    sorted_expert_ids : torch.Tensor
-        Sorted expert IDs.
-    num_valid_ids : torch.Tensor
-        Number of valid token IDs.
-    out : torch.Tensor, optional
-        Output tensor ``(token_num, model_dim)``.
-        If ``None``, will be allocated (zeroed for atomic mode).
-    topk : int
-        Number of experts per token.
-    tile_m, tile_n, tile_k : int
-        Tile sizes for the kernel.
-    a_dtype : str
-        Activation dtype (``"fp8"``, ``"fp4"``, ``"fp16"``, etc.).
-    b_dtype : str
-        Weight dtype (``"fp4"``, ``"fp8"``, etc.).
-    out_dtype : str
-        Output dtype (``"bf16"``, ``"f16"``).
-    mode : str
-        Execution mode: ``"atomic"`` (default) or ``"reduce"``.
-    w2_scale : torch.Tensor, optional
-        Weight scale factors (pre-shuffled via ``e8m0_shuffle`` for fp4).
-    a2_scale : torch.Tensor, optional
-        Activation scale factors.
-    sorted_weights : torch.Tensor, optional
-        Per-token expert weights.
-
-    Returns
-    -------
-    torch.Tensor
-        Stage2 output of shape ``(token_num, model_dim)``.
+    a: (token_num, topk, inter_dim), w1: (E, model_dim, inter_dim) pre-shuffled.
+    Returns (token_num, model_dim).
     """
     token_num = inter_states.shape[0]
     E = w2.shape[0]
@@ -673,9 +558,7 @@ def flydsl_moe_stage2(
     sw = (
         sorted_weights
         if sorted_weights is not None
-        else torch.zeros(
-            sorted_token_ids.shape, dtype=torch.float32, device=dev
-        )
+        else torch.zeros(sorted_token_ids.shape, dtype=torch.float32, device=dev)
     )
 
     tensor_api = _get_compiled_stage2(

@@ -37,11 +37,10 @@ from aiter.ops.flydsl.utils import is_flydsl_available
 
 if is_flydsl_available():
     from aiter.ops.flydsl.moe_kernels import (
-        parse_flydsl_kernel_name,
         get_flydsl_stage1_kernels,
         get_flydsl_stage2_kernels,
         flydsl_moe_stage1,
-        flydsl_moe_stage2 as flydsl_moe_stage2_op,
+        flydsl_moe_stage2,
     )
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/")
@@ -277,15 +276,10 @@ class FmoeTuner(TunerCommon):
         q_type,
         act_type,
     ):
-        from aiter.ops.shuffle import shuffle_weight
-
         w2_shuffled = shuffle_weight(w2_qt, layout=(16, 16))
         if kparams["b_dtype"] == "fp4" and w2_scale is not None:
-            from aiter import fp4_utils
-
             w2_scale = fp4_utils.e8m0_shuffle(w2_scale)
-
-        return flydsl_moe_stage2_op(
+        return flydsl_moe_stage2(
             inter_states=a2_qt,
             w2=w2_shuffled,
             sorted_token_ids=sorted_ids,
