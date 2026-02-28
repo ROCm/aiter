@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
 import os
 import shutil
@@ -15,7 +15,7 @@ from gemm_a8w8_blockscale_cktile_instance import (
 )
 
 """
-a8w8_blockscale_gemm instance gen for tile CK
+a8w8_blockscale_gemm instance gen for cktile
 """
 
 
@@ -61,7 +61,7 @@ class gemm_a8w8_blockscale_codegen:
 
         return tune_dict
 
-    def gen_tile_instance(self, k: TileKernelInstance):
+    def gen_cktile_instance(self, k: TileKernelInstance):
         """
         Generate kernel instance code for tile gemm a8w8 blockscale
         """
@@ -78,7 +78,8 @@ torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y
+    torch::Tensor &Y,
+    bool preshuffleB
     )
 {{
     // Get M, N, K from input tensors.
@@ -98,13 +99,12 @@ torch::Tensor
             {k.M_Warp_Tile}, {k.N_Warp_Tile}, {k.K_Warp_Tile},
             {str(k.TiledMMAPermuteN).lower()},
             {str(k.TransposeC).lower()},
-            {str(k.DoubleSmemBuffer).lower()},
             {str(k.UsePersistentKernel).lower()},
             ck_tile::GemmPipelineScheduler::{k.Scheduler},
             {k.BlockPerCu}>;
 
         // Run kernel instance.
-        return gemm_a8w8_blockscale_cktile_impl<DDataType, EDataType, TileGemmInstance>(XQ, WQ, x_scale, w_scale, Y);
+        return gemm_a8w8_blockscale_cktile_impl<DDataType, EDataType, TileGemmInstance>(XQ, WQ, x_scale, w_scale, Y, preshuffleB);
 """
 
         TILE_INSTANCE_IMPL_str = TILE_INSTANCE_IMPL.replace(
@@ -126,7 +126,8 @@ template torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y
+    torch::Tensor &Y,
+    bool preshuffleB
     );
 
 """
@@ -210,7 +211,8 @@ torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y);
+    torch::Tensor &Y,
+    bool preshuffleB);
 """
         MAINFEST_end = """
 
@@ -228,12 +230,12 @@ torch::Tensor
 
     def gen_code(self, kernels_dict: dict):
         """
-        Codegen for tile gemm a8w8 blockscale
+        Codegen for cktile gemm a8w8 blockscale
         """
 
         # generate instances code
         for _, k in kernels_dict.items():
-            self.gen_tile_instance(k)
+            self.gen_cktile_instance(k)
 
         # generate lookup dict for kernel instances
         self.gen_lookup_dict(kernels_dict)
@@ -254,7 +256,7 @@ torch::Tensor
             shutil.rmtree(self.instances_path)
         os.mkdir(self.instances_path)
 
-        # generate code for legacy and tile
+        # generate code for cktile
         if self.istune:
             # generate code for default kernels
             self.gen_code(candidate_kernels_cktile_dict)

@@ -1,23 +1,25 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-from torch import Tensor
-from typing import Optional
 import functools
+from typing import Optional
+
 import pandas as pd
+import torch
 from aiter import logger
+from torch import Tensor
+from torch.library import Library
+
 from ..jit.core import (
-    compile_ops,
-    AITER_ROOT_DIR,
     AITER_CONFIGS,
     AITER_LOG_TUNED_CONFIG,
+    AITER_ROOT_DIR,
+    compile_ops,
 )
-from ..jit.utils.torch_guard import torch_compile_guard
-from ..utility import dtypes
 from ..jit.utils.chip_info import get_cu_num
-from torch.library import Library
+from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import get_padded_m
+from ..utility import dtypes
 
 aiter_lib = Library("aiter", "FRAGMENT")
 
@@ -163,6 +165,7 @@ def gemm_a8w8_blockscale_cktile(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    isBpreshuffled: bool = False,
 ) -> torch.Tensor: ...
 
 
@@ -177,6 +180,21 @@ def gemm_a8w8_blockscale_bpreshuffle_ck(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+) -> torch.Tensor: ...
+
+
+@compile_ops(
+    "module_gemm_a8w8_blockscale_bpreshuffle_cktile",
+    fc_name="gemm_a8w8_blockscale_bpreshuffle_cktile",
+    gen_fake=gen_gemm_a8w8_blockscale_ck_fake_tensors,
+)
+def gemm_a8w8_blockscale_bpreshuffle_cktile(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    isBpreshuffled: bool = True,
 ) -> torch.Tensor: ...
 
 
@@ -618,10 +636,16 @@ def gemm_a8w8_blockscale_bpreshuffle(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
-    get_CKGEMM_config(
+    config = get_CKGEMM_config(
         m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
     )
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    if config is not None:
+        libtype = config["libtype"]
+        if libtype == "cktile":
+            return gemm_a8w8_blockscale_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
+        elif libtype == "ck":
+            return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
     return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
 
@@ -708,6 +732,7 @@ def gemm_a8w8_blockscale_cktile_tune(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
+    preshuffleB: bool = False,
 ) -> torch.Tensor: ...
 
 
@@ -724,6 +749,23 @@ def gemm_a8w8_bpreshuffle_tune(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
+) -> torch.Tensor: ...
+
+
+@compile_ops(
+    "module_gemm_a8w8_blockscale_bpreshuffle_cktile_tune",
+    fc_name="gemm_a8w8_blockscale_bpreshuffle_cktile_tune",
+    gen_fake=gen_gemm_a8w8_blockscale_tune_fake_tensors,
+)
+def gemm_a8w8_blockscale_bpreshuffle_cktile_tune(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    kernelId: int = 0,
+    splitK: int = 0,
+    preshuffleB: bool = True,
 ) -> torch.Tensor: ...
 
 
