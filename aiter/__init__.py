@@ -88,6 +88,7 @@ from .ops.trans_ragged_layout import *  # noqa: F403,E402
 from .ops.sample import *  # noqa: F403,E402
 from .ops.fused_qk_norm_mrope_cache_quant import *  # noqa: F403,E402
 from .ops.fused_qk_norm_rope_cache_quant import *  # noqa: F403,E402
+from .rotary_embedding import fused_rope_rms  # noqa: F401,E402
 from .ops.groupnorm import *  # noqa: F403,E402
 from .ops.mhc import *  # noqa: F403,E402
 from .ops.causal_conv1d import *  # noqa: F403,E402
