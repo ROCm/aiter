@@ -59,7 +59,7 @@ def mhc_pre(
     prefetch_stages = 2
     tile_m = 16 * 4
     tile_k_tg_dict = {
-        # 128: 2,
+        128: 2,
         64: 4,
     }
     num_cu = get_cu_num()
@@ -80,7 +80,7 @@ def mhc_pre(
             num_tg = num_tg_m * splitk
             score = num_tg / meanwhile_tg
             score = score / math.ceil(score)
-            if selected_score <= score:
+            if selected_score < score:
                 selected_splitk = splitk
                 selected_tile_k = tile_k
                 selected_score = score

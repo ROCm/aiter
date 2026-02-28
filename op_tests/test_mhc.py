@@ -437,8 +437,13 @@ def test_mhc_pre(m, hidden_size, hc_mult):
         residual, fn, hc_scale, hc_base, **extra_args
     )
     (post_mix_hip, comb_mix_hip, layer_input_hip), hip_us = run_perftest(
-        mhc_pre_hip, residual, fn, hc_scale, hc_base, **extra_args,)
-        # num_iters=2, num_warmup=0)
+        mhc_pre_hip,
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        **extra_args,
+    )
 
     checkAllclose(post_mix_ref, post_mix_hip, msg="post_mix")
     checkAllclose(comb_mix_ref, comb_mix_hip, msg="comb_mix")
@@ -446,8 +451,8 @@ def test_mhc_pre(m, hidden_size, hc_mult):
     ret = {}
     ret["hip_err"] = hip_err
     ret["hip_us"] = hip_us
-    # ret["FLOPS / T"] = 2.0 * m * hidden_size * hc_mult * hc_mult3 / 1e6
-    # ret["GB / T"] = (m * hc_mult3 * dtypes.fp32.itemsize + (m * hc_mult + m) * hidden_size * dtypes.bf16.itemsize) / 1e6
+    # ret["TFLOPS * us"] = 2.0 * m * hidden_size * hc_mult * hc_mult3 / 1e6
+    # ret["GB"] = (m * hc_mult3 * dtypes.fp32.itemsize + (m * hc_mult + m) * hidden_size * dtypes.bf16.itemsize) / 1e6
     # try:
     #     (post_mix_tilelang, comb_mix_tilelang, layer_input_tilelang), tilelang_us = run_perftest(mhc_pre_tilelang, residual, fn, hc_scale, hc_base, **extra_args)
     #     checkAllclose(post_mix_ref, post_mix_tilelang, msg="post_mix")
