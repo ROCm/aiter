@@ -273,8 +273,8 @@ def mla_decode_fwd(
                 o_out.copy_(o[:, :ori_nhead, :])
                 logits = logits[:, :, :ori_nhead, :]
                 attn_lse = attn_lse[:, :, :ori_nhead, :]
-                return logits.view(total_s, ori_nhead, v_head_dim), attn_lse
-            return logits.view(total_s, nhead, v_head_dim), attn_lse
+                return logits.reshape(total_s, ori_nhead, v_head_dim), attn_lse
+            return logits.reshape(total_s, nhead, v_head_dim), attn_lse
 
         Lv = v_head_dim
         BLOCK_DV = triton.next_power_of_2(Lv)
