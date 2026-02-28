@@ -7,6 +7,7 @@ from aiter.test_common import checkAllclose, run_perftest, benchmark
 from aiter.fused_moe import moe_sorting, fused_topk
 from aiter import dtypes
 import argparse
+import pandas as pd
 
 BLOCK_SIZE_M = 32
 
@@ -103,11 +104,14 @@ def test_moe_sorting(
         num_local_tokens = None
 
     (
-        sorted_ids_a,
-        sorted_weights_a,
-        sorted_expert_ids_a,
-        num_tokens_post_padded_a,
-    ), avg_a = run_perftest(
+        (
+            sorted_ids_a,
+            sorted_weights_a,
+            sorted_expert_ids_a,
+            num_tokens_post_padded_a,
+        ),
+        avg_a,
+    ) = run_perftest(
         moe_sorting_native,
         topk_ids,
         topk_weights,
@@ -120,12 +124,15 @@ def test_moe_sorting(
     )
 
     (
-        sorted_ids_b,
-        sorted_weights_b,
-        sorted_expert_ids_b,
-        num_tokens_post_padded_b,
-        moe_buf,
-    ), avg_b = run_perftest(
+        (
+            sorted_ids_b,
+            sorted_weights_b,
+            sorted_expert_ids_b,
+            num_tokens_post_padded_b,
+            moe_buf,
+        ),
+        avg_b,
+    ) = run_perftest(
         moe_sorting,
         topk_ids,
         topk_weights,
@@ -139,7 +146,7 @@ def test_moe_sorting(
     )
 
     print(
-        f"[perf] {token=}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+        f"[perf] {token=}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a / avg_b - 1:<5.1%}"
     )
     checkAllclose(
         num_tokens_post_padded_a,
@@ -168,8 +175,6 @@ def test_moe_sorting(
     )
     return {"us": avg_b}
 
-
-import pandas as pd
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
