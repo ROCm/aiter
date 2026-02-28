@@ -193,10 +193,11 @@ def mla_decode_fwd(
     if nhead == 8 and not persistent_mode:
         forced_head_pad = True
         padded_nhead = 16
-        q_padded = torch.zeros(
+        q_padded = torch.empty(
             (total_s, padded_nhead, qk_head_dim), dtype=q.dtype, device=device
         )
         q_padded[:, :nhead, :] = q
+        q_padded[:, nhead:, :].zero_()
         o_padded = torch.empty(
             (total_s, padded_nhead, v_head_dim), dtype=o.dtype, device=device
         )
