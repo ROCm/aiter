@@ -102,7 +102,7 @@ if __name__ == "__main__":
                 content += f"""
 #define ADD_CFG({other_columns_comma}, arch, path, knl_name, co_name)         \\
     {{                                         \\
-        arch knl_name, {{ knl_name, path co_name, arch, {other_columns_comma} }}         \\
+        std::string(arch) + qType + "_" + kvType + "_" + knl_name, {{ knl_name, path co_name, arch, {other_columns_comma} }}         \\    
     }}
 
 struct {args.module}Config
