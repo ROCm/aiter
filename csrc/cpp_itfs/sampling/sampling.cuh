@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024-2026 by FlashInfer team.
+ * Copyright (C) 2024-2025 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -607,7 +607,7 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs,
         }
         __syncthreads();
         aggregate_gt_pivot_1 = temp_storage.block_aggregate.pair;
-
+        
         if(aggregate_gt_pivot_0.count < k && aggregate_gt_pivot_0.value < p)
         {
             // case 1: pivot_0 accepted
