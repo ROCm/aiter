@@ -1566,7 +1566,7 @@ def compile_moe_gemm2(
                 # scale_w: [experts*model_dim] f32 (static shape in practice)
                 sw_rsrc = buffer_ops.create_buffer_resource(arg_scale_w, max_size=False)
 
-            # sorted_token_ids / sorted_weights: [blocks*tile_m] (CK-style padded length)
+            # sorted_token_ids / sorted_weights: [blocks*tile_m]
             sorted_nbytes_idx = (
                 size_expert_ids_in
                 * arith.constant(tile_m, index=True)
@@ -2392,7 +2392,7 @@ def compile_moe_gemm2(
                     def precompute_row(*, row_local, row):
                         # Precompute row context for cshuffle stores.
                         # Return (fused_i32, row_valid_i1) so the epilogue can skip the entire row
-                        # for invalid tail rows (CK-style), avoiding per-store branching.
+                        # for invalid tail rows, avoiding per-store branching.
                         fused2 = buffer_ops.buffer_load(
                             sorted_rsrc, row, vec_width=1, dtype=i32
                         )
@@ -2418,7 +2418,7 @@ def compile_moe_gemm2(
                         idx_elem_even = idx_elem & mask_even_i32
                         if out_is_bf16:
                             if bool(accumulate):
-                                # Use global atomicrmw fadd on <2 x bf16> (CK path).
+                                # Use global atomicrmw fadd on <2 x bf16>.
                                 # Row-valid gating is handled at the row level by c_shuffle_epilog via `precompute_row`.
                                 byte_off = idx_elem_even * c2_i32
                                 byte_off_idx = arith.index_cast(

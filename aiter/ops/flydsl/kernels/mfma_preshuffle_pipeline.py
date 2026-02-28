@@ -32,7 +32,7 @@ def make_preshuffle_b_layout(
     kpack_bytes: int = 16,
     elem_bytes: int = 1,
 ) -> PreshuffleBLayout:
-    """Build B layout matching aiter/CK preshuffle for A8 MFMA kernels.
+    """Build B preshuffle layout for A8 MFMA kernels.
 
     Shape: (N0, K0, KLane, NLane, KPackBytes) = (N/16, K/64, 4, 16, kpack_bytes)
 
@@ -52,7 +52,7 @@ def make_preshuffle_b_layout(
     # - For 1B types (fp8/i8): KBytes == K
     # - For 2B types (fp16/bf16): KBytes == 2*K
     #
-    # We keep the same 64B K0 "macro-step" used by CK/aiter preshuffle.
+    # 64B K0 macro-step for preshuffle.
     if elem_bytes not in (1, 2):
         raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
     c_k_bytes = c_k * arith.constant(int(elem_bytes), index=True)
@@ -98,7 +98,7 @@ def make_preshuffle_scale_layout(
     elem_bytes: int = 4,
     scale_block_size: int = 32,
 ) -> object:
-    """Build scale layout matching aiter/CK preshuffle for MXFP4 MFMA kernels.
+    """Build scale preshuffle layout for MXFP4 MFMA kernels.
     scale dtype is e8m0
     the scale shuffle to [K_Pack, N_Pack], pack to int32
 
@@ -115,7 +115,7 @@ def make_preshuffle_scale_layout(
     c_mn1 = c_mn / c16 / c_mn_pack
     c_k1 = c_k_scale / c4 / c_k_pack
 
-    # We keep the same 64B K0 "macro-step" used by CK/aiter preshuffle.
+    # 64B K0 macro-step for preshuffle.
     if elem_bytes != mn_pack * k_pack:
         raise ValueError(
             f"elem_bytes of scale must be {mn_pack} * {k_pack}, got {elem_bytes!r}"
@@ -377,7 +377,7 @@ def lds_store_16b_xor16(
     vec_part_i32x4: ir.Value,
     elem_bytes: int = 1,
 ):
-    """Store one 16B chunk into LDS with CK-style XOR16 swizzle on the K dimension."""
+    """Store one 16B chunk into LDS with XOR16 swizzle on the K dimension."""
     if elem_bytes not in (1, 2):
         raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
     col_local_bytes = col_local_i32 * tx_c4
@@ -420,7 +420,7 @@ def lds_store_8b_xor16(
     vec_part_i32x2: ir.Value,
     elem_bytes: int = 1,
 ):
-    """Store one 8B chunk into LDS with CK-style XOR16 swizzle on the K dimension."""
+    """Store one 8B chunk into LDS with XOR16 swizzle on the K dimension."""
     if elem_bytes not in (1, 2):
         raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
     col_local_bytes = col_local_i32 * tx_c4
@@ -463,7 +463,7 @@ def lds_store_4b_xor16(
     vec_part_i32x1: ir.Value,
     elem_bytes: int = 1,
 ):
-    """Store one 4B chunk into LDS with CK-style XOR16 swizzle on the K dimension."""
+    """Store one 4B chunk into LDS with XOR16 swizzle on the K dimension."""
     if elem_bytes not in (1, 2):
         raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
     col_local_bytes = col_local_i32 * tx_c4

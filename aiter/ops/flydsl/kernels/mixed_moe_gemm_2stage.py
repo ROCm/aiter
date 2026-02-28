@@ -188,7 +188,7 @@ def compile_mixed_moe_gemm1(
     # split into <=16B pieces and use `flir.copy(load-only)` for buffer_load_dwordx4.
     # (Compute the split lens inside the kernel so the code matches GEMM structure.)
 
-    # CK-style LDS128 mode (same idea as test_preshuffle_gemm.py):
+    # LDS128 mode:
     # - LDS stride == tile_k (no extra padding) + XOR16 swizzle
     # - Use ds_{read,write}_b128 (16B) and extract 8B halves for MFMA steps
     _ck_lds128 = os.environ.get("FLIR_CK_LDS128", "1") in (
@@ -275,7 +275,7 @@ def compile_mixed_moe_gemm1(
             vec2_i64 = I.vec(2, i64)
 
             def silu(x):
-                # Align with CK's device fast path:
+                # Device fast path:
                 #   emu = exp(-x)  ~= exp2(log2e * (-x))  -> v_exp_f32
                 #   sig = rcp(1 + emu)                   -> v_rcp_f32
                 #   y = x * sig
@@ -289,7 +289,7 @@ def compile_mixed_moe_gemm1(
                 return x * sig
 
             def swiglu(gate, up, alpha=1.702, limit=7.0):
-                # Align with CK's device fast path
+                # Device fast path
                 #
                 # Using llvm.amdgcn intrinsics prevents lowering to the div_scale/div_fixup
                 # sequences that introduce extra compares/cndmasks.
@@ -375,7 +375,7 @@ def compile_mixed_moe_gemm1(
             arith.index_cast(i32, by_n)
             blk_valid = arith.cmpu(bx_m_i32, max_token_id_i32, "ult")
             # Common constants/atoms (hoisted): keep IR small like GEMM.
-            # CK-style XOR16 swizzle parameter (constant, power-of-two in our configs).
+            # XOR16 swizzle parameter (constant, power-of-two in our configs).
             k_blocks16 = arith.constant(tile_k_bytes // 16, index=True)
             atom_x_s16 = flir.make_copy_atom(x_elem, vector_size=16)
             flir.make_copy_atom(x_elem, vector_size=8)
@@ -406,7 +406,7 @@ def compile_mixed_moe_gemm1(
                 )
 
                 # Use logical buffer sizes (descriptor num_records) so hardware OOB checking can be
-                # used directly (CK-style). This allows us to avoid `select`-based masking for
+                # used directly. This allows us to avoid `select`-based masking for
                 # invalid lanes and rely on the buffer instruction's built-in bounds behavior.
                 # X buffer descriptor size must match the *packed* input storage.
                 # - fp8/int8: 1 byte per element  -> bytes = tokens * K
@@ -516,7 +516,7 @@ def compile_mixed_moe_gemm1(
                             chunk_i32=chunk_i32,
                         )
 
-                    # CK-aligned: decode token once (per thread's M-slice) and build a base row offset.
+                    # Decode token once (per thread's M-slice) and build a base row offset.
                     x_row_base_div4 = []
                     x_col_local_i32 = []
                     x_row_local = []
@@ -978,7 +978,7 @@ def compile_mixed_moe_gemm1(
                             0 if mfma_per_iter == 0 else (mfma_total // mfma_per_iter)
                         )
 
-                        # DS-read preload (CK default is 2); clamp to non-negative.
+                        # DS-read preload (2); clamp to non-negative.
                         rocdl.sched_dsrd(2)
                         rocdl.sched_mfma(2)
                         rocdl.sched_dsrd(1)
@@ -1131,7 +1131,7 @@ def compile_mixed_moe_gemm1(
                     lane_div_16 * arith.index(4)
                     inter_i32_local = inter_i32_v
 
-                    # Optional: CK-style CShuffle epilogue for better global store coalescing.
+                    # Optional: CShuffle epilogue for better global store coalescing.
                     # Uses EVec=4 (buffer store "x4" of fp16 elements).
                     # The current CShuffle epilogue stores packed fp8 (i32 words). Do NOT enable it
                     # for fp16/bf16 outputs.
@@ -1827,7 +1827,7 @@ def compile_mixed_moe_gemm2(
                     arg_scale_w, max_size=False, num_records_bytes=sw_nbytes_i32
                 )
 
-            # sorted_token_ids / sorted_weights: [blocks*tile_m] (CK-style padded length)
+            # sorted_token_ids / sorted_weights: [blocks*tile_m] (padded length)
             sorted_nbytes_idx = (
                 size_expert_ids_in
                 * arith.constant(tile_m, index=True)
@@ -2665,7 +2665,7 @@ def compile_mixed_moe_gemm2(
                 def precompute_row(*, row_local, row):
                     # Precompute row context for cshuffle stores.
                     # Return (fused_i32, row_valid_i1) so the epilogue can skip the entire row
-                    # for invalid tail rows (CK-style), avoiding per-store branching.
+                    # for invalid tail rows, avoiding per-store branching.
                     fused2 = buffer_ops.buffer_load(
                         sorted_rsrc, row, vec_width=1, dtype=i32
                     )

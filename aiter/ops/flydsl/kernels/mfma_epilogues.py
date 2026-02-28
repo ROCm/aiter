@@ -4,7 +4,7 @@ This module provides:
 
 - `mfma_epilog(...)`
   A single entrypoint that dispatches to either the default row-epilogue or the
-  CK-style LDS CShuffle epilogue based on input parameters.
+  LDS CShuffle epilogue based on input parameters.
 
 - `default_epilog(...)` (implementation helper)
   A lightweight row-iterator for the common MFMA accumulator-to-output mapping
@@ -13,7 +13,7 @@ This module provides:
   (e.g. loads scales once, loops over ni, stores).
 
 - `c_shuffle_epilog(...)` (implementation helper)
-  A CK-style LDS CShuffle epilogue skeleton:
+  A LDS CShuffle epilogue skeleton:
     1) call `write_row_to_lds(...)` for each MFMA output row to populate `lds_out`
        in row-major [tile_m, tile_n] order
     2) barrier
@@ -97,7 +97,7 @@ def c_shuffle_epilog(
     precompute_row: Callable | None = None,
     store_pair: Callable,
 ):
-    """CK-style LDS CShuffle epilogue skeleton.
+    """LDS CShuffle epilogue skeleton.
 
     Call pattern:
       - `write_row_to_lds(...)` is called once per MFMA row produced by this thread.
