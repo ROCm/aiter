@@ -176,10 +176,10 @@ run_gfx950_hd192_128_bwd_v3() {
 }
 
 # run_batch_mode_tests
-# run_group_mode_tests
+run_group_mode_tests
 # run_swa_tests
-run_gfx950_group_bwd_v3
-run_gfx950_bwd_v3
+# run_gfx950_group_bwd_v3
+# run_gfx950_bwd_v3
 
 # hdim 192+128 tests
-run_gfx950_hd192_128_bwd_v3
+# run_gfx950_hd192_128_bwd_v3

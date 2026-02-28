@@ -119,7 +119,8 @@ void launch_fallback_odo(const aiter::mha_bwd_args& a, hipStream_t stream)
         a.stride_o, a.nhead_stride_o, a.batch_stride_o,
         a.stride_do, a.nhead_stride_do, a.batch_stride_do,
         a.nhead_stride_lsed, a.batch_stride_lsed,
-        is_bf16);
+        is_bf16,
+        reinterpret_cast<const int32_t*>(a.seqstart_q_ptr));
 }
 
 void launch_fallback_dq_convert(const aiter::mha_bwd_args& a, hipStream_t stream)
@@ -134,7 +135,8 @@ void launch_fallback_dq_convert(const aiter::mha_bwd_args& a, hipStream_t stream
         a.seqlen_q, a.hdim_q,
         a.stride_dq_acc, a.nhead_stride_dq_acc, a.batch_stride_dq_acc,
         a.stride_dq, a.nhead_stride_dq, a.batch_stride_dq,
-        is_bf16);
+        is_bf16,
+        reinterpret_cast<const int32_t*>(a.seqstart_q_ptr));
 }
 
 } // anonymous namespace

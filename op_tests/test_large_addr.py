@@ -189,7 +189,7 @@ def get_test_params_for_kernel(config, large_q=False):
     dtype_str = config['dtype']
     hdim_q = int(config['hdim_q'])
     hdim_v = int(config['hdim_v'])
-    mask = int(config['mask'])  # 0=no mask, 1=causal, 2=causal_br
+    mask = int(config['mask'])  # 0=no mask, 1=causal, 2=causal_br, 3=swa
     atomic32 = int(config['atomic32'])  # 0=a16, 1=a32
     pssk = int(config['pssk'])
     pddv = int(config['pddv'])
@@ -199,9 +199,15 @@ def get_test_params_for_kernel(config, large_q=False):
     # Map dtype string to torch dtype
     dtype = torch.bfloat16 if dtype_str == 'bf16' else torch.float16
     
-    # Determine causal type
-    causal = mask > 0
-    if mask == 2:
+    # Determine causal type and window size
+    # mask=3 (SWA) needs causal=False with finite window_size per mha.py:
+    #   swa = not causal and ((window_size_left > 0) or (window_size_right > 0))
+    causal = (mask > 0 and mask != 3)
+    window_size = (-1, -1)
+    if mask == 3:
+        causal_type = None
+        window_size = (15, 15)
+    elif mask == 2:
         causal_type = "bottom_right"
     elif mask == 1:
         causal_type = "top_left"
@@ -265,6 +271,7 @@ def get_test_params_for_kernel(config, large_q=False):
         "dtype": dtype,
         "causal": causal,
         "causal_type": causal_type,
+        "window_size": window_size,
         "deterministic": deterministic,
         "co_name": co_name,
         "dtype_str": dtype_str,
@@ -284,6 +291,7 @@ def run_mha_backward_test(
     dtype: torch.dtype,
     causal: bool,
     causal_type: str = None,
+    window_size: tuple = (-1, -1),
     deterministic: bool = False,
     test_name: str = "unknown",
     co_name: str = "",
@@ -297,9 +305,11 @@ def run_mha_backward_test(
     dtype_str = "bf16" if dtype == torch.bfloat16 else "fp16"
     causal_flag = "" if causal else "--no-causal"
     det_flag = "--deterministic" if deterministic else "--no-deterministic"
+    is_swa = window_size != (-1, -1)
+    swa_str = f" --window-left {window_size[0]} --window-right {window_size[1]}" if is_swa else ""
     cmd = (f"AITER_DISABLE_V3_FWD=1 python test_mha.py -b {batch_size} -n {nheads} "
            f"-q {seqlen_q} -k {seqlen_k} -d_qk_v {hdim_q},{hdim_v} -d {dtype_str} "
-           f"{causal_flag} --no-local {det_flag} -m mha")
+           f"{causal_flag} --no-local {det_flag}{swa_str} -m mha")
     
     print(f"\n{'='*70}")
     print(f"Test: {test_name}")
@@ -308,15 +318,12 @@ def run_mha_backward_test(
     print(f"Config: batch={batch_size}, heads={nheads}, seq_q={seqlen_q}, seq_k={seqlen_k}")
     print(f"        hdim_q={hdim_q}, hdim_v={hdim_v}, dtype={dtype}")
     print(f"        causal={causal}, causal_type={causal_type}, deterministic={deterministic}")
+    if is_swa:
+        print(f"        window_size=({window_size[0]}, {window_size[1]}) (SWA mode)")
     print(f"        is_v3_atomic_fp32={is_v3_atomic_fp32} ({'A32' if is_v3_atomic_fp32 else 'A16'} kernel)")
     print(f"{'='*70}")
     
     device = "cuda"
-    
-    # Set window size for causal (aligned with test_mha.py)
-    # test_mha.py always uses (-1, -1) for window_size and just passes causal=True
-    # The C++ layer handles mask type selection internally based on seqlen_q vs seqlen_k
-    window_size = (-1, -1)
     
     # Create input tensors (aligned with test_mha.py)
     q = torch.randn(batch_size, seqlen_q, nheads, hdim_q, device=device, dtype=dtype, requires_grad=True)
@@ -437,6 +444,7 @@ def run_mha_varlen_backward_test(
     dtype: torch.dtype,
     causal: bool,
     causal_type: str = None,
+    window_size: tuple = (-1, -1),
     deterministic: bool = False,
     test_name: str = "unknown",
     co_name: str = "",
@@ -448,6 +456,7 @@ def run_mha_varlen_backward_test(
     Aligned with test_mha.py methodology.
     """
     dtype_str = "bf16" if dtype == torch.bfloat16 else "fp16"
+    is_swa = window_size != (-1, -1)
     
     print(f"\n{'='*70}")
     print(f"Test: {test_name} (VARLEN/GROUP MODE)")
@@ -456,15 +465,12 @@ def run_mha_varlen_backward_test(
     print(f"Config: batch={batch_size}, heads={nheads}, seq_q={seqlen_q}, seq_k={seqlen_k}")
     print(f"        hdim_q={hdim_q}, hdim_v={hdim_v}, dtype={dtype}")
     print(f"        causal={causal}, causal_type={causal_type}, deterministic={deterministic}")
+    if is_swa:
+        print(f"        window_size=({window_size[0]}, {window_size[1]}) (SWA mode)")
     print(f"        is_v3_atomic_fp32={is_v3_atomic_fp32} ({'A32' if is_v3_atomic_fp32 else 'A16'} kernel)")
     print(f"{'='*70}")
     
     device = "cuda"
-    
-    # Set window size for causal (aligned with test_mha.py)
-    # test_mha.py always uses (-1, -1) for window_size and just passes causal=True
-    # The C++ layer handles mask type selection internally based on seqlen_q vs seqlen_k
-    window_size = (-1, -1)
     
     # For varlen mode, create packed tensors
     total_q = batch_size * seqlen_q
@@ -782,7 +788,8 @@ def list_tests():
     for config in configs:
         mode_str = "group" if config['mode'] == '1' else "batch"
         atomic_str = "a32" if config['atomic32'] == '1' else "a16"
-        mask_str = ["none", "causal", "causal_br"][int(config['mask'])]
+        mask_names = {0: "none", 1: "causal", 2: "causal_br", 3: "swa"}
+        mask_str = mask_names.get(int(config['mask']), f"unknown({config['mask']})")
         print(f"  {config['co_name']}: {config['dtype']} {atomic_str} hdim={config['hdim_q']}/{config['hdim_v']} "
               f"mask={mask_str} mode={mode_str}")
 
