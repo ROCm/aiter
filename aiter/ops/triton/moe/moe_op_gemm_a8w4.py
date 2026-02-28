@@ -117,7 +117,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
 
 def get_kernel_config_gluon(m, n, k, routing_data):
     block_m = routing_data.block_m
-    group_m = 4
+    num_xcds = 1
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_stages = 2
     split_k = 1
@@ -157,6 +157,7 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         "block_k": block_k,
         "num_warps": num_warps,
         "num_stages": num_stages,
+        "xcd_swizzle": num_xcds,
         "split_k": split_k,
         "w_cache_modifier": w_cache_modifier,
         "waves_per_eu": 0,
@@ -409,6 +410,7 @@ def moe_gemm_a8w4(
             config["block_m"],
             config["block_n"],
             config["block_k"],
+            XCD_SWIZZLE = config["xcd_swizzle"],
             NUM_BUFFERS = config["num_stages"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             EVEN_K=K % config["block_k"] == 0,

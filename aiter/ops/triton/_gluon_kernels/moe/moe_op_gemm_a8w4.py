@@ -70,6 +70,30 @@ def matmul_launch_metadata(grid, kernel, args):
     return ret
 
 
+# TODO: using aiter swizzle instead can lead to perf degradation in rare cases
+@triton.jit
+def xcd_swizzle(pid, domain_size, XCD_SWIZZLE: tl.constexpr):
+    """
+    Swizzle the program id based on integer XCD_SWIZZLE.
+    This is useful for reording how blocks are ordered. A scheduler may, for example,
+    assign sequential blocks 0, 1, 2, 3, ..., 8, 9, 10.. to its 8 hardware units 0, 1, 2, 3, ..., 0, 1, 2.
+    This pattern may not be ideal for memory access, and it may be better to swizzle so the assignment
+    becomes 0, 0, 0, 0, ..., 1, 1, 1, ... In the swizzled arrangement, sequential blocks are assigned to
+    the same hardware unit.
+    """
+    # Number of pids per group in the new arrangement
+    pids_per_group = domain_size // XCD_SWIZZLE
+    extra_pid_groups = domain_size % XCD_SWIZZLE
+
+    # Compute current current and local pid within the group
+    group = pid % XCD_SWIZZLE
+    local_pid = pid // XCD_SWIZZLE
+
+    # Calculate new pid based on the new grouping
+    new_pid = group * pids_per_group + min(group, extra_pid_groups) + local_pid
+    return new_pid
+
+
 @gluon.jit
 def unswizzle_mx_scale(
     x,
@@ -228,6 +252,7 @@ def _moe_gemm_a8w4(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
+    XCD_SWIZZLE: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     # One of ["GFX1250", None]
     SWIZZLE_MX_SCALE: gl.constexpr,
@@ -274,7 +299,8 @@ def _moe_gemm_a8w4(
 
     pid_emn = pid
     pid_mn = pid_emn % (unpadded_m * grid_n)
-    pid_mn = pid_mn
+    if XCD_SWIZZLE != 1:
+        pid_mn = xcd_swizzle(pid_mn, total_actual_tiles, XCD_SWIZZLE)
     pid_m, pid_n = pid_grid(pid_mn, unpadded_m, grid_n, 1)
     # unpack expert data
     expt_data = gl.load(ExptData + pid_m)

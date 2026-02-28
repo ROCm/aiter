@@ -224,20 +224,19 @@ def test_op(
     device="cuda",
 ):
 
-    if get_arch() != "gfx950":
-        pytest.skip("float8 x mx only supported on CDNA4")
+    if get_arch() != "gfx950" and get_arch() != "gfx1250":
+        pytest.skip("Kernel not supported on this GPU.")
 
-    if "float8_e4m3fnuz" in act_dtype_str and get_arch() != "gfx942":
-        pytest.skip("float8_e4m3fnuz only tested on AMD CDNA3 Platform")
+    if get_arch() == "gfx1250":
+        if act_dtype_str == "mxfloat8_e4m3fn":
+            pytest.skip("Mxfloat activations are not supported yet on gfx1250.")
+        if apply_swiglu and has_y_gammas:
+            pytest.skip("Swiglu and gammas are not supported together on gfx1250.")
 
     if hbm_swizzling:
-        if get_arch() != "gfx950":
+        if get_arch() == "gfx950" and (n % 32 != 0 or k % (32 * 8) != 0):
             pytest.skip(
-                "Scale preshuffling on AMD GPU has not been emulated on non-CDNA4 arch yet."
-            )
-        if n % 32 != 0 or k % (32 * 8) != 0:
-            pytest.skip(
-                f"Shape {m}x{n}x{k} is not supported for scale swizzling on AMD GPU"
+                f"Shape {m}x{n}x{k} is not supported for scale swizzling on gfx950."
             )
 
     torch.manual_seed(0)
