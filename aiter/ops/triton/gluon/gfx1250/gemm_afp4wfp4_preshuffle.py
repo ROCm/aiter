@@ -45,18 +45,6 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
         warps_per_cta=[1, num_warps],
         order=[1, 0],
     )
-    as_raw_reg_layout = gl.BlockedLayout(
-        size_per_thread=[1, 16],
-        threads_per_warp=[4, 8],
-        warps_per_cta=[num_warps, 1],
-        order=[1, 0],
-    )
-    bs_raw_reg_layout = gl.BlockedLayout(
-        size_per_thread=[1, 16],
-        threads_per_warp=[4, 8],
-        warps_per_cta=[1, num_warps],
-        order=[1, 0],
-    )
 
     # e2m1 uses instr_shape [16,16,64] for operands
     wmma_layout = gl.amd.AMDWMMALayout(
@@ -96,8 +84,6 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
         "blocked_mk": blocked_mk,
         "blocked_kn": blocked_kn,
         "b_raw_reg_layout": b_raw_reg_layout,
-        "as_raw_reg_layout": as_raw_reg_layout,
-        "bs_raw_reg_layout": bs_raw_reg_layout,
         "wmma_layout": wmma_layout,
         "wmma_acc_layout": wmma_acc_layout,
         "shared_A": shared_A,
@@ -220,8 +206,6 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
     blocked_mk: gl.constexpr,
     blocked_kn: gl.constexpr,
     b_raw_reg_layout: gl.constexpr,
-    as_raw_reg_layout: gl.constexpr,
-    bs_raw_reg_layout: gl.constexpr,
     wmma_layout: gl.constexpr,
     wmma_acc_layout: gl.constexpr,
     shared_A: gl.constexpr,
@@ -239,6 +223,9 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
     BLOCK_K_BYTES: gl.constexpr = BLOCK_K // FP4_ELEMS_PER_BYTE
     SPLITK_BYTES: gl.constexpr = SPLITK_BLOCK // FP4_ELEMS_PER_BYTE
     K_GROUPS: gl.constexpr = BLOCK_K // SCALE_GROUP_ELEMS
+
+    gl.static_assert(BLOCK_K % 32 == 0)
+    gl.static_assert(K_GROUPS * 32 == BLOCK_K)
 
     pid = gl.program_id(axis=0)
     tiles_n = gl.cdiv(N, BLOCK_N)
@@ -285,7 +272,6 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
 
     # Base pointers for this split-K slice; advance by k_tile each iteration
     split_k0_groups = split_k_id * (SPLITK_BLOCK // 32)
-    K_groups_total = K_elems // 32
 
     # -------------------- TDM descriptors --------------------
     grid_m = gl.cdiv(M, BLOCK_M) * BLOCK_M
@@ -314,14 +300,14 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
 
     as_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=a_scale_ptr,
-        shape=(grid_m32, K_groups_total * 32),
+        shape=(grid_m32, K_elems),
         strides=(stride_as_m, stride_as_k),
         block_shape=(BLOCK_M // 32, K_GROUPS * 32),
         layout=shared_S,
     )
     bs_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=b_scale_ptr,
-        shape=(grid_n32, K_groups_total * 32),
+        shape=(grid_n32, K_elems),
         strides=(stride_bs_n, stride_bs_k),
         block_shape=(BLOCK_N // 32, K_GROUPS * 32),
         layout=shared_S,
@@ -410,13 +396,37 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
             layout=dot_b_layout,
         )
         # scales: raw shuffled -> unshuffle -> load with wmma scale layouts
-        AS_raw = smem_ASraw.index(slot_c).load(layout=as_raw_reg_layout)
-        BS_raw = smem_BSraw.index(slot_c).load(layout=bs_raw_reg_layout)
+        # AS_raw = smem_ASraw.index(slot_c).load(layout=as_raw_reg_layout)
 
-        gl.barrier()
+        as_view = smem_ASraw.index(slot_c)
+        as_view = (
+            as_view.reshape((BLOCK_M // 32, K_GROUPS // 8, 4, 16, 2, 2, 1))
+            .permute((0, 5, 3, 1, 4, 2, 6))
+            .reshape((BLOCK_M, K_GROUPS))
+        )
+        AS = as_view.load(layout=a_scale_layout)
 
-        AS = gl.convert_layout(unshuffle_a_scales(AS_raw, BLOCK_M=BLOCK_M, K_GROUPS=K_GROUPS), layout=a_scale_layout)
-        BS = gl.convert_layout(unshuffle_b_scales(BS_raw, BLOCK_N=BLOCK_N, K_GROUPS=K_GROUPS), layout=b_scale_layout)
+        BS_raw = smem_BSraw.index(slot_c)
+        BS_raw = (
+            BS_raw.reshape(
+                (
+                    BLOCK_N // 32,  # nblocks
+                    K_GROUPS // 8,  # kgroups/8
+                    4,
+                    16,
+                    2,
+                    2,
+                    1,
+                )
+            )
+            .permute((0, 5, 3, 1, 4, 2, 6))
+            .reshape((BLOCK_N, K_GROUPS))
+        )
+
+        # gl.barrier()
+
+        # AS = gl.convert_layout(unshuffle_a_scales(AS_raw, BLOCK_M=BLOCK_M, K_GROUPS=K_GROUPS), layout=a_scale_layout)
+        BS = BS_raw.load(layout=b_scale_layout)
 
         acc = gl.amd.gfx1250.wmma_scaled(A, AS, "e2m1", B, BS, "e2m1", acc)
         consumer += 1
@@ -440,14 +450,35 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
                 ),
                 layout=dot_b_layout,
             )
-            # scales: raw shuffled -> unshuffle -> load with wmma scale layouts
-            AS_raw = smem_ASraw.index(slot_c).load(layout=as_raw_reg_layout)
-            BS_raw = smem_BSraw.index(slot_c).load(layout=bs_raw_reg_layout)
+            as_view = smem_ASraw.index(slot_c)
+            as_view = (
+                as_view.reshape((BLOCK_M // 32, K_GROUPS // 8, 4, 16, 2, 2, 1))
+                .permute((0, 5, 3, 1, 4, 2, 6))
+                .reshape((BLOCK_M, K_GROUPS))
+            )
+            AS = as_view.load(layout=a_scale_layout)
 
-            gl.barrier()
+            BS_raw = smem_BSraw.index(slot_c)
+            BS_raw = (
+                BS_raw.reshape(
+                    (
+                        BLOCK_N // 32,  # nblocks
+                        K_GROUPS // 8,  # kgroups/8
+                        4,
+                        16,
+                        2,
+                        2,
+                        1,
+                    )
+                )
+                .permute((0, 5, 3, 1, 4, 2, 6))
+                .reshape((BLOCK_N, K_GROUPS))
+            )
 
-            AS = gl.convert_layout(unshuffle_a_scales(AS_raw, BLOCK_M=BLOCK_M, K_GROUPS=K_GROUPS), layout=a_scale_layout)
-            BS = gl.convert_layout(unshuffle_b_scales(BS_raw, BLOCK_N=BLOCK_N, K_GROUPS=K_GROUPS), layout=b_scale_layout)
+            # gl.barrier()
+
+            # AS = gl.convert_layout(unshuffle_a_scales(AS_raw, BLOCK_M=BLOCK_M, K_GROUPS=K_GROUPS), layout=a_scale_layout)
+            BS = BS_raw.load(layout=b_scale_layout)
 
             acc = gl.amd.gfx1250.wmma_scaled(A, AS, "e2m1", B, BS, "e2m1", acc)
 
