@@ -356,23 +356,23 @@
     int const batch_size   // Batch size
 )
 {
-    // per block deal with blockSize tokens
+    // per block deal with one cache page (page_size tokens)
     // gridDim = (1, gridSize, num_heads_q + num_heads_k + num_heads_v)
     // blockIdx.y is the global block index across all batches
-    // Each batch needs ceil(seq_len/blockDim.x) + 1 blocks
+    // Each batch needs ceil(seq_len/page_size) + 1 blocks (align with cache pages like cache_kernels.cu)
     int const laneId        = threadIdx.x % WARP_SIZE;
 
     int const num_heads    = num_heads_q + num_heads_k + num_heads_v;
     int const localHeadIdx = blockIdx.z;  // head index
 
     // Map blockIdx.y -> (batch_id, block_within_batch) -> first_token_idx
-    // Each batch i uses ceil(seq_len_i / blockDim.x) + 1 blocks
+    // Stride by page_size to match cache block layout (blockDim.x may be 64 for reduce, but assignment is per page)
     int batch_id = -1;
     int cum_blocks = 0;
     for(int i = 0; i < batch_size; i++)
     {
         int64_t seq_len_i = cu_q_len[i + 1] - cu_q_len[i];
-        int blocks_i = (seq_len_i + blockDim.x - 1) / blockDim.x + 1;
+        int blocks_i     = (seq_len_i + page_size - 1) / page_size + 1;
         if(cum_blocks + blocks_i > (int)blockIdx.y)
         {
             batch_id = i;
@@ -390,8 +390,8 @@
     int64_t batch_end_idx   = cu_q_len[batch_id + 1];
     int64_t seq_len         = batch_end_idx - batch_start_idx;
 
-    // first_token_idx is relative to batch start
-    int64_t first_token_idx = batch_start_idx + block_within_batch * blockDim.x;
+    // first_token_idx: stride by page_size (like cache_kernels blockIdx.y * block_size)
+    int64_t first_token_idx = batch_start_idx + block_within_batch * page_size;
 
     int64_t slot_idx;
     int64_t block_idx;
@@ -408,7 +408,7 @@
         // Check if we need to process remaining tokens from a different cache page
 
         // Get the previous GPU block's first token
-        int64_t prev_first_token_idx = batch_start_idx + (block_within_batch - 1) * blockDim.x;
+        int64_t prev_first_token_idx = batch_start_idx + (block_within_batch - 1) * page_size;
         if(prev_first_token_idx < batch_start_idx || prev_first_token_idx >= batch_end_idx)
         {
             return;  // Invalid, just return
@@ -448,7 +448,6 @@
         if(threadIdx.x < page_size)
         {
             int64_t token_idx  = first_token_idx - (threadIdx.x + 1);
-            // Check if token_idx is within current batch
             if(token_idx >= batch_start_idx)
             {
                 int64_t block_idx1 = slot_mapping[token_idx] / page_size;
@@ -487,12 +486,7 @@
     }
     auto sum               = [](float a, float b) { return a + b; };
     int numtokens_in_block = 0;
-    if constexpr (wg_size < WARP_SIZE) {
-        numtokens_in_block = multithread_reduce<int, decltype(sum), wg_size, true>(tokens_in_block, sum, blockDim.x);
-    } else {
-        numtokens_in_block = block_reduce<int, decltype(sum), wg_size, true>(tokens_in_block, sum);
-    }
-    
+    numtokens_in_block = block_reduce<int, decltype(sum), wg_size, true>(tokens_in_block, sum);
     // Calculate tokenIdx for current thread
     int tokenIdx = first_token_idx + threadIdx.x;
 
@@ -533,7 +527,7 @@
             {
                 block_max = f_absmax_f32(block_max, static_cast<float>(elements[j]));
             }
-         }
+        }
     }
     else
     {
@@ -559,7 +553,6 @@
                     scalar_t const* cache_ptr = cos_sin_cache + pos_id * head_dim;
                     scalar_t const* cos_ptr  = cache_ptr;
                     scalar_t const* sin_ptr  = cache_ptr + head_dim / 2;
-
                     int const base_idx = vec_slot * vec_size;
                     #pragma unroll
                     for(int k = 0; k < vec_size; k += 2)
@@ -582,7 +575,6 @@
                 }
             } else {
                 constexpr int64_t head_thread_half = head_dim / vec_size / 2;
-
                 for(int idx = threadIdx.x; idx < total_elements / vec_size; idx += blockDim.x)
                 {
                     int token_local = idx / head_thread;
@@ -716,17 +708,16 @@
             int token_idx          = first_token_idx + idx * vec_size / head_dim;
             int head_offset        = (idx * vec_size) % head_dim;
             int block_offset_local = (token_idx - first_token_idx + block_offset) % page_size;
-            int head_divX          = head_offset >> x_shift;
-            int head_modX          = head_offset & x_mask;
-            int64_t k_base         = cache_offset + head_divX * k_row_stride + block_offset_local * x + head_modX;
 
             int64_t offsetWarp = (token_idx * num_heads * head_dim + localHeadIdx * head_dim) / vec_size;
             elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + head_offset / vec_size];
-
 #pragma unroll
             for(int j = 0; j < vec_size; j++)
             {
-                int64_t offset = k_base + j;
+                int ho            = head_offset + j;
+                int head_offset_divX = ho >> x_shift;
+                int head_offset_modX = ho & x_mask;
+                int64_t offset = cache_offset + head_offset_divX * page_size * x + block_offset_local * x + head_offset_modX;
                 if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
                 {
                     k_cache[offset] = elements[j];
@@ -1020,15 +1011,15 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
                                             int batch_size,
                                             hipStream_t stream)
 {
-    // blockSize (wg_size) selection: use page_size if it's 64/128/256, otherwise default to 64
-    int blockSize = page_size >= 64 ? page_size : 64;
+    // blockSize (wg_size): match page_size when sufficient for reduce_per_group.
+    // When page_size < 64 and head_thread > page_size (e.g. head_dim=256, page_size=16),
+    // use 64 threads so reduce_per_group has enough lanes.
+    int blockSize = page_size < 64 ? 64 : page_size;
 
     // Kernel uses cum_blocks: each batch needs ceil(seq_len_i/blockSize) + 1 blocks.
-    // Conservative upper bound: ceil(total/blockSize) + 2*batch_size
-    int const gridSize = (num_tokens + blockSize - 1) / blockSize + 2 * batch_size;
+    int const gridSize = (num_tokens + page_size - 1) / page_size + 2 * batch_size;
     dim3 gridDim(1, gridSize, num_heads_q + num_heads_k + num_heads_v);
     dim3 blockDim(blockSize);
-
 #define LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, WG_SIZE)                            \
         DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {                           \
             fusedQKNormRopeBlockQuantCacheShuffleKernel<scalar_t,               \
@@ -1060,7 +1051,7 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
         });
 
 #define DISPATCH_BLOCK_SIZE(HEAD_DIM)                                            \
-    if(blockSize == 64)       { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 64)  } \
+    if(blockSize == 64) { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 64)  }       \
     else if(blockSize == 128) { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 128) }      \
     else if(blockSize == 256) { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 256) }      \
     else { TORCH_CHECK(false, "Unsupported blockSize: ", blockSize); }
