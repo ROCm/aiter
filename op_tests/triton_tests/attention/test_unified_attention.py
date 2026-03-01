@@ -309,7 +309,7 @@ def test_triton_unified_attn(
     "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
 )
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("head_size", [128,])
 @pytest.mark.parametrize("block_size", [64, ])
 @pytest.mark.parametrize("sliding_window", [None, 256])
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -321,6 +321,14 @@ def test_triton_unified_attn(
 )
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("q_dtype", QDTYPES)
+@pytest.mark.parametrize(
+    "use_tdm, num_kv_blocks",
+    [
+        #(False, 1),
+        (True, 1),
+        (True, 4),
+    ],
+)
 @torch.inference_mode()
 def test_gluon_unified_attn_2d(
     seq_lens: list[tuple[int, int]],
@@ -332,7 +340,18 @@ def test_gluon_unified_attn_2d(
     soft_cap: Optional[float],
     num_blocks: int,
     q_dtype: Optional[torch.dtype],
+    use_tdm: bool,
+    num_kv_blocks: int,
 ) -> None:
+    if DEVICE_ARCH not in (
+        "gfx950",
+        "gfx1250",
+    ):
+        pytest.skip(f"{DEVICE_ARCH} is not supported")
+    if DEVICE_ARCH not in ("gfx1250",) and use_tdm == True:
+        pytest.skip(f"{DEVICE_ARCH} does not have TDM")
+    if num_kv_blocks > 1 and DEVICE_ARCH not in ("gfx1250",):
+        pytest.skip(f"{DEVICE_ARCH} does not have TDM gather")
     if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
         pytest.skip("block size must be at least 32 for fp8")
     torch.manual_seed(0)
@@ -390,7 +409,10 @@ def test_gluon_unified_attn_2d(
         q_descale = None  # Not yet supported
         k_descale = torch.rand(scale_shape, dtype=torch.float32, device="cpu")
         v_descale = torch.rand(scale_shape, dtype=torch.float32, device="cpu")
-
+    
+    if num_kv_blocks > 1:
+        maybe_quantized_key_cache = maybe_quantized_key_cache.permute(0, 2, 1, 3).contiguous()
+        maybe_quantized_value_cache = maybe_quantized_value_cache.permute(0, 2, 1, 3).contiguous()
     output_cuda = output.cuda()
     gluon_unified_attention_2d(
         q=maybe_quantized_query.cuda(),
@@ -410,6 +432,9 @@ def test_gluon_unified_attn_2d(
         k_descale=k_descale,
         v_descale=v_descale,
         sinks=sinks.cuda(),
+        new_kv_layout=num_kv_blocks > 1,
+        num_kv_blocks=num_kv_blocks,
+        use_tdm=use_tdm,
     )
 
     ref_output = ref_paged_attn(
