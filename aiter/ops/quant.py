@@ -33,7 +33,7 @@ def moe_smoothquant_fwd(
 def get_dtype_max(dtype):
     try:
         dtypeMax = torch.finfo(dtype).max
-    except:
+    except TypeError:
         dtypeMax = torch.iinfo(dtype).max
     return dtypeMax
 
@@ -190,19 +190,17 @@ def get_torch_quant(qType):
 @functools.lru_cache()
 def get_hip_quant(qType):
     tmp = {
-        QuantType.No.value: lambda *a, **k: (a[0], None),
-        QuantType.per_Tensor.value: per_tensor_quant_hip,
-        QuantType.per_Token.value: per_token_quant_hip,
-        QuantType.per_1x32.value: per_1x32_f4_quant_hip,
-        QuantType.per_1x128.value: functools.partial(
-            per_group_quant_hip, group_size=128
-        ),
+        QuantType.No: lambda *a, **k: (a[0], None),
+        QuantType.per_Tensor: per_tensor_quant_hip,
+        QuantType.per_Token: per_token_quant_hip,
+        QuantType.per_1x32: per_1x32_f4_quant_hip,
+        QuantType.per_1x128: functools.partial(per_group_quant_hip, group_size=128),
     }
 
     def raise_NotImplementedError(*a, **k):
         raise NotImplementedError(f"unsupported quant type {qType=}")
 
-    return tmp.get(qType.value, raise_NotImplementedError)
+    return tmp.get(qType, raise_NotImplementedError)
 
 
 @functools.lru_cache()
@@ -236,21 +234,10 @@ def per_token_quant_hip(
     else:
         raise ValueError("unsupported: static per token quant")
 
-    if 1:
-        y = torch.empty(shape, dtype=quant_dtype, device=device)
-        dynamic_per_token_scaled_quant(
-            y, x, scale, num_rows=num_rows, num_rows_factor=num_rows_factor
-        )
-    elif quant_dtype == dtypes.i8:
-        M, N = x.view(-1, shape[-1]).shape
-        y = torch.empty((M, N), dtype=dtypes.i8, device=device)
-        scale = torch.empty(M, dtype=dtypes.fp32, device=device)
-        smooth_scale = torch.ones(N, dtype=dtypes.fp32, device=device)
-        smoothquant_fwd(y, x, smooth_scale, scale)
-        y = y.view(shape)
-    else:
-        raise ValueError(f"unsupported: {quant_dtype=}")
-    # print("finished per token quant hip")
+    y = torch.empty(shape, dtype=quant_dtype, device=device)
+    dynamic_per_token_scaled_quant(
+        y, x, scale, num_rows=num_rows, num_rows_factor=num_rows_factor
+    )
     return y, scale
 
 
@@ -398,7 +385,11 @@ def get_torch_act(aType):
         ActivationType.Silu: F.silu,
         ActivationType.Gelu: F.gelu,
     }
-    return tmp.get(aType, NotImplementedError)
+
+    def raise_NotImplementedError(*a, **k):
+        raise NotImplementedError(f"unsupported activation type {aType=}")
+
+    return tmp.get(aType, raise_NotImplementedError)
 
 
 @compile_ops("module_quant")
