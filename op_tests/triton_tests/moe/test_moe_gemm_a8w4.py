@@ -182,6 +182,13 @@ class Case:
     [
         tuple(getattr(case, f.name) for f in fields(Case))
         for case in [
+            Case(32, 6144, 3072, "float8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(8192, 3072, 3072, "float8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(4, 1024, 3072, "float8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(1024, 3072, 512, "float8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(4096, 3072, 3072, "float8_e4m3fn", 128, 4),
+            Case(16, 1024, 1024, "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(4096, 1024, 1024, "mxfloat8_e4m3fn", 128, 4),
             Case(16, 256, 256, "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
             Case(4096, 256, 256, "mxfloat8_e4m3fn", 128, 4),
             Case(1000, 704, 800, "mxfloat8_e4m3fn", 8, 2),
@@ -236,7 +243,7 @@ def test_op(
                 f"Shape {m}x{n}x{k} is not supported for scale swizzling on gfx950."
             )
 
-    # torch.manual_seed(0)
+    torch.manual_seed(0)
 
     weight_dtype_str = "mxfloat4_e2m1"
     weight_mxfp = weight_dtype_str.startswith("mx")
