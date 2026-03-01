@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-Iris two-shot fused AllReduce + RMSNorm + per-row FP8 Quant.
+Iris two-shot fused AllReduce + RMSNorm + per-row FP8 Quant + inlined GEMM.
 
 FP8 broadcast variant: the symmetric heap carries FP8 data AND per-row
 scales instead of BF16, halving cross-rank traffic for the dominant
-data payload.
+data payload.  The GEMM reads directly from the heap buffer after the
+barrier, eliminating the FP8 round-trip through global memory and the
+separate GEMM kernel launch.
 
 Single persistent kernel:
   Step 1 (Two-shot AllReduce + fused RMSNorm + per-row quant + FP8 broadcast):
@@ -13,14 +15,15 @@ Single persistent kernel:
     optionally pre-adds the residual for its own partial, stores the
     BF16 result (owned rows only), then RMSNorm + per-row FP8 quant.
     The FP8 result and per-row scale are broadcast to all peers via
-    the symmetric heap.
+    the symmetric heap.  No separate quant_out buffer is written.
   Step 2 (Inlined device barrier): CTA 0 performs cross-rank
     synchronization via atomic ops on the symmetric heap. Other CTAs
     spin on a local flag until CTA 0 signals completion.
-  Step 3 (FP8 + scale copy for remaining rows):
-    Copy FP8 quantized results and per-row scales broadcast by owning
-    ranks during Step 1. No RMSNorm or quantization needed -- just a
-    heap-to-local copy.
+  Step 3 (Inlined GEMM): After the barrier, all CTAs transition to
+    GEMM mode. The complete (M, N) FP8 matrix and per-row scales are
+    read directly from the heap buffers. A persistent tiled GEMM
+    computes C = scale_a * (A_fp8 @ W_fp8) * weight_scale,
+    producing BF16 output.
 
 Compared to delayed-scaling twoshot (iris_twoshot_delayed_allreduce.py):
 - No delayed scaling bookkeeping (no cross-rank amax sync, no
@@ -32,7 +35,7 @@ Compared to delayed-scaling twoshot (iris_twoshot_delayed_allreduce.py):
 
 Compared to BF16-broadcast per-row (original iris_twoshot_row):
 - Broadcasts FP8 + scale instead of BF16, halving the dominant traffic
-- Step 3 is a copy instead of redundant RMSNorm + quant
+- GEMM is inlined: no separate kernel launch, no quant_out buffer
 
 CUDA graph compatibility:
 - Buffer pre-allocation with view pattern (same as twoshot)
@@ -49,11 +52,10 @@ import triton
 import triton.language as tl
 
 from .iris_twoshot_allreduce import (
-    IRIS_TWOSHOT_AUTOTUNE_KEYS,
+    _compute_chunk_size,
     _inlined_device_barrier,
     chiplet_transform_chunked,
     extract_group_info,
-    get_iris_twoshot_configs,
 )
 
 __all__ = ["fused_allreduce_add_rms_row_quant_gemm_iris_twoshot"]
@@ -65,22 +67,97 @@ if AUTOTUNE:
     os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 
 
-iris_twoshot_row_autotune_configs = get_iris_twoshot_configs(AUTOTUNE)
+# Autotune keys — includes K_GEMM since GEMM tiling depends on it
+IRIS_TWOSHOT_ROW_GEMM_AUTOTUNE_KEYS = [
+    "M",
+    "N",
+    "K_GEMM",
+    "HAS_RESIDUAL",
+]
+
+# GEMM block size search space: (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_SIZE_M)
+_GEMM_BLOCK_CONFIGS = [
+    (64, 128, 128, 4),
+    (128, 128, 128, 4),
+    (128, 256, 128, 4),
+    (256, 128, 128, 4),
+]
+
+
+def _get_iris_twoshot_row_gemm_configs(autotune: bool):
+    """Generate autotune configs including GEMM block size variations."""
+    num_xcds = iris.hip.get_num_xcc()
+
+    if not autotune:
+        comm_sms = 128
+        return [
+            triton.Config(
+                {
+                    "COMM_SMS": comm_sms,
+                    "NUM_XCDS": num_xcds,
+                    "CHUNK_SIZE": _compute_chunk_size(comm_sms, num_xcds),
+                    "waves_per_eu": 4,
+                    "GEMM_BLOCK_M": 128,
+                    "GEMM_BLOCK_N": 128,
+                    "GEMM_BLOCK_K": 128,
+                    "GEMM_GROUP_SIZE_M": 4,
+                },
+                num_warps=16,
+                num_stages=2,
+            )
+        ]
+
+    configs = []
+    COMM_SMS_OPTIONS = [32, 64, 128]
+    NUM_WARPS_OPTIONS = [4, 8, 16]
+    NUM_STAGES_OPTIONS = [1, 2]
+    WAVES_PER_EU_OPTIONS = [1, 2, 4]
+    for sms in COMM_SMS_OPTIONS:
+        chunk = _compute_chunk_size(sms, num_xcds)
+        for nw in NUM_WARPS_OPTIONS:
+            for ns in NUM_STAGES_OPTIONS:
+                for waves in WAVES_PER_EU_OPTIONS:
+                    for gm, gn, gk, gsm in _GEMM_BLOCK_CONFIGS:
+                        configs.append(
+                            triton.Config(
+                                {
+                                    "COMM_SMS": sms,
+                                    "NUM_XCDS": num_xcds,
+                                    "CHUNK_SIZE": chunk,
+                                    "waves_per_eu": waves,
+                                    "GEMM_BLOCK_M": gm,
+                                    "GEMM_BLOCK_N": gn,
+                                    "GEMM_BLOCK_K": gk,
+                                    "GEMM_GROUP_SIZE_M": gsm,
+                                },
+                                num_stages=ns,
+                                num_warps=nw,
+                            )
+                        )
+    return configs
+
+
+iris_twoshot_row_autotune_configs = _get_iris_twoshot_row_gemm_configs(
+    AUTOTUNE
+)
 
 
 # ============================================================================
-# Fused two-shot AllReduce + RMSNorm + per-row FP8 Quant kernel
-# (FP8 broadcast variant)
+# Fused two-shot AllReduce + RMSNorm + per-row FP8 Quant + GEMM kernel
+# (FP8 broadcast variant with inlined GEMM)
 # ============================================================================
 
 
 @triton.autotune(
     configs=iris_twoshot_row_autotune_configs,
-    key=IRIS_TWOSHOT_AUTOTUNE_KEYS,
+    key=IRIS_TWOSHOT_ROW_GEMM_AUTOTUNE_KEYS,
     use_cuda_graph=True,
 )
+@triton.heuristics(
+    {"EVEN_GEMM_K": lambda args: args["N"] % args["GEMM_BLOCK_K"] == 0}
+)
 @triton.jit
-def fused_twoshot_allreduce_rmsnorm_row_quant_kernel(
+def fused_twoshot_allreduce_rmsnorm_row_quant_gemm_kernel(
     # Input (in symmetric heap for iris.load)
     input_ptr,
     # FP8 quant heap (in symmetric heap for FP8 broadcast)
@@ -89,8 +166,16 @@ def fused_twoshot_allreduce_rmsnorm_row_quant_kernel(
     scale_heap_ptr,
     # Outputs (regular GPU memory)
     result_out_ptr,
-    quant_out_ptr,
-    scale_out_ptr,  # shape (M, 1) -- per-row scale
+    # GEMM parameters
+    gemm_weight_ptr,  # (N, K_GEMM) fp8 weight matrix
+    gemm_out_ptr,  # (M, K_GEMM) output buffer
+    bias_ptr,  # optional bias (K_GEMM,); dummy ptr when HAS_BIAS=False
+    weight_scale,  # float32 scalar (per-tensor weight scale)
+    K_GEMM,  # GEMM output dimension
+    stride_gw_k,  # gemm_weight stride dim 0
+    stride_gw_n,  # gemm_weight stride dim 1
+    stride_go_m,  # gemm_out stride dim 0
+    stride_go_k,  # gemm_out stride dim 1
     # Inlined device barrier state (symmetric heap)
     barrier_flags_ptr,
     barrier_epoch,
@@ -122,16 +207,25 @@ def fused_twoshot_allreduce_rmsnorm_row_quant_kernel(
     # Explicit kernel params
     BLOCK_SIZE_N: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
-    # Autotuned params
+    HAS_BIAS: tl.constexpr,
+    # Autotuned params (from config)
     COMM_SMS: tl.constexpr,
     NUM_XCDS: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
+    GEMM_BLOCK_M: tl.constexpr,
+    GEMM_BLOCK_N: tl.constexpr,
+    GEMM_BLOCK_K: tl.constexpr,
+    GEMM_GROUP_SIZE_M: tl.constexpr,
+    # Heuristic params
+    EVEN_GEMM_K: tl.constexpr,
 ):
-    """Fused two-shot AllReduce + RMSNorm + per-row FP8 quant.
+    """Fused two-shot AllReduce + RMSNorm + per-row FP8 quant + inlined GEMM.
 
     FP8 broadcast: broadcasts FP8 quant results and per-row scales
     instead of BF16 allreduce results, halving cross-rank traffic.
     Only owned rows get BF16 result_out and residual addition.
+    After barrier, all CTAs perform a persistent tiled GEMM reading
+    FP8 data and per-row scales directly from the heap buffers.
     """
     raw_pid = tl.program_id(0)
     pid = raw_pid
@@ -196,12 +290,8 @@ def fused_twoshot_allreduce_rmsnorm_row_quant_kernel(
         row_amax = tl.max(tl.abs(normed), axis=0)
         row_amax = tl.maximum(row_amax, 1e-12)
         scale = row_amax / fp8_max
-        tl.store(scale_out_ptr + row, scale)
 
-        quantized = (normed / scale).to(quant_out_ptr.type.element_ty)
-
-        # Store FP8 locally
-        tl.store(quant_out_ptr + out_offset, quantized, mask=col_mask)
+        quantized = (normed / scale).to(quant_heap_ptr.type.element_ty)
 
         # Store FP8 to heap and broadcast to all peers
         tl.store(
@@ -248,22 +338,105 @@ def fused_twoshot_allreduce_rmsnorm_row_quant_kernel(
     )
 
     # ================================================================
-    # Step 3: Copy FP8 quant + scale for remaining rows (broadcast by owners)
+    # Step 3: Inlined GEMM — read FP8 + scales from heap, produce BF16
     # ================================================================
+    # After barrier, quant_heap_ptr contains the complete (M, N) FP8
+    # matrix and scale_heap_ptr contains per-row scales for ALL rows.
+    # All COMM_SMS CTAs cooperatively tile the (M, K_GEMM) output.
 
-    for row in range(pid, M, COMM_SMS):
-        # Only process rows NOT assigned to this rank
-        if row < my_start or row >= my_end:
-            qh_offset = row * stride_qh_m + cols * stride_qh_n
-            out_offset = row * N + cols
+    num_pid_m = tl.cdiv(M, GEMM_BLOCK_M)
+    num_pid_n = tl.cdiv(K_GEMM, GEMM_BLOCK_N)
+    total_tiles = num_pid_m * num_pid_n
 
-            quant_val = tl.load(
-                quant_heap_ptr + qh_offset, mask=col_mask
+    for tile_id in range(pid, total_tiles, COMM_SMS):
+        # Map tile_id → (pid_m, pid_n) with GROUP_SIZE_M swizzle
+        if GEMM_GROUP_SIZE_M == 1:
+            pid_m = tile_id // num_pid_n
+            pid_n = tile_id % num_pid_n
+        else:
+            num_pid_in_group = GEMM_GROUP_SIZE_M * num_pid_n
+            group_id = tile_id // num_pid_in_group
+            first_pid_m = group_id * GEMM_GROUP_SIZE_M
+            group_size_m = tl.minimum(
+                num_pid_m - first_pid_m, GEMM_GROUP_SIZE_M
             )
-            tl.store(quant_out_ptr + out_offset, quant_val, mask=col_mask)
+            pid_m = first_pid_m + (tile_id % group_size_m)
+            pid_n = (tile_id % num_pid_in_group) // group_size_m
 
-            scale_val = tl.load(scale_heap_ptr + row)
-            tl.store(scale_out_ptr + row, scale_val)
+        # Offsets for this tile
+        offs_am = pid_m * GEMM_BLOCK_M + tl.arange(0, GEMM_BLOCK_M)
+        offs_bn = pid_n * GEMM_BLOCK_N + tl.arange(0, GEMM_BLOCK_N)
+        offs_k = tl.arange(0, GEMM_BLOCK_K)
+
+        # A pointers: read from quant_heap (M, N) — A is (M, N), B is (N, K_GEMM)
+        # stride_qh_m, stride_qh_n are heap strides
+        a_ptrs = (
+            quant_heap_ptr
+            + (offs_am[:, None] % M) * stride_qh_m
+            + offs_k[None, :] * stride_qh_n
+        )
+        # B pointers: gemm_weight is (N, K_GEMM) with strides (stride_gw_k, stride_gw_n)
+        # Note: gemm_weight layout is (K=N, N=K_GEMM) in the GEMM sense
+        b_ptrs = (
+            gemm_weight_ptr
+            + offs_k[:, None] * stride_gw_k
+            + (offs_bn[None, :] % K_GEMM) * stride_gw_n
+        )
+
+        # Load per-row activation scales for this tile's rows
+        a_scale_offs = pid_m * GEMM_BLOCK_M + tl.arange(0, GEMM_BLOCK_M)
+        a_scale = tl.load(
+            scale_heap_ptr + (a_scale_offs % M)
+        )
+
+        # Tiled GEMM accumulation
+        accumulator = tl.zeros((GEMM_BLOCK_M, GEMM_BLOCK_N), dtype=tl.float32)
+
+        for k in range(0, tl.cdiv(N, GEMM_BLOCK_K)):
+            if EVEN_GEMM_K:
+                a = tl.load(a_ptrs)
+                b = tl.load(b_ptrs)
+            else:
+                k_remaining = N - k * GEMM_BLOCK_K
+                a = tl.load(
+                    a_ptrs,
+                    mask=offs_k[None, :] < k_remaining,
+                    other=0.0,
+                )
+                b = tl.load(
+                    b_ptrs,
+                    mask=offs_k[:, None] < k_remaining,
+                    other=0.0,
+                )
+
+            accumulator += tl.dot(a, b, input_precision="ieee")
+
+            # Advance pointers along K (= N) dimension
+            a_ptrs += GEMM_BLOCK_K * stride_qh_n
+            b_ptrs += GEMM_BLOCK_K * stride_gw_k
+
+        # Apply scales: per-row activation scale * per-tensor weight scale
+        accumulator *= a_scale[:, None] * weight_scale
+
+        # Optional bias
+        if HAS_BIAS:
+            bias_offs = (pid_n * GEMM_BLOCK_N
+                         + tl.arange(0, GEMM_BLOCK_N)) % K_GEMM
+            bias_val = tl.load(bias_ptr + bias_offs)
+            accumulator = accumulator.to(bias_ptr.type.element_ty) + bias_val[None, :]
+
+        # Convert to output dtype and store
+        c = accumulator.to(gemm_out_ptr.type.element_ty)
+
+        offs_cm = pid_m * GEMM_BLOCK_M + tl.arange(0, GEMM_BLOCK_M)
+        offs_cn = pid_n * GEMM_BLOCK_N + tl.arange(0, GEMM_BLOCK_N)
+        c_ptrs = (
+            gemm_out_ptr
+            + offs_cm[:, None] * stride_go_m
+            + offs_cn[None, :] * stride_go_k
+        )
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < K_GEMM)
+        tl.store(c_ptrs, c, mask=c_mask)
 
 
 # ============================================================================
@@ -272,11 +445,12 @@ def fused_twoshot_allreduce_rmsnorm_row_quant_kernel(
 
 
 class IrisTwoshotRowManager:
-    """Singleton manager for two-shot AllReduce+RMSNorm+per-row Quant.
+    """Singleton manager for two-shot AllReduce+RMSNorm+per-row Quant+GEMM.
 
     FP8 broadcast variant: broadcasts FP8 and per-row scales on the
     heap instead of BF16. Only owned rows get BF16 result_out and
-    residual addition.
+    residual addition. GEMM is inlined in the kernel — reads FP8 and
+    scales directly from the heap after the barrier.
     """
 
     _instance: Optional["IrisTwoshotRowManager"] = None
@@ -313,10 +487,8 @@ class IrisTwoshotRowManager:
 
         # Pre-allocated output buffers (regular GPU memory)
         self._out_result: Optional[torch.Tensor] = None
-        self._out_quant: Optional[torch.Tensor] = None
-        self._out_scale: Optional[torch.Tensor] = None  # shape (M, 1)
-        self._out_quant_dtype: Optional[torch.dtype] = None
-
+        self._out_gemm: Optional[torch.Tensor] = None  # (M, K_GEMM)
+        self._out_gemm_K: int = 0
 
         # Inlined device barrier state
         self._barrier_flags: Any = None  # on symmetric heap
@@ -477,20 +649,23 @@ class IrisTwoshotRowManager:
         self,
         M: int,
         N: int,
+        K_GEMM: int,
         dtype: torch.dtype,
-        quant_dtype: torch.dtype,
+        out_dtype: torch.dtype,
         device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get views into pre-allocated output buffers (regular GPU memory).
 
-        Returns (result_out, quant_out, scale_out).
+        Returns (result_out, gemm_out).
         result_out stores BF16 allreduce result (only owned rows are valid).
+        gemm_out stores the GEMM output (M, K_GEMM) in out_dtype.
         """
         need_alloc = (
             self._out_result is None
             or M > self._out_result.shape[0]
             or N != self._out_result.shape[1]
-            or quant_dtype != self._out_quant_dtype
+            or self._out_gemm is None
+            or K_GEMM != self._out_gemm_K
         )
 
         if need_alloc:
@@ -507,11 +682,10 @@ class IrisTwoshotRowManager:
                 )
 
             self._out_result = torch.empty((M, N), dtype=dtype, device=device)
-            self._out_quant = torch.empty(
-                (M, N), dtype=quant_dtype, device=device
+            self._out_gemm = torch.empty(
+                (M, K_GEMM), dtype=out_dtype, device=device
             )
-            self._out_scale = torch.empty((M, 1), dtype=torch.float32, device=device)
-            self._out_quant_dtype = quant_dtype
+            self._out_gemm_K = K_GEMM
 
             # Inlined barrier: CTA 0 -> other CTAs signal
             self._barrier_done = torch.zeros(
@@ -524,15 +698,15 @@ class IrisTwoshotRowManager:
                 else 0
             )
             logger.info(
-                f"Iris (twoshot-row): allocated output buffers ({M}, {N}), "
+                f"Iris (twoshot-row): allocated output buffers "
+                f"result=({M}, {N}), gemm=({M}, {K_GEMM}), "
                 f"dtype={dtype}, rank={cur_rank}"
             )
 
         assert self._out_result is not None
-        assert self._out_quant is not None
-        assert self._out_scale is not None
+        assert self._out_gemm is not None
 
-        return self._out_result[:M], self._out_quant[:M], self._out_scale[:M]
+        return self._out_result[:M], self._out_gemm[:M]
 
     def fused_allreduce_rmsnorm_row_quant_gemm(
         self,
@@ -546,21 +720,23 @@ class IrisTwoshotRowManager:
         residual: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Two-shot AllReduce + RMSNorm + per-row FP8 quant + GEMM.
+        """Two-shot AllReduce + RMSNorm + per-row FP8 quant + inlined GEMM.
 
         FP8 broadcast variant: broadcasts FP8 and per-row scales on
-        the heap. Only owned rows get BF16 result_out.
+        the heap. Only owned rows get BF16 result_out. GEMM reads
+        directly from the heap after the barrier — no separate kernel
+        launch or quant_out buffer.
 
         Args:
             input_tensor: Input tensor (M, N) on GPU
             rms_weight: RMSNorm weight (N,)
             rms_eps: RMSNorm epsilon
             quant_dtype: FP8 dtype (e.g. torch.float8_e4m3fn)
-            gemm_weight: FP8 weight matrix for scaled GEMM
-            weight_scale: Scale for gemm_weight
+            gemm_weight: FP8 weight matrix (N, K_GEMM)
+            weight_scale: Per-tensor scale for gemm_weight
             out_dtype: Output dtype for GEMM (e.g. torch.bfloat16)
             residual: Optional residual tensor (M, N)
-            bias: Optional bias for GEMM
+            bias: Optional bias for GEMM (K_GEMM,)
 
         Returns:
             (gemm_out, residual_out). residual_out is None when
@@ -568,14 +744,15 @@ class IrisTwoshotRowManager:
         """
         shmem = self.shmem
         M, N = input_tensor.shape
+        K_GEMM = gemm_weight.shape[1]
         device = input_tensor.device
 
         # Get pre-allocated buffers
         iris_input = self._get_input_buffer(M, N, input_tensor.dtype)
         quant_heap = self._get_quant_heap_buffer(M, N, quant_dtype)
         scale_heap = self._get_scale_heap_buffer(M)
-        result_out, quant_out, scale_out = self._get_output_buffers(
-            M, N, input_tensor.dtype, quant_dtype, device,
+        result_out, gemm_out = self._get_output_buffers(
+            M, N, K_GEMM, input_tensor.dtype, out_dtype, device,
         )
 
         # Copy input to symmetric heap
@@ -592,6 +769,9 @@ class IrisTwoshotRowManager:
 
         BLOCK_SIZE_N = triton.next_power_of_2(N)
 
+        # Weight scale as a Python float (scalar, not tensor)
+        ws_float = weight_scale.item()
+
         # Reset sync buffer before kernel launch
         assert self._barrier_done is not None
         self._barrier_done.zero_()
@@ -599,35 +779,55 @@ class IrisTwoshotRowManager:
         def grid(META):
             return (META["COMM_SMS"],)
 
-        # Single fused kernel
-        fused_twoshot_allreduce_rmsnorm_row_quant_kernel[grid](
+        # Dummy bias pointer when no bias
+        bias_ptr = bias if bias is not None else input_tensor
+
+        # Single fused kernel: allreduce + rmsnorm + quant + gemm
+        # GEMM block sizes and EVEN_GEMM_K come from autotune/heuristics
+        fused_twoshot_allreduce_rmsnorm_row_quant_gemm_kernel[grid](
             iris_input,
             quant_heap,
             scale_heap,
             result_out,
-            quant_out,
-            scale_out,
+            # GEMM params
+            gemm_weight,
+            gemm_out,
+            bias_ptr,
+            ws_float,
+            K_GEMM,
+            gemm_weight.stride(0),
+            gemm_weight.stride(1),
+            gemm_out.stride(0),
+            gemm_out.stride(1),
+            # Barrier
             self._barrier_flags,
             self._barrier_epoch,
             self._barrier_done,
+            # Residual
             residual if residual is not None else input_tensor,
+            # RMSNorm
             rms_weight,
             rms_eps,
             fp8_max,
+            # Dimensions
             M,
             N,
+            # Strides
             iris_input.stride(0),
             iris_input.stride(1),
             quant_heap.stride(0),
             quant_heap.stride(1),
+            # Iris
             heap_bases,
             rank_in_group,
             rank_global,
             world_size,
             rank_start,
             rank_stride,
+            # Explicit constexprs
             BLOCK_SIZE_N,
             residual is not None,
+            bias is not None,
         )
 
         # Advance epoch for the inlined barrier consumed by the kernel
@@ -636,17 +836,6 @@ class IrisTwoshotRowManager:
         # result_out and residual_out are the same buffer -- only owned
         # rows are valid, which is all that downstream reads.
         residual_out = result_out if residual is not None else None
-
-        # Scaled GEMM -- per-row scale_a (M, 1) triggers row-wise mode
-        # in _scaled_mm, which requires scale_b to be (1, K).  The
-        # model's weight scale is per-tensor (1,), so expand it.
-        K = gemm_weight.shape[1]
-        scale_b = weight_scale.view(1, 1).expand(1, K).contiguous()
-
-        gemm_out = torch._scaled_mm(
-            quant_out, gemm_weight, out_dtype=out_dtype,
-            scale_a=scale_out, scale_b=scale_b, bias=bias,
-        )
 
         return gemm_out, residual_out
 
