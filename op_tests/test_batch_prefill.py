@@ -147,23 +147,12 @@ def should_skip_rocm72_issue(causal, logits_soft_cap):
 
 def check_common_skip_conditions(
     is_input_fp8: bool,
-    dtype,
-    causal: bool,
-    kv_len: int,
-    qo_len: int,
-    contiguous_kv: bool,
     return_lse: bool = False,
 ) -> bool:
     """
     Check common skip conditions shared across test functions.
     Returns True if test should be skipped.
     """
-
-    if skip_test_if(
-        causal and kv_len < qo_len,
-        "kv_len < qo_len is not allowed if causal=True",
-    ):
-        return True
 
     # FP8 is inference-only, no backward pass needed, so LSE is not required
     if skip_test_if(
@@ -671,9 +660,7 @@ def test_batch_prefill_page_size_1_linear_sglang(
     page_size = 1
 
     # Skip conditions
-    if check_common_skip_conditions(
-        is_input_fp8, dtype, causal, kv_len, qo_len, contiguous_kv, return_lse
-    ):
+    if check_common_skip_conditions(is_input_fp8, return_lse):
         return
     if check_layout_skip_conditions(
         "linear",
@@ -820,7 +807,10 @@ def test_batch_prefill_page_size_1_linear_sglang(
             kv_last_page_lens=kv_last_page_len_gpu,
         )
 
-        verify_fp8_output(out_fp8, o_ref)
+        # Causal + kv_len < qo_len: rows with few valid K positions amplify
+        # FP8 quantization error (not averaged over many attention targets)
+        fp8_threshold = 0.06 if causal and kv_len < qo_len else 0.055
+        verify_fp8_output(out_fp8, o_ref, threshold=fp8_threshold)
         rtol, atol = get_tolerances(dtype, is_fp8=True)
         torch.testing.assert_close(out_ref, o_ref, rtol=rtol, atol=atol)
     else:
@@ -933,9 +923,7 @@ def test_batch_prefill(
     k_vector_size_fp8 = get_vector_size(dtypes.fp8)
 
     # Skip conditions
-    if check_common_skip_conditions(
-        is_input_fp8, dtype, causal, kv_len, qo_len, contiguous_kv, return_lse
-    ):
+    if check_common_skip_conditions(is_input_fp8, return_lse):
         return {"status": "skipped"}
     if check_layout_skip_conditions(
         kvcache_layout,
@@ -1106,7 +1094,10 @@ def test_batch_prefill(
             profile=False,
         )
 
-        verify_fp8_output(out_fp8, o_ref)
+        # Causal + kv_len < qo_len: rows with few valid K positions amplify
+        # FP8 quantization error (not averaged over many attention targets)
+        fp8_threshold = 0.06 if causal and kv_len < qo_len else 0.055
+        verify_fp8_output(out_fp8, o_ref, threshold=fp8_threshold)
         rtol, atol = get_tolerances(dtype, is_fp8=False)
         torch.testing.assert_close(out_ref, o_ref, rtol=rtol, atol=atol)
     else:
@@ -1355,12 +1346,6 @@ def test_batch_prefill_linear_vs_vectorized(
     page_size = 1024
     k_vector_size = get_vector_size(dtype)
     k_vector_size_fp8 = get_vector_size(dtypes.fp8)
-
-    if skip_test_if(
-        causal and kv_len < qo_len,
-        "kv_len < qo_len is not allowed if causal=True",
-    ):
-        return
 
     if skip_test_if(
         should_skip_rocm72_issue(causal, logits_soft_cap),
@@ -1920,12 +1905,6 @@ def run_batch_prefill_kv_blockscale(
             return {"status": "skipped"}
 
     k_vector_size = get_vector_size(quant_dtype)
-
-    if skip_test_if(
-        causal and kv_len < qo_len,
-        "kv_len < qo_len is not allowed if causal=True",
-    ):
-        return {"status": "skipped"}
 
     if skip_test_if(
         should_skip_rocm72_issue(causal, logits_soft_cap),
