@@ -10,7 +10,7 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
     moe_gemm_a8w4,
-    swizzle_scales,
+    swizzle_scales_gfx950
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 import tempfile
@@ -88,7 +88,7 @@ def compute_roofline(
 
 def check_and_swizzle_scales(scale, N, K):
     if N % 32 == 0 and K % (32 * 8) == 0:
-        scale = swizzle_scales(scale)
+        scale = swizzle_scales_gfx950(scale)
         return scale, "CDNA4_SCALE"
     else:
         return scale, None

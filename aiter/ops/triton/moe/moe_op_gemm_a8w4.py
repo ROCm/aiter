@@ -165,7 +165,7 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     return ret
 
 
-def swizzle_scales(data):
+def swizzle_scales_gfx950(data):
     NON_K_PRESHUFFLE_BLOCK_SIZE = 32
     block_shape = data.shape
     SCALE_K = block_shape[-2]

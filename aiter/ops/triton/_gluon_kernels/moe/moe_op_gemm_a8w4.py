@@ -7,7 +7,7 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.language.core import _aggregate as aggregate
 import triton.experimental.gluon.language as gl
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
+from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd, pid_grid
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
 
 
@@ -68,30 +68,6 @@ def matmul_launch_metadata(grid, kernel, args):
     ret["bytes"] = int(n_x_bytes + n_y_bytes + n_w_bytes)
 
     return ret
-
-
-# TODO: using aiter swizzle instead can lead to perf degradation in rare cases
-@triton.jit
-def xcd_swizzle(pid, domain_size, XCD_SWIZZLE: tl.constexpr):
-    """
-    Swizzle the program id based on integer XCD_SWIZZLE.
-    This is useful for reording how blocks are ordered. A scheduler may, for example,
-    assign sequential blocks 0, 1, 2, 3, ..., 8, 9, 10.. to its 8 hardware units 0, 1, 2, 3, ..., 0, 1, 2.
-    This pattern may not be ideal for memory access, and it may be better to swizzle so the assignment
-    becomes 0, 0, 0, 0, ..., 1, 1, 1, ... In the swizzled arrangement, sequential blocks are assigned to
-    the same hardware unit.
-    """
-    # Number of pids per group in the new arrangement
-    pids_per_group = domain_size // XCD_SWIZZLE
-    extra_pid_groups = domain_size % XCD_SWIZZLE
-
-    # Compute current current and local pid within the group
-    group = pid % XCD_SWIZZLE
-    local_pid = pid // XCD_SWIZZLE
-
-    # Calculate new pid based on the new grouping
-    new_pid = group * pids_per_group + min(group, extra_pid_groups) + local_pid
-    return new_pid
 
 
 @gluon.jit
@@ -297,10 +273,9 @@ def _moe_gemm_a8w4(
     if padding_m > 0 and pid >= total_actual_tiles:
         return
 
-    pid_emn = pid
-    pid_mn = pid_emn % (unpadded_m * grid_n)
+    pid_mn = pid % (unpadded_m * grid_n)
     if XCD_SWIZZLE != 1:
-        pid_mn = xcd_swizzle(pid_mn, total_actual_tiles, XCD_SWIZZLE)
+        pid_mn = remap_xcd(pid_mn, total_actual_tiles, XCD_SWIZZLE)
     pid_m, pid_n = pid_grid(pid_mn, unpadded_m, grid_n, 1)
     # unpack expert data
     expt_data = gl.load(ExptData + pid_m)
