@@ -391,6 +391,56 @@ def per_tensor_quant_triton(x, scale=None, quant_dtype=dtypes.i8):
     return y, scale
 
 
+def lqq_1x64_quant(
+    w_qt: torch.Tensor,
+    group_in_k_lqq: int = 64,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    quant_bits = 4
+    Qmax = 2**quant_bits - 1
+
+    assert w_qt.dtype == torch.int8, f"Input must be int8, got {w_qt.dtype}"
+    assert torch.all(w_qt >= -119) and torch.all(
+        w_qt <= 119
+    ), "Values must be in range [-119, 119]"
+
+    eprt, M, N = w_qt.shape
+    numGroups = N // group_in_k_lqq
+
+    assert (
+        N % group_in_k_lqq == 0
+    ), f"N={N} must be divisible by group_in_k_lqq={group_in_k_lqq}"
+
+    w_qt_fp32 = w_qt.to(torch.float32)
+    w_reshaped = w_qt_fp32.view(eprt, M, numGroups, group_in_k_lqq)
+
+    w_min = w_reshaped.min(dim=-1, keepdim=True)[0]
+    w_max = w_reshaped.max(dim=-1, keepdim=True)[0]
+
+    # scale
+    scale_fp32 = (w_max - w_min) / Qmax
+    scale_fp32.clamp(min=1.0e-3)
+    scale_u8 = scale_fp32.round().clamp(min=1).to(torch.uint8)
+    assert torch.all(scale_u8 > 0) and torch.all(
+        scale_u8 <= 16
+    ), "lqq scale must be in range (0, 16]"
+
+    # zero
+    zero_i8 = w_min.round().to(torch.int8)
+    zero_u8 = (zero_i8.to(torch.int16) + 128).to(torch.uint8)
+
+    # uint4
+    w_lqq_fp32 = (w_reshaped - w_min.to(torch.float32)) / scale_fp32
+    w_lqq_u4 = w_lqq_fp32.round().to(torch.uint8)
+
+    w_lqq_uint4 = w_lqq_u4.view(eprt, M, N).to(device)
+    w_lqq_scale = scale_u8.squeeze(-1).to(device)
+    w_lqq_zero_u8 = zero_u8.squeeze(-1).to(device)
+    w_lqq_zero_i8 = zero_i8.squeeze(-1).to(device)
+
+    return w_lqq_uint4, w_lqq_scale, w_lqq_zero_u8, w_lqq_zero_i8
+
+
 @functools.lru_cache()
 def get_torch_act(aType):
     tmp = {
