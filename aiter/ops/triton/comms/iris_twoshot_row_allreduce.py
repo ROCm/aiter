@@ -317,6 +317,7 @@ class IrisTwoshotRowManager:
         self._out_scale: Optional[torch.Tensor] = None  # shape (M, 1)
         self._out_quant_dtype: Optional[torch.dtype] = None
 
+
         # Inlined device barrier state
         self._barrier_flags: Any = None  # on symmetric heap
         self._barrier_epoch: int = 0
@@ -636,10 +637,15 @@ class IrisTwoshotRowManager:
         # rows are valid, which is all that downstream reads.
         residual_out = result_out if residual is not None else None
 
-        # Scaled GEMM
+        # Scaled GEMM -- per-row scale_a (M, 1) triggers row-wise mode
+        # in _scaled_mm, which requires scale_b to be (1, K).  The
+        # model's weight scale is per-tensor (1,), so expand it.
+        K = gemm_weight.shape[1]
+        scale_b = weight_scale.view(1, 1).expand(1, K).contiguous()
+
         gemm_out = torch._scaled_mm(
             quant_out, gemm_weight, out_dtype=out_dtype,
-            scale_a=scale_out, scale_b=weight_scale, bias=bias,
+            scale_a=scale_out, scale_b=scale_b, bias=bias,
         )
 
         return gemm_out, residual_out
