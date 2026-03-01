@@ -1314,6 +1314,248 @@ def vectorize_kv_cache(
     return k_cache, v_cache
 
 
+@pytest.mark.parametrize("table_layout", ["sglang", "vllm"])
+@pytest.mark.parametrize("input_dtype", ["bf16", "fp8"])
+@pytest.mark.parametrize("batch_size", [1, 3])
+@pytest.mark.parametrize(
+    "qo_len,kv_len",
+    [
+        (128, 128),
+        (1024, 1024),
+        (2048, 2048),
+        (4096, 4096),
+    ],
+)
+@pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(8, 1), (16, 1)])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+def test_batch_prefill_linear_vs_vectorized(
+    table_layout,
+    input_dtype,
+    batch_size,
+    qo_len,
+    kv_len,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    causal,
+    logits_soft_cap,
+):
+    """
+    Compare LINEAR vs VECTORIZED layout batch_prefill output.
+
+    Both layouts represent the same logical KV data. Outputs should be
+    consistent regardless of memory layout. Uses a tighter tolerance than
+    the FP32 reference tests to catch layout-specific regressions.
+    """
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+    is_input_fp8 = input_dtype == dtypes.fp8 or input_dtype == "fp8"
+    page_size = 1024
+    k_vector_size = get_vector_size(dtype)
+    k_vector_size_fp8 = get_vector_size(dtypes.fp8)
+
+    if skip_test_if(
+        causal and kv_len < qo_len,
+        "kv_len < qo_len is not allowed if causal=True",
+    ):
+        return
+
+    if skip_test_if(
+        should_skip_rocm72_issue(causal, logits_soft_cap),
+        "ROCm 7.2 + gfx950 compiler issue with causal=True + logits_soft_cap=0.0",
+    ):
+        return
+
+    # Build test tensors
+    qo_lens = build_qo_lens(batch_size, qo_len, randomize=batch_size > 1)
+    kv_lens = build_kv_lens(batch_size, kv_len, qo_lens, randomize=batch_size > 1)
+    q_indptr_cpu = convert_lens_to_indptr(qo_lens)
+    q = build_q_tensor_for_test(
+        qo_lens,
+        batch_size,
+        qo_len,
+        num_qo_heads,
+        head_dim,
+        dtype,
+        -10,
+        10,
+        is_input_fp8,
+    )
+
+    kv_cache = build_paged_kv_cache(
+        batch_size,
+        kv_len,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        kv_lens,
+        None if is_input_fp8 else -5,
+        None if is_input_fp8 else 5,
+        dtype,
+        use_uniform=is_input_fp8,
+        contiguous_kv=True,
+    )
+
+    # Move to GPU
+    q_indptr_gpu = q_indptr_cpu.to(0)
+    kv_indptr_gpu = kv_cache["kv_indptr_cpu"].to(0)
+    kv_indices_gpu = kv_cache["kv_indices_cpu"].to(0)
+    kv_last_page_len_gpu = kv_cache["kv_last_page_len_cpu"].to(0)
+    max_qo_len = torch.max(qo_lens).item()
+    max_kv_len = torch.max(kv_lens).item()
+
+    k_cache_ref, v_cache_ref = extract_kv_caches(kv_cache, contiguous_kv=True)
+
+    # Build vLLM block table if needed
+    block_table_gpu = None
+    seqlen_k_gpu = None
+    if table_layout == "vllm":
+        block_table_cpu = build_block_table(
+            kv_cache["kv_indptr_cpu"],
+            kv_cache["kv_indices_cpu"],
+            batch_size,
+            kv_cache["max_num_pages_per_seq"],
+        )
+        block_table_gpu = block_table_cpu.to(0)
+        seqlen_k_gpu = kv_lens.to(0).int()
+
+    if is_input_fp8:
+        q_quant, q_descale = per_tensor_quant(q, quant_dtype=dtypes.fp8)
+        k_cache_quant, k_descale = per_tensor_quant(
+            k_cache_ref.to(dtype), quant_dtype=dtypes.fp8
+        )
+        v_cache_quant, v_descale = per_tensor_quant(
+            v_cache_ref.to(dtype), quant_dtype=dtypes.fp8
+        )
+
+        # LINEAR layout (dispatches V3)
+        k_linear = k_cache_quant.contiguous()
+        v_linear = v_cache_quant.contiguous()
+
+        # VECTORIZED layout (dispatches V2)
+        k_vec, v_vec = vectorize_kv_cache(
+            k_cache_quant,
+            v_cache_quant,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            k_vector_size_fp8,
+        )
+
+        out_linear = run_ck(
+            batch_size,
+            num_kv_heads,
+            q_quant,
+            k_linear,
+            v_linear,
+            q_indptr_gpu,
+            kv_indptr_gpu,
+            kv_indices_gpu,
+            max_qo_len,
+            max_kv_len,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            kv_last_page_lens=kv_last_page_len_gpu,
+            block_table=block_table_gpu,
+            seqlen_k=seqlen_k_gpu,
+        )
+        out_vec = run_ck(
+            batch_size,
+            num_kv_heads,
+            q_quant,
+            k_vec,
+            v_vec,
+            q_indptr_gpu,
+            kv_indptr_gpu,
+            kv_indices_gpu,
+            max_qo_len,
+            max_kv_len,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            kv_last_page_lens=kv_last_page_len_gpu,
+            block_table=block_table_gpu,
+            seqlen_k=seqlen_k_gpu,
+        )
+    else:
+        # LINEAR layout (dispatches V3)
+        k_linear, v_linear = apply_kv_layout(
+            k_cache_ref,
+            v_cache_ref,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            k_vector_size,
+            "linear",
+        )
+
+        # VECTORIZED layout (dispatches V2)
+        k_vec, v_vec = apply_kv_layout(
+            k_cache_ref,
+            v_cache_ref,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            k_vector_size,
+            "vectorized",
+        )
+
+        out_linear = run_ck(
+            batch_size,
+            num_kv_heads,
+            q,
+            k_linear,
+            v_linear,
+            q_indptr_gpu,
+            kv_indptr_gpu,
+            kv_indices_gpu,
+            max_qo_len,
+            max_kv_len,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+            kv_last_page_lens=kv_last_page_len_gpu,
+            block_table=block_table_gpu,
+            seqlen_k=seqlen_k_gpu,
+        )
+        out_vec = run_ck(
+            batch_size,
+            num_kv_heads,
+            q,
+            k_vec,
+            v_vec,
+            q_indptr_gpu,
+            kv_indptr_gpu,
+            kv_indices_gpu,
+            max_qo_len,
+            max_kv_len,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+            kv_last_page_lens=kv_last_page_len_gpu,
+            block_table=block_table_gpu,
+            seqlen_k=seqlen_k_gpu,
+        )
+
+    # Sanity checks
+    assert out_linear.abs().max().item() > 1e-6, "LINEAR output is all zeros!"
+    assert out_vec.abs().max().item() > 1e-6, "VECTORIZED output is all zeros!"
+
+    # LINEAR and VECTORIZED should produce consistent results
+    # Same data, same computation, only memory layout differs
+    max_diff = (out_linear - out_vec).abs().max().item()
+    threshold = 0.017
+    assert max_diff < threshold, (
+        f"LINEAR vs VECTORIZED difference too large: "
+        f"{max_diff} (threshold: {threshold})"
+    )
+
+
 def per_page_quant(tensor, page_size, quant_dtype):
     """
     Quantize tensor with per-page scale.
