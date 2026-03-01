@@ -2143,6 +2143,16 @@ def flydsl_moe_stage2(
             f"FlyDSL stage2 only supports out dtype in (fp16, bf16, fp32), got {out.dtype}"
         )
 
+    # Optional: run fp32 atomics then cast back to bf16/fp16.
+    # Motivation: avoid bf16 atomic requirements / overflow, at the cost of perf.
+    use_fp32_atomics = (
+        os.environ.get("AITER_FLYDSL_STAGE2_ATOMICS_FP32", "0")
+        in ("1", "true", "True", "YES", "yes")
+        and out.dtype in (dtypes.bf16, dtypes.fp16)
+        and not no_atomics
+        and str(gemm2_mode).upper().strip() != "REDUCE"
+    )
+
     # Optional fast path: run fp16 atomics then cast to bf16.
     # This can be significantly faster than bf16 global atomics on some configs.
     use_fp16_out = (
@@ -2150,11 +2160,22 @@ def flydsl_moe_stage2(
         in ("1", "true", "True", "YES", "yes")
         and out.dtype == dtypes.bf16
         and not no_atomics
+        and not use_fp32_atomics
         and not use_gemm2_ex  # compile_moe_gemm2_ex handles dtype internally
     )
     out_kernel = out
     out_dtype_kernel = out_dtype
-    if use_fp16_out:
+    if use_fp32_atomics:
+        # Reuse fp32 scratch to avoid per-iter allocation overhead.
+        key_s = ("stage2_fp32_atomics", int(out.device.index), tuple(out.shape))
+        out_kernel = _FLYDSL_SCRATCH_CACHE.get(key_s)
+        if out_kernel is None or out_kernel.device != out.device:
+            out_kernel = torch.empty(out.shape, device=out.device, dtype=dtypes.fp32)
+            _FLYDSL_SCRATCH_CACHE[key_s] = out_kernel
+        out_kernel.zero_()
+        out_dtype_kernel = "f32"
+        stage2_cshuffle = False
+    elif use_fp16_out:
         # Reuse fp16 scratch to avoid per-iter allocation overhead.
         key_s = ("stage2_fp16_out", int(out.device.index), tuple(out.shape))
         out_kernel = _FLYDSL_SCRATCH_CACHE.get(key_s)
@@ -2275,7 +2296,10 @@ def flydsl_moe_stage2(
 
         # Handle optional fp16->bf16 conversion if scratch buffer was used
         if out_kernel is not out:
-            out.copy_(out_kernel.to(dtypes.bf16))
+            aiter.logger.info(
+                f"copying out_kernel {out_kernel.dtype} ; out with dtype {out.dtype}"
+            )
+            out.copy_(out_kernel.to(out.dtype))
 
         return out
     else:

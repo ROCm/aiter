@@ -27,15 +27,16 @@ rm -fr ~/.cache/flydsl/
 # export AITER_USE_FLYDSL_MOE=1
 # export AITER_FLYDSL_USE_GEMM2_EX=1
 # export AITER_FLYDSL_GEMM2_MODE=ATOMIC
-# python op_tests/test_moe_ep.py -t g1u1_int8smoothquant -m $TOKEN
-
-echo "TEST 2: REDUCE mode"
-export AITER_USE_FLYDSL_MOE=1
-export AITER_FLYDSL_USE_GEMM2_EX=1
-export AITER_FLYDSL_GEMM2_MODE=REDUCE
-export AITER_FLYDSL_GEMM2_VALID_MASK=1
-export AITER_FLYDSL_MOE_TILE_M=32
 # AITER_LOG_MORE=1 python op_tests/test_moe_ep.py -t g1u1_int8smoothquant -m $TOKEN
+# 
+# 
+# echo "TEST 2: REDUCE mode"
+# export AITER_USE_FLYDSL_MOE=1
+# export AITER_FLYDSL_USE_GEMM2_EX=1
+# export AITER_FLYDSL_GEMM2_MODE=REDUCE
+# export AITER_FLYDSL_GEMM2_VALID_MASK=1
+# export AITER_FLYDSL_MOE_TILE_M=32
+# FLIR_DUMP_IR=1 FLIR_DUMP_DIR=dumps AITER_LOG_MORE=1 python op_tests/test_moe_ep.py -t g1u1_int8smoothquant -m $TOKEN
 
 echo "TEST 3: REDUCE mode"
 export AITER_USE_FLYDSL_MOE=1
@@ -43,4 +44,4 @@ export AITER_FLYDSL_USE_GEMM2_EX=1
 export AITER_FLYDSL_GEMM2_VALID_MASK=0
 export AITER_FLYDSL_GEMM2_MODE=REDUCE
 export AITER_FLYDSL_MOE_TILE_M=32
-AITER_LOG_MORE=1 python op_tests/test_moe_ep.py -t g1u1_int8smoothquant -m $TOKEN
+FLIR_DUMP_IR=1 FLIR_DUMP_DIR=dumps AITER_LOG_MORE=1 python op_tests/test_moe_ep.py -t g1u1_int8smoothquant -m $TOKEN
