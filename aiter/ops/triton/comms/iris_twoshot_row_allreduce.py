@@ -25,7 +25,7 @@ Single persistent kernel:
 Compared to delayed-scaling twoshot (iris_twoshot_delayed_allreduce.py):
 - No delayed scaling bookkeeping (no cross-rank amax sync, no
   prev_scale/current_amax state)
-- Per-row scales: shape (M,) instead of (1,), computed independently
+- Per-row scales: shape (M, 1) instead of (1,), computed independently
   per row with no cross-CTA or cross-rank coordination
 - Broadcasts both FP8 data and per-row scales (scale is one float32
   per row, tiny compared to the FP8 data)
@@ -90,7 +90,7 @@ def fused_twoshot_allreduce_rmsnorm_row_quant_kernel(
     # Outputs (regular GPU memory)
     result_out_ptr,
     quant_out_ptr,
-    scale_out_ptr,  # shape (M,) -- per-row scale
+    scale_out_ptr,  # shape (M, 1) -- per-row scale
     # Inlined device barrier state (symmetric heap)
     barrier_flags_ptr,
     barrier_epoch,
@@ -314,7 +314,7 @@ class IrisTwoshotRowManager:
         # Pre-allocated output buffers (regular GPU memory)
         self._out_result: Optional[torch.Tensor] = None
         self._out_quant: Optional[torch.Tensor] = None
-        self._out_scale: Optional[torch.Tensor] = None  # shape (M,)
+        self._out_scale: Optional[torch.Tensor] = None  # shape (M, 1)
         self._out_quant_dtype: Optional[torch.dtype] = None
 
         # Inlined device barrier state
@@ -509,7 +509,7 @@ class IrisTwoshotRowManager:
             self._out_quant = torch.empty(
                 (M, N), dtype=quant_dtype, device=device
             )
-            self._out_scale = torch.empty(M, dtype=torch.float32, device=device)
+            self._out_scale = torch.empty((M, 1), dtype=torch.float32, device=device)
             self._out_quant_dtype = quant_dtype
 
             # Inlined barrier: CTA 0 -> other CTAs signal
