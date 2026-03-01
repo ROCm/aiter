@@ -18,7 +18,10 @@ Implementations:
 2. "iris_oneshot" - Iris fused single-kernel allreduce+rmsnorm+quant (see iris_oneshot_allreduce.py)
 3. "iris_twoshot" - Iris two-shot reduce+broadcast allreduce+rmsnorm+quant (see iris_twoshot_allreduce.py)
 4. "iris_twoshot_row" - Same as iris_twoshot but with per-row FP8 quant (see iris_twoshot_row_allreduce.py)
-5. "iris_twoshot_delayed" (default) - Iris two-shot with delayed scaling + FP8 broadcast (see iris_twoshot_delayed_allreduce.py)
+5. "iris_twoshot_delayed" - Iris two-shot with delayed scaling + FP8 broadcast (see iris_twoshot_delayed_allreduce.py)
+
+Default: "iris_twoshot_row" -- per-row FP8 quant with FP8 broadcast (halved
+cross-rank traffic, no delayed-scaling overhead).
 """
 
 import logging
@@ -32,7 +35,7 @@ __all__ = ["fused_allreduce_add_rms_quant_gemm"]
 logger = logging.getLogger(__name__)
 
 ALLREDUCE_IMPL = os.environ.get(
-    "VLLM_ROCM_FUSED_ALLREDUCE", "iris_twoshot_delayed"
+    "VLLM_ROCM_FUSED_ALLREDUCE", "iris_twoshot_row"
 )
 
 
