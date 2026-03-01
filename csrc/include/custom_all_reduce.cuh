@@ -532,7 +532,7 @@ cross_device_reduce_2stage(RankData* _input_dp,
 #pragma unroll
                 for (int i = 0; i < pack_size; ++i)
                 {
-                    write_reg = downcast_s<T>(add_reg[i]);
+                    write_reg[i] = downcast_s<T>(add_reg[i]);
                 }
                 // Write local reduced result into this rank's tmp buffer (scatter)
                 tmp_out[idx - start] = write_reg;
@@ -594,7 +594,7 @@ cross_device_reduce_2stage(RankData* _input_dp,
 #pragma unroll
                 for (int i = 0; i < pack_size; ++i)
                 {
-                    write_reg = downcase_s<T>(add_reg[i]);
+                    write_reg[i] = downcase_s<T>(add_reg[i]);
                 }
                 tmp_out[idx - start] = write_reg;
             }
