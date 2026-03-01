@@ -13,37 +13,28 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-__all__ = ["fused_allreduce_add_rms_quant_torch"]
+__all__ = ["fused_allreduce_add_rms_quant_gemm_torch"]
 
 
-def fused_allreduce_add_rms_quant_torch(
+def fused_allreduce_add_rms_quant_gemm_torch(
     input: torch.Tensor,
     rms_weight: torch.Tensor,
     rms_eps: float,
-    quant_scale: torch.Tensor,
     quant_dtype: torch.dtype,
+    group_name: str,
+    gemm_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
     group: Optional[ProcessGroup] = None,
     residual: Optional[torch.Tensor] = None,
-) -> Tuple[
-    torch.Tensor,
-    torch.Tensor,
-    Optional[torch.Tensor],
-    torch.Tensor,
-    torch.Tensor,
-]:
-    """Pure torch reference: AllReduce + (optional) Add + RMSNorm + FP8 Quant.
+    bias: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Pure torch reference: AllReduce + Add + RMSNorm + FP8 Quant + GEMM.
 
-    Args:
-        input: Input tensor to all-reduce
-        rms_weight: RMSNorm weight
-        rms_eps: RMSNorm epsilon
-        quant_scale: Quantization scale (unused for dynamic quant, kept for API)
-        quant_dtype: Target quantization dtype (e.g., torch.float8_e4m3fn)
-        group: Process group for all-reduce (defaults to WORLD)
-        residual: Optional residual tensor for fused add
+    All FP8 is internal -- takes BF16 in, produces BF16 GEMM output.
 
-    Returns: (allreduce_out, rms_out, residual_out, quant_out, quant_scale_out)
-             residual_out is None if residual is None
+    Returns (gemm_out, residual_out). residual_out is None when residual
+    is None.
     """
     # Step 1: All-reduce using standard torch.distributed
     allreduce_out = input.clone()
@@ -74,4 +65,9 @@ def fused_allreduce_add_rms_quant_torch(
         -fp8_max, fp8_max
     ).to(quant_dtype)
 
-    return allreduce_out, rms_out, residual_out, quant_out, quant_scale_out
+    # Step 4: Scaled GEMM
+    gemm_out = torch.ops.vllm.rocm_per_tensor_float_w8a8_scaled_mm_impl(
+        quant_out, gemm_weight, out_dtype, quant_scale_out, weight_scale, bias,
+    )
+
+    return gemm_out, residual_out

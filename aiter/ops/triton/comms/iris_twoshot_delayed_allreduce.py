@@ -3,25 +3,30 @@
 """
 Iris two-shot fused AllReduce + RMSNorm + delayed-scaling FP8 Quant.
 
+FP8 broadcast variant: the symmetric heap carries FP8 data instead of
+BF16, halving cross-rank traffic.
+
 Single persistent kernel:
-  Step 1 (Two-shot AllReduce + fused RMSNorm + quant):
+  Step 1 (Two-shot AllReduce + fused RMSNorm + quant + FP8 broadcast):
     Each rank reduces its assigned rows by gathering from all ranks,
-    then broadcasts reduced rows to all peers. For assigned rows, the
-    data stays in registers after reduction, so RMSNorm + FP8
-    quantization happen immediately using the PREVIOUS call's scale.
+    optionally pre-adds the residual for its own partial, stores the
+    BF16 result (owned rows only), then RMSNorm + FP8 quant using the
+    PREVIOUS call's scale. The FP8 result is broadcast to all peers
+    via the symmetric heap.
   Step 2 (Inlined device barrier): CTA 0 performs cross-rank
     synchronization via atomic ops on the symmetric heap. Other CTAs
     spin on a local flag until CTA 0 signals completion.
-  Step 3 (RMSNorm + quant for remaining rows):
-    Process rows NOT assigned to this rank (received via broadcast),
-    again quantizing with the previous scale.
+  Step 3 (FP8 copy for remaining rows):
+    Copy FP8 quantized results broadcast by owning ranks during Step 1.
+    No RMSNorm or quantization needed -- just a heap-to-local copy.
 
 Delayed scaling:
   Quantization uses the scale from the PREVIOUS call (prev_scale).
   The kernel computes the current iteration's amax as a side-effect
   (via per-CTA local max + atomicMax to a global accumulator). After
   the kernel, the Python wrapper derives the new scale for the NEXT
-  call: new_scale = amax / fp8_max.
+  call: new_scale = amax / fp8_max. Each rank only computes amax for
+  its owned rows; a cross-rank all_reduce(MAX) syncs the global amax.
 
   This eliminates BOTH the cross-CTA barrier for global amax AND the
   separate quant pass, while outputting a per-tensor scale (1,) that
@@ -52,7 +57,7 @@ from .iris_twoshot_allreduce import (
     get_iris_twoshot_configs,
 )
 
-__all__ = ["fused_allreduce_add_rms_delayed_quant_iris_twoshot"]
+__all__ = ["fused_allreduce_add_rms_delayed_quant_gemm_iris_twoshot"]
 
 logger = logging.getLogger(__name__)
 
@@ -65,67 +70,8 @@ iris_twoshot_delayed_autotune_configs = get_iris_twoshot_configs(AUTOTUNE)
 
 
 # ============================================================================
-# Helpers
-# ============================================================================
-
-
-@triton.jit
-def _rmsnorm_delayed_quant(
-    rms_in,
-    rms_w,
-    rms_eps,
-    prev_scale,
-    rms_out_ptr,
-    quant_out_ptr,
-    residual_in_ptr,
-    residual_out_ptr,
-    out_offset,
-    N,
-    col_mask,
-    rms_out_dtype: tl.constexpr,
-    quant_out_dtype: tl.constexpr,
-    residual_out_dtype: tl.constexpr,
-    HAS_RESIDUAL: tl.constexpr,
-):
-    """RMSNorm + delayed-scaling FP8 quantization for a single row.
-
-    Quantizes using prev_scale (from previous call). Returns the row's
-    amax so the caller can accumulate it for the next call's scale.
-    """
-    # Optional residual addition
-    if HAS_RESIDUAL:
-        res_in = tl.load(
-            residual_in_ptr + out_offset, mask=col_mask, other=0.0
-        ).to(tl.float32)
-        rms_in = rms_in + res_in
-        tl.store(
-            residual_out_ptr + out_offset,
-            rms_in.to(residual_out_dtype),
-            mask=col_mask,
-        )
-
-    # RMSNorm
-    sq_sum = tl.sum(rms_in * rms_in, axis=0)
-    variance = sq_sum / N
-    rrms = tl.rsqrt(variance + rms_eps)
-    normed = rms_in * rrms * rms_w
-
-    tl.store(
-        rms_out_ptr + out_offset,
-        normed.to(rms_out_dtype),
-        mask=col_mask,
-    )
-
-    # Delayed-scaling quantize: use prev_scale, track amax
-    row_amax = tl.max(tl.abs(normed), axis=0)
-    quantized = (normed / prev_scale).to(quant_out_dtype)
-    tl.store(quant_out_ptr + out_offset, quantized, mask=col_mask)
-
-    return row_amax
-
-
-# ============================================================================
 # Fused two-shot AllReduce + RMSNorm + delayed-scaling FP8 Quant kernel
+# (FP8 broadcast variant)
 # ============================================================================
 
 
@@ -138,10 +84,10 @@ def _rmsnorm_delayed_quant(
 def fused_twoshot_allreduce_rmsnorm_delayed_quant_kernel(
     # Input (in symmetric heap for iris.load)
     input_ptr,
-    # Allreduce output (in symmetric heap for iris.store broadcast)
-    allreduce_out_ptr,
+    # FP8 quant heap (in symmetric heap for FP8 broadcast)
+    quant_heap_ptr,
     # Outputs (regular GPU memory)
-    rms_out_ptr,
+    result_out_ptr,
     quant_out_ptr,
     # Delayed scaling state
     prev_scale_ptr,   # (1,) -- scale from previous call, used for quant
@@ -153,21 +99,19 @@ def fused_twoshot_allreduce_rmsnorm_delayed_quant_kernel(
     barrier_done_ptr,
     # Residual (regular GPU memory; dummy ptr when HAS_RESIDUAL=False)
     residual_in_ptr,
-    residual_out_ptr,
     # RMSNorm weight
     rms_weight_ptr,
     # Scalar params
     rms_eps,
-    fp8_max,
     # Dimensions
     M,
     N,
     # Input strides (iris heap buffer)
     stride_in_m,
     stride_in_n,
-    # Allreduce output strides (iris heap buffer)
-    stride_ar_m,
-    stride_ar_n,
+    # Quant heap strides (iris heap buffer, FP8)
+    stride_qh_m,
+    stride_qh_n,
     # Iris params
     heap_bases: tl.tensor,
     group_rank: tl.constexpr,
@@ -185,8 +129,9 @@ def fused_twoshot_allreduce_rmsnorm_delayed_quant_kernel(
 ):
     """Fused two-shot AllReduce + RMSNorm + delayed-scaling FP8 quant.
 
-    Delayed scaling uses prev_scale for quantization and accumulates
-    the current amax for the next call. Outputs per-tensor scale (1,).
+    FP8 broadcast: broadcasts FP8 quant results instead of BF16 allreduce
+    results, halving cross-rank traffic. Only owned rows get BF16 result_out
+    and residual addition.
     """
     raw_pid = tl.program_id(0)
     pid = raw_pid
@@ -209,7 +154,7 @@ def fused_twoshot_allreduce_rmsnorm_delayed_quant_kernel(
     cta_amax = 0.0
 
     # ================================================================
-    # Step 1: Two-shot AllReduce (reduce + broadcast + fused norm+quant)
+    # Step 1: Two-shot AllReduce + fused RMSNorm + quant + FP8 broadcast
     # ================================================================
 
     # Block distribution of rows across ranks
@@ -219,56 +164,66 @@ def fused_twoshot_allreduce_rmsnorm_delayed_quant_kernel(
 
     for row in range(my_start + pid, my_end, COMM_SMS):
         in_offset = row * stride_in_m + cols * stride_in_n
-        ar_offset = row * stride_ar_m + cols * stride_ar_n
+        qh_offset = row * stride_qh_m + cols * stride_qh_n
         out_offset = row * N + cols
 
-        # Gather from all ranks and reduce
+        # Gather from all ranks and reduce, with inline residual pre-add
         acc = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
         for i in tl.static_range(0, world_size):
             remote_rank = rank_start + i * rank_stride
-            partial = iris.load(
+            val = iris.load(
                 input_ptr + in_offset,
                 iris_rank,
                 remote_rank,
                 heap_bases,
                 mask=col_mask,
-            )
-            acc += partial.to(tl.float32)
+            ).to(tl.float32)
+            # Pre-add residual for this rank's own partial
+            if HAS_RESIDUAL and remote_rank == iris_rank:
+                res_in = tl.load(
+                    residual_in_ptr + out_offset, mask=col_mask, other=0.0
+                ).to(tl.float32)
+                val = val + res_in
+            acc += val
 
-        reduced = acc.to(allreduce_out_ptr.type.element_ty)
-
-        # Store locally
+        # Store BF16 result (owned rows only) -- serves as both
+        # allreduce_out and residual_out for downstream
         tl.store(
-            allreduce_out_ptr + ar_offset,
-            reduced,
+            result_out_ptr + out_offset,
+            acc.to(result_out_ptr.type.element_ty),
             mask=col_mask,
         )
 
-        # Broadcast to all peers
+        # RMSNorm
+        sq_sum = tl.sum(acc * acc, axis=0)
+        rrms = tl.rsqrt(sq_sum / N + rms_eps)
+        normed = acc * rrms * rms_w
+
+        # Delayed-scaling FP8 quantize: use prev_scale, track amax
+        row_amax = tl.max(tl.abs(normed), axis=0)
+        cta_amax = tl.maximum(cta_amax, row_amax)
+        quantized = (normed / prev_scale).to(quant_out_ptr.type.element_ty)
+
+        # Store FP8 locally
+        tl.store(quant_out_ptr + out_offset, quantized, mask=col_mask)
+
+        # Store FP8 to heap and broadcast to all peers
+        tl.store(
+            quant_heap_ptr + qh_offset,
+            quantized,
+            mask=col_mask,
+        )
         for i in tl.static_range(0, world_size):
             remote_rank = rank_start + i * rank_stride
             if remote_rank != iris_rank:
                 iris.store(
-                    allreduce_out_ptr + ar_offset,
-                    reduced,
+                    quant_heap_ptr + qh_offset,
+                    quantized,
                     iris_rank,
                     remote_rank,
                     heap_bases,
                     mask=col_mask,
                 )
-
-        # Fused RMSNorm + delayed-scaling quant (data already in acc)
-        row_amax = _rmsnorm_delayed_quant(
-            acc, rms_w, rms_eps, prev_scale,
-            rms_out_ptr, quant_out_ptr,
-            residual_in_ptr, residual_out_ptr,
-            out_offset, N, col_mask,
-            rms_out_ptr.type.element_ty,
-            quant_out_ptr.type.element_ty,
-            residual_out_ptr.type.element_ty,
-            HAS_RESIDUAL,
-        )
-        cta_amax = tl.maximum(cta_amax, row_amax)
 
     # ================================================================
     # Step 2: Cross-rank device barrier
@@ -287,30 +242,19 @@ def fused_twoshot_allreduce_rmsnorm_delayed_quant_kernel(
     )
 
     # ================================================================
-    # Step 3: RMSNorm + delayed-scaling quant for remaining rows
+    # Step 3: Copy FP8 quant for remaining rows (broadcast by owners)
     # ================================================================
 
     for row in range(pid, M, COMM_SMS):
         # Only process rows NOT assigned to this rank
         if row < my_start or row >= my_end:
-            ar_offset = row * stride_ar_m + cols * stride_ar_n
+            qh_offset = row * stride_qh_m + cols * stride_qh_n
             out_offset = row * N + cols
 
-            ar_val = tl.load(
-                allreduce_out_ptr + ar_offset, mask=col_mask, other=0.0
-            ).to(tl.float32)
-
-            row_amax = _rmsnorm_delayed_quant(
-                ar_val, rms_w, rms_eps, prev_scale,
-                rms_out_ptr, quant_out_ptr,
-                residual_in_ptr, residual_out_ptr,
-                out_offset, N, col_mask,
-                rms_out_ptr.type.element_ty,
-                quant_out_ptr.type.element_ty,
-                residual_out_ptr.type.element_ty,
-                HAS_RESIDUAL,
+            quant_val = tl.load(
+                quant_heap_ptr + qh_offset, mask=col_mask
             )
-            cta_amax = tl.maximum(cta_amax, row_amax)
+            tl.store(quant_out_ptr + out_offset, quant_val, mask=col_mask)
 
     # ================================================================
     # Step 4: Accumulate this CTA's amax into the global accumulator
@@ -326,6 +270,9 @@ def fused_twoshot_allreduce_rmsnorm_delayed_quant_kernel(
 
 class IrisTwoshotDelayedManager:
     """Singleton manager for two-shot AllReduce+RMSNorm+delayed-scaling Quant.
+
+    FP8 broadcast variant: broadcasts FP8 on the heap instead of BF16.
+    Only owned rows get BF16 result_out and residual addition.
 
     Maintains prev_scale (1,) across calls. The first call uses
     prev_scale=1.0. Each subsequent call uses the scale derived from
@@ -354,14 +301,15 @@ class IrisTwoshotDelayedManager:
         self._input_N: int = 0
         self._input_dtype: Optional[torch.dtype] = None
 
-        # Pre-allocated allreduce output buffer (iris symmetric heap)
-        self._ar_output_buf: Any = None
-        self._ar_output_M: int = 0
+        # Pre-allocated FP8 quant heap buffer (iris symmetric heap)
+        self._quant_heap_buf: Any = None
+        self._quant_heap_M: int = 0
+        self._quant_heap_N: int = 0
+        self._quant_heap_dtype: Optional[torch.dtype] = None
 
         # Pre-allocated output buffers (regular GPU memory)
-        self._out_rms: Optional[torch.Tensor] = None
+        self._out_result: Optional[torch.Tensor] = None
         self._out_quant: Optional[torch.Tensor] = None
-        self._out_residual: Optional[torch.Tensor] = None
         self._out_quant_dtype: Optional[torch.dtype] = None
 
         # Delayed scaling state
@@ -451,30 +399,32 @@ class IrisTwoshotDelayedManager:
 
         return self._input_buf
 
-    def _get_ar_output_buffer(
+    def _get_quant_heap_buffer(
         self,
         M: int,
         N: int,
-        dtype: torch.dtype,
+        quant_dtype: torch.dtype,
     ) -> Any:
-        """Get a view into the pre-allocated iris allreduce output buffer."""
-        if (self._ar_output_buf is not None
-                and M <= self._ar_output_M
-                and N == self._input_N
-                and dtype == self._input_dtype):
-            return self._ar_output_buf[:M]
+        """Get a view into the pre-allocated iris FP8 quant heap buffer."""
+        if (self._quant_heap_buf is not None
+                and M <= self._quant_heap_M
+                and N == self._quant_heap_N
+                and quant_dtype == self._quant_heap_dtype):
+            return self._quant_heap_buf[:M]
 
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                f"Iris (twoshot-delayed): allreduce output buffer too small for "
-                f"M={M} (allocated {self._ar_output_M}). Cannot allocate "
+                f"Iris (twoshot-delayed): quant heap buffer too small for "
+                f"M={M} (allocated {self._quant_heap_M}). Cannot allocate "
                 f"during CUDA graph capture."
             )
 
         shmem = self.shmem
-        self._ar_output_buf = shmem.zeros((M, N), dtype=dtype)
+        self._quant_heap_buf = shmem.zeros((M, N), dtype=quant_dtype)
         shmem.device_barrier()
-        self._ar_output_M = M
+        self._quant_heap_M = M
+        self._quant_heap_N = N
+        self._quant_heap_dtype = quant_dtype
 
         cur_rank = (
             torch.distributed.get_rank()
@@ -482,11 +432,11 @@ class IrisTwoshotDelayedManager:
             else 0
         )
         logger.info(
-            f"Iris (twoshot-delayed): allocated allreduce output buffer "
-            f"({M}, {N}), dtype={dtype}, rank={cur_rank}"
+            f"Iris (twoshot-delayed): allocated quant heap buffer "
+            f"({M}, {N}), dtype={quant_dtype}, rank={cur_rank}"
         )
 
-        return self._ar_output_buf
+        return self._quant_heap_buf
 
     def _get_output_buffers(
         self,
@@ -495,42 +445,52 @@ class IrisTwoshotDelayedManager:
         dtype: torch.dtype,
         quant_dtype: torch.dtype,
         device: torch.device,
-        has_residual: bool,
-    ) -> Tuple[
-        torch.Tensor,
-        Optional[torch.Tensor],
-        torch.Tensor,
-    ]:
-        """Get views into pre-allocated output buffers (regular GPU memory)."""
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get views into pre-allocated output buffers (regular GPU memory).
+
+        Returns (result_out, quant_out).
+        result_out stores BF16 allreduce result (only owned rows are valid).
+        """
         need_alloc = (
-            self._out_rms is None
-            or M > self._out_rms.shape[0]
-            or N != self._out_rms.shape[1]
+            self._out_result is None
+            or M > self._out_result.shape[0]
+            or N != self._out_result.shape[1]
             or quant_dtype != self._out_quant_dtype
         )
 
         if need_alloc:
             if torch.cuda.is_current_stream_capturing():
-                existing = self._out_rms.shape[0] if self._out_rms is not None else 0
+                existing = (
+                    self._out_result.shape[0]
+                    if self._out_result is not None
+                    else 0
+                )
                 raise RuntimeError(
                     f"Iris (twoshot-delayed): output buffers too small for M={M} "
                     f"(allocated {existing}). Cannot allocate during "
                     f"CUDA graph capture."
                 )
 
-            self._out_rms = torch.empty((M, N), dtype=dtype, device=device)
-            self._out_quant = torch.empty((M, N), dtype=quant_dtype, device=device)
-            self._out_residual = torch.empty((M, N), dtype=dtype, device=device)
+            self._out_result = torch.empty((M, N), dtype=dtype, device=device)
+            self._out_quant = torch.empty(
+                (M, N), dtype=quant_dtype, device=device
+            )
             self._out_quant_dtype = quant_dtype
 
-            # Delayed scaling: prev_scale starts at 1.0, current_amax zeroed each call
+            # Delayed scaling: prev_scale starts at 1.0, amax zeroed each call
             if self._prev_scale is None:
-                self._prev_scale = torch.ones(1, dtype=torch.float32, device=device)
+                self._prev_scale = torch.ones(
+                    1, dtype=torch.float32, device=device
+                )
             if self._current_amax is None:
-                self._current_amax = torch.zeros(1, dtype=torch.float32, device=device)
+                self._current_amax = torch.zeros(
+                    1, dtype=torch.float32, device=device
+                )
 
             # Inlined barrier: CTA 0 -> other CTAs signal
-            self._barrier_done = torch.zeros(1, dtype=torch.int32, device=device)
+            self._barrier_done = torch.zeros(
+                1, dtype=torch.int32, device=device
+            )
 
             cur_rank = (
                 torch.distributed.get_rank()
@@ -542,15 +502,10 @@ class IrisTwoshotDelayedManager:
                 f"dtype={dtype}, rank={cur_rank}"
             )
 
-        assert self._out_rms is not None
+        assert self._out_result is not None
         assert self._out_quant is not None
-        assert self._out_residual is not None
 
-        return (
-            self._out_rms[:M],
-            self._out_residual[:M] if has_residual else None,
-            self._out_quant[:M],
-        )
+        return self._out_result[:M], self._out_quant[:M]
 
     def fused_allreduce_rmsnorm_delayed_quant(
         self,
@@ -561,12 +516,15 @@ class IrisTwoshotDelayedManager:
         residual: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor,
-        torch.Tensor,
+        None,
         Optional[torch.Tensor],
         torch.Tensor,
         torch.Tensor,
     ]:
         """Two-shot AllReduce + RMSNorm + delayed-scaling FP8 quant.
+
+        FP8 broadcast variant: broadcasts FP8 on the heap. Only owned
+        rows get BF16 result_out.
 
         Args:
             input_tensor: Input tensor (M, N) on GPU
@@ -576,8 +534,11 @@ class IrisTwoshotDelayedManager:
             residual: Optional residual tensor (M, N)
 
         Returns:
-            (allreduce_out, rms_out, residual_out, quant_out, scale_out)
-            residual_out is None when residual is None.
+            (result_out, None, residual_out, quant_out, scale_out)
+            result_out has valid BF16 data only for owned rows.
+            rms_out is always None (RMSNorm output is internal to the
+            fusion -- it goes directly to FP8 quant).
+            residual_out is result_out when residual is not None, else None.
             scale_out shape is (1,) -- per-tensor, compatible with scaled GEMMs.
         """
         shmem = self.shmem
@@ -586,12 +547,9 @@ class IrisTwoshotDelayedManager:
 
         # Get pre-allocated buffers
         iris_input = self._get_input_buffer(M, N, input_tensor.dtype)
-        ar_output = self._get_ar_output_buffer(M, N, input_tensor.dtype)
-        rms_out, residual_out, quant_out = (
-            self._get_output_buffers(
-                M, N, input_tensor.dtype, quant_dtype, device,
-                has_residual=residual is not None,
-            )
+        quant_heap = self._get_quant_heap_buffer(M, N, quant_dtype)
+        result_out, quant_out = self._get_output_buffers(
+            M, N, input_tensor.dtype, quant_dtype, device,
         )
 
         # Copy input to symmetric heap
@@ -621,8 +579,8 @@ class IrisTwoshotDelayedManager:
         # Single fused kernel
         fused_twoshot_allreduce_rmsnorm_delayed_quant_kernel[grid](
             iris_input,
-            ar_output,
-            rms_out,
+            quant_heap,
+            result_out,
             quant_out,
             self._prev_scale,
             self._current_amax,
@@ -630,16 +588,14 @@ class IrisTwoshotDelayedManager:
             self._barrier_epoch,
             self._barrier_done,
             residual if residual is not None else input_tensor,
-            residual_out if residual_out is not None else ar_output,
             rms_weight,
             rms_eps,
-            fp8_max,
             M,
             N,
             iris_input.stride(0),
             iris_input.stride(1),
-            ar_output.stride(0),
-            ar_output.stride(1),
+            quant_heap.stride(0),
+            quant_heap.stride(1),
             heap_bases,
             rank_in_group,
             rank_global,
@@ -653,15 +609,23 @@ class IrisTwoshotDelayedManager:
         # Advance epoch for the inlined barrier consumed by the kernel
         self._barrier_epoch += 1
 
+        # Each rank only computes amax for its owned M/world_size rows.
+        # Sync across ranks to get the true global amax.
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(
+                self._current_amax, op=torch.distributed.ReduceOp.MAX
+            )
+
         # Derive scale_out from accumulated amax (for downstream GEMM)
         # and update prev_scale for the next call
         scale_out = self._current_amax.clamp(min=1e-12) / fp8_max
         self._prev_scale.copy_(scale_out)
 
-        # Return allreduce_out as a view from the heap buffer
-        allreduce_out = ar_output[:M]
+        # result_out and residual_out are the same buffer -- only owned
+        # rows are valid, which is all that downstream reads.
+        residual_out = result_out if residual is not None else None
 
-        return allreduce_out, rms_out, residual_out, quant_out, scale_out
+        return result_out, None, residual_out, quant_out, scale_out
 
 
 _iris_twoshot_delayed_manager: Optional[IrisTwoshotDelayedManager] = None
@@ -686,28 +650,32 @@ def initialize_iris_twoshot_delayed(heap_size: Optional[int] = None) -> None:
     get_iris_twoshot_delayed_manager().initialize(heap_size)
 
 
-def fused_allreduce_add_rms_delayed_quant_iris_twoshot(
+def fused_allreduce_add_rms_delayed_quant_gemm_iris_twoshot(
     input: torch.Tensor,
     rms_weight: torch.Tensor,
     rms_eps: float,
-    quant_scale: torch.Tensor,
     quant_dtype: torch.dtype,
     group_name: str,
+    gemm_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
     residual: Optional[torch.Tensor] = None,
-) -> Tuple[
-    torch.Tensor,
-    torch.Tensor,
-    Optional[torch.Tensor],
-    torch.Tensor,
-    torch.Tensor,
-]:
-    """Fused AllReduce + Add + RMSNorm + delayed-scaling FP8 Quant (two-shot).
+    bias: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Fused AllReduce + RMSNorm + delayed-scaling FP8 Quant + GEMM (two-shot).
 
-    Two-shot allreduce with inlined device barrier and fused
-    RMSNorm + delayed-scaling FP8 quantization in a single kernel.
-    scale_out shape is (1,) -- per-tensor, compatible with scaled GEMMs.
+    FP8 broadcast variant: broadcasts FP8 on the heap instead of BF16.
+    All FP8 is internal -- takes BF16 in, produces BF16 GEMM output.
+
+    Returns (gemm_out, residual_out).
     """
     iris_mgr = get_iris_twoshot_delayed_manager()
-    return iris_mgr.fused_allreduce_rmsnorm_delayed_quant(
-        input, rms_weight, rms_eps, quant_dtype, residual,
+    _, _, residual_out, quant_out, scale_out = (
+        iris_mgr.fused_allreduce_rmsnorm_delayed_quant(
+            input, rms_weight, rms_eps, quant_dtype, residual,
+        )
     )
+    gemm_out = torch.ops.vllm.rocm_per_tensor_float_w8a8_scaled_mm_impl(
+        quant_out, gemm_weight, out_dtype, scale_out, weight_scale, bias,
+    )
+    return gemm_out, residual_out

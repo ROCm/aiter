@@ -36,7 +36,7 @@ import triton.language as tl
 
 import logging
 
-__all__ = ["fused_allreduce_add_rms_quant_iris_twoshot"]
+__all__ = ["fused_allreduce_add_rms_quant_gemm_iris_twoshot"]
 
 logger = logging.getLogger(__name__)
 
@@ -799,27 +799,33 @@ def initialize_iris_twoshot(heap_size: Optional[int] = None) -> None:
     get_iris_twoshot_manager().initialize(heap_size)
 
 
-def fused_allreduce_add_rms_quant_iris_twoshot(
+def fused_allreduce_add_rms_quant_gemm_iris_twoshot(
     input: torch.Tensor,
     rms_weight: torch.Tensor,
     rms_eps: float,
-    quant_scale: torch.Tensor,
     quant_dtype: torch.dtype,
     group_name: str,
+    gemm_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
     residual: Optional[torch.Tensor] = None,
-) -> Tuple[
-    torch.Tensor,
-    torch.Tensor,
-    Optional[torch.Tensor],
-    torch.Tensor,
-    torch.Tensor,
-]:
-    """Fused AllReduce + Add + RMSNorm + per-tensor FP8 Quant (two-shot).
+    bias: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Fused AllReduce + RMSNorm + per-tensor FP8 Quant + GEMM (two-shot).
 
     Two-shot allreduce with inlined device barrier and fused
-    RMSNorm + per-tensor FP8 quantization in a single kernel.
+    RMSNorm + per-tensor FP8 quantization, followed by scaled GEMM.
+    All FP8 is internal.
+
+    Returns (gemm_out, residual_out).
     """
     iris_mgr = get_iris_twoshot_manager()
-    return iris_mgr.fused_allreduce_rmsnorm_quant(
-        input, rms_weight, rms_eps, quant_dtype, residual,
+    _, _, residual_out, quant_out, scale_out = (
+        iris_mgr.fused_allreduce_rmsnorm_quant(
+            input, rms_weight, rms_eps, quant_dtype, residual,
+        )
     )
+    gemm_out = torch.ops.vllm.rocm_per_tensor_float_w8a8_scaled_mm_impl(
+        quant_out, gemm_weight, out_dtype, scale_out, weight_scale, bias,
+    )
+    return gemm_out, residual_out
