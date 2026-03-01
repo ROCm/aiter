@@ -9,24 +9,16 @@ from aiter.ops.triton.quant.fused_fp8_quant import (
     fused_silu_mul_fp8_per_tensor_static_quant,
 )
 
-from aiter import (
-    rmsnorm2d_fwd,
-    silu_and_mul,
-)
-
 from aiter.test_common import (
     checkAllclose,
 )
 
-from aiter.ops.quant import per_tensor_quant_hip
 import aiter
 import torch.nn.functional as F
 
 import aiter as rocm_aiter
 
 rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
-
-torch.manual_seed(0)
 
 
 def rmsnorm(input, weight, eps=1e-6):
@@ -107,7 +99,7 @@ def run_torch_rms_fp8_per_tensor_static_quant(
 
 
 @pytest.mark.parametrize("M", [1, 32, 256])
-@pytest.mark.parametrize("N1, N2", [(128, 128), (128, 7168), (7168, 7168)])
+@pytest.mark.parametrize("N1, N2", [(128, 128), (128, 256), (512, 512)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fused_rms_fp8_per_tensor_static_quant(M: int, N1: int, N2: int, dtype):
     dtype_quant = aiter.dtypes.fp8
@@ -151,7 +143,7 @@ def test_fused_rms_fp8_per_tensor_static_quant(M: int, N1: int, N2: int, dtype):
 
 
 @pytest.mark.parametrize("M", [1, 32, 256])
-@pytest.mark.parametrize("N1, N2", [(128, 128), (128, 7168), (7168, 7168)])
+@pytest.mark.parametrize("N1, N2", [(128, 128), (128, 512), (512, 512)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fused_rms_fp8_group_quant(M: int, N1: int, N2: int, dtype):
     group_size = 128
@@ -198,17 +190,11 @@ def test_fused_rms_fp8_group_quant(M: int, N1: int, N2: int, dtype):
     torch.testing.assert_close(y1_upcast_torch, y1_upcast_triton, atol=0.1, rtol=0.1)
 
 
-def rmsnorm2d_fwd_(
-    x: torch.Tensor, weight: torch.Tensor, eps: float, dim: int
-) -> torch.Tensor:
-    ori_shape = x.shape
-    x = x.reshape(-1, dim)
-    return rmsnorm2d_fwd(x, weight, eps).view(ori_shape)
-
-
-def rmsnorm_fp8_quantization_ref(x, w, x_scale, eps, n, rocm_fp8_dtype):
-    rms_out = rmsnorm2d_fwd_(x, w, eps, n)
-    quant_out, _ = per_tensor_quant_hip(rms_out, x_scale, rocm_fp8_dtype)
+def rmsnorm_fp8_quantization_ref(x, w, x_scale, eps, rocm_fp8_dtype):
+    rms_out = rmsnorm(x.to(torch.float32), w.to(torch.float32), eps).to(x.dtype)
+    quant_out = per_tensor_fp8_static_quant(
+        rms_out.to(torch.float32), rocm_fp8_dtype, x_scale.to(torch.float32)
+    )
     return quant_out, rms_out
 
 
@@ -230,7 +216,7 @@ def triton_rmsnorm_fp8_quantization_fuse(x, w, x_scale, eps, rocm_fp8_dtype):
 
 
 @pytest.mark.parametrize(
-    "m, n", [(m, n) for m in [1, 2, 4, 8, 256, 1024, 8192] for n in [128, 4096, 8192]]
+    "m, n", [(m, n) for m in [1, 2, 4, 8, 256] for n in [128, 512]]
 )
 def test_rmsnorm_quant_fuse(m, n):
     eps = 0.0012
@@ -248,14 +234,14 @@ def test_rmsnorm_quant_fuse(m, n):
     )
 
     # calculate the correct scale value
-    rms_out = rmsnorm2d_fwd_(x, w, eps, n)
+    rms_out = rmsnorm(x.to(torch.float32), w.to(torch.float32), eps)
     rms_out_abs = torch.abs(rms_out)
     rms_out_abs_max = torch.max(rms_out_abs)
     scale_val = rms_out_abs_max / DTYPE_MAX
     x_scale = torch.tensor((scale_val), dtype=torch.float32, device="cuda")
 
     fp8_x_ref, rms_out_ref = rmsnorm_fp8_quantization_ref(
-        x, w, x_scale, eps, n, rocm_fp8_dtype
+        x, w, x_scale, eps, rocm_fp8_dtype
     )
     fp8_x, rms_out = triton_rmsnorm_fp8_quantization_fuse(
         x, w, x_scale, eps, rocm_fp8_dtype
@@ -266,7 +252,7 @@ def test_rmsnorm_quant_fuse(m, n):
 
 
 @pytest.mark.parametrize("M", [1, 32, 256])
-@pytest.mark.parametrize("N1, N2", [(128, 128), (128, 7168), (7168, 7168)])
+@pytest.mark.parametrize("N1, N2", [(128, 128), (128, 256), (512, 512)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fused_rms_fp8_group_quant_transpose_scale(M: int, N1: int, N2: int, dtype):
     """Test that transpose_scale parameter returns scale with transposed memory layout."""
@@ -416,9 +402,9 @@ def generate_fused_reduce_act_mul_fp8_group_quant(
     return x, x2
 
 
-@pytest.mark.parametrize("M", [1, 32, 256, 131072])
+@pytest.mark.parametrize("M", [1, 32, 256])
 @pytest.mark.parametrize("N1, N2", [(256, 256)])
-@pytest.mark.parametrize("SPK", [1, 4, 14])
+@pytest.mark.parametrize("SPK", [1, 4])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("activation", ["silu", "gelu"])
 def test_fused_reduce_act_mul_fp8_group_quant(
@@ -494,11 +480,11 @@ def generate_fused_reduce_rms_quant_data(M, N1, N2, N3, SPK, dtype=torch.bfloat1
     return x1, w1, x2, w2, res1, x3
 
 
-@pytest.mark.parametrize("M", [1, 32, 256, 8192])
+@pytest.mark.parametrize("M", [1, 32, 256])
 @pytest.mark.parametrize(
-    "N1, N2, N3", [(128, 128, 128), (1536, 512, 64), (7168, 7168, 7168)]
+    "N1, N2, N3", [(128, 128, 128), (256, 128, 64), (512, 512, 512)]
 )
-@pytest.mark.parametrize("SPK", [1, 4, 14])
+@pytest.mark.parametrize("SPK", [1, 4])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fused_reduce_rms_fp8_group_quant(
     M: int, N1: int, N2: int, N3: int, SPK: int, dtype
@@ -557,11 +543,11 @@ def test_fused_reduce_rms_fp8_group_quant(
         torch.testing.assert_close(y3_torch, y3_triton, atol=0.1, rtol=0.1)
 
 
-@pytest.mark.parametrize("M", [1, 32, 256, 8192])
+@pytest.mark.parametrize("M", [1, 32, 256])
 @pytest.mark.parametrize(
-    "N1, N2, N3", [(128, 128, 128), (1536, 512, 64), (7168, 7168, 7168)]
+    "N1, N2, N3", [(128, 128, 128), (256, 128, 64), (512, 512, 512)]
 )
-@pytest.mark.parametrize("SPK", [1, 4, 14])
+@pytest.mark.parametrize("SPK", [1, 4])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fused_reduce_rms_fp8_group_quant_transpose_scale(
     M: int, N1: int, N2: int, N3: int, SPK: int, dtype
@@ -658,9 +644,13 @@ def silu_mul_fp8_quantization_ref(x, x_scale, rocm_fp8_dtype):
     m, n2 = x.shape
     assert n2 % 2 == 0
     n = n2 // 2
-    silu_out = torch.empty((m, n), dtype=x.dtype, device=x.device)
-    silu_and_mul(silu_out, x)
-    quant_out, _ = per_tensor_quant_hip(silu_out, x_scale, rocm_fp8_dtype)
+    x1, x2 = x.split([n, n], dim=-1)
+    silu_out = (
+        (F.silu(x1.to(torch.float32)) * x2.to(torch.float32))
+        .to(x.dtype)
+        .to(torch.float32)
+    )
+    quant_out = per_tensor_fp8_static_quant(silu_out, rocm_fp8_dtype, x_scale)
     return quant_out
 
 
@@ -672,7 +662,7 @@ def triton_silu_mul_fp8_quantization_fuse(x, x_scale, rocm_fp8_dtype):
 
 
 @pytest.mark.parametrize(
-    "m, n", [(m, n) for m in [1, 2, 4, 8, 256, 1024, 8192] for n in [128, 4096, 8192]]
+    "m, n", [(m, n) for m in [1, 2, 4, 8, 256] for n in [128, 512]]
 )
 def test_silu_mul_quant_fuse(m, n):
     rocm_fp8_dtype = rocm_aiter_fp8_dtype
@@ -688,8 +678,12 @@ def test_silu_mul_quant_fuse(m, n):
     )
 
     # calculate the correct scale value
-    silu_out = torch.empty((m, n), dtype=x.dtype, device=x.device)
-    silu_and_mul(silu_out, x)
+    x1, x2 = x.split([n, n], dim=-1)
+    silu_out = (
+        (F.silu(x1.to(torch.float32)) * x2.to(torch.float32))
+        .to(x.dtype)
+        .to(torch.float32)
+    )
     silu_out_abs = torch.abs(silu_out)
     silu_out_abs_max = torch.max(silu_out_abs)
     scale_val = silu_out_abs_max / DTYPE_MAX

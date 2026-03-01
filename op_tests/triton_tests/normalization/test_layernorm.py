@@ -133,7 +133,8 @@ def get_vals():
 )
 def test_layernorm(M, N, dtype_str, eps=1e-5):
     dtype = str_to_torch_dtype[dtype_str]
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
     x = torch.randn(M, N, device="cuda", dtype=dtype)
     w_shape = (N,)
     b = torch.rand(w_shape, dtype=dtype, device="cuda", requires_grad=True)
@@ -175,7 +176,8 @@ def test_layernorm(M, N, dtype_str, eps=1e-5):
 )
 def test_fused_add_layernorm(M, N, dtype_str, eps=1e-5):
     dtype = str_to_torch_dtype[dtype_str]
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
     x = torch.randn(M, N, device="cuda", dtype=dtype)
     res = torch.randn(M, N, device="cuda", dtype=dtype)
     w_shape = (N,)
@@ -220,7 +222,8 @@ def test_fused_add_layernorm(M, N, dtype_str, eps=1e-5):
 def test_layernorm_smoothquant(M, N, dtype_str, scale_dtype_str, eps=1e-5):
     dtype = str_to_torch_dtype[dtype_str]
     scale_dtype = str_to_torch_dtype[scale_dtype_str]
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
 
     x = torch.randn(M, N, device="cuda", dtype=dtype)
     w_shape = (N,)
@@ -261,7 +264,8 @@ def test_layernorm_smoothquant(M, N, dtype_str, scale_dtype_str, eps=1e-5):
 def test_layernorm_dynamicquant(M, N, dtype_str, scale_dtype_str, eps=1e-3):
     dtype = str_to_torch_dtype[dtype_str]
     scale_dtype = str_to_torch_dtype[scale_dtype_str]
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
 
     x = torch.randn(M, N, device="cuda", dtype=dtype)
     w_shape = (N,)
@@ -298,7 +302,8 @@ def test_layernorm_dynamicquant(M, N, dtype_str, scale_dtype_str, eps=1e-3):
 def test_layernorm_fused_add_smoothquant(M, N, dtype_str, scale_dtype_str, eps=1e-5):
     dtype = str_to_torch_dtype[dtype_str]
     scale_dtype = str_to_torch_dtype[scale_dtype_str]
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
 
     x = torch.randn(M, N, device="cuda", dtype=dtype)
     res = torch.randn(M, N, device="cuda", dtype=dtype)
@@ -341,7 +346,8 @@ def test_layernorm_fused_add_smoothquant(M, N, dtype_str, scale_dtype_str, eps=1
 def test_layernorm_fused_add_dynamicquant(M, N, dtype_str, scale_dtype_str, eps=1e-3):
     dtype = str_to_torch_dtype[dtype_str]
     scale_dtype = str_to_torch_dtype[scale_dtype_str]
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
 
     x = torch.randn(M, N, device="cuda", dtype=dtype)
     res = torch.randn(M, N, device="cuda", dtype=dtype)

@@ -8,6 +8,7 @@ import argparse
 defaultDtypes = {
     "gfx942": {"fp8": torch.float8_e4m3fnuz},
     "gfx950": {"fp8": torch.float8_e4m3fn},
+    "gfx1250": {"fp8": torch.float8_e4m3fn},
 }
 
 _8bit_fallback = torch.uint8

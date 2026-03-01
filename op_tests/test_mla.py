@@ -384,6 +384,8 @@ def test_mla(
             kv_indices,
             kv_last_page_lens,
             max_seqlen_qo,
+            page_size,
+            nhead_kv,
             sm_scale,
             num_kv_splits=split_per_batch,
         )
@@ -429,6 +431,8 @@ def test_mla(
             kv_indices,
             kv_last_page_lens,
             max_seqlen_qo,
+            page_size,
+            nhead_kv,
             sm_scale,
             q_scale=q_scale,
             kv_scale=kv_scale,

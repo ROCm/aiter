@@ -37,7 +37,7 @@ def moe_sorting(
     try:
         device = topk_ids.device
         M, topk = topk_ids.shape
-        max_num_tokens_padded = topk_ids.numel() + num_experts * block_size - topk
+        max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
 
         max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
         sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
@@ -59,7 +59,7 @@ def moe_sorting(
             num_valid_ids,
             moe_buf,
             num_experts,
-            block_size,
+            int(block_size),
             expert_mask,
             num_local_tokens,
             dispatch_policy,
@@ -252,6 +252,9 @@ def fused_moe_(
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
+    # Ensure block_size_M is int (metadata.block_m from CSV may be float)
+    if block_size_M is not None:
+        block_size_M = int(block_size_M)
 
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
         topk_ids,
@@ -1643,11 +1646,13 @@ def fused_topk(
         M, topk, dtype=dtypes.i32, device=hidden_states.device
     )
 
-    if (
-        get_gfx() == "gfx942"
-        and (expert, topk) in [(128, 6), (128, 8), (256, 6), (256, 8)]
-        and gating_output.dtype == dtypes.fp32
-    ):
+    if (expert, topk) in [
+        (128, 4),
+        (128, 6),
+        (128, 8),
+        (256, 6),
+        (256, 8),
+    ] and gating_output.dtype in [dtypes.bf16, dtypes.fp32]:
         if topk_weights is None:
             topk_weights = torch.empty(
                 (M + 3) // 4 * 4, topk, dtype=dtypes.fp32, device=hidden_states.device

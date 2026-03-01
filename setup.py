@@ -41,12 +41,16 @@ PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
 def getMaxJobs():
     # calculate the maximum allowed NUM_JOBS based on cores
     max_num_jobs_cores = max(1, os.cpu_count() * 0.8)
-    import psutil
 
-    # calculate the maximum allowed NUM_JOBS based on free memory
-    free_memory_gb = psutil.virtual_memory().available / (1024**3)
-    # free memory in GB
-    max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
+    try:
+        import psutil
+
+        # calculate the maximum allowed NUM_JOBS based on free memory
+        free_memory_gb = psutil.virtual_memory().available / (1024**3)
+        max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
+    except ImportError:
+        # psutil may not be available during metadata extraction
+        max_num_jobs_memory = max_num_jobs_cores
 
     # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
     max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
