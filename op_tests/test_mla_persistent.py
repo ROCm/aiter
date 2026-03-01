@@ -545,7 +545,7 @@ def test_mla(
         reduce_partial_map,
         kv_granularity=max(page_size, 16),  # for qh32 kv split is disabled
         max_seqlen_qo=int(max_seqlen_qo),
-        uni_seqlen_qo=decode_qlen,
+        uni_seqlen_qo=decode_qlen,#ori_uni_seqlen_qo
         fast_mode=True if not non_persistent_mode else False,
         max_split_per_batch=max_split_per_batch,
         intra_batch_mode=non_persistent_mode,

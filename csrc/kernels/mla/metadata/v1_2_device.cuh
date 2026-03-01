@@ -143,7 +143,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
         {
             const int32_t num_qo_tiles = get_num_qo_tiles(curr_batch);
             const int32_t qo_tile_size =
-                ck_tile::integer_divide_ceil(qo_state.get_seqlen(curr_batch), num_qo_tiles);
+                ck_tile::integer_divide_ceil(qo_state.get_seqlen(curr_batch), num_qo_tiles);//o_tile_size 表示每个 QO tile 内的 query token 数，不是 tile size
             const int32_t num_kv_blocks = integer_divide_ceil_power2(
                 curr_kv_seqlen, params.kv_granularity, params.kv_granularity_log2);
             const int32_t remain_kv_blocks = num_kv_blocks - curr_kv_block;
@@ -159,7 +159,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                     MlaWorkInfo work_info{};
                     work_info.batch_idx = curr_batch;
                     work_info.qo_start =
-                        qo_state.get_begin(curr_batch) + curr_qo_tile_idx * qo_tile_size;
+                        qo_state.get_begin(curr_batch) + curr_qo_tile_idx * qo_tile_size; //include nhead， but in nhead 64 kernel no include
                     work_info.qo_end   = ck_tile::min(work_info.qo_start + qo_tile_size,
                                                     qo_state.get_end(curr_batch));
                     work_info.kv_start = curr_kv_begin + (curr_kv_block * params.kv_granularity);
@@ -405,8 +405,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                   torch::Tensor& reduce_final_map,
                                   torch::Tensor& reduce_partial_map)
 {
-    constexpr int32_t kPackedQoLenPerWg = 128;
-    const hipStream_t stream            = at::hip::getCurrentHIPStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
@@ -474,16 +473,29 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     params.qk_batch_ratio               = qk_batch_ratio;
     params.fixed_over_head_num_blocks   = max(1, (16 + page_size - 1) / page_size);
 
-    // launch kernel
-    MLA_METADATA_DISPATCHER(
-        max_seqlen_qo * num_heads_per_head_k,
-        kPackedQoLenPerWg,
-        params.uni_seqlen_qo,
-        topk,
-        dispatch_mla_metadata_v1_2_device<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo, kIsSparse>(
-            params,
-            stream,
-            max_seqlen_qo,
-            dev_prop.warpSize,
-            dev_prop.maxSharedMemoryPerMultiProcessor));
+    const int32_t ori_num_heads = num_heads_k * num_heads_per_head_k;
+
+    auto launch = [&](auto kPackedQoLenPerWgConstant) {
+        constexpr int32_t kPackedQoLenPerWg = decltype(kPackedQoLenPerWgConstant)::value;
+        MLA_METADATA_DISPATCHER(
+            max_seqlen_qo * num_heads_per_head_k,
+            kPackedQoLenPerWg,
+            params.uni_seqlen_qo,
+            topk,
+            dispatch_mla_metadata_v1_2_device<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo, kIsSparse>(
+                params,
+                stream,
+                max_seqlen_qo,
+                dev_prop.warpSize,
+                dev_prop.maxSharedMemoryPerMultiProcessor));
+    };
+
+    if(ori_num_heads == 128)
+    {
+        launch(std::integral_constant<int32_t, 64>{});
+    }
+    else
+    {
+        launch(std::integral_constant<int32_t, 128>{});
+    }
 }
