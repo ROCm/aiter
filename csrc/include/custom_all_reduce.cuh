@@ -515,8 +515,8 @@ cross_device_reduce_2stage(RankData* _input_dp,
 #pragma unroll
                 for (int i = 0; i < pack_size; ++i)
                 {
-                    add_reg.data[i] =
-                        ck_tile::type_convert<float>(tmp_smem[cur][pack_size * threadIdx.x + i]);
+                    add_reg[i] =
+                        upcast_s(tmp_smem[cur][pack_size * threadIdx.x + i]);
                 }
 #pragma unroll
                 for (int g = 1; g < ngpus; ++g)
@@ -524,7 +524,7 @@ cross_device_reduce_2stage(RankData* _input_dp,
 #pragma unroll
                     for (int j = 0; j < pack_size; ++j)
                     {
-                        add_reg.data[j] += ck_tile::type_convert<float>(
+                        add_reg[j] += upcast_s(
                             tmp_smem[cur][g * smem_gpu_loop_stride + pack_size * threadIdx.x + j]);
                     }
                 }
@@ -532,7 +532,7 @@ cross_device_reduce_2stage(RankData* _input_dp,
 #pragma unroll
                 for (int i = 0; i < pack_size; ++i)
                 {
-                    write_reg.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
+                    write_reg = downcast_s<T>(add_reg[i]);
                 }
                 // Write local reduced result into this rank's tmp buffer (scatter)
                 tmp_out[idx - start] = write_reg;
@@ -563,7 +563,7 @@ cross_device_reduce_2stage(RankData* _input_dp,
     }
     else
     {
-        // Single-buffer path 
+        // Single-buffer path
         for (int idx = start + tid; idx < end; idx += stride)
         {
             // Load current tile for ALL groups into the single buffer
@@ -577,8 +577,8 @@ cross_device_reduce_2stage(RankData* _input_dp,
 #pragma unroll
                 for (int i = 0; i < pack_size; ++i)
                 {
-                    add_reg.data[i] =
-                        ck_tile::type_convert<float>(tmp_smem[0][pack_size * threadIdx.x + i]);
+                    add_reg[i] =
+                        upcast_s(tmp_smem[0][pack_size * threadIdx.x + i]);
                 }
 #pragma unroll
                 for (int g = 1; g < ngpus; ++g)
@@ -586,7 +586,7 @@ cross_device_reduce_2stage(RankData* _input_dp,
 #pragma unroll
                     for (int j = 0; j < pack_size; ++j)
                     {
-                        add_reg.data[j] += ck_tile::type_convert<float>(
+                        add_reg[j] += upcast_s(
                             tmp_smem[0][g * smem_gpu_loop_stride + pack_size * threadIdx.x + j]);
                     }
                 }
@@ -594,7 +594,7 @@ cross_device_reduce_2stage(RankData* _input_dp,
 #pragma unroll
                 for (int i = 0; i < pack_size; ++i)
                 {
-                    write_reg.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
+                    write_reg = downcase_s<T>(add_reg[i]);
                 }
                 tmp_out[idx - start] = write_reg;
             }
@@ -606,13 +606,50 @@ cross_device_reduce_2stage(RankData* _input_dp,
     end_sync<ngpus>(sg, self_sg, rank);
 
     // ------------------------------
-    // Stage 2: allgather 
+    // Stage 2: allgather
     // ------------------------------
-    for (int idx = tid; idx < largest_part; idx += stride)
+    //for (int idx = tid; idx < largest_part; idx += stride)
+    //{
+    //    int dst_idx           = ((warp_id + rank) % ngpus) * part + idx;
+    //    reinterpret_cast<P*>(result)[dst_idx] = tmps[warp_id][idx];
+    //}
+    // ------------------------------
+    // Stage 2: allgather (optimised)
+    // ------------------------------
     {
-        int dst_idx           = ((warp_id + rank) % ngpus) * part + idx;
-        reinterpret_cast<P*>(result)[dst_idx] = tmps[warp_id][idx];
+        // Vector pointers (16B)
+        P* __restrict__ dstP        = reinterpret_cast<P*>(result);
+        const P* __restrict__ srcP  = tmps[warp_id];
+
+        // Compute destination group once (avoid modulo in the loop)
+        int rpw = rank + warp_id;
+        int dst_group = (rpw >= ngpus) ? (rpw - ngpus) : rpw;
+
+        // Base offset for this group's slice inside 'result' (in P elements)
+        const int dst_base = dst_group * part;
+
+        // Length of the source chunk for this group (handle remainder on the last group)
+        const int src_len = (dst_group == (ngpus - 1)) ? largest_part : part;
+
+        // Optionally tell the compiler about alignment (16 B) if you can guarantee it:
+        // srcP  = (const P*)__builtin_assume_aligned(srcP, 16);
+        // dstP  = (P*)__builtin_assume_aligned(dstP, 16);
+
+        // Grid-stride, vectorised copy
+        // Unroll a bit to improve ILP without ballooning registers
+        #pragma unroll 2
+        for (int i = tid; i < src_len; i += stride) {
+            // one 16B transaction per iteration per thread (coalesced across lanes)
+            dstP[dst_base + i] = srcP[i];
+
+            // If you want a 2x unroll without complicating the header:
+            int j = i + stride;
+            if (j < src_len) {
+                dstP[dst_base + j] = srcP[j];
+            }
+        }
     }
+
 }
 
 template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
