@@ -131,6 +131,16 @@ def fused_moe(
     w2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
+    w1_lqq_scale: Optional[torch.tensor] = None,
+    w1_lqq_zero: Optional[torch.tensor] = None,
+    w2_lqq_scale: Optional[torch.tensor] = None,
+    w2_lqq_zero: Optional[torch.tensor] = None,
+    fc1_smooth_scale: Optional[
+        torch.Tensor
+    ] = None,  # [expert(local_expert:EP), 1, model_dim]
+    fc2_smooth_scale: Optional[
+        torch.Tensor
+    ] = None,  # [expert(local_expert:EP), 1, inter_dim]
     # following for tuning
     block_size_M=None,
     num_local_tokens: Optional[torch.tensor] = None,
@@ -159,6 +169,12 @@ def fused_moe(
         w2_scale=w2_scale,
         a1_scale=a1_scale,
         a2_scale=a2_scale,
+        w1_lqq_scale=w1_lqq_scale,
+        w1_lqq_zero=w1_lqq_zero,
+        w2_lqq_scale=w2_lqq_scale,
+        w2_lqq_zero=w2_lqq_zero,
+        fc1_smooth_scale=fc1_smooth_scale,
+        fc2_smooth_scale=fc2_smooth_scale,
         block_size_M=block_size_M,
         num_local_tokens=num_local_tokens,
         moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
@@ -219,6 +235,16 @@ def fused_moe_(
     w2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
+    w1_lqq_scale: Optional[torch.Tensor] = None,
+    w1_lqq_zero: Optional[torch.Tensor] = None,
+    w2_lqq_scale: Optional[torch.Tensor] = None,
+    w2_lqq_zero: Optional[torch.Tensor] = None,
+    fc1_smooth_scale: Optional[
+        torch.Tensor
+    ] = None,  # [expert(local_expert:EP), 1, model_dim]
+    fc2_smooth_scale: Optional[
+        torch.Tensor
+    ] = None,  # [expert(local_expert:EP), 1, inter_dim]
     # following for tuning
     block_size_M: int = -1,
     num_local_tokens: Optional[torch.Tensor] = None,
@@ -265,6 +291,8 @@ def fused_moe_(
                 q_dtype_a = dtypes.fp8
         else:
             q_dtype_a = dtypes.fp4x2
+    elif quant_type == QuantType.lqq_1x64:
+        q_dtype_a = dtypes.i8
 
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
@@ -349,6 +377,14 @@ def fused_moe_(
             w2_scale=w2_scale,
             a1_scale=a1_scale,
             a2_scale=a2_scale,
+            w1_lqq_scale=w1_lqq_scale,
+            w1_lqq_zero=w1_lqq_zero,
+            w2_lqq_scale=w2_lqq_scale,
+            w2_lqq_zero=w2_lqq_zero,
+            expert_mask=expert_mask,
+            topk_ids=topk_ids,
+            fc1_smooth_scale=fc1_smooth_scale,
+            fc2_smooth_scale=fc2_smooth_scale,
             num_local_tokens=num_local_tokens,
             # following for cktile support
             hidden_pad=hidden_pad,
@@ -638,6 +674,21 @@ def get_2stage_cfgs(
     intermediate_pad,
     is_shuffled=True,
 ):
+    return MOEMetadata(
+        functools.partial(
+            asm_stage1,
+            activation=activation,
+            quant_type=q_type,
+        ),
+        functools.partial(
+            asm_stage2,
+            activation=activation,
+            quant_type=q_type,
+        ),
+        block_m=0,
+        ksplit=0,
+    )
+
     def get_cfg_2stages(tune_file):
         import pandas as pd
 
@@ -940,6 +991,18 @@ def fused_moe_2stages(
     w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
+    w1_lqq_scale: Optional[torch.Tensor] = None,
+    w1_lqq_zero: Optional[torch.Tensor] = None,
+    w2_lqq_scale: Optional[torch.Tensor] = None,
+    w2_lqq_zero: Optional[torch.Tensor] = None,
+    expert_mask: Optional[torch.Tensor] = None,  # EP
+    topk_ids: Optional[torch.Tensor] = None,  # EP
+    fc1_smooth_scale: Optional[
+        torch.Tensor
+    ] = None,  # [expert(local_expert:EP), 1, model_dim]
+    fc2_smooth_scale: Optional[
+        torch.Tensor
+    ] = None,  # [expert(local_expert:EP), 1, inter_dim]
     num_local_tokens: Optional[torch.tensor] = None,
     # following for cktile support
     hidden_pad=0,
@@ -994,7 +1057,6 @@ def fused_moe_2stages(
         M = sorted_ids.shape[0]
         N = a1.shape[-1]
         a1_scale = torch.ones([M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device)
-
     elif quant_type == QuantType.per_1x32:
         if token_num <= token_num_quant_moe_sort_switch:
             a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
@@ -1019,6 +1081,35 @@ def fused_moe_2stages(
                 token_num=token_num,
                 block_size=block_size_M,
             )
+    elif quant_type == QuantType.lqq_1x64:
+        if hidden_states.dtype == q_dtype_a and a1_scale is not None:
+            a8 = hidden_states.repeat(topk, 1, 1)
+            a8_scale = a1_scale.repeat(topk, 1, 1)
+        else:
+            if expert_mask is not None:
+                local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
+                local_expert_hash[local_expert_hash > 0] -= 1
+                topk_ids = local_expert_hash[topk]
+
+            if fc1_smooth_scale is not None:
+                a8 = torch.empty(
+                    (topk, token_num, model_dim), dtype=dtypes.i8, device=device
+                )
+                a8_scale = torch.empty(
+                    (topk, token_num, 1), dtype=dtypes.fp32, device=device
+                )
+                aiter.moe_smoothquant_fwd(
+                    a8, hidden_states, fc1_smooth_scale, topk_ids, a8_scale
+                )
+            else:
+                a8, a8_scale = aiter.pertoken_quant(
+                    hidden_states, quant_dtype=dtypes.i8
+                )
+                a8 = a8.repeat(topk, 1, 1)
+                a8_scale = a8_scale.repeat(topk, 1, 1)
+
+        a1 = a8
+        a1_scale = a8_scale
     elif hidden_states.dtype != q_dtype_a:
         if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
             quant_func = functools.partial(quant_func, transpose_scale=True)
@@ -1033,6 +1124,7 @@ def fused_moe_2stages(
             a1_scale is not None or quant_type == QuantType.No
         ), "a1_scale must be provided for quantized input for fused_moe"
         a1 = hidden_states
+
     if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         ratio = a1_scale.element_size() // a1.element_size()
         a2 = torch.empty(
@@ -1071,6 +1163,8 @@ def fused_moe_2stages(
         w1_scale=(
             w1_scale.view(dtypes.fp8_e8m0) if w1.dtype == dtypes.fp4x2 else w1_scale
         ),
+        w1_lqq_scale=w1_lqq_scale,
+        w1_lqq_zero=w1_lqq_zero,
         sorted_weights=sorted_weights if doweight_stage1 else None,
         **extra_stage1_args,
     )
@@ -1130,6 +1224,9 @@ def fused_moe_2stages(
             .view(token_num, -1)
         )
         a2 = a2_v
+    elif quant_type == QuantType.lqq_1x64 and metadata.stage1.func is asm_stage1:
+        a2_qt, a2_scale = aiter.pertoken_quant(a2, quant_dtype=dtypes.i8, dtypeMax=7)
+        a2 = a2_qt.view(token_num, topk, -1)
     else:
         a2, a2_scale = quant_func(
             a2,
@@ -1153,6 +1250,8 @@ def fused_moe_2stages(
             w2_scale.view(dtypes.fp8_e8m0) if w2.dtype == dtypes.fp4x2 else w2_scale
         ),
         a2_scale=a2_scale,
+        w2_lqq_scale=w2_lqq_scale,
+        w2_lqq_zero=w2_lqq_zero,
         block_m=block_size_M,
         sorted_weights=sorted_weights if not doweight_stage1 else None,
         **extra_stage2_args,
@@ -1185,6 +1284,8 @@ def asm_stage1(
     quant_type=QuantType.No,
     a1_scale=None,
     w1_scale=None,
+    w1_lqq_scale: Optional[torch.Tensor] = None,
+    w1_lqq_zero: Optional[torch.Tensor] = None,
     sorted_weights=None,
 ):
     dtype = dtypes.bf16  # out.dtype, asm only support bf16
@@ -1223,6 +1324,8 @@ def asm_stage1(
         quant_type=quant_type,
         a1_scale=a1_scale,
         w1_scale=w1_scale,
+        w1_lqq_scale=w1_lqq_scale,
+        w1_lqq_zero=w1_lqq_zero,
         sorted_weights=sorted_weights,
     )
     if ksplit > 0:
@@ -1230,6 +1333,50 @@ def asm_stage1(
             aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32))
         else:
             aiter.gelu_and_mul(out, tmp_out.view(dtypes.fp32))
+    return out
+
+
+def asm_stage2(
+    inter_states,
+    w1,
+    w2,
+    sorted_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    block_m: int,
+    kernelName: str = "",
+    splitk: int = 0,
+    activation=ActivationType.Silu,
+    quant_type=QuantType.No,
+    a2_scale=None,
+    w2_scale=None,
+    w2_lqq_scale=None,
+    w2_lqq_zero=None,
+    sorted_weights=None,
+):
+    return aiter.moe_stage2_g1u1(
+        inter_states,
+        w1,
+        w2,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        out,
+        topk,
+        kernelName,
+        block_m,
+        w2_scale,
+        a2_scale,
+        w2_lqq_scale,
+        w2_lqq_zero,
+        sorted_weights,
+        quant_type,
+        activation,
+        splitk,
+    )
+
     return out
 
 
