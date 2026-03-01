@@ -111,3 +111,59 @@ def shuffle_scale_a16w4(
         shfl_scale = shfl_scale.permute(0, 1, 4, 6, 3, 5, 2).contiguous()
     # print("shf_scale shape:", shfl_scale.shape)
     return shfl_scale.view(*src.shape).contiguous()
+
+
+def shuffle_scale_zero_lqq_a8w4(x: torch.Tensor, layout=(4, 16)) -> torch.Tensor:
+    BK, BN = layout
+
+    assert (
+        x.shape[-2] % BN == 0
+    ), f"N dimension {x.shape[-2]} must be divisible by BN={BN}"
+    assert (
+        x.shape[-1] % BK == 0
+    ), f"K dimension {x.shape[-1]} must be divisible by BK={BK}"
+
+    x_ = x
+    x_ = x_.view(-1, x.shape[-2] // BN, BN, x.shape[-1] // BK, BK)
+    x_ = x_.permute(0, 1, 3, 2, 4)
+    x_ = x_.contiguous()
+    x_ = x_.view(*x.shape)
+
+    x_.is_shuffled = True
+    return x_
+
+
+def shuffle_weight_lqq_a8w4(
+    x: torch.Tensor,
+    interExp: int = 6,
+) -> torch.Tensor:
+    eprt, M, N = x.shape
+
+    # Step 1: Interleave shuffle
+    groupSize = (1 << interExp) * 2
+    numGroups = N // groupSize
+    shuffle_pattern = torch.tensor(
+        [(k >> 1) + ((k & 1) << interExp) for k in range(groupSize)],
+        device=x.device,
+    )
+
+    buffer = x.view(eprt, M, numGroups, groupSize)
+    buffer = torch.gather(buffer, -1, shuffle_pattern.expand_as(buffer))
+    buffer = buffer.view(eprt, M, N)
+
+    # Step 2: 32x16 shuffle
+    tiles_in_M = M // 16
+    tiles_in_N = N // 32
+    buffer = buffer.view(eprt, tiles_in_M, 16, tiles_in_N, 32)
+    buffer = buffer.permute(0, 1, 3, 2, 4).contiguous()
+    buffer = buffer.view(eprt, M, N)
+
+    # Step 3: Pack int4
+    flattened = buffer.view(-1)
+    out_len = flattened.numel() // 2
+
+    v0 = flattened[::2] & 0x0F
+    v1 = flattened[1::2] & 0x0F
+    result = (v0 | (v1 << 4)).view(eprt, M, N // 2)
+
+    return result

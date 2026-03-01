@@ -10,6 +10,105 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <torch/all.h>
+
+#define EN_ASM_MOE_PRINT 0
+
+#if EN_ASM_MOE_PRINT == 1
+    #define print(...) printf(__VA_ARGS__)
+#else
+    #define print(...) ((void)0)
+#endif
+#if EN_ASM_MOE_PRINT == 1
+    template<typename T>
+    static int save_dev_hex(const char* filename, T* array, size_t size) {
+        if (filename == NULL || array == NULL || size == 0) {
+            return -1;
+        }    
+        FILE* file = fopen(filename, "wb");
+        if (file == NULL) {
+            return -1;
+        }
+        
+        T* ptr = new T[size];
+        hipMemcpy(ptr, array, size * sizeof(T), hipMemcpyDeviceToHost);
+        size_t elements_written = fwrite(ptr, sizeof(T), size, file);
+        delete[] ptr;
+        
+        if (elements_written != size) {
+            fclose(file);
+            return -1;
+        }
+        
+        fclose(file);
+        return 0;
+    }
+    template<typename T>
+    static int save_dev_int(const char* filename, T* array, size_t size)
+    {
+        int items_per_line = 16;
+        if (filename == NULL || array == NULL || size == 0) {
+            return -1;
+        }
+        
+        FILE* fp = fopen(filename, "w");
+        if (fp == NULL) {
+            perror("Error opening file");
+            return -1;
+        }
+        
+        fprintf(fp, "Index | Value | size = %zu\n", size);
+        fprintf(fp, "-------------\n");
+        
+        T* ptr = new T[size];
+        hipMemcpy(ptr, array, size * sizeof(T), hipMemcpyDeviceToHost);
+        for (size_t i = 0; i < size; i++) {
+            fprintf(fp, "%d", ptr[i]);
+            
+            if (items_per_line > 0 && (i + 1) % items_per_line == 0) {
+                fprintf(fp, "\n");
+            } else if (i < size - 1) {
+                fprintf(fp, " ");
+            }
+        }
+        delete[] ptr;
+        
+        fclose(fp);
+        return 0;
+    }
+    static int save_dev_float(const char* filename, float* array, size_t size)
+    {
+        int items_per_line = 16;
+        if (filename == NULL || array == NULL || size == 0) {
+            return -1;
+        }
+        
+        FILE* fp = fopen(filename, "w");
+        if (fp == NULL) {
+            perror("Error opening file");
+            return -1;
+        }
+        
+        fprintf(fp, "Index | Value | size = %zu\n", size);
+        fprintf(fp, "-------------\n");
+        
+        float* ptr = new float[size];
+        hipMemcpy(ptr, array, size * sizeof(float), hipMemcpyDeviceToHost);
+        for (size_t i = 0; i < size; i++) {
+            fprintf(fp, "%.4e", ptr[i]);
+            
+            if (items_per_line > 0 && (i + 1) % items_per_line == 0) {
+                fprintf(fp, "\n");
+            } else if (i < size - 1) {
+                fprintf(fp, " ");
+            }
+        }
+        delete[] ptr;
+            
+        fclose(fp);
+        return 0;
+    }
+#endif
+
 struct __attribute__((packed)) KernelArgs
 {
     void* ptr_O;
@@ -68,6 +167,26 @@ struct __attribute__((packed)) KernelArgs
     p2 _p26;
     unsigned int eLQQs;
     p3 _p27;
+    void log()
+    {
+        print("[KernelArgs] argsize: %zu\n", sizeof(KernelArgs));
+        print("[KARG] dim          @ 0x%04lX   = %d\n", offsetof(KernelArgs, dim), dim);
+        print("[KARG] hidden_dim   @ 0x%04lX   = %d\n", offsetof(KernelArgs, hidden_dim), hidden_dim);
+        print("[KARG] token_cnt    @ 0x%04lX   = %d\n", offsetof(KernelArgs, token_cnt), token_cnt);
+        print("[KARG] eprt_cnt     @ 0x%04lX   = %d\n", offsetof(KernelArgs, eprt_cnt), eprt_cnt);
+        print("[KARG] Xs           @ 0x%04lX   = %d\n", offsetof(KernelArgs, Xs), Xs);
+        print("[KARG] GUs          @ 0x%04lX   = %d\n", offsetof(KernelArgs, GUs), GUs);
+        print("[KARG] Os           @ 0x%04lX   = %d\n", offsetof(KernelArgs, Os), Os);
+        print("[KARG] eGUs         @ 0x%04lX   = %d\n", offsetof(KernelArgs, eGUs), eGUs);
+        print("[KARG] eGUQs        @ 0x%04lX   = %d\n", offsetof(KernelArgs, eGUQs), eGUQs);
+        print("[KARG] eSMQs        @ 0x%04lX   = %d\n", offsetof(KernelArgs, eSMQs), eSMQs);
+        print("[KARG] topk         @ 0x%04lX   = %d\n", offsetof(KernelArgs, topk), topk);
+        print("[KARG] splitk       @ 0x%04lX   = %d\n", offsetof(KernelArgs, splitk), splitk);
+        print("[KARG] activation   @ 0x%04lX   = %d\n", offsetof(KernelArgs, activation), activation);
+        print("[KARG] total_tgs    @ 0x%04lX   = %d\n", offsetof(KernelArgs, total_tgs), total_tgs);
+        print("[KARG] ps_deno      @ 0x%04lX   = %d\n", offsetof(KernelArgs, ps_deno), ps_deno);
+        print("[KARG] eLQQs        @ 0x%04lX   = %d\n", offsetof(KernelArgs, eLQQs), eLQQs);
+    }
 };
 
 struct __attribute__((packed)) Kernel2Args
@@ -118,6 +237,22 @@ struct __attribute__((packed)) Kernel2Args
     p2 _p21;
     unsigned int stride_expert_dequant_D;
     p3 _p22;
+    void log()
+    {
+        print("[Kernel2Args] argsize: %zu\n", sizeof(Kernel2Args));
+        print("[KARG] dim                      @ 0x%04lX   = %d\n", offsetof(Kernel2Args, dim), dim);
+        print("[KARG] hidden_dim               @ 0x%04lX   = %d\n", offsetof(Kernel2Args, hidden_dim), hidden_dim);
+        print("[KARG] token_cnt                @ 0x%04lX   = %d\n", offsetof(Kernel2Args, token_cnt), token_cnt);
+        print("[KARG] eprt_cnt                 @ 0x%04lX   = %d\n", offsetof(Kernel2Args, eprt_cnt), eprt_cnt);
+        print("[KARG] stride_X                 @ 0x%04lX   = %d\n", offsetof(Kernel2Args, stride_X), stride_X);
+        print("[KARG] stride_D                 @ 0x%04lX   = %d\n", offsetof(Kernel2Args, stride_D), stride_D);
+        print("[KARG] stride_O                 @ 0x%04lX   = %d\n", offsetof(Kernel2Args, stride_O), stride_O);
+        print("[KARG] stride_expert_D          @ 0x%04lX   = %d\n", offsetof(Kernel2Args, stride_expert_D), stride_expert_D);
+        print("[KARG] stride_expert_scale_D    @ 0x%04lX   = %d\n", offsetof(Kernel2Args, stride_expert_scale_D), stride_expert_scale_D);
+        print("[KARG] topk                     @ 0x%04lX   = %d\n", offsetof(Kernel2Args, topk), topk);
+        print("[KARG] splitk                   @ 0x%04lX   = %d\n", offsetof(Kernel2Args, splitk), splitk);
+        print("[KARG] stride_expert_dequant_D  @ 0x%04lX   = %d\n", offsetof(Kernel2Args, stride_expert_dequant_D), stride_expert_dequant_D);
+    }
 };
 
 static CFG* get_cfg(torch::Tensor& inp,
@@ -157,10 +292,10 @@ static CFG* get_cfg(torch::Tensor& inp,
     {
         return &cfg_fmoe_stage1_int8_pertokenInt8_g1u1;
     }
-    else if(inp.scalar_type() == at::ScalarType::Char && w1.scalar_type() == at::ScalarType::Int4 &&
-            (out.scalar_type() == at::ScalarType::BFloat16) && quant_type == QuantType::per_Token) // feifei : use lqq enum
+    else if(w1.scalar_type() == at::ScalarType::Int4 && out.scalar_type() == at::ScalarType::BFloat16 && 
+            quant_type == QuantType::lqq_1x64)
     {
-        return &cfg_fmoe_stage1_bf16_lqqInt4_g1u1;
+        return &cfg_fmoe_stage1_bf16_pertokenLqqUint4_g1u1;
     }
     else
     {
@@ -191,10 +326,10 @@ static CFG* get_cfg_stage2(torch::Tensor& inter_states,
     {
         return &cfg_fmoe_stage2_bf16_pertokenInt8_g1u1;
     }
-    else if(inter_states.scalar_type() == at::ScalarType::Char && w2.scalar_type() == at::ScalarType::Int4 &&
-            (out.scalar_type() == at::ScalarType::BFloat16) && quant_type == QuantType::per_Token) 
+    else if(w2.scalar_type() == at::ScalarType::Int4 && out.scalar_type() == at::ScalarType::BFloat16 &&
+            quant_type == QuantType::lqq_1x64)
     {
-        return &cfg_fmoe_stage2_bf16_lqqInt4_g1u1;
+        return &cfg_fmoe_stage2_bf16_pertokenLqqUint4_g1u1;
     }
     else
     {
@@ -284,6 +419,7 @@ void moe_stage1_g1u1(
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     CFG* config_map = get_cfg(input, out, w1, quant_type, sorted_weights.has_value());
+    print("[KERNEL] config_map size = %zu\n", config_map->size());
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
     int model_dim  = input.size(-1);
     int hidden_dim = inter_dim;
@@ -291,7 +427,7 @@ void moe_stage1_g1u1(
     int model_dim_w1 = w1.size(2);
     int model_dim_w2 = w2.size(1);
     int gu_int4 = (model_dim_w2 / model_dim_w1 == 2) ? 1 : 0;
-    
+
     int token_cnt = input.size(-2);
     int topk      = out.size(1);
     int eprt      = w1.size(0);
@@ -309,6 +445,7 @@ void moe_stage1_g1u1(
     if(kernelName.empty())
     {
         kernelName = get_heuristic_kernel(sub_X_cnt, inter_dim, block_m, config_map, arch_id);
+        print("[KERNEL] heuristic_kernel = %s\n", kernelName.c_str());
     }
 
     AiterAsmKernel* impl_ptr = nullptr;
@@ -318,6 +455,9 @@ void moe_stage1_g1u1(
         const auto& cfg     = it->second;
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
+
+        print("[KERNEL] name = %s\n", name);
+        print("[KERNEL] co_name = %s\n", co_name);
 
         TORCH_CHECK(inter_dim % cfg.tile_n == 0,
                     "ASM kernel " + std::string(name) +
@@ -351,7 +491,7 @@ void moe_stage1_g1u1(
     int stride_expert_SMTDQN = inter_dim * sizeof(float);
     int stride_O             = topk * inter_dim * out.element_size();
     int stride_expert_LQQ    = w1_lqq_scale.has_value() ? w1_lqq_scale.value().stride(0) : 0;
-
+    
     if(gu_int4)
     {
         stride_GU /= 2;
@@ -415,31 +555,22 @@ void moe_stage1_g1u1(
     int gdy = sz_stp; // sub_X_cnt;
     int gdz = k_num;
 
-    // printf("####stage1 arg start############ \n");
-    // std::cout << " args.ptr_O       = " << args.ptr_O << std::endl;
-    // std::cout << " args.ptr_X       = " << args.ptr_X << std::endl;
-    // std::cout << " args.ptr_GU      = " << args.ptr_GU << std::endl;
-    // std::cout << " args.ptr_XC      = " << args.ptr_XC << std::endl;
-    // std::cout << " args.ptr_XQ      = " << args.ptr_XQ << std::endl;
-    // std::cout << " args.ptr_GUQ     = " << args.ptr_GUQ << std::endl;
-    // std::cout << " args.ptr_SMQ     = " << args.ptr_SMQ << std::endl;
-    // std::cout << " args.ptr_STP     = " << args.ptr_STP << std::endl;
-    // std::cout << " args.ptr_SEP     = " << args.ptr_SEP << std::endl;
-    // std::cout << " args.dim         = " << args.dim << std::endl;
-    // std::cout << " args.hidden_dim  = " << args.hidden_dim << std::endl;
-    // std::cout << " args.token_cnt   = " << args.token_cnt << std::endl;
-    // std::cout << " args.eprt_cnt    = " << args.eprt_cnt << std::endl;
-    // std::cout << " args.Xs          = " << args.Xs << std::endl;
-    // std::cout << " args.GUs         = " << args.GUs << std::endl;
-    // std::cout << " args.Os          = " << args.Os << std::endl;
-    // std::cout << " args.eGUs        = " << args.eGUs << std::endl;
-    // std::cout << " args.eGUQs       = " << args.eGUQs << std::endl;
-    // std::cout << " args.eSMQs       = " << args.eSMQs << std::endl;
-    // std::cout << " args.topk        = " << args.topk << std::endl;
-    // std::cout << " args.splitk      = " << args.splitk << std::endl;
-    // std::cout << " args.activation  = " << args.activation << std::endl;
-    // std::cout << " args.ptr_SW      = " << args.ptr_SW << std::endl;
-    // printf("gdx:%d, gdy:%d, gdz:%d, tgs:%d\n", gdx, gdy, gdz, sub_X_cnt * gdx * gdz);
+    args.log();
+    print("[DEV_BUF] ptr_O     : out               = %lu bytes\n", out.numel() * out.element_size());
+    print("[DEV_BUF] ptr_X     : input             = %lu bytes\n", input.numel() * input.element_size());
+    print("[DEV_BUF] ptr_GU    : w1                = %lu bytes\n", w1.numel() * w1.element_size());
+    print("[DEV_BUF] ptr_XC    : num_valid_ids     = %lu bytes\n", num_valid_ids.numel() * num_valid_ids.element_size());
+    print("[DEV_BUF] ptr_XQ    : a1_scale          = %lu bytes\n", a1_scale.has_value() ? a1_scale.value().numel() * a1_scale.value().element_size() : 0);
+    print("[DEV_BUF] ptr_GUQ   : w1_scale          = %lu bytes\n", w1_scale.has_value() ? w1_scale.value().numel() * w1_scale.value().element_size() : 0);
+    print("[DEV_BUF] ptr_SMQ   : fc2_smooth_scale  = %lu bytes\n", fc2_smooth_scale.has_value() ? fc2_smooth_scale.value().numel() * fc2_smooth_scale.value().element_size() : 0);
+    print("[DEV_BUF] ptr_STP   : sorted_token_ids  = %lu bytes\n", sorted_token_ids.numel() * sorted_token_ids.element_size());
+    print("[DEV_BUF] ptr_SEP   : sorted_expert_ids = %lu bytes\n", sorted_expert_ids.numel() * sorted_expert_ids.element_size());
+    print("[DEV_BUF] ptr_SW    : sorted_weights    = %lu bytes\n", sorted_weights.has_value() ? sorted_weights.value().numel() * sorted_weights.value().element_size() : 0);
+    print("[DEV_BUF] ptr_Qscl  : w1_lqq_scale      = %lu bytes\n", w1_lqq_scale.has_value() ? w1_lqq_scale.value().numel() * w1_lqq_scale.value().element_size() : 0);
+    print("[DEV_BUF] ptr_Qzero : w1_lqq_zero       = %lu bytes\n", w1_lqq_zero.has_value() ? w1_lqq_zero.value().numel() * w1_lqq_zero.value().element_size() : 0);
+    print("[KERNEL] sub_X = %d, sub_GU = %d\n", block_m, sub_GU);
+    print("[KERNEL] sub_X_cnt = %d, sz_stp = %d\n", sub_X_cnt, sz_stp);
+    print("[KERNEL] gdx:%d, gdy:%d, gdz:%d, bdx:%d\n", gdx, gdy, gdz, bdx);
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,
@@ -477,6 +608,7 @@ void moe_stage2_g1u1(
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     CFG* config_map = get_cfg_stage2(inter_states, out, w2, quant_type, sorted_weights.has_value());
+    print("[KERNEL] config_map size = %zu\n", config_map->size());
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
 
     int inter_dim = inter_states.size(-1); // inter_states: [..., inter_dim]
@@ -491,6 +623,7 @@ void moe_stage2_g1u1(
     if(kernelName.empty())
     {
         kernelName = get_heuristic_kernel(sub_X_cnt, out.size(-1), block_m, config_map, arch_id);
+        print("[KERNEL] heuristic_kernel = %s\n", kernelName.c_str());
     }
 
     AiterAsmKernel* impl_ptr = nullptr;
@@ -500,6 +633,9 @@ void moe_stage2_g1u1(
         const auto& cfg     = it->second;
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
+
+        print("[KERNEL] name = %s\n", name);
+        print("[KERNEL] co_name = %s\n", co_name);
 
         auto result = impl_ptr_map.emplace(name, nullptr);
         if(result.second)
@@ -525,17 +661,12 @@ void moe_stage2_g1u1(
                 cfg.tile_m);
 
     int stride_X = inter_dim * inter_states.element_size();
-
     int stride_D = inter_dim * w2.element_size();
-
     int stride_Scale_X = a2_scale.has_value() ? a2_scale.value().stride(0) * sizeof(float) : 0;
-
     int stride_expert_D = inter_dim * dim * w2.element_size();
-
     int stride_expert_scale_D = w2_scale.has_value() ? dim * sizeof(float) : 0;
-
     int stride_expert_dequant_D =  w2_lqq_scale.has_value() ? w2_lqq_scale.value().stride(0) : 0;
-
+    
     if (isInt4) {
         stride_D         /= 2;
         stride_expert_D  /= 2;
@@ -586,30 +717,23 @@ void moe_stage2_g1u1(
     int gdy = sub_X_cnt;
     int gdz = k_num;
 
-    // printf("#### stage2 arg start ############\n ");
-    // printf("args.ptr_OBuffer  = %p\n", args.ptr_OBuffer);
-    // printf("args.ptr_XBuffer  = %p\n", args.ptr_XBuffer);
-    // printf("args.ptr_DBuffer  = %p\n", args.ptr_DBuffer);
-    // printf("args.ptr_XCBuffer = %p\n", args.ptr_XCBuffer);
-    // printf("args.ptr_ScaleXBuffer = %p\n", args.ptr_ScaleXBuffer);
-    // printf("args.ptr_ScaleDBuffer = %p\n", args.ptr_ScaleDBuffer);
-    // printf("args.ptr_STPBuffer = %p\n", args.ptr_STPBuffer);
-    // printf("args.ptr_SEPBuffer = %p\n", args.ptr_SEPBuffer);
-    // printf("args.dim = %u\n", args.dim);
-    // printf("args.hidden_dim = %u\n", args.hidden_dim);
-    // printf("args.token_cnt = %u\n", args.token_cnt);
-    // printf("args.eprt_cnt = %u\n", args.eprt_cnt);
-    // printf("args.stride_X = %u\n", args.stride_X);
-    // printf("args.stride_D = %u\n", args.stride_D);
-    // printf("args.stride_O = %u\n", args.stride_O);
-    // printf("args.stride_expert_D = %u\n", args.stride_expert_D);
-    // printf("args.stride_expert_scale_D = %u\n", args.stride_expert_scale_D);
-    // printf("args.topk = %u\n", args.topk);
-    // printf("args.splitk = %u\n", args.splitk);
-    // printf("args.ptr_SWBuffer = %p\n", args.ptr_SWBuffer);
-    // printf("gdx = %d\n", gdx);
-    // printf("gdy = %d\n", gdy);
-    // printf("gdz = %d\n", gdz);
+    args.log();
+    print("[DEV_BUF] ptr_OBuffer       : out               = %lu bytes\n", out.numel() * out.element_size());
+    print("[DEV_BUF] ptr_XBuffer       : inter_states      = %lu bytes\n", inter_states.numel() * inter_states.element_size());
+    print("[DEV_BUF] ptr_DBuffer       : w2                = %lu bytes\n", w2.numel() * w2.element_size());
+    print("[DEV_BUF] ptr_XCBuffer      : num_valid_ids     = %lu bytes\n", num_valid_ids.numel() * num_valid_ids.element_size());
+    print("[DEV_BUF] ptr_ScaleXBuffer  : a2_scale          = %lu bytes\n", a2_scale.has_value() ? a2_scale.value().numel() * a2_scale.value().element_size() : 0);
+    print("[DEV_BUF] ptr_ScaleDBuffer  : w2_scale          = %lu bytes\n", w2_scale.has_value() ? w2_scale.value().numel() * w2_scale.value().element_size() : 0);
+    print("[DEV_BUF] ptr_STPBuffer     : sorted_token_ids  = %lu bytes\n", sorted_token_ids.numel() * sorted_token_ids.element_size());
+    print("[DEV_BUF] ptr_SEPBuffer     : sorted_expert_ids = %lu bytes\n", sorted_expert_ids.numel() * sorted_expert_ids.element_size());
+    print("[DEV_BUF] ptr_SWBuffer      : sorted_weights    = %lu bytes\n", sorted_weights.has_value() ? sorted_weights.value().numel() * sorted_weights.value().element_size() : 0);
+    print("[DEV_BUF] ptr_DScaleBuffer  : w2_lqq_scale      = %lu bytes\n", w2_lqq_scale.has_value() ? w2_lqq_scale.value().numel() * w2_lqq_scale.value().element_size() : 0);
+    print("[DEV_BUF] ptr_DZeroBuffer   : w2_lqq_zero       = %lu bytes\n", w2_lqq_zero.has_value() ? w2_lqq_zero.value().numel() * w2_lqq_zero.value().element_size() : 0);
+    //save_dev_int<int32_t>("./feifei/ptr_XCBuffer.txt",  (int32_t*)(args.ptr_XCBuffer),  num_valid_ids.numel());
+    //save_dev_int<int32_t>("./feifei/ptr_STPBuffer.txt", (int32_t*)(args.ptr_STPBuffer), sorted_token_ids.numel());
+    //save_dev_int<int32_t>("./feifei/ptr_SEPBuffer.txt", (int32_t*)(args.ptr_SEPBuffer), sorted_expert_ids.numel());
+    print("[KERNEL] sub_X = %d, sub_D = %d\n", block_m, sub_D);
+    print("[KERNEL] gdx:%d, gdy:%d, gdz:%d, bdx:%d\n", gdx, gdy, gdz, bdx);
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,
