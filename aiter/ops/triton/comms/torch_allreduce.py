@@ -66,8 +66,9 @@ def fused_allreduce_add_rms_quant_gemm_torch(
     ).to(quant_dtype)
 
     # Step 4: Scaled GEMM
-    gemm_out = torch.ops.vllm.rocm_per_tensor_float_w8a8_scaled_mm_impl(
-        quant_out, gemm_weight, out_dtype, quant_scale_out, weight_scale, bias,
+    gemm_out = torch._scaled_mm(
+        quant_out, gemm_weight, out_dtype=out_dtype,
+        scale_a=quant_scale_out, scale_b=weight_scale, bias=bias,
     )
 
     return gemm_out, residual_out

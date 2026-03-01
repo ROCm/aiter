@@ -668,33 +668,34 @@ class IrisTwoshotManager:
             self._out_scale,
         )
 
-    def fused_allreduce_rmsnorm_quant(
+    def fused_allreduce_rmsnorm_quant_gemm(
         self,
         input_tensor: torch.Tensor,
         rms_weight: torch.Tensor,
         rms_eps: float,
         quant_dtype: torch.dtype,
+        gemm_weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        out_dtype: torch.dtype,
         residual: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        Optional[torch.Tensor],
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        """Two-shot AllReduce + RMSNorm + per-tensor FP8 quant.
+        bias: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Two-shot AllReduce + RMSNorm + per-tensor FP8 quant + GEMM.
 
         Args:
             input_tensor: Input tensor (M, N) on GPU
             rms_weight: RMSNorm weight (N,)
             rms_eps: RMSNorm epsilon
             quant_dtype: FP8 dtype (e.g. torch.float8_e4m3fn)
+            gemm_weight: FP8 weight matrix for scaled GEMM
+            weight_scale: Scale for gemm_weight
+            out_dtype: Output dtype for GEMM (e.g. torch.bfloat16)
             residual: Optional residual tensor (M, N)
+            bias: Optional bias for GEMM
 
         Returns:
-            (allreduce_out, rms_out, residual_out, quant_out, scale_out)
-            residual_out is None when residual is None.
-            scale_out is per-tensor: shape (1,).
+            (gemm_out, residual_out). residual_out is None when
+            residual is None.
         """
         shmem = self.shmem
         M, N = input_tensor.shape
@@ -771,10 +772,13 @@ class IrisTwoshotManager:
         # Advance epoch for the inlined barrier consumed by the kernel
         self._barrier_epoch += 1
 
-        # Return allreduce_out as a view from the heap buffer
-        allreduce_out = ar_output[:M]
+        # Scaled GEMM
+        gemm_out = torch._scaled_mm(
+            quant_out, gemm_weight, out_dtype=out_dtype,
+            scale_a=scale_out, scale_b=weight_scale, bias=bias,
+        )
 
-        return allreduce_out, rms_out, residual_out, quant_out, scale_out
+        return gemm_out, residual_out
 
 
 _iris_twoshot_manager: Optional[IrisTwoshotManager] = None
@@ -819,13 +823,7 @@ def fused_allreduce_add_rms_quant_gemm_iris_twoshot(
 
     Returns (gemm_out, residual_out).
     """
-    iris_mgr = get_iris_twoshot_manager()
-    _, _, residual_out, quant_out, scale_out = (
-        iris_mgr.fused_allreduce_rmsnorm_quant(
-            input, rms_weight, rms_eps, quant_dtype, residual,
-        )
+    return get_iris_twoshot_manager().fused_allreduce_rmsnorm_quant_gemm(
+        input, rms_weight, rms_eps, quant_dtype,
+        gemm_weight, weight_scale, out_dtype, residual, bias,
     )
-    gemm_out = torch.ops.vllm.rocm_per_tensor_float_w8a8_scaled_mm_impl(
-        quant_out, gemm_weight, out_dtype, scale_out, weight_scale, bias,
-    )
-    return gemm_out, residual_out
