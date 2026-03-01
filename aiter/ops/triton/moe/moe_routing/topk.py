@@ -1,15 +1,17 @@
+import triton
 import torch
 from aiter.ops.triton._triton_kernels.moe.moe_routing.topk import _topk
 from aiter.ops.triton.moe.moe_routing.bitmatrix import Bitmatrix
 
 
-def topk(
-    x, k, apply_softmax=True, dim=1, return_bitmatrix=True, y_indx=None, HIST_BLOCK_M=32
-):
+def topk(x, k, apply_softmax=True, dim=1, return_bitmatrix=True, HIST_BLOCK_M=32):
     x_shape = [x.shape[0], x.shape[1]]
-    cdiv = lambda a, b: (a + b - 1) // b
+
+    def cdiv(a, b):
+        return (a + b - 1) // b
+
     BLOCK_M = 32
-    BLOCK_N = 128
+    BLOCK_N = 128  # triton.next_power_of_2(x_shape[1])  # 128
     BLOCK_S = 128
     BLOCK_SP = 128
     assert len(x.shape) == 2
@@ -21,11 +23,8 @@ def topk(
     # scratchpad tensors
     # NOTE: these are not returned
     y_vals = torch.empty((n_rows, k), dtype=x.dtype, device=dev)
-    if y_indx is not None:
-        use_provided_indx = True
-    else:
-        y_indx = torch.empty((n_rows, k), dtype=torch.int16, device=dev)
-        use_provided_indx = False
+    y_indx = torch.empty((n_rows, k), dtype=torch.int16, device=dev)
+    k_pow2 = triton.next_power_of_2(k)
     # create bitmatrix in transposed memory layout:
     n_cols_pad = cdiv(n_cols, BLOCK_N) * BLOCK_N
     n_cols_words = n_cols_pad // 32
@@ -49,10 +48,9 @@ def topk(
     _topk[(pids,)](
         x,
         x.stride(0),  # inputs
-        y_vals,
+        y_vals,  # output [topk]
         y_indx,
         y_vals.stride(0),
-        use_provided_indx,  # output [topk]
         bitmatrix,
         bitmatrix.stride(0),
         bitmatrix.stride(1),  # output [bitmatrix]
@@ -70,6 +68,7 @@ def topk(
         APPLY_SOFTMAX=apply_softmax,
         N_EXPTS_PAD=n_cols_pad,
         N_EXPTS_ACT=k,  # constants
+        N_EXPTS_ACT_PAD=k_pow2,
         num_warps=8,
     )
     bitmatrix_shape = [n_rows, n_cols_words * 32]

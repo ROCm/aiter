@@ -176,6 +176,7 @@ a8w8_gemm1_kernels_list= {
      7: kernelInstanceGEMM1(       256,       128,       128,       256,     1,       4,        3,),
      8: kernelInstanceGEMM1(       256,       128,       128,       128,     1,       4,        3,),
      9: kernelInstanceGEMM1(       256,       256,       128,       128,     1,       4,        3,),
+    13: kernelInstanceGEMM1(       256,        16,        64,       256,     1,       4,        1,),
 }
 # gemm1 blockscale out:bf16/fp16 AB:fp8/i8
 a8w8_gemm1_blockscale_kernels_list= {
@@ -297,6 +298,7 @@ a8w8_gemm2_kernels_list= {
      14: kernelInstanceGEMM2(       256,       128,        64,       64,     1,       4,         3,),
      15: kernelInstanceGEMM2(       256,       256,       128,       64,     1,       4,         3,),
      16: kernelInstanceGEMM2(       256,       256,        64,       64,     1,       4,         3,),
+     19: kernelInstanceGEMM2(        64,        16,        64,       64,     1,       1,         1,),
 }
 
 # gemm2 MXDLPerWave out:bf16/fp16 AB:fp8/i8
@@ -397,6 +399,7 @@ def get_gemm1_kernels_list(
             tag = "a4w4"
         else:
             tag = "a4w4_bns"
+
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
     kernels_list = gemm1_kernels_dict[tag]
@@ -416,8 +419,10 @@ def get_gemm1_kernels_list(
                 kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscaleSplitk"
             else:
                 kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscale"
-        elif tag == "a8w8" or tag == "a4w4" or tag == "a4w4_bns":
+        elif tag == "a8w8" or tag == "a4w4_bns":
             kernel.CDEElementOp = "MulABScale"
+        elif tag == "a4w4":
+            kernel.CDEElementOp = "MulABScaleShuffled"
         elif tag == "a16w16":
             if MulRoutedWeight:
                 kernel.CDEElementOp = "TypeCastExpertWeight"
@@ -480,8 +485,10 @@ def get_gemm2_kernels_list(
             kernel.CDEElementOp = "MulABScaleExpertWeightWin4"
         elif tag == "a8w8blkscale":
             kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscale"
-        elif tag == "a8w8" or tag == "a4w4" or tag == "a4w4_bns":
+        elif tag == "a8w8" or tag == "a4w4_bns":
             kernel.CDEElementOp = "MulABScaleExpertWeight"
+        elif tag == "a4w4":
+            kernel.CDEElementOp = "MulABScaleExpertWeightShuffled"
         elif tag == "a16w16":
             if MulRoutedWeight:
                 kernel.CDEElementOp = "TypeCastExpertWeight"
