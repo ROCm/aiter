@@ -18,6 +18,9 @@ from typing import Any, Callable, List, Optional
 
 from packaging.version import Version, parse
 
+# Ensure ROCM_HOME is set so cpp_extension can find thrust (e.g. thrust/complex.h)
+os.environ.setdefault("ROCM_HOME", "/opt/rocm")
+
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
 from chip_info import get_gfx, get_gfx_list
@@ -596,8 +599,8 @@ def build_module(
                 "-mllvm -amdgpu-early-inline-all=true",
                 "-mllvm -amdgpu-function-calls=false",
             ]
-        if hip_version > Version("6.2.41133"):
-            flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
+        # if hip_version > Version("6.2.41133"):
+        #     flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
         if get_gfx() == "gfx950" and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]
 

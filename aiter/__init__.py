@@ -78,6 +78,7 @@ from .ops.moe_sorting_opus import *  # noqa: F403,E402
 from .ops.pos_encoding import *  # noqa: F403,E402
 from .ops.cache import *  # noqa: F403,E402
 from .ops.rmsnorm import *  # noqa: F403,E402
+from .ops.gemma_norm import *  # noqa: F403,E402
 from .ops.communication import *  # noqa: F403,E402
 from .ops.rope import *  # noqa: F403,E402
 from .ops.topk import *  # noqa: F403,E402
