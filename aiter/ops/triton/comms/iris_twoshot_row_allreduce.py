@@ -175,7 +175,7 @@ def fused_twoshot_allreduce_rmsnorm_row_quant_gemm_kernel(
     gemm_weight_ptr,  # (N, K_GEMM) fp8 weight matrix
     gemm_out_ptr,  # (M, K_GEMM) output buffer
     bias_ptr,  # optional bias (K_GEMM,); dummy ptr when HAS_BIAS=False
-    weight_scale,  # float32 scalar (per-tensor weight scale)
+    weight_scale_ptr,  # pointer to float32 scalar (per-tensor weight scale)
     K_GEMM,  # GEMM output dimension
     stride_gw_k,  # gemm_weight stride dim 0
     stride_gw_n,  # gemm_weight stride dim 1
@@ -421,7 +421,8 @@ def fused_twoshot_allreduce_rmsnorm_row_quant_gemm_kernel(
             b_ptrs += GEMM_BLOCK_K * stride_gw_k
 
         # Apply scales: per-row activation scale * per-tensor weight scale
-        accumulator *= a_scale[:, None] * weight_scale
+        ws = tl.load(weight_scale_ptr)
+        accumulator *= a_scale[:, None] * ws
 
         # Optional bias
         if HAS_BIAS:
@@ -774,9 +775,6 @@ class IrisTwoshotRowManager:
 
         BLOCK_SIZE_N = triton.next_power_of_2(N)
 
-        # Weight scale as a Python float (scalar, not tensor)
-        ws_float = weight_scale.item()
-
         # Reset sync buffer before kernel launch
         assert self._barrier_done is not None
         self._barrier_done.zero_()
@@ -798,7 +796,7 @@ class IrisTwoshotRowManager:
             gemm_weight,
             gemm_out,
             bias_ptr,
-            ws_float,
+            weight_scale,
             K_GEMM,
             gemm_weight.stride(0),
             gemm_weight.stride(1),
