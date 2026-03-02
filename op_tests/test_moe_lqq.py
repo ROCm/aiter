@@ -14,6 +14,7 @@ from aiter.fused_moe import (
     fused_moe,
     torch_moe_stage1,
     torch_moe_stage2,
+    torch_moe,
 )
 from aiter.ops.shuffle import shuffle_scale_zero_lqq_a8w4, shuffle_weight_lqq_a8w4
 from aiter import ActivationType
@@ -177,32 +178,18 @@ def test_fmoe_lqq(
     w2_lqq_zero_uint8_shf = shuffle_scale_zero_lqq_a8w4(w2_lqq_zero_uint8, (4, 16))
 
     ######################################################################################
-    out1_ref = torch_moe_stage1(
-        a1_qt,
+    out_ref = torch_moe(
+        input,
         w1_qt,
         w2_qt,
         topk_weights,
         topk_ids,
-        dtype=dtype,
+        fc1_scale=w1_scale,
+        fc2_scale=w2_scale,
+        fc1_smooth_scale=None,
+        fc2_smooth_scale=None,
+        expert_mask=expert_mask,
         activation=act_type,
-        quant_type=aiter.QuantType.per_Token,
-        a1_scale=a1_scale,
-        w1_scale=w1_scale,
-        doweight=False,
-    )
-    a2_qt, a2_scale = aiter.pertoken_quant(out1_ref, quant_dtype=dtypes.i8)
-    a2_qt = a2_qt.view(token, topk, -1)
-    out2_ref = torch_moe_stage2(
-        a2_qt,
-        w1_qt,
-        w2_qt,
-        topk_weights,
-        topk_ids,
-        dtype=dtype,
-        quant_type=aiter.QuantType.per_Token,
-        a2_scale=a2_scale,
-        w2_scale=w2_scale,
-        doweight=True,
     )
 
     ######################################################################################
@@ -212,6 +199,7 @@ def test_fmoe_lqq(
         w2_lqq,
         topk_weights,
         topk_ids,
+        expert_mask=expert_mask,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         a1_scale=a1_scale,
@@ -229,7 +217,7 @@ def test_fmoe_lqq(
 
     ######################################################################################
     err = checkAllclose(
-        out2_ref,
+        out_ref,
         out_asm,
         msg=f"sub_X:{block_size_M}.",
     )
@@ -240,11 +228,11 @@ def test_fmoe_lqq(
         sim = torch.cosine_similarity(x.flatten(), y.flatten(), dim=0)
         return 1 - sim
 
-    logits_diff = calc_diff(out2_ref, out_asm)
+    logits_diff = calc_diff(out_ref, out_asm)
     if logits_diff > 1e-3:
-        print(f"rms_diff: {logits_diff} is too large, please check the implementation")
+        print(f"logits_diff: {logits_diff} is too large, please check the implementation")
     else:
-        print(f"rms_diff: {logits_diff} is acceptable")
+        print(f"logits_diff: {logits_diff} is acceptable")
 
     ######################################################################################
     _, us = run_perftest(
@@ -354,12 +342,12 @@ parser.add_argument(
 args = parser.parse_args()
 
 print(f"\nRunning moe_lqq test...")
-expert = 16 if args.expert is None else args.expert[0]
+expert = 128 if args.expert is None else args.expert[0]
 topk = 6 if args.topk is None else args.topk[0]
 tokens = 208 if args.token is None else args.token[0]
 mdim = 5120 if args.model_dim is None else args.model_dim[0]
 idim = 1536 if args.inter_dim is None else args.inter_dim[0]
-ep = 1 if args.expert_parallelism is None else args.expert_parallelism
+ep = 8 if args.expert_parallelism is None else args.expert_parallelism
 shared_E = 2 if args.shared_expert is None else args.shared_expert
 
 for subX in [32, 48, 64, 80] if args.subx is None else args.subx:
