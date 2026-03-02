@@ -55,42 +55,43 @@ struct vec_t_float {
   }
 };
 
-template <size_t N>
-struct vec_t_half;
 
-template <>
-struct vec_t_half<8> {
-  int4 data;
-  __device__ __forceinline__ __half& operator[](size_t i) { return ((__half*)&data)[i]; }
-  __device__ __forceinline__ void fill(__half val) {
-    __half2 v = __half2(val, val);
-    *(__half2*)(&data.x) = v;
-    *(__half2*)(&data.y) = v;
-    *(__half2*)(&data.z) = v;
-    *(__half2*)(&data.w) = v;
+template <typename T>
+struct alignas(16) VecT8 { 
+  T d[VEC_SIZE];
+
+  __device__ __forceinline__ void load(const T* ptr) {
+    using VecType = uint4; 
+    *reinterpret_cast<VecType*>(d) = *reinterpret_cast<const VecType*>(ptr);
   }
-  __device__ __forceinline__ void load(const __half* ptr) { data = *((int4*)ptr); }
-  __device__ __forceinline__ void store(__half* ptr) const { *((int4*)ptr) = data; }
+
+  __device__ __forceinline__ void store(T* ptr) const {
+    using VecType = uint4;
+    *reinterpret_cast<VecType*>(ptr) = *reinterpret_cast<const VecType*>(d);
+  }
+
+  __device__ __forceinline__ void fill(T val) {
+    using T2 = typename std::conditional<
+        std::is_same<T, __half>::value, __half2, __hip_bfloat162>::type;
+    
+    T2 v2 = {val, val}; 
+    T2* p2 = reinterpret_cast<T2*>(d);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) p2[i] = v2;
+  }
+  
+  __device__ __forceinline__ T& operator[](size_t i) { return d[i]; }
+  __device__ __forceinline__ const T& operator[](size_t i) const { return d[i]; }
 };
 
 }  // namespace gemma_norm
 
-struct vec_bf16_8 {
-  uint4 data;
-  __device__ __forceinline__ __bf16& operator[](uint32_t i) { return ((__bf16*)&data)[i]; }
-  __device__ __forceinline__ void load(const __bf16* ptr) {
-    data = *reinterpret_cast<const uint4*>(ptr);
-  }
-  __device__ __forceinline__ void store(__bf16* ptr) const {
-    *reinterpret_cast<uint4*>(ptr) = data;
-  }
-};
-
-__global__ void gemma_rmsnorm_fp16(__half* __restrict__ output,
-                                   const __half* __restrict__ input,
-                                   const __half* __restrict__ weight,
-                                   uint32_t hidden_size,
-                                   float eps) {
+template <typename T>
+__global__ void gemma_rmsnorm_kernel(T* __restrict__ output,
+                                    const T* __restrict__ input,
+                                    const T* __restrict__ weight,
+                                    uint32_t hidden_size,
+                                    float eps) {
   const uint32_t d = hidden_size;
   const uint32_t stride_input = hidden_size;
   const uint32_t stride_output = hidden_size;
@@ -107,15 +108,15 @@ __global__ void gemma_rmsnorm_fp16(__half* __restrict__ output,
   float sum_sq = 0.f;
 
   for (uint32_t i = 0; i < rounds; i++) {
-    gemma_norm::vec_t_half<VEC_SIZE> input_vec;
-    input_vec.fill(acctype2dtype<__half>(0.f));
+    gemma_norm::VecT8<T> input_vec;
+    input_vec.fill(acctype2dtype<T>(0.f));
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       input_vec.load(input + bx * stride_input + i * num_threads * VEC_SIZE +
                      thread_id * VEC_SIZE);
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
-      float v = dtype2acctype<__half>(input_vec[j]);
+      float v = dtype2acctype<T>(input_vec[j]);
       sum_sq += v * v;
     }
   }
@@ -140,9 +141,9 @@ __global__ void gemma_rmsnorm_fp16(__half* __restrict__ output,
   float rms_rcp = gemma_norm::rsqrt(smem[0] / float(d) + eps);
 
   for (uint32_t i = 0; i < rounds; i++) {
-    gemma_norm::vec_t_half<VEC_SIZE> input_vec, weight_vec, output_vec;
-    input_vec.fill(acctype2dtype<__half>(0.f));
-    weight_vec.fill(acctype2dtype<__half>(0.f));
+    gemma_norm::VecT8<T> input_vec, weight_vec, output_vec;
+    input_vec.fill(acctype2dtype<T>(0.f));
+    weight_vec.fill(acctype2dtype<T>(0.f));
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       input_vec.load(input + bx * stride_input + i * num_threads * VEC_SIZE +
                      thread_id * VEC_SIZE);
@@ -150,8 +151,8 @@ __global__ void gemma_rmsnorm_fp16(__half* __restrict__ output,
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
-      output_vec[j] = acctype2dtype<__half>(dtype2acctype<__half>(input_vec[j]) * rms_rcp *
-                                           (weight_bias + dtype2acctype<__half>(weight_vec[j])));
+      output_vec[j] = acctype2dtype<T>(dtype2acctype<T>(input_vec[j]) * rms_rcp *
+                                       (weight_bias + dtype2acctype<T>(weight_vec[j])));
     }
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       output_vec.store(output + bx * stride_output + i * num_threads * VEC_SIZE +
@@ -160,11 +161,12 @@ __global__ void gemma_rmsnorm_fp16(__half* __restrict__ output,
   }
 }
 
-__global__ void gemma_fused_add_rmsnorm_fp16(__half* __restrict__ input,
-                                             __half* __restrict__ residual,
-                                             const __half* __restrict__ weight,
-                                             uint32_t hidden_size,
-                                             float eps) {
+template <typename T>
+__global__ void gemma_fused_add_rmsnorm_kernel(T* __restrict__ input,
+                                              T* __restrict__ residual,
+                                              const T* __restrict__ weight,
+                                              uint32_t hidden_size,
+                                              float eps) {
   const uint32_t d = hidden_size;
   const uint32_t stride_input = hidden_size;
   const uint32_t stride_residual = hidden_size;
@@ -182,10 +184,10 @@ __global__ void gemma_fused_add_rmsnorm_fp16(__half* __restrict__ input,
   float sum_sq = 0.f;
 
   for (uint32_t i = 0; i < rounds; i++) {
-    gemma_norm::vec_t_half<VEC_SIZE> input_vec, residual_vec;
-    input_vec.fill(acctype2dtype<__half>(0.f));
-    residual_vec.fill(acctype2dtype<__half>(0.f));
+    gemma_norm::VecT8<T> input_vec, residual_vec;
     gemma_norm::vec_t_float<VEC_SIZE> x_vec;
+    input_vec.fill(acctype2dtype<T>(0.f));
+    residual_vec.fill(acctype2dtype<T>(0.f));
     x_vec.fill(0.f);
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       input_vec.load(input + bx * stride_input + i * num_threads * VEC_SIZE +
@@ -195,9 +197,9 @@ __global__ void gemma_fused_add_rmsnorm_fp16(__half* __restrict__ input,
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
-      float x = dtype2acctype<__half>(input_vec[j]) + dtype2acctype<__half>(residual_vec[j]);
+      float x = dtype2acctype<T>(input_vec[j]) + dtype2acctype<T>(residual_vec[j]);
       sum_sq += x * x;
-      residual_vec[j] = acctype2dtype<__half>(x);
+      residual_vec[j] = acctype2dtype<T>(x);
       x_vec[j] = x;
     }
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
@@ -227,10 +229,9 @@ __global__ void gemma_fused_add_rmsnorm_fp16(__half* __restrict__ input,
   float rms_rcp = gemma_norm::rsqrt(smem[0] / float(d) + eps);
 
   for (uint32_t i = 0; i < rounds; i++) {
-    gemma_norm::vec_t_half<VEC_SIZE> input_vec, weight_vec;
+    gemma_norm::VecT8<T> input_vec, weight_vec;
     gemma_norm::vec_t_float<VEC_SIZE> x_vec;
-    input_vec.fill(acctype2dtype<__half>(0.f));
-    weight_vec.fill(acctype2dtype<__half>(0.f));
+    weight_vec.fill(acctype2dtype<T>(0.f));
     x_vec.fill(0.f);
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
@@ -238,180 +239,12 @@ __global__ void gemma_fused_add_rmsnorm_fp16(__half* __restrict__ input,
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
-      input_vec[j] = acctype2dtype<__half>(x_vec[j] * rms_rcp *
-                                          (weight_bias + dtype2acctype<__half>(weight_vec[j])));
+      input_vec[j] = acctype2dtype<T>(x_vec[j] * rms_rcp *
+                                      (weight_bias + dtype2acctype<T>(weight_vec[j])));
     }
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       input_vec.store(input + bx * stride_input + i * num_threads * VEC_SIZE +
                       thread_id * VEC_SIZE);
-    }
-  }
-}
-
-__global__ void gemma_rmsnorm_bf16(__bf16* __restrict__ output,
-                                   const __bf16* __restrict__ input,
-                                   const __bf16* __restrict__ weight,
-                                   uint32_t hidden_size,
-                                   float eps) {
-  const uint32_t d = hidden_size;
-  const uint32_t stride_input = hidden_size;
-  const uint32_t stride_output = hidden_size;
-  const float weight_bias = 1.f;
-
-  const uint32_t bx = blockIdx.x;
-  const uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  const uint32_t num_warps = blockDim.y;
-  const uint32_t thread_id = tx + ty * WARP_SIZE;
-  const uint32_t num_threads = num_warps * WARP_SIZE;
-  const uint32_t rounds = ceil_div(d, VEC_SIZE * num_threads);
-  extern __shared__ float smem[];
-
-  float sum_sq = 0.f;
-
-  for (uint32_t i = 0; i < rounds; i++) {
-    vec_bf16_8 input_vec;
-    if ((i * num_threads + thread_id) * VEC_SIZE < d) {
-      input_vec.load(input + bx * stride_input + i * num_threads * VEC_SIZE +
-                    thread_id * VEC_SIZE);
-    } else {
-      *reinterpret_cast<uint4*>(&input_vec.data) = uint4{0, 0, 0, 0};
-    }
-#pragma unroll
-    for (uint32_t j = 0; j < VEC_SIZE; j++) {
-      float v = dtype2acctype<__bf16>(input_vec[j]);
-      sum_sq += v * v;
-    }
-  }
-
-#pragma unroll
-  for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-    sum_sq += gemma_norm::shfl_xor_sync(sum_sq, offset);
-  }
-
-  smem[ty] = sum_sq;
-  __syncthreads();
-  if (ty == 0) {
-    sum_sq = (tx < num_warps) ? smem[tx] : 0.f;
-#pragma unroll
-    for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-      sum_sq += gemma_norm::shfl_xor_sync(sum_sq, offset);
-    }
-    smem[0] = sum_sq;
-  }
-  __syncthreads();
-
-  float rms_rcp = gemma_norm::rsqrt(smem[0] / float(d) + eps);
-
-  for (uint32_t i = 0; i < rounds; i++) {
-    vec_bf16_8 input_vec, weight_vec, output_vec;
-    if ((i * num_threads + thread_id) * VEC_SIZE < d) {
-      input_vec.load(input + bx * stride_input + i * num_threads * VEC_SIZE +
-                    thread_id * VEC_SIZE);
-      weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
-    } else {
-      *reinterpret_cast<uint4*>(&input_vec.data) = uint4{0, 0, 0, 0};
-      *reinterpret_cast<uint4*>(&weight_vec.data) = uint4{0, 0, 0, 0};
-    }
-#pragma unroll
-    for (uint32_t j = 0; j < VEC_SIZE; j++) {
-      output_vec[j] = acctype2dtype<__bf16>(dtype2acctype<__bf16>(input_vec[j]) * rms_rcp *
-                                            (weight_bias + dtype2acctype<__bf16>(weight_vec[j])));
-    }
-    if ((i * num_threads + thread_id) * VEC_SIZE < d) {
-      output_vec.store(output + bx * stride_output + i * num_threads * VEC_SIZE +
-                       thread_id * VEC_SIZE);
-    }
-  }
-}
-
-__global__ void gemma_fused_add_rmsnorm_bf16(__bf16* __restrict__ input,
-                                             __bf16* __restrict__ residual,
-                                             const __bf16* __restrict__ weight,
-                                             uint32_t hidden_size,
-                                             float eps) {
-  const uint32_t d = hidden_size;
-  const uint32_t stride_input = hidden_size;
-  const uint32_t stride_residual = hidden_size;
-  const float weight_bias = 1.f;
-
-  const uint32_t bx = blockIdx.x;
-  const uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  const uint32_t num_warps = blockDim.y;
-  const uint32_t thread_id = tx + ty * WARP_SIZE;
-  const uint32_t num_threads = num_warps * WARP_SIZE;
-  const uint32_t rounds = ceil_div(d, VEC_SIZE * num_threads);
-  extern __shared__ float smem[];
-  float* smem_x = smem + ceil_div(num_warps, 4u) * 4;
-
-  float sum_sq = 0.f;
-
-  for (uint32_t i = 0; i < rounds; i++) {
-    vec_bf16_8 input_vec, residual_vec;
-    float x_buf[VEC_SIZE];
-    if ((i * num_threads + thread_id) * VEC_SIZE < d) {
-      input_vec.load(input + bx * stride_input + i * num_threads * VEC_SIZE +
-                    thread_id * VEC_SIZE);
-      residual_vec.load(residual + bx * stride_residual + i * num_threads * VEC_SIZE +
-                        thread_id * VEC_SIZE);
-    } else {
-      *reinterpret_cast<uint4*>(&input_vec.data) = uint4{0, 0, 0, 0};
-      *reinterpret_cast<uint4*>(&residual_vec.data) = uint4{0, 0, 0, 0};
-    }
-#pragma unroll
-    for (uint32_t j = 0; j < VEC_SIZE; j++) {
-      float x = dtype2acctype<__bf16>(input_vec[j]) + dtype2acctype<__bf16>(residual_vec[j]);
-      sum_sq += x * x;
-      residual_vec[j] = acctype2dtype<__bf16>(x);
-      x_buf[j] = x;
-    }
-    if ((i * num_threads + thread_id) * VEC_SIZE < d) {
-      residual_vec.store(residual + bx * stride_residual + i * num_threads * VEC_SIZE +
-                         thread_id * VEC_SIZE);
-      for (uint32_t j = 0; j < VEC_SIZE; j++) {
-        smem_x[i * num_threads * VEC_SIZE + thread_id * VEC_SIZE + j] = x_buf[j];
-      }
-    }
-  }
-
-#pragma unroll
-  for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-    sum_sq += gemma_norm::shfl_xor_sync(sum_sq, offset);
-  }
-
-  smem[ty] = sum_sq;
-  __syncthreads();
-  if (ty == 0) {
-    sum_sq = (tx < num_warps) ? smem[tx] : 0.f;
-#pragma unroll
-    for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-      sum_sq += gemma_norm::shfl_xor_sync(sum_sq, offset);
-    }
-    smem[0] = sum_sq;
-  }
-  __syncthreads();
-
-  float rms_rcp = gemma_norm::rsqrt(smem[0] / float(d) + eps);
-
-  for (uint32_t i = 0; i < rounds; i++) {
-    vec_bf16_8 weight_vec, output_vec;
-    float x_buf[VEC_SIZE];
-    if ((i * num_threads + thread_id) * VEC_SIZE < d) {
-      weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
-      for (uint32_t j = 0; j < VEC_SIZE; j++) {
-        x_buf[j] = smem_x[i * num_threads * VEC_SIZE + thread_id * VEC_SIZE + j];
-      }
-    } else {
-      *reinterpret_cast<uint4*>(&weight_vec.data) = uint4{0, 0, 0, 0};
-      for (uint32_t j = 0; j < VEC_SIZE; j++) x_buf[j] = 0.f;
-    }
-#pragma unroll
-    for (uint32_t j = 0; j < VEC_SIZE; j++) {
-      output_vec[j] = acctype2dtype<__bf16>(x_buf[j] * rms_rcp *
-                                            (weight_bias + dtype2acctype<__bf16>(weight_vec[j])));
-    }
-    if ((i * num_threads + thread_id) * VEC_SIZE < d) {
-      output_vec.store(input + bx * stride_input + i * num_threads * VEC_SIZE +
-                       thread_id * VEC_SIZE);
     }
   }
 }
@@ -463,13 +296,13 @@ void gemma_rmsnorm(torch::Tensor& output,
   hipStream_t stream = at::hip::getCurrentHIPStream();
 
   if (input.scalar_type() == at::kHalf) {
-    hipLaunchKernelGGL(gemma_rmsnorm_fp16, grid, block, smem, stream,
+    hipLaunchKernelGGL(gemma_rmsnorm_kernel<__half>, grid, block, smem, stream,
                       reinterpret_cast<__half*>(output.data_ptr()),
                       reinterpret_cast<const __half*>(input.data_ptr()),
                       reinterpret_cast<const __half*>(weight.data_ptr()),
                       static_cast<uint32_t>(hidden_size), eps_f);
   } else if (input.scalar_type() == at::kBFloat16) {
-    hipLaunchKernelGGL(gemma_rmsnorm_bf16, grid, block, smem, stream,
+    hipLaunchKernelGGL(gemma_rmsnorm_kernel<__bf16>, grid, block, smem, stream,
                       reinterpret_cast<__bf16*>(output.data_ptr()),
                       reinterpret_cast<const __bf16*>(input.data_ptr()),
                       reinterpret_cast<const __bf16*>(weight.data_ptr()),
@@ -499,13 +332,13 @@ void gemma_fused_add_rmsnorm(torch::Tensor& input,
   hipStream_t stream = at::hip::getCurrentHIPStream();
 
   if (input.scalar_type() == at::kHalf) {
-    hipLaunchKernelGGL(gemma_fused_add_rmsnorm_fp16, grid, block, smem, stream,
+    hipLaunchKernelGGL(gemma_fused_add_rmsnorm_kernel<__half>, grid, block, smem, stream,
                       reinterpret_cast<__half*>(input.data_ptr()),
                       reinterpret_cast<__half*>(residual.data_ptr()),
                       reinterpret_cast<const __half*>(weight.data_ptr()),
                       static_cast<uint32_t>(hidden_size), eps_f);
   } else if (input.scalar_type() == at::kBFloat16) {
-    hipLaunchKernelGGL(gemma_fused_add_rmsnorm_bf16, grid, block, smem, stream,
+    hipLaunchKernelGGL(gemma_fused_add_rmsnorm_kernel<__bf16>, grid, block, smem, stream,
                       reinterpret_cast<__bf16*>(input.data_ptr()),
                       reinterpret_cast<__bf16*>(residual.data_ptr()),
                       reinterpret_cast<const __bf16*>(weight.data_ptr()),
