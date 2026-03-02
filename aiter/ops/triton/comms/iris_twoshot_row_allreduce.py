@@ -62,7 +62,7 @@ __all__ = ["fused_allreduce_add_rms_row_quant_gemm_iris_twoshot"]
 
 logger = logging.getLogger(__name__)
 
-AUTOTUNE = True
+AUTOTUNE = False
 if AUTOTUNE:
     os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 
