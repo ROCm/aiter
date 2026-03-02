@@ -37,7 +37,7 @@ __all__ = ["fused_allreduce_add_rms_quant_gemm"]
 logger = logging.getLogger(__name__)
 
 ALLREDUCE_IMPL = os.environ.get(
-    "VLLM_ROCM_FUSED_ALLREDUCE", "iris_twoshot_2d_hipblaslt"
+    "VLLM_ROCM_FUSED_ALLREDUCE", "iris_twoshot_row_hipblaslt"
 )
 
 

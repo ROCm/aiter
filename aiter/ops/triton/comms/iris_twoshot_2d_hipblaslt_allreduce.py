@@ -160,12 +160,27 @@ def _inlined_device_barrier(
 
 
 # ============================================================================
+# Autotune configs (shared with iris_twoshot_row_hipblaslt_allreduce.py)
+# ============================================================================
+
+FUSED_ALLREDUCE_AUTOTUNE_CONFIGS = [
+    triton.Config({}, num_warps=16, num_stages=2),  # best for 1D
+    triton.Config({}, num_warps=8, num_stages=1),   # best for 2D
+]
+
+
+# ============================================================================
 # Fused two-shot AllReduce + RMSNorm + per-row FP8 Quant kernel (2D tiling)
 # ============================================================================
 
 
+@triton.autotune(
+    configs=FUSED_ALLREDUCE_AUTOTUNE_CONFIGS,
+    key=["M", "N"],
+    use_cuda_graph=True,
+)
 @triton.jit
-def persistent_fused_allreduce_rmsnorm_row_quant_two_shot(
+def persistent_fused_allreduce_rmsnorm_2d_quant_two_shot(
     # Symmetric heap buffers
     input_ptr,
     quant_heap_ptr,
@@ -695,6 +710,7 @@ class IrisTwoshot2dHipblasltManager:
         heap_bases = shmem.get_heap_bases()
 
         # ---- Tunable parameters ----
+        # num_warps and num_stages are in the @triton.autotune config above
         num_xcds = iris.hip.get_num_xcc()
         BLOCK_SIZE_M = 4
         BLOCK_SIZE_N = triton.next_power_of_2(N)
@@ -704,8 +720,6 @@ class IrisTwoshot2dHipblasltManager:
         DISTRIBUTION = 1       # 0=striding, 1=block
         COMM_SMS = 128
         CHUNK_SIZE = _compute_chunk_size(COMM_SMS, num_xcds)
-        NUM_WARPS = 8
-        NUM_STAGES = 1
         WAVES_PER_EU = 1
         # ---- End tunable parameters ----
 
@@ -714,7 +728,10 @@ class IrisTwoshot2dHipblasltManager:
         self._barrier_done.zero_()
 
         # Launch kernel
-        persistent_fused_allreduce_rmsnorm_row_quant_two_shot[(COMM_SMS,)](
+        def grid(META):
+            return (COMM_SMS,)
+
+        persistent_fused_allreduce_rmsnorm_2d_quant_two_shot[grid](
             iris_input,
             quant_heap,
             scale_heap,
@@ -758,8 +775,6 @@ class IrisTwoshot2dHipblasltManager:
             num_xcds,
             CHUNK_SIZE,
             DISTRIBUTION,
-            num_warps=NUM_WARPS,
-            num_stages=NUM_STAGES,
             waves_per_eu=WAVES_PER_EU,
         )
 

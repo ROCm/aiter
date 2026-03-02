@@ -34,7 +34,6 @@ CUDA graph compatibility:
 """
 
 import logging
-import os
 from typing import Any, Optional, Tuple
 
 import iris
@@ -42,103 +41,160 @@ import torch
 import triton
 import triton.language as tl
 
-from .iris_twoshot_allreduce import (
-    _compute_chunk_size,
-    _inlined_device_barrier,
-    chiplet_transform_chunked,
-    extract_group_info,
-)
-
 __all__ = ["fused_allreduce_add_rms_row_quant_gemm_iris_twoshot_hipblaslt"]
 
 logger = logging.getLogger(__name__)
 
-AUTOTUNE = False
-if AUTOTUNE:
-    os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
+
+# ============================================================================
+# Utilities (inlined from iris.ccl.utils and iris._distributed_helpers)
+# ============================================================================
 
 
-IRIS_TWOSHOT_ROW_HIPBLASLT_AUTOTUNE_KEYS = [
-    "M",
-    "N",
-    "HAS_RESIDUAL",
-]
+def _compute_chunk_size(
+    comm_sms: int, num_xcds: int, swizzle_size: int = 4
+) -> int:
+    chunk = swizzle_size * swizzle_size
+    return min(chunk, comm_sms // num_xcds)
 
 
-def _get_iris_twoshot_row_hipblaslt_configs(autotune: bool):
-    """Generate autotune configs for the comm-only kernel."""
-    num_xcds = iris.hip.get_num_xcc()
+def extract_group_info(
+    shmem: Any,
+) -> Tuple[int, int, int, int, int]:
+    """Extract rank/group info from iris shmem context.
 
-    if not autotune:
-        comm_sms = 128
-        return [
-            triton.Config(
-                {
-                    "COMM_SMS": comm_sms,
-                    "NUM_XCDS": num_xcds,
-                    "CHUNK_SIZE": _compute_chunk_size(comm_sms, num_xcds),
-                    "waves_per_eu": 1,
-                },
-                num_warps=16,
-                num_stages=2,
-            )
-        ]
+    Returns: (rank_in_group, rank_global, world_size, rank_start, rank_stride)
+    """
+    rank_global = shmem.get_rank()
+    rank_in_group = rank_global
+    world_size = shmem.get_num_ranks()
+    rank_start = 0
+    rank_stride = 1
+    return rank_in_group, rank_global, world_size, rank_start, rank_stride
 
-    configs = []
-    COMM_SMS_OPTIONS = [64, 128]
-    NUM_WARPS_OPTIONS = [4, 16]
-    NUM_STAGES_OPTIONS = [2]
-    WAVES_PER_EU_OPTIONS = [1]
-    for sms in COMM_SMS_OPTIONS:
-        chunk = _compute_chunk_size(sms, num_xcds)
-        for nw in NUM_WARPS_OPTIONS:
-            for ns in NUM_STAGES_OPTIONS:
-                for waves in WAVES_PER_EU_OPTIONS:
-                    configs.append(
-                        triton.Config(
-                            {
-                                "COMM_SMS": sms,
-                                "NUM_XCDS": num_xcds,
-                                "CHUNK_SIZE": chunk,
-                                "waves_per_eu": waves,
-                            },
-                            num_stages=ns,
-                            num_warps=nw,
-                        )
+
+@triton.jit()
+def chiplet_transform_chunked(
+    pid,
+    num_workgroups: tl.constexpr,
+    num_xcds: tl.constexpr,
+    chunk_size: tl.constexpr,
+):
+    """Redistribute workgroups across XCDs in chunks."""
+    if pid > (num_workgroups // (num_xcds * chunk_size)) * (
+        num_xcds * chunk_size
+    ):
+        return pid
+
+    local_pid = pid // num_xcds
+    chunk_idx = local_pid // chunk_size
+    pos_in_chunk = local_pid % chunk_size
+
+    xcd = pid % num_xcds
+    new_pid = (
+        chunk_idx * num_xcds * chunk_size + xcd * chunk_size + pos_in_chunk
+    )
+    return new_pid
+
+
+@triton.jit
+def _translate_ptr(ptr, from_rank, to_rank, heap_bases):
+    """Translate a pointer from one rank's address space to another's."""
+    from_base = tl.load(heap_bases + from_rank)
+    to_base = tl.load(heap_bases + to_rank)
+    offset = tl.cast(ptr, tl.uint64) - from_base
+    translated_ptr = tl.cast(
+        tl.cast(to_base, tl.pointer_type(tl.int8)) + offset, ptr.dtype
+    )
+    return translated_ptr
+
+
+@triton.jit
+def _inlined_device_barrier(
+    raw_pid,
+    barrier_flags_ptr,
+    barrier_epoch_ptr,
+    barrier_done_ptr,
+    heap_bases: tl.tensor,
+    iris_rank: tl.constexpr,
+    world_size: tl.constexpr,
+    rank_start: tl.constexpr,
+    rank_stride: tl.constexpr,
+):
+    """Cross-rank device barrier for use inside persistent kernels.
+
+    CTA 0 signals own readiness, polls remote ranks, then signals
+    other CTAs via barrier_done_ptr. Epoch is self-advancing for
+    CUDA graph compatibility.
+    """
+    barrier_epoch = tl.load(barrier_epoch_ptr)
+    target_epoch = barrier_epoch + 1
+
+    if raw_pid == 0:
+        own_flag_ptr = barrier_flags_ptr + iris_rank
+        own_translated = _translate_ptr(
+            own_flag_ptr, iris_rank, iris_rank, heap_bases
+        )
+        tl.atomic_xchg(own_translated, target_epoch, sem="release", scope="sys")
+
+        for i in range(world_size):
+            remote_rank = rank_start + i * rank_stride
+            if remote_rank != iris_rank:
+                remote_flag_ptr = barrier_flags_ptr + remote_rank
+                remote_translated = _translate_ptr(
+                    remote_flag_ptr, iris_rank, remote_rank, heap_bases
+                )
+                while (
+                    tl.atomic_cas(
+                        remote_translated,
+                        target_epoch,
+                        target_epoch,
+                        sem="acquire",
+                        scope="sys",
                     )
-    return configs
+                    != target_epoch
+                ):
+                    pass
 
-
-iris_twoshot_row_hipblaslt_autotune_configs = (
-    _get_iris_twoshot_row_hipblaslt_configs(AUTOTUNE)
-)
+        tl.store(barrier_epoch_ptr, target_epoch)
+        tl.atomic_add(barrier_done_ptr, 1, sem="release")
+    else:
+        while tl.atomic_add(barrier_done_ptr, 0, sem="acquire") < 1:
+            pass
 
 
 # ============================================================================
-# Fused two-shot AllReduce + RMSNorm + per-row FP8 Quant kernel
+# Autotune configs (shared with iris_twoshot_2d_hipblaslt_allreduce.py)
+# ============================================================================
+
+FUSED_ALLREDUCE_AUTOTUNE_CONFIGS = [
+    triton.Config({}, num_warps=16, num_stages=2),  # best for 1D
+    triton.Config({}, num_warps=8, num_stages=1),   # best for 2D
+]
+
+
+# ============================================================================
+# Fused two-shot AllReduce + RMSNorm + per-row FP8 Quant kernel (1D row)
 # (Communication only — no GEMM. GEMM is done via torch._scaled_mm.)
 # ============================================================================
 
 
 @triton.autotune(
-    configs=iris_twoshot_row_hipblaslt_autotune_configs,
-    key=IRIS_TWOSHOT_ROW_HIPBLASLT_AUTOTUNE_KEYS,
+    configs=FUSED_ALLREDUCE_AUTOTUNE_CONFIGS,
+    key=["M", "N"],
     use_cuda_graph=True,
 )
 @triton.jit
-def fused_twoshot_allreduce_rmsnorm_row_quant_kernel(
-    # Input (in symmetric heap for iris.load)
+def persistent_fused_allreduce_rmsnorm_row_quant_two_shot(
+    # Symmetric heap buffers
     input_ptr,
-    # FP8 quant heap (in symmetric heap for FP8 broadcast)
     quant_heap_ptr,
-    # Scale heap (in symmetric heap for per-row scale broadcast)
     scale_heap_ptr,
-    # Outputs (regular GPU memory)
+    # Regular GPU memory
     result_out_ptr,
-    # Inlined device barrier state (symmetric heap)
+    # Inlined device barrier state
     barrier_flags_ptr,
     barrier_epoch_ptr,
-    # Inlined device barrier: CTA 0 -> other CTAs signal (local GPU memory)
     barrier_done_ptr,
     # Residual (regular GPU memory; dummy ptr when HAS_RESIDUAL=False)
     residual_in_ptr,
@@ -150,10 +206,10 @@ def fused_twoshot_allreduce_rmsnorm_row_quant_kernel(
     # Dimensions
     M,
     N,
-    # Input strides (iris heap buffer)
+    # Input strides
     stride_in_m,
     stride_in_n,
-    # Quant heap strides (iris heap buffer, FP8)
+    # Quant heap strides
     stride_qh_m,
     stride_qh_n,
     # Iris params
@@ -163,120 +219,157 @@ def fused_twoshot_allreduce_rmsnorm_row_quant_kernel(
     world_size: tl.constexpr,
     rank_start: tl.constexpr,
     rank_stride: tl.constexpr,
-    # Explicit kernel params
+    # Tile params
     BLOCK_SIZE_N: tl.constexpr,
+    ACTUAL_N: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
-    # Autotuned params (from config)
+    PADDED_N: tl.constexpr,
     COMM_SMS: tl.constexpr,
     NUM_XCDS: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
+    DISTRIBUTION: tl.constexpr,
 ):
-    """Fused two-shot AllReduce + RMSNorm + per-row FP8 quant.
+    """Fused two-shot AllReduce + RMSNorm + per-row FP8 quant (1D row).
 
-    Communication-only kernel: performs allreduce, rmsnorm, per-row FP8
-    quantization, and FP8 broadcast via the iris symmetric heap. No GEMM.
-    After this kernel completes, quant_heap contains the complete (M, N)
-    FP8 matrix and scale_heap contains per-row scales for ALL rows.
+    Each rank reduces its assigned rows, applies RMSNorm + per-row FP8
+    quant, then broadcasts the FP8 result and scales to all peers.
+    Uses fast/slow path: when PADDED_N is False, column masking is
+    eliminated entirely.
     """
-    raw_pid = tl.program_id(0)
-    pid = raw_pid
+    pid = tl.program_id(0)
 
-    if NUM_XCDS != 1:
-        pid = chiplet_transform_chunked(raw_pid, COMM_SMS, NUM_XCDS, CHUNK_SIZE)
+    # Row distribution across ranks
+    rows_per_rank = tl.cdiv(M, world_size)
+    if DISTRIBUTION == 0:
+        my_start = group_rank
+        stride = world_size
+        remaining = M - my_start
+        remaining = tl.maximum(remaining, 0)
+        max_row_offset = tl.cdiv(remaining, stride)
+    else:
+        my_start = group_rank * rows_per_rank
+        stride = 1
+        remaining = M - my_start
+        remaining = tl.maximum(remaining, 0)
+        max_row_offset = tl.minimum(rows_per_rank, remaining)
 
     cols = tl.arange(0, BLOCK_SIZE_N)
-    col_mask = cols < N
 
-    rms_w = tl.load(
-        rms_weight_ptr + cols, mask=col_mask, other=0.0
-    ).to(tl.float32)
+    # Load RMSNorm weights
+    if PADDED_N:
+        rms_w = tl.load(
+            rms_weight_ptr + cols, mask=cols < ACTUAL_N, other=0.0
+        ).to(tl.float32)
+    else:
+        rms_w = tl.load(rms_weight_ptr + cols).to(tl.float32)
 
-    # ================================================================
-    # Step 1: Two-shot AllReduce + fused RMSNorm + quant + FP8 broadcast
-    # ================================================================
+    # Persistent traversal over this rank's assigned rows
+    for row_offset in range(pid, max_row_offset, COMM_SMS):
+        row = my_start + row_offset * stride
 
-    # Block distribution of rows across ranks
-    rows_per_rank = tl.cdiv(M, world_size)
-    my_start = group_rank * rows_per_rank
-    my_end = tl.minimum(my_start + rows_per_rank, M)
-
-    for row in range(my_start + pid, my_end, COMM_SMS):
         in_offset = row * stride_in_m + cols * stride_in_n
         qh_offset = row * stride_qh_m + cols * stride_qh_n
         out_offset = row * N + cols
 
-        # Gather from all ranks and reduce, with inline residual pre-add
-        acc = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
-        for i in tl.static_range(0, world_size):
-            remote_rank = rank_start + i * rank_stride
-            val = iris.load(
-                input_ptr + in_offset,
-                iris_rank,
-                remote_rank,
-                heap_bases,
-                mask=col_mask,
-            ).to(tl.float32)
-            # Pre-add residual for this rank's own partial
-            if HAS_RESIDUAL and remote_rank == iris_rank:
-                res_in = tl.load(
-                    residual_in_ptr + out_offset, mask=col_mask, other=0.0
-                ).to(tl.float32)
-                val = val + res_in
-            acc += val
+        if PADDED_N:
+            # ---- Slow path: masked (N not power of 2) ----
+            col_mask = cols < ACTUAL_N
 
-        # Store BF16 result residual_out for downstream
-        tl.store(
-            result_out_ptr + out_offset,
-            acc.to(result_out_ptr.type.element_ty),
-            mask=col_mask,
-        )
-
-        # RMSNorm
-        sq_sum = tl.sum(acc * acc, axis=0)
-        rrms = tl.rsqrt(sq_sum / N + rms_eps)
-        normed = acc * rrms * rms_w
-
-        # Per-row scale and quantize
-        row_amax = tl.max(tl.abs(normed), axis=0)
-        row_amax = tl.maximum(row_amax, 1e-12)
-        scale = row_amax / fp8_max
-
-        quantized = (normed / scale).to(quant_heap_ptr.type.element_ty)
-
-        # Store FP8 to heap and broadcast to all peers
-        tl.store(
-            quant_heap_ptr + qh_offset,
-            quantized,
-            mask=col_mask,
-        )
-        # Store scale to heap
-        tl.store(scale_heap_ptr + row, scale)
-
-        for i in tl.static_range(0, world_size):
-            remote_rank = rank_start + i * rank_stride
-            if remote_rank != iris_rank:
-                iris.store(
-                    quant_heap_ptr + qh_offset,
-                    quantized,
-                    iris_rank,
-                    remote_rank,
-                    heap_bases,
+            acc = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
+            for i in tl.static_range(0, world_size):
+                remote_rank = rank_start + i * rank_stride
+                val = iris.load(
+                    input_ptr + in_offset,
+                    iris_rank, remote_rank, heap_bases,
                     mask=col_mask,
                 )
-                iris.store(
-                    scale_heap_ptr + row,
-                    scale,
-                    iris_rank,
-                    remote_rank,
-                    heap_bases,
+                acc += val.to(tl.float32)
+                if HAS_RESIDUAL and remote_rank == iris_rank:
+                    res_in = tl.load(
+                        residual_in_ptr + out_offset, mask=col_mask, other=0.0
+                    ).to(tl.float32)
+                    acc += res_in
+
+            tl.store(
+                result_out_ptr + out_offset,
+                acc.to(result_out_ptr.type.element_ty),
+                mask=col_mask,
+            )
+
+            sq_sum = tl.sum(acc * acc, axis=0)
+            rrms = tl.rsqrt(sq_sum / N + rms_eps)
+            normed = acc * rrms * rms_w
+
+            row_amax = tl.max(tl.abs(normed), axis=0)
+            row_amax = tl.maximum(row_amax, 1e-12)
+            scale = row_amax / fp8_max
+
+            quantized = (normed / scale).to(quant_heap_ptr.type.element_ty)
+
+            tl.store(quant_heap_ptr + qh_offset, quantized, mask=col_mask)
+            tl.store(scale_heap_ptr + row, scale)
+
+            for i in tl.static_range(0, world_size):
+                remote_rank = rank_start + i * rank_stride
+                if remote_rank != iris_rank:
+                    iris.store(
+                        quant_heap_ptr + qh_offset, quantized,
+                        iris_rank, remote_rank, heap_bases,
+                        mask=col_mask,
+                    )
+                    iris.store(
+                        scale_heap_ptr + row, scale,
+                        iris_rank, remote_rank, heap_bases,
+                    )
+        else:
+            # ---- Fast path: no column masks (N is power of 2) ----
+            acc = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
+            for i in tl.static_range(0, world_size):
+                remote_rank = rank_start + i * rank_stride
+                val = iris.load(
+                    input_ptr + in_offset,
+                    iris_rank, remote_rank, heap_bases,
                 )
+                acc += val.to(tl.float32)
+                if HAS_RESIDUAL and remote_rank == iris_rank:
+                    res_in = tl.load(
+                        residual_in_ptr + out_offset
+                    ).to(tl.float32)
+                    acc += res_in
 
-    # ================================================================
-    # Step 2: Cross-rank device barrier
-    # ================================================================
+            tl.store(
+                result_out_ptr + out_offset,
+                acc.to(result_out_ptr.type.element_ty),
+            )
 
+            sq_sum = tl.sum(acc * acc, axis=0)
+            rrms = tl.rsqrt(sq_sum / N + rms_eps)
+            normed = acc * rrms * rms_w
+
+            row_amax = tl.max(tl.abs(normed), axis=0)
+            row_amax = tl.maximum(row_amax, 1e-12)
+            scale = row_amax / fp8_max
+
+            quantized = (normed / scale).to(quant_heap_ptr.type.element_ty)
+
+            tl.store(quant_heap_ptr + qh_offset, quantized)
+            tl.store(scale_heap_ptr + row, scale)
+
+            for i in tl.static_range(0, world_size):
+                remote_rank = rank_start + i * rank_stride
+                if remote_rank != iris_rank:
+                    iris.store(
+                        quant_heap_ptr + qh_offset, quantized,
+                        iris_rank, remote_rank, heap_bases,
+                    )
+                    iris.store(
+                        scale_heap_ptr + row, scale,
+                        iris_rank, remote_rank, heap_bases,
+                    )
+
+    # ---- Cross-rank device barrier ----
     _inlined_device_barrier(
-        raw_pid,
+        tl.program_id(0),
         barrier_flags_ptr,
         barrier_epoch_ptr,
         barrier_done_ptr,
@@ -607,17 +700,26 @@ class IrisTwoshotRowHipblasltManager:
         )
         heap_bases = shmem.get_heap_bases()
 
+        # ---- Tunable parameters ----
+        # num_warps and num_stages are in FUSED_ALLREDUCE_AUTOTUNE_CONFIGS
+        num_xcds = iris.hip.get_num_xcc()
         BLOCK_SIZE_N = triton.next_power_of_2(N)
+        ACTUAL_N = N
+        PADDED_N = (BLOCK_SIZE_N != N)
+        DISTRIBUTION = 1       # 0=striding, 1=block
+        COMM_SMS = 128
+        CHUNK_SIZE = _compute_chunk_size(COMM_SMS, num_xcds)
+        # ---- End tunable parameters ----
 
         # Reset sync buffer before kernel launch
         assert self._barrier_done is not None
         self._barrier_done.zero_()
 
+        # Launch kernel
         def grid(META):
-            return (META["COMM_SMS"],)
+            return (COMM_SMS,)
 
-        # Step 1+2: Triton kernel for allreduce + rmsnorm + quant + barrier
-        fused_twoshot_allreduce_rmsnorm_row_quant_kernel[grid](
+        persistent_fused_allreduce_rmsnorm_row_quant_two_shot[grid](
             iris_input,
             quant_heap,
             scale_heap,
@@ -647,9 +749,15 @@ class IrisTwoshotRowHipblasltManager:
             world_size,
             rank_start,
             rank_stride,
-            # Explicit constexprs
+            # Tile params
             BLOCK_SIZE_N,
-            residual is not None,
+            ACTUAL_N,
+            residual is not None,  # HAS_RESIDUAL
+            PADDED_N,
+            COMM_SMS,
+            num_xcds,
+            CHUNK_SIZE,
+            DISTRIBUTION,
         )
 
         # Step 3: hipBLASLt GEMM via torch._scaled_mm
