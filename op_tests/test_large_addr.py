@@ -214,6 +214,8 @@ def get_test_params_for_kernel(config, large_q=False):
     else:
         causal_type = None
     
+    bf16_cvt = int(config['bf16_cvt'])  # 0=RTNE, 1=RTNA, 2=RTZ, 3=FP16(n/a)
+    
     # deterministic=False is required to use ASM backend kernels
     # atomic32 field determines a16 vs a32 kernel via is_v3_atomic_fp32 flag
     # is_v3_atomic_fp32: True=A32 kernel, False=A16 kernel
@@ -252,7 +254,11 @@ def get_test_params_for_kernel(config, large_q=False):
     #     seqlen_q = seqlen
     #     seqlen_k = seqlen
     # elif 
-    if large_q:
+    if large_q is None:
+        # Normal case: baseline correctness test with small seqlens
+        seqlen_q = 256
+        seqlen_k = 256
+    elif large_q:
         # Large seqlen_q: tests Q/dO/dQ/ODO address overflow
         seqlen_q = 75600
         seqlen_k = 256
@@ -277,6 +283,7 @@ def get_test_params_for_kernel(config, large_q=False):
         "dtype_str": dtype_str,
         "atomic32": atomic32,
         "is_v3_atomic_fp32": is_v3_atomic_fp32,  # True=A32, False=A16
+        "how_v3_bf16_cvt": bf16_cvt,  # 0=RTNE, 1=RTNA, 2=RTZ, 3=FP16
         "is_varlen": (mode == 1),  # group mode uses varlen API
     }
 
@@ -296,6 +303,7 @@ def run_mha_backward_test(
     test_name: str = "unknown",
     co_name: str = "",
     is_v3_atomic_fp32: bool = True,  # True=A32 kernel, False=A16 kernel
+    how_v3_bf16_cvt: int = 1,  # 0=RTNE, 1=RTNA, 2=RTZ
     **kwargs,
 ):
     """
@@ -320,7 +328,9 @@ def run_mha_backward_test(
     print(f"        causal={causal}, causal_type={causal_type}, deterministic={deterministic}")
     if is_swa:
         print(f"        window_size=({window_size[0]}, {window_size[1]}) (SWA mode)")
+    cvt_names = {0: "RTNE", 1: "RTNA", 2: "RTZ", 3: "FP16"}
     print(f"        is_v3_atomic_fp32={is_v3_atomic_fp32} ({'A32' if is_v3_atomic_fp32 else 'A16'} kernel)")
+    print(f"        how_v3_bf16_cvt={how_v3_bf16_cvt} ({cvt_names.get(how_v3_bf16_cvt, '?')})")
     print(f"{'='*70}")
     
     device = "cuda"
@@ -346,7 +356,7 @@ def run_mha_backward_test(
                 deterministic,
                 return_lse=True,
                 return_attn_probs=True,  # Aligned with test_mha.py
-                how_v3_bf16_cvt=2,
+                how_v3_bf16_cvt=how_v3_bf16_cvt,
                 is_v3_atomic_fp32=is_v3_atomic_fp32,  # True=A32, False=A16
                 num_rotate_args=1,
             )
@@ -449,6 +459,7 @@ def run_mha_varlen_backward_test(
     test_name: str = "unknown",
     co_name: str = "",
     is_v3_atomic_fp32: bool = True,  # True=A32 kernel, False=A16 kernel
+    how_v3_bf16_cvt: int = 1,  # 0=RTNE, 1=RTNA, 2=RTZ
     **kwargs,
 ):
     """
@@ -467,7 +478,9 @@ def run_mha_varlen_backward_test(
     print(f"        causal={causal}, causal_type={causal_type}, deterministic={deterministic}")
     if is_swa:
         print(f"        window_size=({window_size[0]}, {window_size[1]}) (SWA mode)")
+    cvt_names = {0: "RTNE", 1: "RTNA", 2: "RTZ", 3: "FP16"}
     print(f"        is_v3_atomic_fp32={is_v3_atomic_fp32} ({'A32' if is_v3_atomic_fp32 else 'A16'} kernel)")
+    print(f"        how_v3_bf16_cvt={how_v3_bf16_cvt} ({cvt_names.get(how_v3_bf16_cvt, '?')})")
     print(f"{'='*70}")
     
     device = "cuda"
@@ -502,6 +515,7 @@ def run_mha_varlen_backward_test(
                 return_lse=True,
                 return_attn_probs=False,
                 deterministic=deterministic,
+                how_v3_bf16_cvt=how_v3_bf16_cvt,
                 is_v3_atomic_fp32=is_v3_atomic_fp32,  # True=A32, False=A16
             )
             
@@ -597,27 +611,35 @@ def run_mha_varlen_backward_test(
     }
 
 
-def run_all_tests(kernel_filter=None, large_q=False, large_k=False):
+def run_all_tests(kernel_filter=None, large_q=False, large_k=False, normal=False):
     """Run all kernel tests or a filtered subset.
     
     By default (no flags), runs BOTH large_q and large_k tests.
     Use --large-q or --large-k to run only one mode.
+    Use --normal to add a baseline correctness test with small seqlens (q=256, k=256).
     """
     print(f"\nRunning on: {get_device_arch()}")
     print(f"PyTorch version: {torch.__version__}")
     print(f"CUDA version: {torch.version.cuda}")
     
     # Determine which modes to run
-    if not large_q and not large_k:
-        # Default: run both
+    # large_q value in tuple: None=normal, True=large_q, False=large_k
+    any_specified = normal or large_q or large_k
+    if not any_specified:
+        # Default: run all three tests
         modes = [
+            (None,  "normal (q=256, k=256): baseline correctness test"),
             (False, "large_k (q=256, k=75600): tests K/V/dK/dV address overflow"),
             (True,  "large_q (q=75600, k=256): tests Q/dO/dQ/ODO address overflow"),
         ]
-    elif large_q:
-        modes = [(True, "large_q (q=75600, k=256): tests Q/dO/dQ/ODO address overflow")]
     else:
-        modes = [(False, "large_k (q=256, k=75600): tests K/V/dK/dV address overflow")]
+        modes = []
+        if normal:
+            modes.append((None, "normal (q=256, k=256): baseline correctness test"))
+        if large_k:
+            modes.append((False, "large_k (q=256, k=75600): tests K/V/dK/dV address overflow"))
+        if large_q:
+            modes.append((True, "large_q (q=75600, k=256): tests Q/dO/dQ/ODO address overflow"))
     
     configs = load_kernel_configs()
     
@@ -675,7 +697,9 @@ def run_all_tests(kernel_filter=None, large_q=False, large_k=False):
                 skipped += 1
                 continue
             
-            if cfg_pssk == 0:
+            if is_large_q is None:
+                suffix = "_normal"
+            elif cfg_pssk == 0:
                 suffix = "_equalSeqlen"
             elif is_large_q:
                 suffix = "_largeQ"
@@ -840,6 +864,12 @@ def main():
         action="store_true",
         help="Only test large seqlen_k (q=256, k=75600). Default runs both."
     )
+    parser.add_argument(
+        "--normal",
+        action="store_true",
+        help="Add baseline correctness test with small seqlens (q=256, k=256). "
+             "Use alone for normal-only, or combine with --large-q/--large-k."
+    )
     
     args = parser.parse_args()
     
@@ -848,7 +878,7 @@ def main():
     elif args.csv:
         show_csv()
     else:
-        run_all_tests(kernel_filter=args.kernel, large_q=args.large_q, large_k=args.large_k)
+        run_all_tests(kernel_filter=args.kernel, large_q=args.large_q, large_k=args.large_k, normal=args.normal)
 
 
 if __name__ == "__main__":

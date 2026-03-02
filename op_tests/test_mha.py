@@ -91,6 +91,7 @@ def run_ck(
     return_attn_probs=False,
     cu_seqlens_q=None,
     cu_seqlens_kv=None,
+    how_v3_bf16_cvt=1,
 ):
     (out, softmax_lse, S_dmask), us_fwd = run_perftest(
         aiter.flash_attn_func,
@@ -106,7 +107,7 @@ def run_ck(
         deterministic,
         return_lse=return_lse,
         return_attn_probs=return_attn_probs,
-        how_v3_bf16_cvt=2,
+        how_v3_bf16_cvt=how_v3_bf16_cvt,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_kv=cu_seqlens_kv,
         num_rotate_args=1,
@@ -213,6 +214,7 @@ def test_flash_attn_output(
     mha_type,
     dtype,
     input_layout,
+    how_v3_bf16_cvt=1,
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
@@ -302,6 +304,7 @@ def test_flash_attn_output(
         deterministic,
         return_lse,
         return_attn_probs,
+        how_v3_bf16_cvt=how_v3_bf16_cvt,
     )
 
     out_ref, softmax_lse_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
@@ -453,6 +456,7 @@ def flash_attn_output_benchmark(
     mha_type,
     dtype,
     input_layout,
+    how_v3_bf16_cvt=1,
 ):
     return test_flash_attn_output(
         batch_size,
@@ -469,6 +473,7 @@ def flash_attn_output_benchmark(
         mha_type,
         dtype,
         input_layout,
+        how_v3_bf16_cvt=how_v3_bf16_cvt,
     )
 
 
@@ -845,8 +850,19 @@ parser.add_argument(
     help="""input_layout.
     e.g.: -i BSHD""",
 )
+parser.add_argument(
+    "--bf16-cvt",
+    type=str,
+    choices=["rtne", "rtna", "rtz"],
+    default="rtna",
+    help="""BF16 conversion rounding mode (rtne=0, rtna=1, rtz=2). Default: rtna.
+    e.g.: --bf16-cvt rtz""",
+)
 if __name__ == "__main__":
     args = parser.parse_args()
+
+    bf16_cvt_map = {"rtne": 0, "rtna": 1, "rtz": 2}
+    how_v3_bf16_cvt = bf16_cvt_map[args.bf16_cvt]
 
     if args.causal is not None:
         l_causal = [args.causal]
@@ -883,6 +899,7 @@ if __name__ == "__main__":
             mha_type,
             dtypes.d_dtypes[dtype],
             args.input_layout,
+            how_v3_bf16_cvt=how_v3_bf16_cvt,
         )
         collected.append(ret)
         test_flash_attn_seq_padding(
