@@ -26,6 +26,9 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
 from aiter.utility import fp4_utils
 
+
+from aiter.ops.flydsl.utils import is_flydsl_available
+
 BLOCK_SIZE_M = 32
 
 _USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
@@ -626,6 +629,46 @@ class MOEMetadata:
     use_non_temporal_load: bool = True
 
 
+def _flydsl_stage2_wrapper(
+    inter_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    kernelName="",
+    w2_scale=None,
+    a2_scale=None,
+    sorted_weights=None,
+    **_kwargs,
+):
+
+    parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
+    if parsed is None:
+        raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
+    aiter.ops.flydsl.flydsl_moe_stage2(
+        inter_states=inter_states,
+        w2=w2,
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        out=out,
+        topk=topk,
+        tile_m=parsed["tile_m"],
+        tile_n=parsed["tile_n"],
+        tile_k=parsed["tile_k"],
+        a_dtype=parsed["a_dtype"],
+        b_dtype=parsed["b_dtype"],
+        out_dtype=parsed["out_dtype"],
+        mode=parsed.get("mode", "atomic"),
+        w2_scale=w2_scale,
+        a2_scale=a2_scale,
+        sorted_weights=sorted_weights,
+    )
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -644,28 +687,53 @@ def get_2stage_cfgs(
     intermediate_pad,
     is_shuffled=True,
 ):
+    _INDEX_COLS = [
+        "cu_num",
+        "token",
+        "model_dim",
+        "inter_dim",
+        "expert",
+        "topk",
+        "act_type",
+        "dtype",
+        "q_dtype_a",
+        "q_dtype_w",
+        "q_type",
+        "use_g1u1",
+        "doweight_stage1",
+    ]
+
     def get_cfg_2stages(tune_file):
         import pandas as pd
 
-        cfg_2stages = pd.read_csv(tune_file)
-        cfg_2stages = cfg_2stages.set_index(
-            [
-                "cu_num",
-                "token",
-                "model_dim",
-                "inter_dim",
-                "expert",
-                "topk",
-                "act_type",
-                "dtype",
-                "q_dtype_a",
-                "q_dtype_w",
-                "q_type",
-                "use_g1u1",
-                "doweight_stage1",
-            ]
-        ).to_dict("index")
-        return cfg_2stages
+        df = pd.read_csv(tune_file)
+        if "_tag" in df.columns:
+            df = df[df["_tag"].fillna("") == ""]
+        df = df.set_index(_INDEX_COLS).to_dict("index")
+        return df
+
+    _flydsl_fallback_cache = {}
+
+    def get_flydsl_fallback_cfgs(tune_file):
+        """Return fallback configs (rows tagged ``flydsl_fallback``)."""
+        if tune_file in _flydsl_fallback_cache:
+            return _flydsl_fallback_cache[tune_file]
+        import pandas as pd
+
+        if not os.path.exists(tune_file):
+            _flydsl_fallback_cache[tune_file] = {}
+            return {}
+        df = pd.read_csv(tune_file)
+        if "_tag" not in df.columns:
+            _flydsl_fallback_cache[tune_file] = {}
+            return {}
+        fb_df = df[df["_tag"] == "flydsl_fallback"]
+        if fb_df.empty:
+            _flydsl_fallback_cache[tune_file] = {}
+            return {}
+        result = fb_df.set_index(_INDEX_COLS).to_dict("index")
+        _flydsl_fallback_cache[tune_file] = result
+        return result
 
     global cfg_2stages
     config_path = os.path.dirname(AITER_CONFIGS.AITER_CONFIG_FMOE_FILE)
@@ -736,6 +804,24 @@ def get_2stage_cfgs(
         cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
+    if cfg is not None and not is_flydsl_available():
+        kn1 = str(cfg.get("kernelName1", ""))
+        kn2 = str(cfg.get("kernelName2", ""))
+        if kn1.startswith("flydsl_") or kn2.startswith("flydsl_"):
+            fallback_cfgs = get_flydsl_fallback_cfgs(tune_file)
+            fallback = fallback_cfgs.get(keys)
+            if fallback is not None:
+                cfg = fallback
+                logger.info(
+                    f"[fused_moe] flydsl unavailable, using fallback config for {keys}"
+                )
+            else:
+                cfg = None
+                logger.warning(
+                    f"[fused_moe] flydsl unavailable and no fallback for {keys}, "
+                    "using default heuristics"
+                )
+
     use_non_temporal_load = False
     if cfg is None or int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")):
         ksplit = 0
@@ -877,6 +963,19 @@ def get_2stage_cfgs(
             ]
         )
     ):
+        if kernelName2 and kernelName2.startswith("flydsl_") and is_flydsl_available():
+            stage2_func = functools.partial(
+                _flydsl_stage2_wrapper,
+                kernelName=kernelName2,
+            )
+        else:
+            stage2_func = functools.partial(
+                aiter.ck_moe_stage2_fwd,
+                kernelName=kernelName2,
+                activation=activation,
+                quant_type=q_type,
+                use_non_temporal_load=use_non_temporal_load,
+            )
         return MOEMetadata(
             functools.partial(
                 ck_moe_stage1,
@@ -887,13 +986,7 @@ def get_2stage_cfgs(
                 splitk=ksplit,
                 use_non_temporal_load=use_non_temporal_load,
             ),
-            functools.partial(
-                aiter.ck_moe_stage2_fwd,
-                kernelName=kernelName2,
-                activation=activation,
-                quant_type=q_type,
-                use_non_temporal_load=use_non_temporal_load,
-            ),
+            stage2_func,
             block_m,
             int(ksplit),
             run_1stage,
