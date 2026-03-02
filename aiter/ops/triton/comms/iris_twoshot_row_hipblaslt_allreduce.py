@@ -73,96 +73,6 @@ def extract_group_info(
     return rank_in_group, rank_global, world_size, rank_start, rank_stride
 
 
-@triton.jit()
-def chiplet_transform_chunked(
-    pid,
-    num_workgroups: tl.constexpr,
-    num_xcds: tl.constexpr,
-    chunk_size: tl.constexpr,
-):
-    """Redistribute workgroups across XCDs in chunks."""
-    if pid > (num_workgroups // (num_xcds * chunk_size)) * (
-        num_xcds * chunk_size
-    ):
-        return pid
-
-    local_pid = pid // num_xcds
-    chunk_idx = local_pid // chunk_size
-    pos_in_chunk = local_pid % chunk_size
-
-    xcd = pid % num_xcds
-    new_pid = (
-        chunk_idx * num_xcds * chunk_size + xcd * chunk_size + pos_in_chunk
-    )
-    return new_pid
-
-
-@triton.jit
-def _translate_ptr(ptr, from_rank, to_rank, heap_bases):
-    """Translate a pointer from one rank's address space to another's."""
-    from_base = tl.load(heap_bases + from_rank)
-    to_base = tl.load(heap_bases + to_rank)
-    offset = tl.cast(ptr, tl.uint64) - from_base
-    translated_ptr = tl.cast(
-        tl.cast(to_base, tl.pointer_type(tl.int8)) + offset, ptr.dtype
-    )
-    return translated_ptr
-
-
-@triton.jit
-def _inlined_device_barrier(
-    raw_pid,
-    barrier_flags_ptr,
-    barrier_epoch_ptr,
-    barrier_done_ptr,
-    heap_bases: tl.tensor,
-    iris_rank: tl.constexpr,
-    world_size: tl.constexpr,
-    rank_start: tl.constexpr,
-    rank_stride: tl.constexpr,
-):
-    """Cross-rank device barrier for use inside persistent kernels.
-
-    CTA 0 signals own readiness, polls remote ranks, then signals
-    other CTAs via barrier_done_ptr. Epoch is self-advancing for
-    CUDA graph compatibility.
-    """
-    barrier_epoch = tl.load(barrier_epoch_ptr)
-    target_epoch = barrier_epoch + 1
-
-    if raw_pid == 0:
-        own_flag_ptr = barrier_flags_ptr + iris_rank
-        own_translated = _translate_ptr(
-            own_flag_ptr, iris_rank, iris_rank, heap_bases
-        )
-        tl.atomic_xchg(own_translated, target_epoch, sem="release", scope="sys")
-
-        for i in range(world_size):
-            remote_rank = rank_start + i * rank_stride
-            if remote_rank != iris_rank:
-                remote_flag_ptr = barrier_flags_ptr + remote_rank
-                remote_translated = _translate_ptr(
-                    remote_flag_ptr, iris_rank, remote_rank, heap_bases
-                )
-                while (
-                    tl.atomic_cas(
-                        remote_translated,
-                        target_epoch,
-                        target_epoch,
-                        sem="acquire",
-                        scope="sys",
-                    )
-                    != target_epoch
-                ):
-                    pass
-
-        tl.store(barrier_epoch_ptr, target_epoch)
-        tl.atomic_add(barrier_done_ptr, 1, sem="release")
-    else:
-        while tl.atomic_add(barrier_done_ptr, 0, sem="acquire") < 1:
-            pass
-
-
 # ============================================================================
 # Fused two-shot AllReduce + RMSNorm + per-row FP8 Quant kernel (1D row)
 # (Communication only — no GEMM. GEMM is done via torch._scaled_mm.)
@@ -177,10 +87,6 @@ def persistent_fused_allreduce_rmsnorm_row_quant_two_shot(
     scale_heap_ptr,
     # Regular GPU memory
     result_out_ptr,
-    # Inlined device barrier state
-    barrier_flags_ptr,
-    barrier_epoch_ptr,
-    barrier_done_ptr,
     # Residual (regular GPU memory; dummy ptr when HAS_RESIDUAL=False)
     residual_in_ptr,
     # RMSNorm weight
@@ -352,18 +258,8 @@ def persistent_fused_allreduce_rmsnorm_row_quant_two_shot(
                         iris_rank, remote_rank, heap_bases,
                     )
 
-    # ---- Cross-rank device barrier ----
-    _inlined_device_barrier(
-        tl.program_id(0),
-        barrier_flags_ptr,
-        barrier_epoch_ptr,
-        barrier_done_ptr,
-        heap_bases,
-        iris_rank,
-        world_size,
-        rank_start,
-        rank_stride,
-    )
+    # No device-side barrier needed: NCCL barrier on host ensures
+    # all ranks have copied input to heap before kernel launch.
 
 
 # ============================================================================
@@ -415,10 +311,8 @@ class IrisTwoshotRowHipblasltManager:
         # Pre-allocated output buffers (regular GPU memory)
         self._out_result: Optional[torch.Tensor] = None
 
-        # Inlined device barrier state
-        self._barrier_flags: Any = None  # on symmetric heap
-        self._barrier_epoch: Optional[torch.Tensor] = None
-        self._barrier_done: Optional[torch.Tensor] = None  # local GPU memory
+        # NCCL barrier buffer (1-element tensor for pre-kernel sync)
+        self._nccl_barrier_buf: Optional[torch.Tensor] = None
 
     def initialize(self, heap_size: Optional[int] = None) -> None:
         """Initialize Iris symmetric heap (call once at startup)."""
@@ -442,13 +336,6 @@ class IrisTwoshotRowHipblasltManager:
         )
 
         self._shmem = iris.iris(self._heap_size)
-
-        # Allocate barrier flags on symmetric heap (one int32 per rank)
-        num_ranks = self._shmem.get_num_ranks()
-        self._barrier_flags = self._shmem.zeros(
-            (num_ranks,), dtype=torch.int32
-        )
-        self._shmem.device_barrier()
 
         logger.info(
             f"Iris (twoshot-row-hipblaslt) initialized successfully "
@@ -589,9 +476,8 @@ class IrisTwoshotRowHipblasltManager:
             or M > self._out_result.shape[0]
             or N != self._out_result.shape[1]
         )
-        need_barrier = self._barrier_done is None
 
-        if need_result or need_barrier:
+        if need_result:
             if torch.cuda.is_current_stream_capturing():
                 existing_M = (
                     self._out_result.shape[0]
@@ -604,18 +490,9 @@ class IrisTwoshotRowHipblasltManager:
                     f"during CUDA graph capture."
                 )
 
-            if need_result:
-                self._out_result = torch.empty(
-                    (M, N), dtype=dtype, device=device,
-                )
-
-            if need_barrier:
-                self._barrier_done = torch.zeros(
-                    1, dtype=torch.int32, device=device
-                )
-                self._barrier_epoch = torch.zeros(
-                    1, dtype=torch.int32, device=device
-                )
+            self._out_result = torch.empty(
+                (M, N), dtype=dtype, device=device,
+            )
 
             cur_rank = (
                 torch.distributed.get_rank()
@@ -676,6 +553,17 @@ class IrisTwoshotRowHipblasltManager:
         # Copy input to symmetric heap
         iris_input.copy_(input_tensor)
 
+        # NCCL barrier: ensures all ranks have copied input to heap
+        # before any rank's kernel starts reading from peers.
+        # Uses a 1-element allreduce (graph-capture-safe via NCCL).
+        if self._nccl_barrier_buf is None:
+            self._nccl_barrier_buf = torch.zeros(
+                1, dtype=torch.int32, device=device
+            )
+        torch.distributed.all_reduce(
+            self._nccl_barrier_buf, op=torch.distributed.ReduceOp.SUM
+        )
+
         # FP8 max value
         fp8_max = torch.finfo(quant_dtype).max
 
@@ -698,20 +586,12 @@ class IrisTwoshotRowHipblasltManager:
         WAVES_PER_EU = 1
         # ---- End tunable parameters ----
 
-        # Reset sync buffer before kernel launch
-        assert self._barrier_done is not None
-        self._barrier_done.zero_()
-
         # Launch kernel
         persistent_fused_allreduce_rmsnorm_row_quant_two_shot[(COMM_SMS,)](
             iris_input,
             quant_heap,
             scale_heap,
             result_out,
-            # Barrier
-            self._barrier_flags,
-            self._barrier_epoch,
-            self._barrier_done,
             # Residual
             residual if residual is not None else input_tensor,
             # RMSNorm
