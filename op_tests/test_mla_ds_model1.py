@@ -319,6 +319,63 @@ def ref_sparse_attn_decode(
     )  # output: (b,s_q,h_q,d_v), lse: (b,h_q,s_q)
 
 
+@perftest(num_iters=TEST_NUM_ITERS)
+def ref_native_attn_decode(
+    q: torch.Tensor,                    # (batch, s_q, h_q, d) bf16
+    kv_cache: torch.Tensor,             # (num_page, block_size, h_kv, d) bf16
+    kv_indptr: torch.Tensor,            # (batch + 1,) int32, cumulative page counts
+    kv_indices: torch.Tensor,           # (total_pages,) int32, page indices
+    kv_last_page_lens: torch.Tensor,    # (batch,) int32, valid tokens in last page
+    sm_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch, s_q, h_q, d = q.shape
+    _, block_size, h_kv, _ = kv_cache.shape
+    d_v = d
+
+    outputs = []
+    lses = []
+
+    for b in range(batch):
+        page_start = kv_indptr[b].item()
+        page_end = kv_indptr[b + 1].item()
+        num_pages_b = page_end - page_start
+
+        if num_pages_b == 0:
+            outputs.append(
+                torch.zeros(s_q, h_q, d_v, dtype=torch.float32, device=q.device)
+            )
+            lses.append(
+                torch.full((s_q, h_q), float("+inf"), dtype=torch.float32, device=q.device)
+            )
+            continue
+
+        page_ids = kv_indices[page_start:page_end]
+        kv_pages = kv_cache[page_ids]               # (num_pages_b, block_size, h_kv, d)
+        kv_flat = kv_pages.reshape(-1, h_kv, d)      # (num_pages_b * block_size, h_kv, d)
+
+        last_page_len = kv_last_page_lens[b].item()
+        total_tokens = (num_pages_b - 1) * block_size + last_page_len
+        kv_b = kv_flat[:total_tokens].float()         # (seq_len_k, h_kv, d)
+
+        kv_b = kv_b.expand(-1, h_q, -1)              # (seq_len_k, h_q, d)
+        q_b = q[b].float()                            # (s_q, h_q, d)
+
+        attn_weight = torch.einsum("shd,khd->shk", q_b, kv_b) * sm_scale
+        lse = attn_weight.logsumexp(dim=-1)           # (s_q, h_q)
+        attn_weight = torch.exp(attn_weight - lse.unsqueeze(-1))
+
+        v_b = kv_b[..., :d_v]
+        output = torch.einsum("shk,khv->shv", attn_weight, v_b)
+
+        outputs.append(output)
+        lses.append(lse)
+
+    output = torch.stack(outputs, dim=0)
+    lse = torch.stack(lses, dim=0)
+
+    return output.to(dtypes.bf16), lse.transpose(1, 2).to(dtypes.bf16)
+
+
 def run_asm_sparse_attn_decode():
     pass
 
@@ -414,11 +471,18 @@ def test_sparse_attn_decode(
     q_nope_scale_buff, q_rope_buff = native_to_2buff_for_asm(q)
     kv_nope_scale_buff, kv_rope_buff = native_to_2buff_for_asm(native_kv_cache)
 
-    # 2. call reference implementation
-    """
-    refer: need use quantized kv cache.
-    """
-    ref_out, ref_lse = ref_sparse_attn_decode(
+    # 2. golden reference: native bf16 attention (no quantization)
+    (golden_out, golden_lse), golden_us = ref_native_attn_decode(
+        q,
+        native_kv_cache,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+        sm_scale,
+    )
+
+    # 3. reference with quantized kv cache (measures quant error)
+    (ref_out, ref_lse), ref_us = ref_sparse_attn_decode(
         q_nope_scale_buff,
         q_rope_buff,
         kv_nope_scale_buff,
@@ -429,7 +493,16 @@ def test_sparse_attn_decode(
         sm_scale,
     )
 
-    # 3. call asm implementation
+    # 4. compare golden vs ref
+    print(f"{golden_out=}")
+    print(f"{ref_out=}")
+    checkAllclose(golden_out, ref_out, msg="[golden vs ref] output")
+    print(f"{golden_lse=}")
+    print(f"{ref_lse=}")
+    checkAllclose(golden_lse, ref_lse, msg="[golden vs ref] lse")
+    print(f"golden_us={golden_us}, ref_us={ref_us}")
+
+    # 5. call asm implementation
     """
     ASM kernel memory layout:
         buffer1: (d_nope + scale + padding_to_512 ) = 512 bytes per token
