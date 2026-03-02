@@ -16,6 +16,3 @@ write_to = "aiter/_version.py"
 write_to_template = "__version__ = '{version}'\n"
 fallback_version = "0.1.0"
 
-[tool.black]
-# Avoid infinite traversal (CodeQL / CI can leave recursive _codeql_detected_source_root)
-extend-exclude = '_codeql_detected_source_root'
