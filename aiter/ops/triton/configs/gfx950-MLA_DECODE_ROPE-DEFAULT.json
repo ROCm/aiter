@@ -5,8 +5,7 @@
         "num_warps": 8,
         "num_stages": 3,
         "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
-        "kpack": 1
+        "matrix_instr_nonkdim": 16
     },
     "fwd_grouped_kernel_stage1_rope_fp32": {
         "BLOCK_N": 32,
@@ -14,13 +13,11 @@
         "num_warps": 8,
         "num_stages": 1,
         "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
-        "kpack": 1
+        "matrix_instr_nonkdim": 16
     },
     "fwd_kernel_stage2": {
         "num_stages": 2,
         "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
-        "kpack": 1
+        "matrix_instr_nonkdim": 16
     }
 }
