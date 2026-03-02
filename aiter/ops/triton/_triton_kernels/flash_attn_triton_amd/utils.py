@@ -58,7 +58,7 @@ RDNA_ARCHS = frozenset(
         "gfx1201",
     }
 )
-FP8_ARCHS = frozenset({"gfx942", "gfx950"})
+FP8_ARCHS = frozenset({"gfx942", "gfx950", "gfx1201"})
 
 _RECOMMENDED_FP8_REPLACEMENTS: dict[str, dict[torch.dtype, torch.dtype]] = {
     "gfx942": {
