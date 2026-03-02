@@ -261,7 +261,7 @@ FMoeKernel* get_heuristic_kernel(
     static std::unordered_map<std::string, std::unique_ptr<FMoeKernel>> impl_ptr_map;
 
     const char* vs_env_value = std::getenv("AITER_ENABLE_VSKIP");
-    if(vs_env_value != nullptr && std::string(vs_env_value) == "0")
+    if(vs_env_value == nullptr || std::string(vs_env_value) == "0")
         vskip = 0;
     if(selectedKl.empty())
     {
