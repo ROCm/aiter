@@ -297,10 +297,10 @@ def persistent_fused_allreduce_rmsnorm_row_quant_two_shot(
                     input_ptr + input_offset,
                     iris_rank, remote_rank, heap_bases,
                 )
+                acc += partial.to(tl.float32)
                 if HAS_RESIDUAL and remote_rank == iris_rank:
                     res_in = tl.load(residual_in_ptr + out_offset).to(tl.float32)
-                    partial = partial.to(tl.float32) + res_in
-                acc += partial.to(tl.float32)
+                    acc += res_in
 
             tl.store(
                 result_out_ptr + out_offset,
@@ -351,12 +351,12 @@ def persistent_fused_allreduce_rmsnorm_row_quant_two_shot(
                     iris_rank, remote_rank, heap_bases,
                     mask=mask,
                 )
+                acc += partial.to(tl.float32)
                 if HAS_RESIDUAL and remote_rank == iris_rank:
                     res_in = tl.load(
                         residual_in_ptr + out_offset, mask=mask, other=0.0
                     ).to(tl.float32)
-                    partial = partial.to(tl.float32) + res_in
-                acc += partial.to(tl.float32)
+                    acc += res_in
 
             tl.store(
                 result_out_ptr + out_offset,
