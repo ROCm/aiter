@@ -8,6 +8,7 @@ bf16,fp8,16,1,4,0,0,_ZN5aiter41mla_a16w8_qh16_m16x4_n16x1_coex0_mask1_psE,mla_a1
 fp8,fp8,16,1,1,0,0,_ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE,mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co
 fp8,fp8,16,1,2,0,0,_ZN5aiter36mla_a8w8_qh16_qseqlen2_gqaratio16_psE,mla_a8w8_qh16_qseqlen2_gqaratio16_ps.co
 fp8,fp8,16,1,4,0,0,_ZN5aiter36mla_a8w8_qh64_qseqlen4_gqaratio16_psE,mla_a8w8_qh64_qseqlen4_gqaratio16_ps.co
+fp8,fp8,64,1,4,0,0,_ZN5aiter36mla_a8w8_qh64_qseqlen4_gqaratio16_psE,mla_a8w8_qh64_qseqlen4_gqaratio16_ps.co
 fp8,fp8,16,0,1,0,0,_ZN5aiter33mla_a8w8_qh16_qseqlen1_gqaratio16E,mla_a8w8_qh16_qseqlen1_gqaratio16.co
 fp8,fp8,16,0,2,0,0,_ZN5aiter33mla_a8w8_qh16_qseqlen2_gqaratio16E,mla_a8w8_qh16_qseqlen2_gqaratio16.co
 fp8,fp8,16,0,4,0,0,_ZN5aiter33mla_a8w8_qh64_qseqlen4_gqaratio16E,mla_a8w8_qh64_qseqlen4_gqaratio16.co
