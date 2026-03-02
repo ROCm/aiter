@@ -1359,7 +1359,7 @@ def paged_attention_decode_sliding_window_head_1(
         CONTEXT_PARTITION_SIZE_PER_BLOCK,
     ):
         kv_block_start_idx2 = (
-            sequence_partition_idx
+            kv_block_start_idx
             + MAX_NUM_KV_BLOCKS_PER_COMPUTE * CONTEXT_PARTITION_SIZE_PER_BLOCK
         )
         # Prepare QK MFMA while key loads (these don't depend on key data)
