@@ -77,7 +77,7 @@ jobs:
           RUN pip show pybind11
 
           RUN rm -rf aiter \
-           && git clone ${{ env.GITHUB_REPO_URL }} \
+           && git clone ${{ env.GITHUB_REPO_URL }} aiter \
            && cd aiter \
            && git checkout ${{ env.GITHUB_COMMIT_SHA }} \
            && git submodule update --init --recursive \

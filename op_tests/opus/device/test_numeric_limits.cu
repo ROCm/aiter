@@ -4,23 +4,21 @@
 // Device test for opus::numeric_limits.
 // Single-thread kernel writes min/max/lowest/quiet_nan/infinity as uint32 bit patterns.
 
-#include <hip/hip_runtime.h>
+#ifdef __HIP_DEVICE_COMPILE__
+// ── Device pass ─────────────────────────────────────────────────────────────
 #include "opus/opus.hpp"
-#include "test_numeric_limits.h"
-
 using namespace opus;
-
 namespace {
 
 template<typename T>
-__device__ uint32_t to_bits(T v) {
-    if constexpr (sizeof(T) == 1) return static_cast<uint32_t>(__builtin_bit_cast(uint8_t, v));
-    else if constexpr (sizeof(T) == 2) return static_cast<uint32_t>(__builtin_bit_cast(uint16_t, v));
-    else return __builtin_bit_cast(uint32_t, v);
+__device__ unsigned int to_bits(T v) {
+    if constexpr (sizeof(T) == 1) return static_cast<unsigned int>(__builtin_bit_cast(unsigned char, v));
+    else if constexpr (sizeof(T) == 2) return static_cast<unsigned int>(__builtin_bit_cast(unsigned short, v));
+    else return __builtin_bit_cast(unsigned int, v);
 }
 
 template<typename T>
-__device__ void write_limits(uint32_t* out) {
+__device__ void write_limits(unsigned int* out) {
     out[0] = to_bits(numeric_limits<T>::min());
     out[1] = to_bits(numeric_limits<T>::max());
     out[2] = to_bits(numeric_limits<T>::lowest());
@@ -28,8 +26,8 @@ __device__ void write_limits(uint32_t* out) {
     out[4] = to_bits(numeric_limits<T>::infinity());
 }
 
-__global__ void numeric_limits_kernel(uint32_t* out) {
-    if (threadIdx.x != 0) return;
+__global__ void numeric_limits_kernel(unsigned int* out) {
+    if (__builtin_amdgcn_workitem_id_x() != 0) return;
     write_limits<fp32_t>(out +  0);
     write_limits<fp16_t>(out +  5);
     write_limits<bf16_t>(out + 10);
@@ -44,13 +42,23 @@ __global__ void numeric_limits_kernel(uint32_t* out) {
     write_limits<i8_t  >(out + 45);
     write_limits<u8_t  >(out + 50);
 }
-
 } // anonymous namespace
 
+#else
+// ── Host pass ───────────────────────────────────────────────────────────────
+// #include <hip/hip_runtime.h>   // replaced by hip_host_minimal.h for faster builds
+#include "hip_host_minimal.h"
+#include <cstdio>
+
+namespace {
+__global__ void numeric_limits_kernel(unsigned int* out) {}
+}
+
 extern "C" void run_numeric_limits(void* d_out) {
-    numeric_limits_kernel<<<1, 1>>>(static_cast<uint32_t*>(d_out));
+    numeric_limits_kernel<<<1, 1>>>(static_cast<unsigned int*>(d_out));
     hipError_t err = hipDeviceSynchronize();
     if (err != hipSuccess) {
         fprintf(stderr, "numeric_limits_kernel failed: %s\n", hipGetErrorString(err));
     }
 }
+#endif
