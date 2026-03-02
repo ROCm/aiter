@@ -254,6 +254,10 @@ void gemma_rmsnorm_launch_config(uint32_t batch_size,
                                  dim3& grid,
                                  dim3& block,
                                  size_t& smem) {
+  TORCH_CHECK(hidden_size % VEC_SIZE == 0, 
+    "hidden_size must be a multiple of VEC_SIZE (", VEC_SIZE, ") for optimized vectorized access.");
+  TORCH_CHECK(hidden_size >= VEC_SIZE, 
+    "hidden_size is too small for this kernel.");
   uint32_t block_size = std::min(1024u, hidden_size / VEC_SIZE);
   uint32_t num_warps = ceil_div(block_size, WARP_SIZE);
   grid = dim3(batch_size, 1, 1);
