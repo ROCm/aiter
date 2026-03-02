@@ -569,6 +569,7 @@ void moe_stage1_g1u1(
     print("[DEV_BUF] ptr_Qscl  : w1_lqq_scale      = %lu bytes\n", w1_lqq_scale.has_value() ? w1_lqq_scale.value().numel() * w1_lqq_scale.value().element_size() : 0);
     print("[DEV_BUF] ptr_Qzero : w1_lqq_zero       = %lu bytes\n", w1_lqq_zero.has_value() ? w1_lqq_zero.value().numel() * w1_lqq_zero.value().element_size() : 0);
     print("[KERNEL] sub_X = %d, sub_GU = %d\n", block_m, sub_GU);
+    print("[KERNEL] sub_X_cnt = %d, sz_stp = %d\n", sub_X_cnt, sz_stp);
     print("[KERNEL] gdx:%d, gdy:%d, gdz:%d, bdx:%d\n", gdx, gdy, gdz, bdx);
 
     impl_ptr->launch_kernel({&args,

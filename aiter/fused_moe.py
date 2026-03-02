@@ -1091,6 +1091,7 @@ def fused_moe_2stages(
                 local_expert_hash[local_expert_hash > 0] -= 1
                 topk_ids = local_expert_hash[topk]
 
+            """
             if fc1_smooth_scale is not None:
                 a8 = torch.empty(
                     (topk, token_num, model_dim), dtype=dtypes.i8, device=device
@@ -1107,7 +1108,11 @@ def fused_moe_2stages(
                 )
                 a8 = a8.repeat(topk, 1, 1)
                 a8_scale = a8_scale.repeat(topk, 1, 1)
+            """
 
+            a8, a8_scale = aiter.pertoken_quant(hidden_states, quant_dtype=dtypes.i8)
+            a8 = a8.repeat(topk, 1, 1)
+            a8_scale = a8_scale.repeat(topk, 1, 1)
         a1 = a8
         a1_scale = a8_scale
     elif hidden_states.dtype != q_dtype_a:

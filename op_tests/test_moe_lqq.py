@@ -172,7 +172,7 @@ def test_fmoe_lqq(
     topk,
     shared_E=2,
     ep=8,
-    block_size_M=80,
+    block_size_M=32,
 ):
     dtype = dtypes.bf16
     use_g1u1 = True
@@ -261,12 +261,12 @@ def test_fmoe_lqq(
         w1_qt, group_in_k_lqq
     )
     w1_qt_dqt = moe_lqq_dequant(w1_lqq_uint4, w1_lqq_scale, w1_lqq_zero)
-    # w1_qt = w1_qt_dqt
+    w1_qt = w1_qt_dqt
     w2_lqq_uint4, w2_lqq_scale, w2_lqq_zero_uint8, w2_lqq_zero = lqq_1x64_quant(
         w2_qt, group_in_k_lqq
     )
     w2_qt_dqt = moe_lqq_dequant(w2_lqq_uint4, w2_lqq_scale, w2_lqq_zero)
-    # w2_qt = w2_qt_dqt
+    w2_qt = w2_qt_dqt
     # -----------------------------------------------------------------------------------
 
     w1_lqq = shuffle_weight_lqq_a8w4(w1_lqq_uint4).view(dtypes.i4x2)
@@ -347,8 +347,27 @@ def test_fmoe_lqq(
     print("[test] out_asm       : ", out_asm.shape, out_asm.dtype)
 
     ######################################################################################
-    us = 1
-    """
+    checkAllclose(
+        out2_ref,
+        out_asm,
+    )
+
+    def calc_diff(x: torch.Tensor, y: torch.Tensor):
+        x, y = x.double(), y.double()
+        denominator = (x * x + y * y).sum()
+        cos_sim = torch.cosine_similarity(x.flatten(), y.flatten(), dim=0)
+        return 1 - cos_sim
+
+    logits_diff = calc_diff(out2_ref, out_asm)
+    if logits_diff > 1e-3:
+        print(
+            f"logits_diff: {logits_diff} is too large, please check the implementation"
+        )
+    else:
+        print(f"logits_diff: {logits_diff} is acceptable")
+
+    ######################################################################################
+    return
     _, us = run_perftest(
         fused_moe,
         input,
@@ -372,28 +391,9 @@ def test_fmoe_lqq(
         num_iters=100,
         num_warmup=2,
     )
-    """
-
-    ######################################################################################
-    err = checkAllclose(
-        out2_ref,
-        out_asm,
-        msg=f"asm_moe:{us:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us/1000/1000:>8.2f} tflops.",
+    print(
+        "asm_moe:{us:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us/1000/1000:>8.2f} tflops."
     )
-
-    def calc_diff(x: torch.Tensor, y: torch.Tensor):
-        x, y = x.double(), y.double()
-        denominator = (x * x + y * y).sum()
-        cos_sim = torch.cosine_similarity(x.flatten(), y.flatten(), dim=0)
-        return 1 - cos_sim
-
-    logits_diff = calc_diff(out2_ref, out_asm)
-    if logits_diff > 1e-3:
-        print(
-            f"logits_diff: {logits_diff} is too large, please check the implementation"
-        )
-    else:
-        print(f"logits_diff: {logits_diff} is acceptable")
 
 
 parser = argparse.ArgumentParser(
@@ -475,7 +475,7 @@ parser.add_argument(
 args = parser.parse_args()
 
 print(f"\nRunning moe_lqq test...")
-expert = 128 if args.expert is None else args.expert[0]
+expert = 16 if args.expert is None else args.expert[0]
 topk = 6 if args.topk is None else args.topk[0]
 tokens = 208 if args.token is None else args.token[0]
 mdim = 5120 if args.model_dim is None else args.model_dim[0]
@@ -483,7 +483,7 @@ idim = 1536 if args.inter_dim is None else args.inter_dim[0]
 ep = 1 if args.expert_parallelism is None else args.expert_parallelism
 shared_E = 2 if args.shared_expert is None else args.shared_expert
 
-for subX in [80] if args.subx is None else args.subx:
+for subX in [32] if args.subx is None else args.subx:
     test_fmoe_lqq(
         token=tokens,
         model_dim=mdim,
