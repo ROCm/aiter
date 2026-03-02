@@ -104,9 +104,11 @@ def _inlined_device_barrier(
     CTA 0 signals own readiness, polls remote ranks, then signals
     other CTAs via barrier_done_ptr.
 
-    barrier_epoch_ptr points to a GPU tensor so that CUDA graph replay
-    sees the updated epoch value each time (the host increments the
-    tensor between replays via .add_(1)).
+    The epoch is advanced inside the kernel (CTA 0 stores target_epoch
+    back to barrier_epoch_ptr after confirming all ranks arrived).
+    This makes the barrier self-contained: it works correctly whether
+    called from the manager, from Triton's autotuner, or from CUDA
+    graph replay, with no external state management needed.
     """
     barrier_epoch = tl.load(barrier_epoch_ptr)
     target_epoch = barrier_epoch + 1
@@ -136,6 +138,11 @@ def _inlined_device_barrier(
                     != target_epoch
                 ):
                     pass
+
+        # Advance epoch for the next barrier invocation. Done inside
+        # the kernel so autotuning trials and CUDA graph replays each
+        # see a fresh epoch without any host-side bookkeeping.
+        tl.store(barrier_epoch_ptr, target_epoch)
 
         tl.atomic_add(barrier_done_ptr, 1, sem="release")
     else:
@@ -775,9 +782,7 @@ class IrisTwoshotManager:
             residual is not None,
         )
 
-        # Advance epoch for the inlined barrier consumed by the kernel.
-        # GPU tensor so CUDA graph replay sees the updated value.
-        self._barrier_epoch.add_(1)
+
 
         # Scaled GEMM
         gemm_out = torch._scaled_mm(

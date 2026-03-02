@@ -80,6 +80,8 @@ def _get_iris_twoshot_row_gemm_configs(autotune: bool):
     num_xcds = iris.hip.get_num_xcc()
 
     if not autotune:
+        # Best config from autotuning on MI350X 8-GPU (512 tokens, 8192 hidden):
+        # COMM_SMS=128, GEMM_BLOCK_M=256, num_warps=16, waves_per_eu=1
         comm_sms = 128
         return [
             triton.Config(
@@ -87,8 +89,8 @@ def _get_iris_twoshot_row_gemm_configs(autotune: bool):
                     "COMM_SMS": comm_sms,
                     "NUM_XCDS": num_xcds,
                     "CHUNK_SIZE": _compute_chunk_size(comm_sms, num_xcds),
-                    "waves_per_eu": 4,
-                    "GEMM_BLOCK_M": 128,
+                    "waves_per_eu": 1,
+                    "GEMM_BLOCK_M": 256,
                     "GEMM_BLOCK_N": 128,
                     "GEMM_BLOCK_K": 128,
                     "GEMM_GROUP_SIZE_M": 4,
@@ -836,9 +838,7 @@ class IrisTwoshotRowManager:
             bias is not None,
         )
 
-        # Advance epoch for the inlined barrier consumed by the kernel.
-        # GPU tensor so CUDA graph replay sees the updated value.
-        self._barrier_epoch.add_(1)
+
 
         # result_out and residual_out are the same buffer -- only owned
         # rows are valid, which is all that downstream reads.

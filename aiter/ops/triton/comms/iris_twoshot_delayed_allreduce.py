@@ -607,10 +607,6 @@ class IrisTwoshotDelayedManager:
             residual is not None,
         )
 
-        # Advance epoch for the inlined barrier consumed by the kernel.
-        # GPU tensor so CUDA graph replay sees the updated value.
-        self._barrier_epoch.add_(1)
-
         # Each rank only computes amax for its owned M/world_size rows.
         # Sync across ranks to get the true global amax.
         if torch.distributed.is_initialized():
