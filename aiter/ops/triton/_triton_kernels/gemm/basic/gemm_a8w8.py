@@ -72,12 +72,11 @@ def _gemm_a8w8_kernel(
     cache_modifier: tl.constexpr
 ):
     """
-    Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8 function
-    below
+    Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8 instead.
 
     Computes the 8 bit matmul C = A x B, applies a conversion scale and optionally adds a bias to
     the result.
-    The conversion scale is received in the form of two 1D tensors that are multiplied to form a
+    The conversion scale is received in the form of two 1D tensors that are multiplied and form a
     2D one before being applied.
 
     Key parameters:
@@ -146,10 +145,10 @@ def _gemm_a8w8_kernel(
             # If it is out of bounds, set it to 0.
             if EVEN_K:
                 a = tl.load(a_ptrs)
-                b = tl.load(b_ptrs)
+                b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
                 a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-                b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+                b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0, cache_modifier=cache_modifier)
 
             accumulator += tl.dot(a, b, input_precision="ieee")
 
