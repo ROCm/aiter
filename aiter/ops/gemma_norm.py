@@ -1,6 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+"""
+Gemma normalization ops.
+
+This module exposes Python bindings for Gemma-style RMSNorm and fused
+add-RMSNorm operations via `compile_ops("module_gemma_norm", ...)`.
+
+The underlying CUDA kernel implementations live in:
+  - csrc/kernels/gemma_norm_kernels.cu
+  - csrc/pybind/gemma_norm_pybind.cu
+"""
 import torch
 from torch import Tensor
 from ..jit.core import compile_ops
