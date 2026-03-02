@@ -285,6 +285,21 @@
         ],
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale_bpreshuffle/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE}'"
     },
+    "module_gemm_a8w8_blockscale_bpreshuffle_cktile": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_blockscale_bpreshuffle_cktile_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/gemm_common.cu'",
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_cktile.cu'"
+        ],
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/include'"
+        ],
+        "flags_extra_hip": [
+            "'-mllvm -greedy-reverse-local-assignment=1'",
+            "'-mllvm -enable-noalias-to-md-conversion=1'"
+        ],
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances_cktile.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE}'"
+    },
     "module_gemm_a4w4_blockscale": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/gemm_a4w4_blockscale_pybind.cu'",
@@ -507,6 +522,20 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_moe_sorting_opus": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/moe_sorting_opus_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/moe_sorting_opus_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DOPUS_WA_ISSUE_2028=0'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_moe_topk": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/moe_topk_pybind.cu'",
@@ -666,6 +695,21 @@
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale_bpreshuffle/include'"
         ],
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale_bpreshuffle/gen_instances.py --working_path {{}} --tune'"
+    },
+    "module_gemm_a8w8_blockscale_bpreshuffle_cktile_tune": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_blockscale_bpreshuffle_cktile_tune_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_cktile_tune.cu'"
+        ],
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/include'"
+        ],
+        "flags_extra_hip": [
+            "'-mllvm -greedy-reverse-local-assignment=1'",
+            "'-mllvm -enable-noalias-to-md-conversion=1'"
+        ],
+
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances_cktile.py --working_path {{}} --tune'"
     },
     "module_gemm_a4w4_blockscale_tune": {
         "srcs": [
@@ -1189,6 +1233,18 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/groupnorm_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/groupnorm.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_causal_conv1d_update": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/causal_conv1d_update_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/causal_conv1d_update.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],

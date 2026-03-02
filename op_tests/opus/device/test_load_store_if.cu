@@ -16,10 +16,91 @@
  * All kernels run on all GPU architectures (gfx942, gfx950, ...).
  */
 
-#include <hip/hip_runtime.h>
-#include <cstdio>
+#ifdef __HIP_DEVICE_COMPILE__
+// ── Device pass ─────────────────────────────────────────────────────────────
 #include "opus/opus.hpp"
-#include "test_load_store_if.h"
+
+template<int BLOCK_SIZE, int ELEMS>
+__global__ void predicated_copy_kernel(const float* __restrict__ src,
+                                       float* __restrict__ dst,
+                                       int n)
+{
+    using namespace opus;
+    int base = (__builtin_amdgcn_workgroup_id_x() * BLOCK_SIZE + __builtin_amdgcn_workitem_id_x()) * ELEMS;
+
+    auto g_src = make_gmem(src);
+    auto g_dst = make_gmem(dst);
+
+    constexpr auto shape = opus::make_tuple(number<ELEMS>{});
+    auto u = make_layout_packed(shape, opus::make_tuple(_)) + base;
+
+    auto pred = [&](auto id) -> bool { return (base + id.value) < n; };
+
+    auto data = load_if(g_src, pred, u);
+    store_if(g_dst, pred, data, u);
+}
+
+template<int BLOCK_SIZE, int VEC>
+__global__ void free_func_add_kernel(const float* a, const float* b,
+                                     float* result, int n)
+{
+    auto g_a = opus::make_gmem(a);
+    auto g_b = opus::make_gmem(b);
+    auto g_r = opus::make_gmem(result);
+
+    int idx = __builtin_amdgcn_workgroup_id_x() * BLOCK_SIZE + __builtin_amdgcn_workitem_id_x();
+    int stride = __builtin_amdgcn_grid_size_x();
+
+    for (int i = idx * VEC; i < n; i += stride * VEC) {
+        auto va = opus::load<VEC>(g_a, i);
+        auto vb = opus::load<VEC>(g_b, i);
+
+        decltype(va) vr;
+        for (int j = 0; j < VEC; j++) {
+            vr[j] = va[j] + vb[j];
+        }
+
+        opus::store<VEC>(g_r, vr, i);
+    }
+}
+
+template<int BLOCK_SIZE>
+__global__ void predicated_async_load_kernel(const float* __restrict__ src,
+                                              float* __restrict__ dst,
+                                              int n, int n_padded)
+{
+    using namespace opus;
+    __shared__ float smem_buf[BLOCK_SIZE];
+
+    int tid = __builtin_amdgcn_workitem_id_x();
+    int gid = __builtin_amdgcn_workgroup_id_x() * BLOCK_SIZE + tid;
+
+    if (gid >= n_padded) return;
+
+    auto g_src = make_gmem(src, static_cast<unsigned int>(n * sizeof(float)));
+
+    auto u_gmem = make_layout(seq<1>{}) + gid;
+    auto u_smem = make_layout(seq<1>{}) + tid;
+
+    auto pred = [&](auto) -> bool { return gid < n; };
+
+    async_load_if(g_src, pred, smem_buf, u_gmem, u_smem);
+
+    s_waitcnt_vmcnt(number<0>{});
+    __builtin_amdgcn_s_barrier();
+
+    dst[gid] = smem_buf[tid];
+}
+
+template __global__ void predicated_copy_kernel<256, 4>(const float*, float*, int);
+template __global__ void free_func_add_kernel<256, 4>(const float*, const float*, float*, int);
+template __global__ void predicated_async_load_kernel<256>(const float*, float*, int, int);
+
+#else
+// ── Host pass ───────────────────────────────────────────────────────────────
+// #include <hip/hip_runtime.h>   // replaced by hip_host_minimal.h for faster builds
+#include "hip_host_minimal.h"
+#include <cstdio>
 
 #define HIP_CALL(call) do { \
     hipError_t err = (call); \
@@ -29,38 +110,19 @@
     } \
 } while(0)
 
-// ==========================================================================
-// Kernel 1: predicated copy — gmem load_if / store_if via free functions
-// ==========================================================================
-// Each thread processes ELEMS elements using layout-based load_if/store_if.
-// The predicate checks bounds, so the last block safely handles partial tiles.
 template<int BLOCK_SIZE, int ELEMS>
 __global__ void predicated_copy_kernel(const float* __restrict__ src,
                                        float* __restrict__ dst,
-                                       int n)
-{
-    using namespace opus;
-    int base = (blockIdx.x * BLOCK_SIZE + threadIdx.x) * ELEMS;
+                                       int n) {}
 
-    auto g_src = make_gmem(src);
-    auto g_dst = make_gmem(dst);
+template<int BLOCK_SIZE, int VEC>
+__global__ void free_func_add_kernel(const float* a, const float* b,
+                                     float* result, int n) {}
 
-    // Layout: maps issue coords {0..ELEMS-1} to global offsets {base..base+ELEMS-1}
-    // Tests layout_linear::operator+ from PR #2020.
-    // The coord (make_tuple(_)) marks the dimension as issue-space so that
-    // layout_to_issue_space returns (ELEMS,) instead of the default (1,).
-    // Use opus::make_tuple(number<ELEMS>{}) rather than seq<ELEMS>{} so the shape
-    // contains number<> types that vectorize_issue_space can decompose.
-    constexpr auto shape = opus::make_tuple(number<ELEMS>{});
-    auto u = make_layout_packed(shape, opus::make_tuple(_)) + base;
-
-    // Predicate: only access if within bounds
-    auto pred = [&](auto id) -> bool { return (base + id.value) < n; };
-
-    // Free function wrappers (tests opus::load_if / opus::store_if and is_gmem_v)
-    auto data = load_if(g_src, pred, u);
-    store_if(g_dst, pred, data, u);
-}
+template<int BLOCK_SIZE>
+__global__ void predicated_async_load_kernel(const float* __restrict__ src,
+                                              float* __restrict__ dst,
+                                              int n, int n_padded) {}
 
 extern "C" void run_predicated_copy(const void* d_src, void* d_dst, int n)
 {
@@ -77,37 +139,6 @@ extern "C" void run_predicated_copy(const void* d_src, void* d_dst, int n)
         n);
     HIP_CALL(hipGetLastError());
     HIP_CALL(hipDeviceSynchronize());
-}
-
-// ==========================================================================
-// Kernel 2: vector add via free function API
-// ==========================================================================
-// Same as test_vector_add but uses opus::load / opus::store free functions
-// instead of member functions, exercising is_mem_v / is_gmem_v type traits.
-template<int BLOCK_SIZE, int VEC>
-__global__ void free_func_add_kernel(const float* a, const float* b,
-                                     float* result, int n)
-{
-    // NOTE: deliberately NOT using "using namespace opus" here to test
-    // that the free functions work with explicit opus:: qualification.
-    auto g_a = opus::make_gmem(a);
-    auto g_b = opus::make_gmem(b);
-    auto g_r = opus::make_gmem(result);
-
-    int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
-    int stride = gridDim.x * BLOCK_SIZE;
-
-    for (int i = idx * VEC; i < n; i += stride * VEC) {
-        auto va = opus::load<VEC>(g_a, i);   // free function wrapper
-        auto vb = opus::load<VEC>(g_b, i);   // free function wrapper
-
-        decltype(va) vr;
-        for (int j = 0; j < VEC; j++) {
-            vr[j] = va[j] + vb[j];
-        }
-
-        opus::store<VEC>(g_r, vr, i);        // free function wrapper
-    }
 }
 
 extern "C" void run_free_func_add(const void* d_a, const void* d_b,
@@ -128,43 +159,6 @@ extern "C" void run_free_func_add(const void* d_a, const void* d_b,
     HIP_CALL(hipDeviceSynchronize());
 }
 
-// ==========================================================================
-// Kernel 3: predicated async load via free function API
-// ==========================================================================
-// Copies src -> LDS (async) -> dst with a bounds-checking predicate.
-// Out-of-bounds smem slots are zero-filled by async_load_if.
-template<int BLOCK_SIZE>
-__global__ void predicated_async_load_kernel(const float* __restrict__ src,
-                                              float* __restrict__ dst,
-                                              int n, int n_padded)
-{
-    using namespace opus;
-    __shared__ float smem_buf[BLOCK_SIZE];
-
-    int tid = threadIdx.x;
-    int gid = blockIdx.x * BLOCK_SIZE + tid;
-
-    if (gid >= n_padded) return;
-
-    auto g_src = make_gmem(src, static_cast<uint32_t>(n * sizeof(float)));
-
-    // Layouts: single element per thread
-    auto u_gmem = make_layout(seq<1>{}) + gid;  // global offset
-    auto u_smem = make_layout(seq<1>{}) + tid;   // smem offset
-
-    // Predicate: only load if within actual data bounds
-    auto pred = [&](auto) -> bool { return gid < n; };
-
-    // Free function wrapper (tests opus::async_load_if and is_gmem_v)
-    async_load_if(g_src, pred, smem_buf, u_gmem, u_smem);
-
-    s_waitcnt_vmcnt(number<0>{});
-    __syncthreads();
-
-    // Write back from LDS to global output
-    dst[gid] = smem_buf[tid];
-}
-
 extern "C" void run_predicated_async_load(const void* d_src, void* d_dst,
                                            int n, int n_padded)
 {
@@ -180,3 +174,4 @@ extern "C" void run_predicated_async_load(const void* d_src, void* d_dst,
     HIP_CALL(hipGetLastError());
     HIP_CALL(hipDeviceSynchronize());
 }
+#endif
