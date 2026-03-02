@@ -18,9 +18,6 @@ from typing import Any, Callable, List, Optional
 
 from packaging.version import Version, parse
 
-# Ensure ROCM_HOME is set so cpp_extension can find thrust (e.g. thrust/complex.h)
-os.environ.setdefault("ROCM_HOME", "/opt/rocm")
-
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
 from chip_info import get_gfx, get_gfx_list
