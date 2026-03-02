@@ -1864,3 +1864,17 @@ namespace py = pybind11;
           py::arg("input"),                  \
           py::arg("weight"),                 \
           py::arg("epsilon"));
+
+#define CAUSAL_CONV1D_UPDATE_PYBIND                                                 \
+      m.def("causal_conv1d_update",                                                 \
+            &aiter::causal_conv1d_update,                                           \
+            "Causal 1D convolution update with state (for inference/decoding).",    \
+            py::arg("x"),                                                           \
+            py::arg("conv_state"),                                                  \
+            py::arg("weight"),                                                      \
+            py::arg("bias"),                                                        \
+            py::arg("out"),                                                         \
+            py::arg("use_silu"),                                                    \
+            py::arg("cache_seqlens")      = torch::Tensor(),                        \
+            py::arg("conv_state_indices") = torch::Tensor(),                        \
+            py::arg("pad_slot_id")        = -1);
