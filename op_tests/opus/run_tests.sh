@@ -4,8 +4,7 @@
 #
 # Run all OPUS tests:
 #   1. C++ host test (test_opus_basic)
-#   2. Device kernel tests via opus_device_test PyTorch extension
-#      (MFMA 32x32x8 fp16, vector_add)
+#   2. Device kernel tests via opus_device_test.so (hipcc, loaded via ctypes)
 #
 # Can be invoked from any directory, e.g.:
 #   ./op_tests/opus/run_tests.sh        (from repo root)

@@ -192,10 +192,11 @@ class AITER_CONFIG(object):
         for i, path in enumerate(path_list[1:]):
             if os.path.exists(path):
                 df = pd.read_csv(path)
-                ## check columns
+                base_cols = [c for c in df_list[0].columns if c != "_tag"]
+                new_cols = [c for c in df.columns if c != "_tag"]
                 assert (
-                    df.columns.tolist() == df_list[0].columns.tolist()
-                ), f"Column mismatch between {path_list[0]} and {path}, {df_list[0].columns.tolist()}, {df.columns.tolist()}"
+                    base_cols == new_cols
+                ), f"Column mismatch between {path_list[0]} and {path}, {base_cols}, {new_cols}"
 
                 df_list.append(df)
             else:
@@ -205,6 +206,10 @@ class AITER_CONFIG(object):
             if df_list
             else pd.DataFrame()
         )
+        has_tag = "_tag" in merge_df.columns
+        if has_tag:
+            merge_df["_tag"] = merge_df["_tag"].fillna("")
+
         ## get keys from untuned file to drop_duplicates
         untuned_name = (
             re.sub(r"(?:_)?tuned$", r"\1untuned", merge_name)
@@ -215,12 +220,12 @@ class AITER_CONFIG(object):
         if os.path.exists(untuned_path):
             untunedf = pd.read_csv(untuned_path)
             keys = untunedf.columns.to_list()
-            # Add "cu_num" if not already present
             if "cu_num" not in keys:
                 keys.append("cu_num")
+            dedup_keys = keys + ["_tag"] if has_tag else keys
             merge_df = (
                 merge_df.sort_values("us")
-                .drop_duplicates(subset=keys, keep="first")
+                .drop_duplicates(subset=dedup_keys, keep="first")
                 .reset_index(drop=True)
             )
         else:

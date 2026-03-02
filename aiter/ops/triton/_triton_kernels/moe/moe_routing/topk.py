@@ -26,17 +26,6 @@ def key_to_fpval(x):
     return x ^ tl.where((x & tm) == 0, fm, tm)
 
 
-# stable top-k tie-breaks to value with smaller index
-@triton.jit
-def indx_to_key(indx, N_EXPTS_PAD: tl.constexpr):
-    return N_EXPTS_PAD - indx
-
-
-@triton.jit
-def key_to_indx(indx, N_EXPTS_PAD: tl.constexpr):
-    return N_EXPTS_PAD - indx
-
-
 @triton.jit
 def streaming_topk(
     X,
@@ -46,6 +35,7 @@ def streaming_topk(
     mask_m,
     N_EXPTS_PAD: tl.constexpr,
     N_EXPTS_ACT: tl.constexpr,
+    N_EXPTS_ACT_PAD: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     x_nbits: tl.constexpr = X.dtype.element_ty.primitive_bitwidth
@@ -68,8 +58,8 @@ def streaming_topk(
     X_ptrs = X + offs_m[:, None] * stride_xm + offs_x_n[None, :]
     x = tl.load(X_ptrs, mask=(mask_m & mask_n), other=float("-inf"))
     x = fpval_to_key(x.to(x_utype, bitcast=True))
-    x = (x.to(x_ultype) << 16) | indx_to_key(offs_x_n, N_EXPTS_PAD)[None, :]
-    acc = tl.topk(x, N_EXPTS_ACT, dim=1)
+    x = (x.to(x_ultype) << 16) | offs_x_n[None, :]
+    acc = tl.topk(x, N_EXPTS_ACT_PAD, dim=1)
 
     # subsequent iterations:
     for _i in (tl.static_range if loop_iterations <= 4 else range)(loop_iterations):
@@ -78,20 +68,24 @@ def streaming_topk(
         offs_x_n -= BLOCK_N
         x = tl.load(X_ptrs, mask=mask_m, other=float("-inf"))
         x = fpval_to_key(x.to(x_utype, bitcast=True))
-        x = (x.to(x_ultype) << 16) | indx_to_key(offs_x_n, N_EXPTS_PAD)[None, :]
-        acc = tl.maximum(acc, tl.topk(x, N_EXPTS_ACT, dim=1))
+        x = (x.to(x_ultype) << 16) | offs_x_n[None, :]
+        acc = tl.maximum(acc, tl.topk(x, N_EXPTS_ACT_PAD, dim=1))
 
     # rotate expert index into upper 16 bits:
     # 0000vvvvvvvviiii --> iiii0000vvvvvvvv
     acc = (acc << (y_nbits - 16)) | (acc >> 16)
+    if N_EXPTS_ACT != N_EXPTS_ACT_PAD:
+        mask_expts_act = tl.arange(0, N_EXPTS_ACT_PAD)[None, :] < N_EXPTS_ACT
+        acc = tl.where(mask_expts_act, acc, N_EXPTS_PAD << (y_nbits - 16))
     # sort in ascending order of expert (descending order of key)
-    acc = tl.sort(acc, dim=1, descending=True)
+    acc = tl.sort(acc, dim=1)
     # iiii0000vvvvvvvv --> 0000iiii:
-    y_indices_raw = (acc >> (y_nbits - 16)).to(tl.uint32)
-    y_indices = key_to_indx(y_indices_raw, N_EXPTS_PAD)
+    y_indices = (acc >> (y_nbits - 16)).to(tl.uint32)
     # iiii0000vvvvvvvv --> vvvvvvvv:
     y_values_raw = acc.to(x_utype)
     y_values = key_to_fpval(y_values_raw).to(x_dtype, bitcast=True)
+    if N_EXPTS_ACT != N_EXPTS_ACT_PAD:
+        y_values = tl.where(y_indices == N_EXPTS_PAD, float("-inf"), y_values)
 
     return y_values, y_indices
 
@@ -103,7 +97,6 @@ def _topk(
     Yv,
     Yi,
     stride_ym,  # topk values/indices
-    USE_PROVIDED_INDX: tl.constexpr,
     Bits,
     stride_rm,
     stride_rn,  # bitmatrix
@@ -120,6 +113,7 @@ def _topk(
     BLOCK_M: tl.constexpr,
     N_EXPTS_PAD: tl.constexpr,
     N_EXPTS_ACT: tl.constexpr,
+    N_EXPTS_ACT_PAD: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
 
@@ -145,24 +139,19 @@ def _topk(
 
     # load logits
     offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_y_n = tl.arange(0, N_EXPTS_ACT)
+    offs_y_n = tl.arange(0, N_EXPTS_ACT_PAD)
     mask_m = offs_m[:, None] < n_rows
-    if USE_PROVIDED_INDX:
-        Yi_ptrs = Yi + offs_m[:, None] * stride_ym + offs_y_n[None, :]
-        y_indices = tl.load(Yi_ptrs, mask=mask_m)
-        Xv_ptrs = X + offs_m[:, None] * stride_xm + y_indices
-        y_values = tl.load(Xv_ptrs, mask=mask_m)
-    else:
-        y_values, y_indices = streaming_topk(
-            X,
-            stride_xm,
-            n_expts_tot,
-            offs_m,
-            mask_m,  #
-            N_EXPTS_PAD,
-            N_EXPTS_ACT,
-            BLOCK_N,
-        )
+    y_values, y_indices = streaming_topk(
+        X,
+        stride_xm,
+        n_expts_tot,
+        offs_m,
+        mask_m,
+        N_EXPTS_PAD,
+        N_EXPTS_ACT,
+        N_EXPTS_ACT_PAD,
+        BLOCK_N,
+    )
 
     # normalize selected values
     if APPLY_SOFTMAX:
@@ -172,10 +161,14 @@ def _topk(
 
     # write back
     Yv_ptrs = Yv + offs_m[:, None] * stride_ym + offs_y_n[None, :]
-    tl.store(Yv_ptrs, y_values, mask=mask_m)
-    if not USE_PROVIDED_INDX:
-        Yi_ptrs = Yi + offs_m[:, None] * stride_ym + offs_y_n[None, :]
-        tl.store(Yi_ptrs, y_indices, mask=mask_m)
+    if N_EXPTS_ACT != N_EXPTS_ACT_PAD:
+        mask_n = offs_y_n[None, :] < N_EXPTS_ACT
+        mask = mask_m & mask_n
+    else:
+        mask = mask_m
+    tl.store(Yv_ptrs, y_values, mask=mask)
+    Yi_ptrs = Yi + offs_m[:, None] * stride_ym + offs_y_n[None, :]
+    tl.store(Yi_ptrs, y_indices, mask=mask)
 
     # pack into bitmatrix
     y_div = y_indices // 32
