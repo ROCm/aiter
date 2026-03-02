@@ -365,6 +365,10 @@
     int const num_heads    = num_heads_q + num_heads_k + num_heads_v;
     int const localHeadIdx = blockIdx.z;  // head index
 
+    // page_size is power of 2: use shift/AND instead of div/mod/mul
+    int const page_size_log2 = __builtin_ctz(page_size);
+    int const page_mask     = page_size - 1;
+
     // Map blockIdx.y -> (batch_id, block_within_batch) -> first_token_idx
     // Stride by page_size to match cache block layout (blockDim.x may be 64 for reduce, but assignment is per page)
     int batch_id = -1;
@@ -372,7 +376,7 @@
     for(int i = 0; i < batch_size; i++)
     {
         int64_t seq_len_i = cu_q_len[i + 1] - cu_q_len[i];
-        int blocks_i     = (seq_len_i + page_size - 1) / page_size + 1;
+        int blocks_i     = ((seq_len_i + page_mask) >> page_size_log2) + 1;
         if(cum_blocks + blocks_i > (int)blockIdx.y)
         {
             batch_id = i;
@@ -415,26 +419,26 @@
         }
 
         int64_t prev_slot_idx = slot_mapping[prev_first_token_idx];
-        int64_t preTg_block_idx = prev_slot_idx / page_size;
+        int64_t preTg_block_idx = prev_slot_idx >> page_size_log2;
 
         // Get the last token's cache block_idx (page)
         int64_t last_token_idx = batch_end_idx - 1;
         slot_idx = slot_mapping[last_token_idx];
-        block_idx = slot_idx / page_size;
+        block_idx = slot_idx >> page_size_log2;
         // If they are in the same cache page, the previous GPU block already handled it
         if(preTg_block_idx == block_idx)
         {
             return;  // Already processed by previous GPU block
         }
         // Different page: keep slot_idx/block_idx from last token; set block_offset and first_token_idx (like cache_kernels.cu)
-        block_offset = slot_idx % page_size;
+        block_offset = slot_idx & page_mask;
     }
     else
     {
         // Normal case: GPU block starts within the valid token range
         slot_idx = slot_mapping[first_token_idx];
-        block_idx = slot_idx / page_size;
-        block_offset = slot_idx % page_size;
+        block_idx = slot_idx >> page_size_log2;
+        block_offset = slot_idx & page_mask;
     }
 
     if(slot_idx < 0)
@@ -450,9 +454,9 @@
             int64_t token_idx  = first_token_idx - (threadIdx.x + 1);
             if(token_idx >= batch_start_idx)
             {
-                int64_t block_idx1 = slot_mapping[token_idx] / page_size;
+                int64_t block_idx1 = slot_mapping[token_idx] >> page_size_log2;
                 int64_t slot_idx2  = slot_mapping[token_idx + 1];
-                int64_t block_idx2 = slot_idx2 / page_size;
+                int64_t block_idx2 = slot_idx2 >> page_size_log2;
                 if(block_idx1 != block_idx2 && block_idx2 == block_idx)
                 {
                     idx_smem[0] = token_idx + 1;
@@ -465,7 +469,7 @@
         first_token_idx = idx_smem[0];
         slot_idx        = idx_smem[1];
         // block_idx unchanged: idx_smem search guarantees same page (block_idx2 == block_idx)
-        block_offset    = slot_idx % page_size;
+        block_offset    = slot_idx & page_mask;
     }
     // Each token should compute its own slot_id and block_offset
     int64_t actual_slot_id = -1;
@@ -479,14 +483,14 @@
         actual_slot_id = slot_mapping[first_token_idx + threadIdx.x];
         if(actual_slot_id >= 0)
         {
-            actual_block_idx = actual_slot_id / page_size;
-            actual_block_offset = actual_slot_id % page_size;
+            actual_block_idx = actual_slot_id >> page_size_log2;
+            actual_block_offset = actual_slot_id & page_mask;
             tokens_in_block = (actual_block_idx == block_idx) ? 1 : 0;
         }
     }
     auto sum               = [](float a, float b) { return a + b; };
     int numtokens_in_block = 0;
-    numtokens_in_block = block_reduce<int, decltype(sum), wg_size, true>(tokens_in_block, sum);
+    numtokens_in_block = block_reduce<float, decltype(sum), wg_size, true>(static_cast<float>(tokens_in_block), sum);
     // Calculate tokenIdx for current thread
     int tokenIdx = first_token_idx + threadIdx.x;
 
@@ -633,11 +637,7 @@
     auto f_max_f32 = [](float v_0_, float v_1_) { return __builtin_fmaxf(v_0_, v_1_); };
     if(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
     {
-        if constexpr (wg_size < 64) {
-            block_max = multithread_reduce<float, decltype(f_max_f32), wg_size, true>(block_max, f_max_f32, blockDim.x);
-        } else {
-            block_max = block_reduce<float, decltype(f_max_f32), wg_size, true>(block_max, f_max_f32);
-        }
+        block_max = block_reduce<float, decltype(f_max_f32), wg_size, true>(block_max, f_max_f32);
     }
 
     if(isK)
@@ -677,9 +677,9 @@
                         int64_t cache_idx = cache_base + d_idx * page_size * x +
                                             old_offset * x + x_idx;
 
-                        float tmp = ck_tile::type_convert<float>(k_cache[cache_idx]);
+                        float tmp = opus::cast<float>(k_cache[cache_idx]);
                         tmp = tmp * k_scale_global * inv_scale_val;
-                        k_cache[cache_idx] = ck_tile::type_convert<kv_cache_scalar_t>(tmp);
+                        k_cache[cache_idx] = opus::cast<kv_cache_scalar_t>(tmp);
                     }
                     k_scale[scale_offset] = k_scale_val;
                 }
@@ -707,7 +707,7 @@
         {
             int token_idx          = first_token_idx + idx * vec_size / head_dim;
             int head_offset        = (idx * vec_size) % head_dim;
-            int block_offset_local = (token_idx - first_token_idx + block_offset) % page_size;
+            int block_offset_local = (token_idx - first_token_idx + block_offset) & page_mask;
 
             int64_t offsetWarp = (token_idx * num_heads * head_dim + localHeadIdx * head_dim) / vec_size;
             elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + head_offset / vec_size];
@@ -725,7 +725,7 @@
                 else
                 {
                     k_cache[offset] =
-                        ck_tile::type_convert<kv_cache_scalar_t>(float(elements[j]) * inv_scale_val);
+                    opus::cast<kv_cache_scalar_t>(float(elements[j]) * inv_scale_val);
                 }
             }
         }
@@ -767,9 +767,9 @@
                         int64_t cache_idx = cache_base + old_offset_divX * head_dim * x +
                                             d * x + old_offset_modX;
 
-                        float tmp = ck_tile::type_convert<float>(v_cache[cache_idx]);
+                        float tmp = opus::cast<float>(v_cache[cache_idx]);
                         tmp = tmp * v_scale_global * inv_scale_val;
-                        v_cache[cache_idx] = ck_tile::type_convert<kv_cache_scalar_t>(tmp);
+                        v_cache[cache_idx] = opus::cast<kv_cache_scalar_t>(tmp);
                     }
                     v_scale[scale_offset] = v_scale_val;
                 }
@@ -796,7 +796,7 @@
         {
             int token_idx          = first_token_idx + idx * vec_size / head_dim;
             int head_offset        = (idx * vec_size) % head_dim;
-            int block_offset_local = (token_idx - first_token_idx + block_offset) % page_size;
+            int block_offset_local = (token_idx - first_token_idx + block_offset) & page_mask;
             int block_offset_divX  = block_offset_local >> v_x_shift;
             int x_idx              = block_offset_local & v_x_mask;
             int64_t v_base         = cache_offset + block_offset_divX * head_dim * x + head_offset * x + x_idx;
@@ -815,7 +815,7 @@
                 else
                 {
                     v_cache[offset] =
-                        ck_tile::type_convert<kv_cache_scalar_t>(float(elements[j]) * inv_scale_val);
+                    opus::cast<kv_cache_scalar_t>(float(elements[j]) * inv_scale_val);
                 }
             }
         }
@@ -1787,7 +1787,7 @@ void fused_qk_norm_rope_cache_block_quant_shuffle(
                  "QKV tensor size must match total number of heads and head dimension");
  
      auto stream = at::hip::getCurrentHIPStream(qkv.get_device());
-     DISPATCH_BY_KV_CACHE_DTYPE(qkv.scalar_type(), kv_cache_dtype, CALL_QK_NORM_ROPE_CACHE_BLOCK_QUANT);
+     DISPATCH_BY_KV_CACHE_DTYPE_OPUS(qkv.scalar_type(), kv_cache_dtype, CALL_QK_NORM_ROPE_CACHE_BLOCK_QUANT);
  }
 
 } // namespace aiter
