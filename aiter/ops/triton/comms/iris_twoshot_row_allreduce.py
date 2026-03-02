@@ -111,7 +111,7 @@ def _get_iris_twoshot_row_gemm_configs(autotune: bool):
     GEMM_BLOCK_K_OPTIONS = [128]
     GEMM_GROUP_SIZE_M_OPTIONS = [4]
     # Shared parameters
-    NUM_WARPS_OPTIONS = [16]
+    NUM_WARPS_OPTIONS = [4, 16]
     NUM_STAGES_OPTIONS = [2]
     WAVES_PER_EU_OPTIONS = [1]
     for sms in COMM_SMS_OPTIONS:
