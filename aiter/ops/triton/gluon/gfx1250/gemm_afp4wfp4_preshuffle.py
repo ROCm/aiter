@@ -23,8 +23,6 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
 
     # Raw LDS -> reg layouts (must be DistributedLayout)
     #   B_raw:   (BLOCK_N//16, BLOCK_K_BYTES*16)
-    #   AS_raw:  (BLOCK_M//32, K_GROUPS*32)
-    #   BS_raw:  (BLOCK_N//32, K_GROUPS*32)
 
     b_raw_reg_layout = gl.BlockedLayout(
         size_per_thread=[1, 16],
@@ -52,7 +50,7 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
 
     # LDS layouts (shared memory layouts). These must be SharedLayout types.
     shared_A = gl.SwizzledSharedLayout(vec=16, per_phase=1, max_phase=1, order=[1, 0])
-    shared_B = gl.SwizzledSharedLayout(vec=16, per_phase=1, max_phase=1, order=[0, 1])
+    shared_B = gl.SwizzledSharedLayout(vec=16, per_phase=1, max_phase=1, order=[1, 0])
     shared_S = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
 
     # Dot operand layouts (register layouts expected by WMMA)
@@ -103,7 +101,7 @@ def unshuffle_scales_32(
     BLOCK_X: gl.constexpr,
     K_GROUPS: gl.constexpr,
 ):
-    # One shared unshuffle for A/B scales. Gluon shared_memory_descriptor
+    # One shared unshuffle for A/B scales
     return (
         scales_shuf.reshape((BLOCK_X // 32, K_GROUPS // 8, 4, 16, 2, 2, 1))
         .permute((0, 5, 3, 1, 4, 2, 6))
@@ -224,7 +222,6 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
     smem_B = gl.allocate_shared_memory(
         b_preshuf_ptr.type.element_ty,
         [NUM_BUFFERS, BLOCK_N // 16, BLOCK_K_BYTES * 16],
-        # [NUM_BUFFERS, BLOCK_K_BYTES, BLOCK_N],
         layout=shared_B,
     )
     # scales: raw shuffled blocks into LDS via TDM, then unshuffle and then load with layout
