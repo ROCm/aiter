@@ -1208,7 +1208,10 @@ def fused_moe_2stages(
             if expert_mask is not None:
                 local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
                 local_expert_hash[local_expert_hash > 0] -= 1
-                topk_ids = local_expert_hash[topk_ids]
+                local_expert_hash[expert_mask == 0] = -1
+            else:
+                local_expert_hash = None
+
             if fc1_smooth_scale is not None:
                 a8 = torch.empty(
                     (topk, token_num, model_dim), dtype=dtypes.i8, device=device
@@ -1216,8 +1219,20 @@ def fused_moe_2stages(
                 a8_scale = torch.empty(
                     (topk, token_num, 1), dtype=dtypes.fp32, device=device
                 )
-                aiter.moe_smoothquant_fwd(
-                    a8, hidden_states, fc1_smooth_scale, topk_ids, a8_scale
+                aiter.smooth_per_token_scaled_quant(
+                    a8.view(topk, token_num, model_dim).transpose(
+                        0, 1
+                    ),  # [token, topk, model_dim]
+                    hidden_states.view(token_num, 1, model_dim).expand(
+                        -1, topk, -1
+                    ),  # [token, topk, model_dim]
+                    a8_scale.view(topk * token_num),
+                    fc1_smooth_scale.to(dtypes.fp32).contiguous(),  # [E, model_dim]
+                    topk_ids.to(
+                        dtypes.i32
+                    ),  # [token, topk] - global expert ids as smooth_scale_map
+                    smooth_scale_map_hash=local_expert_hash,
+                    enable_ps=True,
                 )
             else:
                 a8, a8_scale = aiter.pertoken_quant(
@@ -1349,8 +1364,22 @@ def fused_moe_2stages(
         asm_stage1,
         flydsl_moe_stage1,
     ]:
-        a2_qt, a2_scale = aiter.pertoken_quant(a2, quant_dtype=dtypes.i8, dtypeMax=7)
-        a2 = a2_qt.view(token_num, topk, -1)
+        a2 = a2.view(token_num, topk, -1)
+        a2_out = torch.empty(
+            (token_num, topk, inter_dim), dtype=dtypes.i8, device=device
+        )
+        a2_scale = torch.empty((token_num, topk, 1), dtype=dtypes.fp32, device=device)
+        aiter.smooth_per_token_scaled_quant(
+            a2_out,
+            a2,
+            a2_scale,
+            fc2_smooth_scale.to(dtypes.fp32).contiguous(),
+            topk_ids.contiguous(),
+            smooth_scale_map_hash=local_expert_hash,  # Optional EP hash for global->local mapping
+            num_rows=num_local_tokens,
+            num_rows_factor=topk,
+        )
+        a2 = a2_out
     else:
         a2, a2_scale = quant_func(
             a2,
@@ -1360,7 +1389,6 @@ def fused_moe_2stages(
             num_rows_factor=topk,
         )
         a2 = a2.view(token_num, topk, inter_dim)
-    aiter.logger.info(f"fused_moe {quant_type} a2_scale = {a2_scale}")
     metadata.stage2(
         a2,
         w1,

@@ -11,8 +11,7 @@ from aiter.test_common import (
 from aiter.fused_moe import (
     fused_topk,
     fused_moe,
-    torch_moe_stage1,
-    torch_moe_stage2,
+    torch_moe,
 )
 from aiter.ops.shuffle import shuffle_scale_zero_lqq_a8w4, shuffle_weight_lqq_a8w4
 from aiter import ActivationType
@@ -67,6 +66,14 @@ LQQ_I8_MAX = 119
 #!!!!!!!!!!!!!!!!!!!!!!!!!!!! do NOT overwrite this value !!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 
+def _get_local_expert_hash(expert_mask: torch.Tensor) -> torch.Tensor:
+    """Cache global->local expert id map for EP."""
+    local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
+    local_expert_hash[local_expert_hash > 0] -= 1
+    local_expert_hash[expert_mask == 0] = -1
+    return local_expert_hash
+
+
 def test_fmoe_lqq(
     token,
     model_dim,
@@ -97,8 +104,10 @@ def test_fmoe_lqq(
     fake_expertid = expert_mask.numel() - 1
     # Ensure fake expert to be masked
     expert_mask[-1] = 0
-    # Ensure shared expert not to be masked
+    # Ensure shared expert not to be maskedc
     expert_mask[E:-1] = 1
+
+    local_expert_hash = _get_local_expert_hash(expert_mask)
 
     input = torch.randn((token, model_dim), dtype=dtype, device="cuda")
     score = torch.randn((token, E), device="cuda", dtype=dtype)
@@ -135,12 +144,15 @@ def test_fmoe_lqq(
 
     a1_qt, a1_scale = aiter.pertoken_quant(input, quant_dtype=dtypes.i8)
     if shared_E > 0:
-        fc1_smooth_scale = torch.ones(
+        fc1_smooth_scale = torch.randn(
             (eprt, model_dim), dtype=dtypes.fp32, device="cuda"
+        )
+        fc2_smooth_scale = torch.randn(
+            (eprt, inter_dim), dtype=dtypes.fp32, device="cuda"
         )
     else:
         fc1_smooth_scale = None
-
+        fc2_smooth_scale = None
     w1 = torch.randn((eprt, inter_dim * 2, model_dim), dtype=dtype, device="cuda")
     w2 = torch.randn((eprt, model_dim, inter_dim), dtype=dtype, device="cuda")
     exp_bias1 = torch.clamp(
@@ -179,32 +191,18 @@ def test_fmoe_lqq(
     w2_lqq_zero_uint8_shf = shuffle_scale_zero_lqq_a8w4(w2_lqq_zero_uint8, (4, 16))
 
     ######################################################################################
-    out1_ref = torch_moe_stage1(
-        a1_qt,
-        w1_qt,
-        w2_qt,
+    out_ref = torch_moe(
+        input,
+        w1_qt.to(dtype),
+        w2_qt.to(dtype),
         topk_weights,
         topk_ids,
-        dtype=dtype,
+        fc1_scale=w1_scale,
+        fc2_scale=w2_scale,
+        fc1_smooth_scale=fc1_smooth_scale,
+        fc2_smooth_scale=fc2_smooth_scale,
+        expert_mask=expert_mask,
         activation=act_type,
-        quant_type=aiter.QuantType.per_Token,
-        a1_scale=a1_scale,
-        w1_scale=w1_scale,
-        doweight=False,
-    )
-    a2_qt, a2_scale = aiter.pertoken_quant(out1_ref, quant_dtype=dtypes.i8, dtypeMax=7)
-    a2_qt = a2_qt.view(token, topk, -1)
-    out2_ref = torch_moe_stage2(
-        a2_qt,
-        w1_qt,
-        w2_qt,
-        topk_weights,
-        topk_ids,
-        dtype=dtype,
-        quant_type=aiter.QuantType.per_Token,
-        a2_scale=a2_scale,
-        w2_scale=w2_scale,
-        doweight=True,
     )
 
     ######################################################################################
@@ -221,6 +219,7 @@ def test_fmoe_lqq(
         w2_lqq,
         topk_weights,
         topk_ids,
+        expert_mask=expert_mask,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         a1_scale=a1_scale,
@@ -229,6 +228,7 @@ def test_fmoe_lqq(
         w2_lqq_scale=w2_lqq_scale_shf,
         w2_lqq_zero=w2_lqq_zero_uint8_shf,
         fc1_smooth_scale=fc1_smooth_scale,
+        fc2_smooth_scale=fc2_smooth_scale,
         quant_type=quant_type,
         activation=act_type,
         doweight_stage1=False,
@@ -250,6 +250,7 @@ def test_fmoe_lqq(
             w2_lqq,
             topk_weights,
             topk_ids,
+            expert_mask=expert_mask,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             a1_scale=a1_scale,
@@ -258,6 +259,7 @@ def test_fmoe_lqq(
             w2_lqq_scale=w2_lqq_scale_shf,
             w2_lqq_zero=w2_lqq_zero_uint8_shf,
             fc1_smooth_scale=fc1_smooth_scale,
+            fc2_smooth_scale=fc2_smooth_scale,
             quant_type=quant_type,
             activation=act_type,
             doweight_stage1=False,
@@ -267,12 +269,29 @@ def test_fmoe_lqq(
     os.environ["AITER_USE_FLYDSL"] = old_flydsl
 
     ######################################################################################
+    # torch_moe reference uses fp32, while kernels use int8*uint4 quantized arithmetic
+    # with intermediate re-quantization. Use relaxed tolerance for kernel vs fp32 ref.
+    quant_rtol, quant_atol, quant_tol_err = 0.25, 1.0, 0.15
     print("[test] Comparing ASM vs Ref...")
-    checkAllclose(out_asm, out2_ref, msg="ASM vs Ref")
+    checkAllclose(
+        out_asm,
+        out_ref,
+        rtol=quant_rtol,
+        atol=quant_atol,
+        tol_err_ratio=quant_tol_err,
+        msg="ASM vs Ref",
+    )
 
     if out_flydsl is not None:
         print("[test] Comparing FlyDSL vs Ref...")
-        checkAllclose(out_flydsl, out2_ref, msg="FlyDSL vs Ref")
+        checkAllclose(
+            out_flydsl,
+            out_ref,
+            rtol=quant_rtol,
+            atol=quant_atol,
+            tol_err_ratio=quant_tol_err,
+            msg="FlyDSL vs Ref",
+        )
 
         print("[test] Comparing FlyDSL vs ASM...")
         checkAllclose(out_flydsl, out_asm, msg="FlyDSL vs ASM")
