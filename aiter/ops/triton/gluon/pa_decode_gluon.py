@@ -3970,7 +3970,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     # This is required for KV_BLOCK_SIZE==1024 support in PS mode.
     if PS:
         ONE_SHOT = num_splits <= 1
-        if num_kv_heads == 1:
+        if num_kv_heads == 1 and SLIDING_WINDOW == 0:
             paged_attention_kernel = paged_attention_decode_sliding_window_head_1
             grid = (num_sequences, query_seq_len, num_splits)
             ONE_QUERY_GROUP_SIZE_POW2 = max(16, ONE_QUERY_GROUP_SIZE_POW2)
