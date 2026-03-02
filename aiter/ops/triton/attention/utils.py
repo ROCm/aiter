@@ -5,6 +5,10 @@ from __future__ import annotations
 from typing import Optional, Tuple
 import torch
 
+from aiter.ops.triton._triton_kernels.attention.block_lut import (
+    block_attn_mask_to_lut_kernel,
+)
+
 
 def block_attn_mask_to_ragged_lut(
     block_attn_mask: torch.Tensor,
@@ -56,11 +60,16 @@ def block_attn_mask_to_ragged_lut(
         kv_block_indices = torch.zeros(1, dtype=torch.int32, device=device)
         return kv_block_indices, lut_start, lut_count
 
-    b_idx, h_idx, qb_idx, kb_idx = block_attn_mask.nonzero(as_tuple=True)
-    linear = b_idx * (num_heads * num_q_blocks) + h_idx * num_q_blocks + qb_idx
-    # Lexicographic sort (linear, kb_idx) so last K block is last per segment
-    sort_key = linear * (num_kv_blocks + 1) + kb_idx
-    sort_idx = sort_key.argsort(stable=True)
-    kv_block_indices = kb_idx[sort_idx].to(torch.int32)
+    total_count = lut_count.sum()
+    kv_block_indices = torch.empty(
+        total_count, dtype=torch.int32, device=device
+    )
+    block_attn_mask_to_lut_kernel(
+        block_attn_mask,
+        lut_start,
+        lut_count,
+        kv_block_indices,
+        BLOCK_KB=128,
+    )
 
     return kv_block_indices, lut_start, lut_count
