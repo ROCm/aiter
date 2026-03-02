@@ -190,7 +190,9 @@ def test_fmoe(
             avg_b = 9999
             print("asm g1u1 only support quant/smoothquant Now")
         else:
-            out_b, avg_b = asm_moe_test(input, w1b, w2b, topk_weights, topk_ids)
+            out_b, avg_b = asm_moe_test(
+                input, w1b, w2b, topk_weights, topk_ids, activation=activation
+            )
 
         msg = f"[perf] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us, uplift: {avg_c/avg_b-1:.1%}"
         checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg)
@@ -436,7 +438,16 @@ for test in l_test:
                     for idim in [1024] if args.inter_dim is None else args.inter_dim:
                         expert = 32 if args.expert is None else args.expert
                         topk = 5 if args.topk is None else args.topk
-                        test_fmoe(dtype, m, hdim, idim, expert, topk, quant="No")
+                        test_fmoe(
+                            dtype,
+                            m,
+                            hdim,
+                            idim,
+                            expert,
+                            topk,
+                            quant="No",
+                            activation=args.activation,
+                        )
     elif test == "g1u1_no_quant":
         for dtype in (
             [dtypes.fp16, dtypes.bf16]
@@ -459,6 +470,7 @@ for test in l_test:
                             topk,
                             quant="No",
                             use_g1u1=True,
+                            activation=args.activation,
                         )
     elif test == "g1u1_int8quant":
         for dtype in (
@@ -481,6 +493,7 @@ for test in l_test:
                             #   quant='int8quant', use_g1u1=True, shared_E=0, activation=ActivationType.Gelu)
                             quant="int8quant",
                             use_g1u1=True,
+                            activation=args.activation,
                         )
 
     elif test == "g1u1_fp8quant":
@@ -530,6 +543,7 @@ for test in l_test:
                             topk,
                             quant="int8smoothquant",
                             use_g1u1=False,
+                            activation=args.activation,
                         )
 
     elif test == "g1u1_int8smoothquant":
@@ -556,6 +570,7 @@ for test in l_test:
                             topk,
                             quant="int8smoothquant",
                             use_g1u1=True,
+                            activation=args.activation,
                         )
 
     elif test == "g1u1_fp8smoothquant":
@@ -580,6 +595,7 @@ for test in l_test:
                             topk,
                             quant="fp8smoothquant",
                             use_g1u1=True,
+                            activation=args.activation,
                         )
     elif test == "g1u1_int4":
         for dtype in (
@@ -603,6 +619,7 @@ for test in l_test:
                             topk,
                             quant="wint4afp8smoothquant",
                             use_g1u1=True,
+                            activation=args.activation,
                         )
     else:
         raise ValueError(f"Unknown test: {test}")
