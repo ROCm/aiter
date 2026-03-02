@@ -17,6 +17,7 @@ from aiter import logger
 from aiter.jit.core import AITER_CONFIGS, PY, bd_dir, get_asm_dir, mp_lock
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.moe_flydsl import flydsl_moe_stage1, flydsl_moe_stage2
 from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
 from aiter.utility import fp4_utils
 
@@ -674,6 +675,24 @@ def get_2stage_cfgs(
     intermediate_pad,
     is_shuffled=True,
 ):
+    if q_type == QuantType.lqq_1x64 and os.environ.get("AITER_USE_FLYDSL", "0") == "1":
+        return MOEMetadata(
+            functools.partial(
+                flydsl_moe_stage1,
+                experts=expert,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+            ),
+            functools.partial(
+                flydsl_moe_stage2,
+                experts=expert,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+            ),
+            block_m=0,
+            ksplit=0,
+        )
+
     return MOEMetadata(
         functools.partial(
             asm_stage1,
@@ -1090,7 +1109,6 @@ def fused_moe_2stages(
                 local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
                 local_expert_hash[local_expert_hash > 0] -= 1
                 topk_ids = local_expert_hash[topk]
-
             if fc1_smooth_scale is not None:
                 a8 = torch.empty(
                     (topk, token_num, model_dim), dtype=dtypes.i8, device=device
@@ -1103,7 +1121,8 @@ def fused_moe_2stages(
                 )
             else:
                 a8, a8_scale = aiter.pertoken_quant(
-                    hidden_states, quant_dtype=dtypes.i8
+                    hidden_states,
+                    quant_dtype=dtypes.i8,
                 )
                 a8 = a8.repeat(topk, 1, 1)
                 a8_scale = a8_scale.repeat(topk, 1, 1)
@@ -1168,6 +1187,8 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if doweight_stage1 else None,
         **extra_stage1_args,
     )
+    # if quant_type == QuantType.lqq_1x64:
+    #     return a2
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
@@ -1224,7 +1245,10 @@ def fused_moe_2stages(
             .view(token_num, -1)
         )
         a2 = a2_v
-    elif quant_type == QuantType.lqq_1x64 and metadata.stage1.func is asm_stage1:
+    elif quant_type == QuantType.lqq_1x64 and metadata.stage1.func in [
+        asm_stage1,
+        flydsl_moe_stage1,
+    ]:
         a2_qt, a2_scale = aiter.pertoken_quant(a2, quant_dtype=dtypes.i8, dtypeMax=7)
         a2 = a2_qt.view(token_num, topk, -1)
     else:
@@ -1236,7 +1260,7 @@ def fused_moe_2stages(
             num_rows_factor=topk,
         )
         a2 = a2.view(token_num, topk, inter_dim)
-
+    aiter.logger.info(f"fused_moe {quant_type} a2_scale = {a2_scale}")
     metadata.stage2(
         a2,
         w1,

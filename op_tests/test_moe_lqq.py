@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from aiter.ops.enum import QuantType
 import torch
 import aiter
+import os
 from aiter.test_common import (
     checkAllclose,
-    run_perftest,
-    perftest,
 )
 from aiter.fused_moe import (
     fused_topk,
@@ -17,10 +16,9 @@ from aiter.fused_moe import (
 )
 from aiter.ops.shuffle import shuffle_scale_zero_lqq_a8w4, shuffle_weight_lqq_a8w4
 from aiter import ActivationType
-from aiter import pertoken_quant, lqq_1x64_quant
+from aiter import lqq_1x64_quant
 from aiter import dtypes
 import argparse
-from typing import Optional
 
 
 def moe_lqq_dequant(
@@ -210,6 +208,13 @@ def test_fmoe_lqq(
     )
 
     ######################################################################################
+    # 1. Run ASM
+    old_flydsl = os.environ.get("AITER_USE_FLYDSL", "0")
+    os.environ["AITER_USE_FLYDSL"] = "0"
+    from aiter.fused_moe import get_2stage_cfgs
+
+    get_2stage_cfgs.cache_clear()
+
     out_asm = fused_moe(
         input,
         w1_lqq,
@@ -231,52 +236,46 @@ def test_fmoe_lqq(
         block_size_M=block_size_M,
     )
 
-    ######################################################################################
-    us = 1
-    _, us = run_perftest(
-        fused_moe,
-        input,
-        w1_lqq,
-        w2_lqq,
-        topk_weights,
-        topk_ids,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        a1_scale=a1_scale,
-        w1_lqq_scale=w1_lqq_scale_shf,
-        w1_lqq_zero=w1_lqq_zero_uint8_shf,
-        w2_lqq_scale=w2_lqq_scale_shf,
-        w2_lqq_zero=w2_lqq_zero_uint8_shf,
-        fc1_smooth_scale=fc1_smooth_scale,
-        quant_type=aiter.QuantType.lqq_1x64,
-        activation=aiter.ActivationType.Silu,
-        doweight_stage1=False,
-        dtype=dtype,
-        block_size_M=80,
-        num_iters=100,
-        num_warmup=2,
-    )
-
-    ######################################################################################
-    err = checkAllclose(
-        out2_ref,
-        out_asm,
-        msg=f"asm_moe:{us:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us/1000/1000:>8.2f} tflops.",
-    )
-
-    def calc_diff(x: torch.Tensor, y: torch.Tensor):
-        x, y = x.double(), y.double()
-        denominator = (x * x + y * y).sum()
-        cos_sim = torch.cosine_similarity(x.flatten(), y.flatten(), dim=0)
-        return 1 - cos_sim
-
-    logits_diff = calc_diff(out2_ref, out_asm)
-    if logits_diff > 1e-3:
-        print(
-            f"logits_diff: {logits_diff} is too large, please check the implementation"
+    # 2. Run FlyDSL if FLIR_PATH is set
+    out_flydsl = None
+    if os.getenv("FLIR_PATH"):
+        print("[test] Running FlyDSL backend...")
+        os.environ["AITER_USE_FLYDSL"] = "1"
+        get_2stage_cfgs.cache_clear()
+        aiter.logger.info(f"w1_lqq.shape: {w1_lqq.shape}")
+        aiter.logger.info(f"w2_lqq.shape: {w2_lqq.shape}")
+        out_flydsl = fused_moe(
+            input,
+            w1_lqq,
+            w2_lqq,
+            topk_weights,
+            topk_ids,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=a1_scale,
+            w1_lqq_scale=w1_lqq_scale_shf,
+            w1_lqq_zero=w1_lqq_zero_uint8_shf,
+            w2_lqq_scale=w2_lqq_scale_shf,
+            w2_lqq_zero=w2_lqq_zero_uint8_shf,
+            fc1_smooth_scale=fc1_smooth_scale,
+            quant_type=quant_type,
+            activation=act_type,
+            doweight_stage1=False,
+            dtype=dtype,
+            block_size_M=32,
         )
-    else:
-        print(f"logits_diff: {logits_diff} is acceptable")
+    os.environ["AITER_USE_FLYDSL"] = old_flydsl
+
+    ######################################################################################
+    print("[test] Comparing ASM vs Ref...")
+    checkAllclose(out_asm, out2_ref, msg="ASM vs Ref")
+
+    if out_flydsl is not None:
+        print("[test] Comparing FlyDSL vs Ref...")
+        checkAllclose(out_flydsl, out2_ref, msg="FlyDSL vs Ref")
+
+        print("[test] Comparing FlyDSL vs ASM...")
+        checkAllclose(out_flydsl, out_asm, msg="FlyDSL vs ASM")
 
 
 parser = argparse.ArgumentParser(
@@ -357,7 +356,7 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
-print(f"\nRunning moe_lqq test...")
+print("\nRunning moe_lqq test...")
 expert = 128 if args.expert is None else args.expert[0]
 topk = 6 if args.topk is None else args.topk[0]
 tokens = 208 if args.token is None else args.token[0]
