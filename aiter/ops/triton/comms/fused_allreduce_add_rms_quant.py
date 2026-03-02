@@ -17,11 +17,12 @@ Implementations:
 1. "torch" - Pure torch reference implementation (see torch_allreduce.py)
 2. "iris_oneshot" - Iris fused single-kernel allreduce+rmsnorm+quant (see iris_oneshot_allreduce.py)
 3. "iris_twoshot" - Iris two-shot reduce+broadcast allreduce+rmsnorm+quant (see iris_twoshot_allreduce.py)
-4. "iris_twoshot_row" - Same as iris_twoshot but with per-row FP8 quant (see iris_twoshot_row_allreduce.py)
+4. "iris_twoshot_row" - Same as iris_twoshot but with per-row FP8 quant + inlined Triton GEMM (see iris_twoshot_row_allreduce.py)
 5. "iris_twoshot_delayed" - Iris two-shot with delayed scaling + FP8 broadcast (see iris_twoshot_delayed_allreduce.py)
+6. "iris_twoshot_row_hipblaslt" - Same comm kernel as iris_twoshot_row but GEMM via torch._scaled_mm/hipBLASLt (see iris_twoshot_row_hipblaslt_allreduce.py)
 
-Default: "iris_twoshot_row" -- per-row FP8 quant with FP8 broadcast (halved
-cross-rank traffic, no delayed-scaling overhead).
+Default: "iris_twoshot_row_hipblaslt" -- per-row FP8 quant with FP8 broadcast
+(halved cross-rank traffic), vendor-tuned hipBLASLt GEMM.
 """
 
 import logging
@@ -35,7 +36,7 @@ __all__ = ["fused_allreduce_add_rms_quant_gemm"]
 logger = logging.getLogger(__name__)
 
 ALLREDUCE_IMPL = os.environ.get(
-    "VLLM_ROCM_FUSED_ALLREDUCE", "iris_twoshot_row"
+    "VLLM_ROCM_FUSED_ALLREDUCE", "iris_twoshot_row_hipblaslt"
 )
 
 
@@ -87,6 +88,15 @@ def fused_allreduce_add_rms_quant_gemm(
 
         return fused_allreduce_add_rms_row_quant_gemm_iris_twoshot(*args)
 
+    elif impl == "iris_twoshot_row_hipblaslt":
+        from .iris_twoshot_row_hipblaslt_allreduce import (
+            fused_allreduce_add_rms_row_quant_gemm_iris_twoshot_hipblaslt,
+        )
+
+        return fused_allreduce_add_rms_row_quant_gemm_iris_twoshot_hipblaslt(
+            *args
+        )
+
     elif impl == "iris_twoshot_delayed":
         from .iris_twoshot_delayed_allreduce import (
             fused_allreduce_add_rms_delayed_quant_gemm_iris_twoshot,
@@ -108,5 +118,6 @@ def fused_allreduce_add_rms_quant_gemm(
     else:
         raise ValueError(
             f"Unknown impl '{impl}', expected 'torch', 'iris_oneshot',"
-            f" 'iris_twoshot', 'iris_twoshot_row', or 'iris_twoshot_delayed'"
+            f" 'iris_twoshot', 'iris_twoshot_row',"
+            f" 'iris_twoshot_row_hipblaslt', or 'iris_twoshot_delayed'"
         )
