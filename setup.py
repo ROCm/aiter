@@ -43,6 +43,7 @@ def is_develop_mode():
             return True
     return False
 
+
 def write_install_mode():
     """Write install_mode so core.py uses aiter_meta/ (install) vs repo root (develop).
 
@@ -52,6 +53,7 @@ def write_install_mode():
     mode = "develop" if is_develop_mode() else "install"
     with open("./aiter/install_mode", "w") as f:
         f.write(mode)
+
 
 def prepare_packaging():
     """Copy source directories and create package metadata for non-editable installs."""
@@ -282,10 +284,17 @@ class ForcePlatlibDistribution(Distribution):
         return True
 
 
+if is_develop_mode():
+    packages = ["aiter"]
+    write_install_mode()
+else:
+    prepare_packaging()
+    packages = ["aiter_meta", "aiter"]
+
 setup(
     name=PACKAGE_NAME,
     use_scm_version=True,
-    packages=["aiter_meta", "aiter"],
+    packages=packages,
     include_package_data=True,
     package_data={
         "": ["*"],
