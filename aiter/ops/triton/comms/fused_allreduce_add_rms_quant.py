@@ -20,6 +20,7 @@ Implementations:
 4. "iris_twoshot_row" - Same as iris_twoshot but with per-row FP8 quant + inlined Triton GEMM (see iris_twoshot_row_allreduce.py)
 5. "iris_twoshot_delayed" - Iris two-shot with delayed scaling + FP8 broadcast (see iris_twoshot_delayed_allreduce.py)
 6. "iris_twoshot_row_hipblaslt" - Same comm kernel as iris_twoshot_row but GEMM via torch._scaled_mm/hipBLASLt (see iris_twoshot_row_hipblaslt_allreduce.py)
+7. "iris_twoshot_2d_hipblaslt" - 2D-tiled variant mimicking CCL two-shot structure, per-row FP8 quant + hipBLASLt GEMM (see iris_twoshot_2d_hipblaslt_allreduce.py)
 
 Default: "iris_twoshot_row_hipblaslt" -- per-row FP8 quant with FP8 broadcast
 (halved cross-rank traffic), vendor-tuned hipBLASLt GEMM.
@@ -36,7 +37,7 @@ __all__ = ["fused_allreduce_add_rms_quant_gemm"]
 logger = logging.getLogger(__name__)
 
 ALLREDUCE_IMPL = os.environ.get(
-    "VLLM_ROCM_FUSED_ALLREDUCE", "iris_twoshot_row_hipblaslt"
+    "VLLM_ROCM_FUSED_ALLREDUCE", "iris_twoshot_2d_hipblaslt"
 )
 
 
@@ -97,6 +98,15 @@ def fused_allreduce_add_rms_quant_gemm(
             *args
         )
 
+    elif impl == "iris_twoshot_2d_hipblaslt":
+        from .iris_twoshot_2d_hipblaslt_allreduce import (
+            fused_allreduce_add_rms_row_quant_gemm_iris_twoshot_2d_hipblaslt,
+        )
+
+        return fused_allreduce_add_rms_row_quant_gemm_iris_twoshot_2d_hipblaslt(
+            *args
+        )
+
     elif impl == "iris_twoshot_delayed":
         from .iris_twoshot_delayed_allreduce import (
             fused_allreduce_add_rms_delayed_quant_gemm_iris_twoshot,
@@ -119,5 +129,6 @@ def fused_allreduce_add_rms_quant_gemm(
         raise ValueError(
             f"Unknown impl '{impl}', expected 'torch', 'iris_oneshot',"
             f" 'iris_twoshot', 'iris_twoshot_row',"
-            f" 'iris_twoshot_row_hipblaslt', or 'iris_twoshot_delayed'"
+            f" 'iris_twoshot_row_hipblaslt', 'iris_twoshot_2d_hipblaslt',"
+            f" or 'iris_twoshot_delayed'"
         )
