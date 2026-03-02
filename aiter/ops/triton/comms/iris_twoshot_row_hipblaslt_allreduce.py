@@ -287,8 +287,6 @@ def fused_twoshot_allreduce_rmsnorm_row_quant_kernel(
         rank_stride,
     )
 
-    # No Step 3 — GEMM is done after kernel returns via torch._scaled_mm
-
 
 # ============================================================================
 # Manager and public API
