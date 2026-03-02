@@ -1005,12 +1005,6 @@ def test_qk_norm_rope_cache_block_quant(
     page_size = k_cache.shape[
         -2
     ]  # k_cache: [num_blocks, num_kv_heads, head_size//x, page_size, x]
-    ctx_lens = num_tokens // batch_size if num_tokens > batch_size else num_tokens
-    max_token_num_support = slot_mapping.max().item() + 1  # infer from slot_mapping
-    # Use a conservative per-batch max_token
-    max_token_per_batch = (
-        max_token_num_support // batch_size if batch_size > 0 else max_token_num_support
-    )
     #
     chunk_left_ctx_lens = 10
     chunk_total_tokens = batch_size * chunk_left_ctx_lens
