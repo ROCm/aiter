@@ -123,6 +123,7 @@ def fused_moe(
     topk_weight,
     topk_ids,
     expert_mask: Optional[torch.tensor] = None,  # EP
+    local_expert_hash: Optional[torch.Tensor] = None,  # EP
     activation=ActivationType.Silu,
     quant_type=QuantType.No,
     doweight_stage1=False,
@@ -162,6 +163,7 @@ def fused_moe(
         topk_weight=topk_weight,
         topk_ids=topk_ids,
         expert_mask=expert_mask,
+        local_expert_hash=local_expert_hash,
         activation=activation.value,
         quant_type=quant_type.value,
         doweight_stage1=doweight_stage1,
@@ -193,6 +195,7 @@ def fused_moe_fake(
     topk_weight: torch.Tensor,
     topk_ids: torch.Tensor,
     expert_mask: Optional[torch.Tensor] = None,  # EP
+    local_expert_hash: Optional[torch.Tensor] = None,  # EP
     activation: int = ActivationType.Silu.value,
     quant_type: int = QuantType.No.value,
     doweight_stage1: bool = False,
@@ -227,6 +230,7 @@ def fused_moe_(
     topk_weight: torch.Tensor,
     topk_ids: torch.Tensor,
     expert_mask: Optional[torch.Tensor] = None,  # EP
+    local_expert_hash: Optional[torch.Tensor] = None,  # EP
     activation: int = ActivationType.Silu.value,
     quant_type: int = QuantType.No.value,
     doweight_stage1: bool = False,
@@ -383,6 +387,7 @@ def fused_moe_(
             w2_lqq_zero=w2_lqq_zero,
             expert_mask=expert_mask,
             topk_ids=topk_ids,
+            local_expert_hash=local_expert_hash,
             fc1_smooth_scale=fc1_smooth_scale,
             fc2_smooth_scale=fc2_smooth_scale,
             num_local_tokens=num_local_tokens,
@@ -997,6 +1002,7 @@ def fused_moe_2stages(
     w2_lqq_zero: Optional[torch.Tensor] = None,
     expert_mask: Optional[torch.Tensor] = None,  # EP
     topk_ids: Optional[torch.Tensor] = None,  # EP
+    local_expert_hash: Optional[torch.Tensor] = None,  # EP
     fc1_smooth_scale: Optional[
         torch.Tensor
     ] = None,  # [expert(local_expert:EP), 1, model_dim]
@@ -1086,12 +1092,6 @@ def fused_moe_2stages(
             a8 = hidden_states.repeat(topk, 1, 1)
             a8_scale = a1_scale.repeat(topk, 1, 1)
         else:
-            if expert_mask is not None:
-                local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
-                local_expert_hash[local_expert_hash > 0] -= 1
-                topk_ids = local_expert_hash[topk]
-
-            """
             if fc1_smooth_scale is not None:
                 a8 = torch.empty(
                     (topk, token_num, model_dim), dtype=dtypes.i8, device=device
@@ -1099,20 +1099,28 @@ def fused_moe_2stages(
                 a8_scale = torch.empty(
                     (topk, token_num, 1), dtype=dtypes.fp32, device=device
                 )
-                aiter.moe_smoothquant_fwd(
-                    a8, hidden_states, fc1_smooth_scale, topk_ids, a8_scale
+                aiter.smooth_per_token_scaled_quant(
+                    a8.view(topk, token_num, model_dim).transpose(
+                        0, 1
+                    ),  # [token, topk, model_dim]
+                    hidden_states.view(token_num, 1, model_dim).expand(
+                        -1, topk, -1
+                    ),  # [token, topk, model_dim]
+                    a8_scale.view(topk * token_num),
+                    fc1_smooth_scale.to(dtypes.fp32).contiguous(),  # [E, model_dim]
+                    topk_ids.to(
+                        dtypes.i32
+                    ),  # [token, topk] - global expert ids as smooth_scale_map
+                    smooth_scale_map_hash=local_expert_hash,
+                    enable_ps=True,
                 )
             else:
                 a8, a8_scale = aiter.pertoken_quant(
-                    hidden_states, quant_dtype=dtypes.i8
+                    hidden_states,
+                    quant_dtype=dtypes.i8,
                 )
                 a8 = a8.repeat(topk, 1, 1)
                 a8_scale = a8_scale.repeat(topk, 1, 1)
-            """
-            # @Yan.Dai please fixme for smoothquant
-            a8, a8_scale = aiter.pertoken_quant(hidden_states, quant_dtype=dtypes.i8)
-            a8 = a8.repeat(topk, 1, 1)
-            a8_scale = a8_scale.repeat(topk, 1, 1)
 
         a1 = a8
         a1_scale = a8_scale
@@ -1233,18 +1241,23 @@ def fused_moe_2stages(
             .view(token_num, -1)
         )
         a2 = a2_v
-    elif quant_type == QuantType.lqq_1x64 and metadata.stage1.func is asm_stage1:
-        a2_qt, a2_scale = aiter.pertoken_quant(a2, quant_dtype=dtypes.i8)
-        a2 = a2_qt.view(token_num, topk, -1)
-    else:
-        a2, a2_scale = quant_func(
+    elif quant_type == QuantType.lqq_1x64:
+        a2 = a2.view(token_num, topk, -1)
+        a2_out = torch.empty(
+            (token_num, topk, inter_dim), dtype=dtypes.i8, device=device
+        )
+        a2_scale = torch.empty((token_num, topk, 1), dtype=dtypes.fp32, device=device)
+        aiter.smooth_per_token_scaled_quant(
+            a2_out,
             a2,
-            scale=a2_scale,
-            quant_dtype=q_dtype_a,
+            a2_scale,
+            fc2_smooth_scale.to(dtypes.fp32).contiguous(),
+            topk_ids.contiguous(),
+            smooth_scale_map_hash=local_expert_hash,  # Optional EP hash for global->local mapping
             num_rows=num_local_tokens,
             num_rows_factor=topk,
         )
-        a2 = a2.view(token_num, topk, inter_dim)
+        a2 = a2_out
 
     metadata.stage2(
         a2,
@@ -1435,6 +1448,8 @@ def torch_moe(
     if fc1_smooth_scale is not None:
         expert = fc1_smooth_scale.shape[0]
         fc1_smooth_scale = fc1_smooth_scale.view(expert, -1)
+    if fc2_smooth_scale is not None:
+        expert = fc2_smooth_scale.shape[0]
         fc2_smooth_scale = fc2_smooth_scale.view(expert, -1)
 
     for E_id in range(w1.shape[0]):
