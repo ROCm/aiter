@@ -164,26 +164,11 @@ def _inlined_device_barrier(
 
 
 # ============================================================================
-# Autotune configs (shared with iris_twoshot_2d_hipblaslt_allreduce.py)
-# ============================================================================
-
-FUSED_ALLREDUCE_AUTOTUNE_CONFIGS = [
-    triton.Config({}, num_warps=16, num_stages=2),  # best for 1D
-    triton.Config({}, num_warps=8, num_stages=1),   # best for 2D
-]
-
-
-# ============================================================================
 # Fused two-shot AllReduce + RMSNorm + per-row FP8 Quant kernel (1D row)
 # (Communication only — no GEMM. GEMM is done via torch._scaled_mm.)
 # ============================================================================
 
 
-@triton.autotune(
-    configs=FUSED_ALLREDUCE_AUTOTUNE_CONFIGS,
-    key=["M", "N"],
-    use_cuda_graph=True,
-)
 @triton.jit
 def persistent_fused_allreduce_rmsnorm_row_quant_two_shot(
     # Symmetric heap buffers
@@ -701,7 +686,6 @@ class IrisTwoshotRowHipblasltManager:
         heap_bases = shmem.get_heap_bases()
 
         # ---- Tunable parameters ----
-        # num_warps and num_stages are in FUSED_ALLREDUCE_AUTOTUNE_CONFIGS
         num_xcds = iris.hip.get_num_xcc()
         BLOCK_SIZE_N = triton.next_power_of_2(N)
         ACTUAL_N = N
@@ -709,6 +693,9 @@ class IrisTwoshotRowHipblasltManager:
         DISTRIBUTION = 1       # 0=striding, 1=block
         COMM_SMS = 128
         CHUNK_SIZE = _compute_chunk_size(COMM_SMS, num_xcds)
+        NUM_WARPS = 16
+        NUM_STAGES = 2
+        WAVES_PER_EU = 1
         # ---- End tunable parameters ----
 
         # Reset sync buffer before kernel launch
@@ -716,10 +703,7 @@ class IrisTwoshotRowHipblasltManager:
         self._barrier_done.zero_()
 
         # Launch kernel
-        def grid(META):
-            return (COMM_SMS,)
-
-        persistent_fused_allreduce_rmsnorm_row_quant_two_shot[grid](
+        persistent_fused_allreduce_rmsnorm_row_quant_two_shot[(COMM_SMS,)](
             iris_input,
             quant_heap,
             scale_heap,
@@ -758,6 +742,9 @@ class IrisTwoshotRowHipblasltManager:
             num_xcds,
             CHUNK_SIZE,
             DISTRIBUTION,
+            num_warps=NUM_WARPS,
+            num_stages=NUM_STAGES,
+            waves_per_eu=WAVES_PER_EU,
         )
 
         # Step 3: hipBLASLt GEMM via torch._scaled_mm
