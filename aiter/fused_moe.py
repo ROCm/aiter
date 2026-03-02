@@ -1208,7 +1208,7 @@ def fused_moe_2stages(
             if expert_mask is not None:
                 local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
                 local_expert_hash[local_expert_hash > 0] -= 1
-                topk_ids = local_expert_hash[topk]
+                topk_ids = local_expert_hash[topk_ids]
             if fc1_smooth_scale is not None:
                 a8 = torch.empty(
                     (topk, token_num, model_dim), dtype=dtypes.i8, device=device
