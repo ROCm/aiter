@@ -101,7 +101,7 @@ def make_layout_3d(
             transposed=True,
             warp_bases=[(1 << i, 0) for i in range(int(math.log2(num_warps)))],
             reg_bases=[],
-            instr_shape=[16, 16, 32],
+            instr_shape=[16, 16, 32 if kv_cache_dtype == torch.bfloat16 else 64],
         )
 
         PV_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
@@ -109,7 +109,7 @@ def make_layout_3d(
             transposed=True,
             warp_bases=[(0, 1 << i) for i in range(int(math.log2(num_warps)))],
             reg_bases=[],
-            instr_shape=[16, 16, 32],
+            instr_shape=[16, 16, 32 if kv_cache_dtype == torch.bfloat16 else 64],
         )
         Q_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
             operand_index=0, parent=QK_WMMA_LAYOUT, k_width=8
@@ -383,7 +383,10 @@ def select_3d_config(
     if use_tdm:
         # With TDM async_copy pipelined, use_swizzle will be ignored (padded smem layout is used always)
         attn_impl = gluon_kernel_unified_attention_3d_tdm
-        layout_configs = {"NUM_BLOCKS_GATHER_PER_TILE": num_tdm_gather}
+        layout_configs = {
+            "NUM_BLOCKS_GATHER_PER_TILE": num_tdm_gather,
+            "FP8_WMMA": (kv_cache_dtype == e4m3_dtype),
+        }
         attn_stages = 2
     else:
         if use_async:

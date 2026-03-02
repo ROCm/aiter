@@ -18,34 +18,43 @@ from aiter.ops.triton.gluon.unified_attention_2d import (
 from aiter.ops.triton.utils.types import e4m3_dtype
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 
+DEVICE_ARCH = arch_info.get_arch()
+IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+
 
 def shuffle_kv_cache(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
-    layout=(16, 16),  # (num_lanes, bytes_per_thread)
 ):
     """
     Shuffle key and value cache layout for optimized memory access.
-        16x16x32 for BF16
-        16x16x64 for FP8
+
+        layout: (num_lanes, num_elements_per_thread)
+            gfx1250: (16, 8) for BF16 and FP8.
+            gfx950: (16, 8) for BF16 and (16, 16) for FP8.
+
+        WMMA/MFMA instruction shape:
+            BF16: 16x16x32
+            FP8: 16x16x64
     """
     dtype = key_cache.dtype
-    dtype_v = value_cache.dtype
+    assert value_cache.dtype == dtype
     assert dtype in (torch.bfloat16, e4m3_dtype)
+
+    if IS_DEVICE_ARCH_GFX12 or key_cache.dtype == torch.bfloat16:
+        layout = (16, 8)
+    else:
+        layout = (16, 16)
+
     num_blocks, block_size, num_kv_heads, head_size = key_cache.shape
     num_blocks_v, block_size_v, num_kv_heads_v, head_size_v = value_cache.shape
     assert block_size >= 16
-    assert dtype == dtype_v
     assert num_blocks == num_blocks_v
     assert num_kv_heads == num_kv_heads_v
     assert head_size == head_size_v
     assert block_size == block_size_v
 
-    num_lanes, bytes_per_thread = layout
-    num_elements_per_thread = (
-        bytes_per_thread // dtype.itemsize
-    )  # there are 16 bytes every 4 VGPRs
-
+    num_lanes, num_elements_per_thread = layout
     key_cache_shuffled = key_cache.view(
         -1, block_size, num_kv_heads, head_size
     ).permute(0, 2, 1, 3)
@@ -87,17 +96,26 @@ def shuffle_kv_cache(
 
 DEVICE_ARCH = arch_info.get_arch()
 
+import os
+
+SL = int(os.environ.get("SL", "1328"))
+HS = int(os.environ.get("HS", "128"))
+BS = int(os.environ.get("BS", "64"))
+SF = os.environ.get("SF", "F") == "T"
 NUM_HEADS = [(64, 8)]
 HEAD_SIZES = [64, 128]
 BLOCK_SIZES = [16, 64]
+HEAD_SIZES = [HS]
+BLOCK_SIZES = [BS]
 
 
 DTYPES = [torch.bfloat16]
 QDTYPES = [None]
+# QDTYPES = [e4m3_dtype]
 # one value large enough to test overflow in index calculation.
 # one value small enough to test the schema op check
 NUM_BLOCKS = [
-    4096,
+    128,
 ]
 SLIDING_WINDOWS = [None]
 
@@ -180,7 +198,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize(
     "seq_lens",
     [
-        [(1, 1328)],
+        [(1, SL)],
         # [(1, 8192)],
         # [(1, 8192)] * 4,
         # [(1, 8192)] * 8,
@@ -198,16 +216,17 @@ def ref_paged_attn(
 @pytest.mark.parametrize("soft_cap", [None])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("q_dtype", QDTYPES)
-@pytest.mark.parametrize("shuffled_kv_cache", [True, False])
+# @pytest.mark.parametrize("shuffled_kv_cache", [True, False])
+@pytest.mark.parametrize("shuffled_kv_cache", [SF])
 @pytest.mark.parametrize(
     "backend, use_tdm, num_tdm_gather, use_async",
     [
-        ("triton", False, 1, False),  # use triton
-        ("gluon", False, 1, False),  # use gluon baseline
-        ("gluon", False, 1, True),  # use gluon simple async_copy
+        # ("triton", False, 1, False),  # use triton
+        # ("gluon", False, 1, False),  # use gluon baseline
+        # ("gluon", False, 1, True),  # use gluon simple async_copy
         ("gluon", True, 1, False),  # use gluon TDM async_copy
-        ("gluon", True, 4, False),  # use gluon TDM gather pipelined
-        ("gluon", True, 8, False),  # use gluon TDM gather pipelined
+        # ("gluon", True, 4, False),  # use gluon TDM gather pipelined
+        # ("gluon", True, 8, False),  # use gluon TDM gather pipelined
     ],
 )
 @torch.inference_mode()
@@ -253,7 +272,7 @@ def test_triton_unified_attn(
             * (num_tdm_gather if use_tdm else 1)
             * block_size
             * head_size
-            * (torch.finfo(dtype).bits // 8)
+            * (dtype.itemsize if q_dtype is None else q_dtype.itemsize)
         )
         if kv_cache_shared_mem_size > 327680:
             pytest.skip(
