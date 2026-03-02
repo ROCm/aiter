@@ -15,4 +15,3 @@ requires = [
 write_to = "aiter/_version.py"
 write_to_template = "__version__ = '{version}'\n"
 fallback_version = "0.1.0"
-
