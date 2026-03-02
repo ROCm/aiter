@@ -71,13 +71,10 @@ struct alignas(16) VecT8 {
   }
 
   __device__ __forceinline__ void fill(T val) {
-    using T2 = typename std::conditional<
-        std::is_same<T, __half>::value, __half2, __hip_bfloat162>::type;
-    
-    T2 v2 = {val, val}; 
-    T2* p2 = reinterpret_cast<T2*>(d);
     #pragma unroll
-    for (int i = 0; i < 4; ++i) p2[i] = v2;
+    for (int i = 0; i < static_cast<int>(VEC_SIZE); ++i) {
+      d[i] = val;
+    }
   }
   
   __device__ __forceinline__ T& operator[](size_t i) { return d[i]; }
