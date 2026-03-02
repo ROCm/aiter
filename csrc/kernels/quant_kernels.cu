@@ -457,7 +457,7 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
         std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
             ? 0.25
             : (1. / ck_tile::type_convert<float>(ck_tile::numeric<DTYPE_O>::max()));
-    const int64_t row_offset      = token_idx * cols;
+    const int64_t row_offset      = (int64_t)token_idx * cols;
     auto const* ptr_i             = reinterpret_cast<DTYPE_I const*>(input + row_offset);
     auto const* input_vecs        = reinterpret_cast<vec_i const*>(ptr_i);
     static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
@@ -582,8 +582,7 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                 scale[out_token_idx] = row_scale;
             }
         }
-
-        int64_t out_offset = out_token_idx * cols;    
+        int64_t out_offset = (int64_t)out_token_idx * cols;
         scaled_quant_vgpr_impl<float, DTYPE_O, thread_data_size>(out, vec_ptr, &row_scale, cols, out_offset);
     }
 }

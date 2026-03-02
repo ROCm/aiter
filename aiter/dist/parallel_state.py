@@ -20,6 +20,7 @@ If you only need to use the distributed environment without model/pipeline
  parallelism, you can skip the model parallel initialization and destruction
  steps.
 """
+
 import contextlib
 import pickle
 import weakref
@@ -149,7 +150,11 @@ def fused_allreduce_rmsnorm_quant_fake(
     eps: float,
     group_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return torch.empty_like(res_inp), torch.empty_like(inp), torch.empty(inp.shape[:-1] + (1,), dtype=torch.float32, device=inp.device())
+    return (
+        torch.empty_like(res_inp),
+        torch.empty_like(inp),
+        torch.empty(inp.shape[:-1] + (1,), dtype=torch.float32, device=inp.device()),
+    )
 
 
 @torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_fake)
@@ -399,7 +404,7 @@ class GroupCoordinator:
         return fused_allreduce_rmsnorm_(
             input_, residual_inp_, weight_, eps, group_name=self.unique_name
         )
-    
+
     def fused_allreduce_rmsnorm_quant(
         self,
         input_: torch.Tensor,
@@ -423,7 +428,7 @@ class GroupCoordinator:
         return self.device_communicator.fused_allreduce_rmsnorm(
             input_, residual_inp_, weight_, eps
         )
-    
+
     def _fused_allreduce_rmsnorm_quant_out_place(
         self,
         input_: torch.Tensor,
@@ -1302,6 +1307,16 @@ def destroy_model_parallel():
     if _PP:
         _PP.destroy()
     _PP = None
+
+    global _DP
+    if _DP:
+        _DP.destroy()
+    _DP = None
+
+    global _EP
+    if _EP:
+        _EP.destroy()
+    _EP = None
 
 
 def destroy_distributed_environment():

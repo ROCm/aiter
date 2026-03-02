@@ -173,7 +173,7 @@ def run_torch2(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @perftest()
-def run_asm(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
+def run_asm(x, weight, x_scale, w_scale, dtype=dtypes.bf16, kernel_name=None):
     m, k = x.shape
     n, _ = weight.shape
     out = torch.empty((m, n), dtype=dtype, device=x.device)
