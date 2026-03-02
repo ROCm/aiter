@@ -1,6 +1,8 @@
 import argparse
 import csv
+import functools
 import io
+import json
 import logging
 import os
 import re
@@ -11,7 +13,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
-from typing import Iterable, Literal, Optional, Self, get_args
+from typing import Iterable, Literal, Optional, get_args
 
 import matplotlib.pyplot as plt
 from triton import next_power_of_2
@@ -248,54 +250,6 @@ class Model:
                 _logged_hdim_warnings.add(warning_key)
 
         return (effective_dqk, effective_dv)
-
-    @classmethod
-    def new(cls, name: str) -> "ModelBuilder":
-        return ModelBuilder(name)
-
-
-class ModelBuilder:
-    name: str
-    hq: int
-    hkv: int
-    dqk: int
-    dv: int
-    use_mla: bool = False
-
-    def __init__(self, name: str) -> None:
-        self.name = name
-
-    def h(self, h: int) -> Self:
-        self.hq = self.hkv = h
-        return self
-
-    def h_q_vk(self, hq: int, hkv: int) -> Self:
-        self.hq = hq
-        self.hkv = hkv
-        return self
-
-    def d(self, d: int) -> Self:
-        self.dqk = self.dv = d
-        return self
-
-    def d_qk_v(self, dqk: int, dv: int) -> Self:
-        self.dqk = dqk
-        self.dv = dv
-        return self
-
-    def mla(self) -> Self:
-        self.use_mla = True
-        return self
-
-    def build(self) -> Model:
-        return Model(
-            name=self.name,
-            hq=self.hq,
-            hkv=self.hkv,
-            dqk=self.dqk,
-            dv=self.dv,
-            use_mla=self.use_mla,
-        )
 
 
 TpDegree = Literal[1, 2, 4, 8]
@@ -663,18 +617,183 @@ def run_bench(args: BenchArgs, metric: Metric) -> Optional[float]:
     return perf
 
 
+@functools.lru_cache(maxsize=1)
+def load_models(filename: str = "model_shapes.json") -> list[Model]:
+    json_path: Path = Path(filename)
+    if not json_path.is_absolute():
+        json_path = Path(__file__).resolve().parent / json_path
+
+    if not json_path.exists():
+        logging.critical("Model shapes file [%s] does not exist.", json_path)
+        raise SystemExit(1)
+    if not json_path.is_file():
+        logging.critical("Model shapes path [%s] is not a regular file.", json_path)
+        raise SystemExit(1)
+
+    try:
+        with json_path.open("r", encoding="utf-8") as file:
+            root: object = json.load(file)
+    except OSError as e:
+        logging.critical(
+            "Unable to open model shapes file [%s]. %s: %s",
+            json_path,
+            type(e).__name__,
+            e,
+        )
+        raise SystemExit(1) from e
+    except json.JSONDecodeError as e:
+        logging.critical(
+            "Invalid JSON in model shapes file [%s]. %s: %s",
+            json_path,
+            type(e).__name__,
+            e,
+        )
+        raise SystemExit(1) from e
+
+    if not isinstance(root, dict):
+        logging.critical(
+            "Invalid model shapes format in [%s]. Top-level JSON value must be an object.",
+            json_path,
+        )
+        raise SystemExit(1)
+
+    models: list[Model] = []
+    for base_name_raw, backends_raw in root.items():
+        if not isinstance(base_name_raw, str) or not base_name_raw.strip():
+            logging.error(
+                "Skipping malformed model entry with invalid name key type/value: %r",
+                base_name_raw,
+            )
+            continue
+        base_name: str = base_name_raw.strip()
+
+        if not isinstance(backends_raw, dict):
+            logging.error(
+                "Skipping model '%s': expected object for model payload, got %s.",
+                base_name,
+                type(backends_raw).__name__,
+            )
+            continue
+
+        for backend_name, use_mla in (("mha", False), ("mla", True)):
+            entries_raw: object = backends_raw.get(backend_name)
+            if entries_raw is None:
+                continue
+            if not isinstance(entries_raw, list):
+                logging.error(
+                    "Skipping '%s' backend for model '%s': expected list, got %s.",
+                    backend_name,
+                    base_name,
+                    type(entries_raw).__name__,
+                )
+                continue
+
+            for idx, entry_raw in enumerate(entries_raw):
+                if not isinstance(entry_raw, dict):
+                    logging.error(
+                        "Skipping malformed %s entry #%d for model '%s': expected object, got %s.",
+                        backend_name,
+                        idx,
+                        base_name,
+                        type(entry_raw).__name__,
+                    )
+                    continue
+
+                comment_raw: object = entry_raw.get("comment")
+                if comment_raw is None:
+                    model_name: str = base_name
+                elif isinstance(comment_raw, str):
+                    model_name = (
+                        f"{base_name} ({comment_raw.strip()})"
+                        if comment_raw.strip()
+                        else base_name
+                    )
+                else:
+                    logging.error(
+                        "Skipping malformed %s entry #%d for model '%s': 'comment' must be a string.",
+                        backend_name,
+                        idx,
+                        base_name,
+                    )
+                    continue
+
+                hq_raw: object = entry_raw.get("hq")
+                hkv_raw: object = entry_raw.get("hkv")
+                dqk_raw: object = entry_raw.get("dqk")
+                dv_raw: object = entry_raw.get("dv")
+
+                # In Python, bool is a subclass of int, so True/False pass `isinstance(..., int)`.
+                # We want to reject Booleans as valid values, so we explicitly check for bool.
+                if not isinstance(hq_raw, int) or isinstance(hq_raw, bool):
+                    logging.error(
+                        "Skipping malformed %s entry #%d for model '%s': '%s' must be an integer.",
+                        backend_name,
+                        idx,
+                        base_name,
+                        "hq",
+                    )
+                    continue
+                if not isinstance(hkv_raw, int) or isinstance(hkv_raw, bool):
+                    logging.error(
+                        "Skipping malformed %s entry #%d for model '%s': '%s' must be an integer.",
+                        backend_name,
+                        idx,
+                        base_name,
+                        "hkv",
+                    )
+                    continue
+                if not isinstance(dqk_raw, int) or isinstance(dqk_raw, bool):
+                    logging.error(
+                        "Skipping malformed %s entry #%d for model '%s': '%s' must be an integer.",
+                        backend_name,
+                        idx,
+                        base_name,
+                        "dqk",
+                    )
+                    continue
+                if not isinstance(dv_raw, int) or isinstance(dv_raw, bool):
+                    logging.error(
+                        "Skipping malformed %s entry #%d for model '%s': '%s' must be an integer.",
+                        backend_name,
+                        idx,
+                        base_name,
+                        "dv",
+                    )
+                    continue
+
+                try:
+                    model = Model(
+                        name=model_name,
+                        hq=hq_raw,
+                        hkv=hkv_raw,
+                        dqk=dqk_raw,
+                        dv=dv_raw,
+                        use_mla=use_mla,
+                    )
+                except Exception as e:
+                    logging.error(
+                        "Skipping invalid %s entry #%d for model '%s'. %s: %s",
+                        backend_name,
+                        idx,
+                        base_name,
+                        type(e).__name__,
+                        e,
+                    )
+                    continue
+
+                models.append(model)
+
+    if not models:
+        logging.critical(
+            "No valid model entries found in model shapes file: %s", json_path
+        )
+        raise SystemExit(1)
+
+    return models
+
+
 def get_models(model_filter: Optional[str] = None) -> list[Model]:
-    all_models: list[Model] = [
-        Model.new("Llama3 405B").h_q_vk(128, 8).d(128).build(),
-        Model.new("Llama3 70B").h_q_vk(64, 8).d(128).build(),
-        Model.new("Llama3 8B").h_q_vk(32, 8).d(128).build(),
-        Model.new("Llama4 Maverick (Text)").h_q_vk(40, 8).d(128).build(),
-        Model.new("Llama4 Maverick (Vision)").h(16).d(88).build(),
-        Model.new("Qwen-235B-A22B").h_q_vk(64, 4).d(128).build(),
-        Model.new("GPT-OSS 120B").h_q_vk(64, 8).d(64).build(),
-        Model.new("DeepSeek V3 (Prefill)").h(128).d_qk_v(192, 128).build(),
-        Model.new("DeepSeek V3 (Decode)").mla().h_q_vk(128, 1).d_qk_v(576, 512).build(),
-    ]
+    all_models: list[Model] = load_models()
     model_names: list[str] = [model.name for model in all_models]
     assert len(model_names) == len(
         set(model_names)
@@ -722,9 +841,11 @@ def list_models() -> None:
 
 
 def get_tp_models(
-    models: list[Model] = get_models(),
+    models: Optional[list[Model]] = None,
     tps: Iterable[TpDegree] = get_args(TpDegree),
 ) -> list[TpModel]:
+    if models is None:
+        models = get_models()
     return [TpModel(model=model, tp=tp) for model, tp in product(models, tps)]
 
 
@@ -747,7 +868,7 @@ class Range:
 def get_bench_args(
     kernels: Iterable[Kernel] = get_args(Kernel),
     layouts: Iterable[Layout] = get_args(Layout),
-    tp_models: list[TpModel] = get_tp_models(),
+    tp_models: Optional[list[TpModel]] = None,
     batch_range: Range = Range(
         start=DEFAULT_BATCH_START, inc=DEFAULT_BATCH_INC, end=DEFAULT_BATCH_END
     ),
@@ -755,6 +876,8 @@ def get_bench_args(
         start=DEFAULT_SEQ_START, inc=DEFAULT_SEQ_INC, end=DEFAULT_SEQ_END
     ),
 ) -> list[BenchArgs]:
+    if tp_models is None:
+        tp_models = get_tp_models()
     # MHA kernel backend:
     bench_args: list[BenchArgs] = [
         BenchArgs(kernel=kernel, layout=layout, tp_model=tp_model, b=b, s=s)
