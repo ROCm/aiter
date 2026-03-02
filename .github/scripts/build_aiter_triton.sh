@@ -22,7 +22,8 @@ if [[ "$BUILD_TRITON" == "1" ]]; then
     echo
     echo "==== Install triton ===="
     pip uninstall -y triton || true
-    git clone https://github.com/triton-lang/triton && cd triton && git checkout c147f098
+    git clone --depth=1 https://github.com/triton-lang/triton || true
+    cd triton
     pip install -r python/requirements.txt
     pip install filecheck
     # NetworkX is a dependency of Triton test selection script

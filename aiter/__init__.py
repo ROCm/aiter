@@ -74,6 +74,7 @@ from .ops.custom_all_reduce import *  # noqa: F403,E402
 from .ops.quick_all_reduce import *  # noqa: F403,E402
 from .ops.moe_op import *  # noqa: F403,E402
 from .ops.moe_sorting import *  # noqa: F403,E402
+from .ops.moe_sorting_opus import *  # noqa: F403,E402
 from .ops.pos_encoding import *  # noqa: F403,E402
 from .ops.cache import *  # noqa: F403,E402
 from .ops.rmsnorm import *  # noqa: F403,E402
@@ -88,6 +89,7 @@ from .ops.sample import *  # noqa: F403,E402
 from .ops.fused_qk_norm_mrope_cache_quant import *  # noqa: F403,E402
 from .ops.fused_qk_norm_rope_cache_quant import *  # noqa: F403,E402
 from .ops.groupnorm import *  # noqa: F403,E402
+from .ops.causal_conv1d import *  # noqa: F403,E402
 from . import mla  # noqa: F403,F401,E402
 
 # Import Triton-based communication primitives from ops.triton.comms (optional, only if Iris is available)
