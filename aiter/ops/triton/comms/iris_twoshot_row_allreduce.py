@@ -495,8 +495,11 @@ class IrisTwoshotRowManager:
 
         # Pre-allocated output buffers (regular GPU memory)
         self._out_result: Optional[torch.Tensor] = None
-        self._out_gemm: Optional[torch.Tensor] = None  # (M, K_GEMM)
-        self._out_gemm_K: int = 0
+        # Dict of GEMM output buffers keyed by K_GEMM dimension.
+        # Different layers have different GEMM output dims (e.g. 1280, 3584,
+        # 8192 in Llama 70B). Each needs a contiguous buffer because
+        # Inductor asserts contiguous strides on custom op outputs.
+        self._out_gemm_bufs: dict[int, torch.Tensor] = {}
 
         # Inlined device barrier state
         self._barrier_flags: Any = None  # on symmetric heap
@@ -667,44 +670,54 @@ class IrisTwoshotRowManager:
         Returns (result_out, gemm_out).
         result_out stores BF16 allreduce result (only owned rows are valid).
         gemm_out stores the GEMM output (M, K_GEMM) in out_dtype.
+
+        GEMM buffers are keyed by K_GEMM because different layers have
+        different output dimensions (e.g. 1280, 3584, 8192 in Llama 70B)
+        and Inductor requires contiguous output tensors.
         """
-        need_alloc = (
+        need_result = (
             self._out_result is None
             or M > self._out_result.shape[0]
             or N != self._out_result.shape[1]
-            or self._out_gemm is None
-            or K_GEMM > self._out_gemm_K
         )
+        need_gemm = (
+            K_GEMM not in self._out_gemm_bufs
+            or M > self._out_gemm_bufs[K_GEMM].shape[0]
+        )
+        need_barrier = self._barrier_done is None
 
-        if need_alloc:
+        if need_result or need_gemm or need_barrier:
             if torch.cuda.is_current_stream_capturing():
                 existing_M = (
                     self._out_result.shape[0]
                     if self._out_result is not None
                     else 0
                 )
-                existing_K = self._out_gemm_K or 0
                 raise RuntimeError(
                     f"Iris (twoshot-row): output buffers too small for "
                     f"M={M}, K_GEMM={K_GEMM} "
-                    f"(allocated M={existing_M}, K={existing_K}). "
+                    f"(allocated M={existing_M}, "
+                    f"K_GEMM keys={list(self._out_gemm_bufs.keys())}). "
                     f"Cannot allocate during CUDA graph capture."
                 )
 
-            alloc_K = max(K_GEMM, self._out_gemm_K or 0)
-            self._out_result = torch.empty((M, N), dtype=dtype, device=device)
-            self._out_gemm = torch.empty(
-                (M, alloc_K), dtype=out_dtype, device=device
-            )
-            self._out_gemm_K = alloc_K
+            if need_result:
+                self._out_result = torch.empty(
+                    (M, N), dtype=dtype, device=device,
+                )
 
-            # Inlined barrier: CTA 0 -> other CTAs signal
-            self._barrier_done = torch.zeros(
-                1, dtype=torch.int32, device=device
-            )
-            self._barrier_epoch = torch.zeros(
-                1, dtype=torch.int32, device=device
-            )
+            if need_gemm:
+                self._out_gemm_bufs[K_GEMM] = torch.empty(
+                    (M, K_GEMM), dtype=out_dtype, device=device,
+                )
+
+            if need_barrier:
+                self._barrier_done = torch.zeros(
+                    1, dtype=torch.int32, device=device
+                )
+                self._barrier_epoch = torch.zeros(
+                    1, dtype=torch.int32, device=device
+                )
 
             cur_rank = (
                 torch.distributed.get_rank()
@@ -718,9 +731,9 @@ class IrisTwoshotRowManager:
             )
 
         assert self._out_result is not None
-        assert self._out_gemm is not None
+        gemm_out = self._out_gemm_bufs[K_GEMM]
 
-        return self._out_result[:M], self._out_gemm[:M, :K_GEMM]
+        return self._out_result[:M], gemm_out[:M]
 
     def fused_allreduce_rmsnorm_row_quant_gemm(
         self,
