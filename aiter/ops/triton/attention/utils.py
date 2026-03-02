@@ -52,9 +52,9 @@ def block_attn_mask_to_ragged_lut(
     if return_none_if_dense and block_attn_mask.all():
         return None
 
-    counts = block_attn_mask.long().sum(dim=-1)
-    lut_count = counts.reshape(-1).to(torch.int32)
-    lut_start = (torch.cumsum(lut_count, dim=0) - lut_count).to(torch.int32)
+    counts = block_attn_mask.to(torch.int32).sum(dim=-1)
+    lut_count = counts.reshape(-1)
+    lut_start = (torch.cumsum(lut_count, dim=0) - lut_count)
 
     total_count = lut_count.sum()
     kv_block_indices = torch.empty(
