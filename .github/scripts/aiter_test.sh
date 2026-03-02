@@ -32,14 +32,18 @@ skip_tests=(
     "op_tests/multigpu_tests/triton_test/test_fused_rs_rmsnorm_quant_ag.py"
 )
 
-# tests are split into 5 shards, each shard is called a shard
-sharded_files=()
-for idx in "${!files[@]}"; do
-    # modulo operation is used to determine which shard the test belongs to
-    if (( idx % SHARD_TOTAL == SHARD_IDX )); then
-        sharded_files+=("${files[$idx]}")
-    fi
-done
+# When AITER_TEST is set, files are already the exact list for this shard (from artifact).
+# Otherwise, apply modulo to split "all files" into shards by index.
+if [[ -n "${AITER_TEST:-}" ]]; then
+    sharded_files=("${files[@]}")
+else
+    sharded_files=()
+    for idx in "${!files[@]}"; do
+        if (( idx % SHARD_TOTAL == SHARD_IDX )); then
+            sharded_files+=("${files[$idx]}")
+        fi
+    done
+fi
 
 echo "Running ${sharded_files[@]} in shard $SHARD_IDX of $SHARD_TOTAL."
 
