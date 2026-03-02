@@ -287,6 +287,7 @@ def test_fmoe_lqq(
     print("[test] w2_lqq_scale  : ", w2_lqq_scale.shape, w2_lqq_scale.dtype)
     print("[test] w2_lqq_zero   : ", w2_lqq_zero.shape, w2_lqq_zero.dtype)
 
+    """
     out1_ref = torch_moe_stage1(
         a1_qt,
         w1_qt,
@@ -314,6 +315,12 @@ def test_fmoe_lqq(
         w2_scale=w2_scale,
         doweight=True,
     )
+
+    print("[test] out1_ref      : ", out1_ref.shape, out1_ref.dtype)
+    print("[test] a2_qt         : ", a2_qt.shape, a2_qt.dtype)
+    print("[test] a2_scale      : ", a2_scale.shape, a2_scale.dtype)
+    print("[test] out2_ref      : ", out2_ref.shape, out2_ref.dtype)
+    """
     out_ref = torch_moe(
         input,
         w1_qt,
@@ -324,7 +331,7 @@ def test_fmoe_lqq(
         fc2_scale=w2_scale,
         fc1_smooth_scale=None,
         fc2_smooth_scale=None,
-        expert_mask=None,
+        expert_mask=expert_mask,
         activation=act_type,
     )
 
@@ -335,6 +342,7 @@ def test_fmoe_lqq(
         w2_lqq,
         topk_weights,
         topk_ids,
+        expert_mask=expert_mask,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         a1_scale=a1_scale,
@@ -349,11 +357,6 @@ def test_fmoe_lqq(
         dtype=dtype,
         block_size_M=block_size_M,
     )
-    print("[test] out1_ref      : ", out1_ref.shape, out1_ref.dtype)
-    print("[test] a2_qt         : ", a2_qt.shape, a2_qt.dtype)
-    print("[test] a2_scale      : ", a2_scale.shape, a2_scale.dtype)
-    print("[test] out2_ref      : ", out2_ref.shape, out2_ref.dtype)
-    print("[test] out_asm       : ", out_asm.shape, out_asm.dtype)
 
     ######################################################################################
     checkAllclose(out_ref, out_asm)
@@ -393,12 +396,12 @@ def test_fmoe_lqq(
         activation=aiter.ActivationType.Silu,
         doweight_stage1=False,
         dtype=dtype,
-        block_size_M=80,
+        block_size_M=block_size_M,
         num_iters=100,
         num_warmup=2,
     )
     print(
-        "asm_moe:{us:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us/1000/1000:>8.2f} tflops."
+        f"sub_X = {block_size_M} : {us:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us/1000/1000:>8.2f} tflops."
     )
 
 
@@ -486,8 +489,8 @@ topk = 6 if args.topk is None else args.topk[0]
 tokens = 208 if args.token is None else args.token[0]
 mdim = 5120 if args.model_dim is None else args.model_dim[0]
 idim = 1536 if args.inter_dim is None else args.inter_dim[0]
-ep = 1 if args.expert_parallelism is None else args.expert_parallelism
-shared_E = 0 if args.shared_expert is None else args.shared_expert
+ep = 8 if args.expert_parallelism is None else args.expert_parallelism
+shared_E = 2 if args.shared_expert is None else args.shared_expert
 
 for subX in [32] if args.subx is None else args.subx:
     test_fmoe_lqq(
