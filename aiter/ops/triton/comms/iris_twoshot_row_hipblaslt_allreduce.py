@@ -658,12 +658,18 @@ class IrisTwoshotRowHipblasltManager:
         # Step 3: hipBLASLt GEMM via torch._scaled_mm
         # quant_heap is (M, N) FP8, scale_heap is (M,) float32
         # gemm_weight is (N, K_GEMM) FP8, weight_scale is float32 scalar
+        # torch._scaled_mm requires scale_b to be at least 1D when
+        # scale_a is row-wise (M, 1). weight_scale may arrive as a
+        # dimensionless scalar [] from the fusion pass.
+        scale_b = weight_scale
+        if scale_b.dim() == 0:
+            scale_b = scale_b.reshape(1, 1)
         gemm_out = torch._scaled_mm(
             quant_heap,
             gemm_weight,
             out_dtype=out_dtype,
             scale_a=scale_heap.unsqueeze(1),
-            scale_b=weight_scale,
+            scale_b=scale_b,
             bias=bias,
         )
 
