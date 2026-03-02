@@ -75,15 +75,6 @@ IRIS_TWOSHOT_ROW_GEMM_AUTOTUNE_KEYS = [
     "HAS_RESIDUAL",
 ]
 
-# GEMM block size search space: (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_SIZE_M)
-_GEMM_BLOCK_CONFIGS = [
-    (64, 128, 128, 4),
-    (128, 128, 128, 4),
-    (128, 256, 128, 4),
-    (256, 128, 128, 4),
-]
-
-
 def _get_iris_twoshot_row_gemm_configs(autotune: bool):
     """Generate autotune configs including GEMM block size variations."""
     num_xcds = iris.hip.get_num_xcc()
@@ -107,33 +98,47 @@ def _get_iris_twoshot_row_gemm_configs(autotune: bool):
             )
         ]
 
+    # ===================== Autotune Sweep =====================
+    # Best known config: COMM_SMS=128, GEMM_BLOCK_M=256, GEMM_BLOCK_N=128,
+    # GEMM_BLOCK_K=128, GROUP_SIZE_M=4, num_warps=16, num_stages=2,
+    # waves_per_eu=1.  Add neighboring values to any list to search around it.
     configs = []
-    COMM_SMS_OPTIONS = [32, 64, 128]
-    NUM_WARPS_OPTIONS = [4, 8, 16]
-    NUM_STAGES_OPTIONS = [1, 2]
-    WAVES_PER_EU_OPTIONS = [1, 2, 4]
+    # Comm parameters
+    COMM_SMS_OPTIONS = [64, 128]
+    # GEMM tile parameters
+    GEMM_BLOCK_M_OPTIONS = [128, 256]
+    GEMM_BLOCK_N_OPTIONS = [128]
+    GEMM_BLOCK_K_OPTIONS = [128]
+    GEMM_GROUP_SIZE_M_OPTIONS = [4]
+    # Shared parameters
+    NUM_WARPS_OPTIONS = [16]
+    NUM_STAGES_OPTIONS = [2]
+    WAVES_PER_EU_OPTIONS = [1]
     for sms in COMM_SMS_OPTIONS:
         chunk = _compute_chunk_size(sms, num_xcds)
-        for nw in NUM_WARPS_OPTIONS:
-            for ns in NUM_STAGES_OPTIONS:
-                for waves in WAVES_PER_EU_OPTIONS:
-                    for gm, gn, gk, gsm in _GEMM_BLOCK_CONFIGS:
-                        configs.append(
-                            triton.Config(
-                                {
-                                    "COMM_SMS": sms,
-                                    "NUM_XCDS": num_xcds,
-                                    "CHUNK_SIZE": chunk,
-                                    "waves_per_eu": waves,
-                                    "GEMM_BLOCK_M": gm,
-                                    "GEMM_BLOCK_N": gn,
-                                    "GEMM_BLOCK_K": gk,
-                                    "GEMM_GROUP_SIZE_M": gsm,
-                                },
-                                num_stages=ns,
-                                num_warps=nw,
-                            )
-                        )
+        for gm in GEMM_BLOCK_M_OPTIONS:
+            for gn in GEMM_BLOCK_N_OPTIONS:
+                for gk in GEMM_BLOCK_K_OPTIONS:
+                    for gsm in GEMM_GROUP_SIZE_M_OPTIONS:
+                        for nw in NUM_WARPS_OPTIONS:
+                            for ns in NUM_STAGES_OPTIONS:
+                                for waves in WAVES_PER_EU_OPTIONS:
+                                    configs.append(
+                                        triton.Config(
+                                            {
+                                                "COMM_SMS": sms,
+                                                "NUM_XCDS": num_xcds,
+                                                "CHUNK_SIZE": chunk,
+                                                "waves_per_eu": waves,
+                                                "GEMM_BLOCK_M": gm,
+                                                "GEMM_BLOCK_N": gn,
+                                                "GEMM_BLOCK_K": gk,
+                                                "GEMM_GROUP_SIZE_M": gsm,
+                                            },
+                                            num_stages=ns,
+                                            num_warps=nw,
+                                        )
+                                    )
     return configs
 
 
