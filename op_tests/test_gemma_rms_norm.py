@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """
 Test Gemma-style RMSNorm (gemma_rmsnorm, gemma_fused_add_rmsnorm).
 Kernels from pyhip/archive/norm; only fp16 and bf16.
