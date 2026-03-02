@@ -31,7 +31,9 @@ def _gemma_rms_norm_ref_native(x, w, eps=1e-6, residual=None):
 @perftest()
 def run_torch(input, weight, eps, residual=None):
     output, residual_out = _gemma_rms_norm_ref_native(
-        input.clone(), weight, eps,
+        input.clone(),
+        weight,
+        eps,
         residual=residual.clone() if residual is not None else None,
     )
     return output, residual_out
@@ -82,6 +84,7 @@ def _run_gemma_fused_add_rmsnorm(dtype, m, n):
 L_DTYPE_STR = ["fp16", "bf16"]
 L_M = [1, 2, 128, 256, 8000, 16000]
 L_N = [4096, 8192]
+
 
 @pytest.mark.parametrize("dtype", [dtypes.d_dtypes[k] for k in L_DTYPE_STR])
 @pytest.mark.parametrize("m", L_M)
@@ -153,5 +156,3 @@ if __name__ == "__main__":
         for m in l_m:
             for n in l_n:
                 _run_gemma_fused_add_rmsnorm(dtype, m, n)
-
-
