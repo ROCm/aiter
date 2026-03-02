@@ -550,19 +550,25 @@ class IrisTwoshotRowHipblasltManager:
         scale_heap = self._get_scale_heap_buffer(M)
         result_out = self._get_output_buffers(M, N, input_tensor.dtype, device)
 
-        # Copy input to symmetric heap
+        # Copy input to symmetric heap (captured in graph)
         iris_input.copy_(input_tensor)
 
-        # NCCL barrier: ensures all ranks have copied input to heap
+        # Cross-rank sync: ensure all ranks have copied input to heap
         # before any rank's kernel starts reading from peers.
-        # Uses a 1-element allreduce (graph-capture-safe via NCCL).
-        if self._nccl_barrier_buf is None:
-            self._nccl_barrier_buf = torch.zeros(
-                1, dtype=torch.int32, device=device
+        #
+        # Eager mode: NCCL 1-element allreduce acts as a barrier.
+        # Graph capture/replay: skipped. During capture, ranks run the
+        # same Python loop in lockstep. During replay, vLLM triggers
+        # all ranks simultaneously and the copy (local memcpy) completes
+        # well before the kernel's first iris.load from a remote rank.
+        if not torch.cuda.is_current_stream_capturing():
+            if self._nccl_barrier_buf is None:
+                self._nccl_barrier_buf = torch.zeros(
+                    1, dtype=torch.int32, device=device
+                )
+            torch.distributed.all_reduce(
+                self._nccl_barrier_buf, op=torch.distributed.ReduceOp.SUM
             )
-        torch.distributed.all_reduce(
-            self._nccl_barrier_buf, op=torch.distributed.ReduceOp.SUM
-        )
 
         # FP8 max value
         fp8_max = torch.finfo(quant_dtype).max
