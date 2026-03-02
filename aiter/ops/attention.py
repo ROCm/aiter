@@ -4,6 +4,7 @@
 import math
 from typing import Optional, Tuple
 
+from aiter.ops.enum import QuantType, Enum
 import torch
 from csrc.cpp_itfs.pa.pa import paged_attention_rocm as paged_attention_rocm_core
 from csrc.cpp_itfs.pa.pa_ragged import (
@@ -254,6 +255,7 @@ def gen_pa_ps_fwd_asm(
         int
     ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
     kernelName: Optional[str] = None,
+    quant_type: Optional[Enum] = QuantType.per_Token.value,
 ) -> torch.Tensor:
     if out_ is not None:
         return out_
@@ -261,7 +263,7 @@ def gen_pa_ps_fwd_asm(
         return torch.empty_like(Q)
 
 
-@compile_ops("module_attention_asm", gen_fake=gen_pa_fwd_asm)
+@compile_ops("module_attention_asm", gen_fake=gen_pa_ps_fwd_asm)
 def pa_ps_fwd_asm(
     Q: torch.Tensor,
     K: torch.Tensor,
@@ -285,6 +287,7 @@ def pa_ps_fwd_asm(
         int
     ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
     kernelName: Optional[str] = None,
+    quant_type: Optional[Enum] = QuantType.per_Token.value,
 ) -> torch.Tensor: ...
 
 
@@ -330,6 +333,7 @@ def pa_persistent_fwd(
     V_QScale: Optional[torch.Tensor] = None,  # [num_blocks, kv_heads, block_size]
     softmax_scale: Optional[float] = None,
     mask: int = 0,
+    quant_type: QuantType = QuantType.per_Token,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
@@ -364,7 +368,8 @@ def pa_persistent_fwd(
         work_info,
         logits,
         splitLse,
-        mask,
+        mask=mask,
+        quant_type=quant_type,
     )
     pa_reduce_v1(
         logits,
