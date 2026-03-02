@@ -150,7 +150,7 @@ jobs:
   standard:
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     name: Standard Tests (1 GPU)
-    needs: build_aiter_image 
+    needs: [build_aiter_image, split_aiter_tests] 
     strategy:
       fail-fast: false
       matrix:

@@ -60,6 +60,9 @@ static CFG* get_cfg(torch::Tensor& inp, torch::Tensor& out) {
 
 // Validation functions for fp8gemm_bf16_blockscale
 // rule1: Ndim % TileN == 0 and Kdim % TileK == 0
+// rule2: A and B must have same K dimension
+// rule3: A_scale should be [M, (K + block_shape_k - 1) / block_shape_k]
+// rule4: B_scale should be [(N + block_shape_n - 1) / block_shape_n, (K + block_shape_k - 1) / block_shape_k]
 static void validate_inputs(const torch::Tensor& A, const torch::Tensor& B, const torch::Tensor& out,
                            const torch::Tensor& A_scale, const torch::Tensor& B_scale) {
     constexpr int TileN = 128, TileK = 128;
@@ -70,10 +73,16 @@ static void validate_inputs(const torch::Tensor& A, const torch::Tensor& B, cons
     TORCH_CHECK(A.dtype() == torch_fp8 && B.dtype() == torch_fp8,
                 "MI308 A8W8 blockscale asm requires FP8 input tensors!");
     
-    int Ndim = B.size(0), Kdim = A.size(1);
+    int Mdim = A.size(0), Ndim = B.size(0), Kdim = A.size(1);
     
     TORCH_CHECK(Ndim % TileN == 0 && Kdim % TileK == 0,
                 "MI308 A8W8 blockscale asm only support 128nx128k tile now!");
+    TORCH_CHECK(A.size(1) == B.size(1), "A and B must have same K dimension!");
+    TORCH_CHECK(A_scale.size(0) == Mdim && A_scale.size(1) == (Kdim + block_shape_k - 1) / block_shape_k,
+                "A_scale dimensions mismatch!");
+    TORCH_CHECK(B_scale.size(0) == (Ndim + block_shape_n - 1) / block_shape_n && 
+                B_scale.size(1) == (Kdim + block_shape_k - 1) / block_shape_k,
+                "B_scale dimensions mismatch!");
 }
 
 // Heuristic kernel selection
