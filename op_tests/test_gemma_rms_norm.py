@@ -121,7 +121,7 @@ if __name__ == "__main__":
         type=int,
         nargs="?",
         default=None,
-        help="Batch size (M)",
+        help="Token number (M)",
     )
     parser.add_argument(
         "-n",
