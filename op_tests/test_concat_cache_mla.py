@@ -602,8 +602,6 @@ def run_torch_fused_norm_rope_group_quant(
 
     # Store original k_nope for group quantization (before writing to fp8 cache)
     k_nope_original = k_nope.clone() if kv_cache_dtype == "fp8" else None
-    k_nope_original_shape = k_nope.shape
-
     num_kv_heads = kv_cache.shape[2]
 
     block_size = kv_cache.shape[1]
