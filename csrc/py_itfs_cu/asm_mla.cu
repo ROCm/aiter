@@ -174,6 +174,7 @@ void mla_decode_stage1_asm_fwd(
         args.ptr_STP = num_kv_splits_indptr.value().data_ptr();
     }
     args.ptr_RP = output.data_ptr(); //final output
+    args.ptr_LSEP = nullptr;
     if (lse.has_value())
     {
         args.ptr_LSEP = lse.value().data_ptr(); //final lse
