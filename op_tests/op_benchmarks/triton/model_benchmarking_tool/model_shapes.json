@@ -58,6 +58,14 @@
                 "positions": "true",
                 "rotate_style": "neox"
             }
+        ],
+        "mha": [
+            {
+                "hq": 128,
+                "khv": 8,
+                "dqk": 128,
+                "dv": 128
+            }
         ]
     },
     "Llama3 70B": {
@@ -118,6 +126,14 @@
                 "two_inputs": "true",
                 "positions": "true",
                 "rotate_style": "neox"
+            }
+        ],
+        "mha": [
+            {
+                "hq": 64,
+                "khv": 8,
+                "dqk": 128,
+                "dv": 128
             }
         ]
     },
@@ -180,6 +196,14 @@
                 "positions": "true",
                 "rotate_style": "neox"
             }
+        ],
+        "mha": [
+            {
+                "hq": 32,
+                "khv": 8,
+                "dqk": 128,
+                "dv": 128
+            }
         ]
     },
     "GPT-OSS 120B": {
@@ -221,6 +245,14 @@
                 "two_inputs": "true",
                 "positions": "true",
                 "rotate_style": "neox"
+            }
+        ],
+        "mha": [
+            {
+                "hq": 64,
+                "khv": 8,
+                "dqk": 64,
+                "dv": 64
             }
         ]
     },
@@ -388,6 +420,24 @@
                 "positions": "true",
                 "rotate_style": "gptj"
             }
+        ],
+        "mha": [
+            {
+                "comment": "Prefill",
+                "hq": 128,
+                "khv": 128,
+                "dqk": 192,
+                "dv": 128
+            }
+        ],
+        "mla": [
+            {
+                "comment": "Decode",
+                "hq": 128,
+                "khv": 1,
+                "dqk": 576,
+                "dv": 512
+            }
         ]
     },
     "Llama4 Maverick": {
@@ -452,6 +502,22 @@
                 "positions": "true",
                 "rotate_style": "neox"
             }
+        ],
+        "mha": [
+            {
+                "comment": "Text",
+                "hq": 40,
+                "khv": 8,
+                "dqk": 128,
+                "dv": 128
+            },
+            {
+                "comment": "Vison",
+                "hq": 16,
+                "khv": 16,
+                "dqk": 88,
+                "dv": 88
+            }
         ]
     },
     "Qwen3-235B-A22B": {
@@ -498,6 +564,14 @@
                 "two_inputs": "true",
                 "positions": "true",
                 "rotate_style": "neox"
+            }
+        ],
+        "mha": [
+            {
+                "hq": 64,
+                "khv": 4,
+                "dqk": 128,
+                "dv": 128
             }
         ]
     }

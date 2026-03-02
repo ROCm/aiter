@@ -384,8 +384,14 @@ def run_benchmarks(
     for model, kernels in data.items():
         print(f"Running benchmarks for {model}...")
         for kernel, shapes in kernels.items():
+
+            # Skip MHA and MLA kernels for now
+            if kernel in ["mha", "mla"]:
+                continue
+
             if "fp4" in kernel and not arch_info.is_fp4_avail():
                 continue
+
             bench_fn = KERNEL_DICT[kernel]
             handler = _get_handler(kernel)
             handler.set_run(model, kernel, metric, layout)
