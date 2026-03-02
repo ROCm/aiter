@@ -621,7 +621,9 @@ def _gemm_afp4wfp4_preshuffle_kernel(
                 .trans(1, 0)
             )
 
-            accumulator += tl.dot_scaled(a, a_scales, "e2m1", b, b_scales, "e2m1")
+            accumulator = tl.dot_scaled(
+                a, a_scales, "e2m1", b, b_scales, "e2m1", accumulator
+            )
 
             # Advance the ptrs to the next K block.
             a_ptrs += (BLOCK_SIZE_K // 2) * stride_ak
@@ -715,6 +717,12 @@ def _get_config(
     # Note: Config files use K=2*K in their naming
     K = 2 * K
     if shuffle:
-        return get_gemm_config("GEMM-AFP4WFP4_PRESHUFFLED", M, N, K)
+        return get_gemm_config(
+            "GEMM-AFP4WFP4_PRESHUFFLED",
+            M,
+            N,
+            K,
+            bounds=(4, 8, 16, 31, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
+        )
     else:
         return get_gemm_config("GEMM-AFP4WFP4", M, N, K)

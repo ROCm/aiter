@@ -1,43 +1,32 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """
-Test OPUS device kernels via a single PyTorch extension (opus_device_test).
+Test OPUS device kernels via a ctypes wrapper around opus_device_test.so.
+
+The .so is built by setup.py using hipcc directly (no torch/pybind11 headers
+needed at compile time). Python loads it via ctypes and calls the extern "C"
+launcher functions, passing device pointers obtained from torch tensors.
+
 Covers:
-  - MFMA 32x32x2   fp32      (gfx942 + gfx950)
-  - MFMA 16x16x4   fp32      (gfx942 + gfx950)
-  - MFMA 32x32x8   fp16/bf16 (gfx942 only)
-  - MFMA 16x16x16  fp16/bf16 (gfx942 only)
-  - MFMA 32x32x16  fp16/bf16 (gfx942 + gfx950)
-  - MFMA 16x16x32  fp16/bf16 (gfx942 + gfx950)
-  - MFMA 32x32x16  fp8/bf8  (gfx942 + gfx950, fp32 output)
-  - MFMA 16x16x32  fp8/bf8  (gfx942 + gfx950, fp32 output)
-  - MXFP8 32x32x64  fp8*fp8 (gfx950 only, fp32 output)
-  - MXFP8 16x16x128 fp8*fp8 (gfx950 only, fp32 output)
-  - MXFP4 32x32x64  fp4*fp4 (gfx950 only, fp32 output)
-  - MXFP4 16x16x128 fp4*fp4 (gfx950 only, fp32 output)
-  - vector_add (all GPUs)
-  - async_load (all GPUs)
-  - dtype_convert: FP32<->BF16, FP32<->FP16, FP32<->FP8 round-trips (all GPUs)
-  - dtype_convert: FP32<->FP4 (e2m1) round-trip (gfx950 only, packed x8)
-  - predicated_copy: gmem load_if/store_if with boundary predicate (all GPUs)
-  - free_func_vector_add: opus::load/store free function API (all GPUs)
-  - predicated_async_load: gmem async_load_if with boundary predicate (all GPUs)
+  - MFMA variants (fp32, fp16, bf16, fp8, bf8)
+  - MXFP variants (fp8, fp4) -- gfx950 only
+  - vector_add, async_load, dtype_convert, predicated_copy, free_func_add,
+    predicated_async_load, numeric_limits, mdiv, workgroup_barrier
 """
 
-import glob
+import ctypes
 import os
 import subprocess
 import sys
 
 try:
     import torch
-    from torch.utils.cpp_extension import BuildExtension, CUDAExtension  # noqa: F401
 except ImportError as e:
-    print(f"SKIP: PyTorch or C++ extension support not available ({e})")
+    print(f"SKIP: PyTorch not available ({e})")
     sys.exit(0)
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_MODULE_NAME = "opus_device_test"
+_SO_NAME = "opus_device_test.so"
 
 
 # ---------------------------------------------------------------------------
@@ -45,51 +34,138 @@ _MODULE_NAME = "opus_device_test"
 # ---------------------------------------------------------------------------
 
 
-def _clean_previous_extension():
-    """Remove previously built extension and build dir for a fresh build."""
-    removed = []
-    for pattern in (f"{_MODULE_NAME}*.so", f"{_MODULE_NAME}*.pyd"):
-        for path in glob.glob(os.path.join(_THIS_DIR, pattern)):
-            try:
-                os.remove(path)
-                removed.append(path)
-            except OSError as e:
-                print(f"WARNING: could not remove {path}: {e}", file=sys.stderr)
-    build_dir = os.path.join(_THIS_DIR, "build")
-    if os.path.isdir(build_dir):
-        try:
-            import shutil
-
-            shutil.rmtree(build_dir)
-            removed.append(build_dir)
-        except OSError as e:
-            print(f"WARNING: could not remove {build_dir}: {e}", file=sys.stderr)
-    if removed:
-        print(
-            "Cleaned previous extension:",
-            " ".join(os.path.basename(p) for p in removed),
-        )
-
-
-def _ensure_extension_built():
-    """Build extension with setup.py if not already importable."""
-    try:
-        __import__(_MODULE_NAME)
-        return True
-    except ModuleNotFoundError:
-        pass
-    if _THIS_DIR not in sys.path:
-        sys.path.insert(0, _THIS_DIR)
+def _build_so():
+    """Build opus_device_test.so via setup.py (hipcc, no torch/pybind11)."""
+    so_path = os.path.join(_THIS_DIR, _SO_NAME)
     try:
         subprocess.run(
-            [sys.executable, "setup.py", "build_ext", "--inplace"],
+            [sys.executable, "setup.py"],
             cwd=_THIS_DIR,
             check=True,
         )
     except subprocess.CalledProcessError as e:
         print(f"FAIL: Build exited with code {e.returncode}", file=sys.stderr)
-        return False
-    return True
+        return None
+    if not os.path.isfile(so_path):
+        print(f"FAIL: {_SO_NAME} not found after build", file=sys.stderr)
+        return None
+    return so_path
+
+
+# ---------------------------------------------------------------------------
+# ctypes wrapper -- same interface as the old pybind11 module
+# ---------------------------------------------------------------------------
+
+_VP = ctypes.c_void_p
+_I = ctypes.c_int
+
+
+class OpusDeviceLib:
+    """Thin ctypes wrapper that provides the same call interface as the old
+    pybind11 module so test functions don't need to change."""
+
+    def __init__(self, so_path):
+        self._lib = ctypes.CDLL(so_path)
+
+    @staticmethod
+    def _ptr(tensor):
+        return ctypes.c_void_p(tensor.data_ptr())
+
+    # -- MFMA --
+    def run_mfma(self, A, B, C, variant):
+        fn = getattr(self._lib, f"run_mfma_{variant}")
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _VP, _I, _I, _I]
+        fn(
+            self._ptr(A),
+            self._ptr(B),
+            self._ptr(C),
+            int(A.stride(0)),
+            int(B.stride(0)),
+            int(C.stride(0)),
+        )
+
+    # -- MXFP --
+    def run_mxfp(self, A, B, C, variant, scale_a=127, scale_b=127):
+        fn = getattr(self._lib, f"run_{variant}")
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _VP, _I, _I]
+        fn(self._ptr(A), self._ptr(B), self._ptr(C), int(scale_a), int(scale_b))
+
+    # -- vector_add --
+    def run_vector_add(self, A, B, Result):
+        fn = self._lib.run_vector_add
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _VP, _I]
+        fn(self._ptr(A), self._ptr(B), self._ptr(Result), int(A.numel()))
+
+    # -- async_load --
+    def run_async_load(self, Src, Dst):
+        fn = self._lib.run_async_load
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _I]
+        fn(self._ptr(Src), self._ptr(Dst), int(Src.numel()))
+
+    # -- dtype_convert --
+    def run_dtype_convert(self, In, Out, variant):
+        fn = getattr(self._lib, f"run_dtype_convert_{variant}")
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _I]
+        fn(self._ptr(In), self._ptr(Out), int(In.numel()))
+
+    # -- predicated_copy --
+    def run_predicated_copy(self, Src, Dst):
+        fn = self._lib.run_predicated_copy
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _I]
+        fn(self._ptr(Src), self._ptr(Dst), int(Src.numel()))
+
+    # -- free_func_add --
+    def run_free_func_add(self, A, B, Result):
+        fn = self._lib.run_free_func_add
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _VP, _I]
+        fn(self._ptr(A), self._ptr(B), self._ptr(Result), int(A.numel()))
+
+    # -- predicated_async_load --
+    def run_predicated_async_load(self, Src, Dst, n_padded):
+        fn = self._lib.run_predicated_async_load
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _I, _I]
+        fn(self._ptr(Src), self._ptr(Dst), int(Src.numel()), int(n_padded))
+
+    # -- numeric_limits --
+    def run_numeric_limits(self, Out):
+        fn = self._lib.run_numeric_limits
+        fn.restype = None
+        fn.argtypes = [_VP]
+        fn(self._ptr(Out))
+
+    # -- mdiv --
+    def run_mdiv(self, Dividends, OutQ, OutR, divisor):
+        fn = self._lib.run_mdiv
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _VP, _I, _I]
+        fn(
+            self._ptr(Dividends),
+            self._ptr(OutQ),
+            self._ptr(OutR),
+            int(divisor),
+            int(Dividends.numel()),
+        )
+
+    # -- workgroup_barrier --
+    def run_wb_cumulative(self, Accum, n_workgroups):
+        fn = self._lib.run_workgroup_barrier_cumulative
+        fn.restype = None
+        fn.argtypes = [_VP, _I]
+        fn(self._ptr(Accum), int(n_workgroups))
+
+    def run_wb_streamk_reduce(self, Input, Workspace, Result, n_chunks):
+        fn = self._lib.run_workgroup_barrier_streamk_reduce
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _VP, _I]
+        fn(self._ptr(Input), self._ptr(Workspace), self._ptr(Result), int(n_chunks))
 
 
 def _get_gpu_arch():
@@ -579,8 +655,104 @@ def test_dtype_convert_fp32_fp16(mod):
     return 0
 
 
+def test_dtype_convert_fp32_bf16_vec4(mod):
+    """Test vectorized FP32x4 -> BF16x4 -> FP32x4 round-trip via opus::cast<bf16_t>(fp32x4_t).
+
+    Exercises the generic vectorized cast() entry point (element-wise bf16 conversion
+    applied to a 4-wide vector), unlike the scalar test which converts one element at a time.
+    """
+    n = 1048576
+    device = torch.device("cuda")
+
+    torch.manual_seed(210)
+    In = torch.randn(n, device=device, dtype=torch.float32)
+    Out = torch.empty(n, device=device, dtype=torch.float32)
+
+    mod.run_dtype_convert(In, Out, "fp32_bf16_vec4")
+
+    Ref = In.to(torch.bfloat16).to(torch.float32)
+
+    ok = torch.equal(Out, Ref)
+    if not ok:
+        diff = (Out - Ref).abs()
+        max_diff = diff.max().item()
+        diff_count = diff.gt(0).sum().item()
+        print(
+            f"  FAIL: dtype_convert fp32<->bf16 vec4 max_diff={max_diff:.6e}, "
+            f"{diff_count}/{n} elements differ"
+        )
+        return 1
+    print(f"  PASS: dtype_convert fp32<->bf16 vec4 (n={n}), bit-exact")
+    return 0
+
+
+def test_dtype_convert_fp32_fp16_vec4(mod):
+    """Test vectorized FP32x4 -> FP16x4 -> FP32x4 round-trip via opus::cast<fp16_t>(fp32x4_t).
+
+    Exercises the generic vectorized cast() entry point for fp16.
+    """
+    n = 1048576
+    device = torch.device("cuda")
+
+    torch.manual_seed(211)
+    In = torch.randn(n, device=device, dtype=torch.float32)
+    Out = torch.empty(n, device=device, dtype=torch.float32)
+
+    mod.run_dtype_convert(In, Out, "fp32_fp16_vec4")
+
+    Ref = In.to(torch.float16).to(torch.float32)
+
+    atol, rtol = 1e-4, 1e-4
+    ok = torch.allclose(Out, Ref, atol=atol, rtol=rtol)
+    max_diff = (Out - Ref).abs().max().item()
+    if not ok:
+        diff_count = (Out - Ref).abs().gt(atol + rtol * Ref.abs()).sum().item()
+        print(
+            f"  FAIL: dtype_convert fp32<->fp16 vec4 max_diff={max_diff:.6e}, "
+            f"{diff_count}/{n} elements outside tol"
+        )
+        return 1
+    print(f"  PASS: dtype_convert fp32<->fp16 vec4 (n={n}), max_diff={max_diff:.6e}")
+    return 0
+
+
 _FP8_SUPPORTED_ARCHS = {"gfx942", "gfx950"}
 _FP4_SUPPORTED_ARCHS = {"gfx950"}
+
+
+def test_dtype_convert_fp32_fp8_scalar(mod):
+    """Test scalar FP32 -> FP8 (e4m3) -> FP32 round-trip via opus::cast (one element per thread)."""
+    arch = _get_gpu_arch()
+    if arch not in _FP8_SUPPORTED_ARCHS:
+        print(
+            f"  SKIP: dtype_convert fp32<->fp8 scalar requires {_FP8_SUPPORTED_ARCHS}, got '{arch}'"
+        )
+        return 0
+
+    n = 1048576
+    device = torch.device("cuda")
+
+    torch.manual_seed(220)
+    In = torch.randn(n, device=device, dtype=torch.float32) * 2.0
+    Out = torch.empty(n, device=device, dtype=torch.float32)
+
+    mod.run_dtype_convert(In, Out, "fp32_fp8_scalar")
+
+    fp8_dtype = _get_fp8_dtype()
+    Ref = In.to(fp8_dtype).to(torch.float32)
+
+    atol, rtol = 0.5, 0.25
+    ok = torch.allclose(Out, Ref, atol=atol, rtol=rtol)
+    max_diff = (Out - Ref).abs().max().item()
+    if not ok:
+        diff_count = (Out - Ref).abs().gt(atol + rtol * Ref.abs()).sum().item()
+        print(
+            f"  FAIL: dtype_convert fp32<->fp8 scalar max_diff={max_diff:.6e}, "
+            f"{diff_count}/{n} elements outside tol"
+        )
+        return 1
+    print(f"  PASS: dtype_convert fp32<->fp8 scalar (n={n}), max_diff={max_diff:.6e}")
+    return 0
 
 
 def test_dtype_convert_fp32_fp8(mod):
@@ -681,6 +853,185 @@ def test_dtype_convert_fp32_fp4(mod):
         )
         return 1
     print(f"  PASS: dtype_convert fp32<->fp4 (n={n}), bit-exact")
+    return 0
+
+
+def test_dtype_convert_fp32_fp8_x2(mod):
+    """Test FP32x2 -> FP8x2 -> FP32x2 round-trip via opus::cast packed x2."""
+    arch = _get_gpu_arch()
+    if arch not in _FP8_SUPPORTED_ARCHS:
+        print(
+            f"  SKIP: dtype_convert fp32<->fp8 x2 requires {_FP8_SUPPORTED_ARCHS}, got '{arch}'"
+        )
+        return 0
+
+    n = 1048576
+    device = torch.device("cuda")
+
+    torch.manual_seed(212)
+    In = torch.randn(n, device=device, dtype=torch.float32) * 2.0
+    Out = torch.empty(n, device=device, dtype=torch.float32)
+
+    mod.run_dtype_convert(In, Out, "fp32_fp8_x2")
+
+    fp8_dtype = _get_fp8_dtype()
+    Ref = In.to(fp8_dtype).to(torch.float32)
+
+    atol, rtol = 0.5, 0.25
+    ok = torch.allclose(Out, Ref, atol=atol, rtol=rtol)
+    max_diff = (Out - Ref).abs().max().item()
+    if not ok:
+        diff_count = (Out - Ref).abs().gt(atol + rtol * Ref.abs()).sum().item()
+        print(
+            f"  FAIL: dtype_convert fp32<->fp8 x2 max_diff={max_diff:.6e}, "
+            f"{diff_count}/{n} elements outside tol"
+        )
+        return 1
+    print(f"  PASS: dtype_convert fp32<->fp8 x2 (n={n}), max_diff={max_diff:.6e}")
+    return 0
+
+
+def test_dtype_convert_fp32_fp8_vec8(mod):
+    """Test FP32x8 -> FP8(auto-fold 2x x4) -> FP32x8 round-trip.
+
+    Exercises the generic vectorized cast() auto-folding path for fp8 with 8-wide input.
+    """
+    arch = _get_gpu_arch()
+    if arch not in _FP8_SUPPORTED_ARCHS:
+        print(
+            f"  SKIP: dtype_convert fp32<->fp8 vec8 requires {_FP8_SUPPORTED_ARCHS}, got '{arch}'"
+        )
+        return 0
+
+    n = 1048576
+    device = torch.device("cuda")
+
+    torch.manual_seed(213)
+    In = torch.randn(n, device=device, dtype=torch.float32) * 2.0
+    Out = torch.empty(n, device=device, dtype=torch.float32)
+
+    mod.run_dtype_convert(In, Out, "fp32_fp8_vec8")
+
+    fp8_dtype = _get_fp8_dtype()
+    Ref = In.to(fp8_dtype).to(torch.float32)
+
+    atol, rtol = 0.5, 0.25
+    ok = torch.allclose(Out, Ref, atol=atol, rtol=rtol)
+    max_diff = (Out - Ref).abs().max().item()
+    if not ok:
+        diff_count = (Out - Ref).abs().gt(atol + rtol * Ref.abs()).sum().item()
+        print(
+            f"  FAIL: dtype_convert fp32<->fp8 vec8 max_diff={max_diff:.6e}, "
+            f"{diff_count}/{n} elements outside tol"
+        )
+        return 1
+    print(f"  PASS: dtype_convert fp32<->fp8 vec8 (n={n}), max_diff={max_diff:.6e}")
+    return 0
+
+
+def test_dtype_convert_fp32_fp4_x2(mod):
+    """Test FP32x2 -> FP4(x2) -> FP32x2 round-trip via opus::cast packed x2 (gfx950 only)."""
+    arch = _get_gpu_arch()
+    if arch not in _FP4_SUPPORTED_ARCHS:
+        print(
+            f"  SKIP: dtype_convert fp32<->fp4 x2 requires {_FP4_SUPPORTED_ARCHS}, got '{arch}'"
+        )
+        return 0
+
+    n = 1048576
+    device = torch.device("cuda")
+    fp4_values = torch.tensor(
+        [
+            -6.0,
+            -4.0,
+            -3.0,
+            -2.0,
+            -1.5,
+            -1.0,
+            -0.5,
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+        ],
+        dtype=torch.float32,
+    )
+    torch.manual_seed(214)
+    indices = torch.randint(0, len(fp4_values), (n,))
+    In = fp4_values[indices].to(device=device)
+    Out = torch.empty(n, device=device, dtype=torch.float32)
+
+    mod.run_dtype_convert(In, Out, "fp32_fp4_x2")
+
+    Ref = In
+    ok = torch.equal(Out, Ref)
+    if not ok:
+        diff = (Out - Ref).abs()
+        max_diff = diff.max().item()
+        diff_count = diff.gt(0).sum().item()
+        print(
+            f"  FAIL: dtype_convert fp32<->fp4 x2 max_diff={max_diff:.6e}, "
+            f"{diff_count}/{n} elements differ"
+        )
+        return 1
+    print(f"  PASS: dtype_convert fp32<->fp4 x2 (n={n}), bit-exact")
+    return 0
+
+
+def test_dtype_convert_fp32_fp4_x4(mod):
+    """Test FP32x4 -> FP4(x4) -> FP32x4 round-trip via opus::cast packed x4 (gfx950 only)."""
+    arch = _get_gpu_arch()
+    if arch not in _FP4_SUPPORTED_ARCHS:
+        print(
+            f"  SKIP: dtype_convert fp32<->fp4 x4 requires {_FP4_SUPPORTED_ARCHS}, got '{arch}'"
+        )
+        return 0
+
+    n = 1048576
+    device = torch.device("cuda")
+    fp4_values = torch.tensor(
+        [
+            -6.0,
+            -4.0,
+            -3.0,
+            -2.0,
+            -1.5,
+            -1.0,
+            -0.5,
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+        ],
+        dtype=torch.float32,
+    )
+    torch.manual_seed(215)
+    indices = torch.randint(0, len(fp4_values), (n,))
+    In = fp4_values[indices].to(device=device)
+    Out = torch.empty(n, device=device, dtype=torch.float32)
+
+    mod.run_dtype_convert(In, Out, "fp32_fp4_x4")
+
+    Ref = In
+    ok = torch.equal(Out, Ref)
+    if not ok:
+        diff = (Out - Ref).abs()
+        max_diff = diff.max().item()
+        diff_count = diff.gt(0).sum().item()
+        print(
+            f"  FAIL: dtype_convert fp32<->fp4 x4 max_diff={max_diff:.6e}, "
+            f"{diff_count}/{n} elements differ"
+        )
+        return 1
+    print(f"  PASS: dtype_convert fp32<->fp4 x4 (n={n}), bit-exact")
     return 0
 
 
@@ -798,6 +1149,198 @@ def test_predicated_async_load(mod):
 
 
 # ---------------------------------------------------------------------------
+# mdiv tests
+# ---------------------------------------------------------------------------
+
+
+def test_mdiv(mod):
+    """Test opus::mdiv magic division against native integer division."""
+    device = torch.device("cuda")
+
+    divisors = [1, 2, 3, 7, 13, 32, 64, 127, 255, 1024, 65537]
+    n = 100000
+
+    torch.manual_seed(99)
+    # Unsigned 32-bit range: use int32 tensor with values in [0, 2^31-1)
+    dividends = torch.randint(0, 2**31 - 1, (n,), device=device, dtype=torch.int32)
+
+    fails = 0
+    for d in divisors:
+        out_q = torch.empty(n, device=device, dtype=torch.int32)
+        out_r = torch.empty(n, device=device, dtype=torch.int32)
+        mod.run_mdiv(dividends, out_q, out_r, d)
+
+        # Reference: unsigned division via Python
+        vals = dividends.to(torch.int64)  # avoid overflow
+        ref_q = (vals // d).to(torch.int32)
+        ref_r = (vals % d).to(torch.int32)
+
+        q_ok = torch.equal(out_q, ref_q)
+        r_ok = torch.equal(out_r, ref_r)
+        if not q_ok or not r_ok:
+            q_bad = (out_q != ref_q).sum().item()
+            r_bad = (out_r != ref_r).sum().item()
+            print(f"  FAIL: mdiv divisor={d}, q_mismatch={q_bad}, r_mismatch={r_bad}")
+            fails += 1
+        else:
+            print(f"  PASS: mdiv divisor={d}")
+
+    if fails:
+        print(f"  mdiv: {fails}/{len(divisors)} divisors FAILED")
+        return 1
+    print(f"  PASS: mdiv all {len(divisors)} divisors correct")
+    return 0
+
+
+def test_numeric_limits(mod):
+    """Test opus::numeric_limits against torch reference values (bitwise comparison)."""
+    import struct
+
+    arch = _get_gpu_arch()
+    device = torch.device("cuda")
+
+    N = 55  # 11 types * 5 fields
+    out = torch.zeros(N, device=device, dtype=torch.int32)
+    mod.run_numeric_limits(out)
+    raw = [(out[i].item()) & 0xFFFFFFFF for i in range(N)]
+
+    fails = 0
+    fields = ["min", "max", "lowest", "quiet_nan", "infinity"]
+
+    def float_to_u32(f):
+        return struct.unpack("I", struct.pack("f", float(f)))[0]
+
+    def tensor_to_bits(t, size):
+        if size == 4:
+            return t.reshape(1).view(torch.int32).item() & 0xFFFFFFFF
+        elif size == 2:
+            return t.reshape(1).view(torch.int16).item() & 0xFFFF
+        else:
+            return t.reshape(1).view(torch.uint8).item()
+
+    def ref_float(dtype, size, has_inf):
+        fi = torch.finfo(dtype)
+        ref = {}
+        for field in fields:
+            if field == "min":
+                ref[field] = tensor_to_bits(torch.tensor(fi.tiny, dtype=dtype), size)
+            elif field == "max":
+                ref[field] = tensor_to_bits(torch.tensor(fi.max, dtype=dtype), size)
+            elif field == "lowest":
+                ref[field] = tensor_to_bits(torch.tensor(fi.min, dtype=dtype), size)
+            elif field == "quiet_nan":
+                ref[field] = tensor_to_bits(
+                    torch.tensor(float("nan"), dtype=dtype), size
+                )
+            elif field == "infinity":
+                if not has_inf:
+                    ref[field] = 0
+                    continue
+                ref[field] = tensor_to_bits(
+                    torch.tensor(float("inf"), dtype=dtype), size
+                )
+        return ref
+
+    def ref_int(dtype, size):
+        ii = torch.iinfo(dtype)
+        mask = (1 << (size * 8)) - 1
+        return {
+            "min": ii.min & mask,
+            "max": ii.max & mask,
+            "lowest": ii.min & mask,
+            "quiet_nan": 0,
+            "infinity": 0,
+        }
+
+    fp8_dtype = _get_fp8_dtype()
+    bf8_dtype = _get_bf8_dtype()
+
+    # (name, offset, byte_size, is_float, torch_dtype, has_infinity)
+    type_table = [
+        ("fp32", 0, 4, True, torch.float32, True),
+        ("fp16", 5, 2, True, torch.float16, True),
+        ("bf16", 10, 2, True, torch.bfloat16, True),
+        ("fp8", 15, 1, True, fp8_dtype, False),
+        ("bf8", 20, 1, True, bf8_dtype, arch == "gfx950"),
+        ("i32", 25, 4, False, torch.int32, False),
+        ("i16", 35, 2, False, torch.int16, False),
+        ("i8", 45, 1, False, torch.int8, False),
+        ("u8", 50, 1, False, torch.uint8, False),
+    ]
+
+    for name, offset, size, is_float, dtype, has_inf in type_table:
+        if is_float:
+            ref = ref_float(dtype, size, has_inf)
+        else:
+            ref = ref_int(dtype, size)
+        mask = (1 << (size * 8)) - 1
+        width = size * 2
+        type_fails = 0
+        for j, field in enumerate(fields):
+            actual = raw[offset + j] & mask
+            expected = ref[field]
+            if actual != expected:
+                print(
+                    f"    {name}.{field}: 0x{actual:0{width}X} "
+                    f"!= expected 0x{expected:0{width}X}"
+                )
+                type_fails += 1
+        if type_fails == 0:
+            print(f"  PASS: numeric_limits<{name}> (all {len(fields)} fields)")
+        else:
+            print(f"  FAIL: numeric_limits<{name}> ({type_fails} field(s) wrong)")
+            fails += type_fails
+
+    if fails:
+        print(f"  numeric_limits: {fails} field(s) FAILED")
+        return 1
+    print("  PASS: numeric_limits all types correct")
+    return 0
+
+
+def test_wb_cumulative(mod):
+    """Test workgroup_barrier wait_lt + inc: N workgroups contribute i+1 sequentially."""
+    device = torch.device("cuda")
+    n_workgroups = 128
+    accum = torch.zeros(1, device=device, dtype=torch.int32)
+    mod.run_wb_cumulative(accum, n_workgroups)
+    expected = n_workgroups * (n_workgroups + 1) // 2
+    actual = accum.item()
+    if actual != expected:
+        print(f"  FAIL: wb_cumulative expected={expected}, got={actual}")
+        return 1
+    print(f"  PASS: wb_cumulative (n={n_workgroups}, accum={actual})")
+    return 0
+
+
+def test_wb_streamk_reduce(mod):
+    """Test workgroup_barrier stream-K reduce: N producers + 1 consumer sum an array."""
+    device = torch.device("cuda")
+    for n_chunks in [1, 4, 16, 64]:
+        n_elems = 256 * n_chunks
+        torch.manual_seed(42)
+        inp = torch.randn(n_elems, device=device, dtype=torch.float32)
+        workspace = torch.empty(n_chunks, device=device, dtype=torch.float32)
+        result = torch.empty(1, device=device, dtype=torch.float32)
+        mod.run_wb_streamk_reduce(inp, workspace, result, n_chunks)
+        expected = inp.sum().item()
+        actual = result.item()
+        rtol = 1e-4
+        if abs(expected) > 0:
+            rel_err = abs(actual - expected) / abs(expected)
+        else:
+            rel_err = abs(actual - expected)
+        if rel_err > rtol:
+            print(
+                f"  FAIL: wb_streamk_reduce n_chunks={n_chunks}, "
+                f"expected={expected:.6f}, got={actual:.6f}, rel_err={rel_err:.2e}"
+            )
+            return 1
+        print(f"  PASS: wb_streamk_reduce n_chunks={n_chunks} (rel_err={rel_err:.2e})")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -807,14 +1350,14 @@ def main():
         print("SKIP: CUDA not available")
         return 0
 
-    _clean_previous_extension()
     arch = _get_gpu_arch()
     print(f"GPU arch: {arch}")
-    print(f"Building {_MODULE_NAME} extension ...")
-    if not _ensure_extension_built():
+    print(f"Building {_SO_NAME} ...")
+    so_path = _build_so()
+    if so_path is None:
         return 1
 
-    mod = __import__(_MODULE_NAME)
+    mod = OpusDeviceLib(so_path)
 
     failures = 0
     failures += test_mfma_32x32x2_f32(mod)
@@ -839,11 +1382,22 @@ def main():
     failures += test_async_load(mod)
     failures += test_dtype_convert_fp32_bf16(mod)
     failures += test_dtype_convert_fp32_fp16(mod)
+    failures += test_dtype_convert_fp32_bf16_vec4(mod)
+    failures += test_dtype_convert_fp32_fp16_vec4(mod)
+    failures += test_dtype_convert_fp32_fp8_scalar(mod)
     failures += test_dtype_convert_fp32_fp8(mod)
+    failures += test_dtype_convert_fp32_fp8_x2(mod)
+    failures += test_dtype_convert_fp32_fp8_vec8(mod)
     failures += test_dtype_convert_fp32_fp4(mod)
+    failures += test_dtype_convert_fp32_fp4_x2(mod)
+    failures += test_dtype_convert_fp32_fp4_x4(mod)
     failures += test_predicated_copy(mod)
     failures += test_free_func_vector_add(mod)
     failures += test_predicated_async_load(mod)
+    failures += test_numeric_limits(mod)
+    failures += test_mdiv(mod)
+    failures += test_wb_cumulative(mod)
+    failures += test_wb_streamk_reduce(mod)
 
     if failures:
         print(f"\n{failures} test(s) FAILED")

@@ -678,10 +678,6 @@ def test_flash_attn_seq_padding(
     assert diff <= out_tol
 
 
-l_causal = [False, True]
-l_local = [False, True]
-l_deterministic = [False, True]
-
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",

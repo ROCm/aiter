@@ -7,7 +7,8 @@ requires = [
     "packaging",
     "psutil",
     "ninja",
-    "pandas"
+    "pandas",
+    "flydsl==0.0.1.dev95158637"
 ]
 
 [tool.setuptools_scm]
