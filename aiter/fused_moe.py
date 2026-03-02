@@ -3,7 +3,6 @@
 
 import functools
 import os
-import threading
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -23,40 +22,6 @@ from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 
 BLOCK_SIZE_M = 32
-_MOE_SHAPE_LOG_LOCK = threading.Lock()
-_MOE_SHAPE_COMBOS = set()
-_MOE_SHAPE_COMBOS_LOADED = False
-_MOE_SHAPE_LOG_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)), "profiler_traces"
-)
-_MOE_SHAPE_LOG_FILE = os.path.join(_MOE_SHAPE_LOG_DIR, "moe_unique_mnk_topk_expert.txt")
-
-
-def _record_unique_moe_shape_combo(M, N, K, topk, expert):
-    global _MOE_SHAPE_COMBOS_LOADED
-
-    combo = (int(M), int(N), int(K), int(topk), int(expert))
-    with _MOE_SHAPE_LOG_LOCK:
-        if not _MOE_SHAPE_COMBOS_LOADED:
-            if os.path.exists(_MOE_SHAPE_LOG_FILE):
-                with open(_MOE_SHAPE_LOG_FILE, "r", encoding="utf-8") as f:
-                    for line in f:
-                        parts = [p.strip() for p in line.strip().split(",")]
-                        if len(parts) != 5:
-                            continue
-                        try:
-                            _MOE_SHAPE_COMBOS.add(tuple(int(p) for p in parts))
-                        except ValueError:
-                            continue
-            _MOE_SHAPE_COMBOS_LOADED = True
-
-        if combo in _MOE_SHAPE_COMBOS:
-            return
-
-        os.makedirs(_MOE_SHAPE_LOG_DIR, exist_ok=True)
-        with open(_MOE_SHAPE_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"{combo[0]},{combo[1]},{combo[2]},{combo[3]},{combo[4]}\n")
-        _MOE_SHAPE_COMBOS.add(combo)
 
 
 def moe_sorting(
@@ -1356,10 +1321,7 @@ def cktile_moe_stage1(
     out = torch.empty(
         (token_num, topk, D), dtype=hidden_states.dtype, device=hidden_states.device
     )
-    #_record_unique_moe_shape_combo(
-    #    token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]
-    #)
-    #print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
+    # print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
     aiter.moe_cktile2stages_gemm1(
         hidden_states,
         w1,
@@ -1408,10 +1370,7 @@ def cktile_moe_stage2(
     # )
     # if zeros_out:
     #     out.fill_(0)
-    #_record_unique_moe_shape_combo(
-    #    a2.shape[0]*a2.shape[1], w2.shape[1], a2.shape[2], topk, w2.shape[0]
-    #)
-    #print("Run cktile_moe_stage2: M=%d, N=%d, K=%d, topk=%d, expert=%d"%(a2.shape[0]*a2.shape[1], w2.shape[1], a2.shape[2], topk, w2.shape[0]))
+    # print("Run cktile_moe_stage2: M=%d, N=%d, K=%d, topk=%d, expert=%d"%(a2.shape[0]*a2.shape[1], w2.shape[1], a2.shape[2], topk, w2.shape[0]))
     aiter.moe_cktile2stages_gemm2(
         a2,
         w2,
