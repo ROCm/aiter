@@ -224,8 +224,7 @@ def fused_twoshot_allreduce_rmsnorm_row_quant_kernel(
                 val = val + res_in
             acc += val
 
-        # Store BF16 result (owned rows only) -- serves as both
-        # allreduce_out and residual_out for downstream
+        # Store BF16 result residual_out for downstream
         tl.store(
             result_out_ptr + out_offset,
             acc.to(result_out_ptr.type.element_ty),
