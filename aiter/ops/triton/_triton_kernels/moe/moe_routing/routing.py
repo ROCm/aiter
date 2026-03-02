@@ -39,13 +39,14 @@ def _routing_compute_indx(
     BLOCK_M: tl.constexpr,
     EVEN_M: tl.constexpr,
     N_EXPTS_ACT: tl.constexpr,
+    N_EXPTS_ACT_PAD: tl.constexpr,
 ):
 
-    tl.static_assert(N_EXPTS_ACT * BLOCK_M <= 32768)
+    tl.static_assert(N_EXPTS_ACT_PAD * BLOCK_M <= 32768)
 
-    local_offs = tl.arange(0, N_EXPTS_ACT * BLOCK_M)
+    local_offs = tl.arange(0, N_EXPTS_ACT_PAD * BLOCK_M)
     offs = pid_m * BLOCK_M * N_EXPTS_ACT + local_offs
-    if EVEN_M:
+    if EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD:
         expert = tl.load(ExptIndx + offs).to(tl.uint32)
     else:
         expert = tl.load(ExptIndx + offs, mask=(offs < n_gates), other=-1).to(tl.uint32)
@@ -56,8 +57,7 @@ def _routing_compute_indx(
     expert = kv_pairs >> 16
     offs = pid_m * BLOCK_M * N_EXPTS_ACT + (kv_pairs & 0xFFFF)
 
-    if EVEN_M:
-        mask = expert != 0xFFFF
+    if EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD:
         gate_scal = tl.load(ExptScal + offs)
 
         # compute run lengths in expert-sorted order:
@@ -102,13 +102,14 @@ def _routing_compute_indx_fused(
     BLOCK_M: tl.constexpr,
     EVEN_M: tl.constexpr,
     N_EXPTS_ACT: tl.constexpr,
+    N_EXPTS_ACT_PAD: tl.constexpr,
 ):
 
-    tl.static_assert(N_EXPTS_ACT * BLOCK_M <= 32768)
+    tl.static_assert(N_EXPTS_ACT_PAD * BLOCK_M <= 32768)
 
-    local_offs = tl.arange(0, N_EXPTS_ACT * BLOCK_M)
+    local_offs = tl.arange(0, N_EXPTS_ACT_PAD * BLOCK_M)
     offs = local_offs
-    if EVEN_M:
+    if EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD:
         expert = tl.load(ExptIndx + offs).to(tl.uint32)
     else:
         expert = tl.load(ExptIndx + offs, mask=(offs < n_gates), other=-1).to(tl.uint32)
@@ -119,7 +120,7 @@ def _routing_compute_indx_fused(
     expert = kv_pairs >> 16
     offs = kv_pairs & 0xFFFF
 
-    if EVEN_M:
+    if EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD:
         gate_scal = tl.load(ExptScal + offs)
 
         # compute run lengths in expert-sorted order:
@@ -164,6 +165,7 @@ def _combined_routing(
     BLOCK_M: tl.constexpr,
     EVEN_M: tl.constexpr,
     N_EXPTS_ACT: tl.constexpr,
+    N_EXPTS_ACT_PAD: tl.constexpr,
     ExpertHist,
     n_expts_tot,
     TokenStart,
@@ -211,6 +213,7 @@ def _combined_routing(
             BLOCK_M,
             EVEN_M,
             N_EXPTS_ACT,
+            N_EXPTS_ACT_PAD,
         )
 
 
@@ -230,6 +233,7 @@ def _combined_routing_fused(
     BLOCK_M: tl.constexpr,
     EVEN_M: tl.constexpr,
     N_EXPTS_ACT: tl.constexpr,
+    N_EXPTS_ACT_PAD: tl.constexpr,
     N_EXPTS_TOT: tl.constexpr,
     ExpertHist,
     TokenStart,
@@ -288,4 +292,5 @@ def _combined_routing_fused(
             BLOCK_M,
             EVEN_M,
             N_EXPTS_ACT,
+            N_EXPTS_ACT_PAD,
         )

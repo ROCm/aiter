@@ -143,13 +143,9 @@ torch::Tensor gemm_a8w8_asm(torch::Tensor& A,       // A:[M, K] i8
     int Mdim     = A.size(0);
     int Ndim     = out.size(1);
     int Kdim     = A.size(1);
-    int pad_a    = 0;
-    int pad_b    = 0;
-    int pad_c    = 0;
-    int stride_a = Kdim + pad_a;
-    int stride_b = Kdim + pad_b;
-    int stride_c = Ndim + pad_c;
-    stride_c     = stride_c * sizeof(uint16_t);
+    int stride_a = static_cast<int>(A.stride(0));
+    int stride_b = static_cast<int>(B.stride(0));
+    int stride_c = static_cast<int>(out.stride(0)) * sizeof(uint16_t);
     int ks       = splitK.value_or(0) ?: 1;
 
     KernelArgs args;
@@ -257,8 +253,8 @@ torch::Tensor gemm_a8w8_asm(torch::Tensor& A,       // A:[M, K] i8
             //        k_per_split,
             //        k_per_split_aligned);
             args.ks = selectedksplit;
-            // if(selectedksplit > 1)
-            //     out.zero_();
+            if(selectedksplit > 1)
+                out.zero_();
         }
         gdx         = gdx * selectedksplit;
         auto result = impl_ptr_map.emplace(name, nullptr);
