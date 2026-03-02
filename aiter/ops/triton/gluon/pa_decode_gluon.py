@@ -777,25 +777,25 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     )
 
 
-@triton.autotune(
-    configs=[
-        triton.Config(
-            {"waves_per_eu": wa}, maxnreg=512 // wa if wa > 0 else None, num_stages=1
-        )
-        for wa in range(5)
-    ],
-    key=[
-        "KV_BLOCK_SIZE",
-        "SLIDING_WINDOW",
-        "KV_QUANT_MODE",
-        "QUERY_QUANT_MODE",
-        "ONE_QUERY_GROUP_SIZE_POW2",
-        "HEAD_SIZE_POW2",
-        "COMPUTE_TYPE",
-        "ONE_SHOT",
-    ],
-    cache_results=True,
-)
+# @triton.autotune(
+#     configs=[
+#         triton.Config(
+#             {"waves_per_eu": wa}, maxnreg=512 // wa if wa > 0 else None, num_stages=1
+#         )
+#         for wa in range(5)
+#     ],
+#     key=[
+#         "KV_BLOCK_SIZE",
+#         "SLIDING_WINDOW",
+#         "KV_QUANT_MODE",
+#         "QUERY_QUANT_MODE",
+#         "ONE_QUERY_GROUP_SIZE_POW2",
+#         "HEAD_SIZE_POW2",
+#         "COMPUTE_TYPE",
+#         "ONE_SHOT",
+#     ],
+#     cache_results=True,
+# )
 @gluon.jit
 def paged_attention_decode_sliding_window_head_1(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
