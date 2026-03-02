@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: MIT
-# FlyDSL A8W8 bpreshuffle kernel instance definitions.
-# Mirrors the CKTile pattern in gemm_a8w8_bpreshuffle_cktile_common.py
-# so the tuning framework can treat FlyDSL as another "libtype".
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 from dataclasses import dataclass
 import os
 
@@ -41,6 +39,7 @@ class kernelInstance:
     lds_stage: int          # 1 or 2
     use_cshuffle_epilog: int  # 0 or 1
     use_async_copy: int       # 0 or 1
+    waves_per_eu: int         # 0=no hint, 1-4=occupancy limit
     sScheduler: str           # "Default"
 
     @property
@@ -59,236 +58,122 @@ class kernelInstance:
                 self.lds_stage,
                 self.use_cshuffle_epilog,
                 self.use_async_copy,
+                self.waves_per_eu,
             ])),
             self.sScheduler.lower(),
         ])
 
 
 def _ki(tile_m, tile_n, tile_k, lds_stage,
-        cshuffle=0, async_copy=0, scheduler="Default",
+        cshuffle=0, async_copy=0, waves_per_eu=0,
+        scheduler="Default",
         q_dtype_a="fp8", q_dtype_w="fp8", dtype="bf16"):
     return kernelInstance(
         tile_m, tile_n, tile_k,
         q_dtype_a, q_dtype_w, dtype,
-        lds_stage, cshuffle, async_copy, scheduler,
+        lds_stage, cshuffle, async_copy,
+        waves_per_eu, scheduler,
     )
 
 
 # fmt: off
 # ---------------------------------------------------------------------------
-# gfx942 (MI300): MFMA fp8 uses float8_e4m3fnuz, KWTile=64
-# Tile search space matches CKTile tile dimensions for fair tuning comparison.
-# Two lds_stage variants (2=ping-pong, 1=single) per tile.
+# Base tile configurations: (tile_m, tile_n, tile_k)
 # ---------------------------------------------------------------------------
-kernels_list_942 = {
-    #      tile_m  tile_n  tile_k  lds  csh  acp  scheduler
-    # ---- small M (decode / token-gen) ----
-    0:  _ki(16,     64,     256,    2, 0, 0, "Default"),
-    1:  _ki(16,     64,     512,    2, 0, 0, "Default"),
-    2:  _ki(16,     128,    256,    2, 0, 0, "Default"),
-    3:  _ki(16,     128,    512,    2, 0, 0, "Default"),
-    4:  _ki(16,     256,    256,    2, 0, 0, "Default"),
-    5:  _ki(16,     256,    512,    2, 0, 0, "Default"),
-    6:  _ki(16,     512,    256,    2, 0, 0, "Default"),
-    7:  _ki(16,     192,    256,    2, 0, 0, "Default"),
-    # ---- M=32 ----
-    8:  _ki(32,     64,     128,    2, 0, 0, "Default"),
-    9:  _ki(32,     64,     256,    2, 0, 0, "Default"),
-    10: _ki(32,     64,     512,    2, 0, 0, "Default"),
-    11: _ki(32,     128,    128,    2, 0, 0, "Default"),
-    12: _ki(32,     128,    256,    2, 0, 0, "Default"),
-    13: _ki(32,     192,    128,    2, 0, 0, "Default"),
-    14: _ki(32,     192,    256,    2, 0, 0, "Default"),
-    15: _ki(32,     256,    128,    2, 0, 0, "Default"),
-    16: _ki(32,     256,    256,    2, 0, 0, "Default"),
-    # ---- M=48 ----
-    17: _ki(48,     64,     256,    2, 0, 0, "Default"),
-    18: _ki(48,     128,    256,    2, 0, 0, "Default"),
-    19: _ki(48,     192,    256,    2, 0, 0, "Default"),
-    20: _ki(48,     256,    256,    2, 0, 0, "Default"),
-    # ---- M=64 ----
-    21: _ki(64,     64,     128,    2, 0, 0, "Default"),
-    22: _ki(64,     64,     256,    2, 0, 0, "Default"),
-    23: _ki(64,     128,    128,    2, 0, 0, "Default"),
-    24: _ki(64,     128,    256,    2, 0, 0, "Default"),
-    25: _ki(64,     192,    128,    2, 0, 0, "Default"),
-    26: _ki(64,     192,    256,    2, 0, 0, "Default"),
-    27: _ki(64,     256,    64,     2, 0, 0, "Default"),
-    28: _ki(64,     256,    128,    2, 0, 0, "Default"),
-    29: _ki(64,     256,    256,    2, 0, 0, "Default"),
-    # ---- M=80 ----
-    30: _ki(80,     64,     256,    2, 0, 0, "Default"),
-    31: _ki(80,     128,    256,    2, 0, 0, "Default"),
-    32: _ki(80,     192,    256,    2, 0, 0, "Default"),
-    33: _ki(80,     256,    256,    2, 0, 0, "Default"),
-    # ---- M=96 ----
-    34: _ki(96,     64,     128,    2, 0, 0, "Default"),
-    35: _ki(96,     64,     256,    2, 0, 0, "Default"),
-    36: _ki(96,     128,    128,    2, 0, 0, "Default"),
-    37: _ki(96,     128,    256,    2, 0, 0, "Default"),
-    38: _ki(96,     192,    128,    2, 0, 0, "Default"),
-    39: _ki(96,     192,    256,    2, 0, 0, "Default"),
-    40: _ki(96,     256,    128,    2, 0, 0, "Default"),
-    41: _ki(96,     256,    256,    2, 0, 0, "Default"),
-    # ---- M=112 ----
-    42: _ki(112,    64,     256,    2, 0, 0, "Default"),
-    43: _ki(112,    128,    256,    2, 0, 0, "Default"),
-    44: _ki(112,    192,    256,    2, 0, 0, "Default"),
-    45: _ki(112,    256,    256,    2, 0, 0, "Default"),
-    # ---- M=128 ----
-    46: _ki(128,    64,     128,    2, 0, 0, "Default"),
-    47: _ki(128,    64,     256,    2, 0, 0, "Default"),
-    48: _ki(128,    128,    64,     2, 0, 0, "Default"),
-    49: _ki(128,    128,    128,    2, 0, 0, "Default"),
-    50: _ki(128,    128,    256,    2, 0, 0, "Default"),
-    51: _ki(128,    192,    128,    2, 0, 0, "Default"),
-    52: _ki(128,    192,    256,    2, 0, 0, "Default"),
-    53: _ki(128,    256,    128,    2, 0, 0, "Default"),
-    # ---- M=160/192/224/256 ----
-    54: _ki(160,    192,    128,    2, 0, 0, "Default"),
-    55: _ki(192,    64,     128,    2, 0, 0, "Default"),
-    56: _ki(192,    128,    128,    2, 0, 0, "Default"),
-    57: _ki(224,    64,     128,    2, 0, 0, "Default"),
-    58: _ki(224,    128,    128,    2, 0, 0, "Default"),
-    59: _ki(224,    192,    128,    2, 0, 0, "Default"),
-    60: _ki(256,    64,     128,    2, 0, 0, "Default"),
-    61: _ki(256,    128,    128,    2, 0, 0, "Default"),
-    62: _ki(256,    192,    128,    2, 0, 0, "Default"),
 
-    # ---- lds_stage=1 variants (single LDS buffer) ----
-    63: _ki(16,     64,     256,    1, 0, 0, "Default"),
-    64: _ki(16,     64,     512,    1, 0, 0, "Default"),
-    65: _ki(16,     128,    256,    1, 0, 0, "Default"),
-    66: _ki(16,     128,    512,    1, 0, 0, "Default"),
-    67: _ki(16,     256,    256,    1, 0, 0, "Default"),
-    68: _ki(16,     256,    512,    1, 0, 0, "Default"),
-    69: _ki(16,     512,    256,    1, 0, 0, "Default"),
-    70: _ki(32,     64,     128,    1, 0, 0, "Default"),
-    71: _ki(32,     64,     256,    1, 0, 0, "Default"),
-    72: _ki(32,     64,     512,    1, 0, 0, "Default"),
-    73: _ki(32,     128,    128,    1, 0, 0, "Default"),
-    74: _ki(32,     128,    256,    1, 0, 0, "Default"),
-    75: _ki(64,     64,     128,    1, 0, 0, "Default"),
-    76: _ki(64,     64,     256,    1, 0, 0, "Default"),
-    77: _ki(64,     128,    128,    1, 0, 0, "Default"),
-    78: _ki(64,     128,    256,    1, 0, 0, "Default"),
-    79: _ki(64,     256,    128,    1, 0, 0, "Default"),
-    80: _ki(128,    64,     128,    1, 0, 0, "Default"),
-    81: _ki(128,    128,    128,    1, 0, 0, "Default"),
-    82: _ki(128,    128,    256,    1, 0, 0, "Default"),
-    83: _ki(128,    256,    128,    1, 0, 0, "Default"),
-}
+# lds_stage=2 tiles shared by gfx942 and gfx950
+_base_tiles_lds2_common = [
+    # small M (decode / token-gen)
+    (16,  64,  256), (16,  64,  512), (16,  128, 256), (16,  128, 512),
+    (16,  256, 256), (16,  256, 512), (16,  512, 256), (16,  192, 256),
+    # M=32
+    (32,  64,  128), (32,  64,  256), (32,  64,  512), (32,  128, 128),
+    (32,  128, 256), (32,  192, 128), (32,  192, 256), (32,  256, 128),
+    (32,  256, 256),
+    # M=48
+    (48,  64,  256), (48,  128, 256), (48,  192, 256), (48,  256, 256),
+    # M=64
+    (64,  64,  128), (64,  64,  256), (64,  128, 128), (64,  128, 256),
+    (64,  192, 128), (64,  192, 256), (64,  256, 64),  (64,  256, 128),
+    (64,  256, 256),
+    # M=80
+    (80,  64,  256), (80,  128, 256), (80,  192, 256), (80,  256, 256),
+    # M=96
+    (96,  64,  128), (96,  64,  256), (96,  128, 128), (96,  128, 256),
+    (96,  192, 128), (96,  192, 256), (96,  256, 128), (96,  256, 256),
+    # M=112
+    (112, 64,  256), (112, 128, 256), (112, 192, 256), (112, 256, 256),
+    # M=128
+    (128, 64,  128), (128, 64,  256), (128, 128, 64),  (128, 128, 128),
+    (128, 128, 256), (128, 192, 128), (128, 192, 256), (128, 256, 128),
+    # M=160/192/224/256
+    (160, 192, 128),
+    (192, 64,  128), (192, 128, 128),
+    (224, 64,  128), (224, 128, 128), (224, 192, 128),
+    (256, 64,  128), (256, 128, 128), (256, 192, 128),
+]
+
+# gfx950 has one extra lds_stage=2 tile
+_base_tiles_lds2_950_extra = [
+    (256, 256, 128),
+]
+
+# lds_stage=1 tiles (same for both archs)
+_base_tiles_lds1 = [
+    (16,  64,  256), (16,  64,  512), (16,  128, 256), (16,  128, 512),
+    (16,  256, 256), (16,  256, 512), (16,  512, 256),
+    (32,  64,  128), (32,  64,  256), (32,  64,  512), (32,  128, 128),
+    (32,  128, 256),
+    (64,  64,  128), (64,  64,  256), (64,  128, 128), (64,  128, 256),
+    (64,  256, 128),
+    (128, 64,  128), (128, 128, 128), (128, 128, 256), (128, 256, 128),
+]
+
+# ---------------------------------------------------------------------------
+# Combo sweep: lds_stage x cshuffle x async_copy x waves_per_eu
+# ---------------------------------------------------------------------------
+_LDS_STAGES      = (1, 2)
+_CSHUFFLE_VALS   = (0, 1)
+_ASYNC_COPY_VALS = (0, 1)
+_WAVES_PER_EU    = (1, 2, 3, 4)
+
+
+def _build_kernels_list(tiles_lds2, tiles_lds1):
+    tiles_by_lds = {2: tiles_lds2, 1: tiles_lds1}
+    kl = {}
+    idx = 0
+    for wpe in _WAVES_PER_EU:
+        for csh in _CSHUFFLE_VALS:
+            for acp in _ASYNC_COPY_VALS:
+                for lds in _LDS_STAGES:
+                    for tm, tn, tk in tiles_by_lds[lds]:
+                        kl[idx] = _ki(tm, tn, tk, lds, csh, acp, wpe)
+                        idx += 1
+    return kl
+
+
+kernels_list_942 = _build_kernels_list(
+    _base_tiles_lds2_common, _base_tiles_lds1)
+kernels_list_950 = _build_kernels_list(
+    _base_tiles_lds2_common + _base_tiles_lds2_950_extra, _base_tiles_lds1)
+# fmt: on
 
 default_kernels_dict_942 = {
-    (-1): _ki(128,  128,    128,    2, 0, 0, "Default"),
-    (-2): _ki(16,   64,     512,    2, 0, 0, "Default"),
-    (-3): _ki(32,   64,     512,    2, 0, 0, "Default"),
-    (-4): _ki(64,   256,    64,     2, 0, 0, "Default"),
-    (-5): _ki(128,  128,    64,     2, 0, 0, "Default"),
-    (-6): _ki(128,  64,     128,    2, 0, 0, "Default"),
-    (-7): _ki(64,   256,    128,    2, 0, 0, "Default"),
-}
-
-# ---------------------------------------------------------------------------
-# gfx950 (MI350): MFMA fp8 uses float8_e4m3fn, KWTile=128
-# Same tile search space, just different arch defaults.
-# ---------------------------------------------------------------------------
-kernels_list_950 = {
-    0:  _ki(16,     64,     256,    2, 0, 0, "Default"),
-    1:  _ki(16,     64,     512,    2, 0, 0, "Default"),
-    2:  _ki(16,     128,    256,    2, 0, 0, "Default"),
-    3:  _ki(16,     128,    512,    2, 0, 0, "Default"),
-    4:  _ki(16,     256,    256,    2, 0, 0, "Default"),
-    5:  _ki(16,     256,    512,    2, 0, 0, "Default"),
-    6:  _ki(16,     512,    256,    2, 0, 0, "Default"),
-    7:  _ki(16,     192,    256,    2, 0, 0, "Default"),
-    8:  _ki(32,     64,     128,    2, 0, 0, "Default"),
-    9:  _ki(32,     64,     256,    2, 0, 0, "Default"),
-    10: _ki(32,     64,     512,    2, 0, 0, "Default"),
-    11: _ki(32,     128,    128,    2, 0, 0, "Default"),
-    12: _ki(32,     128,    256,    2, 0, 0, "Default"),
-    13: _ki(32,     192,    128,    2, 0, 0, "Default"),
-    14: _ki(32,     192,    256,    2, 0, 0, "Default"),
-    15: _ki(32,     256,    128,    2, 0, 0, "Default"),
-    16: _ki(32,     256,    256,    2, 0, 0, "Default"),
-    17: _ki(48,     64,     256,    2, 0, 0, "Default"),
-    18: _ki(48,     128,    256,    2, 0, 0, "Default"),
-    19: _ki(48,     192,    256,    2, 0, 0, "Default"),
-    20: _ki(48,     256,    256,    2, 0, 0, "Default"),
-    21: _ki(64,     64,     128,    2, 0, 0, "Default"),
-    22: _ki(64,     64,     256,    2, 0, 0, "Default"),
-    23: _ki(64,     128,    128,    2, 0, 0, "Default"),
-    24: _ki(64,     128,    256,    2, 0, 0, "Default"),
-    25: _ki(64,     192,    128,    2, 0, 0, "Default"),
-    26: _ki(64,     192,    256,    2, 0, 0, "Default"),
-    27: _ki(64,     256,    64,     2, 0, 0, "Default"),
-    28: _ki(64,     256,    128,    2, 0, 0, "Default"),
-    29: _ki(64,     256,    256,    2, 0, 0, "Default"),
-    30: _ki(80,     64,     256,    2, 0, 0, "Default"),
-    31: _ki(80,     128,    256,    2, 0, 0, "Default"),
-    32: _ki(80,     192,    256,    2, 0, 0, "Default"),
-    33: _ki(80,     256,    256,    2, 0, 0, "Default"),
-    34: _ki(96,     64,     128,    2, 0, 0, "Default"),
-    35: _ki(96,     64,     256,    2, 0, 0, "Default"),
-    36: _ki(96,     128,    128,    2, 0, 0, "Default"),
-    37: _ki(96,     128,    256,    2, 0, 0, "Default"),
-    38: _ki(96,     192,    128,    2, 0, 0, "Default"),
-    39: _ki(96,     192,    256,    2, 0, 0, "Default"),
-    40: _ki(96,     256,    128,    2, 0, 0, "Default"),
-    41: _ki(96,     256,    256,    2, 0, 0, "Default"),
-    42: _ki(112,    64,     256,    2, 0, 0, "Default"),
-    43: _ki(112,    128,    256,    2, 0, 0, "Default"),
-    44: _ki(112,    192,    256,    2, 0, 0, "Default"),
-    45: _ki(112,    256,    256,    2, 0, 0, "Default"),
-    46: _ki(128,    64,     128,    2, 0, 0, "Default"),
-    47: _ki(128,    64,     256,    2, 0, 0, "Default"),
-    48: _ki(128,    128,    64,     2, 0, 0, "Default"),
-    49: _ki(128,    128,    128,    2, 0, 0, "Default"),
-    50: _ki(128,    128,    256,    2, 0, 0, "Default"),
-    51: _ki(128,    192,    128,    2, 0, 0, "Default"),
-    52: _ki(128,    192,    256,    2, 0, 0, "Default"),
-    53: _ki(128,    256,    128,    2, 0, 0, "Default"),
-    54: _ki(160,    192,    128,    2, 0, 0, "Default"),
-    55: _ki(192,    64,     128,    2, 0, 0, "Default"),
-    56: _ki(192,    128,    128,    2, 0, 0, "Default"),
-    57: _ki(224,    64,     128,    2, 0, 0, "Default"),
-    58: _ki(224,    128,    128,    2, 0, 0, "Default"),
-    59: _ki(224,    192,    128,    2, 0, 0, "Default"),
-    60: _ki(256,    64,     128,    2, 0, 0, "Default"),
-    61: _ki(256,    128,    128,    2, 0, 0, "Default"),
-    62: _ki(256,    192,    128,    2, 0, 0, "Default"),
-    63: _ki(256,    256,    128,    2, 0, 0, "Default"),
-
-    64: _ki(16,     64,     256,    1, 0, 0, "Default"),
-    65: _ki(16,     64,     512,    1, 0, 0, "Default"),
-    66: _ki(16,     128,    256,    1, 0, 0, "Default"),
-    67: _ki(16,     128,    512,    1, 0, 0, "Default"),
-    68: _ki(16,     256,    256,    1, 0, 0, "Default"),
-    69: _ki(16,     256,    512,    1, 0, 0, "Default"),
-    70: _ki(16,     512,    256,    1, 0, 0, "Default"),
-    71: _ki(32,     64,     128,    1, 0, 0, "Default"),
-    72: _ki(32,     64,     256,    1, 0, 0, "Default"),
-    73: _ki(32,     64,     512,    1, 0, 0, "Default"),
-    74: _ki(32,     128,    128,    1, 0, 0, "Default"),
-    75: _ki(32,     128,    256,    1, 0, 0, "Default"),
-    76: _ki(64,     64,     128,    1, 0, 0, "Default"),
-    77: _ki(64,     64,     256,    1, 0, 0, "Default"),
-    78: _ki(64,     128,    128,    1, 0, 0, "Default"),
-    79: _ki(64,     128,    256,    1, 0, 0, "Default"),
-    80: _ki(64,     256,    128,    1, 0, 0, "Default"),
-    81: _ki(128,    64,     128,    1, 0, 0, "Default"),
-    82: _ki(128,    128,    128,    1, 0, 0, "Default"),
-    83: _ki(128,    128,    256,    1, 0, 0, "Default"),
-    84: _ki(128,    256,    128,    1, 0, 0, "Default"),
+    (-1): _ki(128,  128,    128,    2, 0, 0, 2, "Default"),
+    (-2): _ki(16,   64,     512,    2, 0, 0, 2, "Default"),
+    (-3): _ki(32,   64,     512,    2, 0, 0, 2, "Default"),
+    (-4): _ki(64,   256,    64,     2, 0, 0, 2, "Default"),
+    (-5): _ki(128,  128,    64,     2, 0, 0, 2, "Default"),
+    (-6): _ki(128,  64,     128,    2, 0, 0, 2, "Default"),
+    (-7): _ki(64,   256,    128,    2, 0, 0, 2, "Default"),
 }
 
 default_kernels_dict_950 = {
-    (-1): _ki(128,  256,    256,    2, 0, 0, "Default"),
-    (-2): _ki(16,   64,     512,    2, 0, 0, "Default"),
-    (-3): _ki(32,   64,     512,    2, 0, 0, "Default"),
-    (-4): _ki(128,  128,    128,    2, 0, 0, "Default"),
+    (-1): _ki(128,  256,    256,    2, 0, 0, 2, "Default"),
+    (-2): _ki(16,   64,     512,    2, 0, 0, 2, "Default"),
+    (-3): _ki(32,   64,     512,    2, 0, 0, 2, "Default"),
+    (-4): _ki(128,  128,    128,    2, 0, 0, 2, "Default"),
 }
-# fmt: on
 
 arch = get_gfx()
 if arch == "gfx942":

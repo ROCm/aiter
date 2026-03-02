@@ -47,6 +47,7 @@ def _flydsl_get_compile_fn():
         if DSL2_ROOT not in sys.path:
             sys.path.insert(0, DSL2_ROOT)
         from kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
+
         _flydsl_compile_fn = compile_preshuffle_gemm_a8
         logger.info(f"[FlyDSL] loaded from {DSL2_ROOT}")
     except Exception as e:
@@ -80,17 +81,35 @@ def _flydsl_select_tiles(M: int, N: int, K: int):
     return tile_m, tile_n, tile_k
 
 
+def _flydsl_parse_kernel_name(kernel_name: str):
+    """Extract tuning params from a FlyDSL kernel name.
+
+    Format: flydsl_bpreshuflle_{TM}x{TN}x{TK}_{qa}_{qw}_{dt}_{lds}x{csh}x{acp}x{wpe}_{sched}
+    """
+    parts = kernel_name.split("_")
+    tm, tn, tk = (int(v) for v in parts[2].split("x"))
+    cfg = [int(v) for v in parts[6].split("x")]
+    return tm, tn, tk, cfg[0], cfg[1], cfg[2], (cfg[3] if len(cfg) > 3 else 0)
+
+
 def _flydsl_preshuffle_gemm_a8(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    out_dtype: torch.dtype = torch.bfloat16,
-) -> Optional[Tensor]:
+    Out: Tensor,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    lds_stage: int = 2,
+    use_cshuffle_epilog: int = 0,
+    use_async_copy: int = 0,
+    waves_per_eu: int = 0,
+) -> Tensor:
 
     compile_fn = _flydsl_get_compile_fn()
     if compile_fn is None:
-        return None
+        raise RuntimeError("[FlyDSL] compile function not available")
 
     m, k = XQ.shape[0], XQ.shape[-1]
     n = WQ.shape[0]
@@ -100,38 +119,56 @@ def _flydsl_preshuffle_gemm_a8(
     elif XQ.dtype == torch.int8:
         in_dtype = "int8"
     else:
-        return None
+        raise ValueError(f"[FlyDSL] unsupported input dtype {XQ.dtype}")
 
-    tiles = _flydsl_select_tiles(m, n, k)
-    if tiles is None:
-        return None
-    tile_m, tile_n, tile_k = tiles
+    wpe = None if waves_per_eu <= 0 else waves_per_eu
 
-    cache_key = (m, n, k, in_dtype, tile_m, tile_n, tile_k)
+    cache_key = (
+        m,
+        n,
+        k,
+        in_dtype,
+        tile_m,
+        tile_n,
+        tile_k,
+        lds_stage,
+        use_cshuffle_epilog,
+        use_async_copy,
+        wpe,
+    )
     if cache_key not in _flydsl_kernel_cache:
         try:
             exe = compile_fn(
-                M=m, N=n, K=k,
-                tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+                M=m,
+                N=n,
+                K=k,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                tile_k=tile_k,
                 in_dtype=in_dtype,
+                lds_stage=lds_stage,
+                use_cshuffle_epilog=bool(use_cshuffle_epilog),
+                use_async_copy=bool(use_async_copy),
+                waves_per_eu=wpe,
             )
             _flydsl_kernel_cache[cache_key] = exe
+            logger.info(
+                f"[FlyDSL] compiled preshuffle GEMM ({m},{n},{k} {in_dtype} "
+                f"tile={tile_m}x{tile_n}x{tile_k} lds={lds_stage} csh={use_cshuffle_epilog} "
+                f"acp={use_async_copy} wpe={waves_per_eu})"
+            )
         except Exception as e:
             logger.warning(f"[FlyDSL] compile failed ({m},{n},{k} {in_dtype}): {e}")
             _flydsl_kernel_cache[cache_key] = None
 
     exe = _flydsl_kernel_cache[cache_key]
     if exe is None:
-        return None
+        raise RuntimeError(f"[FlyDSL] kernel compile returned None for ({m},{n},{k})")
 
-    c_out = torch.empty(m, n, dtype=torch.float16, device=XQ.device)
     stream_ptr = torch.cuda.current_stream().cuda_stream
-    exe(c_out, XQ, WQ, x_scale, w_scale, m, n, k, stream_ptr)
-    logger.info(f"[FlyDSL] executed preshuffle GEMM ({m},{n},{k} {in_dtype} tile={tile_m}x{tile_n}x{tile_k})")
+    exe(Out, XQ, WQ, x_scale, w_scale, m, n, k, stream_ptr)
 
-    if out_dtype != torch.float16:
-        c_out = c_out.to(out_dtype)
-    return c_out
+    return Out
 
 
 def gen_gemm_a8w8_ck_fake_tensors(
@@ -613,16 +650,31 @@ def gemm_a8w8_bpreshuffle(
         elif libtype == "cktile":
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
         elif libtype == "flydsl":
-            flydsl = _flydsl_preshuffle_gemm_a8(
-                XQ.contiguous(), WQ.contiguous(), x_scale, w_scale, out_dtype=dtype
+            kernel_name = config.get("kernelName", "")
+            if kernel_name and kernel_name.startswith("flydsl_"):
+                tm, tn, tk, lds, csh, acp, wpe = _flydsl_parse_kernel_name(kernel_name)
+            else:
+                tiles = _flydsl_select_tiles(m, n, k)
+                if tiles is None:
+                    return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+                tm, tn, tk = tiles
+                lds, csh, acp, wpe = 2, 0, 0, 0
+            Y_fp16 = torch.empty(m, n, dtype=torch.float16, device=XQ.device)
+            _flydsl_preshuffle_gemm_a8(
+                XQ.contiguous(),
+                WQ.contiguous(),
+                x_scale,
+                w_scale,
+                Y_fp16,
+                tm,
+                tn,
+                tk,
+                lds,
+                csh,
+                acp,
+                wpe,
             )
-            if flydsl is not None:
-                return flydsl
-            logger.warning(
-                f"[FlyDSL] tuned config selected flydsl but unavailable, "
-                f"falling back to ck for ({m},{n},{k})"
-            )
-            return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+            return Y_fp16.to(dtype)
     else:
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 

@@ -23,7 +23,9 @@ sys.path.insert(0, f"{AITER_CSRC_DIR}/flydsl_gemm_a8w8_bpreshuffle/")
 try:
     from flydsl_gemm_a8w8_bpreshuffle_common import kernels_list as kernels_list_flydsl
 except ImportError:
-    print("[FlyDSL] flydsl_gemm_a8w8_bpreshuffle_common.py not found, flydsl tuning disabled")
+    print(
+        "[FlyDSL] flydsl_gemm_a8w8_bpreshuffle_common.py not found, flydsl tuning disabled"
+    )
     kernels_list_flydsl = {}
 
 DSL2_ROOT = os.environ.get("DSL2_ROOT", None)
@@ -110,32 +112,62 @@ def _get_flydsl_compile_fn():
         if DSL2_ROOT not in sys.path:
             sys.path.insert(0, DSL2_ROOT)
         from kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
+
         _flydsl_compile_fn = compile_preshuffle_gemm_a8
     except Exception as e:
         print(f"[FlyDSL] compile function not available: {e}")
     return _flydsl_compile_fn
 
 
-def run_gemm_flydsl(x, weight_shuffle, x_scale, w_scale, out,
-                    tile_m, tile_n, tile_k, in_dtype, lds_stage,
-                    use_cshuffle_epilog, use_async_copy):
+def run_gemm_flydsl(
+    x,
+    weight_shuffle,
+    x_scale,
+    w_scale,
+    out,
+    tile_m,
+    tile_n,
+    tile_k,
+    in_dtype,
+    lds_stage,
+    use_cshuffle_epilog,
+    use_async_copy,
+    waves_per_eu=0,
+):
     compile_fn = _get_flydsl_compile_fn()
     if compile_fn is None:
         raise RuntimeError("[FlyDSL] compile function not available")
 
     m, k = x.shape
     n = out.shape[1]
+    wpe = None if int(waves_per_eu) <= 0 else int(waves_per_eu)
 
-    cache_key = (m, n, k, tile_m, tile_n, tile_k, in_dtype, lds_stage,
-                 use_cshuffle_epilog, use_async_copy)
+    cache_key = (
+        m,
+        n,
+        k,
+        tile_m,
+        tile_n,
+        tile_k,
+        in_dtype,
+        lds_stage,
+        use_cshuffle_epilog,
+        use_async_copy,
+        wpe,
+    )
     if cache_key not in _flydsl_exe_cache:
         _flydsl_exe_cache[cache_key] = compile_fn(
-            M=m, N=n, K=k,
-            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+            M=m,
+            N=n,
+            K=k,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
             in_dtype=in_dtype,
             lds_stage=lds_stage,
             use_cshuffle_epilog=bool(use_cshuffle_epilog),
             use_async_copy=bool(use_async_copy),
+            waves_per_eu=wpe,
         )
 
     exe = _flydsl_exe_cache[cache_key]
@@ -341,6 +373,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                         ki.lds_stage,
                         ki.use_cshuffle_epilog,
                         ki.use_async_copy,
+                        ki.waves_per_eu,
                     ),
                     {
                         "num_warmup": args.warmup,
