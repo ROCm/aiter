@@ -84,15 +84,15 @@ L_M = [1, 2, 128, 256, 8000, 16000]
 L_N = [4096, 8192]
 
 @pytest.mark.parametrize("dtype", [dtypes.d_dtypes[k] for k in L_DTYPE_STR])
-@pytest.mark.parametrize("m", [1, 2, 8000, 16000])
-@pytest.mark.parametrize("n", [4096, 8192])
+@pytest.mark.parametrize("m", L_M)
+@pytest.mark.parametrize("n", L_N)
 def test_gemma_rmsnorm_pytest(dtype, m, n):
     _run_gemma_rmsnorm(dtype, m, n)
 
 
 @pytest.mark.parametrize("dtype", [dtypes.d_dtypes[k] for k in L_DTYPE_STR])
-@pytest.mark.parametrize("m", [1, 2, 8000, 16000])
-@pytest.mark.parametrize("n", [4096, 8192])
+@pytest.mark.parametrize("m", L_M)
+@pytest.mark.parametrize("n", L_N)
 def test_gemma_fused_add_rmsnorm_pytest(dtype, m, n):
     _run_gemma_fused_add_rmsnorm(dtype, m, n)
 
