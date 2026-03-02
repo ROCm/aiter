@@ -21,7 +21,7 @@ def compute_padding_info(seqlen_k, BLOCK_N: tl.constexpr):
     # K blocks visualization:
     #         Block 0         Block 1         Block 2 (last)
     #         K0 K1 K2 K3    K4 K5 K6 K7     K8 K9 ?? ??
-    #         ↑---------↑    ↑---------↑     ↑---↑ ↑---↑
+    #         ?---------?    ?---------?     ?---? ?---?
     #         full block     full block      valid  pad
     if seqlen_k < BLOCK_N:
         n_extra_tokens = BLOCK_N - seqlen_k
@@ -63,16 +63,16 @@ def compute_block_masking(
         # ========== CAUSAL MODE: Classify K Blocks ==========
         # Calculate causal boundary for this Q block
         #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9 ?? ??]
-        # Q0-Q3:   [ 1  0  0  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q0
-        #          [ 1  1  0  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q1
-        #          [ 1  1  1  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q2
-        #          [ 1  1  1  1] [ 1  1  0  0] [ 0  0 -- --]  ← Q3
-        #                            ↑ can see up to K5
+        # Q0-Q3:   [ 1  0  0  0] [ 0  0  0  0] [ 0  0 -- --]  <- Q0
+        #          [ 1  1  0  0] [ 0  0  0  0] [ 0  0 -- --]  <- Q1
+        #          [ 1  1  1  0] [ 0  0  0  0] [ 0  0 -- --]  <- Q2
+        #          [ 1  1  1  1] [ 1  1  0  0] [ 0  0 -- --]  <- Q3
+        #                            ? can see up to K5
         #
-        # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  0] [ 0  0 -- --]  ← Q4
-        #          [ 1  1  1  1] [ 1  1  1  1] [ 0  0 -- --]  ← Q5
-        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  0 -- --]  ← Q6
-        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -- --]  ← Q7
+        # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  0] [ 0  0 -- --]  <- Q4
+        #          [ 1  1  1  1] [ 1  1  1  1] [ 0  0 -- --]  <- Q5
+        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  0 -- --]  <- Q6
+        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -- --]  <- Q7
 
         # ------------------------------------------------------------
         # 1. figure out, in tokens, the right-most K position
@@ -80,7 +80,7 @@ def compute_block_masking(
         # ------------------------------------------------------------
         k_max_token = q_end + diag  # last visible K index
 
-        # this Q-block is entirely above the diagonal ⇒ nothing to do
+        # this Q-block is entirely above the diagonal => nothing to do
         if k_max_token < 0:
             return 0, 0, 0, 0, n_extra_tokens
 
@@ -94,12 +94,12 @@ def compute_block_masking(
 
         # ------------------------------------------------------------
         # 3. classify those visible blocks
-        #    – we *never* skip or mask blocks in front, because causal
+        #    - we *never* skip or mask blocks in front, because causal
         #      attention always starts at K0
-        #    – the back side can require several masked blocks:
-        #         • intersection of the causal diagonal with K-grid
-        #           (at most  ⌈BLOCK_M / BLOCK_N⌉ blocks)
-        #         • plus one extra block if this Q-block stops in the
+        #    - the back side can require several masked blocks:
+        #         o intersection of the causal diagonal with K-grid
+        #           (at most  ?BLOCK_M / BLOCK_N? blocks)
+        #         o plus one extra block if this Q-block stops in the
         #           middle of a K-block or the last K-block is padded
         # ------------------------------------------------------------
         padded_last_k = n_extra_tokens != 0
@@ -116,15 +116,15 @@ def compute_block_masking(
         # Without causal mask, all positions can attend to all positions
         # Only need to handle the padding in the last block
         #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9 ?? ??]
-        # Q0-Q3:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+        # Q0-Q3:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
+        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
+        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
+        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
         #
-        # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+        # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
+        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
+        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
+        #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
 
         n_front_skip_blocks = 0  # never skips the left side
         n_front_masked_blocks = 0  # ditto
@@ -869,6 +869,14 @@ def _rotate_quantize_qk_kernel(
     stride_qh,
     stride_qm,
     stride_qd,
+    stride_qqb,
+    stride_qqm,
+    stride_qqh,
+    stride_qqd,
+    stride_qsb,
+    stride_qsm,
+    stride_qsh,
+    stride_qsd,
     stride_mb,
     stride_mh,
     stride_mm,
@@ -877,6 +885,14 @@ def _rotate_quantize_qk_kernel(
     stride_kh,
     stride_km,
     stride_kd,
+    stride_kqb,
+    stride_kqn,
+    stride_kqh,
+    stride_kqd,
+    stride_ksb,
+    stride_ksn,
+    stride_ksh,
+    stride_ksd,
     batch,
     heads_q,
     heads_k,
@@ -921,15 +937,18 @@ def _rotate_quantize_qk_kernel(
             + offs_m[:, None] * stride_qm
             + offs_d[None, :] * stride_qd
         )
-        descale_offset = (
-            Q_descale
-            + (pid_b * stride_qb + pid_h * stride_qh + offs_m[:, None] * stride_qm)
-            // SCALE_GROUP_SIZE
+        descale_offset = Q_descale + (
+            pid_b * stride_qsb
+            + pid_h * stride_qsh
+            + offs_m[:, None] * stride_qsm
+            + offs_ds[None, :] * stride_qsd
         )  # we group 32 values together for quantization
         # Store rotated and quantized Q
-        quant_tensor_offset = (
-            Q_q
-            + (pid_b * stride_qb + pid_h * stride_qh + offs_m[:, None] * stride_qm) // 2
+        quant_tensor_offset = Q_q + (
+            pid_b * stride_qqb
+            + pid_h * stride_qqh
+            + offs_m[:, None] * stride_qqm
+            + offs_dq[None, :] * stride_qqd
         )
         seqlen = seqlen_q
     else:
@@ -939,21 +958,24 @@ def _rotate_quantize_qk_kernel(
             + offs_m[:, None] * stride_km
             + offs_d[None, :] * stride_kd
         )
-        descale_offset = (
-            K_descale
-            + (pid_b * stride_kb + pid_h * stride_kh + offs_m[:, None] * stride_km)
-            // SCALE_GROUP_SIZE
+        descale_offset = K_descale + (
+            pid_b * stride_ksb
+            + pid_h * stride_ksh
+            + offs_m[:, None] * stride_ksn
+            + offs_ds[None, :] * stride_ksd
         )  # we group 32 values together for quantization
 
-        quant_tensor_offset = (
-            K_q
-            + (pid_b * stride_kb + pid_h * stride_kh + offs_m[:, None] * stride_km) // 2
+        quant_tensor_offset = K_q + (
+            pid_b * stride_kqb
+            + pid_h * stride_kqh
+            + offs_m[:, None] * stride_kqn
+            + offs_dq[None, :] * stride_kqd
         )
         seqlen = seqlen_k
 
     qk_ptr = tensor_offset
-    qk_descale_ptr = descale_offset + offs_ds[None, :]
-    qk_quant_ptr = quant_tensor_offset + offs_dq[None, :]
+    qk_descale_ptr = descale_offset
+    qk_quant_ptr = quant_tensor_offset
 
     qk_tile = tl.load(
         qk_ptr, mask=(offs_m[:, None] < seqlen) & (offs_d[None, :] < d_model), other=0.0
@@ -1164,6 +1186,12 @@ def smooth_rotate_downcast_qk(
         (*k.shape[:-1], d // 32), dtype=torch.uint8, device=k.device
     )
 
+    stride_qqb, stride_qqm, stride_qqh, stride_qqd = map_dims(Q_q.stride(), bshd)
+    stride_kqb, stride_kqn, stride_kqh, stride_kqd = map_dims(K_q.stride(), bshd)
+
+    stride_qsb, stride_qsm, stride_qsh, stride_qsd = map_dims(Q_descale.stride(), bshd)
+    stride_ksb, stride_ksn, stride_ksh, stride_ksd = map_dims(K_descale.stride(), bshd)
+
     grid = (b * (h_q * Q_NUM_BLKS + h_k * K_NUM_BLKS),)
     _rotate_quantize_qk_kernel[grid](
         q,
@@ -1179,6 +1207,14 @@ def smooth_rotate_downcast_qk(
         stride_qh,
         stride_qm,
         stride_qd,
+        stride_qqb,
+        stride_qqm,
+        stride_qqh,
+        stride_qqd,
+        stride_qsb,
+        stride_qsm,
+        stride_qsh,
+        stride_qsd,
         q_mean.stride(0) if q_smoothing else None,
         q_mean.stride(1) if q_smoothing else None,
         q_mean.stride(2) if q_smoothing else None,
@@ -1187,6 +1223,14 @@ def smooth_rotate_downcast_qk(
         stride_kh,
         stride_kn,
         stride_kd,
+        stride_kqb,
+        stride_kqn,
+        stride_kqh,
+        stride_kqd,
+        stride_ksb,
+        stride_ksn,
+        stride_ksh,
+        stride_ksd,
         b,
         h_q,
         h_k,
