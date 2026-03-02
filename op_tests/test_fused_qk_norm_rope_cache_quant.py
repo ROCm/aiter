@@ -1413,27 +1413,27 @@ if __name__ == "__main__":
         "qk_norm_rope_cache_block_quant summary (markdown):\n%s", block_df_md
     )
 
-    # dtype = torch.bfloat16
-    # batch_size = 2
-    # num_tokens1 = 3608
-    # num_heads_q = 24
-    # num_heads_k = 25
-    # df = []
-    # for head_size in args.head_sizes:
-    #    for num_tokens0 in args.token:
-    #        for is_neox_styles in args.is_neox_styles:
-    #            ret = test_qk_norm_rope_2way(
-    #                dtype,
-    #                batch_size,
-    #                num_tokens0,
-    #                num_tokens1,
-    #                num_heads_q,
-    #                num_heads_k,
-    #                head_size,
-    #                not is_neox_styles,
-    #                eps=1e-6,
-    #            )
-    #            df.append(ret)
-    # df = pd.DataFrame(df)
-    # df_md = df.to_markdown(index=False)
-    # aiter.logger.info("qk_norm_rope_2way summary (markdown):\n%s", df_md)
+    dtype = torch.bfloat16
+    batch_size = 2
+    num_tokens1 = 3608
+    num_heads_q = 24
+    num_heads_k = 25
+    df = []
+    for head_size in args.head_sizes:
+        for num_tokens0 in args.token:
+            for is_neox_styles in args.is_neox_styles:
+                ret = test_qk_norm_rope_2way(
+                    dtype,
+                    batch_size,
+                    num_tokens0,
+                    num_tokens1,
+                    num_heads_q,
+                    num_heads_k,
+                    head_size,
+                    not is_neox_styles,
+                    eps=1e-6,
+                )
+                df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("qk_norm_rope_2way summary (markdown):\n%s", df_md)
