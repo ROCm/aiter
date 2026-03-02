@@ -1,9 +1,5 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""
-Gemma-style RMSNorm kernels (fp16/bf16 only).
-Kernel implementation lives in pyhip/archive/norm; this module provides aiter-style API.
-"""
 
 import torch
 from torch import Tensor
