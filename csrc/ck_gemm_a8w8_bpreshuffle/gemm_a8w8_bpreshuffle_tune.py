@@ -93,12 +93,19 @@ def generate_data(
     x, x_scale = aiter.pertoken_quant(x, quant_dtype=q_dtype_w)
     weight, w_scale = aiter.pertoken_quant(weight, quant_dtype=q_dtype_w)
     bias_f32 = None
+    weight_shuffle = shuffle_weight(weight, layout=(16, 16))
     if is_asm:
-        weight_shuffle = shuffle_weight(weight, layout=(32, 16))
+        pad_k = 128
+        x_full = torch.empty_strided(
+            (m, k + pad_k),
+            (k + pad_k, 1),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        x_full[:, :k] = x
+        x = x_full[:, :k]
         bias = torch.zeros(1, n, dtype=dtype, device=device)
         bias_f32 = bias.to(dtypes.fp32)
-    else:
-        weight_shuffle = shuffle_weight(weight, layout=(16, 16))
     out = torch.empty(m, n, dtype=dtype, device=device)
     return x, weight_shuffle, x_scale, w_scale, out, weight, bias_f32
 

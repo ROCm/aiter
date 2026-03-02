@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
@@ -13,6 +13,7 @@ from aiter.test_mha_common import (
 import pytest
 import pandas as pd
 import argparse
+import math
 
 benchmark = {}
 
@@ -197,7 +198,16 @@ def test_flash_attn_varlen_output(
         window_size,
     )
 
-    max_diff = (out - out_ref).abs().max().item()
+    abs_diff = (out - out_ref).abs()
+    max_diff = abs_diff.max().item()
+
+    # calculate nrms
+    square_diff = (abs_diff / out_ref.abs()).pow(2)
+    square_diff = torch.where(out_ref == 0.0, 1.0, square_diff)
+    max_item = max(out.abs().max().item(), out_ref.abs().max().item(), 10**-7)
+    nrms = square_diff.sum().sqrt() / (math.sqrt(out_ref.numel()) * max_item)
+
+    print(f"Output nrms: {nrms}")
     print(f"Output max diff: {max_diff}")
     assert max_diff < 0.055
 

@@ -26,6 +26,20 @@ git submodule sync && git submodule update --init --recursive
 ```
 
 
+### FlyDSL (Optional)
+
+AITER's FusedMoE supports [FlyDSL](https://pypi.org/project/flydsl/)-based kernels for mixed-precision MOE (e.g., A4W4). FlyDSL is optional — when not installed, AITER automatically falls back to CK kernels.
+
+```bash
+pip install --pre flydsl
+```
+
+Or install all optional dependencies at once:
+
+```bash
+pip install -r requirements.txt
+```
+
 ### Triton-based Communication (Iris)
 
 AITER supports GPU-initiated communication using the [Iris library](https://github.com/ROCm/iris). This enables high-performance Triton-based communication primitives like reduce-scatter and all-gather.
