@@ -57,11 +57,12 @@ def _run_gemma_rmsnorm(dtype, m, n):
     weight = torch.randn(n, dtype=dtype, device="cuda")
     (a, *_), avg_a = run_torch(input, weight, 1e-6)
     (b, *_), avg_b = run_gemma(input, weight, 1e-6)
+    speedup = avg_a / avg_b if avg_b > 0 else 0.0
     msg = (
         f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, "
-        f"gemma avg: {avg_b:<8.2f} us"
+        f"gemma avg: {avg_b:<8.2f} us, speedup: {speedup:.2f}x"
     )
-    rtol, atol = (1e-2, 1e-2) if dtype == torch.bfloat16 else (1e-3, 1e-3)
+    rtol, atol = 1e-3, 1e-2
     checkAllclose(a, b, rtol=rtol, atol=atol, msg=msg)
 
 
@@ -72,18 +73,19 @@ def _run_gemma_fused_add_rmsnorm(dtype, m, n):
     res = torch.randn(dim, dtype=dtype, device="cuda")
     (a, res_a, *_), avg_a = run_torch(input, weight, 1e-6, residual=res)
     (b, res_b, *_), avg_b = run_gemma(input, weight, 1e-6, residual=res)
+    speedup = avg_a / avg_b if avg_b > 0 else 0.0
     msg = (
         f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, "
-        f"gemma avg: {avg_b:<8.2f} us"
+        f"gemma avg: {avg_b:<8.2f} us, speedup: {speedup:.2f}x"
     )
-    rtol, atol = (1e-2, 1e-2) if dtype == torch.bfloat16 else (1e-3, 1e-3)
+    rtol, atol = 1e-3, 1e-2
     checkAllclose(a, b, rtol=rtol, atol=atol, msg=msg)
     checkAllclose(res_a, res_b, rtol=rtol, atol=atol, msg="gemma res check")
 
 
 L_DTYPE_STR = ["fp16", "bf16"]
-L_M = [1, 2, 128, 256, 8000, 16000]
-L_N = [4096, 8192]
+L_M = [1, 2, 128, 256, 8000, 8294, 33176]
+L_N = [256, 4096]
 
 
 @pytest.mark.parametrize("dtype", [dtypes.d_dtypes[k] for k in L_DTYPE_STR])
