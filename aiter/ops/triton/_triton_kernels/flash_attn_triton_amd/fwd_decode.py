@@ -932,9 +932,7 @@ def attention_forward_decode_triton_impl(
                 # Find the first unoccupied position per batch from the block table.
                 invalid_mask = block_table < 0
                 has_invalid = invalid_mask.any(dim=1)
-                first_invalid_idx = (
-                    invalid_mask.to(torch.int32).argmax(dim=1).long()
-                )
+                first_invalid_idx = invalid_mask.to(torch.int32).argmax(dim=1).long()
                 start_idx = torch.where(
                     has_invalid,
                     first_invalid_idx * block_size,
@@ -949,9 +947,7 @@ def attention_forward_decode_triton_impl(
             batch_idx = torch.arange(batch_size, device=k_new.device, dtype=torch.long)[
                 :, None
             ]
-            physical_blocks = block_table[
-                batch_idx, block_indices
-            ]
+            physical_blocks = block_table[batch_idx, block_indices]
 
             flat_phys = physical_blocks.reshape(-1)
             flat_within = within_block_indices.reshape(-1)
