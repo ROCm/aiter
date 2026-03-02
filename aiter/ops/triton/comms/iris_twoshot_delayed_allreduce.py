@@ -94,7 +94,7 @@ def fused_twoshot_allreduce_rmsnorm_delayed_quant_kernel(
     amax_out_ptr,     # (1,) -- accumulated amax, zeroed before launch
     # Inlined device barrier state (symmetric heap)
     barrier_flags_ptr,
-    barrier_epoch,
+    barrier_epoch_ptr,
     # Inlined device barrier: CTA 0 -> other CTAs signal (local GPU memory)
     barrier_done_ptr,
     # Residual (regular GPU memory; dummy ptr when HAS_RESIDUAL=False)
@@ -232,7 +232,7 @@ def fused_twoshot_allreduce_rmsnorm_delayed_quant_kernel(
     _inlined_device_barrier(
         raw_pid,
         barrier_flags_ptr,
-        barrier_epoch,
+        barrier_epoch_ptr,
         barrier_done_ptr,
         heap_bases,
         iris_rank,
@@ -318,7 +318,7 @@ class IrisTwoshotDelayedManager:
 
         # Inlined device barrier state
         self._barrier_flags: Any = None  # on symmetric heap
-        self._barrier_epoch: int = 0
+        self._barrier_epoch: Optional[torch.Tensor] = None  # GPU tensor for graph compat
         self._barrier_done: Optional[torch.Tensor] = None  # local GPU memory
 
     def initialize(self, heap_size: Optional[int] = None) -> None:
@@ -491,6 +491,9 @@ class IrisTwoshotDelayedManager:
             self._barrier_done = torch.zeros(
                 1, dtype=torch.int32, device=device
             )
+            self._barrier_epoch = torch.zeros(
+                1, dtype=torch.int32, device=device
+            )
 
             cur_rank = (
                 torch.distributed.get_rank()
@@ -604,8 +607,9 @@ class IrisTwoshotDelayedManager:
             residual is not None,
         )
 
-        # Advance epoch for the inlined barrier consumed by the kernel
-        self._barrier_epoch += 1
+        # Advance epoch for the inlined barrier consumed by the kernel.
+        # GPU tensor so CUDA graph replay sees the updated value.
+        self._barrier_epoch.add_(1)
 
         # Each rank only computes amax for its owned M/world_size rows.
         # Sync across ranks to get the true global amax.

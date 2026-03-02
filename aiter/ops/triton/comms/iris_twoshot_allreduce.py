@@ -90,7 +90,7 @@ def _translate_ptr(ptr, from_rank, to_rank, heap_bases):
 def _inlined_device_barrier(
     raw_pid,
     barrier_flags_ptr,
-    barrier_epoch,
+    barrier_epoch_ptr,
     barrier_done_ptr,
     heap_bases: tl.tensor,
     iris_rank: tl.constexpr,
@@ -103,7 +103,12 @@ def _inlined_device_barrier(
     Same protocol as iris._distributed_helpers._device_barrier_kernel:
     CTA 0 signals own readiness, polls remote ranks, then signals
     other CTAs via barrier_done_ptr.
+
+    barrier_epoch_ptr points to a GPU tensor so that CUDA graph replay
+    sees the updated epoch value each time (the host increments the
+    tensor between replays via .add_(1)).
     """
+    barrier_epoch = tl.load(barrier_epoch_ptr)
     target_epoch = barrier_epoch + 1
 
     if raw_pid == 0:
@@ -240,7 +245,7 @@ def fused_twoshot_allreduce_rmsnorm_quant_kernel(
     cta_arrival_ptr,
     # Inlined device barrier state (symmetric heap)
     barrier_flags_ptr,
-    barrier_epoch,
+    barrier_epoch_ptr,
     # Inlined device barrier: CTA 0 -> other CTAs signal (local GPU memory)
     barrier_done_ptr,
     # Residual (regular GPU memory; dummy ptr when HAS_RESIDUAL=False)
@@ -345,7 +350,7 @@ def fused_twoshot_allreduce_rmsnorm_quant_kernel(
     _inlined_device_barrier(
         raw_pid,
         barrier_flags_ptr,
-        barrier_epoch,
+        barrier_epoch_ptr,
         barrier_done_ptr,
         heap_bases,
         iris_rank,
@@ -480,7 +485,7 @@ class IrisTwoshotManager:
 
         # Inlined device barrier state
         self._barrier_flags: Any = None  # on symmetric heap
-        self._barrier_epoch: int = 0
+        self._barrier_epoch: Optional[torch.Tensor] = None  # GPU tensor for graph compat
         self._barrier_done: Optional[torch.Tensor] = None  # local GPU memory
 
     def initialize(self, heap_size: Optional[int] = None) -> None:
@@ -645,6 +650,7 @@ class IrisTwoshotManager:
 
             # Inlined barrier: CTA 0 -> other CTAs signal
             self._barrier_done = torch.zeros(1, dtype=torch.int32, device=device)
+            self._barrier_epoch = torch.zeros(1, dtype=torch.int32, device=device)
 
             cur_rank = (
                 torch.distributed.get_rank()
@@ -769,8 +775,9 @@ class IrisTwoshotManager:
             residual is not None,
         )
 
-        # Advance epoch for the inlined barrier consumed by the kernel
-        self._barrier_epoch += 1
+        # Advance epoch for the inlined barrier consumed by the kernel.
+        # GPU tensor so CUDA graph replay sees the updated value.
+        self._barrier_epoch.add_(1)
 
         # Scaled GEMM
         gemm_out = torch._scaled_mm(
