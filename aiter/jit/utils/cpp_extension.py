@@ -930,14 +930,6 @@ def include_paths(cuda: bool = False) -> List[str]:
     if cuda and IS_HIP_EXTENSION:
         paths.append(os.path.join(lib_include, "THH"))
         paths.append(_join_rocm_home("include"))
-        # PyTorch torch/headeronly/util/complex.h includes <thrust/complex.h> under __HIPCC__.
-        # Thrust may live in ROCM_HOME or in a versioned rocm (e.g. rocthrust-dev → /opt/rocm-7.1.0).
-        # _rocm_include = _join_rocm_home("include")
-        # if not os.path.isfile(os.path.join(_rocm_include, "thrust", "complex.h")):
-        #     for _alt in ["/opt/rocm-7.1.0/include",]:
-        #         if os.path.isfile(os.path.join(_alt, "thrust", "complex.h")):
-        #             paths.append(_alt)
-        #             break
     return paths
 
 
