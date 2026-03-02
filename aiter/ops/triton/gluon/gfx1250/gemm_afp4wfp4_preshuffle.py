@@ -336,12 +336,8 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
 
             gl.amd.gfx1250.tdm.async_load(a_desc, a_offs, smem_A.index(slot_p), pred=1)
             gl.amd.gfx1250.tdm.async_load(b_desc, b_offs, smem_B.index(slot_p), pred=1)
-            gl.amd.gfx1250.tdm.async_load(
-                as_desc, as_offs, smem_ASraw.index(slot_p), pred=1
-            )
-            gl.amd.gfx1250.tdm.async_load(
-                bs_desc, bs_offs, smem_BSraw.index(slot_p), pred=1
-            )
+            gl.amd.gfx1250.tdm.async_load(as_desc, as_offs, smem_ASraw.index(slot_p), pred=1)
+            gl.amd.gfx1250.tdm.async_load(bs_desc, bs_offs, smem_BSraw.index(slot_p), pred=1)
 
         producer += 1
     gl.amd.gfx1250.tdm.async_wait(0)
