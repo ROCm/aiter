@@ -13,6 +13,7 @@ from aiter.test_common import (
 from aiter.fused_moe import (
     fused_topk,
     fused_moe,
+    torch_moe,
     torch_moe_stage1,
     torch_moe_stage2,
 )
@@ -231,9 +232,7 @@ def test_fmoe_lqq(
     print("[test] model_dim: ", model_dim, " inter_dim: ", inter_dim)
 
     a1_qt, a1_scale = aiter.pertoken_quant(input, quant_dtype=dtypes.i8)
-    fc1_smooth_scale = torch.ones(
-        (eprt, model_dim), dtype=dtypes.fp32, device="cuda"
-    )
+    fc1_smooth_scale = torch.ones((eprt, model_dim), dtype=dtypes.fp32, device="cuda")
 
     w1 = torch.randn((eprt, inter_dim * 2, model_dim), dtype=dtype, device="cuda")
     w2 = torch.randn((eprt, model_dim, inter_dim), dtype=dtype, device="cuda")
@@ -301,7 +300,7 @@ def test_fmoe_lqq(
         w1_scale=w1_scale,
         doweight=False,
     )
-    a2_qt, a2_scale = aiter.pertoken_quant(out1_ref, quant_dtype=dtypes.i8, dtypeMax=7)
+    a2_qt, a2_scale = aiter.pertoken_quant(out1_ref, quant_dtype=dtypes.i8)
     a2_qt = a2_qt.view(token, topk, -1)
     out2_ref = torch_moe_stage2(
         a2_qt,
@@ -314,6 +313,19 @@ def test_fmoe_lqq(
         a2_scale=a2_scale,
         w2_scale=w2_scale,
         doweight=True,
+    )
+    out_ref = torch_moe(
+        input,
+        w1_qt,
+        w2_qt,
+        topk_weights,
+        topk_ids,
+        fc1_scale=w1_scale,
+        fc2_scale=w2_scale,
+        fc1_smooth_scale=None,
+        fc2_smooth_scale=None,
+        expert_mask=None,
+        activation=act_type,
     )
 
     ######################################################################################
@@ -344,18 +356,15 @@ def test_fmoe_lqq(
     print("[test] out_asm       : ", out_asm.shape, out_asm.dtype)
 
     ######################################################################################
-    checkAllclose(
-        out2_ref,
-        out_asm,
-    )
+    checkAllclose(out_ref, out_asm)
 
     def calc_diff(x: torch.Tensor, y: torch.Tensor):
         x, y = x.double(), y.double()
         denominator = (x * x + y * y).sum()
-        cos_sim = torch.cosine_similarity(x.flatten(), y.flatten(), dim=0)
-        return 1 - cos_sim
+        sim = torch.cosine_similarity(x.flatten(), y.flatten(), dim=0)
+        return 1 - sim
 
-    logits_diff = calc_diff(out2_ref, out_asm)
+    logits_diff = calc_diff(out_ref, out_asm)
     if logits_diff > 1e-3:
         print(
             f"logits_diff: {logits_diff} is too large, please check the implementation"
@@ -478,7 +487,7 @@ tokens = 208 if args.token is None else args.token[0]
 mdim = 5120 if args.model_dim is None else args.model_dim[0]
 idim = 1536 if args.inter_dim is None else args.inter_dim[0]
 ep = 1 if args.expert_parallelism is None else args.expert_parallelism
-shared_E = 2 if args.shared_expert is None else args.shared_expert
+shared_E = 0 if args.shared_expert is None else args.shared_expert
 
 for subX in [32] if args.subx is None else args.subx:
     test_fmoe_lqq(

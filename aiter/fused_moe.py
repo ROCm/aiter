@@ -1230,7 +1230,7 @@ def fused_moe_2stages(
         )
         a2 = a2_v
     elif quant_type == QuantType.lqq_1x64 and metadata.stage1.func is asm_stage1:
-        a2_qt, a2_scale = aiter.pertoken_quant(a2, quant_dtype=dtypes.i8, dtypeMax=7)
+        a2_qt, a2_scale = aiter.pertoken_quant(a2, quant_dtype=dtypes.i8)
         a2 = a2_qt.view(token_num, topk, -1)
     else:
         a2, a2_scale = quant_func(
@@ -1490,7 +1490,6 @@ def torch_moe_stage1(
             a1_scale = fp4_utils.e8m0_to_f32(a1_scale)
         else:  # a16w4
             hidden_states = hidden_states.to(ctype)
-
     else:
         hidden_states = hidden_states.to(ctype)
         w1 = w1.to(ctype)
