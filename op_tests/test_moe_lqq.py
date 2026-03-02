@@ -231,12 +231,9 @@ def test_fmoe_lqq(
     print("[test] model_dim: ", model_dim, " inter_dim: ", inter_dim)
 
     a1_qt, a1_scale = aiter.pertoken_quant(input, quant_dtype=dtypes.i8)
-    if shared_E > 0:
-        fc1_smooth_scale = torch.ones(
-            (eprt, model_dim), dtype=dtypes.fp32, device="cuda"
-        )
-    else:
-        fc1_smooth_scale = None
+    fc1_smooth_scale = torch.ones(
+        (eprt, model_dim), dtype=dtypes.fp32, device="cuda"
+    )
 
     w1 = torch.randn((eprt, inter_dim * 2, model_dim), dtype=dtype, device="cuda")
     w2 = torch.randn((eprt, model_dim, inter_dim), dtype=dtype, device="cuda")
