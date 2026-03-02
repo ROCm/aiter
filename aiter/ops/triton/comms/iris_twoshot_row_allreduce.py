@@ -673,27 +673,30 @@ class IrisTwoshotRowManager:
             or M > self._out_result.shape[0]
             or N != self._out_result.shape[1]
             or self._out_gemm is None
-            or K_GEMM != self._out_gemm_K
+            or K_GEMM > self._out_gemm_K
         )
 
         if need_alloc:
             if torch.cuda.is_current_stream_capturing():
-                existing = (
+                existing_M = (
                     self._out_result.shape[0]
                     if self._out_result is not None
                     else 0
                 )
+                existing_K = self._out_gemm_K or 0
                 raise RuntimeError(
-                    f"Iris (twoshot-row): output buffers too small for M={M} "
-                    f"(allocated {existing}). Cannot allocate during "
-                    f"CUDA graph capture."
+                    f"Iris (twoshot-row): output buffers too small for "
+                    f"M={M}, K_GEMM={K_GEMM} "
+                    f"(allocated M={existing_M}, K={existing_K}). "
+                    f"Cannot allocate during CUDA graph capture."
                 )
 
+            alloc_K = max(K_GEMM, self._out_gemm_K or 0)
             self._out_result = torch.empty((M, N), dtype=dtype, device=device)
             self._out_gemm = torch.empty(
-                (M, K_GEMM), dtype=out_dtype, device=device
+                (M, alloc_K), dtype=out_dtype, device=device
             )
-            self._out_gemm_K = K_GEMM
+            self._out_gemm_K = alloc_K
 
             # Inlined barrier: CTA 0 -> other CTAs signal
             self._barrier_done = torch.zeros(
@@ -717,7 +720,7 @@ class IrisTwoshotRowManager:
         assert self._out_result is not None
         assert self._out_gemm is not None
 
-        return self._out_result[:M], self._out_gemm[:M]
+        return self._out_result[:M], self._out_gemm[:M, :K_GEMM]
 
     def fused_allreduce_rmsnorm_row_quant_gemm(
         self,
