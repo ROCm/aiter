@@ -281,6 +281,7 @@ void gemma_rmsnorm(torch::Tensor& output,
                    const torch::Tensor& input,
                    const torch::Tensor& weight,
                    double eps) {
+  at::DeviceGuard device_guard(input.device());
   TORCH_CHECK(input.is_contiguous() && output.is_contiguous() && weight.is_contiguous());
   TORCH_CHECK(input.dim() == 2 && weight.dim() == 1);
   TORCH_CHECK(input.size(1) == weight.size(0));
@@ -317,6 +318,7 @@ void gemma_fused_add_rmsnorm(torch::Tensor& input,
                              torch::Tensor& residual,
                              const torch::Tensor& weight,
                              double eps) {
+  at::DeviceGuard device_guard(input.device());
   TORCH_CHECK(input.is_contiguous() && residual.is_contiguous() && weight.is_contiguous());
   TORCH_CHECK(input.dim() == 2 && weight.dim() == 1);
   TORCH_CHECK(input.size(1) == weight.size(0));
