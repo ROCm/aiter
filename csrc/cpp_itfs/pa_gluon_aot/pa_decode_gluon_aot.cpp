@@ -120,13 +120,46 @@ void pa_decode_gluon_aot(
     const torch::Tensor& sinks,
     void* stream)
 {
+    TORCH_CHECK(query.is_cuda(), "pa_decode_gluon_aot: query must be a CUDA tensor");
+    TORCH_CHECK(key_cache.is_cuda(), "pa_decode_gluon_aot: key_cache must be a CUDA tensor");
+    TORCH_CHECK(value_cache.is_cuda(), "pa_decode_gluon_aot: value_cache must be a CUDA tensor");
+    TORCH_CHECK(output.is_cuda(), "pa_decode_gluon_aot: output must be a CUDA tensor");
+
+    TORCH_CHECK(query.dim() == 3,
+        "pa_decode_gluon_aot: expected 3D query tensor, but got shape with dim=", query.dim());
+    TORCH_CHECK(output.dim() == 3,
+        "pa_decode_gluon_aot: expected 3D output tensor, but got shape with dim=", output.dim());
+    TORCH_CHECK(key_cache.dim() == 5,
+        "pa_decode_gluon_aot: expected 5D key_cache tensor, but got shape with dim=", key_cache.dim());
+
+    TORCH_CHECK(query_length > 0 && query_length <= 4,
+        "pa_decode_gluon_aot: query_length must be in [1, 4], but got ", query_length);
+    TORCH_CHECK(query.size(0) % query_length == 0,
+        "pa_decode_gluon_aot: query.size(0) (", query.size(0),
+        ") must be divisible by query_length (", query_length, ")");
+
     const int num_query_heads  = query.size(1);
+    const int num_kv_heads     = key_cache.size(1);
+    TORCH_CHECK(num_kv_heads > 0,
+        "pa_decode_gluon_aot: num_kv_heads must be positive");
+    TORCH_CHECK(num_query_heads % num_kv_heads == 0,
+        "pa_decode_gluon_aot: num_query_heads (", num_query_heads,
+        ") must be divisible by num_kv_heads (", num_kv_heads, ")");
+
     const int head_size        = query.size(-1);
     const int batch_size       = query.size(0) / query_length;
-    const int num_kv_heads     = key_cache.size(1);
     const int query_group_size = num_query_heads / num_kv_heads;
     const int kv_block_size    = key_cache.size(-2);
+    const int equivalent_query_group_size = query_length * query_group_size;
 
+    TORCH_CHECK(equivalent_query_group_size <= 64,
+        "pa_decode_gluon_aot: query_length * query_group_size (", equivalent_query_group_size,
+        ") exceeds maximum of 64");
+    TORCH_CHECK(kv_block_size == 16 || kv_block_size == 64 || kv_block_size == 1024,
+        "pa_decode_gluon_aot: kv_block_size (", kv_block_size, ") must be one of [16, 64, 1024]");
+
+    TORCH_CHECK(value_cache.dim() == 4 || value_cache.dim() == 5,
+        "pa_decode_gluon_aot: expected 4D or 5D value_cache tensor, but got dim=", value_cache.dim());
     const bool is_causal       = (query_length > 1);
     const bool value_transposed = (value_cache.dim() == 5);
     const bool use_sinks_flag   = sinks.defined();
@@ -140,6 +173,9 @@ void pa_decode_gluon_aot(
 
     const float fp8_max_val    = fp8_max_value(value_cache.scalar_type());
     const int cdna_ver         = get_cdna_version();
+    TORCH_CHECK(cdna_ver == 3 || cdna_ver == 4,
+        "pa_decode_gluon_aot: unsupported GPU architecture (cdna_version=",
+        cdna_ver, "). Only gfx942 (CDNA3) and gfx950 (CDNA4) are supported.");
     const int head_size_pow2   = next_pow2(head_size);
     const std::string compute_type_str = scalar_type_to_str(compute_type);
 
@@ -183,18 +219,29 @@ void pa_decode_gluon_aot(
         init_lru_cache<std::string, PaDecodeCacheEntry>, g_kernel_cache);
 
     PaDecodeCacheEntry cache_entry;
+    bool found = false;
     {
         std::lock_guard<std::mutex> lock(g_cache_mutex);
         PaDecodeCacheEntry* entry_ptr = g_kernel_cache->get(key);
         if (entry_ptr != nullptr) {
             cache_entry = *entry_ptr;
+            found = true;
+        }
+    }
+
+    if (!found) {
+        cache_entry = warmup_and_load(
+            compute_type_str, query_length, query_group_size, head_size,
+            kv_block_size, context_partition_size, query_quant_mode,
+            kv_quant_mode, fp8_max_val, static_cast<int>(value_transposed),
+            static_cast<int>(is_causal), static_cast<int>(use_sinks_flag),
+            cdna_ver);
+
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        PaDecodeCacheEntry* entry_ptr = g_kernel_cache->get(key);
+        if (entry_ptr != nullptr) {
+            cache_entry = *entry_ptr;
         } else {
-            cache_entry = warmup_and_load(
-                compute_type_str, query_length, query_group_size, head_size,
-                kv_block_size, context_partition_size, query_quant_mode,
-                kv_quant_mode, fp8_max_val, static_cast<int>(value_transposed),
-                static_cast<int>(is_causal), static_cast<int>(use_sinks_flag),
-                cdna_ver);
             g_kernel_cache->put(key, cache_entry);
         }
     }
