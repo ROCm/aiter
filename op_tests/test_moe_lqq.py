@@ -24,6 +24,11 @@ from aiter import dtypes
 import argparse
 
 
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!! do NOT overwrite this value !!!!!!!!!!!!!!!!!!!!!!!!!!!!
+LQQ_I8_MAX = 119
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!! do NOT overwrite this value !!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
 def moe_lqq_dequant(
     in_buffer: torch.Tensor,
     qscale_buf: torch.Tensor,
@@ -160,11 +165,6 @@ def save_buffer_to_file(
             buffer_cpu.numpy().tofile(f)
 
 
-#!!!!!!!!!!!!!!!!!!!!!!!!!!!! do NOT overwrite this value !!!!!!!!!!!!!!!!!!!!!!!!!!!!
-LQQ_I8_MAX = 119
-#!!!!!!!!!!!!!!!!!!!!!!!!!!!! do NOT overwrite this value !!!!!!!!!!!!!!!!!!!!!!!!!!!!
-
-
 def test_fmoe_lqq(
     token,
     model_dim,
@@ -181,6 +181,7 @@ def test_fmoe_lqq(
     act_type = ActivationType.Silu
     group_in_k_lqq = 64
 
+    ######################################################################################
     # This gpu id in EP, this example use the last id
     ep_id = ep - 1
     # total_expert = unshared_expert + shared_expert + fake_expert(only use this fake expert id to mask)
@@ -225,6 +226,15 @@ def test_fmoe_lqq(
         topk_ids = torch.cat((topk_ids, s_topk_ids), dim=1)
 
     eprt = local_E + shared_E
+    if ep == 1:
+        expert_mask = None
+
+    if expert_mask is not None:
+        local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
+        local_expert_hash[local_expert_hash > 0] -= 1
+        local_expert_hash[expert_mask == 0] = -1
+    else:
+        local_expert_hash = None
 
     ######################################################################################
     print("[test] batch: ", token)
@@ -232,8 +242,18 @@ def test_fmoe_lqq(
     print("[test] model_dim: ", model_dim, " inter_dim: ", inter_dim)
 
     a1_qt, a1_scale = aiter.pertoken_quant(input, quant_dtype=dtypes.i8)
-    fc1_smooth_scale = torch.ones((eprt, model_dim), dtype=dtypes.fp32, device="cuda")
+    if shared_E > 0:
+        fc1_smooth_scale = torch.randn(
+            (eprt, model_dim), dtype=dtypes.fp32, device="cuda"
+        )
+        fc2_smooth_scale = torch.randn(
+            (eprt, inter_dim), dtype=dtypes.fp32, device="cuda"
+        )
+    else:
+        fc1_smooth_scale = None
+        fc2_smooth_scale = None
 
+    # -----------------------------------------------------------------------------------
     w1 = torch.randn((eprt, inter_dim * 2, model_dim), dtype=dtype, device="cuda")
     w2 = torch.randn((eprt, model_dim, inter_dim), dtype=dtype, device="cuda")
     exp_bias1 = torch.clamp(
@@ -329,8 +349,8 @@ def test_fmoe_lqq(
         topk_ids,
         fc1_scale=w1_scale,
         fc2_scale=w2_scale,
-        fc1_smooth_scale=None,
-        fc2_smooth_scale=None,
+        fc1_smooth_scale=fc1_smooth_scale,
+        fc2_smooth_scale=fc2_smooth_scale,
         expert_mask=expert_mask,
         activation=act_type,
     )
@@ -343,6 +363,7 @@ def test_fmoe_lqq(
         topk_weights,
         topk_ids,
         expert_mask=expert_mask,
+        local_expert_hash=local_expert_hash,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         a1_scale=a1_scale,
@@ -351,6 +372,7 @@ def test_fmoe_lqq(
         w2_lqq_scale=w2_lqq_scale_shf,
         w2_lqq_zero=w2_lqq_zero_uint8_shf,
         fc1_smooth_scale=fc1_smooth_scale,
+        fc2_smooth_scale=fc2_smooth_scale,
         quant_type=quant_type,
         activation=act_type,
         doweight_stage1=False,
@@ -384,6 +406,8 @@ def test_fmoe_lqq(
         w2_lqq,
         topk_weights,
         topk_ids,
+        expert_mask=expert_mask,
+        local_expert_hash=local_expert_hash,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         a1_scale=a1_scale,
@@ -392,8 +416,9 @@ def test_fmoe_lqq(
         w2_lqq_scale=w2_lqq_scale_shf,
         w2_lqq_zero=w2_lqq_zero_uint8_shf,
         fc1_smooth_scale=fc1_smooth_scale,
-        quant_type=aiter.QuantType.lqq_1x64,
-        activation=aiter.ActivationType.Silu,
+        fc2_smooth_scale=fc2_smooth_scale,
+        quant_type=quant_type,
+        activation=act_type,
         doweight_stage1=False,
         dtype=dtype,
         block_size_M=block_size_M,
@@ -484,7 +509,7 @@ parser.add_argument(
 args = parser.parse_args()
 
 print(f"\nRunning moe_lqq test...")
-expert = 16 if args.expert is None else args.expert[0]
+expert = 128 if args.expert is None else args.expert[0]
 topk = 6 if args.topk is None else args.topk[0]
 tokens = 208 if args.token is None else args.token[0]
 mdim = 5120 if args.model_dim is None else args.model_dim[0]
