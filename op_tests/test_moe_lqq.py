@@ -66,7 +66,7 @@ LQQ_I8_MAX = 119
 #!!!!!!!!!!!!!!!!!!!!!!!!!!!! do NOT overwrite this value !!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 
-def _get_local_expert_hash(expert_mask: torch.Tensor) -> torch.Tensor:
+def build_local_expert_hash(expert_mask: torch.Tensor) -> torch.Tensor:
     """Cache global->local expert id map for EP."""
     local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
     local_expert_hash[local_expert_hash > 0] -= 1
@@ -107,7 +107,7 @@ def test_fmoe_lqq(
     # Ensure shared expert not to be maskedc
     expert_mask[E:-1] = 1
 
-    local_expert_hash = _get_local_expert_hash(expert_mask)
+    local_expert_hash = build_local_expert_hash(expert_mask)
 
     input = torch.randn((token, model_dim), dtype=dtype, device="cuda")
     score = torch.randn((token, E), device="cuda", dtype=dtype)
@@ -220,6 +220,7 @@ def test_fmoe_lqq(
         topk_weights,
         topk_ids,
         expert_mask=expert_mask,
+        local_expert_hash=local_expert_hash,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         a1_scale=a1_scale,
@@ -251,6 +252,7 @@ def test_fmoe_lqq(
             topk_weights,
             topk_ids,
             expert_mask=expert_mask,
+            local_expert_hash=local_expert_hash,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             a1_scale=a1_scale,

@@ -133,6 +133,7 @@ def fused_moe(
     topk_weight,
     topk_ids,
     expert_mask: Optional[torch.tensor] = None,  # EP
+    local_expert_hash: Optional[torch.Tensor] = None,
     activation=ActivationType.Silu,
     quant_type=QuantType.No,
     doweight_stage1=False,
@@ -172,6 +173,7 @@ def fused_moe(
         topk_weight=topk_weight,
         topk_ids=topk_ids,
         expert_mask=expert_mask,
+        local_expert_hash=local_expert_hash,
         activation=activation.value,
         quant_type=quant_type.value,
         doweight_stage1=doweight_stage1,
@@ -237,6 +239,7 @@ def fused_moe_(
     topk_weight: torch.Tensor,
     topk_ids: torch.Tensor,
     expert_mask: Optional[torch.Tensor] = None,  # EP
+    local_expert_hash: Optional[torch.Tensor] = None,
     activation: int = ActivationType.Silu.value,
     quant_type: int = QuantType.No.value,
     doweight_stage1: bool = False,
@@ -392,6 +395,7 @@ def fused_moe_(
             w2_lqq_scale=w2_lqq_scale,
             w2_lqq_zero=w2_lqq_zero,
             expert_mask=expert_mask,
+            local_expert_hash=local_expert_hash,
             topk_ids=topk_ids,
             fc1_smooth_scale=fc1_smooth_scale,
             fc2_smooth_scale=fc2_smooth_scale,
@@ -1115,6 +1119,7 @@ def fused_moe_2stages(
     w2_lqq_scale: Optional[torch.Tensor] = None,
     w2_lqq_zero: Optional[torch.Tensor] = None,
     expert_mask: Optional[torch.Tensor] = None,  # EP
+    local_expert_hash: Optional[torch.Tensor] = None,
     topk_ids: Optional[torch.Tensor] = None,  # EP
     fc1_smooth_scale: Optional[
         torch.Tensor
@@ -1205,12 +1210,11 @@ def fused_moe_2stages(
             a8 = hidden_states.repeat(topk, 1, 1)
             a8_scale = a1_scale.repeat(topk, 1, 1)
         else:
-            if expert_mask is not None:
-                local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
-                local_expert_hash[local_expert_hash > 0] -= 1
-                local_expert_hash[expert_mask == 0] = -1
-            else:
-                local_expert_hash = None
+            if local_expert_hash is None:
+                if expert_mask is not None:
+                    local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
+                    local_expert_hash[local_expert_hash > 0] -= 1
+                    local_expert_hash[expert_mask == 0] = -1
 
             if fc1_smooth_scale is not None:
                 a8 = torch.empty(
