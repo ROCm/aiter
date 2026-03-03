@@ -273,14 +273,14 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
         layout=shared_S,
     )
 
-    producer = 0
-    consumer = 0
+    k_tile_load_idx = 0
+    k_tile_compute_idx = 0
 
     # ---- Prologue ---- stage (NUM_BUFFERS - 1) K-tiles into LDS
     for _ in gl.static_range(NUM_BUFFERS - 1):
-        if producer < k_tiles:
-            slot_p = producer
-            k_tile_p = producer
+        if k_tile_load_idx < k_tiles:
+            slot_p = k_tile_load_idx
+            k_tile_p = k_tile_load_idx
 
             # A/B offsets (bytes-domain for A_fp4 and B_preshuf raw)
             a_offs = [tile_m * BLOCK_M, split_k0_bytes + k_tile_p * BLOCK_K_BYTES]
@@ -299,7 +299,7 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
             gl.amd.gfx1250.tdm.async_load(as_desc, as_offs, smem_ASraw.index(slot_p), pred=1)
             gl.amd.gfx1250.tdm.async_load(bs_desc, bs_offs, smem_BSraw.index(slot_p), pred=1)
 
-        producer += 1
+        k_tile_load_idx += 1
     gl.amd.gfx1250.tdm.async_wait(0)
     gl.barrier()
 
@@ -309,10 +309,10 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
     # ---- Main pipeline ----
     main_iters: gl.constexpr = k_tiles - (NUM_BUFFERS - 1)
     for _ in gl.static_range(main_iters):
-        # Producer: advance pointers for this k_tile, reuse precomputed offsets
+        # Load: advance pointers for this k_tile
         # HBM -> vGPR -> LDS
-        slot_p = producer % NUM_BUFFERS
-        k_tile_p = producer
+        slot_p = k_tile_load_idx % NUM_BUFFERS
+        k_tile_p = k_tile_load_idx
 
         a_offs = [tile_m * BLOCK_M, split_k0_bytes + k_tile_p * BLOCK_K_BYTES]
         b_offs = [
@@ -328,13 +328,12 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
         gl.amd.gfx1250.tdm.async_load(as_desc, as_offs, smem_ASraw.index(slot_p), pred=1)
         gl.amd.gfx1250.tdm.async_load(bs_desc, bs_offs, smem_BSraw.index(slot_p), pred=1)
 
-        producer += 1
-        # Consumer: wait for data we’re about to use
+        k_tile_load_idx += 1
+        # Compute: wait for data we’re about to use
         gl.amd.gfx1250.tdm.async_wait(0)
         gl.barrier()
 
-        slot_c = consumer % NUM_BUFFERS
-        # k_tile_c = consumer
+        slot_c = k_tile_compute_idx % NUM_BUFFERS
 
         # LDS -> vGPR
         A = smem_A.index(slot_c).load(layout=dot_a_layout)
@@ -358,17 +357,17 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
         BS = BS_raw.load(layout=b_scale_layout)
 
         acc = gl.amd.gfx1250.wmma_scaled(A, AS, "e2m1", B, BS, "e2m1", acc)
-        consumer += 1
+        k_tile_compute_idx += 1
 
     # ---- Drain ----
     for _ in gl.static_range(NUM_BUFFERS - 1):
-        if consumer < k_tiles:
-            slot_c = consumer % NUM_BUFFERS
+        if k_tile_compute_idx < k_tiles:
+            slot_c = k_tile_compute_idx % NUM_BUFFERS
 
             gl.amd.gfx1250.tdm.async_wait(0)
             gl.barrier()
 
-            slot_c = consumer % NUM_BUFFERS
+            slot_c = k_tile_compute_idx % NUM_BUFFERS
 
             A = smem_A.index(slot_c).load(layout=dot_a_layout)
 
@@ -390,7 +389,7 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
 
             acc = gl.amd.gfx1250.wmma_scaled(A, AS, "e2m1", B, BS, "e2m1", acc)
 
-        consumer += 1
+        k_tile_compute_idx += 1
 
     # Store C tile
     store_c_tile(
