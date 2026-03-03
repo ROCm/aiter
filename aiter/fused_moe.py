@@ -333,6 +333,11 @@ def fused_moe_(
         moe_sorting_dispatch_policy,
     )
 
+    print("[debug] sorted_ids:", sorted_ids.shape)
+    # print("[debug] sorted_ids:", sorted_ids)
+    print("[debug] sorted_expert_ids:", sorted_expert_ids.shape)
+    # print("[debug] sorted_expert_ids:", sorted_expert_ids)
+    print("[debug] num_valid_ids:", num_valid_ids)
     if metadata.run_1stage:
         return metadata.stage1(
             hidden_states,

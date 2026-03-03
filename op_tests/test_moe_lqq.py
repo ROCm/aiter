@@ -28,6 +28,8 @@ import argparse
 LQQ_I8_MAX = 119
 #!!!!!!!!!!!!!!!!!!!!!!!!!!!! do NOT overwrite this value !!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
+MAX_TOKENS = 4096 * 4
+
 
 def moe_lqq_dequant(
     in_buffer: torch.Tensor,
@@ -70,13 +72,10 @@ def moe_lqq_dequant(
     return out.to(device)
 
 
-def save_int8_to_file(
-    buffer: torch.Tensor,
-    filename: str,
-    cnt_per_line: int = 64,
-) -> None:
+def save_int_to_file(buffer: torch.Tensor, filename: str) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(filename)), exist_ok=True)
     base_name = os.path.splitext(filename)[0]
+    cnt_per_line = buffer.shape[-1]
 
     if buffer.device.type != "cpu":
         buffer_cpu = buffer.cpu()
@@ -91,22 +90,17 @@ def save_int8_to_file(
 
         f.write("\nData:\n")
 
-        # buffer_cpu_fp32 = buffer_cpu.to(torch.int8)
-        buffer_cpu_fp32 = buffer_cpu
-        flat_data = buffer_cpu_fp32.flatten().numpy()
+        flat_data = buffer_cpu.flatten().numpy()
         for i in range(len(flat_data)):
             f.write(f"{flat_data[i]:d} ")
             if (i + 1) % cnt_per_line == 0:
                 f.write("\n")
 
 
-def save_float_to_file(
-    buffer: torch.Tensor,
-    filename: str,
-    cnt_per_line: int = 64,
-) -> None:
+def save_float_to_file(buffer: torch.Tensor, filename: str) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(filename)), exist_ok=True)
     base_name = os.path.splitext(filename)[0]
+    cnt_per_line = buffer.shape[-1]
 
     if buffer.device.type != "cpu":
         buffer_cpu = buffer.cpu()
@@ -121,48 +115,11 @@ def save_float_to_file(
 
         f.write("\nData:\n")
 
-        # buffer_cpu_fp32 = buffer_cpu.to(torch.int8)
-        buffer_cpu_fp32 = buffer_cpu
-        flat_data = buffer_cpu_fp32.flatten().numpy()
+        flat_data = buffer_cpu.flatten().numpy()
         for i in range(len(flat_data)):
             f.write(f"{flat_data[i]:.3f} ")
             if (i + 1) % cnt_per_line == 0:
                 f.write("\n")
-
-
-def save_buffer_to_file(
-    buffer: torch.Tensor,
-    filename: str,
-    cnt_per_line: int = 64,
-    format: str = "text",
-) -> None:
-    os.makedirs(os.path.dirname(os.path.abspath(filename)), exist_ok=True)
-    base_name = os.path.splitext(filename)[0]
-
-    if buffer.device.type != "cpu":
-        buffer_cpu = buffer.cpu()
-    else:
-        buffer_cpu = buffer
-
-    if format.lower() == "text":
-        with open(f"{base_name}.txt", "w") as f:
-            f.write(f"Shape: {buffer.shape}\n")
-            f.write(f"DataType: {buffer.dtype}\n")
-            f.write(f"Min: {buffer.min().item()}\n")
-            f.write(f"Max: {buffer.max().item()}\n")
-
-            f.write("\nData:\n")
-
-            buffer_cpu_fp32 = buffer_cpu.to(torch.float32)
-            flat_data = buffer_cpu_fp32.flatten().numpy()
-            for i in range(len(flat_data)):
-                f.write(f"{flat_data[i]:.3e} ")
-                if (i + 1) % cnt_per_line == 0:
-                    f.write("\n")
-
-    elif format.lower() == "binary":
-        with open(f"{base_name}.hex", "wb") as f:
-            buffer_cpu.numpy().tofile(f)
 
 
 def test_fmoe_lqq(
@@ -180,6 +137,9 @@ def test_fmoe_lqq(
     quant_type = QuantType.lqq_1x64
     act_type = ActivationType.Silu
     group_in_k_lqq = 64
+
+    print("[test] batch: ", token)
+    print("[test] model_dim: ", model_dim, " inter_dim: ", inter_dim)
 
     ######################################################################################
     # This gpu id in EP, this example use the last id
@@ -202,28 +162,37 @@ def test_fmoe_lqq(
     input = torch.randn((token, model_dim), dtype=dtype, device="cuda")
     score = torch.randn((token, E), device="cuda", dtype=dtype)
 
-    topk_weights, topk_ids = fused_topk(input, score, topk, True)
-
     if shared_E > 0:
-        shared_E_score = 0.5
-        s_topk_weights = torch.tensor(
-            [
-                [shared_E_score, shared_E_score],
-            ]
-            * token,
-            dtype=dtypes.fp32,
-            device=input.device,
+        shared_E_score = 0.1
+        # init total_topk_ids, inference time you just need to fill ns_topk_ids in total_topk_ids
+        total_topk_ids = torch.empty(
+            (MAX_TOKENS, topk + shared_E + 1), dtype=dtypes.i32, device=input.device
         )
-        topk_weights = torch.cat((topk_weights, s_topk_weights), dim=1)
-        s_topk_ids = torch.tensor(
-            [
-                [E, E + 1],
-            ]
-            * token,
-            dtype=dtypes.i32,
-            device=input.device,
+        ns_topk_ids, s_topk_ids = total_topk_ids.split([topk, shared_E + 1], dim=1)
+        shared_expert_ids = [E + i for i in range(shared_E + 1)]
+        s_topk_ids_list = [[fake_expertid] * (shared_E + 1)] * MAX_TOKENS
+        for i in range(ep_id, MAX_TOKENS, ep):
+            s_topk_ids_list[i] = shared_expert_ids
+        s_topk_ids[:] = torch.tensor(
+            s_topk_ids_list, dtype=dtypes.i32, device=input.device
         )
-        topk_ids = torch.cat((topk_ids, s_topk_ids), dim=1)
+
+        # init total_topk_weights, inference time you just need to fill ns_topk_weights in total_topk_weights
+        total_topk_weights = torch.empty(
+            (MAX_TOKENS, topk + shared_E + 1), dtype=dtypes.fp32, device=input.device
+        )
+        ns_topk_weights, s_topk_weights = total_topk_weights.split(
+            [topk, shared_E + 1], dim=1
+        )
+        s_topk_weights[:] = shared_E_score
+
+        # inference time, use fused_topk to fill ns_topk_ids and ns_topk_weights
+        fused_topk(input, score, topk, True, ns_topk_ids, ns_topk_weights)
+        # inference time, topk_ids simply slices total_topk_ids into the number of input tokens, same for topk_weights
+        topk_ids = total_topk_ids[:token]
+        topk_weights = total_topk_weights[:token]
+    else:
+        topk_weights, topk_ids = fused_topk(input, score, topk, True)
 
     eprt = local_E + shared_E
     if ep == 1:
@@ -236,13 +205,29 @@ def test_fmoe_lqq(
     else:
         local_expert_hash = None
 
-    ######################################################################################
-    print("[test] batch: ", token)
     print("[test] expr: ", eprt, "topk: ", topk)
-    print("[test] model_dim: ", model_dim, " inter_dim: ", inter_dim)
+    print("[test] topk_ids: ", topk_ids.shape)
+    print("[test] topk_ids: ", topk_ids)
+    print("[test] expert_mask: ", expert_mask.shape)
+    print("[test] expert_mask: ", expert_mask)
+    print("[test] local_expert_hash: ", local_expert_hash.shape)
+    count_in_range = ((topk_ids >= 112) & (topk_ids <= 127)).sum().item()
+    print("[test] count_in_range: ", count_in_range)
+    ratio = count_in_range / topk_ids.numel()
+    print("[test] last ep ratio: ", ratio)
+    save_int_to_file(topk_ids, "./feifei/topk_ids.txt")
+    for test_eprt in range(112, 130):
+        count_in_eprt = (topk_ids == test_eprt).sum().item()
+        print(
+            f"[test] count of {test_eprt}({test_eprt-112}): ",
+            count_in_eprt,
+            "ratio: ",
+            count_in_eprt / topk_ids.numel(),
+        )
 
+    ######################################################################################
     a1_qt, a1_scale = aiter.pertoken_quant(input, quant_dtype=dtypes.i8)
-    if shared_E > 0:
+    if ep > 1:
         fc1_smooth_scale = torch.randn(
             (eprt, model_dim), dtype=dtypes.fp32, device="cuda"
         )
@@ -511,13 +496,16 @@ args = parser.parse_args()
 print(f"\nRunning moe_lqq test...")
 expert = 128 if args.expert is None else args.expert[0]
 topk = 6 if args.topk is None else args.topk[0]
-tokens = 208 if args.token is None else args.token[0]
+tokens = 1664 if args.token is None else args.token[0]
 mdim = 5120 if args.model_dim is None else args.model_dim[0]
 idim = 1536 if args.inter_dim is None else args.inter_dim[0]
 ep = 8 if args.expert_parallelism is None else args.expert_parallelism
 shared_E = 2 if args.shared_expert is None else args.shared_expert
 
-for subX in [32] if args.subx is None else args.subx:
+# EP = 8
+# token = 1664 // 8 = 208 per ep
+# expert = 128 // 8 = 16 per ep
+for subX in [80] if args.subx is None else args.subx:
     test_fmoe_lqq(
         token=tokens,
         model_dim=mdim,

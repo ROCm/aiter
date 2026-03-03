@@ -15,10 +15,6 @@
 
 #if EN_ASM_MOE_PRINT == 1
     #define print(...) printf(__VA_ARGS__)
-#else
-    #define print(...) ((void)0)
-#endif
-#if EN_ASM_MOE_PRINT == 1
     template<typename T>
     static int save_dev_hex(const char* filename, T* array, size_t size) {
         if (filename == NULL || array == NULL || size == 0) {
@@ -43,9 +39,8 @@
         return 0;
     }
     template<typename T>
-    static int save_dev_int(const char* filename, T* array, size_t size)
+    static int save_dev_int(const char* filename, T* array, size_t size, int items_per_line = 16)
     {
-        int items_per_line = 16;
         if (filename == NULL || array == NULL || size == 0) {
             return -1;
         }
@@ -62,7 +57,7 @@
         T* ptr = new T[size];
         hipMemcpy(ptr, array, size * sizeof(T), hipMemcpyDeviceToHost);
         for (size_t i = 0; i < size; i++) {
-            fprintf(fp, "%d", ptr[i]);
+            fprintf(fp, "%d", ptr[i] & 0xFFFF); // Print as unsigned integer
             
             if (items_per_line > 0 && (i + 1) % items_per_line == 0) {
                 fprintf(fp, "\n");
@@ -105,6 +100,21 @@
         delete[] ptr;
             
         fclose(fp);
+        return 0;
+    }
+#else
+    #define print(...) ((void)0)
+    template<typename T>
+    static int save_dev_hex(const char* filename, T* array, size_t size) {
+        return 0;
+    }
+    template<typename T>
+    static int save_dev_int(const char* filename, T* array, size_t size, int items_per_line = 16)
+    {
+        return 0;
+    }
+    static int save_dev_float(const char* filename, float* array, size_t size)
+    {
         return 0;
     }
 #endif
@@ -437,7 +447,7 @@ void moe_stage1_g1u1(
     // batch -> token_cnt
     // sz_sep -> gdy
     long long sz_stp = (long long)topk * token_cnt + (long long)eprt * block_m - topk;
-    sz_stp           = (sz_stp + block_m - 1) / block_m;
+    long long sz_sep = (sz_stp + block_m - 1) / block_m;
     int sub_X_cnt    = sorted_expert_ids.size(0);
 
     std::string arch_id = get_gpu_arch();
@@ -552,7 +562,7 @@ void moe_stage1_g1u1(
 
     int bdx = 256;
     int gdx = ((hidden_dim + sub_GU - 1) / sub_GU);
-    int gdy = sz_stp; // sub_X_cnt;
+    int gdy = sub_X_cnt;
     int gdz = k_num;
 
     args.log();
@@ -569,8 +579,13 @@ void moe_stage1_g1u1(
     print("[DEV_BUF] ptr_Qscl  : w1_lqq_scale      = %lu bytes\n", w1_lqq_scale.has_value() ? w1_lqq_scale.value().numel() * w1_lqq_scale.value().element_size() : 0);
     print("[DEV_BUF] ptr_Qzero : w1_lqq_zero       = %lu bytes\n", w1_lqq_zero.has_value() ? w1_lqq_zero.value().numel() * w1_lqq_zero.value().element_size() : 0);
     print("[KERNEL] sub_X = %d, sub_GU = %d\n", block_m, sub_GU);
-    print("[KERNEL] sub_X_cnt = %d, sz_stp = %d\n", sub_X_cnt, sz_stp);
+    print("[KERNEL] topk: %d, batch:%d, eprt: %d, sub_X:%d\n", topk, token_cnt, eprt, block_m);
+    print("[KERNEL] sz_stp: %lld, sz_sep: %lld\n", sz_stp, sz_sep);
+    print("[KERNEL] sub_X_cnt: %d =?= sz_sep: %lld\n", sub_X_cnt, sz_sep);
     print("[KERNEL] gdx:%d, gdy:%d, gdz:%d, bdx:%d\n", gdx, gdy, gdz, bdx);
+    save_dev_int("./feifei/ptr_STP.txt", (int32_t*)(sorted_token_ids.data_ptr()), sorted_token_ids.numel(), block_m);
+    save_dev_int("./feifei/ptr_SEP.txt", (int32_t*)(sorted_expert_ids.data_ptr()), sorted_expert_ids.numel(), 1);
+    save_dev_int("./feifei/ptr_XC.txt", (int32_t*)(num_valid_ids.data_ptr()), num_valid_ids.numel(), 1);
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,
@@ -729,9 +744,9 @@ void moe_stage2_g1u1(
     print("[DEV_BUF] ptr_SWBuffer      : sorted_weights    = %lu bytes\n", sorted_weights.has_value() ? sorted_weights.value().numel() * sorted_weights.value().element_size() : 0);
     print("[DEV_BUF] ptr_DScaleBuffer  : w2_lqq_scale      = %lu bytes\n", w2_lqq_scale.has_value() ? w2_lqq_scale.value().numel() * w2_lqq_scale.value().element_size() : 0);
     print("[DEV_BUF] ptr_DZeroBuffer   : w2_lqq_zero       = %lu bytes\n", w2_lqq_zero.has_value() ? w2_lqq_zero.value().numel() * w2_lqq_zero.value().element_size() : 0);
-    //save_dev_int<int32_t>("./feifei/ptr_XCBuffer.txt",  (int32_t*)(args.ptr_XCBuffer),  num_valid_ids.numel());
-    //save_dev_int<int32_t>("./feifei/ptr_STPBuffer.txt", (int32_t*)(args.ptr_STPBuffer), sorted_token_ids.numel());
-    //save_dev_int<int32_t>("./feifei/ptr_SEPBuffer.txt", (int32_t*)(args.ptr_SEPBuffer), sorted_expert_ids.numel());
+    save_dev_int<int32_t>("./feifei/ptr_XCBuffer.txt",  (int32_t*)(args.ptr_XCBuffer),  num_valid_ids.numel(), block_m);
+    save_dev_int<int32_t>("./feifei/ptr_STPBuffer.txt", (int32_t*)(args.ptr_STPBuffer), sorted_token_ids.numel(), 1);
+    save_dev_int<int32_t>("./feifei/ptr_SEPBuffer.txt", (int32_t*)(args.ptr_SEPBuffer), sorted_expert_ids.numel(), 1);
     print("[KERNEL] sub_X = %d, sub_D = %d\n", block_m, sub_D);
     print("[KERNEL] gdx:%d, gdy:%d, gdz:%d, bdx:%d\n", gdx, gdy, gdz, bdx);
 
