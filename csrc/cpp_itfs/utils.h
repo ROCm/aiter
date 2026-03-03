@@ -79,9 +79,9 @@ __inline__ const std::pair<std::string, int> execute_cmd(const std::string& cmd,
         store.push_back(arg);
     }
     std::string cmd_with_args = fmt::vformat(cmd, store);
-    std::cout << cmd_with_args << std::endl;
+    AITER_LOG_INFO(cmd_with_args);
     const auto results = execute_cmd(cmd_with_args);
-    std::cout << results.first << std::endl;
+    AITER_LOG_INFO(results.first);
     return results;
 }
 
