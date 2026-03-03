@@ -140,6 +140,7 @@ def run_gemm_flydsl(
 
     m, k = x.shape
     n = out.shape[1]
+    out_dtype = "bf16" if out.dtype == torch.bfloat16 else "fp16"
     wpe = None if int(waves_per_eu) <= 0 else int(waves_per_eu)
 
     cache_key = (
@@ -150,6 +151,7 @@ def run_gemm_flydsl(
         tile_n,
         tile_k,
         in_dtype,
+        out_dtype,
         lds_stage,
         use_cshuffle_epilog,
         use_async_copy,
@@ -164,6 +166,7 @@ def run_gemm_flydsl(
             tile_n=tile_n,
             tile_k=tile_k,
             in_dtype=in_dtype,
+            out_dtype=out_dtype,
             lds_stage=lds_stage,
             use_cshuffle_epilog=bool(use_cshuffle_epilog),
             use_async_copy=bool(use_async_copy),

@@ -121,6 +121,7 @@ def _flydsl_preshuffle_gemm_a8(
     else:
         raise ValueError(f"[FlyDSL] unsupported input dtype {XQ.dtype}")
 
+    out_dtype = "bf16" if Out.dtype == torch.bfloat16 else "fp16"
     wpe = None if waves_per_eu <= 0 else waves_per_eu
 
     cache_key = (
@@ -128,6 +129,7 @@ def _flydsl_preshuffle_gemm_a8(
         n,
         k,
         in_dtype,
+        out_dtype,
         tile_m,
         tile_n,
         tile_k,
@@ -146,6 +148,7 @@ def _flydsl_preshuffle_gemm_a8(
                 tile_n=tile_n,
                 tile_k=tile_k,
                 in_dtype=in_dtype,
+                out_dtype=out_dtype,
                 lds_stage=lds_stage,
                 use_cshuffle_epilog=bool(use_cshuffle_epilog),
                 use_async_copy=bool(use_async_copy),
@@ -153,7 +156,7 @@ def _flydsl_preshuffle_gemm_a8(
             )
             _flydsl_kernel_cache[cache_key] = exe
             logger.info(
-                f"[FlyDSL] compiled preshuffle GEMM ({m},{n},{k} {in_dtype} "
+                f"[FlyDSL] compiled preshuffle GEMM ({m},{n},{k} {in_dtype}->{out_dtype} "
                 f"tile={tile_m}x{tile_n}x{tile_k} lds={lds_stage} csh={use_cshuffle_epilog} "
                 f"acp={use_async_copy} wpe={waves_per_eu})"
             )
