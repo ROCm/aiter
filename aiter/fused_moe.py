@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import atexit
 import functools
 import os
+import threading
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -956,7 +959,9 @@ def get_2stage_cfgs(
             #     block_m=16 -> 8 (fails 16B check), block_m=32 -> 16 (OK)
             # fp8 (elem_bytes=1) can use block_m=16 safely.
             min_block_m = 32 if (_is_flydsl_w4a16 or _is_flydsl_bf16) else 16
-            if token > 128:
+            if token > 1024:
+                return 64
+            elif token > 128:
                 return max(32, min_block_m)
             else:
                 return min_block_m
@@ -1760,6 +1765,96 @@ _FLYDSL_SCRATCH_CACHE = {}
 _LOCAL_EXPERT_HASH_CACHE = {}
 
 
+class _FlydslMoeProfiler:
+    """Singleton profiler that collects per-shape invocation counts and CUDA timing.
+
+    Enabled by FLYDSL_MOE_PROFILE=1.  Prints a summary table at process exit.
+    Timing is skipped during CUDA graph capture (synchronize is forbidden there);
+    only invocation counts are recorded in that case.
+    """
+
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    inst = super().__new__(cls)
+                    inst._data = defaultdict(lambda: {"count": 0, "total_ms": 0.0})
+                    inst._pending = []
+                    inst._registered = False
+                    cls._instance = inst
+        return cls._instance
+
+    @staticmethod
+    def _is_capturing() -> bool:
+        return torch.cuda.is_current_stream_capturing()
+
+    def begin(self):
+        """Return (start_event, end_event) or None if inside graph capture."""
+        if self._is_capturing():
+            return None
+        ev_s = torch.cuda.Event(enable_timing=True)
+        ev_e = torch.cuda.Event(enable_timing=True)
+        ev_s.record()
+        return (ev_s, ev_e)
+
+    def end(self, events, stage: str, shape_key: tuple):
+        """Record timing if events were created, otherwise just count."""
+        entry = self._data[(stage, shape_key)]
+        entry["count"] += 1
+        if events is not None:
+            ev_s, ev_e = events
+            ev_e.record()
+            self._pending.append((stage, shape_key, ev_s, ev_e))
+        if not self._registered:
+            atexit.register(self.dump_summary)
+            self._registered = True
+
+    def _flush_pending(self):
+        torch.cuda.synchronize()
+        for stage, shape_key, ev_s, ev_e in self._pending:
+            self._data[(stage, shape_key)]["total_ms"] += ev_s.elapsed_time(ev_e)
+        self._pending.clear()
+
+    def dump_summary(self):
+        if not self._data and not self._pending:
+            return
+        try:
+            self._flush_pending()
+        except Exception:
+            pass
+        grand_total = sum(v["total_ms"] for v in self._data.values())
+        rows = []
+        for (stage, shape_key), v in self._data.items():
+            pct = (v["total_ms"] / grand_total * 100.0) if grand_total > 0 else 0.0
+            rows.append((stage, shape_key, v["count"], v["total_ms"], pct))
+        rows.sort(key=lambda r: -r[3])
+        header = (
+            f"\n{'='*120}\n"
+            f"[flydsl-profile] Summary (grand_total={grand_total:.2f} ms)\n"
+            f"{'='*120}\n"
+            f"{'stage':<8} {'mode':<10} {'tokens':>8} {'model_dim':>10} {'inter_dim':>10} "
+            f"{'E':>4} {'topk':>5} {'tile_m':>7} {'tile_n':>7} {'tile_k':>7} "
+            f"{'count':>8} {'total_ms':>12} {'pct':>7}\n"
+            f"{'-'*120}"
+        )
+        lines = [header]
+        for stage, shape_key, count, total_ms, pct in rows:
+            mode, tokens, model_dim, inter_dim, E, topk, tile_m, tile_n, tile_k = shape_key
+            lines.append(
+                f"{stage:<8} {mode:<10} {tokens:>8} {model_dim:>10} {inter_dim:>10} "
+                f"{E:>4} {topk:>5} {tile_m:>7} {tile_n:>7} {tile_k:>7} "
+                f"{count:>8} {total_ms:>12.3f} {pct:>6.1f}%"
+            )
+        lines.append("=" * 120)
+        logger.info("\n".join(lines))
+
+
+_flydsl_profiler = _FlydslMoeProfiler()
+
+
 def flydsl_moe_stage1(
     hidden_states,
     w1,
@@ -1781,6 +1876,9 @@ def flydsl_moe_stage1(
     group_size: int = -1,  # -1 for per-row, >0 for group-wise
     **_kwargs,
 ):
+    # === Profiling: shape logging (no CUDA sync, safe for graph capture) ===
+    _FLYDSL_PROFILE = os.environ.get("FLYDSL_MOE_PROFILE", "0") == "1"
+
     # Detect weight dtype: W4A16/W4A8 (packed int4 as i8), pure bf16 (dequanted), or fp8
     _is_w_int4 = w1.dtype in (dtypes.i8, torch.int8)
     _is_w4a16 = _is_w_int4 and a1_scale is None   # W4A16: no activation scale
@@ -1810,7 +1908,7 @@ def flydsl_moe_stage1(
         )
 
     tile_m = int(block_m) if block_m is not None else 64
-    tile_n = 64 # 128
+    tile_n = 64
     tile_k = 128 if _is_w_int4 else 256
     # Decode/small-token fix (NO kernel changes):
     # FlyDSL stage1 kernel expects CK-style preshuffled W1 layout, but model weights are not
@@ -1970,7 +2068,6 @@ def flydsl_moe_stage1(
     else:
         _stage1_in_dtype = "fp8"
 
-    thread_size = None if (_is_w_int4 or _is_bf16) else (256 if token_num > 128 else 128)
     key1 = (
         model_dim,
         inter_dim,
@@ -1983,7 +2080,6 @@ def flydsl_moe_stage1(
         _stage1_in_dtype,
         out_dtype,
         False,
-        thread_size,
         group_size,
     )
     exe1 = _FLYDSL_MOE_GEMM1_CACHE.get(key1)
@@ -2002,10 +2098,9 @@ def flydsl_moe_stage1(
             use_cshuffle_epilog=False,
             group_size=group_size,
         )
-        if thread_size is not None:
-            compile_kwargs["total_thread_size"] = thread_size
         exe1 = compile_moe_gemm1(**compile_kwargs)
         _FLYDSL_MOE_GEMM1_CACHE[key1] = exe1
+    _prof_ev1 = _flydsl_profiler.begin() if _FLYDSL_PROFILE else None
     exe1(
         out,
         x_q,
@@ -2022,6 +2117,14 @@ def flydsl_moe_stage1(
         int(blocks),
         stream_ptr
     )
+    if _FLYDSL_PROFILE:
+        _mode = "w4a8_fp8" if _is_w4a8_fp8 else ("w4a16" if _is_w4a16 else ("bf16" if _is_bf16 else "fp8"))
+        _flydsl_profiler.end(
+            _prof_ev1,
+            "stage1",
+            (_mode, int(token_num), int(model_dim), int(inter_dim), int(E), int(topk),
+             int(tile_m), int(tile_n), int(tile_k)),
+        )
 
     # Debug hook: run CK in parallel and diff (small tokens only).
     # Enable with:
@@ -2178,6 +2281,17 @@ def flydsl_moe_stage1(
             raise RuntimeError(
                 f"[flydsl-compare][stage1] max_abs={max_abs} exceeds threshold={_max_allow} (kernel={kernelName})"
             )
+
+    # === Profiling: log shape stats (no timing, safe for CUDA graph) ===
+    if _FLYDSL_PROFILE:
+        _mode = "w4a8_fp8" if _is_w4a8_fp8 else ("w4a16" if _is_w4a16 else ("bf16" if _is_bf16 else "fp8"))
+        logger.info(
+            "[flydsl-profile][stage1] mode=%s tokens=%d model_dim=%d inter_dim=%d E=%d topk=%d "
+            "tile_m=%d tile_n=%d tile_k=%d group_size=%d",
+            _mode, token_num, model_dim, inter_dim, E, topk,
+            tile_m, tile_n, tile_k, group_size,
+        )
+
     return out
 
 
@@ -2250,6 +2364,9 @@ def flydsl_moe_stage2(
     activation=ActivationType.Silu,
     **_kwargs,
 ):
+    # === Profiling: shape logging (no CUDA sync, safe for graph capture) ===
+    _FLYDSL_PROFILE = os.environ.get("FLYDSL_MOE_PROFILE", "0") == "1"
+
     # Detect weight dtype: W4A16/W4A8 (packed int4 as i8), pure bf16 (dequanted), or fp8
     _is_w_int4_s2 = w2.dtype in (dtypes.i8, torch.int8)
     _is_w4a16_s2 = _is_w_int4_s2 and a2_scale is None
@@ -2312,7 +2429,7 @@ def flydsl_moe_stage2(
 
     tile_m = int(block_m) if block_m is not None else 64
     tile_n = 256
-    tile_k = 64 # 128
+    tile_k = 64
 
     sorted_ids = sorted_token_ids.contiguous()
     sorted_eids = sorted_expert_ids.contiguous()
@@ -2412,11 +2529,11 @@ def flydsl_moe_stage2(
     _do_cmp = _cmp and _cmp_s2 and int(token_num) <= int(_cmp_max_tokens)
     out_base = out.clone() if _do_cmp else None
 
-    moe_mode = MoeGemm2Mode.REDUCE
+    moe_mode = MoeGemm2Mode.ATOMIC
     try:
-        _moe_mode_env = os.environ.get("AITER_FLYDSL_MOE_GEMM2_MODE", "reduce").lower()
-        if _moe_mode_env == "atomic":
-            moe_mode = MoeGemm2Mode.ATOMIC
+        _moe_mode_env = os.environ.get("AITER_FLYDSL_MOE_GEMM2_MODE", "atomic").lower()
+        if _moe_mode_env == "reduce":
+            moe_mode = MoeGemm2Mode.REDUCE
     except Exception:
         pass
 
@@ -2439,8 +2556,6 @@ def flydsl_moe_stage2(
     else:
         _stage2_in_dtype = "fp8"
 
-    thread_size = None if (_is_w_int4_s2 or _is_bf16_s2) else 256
-
     key2 = (
         model_dim,
         inter_dim,
@@ -2453,7 +2568,6 @@ def flydsl_moe_stage2(
         _stage2_in_dtype,
         out_dtype,
         moe_mode,
-        thread_size,
         group_size,
     )
     exe2 = _FLYDSL_MOE_GEMM2_CACHE.get(key2)
@@ -2472,13 +2586,12 @@ def flydsl_moe_stage2(
             mode=moe_mode,
             group_size=group_size,
         )
-        if thread_size is not None:
-            compile_kwargs["total_thread_size"] = thread_size
         exe2 = compile_moe_gemm2_ex(**compile_kwargs)
         _FLYDSL_MOE_GEMM2_CACHE[key2] = exe2
 
     # REDUCE mode wrapper has valid_mask before stream_ptr in __call__,
     # so we must pass None explicitly for valid_mask to avoid misalignment.
+    _prof_ev2 = _flydsl_profiler.begin() if _FLYDSL_PROFILE else None
     if moe_mode == MoeGemm2Mode.REDUCE:
         exe2(
             out,
@@ -2513,6 +2626,14 @@ def flydsl_moe_stage2(
             inter_dim,
             int(blocks),
             stream_ptr,
+        )
+    if _FLYDSL_PROFILE:
+        _mode_s2 = "w4a8_fp8" if _is_w4a8_fp8_s2 else ("w4a16" if _is_w4a16_s2 else ("bf16" if _is_bf16_s2 else "fp8"))
+        _flydsl_profiler.end(
+            _prof_ev2,
+            "stage2",
+            (_mode_s2, int(token_num), int(model_dim), int(inter_dim), int(E), int(topk),
+             int(tile_m), int(tile_n), int(tile_k)),
         )
     if _do_cmp:
         out_ck = out_base.clone()  # type: ignore[union-attr]
@@ -2570,6 +2691,17 @@ def flydsl_moe_stage2(
             raise RuntimeError(
                 f"[flydsl-compare][stage2] max_abs={max_abs} exceeds threshold={_max_allow} (kernel={kernelName})"
             )
+
+    # === Profiling: log shape stats (no timing, safe for CUDA graph) ===
+    if _FLYDSL_PROFILE:
+        _mode_s2 = "w4a8_fp8" if _is_w4a8_fp8_s2 else ("w4a16" if _is_w4a16_s2 else ("bf16" if _is_bf16_s2 else "fp8"))
+        logger.info(
+            "[flydsl-profile][stage2] mode=%s tokens=%d model_dim=%d inter_dim=%d E=%d topk=%d "
+            "tile_m=%d tile_n=%d tile_k=%d group_size=%d",
+            _mode_s2, token_num, model_dim, inter_dim, E, topk,
+            tile_m, tile_n, tile_k, group_size,
+        )
+
     return out
 
 
