@@ -1006,7 +1006,7 @@ void smooth_per_token_scaled_quant(
             smooth_per_token_scaled_quant_kernel, ck_tile::int8_t, cols);
     }
 #if defined(__Float4_e2m1fn_x2)
-    else if(out.dtype() == torch::kFloat4_e2m1fn_x2 || out.dtype() == torch::kUInt8)
+    else if(out.dtype() == torch_fp4x2 || out.dtype() == torch::kUInt8)
     {
         SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
             smooth_per_token_scaled_quant_kernel, ck_tile::fp4x2_t, cols);
