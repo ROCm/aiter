@@ -1671,6 +1671,7 @@ def _write_ninja_file(
     # Version 1.3 is required for the `deps` directive.
     config = ["ninja_required_version = 1.3"]
     config.append(f"cxx = {compiler}")
+    config.append(f"ar = {os.environ.get('AR', 'ar')}")
     if with_cuda or cuda_dlink_post_cflags:
         nvcc = _join_rocm_home("bin", "hipcc")
         config.append(f"nvcc = {nvcc}")
@@ -1730,17 +1731,25 @@ def _write_ninja_file(
             "  command = $cxx @$out.rsp $ldflags -o $out\n  rspfile = $out.rsp\n  rspfile_content = $in"
         )
 
+        archive_rule = ["rule archive"]
+        archive_rule.append(
+            "  command = rm -f $out && $ar rcs $out @$out.rsp\n  rspfile = $out.rsp\n  rspfile_content = $in"
+        )
+
         link = [f'build {library_target}: link {" ".join(objects)}']
+
+        archive_target = os.path.splitext(library_target)[0] + ".a"
+        archive = [f'build {archive_target}: archive {" ".join(objects)}']
 
         default = [f"default {library_target}"]
     else:
-        link_rule, link, default = [], [], []
+        link_rule, archive_rule, link, archive, default = [], [], [], [], []
 
     # 'Blocks' should be separated by newlines, for visual benefit.
     blocks = [config, flags, compile_rule]
     if with_cuda:
         blocks.append(cuda_compile_rule)  # type: ignore[possibly-undefined]
-    blocks += [devlink_rule, link_rule, build, devlink, link, default]
+    blocks += [devlink_rule, link_rule, archive_rule, build, devlink, link, archive, default]
     content = "\n\n".join("\n".join(b) for b in blocks)
     # Ninja requires a new lines at the end of the .ninja file
     content += "\n"
