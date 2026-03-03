@@ -246,7 +246,8 @@
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale.cu'"
         ],
         "extra_include": [
-            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/include'"
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/include'",
+            "f'{CK_3RDPARTY_DIR}/include'"
         ],
         "flags_extra_hip": [
             "'-mllvm -greedy-reverse-local-assignment=1'",
