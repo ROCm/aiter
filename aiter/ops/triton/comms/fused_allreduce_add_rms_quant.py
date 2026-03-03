@@ -21,6 +21,7 @@ Implementations:
 5. "iris_twoshot_delayed" - Iris two-shot with delayed scaling + FP8 broadcast (see iris_twoshot_delayed_allreduce.py)
 6. "iris_twoshot_row_hipblaslt" - Same comm kernel as iris_twoshot_row but GEMM via torch._scaled_mm/hipBLASLt (see iris_twoshot_row_hipblaslt_allreduce.py)
 7. "iris_twoshot_2d_hipblaslt" - 2D-tiled variant mimicking CCL two-shot structure, per-row FP8 quant + hipBLASLt GEMM (see iris_twoshot_2d_hipblaslt_allreduce.py)
+8. "iris_partial_gemm" - Partial GEMM + allgather. No FP8 broadcast, no internal cross-rank barrier. Each rank GEMMs its own rows, then allgather assembles the full output via iris.load (see iris_partial_gemm_allreduce.py)
 
 Default: "iris_twoshot_row_hipblaslt" -- per-row FP8 quant with FP8 broadcast
 (halved cross-rank traffic), vendor-tuned hipBLASLt GEMM.
@@ -114,6 +115,13 @@ def fused_allreduce_add_rms_quant_gemm(
 
         return fused_allreduce_add_rms_delayed_quant_gemm_iris_twoshot(*args)
 
+    elif impl == "iris_partial_gemm":
+        from .iris_partial_gemm_allreduce import (
+            fused_allreduce_add_rms_row_quant_gemm_iris_partial,
+        )
+
+        return fused_allreduce_add_rms_row_quant_gemm_iris_partial(*args)
+
     elif impl == "torch":
         from .torch_allreduce import (
             fused_allreduce_add_rms_quant_gemm_torch,
@@ -130,5 +138,5 @@ def fused_allreduce_add_rms_quant_gemm(
             f"Unknown impl '{impl}', expected 'torch', 'iris_oneshot',"
             f" 'iris_twoshot', 'iris_twoshot_row',"
             f" 'iris_twoshot_row_hipblaslt', 'iris_twoshot_2d_hipblaslt',"
-            f" or 'iris_twoshot_delayed'"
+            f" 'iris_twoshot_delayed', or 'iris_partial_gemm'"
         )
