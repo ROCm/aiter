@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2023, Tri Dao.
-// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2023-2026, Tri Dao.
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 // 
 // Causal 1D Convolution Update Kernel for AIter Framework
 // Adapted for AMD MI308 GPU (ROCm/HIP)

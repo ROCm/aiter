@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from torch import Tensor
 from ..jit.core import compile_ops
@@ -47,7 +47,7 @@ def causal_conv1d_update(
 
     Features:
         - Continuous batching: Different sequences can use different state slots
-        - Padding token handling: conv_state_indices[i] == pad_slot_id → skip processing
+        - Padding token handling: conv_state_indices[i] == pad_slot_id -> skip processing
         - In-place state update: conv_state is modified during execution
         - Optimized for small seqlen (1-4 tokens), typical for decoding
 
