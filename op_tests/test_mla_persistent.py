@@ -8,6 +8,8 @@ from aiter import dtypes
 import random
 import itertools
 import argparse
+import os
+import numpy as np
 import pandas as pd
 
 torch.set_default_device("cuda")
@@ -184,6 +186,65 @@ def cal_diff(
         assert cos_diff < 3e-2
     else:
         assert cos_diff < 1e-5
+
+
+def debug_per_batch_diff(
+    out_ref, out_asm, qo_indptr, seq_lens_kv, batch_size, label="out"
+):
+    """Per-batch max abs delta analysis, prints which batch has nan/max error."""
+    print(f"\n{'='*60}")
+    print(f"[debug] Per-batch diff analysis for '{label}'")
+    print(f"{'='*60}")
+    worst_batch = -1
+    worst_delta = -1.0
+    for b in range(batch_size):
+        q_start = int(qo_indptr[b].item())
+        q_end = int(qo_indptr[b + 1].item())
+        ref_b = out_ref[q_start:q_end].double()
+        asm_b = out_asm[q_start:q_end].double()
+        diff_b = (ref_b - asm_b).abs()
+        has_nan = torch.isnan(diff_b).any().item()
+        has_inf = torch.isinf(diff_b).any().item()
+        nan_count = torch.isnan(diff_b).sum().item()
+        finite_diff = diff_b[torch.isfinite(diff_b)]
+        max_delta = finite_diff.max().item() if finite_diff.numel() > 0 else float("nan")
+        kv_sl = int(seq_lens_kv[b].item())
+
+        flag = ""
+        if has_nan or has_inf:
+            flag = " *** NAN/INF ***"
+        elif max_delta > 0.01:
+            flag = " *** HIGH ***"
+
+        print(
+            f"  batch={b:3d}  kv_seqlen={kv_sl:6d}  "
+            f"max_abs_delta={max_delta:.6f}  nan_count={nan_count}{flag}"
+        )
+        if max_delta > worst_delta and not (has_nan and finite_diff.numel() == 0):
+            worst_delta = max_delta
+            worst_batch = b
+    if worst_batch >= 0:
+        print(
+            f"[debug] Worst finite batch={worst_batch}, "
+            f"kv_seqlen={int(seq_lens_kv[worst_batch].item())}, "
+            f"max_abs_delta={worst_delta:.6f}"
+        )
+    print(f"{'='*60}\n")
+
+
+def dump_tensor_to_txt(tensor, filepath):
+    """Dump tensor to txt: first line is shape/dtype, then flattened values."""
+    if tensor is None:
+        print(f"[debug] skip dump {filepath}  (tensor is None)")
+        return
+    os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
+    t = tensor.detach().float().cpu()
+    with open(filepath, "w") as f:
+        f.write(f"# shape={list(tensor.shape)} dtype={tensor.dtype}\n")
+        flat = t.reshape(-1).numpy()
+        for i, v in enumerate(flat):
+            f.write(f"{i} {v:.8e}\n")
+    print(f"[debug] dumped {filepath}  shape={list(tensor.shape)} dtype={tensor.dtype}")
 
 
 def ref_masked_attention(
@@ -374,13 +435,29 @@ def test_mla(
     seq_lens_kv = torch.empty(batch_size, dtype=torch.int)
     kv_block_nums = torch.empty(batch_size, dtype=torch.int)
     kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+
+    a = [742, 1448, 2163, 2898, 3686, 4417, 5138, 5882, 6662,
+     7396, 8137, 8876, 9614, 10361, 11089, 11816, 12585, 13315,
+     14023, 14767, 15506, 16228, 16962, 17679, 18395, 19138,
+     19871, 20612, 21356, 22085, 22800, 23541]
+ 
+    b = [0, 742, 1448, 2163, 2898, 3686, 4417, 5138, 5882, 6662,
+     7396, 8137, 8876, 9614, 10361, 11089, 11816, 12585,
+     13315, 14023, 14767, 15506, 16228, 16962, 17679,
+     18395, 19138, 19871, 20612, 21356, 22085, 22800]
+
+    # [742, 706, 715, 735, 788, 731, 721, 744, 780, 734, 741, 739, 738, 747, 728, 727, 769, 730, 708, 744, 739, 722, 734, 717, 716, 743, 733, 741, 744, 729, 715, 741]
+ 
+    seq_lens_kv = torch.tensor([x - y for x, y in zip(a, b)])
+    seq_lens_qo.fill_(4)
+
     if varlen:
         for i in range(batch_size):
             # seq_lens_kv[i] = max(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens)
-            seq_lens_kv[i] = random.uniform(5, ctx_lens)
-            seq_lens_qo[i] = max(
-                min(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens), 1
-            )
+            # seq_lens_kv[i] = random.uniform(5, ctx_lens)
+            # seq_lens_qo[i] = max(
+            #     min(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens), 1
+            # )
             kv_block_nums[i] = (seq_lens_kv[i] + page_size - 1) // page_size
             if seq_lens_kv[i] % page_size == 0:
                 kv_last_page_lens[i] = page_size
@@ -532,6 +609,87 @@ def test_mla(
         dtype_q=dtype,
         dtype_kv=kvtype,
     )
+    # ===== DEBUG: dump & verify metadata =====
+    def debug_verify_metadata():
+        wi_cpu = work_indptr.cpu().to(torch.int32)
+        wis_cpu = work_info_set.cpu().to(torch.int32)
+        ri_cpu = reduce_indptr.cpu().to(torch.int32)
+        rfm_cpu = reduce_final_map.cpu().to(torch.int32)
+        rpm_cpu = reduce_partial_map.cpu().to(torch.int32)
+
+        num_cu = wi_cpu.shape[0] - 1
+        total_works = int(wi_cpu[-1].item())
+        print(f"\n[metadata] num_cu={num_cu}, total_works={total_works}")
+
+        per_batch_works = {b: [] for b in range(batch_size)}
+        for w in range(total_works):
+            row = wis_cpu[w]
+            info = {
+                "batch_idx": int(row[0].item()),
+                "partial_qo_loc": int(row[1].item()),
+                "qo_start": int(row[2].item()),
+                "qo_end": int(row[3].item()),
+                "kv_start": int(row[4].item()),
+                "kv_end": int(row[5].item()),
+                "kv_offset": int(row[6].item()),
+            }
+            b = info["batch_idx"]
+            if 0 <= b < batch_size:
+                per_batch_works[b].append((w, info))
+
+        for b in range(batch_size):
+            works = per_batch_works[b]
+            kv_sl = int(seq_lens_kv[b].item())
+            kv_begin = int(kv_indptr[b].item())
+            kv_end_expected = int(kv_indptr[b + 1].item())
+            num_splits = len(works)
+
+            if num_splits == 0:
+                print(f"  batch={b:3d}  kv_seqlen={kv_sl:6d}  *** NO WORK ITEMS ***")
+                continue
+
+            kv_ranges = [(w["kv_start"], w["kv_end"]) for _, w in works]
+            kv_ranges_sorted = sorted(kv_ranges, key=lambda x: x[0])
+            first_start = kv_ranges_sorted[0][0]
+            last_end = kv_ranges_sorted[-1][1]
+
+            gaps = []
+            for i in range(len(kv_ranges_sorted) - 1):
+                if kv_ranges_sorted[i][1] < kv_ranges_sorted[i + 1][0]:
+                    gaps.append(
+                        (kv_ranges_sorted[i][1], kv_ranges_sorted[i + 1][0])
+                    )
+
+            flag = ""
+            if first_start != kv_begin:
+                flag += f" *** START_MISMATCH(expect={kv_begin},got={first_start}) ***"
+            if last_end != kv_end_expected:
+                flag += f" *** END_MISMATCH(expect={kv_end_expected},got={last_end}) ***"
+            if gaps:
+                flag += f" *** GAPS={gaps} ***"
+
+            if flag or b == 16:
+                print(
+                    f"  batch={b:3d}  kv_seqlen={kv_sl:6d}  splits={num_splits}  "
+                    f"kv_range=[{first_start},{last_end})  expect=[{kv_begin},{kv_end_expected}){flag}"
+                )
+                for w_idx, w in works:
+                    print(
+                        f"    work[{w_idx:4d}]: qo=[{w['qo_start']},{w['qo_end']})  "
+                        f"kv=[{w['kv_start']},{w['kv_end']})  "
+                        f"kv_offset={w['kv_offset']}  partial_qo_loc={w['partial_qo_loc']}"
+                    )
+
+        tot_qo_tiles = 0
+        for b in range(batch_size):
+            if per_batch_works[b]:
+                tot_qo_tiles += 1
+        print(f"[metadata] tot_qo_tiles={tot_qo_tiles}")
+        print(f"[metadata] reduce_indptr (first {min(tot_qo_tiles+2, ri_cpu.shape[0])}): "
+              f"{ri_cpu[:min(tot_qo_tiles+2, ri_cpu.shape[0])].tolist()}")
+
+    debug_verify_metadata()
+    print()
 
     def test_absorb_decode_bf16_fp8():
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
@@ -679,11 +837,189 @@ def test_mla(
             intra_batch_mode=non_persistent_mode,
         )
 
-        # print(f"{out_ref.view(total_q, -1)=}")
-        # print(f"{out_asm.view(total_q, -1)=}")
-        # checkAllclose(logits_ref, attn_logits,
-        #               msg=f'attn_logits [golden vs aiter_asm]')
-        # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
+        # ===== DEBUG: dump attn_logits and attn_lse to .pt (binary, much faster) =====
+        dump_dir = "mla_debug_dump"
+        os.makedirs(dump_dir, exist_ok=True)
+        if attn_logits is not None:
+            torch.save(attn_logits.cpu(), os.path.join(dump_dir, "fp8_attn_logits.pt"))
+            print(f"[debug] saved attn_logits {list(attn_logits.shape)} {attn_logits.dtype}")
+        if attn_lse is not None:
+            torch.save(attn_lse.cpu(), os.path.join(dump_dir, "fp8_attn_lse.pt"))
+            print(f"[debug] saved attn_lse {list(attn_lse.shape)} {attn_lse.dtype}")
+
+        # ===== DEBUG: comprehensive analysis for a target batch =====
+        def debug_batch_analysis(target_batch=16):
+            wis_cpu = work_info_set.cpu().to(torch.int32)
+            wi_cpu = work_indptr.cpu().to(torch.int32)
+            total_works = int(wi_cpu[-1].item())
+            logits_cpu = attn_logits.float().cpu() if attn_logits is not None else None
+            lse_cpu = attn_lse.float().cpu() if attn_lse is not None else None
+            kv_seqlen_b = int(seq_lens_kv[target_batch].item())
+
+            # --- Part 1: partial output & LSE statistics ---
+            print(f"\n{'='*70}")
+            print(f"[debug] Part 1: Partial output stats for batch {target_batch} "
+                  f"(kv_seqlen={kv_seqlen_b})")
+            print(f"{'='*70}")
+            splits_info = []
+            for w in range(total_works):
+                row = wis_cpu[w]
+                b = int(row[0].item())
+                if b != target_batch:
+                    continue
+                info = {
+                    "w": w, "partial_loc": int(row[1].item()),
+                    "qo_s": int(row[2].item()), "qo_e": int(row[3].item()),
+                    "kv_s": int(row[4].item()), "kv_e": int(row[5].item()),
+                    "kv_off": int(row[6].item()),
+                }
+                splits_info.append(info)
+                kv_len = info["kv_e"] - info["kv_s"]
+                msg = (f"  work[{w}]: qo=[{info['qo_s']},{info['qo_e']})  "
+                       f"kv=[{info['kv_s']},{info['kv_e']})  kv_len={kv_len}  "
+                       f"kv_offset={info['kv_off']}  partial_loc={info['partial_loc']}")
+                if logits_cpu is not None and info["partial_loc"] >= 0:
+                    for qi in range(max_seqlen_qo):
+                        idx = info["partial_loc"] + qi
+                        if idx < logits_cpu.shape[0]:
+                            chunk = logits_cpu[idx]
+                            has_nan = torch.isnan(chunk).any().item()
+                            has_inf = torch.isinf(chunk).any().item()
+                            fin = chunk[torch.isfinite(chunk)]
+                            amax = fin.abs().max().item() if fin.numel() > 0 else float("nan")
+                            msg += f"\n    q{qi}: nan={has_nan} inf={has_inf} abs_max={amax:.6f}"
+                        if lse_cpu is not None and idx < lse_cpu.shape[0]:
+                            lc = lse_cpu[idx]
+                            lv = lc[torch.isfinite(lc)]
+                            lr = f"[{lv.min().item():.4f},{lv.max().item():.4f}]" if lv.numel() > 0 else "N/A"
+                            msg += f"  lse_range={lr}"
+                print(msg)
+
+            # --- Part 2: manual reduce → compare with ASM output ---
+            print(f"\n{'='*70}")
+            print(f"[debug] Part 2: Manual reduce vs ASM final output for batch {target_batch}")
+            print(f"{'='*70}")
+            if logits_cpu is not None and lse_cpu is not None and splits_info:
+                n_splits = len(splits_info)
+                s_q = max_seqlen_qo
+                manual_out = torch.zeros(s_q, nhead, v_head_dim)
+                for qi in range(s_q):
+                    all_lse = []
+                    all_out = []
+                    for si in splits_info:
+                        pl = si["partial_loc"]
+                        if pl < 0:
+                            continue
+                        idx = pl + qi
+                        part_out = logits_cpu[idx, 0, :, :v_head_dim]  # (nhead, v_head_dim)
+                        part_lse = lse_cpu[idx, 0, :, 0]               # (nhead,)
+                        all_lse.append(part_lse)
+                        all_out.append(part_out)
+                    if not all_lse:
+                        continue
+                    lse_stack = torch.stack(all_lse, dim=0)    # (n_splits, nhead)
+                    out_stack = torch.stack(all_out, dim=0)    # (n_splits, nhead, v_head_dim)
+                    max_lse = lse_stack.max(dim=0).values      # (nhead,)
+                    scales = torch.exp(lse_stack - max_lse.unsqueeze(0))  # (n_splits, nhead)
+                    sum_scales = scales.sum(dim=0)             # (nhead,)
+                    weighted = (out_stack * scales.unsqueeze(-1)).sum(dim=0)  # (nhead, v_head_dim)
+                    manual_out[qi] = weighted / sum_scales.unsqueeze(-1)
+
+                asm_out_b = out_asm[qo_indptr[target_batch]:qo_indptr[target_batch+1]].float().cpu()
+                golden_out_b = out_ref_fp8[qo_indptr[target_batch]:qo_indptr[target_batch+1]].float().cpu()
+
+                diff_manual_vs_asm = (manual_out - asm_out_b[:, :, :v_head_dim]).abs()
+                diff_manual_vs_golden = (manual_out - golden_out_b[:, :, :v_head_dim]).abs()
+                diff_asm_vs_golden = (asm_out_b[:, :, :v_head_dim] - golden_out_b[:, :, :v_head_dim]).abs()
+
+                print(f"  manual_reduce vs ASM_output:   max_abs_delta={diff_manual_vs_asm.max().item():.6f}")
+                print(f"  manual_reduce vs golden_fp8:   max_abs_delta={diff_manual_vs_golden.max().item():.6f}")
+                print(f"  ASM_output    vs golden_fp8:   max_abs_delta={diff_asm_vs_golden.max().item():.6f}")
+                if diff_manual_vs_asm.max().item() < 0.01:
+                    print("  >>> Manual reduce matches ASM output → reduce kernel is OK")
+                    if diff_manual_vs_golden.max().item() > 0.1:
+                        print("  >>> But manual reduce differs from golden → stage1 kernel produces wrong partial outputs!")
+                elif diff_manual_vs_golden.max().item() < 0.01:
+                    print("  >>> Manual reduce matches golden → stage1 kernel is OK, reduce kernel has a bug!")
+                else:
+                    print("  >>> Both manual reduce and ASM output differ from golden → stage1 kernel has a bug")
+
+            # --- Part 3: per-split golden comparison ---
+            print(f"\n{'='*70}")
+            print(f"[debug] Part 3: Per-split golden comparison for batch {target_batch}")
+            print(f"{'='*70}")
+            kv_buffer_fp8_local = kv_buffer.to(dtypes.fp8)
+            kv_indices_cpu = kv_indices.cpu()
+            q_batch = (q_fp8 if dtype == dtypes.fp8 else q)[splits_info[0]["qo_s"]:splits_info[0]["qo_e"]]
+            q_f = q_batch.float()
+            s_q = q_f.shape[0]
+
+            for si in splits_info:
+                pl = si["partial_loc"]
+                kv_s, kv_e, kv_off = si["kv_s"], si["kv_e"], si["kv_off"]
+                kv_len = kv_e - kv_s
+                if pl < 0:
+                    print(f"  work[{si['w']}] kv=[{kv_s},{kv_e}) (direct output, skip)")
+                    continue
+
+                kv_page_idx = kv_indices_cpu[kv_s:kv_e].to(q.device)
+                kv_data = kv_buffer_fp8_local[kv_page_idx, 0, 0, :].float()
+                eff_scale = sm_scale
+                if q_scale is not None:
+                    eff_scale *= q_scale.item()
+                if kv_scale is not None:
+                    eff_scale *= kv_scale.item()
+                attn = torch.einsum("qhd,kd->hqk", q_f, kv_data) * eff_scale
+                if kv_off < s_q:
+                    for qi in range(s_q):
+                        visible = kv_len - max(0, (s_q - 1 - qi) - kv_off)
+                        if visible < kv_len:
+                            attn[:, qi, visible:] = float("-inf")
+                m = attn.max(-1).values
+                exp_attn = torch.exp(attn - m.unsqueeze(-1))
+                l_sum = exp_attn.sum(-1)
+                ref_lse = m + torch.log(l_sum)
+                ref_out = torch.einsum("hqk,kd->qhd", exp_attn, kv_data[:, :v_head_dim])
+                ref_out = ref_out / l_sum.transpose(0, 1).unsqueeze(-1)
+
+                asm_outs = []
+                asm_lses = []
+                for qi in range(s_q):
+                    idx = pl + qi
+                    asm_outs.append(logits_cpu[idx, 0, :, :v_head_dim])
+                    if lse_cpu is not None:
+                        asm_lses.append(lse_cpu[idx, 0, :, 0])
+                asm_out_s = torch.stack(asm_outs, dim=0).float()
+                diff_out = (ref_out.cpu() - asm_out_s).abs()
+                max_d = diff_out.max().item()
+                nan_cnt = torch.isnan(asm_out_s).sum().item()
+                lse_msg = ""
+                if asm_lses:
+                    asm_lse_s = torch.stack(asm_lses, dim=0).float()
+                    ref_lse_t = ref_lse.transpose(0, 1).cpu()
+                    lse_diff = (ref_lse_t - asm_lse_s).abs()
+                    lse_msg = f" lse_max_delta={lse_diff.max().item():.6f}"
+                print(f"  work[{si['w']}] kv=[{kv_s},{kv_e}) kv_off={kv_off}: "
+                      f"out_max_delta={max_d:.6f} nan_cnt={nan_cnt}{lse_msg}")
+
+            out_asm_b = out_asm[qo_indptr[target_batch]:qo_indptr[target_batch+1]]
+            print(f"\n  final out_asm batch {target_batch}: "
+                  f"has_nan={torch.isnan(out_asm_b).any().item()} "
+                  f"nan_count={torch.isnan(out_asm_b).sum().item()} / {out_asm_b.numel()}")
+
+        debug_batch_analysis(16)
+        debug_batch_analysis(0)
+
+        # ===== DEBUG: per-batch diff analysis =====
+        debug_per_batch_diff(
+            out_ref, out_asm, qo_indptr, seq_lens_kv, batch_size,
+            label="golden vs aiter_asm (fp8)"
+        )
+        debug_per_batch_diff(
+            out_ref_fp8, out_asm, qo_indptr, seq_lens_kv, batch_size,
+            label="golden_fp8 vs aiter_asm (fp8)"
+        )
+
         err = checkAllclose(
             out_ref,
             out_asm,
@@ -848,7 +1184,7 @@ parser.add_argument(
     "-d",
     "--dtype",
     type=dtypes.str2Dtype,
-    choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
+    choices=[dtypes.d_dtypes["fp8"]],
     nargs="*",
     default="bf16,fp8",
     metavar="{bf16, fp8}",
@@ -859,7 +1195,7 @@ parser.add_argument(
     "-kvd",
     "--kv_dtype",
     type=dtypes.str2Dtype,
-    choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
+    choices=[dtypes.d_dtypes["fp8"]],
     nargs="*",
     metavar="{bf16, fp8}",
     default="bf16,fp8",
@@ -871,7 +1207,7 @@ parser.add_argument(
     "--ctxLen",
     type=int,
     nargs="*",
-    default=[21, 64, 256, 512, 1200, 3200, 5200, 8192],
+    default=[742, 706, 715, 735, 788, 731, 721, 744, 780, 734, 741, 739, 738, 747, 728, 727, 769, 730, 708, 744, 739, 722, 734, 717, 716, 743, 733, 741, 744, 729, 715, 741],
     help="""Context length.
     e.g.: -c 21""",
 )
@@ -880,7 +1216,7 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    default=[1, 3, 5, 16, 32, 64, 128, 256],
+    default=[32],
     help="""Batch size.
     e.g.: -b 16""",
 )
@@ -890,7 +1226,7 @@ parser.add_argument(
     type=dtypes.str2tuple,
     nargs="*",
     const=None,
-    default=[(16, 1), (16, 2), (16, 4), (48, 1), (128, 2)],
+    default=[(32, 4)],
     help="""Number of heads.
     e.g.: -n 16,1""",
 )
