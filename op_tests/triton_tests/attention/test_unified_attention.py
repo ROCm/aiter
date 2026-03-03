@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # import hip
 # hip.hip.hipInit(0)
+from re import T
 from typing import Optional
 
 import pytest
@@ -17,11 +18,79 @@ from aiter.ops.triton.gluon.unified_attention_2d import (
 from aiter.ops.triton.utils.types import e4m3_dtype
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 
+
+def shuffle_kv_cache(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    layout=(16, 16),  # (num_lanes, bytes_per_thread)
+):
+    """
+    Shuffle key and value cache layout for optimized memory access.
+        16x16x32 for BF16
+        16x16x64 for FP8
+    """
+    dtype = key_cache.dtype
+    dtype_v = value_cache.dtype
+    assert dtype in (torch.bfloat16, e4m3_dtype)
+    num_blocks, block_size, num_kv_heads, head_size = key_cache.shape
+    num_blocks_v, block_size_v, num_kv_heads_v, head_size_v = value_cache.shape
+    assert block_size >= 16
+    assert dtype == dtype_v
+    assert num_blocks == num_blocks_v
+    assert num_kv_heads == num_kv_heads_v
+    assert head_size == head_size_v
+    assert block_size == block_size_v
+
+    num_lanes, bytes_per_thread = layout
+    num_elements_per_thread = (
+        bytes_per_thread // dtype.itemsize
+    )  # there are 16 bytes every 4 VGPRs
+
+    key_cache_shuffled = key_cache.view(
+        -1, block_size, num_kv_heads, head_size
+    ).permute(0, 2, 1, 3)
+    key_cache_shuffled = key_cache_shuffled.view(
+        -1,
+        num_kv_heads,
+        block_size // num_lanes,
+        num_lanes,
+        head_size // (2 * num_elements_per_thread),
+        2,  # there are 2 groups of threads, t0 ~ t15 and t16 ~ t31
+        num_elements_per_thread,
+    )
+    key_cache_shuffled = key_cache_shuffled.permute(0, 1, 2, 4, 5, 3, 6).contiguous()
+    key_cache_shuffled = key_cache_shuffled.view(
+        -1, num_kv_heads, block_size // 16, head_size * 16
+    )
+
+    value_cache_shuffled = value_cache.view(
+        -1, block_size, num_kv_heads, head_size
+    ).permute(0, 2, 1, 3)
+    value_cache_shuffled = value_cache_shuffled.view(
+        -1,
+        num_kv_heads,
+        block_size // (2 * num_elements_per_thread),
+        2,
+        num_elements_per_thread,
+        head_size // num_lanes,
+        num_lanes,
+    )
+    value_cache_shuffled = value_cache_shuffled.permute(
+        0, 1, 5, 2, 3, 6, 4
+    ).contiguous()
+    value_cache_shuffled = value_cache_shuffled.view(
+        -1, num_kv_heads, head_size // 16, block_size * 16
+    )
+
+    return key_cache_shuffled, value_cache_shuffled
+
+
 DEVICE_ARCH = arch_info.get_arch()
 
 NUM_HEADS = [(64, 8)]
-HEAD_SIZES = [32, 64]
-BLOCK_SIZES = [16]
+HEAD_SIZES = [64, 128]
+BLOCK_SIZES = [16, 64]
+
 
 DTYPES = [torch.bfloat16]
 QDTYPES = [None]
@@ -112,6 +181,13 @@ def ref_paged_attn(
     "seq_lens",
     [
         [(1, 1328)],
+        # [(1, 8192)],
+        # [(1, 8192)] * 4,
+        # [(1, 8192)] * 8,
+        # [(1, 8192)] * 16,
+        # [(1, 32768)],
+        # [(1, 523), (1, 37), (1, 2011)],
+        # [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)],
     ],
 )
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
@@ -122,14 +198,16 @@ def ref_paged_attn(
 @pytest.mark.parametrize("soft_cap", [None])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("q_dtype", QDTYPES)
+@pytest.mark.parametrize("shuffled_kv_cache", [True, False])
 @pytest.mark.parametrize(
-    "use_tdm, num_tdm_gather, use_async",
+    "backend, use_tdm, num_tdm_gather, use_async",
     [
-        (False, 1, False),  # use baseline
-        (False, 1, True),  # use simple async_copy
-        (True, 1, False),  # use TDM async_copy
-        (True, 4, False),  # use TDM gather pipelined
-        (True, 8, False),  # use TDM gather pipelined
+        ("triton", False, 1, False),  # use triton
+        ("gluon", False, 1, False),  # use gluon baseline
+        ("gluon", False, 1, True),  # use gluon simple async_copy
+        ("gluon", True, 1, False),  # use gluon TDM async_copy
+        ("gluon", True, 4, False),  # use gluon TDM gather pipelined
+        ("gluon", True, 8, False),  # use gluon TDM gather pipelined
     ],
 )
 @torch.inference_mode()
@@ -143,6 +221,8 @@ def test_triton_unified_attn(
     soft_cap: Optional[float],
     num_blocks: int,
     q_dtype: Optional[torch.dtype],
+    shuffled_kv_cache: bool,
+    backend: str,
     use_tdm: bool,
     num_tdm_gather: int,
     use_async: bool,
@@ -159,12 +239,26 @@ def test_triton_unified_attn(
     if DEVICE_ARCH not in ("gfx1250",) and use_tdm == True:
         pytest.skip(f"{DEVICE_ARCH} does not have TDM")
 
-    if use_tdm and num_tdm_gather > 1:
-        if head_size > 32:
-            pytest.skip("skipping test for head size > 32 and TDM gather cases")
-    else:
-        if head_size <= 32:
-            pytest.skip("skipping test for head size <= 32 for non-TDM gather cases")
+    if backend == "gluon":
+        if shuffled_kv_cache:
+            if block_size < 64:
+                pytest.skip(
+                    "Only block size >= 64 is supported for shuffled KV cache with gluon backend"
+                )
+
+        num_stage_assume = 2 if (use_tdm or use_async) else 1
+        kv_cache_shared_mem_size = (
+            2
+            * num_stage_assume
+            * (num_tdm_gather if use_tdm else 1)
+            * block_size
+            * head_size
+            * (torch.finfo(dtype).bits // 8)
+        )
+        if kv_cache_shared_mem_size > 327680:
+            pytest.skip(
+                f"skipping test for KV cache LDS required memory = {kv_cache_shared_mem_size/1024} kB > 320 kB"
+            )
 
     # TODO: Uncomment after pytorch adds support for manual_seed
     # torch.manual_seed(0)
@@ -201,7 +295,6 @@ def test_triton_unified_attn(
     )
     sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
     output = torch.empty_like(query)
-    output_gluon = torch.empty_like(query)
 
     maybe_quantized_query = query
     maybe_quantized_key_cache = key_cache
@@ -220,63 +313,79 @@ def test_triton_unified_attn(
         k_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
         v_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
 
-    unified_attention(
-        q=maybe_quantized_query,
-        k=maybe_quantized_key_cache,
-        v=maybe_quantized_value_cache,
-        out=output,
-        cu_seqlens_q=cu_query_lens,
-        seqused_k=kv_lens,
-        max_seqlen_q=max_query_len,
-        max_seqlen_k=max_kv_len,
-        softmax_scale=scale,
-        causal=True,
-        window_size=window_size,
-        block_table=block_tables,
-        softcap=soft_cap if soft_cap is not None else 0,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        sinks=sinks,
-    )
+    if backend == "triton":
+        if shuffled_kv_cache:
+            maybe_shuffled_qnatized_key_cache, maybe_shuffled_quantized_value_cache = (
+                shuffle_kv_cache(maybe_quantized_key_cache, maybe_quantized_value_cache)
+            )
+        else:
+            maybe_shuffled_qnatized_key_cache = maybe_quantized_key_cache
+            maybe_shuffled_quantized_value_cache = maybe_quantized_value_cache
 
-    if use_tdm and num_tdm_gather > 1:
-        # note: random gather is not yet hardware verified
-        # maybe_sorted_block_tables = torch.sort(block_tables, dim=-1)[0]
-        maybe_sorted_block_tables = block_tables
-        maybe_reordered_key_cache = maybe_quantized_key_cache.permute(
-            0, 2, 1, 3
-        ).contiguous()
-        maybe_reordered_value_cache = maybe_quantized_value_cache.permute(
-            0, 2, 1, 3
-        ).contiguous()
+        unified_attention(
+            q=maybe_quantized_query,
+            k=maybe_shuffled_qnatized_key_cache,
+            v=maybe_shuffled_quantized_value_cache,
+            out=output,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=soft_cap if soft_cap is not None else 0,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            sinks=sinks,
+            shuffled_kv_cache=shuffled_kv_cache,
+        )
     else:
-        maybe_sorted_block_tables = block_tables
-        maybe_reordered_key_cache = maybe_quantized_key_cache
-        maybe_reordered_value_cache = maybe_quantized_value_cache
+        if shuffled_kv_cache:
+            maybe_sorted_block_tables = block_tables
+            maybe_shuffled_qnatized_key_cache, maybe_shuffled_quantized_value_cache = (
+                shuffle_kv_cache(maybe_quantized_key_cache, maybe_quantized_value_cache)
+            )
+        elif use_tdm and num_tdm_gather > 1:
+            # note: random gather is not yet hardware verified
+            # maybe_sorted_block_tables = torch.sort(block_tables, dim=-1)[0]
+            maybe_sorted_block_tables = block_tables
+            maybe_shuffled_qnatized_key_cache = maybe_quantized_key_cache.permute(
+                0, 2, 1, 3
+            ).contiguous()
+            maybe_shuffled_quantized_value_cache = maybe_quantized_value_cache.permute(
+                0, 2, 1, 3
+            ).contiguous()
+        else:
+            maybe_sorted_block_tables = block_tables
+            maybe_shuffled_qnatized_key_cache = maybe_quantized_key_cache
+            maybe_shuffled_quantized_value_cache = maybe_quantized_value_cache
 
-    gluon_unified_attention(
-        q=maybe_quantized_query,
-        k=maybe_reordered_key_cache,
-        v=maybe_reordered_value_cache,
-        out=output_gluon,
-        cu_seqlens_q=cu_query_lens,
-        seqused_k=kv_lens,
-        max_seqlen_q=max_query_len,
-        max_seqlen_k=max_kv_len,
-        softmax_scale=scale,
-        causal=True,
-        window_size=window_size,
-        block_table=maybe_sorted_block_tables,
-        softcap=soft_cap if soft_cap is not None else 0,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        sinks=sinks,
-        use_tdm=use_tdm,
-        num_tdm_gather=num_tdm_gather,
-        use_async=use_async,
-    )
+        gluon_unified_attention(
+            q=maybe_quantized_query,
+            k=maybe_shuffled_qnatized_key_cache,
+            v=maybe_shuffled_quantized_value_cache,
+            out=output,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=maybe_sorted_block_tables,
+            softcap=soft_cap if soft_cap is not None else 0,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            sinks=sinks,
+            use_tdm=use_tdm,
+            num_tdm_gather=num_tdm_gather,
+            use_async=use_async,
+            shuffled_kv_cache=shuffled_kv_cache,
+        )
 
     ref_output = ref_paged_attn(
         query=query,
@@ -297,12 +406,6 @@ def test_triton_unified_attn(
     torch.testing.assert_close(
         output, ref_output, atol=atol, rtol=rtol
     ), f"{torch.max(torch.abs(output - ref_output))}"
-    torch.testing.assert_close(
-        output_gluon, ref_output, atol=atol, rtol=rtol
-    ), f"{torch.max(torch.abs(output_gluon - ref_output))}"
-    # torch.testing.assert_close(
-    #     output_gluon, output, atol=atol, rtol=rtol
-    # ), f"{torch.max(torch.abs(output_gluon - output))}"
 
 
 @pytest.mark.parametrize(
