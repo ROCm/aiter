@@ -392,14 +392,18 @@ namespace py = pybind11;
           "all_gather_reg(int fa, Tensor inp, Tensor! out) -> ()",                             \
           py::arg("_fa"),                                                                      \
           py::arg("inp"),                                                                      \
-          py::arg("out"));                                                                     \
+          py::arg("out"),                                                                      \
+          py::arg("last_dim_size"),                                                            \
+          py::arg("dim"));                                                                     \
     m.def("all_gather_unreg",                                                                  \
           &aiter::all_gather_unreg,                                                            \
           "all_gather_unreg(int fa, Tensor inp, Tensor reg_buffer, Tensor! out) -> ()",        \
           py::arg("_fa"),                                                                      \
           py::arg("inp"),                                                                      \
           py::arg("reg_buffer"),                                                               \
-          py::arg("out"));                                                                     \
+          py::arg("out"),                                                                      \
+          py::arg("last_dim_size"),                                                            \
+          py::arg("dim"));                                                                     \
     m.def("reduce_scatter",                                                                    \
           &aiter::reduce_scatter,                                                              \
           py::arg("_fa"),                                                                      \
