@@ -255,7 +255,7 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     impl_ptr = result.first->second.get();
 
     fmha_fwd_v3_args args;
-    int arg_size = sizeof(args);
+    size_t arg_size = sizeof(args);
     init_fmha_fwd_v3_args(args, a, cfg.ts_qo, arch_id);
 
     int bdx              = (a.hdim_q == 192 && a.hdim_v == 128) ? 256 : 512;
