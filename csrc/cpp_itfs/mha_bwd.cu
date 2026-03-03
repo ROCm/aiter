@@ -346,7 +346,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     int ts_odo;
     int ts_kv;
     int ts_dq;
-    int arg_size;
+    size_t arg_size;
 
     AiterAsmKernel* impl_ptr_pre    = nullptr;
     AiterAsmKernel* impl_ptr_dqdkdv = nullptr;
