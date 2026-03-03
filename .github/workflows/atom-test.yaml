@@ -55,7 +55,7 @@ jobs:
           - model_name: "gpt-oss-120b"
             label: MI355
             model_path: "openai/gpt-oss-120b"
-            extraArgs: "--kv_cache_dtype fp8"
+            extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3"
             env_vars: |
               ATOM_GPT_OSS_MODEL=1
             runner: linux-aiter-mi355-1
@@ -88,38 +88,6 @@ jobs:
               MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
           EOF
-
-      - name: Check System health
-        run: |
-            if command -v rocm-smi &> /dev/null; then
-              echo -e "\n===== ROCm GPU Overview ====="
-              sudo rocm-smi
-              echo -e "\n===== ROCm GPU Memory Status ====="
-              sudo rocm-smi --showmeminfo vram
-              echo -e "\n===== ROCm GPU Processes ====="
-              sudo rocm-smi --showpidgpus
-              sudo rocm-smi --showpids
-            else
-              echo "rocm-smi not found"
-            fi
-
-            #echo -e "\n===== Resetting GPU ====="
-            #sudo rocm-smi --gpureset -d 0
-
-            echo -e "\n===== System Memory Status ====="
-            free -h
-            echo -e "\n===== Memory usage by process (top 10) ====="
-            ps aux --sort=-%mem | head -11
-
-            echo -e "\n==== Docker Container Status ==="
-            docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Size}}"
-
-            echo -e "\n===== Python/PyTorch Processes ====="
-            ps aux | grep -E "python|torch" | grep -v grep || echo "No Python processes found"
-
-            # echo -e "\n===== Setting Memory Management Env Vars ====="
-            # echo "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
-            # echo "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" >> $GITHUB_ENV
 
       - name: Build the ATOM test image
         run: |
@@ -202,6 +170,12 @@ jobs:
             model_path="${{ matrix.model_path }}"
           fi
           echo "Model path: $model_path"
+
+          echo "========= Runner debug logs ==============="
+          rocm-smi --showmemuse
+          rocm-smi --showpids
+          ps aux
+          docker ps -a
 
           docker exec atom_aiter_test bash -lc "
             set -euo pipefail

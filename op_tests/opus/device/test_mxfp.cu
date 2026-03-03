@@ -19,12 +19,11 @@
  *   C = A @ B  (standard matmul, NOT swap_ab).
  */
 
-#include <hip/hip_runtime.h>
-#include <cstdio>
-#include <cstring>
 #include "opus/opus.hpp"
-#include "test_mxfp.h"
-
+#ifndef __HIP_DEVICE_COMPILE__
+// #include <hip/hip_runtime.h>   // replaced by hip_host_minimal.h for faster builds
+#include "hip_host_minimal.h"
+#include <cstdio>
 #define HIP_CALL(call) do { \
     hipError_t err = (call); \
     if (err != hipSuccess) { \
@@ -32,6 +31,7 @@
         return; \
     } \
 } while(0)
+#endif
 
 // Helper: extract one fp4 nibble (0=low, 1=high) from a packed fp4x2 byte
 __device__ inline unsigned char fp4_extract(unsigned char packed, int idx) {
@@ -53,9 +53,9 @@ __global__ void mxfp8_kernel(
     opus::fp32_t* __restrict__ ptr_c,        // C[M][N] row-major
     int scale_a, int scale_b)
 {
-#if defined(__gfx950__) || !defined(__HIP_DEVICE_COMPILE__)
+#if defined(__gfx950__)
     using namespace opus;
-    int lane = static_cast<int>(threadIdx.x);
+    int lane = static_cast<int>(__builtin_amdgcn_workitem_id_x());
 
     if constexpr (M == 32 && N == 32 && K == 64) {
         int lane32 = lane % 32;
@@ -138,9 +138,9 @@ __global__ void mxfp4_kernel(
     opus::fp32_t* __restrict__ ptr_c,         // C[M][N] row-major
     int scale_a, int scale_b)
 {
-#if defined(__gfx950__) || !defined(__HIP_DEVICE_COMPILE__)
+#if defined(__gfx950__)
     using namespace opus;
-    int lane = static_cast<int>(threadIdx.x);
+    int lane = static_cast<int>(__builtin_amdgcn_workitem_id_x());
     constexpr int A_BYTES_PER_ROW = K / 2;  // 2 fp4 values packed per byte
     constexpr int B_BYTES_PER_ROW = N / 2;
 
@@ -220,9 +220,19 @@ __global__ void mxfp4_kernel(
 #endif // gfx950 guard
 }
 
-// ---------------------------------------------------------------------------
-// Host launch functions
-// ---------------------------------------------------------------------------
+#if defined(__gfx950__)
+template __global__ void mxfp8_kernel<32, 32, 64>(
+    const opus::fp8_t*, const opus::fp8_t*, opus::fp32_t*, int, int);
+template __global__ void mxfp8_kernel<16, 16, 128>(
+    const opus::fp8_t*, const opus::fp8_t*, opus::fp32_t*, int, int);
+template __global__ void mxfp4_kernel<32, 32, 64>(
+    const unsigned char*, const unsigned char*, opus::fp32_t*, int, int);
+template __global__ void mxfp4_kernel<16, 16, 128>(
+    const unsigned char*, const unsigned char*, opus::fp32_t*, int, int);
+#endif
+
+#ifndef __HIP_DEVICE_COMPILE__
+// ── Host launch functions ───────────────────────────────────────────────────
 
 extern "C" void run_mxfp8_32x32x64(
     const void* d_a, const void* d_b, void* d_c, int scale_a, int scale_b)
@@ -275,3 +285,4 @@ extern "C" void run_mxfp4_16x16x128(
     HIP_CALL(hipGetLastError());
     HIP_CALL(hipDeviceSynchronize());
 }
+#endif // !__HIP_DEVICE_COMPILE__

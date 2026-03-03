@@ -870,23 +870,26 @@ namespace py = pybind11;
           py::arg("rng_state")    = std::nullopt, \
           py::arg("gen")          = std::nullopt);
 
-#define MHA_FWD_ASM_PYBIND                        \
-    m.def("fmha_v3_fwd",                          \
-          &aiter::torch_itfs::fmha_v3_fwd,        \
-          py::arg("q"),                           \
-          py::arg("k"),                           \
-          py::arg("v"),                           \
-          py::arg("dropout_p"),                   \
-          py::arg("softmax_scale"),               \
-          py::arg("is_causal"),                   \
-          py::arg("window_size_left"),            \
-          py::arg("window_size_right"),           \
-          py::arg("return_softmax_lse"),          \
-          py::arg("return_dropout_randval"),      \
-          py::arg("how_v3_bf16_cvt"),             \
-          py::arg("out")          = std::nullopt, \
-          py::arg("bias")         = std::nullopt, \
-          py::arg("alibi_slopes") = std::nullopt, \
+#define MHA_FWD_ASM_PYBIND                         \
+    m.def("fmha_v3_fwd",                           \
+          &aiter::torch_itfs::fmha_v3_fwd,         \
+          py::arg("q"),                            \
+          py::arg("k"),                            \
+          py::arg("v"),                            \
+          py::arg("dropout_p"),                    \
+          py::arg("softmax_scale"),                \
+          py::arg("is_causal"),                    \
+          py::arg("window_size_left"),             \
+          py::arg("window_size_right"),            \
+          py::arg("return_softmax_lse"),           \
+          py::arg("return_dropout_randval"),       \
+          py::arg("how_v3_bf16_cvt"),              \
+          py::arg("out")          = std::nullopt,  \
+          py::arg("bias")         = std::nullopt,  \
+          py::arg("alibi_slopes") = std::nullopt,  \
+          py::arg("q_descale")     = std::nullopt, \
+          py::arg("k_descale")     = std::nullopt, \
+          py::arg("v_descale")     = std::nullopt, \
           py::arg("gen")          = std::nullopt);
 
 #define MHA_FWD_PYBIND                             \
@@ -963,6 +966,9 @@ namespace py = pybind11;
           py::arg("block_table")         = std::nullopt, \
           py::arg("bias")                = std::nullopt, \
           py::arg("alibi_slopes")        = std::nullopt, \
+          py::arg("q_descale")           = std::nullopt, \
+          py::arg("k_descale")           = std::nullopt, \
+          py::arg("v_descale")           = std::nullopt, \
           py::arg("gen")                 = std::nullopt, \
           py::arg("cu_seqlens_q_padded") = std::nullopt, \
           py::arg("cu_seqlens_k_padded") = std::nullopt);
@@ -1856,3 +1862,42 @@ namespace py = pybind11;
           py::arg("input"),                  \
           py::arg("weight"),                 \
           py::arg("epsilon"));
+
+#define MHC_PYBIND                              \
+    m.def("mhc_pre_gemm_sqrsum",                \
+          &aiter::mhc_pre_gemm_sqrsum,          \
+          "mhc_pre_gemm_sqrsum",                \
+          py::arg("out"),                       \
+          py::arg("sqrsum"),                    \
+          py::arg("x"),                         \
+          py::arg("fn"),                        \
+          py::arg("tile_k") = 128);             \
+    m.def("mhc_pre_big_fuse",                   \
+          &aiter::mhc_pre_big_fuse,             \
+          "mhc_pre_big_fuse",                   \
+          py::arg("post_mix"),                  \
+          py::arg("comb_mix"),                  \
+          py::arg("layer_input"),               \
+          py::arg("gemm_out_mul"),              \
+          py::arg("gemm_out_sqrsum"),           \
+          py::arg("hc_scale"),                  \
+          py::arg("hc_base"),                   \
+          py::arg("residual"),                  \
+          py::arg("rms_eps")            = 1e-6, \
+          py::arg("hc_pre_eps")         = 1e-6, \
+          py::arg("hc_sinkhorn_eps")    = 1e-6, \
+          py::arg("hc_post_mult_value") = 1.0,  \
+          py::arg("sinkhorn_repeat")    = 20);
+#define CAUSAL_CONV1D_UPDATE_PYBIND                                                 \
+      m.def("causal_conv1d_update",                                                 \
+            &aiter::causal_conv1d_update,                                           \
+            "Causal 1D convolution update with state (for inference/decoding).",    \
+            py::arg("x"),                                                           \
+            py::arg("conv_state"),                                                  \
+            py::arg("weight"),                                                      \
+            py::arg("bias"),                                                        \
+            py::arg("out"),                                                         \
+            py::arg("use_silu"),                                                    \
+            py::arg("cache_seqlens")      = torch::Tensor(),                        \
+            py::arg("conv_state_indices") = torch::Tensor(),                        \
+            py::arg("pad_slot_id")        = -1);
