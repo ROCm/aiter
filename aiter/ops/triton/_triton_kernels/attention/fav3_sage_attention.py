@@ -425,7 +425,7 @@ def _sage_fwd_mask(
         # IMPORTANT: Handle the case where all values are -inf
         # When m_ij = -inf and qk = -inf, subtraction gives NaN
         # We need to handle this explicitly
-        if USE_SLIDING_WINDOW:
+        if USE_SLIDING_WINDOW or IS_CAUSAL or USE_BIAS:
             # Check if this block has any valid values (m_ij != -inf)
             # For rows where everything is -inf, set q_shifted to -inf (not NaN)
             q_shifted = tl.where(
@@ -548,7 +548,11 @@ def _sage_fwd_mask(
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
         # store the diff in maxes to adjust acc and li as we discover new maxes
-        m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
+
+        if USE_SLIDING_WINDOW or IS_CAUSAL or USE_BIAS:
+            m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
+        else:
+            m_diff = m_i - m_ij
         if USE_EXP2:
             # alpha = tl.math.exp2(m_diff * RCP_LN2)
             alpha = tl.math.exp2(m_diff)
