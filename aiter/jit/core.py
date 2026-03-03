@@ -14,6 +14,7 @@ import time
 import traceback
 import types
 import typing
+import yaml
 from typing import Any, Callable, List, Optional
 
 from packaging.version import Version, parse
@@ -322,7 +323,9 @@ CK_3RDPARTY_DIR = os.environ.get(
 )
 CK_HELPER_DIR = f"{AITER_META_DIR}/3rdparty/ck_helper"
 CK_DIR = CK_3RDPARTY_DIR
-HIP_KITTENS_DIR = f"{AITER_META_DIR}/3rdparty/HipKittens"
+HIP_KITTENS_DIR = os.environ.get(
+    "HIP_KITTENS_DIR", f"{AITER_META_DIR}/3rdparty/HipKittens"
+)
 
 
 @functools.lru_cache(maxsize=1)
@@ -518,6 +521,137 @@ def get_module(md_name):
 rebuilded_list = ["module_aiter_enum"]
 
 
+def clone_3rdparty(third_party: str) -> None:
+    if third_party == "HipKittens":
+        dir_path = HIP_KITTENS_DIR
+    elif third_party == "ComposableKernel":
+        dir_path = CK_DIR
+    else:
+        dir_path = f"{AITER_META_DIR}/3rdparty/{third_party}"
+
+    def MainFunc():
+        if not os.path.exists(dir_path):
+            import subprocess
+
+            def check_git_version(required_major, required_minor):
+                try:
+                    output = subprocess.check_output(
+                        ["git", "--version"], text=True
+                    ).strip()
+                    import re
+
+                    m = re.search(r"(\d+)\.(\d+)", output)
+                    if m:
+                        major, minor = int(m.group(1)), int(m.group(2))
+                        return (major > required_major) or (
+                            major == required_major and minor >= required_minor
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to check git version: {e}")
+                return False
+
+            logger.info(f"Cloning 3rdparty {third_party} to {dir_path}")
+            # Check git version for --revision flag support (>=2.49)
+            if not check_git_version(2, 49):
+                logger.warning(
+                    "Your git version does not support the --revision flag (requires >=2.49). Slow path is used for cloning 3rdparty."
+                )
+                subprocess.call(
+                    [
+                        "git",
+                        "clone",
+                        "-q",
+                        third_party_info["url"],
+                        dir_path,
+                    ]
+                )
+                subprocess.call(
+                    [
+                        "git",
+                        "-C",
+                        dir_path,
+                        "reset",
+                        "-q",
+                        "--hard",
+                        third_party_info["commit"],
+                    ]
+                )
+                subprocess.call(
+                    [
+                        "git",
+                        "-C",
+                        dir_path,
+                        "submodule",
+                        "update",
+                        "-q",
+                        "--init",
+                        "--recursive",
+                    ]
+                )
+            else:
+                # Save current git config value for advice.detachedHead, set to false
+                prev_detached_head = None
+                try:
+                    try:
+                        prev_detached_head = subprocess.check_output(
+                            ["git", "config", "--get", "advice.detachedHead"], text=True
+                        ).strip()
+                    except subprocess.CalledProcessError:
+                        prev_detached_head = None  # not set before
+                    # Set to false before clone
+                    subprocess.call(
+                        ["git", "config", "--global", "advice.detachedHead", "false"]
+                    )
+
+                    subprocess.call(
+                        [
+                            "git",
+                            "clone",
+                            "-q",
+                            f"--revision={third_party_info['commit']}",
+                            "--depth=1",
+                            "--recurse-submodules",
+                            third_party_info["url"],
+                            dir_path,
+                        ]
+                    )
+                finally:
+                    # Restore config after clone
+                    if prev_detached_head is not None:
+                        subprocess.call(
+                            [
+                                "git",
+                                "config",
+                                "--global",
+                                "advice.detachedHead",
+                                prev_detached_head,
+                            ]
+                        )
+                    else:
+                        subprocess.call(
+                            [
+                                "git",
+                                "config",
+                                "--global",
+                                "--unset",
+                                "advice.detachedHead",
+                            ]
+                        )
+
+    with open(f"{AITER_META_DIR}/3rdparty/3rdparty_info.yaml", "r") as f:
+        third_party_info = yaml.safe_load(f)
+
+    if third_party in third_party_info:
+        third_party_info = third_party_info[third_party]
+        lock_path = f"{bd_dir}/lock_3rdparty_clone_{third_party}"
+        mp_lock(lockPath=lock_path, MainFunc=MainFunc)
+    # TODO: ComposableKernel will be supported in the future
+    elif third_party != "ComposableKernel":
+        raise ValueError(
+            f"Invalid third party: {third_party}! Please check {AITER_META_DIR}/3rdparty/3rdparty_info.yaml"
+        )
+
+
 def rm_module(md_name):
     os.system(f"rm -rf {get_user_jit_dir()}/{md_name}.so")
 
@@ -538,12 +672,16 @@ def build_module(
     is_python_module,
     is_standalone,
     torch_exclude,
+    third_party,
     hipify=False,
 ):
     os.makedirs(bd_dir, exist_ok=True)
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
     target_name = f"{md_name}.so" if not is_standalone else md_name
+
+    for tp in third_party:
+        clone_3rdparty(tp)
 
     def MainFunc():
         if AITER_REBUILD == 1:
@@ -724,6 +862,7 @@ def get_args_of_build(ops_name: str, exclude=[]):
         "torch_exclude": False,
         "hip_clang_path": None,
         "blob_gen_cmd": "",
+        "3rdparty": [],
     }
 
     def convert(d_ops: dict):
@@ -847,6 +986,7 @@ def compile_ops(
                 torch_exclude = d_args["torch_exclude"]
                 hipify = d_args.get("hipify", False)
                 hip_clang_path = d_args.get("hip_clang_path", None)
+                third_party = d_args.get("third_party", [])
                 prev_hip_clang_path = None
                 if hip_clang_path is not None and os.path.exists(hip_clang_path):
                     prev_hip_clang_path = os.environ.get("HIP_CLANG_PATH", None)
@@ -864,6 +1004,7 @@ def compile_ops(
                     is_python_module,
                     is_standalone,
                     torch_exclude,
+                    third_party,
                     hipify,
                 )
 
