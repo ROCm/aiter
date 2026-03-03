@@ -3,14 +3,7 @@
 
 import torch
 import pytest
-from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
-    gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
-    gemm_a8w8_blockscale_preshuffle as triton_gemm_a8w8_blockscale_preshuffle,
-)
 from aiter.ops.triton.gemm_a8w8_blockscale import (
-    gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale_gfx12,
-)
-from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
 )
 from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
@@ -191,9 +184,7 @@ def generate_gemm_a8w8_blockscale_inputs(
 @pytest.mark.parametrize(
     "impl",
     [
-        # "gluon",
-        "triton",
-        "triton_shuffle",
+        "gluon",
     ],
 )
 def test_gemm(dtype, M, N, K, layout, output, impl: str):
@@ -202,7 +193,7 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
 
     block_shape_n, block_shape_k = block_shape
 
-    if impl == "gluon" and DEVICE_ARCH not in ("gfx950",):
+    if impl == "gluon" and DEVICE_ARCH not in ("gfx950", "gfx1250"):
         pytest.skip(
             "Gluon implementation is not supported on this device (requires CDNA4/gfx950)."
         )
@@ -241,18 +232,12 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
         )
     )
 
-    a = run_torch(x, weight, x_scale, w_scale, dtype)
-
-    if impl == "gluon" and DEVICE_ARCH in ("gfx1250",):
-        impl = gluon_gemm_a8w8_blockscale_gfx12
-    elif impl == "gluon":
+    if impl == "gluon":
         impl = gluon_gemm_a8w8_blockscale
-    elif impl == "triton":
-        impl = triton_gemm_a8w8_blockscale
-    elif impl == "triton_shuffle":
-        impl = triton_gemm_a8w8_blockscale_preshuffle
     else:
         raise ValueError(f"Unknown implementation: {impl}")
+    
+    a = run_torch(x, weight, x_scale, w_scale, dtype)
 
     b = run_triton(x, weight_triton, x_scale_shuffled, w_scale, dtype, y, impl)
 
