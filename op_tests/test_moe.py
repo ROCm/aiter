@@ -367,7 +367,7 @@ parser.add_argument(
     "--token",
     type=int,
     nargs="*",
-    default=128,
+    default=[128],
     help="""Token Num.
     e.g.: -m 128""",
 )
@@ -376,7 +376,7 @@ parser.add_argument(
     "--hidden_dim",
     type=int,
     nargs="*",
-    default=4096,
+    default=[4096],
     help="""Hidden states dim.
     e.g.: -hd 4096""",
 )
@@ -385,7 +385,7 @@ parser.add_argument(
     "--inter_dim",
     type=int,
     nargs="*",
-    default=1024,
+    default=[1024],
     help="""Intermediate dim.
     e.g.: -id 1024""",
 )
