@@ -1,0 +1,38 @@
+{
+    "1": {
+        "block_n": 128, "block_k": 256, "num_warps": 4,
+        "num_stages": 3, "group_m": 4, "waves_per_eu": 0
+    },
+    "2": {
+        "block_n": 128, "block_k": 256, "num_warps": 4,
+        "num_stages": 3, "group_m": 4, "waves_per_eu": 0
+    },
+    "4": {
+        "block_n": 128, "block_k": 256, "num_warps": 4,
+        "num_stages": 3, "group_m": 4, "waves_per_eu": 0
+    },
+    "8": {
+        "block_n": 128, "block_k": 256, "num_warps": 4,
+        "num_stages": 3, "group_m": 4, "waves_per_eu": 0
+    },
+    "16": {
+        "block_n": 128, "block_k": 256, "num_warps": 4,
+        "num_stages": 3, "group_m": 4, "waves_per_eu": 0
+    },
+    "32": {
+        "block_n": 256, "block_k": 256, "num_warps": 8,
+        "num_stages": 3, "group_m": 4, "waves_per_eu": 2
+    },
+    "64": {
+        "block_n": 256, "block_k": 256, "num_warps": 8,
+        "num_stages": 3, "group_m": 4, "waves_per_eu": 0
+    },
+    "128": {
+        "block_n": 256, "block_k": 256, "num_warps": 8,
+        "num_stages": 3, "group_m": 4, "waves_per_eu": 0
+    },
+    "256": {
+        "block_n": 256, "block_k": 256, "num_warps": 8,
+        "num_stages": 3, "group_m": 4, "waves_per_eu": 0
+    }
+}

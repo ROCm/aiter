@@ -63,89 +63,107 @@ def allocate_output(
     return matmul_output, final_output
 
 
-def _is_gfx950():
+_moe_a8w4_config_cache = {}
+
+
+def _load_moe_a8w4_config():
+    """Load per-device tuned configs from JSON files in aiter/configs/moe_a8w4_configs/."""
+    if _moe_a8w4_config_cache:
+        return _moe_a8w4_config_cache.get("data")
+
+    import json
+    import os
     try:
         from aiter.jit.utils.chip_info import get_gfx
-        return get_gfx() == "gfx950"
+        gfx = get_gfx()
     except Exception:
-        return False
+        gfx = None
+
+    if gfx is None:
+        _moe_a8w4_config_cache["data"] = None
+        return None
+
+    config_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))),
+        "configs", "moe_a8w4_configs"
+    )
+    config_file = os.path.join(config_dir, f"{gfx}.json")
+
+    if not os.path.exists(config_file):
+        _moe_a8w4_config_cache["data"] = None
+        return None
+
+    with open(config_file) as f:
+        data = json.load(f)
+
+    _moe_a8w4_config_cache["data"] = data
+    return data
 
 
 def get_kernel_config(m, n, k, routing_data):
     block_m = routing_data.block_m
-    group_m = 4
     num_xcds = 8
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     split_k = 1
+
+    tuned = _load_moe_a8w4_config()
+    if tuned is not None:
+        best_key = None
+        for key in sorted(tuned.keys(), key=int):
+            if int(key) <= block_m:
+                best_key = key
+        if best_key is not None:
+            cfg = tuned[best_key]
+            return {
+                "block_m": block_m,
+                "block_n": cfg["block_n"],
+                "block_k": cfg.get("block_k", 256),
+                "num_warps": cfg["num_warps"],
+                "num_stages": cfg["num_stages"],
+                "group_m": cfg.get("group_m", 4),
+                "xcd_swizzle": xcd_swizzle,
+                "w_cache_modifier": w_cache_modifier,
+                "split_k": split_k,
+                "waves_per_eu": cfg.get("waves_per_eu", 0),
+                "matrix_instr_nonkdim": 16,
+                "kpack": 1,
+            }
+
+    # Default heuristics (no tuned config found)
+    group_m = 4
     block_k = 256
+    num_stages = 2
+    waves_per_eu = 0
 
-    if _is_gfx950():
-        num_stages = 3
-        waves_per_eu = 2 if block_m <= 32 else 0
+    if block_m == 16:
+        block_n = 128
+        num_warps = 4
 
-        if block_m == 16:
-            block_n = 128
-            num_warps = 4
-
+        grid_m = routing_data.n_blocks(m, block_m)
+        grid_n = triton.cdiv(n, block_n)
+        grid = grid_m * grid_n * split_k
+        while block_n >= 64 and grid < 256:
+            block_n = block_n // 2
             grid_m = routing_data.n_blocks(m, block_m)
             grid_n = triton.cdiv(n, block_n)
             grid = grid_m * grid_n * split_k
-            while block_n >= 64 and grid < 256:
-                block_n = block_n // 2
-                grid_m = routing_data.n_blocks(m, block_m)
-                grid_n = triton.cdiv(n, block_n)
-                grid = grid_m * grid_n * split_k
 
-        elif block_m == 32:
-            if n <= 1024:
-                block_n = 128
-                num_warps = 4
-            elif n <= 4096:
-                block_n = 256
-                num_warps = 8
-            else:
-                block_n = 256
-                num_warps = 8
-
-        elif block_m == 64:
-            block_n = 256
-            num_warps = 8
-
-        else:
-            block_n = 256
-            num_warps = 8
-    else:
-        num_stages = 2
-        waves_per_eu = 0
-
-        if block_m == 16:
+    elif block_m == 32:
+        if n <= 1024:
             block_n = 128
             num_warps = 4
-
-            grid_m = routing_data.n_blocks(m, block_m)
-            grid_n = triton.cdiv(n, block_n)
-            grid = grid_m * grid_n * split_k
-            while block_n >= 64 and grid < 256:
-                block_n = block_n // 2
-                grid_m = routing_data.n_blocks(m, block_m)
-                grid_n = triton.cdiv(n, block_n)
-                grid = grid_m * grid_n * split_k
-
-        elif block_m == 32:
-            if n <= 1024:
-                block_n = 128
-                num_warps = 4
-            elif n <= 4096:
-                block_n = 256
-                num_warps = 8
-            else:
-                block_n = 512
-                num_warps = 8
-
+        elif n <= 4096:
+            block_n = 256
+            num_warps = 8
         else:
             block_n = 512
             num_warps = 8
+
+    else:
+        block_n = 512
+        num_warps = 8
 
     ret = {
         "block_m": block_m,
