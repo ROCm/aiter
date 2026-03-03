@@ -863,7 +863,7 @@ def get_args_of_build(ops_name: str, exclude=[]):
         "torch_exclude": False,
         "hip_clang_path": None,
         "blob_gen_cmd": "",
-        "3rdparty": [],
+        "third_party": [],
     }
 
     def convert(d_ops: dict):
@@ -912,6 +912,7 @@ def get_args_of_build(ops_name: str, exclude=[]):
                         "flags_extra_hip": single_ops["flags_extra_hip"],
                         "extra_include": single_ops["extra_include"],
                         "blob_gen_cmd": single_ops["blob_gen_cmd"],
+                        "third_party": single_ops["third_party"],
                     }
                     for k in d_all_ops.keys():
                         if isinstance(single_ops[k], list):

@@ -199,6 +199,7 @@ class NinjaBuildExtension(build_ext):
                                 "flags_extra_hip": base_args["flags_extra_hip"],
                                 "extra_include": base_args["extra_include"],
                                 "blob_gen_cmd": v["blob_gen_cmd"],
+                                "third_party": base_args["third_party"],
                             }
                         )
                     all_opts_args_build.extend(extra_args_build)
@@ -232,7 +233,7 @@ class NinjaBuildExtension(build_ext):
                         is_python_module=True,
                         is_standalone=False,
                         torch_exclude=False,
-                        third_party=one_opt_args.get("third_party"),
+                        third_party=one_opt_args["third_party"],
                     )
 
                 prebuid_thread_num = 5
