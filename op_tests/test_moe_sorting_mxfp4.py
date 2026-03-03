@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 import aiter
 from aiter.test_common import checkAllclose, benchmark, run_perftest, perftest
@@ -84,11 +84,6 @@ def test_moe_mxfp4_sort(dtype, token_num, model_dim, E, topk, block_size, stage)
     return {"us_ref": us_ref, "us": us, "err": err}
 
 
-l_dtype = ["bf16"]
-list_dim = [4096, 6144, 8192]
-list_Expert = [32, 256, 257, 512]
-list_topk = [5, 8]
-list_m = [1, 31, 64, 128, 256, 10000, 163840]
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -96,71 +91,59 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["bf16"]],
+    nargs="*",
+    default=[dtypes.d_dtypes["bf16"]],
+    metavar="{bf16}",
     help="""Data type.
     e.g.: -d bf16""",
 )
 parser.add_argument(
     "-dim",
-    choices=list_dim,
     type=int,
-    default=None,
+    nargs="*",
+    default=[4096, 6144, 8192],
     help="""Model dimension.
     e.g.: -dim 4096""",
 )
 parser.add_argument(
     "-e",
     "--expert",
-    choices=list_Expert,
     type=int,
-    default=None,
+    nargs="*",
+    default=[32, 256, 257, 512],
     help="""Number of experts.
     e.g.: -e 32""",
 )
 parser.add_argument(
     "-t",
     "--topk",
-    choices=list_topk,
     type=int,
-    default=None,
+    nargs="*",
+    default=[5, 8],
     help="""Number of top experts.
     e.g.: -t 5""",
 )
 parser.add_argument(
     "-m",
     type=int,
-    default=None,
+    nargs="*",
+    default=[1, 31, 64, 128, 256, 10000, 163840],
     help="""M of mnk.
     e.g.: -m 64""",
 )
 
 args = parser.parse_args()
-if args.dtype is None:
-    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-else:
-    l_dtype = [dtypes.d_dtypes[args.dtype]]
-
-if args.dim is not None:
-    list_dim = [args.dim]
-if args.expert is not None:
-    list_Expert = [args.expert]
-if args.topk is not None:
-    list_topk = [args.topk]
-if args.m is not None:
-    list_m = [args.m]
 
 df = []
-for dtype in l_dtype:
+for dtype in args.dtype:
     for (
         dim,
         E,
         topk,
         m,
-    ) in itertools.product(list_dim, list_Expert, list_topk, list_m):
+    ) in itertools.product(args.dim, args.expert, args.topk, args.m):
         ret = test_moe_mxfp4_sort(dtype, m, dim, E, topk, 32, "stage1")
         df.append(ret)
 df = pd.DataFrame(df)
@@ -168,13 +151,13 @@ df_md = df.to_markdown(index=False)
 aiter.logger.info("moe_sorting_mxfp4_stage1 summary (markdown):\n%s", df_md)
 
 df = []
-for dtype in l_dtype:
+for dtype in args.dtype:
     for (
         dim,
         E,
         topk,
         m,
-    ) in itertools.product(list_dim, list_Expert, list_topk, list_m):
+    ) in itertools.product(args.dim, args.expert, args.topk, args.m):
         ret = test_moe_mxfp4_sort(dtype, m, dim, E, topk, 32, "stage2")
         df.append(ret)
 df = pd.DataFrame(df)
