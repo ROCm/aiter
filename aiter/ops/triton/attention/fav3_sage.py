@@ -178,7 +178,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             ctx.input_dtype = q.dtype
             ctx.layout = layout
 
-        return out
+        return out, softmax_lse
 
     @staticmethod
     def backward(ctx, dout: torch.Tensor):
