@@ -35,7 +35,7 @@ def select_2d_config(
     else:
         num_stages_2d = 3
         num_warps = 2
-        TILE_SIZE = block_size
+        TILE_SIZE = 64
 
     if max_seqlen_q >= 256:
         BLOCK_M = 128
@@ -54,11 +54,11 @@ def select_2d_config(
 
 
 def select_3d_config(
-    head_size, block_size, element_size, max_seqlen_k, target_num_prgms, num_2d_prgms
+    head_size, block_size, element_size, max_seqlen_k, max_seqlen_q, q_len, ALL_DECODE, target_num_prgms, num_2d_prgms
 ):
     reduce_num_warps = 2
     attn_warps = 2
-    TILE_SIZE = block_size
+    TILE_SIZE = 64
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     num_segments = math.ceil(target_num_prgms / num_2d_prgms)
     num_segments = triton.next_power_of_2(num_segments)
@@ -72,7 +72,7 @@ def select_3d_config(
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": attn_warps,
         "num_stages": 1,
-        "waves_per_eu": 2,
+        "waves_per_eu": 3,
     }
     reduce_config = {
         "TILE_SIZE": TILE_SIZE,
@@ -139,10 +139,16 @@ def unified_attention(
     num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
-
+    MAX_SPEC_DECODE_COUNT = 4
+    # Cover the speculative decode case
+    # TODO: requires a better way to check for speculative decode
+    ALL_DECODE = (max_seqlen_q <= MAX_SPEC_DECODE_COUNT) and (max_seqlen_q * num_seqs == q.shape[0])
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
+    # if speculative decode, we need to cover all queries from same sequence together
+    if ALL_DECODE:
+        BLOCK_M = BLOCK_M * max_seqlen_q
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     assert BLOCK_Q >= 1
     # Ideally we would launch with kernel with:
@@ -158,7 +164,7 @@ def unified_attention(
     total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
-    ALL_DECODE = max_seqlen_q == 1
+
     # if batch contains a prefill
     if use_2d_kernel(
         head_size,
@@ -239,6 +245,9 @@ def unified_attention(
             block_size,
             q.element_size(),
             max_seqlen_k,
+            max_seqlen_q,
+            q.shape[0],
+            ALL_DECODE,
             target_num_prgms,
             num_2d_prgms,
         )
