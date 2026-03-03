@@ -17,6 +17,9 @@ def fused_qkv_split_qk_rope(
     offsets: torch.Tensor = None,
     reuse_freqs_front_part: bool = True,
     nope_first: bool = False,
+    attn_output_gate: bool = False,
+    rms_norm_qk: bool = False,
+    eps: float = 1e-5
 ):
     T = qkv.shape[0]
     q_size = qh * head_dim
@@ -27,6 +30,10 @@ def fused_qkv_split_qk_rope(
     q = torch.empty((qkv.shape[0], qh, head_dim), dtype=qkv.dtype, device=qkv.device)
     k = torch.empty((qkv.shape[0], kvh, head_dim), dtype=qkv.dtype, device=qkv.device)
     v = torch.empty((qkv.shape[0], kvh, head_dim), dtype=qkv.dtype, device=qkv.device)
+    if attn_output_gate:
+        gate = q.detach().clone()
+    else:
+        gate = None
 
     if cos.shape[-1] == head_dim // 2:
         if reuse_freqs_front_part:
@@ -38,7 +45,10 @@ def fused_qkv_split_qk_rope(
     else:
         have_nope = False
 
-    assert qkv.shape[-1] == q_size + 2 * kv_size, "Shape error"
+    if attn_output_gate:
+        assert qkv.shape[-1] == 2 * q_size + 2 * kv_size, "Shape error"
+    else:
+        assert qkv.shape[-1] == q_size + 2 * kv_size, "Shape error"
     assert head_dim // ((2 if have_nope else 1)) == triton.next_power_of_2(
         head_dim // ((2 if have_nope else 1))
     ), "head_dim should be power of 2"
@@ -62,9 +72,11 @@ def fused_qkv_split_qk_rope(
         positions,
         offsets,
         q,
+        gate,
         k,
         v,
         T,
+        eps,
         *qkv.stride(),
         cos.stride(0),
         cos.stride(-1),
@@ -77,6 +89,8 @@ def fused_qkv_split_qk_rope(
         IS_NEOX=is_neox,
         HAVE_POS=(positions is not None),
         HAVE_OFFS=(offsets is not None),
+        ENABLE_GATED_Q=attn_output_gate,
+        RMS_NORM_QK=rms_norm_qk,
         QH=qh,
         KVH=kvh,
         BLOCK_T=BLOCK_T,
@@ -86,4 +100,7 @@ def fused_qkv_split_qk_rope(
         waves_per_eu=waves_per_eu,
     )
 
-    return q, k, v
+    if attn_output_gate:
+        return q, gate, k, v 
+    else:
+        return q, k, v

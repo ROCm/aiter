@@ -11,9 +11,11 @@ def _fused_qkv_split_qk_rope_kernel(
     pos_ptr,
     off_ptr,
     q_ptr,
+    gate_ptr,
     k_ptr,
     v_ptr,
     T,
+    eps,
     stride_qkv_t,
     stride_qkv_d,
     stride_cos_t,
@@ -31,6 +33,8 @@ def _fused_qkv_split_qk_rope_kernel(
     IS_NEOX: tl.constexpr,
     HAVE_POS: tl.constexpr,
     HAVE_OFFS: tl.constexpr,
+    ENABLE_GATED_Q: tl.constexpr,
+    RMS_NORM_QK: tl.constexpr,
     QH: tl.constexpr,
     KVH: tl.constexpr,
     BLOCK_T: tl.constexpr,
@@ -114,6 +118,23 @@ def _fused_qkv_split_qk_rope_kernel(
     )
     q = tl.load(qkv_ptr + q_in_offs, mask=x_mask)
 
+    if RMS_NORM_QK:
+        # RMS Norm Q
+        q_f32 = q.to(tl.float32)
+        q_sq_sum = tl.sum(q_f32 * q_f32, axis=1)
+        q_rsqrt = tl.rsqrt(q_sq_sum / BLOCK_D + eps)
+        
+        q_normed = q_f32 * q_rsqrt[:, None]
+        q = q_normed.to(q.dtype)
+
+    if ENABLE_GATED_Q:
+        Q_SIZE = QH * BLOCK_D
+        gate_in_offs = (
+            t_offs[:, None] * stride_qkv_t
+            + (Q_SIZE + H_OFFS_SIZE * offs_nope_ratio + d_offs)[None, :] * stride_qkv_d
+        )
+        gate = tl.load(qkv_ptr + gate_in_offs, mask=x_mask)
+
     if IS_NEOX:
         q_rotated = _get_neox_rotated_x(
             q, qk_rotated_mask, BLOCK_T, BLOCK_D, BLOCK_D_HALF
@@ -130,6 +151,9 @@ def _fused_qkv_split_qk_rope_kernel(
     q = q.to(q_ptr.dtype.element_ty)
     tl.store(q_ptr + q_out_offs, q, mask=x_mask)
 
+    if ENABLE_GATED_Q:
+        tl.store(gate_ptr + q_out_offs, gate, mask=x_mask)
+
     if HAVE_NOPE:
         if NOPE_FIRST:
             q = tl.load(qkv_ptr + q_in_offs - BLOCK_D * stride_qkv_d, mask=x_mask)
@@ -139,7 +163,11 @@ def _fused_qkv_split_qk_rope_kernel(
             tl.store(q_ptr + q_out_offs + BLOCK_D * stride_q_d, q, mask=x_mask)
 
     if hq < KVH:
-        Q_SIZE = QH * BLOCK_D
+        Q_HEAD_DIM_STRIDE_MULT = 1
+        if ENABLE_GATED_Q:
+            Q_HEAD_DIM_STRIDE_MULT = 2
+        Q_HEAD_SIZE_IN = BLOCK_D * Q_HEAD_DIM_STRIDE_MULT
+        Q_SIZE = QH * Q_HEAD_SIZE_IN
         KV_SIZE = KVH * BLOCK_D
         k_in_offs = (
             t_offs[:, None] * stride_qkv_t
@@ -153,6 +181,15 @@ def _fused_qkv_split_qk_rope_kernel(
         )
         k = tl.load(qkv_ptr + k_in_offs, mask=x_mask)
         v = tl.load(qkv_ptr + v_in_offs, mask=x_mask)
+
+        if RMS_NORM_QK:
+            # RMS Norm K
+            k_f32 = k.to(tl.float32)
+            k_sq_sum = tl.sum(k_f32 * k_f32, axis=1)
+            k_rsqrt = tl.rsqrt(k_sq_sum / BLOCK_D + eps)
+            
+            k_normed = k_f32 * k_rsqrt[:, None]
+            k = k_normed.to(k.dtype)
 
         if IS_NEOX:
             k_rotated = _get_neox_rotated_x(
