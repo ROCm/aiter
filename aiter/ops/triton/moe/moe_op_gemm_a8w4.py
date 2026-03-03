@@ -63,43 +63,89 @@ def allocate_output(
     return matmul_output, final_output
 
 
+def _is_gfx950():
+    try:
+        from aiter.jit.utils.chip_info import get_gfx
+        return get_gfx() == "gfx950"
+    except Exception:
+        return False
+
+
 def get_kernel_config(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
     num_xcds = 8
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_stages = 2
     split_k = 1
     block_k = 256
 
-    if block_m == 16:
-        block_n = 128
-        num_warps = 4
+    if _is_gfx950():
+        num_stages = 3
+        waves_per_eu = 2 if block_m <= 32 else 0
 
-        grid_m = routing_data.n_blocks(m, block_m)
-        grid_n = triton.cdiv(n, block_n)
-        grid = grid_m * grid_n * split_k
-        while block_n >= 64 and grid < 256:
-            block_n = block_n // 2
+        if block_m == 16:
+            block_n = 128
+            num_warps = 4
+
             grid_m = routing_data.n_blocks(m, block_m)
             grid_n = triton.cdiv(n, block_n)
             grid = grid_m * grid_n * split_k
+            while block_n >= 64 and grid < 256:
+                block_n = block_n // 2
+                grid_m = routing_data.n_blocks(m, block_m)
+                grid_n = triton.cdiv(n, block_n)
+                grid = grid_m * grid_n * split_k
 
-    elif block_m == 32:
-        if n <= 1024:
-            block_n = 128
-            num_warps = 4
-        elif n <= 4096:
+        elif block_m == 32:
+            if n <= 1024:
+                block_n = 128
+                num_warps = 4
+            elif n <= 4096:
+                block_n = 256
+                num_warps = 8
+            else:
+                block_n = 256
+                num_warps = 8
+
+        elif block_m == 64:
             block_n = 256
             num_warps = 8
+
+        else:
+            block_n = 256
+            num_warps = 8
+    else:
+        num_stages = 2
+        waves_per_eu = 0
+
+        if block_m == 16:
+            block_n = 128
+            num_warps = 4
+
+            grid_m = routing_data.n_blocks(m, block_m)
+            grid_n = triton.cdiv(n, block_n)
+            grid = grid_m * grid_n * split_k
+            while block_n >= 64 and grid < 256:
+                block_n = block_n // 2
+                grid_m = routing_data.n_blocks(m, block_m)
+                grid_n = triton.cdiv(n, block_n)
+                grid = grid_m * grid_n * split_k
+
+        elif block_m == 32:
+            if n <= 1024:
+                block_n = 128
+                num_warps = 4
+            elif n <= 4096:
+                block_n = 256
+                num_warps = 8
+            else:
+                block_n = 512
+                num_warps = 8
+
         else:
             block_n = 512
             num_warps = 8
-
-    else:
-        block_n = 512
-        num_warps = 8
 
     ret = {
         "block_m": block_m,
@@ -111,7 +157,7 @@ def get_kernel_config(m, n, k, routing_data):
         "xcd_swizzle": xcd_swizzle,
         "w_cache_modifier": w_cache_modifier,
         "split_k": split_k,
-        "waves_per_eu": 0,
+        "waves_per_eu": waves_per_eu,
         "matrix_instr_nonkdim": 16,
         "kpack": 1,
     }
