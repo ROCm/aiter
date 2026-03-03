@@ -268,11 +268,21 @@ def test_fmoe_lqq(
         )
     os.environ["AITER_USE_FLYDSL"] = old_flydsl
 
-    ######################################################################################
-    # torch_moe reference uses fp32, while kernels use int8*uint4 quantized arithmetic
-    # with intermediate re-quantization. Use relaxed tolerance for kernel vs fp32 ref.
+    def calc_diff(x: torch.Tensor, y: torch.Tensor):
+        x, y = x.double(), y.double()
+        denominator = (x * x + y * y).sum()
+        sim = torch.cosine_similarity(x.flatten(), y.flatten(), dim=0)
+        return 1 - sim
+
+    def checkLogitsDiff(x: torch.Tensor, y: torch.Tensor, tol=1e-3):
+        cos_diff = calc_diff(x, y)
+        aiter.logger.info(
+            f"cosine_similarity: {1 - cos_diff:.6f}, diff: {cos_diff:.2e}"
+        )
+        return cos_diff < tol
+
     quant_rtol, quant_atol, quant_tol_err = 0.25, 1.0, 0.15
-    print("[test] Comparing ASM vs Ref...")
+    aiter.logger.info("[test] Comparing ASM vs Ref...")
     checkAllclose(
         out_asm,
         out_ref,
@@ -281,9 +291,10 @@ def test_fmoe_lqq(
         tol_err_ratio=quant_tol_err,
         msg="ASM vs Ref",
     )
+    assert checkLogitsDiff(out_asm, out_ref), "ASM vs Ref logits diff is too large"
 
     if out_flydsl is not None:
-        print("[test] Comparing FlyDSL vs Ref...")
+        aiter.logger.info("[test] Comparing FlyDSL vs Ref...")
         checkAllclose(
             out_flydsl,
             out_ref,
@@ -292,9 +303,15 @@ def test_fmoe_lqq(
             tol_err_ratio=quant_tol_err,
             msg="FlyDSL vs Ref",
         )
+        assert checkLogitsDiff(
+            out_flydsl, out_ref
+        ), "FlyDSL vs Ref logits diff is too large"
 
-        print("[test] Comparing FlyDSL vs ASM...")
+        aiter.logger.info("[test] Comparing FlyDSL vs ASM...")
         checkAllclose(out_flydsl, out_asm, msg="FlyDSL vs ASM")
+        assert checkLogitsDiff(
+            out_flydsl, out_asm
+        ), "FlyDSL vs ASM logits diff is too large"
 
 
 parser = argparse.ArgumentParser(
