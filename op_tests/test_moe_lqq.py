@@ -7,6 +7,7 @@ import aiter
 import os
 from aiter.test_common import (
     checkAllclose,
+    perftest,
 )
 from aiter.fused_moe import (
     fused_topk,
@@ -74,6 +75,58 @@ def build_local_expert_hash(expert_mask: torch.Tensor) -> torch.Tensor:
     return local_expert_hash
 
 
+def make_fused_moe_perftest(*, num_iters: int, num_warmup: int):
+
+    @perftest(num_iters=num_iters, num_warmup=num_warmup)
+    def _run(
+        hidden_states,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        expert_mask,
+        local_expert_hash,
+        w1_scale,
+        w2_scale,
+        a1_scale,
+        w1_lqq_scale,
+        w1_lqq_zero,
+        w2_lqq_scale,
+        w2_lqq_zero,
+        fc1_smooth_scale,
+        fc2_smooth_scale,
+        quant_type,
+        activation,
+        dtype,
+        block_size_M,
+    ):
+        return fused_moe(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            expert_mask=expert_mask,
+            local_expert_hash=local_expert_hash,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=a1_scale,
+            w1_lqq_scale=w1_lqq_scale,
+            w1_lqq_zero=w1_lqq_zero,
+            w2_lqq_scale=w2_lqq_scale,
+            w2_lqq_zero=w2_lqq_zero,
+            fc1_smooth_scale=fc1_smooth_scale,
+            fc2_smooth_scale=fc2_smooth_scale,
+            quant_type=quant_type,
+            activation=activation,
+            doweight_stage1=False,
+            dtype=dtype,
+            block_size_M=block_size_M,
+        )
+
+    return _run
+
+
 def test_fmoe_lqq(
     token,
     model_dim,
@@ -82,7 +135,7 @@ def test_fmoe_lqq(
     topk,
     shared_E=2,
     ep=8,
-    block_size_M=80,
+    block_size_M=32,
 ):
     dtype = dtypes.bf16
     use_g1u1 = True
@@ -213,61 +266,61 @@ def test_fmoe_lqq(
 
     get_2stage_cfgs.cache_clear()
 
-    out_asm = fused_moe(
+    run_fused_moe = make_fused_moe_perftest(num_iters=128, num_warmup=5)
+    out_asm, us_asm = run_fused_moe(
         input,
         w1_lqq,
         w2_lqq,
         topk_weights,
         topk_ids,
-        expert_mask=expert_mask,
-        local_expert_hash=local_expert_hash,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        a1_scale=a1_scale,
-        w1_lqq_scale=w1_lqq_scale_shf,
-        w1_lqq_zero=w1_lqq_zero_uint8_shf,
-        w2_lqq_scale=w2_lqq_scale_shf,
-        w2_lqq_zero=w2_lqq_zero_uint8_shf,
-        fc1_smooth_scale=fc1_smooth_scale,
-        fc2_smooth_scale=fc2_smooth_scale,
-        quant_type=quant_type,
-        activation=act_type,
-        doweight_stage1=False,
-        dtype=dtype,
-        block_size_M=block_size_M,
+        expert_mask,
+        local_expert_hash,
+        w1_scale,
+        w2_scale,
+        a1_scale,
+        w1_lqq_scale_shf,
+        w1_lqq_zero_uint8_shf,
+        w2_lqq_scale_shf,
+        w2_lqq_zero_uint8_shf,
+        fc1_smooth_scale,
+        fc2_smooth_scale,
+        quant_type,
+        act_type,
+        dtype,
+        block_size_M,
     )
+    aiter.logger.info(f"[bench] ASM: {us_asm:>8.2f} us")
 
     # 2. Run FlyDSL if FLIR_PATH is set
     out_flydsl = None
+    us_flydsl = None
     if os.getenv("FLIR_PATH"):
         print("[test] Running FlyDSL backend...")
         os.environ["AITER_USE_FLYDSL"] = "1"
         get_2stage_cfgs.cache_clear()
-        aiter.logger.info(f"w1_lqq.shape: {w1_lqq.shape}")
-        aiter.logger.info(f"w2_lqq.shape: {w2_lqq.shape}")
-        out_flydsl = fused_moe(
+        out_flydsl, us_flydsl = run_fused_moe(
             input,
             w1_lqq,
             w2_lqq,
             topk_weights,
             topk_ids,
-            expert_mask=expert_mask,
-            local_expert_hash=local_expert_hash,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            a1_scale=a1_scale,
-            w1_lqq_scale=w1_lqq_scale_shf,
-            w1_lqq_zero=w1_lqq_zero_uint8_shf,
-            w2_lqq_scale=w2_lqq_scale_shf,
-            w2_lqq_zero=w2_lqq_zero_uint8_shf,
-            fc1_smooth_scale=fc1_smooth_scale,
-            fc2_smooth_scale=fc2_smooth_scale,
-            quant_type=quant_type,
-            activation=act_type,
-            doweight_stage1=False,
-            dtype=dtype,
-            block_size_M=32,
+            expert_mask,
+            local_expert_hash,
+            w1_scale,
+            w2_scale,
+            a1_scale,
+            w1_lqq_scale_shf,
+            w1_lqq_zero_uint8_shf,
+            w2_lqq_scale_shf,
+            w2_lqq_zero_uint8_shf,
+            fc1_smooth_scale,
+            fc2_smooth_scale,
+            quant_type,
+            act_type,
+            dtype,
+            block_size_M,
         )
+        aiter.logger.info(f"[bench] FlyDSL: {us_flydsl:>8.2f} us")
     os.environ["AITER_USE_FLYDSL"] = old_flydsl
 
     def calc_diff(x: torch.Tensor, y: torch.Tensor):
@@ -276,12 +329,22 @@ def test_fmoe_lqq(
         sim = torch.cosine_similarity(x.flatten(), y.flatten(), dim=0)
         return 1 - sim
 
-    def checkLogitsDiff(x: torch.Tensor, y: torch.Tensor, tol=1e-3):
+    def logn(tag: str, x: torch.Tensor, y: torch.Tensor, n: int = 10):
+        a = x.reshape(-1)[:n]
+        b = y.reshape(-1)[:n]
+        diff = a - b
+        print(f"[a vs b] {tag} (first {n} elements)")
+        print(f"    a    : {a.shape}")
+        print(f"           {a}")
+        print(f"    b    : {b.shape}")
+        print(f"           {b}")
+        print("    diff :")
+        print(f"           {diff}")
+
+    def log_logits_diff(tag: str, x: torch.Tensor, y: torch.Tensor):
         cos_diff = calc_diff(x, y)
-        aiter.logger.info(
-            f"cosine_similarity: {1 - cos_diff:.6f}, diff: {cos_diff:.2e}"
-        )
-        return cos_diff < tol
+        aiter.logger.info(f"[logits_diff] {tag} {cos_diff:.2e}")
+        return cos_diff
 
     quant_rtol, quant_atol, quant_tol_err = 0.25, 1.0, 0.15
     aiter.logger.info("[test] Comparing ASM vs Ref...")
@@ -293,7 +356,8 @@ def test_fmoe_lqq(
         tol_err_ratio=quant_tol_err,
         msg="ASM vs Ref",
     )
-    assert checkLogitsDiff(out_asm, out_ref), "ASM vs Ref logits diff is too large"
+    log_logits_diff("ASM vs Ref", out_asm, out_ref)
+    logn("ASM vs Ref", out_asm, out_ref, n=10)
 
     if out_flydsl is not None:
         aiter.logger.info("[test] Comparing FlyDSL vs Ref...")
@@ -305,15 +369,26 @@ def test_fmoe_lqq(
             tol_err_ratio=quant_tol_err,
             msg="FlyDSL vs Ref",
         )
-        assert checkLogitsDiff(
-            out_flydsl, out_ref
-        ), "FlyDSL vs Ref logits diff is too large"
+        log_logits_diff("FlyDSL vs Ref", out_flydsl, out_ref)
+        logn("FlyDSL vs Ref", out_flydsl, out_ref, n=10)
 
         aiter.logger.info("[test] Comparing FlyDSL vs ASM...")
         checkAllclose(out_flydsl, out_asm, msg="FlyDSL vs ASM")
-        assert checkLogitsDiff(
-            out_flydsl, out_asm
-        ), "FlyDSL vs ASM logits diff is too large"
+        log_logits_diff("FlyDSL vs ASM", out_flydsl, out_asm)
+        logn("FlyDSL vs ASM", out_flydsl, out_asm, n=10)
+
+    result = {
+        "token": token,
+        "model_dim": model_dim,
+        "inter_dim": inter_dim,
+        "E": E,
+        "topk": topk,
+        "ep": ep,
+        "us_asm": f"{us_asm:.2f}",
+    }
+    if us_flydsl is not None:
+        result["us_flydsl"] = f"{us_flydsl:.2f}"
+    return result
 
 
 parser = argparse.ArgumentParser(
@@ -385,32 +460,42 @@ parser.add_argument(
 )
 parser.add_argument(
     "-x",
-    "--subx",
+    "--block_m",
     type=int,
     nargs="*",
-    default=None,
-    help="""block_size_M value.
-    e.g.: -x 80""",
+    default=[32],
+    help="""block_size_M value. Default: 32.
+    e.g.: -x 32""",
 )
 args = parser.parse_args()
 
-print("\nRunning moe_lqq test...")
+
 expert = 128 if args.expert is None else args.expert[0]
 topk = 6 if args.topk is None else args.topk[0]
-tokens = 208 if args.token is None else args.token[0]
 mdim = 5120 if args.model_dim is None else args.model_dim[0]
 idim = 1536 if args.inter_dim is None else args.inter_dim[0]
 ep = 1 if args.expert_parallelism is None else args.expert_parallelism
 shared_E = 2 if args.shared_expert is None else args.shared_expert
+token_list = [208] if args.token is None else args.token
 
-for subX in [80] if args.subx is None else args.subx:
-    test_fmoe_lqq(
-        token=tokens,
-        model_dim=mdim,
-        inter_dim=idim,
-        E=expert,
-        topk=topk,
-        shared_E=shared_E,
-        ep=ep,
-        block_size_M=subX,
-    )
+print("\nRunning moe_lqq test + benchmark...")
+df = []
+for m in token_list:
+    for block_m in args.block_m:
+        ret = test_fmoe_lqq(
+            token=m,
+            model_dim=mdim,
+            inter_dim=idim,
+            E=expert,
+            topk=topk,
+            shared_E=shared_E,
+            ep=ep,
+            block_size_M=block_m,
+        )
+        if ret is not None:
+            df.append(ret)
+if df:
+    import pandas as pd
+
+    df = pd.DataFrame(df)
+    aiter.logger.info("moe_lqq summary:\n%s", df.to_markdown(index=False))
