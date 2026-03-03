@@ -267,9 +267,12 @@ def fused_moe_(
     ], f"Fused_moe unsupported out dtype: {dtype}"
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
-    # For W4A16: activation is bf16, not quantized like weights
+    # For packed int4 weights (i8 dtype): W4A16 or W4A8 depending on quant_type
     if w1.dtype in (dtypes.i8, torch.int8):
-        q_dtype_a = dtypes.bf16  # W4A16: bf16 activations
+        if quant_type in (QuantType.No,):
+            q_dtype_a = dtypes.bf16  # W4A16: bf16 activations, no quant
+        else:
+            q_dtype_a = dtypes.fp8   # W4A8: fp8 activations, dynamic quant
     elif w1.dtype != torch.uint32:
         q_dtype_a = w1.dtype
     else:
@@ -1778,20 +1781,22 @@ def flydsl_moe_stage1(
     group_size: int = -1,  # -1 for per-row, >0 for group-wise
     **_kwargs,
 ):
-    # Detect weight dtype: W4A16 (packed int4 as i8), pure bf16 (dequanted), or fp8
-    _is_w4a16 = w1.dtype in (dtypes.i8, torch.int8)
+    # Detect weight dtype: W4A16/W4A8 (packed int4 as i8), pure bf16 (dequanted), or fp8
+    _is_w_int4 = w1.dtype in (dtypes.i8, torch.int8)
+    _is_w4a16 = _is_w_int4 and a1_scale is None   # W4A16: no activation scale
+    _is_w4a8_fp8 = _is_w_int4 and a1_scale is not None  # W4A8: has activation scale (fp8)
     _is_bf16 = w1.dtype in (dtypes.bf16, torch.bfloat16)
     # Scale checks: bf16 needs no scales (dequant baked in), W4A16 needs w1_scale but not a1_scale
-    if w1_scale is None and not (_is_w4a16 or _is_bf16):
+    if w1_scale is None and not (_is_w_int4 or _is_bf16):
         raise RuntimeError("FlyDSL stage1 requires w1_scale")
-    if a1_scale is None and not (_is_w4a16 or _is_bf16):
-        raise RuntimeError("FlyDSL stage1 requires a1_scale (unless W4A16 or bf16 mode)")
+    if a1_scale is None and not (_is_w_int4 or _is_bf16):
+        raise RuntimeError("FlyDSL stage1 requires a1_scale (unless W4A16/W4A8 or bf16 mode)")
 
     token_num = hidden_states.shape[0]
     E, w1_n, model_dim = w1.shape
-    # For W4A16 (packed int4), last dim is model_dim//2, need to adjust
+    # For packed int4 (W4A16 or W4A8), last dim is model_dim//2, need to adjust
     # bf16 weights are full-size, no adjustment needed
-    if _is_w4a16:
+    if _is_w_int4:
         model_dim = model_dim * 2
     inter_dim = w2.shape[2]
     # For W4A16 (packed int4), w2 last dim is inter_dim//2
@@ -1806,7 +1811,7 @@ def flydsl_moe_stage1(
 
     tile_m = int(block_m) if block_m is not None else 64
     tile_n = 64 # 128
-    tile_k = 128 if _is_w4a16 else 256
+    tile_k = 128 if _is_w_int4 else 256
     # Decode/small-token fix (NO kernel changes):
     # FlyDSL stage1 kernel expects CK-style preshuffled W1 layout, but model weights are not
     # preshuffled. For small tokens, only a handful of experts are actually touched.
@@ -1904,10 +1909,10 @@ def flydsl_moe_stage1(
     else:
         scale_x_1d = a1_scale.view(-1).contiguous().to(torch.float32)
     # Weight layout depends on dtype:
-    # - W4A16: int4 packed, shape is [E, 2*inter_dim, model_dim//2] -> flatten to 1D
+    # - W4A16/W4A8: int4 packed, shape is [E, 2*inter_dim, model_dim//2] -> flatten to 1D
     # - bf16: full-size [E, 2*inter_dim, model_dim] -> 2D view [E*N, K]
     # - fp8: [E, 2*inter_dim, model_dim] -> 2D view [E*N, K]
-    if _is_w4a16:
+    if _is_w_int4:
         w1_flat = w1.contiguous().view(-1)  # FlyDSL expects 1D buffer for int4
     else:
         w1_flat = w1.contiguous().view(E * (2 * inter_dim), model_dim)
@@ -1954,7 +1959,9 @@ def flydsl_moe_stage1(
     stream_ptr = torch.cuda.current_stream().cuda_stream
 
     # Select FlyDSL in_dtype based on weight type
-    if _is_w4a16:
+    if _is_w4a8_fp8:
+        _stage1_in_dtype = "int4_fp8"
+    elif _is_w4a16:
         _stage1_in_dtype = "int4_bf16"
     elif _is_bf16 and w1_scale is None:
         _stage1_in_dtype = "bf16"
@@ -1963,7 +1970,7 @@ def flydsl_moe_stage1(
     else:
         _stage1_in_dtype = "fp8"
 
-    thread_size = None if (_is_w4a16 or _is_bf16) else (256 if token_num > 128 else 128)
+    thread_size = None if (_is_w_int4 or _is_bf16) else (256 if token_num > 128 else 128)
     key1 = (
         model_dim,
         inter_dim,
@@ -2243,14 +2250,16 @@ def flydsl_moe_stage2(
     activation=ActivationType.Silu,
     **_kwargs,
 ):
-    # Detect weight dtype: W4A16 (packed int4 as i8), pure bf16 (dequanted), or fp8
-    _is_w4a16_s2 = w2.dtype in (dtypes.i8, torch.int8)
+    # Detect weight dtype: W4A16/W4A8 (packed int4 as i8), pure bf16 (dequanted), or fp8
+    _is_w_int4_s2 = w2.dtype in (dtypes.i8, torch.int8)
+    _is_w4a16_s2 = _is_w_int4_s2 and a2_scale is None
+    _is_w4a8_fp8_s2 = _is_w_int4_s2 and a2_scale is not None
     _is_bf16_s2 = w2.dtype in (dtypes.bf16, torch.bfloat16)
     # Scale checks: bf16 needs no scales, W4A16 needs w2_scale but not a2_scale
-    if w2_scale is None and not (_is_w4a16_s2 or _is_bf16_s2):
+    if w2_scale is None and not (_is_w_int4_s2 or _is_bf16_s2):
         raise RuntimeError("FlyDSL stage2 requires w2_scale")
-    if a2_scale is None and not (_is_w4a16_s2 or _is_bf16_s2):
-        raise RuntimeError("FlyDSL stage2 requires a2_scale (unless W4A16 or bf16 mode)")
+    if a2_scale is None and not (_is_w_int4_s2 or _is_bf16_s2):
+        raise RuntimeError("FlyDSL stage2 requires a2_scale (unless W4A16/W4A8 or bf16 mode)")
 
     token_num, _, inter_dim = a2.shape
     model_dim = w2.shape[1]
@@ -2328,10 +2337,10 @@ def flydsl_moe_stage2(
     else:
         a2_scale_1d = a2_scale.view(-1).contiguous().to(torch.float32)
     # Weight layout depends on dtype:
-    # - W4A16: int4 packed, shape is [E, model_dim, inter_dim//2] -> flatten to 1D
+    # - W4A16/W4A8: int4 packed, shape is [E, model_dim, inter_dim//2] -> flatten to 1D
     # - bf16: full-size [E, model_dim, inter_dim] -> 2D view [E*N, K]
     # - fp8: [E, model_dim, inter_dim] -> 2D view [E*N, K]
-    if _is_w4a16_s2:
+    if _is_w_int4_s2:
         w2_flat = w2.contiguous().view(-1)  # FlyDSL expects 1D buffer for int4
     else:
         w2_flat = w2.contiguous().view(E * model_dim, inter_dim)
@@ -2419,7 +2428,9 @@ def flydsl_moe_stage2(
     stream_ptr = torch.cuda.current_stream().cuda_stream
 
     # Select FlyDSL in_dtype based on weight type
-    if _is_w4a16_s2:
+    if _is_w4a8_fp8_s2:
+        _stage2_in_dtype = "int4_fp8"
+    elif _is_w4a16_s2:
         _stage2_in_dtype = "int4_bf16"
     elif _is_bf16_s2 and w2_scale is None:
         _stage2_in_dtype = "bf16"
@@ -2428,7 +2439,7 @@ def flydsl_moe_stage2(
     else:
         _stage2_in_dtype = "fp8"
 
-    thread_size = None if (_is_w4a16_s2 or _is_bf16_s2) else 256
+    thread_size = None if (_is_w_int4_s2 or _is_bf16_s2) else 256
 
     key2 = (
         model_dim,
