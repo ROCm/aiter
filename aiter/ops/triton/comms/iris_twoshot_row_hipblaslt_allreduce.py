@@ -30,7 +30,8 @@ cross-rank traffic).
 
 CUDA graph compatibility:
 - Buffer pre-allocation with view pattern (same as twoshot)
-- Device barriers are inlined (no separate kernel launch)
+- device_barrier() before and after kernel (graph-capturable,
+  pure device-side atomics on the symmetric heap)
 """
 
 import logging
@@ -258,8 +259,9 @@ def persistent_fused_allreduce_rmsnorm_row_quant_two_shot(
                         iris_rank, remote_rank, heap_bases,
                     )
 
-    # No device-side barrier needed: NCCL barrier on host ensures
-    # all ranks have copied input to heap before kernel launch.
+    # Post-kernel barrier is external (called by the manager after
+    # kernel launch). Prevents a fast rank from overwriting its heap
+    # buffer on the next iteration while a slow rank still reads it.
 
 
 # ============================================================================
@@ -311,9 +313,7 @@ class IrisTwoshotRowHipblasltManager:
         # Pre-allocated output buffers (regular GPU memory)
         self._out_result: Optional[torch.Tensor] = None
 
-        # NCCL barrier buffer (1-element tensor for pre-kernel sync)
-        self._nccl_barrier_buf: Optional[torch.Tensor] = None
-
+    
     def initialize(self, heap_size: Optional[int] = None) -> None:
         """Initialize Iris symmetric heap (call once at startup)."""
         if self._shmem is not None:
@@ -371,7 +371,6 @@ class IrisTwoshotRowHipblasltManager:
 
         shmem = self.shmem
         self._input_buf = shmem.zeros((M, N), dtype=dtype)
-        shmem.device_barrier()
         self._input_M = M
         self._input_N = N
         self._input_dtype = dtype
@@ -410,7 +409,6 @@ class IrisTwoshotRowHipblasltManager:
 
         shmem = self.shmem
         self._quant_heap_buf = shmem.zeros((M, N), dtype=quant_dtype)
-        shmem.device_barrier()
         self._quant_heap_M = M
         self._quant_heap_N = N
         self._quant_heap_dtype = quant_dtype
@@ -445,7 +443,6 @@ class IrisTwoshotRowHipblasltManager:
 
         shmem = self.shmem
         self._scale_heap_buf = shmem.zeros((M,), dtype=torch.float32)
-        shmem.device_barrier()
         self._scale_heap_M = M
 
         cur_rank = (
@@ -553,22 +550,10 @@ class IrisTwoshotRowHipblasltManager:
         # Copy input to symmetric heap (captured in graph)
         iris_input.copy_(input_tensor)
 
-        # Cross-rank sync: ensure all ranks have copied input to heap
+        # Pre-kernel barrier: ensure all ranks have copied input to heap
         # before any rank's kernel starts reading from peers.
-        #
-        # Eager mode: NCCL 1-element allreduce acts as a barrier.
-        # Graph capture/replay: skipped. During capture, ranks run the
-        # same Python loop in lockstep. During replay, vLLM triggers
-        # all ranks simultaneously and the copy (local memcpy) completes
-        # well before the kernel's first iris.load from a remote rank.
-        if not torch.cuda.is_current_stream_capturing():
-            if self._nccl_barrier_buf is None:
-                self._nccl_barrier_buf = torch.zeros(
-                    1, dtype=torch.int32, device=device
-                )
-            torch.distributed.all_reduce(
-                self._nccl_barrier_buf, op=torch.distributed.ReduceOp.SUM
-            )
+        # device_barrier is graph-capturable (pure device-side atomics).
+        shmem.device_barrier()
 
         # FP8 max value
         fp8_max = torch.finfo(quant_dtype).max
@@ -632,6 +617,11 @@ class IrisTwoshotRowHipblasltManager:
             num_stages=NUM_STAGES,
             waves_per_eu=WAVES_PER_EU,
         )
+
+        # Post-kernel barrier: ensure all ranks have finished writing
+        # FP8 data + scales to the heap before any rank overwrites its
+        # input buffer on the next iteration.
+        shmem.device_barrier()
 
         # Step 3: hipBLASLt GEMM via torch._scaled_mm
         # quant_heap is (M, N) FP8, scale_heap is (M,) float32
