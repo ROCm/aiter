@@ -4369,7 +4369,8 @@ def pa_decode_gluon(
     is_causal = query_length > 1
     # Calculate elements per 16B load based on data type
     kv_elements_per_16b = 16 // key_cache.dtype.itemsize
-
+    if sliding_window > 0:
+        max_context_partition_num = 1
     grid = (batch_size, num_kv_heads, max_context_partition_num)
 
     assert query_length <= 4, f"query_length == {query_length} exceeds maximum of 4"
