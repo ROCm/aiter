@@ -11,11 +11,8 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a8w8_blockscale import (
     moe_gemm_a8w8_blockscale,
-    moe_gemm_torch,
-)
-from aiter.ops.gluon.moe.moe_op_gemm_a8w8_blockscale import (
-    moe_gemm_a8w8_blockscale_gfx1250,
     preshuffle_weights,
+    moe_gemm_torch,
 )
 
 # numerics utilities
@@ -24,99 +21,15 @@ from aiter.ops.triton.moe.quant_moe import (
     dequant_w_blockscale,
 )
 
+# target-specific utilities
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+
 # ---------------
 # initialize data
 # ---------------
 
 # Default group_m, group_n, group_k
 group_shape = (128, 128, 128)
-
-
-def get_gpu_arch():
-    """Get the GPU architecture name (e.g., 'gfx1250', 'gfx942')."""
-    if not torch.cuda.is_available():
-        return None
-    props = torch.cuda.get_device_properties(0)
-    return getattr(props, "gcnArchName", None)
-
-
-def is_gluon_supported():
-    """Check if the current GPU supports gfx1250 Gluon kernels."""
-    arch = get_gpu_arch()
-    return arch is not None and "gfx1250" in arch
-
-
-def run_moe_gemm_triton(
-    x_tri,
-    w_tri,
-    x_scales_tri,
-    w_scales_tri,
-    x_static_scale,
-    w_static_scale,
-    quant_static_scale,
-    bias_tri,
-    rdata,
-    gindx,
-    sindx,
-    gammas,
-    out_dtype,
-    apply_swiglu,
-    per_row_x_scale,
-):
-    return moe_gemm_a8w8_blockscale(
-        x_tri,
-        w_tri,
-        x_scales_tri,
-        w_scales_tri,
-        x_static_scale,
-        w_static_scale,
-        quant_static_scale,
-        bias_tri,
-        rdata,
-        gindx,
-        sindx,
-        gammas,
-        out_dtype,
-        apply_swiglu,
-        per_row_x_scale=per_row_x_scale,
-    )
-
-
-def run_moe_gemm_gluon(
-    x_tri,
-    w_tri,
-    x_scales_tri,
-    w_scales_tri,
-    x_static_scale,
-    w_static_scale,
-    quant_static_scale,
-    bias_tri,
-    rdata,
-    gindx,
-    sindx,
-    gammas,
-    out_dtype,
-    apply_swiglu,
-    per_row_x_scale,
-):
-    w_preshuffled = preshuffle_weights(w_tri)
-    return moe_gemm_a8w8_blockscale_gfx1250(
-        x=x_tri,
-        w=w_preshuffled,
-        x_block_scales=x_scales_tri,
-        w_block_scales=w_scales_tri,
-        x_static_scale=x_static_scale,
-        w_static_scale=w_static_scale,
-        quant_static_scale=quant_static_scale,
-        bias=bias_tri,
-        routing_data=rdata,
-        gather_indx=gindx,
-        scatter_indx=sindx,
-        gammas=gammas,
-        out_dtype=out_dtype,
-        apply_swiglu=apply_swiglu,
-        per_row_x_scale=per_row_x_scale,
-    )
 
 
 def init_routing_data(
@@ -342,7 +255,6 @@ class Case:
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
 @pytest.mark.parametrize("fused_quant", [False, True])
-@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_op(
     m,
     n,
@@ -357,12 +269,8 @@ def test_op(
     is_x_blockscale,
     is_w_blockscale,
     per_row_x_scale,
-    backend,
     device="cuda",
 ):
-    if backend == "gluon" and not is_gluon_supported():
-        pytest.skip("Gluon not supported on this architecture")
-
     # TODO: Uncomment after pytorch adds support for manual_seed
     # torch.manual_seed(0)
 
@@ -429,42 +337,28 @@ def test_op(
     else:
         maxtol = None
         rmstol = None
-    if backend == "triton":
-        tri_y = run_moe_gemm_triton(
-            x_tri,
-            w_tri,
-            x_scales_tri,
-            w_scales_tri,
-            x_static_scale,
-            w_static_scale,
-            quant_static_scale,
-            bias_tri,
-            rdata,
-            gindx,
-            sindx,
-            gammas,
-            out_dtype,
-            apply_swiglu,
-            per_row_x_scale,
-        )
-    else:
-        tri_y = run_moe_gemm_gluon(
-            x_tri,
-            w_tri,
-            x_scales_tri,
-            w_scales_tri,
-            x_static_scale,
-            w_static_scale,
-            quant_static_scale,
-            bias_tri,
-            rdata,
-            gindx,
-            sindx,
-            gammas,
-            out_dtype,
-            apply_swiglu,
-            per_row_x_scale,
-        )
+
+    # preshuffle weights for gfx1250
+    if get_arch() == "gfx1250":
+        w_tri = preshuffle_weights(w_tri)
+
+    tri_y = moe_gemm_a8w8_blockscale(
+        x_tri,
+        w_tri,
+        x_scales_tri,
+        w_scales_tri,
+        x_static_scale,
+        w_static_scale,
+        quant_static_scale,
+        bias_tri,
+        rdata,
+        gindx,
+        sindx,
+        gammas,
+        out_dtype,
+        apply_swiglu,
+        per_row_x_scale=per_row_x_scale,
+    )
     if not is_x_blockscale and fused_quant:
         tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
