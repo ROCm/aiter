@@ -171,10 +171,8 @@ def run_gemm_flydsl(
         )
 
     exe = _flydsl_exe_cache[cache_key]
-    c_fp16 = torch.empty(m, n, dtype=torch.float16, device=x.device)
     stream_ptr = torch.cuda.current_stream().cuda_stream
-    exe(c_fp16, x, weight_shuffle, x_scale, w_scale, m, n, k, stream_ptr)
-    out.copy_(c_fp16.to(out.dtype))
+    exe(out, x, weight_shuffle, x_scale, w_scale, m, n, k, stream_ptr)
     return out
 
 

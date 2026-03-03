@@ -659,13 +659,12 @@ def gemm_a8w8_bpreshuffle(
                     return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
                 tm, tn, tk = tiles
                 lds, csh, acp, wpe = 2, 0, 0, 0
-            Y_fp16 = torch.empty(m, n, dtype=torch.float16, device=XQ.device)
             _flydsl_preshuffle_gemm_a8(
                 XQ.contiguous(),
                 WQ.contiguous(),
                 x_scale,
                 w_scale,
-                Y_fp16,
+                Y,
                 tm,
                 tn,
                 tk,
@@ -674,7 +673,7 @@ def gemm_a8w8_bpreshuffle(
                 acp,
                 wpe,
             )
-            return Y_fp16.to(dtype)
+            return Y
     else:
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
