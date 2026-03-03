@@ -184,7 +184,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                         if ((curr_kv_end - work_info.kv_end < Traits::kTailDoneThreshold &&
                             curr_kv_end - work_info.kv_end > 0) || cur_tail_done)
                         {
-                            work_info.kv_end = curr_kv_end;
+                            work_info.kv_end = ck_tile::min(curr_kv_end - batch_tail, curr_kv_end);
                         }
                         work_info.kv_offset = curr_kv_end - work_info.kv_end;
                     }
@@ -324,7 +324,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                             if (curr_kv_end - work_info.kv_end < Traits::kTailDoneThreshold)
                             {
                                 cur_tail_done = true;
-                                work_info.kv_end = curr_kv_end;
+                                work_info.kv_end = ck_tile::min(curr_kv_end, curr_kv_end - batch_tail);
                             }
                             work_info.kv_offset = curr_kv_end - work_info.kv_end;
                         }
