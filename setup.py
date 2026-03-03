@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
 import shutil
@@ -232,6 +232,7 @@ class NinjaBuildExtension(build_ext):
                         is_python_module=True,
                         is_standalone=False,
                         torch_exclude=False,
+                        third_party=one_opt_args.get("third_party"),
                     )
 
                 prebuid_thread_num = 5

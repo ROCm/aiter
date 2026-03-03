@@ -14,7 +14,6 @@ import time
 import traceback
 import types
 import typing
-import yaml
 from typing import Any, Callable, List, Optional
 
 from packaging.version import Version, parse
@@ -639,6 +638,8 @@ def clone_3rdparty(third_party: str) -> None:
                         )
 
     with open(f"{AITER_META_DIR}/3rdparty/3rdparty_info.yaml", "r") as f:
+        import yaml
+
         third_party_info = yaml.safe_load(f)
 
     if third_party in third_party_info:
