@@ -70,21 +70,34 @@ def moe_lqq_dequant(
     return out.to(device)
 
 
+def build_local_expert_hash(expert_mask: torch.Tensor) -> torch.Tensor:
+    """Cache global->local expert id map for EP."""
+    local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
+    local_expert_hash[local_expert_hash > 0] -= 1
+    local_expert_hash[expert_mask == 0] = -1
+    return local_expert_hash
+
+
 def test_fmoe_lqq(
     token,
     model_dim,
     inter_dim,
     E,
     topk,
-    shared_E=2,
-    ep=8,
-    block_size_M=32,
+    shared_E,
+    ep,
+    block_size_M,
 ):
     dtype = dtypes.bf16
     use_g1u1 = True
+    use_smooth = True
     quant_type = QuantType.lqq_1x64
     act_type = ActivationType.Silu
     group_in_k_lqq = 64
+
+    print("[test] batch:", token)
+    print("[test] expert:", E, "shared_expr:", shared_E, "topk:", topk)
+    print("[test] model_dim:", model_dim, " inter_dim:", inter_dim)
 
     ######################################################################################
     # This gpu id in EP, this example use the last id
@@ -103,6 +116,8 @@ def test_fmoe_lqq(
     expert_mask[-1] = 0
     # Ensure shared expert not to be masked
     expert_mask[E:-1] = 1
+
+    local_expert_hash = build_local_expert_hash(expert_mask)
 
     input = torch.randn((token, model_dim), dtype=dtype, device="cuda")
     score = torch.randn((token, E), device="cuda", dtype=dtype)
@@ -131,34 +146,11 @@ def test_fmoe_lqq(
         topk_ids = torch.cat((topk_ids, s_topk_ids), dim=1)
 
     eprt = local_E + shared_E
-    if ep == 1:
-        expert_mask = None
-
-    if expert_mask is not None:
-        local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
-        local_expert_hash[local_expert_hash > 0] -= 1
-        local_expert_hash[expert_mask == 0] = -1
-    else:
-        local_expert_hash = None
 
     ######################################################################################
-    print("[test] batch: ", token)
-    print("[test] expr: ", eprt, "topk: ", topk)
-    print("[test] model_dim: ", model_dim, " inter_dim: ", inter_dim)
-
     a1_qt, a1_scale = aiter.pertoken_quant(input, quant_dtype=dtypes.i8)
-    if shared_E > 0:
-        fc1_smooth_scale = torch.randn(
-            (eprt, model_dim), dtype=dtypes.fp32, device="cuda"
-        )
-        fc2_smooth_scale = torch.randn(
-            (eprt, inter_dim), dtype=dtypes.fp32, device="cuda"
-        )
-    else:
-        fc1_smooth_scale = None
-        fc2_smooth_scale = None
-
-    # -----------------------------------------------------------------------------------
+    fc1_smooth_scale = torch.randn((eprt, model_dim), dtype=dtypes.fp32, device="cuda")
+    fc2_smooth_scale = torch.randn((eprt, inter_dim), dtype=dtypes.fp32, device="cuda")
 
     w1 = torch.randn((eprt, inter_dim * 2, model_dim), dtype=dtype, device="cuda")
     w2 = torch.randn((eprt, model_dim, inter_dim), dtype=dtype, device="cuda")
@@ -371,7 +363,7 @@ args = parser.parse_args()
 print(f"\nRunning moe_lqq test...")
 expert = 128 if args.expert is None else args.expert[0]
 topk = 6 if args.topk is None else args.topk[0]
-tokens = 208 if args.token is None else args.token[0]
+tokens = 1664 if args.token is None else args.token[0]
 mdim = 5120 if args.model_dim is None else args.model_dim[0]
 idim = 1536 if args.inter_dim is None else args.inter_dim[0]
 ep = 8 if args.expert_parallelism is None else args.expert_parallelism

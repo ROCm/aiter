@@ -15,10 +15,6 @@
 
 #if EN_ASM_MOE_PRINT == 1
     #define print(...) printf(__VA_ARGS__)
-#else
-    #define print(...) ((void)0)
-#endif
-#if EN_ASM_MOE_PRINT == 1
     template<typename T>
     static int save_dev_hex(const char* filename, T* array, size_t size) {
         if (filename == NULL || array == NULL || size == 0) {
@@ -105,6 +101,19 @@
         delete[] ptr;
             
         fclose(fp);
+        return 0;
+    }
+#else
+    #define print(...) ((void)0)
+    template<typename T>
+    static int save_dev_hex(const char* filename, T* array, size_t size) {
+        return 0;
+    }
+    template<typename T>
+    static int save_dev_int(const char* filename, T* array, size_t size) {
+        return 0;
+    }
+    static int save_dev_float(const char* filename, float* array, size_t size) {
         return 0;
     }
 #endif
@@ -552,7 +561,7 @@ void moe_stage1_g1u1(
 
     int bdx = 256;
     int gdx = ((hidden_dim + sub_GU - 1) / sub_GU);
-    int gdy = sz_stp; // sub_X_cnt;
+    int gdy = sub_X_cnt;
     int gdz = k_num;
 
     args.log();
@@ -568,6 +577,9 @@ void moe_stage1_g1u1(
     print("[DEV_BUF] ptr_SW    : sorted_weights    = %lu bytes\n", sorted_weights.has_value() ? sorted_weights.value().numel() * sorted_weights.value().element_size() : 0);
     print("[DEV_BUF] ptr_Qscl  : w1_lqq_scale      = %lu bytes\n", w1_lqq_scale.has_value() ? w1_lqq_scale.value().numel() * w1_lqq_scale.value().element_size() : 0);
     print("[DEV_BUF] ptr_Qzero : w1_lqq_zero       = %lu bytes\n", w1_lqq_zero.has_value() ? w1_lqq_zero.value().numel() * w1_lqq_zero.value().element_size() : 0);
+    save_dev_int<int32_t>("./feifei/ptr_XCBuffer.txt",  (int32_t*)(args.ptr_XC),  num_valid_ids.numel());
+    save_dev_int<int32_t>("./feifei/ptr_STPBuffer.txt", (int32_t*)(args.ptr_STP), sorted_token_ids.numel());
+    save_dev_int<int32_t>("./feifei/ptr_SEPBuffer.txt", (int32_t*)(args.ptr_SEP), sorted_expert_ids.numel());
     print("[KERNEL] sub_X = %d, sub_GU = %d\n", block_m, sub_GU);
     print("[KERNEL] sub_X_cnt = %d, sz_stp = %d\n", sub_X_cnt, sz_stp);
     print("[KERNEL] gdx:%d, gdy:%d, gdz:%d, bdx:%d\n", gdx, gdy, gdz, bdx);
@@ -729,9 +741,9 @@ void moe_stage2_g1u1(
     print("[DEV_BUF] ptr_SWBuffer      : sorted_weights    = %lu bytes\n", sorted_weights.has_value() ? sorted_weights.value().numel() * sorted_weights.value().element_size() : 0);
     print("[DEV_BUF] ptr_DScaleBuffer  : w2_lqq_scale      = %lu bytes\n", w2_lqq_scale.has_value() ? w2_lqq_scale.value().numel() * w2_lqq_scale.value().element_size() : 0);
     print("[DEV_BUF] ptr_DZeroBuffer   : w2_lqq_zero       = %lu bytes\n", w2_lqq_zero.has_value() ? w2_lqq_zero.value().numel() * w2_lqq_zero.value().element_size() : 0);
-    //save_dev_int<int32_t>("./feifei/ptr_XCBuffer.txt",  (int32_t*)(args.ptr_XCBuffer),  num_valid_ids.numel());
-    //save_dev_int<int32_t>("./feifei/ptr_STPBuffer.txt", (int32_t*)(args.ptr_STPBuffer), sorted_token_ids.numel());
-    //save_dev_int<int32_t>("./feifei/ptr_SEPBuffer.txt", (int32_t*)(args.ptr_SEPBuffer), sorted_expert_ids.numel());
+    save_dev_int<int32_t>("./feifei/ptr_XCBuffer.txt",  (int32_t*)(args.ptr_XCBuffer),  num_valid_ids.numel());
+    save_dev_int<int32_t>("./feifei/ptr_STPBuffer.txt", (int32_t*)(args.ptr_STPBuffer), sorted_token_ids.numel());
+    save_dev_int<int32_t>("./feifei/ptr_SEPBuffer.txt", (int32_t*)(args.ptr_SEPBuffer), sorted_expert_ids.numel());
     print("[KERNEL] sub_X = %d, sub_D = %d\n", block_m, sub_D);
     print("[KERNEL] gdx:%d, gdy:%d, gdz:%d, bdx:%d\n", gdx, gdy, gdz, bdx);
 
