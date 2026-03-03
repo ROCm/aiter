@@ -367,7 +367,7 @@ parser.add_argument(
     "--token",
     type=int,
     nargs="*",
-    default=None,
+    default=128,
     help="""Token Num.
     e.g.: -m 128""",
 )
@@ -376,7 +376,7 @@ parser.add_argument(
     "--hidden_dim",
     type=int,
     nargs="*",
-    default=None,
+    default=4096,
     help="""Hidden states dim.
     e.g.: -hd 4096""",
 )
@@ -385,7 +385,7 @@ parser.add_argument(
     "--inter_dim",
     type=int,
     nargs="*",
-    default=None,
+    default=1024,
     help="""Intermediate dim.
     e.g.: -id 1024""",
 )
@@ -410,7 +410,7 @@ parser.add_argument(
 parser.add_argument(
     "-a",
     "--activation",
-    type=str,
+    type=dtypes.str2ActivationType,
     choices=[
         "silu",
         "gelu",
@@ -424,9 +424,6 @@ parser.add_argument(
 
 args = parser.parse_args()
 
-args.activation = {"gelu": ActivationType.Gelu, "silu": ActivationType.Silu}[
-    args.activation
-]
 
 for test in args.test:
     print(f"\nRunning test: {test}")
@@ -434,11 +431,9 @@ for test in args.test:
         print("test test_fmoe 16 bit")
         print("\ng1u0 no quant")
         for dtype in args.dtype:
-            for m in [128, 256] if args.token is None else args.token:
-                for hdim in (
-                    [4096, 8192] if args.hidden_dim is None else args.hidden_dim
-                ):
-                    for idim in [1024] if args.inter_dim is None else args.inter_dim:
+            for m in args.token:
+                for hdim in args.hidden_dim:
+                    for idim in args.inter_dim:
                         expert = 32 if args.expert is None else args.expert
                         topk = 5 if args.topk is None else args.topk
                         test_fmoe(
@@ -453,11 +448,9 @@ for test in args.test:
                         )
     elif test == "g1u1_no_quant":
         for dtype in args.dtype:
-            for m in [128, 256] if args.token is None else args.token:
-                for hdim in (
-                    [4096, 8192] if args.hidden_dim is None else args.hidden_dim
-                ):
-                    for idim in [1024] if args.inter_dim is None else args.inter_dim:
+            for m in args.token:
+                for hdim in args.hidden_dim:
+                    for idim in args.inter_dim:
                         expert = 32 if args.expert is None else args.expert
                         topk = 5 if args.topk is None else args.topk
                         test_fmoe(
@@ -473,11 +466,9 @@ for test in args.test:
                         )
     elif test == "g1u1_int8quant":
         for dtype in args.dtype:
-            for m in [128, 256] if args.token is None else args.token:
-                for hdim in (
-                    [4096, 8192] if args.hidden_dim is None else args.hidden_dim
-                ):
-                    for idim in [1024] if args.inter_dim is None else args.inter_dim:
+            for m in args.token:
+                for hdim in args.hidden_dim:
+                    for idim in args.inter_dim:
                         expert = 32 if args.expert is None else args.expert
                         topk = 5 if args.topk is None else args.topk
                         test_fmoe(
@@ -495,11 +486,9 @@ for test in args.test:
 
     elif test == "g1u1_fp8quant":
         for dtype in args.dtype:
-            for m in [128, 256] if args.token is None else args.token:
-                for hdim in (
-                    [4096, 8192] if args.hidden_dim is None else args.hidden_dim
-                ):
-                    for idim in [1024] if args.inter_dim is None else args.inter_dim:
+            for m in args.token:
+                for hdim in args.hidden_dim:
+                    for idim in args.inter_dim:
                         expert = 32 if args.expert is None else args.expert
                         topk = 5 if args.topk is None else args.topk
                         test_fmoe(
@@ -518,13 +507,9 @@ for test in args.test:
 
     elif test == "g1u0_int8smoothquant":
         for dtype in args.dtype:
-            for m in [128] if args.token is None else args.token:
-                for hdim in (
-                    [4096, 6144, 8192] if args.hidden_dim is None else args.hidden_dim
-                ):
-                    for idim in (
-                        [512, 1024] if args.inter_dim is None else args.inter_dim
-                    ):
+            for m in args.token:
+                for hdim in args.hidden_dim:
+                    for idim in args.inter_dim:
                         expert = 32 if args.expert is None else args.expert
                         topk = 5 if args.topk is None else args.topk
                         test_fmoe(
@@ -541,15 +526,9 @@ for test in args.test:
 
     elif test == "g1u1_int8smoothquant":
         for dtype in args.dtype:
-            for m in [128] if args.token is None else args.token:
-                for hdim in (
-                    [4096, 6144, 8192] if args.hidden_dim is None else args.hidden_dim
-                ):
-                    for idim in (
-                        [512, 1024, 1280, 1536]
-                        if args.inter_dim is None
-                        else args.inter_dim
-                    ):
+            for m in args.token:
+                for hdim in args.hidden_dim:
+                    for idim in args.inter_dim:
                         expert = 32 if args.expert is None else args.expert
                         topk = 5 if args.topk is None else args.topk
                         test_fmoe(
@@ -566,13 +545,9 @@ for test in args.test:
 
     elif test == "g1u1_fp8smoothquant":
         for dtype in args.dtype:
-            for m in [128] if args.token is None else args.token:
-                for hdim in (
-                    [4096, 6144, 8192] if args.hidden_dim is None else args.hidden_dim
-                ):
-                    for idim in (
-                        [512, 1024, 1280] if args.inter_dim is None else args.inter_dim
-                    ):
+            for m in args.token:
+                for hdim in args.hidden_dim:
+                    for idim in args.inter_dim:
                         expert = 32 if args.expert is None else args.expert
                         topk = 5 if args.topk is None else args.topk
                         test_fmoe(
@@ -588,13 +563,9 @@ for test in args.test:
                         )
     elif test == "g1u1_int4":
         for dtype in args.dtype:
-            for m in [32, 128] if args.token is None else args.token:
-                for hdim in (
-                    [4096, 6144] if args.hidden_dim is None else args.hidden_dim
-                ):
-                    for idim in (
-                        [1024, 4096] if args.inter_dim is None else args.inter_dim
-                    ):
+            for m in args.token:
+                for hdim in args.hidden_dim:
+                    for idim in args.inter_dim:
                         expert = 8 if args.expert is None else args.expert
                         topk = 3 if args.topk is None else args.topk
                         test_fmoe(
