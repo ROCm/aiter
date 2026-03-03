@@ -37,7 +37,7 @@ For a new kernel to be run by the script, the corresponding benchmark must be im
 | `B`      | int    | Batch size. |
 | `N`      | int    | Dimension N. |
 | `K`      | int    | Dimension K. |
-| `TP_dim` | string | `"B"`, `"N"`, `"K"`, or `"null"`. |
+| `TP_dim` | string \| null | `"B"`, `"N"`, `"K"`, or `"null"`. |
 
 ### MoE GEMM kernels (e.g. `moe_op_gemm_a8w8`, `moe_op_gemm_a8w8_blockscale`, `moe_op_gemm_a8w4`, `moe_op_gemm_a4w4`)
 
@@ -65,6 +65,28 @@ For a new kernel to be run by the script, the corresponding benchmark must be im
 | `positions`   | string | `"true"` or `"false"`. |
 | `rotate_style`| string | `"neox"` or `"gptj"`. |
 
+### MHA — Multi-Head Attention (`mha`)
+
+| Field     | Type   | Description |
+|----------|--------|-------------|
+| `hq`     | int    | Number of query heads. |
+| `hkv`    | int    | Number of key/value heads. |
+| `dqk`    | int    | Query/key head dimension. |
+| `dv`     | int    | Value head dimension. |
+| `comment`| string | Optional label (e.g. `"Prefill"`, `"Text"`, `"Vision"`). |
+
+### MLA — Multi-head Latent Attention (`mla`)
+
+Uses the same shape fields as `mha`:
+
+| Field     | Type   | Description |
+|----------|--------|-------------|
+| `hq`     | int    | Number of query heads. |
+| `hkv`    | int    | Number of key/value heads. |
+| `dqk`    | int    | Query/key head dimension. |
+| `dv`     | int    | Value head dimension. |
+| `comment`| string | Optional label (e.g. `"Decode"`). |
+
 ## Example
 
 ```json
@@ -86,6 +108,9 @@ For a new kernel to be run by the script, the corresponding benchmark must be im
         "positions": "true",
         "rotate_style": "neox"
       }
+    ],
+    "mha": [
+      { "hq": 128, "hkv": 8, "dqk": 128, "dv": 128 }
     ]
   }
 }
