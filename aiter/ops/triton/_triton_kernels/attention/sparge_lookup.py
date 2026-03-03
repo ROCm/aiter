@@ -59,7 +59,32 @@ def mean_pooling_kernel(
     tl.store(simiarlity_ptr, var)
 
 
-def sparge_preprocess(q, k, BLOCK_M, BLOCK_N, layout):
+# Theta is the threshold for simiarlity
+def sparge_preprocess(q, k, BLOCK_M, BLOCK_N, theta, tau, layout):
+    """
+    Preprocesses query (Q) and key (K) tensors for the Sparge attention mechanism by computing block-level statistics and generating a sparsity mask.
+    This function performs mean pooling on Q and K blocks using Triton kernels, computes block-to-block similarity scores, and determines which Key blocks should be attended to by each Query block based on thresholding ($\theta$) and cumulative probability distribution functions (TopCdf with $\tau$).
+    Args:
+        q (torch.Tensor): The query tensor. Shape depends on `layout`.
+        k (torch.Tensor): The key tensor. Shape depends on `layout`.
+        BLOCK_M (int): Block size for the query sequence dimension (used in tiling).
+        BLOCK_N (int): Block size for the key sequence dimension (used in tiling).
+        theta (float): A threshold value for similarity scores. Blocks with similarity scores below this threshold are marked as "sparse" (or fully attended to, depending on the implementation logic of the mask `M`). Specifically, if a block's internal similarity metric is less than `theta`, the corresponding row/column in the mask `M` is set to True.
+        tau (float): The cumulative probability threshold (0 < tau <= 1.0) used for the TopCdf selection strategy.
+        layout (str): The data layout format. Either "bshd" (Batch, Seq, Head, Dim) or "bhsd" (Batch, Head, Seq, Dim).
+    Returns:
+        tuple: A tuple containing:
+            - q_mean (torch.Tensor): The mean-pooled representation of Q blocks.
+            - q_similarity (torch.Tensor): The similarity/importance scores for Q blocks.
+            - k_mean (torch.Tensor): The mean-pooled representation of K blocks.
+            - k_similarity (torch.Tensor): The similarity/importance scores for K blocks.
+    TopCdf Explanation:
+        The "TopCdf" (Top Cumulative Distribution Function) logic selects a dynamic number of Key blocks for each Query block based on their contribution to the total attention mass.
+        1. **Similarity:** It computes the approximate attention score between block means: $S = \text{softmax}(Q_{mean} @ K_{mean}^T)$.
+        2. **Sorting:** For each query block, the key blocks are sorted by these scores in descending order.
+        3. **CumSum:** A cumulative sum (CDF) is calculated over the sorted probabilities.
+        4. **Selection:** The algorithm selects the top-k blocks whose cumulative probability sums up to `tau`. This ensures that the selected sparse blocks preserve at least `tau` amount of the estimated attention probability mass.
+    """
     bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
     batch, seqlen_q, num_q_heads, head_dim = map_dims(q.shape, bshd_map)
     batch, seqlen_k, num_k_heads, head_dim = map_dims(k.shape, bshd_map)
@@ -113,7 +138,45 @@ def sparge_preprocess(q, k, BLOCK_M, BLOCK_N, layout):
     # Compute similarity: Q_mean @ K_mean^T
     similarity = torch.matmul(q_mean, k_mean.transpose(-2, -1))  # [batch, num_q_heads, num_blocks_q, num_blocks_k]
 
+    # S[:, j] = -inf if skj < theta
+    mask = k_similarity.unsqueeze(-2) < theta
+    similarity = similarity.masked_fill(mask, float("-inf"))
+
     # Apply softmax
     similarity = torch.softmax(similarity, dim=-1)
+
+    # TODO check impl
+    # M[i, :] = TopCdf(Pˆ[i], τ )
+    # Sort similarity scores in descending order to compute CDF
+    sorted_probs, sorted_indices = torch.sort(similarity, descending=True, dim=-1)
+    cdf = torch.cumsum(sorted_probs, dim=-1)
+    
+    # Identify which blocks are needed to reach cumulative probability tau
+    # true means we keep it. We keep the first k elements where sum < tau, plus one more to cross the threshold.
+    # The mask needs to be mapped back to original indices.
+    # The logic here: find the cut-off index where CDF >= tau.
+    cutoff_mask = cdf < tau
+    # Because we check < tau, the first element that makes it >= tau is False. 
+    # We want to include that "crossing" element. 
+    # Shift mask to the right to select the one that crosses the threshold.
+    cutoff_mask = torch.cat([torch.ones_like(cutoff_mask[..., :1], dtype=torch.bool), cutoff_mask[..., :-1]], dim=-1)
+    
+    # Create the block mask M. Initialize with zeros (all False).
+    M = torch.zeros_like(similarity, dtype=torch.bool)
+    # Scatter the True values back to the original positions based on sorted_indices
+    M.scatter_(dim=-1, index=sorted_indices, src=cutoff_mask)
+
+    # M[i, :] = 1, If sqi < θ ; 
+    q_mask = q_similarity < theta
+    # Broadcast q_mask to match M's shape [batch, num_q_heads, num_blocks_q, num_blocks_k]
+    # q_similarity is [batch, num_q_heads, num_blocks_q]
+    M = M | q_mask.unsqueeze(-1)
+
+    # TODO shape of mask
+    # M[:, j] = 1, If skj < θ ;
+    k_mask = k_similarity < theta
+    # k_similarity is [batch, num_k_heads, num_blocks_k]
+    # Note: Assuming num_q_heads == num_k_heads or broadcastable for GQA/MQA handled by torch
+    M = M | k_mask.unsqueeze(-2)
 
     return q_mean, q_similarity, k_mean, k_similarity
