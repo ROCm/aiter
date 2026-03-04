@@ -19,7 +19,6 @@ struct MlaMetadataV12Traits
     static constexpr int32_t kUniSeqlenQo  = kUniSeqlenQo_;
     static constexpr int32_t kIsSparse     = kIsSparse_;
     static constexpr int32_t kLdsBatchInfo = kLdsBatchInfo_;
-    static constexpr int32_t kTailDoneThreshold = 4;
 };
 
 template <typename Traits>
@@ -181,7 +180,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                         work_info.kv_end = ck_tile::min(
                             work_info.kv_start + (remain_kv_blocks * params.kv_granularity),
                             curr_kv_end - batch_tail);
-                        if ((curr_kv_end - work_info.kv_end < Traits::kTailDoneThreshold &&
+                        if ((curr_kv_end - work_info.kv_end < params.tail_done_threshold &&
                             curr_kv_end - work_info.kv_end > 0) || cur_tail_done)
                         {
                             work_info.kv_end = ck_tile::min(curr_kv_end - batch_tail, curr_kv_end);
@@ -321,7 +320,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                             work_info.kv_end = ck_tile::min(
                                 work_info.kv_start + (consuming_blks * params.kv_granularity),
                                 curr_kv_end - batch_tail);
-                            if (curr_kv_end - work_info.kv_end < Traits::kTailDoneThreshold)
+                            if (curr_kv_end - work_info.kv_end < params.tail_done_threshold)
                             {
                                 cur_tail_done = true;
                                 work_info.kv_end = ck_tile::min(curr_kv_end, curr_kv_end - batch_tail);
@@ -498,6 +497,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     params.topk                         = (topk < 0) ? topk : (topk + page_size - 1) / page_size;
     params.qk_batch_ratio               = qk_batch_ratio;
     params.fixed_over_head_num_blocks   = max(1, (16 + page_size - 1) / page_size);
+    params.tail_done_threshold          = max_seqlen_qo;
 
     // launch kernel
     MLA_METADATA_DISPATCHER(
