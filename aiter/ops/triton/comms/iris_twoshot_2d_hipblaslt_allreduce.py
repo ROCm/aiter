@@ -29,6 +29,8 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.comms import is_graph_capturing
+
 __all__ = ["fused_allreduce_add_rms_row_quant_gemm_iris_twoshot_2d_hipblaslt"]
 
 logger = logging.getLogger(__name__)
@@ -333,16 +335,11 @@ class IrisTwoshot2dHipblasltManager:
             if torch.distributed.is_initialized()
             else 0
         )
-        logger.info(
-            "Initializing Iris (twoshot-2d-hipblaslt) symmetric heap: "
-            f"rank={cur_rank}, heap_size={self._heap_size / 2**30:.1f}GB"
-        )
-
         self._shmem = iris.iris(self._heap_size)
 
         logger.info(
-            f"Iris (twoshot-2d-hipblaslt) initialized successfully "
-            f"on rank {cur_rank}"
+            f"Iris (twoshot-2d-hipblaslt) initialized: "
+            f"rank={cur_rank}, heap_size={self._heap_size / 2**30:.1f}GB"
         )
 
     @property
@@ -404,7 +401,7 @@ class IrisTwoshot2dHipblasltManager:
             self._input_M = M
             self._input_N = N
             self._input_dtype = input_dtype
-            logger.info(
+            logger.debug(
                 f"Iris (twoshot-2d-hipblaslt): allocated input buffer "
                 f"({M}, {N}), dtype={input_dtype}, rank={cur_rank}"
             )
@@ -414,7 +411,7 @@ class IrisTwoshot2dHipblasltManager:
             self._quant_heap_M = M
             self._quant_heap_N = N
             self._quant_heap_dtype = quant_dtype
-            logger.info(
+            logger.debug(
                 f"Iris (twoshot-2d-hipblaslt): allocated quant heap buffer "
                 f"({M}, {N}), dtype={quant_dtype}, rank={cur_rank}"
             )
@@ -422,7 +419,7 @@ class IrisTwoshot2dHipblasltManager:
         if need_scale:
             self._scale_heap_buf = shmem.zeros((M,), dtype=torch.float32)
             self._scale_heap_M = M
-            logger.info(
+            logger.debug(
                 f"Iris (twoshot-2d-hipblaslt): allocated scale heap buffer "
                 f"({M},), dtype=float32, rank={cur_rank}"
             )
@@ -472,7 +469,7 @@ class IrisTwoshot2dHipblasltManager:
         self._out_result = torch.empty(
             (M, N), dtype=dtype, device=device,
         )
-        logger.info(
+        logger.debug(
             f"Iris (twoshot-2d-hipblaslt): allocated result_out "
             f"({M}, {N}), dtype={dtype}, rank={cur_rank}"
         )
@@ -513,7 +510,8 @@ class IrisTwoshot2dHipblasltManager:
 
         # Pre-kernel barrier: ensure all ranks have copied input to heap
         # before any rank's kernel starts reading from peers.
-        shmem.device_barrier()
+        if not is_graph_capturing():
+            shmem.device_barrier()
 
         # FP8 max value
         fp8_max = torch.finfo(quant_dtype).max
@@ -526,7 +524,7 @@ class IrisTwoshot2dHipblasltManager:
 
         # ---- Tunable parameters ----
         num_xcds = iris.hip.get_num_xcc()
-        BLOCK_SIZE_M = 2
+        BLOCK_SIZE_M = 1
         BLOCK_SIZE_N = triton.next_power_of_2(N)
         ACTUAL_N = N
         PADDED_N = (BLOCK_SIZE_N != N)
@@ -586,7 +584,8 @@ class IrisTwoshot2dHipblasltManager:
         # Post-kernel barrier: ensure all ranks have finished writing
         # FP8 data + scales to the heap before any rank overwrites its
         # input buffer on the next iteration.
-        shmem.device_barrier()
+        if not is_graph_capturing():
+            shmem.device_barrier()
 
         # hipBLASLt GEMM
         K_GEMM = gemm_weight.shape[1]
