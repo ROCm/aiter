@@ -427,7 +427,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
         __syncthreads();
     }
     // maybe do not need device sync
-    // end_sync<ngpus, true>(sg, self_sg, rank);
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
