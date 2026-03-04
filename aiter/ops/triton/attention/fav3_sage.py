@@ -200,7 +200,7 @@ def fav3_sage_wrapper_func(
     softcap: float = 0.0,
     deterministic: bool = False,
     sm_margin: int = 0,
-    inference_mode: bool = True,
+    return_lse: bool = True,
     layout: str = "bshd",
     config: Optional[dict] = None,
     block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
@@ -268,8 +268,6 @@ def fav3_sage_wrapper_func(
         raise NotImplementedError(
             "sm_margin != 0 not supported in Sage Attention v1 API"
         )
-
-    return_lse = not inference_mode
 
     return _FAv3SageWrapperFunc.apply(
         q,
