@@ -406,8 +406,10 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                   torch::Tensor& reduce_partial_map)
 {
     constexpr int32_t kPackedQoLenPerWg = 128;
+    // TODO(rocm): No device guard?
     const hipStream_t stream            = at::hip::getCurrentHIPStream();
 
+    // TODO(rocm): get_num_cu?
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
     hipGetDevice(&dev);
@@ -431,7 +433,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         (kv_dtype == at::ScalarType::Float8_e4m3fnuz || kv_dtype == at::ScalarType::Float8_e4m3fn);
 
     const bool natively_supported = (num_heads == 16) ||
-                                    ((arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 &&
+                                    ((arch_id == GPUArchId::gfx950) && (num_heads == 32) && q_is_fp8 &&
                                      kv_is_fp8 && (max_seqlen_qo == 4)) ||
                                     ((num_heads == 128) && q_is_fp8 && kv_is_fp8);
 
