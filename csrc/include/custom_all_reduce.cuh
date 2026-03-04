@@ -686,6 +686,37 @@ __global__ void __launch_bounds__(512, 1) allgather_vec(
     }
 }
 
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) allgather_lastdim(
+    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size, int last_dim_size)
+{
+    constexpr int tnum_gpu = THREAD_NUM / ngpus;
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                = typename opus::vector_t<T, pack_size>;
+    int warp_id            = threadIdx.x / tnum_gpu;
+    int lane_id            = threadIdx.x % tnum_gpu;
+    int tid                = blockIdx.x * tnum_gpu + lane_id;
+    int stride             = gridDim.x * tnum_gpu;
+
+    last_dim_size /= pack_size;
+    const P* ptrs[ngpus];
+
+#pragma unroll
+    for(int i = 0; i < ngpus; ++i)
+    {
+        ptrs[i] = (const P*)_dp->ptrs[i];
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    for (int idx = tid; idx < size; idx += stride)
+    {
+        int y = idx / last_dim_size;
+        int x = idx % last_dim_size;
+        int write_idx = (ngpus * y + warp_id) * last_dim_size + x;
+        *(reinterpret_cast<P*>(&result[0]) + write_idx) = ptrs[warp_id][idx];
+    }
+}
+
 /*
  * reduce_scatter, at first dim
  * range = size / (pack_size * ngpu)
@@ -2255,33 +2286,61 @@ void dispatchReduceScatter(hipStream_t stream, T* input, T* output, int size)
 }
 
 template <typename T>
-void dispatchAllGather(hipStream_t stream, T* input, T* output, int size)
+void dispatchAllGather(hipStream_t stream, T* input, T* output, int size, int last_dim_size, int gather_dim)
 {
     RankData* ptrs = get_buffer_RD(stream, input);
     auto d         = 16 / sizeof(T);
     dim3 block(512);
-    if(size % d != 0)
+    // only support gather first dim and gather last dim
+    // gather first dim
+    if (gather_dim == 0)
     {
-        int block_num = (size + 512 - 1) / 512;
-        dim3 grid(std::min(block_num, 80));
-        switch(world_size_)
+        if(size % d != 0)
         {
-        case 8:
-            allgather_naive<T, 8>
-                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
-            break;
-        case 4:
-            allgather_naive<T, 4>
-                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
-            break;
-        case 2:
-            allgather_naive<T, 2>
-                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
-            break;
-        default: printf("allgather world_size error\n");
+            int block_num = (size + 512 - 1) / 512;
+            dim3 grid(std::min(block_num, 80));
+            switch(world_size_)
+            {
+            case 8:
+                allgather_naive<T, 8>
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+                break;
+            case 4:
+                allgather_naive<T, 4>
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+                break;
+            case 2:
+                allgather_naive<T, 2>
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+                break;
+            default: printf("allgather world_size error\n");
+            }
+        }
+        else
+        {
+            size /= d;
+            int tnum_per_block = 512 / world_size_;
+            int block_num      = (size + tnum_per_block - 1) / tnum_per_block;
+            dim3 grid(std::min(block_num, 80));
+            switch(world_size_)
+            {
+            case 8:
+                allgather_vec<T, 8>
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+                break;
+            case 4:
+                allgather_vec<T, 4>
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+                break;
+            case 2:
+                allgather_vec<T, 2>
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+                break;
+            default: printf("allgather world_size error\n");
+            }
         }
     }
-    else
+    else // gather last dim
     {
         size /= d;
         int tnum_per_block = 512 / world_size_;
@@ -2290,16 +2349,16 @@ void dispatchAllGather(hipStream_t stream, T* input, T* output, int size)
         switch(world_size_)
         {
         case 8:
-            allgather_vec<T, 8>
-                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+            allgather_lastdim<T, 8>
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size, last_dim_size);
             break;
         case 4:
-            allgather_vec<T, 4>
-                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+            allgather_lastdim<T, 4>
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size, last_dim_size);
             break;
         case 2:
-            allgather_vec<T, 2>
-                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+            allgather_lastdim<T, 2>
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size, last_dim_size);
             break;
         default: printf("allgather world_size error\n");
         }
