@@ -2046,7 +2046,7 @@ struct mfma_adaptor : public remove_cvref_t<MFMA> {
 
     // by default, this is X shape, P + Y
     OPUS_D static constexpr auto shape_a() { return tuple<number<grpm_a>, number<rept_a>, number<grpk_a>, number<pack_a>>{}; }
-    OPUS_D static constexpr auto shape_b() { return tuple<number<grpn_b>, number<rept_b>, number<grpk_a>, number<pack_b>>{}; }
+    OPUS_D static constexpr auto shape_b() { return tuple<number<grpn_b>, number<rept_b>, number<grpk_b>, number<pack_b>>{}; }
     OPUS_D static constexpr auto shape_c() { return tuple<number<rept_c>, number<grpm_c>, number<pack_c>, number<grpn_c>>{}; }
 
     // here we describe above shape by group them into a 2d shape style, and with p/y dim. we could put into same structure, but let's make things easier
@@ -2079,10 +2079,35 @@ struct mfma_adaptor_swap_ab : mfma_adaptor<MFMA> {
 
     OPUS_ADAPTOR_LAYOUT_API_DEFINE
 };
+
+// Swap A/B and swizzle B row mapping so C can use larger vector stores (pack_c*2)
+// B: grpn_b decomposed as (2,2,2,4); lane->row permuted. Requires base::grpn_b == 32
+// C: [(grpn_c<p>), (rept_c/2<y>, grpm_c<p>, pack_c*2<y>)], MxN transposed(!)
+template<typename MFMA>
+struct mfma_adaptor_swap_ab_swizzle_b : mfma_adaptor_swap_ab<MFMA> {
+    using base = mfma_adaptor_swap_ab<MFMA>;
+    static_assert(base::grpn_b == 32, "mfma_adaptor_swap_ab_swizzle_b requires grpn_b == 32 (B row decomposition 2*2*2*4)");
+    using base::shape_a; using base::dim_a;
+    OPUS_D static constexpr auto shape_b() { return tuple<number<2>, number<2>, number<2>, number<4>, number<base::rept_b>, number<base::grpk_b>, number<base::pack_b>>{}; }
+    OPUS_D static constexpr auto dim_b() { return tuple<tuple<p_dim, p_dim, p_dim, p_dim>, tuple<y_dim, p_dim, y_dim>>{}; }
+    OPUS_D static constexpr auto shape_c() { return tuple<number<base::grpn_c>, number<base::rept_c / 2>, number<base::grpm_c>, number<base::pack_c * 2>>{}; }
+    using base::dim_c;
+
+    template<typename VA, typename VB, typename VC, index_t cbsz = 0, index_t abid = 0, index_t blgp = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) {
+        return base::operator()(a, b, c, number<cbsz>{}, number<abid>{}, number<blgp>{});
+    }
+    template<typename VA, typename VB, index_t cbsz = 0, index_t abid = 0, index_t blgp = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) {
+        typename MFMA::vtype_c c{0}; return operator()(a, b, c, number<cbsz>{}, number<abid>{}, number<blgp>{});
+    }
+    OPUS_ADAPTOR_LAYOUT_API_DEFINE
+};
 }
 // helper class to create adaptor instance for mfma, need be paired with make_mfma(). don't directly use it
-struct mfma_adaptor         { template<typename M> OPUS_D decltype(auto) operator()(M&&) { return impl::mfma_adaptor<remove_cvref_t<M>>{};} };
+struct mfma_adaptor { template<typename M> OPUS_D decltype(auto) operator()(M&&) { return impl::mfma_adaptor<remove_cvref_t<M>>{};} };
 struct mfma_adaptor_swap_ab { template<typename M> OPUS_D decltype(auto) operator()(M&&) { return impl::mfma_adaptor_swap_ab<remove_cvref_t<M>>{};} };
+struct mfma_adaptor_swap_ab_swizzle_b { template<typename M> OPUS_D decltype(auto) operator()(M&&) { return impl::mfma_adaptor_swap_ab_swizzle_b<remove_cvref_t<M>>{};} };
 
 template<typename d_a, typename d_b, typename d_c, index_t w_m, index_t w_n, index_t w_k, typename A = mfma_adaptor, index_t warp_size_ = get_warp_size()>
 OPUS_D decltype(auto) make_mfma(number<w_m>, number<w_n>, number<w_k>, A&& = {}, number<warp_size_> = {}) { return A{}(mfma<d_a, d_b, d_c, w_m, w_n, w_k, warp_size_>{}); }
