@@ -1835,6 +1835,9 @@ void fused_qk_norm_rope_cache_block_quant_shuffle(
      int64_t x          = k_cache.size(-1);
      TORCH_CHECK(x > 0 && (x & (x - 1)) == 0,
                  "KV cache tiling size (x) must be a power of two, got ", x);
+     // vec_size is 8 for bf16/fp16, 4 for fp32; vec_per_x = x/vec_size requires x >= vec_size
+     TORCH_CHECK(x >= 4,
+                 "KV cache tiling size (x) must be >= 4 for vectorized access, got ", x);
      TORCH_CHECK(position_ids.size(0) == num_tokens,
                  "Number of tokens in position_ids must match QKV");
 
