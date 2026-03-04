@@ -14,6 +14,7 @@ from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
     moe_gemm_a4w4,
     moe_gemm_torch,
     swizzle_scales,
+    swizzle_scales_gfx1250,
 )
 
 # numerics utilities
@@ -214,6 +215,7 @@ class Case:
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
 @pytest.mark.parametrize("fused_quant", [False, True])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_op(
     m,
     n,
@@ -226,10 +228,9 @@ def test_op(
     n_expts_tot,
     n_expts_act,
     hbm_swizzling,
+    backend,
     device="cuda",
 ):
-    if get_arch() != "gfx950":
-        pytest.skip("FP4 kernels are not supported on MI300.")
     if hbm_swizzling:
         if n % 32 != 0 or k % (32 * 8) != 0:
             pytest.skip(
@@ -266,8 +267,14 @@ def test_op(
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
     if hbm_swizzling:
-        swizzle_mx_scale = "CDNA4_SCALE"
-        w_scale_tri = swizzle_scales(w_scale_tri)
+        if get_arch() == "gfx1250":
+            swizzle_mx_scale = "GFX1250_SCALE"
+            w_scale_tri = swizzle_scales_gfx1250(w_scale_tri)
+        elif get_arch() == "gfx950":
+            swizzle_mx_scale = "CDNA4_SCALE"
+            w_scale_tri = swizzle_scales(w_scale_tri)
+        else:
+            assert False, "Unsupported architecture"
     else:
         swizzle_mx_scale = None
 
@@ -285,6 +292,8 @@ def test_op(
         quant_static_scale = ref_y.abs().max().float() / 448.0
     else:
         quant_static_scale = None
+
+    # run kernel
     tri_y = moe_gemm_a4w4(
         x_tri,
         w_tri,
@@ -300,6 +309,7 @@ def test_op(
         swizzle_mx_scale,
         out_dtype,
         apply_swiglu,
+        backend=backend,
     )
     if not act_mxfp4 and fused_quant:
         tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)
