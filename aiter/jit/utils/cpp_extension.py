@@ -1763,7 +1763,16 @@ def _write_ninja_file(
     blocks = [config, flags, compile_rule]
     if with_cuda:
         blocks.append(cuda_compile_rule)  # type: ignore[possibly-undefined]
-    blocks += [devlink_rule, link_rule, archive_rule, build, devlink, link, archive, default]
+    blocks += [
+        devlink_rule,
+        link_rule,
+        archive_rule,
+        build,
+        devlink,
+        link,
+        archive,
+        default
+    ]
     content = "\n\n".join("\n".join(b) for b in blocks)
     # Ninja requires a new lines at the end of the .ninja file
     content += "\n"
