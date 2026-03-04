@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
 #include <ATen/hip/HIPContext.h>
@@ -27,12 +27,18 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
                                    const at::Tensor v,
                                    std::optional<const at::Tensor> &bias_,
                                    std::optional<const at::Tensor> &alibi_slopes_,
+                                   std::optional<const at::Tensor> &q_descale_,
+                                   std::optional<const at::Tensor> &k_descale_,
+                                   std::optional<const at::Tensor> &v_descale_,
                                    at::Tensor out,
                                    at::Tensor softmax_lse,
                                    at::Tensor dropout_randval,
                                    float softmax_scale,
                                    float p_dropout,
-                                   std::pair<uint64_t*, uint64_t*> drop_seed_offset)
+                                   std::pair<uint64_t*, uint64_t*> drop_seed_offset,
+                                   const std::string& data_type,
+                                   bias_enum bias_type,
+                                   int how_v3_bf16_cvt)
 {
     // q: (batch_size, seqlen_q, nheads, d)
     // k: (batch_size, seqlen_k, nheads_k, d)
@@ -67,6 +73,16 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
 
     void *bias_ptr = nullptr;
     ck_tile::index_t stride_bias = 0;
+    ck_tile::index_t nhead_stride_descale_q = 0;
+    ck_tile::index_t nhead_stride_descale_k = 0;
+    ck_tile::index_t nhead_stride_descale_v = 0;
+    ck_tile::index_t batch_stride_descale_q = 0;
+    ck_tile::index_t batch_stride_descale_k = 0;
+    ck_tile::index_t batch_stride_descale_v = 0;
+
+    void *q_descale_ptr = nullptr;
+    void *k_descale_ptr = nullptr;
+    void *v_descale_ptr = nullptr;
 
     if (bias_.has_value()) {
         auto bias = bias_.value();
@@ -85,13 +101,53 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
         stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
 
-    return mha_fwd_args{q.data_ptr(),
+    if (q_descale_.has_value()) {
+        auto q_descale = q_descale_.value();
+        CHECK_DEVICE(q_descale);
+        TORCH_CHECK(q_descale.sizes() == torch::IntArrayRef({1}) || q_descale.sizes() == torch::IntArrayRef({b, h_k}));
+        if (q_descale.dim() == 2) {
+            batch_stride_descale_q = q_descale.stride(0);
+            nhead_stride_descale_q = q_descale.stride(1);
+        }
+        q_descale_ptr = q_descale.data_ptr();
+    }
+    if (k_descale_.has_value()) {
+        auto k_descale = k_descale_.value();
+        CHECK_DEVICE(k_descale);
+        TORCH_CHECK(k_descale.sizes() == torch::IntArrayRef({1}) || k_descale.sizes() == torch::IntArrayRef({b, h_k}));
+        if (k_descale.dim() == 2) {
+            batch_stride_descale_k = k_descale.stride(0);
+            nhead_stride_descale_k = k_descale.stride(1);
+        }
+        k_descale_ptr = k_descale.data_ptr();
+    }
+    if (v_descale_.has_value()) {
+        auto v_descale = v_descale_.value();
+        CHECK_DEVICE(v_descale);
+        TORCH_CHECK(v_descale.sizes() == torch::IntArrayRef({1}) || v_descale.sizes() == torch::IntArrayRef({b, h_k}));
+        if (v_descale.dim() == 2) {
+            batch_stride_descale_v = v_descale.stride(0);
+            nhead_stride_descale_v = v_descale.stride(1);
+        }
+        v_descale_ptr = v_descale.data_ptr();
+    }
+
+    return mha_fwd_args{true, // use_asm_v3
+                        false, // v3_api_check
+                        how_v3_bf16_cvt,
+                        data_type,
+                        false, // is_group_mode
+                        static_cast<int>(bias_type),
+                        has_lse,
+                        0, // qscale_type
+                        false, //has_sink
+                        q.data_ptr(),
                         k.data_ptr(),
                         v.data_ptr(),
                         bias_ptr,
-                        nullptr, // q_descale_ptr
-                        nullptr, // k_descale_ptr
-                        nullptr, // v_descale_ptr
+                        q_descale_ptr,
+                        k_descale_ptr,
+                        v_descale_ptr,
                         has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
                         has_lse ? softmax_lse.data_ptr() : nullptr,
                         out.data_ptr(),
@@ -101,6 +157,9 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
                         nullptr, // seqlen_k_ptr
                         nullptr, // cu_seqlen_q_ptr
                         nullptr, // cu_seqlen_k_ptr
+                        nullptr, // block_scale_seqstart_q_ptr
+                        nullptr, // block_scale_seqstart_k_ptr
+                        nullptr, //sink_ptr
                         seqlen_q,
                         seqlen_k,
                         b,
@@ -124,6 +183,9 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
                         nhead_stride_randval,
                         nhead_stride_lse,
                         nhead_stride_o,
+                        nhead_stride_descale_q,
+                        nhead_stride_descale_k,
+                        nhead_stride_descale_v,
                         batch_stride_q,
                         batch_stride_k,
                         batch_stride_v,
@@ -131,13 +193,19 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
                         batch_stride_randval,
                         batch_stride_lse,
                         batch_stride_o,
+                        batch_stride_descale_q,
+                        batch_stride_descale_k,
+                        batch_stride_descale_v,
                         mask.left,
                         mask.right,
+                        0, // sink_size
                         static_cast<ck_tile::index_t>(mask.type),
                         0, // min_seqlen_q
                         p_dropout,
                         has_dropout_randval,
-                        drop_seed_offset};
+                        drop_seed_offset,
+                        128, // block_scale_size_q (per-block quantization block size)
+                        128}; // block_scale_size_kv (per-block quantization block size)
 }
 
 std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
@@ -154,18 +222,45 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
                                     std::optional<at::Tensor> out_,          // [b, sq, hq, d_v]
                                     std::optional<const at::Tensor> bias_,   // [sq, sk]
                                     std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
+                                    std::optional<const at::Tensor> q_descale_,    // [1] or [b, h_k]
+                                    std::optional<const at::Tensor> k_descale_,    // [1] or [b, h_k]
+                                    std::optional<const at::Tensor> v_descale_,    // [1] or [b, h_k]
                                     std::optional<at::Generator> gen_)
 {
     auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-                "FlashAttention only support fp16 and bf16 data type");
+    bool is_qkv_fp8 = q_dtype == at::ScalarType::Float8_e4m3fn || q_dtype == at::ScalarType::Float8_e4m3fnuz;
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16 || is_qkv_fp8,
+                "FlashAttention only support fp16, bf16 and fp8_e4m3 data type");
 
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
 
-    std::string q_dtype_str = q_dtype == torch::kFloat16 ? "fp16" : "bf16";
+    std::string dtype_str;
+    if (q_dtype == torch::kFloat16) {
+        dtype_str = "fp16";
+    } else if (q_dtype == torch::kBFloat16) {
+        dtype_str = "bf16";
+    } else if (is_qkv_fp8) {
+        if (!out_.has_value() || out_.value().dtype() == torch::kBFloat16)
+            dtype_str = "fp8bf16"; // only support bf16 out for fp8
+        else
+            TORCH_CHECK(false, "For FP8 input, output must have dtype BF16 for now");
+    }
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
+
+    TORCH_CHECK(q_descale_.has_value() == k_descale_.has_value() &&
+                k_descale_.has_value() == v_descale_.has_value(),
+                "q_descale, k_descale, v_descale must be all provided or all not provided");
+    if(is_qkv_fp8)
+    {
+        TORCH_CHECK(q_descale_.has_value(),
+                    "q_descale, k_descale, v_descale must be provided for asm fp8");
+        TORCH_CHECK(q_descale_.value().dtype() == torch::kFloat32 &&
+                        k_descale_.value().dtype() == torch::kFloat32 &&
+                        v_descale_.value().dtype() == torch::kFloat32,
+                    "q_descale, k_descale, v_descale must be float32");
+    }
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
@@ -230,10 +325,11 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
     CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size_v);
 
     auto opts = q.options();
+    auto out_type = dtype_str == "fp8bf16" ? torch::kBFloat16 : q.scalar_type();
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
-        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        TORCH_CHECK(out.dtype() == out_type, "For FP16/BF16 input, output must have the same dtype as inputs. For FP8 input, output must have dtype BF16");
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, batch_size, sizes[1], sizes[2], head_size_v);
@@ -242,7 +338,7 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
         }
     }
     else {
-        out = torch::empty({batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(q_dtype));
+        out = torch::empty({batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(out_type));
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -304,23 +400,20 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
                 v,
                 bias_,
                 alibi_slopes_,
+                q_descale_,
+                k_descale_,
+                v_descale_,
                 out,
                 softmax_lse,
                 p,
                 softmax_scale,
                 p_dropout,
-                drop_seed_offset);
+                drop_seed_offset,
+                dtype_str,
+                bias_type,
+                how_v3_bf16_cvt);
 
-        float t = aiter::mha_fwd(args,
-                                 stream_config,
-                                 q_dtype_str,
-                                 false, // is_group_mode
-                                 mask.type,
-                                 bias_type,
-                                 has_lse,
-                                 quant_scale_enum::no_scale,
-                                 true,
-                                 how_v3_bf16_cvt);
+        float t = aiter::mha_fwd(args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
     }
     else {

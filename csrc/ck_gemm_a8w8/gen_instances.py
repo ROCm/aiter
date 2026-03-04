@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
 import os
 import shutil
@@ -175,12 +175,28 @@ template torch::Tensor
 
 """
         if self.istune:
-            INSTANCE_abI8_dBF16_eBF16 = INSTANCE_template.format(
-                name=k.name, dtypes="I8, B16"
-            )
-            Path(
-                os.path.join(self.instances_path, f"{k.name}_abI8_dB16_eB16.cpp")
-            ).write_text(INSTANCE_abI8_dBF16_eBF16)
+            # Generate both I8 and F8 instances for tuning
+            # I8 instances
+            for EDtype in ["B16"]:
+                INSTANCE_abI8 = INSTANCE_template.format(
+                    name=k.name, dtypes=f"I8, B16, {EDtype}"
+                )
+                Path(
+                    os.path.join(
+                        self.instances_path, f"{k.name}_abI8_dB16_e{EDtype}.cpp"
+                    )
+                ).write_text(INSTANCE_abI8)
+
+            # F8 instances
+            for EDtype in ["B16"]:
+                INSTANCE_abF8 = INSTANCE_template.format(
+                    name=k.name, dtypes=f"F8, F32, {EDtype}"
+                )
+                Path(
+                    os.path.join(
+                        self.instances_path, f"{k.name}_abF8_dF32_e{EDtype}.cpp"
+                    )
+                ).write_text(INSTANCE_abF8)
         else:
             for EDtype in ["B16", "F16"]:
                 for ABDtype in ["I8", "F8"]:

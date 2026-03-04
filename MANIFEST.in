@@ -1,2 +1,6 @@
 graft aiter
 graft aiter_meta
+ 
+# exclude cache and compiled files .pyc / .pyo / .pyd / .pyd 
+global-exclude *.py[cod]
+prune aiter/jit/build

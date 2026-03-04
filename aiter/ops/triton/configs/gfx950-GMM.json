@@ -19,6 +19,15 @@
             "GRID_DIM": 256,
             "num_warps": 8,
             "num_stages": 1
+        },
+        "accumulate": {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_K": 128,
+            "BLOCK_SIZE_N": 128,
+            "GROUP_SIZE": 1,
+            "GRID_DIM": 256,
+            "num_warps": 8,
+            "num_stages": 1
         }
     },
     "nptgmm": {
@@ -26,6 +35,14 @@
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_K": 256,
             "BLOCK_SIZE_N": 256,
+            "GROUP_SIZE": 1,
+            "num_warps": 8,
+            "num_stages": 1
+        },
+        "accumulate": {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_K": 128,
+            "BLOCK_SIZE_N": 128,
             "GROUP_SIZE": 1,
             "num_warps": 8,
             "num_stages": 1

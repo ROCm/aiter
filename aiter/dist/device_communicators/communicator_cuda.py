@@ -7,7 +7,9 @@ from torch.distributed import ProcessGroup
 
 should_nccl_symm_mem_allreduce = False
 from aiter.dist.parallel_state import is_global_first_rank
-from aiter import logger
+from aiter import logger, get_hip_quant
+from aiter.utility.dtypes import fp8
+from aiter.ops.enum import QuantType
 from .base_device_communicator import DeviceCommunicatorBase
 
 
@@ -49,10 +51,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 PyNcclCommunicator,
             )
 
-            self.pynccl_comm = PyNcclCommunicator(
-                group=self.cpu_group,
-                device=self.device,
-            )
+            try:
+                self.pynccl_comm = PyNcclCommunicator(
+                    group=self.cpu_group,
+                    device=self.device,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to initialize PyNcclCommunicator for group "
+                    f"{self.unique_name}. Exception: {e}"
+                )
             # if is_symmetric_memory_enabled():
             #     register_nccl_symmetric_ops(self.pynccl_comm)
 
@@ -149,6 +157,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             qr_comm is not None
             and not qr_comm.disabled
             and qr_comm.should_quick_allreduce(input_)
+            # input shape estimated at 2 * max concurrency for now. if performance issues, subject to change
         ):
             out = qr_comm.quick_all_reduce(input_)
             assert out is not None
@@ -185,10 +194,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self, input_, res_inp_, weight_, eps
     ) -> tuple[torch.Tensor, torch.Tensor]:
         n = input_.shape[-1]
+        total_bytes = input_.numel() * input_.element_size()
         can_use_fuse_ar_rms = (
-            n <= 16384
-            and input_.numel() * input_.element_size() < 8 * 1024 * 8192
-            and self.world_size != 6
+            n <= 16384 and total_bytes < 8 * 1024 * 8192 and self.world_size != 6
         )
         ca_comm = self.ca_comm
         if (
@@ -197,7 +205,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and ca_comm.should_custom_ar(input_)
             and can_use_fuse_ar_rms
         ):
-            out, res_out = ca_comm.custom_fused_ar_rms(input_, res_inp_, weight_, eps)
+            use_1stage = True if total_bytes <= 128 * 1024 else False
+            out, res_out = ca_comm.custom_fused_ar_rms(
+                input_, res_inp_, weight_, eps, use_1stage
+            )
             assert out is not None
             assert res_out is not None
             return out, res_out
@@ -218,30 +229,58 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
         return out, residual_out
 
-    def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
+    def fused_allreduce_rmsnorm_quant(
+        self, input_, res_inp_, weight_, eps
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        total_bytes = input_.numel() * input_.element_size()
+        if (
+            int(input_.shape[-1]) in [512, 1024, 2048, 4096]
+            and total_bytes <= 4096 * 1024
+        ):
+            use_1stage = True if total_bytes <= 128 * 1024 else False
+            out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_quant(
+                input_, res_inp_, weight_, eps, use_1stage
+            )
+        else:
+            out_, res_out = self.fused_allreduce_rmsnorm(input_, res_inp_, weight_, eps)
+            hip_quant = get_hip_quant(QuantType.per_Token)
+            out, scale_out = hip_quant(out_, quant_dtype=fp8)
+        assert out is not None
+        assert res_out is not None
+        assert scale_out is not None
+        return out, res_out, scale_out
+
+    def reduce_scatter(
+        self, input_: torch.Tensor, output_: torch.Tensor, dim: int = -1
+    ):
         world_size = self.world_size
-        pynccl_comm = self.pynccl_comm
-        assert pynccl_comm is not None
-        if dim < 0:
-            # Convert negative dim to positive.
-            dim += input_.dim()
+        ca_comm = self.ca_comm
+        if (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and ca_comm.should_custom_ar(input_)
+        ):
+            ca_comm.custom_reduce_scatter(input_, output_)
+        else:
+            pynccl_comm = self.pynccl_comm
+            assert pynccl_comm is not None
+            if dim < 0:
+                # Convert negative dim to positive.
+                dim += input_.dim()
 
-        # Note: This will produce an incorrect answer if we don't make
-        # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
-        input_tensor = input_.movedim(0, dim).contiguous()
+            # Note: This will produce an incorrect answer if we don't make
+            # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
+            input_tensor = input_.movedim(0, dim).contiguous()
 
-        assert input_tensor.shape[0] % world_size == 0
-        chunk_size = input_tensor.shape[0] // world_size
-        output_shape = (chunk_size,) + input_tensor.shape[1:]
+            assert input_tensor.shape[0] % world_size == 0
+            chunk_size = input_tensor.shape[0] // world_size
+            output_shape = (chunk_size,) + input_tensor.shape[1:]
+            output_.reshape(output_shape)
 
-        output = torch.empty(
-            output_shape, dtype=input_tensor.dtype, device=input_tensor.device
-        )
+            pynccl_comm.reduce_scatter(output_, input_tensor)
 
-        pynccl_comm.reduce_scatter(output, input_tensor)
-
-        # Reshape before returning
-        return output.movedim(0, dim).contiguous()
+            # Reshape before returning
+            output_.movedim(0, dim).contiguous()
 
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
@@ -313,9 +352,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.qr_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
-        if self.all2all_manager is not None:
-            self.all2all_manager.destroy()
-            self.all2all_manager = None
+        if self._all2all_manager is not None:
+            self._all2all_manager.destroy()
+            self._all2all_manager = None
 
     def all_gatherv(
         self,

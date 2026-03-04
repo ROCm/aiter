@@ -3,20 +3,18 @@
 
 from itertools import chain
 from pathlib import Path
-from copy import deepcopy
-import csv
 import triton.profiler as proton
 import torch
 import argparse
-from aiter.ops.triton.moe_routing.routing import routing
-from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
-from aiter.ops.triton.moe_op_gemm_a8w4 import (
+from aiter.ops.triton.moe.moe_routing.routing import routing
+from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
+from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
     moe_gemm_a8w4,
     swizzle_scales,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 import tempfile
-from aiter.ops.triton.quant_moe import downcast_to_static_fp8, downcast_to_mxfp
+from aiter.ops.triton.moe.quant_moe import downcast_to_static_fp8, downcast_to_mxfp
 import inspect
 
 
@@ -119,7 +117,7 @@ def quantize(x, dtype):
         return x, scale
 
 
-def bench_mlp(
+def bench_mlp_single_weight_init(
     batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex
 ):
     rank = 0
@@ -194,7 +192,7 @@ def bench_mlp(
             )
         else:
             assert x_dtype_str == "mx8"
-            x, _, x_scale = quantize(x, x_dtype_str)
+            x, x_scale = quantize(x, x_dtype_str)
             x = moe_gemm_a8w4(
                 x,
                 w1,
@@ -208,7 +206,7 @@ def bench_mlp(
                 swizzle_mx_scale="CDNA4_SCALE",
                 apply_swiglu=True,
             )
-            x, _, x_scale = quantize(x, x_dtype_str)
+            x, x_scale = quantize(x, x_dtype_str)
             x = moe_gemm_a8w4(
                 x,
                 w2,
@@ -227,6 +225,37 @@ def bench_mlp(
     )
 
 
+def bench_mlp(
+    batch,
+    dim1,
+    dim2,
+    n_expts_tot,
+    n_expts_act,
+    x_dtype,
+    w_dtype,
+    TP,
+    op_regex,
+    num_weight_inits=1,
+):
+    all_results = []
+    for i in range(num_weight_inits):
+        result = bench_mlp_single_weight_init(
+            batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex
+        )
+        all_results.append(result)
+
+    num_runs = len(all_results)
+    aggregated = {
+        "total_time_ns": sum(r["total_time_ns"] for r in all_results) / num_runs,
+        "kernel_time_ns": sum(r["kernel_time_ns"] for r in all_results) / num_runs,
+        "flops": sum(r["flops"] for r in all_results) / num_runs,
+        "bytes": sum(r["bytes"] for r in all_results) / num_runs,
+        "reps": all_results[0]["reps"],
+    }
+
+    return aggregated
+
+
 def roofline_mlp(
     batch_sizes,
     dim1,
@@ -238,6 +267,7 @@ def roofline_mlp(
     TP,
     op_regex,
     name="",
+    num_weight_inits=1,
 ):
     out_path = Path(f"logs/{name}/{x_dtype}x-{w_dtype}w-TP{TP}/")
     out_path.mkdir(parents=True, exist_ok=True)
@@ -250,6 +280,7 @@ def roofline_mlp(
         w_dtype,
         TP,
         op_regex,  # fixed args
+        num_weight_inits,
         bench_fn=bench_mlp,  # function to benchmark
         intensity_proxy_name="batch",  # intensity proxy name
         intensity_proxy_values=batch_sizes,  # intensity proxy values to sweep
@@ -285,6 +316,13 @@ def parse_args():
         default="fp8",
         help="Activation dtype, fp8 or mx8.",
     )
+    parser.add_argument(
+        "--num-weight-inits",
+        type=int,
+        default=1,
+        help="Number of different weight initializations to run for more stable results (default: 1). "
+        "Each initialization runs 100 iterations. Use higher values (e.g., 10) for more stable benchmarks.",
+    )
     args = parser.parse_args()
     return args
 
@@ -317,4 +355,5 @@ if __name__ == "__main__":
         TP=1,
         op_regex=args.op_regex,
         name="gpt-oss-x2",
+        num_weight_inits=args.num_weight_inits,
     )

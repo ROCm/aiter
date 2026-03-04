@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
 #include <ATen/hip/HIPContext.h>
@@ -26,17 +26,25 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                                           const at::Tensor k,
                                           const at::Tensor v,
                                           const at::Tensor cu_seqlens_q,
-                                          std::optional<const at::Tensor> &cu_seqlens_k,
+                                          const at::Tensor cu_seqlens_k,
+                                          std::optional<const at::Tensor> &cu_seqlens_q_padded,
+                                          std::optional<const at::Tensor> &cu_seqlens_k_padded,
                                           std::optional<const at::Tensor> &seqlens_k,
                                           std::optional<const at::Tensor> &bias_,
                                           std::optional<const at::Tensor> &alibi_slopes_,
+                                          std::optional<const at::Tensor> &q_descale_,
+                                          std::optional<const at::Tensor> &k_descale_,
+                                          std::optional<const at::Tensor> &v_descale_,
                                           at::Tensor out,
                                           at::Tensor softmax_lse,
                                           at::Tensor dropout_randval,
                                           float softmax_scale,
                                           float logits_soft_cap,
                                           float p_dropout,
-                                          std::pair<uint64_t*, uint64_t*> drop_seed_offset)
+                                          std::pair<uint64_t*, uint64_t*> drop_seed_offset,
+                                          const std::string& data_type,
+                                          bias_enum bias_type,
+                                          int how_v3_bf16_cvt)
 {
     // q: (total_q, nheads, d)
     // k: (total_k, nheads_k, d)
@@ -94,22 +102,94 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
         stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
 
-    return mha_fwd_args{q.data_ptr(),
+    const void* seqstart_q_ptr = nullptr;
+    const void* seqstart_k_ptr = nullptr;
+    const void* cu_seqlen_q_ptr = nullptr;
+    const void* cu_seqlen_k_ptr = nullptr;
+
+    if (cu_seqlens_k_padded.has_value()) {
+        seqstart_k_ptr = cu_seqlens_k_padded.value().data_ptr();
+        cu_seqlen_k_ptr = cu_seqlens_k.data_ptr();
+    } else {
+        seqstart_k_ptr = cu_seqlens_k.data_ptr();
+    }
+
+    if (cu_seqlens_q_padded.has_value()) {
+        seqstart_q_ptr = cu_seqlens_q_padded.value().data_ptr();
+        cu_seqlen_q_ptr = cu_seqlens_q.data_ptr();
+    } else {
+        seqstart_q_ptr = cu_seqlens_q.data_ptr();
+    }
+
+    ck_tile::index_t nhead_stride_descale_q = 0;
+    ck_tile::index_t nhead_stride_descale_k = 0;
+    ck_tile::index_t nhead_stride_descale_v = 0;
+    ck_tile::index_t batch_stride_descale_q = 0;
+    ck_tile::index_t batch_stride_descale_k = 0;
+    ck_tile::index_t batch_stride_descale_v = 0;
+    void *q_descale_ptr = nullptr;
+    void *k_descale_ptr = nullptr;
+    void *v_descale_ptr = nullptr;
+
+    if (q_descale_.has_value()) {
+        auto q_descale = q_descale_.value();
+        CHECK_DEVICE(q_descale);
+        TORCH_CHECK(q_descale.sizes() == torch::IntArrayRef({1}) || q_descale.sizes() == torch::IntArrayRef({b, h_k}));
+        if (q_descale.dim() == 2) {
+            batch_stride_descale_q = q_descale.stride(0);
+            nhead_stride_descale_q = q_descale.stride(1);
+        }
+        q_descale_ptr = q_descale.data_ptr();
+    }
+    if (k_descale_.has_value()) {
+        auto k_descale = k_descale_.value();
+        CHECK_DEVICE(k_descale);
+        TORCH_CHECK(k_descale.sizes() == torch::IntArrayRef({1}) || k_descale.sizes() == torch::IntArrayRef({b, h_k}));
+        if (k_descale.dim() == 2) {
+            batch_stride_descale_k = k_descale.stride(0);
+            nhead_stride_descale_k = k_descale.stride(1);
+        }
+        k_descale_ptr = k_descale.data_ptr();
+    }
+    if (v_descale_.has_value()) {
+        auto v_descale = v_descale_.value();
+        CHECK_DEVICE(v_descale);
+        TORCH_CHECK(v_descale.sizes() == torch::IntArrayRef({1}) || v_descale.sizes() == torch::IntArrayRef({b, h_k}));
+        if (v_descale.dim() == 2) {
+            batch_stride_descale_v = v_descale.stride(0);
+            nhead_stride_descale_v = v_descale.stride(1);
+        }
+        v_descale_ptr = v_descale.data_ptr();
+    }
+
+    return mha_fwd_args{true, // use_asm_v3
+                        false, // v3_api_check
+                        how_v3_bf16_cvt,
+                        data_type,
+                        true, //is_group_mode
+                        static_cast<int>(bias_type),
+                        has_lse,
+                        0, // qscale_type
+                        false, // has_sink
+                        q.data_ptr(),
                         k.data_ptr(),
                         v.data_ptr(),
                         bias_ptr,
-                        nullptr, // q_descale_ptr
-                        nullptr, // k_descale_ptr
-                        nullptr, // v_descale_ptr
+                        q_descale_ptr,
+                        k_descale_ptr,
+                        v_descale_ptr,
                         has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
                         has_lse ? softmax_lse.data_ptr() : nullptr,
                         out.data_ptr(),
-                        cu_seqlens_q.data_ptr(), // seqstart_q_ptr (cumulative physical)
-                        cu_seqlens_k.has_value() ? cu_seqlens_k.value().data_ptr() : nullptr, // seqstart_k_ptr
+                        seqstart_q_ptr, // seqstart_q_ptr (cumulative physical)
+                        seqstart_k_ptr, // seqstart_k_ptr
                         nullptr, // seqlen_q_ptr (per-sequence logical, not used here)
                         seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr, // seqlen_k_ptr
-                        nullptr, // cu_seqlen_q_ptr (not used in this mode)
-                        nullptr, // cu_seqlen_k_ptr (not used in this mode)
+                        cu_seqlen_q_ptr, // cu_seqlen_q_ptr
+                        cu_seqlen_k_ptr, // cu_seqlen_k_ptr
+                        nullptr, // block_scale_seqstart_q_ptr
+                        nullptr, // block_scale_seqstart_k_ptr
+                        nullptr, // sink_ptr
                         total_q,
                         total_k,
                         b,
@@ -133,6 +213,9 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                         nhead_stride_randval,
                         nhead_stride_lse,
                         nhead_stride_o,
+                        nhead_stride_descale_q,
+                        nhead_stride_descale_k,
+                        nhead_stride_descale_v,
                         batch_stride_q,
                         batch_stride_k,
                         batch_stride_v,
@@ -140,13 +223,19 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                         batch_stride_randval,
                         batch_stride_lse,
                         batch_stride_o,
+                        batch_stride_descale_q,
+                        batch_stride_descale_k,
+                        batch_stride_descale_v,
                         mask.left,
                         mask.right,
+                        0,              // sink_size
                         static_cast<ck_tile::index_t>(mask.type),
                         min_seqlen_q,
                         p_dropout,
                         has_dropout_randval,
-                        drop_seed_offset};
+                        drop_seed_offset,
+                        128, // block_scale_size_q
+                        128}; // block_scale_size_kv
 }
 
 
@@ -155,11 +244,7 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                const at::Tensor &k,            // [total_k, hk, d]
                const at::Tensor &v,            // [total_k, hk, d]
                const at::Tensor &cu_seqlens_q, // [b+1]
-               std::optional<const at::Tensor> &cu_seqlens_k, // [b+1]
-                // FIXME: this two args currently not support on ck side
-                //        and has no host code on aiter side
-                //    const at::Tensor& cu_seqlens_q_padded,   // [b+1]
-                //    const at::Tensor& cu_seqlens_k_padded,   // [b+1]
+               const at::Tensor &cu_seqlens_k, // [b+1]
                int max_seqlen_q,
                int max_seqlen_k,
                int min_seqlen_q,
@@ -177,26 +262,38 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                std::optional<const at::Tensor> block_table_,  // [hq] or [b, hq]
                std::optional<const at::Tensor> bias_,         // [total_q, max_seqlen_k]
                std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
-               std::optional<at::Generator> gen_)
+               std::optional<const at::Tensor> q_descale_,    // [1] or [b, h_k]
+               std::optional<const at::Tensor> k_descale_,    // [1] or [b, h_k]
+               std::optional<const at::Tensor> v_descale_,    // [1] or [b, h_k]
+               std::optional<at::Generator> gen_,
+               std::optional<const at::Tensor> cu_seqlens_q_padded,   // [b+1]
+               std::optional<const at::Tensor> cu_seqlens_k_padded)   // [b+1])
 {
     auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
-                "FlashAttention only support fp16 and bf16 data type");
+    bool is_qkv_fp8 = q_dtype == at::ScalarType::Float8_e4m3fn || q_dtype == at::ScalarType::Float8_e4m3fnuz;
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16 || is_qkv_fp8,
+                "FlashAttention only support fp16, bf16 and fp8_e4m3 data type");
 
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
-    if (cu_seqlens_k.has_value()) {
-        TORCH_CHECK(cu_seqlens_k.value().dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
-    }
+    TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
 
-    std::string q_dtype_str = q_dtype == torch::kFloat16 ? "fp16" : "bf16";
+    std::string dtype_str;
+    if (q_dtype == torch::kFloat16) {
+        dtype_str = "fp16";
+    } else if (q_dtype == torch::kBFloat16) {
+        dtype_str = "bf16";
+    } else if (is_qkv_fp8) {
+        if (!out_.has_value() || out_.value().dtype() == torch::kBFloat16)
+            dtype_str = "fp8bf16"; // only support bf16 out for fp8
+        else
+            TORCH_CHECK(false, "For FP8 input, output must have dtype BF16 for now");
+    }
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
     CHECK_DEVICE(cu_seqlens_q);
-    if (cu_seqlens_k.has_value()) {
-        CHECK_DEVICE(cu_seqlens_k.value());
-    }
+    CHECK_DEVICE(cu_seqlens_k);
 
     at::Tensor block_table;
     const bool paged_KV = block_table_.has_value();
@@ -207,13 +304,24 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
         TORCH_CHECK(block_table.stride(-1) == 1, "block_table must have contiguous last dimension");
     }
 
+    TORCH_CHECK(q_descale_.has_value() == k_descale_.has_value() &&
+                k_descale_.has_value() == v_descale_.has_value(),
+                "q_descale, k_descale, v_descale must be all provided or all not provided");
+    if(is_qkv_fp8)
+    {
+        TORCH_CHECK(q_descale_.has_value(),
+                    "q_descale, k_descale, v_descale must be provided for asm fp8");
+        TORCH_CHECK(q_descale_.value().dtype() == torch::kFloat32 &&
+                        k_descale_.value().dtype() == torch::kFloat32 &&
+                        v_descale_.value().dtype() == torch::kFloat32,
+                    "q_descale, k_descale, v_descale must be float32");
+    }
+
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     CHECK_CONTIGUOUS(cu_seqlens_q);
-    if (cu_seqlens_k.has_value()) {
-        CHECK_CONTIGUOUS(cu_seqlens_k.value());
-    }
+    CHECK_CONTIGUOUS(cu_seqlens_k);
 
     const auto sizes = q.sizes();
 
@@ -279,21 +387,20 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
     }
 
     CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
-    if (cu_seqlens_k.has_value()) {
-        CHECK_SHAPE(cu_seqlens_k.value(), batch_size + 1);
-    }
-    auto opts = q.options();
+    CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
 
+    auto opts = q.options();
+    auto out_type = dtype_str == "fp8bf16" ? torch::kBFloat16 : q.scalar_type();
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
-        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        TORCH_CHECK(out.dtype() == out_type, "For FP16/BF16 input, output must have the same dtype as inputs. For FP8 input, output must have dtype BF16");
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, total_q, num_heads, head_size_v);
     }
     else {
-        out = torch::empty({total_q, num_heads, head_size_v}, opts.dtype(q_dtype));
+        out = torch::empty({total_q, num_heads, head_size_v}, opts.dtype(out_type));
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -347,7 +454,6 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
         auto stream = at::hip::getCurrentHIPStream();
         ck_tile::stream_config stream_config{stream};
 
-        TORCH_CHECK(cu_seqlens_k.has_value(), "cu_seqlens_k must be provided if paged_KV is false");
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
         auto args =
             get_asm_mha_varlen_fwd_args(
@@ -366,28 +472,27 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                 v,
                 cu_seqlens_q,
                 cu_seqlens_k,
+                cu_seqlens_q_padded,
+                cu_seqlens_k_padded,
                 seqlens_k,
                 bias_,
                 alibi_slopes_,
+                q_descale_,
+                k_descale_,
+                v_descale_,
                 out,
                 softmax_lse,
                 p,
                 softmax_scale,
                 logits_soft_cap,
                 p_dropout,
-                drop_seed_offset);
+                drop_seed_offset,
+                dtype_str,
+                bias_type,
+                how_v3_bf16_cvt);
 
-        float t = aiter::mha_fwd(args,
-                                stream_config,
-                                q_dtype_str,
-                                true, //is_group_mode
-                                mask.type,
-                                bias_type,
-                                has_lse,
-                                quant_scale_enum::no_scale,
-                                true,
-                                how_v3_bf16_cvt);
-        TORCH_CHECK(t >= 0, "invalid argument for fmha_v3_varlen_fwd 3");
+        float t = aiter::mha_fwd(args, stream_config);
+        TORCH_CHECK(t >= 0, "invalid argument for fmha_v3_varlen_fwd");
     }
     else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.

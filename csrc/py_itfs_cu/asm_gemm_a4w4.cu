@@ -111,9 +111,10 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
             continue;
         const auto& cfg = el.second;
         if(cfg.bpreshuffle == bpreshuffle_en &&
-           ((cfg.splitK == log2_k_split_en) || !log2_k_split.has_value()))
+           (cfg.splitK >= log2_k_split_en))
         {
-            if((N % cfg.tile_N) == 0)
+            // tile128x512 may not support N % cfg.tile_N != 0
+            if(cfg.tile_M != 128 || cfg.tile_N != 512 || (N % cfg.tile_N) == 0)
             {
                 std::vector<int> splitK_list =
                     (log2_k_split.has_value() && cfg.splitK)
@@ -134,12 +135,12 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
                     bool is_same_round           = (local_round == round);
                     bool has_sufficient_empty_cu = (empty_cu > (local_round * num_cu - tg_num));
                     bool has_better_efficiency   = (local_compute2mem_effi > compute2mem_effi);
-
                     if(is_earlier_round ||
                        (is_same_round && (has_sufficient_empty_cu || has_better_efficiency)))
                     {
                         round              = local_round;
                         empty_cu           = local_round * num_cu - tg_num;
+                        compute2mem_effi   = local_compute2mem_effi;
                         selectedKernelName = el.first;
                         selectedsplitK     = splitK;
                     }

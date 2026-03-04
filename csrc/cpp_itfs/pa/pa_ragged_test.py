@@ -601,9 +601,7 @@ def test_paged_attention(
 
     # prepare inputs & golden output
     if INPUT_SOURCE == InputSource.PreGen:
-        (query, key_cache, value_cache, block_tables, seq_lens, out_golden) = (
-            load_input()
-        )
+        query, key_cache, value_cache, block_tables, seq_lens, out_golden = load_input()
     else:
         query = torch.empty(num_seqs, num_query_heads, head_size, dtype=dtype)
         query.uniform_(*uniform_range)
