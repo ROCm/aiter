@@ -271,11 +271,14 @@ def fused_moe_(
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     # For packed int4 weights (i8 dtype): W4A16 or W4A8 depending on quant_type
+    _w4a8_use_int8 = os.environ.get("AITER_W4A8_USE_INT8", "0") in ("1", "true", "True")
     if w1.dtype in (dtypes.i8, torch.int8):
         if quant_type in (QuantType.No,):
             q_dtype_a = dtypes.bf16  # W4A16: bf16 activations, no quant
+        elif _w4a8_use_int8:
+            q_dtype_a = dtypes.i8    # W4A8-INT8: int8 activations
         else:
-            q_dtype_a = dtypes.fp8   # W4A8: fp8 activations, dynamic quant
+            q_dtype_a = dtypes.fp8   # W4A8-FP8: fp8 activations, dynamic quant
     elif w1.dtype != torch.uint32:
         q_dtype_a = w1.dtype
     else:
@@ -908,6 +911,12 @@ def get_2stage_cfgs(
             and q_dtype_a == dtypes.fp8
             and q_dtype_w == dtypes.fp8
         )
+        # W4A8-INT8: int8 activation + int4 (packed as i8) weights
+        _is_flydsl_w4a8_i8 = (
+            q_type == QuantType.per_Token
+            and q_dtype_a == dtypes.i8
+            and q_dtype_w == dtypes.i8
+        )
         # W4A16: bf16 activation + int4 (packed as i8) weights
         _is_flydsl_w4a16 = (
             q_type == QuantType.No
@@ -923,7 +932,7 @@ def get_2stage_cfgs(
         use_flydsl_stage2 = (
             os.environ.get("AITER_USE_FLYDSL_MOE", "1")
             in ("1", "true", "True", "YES", "yes")
-            and (_is_flydsl_fp8 or _is_flydsl_w4a16 or _is_flydsl_bf16)
+            and (_is_flydsl_fp8 or _is_flydsl_w4a8_i8 or _is_flydsl_w4a16 or _is_flydsl_bf16)
             and use_g1u1
             and activation == ActivationType.Silu
         )
@@ -1882,9 +1891,11 @@ def flydsl_moe_stage1(
     # Detect weight dtype: W4A16/W4A8 (packed int4 as i8), pure bf16 (dequanted), or fp8
     _is_w_int4 = w1.dtype in (dtypes.i8, torch.int8)
     _is_w4a16 = _is_w_int4 and a1_scale is None   # W4A16: no activation scale
-    _is_w4a8_fp8 = _is_w_int4 and a1_scale is not None  # W4A8: has activation scale (fp8)
+    _act_is_fp8 = hidden_states.dtype in (dtypes.fp8, torch.float8_e4m3fnuz)
+    _act_is_i8 = hidden_states.dtype in (dtypes.i8, torch.int8)
+    _is_w4a8_fp8 = _is_w_int4 and a1_scale is not None and _act_is_fp8
+    _is_w4a8_i8 = _is_w_int4 and a1_scale is not None and _act_is_i8
     _is_bf16 = w1.dtype in (dtypes.bf16, torch.bfloat16)
-    # Scale checks: bf16 needs no scales (dequant baked in), W4A16 needs w1_scale but not a1_scale
     if w1_scale is None and not (_is_w_int4 or _is_bf16):
         raise RuntimeError("FlyDSL stage1 requires w1_scale")
     if a1_scale is None and not (_is_w_int4 or _is_bf16):
@@ -2057,7 +2068,9 @@ def flydsl_moe_stage1(
     stream_ptr = torch.cuda.current_stream().cuda_stream
 
     # Select FlyDSL in_dtype based on weight type
-    if _is_w4a8_fp8:
+    if _is_w4a8_i8:
+        _stage1_in_dtype = "int4"
+    elif _is_w4a8_fp8:
         _stage1_in_dtype = "int4_fp8"
     elif _is_w4a16:
         _stage1_in_dtype = "int4_bf16"
@@ -2370,7 +2383,10 @@ def flydsl_moe_stage2(
     # Detect weight dtype: W4A16/W4A8 (packed int4 as i8), pure bf16 (dequanted), or fp8
     _is_w_int4_s2 = w2.dtype in (dtypes.i8, torch.int8)
     _is_w4a16_s2 = _is_w_int4_s2 and a2_scale is None
-    _is_w4a8_fp8_s2 = _is_w_int4_s2 and a2_scale is not None
+    _a2_is_fp8 = a2.dtype in (dtypes.fp8, torch.float8_e4m3fnuz)
+    _a2_is_i8 = a2.dtype in (dtypes.i8, torch.int8)
+    _is_w4a8_fp8_s2 = _is_w_int4_s2 and a2_scale is not None and _a2_is_fp8
+    _is_w4a8_i8_s2 = _is_w_int4_s2 and a2_scale is not None and _a2_is_i8
     _is_bf16_s2 = w2.dtype in (dtypes.bf16, torch.bfloat16)
     # Scale checks: bf16 needs no scales, W4A16 needs w2_scale but not a2_scale
     if w2_scale is None and not (_is_w_int4_s2 or _is_bf16_s2):
@@ -2545,7 +2561,9 @@ def flydsl_moe_stage2(
     stream_ptr = torch.cuda.current_stream().cuda_stream
 
     # Select FlyDSL in_dtype based on weight type
-    if _is_w4a8_fp8_s2:
+    if _is_w4a8_i8_s2:
+        _stage2_in_dtype = "int4"
+    elif _is_w4a8_fp8_s2:
         _stage2_in_dtype = "int4_fp8"
     elif _is_w4a16_s2:
         _stage2_in_dtype = "int4_bf16"
