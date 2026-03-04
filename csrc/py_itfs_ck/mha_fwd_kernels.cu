@@ -3,6 +3,7 @@
 
 #include <torch/all.h>
 #include <ATen/hip/HIPContext.h>
+#include <cstdlib>
 #include "py_itfs_common.h"
 #include "mha_common.h"
 
@@ -10,6 +11,33 @@
 
 namespace aiter {
 namespace torch_itfs {
+namespace {
+int get_forced_splitkv_num_splits_from_env()
+{
+    const char* v = std::getenv("AITER_FORCE_SPLITKV_NUM_SPLITS");
+    if(v == nullptr || *v == '\0')
+    {
+        return 0;
+    }
+    return std::atoi(v);
+}
+
+std::string get_forced_splitkv_kernel_filter()
+{
+    const char* v = std::getenv("AITER_FORCE_FMHA_SPLITKV_KERNEL");
+    if(v == nullptr || *v == '\0')
+    {
+        return "";
+    }
+    std::string filter(v);
+    if(filter.find("splitkv") == std::string::npos)
+    {
+        return "";
+    }
+    return filter;
+}
+} // namespace
+
 mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                                    bool has_dropout_randval,
                                    const mask_info &mask,
@@ -175,6 +203,128 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                         drop_seed_offset,
                         128, // block_scale_size_q (per-block quantization block size)
                         128}; // block_scale_size_kv (per-block quantization block size)
+}
+
+fmha_fwd_splitkv_args get_ck_fmha_fwd_splitkv_args(bool has_lse,
+                                                   const mask_info &mask,
+                                                   const int b,
+                                                   const int seqlen_q,
+                                                   const int h,
+                                                   const int h_k,
+                                                   const int d,
+                                                   const int d_v,
+                                                   const int num_splits,
+                                                   float softmax_scale,
+                                                   const at::Tensor q,
+                                                   const at::Tensor k,
+                                                   const at::Tensor v,
+                                                   std::optional<const at::Tensor> &bias_,
+                                                   std::optional<const at::Tensor> &alibi_slopes_,
+                                                   at::Tensor out,
+                                                   at::Tensor lse,
+                                                   at::Tensor lse_acc,
+                                                   at::Tensor out_acc,
+                                                   const std::optional<at::Tensor> &sink_ptr_)
+{
+    fmha_fwd_splitkv_args args{};
+    args.q_ptr = q.data_ptr();
+    args.k_ptr = k.data_ptr();
+    args.v_ptr = v.data_ptr();
+    args.bias_ptr = nullptr;
+    args.lse_acc_ptr = lse_acc.data_ptr();
+    args.o_acc_ptr = out_acc.data_ptr();
+    args.lse_ptr = nullptr;
+    args.o_ptr = out.data_ptr();
+
+    args.block_table_ptr = nullptr;
+    args.batch_stride_block_table = 0;
+    args.page_block_size = 0;
+
+    args.is_gappy = false;
+    args.cache_batch_idx = nullptr;
+
+    args.seqstart_q_ptr = nullptr;
+    args.seqstart_k_ptr = nullptr;
+    args.seqlen_k_ptr = nullptr;
+    args.sink_ptr = sink_ptr_.has_value() ? sink_ptr_.value().data_ptr() : nullptr;
+
+    args.batch = b;
+    args.seqlen_q = seqlen_q;
+    args.seqlen_k = k.size(1);
+    args.max_seqlen_q = seqlen_q;
+    args.hdim_q = d;
+    args.hdim_v = d_v;
+    args.nhead_q = h;
+    args.nhead_k = h_k;
+    args.num_splits = num_splits;
+
+    args.scale_s = softmax_scale;
+    args.scale_p = 1;
+    args.scale_o = 1;
+
+    args.logits_soft_cap = 0;
+
+    args.batch_stride_q = q.stride(0);
+    args.stride_q = q.stride(1);
+    args.nhead_stride_q = q.stride(2);
+
+    args.batch_stride_k = k.stride(0);
+    args.stride_k = k.stride(1);
+    args.nhead_stride_k = k.stride(2);
+
+    args.batch_stride_v = v.stride(0);
+    args.stride_v = v.stride(1);
+    args.nhead_stride_v = v.stride(2);
+
+    args.batch_stride_o = out.stride(0);
+    args.stride_o = out.stride(1);
+    args.nhead_stride_o = out.stride(2);
+
+    args.batch_stride_bias = 0;
+    args.stride_bias = 0;
+    args.nhead_stride_bias = 0;
+
+    args.batch_stride_lse = 0;
+    args.nhead_stride_lse = 0;
+
+    args.batch_stride_lse_acc = lse_acc.stride(0);
+    args.nhead_stride_lse_acc = lse_acc.stride(1);
+    args.split_stride_lse_acc = lse_acc.stride(2);
+
+    args.batch_stride_o_acc = out_acc.stride(0);
+    args.nhead_stride_o_acc = out_acc.stride(1);
+    args.split_stride_o_acc = out_acc.stride(2);
+    args.stride_o_acc = out_acc.stride(3);
+
+    if (has_lse) {
+        args.lse_ptr = lse.data_ptr();
+        args.batch_stride_lse = lse.stride(0);
+        args.nhead_stride_lse = lse.stride(1);
+    }
+
+    if (bias_.has_value()) {
+        auto bias = bias_.value();
+        CHECK_DEVICE(bias);
+        TORCH_CHECK(bias.stride(-1) == 1, "bias tensor must have contiguous last dimension");
+        TORCH_CHECK(bias.sizes() == torch::IntArrayRef({seqlen_q, k.size(1)}), "bias shape should be [sq, sk]");
+        args.bias_ptr = bias.data_ptr();
+        args.stride_bias = bias.stride(0);
+    }
+    else if (alibi_slopes_.has_value()) {
+        auto alibi_slopes = alibi_slopes_.value();
+        CHECK_DEVICE(alibi_slopes);
+        TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
+        TORCH_CHECK(alibi_slopes.sizes() == torch::IntArrayRef({h}) || alibi_slopes.sizes() == torch::IntArrayRef({b, h}));
+        args.bias_ptr = alibi_slopes.data_ptr();
+        args.stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
+    }
+
+    args.window_size_left = mask.left;
+    args.window_size_right = mask.right;
+    args.sink_size = mask.sink;
+    args.mask_type = static_cast<ck_tile::index_t>(mask.type);
+
+    return args;
 }
 
 std::vector<at::Tensor>
@@ -348,45 +498,109 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
     }
 
     if (seqlen_k > 0) {
-        auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
         auto stream = at::hip::getCurrentHIPStream();
         ck_tile::stream_config stream_config{stream};
+        int num_splits = get_forced_splitkv_num_splits_from_env();
 
-        auto args =
-            get_ck_fmha_fwd_args(
-                has_lse,
-                return_dropout_randval,
-                mask,
-                batch_size,
-                seqlen_q,
-                seqlen_k,
-                num_heads,
-                num_heads_k,
+        if (num_splits >= 2) {
+            TORCH_CHECK(!has_dropout && !return_dropout_randval,
+                        "split-kv path does not support dropout");
+            TORCH_CHECK(qscale_type == quant_scale_enum::no_scale,
+                        "split-kv path does not support q_descale/k_descale/v_descale");
+            TORCH_CHECK(num_splits <= 128, "num_splits greater than 128 is not supported");
+
+            auto softmax_lse_accum = torch::empty(
+                {batch_size, num_heads, num_splits, seqlen_q},
+                opts.dtype(at::kFloat));
+            auto out_accum = torch::empty(
+                {batch_size, num_heads, num_splits, seqlen_q, head_size_v},
+                opts.dtype(at::kFloat));
+
+            auto splitkv_args =
+                get_ck_fmha_fwd_splitkv_args(
+                    has_lse,
+                    mask,
+                    batch_size,
+                    seqlen_q,
+                    num_heads,
+                    num_heads_k,
+                    head_size_q,
+                    head_size_v,
+                    num_splits,
+                    softmax_scale,
+                    q,
+                    k,
+                    v,
+                    bias_,
+                    alibi_slopes_,
+                    out,
+                    softmax_lse,
+                    softmax_lse_accum,
+                    out_accum,
+                    sink_ptr);
+
+            auto traits = mha_fwd_splitkv_traits(
                 head_size_q,
                 head_size_v,
-                q,
-                k,
-                v,
-                bias_,
-                alibi_slopes_,
-                q_descale_,
-                k_descale_,
-                v_descale_,
-                out,
-                softmax_lse,
-                p,
-                softmax_scale,
-                p_dropout,
-                drop_seed_offset,
-                cu_seqlens_q_,
-                cu_seqlens_kv_,
                 dtype_str,
+                false, // is_group_mode
+                false, // has_logits_soft_cap
+                mask.type,
                 bias_type,
-                qscale_type,
-                sink_ptr);
+                has_lse,
+                mask.sink > 0 && sink_ptr.has_value());
+            const std::string forced_splitkv_filter = get_forced_splitkv_kernel_filter();
+            if (!forced_splitkv_filter.empty()) {
+                traits.kernel_filter = forced_splitkv_filter;
+            }
+            static bool printed_dense_split_path_once = false;
+            if (!printed_dense_split_path_once) {
+                std::fprintf(stderr,
+                             "[aiter] fmha dispatch path=splitkv_ck_dense filter=%s\\n",
+                             forced_splitkv_filter.empty() ? "<none>" : forced_splitkv_filter.c_str());
+                printed_dense_split_path_once = true;
+            }
 
-        float t = aiter::mha_fwd(args, stream_config);
-        TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
+            float t = fmha_fwd_splitkv(traits, splitkv_args, stream_config);
+            TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd_splitkv");
+        } else {
+            auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
+            auto args =
+                get_ck_fmha_fwd_args(
+                    has_lse,
+                    return_dropout_randval,
+                    mask,
+                    batch_size,
+                    seqlen_q,
+                    seqlen_k,
+                    num_heads,
+                    num_heads_k,
+                    head_size_q,
+                    head_size_v,
+                    q,
+                    k,
+                    v,
+                    bias_,
+                    alibi_slopes_,
+                    q_descale_,
+                    k_descale_,
+                    v_descale_,
+                    out,
+                    softmax_lse,
+                    p,
+                    softmax_scale,
+                    p_dropout,
+                    drop_seed_offset,
+                    cu_seqlens_q_,
+                    cu_seqlens_kv_,
+                    dtype_str,
+                    bias_type,
+                    qscale_type,
+                    sink_ptr);
+
+            float t = aiter::mha_fwd(args, stream_config);
+            TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
+        }
     }
     else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.

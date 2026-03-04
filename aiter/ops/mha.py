@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Any, Optional, Tuple
+import os
 
 import torch
 from torch import Generator, Tensor
@@ -98,6 +99,49 @@ def cmdGenFunc_mha_fwd(
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
         "--receipt 100 --filter {} --output_dir {{}}".format(filter),
     ]
+
+    forced_num_splits_str = os.environ.get("AITER_FORCE_SPLITKV_NUM_SPLITS", "0")
+    try:
+        forced_num_splits = int(forced_num_splits_str)
+    except ValueError:
+        forced_num_splits = 0
+
+    if forced_num_splits >= 2:
+        splitkv_dtype = "*"
+        if q.dtype == dtypes.fp16:
+            splitkv_dtype = "fp16"
+        elif q.dtype == dtypes.bf16:
+            splitkv_dtype = "bf16"
+        elif q.dtype == dtypes.fp8:
+            splitkv_dtype = "fp8bf16"
+
+        splitkv_bias = "nbias"
+        if bias is not None:
+            splitkv_bias = "bias"
+        elif alibi_slopes is not None:
+            splitkv_bias = "alibi"
+
+        splitkv_mask = "nmask"
+        if not causal and window_size_left == -1 and window_size_right == -1:
+            splitkv_mask = "nmask"
+        else:
+            splitkv_mask = "mask"
+
+        has_sink = sink_ptr is not None or sink_size > 0
+        splitkv_sink = "sink" if has_sink else "nsink"
+
+        combine_filter = f"*_{splitkv_dtype}_batch*"
+        split_filter = (
+            f"*_{splitkv_dtype}_batch*_{splitkv_bias}*_{splitkv_mask}*"
+            f"_lse*_npagedkv*_{splitkv_sink}*"
+        )
+
+        splitkv_filter = f"{combine_filter}@{split_filter}"
+        blob_gen_cmd.append(
+            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
+            '--receipt 100 --filter "{}" --output_dir {{}}'.format(splitkv_filter)
+        )
+
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,

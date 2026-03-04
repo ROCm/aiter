@@ -13,9 +13,6 @@ import logging
 from aiter.ops.triton.mha import (
     flash_attn_func,
 )
-from aiter.ops.mha import (
-    flash_attn_varlen_func,
-)
 
 from aiter.test_mha_common import (
     attention_ref,
@@ -193,54 +190,16 @@ def run_aiter_flash_attn_splitkv(
     v: torch.Tensor,
     num_splits: int,
 ):
-    page_size = 128
-    bsz, seqlen_q, num_heads_q, head_dim_q = q.shape
-    _, seqlen_k, num_heads_k, head_dim_v = v.shape
-
-    if seqlen_k % page_size != 0:
-        raise ValueError(
-            f"splitkv mode requires seqlen_k divisible by {page_size}, got {seqlen_k}"
-        )
-
-    num_blocks_per_seq = seqlen_k // page_size
-
-    q_varlen = q.reshape(bsz * seqlen_q, num_heads_q, head_dim_q).contiguous()
-    k_paged = (
-        k.reshape(bsz, num_blocks_per_seq, page_size, num_heads_k, head_dim_q)
-        .reshape(bsz * num_blocks_per_seq, page_size, num_heads_k, head_dim_q)
-        .contiguous()
-    )
-    v_paged = (
-        v.reshape(bsz, num_blocks_per_seq, page_size, num_heads_k, head_dim_v)
-        .reshape(bsz * num_blocks_per_seq, page_size, num_heads_k, head_dim_v)
-        .contiguous()
-    )
-
-    cu_seqlens_q = torch.arange(
-        0, (bsz + 1) * seqlen_q, seqlen_q, device=q.device, dtype=torch.int32
-    )
-    cu_seqlens_k = torch.arange(
-        0, (bsz + 1) * seqlen_k, seqlen_k, device=q.device, dtype=torch.int32
-    )
-    block_table = torch.arange(
-        bsz * num_blocks_per_seq, device=q.device, dtype=torch.int32
-    ).reshape(bsz, num_blocks_per_seq)
-
     def fn():
-        return flash_attn_varlen_func(
-            q_varlen,
-            k_paged,
-            v_paged,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            seqlen_q,
-            seqlen_k,
+        if num_splits < 2:
+            raise ValueError(f"splitkv mode requires num_splits >= 2, got {num_splits}")
+        return aiter.ops.mha.flash_attn_func(
+            q,
+            k,
+            v,
             dropout_p=0.0,
             causal=False,
-                return_lse=False,
             return_attn_probs=False,
-            how_v3_bf16_cvt=2,
-            block_table=block_table,
         )
 
     return fn
@@ -873,7 +832,7 @@ def parse_args():
         default=0,
         help=(
             "CK-style split-kv selection. "
-            "0 or 1 uses normal flash_attn_func path; >=2 uses split-kv path via flash_attn_varlen_func."
+            "0 or 1 uses normal flash_attn_func path; >=2 uses split-kv path in dense flash_attn_func (batch+npagedkv)."
         ),
     )
     return parser.parse_args()

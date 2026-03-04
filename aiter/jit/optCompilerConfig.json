@@ -868,14 +868,16 @@
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_fwd_kernels.cu'",
             "f'{AITER_CSRC_DIR}/pybind/mha_fwd_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu'"
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_split.cu'"
         ],
         "flags_extra_cc": [
             "'-DFAV2_ON=1'"
         ],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
+            "'-DCK_TILE_FMHA_FWD_SPLITKV_API=1'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -884,7 +886,8 @@
         "verbose": "False",
         "hip_clang_path": "os.environ.get('MHA_HIP_CLANG_PATH')",
         "blob_gen_cmd": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'"
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --output_dir {{}}'"
         ]
     },
     "module_mha_varlen_fwd": {
