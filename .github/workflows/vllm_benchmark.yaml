@@ -3,14 +3,6 @@ name: vLLM Benchmark
 on:
   push:
     branches: [main]
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE'
-      - '.gitignore'
   workflow_dispatch:
 
 concurrency:
@@ -21,12 +13,12 @@ env:
   VLLM_BRANCH: "main"
   VLLM_REPOSITORY_URL: "https://github.com/vllm-project/vllm"
   BASE_IMAGE: rocm/vllm-dev:nightly
-  GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
-  GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
+  GITHUB_REPO_URL: 'https://github.com/ROCm/aiter.git'
+  GITHUB_COMMIT_SHA: ${{ github.sha }}
 
 jobs:
   check-signal:
-    if: ${{ !github.event.pull_request.head.repo.fork && (!github.event.pull_request || github.event.pull_request.draft == false) }}
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -40,7 +32,7 @@ jobs:
 
   build_vllm_image:
     name: Build vLLM Image
-    if: ${{ !github.event.pull_request.head.repo.fork && (!github.event.pull_request || github.event.pull_request.draft == false) }}
+    if: ${{ github.event_name != 'pull_request' }}
     needs: [check-signal]
     runs-on: build-only-aiter
 
@@ -104,7 +96,7 @@ jobs:
 
   vllm_benchmark:
     name: vLLM Benchmark (8 GPU)
-    if: ${{ !github.event.pull_request.head.repo.fork && (!github.event.pull_request || github.event.pull_request.draft == false) }}
+    if: ${{ github.event_name != 'pull_request' }}
     needs: build_vllm_image
     runs-on: aiter-8gpu-runner
     strategy:
