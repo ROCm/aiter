@@ -74,11 +74,11 @@ struct mha_batch_prefill_traits : public fmha_batch_prefill_traits
                                     has_dropout,
                                     qscale_type,
                                     skip_min_seqlen_q,
-                                    false, // has_sink
-                                    kv_memory_layout,
-                                    kv_lookup_table,
-                                    page_size}
+                                    false} // has_sink
     {
+        this->kv_memory_layout = kv_memory_layout;
+        this->kv_lookup_table  = kv_lookup_table;
+        this->page_size        = page_size;
     }
 };
 

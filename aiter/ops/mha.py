@@ -342,18 +342,16 @@ def cmdGenFunc_mha_varlen_fwd(
         filter_fwd_splitkv2 = "*"  # get_fwd_splitkv_blobs()
         if q.dtype == dtypes.fp16:
             md_name += "_fp16"
-            filter_fwd_splitkv1 += "_fp16*"
             filter_fwd_splitkv2 += "_fp16*"
         elif q.dtype == dtypes.bf16:
             md_name += "_bf16"
-            filter_fwd_splitkv1 += "_bf16*"
             filter_fwd_splitkv2 += "_bf16*"
         if 0.0 < logits_soft_cap:
             md_name += "_logits"
-            filter_fwd += "_logits*"
+            filter_fwd_splitkv2 += "_logits*"
         else:
             md_name += "_nlogits"
-            filter_fwd += "_nlogits*"
+            filter_fwd_splitkv2 += "_nlogits*"
         if bias is not None:
             md_name += "_bias"
             filter_fwd_splitkv2 += "_bias*"
@@ -371,14 +369,20 @@ def cmdGenFunc_mha_varlen_fwd(
             filter_fwd_splitkv2 += "_m*"
         if return_softmax_lse:
             md_name += "_lse"
-            filter_fwd_splitkv1 += "_lse*"
             filter_fwd_splitkv2 += "_lse*"
         else:
             md_name += "_nlse"
-            filter_fwd_splitkv1 += "_nlse*"
-            filter_fwd_splitkv2 += "_nlse*"
+            # split-kv stage always materializes lse intermediates; nlse is only
+            # for the final combine output flavor
+            filter_fwd_splitkv2 += "_lse*"
+        has_sink = sink_ptr is not None or sink_size > 0
+        if has_sink:
+            md_name += "_sink"
+            filter_fwd_splitkv2 += "_pagedkv*_sink*"
+        else:
+            md_name += "_nsink"
+            filter_fwd_splitkv2 += "_pagedkv*_nsink*"
         md_name += "_pagedkv"
-        filter_fwd_splitkv2 += "_pagedkv*"
         filter_fwd_splitkv = f"{filter_fwd_splitkv1}@{filter_fwd_splitkv2}"
         blob_gen_cmd = [
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
@@ -386,7 +390,7 @@ def cmdGenFunc_mha_varlen_fwd(
         ]
         blob_gen_cmd.append(
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
-            "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd_splitkv)
+            "--receipt 200 --filter \"{}\" --output_dir {{}}".format(filter_fwd_splitkv)
         )
     return {
         "md_name": md_name,
@@ -1997,6 +2001,7 @@ def _flash_attn_varlen_forward(
         # basic
         ret = alibi_slopes is None
         ret = ret and (bias is None)
+        ret = ret and (block_table is None)
         ret = ret and (dropout_p == 0.0)
         ret = ret and (hdim_v == 128)
         ret = ret and (hdim_q == 128 or hdim_q == 192)

@@ -3,6 +3,7 @@
 
 #include <torch/all.h>
 #include <ATen/hip/HIPContext.h>
+#include <cstdlib>
 #include "py_itfs_common.h"
 #include "mha_common.h"
 
@@ -10,6 +11,18 @@
 
 namespace aiter {
 namespace torch_itfs {
+namespace {
+int get_forced_splitkv_num_splits_from_env()
+{
+    const char* v = std::getenv("AITER_FORCE_SPLITKV_NUM_SPLITS");
+    if(v == nullptr || *v == '\0')
+    {
+        return 0;
+    }
+    return std::atoi(v);
+}
+} // namespace
+
 mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                                           bool has_dropout_randval,
                                           const mask_info &mask,
@@ -244,7 +257,7 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
     // o_acc: (nheads, split, total_q, d_v)
     // block_table: (batch_size, max_num_blocks_per_seq)
 
-    fmha_fwd_splitkv_args args;
+    fmha_fwd_splitkv_args args{};
     args.q_ptr = q.data_ptr();
     args.k_ptr = k.data_ptr();
     args.v_ptr = v.data_ptr();
@@ -573,6 +586,7 @@ mha_varlen_fwd(
         hipLaunchKernelGGL(
             aiter::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0, philox_args, rng_state_ptr);
     }
+    at::Tensor seqlens_k_tensor;
     std::optional<const at::Tensor> seqlens_k = std::nullopt;
 
     if (max_seqlen_k > 0) {
@@ -581,10 +595,40 @@ mha_varlen_fwd(
 
         if (paged_KV)
         {
+            seqlens_k_tensor = torch::full(
+                {batch_size},
+                max_seqlen_k,
+                torch::TensorOptions().dtype(torch::kInt32).device(q.device()));
+            seqlens_k.emplace(seqlens_k_tensor);
+
             int num_splits = 0;
-            num_splits = aiter::override_num_splits_if_necessary(batch_size, num_heads, max_seqlen_q, head_size_v, 0, num_splits);
+            const int forced_num_splits = get_forced_splitkv_num_splits_from_env();
+            if (forced_num_splits > 0) {
+                num_splits = forced_num_splits;
+            } else {
+                num_splits = aiter::override_num_splits_if_necessary(batch_size, num_heads, max_seqlen_q, head_size_v, 0, num_splits);
+            }
             TORCH_CHECK(num_splits > 0, "num_splits should greater than 0");
             TORCH_CHECK(num_splits <= 128, "num_splits greater than 128 is not supported");
+
+            static bool printed_splitkv_args_once = false;
+            if(!printed_splitkv_args_once)
+            {
+                std::fprintf(stderr,
+                             "[aiter] splitkv args b=%d hq=%d hk=%d sq=%d sk=%d page=%d blocks=%d blocks_per_seq=%d num_splits=%d has_cu_k=%d has_seqlen_k=%d\n",
+                             batch_size,
+                             num_heads,
+                             num_heads_k,
+                             max_seqlen_q,
+                             max_seqlen_k,
+                             page_block_size,
+                             num_blocks,
+                             max_num_blocks_per_seq,
+                             num_splits,
+                             cu_seqlens_k.has_value() ? 1 : 0,
+                             seqlens_k.has_value() ? 1 : 0);
+                printed_splitkv_args_once = true;
+            }
 
             auto softmax_lse_accum = torch::empty({num_heads, num_splits, total_q}, opts.dtype(at::kFloat));
             auto out_accum = torch::empty({num_heads, num_splits, total_q, head_size_v}, opts.dtype(at::kFloat));

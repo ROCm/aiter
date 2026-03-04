@@ -3,10 +3,39 @@
 #if FAV3_ON
 #include "asm_fmha_v3_fwd_configs.hpp"
 #endif
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <string>
 
 namespace aiter {
+
+namespace {
+std::string get_env_or_empty(const char* key)
+{
+    const char* v = std::getenv(key);
+    if(v == nullptr || *v == '\0')
+    {
+        return "";
+    }
+    return std::string(v);
+}
+
+std::string get_forced_fwd_kernel_filter()
+{
+    std::string filter = get_env_or_empty("AITER_FORCE_FMHA_FWD_KERNEL");
+    if(filter.empty())
+    {
+        filter = get_env_or_empty("AITER_FORCE_FMHA_KERNEL");
+    }
+    if(filter.find("splitkv") != std::string::npos)
+    {
+        return "";
+    }
+    return filter;
+}
+} // namespace
+
 #if FAV3_ON
 
 int get_cfg_mask_type(const mha_fwd_args& a)
@@ -263,6 +292,12 @@ float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
                            a.min_seqlen_q != 0,
                            a.has_sink};
 
+    const std::string forced_kernel_filter = get_forced_fwd_kernel_filter();
+    if(!forced_kernel_filter.empty())
+    {
+        traits.kernel_filter = forced_kernel_filter;
+    }
+
     fmha_fwd_args args{a.q_ptr,
                        a.k_ptr,
                        a.v_ptr,
@@ -336,15 +371,34 @@ float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
 float mha_fwd(mha_fwd_args args, const ck_tile::stream_config& s)
 {
     float ret = -1;
+    const std::string forced_fwd_filter = get_forced_fwd_kernel_filter();
+    const bool force_ck_kernel          = !forced_fwd_filter.empty();
+    static bool printed_path_once       = false;
 
 #if FAV3_ON
-    ret = fmha_fwd_v3(args, s);
+    if(!force_ck_kernel)
+    {
+        ret = fmha_fwd_v3(args, s);
+        if(ret != -1 && !printed_path_once)
+        {
+            std::fprintf(stderr,
+                         "[aiter] fmha dispatch path=fwd_v3 filter=<none>\n");
+            printed_path_once = true;
+        }
+    }
 #endif
 
 #if FAV2_ON
     if(ret == -1 && !args.v3_api_check)
     {
         ret = fmha_fwd_ck(args, s);
+        if(ret != -1 && !printed_path_once)
+        {
+            std::fprintf(stderr,
+                         "[aiter] fmha dispatch path=fwd_ck filter=%s\n",
+                         forced_fwd_filter.empty() ? "<none>" : forced_fwd_filter.c_str());
+            printed_path_once = true;
+        }
     }
 #endif
     return ret;

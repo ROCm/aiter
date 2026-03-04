@@ -13,6 +13,9 @@ import logging
 from aiter.ops.triton.mha import (
     flash_attn_func,
 )
+from aiter.ops.mha import (
+    flash_attn_varlen_func,
+)
 
 from aiter.test_mha_common import (
     attention_ref,
@@ -180,6 +183,65 @@ def run_aiter_flash_attn(
             return aiter.ops.mha.flash_attn_func(
                 q, k, v, dropout_p=0.0, causal=False, return_attn_probs=False
             )
+
+    return fn
+
+
+def run_aiter_flash_attn_splitkv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    num_splits: int,
+):
+    page_size = 128
+    bsz, seqlen_q, num_heads_q, head_dim_q = q.shape
+    _, seqlen_k, num_heads_k, head_dim_v = v.shape
+
+    if seqlen_k % page_size != 0:
+        raise ValueError(
+            f"splitkv mode requires seqlen_k divisible by {page_size}, got {seqlen_k}"
+        )
+
+    num_blocks_per_seq = seqlen_k // page_size
+
+    q_varlen = q.reshape(bsz * seqlen_q, num_heads_q, head_dim_q).contiguous()
+    k_paged = (
+        k.reshape(bsz, num_blocks_per_seq, page_size, num_heads_k, head_dim_q)
+        .reshape(bsz * num_blocks_per_seq, page_size, num_heads_k, head_dim_q)
+        .contiguous()
+    )
+    v_paged = (
+        v.reshape(bsz, num_blocks_per_seq, page_size, num_heads_k, head_dim_v)
+        .reshape(bsz * num_blocks_per_seq, page_size, num_heads_k, head_dim_v)
+        .contiguous()
+    )
+
+    cu_seqlens_q = torch.arange(
+        0, (bsz + 1) * seqlen_q, seqlen_q, device=q.device, dtype=torch.int32
+    )
+    cu_seqlens_k = torch.arange(
+        0, (bsz + 1) * seqlen_k, seqlen_k, device=q.device, dtype=torch.int32
+    )
+    block_table = torch.arange(
+        bsz * num_blocks_per_seq, device=q.device, dtype=torch.int32
+    ).reshape(bsz, num_blocks_per_seq)
+
+    def fn():
+        return flash_attn_varlen_func(
+            q_varlen,
+            k_paged,
+            v_paged,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqlen_q,
+            seqlen_k,
+            dropout_p=0.0,
+            causal=False,
+                return_lse=False,
+            return_attn_probs=False,
+            how_v3_bf16_cvt=2,
+            block_table=block_table,
+        )
 
     return fn
 
@@ -439,7 +501,17 @@ def primary_output(result):
     return result
 
 
-def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype):
+def attn_forward_func(
+    q,
+    k,
+    v,
+    func_name,
+    softmax_scale,
+    k_smooth,
+    layout,
+    dtype,
+    num_splits,
+):
     if func_name == "fav3_sage":  # fav3 sage hybrid
         fn = fav3_sage_forward_func(
             q,
@@ -452,7 +524,10 @@ def attn_forward_func(q, k, v, func_name, softmax_scale, k_smooth, layout, dtype
     else:
         q, k, v = layout_preprocess(q, k, v, layout=layout, target_layout="bshd")
         if func_name == "aiter_bf16":
-            fn = run_aiter_flash_attn(q, k, v)
+            if num_splits >= 2:
+                fn = run_aiter_flash_attn_splitkv(q, k, v, num_splits=num_splits)
+            else:
+                fn = run_aiter_flash_attn(q, k, v)
         elif func_name == "aiter_fp8":
             fn = run_aiter_fp8_flash_attn(q, k, v, has_descale=True)
         elif func_name == "fav2":  # fav2 (no quantization)
@@ -522,8 +597,9 @@ def bench_kernel(q, k, v, args, provider):
         k_smooth=k_smooth,
         layout=args.layout,
         dtype=arg_to_torch_dtype[args.dtype],
+        num_splits=args.num_splits,
     )
-    ms = triton.testing.do_bench(fn)
+    ms = triton.testing.do_bench(fn, warmup=210, rep=200)
 
     if args.compare_to_ref:
         current_output = fn()
@@ -545,6 +621,7 @@ def bench_kernel(q, k, v, args, provider):
                 k_smooth=k_smooth,
                 layout=args.layout,
                 dtype=arg_to_torch_dtype[args.dtype],
+                num_splits=args.num_splits,
             )()
         )
 
@@ -778,6 +855,27 @@ def parse_args():
         default="./captured_inputs",
         help="Directory containing captured input .pt files",
     )
+    parser.add_argument(
+        "--aiter_kernel_filter",
+        "--filter_kernel",
+        dest="aiter_kernel_filter",
+        type=str,
+        default="",
+        help=(
+            "Optional forced CK kernel substring for Aiter path. "
+            "If it contains 'splitkv', sets AITER_FORCE_FMHA_SPLITKV_KERNEL only; "
+            "otherwise sets AITER_FORCE_FMHA_FWD_KERNEL only."
+        ),
+    )
+    parser.add_argument(
+        "--num_splits",
+        type=int,
+        default=0,
+        help=(
+            "CK-style split-kv selection. "
+            "0 or 1 uses normal flash_attn_func path; >=2 uses split-kv path via flash_attn_varlen_func."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -790,6 +888,32 @@ arg_to_torch_dtype = {
 
 def main():
     args = parse_args()
+
+    if args.num_splits < 0:
+        raise ValueError("--num_splits must be >= 0")
+    if args.num_splits >= 2 and not args.aiter_bf16:
+        raise ValueError("--num_splits >= 2 is only supported with -aiter_bf16")
+
+    if args.aiter_kernel_filter:
+        os.environ.pop("AITER_FORCE_FMHA_KERNEL", None)
+        os.environ.pop("AITER_FORCE_FMHA_FWD_KERNEL", None)
+        os.environ.pop("AITER_FORCE_FMHA_SPLITKV_KERNEL", None)
+        if args.num_splits >= 2:
+            os.environ["AITER_FORCE_FMHA_SPLITKV_KERNEL"] = args.aiter_kernel_filter
+        elif "splitkv" in args.aiter_kernel_filter:
+            os.environ["AITER_FORCE_FMHA_SPLITKV_KERNEL"] = args.aiter_kernel_filter
+        else:
+            os.environ["AITER_FORCE_FMHA_FWD_KERNEL"] = args.aiter_kernel_filter
+        logger.info("Using forced Aiter CK kernel filter: %s", args.aiter_kernel_filter)
+
+    if args.num_splits >= 2:
+        os.environ["AITER_FORCE_SPLITKV_NUM_SPLITS"] = str(args.num_splits)
+        logger.info(
+            "Using split-kv mode (forced num_splits=%d)",
+            args.num_splits,
+        )
+    else:
+        os.environ.pop("AITER_FORCE_SPLITKV_NUM_SPLITS", None)
 
     args.fav3_sage = not args.fav3_fp8 and not args.aiter_fp8 and not args.aiter_bf16
 
