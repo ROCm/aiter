@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
+from typing import Optional
+
 import torch
 import torch.distributed as dist
 import argparse
@@ -17,7 +19,7 @@ from aiter.dist.parallel_state import (
     destroy_distributed_environment,
 )
 from aiter.dist.utils import get_open_port, get_distributed_init_method, get_ip
-from aiter.dist.communication_op import *
+from aiter.dist.communication_op import tensor_model_parallel_all_gather
 from aiter.test_common import (
     checkAllclose,
     perftest,
