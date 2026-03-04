@@ -10,7 +10,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 USE_TDM = True
-TRANSPOSE_B = False
+TRANSPOSE_B = True
 
 @gluon.jit
 def issue_loads(producer, a_desc, b_desc, off_am, off_bn, a_buffer, b_buffer, BLOCK_K: gl.constexpr,
@@ -445,7 +445,7 @@ def _gemm_a8w8_kernel_async(
         if not TRANSPOSE_B:
             gl.amd.gfx1250.tdm.async_load(b_desc, [k * BLOCK_SIZE_K, offs_bn], b_buffer.index(k % NUM_BUFFERS), pred=pred_i32)
         else:
-            gl.amd.gfx1250.tdm.async_load(b_desc, [offs_bn, 0], b_buffer.index(k % NUM_BUFFERS), pred=pred_i32)
+            gl.amd.gfx1250.tdm.async_load(b_desc, [offs_bn, k * BLOCK_SIZE_K], b_buffer.index(k % NUM_BUFFERS), pred=pred_i32)
         
         gl.amd.gfx1250.tdm.async_wait(2) # wait for a and b async load
         a = a_buffer.index((k-1) % NUM_BUFFERS).load(layout=dot_a_layout)
