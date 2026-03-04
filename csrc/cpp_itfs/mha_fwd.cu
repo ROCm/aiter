@@ -240,7 +240,7 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
         // Explicit assignment forces evaluation order and prevents compiler from
         // reordering operations that could lead to accessing uninitialized args
         void* args_ptr     = &args;
-        void* arg_size_ptr = &arg_size;
+        size_t* arg_size_ptr = &arg_size;
         impl_ptr->launch_kernel({args_ptr, arg_size_ptr, gdx, gdy, gdz, bdx, 1, 1, s_.stream_id_});
     });
 }
