@@ -4008,7 +4008,6 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             paged_attention_kernel = paged_attention_decode_sliding_window_head_1
             mtp_splits = triton.cdiv(query_seq_len, num_splits)
             grid = (num_sequences, mtp_splits, num_splits)
-            ONE_QUERY_GROUP_SIZE_POW2 = max(16, ONE_QUERY_GROUP_SIZE_POW2)
             QUERY_SEQ_LEN_POW2 = QUERY_SEQ_LEN_POW2 // mtp_splits
         else:
             paged_attention_kernel = paged_attention_decode_sliding_window
@@ -4069,8 +4068,6 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             SLIDING_WINDOW=SLIDING_WINDOW,
             CDNA_VERSION=CDNA_VERSION,
             ONE_SHOT=ONE_SHOT,
-            # num_stages=1,
-            # waves_per_eu=0,
         )
         return
 
