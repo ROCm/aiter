@@ -506,6 +506,7 @@
     constexpr int vec_size      = std::min(best_vec_size, numElemsPerThread);
     constexpr int load_loop_cnt = numElemsPerThread / vec_size;
     using ltype                 = ::vec_t<scalar_t, vec_size>;
+    using kv_cache_ltype        = ::vec_t<kv_cache_scalar_t, vec_size>;
     ltype elements;
     ltype next_elements;
     float block_max = 0.0f;
@@ -547,6 +548,9 @@
                     if(token_idx >= batch_end_idx) continue;
                     int64_t offsetWarp = (token_idx * num_heads * head_dim + localHeadIdx * head_dim) / vec_size;
                     elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + vec_slot];
+                    ltype weights;
+                    scalar_t const* weight_ptr = isQ ? q_weight : k_weight;
+                    weights = reinterpret_cast<const ltype*>(weight_ptr)[vec_slot];
                     float partial_sum = 0.0f;
                     #pragma unroll
                     for(int j = 0; j < vec_size; j++)
@@ -558,16 +562,23 @@
                     scalar_t const* cos_ptr  = cache_ptr;
                     scalar_t const* sin_ptr  = cache_ptr + head_dim / 2;
                     int const base_idx = vec_slot * vec_size;
+                    
+                    using cos_sin_ltype = ::vec_t<scalar_t, vec_size/2>;
+                    cos_sin_ltype cos;
+                    cos = reinterpret_cast<const cos_sin_ltype*>(cos_ptr)[vec_slot];
+                    cos_sin_ltype sin;
+                    sin = reinterpret_cast<const cos_sin_ltype*>(sin_ptr)[vec_slot];
+
                     #pragma unroll
                     for(int k = 0; k < vec_size; k += 2)
                     {
                         int const local0   = base_idx + k;
                         int const local1   = base_idx + k + 1;
-                        float weight0      = isQ ? float(q_weight[local0]) : float(k_weight[local0]);
-                        float weight1      = isQ ? float(q_weight[local1]) : float(k_weight[local1]);
+                        float weight0 = static_cast<float>(weights[k]);
+                        float weight1 = static_cast<float>(weights[k + 1]);
                         int const half_dim = local0 / 2;
-                        float cos_val     = static_cast<float>(cos_ptr[half_dim]);
-                        float sin_val     = static_cast<float>(sin_ptr[half_dim]);
+                        float cos_val = static_cast<float>(cos[k/2]);
+                        float sin_val = static_cast<float>(sin[k/2]);
                         float const val0  = static_cast<float>(elements[k]) * rms_rcp * weight0;
                         float const val1  = static_cast<float>(elements[k + 1]) * rms_rcp * weight1;
                         elements[k]       = static_cast<scalar_t>(val0 * cos_val - val1 * sin_val);
@@ -590,6 +601,10 @@
                     int64_t offsetWarp = (token_idx * num_heads * head_dim + localHeadIdx * head_dim) / vec_size;
                     elements      = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + vec_slot];
                     next_elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + pair_slot];
+                    ltype weights0, weights1;
+                    scalar_t const* weight_ptr = isQ ? q_weight : k_weight;
+                    weights0 = reinterpret_cast<const ltype*>(weight_ptr)[vec_slot];
+                    weights1 = reinterpret_cast<const ltype*>(weight_ptr)[pair_slot];
                     int64_t pos_id = position_ids[token_idx];
                     scalar_t const* cache_ptr = cos_sin_cache + pos_id * head_dim;
                     scalar_t const* cos_ptr  = cache_ptr;
@@ -601,15 +616,20 @@
                                      + static_cast<float>(next_elements[j]) * static_cast<float>(next_elements[j]);
                     float sumOfSquares = wave_reduce<float, decltype(sum_op), head_thread_half, true>(partial_sum, sum_op);
                     float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
-                    #pragma unroll
+                    using cos_sin_ltype = ::vec_t<scalar_t, vec_size>;
+                    cos_sin_ltype cos;
+                    cos = reinterpret_cast<const cos_sin_ltype*>(cos_ptr)[vec_slot];
+                    cos_sin_ltype sin;
+                    sin = reinterpret_cast<const cos_sin_ltype*>(sin_ptr)[vec_slot];
+                    #pragma unroll                    
                     for(int j = 0; j < vec_size; j++)
                     {
                         int const idx0 = vec_slot * vec_size + j;
                         int const idx1 = pair_slot * vec_size + j;
-                        float weight0 = isQ ? float(q_weight[idx0]) : float(k_weight[idx0]);
-                        float weight1 = isQ ? float(q_weight[idx1]) : float(k_weight[idx1]);
-                        float cos_val = static_cast<float>(cos_ptr[idx0]);
-                        float sin_val = static_cast<float>(sin_ptr[idx0]);
+                        float weight0 = static_cast<float>(weights0[j]);
+                        float weight1 = static_cast<float>(weights1[j]);
+                        float cos_val = static_cast<float>(cos[j]);
+                        float sin_val = static_cast<float>(sin[j]);
                         float const val0 = static_cast<float>(elements[j]) * rms_rcp * weight0;
                         float const val1 = static_cast<float>(next_elements[j]) * rms_rcp * weight1;
                         float out0 = val0 * cos_val - val1 * sin_val;
@@ -632,7 +652,7 @@
         return;
     }
 
-    float dtype_max = ck_tile::type_convert<float>(ck_tile::numeric<kv_cache_scalar_t>::max());
+    float dtype_max = opus::cast<float>(opus::numeric_limits<opus::fp8_t>::max());
 
     auto f_max_f32 = [](float v_0_, float v_1_) { return __builtin_fmaxf(v_0_, v_1_); };
     if(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
@@ -654,32 +674,33 @@
             if(block_offset > 0)
             {
                 float k_scale_global = k_scale[scale_offset];
-
                 if(k_scale_global < k_scale_val)
                 {
                     // New data has larger dynamic range, need to requantize old data
                     int64_t cache_base = block_idx * page_size * num_heads_k * head_dim +
                                         headIdx * head_dim * page_size;
 
-                    // Requantize existing data [0, block_offset)
-                    // Flatten the loop: all threads cooperatively process block_offset * head_dim elements
+                    // Requantize existing data [0, block_offset) - same indexing as quant write below
                     // [num_blocks, num_kv_heads, head_size // x, block_size, x]
                     int total_elements = block_offset * head_dim;
                     int x_mask         = x - 1;
                     int x_shift        = __builtin_ctz(x);
-                    for(int idx = threadIdx.x; idx < total_elements; idx += blockDim.x)
+                    for(int idx = threadIdx.x; idx < total_elements / vec_size; idx += blockDim.x)
                     {
-                        int old_offset = idx / head_dim;
-                        int d          = idx % head_dim;
-                        int d_idx      = d >> x_shift;
-                        int x_idx      = d & x_mask;
-                        // [num_blocks, num_kv_heads, head_size // x, block_size, x]
-                        int64_t cache_idx = cache_base + d_idx * page_size * x +
-                                            old_offset * x + x_idx;
-
-                        float tmp = opus::cast<float>(k_cache[cache_idx]);
-                        tmp = tmp * k_scale_global * inv_scale_val;
-                        k_cache[cache_idx] = opus::cast<kv_cache_scalar_t>(tmp);
+                        int old_offset       = idx * vec_size / head_dim;
+                        int head_offset      = (idx * vec_size) % head_dim;
+                        int head_offset_divX = head_offset >> x_shift;
+                        int head_offset_modX = head_offset & x_mask;
+                        int64_t vec_off      = cache_base + head_offset_divX * page_size * x + old_offset * x + head_offset_modX;
+                        kv_cache_ltype data = *reinterpret_cast<kv_cache_ltype*>(&k_cache[vec_off]);
+                        #pragma unroll
+                        for(int j = 0; j < vec_size; j++)
+                        {
+                            float tmp = opus::cast<float>(data[j]);
+                            tmp       = tmp * k_scale_global * inv_scale_val;
+                            data[j]   = opus::cast<kv_cache_scalar_t>(tmp);
+                        }
+                        *reinterpret_cast<kv_cache_ltype*>(&k_cache[vec_off]) = data;
                     }
                     k_scale[scale_offset] = k_scale_val;
                 }
@@ -711,22 +732,23 @@
 
             int64_t offsetWarp = (token_idx * num_heads * head_dim + localHeadIdx * head_dim) / vec_size;
             elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + head_offset / vec_size];
-#pragma unroll
-            for(int j = 0; j < vec_size; j++)
+            // vec_size=8, x=16: head_offset can be 0,8,16,...; need head_offset_modX when head_offset=8,24,...
+            int head_offset_divX = head_offset >> x_shift;
+            int head_offset_modX = head_offset & x_mask;
+            int64_t vec_offset = cache_offset + head_offset_divX * page_size * x + block_offset_local * x + head_offset_modX;
+            if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
             {
-                int ho            = head_offset + j;
-                int head_offset_divX = ho >> x_shift;
-                int head_offset_modX = ho & x_mask;
-                int64_t offset = cache_offset + head_offset_divX * page_size * x + block_offset_local * x + head_offset_modX;
-                if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
+                *reinterpret_cast<ltype*>(k_cache + vec_offset) = elements;
+            }
+            else
+            {
+                kv_cache_ltype out_vec;
+                for(int j = 0; j < vec_size; j++)
                 {
-                    k_cache[offset] = elements[j];
+                    out_vec[j] = opus::cast<kv_cache_scalar_t>(float(elements[j]) * inv_scale_val);
+
                 }
-                else
-                {
-                    k_cache[offset] =
-                    opus::cast<kv_cache_scalar_t>(float(elements[j]) * inv_scale_val);
-                }
+                *reinterpret_cast<kv_cache_ltype*>(k_cache + vec_offset) = out_vec;
             }
         }
     }
@@ -740,7 +762,6 @@
             // Fix: correct scale index calculation [num_blocks, num_kv_heads]
             inv_scale_val = dtype_max / block_max;
             int64_t scale_offset = block_idx * num_kv_heads + headIdx;
-
             // Handle incremental updates: check for scale conflicts
             if(block_offset > 0)
             {
@@ -751,27 +772,63 @@
                     // New data has larger dynamic range, need to requantize old data
                     int64_t cache_base = block_idx * page_size * num_heads_v * head_dim +
                                         headIdx * head_dim * page_size;
+                    // Requantize existing data [0, block_offset) - vec load/store
+                    // v_cache [num_blocks, num_kv_heads, block_size//x, head_size, x]
+                    // For fixed (block_offset_divX, head_offset), x-dim is consecutive -> vec friendly
+                    int const v_x_mask     = x - 1;
+                    int const v_x_shift    = __builtin_ctz(x);
+                    int vec_per_x         = x / vec_size;
+                    int vecs_per_bh     = vec_per_x * head_dim;
+                    int n_full_blocks   = block_offset >> v_x_shift;
+                    int full_vecs       = n_full_blocks * vecs_per_bh;
 
-                    // Requantize existing data [0, block_offset)
-                    // Flatten the loop: all threads cooperatively process block_offset * head_dim elements
-                    int total_elements = block_offset * head_dim;
-                    int x_mask        = x - 1;
-                    int x_shift        = __builtin_ctz(x);
-                    for(int idx = threadIdx.x; idx < total_elements; idx += blockDim.x)
+                    for(int idx = threadIdx.x; idx < full_vecs; idx += blockDim.x)
                     {
-                        int old_offset = idx / head_dim;
-                        int d          = idx % head_dim;
-                        int old_offset_divX = old_offset >> x_shift;
-                        int old_offset_modX = old_offset & x_mask;
-                        // [num_blocks, num_kv_heads, block_size // x, head_size, x]
-                        int64_t cache_idx = cache_base + old_offset_divX * head_dim * x +
-                                            d * x + old_offset_modX;
-
-                        float tmp = opus::cast<float>(v_cache[cache_idx]);
-                        tmp = tmp * v_scale_global * inv_scale_val;
-                        v_cache[cache_idx] = opus::cast<kv_cache_scalar_t>(tmp);
+                        kv_cache_ltype data =
+                            *reinterpret_cast<kv_cache_ltype*>(v_cache + cache_base + idx * vec_size);
+                        #pragma unroll
+                        for(int j = 0; j < vec_size; j++)
+                        {
+                            float tmp = opus::cast<float>(data[j]);
+                            tmp       = tmp * v_scale_global * inv_scale_val;
+                            data[j]   = opus::cast<kv_cache_scalar_t>(tmp);
+                        }
+                        *reinterpret_cast<kv_cache_ltype*>(v_cache + cache_base + idx * vec_size) = data;
+                    }
+                    // Last partial block (only when block_offset % x != 0): vec + scalar tail
+                    if((block_offset & v_x_mask) != 0) {
+                        int last_block_divX = (block_offset - 1) >> v_x_shift;
+                        int last_x_idx      = (block_offset - 1) & v_x_mask;
+                        int last_full_vec   = (last_x_idx + 1) / vec_size;
+                        int partial_vecs   = last_full_vec * head_dim;
+                        for(int idx = threadIdx.x; idx < partial_vecs; idx += blockDim.x) {
+                            int head_offset = idx / last_full_vec;
+                            int vec_chunk   = idx % last_full_vec;
+                            int64_t vec_off = cache_base + last_block_divX * head_dim * x +
+                                              head_offset * x + vec_chunk * vec_size;
+                            kv_cache_ltype data =
+                                *reinterpret_cast<kv_cache_ltype*>(&v_cache[vec_off]);
+                            #pragma unroll
+                            for(int j = 0; j < vec_size; j++) {
+                                float tmp = opus::cast<float>(data[j]);
+                                tmp       = tmp * v_scale_global * inv_scale_val;
+                                data[j]   = opus::cast<kv_cache_scalar_t>(tmp);
+                            }
+                            *reinterpret_cast<kv_cache_ltype*>(&v_cache[vec_off]) = data;
+                        }
+                        int tail_count = (last_x_idx - last_full_vec * vec_size + 1) * head_dim;
+                        for(int idx = threadIdx.x; idx < tail_count; idx += blockDim.x) {
+                            int head_offset = idx % head_dim;
+                            int x_idx       = last_full_vec * vec_size + idx / head_dim;
+                            int64_t v_base  = cache_base + last_block_divX * head_dim * x +
+                                              head_offset * x + x_idx;
+                            float tmp = opus::cast<float>(v_cache[v_base]);
+                            tmp       = tmp * v_scale_global * inv_scale_val;
+                            v_cache[v_base] = opus::cast<kv_cache_scalar_t>(tmp);
+                        }
                     }
                     v_scale[scale_offset] = v_scale_val;
+
                 }
                 else
                 {

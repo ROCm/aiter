@@ -357,7 +357,7 @@ def run_torch_qk_norm_rope_cache_block_quant_shuffle(
     return q, k, v, k_cache, v_cache
 
 
-@perftest(num_iters=101)
+@perftest(num_iters=101, num_rotate_args=101)
 def run_aiter_qk_norm_rope_cache_block_quant_shuffle(
     qkv: Tensor,  # contiguous (num_tokens * (num_heads_q + num_heads_k + num_heads_v) * head_size)
     qw: Tensor,  #  contiguous (head_size)
@@ -997,16 +997,17 @@ def test_qk_norm_rope_cache_block_quant(
         * (torch.finfo(dtype).bits // 8)
         + num_tokens * num_heads_q * head_size * (torch.finfo(dtype).bits // 8)
         + num_tokens * num_heads_k * head_size * (torch.finfo(cache_dtype).bits // 8)
+        + num_tokens * num_heads_k * head_size * (torch.finfo(dtype).bits // 8)
         + num_tokens * num_heads_v * head_size * (torch.finfo(cache_dtype).bits // 8)
     ) / (avg_cu * 1e6)
     # ========== chunk-prefill part ==========
-    # Derive batch_size and page_size from cu_q_len and k_cache
+    # Chunk: (page_size-1) tokens per batch, K=0.001 + kw=1 -> k_scale_global small.
+    # Decode fills last slot per block -> k_scale_val > k_scale_global triggers requantization.
     batch_size = cu_q_len.size(0) - 1
     page_size = k_cache.shape[
         -2
     ]  # k_cache: [num_blocks, num_kv_heads, head_size//x, page_size, x]
-    #
-    chunk_left_ctx_lens = 10
+    chunk_left_ctx_lens = page_size - 1
     chunk_total_tokens = batch_size * chunk_left_ctx_lens
     #
     chunk_qkv = torch.randn(
@@ -1014,9 +1015,20 @@ def test_qk_norm_rope_cache_block_quant(
         dtype=dtype,
         device="cuda",
     )
-    # slot_mapping: chunk tokens append after prefill, each token gets a unique slot.
-    # Must start from prefill_slot_end to avoid overwriting prefill (batch-disjoint alloc).
-    # Each batch uses a different block (batch i uses block at prefill_slot_end/page_size + i).
+    q_size, k_size, v_size = (
+        num_heads_q * head_size,
+        num_heads_k * head_size,
+        num_heads_v * head_size,
+    )
+    ## to test requant in worst case
+    # chunk_qkv[:, q_size : q_size + k_size] = 1e-6  # K ~0 -> k_scale_global ~2e-6
+    # chunk_qkv[:, q_size + k_size : q_size + k_size + v_size] = (
+    #    1  # V ~0 -> v_scale_global ~2e-6
+    # )
+    kw = torch.ones(
+        head_size, dtype=dtype, device="cuda"
+    )  # kw=1 so k_scale_global small
+    # slot_mapping: each batch fills slots [0..page_size-2] of its chunk block
     chunk_slot_mapping = (
         (
             prefill_slot_end
@@ -1125,6 +1137,7 @@ def test_qk_norm_rope_cache_block_quant(
         rtol=1e-2,
         atol=0.01,
     )
+    print("chunk_slot_mapping: ", chunk_slot_mapping)
     ret["chunk_fused_qk_us"] = avg_cu_chunk
     ret["chunk_k_cache_err"] = chunk_k_cache_err
     ret["chunk_v_cache_err"] = chunk_v_cache_err
@@ -1137,6 +1150,16 @@ def test_qk_norm_rope_cache_block_quant(
         dtype=dtype,
         device="cuda",
     )
+    # randn K/V; scale up decode so scale_val consistently > scale_global (avoid equality)
+    decode_qkv[:, q_size : q_size + k_size] = torch.randn(
+        (decode_total_tokens, k_size), dtype=dtype, device="cuda"
+    )
+    # randn*2+2: range~[-2,6], block_max typically 5-6, scale_val~0.011-0.013 > chunk scale
+    decode_qkv[:, q_size + k_size : q_size + k_size + v_size] = (
+        torch.randn((decode_total_tokens, v_size), dtype=dtype, device="cuda") * 2.0
+        + 2.0
+    )
+
     #
     # slot_mapping: each batch appends 1 token after chunk-prefill
     decode_slot_mapping = torch.tensor(
@@ -1274,7 +1297,7 @@ parser.add_argument(
     "--token",
     type=int,
     nargs="*",
-    default=[3, 127, 513, 778, 1024, 1257],
+    default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384],
     help="""Number of tokens.
     e.g.: -t 513""",
 )
@@ -1354,7 +1377,7 @@ parser.add_argument(
     choices=["block", "per_head"],
     default=["block", "per_head"],
     help="""Quantization type.
-    e.g.: -q per_head""",
+    block: prefill + chunk (page_size-1 per batch, K=0.001) + decode (last slot)""",
 )
 
 if __name__ == "__main__":
@@ -1413,27 +1436,27 @@ if __name__ == "__main__":
         "qk_norm_rope_cache_block_quant summary (markdown):\n%s", block_df_md
     )
 
-    dtype = torch.bfloat16
-    batch_size = 2
-    num_tokens1 = 3608
-    num_heads_q = 24
-    num_heads_k = 25
-    df = []
-    for head_size in args.head_sizes:
-        for num_tokens0 in args.token:
-            for is_neox_styles in args.is_neox_styles:
-                ret = test_qk_norm_rope_2way(
-                    dtype,
-                    batch_size,
-                    num_tokens0,
-                    num_tokens1,
-                    num_heads_q,
-                    num_heads_k,
-                    head_size,
-                    not is_neox_styles,
-                    eps=1e-6,
-                )
-                df.append(ret)
-    df = pd.DataFrame(df)
-    df_md = df.to_markdown(index=False)
-    aiter.logger.info("qk_norm_rope_2way summary (markdown):\n%s", df_md)
+    # dtype = torch.bfloat16
+    # batch_size = 2
+    # num_tokens1 = 3608
+    # num_heads_q = 24
+    # num_heads_k = 25
+    # df = []
+    # for head_size in args.head_sizes:
+    #    for num_tokens0 in args.token:
+    #        for is_neox_styles in args.is_neox_styles:
+    #            ret = test_qk_norm_rope_2way(
+    #                dtype,
+    #                batch_size,
+    #                num_tokens0,
+    #                num_tokens1,
+    #                num_heads_q,
+    #                num_heads_k,
+    #                head_size,
+    #                not is_neox_styles,
+    #                eps=1e-6,
+    #            )
+    #            df.append(ret)
+    # df = pd.DataFrame(df)
+    # df_md = df.to_markdown(index=False)
+    # aiter.logger.info("qk_norm_rope_2way summary (markdown):\n%s", df_md)
