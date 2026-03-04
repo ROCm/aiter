@@ -1137,7 +1137,6 @@ def test_qk_norm_rope_cache_block_quant(
         rtol=1e-2,
         atol=0.01,
     )
-    print("chunk_slot_mapping: ", chunk_slot_mapping)
     ret["chunk_fused_qk_us"] = avg_cu_chunk
     ret["chunk_k_cache_err"] = chunk_k_cache_err
     ret["chunk_v_cache_err"] = chunk_v_cache_err
