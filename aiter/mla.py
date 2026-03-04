@@ -306,8 +306,17 @@ def mla_decode_fwd(
             if max_seqlen_q == 1:
                 q = q.view(total_s, nhead, -1)
             else:
-                q = q.reshape(ori_total_s // max_seqlen_q, max_seqlen_q, ori_nhead // nhead,
-                    nhead, -1).permute(0, 2, 1, 3, 4).reshape(total_s, nhead, -1)
+                q = (
+                    q.reshape(
+                        ori_total_s // max_seqlen_q,
+                        max_seqlen_q,
+                        ori_nhead // nhead,
+                        nhead,
+                        -1,
+                    )
+                    .permute(0, 2, 1, 3, 4)
+                    .reshape(total_s, nhead, -1)
+                )
                 o_orig = o
 
             o = o.view(total_s, nhead, -1)
@@ -373,8 +382,18 @@ def mla_decode_fwd(
             o = o.view(ori_total_s, ori_nhead, -1)
         else:
             # for test, q need to be transpose into the original shape
-            new_o = o.reshape(ori_total_s // max_seqlen_q, ori_nhead // nhead, max_seqlen_q,
-                nhead, -1).permute(0, 2, 1, 3, 4).reshape(ori_total_s, ori_nhead, -1).contiguous()
+            new_o = (
+                o.reshape(
+                    ori_total_s // max_seqlen_q,
+                    ori_nhead // nhead,
+                    max_seqlen_q,
+                    nhead,
+                    -1,
+                )
+                .permute(0, 2, 1, 3, 4)
+                .reshape(ori_total_s, ori_nhead, -1)
+                .contiguous()
+            )
             o_orig.set_(new_o)
             o = o_orig
 
