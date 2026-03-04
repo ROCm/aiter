@@ -1299,10 +1299,12 @@ def paged_attention_decode_sliding_window_head_1(
                 mask=output_mask,
             )
         return  # No computation needed for this partition
-
-    sequence_partition_end_idx = (
-        gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE) + block_split_idx
-    )
+    if SLIDING_WINDOW > 0:
+        sequence_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
+    else:
+        sequence_partition_end_idx = (
+            gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE) + block_split_idx
+        )
 
     # Load query tensor with 3D MTP layout
     # Query shape: [batch_size, query_length, num_kv_heads, query_group_size, head_size]
