@@ -42,6 +42,8 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.comms import is_graph_capturing
+
 __all__ = ["fused_allreduce_add_rms_row_quant_gemm_iris_twoshot_hipblaslt"]
 
 logger = logging.getLogger(__name__)
@@ -550,13 +552,13 @@ class IrisTwoshotRowHipblasltManager:
         # Copy input to symmetric heap (captured in graph)
         iris_input.copy_(input_tensor)
 
-        capturing = torch.cuda.is_current_stream_capturing()
+        capturing = is_graph_capturing()
         logger.info("fused_op M=%d N=%d capturing=%s pre_barrier", M, N, capturing)
 
         # Pre-kernel barrier: ensure all ranks have copied input to heap
         # before any rank's kernel starts reading from peers.
-        # device_barrier is graph-capturable (pure device-side atomics).
-        shmem.device_barrier()
+        if not capturing:
+            shmem.device_barrier()
 
         logger.info("fused_op M=%d N=%d pre_barrier done", M, N)
 
@@ -628,7 +630,8 @@ class IrisTwoshotRowHipblasltManager:
         # Post-kernel barrier: ensure all ranks have finished writing
         # FP8 data + scales to the heap before any rank overwrites its
         # input buffer on the next iteration.
-        shmem.device_barrier()
+        if not capturing:
+            shmem.device_barrier()
 
         logger.info("fused_op M=%d N=%d post_barrier done", M, N)
 
