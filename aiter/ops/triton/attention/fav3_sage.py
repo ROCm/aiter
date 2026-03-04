@@ -164,21 +164,10 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             use_block_sparse=use_block_sparse,
         )
 
-        # 6. Context Saving for Backward
         if return_lse:
-            ctx.save_for_backward(
-                q_int8, k_int8, v_fp8, out, softmax_lse, q_descale, k_descale
-            )
-            ctx.softmax_scale = softmax_scale
-            ctx.causal = causal
-            ctx.window_size = window_size
-            ctx.softcap = softcap
-            ctx.deterministic = deterministic
-            ctx.sm_margin = sm_margin
-            ctx.input_dtype = q.dtype
-            ctx.layout = layout
-
-        return out, softmax_lse
+            return out, softmax_lse
+        
+        return out
 
     @staticmethod
     def backward(ctx, dout: torch.Tensor):
