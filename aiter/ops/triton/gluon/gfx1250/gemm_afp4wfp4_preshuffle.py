@@ -237,10 +237,9 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
     )
 
     # -------------------- TDM descriptors --------------------
-    grid_m = gl.cdiv(M, BLOCK_M) * BLOCK_M
     a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=a_fp4_ptr,
-        shape=(grid_m, K_bytes),
+        shape=(M, K_bytes),
         strides=(stride_a_m, stride_a_kbytes),
         block_shape=(BLOCK_M, BLOCK_K_BYTES),
         layout=shared_A,
