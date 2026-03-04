@@ -4,7 +4,10 @@
 import triton.language as tl
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config, compute_splitk_params
+from aiter.ops.triton.utils.gemm_config_utils import (
+    get_gemm_config,
+    compute_splitk_params,
+)
 
 import triton
 
@@ -69,7 +72,7 @@ def _gemm_a8w8_kernel(
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
-    cache_modifier: tl.constexpr
+    cache_modifier: tl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8 instead.
@@ -128,8 +131,12 @@ def _gemm_a8w8_kernel(
         offs_k_split = pid_k * SPLITK_BLOCK_SIZE + offs_k
         offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
         offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-        a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak)
-        b_ptrs = b_ptr + (offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+        a_ptrs = a_ptr + (
+            offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
+        )
+        b_ptrs = b_ptr + (
+            offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+        )
 
         # Create pointers for the scale tensors and load them
         offs_a_scale = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M) % M
@@ -147,8 +154,15 @@ def _gemm_a8w8_kernel(
                 a = tl.load(a_ptrs)
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
-                a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-                b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0, cache_modifier=cache_modifier)
+                a = tl.load(
+                    a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
+                )
+                b = tl.load(
+                    b_ptrs,
+                    mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
+                    other=0.0,
+                    cache_modifier=cache_modifier,
+                )
 
             accumulator += tl.dot(a, b, input_precision="ieee")
 

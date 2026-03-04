@@ -269,7 +269,12 @@ def test_gemm_splitk(in_dtype, out_dtype, m, n, k, num_ksplit, has_bias):
 
     a = run_torch(x, weight, x_scale, w_scale, bias, out_dtype)
     b = triton_gemm_a8w8(
-        x, weight_triton, x_scale, w_scale, bias, out_dtype,
+        x,
+        weight_triton,
+        x_scale,
+        w_scale,
+        bias,
+        out_dtype,
         config=config,
     )
 
@@ -316,15 +321,20 @@ def test_gemm_splitk_skip_reduce(in_dtype, out_dtype, m, n, k, num_ksplit):
     a = run_torch(x, weight, x_scale, w_scale, None, out_dtype)
 
     y_pp = triton_gemm_a8w8(
-        x, weight_triton, x_scale, w_scale, None, out_dtype,
+        x,
+        weight_triton,
+        x_scale,
+        w_scale,
+        None,
+        out_dtype,
         config=config,
         skip_reduce=True,
     )
 
     assert y_pp.dim() == 3, f"Expected 3D tensor, got {y_pp.dim()}D"
-    assert y_pp.shape[1] == m and y_pp.shape[2] == n, (
-        f"Expected shape (*, {m}, {n}), got {y_pp.shape}"
-    )
+    assert (
+        y_pp.shape[1] == m and y_pp.shape[2] == n
+    ), f"Expected shape (*, {m}, {n}), got {y_pp.shape}"
 
     b = y_pp.sum(dim=0).to(out_dtype)
     torch.testing.assert_close(a, b, atol=0.02, rtol=1e-2)
