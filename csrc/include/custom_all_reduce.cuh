@@ -384,7 +384,6 @@ cross_device_reduce_1stage(
     using A = typename opus::vector_t<opus::fp32_t, pack_size>;
 
     constexpr int tnum_gpu = THREAD_NUM / ngpus;
-    __shared__ T tmp_smem[tnum_gpu * ngpus * pack_size];
     // note: we don't reorder the address so the accumulation order is the same
     // for all ranks, ensuring bitwise identical results
     auto dp = *_input_dp;
