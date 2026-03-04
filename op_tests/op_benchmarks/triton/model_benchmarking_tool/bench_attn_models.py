@@ -26,8 +26,11 @@ def disable_logs(logger: str) -> None:
 
 
 disable_logs("aiter")
-from bench_mha import main as bench_mha_main  # noqa: E402
-from bench_mla_decode import main as bench_mla_main  # noqa: E402
+from aiter.ops.triton.utils._triton.arch_info import get_arch  # noqa: E402
+from op_tests.op_benchmarks.triton.bench_mha import main as bench_mha_main  # noqa: E402
+from op_tests.op_benchmarks.triton.bench_mla_decode import (  # noqa: E402
+    main as bench_mla_main,
+)
 
 # Module-level tracking for head dimension warnings
 # Stores (model_name, kernel) tuples to ensure each warning is logged once
@@ -1232,7 +1235,7 @@ def main(args: list[str] | None = None) -> None:
         list_models()
         return
 
-    logging.info("Benchmarking attention configurations...")
+    logging.info("Benchmarking attention configurations for %s arch...", get_arch())
 
     metric: Metric = parsed_args.metric
     if metric != METRICS["time"] and any(
