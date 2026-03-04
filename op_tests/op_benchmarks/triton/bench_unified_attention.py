@@ -12,6 +12,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
 from aiter.ops.triton.attention.unified_attention import unified_attention
+from op_tests.triton_tests.attention.test_unified_attention import ref_paged_attn
 
 
 def nonvarlen_benchmark_configs():
@@ -198,12 +199,11 @@ def run_benchmark(custom, args):
         assert num_query_heads % num_kv_heads == 0
         max_query_len = max(seqlens_q).item()
         max_kv_len = max(seqlens_k).item()
-        sliding_window_size = args.sliding_window_size
         soft_cap = args.softcap
         block_size = args.block_size if args.block_size else 512
         num_blocks = args.num_blocks if args.num_blocks else (max_kv_len * BATCH // block_size + 1)
 
-        window_size = (sliding_window_size - 1, 0) if sliding_window_size is not None else (-1, -1)
+        window_size = (args.sliding_window - 1, 0) if args.sliding_window is not None else (-1, -1)
         scale = D_HEAD**-0.5
 
         query = torch.randn(
@@ -231,8 +231,20 @@ def run_benchmark(custom, args):
         else:
             sinks = None
         
-        output = torch.empty_like(query)
-
+        if args.test:
+            ref_output = ref_paged_attn(
+                query=query,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                query_lens=seqlens_q,
+                kv_lens=seqlens_k,
+                block_tables=block_tables,
+                scale=scale,
+                sliding_window=args.sliding_window,
+                soft_cap=soft_cap,
+                sinks=sinks,
+            )
+        
         if args.fp8:
             FP8_TYPE = aiter.dtypes.fp8
             FP8_MAX = torch.finfo(FP8_TYPE).max
@@ -248,6 +260,7 @@ def run_benchmark(custom, args):
         else:
             q_descale, k_descale, v_descale = None, None, None
 
+        output = torch.empty_like(query)
         fn =  lambda: unified_attention(
             q=query,
             k=key_cache,
@@ -267,6 +280,16 @@ def run_benchmark(custom, args):
             v_descale=v_descale,
             sinks=sinks,
         )
+        
+        if args.test:
+            atol, rtol = 1.5e-2, 1e-2
+            if args.fp8:
+                atol, rtol = 1.5e-1, 1.5e-1
+            fn() # evaluate function
+            torch.testing.assert_close(
+                output, ref_output, atol=atol, rtol=rtol
+            ), f"{torch.max(torch.abs(output - ref_output))}"
+        
         ms = triton.testing.do_bench(fn)
         
         # calculate perf metrics
@@ -393,6 +416,13 @@ def parse_args():
     )
 
     parser.add_argument(
+        "-test",
+        action="store_true",
+        default=False,
+        help="test the correctness of each benchmark shape",
+    )
+
+    parser.add_argument(
         "-equal_seqlens",
         action="store_true",
         default=False,
@@ -411,7 +441,7 @@ def parse_args():
         help="Q and K head size, if -dv is absent then -d specifies V head size too",
     )
     parser.add_argument("-unified_attention", type=int, default=1)
-    parser.add_argument("-sliding_window_size", type=int, default=0, help="optional sliding window size, if >= 0 sliding window is active with that size.")
+    parser.add_argument("-sliding_window", type=int, default=None, help="optional sliding window size, default None = not active.")
     parser.add_argument("-softcap", type=float, default=0.0)
     parser.add_argument("-dv", type=int, default=0, help="optional V head size")
     parser.add_argument(
