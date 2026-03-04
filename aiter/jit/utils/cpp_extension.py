@@ -1736,12 +1736,6 @@ def _write_ninja_file(
         link_rule.append(
             "  command = $cxx @$out.rsp $ldflags -o $out\n  rspfile = $out.rsp\n  rspfile_content = $in"
         )
-
-        archive_rule = ["rule archive"]
-        archive_rule.append(
-            "  command = rm -f $out && $ar rcs $out @$out.rsp\n  rspfile = $out.rsp\n  rspfile_content = $in"
-        )
-
         link = [f'build {library_target}: link {" ".join(objects)}']
 
         if emit_static_archive:
@@ -1771,7 +1765,7 @@ def _write_ninja_file(
         devlink,
         link,
         archive,
-        default
+        default,
     ]
     content = "\n\n".join("\n".join(b) for b in blocks)
     # Ninja requires a new lines at the end of the .ninja file
