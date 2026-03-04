@@ -4,7 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]  # Triggers on PRs targeting `main`
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
   workflow_dispatch:
 
 concurrency:
@@ -13,6 +19,7 @@ concurrency:
 
 jobs:
   check-signal:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -25,6 +32,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   sglang:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     name: Sglang Integration Test (1 GPU)
     needs: [check-signal]
     runs-on: ${{ matrix.runner }}
@@ -69,11 +77,12 @@ jobs:
           RUN pip show pybind11
 
           RUN rm -rf aiter \
-           && git clone ${{ env.GITHUB_REPO_URL }} \
+           && git clone ${{ env.GITHUB_REPO_URL }} aiter \
            && cd aiter \
            && git checkout ${{ env.GITHUB_COMMIT_SHA }} \
            && git submodule update --init --recursive \
-           && PREBUILD_KERNELS=1 GPU_ARCHS=${{ env.GPU_ARCH }} python setup.py develop
+           && PREBUILD_KERNELS=1 GPU_ARCHS=${{ env.GPU_ARCH }} python setup.py build_ext --inplace \
+           && pip install -e .
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
           EOF
