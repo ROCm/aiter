@@ -332,16 +332,11 @@ class IrisTwoshotRowHipblasltManager:
             if torch.distributed.is_initialized()
             else 0
         )
-        logger.info(
-            "Initializing Iris (twoshot-row-hipblaslt) symmetric heap: "
-            f"rank={cur_rank}, heap_size={self._heap_size / 2**30:.1f}GB"
-        )
-
         self._shmem = iris.iris(self._heap_size)
 
         logger.info(
-            f"Iris (twoshot-row-hipblaslt) initialized successfully "
-            f"on rank {cur_rank}"
+            f"Iris (twoshot-row-hipblaslt) initialized: "
+            f"rank={cur_rank}, heap_size={self._heap_size / 2**30:.1f}GB"
         )
 
     @property
@@ -382,7 +377,7 @@ class IrisTwoshotRowHipblasltManager:
             if torch.distributed.is_initialized()
             else 0
         )
-        logger.info(
+        logger.debug(
             f"Iris (twoshot-row-hipblaslt): allocated input buffer "
             f"({M}, {N}), dtype={dtype}, rank={cur_rank}"
         )
@@ -420,7 +415,7 @@ class IrisTwoshotRowHipblasltManager:
             if torch.distributed.is_initialized()
             else 0
         )
-        logger.info(
+        logger.debug(
             f"Iris (twoshot-row-hipblaslt): allocated quant heap buffer "
             f"({M}, {N}), dtype={quant_dtype}, rank={cur_rank}"
         )
@@ -452,7 +447,7 @@ class IrisTwoshotRowHipblasltManager:
             if torch.distributed.is_initialized()
             else 0
         )
-        logger.info(
+        logger.debug(
             f"Iris (twoshot-row-hipblaslt): allocated scale heap buffer "
             f"({M},), dtype=float32, rank={cur_rank}"
         )
@@ -498,7 +493,7 @@ class IrisTwoshotRowHipblasltManager:
                 if torch.distributed.is_initialized()
                 else 0
             )
-            logger.info(
+            logger.debug(
                 f"Iris (twoshot-row-hipblaslt): allocated output buffer "
                 f"result=({M}, {N}), dtype={dtype}, rank={cur_rank}"
             )
@@ -552,15 +547,10 @@ class IrisTwoshotRowHipblasltManager:
         # Copy input to symmetric heap (captured in graph)
         iris_input.copy_(input_tensor)
 
-        capturing = is_graph_capturing()
-        logger.info("fused_op M=%d N=%d capturing=%s pre_barrier", M, N, capturing)
-
         # Pre-kernel barrier: ensure all ranks have copied input to heap
         # before any rank's kernel starts reading from peers.
-        if not capturing:
+        if not is_graph_capturing():
             shmem.device_barrier()
-
-        logger.info("fused_op M=%d N=%d pre_barrier done", M, N)
 
         # FP8 max value
         fp8_max = torch.finfo(quant_dtype).max
@@ -625,15 +615,11 @@ class IrisTwoshotRowHipblasltManager:
             waves_per_eu=WAVES_PER_EU,
         )
 
-        logger.info("fused_op M=%d N=%d post_barrier", M, N)
-
         # Post-kernel barrier: ensure all ranks have finished writing
         # FP8 data + scales to the heap before any rank overwrites its
         # input buffer on the next iteration.
-        if not capturing:
+        if not is_graph_capturing():
             shmem.device_barrier()
-
-        logger.info("fused_op M=%d N=%d post_barrier done", M, N)
 
         # Step 3: hipBLASLt GEMM via torch._scaled_mm
         # quant_heap is (M, N) FP8, scale_heap is (M,) float32
