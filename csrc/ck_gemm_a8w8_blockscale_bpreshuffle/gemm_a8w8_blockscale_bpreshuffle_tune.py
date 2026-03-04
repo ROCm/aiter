@@ -13,7 +13,10 @@ import torch
 import torch.nn.functional as F
 import pandas as pd
 import argparse
-import aiter.jit.core as jit_core
+from aiter.jit.core import (
+    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE,
+    get_asm_dir,
+)
 from einops import rearrange
 from gemm_a8w8_blockscale_bpreshuffle_common import kernels_list
 
@@ -22,16 +25,6 @@ from aiter import dtypes
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
-
-AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE = getattr(
-    jit_core,
-    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
-    os.getenv(
-        "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
-        "aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv",
-    ),
-)
-get_asm_dir = jit_core.get_asm_dir
 
 block_shape = (128, 128)
 
@@ -59,7 +52,7 @@ class Gemma8W8BlockScaleBPreShuffleTuner(GemmCommonTuner):
             required=False,
             help="choose libtype to be tuned, support ['all', 'asm', 'ck']",
         )
-
+# self.parser.set_defaults(splitK=True)
     def calculate(self, results, bpes=(1, 1, 2)):
         ## bpes = (inbpe, w_bpe, outbpe)
         return super().calculate(results, bpes=bpes)
