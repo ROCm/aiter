@@ -285,9 +285,9 @@ def mla_decode_fwd(
             num_kv_splits = get_cu_num()
         if (
             nhead == 16
-            or (
-                nhead == 128 and q.dtype == dtypes.fp8 and kv_buffer.dtype == dtypes.fp8
-            )
+            # or (
+            #     nhead == 128 and q.dtype == dtypes.fp8 and kv_buffer.dtype == dtypes.fp8
+            # )
             or (
                 get_gfx() == "gfx950"
                 and nhead == 32

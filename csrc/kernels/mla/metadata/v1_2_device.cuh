@@ -427,6 +427,8 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                   torch::Tensor& reduce_final_map,
                                   torch::Tensor& reduce_partial_map)
 {
+    //if num_heads_per_head_k == 128, set the kPackedQoLenPerWg to 64, else 128
+
     constexpr int32_t kPackedQoLenPerWg = 128;
     const hipStream_t stream            = at::hip::getCurrentHIPStream();
 
@@ -452,10 +454,13 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     const bool kv_is_fp8 =
         (kv_dtype == at::ScalarType::Float8_e4m3fnuz || kv_dtype == at::ScalarType::Float8_e4m3fn);
 
-    const bool natively_supported = (num_heads == 16) ||
+    // const bool natively_supported = (num_heads == 16) ||
+    //                                 ((arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 &&
+    //                                  kv_is_fp8 && (max_seqlen_qo == 4)) ||
+    //                                 ((num_heads == 128) && q_is_fp8 && kv_is_fp8);
+      const bool natively_supported = (num_heads == 16) ||
                                     ((arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 &&
-                                     kv_is_fp8 && (max_seqlen_qo == 4)) ||
-                                    ((num_heads == 128) && q_is_fp8 && kv_is_fp8);
+                                     kv_is_fp8 && (max_seqlen_qo == 4)) 
 
     if((natively_supported == false) && (num_heads % 16 == 0))
     {
