@@ -1671,7 +1671,7 @@ def _write_ninja_file(
     # Version 1.3 is required for the `deps` directive.
     config = ["ninja_required_version = 1.3"]
     config.append(f"cxx = {compiler}")
-    config.append(f"ar = {os.environ.get('AR', 'ar')}")
+    config.append(f"ar = {os.environ.get('AITER_AR_BIN', 'ar')}")
     if with_cuda or cuda_dlink_post_cflags:
         nvcc = _join_rocm_home("bin", "hipcc")
         config.append(f"nvcc = {nvcc}")
@@ -1724,6 +1724,12 @@ def _write_ninja_file(
     else:
         devlink_rule, devlink = [], []
 
+    emit_static_archive = (
+        library_target is not None
+        and os.environ.get("AITER_BUILD_STATIC", "0") == "1"
+        and os.path.basename(library_target) in {"libmha_fwd.so", "libmha_bwd.so"}
+    )
+
     if library_target is not None:
         link_rule = ["rule link"]
 
@@ -1738,10 +1744,18 @@ def _write_ninja_file(
 
         link = [f'build {library_target}: link {" ".join(objects)}']
 
-        archive_target = os.path.splitext(library_target)[0] + ".a"
-        archive = [f'build {archive_target}: archive {" ".join(objects)}']
+        if emit_static_archive:
+            archive_rule = ["rule archive"]
+            archive_rule.append(
+                "  command = rm -f $out && $ar rcs $out @$out.rsp\n  rspfile = $out.rsp\n  rspfile_content = $in"
+            )
 
-        default = [f"default {library_target}"]
+            archive_target = os.path.splitext(library_target)[0] + ".a"
+            archive = [f'build {archive_target}: archive {" ".join(objects)}']
+            default = [f"default {library_target} {archive_target}"]
+        else:
+            archive_rule, archive = [], []
+            default = [f"default {library_target}"]
     else:
         link_rule, archive_rule, link, archive, default = [], [], [], [], []
 
