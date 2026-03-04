@@ -1863,6 +1863,31 @@ namespace py = pybind11;
           py::arg("weight"),                 \
           py::arg("epsilon"));
 
+#define MHC_PYBIND                              \
+    m.def("mhc_pre_gemm_sqrsum",                \
+          &aiter::mhc_pre_gemm_sqrsum,          \
+          "mhc_pre_gemm_sqrsum",                \
+          py::arg("out"),                       \
+          py::arg("sqrsum"),                    \
+          py::arg("x"),                         \
+          py::arg("fn"),                        \
+          py::arg("tile_k") = 128);             \
+    m.def("mhc_pre_big_fuse",                   \
+          &aiter::mhc_pre_big_fuse,             \
+          "mhc_pre_big_fuse",                   \
+          py::arg("post_mix"),                  \
+          py::arg("comb_mix"),                  \
+          py::arg("layer_input"),               \
+          py::arg("gemm_out_mul"),              \
+          py::arg("gemm_out_sqrsum"),           \
+          py::arg("hc_scale"),                  \
+          py::arg("hc_base"),                   \
+          py::arg("residual"),                  \
+          py::arg("rms_eps")            = 1e-6, \
+          py::arg("hc_pre_eps")         = 1e-6, \
+          py::arg("hc_sinkhorn_eps")    = 1e-6, \
+          py::arg("hc_post_mult_value") = 1.0,  \
+          py::arg("sinkhorn_repeat")    = 20);
 #define CAUSAL_CONV1D_UPDATE_PYBIND                                                 \
       m.def("causal_conv1d_update",                                                 \
             &aiter::causal_conv1d_update,                                           \

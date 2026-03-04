@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from aiter.test_common import checkAllclose, perftest
@@ -305,11 +305,6 @@ def test_fmoe(
         checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg)
 
 
-l_dtype = ["bf16"]
-l_m = [1, 128, 256]
-l_dim = [5120]
-l_hdim = [1024]
-l_expert = [16, 128]
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -317,67 +312,56 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["bf16"]],
+    nargs="*",
+    default=[dtypes.d_dtypes["bf16"]],
+    metavar="{bf16}",
     help="""Data type.
     e.g.: -d bf16""",
 )
 parser.add_argument(
     "-m",
     type=int,
-    default=None,
-    help="""M of mnk.
+    nargs="*",
+    default=[1, 128, 256],
+    help="""Number of tokens.
     e.g.: -m 64""",
 )
 parser.add_argument(
     "-dim",
     type=int,
-    default=None,
-    help="""model dimension, default 5120
+    nargs="*",
+    default=[5120],
+    help="""Model dimension.
     e.g.: -dim 5120""",
 )
 parser.add_argument(
     "-hdim",
     type=int,
-    default=None,
-    help="""Hidden dimension, default 1024
+    nargs="*",
+    default=[1024],
+    help="""Hidden dimension.
     e.g.: -hdim 1024""",
 )
 parser.add_argument(
     "-e",
     "--expert",
     type=int,
-    choices=l_expert,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    default=[16, 128],
     help="""Number of experts.
     e.g.: -e 16""",
 )
 
 args = parser.parse_args()
-if args.dtype is None:
-    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-else:
-    l_dtype = [dtypes.d_dtypes[args.dtype]]
-if args.m is not None:
-    l_m = [args.m]
-if args.dim is not None:
-    l_dim = [args.dim]
-if args.hdim is not None:
-    l_hdim = [args.hdim]
-if args.expert is not None:
-    l_expert = [args.expert]
 
 print("\ng1u1 fp8quant")
-for dtype in l_dtype:
-    for m in l_m:
-        for dim in l_dim:
-            for hdim in l_hdim:
-                for num_of_experts in l_expert:
+for dtype in args.dtype:
+    for m in args.m:
+        for dim in args.dim:
+            for hdim in args.hdim:
+                for num_of_experts in args.expert:
                     test_fmoe(
                         dtype,
                         m,
@@ -390,4 +374,3 @@ for dtype in l_dtype:
                         shared_E=0,
                         activation=ActivationType.Silu,
                     )
-                    #   quant='fp8quant', use_g1u1=True)
