@@ -1,4 +1,4 @@
-# Copyright (C) 2024, Tri Dao.
+# Copyright (C) 2024-2026, Tri Dao.
 # AIter causal_conv1d benchmark tests with @perftest and @benchmark
 
 import argparse
