@@ -5,6 +5,8 @@ import math
 from typing import Optional, Tuple
 
 import torch
+import triton
+import triton.language as tl
 from csrc.cpp_itfs.pa.pa import paged_attention_rocm as paged_attention_rocm_core
 from csrc.cpp_itfs.pa.pa_ragged import (
     paged_attention_ragged as paged_attention_ragged_core,
@@ -973,3 +975,236 @@ def mla_reduce_v1(
     final_output: torch.Tensor,
     final_lse: Optional[torch.Tensor] = None,
 ) -> None: ...
+
+
+# @triton.jit
+# def decode_update_mla_metadata_v1_kernel(
+#     seqlens_qo_indptr,
+#     seqlens_kv_indptr,
+#     kv_last_page_lens,
+#     num_heads_per_head_k: tl.constexpr,
+#     num_heads_k: tl.constexpr,
+#     is_causal: tl.constexpr,
+#     work_info,
+#     work_indptr,
+#     reduce_indptr,
+#     reduce_final_map,
+#     reduce_partial_map,
+#     page_size: tl.constexpr,
+#     kv_granularity: tl.constexpr,
+#     cu_num: tl.constexpr,
+#     batch_size: tl.constexpr,
+#     qk_batch_ratio: tl.constexpr,
+# ):
+#     batch_id = tl.program_id(0)
+#     real_batch_id = batch_id // qk_batch_ratio
+#     real_batch_repeat = batch_id % qk_batch_ratio + 1
+#     added_worker_offset = 0
+#     added_partial_offset = 0
+#     old_num_worker = tl.load(work_indptr + cu_num)
+#     # old_num_partial = tl.load(reduce_indptr + tile_reduce_cnt + 1)seq_kv_start = tl.load(seqlens_kv_indptr + j)
+#     seq_kv_end = 0
+#     seq_kv_last = 0
+#     seq_kv_len = 0
+#     seq_partial = 0
+#     cur_sum_partial = 0
+#     for j in range(0, real_batch_id + 1):
+#         seq_kv_start = tl.load(seqlens_kv_indptr + j)
+#         seq_kv_end = tl.load(seqlens_kv_indptr + (j + 1))
+#         seq_kv_last = tl.load(kv_last_page_lens + j)
+#         seq_kv_len = (seq_kv_end - seq_kv_start - 1) * page_size + seq_kv_last
+#         seq_partial = 0 if seq_kv_len <= kv_granularity else (seq_kv_len - 1) // kv_granularity + 1
+#         ratio = real_batch_repeat if j == real_batch_id else qk_batch_ratio
+#         cur_sum_partial += seq_partial * ratio
+#         if seq_kv_len % kv_granularity == 1:
+#             added_worker_offset += ratio
+#             added_partial_offset += ratio
+#             if seq_kv_len == (kv_granularity + 1):
+#                 added_partial_offset += ratio
+#     tl.store(reduce_indptr + batch_id + 1, cur_sum_partial)
+
+#     seq_q_start = 0
+#     seq_q_end = 0
+#     batch_tile_id = 0
+#     for i in range(0, old_num_worker):
+#         bs_id = tl.load(work_info + i * 8 + 0)
+#         partial_index = tl.load(work_info + i * 8 + 1)
+#         q_start = tl.load(work_info + i * 8 + 2)
+#         q_end = tl.load(work_info + i * 8 + 3)
+#         kv_start = tl.load(work_info + i * 8 + 4)
+#         kv_end = tl.load(work_info + i * 8 + 5)
+#         kv_offset = tl.load(work_info + i * 8 + 6)
+
+#         if bs_id == batch_id:
+#             seq_q_start = q_start
+#             seq_q_end = q_end
+#             if (kv_end - kv_start) * page_size < kv_granularity:
+#                 kv_start = seq_kv_end - (seq_kv_len % kv_granularity) // page_size
+#                 kv_end = seq_kv_end
+#                 kv_offset = 0
+#             else:
+#                 kv_offset += 1
+#                 kv_end = seq_kv_end - kv_offset // page_size
+#                 kv_start = kv_end - kv_granularity // page_size
+
+#             if seq_kv_len > kv_granularity:
+#                 partial_index = cur_sum_partial - seq_partial + batch_tile_id
+#                 tl.store(reduce_partial_map + partial_index, partial_index)
+#             tl.store(work_info + i * 8 + 0, batch_id)
+#             tl.store(work_info + i * 8 + 1, partial_index)
+#             tl.store(work_info + i * 8 + 2, seq_q_start)
+#             tl.store(work_info + i * 8 + 3, seq_q_end)
+#             tl.store(work_info + i * 8 + 4, kv_start)
+#             tl.store(work_info + i * 8 + 5, kv_end)
+#             tl.store(work_info + i * 8 + 6, kv_offset)
+#             tl.store(work_info + i * 8 + 7, 0)
+#             batch_tile_id += 1
+
+#     tl.store(reduce_final_map + batch_id * 2, seq_q_start)
+#     tl.store(reduce_final_map + batch_id * 2 + 1, seq_q_end)
+
+#     if seq_kv_len % kv_granularity == 1:
+#         added_worker_pos = old_num_worker + added_worker_offset - 1
+#         added_worker_ptr = work_info + added_worker_pos * 8
+#         tl.store(added_worker_ptr + 0, batch_id)
+#         tl.store(added_worker_ptr + 1, cur_sum_partial - 1)
+#         tl.store(added_worker_ptr + 2, seq_q_start)
+#         tl.store(added_worker_ptr + 3, seq_q_end)
+#         tl.store(added_worker_ptr + 4, seq_kv_end - 1)
+#         tl.store(added_worker_ptr + 5, seq_kv_end)
+#         tl.store(added_worker_ptr + 6, 0)
+#         tl.store(added_worker_ptr + 7, 0)
+#         tl.store(reduce_partial_map + cur_sum_partial - 1, cur_sum_partial - 1)
+
+#     if batch_id == batch_size - 1:
+#         tl.store(work_indptr + cu_num, old_num_worker + added_worker_offset)
+
+
+@triton.jit
+def decode_update_mla_metadata_v1_kernel(
+    seqlens_qo_indptr,
+    seqlens_kv_indptr,
+    kv_last_page_lens,
+    num_heads_per_head_k: tl.constexpr,
+    num_heads_k: tl.constexpr,
+    is_causal: tl.constexpr,
+    work_info,
+    work_indptr,
+    reduce_indptr,
+    reduce_final_map,
+    reduce_partial_map,
+    page_size: tl.constexpr,
+    kv_granularity: tl.constexpr,
+    cu_num: tl.constexpr,
+    batch_size: tl.constexpr,
+    qk_batch_ratio: tl.constexpr,
+):
+    batch_id = tl.program_id(0)
+    real_batch_id = batch_id // qk_batch_ratio
+    old_num_worker = tl.load(work_indptr + cu_num)
+    seq_kv_end = 0
+    seq_kv_last = 0
+    seq_kv_len = 0
+    seq_partial = 0
+    cur_sum_partial = 0
+    for j in range(0, real_batch_id + 1):
+        seq_kv_start = tl.load(seqlens_kv_indptr + j)
+        seq_kv_end = tl.load(seqlens_kv_indptr + (j + 1))
+        seq_kv_last = tl.load(kv_last_page_lens + j)
+        seq_kv_len = (seq_kv_end - seq_kv_start - 1) * page_size + seq_kv_last
+
+    batch_tile_id = 0
+    batch_last_work_id = -1
+    batch_last_kv_len = seq_kv_len
+    for i in range(0, old_num_worker):
+        bs_id = tl.load(work_info + i * 8 + 0)
+        partial_index = tl.load(work_info + i * 8 + 1)
+        q_start = tl.load(work_info + i * 8 + 2)
+        q_end = tl.load(work_info + i * 8 + 3)
+        kv_start = tl.load(work_info + i * 8 + 4)
+        kv_end = tl.load(work_info + i * 8 + 5)
+        kv_offset = tl.load(work_info + i * 8 + 6)
+
+        if bs_id == batch_id:
+            if kv_offset == 0:
+                batch_last_work_id = i
+            else:
+                kv_offset += 1
+                work_kv_pages = kv_end - kv_start
+                kv_end = seq_kv_end - (kv_offset + page_size - 1) // page_size
+                kv_start = kv_end - work_kv_pages
+                batch_last_kv_len = tl.minimum(batch_last_kv_len, kv_offset)
+
+            if seq_kv_len > kv_granularity:
+                partial_index = cur_sum_partial - seq_partial + batch_tile_id
+                tl.store(reduce_partial_map + partial_index, partial_index)
+            # tl.store(work_info + i * 8 + 0, batch_id)
+            # tl.store(work_info + i * 8 + 1, partial_index)
+            # tl.store(work_info + i * 8 + 2, q_start)
+            # tl.store(work_info + i * 8 + 3, q_end)
+            tl.store(work_info + i * 8 + 4, kv_start)
+            tl.store(work_info + i * 8 + 5, kv_end)
+            tl.store(work_info + i * 8 + 6, kv_offset)
+            tl.store(work_info + i * 8 + 7, 0)
+            batch_tile_id += 1
+
+    batch_last_kv_pages = (batch_last_kv_len + page_size - 1) // page_size
+    batch_last_kv_start = seq_kv_end - batch_last_kv_pages
+    tl.store(work_info + batch_last_work_id * 8 + 4, batch_last_kv_start)
+    tl.store(work_info + batch_last_work_id * 8 + 5, seq_kv_end)
+
+
+def decode_update_mla_metadata_v1(
+    seqlens_qo_indptr: torch.Tensor,
+    seqlens_kv_indptr: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    num_heads_per_head_k: int,
+    num_heads_k: int,
+    is_causal: bool,
+    work_metadata_ptrs: torch.Tensor,
+    work_info_set: torch.Tensor,
+    work_indptr: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: torch.Tensor,
+    reduce_partial_map: torch.Tensor,
+    page_size: int = 1,
+    kv_granularity: int = 16,
+    max_seqlen_qo: int = 1,
+    dtype_q: torch.dtype = dtypes.bf16,
+    dtype_kv: torch.dtype = dtypes.bf16,
+) -> None:
+    assert max_seqlen_qo == 1
+    assert kv_granularity % page_size == 0
+    assert num_heads_k == 1
+    # assert not (dtype_q == dtypes.bf16 and dtype_kv == dtypes.bf16 and num_heads_per_head_k == 128), "In this case, use get_mla_metadata_v1 instead"
+    natively_supported = (num_heads_per_head_k == 16) or (
+        num_heads_per_head_k == 128 and dtype_q == dtypes.fp8 and dtype_kv == dtypes.fp8
+    )
+    cu_num = work_indptr.shape[0] - 1
+    tile_reduce_cnt = reduce_indptr.shape[0] - 1
+    max_work = work_info_set.shape[0]
+    batch_size = seqlens_qo_indptr.shape[0] - 1
+    qk_batch_ratio = 1
+    if not natively_supported and num_heads_per_head_k % 16 == 0:
+        qk_batch_ratio = num_heads_per_head_k // 16
+        num_heads_per_head_k = 16
+        batch_size *= qk_batch_ratio
+    grid = (batch_size,)
+    decode_update_mla_metadata_v1_kernel[grid](
+        seqlens_qo_indptr,
+        seqlens_kv_indptr,
+        kv_last_page_lens,
+        num_heads_per_head_k,
+        num_heads_k,
+        is_causal,
+        work_info_set,
+        work_indptr,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        page_size,
+        kv_granularity,
+        cu_num,
+        batch_size,
+        qk_batch_ratio,
+    )
