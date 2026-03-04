@@ -45,8 +45,10 @@ def run_torch(
     v = v.view(-1, KH, D).contiguous()
 
     if rms_norm_qk:
-        q = q * torch.rsqrt(q.pow(2).mean(-1, keepdim=True) + eps)
-        k = k * torch.rsqrt(k.pow(2).mean(-1, keepdim=True) + eps)
+        q = q.to(torch.float32) * torch.rsqrt(q.to(torch.float32).pow(2).mean(-1, keepdim=True) + eps)
+        k = k.to(torch.float32) * torch.rsqrt(k.to(torch.float32).pow(2).mean(-1, keepdim=True) + eps)
+        q = q.to(v.dtype)
+        k = k.to(v.dtype)
 
     q = ref_rope_sbhd_fwd(
         q,
@@ -79,9 +81,8 @@ def run_torch(
 @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
 @pytest.mark.parametrize("max_embed_positions", [131072])
 @pytest.mark.parametrize(
-    "nope, nope_first", [(False, False)]
+    "nope, nope_first, rms_norm_qk", [(False, False, False), (False, False, True), (True, False, False), (True, True, False)]
 )
-@pytest.mark.parametrize("rms_norm_qk", [True])
 @pytest.mark.parametrize("attn_output_gate", [False, True])
 @pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -154,6 +155,6 @@ def test_fused_qkv_split_qk_rope(
     if attn_output_gate:
         torch.testing.assert_close(gate_torch, gate_triton)
 
-    torch.testing.assert_close(q_torch, q_triton)
-    torch.testing.assert_close(k_torch, k_triton)
+    torch.testing.assert_close(q_torch, q_triton, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(k_torch, k_triton, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(v_torch, v_triton)

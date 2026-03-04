@@ -123,17 +123,29 @@ def _fused_qkv_split_qk_rope_kernel(
         q_f32 = q.to(tl.float32)
         q_sq_sum = tl.sum(q_f32 * q_f32, axis=1)
         q_rsqrt = tl.rsqrt(q_sq_sum / BLOCK_D + eps)
-        
+
         q_normed = q_f32 * q_rsqrt[:, None]
         q = q_normed.to(q.dtype)
 
     if ENABLE_GATED_Q:
-        Q_SIZE = QH * BLOCK_D
+        BLOCK_D_FULL: tl.constexpr = BLOCK_D * 2 if HAVE_NOPE else BLOCK_D
+        Q_SIZE = QH * BLOCK_D_FULL
+
+        d_gate_offs = tl.arange(0, BLOCK_D_FULL)
+        x_gate_mask = t_mask[:, None] & (d_gate_offs < BLOCK_D_FULL)[None, :]
+
         gate_in_offs = (
             t_offs[:, None] * stride_qkv_t
-            + (Q_SIZE + H_OFFS_SIZE * offs_nope_ratio + d_offs)[None, :] * stride_qkv_d
+            + (Q_SIZE + H_OFFS_SIZE * offs_nope_ratio + d_gate_offs)[None, :]
+            * stride_qkv_d
         )
-        gate = tl.load(qkv_ptr + gate_in_offs, mask=x_mask)
+        gate = tl.load(qkv_ptr + gate_in_offs, mask=x_gate_mask)
+        gate_out_offs = (
+            t_offs[:, None] * stride_q_t
+            + d_gate_offs[None, :] * stride_q_d
+            + hq * stride_q_h
+        )
+        tl.store(gate_ptr + gate_out_offs, gate, mask=x_gate_mask)
 
     if IS_NEOX:
         q_rotated = _get_neox_rotated_x(
@@ -150,9 +162,6 @@ def _fused_qkv_split_qk_rope_kernel(
     q = q * cos + q_rotated * sin
     q = q.to(q_ptr.dtype.element_ty)
     tl.store(q_ptr + q_out_offs, q, mask=x_mask)
-
-    if ENABLE_GATED_Q:
-        tl.store(gate_ptr + q_out_offs, gate, mask=x_mask)
 
     if HAVE_NOPE:
         if NOPE_FIRST:
@@ -187,7 +196,7 @@ def _fused_qkv_split_qk_rope_kernel(
             k_f32 = k.to(tl.float32)
             k_sq_sum = tl.sum(k_f32 * k_f32, axis=1)
             k_rsqrt = tl.rsqrt(k_sq_sum / BLOCK_D + eps)
-            
+
             k_normed = k_f32 * k_rsqrt[:, None]
             k = k_normed.to(k.dtype)
 

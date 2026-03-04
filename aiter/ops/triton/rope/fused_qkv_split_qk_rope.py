@@ -26,7 +26,6 @@ def fused_qkv_split_qk_rope(
     kv_size = kvh * head_dim
 
     assert qh >= kvh and qh % kvh == 0, "qh must be mutiple of kvh"
-
     q = torch.empty((qkv.shape[0], qh, head_dim), dtype=qkv.dtype, device=qkv.device)
     k = torch.empty((qkv.shape[0], kvh, head_dim), dtype=qkv.dtype, device=qkv.device)
     v = torch.empty((qkv.shape[0], kvh, head_dim), dtype=qkv.dtype, device=qkv.device)
@@ -44,6 +43,8 @@ def fused_qkv_split_qk_rope(
         have_nope = True
     else:
         have_nope = False
+
+    assert not (have_nope and rms_norm_qk), "nope and rms norm qk can not be used togather"
 
     if attn_output_gate:
         assert qkv.shape[-1] == 2 * q_size + 2 * kv_size, "Shape error"
