@@ -550,10 +550,15 @@ class IrisTwoshotRowHipblasltManager:
         # Copy input to symmetric heap (captured in graph)
         iris_input.copy_(input_tensor)
 
+        capturing = torch.cuda.is_current_stream_capturing()
+        logger.info("fused_op M=%d N=%d capturing=%s pre_barrier", M, N, capturing)
+
         # Pre-kernel barrier: ensure all ranks have copied input to heap
         # before any rank's kernel starts reading from peers.
         # device_barrier is graph-capturable (pure device-side atomics).
         shmem.device_barrier()
+
+        logger.info("fused_op M=%d N=%d pre_barrier done", M, N)
 
         # FP8 max value
         fp8_max = torch.finfo(quant_dtype).max
@@ -618,10 +623,14 @@ class IrisTwoshotRowHipblasltManager:
             waves_per_eu=WAVES_PER_EU,
         )
 
+        logger.info("fused_op M=%d N=%d post_barrier", M, N)
+
         # Post-kernel barrier: ensure all ranks have finished writing
         # FP8 data + scales to the heap before any rank overwrites its
         # input buffer on the next iteration.
         shmem.device_barrier()
+
+        logger.info("fused_op M=%d N=%d post_barrier done", M, N)
 
         # Step 3: hipBLASLt GEMM via torch._scaled_mm
         # quant_heap is (M, N) FP8, scale_heap is (M,) float32
