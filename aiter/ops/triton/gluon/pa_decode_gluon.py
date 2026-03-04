@@ -1188,12 +1188,16 @@ def paged_attention_decode_sliding_window_head_1(
     )
     mtp_query_offsets = (
         sequence_idx * stride_query_bs
-        + (mtp_idx * QUERY_SEQ_LEN_POW2 + mtp_query_len_offsets[:, None, None]) * stride_query_qlen
+        + (mtp_idx * QUERY_SEQ_LEN_POW2 + mtp_query_len_offsets[:, None, None])
+        * stride_query_qlen
         + mtp_query_group_size_offsets[None, :, None] * stride_query_group_size
         + mtp_head_size_offsets[None, None, :]
     )
     mtp_query_mask = (
-        (mtp_idx * QUERY_SEQ_LEN_POW2 + mtp_query_len_offsets[:, None, None] < query_seq_len)
+        (
+            mtp_idx * QUERY_SEQ_LEN_POW2 + mtp_query_len_offsets[:, None, None]
+            < query_seq_len
+        )
         & (mtp_query_group_size_offsets[None, :, None] < query_group_size)
         & (mtp_head_size_offsets[None, None, :] < head_size)
     )
@@ -1243,7 +1247,8 @@ def paged_attention_decode_sliding_window_head_1(
     if ONE_SHOT:
         output_offsets = (
             sequence_idx * stride_output_bs
-            + (mtp_idx * QUERY_SEQ_LEN_POW2 + mtp_query_len_offsets[:, None, None]) * stride_output_len
+            + (mtp_idx * QUERY_SEQ_LEN_POW2 + mtp_query_len_offsets[:, None, None])
+            * stride_output_len
             + mtp_query_group_size_offsets[None, :, None] * stride_output_group_size
             + mtp_head_size_offsets[None, None, :]
         )
@@ -1322,12 +1327,14 @@ def paged_attention_decode_sliding_window_head_1(
         # Per-token quantization
         query_scale_offsets = (
             sequence_idx * stride_query_scale_bs
-            + (mtp_idx * QUERY_SEQ_LEN_POW2 + mtp_query_len_offsets[:, None, None]) * stride_query_scale_qlen
+            + (mtp_idx * QUERY_SEQ_LEN_POW2 + mtp_query_len_offsets[:, None, None])
+            * stride_query_scale_qlen
             + mtp_query_group_size_offsets[None, :, None]
         )
-        query_scale_mask = (mtp_idx * QUERY_SEQ_LEN_POW2 + mtp_query_len_offsets[:, None, None] < query_seq_len) & (
-            mtp_query_group_size_offsets[None, :, None] < query_group_size
-        )
+        query_scale_mask = (
+            mtp_idx * QUERY_SEQ_LEN_POW2 + mtp_query_len_offsets[:, None, None]
+            < query_seq_len
+        ) & (mtp_query_group_size_offsets[None, :, None] < query_group_size)
         query_scale_value = gl.amd.cdna3.buffer_load(
             ptr=query_scale,
             offsets=query_scale_offsets,
@@ -1383,7 +1390,19 @@ def paged_attention_decode_sliding_window_head_1(
         * stride_key_block_elem
         + contiguous_kv_element_offsets[None, None, None, :]
     )
-    key_tensor = gl.load(key_cache_ptr + key_block_offsets)
+    if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE and SLIDING_WINDOW > 0:
+        kv_token_global = (
+            kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE + block_element_offsets
+        )
+        kv_in_window_mask = kv_token_global >= sequence_start_idx
+
+        key_tensor = gl.load(
+            key_cache_ptr + key_block_offsets,
+            mask=kv_in_window_mask[None, None, :, None],
+            other=0.0,
+        )
+    else:
+        key_tensor = gl.load(key_cache_ptr + key_block_offsets)
     query_converted = query_shared.load(qk_lhs_operand_layout)
     for sequence_partition_idx in range(
         sequence_partition_start_idx,
@@ -1482,9 +1501,8 @@ def paged_attention_decode_sliding_window_head_1(
 
                 value_tensor = gl.load(
                     value_cache_ptr + value_block_offsets,
-                    mask=value_in_window_mask,
-                    other=0.0,
                 )
+                value_tensor = gl.where(value_in_window_mask, value_tensor, 0.0)
             else:
                 value_tensor = gl.load(value_cache_ptr + value_block_offsets)
 
