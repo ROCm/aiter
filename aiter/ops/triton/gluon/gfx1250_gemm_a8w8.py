@@ -70,7 +70,6 @@ def _gemm_a8w8_kernel(
     GRID_MN: gl.constexpr,
     NUM_XCDS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    K_DIM: gl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8 function
@@ -115,14 +114,14 @@ def _gemm_a8w8_kernel(
         transposed=True,
         warp_bases=[[0, 1], [0, 2], [1, 0]],  # [2, 4] layout
         reg_bases=[],
-        instr_shape=[16, 16, K_DIM],
+        instr_shape=[16, 16, 128],
     )
 
     shared_a: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=8, per_phase=1, max_phase=16, order=[1, 0]
+        vec=16, per_phase=1, max_phase=16, order=[1, 0]
     ) # CHECK VEC=16, rn doing ds_load_2addr_stride64_b64. Will ds_load_b128 be better?
     shared_b: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=8, per_phase=1, max_phase=16, order=[0, 1]
+        vec=16, per_phase=1, max_phase=16, order=[0, 1]
     )
 
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
@@ -343,7 +342,6 @@ def _gemm_a8w8_kernel_async(
     GROUP_SIZE_M: gl.constexpr,
     GRID_MN: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    K_DIM: gl.constexpr,
     TRANSPOSE_B: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
 ):
@@ -371,12 +369,12 @@ def _gemm_a8w8_kernel_async(
 
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
-    shared_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_SIZE_K, 16]], [BLOCK_SIZE_M, BLOCK_SIZE_K], [1, 0])
+    shared_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[256, 16]], [BLOCK_SIZE_M, BLOCK_SIZE_K], [1, 0])
     if not TRANSPOSE_B:
         shared_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_SIZE_N, 32]], [BLOCK_SIZE_K, BLOCK_SIZE_N], [1, 0])
         # this dont make sense need to look more into this
     else:
-        shared_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_SIZE_K, 16]], [BLOCK_SIZE_N, BLOCK_SIZE_K], [1, 0])
+        shared_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[256, 16]], [BLOCK_SIZE_N, BLOCK_SIZE_K], [1, 0])
 
     a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(base=a_ptr, shape=(M, K),
                                                          strides=(stride_am, stride_ak), block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K), layout=shared_a)
@@ -395,7 +393,7 @@ def _gemm_a8w8_kernel_async(
         transposed=True,
         warp_bases=[[0, 1], [0, 2], [1, 0]],  # [2, 4] layout
         reg_bases=[],
-        instr_shape=[16, 16, K_DIM],
+        instr_shape=[16, 16, 128],
     )
 
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
@@ -407,6 +405,7 @@ def _gemm_a8w8_kernel_async(
 
     offs_am = pid_m * BLOCK_SIZE_M
     offs_bn = pid_n * BLOCK_SIZE_N
+    
     # Load scales
     offs_a_scale = pid_m * BLOCK_SIZE_M + gl.arange(
         0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_layout)
@@ -425,33 +424,44 @@ def _gemm_a8w8_kernel_async(
         mask=offs_b_scale < N,
     )
 
-    producer=0
-    consumer=0
-
     # prologue
-    producer = issue_loads(producer, a_desc, b_desc, offs_am, offs_bn, a_buffer, b_buffer, BLOCK_SIZE_K, NUM_BUFFERS, TRANSPOSE_B)
+    pred = 1
+    pred_i32 = pred.to(gl.int32) if hasattr(pred, 'to') else pred
+    
+    gl.amd.gfx1250.tdm.async_load(a_desc, [offs_am, 0], a_buffer.index(0), pred=pred_i32)
+    
+    if not TRANSPOSE_B:
+        gl.amd.gfx1250.tdm.async_load(b_desc, [0, offs_bn], b_buffer.index(0), pred=pred_i32)
+    else:
+        gl.amd.gfx1250.tdm.async_load(b_desc, [offs_bn, 0], b_buffer.index(0), pred=pred_i32)
+        
     #change this to k_iter
-
     acc_dtype = gl.float32 if a_ptr.type.element_ty != gl.int8 else gl.int32
     acc = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=wmma_layout)
-    for _ in range(0, gl.cdiv(K, BLOCK_SIZE_K) - 1):
-        producer = issue_loads(producer, a_desc, b_desc, offs_am, offs_bn, a_buffer, b_buffer, BLOCK_SIZE_K, NUM_BUFFERS, TRANSPOSE_B)
-        gl.amd.gfx1250.tdm.async_wait(2) # wait for a and b async load
-        a = a_buffer.index(consumer % NUM_BUFFERS).load(layout=dot_a_layout)
+    num_k_iters = gl.cdiv(K, BLOCK_SIZE_K)
+    for k in range(1, num_k_iters):
+        gl.amd.gfx1250.tdm.async_load(a_desc, [offs_am, k * BLOCK_SIZE_K], a_buffer.index(k % NUM_BUFFERS), pred=pred_i32)
+    
         if not TRANSPOSE_B:
-            b = b_buffer.index(consumer % NUM_BUFFERS).load(layout=dot_b_layout)
+            gl.amd.gfx1250.tdm.async_load(b_desc, [k * BLOCK_SIZE_K, offs_bn], b_buffer.index(k % NUM_BUFFERS), pred=pred_i32)
         else:
-            b = b_buffer.index(consumer % NUM_BUFFERS).permute([1, 0]).load(layout=dot_b_layout) #wmma layout expects (K, N)
+            gl.amd.gfx1250.tdm.async_load(b_desc, [offs_bn, 0], b_buffer.index(k % NUM_BUFFERS), pred=pred_i32)
+        
+        gl.amd.gfx1250.tdm.async_wait(2) # wait for a and b async load
+        a = a_buffer.index((k-1) % NUM_BUFFERS).load(layout=dot_a_layout)
+        if not TRANSPOSE_B:
+            b = b_buffer.index((k-1) % NUM_BUFFERS).load(layout=dot_b_layout)
+        else:
+            b = b_buffer.index((k-1) % NUM_BUFFERS).permute([1, 0]).load(layout=dot_b_layout) #wmma layout expects (K, N)
         acc = gl.amd.gfx1250.wmma(a, b, acc)
-        consumer += 1
 
     #epilogue
     gl.amd.gfx1250.tdm.async_wait(0)
-    a = a_buffer.index(consumer % NUM_BUFFERS).load(layout=dot_a_layout)
+    a = a_buffer.index((num_k_iters-1) % NUM_BUFFERS).load(layout=dot_a_layout)
     if not TRANSPOSE_B:
-        b = b_buffer.index(consumer % NUM_BUFFERS).load(layout=dot_b_layout)
+        b = b_buffer.index((num_k_iters-1) % NUM_BUFFERS).load(layout=dot_b_layout)
     else:
-        b = b_buffer.index(consumer % NUM_BUFFERS).permute([1, 0]).load(layout=dot_b_layout)
+        b = b_buffer.index((num_k_iters-1) % NUM_BUFFERS).permute([1, 0]).load(layout=dot_b_layout)
     acc = gl.amd.gfx1250.wmma(a, b, acc)
 
     # apply scales to accumulator
@@ -769,7 +779,6 @@ def gemm_a8w8(
             bias is not None,
             NUM_WARPS=config["num_warps"],
             **config,
-            K_DIM=64 if x.dtype == torch.int8 else 128,
             TRANSPOSE_B=TRANSPOSE_B,
             NUM_BUFFERS=2,
         )
