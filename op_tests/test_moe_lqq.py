@@ -24,9 +24,10 @@ import argparse
 from typing import Optional
 
 
-#!!!!!!!!!!!!!!!!!!!!!!!!!!!! do NOT overwrite this value !!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!! do NOT overwrite bellow value !!!!!!!!!!!!!!!!!!!!!!!!!!!!
 LQQ_I8_MAX = 119
-#!!!!!!!!!!!!!!!!!!!!!!!!!!!! do NOT overwrite this value !!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!! do NOT overwrite above value !!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+MAX_TOKENS = 4096 * 4
 
 
 def moe_lqq_dequant(
@@ -122,30 +123,46 @@ def test_fmoe_lqq(
     input = torch.randn((token, model_dim), dtype=dtype, device="cuda")
     score = torch.randn((token, E), device="cuda", dtype=dtype)
 
-    topk_weights, topk_ids = fused_topk(input, score, topk, True)
-
     if shared_E > 0:
-        shared_E_score = 0.5
-        s_topk_weights = torch.tensor(
-            [
-                [shared_E_score, shared_E_score],
-            ]
-            * token,
-            dtype=dtypes.fp32,
-            device=input.device,
+        shared_E_score = 0.1
+        # init total_topk_ids, inference time you just need to fill ns_topk_ids in total_topk_ids
+        total_topk_ids = torch.empty(
+            (MAX_TOKENS, topk + shared_E + 1), dtype=dtypes.i32, device=input.device
         )
-        topk_weights = torch.cat((topk_weights, s_topk_weights), dim=1)
-        s_topk_ids = torch.tensor(
-            [
-                [E, E + 1],
-            ]
-            * token,
-            dtype=dtypes.i32,
-            device=input.device,
+        ns_topk_ids, s_topk_ids = total_topk_ids.split([topk, shared_E + 1], dim=1)
+        shared_expert_ids = [E + i for i in range(shared_E + 1)]
+        s_topk_ids_list = [[fake_expertid] * (shared_E + 1)] * MAX_TOKENS
+        for i in range(ep_id, MAX_TOKENS, ep):
+            s_topk_ids_list[i] = shared_expert_ids
+        s_topk_ids[:] = torch.tensor(
+            s_topk_ids_list, dtype=dtypes.i32, device=input.device
         )
-        topk_ids = torch.cat((topk_ids, s_topk_ids), dim=1)
+
+        # init total_topk_weights, inference time you just need to fill ns_topk_weights in total_topk_weights
+        total_topk_weights = torch.empty(
+            (MAX_TOKENS, topk + shared_E + 1), dtype=dtypes.fp32, device=input.device
+        )
+        ns_topk_weights, s_topk_weights = total_topk_weights.split(
+            [topk, shared_E + 1], dim=1
+        )
+        s_topk_weights[:] = shared_E_score
+
+        # inference time, use fused_topk to fill ns_topk_ids and ns_topk_weights
+        fused_topk(input, score, topk, True, ns_topk_ids, ns_topk_weights)
+        # inference time, topk_ids simply slices total_topk_ids into the number of input tokens, same for topk_weights
+        topk_ids = total_topk_ids[:token]
+        topk_weights = total_topk_weights[:token]
+    else:
+        topk_weights, topk_ids = fused_topk(input, score, topk, True)
 
     eprt = local_E + shared_E
+
+    # topk_ids_absolute_avera
+    topk_ids_list2 = [[((i * topk) + j) % E for j in range(topk)] for i in range(token)]
+    topk_ids_absolute_avera = torch.tensor(
+        topk_ids_list2, device=topk_ids.device, dtype=topk_ids.dtype
+    )
+    topk_ids[:, :6] = topk_ids_absolute_avera
 
     ######################################################################################
     a1_qt, a1_scale = aiter.pertoken_quant(input, quant_dtype=dtypes.i8)
