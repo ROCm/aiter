@@ -1100,7 +1100,18 @@ def fused_moe_2stages(
         a1_scale = torch.ones([M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device)
 
     elif quant_type == QuantType.per_1x32:
-        if token_num <= token_num_quant_moe_sort_switch:
+        if hidden_states.dtype == dtypes.fp4x2 and a1_scale is not None:
+            # Input is already quantized to fp4x2 (e.g., from FP4 dispatch),
+            # skip re-quantization, only sort the scale
+            a1 = hidden_states
+            a1_scale = fp4_utils.moe_mxfp4_sort(
+                a1_scale,
+                sorted_ids=sorted_ids,
+                num_valid_ids=num_valid_ids,
+                token_num=token_num,
+                block_size=block_size_M,
+            )
+        elif token_num <= token_num_quant_moe_sort_switch:
             a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
                 hidden_states,
                 sorted_ids=sorted_ids,
