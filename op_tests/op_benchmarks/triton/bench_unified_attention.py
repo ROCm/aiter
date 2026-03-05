@@ -1,17 +1,22 @@
-import torch
+import os
 import sys
+
+import random
 import argparse
 import itertools
+
+import torch
 import triton
+import aiter
+
+from aiter.ops.triton.attention.unified_attention import unified_attention
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     print_vgpr,
     get_caller_name_no_ext,
 )
-from aiter.ops.triton.attention.unified_attention import unified_attention
 from op_tests.triton_tests.attention.test_unified_attention import ref_paged_attn
-import random
 from op_tests.triton_tests.attention.test_pa_prefill import seed_everything
 
 
@@ -366,11 +371,28 @@ def run_benchmark(custom, args):
         else:
             sinks = None
 
+        maybe_quantized_query = query
+        maybe_quantized_k_cache = k_cache
+        maybe_quantized_v_cache = v_cache
+        q_descale = None
+        k_descale = k_scale
+        v_descale = v_scale
+
+        if args.fp8:
+            FP8_TYPE = aiter.dtypes.fp8
+            FP8_MAX = torch.finfo(FP8_TYPE).max
+            maybe_quantized_query = query.to(FP8_TYPE)
+            maybe_quantized_k_cache = k_cache.to(FP8_TYPE)
+            maybe_quantized_v_cache = v_cache.to(FP8_TYPE)
+            q_descale = None
+            k_descale = k_cache.max().to(torch.float32) / FP8_MAX
+            v_descale = v_cache.max().to(torch.float32) / FP8_MAX
+
         def fn():
             return unified_attention(
-                q=query,
-                k=k_cache,
-                v=v_cache,
+                q=maybe_quantized_query,
+                k=maybe_quantized_k_cache,
+                v=maybe_quantized_v_cache,
                 out=output,
                 cu_seqlens_q=cu_seqlens_q,
                 seqused_k=kv_lens,
@@ -381,9 +403,9 @@ def run_benchmark(custom, args):
                 window_size=window_size,
                 block_table=block_table,
                 softcap=args.softcap if args.softcap is not None else 0,
-                q_descale=None,  # required to be None
-                k_descale=k_scale,
-                v_descale=v_scale,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
                 sinks=sinks,
             )
 
@@ -632,6 +654,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import sys
-
     sys.exit(main())
