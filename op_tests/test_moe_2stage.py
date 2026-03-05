@@ -79,7 +79,7 @@ def test_fmoe(
     elif qType == aiter.QuantType.per_Token and WQDType == torch.int4:  # int4 w quant
         w1_qt, w1_scale = aiter.pertoken_quant(w1, quant_dtype=dtypes.i8, dtypeMax=7)
         w2_qt, w2_scale = aiter.pertoken_quant(w2, quant_dtype=dtypes.i8, dtypeMax=7)
-    elif qType == aiter.QuantType.per_128x128:
+    elif qType in [aiter.QuantType.per_128x128, aiter.QuantType.per_1x128]:
 
         def weight_per_128x128_quant(weight, quant_dtype):
             E, dim1, dim2 = weight.shape
@@ -121,7 +121,7 @@ def test_fmoe(
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
 
     # Quant-ing a
-    if qType == aiter.QuantType.per_128x128:
+    if qType in [aiter.QuantType.per_128x128, aiter.QuantType.per_1x128]:
         a1_qt, a1_scale = aiter.pertoken_quant(
             input.view(token, -1, 128), quant_dtype=AQDType
         )
@@ -200,7 +200,7 @@ def test_fmoe(
     )
 
     # ######################## stage 2 start ###########
-    if qType == aiter.QuantType.per_128x128:
+    if qType in [aiter.QuantType.per_128x128, aiter.QuantType.per_1x128]:
         a2_qt, a2_scale = aiter.pertoken_quant(
             out1_ref.view(token, -1, 128), quant_dtype=AQDType
         )
@@ -297,6 +297,7 @@ l_quant = [
     (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
     (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
     (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2),  # a8w4
+    (aiter.QuantType.per_1x128, dtypes.fp8, dtypes.fp8)
 ]
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 l_doweight_stage1 = [False, True][:1]
@@ -355,7 +356,9 @@ parser.add_argument(
     4: aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2  # a4w4
     5: aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8,  # a8w8,
     6: aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2,  # a16w4,
-    7: aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2,  # a8w4,""",
+    7: aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2,  # a8w4,
+    8: aiter.QuantType.per_1x128, dtypes.fp8, dtypes.fp8  #  a8w8
+    """
 )
 
 parser.add_argument(
