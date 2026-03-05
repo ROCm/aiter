@@ -353,7 +353,7 @@ def run_benchmark(custom, args):
             max_seqlen_q=max_query_len,
             max_seqlen_k=max_kv_len,
             softmax_scale=scale,
-            causal=True,
+            causal=causal,
             window_size=window_size,
             block_table=block_table,
             softcap=args.softcap if args.softcap is not None else 0,
@@ -622,7 +622,6 @@ def main():
         )
 
     if args.print_vgpr:
-        assert not args.bench_torch, "Do not use -bench_torch with -print_vgpr."
         print("Retrieving VGPR usage for Triton kernels...")
 
         def fun():
