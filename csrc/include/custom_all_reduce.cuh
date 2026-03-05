@@ -605,49 +605,31 @@ cross_device_reduce_2stage(RankData* _input_dp,
     // Cross-device end-of-stage sync.
     end_sync<ngpus>(sg, self_sg, rank);
 
-    // ------------------------------
-    // Stage 2: allgather
-    // ------------------------------
-    //for (int idx = tid; idx < largest_part; idx += stride)
-    //{
-    //    int dst_idx           = ((warp_id + rank) % ngpus) * part + idx;
-    //    reinterpret_cast<P*>(result)[dst_idx] = tmps[warp_id][idx];
-    //}
-    // ------------------------------
-    // Stage 2: allgather (optimised)
-    // ------------------------------
+    // stage 2: allgather. Note: it's important to match the tid between
+    // the two stages, because visibility across devices is only guaranteed
+    // between threads that have the same tid. If thread i computes the sum of
+    // start + i in the first stage, then thread i also gathers start + i from all
+    // ranks.
+    //
+    // Optimisations: (1) software pipelining — prefetch next element while
+    // storing current to hide read latency (e.g. peer memory); (2) unroll to
+    // reduce loop overhead and improve ILP.
+    const int dst_base = (warp_id + rank) % ngpus * part;
+    P cur;
+    if(tid < largest_part)
+        cur = tmps[warp_id][tid];
+#pragma unroll 4
+    for(int idx = tid; idx < largest_part; idx += stride)
     {
-        // Vector pointers (16B)
-        P* __restrict__ dstP        = reinterpret_cast<P*>(result);
-        const P* __restrict__ srcP  = tmps[warp_id];
-
-        // Compute destination group once (avoid modulo in the loop)
-        int rpw = rank + warp_id;
-        int dst_group = (rpw >= ngpus) ? (rpw - ngpus) : rpw;
-
-        // Base offset for this group's slice inside 'result' (in P elements)
-        const int dst_base = dst_group * part;
-
-        // Length of the source chunk for this group (handle remainder on the last group)
-        const int src_len = (dst_group == (ngpus - 1)) ? largest_part : part;
-
-        // Optionally tell the compiler about alignment (16 B) if you can guarantee it:
-        // srcP  = (const P*)__builtin_assume_aligned(srcP, 16);
-        // dstP  = (P*)__builtin_assume_aligned(dstP, 16);
-
-        // Grid-stride, vectorised copy
-        // Unroll a bit to improve ILP without ballooning registers
-        #pragma unroll 2
-        for (int i = tid; i < src_len; i += stride) {
-            // one 16B transaction per iteration per thread (coalesced across lanes)
-            dstP[dst_base + i] = srcP[i];
-
-            // If you want a 2x unroll without complicating the header:
-            int j = i + stride;
-            if (j < src_len) {
-                dstP[dst_base + j] = srcP[j];
-            }
+        const int d = dst_base + idx;
+        if(idx + stride < largest_part)
+        {
+            P next = tmps[warp_id][idx + stride];
+            ((P*)result)[d] = cur;
+            cur = next;
         }
+        else
+            ((P*)result)[d] = cur;
     }
 
 }
