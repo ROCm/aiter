@@ -32,6 +32,7 @@ env:
   GPU_ARCH: gfx950
   BASE_IMAGE: rocm/pytorch:latest@sha256:683765a52c61341e1674fe730ab3be861a444a45a36c0a8caae7653a08a0e208
   AITER_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+  AITER_SUBMODULE_PATH: third_party/aiter
 
 jobs:
   check-signal:
@@ -115,12 +116,15 @@ jobs:
           RUN pip install --upgrade pip
           RUN pip install pytest pytest-rerunfailures pytest-timeout einops
 
-          # Clone and install flash-attention
-          # FA will install aiter as a dependency via FLASH_ATTENTION_ROCM_AITER_COMMIT
+          # Clone flash-attention and override aiter submodule with PR commit
           RUN git clone -b ${{ env.FA_BRANCH }} ${{ env.FA_REPOSITORY_URL }} /flash-attention && \
               cd /flash-attention && \
+              git submodule update --init ${{ env.AITER_SUBMODULE_PATH }} && \
+              cd ${{ env.AITER_SUBMODULE_PATH }} && \
+              git fetch origin ${{ env.AITER_COMMIT }} && \
+              git checkout ${{ env.AITER_COMMIT }} && \
+              cd /flash-attention && \
               FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
-              FLASH_ATTENTION_ROCM_AITER_COMMIT=${{ env.AITER_COMMIT }} \
               pip install --no-build-isolation .
 
           RUN echo "=== Installed versions ===" && \
@@ -234,10 +238,14 @@ jobs:
           RUN pip install pytest pytest-rerunfailures pytest-timeout einops
 
           # Clone and install flash-attention (CK backend)
-          # FA will install aiter as a dependency via FLASH_ATTENTION_ROCM_AITER_COMMIT
+          # Override aiter submodule with PR commit
           RUN git clone -b ${{ env.FA_BRANCH }} ${{ env.FA_REPOSITORY_URL }} /flash-attention && \
               cd /flash-attention && \
-              FLASH_ATTENTION_ROCM_AITER_COMMIT=${{ env.AITER_COMMIT }} \
+              git submodule update --init ${{ env.AITER_SUBMODULE_PATH }} && \
+              cd ${{ env.AITER_SUBMODULE_PATH }} && \
+              git fetch origin ${{ env.AITER_COMMIT }} && \
+              git checkout ${{ env.AITER_COMMIT }} && \
+              cd /flash-attention && \
               pip install --no-build-isolation .
 
           RUN echo "=== Installed versions ===" && \
