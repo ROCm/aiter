@@ -98,8 +98,6 @@ def _gemm_a8w8_kernel(
     tl.assume(stride_cm > 0)
     tl.assume(stride_cn > 0)
 
-    GRID_MN = tl.cdiv(M, BLOCK_SIZE_M) * tl.cdiv(N, BLOCK_SIZE_N)
-
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
@@ -122,13 +120,12 @@ def _gemm_a8w8_kernel(
     tl.assume(pid_n >= 0)
     tl.assume(pid_k >= 0)
 
-    if (pid_k * SPLITK_BLOCK_SIZE) < K:
-
-        num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
+    split_k_start = pid_k * SPLITK_BLOCK_SIZE
+    if split_k_start < K:
 
         # Create pointers for first block of A and B input matrices
         offs_k = tl.arange(0, BLOCK_SIZE_K)
-        offs_k_split = pid_k * SPLITK_BLOCK_SIZE + offs_k
+        offs_k_split = split_k_start + offs_k
         offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
         offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
         a_ptrs = a_ptr + (
@@ -139,27 +136,27 @@ def _gemm_a8w8_kernel(
         )
 
         # Create pointers for the scale tensors and load them
-        offs_a_scale = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M) % M
-        offs_b_scale = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N) % N
-        a_scale = tl.load(a_scale_ptr + offs_a_scale)
-        b_scale = tl.load(b_scale_ptr + offs_b_scale)
+        a_scale = tl.load(a_scale_ptr + offs_am)
+        b_scale = tl.load(b_scale_ptr + offs_bn)
 
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
-        for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
-            # Load the next block of A and B, generate a mask by checking the K dimension.
-            # If it is out of bounds, set it to 0.
+        split_k_end = tl.minimum(split_k_start + SPLITK_BLOCK_SIZE, K)
+        k_span = split_k_end - split_k_start
+        num_k_iter = tl.cdiv(k_span, BLOCK_SIZE_K)
+
+        for k in range(num_k_iter):
             if EVEN_K:
                 a = tl.load(a_ptrs)
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
                 a = tl.load(
-                    a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
+                    a_ptrs, mask=offs_k[None, :] < k_span - k * BLOCK_SIZE_K, other=0.0
                 )
                 b = tl.load(
                     b_ptrs,
-                    mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
+                    mask=offs_k[:, None] < k_span - k * BLOCK_SIZE_K,
                     other=0.0,
                     cache_modifier=cache_modifier,
                 )

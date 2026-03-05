@@ -80,7 +80,6 @@ def gemm_a8w8(
             * triton.cdiv(N, META["BLOCK_SIZE_N"])
         ),
     )
-
     _gemm_a8w8_kernel[grid](
         x,
         w,
