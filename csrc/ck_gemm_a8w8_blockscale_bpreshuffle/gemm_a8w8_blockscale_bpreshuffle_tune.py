@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# ruff: noqa: E402
 
 import os
 import sys
@@ -52,9 +53,9 @@ class Gemma8W8BlockScaleBPreShuffleTuner(GemmCommonTuner):
             required=False,
             help="choose libtype to be tuned, support ['all', 'asm', 'ck']",
         )
-# self.parser.set_defaults(splitK=True)
+
     def calculate(self, results, bpes=(1, 1, 2)):
-        ## bpes = (inbpe, w_bpe, outbpe)
+        # bpes = (inbpe, w_bpe, outbpe)
         return super().calculate(results, bpes=bpes)
 
     def getKernelName(self, kernelId, libtype="ck"):
@@ -71,8 +72,6 @@ class Gemma8W8BlockScaleBPreShuffleTuner(GemmCommonTuner):
         n = weight.shape[0]
         scale_n = (n + block_shape_n - 1) // block_shape_n
         scale_k = (k + block_shape_k - 1) // block_shape_k
-        # x_scale = rearrange(x_scale.view(-1, 1).repeat(1, block_shape_n*block_shape_k).view(m, scale_k, 1, block_shape_k),
-        #                           'num_blk_n num_blk_k blk_n blk_k ->(num_blk_n blk_n) (num_blk_k blk_k)')
         x = x.to(x_scale.dtype).view(
             m, k // block_shape[1], block_shape[1]
         ) * x_scale.unsqueeze(-1)
@@ -88,8 +87,6 @@ class Gemma8W8BlockScaleBPreShuffleTuner(GemmCommonTuner):
         weight = weight.to(w_scale.dtype) * w_scale
 
         out = F.linear(x.to(dtypes.fp32), weight.to(dtypes.fp32))
-        # scale = torch.matmul(x_scale, w_scale)
-        # out = torch.mul(x, scale)
         if bias is not None:
             out = out.to(bias) + bias
         return out.to(dtype)
@@ -202,7 +199,9 @@ class Gemma8W8BlockScaleBPreShuffleTuner(GemmCommonTuner):
 
     def get_asm_tasks(self, info_keys, useSplitK, seed, num_warmup, num_iters):
         cu_num, M, N, K = info_keys
-        asm_kernel_list_csv = f"{get_asm_dir()}/fp8gemm_blockscale/fp8gemm_bf16_blockscale.csv"
+        asm_kernel_list_csv = (
+            f"{get_asm_dir()}/fp8gemm_blockscale/fp8gemm_bf16_blockscale.csv"
+        )
         asm_kernels = self.get_asm_kernels(asm_kernel_list_csv)
         if not asm_kernels:
             return []
@@ -214,13 +213,11 @@ class Gemma8W8BlockScaleBPreShuffleTuner(GemmCommonTuner):
         asm_kernel_id = len(kernels_list)
         for key, kernel_names in asm_kernels.items():
             tile_m, tile_n, splitk_supported = key
-            # Keep task generation consistent with asm kernel constraints from config csv.
+            # Respect ASM kernel tile constraints from the config CSV.
             if N % tile_n != 0:
                 continue
             splitK_list = (
-                list(range(1, 9))
-                if useSplitK and int(splitk_supported) == 1
-                else [1]
+                list(range(1, 9)) if useSplitK and int(splitk_supported) == 1 else [1]
             )
             for kernel_name in kernel_names:
                 for splitK in splitK_list:
@@ -262,15 +259,11 @@ class Gemma8W8BlockScaleBPreShuffleTuner(GemmCommonTuner):
         shape_grouped = False
         mp_num = args.mp
         errRatio = args.errRatio
-        cu_num = self.get_cu_num()
         task = []
         tasks_data = []
 
         seed = 0
         for i in range(len(untunedf)):
-            M = untunedf.loc[i, "M"]
-            N = untunedf.loc[i, "N"]
-            K = untunedf.loc[i, "K"]
             seed = seed + 1
             total_kernel_nums = 0
 
