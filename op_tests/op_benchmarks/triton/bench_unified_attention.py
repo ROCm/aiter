@@ -467,7 +467,7 @@ def str2bool(v):
 
 
 def parse_args():
-    parser = get_parser(kernel_name="FlashAttention")
+    parser = get_parser(kernel_name="UnifiedAttention")
 
     parser.add_argument("-b", type=int, default=0)
     parser.add_argument("-hq", type=int, default=0)
