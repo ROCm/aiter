@@ -4802,7 +4802,8 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                                           KVT* v_out               = nullptr,
                                           bool use_shuffle_layout  = false,
                                           int block_size           = 0,
-                                          int x                    = 0)
+                                          int x                    = 0,
+                                          int rotary_dim           = 0)
 {
     constexpr int VEC_SIZE        = HEAD_SIZE / WARP_SIZE;
     constexpr int HALF_HEAD_SIZE  = HEAD_SIZE / 2;
@@ -4868,6 +4869,9 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
         vec_t<T, VEC_SIZE> x_vec;
         x_vec.load(qkv_ + access_id_in_head);
         vec_t<T, VEC_SIZE> out_vec;
+        const int rotary_dim_ = rotary_dim > 0 ? rotary_dim : HEAD_SIZE;
+        const int half_rotary = rotary_dim_ / 2;
+        const bool in_rotary  = access_id_in_head < rotary_dim_;
         if constexpr(IS_NEOX)
         {
             vec_t<T, VEC_SIZE> cos_sin_vec;
@@ -4887,30 +4891,47 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
             else
             {
                 auto position_ = positions[token_id * positions_stride_1];
-                cos_sin_vec.load(&cos_sin[position_ * HEAD_SIZE + access_id_in_head]);
+                if(in_rotary)
+                {
+                    cos_sin_vec.load(&cos_sin[position_ * rotary_dim_ + access_id_in_head]);
+                }
             }
             warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, HEAD_SIZE, eps);
-            auto nb_cos_sin_vec =
-                warp_shfl_sync_vec<T, VEC_SIZE>(cos_sin_vec, threadIdx.x + neighbor_offset);
-            auto nb_x_vec = warp_shfl_sync_vec<T, VEC_SIZE>(x_vec, threadIdx.x + neighbor_offset);
-            if(neighbor_offset > 0)
+            if(in_rotary)
             {
-#pragma unroll
-                for(int i = 0; i < VEC_SIZE; ++i)
+                const int rotary_neighbor_offset = access_id_in_head < half_rotary
+                                                       ? half_rotary / VEC_SIZE
+                                                       : -(half_rotary / VEC_SIZE);
+                auto nb_cos_sin_vec = warp_shfl_sync_vec<T, VEC_SIZE>(
+                    cos_sin_vec, threadIdx.x + rotary_neighbor_offset);
+                auto nb_x_vec = warp_shfl_sync_vec<T, VEC_SIZE>(
+                    x_vec, threadIdx.x + rotary_neighbor_offset);
+                if(access_id_in_head < half_rotary)
                 {
-                    out_vec[i] =
-                        (float)x_vec[i] * (float)cos_sin_vec[i] -
-                        (float)nb_x_vec[i] * (float)nb_cos_sin_vec[i]; // x0 * cos - x1 * sin
+#pragma unroll
+                    for(int i = 0; i < VEC_SIZE; ++i)
+                    {
+                        out_vec[i] =
+                            (float)x_vec[i] * (float)cos_sin_vec[i] -
+                            (float)nb_x_vec[i] * (float)nb_cos_sin_vec[i]; // x0 * cos - x1 * sin
+                    }
+                }
+                else
+                {
+#pragma unroll
+                    for(int i = 0; i < VEC_SIZE; ++i)
+                    {
+                        out_vec[i] =
+                            (float)x_vec[i] * (float)nb_cos_sin_vec[i] +
+                            (float)nb_x_vec[i] * (float)cos_sin_vec[i]; // x1 * cos + x0 * sin
+                    }
                 }
             }
             else
             {
 #pragma unroll
                 for(int i = 0; i < VEC_SIZE; ++i)
-                {
-                    out_vec[i] = (float)x_vec[i] * (float)nb_cos_sin_vec[i] +
-                                 (float)nb_x_vec[i] * (float)cos_sin_vec[i]; // x1 * cos + x0 * sin
-                }
+                    out_vec[i] = x_vec[i];
             }
         }
         else
@@ -4942,18 +4963,30 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
             else
             {
                 auto position_ = positions[token_id * positions_stride_1];
-                cos_vec.load(&cos_sin[position_ * HEAD_SIZE + access_id_in_head / 2]);
-                sin_vec.load(
-                    &cos_sin[position_ * HEAD_SIZE + access_id_in_head / 2 + HALF_HEAD_SIZE]);
+                if(in_rotary)
+                {
+                    cos_vec.load(&cos_sin[position_ * rotary_dim_ + access_id_in_head / 2]);
+                    sin_vec.load(
+                        &cos_sin[position_ * rotary_dim_ + access_id_in_head / 2 + half_rotary]);
+                }
             }
             warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, HEAD_SIZE, eps);
-#pragma unroll
-            for(int i = 0; i < VEC_SIZE / 2; ++i)
+            if(in_rotary)
             {
-                out_vec[2 * i + 0] = (float)x_vec[2 * i + 0] * (float)cos_vec[i] -
-                                     (float)x_vec[2 * i + 1] * (float)sin_vec[i];
-                out_vec[2 * i + 1] = (float)x_vec[2 * i + 1] * (float)cos_vec[i] +
-                                     (float)x_vec[2 * i + 0] * (float)sin_vec[i];
+#pragma unroll
+                for(int i = 0; i < VEC_SIZE / 2; ++i)
+                {
+                    out_vec[2 * i + 0] = (float)x_vec[2 * i + 0] * (float)cos_vec[i] -
+                                         (float)x_vec[2 * i + 1] * (float)sin_vec[i];
+                    out_vec[2 * i + 1] = (float)x_vec[2 * i + 1] * (float)cos_vec[i] +
+                                         (float)x_vec[2 * i + 0] * (float)sin_vec[i];
+                }
+            }
+            else
+            {
+#pragma unroll
+                for(int i = 0; i < VEC_SIZE; ++i)
+                    out_vec[i] = x_vec[i];
             }
         }
 
@@ -5176,7 +5209,8 @@ void fused_rope_rms_set_kv(const T* qkv,
                            KVT* v_out               = nullptr,
                            bool use_shuffle_layout  = false,
                            int64_t block_size       = 0,
-                           int64_t x                = 0)
+                           int64_t x                = 0,
+                           int64_t rotary_dim       = 0)
 {
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     constexpr int THREAD_BLOCK_SIZE = 256;
@@ -5214,7 +5248,8 @@ void fused_rope_rms_set_kv(const T* qkv,
                                                         v_out,               \
                                                         use_shuffle_layout,  \
                                                         block_size,          \
-                                                        x);                  \
+                                                        x,                   \
+                                                        (int)rotary_dim);    \
     }                                                                        \
     else                                                                     \
     {                                                                        \
@@ -5243,7 +5278,8 @@ void fused_rope_rms_set_kv(const T* qkv,
                                                         v_out,               \
                                                         use_shuffle_layout,  \
                                                         block_size,          \
-                                                        x);                  \
+                                                        x,                   \
+                                                        (int)rotary_dim);    \
     }
 
     switch(head_size)
