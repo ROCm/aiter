@@ -27,10 +27,8 @@ Default: "iris_twoshot_2d_hipblaslt" -- 2D-tiled variant, per-row FP8 quant with
 (halved cross-rank traffic), vendor-tuned hipBLASLt GEMM.
 """
 
-import atexit
 import logging
 import os
-from collections import Counter
 from typing import Optional
 
 import torch
@@ -43,20 +41,8 @@ ALLREDUCE_IMPL = os.environ.get(
     "VLLM_ROCM_FUSED_ALLREDUCE", "iris_twoshot_2d_hipblaslt"
 )
 
-# Track M values seen during execution for profiling/debugging.
-_m_value_counts: Counter[int] = Counter()
-def _log_m_summary() -> None:
-    if not _m_value_counts:
-        return
-    total = sum(_m_value_counts.values())
-    sorted_m = sorted(_m_value_counts.items())
-    dist = ", ".join(f"M={m}: {c}" for m, c in sorted_m)
-    logger.info(
-        f"Fused allreduce M distribution ({total} calls): {dist}"
-    )
-
-
-atexit.register(_log_m_summary)
+# Log each unique M value on first occurrence.
+_m_values_seen: set[int] = set()
 
 
 def fused_allreduce_add_rms_quant_gemm(
@@ -81,7 +67,10 @@ def fused_allreduce_add_rms_quant_gemm(
     is None.
     """
     impl = ALLREDUCE_IMPL
-    _m_value_counts[input.shape[0]] += 1
+    M = input.shape[0]
+    if M not in _m_values_seen:
+        _m_values_seen.add(M)
+        logger.info(f"Fused allreduce: new M={M} (seen so far: {sorted(_m_values_seen)})")
 
     args = (
         input, rms_weight, rms_eps, quant_dtype, group_name,
