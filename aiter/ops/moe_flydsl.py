@@ -50,6 +50,11 @@ class FlyDSLManager:
 
 _manager = FlyDSLManager()
 
+_ENV_TILE_N1 = "AITER_FLYDSL_MOE_TILE_N1"
+_ENV_TILE_K1 = "AITER_FLYDSL_MOE_TILE_K1"
+_ENV_TILE_N2 = "AITER_FLYDSL_MOE_TILE_N2"
+_ENV_TILE_K2 = "AITER_FLYDSL_MOE_TILE_K2"
+
 
 def flydsl_moe_stage1(
     input,
@@ -75,6 +80,8 @@ def flydsl_moe_stage1(
 
     token_num = out.shape[0]
     tile_m = block_m if block_m else 16
+    tile_n = int(os.environ.get(_ENV_TILE_N1, "64"))
+    tile_k = int(os.environ.get(_ENV_TILE_K1, "256"))
 
     exe = _manager.get_exe(
         compile_moe_gemm1,
@@ -83,8 +90,8 @@ def flydsl_moe_stage1(
         experts=experts,
         topk=topk,
         tile_m=int(tile_m),
-        tile_n=64,
-        tile_k=256,
+        tile_n=int(tile_n),
+        tile_k=int(tile_k),
         doweight_stage1=sorted_weights is not None,
         in_dtype="a8w4smooth",
         out_dtype="bf16",
@@ -148,6 +155,8 @@ def flydsl_moe_stage2(
 
     token_num = out.shape[0]
     tile_m = block_m if block_m else 16
+    tile_n = int(os.environ.get(_ENV_TILE_N2, "128"))
+    tile_k = int(os.environ.get(_ENV_TILE_K2, "256"))
 
     out.zero_()
 
@@ -158,8 +167,8 @@ def flydsl_moe_stage2(
         experts=experts,
         topk=topk,
         tile_m=int(tile_m),
-        tile_n=128,
-        tile_k=256,
+        tile_n=int(tile_n),
+        tile_k=int(tile_k),
         doweight_stage2=sorted_weights is not None,
         in_dtype="a8w4smooth",
         out_dtype="bf16",

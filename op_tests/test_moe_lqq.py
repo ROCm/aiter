@@ -66,6 +66,8 @@ def moe_lqq_dequant(
 LQQ_I8_MAX = 119
 #!!!!!!!!!!!!!!!!!!!!!!!!!!!! do NOT overwrite this value !!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
+MAX_TOKENS = 4096 * 9
+
 
 def build_local_expert_hash(expert_mask: torch.Tensor) -> torch.Tensor:
     """Cache global->local expert id map for EP."""
@@ -166,27 +168,39 @@ def test_fmoe_lqq(
     score = torch.randn((token, E), device="cuda", dtype=dtype)
 
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
+    print(f"after fused_topk topk_ids: {topk_ids}")
 
     if shared_E > 0:
-        shared_E_score = 0.5
-        s_topk_weights = torch.tensor(
-            [
-                [shared_E_score, shared_E_score],
-            ]
-            * token,
-            dtype=dtypes.fp32,
-            device=input.device,
+        shared_E_score = 0.1
+        # init total_topk_ids, inference time you just need to fill ns_topk_ids in total_topk_ids
+        total_topk_ids = torch.empty(
+            (MAX_TOKENS, topk + shared_E + 1), dtype=dtypes.i32, device=input.device
         )
-        topk_weights = torch.cat((topk_weights, s_topk_weights), dim=1)
-        s_topk_ids = torch.tensor(
-            [
-                [E, E + 1],
-            ]
-            * token,
-            dtype=dtypes.i32,
-            device=input.device,
+        ns_topk_ids, s_topk_ids = total_topk_ids.split([topk, shared_E + 1], dim=1)
+        shared_expert_ids = [E + i for i in range(shared_E + 1)]
+        s_topk_ids_list = [[fake_expertid] * (shared_E + 1)] * MAX_TOKENS
+        for i in range(ep_id, MAX_TOKENS, ep):
+            s_topk_ids_list[i] = shared_expert_ids
+        s_topk_ids[:] = torch.tensor(
+            s_topk_ids_list, dtype=dtypes.i32, device=input.device
         )
-        topk_ids = torch.cat((topk_ids, s_topk_ids), dim=1)
+
+        # init total_topk_weights, inference time you just need to fill ns_topk_weights in total_topk_weights
+        total_topk_weights = torch.empty(
+            (MAX_TOKENS, topk + shared_E + 1), dtype=dtypes.fp32, device=input.device
+        )
+        ns_topk_weights, s_topk_weights = total_topk_weights.split(
+            [topk, shared_E + 1], dim=1
+        )
+        s_topk_weights[:] = shared_E_score
+
+        # inference time, use fused_topk to fill ns_topk_ids and ns_topk_weights
+        fused_topk(input, score, topk, True, ns_topk_ids, ns_topk_weights)
+        # inference time, topk_ids simply slices total_topk_ids into the number of input tokens, same for topk_weights
+        topk_ids = total_topk_ids[:token]
+        topk_weights = total_topk_weights[:token]
+    else:
+        topk_weights, topk_ids = fused_topk(input, score, topk, True)
 
     eprt = local_E + shared_E
 
@@ -196,16 +210,8 @@ def test_fmoe_lqq(
     print("[test] model_dim: ", model_dim, " inter_dim: ", inter_dim)
 
     a1_qt, a1_scale = aiter.pertoken_quant(input, quant_dtype=dtypes.i8)
-    if shared_E > 0:
-        fc1_smooth_scale = torch.randn(
-            (eprt, model_dim), dtype=dtypes.fp32, device="cuda"
-        )
-        fc2_smooth_scale = torch.randn(
-            (eprt, inter_dim), dtype=dtypes.fp32, device="cuda"
-        )
-    else:
-        fc1_smooth_scale = None
-        fc2_smooth_scale = None
+    fc1_smooth_scale = torch.randn((eprt, model_dim), dtype=dtypes.fp32, device="cuda")
+    fc2_smooth_scale = torch.randn((eprt, inter_dim), dtype=dtypes.fp32, device="cuda")
     w1 = torch.randn((eprt, inter_dim * 2, model_dim), dtype=dtype, device="cuda")
     w2 = torch.randn((eprt, model_dim, inter_dim), dtype=dtype, device="cuda")
     exp_bias1 = torch.clamp(
