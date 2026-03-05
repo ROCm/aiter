@@ -39,11 +39,13 @@ void reduce_scatter(fptr_t _fa,
                     torch::Tensor& inp,
                     torch::Tensor& out,
                     std::optional<torch::Tensor> reg_buffer);
-void all_gather_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out);
+void all_gather_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int last_dim_size, int dim);
 void all_gather_unreg(fptr_t _fa,
                       torch::Tensor& inp,
                       torch::Tensor& reg_buffer,
-                      torch::Tensor& out);
+                      torch::Tensor& out,
+                      int last_dim_size,
+                      int dim);
 void fused_allreduce_rmsnorm(fptr_t _fa,
                              torch::Tensor& inp,
                              torch::Tensor& res_inp,

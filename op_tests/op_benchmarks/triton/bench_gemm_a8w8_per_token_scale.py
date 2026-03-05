@@ -1,4 +1,3 @@
-import sys
 import torch
 import triton
 from aiter.ops.triton.gemm.basic.gemm_a8w8_per_token_scale import (
@@ -136,21 +135,21 @@ def run_benchmark(args, defaults):
         run_shape_benchmark(args)
 
 
-def parse_args():
+def parse_args(args: list[str] | None = None):
     parser = get_parser(kernel_name="A8W8 GEMM Per token scale")
     parser = add_argparse_ff(parser)
-    return get_ff_args(parser)
+    return get_ff_args(parser, args=args)
 
 
-def main():
-    args, defaults = parse_args()
-    if args.print_vgpr:
+def main(args: list[str] | None = None) -> None:
+    parsed_args, defaults = parse_args(args=args)
+    if parsed_args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args, defaults)  # noqa: E731
+        fun = lambda: run_benchmark(parsed_args, defaults)  # noqa: E731
         print_vgpr(fun, get_caller_name_no_ext())
-        return 0
-    run_benchmark(args, defaults)
+        return
+    run_benchmark(parsed_args, defaults)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

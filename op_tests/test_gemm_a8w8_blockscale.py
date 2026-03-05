@@ -86,8 +86,8 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     ret["ck err"] = err_ck
 
     tag = "asm"
-    weight_asm = shuffle_weight(weight, layout=(32, 16))
-    c, avg_c = run_asm(x, weight_asm, x_scale, w_scale, dtype)
+    weight_asm = shuffle_weight(weight, layout=(16, 16))
+    c, avg_c = run_asm(x, weight_asm, x_scale_t, w_scale, dtype)
 
     err_asm = checkAllclose(a, c, msg=f"{tag}")
     ret[f"{tag} us"] = avg_c

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
+#include "aiter_logger.h"
 #include "ck_tile/core.hpp"
 #include <cstdint>
 #include <hip/hip_runtime.h>
@@ -59,7 +60,7 @@ struct p1
 struct AiterAsmKernelArgs
 {
     void* args_ptr;
-    void* arg_size_ptr;
+    size_t* arg_size_ptr;
     int gdx;
     int gdy;
     int gdz;
@@ -81,7 +82,7 @@ inline void load_asm_kernel(const char* name,
     if(AITER_ASM_DIR != nullptr)
     {
         std::string hsa_path = std::string(AITER_ASM_DIR) + "/" + arch_name + "/" + hsaco;
-        std::cout << "[aiter] hipModuleLoad: " << hsa_path << " GetFunction: " << name;
+        AITER_LOG_INFO("hipModuleLoad: " << hsa_path << " GetFunction: " << name);
         HIP_CALL(hipModuleLoad(&module, hsa_path.c_str()));
     }
     else
@@ -91,12 +92,12 @@ inline void load_asm_kernel(const char* name,
         auto hasco_obj    = AITER_EMBEDDED_HSA_MAP.find(fname);
         CHECK_COND(hasco_obj != AITER_EMBEDDED_HSA_MAP.end());
         CHECK_COND(hasco_obj->second.data() != nullptr);
-        std::cout << "hipModuleLoad: " << fname << " GetFunction: " << name << std::endl;
+        AITER_LOG_INFO("hipModuleLoad: " << fname << " GetFunction: " << name);
         HIP_CALL(hipModuleLoadData(&module, hasco_obj->second.data()));
 #endif
     }
     HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
-    std::cout << " Success" << std::endl;
+    AITER_LOG_INFO("hipModuleGetFunction: " << name << " Success");
 }
 
 class AiterAsmKernel
@@ -146,7 +147,7 @@ class AiterAsmKernelFast
     {
         HIP_CALL(hipModuleLoadData(&module, hsaco));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
-        std::cout << " Success" << std::endl;
+        AITER_LOG_INFO("hipModuleGetFunction: " << name << " Success");
     };
 
     ~AiterAsmKernelFast() { HIP_CALL(hipModuleUnload(module)); }
