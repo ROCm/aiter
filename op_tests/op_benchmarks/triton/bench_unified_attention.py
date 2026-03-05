@@ -1,10 +1,8 @@
 import torch
 import sys
-import warnings
 import argparse
 import itertools
 import triton
-import aiter
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
@@ -363,25 +361,26 @@ def run_benchmark(custom, args):
 
         output = torch.empty_like(query)
 
-        fn = lambda: unified_attention(
-            q=query,
-            k=k_cache,
-            v=v_cache,
-            out=output,
-            cu_seqlens_q=cu_seqlens_q,
-            seqused_k=kv_lens,
-            max_seqlen_q=max_query_len,
-            max_seqlen_k=max_kv_len,
-            softmax_scale=scale,
-            causal=causal,
-            window_size=window_size,
-            block_table=block_table,
-            softcap=args.softcap if args.softcap is not None else 0,
-            q_descale=None,  # required to be None
-            k_descale=k_scale,
-            v_descale=v_scale,
-            sinks=None,
-        )
+        def fn():
+            return unified_attention(
+                    q=query,
+                    k=k_cache,
+                    v=v_cache,
+                    out=output,
+                    cu_seqlens_q=cu_seqlens_q,
+                    seqused_k=kv_lens,
+                    max_seqlen_q=max_query_len,
+                    max_seqlen_k=max_kv_len,
+                    softmax_scale=scale,
+                    causal=causal,
+                    window_size=window_size,
+                    block_table=block_table,
+                    softcap=args.softcap if args.softcap is not None else 0,
+                    q_descale=None,  # required to be None
+                    k_descale=k_scale,
+                    v_descale=v_scale,
+                    sinks=None,
+                )
 
         if args.test:
             fn()  # eval triton kernel
