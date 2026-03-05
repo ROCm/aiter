@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
+from typing import Optional
+
 import torch
 import torch.distributed as dist
 import argparse
@@ -17,7 +19,7 @@ from aiter.dist.parallel_state import (
     destroy_distributed_environment,
 )
 from aiter.dist.utils import get_open_port, get_distributed_init_method, get_ip
-from aiter.dist.communication_op import *
+from aiter.dist.communication_op import tensor_model_parallel_all_gather
 from aiter.test_common import (
     checkAllclose,
     perftest,
@@ -38,6 +40,7 @@ def run_allgather(
     x,
     withGraph=False,
     use_custom=False,
+    dim=0,
     distributed_init_method: Optional[str] = None,
 ):
     device = torch.device(f"cuda:{rankID}")
@@ -63,7 +66,9 @@ def run_allgather(
         graph = torch.cuda.CUDAGraph()
         with graph_capture() as gc:
             with torch.cuda.graph(graph, stream=gc.stream):
-                out = tensor_model_parallel_all_gather(x, use_custom=use_custom)
+                out = tensor_model_parallel_all_gather(
+                    x, use_custom=use_custom, dim=dim
+                )
         out.fill_(0)
 
         @perftest()
@@ -76,7 +81,7 @@ def run_allgather(
 
         @perftest()
         def run_ca(x):
-            return tensor_model_parallel_all_gather(x, use_custom=use_custom)
+            return tensor_model_parallel_all_gather(x, use_custom=use_custom, dim=dim)
 
         out = run_ca(x)
 
@@ -179,6 +184,7 @@ def allgather_perftest(
     dtype,
     withGraph=False,
     use_custom=False,
+    dim=0,
     distributed_init_method: Optional[str] = None,
 ):
     print(f"run perf test, use custom allgather {use_custom}")
@@ -201,6 +207,7 @@ def allgather_perftest(
                     x,
                     withGraph,
                     use_custom,
+                    dim,
                     distributed_init_method,
                 ),
             )
@@ -210,12 +217,13 @@ def allgather_perftest(
     pool.join()
     ref = input_list[0]
     for i in range(tp_size - 1):
-        ref = torch.concat((ref, input_list[i + 1]), -1)
+        ref = torch.concat((ref, input_list[i + 1]), dim)
 
     rets = [el.get() for el in rets]
     for out, us in rets:
         msg = f"allgather (use custom {use_custom}): {shape=} {dtype=} {withGraph=} {us:>8.2f}"
         # print(cpu_rslt[out.device.index])
+        print("cpu_size:", ref.shape, ", gpu_size:", out.shape)
         checkAllclose(ref, out.to(ref), msg=msg)
         # checkAllclose(ref, out.to(ref), msg=msg)
 
@@ -223,8 +231,9 @@ def allgather_perftest(
 l_dtype = ["bf16"]
 l_shape = [
     # (4096, 2048)
-    (1345,)
-    # (16, 512)
+    # (1345,),
+    # (16, 512),
+    (128, 7168)
 ]
 
 parser = argparse.ArgumentParser(description="config input of test")
@@ -269,6 +278,7 @@ if __name__ == "__main__":
                 dtype,
                 withGraph=False,
                 use_custom=False,
+                dim=-1,
                 distributed_init_method=get_distributed_init_method(
                     get_ip(), get_open_port()
                 ),
@@ -280,6 +290,7 @@ if __name__ == "__main__":
                 dtype,
                 withGraph=False,
                 use_custom=True,
+                dim=-1,
                 distributed_init_method=get_distributed_init_method(
                     get_ip(), get_open_port()
                 ),
