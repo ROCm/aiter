@@ -983,6 +983,10 @@ def cmdGenFunc_mha_batch_prefill(
     causal = is_causal
     if max_seqlen_q == 1 and alibi_slopes is None:
         causal = False
+        if window_size_left >= max_seqlen_k:
+            window_size_left = -1
+        if window_size_right >= max_seqlen_k:
+            window_size_right = -1
     md_name = "mha_batch_prefill"
     filter_fwd = "*"  # get_fwd_blobs()
     if q.dtype == torch.float16:
