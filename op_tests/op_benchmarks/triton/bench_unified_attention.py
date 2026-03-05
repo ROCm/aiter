@@ -363,24 +363,24 @@ def run_benchmark(custom, args):
 
         def fn():
             return unified_attention(
-                    q=query,
-                    k=k_cache,
-                    v=v_cache,
-                    out=output,
-                    cu_seqlens_q=cu_seqlens_q,
-                    seqused_k=kv_lens,
-                    max_seqlen_q=max_query_len,
-                    max_seqlen_k=max_kv_len,
-                    softmax_scale=scale,
-                    causal=causal,
-                    window_size=window_size,
-                    block_table=block_table,
-                    softcap=args.softcap if args.softcap is not None else 0,
-                    q_descale=None,  # required to be None
-                    k_descale=k_scale,
-                    v_descale=v_scale,
-                    sinks=None,
-                )
+                q=query,
+                k=k_cache,
+                v=v_cache,
+                out=output,
+                cu_seqlens_q=cu_seqlens_q,
+                seqused_k=kv_lens,
+                max_seqlen_q=max_query_len,
+                max_seqlen_k=max_kv_len,
+                softmax_scale=scale,
+                causal=causal,
+                window_size=window_size,
+                block_table=block_table,
+                softcap=args.softcap if args.softcap is not None else 0,
+                q_descale=None,  # required to be None
+                k_descale=k_scale,
+                v_descale=v_scale,
+                sinks=None,
+            )
 
         if args.test:
             fn()  # eval triton kernel
