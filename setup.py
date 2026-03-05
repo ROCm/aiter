@@ -12,6 +12,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 PACKAGE_NAME = "amd-aiter"
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
+ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
 
 
 def getMaxJobs():
@@ -58,15 +59,15 @@ def prepare_packaging():
     """Copy source directories and create package metadata for non-editable installs."""
     if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
         shutil.rmtree("aiter_meta")
-    shutil.copytree("3rdparty", "aiter_meta/3rdparty")
+    if ENABLE_CK:
+        shutil.copytree("3rdparty", "aiter_meta/3rdparty")
+    else:
+        os.makedirs("aiter_meta/3rdparty", exist_ok=True)
     shutil.copytree("hsa", "aiter_meta/hsa")
     shutil.copytree("gradlib", "aiter_meta/gradlib")
     shutil.copytree("csrc", "aiter_meta/csrc")
     open("aiter_meta/__init__.py", "w").close()
     write_install_mode()
-
-
-prepare_packaging()
 
 
 class NinjaBuildExtension(build_ext):
@@ -93,11 +94,12 @@ class NinjaBuildExtension(build_ext):
             raise NotImplementedError("Only ROCM is supported")
 
         ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
-        assert os.path.exists(ck_dir), (
-            "CK is needed by aiter, please make sure clone by "
-            '"git clone --recursive https://github.com/ROCm/aiter.git" or '
-            '"git submodule sync ; git submodule update --init --recursive"'
-        )
+        if ENABLE_CK:
+            assert os.path.exists(ck_dir), (
+                "CK is needed by aiter, please make sure clone by "
+                '"git clone --recursive https://github.com/ROCm/aiter.git" or '
+                '"git submodule sync ; git submodule update --init --recursive"'
+            )
 
         write_install_mode()
 
@@ -115,6 +117,11 @@ class NinjaBuildExtension(build_ext):
         def get_exclude_ops():
             all_modules = _load_modules_from_config()
             exclude_ops = []
+
+            # When CK is disabled, exclude all CK-dependent modules
+            if not ENABLE_CK:
+                exclude_ops.extend(sorted(core._get_ck_exclude_modules()))
+                return exclude_ops
 
             for module in all_modules:
                 if PREBUILD_KERNELS == 1:
@@ -177,7 +184,7 @@ class NinjaBuildExtension(build_ext):
                     "all", exclude=exclude_ops
                 )
 
-                if PREBUILD_KERNELS == 1:
+                if PREBUILD_KERNELS == 1 and ENABLE_CK:
                     extra_args_build = []
 
                     req_md_names = [
@@ -279,10 +286,17 @@ class ForcePlatlibDistribution(Distribution):
         return True
 
 
+if is_develop_mode():
+    packages = ["aiter"]
+    write_install_mode()
+else:
+    prepare_packaging()
+    packages = ["aiter_meta", "aiter"]
+
 setup(
     name=PACKAGE_NAME,
     use_scm_version=True,
-    packages=["aiter_meta", "aiter"],
+    packages=packages,
     include_package_data=True,
     package_data={
         "": ["*"],

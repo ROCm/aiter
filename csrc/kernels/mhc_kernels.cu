@@ -224,7 +224,7 @@ namespace aiter {
             x_stride, \
             fn_stride, \
             out_stride, \
-            split_k, \
+            split_k \
         ); \
     });
 

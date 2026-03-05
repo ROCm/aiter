@@ -239,9 +239,11 @@ class AITER_CONFIG(object):
             config_path.mkdir(parents=True, exist_ok=True)
         new_file_path = f"{config_path}/{merge_name}.csv"
         lock_path = f"{new_file_path}.lock"
+        tmp_file_path = f"{new_file_path}.tmp"
 
         def write_config():
-            merge_df.to_csv(new_file_path, index=False)
+            merge_df.to_csv(tmp_file_path, index=False)
+            os.replace(tmp_file_path, new_file_path)
 
         mp_lock(lock_path, write_config)
         return new_file_path
@@ -771,17 +773,35 @@ def build_module(
         else:
             sources = exec_blob(blob_gen_cmd, op_dir, src_dir, sources)
 
-        extra_include_paths = [
-            f"{CK_HELPER_DIR}",
-            f"{CK_3RDPARTY_DIR}/include",
-            f"{CK_3RDPARTY_DIR}/library/include",
-            f"{HIP_KITTENS_DIR}/include",
-        ]
+        extra_include_paths = []
+
+        _is_ckfree = not os.path.isdir(CK_3RDPARTY_DIR)
+        if not _is_ckfree:
+            extra_include_paths += [
+                f"{CK_HELPER_DIR}",
+                f"{CK_3RDPARTY_DIR}/include",
+                f"{CK_3RDPARTY_DIR}/library/include",
+            ]
+        else:
+            # When CK is not available, define AITER_CK_FREE for all modules
+            # so headers use lightweight shims instead of ck_tile/core.hpp
+            flags_cc.append("-DAITER_CK_FREE=1")
+
+        if os.path.isdir(HIP_KITTENS_DIR):
+            extra_include_paths += [
+                f"{HIP_KITTENS_DIR}/include",
+            ]
+
+        extra_include_paths = [p for p in extra_include_paths if os.path.isdir(str(p))]
+
         if not hipify:
+            _extra_inc = extra_include
+            if _is_ckfree:
+                _extra_inc = [p for p in extra_include if os.path.isdir(str(p))]
             extra_include_paths += [
                 f"{AITER_CSRC_DIR}/include",
                 f"{op_dir}/blob",
-            ] + extra_include
+            ] + _extra_inc
             if not is_standalone:
                 extra_include_paths += [f"{AITER_CSRC_DIR}/include/torch"]
         else:
@@ -837,7 +857,7 @@ def build_module(
                     ),
                 )
             )
-            raise SystemExit(
+            raise RuntimeError(
                 f"[aiter] build [{md_name}] under {opbd_dir} failed !!!!!!"
             ) from e
 
@@ -847,6 +867,66 @@ def build_module(
         )
 
     mp_lock(lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
+
+
+def _get_ck_exclude_modules():
+    """Return set of module names that require CK and should be excluded in CK-free builds.
+
+    Combines two detection methods:
+    1. Config pattern matching -- modules whose optCompilerConfig.json entry references
+       CK_DIR, py_itfs_ck, gen_instances, or generate.py
+    2. Hardcoded list -- modules with deep ck_tile:: source-level dependencies that
+       aren't caught by config pattern matching
+
+    V3 ASM modules are exempted because they build with shim headers only.
+    """
+    cfg_path = os.path.join(this_dir, "optCompilerConfig.json")
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            config_data = json.load(f)
+    except Exception:
+        config_data = {}
+
+    # Pattern-matched CK modules
+    ck_patterns = ["CK_DIR", "py_itfs_ck", "gen_instances", "generate.py"]
+    ck_modules = set()
+    for mod_name, mod_cfg in config_data.items():
+        mod_str = json.dumps(mod_cfg)
+        if any(p in mod_str for p in ck_patterns):
+            ck_modules.add(mod_name)
+
+    # V3 ASM modules can build with shim headers -- exempt them
+    v3_flags = ["FAV3_ON", "ONLY_FAV3"]
+    for mod_name, mod_cfg in config_data.items():
+        flags_str = json.dumps(mod_cfg.get("flags_extra_cc", []))
+        if any(f in flags_str for f in v3_flags):
+            ck_modules.discard(mod_name)
+
+    # Modules with deep ck_tile:: source-level deps not caught by config patterns
+    ck_modules |= {
+        "module_activation",
+        "module_cache",
+        "module_custom_all_reduce",
+        "module_fused_qk_norm_mrope_cache_quant_shuffle",
+        "module_fused_qk_norm_rope_cache_quant_shuffle",
+        "module_mla_metadata",
+        "module_mla_reduce",
+        "module_moe_asm",
+        "module_pa",
+        "module_pa_metadata",
+        "module_pa_ragged",
+        "module_pa_v1",
+        "module_ps_metadata",
+        "module_quant",
+        "module_rmsnorm_quant",
+        "module_rope_general_bwd",
+        "module_rope_general_fwd",
+        "module_rope_pos_fwd",
+        "module_sample",
+        "module_topk_plain",
+    }
+
+    return ck_modules
 
 
 def get_args_of_build(ops_name: str, exclude=[]):
@@ -889,6 +969,13 @@ def get_args_of_build(ops_name: str, exclude=[]):
         if isinstance(data, dict):
             # parse all ops, return list
             if ops_name == "all":
+                # Auto-exclude CK-dependent modules in CK-free builds
+                if not os.path.isdir(CK_3RDPARTY_DIR):
+                    ck_excludes = _get_ck_exclude_modules()
+                    exclude = list(set(exclude) | ck_excludes)
+                    logger.info(
+                        f"[CK-free] Auto-excluding {len(ck_excludes)} CK-dependent modules"
+                    )
                 all_ops_list = []
                 d_all_ops = {
                     "flags_extra_cc": [],
