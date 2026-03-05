@@ -50,7 +50,11 @@ def input_helper(
         query_lens = [MAX_SEQ_LEN for _ in range(BS)]
         ctx_lens = [MAX_CTX_LEN for _ in range(BS)]
     
-
+    # Turn DECODE_P portion of query_lens to 1
+    if DECODE_P > 0.0:
+        num_decode = max(1, int(BS * DECODE_P))
+        for i in range(num_decode):
+            query_lens[i] = 1
 
     seq_lens = [a + b for a, b in zip(query_lens, ctx_lens)]
     num_kv_heads = num_heads // num_queries_per_kv
@@ -64,7 +68,7 @@ def input_helper(
     kv.uniform_(-1e-3, 1e-3)
     key, value = kv.unbind(dim=1)
 
-    cache_dtype = dtype
+    cache_dtype = kv_cache_dtype
 
     k_cache = torch.zeros(
         cache_size, block_size, num_kv_heads, head_size, dtype=cache_dtype
@@ -129,15 +133,6 @@ def input_helper(
         query_lens,
         ctx_lens
     )
-
-
-
-
-
-
-
-
-
 
 def nonvarlen_benchmark_configs():
     batch_sizes = [1, 4, 16]
@@ -303,36 +298,34 @@ def run_benchmark(custom, args):
 
         (
             query,
-            k,
-            v,
+            _, # k,
+            _, # v,
             output,
             k_cache,
             v_cache,
             block_table,
-            b_start_loc,
-            b_seq_len,
-            max_input_len,
+            _, # b_start_loc,
+            _, # b_seq_len,
+            _, # max_input_len,
             k_scale,
             v_scale,
-            seq_lens,
+            query_lens,
             ctx_lens
         ) = input_helper(BATCH, N_CTX_Q, N_CTX_K, args.num_blocks, args.block_size, N_CTX_K // args.block_size + 1, HQ, D_HEAD, HQ//HK, dtype, dtype,  device=[
                 f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
             ][0],
             varlen=varlen,
-            DECODE_P=args.decode
+            DECODE_P=DECODE_P
             )
 
-        
-        
-        max_query_len = max(seq_lens)
+        max_query_len = max(query_lens)
         max_kv_len = max(ctx_lens)
 
         scale = D_HEAD**-0.5
         window_size = (args.sliding_window - 1, 0) if args.sliding_window is not None else (-1, -1)
 
         cu_seqlens_q = torch.tensor(
-            [0] + seq_lens, dtype=torch.int32, device="cuda"
+            [0] + query_lens, dtype=torch.int32, device="cuda"
         ).cumsum(dim=0, dtype=torch.int32)
 
         cu_seqlens_k = torch.tensor(
@@ -369,7 +362,7 @@ def run_benchmark(custom, args):
                 query=query,
                 key_cache=k_cache,
                 value_cache=v_cache,
-                query_lens=seq_lens,
+                query_lens=query_lens,
                 kv_lens=kv_lens,
                 block_tables=block_table,
                 scale=scale,
@@ -388,43 +381,24 @@ def run_benchmark(custom, args):
         ms = triton.testing.do_bench(fn)
         
         # calculate perf metrics
-      
         total_flops = 0
-        if varlen:
-            num_contexts = len(cu_seqlens_q) - 1
-            for i in range(num_contexts):
-                seqlen_q = (cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item()
-                seqlen_k = (cu_seqlens_k[i + 1] - cu_seqlens_k[i]).item()
-                if causal:
-                    valid_out_elements = (
-                        ((seqlen_k**2 + seqlen_k) / 2)
-                        if seqlen_q > seqlen_k
-                        else (seqlen_q * seqlen_k - ((seqlen_q**2 - seqlen_q) / 2))
-                    )
-                    total_flops += valid_out_elements * HQ * (D_HEAD + D_HEAD_V) * 2.0
-                else:
-                    total_flops += seqlen_q * seqlen_k * HQ * (D_HEAD + D_HEAD_V) * 2.0
-        else:
+        num_contexts = len(cu_seqlens_q) - 1
+        for i in range(num_contexts):
+            seqlen_q = (cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item()
+            seqlen_k = (cu_seqlens_k[i + 1] - cu_seqlens_k[i]).item()
             if causal:
                 valid_out_elements = (
-                    ((N_CTX_K**2 + N_CTX_K) / 2)
-                    if N_CTX_Q > N_CTX_K
-                    else (N_CTX_Q * N_CTX_K - ((N_CTX_Q**2 - N_CTX_Q) / 2))
+                    ((seqlen_k**2 + seqlen_k) / 2)
+                    if seqlen_q > seqlen_k
+                    else (seqlen_q * seqlen_k - ((seqlen_q**2 - seqlen_q) / 2))
                 )
-                total_flops += (
-                    2.0 * BATCH * HQ * valid_out_elements * (D_HEAD + D_HEAD_V)
-                )
+                total_flops += valid_out_elements * HQ * (D_HEAD + D_HEAD_V) * 2.0
             else:
-                total_flops += (
-                    2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
-                )
+                total_flops += seqlen_q * seqlen_k * HQ * (D_HEAD + D_HEAD_V) * 2.0
 
-        if varlen:
-            total_num_tokens_q = cu_seqlens_q[-1].item()
-            total_num_tokens_k = cu_seqlens_k[-1].item()
-        else:
-            total_num_tokens_q = BATCH * N_CTX_Q
-            total_num_tokens_k = BATCH * N_CTX_K
+        total_num_tokens_q = cu_seqlens_q[-1].item()
+        total_num_tokens_k = cu_seqlens_k[-1].item()
+  
         
         q_size = total_num_tokens_q * HQ * D_HEAD * query.element_size()
         k_size = total_num_tokens_k * HK * D_HEAD * k_cache.element_size()
@@ -451,13 +425,12 @@ def run_benchmark(custom, args):
 
 def supported_layouts():
     layouts = (
-        "bshd: Q, K, V are individual tensors of [batch, seqlen_q/k, num_heads, head_size]. "
         "thd: Q, K, V are individual tensors of [total_q/k, num_heads, head_size]. "
     )
     return layouts
 
 
-# argparse lacks support for boolean argument type (sigh...)
+# argparse lacks support for boolean argument type
 def str2bool(v):
     if isinstance(v, bool) or v is None:
         return v
@@ -613,13 +586,6 @@ def main():
     assert (
         args.layout in supported_layouts()
     ), f"{args.layout} is not in supported layouts: {supported_layouts()}."
-
-    if args.layout == "thd" and args.equal_seqlens:
-        warnings.warn(
-            "Using 'thd' layout with equal_seqlen=True incurs an extra sequence length lookup cost "
-            "compared to 'bshd' layout. Consider using 'bshd' for better performance.",
-            category=RuntimeWarning,
-        )
 
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
