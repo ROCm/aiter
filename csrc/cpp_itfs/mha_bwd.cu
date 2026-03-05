@@ -133,16 +133,25 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 #if ONLY_FAV3
     return asm_ret;
 #else
-    fmha_bwd_traits traits{a.hdim_q,
-                           a.hdim_v,
-                           a.data_type,
-                           a.is_group_mode,
-                           static_cast<mask_enum>(a.mask_type),
-                           static_cast<bias_enum>(a.bias_type),
-                           a.has_dbias,
-                           a.has_dropout,
-                           a.is_store_randval,
-                           a.is_deterministic};
+    const fmha_bwd_traits traits{
+        a.seqlen_q,
+        a.seqlen_k,
+        a.batch,
+        a.max_seqlen_q,
+        a.max_seqlen_k,
+        a.hdim_q,
+        a.hdim_v,
+        a.nhead_q,
+        a.nhead_k,
+        a.data_type,
+        a.is_group_mode,
+        static_cast<mask_enum>(a.mask_type),
+        static_cast<bias_enum>(a.bias_type),
+        a.has_dbias,
+        a.has_dropout,
+        a.is_store_randval,
+        a.is_deterministic,
+    };
 
     fmha_bwd_args ck_args{
         /* q_ptr              */ a.q_ptr,
