@@ -12,298 +12,6 @@ from triton.experimental.gluon import language as gl
 USE_TDM = True
 TRANSPOSE_B = True
 
-@gluon.jit
-def issue_loads(producer, a_desc, b_desc, off_am, off_bn, a_buffer, b_buffer, BLOCK_K: gl.constexpr,
-                NUM_BUFFERS: gl.constexpr, TRANSPOSE_B: gl.constexpr, pred=1):
-    # pred is a hardware predicate passed to async_load for conditional execution without branch divergence
-    # Convert boolean pred to i32 for hardware predicate (i1 -> i32)
-    pred_i32 = pred.to(gl.int32) if hasattr(pred, 'to') else pred
-    gl.amd.gfx1250.tdm.async_load(a_desc, [off_am, producer * BLOCK_K], a_buffer.index(producer % NUM_BUFFERS),
-                                    pred=pred_i32)
-    if not TRANSPOSE_B:
-        gl.amd.gfx1250.tdm.async_load(b_desc, [producer * BLOCK_K, off_bn], b_buffer.index(producer % NUM_BUFFERS),
-                                        pred=pred_i32)
-    else:
-        gl.amd.gfx1250.tdm.async_load(b_desc, [off_bn, producer * BLOCK_K], b_buffer.index(producer % NUM_BUFFERS),
-                                        pred=pred_i32)
-    producer += 1
-    return producer
-
-
-@triton.heuristics(
-    {
-        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
-    }
-)
-@gluon.jit
-def _gemm_a8w8_kernel(
-    # Pointers to matrices
-    a_ptr,
-    b_ptr,
-    a_scale_ptr,
-    b_scale_ptr,
-    bias_ptr,
-    c_ptr,
-    # Matrix dimensions
-    M,
-    N,
-    K,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `stride_am` is
-    # how much to increase `a_ptr` by to get the element one row down
-    # (A has M rows).
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
-    # Meta-parameters
-    HAS_BIAS: gl.constexpr,
-    BLOCK_SIZE_M: gl.constexpr,
-    BLOCK_SIZE_N: gl.constexpr,
-    BLOCK_SIZE_K: gl.constexpr,
-    GROUP_SIZE_M: gl.constexpr,
-    EVEN_K: gl.constexpr,
-    GRID_MN: gl.constexpr,
-    NUM_XCDS: gl.constexpr,
-    NUM_WARPS: gl.constexpr,
-):
-    """
-    Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8 function
-    below
-
-    Computes the 8 bit matmul C = A x B, applies a conversion scale and optionally adds a bias to
-    the result.
-    The conversion scale is received in the form of two 1D tensors that are multiplied to form a
-    2D one before being applied.
-
-    Key parameters:
-    - A: Matrix A with shape (M, K).
-    - B: Matrix B with shape (K, N).
-    - C: Matrix C with shape (M, N).
-    - A_scale: First scale tensor with shape (M, 1).
-    - B_scale: Second scale tensor with shape (1, N).
-    - Bias: Bias tensor with shape (1, N).
-    """
-
-    pid = gl.program_id(axis=0)
-    num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
-
-    pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
-
-    blocked_mk: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 16],
-        threads_per_warp=[4, 8],
-        warps_per_cta=[NUM_WARPS, 1],
-        order=[1, 0],
-    )
-    
-    blocked_kn: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[16, 1],
-        threads_per_warp=[8, 4],
-        warps_per_cta=[1, NUM_WARPS],
-        order=[0, 1],
-    )
-
-    wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
-        version=3,
-        transposed=True,
-        warp_bases=[[0, 1], [0, 2], [1, 0]],  # [2, 4] layout
-        reg_bases=[],
-        instr_shape=[16, 16, 128],
-    )
-
-    shared_a: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=16, per_phase=1, max_phase=16, order=[1, 0]
-    ) # CHECK VEC=16, rn doing ds_load_2addr_stride64_b64. Will ds_load_b128 be better?
-    shared_b: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=16, per_phase=1, max_phase=16, order=[0, 1]
-    )
-
-    dot_a_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=wmma_layout, k_width=16
-    )
-    dot_b_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=wmma_layout, k_width=16
-    )
-
-    # Load first blocks of A and B input matrices
-    offs_ak = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(0, blocked_mk))
-    offs_am = (
-        pid_m * BLOCK_SIZE_M
-        + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_mk))
-    ) % M
-    offs_a = offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak
-    if EVEN_K:
-        a = gl.amd.gfx1250.buffer_load(
-            ptr=a_ptr,
-            offsets=offs_a,
-        )
-    else:
-        a = gl.amd.gfx1250.buffer_load(
-            ptr=a_ptr,
-            offsets=offs_a,
-            mask=(offs_ak[None, :] < K),
-        )
-
-    offs_bk = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(1, blocked_kn))
-    offs_bn = (
-        pid_n * BLOCK_SIZE_N
-        + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_kn))
-    ) % N
-    offs_b = offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-    if EVEN_K:
-        b = gl.amd.gfx1250.buffer_load(
-            ptr=b_ptr,
-            offsets=offs_b,
-        )
-    else:
-        b = gl.amd.gfx1250.buffer_load(
-            ptr=b_ptr,
-            offsets=offs_b,
-            mask=(offs_bk[:, None] < K),
-        )
-
-    # Load scales
-    offs_a_scale = pid_m * BLOCK_SIZE_M + gl.arange(
-        0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_layout)
-    )
-    offs_b_scale = pid_n * BLOCK_SIZE_N + gl.arange(
-        0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_layout)
-    )
-    a_scale = gl.amd.gfx1250.buffer_load(
-        ptr=a_scale_ptr,
-        offsets=offs_a_scale,
-        mask=offs_a_scale < M,
-    )
-    b_scale = gl.amd.gfx1250.buffer_load(
-        ptr=b_scale_ptr,
-        offsets=offs_b_scale,
-        mask=offs_b_scale < N,
-    )
-
-    # Create shared memories
-    smem_a = gl.allocate_shared_memory(
-        a_ptr.type.element_ty, [BLOCK_SIZE_M, BLOCK_SIZE_K], layout=shared_a
-    )
-    smem_b = gl.allocate_shared_memory(
-        b_ptr.type.element_ty, [BLOCK_SIZE_K, BLOCK_SIZE_N], layout=shared_b
-    )
-
-    # LDS write first block of A
-    smem_a.store(a)
-
-    acc_dtype = gl.float32 if a_ptr.type.element_ty != gl.int8 else gl.int32
-    acc = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=wmma_layout)
-
-    # num_stages:2
-    for k in range(0, gl.cdiv(K, BLOCK_SIZE_K) - 1):
-
-        # advance pointers for block A and B
-        a_ptr += BLOCK_SIZE_K * stride_ak
-        b_ptr += BLOCK_SIZE_K * stride_bk
-
-        # load next block of A
-        if EVEN_K:
-            a = gl.amd.gfx1250.buffer_load(
-                ptr=a_ptr,
-                offsets=offs_a,
-            )
-        else:
-            a = gl.amd.gfx1250.buffer_load(
-                ptr=a_ptr,
-                offsets=offs_a,
-                mask=(offs_ak[None, :] < K - (k + 1) * BLOCK_SIZE_K),
-            )
-
-        # LDS write current block of B
-        smem_b.store(b)
-
-        # read current block of A from LDS
-        cur_a = smem_a.load(layout=dot_a_layout)
-
-        # load next block of B
-        if EVEN_K:
-            b = gl.amd.gfx1250.buffer_load(
-                ptr=b_ptr,
-                offsets=offs_b,
-            )
-        else:
-            b = gl.amd.gfx1250.buffer_load(
-                ptr=b_ptr,
-                offsets=offs_b,
-                mask=(offs_bk[:, None] < K - (k + 1) * BLOCK_SIZE_K),
-            )
-
-        # read current block of B from LDS
-        cur_b = smem_b.load(layout=dot_b_layout)
-
-        acc = gl.amd.gfx1250.wmma(cur_a, cur_b, acc)
-        
-        # write next block of A to LDS
-        smem_a.store(a)
-
-    # ======= Epilogue ========
-
-    # write last block of B to LDS
-    smem_b.store(b)
-
-    # read last blocks of A and B from LDS
-    cur_a = smem_a.load(layout=dot_a_layout)
-    cur_b = smem_b.load(layout=dot_b_layout)
-
-    acc = gl.amd.gfx1250.wmma(cur_a, cur_b, acc)
-
-    # apply scales to accumulator
-    acc *= a_scale[:, None] * b_scale[None, :]
-
-    # add bias
-    if HAS_BIAS:
-        bias = gl.amd.gfx1250.buffer_load(
-            ptr=bias_ptr,
-            offsets=offs_b_scale,
-            mask=offs_b_scale < N,
-        )
-        acc = acc.to(bias_ptr.type.element_ty) + bias[None, :]
-
-    c = acc.to(c_ptr.type.element_ty)
-
-    # store block C back to global memory with masks
-    offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(
-        0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_layout)
-    )
-    offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(
-        0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_layout)
-    )
-    c_offs = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-
-    gl.amd.gfx1250.buffer_store(stored_value=c, ptr=c_ptr, offsets=c_offs, mask=c_mask)
-
-@functools.lru_cache(maxsize=1024)
-def _get_config(
-    M: int,
-    N: int,
-    K: int,
-):
-
-    if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        if dev != "gfx1250":
-            raise ValueError(
-                "This kernel is not supported on this device (requires gfx1250)."
-            )
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8.json"
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict = config
-
-    return _get_config._config_dict["any"]
-
 @triton.heuristics(
     {
         "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
@@ -387,7 +95,7 @@ def _gemm_a8w8_kernel_async(
 
     a_buffer = gl.allocate_shared_memory(a_desc.dtype, shape=[NUM_BUFFERS] + a_desc.block_shape, layout=a_desc.layout)
     b_buffer = gl.allocate_shared_memory(b_desc.dtype, shape=[NUM_BUFFERS] + b_desc.block_shape, layout=b_desc.layout)
-
+    
     wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
@@ -428,18 +136,18 @@ def _gemm_a8w8_kernel_async(
     pred = 1
     pred_i32 = pred.to(gl.int32) if hasattr(pred, 'to') else pred
     
-    gl.amd.gfx1250.tdm.async_load(a_desc, [offs_am, 0], a_buffer.index(0), pred=pred_i32)
-    
-    if not TRANSPOSE_B:
-        gl.amd.gfx1250.tdm.async_load(b_desc, [0, offs_bn], b_buffer.index(0), pred=pred_i32)
-    else:
-        gl.amd.gfx1250.tdm.async_load(b_desc, [offs_bn, 0], b_buffer.index(0), pred=pred_i32)
+    for i in gl.static_range(NUM_BUFFERS - 1):    
+        gl.amd.gfx1250.tdm.async_load(a_desc, [offs_am, i * BLOCK_SIZE_K], a_buffer.index(i), pred=pred_i32)
+
+        if not TRANSPOSE_B:
+            gl.amd.gfx1250.tdm.async_load(b_desc, [i * BLOCK_SIZE_K, offs_bn], b_buffer.index(i), pred=pred_i32)
+        else:
+            gl.amd.gfx1250.tdm.async_load(b_desc, [offs_bn, i * BLOCK_SIZE_K], b_buffer.index(i), pred=pred_i32)
         
-    #change this to k_iter
     acc_dtype = gl.float32 if a_ptr.type.element_ty != gl.int8 else gl.int32
     acc = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=wmma_layout)
     num_k_iters = gl.cdiv(K, BLOCK_SIZE_K)
-    for k in range(1, num_k_iters):
+    for k in range(NUM_BUFFERS-1, num_k_iters):
         gl.amd.gfx1250.tdm.async_load(a_desc, [offs_am, k * BLOCK_SIZE_K], a_buffer.index(k % NUM_BUFFERS), pred=pred_i32)
     
         if not TRANSPOSE_B:
@@ -447,22 +155,23 @@ def _gemm_a8w8_kernel_async(
         else:
             gl.amd.gfx1250.tdm.async_load(b_desc, [offs_bn, k * BLOCK_SIZE_K], b_buffer.index(k % NUM_BUFFERS), pred=pred_i32)
         
-        gl.amd.gfx1250.tdm.async_wait(2) # wait for a and b async load
-        a = a_buffer.index((k-1) % NUM_BUFFERS).load(layout=dot_a_layout)
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS-1)*2) # wait for a and b async load
+        a = a_buffer.index((k-(NUM_BUFFERS-1)) % NUM_BUFFERS).load(layout=dot_a_layout)
         if not TRANSPOSE_B:
-            b = b_buffer.index((k-1) % NUM_BUFFERS).load(layout=dot_b_layout)
+            b = b_buffer.index((k-(NUM_BUFFERS-1)) % NUM_BUFFERS).load(layout=dot_b_layout)
         else:
-            b = b_buffer.index((k-1) % NUM_BUFFERS).permute([1, 0]).load(layout=dot_b_layout) #wmma layout expects (K, N)
+            b = b_buffer.index((k-(NUM_BUFFERS-1)) % NUM_BUFFERS).permute([1, 0]).load(layout=dot_b_layout) #wmma layout expects (K, N)
         acc = gl.amd.gfx1250.wmma(a, b, acc)
 
     #epilogue
-    gl.amd.gfx1250.tdm.async_wait(0)
-    a = a_buffer.index((num_k_iters-1) % NUM_BUFFERS).load(layout=dot_a_layout)
-    if not TRANSPOSE_B:
-        b = b_buffer.index((num_k_iters-1) % NUM_BUFFERS).load(layout=dot_b_layout)
-    else:
-        b = b_buffer.index((num_k_iters-1) % NUM_BUFFERS).permute([1, 0]).load(layout=dot_b_layout)
-    acc = gl.amd.gfx1250.wmma(a, b, acc)
+    for i in gl.static_range(NUM_BUFFERS - 1):  
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * 2)
+        a = a_buffer.index((num_k_iters-(NUM_BUFFERS-1)+i) % NUM_BUFFERS).load(layout=dot_a_layout)
+        if not TRANSPOSE_B:
+            b = b_buffer.index((num_k_iters-(NUM_BUFFERS-1)+i) % NUM_BUFFERS).load(layout=dot_b_layout)
+        else:
+            b = b_buffer.index((num_k_iters-(NUM_BUFFERS-1)+i) % NUM_BUFFERS).permute([1, 0]).load(layout=dot_b_layout)
+        acc = gl.amd.gfx1250.wmma(a, b, acc)
 
     # apply scales to accumulator
     acc *= a_scale[:, None] * b_scale[None, :]
@@ -490,222 +199,25 @@ def _gemm_a8w8_kernel_async(
 
     gl.amd.gfx1250.buffer_store(stored_value=c, ptr=c_ptr, offsets=c_offs, mask=c_mask)
 
-
-@triton.heuristics(
-    {
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
-    }
-)
-
-@gluon.jit
-def _gemm_a8w8_kernel_async_preshuffled(
-    # Pointers to matrices
-    a_ptr,
-    b_ptr,
-    a_scale_ptr,
-    b_scale_ptr,
-    bias_ptr,
-    c_ptr,
-    # Matrix dimensions
-    M,
-    N,
-    K,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `stride_am` is
-    # how much to increase `a_ptr` by to get the element one row down
-    # (A has M rows).
-    stride_am,
-    stride_ak,
-    stride_bn,
-    stride_bk,
-    stride_cm,
-    stride_cn,
-    # Meta-parameters
-    HAS_BIAS: gl.constexpr,
-    BLOCK_SIZE_M: gl.constexpr,
-    BLOCK_SIZE_N: gl.constexpr,
-    BLOCK_SIZE_K: gl.constexpr,
-    GROUP_SIZE_M: gl.constexpr,
-    GRID_MN: gl.constexpr,
-    NUM_WARPS: gl.constexpr,
-    K_DIM: gl.constexpr,
-    NUM_BUFFERS: gl.constexpr,
+@functools.lru_cache(maxsize=1024)
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
 ):
-    """
-    Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8 function
-    below
 
-    Computes the 8 bit matmul C = A x B, applies a conversion scale and optionally adds a bias to
-    the result.
-    The conversion scale is received in the form of two 1D tensors that are multiplied to form a
-    2D one before being applied.
-
-    Key parameters:
-    - A: Matrix A with shape (M, K).
-    - B: Matrix B with shape (K, N).
-    - C: Matrix C with shape (M, N).
-    - A_scale: First scale tensor with shape (M, 1).
-    - B_scale: Second scale tensor with shape (1, N).
-    - Bias: Bias tensor with shape (1, N).
-    """
-
-    pid = gl.program_id(axis=0)
-    num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
-
-    pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
-
-    shared_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_SIZE_K, 16]], [BLOCK_SIZE_M, BLOCK_SIZE_K], [1, 0])
-
-    a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(base=a_ptr, shape=(M, K),
-                                                         strides=(stride_am, stride_ak), block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K), layout=shared_a)
-    
-    a_buffer = gl.allocate_shared_memory(a_desc.dtype, shape=[NUM_BUFFERS] + a_desc.block_shape, layout=a_desc.layout)
-
-    wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
-        version=3,
-        transposed=True,
-        warp_bases=[[0, 1], [0, 2], [0, 4]],  # [1, 8] layout
-        reg_bases=[],
-        instr_shape=[16, 16, K_DIM],
-    )
-
-    linear_nk: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 512], [0, 1024]],
-        lane_bases=[[0, 16], [0, 32], [0, 64], [0, 128], [0, 256]],
-        warp_bases=[[1, 0], [2, 0], [4, 0]],
-        block_bases=[],
-        shape=[BLOCK_SIZE_N // 16, BLOCK_SIZE_K * 16],
-    )
-
-    
-    dot_a_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=wmma_layout, k_width=16
-    )
-    dot_b_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=wmma_layout, k_width=16
-    )
-
-    offs_am = pid_m * BLOCK_SIZE_M
-    # Load scales
-    offs_a_scale = pid_m * BLOCK_SIZE_M + gl.arange(
-        0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_layout)
-    )
-    offs_b_scale = pid_n * BLOCK_SIZE_N + gl.arange(
-        0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_layout)
-    )
-    a_scale = gl.amd.gfx1250.buffer_load(
-        ptr=a_scale_ptr,
-        offsets=offs_a_scale,
-        mask=offs_a_scale < M,
-    )
-    b_scale = gl.amd.gfx1250.buffer_load(
-        ptr=b_scale_ptr,
-        offsets=offs_b_scale,
-        mask=offs_b_scale < N,
-    )
-
-    # prologue
-    pred = 1
-    pred_i32 = pred.to(gl.int32) if hasattr(pred, 'to') else pred
-    gl.amd.gfx1250.tdm.async_load(a_desc, [offs_am, 0], a_buffer.index(0), pred=pred_i32)
-    offs_bk = gl.arange(0, BLOCK_SIZE_K*16, layout=gl.SliceLayout(0, linear_nk))
-    offs_bn = (
-        pid_n * BLOCK_SIZE_N // 16
-        + gl.arange(0, BLOCK_SIZE_N//16, layout=gl.SliceLayout(1, linear_nk))
-    )
-    offs_b = offs_bn[:, None] * stride_bn + offs_bk[None, :] * stride_bk
-    b = gl.amd.gfx1250.buffer_load(
-        ptr=b_ptr,
-        offsets=offs_b,
-        mask=offs_bn[:, None] < N // 16,
-    )
-
-    acc_dtype = gl.float32 if a_ptr.type.element_ty != gl.int8 else gl.int32
-    acc = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=wmma_layout)
-    
-    cur_b = b
-    num_k_iters = gl.cdiv(K, BLOCK_SIZE_K)
-    for k in range(1, num_k_iters):
-        
-        #advance pointers for B
-        b_ptr += BLOCK_SIZE_K * 16 * stride_bk
-        
-        gl.amd.gfx1250.tdm.async_load(a_desc, [offs_am, k * BLOCK_SIZE_K], a_buffer.index(k % NUM_BUFFERS), pred=pred_i32)
-        gl.amd.gfx1250.tdm.async_wait(1) # wait for a async load
-        a = a_buffer.index((k-1) % NUM_BUFFERS).load(layout=dot_a_layout)
-        b = gl.amd.gfx1250.buffer_load(
-            ptr=b_ptr,
-            offsets=offs_b,
-            mask=offs_bn[:, None] < N // 16,
-        )
-        
-        # unshuffle current block of B
-        cur_b = (
-            cur_b.reshape(
-                1,
-                BLOCK_SIZE_N // 16,
-                BLOCK_SIZE_K // 32,
-                2,
-                16,
-                16,
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_arch()
+        if dev != "gfx1250":
+            raise ValueError(
+                "This kernel is not supported on this device (requires gfx1250)."
             )
-            .permute(0, 1, 4, 2, 3, 5)
-            .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K)
-            .trans(1, 0)
-        )
-        cur_b = gl.convert_layout(value=cur_b, layout=dot_b_layout, assert_trivial=True)
-        
-        acc = gl.amd.gfx1250.wmma(a, cur_b, acc)
-        cur_b = b
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8.json"
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_config._config_dict = config
 
-    #epilogue
-    gl.amd.gfx1250.tdm.async_wait(0)
-    a = a_buffer.index((num_k_iters-1) % NUM_BUFFERS).load(layout=dot_a_layout)
-    cur_b = (
-        cur_b.reshape(
-            1,
-            BLOCK_SIZE_N // 16,
-            BLOCK_SIZE_K // 32,
-            2,
-            16,
-            16,
-        )
-        .permute(0, 1, 4, 2, 3, 5)
-        .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K)
-        .trans(1, 0)
-    )
-    cur_b = gl.convert_layout(value=cur_b, layout=dot_b_layout, assert_trivial=True)
-
-    acc = gl.amd.gfx1250.wmma(a, cur_b, acc)
-
-    # apply scales to accumulator
-    acc *= a_scale[:, None] * b_scale[None, :]
-
-    # add bias
-    if HAS_BIAS:
-        bias = gl.amd.gfx1250.buffer_load(
-            ptr=bias_ptr,
-            offsets=offs_b_scale,
-            mask=offs_b_scale < N,
-        )
-        acc = acc.to(bias_ptr.type.element_ty) + bias[None, :]
-
-    c = acc.to(c_ptr.type.element_ty)
-
-    # store block C back to global memory with masks
-    offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(
-        0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_layout)
-    )
-    offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(
-        0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_layout)
-    )
-    c_offs = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-
-    gl.amd.gfx1250.buffer_store(stored_value=c, ptr=c_ptr, offsets=c_offs, mask=c_mask)
-    
+    return _get_config._config_dict["any"]
 
     
 def gemm_a8w8(
@@ -750,125 +262,17 @@ def gemm_a8w8(
     if config is None:
         config = _get_config(M, N, K)
     
-    if USE_TDM:
-        if not TRANSPOSE_B: # (K , N)
-            w = w.T.contiguous()
-        else: # (N, K)
-            w = w.contiguous() # TDM needs the inner dimension to be contiguous
-
-        x = x.contiguous()
-        grid = (
-            triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
-        )
-        _gemm_a8w8_kernel_async[grid](
-            x,
-            w,
-            x_scale,
-            w_scale,
-            bias,
-            y,
-            M,
-            N,
-            K,
-            x.stride(0),
-            x.stride(1),
-            w.stride(0) if TRANSPOSE_B else w.stride(1),
-            w.stride(1) if TRANSPOSE_B else w.stride(0),
-            y.stride(0),
-            y.stride(1),
-            bias is not None,
-            NUM_WARPS=config["num_warps"],
-            **config,
-            TRANSPOSE_B=TRANSPOSE_B,
-            NUM_BUFFERS=2,
-        )
-
-    else:
-
-        # Transpose w (kernel expects (K, N))
-        w = w.T
-
-        grid = (
-            triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
-        )
-        _gemm_a8w8_kernel[grid](
-            x,
-            w,
-            x_scale,
-            w_scale,
-            bias,
-            y,
-            M,
-            N,
-            K,
-            x.stride(0),
-            x.stride(1),
-            w.stride(0),
-            w.stride(1),
-            y.stride(0),
-            y.stride(1),
-            bias is not None,
-            NUM_XCDS=0,
-            NUM_WARPS=config["num_warps"],
-            K_DIM=64 if x.dtype == torch.int8 else 128,
-            **config
-        )
-
-    return y
-
-def gemm_a8w8_preshuffle(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    x_scale: torch.Tensor,
-    w_scale: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-):
-    """
-    Computes 8 bit matrix multiplication Y = (X @ W^T) * (x_scale * w_scale) with optional bias.
-    INT8 inputs are scaled back to higher precision using per-tensor scale factors.
-
-    Args:
-        x (torch.Tensor): INT8 input matrix with shape (M, K).
-        w (torch.Tensor): INT8 weight matrix with shape (N, K), internally transposed.
-        x_scale (torch.Tensor): Scale factor for x with shape (M, 1) or (M,).
-        w_scale (torch.Tensor): Scale factor for w with shape (1, N) or (N,).
-        bias (Optional[torch.Tensor]): Bias vector with shape (N,).
-        dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
-        y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
-        config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
-            BLOCK_SIZE_K, GROUP_SIZE_M).
-
-    Returns:
-        torch.Tensor: Output with shape (M, N) in higher precision format.
-    """
-
-
-    assert x.dtype == w.dtype, "Input types must be the same"
-    M, K = x.shape
-    N, K = w.shape
-    N = N * 16
-    K = K // 16
-
-    if config is None:
-        config = _get_config(M, N, K)
     
-    assert (
-        K % config["BLOCK_SIZE_K"] == 0
-    ), "K must be multiple of BLOCK_SIZE_K for preshuffling"
-    
+    if not TRANSPOSE_B: # (K , N)
+        w = w.T.contiguous()
+    else: # (N, K)
+        w = w.contiguous() # TDM needs the inner dimension to be contiguous
+
     x = x.contiguous()
-    
-    if y is None:
-        y = torch.empty((M, N), dtype=dtype, device=x.device)
-
-
     grid = (
         triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
     )
-    _gemm_a8w8_kernel_async_preshuffled[grid](
+    _gemm_a8w8_kernel_async[grid](
         x,
         w,
         x_scale,
@@ -880,15 +284,14 @@ def gemm_a8w8_preshuffle(
         K,
         x.stride(0),
         x.stride(1),
-        w.stride(0),
-        w.stride(1),
+        w.stride(0) if TRANSPOSE_B else w.stride(1),
+        w.stride(1) if TRANSPOSE_B else w.stride(0),
         y.stride(0),
         y.stride(1),
         bias is not None,
         NUM_WARPS=config["num_warps"],
         **config,
-        K_DIM=64 if x.dtype == torch.int8 else 128,
-        NUM_BUFFERS=2,
+        TRANSPOSE_B=TRANSPOSE_B,
     )
 
     return y
