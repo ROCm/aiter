@@ -1080,7 +1080,83 @@ def mla_reduce_v1(
 #         tl.store(work_indptr + cu_num, old_num_worker + added_worker_offset)
 
 
-@triton.jit
+# @triton.jit
+# def decode_update_mla_metadata_v1_kernel(
+#     seqlens_qo_indptr,
+#     seqlens_kv_indptr,
+#     kv_last_page_lens,
+#     num_heads_per_head_k: tl.constexpr,
+#     num_heads_k: tl.constexpr,
+#     is_causal: tl.constexpr,
+#     work_info,
+#     work_indptr,
+#     reduce_indptr,
+#     reduce_final_map,
+#     reduce_partial_map,
+#     page_size: tl.constexpr,
+#     kv_granularity: tl.constexpr,
+#     cu_num: tl.constexpr,
+#     qk_batch_ratio: tl.constexpr,
+# ):
+#     batch_id = tl.program_id(0)
+#     real_batch_id = batch_id // qk_batch_ratio
+#     old_num_worker = tl.load(work_indptr + cu_num)
+#     seq_kv_end = 0
+#     seq_kv_last = 0
+#     seq_kv_len = 0
+#     for j in range(0, real_batch_id + 1):
+#         seq_kv_start = tl.load(seqlens_kv_indptr + j)
+#         seq_kv_end = tl.load(seqlens_kv_indptr + (j + 1))
+#         seq_kv_last = tl.load(kv_last_page_lens + j)
+#         seq_kv_len = (seq_kv_end - seq_kv_start - 1) * page_size + seq_kv_last
+
+#     batch_tile_id = 0
+#     batch_last_work_id = -1
+#     batch_last_kv_len = seq_kv_len
+#     interval = 1
+#     for i in range(0, old_num_worker):
+#         bs_id = tl.load(work_info + i * 8 + 0)
+#         partial_index = tl.load(work_info + i * 8 + 1)
+#         q_start = tl.load(work_info + i * 8 + 2)
+#         q_end = tl.load(work_info + i * 8 + 3)
+#         kv_start = tl.load(work_info + i * 8 + 4)
+#         kv_end = tl.load(work_info + i * 8 + 5)
+#         kv_offset = tl.load(work_info + i * 8 + 6)
+
+#         if bs_id == batch_id:
+#             if kv_offset == 0:
+#                 batch_last_work_id = i
+#             else:
+#                 kv_offset += 1
+#                 work_kv_pages = kv_end - kv_start
+#                 kv_end = seq_kv_end - (kv_offset + page_size - 1) // page_size
+#                 kv_start = kv_end - work_kv_pages
+#                 batch_last_kv_len = tl.minimum(batch_last_kv_len, kv_offset)
+
+#             # tl.store(work_info + i * 8 + 0, batch_id)
+#             # tl.store(work_info + i * 8 + 1, partial_index)
+#             interval = q_end - q_start
+#             if interval > 1:
+#                 q_start = q_start // interval
+#                 q_end = q_end // interval
+#                 if kv_offset == 0:
+#                     tl.store(reduce_final_map + batch_id * 2, q_start)
+#                     tl.store(reduce_final_map + batch_id * 2 + 1, q_end)
+#             tl.store(work_info + i * 8 + 2, q_start)
+#             tl.store(work_info + i * 8 + 3, q_end)
+#             tl.store(work_info + i * 8 + 4, kv_start)
+#             tl.store(work_info + i * 8 + 5, kv_end)
+#             tl.store(work_info + i * 8 + 6, kv_offset)
+#             tl.store(work_info + i * 8 + 7, 0)
+#             batch_tile_id += 1
+
+#     batch_last_kv_pages = (batch_last_kv_len + page_size - 1) // page_size
+#     batch_last_kv_start = seq_kv_end - batch_last_kv_pages
+#     tl.store(work_info + batch_last_work_id * 8 + 4, batch_last_kv_start)
+#     tl.store(work_info + batch_last_work_id * 8 + 5, seq_kv_end)
+
+
+@triton.jit(do_not_specialize=["tile_reduce_cnt"])
 def decode_update_mla_metadata_v1_kernel(
     seqlens_qo_indptr,
     seqlens_kv_indptr,
@@ -1096,26 +1172,43 @@ def decode_update_mla_metadata_v1_kernel(
     page_size: tl.constexpr,
     kv_granularity: tl.constexpr,
     cu_num: tl.constexpr,
-    batch_size: tl.constexpr,
     qk_batch_ratio: tl.constexpr,
+    tile_reduce_cnt,
 ):
     batch_id = tl.program_id(0)
     real_batch_id = batch_id // qk_batch_ratio
     old_num_worker = tl.load(work_indptr + cu_num)
+    num_partial_tiles = tile_reduce_cnt
     seq_kv_end = 0
     seq_kv_last = 0
     seq_kv_len = 0
-    seq_partial = 0
-    cur_sum_partial = 0
     for j in range(0, real_batch_id + 1):
         seq_kv_start = tl.load(seqlens_kv_indptr + j)
         seq_kv_end = tl.load(seqlens_kv_indptr + (j + 1))
         seq_kv_last = tl.load(kv_last_page_lens + j)
-        seq_kv_len = (seq_kv_end - seq_kv_start - 1) * page_size + seq_kv_last
+        seq_kv_len = (seq_kv_end - seq_kv_start - 1) + seq_kv_last
+
+    seq_pre_kv_len = 0
+    for i in range(0, old_num_worker):
+        bs_id = tl.load(work_info + i * 8 + 0)
+        partial_index = tl.load(work_info + i * 8 + 1)
+        q_start = tl.load(work_info + i * 8 + 2)
+        q_end = tl.load(work_info + i * 8 + 3)
+        kv_start = tl.load(work_info + i * 8 + 4)
+        kv_end = tl.load(work_info + i * 8 + 5)
+        kv_offset = tl.load(work_info + i * 8 + 6)
+        if bs_id == batch_id:
+            kv_len = (kv_end - kv_start) + kv_offset
+            seq_pre_kv_len = tl.maximum(seq_pre_kv_len, kv_len)
+
+    seq_kv_delta = seq_kv_len - seq_pre_kv_len
 
     batch_tile_id = 0
     batch_last_work_id = -1
     batch_last_kv_len = seq_kv_len
+    seq_q_start = 2147483647  # INT_MAX
+    seq_q_end = 0
+    q_interval = 1
     for i in range(0, old_num_worker):
         bs_id = tl.load(work_info + i * 8 + 0)
         partial_index = tl.load(work_info + i * 8 + 1)
@@ -1126,22 +1219,35 @@ def decode_update_mla_metadata_v1_kernel(
         kv_offset = tl.load(work_info + i * 8 + 6)
 
         if bs_id == batch_id:
+            work_kv_len = kv_end - kv_start
             if kv_offset == 0:
                 batch_last_work_id = i
+                kv_end = seq_kv_end
+                if work_kv_len + seq_kv_delta > 0:
+                    kv_start = kv_end - work_kv_len - seq_kv_delta
+                else:
+                    kv_start = kv_end - 1
             else:
-                kv_offset += 1
-                work_kv_pages = kv_end - kv_start
-                kv_end = seq_kv_end - (kv_offset + page_size - 1) // page_size
-                kv_start = kv_end - work_kv_pages
+                kv_offset += seq_kv_delta
+                if kv_offset <= 0:
+                    work_kv_len += kv_offset - 1
+                    kv_offset = 1
+                kv_end = seq_kv_end - kv_offset
+                kv_start = kv_end - work_kv_len
                 batch_last_kv_len = tl.minimum(batch_last_kv_len, kv_offset)
 
-            if seq_kv_len > kv_granularity:
-                partial_index = cur_sum_partial - seq_partial + batch_tile_id
-                tl.store(reduce_partial_map + partial_index, partial_index)
+            seq_q_start = tl.minimum(seq_q_start, q_start)
+            seq_q_end = tl.maximum(seq_q_end, q_end)
+            q_interval = q_end - q_start
+            if q_interval > 1:
+                q_start = q_start // q_interval
+                q_end = q_end // q_interval
+                partial_index = partial_index // q_interval
+
             # tl.store(work_info + i * 8 + 0, batch_id)
-            # tl.store(work_info + i * 8 + 1, partial_index)
-            # tl.store(work_info + i * 8 + 2, q_start)
-            # tl.store(work_info + i * 8 + 3, q_end)
+            tl.store(work_info + i * 8 + 1, partial_index)
+            tl.store(work_info + i * 8 + 2, q_start)
+            tl.store(work_info + i * 8 + 3, q_end)
             tl.store(work_info + i * 8 + 4, kv_start)
             tl.store(work_info + i * 8 + 5, kv_end)
             tl.store(work_info + i * 8 + 6, kv_offset)
@@ -1152,6 +1258,19 @@ def decode_update_mla_metadata_v1_kernel(
     batch_last_kv_start = seq_kv_end - batch_last_kv_pages
     tl.store(work_info + batch_last_work_id * 8 + 4, batch_last_kv_start)
     tl.store(work_info + batch_last_work_id * 8 + 5, seq_kv_end)
+
+    if q_interval > 1:
+        for i in range(0, num_partial_tiles):
+            partial_start = tl.load(reduce_indptr + i)
+            partial_end = tl.load(reduce_indptr + i + 1)
+            partial_q_start = tl.load(reduce_final_map + i * 2)
+            partial_q_end = tl.load(reduce_final_map + i * 2 + 1)
+            if partial_q_start >= seq_q_start and partial_q_end <= seq_q_end:
+                tl.store(reduce_final_map + i * 2, partial_q_start // q_interval)
+                tl.store(reduce_final_map + i * 2 + 1, partial_q_end // q_interval)
+                for j in range(partial_start, partial_end):
+                    partial_index = tl.load(reduce_partial_map + j)
+                    tl.store(reduce_partial_map + j, partial_index // q_interval)
 
 
 def decode_update_mla_metadata_v1(
@@ -1173,9 +1292,15 @@ def decode_update_mla_metadata_v1(
     dtype_q: torch.dtype = dtypes.bf16,
     dtype_kv: torch.dtype = dtypes.bf16,
 ) -> None:
+    """
+    This function is used to update the mla metadata for the decode update
+    when sequence batch is not changed and all batchs' q_len is same.
+    """
     assert max_seqlen_qo == 1
     assert kv_granularity % page_size == 0
     assert num_heads_k == 1
+    assert kv_granularity >= 16
+    assert page_size == 1
     # assert not (dtype_q == dtypes.bf16 and dtype_kv == dtypes.bf16 and num_heads_per_head_k == 128), "In this case, use get_mla_metadata_v1 instead"
     natively_supported = (num_heads_per_head_k == 16) or (
         num_heads_per_head_k == 128 and dtype_q == dtypes.fp8 and dtype_kv == dtypes.fp8
@@ -1205,6 +1330,6 @@ def decode_update_mla_metadata_v1(
         page_size,
         kv_granularity,
         cu_num,
-        batch_size,
         qk_batch_ratio,
+        tile_reduce_cnt,
     )
