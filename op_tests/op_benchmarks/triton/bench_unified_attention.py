@@ -31,6 +31,8 @@ def input_helper(
     dtype: torch.dtype,
     kv_cache_dtype: str,
     device: str,
+    varlen: bool,
+    DECODE_P: float,
 ):
     seed_everything(0)
     torch.set_default_device(device)
@@ -41,9 +43,15 @@ def input_helper(
     # see also similar issue: https://github.com/Dao-AILab/flash-attention/issues/523
     torch.cuda.set_device(device)
 
+    if varlen:
+        query_lens = [random.randint(16, MAX_SEQ_LEN) for _ in range(BS)]
+        ctx_lens = [random.randint(16, MAX_CTX_LEN) for _ in range(BS)]
+    else:
+        query_lens = [MAX_SEQ_LEN for _ in range(BS)]
+        ctx_lens = [MAX_CTX_LEN for _ in range(BS)]
+    
 
-    query_lens = [random.randint(16, MAX_SEQ_LEN) for _ in range(BS)]
-    ctx_lens = [random.randint(16, MAX_CTX_LEN) for _ in range(BS)]
+
     seq_lens = [a + b for a, b in zip(query_lens, ctx_lens)]
     num_kv_heads = num_heads // num_queries_per_kv
 
@@ -99,20 +107,10 @@ def input_helper(
             )
             cur_ctx += block_size
             block_id += 1
-    # transpose K_cache[num_blocks, block_size, num_kv_heads, head_size]
-    # to K_cache[num_blocks, num_kv_heads, head_size/8, block_size, 8]
-    # k_cache = (
-    #     k_cache.view(-1, block_size, num_kv_heads, head_size // 8, 8)
-    #     .permute(0, 2, 3, 1, 4)
-    #     .contiguous()
-    # )
-    # # transpose V_cache[num_blocks, block_size, num_kv_heads, head_size]
-    # # to V_cache[num_blocks, num_kv_heads, head_size, block_size]
-    # v_cache = (
-    #     v_cache.view(-1, block_size, num_kv_heads, head_size)
-    #     .permute(0, 2, 3, 1)
-    #     .contiguous()
-    # )
+
+    k_cache = k_cache.contiguous()
+    v_cache = v_cache.contiguous()
+
     k_scale = v_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
 
     return (
@@ -128,7 +126,7 @@ def input_helper(
         max_input_len,
         k_scale,
         v_scale,
-        seq_lens,
+        query_lens,
         ctx_lens
     )
 
@@ -303,89 +301,6 @@ def run_benchmark(custom, args):
         assert args.layout == "thd"
         varlen = not args.equal_seqlens
 
-        # if not varlen:
-        #     seqlens_q = torch.tensor([N_CTX_Q for _ in range(BATCH)], dtype=torch.int32, device="cuda")
-        #     seqlens_k = torch.tensor([N_CTX_K for _ in range(BATCH)], dtype=torch.int32, device="cuda")
-        # else:
-        #     seqlens_q = torch.randint(1,N_CTX_Q + 1, (BATCH,), dtype=torch.int32, device="cuda")
-        #     seqlens_k = torch.randint(1,N_CTX_K + 1, (BATCH,), dtype=torch.int32, device="cuda")
-
-        # # turn DECODE_P of the samples to decode samples (seqlen_q == 1)
-        # if DECODE_P > 0.0:
-        #     num_decode = int(round(DECODE_P * BATCH))
-        #     if num_decode > 0:
-        #         # choose which samples become decode samples
-        #         decode_idx = torch.randperm(BATCH, device=seqlens_q.device)[:num_decode]
-        #         seqlens_q[decode_idx] = 1
-        
-        
-        # num_seqs = BATCH
-        # num_query_heads = HQ
-        # num_kv_heads = HK
-        # head_size = D_HEAD
-        # assert num_query_heads % num_kv_heads == 0
-        # max_query_len = max(seqlens_q).item()
-        # max_kv_len = max(seqlens_k).item()
-        # soft_cap = args.softcap
-        # block_size = args.block_size if args.block_size else 512
-        # num_blocks = args.num_blocks if args.num_blocks else (max_kv_len * BATCH // block_size + 1)
-        # sliding_window = args.sliding_window
-        
-        # num_seqs = len(seqlens_q)
-        # query_lens = seqlens_q
-        # kv_lens = seqlens_k
-        # assert num_query_heads % num_kv_heads == 0
-        # max_query_len = max(query_lens).item()
-        # max_kv_len = max(kv_lens).item()
-        # window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
-        # scale = head_size**-0.5
-
-        # query = torch.randn(
-        #     sum(query_lens), num_query_heads, head_size, dtype=dtype, device="cuda"
-        # )
-        # key_cache = torch.randn(
-        #     num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cuda"
-        # )
-        # value_cache = torch.randn_like(key_cache)
-        
-        
-        # cu_seqlens_q = torch.zeros(len(seqlens_q) + 1, dtype=torch.int32, device="cuda")
-        # cu_seqlens_q[1:] = seqlens_q.cumsum(dim=0, dtype=torch.int32)
-        # cu_seqlens_k = torch.zeros(len(seqlens_k) + 1, dtype=torch.int32, device="cuda")
-        # cu_seqlens_k[1:] = seqlens_k.cumsum(dim=0, dtype=torch.int32)
-    
-
-        # max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
-        # block_tables = torch.randint(
-        #     0,
-        #     num_blocks,
-        #     (num_seqs, max_num_blocks_per_seq),
-        #     dtype=torch.int32,
-        #     device="cuda",
-        # )
-        # sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
-        # output = torch.empty_like(query)
-
-        # maybe_quantized_query = query
-        # maybe_quantized_key_cache = key_cache
-        # maybe_quantized_value_cache = value_cache
-        # q_descale = None
-        # k_descale = None
-        # v_descale = None
-        
-        # if args.fp8:
-        #     FP8_TYPE = aiter.dtypes.fp8
-        #     FP8_MAX = torch.finfo(FP8_TYPE).max
-        #     maybe_quantized_query = query.to(FP8_TYPE)
-        #     q_descale = query.max().to(torch.float32) / FP8_MAX 
-        #     k_descale = key_cache.max().to(torch.float32) / FP8_MAX 
-        #     # k_descale is qk_descale inside the kernel
-        #     k_descale = k_descale * q_descale
-        #     q_descale = None # q_descale must be None
-        #     maybe_quantized_key_cache = (key_cache / k_descale).to(query.dtype)
-        #     v_descale = value_cache.max().to(torch.float32) / FP8_MAX 
-        #     maybe_quantized_value_cache = (value_cache / v_descale).to(query.dtype)
-
         (
             query,
             k,
@@ -403,17 +318,15 @@ def run_benchmark(custom, args):
             ctx_lens
         ) = input_helper(BATCH, N_CTX_Q, N_CTX_K, args.num_blocks, args.block_size, N_CTX_K // args.block_size + 1, HQ, D_HEAD, HQ//HK, dtype, dtype,  device=[
                 f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
-            ][0])
+            ][0],
+            varlen=varlen,
+            DECODE_P=args.decode
+            )
 
         
         
         max_query_len = max(seq_lens)
         max_kv_len = max(ctx_lens)
-        
-        
-        print("query.shape", query.shape)
-        print("k_cache.shape", k_cache.shape)
-        print("v_cache.shape", k_cache.shape)
 
         scale = D_HEAD**-0.5
         window_size = (args.sliding_window - 1, 0) if args.sliding_window is not None else (-1, -1)
