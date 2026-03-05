@@ -265,6 +265,14 @@ def fused_moe_(
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
+    # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
+    # use FP8 as activation dtype to skip redundant re-quantization
+    if (
+        quant_type == QuantType.per_1x128
+        and hidden_states.dtype == dtypes.fp8
+        and a1_scale is not None
+    ):
+        q_dtype_a = dtypes.fp8
     bf16_fp8_bound = 512
     if quant_type == QuantType.per_1x32:
         if activation == ActivationType.Swiglu:
