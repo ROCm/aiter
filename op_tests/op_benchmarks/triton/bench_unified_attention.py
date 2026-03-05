@@ -13,6 +13,132 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 )
 from aiter.ops.triton.attention.unified_attention import unified_attention
 from op_tests.triton_tests.attention.test_unified_attention import ref_paged_attn
+import random
+from op_tests.triton_tests.attention.test_pa_prefill import (
+    seed_everything
+)
+
+def input_helper(
+    BS,
+    MAX_SEQ_LEN,
+    MAX_CTX_LEN,
+    cache_size,
+    block_size,
+    max_block_per_request,
+    num_heads: int,
+    head_size: int,
+    num_queries_per_kv: int,
+    dtype: torch.dtype,
+    kv_cache_dtype: str,
+    device: str,
+):
+    seed_everything(0)
+    torch.set_default_device(device)
+
+    # Need this, otherwise when we capture the graph the process
+    # for GPU 1 would run on both GPU0 and GPU1 and things would hang
+    #
+    # see also similar issue: https://github.com/Dao-AILab/flash-attention/issues/523
+    torch.cuda.set_device(device)
+
+
+    query_lens = [random.randint(16, MAX_SEQ_LEN) for _ in range(BS)]
+    ctx_lens = [random.randint(16, MAX_CTX_LEN) for _ in range(BS)]
+    seq_lens = [a + b for a, b in zip(query_lens, ctx_lens)]
+    num_kv_heads = num_heads // num_queries_per_kv
+
+    num_tokens = sum(query_lens)
+    query = torch.empty(num_tokens, num_heads, head_size, dtype=dtype)
+    query.uniform_(-1e-3, 1e-3)
+    output = torch.empty(num_tokens, num_heads, head_size, dtype=dtype)
+
+    kv = torch.empty(sum(seq_lens), 2, num_kv_heads, head_size, dtype=dtype)
+    kv.uniform_(-1e-3, 1e-3)
+    key, value = kv.unbind(dim=1)
+
+    cache_dtype = dtype
+
+    k_cache = torch.zeros(
+        cache_size, block_size, num_kv_heads, head_size, dtype=cache_dtype
+    )
+    v_cache = torch.zeros(
+        cache_size, block_size, num_kv_heads, head_size, dtype=cache_dtype
+    )
+    k = torch.zeros(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
+    v = torch.zeros(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
+    values = torch.arange(0, cache_size, dtype=torch.long)
+    values = values[torch.randperm(cache_size)]
+    block_table = values[: BS * max_block_per_request].view(BS, max_block_per_request)
+    b_seq_len = torch.tensor(seq_lens, dtype=torch.long)
+    b_ctx_len = torch.tensor(ctx_lens, dtype=torch.long)
+    b_start_loc = torch.cumsum(torch.tensor([0] + query_lens, dtype=torch.long), dim=0)
+    max_input_len = MAX_SEQ_LEN
+    # copy kv to cache
+    b_seq_start_loc = torch.cumsum(
+        torch.tensor([0] + seq_lens[:-1], dtype=torch.long), dim=0
+    )
+    for i in range(BS):
+        for j in range(query_lens[i]):
+            k[b_start_loc[i] + j].copy_(key[b_seq_start_loc[i] + b_ctx_len[i] + j])
+            v[b_start_loc[i] + j].copy_(value[b_seq_start_loc[i] + b_ctx_len[i] + j])
+        cur_ctx = 0
+        block_id = 0
+        while cur_ctx < b_ctx_len[i]:
+            start_loc = b_seq_start_loc[i] + cur_ctx
+            if cur_ctx + block_size > b_ctx_len[i]:
+                end_loc = b_seq_start_loc[i] + b_ctx_len[i]
+            else:
+                end_loc = start_loc + block_size
+            start_slot = block_table[i, block_id] * block_size
+            end_slot = start_slot + end_loc - start_loc
+            k_cache.view(-1, num_kv_heads, head_size)[start_slot:end_slot].copy_(
+                key[start_loc:end_loc]
+            )
+            v_cache.view(-1, num_kv_heads, head_size)[start_slot:end_slot].copy_(
+                value[start_loc:end_loc]
+            )
+            cur_ctx += block_size
+            block_id += 1
+    # transpose K_cache[num_blocks, block_size, num_kv_heads, head_size]
+    # to K_cache[num_blocks, num_kv_heads, head_size/8, block_size, 8]
+    # k_cache = (
+    #     k_cache.view(-1, block_size, num_kv_heads, head_size // 8, 8)
+    #     .permute(0, 2, 3, 1, 4)
+    #     .contiguous()
+    # )
+    # # transpose V_cache[num_blocks, block_size, num_kv_heads, head_size]
+    # # to V_cache[num_blocks, num_kv_heads, head_size, block_size]
+    # v_cache = (
+    #     v_cache.view(-1, block_size, num_kv_heads, head_size)
+    #     .permute(0, 2, 3, 1)
+    #     .contiguous()
+    # )
+    k_scale = v_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+
+    return (
+        query,
+        k,
+        v,
+        output,
+        k_cache,
+        v_cache,
+        block_table,
+        b_start_loc,
+        b_seq_len,
+        max_input_len,
+        k_scale,
+        v_scale,
+        seq_lens,
+        ctx_lens
+    )
+
+
+
+
+
+
+
+
 
 
 def nonvarlen_benchmark_configs():
@@ -177,94 +303,137 @@ def run_benchmark(custom, args):
         assert args.layout == "thd"
         varlen = not args.equal_seqlens
 
-        if not varlen:
-            seqlens_q = torch.tensor([N_CTX_Q for _ in range(BATCH)], dtype=torch.int32, device="cuda")
-            seqlens_k = torch.tensor([N_CTX_K for _ in range(BATCH)], dtype=torch.int32, device="cuda")
-        else:
-            seqlens_q = torch.randint(1,N_CTX_Q + 1, (BATCH,), dtype=torch.int32, device="cuda")
-            seqlens_k = torch.randint(1,N_CTX_K + 1, (BATCH,), dtype=torch.int32, device="cuda")
+        # if not varlen:
+        #     seqlens_q = torch.tensor([N_CTX_Q for _ in range(BATCH)], dtype=torch.int32, device="cuda")
+        #     seqlens_k = torch.tensor([N_CTX_K for _ in range(BATCH)], dtype=torch.int32, device="cuda")
+        # else:
+        #     seqlens_q = torch.randint(1,N_CTX_Q + 1, (BATCH,), dtype=torch.int32, device="cuda")
+        #     seqlens_k = torch.randint(1,N_CTX_K + 1, (BATCH,), dtype=torch.int32, device="cuda")
 
-        # turn DECODE_P of the samples to decode samples (seqlen_q == 1)
-        if DECODE_P > 0.0:
-            num_decode = int(round(DECODE_P * BATCH))
-            if num_decode > 0:
-                # choose which samples become decode samples
-                decode_idx = torch.randperm(BATCH, device=seqlens_q.device)[:num_decode]
-                seqlens_q[decode_idx] = 1
+        # # turn DECODE_P of the samples to decode samples (seqlen_q == 1)
+        # if DECODE_P > 0.0:
+        #     num_decode = int(round(DECODE_P * BATCH))
+        #     if num_decode > 0:
+        #         # choose which samples become decode samples
+        #         decode_idx = torch.randperm(BATCH, device=seqlens_q.device)[:num_decode]
+        #         seqlens_q[decode_idx] = 1
         
         
-        num_seqs = BATCH
-        num_query_heads = HQ
-        num_kv_heads = HK
-        head_size = D_HEAD
-        assert num_query_heads % num_kv_heads == 0
-        max_query_len = max(seqlens_q).item()
-        max_kv_len = max(seqlens_k).item()
-        soft_cap = args.softcap
-        block_size = args.block_size if args.block_size else 512
-        num_blocks = args.num_blocks if args.num_blocks else (max_kv_len * BATCH // block_size + 1)
-        sliding_window = args.sliding_window
+        # num_seqs = BATCH
+        # num_query_heads = HQ
+        # num_kv_heads = HK
+        # head_size = D_HEAD
+        # assert num_query_heads % num_kv_heads == 0
+        # max_query_len = max(seqlens_q).item()
+        # max_kv_len = max(seqlens_k).item()
+        # soft_cap = args.softcap
+        # block_size = args.block_size if args.block_size else 512
+        # num_blocks = args.num_blocks if args.num_blocks else (max_kv_len * BATCH // block_size + 1)
+        # sliding_window = args.sliding_window
         
-        num_seqs = len(seqlens_q)
-        query_lens = seqlens_q
-        kv_lens = seqlens_k
-        assert num_query_heads % num_kv_heads == 0
-        max_query_len = max(query_lens).item()
-        max_kv_len = max(kv_lens).item()
-        window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
-        scale = head_size**-0.5
+        # num_seqs = len(seqlens_q)
+        # query_lens = seqlens_q
+        # kv_lens = seqlens_k
+        # assert num_query_heads % num_kv_heads == 0
+        # max_query_len = max(query_lens).item()
+        # max_kv_len = max(kv_lens).item()
+        # window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
+        # scale = head_size**-0.5
 
-        query = torch.randn(
-            sum(query_lens), num_query_heads, head_size, dtype=dtype, device="cuda"
-        )
-        key_cache = torch.randn(
-            num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cuda"
-        )
-        value_cache = torch.randn_like(key_cache)
+        # query = torch.randn(
+        #     sum(query_lens), num_query_heads, head_size, dtype=dtype, device="cuda"
+        # )
+        # key_cache = torch.randn(
+        #     num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cuda"
+        # )
+        # value_cache = torch.randn_like(key_cache)
         
         
-        cu_seqlens_q = torch.zeros(len(seqlens_q) + 1, dtype=torch.int32, device="cuda")
-        cu_seqlens_q[1:] = seqlens_q.cumsum(dim=0, dtype=torch.int32)
-        cu_seqlens_k = torch.zeros(len(seqlens_k) + 1, dtype=torch.int32, device="cuda")
-        cu_seqlens_k[1:] = seqlens_k.cumsum(dim=0, dtype=torch.int32)
+        # cu_seqlens_q = torch.zeros(len(seqlens_q) + 1, dtype=torch.int32, device="cuda")
+        # cu_seqlens_q[1:] = seqlens_q.cumsum(dim=0, dtype=torch.int32)
+        # cu_seqlens_k = torch.zeros(len(seqlens_k) + 1, dtype=torch.int32, device="cuda")
+        # cu_seqlens_k[1:] = seqlens_k.cumsum(dim=0, dtype=torch.int32)
     
 
-        max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
-        block_tables = torch.randint(
-            0,
-            num_blocks,
-            (num_seqs, max_num_blocks_per_seq),
-            dtype=torch.int32,
-            device="cuda",
-        )
-        sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
+        # max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+        # block_tables = torch.randint(
+        #     0,
+        #     num_blocks,
+        #     (num_seqs, max_num_blocks_per_seq),
+        #     dtype=torch.int32,
+        #     device="cuda",
+        # )
+        # sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
+        # output = torch.empty_like(query)
+
+        # maybe_quantized_query = query
+        # maybe_quantized_key_cache = key_cache
+        # maybe_quantized_value_cache = value_cache
+        # q_descale = None
+        # k_descale = None
+        # v_descale = None
+        
+        # if args.fp8:
+        #     FP8_TYPE = aiter.dtypes.fp8
+        #     FP8_MAX = torch.finfo(FP8_TYPE).max
+        #     maybe_quantized_query = query.to(FP8_TYPE)
+        #     q_descale = query.max().to(torch.float32) / FP8_MAX 
+        #     k_descale = key_cache.max().to(torch.float32) / FP8_MAX 
+        #     # k_descale is qk_descale inside the kernel
+        #     k_descale = k_descale * q_descale
+        #     q_descale = None # q_descale must be None
+        #     maybe_quantized_key_cache = (key_cache / k_descale).to(query.dtype)
+        #     v_descale = value_cache.max().to(torch.float32) / FP8_MAX 
+        #     maybe_quantized_value_cache = (value_cache / v_descale).to(query.dtype)
+
+        (
+            query,
+            k,
+            v,
+            output,
+            k_cache,
+            v_cache,
+            block_table,
+            b_start_loc,
+            b_seq_len,
+            max_input_len,
+            k_scale,
+            v_scale,
+            seq_lens,
+            ctx_lens
+        ) = input_helper(BATCH, N_CTX_Q, N_CTX_K, args.num_blocks, args.block_size, N_CTX_K // args.block_size + 1, HQ, D_HEAD, HQ//HK, dtype, dtype,  device=[
+                f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
+            ][0])
+
+        
+        
+        max_query_len = max(seq_lens)
+        max_kv_len = max(ctx_lens)
+        
+        
+        print("query.shape", query.shape)
+        print("k_cache.shape", k_cache.shape)
+        print("v_cache.shape", k_cache.shape)
+
+        scale = D_HEAD**-0.5
+        window_size = (args.sliding_window - 1, 0) if args.sliding_window is not None else (-1, -1)
+
+        cu_seqlens_q = torch.tensor(
+            [0] + seq_lens, dtype=torch.int32, device="cuda"
+        ).cumsum(dim=0, dtype=torch.int32)
+
+        cu_seqlens_k = torch.tensor(
+            [0] + ctx_lens, dtype=torch.int32, device="cuda"
+        ).cumsum(dim=0, dtype=torch.int32)
+
+        kv_lens = torch.tensor(ctx_lens, dtype=torch.int32, device="cuda")
+
         output = torch.empty_like(query)
 
-        maybe_quantized_query = query
-        maybe_quantized_key_cache = key_cache
-        maybe_quantized_value_cache = value_cache
-        q_descale = None
-        k_descale = None
-        v_descale = None
-        
-        if args.fp8:
-            FP8_TYPE = aiter.dtypes.fp8
-            FP8_MAX = torch.finfo(FP8_TYPE).max
-            maybe_quantized_query = query.to(FP8_TYPE)
-            q_descale = query.max().to(torch.float32) / FP8_MAX 
-            k_descale = key_cache.max().to(torch.float32) / FP8_MAX 
-            # k_descale is qk_descale inside the kernel
-            k_descale = k_descale * q_descale
-            q_descale = None # q_descale must be None
-            maybe_quantized_key_cache = (key_cache / k_descale).to(query.dtype)
-            v_descale = value_cache.max().to(torch.float32) / FP8_MAX 
-            maybe_quantized_value_cache = (value_cache / v_descale).to(query.dtype)
-
-
         fn = lambda: unified_attention(
-            q=maybe_quantized_query,
-            k=maybe_quantized_key_cache,
-            v=maybe_quantized_value_cache,
+            q=query,
+            k=k_cache,
+            v=v_cache,
             out=output,
             cu_seqlens_q=cu_seqlens_q,
             seqused_k=kv_lens,
@@ -273,27 +442,27 @@ def run_benchmark(custom, args):
             softmax_scale=scale,
             causal=True,
             window_size=window_size,
-            block_table=block_tables,
-            softcap=soft_cap if soft_cap is not None else 0,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            sinks=sinks,
+            block_table=block_table,
+            softcap=args.softcap if args.softcap is not None else 0,
+            q_descale=None, # required to be None
+            k_descale=k_scale,
+            v_descale=v_scale,
+            sinks=None,
         )
 
         if args.test:
             fn() # eval triton kernel
             ref_output = ref_paged_attn(
                 query=query,
-                key_cache=key_cache,
-                value_cache=value_cache,
-                query_lens=query_lens,
+                key_cache=k_cache,
+                value_cache=v_cache,
+                query_lens=seq_lens,
                 kv_lens=kv_lens,
-                block_tables=block_tables,
+                block_tables=block_table,
                 scale=scale,
-                sliding_window=sliding_window,
-                soft_cap=soft_cap,
-                sinks=sinks,
+                sliding_window=args.sliding_window,
+                soft_cap=args.softcap,
+                sinks=None,
             )
             atol, rtol = 1.5e-2, 1e-2
             if args.fp8:
@@ -345,8 +514,8 @@ def run_benchmark(custom, args):
             total_num_tokens_k = BATCH * N_CTX_K
         
         q_size = total_num_tokens_q * HQ * D_HEAD * query.element_size()
-        k_size = total_num_tokens_k * HK * D_HEAD * key_cache.element_size()
-        v_size = total_num_tokens_k * HK * D_HEAD_V * value_cache.element_size()
+        k_size = total_num_tokens_k * HK * D_HEAD * k_cache.element_size()
+        v_size = total_num_tokens_k * HK * D_HEAD_V * v_cache.element_size()
         o_size = total_num_tokens_q * HQ * D_HEAD_V * query.element_size()
 
         # read q, k, v
@@ -418,14 +587,14 @@ def parse_args():
     parser.add_argument(
         "-num_blocks",
         type=parse_int_or_list,
-        default=0,
+        default=15535,
         help="number of blocks in kv cache",
     )
 
     parser.add_argument(
         "-block_size",
         type=parse_int_or_list,
-        default=0,
+        default=544,
         help="block size in kv cache",
     )
 
