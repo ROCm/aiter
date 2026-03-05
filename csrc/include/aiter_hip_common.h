@@ -60,7 +60,7 @@ struct p1
 struct AiterAsmKernelArgs
 {
     void* args_ptr;
-    void* arg_size_ptr;
+    size_t* arg_size_ptr;
     int gdx;
     int gdy;
     int gdz;
