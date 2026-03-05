@@ -14,9 +14,8 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 from aiter.ops.triton.attention.unified_attention import unified_attention
 from op_tests.triton_tests.attention.test_unified_attention import ref_paged_attn
 import random
-from op_tests.triton_tests.attention.test_pa_prefill import (
-    seed_everything
-)
+from op_tests.triton_tests.attention.test_pa_prefill import seed_everything
+
 
 def input_helper(
     BS,
@@ -49,7 +48,7 @@ def input_helper(
     else:
         query_lens = [MAX_SEQ_LEN for _ in range(BS)]
         ctx_lens = [MAX_CTX_LEN for _ in range(BS)]
-    
+
     # Turn DECODE_P portion of query_lens to 1
     if DECODE_P > 0.0:
         num_decode = max(1, int(BS * DECODE_P))
@@ -131,8 +130,9 @@ def input_helper(
         k_scale,
         v_scale,
         query_lens,
-        ctx_lens
+        ctx_lens,
     )
+
 
 def nonvarlen_benchmark_configs():
     batch_sizes = [1, 4, 16]
@@ -162,6 +162,7 @@ def varlen_benchmark_configs():
         for batch_size, N_HEAD, seq_len_q, seq_len_k in configs
     ]
     return configs
+
 
 def model_benchmark_configs(args):
     config_file = args.model_configs
@@ -209,7 +210,16 @@ def create_benchmark_configs(custom, args):
     head_size = 128 if not args.d else args.d
     head_size_v = head_size if not args.dv else args.dv
     decode_p = args.decode
-    x_names = ["BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K", "D_HEAD", "D_HEAD_V", "DECODE_P"]
+    x_names = [
+        "BATCH",
+        "HQ",
+        "HK",
+        "N_CTX_Q",
+        "N_CTX_K",
+        "D_HEAD",
+        "D_HEAD_V",
+        "DECODE_P",
+    ]
     causal = args.causal
     varlen = args.layout == "thd"
 
@@ -224,9 +234,9 @@ def create_benchmark_configs(custom, args):
         x_vals_list = [(args.b, args.hq, hk, args.sq, sk, head_size, head_size_v)]
     else:
         if varlen:
-            x_vals_list = varlen_benchmark_configs()  
+            x_vals_list = varlen_benchmark_configs()
         else:
-            x_vals_list = nonvarlen_benchmark_configs() 
+            x_vals_list = nonvarlen_benchmark_configs()
 
         if args.model:
             x_vals_list = model_benchmark_configs(args)
@@ -241,13 +251,14 @@ def create_benchmark_configs(custom, args):
                 "D_HEAD_V",
                 "DECODE_P",
             ]
-            plot_name = f"fused-attention-layout-{args.layout}-fp8-{args.fp8}-causal-{causal}"
+            plot_name = (
+                f"fused-attention-layout-{args.layout}-fp8-{args.fp8}-causal-{causal}"
+            )
             extra_args = {"dtype": dtype, "causal": causal}
 
     for i in range(len(x_vals_list)):
         x_vals_list[i] = (*x_vals_list[i], decode_p)
-    
-    
+
     if args.metric == "time":
         unit = "ms"
     elif args.metric == "throughput":
@@ -256,7 +267,6 @@ def create_benchmark_configs(custom, args):
         unit = "GB/s"
     else:
         raise ValueError("Unknown metric: " + args.metric)
-
 
     line_vals = [f"fwd({unit})"]
 
@@ -274,6 +284,7 @@ def create_benchmark_configs(custom, args):
         )
     )
     return configs
+
 
 def run_benchmark(custom, args):
     torch.manual_seed(20)
@@ -298,31 +309,47 @@ def run_benchmark(custom, args):
 
         (
             query,
-            _, # k,
-            _, # v,
+            _,  # k,
+            _,  # v,
             output,
             k_cache,
             v_cache,
             block_table,
-            _, # b_start_loc,
-            _, # b_seq_len,
-            _, # max_input_len,
+            _,  # b_start_loc,
+            _,  # b_seq_len,
+            _,  # max_input_len,
             k_scale,
             v_scale,
             query_lens,
-            ctx_lens
-        ) = input_helper(BATCH, N_CTX_Q, N_CTX_K, args.num_blocks, args.block_size, N_CTX_K // args.block_size + 1, HQ, D_HEAD, HQ//HK, dtype, dtype,  device=[
+            ctx_lens,
+        ) = input_helper(
+            BATCH,
+            N_CTX_Q,
+            N_CTX_K,
+            args.num_blocks,
+            args.block_size,
+            N_CTX_K // args.block_size + 1,
+            HQ,
+            D_HEAD,
+            HQ // HK,
+            dtype,
+            dtype,
+            device=[
                 f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
             ][0],
             varlen=varlen,
-            DECODE_P=DECODE_P
-            )
+            DECODE_P=DECODE_P,
+        )
 
         max_query_len = max(query_lens)
         max_kv_len = max(ctx_lens)
 
         scale = D_HEAD**-0.5
-        window_size = (args.sliding_window - 1, 0) if args.sliding_window is not None else (-1, -1)
+        window_size = (
+            (args.sliding_window - 1, 0)
+            if args.sliding_window is not None
+            else (-1, -1)
+        )
 
         cu_seqlens_q = torch.tensor(
             [0] + query_lens, dtype=torch.int32, device="cuda"
@@ -350,14 +377,14 @@ def run_benchmark(custom, args):
             window_size=window_size,
             block_table=block_table,
             softcap=args.softcap if args.softcap is not None else 0,
-            q_descale=None, # required to be None
+            q_descale=None,  # required to be None
             k_descale=k_scale,
             v_descale=v_scale,
             sinks=None,
         )
 
         if args.test:
-            fn() # eval triton kernel
+            fn()  # eval triton kernel
             ref_output = ref_paged_attn(
                 query=query,
                 key_cache=k_cache,
@@ -377,9 +404,8 @@ def run_benchmark(custom, args):
                 output, ref_output, atol=atol, rtol=rtol
             ), f"{torch.max(torch.abs(output - ref_output))}"
 
-        
         ms = triton.testing.do_bench(fn)
-        
+
         # calculate perf metrics
         total_flops = 0
         num_contexts = len(cu_seqlens_q) - 1
@@ -398,8 +424,7 @@ def run_benchmark(custom, args):
 
         total_num_tokens_q = cu_seqlens_q[-1].item()
         total_num_tokens_k = cu_seqlens_k[-1].item()
-  
-        
+
         q_size = total_num_tokens_q * HQ * D_HEAD * query.element_size()
         k_size = total_num_tokens_k * HK * D_HEAD * k_cache.element_size()
         v_size = total_num_tokens_k * HK * D_HEAD_V * v_cache.element_size()
@@ -510,23 +535,27 @@ def parse_args():
         help="Q and K head size, if -dv is absent then -d specifies V head size too",
     )
     parser.add_argument("-unified_attention", type=int, default=1)
-    parser.add_argument("-sliding_window", type=int, default=None, help="optional sliding window size, default None = not active.")
+    parser.add_argument(
+        "-sliding_window",
+        type=int,
+        default=None,
+        help="optional sliding window size, default None = not active.",
+    )
     parser.add_argument("-softcap", type=float, default=0.0)
     parser.add_argument("-dv", type=int, default=0, help="optional V head size")
     parser.add_argument(
         "-decode",
-        nargs="?",          # 0 or 1 values
-        const=1.0,          # value if just `-decode`
-        default=0.0,        # value if `-decode` not given at all
+        nargs="?",  # 0 or 1 values
+        const=1.0,  # value if just `-decode`
+        default=0.0,  # value if `-decode` not given at all
         type=float,
-        metavar="P",        # shown as -decode P in help
+        metavar="P",  # shown as -decode P in help
         help="portion of decode samples in batch (omit P for all=1.0)",
     )
     parser.add_argument("-fp8", action="store_true", default=False)
     parser.add_argument("-dtype", default="fp16")
     parser.add_argument("-print_vgpr", action="store_true", default=False)
 
-    
     parser.add_argument(
         "-metric",
         nargs="?",
@@ -563,7 +592,6 @@ def main():
 
     custom_config = False
 
-  
     if args.hq or args.hk or args.d or args.dv:
         custom_config = True
         if not args.dv:
