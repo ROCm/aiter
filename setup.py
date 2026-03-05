@@ -234,7 +234,7 @@ class NinjaBuildExtension(build_ext):
                         torch_exclude=False,
                     )
 
-                prebuid_thread_num = 5
+                prebuid_thread_num = 3
                 max_jobs = os.environ.get("MAX_JOBS")
                 if max_jobs is not None and max_jobs.isdigit() and int(max_jobs) > 0:
                     prebuid_thread_num = min(prebuid_thread_num, int(max_jobs))
