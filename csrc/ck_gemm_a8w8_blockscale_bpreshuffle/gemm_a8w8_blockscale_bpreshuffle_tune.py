@@ -210,7 +210,7 @@ class Gemma8W8BlockScaleBPreShuffleTuner(GemmCommonTuner):
         ref_data_idx = [0, 5, 6, 3]
 
         asm_tasks = []
-        asm_kernel_id = len(kernels_list)
+        asm_kernel_id = 0
         for key, kernel_names in asm_kernels.items():
             tile_m, tile_n, splitk_supported = key
             # Respect ASM kernel tile constraints from the config CSV.
