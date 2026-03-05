@@ -126,6 +126,24 @@ def matmul_kernel(
     for k in range(0,num_k_iter-2):
         cur_a = a_bufs.index(buf_idx).load(layout=dot_a_layout)
         cur_b = b_bufs.index(buf_idx).load(layout=dot_b_layout)
+
+        # sched_barrier(mask) controls which instruction types may be
+        # reordered across this point by the LLVM scheduler.
+        # Two sched_barrier(0x0) calls define a hard scheduling region:
+        # no instructions may move in or out.
+        #
+        # Mask values (combinable via bitwise OR):
+        #   0x000 = NONE       → hard fence, nothing crosses
+        #   0x001 = ALU        → non-memory, non-side-effect
+        #   0x002 = VALU       → vector ALU
+        #   0x004 = SALU       → scalar ALU
+        #   0x008 = MFMA/WMMA  → matrix multiply-accumulate
+        #   0x010 = ALL VMEM   → all vector memory (read + write)
+        #   0x020 = VMEM read  → vector memory reads only
+        #   0x040 = VMEM write → vector memory writes only
+        #   0x080 = ALL DS     → all LDS operations (read + write)
+        #   0x100 = DS read    → LDS reads only
+        #   0x200 = DS write   → LDS writes only
         gl.amd.cdna3.sched_barrier(0x0)
         accumulator = gl.amd.cdna4.mfma(cur_a, cur_b, accumulator)
         async_idx = (buf_idx + 2) % 3
@@ -134,16 +152,25 @@ def matmul_kernel(
         gl.amd.cdna4.async_copy.buffer_load_to_shared(b_bufs.index(async_idx), b_ptr, b_offs)
         gl.amd.cdna4.async_copy.commit_group()
 
-
-        #DS_READ
+        # sched_group_barrier(mask, count, group_id) tells LLVM to schedule
+        # `count` instructions matching `mask` before crossing this point.
+        # Instructions are selected bottom-up from the barrier's position.
+        # The third parameter, group_id, identifies which other sched_group_barriers
+        # should be synchronized with.
+        #
+        # Mask values: 0x008=MFMA, 0x020=VMEM, 0x100=DS_READ, 0x200=DS_WRITE
+        #
+        # The sequence below interleaves compute and memory to hide latency:
+        #   4x DS_READ  -> 1x MFMA -> 1x DS_WRITE -> 4x VMEM -> 1x MFMA
+        # DS_READ
         gl.amd.cdna3.sched_group_barrier(0x100, 4, 0)
-        #MFMA
+        # MFMA
         gl.amd.cdna3.sched_group_barrier(0x008, 1, 0)
-        #DS_WRITE
+        # DS_WRITE
         gl.amd.cdna3.sched_group_barrier(0x200, 1, 0)
-        #VMEM
+        # VMEM
         gl.amd.cdna3.sched_group_barrier(0x020, 4, 0)
-        #MFMA
+        # MFMA
         gl.amd.cdna3.sched_group_barrier(0x008, 1, 0)
         gl.amd.cdna3.sched_barrier(0x0)
 
