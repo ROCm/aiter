@@ -361,6 +361,11 @@ def run_benchmark(custom, args):
 
         output = torch.empty_like(query)
 
+        if args.use_sinks:
+            sinks = torch.randn(HQ, dtype=torch.bfloat16, device="cuda")
+        else:
+            sinks = None
+
         def fn():
             return unified_attention(
                 q=query,
@@ -379,7 +384,7 @@ def run_benchmark(custom, args):
                 q_descale=None,  # required to be None
                 k_descale=k_scale,
                 v_descale=v_scale,
-                sinks=None,
+                sinks=sinks,
             )
 
         if args.test:
@@ -394,7 +399,7 @@ def run_benchmark(custom, args):
                 scale=scale,
                 sliding_window=args.sliding_window,
                 soft_cap=args.softcap,
-                sinks=None,
+                sinks=sinks,
             )
             atol, rtol = 1.5e-2, 1e-2
             if args.fp8:
