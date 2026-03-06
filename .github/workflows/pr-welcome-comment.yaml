@@ -24,12 +24,12 @@ jobs:
 
             **Extended tests (opt-in via labels):**
 
-            | Label | Tests | Runner |
-            |-------|-------|--------|
-            | \`ci:sglang\` | SGLang integration tests | 1 GPU |
-            | \`ci:atom\` | ATOM benchmark (DeepSeek-R1 + GPT-OSS) | 8 GPU / MI355 |
-            | \`ci:vllm\` | vLLM benchmark | 8 GPU |
-            | \`ci:all\` | All of the above | — |
+            | Label | Tests |
+            |-------|-------|
+            | \`ci:sglang\` | SGLang integration tests |
+            | \`ci:atom\` | ATOM benchmark (DeepSeek-R1 + GPT-OSS) |
+            | \`ci:vllm\` | vLLM benchmark |
+            | \`ci:all\` | All of the above |
 
             > Add labels via the sidebar or \`gh pr edit ${context.issue.number} --add-label <label>\``
             });
