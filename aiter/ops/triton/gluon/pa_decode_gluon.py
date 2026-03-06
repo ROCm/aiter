@@ -994,37 +994,60 @@ def paged_attention_decode_sliding_window_head_1(
     )
 
     # Register allocation configuration based on group size and compute block size
-    if QUERY_GROUP_SIZE_POW2 == 16:
-        if CONTEXT_PARTITION_SIZE == 128:
-            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64))
-        elif CONTEXT_PARTITION_SIZE == 256:
-            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (0, 128))
-    elif QUERY_GROUP_SIZE_POW2 == 32:
-        if CONTEXT_PARTITION_SIZE == 128:
-            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (16, 0))
-        elif CONTEXT_PARTITION_SIZE == 256:
-            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (0, 128), (16, 0))
-    elif QUERY_GROUP_SIZE_POW2 == 64:
-        if CONTEXT_PARTITION_SIZE == 128:
-            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (16, 0), (32, 0))
-        elif CONTEXT_PARTITION_SIZE == 256:
-            register_bases: gl.constexpr = (
-                (0, 1),
-                (0, 2),
-                (0, 64),
-                (0, 128),
-                (16, 0),
-                (32, 0),
-            )
+    if QUERY_GROUP_SIZE_POW2 >= 16:
+        if QUERY_GROUP_SIZE_POW2 == 16:
+            if CONTEXT_PARTITION_SIZE == 128:
+                register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64))
+            elif CONTEXT_PARTITION_SIZE == 256:
+                register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (0, 128))
+        elif QUERY_GROUP_SIZE_POW2 == 32:
+            if CONTEXT_PARTITION_SIZE == 128:
+                register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (16, 0))
+            elif CONTEXT_PARTITION_SIZE == 256:
+                register_bases: gl.constexpr = (
+                    (0, 1),
+                    (0, 2),
+                    (0, 64),
+                    (0, 128),
+                    (16, 0),
+                )
+        elif QUERY_GROUP_SIZE_POW2 == 64:
+            if CONTEXT_PARTITION_SIZE == 128:
+                register_bases: gl.constexpr = (
+                    (0, 1),
+                    (0, 2),
+                    (0, 64),
+                    (16, 0),
+                    (32, 0),
+                )
+            elif CONTEXT_PARTITION_SIZE == 256:
+                register_bases: gl.constexpr = (
+                    (0, 1),
+                    (0, 2),
+                    (0, 64),
+                    (0, 128),
+                    (16, 0),
+                    (32, 0),
+                )
 
-    # Distributed layout for QK linear operations
-    qk_linear_layout: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=register_bases,
-        lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 4), (0, 8)),
-        warp_bases=((0, 16), (0, 32)),
-        block_bases=[],
-        shape=[QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE],
-    )
+        # Distributed layout for QK linear operations
+        qk_linear_layout: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=register_bases,
+            lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 4), (0, 8)),
+            warp_bases=((0, 16), (0, 32)),
+            block_bases=[],
+            shape=[QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE],
+        )
+    else:
+        THREADS0: gl.constexpr = QUERY_SEQ_LEN_POW2
+        THREADS1: gl.constexpr = 64 // THREADS0
+        VGPRS0: gl.constexpr = QUERY_GROUP_SIZE_POW2 // (4 * THREADS0)
+        qk_linear_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[VGPRS0, CONTEXT_PARTITION_SIZE // THREADS1],
+            threads_per_warp=[THREADS0, THREADS1],
+            warps_per_cta=[4, 1],
+            order=[1, 0],
+        )
 
     context_length = gl.load(context_lengths_ptr + sequence_idx)
     # Value cache layout configuration based on transpose flag
@@ -4012,10 +4035,10 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     num_sequences, num_kv_heads, num_splits = grid
     HEAD_SIZE_POW2 = triton.next_power_of_2(HEAD_SIZE)
     QUERY_SEQ_LEN_POW2 = triton.next_power_of_2(query_seq_len)
-    if query_group_size <= 16 // QUERY_SEQ_LEN_POW2:
-        ONE_QUERY_GROUP_SIZE_POW2 = 16 // QUERY_SEQ_LEN_POW2
-    else:
-        ONE_QUERY_GROUP_SIZE_POW2 = triton.next_power_of_2(query_group_size)
+    # if query_group_size <= 16 // QUERY_SEQ_LEN_POW2:
+    #     ONE_QUERY_GROUP_SIZE_POW2 = 16 // QUERY_SEQ_LEN_POW2
+    # else:
+    ONE_QUERY_GROUP_SIZE_POW2 = triton.next_power_of_2(query_group_size)
     waves_per_eu = 1
     KV_COMPUTE_BLOCK_SIZE = CONTEXT_PARTITION_SIZE
     # Select kernel implementation based on block size
