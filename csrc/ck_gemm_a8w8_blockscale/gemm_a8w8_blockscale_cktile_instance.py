@@ -34,7 +34,6 @@ class TileKernelInstance:
     TiledMMAPermuteN: bool
     TransposeC: bool
     UsePersistentKernel: bool
-
     BlockPerCu: int  # 1,2
 
     @property
