@@ -73,6 +73,7 @@ def fused_gemm_afp4wfp4_split_cat(
 
     if config is None:
         config, _ = _get_config(M, N, K)
+    config = dict(config)
 
     c1 = torch.empty((M, D, S1 + S3), dtype=dtype, device=x.device)
     c2 = torch.empty((M, D, S2), dtype=dtype, device=x.device)
@@ -251,6 +252,7 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
 
     if config is None:
         config, _ = _get_config(M, N, K, True)
+    config = dict(config)
 
     c1 = torch.empty((M, D, S1 + S3), dtype=dtype, device=x.device)
     c2 = torch.empty((M, D, S2), dtype=dtype, device=x.device)
