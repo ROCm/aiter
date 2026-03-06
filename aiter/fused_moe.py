@@ -431,6 +431,7 @@ def fused_moe_1stage(
                 aiter.fmoe_fp8_blockscale_g1u1,
                 fc_scale_blkn=128,
                 fc_scale_blkk=128,
+                block_size_M=block_size_M,
             )
         elif isG1U1:
             fmoe_func = aiter.fmoe_g1u1
