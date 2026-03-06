@@ -1231,7 +1231,8 @@
         "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''",
-        "third_party": ["'HipKittens'", "'ComposableKernel'"]
+        "third_party": ["'HipKittens'", "'ComposableKernel'"],
+        "experimental": "True"
     },
     "module_topk_plain": {
         "srcs": [

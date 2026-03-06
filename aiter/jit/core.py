@@ -523,13 +523,6 @@ rebuilded_list = ["module_aiter_enum"]
 
 
 def clone_3rdparty(third_party: str) -> None:
-    if third_party == "HipKittens":
-        dir_path = HIP_KITTENS_DIR
-    elif third_party == "ComposableKernel":
-        dir_path = CK_DIR
-    else:
-        dir_path = f"{AITER_META_DIR}/3rdparty/{third_party}"
-
     def MainFunc():
         if not os.path.exists(dir_path):
             import subprocess
@@ -639,20 +632,19 @@ def clone_3rdparty(third_party: str) -> None:
                             ]
                         )
 
-    with open(f"{AITER_META_DIR}/3rdparty/3rdparty_info.yaml", "r") as f:
-        import yaml
+    if third_party == "HipKittens":
+        dir_path = HIP_KITTENS_DIR
+        third_party_info = {
+            "url": "https://github.com/HazyResearch/HipKittens.git",
+            "commit": "b027c06ba935b80a53a7c7f7f82c0f9cbd0bf3cb",
+        }
+    elif third_party == "ComposableKernel":
+        # TODO: ComposableKernel will be supported in the future
+        pass
 
-        third_party_info = yaml.safe_load(f)
-
-    if third_party in third_party_info:
-        third_party_info = third_party_info[third_party]
+    if "third_party_info" in locals():
         lock_path = f"{bd_dir}/lock_3rdparty_clone_{third_party}"
         mp_lock(lockPath=lock_path, MainFunc=MainFunc)
-    # TODO: ComposableKernel will be supported in the future
-    elif third_party != "ComposableKernel":
-        raise ValueError(
-            f"Invalid third party: {third_party}! Please check {AITER_META_DIR}/3rdparty/3rdparty_info.yaml"
-        )
 
 
 def rm_module(md_name):
@@ -992,6 +984,10 @@ def get_args_of_build(ops_name: str, exclude=[]):
                     if ops_name in exclude:
                         continue
                     single_ops = convert(d_ops)
+                    # exclude experimental ops if AITER_ENABLE_EXPERIMENTAL is not set
+                    if not os.getenv("AITER_ENABLE_EXPERIMENTAL", False):
+                        if single_ops.get("experimental", False):
+                            continue
                     d_single_ops = {
                         "md_name": ops_name,
                         "srcs": single_ops["srcs"],

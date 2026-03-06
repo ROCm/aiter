@@ -14,6 +14,8 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 
+import os
+
 
 @triton.jit
 def _fwd_kernel_stage2_asm(
@@ -340,14 +342,12 @@ def mla_decode_fwd(
             else None
         )
 
-        # For gfx942, HK kernel is better or equal to asm in almost all the cases.
-        # For gfx950, HK kernel is worse than asm if the problem size is very large.
         use_hk = (
             nhead == 128
             and q.dtype == dtypes.fp8
             and kv_buffer.dtype == dtypes.fp8
-            and get_gfx() == "gfx942"
             and page_size == 1
+            and os.getenv("AITER_ENABLE_EXPERIMENTAL", False)
         )
 
         if use_hk:
