@@ -986,7 +986,7 @@ def get_args_of_build(ops_name: str, exclude=[]):
                     single_ops = convert(d_ops)
                     # exclude experimental ops if AITER_ENABLE_EXPERIMENTAL is not set
                     if not os.getenv("AITER_ENABLE_EXPERIMENTAL", False):
-                        if single_ops.get("experimental", False):
+                        if single_ops.get("is_experimental", False):
                             continue
                     d_single_ops = {
                         "md_name": ops_name,

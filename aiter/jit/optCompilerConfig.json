@@ -1232,7 +1232,7 @@
         "verbose": "False",
         "blob_gen_cmd": "''",
         "third_party": ["'HipKittens'", "'ComposableKernel'"],
-        "experimental": "True"
+        "is_experimental": "True"
     },
     "module_topk_plain": {
         "srcs": [
