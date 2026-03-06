@@ -4,22 +4,25 @@ from aiter.ops.triton.rope.rope import _get_gptj_rotated_x, _get_neox_rotated_x
 
 @triton.jit
 def _rms_norm(
-    tensor,
-    weight,
-    BLOCK_D,
-    eps
+    tensor,      # Pre-loaded block: (BLOCK_M, BLOCK_D)
+    weight,      # Pre-loaded block: (BLOCK_D,)
+    BLOCK_D,     # Constant
+    eps          # Scalar
 ):
     tensor_f32 = tensor.to(tl.float32)
-    tensor_sq_sum = tl.sum(tensor_f32 * tensor_f32, axis=1)
-    tensor_rsqrt = tl.rsqrt(tensor_sq_sum / BLOCK_D + eps)
-
-    tensor_normed = tensor_f32 * tensor_rsqrt[:, None]
-    tensor_normed = tensor_normed * (1.0 + weight[None, :])
-    tensor = tensor_normed.to(tensor.dtype)
-    return tensor
+    tensor_sq = tensor_f32 * tensor_f32
+    variance = tl.sum(tensor_sq, axis=1) / BLOCK_D
+    
+    inv_rms = tl.rsqrt(variance + eps)[:, None]
+    tensor_normed = tensor_f32 * inv_rms
+    
+    w_f32 = weight.to(tl.float32)
+    tensor_final = tensor_normed * (1.0 + w_f32[None, :])
+    
+    return tensor_final.to(tensor.dtype)
 
 @triton.jit
-def _fused_qkv_split_qk_rope_kernel(
+def _fused_qkv_split_qk_norm_rope_cache_kernel(
     qkv_ptr,
     q_weight_ptr,
     k_weight_ptr,

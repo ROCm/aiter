@@ -1,10 +1,10 @@
 import torch
 import triton
-from aiter.ops.triton._triton_kernels.rope.fused_qkv_split_qk_rope import (
-    _fused_qkv_split_qk_rope_kernel,
+from aiter.ops.triton._triton_kernels.rope.fused_qkv_split_qk_norm_rope_cache import (
+    _fused_qkv_split_qk_norm_rope_cache_kernel,
 )
 
-def fused_qkv_split_qk_rope(
+def fused_qkv_split_qk_norm_rope_cache(
     qkv: torch.Tensor,
     q_weight: torch.Tensor, # RMS norm weight for Q
     k_weight: torch.Tensor, # RMS norm weight for K
@@ -54,7 +54,7 @@ def fused_qkv_split_qk_rope(
     num_warps = 4
     grid = (triton.cdiv(T, BLOCK_T), qh)
 
-    _fused_qkv_split_qk_rope_kernel[grid](
+    _fused_qkv_split_qk_norm_rope_cache_kernel[grid](
         qkv_ptr=qkv,
         q_weight_ptr=q_weight,
         k_weight_ptr=k_weight,
