@@ -5,11 +5,103 @@ This directory contains performance benchmarks for various operations implemente
 ## Table of Contents
 
 - [User Guide](#user-guide)
-- [Available Benchmarks](#available-benchmarks)
-  - [Triton Benchmarks](#triton-benchmarks)
-  - [HIP Benchmarks](#hip-benchmarks)
+  - [Available Benchmarks](#available-benchmarks)
+    - [Triton Benchmarks](#triton-benchmarks)
+    - [HIP Benchmarks](#hip-benchmarks)
+  - [Prerequisites](#prerequisites)
+  - [Running Individual Benchmarks](#running-individual-benchmarks)
+  - [Common Command-Line Arguments](#common-command-line-arguments)
+  - [Example Usage](#example-usage)
+  - [Output Format](#output-format)
+  - [Benchmark Schema](#benchmark-schema)
+- [Benchmark Schema Reference](#benchmark-schema-reference)
+- [Tips for Benchmarking](#tips-for-benchmarking)
+- [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
 
 ## User Guide
+
+### Available Benchmarks
+
+#### Triton Benchmarks
+
+##### GEMM Operations
+
+| Benchmark | Description | Input Parameters | Output Metrics |
+|-----------|-------------|------------------|----------------|
+| `bench_gemm_a8w8.py` | INT8 activation, INT8 weight GEMM | M, N, K | TFLOPS |
+| `bench_gemm_a8w8_blockscale.py` | INT8 GEMM with block-wise scaling | M, N, K | TFLOPS |
+| `bench_gemm_a8w8_per_token_scale.py` | INT8 GEMM with per-token scaling | M, N, K | TFLOPS |
+| `bench_gemm_a8wfp4.py` | INT8 activation, FP4 weight GEMM | M, N, K | TFLOPS |
+| `bench_gemm_a16w16.py` | FP16/BF16 activation, FP16/BF16 weight GEMM | M, N, K | TFLOPS |
+| `bench_gemm_a16w16_gating.py` | FP16/BF16 GEMM with gating mechanism | M, N, K | TFLOPS |
+| `bench_gemm_afp4wfp4.py` | FP4 activation, FP4 weight GEMM | M, N, K | TFLOPS |
+| `bench_gemm_afp4wfp4_pre_quant_atomic.py` | FP4 GEMM with pre-quantization (atomic) | M, N, K | TFLOPS |
+
+##### Batched GEMM Operations
+
+| Benchmark | Description | Input Parameters | Output Metrics |
+|-----------|-------------|------------------|----------------|
+| `bench_batched_gemm_a8w8.py` | Batched INT8 GEMM | batch, M, N, K | TFLOPS |
+| `bench_batched_gemm_a16w16.py` | Batched FP16/BF16 GEMM | batch, M, N, K | TFLOPS |
+| `bench_batched_gemm_a16wfp4.py` | Batched INT8 activation, FP4 weight GEMM | batch, M, N, K | TFLOPS |
+| `bench_batched_gemm_afp4wfp4.py` | Batched FP4 GEMM | batch, M, N, K | TFLOPS |
+
+##### Attention Operations
+
+| Benchmark | Description | Input Parameters | Output Metrics |
+|-----------|-------------|------------------|----------------|
+| `bench_mha.py` | Multi-Head Attention | BATCH, HQ, HK, N_CTX_Q, N_CTX_K | fwd(TFLOPS) |
+| `bench_mla_decode.py` | Multi-head Latent Attention (decode) | model, BS, HQ, HK, SEQ_LEN, HEAD_DIM | Time(ms), TFLOPS, Bandwidth(GB/s) |
+| `bench_mla_decode_rope.py` | MLA decode with RoPE | model, BS, HQ, HK, SEQ_LEN, HEAD_DIM | Time(ms), TFLOPS, Bandwidth(GB/s) |
+| `bench_pa_decode.py` | Paged Attention (decode) | model, BS, HQ, HK, SEQ_LEN, HEAD_DIM | Time(ms), TFLOPS, Bandwidth(GB/s) |
+| `bench_pa_prefill.py` | Paged Attention (prefill) | model, BS, HQ, HK, MAX_SEQ_LEN, HEAD_DIM | Time(ms), TFLOPS, Bandwidth(GB/s) |
+| `bench_la.py` | Linear Attention | OP, BS, HQ, HK, SEQ_LEN, HEAD_DIM | Time(ms) |
+| `bench_la_paged_decode.py` | Paged Linear Attention (decode) | OP, BS, HQ, HK, SEQ_LEN, HEAD_DIM | Time(ms) |
+| `bench_extend_attention.py` | Extended Attention | B, H, prefix, extend, kv_lora_rank, qk_rope_head_dim, v_head_dim, attn_impl | fwd_Time(ms) |
+| `bench_batch_prefill.py` | Batch Prefill Attention | Various | Various |
+| `bench_hstu_attn.py` | HSTU (Hierarchical Sparse Transformer Unit) Attention | batch_size, max_seq_len, sparsity, heads, attn_dim, hidden_dim | TFLOPS |
+| `bench_deepgemm_attention.py` | DeepGEMM Attention | Various | Various |
+| `bench_fav3_sage.py` | FAV3 SAGE Attention | Various | Various |
+| `bench_fav3_sage_mxfp4.py` | FAV3 SAGE Attention with MXFP4 | Various | Various |
+| `bench_fp8_mqa_logits.py` | FP8 Multi-Query Attention Logits | Various | Various |
+
+##### MoE (Mixture of Experts) Operations
+
+| Benchmark | Description | Input Parameters | Output Metrics |
+|-----------|-------------|------------------|----------------|
+| `bench_moe.py` | MoE forward pass | model, M, N, K, E, top_k | Time(ms), TFLOPS, Bandwidth(GB/s) |
+| `bench_moe_mx.py` | MoE with matrix operations | model, M, N, K, E, top_k | Time(ms), TFLOPS, Bandwidth(GB/s) |
+| `bench_moe_align_block_size.py` | MoE block size alignment | model, M, N, K, E, top_k | Time(ms), Bandwidth(GB/s) |
+| `bench_moe_routing_sigmoid_top1_fused.py` | MoE routing with sigmoid top-1 fusion | M, N, K | Time(ms), TFLOPS, Bandwidth(GB/s) |
+| `bench_moe_gemm_a8w8.py` | MoE INT8 GEMM | Various | Various |
+| `bench_moe_gemm_a8w8_blockscale.py` | MoE INT8 GEMM with block scaling | Various | Various |
+| `bench_moe_gemm_a8w4.py` | MoE INT8 activation, INT4 weight GEMM | Various | Various |
+| `bench_moe_gemm_a4w4.py` | MoE INT4 GEMM | Various | Various |
+| `bench_moe_gemm_int8_smoothquant.py` | MoE INT8 GEMM with SmoothQuant | Various | Various |
+
+##### Normalization and Other Operations
+
+| Benchmark | Description | Input Parameters | Output Metrics |
+|-----------|-------------|------------------|----------------|
+| `bench_rmsnorm.py` | RMS Normalization | model_name, M, N | Bandwidth(GB/s) |
+| `bench_rope.py` | Rotary Position Embedding (RoPE) | model, M (seq_len) | Time(ms), Total FLOPS |
+| `bench_topk.py` | Top-K selection | M (batch), N (vocab), topk | Time(ms) |
+| `bench_gmm.py` | Gaussian Mixture Model | Various | Various |
+| `bench_ff_a16w16_fused.py` | Fused Feed-Forward with FP16/BF16 | Various | Various |
+
+##### Model Benchmarking Tools
+
+| Tool | Description | Usage |
+|------|-------------|-------|
+| `model_benchmarking_tool/bench_models.py` | Comprehensive model-level benchmarking | `python bench_models.py --model <model_name> --M <sizes> --TP <tensor_parallel>` |
+| `model_benchmarking_tool/bench_attn_models.py` | Attention kernel benchmarking across models | `python bench_attn_models.py --kernel <kernels> --model <model_filter>` |
+
+#### HIP Benchmarks
+
+| Benchmark | Description | Input Parameters | Output Metrics |
+|-----------|-------------|------------------|----------------|
+| `bench_topk_topp_sampling.py` | Top-K/Top-P sampling kernel | batch_size, vocab_size, k, p | Latency(ms), Throughput(tokens/s) |
 
 ### Prerequisites
 
@@ -109,88 +201,6 @@ Benchmarks typically output:
 The benchmark schema is defined in `triton/bench_schema.yaml`, which specifies:
 - Input columns for each benchmark
 - Output columns/metrics reported
-
-## Available Benchmarks
-
-### Triton Benchmarks
-
-#### GEMM Operations
-
-| Benchmark | Description | Input Parameters | Output Metrics |
-|-----------|-------------|------------------|----------------|
-| `bench_gemm_a8w8.py` | INT8 activation, INT8 weight GEMM | M, N, K | TFLOPS |
-| `bench_gemm_a8w8_blockscale.py` | INT8 GEMM with block-wise scaling | M, N, K | TFLOPS |
-| `bench_gemm_a8w8_per_token_scale.py` | INT8 GEMM with per-token scaling | M, N, K | TFLOPS |
-| `bench_gemm_a8wfp4.py` | INT8 activation, FP4 weight GEMM | M, N, K | TFLOPS |
-| `bench_gemm_a16w16.py` | FP16/BF16 activation, FP16/BF16 weight GEMM | M, N, K | TFLOPS |
-| `bench_gemm_a16w16_gating.py` | FP16/BF16 GEMM with gating mechanism | M, N, K | TFLOPS |
-| `bench_gemm_afp4wfp4.py` | FP4 activation, FP4 weight GEMM | M, N, K | TFLOPS |
-| `bench_gemm_afp4wfp4_pre_quant_atomic.py` | FP4 GEMM with pre-quantization (atomic) | M, N, K | TFLOPS |
-
-#### Batched GEMM Operations
-
-| Benchmark | Description | Input Parameters | Output Metrics |
-|-----------|-------------|------------------|----------------|
-| `bench_batched_gemm_a8w8.py` | Batched INT8 GEMM | batch, M, N, K | TFLOPS |
-| `bench_batched_gemm_a16w16.py` | Batched FP16/BF16 GEMM | batch, M, N, K | TFLOPS |
-| `bench_batched_gemm_a16wfp4.py` | Batched INT8 activation, FP4 weight GEMM | batch, M, N, K | TFLOPS |
-| `bench_batched_gemm_afp4wfp4.py` | Batched FP4 GEMM | batch, M, N, K | TFLOPS |
-
-#### Attention Operations
-
-| Benchmark | Description | Input Parameters | Output Metrics |
-|-----------|-------------|------------------|----------------|
-| `bench_mha.py` | Multi-Head Attention | BATCH, HQ, HK, N_CTX_Q, N_CTX_K | fwd(TFLOPS) |
-| `bench_mla_decode.py` | Multi-head Latent Attention (decode) | model, BS, HQ, HK, SEQ_LEN, HEAD_DIM | Time(ms), TFLOPS, Bandwidth(GB/s) |
-| `bench_mla_decode_rope.py` | MLA decode with RoPE | model, BS, HQ, HK, SEQ_LEN, HEAD_DIM | Time(ms), TFLOPS, Bandwidth(GB/s) |
-| `bench_pa_decode.py` | Paged Attention (decode) | model, BS, HQ, HK, SEQ_LEN, HEAD_DIM | Time(ms), TFLOPS, Bandwidth(GB/s) |
-| `bench_pa_prefill.py` | Paged Attention (prefill) | model, BS, HQ, HK, MAX_SEQ_LEN, HEAD_DIM | Time(ms), TFLOPS, Bandwidth(GB/s) |
-| `bench_la.py` | Linear Attention | OP, BS, HQ, HK, SEQ_LEN, HEAD_DIM | Time(ms) |
-| `bench_la_paged_decode.py` | Paged Linear Attention (decode) | OP, BS, HQ, HK, SEQ_LEN, HEAD_DIM | Time(ms) |
-| `bench_extend_attention.py` | Extended Attention | B, H, prefix, extend, kv_lora_rank, qk_rope_head_dim, v_head_dim, attn_impl | fwd_Time(ms) |
-| `bench_batch_prefill.py` | Batch Prefill Attention | Various | Various |
-| `bench_hstu_attn.py` | HSTU (Hierarchical Sparse Transformer Unit) Attention | batch_size, max_seq_len, sparsity, heads, attn_dim, hidden_dim | TFLOPS |
-| `bench_deepgemm_attention.py` | DeepGEMM Attention | Various | Various |
-| `bench_fav3_sage.py` | FAV3 SAGE Attention | Various | Various |
-| `bench_fav3_sage_mxfp4.py` | FAV3 SAGE Attention with MXFP4 | Various | Various |
-| `bench_fp8_mqa_logits.py` | FP8 Multi-Query Attention Logits | Various | Various |
-
-#### MoE (Mixture of Experts) Operations
-
-| Benchmark | Description | Input Parameters | Output Metrics |
-|-----------|-------------|------------------|----------------|
-| `bench_moe.py` | MoE forward pass | model, M, N, K, E, top_k | Time(ms), TFLOPS, Bandwidth(GB/s) |
-| `bench_moe_mx.py` | MoE with matrix operations | model, M, N, K, E, top_k | Time(ms), TFLOPS, Bandwidth(GB/s) |
-| `bench_moe_align_block_size.py` | MoE block size alignment | model, M, N, K, E, top_k | Time(ms), Bandwidth(GB/s) |
-| `bench_moe_routing_sigmoid_top1_fused.py` | MoE routing with sigmoid top-1 fusion | M, N, K | Time(ms), TFLOPS, Bandwidth(GB/s) |
-| `bench_moe_gemm_a8w8.py` | MoE INT8 GEMM | Various | Various |
-| `bench_moe_gemm_a8w8_blockscale.py` | MoE INT8 GEMM with block scaling | Various | Various |
-| `bench_moe_gemm_a8w4.py` | MoE INT8 activation, INT4 weight GEMM | Various | Various |
-| `bench_moe_gemm_a4w4.py` | MoE INT4 GEMM | Various | Various |
-| `bench_moe_gemm_int8_smoothquant.py` | MoE INT8 GEMM with SmoothQuant | Various | Various |
-
-#### Normalization and Other Operations
-
-| Benchmark | Description | Input Parameters | Output Metrics |
-|-----------|-------------|------------------|----------------|
-| `bench_rmsnorm.py` | RMS Normalization | model_name, M, N | Bandwidth(GB/s) |
-| `bench_rope.py` | Rotary Position Embedding (RoPE) | model, M (seq_len) | Time(ms), Total FLOPS |
-| `bench_topk.py` | Top-K selection | M (batch), N (vocab), topk | Time(ms) |
-| `bench_gmm.py` | Gaussian Mixture Model | Various | Various |
-| `bench_ff_a16w16_fused.py` | Fused Feed-Forward with FP16/BF16 | Various | Various |
-
-#### Model Benchmarking Tools
-
-| Tool | Description | Usage |
-|------|-------------|-------|
-| `model_benchmarking_tool/bench_models.py` | Comprehensive model-level benchmarking | `python bench_models.py --model <model_name> --M <sizes> --TP <tensor_parallel>` |
-| `model_benchmarking_tool/bench_attn_models.py` | Attention kernel benchmarking across models | `python bench_attn_models.py --kernel <kernels> --model <model_filter>` |
-
-### HIP Benchmarks
-
-| Benchmark | Description | Input Parameters | Output Metrics |
-|-----------|-------------|------------------|----------------|
-| `bench_topk_topp_sampling.py` | Top-K/Top-P sampling kernel | batch_size, vocab_size, k, p | Latency(ms), Throughput(tokens/s) |
 
 ## Benchmark Schema Reference
 
