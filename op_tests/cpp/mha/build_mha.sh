@@ -8,8 +8,14 @@ else
     FMA_API=""  # build all
 fi
 
-echo "######## building mha kernel $FMA_API"
-python3 compile.py --api=$FMA_API
+# Skip building the kernels if AITER_TEST_SKIP_BUILD is set to 1
+# and continue onto linking
+if [ x"$AITER_TEST_SKIP_BUILD" = x"1" ]; then
+    echo "######## skipping build of mha kernels $FMA_API"
+else
+    echo "######## building mha kernels $FMA_API"
+    python3 compile.py --api=$FMA_API
+fi
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 TOP_DIR=$(dirname "$SCRIPT_DIR")/../../
