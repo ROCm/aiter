@@ -166,10 +166,17 @@ Run FlashAttention performance benchmarks:
 # Navigate to benchmarks directory
 cd op_tests/op_benchmarks/triton
 
-# Run FlashAttention benchmark with default model configurations
-python bench_mha.py --model llama3-70b
+# List available models (check --help for available model names)
+python bench_mha.py --help
 
-# Run with custom parameters
+# Run FlashAttention benchmark with model configurations
+# Note: Model names use format "family-size" with capital letters (e.g., "70B" not "70b")
+python bench_mha.py --model llama3-70B
+
+# Run all models in a family
+python bench_mha.py --model llama3
+
+# Run with custom parameters (without model config)
 python bench_mha.py \
     --b 4 \
     --hq 32 \
@@ -188,11 +195,22 @@ python bench_mha.py --fp8 --b 4 --hq 32 --hk 32 --sq 2048 --sk 2048 --d 128
 python bench_mha.py --mode bwd --b 4 --hq 32 --hk 32 --sq 2048 --sk 2048 --d 128
 
 # Run with model-specific configurations
-python bench_mha.py --model llama3-70b --b 1 --sq 4096 --metric throughput
+python bench_mha.py --model llama3-70B --b 1 --sq 4096 --metric throughput
 
 # Test correctness against PyTorch SDPA
 python bench_mha.py --test_mode --b 4 --hq 32 --hk 32 --sq 1024 --sk 1024 --d 128
 ```
+
+**Available Model Names:**
+
+The model configuration file (`utils/model_configs.json`) contains the following models:
+- `llama3-8B`, `llama3-70B`, `llama3-405B`
+- `mixtral-7B`, `mixtral-22B`
+- `deepseek-V3`
+
+You can also use just the family name (e.g., `llama3`) to benchmark all models in that family, or use `all` to benchmark all available models.
+
+**Important:** Model names are case-sensitive. Use capital letters for model sizes (e.g., `70B` not `70b`).
 
 **Common FlashAttention Benchmark Arguments:**
 
@@ -348,10 +366,24 @@ benchmark_name:
 
 ## Troubleshooting
 
+### Common Issues
+
 - **Import Errors**: Ensure all dependencies are installed and the Python path includes the project root
+
 - **CUDA Errors**: Verify GPU availability and CUDA/ROCm installation
+
 - **Out of Memory**: Reduce batch sizes or sequence lengths
+
 - **Slow Performance**: Check GPU utilization and ensure no thermal throttling
+
+- **Model Not Found Error**: If you see `Warning: No models selected with the provided model names: ['model-name']`:
+  - Check available models by running: `python bench_mha.py --help` (models are listed in the `--model` help text)
+  - Model names are case-sensitive: use `llama3-70B` (capital B) not `llama3-70b` (lowercase b)
+  - Use the exact format from the model configs: `family-size` (e.g., `llama3-70B`, `mixtral-7B`, `deepseek-V3`)
+  - You can use just the family name (e.g., `llama3`) to benchmark all models in that family
+  - Check the model config file at `op_tests/op_benchmarks/triton/utils/model_configs.json` for all available models
+
+- **amdgpu.ids Warning**: The warning `/opt/amdgpu/share/libdrm/amdgpu.ids: No such file or directory` is harmless and can be ignored. It does not affect benchmark functionality.
 
 ## Contributing
 
