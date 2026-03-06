@@ -305,7 +305,6 @@ def fused_moe_(
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
     if block_size_M is not None:
         block_size_M = int(block_size_M)
-    print(f"blocksize: {block_size_M}")
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
         topk_ids,
         topk_weight,
@@ -893,7 +892,6 @@ def get_2stage_cfgs(
 
     if run_1stage:
         tkn_per_epr = token * topk / expert
-        print(f"tkn_per_epr: {tkn_per_epr}") 
         return MOEMetadata(
             functools.partial(
                 fused_moe_1stage,
