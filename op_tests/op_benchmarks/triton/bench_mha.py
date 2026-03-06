@@ -591,7 +591,7 @@ def str2bool(v):
         raise argparse.ArgumentTypeError("Boolean value expected.")
 
 
-def parse_args():
+def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser = get_parser(kernel_name="FlashAttention")
     parser.add_argument(
         "-mode", type=str, default="fwd", help="fwd:forward kernel, bwd:backward kernel"
@@ -651,7 +651,7 @@ def parse_args():
     parser.add_argument(
         "-sink", action="store_true", default=False, help="use attention sink"
     )
-    return parser.parse_args()
+    return parser.parse_args(args=args)
 
 
 arg_to_torch_dtype = {
@@ -661,9 +661,7 @@ arg_to_torch_dtype = {
 }
 
 
-def main():
-    args = parse_args()
-
+def post_process_args(args: argparse.Namespace) -> tuple[argparse.Namespace, bool]:
     if args.model:
         if args.causal is None:  # User didn't specify -causal
             args.causal = True
@@ -714,20 +712,25 @@ def main():
             category=RuntimeWarning,
         )
 
-    if args.print_vgpr:
-        assert not args.bench_torch, "Do not use -bench_torch with -print_vgpr."
+    return args, custom_config
+
+
+def main(args: list[str] | None = None) -> None:
+    parsed_args = parse_args(args=args)
+    parsed_args, custom_config = post_process_args(parsed_args)
+
+    if parsed_args.print_vgpr:
+        assert not parsed_args.bench_torch, "Do not use -bench_torch with -print_vgpr."
         print("Retrieving VGPR usage for Triton kernels...")
 
         def fun():
-            return run_benchmark(custom_config, args)
+            return run_benchmark(custom_config, parsed_args)
 
         print_vgpr(fun, get_caller_name_no_ext())
-        return 0
+        return
 
-    run_benchmark(custom_config, args)
+    run_benchmark(custom_config, parsed_args)
 
 
 if __name__ == "__main__":
-    import sys
-
-    sys.exit(main())
+    main()
