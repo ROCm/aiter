@@ -15,16 +15,21 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: `### 🏷️ Available CI Labels
+              body: `### 🏷️ CI Guide
 
-            By default, only standard tests run on PRs. You can trigger extended tests by adding these labels:
+            **Runs automatically on every PR:**
+            - ✅ Pre-checks (submodule verification, code formatting)
+            - ✅ Aiter op tests (gfx942 + gfx950)
+            - ✅ Triton tests (only when \`aiter/ops/triton/**\` or related paths are changed)
 
-            | Label | Tests |
-            |-------|-------|
-            | \`ci:sglang\` | SGLang integration tests |
-            | \`ci:atom\` | ATOM benchmark |
-            | \`ci:vllm\` | vLLM benchmark (8 GPU) |
-            | \`ci:all\` | All extended tests |
+            **Extended tests (opt-in via labels):**
 
-            > Add labels via the sidebar or \`gh pr edit --add-label <label>\``
+            | Label | Tests | Runner |
+            |-------|-------|--------|
+            | \`ci:sglang\` | SGLang integration tests | 1 GPU |
+            | \`ci:atom\` | ATOM benchmark (DeepSeek-R1 + GPT-OSS) | 8 GPU / MI355 |
+            | \`ci:vllm\` | vLLM benchmark | 8 GPU |
+            | \`ci:all\` | All of the above | — |
+
+            > Add labels via the sidebar or \`gh pr edit ${context.issue.number} --add-label <label>\``
             });
