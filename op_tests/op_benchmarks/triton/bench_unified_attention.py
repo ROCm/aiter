@@ -310,128 +310,126 @@ def run_benchmark(custom, args):
         assert args.layout == "thd"
         varlen = not args.equal_seqlens
 
-        (
-            query,
-            _,  # k,
-            _,  # v,
-            output,
-            k_cache,
-            v_cache,
-            block_table,
-            _,  # b_start_loc,
-            _,  # b_seq_len,
-            _,  # max_input_len,
-            k_scale,
-            v_scale,
-            query_lens,
-            ctx_lens,
-        ) = input_helper(
-            BATCH,
-            N_CTX_Q,
-            N_CTX_K,
-            args.num_blocks,
-            args.block_size,
-            N_CTX_K // args.block_size + 1,
-            HQ,
-            D_HEAD,
-            HQ // HK,
-            dtype,
-            dtype,
-            device=[
-                f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
-            ][0],
-            varlen=varlen,
-            DECODE_P=DECODE_P,
-        )
+        if not varlen:
+            seqlens_q = torch.tensor([N_CTX_Q for _ in range(BATCH)], dtype=torch.int32, device="cuda")
+            seqlens_k = torch.tensor([N_CTX_K for _ in range(BATCH)], dtype=torch.int32, device="cuda")
+        else:
+            seqlens_q = torch.randint(16,N_CTX_Q + 1, (BATCH,), dtype=torch.int32, device="cuda")
+            seqlens_k = torch.randint(16,N_CTX_K + 1, (BATCH,), dtype=torch.int32, device="cuda")
 
-        max_query_len = max(query_lens)
-        max_kv_len = max(ctx_lens)
+        # turn DECODE_P of the samples to decode samples (seqlen_q == 1)
+        if DECODE_P > 0.0:
+            num_decode = int(round(DECODE_P * BATCH))
+            if num_decode > 0:
+                # choose which samples become decode samples
+                decode_idx = torch.randperm(BATCH, device=seqlens_q.device)[:num_decode]
+                seqlens_q[decode_idx] = 1
+        
+        num_seqs = BATCH
+        num_query_heads = HQ
+        num_kv_heads = HK
+        head_size = D_HEAD
+        assert num_query_heads % num_kv_heads == 0
+        max_query_len = max(seqlens_q).item()
+        max_kv_len = max(seqlens_k).item()
+        soft_cap = args.softcap
+        # TODO provide sensible defaults
+        block_size = args.block_size if args.block_size else 512
+        num_blocks = args.num_blocks if args.num_blocks else (max_kv_len * BATCH // block_size + 1)
 
+        window_size = (args.sliding_window - 1, 0) if args.sliding_window is not None else (-1, -1)
         scale = D_HEAD**-0.5
-        window_size = (
-            (args.sliding_window - 1, 0)
-            if args.sliding_window is not None
-            else (-1, -1)
+
+        query = torch.randn(
+            sum(seqlens_q), num_query_heads, head_size, dtype=dtype, device="cuda"
         )
+        key_cache = torch.randn(
+            num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cuda"
+        )
+        value_cache = torch.randn_like(key_cache)
+        cu_seqlens_q = torch.zeros(len(seqlens_q) + 1, dtype=torch.int32, device="cuda")
+        cu_seqlens_q[1:] = seqlens_q.cumsum(dim=0, dtype=torch.int32)
+        cu_seqlens_k = torch.zeros(len(seqlens_k) + 1, dtype=torch.int32, device="cuda")
+        cu_seqlens_k[1:] = seqlens_k.cumsum(dim=0, dtype=torch.int32)
 
-        cu_seqlens_q = torch.tensor(
-            [0] + query_lens, dtype=torch.int32, device="cuda"
-        ).cumsum(dim=0, dtype=torch.int32)
-
-        cu_seqlens_k = torch.tensor(
-            [0] + ctx_lens, dtype=torch.int32, device="cuda"
-        ).cumsum(dim=0, dtype=torch.int32)
-
-        kv_lens = torch.tensor(ctx_lens, dtype=torch.int32, device="cuda")
-
-        output = torch.empty_like(query)
-
+        max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+        block_tables = torch.randint(
+            0,
+            num_blocks,
+            (num_seqs, max_num_blocks_per_seq),
+            dtype=torch.int32,
+            device="cuda",
+        )
         if args.use_sinks:
-            sinks = torch.randn(HQ, dtype=torch.bfloat16, device="cuda")
+            sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
         else:
             sinks = None
-
+        
+        output = torch.empty_like(query)
         maybe_quantized_query = query
-        maybe_quantized_k_cache = k_cache
-        maybe_quantized_v_cache = v_cache
-        q_descale = None
-        k_descale = k_scale
-        v_descale = v_scale
-
+        maybe_quantized_key_cache = key_cache
+        maybe_quantized_value_cache = value_cache
+        
         if args.fp8:
-            FP8_TYPE = aiter.dtypes.fp8
-            FP8_MAX = torch.finfo(FP8_TYPE).max
-            maybe_quantized_query = query.to(FP8_TYPE)
-            maybe_quantized_k_cache = k_cache.to(FP8_TYPE)
-            maybe_quantized_v_cache = v_cache.to(FP8_TYPE)
-            q_descale = None
-            k_descale = k_cache.max().to(torch.float32) / FP8_MAX
-            v_descale = v_cache.max().to(torch.float32) / FP8_MAX
+            from aiter.ops.triton.utils.types import e4m3_dtype
+            FP8_TYPE = e4m3_dtype
+            # FP8_MAX = torch.finfo(FP8_TYPE).max
+            maybe_quantized_query = (query).to(FP8_TYPE)
+            # kernel does not support descaling
+            # k_descale = (key_cache.max() / FP8_MAX).to(torch.float32)
+            # v_descale = (value_cache.max() / FP8_MAX).to(torch.float32) 
+            maybe_quantized_key_cache = (key_cache).to(FP8_TYPE)
+            maybe_quantized_value_cache = (value_cache).to(FP8_TYPE)
+            scale_shape = (1,)
+            q_descale = None  # Not yet supported
+            k_descale = torch.ones(scale_shape, dtype=torch.float32, device="cuda")
+            v_descale = torch.ones(scale_shape, dtype=torch.float32, device="cuda")
+        else:
+            q_descale, k_descale, v_descale = None, None, None
 
-        def fn():
-            return unified_attention(
-                q=maybe_quantized_query,
-                k=maybe_quantized_k_cache,
-                v=maybe_quantized_v_cache,
-                out=output,
-                cu_seqlens_q=cu_seqlens_q,
-                seqused_k=kv_lens,
-                max_seqlen_q=max_query_len,
-                max_seqlen_k=max_kv_len,
-                softmax_scale=scale,
-                causal=causal,
-                window_size=window_size,
-                block_table=block_table,
-                softcap=args.softcap if args.softcap is not None else 0,
-                q_descale=q_descale,
-                k_descale=k_descale,
-                v_descale=v_descale,
-                sinks=sinks,
-            )
+        fn =  lambda: unified_attention(
+            q=maybe_quantized_query,
+            k=maybe_quantized_key_cache,
+            v=maybe_quantized_value_cache,
+            out=output,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seqlens_k,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=causal,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=soft_cap if soft_cap is not None else 0,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            sinks=sinks,
+        )
 
+        ms = triton.testing.do_bench(fn)
+        
         if args.test:
-            fn()  # eval triton kernel
             ref_output = ref_paged_attn(
                 query=query,
-                key_cache=k_cache,
-                value_cache=v_cache,
-                query_lens=query_lens,
-                kv_lens=kv_lens,
-                block_tables=block_table,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                query_lens=seqlens_q,
+                kv_lens=seqlens_k,
+                block_tables=block_tables,
                 scale=scale,
                 sliding_window=args.sliding_window,
-                soft_cap=args.softcap,
+                soft_cap=soft_cap,
                 sinks=sinks,
             )
             atol, rtol = 1.5e-2, 1e-2
             if args.fp8:
                 atol, rtol = 1.5e-1, 1.5e-1
+            fn() # evaluate function
             torch.testing.assert_close(
                 output, ref_output, atol=atol, rtol=rtol
             ), f"{torch.max(torch.abs(output - ref_output))}"
-
-        ms = triton.testing.do_bench(fn)
-
+        
         # calculate perf metrics
         total_flops = 0
         num_contexts = len(cu_seqlens_q) - 1
@@ -452,8 +450,8 @@ def run_benchmark(custom, args):
         total_num_tokens_k = cu_seqlens_k[-1].item()
 
         q_size = total_num_tokens_q * HQ * D_HEAD * query.element_size()
-        k_size = total_num_tokens_k * HK * D_HEAD * k_cache.element_size()
-        v_size = total_num_tokens_k * HK * D_HEAD_V * v_cache.element_size()
+        k_size = total_num_tokens_k * HK * D_HEAD * key_cache.element_size()
+        v_size = total_num_tokens_k * HK * D_HEAD_V * value_cache.element_size()
         o_size = total_num_tokens_q * HQ * D_HEAD_V * query.element_size()
 
         # read q, k, v
