@@ -9,6 +9,8 @@ This directory contains performance benchmarks for various operations implemente
     - [Triton Benchmarks](#triton-benchmarks)
     - [HIP Benchmarks](#hip-benchmarks)
   - [Prerequisites](#prerequisites)
+  - [How to Benchmark](#how-to-benchmark)
+    - [Running FlashAttention Tests](#running-flashattention-tests)
   - [Running Individual Benchmarks](#running-individual-benchmarks)
   - [Common Command-Line Arguments](#common-command-line-arguments)
   - [Example Usage](#example-usage)
@@ -128,6 +130,97 @@ git submodule sync && git submodule update --init --recursive
 - Triton (for Triton benchmarks)
 - ROCm/HIP (for HIP benchmarks)
 - CUDA-capable GPU (AMD GPU recommended for HIP benchmarks)
+
+### How to Benchmark
+
+#### Running FlashAttention Tests
+
+FlashAttention tests can be run in two ways: correctness tests and performance benchmarks.
+
+##### Correctness Tests
+
+Run the FlashAttention correctness tests to verify the implementation:
+
+```bash
+# Run basic FlashAttention output tests
+cd op_tests
+python test_mha.py --batch_size 4 --nheads 6 --seqlen_q 1024 --seqlen_k 1024 --dtype fp16
+
+# Run with specific parameters
+python test_mha.py \
+    --batch_size 4 \
+    --nheads 32 \
+    --seqlen_q 2048 \
+    --seqlen_k 2048 \
+    --d_qk_v 128 128 \
+    --dtype bf16 \
+    --causal True \
+    --mha_type mha
+```
+
+##### Performance Benchmarks
+
+Run FlashAttention performance benchmarks:
+
+```bash
+# Navigate to benchmarks directory
+cd op_tests/op_benchmarks/triton
+
+# Run FlashAttention benchmark with default model configurations
+python bench_mha.py --model llama3-70b
+
+# Run with custom parameters
+python bench_mha.py \
+    --b 4 \
+    --hq 32 \
+    --hk 32 \
+    --sq 2048 \
+    --sk 2048 \
+    --d 128 \
+    --dtype fp16 \
+    --metric throughput \
+    --mode fwd
+
+# Run with FP8 precision
+python bench_mha.py --fp8 --b 4 --hq 32 --hk 32 --sq 2048 --sk 2048 --d 128
+
+# Run backward pass benchmark
+python bench_mha.py --mode bwd --b 4 --hq 32 --hk 32 --sq 2048 --sk 2048 --d 128
+
+# Run with model-specific configurations
+python bench_mha.py --model llama3-70b --b 1 --sq 4096 --metric throughput
+
+# Test correctness against PyTorch SDPA
+python bench_mha.py --test_mode --b 4 --hq 32 --hk 32 --sq 1024 --sk 1024 --d 128
+```
+
+**Common FlashAttention Benchmark Arguments:**
+
+- `--b`: Batch size
+- `--hq`: Number of query heads
+- `--hk`: Number of key/value heads
+- `--sq`: Query sequence length
+- `--sk`: Key sequence length
+- `--d`: Head dimension (Q and K)
+- `--dv`: Value head dimension (optional)
+- `--dtype`: Data type (`fp16`, `bf16`, `fp8`)
+- `--mode`: Kernel mode (`fwd` for forward, `bwd` for backward)
+- `--metric`: Performance metric (`throughput`, `time`, `bandwidth`)
+- `--causal`: Enable causal attention mask
+- `--fp8`: Use FP8 precision
+- `--model`: Model name (uses model configs from `utils/model_configs.json`)
+- `--test_mode`: Run correctness tests comparing to PyTorch SDPA
+- `-o`: Save results to CSV file
+
+##### KV Cache Tests
+
+Run FlashAttention with KV cache tests:
+
+```bash
+# Run KV cache correctness tests
+cd op_tests/triton_tests/attention
+pytest test_flash_attn_kvcache.py -v
+```
 
 ### Running Individual Benchmarks
 
