@@ -241,8 +241,8 @@ def ref_paged_attn(
     "q_dtype, kv_dtype, o_dtype",
     [
         # (torch.bfloat16, torch.bfloat16, torch.bfloat16),
-        # (torch.bfloat16, e4m3_dtype, torch.bfloat16),
-        (e4m3_dtype, e4m3_dtype, torch.bfloat16),
+        (torch.bfloat16, e4m3_dtype, torch.bfloat16),
+        # (e4m3_dtype, e4m3_dtype, torch.bfloat16),
     ],
 )
 @pytest.mark.parametrize("soft_cap", [None])
@@ -255,7 +255,7 @@ def ref_paged_attn(
         # ("triton", False, 1, False),  # use triton
         # ("gluon", False, 1, False),  # use gluon baseline
         # ("gluon", False, 1, True),  # use gluon simple async_copy
-        # ("gluon", True, 1, False),  # use gluon TDM async_copy
+        ("gluon", True, 1, False),  # use gluon TDM async_copy
         # ("gluon", True, 4, False),  # use gluon TDM gather pipelined
         # ("gluon", True, 8, False),  # use gluon TDM gather pipelined
     ],
