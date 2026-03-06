@@ -144,9 +144,14 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
             const int32_t num_qo_tiles = get_num_qo_tiles(curr_batch);
             const int32_t qo_tile_size =
                 ck_tile::integer_divide_ceil(qo_state.get_seqlen(curr_batch), num_qo_tiles);//o_tile_size 表示每个 QO tile 内的 query token 数，不是 tile size
+            // printf("qo_tile_size: %d, num_qo_tiles: %d\n", qo_tile_size, num_qo_tiles);
             const int32_t num_kv_blocks = integer_divide_ceil_power2(
                 curr_kv_seqlen, params.kv_granularity, params.kv_granularity_log2);
             const int32_t remain_kv_blocks = num_kv_blocks - curr_kv_block;
+            int qo_start =
+            qo_state.get_begin(curr_batch) + curr_qo_tile_idx * qo_tile_size;
+            int qo_end = ck_tile::min(qo_start + qo_tile_size,
+                                        qo_state.get_end(curr_batch));
 
             // If current cu part is able to handle this batch of seqences
             if(remain_payload >= (remain_kv_blocks + params.fixed_over_head_num_blocks))
@@ -179,6 +184,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                         work_info.kv_end = ck_tile::min(
                             work_info.kv_start + (remain_kv_blocks * params.kv_granularity),
                             curr_kv_end - batch_tail);
+                        work_info.kv_end = ck_tile::min(work_info.kv_end, curr_kv_end);
                         work_info.kv_offset = curr_kv_end - work_info.kv_end;
                     }
                     else
@@ -312,6 +318,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                             work_info.kv_end = ck_tile::min(
                                 work_info.kv_start + (consuming_blks * params.kv_granularity),
                                 curr_kv_end - batch_tail);
+                            work_info.kv_end = ck_tile::min(work_info.kv_end, curr_kv_end);
                             work_info.kv_offset = curr_kv_end - work_info.kv_end;
                         }
                         else
@@ -428,8 +435,8 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         (kv_dtype == at::ScalarType::Float8_e4m3fnuz || kv_dtype == at::ScalarType::Float8_e4m3fn);
 
     const bool natively_supported =
-        (num_heads == 16) || ((num_heads == 32) && q_is_fp8 && kv_is_fp8 && (max_seqlen_qo == 4)) ||
-        ((num_heads == 128) && q_is_fp8 && kv_is_fp8);
+        (num_heads == 16) || ((num_heads == 32) && q_is_fp8 && kv_is_fp8 && (max_seqlen_qo == 4));
+        // ((num_heads == 128) && q_is_fp8 && kv_is_fp8);
 
     if((natively_supported == false) && (num_heads % 16 == 0))
     {
@@ -459,7 +466,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     params.p_seqlens_kv_indptr          = seqlens_kv_indptr.data_ptr<int32_t>();
     params.p_kv_last_page_lens          = kv_last_page_lens.data_ptr<int32_t>();
     params.num_batches                  = num_batches;
-    params.num_heads                    = num_heads_k * num_heads_per_head_k;
+    params.num_heads                    = num_heads;
     params.num_cu                       = num_clusters;
     params.num_splits                   = num_splits;
     params.reduce_indptr_size           = reduce_indptr.size(0);
@@ -492,7 +499,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
 
     if(ori_num_heads == 128)
     {
-        launch(std::integral_constant<int32_t, 64>{});
+        launch(std::integral_constant<int32_t, 128>{});
     }
     else
     {

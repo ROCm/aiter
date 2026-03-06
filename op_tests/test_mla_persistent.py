@@ -389,7 +389,7 @@ def torch_mla_extend_split_kv(
     q_ratio = 1
     if (
         nheads == 16
-        or (nheads == 128 and is_fp8_q and is_fp8_kvc)
+        # or (nheads == 128 and is_fp8_q and is_fp8_kvc)
         or (
             # get_gfx() == "gfx950"
             # nheads == 32
@@ -420,9 +420,9 @@ def torch_mla_extend_split_kv(
         kv_start = row[4].item()
         kv_end = row[5].item()
         kv_offset = row[6].item()
-        print(
-            f"batch_idx: {batch_idx}, partial_qo_loc: {partial_qo_loc}, qo_start: {qo_start}, qo_end: {qo_end}, kv_start: {kv_start}, kv_end: {kv_end}, kv_offset: {kv_offset}"
-        )
+        # print(
+        #     f"batch_idx: {batch_idx}, partial_qo_loc: {partial_qo_loc}, qo_start: {qo_start}, qo_end: {qo_end}, kv_start: {kv_start}, kv_end: {kv_end}, kv_offset: {kv_offset}"
+        # )
         cur_num_page = kvs[batch_idx].shape[0]
         cur_real_kv_seq_len = (
             cur_num_page - 1
@@ -431,10 +431,10 @@ def torch_mla_extend_split_kv(
             kv_indptr.tolist()[batch_idx] * page_size + cur_real_kv_seq_len
         )
         # slice_k = kvs[batch_idx].flatten(0, 1)[(kv_start * page_size):(real_kv_seq_len - kv_offset)]
-        print(
-            f"slice_k start: {kv_start * page_size}, end: {real_sum_kv_seq_len - kv_offset}"
-        )
-        print(f"slice_q start: {qo_start}, end: {qo_end}")
+        # print(
+        #     f"slice_k start: {kv_start * page_size}, end: {real_sum_kv_seq_len - kv_offset}"
+        # )
+        # print(f"slice_q start: {qo_start}, end: {qo_end}")
 
         slice_k = kvc.flatten(0, 1)[
             kv_start * page_size : real_sum_kv_seq_len - kv_offset
@@ -442,9 +442,9 @@ def torch_mla_extend_split_kv(
         slice_q = q[qo_start:qo_end]
 
         v, _ = torch.split(slice_k, [kv_lora_rank, qk_rope_head_dim], dim=-1)
-        print(f"slice_k shape: {slice_k.shape}")
-        print(f"slice_q shape: {slice_q.shape}")
-        print(f"v shape: {v.shape}")
+        # print(f"slice_k shape: {slice_k.shape}")
+        # print(f"slice_q shape: {slice_q.shape}")
+        # print(f"v shape: {v.shape}")
         if partial_qo_loc != -1:
             out_dtype = torch.float32
         else:
@@ -1102,6 +1102,13 @@ def test_mla(
         return err, us_asm_decode
 
     def test_absorb_decode_fp8():
+        print(f"work_indptr: {work_indptr}")
+        print(f"work_info_set shape: {work_info_set.shape}")
+        num_works = work_indptr[-1].item()
+        for i in range(num_works):
+            print(
+                f"work_info_set[{i}, 0]: {work_info_set[i, 0]}, [{i}, 1]: {work_info_set[i, 1]}, [{i}, 2]: {work_info_set[i, 2]}, [{i}, 3]: {work_info_set[i, 3]}, [{i}, 4]: {work_info_set[i, 4]}, [{i}, 5]: {work_info_set[i, 5]}, [{i}, 6]: {work_info_set[i, 6]}"
+            )        
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
@@ -1197,11 +1204,19 @@ def test_mla(
             )
 
             checkAllclose(
+                out_ref,
+                split_out_ref,
+                msg=f"mla_decode-absorb_fp8    [golden out_ref vs split_out_ref]: {us_asm_decode:>8.2f} us......",
+            )
+            
+            checkAllclose(
                 split_out_ref,
                 out_asm,
                 msg=f"mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]: {us_asm_decode:>8.2f} us......",
             )
-
+            print(f"partial_out_ref shape: {partial_out_ref.shape}")
+            print(f"attn_logits shape: {attn_logits.shape}")
+            # import pdb; pdb.set_trace()
             checkAllclose(
                 partial_out_ref,
                 attn_logits[: partial_out_ref.shape[0]].view(-1, nhead, kv_lora_rank),

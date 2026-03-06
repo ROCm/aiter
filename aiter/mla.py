@@ -12,7 +12,7 @@ import triton.language as tl
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_cu_num
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 
 
 @triton.jit
@@ -285,11 +285,12 @@ def mla_decode_fwd(
             num_kv_splits = get_cu_num()
         if (
             nhead == 16
+            # or (
+            #     nhead == 128 and q.dtype == dtypes.fp8 and kv_buffer.dtype == dtypes.fp8
+            # )
             or (
-                nhead == 128 and q.dtype == dtypes.fp8 and kv_buffer.dtype == dtypes.fp8
-            )
-            or (
-                nhead == 32
+                get_gfx() == "gfx950"
+                and nhead == 32
                 and q.dtype == dtypes.fp8
                 and kv_buffer.dtype == dtypes.fp8
                 and max_seqlen_q == 4
