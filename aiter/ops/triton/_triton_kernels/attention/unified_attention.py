@@ -4,8 +4,44 @@ import triton
 import triton.language as tl
 import torch
 from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.ops.triton.utils.arch_info import get_num_sms, get_fp8_dtypes
+import os
 
+e5m2_type, e4m3_type = get_fp8_dtypes()
 float8_info = torch.finfo(e4m3_dtype)
+
+# Global cache for Hadamard matrices
+_hadamard_cache = {}
+
+
+def generate_hadamard_matrix(n, device='cuda'):
+    """
+    Generate a Hadamard matrix of size n x n.
+    Uses Sylvester's construction method.
+    n must be a power of 2.
+    """
+    if n in _hadamard_cache and _hadamard_cache[n].device == torch.device(device):
+        return _hadamard_cache[n]
+    
+    if n & (n - 1) != 0:
+        raise ValueError(f"Hadamard matrix size must be a power of 2, got {n}")
+    
+    # Start with H1 = [[1]]
+    H = torch.tensor([[1.0]], dtype=torch.float32, device=device)
+    
+    # Build up using Sylvester construction: H_2n = [[H_n, H_n], [H_n, -H_n]]
+    while H.shape[0] < n:
+        H = torch.cat([
+            torch.cat([H, H], dim=1),
+            torch.cat([H, -H], dim=1)
+        ], dim=0)
+    
+    # Normalize by 1/sqrt(n) to make it orthogonal
+    H = H / (n ** 0.5)
+    
+    # Cache it
+    _hadamard_cache[n] = H
+    return H
 
 
 @triton.jit
@@ -48,6 +84,144 @@ def find_seq_idx(
             right = mid
 
     return left - 1
+
+
+@triton.jit
+def _get_max_quant_val(dtype: tl.constexpr):
+    if dtype == tl.uint8:
+        return 6.0
+    elif dtype == tl.float8e5:
+        return 57344.0
+    elif dtype == tl.float8e4nv:
+        return 448.0
+    else:
+        tl.static_assert(False, f"Invalid {dtype=}")
+
+
+@triton.jit
+def _get_max_quant_exp(dtype: tl.constexpr):
+    if dtype == tl.uint8:
+        return 2
+    else:
+        tl.static_assert(False, f"Invalid {dtype=}")
+
+
+@triton.jit
+def _compute_quant_and_scale(src_tensor, valid_src_mask, mx_tensor_dtype: tl.constexpr,
+                             DEQUANT_SCALE_ROUNDING_MODE: tl.constexpr = 0, pack_order: tl.constexpr = 1):
+    is_fp8: tl.constexpr = mx_tensor_dtype == tl.float8e4nv or mx_tensor_dtype == tl.float8e5
+    BLOCK_SIZE_OUT_DIM: tl.constexpr = src_tensor.shape[0]
+    BLOCK_SIZE_QUANT_DIM: tl.constexpr = src_tensor.shape[1]
+    BLOCK_SIZE_QUANT_MX_SCALE: tl.constexpr = src_tensor.shape[1] // 32
+
+    # Explicit cast to fp32 since most ops are not supported on bfloat16
+    f32_tensor = src_tensor.to(tl.float32)
+    abs_tensor = tl.abs(f32_tensor)
+    abs_tensor = tl.where(valid_src_mask, abs_tensor, -1.0)  # Don't consider padding tensors in scale computation
+    abs_tensor = tl.reshape(abs_tensor, [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE, 32])
+    max_val = tl.max(abs_tensor, axis=2, keep_dims=True)
+    
+    if DEQUANT_SCALE_ROUNDING_MODE == 0:
+        # DequantScaleRoundingMode.ROUND_UP
+        dequant_scale = max_val / _get_max_quant_val(mx_tensor_dtype)
+        dequant_scale_exponent = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
+    elif DEQUANT_SCALE_ROUNDING_MODE == 1:
+        # DequantScaleRoundingMode.ROUND_DOWN
+        dequant_scale = max_val / _get_max_quant_val(mx_tensor_dtype)
+        dequant_scale_exponent = dequant_scale.to(tl.uint32, bitcast=True) & 0x7F800000
+    else:
+        # DequantScaleRoundingMode.EVEN
+        assert DEQUANT_SCALE_ROUNDING_MODE == 2
+        max_val = max_val.to(tl.int32, bitcast=True)
+        max_val = (max_val + 0x200000).to(tl.uint32, bitcast=True) & 0x7F800000
+        max_val = max_val.to(tl.float32, bitcast=True)
+        scale_e8m0_unbiased = tl.log2(max_val).floor() - _get_max_quant_exp(mx_tensor_dtype)
+        scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
+        dequant_scale_rounded = tl.exp2(scale_e8m0_unbiased)
+        dequant_scale_exponent = dequant_scale_rounded.to(tl.uint32, bitcast=True)
+
+    dequant_scale_rounded = dequant_scale_exponent.to(tl.float32, bitcast=True)
+    quant_scale = tl.where(dequant_scale_rounded == 0, 0, 1.0 / dequant_scale_rounded)
+
+    f32_tensor = tl.reshape(f32_tensor, [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE, 32])
+    quant_tensor = f32_tensor * quant_scale
+
+    # Reshape the tensors after scaling
+    quant_tensor = quant_tensor.reshape([BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_DIM])
+    quant_tensor = tl.where(valid_src_mask, quant_tensor, 0)
+    dequant_scale_exponent = dequant_scale_exponent.reshape([BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_MX_SCALE])
+
+    # Extract the exponent part of the scales
+    dequant_scale_exponent = (dequant_scale_exponent >> 23).to(tl.uint8)
+    
+    # Convert to mx format
+    if is_fp8:
+        out_tensor = quant_tensor.to(mx_tensor_dtype)
+    else:
+        quant_tensor = quant_tensor.to(tl.uint32, bitcast=True)
+        signs = quant_tensor & 0x80000000
+        exponents = (quant_tensor >> 23) & 0xFF
+        mantissas = (quant_tensor & 0x7FFFFF)
+
+        E8_BIAS = 127
+        E2_BIAS = 1
+        adjusted_exponents = tl.core.sub(E8_BIAS, exponents + 1, sanitize_overflow=False)
+        mantissas = tl.where(exponents < E8_BIAS, (0x400000 | (mantissas >> 1)) >> adjusted_exponents, mantissas)
+
+        exponents = tl.maximum(exponents, E8_BIAS - E2_BIAS) - (E8_BIAS - E2_BIAS)
+
+        e2m1_tmp = tl.minimum((((exponents << 2) | (mantissas >> 21)) + 1) >> 1, 0x7)
+        e2m1_value = ((signs >> 28) | e2m1_tmp).to(tl.uint8)
+
+        e2m1_value = tl.reshape(e2m1_value, [BLOCK_SIZE_OUT_DIM, BLOCK_SIZE_QUANT_DIM // 2, 2])
+        evens, odds = tl.split(e2m1_value)
+        out_tensor = evens | (odds << 4) if (pack_order==0) else odds | (evens<< 4)
+
+    return out_tensor, dequant_scale_exponent
+
+
+@triton.jit
+def _can_use_mxfp4(TILE_SIZE: tl.constexpr, HEAD_SIZE_PADDED: tl.constexpr) -> tl.constexpr:
+    """Check if MXFP4 can be used with current TILE_SIZE and HEAD_SIZE_PADDED"""
+    # MXFP4 requires HEAD_SIZE_PADDED to be divisible by 32 (for scale computation)
+    # and TILE_SIZE should be reasonable for dot_scaled operations
+    return (HEAD_SIZE_PADDED >= 32 and HEAD_SIZE_PADDED % 32 == 0)
+
+
+@triton.jit
+def _apply_hadamard_rotation(
+    tensor,
+    hadamard_ptr,
+    HADAMARD_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+):
+    """
+    Apply Hadamard rotation to a tensor.
+    tensor: (M, HEAD_SIZE_PADDED)
+    hadamard_ptr: pointer to Hadamard matrix (HEAD_SIZE_PADDED, HEAD_SIZE_PADDED)
+    Returns: rotated tensor (M, HEAD_SIZE_PADDED)
+    """
+    M: tl.constexpr = tensor.shape[0]
+    
+    # Load Hadamard matrix for the head dimension
+    offs_d1 = tl.arange(0, HEAD_SIZE_PADDED)
+    offs_d2 = tl.arange(0, HEAD_SIZE_PADDED)
+    
+    # For efficiency, we'll apply rotation in chunks if needed
+    # For now, assuming HEAD_SIZE_PADDED <= HADAMARD_SIZE
+    if HEAD_SIZE_PADDED > HADAMARD_SIZE:
+        # If head size is larger than Hadamard size, apply block-wise
+        # This is a fallback - ideally HADAMARD_SIZE should be >= HEAD_SIZE_PADDED
+        return tensor
+    
+    # Load Hadamard matrix: H[HEAD_SIZE_PADDED, HEAD_SIZE_PADDED]
+    H_offset = offs_d1[:, None] * HEAD_SIZE_PADDED + offs_d2[None, :]
+    H = tl.load(hadamard_ptr + H_offset)
+    
+    # Apply rotation: result = tensor @ H
+    rotated = tl.dot(tensor, H)
+    
+    return rotated
 
 
 @triton.jit
@@ -99,6 +273,14 @@ def kernel_unified_attention_2d(
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
     ALL_DECODE: tl.constexpr = False,  # bool
+    use_native_fp4: tl.constexpr = 0,  # options: 0 Original; 1 - native fp4 QK; 2 - smoothed fp4 QK; >=3 - smoothed fp4 QK and PV
+    fp4_data_ptr = None,
+    fp4_scale_ptr = None,
+    test_id: tl.int64 = 0,
+    PACK_ALONG_K: tl.constexpr = True,
+    use_hadamard_rotation: tl.constexpr = False,  # bool: enable Hadamard rotation for MXFP4
+    hadamard_matrix_ptr = None,  # pointer to Hadamard matrix [HEAD_SIZE_PADDED, HEAD_SIZE_PADDED]
+    HADAMARD_SIZE: tl.constexpr = 32,  # int: size of Hadamard matrix (default 32x32)
 ):
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
@@ -154,6 +336,31 @@ def kernel_unified_attention_2d(
         other=0.0,
         cache_modifier=Q_cache_modifier,
     )
+
+    # >>>>>> Q-MXFP4 <<<<<<
+    # Check if MXFP4 can be used with current parameters
+    USE_MXFP4: tl.constexpr = use_native_fp4 > 0 and _can_use_mxfp4(TILE_SIZE, HEAD_SIZE_PADDED)
+    
+    if USE_MXFP4:
+        # Apply Hadamard rotation if enabled
+        if use_hadamard_rotation and hadamard_matrix_ptr is not None:
+            Q_rotated = _apply_hadamard_rotation(Q, hadamard_matrix_ptr, HADAMARD_SIZE, HEAD_SIZE_PADDED)
+        else:
+            Q_rotated = Q
+        
+        Q1 = tl.full(shape=Q_rotated.shape, value=1, dtype=tl.int32)
+        
+        if use_native_fp4 == 1:
+            q_fp4, scale_q = _compute_quant_and_scale(Q_rotated, Q1, tl.uint8, 2)
+        else:
+            # Smoothed version: subtract average
+            q_avg = tl.sum(Q_rotated, 1) / HEAD_SIZE_PADDED
+            q_avg = tl.reshape(q_avg, (BLOCK_M, 1))
+            ones = tl.full((1, HEAD_SIZE_PADDED), 1.0, dtype=tl.float32)
+            q_avg = tl.dot(q_avg, ones)
+            Qr = Q_rotated - q_avg
+            q_fp4, scale_q = _compute_quant_and_scale(Qr, Q1, tl.uint8, 2)
+    # >>>>>>> End of Q-MXFP4 <<<<<<<<
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -293,7 +500,40 @@ def kernel_unified_attention_2d(
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
-        S = qk_scale * tl.dot(Q, K)
+        
+        # ****** QK-MXFP4 ******
+        if USE_MXFP4:
+            # Apply Hadamard rotation to K if enabled
+            if use_hadamard_rotation and hadamard_matrix_ptr is not None:
+                K_rotated = _apply_hadamard_rotation(K, hadamard_matrix_ptr, HADAMARD_SIZE, HEAD_SIZE_PADDED)
+            else:
+                K_rotated = K
+            
+            K1 = tl.full(shape=K_rotated.shape, value=1, dtype=tl.int32)
+            kt = tl.trans(K_rotated)
+            k1t = tl.trans(K1)
+            
+            if use_native_fp4 >= 2:
+                # Smoothed version: subtract average
+                k_avg = tl.sum(kt, 1) / HEAD_SIZE_PADDED
+                k_avg = tl.reshape(k_avg, (TILE_SIZE, 1))
+                ones = tl.full((1, HEAD_SIZE_PADDED), 1.0, dtype=tl.float32)
+                k_avg = tl.dot(k_avg, ones)
+                kt -= k_avg
+                detS = tl.dot(q_avg, tl.trans(kt))
+            
+            k_fp4, scale_k_fp4 = _compute_quant_and_scale(kt, k1t, tl.uint8, 2)
+            
+            # Use dot_scaled for MXFP4 computation
+            s_fp4 = tl.dot_scaled(q_fp4, scale_q, "e2m1", tl.trans(k_fp4), scale_k_fp4, "e2m1", 
+                                   lhs_k_pack=PACK_ALONG_K, rhs_k_pack=PACK_ALONG_K, out_dtype=tl.float32)
+            if use_native_fp4 >= 2:
+                S = qk_scale * (s_fp4 + detS)
+            else:
+                S = qk_scale * s_fp4
+        else:
+            S = qk_scale * tl.dot(Q, K)
+        # ****** End of QK-MXFP4 ******
 
         if USE_SOFTCAP:
             # softcap here uses exp2 and consumes RCP_LN2 conversion.
@@ -354,12 +594,46 @@ def kernel_unified_attention_2d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P.to(V.dtype), V)
+        # ****** MXFP4 PV ******
+        if USE_MXFP4 and use_native_fp4 >= 3:
+            # Apply Hadamard rotation to V if enabled
+            if use_hadamard_rotation and hadamard_matrix_ptr is not None:
+                V_rotated = _apply_hadamard_rotation(V, hadamard_matrix_ptr, HADAMARD_SIZE, HEAD_SIZE_PADDED)
+            else:
+                V_rotated = V
+            
+            # PV quant to fp4 - note: this can increase error significantly
+            p_zoom_scale: tl.constexpr = 200.0
+            P1 = tl.full(shape=P.shape, value=1, dtype=tl.int32)
+            Pz = P * p_zoom_scale
+            p_fp4, scale_p = _compute_quant_and_scale(Pz, P1, tl.uint8, 2)
+            
+            Vt = tl.trans(V_rotated)
+            V1 = tl.full(shape=Vt.shape, value=1, dtype=tl.int32)
+            v_fp4, scale_v = _compute_quant_and_scale(Vt, V1, tl.uint8, 2)
+            
+            v_fp4_t = tl.trans(v_fp4)
+            scale_v_t = tl.trans(scale_v)
+            
+            acc_fp4 = tl.dot_scaled(p_fp4, scale_p, "e2m1", v_fp4_t, scale_v, "e2m1", 
+                                     acc * p_zoom_scale, lhs_k_pack=PACK_ALONG_K,
+                                     rhs_k_pack=PACK_ALONG_K, out_dtype=tl.float32) / p_zoom_scale
+            acc = acc_fp4
+        else:
+            acc += tl.dot(P.to(V.dtype), V)
+        # ****** End of MXFP4 PV ******
 
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
     one_over_L = 1.0 / L[:, None]
     acc = acc * one_over_L
+    
+    # Apply inverse Hadamard rotation if enabled (only needed for PV quantization)
+    if USE_MXFP4 and use_native_fp4 >= 3 and use_hadamard_rotation and hadamard_matrix_ptr is not None:
+        # For orthogonal Hadamard matrices, inverse = transpose
+        # Since our Hadamard matrix is symmetric, H^-1 = H
+        acc = _apply_hadamard_rotation(acc, hadamard_matrix_ptr, HADAMARD_SIZE, HEAD_SIZE_PADDED)
+    
     if USE_FP8:
         acc = acc * tl.load(out_scale)
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
@@ -732,7 +1006,8 @@ def reduce_segments(
     segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
         [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32
     )
-
+    
+    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
     if HEAD_SIZE_PADDED != HEAD_SIZE:
         dim_mask = offs_d < HEAD_SIZE
     else:
