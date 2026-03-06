@@ -61,7 +61,7 @@ jobs:
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
             env_vars: ""
             runner: aiter-8gpu-runner
-            run_on_pr: false
+            run_on_pr: true
           - model_name: "gpt-oss-120b"
             label: MI355
             model_path: "openai/gpt-oss-120b"

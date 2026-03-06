@@ -2,7 +2,7 @@ name: PR Welcome Comment
 
 on:
   pull_request:
-    types: [opened]
+    types: [opened, reopened]
 
 jobs:
   comment:
