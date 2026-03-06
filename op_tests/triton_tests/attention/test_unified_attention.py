@@ -58,16 +58,33 @@ def shuffle_kv_cache(
     key_cache_shuffled = key_cache.view(
         -1, block_size, num_kv_heads, head_size
     ).permute(0, 2, 1, 3)
-    key_cache_shuffled = key_cache_shuffled.view(
-        -1,
-        num_kv_heads,
-        block_size // num_lanes,
-        num_lanes,
-        head_size // (2 * num_elements_per_thread),
-        2,  # there are 2 groups of threads, t0 ~ t15 and t16 ~ t31
-        num_elements_per_thread,
-    )
-    key_cache_shuffled = key_cache_shuffled.permute(0, 1, 2, 4, 5, 3, 6).contiguous()
+    if IS_DEVICE_ARCH_GFX12 and dtype == e4m3_dtype:
+        key_cache_shuffled = key_cache_shuffled.view(
+            -1,
+            num_kv_heads,
+            block_size // num_lanes,
+            num_lanes,
+            head_size // (4 * num_elements_per_thread),
+            2,
+            2,
+            num_elements_per_thread,
+        )
+        key_cache_shuffled = key_cache_shuffled.permute(
+            0, 1, 2, 4, 6, 5, 3, 7
+        ).contiguous()
+    else:
+        key_cache_shuffled = key_cache_shuffled.view(
+            -1,
+            num_kv_heads,
+            block_size // num_lanes,
+            num_lanes,
+            head_size // (2 * num_elements_per_thread),
+            2,  # there are 2 groups of threads, t0 ~ t15 and t16 ~ t31
+            num_elements_per_thread,
+        )
+        key_cache_shuffled = key_cache_shuffled.permute(
+            0, 1, 2, 4, 5, 3, 6
+        ).contiguous()
     key_cache_shuffled = key_cache_shuffled.view(
         -1, num_kv_heads, block_size // 16, head_size * 16
     )
@@ -75,6 +92,19 @@ def shuffle_kv_cache(
     value_cache_shuffled = value_cache.view(
         -1, block_size, num_kv_heads, head_size
     ).permute(0, 2, 1, 3)
+    # if IS_DEVICE_ARCH_GFX12 and dtype == e4m3_dtype:
+    #     value_cache_shuffled = value_cache_shuffled.view(
+    #         -1,
+    #         num_kv_heads,
+    #         block_size // num_lanes,
+    #         num_lanes,
+    #         head_size // (4 * num_elements_per_thread),
+    #         2,
+    #         2,
+    #         num_elements_per_thread,
+    #     )
+    #     value_cache_shuffled = value_cache_shuffled.permute(0, 1, 2, 4, 6, 5, 3, 7).contiguous()
+    # else:
     value_cache_shuffled = value_cache_shuffled.view(
         -1,
         num_kv_heads,

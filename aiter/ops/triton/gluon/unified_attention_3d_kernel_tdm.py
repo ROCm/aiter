@@ -926,6 +926,24 @@ class AttentionProgram:
 
     @gluon.jit
     def lds_unshuffle_k(self, buffer_id):
+        # if self.cfg.IS_KV_FP8:
+        #     return (
+        #         self.k_shared.index(buffer_id)
+        #         .reshape(
+        #             (
+        #                 self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
+        #                 self.cfg.BLOCK_SIZE // 16,
+        #                 self.cfg.HEAD_SIZE // 32,
+        #                 2, 2,
+        #                 16,
+        #                 8,
+        #             )
+        #         )
+        #         .permute((0, 1, 5, 2, 4, 3, 6))
+        #         .reshape((self.cfg.TILE_SIZE, self.cfg.HEAD_SIZE))
+        #         .permute((1, 0))
+        #     )
+        # else:
         return (
             self.k_shared.index(buffer_id)
             .reshape(
@@ -945,6 +963,32 @@ class AttentionProgram:
 
     @gluon.jit
     def lds_unshuffle_v(self, buffer_id):
+        # if self.cfg.IS_KV_FP8:
+        #     return (
+        #         self.v_shared.index(buffer_id)
+        #         .reshape(
+        #             (
+        #                 self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
+        #                 self.cfg.HEAD_SIZE // 16,
+        #                 self.cfg.BLOCK_SIZE // 32,
+        #                 2,
+        #                 16,
+        #                 16,
+        #             )
+        #         )
+        #         .permute((0, 1, 4, 2, 3, 5))
+        #         .reshape(
+        #             (
+        #                 self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
+        #                 self.cfg.HEAD_SIZE,
+        #                 self.cfg.BLOCK_SIZE,
+        #             )
+        #         )
+        #         .permute((1, 0, 2))
+        #         .reshape((self.cfg.HEAD_SIZE, self.cfg.TILE_SIZE))
+        #         .permute((1, 0))
+        #     )
+        # else:
         return (
             self.v_shared.index(buffer_id)
             .reshape(
