@@ -62,6 +62,30 @@ def ref_masked_attention(
     return out.to(dtype)
 
 
+def ref_masked_attention_with_lse(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scale: float,
+    dtype,
+    is_causal=True,
+):
+    attn_logits = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
+    if is_causal:
+        s_q = query.shape[0]
+        s_k = key.shape[0]
+        attn_bias = torch.zeros(s_q, s_k, dtype=query.dtype)
+        temp_mask = torch.ones(s_q, s_k, dtype=torch.bool).tril(diagonal=s_k - s_q)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+        attn_bias.to(query.dtype)
+        attn_logits += attn_bias
+
+    lse = torch.logsumexp(attn_logits, dim=-1).transpose(0, 1).contiguous()
+    attn_weights = torch.softmax(attn_logits, dim=-1)
+    out = torch.einsum("hqk,khd->qhd", attn_weights.float(), value.float())
+    return out.to(dtype), lse
+
+
 def torch_mha_extend(
     q,  # [total_q, nheads, headdim_q]
     k,  # [num_page * page_size, nhead_kv, qk_head_dim]
@@ -99,6 +123,7 @@ def torch_mla_extend(
     qk_rope_head_dim,
     dtype,
     is_causal=True,
+    return_lse=False,
 ):
     qs = torch.tensor_split(q, qo_indptr.tolist()[1:])
     kvc = torch.index_select(kvc_cache, 0, kv_indices)
@@ -106,14 +131,23 @@ def torch_mla_extend(
     bs = qo_indptr.shape[0] - 1
 
     os = []
+    lses = []
     for i in range(bs):
         kvc = kvs[i]
         q = qs[i]
         k = kvc
         v, _ = torch.split(kvc, [kv_lora_rank, qk_rope_head_dim], dim=-1)
-        o = ref_masked_attention(q, k, v, sm_scale, dtype, is_causal=is_causal)
+        if return_lse:
+            o, lse = ref_masked_attention_with_lse(
+                q, k, v, sm_scale, dtype, is_causal=is_causal
+            )
+            lses.append(lse)
+        else:
+            o = ref_masked_attention(q, k, v, sm_scale, dtype, is_causal=is_causal)
         os.append(o)
     o = torch.concat(os)
+    if return_lse:
+        return o, torch.concat(lses)
     return o
 
 
@@ -324,7 +358,7 @@ def test_mla(
     q = torch.randn((total_q, nhead, qk_head_dim), dtype=torch.bfloat16)
 
     # troch implementation
-    out_ref = torch_mla_extend(
+    out_ref, lse_ref = torch_mla_extend(
         q,
         kv_buffer,
         qo_indptr,
@@ -335,7 +369,18 @@ def test_mla(
         qk_rope_head_dim,
         is_causal=True,
         dtype=out_dtype,
+        return_lse=True,
     )
+
+    def normalize_decode_lse(lse_tensor: torch.Tensor) -> torch.Tensor:
+        if lse_tensor.ndim == 4:
+            lse_tensor = lse_tensor.squeeze(-1)
+            if lse_tensor.shape[1] == 1:
+                return lse_tensor[:, 0, :]
+            return torch.logsumexp(lse_tensor, dim=1)
+        if lse_tensor.ndim == 2:
+            return lse_tensor
+        raise ValueError(f"Unexpected LSE shape: {tuple(lse_tensor.shape)}")
 
     # Triton implementation
     # if decode_qlen == 1:
@@ -392,21 +437,25 @@ def test_mla(
 
         # print(f"{out_ref.view(total_q, -1)=}")
         # print(f"{out_asm.view(total_q, -1)=}")
-        # checkAllclose(logits_ref, attn_logits,
-        #               msg=f'attn_logits [golden vs aiter_asm]')
-        # checkAllclose(lse_ref, attn_lse,
-        #               msg=f'attn_lse    [golden vs aiter_asm]')
+        lse_asm = normalize_decode_lse(attn_lse)
+        lse_err = checkAllclose(
+            lse_ref,
+            lse_asm,
+            rtol=2e-2,
+            atol=2e-2,
+            msg=f"mla_decode-lse    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+        )
         err = checkAllclose(
             out_ref,
             out_asm,
             msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
-        return err, us_asm_decode
+        return err, lse_err, us_asm_decode
 
     def test_absorb_decode_fp8():
         if dtype != dtypes.fp8 and nhead == 128:
             aiter.logger.info("don't support this case:\n")
-            return None, 1e12
+            return None, None, 1e12
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
@@ -416,7 +465,7 @@ def test_mla(
             q_scale = torch.ones([1], dtype=torch.float, device="cuda")
         else:
             aiter.logger.info("don't support this case.")
-            return None, 1e12
+            return None, None, 1e12
 
         kv_buffer_fp8 = kv_buffer.to(kvtype)
         kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
@@ -441,9 +490,14 @@ def test_mla(
 
         # print(f"{out_ref.view(total_q, -1)=}")
         # print(f"{out_asm.view(total_q, -1)=}")
-        # checkAllclose(logits_ref, attn_logits,
-        #               msg=f'attn_logits [golden vs aiter_asm]')
-        # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
+        lse_asm = normalize_decode_lse(attn_lse)
+        lse_err = checkAllclose(
+            lse_ref,
+            lse_asm,
+            rtol=3e-1,
+            atol=3e-1,
+            msg=f"mla_decode-lse_fp8 [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+        )
         err = checkAllclose(
             out_ref,
             out_asm,
@@ -451,9 +505,10 @@ def test_mla(
         )
 
         cal_diff(out_ref, out_asm, "out", True)
-        return err, us_asm_decode
+        return err, lse_err, us_asm_decode
 
     err = None
+    lse_err = None
     us_asm_decode = 1e12
     if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
         16,
@@ -461,11 +516,12 @@ def test_mla(
         64,
         128,
     ]:
-        err, us_asm_decode = test_absorb_decode_bf16()
+        err, lse_err, us_asm_decode = test_absorb_decode_bf16()
     elif kvtype == dtypes.fp8 and nhead in [16, 128]:
-        err, us_asm_decode = test_absorb_decode_fp8()
+        err, lse_err, us_asm_decode = test_absorb_decode_fp8()
 
     ret["decode:err"] = err
+    ret["decode:lse_err"] = lse_err
     ret["decode:asm_576"] = us_asm_decode
 
     flops = decode_qlen * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
@@ -571,10 +627,10 @@ parser.add_argument(
     "-n",
     "--nhead",
     type=dtypes.str2tuple,
-    choices=[(16, 1), (16, 2), (16, 4), (128, 1), (128, 2)],
+    choices=[(16, 1), (16, 2), (16, 4), (128, 1), (128, 2), (128, 4)],
     nargs="*",
     const=None,
-    default=[(16, 1), (16, 2), (16, 4), (128, 1), (128, 2)],
+    default=[(16, 1), (16, 2), (16, 4), (128, 1), (128, 2), (128, 4)],
     help="""Number of nhead and decode_qlen.
     e.g.: -n 16,1""",
 )

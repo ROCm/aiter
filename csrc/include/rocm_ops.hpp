@@ -63,6 +63,7 @@ namespace py = pybind11;
           py::arg("splitData"),                \
           py::arg("splitLse"),                 \
           py::arg("output"),                   \
+          py::arg("lse"),                      \
           py::arg("q_scale")  = std::nullopt,  \
           py::arg("kv_scale") = std::nullopt); \
     m.def("mla_prefill_asm_fwd",               \
