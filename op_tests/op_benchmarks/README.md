@@ -138,86 +138,34 @@ AITER is compatible with Triton for AMD GPU (HIP) backend support. The recommend
 
 - **Minimum Recommended**: Triton >= 3.2.0
 - **Tested/Recommended Commit**: `756afc06` (used in CI builds)
+  - To find the current recommended commit, check `.github/scripts/build_aiter_triton.sh` where `TRITON_COMMIT` is defined
 - **Some features require**: Triton >= 3.6.0 (for certain advanced features)
 
-**Installing Triton with the Recommended Commit:**
+**Installing Triton for AITER:**
 
-Follow these steps to install Triton from source using the known-good commit:
+Install Triton from source using the recommended commit:
 
-**Step 1: Uninstall any existing Triton installation**
 ```bash
 pip uninstall -y triton || true
-```
-
-**Step 2: Clone the Triton repository**
-```bash
 git clone https://github.com/triton-lang/triton.git
 cd triton
-```
-
-**Step 3: Checkout the recommended commit**
-```bash
-# Checkout the known-good commit for AITER
-git checkout 756afc06
-```
-
-**Step 4: Install Triton dependencies**
-```bash
-# Install Python dependencies
+git checkout 756afc06  # Known-good commit for AITER
 pip install -r python/requirements.txt
-
-# Install additional required packages
 pip install filecheck networkx
-```
-
-**Step 5: Build and install Triton**
-```bash
-# Build Triton (adjust MAX_JOBS based on your system)
 MAX_JOBS=64 pip install .
-```
-
-**Step 6: Verify installation**
-```bash
-# Return to your working directory
 cd ..
-
-# Verify Triton is installed correctly
-python -c "import triton; print(f'Triton version: {triton.__version__}')"
 ```
 
-**Alternative: Using AITER Build Script**
+**Using AITER Build Script:**
 
-Alternatively, you can use the AITER build script which automatically handles Triton installation:
+Alternatively, use the AITER build script which automatically handles Triton installation:
 
 ```bash
-# Set environment variable to enable Triton build (default is enabled)
+# Uses default commit 756afc06
 BUILD_TRITON=1 bash .github/scripts/build_aiter_triton.sh
 
 # Or specify a custom Triton commit
 TRITON_COMMIT=756afc06 BUILD_TRITON=1 bash .github/scripts/build_aiter_triton.sh
-```
-
-**Using a Different Triton Commit:**
-
-If you need to use a different Triton commit, you can set the `TRITON_COMMIT` environment variable:
-
-```bash
-# Uninstall existing Triton
-pip uninstall -y triton || true
-
-# Clone Triton
-git clone https://github.com/triton-lang/triton.git
-cd triton
-
-# Checkout your desired commit
-TRITON_COMMIT=your_commit_hash
-git checkout $TRITON_COMMIT
-
-# Install dependencies and build
-pip install -r python/requirements.txt
-pip install filecheck networkx
-MAX_JOBS=64 pip install .
-cd ..
 ```
 
 **Note**: Some AITER features may require specific Triton versions:
