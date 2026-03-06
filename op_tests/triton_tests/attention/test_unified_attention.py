@@ -11,7 +11,7 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
 HEAD_SIZES = [128, 256]
-BLOCK_SIZES = [16, 64]
+BLOCK_SIZES = [16, 64, 100, 544]
 
 DTYPES = [torch.float16, torch.bfloat16]
 QDTYPES = [None, e4m3_dtype]
