@@ -1639,7 +1639,6 @@ def gluon_kernel_unified_attention_3d_tdm(
 
     j_from_hbm: gl.int32 = segm_idx * tiles_per_segment
     buffer_id: gl.int32 = 0
-    physical_block_idx: gl.int32 = 0
     seq_offset = j_from_hbm * cfg.TILE_SIZE + gl.arange(
         0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_LAYOUT)
     )

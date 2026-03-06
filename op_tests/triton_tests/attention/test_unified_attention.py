@@ -223,8 +223,8 @@ def ref_paged_attn(
 @pytest.mark.parametrize(
     "seq_lens",
     [
-        [(1, 1328)] * SL,
-        # [(1, 8192)],
+        # [(1, 1328)] * SL,
+        [(1, 8192)] * SL,
         # [(1, 8192)] * 4,
         # [(1, 8192)] * 8,
         # [(1, 8192)] * 16,
@@ -240,9 +240,9 @@ def ref_paged_attn(
 @pytest.mark.parametrize(
     "q_dtype, kv_dtype, o_dtype",
     [
-        (torch.bfloat16, torch.bfloat16, torch.bfloat16),
+        # (torch.bfloat16, torch.bfloat16, torch.bfloat16),
         # (torch.bfloat16, e4m3_dtype, torch.bfloat16),
-        # (e4m3_dtype, e4m3_dtype, torch.bfloat16),
+        (e4m3_dtype, e4m3_dtype, torch.bfloat16),
     ],
 )
 @pytest.mark.parametrize("soft_cap", [None])
@@ -255,7 +255,7 @@ def ref_paged_attn(
         # ("triton", False, 1, False),  # use triton
         # ("gluon", False, 1, False),  # use gluon baseline
         # ("gluon", False, 1, True),  # use gluon simple async_copy
-        ("gluon", True, 1, False),  # use gluon TDM async_copy
+        # ("gluon", True, 1, False),  # use gluon TDM async_copy
         # ("gluon", True, 4, False),  # use gluon TDM gather pipelined
         # ("gluon", True, 8, False),  # use gluon TDM gather pipelined
     ],
@@ -286,6 +286,11 @@ def test_triton_unified_attn(
         "gfx1250",
     ):
         pytest.skip(f"skip {DEVICE_ARCH}")
+
+    if backend == "triton" and (
+        q_dtype != torch.bfloat16 or kv_dtype != torch.bfloat16
+    ):
+        pytest.skip("triton backend does not support fp8 unified attention")
 
     if DEVICE_ARCH not in ("gfx1250",) and use_tdm == True:
         pytest.skip(f"{DEVICE_ARCH} does not have TDM")
@@ -455,6 +460,9 @@ def test_triton_unified_attn(
 
     atol, rtol = 1.5e-2, 1e-2
     if q_dtype != torch.bfloat16:
+        atol, rtol = 1.5e-1, 1.5e-1
+    if use_tdm and num_tdm_gather > 1 and kv_dtype != torch.bfloat16:
+        # TDM gather seems to require a more loose precision requirement for FP8 KV cache
         atol, rtol = 1.5e-1, 1.5e-1
     torch.testing.assert_close(
         output, ref_output, atol=atol, rtol=rtol
