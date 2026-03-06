@@ -242,7 +242,7 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
 
     AiterAsmKernel* impl_ptr = nullptr;
     static std::mutex impl_ptr_mutex;
-    static thread_local std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>>
+    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>>
         impl_ptr_map;
 #define LOCK_IMPL_PTR_MAP   std::lock_guard<std::mutex> lock(impl_ptr_mutex)
 
