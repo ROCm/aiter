@@ -1039,9 +1039,10 @@ def paged_attention_decode_sliding_window_head_1(
             shape=[QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE],
         )
     else:
-        THREADS0: gl.constexpr = QUERY_SEQ_LEN_POW2
+        VGPRS0: gl.constexpr = QUERY_SEQ_LEN_POW2
+        THREADS0: gl.constexpr = QUERY_GROUP_SIZE_POW2 // (4 * VGPRS0)
         THREADS1: gl.constexpr = 64 // THREADS0
-        VGPRS0: gl.constexpr = QUERY_GROUP_SIZE_POW2 // (4 * THREADS0)
+
         qk_linear_layout: gl.constexpr = gl.BlockedLayout(
             size_per_thread=[VGPRS0, CONTEXT_PARTITION_SIZE // THREADS1],
             threads_per_warp=[THREADS0, THREADS1],
@@ -1789,26 +1790,26 @@ def paged_attention_decode_sliding_window_head_1(
         )
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config(
-#             {"waves_per_eu": wa}, maxnreg=512 // wa if wa > 0 else None, num_stages=1
-#         )
-#         for wa in range(5)
-#     ],
-#     key=[
-#         "KV_BLOCK_SIZE",
-#         "SLIDING_WINDOW",
-#         "KV_QUANT_MODE",
-#         "QUERY_QUANT_MODE",
-#         "ONE_QUERY_GROUP_SIZE_POW2",
-#         "QUERY_SEQ_LEN_POW2",
-#         "HEAD_SIZE_POW2",
-#         "COMPUTE_TYPE",
-#         "ONE_SHOT",
-#     ],
-#     cache_results=True,
-# )
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"waves_per_eu": wa}, maxnreg=512 // wa if wa > 0 else None, num_stages=1
+        )
+        for wa in range(5)
+    ],
+    key=[
+        "KV_BLOCK_SIZE",
+        "SLIDING_WINDOW",
+        "KV_QUANT_MODE",
+        "QUERY_QUANT_MODE",
+        "ONE_QUERY_GROUP_SIZE_POW2",
+        "QUERY_SEQ_LEN_POW2",
+        "HEAD_SIZE_POW2",
+        "COMPUTE_TYPE",
+        "ONE_SHOT",
+    ],
+    cache_results=True,
+)
 @gluon.jit
 def paged_attention_decode_sliding_window(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
@@ -2005,37 +2006,61 @@ def paged_attention_decode_sliding_window(
     )
 
     # Register allocation configuration based on group size and compute block size
-    if QUERY_GROUP_SIZE_POW2 == 16:
-        if CONTEXT_PARTITION_SIZE == 128:
-            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64))
-        elif CONTEXT_PARTITION_SIZE == 256:
-            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (0, 128))
-    elif QUERY_GROUP_SIZE_POW2 == 32:
-        if CONTEXT_PARTITION_SIZE == 128:
-            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (16, 0))
-        elif CONTEXT_PARTITION_SIZE == 256:
-            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (0, 128), (16, 0))
-    elif QUERY_GROUP_SIZE_POW2 == 64:
-        if CONTEXT_PARTITION_SIZE == 128:
-            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (16, 0), (32, 0))
-        elif CONTEXT_PARTITION_SIZE == 256:
-            register_bases: gl.constexpr = (
-                (0, 1),
-                (0, 2),
-                (0, 64),
-                (0, 128),
-                (16, 0),
-                (32, 0),
-            )
+    if QUERY_GROUP_SIZE_POW2 >= 16:
+        if QUERY_GROUP_SIZE_POW2 == 16:
+            if CONTEXT_PARTITION_SIZE == 128:
+                register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64))
+            elif CONTEXT_PARTITION_SIZE == 256:
+                register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (0, 128))
+        elif QUERY_GROUP_SIZE_POW2 == 32:
+            if CONTEXT_PARTITION_SIZE == 128:
+                register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (16, 0))
+            elif CONTEXT_PARTITION_SIZE == 256:
+                register_bases: gl.constexpr = (
+                    (0, 1),
+                    (0, 2),
+                    (0, 64),
+                    (0, 128),
+                    (16, 0),
+                )
+        elif QUERY_GROUP_SIZE_POW2 == 64:
+            if CONTEXT_PARTITION_SIZE == 128:
+                register_bases: gl.constexpr = (
+                    (0, 1),
+                    (0, 2),
+                    (0, 64),
+                    (16, 0),
+                    (32, 0),
+                )
+            elif CONTEXT_PARTITION_SIZE == 256:
+                register_bases: gl.constexpr = (
+                    (0, 1),
+                    (0, 2),
+                    (0, 64),
+                    (0, 128),
+                    (16, 0),
+                    (32, 0),
+                )
 
-    # Distributed layout for QK linear operations
-    qk_linear_layout: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=register_bases,
-        lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 4), (0, 8)),
-        warp_bases=((0, 16), (0, 32)),
-        block_bases=[],
-        shape=[QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE],
-    )
+        # Distributed layout for QK linear operations
+        qk_linear_layout: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=register_bases,
+            lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 4), (0, 8)),
+            warp_bases=((0, 16), (0, 32)),
+            block_bases=[],
+            shape=[QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE],
+        )
+    else:
+        VGPRS0: gl.constexpr = QUERY_SEQ_LEN_POW2
+        THREADS0: gl.constexpr = QUERY_GROUP_SIZE_POW2 // (4 * VGPRS0)
+        THREADS1: gl.constexpr = 64 // THREADS0
+
+        qk_linear_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[VGPRS0, CONTEXT_PARTITION_SIZE // THREADS1],
+            threads_per_warp=[THREADS0, THREADS1],
+            warps_per_cta=[4, 1],
+            order=[1, 0],
+        )
     context_length = gl.load(context_lengths_ptr + sequence_idx)
     # Value cache layout configuration based on transpose flag
     if VALUE_TRANSPOSED:
@@ -2579,7 +2604,7 @@ def paged_attention_decode_sliding_window(
                 qk_scale_value = softmax_scale * query_scale_value
             else:
                 qk_scale_value = softmax_scale
-
+        attention_scores = gl.convert_layout(attention_scores, layout=qk_linear_layout)
         attention_scores = qk_scale_value * attention_scores
         # ==================== ATTENTION MASKING ====================
         # Compute query token index (0 to query_seq_len-1)
@@ -2762,16 +2787,18 @@ def paged_attention_decode_sliding_window(
         )
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({'matrix_instr_nonkdim' : dim, 'waves_per_eu' : wa}, num_stages=s, num_warps=w) \
-#         for s in [1, 2, 3, 4, 5, 6, 7, 8] \
-#         for w in [4] \
-#         for wa in [1, 2, 3, 4] \
-#         for dim in [16] \
-#     ],
-#     key = ['Q_SEQ_LEN', 'QUERY_GRP_SZ_POW2', 'KV_BLK_SZ'],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"matrix_instr_nonkdim": dim, "waves_per_eu": wa}, num_stages=s, num_warps=w
+        )
+        for s in [1, 2, 3, 4, 5, 6, 7, 8]
+        for w in [4]
+        for wa in [1, 2, 3, 4]
+        for dim in [16]
+    ],
+    key=["Q_SEQ_LEN", "QUERY_GRP_SZ_POW2", "KV_BLK_SZ"],
+)
 @gluon.jit
 def paged_attention_decode_v2_gluon_dot_kernel(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
