@@ -165,8 +165,7 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128):
     avg_d = None
     err_d = None
     gpu = torch.cuda.current_device()
-    device_properties = torch.cuda.get_device_properties(gpu)
-    cu_num = device_properties.multi_processor_count
+    torch.cuda.get_device_properties(gpu)
     if (
         dtype == dtypes.bf16
         and quantDtype == dtypes.i8

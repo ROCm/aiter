@@ -157,7 +157,7 @@ def device_memory_profiling(func, *args, **kwargs):
     )
     non_torch_memory_before = cuda_memory_before - torch_memory_before
 
-    data = func(*args, **kwargs)
+    func(*args, **kwargs)
 
     torch.cuda.reset_peak_memory_stats(gpu_id)
     cuda_memory_after = (

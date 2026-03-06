@@ -209,8 +209,6 @@ def run_benchmark(args):
     x_vals_list = model_benchmark_configs(args)
     x_names = ["model", "BS", "HQ", "HK", "MAX_SEQ_LEN", "HEAD_DIM"]
 
-    model_name = "paged-attn-decode"
-
     line_names = ["Time_(ms)", "TFLOPS", "Bandwidth_(GB/s)"]
     line_vals = ["time", "tflops", "bandwidth"]
 

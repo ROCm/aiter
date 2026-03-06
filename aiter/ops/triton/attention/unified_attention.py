@@ -29,7 +29,7 @@ def select_2d_config(
     max_num_stages_2d = 4
     if head_size > 128:
         max_num_stages_2d = 2
-    if all_decode == False:
+    if not all_decode:
         num_stages_2d = 1
         num_warps = 2
     else:

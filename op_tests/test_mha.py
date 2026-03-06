@@ -341,9 +341,7 @@ def test_flash_attn_output(
     print(
         f"softmax_lse Pytorch max diff: {(softmax_lse_pt - softmax_lse_ref).abs().max().item()}"
     )
-    softmax_lse_tol = max(
-        2 * (softmax_lse_pt - softmax_lse_ref).abs().max().item(), 0.01
-    )
+    max(2 * (softmax_lse_pt - softmax_lse_ref).abs().max().item(), 0.01)
     # assert (softmax_lse - softmax_lse_ref).abs().max().item() <= softmax_lse_tol
 
     print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")

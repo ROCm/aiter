@@ -8,7 +8,6 @@ import functools
 import pandas as pd
 from ..jit.core import (
     compile_ops,
-    AITER_ROOT_DIR,
     AITER_CONFIGS,
     AITER_LOG_TUNED_CONFIG,
 )

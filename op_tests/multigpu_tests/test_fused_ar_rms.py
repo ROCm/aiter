@@ -210,7 +210,7 @@ def get_acc_value_only(
     # dist.barrier(device_ids=[i for i in range(tp_size)])
 
     # warmup and align all gpu
-    group = get_tp_group().device_group
+    get_tp_group().device_group
     torch.cuda.synchronize()
 
     for i in range(loop_time):
@@ -325,7 +325,7 @@ def test_split_ar_rmsnorm(
     weight_list = []
     res_inp = []
     # print(type(shape[0]), shape[1], ref.device)
-    m = shape[0]
+    shape[0]
     n = shape[1]
     eps = 1e-6
     for i in range(tp_size):
@@ -385,7 +385,7 @@ def test_fused_ar_rmsnorm(
     weight_list = []
     res_inp = []
     # print(type(shape[0]), shape[1], ref.device)
-    m = shape[0]
+    shape[0]
     n = shape[1]
     eps = 1e-6
     for i in range(tp_size):
@@ -447,10 +447,9 @@ def acc_test(
     pool = Pool(processes=tp_size)
     ref = torch.zeros(shape, dtype=dtype)
     rets = []
-    cpu_rslt = []
     weight_list = []
     # print(type(shape[0]), shape[1], ref.device)
-    m = shape[0]
+    shape[0]
     n = shape[1]
     eps = 1e-6
     for i in range(tp_size):
@@ -488,10 +487,9 @@ def acc_test_cudagraph_on(
     pool = Pool(processes=tp_size)
     ref = torch.zeros(shape, dtype=dtype)
     rets = []
-    cpu_rslt = []
     weight_list = []
     # print(type(shape[0]), shape[1], ref.device)
-    m = shape[0]
+    shape[0]
     n = shape[1]
     eps = 1e-6
     for i in range(tp_size):

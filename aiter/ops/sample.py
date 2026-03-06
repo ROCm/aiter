@@ -3,7 +3,6 @@
 
 from typing import Optional
 
-import torch
 from torch import Generator, Tensor
 
 from ..jit.core import compile_ops

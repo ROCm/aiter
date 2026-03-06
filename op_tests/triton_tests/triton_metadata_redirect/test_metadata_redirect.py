@@ -5785,7 +5785,7 @@ def test_f32_kernel():
         compile_args = CompileArgs(
             path=kernel_path,
             kernel_name="empty_kernel",
-            signature=f"*fp32:16,1",
+            signature="*fp32:16,1",
             grid="1,1,1",
             num_warps=4,
             num_stages=2,
