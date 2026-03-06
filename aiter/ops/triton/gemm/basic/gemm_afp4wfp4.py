@@ -149,9 +149,6 @@ def gemm_afp4wfp4_(
     else:
         config = deserialize_str(config)
 
-    # Workaround: remove keys injected by fused kernels that pollute the lru_cache
-    config.pop("BLOCK_SIZE_S3", None)
-
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
             K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
@@ -317,9 +314,6 @@ def gemm_afp4wfp4_preshuffled_scales(
     if config is None:
         config, _ = _get_config(M, N, K)
 
-    # Workaround: remove keys injected by fused kernels that pollute the lru_cache
-    config.pop("BLOCK_SIZE_S3", None)
-
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
             K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
@@ -450,9 +444,6 @@ def gemm_afp4wfp4_preshuffle(
 
     if config is None:
         config, _ = _get_config(M, N, K, True)
-
-    # Workaround: remove keys injected by fused kernels that pollute the lru_cache
-    config.pop("BLOCK_SIZE_S3", None)
 
     return_y_pp = config["NUM_KSPLIT"] > 1 and skip_reduce
 
