@@ -442,6 +442,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
             return -1;
         }
     }
+#undef LOCK_IMPL_PTR_MAP
 
     if(a.v3_api_check)
         return 1;

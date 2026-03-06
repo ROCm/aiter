@@ -259,6 +259,7 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
       }
       impl_ptr = result.first->second.get();
     }
+#undef LOCK_IMPL_PTR_MAP
 
     fmha_fwd_v3_args args;
     size_t arg_size = sizeof(args);
