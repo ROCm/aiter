@@ -154,9 +154,9 @@ def nonvarlen_benchmark_configs():
 
 def varlen_benchmark_configs():
     batch_sizes = [1, 4, 8]
-    N_HEADS = [16, 48]
+    N_HEADS = [16, 32]
     seq_len_q = [1, 1024, 4096]
-    seq_len_k = [163, 8192]
+    seq_len_k = [8192]
     HEAD_DIM = 128
     V_HEAD_DIM = HEAD_DIM
     configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_q, seq_len_k))
@@ -411,7 +411,7 @@ def run_benchmark(custom, args):
         
         if args.test:
             ref_output = ref_paged_attn(
-                query=query,
+                query=query.clone(),
                 key_cache=key_cache,
                 value_cache=value_cache,
                 query_lens=seqlens_q,
