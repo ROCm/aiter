@@ -1,28 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-Iris two-shot fused AllReduce + RMSNorm + per-row FP8 Quant + inlined GEMM.
-2D-tiled variant with external pre/post barriers and inlined mid-barrier.
+Iris fused AllReduce + RMSNorm + per-row FP8 Quant + partial GEMM + allgather.
 
-Based on iris_twoshot_2d_hipblaslt but replaces the external hipBLASLt GEMM
-with an inlined Triton GEMM. This eliminates the separate GEMM kernel launch,
-the rocclr_copyBuffer overhead from scale_b expansion, and reads FP8 data
-directly from the heap without an intermediate round-trip.
+Single Triton kernel with 2 phases:
+  Phase 1 (Comm + GEMM): Each rank reduces its assigned rows from the
+    symmetric heap, applies RMSNorm + per-row FP8 quant, then immediately
+    does a small GEMM on just its owned rows. The BF16 GEMM output is
+    broadcast to all peers via iris.store.
+  Phase 2 (Allgather): Each rank reads other ranks' GEMM output rows
+    from the symmetric heap via iris.load, assembling the full output.
 
-Single Triton kernel with 3 phases:
-  Phase 1 (Comm): Two-shot allreduce + RMSNorm + per-row FP8 quant +
-    FP8 broadcast to all peers via symmetric heap.
-  Phase 2 (Barrier): Inlined cross-rank device barrier via atomic ops.
-  Phase 3 (GEMM): Persistent tiled matmul reading FP8 + per-row scales
-    directly from heap. Produces BF16 output.
-
-External barriers (pre/post kernel) are skipped during CUDA graph capture.
-The inlined mid-barrier (between comm and GEMM) is always active.
+No cross-rank barrier needed between quant and GEMM because each rank
+only GEMMs its own rows. No hipBLASLt needed because the per-rank GEMM
+is small (M/world_size rows).
 
 CUDA graph compatibility:
 - Buffer pre-allocation with view pattern
 - External device_barrier() before and after kernel (skipped during capture)
-- Inlined barrier between comm and GEMM phases
 """
 
 import logging
@@ -64,100 +59,33 @@ def extract_group_info(
     return rank_in_group, rank_global, world_size, rank_start, rank_stride
 
 
-@triton.jit
-def _translate_ptr(ptr, from_rank, to_rank, heap_bases):
-    """Translate a pointer from one rank's address space to another's."""
-    from_base = tl.load(heap_bases + from_rank)
-    to_base = tl.load(heap_bases + to_rank)
-    offset = tl.cast(ptr, tl.uint64) - from_base
-    translated_ptr = tl.cast(
-        tl.cast(to_base, tl.pointer_type(tl.int8)) + offset, ptr.dtype
-    )
-    return translated_ptr
-
-
-@triton.jit
-def _inlined_device_barrier(
-    raw_pid,
-    barrier_flags_ptr,
-    barrier_epoch_ptr,
-    barrier_done_ptr,
-    heap_bases: tl.tensor,
-    iris_rank: tl.constexpr,
-    world_size: tl.constexpr,
-    rank_start: tl.constexpr,
-    rank_stride: tl.constexpr,
-):
-    """Cross-rank device barrier for use inside persistent kernels.
-
-    CTA 0 signals own readiness, polls remote ranks, then signals
-    other CTAs via barrier_done_ptr. Epoch is self-advancing so it
-    works correctly in autotuning and CUDA graph replay.
-    """
-    barrier_epoch = tl.load(barrier_epoch_ptr)
-    target_epoch = barrier_epoch + 1
-
-    if raw_pid == 0:
-        own_flag_ptr = barrier_flags_ptr + iris_rank
-        own_translated = _translate_ptr(
-            own_flag_ptr, iris_rank, iris_rank, heap_bases
-        )
-        tl.atomic_xchg(own_translated, target_epoch, sem="release", scope="sys")
-
-        for i in range(world_size):
-            remote_rank = rank_start + i * rank_stride
-            if remote_rank != iris_rank:
-                remote_flag_ptr = barrier_flags_ptr + remote_rank
-                remote_translated = _translate_ptr(
-                    remote_flag_ptr, iris_rank, remote_rank, heap_bases
-                )
-                while (
-                    tl.atomic_cas(
-                        remote_translated,
-                        target_epoch,
-                        target_epoch,
-                        sem="acquire",
-                        scope="sys",
-                    )
-                    != target_epoch
-                ):
-                    pass
-
-        tl.store(barrier_epoch_ptr, target_epoch)
-        tl.atomic_add(barrier_done_ptr, 1, sem="release")
-    else:
-        while tl.atomic_add(barrier_done_ptr, 0, sem="acquire") < 1:
-            pass
-
-
 # ============================================================================
-# Fused kernel: AllReduce + RMSNorm + per-row FP8 Quant + inlined GEMM
+# Fused kernel: AllReduce + RMSNorm + FP8 Quant + partial GEMM + allgather
 # ============================================================================
 
 
 @triton.jit
-def persistent_fused_allreduce_rmsnorm_2d_quant_gemm(
+def persistent_fused_allreduce_rmsnorm_quant_partial_gemm(
     # Symmetric heap buffers
     input_ptr,
-    quant_heap_ptr,
-    scale_heap_ptr,
+    quant_local_ptr,
+    scale_local_ptr,
+    # GEMM output on symmetric heap (for allgather)
+    gemm_heap_ptr,
     # Regular GPU memory
     result_out_ptr,
+    gemm_out_ptr,
     # GEMM parameters
     gemm_weight_ptr,
-    gemm_out_ptr,
     bias_ptr,
     weight_scale_ptr,
     K_GEMM,
     stride_gw_k,
     stride_gw_n,
     stride_go_m,
-    stride_go_k,
-    # Inlined device barrier state (symmetric heap)
-    barrier_flags_ptr,
-    barrier_epoch_ptr,
-    # Inlined device barrier: CTA 0 -> other CTAs signal (local GPU memory)
-    barrier_done_ptr,
+    stride_go_n,
+    stride_gh_m,
+    stride_gh_n,
     # Residual (regular GPU memory; dummy ptr when HAS_RESIDUAL=False)
     residual_in_ptr,
     # RMSNorm weight
@@ -171,14 +99,14 @@ def persistent_fused_allreduce_rmsnorm_2d_quant_gemm(
     # Input strides
     stride_in_m,
     stride_in_n,
-    # Quant heap strides
-    stride_qh_m,
-    stride_qh_n,
+    # Quant local strides
+    stride_ql_m,
+    stride_ql_n,
     # Result out strides
     stride_out_m,
     stride_out_n,
-    # Scale heap stride
-    stride_sh,
+    # Scale local stride
+    stride_sl,
     # Iris params
     heap_bases: tl.tensor,
     group_rank: tl.constexpr,
@@ -186,7 +114,7 @@ def persistent_fused_allreduce_rmsnorm_2d_quant_gemm(
     world_size: tl.constexpr,
     rank_start: tl.constexpr,
     rank_stride: tl.constexpr,
-    # Tile params
+    # Comm tile params
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     ACTUAL_N: tl.constexpr,
@@ -204,20 +132,19 @@ def persistent_fused_allreduce_rmsnorm_2d_quant_gemm(
     GEMM_GROUP_SIZE_M: tl.constexpr,
     EVEN_GEMM_K: tl.constexpr,
 ):
-    """Fused AllReduce + RMSNorm + per-row FP8 quant + inlined GEMM (2D).
+    """Fused AllReduce + RMSNorm + per-row FP8 quant + partial GEMM + allgather.
 
-    Phase 1: Each rank reduces its assigned tiles, applies RMSNorm + per-row
-    FP8 quant, broadcasts FP8 result and scales to all peers.
-    Phase 2: Inlined cross-rank barrier.
-    Phase 3: Persistent tiled GEMM reading FP8 + scales from heap.
+    Phase 1: Each rank reduces its assigned rows, applies RMSNorm + per-row
+    FP8 quant, does GEMM on owned rows, broadcasts BF16 GEMM output to peers.
+    Phase 2: Each rank reads all other ranks' GEMM output via iris.load.
     """
     pid = tl.program_id(0)
 
     # ================================================================
-    # Phase 1: Two-shot AllReduce + RMSNorm + Quant + FP8 Broadcast
+    # Phase 1: Reduce + RMSNorm + Quant + partial GEMM + broadcast
     # ================================================================
 
-    # Row distribution across ranks
+    # Row distribution across ranks (block distribution)
     rows_per_rank = tl.cdiv(M, world_size)
     if DISTRIBUTION == 0:
         my_start = group_rank
@@ -232,7 +159,7 @@ def persistent_fused_allreduce_rmsnorm_2d_quant_gemm(
         remaining = tl.maximum(remaining, 0)
         max_row_offset = tl.minimum(rows_per_rank, remaining)
 
-    num_tiles = tl.cdiv(max_row_offset, BLOCK_SIZE_M)
+    num_comm_tiles = tl.cdiv(max_row_offset, BLOCK_SIZE_M)
 
     # Load RMSNorm weights
     rn = tl.arange(0, BLOCK_SIZE_N)
@@ -243,25 +170,33 @@ def persistent_fused_allreduce_rmsnorm_2d_quant_gemm(
     else:
         rms_w = tl.load(rms_weight_ptr + rn).to(tl.float32)
 
-    # Persistent traversal over this rank's assigned tiles
-    for tile_offset in range(pid, num_tiles, COMM_SMS):
+    # Phase 1a: Allreduce + RMSNorm + FP8 quant on owned rows
+    for tile_offset in range(pid, num_comm_tiles, COMM_SMS):
         row_base = my_start + tile_offset * BLOCK_SIZE_M * stride
 
         rm = row_base + tl.arange(0, BLOCK_SIZE_M) * stride
         row_mask = rm < M
 
         input_offset = rm[:, None] * stride_in_m + rn[None, :] * stride_in_n
-        qh_offset = rm[:, None] * stride_qh_m + rn[None, :] * stride_qh_n
         out_offset = rm[:, None] * stride_out_m + rn[None, :] * stride_out_n
-        scale_offset = rm * stride_sh
+
+        # Local quant buffer offsets (indexed by local row position)
+        local_row = tile_offset * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        local_row_mask = local_row < max_row_offset
+        ql_offset = (
+            local_row[:, None] * stride_ql_m + rn[None, :] * stride_ql_n
+        )
+        sl_offset = local_row * stride_sl
 
         is_full = (row_base + BLOCK_SIZE_M * stride <= M)
 
         if PADDED_N:
             col_mask = rn < ACTUAL_N
             mask = row_mask[:, None] & col_mask[None, :]
+            local_mask = local_row_mask[:, None] & col_mask[None, :]
         else:
             mask = row_mask[:, None]
+            local_mask = local_row_mask[:, None]
 
         if is_full and not PADDED_N:
             # ---- Fast path: no masks ----
@@ -293,23 +228,11 @@ def persistent_fused_allreduce_rmsnorm_2d_quant_gemm(
             scale = row_amax / fp8_max
 
             quantized = (normed / scale[:, None]).to(
-                quant_heap_ptr.type.element_ty
+                quant_local_ptr.type.element_ty
             )
 
-            tl.store(quant_heap_ptr + qh_offset, quantized)
-            tl.store(scale_heap_ptr + scale_offset, scale)
-
-            for i in tl.static_range(0, world_size):
-                remote_rank = rank_start + i * rank_stride
-                if remote_rank != iris_rank:
-                    iris.store(
-                        quant_heap_ptr + qh_offset, quantized,
-                        iris_rank, remote_rank, heap_bases,
-                    )
-                    iris.store(
-                        scale_heap_ptr + scale_offset, scale,
-                        iris_rank, remote_rank, heap_bases,
-                    )
+            tl.store(quant_local_ptr + ql_offset, quantized)
+            tl.store(scale_local_ptr + sl_offset, scale)
         else:
             # ---- Slow path: masked ----
             acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -342,54 +265,27 @@ def persistent_fused_allreduce_rmsnorm_2d_quant_gemm(
             scale = row_amax / fp8_max
 
             quantized = (normed / scale[:, None]).to(
-                quant_heap_ptr.type.element_ty
+                quant_local_ptr.type.element_ty
             )
 
-            tl.store(quant_heap_ptr + qh_offset, quantized, mask=mask)
-            tl.store(scale_heap_ptr + scale_offset, scale, mask=row_mask)
-
-            for i in tl.static_range(0, world_size):
-                remote_rank = rank_start + i * rank_stride
-                if remote_rank != iris_rank:
-                    iris.store(
-                        quant_heap_ptr + qh_offset, quantized,
-                        iris_rank, remote_rank, heap_bases,
-                        mask=mask,
-                    )
-                    iris.store(
-                        scale_heap_ptr + scale_offset, scale,
-                        iris_rank, remote_rank, heap_bases,
-                        mask=row_mask,
-                    )
+            tl.store(
+                quant_local_ptr + ql_offset, quantized, mask=local_mask
+            )
+            tl.store(
+                scale_local_ptr + sl_offset, scale, mask=local_row_mask
+            )
 
     # ================================================================
-    # Phase 2: Inlined cross-rank device barrier
+    # Phase 1b: Partial GEMM on owned rows + broadcast output
     # ================================================================
+    # Each rank GEMMs its own rows: (max_row_offset, N) x (N, K_GEMM)
+    # No barrier needed -- we just wrote the quant data ourselves.
 
-    _inlined_device_barrier(
-        pid,
-        barrier_flags_ptr,
-        barrier_epoch_ptr,
-        barrier_done_ptr,
-        heap_bases,
-        iris_rank,
-        world_size,
-        rank_start,
-        rank_stride,
-    )
-
-    # ================================================================
-    # Phase 3: Inlined GEMM — read FP8 + scales from heap
-    # ================================================================
-    # After barrier, quant_heap_ptr has complete (M, N) FP8 matrix and
-    # scale_heap_ptr has per-row scales for ALL rows on every rank.
-
-    num_pid_m = tl.cdiv(M, GEMM_BLOCK_M)
+    num_pid_m = tl.cdiv(max_row_offset, GEMM_BLOCK_M)
     num_pid_n = tl.cdiv(K_GEMM, GEMM_BLOCK_N)
-    total_tiles = num_pid_m * num_pid_n
+    total_gemm_tiles = num_pid_m * num_pid_n
 
-    for tile_id in range(pid, total_tiles, COMM_SMS):
-        # Map tile_id -> (pid_m, pid_n) with GROUP_SIZE_M swizzle
+    for tile_id in range(pid, total_gemm_tiles, COMM_SMS):
         if GEMM_GROUP_SIZE_M == 1:
             pid_m = tile_id // num_pid_n
             pid_n = tile_id % num_pid_n
@@ -407,25 +303,24 @@ def persistent_fused_allreduce_rmsnorm_2d_quant_gemm(
         offs_bn = pid_n * GEMM_BLOCK_N + tl.arange(0, GEMM_BLOCK_N)
         offs_k = tl.arange(0, GEMM_BLOCK_K)
 
-        # A pointers: quant_heap (M, N) FP8
+        # A pointers: local quant buffer (max_row_offset, N)
         a_ptrs = (
-            quant_heap_ptr
-            + (offs_am[:, None] % M) * stride_qh_m
-            + offs_k[None, :] * stride_qh_n
+            quant_local_ptr
+            + (offs_am[:, None] % max_row_offset) * stride_ql_m
+            + offs_k[None, :] * stride_ql_n
         )
-        # B pointers: gemm_weight (N, K_GEMM) FP8
+        # B pointers: gemm_weight (N, K_GEMM)
         b_ptrs = (
             gemm_weight_ptr
             + offs_k[:, None] * stride_gw_k
             + (offs_bn[None, :] % K_GEMM) * stride_gw_n
         )
 
-        # Per-row activation scales
+        # Per-row activation scales (local indexing)
         a_scale = tl.load(
-            scale_heap_ptr + (offs_am % M) * stride_sh
+            scale_local_ptr + (offs_am % max_row_offset) * stride_sl
         )
 
-        # Tiled GEMM accumulation
         accumulator = tl.zeros(
             (GEMM_BLOCK_M, GEMM_BLOCK_N), dtype=tl.float32
         )
@@ -449,14 +344,13 @@ def persistent_fused_allreduce_rmsnorm_2d_quant_gemm(
 
             accumulator += tl.dot(a, b, input_precision="ieee")
 
-            a_ptrs += GEMM_BLOCK_K * stride_qh_n
+            a_ptrs += GEMM_BLOCK_K * stride_ql_n
             b_ptrs += GEMM_BLOCK_K * stride_gw_k
 
-        # Apply scales: per-row activation scale * per-tensor weight scale
+        # Apply scales
         ws = tl.load(weight_scale_ptr)
         accumulator *= a_scale[:, None] * ws
 
-        # Optional bias
         if HAS_BIAS:
             bias_offs = (pid_n * GEMM_BLOCK_N
                          + tl.arange(0, GEMM_BLOCK_N)) % K_GEMM
@@ -465,18 +359,66 @@ def persistent_fused_allreduce_rmsnorm_2d_quant_gemm(
                 accumulator.to(bias_ptr.type.element_ty) + bias_val[None, :]
             )
 
-        # Store GEMM output
-        c = accumulator.to(gemm_out_ptr.type.element_ty)
+        c = accumulator.to(gemm_heap_ptr.type.element_ty)
 
-        offs_cm = pid_m * GEMM_BLOCK_M + tl.arange(0, GEMM_BLOCK_M)
+        # Global row indices for this rank's owned rows
+        offs_cm_global = my_start + offs_am * stride
         offs_cn = pid_n * GEMM_BLOCK_N + tl.arange(0, GEMM_BLOCK_N)
-        c_ptrs = (
-            gemm_out_ptr
-            + offs_cm[:, None] * stride_go_m
-            + offs_cn[None, :] * stride_go_k
+        c_mask = (offs_am[:, None] < max_row_offset) & (
+            offs_cn[None, :] < K_GEMM
         )
-        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < K_GEMM)
-        tl.store(c_ptrs, c, mask=c_mask)
+
+        # Store to GEMM heap (symmetric, for allgather)
+        gh_ptrs = (
+            gemm_heap_ptr
+            + offs_cm_global[:, None] * stride_gh_m
+            + offs_cn[None, :] * stride_gh_n
+        )
+        tl.store(gh_ptrs, c, mask=c_mask)
+
+        # Broadcast GEMM output to all peers
+        for i in tl.static_range(0, world_size):
+            remote_rank = rank_start + i * rank_stride
+            if remote_rank != iris_rank:
+                iris.store(
+                    gh_ptrs, c,
+                    iris_rank, remote_rank, heap_bases,
+                    mask=c_mask,
+                )
+
+    # ================================================================
+    # Phase 2: Copy from heap to output
+    # ================================================================
+    # After all ranks have broadcast, gemm_heap has the full (M, K_GEMM)
+    # output. Copy our assigned rows to gemm_out. The external post-barrier
+    # ensures all ranks have finished writing before the next iteration
+    # overwrites the input buffer.
+
+    # Copy all rows (not just owned) from heap to output
+    num_copy_m = tl.cdiv(M, GEMM_BLOCK_M)
+    num_copy_n = tl.cdiv(K_GEMM, GEMM_BLOCK_N)
+    total_copy_tiles = num_copy_m * num_copy_n
+
+    for tile_id in range(pid, total_copy_tiles, COMM_SMS):
+        cm = tile_id // num_copy_n
+        cn = tile_id % num_copy_n
+
+        offs_m = cm * GEMM_BLOCK_M + tl.arange(0, GEMM_BLOCK_M)
+        offs_n = cn * GEMM_BLOCK_N + tl.arange(0, GEMM_BLOCK_N)
+        cp_mask = (offs_m[:, None] < M) & (offs_n[None, :] < K_GEMM)
+
+        src_ptrs = (
+            gemm_heap_ptr
+            + offs_m[:, None] * stride_gh_m
+            + offs_n[None, :] * stride_gh_n
+        )
+        dst_ptrs = (
+            gemm_out_ptr
+            + offs_m[:, None] * stride_go_m
+            + offs_n[None, :] * stride_go_n
+        )
+        vals = tl.load(src_ptrs, mask=cp_mask)
+        tl.store(dst_ptrs, vals, mask=cp_mask)
 
 
 # ============================================================================
@@ -484,25 +426,25 @@ def persistent_fused_allreduce_rmsnorm_2d_quant_gemm(
 # ============================================================================
 
 
-class IrisTwoshot2dGemmManager:
-    """Singleton manager for 2D-tiled AllReduce+RMSNorm+Quant+inlined GEMM.
+class IrisOneManager:
+    """Singleton manager for fused allreduce + partial GEMM + allgather.
 
-    Combines 2D comm tiling from 2d_hipblaslt with inlined Triton GEMM.
-    External pre/post barriers, inlined mid-barrier between comm and GEMM.
+    Single kernel: allreduce+rmsnorm+quant on owned rows, GEMM on owned
+    rows, broadcast BF16 GEMM output, copy full output from heap.
     """
 
-    _instance: Optional["IrisTwoshot2dGemmManager"] = None
+    _instance: Optional["IrisOneManager"] = None
     _initialized: bool = False
 
-    def __new__(cls) -> "IrisTwoshot2dGemmManager":
+    def __new__(cls) -> "IrisOneManager":
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
 
     def __init__(self) -> None:
-        if IrisTwoshot2dGemmManager._initialized:
+        if IrisOneManager._initialized:
             return
-        IrisTwoshot2dGemmManager._initialized = True
+        IrisOneManager._initialized = True
 
         self._shmem: Any = None
         self._heap_size: int = 2**33  # 8GB default
@@ -513,31 +455,25 @@ class IrisTwoshot2dGemmManager:
         self._input_N: int = 0
         self._input_dtype: Optional[torch.dtype] = None
 
-        self._quant_heap_buf: Any = None
-        self._quant_heap_M: int = 0
-        self._quant_heap_N: int = 0
-        self._quant_heap_dtype: Optional[torch.dtype] = None
+        # GEMM output on symmetric heap (for allgather broadcast)
+        self._gemm_heap_bufs: dict[int, Any] = {}  # keyed by K_GEMM
 
-        self._scale_heap_buf: Any = None
-        self._scale_heap_M: int = 0
+        # Local GPU memory (not on heap)
+        self._quant_local_buf: Optional[torch.Tensor] = None
+        self._quant_local_M: int = 0
+        self._quant_local_N: int = 0
+        self._quant_local_dtype: Optional[torch.dtype] = None
 
-        # Regular GPU memory
+        self._scale_local_buf: Optional[torch.Tensor] = None
+        self._scale_local_M: int = 0
+
         self._out_result: Optional[torch.Tensor] = None
-        # GEMM output buffers keyed by K_GEMM (different layers have
-        # different output dims, e.g. 1280, 3584, 8192 in Llama 70B)
         self._out_gemm_bufs: dict[int, torch.Tensor] = {}
-
-        # Inlined device barrier state
-        self._barrier_flags: Any = None  # on symmetric heap
-        self._barrier_epoch: Optional[torch.Tensor] = None
-        self._barrier_done: Optional[torch.Tensor] = None
 
     def initialize(self, heap_size: Optional[int] = None) -> None:
         """Initialize Iris symmetric heap (call once at startup)."""
         if self._shmem is not None:
-            logger.debug(
-                "Iris (twoshot-2d-gemm) already initialized, skipping"
-            )
+            logger.debug("Iris (one) already initialized, skipping")
             return
 
         if heap_size is not None:
@@ -550,15 +486,8 @@ class IrisTwoshot2dGemmManager:
         )
         self._shmem = iris.iris(self._heap_size)
 
-        # Allocate barrier flags on symmetric heap (one int32 per rank)
-        num_ranks = self._shmem.get_num_ranks()
-        self._barrier_flags = self._shmem.zeros(
-            (num_ranks,), dtype=torch.int32
-        )
-        self._shmem.device_barrier()
-
         logger.info(
-            f"Iris (twoshot-2d-gemm) initialized: "
+            f"Iris (one) initialized: "
             f"rank={cur_rank}, heap_size={self._heap_size / 2**30:.1f}GB"
         )
 
@@ -572,37 +501,34 @@ class IrisTwoshot2dGemmManager:
         self,
         M: int,
         N: int,
+        K_GEMM: int,
         input_dtype: torch.dtype,
-        quant_dtype: torch.dtype,
-    ) -> Tuple[Any, Any, Any]:
-        """Allocate or reuse symmetric heap buffers."""
+        out_dtype: torch.dtype,
+    ) -> Tuple[Any, Any]:
+        """Allocate or reuse symmetric heap buffers.
+
+        Returns (input_buf, gemm_heap).
+        """
         need_input = (
             self._input_buf is None
             or M > self._input_M
             or N != self._input_N
             or input_dtype != self._input_dtype
         )
-        need_quant = (
-            self._quant_heap_buf is None
-            or M > self._quant_heap_M
-            or N != self._quant_heap_N
-            or quant_dtype != self._quant_heap_dtype
-        )
-        need_scale = (
-            self._scale_heap_buf is None
-            or M > self._scale_heap_M
+        need_gemm_heap = (
+            K_GEMM not in self._gemm_heap_bufs
+            or M > self._gemm_heap_bufs[K_GEMM].shape[0]
         )
 
-        if not (need_input or need_quant or need_scale):
+        if not (need_input or need_gemm_heap):
             return (
                 self._input_buf[:M],
-                self._quant_heap_buf[:M],
-                self._scale_heap_buf[:M],
+                self._gemm_heap_bufs[K_GEMM][:M],
             )
 
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                f"Iris (twoshot-2d-gemm): heap buffers too small for "
+                f"Iris (one): heap buffers too small for "
                 f"M={M}. Cannot allocate during CUDA graph capture."
             )
 
@@ -619,44 +545,51 @@ class IrisTwoshot2dGemmManager:
             self._input_N = N
             self._input_dtype = input_dtype
             logger.debug(
-                f"Iris (twoshot-2d-gemm): allocated input buffer "
+                f"Iris (one): allocated input buffer "
                 f"({M}, {N}), dtype={input_dtype}, rank={cur_rank}"
             )
 
-        if need_quant:
-            self._quant_heap_buf = shmem.zeros((M, N), dtype=quant_dtype)
-            self._quant_heap_M = M
-            self._quant_heap_N = N
-            self._quant_heap_dtype = quant_dtype
-            logger.debug(
-                f"Iris (twoshot-2d-gemm): allocated quant heap buffer "
-                f"({M}, {N}), dtype={quant_dtype}, rank={cur_rank}"
+        if need_gemm_heap:
+            self._gemm_heap_bufs[K_GEMM] = shmem.zeros(
+                (M, K_GEMM), dtype=out_dtype
             )
-
-        if need_scale:
-            self._scale_heap_buf = shmem.zeros((M,), dtype=torch.float32)
-            self._scale_heap_M = M
             logger.debug(
-                f"Iris (twoshot-2d-gemm): allocated scale heap buffer "
-                f"({M},), dtype=float32, rank={cur_rank}"
+                f"Iris (one): allocated GEMM heap buffer "
+                f"({M}, {K_GEMM}), dtype={out_dtype}, rank={cur_rank}"
             )
 
         return (
             self._input_buf[:M],
-            self._quant_heap_buf[:M],
-            self._scale_heap_buf[:M],
+            self._gemm_heap_bufs[K_GEMM][:M],
         )
 
-    def _ensure_gpu_buffers(
+    def _ensure_local_buffers(
         self,
         M: int,
         N: int,
         K_GEMM: int,
-        dtype: torch.dtype,
+        world_size: int,
+        quant_dtype: torch.dtype,
         out_dtype: torch.dtype,
         device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Allocate or reuse result_out and gemm_out on GPU memory."""
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Allocate local GPU buffers (not on heap).
+
+        Returns (quant_local, scale_local, result_out, gemm_out).
+        """
+        # Max rows this rank will own
+        rows_per_rank = (M + world_size - 1) // world_size
+
+        need_quant = (
+            self._quant_local_buf is None
+            or rows_per_rank > self._quant_local_M
+            or N != self._quant_local_N
+            or quant_dtype != self._quant_local_dtype
+        )
+        need_scale = (
+            self._scale_local_buf is None
+            or rows_per_rank > self._scale_local_M
+        )
         need_result = (
             self._out_result is None
             or M > self._out_result.shape[0]
@@ -666,28 +599,41 @@ class IrisTwoshot2dGemmManager:
             K_GEMM not in self._out_gemm_bufs
             or M > self._out_gemm_bufs[K_GEMM].shape[0]
         )
-        need_barrier = self._barrier_done is None
 
-        if not (need_result or need_gemm or need_barrier):
+        if not (need_quant or need_scale or need_result or need_gemm):
+            assert self._quant_local_buf is not None
+            assert self._scale_local_buf is not None
             assert self._out_result is not None
-            return self._out_result[:M], self._out_gemm_bufs[K_GEMM][:M]
+            return (
+                self._quant_local_buf[:rows_per_rank],
+                self._scale_local_buf[:rows_per_rank],
+                self._out_result[:M],
+                self._out_gemm_bufs[K_GEMM][:M],
+            )
 
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                f"Iris (twoshot-2d-gemm): GPU buffers too small for "
-                f"M={M}, K_GEMM={K_GEMM}. Cannot allocate during "
-                f"CUDA graph capture."
+                f"Iris (one): local buffers too small for "
+                f"M={M}. Cannot allocate during CUDA graph capture."
             )
 
-        cur_rank = (
-            torch.distributed.get_rank()
-            if torch.distributed.is_initialized()
-            else 0
-        )
+        if need_quant:
+            self._quant_local_buf = torch.empty(
+                (rows_per_rank, N), dtype=quant_dtype, device=device,
+            )
+            self._quant_local_M = rows_per_rank
+            self._quant_local_N = N
+            self._quant_local_dtype = quant_dtype
+
+        if need_scale:
+            self._scale_local_buf = torch.empty(
+                (rows_per_rank,), dtype=torch.float32, device=device,
+            )
+            self._scale_local_M = rows_per_rank
 
         if need_result:
             self._out_result = torch.empty(
-                (M, N), dtype=dtype, device=device,
+                (M, N), dtype=torch.bfloat16, device=device,
             )
 
         if need_gemm:
@@ -695,21 +641,15 @@ class IrisTwoshot2dGemmManager:
                 (M, K_GEMM), dtype=out_dtype, device=device,
             )
 
-        if need_barrier:
-            self._barrier_done = torch.zeros(
-                1, dtype=torch.int32, device=device
-            )
-            self._barrier_epoch = torch.zeros(
-                1, dtype=torch.int32, device=device
-            )
-
-        logger.debug(
-            f"Iris (twoshot-2d-gemm): allocated GPU buffers "
-            f"result=({M}, {N}), gemm=({M}, {K_GEMM}), rank={cur_rank}"
-        )
-
+        assert self._quant_local_buf is not None
+        assert self._scale_local_buf is not None
         assert self._out_result is not None
-        return self._out_result[:M], self._out_gemm_bufs[K_GEMM][:M]
+        return (
+            self._quant_local_buf[:rows_per_rank],
+            self._scale_local_buf[:rows_per_rank],
+            self._out_result[:M],
+            self._out_gemm_bufs[K_GEMM][:M],
+        )
 
     def fused_allreduce_rmsnorm_row_quant_gemm(
         self,
@@ -723,7 +663,7 @@ class IrisTwoshot2dGemmManager:
         residual: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Fused AllReduce + RMSNorm + per-row FP8 quant + inlined GEMM.
+        """Fused AllReduce + RMSNorm + FP8 quant + partial GEMM + allgather.
 
         Returns (gemm_out, residual_out). residual_out is None when
         residual is None.
@@ -733,12 +673,20 @@ class IrisTwoshot2dGemmManager:
         K_GEMM = gemm_weight.shape[1]
         device = input_tensor.device
 
-        # Allocate buffers
-        iris_input, quant_heap, scale_heap = self._ensure_heap_buffers(
-            M, N, input_tensor.dtype, quant_dtype,
+        # Iris group info
+        rank_in_group, rank_global, world_size, rank_start, rank_stride = (
+            extract_group_info(shmem)
         )
-        result_out, gemm_out = self._ensure_gpu_buffers(
-            M, N, K_GEMM, input_tensor.dtype, out_dtype, device,
+
+        # Allocate buffers
+        iris_input, gemm_heap = self._ensure_heap_buffers(
+            M, N, K_GEMM, input_tensor.dtype, out_dtype,
+        )
+        quant_local, scale_local, result_out, gemm_out = (
+            self._ensure_local_buffers(
+                M, N, K_GEMM, world_size,
+                quant_dtype, out_dtype, device,
+            )
         )
 
         # Copy input to symmetric heap (captured in graph)
@@ -748,13 +696,7 @@ class IrisTwoshot2dGemmManager:
         if not is_graph_capturing():
             shmem.device_barrier()
 
-        # FP8 max value
         fp8_max = torch.finfo(quant_dtype).max
-
-        # Iris group info
-        rank_in_group, rank_global, world_size, rank_start, rank_stride = (
-            extract_group_info(shmem)
-        )
         heap_bases = shmem.get_heap_bases()
 
         # ---- Tunable parameters ----
@@ -769,30 +711,24 @@ class IrisTwoshot2dGemmManager:
         NUM_WARPS = 16
         NUM_STAGES = 2
         WAVES_PER_EU = 1
-        # GEMM tile sizes (from twoshot_row autotuning on MI350X)
-        GEMM_BLOCK_M = 256
+        GEMM_BLOCK_M = 128
         GEMM_BLOCK_N = 128
         GEMM_BLOCK_K = 128
         GEMM_GROUP_SIZE_M = 4
         EVEN_GEMM_K = (N % GEMM_BLOCK_K == 0)
         # ---- End tunable parameters ----
 
-        # Reset barrier sync buffer
-        assert self._barrier_done is not None
-        self._barrier_done.zero_()
-
-        # Dummy bias pointer
         bias_ptr = bias if bias is not None else input_tensor
 
-        # Single fused kernel: comm + barrier + GEMM
-        persistent_fused_allreduce_rmsnorm_2d_quant_gemm[(COMM_SMS,)](
+        persistent_fused_allreduce_rmsnorm_quant_partial_gemm[(COMM_SMS,)](
             iris_input,
-            quant_heap,
-            scale_heap,
+            quant_local,
+            scale_local,
+            gemm_heap,
             result_out,
+            gemm_out,
             # GEMM params
             gemm_weight,
-            gemm_out,
             bias_ptr,
             weight_scale,
             K_GEMM,
@@ -800,10 +736,8 @@ class IrisTwoshot2dGemmManager:
             gemm_weight.stride(1),
             gemm_out.stride(0),
             gemm_out.stride(1),
-            # Barrier
-            self._barrier_flags,
-            self._barrier_epoch,
-            self._barrier_done,
+            gemm_heap.stride(0),
+            gemm_heap.stride(1),
             # Residual
             residual if residual is not None else input_tensor,
             # RMSNorm
@@ -816,11 +750,11 @@ class IrisTwoshot2dGemmManager:
             # Strides
             iris_input.stride(0),
             iris_input.stride(1),
-            quant_heap.stride(0),
-            quant_heap.stride(1),
+            quant_local.stride(0),
+            quant_local.stride(1),
             result_out.stride(0),
             result_out.stride(1),
-            scale_heap.stride(0),
+            scale_local.stride(0),
             # Iris
             heap_bases,
             rank_in_group,
@@ -828,7 +762,7 @@ class IrisTwoshot2dGemmManager:
             world_size,
             rank_start,
             rank_stride,
-            # Tile params
+            # Comm tile params
             BLOCK_SIZE_M,
             BLOCK_SIZE_N,
             ACTUAL_N,
@@ -859,20 +793,20 @@ class IrisTwoshot2dGemmManager:
         return gemm_out, residual_out
 
 
-_manager: Optional[IrisTwoshot2dGemmManager] = None
+_manager: Optional[IrisOneManager] = None
 
 
-def _get_manager() -> IrisTwoshot2dGemmManager:
+def _get_manager() -> IrisOneManager:
     global _manager
     if _manager is None:
-        _manager = IrisTwoshot2dGemmManager()
+        _manager = IrisOneManager()
     return _manager
 
 
-def initialize_iris_twoshot_2d_gemm(
+def initialize_iris_one(
     heap_size: Optional[int] = None,
 ) -> None:
-    """Initialize Iris for 2D-tiled fused all-reduce with inlined GEMM."""
+    """Initialize Iris for fused allreduce + partial GEMM."""
     _get_manager().initialize(heap_size)
 
 
@@ -888,9 +822,9 @@ def fused_allreduce_add_rms_quant_gemm_one(
     residual: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Fused AllReduce + RMSNorm + per-row FP8 Quant + inlined GEMM.
+    """Fused AllReduce + RMSNorm + per-row FP8 Quant + partial GEMM.
 
-    2D-tiled two-shot variant with Triton GEMM. Returns (gemm_out, residual_out).
+    Single kernel variant. Returns (gemm_out, residual_out).
     """
     return (
         _get_manager()
