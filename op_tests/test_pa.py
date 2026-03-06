@@ -974,9 +974,6 @@ def test_paged_attention(
 
 
 df = []
-l_num_heads = [(4, 1), (8, 1), (32, 8)]
-l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097]
-l_dtype = ["fp16", "bf16"]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -985,53 +982,35 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
+    type=dtypes.str2Dtype,
+    nargs="*",
+    default=[dtypes.d_dtypes["fp16"], dtypes.d_dtypes["bf16"]],
     help="""Data type.
     e.g.: -d bf16""",
 )
-
 parser.add_argument(
     "-n",
     "--num_heads",
     type=dtypes.str2tuple,
-    choices=l_num_heads,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    default=[(4, 1), (8, 1), (32, 8)],
     help="""Number of heads (num_query_heads, num_kv_heads)
     e.g.: -n 4,1""",
 )
-
 parser.add_argument(
     "-c",
     "--ctx_len",
     type=int,
-    choices=l_ctx_len,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    default=[7, 26, 57, 66, 109, 128, 257, 282, 4097],
     help="""Context length.
     e.g. -c 128""",
 )
-
 args = parser.parse_args()
-if args.dtype is None:
-    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-else:
-    l_dtype = [dtypes.d_dtypes[args.dtype]]
-if args.num_heads is not None:
-    l_num_heads = [args.num_heads]
-if args.ctx_len is not None:
-    l_ctx_len = [args.ctx_len]
 
-
-for num_heads in l_num_heads:
-    for ctx_len in l_ctx_len:
-        for dtype in l_dtype:
+for num_heads in args.num_heads:
+    for ctx_len in args.ctx_len:
+        for dtype in args.dtype:
             ret = test_paged_attention(
                 ctx_len, 128, num_heads, 128, False, 16, dtype, "auto", 0, "cuda:0"
             )

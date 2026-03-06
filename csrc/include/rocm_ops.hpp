@@ -392,14 +392,18 @@ namespace py = pybind11;
           "all_gather_reg(int fa, Tensor inp, Tensor! out) -> ()",                             \
           py::arg("_fa"),                                                                      \
           py::arg("inp"),                                                                      \
-          py::arg("out"));                                                                     \
+          py::arg("out"),                                                                      \
+          py::arg("last_dim_size"),                                                            \
+          py::arg("dim"));                                                                     \
     m.def("all_gather_unreg",                                                                  \
           &aiter::all_gather_unreg,                                                            \
           "all_gather_unreg(int fa, Tensor inp, Tensor reg_buffer, Tensor! out) -> ()",        \
           py::arg("_fa"),                                                                      \
           py::arg("inp"),                                                                      \
           py::arg("reg_buffer"),                                                               \
-          py::arg("out"));                                                                     \
+          py::arg("out"),                                                                      \
+          py::arg("last_dim_size"),                                                            \
+          py::arg("dim"));                                                                     \
     m.def("reduce_scatter",                                                                    \
           &aiter::reduce_scatter,                                                              \
           py::arg("_fa"),                                                                      \
@@ -1588,11 +1592,13 @@ namespace py = pybind11;
     m.def("fused_qk_norm_mrope_3d_cache_pts_quant_shuffle", \
           &fused_qk_norm_mrope_3d_cache_pts_quant_shuffle);
 
-#define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                   \
-    m.def("fused_qk_norm_rope_cache_quant_shuffle",            \
-          &aiter::fused_qk_norm_rope_cache_quant_shuffle);     \
-    m.def("fused_qk_norm_rope_cache_pts_quant_shuffle",        \
-          &aiter::fused_qk_norm_rope_cache_pts_quant_shuffle); \
+#define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                     \
+    m.def("fused_qk_norm_rope_cache_quant_shuffle",              \
+          &aiter::fused_qk_norm_rope_cache_quant_shuffle);       \
+    m.def("fused_qk_norm_rope_cache_pts_quant_shuffle",          \
+          &aiter::fused_qk_norm_rope_cache_pts_quant_shuffle);   \
+    m.def("fused_qk_norm_rope_cache_block_quant_shuffle",        \
+          &aiter::fused_qk_norm_rope_cache_block_quant_shuffle); \
     m.def("fused_qk_norm_rope_2way", &aiter::fused_qk_norm_rope_2way);
 
 #define SMOOTHQUANT_PYBIND                      \

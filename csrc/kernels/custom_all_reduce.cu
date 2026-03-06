@@ -86,7 +86,21 @@ bool _is_weak_contiguous(torch::Tensor& t)
                                  t.numel() * t.element_size());
 }
 
+inline std::string _tensor_meta_str(const char* label, const torch::Tensor& t) \
+{                                                                              \
+  std::ostringstream os;                                                       \
+  os << label << ":[";                                                         \
+  for (int i = 0; i < t.dim(); ++i) { if (i) os << ","; os << t.size(i); }    \
+  os << "] stride:[";                                                          \
+  for (int i = 0; i < t.dim(); ++i) { if (i) os << ","; os << t.stride(i); }  \
+  os << "]";                                                                   \
+  return os.str();                                                             \
+}
+
 #define INSTRUMENTATION(kernel_name, inp, out, rank_id, world_size)         \
+  std::string _inst_name = std::string(kernel_name)                          \
+    + " " + _tensor_meta_str("inp", inp)                                     \
+    + " " + _tensor_meta_str("out", out);                                    \
   std::vector<torch::Tensor> input_tensors = {inp};                         \
   std::vector<torch::Tensor> output_tensors = {out};                        \
   std::vector<int64_t> inp_split_sizes;                                     \
@@ -114,7 +128,7 @@ bool _is_weak_contiguous(torch::Tensor& t)
     input_tensors,                                                          \
     output_tensors,                                                         \
     rank_id,                                                                \
-    kernel_name,                                                            \
+    _inst_name.c_str(),                                                     \
     inp.numel(),                                                            \
     out.numel(),                                                            \
     inp.scalar_type(),                                                      \
@@ -329,7 +343,7 @@ void reduce_scatter(fptr_t _fa,
     }
 }
 
-void _all_gather(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int size, hipStream_t stream)
+void _all_gather(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int size, int last_dim_size, int gather_dim, hipStream_t stream)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     TORCH_CHECK(_is_weak_contiguous(out));
@@ -339,22 +353,22 @@ void _all_gather(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int size, h
         fa->dispatchAllGather<opus::fp32_t>(stream,
                                      reinterpret_cast<opus::fp32_t*>(inp.data_ptr()),
                                      reinterpret_cast<opus::fp32_t*>(out.data_ptr()),
-                                     size);
+                                     size, last_dim_size, gather_dim);
         break;
     }
     case at::ScalarType::Half: {
         fa->dispatchAllGather<opus::fp16_t>(stream,
                                     reinterpret_cast<opus::fp16_t*>(inp.data_ptr()),
                                     reinterpret_cast<opus::fp16_t*>(out.data_ptr()),
-                                    size);
+                                    size, last_dim_size, gather_dim);
         break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
     case at::ScalarType::BFloat16: {
         fa->dispatchAllGather<opus::bf16_t>(stream,
-                                              reinterpret_cast<opus::bf16_t*>(inp.data_ptr()),
-                                              reinterpret_cast<opus::bf16_t*>(out.data_ptr()),
-                                              size);
+                                    reinterpret_cast<opus::bf16_t*>(inp.data_ptr()),
+                                    reinterpret_cast<opus::bf16_t*>(out.data_ptr()),
+                                    size, last_dim_size, gather_dim);
         break;
     }
 #endif
@@ -363,17 +377,17 @@ void _all_gather(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int size, h
     }
 }
 
-void all_gather_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out)
+void all_gather_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int last_dim_size, int dim)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     INSTRUMENTATION("all_gather", inp, out, fa->rank_, fa->world_size_);
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
-    _all_gather(_fa, inp, out, inp.numel(), stream);
+    _all_gather(_fa, inp, out, inp.numel(), last_dim_size, dim, stream);
 }
 
-void all_gather_unreg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& reg_buffer, torch::Tensor& out)
+void all_gather_unreg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& reg_buffer, torch::Tensor& out, int last_dim_size, int dim)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     INSTRUMENTATION("all_gather", inp, out, fa->rank_, fa->world_size_);
@@ -386,7 +400,7 @@ void all_gather_unreg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& reg_buffer,
                 "registered buffer is too small to contain the input");
     HIP_CALL(hipMemcpyAsync(
         reg_buffer.data_ptr(), inp.data_ptr(), input_size, hipMemcpyDeviceToDevice, stream));
-    _all_gather(_fa, reg_buffer, out, inp.numel(), stream);
+    _all_gather(_fa, reg_buffer, out, inp.numel(), last_dim_size, dim, stream);
 }
 
 void _fused_allreduce_rmsnorm(fptr_t _fa,
