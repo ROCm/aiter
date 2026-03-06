@@ -957,14 +957,14 @@ def test_qk_norm_rope_cache_block_quant(
         -2
     ]  # k_cache: [num_blocks, num_kv_heads, head_size//x, page_size, x]
     slots_edit = torch.unique(slot_mapping // page_size)
-    k_cache_err = checkAllclose(
+    checkAllclose(
         k_cache_ref.float()[slots_edit],
         k_cache.float()[slots_edit],
         msg="prefill k_cache",
         rtol=5e-2,
         atol=0.05,
     )
-    v_cache_err = checkAllclose(
+    checkAllclose(
         v_cache_ref.float()[slots_edit],
         v_cache.float()[slots_edit],
         msg="prefill v_cache",
@@ -1256,7 +1256,7 @@ def test_qk_norm_rope_cache_block_quant(
         decode2_total = batch_size * dtpb
         last_used_slot = int(chunk_slot_mapping[-1].item())
         decode2_page_base = (last_used_slot + page_size) // page_size * page_size
-        max_slot = num_blocks * page_size
+        num_blocks * page_size
         pages_needed = batch_size * 2 + (decode2_page_base // page_size)
         assert (
             pages_needed <= num_blocks
@@ -1347,14 +1347,14 @@ def test_qk_norm_rope_cache_block_quant(
         checkAllclose(v_d2_ref, v_d2, msg="decode2 v", rtol=1e-2, atol=0.05)
         all_slots_d2 = torch.cat([all_slots_d1, decode2_slot_mapping])
         d2_pages = torch.unique(all_slots_d2 // page_size)
-        d2_k_err = checkAllclose(
+        checkAllclose(
             k_cache_ref.float()[d2_pages],
             k_cache.float()[d2_pages],
             msg="decode2 k_cache",
             rtol=5e-2,
             atol=0.05,
         )
-        d2_v_err = checkAllclose(
+        checkAllclose(
             v_cache_ref.float()[d2_pages],
             v_cache.float()[d2_pages],
             msg="decode2 v_cache",
