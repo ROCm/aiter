@@ -168,6 +168,8 @@ def _perform_QK_wmma_and_update_L_M(
     alibi_slope,
     qq_bias_stride_0,
     qk_scale,
+    q_scale,
+    k_scale,
     softcap,
     RCP_LN2,
     BLOCK_M: gl.constexpr,
@@ -179,11 +181,19 @@ def _perform_QK_wmma_and_update_L_M(
     Q_LOAD_LAYOUT: gl.constexpr,
     QK_WMMA_LAYOUT: gl.constexpr,
     PV_WMMA_LAYOUT: gl.constexpr,
+    IS_Q_FP8: gl.constexpr,
+    IS_KV_FP8: gl.constexpr,
 ):
     # S : shape = (BLOCK_M, TILE_SIZE), layout = QK_WMMA_LAYOUT
     S = gl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32, layout=QK_WMMA_LAYOUT)
+    pre_factor: gl.float32 = qk_scale
+    if IS_Q_FP8 and IS_KV_FP8:
+        pre_factor = pre_factor * q_scale * k_scale
+    elif IS_KV_FP8:
+        K = K.to(Q.dtype)
+        pre_factor = pre_factor * k_scale
     # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
-    S = qk_scale * MMA_operation(Q, K, S)
+    S = pre_factor * MMA_operation(Q, K, S)
     # S : shape = (BLOCK_M, TILE_SIZE), layout = Q_LOAD_LAYOUT
     # S = gl.convert_layout(S, layout=Q_LOAD_LAYOUT)
 
@@ -254,7 +264,9 @@ def _perform_PV_wmma(
     P,
     V,
     acc,
+    v_scale,
     P_DOT_LAYOUT: gl.constexpr,
+    IS_KV_FP8: gl.constexpr,
 ):
     P = P.to(V.dtype)
     P = gl.convert_layout(P, layout=P_DOT_LAYOUT)
@@ -262,6 +274,8 @@ def _perform_PV_wmma(
     # V : shape = (TILE_SIZE, HEAD_SIZE), layout = V_DOT_LAYOUT
     # acc : shape = (BLOCK_M, HEAD_SIZE), layout = PV_WMMA_LAYOUT
     acc = MMA_operation(P, V, acc)
+    if IS_KV_FP8:
+        acc = acc * v_scale
     return acc
 
 
@@ -1584,8 +1598,6 @@ def _async_load_to_lds(
 @gluon.jit
 def _request_from_lds(
     from_lds,
-    kv_scale,
-    Q_dtype,
     smem,
     wait_group,
     LOAD_LAYOUT: gl.constexpr,
@@ -1602,8 +1614,6 @@ def _request_from_lds(
         KV = gl.amd.cdna4.async_copy.load_shared_relaxed(
             smem.index(from_lds % num_stages), layout=DOT_LAYOUT
         )
-    if KV.dtype.is_fp8() and not Q_dtype.is_fp8():
-        KV = (KV.to(gl.float32) * gl.load(kv_scale)).to(Q_dtype)
     return KV, from_lds + 1
 
 
@@ -1702,6 +1712,7 @@ gluon_kernel_unified_attention_3d_async_repr = make_kernel_repr(
         "TILE_SIZE",
         "HEAD_SIZE",
         "num_warps",
+        "waves_per_eu",
         "num_stages",
         "use_buffer_load",
         "ALL_DECODE",
@@ -1723,8 +1734,9 @@ def gluon_kernel_unified_attention_3d_async(
     seq_lens_ptr,  # [num_seqs]
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
-    k_scale,  # float32
-    v_scale,  # float32
+    q_scale_ptr,  # float32
+    k_scale_ptr,  # float32
+    v_scale_ptr,  # float32
     softcap,  # float32
     num_seqs: gl.int32,  # int
     num_blocks: gl.int32,  # int
@@ -1774,6 +1786,8 @@ def gluon_kernel_unified_attention_3d_async(
     ALL_DECODE: gl.constexpr = False,  # bool
     SHUFFLED_KV_CACHE: gl.constexpr = False,  # bool
     USE_LOAD_BUFFER_OP: gl.constexpr = False,  # bool
+    IS_Q_FP8: gl.constexpr = False,  # bool
+    IS_KV_FP8: gl.constexpr = False,  # bool
 ):
     q_block_global_idx = gl.program_id(0)
     kv_head_idx = gl.program_id(1)
@@ -1809,6 +1823,15 @@ def gluon_kernel_unified_attention_3d_async(
 
     if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
         return
+
+    q_scale: gl.float32 = 1.0
+    k_scale: gl.float32 = 1.0
+    v_scale: gl.float32 = 1.0
+    if IS_Q_FP8:
+        q_scale = gl.load(q_scale_ptr)
+    if IS_KV_FP8:
+        k_scale = gl.load(k_scale_ptr)
+        v_scale = gl.load(v_scale_ptr)
 
     # block table offset for this particular sequence
     block_table_offset = seq_idx * block_table_stride
@@ -2058,8 +2081,6 @@ def gluon_kernel_unified_attention_3d_async(
 
         K, k_from_lds = _request_from_lds(
             k_from_lds,
-            k_scale,
-            Q.dtype,
             smem_K,
             wait_group=(num_stages - 2) * 2 + 1,
             LOAD_LAYOUT=K_LOAD_LAYOUT,
@@ -2143,6 +2164,8 @@ def gluon_kernel_unified_attention_3d_async(
             alibi_slope,
             qq_bias_stride_0,
             qk_scale,
+            q_scale,
+            k_scale,
             softcap,
             RCP_LN2,
             BLOCK_M,
@@ -2154,13 +2177,13 @@ def gluon_kernel_unified_attention_3d_async(
             Q_LOAD_LAYOUT,
             QK_WMMA_LAYOUT,
             PV_WMMA_LAYOUT,
+            IS_Q_FP8,
+            IS_KV_FP8,
         )
 
         # V : shape = (TILE_SIZE, HEAD_SIZE), layout = V_DOT_LAYOUT
         V, v_from_lds = _request_from_lds(
             v_from_lds,
-            v_scale,
-            Q.dtype,
             smem_V,
             wait_group=(num_stages - 1) * 2,
             LOAD_LAYOUT=V_LOAD_LAYOUT,
@@ -2173,7 +2196,7 @@ def gluon_kernel_unified_attention_3d_async(
             V = gl.convert_layout(value=V, layout=V_DOT_LAYOUT, assert_trivial=True)
 
         # acc : shape = (BLOCK_M, HEAD_SIZE), layout = PV_WMMA_LAYOUT
-        acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
+        acc = _perform_PV_wmma(P, V, acc, v_scale, P_DOT_LAYOUT, IS_KV_FP8)
 
         seq_offset += TILE_SIZE
 
@@ -2181,8 +2204,6 @@ def gluon_kernel_unified_attention_3d_async(
         # K : shape = (HEAD_SIZE, TILE_SIZE), layout = K_DOT_LAYOUT
         K, k_from_lds = _request_from_lds(
             k_from_lds,
-            k_scale,
-            Q.dtype,
             smem_K,
             wait_group=(num_stages - 2) * 2
             + 1,  # there is no async_copy in the epilogue, hence num_stages - 2
@@ -2214,6 +2235,8 @@ def gluon_kernel_unified_attention_3d_async(
             alibi_slope,
             qq_bias_stride_0,
             qk_scale,
+            q_scale,
+            k_scale,
             softcap,
             RCP_LN2,
             BLOCK_M,
@@ -2225,13 +2248,13 @@ def gluon_kernel_unified_attention_3d_async(
             Q_LOAD_LAYOUT,
             QK_WMMA_LAYOUT,
             PV_WMMA_LAYOUT,
+            IS_Q_FP8,
+            IS_KV_FP8,
         )
 
         # V : shape = (TILE_SIZE, HEAD_SIZE), layout = V_DOT_LAYOUT
         V, v_from_lds = _request_from_lds(
             v_from_lds,
-            v_scale,
-            Q.dtype,
             smem_V,
             wait_group=(num_stages - 2)
             * 2,  # there is no async_copy in the epilogue, hence num_stages - 2
@@ -2246,7 +2269,7 @@ def gluon_kernel_unified_attention_3d_async(
             V = gl.convert_layout(value=V, layout=V_DOT_LAYOUT, assert_trivial=True)
 
         # acc : shape = (BLOCK_M, HEAD_SIZE), layout = PV_WMMA_LAYOUT
-        acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
+        acc = _perform_PV_wmma(P, V, acc, v_scale, P_DOT_LAYOUT, IS_KV_FP8)
 
         seq_offset += TILE_SIZE
 
@@ -2313,14 +2336,11 @@ def _unshuffle_kv_cache(
 
 @gluon.jit
 def _buffer_load_to_reg(
-    x_scale,
-    Q_dtype,
     ptr,
     offsets,
     mask,
     other,
     cache_modifier: gl.constexpr,
-    SHUFFLED_KV_CACHE: gl.constexpr = False,
 ):
     X = gl.amd.cdna4.buffer_load(
         ptr=ptr,
@@ -2329,8 +2349,6 @@ def _buffer_load_to_reg(
         other=other,
         cache=cache_modifier,
     )
-    if X.dtype.is_fp8() and not Q_dtype.is_fp8():
-        X = (X.to(gl.float32) * gl.load(x_scale)).to(Q_dtype)
     return X
 
 
@@ -2343,6 +2361,7 @@ gluon_kernel_unified_attention_3d_repr = make_kernel_repr(
         "TILE_SIZE",
         "HEAD_SIZE",
         "num_warps",
+        "waves_per_eu",
         "num_stages",
         "ALL_DECODE",
         "SHUFFLED_KV_CACHE",
@@ -2363,8 +2382,9 @@ def gluon_kernel_unified_attention_3d(
     seq_lens_ptr,  # [num_seqs]
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
-    k_scale,  # float32
-    v_scale,  # float32
+    q_scale_ptr,  # float32
+    k_scale_ptr,  # float32
+    v_scale_ptr,  # float32
     softcap,  # float32
     num_seqs: gl.int32,  # int
     num_blocks: gl.int32,  # int
@@ -2414,6 +2434,8 @@ def gluon_kernel_unified_attention_3d(
     ALL_DECODE: gl.constexpr = False,  # bool
     SHUFFLED_KV_CACHE: gl.constexpr = False,  # bool
     USE_LOAD_BUFFER_OP: gl.constexpr = False,  # bool
+    IS_Q_FP8: gl.constexpr = False,  # bool
+    IS_KV_FP8: gl.constexpr = False,  # bool
 ):
     q_block_global_idx = gl.program_id(0)
     kv_head_idx = gl.program_id(1)
@@ -2448,6 +2470,15 @@ def gluon_kernel_unified_attention_3d(
 
     if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
         return
+
+    q_scale: gl.float32 = 1.0
+    k_scale: gl.float32 = 1.0
+    v_scale: gl.float32 = 1.0
+    if IS_Q_FP8:
+        q_scale = gl.load(q_scale_ptr)
+    if IS_KV_FP8:
+        k_scale = gl.load(k_scale_ptr)
+        v_scale = gl.load(v_scale_ptr)
 
     # block table offset for this particular sequence
     block_table_offset = seq_idx * block_table_stride
@@ -2673,14 +2704,11 @@ def gluon_kernel_unified_attention_3d(
 
         # K_load : shape = (HEAD_SIZE, TILE_SIZE), layout = K_LOAD_LAYOUT
         K = _buffer_load_to_reg(
-            k_scale,
-            Q.dtype,
             key_cache_ptr,
             k_offset.to(gl.int32),
             k_mask,
             other,
             KV_cache_modifier,
-            SHUFFLED_KV_CACHE,
         )
         if SHUFFLED_KV_CACHE:
             # smem_K.store(K)
@@ -2690,8 +2718,6 @@ def gluon_kernel_unified_attention_3d(
 
         # V_load : shape = (TILE_SIZE, HEAD_SIZE), layout = Q_LOAD_LAYOUT
         V = _buffer_load_to_reg(
-            v_scale,
-            Q.dtype,
             value_cache_ptr,
             v_offset.to(gl.int32),
             v_mask,
@@ -2724,6 +2750,8 @@ def gluon_kernel_unified_attention_3d(
             alibi_slope,
             qq_bias_stride_0,
             qk_scale,
+            q_scale,
+            k_scale,
             softcap,
             RCP_LN2,
             BLOCK_M,
@@ -2735,6 +2763,8 @@ def gluon_kernel_unified_attention_3d(
             Q_LOAD_LAYOUT,
             QK_WMMA_LAYOUT,
             PV_WMMA_LAYOUT,
+            IS_Q_FP8,
+            IS_KV_FP8,
         )
 
         if SHUFFLED_KV_CACHE:
@@ -2744,7 +2774,7 @@ def gluon_kernel_unified_attention_3d(
         else:
             V = smem_V.load(layout=V_DOT_LAYOUT)
         # acc : shape = (BLOCK_M, HEAD_SIZE), layout = PV_WMMA_LAYOUT
-        acc = _perform_PV_wmma(P, V, acc, P_DOT_LAYOUT)
+        acc = _perform_PV_wmma(P, V, acc, v_scale, P_DOT_LAYOUT, IS_KV_FP8)
 
     # store segm_output
     # acc : shape = (BLOCK_M, HEAD_SIZE), layout = PV_WMMA_LAYOUT

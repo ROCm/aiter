@@ -128,13 +128,30 @@ def ref_paged_attn(
     kv_lens: list[int],
     block_tables: torch.Tensor,
     scale: float,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     sliding_window: Optional[int] = None,
     soft_cap: Optional[float] = None,
     sinks: Optional[torch.Tensor] = None,
+    o_dtype: Optional[torch.dtype] = torch.bfloat16,
 ) -> torch.Tensor:
     num_seqs = len(query_lens)
     block_tables = block_tables.cpu().numpy()
     _, block_size, num_kv_heads, head_size = key_cache.shape
+
+    if (
+        query.dtype == key_cache.dtype and query.dtype in [torch.bfloat16, e4m3_dtype]
+    ) or (query.dtype == torch.bfloat16 and key_cache.dtype == e4m3_dtype):
+        if query.dtype == e4m3_dtype:
+            query = query.to(q_descale.dtype) * q_descale
+        if key_cache.dtype == e4m3_dtype:
+            key_cache = key_cache.to(k_descale.dtype) * k_descale
+            value_cache = value_cache.to(v_descale.dtype) * v_descale
+    else:
+        raise ValueError(
+            f"Unsupported dtype combination: Q dtype {query.dtype}, K cache dtype {key_cache.dtype}, and V cache dtype {value_cache.dtype}"
+        )
 
     outputs: list[torch.Tensor] = []
     start_idx = 0
@@ -155,7 +172,12 @@ def ref_paged_attn(
         if q.shape[1] != k.shape[1]:
             k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
             v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
-        attn = torch.einsum("qhd,khd->hqk", q, k).float()
+        k = k.to(q.dtype)
+        attn = torch.einsum("qhd,khd->hqk", q, k).float()  # GEMM at q.dtype precision
+        if query.dtype == e4m3_dtype:
+            attn = attn * q_descale
+        if key_cache.dtype == e4m3_dtype:
+            attn = attn * k_descale
         empty_mask = torch.ones(query_len, kv_len, device=q.device)
         mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
         if sliding_window is not None:
@@ -176,12 +198,15 @@ def ref_paged_attn(
         attn = torch.softmax(attn, dim=-1).to(v.dtype)
         if sinks is not None:
             attn = attn[..., :-1]
-        out = torch.einsum("hqk,khd->qhd", attn, v)
+        v = v.to(attn.dtype)
+        out = torch.einsum("hqk,khd->qhd", attn, v)  # GEMM at fp32 precision
+        if value_cache.dtype == e4m3_dtype:
+            out = out * v_descale
 
         outputs.append(out)
         start_idx += query_len
 
-    return torch.cat(outputs, dim=0)
+    return torch.cat(outputs, dim=0).to(o_dtype)
 
 
 # @pytest.mark.parametrize(
@@ -198,7 +223,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize(
     "seq_lens",
     [
-        [(1, SL)],
+        [(1, 1328)] * SL,
         # [(1, 8192)],
         # [(1, 8192)] * 4,
         # [(1, 8192)] * 8,
@@ -212,10 +237,16 @@ def ref_paged_attn(
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
 @pytest.mark.parametrize("sliding_window", SLIDING_WINDOWS)
-@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize(
+    "q_dtype, kv_dtype, o_dtype",
+    [
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16),
+        # (torch.bfloat16, e4m3_dtype, torch.bfloat16),
+        # (e4m3_dtype, e4m3_dtype, torch.bfloat16),
+    ],
+)
 @pytest.mark.parametrize("soft_cap", [None])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
-@pytest.mark.parametrize("q_dtype", QDTYPES)
 # @pytest.mark.parametrize("shuffled_kv_cache", [True, False])
 @pytest.mark.parametrize("shuffled_kv_cache", [SF])
 @pytest.mark.parametrize(
@@ -235,11 +266,12 @@ def test_triton_unified_attn(
     num_heads: tuple[int, int],
     head_size: int,
     sliding_window: Optional[int],
-    dtype: torch.dtype,
     block_size: int,
     soft_cap: Optional[float],
     num_blocks: int,
-    q_dtype: Optional[torch.dtype],
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    o_dtype: torch.dtype,
     shuffled_kv_cache: bool,
     backend: str,
     use_tdm: bool,
@@ -272,7 +304,7 @@ def test_triton_unified_attn(
             * (num_tdm_gather if use_tdm else 1)
             * block_size
             * head_size
-            * (dtype.itemsize if q_dtype is None else q_dtype.itemsize)
+            * kv_dtype.itemsize
         )
         if kv_cache_shared_mem_size > 327680:
             pytest.skip(
@@ -293,12 +325,19 @@ def test_triton_unified_attn(
     scale = head_size**-0.5
 
     query = torch.randn(
-        sum(query_lens), num_query_heads, head_size, dtype=dtype, device="cuda"
-    )
+        sum(query_lens), num_query_heads, head_size, dtype=torch.bfloat16, device="cuda"
+    ).to(q_dtype)
     key_cache = torch.randn(
-        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cuda"
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        head_size,
+        dtype=torch.bfloat16,
+        device="cuda",
     )
     value_cache = torch.randn_like(key_cache)
+    key_cache = key_cache.to(kv_dtype)
+    value_cache = value_cache.to(kv_dtype)
     cu_query_lens = torch.tensor(
         [0] + query_lens, dtype=torch.int32, device="cuda"
     ).cumsum(dim=0, dtype=torch.int32)
@@ -313,38 +352,33 @@ def test_triton_unified_attn(
         device="cuda",
     )
     sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
-    output = torch.empty_like(query)
+    output = torch.randn(
+        sum(query_lens), num_query_heads, head_size, dtype=o_dtype, device="cuda"
+    )
 
-    maybe_quantized_query = query
-    maybe_quantized_key_cache = key_cache
-    maybe_quantized_value_cache = value_cache
     q_descale = None
     k_descale = None
     v_descale = None
-    if q_dtype is not None:
-        # QKV are drawn from N(0, 1): no need for a fp8 scaling factor
-        maybe_quantized_query = query.to(q_dtype)
-        maybe_quantized_key_cache = key_cache.to(q_dtype)
-        maybe_quantized_value_cache = value_cache.to(q_dtype)
+    if q_dtype != torch.bfloat16:
+        q_descale = torch.rand((1,), dtype=torch.float32, device="cuda")
 
-        scale_shape = (num_seqs, num_kv_heads)
-        q_descale = None  # Not yet supported
-        k_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
-        v_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
+    if kv_dtype != torch.bfloat16:
+        k_descale = torch.rand((1,), dtype=torch.float32, device="cuda")
+        v_descale = torch.rand((1,), dtype=torch.float32, device="cuda")
 
     if backend == "triton":
         if shuffled_kv_cache:
-            maybe_shuffled_qnatized_key_cache, maybe_shuffled_quantized_value_cache = (
-                shuffle_kv_cache(maybe_quantized_key_cache, maybe_quantized_value_cache)
+            maybe_shuffled_key_cache, maybe_shuffled_value_cache = shuffle_kv_cache(
+                key_cache, value_cache
             )
         else:
-            maybe_shuffled_qnatized_key_cache = maybe_quantized_key_cache
-            maybe_shuffled_quantized_value_cache = maybe_quantized_value_cache
+            maybe_shuffled_key_cache = key_cache
+            maybe_shuffled_value_cache = value_cache
 
         unified_attention(
-            q=maybe_quantized_query,
-            k=maybe_shuffled_qnatized_key_cache,
-            v=maybe_shuffled_quantized_value_cache,
+            q=query,
+            k=maybe_shuffled_key_cache,
+            v=maybe_shuffled_value_cache,
             out=output,
             cu_seqlens_q=cu_query_lens,
             seqused_k=kv_lens,
@@ -364,28 +398,24 @@ def test_triton_unified_attn(
     else:
         if shuffled_kv_cache:
             maybe_sorted_block_tables = block_tables
-            maybe_shuffled_qnatized_key_cache, maybe_shuffled_quantized_value_cache = (
-                shuffle_kv_cache(maybe_quantized_key_cache, maybe_quantized_value_cache)
+            maybe_shuffled_key_cache, maybe_shuffled_value_cache = shuffle_kv_cache(
+                key_cache, value_cache
             )
         elif use_tdm and num_tdm_gather > 1:
             # note: random gather is not yet hardware verified
             # maybe_sorted_block_tables = torch.sort(block_tables, dim=-1)[0]
             maybe_sorted_block_tables = block_tables
-            maybe_shuffled_qnatized_key_cache = maybe_quantized_key_cache.permute(
-                0, 2, 1, 3
-            ).contiguous()
-            maybe_shuffled_quantized_value_cache = maybe_quantized_value_cache.permute(
-                0, 2, 1, 3
-            ).contiguous()
+            maybe_shuffled_key_cache = key_cache.permute(0, 2, 1, 3).contiguous()
+            maybe_shuffled_value_cache = value_cache.permute(0, 2, 1, 3).contiguous()
         else:
             maybe_sorted_block_tables = block_tables
-            maybe_shuffled_qnatized_key_cache = maybe_quantized_key_cache
-            maybe_shuffled_quantized_value_cache = maybe_quantized_value_cache
+            maybe_shuffled_key_cache = key_cache
+            maybe_shuffled_value_cache = value_cache
 
         gluon_unified_attention(
-            q=maybe_quantized_query,
-            k=maybe_shuffled_qnatized_key_cache,
-            v=maybe_shuffled_quantized_value_cache,
+            q=query,
+            k=maybe_shuffled_key_cache,
+            v=maybe_shuffled_value_cache,
             out=output,
             cu_seqlens_q=cu_query_lens,
             seqused_k=kv_lens,
@@ -414,13 +444,17 @@ def test_triton_unified_attn(
         kv_lens=kv_lens,
         block_tables=block_tables,
         scale=scale,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
         sinks=sinks,
+        o_dtype=o_dtype,
     )
 
     atol, rtol = 1.5e-2, 1e-2
-    if q_dtype is not None:
+    if q_dtype != torch.bfloat16:
         atol, rtol = 1.5e-1, 1.5e-1
     torch.testing.assert_close(
         output, ref_output, atol=atol, rtol=rtol

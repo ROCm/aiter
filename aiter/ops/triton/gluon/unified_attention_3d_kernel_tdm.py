@@ -88,7 +88,8 @@ class AttentionConfig:
 
     NUM_STAGES: gl.constexpr
     SHUFFLED_KV_CACHE: gl.constexpr
-    FP8_WMMA: gl.constexpr
+    IS_Q_FP8: gl.constexpr
+    IS_KV_FP8: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -113,7 +114,8 @@ class AttentionConfig:
         USE_LOAD_BUFFER_OP,
         USE_STORE_BUFFER_OP,
         SHUFFLED_KV_CACHE,
-        FP8_WMMA,
+        IS_Q_FP8,
+        IS_KV_FP8,
     ):
         # Constants
         self.HEAD_SIZE = gl.constexpr(HEAD_SIZE)
@@ -126,7 +128,8 @@ class AttentionConfig:
         self.SLIDING_WINDOW = gl.constexpr(SLIDING_WINDOW)
         self.NUM_STAGES = gl.constexpr(NUM_STAGES)
         self.SHUFFLED_KV_CACHE = gl.constexpr(SHUFFLED_KV_CACHE)
-        self.FP8_WMMA = gl.constexpr(FP8_WMMA)
+        self.IS_Q_FP8 = gl.constexpr(IS_Q_FP8)
+        self.IS_KV_FP8 = gl.constexpr(IS_KV_FP8)
         # Derived constants
         self.TILE_SIZE = gl.constexpr(BLOCK_SIZE * NUM_BLOCKS_GATHER_PER_TILE)
         self.NUM_QUERIES_PER_KV = gl.constexpr(NUM_QUERY_HEADS // NUM_KV_HEADS)
@@ -164,7 +167,7 @@ class AttentionConfig:
                 transposed=True,
                 warp_bases=warp_bases_qk,
                 reg_bases=[],
-                instr_shape=[16, 16, 32 if not self.FP8_WMMA else 64],
+                instr_shape=[16, 16, 32 if not self.IS_Q_FP8 else 64],
             )
         )
 
@@ -174,7 +177,7 @@ class AttentionConfig:
                 transposed=True,
                 warp_bases=warp_bases_pv,
                 reg_bases=[],
-                instr_shape=[16, 16, 32 if not self.FP8_WMMA else 64],
+                instr_shape=[16, 16, 32 if not self.IS_KV_FP8 else 64],
             )
         )
         self.Q_DOT_LAYOUT = gl.constexpr(
@@ -317,7 +320,7 @@ class AttentionConfig:
             self.V_LOAD_LAYOUT = gl.constexpr(None)
 
         self.q_cache_modifier = gl.constexpr(".cg")
-        self.kv_cache_modifier = gl.constexpr("")
+        self.kv_cache_modifier = gl.constexpr(".cg")
 
     @gluon.constexpr_function
     def make_kv_cache_shuffled_layout(
@@ -438,6 +441,9 @@ class AttentionProgram:
 
     qq_bias_stride_0: gl.tensor
     softcap: gl.tensor
+    q_scale: gl.tensor
+    k_scale: gl.tensor
+    v_scale: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
@@ -479,6 +485,9 @@ class AttentionProgram:
         stride_v_cache_3,
         qq_bias_stride_0,
         softcap,
+        q_scale,
+        k_scale,
+        v_scale,
     ):
         self.cfg = cfg
         self.q = q
@@ -516,6 +525,9 @@ class AttentionProgram:
         self.stride_v_cache_2 = stride_v_cache_2
         self.stride_v_cache_3 = stride_v_cache_3
         self.qq_bias_stride_0 = qq_bias_stride_0
+        self.q_scale = q_scale
+        self.k_scale = k_scale
+        self.v_scale = v_scale
         self.softcap = softcap
 
     @gluon.jit
@@ -554,6 +566,9 @@ class AttentionProgram:
         stride_v_cache_2,
         stride_v_cache_3,
         qq_bias_stride_0,
+        q_scale,
+        k_scale,
+        v_scale,
         softcap,
     ):
         # the last dimension of the stride should always be 1
@@ -737,6 +752,9 @@ class AttentionProgram:
             stride_v_cache_3,
             qq_bias_stride_0,
             softcap,
+            q_scale,
+            k_scale,
+            v_scale,
         )
 
     @gluon.jit
@@ -1060,7 +1078,13 @@ class AttentionProgram:
             dtype=gl.float32,
             layout=self.cfg.QK_WMMA_LAYOUT,
         )
-        return gl.amd.gfx1250.wmma(self.q, k, S) * self.cfg.QK_SCALE
+        pre_factor: gl.float32 = self.cfg.QK_SCALE
+        if self.cfg.IS_Q_FP8 and self.cfg.IS_KV_FP8:
+            pre_factor = pre_factor * self.q_scale * self.k_scale
+        elif self.cfg.IS_KV_FP8:
+            k = k.to(self.q.dtype)
+            pre_factor = pre_factor * self.k_scale
+        return gl.amd.gfx1250.wmma(self.q, k, S) * pre_factor
 
     @gluon.jit
     def apply_softcap(self, S):
@@ -1135,14 +1159,21 @@ class AttentionProgram:
     def softmax_part1(self, p, L, acc, alpha):
         l_ij = gl.sum(p, 1)
         acc = acc * gl.convert_layout(alpha[:, None], layout=self.cfg.PV_WMMA_LAYOUT)
-        p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
+        # p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
         L = L * alpha + l_ij
         return p, L, acc
 
     @gluon.jit
     def compute_pv(self, p, v, acc):
+        if self.cfg.IS_KV_FP8:
+            p = p.to(v.dtype)
+        else:
+            p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
         p = gl.convert_layout(p, self.cfg.P_DOT_LAYOUT)
-        return gl.amd.gfx1250.wmma(p, v, acc)
+        acc = gl.amd.gfx1250.wmma(p, v, acc)
+        if self.cfg.IS_KV_FP8:
+            acc = acc * self.v_scale
+        return acc
 
     @gluon.jit
     def store_output_3D(self, acc, M, L, segm_idx):
@@ -1323,7 +1354,27 @@ def get_seq_metadata(
     return seq_len, tiles_per_segment
 
 
-@gluon.jit
+gluon_kernel_unified_attention_3d_tdm_repr = make_kernel_repr(
+    "gluon_kernel_unified_attention_3d_tdm",
+    [
+        "num_query_heads",
+        "num_queries_per_kv",
+        "BLOCK_SIZE",
+        "TILE_SIZE",
+        "HEAD_SIZE",
+        "NUM_BLOCKS_GATHER_PER_TILE",
+        "num_warps",
+        "waves_per_eu",
+        "num_stages",
+        "ALL_DECODE",
+        "SHUFFLED_KV_CACHE",
+        "IS_Q_FP8",
+        "IS_KV_FP8",
+    ],
+)
+
+
+@gluon.jit(repr=gluon_kernel_unified_attention_3d_tdm_repr)
 def gluon_kernel_unified_attention_3d_tdm(
     segm_output_ptr,  # [num_tokens, num_query_heads, num_segments, head_size]
     segm_max_ptr,  # [num_tokens, num_query_heads, num_segments]
@@ -1336,8 +1387,9 @@ def gluon_kernel_unified_attention_3d_tdm(
     seq_lens_ptr,  # [num_seqs]
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
-    k_scale,  # float32
-    v_scale,  # float32
+    q_scale_ptr,  # [1, ], float32
+    k_scale_ptr,  # [1, ], float32
+    v_scale_ptr,  # [1, ], float32
     softcap,  # float32
     num_seqs: gl.int32,  # int
     num_blocks: gl.int32,  # int
@@ -1377,7 +1429,8 @@ def gluon_kernel_unified_attention_3d_tdm(
     SHUFFLED_KV_CACHE: gl.constexpr = False,  # bool
     USE_LOAD_BUFFER_OP: gl.constexpr = False,  # bool
     USE_STORE_BUFFER_OP: gl.constexpr = False,  # bool
-    FP8_WMMA: gl.constexpr = False,  # bool
+    IS_Q_FP8: gl.constexpr = False,  # bool
+    IS_KV_FP8: gl.constexpr = False,  # bool
 ):
     # Build config with all layouts and derived constants
     cfg = AttentionConfig(
@@ -1401,7 +1454,8 @@ def gluon_kernel_unified_attention_3d_tdm(
         USE_LOAD_BUFFER_OP,
         USE_STORE_BUFFER_OP,
         SHUFFLED_KV_CACHE,
-        FP8_WMMA,
+        IS_Q_FP8,
+        IS_KV_FP8,
     )
 
     # Workgroup offsets
@@ -1436,6 +1490,15 @@ def gluon_kernel_unified_attention_3d_tdm(
 
     if segm_idx * tiles_per_segment * cfg.TILE_SIZE >= seq_len:
         return
+
+    q_scale: gl.float32 = 1.0
+    k_scale: gl.float32 = 1.0
+    v_scale: gl.float32 = 1.0
+    if cfg.IS_Q_FP8:
+        q_scale = gl.load(q_scale_ptr)
+    if cfg.IS_KV_FP8:
+        k_scale = gl.load(k_scale_ptr)
+        v_scale = gl.load(v_scale_ptr)
 
     context_len = seq_len - cur_batch_query_len
     block_tables_ptr_shifted = block_tables_ptr + seq_idx * block_table_stride
@@ -1549,6 +1612,9 @@ def gluon_kernel_unified_attention_3d_tdm(
         stride_v_cache_2,
         stride_v_cache_3,
         qq_bias_stride_0,
+        q_scale,
+        k_scale,
+        v_scale,
         softcap,
     )
 
@@ -1577,73 +1643,6 @@ def gluon_kernel_unified_attention_3d_tdm(
     seq_offset = j_from_hbm * cfg.TILE_SIZE + gl.arange(
         0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_LAYOUT)
     )
-
-    # j_from_hbm, physical_block_idx = pgm.load_physical_block_idx(j_from_hbm, block_tables_ptr_shifted)
-    # j_from_hbm, next_physical_block_idx = pgm.load_physical_block_idx(j_from_hbm, block_tables_ptr_shifted)
-    # pgm.tdm_load_global_to_shared_k(physical_block_idx, buffer_id=0)
-    # pgm.tdm_load_global_to_shared_k(next_physical_block_idx, buffer_id=1)
-    # pgm.tdm_load_global_to_shared_v(physical_block_idx, buffer_id=0)
-
-    # k = pgm.tdm_shared_load_k(wait_count=2, buffer_id=0)
-
-    # S = pgm.compute_qk(k)
-    # S = pgm.apply_softcap(S)
-    # S = pgm.apply_mask_qk_3D(S, seq_offset, alibi_slope, qq_bias_row_ptrs)
-    # p, alpha, M = pgm.softmax_part0(S, M)
-
-    # j_from_hbm, physical_block_idx = pgm.load_physical_block_idx(j_from_hbm, block_tables_ptr_shifted)
-    # pgm.tdm_load_global_to_shared_v(next_physical_block_idx, buffer_id=1)
-    # pgm.tdm_load_global_to_shared_k(physical_block_idx, buffer_id=0)
-
-    # k = pgm.tdm_shared_load_k(wait_count=3, buffer_id=1)
-    # # Main attention loop over KV tiles (staged, num_stages=2)
-    # for j in range(pgm.tile_start, pgm.tile_end - (cfg.NUM_STAGES - 1)):
-
-    #     with gl.amd.warp_pipeline_stage("qk", priority=0):
-    #         S = pgm.compute_qk(k)
-
-    #     with gl.amd.warp_pipeline_stage("softmax", priority=1):
-    #         p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
-    #         v = pgm.tdm_shared_load_v(wait_count=2, buffer_id=buffer_id)
-    #         p = p.to(v.dtype)
-    #         next_buffer_id = pgm.get_next_buffer_id(buffer_id)
-    #         j_from_hbm, next_physical_block_idx = pgm.load_physical_block_idx(j_from_hbm, block_tables_ptr_shifted)
-    #         pgm.tdm_load_global_to_shared_k(next_physical_block_idx, buffer_id=next_buffer_id)
-
-    #     with gl.amd.warp_pipeline_stage("pv", priority=0):
-    #         acc = pgm.compute_pv(p, v, acc)
-
-    #         # buffer_id = next_buffer_id
-    #         seq_offset += cfg.TILE_SIZE
-
-    #     with gl.amd.warp_pipeline_stage("pv", priority=1):
-    #         S = pgm.apply_softcap(S)
-    #         S = pgm.apply_mask_qk_3D(S, seq_offset, alibi_slope, qq_bias_row_ptrs)
-    #         p, alpha, M = pgm.softmax_part0(S, M)
-
-    #         k = pgm.tdm_shared_load_k(wait_count=2, buffer_id=buffer_id)
-
-    #         next_buffer_id = pgm.get_next_buffer_id(buffer_id)
-    #         pgm.tdm_load_global_to_shared_v(next_physical_block_idx, buffer_id=next_buffer_id)
-
-    # # Load k_i, v_i from shared into registers
-    # k = pgm.tdm_shared_load_k(
-    #     wait_count=(cfg.NUM_STAGES - 2) * 2 + 1, buffer_id=buffer_id
-    # )
-    # # Compute attention for current tile
-    # S = pgm.compute_qk(k)
-
-    # S = pgm.apply_softcap(S)
-    # S = pgm.apply_mask_qk_3D(S, seq_offset, alibi_slope, qq_bias_row_ptrs)
-    # # S = pgm.apply_mask_qk(S, pgm.tile_end - 1)
-
-    # p, alpha, M = pgm.softmax_part0(S, M)
-    # p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
-    # v = pgm.tdm_shared_load_v(
-    #     wait_count=(cfg.NUM_STAGES - 2) * 2, buffer_id=buffer_id
-    # )
-    # p = p.to(v.dtype)
-    # acc = pgm.compute_pv(p, v, acc)
 
     for _ in range(cfg.NUM_STAGES - 1):
         j_from_hbm, physical_block_idx = pgm.load_physical_block_idx(
@@ -1682,7 +1681,6 @@ def gluon_kernel_unified_attention_3d_tdm(
         v = pgm.tdm_shared_load_v(
             wait_count=(cfg.NUM_STAGES - 1) * 2, buffer_id=buffer_id
         )
-        p = p.to(v.dtype)
         acc = pgm.compute_pv(p, v, acc)
 
         buffer_id = next_buffer_id
@@ -1705,7 +1703,6 @@ def gluon_kernel_unified_attention_3d_tdm(
         v = pgm.tdm_shared_load_v(
             wait_count=(cfg.NUM_STAGES - 2) * 2, buffer_id=buffer_id
         )
-        p = p.to(v.dtype)
         acc = pgm.compute_pv(p, v, acc)
 
         seq_offset += cfg.TILE_SIZE
@@ -1735,8 +1732,9 @@ def gluon_kernel_unified_attention_3d_tdm_pp(
     seq_lens_ptr,  # [num_seqs]
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
-    k_scale,  # float32
-    v_scale,  # float32
+    q_scale_ptr,  # [1, ] float32
+    k_scale_ptr,  # [1, ] float32
+    v_scale_ptr,  # [1, ] float32
     softcap,  # float32
     num_seqs: gl.int32,  # int
     num_blocks: gl.int32,  # int
@@ -1776,7 +1774,8 @@ def gluon_kernel_unified_attention_3d_tdm_pp(
     SHUFFLED_KV_CACHE: gl.constexpr = False,  # bool
     USE_LOAD_BUFFER_OP: gl.constexpr = False,  # bool
     USE_STORE_BUFFER_OP: gl.constexpr = False,  # bool
-    FP8_WMMA: gl.constexpr = False,  # bool
+    IS_Q_FP8: gl.constexpr = False,  # bool
+    IS_KV_FP8: gl.constexpr = False,  # bool
 ):
     # Build config with all layouts and derived constants
     cfg = AttentionConfig(
@@ -1800,7 +1799,8 @@ def gluon_kernel_unified_attention_3d_tdm_pp(
         USE_LOAD_BUFFER_OP,
         USE_STORE_BUFFER_OP,
         SHUFFLED_KV_CACHE,
-        FP8_WMMA,
+        IS_Q_FP8,
+        IS_KV_FP8,
     )
 
     # Workgroup offsets
@@ -1835,6 +1835,15 @@ def gluon_kernel_unified_attention_3d_tdm_pp(
 
     if segm_idx * tiles_per_segment * cfg.TILE_SIZE >= seq_len:
         return
+
+    q_scale: gl.float32 = 1.0
+    k_scale: gl.float32 = 1.0
+    v_scale: gl.float32 = 1.0
+    if cfg.IS_Q_FP8:
+        q_scale = gl.load(q_scale_ptr)
+    if cfg.IS_KV_FP8:
+        k_scale = gl.load(k_scale_ptr)
+        v_scale = gl.load(v_scale_ptr)
 
     context_len = seq_len - cur_batch_query_len
     block_tables_ptr_shifted = block_tables_ptr + seq_idx * block_table_stride

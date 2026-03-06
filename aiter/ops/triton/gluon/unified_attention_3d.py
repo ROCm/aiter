@@ -88,6 +88,7 @@ def make_layout_3d(
     NUM_BLOCKS_GATHER_PER_TILE: int,
     HEAD_SIZE_PADDED: int,
     shuffled_kv_cache: bool,
+    q_dtype: torch.dtype,
     kv_cache_dtype: torch.dtype,
     use_tdm: bool,
     use_async: bool,
@@ -101,7 +102,7 @@ def make_layout_3d(
             transposed=True,
             warp_bases=[(1 << i, 0) for i in range(int(math.log2(num_warps)))],
             reg_bases=[],
-            instr_shape=[16, 16, 32 if kv_cache_dtype == torch.bfloat16 else 64],
+            instr_shape=[16, 16, 32 if q_dtype == torch.bfloat16 else 64],
         )
 
         PV_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
@@ -323,6 +324,7 @@ def select_3d_config(
     num_2d_prgms,
     BLOCK_M: int,
     HEAD_SIZE_PADDED: int,
+    q_dtype: torch.dtype,
     kv_cache_dtype: torch.dtype,
     use_tdm: bool = False,
     num_tdm_gather: int = 1,
@@ -372,6 +374,7 @@ def select_3d_config(
         num_tdm_gather,
         HEAD_SIZE_PADDED,
         shuffled_kv_cache,
+        q_dtype,
         kv_cache_dtype,
         use_tdm,
         use_async,
@@ -385,7 +388,6 @@ def select_3d_config(
         attn_impl = gluon_kernel_unified_attention_3d_tdm
         layout_configs = {
             "NUM_BLOCKS_GATHER_PER_TILE": num_tdm_gather,
-            "FP8_WMMA": (kv_cache_dtype == e4m3_dtype),
         }
         attn_stages = 2
     else:
@@ -415,6 +417,8 @@ def select_3d_config(
         "num_warps": attn_warps,
         "num_stages": attn_stages,
         "waves_per_eu": 2,
+        "IS_Q_FP8": (q_dtype == e4m3_dtype),
+        "IS_KV_FP8": (kv_cache_dtype == e4m3_dtype),
         **layout_configs,
     }
 
@@ -473,7 +477,6 @@ def unified_attention(
     shuffled_kv_cache: bool = False,
 ):
     assert causal, "Only causal attention is supported"
-    assert q_descale is None, "Q scales not supported"
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -483,6 +486,7 @@ def unified_attention(
     SLIDING_WINDOW = 1 + window_size[0]
 
     num_tokens, num_query_heads, head_size = q.shape
+    q_dtype = q.dtype
     kv_cache_dtype = k.dtype
     if shuffled_kv_cache:
         # key_cache: num_blocks, num_kv_heads, block_size // 16, head_size * 16
@@ -554,6 +558,7 @@ def unified_attention(
             num_2d_prgms,
             BLOCK_M,
             head_size_padded,
+            q_dtype,
             kv_cache_dtype,
             use_tdm,
             num_tdm_gather,
@@ -597,8 +602,9 @@ def unified_attention(
             seq_lens_ptr=seqused_k,
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
-            k_scale=k_descale,
-            v_scale=v_descale,
+            q_scale_ptr=q_descale,
+            k_scale_ptr=k_descale,
+            v_scale_ptr=v_descale,
             softcap=softcap,
             num_seqs=num_seqs,
             num_blocks=num_blocks,
