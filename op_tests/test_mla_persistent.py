@@ -1217,11 +1217,12 @@ def test_mla(
             print(f"partial_out_ref shape: {partial_out_ref.shape}")
             print(f"attn_logits shape: {attn_logits.shape}")
             # import pdb; pdb.set_trace()
-            checkAllclose(
-                partial_out_ref,
-                attn_logits[: partial_out_ref.shape[0]].view(-1, nhead, kv_lora_rank),
-                msg=f"mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
-            )
+            if partial_out_ref.shape[0] != 0:
+                checkAllclose(
+                    partial_out_ref,
+                    attn_logits[: partial_out_ref.shape[0]].view(-1, nhead, kv_lora_rank),
+                    msg=f"mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
+                )
 
         cal_diff(out_ref, out_asm, "out", True)
         return err, us_asm_decode
