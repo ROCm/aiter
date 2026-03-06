@@ -39,10 +39,6 @@ def input_helper(
     seed_everything(0)
     torch.set_default_device(device)
 
-    # Need this, otherwise when we capture the graph the process
-    # for GPU 1 would run on both GPU0 and GPU1 and things would hang
-    #
-    # see also similar issue: https://github.com/Dao-AILab/flash-attention/issues/523
     torch.cuda.set_device(device)
 
     if varlen:
@@ -141,7 +137,7 @@ def nonvarlen_benchmark_configs():
     batch_sizes = [1, 4, 16]
     N_HEADS = [16, 48]
     seq_len_q = [1, 1024, 4096]
-    seq_len_k = [163, 8192]
+    seq_len_k = [8192]
     HEAD_DIM = 128
     V_HEAD_DIM = HEAD_DIM
     configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_q, seq_len_k))
@@ -154,7 +150,7 @@ def nonvarlen_benchmark_configs():
 
 def varlen_benchmark_configs():
     batch_sizes = [1, 4, 8]
-    N_HEADS = [16, 32]
+    N_HEADS = [16, 48]
     seq_len_q = [1, 1024, 4096]
     seq_len_k = [8192]
     HEAD_DIM = 128
@@ -314,8 +310,8 @@ def run_benchmark(custom, args):
             seqlens_q = torch.tensor([N_CTX_Q for _ in range(BATCH)], dtype=torch.int32, device="cuda")
             seqlens_k = torch.tensor([N_CTX_K for _ in range(BATCH)], dtype=torch.int32, device="cuda")
         else:
-            seqlens_q = torch.randint(16,N_CTX_Q + 1, (BATCH,), dtype=torch.int32, device="cuda")
-            seqlens_k = torch.randint(16,N_CTX_K + 1, (BATCH,), dtype=torch.int32, device="cuda")
+            seqlens_q = torch.randint(1, N_CTX_Q + 1, (BATCH,), dtype=torch.int32, device="cuda")
+            seqlens_k = torch.randint(N_CTX_Q, N_CTX_K + 1, (BATCH,), dtype=torch.int32, device="cuda")
 
         # turn DECODE_P of the samples to decode samples (seqlen_q == 1)
         if DECODE_P > 0.0:
@@ -324,7 +320,13 @@ def run_benchmark(custom, args):
                 # choose which samples become decode samples
                 decode_idx = torch.randperm(BATCH, device=seqlens_q.device)[:num_decode]
                 seqlens_q[decode_idx] = 1
-        
+
+        if causal:
+            if (seqlens_k < seqlens_q).any():
+                print(f"Warning: clamping seqlens_k to be >= seqlens_q for config "
+                      f"(BATCH={BATCH}, HQ={HQ}, HK={HK}, N_CTX_Q={N_CTX_Q}, N_CTX_K={N_CTX_K})")
+            seqlens_k = torch.maximum(seqlens_k, seqlens_q)
+
         num_seqs = BATCH
         num_query_heads = HQ
         num_kv_heads = HK
@@ -333,9 +335,11 @@ def run_benchmark(custom, args):
         max_query_len = max(seqlens_q).item()
         max_kv_len = max(seqlens_k).item()
         soft_cap = args.softcap
-        # TODO provide sensible defaults
         block_size = args.block_size if args.block_size else 512
-        num_blocks = args.num_blocks if args.num_blocks else (max_kv_len * BATCH // block_size + 1)
+        max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+        min_required_blocks = BATCH * max_num_blocks_per_seq
+        num_blocks = args.num_blocks if args.num_blocks else max(min_required_blocks * 4, 2048)
+        num_blocks = max(num_blocks, min_required_blocks)
 
         window_size = (args.sliding_window - 1, 0) if args.sliding_window is not None else (-1, -1)
         scale = D_HEAD**-0.5
@@ -351,8 +355,6 @@ def run_benchmark(custom, args):
         cu_seqlens_q[1:] = seqlens_q.cumsum(dim=0, dtype=torch.int32)
         cu_seqlens_k = torch.zeros(len(seqlens_k) + 1, dtype=torch.int32, device="cuda")
         cu_seqlens_k[1:] = seqlens_k.cumsum(dim=0, dtype=torch.int32)
-
-        max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
         block_tables = torch.randint(
             0,
             num_blocks,
@@ -373,15 +375,11 @@ def run_benchmark(custom, args):
         if args.fp8:
             from aiter.ops.triton.utils.types import e4m3_dtype
             FP8_TYPE = e4m3_dtype
-            # FP8_MAX = torch.finfo(FP8_TYPE).max
             maybe_quantized_query = (query).to(FP8_TYPE)
-            # kernel does not support descaling
-            # k_descale = (key_cache.max() / FP8_MAX).to(torch.float32)
-            # v_descale = (value_cache.max() / FP8_MAX).to(torch.float32) 
             maybe_quantized_key_cache = (key_cache).to(FP8_TYPE)
             maybe_quantized_value_cache = (value_cache).to(FP8_TYPE)
             scale_shape = (1,)
-            q_descale = None  # Not yet supported
+            q_descale = None
             k_descale = torch.ones(scale_shape, dtype=torch.float32, device="cuda")
             v_descale = torch.ones(scale_shape, dtype=torch.float32, device="cuda")
         else:
@@ -410,8 +408,9 @@ def run_benchmark(custom, args):
         ms = triton.testing.do_bench(fn)
         
         if args.test:
+            fn()
             ref_output = ref_paged_attn(
-                query=query.clone(),
+                query=query,
                 key_cache=key_cache,
                 value_cache=value_cache,
                 query_lens=seqlens_q,
@@ -425,7 +424,6 @@ def run_benchmark(custom, args):
             atol, rtol = 1.5e-2, 1e-2
             if args.fp8:
                 atol, rtol = 1.5e-1, 1.5e-1
-            fn() # evaluate function
             torch.testing.assert_close(
                 output, ref_output, atol=atol, rtol=rtol
             ), f"{torch.max(torch.abs(output - ref_output))}"
@@ -522,8 +520,8 @@ def parse_args():
     parser.add_argument(
         "-num_blocks",
         type=parse_int_or_list,
-        default=15535,
-        help="number of blocks in kv cache",
+        default=0,
+        help="number of blocks in kv cache (0=auto)",
     )
 
     parser.add_argument(
