@@ -21,7 +21,7 @@ def _rms_norm(
 @triton.jit
 def _fused_qkv_split_qk_rope_kernel(
     qkv_ptr,
-    q_weight_ptr, # RMS norm weight, shape: [D]
+    q_weight_ptr,
     k_weight_ptr,
     cos_ptr,
     sin_ptr,
@@ -31,6 +31,9 @@ def _fused_qkv_split_qk_rope_kernel(
     gate_ptr,
     k_ptr,
     v_ptr,
+    key_cache_ptr,
+    value_cache_ptr,
+    slot_mapping_ptr,
     T,
     eps,
     stride_qkv_t,
@@ -44,6 +47,14 @@ def _fused_qkv_split_qk_rope_kernel(
     stride_kv_t,
     stride_kv_h,
     stride_kv_d,
+    key_cache_stride_t,
+    key_cache_stride_h,
+    key_cache_stride_d,
+    key_cache_stride_b,
+    value_cache_stride_t,
+    value_cache_stride_h,
+    value_cache_stride_d,
+    value_cache_stride_b,
     REUSE_FREQS_FRONT_PART: tl.constexpr,
     IS_NEOX: tl.constexpr,
     HAVE_POS: tl.constexpr,
@@ -54,6 +65,7 @@ def _fused_qkv_split_qk_rope_kernel(
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_D_HALF: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr, # PagedAttention block size
 ):
     tl.assume(stride_qkv_t > 0)
     tl.assume(stride_qkv_d > 0)
@@ -123,18 +135,14 @@ def _fused_qkv_split_qk_rope_kernel(
     )
     q = tl.load(qkv_ptr + q_in_offs, mask=x_mask)
 
-    # Q rms norm
     q_weight_offs = d_offs
     q_weight = tl.load(q_weight_ptr + q_weight_offs)
-
     q = _rms_norm(q, q_weight, BLOCK_D, eps)
 
     if ENABLE_GATED_Q:
         Q_SIZE = QH * BLOCK_D
-
         d_gate_offs = tl.arange(0, BLOCK_D)
         x_gate_mask = t_mask[:, None] & (d_gate_offs < BLOCK_D)[None, :]
-
         gate_in_offs = (
             t_offs[:, None] * stride_qkv_t
             + (Q_SIZE + H_OFFS_SIZE + d_gate_offs)[None, :]
@@ -184,10 +192,8 @@ def _fused_qkv_split_qk_rope_kernel(
         k = tl.load(qkv_ptr + k_in_offs, mask=x_mask)
         v = tl.load(qkv_ptr + v_in_offs, mask=x_mask)
 
-        # K RMS norm
         k_weight_offs = d_offs
         k_weight = tl.load(k_weight_ptr + k_weight_offs)
-
         k = _rms_norm(k, k_weight, BLOCK_D, eps)
 
         if IS_NEOX:
@@ -199,13 +205,39 @@ def _fused_qkv_split_qk_rope_kernel(
                 k, qk_rotated_mask, BLOCK_T, BLOCK_D, BLOCK_D_HALF
             )
 
+        k = k * cos + k_rotated * sin
+        
+        # Store to contiguous K/V buffers
         kv_out_offs = (
             t_offs[:, None] * stride_kv_t
             + d_offs[None, :] * stride_kv_d
             + hq * stride_kv_h
         )
-        k = k * cos + k_rotated * sin
-        k = k.to(k_ptr.dtype.element_ty)
-        tl.store(k_ptr + kv_out_offs, k, mask=x_mask)
-        v = v.to(v_ptr.dtype.element_ty)
-        tl.store(v_ptr + kv_out_offs, v, mask=x_mask)
+        tl.store(k_ptr + kv_out_offs, k.to(k_ptr.dtype.element_ty), mask=x_mask)
+        tl.store(v_ptr + kv_out_offs, v.to(v_ptr.dtype.element_ty), mask=x_mask)
+
+        # KV Caching Logic
+        slots = tl.load(slot_mapping_ptr + t_offs, mask=t_mask)
+        
+        # Calculate Paged Cache offsets
+        b_idx = slots % BLOCK_SIZE
+        t_slot_idx = slots // BLOCK_SIZE
+        
+        # We process a block of T. We need to handle mask for slots >= 0
+        cache_mask = x_mask & (slots[:, None] >= 0)
+
+        k_cache_offs = (
+            t_slot_idx[:, None] * key_cache_stride_t
+            + hq * key_cache_stride_h
+            + d_offs[None, :] * key_cache_stride_d
+            + b_idx[:, None] * key_cache_stride_b
+        )
+        tl.store(key_cache_ptr + k_cache_offs, k.to(key_cache_ptr.dtype.element_ty), mask=cache_mask)
+
+        v_cache_offs = (
+            t_slot_idx[:, None] * value_cache_stride_t
+            + hq * value_cache_stride_h
+            + d_offs[None, :] * value_cache_stride_d
+            + b_idx[:, None] * value_cache_stride_b
+        )
+        tl.store(value_cache_ptr + v_cache_offs, v.to(value_cache_ptr.dtype.element_ty), mask=cache_mask)
