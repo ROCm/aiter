@@ -38,7 +38,7 @@ __all__ = ["fused_allreduce_add_rms_quant_gemm"]
 logger = logging.getLogger(__name__)
 
 ALLREDUCE_IMPL = os.environ.get(
-    "VLLM_ROCM_FUSED_ALLREDUCE", "iris_twoshot_2d_hipblaslt"
+    "VLLM_ROCM_FUSED_ALLREDUCE", "iris_twoshot_2d_gemm"
 )
 
 
@@ -108,6 +108,15 @@ def fused_allreduce_add_rms_quant_gemm(
             *args
         )
 
+    elif impl == "iris_twoshot_2d_gemm":
+        from .iris_twoshot_2d_gemm_allreduce import (
+            fused_allreduce_add_rms_row_quant_gemm_iris_twoshot_2d_gemm,
+        )
+
+        return fused_allreduce_add_rms_row_quant_gemm_iris_twoshot_2d_gemm(
+            *args
+        )
+
     elif impl == "iris_twoshot_delayed":
         from .iris_twoshot_delayed_allreduce import (
             fused_allreduce_add_rms_delayed_quant_gemm_iris_twoshot,
@@ -138,5 +147,6 @@ def fused_allreduce_add_rms_quant_gemm(
             f"Unknown impl '{impl}', expected 'torch', 'iris_oneshot',"
             f" 'iris_twoshot', 'iris_twoshot_row',"
             f" 'iris_twoshot_row_hipblaslt', 'iris_twoshot_2d_hipblaslt',"
+            f" 'iris_twoshot_2d_gemm',"
             f" 'iris_twoshot_delayed', or 'iris_partial_gemm'"
         )
