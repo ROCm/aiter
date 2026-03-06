@@ -5,6 +5,7 @@
 #endif
 #include <memory>
 #include <string>
+#include <mutex>
 
 namespace aiter {
 #if FAV3_ON
@@ -240,19 +241,24 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     };
 
     AiterAsmKernel* impl_ptr = nullptr;
+    static std::mutex impl_ptr_mutex;
     static thread_local std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>>
         impl_ptr_map;
+#define LOCK_IMPL_PTR_MAP   std::lock_guard<std::mutex> lock(impl_ptr_mutex)
 
     const auto& cfg     = it->second;
     const char* name    = cfg.knl_name.c_str();
     std::string co_name = get_kernel_co_name(cfg.co_name, arch_id);
 
-    auto result = impl_ptr_map.emplace(name, nullptr);
-    if(result.second)
     {
+      LOCK_IMPL_PTR_MAP;
+      auto result = impl_ptr_map.emplace(name, nullptr);
+      if(result.second)
+      {
         result.first->second = std::make_unique<AiterAsmKernel>(name, co_name.c_str());
+      }
+      impl_ptr = result.first->second.get();
     }
-    impl_ptr = result.first->second.get();
 
     fmha_fwd_v3_args args;
     size_t arg_size = sizeof(args);
