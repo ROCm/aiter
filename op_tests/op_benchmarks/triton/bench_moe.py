@@ -172,9 +172,8 @@ def run_benchmark(args):
     if int4_w4a16:
         assert group_size is not None, "set group_size with -group_size"
 
-    kernel_name = "_fused_moe_kernel"
     if (int8_w8a16 or int4_w4a16) and (group_size is not None) and group_size > 0:
-        kernel_name = "_fused_moe_kernel_gptq_awq"
+        pass
 
     x_vals_list = model_benchmark_configs(args)
     x_names = ["model", "M", "N", "K", "E", "top_k"]

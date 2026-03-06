@@ -311,7 +311,7 @@ def _persistent_lean_attention(
     kernel_timing["attn_fwd"]["start_event"].record()
     """
 
-    la_kernel = la_persistent[grid](
+    la_persistent[grid](
         False,
         0,
         q,

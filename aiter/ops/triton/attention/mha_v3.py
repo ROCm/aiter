@@ -1152,11 +1152,11 @@ class _FlashAttnVarlenFP8Wrapper(torch.autograd.Function):
         sm_margin: int,
     ):
         # Determine heads and head_dim from input shapes
-        total_q = q.shape[0]
+        q.shape[0]
         num_q_heads = q.shape[1]
         head_dim = q.shape[2]
 
-        total_k = k.shape[0]
+        k.shape[0]
         num_kv_heads = k.shape[1]
 
         # Quantize inputs to FP8 using _quantize_thd for varlen tensors

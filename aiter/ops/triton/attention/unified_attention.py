@@ -29,13 +29,13 @@ def select_2d_config(
     max_num_stages_2d = 4
     if head_size > 128:
         max_num_stages_2d = 2
-    if all_decode == False:
+    if not all_decode:
         num_stages_2d = 1
         num_warps = 2
     else:
         num_stages_2d = 3
         num_warps = 2
-        TILE_SIZE = block_size
+        TILE_SIZE = min(triton.next_power_of_2(block_size), 64)
 
     if max_seqlen_q >= 256:
         BLOCK_M = 128
@@ -58,8 +58,8 @@ def select_3d_config(
 ):
     reduce_num_warps = 2
     attn_warps = 2
-    TILE_SIZE = block_size
-    MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
+    TILE_SIZE = min(triton.next_power_of_2(block_size), 64)
+    # MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     num_segments = math.ceil(target_num_prgms / num_2d_prgms)
     num_segments = triton.next_power_of_2(num_segments)
     num_segments = min(num_segments, 128)
@@ -136,6 +136,7 @@ def unified_attention(
     block_size = v.shape[1]
     num_seqs = len(seqused_k)
     num_query_heads = q.shape[1]
+
     num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
@@ -159,6 +160,7 @@ def unified_attention(
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
+
     # if batch contains a prefill
     if use_2d_kernel(
         head_size,

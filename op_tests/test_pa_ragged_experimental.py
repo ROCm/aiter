@@ -2,17 +2,11 @@ import random
 from typing import List, Optional, Tuple, Union
 import itertools
 import torch
-import aiter
-import pytest
-from aiter.test_common import checkAllclose, perftest, tensor_dump, tensor_load
-from aiter import pertoken_quant
 from aiter import dtypes
 from enum import Enum
-from einops import rearrange
 import argparse
 import os
 import numpy as np
-from aiter import paged_attention_ragged
 
 uniform_range = (-1, 1)
 
@@ -105,7 +99,7 @@ def kv_ptr_factory(
     )  # e.g., ctx_lens=10, page_size=3 --> padded_ctx_lens=12
     index_total = num_seqs * padded_ctx_lens
     head_per_row = int(np.ceil(ctx_lens / page_size))
-    head_total = num_seqs * int(np.ceil(ctx_lens / page_size))
+    num_seqs * int(np.ceil(ctx_lens / page_size))
 
     # Generate heads (Start from 0, page_size, 2xpage_size, ...)
     all_heads = np.arange(0, index_total, page_size)
@@ -207,7 +201,7 @@ def test_paged_attention(
     torch.set_default_device(device)
     block_size = 1
 
-    if in_pt == None:
+    if in_pt is None:
         # Using default kv_scale
         k_scale = v_scale = torch.tensor([1.0], dtype=dtypes.fp32)
         scale = float(1.0 / (head_size**0.5))
@@ -216,7 +210,7 @@ def test_paged_attention(
         if use_alibi:
             alibi_slopes = torch.randn(num_query_heads, dtype=dtypes.fp32)
         assert num_query_heads % num_kv_heads == 0
-        num_queries_per_kv = num_query_heads // num_kv_heads
+        num_query_heads // num_kv_heads
         max_seq_len = ctx_lens
         padded_ctx_lens = page_size * int(np.ceil(max_seq_len / page_size))  # e.g.,
         num_blocks = padded_ctx_lens * num_seqs
@@ -249,7 +243,7 @@ def test_paged_attention(
 
         data = torch.load(in_pt)
         query = data["q"].clone().detach().to(TARGET_DEVICE)
-        workspace = torch.empty(*data["workspace_buffer_shape"]).to(TARGET_DEVICE)
+        torch.empty(*data["workspace_buffer_shape"]).to(TARGET_DEVICE)
         key_cache = torch.empty(*data["k_buffer_shape"]).to(TARGET_DEVICE)
         value_cache = torch.empty(*data["v_buffer_shape"]).to(TARGET_DEVICE)
         kv_indptr = data["kv_indptr"].clone().detach().to(TARGET_DEVICE)
@@ -374,7 +368,6 @@ def test_paged_attention(
     #             f"_PARTITION_SIZE_ROCM={_PARTITION_SIZE_ROCM}")
 
     target_dtypes = [torch.float, torch.float, torch.bfloat16]
-    import itertools
 
     accu_bytes = list(itertools.accumulate(bytes_sizes, initial=0))
 

@@ -366,7 +366,6 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         tunedf,
         args,
     ):
-        issorted = args.sort
         useSplitK = args.splitK
         mp_num = args.mp
         shape_grouped = False

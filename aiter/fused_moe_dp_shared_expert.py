@@ -151,9 +151,8 @@ def fused_moe_dp_share_expert(
     ], f"Invalid MoE weight: {w1.shape=} {w2.shape=}"
     isG1U1 = inter_dim != w1.shape[1]
 
-    global_E = E
     if expert_mask is not None:
-        global_E = expert_mask.numel()
+        expert_mask.numel()
     dtype = hidden_states.dtype if dtype is None else dtype
     assert dtype in [
         dtypes.fp16,

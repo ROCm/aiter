@@ -25,7 +25,7 @@ Example usage1 for aot:
 
 import functools
 import os
-from typing import Callable, Dict, Optional
+from typing import Callable, Optional
 import threading
 import triton.compiler.compiler as triton_compiler
 

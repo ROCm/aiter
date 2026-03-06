@@ -140,8 +140,6 @@ def input_la_helper(
         list_sum_block_n.append(len_sum)
     batch_num_block_n = torch.tensor(list_sum_block_n, device="cuda", dtype=torch.int32)
 
-    sm_scale = 0.5
-
     # Allocate Tensors
     q = torch.empty((H_Q, N_CTX_Q * B, D), dtype=dtype, device="cuda").normal_(
         mean=0.0, std=0.5
@@ -274,39 +272,45 @@ def paged_attn_decode(
 
     fn = None
     if OP == "PagedAttention":
-        fn = lambda: paged_attention_decode(
-            output=triton_output,
-            query=query,
-            key_cache=key_cache_tri,
-            value_cache=value_cache_tri,
-            seq_lens=context_lens,
-            block_tables=block_tables,
-            attn_scale=attn_scale,
-            max_seq_len=max_context_len,
-            compute_type=compute_type,
-            k_scale=k_scale,
-            v_scale=v_scale,
-        )
+
+        def fn():
+            return paged_attention_decode(
+                output=triton_output,
+                query=query,
+                key_cache=key_cache_tri,
+                value_cache=value_cache_tri,
+                seq_lens=context_lens,
+                block_tables=block_tables,
+                attn_scale=attn_scale,
+                max_seq_len=max_context_len,
+                compute_type=compute_type,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+
     elif OP == "LeanAttentionPaged":
-        fn = lambda: persistent_lean_attention_paged(
-            q=q,
-            k=k,
-            v=v,
-            kv_block_tables=kv_block_tables,
-            Mp=Mp,
-            Lp=Lp,
-            Op=Op,
-            locks=locks,
-            batch_num_block_n=batch_num_block_n,
-            total_programs=total_programs,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            # d: int,
-            batch_size=BS,
-            sm_scale=0.5,
-            num_warps=4,
-            waves_per_eu=2,
-        )
+
+        def fn():
+            return persistent_lean_attention_paged(
+                q=q,
+                k=k,
+                v=v,
+                kv_block_tables=kv_block_tables,
+                Mp=Mp,
+                Lp=Lp,
+                Op=Op,
+                locks=locks,
+                batch_num_block_n=batch_num_block_n,
+                total_programs=total_programs,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                # d: int,
+                batch_size=BS,
+                sm_scale=0.5,
+                num_warps=4,
+                waves_per_eu=2,
+            )
+
     else:
         print(f"Unknown op {OP}")
 

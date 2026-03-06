@@ -174,7 +174,7 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         ret["asm-nshuff err"] = err_asm_noshuffle
 
     a, us = run_gemm_triton(x, weight, bias, otype, scaleA, scaleB)
-    err = checkAllclose(b, a)
+    checkAllclose(b, a)
     ret["triton us"] = us
 
     return ret
