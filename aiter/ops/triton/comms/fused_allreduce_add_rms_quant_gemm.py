@@ -14,11 +14,11 @@ All FP8 is internal to the fusion -- the op takes BF16 in and produces
 BF16 GEMM output + updated residual.
 
 Implementations:
-1. "triton" - Iris AllReduce + inlined Triton GEMM. Single kernel launch.
-2. "hipblaslt" - Iris AllReduce + external hipBLASLt GEMM. Two kernel launches.
-3. "torch" - NCCL AllReduce + torch ops. Reference implementation.
+1. "one" - Iris AllReduce + inlined Triton GEMM. Single kernel launch.
+2. "split" - Iris AllReduce + external hipBLASLt GEMM. Two kernel launches.
+3. "ref" - NCCL AllReduce + torch ops. Reference implementation.
 
-Default: "triton"
+Default: "one"
 """
 
 import logging
@@ -32,7 +32,7 @@ __all__ = ["fused_allreduce_add_rms_quant_gemm"]
 logger = logging.getLogger(__name__)
 
 ALLREDUCE_IMPL = os.environ.get(
-    "VLLM_ROCM_FUSED_ALLREDUCE", "triton"
+    "VLLM_ROCM_FUSED_ALLREDUCE", "one"
 )
 
 
@@ -59,29 +59,29 @@ def fused_allreduce_add_rms_quant_gemm(
         gemm_weight, weight_scale, out_dtype, residual, bias,
     )
 
-    if impl == "triton":
-        from .fused_allreduce_add_rms_quant_gemm_triton import (
-            fused_allreduce_add_rms_quant_gemm_triton,
+    if impl == "one":
+        from .fused_allreduce_add_rms_quant_gemm_one import (
+            fused_allreduce_add_rms_quant_gemm_one,
         )
 
-        return fused_allreduce_add_rms_quant_gemm_triton(*args)
+        return fused_allreduce_add_rms_quant_gemm_one(*args)
 
-    elif impl == "hipblaslt":
-        from .fused_allreduce_add_rms_quant_gemm_hipblaslt import (
-            fused_allreduce_add_rms_quant_gemm_hipblaslt,
+    elif impl == "split":
+        from .fused_allreduce_add_rms_quant_gemm_split import (
+            fused_allreduce_add_rms_quant_gemm_split,
         )
 
-        return fused_allreduce_add_rms_quant_gemm_hipblaslt(*args)
+        return fused_allreduce_add_rms_quant_gemm_split(*args)
 
-    elif impl == "torch":
-        from .fused_allreduce_add_rms_quant_gemm_torch import (
-            fused_allreduce_add_rms_quant_gemm_torch,
+    elif impl == "ref":
+        from .fused_allreduce_add_rms_quant_gemm_ref import (
+            fused_allreduce_add_rms_quant_gemm_ref,
         )
 
-        return fused_allreduce_add_rms_quant_gemm_torch(*args)
+        return fused_allreduce_add_rms_quant_gemm_ref(*args)
 
     else:
         raise ValueError(
             f"Unknown impl '{impl}', expected"
-            f" 'triton', 'hipblaslt', or 'torch'"
+            f" 'one', 'split', or 'ref'"
         )

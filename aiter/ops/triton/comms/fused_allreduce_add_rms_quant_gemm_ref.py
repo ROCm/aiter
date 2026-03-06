@@ -14,10 +14,10 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-__all__ = ["fused_allreduce_add_rms_quant_gemm_torch"]
+__all__ = ["fused_allreduce_add_rms_quant_gemm_ref"]
 
 
-def fused_allreduce_add_rms_quant_gemm_torch(
+def fused_allreduce_add_rms_quant_gemm_ref(
     input: torch.Tensor,
     rms_weight: torch.Tensor,
     rms_eps: float,
