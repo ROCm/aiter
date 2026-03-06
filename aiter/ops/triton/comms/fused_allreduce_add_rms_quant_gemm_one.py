@@ -3,17 +3,32 @@
 """
 Iris fused AllReduce + RMSNorm + per-row FP8 Quant + partial GEMM + allgather.
 
-Single Triton kernel with 2 phases:
-  Phase 1 (Comm + GEMM): Each rank reduces its assigned rows from the
-    symmetric heap, applies RMSNorm + per-row FP8 quant, then immediately
-    does a small GEMM on just its owned rows. The BF16 GEMM output is
-    broadcast to all peers via iris.store.
-  Phase 2 (Allgather): Each rank reads other ranks' GEMM output rows
-    from the symmetric heap via iris.load, assembling the full output.
+Single Triton kernel, two passes per block of BLOCK_SIZE_M owned rows:
 
-No cross-rank barrier needed between quant and GEMM because each rank
-only GEMMs its own rows. No hipBLASLt needed because the per-rank GEMM
-is small (M/world_size rows).
+  Pass 1 (Allreduce + scalars): Tile over K in GEMM_BLOCK_K chunks.
+    For each tile: allreduce via iris.load, store to result_out,
+    accumulate sq_sum (for RMSNorm variance) and weighted_amax
+    (for quant scale). After the loop, compute rrms and scale.
+
+  Pass 2 (GEMM): Tile over K and output columns. For each tile:
+    load allreduced BF16 from result_out (L2 cache hit), apply
+    inline RMSNorm + FP8 quant using rrms/scale from pass 1,
+    tl.dot with weight. After all K tiles, broadcast BF16 GEMM
+    output to all peers via iris.store.
+
+After the main loop, a copy phase assembles the full GEMM output
+from the symmetric heap into the output tensor.
+
+Key insight: max(|x * rrms * rms_w|) = rrms * max(|x * rms_w|).
+Since rrms is per-row, we accumulate max(|x * rms_w|) during pass 1
+before rrms is known, then multiply afterwards. This avoids a third
+pass for the quant scale.
+
+No scratch buffers — result_out (needed anyway for residual chain)
+serves as the intermediate between passes.
+
+No cross-rank barrier between passes because each rank only GEMMs
+its own rows.
 
 CUDA graph compatibility:
 - Buffer pre-allocation with view pattern
@@ -40,13 +55,6 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 
-def _compute_chunk_size(
-    comm_sms: int, num_xcds: int, swizzle_size: int = 4
-) -> int:
-    chunk = swizzle_size * swizzle_size
-    return min(chunk, comm_sms // num_xcds)
-
-
 def extract_group_info(
     shmem: Any,
 ) -> Tuple[int, int, int, int, int]:
@@ -67,26 +75,23 @@ def extract_group_info(
 @triton.jit
 def persistent_fused_allreduce_rmsnorm_quant_partial_gemm(
     # Symmetric heap buffers
-    input_ptr,
-    quant_local_ptr,
-    scale_local_ptr,
-    # GEMM output on symmetric heap (for allgather)
-    gemm_heap_ptr,
-    # Regular GPU memory
-    result_out_ptr,
-    gemm_out_ptr,
-    # GEMM parameters
-    gemm_weight_ptr,
-    bias_ptr,
-    weight_scale_ptr,
-    K_GEMM,
-    stride_gw_k,
-    stride_gw_n,
-    stride_go_m,
-    stride_go_n,
-    stride_gh_m,
-    stride_gh_n,
-    # Residual (regular GPU memory; dummy ptr when HAS_RESIDUAL=False)
+    input_ptr,        # (M, N) on heap — input partials from each rank
+    gemm_heap_ptr,    # (M, K_GEMM) on heap — GEMM output, broadcast target
+    # Regular GPU memory outputs
+    result_out_ptr,   # (M, N) BF16 — allreduced result (residual chain + GEMM input)
+    gemm_out_ptr,     # (M, K_GEMM) — final GEMM output (assembled from heap)
+    # GEMM weight and parameters
+    gemm_weight_ptr,  # (N, K_GEMM) FP8 — weight matrix
+    bias_ptr,         # (K_GEMM,) or dummy when HAS_BIAS=False
+    weight_scale_ptr, # scalar f32 — per-tensor weight scale
+    K_GEMM,           # output columns of GEMM
+    stride_gw_k,      # weight stride dim 0 (K/N direction)
+    stride_gw_n,      # weight stride dim 1 (output direction)
+    stride_go_m,      # gemm_out stride dim 0
+    stride_go_n,      # gemm_out stride dim 1
+    stride_gh_m,      # gemm_heap stride dim 0
+    stride_gh_n,      # gemm_heap stride dim 1
+    # Residual (dummy ptr when HAS_RESIDUAL=False)
     residual_in_ptr,
     # RMSNorm weight
     rms_weight_ptr,
@@ -99,14 +104,9 @@ def persistent_fused_allreduce_rmsnorm_quant_partial_gemm(
     # Input strides
     stride_in_m,
     stride_in_n,
-    # Quant local strides
-    stride_ql_m,
-    stride_ql_n,
     # Result out strides
     stride_out_m,
     stride_out_n,
-    # Scale local stride
-    stride_sl,
     # Iris params
     heap_bases: tl.tensor,
     group_rank: tl.constexpr,
@@ -114,311 +114,239 @@ def persistent_fused_allreduce_rmsnorm_quant_partial_gemm(
     world_size: tl.constexpr,
     rank_start: tl.constexpr,
     rank_stride: tl.constexpr,
-    # Comm tile params
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    ACTUAL_N: tl.constexpr,
+    # Tile params
+    BLOCK_SIZE_M: tl.constexpr,   # rows per block (>= 16 for tl.dot)
     HAS_RESIDUAL: tl.constexpr,
     HAS_BIAS: tl.constexpr,
-    PADDED_N: tl.constexpr,
-    COMM_SMS: tl.constexpr,
-    NUM_XCDS: tl.constexpr,
-    CHUNK_SIZE: tl.constexpr,
-    DISTRIBUTION: tl.constexpr,
+    COMM_SMS: tl.constexpr,       # number of persistent CTAs
     # GEMM tile params
-    GEMM_BLOCK_M: tl.constexpr,
-    GEMM_BLOCK_N: tl.constexpr,
-    GEMM_BLOCK_K: tl.constexpr,
-    GEMM_GROUP_SIZE_M: tl.constexpr,
-    EVEN_GEMM_K: tl.constexpr,
+    GEMM_BLOCK_N: tl.constexpr,   # output column tile size
+    GEMM_BLOCK_K: tl.constexpr,   # reduction tile size (also comm tile width)
+    EVEN_GEMM_K: tl.constexpr,    # True when N % GEMM_BLOCK_K == 0
 ):
-    """Fused AllReduce + RMSNorm + per-row FP8 quant + partial GEMM + allgather.
+    """Fused AllReduce + RMSNorm + FP8 quant + partial GEMM + allgather.
 
-    Phase 1: Each rank reduces its assigned rows, applies RMSNorm + per-row
-    FP8 quant, does GEMM on owned rows, broadcasts BF16 GEMM output to peers.
-    Phase 2: Each rank reads all other ranks' GEMM output via iris.load.
+    Two passes per block:
+      Pass 1: tiled allreduce, accumulate sq_sum + weighted_amax
+      Pass 2: tiled GEMM with inline rmsnorm + quant
+    Then broadcast + copy.
     """
     pid = tl.program_id(0)
 
-    # ================================================================
-    # Phase 1: Reduce + RMSNorm + Quant + partial GEMM + broadcast
-    # ================================================================
-
-    # Row distribution across ranks (block distribution)
+    # Row distribution: contiguous block of rows per rank
     rows_per_rank = tl.cdiv(M, world_size)
-    if DISTRIBUTION == 0:
-        my_start = group_rank
-        stride = world_size
-        remaining = M - my_start
-        remaining = tl.maximum(remaining, 0)
-        max_row_offset = tl.cdiv(remaining, stride)
-    else:
-        my_start = group_rank * rows_per_rank
-        stride = 1
-        remaining = M - my_start
-        remaining = tl.maximum(remaining, 0)
-        max_row_offset = tl.minimum(rows_per_rank, remaining)
+    my_start = group_rank * rows_per_rank
+    remaining = tl.maximum(M - my_start, 0)
+    max_row_offset = tl.minimum(rows_per_rank, remaining)
 
-    num_comm_tiles = tl.cdiv(max_row_offset, BLOCK_SIZE_M)
+    num_row_blocks = tl.cdiv(max_row_offset, BLOCK_SIZE_M)
 
-    # Load RMSNorm weights
-    rn = tl.arange(0, BLOCK_SIZE_N)
-    if PADDED_N:
-        rms_w = tl.load(
-            rms_weight_ptr + rn, mask=rn < ACTUAL_N, other=0.0
-        ).to(tl.float32)
-    else:
-        rms_w = tl.load(rms_weight_ptr + rn).to(tl.float32)
+    # Scalar loaded once
+    ws = tl.load(weight_scale_ptr)
 
-    # Phase 1a: Allreduce + RMSNorm + FP8 quant on owned rows
-    for tile_offset in range(pid, num_comm_tiles, COMM_SMS):
-        row_base = my_start + tile_offset * BLOCK_SIZE_M * stride
-
-        rm = row_base + tl.arange(0, BLOCK_SIZE_M) * stride
-        row_mask = rm < M
-
-        input_offset = rm[:, None] * stride_in_m + rn[None, :] * stride_in_n
-        out_offset = rm[:, None] * stride_out_m + rn[None, :] * stride_out_n
-
-        # Local quant buffer offsets (indexed by local row position)
-        local_row = tile_offset * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        local_row_mask = local_row < max_row_offset
-        ql_offset = (
-            local_row[:, None] * stride_ql_m + rn[None, :] * stride_ql_n
-        )
-        sl_offset = local_row * stride_sl
-
-        is_full = (row_base + BLOCK_SIZE_M * stride <= M)
-
-        if PADDED_N:
-            col_mask = rn < ACTUAL_N
-            mask = row_mask[:, None] & col_mask[None, :]
-            local_mask = local_row_mask[:, None] & col_mask[None, :]
-        else:
-            mask = row_mask[:, None]
-            local_mask = local_row_mask[:, None]
-
-        if is_full and not PADDED_N:
-            # ---- Fast path: no masks ----
-            acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-            for i in tl.static_range(0, world_size):
-                remote_rank = rank_start + i * rank_stride
-                partial = iris.load(
-                    input_ptr + input_offset,
-                    iris_rank, remote_rank, heap_bases,
-                )
-                acc += partial.to(tl.float32)
-                if HAS_RESIDUAL and remote_rank == iris_rank:
-                    res_in = tl.load(
-                        residual_in_ptr + out_offset
-                    ).to(tl.float32)
-                    acc += res_in
-
-            tl.store(
-                result_out_ptr + out_offset,
-                acc.to(result_out_ptr.type.element_ty),
-            )
-
-            sq_sum = tl.sum(acc * acc, axis=1)
-            rrms = tl.rsqrt(sq_sum / N + rms_eps)
-            normed = acc * rrms[:, None] * rms_w[None, :]
-
-            row_amax = tl.max(tl.abs(normed), axis=1)
-            row_amax = tl.maximum(row_amax, 1e-12)
-            scale = row_amax / fp8_max
-
-            quantized = (normed / scale[:, None]).to(
-                quant_local_ptr.type.element_ty
-            )
-
-            tl.store(quant_local_ptr + ql_offset, quantized)
-            tl.store(scale_local_ptr + sl_offset, scale)
-        else:
-            # ---- Slow path: masked ----
-            acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-            for i in tl.static_range(0, world_size):
-                remote_rank = rank_start + i * rank_stride
-                partial = iris.load(
-                    input_ptr + input_offset,
-                    iris_rank, remote_rank, heap_bases,
-                    mask=mask,
-                )
-                acc += partial.to(tl.float32)
-                if HAS_RESIDUAL and remote_rank == iris_rank:
-                    res_in = tl.load(
-                        residual_in_ptr + out_offset, mask=mask, other=0.0
-                    ).to(tl.float32)
-                    acc += res_in
-
-            tl.store(
-                result_out_ptr + out_offset,
-                acc.to(result_out_ptr.type.element_ty),
-                mask=mask,
-            )
-
-            sq_sum = tl.sum(acc * acc, axis=1)
-            rrms = tl.rsqrt(sq_sum / N + rms_eps)
-            normed = acc * rrms[:, None] * rms_w[None, :]
-
-            row_amax = tl.max(tl.abs(normed), axis=1)
-            row_amax = tl.maximum(row_amax, 1e-12)
-            scale = row_amax / fp8_max
-
-            quantized = (normed / scale[:, None]).to(
-                quant_local_ptr.type.element_ty
-            )
-
-            tl.store(
-                quant_local_ptr + ql_offset, quantized, mask=local_mask
-            )
-            tl.store(
-                scale_local_ptr + sl_offset, scale, mask=local_row_mask
-            )
+    num_k_tiles = tl.cdiv(N, GEMM_BLOCK_K)
+    num_n_tiles = tl.cdiv(K_GEMM, GEMM_BLOCK_N)
 
     # ================================================================
-    # Phase 1b: Partial GEMM on owned rows + broadcast output
+    # Main loop: one block of BLOCK_SIZE_M rows per iteration
     # ================================================================
-    # Each rank GEMMs its own rows: (max_row_offset, N) x (N, K_GEMM)
-    # No barrier needed -- we just wrote the quant data ourselves.
+    for block_id in range(pid, num_row_blocks, COMM_SMS):
+        block_start = block_id * BLOCK_SIZE_M
 
-    num_pid_m = tl.cdiv(max_row_offset, GEMM_BLOCK_M)
-    num_pid_n = tl.cdiv(K_GEMM, GEMM_BLOCK_N)
-    total_gemm_tiles = num_pid_m * num_pid_n
+        rm = tl.arange(0, BLOCK_SIZE_M)
+        row_offsets = block_start + rm
+        m_mask = row_offsets < max_row_offset
+        global_rows = my_start + row_offsets
 
-    for tile_id in range(pid, total_gemm_tiles, COMM_SMS):
-        if GEMM_GROUP_SIZE_M == 1:
-            pid_m = tile_id // num_pid_n
-            pid_n = tile_id % num_pid_n
-        else:
-            num_pid_in_group = GEMM_GROUP_SIZE_M * num_pid_n
-            group_id = tile_id // num_pid_in_group
-            first_pid_m = group_id * GEMM_GROUP_SIZE_M
-            group_size_m = tl.minimum(
-                num_pid_m - first_pid_m, GEMM_GROUP_SIZE_M
+        # ---- Pass 1: Tiled allreduce + accumulate scalars ----
+        sq_sum = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
+        weighted_amax = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
+
+        for k_tile in range(num_k_tiles):
+            offs_k = k_tile * GEMM_BLOCK_K + tl.arange(0, GEMM_BLOCK_K)
+
+            in_offset = (
+                global_rows[:, None] * stride_in_m
+                + offs_k[None, :] * stride_in_n
             )
-            pid_m = first_pid_m + (tile_id % group_size_m)
-            pid_n = (tile_id % num_pid_in_group) // group_size_m
+            out_offset = (
+                global_rows[:, None] * stride_out_m
+                + offs_k[None, :] * stride_out_n
+            )
 
-        offs_am = pid_m * GEMM_BLOCK_M + tl.arange(0, GEMM_BLOCK_M)
-        offs_bn = pid_n * GEMM_BLOCK_N + tl.arange(0, GEMM_BLOCK_N)
-        offs_k = tl.arange(0, GEMM_BLOCK_K)
-
-        # A pointers: local quant buffer (max_row_offset, N)
-        a_ptrs = (
-            quant_local_ptr
-            + (offs_am[:, None] % max_row_offset) * stride_ql_m
-            + offs_k[None, :] * stride_ql_n
-        )
-        # B pointers: gemm_weight (N, K_GEMM)
-        b_ptrs = (
-            gemm_weight_ptr
-            + offs_k[:, None] * stride_gw_k
-            + (offs_bn[None, :] % K_GEMM) * stride_gw_n
-        )
-
-        # Per-row activation scales (local indexing)
-        a_scale = tl.load(
-            scale_local_ptr + (offs_am % max_row_offset) * stride_sl
-        )
-
-        accumulator = tl.zeros(
-            (GEMM_BLOCK_M, GEMM_BLOCK_N), dtype=tl.float32
-        )
-
-        for k in range(0, tl.cdiv(N, GEMM_BLOCK_K)):
             if EVEN_GEMM_K:
-                a = tl.load(a_ptrs)
-                b = tl.load(b_ptrs)
+                tile_mask = m_mask[:, None]
             else:
-                k_remaining = N - k * GEMM_BLOCK_K
-                a = tl.load(
-                    a_ptrs,
-                    mask=offs_k[None, :] < k_remaining,
-                    other=0.0,
+                k_valid = offs_k < N
+                tile_mask = m_mask[:, None] & k_valid[None, :]
+
+            # Allreduce: sum this K slice from all ranks
+            tile_acc = tl.zeros(
+                (BLOCK_SIZE_M, GEMM_BLOCK_K), dtype=tl.float32
+            )
+            for i in tl.static_range(0, world_size):
+                remote_rank = rank_start + i * rank_stride
+                partial = iris.load(
+                    input_ptr + in_offset,
+                    iris_rank, remote_rank, heap_bases,
+                    mask=tile_mask,
                 )
-                b = tl.load(
-                    b_ptrs,
-                    mask=offs_k[:, None] < k_remaining,
-                    other=0.0,
-                )
+                tile_acc += partial.to(tl.float32)
+                if HAS_RESIDUAL and remote_rank == iris_rank:
+                    res_tile = tl.load(
+                        residual_in_ptr + out_offset,
+                        mask=tile_mask, other=0.0,
+                    ).to(tl.float32)
+                    tile_acc += res_tile
 
-            accumulator += tl.dot(a, b, input_precision="ieee")
-
-            a_ptrs += GEMM_BLOCK_K * stride_ql_n
-            b_ptrs += GEMM_BLOCK_K * stride_gw_k
-
-        # Apply scales
-        ws = tl.load(weight_scale_ptr)
-        accumulator *= a_scale[:, None] * ws
-
-        if HAS_BIAS:
-            bias_offs = (pid_n * GEMM_BLOCK_N
-                         + tl.arange(0, GEMM_BLOCK_N)) % K_GEMM
-            bias_val = tl.load(bias_ptr + bias_offs)
-            accumulator = (
-                accumulator.to(bias_ptr.type.element_ty) + bias_val[None, :]
+            # Store allreduced tile to result_out
+            tl.store(
+                result_out_ptr + out_offset,
+                tile_acc.to(result_out_ptr.type.element_ty),
+                mask=tile_mask,
             )
 
-        c = accumulator.to(gemm_heap_ptr.type.element_ty)
+            # Accumulate RMSNorm variance
+            sq_sum += tl.sum(tile_acc * tile_acc, axis=1)
 
-        # Global row indices for this rank's owned rows
-        offs_cm_global = my_start + offs_am * stride
-        offs_cn = pid_n * GEMM_BLOCK_N + tl.arange(0, GEMM_BLOCK_N)
-        c_mask = (offs_am[:, None] < max_row_offset) & (
-            offs_cn[None, :] < K_GEMM
-        )
+            # Accumulate weighted amax for quant scale
+            # max(|x * rrms * rms_w|) = rrms * max(|x * rms_w|)
+            if EVEN_GEMM_K:
+                rms_w_k = tl.load(rms_weight_ptr + offs_k).to(tl.float32)
+            else:
+                rms_w_k = tl.load(
+                    rms_weight_ptr + offs_k,
+                    mask=k_valid, other=0.0,
+                ).to(tl.float32)
+            tile_amax = tl.max(
+                tl.abs(tile_acc * rms_w_k[None, :]), axis=1
+            )
+            weighted_amax = tl.maximum(weighted_amax, tile_amax)
 
-        # Store to GEMM heap (symmetric, for allgather)
-        gh_ptrs = (
-            gemm_heap_ptr
-            + offs_cm_global[:, None] * stride_gh_m
-            + offs_cn[None, :] * stride_gh_n
-        )
-        tl.store(gh_ptrs, c, mask=c_mask)
+        # Compute rrms and quant scale from accumulated values
+        rrms = tl.rsqrt(sq_sum / N + rms_eps)          # (BLOCK_SIZE_M,)
+        row_amax = rrms * weighted_amax
+        row_amax = tl.maximum(row_amax, 1e-12)
+        scales = row_amax / fp8_max                     # (BLOCK_SIZE_M,)
 
-        # Broadcast GEMM output to all peers
-        for i in tl.static_range(0, world_size):
-            remote_rank = rank_start + i * rank_stride
-            if remote_rank != iris_rank:
-                iris.store(
-                    gh_ptrs, c,
-                    iris_rank, remote_rank, heap_bases,
-                    mask=c_mask,
+        # ---- Pass 2: GEMM with inline RMSNorm + FP8 quant ----
+        for n_tile in range(num_n_tiles):
+            offs_n = n_tile * GEMM_BLOCK_N + tl.arange(0, GEMM_BLOCK_N)
+            n_mask = offs_n < K_GEMM
+
+            gemm_acc = tl.zeros(
+                (BLOCK_SIZE_M, GEMM_BLOCK_N), dtype=tl.float32
+            )
+
+            for k_tile in range(num_k_tiles):
+                offs_k = (
+                    k_tile * GEMM_BLOCK_K + tl.arange(0, GEMM_BLOCK_K)
                 )
 
-    # ================================================================
-    # Phase 2: Copy from heap to output
-    # ================================================================
-    # After all ranks have broadcast, gemm_heap has the full (M, K_GEMM)
-    # output. Copy our assigned rows to gemm_out. The external post-barrier
-    # ensures all ranks have finished writing before the next iteration
-    # overwrites the input buffer.
+                # Load allreduced BF16 from result_out (L2 cache hit)
+                out_offset_k = (
+                    global_rows[:, None] * stride_out_m
+                    + offs_k[None, :] * stride_out_n
+                )
+                if EVEN_GEMM_K:
+                    a_raw = tl.load(
+                        result_out_ptr + out_offset_k,
+                        mask=m_mask[:, None], other=0.0,
+                    ).to(tl.float32)
+                    rms_w_k = tl.load(
+                        rms_weight_ptr + offs_k
+                    ).to(tl.float32)
+                else:
+                    k_valid = offs_k < N
+                    a_raw = tl.load(
+                        result_out_ptr + out_offset_k,
+                        mask=m_mask[:, None] & k_valid[None, :],
+                        other=0.0,
+                    ).to(tl.float32)
+                    rms_w_k = tl.load(
+                        rms_weight_ptr + offs_k,
+                        mask=k_valid, other=0.0,
+                    ).to(tl.float32)
 
-    # Copy all rows (not just owned) from heap to output
-    num_copy_m = tl.cdiv(M, GEMM_BLOCK_M)
-    num_copy_n = tl.cdiv(K_GEMM, GEMM_BLOCK_N)
-    total_copy_tiles = num_copy_m * num_copy_n
+                # Inline RMSNorm + FP8 quant
+                a_normed = a_raw * rrms[:, None] * rms_w_k[None, :]
+                a_quant = (a_normed / scales[:, None]).to(
+                    gemm_weight_ptr.type.element_ty
+                )
+
+                # Load weight tile: (GEMM_BLOCK_K, GEMM_BLOCK_N)
+                if EVEN_GEMM_K:
+                    b = tl.load(
+                        gemm_weight_ptr
+                        + offs_k[:, None] * stride_gw_k
+                        + offs_n[None, :] * stride_gw_n,
+                        mask=n_mask[None, :], other=0.0,
+                    )
+                else:
+                    b = tl.load(
+                        gemm_weight_ptr
+                        + offs_k[:, None] * stride_gw_k
+                        + offs_n[None, :] * stride_gw_n,
+                        mask=k_valid[:, None] & n_mask[None, :],
+                        other=0.0,
+                    )
+
+                # (BLOCK_SIZE_M, GEMM_BLOCK_K) @ (GEMM_BLOCK_K, GEMM_BLOCK_N)
+                gemm_acc += tl.dot(a_quant, b, input_precision="ieee")
+
+            # Apply per-row activation scales and per-tensor weight scale
+            gemm_acc *= scales[:, None] * ws
+
+            # Optional bias
+            if HAS_BIAS:
+                bias_val = tl.load(
+                    bias_ptr + offs_n, mask=n_mask, other=0.0
+                )
+                gemm_acc += bias_val[None, :].to(tl.float32)
+
+            c = gemm_acc.to(gemm_heap_ptr.type.element_ty)
+
+            # Store to GEMM heap + broadcast to all peers
+            gh_offsets = (
+                global_rows[:, None] * stride_gh_m
+                + offs_n[None, :] * stride_gh_n
+            )
+            store_mask = m_mask[:, None] & n_mask[None, :]
+            tl.store(gemm_heap_ptr + gh_offsets, c, mask=store_mask)
+
+            for i in tl.static_range(0, world_size):
+                remote_rank = rank_start + i * rank_stride
+                if remote_rank != iris_rank:
+                    iris.store(
+                        gemm_heap_ptr + gh_offsets, c,
+                        iris_rank, remote_rank, heap_bases,
+                        mask=store_mask,
+                    )
+
+    # ================================================================
+    # Copy phase: heap -> output
+    # ================================================================
+    # After all ranks have broadcast, gemm_heap has full (M, K_GEMM).
+    # Copy to gemm_out using all CTAs.
+    COPY_BLOCK: tl.constexpr = GEMM_BLOCK_N
+    num_copy_cols = tl.cdiv(K_GEMM, COPY_BLOCK)
+    total_copy_tiles = M * num_copy_cols
 
     for tile_id in range(pid, total_copy_tiles, COMM_SMS):
-        cm = tile_id // num_copy_n
-        cn = tile_id % num_copy_n
+        row = tile_id // num_copy_cols
+        col_tile = tile_id % num_copy_cols
+        offs_n = col_tile * COPY_BLOCK + tl.arange(0, COPY_BLOCK)
+        cp_mask = offs_n < K_GEMM
 
-        offs_m = cm * GEMM_BLOCK_M + tl.arange(0, GEMM_BLOCK_M)
-        offs_n = cn * GEMM_BLOCK_N + tl.arange(0, GEMM_BLOCK_N)
-        cp_mask = (offs_m[:, None] < M) & (offs_n[None, :] < K_GEMM)
-
-        src_ptrs = (
-            gemm_heap_ptr
-            + offs_m[:, None] * stride_gh_m
-            + offs_n[None, :] * stride_gh_n
+        vals = tl.load(
+            gemm_heap_ptr + row * stride_gh_m + offs_n * stride_gh_n,
+            mask=cp_mask,
         )
-        dst_ptrs = (
-            gemm_out_ptr
-            + offs_m[:, None] * stride_go_m
-            + offs_n[None, :] * stride_go_n
+        tl.store(
+            gemm_out_ptr + row * stride_go_m + offs_n * stride_go_n,
+            vals,
+            mask=cp_mask,
         )
-        vals = tl.load(src_ptrs, mask=cp_mask)
-        tl.store(dst_ptrs, vals, mask=cp_mask)
 
 
 # ============================================================================
@@ -427,11 +355,7 @@ def persistent_fused_allreduce_rmsnorm_quant_partial_gemm(
 
 
 class IrisOneManager:
-    """Singleton manager for fused allreduce + partial GEMM + allgather.
-
-    Single kernel: allreduce+rmsnorm+quant on owned rows, GEMM on owned
-    rows, broadcast BF16 GEMM output, copy full output from heap.
-    """
+    """Singleton manager for fused allreduce + partial GEMM + allgather."""
 
     _instance: Optional["IrisOneManager"] = None
     _initialized: bool = False
@@ -455,25 +379,14 @@ class IrisOneManager:
         self._input_N: int = 0
         self._input_dtype: Optional[torch.dtype] = None
 
-        # GEMM output on symmetric heap (for allgather broadcast)
-        self._gemm_heap_bufs: dict[int, Any] = {}  # keyed by K_GEMM
+        self._gemm_heap_bufs: dict[int, Any] = {}
 
-        # Local GPU memory (not on heap)
-        self._quant_local_buf: Optional[torch.Tensor] = None
-        self._quant_local_M: int = 0
-        self._quant_local_N: int = 0
-        self._quant_local_dtype: Optional[torch.dtype] = None
-
-        self._scale_local_buf: Optional[torch.Tensor] = None
-        self._scale_local_M: int = 0
-
+        # Local GPU memory
         self._out_result: Optional[torch.Tensor] = None
         self._out_gemm_bufs: dict[int, torch.Tensor] = {}
 
     def initialize(self, heap_size: Optional[int] = None) -> None:
-        """Initialize Iris symmetric heap (call once at startup)."""
         if self._shmem is not None:
-            logger.debug("Iris (one) already initialized, skipping")
             return
 
         if heap_size is not None:
@@ -505,10 +418,7 @@ class IrisOneManager:
         input_dtype: torch.dtype,
         out_dtype: torch.dtype,
     ) -> Tuple[Any, Any]:
-        """Allocate or reuse symmetric heap buffers.
-
-        Returns (input_buf, gemm_heap).
-        """
+        """Allocate or reuse symmetric heap buffers for input and GEMM output."""
         need_input = (
             self._input_buf is None
             or M > self._input_M
@@ -533,29 +443,16 @@ class IrisOneManager:
             )
 
         shmem = self.shmem
-        cur_rank = (
-            torch.distributed.get_rank()
-            if torch.distributed.is_initialized()
-            else 0
-        )
 
         if need_input:
             self._input_buf = shmem.zeros((M, N), dtype=input_dtype)
             self._input_M = M
             self._input_N = N
             self._input_dtype = input_dtype
-            logger.debug(
-                f"Iris (one): allocated input buffer "
-                f"({M}, {N}), dtype={input_dtype}, rank={cur_rank}"
-            )
 
         if need_gemm_heap:
             self._gemm_heap_bufs[K_GEMM] = shmem.zeros(
                 (M, K_GEMM), dtype=out_dtype
-            )
-            logger.debug(
-                f"Iris (one): allocated GEMM heap buffer "
-                f"({M}, {K_GEMM}), dtype={out_dtype}, rank={cur_rank}"
             )
 
         return (
@@ -568,28 +465,10 @@ class IrisOneManager:
         M: int,
         N: int,
         K_GEMM: int,
-        world_size: int,
-        quant_dtype: torch.dtype,
         out_dtype: torch.dtype,
         device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Allocate local GPU buffers (not on heap).
-
-        Returns (quant_local, scale_local, result_out, gemm_out).
-        """
-        # Max rows this rank will own
-        rows_per_rank = (M + world_size - 1) // world_size
-
-        need_quant = (
-            self._quant_local_buf is None
-            or rows_per_rank > self._quant_local_M
-            or N != self._quant_local_N
-            or quant_dtype != self._quant_local_dtype
-        )
-        need_scale = (
-            self._scale_local_buf is None
-            or rows_per_rank > self._scale_local_M
-        )
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Allocate or reuse result_out and gemm_out on local GPU memory."""
         need_result = (
             self._out_result is None
             or M > self._out_result.shape[0]
@@ -600,13 +479,9 @@ class IrisOneManager:
             or M > self._out_gemm_bufs[K_GEMM].shape[0]
         )
 
-        if not (need_quant or need_scale or need_result or need_gemm):
-            assert self._quant_local_buf is not None
-            assert self._scale_local_buf is not None
+        if not (need_result or need_gemm):
             assert self._out_result is not None
             return (
-                self._quant_local_buf[:rows_per_rank],
-                self._scale_local_buf[:rows_per_rank],
                 self._out_result[:M],
                 self._out_gemm_bufs[K_GEMM][:M],
             )
@@ -616,20 +491,6 @@ class IrisOneManager:
                 f"Iris (one): local buffers too small for "
                 f"M={M}. Cannot allocate during CUDA graph capture."
             )
-
-        if need_quant:
-            self._quant_local_buf = torch.empty(
-                (rows_per_rank, N), dtype=quant_dtype, device=device,
-            )
-            self._quant_local_M = rows_per_rank
-            self._quant_local_N = N
-            self._quant_local_dtype = quant_dtype
-
-        if need_scale:
-            self._scale_local_buf = torch.empty(
-                (rows_per_rank,), dtype=torch.float32, device=device,
-            )
-            self._scale_local_M = rows_per_rank
 
         if need_result:
             self._out_result = torch.empty(
@@ -641,12 +502,8 @@ class IrisOneManager:
                 (M, K_GEMM), dtype=out_dtype, device=device,
             )
 
-        assert self._quant_local_buf is not None
-        assert self._scale_local_buf is not None
         assert self._out_result is not None
         return (
-            self._quant_local_buf[:rows_per_rank],
-            self._scale_local_buf[:rows_per_rank],
             self._out_result[:M],
             self._out_gemm_bufs[K_GEMM][:M],
         )
@@ -663,7 +520,7 @@ class IrisOneManager:
         residual: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Fused AllReduce + RMSNorm + FP8 quant + partial GEMM + allgather.
+        """Fused AllReduce + RMSNorm + per-row FP8 quant + partial GEMM.
 
         Returns (gemm_out, residual_out). residual_out is None when
         residual is None.
@@ -673,20 +530,15 @@ class IrisOneManager:
         K_GEMM = gemm_weight.shape[1]
         device = input_tensor.device
 
-        # Iris group info
         rank_in_group, rank_global, world_size, rank_start, rank_stride = (
             extract_group_info(shmem)
         )
 
-        # Allocate buffers
         iris_input, gemm_heap = self._ensure_heap_buffers(
             M, N, K_GEMM, input_tensor.dtype, out_dtype,
         )
-        quant_local, scale_local, result_out, gemm_out = (
-            self._ensure_local_buffers(
-                M, N, K_GEMM, world_size,
-                quant_dtype, out_dtype, device,
-            )
+        result_out, gemm_out = self._ensure_local_buffers(
+            M, N, K_GEMM, out_dtype, device,
         )
 
         # Copy input to symmetric heap (captured in graph)
@@ -700,34 +552,26 @@ class IrisOneManager:
         heap_bases = shmem.get_heap_bases()
 
         # ---- Tunable parameters ----
-        num_xcds = iris.hip.get_num_xcc()
-        BLOCK_SIZE_M = 1
-        BLOCK_SIZE_N = triton.next_power_of_2(N)
-        ACTUAL_N = N
-        PADDED_N = (BLOCK_SIZE_N != N)
-        DISTRIBUTION = 1
-        COMM_SMS = 128
-        CHUNK_SIZE = _compute_chunk_size(COMM_SMS, num_xcds)
+        BLOCK_SIZE_M = 16        # rows per block (>= 16 for tl.dot matrix cores)
+        COMM_SMS = 128           # number of persistent CTAs
+        GEMM_BLOCK_N = 128       # output column tile size
+        GEMM_BLOCK_K = 128       # reduction tile size (also comm tile width)
+        EVEN_GEMM_K = (N % GEMM_BLOCK_K == 0)
         NUM_WARPS = 16
         NUM_STAGES = 2
         WAVES_PER_EU = 1
-        GEMM_BLOCK_M = 128
-        GEMM_BLOCK_N = 128
-        GEMM_BLOCK_K = 128
-        GEMM_GROUP_SIZE_M = 4
-        EVEN_GEMM_K = (N % GEMM_BLOCK_K == 0)
         # ---- End tunable parameters ----
 
         bias_ptr = bias if bias is not None else input_tensor
 
         persistent_fused_allreduce_rmsnorm_quant_partial_gemm[(COMM_SMS,)](
+            # Heap buffers
             iris_input,
-            quant_local,
-            scale_local,
             gemm_heap,
+            # Outputs
             result_out,
             gemm_out,
-            # GEMM params
+            # GEMM weight
             gemm_weight,
             bias_ptr,
             weight_scale,
@@ -750,11 +594,8 @@ class IrisOneManager:
             # Strides
             iris_input.stride(0),
             iris_input.stride(1),
-            quant_local.stride(0),
-            quant_local.stride(1),
             result_out.stride(0),
             result_out.stride(1),
-            scale_local.stride(0),
             # Iris
             heap_bases,
             rank_in_group,
@@ -762,22 +603,14 @@ class IrisOneManager:
             world_size,
             rank_start,
             rank_stride,
-            # Comm tile params
+            # Tile params
             BLOCK_SIZE_M,
-            BLOCK_SIZE_N,
-            ACTUAL_N,
             residual is not None,  # HAS_RESIDUAL
-            bias is not None,  # HAS_BIAS
-            PADDED_N,
+            bias is not None,      # HAS_BIAS
             COMM_SMS,
-            num_xcds,
-            CHUNK_SIZE,
-            DISTRIBUTION,
             # GEMM tile params
-            GEMM_BLOCK_M,
             GEMM_BLOCK_N,
             GEMM_BLOCK_K,
-            GEMM_GROUP_SIZE_M,
             EVEN_GEMM_K,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
@@ -789,7 +622,6 @@ class IrisOneManager:
             shmem.device_barrier()
 
         residual_out = result_out if residual is not None else None
-
         return gemm_out, residual_out
 
 
@@ -806,7 +638,6 @@ def _get_manager() -> IrisOneManager:
 def initialize_iris_one(
     heap_size: Optional[int] = None,
 ) -> None:
-    """Initialize Iris for fused allreduce + partial GEMM."""
     _get_manager().initialize(heap_size)
 
 
