@@ -12,14 +12,24 @@ from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 )
 @gluon.jit
 def matmul_kernel(
-        a_ptr, b_ptr, c_ptr,
-        M, N, K,
-        stride_am, stride_ak,
-        stride_bk, stride_bn,
-        stride_cm, stride_cn,
-        # Meta-parameters
-        BLOCK_SIZE_M: gl.constexpr, BLOCK_SIZE_N: gl.constexpr, BLOCK_SIZE_K: gl.constexpr,
-        GROUP_SIZE_M: gl.constexpr, GRID_MN: gl.constexpr,
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    # Meta-parameters
+    BLOCK_SIZE_M: gl.constexpr,
+    BLOCK_SIZE_N: gl.constexpr,
+    BLOCK_SIZE_K: gl.constexpr,
+    GROUP_SIZE_M: gl.constexpr,
+    GRID_MN: gl.constexpr,
 ):
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
@@ -46,7 +56,7 @@ def matmul_kernel(
 
     # Add user set layout
     blocked_a: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=((0,1),(0,2), (0,4),(8,0), (128, 0)),
+        reg_bases=((0, 1), (0, 2), (0, 4), (8, 0), (128, 0)),
         lane_bases=((0, 8), (0, 16), (0, 32), (16, 0), (32, 0), (64, 0)),
         warp_bases=((1, 0), (2, 0), (4, 0)),
         block_bases=[],
@@ -54,7 +64,7 @@ def matmul_kernel(
     )
 
     blocked_b: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=((1,0),(2,0),(4,0),(0,8), (0, 128)),
+        reg_bases=((1, 0), (2, 0), (4, 0), (0, 8), (0, 128)),
         lane_bases=((8, 0), (16, 0), (32, 0), (0, 16), (0, 32), (0, 64)),
         warp_bases=((0, 1), (0, 2), (0, 4)),
         block_bases=[],
@@ -75,16 +85,46 @@ def matmul_kernel(
     )
 
     shared_a: gl.constexpr = gl.PaddedSharedLayout(
-        interval_padding_pairs = [[512,16]],
-        offset_bases = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [16,0], [32,0], [64,0], [1,0], [2,0], [4,0], [8,0], [128,0]],
-        block_bases = [],
-        shape = [256, 64]
+        interval_padding_pairs=[[512, 16]],
+        offset_bases=[
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [16, 0],
+            [32, 0],
+            [64, 0],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [128, 0],
+        ],
+        block_bases=[],
+        shape=[256, 64],
     )
     shared_b: gl.constexpr = gl.PaddedSharedLayout(
-        interval_padding_pairs = [[512,16]],
-        offset_bases = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 16], [0, 32], [0, 64], [0, 1], [0, 2], [0, 4], [0, 8], [0, 128]],
-        block_bases = [],
-        shape = [64, 256]
+        interval_padding_pairs=[[512, 16]],
+        offset_bases=[
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [16, 0],
+            [32, 0],
+            [0, 16],
+            [0, 32],
+            [0, 64],
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 128],
+        ],
+        block_bases=[],
+        shape=[64, 256],
     )
 
     a_bufs = gl.allocate_shared_memory(
@@ -95,18 +135,25 @@ def matmul_kernel(
     )
 
     # compute offsets
-    offs_am = (pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_a))) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_b))) % N
+    offs_am = (
+        pid_m * BLOCK_SIZE_M
+        + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_a))
+    ) % M
+    offs_bn = (
+        pid_n * BLOCK_SIZE_N
+        + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_b))
+    ) % N
     offs_ak = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(0, blocked_a))
     offs_bk = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(1, blocked_b))
     a_offs = offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak
     b_offs = offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
 
-    accumulator = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.float32, layout=mfma_layout)
+    accumulator = gl.zeros(
+        (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.float32, layout=mfma_layout
+    )
 
     num_k_iter = gl.cdiv(K, BLOCK_SIZE_K)
     gl.assume(num_k_iter > 2)
-
 
     # prologue
     gl.amd.cdna4.async_copy.buffer_load_to_shared(a_bufs.index(0), a_ptr, a_offs)
@@ -117,14 +164,18 @@ def matmul_kernel(
 
     buf_idx = 0
     # mainloop
-    for k in range(0,num_k_iter-1):
+    for k in range(0, num_k_iter - 1):
         gl.amd.cdna4.async_copy.wait_group(0)
         async_idx = (buf_idx + 1) % 2
         cur_a = a_bufs.index(buf_idx).load(layout=dot_a_layout)
         cur_b = b_bufs.index(buf_idx).load(layout=dot_b_layout)
         accumulator = gl.amd.cdna4.mfma(cur_a, cur_b, accumulator)
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(a_bufs.index(async_idx), a_ptr, a_offs)
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(b_bufs.index(async_idx), b_ptr, b_offs)
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            a_bufs.index(async_idx), a_ptr, a_offs
+        )
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            b_bufs.index(async_idx), b_ptr, b_offs
+        )
 
         a_offs += BLOCK_SIZE_K * stride_ak
         b_offs += BLOCK_SIZE_K * stride_bk
@@ -137,8 +188,12 @@ def matmul_kernel(
 
     # store c
     c = accumulator.to(gl.bfloat16)
-    offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, mfma_layout))
-    offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, mfma_layout))
+    offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(
+        0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, mfma_layout)
+    )
+    offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(
+        0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, mfma_layout)
+    )
     c_offs = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     gl.amd.cdna4.buffer_store(stored_value=c, ptr=c_ptr, offsets=c_offs, mask=c_mask)

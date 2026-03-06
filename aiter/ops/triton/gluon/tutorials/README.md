@@ -23,7 +23,7 @@ from triton.experimental.gluon import language as gl
 
 ### extensions
 1. instruction scheduling related
-  - sched_barrier: separate scheduling regions so that instrs can not pass it, strictly respected by llvm compiler
+  - sched_barrier: separate scheduling regions so that instrs can not pass it, generally respected by llvm compiler, but not guaranteed in all cases.
   - sched_group_barrier: specify certain order in the scheduling region. e.g 1 mma followed by 4 ds_read. may not be respected by llvm compiler.
   - iglp_opt: setting scheduling strategy, not effective all the time
 2. control related
