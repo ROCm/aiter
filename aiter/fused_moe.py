@@ -265,6 +265,14 @@ def fused_moe_(
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
+    # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
+    # use FP8 as activation dtype to skip redundant re-quantization
+    if (
+        quant_type == QuantType.per_1x128
+        and hidden_states.dtype == dtypes.fp8
+        and a1_scale is not None
+    ):
+        q_dtype_a = dtypes.fp8
     bf16_fp8_bound = 512
     if quant_type == QuantType.per_1x32:
         if activation == ActivationType.Swiglu:
@@ -1097,7 +1105,18 @@ def fused_moe_2stages(
         a1_scale = torch.ones([M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device)
 
     elif quant_type == QuantType.per_1x32:
-        if token_num <= token_num_quant_moe_sort_switch:
+        if hidden_states.dtype == dtypes.fp4x2 and a1_scale is not None:
+            # Input is already quantized to fp4x2 (e.g., from FP4 dispatch),
+            # skip re-quantization, only sort the scale
+            a1 = hidden_states
+            a1_scale = fp4_utils.moe_mxfp4_sort(
+                a1_scale,
+                sorted_ids=sorted_ids,
+                num_valid_ids=num_valid_ids,
+                token_num=token_num,
+                block_size=block_size_M,
+            )
+        elif token_num <= token_num_quant_moe_sort_switch:
             a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
                 hidden_states,
                 sorted_ids=sorted_ids,
