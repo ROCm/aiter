@@ -9,6 +9,7 @@ This directory contains performance benchmarks for various operations implemente
     - [Triton Benchmarks](#triton-benchmarks)
     - [HIP Benchmarks](#hip-benchmarks)
   - [Prerequisites](#prerequisites)
+    - [Triton Compatibility](#triton-compatibility)
   - [How to Benchmark](#how-to-benchmark)
     - [Running FlashAttention Tests](#running-flashattention-tests)
   - [Running Individual Benchmarks](#running-individual-benchmarks)
@@ -127,9 +128,55 @@ git submodule sync && git submodule update --init --recursive
 
 - Python 3.x
 - PyTorch
-- Triton (for Triton benchmarks)
+- **Triton** (for Triton benchmarks) - See [Triton Compatibility](#triton-compatibility) below
 - ROCm/HIP (for HIP benchmarks)
 - CUDA-capable GPU (AMD GPU recommended for HIP benchmarks)
+
+#### Triton Compatibility
+
+AITER is compatible with Triton for AMD GPU (HIP) backend support. The recommended Triton version requirements are:
+
+- **Minimum Recommended**: Triton >= 3.2.0
+- **Tested/Recommended Commit**: `756afc06` (used in CI builds)
+- **Some features require**: Triton >= 3.6.0 (for certain advanced features)
+
+**Installing Triton for AITER:**
+
+The recommended way to install Triton for AITER is to build from source using a known-good commit:
+
+```bash
+# Uninstall any existing Triton
+pip uninstall -y triton || true
+
+# Clone and build Triton from source
+git clone https://github.com/triton-lang/triton.git
+cd triton
+git checkout 756afc06  # Known-good commit for AITER
+pip install -r python/requirements.txt
+pip install filecheck networkx
+MAX_JOBS=64 pip install .
+cd ..
+```
+
+Alternatively, you can use the AITER build script which handles Triton installation:
+
+```bash
+# Set environment variable to enable Triton build (default is enabled)
+BUILD_TRITON=1 bash .github/scripts/build_aiter_triton.sh
+```
+
+**Note**: Some AITER features may require specific Triton versions:
+- Features using `gated_delta_rule` require Triton >= 3.2.0
+- Some Gluon kernels check for Triton >= 3.6.0 for enhanced functionality
+- If you encounter version-related errors, ensure you're using a compatible Triton version
+
+**Checking Your Triton Version:**
+
+```bash
+python -c "import triton; print(triton.__version__)"
+```
+
+If your version is below 3.2.0, you may see warnings and some features may not work correctly.
 
 ### How to Benchmark
 
