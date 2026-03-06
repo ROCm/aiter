@@ -105,6 +105,24 @@ This directory contains performance benchmarks for various operations implemente
 
 ### Prerequisites
 
+#### Installing AITER
+
+First, install AITER from source:
+
+```bash
+git clone --recursive https://github.com/ROCm/aiter.git
+cd aiter
+python3 setup.py develop
+```
+
+If you forgot the `--recursive` flag during clone, run:
+
+```bash
+git submodule sync && git submodule update --init --recursive
+```
+
+#### Required Dependencies
+
 - Python 3.x
 - PyTorch
 - Triton (for Triton benchmarks)
