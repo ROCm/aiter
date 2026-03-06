@@ -31,7 +31,7 @@ import triton.language as tl
 
 from aiter.ops.triton.comms import is_graph_capturing
 
-__all__ = ["fused_allreduce_add_rms_row_quant_gemm_iris_twoshot_2d_hipblaslt"]
+__all__ = ["fused_allreduce_add_rms_quant_gemm_hipblaslt"]
 
 logger = logging.getLogger(__name__)
 
@@ -624,7 +624,7 @@ def initialize_iris_twoshot_2d_hipblaslt(
     _get_manager().initialize(heap_size)
 
 
-def fused_allreduce_add_rms_row_quant_gemm_iris_twoshot_2d_hipblaslt(
+def fused_allreduce_add_rms_quant_gemm_hipblaslt(
     input: torch.Tensor,
     rms_weight: torch.Tensor,
     rms_eps: float,
