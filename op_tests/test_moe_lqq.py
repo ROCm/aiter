@@ -128,9 +128,9 @@ def test_fmoe_lqq(
     inter_dim,
     E,
     topk,
-    shared_E=2,
-    ep=8,
-    block_size_M=32,
+    shared_E,
+    ep,
+    block_size_M,
 ):
     dtype = dtypes.bf16
     use_g1u1 = True
@@ -225,18 +225,29 @@ def test_fmoe_lqq(
             count_in_eprt / topk_ids.numel(),
         )
 
+    # topk_ids_absolute_avera
+    topk_ids_list2 = [[((i * topk) + j) % E for j in range(topk)] for i in range(token)]
+    topk_ids_absolute_avera = torch.tensor(
+        topk_ids_list2, device=topk_ids.device, dtype=topk_ids.dtype
+    )
+    print("[test] topk_ids2: ", topk_ids_absolute_avera.shape)
+    save_int_to_file(topk_ids_absolute_avera, "./feifei/topk_ids_absolute_avera.txt")
+
+    topk_ids[:, :6] = topk_ids_absolute_avera
+    save_int_to_file(topk_ids, "./feifei/topk_ids2.txt")
+    for test_eprt in range(112, 130):
+        count_in_eprt = (topk_ids == test_eprt).sum().item()
+        print(
+            f"[test] count of {test_eprt}({test_eprt-112}): ",
+            count_in_eprt,
+            "ratio: ",
+            count_in_eprt / topk_ids.numel(),
+        )
+
     ######################################################################################
     a1_qt, a1_scale = aiter.pertoken_quant(input, quant_dtype=dtypes.i8)
-    if ep > 1:
-        fc1_smooth_scale = torch.randn(
-            (eprt, model_dim), dtype=dtypes.fp32, device="cuda"
-        )
-        fc2_smooth_scale = torch.randn(
-            (eprt, inter_dim), dtype=dtypes.fp32, device="cuda"
-        )
-    else:
-        fc1_smooth_scale = None
-        fc2_smooth_scale = None
+    fc1_smooth_scale = torch.randn((eprt, model_dim), dtype=dtypes.fp32, device="cuda")
+    fc2_smooth_scale = torch.randn((eprt, inter_dim), dtype=dtypes.fp32, device="cuda")
 
     # -----------------------------------------------------------------------------------
     w1 = torch.randn((eprt, inter_dim * 2, model_dim), dtype=dtype, device="cuda")
