@@ -3,6 +3,7 @@
 
 import functools
 import json
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.fwd_prefill import FWD_PREFILL_AUTOTUNE_KEYS
 import torch
 import triton
 import triton.language as tl
@@ -275,7 +276,49 @@ _attn_fwd_repr = make_kernel_repr(
     ],
 )
 
+def get_fwd_configs():
+    configs = []
+    BLOCK_M_OPTIONS = [128, 64, 32, 16]
+    BLOCK_N_OPTIONS = [128, 64, 32, 16]
+    NUM_WARPS_OPTIONS = [2, 4, 8]
+    NUM_STAGES_OPTIONS = [1, 2, 3]
+    WAVES_PER_EU_OPTIONS = [4, 2, 1]
+    PRE_LOAD_V_OPTIONS = [False, True]
+    for bm in BLOCK_M_OPTIONS:
+        for bn in BLOCK_N_OPTIONS:
+            for waves in WAVES_PER_EU_OPTIONS:
+                for nw in NUM_WARPS_OPTIONS:
+                    for ns in NUM_STAGES_OPTIONS:
+                        for preload_v in PRE_LOAD_V_OPTIONS:
+                            configs.append(
+                                triton.Config(
+                                    {
+                                        "BLOCK_M": bm,
+                                        "BLOCK_N": bn,
+                                        "waves_per_eu": waves,
+                                        "PRELOAD_V": preload_v,
+                                    },
+                                    num_stages=ns,
+                                    num_warps=nw,
+                                )
+                            )
 
+    return configs
+
+
+FWD_PREFILL_AUTOTUNE_KEYS = [
+    "IS_CAUSAL",
+    "dropout_p",
+    "VARLEN",
+    "NUM_Q_HEADS",
+    "NUM_Q_HEADS",
+]
+
+@triton.autotune(
+    configs=get_fwd_configs(),
+    key=FWD_PREFILL_AUTOTUNE_KEYS,
+    use_cuda_graph=True,
+)
 @triton.jit(repr=_attn_fwd_repr)
 def _attn_fwd(
     q_ptr: torch.Tensor,
