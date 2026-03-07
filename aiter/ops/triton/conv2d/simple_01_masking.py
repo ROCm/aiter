@@ -79,36 +79,7 @@ def conv2d_kernel(
     tl.store(output_ptr+offset_output, z_sum.to(tl.float16), mask=mask_output)
 
 
-"""
-pad_matric()
 
-Helper function to pad a matrix with zeros
-
-Args:
-    mat_in: torch.Tensor - the matrix to pad
-    pad_h: int - the number of rows to pad
-    pad_w: int - the number of columns to pad
-
-Returns:
-    torch.Tensor - the padded matrix
-"""
-def pad_matrix(mat_in: torch.Tensor, pad_h, pad_w):
-    #easiest check is if no padding bypass
-    
-    _, c, h, w = mat_in.shape
-
-    if pad_h == 0 | pad_w == 0:
-        print("No padding required, returing input tensor")
-        return mat_in, 0
-    else:
-        new_mat_in = torch.nn.functional.pad(mat_in, (pad_h,pad_w, pad_h, pad_w), "constant", 0)
-        return new_mat_in, 1
-
-"""
-conv2d()
-
-Helper function to pass in tensors objects and setup requirements for kernel
-"""
 def conv2d(input_tensor: torch.Tensor , kernel_tensor: torch.Tensor, stride=(1,1), padding=(0,0), dilation=(1,1)):
     
     N_i, C_i, H_i, W_i = input_tensor.shape
@@ -137,12 +108,6 @@ def conv2d(input_tensor: torch.Tensor , kernel_tensor: torch.Tensor, stride=(1,1
     print(f'Output Tensor Shape:{output_tensor.shape}')
     print(f'Output Tensor Stride:{output_tensor.stride()}')
 
-    #print(f'Output Empty Tensor:{output_tensor}')
-
-    padded_tensor, check = pad_matrix(input_tensor, pad_h, pad_w)
-    if check:
-        print(f'Padded Tensor: {padded_tensor}')
-        print(f'Padded shape:{padded_tensor.shape}')
 
     #pass on parameters and values to kernel
     grid = (H_out, W_out)
@@ -189,17 +154,6 @@ if __name__ == "__main__":
 
     print(f'Triton Output: {triton_out2}')
 
-    # t_triton = triton_out2.cpu()
-    # t_triton = t_triton.reshape(h_out,w_out)
-    # np.savetxt('triton_out.xlsx', t_triton)
-
-    # t_input = input_data.cpu()
-    # t_input =  t_input.reshape(H_i,W_i)
-    # np.savetxt('input_data.xlsx', t_input)
-
-    # t_kernel = kernel.cpu()
-    # t_kernel = t_kernel.reshape(H_k,W_k)
-    # np.savetxt('kernel.xlsx', t_kernel)
 
     torch_conv2d= nn.Conv2d(in_channels=C_i,out_channels=C_i,kernel_size=(H_k,W_k), bias=False, dtype=torch.float16).cuda().half()
     with torch.no_grad():
@@ -218,5 +172,3 @@ if __name__ == "__main__":
     else:
         print("❌ Triton and Torch differ")
    
-    
-    # # print(f'W/ Paddings Result: {triton_out1}')
