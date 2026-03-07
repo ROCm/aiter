@@ -366,68 +366,110 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_naive(RankD
 #define THREAD_NUM 512
 
 template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
-__global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _input_dp,
-                                                                     RankData* _output_dp,
-                                                                     RankSignals sg,
+__global__ void __launch_bounds__(512, 1)
+cross_device_reduce_1stage(
+    RankData* _input_dp,
+    RankData* _output_dp,
+    RankSignals sg,
 #ifndef USE_ROCM
-                                                                     volatile
+    volatile
 #endif
-                                                                     Signal* self_sg,
-                                                                     T* __restrict__ result,
-                                                                     int rank,
-                                                                     int size)
+    Signal* self_sg,
+    T* __restrict__ result,
+    int rank,
+    int size)
 {
     constexpr int pack_size = 16 / sizeof(T);
     using P = typename opus::vector_t<T, pack_size>;
     using A = typename opus::vector_t<opus::fp32_t, pack_size>;
+
     constexpr int tnum_gpu = THREAD_NUM / ngpus;
-    __shared__ T tmp_smem[tnum_gpu * ngpus * pack_size];
     // note: we don't reorder the address so the accumulation order is the same
     // for all ranks, ensuring bitwise identical results
     auto dp = *_input_dp;
-
-    // load one gpu data each wave
     int warp_id = threadIdx.x / tnum_gpu;
     int lane_id = threadIdx.x % tnum_gpu;
+
+    // --- double buffer: tmp_smem[0] and tmp_smem[1] ---
+    __shared__ P tmp_smem[2][tnum_gpu * ngpus];
+
+    const int step  = gridDim.x * tnum_gpu;
+    const int start = blockIdx.x * tnum_gpu + lane_id;
+
     start_sync<ngpus>(sg, self_sg, rank);
-    // do the actual reduction
-    for(int idx = blockIdx.x * tnum_gpu + lane_id; idx < size; idx += gridDim.x * tnum_gpu)
+
+    // --- compute uniform iteration count (to keep barriers well-formed) ---
+    const int first = blockIdx.x * tnum_gpu;
+    int iters = 0;
     {
-        *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) =
-            ((const P**)&dp.ptrs[0])[warp_id][idx];
-        __syncthreads();
-        if(warp_id == 0)
-        {
-            A add_reg;
-#pragma unroll
-            for(int i = 0; i < pack_size; ++i)
-            {
-                add_reg[i] =
-                    upcast_s(tmp_smem[threadIdx.x * pack_size + i]);
-            }
-            constexpr int smem_gpu_loop_stride = tnum_gpu * pack_size;
-#pragma unroll
-            for(int i = 1; i < ngpus; ++i)
-            {
-#pragma unroll
-                for(int j = 0; j < pack_size; ++j)
-                {
-                    add_reg[j] += upcast_s(
-                        tmp_smem[smem_gpu_loop_stride * i + threadIdx.x * pack_size + j]);
-                }
-            }
-            P write_reg;
-#pragma unroll
-            for(int i = 0; i < pack_size; ++i)
-            {
-                write_reg[i] = downcast_s<T>(add_reg[i]);
-            }
-            ((P*)result)[idx] = write_reg;
-        }
-        __syncthreads();
+        int rem = size - first;
+        iters = rem > 0 ? (rem + step - 1) / step : 0;
     }
-    // maybe do not need device sync
-    // end_sync<ngpus, true>(sg, self_sg, rank);
+
+    // -------------------------------
+    // fill buffer 0
+    // -------------------------------
+    int buf   = 0;
+    int idx0  = start;
+
+    if (idx0 < size) {
+        P val = ((const P**)&dp.ptrs[0])[warp_id][idx0];
+        tmp_smem[buf][warp_id * tnum_gpu + lane_id] = val;
+    }
+    __syncthreads();
+
+    for (int it = 0; it < iters; ++it)
+    {
+        const int cur_idx  = idx0 + it * step;
+        const int next_idx = cur_idx + step;
+        const int next_buf = buf ^ 1;
+
+        // =======================================================
+        // 1. Warp 0 REDUCES current buffer
+        // =======================================================
+        if (warp_id == 0 && cur_idx < size)
+        {
+            // GPU 0 contribution
+            P v0 = tmp_smem[buf][0 * tnum_gpu + lane_id];
+
+            A acc;
+#pragma unroll
+            for (int j = 0; j < pack_size; ++j)
+                acc[j] = ck_tile::type_convert<float>(v0[j]);
+
+            // GPUs 1..(ngpus-1)
+#pragma unroll
+            for (int g = 1; g < ngpus; ++g)
+            {
+                P vg = tmp_smem[buf][g * tnum_gpu + lane_id];
+#pragma unroll
+                for (int j = 0; j < pack_size; ++j)
+                    acc[j] += ck_tile::type_convert<float>(vg[j]);
+            }
+
+            // store result
+            P out;
+#pragma unroll
+            for (int j = 0; j < pack_size; ++j)
+                out[j] = ck_tile::type_convert<T>(acc[j]);
+
+            ((P*)result)[cur_idx] = out;
+        }
+
+        // =======================================================
+        // 2. ALL warps prefetch NEXT buffer
+        //    (including warp 0; safe to issue after reduction)
+        // =======================================================
+        if (next_idx < size)
+        {
+            P nxt = ((const P**)&dp.ptrs[0])[warp_id][next_idx];
+            tmp_smem[next_buf][warp_id * tnum_gpu + lane_id] = nxt;
+        }
+
+        __syncthreads();
+
+        buf = next_buf;
+    }
 }
 
 template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
@@ -2173,21 +2215,21 @@ class CustomAllreduce
         } \
     } while(0)
 
-#define dispatch(ngpus, name)                             \
+#define dispatch(ngpus, name)              \
     do                                                    \
     {                                                     \
         if(bytes % (ngpus * 16) == 0 && world_size_ != 6) \
         {                                                 \
             if (use_write_mode) {                         \
-                KL(ngpus, name##_write_mode);             \
+                KL(ngpus, name##_write_mode); \
             }                                             \
             else {                                        \
-                KL(ngpus, name);                          \
+                KL(ngpus, name);           \
             }                                             \
         }                                                 \
         else                                              \
         {                                                 \
-            KL(ngpus, name##_naive);                      \
+            KL(ngpus, name##_naive);       \
         }                                                 \
     } while(0)
 
@@ -2195,7 +2237,7 @@ class CustomAllreduce
     case ngpus: {                                        \
         if(call_1stage)                                  \
         {                                                \
-            KL(ngpus, cross_device_reduce_1stage);       \
+            KL(ngpus, cross_device_reduce_1stage); \
         }                                                \
         else if(call_2stage)                             \
         {                                                \
@@ -2224,7 +2266,7 @@ class CustomAllreduce
     case ngpus: {                                            \
         if(world_size_ == 2)                                 \
         {                                                    \
-            KL(ngpus, cross_device_reduce_1stage);           \
+            KL(ngpus, cross_device_reduce_1stage);     \
         }                                                    \
         else if(full_nvlink_)                                \
         {                                                    \
