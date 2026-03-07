@@ -314,11 +314,11 @@ FWD_PREFILL_AUTOTUNE_KEYS = [
     "NUM_Q_HEADS",
 ]
 
-@triton.autotune(
-    configs=get_fwd_configs(),
-    key=FWD_PREFILL_AUTOTUNE_KEYS,
-    use_cuda_graph=True,
-)
+# @triton.autotune(
+#     configs=get_fwd_configs(),
+#     key=FWD_PREFILL_AUTOTUNE_KEYS,
+#     use_cuda_graph=True,
+# )
 @triton.jit(repr=_attn_fwd_repr)
 def _attn_fwd(
     q_ptr: torch.Tensor,

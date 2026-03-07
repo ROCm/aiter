@@ -246,7 +246,7 @@ def _flash_attn_forward(
         NUM_XCD=get_num_xcds(),
         USE_INT64_STRIDES=_USE_INT64_STRIDES,
         ENABLE_SINK=sink is not None,
-        # **config,
+        **config,
     )
 
     return o, softmax_lse, s_dmask, philox_seed, philox_offset
