@@ -2028,7 +2028,7 @@ def paged_attention_decode_sliding_window(
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
     sequence_idx = gl.program_id(0)
     kv_head_idx = gl.program_id(1)
-    sequence_split_idx = gl.program_id(2)
+    split_idx = gl.program_id(2)
 
     # ==================== CONSTANTS AND CONFIGURATION ====================
     if COMPUTE_TYPE.is_fp8():
@@ -2060,6 +2060,8 @@ def paged_attention_decode_sliding_window(
     CONTEXT_PARTITION_SIZE_PER_BLOCK: gl.constexpr = triton.cdiv(
         KV_BLOCK_SIZE, CONTEXT_PARTITION_SIZE
     )
+    sequence_split_idx = split_idx // CONTEXT_PARTITION_SIZE_PER_BLOCK
+    block_split_idx = split_idx % CONTEXT_PARTITION_SIZE_PER_BLOCK
     # ==================== MEMORY LAYOUT DEFINITIONS ====================
     # Query tensor layout - optimized for sequential access (2D)
     shared_query_layout: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, order=[1, 0])
@@ -2346,16 +2348,20 @@ def paged_attention_decode_sliding_window(
         sequence_start_idx = context_length - SLIDING_WINDOW
         sequence_end_idx = context_length
         sequence_partition_start_idx = gl.maximum(
-            0, sequence_start_idx // CONTEXT_PARTITION_SIZE
+            0, sequence_start_idx // CONTEXT_PARTITION_SIZE + block_split_idx
         )
     else:
-        page_size = gl.cdiv(context_length, gl.num_programs(2))
+        page_size = gl.cdiv(
+            context_length, gl.num_programs(2) // CONTEXT_PARTITION_SIZE_PER_BLOCK
+        )
         sequence_start_idx = page_size * sequence_split_idx
 
         sequence_end_idx = gl.minimum(
             context_length, page_size * (sequence_split_idx + 1)
         )
-        sequence_partition_start_idx = sequence_start_idx // CONTEXT_PARTITION_SIZE
+        sequence_partition_start_idx = (
+            sequence_start_idx // CONTEXT_PARTITION_SIZE + block_split_idx
+        )
     block_indices = gl.arange(0, MAX_NUM_KV_BLOCKS_PER_COMPUTE, layout=block_id_layout)
     max_num_kv_blocks = gl.cdiv(context_length, KV_COMPUTE_BLOCK_SIZE)
     kv_block_start_idx = sequence_partition_start_idx * MAX_NUM_KV_BLOCKS_PER_COMPUTE
@@ -2390,7 +2396,7 @@ def paged_attention_decode_sliding_window(
         output_offsets = sequence_idx * stride_output_bs
         output_offsets += kv_head_idx * stride_output_len
         output_offsets += (
-            sequence_split_idx * stride_output_kv_head
+            split_idx * stride_output_kv_head
             + output_group_offsets[:, None] * stride_output_group_size
             + output_head_size_offsets[None, :]
         )
@@ -2398,7 +2404,7 @@ def paged_attention_decode_sliding_window(
         max_logits_offsets = (
             sequence_idx * stride_max_logits_seq
             + kv_head_idx * stride_max_logits_head
-            + sequence_split_idx * stride_max_logits_part
+            + split_idx * stride_max_logits_part
             + max_logits_base_offsets
         )
     qk_row_mask = gl.convert_layout(
@@ -2436,7 +2442,12 @@ def paged_attention_decode_sliding_window(
             )
         return  # No computation needed for this partition
 
-    sequence_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
+    if SLIDING_WINDOW > 0:
+        sequence_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
+    else:
+        sequence_partition_end_idx = (
+            gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE) + block_split_idx
+        )
 
     # Load query tensor with 3D MTP layout
     # Query shape: [batch_size, query_length, num_kv_heads, query_group_size, head_size]
@@ -2529,12 +2540,17 @@ def paged_attention_decode_sliding_window(
     key_tensor = gl.load(key_cache_ptr + key_block_offsets)
     query_converted = query_shared.load(qk_lhs_operand_layout)
     for sequence_partition_idx in range(
-        sequence_partition_start_idx, sequence_partition_end_idx
+        sequence_partition_start_idx,
+        sequence_partition_end_idx,
+        CONTEXT_PARTITION_SIZE_PER_BLOCK,
     ):
 
         # ==================== KEY LOADING AND PROCESSING ====================
         # Calculate key cache offsets and load keys
-        kv_block_start_idx2 = kv_block_start_idx + MAX_NUM_KV_BLOCKS_PER_COMPUTE
+        kv_block_start_idx2 = (
+            kv_block_start_idx
+            + MAX_NUM_KV_BLOCKS_PER_COMPUTE * CONTEXT_PARTITION_SIZE_PER_BLOCK
+        )
         kv_block_numbers2 = gl.amd.cdna3.buffer_load(
             ptr=block_tables_ptr
             + sequence_idx * stride_block_table_seq
@@ -2832,7 +2848,10 @@ def paged_attention_decode_sliding_window(
         else:
             attention_accumulator += attention_output
         max_logits = new_max_logits
-        if sequence_partition_idx + 1 < sequence_partition_end_idx:
+        if (
+            sequence_partition_idx + CONTEXT_PARTITION_SIZE_PER_BLOCK
+            < sequence_partition_end_idx
+        ):
             kv_block_numbers = kv_block_numbers2
             key_tensor = key_tensor2
             kv_block_start_idx = kv_block_start_idx2
@@ -4183,15 +4202,15 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         ONE_SHOT = num_splits <= 1
         if num_kv_heads == 1:
             paged_attention_kernel = paged_attention_decode_sliding_window_head_1
-            if ONE_QUERY_GROUP_SIZE_POW2 >= 16:
-                grid = (num_sequences, query_seq_len, num_splits)
-                QUERY_SEQ_LEN_POW2 = 1
-            else:
-                mtp_splits = triton.cdiv(
-                    QUERY_SEQ_LEN_POW2, triton.cdiv(16, ONE_QUERY_GROUP_SIZE_POW2)
-                )
-                grid = (num_sequences, mtp_splits, num_splits)
-                QUERY_SEQ_LEN_POW2 = triton.cdiv(QUERY_SEQ_LEN_POW2, mtp_splits)
+            # if ONE_QUERY_GROUP_SIZE_POW2 >= 16:
+            #     grid = (num_sequences, query_seq_len, num_splits)
+            #     QUERY_SEQ_LEN_POW2 = 1
+            # else:
+            mtp_splits = triton.cdiv(
+                QUERY_SEQ_LEN_POW2, triton.cdiv(16, ONE_QUERY_GROUP_SIZE_POW2)
+            )
+            grid = (num_sequences, mtp_splits, num_splits)
+            QUERY_SEQ_LEN_POW2 = triton.cdiv(QUERY_SEQ_LEN_POW2, mtp_splits)
         else:
             paged_attention_kernel = paged_attention_decode_sliding_window
         paged_attention_kernel[grid](
