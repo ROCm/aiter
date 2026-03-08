@@ -562,15 +562,7 @@ def nextPow2(n):
     return 1 << (n - 1).bit_length()
 
 def get_padded_M(M):
-    padded_m = M
-    if M < 32:
-        padded_m = 32
-    if M > 512 and M <= 768:
-        padded_m = 768
-    elif M <= 16384:
-        padded_m = nextPow2(padded_m)
-    else:
-        padded_m = 16384
+    padded_m = nextPow2(M)
     return padded_m
 
 @dataclass
