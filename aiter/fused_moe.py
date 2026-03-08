@@ -297,7 +297,6 @@ def fused_moe_(
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
     if block_size_M is not None:
         block_size_M = int(block_size_M)
-
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
         topk_ids,
         topk_weight,
@@ -471,6 +470,7 @@ def fused_moe_1stage(
                 aiter.fmoe_fp8_blockscale_g1u1,
                 fc_scale_blkn=128,
                 fc_scale_blkk=128,
+                block_size_M=block_size_M,
             )
         elif isG1U1:
             fmoe_func = aiter.fmoe_g1u1
@@ -603,22 +603,9 @@ def nextPow2(n):
         return 1
     return 1 << (n - 1).bit_length()
 
-
 def get_padded_M(M):
-    padded_m = M
-    if M >= 1 and M <= 16:
-        # decoding policy may be changed in the future.
-        padded_m = nextPow2(padded_m)
-    elif M < 1024:
-        padded_m = nextPow2(padded_m)
-    elif M < 2048:
-        padded_m = 1024
-    elif M < 16384:
-        padded_m = 2048
-    else:
-        padded_m = 16384
+    padded_m = nextPow2(M)
     return padded_m
-
 
 @dataclass
 class MOEMetadata:
@@ -783,6 +770,7 @@ def get_2stage_cfgs(
         logger.info("\033[0m")
 
     def use_cfg():
+        return False
         problem_type = (activation, dtype, q_dtype_a, q_dtype_w, q_type)
         bypass_type = (
             ActivationType.Silu,
@@ -890,6 +878,7 @@ def get_2stage_cfgs(
             return 16 if token < 2048 else 32 if token < 16384 else 64
 
     if run_1stage:
+        tkn_per_epr = token * topk / expert
         return MOEMetadata(
             functools.partial(
                 fused_moe_1stage,
@@ -898,7 +887,7 @@ def get_2stage_cfgs(
                 quant_type=q_type,
             ),
             None,
-            block_m,
+            64 if tkn_per_epr > 32 else block_m,
             ksplit,
             run_1stage,
         )
