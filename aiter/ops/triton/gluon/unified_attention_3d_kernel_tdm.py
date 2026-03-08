@@ -90,6 +90,7 @@ class AttentionConfig:
     SHUFFLED_KV_CACHE: gl.constexpr
     IS_Q_FP8: gl.constexpr
     IS_KV_FP8: gl.constexpr
+    K_WIDTH: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -180,17 +181,27 @@ class AttentionConfig:
                 instr_shape=[16, 16, 32 if not self.IS_KV_FP8 else 64],
             )
         )
+        k_width = 16 if self.IS_KV_FP8 and self.SHUFFLED_KV_CACHE else 8
+        self.K_WIDTH = gl.constexpr(k_width)
         self.Q_DOT_LAYOUT = gl.constexpr(
-            gl.DotOperandLayout(operand_index=0, parent=self.QK_WMMA_LAYOUT, k_width=8)
+            gl.DotOperandLayout(
+                operand_index=0, parent=self.QK_WMMA_LAYOUT, k_width=k_width
+            )
         )
         self.K_DOT_LAYOUT = gl.constexpr(
-            gl.DotOperandLayout(operand_index=1, parent=self.QK_WMMA_LAYOUT, k_width=8)
+            gl.DotOperandLayout(
+                operand_index=1, parent=self.QK_WMMA_LAYOUT, k_width=k_width
+            )
         )
         self.P_DOT_LAYOUT = gl.constexpr(
-            gl.DotOperandLayout(operand_index=0, parent=self.PV_WMMA_LAYOUT, k_width=8)
+            gl.DotOperandLayout(
+                operand_index=0, parent=self.PV_WMMA_LAYOUT, k_width=k_width
+            )
         )
         self.V_DOT_LAYOUT = gl.constexpr(
-            gl.DotOperandLayout(operand_index=1, parent=self.PV_WMMA_LAYOUT, k_width=8)
+            gl.DotOperandLayout(
+                operand_index=1, parent=self.PV_WMMA_LAYOUT, k_width=k_width
+            )
         )
 
         # gl.static_assert(
@@ -886,74 +897,56 @@ class AttentionProgram:
             )
         return q, query_pos, query_mask
 
-    @gluon.jit
-    def unshuffle_k(self, K):
-        K = (
-            K.reshape(
-                1,
-                self.cfg.TILE_SIZE // 16,
-                self.cfg.HEAD_SIZE // 16,
-                2,
-                16,
-                8,
-            )
-            .permute(0, 1, 4, 2, 3, 5)
-            .reshape(self.cfg.TILE_SIZE, self.cfg.HEAD_SIZE)
-            .trans(1, 0)
-        )
-        return gl.convert_layout(
-            value=K, layout=self.cfg.K_DOT_LAYOUT, assert_trivial=True
-        )
+    # @gluon.jit
+    # def unshuffle_k(self, K):
+    #     K = (
+    #         K.reshape(
+    #             1,
+    #             self.cfg.TILE_SIZE // 16,
+    #             self.cfg.HEAD_SIZE // 16,
+    #             2,
+    #             16,
+    #             8,
+    #         )
+    #         .permute(0, 1, 4, 2, 3, 5)
+    #         .reshape(self.cfg.TILE_SIZE, self.cfg.HEAD_SIZE)
+    #         .trans(1, 0)
+    #     )
+    #     return gl.convert_layout(
+    #         value=K, layout=self.cfg.K_DOT_LAYOUT, assert_trivial=True
+    #     )
 
-    @gluon.jit
-    def unshuffle_v(self, V):
-        V = (
-            V.reshape(
-                1,
-                self.cfg.HEAD_SIZE // 16,
-                self.cfg.TILE_SIZE // 16,
-                2,
-                16,
-                8,
-            )
-            .permute(0, 1, 4, 2, 3, 5)
-            .reshape(self.cfg.HEAD_SIZE, self.cfg.TILE_SIZE)
-            .trans(1, 0)
-        )
-        return gl.convert_layout(
-            value=V, layout=self.cfg.V_DOT_LAYOUT, assert_trivial=True
-        )
+    # @gluon.jit
+    # def unshuffle_v(self, V):
+    #     V = (
+    #         V.reshape(
+    #             1,
+    #             self.cfg.HEAD_SIZE // 16,
+    #             self.cfg.TILE_SIZE // 16,
+    #             2,
+    #             16,
+    #             8,
+    #         )
+    #         .permute(0, 1, 4, 2, 3, 5)
+    #         .reshape(self.cfg.HEAD_SIZE, self.cfg.TILE_SIZE)
+    #         .trans(1, 0)
+    #     )
+    #     return gl.convert_layout(
+    #         value=V, layout=self.cfg.V_DOT_LAYOUT, assert_trivial=True
+    #     )
 
     @gluon.jit
     def lds_unshuffle_k(self, buffer_id):
-        # if self.cfg.IS_KV_FP8:
-        #     return (
-        #         self.k_shared.index(buffer_id)
-        #         .reshape(
-        #             (
-        #                 self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
-        #                 self.cfg.BLOCK_SIZE // 16,
-        #                 self.cfg.HEAD_SIZE // 32,
-        #                 2, 2,
-        #                 16,
-        #                 8,
-        #             )
-        #         )
-        #         .permute((0, 1, 5, 2, 4, 3, 6))
-        #         .reshape((self.cfg.TILE_SIZE, self.cfg.HEAD_SIZE))
-        #         .permute((1, 0))
-        #     )
-        # else:
         return (
             self.k_shared.index(buffer_id)
             .reshape(
                 (
                     self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
                     self.cfg.BLOCK_SIZE // 16,
-                    self.cfg.HEAD_SIZE // 16,
+                    self.cfg.HEAD_SIZE // (2 * self.cfg.K_WIDTH),
                     2,
                     16,
-                    8,
+                    self.cfg.K_WIDTH,
                 )
             )
             .permute((0, 1, 4, 2, 3, 5))
@@ -963,42 +956,16 @@ class AttentionProgram:
 
     @gluon.jit
     def lds_unshuffle_v(self, buffer_id):
-        # if self.cfg.IS_KV_FP8:
-        #     return (
-        #         self.v_shared.index(buffer_id)
-        #         .reshape(
-        #             (
-        #                 self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
-        #                 self.cfg.HEAD_SIZE // 16,
-        #                 self.cfg.BLOCK_SIZE // 32,
-        #                 2,
-        #                 16,
-        #                 16,
-        #             )
-        #         )
-        #         .permute((0, 1, 4, 2, 3, 5))
-        #         .reshape(
-        #             (
-        #                 self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
-        #                 self.cfg.HEAD_SIZE,
-        #                 self.cfg.BLOCK_SIZE,
-        #             )
-        #         )
-        #         .permute((1, 0, 2))
-        #         .reshape((self.cfg.HEAD_SIZE, self.cfg.TILE_SIZE))
-        #         .permute((1, 0))
-        #     )
-        # else:
         return (
             self.v_shared.index(buffer_id)
             .reshape(
                 (
                     self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
                     self.cfg.HEAD_SIZE // 16,
-                    self.cfg.BLOCK_SIZE // 16,
+                    self.cfg.BLOCK_SIZE // (2 * self.cfg.K_WIDTH),
                     2,
                     16,
-                    8,
+                    self.cfg.K_WIDTH,
                 )
             )
             .permute((0, 1, 4, 2, 3, 5))

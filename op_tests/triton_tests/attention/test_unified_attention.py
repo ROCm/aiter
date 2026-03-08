@@ -41,10 +41,18 @@ def shuffle_kv_cache(
     assert value_cache.dtype == dtype
     assert dtype in (torch.bfloat16, e4m3_dtype)
 
-    if IS_DEVICE_ARCH_GFX12 or key_cache.dtype == torch.bfloat16:
-        layout = (16, 8)
+    if IS_DEVICE_ARCH_GFX12:
+        if dtype == torch.bfloat16:
+            layout = (16, 8)
+        else:
+            # Caution: in gfx1250, the 16-bit and 8-bit layout should both be (16, 8), however, in order to enable ds_load_b128 for 8-bit WMMA,
+            # we use (16, 16) here, noted that you must set k_width to 16 in the corresponding DotOperandLayout, the math will be equivalent.
+            layout = (16, 16)
     else:
-        layout = (16, 16)
+        if dtype == torch.bfloat16:
+            layout = (16, 8)
+        else:
+            layout = (16, 16)
 
     num_blocks, block_size, num_kv_heads, head_size = key_cache.shape
     num_blocks_v, block_size_v, num_kv_heads_v, head_size_v = value_cache.shape
@@ -58,21 +66,6 @@ def shuffle_kv_cache(
     key_cache_shuffled = key_cache.view(
         -1, block_size, num_kv_heads, head_size
     ).permute(0, 2, 1, 3)
-    # if IS_DEVICE_ARCH_GFX12 and dtype == e4m3_dtype:
-    #     key_cache_shuffled = key_cache_shuffled.view(
-    #         -1,
-    #         num_kv_heads,
-    #         block_size // num_lanes,
-    #         num_lanes,
-    #         head_size // (4 * num_elements_per_thread),
-    #         2,
-    #         2,
-    #         num_elements_per_thread,
-    #     )
-    #     key_cache_shuffled = key_cache_shuffled.permute(
-    #         0, 1, 2, 4, 6, 5, 3, 7
-    #     ).contiguous()
-    # else:
     key_cache_shuffled = key_cache_shuffled.view(
         -1,
         num_kv_heads,
@@ -82,9 +75,7 @@ def shuffle_kv_cache(
         2,  # there are 2 groups of threads, t0 ~ t15 and t16 ~ t31
         num_elements_per_thread,
     )
-    key_cache_shuffled = key_cache_shuffled.permute(
-        0, 1, 2, 4, 5, 3, 6
-    ).contiguous()
+    key_cache_shuffled = key_cache_shuffled.permute(0, 1, 2, 4, 5, 3, 6).contiguous()
     key_cache_shuffled = key_cache_shuffled.view(
         -1, num_kv_heads, block_size // 16, head_size * 16
     )
@@ -92,19 +83,6 @@ def shuffle_kv_cache(
     value_cache_shuffled = value_cache.view(
         -1, block_size, num_kv_heads, head_size
     ).permute(0, 2, 1, 3)
-    # if IS_DEVICE_ARCH_GFX12 and dtype == e4m3_dtype:
-    #     value_cache_shuffled = value_cache_shuffled.view(
-    #         -1,
-    #         num_kv_heads,
-    #         block_size // num_lanes,
-    #         num_lanes,
-    #         head_size // (4 * num_elements_per_thread),
-    #         2,
-    #         2,
-    #         num_elements_per_thread,
-    #     )
-    #     value_cache_shuffled = value_cache_shuffled.permute(0, 1, 2, 4, 6, 5, 3, 7).contiguous()
-    # else:
     value_cache_shuffled = value_cache_shuffled.view(
         -1,
         num_kv_heads,
@@ -270,9 +248,9 @@ def ref_paged_attn(
 @pytest.mark.parametrize(
     "q_dtype, kv_dtype, o_dtype",
     [
-        # (torch.bfloat16, torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16),
         (torch.bfloat16, e4m3_dtype, torch.bfloat16),
-        # (e4m3_dtype, e4m3_dtype, torch.bfloat16),
+        (e4m3_dtype, e4m3_dtype, torch.bfloat16),
     ],
 )
 @pytest.mark.parametrize("soft_cap", [None])
@@ -286,6 +264,7 @@ def ref_paged_attn(
         # ("gluon", False, 1, False),  # use gluon baseline
         # ("gluon", False, 1, True),  # use gluon simple async_copy
         ("gluon", True, 1, False),  # use gluon TDM async_copy
+        # ("gluon", True, 4, False),  # use gluon TDM gather pipelined
         # ("gluon", True, 4, False),  # use gluon TDM gather pipelined
         # ("gluon", True, 8, False),  # use gluon TDM gather pipelined
     ],
@@ -491,9 +470,10 @@ def test_triton_unified_attn(
     atol, rtol = 1.5e-2, 1e-2
     if q_dtype != torch.bfloat16:
         atol, rtol = 1.5e-1, 1.5e-1
-    if use_tdm and num_tdm_gather > 1 and kv_dtype != torch.bfloat16:
-        # TDM gather seems to require a more loose precision requirement for FP8 KV cache
-        atol, rtol = 1.5e-1, 1.5e-1
+    if kv_dtype != torch.bfloat16:
+        if use_async or (use_tdm and num_tdm_gather > 1):
+            # async_copy and TDM gather seems to require a more loose precision requirement for FP8 KV cache
+            atol, rtol = 1.5e-1, 1.5e-1
     torch.testing.assert_close(
         output, ref_output, atol=atol, rtol=rtol
     ), f"{torch.max(torch.abs(output - ref_output))}"
