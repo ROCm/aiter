@@ -33,11 +33,11 @@ from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16 as triton_gemm_a
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 
-aiter.hipb_create_extension()
-
 
 @lru_cache(maxsize=1)
 def init_hipblas():
+    """Lazy init: called after torch.cuda.set_device() so the hipBLASLt handle
+    and workspace are allocated on the correct GPU."""
     aiter.hipb_create_extension()
 
 
@@ -45,6 +45,8 @@ def call_hipb_mm(
     input, weight, bias, scale_a, scale_b, solidx, out_dtype, bpreshuffle=False
 ):
     init_hipblas()
+    if scale_b is not None:
+        scale_b = scale_b.t()
     return aiter.hipb_mm(
         input,
         weight.t(),
@@ -101,8 +103,15 @@ def generate_data(
     device="cuda:0",
 ):
     torch.manual_seed(seed)
-    inp = torch.randn((m, k), device=device).to(indtype)
-    weights = torch.randn((n, k), device=device).to(indtype)
+    inp = torch.randn((m, k), device=device).to(outdtype)
+    weights = torch.randn((n, k), device=device).to(outdtype)
+    if indtype == dtypes.fp8:
+        inp, x_scale = aiter.pertoken_quant(inp, quant_dtype=dtypes.fp8)
+        weights, w_scale = aiter.pertoken_quant(weights, quant_dtype=dtypes.fp8)
+    else:
+        scale_half = torch.tensor(0.5, dtype=dtypes.fp32, device=device)
+        w_scale = scale_half
+        x_scale = scale_half
     if is_shuffle:
         shuffleweights = shuffle_weight(weights, layout=(16, 16))
     else:
@@ -116,29 +125,35 @@ def generate_data(
     # if scaleAB:
     #    scaleB = scaleB.t()
     out_asm = torch.empty(m, n, dtype=outdtype, device=device)
-    return (inp, weights, weights.t(), bias, scale, out_asm, shuffleweights)
+    return (inp, weights, weights.t(), bias, x_scale, out_asm, shuffleweights, w_scale)
 
 
-def get_gemm_ref(inp, weights, bias, scale, indtype, outdtype):
-    scaleA = scale
-    scaleB = scale
+def get_gemm_ref(inp, weights, bias, scaleA, scaleB, indtype, outdtype):
+    scaleA = scaleA
+    scaleB = scaleB
     if indtype == dtypes.fp8:
-        try:
-            ref = torch._scaled_mm(
-                inp,
-                weights.t(),
-                bias=bias,
-                scale_a=scaleA,
-                scale_b=scaleB,
-                out_dtype=outdtype,
-            )
-        except RuntimeError:
-            ref = (
-                F.linear(inp.to(dtypes.fp32), weights.to(dtypes.fp32)) * scaleA * scaleB
-            )
-            ref = (ref.to(outdtype) + bias) if bias is not None else ref.to(outdtype)
-        if type(ref) is tuple and len(ref) == 2:
-            ref = ref[0]
+        x = inp.to(dtypes.fp32) * scaleA
+        weight = weights.to(dtypes.fp32) * scaleB
+        out = F.linear(x, weight)
+        if bias is not None:
+            out = out.to(bias) + bias
+        return out.to(outdtype)
+        # try:
+        #    ref = torch._scaled_mm(
+        #        inp,
+        #        weights.t(),
+        #        bias=bias,
+        #        scale_a=scaleA,
+        #        scale_b=scaleB,
+        #        out_dtype=outdtype,
+        #    )
+        # except RuntimeError:
+        #    ref = (
+        #        F.linear(inp.to(dtypes.fp32), weights.to(dtypes.fp32)) * scaleA * scaleB
+        #    )
+        #    ref = (ref.to(outdtype) + bias) if bias is not None else ref.to(outdtype)
+        # if type(ref) is tuple and len(ref) == 2:
+        #    ref = ref[0]
     else:
         ref = (
             (
@@ -155,8 +170,6 @@ rtol = 1e-5
 atol = 1
 
 CACHE_INVALIDATE_BUFFERS = int(os.getenv("CACHE_INVALIDATE_BUFFERS", "37"))
-ONE = torch.ones(1, dtype=dtypes.fp32, device="cuda")
-HALF = torch.tensor(0.5, dtype=dtypes.fp32, device="cuda")
 
 
 class Gemm:
@@ -189,9 +202,16 @@ class Gemm:
         self.outdtype = outdtype
         self.scaleAB = scaleAB
         self.nb = CACHE_INVALIDATE_BUFFERS
-        self.inp, self.weights, _, self.bias, _, scaleA, _ = generate_data(
-            m, n, k, indtype, outdtype, scaleAB, is_shuffle, 0, bias
-        )
+        (
+            self.inp,
+            self.weights,
+            _,
+            self.bias,
+            self.x_scale,
+            _,
+            self.shuffleweights,
+            self.w_scale,
+        ) = generate_data(m, n, k, indtype, outdtype, scaleAB, is_shuffle, 0, bias)
         self.blob = torch.ones(128 * 1024 * 1024, dtype=dtypes.fp32, device="cuda")
         self.topn = 20  # number of top solutions from each source
         self.hipb_sols = []
@@ -218,13 +238,19 @@ class Gemm:
         self.libtype = libtype
 
     def find_hipblas_sols(self):
+        init_hipblas()
+        scale = (
+            torch.tensor(0.5, dtype=dtypes.fp32, device=self.inp.device)
+            if self.scaleAB
+            else None
+        )
         sols = aiter.hipb_findallsols(
             self.inp,
             self.weights.t(),
             bias=self.bias,
             out_dtype=self.outdtype,
-            scaleA=HALF if self.scaleAB else None,
-            scaleB=HALF if self.scaleAB else None,
+            scaleA=scale,
+            scaleB=scale,
             bpreshuffle=self.is_shuffle,
         )
         print(
@@ -244,8 +270,13 @@ class Gemm:
         self.hipb_sols = sols
 
     def get_gemm_ref(self):
-        scaleA = HALF if self.scaleAB else ONE
-        scaleB = HALF if self.scaleAB else ONE
+        dev = self.inp.device
+        scaleA = (
+            torch.tensor(0.5, dtype=dtypes.fp32, device=dev)
+            if self.scaleAB
+            else torch.ones(1, dtype=dtypes.fp32, device=dev)
+        )
+        scaleB = scaleA
         if self.indtype == dtypes.fp8:
             try:
                 ref = torch._scaled_mm(
@@ -289,11 +320,10 @@ class Gemm:
         return kernel_dict
 
     def asm_gemm_all_solutions(self):
-
         if (
             self.scaleAB or self.k % 64 != 0 or self.indtype != dtypes.bf16
         ) and get_gfx() == "gfx942":
-            print(
+            logger.warning(
                 f"only indtype=bf16 and outdtype=fp32 and k%64==0 and not scaleAB is supported in {get_gfx()}, but actual indtype is {self.indtype}, outdtype is {self.outdtype}, k is  {self.k}, scaleAB is {self.scaleAB}"
             )
             self.asm_gtimedf = pd.DataFrame(columns=["gtimems", "libtype"])
@@ -304,7 +334,7 @@ class Gemm:
             or self.n % 64 != 0  # mismatch randomly
             or self.indtype != dtypes.bf16
         ) and get_gfx() == "gfx950":
-            print(
+            logger.warning(
                 f"only indtype=bf16 and outdtype=bf16 and k%256==0 and not scaleAB is supported in {get_gfx()}, but actual indtype is {self.indtype}, outdtype is {self.outdtype}, k is  {self.k}, scaleAB is {self.scaleAB}"
             )
 
@@ -413,8 +443,8 @@ class Gemm:
         return ret
 
     def triton_gemm_all_sols(self):
-        if self.scaleAB or self.is_shuffle or self.outdtype == dtypes.fp32:
-            print(
+        if self.scaleAB or self.is_shuffle or self.outdtype == dtypes.fp32 or self.indtype != dtypes.bf16:
+            logger.warning(
                 f"Triton gemm_a16w16 does not support scaling{self.scaleAB} or weight shuffle {self.is_shuffle}  or fp32 output {self.outdtype} yet"
             )
             return []
@@ -512,13 +542,13 @@ class Gemm:
                         self.has_bias,
                     ),
                     call_hipb_mm,
-                    ([0, 6, 3, 4, 4], solidx, self.outdtype),
+                    ([0, 6, 3, 4, 7], solidx, self.outdtype),
                     {
                         "num_warmup": warmi,
                         "num_iters": coldi,
                     },
                     get_gemm_ref if fast_mode == 0 else None,
-                    ([0, 1, 3, 4], self.indtype, self.outdtype),
+                    ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
                     {},
                     None,  # self.ref if fast_mode == 0 else None,
                     self.rtol,
@@ -868,6 +898,8 @@ class GemmTuner(GemmCommonTuner):
 
             ret.extend(gemmobj.run_solutions())
             gemmobj.cleanup()
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
             del gemmobj
 
         return ret
