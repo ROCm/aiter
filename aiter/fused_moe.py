@@ -612,11 +612,15 @@ def nextPow2(n):
     return 1 << (n - 1).bit_length()
 
 def get_padded_M(M):
+<<<<<<< HEAD
     padded_m = M
     if M < 32768:
         padded_m = nextPow2(padded_m)
     else:
         padded_m = 32768
+=======
+    padded_m = nextPow2(M)
+>>>>>>> 9f91a3d4d (Add new 64x256 kernel with batched scheduling in XCD)
     return padded_m
 
 @dataclass
