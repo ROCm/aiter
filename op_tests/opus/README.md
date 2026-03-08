@@ -203,7 +203,7 @@ In `device/test_opus_device.py`:
 
 | Test | Variant | OPUS APIs exercised | Arch |
 |---|---|---|---|
-| `test_mfma_f16` | 32x32x8 fp16/bf16 | `make_tiled_mma`, `mfma_adaptor_swap_ab`, `partition_layout_a/b/c`, `make_gmem`, `cast` | gfx942 |
+| `test_mfma_f16` | 32x32x8 fp16/bf16 | `make_tiled_mma`, `mfma_adaptor_swap_ab`, `mfma_adaptor_swap_ab_swizzle_b`, `partition_layout_a/b/c`, `make_gmem`, `cast` | gfx942 |
 | `test_mfma_f16` | 16x16x16 fp16/bf16 | (same as above) | gfx942 |
 | `test_mfma_f16` | 32x32x16 fp16/bf16 | (same, uses base 32x32x8 with K-loop on gfx942; native on gfx950) | gfx942 + gfx950 |
 | `test_mfma_f16` | 16x16x32 fp16/bf16 | (same, uses base 16x16x16 with K-loop on gfx942; native on gfx950) | gfx942 + gfx950 |
