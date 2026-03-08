@@ -4202,15 +4202,15 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         ONE_SHOT = num_splits <= 1
         if num_kv_heads == 1:
             paged_attention_kernel = paged_attention_decode_sliding_window_head_1
-            # if ONE_QUERY_GROUP_SIZE_POW2 >= 16:
-            #     grid = (num_sequences, query_seq_len, num_splits)
-            #     QUERY_SEQ_LEN_POW2 = 1
-            # else:
-            mtp_splits = triton.cdiv(
-                QUERY_SEQ_LEN_POW2, triton.cdiv(16, ONE_QUERY_GROUP_SIZE_POW2)
-            )
-            grid = (num_sequences, mtp_splits, num_splits)
-            QUERY_SEQ_LEN_POW2 = triton.cdiv(QUERY_SEQ_LEN_POW2, mtp_splits)
+            if ONE_QUERY_GROUP_SIZE_POW2 >= 16:
+                grid = (num_sequences, query_seq_len, num_splits)
+                QUERY_SEQ_LEN_POW2 = 1
+            else:
+                mtp_splits = triton.cdiv(
+                    query_seq_len, triton.cdiv(16, ONE_QUERY_GROUP_SIZE_POW2)
+                )
+                grid = (num_sequences, mtp_splits, num_splits)
+                QUERY_SEQ_LEN_POW2 = triton.cdiv(QUERY_SEQ_LEN_POW2, mtp_splits)
         else:
             paged_attention_kernel = paged_attention_decode_sliding_window
         paged_attention_kernel[grid](
