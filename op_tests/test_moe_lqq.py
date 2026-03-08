@@ -204,6 +204,13 @@ def test_fmoe_lqq(
 
     eprt = local_E + shared_E
 
+    # topk_ids_absolute_avera
+    topk_ids_list2 = [[((i * topk) + j) % E for j in range(topk)] for i in range(token)]
+    topk_ids_absolute_avera = torch.tensor(
+        topk_ids_list2, device=topk_ids.device, dtype=topk_ids.dtype
+    )
+    topk_ids[:, :6] = topk_ids_absolute_avera
+
     ######################################################################################
     print("[test] batch: ", token)
     print("[test] expr: ", eprt, "topk: ", topk)
@@ -388,8 +395,10 @@ def test_fmoe_lqq(
         "model_dim": model_dim,
         "inter_dim": inter_dim,
         "E": E,
+        "shared_E": shared_E,
         "topk": topk,
         "ep": ep,
+        "block_size_M": block_size_M,
         "us_asm": f"{us_asm:.2f}",
     }
     if us_flydsl is not None:
@@ -505,3 +514,4 @@ if df:
 
     df = pd.DataFrame(df)
     aiter.logger.info("moe_lqq summary:\n%s", df.to_markdown(index=False))
+    df.to_csv("moe_lqq_summary.csv", index=False)
