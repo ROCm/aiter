@@ -1,0 +1,38 @@
+name: PR Welcome Comment
+
+on:
+  pull_request:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  comment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `### 🏷️ CI Guide
+
+            **Runs automatically on every PR:**
+            - ✅ Pre-checks (submodule verification, code formatting)
+            - ✅ Aiter op tests (gfx942 + gfx950)
+            - ✅ Triton tests (only when \`aiter/ops/triton/**\` or related paths are changed)
+
+            **Extended tests (opt-in via labels):**
+
+            | Label | Tests |
+            |-------|-------|
+            | \`ci:sglang\` | SGLang integration tests |
+            | \`ci:atom\` | ATOM benchmark (DeepSeek-R1 + GPT-OSS) |
+            | \`ci:vllm\` | vLLM benchmark |
+            | \`ci:all\` | All of the above |
+
+            > Add labels via the sidebar or \`gh pr edit ${context.issue.number} --add-label <label>\``
+            });

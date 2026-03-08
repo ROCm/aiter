@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 from typing import Tuple
 import aiter
@@ -242,7 +242,7 @@ parser.add_argument(
     nargs="*",
     default=[True, False],
     help="""Expert mask default is [True, False].
-    e.g.: -em f    # false 
+    e.g.: -em f    # false
           -em t    # true""",
 )
 

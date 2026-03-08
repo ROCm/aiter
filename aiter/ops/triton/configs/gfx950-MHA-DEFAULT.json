@@ -25,7 +25,7 @@
       "waves_per_eu": 2,
       "num_warps": 8,
       "num_ctas": 1,
-      "num_stages": 5
+      "num_stages": 3
     },
     "pe_dropout_or_fp32": {
       "BLOCK_M": 256,

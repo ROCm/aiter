@@ -158,9 +158,9 @@ fi
 
 get_time() {
     local abs="$1"
-    local rel="${abs#${TEST_DIR}/}"
-    if [[ -n "${FILE_TIMES[$rel]+x}" ]]; then
-        echo "${FILE_TIMES[$rel]}"
+    # FILE_TIMES keys use full path (e.g. op_tests/test_mla.py), so look up with abs
+    if [[ -n "${FILE_TIMES[$abs]+x}" ]]; then
+        echo "${FILE_TIMES[$abs]}"
     else
         echo 15
     fi

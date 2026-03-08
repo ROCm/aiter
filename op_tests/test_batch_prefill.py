@@ -1689,6 +1689,136 @@ def reference_attention_kv_blockscale(
     return output.to(torch.bfloat16)
 
 
+@pytest.mark.parametrize(
+    "num_blocks,page_size",
+    [
+        (5000, 1024),  # ~10GB KV cache
+        (10000, 1024),  # ~20GB KV cache
+    ],
+)
+@pytest.mark.parametrize("num_kv_heads", [8])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("input_dtype", ["bf16", "fp8"])
+def test_batch_prefill_large_kvcache(
+    num_blocks,
+    page_size,
+    num_kv_heads,
+    head_dim,
+    causal,
+    input_dtype,
+):
+    """
+    Test that batch prefill produces correct results with large KV caches
+    whose element offsets exceed the INT32_MAX boundary (~4GB for bf16).
+    """
+    torch.manual_seed(42)
+
+    is_fp8 = input_dtype == "fp8"
+    dtype = torch.bfloat16
+    num_qo_heads = num_kv_heads  # MHA (no GQA) for simplicity
+
+    stride_per_page = page_size * num_kv_heads * head_dim  # elements per page block
+    max_offset = (num_blocks - 1) * stride_per_page
+    INT32_MAX = 2**31 - 1
+
+    if max_offset <= INT32_MAX:
+        pytest.skip(
+            f"max_offset {max_offset} doesn't exceed INT32_MAX, not an overflow test"
+        )
+
+    # Check available GPU memory -- skip if not enough
+    free_mem = torch.cuda.mem_get_info()[0]
+    elem_size = 1 if is_fp8 else 2  # fp8=1 byte, bf16=2 bytes
+    required_mem = 2 * num_blocks * page_size * num_kv_heads * head_dim * elem_size
+    if free_mem < required_mem * 1.1:  # 10% headroom
+        pytest.skip(
+            f"Not enough GPU memory: need {required_mem / 1e9:.1f}GB, "
+            f"have {free_mem / 1e9:.1f}GB"
+        )
+
+    # Allocate KV caches in linear layout: [num_blocks, page_size, num_kv_heads, head_dim]
+    k_cache_bf16 = torch.randn(
+        num_blocks, page_size, num_kv_heads, head_dim, device="cuda", dtype=dtype
+    )
+    v_cache_bf16 = torch.randn(
+        num_blocks, page_size, num_kv_heads, head_dim, device="cuda", dtype=dtype
+    )
+
+    if is_fp8:
+        k_cache, k_descale = per_tensor_quant(k_cache_bf16, quant_dtype=dtypes.fp8)
+        v_cache, v_descale = per_tensor_quant(v_cache_bf16, quant_dtype=dtypes.fp8)
+    else:
+        k_cache = k_cache_bf16
+        v_cache = v_cache_bf16
+
+    # Test pages that span the overflow boundary
+    qo_len = 1
+    kv_len = page_size  # one full page
+
+    q_bf16 = torch.randn(qo_len, num_qo_heads, head_dim, device="cuda", dtype=dtype)
+    if is_fp8:
+        q, q_descale = per_tensor_quant(q_bf16, quant_dtype=dtypes.fp8)
+    else:
+        q = q_bf16
+    cu_seqlens_q = torch.tensor([0, qo_len], device="cuda", dtype=torch.int32)
+
+    # Test at several page indices: before, at, and after the overflow boundary
+    overflow_page = INT32_MAX // stride_per_page
+    test_pages = [
+        0,
+        overflow_page - 1,
+        overflow_page,
+        overflow_page + 1,
+        num_blocks - 1,
+    ]
+    test_pages = [p for p in test_pages if 0 <= p < num_blocks]
+    # Remove duplicates while preserving order
+    test_pages = list(dict.fromkeys(test_pages))
+
+    threshold = 0.055 if is_fp8 else 0.01
+
+    for page_idx in test_pages:
+        offset = page_idx * stride_per_page
+        label = "OVERFLOW" if offset > INT32_MAX else "safe"
+
+        kv_indptr = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+        kv_page_indices = torch.tensor([page_idx], device="cuda", dtype=torch.int32)
+        kv_last_page_lens = torch.tensor([page_size], device="cuda", dtype=torch.int32)
+
+        extra_kwargs = {}
+        if is_fp8:
+            extra_kwargs = dict(
+                q_descale=q_descale, k_descale=k_descale, v_descale=v_descale
+            )
+
+        result = aiter.mha_batch_prefill_func(
+            q,
+            k_cache,
+            v_cache,
+            cu_seqlens_q,
+            kv_indptr,
+            kv_page_indices,
+            qo_len,
+            kv_len,
+            causal=causal,
+            kv_last_page_lens=kv_last_page_lens,
+            **extra_kwargs,
+        )
+        out = result[0] if isinstance(result, (list, tuple)) else result
+
+        # Reference: direct attention on the original bf16 data
+        k_page = k_cache_bf16[page_idx]  # [page_size, num_kv_heads, head_dim]
+        v_page = v_cache_bf16[page_idx]
+        o_ref = ref_masked_attention(q_bf16, k_page, v_page, causal=causal)
+
+        max_diff = (out - o_ref).abs().max().item()
+        assert max_diff < threshold, (
+            f"[{input_dtype}] page {page_idx} (offset={offset}, {label}): "
+            f"max_diff={max_diff} exceeds threshold {threshold}"
+        )
+
+
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(32, 8), (16, 16)])
 @pytest.mark.parametrize("head_dim", [128])

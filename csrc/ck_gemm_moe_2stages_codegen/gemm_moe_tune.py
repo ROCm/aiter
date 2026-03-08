@@ -2116,7 +2116,7 @@ class FmoeTuner(TunerCommon):
                 ["stage", "block_m"], keep="first"
             )
             stage1_profileDF = profileDF[profileDF["stage"] == "stage1"].drop(
-                columns=["stage"], axis=1
+                columns=["stage"]
             )
 
             stage1_profileDF = stage1_profileDF.rename(
@@ -2129,7 +2129,7 @@ class FmoeTuner(TunerCommon):
                 }
             )
             stage2_profileDF = profileDF[profileDF["stage"] == "stage2"].drop(
-                columns=["stage", "ksplit"], axis=1
+                columns=["stage", "ksplit"]
             )
             stage2_profileDF = stage2_profileDF.rename(
                 columns={
@@ -2147,7 +2147,7 @@ class FmoeTuner(TunerCommon):
                     "Error: please check errRatio, stage1 and stage2 should be valid together!"
                 )
             asm_1stage_profileDF = profileDF[profileDF["stage"] == "asm_1stage"].drop(
-                columns=["stage"], axis=1
+                columns=["stage"]
             )
             asm_1stage_profileDF = asm_1stage_profileDF.rename(
                 columns={
