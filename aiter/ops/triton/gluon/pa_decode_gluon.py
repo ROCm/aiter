@@ -67,6 +67,24 @@ TRITON_VERSION = parse_triton_version(triton.__version__)
 TRITON_VERSION_GE_3_6_0 = tl.constexpr(TRITON_VERSION >= (3, 6, 0))
 
 
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"waves_per_eu": wa}, maxnreg=512 // wa if wa > 0 else None, num_stages=1
+        )
+        for wa in range(5)
+    ],
+    key=[
+        "KV_BLOCK_SIZE",
+        "SLIDING_WINDOW",
+        "KV_QUANT_MODE",
+        "QUERY_QUANT_MODE",
+        "ONE_QUERY_GROUP_SIZE_POW2",
+        "HEAD_SIZE_POW2",
+        "COMPUTE_TYPE",
+    ],
+    cache_results=True,
+)
 @gluon.jit
 def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
@@ -123,6 +141,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     VALUE_TRANSPOSED: gl.constexpr,  # [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
     IS_CAUSAL: gl.constexpr,
     CDNA_VERSION: gl.constexpr,
+    SLIDING_WINDOW: gl.constexpr = 0,
 ):
     """
     Gluon-based paged attention decode kernel with FP8 support for large blocks.
@@ -256,38 +275,62 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         operand_index=1, parent=qk_mfma_layout, k_width=16
     )
 
-    # Register allocation bases for different query group sizes
-    if QUERY_GROUP_SIZE_POW2 == 16:
-        if KV_COMPUTE_BLOCK_SIZE == 128:
-            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64))
-        elif KV_COMPUTE_BLOCK_SIZE == 256:
-            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (0, 128))
-    elif QUERY_GROUP_SIZE_POW2 == 32:
-        if KV_COMPUTE_BLOCK_SIZE == 128:
-            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (16, 0))
-        elif KV_COMPUTE_BLOCK_SIZE == 256:
-            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (0, 128), (16, 0))
-    elif QUERY_GROUP_SIZE_POW2 == 64:
-        if KV_COMPUTE_BLOCK_SIZE == 128:
-            register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (16, 0), (32, 0))
-        elif KV_COMPUTE_BLOCK_SIZE == 256:
-            register_bases: gl.constexpr = (
-                (0, 1),
-                (0, 2),
-                (0, 64),
-                (0, 128),
-                (16, 0),
-                (32, 0),
-            )
+    # Register allocation configuration based on group size and compute block size
+    if QUERY_GROUP_SIZE_POW2 >= 16:
+        if QUERY_GROUP_SIZE_POW2 == 16:
+            if CONTEXT_PARTITION_SIZE == 128:
+                register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64))
+            elif CONTEXT_PARTITION_SIZE == 256:
+                register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (0, 128))
+        elif QUERY_GROUP_SIZE_POW2 == 32:
+            if CONTEXT_PARTITION_SIZE == 128:
+                register_bases: gl.constexpr = ((0, 1), (0, 2), (0, 64), (16, 0))
+            elif CONTEXT_PARTITION_SIZE == 256:
+                register_bases: gl.constexpr = (
+                    (0, 1),
+                    (0, 2),
+                    (0, 64),
+                    (0, 128),
+                    (16, 0),
+                )
+        elif QUERY_GROUP_SIZE_POW2 == 64:
+            if CONTEXT_PARTITION_SIZE == 128:
+                register_bases: gl.constexpr = (
+                    (0, 1),
+                    (0, 2),
+                    (0, 64),
+                    (16, 0),
+                    (32, 0),
+                )
+            elif CONTEXT_PARTITION_SIZE == 256:
+                register_bases: gl.constexpr = (
+                    (0, 1),
+                    (0, 2),
+                    (0, 64),
+                    (0, 128),
+                    (16, 0),
+                    (32, 0),
+                )
 
-    # Distributed layout for QK linear operations
-    qk_linear_layout: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=register_bases,
-        lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 4), (0, 8)),
-        warp_bases=((0, 16), (0, 32)),
-        block_bases=[],
-        shape=[QUERY_GROUP_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE],
-    )
+        # Distributed layout for QK linear operations
+        qk_linear_layout: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=register_bases,
+            lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 4), (0, 8)),
+            warp_bases=((0, 16), (0, 32)),
+            block_bases=[],
+            shape=[QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE],
+        )
+    else:
+        VGPRS0: gl.constexpr = QUERY_SEQ_LEN_POW2
+        THREADS0: gl.constexpr = QUERY_GROUP_SIZE_POW2 // (4 * VGPRS0)
+        THREADS1: gl.constexpr = 64 // THREADS0
+
+        qk_linear_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[VGPRS0, CONTEXT_PARTITION_SIZE // THREADS1],
+            threads_per_warp=[THREADS0, THREADS1],
+            warps_per_cta=[4, 1],
+            order=[1, 0],
+        )
 
     # Value cache layout configuration based on transposition
     if VALUE_TRANSPOSED:
@@ -404,9 +447,20 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     # ==================== Program ID and Sequence Setup ====================
     sequence_idx = gl.program_id(0)
     kv_head_idx = gl.program_id(1)
-    sequence_partition_idx = gl.program_id(2)
+    output_partition_idx = gl.program_id(2)
+    context_length = gl.load(context_lengths_ptr + sequence_idx)
 
-    # Calculate page offset based on partition index
+    # Compute KV partition index (adjusted for sliding window)
+    if SLIDING_WINDOW > 0:
+        sequence_start_idx = context_length - SLIDING_WINDOW
+        sequence_partition_idx = (
+            sequence_start_idx // CONTEXT_PARTITION_SIZE + output_partition_idx
+        )
+    else:
+        sequence_start_idx = 0
+        sequence_partition_idx = output_partition_idx
+
+    # Calculate page offset based on KV partition index
     page_offset = 0
     if sequence_partition_idx % 4 == 1:
         page_offset = 1 * CONTEXT_PARTITION_SIZE
@@ -442,7 +496,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     # ==================== Query Quantization Scale Handling ====================
     if QUERY_QUANT_MODE == 0:
         # Per-tensor quantization
-        query_scale_value = tl.load(query_scale)
+        query_scale_value = gl.load(query_scale)
     elif QUERY_QUANT_MODE == 1:
         # Per-token quantization
         query_scale_offsets = (
@@ -480,7 +534,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     max_logits_offsets = (
         sequence_idx * stride_max_logits_seq
         + kv_head_idx * stride_max_logits_head
-        + sequence_partition_idx * stride_max_logits_part
+        + output_partition_idx * stride_max_logits_part
         + max_logits_base_offsets
     )
     # Use qk_row_mask for max_logits/exp_sums mask (consistent with paged_attention_decode_v2_gluon_dot_kernel)
@@ -505,7 +559,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     output_offsets = sequence_idx * stride_output_seq
     output_offsets += kv_head_idx * stride_output_head
     output_offsets += (
-        sequence_partition_idx * stride_output_part
+        output_partition_idx * stride_output_part
         + output_group_offsets[:, None] * stride_output_group
         + output_head_size_offsets[None, :]
     )
@@ -519,18 +573,64 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     )
 
     # ==================== Sequence Length Handling ====================
-    context_length = gl.load(context_lengths_ptr + sequence_idx)
     kv_sequence_start_index = sequence_partition_idx * CONTEXT_PARTITION_SIZE
+
+    if COMPUTE_TYPE.is_fp8():
+        OUTPUT_DTYPE_EARLY: gl.constexpr = tl.bfloat16
+    else:
+        OUTPUT_DTYPE_EARLY: gl.constexpr = COMPUTE_TYPE
+
     # Early return if this partition is beyond sequence length
-    if kv_sequence_start_index >= context_length:
+    if kv_sequence_start_index >= context_length or kv_sequence_start_index < 0:
+        gl.amd.cdna3.buffer_store(
+            stored_value=max_logits,
+            ptr=max_logits_ptr,
+            offsets=max_logits_offsets,
+            mask=max_logits_group_mask,
+        )
+        gl.amd.cdna3.buffer_store(
+            stored_value=exp_sums,
+            ptr=exp_sums_ptr,
+            offsets=max_logits_offsets,
+            mask=max_logits_group_mask,
+        )
+        gl.amd.cdna3.buffer_store(
+            stored_value=attention_accumulator.to(OUTPUT_DTYPE_EARLY),
+            ptr=output_ptr,
+            offsets=output_offsets,
+            mask=output_mask,
+        )
         return
+
+    # Early return if partition is entirely before sliding window
+    if SLIDING_WINDOW > 0:
+        if (kv_sequence_start_index + CONTEXT_PARTITION_SIZE) <= sequence_start_idx:
+            gl.amd.cdna3.buffer_store(
+                stored_value=max_logits,
+                ptr=max_logits_ptr,
+                offsets=max_logits_offsets,
+                mask=max_logits_group_mask,
+            )
+            gl.amd.cdna3.buffer_store(
+                stored_value=exp_sums,
+                ptr=exp_sums_ptr,
+                offsets=max_logits_offsets,
+                mask=max_logits_group_mask,
+            )
+            gl.amd.cdna3.buffer_store(
+                stored_value=attention_accumulator.to(OUTPUT_DTYPE_EARLY),
+                ptr=output_ptr,
+                offsets=output_offsets,
+                mask=output_mask,
+            )
+            return
 
     KV_COMPUTE_BLOCK_COUNT: gl.constexpr = (
         CONTEXT_PARTITION_SIZE // KV_COMPUTE_BLOCK_SIZE
     )
 
     # ==================== Main Attention Computation Loop ====================
-    for kv_block_index in range(KV_COMPUTE_BLOCK_COUNT):
+    for kv_block_index in gl.static_range(KV_COMPUTE_BLOCK_COUNT):
         kv_sub_sequence_start_index = (
             kv_sequence_start_index + kv_block_index * KV_COMPUTE_BLOCK_SIZE
         )
@@ -667,8 +767,19 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
                 sequence_extension[:, None] + qk_column_offsets[None, :]
                 < context_length
             )
+            if SLIDING_WINDOW > 0:
+                causal_mask = causal_mask & (
+                    sequence_extension[:, None] + qk_column_offsets[None, :]
+                    >= sequence_start_idx + QUERY_SEQ_LEN
+                )
         else:
             causal_mask = qk_column_offsets[None, :] < context_length
+            if SLIDING_WINDOW > 0:
+                query_token_idx = qk_row_offsets // ONE_QUERY_GROUP_SIZE_POW2
+                causal_mask = causal_mask & (
+                    qk_column_offsets[None, :]
+                    >= sequence_start_idx + query_token_idx[:, None] + 1
+                )
 
         # Combine masks
         combined_mask = qk_row_mask[:, None] & causal_mask
@@ -1269,6 +1380,7 @@ def paged_attention_decode_sliding_window_head_1(
         sequence_partition_start_idx = gl.maximum(
             0, sequence_start_idx // CONTEXT_PARTITION_SIZE + block_split_idx
         )
+        sequence_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
     else:
         page_size = gl.cdiv(
             context_length, gl.num_programs(2) // CONTEXT_PARTITION_SIZE_PER_BLOCK
@@ -1280,6 +1392,9 @@ def paged_attention_decode_sliding_window_head_1(
         )
         sequence_partition_start_idx = (
             sequence_start_idx // CONTEXT_PARTITION_SIZE + block_split_idx
+        )
+        sequence_partition_end_idx = (
+            gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE) + block_split_idx
         )
     block_indices = gl.arange(0, MAX_NUM_KV_BLOCKS_PER_COMPUTE, layout=block_id_layout)
     max_num_kv_blocks = gl.cdiv(context_length, KV_COMPUTE_BLOCK_SIZE)
@@ -1359,7 +1474,9 @@ def paged_attention_decode_sliding_window_head_1(
             output_head_size_offsets[None, :] < head_size
         )
 
-    if sequence_start_idx >= context_length:
+    if (sequence_start_idx >= context_length) | (
+        sequence_partition_start_idx >= sequence_partition_end_idx
+    ):
         if not ONE_SHOT:
             gl.amd.cdna3.buffer_store(
                 stored_value=max_logits,
@@ -1380,12 +1497,6 @@ def paged_attention_decode_sliding_window_head_1(
                 mask=output_mask,
             )
         return  # No computation needed for this partition
-    if SLIDING_WINDOW > 0:
-        sequence_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
-    else:
-        sequence_partition_end_idx = (
-            gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE) + block_split_idx
-        )
 
     if QUERY_SEQ_LEN_POW2 > 1:
         mtp_query_tensor = gl.reshape(
@@ -1627,8 +1738,9 @@ def paged_attention_decode_sliding_window_head_1(
                 value_in_window_mask = value_token_global >= sequence_start_idx
                 value_tensor = gl.load(
                     value_cache_ptr + value_block_offsets,
-                    mask=value_in_window_mask[None, None, :],
-                    other=0.0,
+                )
+                value_tensor = gl.where(
+                    value_in_window_mask[None, None, :], value_tensor, 0.0
                 )
             else:
                 value_tensor = gl.load(value_cache_ptr + value_block_offsets)
@@ -1675,7 +1787,7 @@ def paged_attention_decode_sliding_window_head_1(
                 if SLIDING_WINDOW > 0:
                     causal_mask = causal_mask & (
                         sequence_position_extension + qk_column_offsets[None, :]
-                        >= sequence_start_idx + mtp_idx + 1
+                        >= sequence_start_idx + query_seq_len
                     )
                 else:
                     causal_mask = causal_mask & (
@@ -1707,7 +1819,7 @@ def paged_attention_decode_sliding_window_head_1(
                     causal_mask = causal_mask & (
                         sequence_position_extension[:, None]
                         + qk_column_offsets[None, :]
-                        >= sequence_start_idx + query_token_idx[:, None] + 1
+                        >= sequence_start_idx + query_seq_len
                     )
                 else:
                     causal_mask = causal_mask & (
@@ -1843,7 +1955,9 @@ def paged_attention_decode_sliding_window_head_1(
 
     # ==================== OUTPUT NORMALIZATION AND STORING ====================
     # Normalize attention output by softmax denominator
-    exp_sums_reciprocal = 1.0 / exp_sums
+    # Guard against division by zero when all tokens are masked for a query position
+    exp_sums_safe = tl.where(exp_sums > 0, exp_sums, 1.0)
+    exp_sums_reciprocal = 1.0 / exp_sums_safe
     exp_sums_reciprocal_cvt = gl.convert_layout(
         exp_sums_reciprocal[:, None], layout=pv_mfma_layout
     )
@@ -2350,6 +2464,7 @@ def paged_attention_decode_sliding_window(
         sequence_partition_start_idx = gl.maximum(
             0, sequence_start_idx // CONTEXT_PARTITION_SIZE + block_split_idx
         )
+        sequence_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
     else:
         page_size = gl.cdiv(
             context_length, gl.num_programs(2) // CONTEXT_PARTITION_SIZE_PER_BLOCK
@@ -2361,6 +2476,9 @@ def paged_attention_decode_sliding_window(
         )
         sequence_partition_start_idx = (
             sequence_start_idx // CONTEXT_PARTITION_SIZE + block_split_idx
+        )
+        sequence_partition_end_idx = (
+            gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE) + block_split_idx
         )
     block_indices = gl.arange(0, MAX_NUM_KV_BLOCKS_PER_COMPUTE, layout=block_id_layout)
     max_num_kv_blocks = gl.cdiv(context_length, KV_COMPUTE_BLOCK_SIZE)
@@ -2420,7 +2538,9 @@ def paged_attention_decode_sliding_window(
             output_head_size_offsets[None, :] < head_size
         )
 
-    if sequence_start_idx >= context_length:
+    if (sequence_start_idx >= context_length) | (
+        sequence_partition_start_idx >= sequence_partition_end_idx
+    ):
         if not ONE_SHOT:
             gl.amd.cdna3.buffer_store(
                 stored_value=max_logits,
@@ -2441,13 +2561,6 @@ def paged_attention_decode_sliding_window(
                 mask=output_mask,
             )
         return  # No computation needed for this partition
-
-    if SLIDING_WINDOW > 0:
-        sequence_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
-    else:
-        sequence_partition_end_idx = (
-            gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE) + block_split_idx
-        )
 
     # Load query tensor with 3D MTP layout
     # Query shape: [batch_size, query_length, num_kv_heads, query_group_size, head_size]
@@ -2665,9 +2778,8 @@ def paged_attention_decode_sliding_window(
 
                 value_tensor = gl.load(
                     value_cache_ptr + value_block_offsets,
-                    mask=value_in_window_mask,
-                    other=0.0,
                 )
+                value_tensor = gl.where(value_in_window_mask, value_tensor, 0.0)
             else:
                 value_tensor = gl.load(value_cache_ptr + value_block_offsets)
 
@@ -2695,8 +2807,9 @@ def paged_attention_decode_sliding_window(
                 value_in_window_mask = value_token_global >= sequence_start_idx
                 value_tensor = gl.load(
                     value_cache_ptr + value_block_offsets,
-                    mask=value_in_window_mask[None, None, :],
-                    other=0.0,
+                )
+                value_tensor = gl.where(
+                    value_in_window_mask[None, None, :], value_tensor, 0.0
                 )
             else:
                 value_tensor = gl.load(value_cache_ptr + value_block_offsets)
@@ -2746,7 +2859,7 @@ def paged_attention_decode_sliding_window(
             if SLIDING_WINDOW > 0:
                 causal_mask = causal_mask & (
                     sequence_position_extension[:, None] + qk_column_offsets[None, :]
-                    >= sequence_start_idx + query_token_idx[:, None] + 1
+                    >= sequence_start_idx + query_seq_len
                 )
             else:
                 causal_mask = causal_mask & (
@@ -2864,7 +2977,9 @@ def paged_attention_decode_sliding_window(
 
     # ==================== OUTPUT NORMALIZATION AND STORING ====================
     # Normalize attention output by softmax denominator
-    exp_sums_reciprocal = 1.0 / exp_sums
+    # Guard against division by zero when all tokens are masked for a query position
+    exp_sums_safe = tl.where(exp_sums > 0, exp_sums, 1.0)
+    exp_sums_reciprocal = 1.0 / exp_sums_safe
     exp_sums_reciprocal_cvt = gl.convert_layout(
         exp_sums_reciprocal[:, None], layout=pv_mfma_layout
     )
@@ -4192,13 +4307,12 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     #     ONE_QUERY_GROUP_SIZE_POW2 = 16 // QUERY_SEQ_LEN_POW2
     # else:
     ONE_QUERY_GROUP_SIZE_POW2 = triton.next_power_of_2(query_group_size)
-    waves_per_eu = 1
     KV_COMPUTE_BLOCK_SIZE = CONTEXT_PARTITION_SIZE
     # Select kernel implementation based on block size
 
     # PS path uses the sliding-window kernel for all KV_BLOCK_SIZE values.
     # This is required for KV_BLOCK_SIZE==1024 support in PS mode.
-    if PS:
+    if PS and not (SLIDING_WINDOW > 0 and KV_BLOCK_SIZE == 1024):
         ONE_SHOT = num_splits <= 1
         if num_kv_heads == 1:
             paged_attention_kernel = paged_attention_decode_sliding_window_head_1
@@ -4276,9 +4390,66 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE:
         # Use big block kernel for large block sizes
         paged_attention_kernel = paged_attention_decode_v2_gluon_large_block_dot_kernel
-        if VALUE_TRANSPOSED:
-            # Use smaller compute block size for better performance with transposed values
-            KV_COMPUTE_BLOCK_SIZE = 128
+        # if VALUE_TRANSPOSED:
+        #     KV_COMPUTE_BLOCK_SIZE = 128
+
+        # Launch the large block kernel (supports SLIDING_WINDOW)
+        paged_attention_kernel[grid](
+            exp_sums_ptr,
+            max_logits_ptr,
+            output_ptr,
+            query_ptr,
+            key_cache_ptr,
+            value_cache_ptr,
+            block_tables_ptr,
+            context_lengths_ptr,
+            softmax_scale,
+            query_scale,
+            key_scale,
+            value_scale,
+            stride_max_logits_seq,
+            stride_max_logits_head,
+            stride_max_logits_part,
+            stride_output_seq,
+            stride_output_head,
+            stride_output_part,
+            stride_output_group,
+            stride_query_bs,
+            stride_query_qlen,
+            stride_query_kv_head,
+            stride_query_group_size,
+            stride_key_block,
+            stride_key_head,
+            stride_key_head_split,
+            stride_key_block_elem,
+            stride_value_block,
+            stride_value_head_size,
+            stride_value_block_elem,
+            stride_block_table_seq,
+            stride_query_scale_bs,
+            stride_query_scale_qlen,
+            stride_query_scale_kv_head,
+            kv_scale_stride_0,
+            kv_scale_stride_1,
+            head_size=HEAD_SIZE,
+            num_seqs=grid[0],
+            num_kv_heads=grid[1],
+            max_context_partition_num=grid[2],
+            COMPUTE_TYPE=COMPUTE_TYPE,
+            QUERY_SEQ_LEN=query_seq_len,
+            ONE_QUERY_GROUP_SIZE=query_group_size,
+            HEAD_SIZE_POW2=HEAD_SIZE_POW2,
+            KV_BLOCK_SIZE=KV_BLOCK_SIZE,
+            CONTEXT_PARTITION_SIZE=CONTEXT_PARTITION_SIZE,
+            KV_COMPUTE_BLOCK_SIZE=KV_COMPUTE_BLOCK_SIZE,
+            QUERY_QUANT_MODE=QUERY_QUANT_MODE,
+            KV_QUANT_MODE=KV_QUANT_MODE,
+            FP8_MAX_VALUE=FP8_MAX_VALUE,
+            VALUE_TRANSPOSED=VALUE_TRANSPOSED,
+            IS_CAUSAL=IS_CAUSAL,
+            CDNA_VERSION=CDNA_VERSION,
+            SLIDING_WINDOW=SLIDING_WINDOW,
+        )
     else:
         # Configure waves per EU based on query group size
         if QUERY_SEQ_LEN_POW2 * ONE_QUERY_GROUP_SIZE_POW2 == 64:
@@ -4289,64 +4460,64 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         # Use standard kernel for normal block sizes
         paged_attention_kernel = paged_attention_decode_v2_gluon_dot_kernel
 
-    # Launch the selected kernel
-    paged_attention_kernel[grid](
-        exp_sums_ptr,
-        max_logits_ptr,
-        output_ptr,
-        query_ptr,
-        key_cache_ptr,
-        value_cache_ptr,
-        block_tables_ptr,
-        context_lengths_ptr,
-        softmax_scale,
-        query_scale,
-        key_scale,
-        value_scale,
-        stride_max_logits_seq,
-        stride_max_logits_head,
-        stride_max_logits_part,
-        stride_output_seq,
-        stride_output_head,
-        stride_output_part,
-        stride_output_group,
-        stride_query_bs,
-        stride_query_qlen,
-        stride_query_kv_head,
-        stride_query_group_size,
-        stride_key_block,
-        stride_key_head,
-        stride_key_head_split,
-        stride_key_block_elem,
-        stride_value_block,
-        stride_value_head_size,
-        stride_value_block_elem,
-        stride_block_table_seq,
-        stride_query_scale_bs,
-        stride_query_scale_qlen,
-        stride_query_scale_kv_head,
-        kv_scale_stride_0,
-        kv_scale_stride_1,
-        head_size=HEAD_SIZE,
-        num_seqs=grid[0],
-        num_kv_heads=grid[1],
-        max_context_partition_num=grid[2],
-        COMPUTE_TYPE=COMPUTE_TYPE,
-        QUERY_SEQ_LEN=query_seq_len,
-        ONE_QUERY_GROUP_SIZE=query_group_size,
-        HEAD_SIZE_POW2=HEAD_SIZE_POW2,
-        KV_BLOCK_SIZE=KV_BLOCK_SIZE,
-        CONTEXT_PARTITION_SIZE=CONTEXT_PARTITION_SIZE,
-        KV_COMPUTE_BLOCK_SIZE=KV_COMPUTE_BLOCK_SIZE,
-        QUERY_QUANT_MODE=QUERY_QUANT_MODE,
-        KV_QUANT_MODE=KV_QUANT_MODE,
-        FP8_MAX_VALUE=FP8_MAX_VALUE,
-        VALUE_TRANSPOSED=VALUE_TRANSPOSED,
-        IS_CAUSAL=IS_CAUSAL,
-        CDNA_VERSION=CDNA_VERSION,
-        waves_per_eu=waves_per_eu,
-        num_stages=1,
-    )
+        # Launch the dot kernel (no SLIDING_WINDOW support)
+        paged_attention_kernel[grid](
+            exp_sums_ptr,
+            max_logits_ptr,
+            output_ptr,
+            query_ptr,
+            key_cache_ptr,
+            value_cache_ptr,
+            block_tables_ptr,
+            context_lengths_ptr,
+            softmax_scale,
+            query_scale,
+            key_scale,
+            value_scale,
+            stride_max_logits_seq,
+            stride_max_logits_head,
+            stride_max_logits_part,
+            stride_output_seq,
+            stride_output_head,
+            stride_output_part,
+            stride_output_group,
+            stride_query_bs,
+            stride_query_qlen,
+            stride_query_kv_head,
+            stride_query_group_size,
+            stride_key_block,
+            stride_key_head,
+            stride_key_head_split,
+            stride_key_block_elem,
+            stride_value_block,
+            stride_value_head_size,
+            stride_value_block_elem,
+            stride_block_table_seq,
+            stride_query_scale_bs,
+            stride_query_scale_qlen,
+            stride_query_scale_kv_head,
+            kv_scale_stride_0,
+            kv_scale_stride_1,
+            head_size=HEAD_SIZE,
+            num_seqs=grid[0],
+            num_kv_heads=grid[1],
+            max_context_partition_num=grid[2],
+            COMPUTE_TYPE=COMPUTE_TYPE,
+            QUERY_SEQ_LEN=query_seq_len,
+            ONE_QUERY_GROUP_SIZE=query_group_size,
+            HEAD_SIZE_POW2=HEAD_SIZE_POW2,
+            KV_BLOCK_SIZE=KV_BLOCK_SIZE,
+            CONTEXT_PARTITION_SIZE=CONTEXT_PARTITION_SIZE,
+            KV_COMPUTE_BLOCK_SIZE=KV_COMPUTE_BLOCK_SIZE,
+            QUERY_QUANT_MODE=QUERY_QUANT_MODE,
+            KV_QUANT_MODE=KV_QUANT_MODE,
+            FP8_MAX_VALUE=FP8_MAX_VALUE,
+            VALUE_TRANSPOSED=VALUE_TRANSPOSED,
+            IS_CAUSAL=IS_CAUSAL,
+            CDNA_VERSION=CDNA_VERSION,
+            waves_per_eu=waves_per_eu,
+            num_stages=1,
+        )
 
 
 def _paged_attention_decode_v2_reduce_kernel_wrapper(
@@ -4604,6 +4775,11 @@ def pa_decode_gluon(
     is_causal = query_length > 1
     # Calculate elements per 16B load based on data type
     kv_elements_per_16b = 16 // key_cache.dtype.itemsize
+
+    if sliding_window > 0 and kv_block_size > context_partition_size:
+        min_partitions = triton.cdiv(sliding_window, context_partition_size) + 1
+        max_context_partition_num = max(max_context_partition_num, min_partitions)
+
     grid = (batch_size, num_kv_heads, max_context_partition_num)
 
     assert query_length <= 4, f"query_length == {query_length} exceeds maximum of 4"
@@ -4641,7 +4817,9 @@ def pa_decode_gluon(
         len(key_cache.shape) == 5
     ), f"Expected 5D key_cache tensor, but got shape {key_cache.shape}"
 
-    one_shot = max_context_partition_num <= 1
+    one_shot = max_context_partition_num <= 1 and not (
+        sliding_window > 0 and kv_block_size == 1024
+    )
     if exp_sums is None:
         exp_sums = torch.empty(
             batch_size,

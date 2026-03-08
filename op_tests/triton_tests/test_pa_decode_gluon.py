@@ -1526,16 +1526,18 @@ def run_pa_gluon_test(
         if sliding_window > 0
         else context_lengths.max().item()
     )
-    if ps:
-        if num_kv_heads == 1:
-            split_kv_blocks = triton.cdiv(block_size, context_partition_size)
-        else:
-            split_kv_blocks = 1
+    if ps and not (sliding_window > 0 and block_size == 1024):
+        split_kv_blocks = triton.cdiv(block_size, context_partition_size)
         max_context_partition_num = get_recommended_splits(
             num_seqs, num_kv_heads, split_kv_blocks
         )
     elif sliding_window > 0:
-        max_context_partition_num = 1
+        if block_size != 1024:
+            max_context_partition_num = 1
+        else:
+            max_context_partition_num = (
+                triton.cdiv(sliding_window, context_partition_size) + 1
+            )
     else:
         max_context_partition_num = triton.cdiv(
             max_context_length, context_partition_size
@@ -2483,16 +2485,16 @@ def sliding_window_accuracy_test():
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
 
     SINKS_OPTIONS = [True, False]
-    SLIDING_WINDOW_OPTIONS = [0, 128]
-    HEAD_DIMENSION_OPTIONS = [64]
+    SLIDING_WINDOW_OPTIONS = [0, 128, 1023]
+    HEAD_DIMENSION_OPTIONS = [64, 128]
     CONTEXT_LENGTH_OPTIONS = [1024, 8192]
     BATCH_SIZE_OPTIONS = [1, 4, 128]
     QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
     COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["bf16", False, True]]
-    QUANT_MODE_OPTIONS = ["per_token"]
+    QUANT_MODE_OPTIONS = ["per_tensor"]
     TRANS_V_OPTIONS = [False]
     KV_VARLEN_OPTIONS = [True]
-    HEAD_CONFIGURATIONS = [(64, 8)]
+    HEAD_CONFIGURATIONS = [(64, 8), (16, 1)]
     USE_AOT_IMPL_OPTIONS = [False]
     PS_OPTIONS = [True]
     BLOCK_SIZE_OPTIONS = [16]
