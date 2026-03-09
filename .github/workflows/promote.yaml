@@ -1,0 +1,77 @@
+name: Promote Wheels
+
+on:
+  workflow_call:
+    inputs:
+      release_type:
+        description: 'Release type used to derive the S3 bucket name'
+        type: string
+        required: true
+      wheel_names:
+        description: 'Space-separated list of wheel filenames to promote'
+        type: string
+        required: true
+
+jobs:
+  promote:
+    runs-on: aiter-k8s-build
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            README.md
+          path: aiter
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: us-east-1
+          role-to-assume: arn:aws:iam::661452401056:role/framework-aiter-${{ inputs.release_type }}
+
+      - name: Install AWS CLI
+        run: |
+          if ! command -v aws &> /dev/null; then
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip -q awscliv2.zip
+            sudo ./aws/install
+            rm -rf awscliv2.zip aws
+          fi
+
+      - name: Download wheels from staging
+        run: |
+          STAGING="s3://framework-whls-${{ inputs.release_type }}/whl-staging/gfx942-gfx950"
+          mkdir -p /tmp/promote-wheels
+          echo "Downloading wheels from ${STAGING}"
+          for WHL in ${{ inputs.wheel_names }}; do
+            echo "Downloading ${WHL}..."
+            aws s3 cp "${STAGING}/${WHL}" "/tmp/promote-wheels/${WHL}"
+          done
+          echo "Downloaded wheels:"
+          ls -lh /tmp/promote-wheels/
+
+      - name: Upload wheels to ${{ inputs.release_type }}
+        run: |
+          RELEASE="s3://framework-whls-${{ inputs.release_type }}/whl/gfx942-gfx950"
+          echo "Uploading wheels to ${RELEASE}"
+          for WHL in ${{ inputs.wheel_names }}; do
+            echo "Uploading ${WHL}..."
+            aws s3 cp "/tmp/promote-wheels/${WHL}" "${RELEASE}/${WHL}"
+          done
+          echo "All wheels promoted successfully"
+
+      - name: Promote summary
+        if: always()
+        run: |
+          echo "## Promote Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Release Type**: ${{ inputs.release_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Source**: s3://framework-whls-${{ inputs.release_type }}/whl-staging/gfx942-gfx950" >> $GITHUB_STEP_SUMMARY
+          echo "- **Destination**: s3://framework-whls-${{ inputs.release_type }}/whl/gfx942-gfx950" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Promoted Wheels" >> $GITHUB_STEP_SUMMARY
+          for WHL in ${{ inputs.wheel_names }}; do
+            echo "- ${WHL}" >> $GITHUB_STEP_SUMMARY
+          done

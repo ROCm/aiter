@@ -1,0 +1,121 @@
+name: Build Wheels
+
+on:
+  workflow_call:
+    inputs:
+      release_type:
+        description: 'Release type determines target S3 bucket (devreleases, nightlies, prereleases, release)'
+        type: string
+        required: true
+      docker_image:
+        description: 'Docker base image for build'
+        type: string
+        required: true
+      gpu_archs:
+        description: 'GPU architectures (e.g. gfx942;gfx950)'
+        type: string
+        required: false
+        default: 'gfx942;gfx950'
+    outputs:
+      wheel_names:
+        description: 'Space-separated list of built wheel filenames'
+        value: ${{ jobs.build.outputs.wheel_names }}
+
+jobs:
+  build:
+    runs-on: aiter-k8s-build
+    outputs:
+      wheel_names: ${{ steps.collect-wheels.outputs.wheel_names }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          path: aiter
+
+      - name: Sync submodules
+        run: |
+          cd aiter
+          git submodule sync
+          git submodule update --init --recursive --depth 1 --jobs 4
+
+      - name: Start build container
+        run: |
+          docker run -dt --network=host --user root \
+            -v "${GITHUB_WORKSPACE}/aiter:/aiter" \
+            --ipc=host --shm-size 16g \
+            -w /aiter \
+            --name aiter_build \
+            ${{ inputs.docker_image }}
+
+      - name: Install build dependencies
+        run: |
+          docker exec aiter_build bash -c "apt-get update && apt-get install -y build-essential"
+          docker exec aiter_build bash -c "python3 -m pip install -U pip setuptools wheel"
+          docker exec aiter_build bash -c "python3 -m pip install ninja>=1.11.1"
+          docker exec aiter_build bash -c "git config --global --add safe.directory /aiter"
+
+      - name: Install package dependencies
+        run: |
+          docker exec aiter_build bash -c "cd /aiter && pip install --timeout=60 --retries=10 -r requirements.txt"
+
+      - name: Build wheels
+        run: |
+          docker exec aiter_build bash -c "cd /aiter && PREBUILD_KERNELS=1 GPU_ARCHS='${{ inputs.gpu_archs }}' python3 setup.py bdist_wheel"
+          docker cp aiter_build:/aiter/dist ./dist
+
+      - name: Collect wheel names
+        id: collect-wheels
+        run: |
+          WHEELS=$(ls dist/*.whl | xargs -n1 basename | tr '\n' ' ')
+          echo "wheel_names=${WHEELS}" >> $GITHUB_OUTPUT
+          echo "Built wheels: ${WHEELS}"
+
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiter-wheels
+          path: dist/*.whl
+          retention-days: 3
+
+      - name: Build summary
+        if: always()
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Docker Image**: ${{ inputs.docker_image }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Release Type**: ${{ inputs.release_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **GPU Architectures**: ${{ inputs.gpu_archs }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Built Wheels" >> $GITHUB_STEP_SUMMARY
+          ls -lh dist/*.whl | awk '{print "- " $9 " (" $5 ")"}' >> $GITHUB_STEP_SUMMARY || echo "No wheels found" >> $GITHUB_STEP_SUMMARY
+
+      - name: Configure AWS credentials
+        if: ${{ github.repository_owner == 'ROCm' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: us-east-1
+          role-to-assume: arn:aws:iam::661452401056:role/framework-aiter-${{ inputs.release_type }}
+
+      - name: Install AWS CLI
+        if: ${{ github.repository_owner == 'ROCm' }}
+        run: |
+          if ! command -v aws &> /dev/null; then
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip -q awscliv2.zip
+            sudo ./aws/install
+            rm -rf awscliv2.zip aws
+          fi
+
+      - name: Upload wheels to S3 staging
+        if: ${{ github.repository_owner == 'ROCm' }}
+        run: |
+          aws s3 cp dist/ s3://framework-whls-${{ inputs.release_type }}/whl-staging/gfx942-gfx950/ \
+            --recursive --exclude "*" --include "*.whl"
+
+      - name: Clean up
+        if: always()
+        run: |
+          docker stop aiter_build || true
+          docker rm aiter_build || true

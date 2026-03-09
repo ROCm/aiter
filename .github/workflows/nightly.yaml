@@ -1,0 +1,66 @@
+name: Nightly Build
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      docker_image:
+        description: 'Docker base image for build'
+        type: string
+        required: false
+        default: 'rocm/vllm-dev:nightly'
+      gpu_archs:
+        description: 'GPU architectures (e.g. gfx942;gfx950)'
+        type: string
+        required: false
+        default: 'gfx942;gfx950'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DOCKER_IMAGE: ${{ github.event.inputs.docker_image || 'rocm/vllm-dev:nightly' }}
+  GPU_ARCHS: ${{ github.event.inputs.gpu_archs || 'gfx942;gfx950' }}
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      docker_image: ${{ steps.set-env.outputs.docker_image }}
+      gpu_archs: ${{ steps.set-env.outputs.gpu_archs }}
+    steps:
+      - name: Set environment variables
+        id: set-env
+        run: |
+          echo "docker_image=${{ env.DOCKER_IMAGE }}" >> $GITHUB_OUTPUT
+          echo "gpu_archs=${{ env.GPU_ARCHS }}" >> $GITHUB_OUTPUT
+
+  build:
+    needs: setup
+    uses: ./.github/workflows/build-whl.yaml
+    with:
+      release_type: nightlies
+      docker_image: ${{ needs.setup.outputs.docker_image }}
+      gpu_archs: ${{ needs.setup.outputs.gpu_archs }}
+    secrets: inherit
+
+  test:
+    needs: [setup, build]
+    uses: ./.github/workflows/test-whl.yaml
+    with:
+      release_type: nightlies
+      wheel_names: ${{ needs.build.outputs.wheel_names }}
+      docker_image: ${{ needs.setup.outputs.docker_image }}
+      test_subset: basic
+    secrets: inherit
+
+  promote:
+    needs: [build, test]
+    uses: ./.github/workflows/promote.yaml
+    with:
+      release_type: nightlies
+      wheel_names: ${{ needs.build.outputs.wheel_names }}
+    secrets: inherit
