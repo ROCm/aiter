@@ -18,7 +18,7 @@ Implementations:
 2. "split" - Iris AllReduce + external hipBLASLt GEMM. Two kernel launches.
 3. "ref" - NCCL AllReduce + torch ops. Reference implementation.
 
-Default: "one"
+Default: "split"
 """
 
 import logging
@@ -32,7 +32,7 @@ __all__ = ["fused_allreduce_add_rms_quant_gemm"]
 logger = logging.getLogger(__name__)
 
 ALLREDUCE_IMPL = os.environ.get(
-    "VLLM_ROCM_FUSED_ALLREDUCE", "one"
+    "VLLM_ROCM_FUSED_ALLREDUCE", "split"
 )
 
 
