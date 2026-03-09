@@ -194,9 +194,9 @@ class Case:
             Case(1000, 704, 800, "mxfloat8_e4m3fn", 8, 2),
             Case(300, 400, 800, "mxfloat8_e4m3fn", 8, 4),
             # smaller tests for gfx1250 ffm
-            #Case(16, 512, 512, "float8_e4m3fn", 32, 2), 
-            #Case(16, 512, 512, "float8_e4m3fn", 32, 2, hbm_swizzling=True),
-            #Case(300, 400, 800, "float8_e4m3fn", 8, 4),
+            Case(16, 512, 512, "float8_e4m3fn", 32, 2), 
+            Case(16, 512, 512, "float8_e4m3fn", 32, 2, hbm_swizzling=True),
+            Case(300, 400, 800, "float8_e4m3fn", 8, 4),
         ]
     ],
 )
@@ -236,6 +236,9 @@ def test_op(
             pytest.skip("Mxfloat activations are not supported yet on gfx1250.")
         if apply_swiglu and has_y_gammas:
             pytest.skip("Swiglu and gammas are not supported together on gfx1250.")
+        # temporary
+        if m > 1024 or n > 1024 or k > 1024 or n_expts_tot > 32:
+            pytest.skip("Test will take too long time on FFM")
 
     if hbm_swizzling:
         if get_arch() == "gfx950" and (n % 32 != 0 or k % (32 * 8) != 0):
