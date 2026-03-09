@@ -22,23 +22,24 @@ enum class GPUArch
         if(!(x))                                                                                  \
         {                                                                                         \
             std::cerr << "check failed, file=" << __FILE__ << ", line=" << __LINE__ << std::endl; \
-            std::terminate();                                                                     \
+            std::abort();                                                                         \
         }                                                                                         \
     } while(0)
 
-#define HIP_CALL(call)                                                       \
-    do                                                                       \
-    {                                                                        \
-        hipError_t err = call;                                               \
-        if(err != hipSuccess)                                                \
-        {                                                                    \
-            printf("\n[AITER] %s:%d fail to call %s ---> [HIP error](%s)\n", \
-                   __FILE__,                                                 \
-                   __LINE__,                                                 \
-                   #call,                                                    \
-                   hipGetErrorString(err));                                  \
-            exit(0);                                                         \
-        }                                                                    \
+#define HIP_CALL(call)                                                        \
+    do                                                                        \
+    {                                                                         \
+        hipError_t err = call;                                                \
+        if(err != hipSuccess)                                                 \
+        {                                                                     \
+            fprintf(stderr,                                                   \
+                    "\n[AITER] %s:%d fail to call %s ---> [HIP error](%s)\n", \
+                    __FILE__,                                                 \
+                    __LINE__,                                                 \
+                    #call,                                                    \
+                    hipGetErrorString(err));                                  \
+            std::abort();                                                     \
+        }                                                                     \
     } while(0)
 
 struct p3
