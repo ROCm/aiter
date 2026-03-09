@@ -1014,7 +1014,7 @@ def decode_update_mla_metadata_v1_kernel(
     if has_num_reject_tokens:
         seq_kv_delta -= tl.load(num_reject_tokens + real_batch_id).to(tl.int32)
 
-    q_interval = 1
+    q_len = 1
     partial_index = tl.load(work_info + work_id * 8 + 1)
     q_start = tl.load(work_info + work_id * 8 + 2)
     q_end = tl.load(work_info + work_id * 8 + 3)
@@ -1038,12 +1038,12 @@ def decode_update_mla_metadata_v1_kernel(
         kv_end = seq_kv_end - kv_offset
         kv_start = kv_end - work_kv_len
 
-    q_interval = q_end - q_start
-    if q_interval > 1:
+    q_len = q_end - q_start
+    if q_len > 1:
         q_start = batch_id
         q_end = batch_id + 1
         if partial_index >= 0:
-            partial_index = partial_index // q_interval
+            partial_index = partial_index // q_len  # qlen must be same for all batches
             # partial_index = work_id
 
     tl.store(work_info + work_id * 8 + 1, partial_index)
@@ -1054,7 +1054,7 @@ def decode_update_mla_metadata_v1_kernel(
     tl.store(work_info + work_id * 8 + 6, kv_offset)
     tl.store(work_info + work_id * 8 + 7, 0)
 
-    if q_interval > 1 and ori_partial_index >= 0:
+    if q_len > 1 and ori_partial_index >= 0:
         tile_idx = batch_id
         partial_start = tl.load(reduce_indptr + tile_idx)
         partial_end = tl.load(reduce_indptr + tile_idx + 1)
@@ -1091,10 +1091,9 @@ def decode_update_mla_metadata_v1(
     num_reject_tokens: Optional[torch.Tensor] = None,
 ) -> None:
     """
-    This function is used to update the mla metadata for the decode update
-    when sequence batch is not changed and all batchs' q_len is same.
+    Update MLA metadata incrementally for decode steps where the batch
+    composition has not changed. It will also convert qlen > 1 to qlen = 1.
     """
-    assert max_seqlen_qo == 1
     assert kv_granularity % page_size == 0
     assert num_heads_k == 1
     assert kv_granularity >= 16
