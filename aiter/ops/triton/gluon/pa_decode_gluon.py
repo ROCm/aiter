@@ -3018,14 +3018,22 @@ def paged_attention_decode_sliding_window(
 # @triton.autotune(
 #     configs=[
 #         triton.Config(
-#             {"matrix_instr_nonkdim": dim, "waves_per_eu": wa}, num_stages=s, num_warps=w
+#             {"waves_per_eu": wa}, maxnreg=512 // wa if wa > 0 else None, num_stages=1
 #         )
-#         for s in [1, 2, 3, 4, 5, 6, 7, 8]
-#         for w in [4]
-#         for wa in [1, 2, 3, 4]
-#         for dim in [16]
+#         for wa in range(5)
 #     ],
-#     key=["Q_SEQ_LEN", "QUERY_GRP_SZ_POW2", "KV_BLK_SZ"],
+#     key=[
+#         "KV_BLOCK_SIZE",
+#         "SLIDING_WINDOW",
+#         "KV_QUANT_MODE",
+#         "QUERY_QUANT_MODE",
+#         "ONE_QUERY_GROUP_SIZE_POW2",
+#         "QUERY_SEQ_LEN_POW2",
+#         "HEAD_SIZE_POW2",
+#         "COMPUTE_TYPE",
+#         "ONE_SHOT",
+#     ],
+#     cache_results=True,
 # )
 @gluon.jit
 def paged_attention_decode_v2_gluon_dot_kernel(
@@ -3415,9 +3423,8 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     context_length = gl.load(context_lengths_ptr + sequence_idx)
     if SLIDING_WINDOW > 0:
         sequence_start_idx = context_length - SLIDING_WINDOW
-        sequence_partition_idx = (
-            sequence_start_idx // CONTEXT_PARTITION_SIZE + output_partition_idx
-        )
+        partition_offset = gl.maximum(0, sequence_start_idx // CONTEXT_PARTITION_SIZE)
+        sequence_partition_idx = partition_offset + output_partition_idx
     else:
         sequence_start_idx = 0
         sequence_partition_idx = output_partition_idx
@@ -3525,17 +3532,21 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     )
 
     # ==================== SEQUENCE PROCESSING ====================
-    kv_sequence_start_idx = sequence_partition_idx * CONTEXT_PARTITION_SIZE
     if COMPUTE_TYPE.is_fp8():
         OUTPUT_DTYPE_EARLY: gl.constexpr = tl.bfloat16
     else:
         OUTPUT_DTYPE_EARLY: gl.constexpr = COMPUTE_TYPE
+
+    KV_COMPUTE_BLOCK_COUNT: gl.constexpr = (
+        CONTEXT_PARTITION_SIZE // KV_COMPUTE_BLOCK_SIZE
+    )
+    SEQUENCE_PARTITION_KV_BLOCKS: gl.constexpr = CONTEXT_PARTITION_SIZE // KV_BLOCK_SIZE
+
     if SLIDING_WINDOW > 0:
-        if (
-            (kv_sequence_start_idx + CONTEXT_PARTITION_SIZE) <= sequence_start_idx
-            or kv_sequence_start_idx < 0
-            or kv_sequence_start_idx >= context_length
-        ):
+        # Only program 0 processes the full sliding window in a single FP32
+        # accumulation pass, avoiding BF16 intermediate quantization loss from
+        # multi-partition PS combine. All other programs early-return with defaults.
+        if output_partition_idx > 0:
             gl.amd.cdna3.buffer_store(
                 stored_value=max_logits,
                 ptr=max_logits_ptr,
@@ -3555,16 +3566,33 @@ def paged_attention_decode_v2_gluon_dot_kernel(
                 mask=output_mask,
             )
             return
-    elif kv_sequence_start_idx >= context_length:
-        return  # No computation needed for this partition
-
-    KV_COMPUTE_BLOCK_COUNT: gl.constexpr = (
-        CONTEXT_PARTITION_SIZE // KV_COMPUTE_BLOCK_SIZE
-    )
-    SEQUENCE_PARTITION_KV_BLOCKS: gl.constexpr = CONTEXT_PARTITION_SIZE // KV_BLOCK_SIZE
+        window_start_partition = gl.maximum(
+            0, sequence_start_idx // CONTEXT_PARTITION_SIZE
+        )
+        window_end_partition = gl.cdiv(context_length, CONTEXT_PARTITION_SIZE)
+        MAX_WINDOW_BLOCKS: gl.constexpr = (
+            SLIDING_WINDOW // CONTEXT_PARTITION_SIZE + 2
+        ) * KV_COMPUTE_BLOCK_COUNT
+    else:
+        kv_sequence_start_idx = sequence_partition_idx * CONTEXT_PARTITION_SIZE
+        if kv_sequence_start_idx >= context_length:
+            return
+        MAX_WINDOW_BLOCKS: gl.constexpr = KV_COMPUTE_BLOCK_COUNT
 
     # Process KV sequence in compute blocks
-    for kv_compute_idx in range(KV_COMPUTE_BLOCK_COUNT):
+    for block_idx in gl.static_range(MAX_WINDOW_BLOCKS):
+        if SLIDING_WINDOW > 0:
+            partition_in_window = block_idx // KV_COMPUTE_BLOCK_COUNT
+            kv_compute_idx = block_idx % KV_COMPUTE_BLOCK_COUNT
+            raw_partition = window_start_partition + partition_in_window
+            is_valid_partition = raw_partition < window_end_partition
+            current_partition = gl.minimum(raw_partition, window_end_partition - 1)
+            kv_sequence_start_idx = current_partition * CONTEXT_PARTITION_SIZE
+        else:
+            kv_compute_idx = block_idx
+            current_partition = sequence_partition_idx
+            is_valid_partition = True
+
         kv_subsequence_start_idx = (
             kv_sequence_start_idx + kv_compute_idx * KV_COMPUTE_BLOCK_SIZE
         )
@@ -3576,7 +3604,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
             kv_subsequence_end_idx - kv_subsequence_start_idx, KV_BLOCK_SIZE
         )
         kv_block_start_idx = (
-            sequence_partition_idx * SEQUENCE_PARTITION_KV_BLOCKS
+            current_partition * SEQUENCE_PARTITION_KV_BLOCKS
             + kv_compute_idx * MAX_NUM_KV_BLOCKS_PER_COMPUTE
         )
         qk_column_offsets = kv_block_start_idx * KV_BLOCK_SIZE + gl.arange(
@@ -3640,16 +3668,6 @@ def paged_attention_decode_v2_gluon_dot_kernel(
             dtype=gl.float32,
             layout=qk_mfma_layout,
         )
-
-        # if sequence_idx == 0 \
-        #     and kv_head_idx == 0 \
-        #     and sequence_partition_idx == 0:
-        #     print("query_tensor=", query_tensor.to(tl.float32))
-        #     print("key_tensor=", key_tensor.to(tl.float32))
-        # if QUERY_QUANT_MODE == 0 and KV_QUANT_MODE == 0:
-        #     print("QKV_per_tensor")
-        # else:
-        #     print("QKV_per_token")
 
         # Convert layouts for MFMA operation
         query_converted = query_shared.load(qk_lhs_operand_layout)
@@ -3739,7 +3757,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
             if SLIDING_WINDOW > 0:
                 causal_mask = causal_mask & (
                     sequence_position_extension[:, None] + qk_column_offsets[None, :]
-                    >= sequence_start_idx + QUERY_SEQ_LEN
+                    >= sequence_start_idx
                 )
         else:
             causal_mask = qk_column_offsets[None, :] < context_length
@@ -3747,10 +3765,12 @@ def paged_attention_decode_v2_gluon_dot_kernel(
                 query_token_idx = qk_row_offsets // ONE_QUERY_GROUP_SIZE_POW2
                 causal_mask = causal_mask & (
                     qk_column_offsets[None, :]
-                    >= sequence_start_idx + query_token_idx[:, None] + 1
+                    >= sequence_start_idx + query_token_idx[:, None]
                 )
 
         boundary_mask = qk_row_mask[:, None] & causal_mask
+        if SLIDING_WINDOW > 0:
+            boundary_mask = boundary_mask & is_valid_partition
 
         # Apply masking to attention scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
         attention_scores = tl.where(boundary_mask, attention_scores, float(-3.4e38))
@@ -4340,16 +4360,13 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     num_sequences, num_kv_heads, num_splits = grid
     HEAD_SIZE_POW2 = triton.next_power_of_2(HEAD_SIZE)
     QUERY_SEQ_LEN_POW2 = triton.next_power_of_2(query_seq_len)
-    # if query_group_size <= 16 // QUERY_SEQ_LEN_POW2:
-    #     ONE_QUERY_GROUP_SIZE_POW2 = 16 // QUERY_SEQ_LEN_POW2
-    # else:
     ONE_QUERY_GROUP_SIZE_POW2 = triton.next_power_of_2(query_group_size)
     KV_COMPUTE_BLOCK_SIZE = CONTEXT_PARTITION_SIZE
     # Select kernel implementation based on block size
 
     # PS path uses the sliding-window kernel for all KV_BLOCK_SIZE values.
     # This is required for KV_BLOCK_SIZE==1024 support in PS mode.
-    if PS and not (SLIDING_WINDOW > 0 and KV_BLOCK_SIZE == 1024):
+    if PS and not (SLIDING_WINDOW > 0):
         ONE_SHOT = num_splits <= 1
         if num_kv_heads == 1:
             paged_attention_kernel = paged_attention_decode_sliding_window_head_1
@@ -4427,8 +4444,6 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE:
         # Use big block kernel for large block sizes
         paged_attention_kernel = paged_attention_decode_v2_gluon_large_block_dot_kernel
-        # if VALUE_TRANSPOSED:
-        #     KV_COMPUTE_BLOCK_SIZE = 128
 
         # Launch the large block kernel (supports SLIDING_WINDOW)
         paged_attention_kernel[grid](
@@ -4488,16 +4503,11 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             SLIDING_WINDOW=SLIDING_WINDOW,
         )
     else:
-        # Configure waves per EU based on query group size
-        if QUERY_SEQ_LEN_POW2 * ONE_QUERY_GROUP_SIZE_POW2 == 64:
-            waves_per_eu = 3
-        else:
-            waves_per_eu = 4
 
         # Use standard kernel for normal block sizes
         paged_attention_kernel = paged_attention_decode_v2_gluon_dot_kernel
 
-        # Launch the dot kernel (no SLIDING_WINDOW support)
+        # Launch the dot kernel
         paged_attention_kernel[grid](
             exp_sums_ptr,
             max_logits_ptr,
@@ -4552,8 +4562,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             VALUE_TRANSPOSED=VALUE_TRANSPOSED,
             IS_CAUSAL=IS_CAUSAL,
             CDNA_VERSION=CDNA_VERSION,
-            waves_per_eu=waves_per_eu,
-            num_stages=1,
+            SLIDING_WINDOW=SLIDING_WINDOW,
         )
 
 
@@ -4853,13 +4862,6 @@ def pa_decode_gluon(
     one_shot = max_context_partition_num <= 1 and not (
         sliding_window > 0 and kv_block_size == 1024
     )
-    # When sinks + sliding_window are both active in the PS path, all splits
-    # redundantly process the same window range. The reduce kernel adds sinks
-    # only once, but exp_sums are duplicated across splits, breaking normalization.
-    # Force single-split to handle sinks correctly inside the attention kernel.
-    if sinks is not None and sliding_window > 0 and not one_shot:
-        grid = (batch_size, num_kv_heads, 1)
-        one_shot = True
     if exp_sums is None:
         exp_sums = torch.empty(
             batch_size,
