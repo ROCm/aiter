@@ -289,22 +289,21 @@ Here's a bash script to run `bench_mha.py` with all combinations of flags:
 ```bash
 #!/bin/bash
 # Comprehensive benchmark script for bench_mha.py
-# Tests all combinations of parameters
-# Total combinations: 4 (batch) × 4 (seqlen_q) × 4 (seqlen_k) × 3 (hq) × 2 (hk) × 3 (head_dim) × 2 (mode) × 3 (dtype) × 2 (causal) × 2 (fp8) × 3 (metric) = 62,208 combinations
+# Tests all combinations of parameters without using --model flag
+# Total combinations: 4 (batch) × 4 (seqlen) × 3 (hq) × 2 (hk) × 3 (head_dim) × 2 (mode) × 3 (dtype) × 2 (causal) × 2 (fp8) × 3 (metric) = 15,552 combinations
 # Note: Some combinations are skipped (fp8 flag without fp8 dtype), so actual number may be slightly less
+# Note: sq and sk use the same value (seqlen) for both query and key sequence lengths
 
-MODEL="llama3-70B"
 OUTPUT_DIR="mha_benchmark_results"
 mkdir -p $OUTPUT_DIR
 
-echo "Starting comprehensive MHA benchmarks with all combinations..."
+echo "Starting comprehensive MHA benchmarks with all combinations (using custom parameters, no --model flag)..."
 
 # Define parameter arrays
-# Total combinations: 4 × 4 × 4 × 3 × 2 × 3 × 2 × 3 × 2 × 2 × 3 = 62,208 (with fp8 dtype)
+# Total combinations: 4 × 4 × 3 × 2 × 3 × 2 × 3 × 2 × 2 × 3 = 15,552 (with fp8 dtype)
 # Reduced by skipping invalid fp8 combinations
 BATCH_SIZES=(1 4 8 16)
-SEQLEN_QS=(512 1024 2048 4096)
-SEQLEN_KS=(512 1024 2048 4096)
+SEQLENS=(512 1024 2048 4096)
 HQ_VALUES=(32 64 128)
 HK_VALUES=(8 32)
 HEAD_DIMS=(64 128 256)
@@ -315,42 +314,41 @@ FP8_FLAGS=("" "-fp8")
 METRICS=(time throughput bandwidth)
 
 # Counter for tracking progress
-TOTAL=$(( ${#BATCH_SIZES[@]} * ${#SEQLEN_QS[@]} * ${#SEQLEN_KS[@]} * ${#HQ_VALUES[@]} * ${#HK_VALUES[@]} * ${#HEAD_DIMS[@]} * ${#MODES[@]} * ${#DTYPES[@]} * ${#CAUSAL_FLAGS[@]} * ${#FP8_FLAGS[@]} * ${#METRICS[@]} ))
+TOTAL=$(( ${#BATCH_SIZES[@]} * ${#SEQLENS[@]} * ${#HQ_VALUES[@]} * ${#HK_VALUES[@]} * ${#HEAD_DIMS[@]} * ${#MODES[@]} * ${#DTYPES[@]} * ${#CAUSAL_FLAGS[@]} * ${#FP8_FLAGS[@]} * ${#METRICS[@]} ))
 CURRENT=0
 
 # Nested loops to test all combinations
 for BATCH in "${BATCH_SIZES[@]}"; do
-    for SEQLEN_Q in "${SEQLEN_QS[@]}"; do
-        for SEQLEN_K in "${SEQLEN_KS[@]}"; do
-            for HQ in "${HQ_VALUES[@]}"; do
-                for HK in "${HK_VALUES[@]}"; do
-                    for HEAD_DIM in "${HEAD_DIMS[@]}"; do
-                        for MODE in "${MODES[@]}"; do
-                            for DTYPE in "${DTYPES[@]}"; do
-                                for CAUSAL in "${CAUSAL_FLAGS[@]}"; do
-                                    for FP8 in "${FP8_FLAGS[@]}"; do
-                                        for METRIC in "${METRICS[@]}"; do
-                                            CURRENT=$((CURRENT + 1))
-                                            
-                                            # Skip invalid combinations (fp8 requires fp8 dtype)
-                                            if [ -n "$FP8" ] && [ "$DTYPE" != "fp8" ]; then
-                                                continue
-                                            fi
-                                            
-                                            # Build filename from parameters
-                                            FILENAME="b${BATCH}_sq${SEQLEN_Q}_sk${SEQLEN_K}_hq${HQ}_hk${HK}_d${HEAD_DIM}_${MODE}_${DTYPE}"
-                                            if [ -n "$CAUSAL" ]; then
-                                                FILENAME="${FILENAME}_causal"
-                                            fi
-                                            if [ -n "$FP8" ]; then
-                                                FILENAME="${FILENAME}_fp8"
-                                            fi
-                                            FILENAME="${FILENAME}_${METRIC}"
-                                            
-                                            echo "[$CURRENT/$TOTAL] Testing: batch=$BATCH, sq=$SEQLEN_Q, sk=$SEQLEN_K, hq=$HQ, hk=$HK, d=$HEAD_DIM, mode=$MODE, dtype=$DTYPE, causal=${CAUSAL:--}, fp8=${FP8:--}, metric=$METRIC"
-                                            
-                                            # Build command
-                                            CMD="python bench_mha.py --model $MODEL -b $BATCH -hq $HQ -hk $HK -sq $SEQLEN_Q -sk $SEQLEN_K -d $HEAD_DIM -mode $MODE --dtype $DTYPE $CAUSAL $FP8 -metric $METRIC -o"
+    for SEQLEN in "${SEQLENS[@]}"; do
+        for HQ in "${HQ_VALUES[@]}"; do
+            for HK in "${HK_VALUES[@]}"; do
+                for HEAD_DIM in "${HEAD_DIMS[@]}"; do
+                    for MODE in "${MODES[@]}"; do
+                        for DTYPE in "${DTYPES[@]}"; do
+                            for CAUSAL in "${CAUSAL_FLAGS[@]}"; do
+                                for FP8 in "${FP8_FLAGS[@]}"; do
+                                    for METRIC in "${METRICS[@]}"; do
+                                        CURRENT=$((CURRENT + 1))
+                                        
+                                        # Skip invalid combinations (fp8 requires fp8 dtype)
+                                        if [ -n "$FP8" ] && [ "$DTYPE" != "fp8" ]; then
+                                            continue
+                                        fi
+                                        
+                                        # Build filename from parameters
+                                        FILENAME="b${BATCH}_s${SEQLEN}_hq${HQ}_hk${HK}_d${HEAD_DIM}_${MODE}_${DTYPE}"
+                                        if [ -n "$CAUSAL" ]; then
+                                            FILENAME="${FILENAME}_causal"
+                                        fi
+                                        if [ -n "$FP8" ]; then
+                                            FILENAME="${FILENAME}_fp8"
+                                        fi
+                                        FILENAME="${FILENAME}_${METRIC}"
+                                        
+                                        echo "[$CURRENT/$TOTAL] Testing: batch=$BATCH, seqlen=$SEQLEN, hq=$HQ, hk=$HK, d=$HEAD_DIM, mode=$MODE, dtype=$DTYPE, causal=${CAUSAL:--}, fp8=${FP8:--}, metric=$METRIC"
+                                        
+                                        # Build command without --model flag (sq and sk use same value)
+                                        CMD="python bench_mha.py -b $BATCH -hq $HQ -hk $HK -sq $SEQLEN -sk $SEQLEN -d $HEAD_DIM -mode $MODE --dtype $DTYPE $CAUSAL $FP8 -metric $METRIC -o"
                                             
                                             # Run benchmark
                                             $CMD > /dev/null 2>&1
@@ -373,7 +371,7 @@ done
 
 # Test VGPR usage separately (only need to run once)
 echo "Testing VGPR usage..."
-python bench_mha.py --model $MODEL -b 4 -hq 32 -hk 32 -sq 2048 -sk 2048 -d 128 -print_vgpr > $OUTPUT_DIR/vgpr_usage.txt 2>&1
+python bench_mha.py -b 4 -hq 32 -hk 32 -sq 2048 -sk 2048 -d 128 -print_vgpr > $OUTPUT_DIR/vgpr_usage.txt 2>&1
 
 echo "Benchmarking complete! Results saved in $OUTPUT_DIR/"
 echo "Total combinations tested: $TOTAL"
