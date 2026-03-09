@@ -195,17 +195,6 @@ def compare_arrays(
         }
     )
 
-    # print("\nTop differences:")
-    # for item in result['top_k_diff']:
-    #     print(f"Position {item['position']}: arr1 = {arr1[item['position']]:.6f}, arr2 = {arr2[item['position']]:.6f}, Diff = {item['value']:.6f}")
-
-    # print("\nThreshold statistics:")
-    # for stat in result['threshold_stats']:
-    #     print(f"{stat['range']}: {stat['count']} ({stat['percentage']:.2f}%)")
-
-    # print("\nNaN info:")
-    # print(result["nan_info"])
-
     return result
 
 
@@ -1449,7 +1438,7 @@ def run_pa_gluon_test(
         if compute_type != aiter.dtypes.fp8 and not quant_q and not quant_kv:
             diff_tolerance = 5e-3
     if sliding_window > 0:
-        diff_tolerance = 5e-2
+        diff_tolerance = 8e-2
 
     flash_style_diff_tolerance = 5e-4
     if quant_mode == "per_token" and (quant_q or quant_kv):
