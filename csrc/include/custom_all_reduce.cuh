@@ -2259,7 +2259,7 @@ class CustomAllreduce
         }                                                                     \
     } while(0)
 
-#define dispatch(ngpus, name)              \
+#define dispatch(ngpus, name)                             \
     do                                                    \
     {                                                     \
         if(bytes % (ngpus * 16) == 0 && world_size_ != 6) \
@@ -2275,7 +2275,7 @@ class CustomAllreduce
         }                                                 \
         else                                              \
         {                                                 \
-            KL(ngpus, name##_naive);       \
+            KL(ngpus, name##_naive);                      \
         }                                                 \
     } while(0)
 
@@ -2283,7 +2283,7 @@ class CustomAllreduce
     case ngpus: {                                        \
         if(call_1stage)                                  \
         {                                                \
-            KL(ngpus, cross_device_reduce_1stage); \
+            KL(ngpus, cross_device_reduce_1stage);       \
         }                                                \
         else if(call_2stage)                             \
         {                                                \
@@ -2312,7 +2312,7 @@ class CustomAllreduce
     case ngpus: {                                            \
         if(world_size_ == 2)                                 \
         {                                                    \
-            KL(ngpus, cross_device_reduce_1stage);     \
+            KL(ngpus, cross_device_reduce_1stage);           \
         }                                                    \
         else if(full_nvlink_)                                \
         {                                                    \
