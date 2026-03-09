@@ -74,8 +74,7 @@ struct __attribute__((packed)) KernelArgs
 class FMoeKernel
 {
     private:
-    hipModule_t module;
-    hipFunction_t kernel_func;
+    AiterAsmKernel kernel;
     uint32_t sub_GU             = 512;
     bool is_int4                = false;
     uint32_t num_persistent_tgs = 0;
@@ -85,9 +84,8 @@ class FMoeKernel
     FMoeKernel(const char* name,
                const char* hsaco,
                uint32_t sub_GU             = 512,
-               uint32_t num_persistent_tgs = 0)
+               uint32_t num_persistent_tgs = 0) : kernel(name, hsaco)
     {
-        load_asm_kernel(name, hsaco, module, kernel_func);
         this->sub_GU             = sub_GU;
         this->num_persistent_tgs = num_persistent_tgs;
         this->name               = name;
@@ -186,11 +184,6 @@ class FMoeKernel
         args.ps_deno   = ((inter_dim + sub_GU - 1) / sub_GU);
         args.total_tgs = this->num_persistent_tgs / args.ps_deno * args.ps_deno;
 
-        void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER,
-                          &args,
-                          HIP_LAUNCH_PARAM_BUFFER_SIZE,
-                          &arg_size,
-                          HIP_LAUNCH_PARAM_END};
         int bdx;
         int gdx;
         int gdy;
@@ -235,13 +228,27 @@ class FMoeKernel
         const hipStream_t stream = at::hip::getCurrentHIPStream();
         if constexpr(switchGxy)
         {
-            HIP_CALL(hipModuleLaunchKernel(
-                kernel_func, gdy, gdx, gdz, bdx, 1, 1, 0, stream, nullptr, (void**)&config));
+            kernel.launch_kernel({&args,
+                                  &arg_size,
+                                  gdy, // gdx
+                                  gdx, // gdy
+                                  gdz, // gdz
+                                  bdx, // bdx
+                                  1,   // bdy
+                                  1,   // bdz
+                                  stream});
         }
         else
         {
-            HIP_CALL(hipModuleLaunchKernel(
-                kernel_func, gdx, gdy, gdz, bdx, 1, 1, 0, stream, nullptr, (void**)&config));
+            kernel.launch_kernel({&args,
+                                  &arg_size,
+                                  gdx, // gdx
+                                  gdy, // gdy
+                                  gdz, // gdz
+                                  bdx, // bdx
+                                  1,   // bdy
+                                  1,   // bdz
+                                  stream});
         }
     };
 };
