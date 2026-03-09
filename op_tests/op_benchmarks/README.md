@@ -282,6 +282,58 @@ You can also use just the family name (e.g., `llama3`) to benchmark all models i
 - `-test_mode`: Run correctness tests comparing to PyTorch SDPA
 - `-o`: Save results to CSV file
 
+###### How to Run MLA Decode
+
+Run Multi-head Latent Attention (MLA) decode benchmarks:
+
+```bash
+# Navigate to benchmarks directory
+cd op_tests/op_benchmarks/triton
+
+# List available models (only DeepSeek models are supported)
+python bench_mla_decode.py --help
+
+# Run MLA decode benchmark with DeepSeek model
+python bench_mla_decode.py --model deepseek-V3
+
+# Run with custom batch size and sequence length
+python bench_mla_decode.py --model deepseek-V3 -b 4 --seqlen 2048
+
+# Run with tensor parallelism
+python bench_mla_decode.py --model deepseek-V3 -b 8 --seqlen 4096 -tp 4
+
+# Run with RoPE enabled
+python bench_mla_decode.py --model deepseek-V3 -b 4 --seqlen 2048 -use_rope
+
+# Run with equal sequence lengths
+python bench_mla_decode.py --model deepseek-V3 -b 4 --seqlen 2048 -equal_seqlens
+
+# Run with causal attention
+python bench_mla_decode.py --model deepseek-V3 -b 4 --seqlen 2048 -causal
+
+# Save results to CSV
+python bench_mla_decode.py --model deepseek-V3 -b 4 --seqlen 2048 -o
+
+# Print VGPR usage
+python bench_mla_decode.py --model deepseek-V3 -b 4 --seqlen 2048 -print_vgpr
+```
+
+**Common MLA Decode Benchmark Arguments:**
+
+- `--model`: Model name (only DeepSeek models are supported, e.g., `deepseek-V3`)
+- `-b`: Batch size
+- `--seqlen`: Sequence length
+- `-tp` or `--tensor-parallelism`: Tensor parallelism degree (`1`, `2`, `4`, `8`, default: `8`)
+- `--dtype`: Data type (`bf16`, `fp16`, `fp32`, default: `bf16`)
+- `--device`: Device (default: `cuda`)
+- `-equal_seqlens`: Use equal sequence lengths for all sequences
+- `-use_rope`: Enable Rotary Position Embedding (RoPE)
+- `-causal`: Enable causal attention mask
+- `-print_vgpr`: Print VGPR usage of the compiled Triton kernel
+- `-o`: Save results to CSV file
+
+**Note**: MLA decode benchmarks only support DeepSeek models. If you specify a model that is not DeepSeek, the benchmark will fail with an assertion error.
+
 ##### KV Cache Tests
 
 Run FlashAttention with KV cache tests:
