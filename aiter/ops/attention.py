@@ -973,3 +973,29 @@ def mla_reduce_v1(
     final_output: torch.Tensor,
     final_lse: Optional[torch.Tensor] = None,
 ) -> None: ...
+
+
+@compile_ops("module_hk_mla")
+def hk_mla_decode_fwd(
+    # [num_seqs, num_heads, head_size]
+    query: torch.Tensor,
+    # [num_page, page_size, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
+    kv_buffer: torch.Tensor,
+    # [batch_size+1]
+    qo_indptr: torch.Tensor,
+    # [batch_size+1]
+    kv_indptr: torch.Tensor,
+    # [num_page_used]
+    kv_page_indices: torch.Tensor,
+    # [batch_size]
+    kv_last_page_lens: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    max_seqlen_q: int,
+    softmax_scale: float,
+    # [batch_size, num_kv_splits, num_heads, v_head_dim]
+    split_output: torch.Tensor,
+    # [batch_size, num_kv_splits, num_heads,  1]
+    split_lse: torch.Tensor,
+    final_output: torch.Tensor,
+) -> None: ...
