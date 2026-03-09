@@ -135,7 +135,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
     using TilePartitioner = ck_tile::GemmTile1DPartitioner<GemmShape>;
 
     using GemmTraits = ck_tile::TileGemmQuantTraits<
-        false, // PadM
+        true, // PadM
         PadN,
         PadK,
         false,       // PreshuffleQuant for A, not supported yet
