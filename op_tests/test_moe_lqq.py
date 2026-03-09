@@ -138,6 +138,7 @@ def test_fmoe_lqq(
     shared_E=2,
     ep=8,
     block_size_M=32,
+    evenly=False,
 ):
     dtype = dtypes.bf16
     use_g1u1 = True
@@ -204,12 +205,14 @@ def test_fmoe_lqq(
 
     eprt = local_E + shared_E
 
-    # topk_ids_absolute_avera
-    topk_ids_list2 = [[((i * topk) + j) % E for j in range(topk)] for i in range(token)]
-    topk_ids_absolute_avera = torch.tensor(
-        topk_ids_list2, device=topk_ids.device, dtype=topk_ids.dtype
-    )
-    topk_ids[:, :6] = topk_ids_absolute_avera
+    if evenly:
+        topk_ids_list2 = [
+            [((i * topk) + j) % E for j in range(topk)] for i in range(token)
+        ]
+        topk_ids_absolute_average = torch.tensor(
+            topk_ids_list2, device=topk_ids.device, dtype=topk_ids.dtype
+        )
+        topk_ids[:, :topk] = topk_ids_absolute_average
 
     ######################################################################################
     print("[test] batch: ", token)
@@ -482,6 +485,13 @@ parser.add_argument(
     help="""block_size_M value. Default: 32.
     e.g.: -x 32""",
 )
+parser.add_argument(
+    "-evenly",
+    "--evenly",
+    action="store_true",
+    default=False,
+    help="Use evenly distributed expert ids.",
+)
 args = parser.parse_args()
 
 
@@ -506,6 +516,7 @@ for m in token_list:
             shared_E=shared_E,
             ep=ep,
             block_size_M=block_m,
+            evenly=args.evenly,
         )
         if ret is not None:
             df.append(ret)
