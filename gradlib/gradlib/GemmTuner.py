@@ -103,8 +103,12 @@ def generate_data(
     device="cuda:0",
 ):
     torch.manual_seed(seed)
-    inp = torch.randn((m, k), device=device).to(outdtype)
-    weights = torch.randn((n, k), device=device).to(outdtype)
+    if indtype == dtypes.fp8:
+        randn_dtype = dtypes.bf16
+    else:
+        randn_dtype = indtype
+    inp = torch.randn((m, k), device=device).to(randn_dtype)
+    weights = torch.randn((n, k), device=device).to(randn_dtype)
     if indtype == dtypes.fp8:
         inp, x_scale = aiter.pertoken_quant(inp, quant_dtype=dtypes.fp8)
         weights, w_scale = aiter.pertoken_quant(weights, quant_dtype=dtypes.fp8)
@@ -119,9 +123,7 @@ def generate_data(
 
     # blob = torch.ones(128 * 1024 * 1024, dtype=dtypes.fp32, device=device)
     bias = torch.randn(n, device=device).to(outdtype) if bias else None
-    scale_half = torch.tensor(0.5, dtype=dtypes.fp32, device=device)
-    # scale_one = torch.tensor(1, dtype=dtypes.fp32, device=device)
-    scale = scale_half if scaleAB else None
+
     # if scaleAB:
     #    scaleB = scaleB.t()
     out_asm = torch.empty(m, n, dtype=outdtype, device=device)
@@ -239,18 +241,22 @@ class Gemm:
 
     def find_hipblas_sols(self):
         init_hipblas()
-        scale = (
-            torch.tensor(0.5, dtype=dtypes.fp32, device=self.inp.device)
-            if self.scaleAB
-            else None
-        )
+        if self.scaleAB and self.indtype == dtypes.fp8:
+            scaleA = self.x_scale
+            scaleB = self.w_scale.t()
+        elif self.scaleAB:
+            scaleA = torch.tensor(0.5, dtype=dtypes.fp32, device=self.inp.device)
+            scaleB = scaleA
+        else:
+            scaleA = None
+            scaleB = None
         sols = aiter.hipb_findallsols(
             self.inp,
             self.weights.t(),
             bias=self.bias,
             out_dtype=self.outdtype,
-            scaleA=scale,
-            scaleB=scale,
+            scaleA=scaleA,
+            scaleB=scaleB,
             bpreshuffle=self.is_shuffle,
         )
         print(
@@ -324,7 +330,7 @@ class Gemm:
             self.scaleAB or self.k % 64 != 0 or self.indtype != dtypes.bf16
         ) and get_gfx() == "gfx942":
             logger.warning(
-                f"only indtype=bf16 and outdtype=fp32 and k%64==0 and not scaleAB is supported in {get_gfx()}, but actual indtype is {self.indtype}, outdtype is {self.outdtype}, k is  {self.k}, scaleAB is {self.scaleAB}"
+                f"ASM gemm only supports indtype=bf16 and outdtype=fp32 and k%64==0 and not scaleAB is supported in {get_gfx()}, but actual indtype is {self.indtype}, outdtype is {self.outdtype}, k is  {self.k}, scaleAB is {self.scaleAB}"
             )
             self.asm_gtimedf = pd.DataFrame(columns=["gtimems", "libtype"])
             return []
@@ -335,7 +341,7 @@ class Gemm:
             or self.indtype != dtypes.bf16
         ) and get_gfx() == "gfx950":
             logger.warning(
-                f"only indtype=bf16 and outdtype=bf16 and k%256==0 and not scaleAB is supported in {get_gfx()}, but actual indtype is {self.indtype}, outdtype is {self.outdtype}, k is  {self.k}, scaleAB is {self.scaleAB}"
+                f"ASM gemm only supports indtype=bf16 and outdtype=bf16 and k%256==0 and not scaleAB is supported in {get_gfx()}, but actual indtype is {self.indtype}, outdtype is {self.outdtype}, k is  {self.k}, scaleAB is {self.scaleAB}"
             )
 
             self.asm_gtimedf = pd.DataFrame(columns=["gtimems", "libtype"])
@@ -412,7 +418,7 @@ class Gemm:
                             "num_iters": 101,
                         },
                         get_gemm_ref,
-                        ([0, 1, 3, 4], self.indtype, self.outdtype),
+                        ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
                         {},
                         None,  # self.ref if fast_mode == 0 else None,
                         self.rtol,
@@ -443,7 +449,12 @@ class Gemm:
         return ret
 
     def triton_gemm_all_sols(self):
-        if self.scaleAB or self.is_shuffle or self.outdtype == dtypes.fp32 or self.indtype != dtypes.bf16:
+        if (
+            self.scaleAB
+            or self.is_shuffle
+            or self.outdtype == dtypes.fp32
+            or self.indtype != dtypes.bf16
+        ):
             logger.warning(
                 f"Triton gemm_a16w16 does not support scaling{self.scaleAB} or weight shuffle {self.is_shuffle}  or fp32 output {self.outdtype} yet"
             )
@@ -487,7 +498,7 @@ class Gemm:
                     "num_iters": 101,
                 },
                 get_gemm_ref,
-                ([0, 1, 3, 4], self.indtype, self.outdtype),
+                ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
                 {},
                 None,  # self.ref if fast_mode == 0 else None,
                 self.rtol,
@@ -542,7 +553,7 @@ class Gemm:
                         self.has_bias,
                     ),
                     call_hipb_mm,
-                    ([0, 6, 3, 4, 7], solidx, self.outdtype),
+                    ([0, 6, 3, 4, 7], solidx, self.outdtype, self.is_shuffle),
                     {
                         "num_warmup": warmi,
                         "num_iters": coldi,
