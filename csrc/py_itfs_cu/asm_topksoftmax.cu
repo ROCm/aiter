@@ -95,7 +95,7 @@ void topk_softmax_asm(torch::Tensor& topk_weights,         // [num_tokens, topk]
     args.out_stride  = out_stride * 4;
 
     CFG* config_map = &cfg_topksoftmax;
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     AiterAsmKernel* impl_ptr = nullptr;
     auto [kernelName, subm] = get_heuristic_kernel_topksoftmax(arch_id, dtype, MAX_SUBM, num_experts, topk, config_map);
 
@@ -105,12 +105,9 @@ void topk_softmax_asm(torch::Tensor& topk_weights,         // [num_tokens, topk]
         const auto& cfg     = it->second;
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
-        auto result         = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
+
+        impl_ptr =
+            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
     }
     else
         TORCH_CHECK(false, __func__, " not find kernel " + kernelName);

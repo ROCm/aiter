@@ -213,7 +213,7 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
                    std::hash<int>()(log2_key) ^ std::hash<bool>()(shuffle_key);
         }
     };
-    static std::unordered_map<DictKey, std::tuple<std::string, int>, SimpleHash>
+    static SynchronizedCache<DictKey, std::tuple<std::string, int>, SimpleHash>
         heuristic_kernel_dict;
 
     if(config_map->empty())
@@ -221,7 +221,7 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
         TORCH_CHECK(false, __func__, " no kernel support a4w4 for this gpu arch");
     }
 
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
 
     std::string arch_id = get_gpu_arch();
     kernelName          = kernelName.empty() ? "" : arch_id + kernelName;
@@ -229,23 +229,11 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
     int selectedksplit = log2_k_split.has_value() ? log2_k_split.value() : 0;
     if(kernelName.empty())
     {
-        auto it = heuristic_kernel_dict.find(DictKey(Mdim, Ndim, Kdim, log2_k_split, bpreshuffle));
-        if(it != heuristic_kernel_dict.end())
-        {
-            auto res       = it->second;
-            kernelName     = std::get<0>(res);
-            selectedksplit = std::get<1>(res);
-        }
-        else
-        {
-            auto it = get_heuristic_kernel(
-                Mdim, Ndim, Kdim, arch_id, log2_k_split, bpreshuffle, config_map);
-
-            kernelName     = std::get<0>(it);
-            selectedksplit = std::get<1>(it);
-            heuristic_kernel_dict[{Mdim, Ndim, Kdim, log2_k_split, bpreshuffle}] =
-                std::make_tuple(kernelName, selectedksplit);
-        }
+        std::tie(kernelName, selectedksplit) = heuristic_kernel_dict.get_or_create(
+            DictKey(Mdim, Ndim, Kdim, log2_k_split, bpreshuffle), [&]() {
+                return get_heuristic_kernel(
+                    Mdim, Ndim, Kdim, arch_id, log2_k_split, bpreshuffle, config_map);
+            });
     }
 
     AiterAsmKernel* impl_ptr = nullptr;
@@ -274,12 +262,8 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
             gdz          = (Kdim + k_per_tg - 1) / k_per_tg;
         }
 
-        auto result = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
+        impl_ptr =
+            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
     }
     else
         TORCH_CHECK(false, __func__, " not find kernel " + kernelName);

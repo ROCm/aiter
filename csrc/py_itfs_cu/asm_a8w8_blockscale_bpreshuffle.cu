@@ -145,8 +145,8 @@ struct KernelSelector {
         }
     };
     
-    static std::unordered_map<DictKey, std::tuple<std::string, int>, SimpleHash> heuristic_cache;
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> kernel_cache;
+    static SynchronizedCache<DictKey, std::tuple<std::string, int>, SimpleHash> heuristic_cache;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> kernel_cache;
     
     static std::tuple<std::string, int> select_kernel(int M, int N, int K, const std::string& arch_id,
                                                      std::optional<int> splitK, std::optional<bool> bpreshuffle,
@@ -156,28 +156,22 @@ struct KernelSelector {
         }
         
         DictKey key(M, N, K, splitK, bpreshuffle);
-        auto it = heuristic_cache.find(key);
-        if (it != heuristic_cache.end()) {
-            return it->second;  // find it and return
-        }
-        auto result = get_heuristic_fp8_kernel(M, N, K, arch_id, splitK, bpreshuffle, config_map);
-        heuristic_cache[key] = result;
-        return result;
+
+        return heuristic_cache.get_or_create(key, [&]() {
+            return get_heuristic_fp8_kernel(M, N, K, arch_id, splitK, bpreshuffle, config_map);
+        });
     }
-    
+
     static AiterAsmKernel* get_kernel(const std::string& kernel_name, const std::string& co_name) {
-        auto result = kernel_cache.emplace(kernel_name, nullptr);
-        if (result.second) {
-            result.first->second = std::make_unique<AiterAsmKernel>(kernel_name.c_str(), co_name.c_str());
-        }
-        return result.first->second.get();
+        return &kernel_cache.get_or_create(
+            kernel_name, [&]() { return AiterAsmKernel(kernel_name.c_str(), co_name.c_str()); });
     }
 };
 
 
-std::unordered_map<KernelSelector::DictKey, std::tuple<std::string, int>, KernelSelector::SimpleHash> 
+SynchronizedCache<KernelSelector::DictKey, std::tuple<std::string, int>, KernelSelector::SimpleHash>
     KernelSelector::heuristic_cache;
-std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> KernelSelector::kernel_cache;
+SynchronizedCache<std::string_view, AiterAsmKernel> KernelSelector::kernel_cache;
 
 static KernelArgs setup_kernel_args(const torch::Tensor& A, const torch::Tensor& B, const torch::Tensor& out,
                                    const torch::Tensor& A_scale, const torch::Tensor& B_scale,
