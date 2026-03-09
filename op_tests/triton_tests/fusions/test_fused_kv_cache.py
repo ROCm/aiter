@@ -556,6 +556,145 @@ def test_fused_qk_rope_reshape_and_cache_value_shuffle_layout(
     )
 
 
+# gpt-oss-120b config: hidden_size=2880, num_attention_heads=64, num_key_value_heads=8, head_dim=64
+GPT_OSS_120B_HEAD_DIM = 64
+GPT_OSS_120B_NUM_ATTENTION_HEADS = 64
+GPT_OSS_120B_NUM_KV_HEADS = 8
+
+
+@pytest.mark.parametrize("T", [1, 4, 16, 64])
+@pytest.mark.parametrize("block_size", [16])
+@pytest.mark.parametrize("x_size", [8])
+@pytest.mark.parametrize("num_kv_cahce_tokens", [256, 4096])
+def test_fused_qk_rope_reshape_and_cache_gpt_oss_120b_config_value_shuffle_precision(
+    T: int,
+    block_size: int,
+    x_size: int,
+    num_kv_cahce_tokens: int,
+):
+    """Test fused_qk_rope_reshape_and_cache with gpt-oss-120b config; compare 4D vs 5D value_cache for precision.
+    Config: head_dim=64, num_attention_heads=64, num_key_value_heads=8.
+    """
+    D = GPT_OSS_120B_HEAD_DIM
+    QH = GPT_OSS_120B_NUM_ATTENTION_HEADS
+    KH = GPT_OSS_120B_NUM_KV_HEADS
+    QH_per_KH = QH // KH
+    assert D % x_size == 0
+    dtype = torch.bfloat16
+    rotate_style = RotateStyle.GPTJ
+    reuse_freqs_front_part = True
+    pos = True
+    offs = False
+
+    q, k, _, _, freqs, positions, offsets, cos, sin = generate_rope_inputs(
+        1,
+        T,
+        KH,
+        QH_per_KH,
+        D,
+        cached=True,
+        reuse_freqs_front_part=reuse_freqs_front_part,
+        nope=False,
+        pos=pos,
+        offs=offs,
+        two_inputs=True,
+        layout="thd",
+        dtype=dtype,
+    )
+    v = torch.randn_like(k)
+    k_scale = torch.ones(1, dtype=torch.float32, device="cuda")[0]
+    v_scale = torch.ones(1, dtype=torch.float32, device="cuda")[0]
+    slot_mapping = torch.randint(0, num_kv_cahce_tokens * block_size, (T,), device="cuda")
+
+    num_blocks = num_kv_cahce_tokens
+    slot_chunk_dim = block_size // x_size
+
+    # 1) Run with 4D value_cache (baseline)
+    key_cache_4d = torch.zeros(
+        (num_blocks, KH, D // x_size, block_size, x_size),
+        dtype=dtype,
+        device="cuda",
+    )
+    value_cache_4d = torch.zeros(
+        (num_blocks, KH, D, block_size),
+        dtype=dtype,
+        device="cuda",
+    )
+    q_out_4d, k_out_4d, kc_4d, vc_4d, zeros_4d = fused_qk_rope_reshape_and_cache(
+        q.clone(),
+        k.clone(),
+        v.clone(),
+        key_cache_4d.clone(),
+        value_cache_4d.clone(),
+        slot_mapping,
+        positions,
+        cos,
+        sin,
+        k_scale,
+        v_scale,
+        (rotate_style == RotateStyle.NEOX),
+        flash_layout=False,
+        apply_scale=True,
+        offs=offsets,
+        q_out=None,
+        k_out=None,
+        output_zeros=True,
+    )
+
+    # 2) Run with 5D value_cache (shuffle layout), same inputs
+    key_cache_5d = torch.zeros(
+        (num_blocks, KH, D // x_size, block_size, x_size),
+        dtype=dtype,
+        device="cuda",
+    )
+    value_cache_5d = torch.zeros(
+        (num_blocks, KH, slot_chunk_dim, D, x_size),
+        dtype=dtype,
+        device="cuda",
+    )
+    q_out_5d, k_out_5d, kc_5d, vc_5d, zeros_5d = fused_qk_rope_reshape_and_cache(
+        q.clone(),
+        k.clone(),
+        v.clone(),
+        key_cache_5d.clone(),
+        value_cache_5d.clone(),
+        slot_mapping,
+        positions,
+        cos,
+        sin,
+        k_scale,
+        v_scale,
+        (rotate_style == RotateStyle.NEOX),
+        flash_layout=False,
+        apply_scale=True,
+        offs=offsets,
+        q_out=None,
+        k_out=None,
+        output_zeros=True,
+    )
+
+    # Compare outputs: q_out, k_out, key_cache, zeros should match exactly (same kernel path for these)
+    torch.testing.assert_close(q_out_4d, q_out_5d, atol=1e-2, rtol=1e-2, msg="q_out 4D vs 5D")
+    torch.testing.assert_close(k_out_4d, k_out_5d, atol=1e-2, rtol=1e-2, msg="k_out 4D vs 5D")
+    torch.testing.assert_close(kc_4d, kc_5d, atol=1e-2, rtol=1e-2, msg="key_cache 4D vs 5D")
+    torch.testing.assert_close(zeros_4d, zeros_5d, atol=1e-2, rtol=1e-2, msg="zeros_out 4D vs 5D")
+
+    # Compare value_cache slot-by-slot: vc_4d[slot_t,:,:,slot_b] vs vc_5d[slot_t,:,slot_b//x,:,slot_b%x]
+    slot_t = slot_mapping // block_size
+    slot_b = slot_mapping % block_size
+    for i in range(T):
+        st, sb = slot_t[i].item(), slot_b[i].item()
+        v4 = vc_4d[st, :, :, sb]
+        v5 = vc_5d[st, :, sb // x_size, :, sb % x_size]
+        torch.testing.assert_close(
+            v4,
+            v5,
+            atol=1e-2,
+            rtol=1e-2,
+            msg=f"value_cache at slot {i} (block={st}, slot_in_block={sb}) 4D vs 5D",
+        )
+
+
 @pytest.mark.parametrize("T", [1, 2, 4, 128])
 @pytest.mark.parametrize("QH_per_KH", [1, 4, 16])
 @pytest.mark.parametrize("KH", [1, 8])
