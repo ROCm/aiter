@@ -2,24 +2,27 @@ import triton
 import triton.language as tl
 from aiter.ops.triton.rope.rope import _get_gptj_rotated_x, _get_neox_rotated_x
 
+
+# GAMMA rms norm
 @triton.jit
 def _rms_norm(
-    tensor,      # Pre-loaded block: (BLOCK_M, BLOCK_D)
-    weight,      # Pre-loaded block: (BLOCK_D,)
-    BLOCK_D,     # Constant
-    eps          # Scalar
+    tensor,  # Pre-loaded block: (BLOCK_M, BLOCK_D)
+    weight,  # Pre-loaded block: (BLOCK_D,)
+    BLOCK_D,  # Constant
+    eps,  # Scalar
 ):
     tensor_f32 = tensor.to(tl.float32)
     tensor_sq = tensor_f32 * tensor_f32
     variance = tl.sum(tensor_sq, axis=1) / BLOCK_D
-    
+
     inv_rms = tl.rsqrt(variance + eps)[:, None]
     tensor_normed = tensor_f32 * inv_rms
-    
+
     w_f32 = weight.to(tl.float32)
     tensor_final = tensor_normed * (1.0 + w_f32[None, :])
-    
+
     return tensor_final.to(tensor.dtype)
+
 
 @triton.jit
 def _fused_qkv_split_qk_norm_rope_cache_kernel(
@@ -68,7 +71,7 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_D_HALF: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr, # PagedAttention block size
+    BLOCK_SIZE: tl.constexpr,  # PagedAttention block size
 ):
     tl.assume(stride_qkv_t > 0)
     tl.assume(stride_qkv_d > 0)
@@ -133,8 +136,7 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
 
     H_OFFS_SIZE = hq * BLOCK_D
     q_in_offs = (
-        t_offs[:, None] * stride_qkv_t
-        + (H_OFFS_SIZE + d_offs)[None, :] * stride_qkv_d
+        t_offs[:, None] * stride_qkv_t + (H_OFFS_SIZE + d_offs)[None, :] * stride_qkv_d
     )
     q = tl.load(qkv_ptr + q_in_offs, mask=x_mask)
 
@@ -148,8 +150,7 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
         x_gate_mask = t_mask[:, None] & (d_gate_offs < BLOCK_D)[None, :]
         gate_in_offs = (
             t_offs[:, None] * stride_qkv_t
-            + (Q_SIZE + H_OFFS_SIZE + d_gate_offs)[None, :]
-            * stride_qkv_d
+            + (Q_SIZE + H_OFFS_SIZE + d_gate_offs)[None, :] * stride_qkv_d
         )
         gate = tl.load(qkv_ptr + gate_in_offs, mask=x_gate_mask)
         gate_out_offs = (
@@ -184,13 +185,11 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
         KV_SIZE = KVH * BLOCK_D
         k_in_offs = (
             t_offs[:, None] * stride_qkv_t
-            + ((Q_SIZE + H_OFFS_SIZE) + d_offs)[None, :]
-            * stride_qkv_d
+            + ((Q_SIZE + H_OFFS_SIZE) + d_offs)[None, :] * stride_qkv_d
         )
         v_in_offs = (
             t_offs[:, None] * stride_qkv_t
-            + ((Q_SIZE + KV_SIZE + H_OFFS_SIZE) + d_offs)[None, :]
-            * stride_qkv_d
+            + ((Q_SIZE + KV_SIZE + H_OFFS_SIZE) + d_offs)[None, :] * stride_qkv_d
         )
         k = tl.load(qkv_ptr + k_in_offs, mask=x_mask)
         v = tl.load(qkv_ptr + v_in_offs, mask=x_mask)
@@ -209,7 +208,7 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
             )
 
         k = k * cos + k_rotated * sin
-        
+
         # Store to contiguous K/V buffers
         kv_out_offs = (
             t_offs[:, None] * stride_kv_t
@@ -221,11 +220,11 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
 
         # KV Caching Logic
         slots = tl.load(slot_mapping_ptr + t_offs, mask=t_mask)
-        
+
         # Calculate Paged Cache offsets
         b_idx = slots % BLOCK_SIZE
         t_slot_idx = slots // BLOCK_SIZE
-        
+
         # We process a block of T. We need to handle mask for slots >= 0
         cache_mask = x_mask & (slots[:, None] >= 0)
 
@@ -235,7 +234,11 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
             + d_offs[None, :] * key_cache_stride_d
             + b_idx[:, None] * key_cache_stride_b
         )
-        tl.store(key_cache_ptr + k_cache_offs, k.to(key_cache_ptr.dtype.element_ty), mask=cache_mask)
+        tl.store(
+            key_cache_ptr + k_cache_offs,
+            k.to(key_cache_ptr.dtype.element_ty),
+            mask=cache_mask,
+        )
 
         v_cache_offs = (
             t_slot_idx[:, None] * value_cache_stride_t
@@ -243,4 +246,8 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
             + d_offs[None, :] * value_cache_stride_d
             + b_idx[:, None] * value_cache_stride_b
         )
-        tl.store(value_cache_ptr + v_cache_offs, v.to(value_cache_ptr.dtype.element_ty), mask=cache_mask)
+        tl.store(
+            value_cache_ptr + v_cache_offs,
+            v.to(value_cache_ptr.dtype.element_ty),
+            mask=cache_mask,
+        )

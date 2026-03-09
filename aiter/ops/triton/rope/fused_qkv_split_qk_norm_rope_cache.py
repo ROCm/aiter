@@ -4,16 +4,17 @@ from aiter.ops.triton._triton_kernels.rope.fused_qkv_split_qk_norm_rope_cache im
     _fused_qkv_split_qk_norm_rope_cache_kernel,
 )
 
+
 def fused_qkv_split_qk_norm_rope_cache(
     qkv: torch.Tensor,
-    q_weight: torch.Tensor, # RMS norm weight for Q
-    k_weight: torch.Tensor, # RMS norm weight for K
+    q_weight: torch.Tensor,  # RMS norm weight for Q
+    k_weight: torch.Tensor,  # RMS norm weight for K
     cos: torch.Tensor,
     sin: torch.Tensor,
     positions: torch.Tensor,
-    key_cache: torch.Tensor,    # Paged KV Cache [num_blocks, num_heads, block_size, head_dim]
+    key_cache: torch.Tensor,  # Paged KV Cache [num_blocks, num_heads, block_size, head_dim]
     value_cache: torch.Tensor,  # Paged KV Cache [num_blocks, num_heads, block_size, head_dim]
-    slot_mapping: torch.Tensor, # Mapping from token index to physical slot [T]
+    slot_mapping: torch.Tensor,  # Mapping from token index to physical slot [T]
     qh: int,
     kvh: int,
     head_dim: int,
@@ -21,12 +22,12 @@ def fused_qkv_split_qk_norm_rope_cache(
     offsets: torch.Tensor = None,
     reuse_freqs_front_part: bool = True,
     attn_output_gate: bool = False,
-    eps: float = 1e-5
+    eps: float = 1e-5,
 ):
     T = qkv.shape[0]
     q_size = qh * head_dim
     kv_size = kvh * head_dim
-    
+
     # Get Paged Attention block size from cache shape (usually 16 or 32)
     # Cache shape: [num_blocks, num_heads, block_size, head_dim]
     block_size = key_cache.shape[2]
@@ -35,16 +36,17 @@ def fused_qkv_split_qk_norm_rope_cache(
     q = torch.empty((T, qh, head_dim), dtype=qkv.dtype, device=qkv.device)
     k = torch.empty((T, kvh, head_dim), dtype=qkv.dtype, device=qkv.device)
     v = torch.empty((T, kvh, head_dim), dtype=qkv.dtype, device=qkv.device)
-    
+
     if attn_output_gate:
         gate = torch.empty((T, qh, head_dim), dtype=qkv.dtype, device=qkv.device)
     else:
         gate = None
 
-    assert qkv.shape[-1] == q_size + 2 * kv_size, "Shape error"
-    assert head_dim == triton.next_power_of_2(
-        head_dim
-    ), "head_dim should be power of 2"
+    if attn_output_gate:
+        assert qkv.shape[-1] == 2 * q_size + 2 * kv_size, "Shape error"
+    else:
+        assert qkv.shape[-1] == q_size + 2 * kv_size, "Shape error"
+    assert head_dim == triton.next_power_of_2(head_dim), "head_dim should be power of 2"
 
     # Logic for dimension splitting
     BLOCK_D = head_dim
@@ -74,7 +76,7 @@ def fused_qkv_split_qk_norm_rope_cache(
         stride_qkv_t=qkv.stride(0),
         stride_qkv_d=qkv.stride(1),
         stride_cos_t=cos.stride(0),
-        stride_cos_d=cos.stride(1),
+        stride_cos_d=cos.stride(-1),
         stride_pos_t=positions.stride(0),
         stride_q_t=q.stride(0),
         stride_q_h=q.stride(1),
@@ -84,8 +86,8 @@ def fused_qkv_split_qk_norm_rope_cache(
         stride_kv_d=k.stride(2),
         key_cache_stride_t=key_cache.stride(0),
         key_cache_stride_h=key_cache.stride(1),
-        key_cache_stride_d=key_cache.stride(3), # head_dim stride
-        key_cache_stride_b=key_cache.stride(2), # block_size stride
+        key_cache_stride_d=key_cache.stride(3),  # head_dim stride
+        key_cache_stride_b=key_cache.stride(2),  # block_size stride
         value_cache_stride_t=value_cache.stride(0),
         value_cache_stride_h=value_cache.stride(1),
         value_cache_stride_d=value_cache.stride(3),
@@ -105,6 +107,6 @@ def fused_qkv_split_qk_norm_rope_cache(
     )
 
     if attn_output_gate:
-        return q, gate, k, v 
+        return q, gate, k, v
     else:
         return q, k, v
