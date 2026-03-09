@@ -419,6 +419,135 @@ chmod +x bench_mla_decode_comprehensive.sh
 ./bench_mla_decode_comprehensive.sh
 ```
 
+###### How to Run PA Decode
+
+Run Paged Attention (PA) decode benchmarks:
+
+```bash
+# Navigate to benchmarks directory
+cd op_tests/op_benchmarks/triton
+
+# List available models
+python bench_pa_decode.py --help
+
+# Run PA decode benchmark with model configuration
+python bench_pa_decode.py --model llama3-70B
+
+# Run with custom parameters
+python bench_pa_decode.py --model llama3-70B -b 4 -hq 32 -hk 32 -sq 2048
+
+# Run with different data types
+python bench_pa_decode.py --model llama3-70B -b 4 -hq 32 -hk 32 -sq 2048 -dtype bf16
+
+# Run with different KV cache data type
+python bench_pa_decode.py --model llama3-70B -b 4 -hq 32 -hk 32 -sq 2048 -kv_cache_dtype fp8
+
+# Run with different compute type
+python bench_pa_decode.py --model llama3-70B -b 4 -hq 32 -hk 32 -sq 2048 -compute_type bf16
+
+# Run with different output type
+python bench_pa_decode.py --model llama3-70B -b 4 -hq 32 -hk 32 -sq 2048 -output_type bf16
+
+# Save results to CSV
+python bench_pa_decode.py --model llama3-70B -b 4 -hq 32 -hk 32 -sq 2048 -o
+
+# Print VGPR usage
+python bench_pa_decode.py --model llama3-70B -b 4 -hq 32 -hk 32 -sq 2048 -print_vgpr
+```
+
+**Common PA Decode Benchmark Arguments:**
+
+- `--model`: Model name (e.g., `llama3-70B`, `deepseek-V3`)
+- `-b`: Batch size
+- `-hq`: Number of query heads
+- `-hk`: Number of key/value heads
+- `-sq`: Sequence length
+- `-dtype`: Query data type (`fp16`, `bf16`, `fp32`, `e5m2fnuz`, `e4m3fnuz`, default: `fp16`)
+- `-kv_cache_dtype`: KV cache data type (`fp16`, `bf16`, `fp32`, `e5m2fnuz`, `e4m3fnuz`, default: `fp16`)
+- `-compute_type`: Compute data type (`fp16`, `bf16`, `fp32`, default: `fp16`)
+- `-output_type`: Output data type (`fp16`, `bf16`, `fp32`, default: `fp16`)
+- `-print_vgpr`: Print VGPR usage of the compiled Triton kernel
+- `-o`: Save results to CSV file
+
+**Comprehensive Benchmark Script:**
+
+Here's a bash script to run `bench_pa_decode.py` with all combinations of flags:
+
+```bash
+#!/bin/bash
+# Comprehensive benchmark script for bench_pa_decode.py
+# Tests all combinations of parameters
+
+MODEL="llama3-70B"
+OUTPUT_DIR="pa_decode_benchmark_results"
+mkdir -p $OUTPUT_DIR
+
+echo "Starting comprehensive PA decode benchmarks with all combinations..."
+
+# Define parameter arrays
+BATCH_SIZES=(1 4 8 16)
+SEQLENS=(512 1024 2048 4096)
+HQ_VALUES=(32 64)
+HK_VALUES=(8 32)
+DTYPES=(fp16 bf16)
+KV_CACHE_DTYPES=(fp16 bf16 fp8)
+COMPUTE_TYPES=(fp16 bf16)
+OUTPUT_TYPES=(fp16 bf16)
+
+# Counter for tracking progress
+TOTAL=$(( ${#BATCH_SIZES[@]} * ${#SEQLENS[@]} * ${#HQ_VALUES[@]} * ${#HK_VALUES[@]} * ${#DTYPES[@]} * ${#KV_CACHE_DTYPES[@]} * ${#COMPUTE_TYPES[@]} * ${#OUTPUT_TYPES[@]} ))
+CURRENT=0
+
+# Nested loops to test all combinations
+for BATCH in "${BATCH_SIZES[@]}"; do
+    for SEQLEN in "${SEQLENS[@]}"; do
+        for HQ in "${HQ_VALUES[@]}"; do
+            for HK in "${HK_VALUES[@]}"; do
+                for DTYPE in "${DTYPES[@]}"; do
+                    for KV_CACHE_DTYPE in "${KV_CACHE_DTYPES[@]}"; do
+                        for COMPUTE_TYPE in "${COMPUTE_TYPES[@]}"; do
+                            for OUTPUT_TYPE in "${OUTPUT_TYPES[@]}"; do
+                                CURRENT=$((CURRENT + 1))
+                                
+                                # Build filename from parameters
+                                FILENAME="b${BATCH}_s${SEQLEN}_hq${HQ}_hk${HK}_d${DTYPE}_kvc${KV_CACHE_DTYPE}_c${COMPUTE_TYPE}_o${OUTPUT_TYPE}"
+                                
+                                echo "[$CURRENT/$TOTAL] Testing: batch=$BATCH, seqlen=$SEQLEN, hq=$HQ, hk=$HK, dtype=$DTYPE, kv_cache_dtype=$KV_CACHE_DTYPE, compute_type=$COMPUTE_TYPE, output_type=$OUTPUT_TYPE"
+                                
+                                # Build command
+                                CMD="python bench_pa_decode.py --model $MODEL -b $BATCH -hq $HQ -hk $HK -sq $SEQLEN -dtype $DTYPE -kv_cache_dtype $KV_CACHE_DTYPE -compute_type $COMPUTE_TYPE -output_type $OUTPUT_TYPE -o"
+                                
+                                # Run benchmark
+                                $CMD > /dev/null 2>&1
+                                
+                                # Move CSV file if it exists
+                                if ls *.csv 1> /dev/null 2>&1; then
+                                    mv *.csv $OUTPUT_DIR/${FILENAME}.csv 2>/dev/null || true
+                                fi
+                            done
+                        done
+                    done
+                done
+            done
+        done
+    done
+done
+
+# Test VGPR usage separately (only need to run once)
+echo "Testing VGPR usage..."
+python bench_pa_decode.py --model $MODEL -b 4 -hq 32 -hk 8 -sq 2048 -print_vgpr > $OUTPUT_DIR/vgpr_usage.txt 2>&1
+
+echo "Benchmarking complete! Results saved in $OUTPUT_DIR/"
+echo "Total combinations tested: $TOTAL"
+```
+
+Save this script as `bench_pa_decode_comprehensive.sh`, make it executable, and run it:
+
+```bash
+chmod +x bench_pa_decode_comprehensive.sh
+./bench_pa_decode_comprehensive.sh
+```
+
 ##### KV Cache Tests
 
 Run FlashAttention with KV cache tests:
