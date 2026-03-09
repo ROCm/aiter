@@ -27,6 +27,28 @@ content = """// SPDX-License-Identifier: MIT
 
 """
 
+
+def infer_cpp_type(series):
+    return (
+        "int"
+        if pd.api.types.is_numeric_dtype(series)
+        else "std::string"
+    )
+
+
+def format_cpp_value(value):
+    if pd.isna(value):
+        return "0"
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return f"{int(value):>4}"
+
+    value_str = str(value)
+    if value_str.replace(".", "", 1).isdigit():
+        return f"{int(float(value_str)):>4}"
+
+    escaped_value = value_str.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped_value}"'
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         prog="generate",
@@ -60,7 +82,10 @@ if __name__ == "__main__":
 
     ## deal with same name csv
     cfgs = []
-    have_get_header = False
+    combined_cfgs = []
+    required_output_columns = {"knl_name", "co_name", "arch"}
+    other_columns = []
+    other_column_types = {}
     for cfgname, file_info_list in csv_groups.items():
         dfs = []
         for file_info in file_info_list:
@@ -69,9 +94,9 @@ if __name__ == "__main__":
             df = pd.read_csv(single_file)
             # check headers
             headers_list = df.columns.tolist()
-            required_columns = {"knl_name", "co_name"}
-            if not required_columns.issubset(headers_list):
-                missing = required_columns - set(headers_list)
+            required_input_columns = {"knl_name", "co_name"}
+            if not required_input_columns.issubset(headers_list):
+                missing = required_input_columns - set(headers_list)
                 print(
                     f"ERROR: Invalid assembly CSV format -- {single_file}. Missing required columns: {', '.join(missing)}"
                 )
@@ -82,24 +107,27 @@ if __name__ == "__main__":
             relpath = os.path.relpath(
                 os.path.dirname(single_file), f"{this_dir}/{arch}"
             )
-            combine_df = (
-                pd.concat(dfs, ignore_index=True).fillna(0).infer_objects(copy=False)
-            )
-            if not have_get_header:
-                headers_list = combine_df.columns.tolist()
-                required_columns = {"knl_name", "co_name", "arch"}
-                other_columns = [
-                    col for col in headers_list if col not in required_columns
-                ]
-                other_columns_comma = ", ".join(other_columns)
-                sample_row = combine_df.iloc[0]
-                other_columns_cpp_def = "\n".join(
-                    [
-                        f"    {'int' if isinstance(sample_row[col], (int, float, np.integer)) else 'std::string'} {col};"
-                        for col in other_columns
-                    ]
-                )
-                content += f"""
+            combine_df = pd.concat(dfs, ignore_index=True).infer_objects(copy=False)
+            current_other_columns = [
+                col
+                for col in combine_df.columns.tolist()
+                if col not in required_output_columns
+            ]
+            for col in current_other_columns:
+                col_type = infer_cpp_type(combine_df[col])
+                if col not in other_column_types:
+                    other_columns.append(col)
+                    other_column_types[col] = col_type
+                elif col_type == "std::string":
+                    other_column_types[col] = col_type
+            combined_cfgs.append((cfgname, relpath, combine_df))
+
+    if combined_cfgs:
+        other_columns_comma = ", ".join(other_columns)
+        other_columns_cpp_def = "\n".join(
+            [f"    {other_column_types[col]} {col};" for col in other_columns]
+        )
+        content += f"""
 #define ADD_CFG({other_columns_comma}, arch, path, knl_name, co_name)         \\
     {{                                         \\
         arch knl_name, {{ knl_name, path co_name, arch, {other_columns_comma} }}         \\
@@ -116,26 +144,27 @@ struct {args.module}Config
 using CFG = std::unordered_map<std::string, {args.module}Config>;
 
 """
-                have_get_header = True
-            cfg = [
-                "ADD_CFG("
-                + ", ".join(
-                    (
-                        f"{int(getattr(row, col)):>4}"
-                        if str(getattr(row, col)).replace(".", "", 1).isdigit()
-                        else f'"{getattr(row, col)}"'
-                    )
-                    for col in other_columns
-                )
-                + f', "{row.arch}", "{relpath}/", "{row.knl_name}", "{row.co_name}"),'
-                for row in combine_df.itertuples(index=False)
-                if row.arch in archs
-            ]
-            cfg_txt = "\n    ".join(cfg) + "\n"
 
-            txt = f"""static CFG cfg_{cfgname} = {{
+    for cfgname, relpath, combine_df in combined_cfgs:
+        for col in other_columns:
+            if col not in combine_df.columns:
+                default_value = (
+                    "" if other_column_types[col] == "std::string" else 0
+                )
+                combine_df[col] = default_value
+
+        cfg = [
+            "ADD_CFG("
+            + ", ".join(format_cpp_value(row[col]) for col in other_columns)
+            + f', "{row["arch"]}", "{relpath}/", "{row["knl_name"]}", "{row["co_name"]}"),'
+            for row in combine_df.to_dict("records")
+            if row["arch"] in archs
+        ]
+        cfg_txt = "\n    ".join(cfg) + "\n"
+
+        txt = f"""static CFG cfg_{cfgname} = {{
     {cfg_txt}}};"""
-            cfgs.append(txt)
+        cfgs.append(txt)
 
     content += "\n".join(cfgs) + "\n"
 
