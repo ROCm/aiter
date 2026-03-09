@@ -336,71 +336,80 @@ python bench_mla_decode.py --model deepseek-V3 -b 4 --seqlen 2048 -print_vgpr
 
 **Comprehensive Benchmark Script:**
 
-Here's a bash script to run `bench_mla_decode.py` with various flag combinations:
+Here's a bash script to run `bench_mla_decode.py` with all combinations of flags:
 
 ```bash
 #!/bin/bash
 # Comprehensive benchmark script for bench_mla_decode.py
+# Tests all combinations of parameters
 
 MODEL="deepseek-V3"
 OUTPUT_DIR="mla_decode_benchmark_results"
 mkdir -p $OUTPUT_DIR
 
-echo "Starting comprehensive MLA decode benchmarks..."
+echo "Starting comprehensive MLA decode benchmarks with all combinations..."
 
-# Test different batch sizes
-for BATCH in 1 4 8 16; do
-    echo "Testing batch size: $BATCH"
-    python bench_mla_decode.py --model $MODEL -b $BATCH --seqlen 2048 -o
-    mv *.csv $OUTPUT_DIR/batch_${BATCH}.csv 2>/dev/null || true
+# Define parameter arrays
+BATCH_SIZES=(1 4 8 16)
+SEQLENS=(512 1024 2048 4096)
+TP_DEGREES=(1 2 4 8)
+DTYPES=(bf16 fp16)
+ROPE_FLAGS=("" "-use_rope")
+CAUSAL_FLAGS=("" "-causal")
+EQUAL_SEQLENS_FLAGS=("" "-equal_seqlens")
+
+# Counter for tracking progress
+TOTAL=$(( ${#BATCH_SIZES[@]} * ${#SEQLENS[@]} * ${#TP_DEGREES[@]} * ${#DTYPES[@]} * ${#ROPE_FLAGS[@]} * ${#CAUSAL_FLAGS[@]} * ${#EQUAL_SEQLENS_FLAGS[@]} ))
+CURRENT=0
+
+# Nested loops to test all combinations
+for BATCH in "${BATCH_SIZES[@]}"; do
+    for SEQLEN in "${SEQLENS[@]}"; do
+        for TP in "${TP_DEGREES[@]}"; do
+            for DTYPE in "${DTYPES[@]}"; do
+                for ROPE in "${ROPE_FLAGS[@]}"; do
+                    for CAUSAL in "${CAUSAL_FLAGS[@]}"; do
+                        for EQUAL_SEQ in "${EQUAL_SEQLENS_FLAGS[@]}"; do
+                            CURRENT=$((CURRENT + 1))
+                            
+                            # Build filename from parameters
+                            FILENAME="b${BATCH}_s${SEQLEN}_tp${TP}_${DTYPE}"
+                            if [ -n "$ROPE" ]; then
+                                FILENAME="${FILENAME}_rope"
+                            fi
+                            if [ -n "$CAUSAL" ]; then
+                                FILENAME="${FILENAME}_causal"
+                            fi
+                            if [ -n "$EQUAL_SEQ" ]; then
+                                FILENAME="${FILENAME}_eqseq"
+                            fi
+                            
+                            echo "[$CURRENT/$TOTAL] Testing: batch=$BATCH, seqlen=$SEQLEN, tp=$TP, dtype=$DTYPE, rope=${ROPE:--}, causal=${CAUSAL:--}, equal_seqlens=${EQUAL_SEQ:--}"
+                            
+                            # Build command
+                            CMD="python bench_mla_decode.py --model $MODEL -b $BATCH --seqlen $SEQLEN -tp $TP --dtype $DTYPE $ROPE $CAUSAL $EQUAL_SEQ -o"
+                            
+                            # Run benchmark
+                            $CMD > /dev/null 2>&1
+                            
+                            # Move CSV file if it exists
+                            if ls *.csv 1> /dev/null 2>&1; then
+                                mv *.csv $OUTPUT_DIR/${FILENAME}.csv 2>/dev/null || true
+                            fi
+                        done
+                    done
+                done
+            done
+        done
+    done
 done
 
-# Test different sequence lengths
-for SEQLEN in 512 1024 2048 4096; do
-    echo "Testing sequence length: $SEQLEN"
-    python bench_mla_decode.py --model $MODEL -b 4 --seqlen $SEQLEN -o
-    mv *.csv $OUTPUT_DIR/seqlen_${SEQLEN}.csv 2>/dev/null || true
-done
-
-# Test different tensor parallelism degrees
-for TP in 1 2 4 8; do
-    echo "Testing tensor parallelism: $TP"
-    python bench_mla_decode.py --model $MODEL -b 4 --seqlen 2048 -tp $TP -o
-    mv *.csv $OUTPUT_DIR/tp_${TP}.csv 2>/dev/null || true
-done
-
-# Test different data types
-for DTYPE in bf16 fp16; do
-    echo "Testing data type: $DTYPE"
-    python bench_mla_decode.py --model $MODEL -b 4 --seqlen 2048 --dtype $DTYPE -o
-    mv *.csv $OUTPUT_DIR/dtype_${DTYPE}.csv 2>/dev/null || true
-done
-
-# Test with RoPE enabled
-echo "Testing with RoPE enabled"
-python bench_mla_decode.py --model $MODEL -b 4 --seqlen 2048 -use_rope -o
-mv *.csv $OUTPUT_DIR/rope_enabled.csv 2>/dev/null || true
-
-# Test with causal attention
-echo "Testing with causal attention"
-python bench_mla_decode.py --model $MODEL -b 4 --seqlen 2048 -causal -o
-mv *.csv $OUTPUT_DIR/causal_enabled.csv 2>/dev/null || true
-
-# Test with equal sequence lengths
-echo "Testing with equal sequence lengths"
-python bench_mla_decode.py --model $MODEL -b 4 --seqlen 2048 -equal_seqlens -o
-mv *.csv $OUTPUT_DIR/equal_seqlens.csv 2>/dev/null || true
-
-# Test combination of flags
-echo "Testing combination: RoPE + Causal + Equal SeqLens"
-python bench_mla_decode.py --model $MODEL -b 4 --seqlen 2048 -use_rope -causal -equal_seqlens -o
-mv *.csv $OUTPUT_DIR/combined_flags.csv 2>/dev/null || true
-
-# Test VGPR usage
-echo "Testing VGPR usage"
+# Test VGPR usage separately (only need to run once)
+echo "Testing VGPR usage..."
 python bench_mla_decode.py --model $MODEL -b 4 --seqlen 2048 -print_vgpr > $OUTPUT_DIR/vgpr_usage.txt 2>&1
 
 echo "Benchmarking complete! Results saved in $OUTPUT_DIR/"
+echo "Total combinations tested: $TOTAL"
 ```
 
 Save this script as `bench_mla_decode_comprehensive.sh`, make it executable, and run it:
