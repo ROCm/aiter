@@ -194,18 +194,18 @@ Run the FlashAttention correctness tests to verify the implementation:
 ```bash
 # Run basic FlashAttention output tests
 cd op_tests
-python test_mha.py --batch_size 4 --nheads 6 --seqlen_q 1024 --seqlen_k 1024 --dtype fp16
+python test_mha.py -b 4 -n 6 -q 1024 -k 1024 --dtype fp16
 
 # Run with specific parameters
 python test_mha.py \
-    --batch_size 4 \
-    --nheads 32 \
-    --seqlen_q 2048 \
-    --seqlen_k 2048 \
-    --d_qk_v 128 128 \
+    -b 4 \
+    -n 32 \
+    -q 2048 \
+    -k 2048 \
+    -d_qk_v 128 128 \
     --dtype bf16 \
-    --causal True \
-    --mha_type mha
+    -c True \
+    -m mha
 ```
 
 ##### Performance Benchmarks
@@ -228,27 +228,27 @@ python bench_mha.py --model llama3
 
 # Run with custom parameters (without model config)
 python bench_mha.py \
-    --b 4 \
-    --hq 32 \
-    --hk 32 \
-    --sq 2048 \
-    --sk 2048 \
-    --d 128 \
+    -b 4 \
+    -hq 32 \
+    -hk 32 \
+    -sq 2048 \
+    -sk 2048 \
+    -d 128 \
     --dtype fp16 \
-    --metric throughput \
-    --mode fwd
+    -metric throughput \
+    -mode fwd
 
 # Run with FP8 precision
-python bench_mha.py --fp8 --b 4 --hq 32 --hk 32 --sq 2048 --sk 2048 --d 128
+python bench_mha.py -fp8 -b 4 -hq 32 -hk 32 -sq 2048 -sk 2048 -d 128
 
 # Run backward pass benchmark
-python bench_mha.py --mode bwd --b 4 --hq 32 --hk 32 --sq 2048 --sk 2048 --d 128
+python bench_mha.py -mode bwd -b 4 -hq 32 -hk 32 -sq 2048 -sk 2048 -d 128
 
 # Run with model-specific configurations
-python bench_mha.py --model llama3-70B --b 1 --sq 4096 --metric throughput
+python bench_mha.py --model llama3-70B -b 1 -sq 4096 -metric throughput
 
 # Test correctness against PyTorch SDPA
-python bench_mha.py --test_mode --b 4 --hq 32 --hk 32 --sq 1024 --sk 1024 --d 128
+python bench_mha.py -test_mode -b 4 -hq 32 -hk 32 -sq 1024 -sk 1024 -d 128
 ```
 
 **Available Model Names:**
@@ -264,20 +264,20 @@ You can also use just the family name (e.g., `llama3`) to benchmark all models i
 
 **Common FlashAttention Benchmark Arguments:**
 
-- `--b`: Batch size
-- `--hq`: Number of query heads
-- `--hk`: Number of key/value heads
-- `--sq`: Query sequence length
-- `--sk`: Key sequence length
-- `--d`: Head dimension (Q and K)
-- `--dv`: Value head dimension (optional)
+- `-b`: Batch size
+- `-hq`: Number of query heads
+- `-hk`: Number of key/value heads
+- `-sq`: Query sequence length
+- `-sk`: Key sequence length
+- `-d`: Head dimension (Q and K)
+- `-dv`: Value head dimension (optional)
 - `--dtype`: Data type (`fp16`, `bf16`, `fp8`)
-- `--mode`: Kernel mode (`fwd` for forward, `bwd` for backward)
-- `--metric`: Performance metric (`throughput`, `time`, `bandwidth`)
-- `--causal`: Enable causal attention mask
-- `--fp8`: Use FP8 precision
+- `-mode`: Kernel mode (`fwd` for forward, `bwd` for backward)
+- `-metric`: Performance metric (`throughput`, `time`, `bandwidth`)
+- `-causal`: Enable causal attention mask
+- `-fp8`: Use FP8 precision
 - `--model`: Model name (uses model configs from `utils/model_configs.json`)
-- `--test_mode`: Run correctness tests comparing to PyTorch SDPA
+- `-test_mode`: Run correctness tests comparing to PyTorch SDPA
 - `-o`: Save results to CSV file
 
 ##### KV Cache Tests
@@ -336,20 +336,20 @@ python bench_gemm_a8w8.py --metric throughput
 
 ```bash
 # Run MHA benchmark
-python bench_mha.py --batch 32 --hq 32 --hk 32 --n_ctx_q 2048 --n_ctx_k 2048
+python bench_mha.py -b 32 -hq 32 -hk 32 -sq 2048 -sk 2048
 
 # Run with model configuration
-python bench_pa_prefill.py --model llama3-70b
+python bench_pa_prefill.py --model llama3-70B
 ```
 
 #### Running MoE Benchmarks
 
 ```bash
 # Run MoE benchmark
-python bench_moe.py --model llama3-70b --M 4096 --N 8192 --K 4096 --E 8 --top_k 2
+python bench_moe.py --model llama3-70B -M 4096 -N 8192 -K 4096
 
 # Run MoE routing benchmark
-python bench_moe_routing_sigmoid_top1_fused.py --M 4096 --N 8192 --K 4096
+python bench_moe_routing_sigmoid_top1_fused.py -M 4096 -N 8192 -K 4096
 ```
 
 #### Running Model Benchmarking Tools
