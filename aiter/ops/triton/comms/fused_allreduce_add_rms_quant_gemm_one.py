@@ -16,8 +16,8 @@ Single Triton kernel, two passes per block of BLOCK_SIZE_M owned rows:
     tl.dot with weight. After all K tiles, broadcast BF16 GEMM
     output to all peers via iris.store.
 
-After the main loop, a copy phase assembles the full GEMM output
-from the symmetric heap into the output tensor.
+After the kernel, a device_barrier() ensures all ranks have finished
+broadcasting, then the caller copies gemm_heap -> gemm_out.
 
 Key insight: max(|x * rrms * rms_w|) = rrms * max(|x * rms_w|).
 Since rrms is per-row, we accumulate max(|x * rms_w|) during pass 1
@@ -79,7 +79,6 @@ def persistent_fused_allreduce_rmsnorm_quant_partial_gemm(
     gemm_heap_ptr,    # (M, K_GEMM) on heap — GEMM output, broadcast target
     # Regular GPU memory outputs
     result_out_ptr,   # (M, N) BF16 — allreduced result (residual chain + GEMM input)
-    gemm_out_ptr,     # (M, K_GEMM) — final GEMM output (assembled from heap)
     # GEMM weight and parameters
     gemm_weight_ptr,  # (N, K_GEMM) FP8 — weight matrix
     bias_ptr,         # (K_GEMM,) or dummy when HAS_BIAS=False
@@ -87,8 +86,6 @@ def persistent_fused_allreduce_rmsnorm_quant_partial_gemm(
     K_GEMM,           # output columns of GEMM
     stride_gw_k,      # weight stride dim 0 (K/N direction)
     stride_gw_n,      # weight stride dim 1 (output direction)
-    stride_go_m,      # gemm_out stride dim 0
-    stride_go_n,      # gemm_out stride dim 1
     stride_gh_m,      # gemm_heap stride dim 0
     stride_gh_n,      # gemm_heap stride dim 1
     # Residual (dummy ptr when HAS_RESIDUAL=False)
@@ -128,8 +125,7 @@ def persistent_fused_allreduce_rmsnorm_quant_partial_gemm(
 
     Two passes per block:
       Pass 1: tiled allreduce, accumulate sq_sum + weighted_amax
-      Pass 2: tiled GEMM with inline rmsnorm + quant
-    Then broadcast + copy.
+      Pass 2: tiled GEMM with inline rmsnorm + quant, broadcast via iris.store
     """
     pid = tl.program_id(0)
 
@@ -322,31 +318,6 @@ def persistent_fused_allreduce_rmsnorm_quant_partial_gemm(
                         iris_rank, remote_rank, heap_bases,
                         mask=store_mask,
                     )
-
-    # ================================================================
-    # Copy phase: heap -> output
-    # ================================================================
-    # After all ranks have broadcast, gemm_heap has full (M, K_GEMM).
-    # Copy to gemm_out using all CTAs.
-    COPY_BLOCK: tl.constexpr = GEMM_BLOCK_N
-    num_copy_cols = tl.cdiv(K_GEMM, COPY_BLOCK)
-    total_copy_tiles = M * num_copy_cols
-
-    for tile_id in range(pid, total_copy_tiles, COMM_SMS):
-        row = tile_id // num_copy_cols
-        col_tile = tile_id % num_copy_cols
-        offs_n = col_tile * COPY_BLOCK + tl.arange(0, COPY_BLOCK)
-        cp_mask = offs_n < K_GEMM
-
-        vals = tl.load(
-            gemm_heap_ptr + row * stride_gh_m + offs_n * stride_gh_n,
-            mask=cp_mask,
-        )
-        tl.store(
-            gemm_out_ptr + row * stride_go_m + offs_n * stride_go_n,
-            vals,
-            mask=cp_mask,
-        )
 
 
 # ============================================================================
@@ -570,7 +541,6 @@ class IrisOneManager:
             gemm_heap,
             # Outputs
             result_out,
-            gemm_out,
             # GEMM weight
             gemm_weight,
             bias_ptr,
@@ -578,8 +548,6 @@ class IrisOneManager:
             K_GEMM,
             gemm_weight.stride(0),
             gemm_weight.stride(1),
-            gemm_out.stride(0),
-            gemm_out.stride(1),
             gemm_heap.stride(0),
             gemm_heap.stride(1),
             # Residual
@@ -617,9 +585,12 @@ class IrisOneManager:
             waves_per_eu=WAVES_PER_EU,
         )
 
-        # Post-kernel barrier
+        # Post-kernel barrier ensures all ranks finished iris.store
         if not is_graph_capturing():
             shmem.device_barrier()
+
+        # Copy assembled GEMM output from heap to local memory
+        gemm_out.copy_(gemm_heap)
 
         residual_out = result_out if residual is not None else None
         return gemm_out, residual_out
