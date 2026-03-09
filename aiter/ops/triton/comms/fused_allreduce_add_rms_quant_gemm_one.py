@@ -505,19 +505,24 @@ class IrisOneManager:
             extract_group_info(shmem)
         )
 
+        logger.info(f"rank={rank_global} M={M} N={N} K_GEMM={K_GEMM} — ensure_heap_buffers")
         iris_input, gemm_heap = self._ensure_heap_buffers(
             M, N, K_GEMM, input_tensor.dtype, out_dtype,
         )
+        logger.info(f"rank={rank_global} — ensure_local_buffers")
         result_out, gemm_out = self._ensure_local_buffers(
             M, N, K_GEMM, out_dtype, device,
         )
 
+        logger.info(f"rank={rank_global} — copy_ to heap")
         # Copy input to symmetric heap (captured in graph)
         iris_input.copy_(input_tensor)
 
         # Pre-kernel barrier
+        logger.info(f"rank={rank_global} — pre-kernel device_barrier")
         if not is_graph_capturing():
             shmem.device_barrier()
+        logger.info(f"rank={rank_global} — pre-kernel barrier done")
 
         fp8_max = torch.finfo(quant_dtype).max
         heap_bases = shmem.get_heap_bases()
@@ -535,6 +540,7 @@ class IrisOneManager:
 
         bias_ptr = bias if bias is not None else input_tensor
 
+        logger.info(f"rank={rank_global} — launching kernel")
         persistent_fused_allreduce_rmsnorm_quant_partial_gemm[(COMM_SMS,)](
             # Heap buffers
             iris_input,
@@ -585,12 +591,15 @@ class IrisOneManager:
             waves_per_eu=WAVES_PER_EU,
         )
 
+        logger.info(f"rank={rank_global} — kernel launched, post-kernel device_barrier")
         # Post-kernel barrier ensures all ranks finished iris.store
         if not is_graph_capturing():
             shmem.device_barrier()
+        logger.info(f"rank={rank_global} — post-kernel barrier done")
 
         # Copy assembled GEMM output from heap to local memory
         gemm_out.copy_(gemm_heap)
+        logger.info(f"rank={rank_global} — copy done")
 
         residual_out = result_out if residual is not None else None
         return gemm_out, residual_out
