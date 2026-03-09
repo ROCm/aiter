@@ -12,7 +12,8 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
     moe_gemm_a8w4,
     moe_gemm_torch,
-    swizzle_scales,
+    swizzle_scales_gfx950,
+    swizzle_scales_gfx1250
 )
 
 # numerics utilities
@@ -68,7 +69,6 @@ def init_compute_data(
     has_y_gammas,
     device="cuda",
 ):
-    torch.manual_seed(0)
     in_m = m * (n_expts_act if gindx is None else 1)
     shape_x = (in_m, k)
     x = alloc_rand(shape_x, device=device, dtype=act_dtype)
@@ -193,6 +193,10 @@ class Case:
             Case(4096, 256, 256, "mxfloat8_e4m3fn", 128, 4),
             Case(1000, 704, 800, "mxfloat8_e4m3fn", 8, 2),
             Case(300, 400, 800, "mxfloat8_e4m3fn", 8, 4),
+            # smaller tests for gfx1250 ffm
+            Case(16, 512, 512, "float8_e4m3fn", 32, 2), 
+            Case(16, 512, 512, "float8_e4m3fn", 32, 2, hbm_swizzling=True),
+            Case(300, 400, 800, "float8_e4m3fn", 8, 4),
         ]
     ],
 )
@@ -224,20 +228,22 @@ def test_op(
     device="cuda",
 ):
 
-    if get_arch() != "gfx950":
-        pytest.skip("float8 x mx only supported on CDNA4")
+    if get_arch() != "gfx950" and get_arch() != "gfx1250":
+        pytest.skip("Kernel not supported on this GPU.")
 
-    if "float8_e4m3fnuz" in act_dtype_str and get_arch() != "gfx942":
-        pytest.skip("float8_e4m3fnuz only tested on AMD CDNA3 Platform")
+    if get_arch() == "gfx1250":
+        if act_dtype_str == "mxfloat8_e4m3fn":
+            pytest.skip("Mxfloat activations are not supported yet on gfx1250.")
+        if apply_swiglu and has_y_gammas:
+            pytest.skip("Swiglu and gammas are not supported together on gfx1250.")
+        # temporary
+        if m > 1024 or n > 1024 or k > 1024 or n_expts_tot > 32:
+            pytest.skip("Test will take too long time on FFM")
 
     if hbm_swizzling:
-        if get_arch() != "gfx950":
+        if get_arch() == "gfx950" and (n % 32 != 0 or k % (32 * 8) != 0):
             pytest.skip(
-                "Scale preshuffling on AMD GPU has not been emulated on non-CDNA4 arch yet."
-            )
-        if n % 32 != 0 or k % (32 * 8) != 0:
-            pytest.skip(
-                f"Shape {m}x{n}x{k} is not supported for scale swizzling on AMD GPU"
+                f"Shape {m}x{n}x{k} is not supported for scale swizzling on gfx950."
             )
 
     torch.manual_seed(0)
@@ -274,8 +280,13 @@ def test_op(
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
     if hbm_swizzling:
-        swizzle_mx_scale = "CDNA4_SCALE"
-        w_scale_tri = swizzle_scales(w_scale_tri)
+        if get_arch() == "gfx1250":
+            swizzle_mx_scale = "GFX1250_SCALE"
+            w_scale_tri = swizzle_scales_gfx1250(w_scale_tri)
+        else:
+            assert(get_arch() == "gfx950")
+            swizzle_mx_scale = "CDNA4_SCALE"
+            w_scale_tri = swizzle_scales_gfx950(w_scale_tri)
     else:
         swizzle_mx_scale = None
 
@@ -283,14 +294,12 @@ def test_op(
         x_tri, x_mx_scales_tri = downcast_to_mxfp(x_tri, act_dtype, axis=-1)
         x_ref = upcast_from_mxfp(x_tri, x_mx_scales_tri, torch.bfloat16, axis=-1)
         x_static_scale = None
-        out_dtype = torch.bfloat16
         maxtol = None
         rmstol = None
     else:
         x_mx_scales_tri = None
         x_static_scale = x_tri.abs().max().float() / 448.0
         x_tri = downcast_to_static_fp8(x_tri, x_static_scale)
-        out_dtype = torch.float8_e4m3fn
         maxtol = 4e-1
         rmstol = 4e-2
 
@@ -299,8 +308,10 @@ def test_op(
     )
     if not act_mxfp8 and fused_quant:
         quant_static_scale = ref_y.abs().max().float() / 448.0
+        out_dtype = torch.float8_e4m3fn
     else:
         quant_static_scale = None
+        out_dtype = torch.bfloat16
     tri_y = moe_gemm_a8w4(
         x_tri,
         w_tri,
