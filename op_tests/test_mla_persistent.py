@@ -395,26 +395,6 @@ def test_mla(
         else:
             kv_last_page_lens.fill_(ctx_lens % page_size)
 
-    # Temporarily work around for fp8/fp8 with gqa_ratio=32 kernel doesn't support bitmask
-    if (
-        nhead == 32
-        and decode_qlen == 4
-        and dtype == dtypes.fp8
-        and kvtype == dtypes.fp8
-    ):
-        remainder = seq_lens_kv % 64
-        need_pad = remainder != 0
-        if need_pad.any():
-            pad = torch.where(need_pad, 64 - remainder, torch.zeros_like(remainder))
-            seq_lens_kv += pad
-
-            kv_block_nums = (seq_lens_kv + page_size - 1) // page_size
-            kv_last_page_lens = torch.where(
-                (seq_lens_kv % page_size) == 0,
-                torch.full_like(kv_last_page_lens, page_size),
-                seq_lens_kv % page_size,
-            )
-
     kv_indptr[1 : batch_size + 1] = torch.cumsum(kv_block_nums, dim=0)
     num_page = kv_indptr[-1].item()
     kv_indices = torch.randperm(num_page, dtype=torch.int)
@@ -669,7 +649,7 @@ def test_mla(
             kv_lora_rank,
             qk_rope_head_dim,
             dtype=out_dtype,
-            is_causal=False,
+            is_causal=True,
             q_scale=None,
             kv_scale=kv_scale,
         )
@@ -820,15 +800,6 @@ def test_mla(
     return ret
 
 
-kv_lora_rank = 512
-qk_nope_head_dim = 128
-qk_rope_head_dim = 64
-v_head_dim = 128
-block_size = 1
-list_dtype = ["bf16", "fp8"]
-l_kv_dtype = ["bf16", "fp8"]
-list_nhead = [(16, 1), (16, 2), (16, 4), (48, 1), (128, 2), (32, 4)]
-
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -876,20 +847,22 @@ parser.add_argument(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=["bf16", "fp8"],
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
     nargs="*",
-    default=["bf16", "fp8"],
+    default="bf16,fp8",
+    metavar="{bf16, fp8}",
     help="""Data type of Q.
     e.g.: -d bf16""",
 )
 parser.add_argument(
     "-kvd",
     "--kv_dtype",
-    type=str,
-    choices=["bf16", "fp8"],
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
     nargs="*",
-    default=["bf16", "fp8"],
+    metavar="{bf16, fp8}",
+    default="bf16,fp8",
     help="""Data type of KV.
     e.g.: -kvd bf16""",
 )
@@ -915,9 +888,9 @@ parser.add_argument(
     "-n",
     "--nhead",
     type=dtypes.str2tuple,
-    nargs="?",
+    nargs="*",
     const=None,
-    default=None,
+    default=[(16, 1), (16, 2), (16, 4), (48, 1), (128, 2)],
     help="""Number of heads.
     e.g.: -n 16,1""",
 )
@@ -964,15 +937,10 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
-list_dtype = [dtypes.d_dtypes[key] for key in args.dtype]
-l_kv_dtype = [dtypes.d_dtypes[key] for key in args.kv_dtype]
-if args.nhead is not None:
-    list_nhead = [args.nhead]
-
-for nhead, decode_qlen in list_nhead:
+for nhead, decode_qlen in args.nhead:
     df = []
     for dtype, kvtype, ctx_len, batch_size, max_split_per_batch in itertools.product(
-        list_dtype, l_kv_dtype, args.ctxLen, args.batchSize, args.max_split_per_batch
+        args.dtype, args.kv_dtype, args.ctxLen, args.batchSize, args.max_split_per_batch
     ):
         if check_support(dtype, kvtype, nhead):
             ret = test_mla(

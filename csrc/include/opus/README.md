@@ -181,27 +181,85 @@ Check [this repo](https://github.com/carlushuang/gcnasm/tree/master/matrix_core_
 
 ## Tests and examples
 
-Unit tests and working examples live under `op_tests/opus/`. These serve both as a test suite and as reference code for using **opus** APIs:
+See [`op_tests/opus/`](../../op_tests/opus/) for unit tests and working examples that serve as both a test suite and reference code.
 
-| Path | Description |
-|------|-------------|
-| `op_tests/opus/test_opus_basic.cpp` | Host-only C++ tests for core components: number, seq, array, tuple (including `merge_peepholed_tuple`), layout, static_for, type traits |
-| `op_tests/opus/device/test_mfma.cu` | GPU kernel: 32x32x8 fp16 MFMA using `make_mfma`, `partition_layout_a/b/c`, `make_gmem` (gfx942 only) |
-| `op_tests/opus/device/test_vector_add.cu` | GPU kernel: vectorized element-wise addition using `make_gmem` with templated `VECTOR_SIZE` |
+## Best Practice to Reduce HIP Kernel Compile Times
 
-To run all tests (host + device) inside a ROCm Docker container:
+Template-heavy headers like `opus.hpp` and the HIP SDK headers can dominate compile time. The following techniques can dramatically reduce it — in one case achieving a **61x speedup** over a standard torch extension build (21s → 346ms). See the [warp_sort_bitonic benchmark](https://github.com/carlushuang/gcnasm/tree/master/warp_sort_bitonic) for detailed numbers.
+
+### Background: hipcc's two-pass compilation
+
+hipcc compiles `.hip` files in **two passes** — once for the host (x86_64) and once for the device (AMDGPU). Both passes parse the same source, but each has different bottlenecks. The optimizations below are organized accordingly.
+
+### Device code: reducing what the GPU compiler must parse
+
+#### Replace `<hip/hip_runtime.h>` with compiler builtins
+
+`<hip/hip_runtime.h>` expands to ~190K preprocessed lines. Most kernel code only needs a handful of symbols that have direct AMDGCN compiler builtin equivalents:
+
+| Standard HIP | Builtin replacement |
+|---|---|
+| `threadIdx.x / .y / .z` | `__builtin_amdgcn_workitem_id_x/y/z()` |
+| `blockIdx.x / .y / .z` | `__builtin_amdgcn_workgroup_id_x/y/z()` |
+| `blockDim.x / .y / .z` | `__builtin_amdgcn_workgroup_size_x/y/z()` |
+| `gridDim.x / .y / .z` | `__builtin_amdgcn_grid_size_x/y/z()` |
+| `__syncthreads()` | `__builtin_amdgcn_s_barrier()` |
+| `warpSize` | `__builtin_amdgcn_wavefrontsize()` |
+| `__shfl()` | `opus::shfl()` (impl via `__builtin_amdgcn_ds_bpermute()`) |
+
+The remaining host-side symbols (`dim3`, `<<<>>>` support) can be declared in a ~60-line minimal header. This reduces preprocessed lines from 190K to ~11K.
+
+#### Use `-D__HIPCC_RTC__` to suppress implicit includes
+
+hipcc implicitly includes `__clang_hip_runtime_wrapper.h`, which pulls in C++ standard library headers (`<cmath>`, `<cstdlib>`, etc.) even when they're unused. Defining `-D__HIPCC_RTC__` tells this wrapper to skip those includes (the same flag used by HIP's runtime compilation path). Note: you may need to provide `#define INFINITY __builtin_huge_valf()` since `<cmath>` is no longer included.
+
+#### Use `--genco` for device-only compilation
+
+If you launch kernels from Python (via `hipModuleLaunchKernel`), you can skip the host pass entirely:
+
 ```bash
-cd op_tests/opus
-./run_tests_in_docker.sh
+hipcc --genco --offload-arch=gfx942 -O3 -D__HIPCC_RTC__ kernel.hip -o kernel.hsaco
 ```
 
-See [`op_tests/opus/README.md`](../../op_tests/opus/README.md) for full details on the test structure and how to add new device tests.
+This produces a `.hsaco` code object with zero host code. Use `extern "C" __global__` wrappers to give template instantiations predictable symbol names, then load from Python with `hipModuleLoad` + `hipModuleGetFunction`. With `--genco` the minimal header needs **zero host declarations** — no `dim3`, no `hipLaunchKernel`.
 
-## C++ key features used
-1. Static (`constexpr`) / dynamic variables
-2. `constexpr` return types
-3. Local scratch
-4. Class inheritance (mainly in 2 places: tuple uses multi-inheritance; adaptors use inheritance to overwrite layout & function calls)
-5. Function template partial specialization
-6. Recursive template expansion
-7. C++17 fold expressions
+### Host code: avoiding redundant parsing
+
+#### Guard device-only code with `__HIP_DEVICE_COMPILE__`
+
+When hipcc compiles a `.hip` file, the host pass still sees **all** source code — including `__device__` functions, kernel bodies, and any headers they pull in. The host compiler parses and type-checks everything, even though it only generates code for the host-side launch stubs. Heavy template headers like `opus.hpp` are only needed by the device pass. Wrapping them in `#ifdef __HIP_DEVICE_COMPILE__` with an empty kernel stub for the host pass avoids parsing them twice:
+
+```cpp
+#ifdef __HIP_DEVICE_COMPILE__
+#include "opus/opus.hpp"
+// ... full kernel implementation ...
+template<typename T> __global__ void my_kernel(T* ptr) { /* real body */ }
+#else
+template<typename T> __global__ void my_kernel(T* ptr) {}  // empty stub
+#endif
+```
+
+The host pass only needs to see the `__global__` function signature to generate the launch stub — it doesn't need the body or any device-side headers.
+
+#### Eliminate the C++ binding layer
+
+Framework binding layers are compiled on the host side and add significant overhead:
+
+| Binding approach | Binding compile time |
+|---|---|
+| torch `CUDAExtension` (hipcc + pybind11 + ATen) | ~8s |
+| pybind11 only (g++) | ~4s |
+| tvm_ffi (g++) | ~1s |
+| ctypes (no binding at all) | **0s** |
+
+Using `ctypes.CDLL` to call `extern "C"` functions — or `hipModuleLaunchKernel` with a `.hsaco` code object — eliminates binding compilation entirely. No pybind11, no torch extension, no framework headers on the host side.
+
+### Summary
+
+| Technique | Applies to | Effect |
+|---|---|---|
+| Compiler builtins instead of `hip_runtime.h` | Device | 190K → 11K preprocessed lines |
+| `-D__HIPCC_RTC__` | Both | Suppresses implicit stdlib includes |
+| `--genco` (device-only compile) | Device | Eliminates host pass entirely |
+| `__HIP_DEVICE_COMPILE__` guard | Host | Skips heavy headers during host pass |
+| ctypes / `hipModuleLaunchKernel` | Host | Eliminates C++ binding compilation |
