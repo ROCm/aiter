@@ -23,8 +23,8 @@ from op_tests.triton_tests.attention.test_fav3_sage import (
 from op_tests.op_benchmarks.triton.bench_fav3_sage import fav2_forward_func
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
+    get_caller_name_no_ext,
 )
-
 # Configuration
 logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
@@ -175,6 +175,12 @@ def parse_args():
         action="store_true",
         help="Causal masking",
     )
+    parser.add_argument(
+        "-test",
+        action="store_true",
+        help="Test benchmark shape correctness.",
+    )
+
     return parser.parse_args()
 
 
@@ -292,15 +298,16 @@ def main():
 
     assert args.BLOCK_R <= args.d, "Rotation block size should be <= d"
 
-    if args.captured_dir is not None:
-        test_accuracy_with_captured_inputs(args)
-    else:
-        test_accuracy_with_shape(args)
-
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
         print_vgpr(lambda: run_benchmark(args), "MXFP4_Attention_Performance")
         return 0
+
+    if args.test:
+        if args.captured_dir is not None:
+            test_accuracy_with_captured_inputs(args)
+        else:
+            test_accuracy_with_shape(args)
 
     run_benchmark(args)
 

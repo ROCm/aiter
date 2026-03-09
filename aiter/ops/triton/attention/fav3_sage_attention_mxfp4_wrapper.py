@@ -62,7 +62,7 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
         FP8_TYPE = aiter.dtypes.fp8
         FP8_MAX = torch.finfo(FP8_TYPE).max
         
-        fused_quant = False
+        fused_quant = True
         (
             q_quantized,
             q_descale,

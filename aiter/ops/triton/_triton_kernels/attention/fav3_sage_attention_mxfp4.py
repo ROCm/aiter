@@ -776,7 +776,7 @@ def fused_sage_quant_mxfp4(
     FP8_MAX = torch.finfo(FP8_TYPE).max
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
 
-    BLOCK_K = 64
+    BLOCK_K = 1024
     K_NUM_BLKS = (kv_len + BLOCK_K - 1) // BLOCK_K
 
     # Apply K tensor smoothing following SageAttention approach
@@ -800,7 +800,7 @@ def fused_sage_quant_mxfp4(
         kv_len,
         D=head_dim,
         BLK_K=BLOCK_K,
-        num_stages=3,
+        num_stages=5,
         num_warps=8,
     )
 
@@ -908,7 +908,7 @@ def _rotate_quantize_qk_kernel(
     SCALE_GROUP_SIZE: tl.constexpr = 32
 
     q_pids = batch * heads_q * tl.cdiv(seqlen_q, BLOCK_M)
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
     is_q_pid = pid < q_pids
 
     if is_q_pid:
@@ -1242,6 +1242,8 @@ def smooth_rotate_downcast_qk(
         BLOCK_M=BLOCK_SIZE_M,
         BLOCK_R=BLOCK_R,
         D=d,
+        num_warps=4,
+        num_stages=5
     )
 
     if q_smoothing:
