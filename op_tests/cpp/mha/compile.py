@@ -26,7 +26,34 @@ def get_asm_dir():
             BWD_CODEGEN_CMD.append(f"{BWD_ASM_DIR}/codegen.py --output_dir {{}}")
 
 
+def get_embedded_hsa_build_args():
+    """Optional embedded-HSA config passed from the outer build via env vars."""
+    header = os.getenv("AITER_EMBEDDED_HSA_HEADER", "").strip()
+    include_dir = os.getenv("AITER_EMBEDDED_HSA_INCLUDE_DIR", "").strip()
+    flags_extra_cc = []
+
+    if header:
+        # If header is provided, then make sure that include_dir is also provided,
+        # otherwise the embedded HSA header won't be found during compilation.
+        if not include_dir:
+            raise ValueError(
+                "AITER_EMBEDDED_HSA_HEADER is provided without AITER_EMBEDDED_HSA_INCLUDE_DIR. "
+                "Both must be provided to use embedded HSA header."
+            )
+
+        # aiter_hip_common.h uses: #include AITER_EMBEDDED_HSA_HEADER
+        # so the macro value must be a quoted header token.
+        flags_extra_cc.append(f'-DAITER_EMBEDDED_HSA_HEADER=\\"{header}\\"')
+
+        # Keep optCompilerConfig's default include list intact by passing include dir
+        # as a compile flag instead of overriding `extra_include` in custom args.
+        flags_extra_cc.append(f"-I{include_dir}")
+
+    return flags_extra_cc
+
+
 def cmdGenFunc_mha_fwd(ck_exclude: bool):
+    embed_flags_extra_cc = get_embedded_hsa_build_args()
     if ck_exclude:
         blob_gen_cmd = [
             f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 1 --output_dir {{}}",
@@ -42,6 +69,7 @@ def cmdGenFunc_mha_fwd(ck_exclude: bool):
     return {
         "md_name": "libmha_fwd",
         "blob_gen_cmd": blob_gen_cmd,
+        "flags_extra_cc": embed_flags_extra_cc,
     }
 
 
@@ -54,6 +82,7 @@ def compile_mha_fwd(ck_exclude: bool): ...
 
 
 def cmdGenFunc_mha_bwd(ck_exclude: bool):
+    embed_flags_extra_cc = get_embedded_hsa_build_args()
     if ck_exclude:
         blob_gen_cmd = [
             f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel_generate.py --filter "*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*" --output_dir {{}}',
@@ -69,6 +98,7 @@ def cmdGenFunc_mha_bwd(ck_exclude: bool):
     return {
         "md_name": "libmha_bwd",
         "blob_gen_cmd": blob_gen_cmd,
+        "flags_extra_cc": embed_flags_extra_cc,
     }
 
 
