@@ -7,6 +7,7 @@ import torch
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+from aiter.jit.utils.torch_guard import torch_compile_guard
 
 
 class _FlashAttnV3Func(torch.autograd.Function):
@@ -375,6 +376,151 @@ def flash_attn_varlen_func(
     )
 
 
+def flash_attn_with_kvcache_fake_tensor(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k: Optional[torch.Tensor] = None,
+    v: Optional[torch.Tensor] = None,
+    qv: Optional[torch.Tensor] = None,
+    cache_seqlens: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = True,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    attention_chunk: int = 0,
+    softcap: float = 0.0,
+    num_splits: int = 0,
+    pack_gqa: Optional[bool] = None,
+    sm_margin: int = 0,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    return_softmax_lse: bool = False,
+    page_table: Optional[torch.Tensor] = None,
+    kv_batch_idx: Optional[torch.Tensor] = None,
+    leftpad_k: Optional[torch.Tensor] = None,
+    rotary_cos: Optional[torch.Tensor] = None,
+    rotary_sin: Optional[torch.Tensor] = None,
+    seqlens_rotary: Optional[torch.Tensor] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+):
+
+    # https://github.com/ROCm/aiter/blob/7411c99753f0661a3eecdbdb1b36feb58539f62b/aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/interface_v3.py#L218
+    out_dtype = torch.float32 if q.dtype == torch.float8_e4m3fnuz else q.dtype
+
+    # establish layout / varlen & max seq lens
+    # https://github.com/ROCm/aiter/blob/7411c99753f0661a3eecdbdb1b36feb58539f62b/aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/interface_v3.py#L156C5-L156C47
+    if cu_seqlens_q is not None:  # thd: [total_tokens, num_heads, head_dim]
+        total_q = q.shape[0]
+        num_heads = q.shape[1]
+        head_dim = q.shape[2]
+
+        out = torch.empty(
+            (total_q, num_heads, head_dim),
+            dtype=out_dtype,
+            device=q.device,
+        )
+
+        softmax_lse = torch.empty(
+            (num_heads, total_q),
+            dtype=torch.float32,
+            device=q.device,
+        )
+    else:  # bshd: [batch, seqlen, num_heads, head_dim]
+        batch_size = q.shape[0]
+        seqlen_q = q.shape[1]
+        num_heads = q.shape[2]
+        head_dim = q.shape[3]
+
+        out = torch.empty(
+            (batch_size, seqlen_q, num_heads, head_dim),
+            dtype=out_dtype,
+            device=q.device,
+        )
+
+        softmax_lse = torch.empty(
+            (batch_size, num_heads, seqlen_q),
+            dtype=torch.float32,
+            device=q.device,
+        )
+    return (out, softmax_lse)
+
+
+@torch_compile_guard(gen_fake=flash_attn_with_kvcache_fake_tensor)
+def _flash_attn_with_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k: Optional[torch.Tensor] = None,
+    v: Optional[torch.Tensor] = None,
+    qv: Optional[torch.Tensor] = None,
+    cache_seqlens: Optional[torch.Tensor] = None,  # Only accepts Tensor, not int
+    softmax_scale: Optional[float] = None,
+    causal: bool = True,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    attention_chunk: int = 0,
+    softcap: float = 0.0,
+    num_splits: int = 0,
+    pack_gqa: Optional[bool] = None,
+    sm_margin: int = 0,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    return_softmax_lse: bool = False,
+    page_table: Optional[torch.Tensor] = None,
+    kv_batch_idx: Optional[torch.Tensor] = None,
+    leftpad_k: Optional[torch.Tensor] = None,
+    rotary_cos: Optional[torch.Tensor] = None,
+    rotary_sin: Optional[torch.Tensor] = None,
+    seqlens_rotary: Optional[torch.Tensor] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    out, softmax_lse, _, _ = flash_attn_3.fwd(
+        q,
+        k_cache,
+        v_cache,
+        k,
+        v,
+        None,  # qv
+        None,  # out allocate
+        cu_seqlens_q,
+        None,  # cu_seqlens_k
+        cu_seqlens_k_new,
+        None,  # seqused_q
+        cache_seqlens,  # seqused_k
+        max_seqlen_q,
+        None,  # max_seqlen_k
+        page_table,
+        kv_batch_idx,
+        leftpad_k,
+        rotary_cos,
+        rotary_sin,
+        seqlens_rotary,
+        q_descale,
+        k_descale,
+        v_descale,
+        softmax_scale,
+        causal,
+        window_size_left,
+        window_size_right,
+        attention_chunk,
+        softcap,
+        False,  # rotary_interleaved
+        None,  # scheduler_metadata
+        num_splits if num_splits != 0 else 1,
+        pack_gqa,
+        sm_margin,
+    )
+    return (out, softmax_lse)
+
+
 def flash_attn_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -429,15 +575,16 @@ def flash_attn_with_kvcache(
     if num_splits not in (0, 1):
         raise NotImplementedError("num_splits > 1 not supported in KV cache path")
 
+    if cu_seqlens_q is not None and cache_seqlens is not None:
+        raise NotImplementedError(
+            "Varlen decode with cache_seqlens tensor not supported yet"
+        )
+
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
         cache_seqlens = torch.full(
             (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
         )
 
-    if cu_seqlens_q is not None and cache_seqlens is not None:
-        raise NotImplementedError(
-            "Varlen decode with cache_seqlens tensor not supported yet"
-        )
     if (rotary_cos is None) ^ (rotary_sin is None):
         raise ValueError(
             "Both rotary_cos and rotary_sin must be provided together or neither"
@@ -456,41 +603,36 @@ def flash_attn_with_kvcache(
     leftpad_k = cache_leftpad
     seqlens_rotary = rotary_seqlens
 
-    out, softmax_lse, _, _ = flash_attn_3.fwd(
+    out, softmax_lse = _flash_attn_with_kvcache(
         q,
         k_cache,
         v_cache,
         k,
         v,
-        None,  # qv
-        None,  # out allocate
-        cu_seqlens_q,
-        None,  # cu_seqlens_k
-        cu_seqlens_k_new,
-        None,  # seqused_q
-        cache_seqlens if isinstance(cache_seqlens, torch.Tensor) else None,  # seqused_k
+        qv,
+        cache_seqlens,
+        softmax_scale,
+        causal,
+        window_size[0],
+        window_size[1],
+        attention_chunk,
+        softcap,
+        num_splits,
+        pack_gqa,
+        sm_margin,
+        q_descale,
+        k_descale,
+        v_descale,
         max_seqlen_q,
-        None,  # max_seqlen_k
+        return_softmax_lse,
         page_table,
         kv_batch_idx,
         leftpad_k,
         rotary_cos,
         rotary_sin,
         seqlens_rotary,
-        q_descale,
-        k_descale,
-        v_descale,
-        softmax_scale,
-        causal,
-        int(window_size[0]),
-        int(window_size[1]),
-        attention_chunk,
-        softcap,
-        False,  # rotary_interleaved
-        None,  # scheduler_metadata
-        num_splits if num_splits != 0 else 1,
-        pack_gqa,
-        sm_margin,
+        cu_seqlens_q,
+        cu_seqlens_k_new,
     )
     return (out, softmax_lse) if return_softmax_lse else out
 

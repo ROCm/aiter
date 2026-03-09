@@ -92,3 +92,18 @@ void get_pa_metadata_v1(const torch::Tensor& seqlens_qo_indptr, // [batch size +
                         const bool fast_mode,
                         const int32_t topk,
                         const int32_t max_split_per_batch);
+
+void hk_mla_decode_fwd(
+    torch::Tensor& query,                   // [num_seqs, num_heads, head_size]
+    torch::Tensor& kv_buffer,               // [num_page, page_size, num_kv_heads, head_size]
+    const torch::Tensor& qo_indptr,         // [batch_size+1]
+    const torch::Tensor& kv_indptr,         // [batch_size+1]
+    const torch::Tensor& kv_page_indices,   // [num_page_used]
+    const torch::Tensor& kv_last_page_lens, // [batch_size]
+    const torch::Tensor& work_indptr,       // metadata
+    const torch::Tensor& work_info_set,
+    const int max_seqlen_q,
+    const float softmax_scale,
+    torch::Tensor& split_output,  // Output: [batch_size, num_kv_splits, num_heads, v_head_dim]
+    torch::Tensor& split_lse,     // Output: [batch_size, num_kv_splits, num_heads,  1]
+    torch::Tensor& final_output); // Output: [batch_size, num_heads, v_head_dim]

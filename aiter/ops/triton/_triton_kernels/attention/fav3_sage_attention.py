@@ -425,14 +425,11 @@ def _sage_fwd_mask(
         # IMPORTANT: Handle the case where all values are -inf
         # When m_ij = -inf and qk = -inf, subtraction gives NaN
         # We need to handle this explicitly
-        if USE_SLIDING_WINDOW:
-            # Check if this block has any valid values (m_ij != -inf)
-            # For rows where everything is -inf, set q_shifted to -inf (not NaN)
-            q_shifted = tl.where(
-                m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
-            )
-        else:
-            q_shifted = qk - m_ij[:, None]
+        # Check if this block has any valid values (m_ij != -inf)
+        # For rows where everything is -inf, set q_shifted to -inf (not NaN)
+        q_shifted = tl.where(
+            m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
+        )
 
         # Compute scaled QK and softmax probabilities
         if USE_EXP2:

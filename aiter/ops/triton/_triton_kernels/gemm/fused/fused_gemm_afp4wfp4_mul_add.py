@@ -611,6 +611,12 @@ def _get_config(
     # Note: Config files use K=2*K in their naming
     K = 2 * K
     if shuffle:
-        return get_gemm_config("GEMM-AFP4WFP4_PRESHUFFLED", M, N, K)
+        return get_gemm_config(
+            "GEMM-AFP4WFP4_PRESHUFFLED",
+            M,
+            N,
+            K,
+            bounds=(4, 8, 16, 31, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
+        )
     else:
         return get_gemm_config("GEMM-AFP4WFP4", M, N, K)

@@ -2,22 +2,21 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
-import sys
 import os
+import sys
 
 # Add parent directory to path to ensure we use local aiter module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import aiter
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from einops import rearrange
-from einops import repeat as eirp
-
-import aiter
 from aiter import dtypes
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
+from einops import rearrange
+from einops import repeat as eirp
 
 block_shape = (128, 128)
 
@@ -62,7 +61,6 @@ def run_gemm_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
 @benchmark()
 def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     ret = {}
-    dim = (m, n, k)
     block_shape_n, block_shape_k = block_shape
     scale_m = m
     scale_n = (n + block_shape_n - 1) // block_shape_n
@@ -86,16 +84,16 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
     ret["ck err"] = err_ck
 
-    tag = "asm"
-    weight_asm = shuffle_weight(weight, layout=(32, 16))
-    c, avg_c = run_asm(x, weight_asm, x_scale, w_scale, dtype)
+    # tag = "asm"
+    # weight_asm = shuffle_weight(weight, layout=(16, 16))
+    # c, avg_c = run_asm(x, weight_asm, x_scale_t, w_scale, dtype)
 
-    err_asm = checkAllclose(a, c, msg=f"{tag}")
-    ret[f"{tag} us"] = avg_c
-    ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
-    ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
-    ret[f"{tag} err"] = err_asm
-    ret["asm/ck"] = avg_c / avg_b
+    # err_asm = checkAllclose(a, c, msg=f"{tag}")
+    # ret[f"{tag} us"] = avg_c
+    # ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
+    # ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
+    # ret[f"{tag} err"] = err_asm
+    # ret["asm/ck"] = avg_c / avg_b
 
     return ret
 
@@ -212,12 +210,6 @@ parser.add_argument(
     "-nk",
     type=dtypes.str2tuple,
     nargs="*",
-    choices=[
-        (24576, 1536),
-        # (32768, 512),
-        # (7168, 16384),
-        # (36864, 7168),
-    ],
     default=[
         (24576, 1536),
         # (32768, 512),

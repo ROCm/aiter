@@ -93,11 +93,6 @@ def test_dp_shared_expert_moe(
     return {"us": avg_t, "err": err}
 
 
-list_M = [1, 4, 8, 16, 32, 64, 128, 192, 256, 384, 512, 1024, 8192]
-list_E = [2]
-list_dim = [(5120, 1536)]
-list_q_dtype = [dtypes.i8, dtypes.fp8]
-
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -105,9 +100,8 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "-dim",
     type=dtypes.str2tuple,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    default=[(5120, 1536)],
     help="""Model dimension.
     e.g.: -dim 6144,4096""",
 )
@@ -116,9 +110,8 @@ parser.add_argument(
     "-t",
     "--tokenNum",
     type=int,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    default=[1, 4, 8, 16, 32, 64, 128, 192, 256, 384, 512, 1024, 8192],
     help="""Number of tokens.
     e.g.: -t 1024""",
 )
@@ -126,19 +119,21 @@ parser.add_argument(
 parser.add_argument(
     "-q",
     "--quant",
-    type=int,
-    choices=range(len(list_q_dtype)),
-    default=0,
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["i8"], dtypes.d_dtypes["fp8"]],
+    nargs="*",
+    default=[dtypes.d_dtypes["i8"]],
     help="""select quantization type:
-    0 : aiter.QuantType.per_Token, dtypes.i8, dtypes.i8  # a8w8
-    1: aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8  # a8w8
+    -q i8    # aiter.QuantType.per_Token, dtypes.i8, dtypes.i8  # a8w8
+    -q fp8   # aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8  # a8w8
     """,
 )
 parser.add_argument(
     "-e",
     "--expert",
     type=int,
-    default=8,
+    nargs="*",
+    default=[8],
     help="""Number of experts.
     e.g.: -e 8""",
 )
@@ -152,23 +147,12 @@ parser.add_argument(
 
 args = parser.parse_args()
 
-if args.dim is not None:
-    list_dim = [args.dim]
-
-if args.tokenNum is not None:
-    list_M = [args.tokenNum]
-
-if args.expert is not None:
-    list_E = [args.expert]
-
-if args.quant is not None:
-    list_q_dtype = [list_q_dtype[args.quant]]
 
 df = []
-for q_dtype in list_q_dtype:
-    for model_dim, inter_dim in list_dim:
-        for E in list_E:
-            for M in list_M:
+for q_dtype in args.quant:
+    for model_dim, inter_dim in args.dim:
+        for E in args.expert:
+            for M in args.tokenNum:
                 ret = test_dp_shared_expert_moe(
                     token_num=M,
                     model_dim=model_dim,
