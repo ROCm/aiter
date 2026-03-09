@@ -300,16 +300,6 @@ def _moe_gemm_a8w4(
     off_w_n = pid_n * PACKED_BLOCK_N_W
     W += expt_id * stride_w_e
 
-    if is_x_microscaled:
-        if GatherIndx is None:
-            XMxScale += start_m * stride_x_mx_m
-        offs_x_k_scale = tl.arange(0, MX_SCALE_BLOCK_K)
-        XMxScalePtrs = (
-            XMxScale
-            + offs_x_m.to(index_type)[:, None] * stride_x_mx_m
-            + offs_x_k_scale.to(index_type)[None, :] * stride_x_mx_k
-        )
-
     SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_K, 16]], [BLOCK_M, BLOCK_K], [1, 0]
     )
