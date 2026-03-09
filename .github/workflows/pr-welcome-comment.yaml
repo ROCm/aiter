@@ -31,6 +31,7 @@ jobs:
             |-------|-------|
             | \`ci:sglang\` | SGLang integration tests |
             | \`ci:atom\` | ATOM benchmark (DeepSeek-R1 + GPT-OSS) |
+            | \`ci:multi-gpu\` | Multi-GPU op tests (8 GPU) |
             | \`ci:vllm\` | vLLM benchmark |
             | \`ci:all\` | All of the above |
 
