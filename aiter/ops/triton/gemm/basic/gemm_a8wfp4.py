@@ -86,7 +86,7 @@ def gemm_a8wfp4(
                 (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=y.device
             )
     else:
-        2 * K
+        SPLITK_BLOCK_SIZE = 2 * K
         y_pp = None
 
     grid = lambda META: (  # noqa: E731

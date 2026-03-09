@@ -68,8 +68,7 @@ def run_benchmark(args):
         q_fp8 = q.to(e4m3_dtype)
         kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
 
-        def func():
-            return fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke)
+        func = lambda: fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke)
 
         time_ms = triton.testing.do_bench(func, warmup=25, rep=100)
         tflops = calculate_tflops(ks, ke, num_heads_q, head_dim, time_ms)

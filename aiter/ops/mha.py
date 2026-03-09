@@ -1454,7 +1454,7 @@ def can_impl_fmha_v3_bwd(
         npssk &= (batch_stride_dv / batch_stride_v) == (nhead_q / nhead_k)
 
         hd128_case = (hdim_q == 128) and npssk
-        hd64_case = (hdim_q == 64 and not is_v3_atomic_fp32) and npssk
+        hd64_case = (hdim_q == 64 and is_v3_atomic_fp32 == False) and npssk
         ret = hd128_case or hd64_case
         ret &= not swa
 
@@ -1474,7 +1474,7 @@ def can_impl_fmha_v3_bwd(
         # bwd_hd64_fp16_a32_pssk
         # bwd_hd64_fp16_causal_a32_pssk
         # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
-        ret = hdim_q == 64 and is_v3_atomic_fp32
+        ret = hdim_q == 64 and is_v3_atomic_fp32 == True
         ret &= not swa
 
         return ret
@@ -1489,7 +1489,7 @@ def can_impl_fmha_v3_bwd(
         # bwd_hd128_bf16_causal_a16_rtz_pddv
         # bwd_hd128_fp16_a16_pddv
         # bwd_hd128_fp16_causal_a16_pddv
-        ret = not is_v3_atomic_fp32
+        ret = is_v3_atomic_fp32 == False
         ret &= hdim_q > 64 and hdim_q < 128
         ret &= seqlen_q == seqlen_k
         ret &= seqlen_k % 64 == 0
@@ -1525,7 +1525,7 @@ def can_impl_fmha_v3_bwd(
         # bwd_hd192_bf16_causal_a32_rtne_psskddv
         # bwd_hd192_bf16_causal_a32_rtna_psskddv
         # bwd_hd192_bf16_causal_a32_rtz_psskddv
-        ret = is_v3_atomic_fp32
+        ret = is_v3_atomic_fp32 == True
         ret &= hdim_q > 64 and hdim_q <= 192
         ret &= nmask or mask or (swa and hdim_q > 64 and hdim_q <= 128)
 
@@ -1636,6 +1636,7 @@ def _flash_attn_backward(
 
     _, seqlen_q, nhead_q, hdim_q = q.shape
     _, seqlen_k, nhead_k, hdim_v = v.shape
+    nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
     swa = (window_size_left > 0) or (window_size_right > 0)
 
     # only 1 block when sk <= 256, thus deterministic
@@ -2022,6 +2023,10 @@ def _flash_attn_varlen_forward(
     window_size_left = -1 if window_size_left >= max_seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= max_seqlen_k else window_size_right
     sink_size = 0 if sink_size >= max_seqlen_k else sink_size
+    mask = causal == True and window_size_left == -1  # causal mask
+    nmask = (
+        causal == False and window_size_left == -1 and window_size_right == -1
+    )  # no mask
     swa = (window_size_left > 0) or (window_size_right > 0)
 
     def is_fmha_v3_fp8():
@@ -2176,6 +2181,10 @@ def _flash_attn_varlen_backward(
     # mask
     window_size_left = -1 if window_size_left >= max_seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= max_seqlen_k else window_size_right
+    mask = causal == True and window_size_left == -1  # causal mask
+    nmask = (
+        causal == False and window_size_left == -1 and window_size_right == -1
+    )  # no mask
     swa = (window_size_left > 0) or (window_size_right > 0)
 
     def pssk():
@@ -2200,8 +2209,8 @@ def _flash_attn_varlen_backward(
         # bwd_hd128_fp16_a32_pssk_group
         # bwd_hd128_fp16_causal_a32_pssk_group
         ret = (
-            is_v3_atomic_fp32  # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
-        )
+            is_v3_atomic_fp32 == True
+        )  # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
         ret &= hdim_q == 64 or hdim_q == 128
 
         return ret
@@ -2216,8 +2225,8 @@ def _flash_attn_varlen_backward(
         # bwd_hd128_fp16_a32_psskddv_group
         # bwd_hd128_fp16_causal_a32_psskddv_group
         ret = (
-            is_v3_atomic_fp32  # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
-        )
+            is_v3_atomic_fp32 == True
+        )  # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
         ret &= hdim_q >= 64 and hdim_q <= 192
 
         return ret
@@ -2229,7 +2238,7 @@ def _flash_attn_varlen_backward(
         # ret &= bias is None
         # ret &= dbias is None
         ret &= dropout_p == 0.0
-        ret &= not deterministic
+        ret &= deterministic == False
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
         ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
@@ -2244,7 +2253,7 @@ def _flash_attn_varlen_backward(
         # ret &= bias is None
         # ret &= dbias is None
         ret &= dropout_p == 0.0
-        ret &= not deterministic
+        ret &= deterministic == False
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
         ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0

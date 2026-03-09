@@ -106,7 +106,7 @@ def ref_compute(
     device="cuda",
 ):
     B, H = q.shape[0], q.shape[1]
-    kv_indptr[1].item()
+    S = kv_indptr[1].item()
 
     qk_rope_head_dim = k_input.shape[-1] - kv_lora_rank
 
@@ -184,7 +184,7 @@ def ref_compute_full_fwd(
 ):
 
     B, H = q.shape[0], q.shape[1]
-    kv_indptr[1].item()
+    S = kv_indptr[1].item()
 
     qk_rope_head_dim = k_input.shape[-1] - kv_lora_rank
 

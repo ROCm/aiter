@@ -116,7 +116,7 @@ def call_ccl_allgather_naive(
     x = x.to(device)
 
     # warmup and align all gpu
-    get_tp_group().device_group
+    group = get_tp_group().device_group
     torch.cuda.synchronize()
 
     for i in range(loop_time):

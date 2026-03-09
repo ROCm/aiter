@@ -1523,7 +1523,7 @@ def rope_fwd_3d(
     c_total = C // 2  # 64
     c1 = c_total - 2 * (c_total // 3)  # 22
     c2 = c_total // 3  # 21
-    c_total // 3  # 21
+    c3 = c_total // 3  # 21
     device = x.device
 
     grid_sizes = grid_sizes.to(device=device, dtype=torch.int32).contiguous()

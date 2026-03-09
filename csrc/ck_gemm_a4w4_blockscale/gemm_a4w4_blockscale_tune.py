@@ -168,6 +168,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         tunedf,
         args,
     ):
+        issorted = args.sort
         useSplitK = args.splitK
         mp_num = args.mp
         shape_grouped = False

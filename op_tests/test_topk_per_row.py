@@ -204,7 +204,7 @@ def test_top_k_per_row_prefill(
     # Create output tensors
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
 
-    torch.empty((num_rows, top_k), dtype=torch.float32, device="cuda").fill_(0)
+    values = torch.empty((num_rows, top_k), dtype=torch.float32, device="cuda").fill_(0)
 
     # Run the kernel
     _, us = run_top_k_per_row_prefill(

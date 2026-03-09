@@ -763,7 +763,7 @@ def la_persistent_inner(
                 k * cap_high,
                 total_high_capacity + (k - ctas_high_avail) * cap_low,
             )
-            tl.minimum(remaining, cap_by_k)
+            covered = tl.minimum(remaining, cap_by_k)
 
             # final last_cta after loop is start_cta + number_of_iterations_performed
             last_cta = start_cta + ctas_to_use

@@ -82,6 +82,7 @@ def test_moe_sorting(
     padding_token=False,
     dispatch_policy=0,
 ):
+    dim = (token, model_dim, inter_dim)
     input = torch.randn((token, model_dim), dtype=dtype, device="cuda")
     score = torch.rand((token, E), device="cuda", dtype=dtype)
 

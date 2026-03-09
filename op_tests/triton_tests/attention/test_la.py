@@ -356,7 +356,7 @@ def test_persistent_lean_attention(
 
     assert batch == len(n_ctx)
     try:
-        sum(int(n) for n in n_ctx)
+        sum_n_ctx = sum(int(n) for n in n_ctx)
     except ValueError:
         print(f"N_CTX contains non-numeric values: {n_ctx}")
 
@@ -562,7 +562,7 @@ def main():
     assert batch == len(n_ctx)
 
     try:
-        sum(int(n) for n in n_ctx)
+        sum_n_ctx = sum(int(n) for n in n_ctx)
     except ValueError:
         print(f"N_CTX contains non-numeric values: {n_ctx}")
     print(f"causal={causal}, batch={batch}")

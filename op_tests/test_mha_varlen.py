@@ -327,7 +327,7 @@ def run_ck_seq_padding(
     out_batches = []
     for i in range(batch_size):
         start = int(cu_seqlens_q_padded[i].item())
-        int(cu_seqlens_q_padded[i + 1].item())
+        end = int(cu_seqlens_q_padded[i + 1].item())
         keep = q_actual_lens[i]
         out_batch = torch.zeros(q.size(1), nheads, d_v, dtype=dtype, device=device)
         out_batch[:keep] = out_flat[start : start + keep]

@@ -5,7 +5,7 @@ import torch
 import aiter
 from aiter.test_common import checkAllclose, run_perftest, benchmark
 from aiter import dtypes
-from aiter import pertoken_quant, indexer_k_quant_and_cache
+from aiter import pertoken_quant, dtypes, indexer_k_quant_and_cache
 import argparse
 import pandas as pd
 

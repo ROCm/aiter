@@ -76,6 +76,7 @@ class BatchedGemmBf16Tuner(GemmCommonTuner):
         tunedf,
         args,
     ):
+        issorted = args.sort
         useSplitK = args.splitK
         mp_num = args.mp
         shape_grouped = False

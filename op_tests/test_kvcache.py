@@ -19,6 +19,8 @@ def run_torch(
 ):
     num_batch, num_tokens, num_heads, head_size = key.shape
     num_blocks = k_cache.shape[0]
+    dtype = k_cache.dtype
+    device = k_cache.device
 
     k_scale = None
     v_scale = None

@@ -1736,8 +1736,8 @@ def cktile_moe_stage2(
     k_pad_zeros=0,
     bias2=None,
 ):
-    a2.shape[0]
-    w2.shape[1]
+    token_num = a2.shape[0]
+    D = w2.shape[1]
     # max_num_tokens_padded = sorted_expert_ids.shape[0]*block_size
 
     # out = torch.empty(

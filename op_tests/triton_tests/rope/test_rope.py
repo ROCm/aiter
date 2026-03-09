@@ -1103,7 +1103,7 @@ def test_rope_2d_fwd(
 
 
 def rope_fwd_3d_torch(x, grid_sizes, freqs, sp_size, sp_rank):
-    x.size(0)
+    B = x.size(0)
     s = x.size(1)
     n = x.size(2)
     c = x.size(3) // 2
@@ -1127,7 +1127,7 @@ def rope_fwd_3d_torch(x, grid_sizes, freqs, sp_size, sp_rank):
             ],
             dim=-1,
         ).reshape(seq_len, 1, -1)
-        freqs_i.real.sum()
+        merged_real_sum = freqs_i.real.sum()
         freqs_i = pad_freqs(freqs_i, s * sp_size)
         s_per_rank = s
         freqs_i_rank = freqs_i[

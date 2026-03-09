@@ -6,7 +6,7 @@ import aiter
 from aiter.test_common import checkAllclose, run_perftest, benchmark
 from aiter.ops.triton.topk import topk
 from aiter.ops.triton.softmax import softmax
-from aiter import dtypes
+from aiter import dtypes, greedy_sample, random_sample
 import argparse
 
 torch.set_default_device("cuda")

@@ -144,15 +144,15 @@ class Gemma8W8BlockScaleBPreShuffleTuner(GemmCommonTuner):
         useSplitK = args.splitK
         shape_grouped = False
         mp_num = args.mp
-        self.get_cu_num()
+        cu_num = self.get_cu_num()
         task = []
         tasks_data = []
 
         seed = 0
         for i in range(len(untunedf)):
-            untunedf.loc[i, "M"]
-            untunedf.loc[i, "N"]
-            untunedf.loc[i, "K"]
+            M = untunedf.loc[i, "M"]
+            N = untunedf.loc[i, "N"]
+            K = untunedf.loc[i, "K"]
             seed = seed + 1
             total_kernel_nums = 0
 

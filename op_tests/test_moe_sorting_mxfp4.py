@@ -4,7 +4,7 @@ import torch
 import aiter
 from aiter.test_common import checkAllclose, benchmark, run_perftest, perftest
 from aiter.fused_moe import moe_sorting, fused_topk
-from aiter import dtypes
+from aiter import get_torch_quant, dtypes
 from aiter.utility import fp4_utils
 import pandas as pd
 import itertools

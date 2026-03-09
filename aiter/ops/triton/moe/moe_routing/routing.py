@@ -215,11 +215,8 @@ def _compute_expt_data_internal(n_expts_tot, n_gates, block_m, device):
         max_n_tiles = n_gates
     else:
         max_n_tiles = n_expts_tot - 1 - ((n_expts_tot - n_gates - 1) // block_m)
-
     # allocate memory
-    def pad(x):
-        return cdiv(x, BLOCK) * BLOCK
-
+    pad = lambda x: cdiv(x, BLOCK) * BLOCK
     dtype = torch.int32
 
     token_offs_combined = torch.empty(

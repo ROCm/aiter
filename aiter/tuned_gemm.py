@@ -337,7 +337,7 @@ def hipb_gemm(
     if otype is None:
         otype = inp.dtype
     global extensions_created
-    if not extensions_created:
+    if extensions_created == False:
         hipb_create_extension()
         extensions_created = True
     return hipb_mm(

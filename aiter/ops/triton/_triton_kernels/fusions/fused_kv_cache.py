@@ -761,6 +761,7 @@ def _fused_qk_rope_cosine_cache_llama_kernel(
                 ).to(d_cos_offs.dtype)
             else:
                 d_cos_offs = d_pe_offs // 2
+                d_cos_mask = d_cos_offs < BLOCK_D_HALF_pe
 
         else:
             d_cos_offs = d_pe_offs

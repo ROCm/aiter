@@ -22,8 +22,8 @@ def run_torch(x, weight, w_scale, dtype=torch.bfloat16):
     block_shape_n, block_shape_k = block_shape
     m, k = x.shape
     n = weight.shape[0]
-    (n + block_shape_n - 1) // block_shape_n
-    (k + block_shape_k - 1) // block_shape_k
+    scale_n = (n + block_shape_n - 1) // block_shape_n
+    scale_k = (k + block_shape_k - 1) // block_shape_k
 
     # the pre-quant version now has accuracy issues
     # x, x_scale = per_token_fp8_group_quant(x, weight.dtype, block_shape_k)

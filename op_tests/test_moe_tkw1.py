@@ -168,6 +168,9 @@ def test_fmoe(
     # ref implement
     # w1a = permute_weight_a(w1)
     # w2a = permute_weight_a(w2)
+    w1a = w1
+    w2a = w2
+    avg_a = 1
     # ref1, avg_a = vllm_moe(input,
     #                        w1a,
     #                        w2a,

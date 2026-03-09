@@ -233,7 +233,7 @@ def asm_moe(
                 logger.warning("FMOE fall into pure torch quant...")
                 a8, a8_scale = aiter.pertoken_quant(hidden_states, quant_dtype=w1.dtype)
         if w2.shape[2] * lastdim_mul == w1.shape[1]:
-            aiter.fmoe_int8_g1u0(
+            fmoe_func = aiter.fmoe_int8_g1u0(
                 moe_buf,
                 a8,
                 w1,
