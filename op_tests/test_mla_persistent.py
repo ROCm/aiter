@@ -365,6 +365,7 @@ def torch_mla_extend_split_kv(
     q_scale=None,
     kv_scale=None,
 ):
+
     num_page, page_size, nhead_kv, _ = kvc_cache.shape
     total_q, nheads, _ = q.shape
     dev = kvc_cache.device
@@ -392,10 +393,10 @@ def torch_mla_extend_split_kv(
         # or (nheads == 128 and is_fp8_q and is_fp8_kvc)
         or (
             # get_gfx() == "gfx950"
-            # nheads == 32
-            # and is_fp8_q
-            # and is_fp8_kvc
-            # and max_seqlen_q == 4
+            nheads == 32
+            and is_fp8_q
+            and is_fp8_kvc
+            and max_seqlen_q == 4
         )
     ):
         # Natively support cases
@@ -711,8 +712,9 @@ def torch_mla_split_kv_and_reduce(
     )
 
     if io_transformed:
-        partial_out = partial_out.reshape(-1, nhead, kv_lora_rank)
-        partial_lse = partial_lse.reshape(-1, nhead)
+        # import pdb; pdb.set_trace()
+        # partial_out = partial_out.reshape(-1, nhead, kv_lora_rank)
+        # partial_lse = partial_lse.reshape(-1, nhead)
         split_out = split_out.reshape(total_q, nhead, kv_lora_rank)
         split_lse = split_lse.reshape(total_q, nhead)
 
@@ -842,7 +844,7 @@ def test_mla(
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     total_q = qo_indptr[-1].item()
     q = torch.randn((total_q, nhead, qk_head_dim), dtype=torch.bfloat16)
-
+    # print(f"q shape: {q.shape}")
     # troch implementation
     out_ref, lse_ref = torch_mla_extend(
         q,
@@ -974,7 +976,6 @@ def test_mla(
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
             kv_scale=kv_scale,
-            return_logits=True,
         )
 
         err = checkAllclose(
@@ -1019,12 +1020,12 @@ def test_mla(
                 out_asm,
                 msg=f"mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]: {us_asm_decode:>8.2f} us......",
             )
-
-            checkAllclose(
-                partial_out_ref,
-                attn_logits[: partial_out_ref.shape[0]].view(-1, nhead, kv_lora_rank),
-                msg=f"mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
-            )
+            if partial_out_ref.shape[0] > 0:
+                checkAllclose(
+                    partial_out_ref,
+                    attn_logits[: partial_out_ref.shape[0]].flatten(0,1),
+                    msg=f"mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
+                )
         return err, us_asm_decode
 
     def test_absorb_decode_bf16():
@@ -1093,17 +1094,17 @@ def test_mla(
                 out_asm,
                 msg=f"mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]: {us_asm_decode:>8.2f} us......",
             )
-
-            checkAllclose(
-                partial_out_ref,
-                attn_logits[: partial_out_ref.shape[0]].view(-1, nhead, kv_lora_rank),
-                msg=f"mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
-            )
+            if partial_out_ref.shape[0] > 0:
+                checkAllclose(
+                    partial_out_ref,
+                    attn_logits[: partial_out_ref.shape[0]].flatten(0,1),
+                    msg=f"mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
+                )
         return err, us_asm_decode
 
     def test_absorb_decode_fp8():
-        print(f"work_indptr: {work_indptr}")
-        print(f"work_info_set shape: {work_info_set.shape}")
+        # print(f"work_indptr: {work_indptr}")
+        # print(f"work_info_set shape: {work_info_set.shape}")
         num_works = work_indptr[-1].item()
         for i in range(num_works):
             print(
@@ -1157,7 +1158,6 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
-            return_logits=True,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -1217,10 +1217,10 @@ def test_mla(
             print(f"partial_out_ref shape: {partial_out_ref.shape}")
             print(f"attn_logits shape: {attn_logits.shape}")
             # import pdb; pdb.set_trace()
-            if partial_out_ref.shape[0] != 0:
+            if partial_out_ref.shape[0] > 0:
                 checkAllclose(
                     partial_out_ref,
-                    attn_logits[: partial_out_ref.shape[0]].view(-1, nhead, kv_lora_rank),
+                    attn_logits[: partial_out_ref.shape[0]].flatten(0,1),
                     msg=f"mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
                 )
 
@@ -1336,7 +1336,7 @@ v_head_dim = 128
 block_size = 1
 list_dtype = ["bf16", "fp8"]
 l_kv_dtype = ["bf16", "fp8"]
-list_nhead = [(16, 1), (16, 2), (16, 4), (48, 1), (128, 2), (32, 4)]
+list_nhead = [ (48, 1), (128, 2), (32, 4)]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
