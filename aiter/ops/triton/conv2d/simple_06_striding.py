@@ -90,7 +90,7 @@ def conv2d(input_tensor: torch.Tensor , kernel_tensor: torch.Tensor, stride=(1,1
 
     pad_h, pad_w = padding
     dilat_h, dilat_w = dilation
-    stride_h, stride_w = strides
+    stride_h, stride_w = stride
     BLOCK_SIZE_W = 32
     BLOCK_SIZE_H = 32
     BLOCK_SIZE_C = 128
