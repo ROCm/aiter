@@ -342,6 +342,7 @@ Here's a bash script to run `bench_mla_decode.py` with all combinations of flags
 #!/bin/bash
 # Comprehensive benchmark script for bench_mla_decode.py
 # Tests all combinations of parameters
+# Total combinations: 4 (batch) × 4 (seqlen) × 4 (tp) × 2 (dtype) × 2 (rope) × 2 (causal) × 2 (equal_seqlens) = 1,024 combinations
 
 MODEL="deepseek-V3"
 OUTPUT_DIR="mla_decode_benchmark_results"
@@ -350,6 +351,7 @@ mkdir -p $OUTPUT_DIR
 echo "Starting comprehensive MLA decode benchmarks with all combinations..."
 
 # Define parameter arrays
+# Total combinations: 4 × 4 × 4 × 2 × 2 × 2 × 2 = 1,024
 BATCH_SIZES=(1 4 8 16)
 SEQLENS=(512 1024 2048 4096)
 TP_DEGREES=(1 2 4 8)
@@ -477,6 +479,7 @@ Here's a bash script to run `bench_pa_decode.py` with all combinations of flags:
 #!/bin/bash
 # Comprehensive benchmark script for bench_pa_decode.py
 # Tests all combinations of parameters
+# Total combinations: 4 (batch) × 4 (seqlen) × 2 (hq) × 2 (hk) × 2 (dtype) × 3 (kv_cache_dtype) × 2 (compute_type) × 2 (output_type) = 1,536 combinations
 
 MODEL="llama3-70B"
 OUTPUT_DIR="pa_decode_benchmark_results"
@@ -485,6 +488,7 @@ mkdir -p $OUTPUT_DIR
 echo "Starting comprehensive PA decode benchmarks with all combinations..."
 
 # Define parameter arrays
+# Total combinations: 4 × 4 × 2 × 2 × 2 × 3 × 2 × 2 = 1,536
 BATCH_SIZES=(1 4 8 16)
 SEQLENS=(512 1024 2048 4096)
 HQ_VALUES=(32 64)
