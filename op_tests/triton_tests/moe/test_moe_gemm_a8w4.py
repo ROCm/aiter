@@ -13,7 +13,7 @@ from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
     moe_gemm_a8w4,
     moe_gemm_torch,
     swizzle_scales_gfx950,
-    swizzle_scales_gfx1250
+    swizzle_scales_gfx1250,
 )
 
 # numerics utilities
@@ -194,7 +194,7 @@ class Case:
             Case(1000, 704, 800, "mxfloat8_e4m3fn", 8, 2),
             Case(300, 400, 800, "mxfloat8_e4m3fn", 8, 4),
             # smaller tests for gfx1250 ffm
-            Case(16, 512, 512, "float8_e4m3fn", 32, 2), 
+            Case(16, 512, 512, "float8_e4m3fn", 32, 2),
             Case(16, 512, 512, "float8_e4m3fn", 32, 2, hbm_swizzling=True),
             Case(300, 400, 800, "float8_e4m3fn", 8, 4),
         ]
@@ -284,7 +284,7 @@ def test_op(
             swizzle_mx_scale = "GFX1250_SCALE"
             w_scale_tri = swizzle_scales_gfx1250(w_scale_tri)
         else:
-            assert(get_arch() == "gfx950")
+            assert get_arch() == "gfx950"
             swizzle_mx_scale = "CDNA4_SCALE"
             w_scale_tri = swizzle_scales_gfx950(w_scale_tri)
     else:

@@ -9,7 +9,9 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4 as _moe_gemm_a8w4_triton,
     _reduce_grouped,
 )
-from aiter.ops.triton._gluon_kernels.moe.moe_op_gemm_a8w4 import _moe_gemm_a8w4 as _moe_gemm_a8w4_gluon
+from aiter.ops.triton._gluon_kernels.moe.moe_op_gemm_a8w4 import (
+    _moe_gemm_a8w4 as _moe_gemm_a8w4_gluon,
+)
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import get_num_sms
 
@@ -37,7 +39,7 @@ def allocate_output(
     scatter_indx,
     block_m,
     split_k,
-    device
+    device,
 ):
     if routing_data.n_expts_act == 1 or scatter_indx is None:
         y_rows = M
@@ -181,7 +183,9 @@ def swizzle_scales_gfx1250(data):
     num_chunk_k = K_SCALE // SCALE_KWIDTH
 
     data = data.transpose(-1, -2)
-    data = data.view(E, num_chunk_n, 4, preshuffle_factor // 4, num_chunk_k, SCALE_KWIDTH)
+    data = data.view(
+        E, num_chunk_n, 4, preshuffle_factor // 4, num_chunk_k, SCALE_KWIDTH
+    )
     data = data.permute(0, 1, 4, 3, 2, 5).contiguous()
     data = data.view(E, N // preshuffle_factor, K_SCALE * preshuffle_factor)
     data = data.transpose(-1, -2)
@@ -293,7 +297,7 @@ def moe_gemm_a8w4(
     for e in num_experts:
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
     """
-    use_gluon = (get_arch() == "gfx1250")
+    use_gluon = get_arch() == "gfx1250"
     assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
     x_has_mx = x_scales is not None
     if x_has_mx:
@@ -348,7 +352,7 @@ def moe_gemm_a8w4(
         scatter_indx,
         config["block_m"],
         config["split_k"],
-        x.device
+        x.device,
     )
     stride_bias = None if bias is None else bias.stride(0)
     # moe metadata
@@ -405,8 +409,8 @@ def moe_gemm_a8w4(
             config["block_m"],
             config["block_n"],
             config["block_k"],
-            XCD_SWIZZLE = config["xcd_swizzle"],
-            NUM_BUFFERS = config["num_stages"],
+            XCD_SWIZZLE=config["xcd_swizzle"],
+            NUM_BUFFERS=config["num_stages"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             EVEN_K=K % config["block_k"] == 0,
             MASK_K_LIMIT=K % config["block_k"],
