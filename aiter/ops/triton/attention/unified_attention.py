@@ -10,6 +10,8 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     reduce_segments,
 )
 
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
+
 
 def select_2d_config(
     block_size,
@@ -21,35 +23,40 @@ def select_2d_config(
     num_queries_per_kv,
     num_2d_prgms,
 ):
+    arch = get_arch()
+
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
-    TILE_SIZE = 64
-    # in case head_size is large
-    max_num_stages_2d = 4
-    if head_size > 128:
-        max_num_stages_2d = 2
-    if all_decode == False:
-        num_stages_2d = 1
-        num_warps = 2
+
+    TILE_SIZE = 32 if arch.name == "gfx1201" else 16 if arch.is_rdna else 64
+    waves_per_eu = 6 if arch.is_rdna else 2
+
+    max_num_stages_2d = 2 if head_size > 128 else 4
+
+    if not all_decode:
+        num_stages_2d, num_warps = 1, 2
+    elif arch.is_rdna:
+        num_stages_2d, num_warps = 1, 4
+        TILE_SIZE = block_size
     else:
-        num_stages_2d = 3
-        num_warps = 2
+        num_stages_2d, num_warps = 3, 2
         TILE_SIZE = block_size
 
     if max_seqlen_q >= 256:
-        BLOCK_M = 128
-        num_stages_2d = 1
-        num_warps = 4
+        BLOCK_M = 64 if arch.is_rdna else 128
+        num_stages_2d, num_warps = 1, 4
+
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     num_stages_2d = min(max_num_stages_2d, num_stages_2d)
+
     return {
         "BLOCK_M": BLOCK_M,
         "BLOCK_Q": BLOCK_Q,
         "TILE_SIZE": TILE_SIZE,
         "num_warps": num_warps,
         "num_stages": num_stages_2d,
-        "waves_per_eu": 2,
+        "waves_per_eu": waves_per_eu,
     }
 
 
