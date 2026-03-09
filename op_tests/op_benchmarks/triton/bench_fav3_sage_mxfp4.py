@@ -68,7 +68,7 @@ def bench_kernel(q, k, v, args, provider):
             R=R,
         )
 
-    ms = triton.testing.do_bench(fn)
+    ms = triton.testing.do_bench_cudagraph(fn)
     # print("kernel (ms)", ms)
 
     # Metrics calculation (MXFP4 treats elements as 0.5 bytes in memory traffic for Q/K)

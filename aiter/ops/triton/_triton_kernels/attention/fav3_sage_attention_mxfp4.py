@@ -11,6 +11,8 @@ from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
     map_dims,
 )
 
+from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
+
 
 @triton.jit
 def compute_padding_info(seqlen_k, BLOCK_N: tl.constexpr):
@@ -729,7 +731,7 @@ def _compute_mx_quant_and_scale(
     return out_tensor, dequant_scale_exponent
 
 
-def sage_quant_mxfp4(
+def fused_sage_quant_mxfp4(
     q,
     k,
     v,
@@ -743,15 +745,15 @@ def sage_quant_mxfp4(
 
     if layout == "bhsd":
         b, h_qo, qo_len, head_dim = q.shape
-        _, h_kv, kv_len, _ = k.shape
+        _, h_kv, kv_len, _ = v.shape
 
-        stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(1), k.stride(2)
+        stride_bz_v, stride_h_v, stride_seq_v = v.stride(0), v.stride(1), v.stride(2)
 
     elif layout == "bshd":
         b, qo_len, h_qo, head_dim = q.shape
-        _, kv_len, h_kv, _ = k.shape
+        _, kv_len, h_kv, _ = v.shape
 
-        stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(2), k.stride(1)
+        stride_bz_v, stride_h_v, stride_seq_v = v.stride(0), v.stride(2), v.stride(1)
     else:
         raise ValueError(f"Unknown tensor layout: {layout}")
 
@@ -774,7 +776,7 @@ def sage_quant_mxfp4(
     FP8_MAX = torch.finfo(FP8_TYPE).max
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
 
-    BLOCK_K = 128
+    BLOCK_K = 64
     K_NUM_BLKS = (kv_len + BLOCK_K - 1) // BLOCK_K
 
     # Apply K tensor smoothing following SageAttention approach
@@ -787,9 +789,9 @@ def sage_quant_mxfp4(
         v,
         v_fp8,
         v_scale,
-        stride_bz_k,
-        stride_h_k,
-        stride_seq_k,
+        stride_bz_v,
+        stride_h_v,
+        stride_seq_v,
         v_scale.stride(0),
         v_scale.stride(1),
         b,
@@ -1271,1098 +1273,413 @@ def smooth_rotate_downcast_qk(
     return Q_q, Q_descale, K_q, K_descale, delta_s
 
 
-def return_static_random_hadamard(device):
-    return torch.tensor(
-        [
-            [
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-            ],
-            [
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-            ],
-            [
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-            ],
-            [
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-            ],
-            [
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-            ],
-            [
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-            ],
-            [
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-            ],
-            [
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-            ],
-            [
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-            ],
-            [
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-            ],
-            [
-                1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-            ],
-            [
-                1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-            ],
-            [
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-            ],
-            [
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-            ],
-            [
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-            ],
-            [
-                -1,
-                1,
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-            ],
-            [
-                1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-            ],
-            [
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-            ],
-            [
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-            ],
-            [
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-            ],
-            [
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-            ],
-            [
-                1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-            ],
-            [
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-            ],
-            [
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-            ],
-            [
-                -1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-            ],
-            [
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-            ],
-            [
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-            ],
-            [
-                1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-            ],
-            [
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                1,
-            ],
-            [
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-            ],
-            [
-                1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                -1,
-            ],
-            [
-                1,
-                1,
-                -1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                1,
-                1,
-                -1,
-                -1,
-                -1,
-                -1,
-                -1,
-                1,
-                -1,
-                1,
-                1,
-            ],
-        ],
-        dtype=torch.bfloat16,
-        device=device,
+
+def sage_quant_mxfp4(
+    q,
+    k,
+    v,
+    FP8_TYPE,
+    FP8_MAX,
+    BLKQ=128,
+    BLKK=64,
+    sm_scale=None,
+    q_smoothing=False,
+    layout="bshd",
+    USE_RNE=False,
+):
+    v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
+
+    if layout == "bhsd":
+        b, h_qo, qo_len, head_dim = q.shape
+        _, h_kv, kv_len, _ = v.shape
+
+        stride_bz_v, stride_h_v, stride_seq_v = v.stride(0), v.stride(1), v.stride(2)
+
+    elif layout == "bshd":
+        b, qo_len, h_qo, head_dim = q.shape
+        _, kv_len, h_kv, _ = v.shape
+
+        stride_bz_v, stride_h_v, stride_seq_v = v.stride(0), v.stride(2), v.stride(1)
+    else:
+        raise ValueError(f"Unknown tensor layout: {layout}")
+    K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
+
+    # Apply K tensor smoothing following SageAttention approach
+    v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
+
+    v_task_count = b * h_kv * K_NUM_BLKS
+    grid = (v_task_count,)
+
+    padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
+
+    if sm_scale is None:
+        sm_scale = head_dim**-0.5
+
+    q, k, delta_s = rotation_smooth_qk(q, k, BLKQ, block_size=padded_head_dim, q_smoothing=q_smoothing, layout=layout, sm_scale=(sm_scale * 1.4426950408889634))
+    
+    sage_quant_v_kernel[grid](
+        v,
+        v_fp8,
+        v_scale,
+        stride_bz_v,
+        stride_h_v,
+        stride_seq_v,
+        v_scale.stride(0),
+        v_scale.stride(1),
+        b,
+        h_kv,
+        K_NUM_BLKS,
+        kv_len,
+        D=head_dim,
+        BLK_K=BLKK,
+        num_stages=3,
+        num_warps=8,
     )
+
+    downcast_func = downcast_to_mxfp
+
+    q_fp4, q_scale = downcast_func(q, torch.uint8, axis=-1)
+    k_fp4, k_scale = downcast_func(k, torch.uint8, axis=-1)
+
+    return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
+
+
+@triton.jit
+def _rot_q_kernel(
+    Q,
+    Q_rot,
+    Q_mean,
+    R,  # Hadamard matrix
+    sm_scale: tl.constexpr,
+    stride_qb,
+    stride_qh,
+    stride_qm,
+    stride_qd,
+    stride_mb,
+    stride_mh,
+    stride_mm,
+    stride_md,
+    n_heads,
+    seq_len,
+    d_model,
+    q_smoothing: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,  # BLOCK_D is 32
+):
+    # Grid: (batch * n_heads, seq_len // BLOCK_M, d_model // BLOCK_D)
+    pid_bh = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_d = tl.program_id(2)
+
+    pid_h = pid_bh % n_heads
+    pid_b = pid_bh // n_heads
+
+    # Offsets
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+
+    # Load Q block and R (Hadamard)
+    # Q block shape: [BLOCK_M, BLOCK_D]
+    q_ptr = (
+        Q
+        + pid_b * stride_qb
+        + pid_h * stride_qh
+        + offs_m[:, None] * stride_qm
+        + offs_d[None, :] * stride_qd
+    )
+    r_ptr = (
+        R + tl.arange(0, BLOCK_D)[:, None] * BLOCK_D + tl.arange(0, BLOCK_D)[None, :]
+    )
+    q_tile = tl.load(
+        q_ptr, mask=(offs_m[:, None] < seq_len) & (offs_d[None, :] < d_model), other=0.0
+    )
+    r_mat = tl.load(r_ptr)  # 32x32
+
+    # Rotate: Q_rot = Q @ R
+    q_rot_tile = tl.dot(q_tile, r_mat)
+    if sm_scale is not None:
+        q_rot_tile *= sm_scale
+
+    # Store rotated Q
+    rot_ptr = (
+        Q_rot
+        + pid_b * stride_qb
+        + pid_h * stride_qh
+        + offs_m[:, None] * stride_qm
+        + offs_d[None, :] * stride_qd
+    )
+
+    # Calculate mean for the block (reduction over d within the BLOCK_M)
+    # q_mean shape: [B, H, Q_NUM_BLKS, D]
+    if q_smoothing:
+        m_row_mean = (
+            tl.sum(q_rot_tile, axis=0) / BLOCK_M
+        )  # Sum over BLOCK_M -> shape [BLOCK_D]
+
+        q_rot_tile -= m_row_mean[None, :]
+        # Store mean (Atomic add or structured store)
+        # For simplicity in this layout, we store the block-sum
+        # and divide by BLOCK_M in the host or final step
+        mean_ptr = (
+            Q_mean
+            + pid_b * stride_mb
+            + pid_h * stride_mh
+            + pid_m * stride_mm
+            + offs_d * stride_md
+        )
+        tl.store(mean_ptr, m_row_mean)
+
+    tl.store(
+        rot_ptr,
+        q_rot_tile,
+        mask=(offs_m[:, None] < seq_len) & (offs_d[None, :] < d_model),
+    )
+
+
+
+
+@triton.jit
+def _rot_k_only_kernel(
+    K,
+    K_rot,
+    R,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_kd,
+    n_heads,
+    seq_k,
+    d_model,
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_bh = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_d = tl.program_id(2)
+
+    pid_h = pid_bh % n_heads
+    pid_b = pid_bh // n_heads
+
+    offs_n = pid_n * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+
+    # Load K block and R
+    k_ptr = (
+        K
+        + pid_b * stride_kb
+        + pid_h * stride_kh
+        + offs_n[:, None] * stride_kn
+        + offs_d[None, :] * stride_kd
+    )
+    r_ptr = (
+        R + tl.arange(0, BLOCK_D)[:, None] * BLOCK_D + tl.arange(0, BLOCK_D)[None, :]
+    )
+
+    k_tile = tl.load(
+        k_ptr, mask=(offs_n[:, None] < seq_k) & (offs_d[None, :] < d_model), other=0.0
+    )
+    r_mat = tl.load(r_ptr)
+
+    # Rotate K
+    k_rot_tile = tl.dot(k_tile, r_mat)
+
+    # Store
+    rot_ptr = (
+        K_rot
+        + pid_b * stride_kb
+        + pid_h * stride_kh
+        + offs_n[:, None] * stride_kn
+        + offs_d[None, :] * stride_kd
+    )
+    tl.store(
+        rot_ptr,
+        k_rot_tile,
+        mask=(offs_n[:, None] < seq_k) & (offs_d[None, :] < d_model),
+    )
+
+
+@triton.jit
+def _compute_delta_s_kernel(
+    Q_mean,
+    K_rot,
+    Delta_S,
+    stride_mb,
+    stride_mh,
+    stride_mm,
+    stride_md,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_kd,
+    stride_sb,
+    stride_sh,
+    stride_sm,
+    stride_sn,
+    n_heads,
+    seq_k,
+    d_model,
+    BLOCK_N: tl.constexpr,  # Number of K-tokens to process
+):
+    pid_bh = tl.program_id(0)
+    pid_m_q = tl.program_id(1)  # The Q-block index
+    pid_n_k = tl.program_id(2)  # The K-block index
+
+    pid_h = pid_bh % n_heads
+    pid_b = pid_bh // n_heads
+
+    offs_n = pid_n_k * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # Accumulate dot product across the whole d_model
+    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+
+    # Loop over d_model in steps of 32 (our block_size)
+    for d_offset in range(0, d_model, 32):
+        offs_d = d_offset + tl.arange(0, 32)
+
+        # Load Q_mean segment: [32]
+        qm_ptr = (
+            Q_mean
+            + pid_b * stride_mb
+            + pid_h * stride_mh
+            + pid_m_q * stride_mm
+            + offs_d * stride_md
+        )
+        qm_val = tl.load(qm_ptr)
+
+        # Load K_rot segment: [BLOCK_N, 32]
+        kn_ptr = (
+            K_rot
+            + pid_b * stride_kb
+            + pid_h * stride_kh
+            + offs_n[:, None] * stride_kn
+            + offs_d[None, :] * stride_kd
+        )
+        kn_val = tl.load(kn_ptr, mask=offs_n[:, None] < seq_k, other=0.0)
+
+        # Compute dot product for this d-segment
+        acc += tl.sum(qm_val[None, :] * kn_val, axis=1)
+
+    # Store to Delta_S [B, H, Q_BLKS, seq_k]
+    s_ptr = (
+        Delta_S
+        + pid_b * stride_sb
+        + pid_h * stride_sh
+        + pid_m_q * stride_sm
+        + offs_n * stride_sn
+    )
+    tl.store(s_ptr, acc, mask=offs_n < seq_k)
+
+
+def create_random_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
+    # 1. Generate the deterministic Hadamard matrix (H)
+    H = create_hadamard_matrix(block_size, dtype=dtype) / (block_size**0.5)
+    # 2. Create the random diagonal matrix D (represented as a vector for efficiency)
+    # This generates random +1 or -1 for each column
+    random_signs = torch.randint(0, 2, (block_size,), device=device, dtype=torch.int) * 2 - 1
+    # 3. Apply the random signs (H @ D)
+    # Multiplying by a diagonal matrix on the right is equivalent to scaling columns
+    H_tilde = H * random_signs
+    return H_tilde
+
+
+def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing=False, sm_scale=None, layout="bhsd"):
+    # Generate Hadamard Matrix R (Rank 32)
+    # TODO we might want to manually define this matrix
+    R = create_hadamard_matrix(block_size, dtype=q.dtype) / (block_size**0.5)
+    # R = create_random_hadamard_matrix(block_size, dtype=q.dtype)
+    bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
+
+    # shapes
+    b, s_q, h_q, d = map_dims(q.shape, bshd)
+    _, s_k, h_k, _ = map_dims(k.shape, bshd)
+
+    Q_rot = torch.empty_like(q)
+    K_rot = torch.empty_like(k)
+
+    Q_NUM_BLKS = (s_q + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+    K_NUM_BLKS = (s_k + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+
+    # TODO check the dtypes for scales
+    if q_smoothing:
+        q_mean = torch.empty((b, h_q, Q_NUM_BLKS, d), dtype=torch.float32, device=q.device)
+        delta_s = torch.empty(
+            (b, h_q, Q_NUM_BLKS, s_k), dtype=torch.float32, device=q.device
+        )
+    else:
+        q_mean = None
+        delta_s = None
+
+    stride_qb, stride_qm, stride_qh, stride_qd = map_dims(q.stride(), bshd)
+    stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k.stride(), bshd)
+
+    # Launch Q Kernel
+    grid_q = (b * h_q, Q_NUM_BLKS, d // block_size)
+    _rot_q_kernel[grid_q](
+        q,
+        Q_rot,
+        q_mean,
+        R,
+        sm_scale,
+        stride_qb,
+        stride_qh,
+        stride_qm,
+        stride_qd,
+        q_mean.stride(0) if q_smoothing else None,
+        q_mean.stride(1) if q_smoothing else None,
+        q_mean.stride(2) if q_smoothing else None,
+        q_mean.stride(3) if q_smoothing else None,
+        h_q,
+        s_q,
+        d,
+        q_smoothing=q_smoothing,
+        BLOCK_M=BLOCK_SIZE_M,
+        BLOCK_D=block_size,
+    )
+
+    # 2. Rotate K (Only once!)
+    grid_k = (b * h_k, K_NUM_BLKS, d // block_size)
+    _rot_k_only_kernel[grid_k](
+        k,
+        K_rot,
+        R,
+        stride_kb,
+        stride_kh,
+        stride_kn,
+        stride_kd,
+        h_k,
+        s_k,
+        d,
+        BLOCK_M=BLOCK_SIZE_M,
+        BLOCK_D=block_size,
+    )
+
+    # smooth k after rotation
+    K_rot = K_rot - K_rot.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
+
+    if q_smoothing:
+        # 3. Compute Smoothing Delta S
+        # Grid: Each Q-block x Each K-block
+        grid_delta = (b * h_k, Q_NUM_BLKS, K_NUM_BLKS)
+        _compute_delta_s_kernel[grid_delta](
+            q_mean,
+            K_rot,
+            delta_s,
+            q_mean.stride(0),
+            q_mean.stride(1),
+            q_mean.stride(2),
+            q_mean.stride(3),
+            stride_kb,
+            stride_kh,
+            stride_kn,
+            stride_kd,
+            delta_s.stride(0),
+            delta_s.stride(1),
+            delta_s.stride(2),
+            delta_s.stride(3),
+            h_k,
+            s_k,
+            d,
+            BLOCK_N=BLOCK_SIZE_M,
+        )
+
+    return Q_rot, K_rot, delta_s
