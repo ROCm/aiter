@@ -479,11 +479,9 @@ def test_fused_qk_rope_reshape_and_cache_value_shuffle_layout(
     )
     slot_mapping = torch.randint(0, num_blocks * block_size, (T,), device="cuda")
 
-    ref_freqs = (
-        freqs[positions if offsets is None else torch.add(positions, offsets)].squeeze(
-            -2
-        )
-    )
+    ref_freqs = freqs[
+        positions if offsets is None else torch.add(positions, offsets)
+    ].squeeze(-2)
     torch_q = ref_rope_sbhd_fwd(
         q.unsqueeze(0),
         ref_freqs,
@@ -604,7 +602,9 @@ def test_fused_qk_rope_reshape_and_cache_gpt_oss_120b_config_value_shuffle_preci
     v = torch.randn_like(k)
     k_scale = torch.ones(1, dtype=torch.float32, device="cuda")[0]
     v_scale = torch.ones(1, dtype=torch.float32, device="cuda")[0]
-    slot_mapping = torch.randint(0, num_kv_cahce_tokens * block_size, (T,), device="cuda")
+    slot_mapping = torch.randint(
+        0, num_kv_cahce_tokens * block_size, (T,), device="cuda"
+    )
 
     num_blocks = num_kv_cahce_tokens
     slot_chunk_dim = block_size // x_size
@@ -674,10 +674,18 @@ def test_fused_qk_rope_reshape_and_cache_gpt_oss_120b_config_value_shuffle_preci
     )
 
     # Compare outputs: q_out, k_out, key_cache, zeros should match exactly (same kernel path for these)
-    torch.testing.assert_close(q_out_4d, q_out_5d, atol=1e-2, rtol=1e-2, msg="q_out 4D vs 5D")
-    torch.testing.assert_close(k_out_4d, k_out_5d, atol=1e-2, rtol=1e-2, msg="k_out 4D vs 5D")
-    torch.testing.assert_close(kc_4d, kc_5d, atol=1e-2, rtol=1e-2, msg="key_cache 4D vs 5D")
-    torch.testing.assert_close(zeros_4d, zeros_5d, atol=1e-2, rtol=1e-2, msg="zeros_out 4D vs 5D")
+    torch.testing.assert_close(
+        q_out_4d, q_out_5d, atol=1e-3, rtol=1e-3, msg="q_out 4D vs 5D"
+    )
+    torch.testing.assert_close(
+        k_out_4d, k_out_5d, atol=1e-3, rtol=1e-3, msg="k_out 4D vs 5D"
+    )
+    torch.testing.assert_close(
+        kc_4d, kc_5d, atol=1e-3, rtol=1e-3, msg="key_cache 4D vs 5D"
+    )
+    torch.testing.assert_close(
+        zeros_4d, zeros_5d, atol=1e-3, rtol=1e-3, msg="zeros_out 4D vs 5D"
+    )
 
     # Compare value_cache slot-by-slot: vc_4d[slot_t,:,:,slot_b] vs vc_5d[slot_t,:,slot_b//x,:,slot_b%x]
     slot_t = slot_mapping // block_size
@@ -689,8 +697,8 @@ def test_fused_qk_rope_reshape_and_cache_gpt_oss_120b_config_value_shuffle_preci
         torch.testing.assert_close(
             v4,
             v5,
-            atol=1e-2,
-            rtol=1e-2,
+            atol=1e-3,
+            rtol=1e-3,
             msg=f"value_cache at slot {i} (block={st}, slot_in_block={sb}) 4D vs 5D",
         )
 

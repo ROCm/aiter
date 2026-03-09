@@ -397,8 +397,16 @@ def fused_qk_rope_reshape_and_cache(
         key_cache.stride(4) if not flash_layout else 0,
         value_cache.stride(0) if not flash_layout else value_cache.stride(0),
         value_cache.stride(1) if not flash_layout else value_cache.stride(2),
-        value_cache.stride(3) if (not flash_layout and value_shuffle_layout) else (value_cache.stride(2) if not flash_layout else value_cache.stride(3)),
-        0 if (not flash_layout and value_shuffle_layout) else (value_cache.stride(3) if not flash_layout else value_cache.stride(1)),
+        (
+            value_cache.stride(3)
+            if (not flash_layout and value_shuffle_layout)
+            else (value_cache.stride(2) if not flash_layout else value_cache.stride(3))
+        ),
+        (
+            0
+            if (not flash_layout and value_shuffle_layout)
+            else (value_cache.stride(3) if not flash_layout else value_cache.stride(1))
+        ),
         value_cache.stride(2) if (not flash_layout and value_shuffle_layout) else 0,
         value_cache.stride(4) if (not flash_layout and value_shuffle_layout) else 0,
         zeros_out.stride(0) if zeros_out is not None else 0,
