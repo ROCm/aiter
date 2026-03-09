@@ -938,9 +938,9 @@ def sage_fwd(
     ACCUMULATOR_TYPE = tl.float32  # for q*k product
 
     # compute offsets
-    start_m = tl.program_id(0)
-    off_h_q = tl.program_id(1)
-    off_z = tl.program_id(2)
+    start_m = tl.program_id(0).to(tl.int64)
+    off_h_q = tl.program_id(1).to(tl.int64)
+    off_z = tl.program_id(2).to(tl.int64)
     # If MQA / GQA, set the K and V head offsets appropriately.
     GROUP_SIZE: tl.constexpr = HQ // HK
     if GROUP_SIZE != 1:
@@ -1620,7 +1620,7 @@ def sage_quant_kernel(
     BLK_Q: tl.constexpr,
     BLK_K: tl.constexpr,
 ):
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
 
     offs_blk_q = tl.arange(0, BLK_Q)
     offs_blk_k = tl.arange(0, BLK_K)

@@ -415,7 +415,7 @@ def sage_fwd_mxfp4(
     SCALE_GROUP: tl.constexpr = 32
     ACC_TYPE: tl.constexpr = tl.float32
 
-    start_m, off_h_q, off_z = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    start_m, off_h_q, off_z = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
     off_h_k = off_h_q // (HQ // HK)
 
     PADDED_HEAD_QK: tl.constexpr = ACTUAL_BLOCK_DMODEL_QK != BLOCK_DMODEL_QK
@@ -509,7 +509,7 @@ def sage_fwd_mxfp4(
             + off_z * stride_bz
             + off_h_q * stride_bh
             + start_m * stride_bm
-            + offs_n.to(tl.int64) * stride_bn
+            + offs_n * stride_bn
         )
         if USE_BIAS
         else None
@@ -747,19 +747,19 @@ def fused_sage_quant_mxfp4(
         b, h_qo, qo_len, head_dim = q.shape
         _, h_kv, kv_len, _ = v.shape
 
-        stride_bz_v, stride_h_v, stride_seq_v = v.stride(0), v.stride(1), v.stride(2)
+        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = v.stride(0), v.stride(1), v.stride(2), v.stride(3)
 
     elif layout == "bshd":
         b, qo_len, h_qo, head_dim = q.shape
         _, kv_len, h_kv, _ = v.shape
 
-        stride_bz_v, stride_h_v, stride_seq_v = v.stride(0), v.stride(2), v.stride(1)
+        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = v.stride(0), v.stride(2), v.stride(1), v.stride(3)
     else:
         raise ValueError(f"Unknown tensor layout: {layout}")
 
     # padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
     sm_scale = head_dim**-0.5
-
+    
     q_fp4, q_scale, k_fp4, k_scale, delta_s = smooth_rotate_downcast_qk(
         q,
         k,
@@ -784,7 +784,6 @@ def fused_sage_quant_mxfp4(
 
     v_task_count = b * h_kv * K_NUM_BLKS
     grid = (v_task_count,)
-
     sage_quant_v_kernel[grid](
         v,
         v_fp8,
@@ -792,6 +791,7 @@ def fused_sage_quant_mxfp4(
         stride_bz_v,
         stride_h_v,
         stride_seq_v,
+        stride_d_v,
         v_scale.stride(0),
         v_scale.stride(1),
         b,
@@ -815,6 +815,7 @@ def sage_quant_v_kernel(
     stride_kz,
     stride_kh,
     stride_kn,
+    stride_kd,
     stride_vsz,
     stride_vsh,
     BATCH,
@@ -824,7 +825,7 @@ def sage_quant_v_kernel(
     D: tl.constexpr,
     BLK_K: tl.constexpr,
 ):
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
 
     offs_blk_k = tl.arange(0, BLK_K)
     offs_d = tl.arange(0, D)
@@ -837,7 +838,7 @@ def sage_quant_v_kernel(
         off_b * stride_kz
         + off_h * stride_kh
         + offs_kn[:, None] * stride_kn
-        + offs_d[None, :]
+        + offs_d[None, :] * stride_kd
     )
 
     v_input_ptrs = V_Input + v_offs
@@ -1104,7 +1105,7 @@ def _compute_delta_s_kernel(
     tl.store(s_ptr, acc, mask=offs_n < seq_k)
 
 
-@functools.lru_cache(maxsize=16)
+# @functools.lru_cache(maxsize=16)
 def create_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
     """
     Returns a Hadamard matrix of size block_size x block_size. Remember to normalize with sqrt(block_size) for it to be orthogonal.
@@ -1293,13 +1294,13 @@ def sage_quant_mxfp4(
         b, h_qo, qo_len, head_dim = q.shape
         _, h_kv, kv_len, _ = v.shape
 
-        stride_bz_v, stride_h_v, stride_seq_v = v.stride(0), v.stride(1), v.stride(2)
+        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v= v.stride(0), v.stride(1), v.stride(2), v.stride(3)
 
     elif layout == "bshd":
         b, qo_len, h_qo, head_dim = q.shape
         _, kv_len, h_kv, _ = v.shape
 
-        stride_bz_v, stride_h_v, stride_seq_v = v.stride(0), v.stride(2), v.stride(1)
+        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = v.stride(0), v.stride(2), v.stride(1), v.stride(3)
     else:
         raise ValueError(f"Unknown tensor layout: {layout}")
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
@@ -1314,9 +1315,10 @@ def sage_quant_mxfp4(
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
-
-    q, k, delta_s = rotation_smooth_qk(q, k, BLKQ, block_size=padded_head_dim, q_smoothing=q_smoothing, layout=layout, sm_scale=(sm_scale * 1.4426950408889634))
     
+    q, k, delta_s = rotation_smooth_qk(q, k, BLKQ, block_size=padded_head_dim, q_smoothing=q_smoothing, layout=layout, sm_scale=(sm_scale * 1.4426950408889634))
+
+
     sage_quant_v_kernel[grid](
         v,
         v_fp8,
@@ -1324,6 +1326,7 @@ def sage_quant_mxfp4(
         stride_bz_v,
         stride_h_v,
         stride_seq_v,
+        stride_d_v,
         v_scale.stride(0),
         v_scale.stride(1),
         b,
@@ -1355,10 +1358,16 @@ def _rot_q_kernel(
     stride_qh,
     stride_qm,
     stride_qd,
+    stride_qob,
+    stride_qoh,
+    stride_qom,
+    stride_qod,
     stride_mb,
     stride_mh,
     stride_mm,
     stride_md,
+    stride_rm,
+    stride_rd,
     n_heads,
     seq_len,
     d_model,
@@ -1367,9 +1376,9 @@ def _rot_q_kernel(
     BLOCK_D: tl.constexpr,  # BLOCK_D is 32
 ):
     # Grid: (batch * n_heads, seq_len // BLOCK_M, d_model // BLOCK_D)
-    pid_bh = tl.program_id(0)
-    pid_m = tl.program_id(1)
-    pid_d = tl.program_id(2)
+    pid_bh = tl.program_id(0).to(tl.int64)
+    pid_m = tl.program_id(1).to(tl.int64)
+    pid_d = tl.program_id(2).to(tl.int64)
 
     pid_h = pid_bh % n_heads
     pid_b = pid_bh // n_heads
@@ -1382,13 +1391,13 @@ def _rot_q_kernel(
     # Q block shape: [BLOCK_M, BLOCK_D]
     q_ptr = (
         Q
-        + pid_b * stride_qb
+        + (pid_b * stride_qb)
         + pid_h * stride_qh
         + offs_m[:, None] * stride_qm
         + offs_d[None, :] * stride_qd
     )
     r_ptr = (
-        R + tl.arange(0, BLOCK_D)[:, None] * BLOCK_D + tl.arange(0, BLOCK_D)[None, :]
+        R + tl.arange(0, BLOCK_D)[:, None] * stride_rm + tl.arange(0, BLOCK_D)[None, :] * stride_rd
     )
     q_tile = tl.load(
         q_ptr, mask=(offs_m[:, None] < seq_len) & (offs_d[None, :] < d_model), other=0.0
@@ -1403,10 +1412,10 @@ def _rot_q_kernel(
     # Store rotated Q
     rot_ptr = (
         Q_rot
-        + pid_b * stride_qb
-        + pid_h * stride_qh
-        + offs_m[:, None] * stride_qm
-        + offs_d[None, :] * stride_qd
+        + (pid_b * stride_qob)
+        + pid_h * stride_qoh
+        + offs_m[:, None] * stride_qom
+        + offs_d[None, :] * stride_qod
     )
 
     # Calculate mean for the block (reduction over d within the BLOCK_M)
@@ -1422,7 +1431,7 @@ def _rot_q_kernel(
         # and divide by BLOCK_M in the host or final step
         mean_ptr = (
             Q_mean
-            + pid_b * stride_mb
+            + (pid_b * stride_mb)
             + pid_h * stride_mh
             + pid_m * stride_mm
             + offs_d * stride_md
@@ -1447,15 +1456,21 @@ def _rot_k_only_kernel(
     stride_kh,
     stride_kn,
     stride_kd,
+    stride_kob,
+    stride_koh,
+    stride_kon,
+    stride_kod,
+    stride_rm,
+    stride_rd,
     n_heads,
     seq_k,
     d_model,
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    pid_bh = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    pid_d = tl.program_id(2)
+    pid_bh = tl.program_id(0).to(tl.int64)
+    pid_n = tl.program_id(1).to(tl.int64)
+    pid_d = tl.program_id(2).to(tl.int64)
 
     pid_h = pid_bh % n_heads
     pid_b = pid_bh // n_heads
@@ -1466,13 +1481,13 @@ def _rot_k_only_kernel(
     # Load K block and R
     k_ptr = (
         K
-        + pid_b * stride_kb
-        + pid_h * stride_kh
+        + (pid_b * stride_kb)
+        + (pid_h * stride_kh)
         + offs_n[:, None] * stride_kn
         + offs_d[None, :] * stride_kd
     )
     r_ptr = (
-        R + tl.arange(0, BLOCK_D)[:, None] * BLOCK_D + tl.arange(0, BLOCK_D)[None, :]
+        R + tl.arange(0, BLOCK_D)[:, None] * stride_rm + tl.arange(0, BLOCK_D)[None, :] * stride_rd
     )
 
     k_tile = tl.load(
@@ -1486,10 +1501,10 @@ def _rot_k_only_kernel(
     # Store
     rot_ptr = (
         K_rot
-        + pid_b * stride_kb
-        + pid_h * stride_kh
-        + offs_n[:, None] * stride_kn
-        + offs_d[None, :] * stride_kd
+        + (pid_b * stride_kob)
+        + pid_h * stride_koh
+        + offs_n[:, None] * stride_kon
+        + offs_d[None, :] * stride_kod
     )
     tl.store(
         rot_ptr,
@@ -1520,9 +1535,9 @@ def _compute_delta_s_kernel(
     d_model,
     BLOCK_N: tl.constexpr,  # Number of K-tokens to process
 ):
-    pid_bh = tl.program_id(0)
-    pid_m_q = tl.program_id(1)  # The Q-block index
-    pid_n_k = tl.program_id(2)  # The K-block index
+    pid_bh = tl.program_id(0).to(tl.int64)
+    pid_m_q = tl.program_id(1).to(tl.int64)  # The Q-block index
+    pid_n_k = tl.program_id(2).to(tl.int64) # The K-block index
 
     pid_h = pid_bh % n_heads
     pid_b = pid_bh // n_heads
@@ -1584,8 +1599,11 @@ def create_random_hadamard_matrix(block_size, device="cuda", dtype=torch.float32
 
 def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing=False, sm_scale=None, layout="bhsd"):
     # Generate Hadamard Matrix R (Rank 32)
-    # TODO we might want to manually define this matrix
+    # TODO we might want to manually define this matri
     R = create_hadamard_matrix(block_size, dtype=q.dtype) / (block_size**0.5)
+
+
+    
     # R = create_random_hadamard_matrix(block_size, dtype=q.dtype)
     bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
 
@@ -1610,8 +1628,9 @@ def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing=False,
         delta_s = None
 
     stride_qb, stride_qm, stride_qh, stride_qd = map_dims(q.stride(), bshd)
+    stride_qob, stride_qom, stride_qoh, stride_qod = map_dims(Q_rot.stride(), bshd)
     stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k.stride(), bshd)
-
+    stride_kob, stride_kon, stride_koh, stride_kod = map_dims(K_rot.stride(), bshd)
     # Launch Q Kernel
     grid_q = (b * h_q, Q_NUM_BLKS, d // block_size)
     _rot_q_kernel[grid_q](
@@ -1624,10 +1643,16 @@ def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing=False,
         stride_qh,
         stride_qm,
         stride_qd,
+        stride_qob,
+        stride_qoh,
+        stride_qom,
+        stride_qod,
         q_mean.stride(0) if q_smoothing else None,
         q_mean.stride(1) if q_smoothing else None,
         q_mean.stride(2) if q_smoothing else None,
         q_mean.stride(3) if q_smoothing else None,
+        R.stride(0),
+        R.stride(1),
         h_q,
         s_q,
         d,
@@ -1635,6 +1660,8 @@ def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing=False,
         BLOCK_M=BLOCK_SIZE_M,
         BLOCK_D=block_size,
     )
+
+    
 
     # 2. Rotate K (Only once!)
     grid_k = (b * h_k, K_NUM_BLKS, d // block_size)
@@ -1646,12 +1673,19 @@ def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing=False,
         stride_kh,
         stride_kn,
         stride_kd,
+        stride_kob,
+        stride_koh,
+        stride_kon,
+        stride_kod,
+        R.stride(0),
+        R.stride(1),
         h_k,
         s_k,
         d,
         BLOCK_M=BLOCK_SIZE_M,
         BLOCK_D=block_size,
     )
+
 
     # smooth k after rotation
     K_rot = K_rot - K_rot.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
