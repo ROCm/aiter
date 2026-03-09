@@ -2,7 +2,6 @@ import torch
 import triton
 import triton.language as tl
 from triton.experimental import gluon
-from triton.language.core import _aggregate as aggregate
 import triton.experimental.gluon.language as gl
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd, pid_grid
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
