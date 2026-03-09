@@ -268,38 +268,6 @@ def run_aiter_hip(
     scale,
     k_scale=None,
     v_scale=None,
-):
-    return ops.PagedAttention.forward_decode(
-        query,
-        k_cache,
-        v_cache,
-        block_tables,
-        seq_lens,
-        max_seq_len,
-        kv_cache_dtype,
-        num_kv_heads,
-        scale,
-        None,
-        k_scale,
-        v_scale,
-        mtp=max_qlen,
-    )
-
-
-@perftest()
-def run_aiter_hip(
-    query,
-    k_cache,
-    v_cache,
-    block_tables,
-    seq_lens,
-    max_seq_len,
-    max_qlen,
-    kv_cache_dtype,
-    num_kv_heads,
-    scale,
-    k_scale=None,
-    v_scale=None,
     q_scale=None,
     output_dtype=dtypes.bf16,
 ):

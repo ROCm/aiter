@@ -33,7 +33,7 @@ def moe_smoothquant_fwd(
 def get_dtype_max(dtype):
     try:
         dtypeMax = torch.finfo(dtype).max
-    except:
+    except Exception:
         dtypeMax = torch.iinfo(dtype).max
     return dtypeMax
 

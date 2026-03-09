@@ -13,10 +13,10 @@ try:
 
     # Re-export communication primitives at this level for convenience
     from .comms import (
-        IrisCommContext,
-        reduce_scatter,
-        all_gather,
-        reduce_scatter_rmsnorm_quant_all_gather,
+        IrisCommContext,  # noqa: F401
+        reduce_scatter,  # noqa: F401
+        all_gather,  # noqa: F401
+        reduce_scatter_rmsnorm_quant_all_gather,  # noqa: F401
         IRIS_COMM_AVAILABLE,
     )
 

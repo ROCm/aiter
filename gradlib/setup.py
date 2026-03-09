@@ -22,11 +22,11 @@ from setuptools import setup
 
 aiter_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, f"{aiter_dir}/aiter/")
-from jit.utils.cpp_extension import (
+from jit.utils.cpp_extension import (  # noqa: E402
     BuildExtension,
     CUDAExtension,
 )
-from jit.utils.hipify import hipify_python
+from jit.utils.hipify import hipify_python  # noqa: E402
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 # gpus = subprocess.check_output("/opt/rocm/bin/rocminfo").decode(

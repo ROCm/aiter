@@ -5,7 +5,6 @@ import torch
 from aiter.test_common import checkAllclose, run_perftest, benchmark
 from aiter import dtypes
 from aiter.ops.shuffle import shuffle_weight
-from aiter.int4_utils import *
 from aiter import QuantType
 from aiter.fused_moe_dp_shared_expert import (
     torch_moe,

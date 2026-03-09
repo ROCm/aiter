@@ -20,9 +20,9 @@ from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
-from chip_info import get_gfx, get_gfx_list
-from cpp_extension import _jit_compile, get_hip_version
-from file_baton import FileBaton
+from chip_info import get_gfx, get_gfx_list  # noqa: E402
+from cpp_extension import _jit_compile, get_hip_version  # noqa: E402
+from file_baton import FileBaton  # noqa: E402
 from torch_guard import torch_compile_guard  # noqa: E402
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))

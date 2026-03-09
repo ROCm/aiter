@@ -14,8 +14,8 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 from triton import language as tl
 
 _LOGGER = AiterTritonLogger()
-from triton.experimental import gluon
-from triton.experimental.gluon import language as gl
+from triton.experimental import gluon  # noqa: E402
+from triton.experimental.gluon import language as gl  # noqa: E402
 
 
 @triton.heuristics(
