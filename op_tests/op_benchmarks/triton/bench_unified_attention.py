@@ -1,5 +1,4 @@
-import os
-import sys
+from sys import exit
 
 import random
 import argparse
@@ -7,7 +6,6 @@ import itertools
 
 import torch
 import triton
-import aiter
 
 from aiter.ops.triton.attention.unified_attention import unified_attention
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
@@ -76,16 +74,16 @@ def input_helper(
     )
     k = torch.zeros(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
     v = torch.zeros(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
-    values = torch.arange(0, cache_size, dtype=torch.long)
-    values = values[torch.randperm(cache_size)]
+    values = torch.arange(0, cache_size, dtype=torch.long, device="cpu")
+    values = values[torch.randperm(cache_size, device="cpu")]
     block_table = values[: BS * max_block_per_request].view(BS, max_block_per_request)
-    b_seq_len = torch.tensor(seq_lens, dtype=torch.long)
-    b_ctx_len = torch.tensor(ctx_lens, dtype=torch.long)
-    b_start_loc = torch.cumsum(torch.tensor([0] + query_lens, dtype=torch.long), dim=0)
+    b_seq_len = torch.tensor(seq_lens, dtype=torch.long, device="cpu")
+    b_ctx_len = torch.tensor(ctx_lens, dtype=torch.long, device="cpu")
+    b_start_loc = torch.cumsum(torch.tensor([0] + query_lens, dtype=torch.long, device="cpu"), dim=0)
     max_input_len = MAX_SEQ_LEN
     # copy kv to cache
     b_seq_start_loc = torch.cumsum(
-        torch.tensor([0] + seq_lens[:-1], dtype=torch.long), dim=0
+        torch.tensor([0] + seq_lens[:-1], dtype=torch.long, device="cpu"), dim=0
     )
     for i in range(BS):
         for j in range(query_lens[i]):
@@ -385,24 +383,25 @@ def run_benchmark(custom, args):
         else:
             q_descale, k_descale, v_descale = None, None, None
 
-        fn =  lambda: unified_attention(
-            q=maybe_quantized_query,
-            k=maybe_quantized_key_cache,
-            v=maybe_quantized_value_cache,
-            out=output,
-            cu_seqlens_q=cu_seqlens_q,
-            seqused_k=seqlens_k,
-            max_seqlen_q=max_query_len,
-            max_seqlen_k=max_kv_len,
-            softmax_scale=scale,
-            causal=causal,
-            window_size=window_size,
-            block_table=block_tables,
-            softcap=soft_cap if soft_cap is not None else 0,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            sinks=sinks,
+        def fn():
+            return unified_attention(
+                q=maybe_quantized_query,
+                k=maybe_quantized_key_cache,
+                v=maybe_quantized_value_cache,
+                out=output,
+                cu_seqlens_q=cu_seqlens_q,
+                seqused_k=seqlens_k,
+                max_seqlen_q=max_query_len,
+                max_seqlen_k=max_kv_len,
+                softmax_scale=scale,
+                causal=causal,
+                window_size=window_size,
+                block_table=block_tables,
+                softcap=soft_cap if soft_cap is not None else 0,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                sinks=sinks,
         )
 
         ms = triton.testing.do_bench(fn)
@@ -498,9 +497,7 @@ def parse_args():
 
     def parse_int_or_list(value):
         if "," in value:
-            return (
-                value.strip()
-            )  # if list, return stripped string and parse when creating tensor
+            return [int(x) for x in value.split(",")]
         else:
             return int(value)
 
@@ -650,4 +647,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    exit(main())
