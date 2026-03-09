@@ -1015,6 +1015,7 @@ def fused_moe_2stages(
     intermediate_pad=0,
     bias1=None,
     bias2=None,
+    accumulate: bool = False,
 ):
     quant_func = get_quant(quant_type)
     token_num_quant_moe_sort_switch = 1024
@@ -1259,6 +1260,19 @@ def fused_moe_2stages(
         )
         a2 = a2_out
 
+    if accumulate:
+        moe_multi_buff = moe_out
+    else:
+        moe_multi_buff = torch.zeros(
+            (
+                token_num,
+                topk,
+                model_dim,
+            ),
+            device=device,
+            dtype=moe_out.dtype,
+        )
+
     metadata.stage2(
         a2,
         w1,
@@ -1266,7 +1280,7 @@ def fused_moe_2stages(
         sorted_ids,
         sorted_expert_ids,
         num_valid_ids,
-        moe_out,
+        moe_multi_buff,
         topk,
         w2_scale=(
             w2_scale.view(dtypes.fp8_e8m0) if w2.dtype == dtypes.fp4x2 else w2_scale
@@ -1276,9 +1290,15 @@ def fused_moe_2stages(
         w2_lqq_zero=w2_lqq_zero,
         block_m=block_size_M,
         sorted_weights=sorted_weights if not doweight_stage1 else None,
+        accumulate=accumulate,
         **extra_stage2_args,
     )
 
+    if accumulate:
+        moe_out = moe_multi_buff
+    else:
+        moe_out = moe_multi_buff.sum(dim=1)
+    
     return moe_out
 
 
@@ -1377,6 +1397,7 @@ def asm_stage2(
     w2_lqq_scale=None,
     w2_lqq_zero=None,
     sorted_weights=None,
+    accumulate: bool = True,
 ):
     return aiter.moe_stage2_g1u1(
         inter_states,
@@ -1398,8 +1419,6 @@ def asm_stage2(
         activation,
         splitk,
     )
-
-    return out
 
 
 def torch_moe(

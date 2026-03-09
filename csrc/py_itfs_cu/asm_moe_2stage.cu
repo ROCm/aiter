@@ -686,6 +686,10 @@ void moe_stage2_g1u1(
 
     int dbl_o    = (splitk > 1) ? 2 : 1;
     int stride_O = dim * out.element_size() * dbl_o;
+    if(out.dim() == 3) // multi buffer
+    {
+        stride_O = stride_O * topk;
+    }
 
     Kernel2Args args;
     size_t arg_size = sizeof(args);
