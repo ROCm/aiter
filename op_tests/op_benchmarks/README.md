@@ -210,6 +210,8 @@ python test_mha.py \
 
 ##### Performance Benchmarks
 
+###### How to Run MHA
+
 Run FlashAttention performance benchmarks:
 
 ```bash
