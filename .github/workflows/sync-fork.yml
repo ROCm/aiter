@@ -1,0 +1,24 @@
+name: Sync Fork
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # 6am UTC daily (before dashboard collection at 8am)
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync fork default branch with upstream
+        run: |
+          # Try fast-forward sync first; fall back to force sync if diverged.
+          # Safe because feature work lives on branches, not the default branch.
+          if gh repo sync "${{ github.repository }}" 2>/dev/null; then
+            echo "Synced successfully (fast-forward)"
+          else
+            echo "Diverging commits detected — force syncing to match upstream"
+            gh repo sync "${{ github.repository }}" --force
+            echo "Force synced successfully"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
