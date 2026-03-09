@@ -6,7 +6,7 @@ import itertools
 import aiter
 from aiter import dtypes
 from aiter.test_common import checkAllclose, benchmark, run_perftest
-from aiter.int4_utils import rearrange_4bit_elements, convert_int8_to_uint32_int4
+from aiter.int4_utils import *
 from aiter.utility import fp4_utils
 from aiter.jit.utils.chip_info import get_gfx
 import argparse

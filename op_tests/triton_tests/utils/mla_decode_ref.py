@@ -476,7 +476,7 @@ def _decode_grouped_att_m_fwd(
 @triton.jit
 def _fwd_kernel_stage2(
     Mid_O,
-    O,  # noqa: E741
+    O,
     kv_indptr,
     stride_mid_ob,
     stride_mid_oh,

@@ -343,7 +343,7 @@ _fwd_kernel_stage2_repr = make_kernel_repr(
 @triton.jit(repr=_fwd_kernel_stage2_repr)
 def _fwd_kernel_stage2(
     Mid_O,
-    O,  # noqa: E741
+    O,
     kv_indptr,
     stride_mid_ob,
     stride_mid_oh,

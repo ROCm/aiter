@@ -21,7 +21,7 @@ import os
 def _fwd_kernel_stage2_asm(
     Mid_O,
     Mid_lse,
-    O,  # noqa: E741
+    O,
     qo_indptr,
     kv_indptr,
     num_kv_splits_indptr,

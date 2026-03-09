@@ -7,7 +7,6 @@ from aiter.test_common import checkAllclose, run_perftest, benchmark
 from aiter.ops.triton.topk import topk
 from aiter.ops.triton.softmax import softmax
 from aiter import dtypes
-import pandas as pd
 import argparse
 
 torch.set_default_device("cuda")
@@ -171,6 +170,7 @@ d_sample = {
 list_dtype = ["bf16"]
 l_n = [129280, 151936][-1:]
 l_m = [1, 8, 16, 32, 64, 128, 192, 256, 512]
+import pandas as pd
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,

@@ -710,13 +710,11 @@ def test_varlen_flash_attn_seq_padding(
     # Dynamically generate padding configurations
     q_padded_lens = torch.randint(seqlen_q // 2, seqlen_q + 1, (batch_size,)).tolist()
     q_actual_lens = [
-        torch.randint(max(1, pad_len // 2), pad_len + 1, (1,)).item()
-        for pad_len in q_padded_lens
+        torch.randint(max(1, l // 2), l + 1, (1,)).item() for l in q_padded_lens
     ]
     k_padded_lens = torch.randint(seqlen_k // 2, seqlen_k + 1, (batch_size,)).tolist()
     k_actual_lens = [
-        torch.randint(max(1, pad_len // 2), pad_len + 1, (1,)).item()
-        for pad_len in k_padded_lens
+        torch.randint(max(1, l // 2), l + 1, (1,)).item() for l in k_padded_lens
     ]
 
     if padding_scenario == "q_only":

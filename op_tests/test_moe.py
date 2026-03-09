@@ -8,7 +8,7 @@ from aiter.fused_moe import torch_moe, fused_topk
 from aiter.fused_moe_bf16_asm import asm_moe
 from aiter.ops.shuffle import shuffle_weight
 from aiter import pertoken_quant
-from aiter.int4_utils import rearrange_4bit_elements, convert_int8_to_uint32_int4
+from aiter.int4_utils import *
 from aiter import ActivationType
 import argparse
 

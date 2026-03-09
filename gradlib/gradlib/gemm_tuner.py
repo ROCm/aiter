@@ -160,7 +160,7 @@ def clean():
                 for name in list(mp.resource_tracker._CLEANUP_FUNCS.keys()):
                     try:
                         mp.resource_tracker._CLEANUP_FUNCS.pop(name)()
-                    except Exception:
+                    except:
                         pass
     except Exception as e:
         print(f"Resource cleanup warning: {e}")

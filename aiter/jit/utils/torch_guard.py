@@ -197,7 +197,7 @@ def torch_compile_guard(
 
         try:
             import torch
-            from torch.library import Library  # noqa: F401
+            from torch.library import Library
             import inspect
         except ImportError:
             return wrapper
