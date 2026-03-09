@@ -8,10 +8,12 @@ import triton
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import map_dims
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import (
-    sage_fwd_mxfp4,
-    sage_quant_mxfp4,
-    fused_sage_quant_mxfp4
+    sage_fwd_mxfp4
 )
+from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
+    sage_quant_mxfp4
+)
+
 
 import aiter
 
@@ -62,7 +64,7 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
         FP8_TYPE = aiter.dtypes.fp8
         FP8_MAX = torch.finfo(FP8_TYPE).max
         
-        fused_quant = True
+        # fused_quant = True
         (
             q_quantized,
             q_descale,
@@ -80,17 +82,17 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
             BLKQ=config["BLOCK_M"],
             BLKK=64,
             layout=layout
-        ) if not fused_quant else fused_sage_quant_mxfp4(
-            q,
-            k,
-            v,
-            hadamard_rotation=hadamard_rotation,
-            R=R,
-            BLOCK_M=config["BLOCK_M"],
-            BLOCK_R=BLOCK_R if R is None else R.shape[-1],
-            q_smoothing=q_smooth,
-            layout=layout,
-        )
+        ) # if not fused_quant else fused_sage_quant_mxfp4(
+        #     q,
+        #     k,
+        #     v,
+        #     hadamard_rotation=hadamard_rotation,
+        #     R=R,
+        #     BLOCK_M=config["BLOCK_M"],
+        #     BLOCK_R=BLOCK_R if R is None else R.shape[-1],
+        #     q_smoothing=q_smooth,
+        #     layout=layout,
+        # )
 
         qd_mapped = map_dims(q_descale.shape, bhsd_map)
         kd_mapped = map_dims(k_descale.shape, bhsd_map)

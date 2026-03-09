@@ -12,7 +12,7 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_wrapper,
 )
 
-from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import (
+from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     create_hadamard_matrix,
 )
 
@@ -22,8 +22,7 @@ from op_tests.triton_tests.attention.test_fav3_sage import (
 )
 from op_tests.op_benchmarks.triton.bench_fav3_sage import fav2_forward_func
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    print_vgpr,
-    get_caller_name_no_ext,
+    print_vgpr
 )
 # Configuration
 logging.getLogger().setLevel(logging.INFO)

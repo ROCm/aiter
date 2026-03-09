@@ -7,10 +7,14 @@ import torch
 import aiter
 import triton
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
-    sage_quant,
     sage_fwd,
     map_dims,
 )
+
+from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
+    sage_quant
+)
+
 from aiter.ops.triton.utils._triton import arch_info
 
 
