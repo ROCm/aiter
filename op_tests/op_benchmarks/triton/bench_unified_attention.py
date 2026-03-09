@@ -79,7 +79,9 @@ def input_helper(
     block_table = values[: BS * max_block_per_request].view(BS, max_block_per_request)
     b_seq_len = torch.tensor(seq_lens, dtype=torch.long, device="cpu")
     b_ctx_len = torch.tensor(ctx_lens, dtype=torch.long, device="cpu")
-    b_start_loc = torch.cumsum(torch.tensor([0] + query_lens, dtype=torch.long, device="cpu"), dim=0)
+    b_start_loc = torch.cumsum(
+        torch.tensor([0] + query_lens, dtype=torch.long, device="cpu"), dim=0
+    )
     max_input_len = MAX_SEQ_LEN
     # copy kv to cache
     b_seq_start_loc = torch.cumsum(
@@ -305,11 +307,19 @@ def run_benchmark(custom, args):
         varlen = not args.equal_seqlens
 
         if not varlen:
-            seqlens_q = torch.tensor([N_CTX_Q for _ in range(BATCH)], dtype=torch.int32, device="cuda")
-            seqlens_k = torch.tensor([N_CTX_K for _ in range(BATCH)], dtype=torch.int32, device="cuda")
+            seqlens_q = torch.tensor(
+                [N_CTX_Q for _ in range(BATCH)], dtype=torch.int32, device="cuda"
+            )
+            seqlens_k = torch.tensor(
+                [N_CTX_K for _ in range(BATCH)], dtype=torch.int32, device="cuda"
+            )
         else:
-            seqlens_q = torch.randint(1, N_CTX_Q + 1, (BATCH,), dtype=torch.int32, device="cuda")
-            seqlens_k = torch.randint(N_CTX_Q, N_CTX_K + 1, (BATCH,), dtype=torch.int32, device="cuda")
+            seqlens_q = torch.randint(
+                1, N_CTX_Q + 1, (BATCH,), dtype=torch.int32, device="cuda"
+            )
+            seqlens_k = torch.randint(
+                N_CTX_Q, N_CTX_K + 1, (BATCH,), dtype=torch.int32, device="cuda"
+            )
 
         # turn DECODE_P of the samples to decode samples (seqlen_q == 1)
         if DECODE_P > 0.0:
@@ -321,8 +331,10 @@ def run_benchmark(custom, args):
 
         if causal:
             if (seqlens_k < seqlens_q).any():
-                print(f"Warning: clamping seqlens_k to be >= seqlens_q for config "
-                      f"(BATCH={BATCH}, HQ={HQ}, HK={HK}, N_CTX_Q={N_CTX_Q}, N_CTX_K={N_CTX_K})")
+                print(
+                    f"Warning: clamping seqlens_k to be >= seqlens_q for config "
+                    f"(BATCH={BATCH}, HQ={HQ}, HK={HK}, N_CTX_Q={N_CTX_Q}, N_CTX_K={N_CTX_K})"
+                )
             seqlens_k = torch.maximum(seqlens_k, seqlens_q)
 
         num_seqs = BATCH
@@ -336,10 +348,16 @@ def run_benchmark(custom, args):
         block_size = args.block_size if args.block_size else 512
         max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
         min_required_blocks = BATCH * max_num_blocks_per_seq
-        num_blocks = args.num_blocks if args.num_blocks else max(min_required_blocks * 4, 2048)
+        num_blocks = (
+            args.num_blocks if args.num_blocks else max(min_required_blocks * 4, 2048)
+        )
         num_blocks = max(num_blocks, min_required_blocks)
 
-        window_size = (args.sliding_window - 1, 0) if args.sliding_window is not None else (-1, -1)
+        window_size = (
+            (args.sliding_window - 1, 0)
+            if args.sliding_window is not None
+            else (-1, -1)
+        )
         scale = D_HEAD**-0.5
 
         query = torch.randn(
@@ -364,14 +382,15 @@ def run_benchmark(custom, args):
             sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
         else:
             sinks = None
-        
+
         output = torch.empty_like(query)
         maybe_quantized_query = query
         maybe_quantized_key_cache = key_cache
         maybe_quantized_value_cache = value_cache
-        
+
         if args.fp8:
             from aiter.ops.triton.utils.types import e4m3_dtype
+
             FP8_TYPE = e4m3_dtype
             maybe_quantized_query = (query).to(FP8_TYPE)
             maybe_quantized_key_cache = (key_cache).to(FP8_TYPE)
@@ -402,10 +421,10 @@ def run_benchmark(custom, args):
                 k_descale=k_descale,
                 v_descale=v_descale,
                 sinks=sinks,
-        )
+            )
 
         ms = triton.testing.do_bench(fn)
-        
+
         if args.test:
             fn()
             ref_output = ref_paged_attn(
@@ -426,7 +445,7 @@ def run_benchmark(custom, args):
             torch.testing.assert_close(
                 output, ref_output, atol=atol, rtol=rtol
             ), f"{torch.max(torch.abs(output - ref_output))}"
-        
+
         # calculate perf metrics
         total_flops = 0
         num_contexts = len(cu_seqlens_q) - 1
