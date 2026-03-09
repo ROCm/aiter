@@ -533,6 +533,56 @@ def test_mla(
         dtype_kv=kvtype,
     )
 
+    # """ test code for decode_update_mla_metadata_v1 """
+    # torch.set_printoptions(linewidth=200)
+    # print(f"{kv_indptr=}")
+    # print(f"{work_indptr=}")
+    # print(f"{work_info_set[:32]=}")
+    # print(f"{reduce_indptr=}")
+    # print(f"{reduce_final_map=}")
+    # print(f"{reduce_partial_map=}")
+
+    # print("*************** decode_update_mla_metadata_v1 ********************")
+    # if decode_qlen > 1:
+    #     num_reject_tokens = torch.randint(0, 4, (batch_size,), dtype=torch.int32)
+    #     kv_len_delta_csum = torch.cumsum(num_reject_tokens - 1, dim=0).to(torch.int32)
+    #     kv_indptr[1:] = kv_indptr[1:] - kv_len_delta_csum
+    # else:
+    #     kv_indptr = kv_indptr + torch.arange(batch_size + 1, dtype=torch.int32)
+    #     num_reject_tokens = None
+    # num_page = kv_indptr[-1].item()
+    # kv_indices = torch.randperm(num_page, dtype=torch.int)
+    # from aiter.ops.attention import decode_update_mla_metadata_v1
+
+    # decode_update_mla_metadata_v1(
+    #     qo_indptr,
+    #     kv_indptr,
+    #     kv_last_page_lens,
+    #     nhead // nhead_kv,
+    #     nhead_kv,
+    #     False,
+    #     work_meta_data,
+    #     work_info_set,
+    #     work_indptr,
+    #     reduce_indptr,
+    #     reduce_final_map,
+    #     reduce_partial_map,
+    #     page_size=page_size,
+    #     kv_granularity=max(page_size, 16),
+    #     max_seqlen_qo=1,
+    #     dtype_q=dtype,
+    #     dtype_kv=kvtype,
+    #     num_reject_tokens=num_reject_tokens,
+    # )
+    # print(f"{num_reject_tokens=}")
+    # print(f"{kv_indptr=}")
+    # print(f"{work_info_set[:32]=}")
+    # print(f"{work_indptr=}")
+    # print(f"{reduce_indptr=}")
+    # print(f"{reduce_final_map=}")
+    # print(f"{reduce_partial_map=}")
+    # return
+
     def test_absorb_decode_bf16_fp8():
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
         kv_buffer_fp8 = kv_buffer.to(kvtype)
