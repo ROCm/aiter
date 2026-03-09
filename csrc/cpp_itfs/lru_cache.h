@@ -4,6 +4,7 @@
 #include <list>
 #include <iostream>
 #include <mutex>
+#include "../include/aiter_logger.h"
 
 template<typename K, typename V>
 class LRUCache {
@@ -20,7 +21,7 @@ private:
 
 public:
     explicit LRUCache(int capacity) : m_capacity(capacity) {
-        std::cout << "LRUCache created with capacity: " << capacity << std::endl;
+        AITER_LOG_DEBUG("LRUCache created with capacity: " << capacity);
     }
     
     // Get value by key. Returns nullptr if not found

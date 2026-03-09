@@ -235,6 +235,9 @@ def gen_fmha_v3_fwd_fake_tensors(
     out: Optional[Tensor] = None,
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
+    q_descale: Optional[Tensor] = None,
+    k_descale: Optional[Tensor] = None,
+    v_descale: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return common_mha_fwd_fake_tensors(
@@ -260,6 +263,9 @@ def fmha_v3_fwd(
     out: Optional[Tensor] = None,
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
+    q_descale: Optional[Tensor] = None,
+    k_descale: Optional[Tensor] = None,
+    v_descale: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
@@ -520,6 +526,9 @@ def gen_fmha_v3_varlen_fwd_fake_tensor(
     block_table: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
+    q_descale: Optional[Tensor] = None,
+    k_descale: Optional[Tensor] = None,
+    v_descale: Optional[Tensor] = None,
     gen: Optional[torch.Generator] = None,
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_padded: Optional[torch.Tensor] = None,
@@ -585,6 +594,9 @@ def fmha_v3_varlen_fwd(
     block_table: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
+    q_descale: Optional[Tensor] = None,
+    k_descale: Optional[Tensor] = None,
+    v_descale: Optional[Tensor] = None,
     gen: Optional[torch.Generator] = None,
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_padded: Optional[torch.Tensor] = None,
@@ -954,9 +966,13 @@ def cmdGenFunc_mha_batch_prefill(
     out: Optional[Tensor] = None,
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
-    q_descale: Optional[Tensor] = None,
-    k_descale: Optional[Tensor] = None,
-    v_descale: Optional[Tensor] = None,
+    # Per-tensor descale for PERTENSOR mode (Q/K/V each have one scale value)
+    q_descale: Optional[Tensor] = None,  # [1] per-tensor Q descale
+    k_descale: Optional[Tensor] = None,  # [1] per-tensor K descale
+    v_descale: Optional[Tensor] = None,  # [1] per-tensor V descale
+    # Per-page descale for KV_BLOCKSCALE mode (Q per-tensor, K/V per-page)
+    # Mutually exclusive with k_descale/v_descale
+    kv_block_descale: Optional[Tensor] = None,  # [num_block, num_kv_head, 2]
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
     kv_last_page_lens: Optional[Tensor] = None,
@@ -967,6 +983,10 @@ def cmdGenFunc_mha_batch_prefill(
     causal = is_causal
     if max_seqlen_q == 1 and alibi_slopes is None:
         causal = False
+        if window_size_left >= max_seqlen_k:
+            window_size_left = -1
+        if window_size_right >= max_seqlen_k:
+            window_size_right = -1
     md_name = "mha_batch_prefill"
     filter_fwd = "*"  # get_fwd_blobs()
     if q.dtype == torch.float16:
@@ -1011,11 +1031,15 @@ def cmdGenFunc_mha_batch_prefill(
     else:
         md_name += "_dropout"
         filter_fwd += "_dropout*"
-    if q_descale is None or k_descale is None or v_descale is None:
+    if kv_block_descale is not None:
+        # KV_BLOCKSCALE: Q per-tensor, K/V per-page
+        md_name += "_kv_blockscale"
+        filter_fwd += "_kv_blockscale*"
+    elif q_descale is None or k_descale is None or v_descale is None:
         md_name += "_nqscale"
         filter_fwd += "_nqscale*"
     else:
-        # only support per-tensor quantization for now
+        # PERTENSOR: per-tensor quantization
         md_name += "_pertensor"
         filter_fwd += "_pertensor*"
     blob_gen_cmd = [
@@ -1235,7 +1259,7 @@ def _flash_attn_forward(
     sink_ptr: Optional[Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
-    _, seqlen_q, nhead_q, hdim_q = q.shape
+    batch_size, seqlen_q, nhead_q, hdim_q = q.shape
     _, seqlen_k, nhead_k, hdim_v = v.shape
     if sink_ptr is not None:
         assert sink_ptr.device == q.device, "sink_ptr must be on the same device as q"
@@ -1245,9 +1269,25 @@ def _flash_attn_forward(
     # mask
     window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
-    mask = causal and window_size_left == -1  # causal mask
-    nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
+    # mask = causal and window_size_left == -1  # causal mask
+    # nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
     swa = (window_size_left > 0) or (window_size_right > 0)
+
+    def is_fmha_v3_fp8():
+        ret = get_gfx() == "gfx942"
+        ret = ret and (hdim_q == 128)
+        ret = ret and (q.dtype == dtypes.fp8)
+        ret = ret and (
+            q_descale is not None and k_descale is not None and v_descale is not None
+        )
+        # support per tensor and per head quant scale
+        ret = ret and (
+            q_descale.shape == (1,) or q_descale.shape == (batch_size, nhead_k)
+        )
+        ret = ret and (
+            q_descale.shape == k_descale.shape and q_descale.shape == v_descale.shape
+        )
+        return ret
 
     def can_impl_fmha_v3_fwd():
         # basic
@@ -1258,7 +1298,7 @@ def _flash_attn_forward(
         ret = ret and (hdim_q == 128 or hdim_q == 192)
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
-        ret = ret and (q.dtype == dtypes.bf16)
+        ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
         ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
         return ret
 
@@ -1292,6 +1332,9 @@ def _flash_attn_forward(
             None,
             bias,
             alibi_slopes,
+            q_descale,
+            k_descale,
+            v_descale,
             None,
         )
     else:
@@ -1614,8 +1657,7 @@ def _flash_attn_backward(
         ret &= not deterministic or is_950_1block
         ret &= nhead_q % nhead_k == 0
         ret &= (
-            (hdim_q > 64 and hdim_q <= 128)
-            or (hdim_q == 192 and hdim_v == 128 and nmask)
+            (hdim_q > 64 and hdim_q <= 128) or (hdim_q == 192 and hdim_v == 128)
         ) and hdim_q % 8 == 0
         ret &= not swa
         return ret
@@ -1968,6 +2010,7 @@ def _flash_attn_varlen_forward(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     _, nhead_q, hdim_q = q.shape
+    batch_size = cu_seqlens_q.numel() - 1
 
     nhead_k = v.shape[-2]
     hdim_v = v.shape[-1]
@@ -1986,6 +2029,22 @@ def _flash_attn_varlen_forward(
     )  # no mask
     swa = (window_size_left > 0) or (window_size_right > 0)
 
+    def is_fmha_v3_fp8():
+        ret = get_gfx() == "gfx942"
+        ret = ret and (hdim_q == 128)
+        ret = ret and (q.dtype == dtypes.fp8)
+        ret = ret and (
+            q_descale is not None and k_descale is not None and v_descale is not None
+        )
+        # support per tensor and per head quant scale
+        ret = ret and (
+            q_descale.shape == (1,) or q_descale.shape == (batch_size, nhead_k)
+        )
+        ret = ret and (
+            q_descale.shape == k_descale.shape and q_descale.shape == v_descale.shape
+        )
+        return ret
+
     def can_impl_fmha_v3_fwd():
         # basic
         ret = alibi_slopes is None
@@ -1995,7 +2054,7 @@ def _flash_attn_varlen_forward(
         ret = ret and (hdim_q == 128 or hdim_q == 192)
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
-        ret = ret and (q.dtype == dtypes.bf16)
+        ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
         ret = ret and logits_soft_cap == 0.0
         return ret
 
@@ -2025,6 +2084,9 @@ def _flash_attn_varlen_forward(
             block_table,
             bias,
             alibi_slopes,
+            q_descale,
+            k_descale,
+            v_descale,
             None,
             cu_seqlens_q_padded,
             cu_seqlens_k_padded,
@@ -2618,9 +2680,12 @@ def mha_batch_prefill_fake_tensors(
     out: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
+    # Per-tensor descale for PERTENSOR mode
+    q_descale: Optional[torch.Tensor] = None,  # [1] per-tensor Q descale
+    k_descale: Optional[torch.Tensor] = None,  # [1] per-tensor K descale
+    v_descale: Optional[torch.Tensor] = None,  # [1] per-tensor V descale
+    # Per-page descale for KV_BLOCKSCALE mode (mutually exclusive with k_descale/v_descale)
+    kv_block_descale: Optional[torch.Tensor] = None,  # [num_block, num_kv_head, 2]
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
     kv_last_page_lens: Optional[torch.Tensor] = None,
@@ -2699,9 +2764,12 @@ def mha_batch_prefill(
     out: Optional[Tensor] = None,
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
+    # Per-tensor descale for PERTENSOR mode
+    q_descale: Optional[torch.Tensor] = None,  # [1] per-tensor Q descale
+    k_descale: Optional[torch.Tensor] = None,  # [1] per-tensor K descale
+    v_descale: Optional[torch.Tensor] = None,  # [1] per-tensor V descale
+    # Per-page descale for KV_BLOCKSCALE mode (mutually exclusive with k_descale/v_descale)
+    kv_block_descale: Optional[torch.Tensor] = None,  # [num_block, num_kv_head, 2]
     kv_last_page_lens: Optional[Tensor] = None,
     block_table: Optional[Tensor] = None,
     seqlen_k: Optional[Tensor] = None,
@@ -2737,6 +2805,9 @@ def _mha_batch_prefill(
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
+    kv_block_descale: Optional[
+        torch.Tensor
+    ] = None,  # [num_block, num_kv_head, 2] per-page K/V descales
     sink_ptr: Optional[Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
@@ -2765,6 +2836,7 @@ def _mha_batch_prefill(
         q_descale,
         k_descale,
         v_descale,
+        kv_block_descale,
         kv_last_page_lens,
         block_table,
         seqlen_k,
@@ -2800,6 +2872,7 @@ def mha_batch_prefill_func(
     q_descale=None,
     k_descale=None,
     v_descale=None,
+    kv_block_descale=None,  # [num_block, num_kv_head, 2] per-page K/V descales
     sink_ptr=None,
 ):
     if softmax_scale is None:
@@ -2863,6 +2936,7 @@ def mha_batch_prefill_func(
         q_descale=q_descale,
         k_descale=k_descale,
         v_descale=v_descale,
+        kv_block_descale=kv_block_descale,
         sink_ptr=sink_ptr,
     )
     out = out_padded[..., :head_size_v_og]

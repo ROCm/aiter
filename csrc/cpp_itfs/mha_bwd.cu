@@ -9,21 +9,23 @@ std::tuple<int, int> get_padded_hdim(int hdim_q, int hdim_v, std::string arch_id
 {
     if(hdim_q == 192 && hdim_v == 128 && arch_id == "gfx950")
         return std::make_tuple(hdim_q, hdim_v);
-    assert(hdim_q == hdim_v);
-    if(hdim_q <= 64)
+        
+    if(hdim_q == hdim_v)
     {
-        return std::make_tuple(64, 64);
-    }
-    else if(hdim_q <= 128)
-    {
-        return std::make_tuple(128, 128);
-    }
-    else if(hdim_q <= 192)
-    {
-        return std::make_tuple(192, 192);
+        if(hdim_q <= 64)
+        {
+            return std::make_tuple(64, 64);
+        }
+        else if(hdim_q <= 128)
+        {
+            return std::make_tuple(128, 128);
+        }
+        else if(hdim_q <= 192)
+        {
+            return std::make_tuple(192, 192);
+        }
     }
 
-    assert(false);
     return std::make_tuple(hdim_q, hdim_v);
 }
 
@@ -131,16 +133,25 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 #if ONLY_FAV3
     return asm_ret;
 #else
-    fmha_bwd_traits traits{a.hdim_q,
-                           a.hdim_v,
-                           a.data_type,
-                           a.is_group_mode,
-                           static_cast<mask_enum>(a.ck_mask_type),
-                           static_cast<bias_enum>(a.bias_type),
-                           a.has_dbias,
-                           a.has_dropout,
-                           a.is_store_randval,
-                           a.is_deterministic};
+    const fmha_bwd_traits traits{
+        a.seqlen_q,
+        a.seqlen_k,
+        a.batch,
+        a.max_seqlen_q,
+        a.max_seqlen_k,
+        a.hdim_q,
+        a.hdim_v,
+        a.nhead_q,
+        a.nhead_k,
+        a.data_type,
+        a.is_group_mode,
+        static_cast<mask_enum>(a.mask_type),
+        static_cast<bias_enum>(a.bias_type),
+        a.has_dbias,
+        a.has_dropout,
+        a.is_store_randval,
+        a.is_deterministic,
+    };
 
     fmha_bwd_args ck_args{
         /* q_ptr              */ a.q_ptr,
@@ -220,7 +231,7 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         /* split_stride_dq_acc*/ a.split_stride_dq_acc,
         /* window_size_left   */ a.window_size_left,
         /* window_size_right  */ a.window_size_right,
-        /* mask_type          */ a.ck_mask_type,
+        /* mask_type          */ a.mask_type,
         /* p_drop             */ a.p_drop,
         /* p_undrop           */ a.p_undrop,
         /* drop_seed_offset   */ a.drop_seed_offset,
@@ -248,6 +259,41 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     {
         return -1;
     }
+
+    // ASM mask type
+    // 0: no mask
+    // 1: top-left triangular
+    // 2: bottom-right triangular
+    // 3: window mask
+    // -1: unsupported (e.g., ck generic mask)
+    auto asm_mask_type = [&]() {
+        if(a.mask_type == static_cast<ck_tile::index_t>(mask_enum::no_mask))
+        {
+            return 0;
+        }
+        else if(a.mask_type == static_cast<ck_tile::index_t>(mask_enum::window_generic))
+        {
+            // CK generic mask isn't supported here
+            return -1;
+        }
+        else
+        {
+            if(a.window_size_left == -1 && a.window_size_right == 0)
+            {
+                // Note: this case includes both top-left and bottom-right masks, but they share the same
+                // kernel selection logic in bwd since the attention sink isn't supported in bwd yet
+                return (a.mask_type == static_cast<ck_tile::index_t>(mask_enum::mask_top_left)) ? 1 : 2;
+            }
+            else if(a.window_size_left == -1 && a.window_size_right == -1)
+            {
+                return 0;
+            }
+            else
+            {
+                return 3;
+            }
+        }
+    };
 
     auto pre_cfgs    = &cfg_fmha_bwd_odo;
     auto dqdkdv_cfgs = &cfg_fmha_bwd_dqdkdv;
@@ -279,13 +325,30 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     bool need_post_processing =
         ((arch_id == "gfx950") && (a.hdim_q != 64)) || (a.v3_atomic_fp32 == 1);
 
+    int mt = asm_mask_type();
+
+    if (mt == -1)
+    {
+        AITER_LOG_WARNING("fmha_v3_bwd: unsupported mask type for asm kernels.");
+        return -1;
+    }
+    // On gfx942, a16 (atomic32=0) has no mask_type=2 (bottom-right causal) kernels,
+    // only mask_type=1 (top-left causal). When seqlen_q == seqlen_k the two masks
+    // are mathematically equivalent, so we can safely convert 2 → 1 to hit the
+    // existing a16 causal kernels.
+    // See config: hsa/gfx942/fmha_v3_bwd/fmha_bwd_dqdkdv.csv
+    if(arch_id == "gfx942" && !a.v3_atomic_fp32 && mt == 2 && a.seqlen_q == a.seqlen_k)
+    {
+        mt = 1;  // bottom-right → top-left (equivalent when sq == sk)
+    }
+
     auto [pre_kernel, dqdkdv_kernel, post_kernel] = get_heuristic_kernel(a.data_type,
                                                                          arch_id,
                                                                          a.seqlen_q,
                                                                          a.seqlen_k,
                                                                          a.hdim_q,
                                                                          a.hdim_v,
-                                                                         a.mask_type,
+                                                                         mt,
                                                                          a.v3_atomic_fp32,
                                                                          a.v3_bf16_cvt,
                                                                          a.is_group_mode,
@@ -301,7 +364,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     int ts_odo;
     int ts_kv;
     int ts_dq;
-    int arg_size;
+    size_t arg_size;
 
     AiterAsmKernel* impl_ptr_pre    = nullptr;
     AiterAsmKernel* impl_ptr_dqdkdv = nullptr;
@@ -378,7 +441,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         return 1;
 
     fmha_bwd_odo_args odo_args;
-    arg_size                 = sizeof(odo_args);
+
     odo_args.ptr_o           = a.o_ptr;
     odo_args.ptr_do          = a.do_ptr;
     odo_args.ptr_d           = a.d_ptr;
@@ -395,6 +458,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
 
     auto pre_kernel_launch = [&]() {
+        arg_size = sizeof(odo_args);
         int bdx = 256;
         int gdx = (a.max_seqlen_q + ts_odo - 1) / ts_odo;
         int gdy = a.nhead_q;
@@ -465,7 +529,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     }
     dqdkdv_args.max_seqlen_dq = a.v3_atomic_fp32 ? a.max_seqlen_q : (a.max_seqlen_q + 15) / 16 * 16;
 
-    if(a.mask_type == 3)
+    if(mt == 3)
     {
         // Note: sink_size=0 is passed as the 3rd parameter (attention sink not supported in bwd
         // yet)
@@ -476,20 +540,20 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
             sink_size,
             a.seqlen_q,
             a.seqlen_k,
-            (a.ck_mask_type == static_cast<ck_tile::index_t>(mask_enum::mask_top_left) ||
-             a.ck_mask_type == static_cast<ck_tile::index_t>(mask_enum::window_generic)));
+            (a.mask_type == static_cast<ck_tile::index_t>(mask_enum::mask_top_left) ||
+             a.mask_type == static_cast<ck_tile::index_t>(mask_enum::window_generic)));
         dqdkdv_args.mask_y = generic_mask.at(ck_tile::number<0>{});
         dqdkdv_args.mask_x = generic_mask.at(ck_tile::number<1>{});
     }
 
-    arg_size                  = sizeof(dqdkdv_args);
     auto dqdkdv_kernel_launch = [&]() {
+        arg_size                  = sizeof(dqdkdv_args);
         int bdx = 256;
         int gdx = (a.max_seqlen_k + ts_kv - 1) / ts_kv;
         int gdy = a.nhead_q;
         int gdz = a.batch;
 
-        if((a.mask_type == 1) || (a.mask_type == 2))
+        if((mt == 1) || (mt == 2))
         { // causal
             gdx = (gdx + 1) / 2;
         }
@@ -508,7 +572,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
     int dq_acc_element_size = a.v3_atomic_fp32 ? 4 : 2;
     fmha_bwd_post_kernel_args post_args;
-    arg_size                  = sizeof(post_args);
+
     post_args.ptr_dq_acc      = a.dq_acc_ptr;
     post_args.ptr_dq          = a.dq_ptr;
     post_args.Hs_dq_acc       = a.nhead_stride_dq_acc * dq_acc_element_size;
@@ -524,6 +588,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
 
     auto post_kernel_launch = [&]() {
+        arg_size                  = sizeof(post_args);
         int bdx = 256;
         int gdx = (a.max_seqlen_q + ts_dq - 1) / ts_dq;
         int gdy = a.nhead_q;

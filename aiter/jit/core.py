@@ -192,10 +192,11 @@ class AITER_CONFIG(object):
         for i, path in enumerate(path_list[1:]):
             if os.path.exists(path):
                 df = pd.read_csv(path)
-                ## check columns
+                base_cols = [c for c in df_list[0].columns if c != "_tag"]
+                new_cols = [c for c in df.columns if c != "_tag"]
                 assert (
-                    df.columns.tolist() == df_list[0].columns.tolist()
-                ), f"Column mismatch between {path_list[0]} and {path}, {df_list[0].columns.tolist()}, {df.columns.tolist()}"
+                    base_cols == new_cols
+                ), f"Column mismatch between {path_list[0]} and {path}, {base_cols}, {new_cols}"
 
                 df_list.append(df)
             else:
@@ -205,6 +206,10 @@ class AITER_CONFIG(object):
             if df_list
             else pd.DataFrame()
         )
+        has_tag = "_tag" in merge_df.columns
+        if has_tag:
+            merge_df["_tag"] = merge_df["_tag"].fillna("")
+
         ## get keys from untuned file to drop_duplicates
         untuned_name = (
             re.sub(r"(?:_)?tuned$", r"\1untuned", merge_name)
@@ -215,12 +220,12 @@ class AITER_CONFIG(object):
         if os.path.exists(untuned_path):
             untunedf = pd.read_csv(untuned_path)
             keys = untunedf.columns.to_list()
-            # Add "cu_num" if not already present
             if "cu_num" not in keys:
                 keys.append("cu_num")
+            dedup_keys = keys + ["_tag"] if has_tag else keys
             merge_df = (
                 merge_df.sort_values("us")
-                .drop_duplicates(subset=keys, keep="first")
+                .drop_duplicates(subset=dedup_keys, keep="first")
                 .reset_index(drop=True)
             )
         else:
@@ -234,9 +239,11 @@ class AITER_CONFIG(object):
             config_path.mkdir(parents=True, exist_ok=True)
         new_file_path = f"{config_path}/{merge_name}.csv"
         lock_path = f"{new_file_path}.lock"
+        tmp_file_path = f"{new_file_path}.tmp"
 
         def write_config():
-            merge_df.to_csv(new_file_path, index=False)
+            merge_df.to_csv(tmp_file_path, index=False)
+            os.replace(tmp_file_path, new_file_path)
 
         mp_lock(lock_path, write_config)
         return new_file_path
@@ -317,6 +324,9 @@ CK_3RDPARTY_DIR = os.environ.get(
 )
 CK_HELPER_DIR = f"{AITER_META_DIR}/3rdparty/ck_helper"
 CK_DIR = CK_3RDPARTY_DIR
+HIP_KITTENS_DIR = os.environ.get(
+    "HIP_KITTENS_DIR", f"{AITER_META_DIR}/3rdparty/HipKittens"
+)
 
 
 @functools.lru_cache(maxsize=1)
@@ -512,6 +522,131 @@ def get_module(md_name):
 rebuilded_list = ["module_aiter_enum"]
 
 
+def clone_3rdparty(third_party: str) -> None:
+    def MainFunc():
+        if not os.path.exists(dir_path):
+            import subprocess
+
+            def check_git_version(required_major, required_minor):
+                try:
+                    output = subprocess.check_output(
+                        ["git", "--version"], text=True
+                    ).strip()
+                    import re
+
+                    m = re.search(r"(\d+)\.(\d+)", output)
+                    if m:
+                        major, minor = int(m.group(1)), int(m.group(2))
+                        return (major > required_major) or (
+                            major == required_major and minor >= required_minor
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to check git version: {e}")
+                return False
+
+            logger.info(f"Cloning 3rdparty {third_party} to {dir_path}")
+            # Check git version for --revision flag support (>=2.49)
+            if not check_git_version(2, 49):
+                logger.warning(
+                    "Your git version does not support the --revision flag (requires >=2.49). Slow path is used for cloning 3rdparty."
+                )
+                subprocess.call(
+                    [
+                        "git",
+                        "clone",
+                        "-q",
+                        third_party_info["url"],
+                        dir_path,
+                    ]
+                )
+                subprocess.call(
+                    [
+                        "git",
+                        "-C",
+                        dir_path,
+                        "reset",
+                        "-q",
+                        "--hard",
+                        third_party_info["commit"],
+                    ]
+                )
+                subprocess.call(
+                    [
+                        "git",
+                        "-C",
+                        dir_path,
+                        "submodule",
+                        "update",
+                        "-q",
+                        "--init",
+                        "--recursive",
+                    ]
+                )
+            else:
+                # Save current git config value for advice.detachedHead, set to false
+                prev_detached_head = None
+                try:
+                    try:
+                        prev_detached_head = subprocess.check_output(
+                            ["git", "config", "--get", "advice.detachedHead"], text=True
+                        ).strip()
+                    except subprocess.CalledProcessError:
+                        prev_detached_head = None  # not set before
+                    # Set to false before clone
+                    subprocess.call(
+                        ["git", "config", "--global", "advice.detachedHead", "false"]
+                    )
+
+                    subprocess.call(
+                        [
+                            "git",
+                            "clone",
+                            "-q",
+                            f"--revision={third_party_info['commit']}",
+                            "--depth=1",
+                            "--recurse-submodules",
+                            third_party_info["url"],
+                            dir_path,
+                        ]
+                    )
+                finally:
+                    # Restore config after clone
+                    if prev_detached_head is not None:
+                        subprocess.call(
+                            [
+                                "git",
+                                "config",
+                                "--global",
+                                "advice.detachedHead",
+                                prev_detached_head,
+                            ]
+                        )
+                    else:
+                        subprocess.call(
+                            [
+                                "git",
+                                "config",
+                                "--global",
+                                "--unset",
+                                "advice.detachedHead",
+                            ]
+                        )
+
+    if third_party == "HipKittens":
+        dir_path = HIP_KITTENS_DIR
+        third_party_info = {
+            "url": "https://github.com/HazyResearch/HipKittens.git",
+            "commit": "b027c06ba935b80a53a7c7f7f82c0f9cbd0bf3cb",
+        }
+    elif third_party == "ComposableKernel":
+        # TODO: ComposableKernel will be supported in the future
+        pass
+
+    if "third_party_info" in locals():
+        lock_path = f"{bd_dir}/lock_3rdparty_clone_{third_party}"
+        mp_lock(lockPath=lock_path, MainFunc=MainFunc)
+
+
 def rm_module(md_name):
     os.system(f"rm -rf {get_user_jit_dir()}/{md_name}.so")
 
@@ -532,12 +667,16 @@ def build_module(
     is_python_module,
     is_standalone,
     torch_exclude,
+    third_party,
     hipify=False,
 ):
     os.makedirs(bd_dir, exist_ok=True)
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
     target_name = f"{md_name}.so" if not is_standalone else md_name
+
+    for tp in third_party:
+        clone_3rdparty(tp)
 
     def MainFunc():
         if AITER_REBUILD == 1:
@@ -556,7 +695,7 @@ def build_module(
 
         sources = rename_cpp_to_cu(srcs, src_dir, hipify)
 
-        flags_cc = ["-O3", "-std=c++20"]
+        flags_cc = ["-O3", "-std=c++20", "-Wno-unknown-warning-option"]
         flags_hip = [
             "-DLEGACY_HIPBLAS_DIRECT",
             "-DUSE_PROF_API=1",
@@ -626,16 +765,35 @@ def build_module(
         else:
             sources = exec_blob(blob_gen_cmd, op_dir, src_dir, sources)
 
-        extra_include_paths = [
-            f"{CK_HELPER_DIR}",
-            f"{CK_3RDPARTY_DIR}/include",
-            f"{CK_3RDPARTY_DIR}/library/include",
-        ]
+        extra_include_paths = []
+
+        _is_ckfree = not os.path.isdir(CK_3RDPARTY_DIR)
+        if not _is_ckfree:
+            extra_include_paths += [
+                f"{CK_HELPER_DIR}",
+                f"{CK_3RDPARTY_DIR}/include",
+                f"{CK_3RDPARTY_DIR}/library/include",
+            ]
+        else:
+            # When CK is not available, define AITER_CK_FREE for all modules
+            # so headers use lightweight shims instead of ck_tile/core.hpp
+            flags_cc.append("-DAITER_CK_FREE=1")
+
+        if os.path.isdir(HIP_KITTENS_DIR):
+            extra_include_paths += [
+                f"{HIP_KITTENS_DIR}/include",
+            ]
+
+        extra_include_paths = [p for p in extra_include_paths if os.path.isdir(str(p))]
+
         if not hipify:
+            _extra_inc = extra_include
+            if _is_ckfree:
+                _extra_inc = [p for p in extra_include if os.path.isdir(str(p))]
             extra_include_paths += [
                 f"{AITER_CSRC_DIR}/include",
                 f"{op_dir}/blob",
-            ] + extra_include
+            ] + _extra_inc
             if not is_standalone:
                 extra_include_paths += [f"{AITER_CSRC_DIR}/include/torch"]
         else:
@@ -691,7 +849,7 @@ def build_module(
                     ),
                 )
             )
-            raise SystemExit(
+            raise RuntimeError(
                 f"[aiter] build [{md_name}] under {opbd_dir} failed !!!!!!"
             ) from e
 
@@ -701,6 +859,66 @@ def build_module(
         )
 
     mp_lock(lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
+
+
+def _get_ck_exclude_modules():
+    """Return set of module names that require CK and should be excluded in CK-free builds.
+
+    Combines two detection methods:
+    1. Config pattern matching -- modules whose optCompilerConfig.json entry references
+       CK_DIR, py_itfs_ck, gen_instances, or generate.py
+    2. Hardcoded list -- modules with deep ck_tile:: source-level dependencies that
+       aren't caught by config pattern matching
+
+    V3 ASM modules are exempted because they build with shim headers only.
+    """
+    cfg_path = os.path.join(this_dir, "optCompilerConfig.json")
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            config_data = json.load(f)
+    except Exception:
+        config_data = {}
+
+    # Pattern-matched CK modules
+    ck_patterns = ["CK_DIR", "py_itfs_ck", "gen_instances", "generate.py"]
+    ck_modules = set()
+    for mod_name, mod_cfg in config_data.items():
+        mod_str = json.dumps(mod_cfg)
+        if any(p in mod_str for p in ck_patterns):
+            ck_modules.add(mod_name)
+
+    # V3 ASM modules can build with shim headers -- exempt them
+    v3_flags = ["FAV3_ON", "ONLY_FAV3"]
+    for mod_name, mod_cfg in config_data.items():
+        flags_str = json.dumps(mod_cfg.get("flags_extra_cc", []))
+        if any(f in flags_str for f in v3_flags):
+            ck_modules.discard(mod_name)
+
+    # Modules with deep ck_tile:: source-level deps not caught by config patterns
+    ck_modules |= {
+        "module_activation",
+        "module_cache",
+        "module_custom_all_reduce",
+        "module_fused_qk_norm_mrope_cache_quant_shuffle",
+        "module_fused_qk_norm_rope_cache_quant_shuffle",
+        "module_mla_metadata",
+        "module_mla_reduce",
+        "module_moe_asm",
+        "module_pa",
+        "module_pa_metadata",
+        "module_pa_ragged",
+        "module_pa_v1",
+        "module_ps_metadata",
+        "module_quant",
+        "module_rmsnorm_quant",
+        "module_rope_general_bwd",
+        "module_rope_general_fwd",
+        "module_rope_pos_fwd",
+        "module_sample",
+        "module_topk_plain",
+    }
+
+    return ck_modules
 
 
 def get_args_of_build(ops_name: str, exclude=[]):
@@ -717,6 +935,7 @@ def get_args_of_build(ops_name: str, exclude=[]):
         "torch_exclude": False,
         "hip_clang_path": None,
         "blob_gen_cmd": "",
+        "third_party": [],
     }
 
     def convert(d_ops: dict):
@@ -742,6 +961,13 @@ def get_args_of_build(ops_name: str, exclude=[]):
         if isinstance(data, dict):
             # parse all ops, return list
             if ops_name == "all":
+                # Auto-exclude CK-dependent modules in CK-free builds
+                if not os.path.isdir(CK_3RDPARTY_DIR):
+                    ck_excludes = _get_ck_exclude_modules()
+                    exclude = list(set(exclude) | ck_excludes)
+                    logger.info(
+                        f"[CK-free] Auto-excluding {len(ck_excludes)} CK-dependent modules"
+                    )
                 all_ops_list = []
                 d_all_ops = {
                     "flags_extra_cc": [],
@@ -758,6 +984,10 @@ def get_args_of_build(ops_name: str, exclude=[]):
                     if ops_name in exclude:
                         continue
                     single_ops = convert(d_ops)
+                    # exclude experimental ops if AITER_ENABLE_EXPERIMENTAL is not set
+                    if not os.getenv("AITER_ENABLE_EXPERIMENTAL", False):
+                        if single_ops.get("is_experimental", False):
+                            continue
                     d_single_ops = {
                         "md_name": ops_name,
                         "srcs": single_ops["srcs"],
@@ -765,6 +995,7 @@ def get_args_of_build(ops_name: str, exclude=[]):
                         "flags_extra_hip": single_ops["flags_extra_hip"],
                         "extra_include": single_ops["extra_include"],
                         "blob_gen_cmd": single_ops["blob_gen_cmd"],
+                        "third_party": single_ops["third_party"],
                     }
                     for k in d_all_ops.keys():
                         if isinstance(single_ops[k], list):
@@ -840,6 +1071,7 @@ def compile_ops(
                 torch_exclude = d_args["torch_exclude"]
                 hipify = d_args.get("hipify", False)
                 hip_clang_path = d_args.get("hip_clang_path", None)
+                third_party = d_args.get("third_party", [])
                 prev_hip_clang_path = None
                 if hip_clang_path is not None and os.path.exists(hip_clang_path):
                     prev_hip_clang_path = os.environ.get("HIP_CLANG_PATH", None)
@@ -857,6 +1089,7 @@ def compile_ops(
                     is_python_module,
                     is_standalone,
                     torch_exclude,
+                    third_party,
                     hipify,
                 )
 
