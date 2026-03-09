@@ -334,6 +334,82 @@ python bench_mla_decode.py --model deepseek-V3 -b 4 --seqlen 2048 -print_vgpr
 
 **Note**: MLA decode benchmarks only support DeepSeek models. If you specify a model that is not DeepSeek, the benchmark will fail with an assertion error.
 
+**Comprehensive Benchmark Script:**
+
+Here's a bash script to run `bench_mla_decode.py` with various flag combinations:
+
+```bash
+#!/bin/bash
+# Comprehensive benchmark script for bench_mla_decode.py
+
+MODEL="deepseek-V3"
+OUTPUT_DIR="mla_decode_benchmark_results"
+mkdir -p $OUTPUT_DIR
+
+echo "Starting comprehensive MLA decode benchmarks..."
+
+# Test different batch sizes
+for BATCH in 1 4 8 16; do
+    echo "Testing batch size: $BATCH"
+    python bench_mla_decode.py --model $MODEL -b $BATCH --seqlen 2048 -o
+    mv *.csv $OUTPUT_DIR/batch_${BATCH}.csv 2>/dev/null || true
+done
+
+# Test different sequence lengths
+for SEQLEN in 512 1024 2048 4096; do
+    echo "Testing sequence length: $SEQLEN"
+    python bench_mla_decode.py --model $MODEL -b 4 --seqlen $SEQLEN -o
+    mv *.csv $OUTPUT_DIR/seqlen_${SEQLEN}.csv 2>/dev/null || true
+done
+
+# Test different tensor parallelism degrees
+for TP in 1 2 4 8; do
+    echo "Testing tensor parallelism: $TP"
+    python bench_mla_decode.py --model $MODEL -b 4 --seqlen 2048 -tp $TP -o
+    mv *.csv $OUTPUT_DIR/tp_${TP}.csv 2>/dev/null || true
+done
+
+# Test different data types
+for DTYPE in bf16 fp16; do
+    echo "Testing data type: $DTYPE"
+    python bench_mla_decode.py --model $MODEL -b 4 --seqlen 2048 --dtype $DTYPE -o
+    mv *.csv $OUTPUT_DIR/dtype_${DTYPE}.csv 2>/dev/null || true
+done
+
+# Test with RoPE enabled
+echo "Testing with RoPE enabled"
+python bench_mla_decode.py --model $MODEL -b 4 --seqlen 2048 -use_rope -o
+mv *.csv $OUTPUT_DIR/rope_enabled.csv 2>/dev/null || true
+
+# Test with causal attention
+echo "Testing with causal attention"
+python bench_mla_decode.py --model $MODEL -b 4 --seqlen 2048 -causal -o
+mv *.csv $OUTPUT_DIR/causal_enabled.csv 2>/dev/null || true
+
+# Test with equal sequence lengths
+echo "Testing with equal sequence lengths"
+python bench_mla_decode.py --model $MODEL -b 4 --seqlen 2048 -equal_seqlens -o
+mv *.csv $OUTPUT_DIR/equal_seqlens.csv 2>/dev/null || true
+
+# Test combination of flags
+echo "Testing combination: RoPE + Causal + Equal SeqLens"
+python bench_mla_decode.py --model $MODEL -b 4 --seqlen 2048 -use_rope -causal -equal_seqlens -o
+mv *.csv $OUTPUT_DIR/combined_flags.csv 2>/dev/null || true
+
+# Test VGPR usage
+echo "Testing VGPR usage"
+python bench_mla_decode.py --model $MODEL -b 4 --seqlen 2048 -print_vgpr > $OUTPUT_DIR/vgpr_usage.txt 2>&1
+
+echo "Benchmarking complete! Results saved in $OUTPUT_DIR/"
+```
+
+Save this script as `bench_mla_decode_comprehensive.sh`, make it executable, and run it:
+
+```bash
+chmod +x bench_mla_decode_comprehensive.sh
+./bench_mla_decode_comprehensive.sh
+```
+
 ##### KV Cache Tests
 
 Run FlashAttention with KV cache tests:
