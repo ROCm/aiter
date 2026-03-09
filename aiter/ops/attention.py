@@ -995,103 +995,79 @@ def decode_update_mla_metadata_v1_kernel(
     cu_num: tl.constexpr,
     qk_batch_ratio: tl.constexpr,
     tile_reduce_cnt,
+    num_reject_tokens,
+    has_num_reject_tokens: tl.constexpr,
 ):
-    batch_id = tl.program_id(0)
+    work_id = tl.program_id(0)
+    num_workers = tl.load(work_indptr + cu_num)
+    if work_id >= num_workers:
+        return
+    batch_id = tl.load(work_info + work_id * 8 + 0)
     real_batch_id = batch_id // qk_batch_ratio
-    old_num_worker = tl.load(work_indptr + cu_num)
-    num_partial_tiles = tile_reduce_cnt
-    seq_kv_end = 0
-    seq_kv_last = 0
-    seq_kv_len = 0
-    for j in range(0, real_batch_id + 1):
-        seq_kv_start = tl.load(seqlens_kv_indptr + j)
-        seq_kv_end = tl.load(seqlens_kv_indptr + (j + 1))
-        seq_kv_last = tl.load(kv_last_page_lens + j)
-        seq_kv_len = (seq_kv_end - seq_kv_start - 1) + seq_kv_last
 
-    seq_pre_kv_len = 0
-    for i in range(0, old_num_worker):
-        bs_id = tl.load(work_info + i * 8 + 0)
-        partial_index = tl.load(work_info + i * 8 + 1)
-        q_start = tl.load(work_info + i * 8 + 2)
-        q_end = tl.load(work_info + i * 8 + 3)
-        kv_start = tl.load(work_info + i * 8 + 4)
-        kv_end = tl.load(work_info + i * 8 + 5)
-        kv_offset = tl.load(work_info + i * 8 + 6)
-        if bs_id == batch_id:
-            kv_len = (kv_end - kv_start) + kv_offset
-            seq_pre_kv_len = tl.maximum(seq_pre_kv_len, kv_len)
+    # seq_kv_start = tl.load(seqlens_kv_indptr + real_batch_id).to(tl.int32)
+    seq_kv_end = tl.load(seqlens_kv_indptr + real_batch_id + 1).to(tl.int32)
+    # seq_kv_last = tl.load(kv_last_page_lens + real_batch_id).to(tl.int32)
+    # seq_kv_len = (seq_kv_end - seq_kv_start - 1) + seq_kv_last
 
-    seq_kv_delta = seq_kv_len - seq_pre_kv_len
+    seq_kv_delta = 1
+    if has_num_reject_tokens:
+        seq_kv_delta -= tl.load(num_reject_tokens + real_batch_id).to(tl.int32)
 
-    batch_tile_id = 0
-    batch_last_work_id = -1
-    batch_last_kv_len = seq_kv_len
-    seq_q_start = 2147483647  # INT_MAX
-    seq_q_end = 0
     q_interval = 1
-    for i in range(0, old_num_worker):
-        bs_id = tl.load(work_info + i * 8 + 0)
-        partial_index = tl.load(work_info + i * 8 + 1)
-        q_start = tl.load(work_info + i * 8 + 2)
-        q_end = tl.load(work_info + i * 8 + 3)
-        kv_start = tl.load(work_info + i * 8 + 4)
-        kv_end = tl.load(work_info + i * 8 + 5)
-        kv_offset = tl.load(work_info + i * 8 + 6)
-
-        if bs_id == batch_id:
-            work_kv_len = kv_end - kv_start
-            if kv_offset == 0:
-                batch_last_work_id = i
-                kv_end = seq_kv_end
-                if work_kv_len + seq_kv_delta > 0:
-                    kv_start = kv_end - work_kv_len - seq_kv_delta
-                else:
-                    kv_start = kv_end - 1
+    partial_index = tl.load(work_info + work_id * 8 + 1)
+    q_start = tl.load(work_info + work_id * 8 + 2)
+    q_end = tl.load(work_info + work_id * 8 + 3)
+    kv_start = tl.load(work_info + work_id * 8 + 4)
+    kv_end = tl.load(work_info + work_id * 8 + 5)
+    kv_offset = tl.load(work_info + work_id * 8 + 6)
+    ori_partial_index = partial_index
+    work_kv_len = kv_end - kv_start
+    if kv_offset == 0:
+        if work_kv_len > 0:
+            kv_end = seq_kv_end
+            if work_kv_len + seq_kv_delta > 0:
+                kv_start = kv_end - work_kv_len - seq_kv_delta
             else:
-                kv_offset += seq_kv_delta
-                if kv_offset <= 0:
-                    work_kv_len += kv_offset - 1
-                    kv_offset = 1
-                kv_end = seq_kv_end - kv_offset
-                kv_start = kv_end - work_kv_len
-                batch_last_kv_len = tl.minimum(batch_last_kv_len, kv_offset)
+                kv_start = kv_end - 1
+    else:
+        kv_offset += seq_kv_delta
+        if kv_offset <= 0:
+            work_kv_len += kv_offset - 1
+            kv_offset = 1
+        kv_end = seq_kv_end - kv_offset
+        kv_start = kv_end - work_kv_len
 
-            seq_q_start = tl.minimum(seq_q_start, q_start)
-            seq_q_end = tl.maximum(seq_q_end, q_end)
-            q_interval = q_end - q_start
-            if q_interval > 1:
-                q_start = q_start // q_interval
-                q_end = q_end // q_interval
-                partial_index = partial_index // q_interval
-
-            # tl.store(work_info + i * 8 + 0, batch_id)
-            tl.store(work_info + i * 8 + 1, partial_index)
-            tl.store(work_info + i * 8 + 2, q_start)
-            tl.store(work_info + i * 8 + 3, q_end)
-            tl.store(work_info + i * 8 + 4, kv_start)
-            tl.store(work_info + i * 8 + 5, kv_end)
-            tl.store(work_info + i * 8 + 6, kv_offset)
-            tl.store(work_info + i * 8 + 7, 0)
-            batch_tile_id += 1
-
-    batch_last_kv_pages = (batch_last_kv_len + page_size - 1) // page_size
-    batch_last_kv_start = seq_kv_end - batch_last_kv_pages
-    tl.store(work_info + batch_last_work_id * 8 + 4, batch_last_kv_start)
-    tl.store(work_info + batch_last_work_id * 8 + 5, seq_kv_end)
-
+    q_interval = q_end - q_start
     if q_interval > 1:
-        for i in range(0, num_partial_tiles):
-            partial_start = tl.load(reduce_indptr + i)
-            partial_end = tl.load(reduce_indptr + i + 1)
-            partial_q_start = tl.load(reduce_final_map + i * 2)
-            partial_q_end = tl.load(reduce_final_map + i * 2 + 1)
-            if partial_q_start >= seq_q_start and partial_q_end <= seq_q_end:
-                tl.store(reduce_final_map + i * 2, partial_q_start // q_interval)
-                tl.store(reduce_final_map + i * 2 + 1, partial_q_end // q_interval)
-                for j in range(partial_start, partial_end):
-                    partial_index = tl.load(reduce_partial_map + j)
-                    tl.store(reduce_partial_map + j, partial_index // q_interval)
+        q_start = batch_id
+        q_end = batch_id + 1
+        if partial_index >= 0:
+            partial_index = partial_index // q_interval
+            # partial_index = work_id
+
+    tl.store(work_info + work_id * 8 + 1, partial_index)
+    tl.store(work_info + work_id * 8 + 2, q_start)
+    tl.store(work_info + work_id * 8 + 3, q_end)
+    tl.store(work_info + work_id * 8 + 4, kv_start)
+    tl.store(work_info + work_id * 8 + 5, kv_end)
+    tl.store(work_info + work_id * 8 + 6, kv_offset)
+    tl.store(work_info + work_id * 8 + 7, 0)
+
+    if q_interval > 1 and ori_partial_index >= 0:
+        tile_idx = batch_id
+        partial_start = tl.load(reduce_indptr + tile_idx)
+        partial_end = tl.load(reduce_indptr + tile_idx + 1)
+        if kv_offset == 0:
+            tl.store(reduce_final_map + tile_idx * 2, q_start)
+            tl.store(reduce_final_map + tile_idx * 2 + 1, q_end)
+        found_partial_index = False
+        for i in range(partial_start, partial_end):
+            if not found_partial_index:
+                partial_index_i = tl.load(reduce_partial_map + i)
+                if partial_index_i == ori_partial_index:
+                    tl.store(reduce_partial_map + i, partial_index)
+                    found_partial_index = True
 
 
 def decode_update_mla_metadata_v1(
@@ -1112,6 +1088,7 @@ def decode_update_mla_metadata_v1(
     max_seqlen_qo: int = 1,
     dtype_q: torch.dtype = dtypes.bf16,
     dtype_kv: torch.dtype = dtypes.bf16,
+    num_reject_tokens: Optional[torch.Tensor] = None,
 ) -> None:
     """
     This function is used to update the mla metadata for the decode update
@@ -1135,7 +1112,7 @@ def decode_update_mla_metadata_v1(
         qk_batch_ratio = num_heads_per_head_k // 16
         num_heads_per_head_k = 16
         batch_size *= qk_batch_ratio
-    grid = (batch_size,)
+    grid = (max_work,)
     decode_update_mla_metadata_v1_kernel[grid](
         seqlens_qo_indptr,
         seqlens_kv_indptr,
@@ -1153,4 +1130,6 @@ def decode_update_mla_metadata_v1(
         cu_num,
         qk_batch_ratio,
         tile_reduce_cnt,
+        num_reject_tokens,
+        num_reject_tokens is not None,
     )
