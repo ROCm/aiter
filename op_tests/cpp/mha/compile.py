@@ -3,6 +3,7 @@
 import sys
 import os
 import argparse
+from pathlib import Path
 
 # !!!!!!!!!!!!!!!! never import aiter
 # from aiter.jit import core
@@ -28,27 +29,20 @@ def get_asm_dir():
 
 def get_embedded_hsa_build_args():
     """Optional embedded-HSA config passed from the outer build via env vars."""
-    header = os.getenv("AITER_EMBEDDED_HSA_HEADER", "").strip()
-    include_dir = os.getenv("AITER_EMBEDDED_HSA_INCLUDE_DIR", "").strip()
+    header_path_var = os.getenv("AITER_EMBEDDED_HSA_HEADER_PATH", "").strip()
     flags_extra_cc = []
 
-    if header:
-        # If header is provided, then make sure that include_dir is also provided,
-        # otherwise the embedded HSA header won't be found during compilation.
-        if not include_dir:
-            raise ValueError(
-                "AITER_EMBEDDED_HSA_HEADER is provided without AITER_EMBEDDED_HSA_INCLUDE_DIR. "
-                "Both must be provided to use embedded HSA header."
-            )
-
+    # If header is provided, then make sure that include_dir is also provided,
+    # otherwise the embedded HSA header won't be found during compilation.
+    if header_path_var:
+        header_path = Path(header_path_var)
         # aiter_hip_common.h uses: #include AITER_EMBEDDED_HSA_HEADER
         # so the macro value must be a quoted header token.
-        flags_extra_cc.append(f'-DAITER_EMBEDDED_HSA_HEADER=\\"{header}\\"')
+        flags_extra_cc.append(f'-DAITER_EMBEDDED_HSA_HEADER=\\"{header_path.name}\\"')
 
         # Keep optCompilerConfig's default include list intact by passing include dir
         # as a compile flag instead of overriding `extra_include` in custom args.
-        flags_extra_cc.append(f"-I{include_dir}")
-
+        flags_extra_cc.append(f"-I{header_path.parent}")
     return flags_extra_cc
 
 
