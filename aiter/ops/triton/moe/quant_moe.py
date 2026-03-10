@@ -5,7 +5,10 @@ from aiter.ops.triton._triton_kernels.moe.quant_moe import (
     _downcast_to_static_fp8,
     _downcast_to_mxfp,
     _upcast_from_mxfp,
+    _smoothquant_fuse_quant_kernel,
+    _smoothquant_fuse_quant_kernel_single_pass,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 
 def downcast_to_static_fp8_3d(x: torch.Tensor, scale: torch.Tensor):
@@ -21,7 +24,11 @@ def downcast_to_static_fp8_3d(x: torch.Tensor, scale: torch.Tensor):
 
 def downcast_to_static_fp8(x: torch.Tensor, scale: torch.Tensor):
     M, N = x.shape
-    y = torch.empty((M, N), dtype=torch.float8_e4m3fn, device="cuda")
+    if get_arch() != "gfx942":
+        dtype = torch.float8_e4m3fn
+    else:
+        dtype = torch.float8_e4m3fnuz
+    y = torch.empty((M, N), dtype=dtype, device="cuda")
 
     BLOCK_M = min(triton.next_power_of_2(M), 128)
     if M <= 4096:
@@ -75,7 +82,11 @@ def downcast_to_mxfp(
     # downcast
     src_tensor = src_tensor.transpose(axis, src_tensor.ndim - 1)
     is_fp4 = out_quant_type == torch.uint8
-    is_fp8 = out_quant_type in (torch.float8_e4m3fn, torch.float8_e5m2)
+    is_fp8 = out_quant_type in (
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2,
+    )
     assert is_fp4 or is_fp8
     divisor = 2 if is_fp4 else 1
     L = src_tensor.shape[-1]
@@ -137,6 +148,7 @@ def upcast_from_mxfp(
         torch.uint8,
         torch.float8_e5m2,
         torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
     }, f"Invalid tensor dtype {tensor.dtype=}"
     assert scale.dtype == torch.uint8, f"Invalid scale dtype {scale.dtype=}"
     assert dtype in (torch.float16, torch.bfloat16), f"Invalid output dtype {dtype=}"
@@ -226,3 +238,122 @@ def dequant_w_blockscale(w, w_scales, group_shape):
     w = w * scales
     w = w.view(E, K_pad, N_pad)[:, :K, :N]
     return w
+
+
+def smoothquant_quantize(
+    x: torch.Tensor,
+    smooth_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply smoothquant quantization to convert bf16/fp16 tensor to int8.
+
+    Args:
+        x: Input tensor in bf16/fp16 [M, K]
+        smooth_scale: Per-column smooth scale in fp32 [K]
+
+    Returns:
+        x_int8: Quantized int8 tensor [M, K]
+        x_scale: Per-row quantization scale in fp32 [M]
+
+    The operation performs:
+    1. x_smooth = x * smooth_scale (per column)
+    2. row_scale = max(abs(x_smooth), dim=1) / 127
+    3. x_int8 = round(x_smooth / row_scale)
+    """
+    assert x.ndim == 2, f"Expected 2D tensor, got {x.ndim}D"
+    assert smooth_scale.ndim == 1, f"Expected 1D smooth_scale, got {smooth_scale.ndim}D"
+    assert (
+        x.shape[1] == smooth_scale.shape[0]
+    ), f"Dimension mismatch: x.shape[1]={x.shape[1]}, smooth_scale.shape[0]={smooth_scale.shape[0]}"
+
+    M, K = x.shape
+    device = x.device
+
+    x_int8 = torch.empty((M, K), dtype=torch.int8, device=device)
+    x_scale = torch.empty((M,), dtype=torch.float32, device=device)
+
+    smooth_scale = smooth_scale.to(torch.float32).contiguous()
+
+    MAX_SINGLE_PASS_K = 1024
+    BLOCK_M = min(triton.next_power_of_2(M), 32)
+
+    if K <= MAX_SINGLE_PASS_K:
+        # Single pass: load entire row at once
+        BLOCK_K = triton.next_power_of_2(K)
+        grid = (triton.cdiv(M, BLOCK_M),)
+
+        _smoothquant_fuse_quant_kernel_single_pass[grid](
+            x,
+            x.stride(0),
+            x.stride(1),
+            smooth_scale,
+            x_int8,
+            x_int8.stride(0),
+            x_int8.stride(1),
+            x_scale,
+            1,
+            M,
+            K,
+            BLOCK_M,
+            BLOCK_K,
+            num_warps=4,
+        )
+    else:
+        BLOCK_K = 256
+        grid = (triton.cdiv(M, BLOCK_M),)
+        _smoothquant_fuse_quant_kernel[grid](
+            x,
+            x.stride(0),
+            x.stride(1),
+            smooth_scale,
+            x_int8,
+            x_int8.stride(0),
+            x_int8.stride(1),
+            x_scale,
+            1,
+            M,
+            K,
+            BLOCK_M,
+            BLOCK_K,
+            num_warps=4,
+        )
+
+    return x_int8, x_scale
+
+
+def quantize_weights_int8(
+    w: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantize weights to int8 with per-output-channel scaling.
+
+    Args:
+        w: Weight tensor in bf16/fp16/fp32 [E, K, N] or [K, N]
+
+    Returns:
+        w_int8: Quantized int8 weights (contiguous)
+        w_scale: Per-output-channel scale [E, N] or [N] (contiguous)
+    """
+    if w.ndim == 2:
+        # [K, N] -> [1, K, N]
+        w = w.unsqueeze(0)
+        squeeze_output = True
+    else:
+        squeeze_output = False
+
+    w_fp32 = w.to(torch.float32)
+    w_abs_max = w_fp32.abs().max(dim=1).values
+    INT8_MAX = 127.0
+    w_scale = w_abs_max / INT8_MAX + 1e-12
+    w_scaled = w_fp32 / w_scale[:, None, :]
+    w_int8 = w_scaled.round().clamp(-127, 127).to(torch.int8)
+
+    # Layout [E, K, N] with N contiguous
+    w_int8 = w_int8.contiguous()
+    w_scale = w_scale.contiguous()
+
+    if squeeze_output:
+        w_int8 = w_int8.squeeze(0)
+        w_scale = w_scale.squeeze(0)
+
+    return w_int8, w_scale

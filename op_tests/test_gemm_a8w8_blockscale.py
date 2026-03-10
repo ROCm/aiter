@@ -1,24 +1,22 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
-import sys
 import os
+import sys
 
 # Add parent directory to path to ensure we use local aiter module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import aiter
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from einops import rearrange
-from einops import repeat as eirp
-from typing_extensions import List
-
-import aiter
 from aiter import dtypes
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
+from einops import rearrange
+from einops import repeat as eirp
 
 block_shape = (128, 128)
 
@@ -49,12 +47,12 @@ def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @perftest()
-def run_gemm_ck(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
+def run_gemm(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype)
 
 
 @perftest()
-def run_gemm_bpreshuffle_ck(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
+def run_gemm_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_blockscale_bpreshuffle(
         x, weightshuffle, x_scale, w_scale, dtype
     )
@@ -63,7 +61,6 @@ def run_gemm_bpreshuffle_ck(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf1
 @benchmark()
 def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     ret = {}
-    dim = (m, n, k)
     block_shape_n, block_shape_k = block_shape
     scale_m = m
     scale_n = (n + block_shape_n - 1) // block_shape_n
@@ -78,7 +75,7 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
     gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
     gemm_weight = shuffle_weight(weight, layout=(16, 16)) if ck_preshuffle else weight
-    run_func = run_gemm_bpreshuffle_ck if ck_preshuffle else run_gemm_ck
+    run_func = run_gemm_bpreshuffle if ck_preshuffle else run_gemm
     b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
 
     err_ck = checkAllclose(a, b, msg="ck")
@@ -87,18 +84,16 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
     ret["ck err"] = err_ck
 
-    tag = "asm"
-    weight_asm = shuffle_weight(weight, layout=(32, 16))
-    # kernel_name = "_ZN5aiter43fp8gemm_bf16_blockscale_BpreShuffle_128x128E"
-    # c, avg_c = run_asm(x, weight_asm, x_scale, w_scale, dtype, kernel_name=kernel_name)
-    c, avg_c = run_asm(x, weight_asm, x_scale, w_scale, dtype)
+    # tag = "asm"
+    # weight_asm = shuffle_weight(weight, layout=(16, 16))
+    # c, avg_c = run_asm(x, weight_asm, x_scale_t, w_scale, dtype)
 
-    err_asm = checkAllclose(a, c, msg=f"{tag}")
-    ret[f"{tag} us"] = avg_c
-    ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
-    ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
-    ret[f"{tag} err"] = err_asm
-    ret["asm/ck"] = avg_c / avg_b
+    # err_asm = checkAllclose(a, c, msg=f"{tag}")
+    # ret[f"{tag} us"] = avg_c
+    # ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
+    # ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
+    # ret[f"{tag} err"] = err_asm
+    # ret["asm/ck"] = avg_c / avg_b
 
     return ret
 
@@ -215,12 +210,6 @@ parser.add_argument(
     "-nk",
     type=dtypes.str2tuple,
     nargs="*",
-    choices=[
-        (24576, 1536),
-        # (32768, 512),
-        # (7168, 16384),
-        # (36864, 7168),
-    ],
     default=[
         (24576, 1536),
         # (32768, 512),

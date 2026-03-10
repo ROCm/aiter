@@ -6,3 +6,4 @@ pyyaml
 einops
 pybind11>=3.0.1
 ninja
+flydsl==0.0.1.dev95158637
