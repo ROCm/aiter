@@ -29,7 +29,7 @@ def get_embedded_hsa_build_args():
 
         # Keep optCompilerConfig's default include list intact by passing include dir
         # as a compile flag instead of overriding `extra_include` in custom args.
-        flags_extra_cc.append(f"-I{header_path.parent}")
+        flags_extra_cc.append(f'-I"{header_path.parent}"')
     return flags_extra_cc
 
 def cmdGenFunc_mha_fwd(ck_exclude: bool):
