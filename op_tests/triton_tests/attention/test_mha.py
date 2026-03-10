@@ -812,7 +812,7 @@ def test_mha_backward_varlen(
 
 
 # Run PE tests with:
-# pytest op_tests/triton_tests/test_mha.py -k with_pe
+# pytest op_tests/triton_tests/attention/test_mha.py -k with_pe
 
 
 @pytest.mark.parametrize("BATCH", [1, 3])
@@ -1306,7 +1306,7 @@ def test_mha_backward_varlen_with_pe(
 
 
 # Run sink tests with:
-# pytest op_tests/triton_tests/test_mha.py -k with_sink
+# pytest op_tests/triton_tests/attention/test_mha.py -k with_sink
 
 
 @pytest.mark.parametrize("BATCH", [1, 3])

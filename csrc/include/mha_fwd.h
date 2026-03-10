@@ -1,6 +1,6 @@
 #pragma once
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 // Include these 2 headers instead of torch/extension.h since we don't need all
 // of the torch headers.
@@ -333,6 +333,24 @@ struct __attribute__((packed)) fmha_fwd_v3_args
     p2 _p30;
     const void* ptr_kseq_padding;
     p2 _p31;
+    const void* ptr_q_descale;
+    p2 _p32;
+    const void* ptr_k_descale;
+    p2 _p33;
+    const void* ptr_v_descale;
+    p2 _p34;
+    unsigned int s_descale_q_Bs;
+    p3 _p35;
+    unsigned int s_descale_q_Hs;
+    p3 _p36;
+    unsigned int s_descale_k_Bs;
+    p3 _p37;
+    unsigned int s_descale_k_Hs;
+    p3 _p38;
+    unsigned int s_descale_v_Bs;
+    p3 _p39;
+    unsigned int s_descale_v_Hs;
+    p3 _p40;
 };
 
 __attribute__((visibility("default"))) float mha_fwd(mha_fwd_args args,

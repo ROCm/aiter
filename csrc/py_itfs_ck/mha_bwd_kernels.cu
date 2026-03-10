@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
 #include <ATen/hip/HIPContext.h>
@@ -90,23 +90,6 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
         std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + std::to_string(window_size_right);
         mask = mask_info::decode(mask_identify, seqlen_q, seqlen_k); // local
     }
-
-    auto get_mask_type = [&]() {
-        if (mask.type == mask_enum::no_mask) {
-            return 0;
-        } else {
-            if (mask.type == mask_enum::window_generic) {
-                assert(false);
-                return 0;
-            } else {
-                if ((mask.left == -1) && (mask.right == 0)) {
-                    return (mask.type == mask_enum::mask_top_left) ? 1 : 2;
-                } else {
-                    return 3;
-                }
-            }
-        }
-    };
 
     // q, k, v, out had been padded in mha_fwd
     // dq_, dk_, dv_ are also padded tensor
@@ -302,8 +285,7 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
                 nhead_stride_dbias = dbias.stride(2);
             }
 
-            return mha_bwd_args{get_mask_type(),
-                                false, // use_v3
+            return mha_bwd_args{false, // use_v3
                                 false, // is_v3_atomic_fp32
                                 false, // how_v3_bf16_cvt
                                 false, // v3_api_check
