@@ -174,7 +174,6 @@ def run_case(case: MoeCase, dtype, num_iters: int, num_warmup: int, seed: int):
     w1_scale = shuffle_scale_a16w4(w1_scale, case.expert, True)
     w2_scale = shuffle_scale_a16w4(w2_scale, case.expert, False)
 
-    # per_1x32 cktile kernels dereference exp_bias optional in generated code.
     bias1 = torch.zeros((case.expert, case.stage1_n), dtype=dtypes.fp32, device=device)
     bias2 = torch.zeros((case.expert, model_dim), dtype=dtypes.fp32, device=device)
 
@@ -200,28 +199,10 @@ def run_case(case: MoeCase, dtype, num_iters: int, num_warmup: int, seed: int):
         num_warmup=num_warmup,
     )
 
-    stage2_in = cktile_moe_stage1(
-        hidden_states,
-        w1_qt,
-        w2_qt,
-        sorted_ids,
-        sorted_expert_ids,
-        num_valid_ids,
-        stage1_out,
-        case.topk,
-        block_m=block_m,
-        a1_scale=None,
-        w1_scale=w1_scale,
-        sorted_weights=sorted_weights,
-        n_pad_zeros=0,
-        k_pad_zeros=0,
-        bias1=bias1,
-    )
-
     moe_out = torch.empty((token, model_dim), dtype=dtype, device=device)
     _, stage2_us = run_perftest(
         cktile_moe_stage2,
-        stage2_in,
+        stage1_out,
         w1_qt,
         w2_qt,
         sorted_ids,
