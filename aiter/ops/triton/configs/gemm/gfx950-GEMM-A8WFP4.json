@@ -70,7 +70,7 @@
         "BLOCK_SIZE_K": 256,
         "GROUP_SIZE_M": 32,
         "num_warps": 8,
-        "num_stages": 2,
+        "num_stages": 1,
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 32,
         "kpack": 1,
