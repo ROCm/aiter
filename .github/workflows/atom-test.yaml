@@ -66,7 +66,7 @@ jobs:
           - model_name: "gpt-oss-120b"
             label: MI355
             model_path: "openai/gpt-oss-120b"
-            extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.8"
+            extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.5"
             env_vars: |
               ATOM_GPT_OSS_MODEL=1
             accuracy_test_threshold: "0.38"
