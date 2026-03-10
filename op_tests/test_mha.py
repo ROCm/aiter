@@ -341,10 +341,11 @@ def test_flash_attn_output(
 
     us_bwd = 1.0
 
+    seqlen_k_eff = seqlen_k / 2.0 if causal else float(seqlen_k)
     fwd_flop = (
         batch_size
         * nheads
-        * (seqlen_q * seqlen_k * d * 2 + seqlen_q * seqlen_k * d_v * 2)
+        * (seqlen_q * seqlen_k_eff * d * 2 + seqlen_q * seqlen_k_eff * d_v * 2)
     )
     dtype_bytes = torch.finfo(dtype).bits // 8
     fwd_num_bytes = (
@@ -356,7 +357,7 @@ def test_flash_attn_output(
     bwd_flop = (
         batch_size
         * nheads
-        * (seqlen_q * seqlen_k * d * 2 * 3 + seqlen_q * seqlen_k * d_v * 2 * 2)
+        * (seqlen_q * seqlen_k_eff * d * 2 * 3 + seqlen_q * seqlen_k_eff * d_v * 2 * 2)
     )
     bwd_num_bytes = (
         2 * fwd_num_bytes
