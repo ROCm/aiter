@@ -274,6 +274,7 @@ class FmoeTuner(TunerCommon):
         num_valid_ids,
         w2_scale,
         a2_scale,
+        moe_buf,
         dtype,
         topk,
         kparams,
@@ -290,6 +291,7 @@ class FmoeTuner(TunerCommon):
             sorted_token_ids=sorted_ids,
             sorted_expert_ids=sorted_expert_ids,
             num_valid_ids=num_valid_ids,
+            out=moe_buf,
             topk=topk,
             tile_m=kparams["tile_m"],
             tile_n=kparams["tile_n"],
@@ -1819,7 +1821,7 @@ class FmoeTuner(TunerCommon):
         )
 
         for blockM in blockMs:
-            if blockM not in [32, 64] or not use_g1u1:
+            if blockM not in [32, 64, 128] or not use_g1u1:
                 continue
             for kname, kparams in flydsl_s1_kernels.items():
                 if kparams["tile_m"] != blockM:
@@ -1897,7 +1899,7 @@ class FmoeTuner(TunerCommon):
                         ),
                         FmoeTuner.run_flydsl_stage2_out,
                         (
-                            [0, 10, 11, 5, 6, 7, 8, 4, 14],
+                            [0, 10, 11, 5, 6, 7, 8, 4, 14, 9],
                             dtype,
                             topk,
                             kparams,
@@ -2112,6 +2114,13 @@ class FmoeTuner(TunerCommon):
                 & (profileDF["us"] != float("-inf"))
                 & (profileDF["us"] != -1)
             ]
+            # Keep best non-flydsl per (stage, block_m) for fallback before dedup
+            _non_flydsl = profileDF[
+                ~profileDF["kernelName"].astype(str).str.startswith("flydsl_")
+            ]
+            _non_flydsl_best = _non_flydsl.sort_values("us").drop_duplicates(
+                ["stage", "block_m"], keep="first"
+            )
             profileDF = profileDF.sort_values("us").drop_duplicates(
                 ["stage", "block_m"], keep="first"
             )
@@ -2271,13 +2280,44 @@ class FmoeTuner(TunerCommon):
                 "flydsl_"
             ) or str(best_one.get("kernelName2", "")).startswith("flydsl_")
             if best_has_flydsl:
-                non_flydsl_df = profileDF[
-                    ~(
-                        profileDF["kernelName1"].astype(str).str.startswith("flydsl_")
-                        | profileDF["kernelName2"].astype(str).str.startswith("flydsl_")
+                # Build fallback from best non-flydsl candidates (saved before dedup)
+                _nf_s1 = (
+                    _non_flydsl_best[_non_flydsl_best["stage"] == "stage1"]
+                    .drop(columns=["stage"])
+                    .rename(
+                        columns={
+                            "kernelName": "kernelName1",
+                            "err": "err1",
+                            "us": "us1",
+                            "tflops": "tflops1",
+                            "bw": "bw1",
+                        }
                     )
-                ]
+                )
+                _nf_s2 = (
+                    _non_flydsl_best[_non_flydsl_best["stage"] == "stage2"]
+                    .drop(columns=["stage", "ksplit"])
+                    .rename(
+                        columns={
+                            "kernelName": "kernelName2",
+                            "err": "err2",
+                            "us": "us2",
+                            "tflops": "tflops2",
+                            "bw": "bw2",
+                        }
+                    )
+                )
+                _join_keys = [
+                    c for c in self.keys if c in _nf_s1.columns and c in _nf_s2.columns
+                ] + ["block_m"]
+                non_flydsl_df = pd.merge(_nf_s1, _nf_s2, on=_join_keys, how="inner")
                 if len(non_flydsl_df) > 0:
+                    non_flydsl_df["us"] = round(
+                        non_flydsl_df["us1"] + non_flydsl_df["us2"], 4
+                    )
+                    non_flydsl_df["run_1stage"] = 0
+                    non_flydsl_df["tflops"] = 0
+                    non_flydsl_df["bw"] = 0
                     fb = non_flydsl_df.loc[non_flydsl_df["us"].idxmin()].copy()
                     fb["act_type"] = str(fb["act_type"])
                     fb["q_type"] = str(fb["q_type"])

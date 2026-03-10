@@ -55,6 +55,7 @@ def compile_mixed_moe_gemm1(
     enable_bias: bool = False,
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
+    persist_m: int = 1,
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
 
@@ -1419,6 +1420,7 @@ def compile_mixed_moe_gemm2(
     enable_bias: bool = False,
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
+    persist_m: int = 1,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
 
@@ -1600,7 +1602,7 @@ def compile_mixed_moe_gemm2(
     module_name = (
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"_vscale_fix3_v10"
+        f"_vscale_fix3_pm{persist_m}"
     ).replace("-", "_")
 
     class _MOE2(flir.MlirModule):
@@ -1619,7 +1621,8 @@ def compile_mixed_moe_gemm2(
             lds_out_bytes = (
                 2 * tile_m * tile_n if _use_cshuffle_epilog else 0
             )  # f16 bytes
-            lds_total_bytes = max(lds_x_bytes, lds_out_bytes)
+            lds_tid_bytes = int(tile_m) * 4
+            lds_total_bytes = max(lds_x_bytes, lds_out_bytes) + lds_tid_bytes
             lds_total_elems = (
                 lds_total_bytes if a_elem_bytes == 1 else (lds_total_bytes // 2)
             )
@@ -1857,7 +1860,7 @@ def compile_mixed_moe_gemm2(
             expert_rsrc = buffer_ops.create_buffer_resource(
                 arg_expert_ids, max_size=False, num_records_bytes=eid_nbytes_i32
             )
-            _PERSIST_M = 4
+            _PERSIST_M = persist_m
             _c0_p = arith.constant(0, index=True)
             _c1_p = arith.constant(1, index=True)
             _c_pm = arith.constant(_PERSIST_M, index=True)
@@ -2700,9 +2703,14 @@ def compile_mixed_moe_gemm2(
                     t_idx = arith.index_cast(ir.IndexType.get(), t)
                     s_idx = arith.index_cast(ir.IndexType.get(), s)
                     ts_idx = t_idx * arith.constant(topk, index=True) + s_idx
-                    row_byte_base = out_base_idx + ts_idx * arith.constant(
-                        model_dim * out_elem_bytes, index=True
-                    )
+                    if accumulate:
+                        row_byte_base = out_base_idx + t_idx * arith.constant(
+                            model_dim * out_elem_bytes, index=True
+                        )
+                    else:
+                        row_byte_base = out_base_idx + ts_idx * arith.constant(
+                            model_dim * out_elem_bytes, index=True
+                        )
                     return ((fused2, row_byte_base), row_valid)
 
                 def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
@@ -2754,7 +2762,7 @@ def compile_mixed_moe_gemm2(
                             alignment=_e_vec * out_elem_bytes,
                         )
 
-                _e_vec = min(tile_n // 32, 8)
+                _e_vec = 2 if accumulate else min(tile_n // 32, 8)
                 c_shuffle_epilog(
                     arith=arith,
                     vector=vector,
@@ -2812,7 +2820,7 @@ def compile_mixed_moe_gemm2(
         ):
             bdx = 256
             gx = n_in / arith.index(tile_n)
-            _c_pm_l = arith.index(4)
+            _c_pm_l = arith.index(persist_m)
             gy = (size_expert_ids_in + _c_pm_l - arith.index(1)) / _c_pm_l
 
             stream_token = stream_ptr_to_async_token(stream_ptr)
