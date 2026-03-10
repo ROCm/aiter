@@ -107,6 +107,7 @@ jobs:
 
   vllm_benchmark:
     name: vLLM Benchmark (8 GPU)
+    timeout-minutes: 60
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&

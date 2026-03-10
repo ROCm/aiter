@@ -17,6 +17,7 @@ from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
 
 from aiter import dtypes
 
+from ..jit.utils.chip_info import get_gfx
 from ..jit.core import compile_ops
 
 MD_NAME = "module_attention"
@@ -821,7 +822,12 @@ def get_mla_metadata_info_v1(
     max_qo_tiles_per_batch = (
         int(math.ceil(max_seqlen_qo * num_head_qo / 128))
         if num_head_qo == 16
-        or (num_head_qo == 128 and kv_dtype == dtypes.fp8 and q_dtype == dtypes.fp8)
+        or (
+            get_gfx() == "gfx942"
+            and num_head_qo == 128
+            and kv_dtype == dtypes.fp8
+            and q_dtype == dtypes.fp8
+        )
         else int(math.ceil(max_seqlen_qo * num_head_qo / 16))
     )
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
