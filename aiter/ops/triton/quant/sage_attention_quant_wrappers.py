@@ -325,8 +325,8 @@ def rotation_smooth_qk(
     layout="bhsd",
 ):
     # Generate Hadamard Matrix R (Rank 32)
-    # TODO we might want to manually define this matri
-    R = create_hadamard_matrix(block_size, dtype=q.dtype) / (block_size**0.5)
+    # TODO we might want to manually define this matrix
+    R = create_hadamard_matrix(block_size, dtype=q.dtype, device=q.device) / (block_size**0.5)
 
     # R = create_random_hadamard_matrix(block_size, dtype=q.dtype)
     bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
@@ -458,7 +458,7 @@ def smooth_rotate_downcast_qk(
             assert (
                 BLOCK_R is not None
             ), "if using hadamard rotation, BLOCK_R (size of the hadamard matrix) must be provided."
-            R = create_hadamard_matrix(BLOCK_R, q.device) / (BLOCK_R**0.5)
+            R = create_hadamard_matrix(BLOCK_R, q.device).to(dtype=q.dtype, device=q.device) / (BLOCK_R**0.5)
         else:
             BLOCK_R = R.shape[-1]
 
@@ -615,7 +615,7 @@ def create_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
 
 def create_random_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
     # 1. Generate the deterministic Hadamard matrix (H)
-    H = create_hadamard_matrix(block_size, dtype=dtype) / (block_size**0.5)
+    H = create_hadamard_matrix(block_size, device=device, dtype=dtype) / (block_size**0.5)
     # 2. Create the random diagonal matrix D (represented as a vector for efficiency)
     # This generates random +1 or -1 for each column
     random_signs = (

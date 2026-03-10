@@ -511,7 +511,7 @@ def sage_fwd_mxfp4(
             + off_z * stride_bz
             + off_h_q * stride_bh
             + start_m * stride_bm
-            + offs_n * stride_bn
+            + tl.cast(offs_n, tl.int64) * stride_bn
         )
         if USE_BIAS
         else None
