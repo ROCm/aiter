@@ -784,7 +784,8 @@ def _compute_delta_s_kernel(
     stride_sh,
     stride_sm,
     stride_sn,
-    n_heads,
+    n_heads_q,
+    n_heads_k,
     seq_k,
     d_model,
     BLOCK_N: tl.constexpr,  # Number of K-tokens to process
@@ -793,8 +794,10 @@ def _compute_delta_s_kernel(
     pid_m_q = tl.program_id(1).to(tl.int64)  # The Q-block index
     pid_n_k = tl.program_id(2).to(tl.int64)  # The K-block index
 
-    pid_h = pid_bh % n_heads
-    pid_b = pid_bh // n_heads
+    pid_hq = pid_bh % n_heads_q
+    pid_b = pid_bh // n_heads_q
+
+    pid_hk = pid_hq // (n_heads_q // n_heads_k)
 
     offs_n = pid_n_k * BLOCK_N + tl.arange(0, BLOCK_N)
 
@@ -809,7 +812,7 @@ def _compute_delta_s_kernel(
         qm_ptr = (
             Q_mean
             + pid_b * stride_mb
-            + pid_h * stride_mh
+            + pid_hq * stride_mh
             + pid_m_q * stride_mm
             + offs_d * stride_md
         )
@@ -819,7 +822,7 @@ def _compute_delta_s_kernel(
         kn_ptr = (
             K_rot
             + pid_b * stride_kb
-            + pid_h * stride_kh
+            + pid_hk * stride_kh
             + offs_n[:, None] * stride_kn
             + offs_d[None, :] * stride_kd
         )
@@ -832,7 +835,7 @@ def _compute_delta_s_kernel(
     s_ptr = (
         Delta_S
         + pid_b * stride_sb
-        + pid_h * stride_sh
+        + pid_hq * stride_sh
         + pid_m_q * stride_sm
         + offs_n * stride_sn
     )

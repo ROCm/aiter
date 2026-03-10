@@ -333,7 +333,7 @@ def rotation_smooth_qk(
         assert (
             BLOCK_R is not None
         ), "if not passing R (hadamard matrix), BLOCK_R (size of the hadamard matrix) must be provided."
-        R = create_hadamard_matrix(BLOCK_R, dtype=q.dtype, device=q.device) / (BLOCK_R**0.5)
+        R = create_hadamard_matrix(BLOCK_R, device=q.device) / (BLOCK_R**0.5)
     else:
         BLOCK_R = R.shape[-1]
 
@@ -426,7 +426,7 @@ def rotation_smooth_qk(
         # = ((Q x H - q_mean + q_mean) x H.T x K
         # = Q_rot x K_rot + q_mean x K_rot
         # = Q_rot x K_rot + delta_s
-        grid_delta = (b * h_k, Q_NUM_BLKS, K_NUM_BLKS)
+        grid_delta = (b * h_q, Q_NUM_BLKS, K_NUM_BLKS)
         _compute_delta_s_kernel[grid_delta](
             q_mean,
             K_rot,
@@ -443,7 +443,7 @@ def rotation_smooth_qk(
             delta_s.stride(1),
             delta_s.stride(2),
             delta_s.stride(3),
-            h_k,
+            h_q,h_k,
             s_k,
             d,
             BLOCK_N=BLOCK_SIZE_M,
