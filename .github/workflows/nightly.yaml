@@ -4,6 +4,15 @@ on:
   schedule:
     # Run daily at 2 AM UTC
     - cron: '0 2 * * *'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-whl.yaml'
+      - '.github/workflows/test-whl.yaml'
+      - '.github/workflows/promote.yaml'
+      - '.github/workflows/nightly.yaml'
+      - 'scripts/generate_summary.py'
   workflow_dispatch:
     inputs:
       docker_image_py310:
@@ -38,7 +47,7 @@ jobs:
   build:
     uses: ./.github/workflows/build-whl.yaml
     with:
-      release_type: ${{ github.event_name == 'schedule' && 'nightlies' || 'devreleases' }}
+      release_type: ${{ github.event_name == 'schedule' && 'nightlies' || github.event_name == 'pull_request' && 'devreleases' || 'devreleases' }}
       docker_image_py310: ${{ inputs.docker_image_py310 || 'rocm/pytorch:rocm6.2_ubuntu22.04_py3.10_pytorch_release-2.3.0' }}
       docker_image_py312: ${{ inputs.docker_image_py312 || 'rocm/vllm-dev:nightly' }}
       gpu_archs: ${{ inputs.gpu_archs || 'gfx942;gfx950' }}
@@ -59,6 +68,7 @@ jobs:
     needs: [build, test]
     if: >-
       ${{ github.repository_owner == 'ROCm'
+          && github.event_name != 'pull_request'
           && !(inputs.skip_promote || false) }}
     uses: ./.github/workflows/promote.yaml
     with:
