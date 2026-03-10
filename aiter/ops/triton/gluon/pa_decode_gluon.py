@@ -589,8 +589,6 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         + output_partition_idx * stride_max_logits_part
         + max_logits_base_offsets
     )
-    # Use qk_row_mask for max_logits/exp_sums mask (consistent with paged_attention_decode_v2_gluon_dot_kernel)
-    max_logits_group_mask = qk_row_mask
 
     # Create MTP layout indices for output
     output_group_offsets_mtp = gl.arange(
@@ -3376,7 +3374,6 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         + output_partition_idx * stride_max_logits_part
         + max_logits_base_offsets
     )
-    max_logits_group_mask = qk_row_mask
 
     output_group_offsets_mtp = gl.arange(
         0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, pv_mfma_layout)
