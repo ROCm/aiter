@@ -16,10 +16,11 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     _rot_k_only_kernel,
     _rot_q_kernel,
     _rotate_quantize_qk_kernel,
-    _compute_delta_s_kernel
+    _compute_delta_s_kernel,
 )
 
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
+
 
 def fused_sage_quant_mxfp4(
     q,
@@ -37,19 +38,29 @@ def fused_sage_quant_mxfp4(
         b, h_qo, qo_len, head_dim = q.shape
         _, h_kv, kv_len, _ = v.shape
 
-        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = v.stride(0), v.stride(1), v.stride(2), v.stride(3)
+        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+        )
 
     elif layout == "bshd":
         b, qo_len, h_qo, head_dim = q.shape
         _, kv_len, h_kv, _ = v.shape
 
-        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = v.stride(0), v.stride(2), v.stride(1), v.stride(3)
+        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
+            v.stride(0),
+            v.stride(2),
+            v.stride(1),
+            v.stride(3),
+        )
     else:
         raise ValueError(f"Unknown tensor layout: {layout}")
 
     # padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
     sm_scale = head_dim**-0.5
-    
+
     q_fp4, q_scale, k_fp4, k_scale, delta_s = smooth_rotate_downcast_qk(
         q,
         k,
@@ -96,6 +107,7 @@ def fused_sage_quant_mxfp4(
 
     return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
 
+
 def sage_quant_mxfp4(
     q,
     k,
@@ -115,13 +127,23 @@ def sage_quant_mxfp4(
         b, h_qo, qo_len, head_dim = q.shape
         _, h_kv, kv_len, _ = v.shape
 
-        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v= v.stride(0), v.stride(1), v.stride(2), v.stride(3)
+        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+        )
 
     elif layout == "bshd":
         b, qo_len, h_qo, head_dim = q.shape
         _, kv_len, h_kv, _ = v.shape
 
-        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = v.stride(0), v.stride(2), v.stride(1), v.stride(3)
+        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
+            v.stride(0),
+            v.stride(2),
+            v.stride(1),
+            v.stride(3),
+        )
     else:
         raise ValueError(f"Unknown tensor layout: {layout}")
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
@@ -136,9 +158,16 @@ def sage_quant_mxfp4(
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
-    
-    q, k, delta_s = rotation_smooth_qk(q, k, BLKQ, block_size=padded_head_dim, q_smoothing=q_smoothing, layout=layout, sm_scale=(sm_scale * 1.4426950408889634))
 
+    q, k, delta_s = rotation_smooth_qk(
+        q,
+        k,
+        BLKQ,
+        block_size=padded_head_dim,
+        q_smoothing=q_smoothing,
+        layout=layout,
+        sm_scale=(sm_scale * 1.4426950408889634),
+    )
 
     sage_quant_v_kernel[grid](
         v,
@@ -166,6 +195,7 @@ def sage_quant_mxfp4(
     k_fp4, k_scale = downcast_func(k, torch.uint8, axis=-1)
 
     return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
+
 
 def sage_quant(
     q,
@@ -284,13 +314,20 @@ def sage_quant(
 
     return q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale
 
-def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing=False, sm_scale=None, layout="bhsd"):
+
+def rotation_smooth_qk(
+    q,
+    k,
+    BLOCK_SIZE_M=256,
+    block_size=32,
+    q_smoothing=False,
+    sm_scale=None,
+    layout="bhsd",
+):
     # Generate Hadamard Matrix R (Rank 32)
     # TODO we might want to manually define this matri
     R = create_hadamard_matrix(block_size, dtype=q.dtype) / (block_size**0.5)
 
-
-    
     # R = create_random_hadamard_matrix(block_size, dtype=q.dtype)
     bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
 
@@ -306,7 +343,9 @@ def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing=False,
 
     # TODO check the dtypes for scales
     if q_smoothing:
-        q_mean = torch.empty((b, h_q, Q_NUM_BLKS, d), dtype=torch.float32, device=q.device)
+        q_mean = torch.empty(
+            (b, h_q, Q_NUM_BLKS, d), dtype=torch.float32, device=q.device
+        )
         delta_s = torch.empty(
             (b, h_q, Q_NUM_BLKS, s_k), dtype=torch.float32, device=q.device
         )
@@ -348,8 +387,6 @@ def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing=False,
         BLOCK_D=block_size,
     )
 
-    
-
     # 2. Rotate K (Only once!)
     grid_k = (b * h_k, K_NUM_BLKS, d // block_size)
     _rot_k_only_kernel[grid_k](
@@ -372,7 +409,6 @@ def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing=False,
         BLOCK_M=BLOCK_SIZE_M,
         BLOCK_D=block_size,
     )
-
 
     # smooth k after rotation
     K_rot = K_rot - K_rot.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
@@ -404,6 +440,7 @@ def rotation_smooth_qk(q, k, BLOCK_SIZE_M=256, block_size=32, q_smoothing=False,
         )
 
     return Q_rot, K_rot, delta_s
+
 
 def smooth_rotate_downcast_qk(
     q,
@@ -514,7 +551,7 @@ def smooth_rotate_downcast_qk(
         BLOCK_R=BLOCK_R,
         D=d,
         num_warps=4,
-        num_stages=5
+        num_stages=5,
     )
 
     if q_smoothing:
@@ -546,6 +583,7 @@ def smooth_rotate_downcast_qk(
 
     return Q_q, Q_descale, K_q, K_descale, delta_s
 
+
 @functools.lru_cache(maxsize=16)
 def create_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
     """
@@ -574,12 +612,15 @@ def create_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
     # remember to divide by sqrt(block_size) to get orthogonal matrix
     return H
 
+
 def create_random_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
     # 1. Generate the deterministic Hadamard matrix (H)
     H = create_hadamard_matrix(block_size, dtype=dtype) / (block_size**0.5)
     # 2. Create the random diagonal matrix D (represented as a vector for efficiency)
     # This generates random +1 or -1 for each column
-    random_signs = torch.randint(0, 2, (block_size,), device=device, dtype=torch.int) * 2 - 1
+    random_signs = (
+        torch.randint(0, 2, (block_size,), device=device, dtype=torch.int) * 2 - 1
+    )
     # 3. Apply the random signs (H @ D)
     # Multiplying by a diagonal matrix on the right is equivalent to scaling columns
     H_tilde = H * random_signs

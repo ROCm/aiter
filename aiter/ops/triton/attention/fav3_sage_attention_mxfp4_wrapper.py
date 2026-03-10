@@ -8,11 +8,9 @@ import triton
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import map_dims
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import (
-    sage_fwd_mxfp4
+    sage_fwd_mxfp4,
 )
-from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
-    sage_quant_mxfp4
-)
+from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_mxfp4
 
 
 import aiter
@@ -63,7 +61,7 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
 
         FP8_TYPE = aiter.dtypes.fp8
         FP8_MAX = torch.finfo(FP8_TYPE).max
-        
+
         # fused_quant = True
         (
             q_quantized,
@@ -74,15 +72,8 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
             v_descale,
             delta_s,
         ) = sage_quant_mxfp4(
-            q,
-            k,
-            v,
-            FP8_TYPE,
-            FP8_MAX,
-            BLKQ=config["BLOCK_M"],
-            BLKK=64,
-            layout=layout
-        ) # if not fused_quant else fused_sage_quant_mxfp4(
+            q, k, v, FP8_TYPE, FP8_MAX, BLKQ=config["BLOCK_M"], BLKK=64, layout=layout
+        )  # if not fused_quant else fused_sage_quant_mxfp4(
         #     q,
         #     k,
         #     v,

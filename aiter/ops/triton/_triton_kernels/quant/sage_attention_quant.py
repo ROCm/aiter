@@ -15,6 +15,7 @@ from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
 ################# Sage V2 quantization kernels ####################
 
+
 @triton.jit
 def _compute_mx_quant_and_scale_rne(
     src_tensor,
@@ -130,6 +131,7 @@ def _compute_mx_quant_and_scale_rne(
         out_tensor = evens | (odds << 4)
 
     return out_tensor, dequant_scale_exponent
+
 
 @triton.jit
 def sage_quant_v_kernel(
@@ -405,7 +407,9 @@ def _rot_q_kernel(
         + offs_d[None, :] * stride_qd
     )
     r_ptr = (
-        R + tl.arange(0, BLOCK_D)[:, None] * stride_rm + tl.arange(0, BLOCK_D)[None, :] * stride_rd
+        R
+        + tl.arange(0, BLOCK_D)[:, None] * stride_rm
+        + tl.arange(0, BLOCK_D)[None, :] * stride_rd
     )
     q_tile = tl.load(
         q_ptr, mask=(offs_m[:, None] < seq_len) & (offs_d[None, :] < d_model), other=0.0
@@ -493,7 +497,9 @@ def _rot_k_only_kernel(
         + offs_d[None, :] * stride_kd
     )
     r_ptr = (
-        R + tl.arange(0, BLOCK_D)[:, None] * stride_rm + tl.arange(0, BLOCK_D)[None, :] * stride_rd
+        R
+        + tl.arange(0, BLOCK_D)[:, None] * stride_rm
+        + tl.arange(0, BLOCK_D)[None, :] * stride_rd
     )
 
     k_tile = tl.load(
@@ -543,7 +549,7 @@ def _compute_delta_s_kernel(
 ):
     pid_bh = tl.program_id(0).to(tl.int64)
     pid_m_q = tl.program_id(1).to(tl.int64)  # The Q-block index
-    pid_n_k = tl.program_id(2).to(tl.int64) # The K-block index
+    pid_n_k = tl.program_id(2).to(tl.int64)  # The K-block index
 
     pid_h = pid_bh % n_heads
     pid_b = pid_bh // n_heads
@@ -590,7 +596,9 @@ def _compute_delta_s_kernel(
     )
     tl.store(s_ptr, acc, mask=offs_n < seq_k)
 
+
 ################# Sage V1 quantization kernels ####################
+
 
 @triton.jit
 def sage_quant_kernel(

@@ -21,9 +21,8 @@ from op_tests.triton_tests.attention.test_fav3_sage import (
     input_helper,
 )
 from op_tests.op_benchmarks.triton.bench_fav3_sage import fav2_forward_func
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    print_vgpr
-)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import print_vgpr
+
 # Configuration
 logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
