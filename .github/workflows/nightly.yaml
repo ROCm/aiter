@@ -6,8 +6,13 @@ on:
     - cron: '0 2 * * *'
   workflow_dispatch:
     inputs:
-      docker_image:
-        description: 'Docker base image for build'
+      docker_image_py310:
+        description: 'Docker image for Python 3.10 build'
+        type: string
+        required: false
+        default: 'rocm/pytorch:rocm6.2_ubuntu22.04_py3.10_pytorch_release-2.3.0'
+      docker_image_py312:
+        description: 'Docker image for Python 3.12 build'
         type: string
         required: false
         default: 'rocm/vllm-dev:nightly'
@@ -16,51 +21,49 @@ on:
         type: string
         required: false
         default: 'gfx942;gfx950'
+      skip_tests:
+        description: 'Skip test job for faster iteration'
+        type: boolean
+        default: false
+      skip_promote:
+        description: 'Skip promote job (build + test only)'
+        type: boolean
+        default: false
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
-
-env:
-  DOCKER_IMAGE: ${{ github.event.inputs.docker_image || 'rocm/vllm-dev:nightly' }}
-  GPU_ARCHS: ${{ github.event.inputs.gpu_archs || 'gfx942;gfx950' }}
+  group: ${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: true
 
 jobs:
-  setup:
-    runs-on: ubuntu-latest
-    outputs:
-      docker_image: ${{ steps.set-env.outputs.docker_image }}
-      gpu_archs: ${{ steps.set-env.outputs.gpu_archs }}
-    steps:
-      - name: Set environment variables
-        id: set-env
-        run: |
-          echo "docker_image=${{ env.DOCKER_IMAGE }}" >> $GITHUB_OUTPUT
-          echo "gpu_archs=${{ env.GPU_ARCHS }}" >> $GITHUB_OUTPUT
-
   build:
-    needs: setup
     uses: ./.github/workflows/build-whl.yaml
     with:
-      release_type: nightlies
-      docker_image: ${{ needs.setup.outputs.docker_image }}
-      gpu_archs: ${{ needs.setup.outputs.gpu_archs }}
-    secrets: inherit
+      release_type: ${{ github.event_name == 'schedule' && 'nightlies' || 'devreleases' }}
+      docker_image_py310: ${{ inputs.docker_image_py310 || 'rocm/pytorch:rocm6.2_ubuntu22.04_py3.10_pytorch_release-2.3.0' }}
+      docker_image_py312: ${{ inputs.docker_image_py312 || 'rocm/vllm-dev:nightly' }}
+      gpu_archs: ${{ inputs.gpu_archs || 'gfx942;gfx950' }}
+    permissions:
+      id-token: write
+      contents: read
 
   test:
-    needs: [setup, build]
+    needs: build
+    if: ${{ !(inputs.skip_tests || false) }}
     uses: ./.github/workflows/test-whl.yaml
     with:
-      release_type: nightlies
-      wheel_names: ${{ needs.build.outputs.wheel_names }}
-      docker_image: ${{ needs.setup.outputs.docker_image }}
-      test_subset: basic
-    secrets: inherit
+      docker_image: ${{ inputs.docker_image_py312 || 'rocm/vllm-dev:nightly' }}
+    permissions:
+      contents: read
 
   promote:
     needs: [build, test]
+    if: >-
+      ${{ github.repository_owner == 'ROCm'
+          && !(inputs.skip_promote || false) }}
     uses: ./.github/workflows/promote.yaml
     with:
-      release_type: nightlies
+      release_type: ${{ github.event_name == 'schedule' && 'nightlies' || 'devreleases' }}
       wheel_names: ${{ needs.build.outputs.wheel_names }}
-    secrets: inherit
+    permissions:
+      id-token: write
+      contents: read

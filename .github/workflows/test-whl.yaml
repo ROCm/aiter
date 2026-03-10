@@ -3,140 +3,80 @@ name: Test Wheels
 on:
   workflow_call:
     inputs:
-      release_type:
-        description: 'Release type determines target S3 bucket (devreleases, nightlies, prereleases, release)'
-        type: string
-        required: true
-      wheel_names:
-        description: 'Space-separated list of wheel filenames to test'
-        type: string
-        required: true
       docker_image:
         description: 'Docker base image for testing'
         type: string
         required: true
-      test_subset:
-        description: 'Subset of tests to run (basic, full, or smoke)'
-        type: string
-        required: false
-        default: 'basic'
-    outputs:
-      test_status:
-        description: 'Test result status (passed or failed)'
-        value: ${{ jobs.test.outputs.test_status }}
 
 jobs:
   test:
-    runs-on: aiter-1gpu-runner
-    outputs:
-      test_status: ${{ steps.run-tests.outputs.status }}
+    strategy:
+      matrix:
+        include:
+          - runners: aiter-1gpu-runner
+            label: MI300
+          - runners: linux-aiter-mi355-1
+            label: MI355
+      fail-fast: false
+    runs-on: ${{ matrix.runners }}
     permissions:
-      id-token: write
       contents: read
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v4
         with:
-          sparse-checkout: |
-            op_tests
-            aiter
-            .github/scripts
-          path: aiter
+          pattern: aiter-wheels-py*
+          path: dist
+          merge-multiple: true
 
-      - name: Configure AWS credentials
-        if: ${{ github.repository_owner == 'ROCm' }}
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-region: us-east-1
-          role-to-assume: arn:aws:iam::661452401056:role/framework-aiter-${{ inputs.release_type }}
-
-      - name: Install AWS CLI
-        if: ${{ github.repository_owner == 'ROCm' }}
+      - name: List downloaded wheels
         run: |
-          if ! command -v aws &> /dev/null; then
-            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-            unzip -q awscliv2.zip
-            sudo ./aws/install
-            rm -rf awscliv2.zip aws
-          fi
-
-      - name: Download wheels from S3 staging
-        if: ${{ github.repository_owner == 'ROCm' }}
-        run: |
-          STAGING="s3://framework-whls-${{ inputs.release_type }}/whl-staging/gfx942-gfx950"
-          mkdir -p /tmp/test-wheels
-          echo "Downloading wheels from ${STAGING}"
-          for WHL in ${{ inputs.wheel_names }}; do
-            echo "Downloading ${WHL}..."
-            aws s3 cp "${STAGING}/${WHL}" "/tmp/test-wheels/${WHL}"
-          done
           echo "Downloaded wheels:"
-          ls -lh /tmp/test-wheels/
+          ls -lh dist/*.whl
 
-      - name: Start test container
+      - name: Start GPU test container
         run: |
+          docker ps -aq -f name=aiter_test | xargs -r docker stop | xargs -r docker rm || true
+
           if [ -f "/etc/podinfo/gha-render-devices" ]; then
             DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
           else
             DEVICE_FLAG="--device /dev/dri"
           fi
 
-          docker run -dt \
-            --device=/dev/kfd $DEVICE_FLAG \
-            --shm-size=16G \
-            --network=host \
-            --group-add $(getent group render | cut -d: -f3) \
-            --group-add $(getent group video | cut -d: -f3) \
-            -v "${{ github.workspace }}/aiter:/workspace" \
-            -v "/tmp/test-wheels:/wheels" \
+          docker run -dt --network=host --user root --device=/dev/kfd $DEVICE_FLAG \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/dist:/wheels" \
+            --ipc=host --group-add video \
+            --shm-size 16g \
+            --cap-add=SYS_PTRACE \
+            --security-opt seccomp=unconfined \
             -w /workspace \
-            --name aiter_whl_test \
+            --name aiter_test \
             ${{ inputs.docker_image }}
 
-      - name: Install wheel and dependencies
+      - name: Install wheels
+        id: install
         run: |
-          docker exec aiter_whl_test bash -c "pip uninstall -y aiter amd-aiter || true"
-          docker exec aiter_whl_test bash -c "pip install /wheels/*.whl"
-          docker exec aiter_whl_test bash -c "pip show amd-aiter"
-
-      - name: Verify installation
-        run: |
-          docker exec aiter_whl_test bash -c "python3 -c 'import aiter; print(\"Aiter version:\", aiter.__version__)'"
-          docker exec aiter_whl_test bash -c "python3 -c 'import aiter.ops; print(\"Aiter ops imported successfully\")'"
+          docker exec aiter_test bash -c "python3 -m pip install -U pip setuptools"
+          docker exec aiter_test bash -c "pip uninstall -y aiter amd-aiter || true"
+          docker exec aiter_test bash -c "python3 -m pip install --no-index --find-links=/wheels amd-aiter"
+          docker exec aiter_test bash -c "python3 -c 'import aiter; print(\"Aiter version:\", aiter.__version__)'"
 
       - name: Run single-GPU tests
-        id: run-tests
+        id: tests
         run: |
-          set -e
           echo "============================================================"
-          echo "Running SINGLE-GPU tests only (test_subset: ${{ inputs.test_subset }})"
-          echo "Multi-GPU tests are NOT included in wheel validation"
+          echo "Running SINGLE-GPU tests on ${{ matrix.label }}"
           echo "============================================================"
 
-          # Define test subset based on input (ALL are single-GPU only)
-          if [ "${{ inputs.test_subset }}" = "smoke" ]; then
-            # Run minimal smoke tests (fast, basic functionality)
-            # Expected runtime: ~1-2 minutes
-            TEST_FILES="op_tests/test_aiter_add.py op_tests/test_aiter_sigmoid.py"
-            echo "Running SMOKE tests (2 tests)"
-          elif [ "${{ inputs.test_subset }}" = "basic" ]; then
-            # Run basic test suite (moderate coverage)
-            # Expected runtime: ~5-10 minutes
-            TEST_FILES="op_tests/test_aiter_add.py op_tests/test_aiter_sigmoid.py op_tests/test_gemm_a16w16.py op_tests/test_activation.py op_tests/test_layernorm2d.py"
-            echo "Running BASIC tests (5 tests)"
-          else
-            # Run full test suite (all single GPU tests, excluding multigpu_tests/)
-            # Expected runtime: ~30+ minutes
-            TEST_FILES=$(docker exec aiter_whl_test bash -c "find op_tests -maxdepth 1 -type f -name 'test_*.py' | sort | head -20 | tr '\n' ' '")
-            echo "Running FULL single-GPU tests (first 20 tests)"
-          fi
+          # Basic test suite (5 tests)
+          TEST_FILES="op_tests/test_aiter_add.py op_tests/test_aiter_sigmoid.py op_tests/test_gemm_a16w16.py op_tests/test_activation.py op_tests/test_layernorm2d.py"
 
-          echo "Test files to run:"
-          echo "$TEST_FILES" | tr ' ' '\n'
-          echo "============================================================"
-
-          # Run tests
-          docker exec aiter_whl_test bash -c "
+          docker exec aiter_test bash -c "
             set -e
             testFailed=false
             for file in $TEST_FILES; do
@@ -154,38 +94,21 @@ jobs:
             if [ \"\$testFailed\" = true ]; then
               exit 1
             fi
-          " && echo "status=passed" >> $GITHUB_OUTPUT || echo "status=failed" >> $GITHUB_OUTPUT
-
-      - name: Collect test output
-        if: always()
-        run: |
-          docker exec aiter_whl_test bash -c "cat test_output.log" || true
-
-      - name: Upload test logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheel-test-logs
-          path: test_output.log
-          if-no-files-found: ignore
+          "
 
       - name: Test summary
         if: always()
         run: |
-          echo "## Wheel Test Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- **Release Type**: ${{ inputs.release_type }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Test Subset**: ${{ inputs.test_subset }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Docker Image**: ${{ inputs.docker_image }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Test Status**: ${{ steps.run-tests.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "## Test Summary - ${{ matrix.label }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Runner**: ${{ matrix.runners }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Install**: ${{ steps.install.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tests**: ${{ steps.tests.outcome }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Tested Wheels" >> $GITHUB_STEP_SUMMARY
-          for WHL in ${{ inputs.wheel_names }}; do
-            echo "- ${WHL}" >> $GITHUB_STEP_SUMMARY
-          done
+          ls -lh dist/*.whl | awk '{print "- " $9}' >> $GITHUB_STEP_SUMMARY || true
 
       - name: Clean up
         if: always()
         run: |
-          docker stop aiter_whl_test || true
-          docker rm aiter_whl_test || true
-          rm -rf /tmp/test-wheels
+          docker stop aiter_test || true
+          docker rm aiter_test || true

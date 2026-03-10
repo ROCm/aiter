@@ -4,11 +4,15 @@ on:
   workflow_call:
     inputs:
       release_type:
-        description: 'Release type determines target S3 bucket (devreleases, nightlies, prereleases, release)'
+        description: 'Release type determines target S3 bucket (devreleases, nightlies)'
         type: string
         required: true
-      docker_image:
-        description: 'Docker base image for build'
+      docker_image_py310:
+        description: 'Docker base image for Python 3.10 build'
+        type: string
+        required: true
+      docker_image_py312:
+        description: 'Docker base image for Python 3.12 build'
         type: string
         required: true
       gpu_archs:
@@ -19,77 +23,107 @@ on:
     outputs:
       wheel_names:
         description: 'Space-separated list of built wheel filenames'
-        value: ${{ jobs.build.outputs.wheel_names }}
+        value: ${{ jobs.collect.outputs.wheel_names }}
 
 jobs:
   build:
-    runs-on: aiter-k8s-build
-    outputs:
-      wheel_names: ${{ steps.collect-wheels.outputs.wheel_names }}
+    runs-on: build-only-aiter
     permissions:
       id-token: write
       contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python_version: "3.10"
+            docker_image: ${{ inputs.docker_image_py310 }}
+          - python_version: "3.12"
+            docker_image: ${{ inputs.docker_image_py312 }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          path: aiter
+          fetch-depth: 0
 
       - name: Sync submodules
         run: |
-          cd aiter
           git submodule sync
           git submodule update --init --recursive --depth 1 --jobs 4
+
+      - name: Generate version with date stamp
+        id: version
+        run: |
+          DATE_STAMP=$(date +%Y%m%d)
+          BASE_VERSION=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo "0.1.0")
+          NIGHTLY_VERSION="${BASE_VERSION}+${DATE_STAMP}"
+          echo "version=${NIGHTLY_VERSION}" >> $GITHUB_OUTPUT
+          echo "date_stamp=${DATE_STAMP}" >> $GITHUB_OUTPUT
+          echo "Building version: ${NIGHTLY_VERSION}"
 
       - name: Start build container
         run: |
           docker run -dt --network=host --user root \
-            -v "${GITHUB_WORKSPACE}/aiter:/aiter" \
+            -v "${{ github.workspace }}:/workspace" \
             --ipc=host --shm-size 16g \
-            -w /aiter \
-            --name aiter_build \
-            ${{ inputs.docker_image }}
+            -w /workspace \
+            --name aiter_build_${{ matrix.python_version }} \
+            ${{ matrix.docker_image }}
 
       - name: Install build dependencies
         run: |
-          docker exec aiter_build bash -c "apt-get update && apt-get install -y build-essential"
-          docker exec aiter_build bash -c "python3 -m pip install -U pip setuptools wheel"
-          docker exec aiter_build bash -c "python3 -m pip install ninja>=1.11.1"
-          docker exec aiter_build bash -c "git config --global --add safe.directory /aiter"
+          docker exec aiter_build_${{ matrix.python_version }} bash -c "apt-get update && apt-get install -y build-essential"
+          docker exec aiter_build_${{ matrix.python_version }} bash -c "python3 -m pip install -U pip setuptools wheel"
+          docker exec aiter_build_${{ matrix.python_version }} bash -c "python3 -m pip install ninja>=1.11.1"
+          docker exec aiter_build_${{ matrix.python_version }} bash -c "git config --global --add safe.directory /workspace"
 
       - name: Install package dependencies
         run: |
-          docker exec aiter_build bash -c "cd /aiter && pip install --timeout=60 --retries=10 -r requirements.txt"
+          docker exec aiter_build_${{ matrix.python_version }} bash -c "cd /workspace && pip install --timeout=60 --retries=10 -r requirements.txt"
 
-      - name: Build wheels
+      - name: Build wheels with date-stamped version
         run: |
-          docker exec aiter_build bash -c "cd /aiter && PREBUILD_KERNELS=1 GPU_ARCHS='${{ inputs.gpu_archs }}' python3 setup.py bdist_wheel"
-          docker cp aiter_build:/aiter/dist ./dist
+          docker exec aiter_build_${{ matrix.python_version }} bash -c "cd /workspace && SETUPTOOLS_SCM_PRETEND_VERSION='${{ steps.version.outputs.version }}' PREBUILD_KERNELS=1 GPU_ARCHS='${{ inputs.gpu_archs }}' python3 setup.py bdist_wheel"
+          mkdir -p dist
+          docker cp aiter_build_${{ matrix.python_version }}:/workspace/dist/. ./dist/
 
-      - name: Collect wheel names
-        id: collect-wheels
+      - name: Verify prebuilt kernels
         run: |
-          WHEELS=$(ls dist/*.whl | xargs -n1 basename | tr '\n' ' ')
-          echo "wheel_names=${WHEELS}" >> $GITHUB_OUTPUT
-          echo "Built wheels: ${WHEELS}"
+          echo "=== Prebuilt kernel validation ==="
+          KERNEL_COUNT=$(docker exec aiter_build_${{ matrix.python_version }} find /workspace/aiter/jit -name "*.so" 2>/dev/null | wc -l)
+          echo "Prebuilt kernel .so files: $KERNEL_COUNT"
+          if [ "$KERNEL_COUNT" -lt 10 ]; then
+            echo "::warning::Prebuild may have failed: expected at least 10 kernel .so files, found $KERNEL_COUNT"
+          else
+            echo "✅ Prebuild validation passed: $KERNEL_COUNT kernels compiled"
+          fi
 
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: aiter-wheels
+          name: aiter-wheels-py${{ matrix.python_version }}
           path: dist/*.whl
           retention-days: 3
 
       - name: Build summary
         if: always()
+        env:
+          SUMMARY_DOCKER_IMAGE: ${{ matrix.docker_image }}
+          SUMMARY_PYTHON_VERSION: ${{ matrix.python_version }}
+          SUMMARY_RELEASE_TYPE: ${{ inputs.release_type }}
+          SUMMARY_GPU_ARCHS: ${{ inputs.gpu_archs }}
+          SUMMARY_WHEEL_DIR: dist
         run: |
-          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- **Docker Image**: ${{ inputs.docker_image }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Release Type**: ${{ inputs.release_type }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **GPU Architectures**: ${{ inputs.gpu_archs }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Built Wheels" >> $GITHUB_STEP_SUMMARY
-          ls -lh dist/*.whl | awk '{print "- " $9 " (" $5 ")"}' >> $GITHUB_STEP_SUMMARY || echo "No wheels found" >> $GITHUB_STEP_SUMMARY
+          if [ -f scripts/generate_summary.py ]; then
+            python3 scripts/generate_summary.py build
+          else
+            echo "## Build Summary - Python ${{ matrix.python_version }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Version**: ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Docker Image**: ${{ matrix.docker_image }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Release Type**: ${{ inputs.release_type }}" >> $GITHUB_STEP_SUMMARY
+            ls -lh dist/*.whl | awk '{print "- " $9}' >> $GITHUB_STEP_SUMMARY || true
+          fi
 
       - name: Configure AWS credentials
         if: ${{ github.repository_owner == 'ROCm' }}
@@ -111,11 +145,37 @@ jobs:
       - name: Upload wheels to S3 staging
         if: ${{ github.repository_owner == 'ROCm' }}
         run: |
-          aws s3 cp dist/ s3://framework-whls-${{ inputs.release_type }}/whl-staging/gfx942-gfx950/ \
-            --recursive --exclude "*" --include "*.whl"
+          for WHL in dist/*.whl; do
+            WHL_NAME=$(basename ${WHL})
+            echo "Uploading ${WHL_NAME} to S3 staging..."
+            aws s3 cp ${WHL} s3://framework-whls-${{ inputs.release_type }}/whl-staging/gfx942-gfx950/${WHL_NAME}
+          done
+          echo "✅ All wheels uploaded to S3 staging"
 
       - name: Clean up
         if: always()
         run: |
-          docker stop aiter_build || true
-          docker rm aiter_build || true
+          docker stop aiter_build_${{ matrix.python_version }} || true
+          docker rm aiter_build_${{ matrix.python_version }} || true
+
+  collect:
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      wheel_names: ${{ steps.collect-wheels.outputs.wheel_names }}
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: aiter-wheels-py*
+          path: all-wheels
+          merge-multiple: true
+
+      - name: Collect wheel names
+        id: collect-wheels
+        run: |
+          cd all-wheels
+          WHEELS=$(ls *.whl | tr '\n' ' ')
+          echo "wheel_names=${WHEELS}" >> $GITHUB_OUTPUT
+          echo "Built wheels: ${WHEELS}"
+          ls -lh *.whl
