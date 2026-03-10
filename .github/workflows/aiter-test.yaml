@@ -43,6 +43,9 @@ jobs:
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     runs-on: build-only-aiter
     needs: check-signal
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - name: Checkout code
         if: ${{ !github.event.pull_request.head.repo.fork }}
@@ -127,7 +130,53 @@ jobs:
         if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
           echo "Successfully prepared image: rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}"
-      
+
+      - name: Build wheel from image
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        run: |
+          set -ex
+          IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
+          docker run --rm \
+            -v "${{ github.workspace }}/dist:/dist" \
+            $IMAGE_TAG \
+            bash -c "cd /aiter && python3 setup.py bdist_wheel && cp dist/*.whl /dist/"
+          echo "Built wheels:"
+          ls -lh dist/*.whl
+
+      - name: Upload wheel as artifact
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiter-whl-main-${{ github.run_id }}
+          path: dist/*.whl
+
+      - name: Configure AWS credentials
+        if: ${{ !github.event.pull_request.head.repo.fork && github.repository_owner == 'ROCm' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: us-east-1
+          role-to-assume: arn:aws:iam::661452401056:role/framework-aiter-nightlies
+
+      - name: Install AWS CLI
+        if: ${{ !github.event.pull_request.head.repo.fork && github.repository_owner == 'ROCm' }}
+        run: |
+          if ! command -v aws &> /dev/null; then
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip -q awscliv2.zip
+            sudo ./aws/install
+            rm -rf awscliv2.zip aws
+          fi
+
+      - name: Upload wheels to S3
+        if: ${{ !github.event.pull_request.head.repo.fork && github.repository_owner == 'ROCm' }}
+        run: |
+          for WHL in dist/*.whl; do
+            WHL_NAME=$(basename ${WHL})
+            echo "Uploading ${WHL_NAME} to S3..."
+            aws s3 cp ${WHL} s3://framework-whls-nightlies/whl-staging/gfx942-gfx950/${WHL_NAME}
+          done
+          echo "Wheels uploaded to S3 staging"
+
   split_aiter_tests:
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
