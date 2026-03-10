@@ -345,14 +345,15 @@
     kv_cache_scalar_t*
         k_cache, // Key cache [num_blocks, num_heads_k, head_size // X, block_size, X]
     kv_cache_scalar_t*
-        v_cache,           // Value cache [num_blocks, num_heads_k, block_size // X, head_size, X]
+        v_cache,           // Value cache [num_blocks, num_heads_v, block_size // X, head_size, X]
     int64_t* slot_mapping,  // Slot mapping
     int64_t const* cu_q_len, // Cu Q len tensor [0, batch0_seq_len, batch0_seq_len + batch1_seq_len, ...]
     float* k_scale,        // Key scale for quantized key cache [num_blocks, num_heads_k]
-    float* v_scale,        // Value scale for quantized value cache [num_blocks, num_heads_k]
+    float* v_scale,        // Value scale for quantized value cache [num_blocks, num_heads_v]
     int const num_tokens,  // Number of tokens
     int const page_size,   // Page size for kv cache
-    int const batch_size   // Batch size
+    int const batch_size,  // Batch size
+    int const blocks_per_batch // Uniform blocks per batch (>0: division mapping, 0: prefix-sum fallback)
 )
 {
     int const num_heads        = num_heads_q + num_heads_k + num_heads_v;
@@ -360,66 +361,27 @@
     int const page_size_log2   = __builtin_ctz(page_size);
     int const page_mask        = page_size - 1;
 
-    __shared__ int cum_blk_smem[513];
     int batch_id = -1;
     int cum_blocks = 0;
     if(gridDim.x > 1)
     {
+        // Decode fast path: batch_id = blockIdx.x, no overhead
         batch_id = blockIdx.x;
+    }
+    else if(blocks_per_batch > 0)
+    {
+        // Uniform allocation: simple integer division, no shared memory / syncthreads.
+        // Used when max_tokens_per_batch is known (prefill, mixed, etc.)
+        batch_id = (int)blockIdx.y / blocks_per_batch;
+        if(batch_id >= batch_size)
+            return;
+        cum_blocks = batch_id * blocks_per_batch;
     }
     else
     {
-        int items_per_thr = (batch_size + (int)blockDim.x - 1) / (int)blockDim.x;
-        int thr_start = threadIdx.x * items_per_thr;
-        int thr_end = thr_start + items_per_thr < batch_size ? thr_start + items_per_thr : batch_size;
-
-        __shared__ int thr_prefix[257];
-        int local_sum = 0;
-        for(int i = thr_start; i < thr_end; i++)
-        {
-            int64_t seq_len_i = cu_q_len[i + 1] - cu_q_len[i];
-            int blks = ((seq_len_i + page_mask) >> page_size_log2) + 1;
-            cum_blk_smem[i] = blks;
-            local_sum += blks;
-        }
-        thr_prefix[threadIdx.x] = local_sum;
-        __syncthreads();
-
-        if(threadIdx.x == 0)
-        {
-            int sum = 0;
-            int active = (batch_size + items_per_thr - 1) / items_per_thr;
-            for(int i = 0; i < active; i++)
-            {
-                int tmp = thr_prefix[i];
-                thr_prefix[i] = sum;
-                sum += tmp;
-            }
-            cum_blk_smem[batch_size] = sum;
-        }
-        __syncthreads();
-
-        int base = thr_prefix[threadIdx.x];
-        for(int i = thr_start; i < thr_end; i++)
-        {
-            int tmp = cum_blk_smem[i];
-            cum_blk_smem[i] = base;
-            base += tmp;
-        }
-        __syncthreads();
-
-        int target = (int)blockIdx.y;
-        int lo = 0, hi = batch_size;
-        while(lo < hi)
-        {
-            int mid = (lo + hi) >> 1;
-            if(cum_blk_smem[mid + 1] <= target)
-                lo = mid + 1;
-            else
-                hi = mid;
-        }
-        batch_id = (lo < batch_size && cum_blk_smem[lo + 1] > target) ? lo : -1;
-        cum_blocks = cum_blk_smem[lo];
+        // Fallback: batch_size <= 1 or max_tokens_per_batch unknown
+        batch_id = 0;
+        cum_blocks = 0;
     }
     if(batch_id < 0)
         return;
@@ -1038,22 +1000,52 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
                                             int page_size,
                                             int x,
                                             int batch_size,
+                                            int max_tokens_per_batch,
                                             hipStream_t stream)
 {
-    // blockSize (wg_size): match page_size when sufficient for reduce_per_group.
-    // When page_size < 64 and head_thread > page_size (e.g. head_dim=256, page_size=16),
-    // use 64 threads so reduce_per_group has enough lanes.
     int blockSize = page_size < 64 ? 64 : page_size;
 
-    // Decode fast path: tokens_per_batch <= page_size, gridDim.x = batch_size
-    // gridDim.y = ceil(tokens_per_batch/page_size) + 1 for boundary handling
-    // batch_id = blockIdx.x, block_within_batch = blockIdx.y, no prefix sum
-    int tokens_per_batch = batch_size > 0 ? (num_tokens + batch_size - 1) / batch_size : num_tokens;
-    bool is_decode = (tokens_per_batch < page_size && batch_size > 1);
-    int const gridSizeY = is_decode
-        ? ((tokens_per_batch + page_size - 1) / page_size + 1)
-        : (num_tokens + page_size - 1) / page_size + 2 * batch_size;
-    dim3 gridDim(is_decode ? batch_size : 1, gridSizeY, num_heads_q + num_heads_k + num_heads_v);
+    // Three batch-mapping modes, chosen at launch time:
+    //
+    // Mode A: best when max_tpb < page_size (gridSizeY small, each batch few Y-blocks)
+    // Mode B: best when max_tpb known but large (no prefix-sum, simple division)
+    // Mode C: only when max_tpb unknown AND avg >= page_size
+    int max_tpb = max_tokens_per_batch > 0
+        ? max_tokens_per_batch
+        : (batch_size > 0 ? (num_tokens + batch_size - 1) / batch_size : num_tokens);
+    int gridSizeY_decode  = (max_tpb + page_size - 1) / page_size + 1;
+    int gridSizeY_general = (num_tokens + page_size - 1) / page_size + 2 * batch_size;
+
+    int gridSizeY;
+    int gridDimX;
+    int blocks_per_batch_param = 0; // 0 = not using uniform division
+
+    if(batch_size > 1 && max_tpb < page_size)
+    {
+        // Mode A: decode fast path — batch_id = blockIdx.x
+        gridDimX = batch_size;
+        gridSizeY = gridSizeY_decode;
+    }
+    else if(batch_size > 1)
+    {
+        // Mode B: uniform division — batch_id = blockIdx.y / blocks_per_batch
+        // When max_tokens_per_batch provided: use actual max (exact).
+        // When max_tokens_per_batch=0: use num_tokens as conservative upper bound
+        // (safe for any distribution; may over-allocate Y-blocks for small batches).
+        gridDimX = 1;
+        blocks_per_batch_param = max_tokens_per_batch > 0
+            ? gridSizeY_decode
+            : ((num_tokens + page_size - 1) / page_size + 1);
+        gridSizeY = batch_size * blocks_per_batch_param;
+    }
+    else
+    {
+        // batch_size <= 1: single batch, batch_id = 0
+        gridDimX = 1;
+        gridSizeY = (num_tokens + page_size - 1) / page_size + 1;
+    }
+
+    dim3 gridDim(gridDimX, gridSizeY, num_heads_q + num_heads_k + num_heads_v);
     dim3 blockDim(blockSize);
 
 #define DISPATCH_X_VALUE(x_val, ...)                                            \
@@ -1083,7 +1075,8 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
                                                        v_scale,                 \
                                                        num_tokens,              \
                                                        page_size,               \
-                                                       batch_size
+                                                       batch_size,              \
+                                                       blocks_per_batch_param
 
 #define LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, WG_SIZE)                            \
         DISPATCH_INTERLEAVE_BQ(interleave, {                                    \
@@ -1161,6 +1154,7 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
              page_size,                                                    \
              x,                                                            \
              batch_size,                                                   \
+             max_tokens_per_batch,                                         \
              stream);
 
 #define CALL_QK_NORM_ROPE_CACHE_QUANT(SRC_T, CACHE_T, KV_DTYPE)       \
@@ -1784,7 +1778,8 @@ void fused_qk_norm_rope_cache_block_quant_shuffle(
     at::Tensor& cu_q_len,              // cu q len tensor [0, batch0_seq_len, batch0_seq_len + batch1_seq_len, ...]
     const std::string& kv_cache_dtype, // kv cache data type
     std::optional<at::Tensor> k_scale, // k scale tensor for quantized k cache
-    std::optional<at::Tensor> v_scale  // v scale tensor for quantized v cache
+    std::optional<at::Tensor> v_scale, // v scale tensor for quantized v cache
+    int64_t max_tokens_per_batch       // max tokens in any single batch (0 = use avg, safe for uniform distributions)
 )
  {
      // Input validation

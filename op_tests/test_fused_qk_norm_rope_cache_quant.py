@@ -378,6 +378,7 @@ def run_aiter_qk_norm_rope_cache_block_quant_shuffle(
     kv_cache_dtype: str,
     k_scale: Tensor,
     v_scale: Tensor,
+    max_tokens_per_batch: int = 0,
 ):
     qkv = qkv.clone()  # inplace op
 
@@ -400,6 +401,7 @@ def run_aiter_qk_norm_rope_cache_block_quant_shuffle(
         kv_cache_dtype,
         k_scale,
         v_scale,
+        max_tokens_per_batch,
     )
 
     q_size = num_heads_q * head_size
@@ -842,6 +844,7 @@ def test_qk_norm_rope_cache_block_quant(
         seq_lens[-1] -= total_len - num_tokens
     elif total_len < num_tokens:
         seq_lens[-1] += num_tokens - total_len
+    max_tpb = max(seq_lens)
     #
     cu_q_len = torch.zeros(batch_size + 1, dtype=torch.int64, device="cuda")
 
@@ -871,7 +874,6 @@ def test_qk_norm_rope_cache_block_quant(
             dtype=torch.int64,
             device="cuda",
         )
-    #
     qkv = torch.randn(
         (num_tokens, (num_heads_q + num_heads_k + num_heads_v) * head_size),
         dtype=dtype,
@@ -944,6 +946,7 @@ def test_qk_norm_rope_cache_block_quant(
             kv_cache_dtype,
             k_scale,
             v_scale,
+            max_tokens_per_batch=max_tpb,
         )
     )
 
@@ -1014,7 +1017,7 @@ def test_qk_norm_rope_cache_block_quant(
     ## to test requant in worst case
     # chunk_qkv[:, q_size : q_size + k_size] = 1e-6  # K ~0 -> k_scale_global ~2e-6
     # chunk_qkv[:, q_size + k_size : q_size + k_size + v_size] = (
-    #    1  # V ~0 -> v_scale_global ~2e-6
+    #   1  # V ~0 -> v_scale_global ~2e-6
     # )
     kw = torch.ones(
         head_size, dtype=dtype, device="cuda"
@@ -1088,6 +1091,7 @@ def test_qk_norm_rope_cache_block_quant(
             kv_cache_dtype,
             k_scale_chunk,
             v_scale_chunk,
+            max_tokens_per_batch=chunk_left_ctx_lens,
         )
     )
     #
@@ -1211,6 +1215,7 @@ def test_qk_norm_rope_cache_block_quant(
             kv_cache_dtype,
             k_scale_d1,
             v_scale_d1,
+            max_tokens_per_batch=1,
         )
     )
     print(f"decode1: torch avg: {avg_torch_d1:.2f} us, cu avg: {avg_cu_d1:.2f} us")
@@ -1339,6 +1344,7 @@ def test_qk_norm_rope_cache_block_quant(
                 kv_cache_dtype,
                 k_scale_d2,
                 v_scale_d2,
+                max_tokens_per_batch=dtpb,
             )
         )
         print(f"decode2: torch avg: {avg_torch_d2:.2f} us, cu avg: {avg_cu_d2:.2f} us")
@@ -1464,6 +1470,7 @@ def test_qk_norm_rope_cache_block_quant(
                 kv_cache_dtype,
                 k_scale_d3,
                 v_scale_d3,
+                max_tokens_per_batch=dtpb,
             )
         )
         print(f"decode3: torch avg: {avg_torch_d3:.2f} us, cu avg: {avg_cu_d3:.2f} us")
@@ -1507,6 +1514,210 @@ def test_qk_norm_rope_cache_block_quant(
     return ret
 
 
+def test_mixed_prefill_decode_block_quant(
+    dtype,
+    num_heads_q,
+    num_heads_k,
+    num_heads_v,
+    head_size,
+    num_blocks,
+    page_size,
+    is_neox_style,
+    eps,
+    kv_cache_dtype,
+    num_decode_batches=120,
+    num_prefill_batches=8,
+    prefill_seq_len=100,
+):
+    """Test mixed prefill/decode: some batches have 1 token (decode),
+    others have many tokens (prefill). Verifies that the general path
+    (non-decode) correctly handles non-uniform batch distributions
+    where avg tokens_per_batch < page_size but max > page_size."""
+    torch.manual_seed(0)
+    batch_size = num_decode_batches + num_prefill_batches
+    seq_lens = [1] * num_decode_batches + [prefill_seq_len] * num_prefill_batches
+    num_tokens = sum(seq_lens)
+    max_tpb = max(seq_lens)
+    avg_tpb = (num_tokens + batch_size - 1) // batch_size
+
+    print(f"\n=== Mixed prefill/decode test ===")
+    print(f"  batch_size={batch_size}, num_tokens={num_tokens}")
+    print(
+        f"  seq_lens: {num_decode_batches}x1 (decode) + {num_prefill_batches}x{prefill_seq_len} (prefill)"
+    )
+    print(f"  avg_tpb={avg_tpb}, max_tpb={max_tpb}, page_size={page_size}")
+    print(
+        f"  is_decode would be: avg<ps={avg_tpb < page_size}, max<ps={max_tpb < page_size}"
+    )
+
+    if kv_cache_dtype == "fp8_e4m3":
+        cache_dtype = get_dtype_fp8()
+    else:
+        cache_dtype = dtype
+
+    k_cache = torch.zeros(
+        [num_blocks, page_size, num_heads_k, head_size],
+        dtype=dtype,
+        device="cuda",
+    ).to(cache_dtype)
+    v_cache = torch.zeros(
+        [num_blocks, page_size, num_heads_v, head_size],
+        dtype=dtype,
+        device="cuda",
+    ).to(cache_dtype)
+
+    x = 16 // k_cache.element_size()
+    k_cache = (
+        k_cache.view([num_blocks, page_size, num_heads_k, head_size // x, x])
+        .permute(0, 2, 3, 1, 4)
+        .contiguous()
+    )
+    v_cache = (
+        v_cache.view([num_blocks, page_size // x, num_heads_v, head_size, x])
+        .permute(0, 2, 1, 3, 4)
+        .contiguous()
+    )
+
+    cu_q_len = torch.zeros(batch_size + 1, dtype=torch.int64, device="cuda")
+    for i in range(batch_size):
+        cu_q_len[i + 1] = cu_q_len[i] + seq_lens[i]
+    assert cu_q_len[-1].item() == num_tokens
+
+    slot_start_per_batch = []
+    next_slot = 0
+    for i in range(batch_size):
+        slot_start_per_batch.append(next_slot)
+        blocks_needed = (seq_lens[i] + page_size - 1) // page_size
+        next_slot += blocks_needed * page_size
+    assert (
+        next_slot <= num_blocks * page_size
+    ), f"Need {next_slot // page_size} pages but num_blocks={num_blocks}. Increase -b."
+
+    slot_mapping = torch.zeros(num_tokens, dtype=torch.int64, device="cuda")
+    for i in range(batch_size):
+        start = cu_q_len[i].item()
+        end = cu_q_len[i + 1].item()
+        slot_mapping[start:end] = torch.arange(
+            slot_start_per_batch[i],
+            slot_start_per_batch[i] + (end - start),
+            dtype=torch.int64,
+            device="cuda",
+        )
+
+    qkv = torch.randn(
+        (num_tokens, (num_heads_q + num_heads_k + num_heads_v) * head_size),
+        dtype=dtype,
+        device="cuda",
+    )
+    qw = torch.randn(head_size, dtype=dtype, device="cuda")
+    kw = torch.randn(head_size, dtype=dtype, device="cuda")
+    cos_sin = torch.randn((max_positions, head_size), dtype=dtype, device="cuda")
+    positions = torch.randint(
+        0, max_positions, (num_tokens,), dtype=torch.int64, device="cuda"
+    )
+
+    k_scale = torch.zeros([num_blocks, num_heads_k], dtype=torch.float32, device="cuda")
+    v_scale = torch.zeros([num_blocks, num_heads_v], dtype=torch.float32, device="cuda")
+    k_scale_ref = k_scale.clone()
+    v_scale_ref = v_scale.clone()
+    k_cache_ref = k_cache.clone()
+    v_cache_ref = v_cache.clone()
+
+    (q_ref, k_ref, v_ref, k_cache_ref, v_cache_ref), avg_torch = (
+        run_torch_qk_norm_rope_cache_block_quant_shuffle(
+            qkv,
+            qw,
+            kw,
+            cos_sin,
+            positions,
+            num_tokens,
+            num_heads_q,
+            num_heads_k,
+            num_heads_v,
+            head_size,
+            is_neox_style,
+            eps,
+            k_cache_ref,
+            v_cache_ref,
+            k_scale_ref,
+            v_scale_ref,
+            slot_mapping,
+            kv_cache_dtype,
+        )
+    )
+    (q, k, v, k_cache, v_cache), avg_cu = (
+        run_aiter_qk_norm_rope_cache_block_quant_shuffle(
+            qkv,
+            qw,
+            kw,
+            cos_sin,
+            positions,
+            num_tokens,
+            num_heads_q,
+            num_heads_k,
+            num_heads_v,
+            head_size,
+            is_neox_style,
+            eps,
+            k_cache,
+            v_cache,
+            slot_mapping,
+            cu_q_len,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+            max_tokens_per_batch=max_tpb,
+        )
+    )
+
+    info = (
+        f"mixed_prefill_decode: batch={batch_size}, decode={num_decode_batches}x1, "
+        f"prefill={num_prefill_batches}x{prefill_seq_len}, "
+        f"num_tokens={num_tokens}, max_tpb={max_tpb}"
+    )
+    msg = (
+        f"[perf] === {info} === torch avg: {avg_torch:<8.2f} us, "
+        f"cu avg: {avg_cu:<8.2f} us, uplift: {avg_torch / avg_cu - 1:<5.1%}"
+    )
+    print(msg)
+
+    checkAllclose(q_ref, q, msg="mixed q", rtol=1e-2, atol=0.05)
+    checkAllclose(k_ref, k, msg="mixed k", rtol=1e-2, atol=0.05)
+    checkAllclose(v_ref, v, msg="mixed v", rtol=1e-2, atol=0.05)
+
+    slots_edit = torch.unique(slot_mapping // page_size)
+    checkAllclose(
+        k_cache_ref.float()[slots_edit],
+        k_cache.float()[slots_edit],
+        msg="mixed k_cache",
+        rtol=5e-2,
+        atol=0.05,
+    )
+    checkAllclose(
+        v_cache_ref.float()[slots_edit],
+        v_cache.float()[slots_edit],
+        msg="mixed v_cache",
+        rtol=5e-2,
+        atol=0.05,
+    )
+    checkAllclose(
+        k_scale_ref[slots_edit],
+        k_scale[slots_edit],
+        msg="mixed k_scale",
+        rtol=1e-2,
+        atol=0.01,
+    )
+    checkAllclose(
+        v_scale_ref[slots_edit],
+        v_scale[slots_edit],
+        msg="mixed v_scale",
+        rtol=1e-2,
+        atol=0.01,
+    )
+    print(f"  PASSED: mixed prefill/decode correctness verified")
+    return {"mixed_fused_qk_us": avg_cu, "mixed_unfused_us": avg_torch}
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -1527,7 +1738,7 @@ parser.add_argument(
     "--token",
     type=int,
     nargs="*",
-    default=[3, 127, 513, 778, 1024, 1257],
+    default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 496, 8192, 16384],
     help="""Number of tokens.
     e.g.: -t 513""",
 )
@@ -1568,7 +1779,8 @@ parser.add_argument(
 parser.add_argument(
     "--batch",
     type=int,
-    default=1,
+    nargs="*",
+    default=[1, 4],
     help="""Batch size. num_tokens is split across batch batches for block quant only.
     e.g.: --batch 4""",
 )
@@ -1642,22 +1854,23 @@ if __name__ == "__main__":
                             cache_dtype = args.dtype
                         for quant_type in args.quant_type:
                             if quant_type == "block":
-                                ret = test_qk_norm_rope_cache_block_quant(
-                                    args.dtype,
-                                    num_token,
-                                    num_head,
-                                    num_kv_head,
-                                    num_kv_head,
-                                    head_size,
-                                    args.num_blocks,
-                                    args.block_page_size,
-                                    is_neox_style,
-                                    1e-6,
-                                    kv_cache_dtype,
-                                    batch=args.batch,
-                                    decode_tokens_per_batch=args.decode_tokens_per_batch,
-                                )
-                                block_df.append(ret)
+                                for batch in args.batch:
+                                    ret = test_qk_norm_rope_cache_block_quant(
+                                        args.dtype,
+                                        num_token,
+                                        num_head,
+                                        num_kv_head,
+                                        num_kv_head,
+                                        head_size,
+                                        args.num_blocks,
+                                        args.block_page_size,
+                                        is_neox_style,
+                                        1e-6,
+                                        kv_cache_dtype,
+                                        batch=batch,
+                                        decode_tokens_per_batch=args.decode_tokens_per_batch,
+                                    )
+                                    block_df.append(ret)
                             else:
                                 ret = test_qk_norm_rope_cache_quant(
                                     args.dtype,
@@ -1682,6 +1895,29 @@ if __name__ == "__main__":
         "qk_norm_rope_cache_block_quant summary (markdown):\n%s", block_df_md
     )
 
+    # Mixed prefill/decode test: 120 decode (1 tok) + 8 prefill (100 tok)
+    # avg_tpb = ceil(920/128) = 8 < page_size=64, but max_tpb = 100 > page_size
+    # Old code would wrongly pick decode fast path; with max_tokens_per_batch fix,
+    # it correctly falls back to general path.
+    if "block" in args.quant_type:
+        for num_head, num_kv_head in args.head:
+            for kv_cache_dtype in args.kv_cache_dtypes:
+                test_mixed_prefill_decode_block_quant(
+                    args.dtype,
+                    num_head,
+                    num_kv_head,
+                    num_kv_head,
+                    128,
+                    args.num_blocks,
+                    args.block_page_size,
+                    True,
+                    1e-6,
+                    kv_cache_dtype,
+                    num_decode_batches=120,
+                    num_prefill_batches=8,
+                    prefill_seq_len=100,
+                )
+    #
     dtype = torch.bfloat16
     batch_size = 2
     num_tokens1 = 3608
