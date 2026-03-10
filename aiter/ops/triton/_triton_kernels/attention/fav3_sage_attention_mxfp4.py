@@ -412,7 +412,7 @@ def sage_fwd_mxfp4(
     K_HEAD_DIV: tl.constexpr = 2 if K_DTYPE_STR == "e2m1" else 1
     SCALE_GROUP: tl.constexpr = 32
     ACC_TYPE: tl.constexpr = tl.float32
-
+    # b*h*s*d can grow to be larger than int32 max, so turn to int64
     start_m, off_h_q, off_z = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
     off_h_k = off_h_q // (HQ // HK)
 
@@ -439,8 +439,8 @@ def sage_fwd_mxfp4(
 
     # Masking logic
     mask_info = compute_block_masking(
-        seqlen_k, seqlen_q, start_m, IS_CAUSAL, BLOCK_M, BLOCK_N
-    )
+        seqlen_k, seqlen_q, start_m.to(tl.int32), IS_CAUSAL, BLOCK_M, BLOCK_N
+    ) # need to turn start_m to int32 for consistent return values
     n_front_skip, n_front_masked, n_full, n_back_masked, n_extra = mask_info
 
     if (n_front_masked + n_full + n_back_masked) == 0:
