@@ -1,6 +1,6 @@
 """
 * Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
-* Copyright (C) 2024-2025, The vLLM team.
+* Copyright (C) 2024-2026, The vLLM team.
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -30,8 +30,6 @@ from GemmTuner import GemmTuner
 import time
 import multiprocessing as mp
 import gc
-
-aiter.hipb_create_extension()
 
 
 def generate_mk_sets(model_dir, tp=1):
@@ -177,13 +175,23 @@ if __name__ == "__main__":
             process = mp.Process(target=runGemmTuner, args=(), daemon=False)
             process.start()
             process.join()
-            if process.exitcode > 1:
+            if process.exitcode < 0:
+                # Negative exit code = killed by signal (e.g. -6 SIGABRT from
+                # GPU memory fault, -11 SIGSEGV).  Worth retrying.
                 time.sleep(0.5 * retries)
                 print(
-                    "!Error when run GemmTuner process exitcode is ", process.exitcode
+                    f"!Process killed by signal {-process.exitcode}, retrying ({retries}/{MAX_TRY})"
                 )
                 clean()
                 retries += 1
+            elif process.exitcode > 0:
+                # Positive exit code = normal exit with error (e.g. sys.exit(1)
+                # from tune_summary when some shapes failed).  Tuning results
+                # are already written to disk; retrying won't help.
+                print(
+                    f"!Process exited with code {process.exitcode} (tuning finished with warnings)"
+                )
+                break
             else:
                 break
         except Exception as e:
