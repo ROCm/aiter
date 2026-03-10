@@ -15,6 +15,7 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
 
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     sage_quant_mxfp4,
+    fused_sage_quant_mxfp4
 )
 
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
@@ -57,52 +58,65 @@ def bench_kernel(q, k, v, args, provider):
         _, HK, N_CTX_K, D_HEAD_V = v.shape
 
     BLOCK_R = args.BLOCK_R
-    R = None #  create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (BLOCK_R**0.5)
+    R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (BLOCK_R**0.5)
 
-    def fn():
-        if args.include_quant_overhead:
-            return fav3_sage_mxfp4_wrapper(
-                q,
-                k,
-                v,
-                causal=args.causal,
-                layout=args.layout,
-                q_smooth=args.qsmooth,
-                hadamard_rotation=args.hadamard_rotate,
-                R=R,
-            )
-        else:
-            config = get_sage_fwd_configs_mxfp4()
-            
-            FP8_TYPE = aiter.dtypes.fp8
-            FP8_MAX = torch.finfo(FP8_TYPE).max
-            (
-                q_quantized,
-                q_descale,
-                k_quantized,
-                k_descale,
-                v_quantized,
-                v_descale,
-                delta_s,
-            ) = sage_quant_mxfp4(
-                q, k, v, FP8_TYPE, FP8_MAX, BLKQ=config["BLOCK_M"], BLKK=64, layout=args.layout, R=R, BLOCK_R=BLOCK_R, q_smoothing=args.qsmooth
-            )
+    if args.include_quant_overhead:
+        fn = lambda: fav3_sage_mxfp4_wrapper(
+            q,
+            k,
+            v,
+            causal=args.causal,
+            layout=args.layout,
+            q_smooth=args.qsmooth,
+            hadamard_rotation=args.hadamard_rotate,
+            R=R,
+        )
+    else:
+        config = get_sage_fwd_configs_mxfp4()
+        
+        FP8_TYPE = aiter.dtypes.fp8
+        FP8_MAX = torch.finfo(FP8_TYPE).max
+        (
+            q_quantized,
+            q_descale,
+            k_quantized,
+            k_descale,
+            v_quantized,
+            v_descale,
+            delta_s,
+        ) = sage_quant_mxfp4(
+            q, k, v, FP8_TYPE, FP8_MAX, BLKQ=config["BLOCK_M"], BLKK=64, layout=args.layout, R=R, BLOCK_R=BLOCK_R, q_smoothing=args.qsmooth
+        )
 
-            return fav3_sage_mxfp4_func(
-                q=q_quantized,
-                k=k_quantized,
-                v=v_quantized,
-                q_descale=q_descale,
-                k_descale=k_descale,
-                v_descale=v_descale,
-                bias=delta_s,
-                causal=args.causal,
-                layout=args.layout,
-                config=config,
-            )
+        fn_unfused_quant = lambda: sage_quant_mxfp4(
+            q, k, v, FP8_TYPE, FP8_MAX, BLKQ=config["BLOCK_M"], BLKK=64, layout=args.layout, R=R, BLOCK_R=BLOCK_R, q_smoothing=args.qsmooth
+        )
+
+        ms = triton.testing.do_bench_cudagraph(fn_unfused_quant)
+        print("fn_unfused_quant (ms)", ms)
+
+        fn_fused_quant = lambda: fused_sage_quant_mxfp4(
+            q, k, v, BLOCK_M=config["BLOCK_M"], layout=args.layout, R=R, BLOCK_R=BLOCK_R, q_smoothing=args.qsmooth, hadamard_rotation=args.hadamard_rotate
+        )
+
+        ms = triton.testing.do_bench_cudagraph(fn_fused_quant)
+        print("fn_fused_quant (ms)", ms)
+
+        fn = lambda: fav3_sage_mxfp4_func(
+            q=q_quantized,
+            k=k_quantized,
+            v=v_quantized,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            bias=delta_s,
+            causal=args.causal,
+            layout=args.layout,
+            config=config,
+        )
 
     ms = triton.testing.do_bench(fn)
-    # print("kernel (ms)", ms)
+    print("kernel (ms)", ms)
 
     # Metrics calculation (MXFP4 treats elements as 0.5 bytes in memory traffic for Q/K)
     total_flops = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)

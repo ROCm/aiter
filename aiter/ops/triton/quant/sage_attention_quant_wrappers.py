@@ -11,6 +11,8 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     _rot_k_only_kernel,
     _rot_q_kernel,
     _rotate_quantize_qk_kernel,
+    _rotate_quantize_q_kernel,
+    _rotate_quantize_k_kernel,
     _compute_delta_s_kernel,
 )
 
@@ -75,7 +77,7 @@ def fused_sage_quant_mxfp4(
     BLOCK_K = 1024
     K_NUM_BLKS = (kv_len + BLOCK_K - 1) // BLOCK_K
 
-    # Apply K tensor smoothing following SageAttention approach
+    # V tensor per channel quantization
     v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
 
     v_task_count = b * h_kv * K_NUM_BLKS
@@ -156,6 +158,7 @@ def sage_quant_mxfp4(
     if sm_scale is None:
         sm_scale = head_dim**-0.5
 
+
     q, k, delta_s = rotation_smooth_qk(
         q,
         k,
@@ -188,9 +191,10 @@ def sage_quant_mxfp4(
     )
 
     downcast_func = downcast_to_mxfp
-
+    
     q_fp4, q_scale = downcast_func(q, torch.uint8, axis=-1)
     k_fp4, k_scale = downcast_func(k, torch.uint8, axis=-1)
+
 
     return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
 
@@ -508,8 +512,46 @@ def smooth_rotate_downcast_qk(
     stride_qsb, stride_qsm, stride_qsh, stride_qsd = map_dims(Q_descale.stride(), bshd)
     stride_ksb, stride_ksn, stride_ksh, stride_ksd = map_dims(K_descale.stride(), bshd)
 
-    grid = (b * (h_q * Q_NUM_BLKS + h_k * K_NUM_BLKS),)
-    _rotate_quantize_qk_kernel[grid](
+    grid_q = (b * h_q * Q_NUM_BLKS,)
+    _rotate_quantize_q_kernel[grid_q](
+        q,
+        Q_q,
+        Q_descale,
+        q_mean,
+        R,
+        sm_scale,
+        stride_qb,
+        stride_qh,
+        stride_qm,
+        stride_qd,
+        stride_qqb,
+        stride_qqm,
+        stride_qqh,
+        stride_qqd,
+        stride_qsb,
+        stride_qsm,
+        stride_qsh,
+        stride_qsd,
+        q_mean.stride(0) if q_smoothing else None,
+        q_mean.stride(1) if q_smoothing else None,
+        q_mean.stride(2) if q_smoothing else None,
+        q_mean.stride(3) if q_smoothing else None,
+        b,
+        h_q,
+        s_q,
+        d,
+        q_smoothing=q_smoothing,
+        hadamard_rotation=hadamard_rotation,
+        BLOCK_M=BLOCK_SIZE_M,
+        BLOCK_R=BLOCK_R,
+        D=d,
+        num_warps=4,
+        num_stages=5,
+    )
+
+
+    grid_k = (b * h_k * K_NUM_BLKS,)
+    _rotate_quantize_k_kernel[grid_k](
         q,
         Q_q,
         Q_descale,
