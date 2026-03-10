@@ -177,7 +177,8 @@ jobs:
           fi
 
       - name: Run ATOM simple inference
-        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
+        # Skip simple inference; accuracy test already validates correctness
+        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && false
         timeout-minutes: 60
         run: |
           # Run the inference and capture output
