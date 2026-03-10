@@ -6,7 +6,6 @@ import aiter
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import checkAllclose, benchmark, run_perftest
 from aiter import dtypes
-
 import random
 import itertools
 import argparse
@@ -884,7 +883,6 @@ def test_mla(
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     total_q = qo_indptr[-1].item()
     q = torch.randn((total_q, nhead, qk_head_dim), dtype=torch.bfloat16)
-    # print(f"q shape: {q.shape}")
     # troch implementation
     out_ref, lse_ref = torch_mla_extend(
         q,
@@ -1485,7 +1483,7 @@ parser.add_argument(
     type=dtypes.str2tuple,
     nargs="*",
     const=None,
-    default=[(48, 1), (128, 2)],
+    default=[(16, 1), (16, 2), (16, 4), (48, 1), (128, 2)],
     help="""Number of heads.
     e.g.: -n 16,1""",
 )
