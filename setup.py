@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
 import shutil
@@ -221,6 +221,7 @@ if PREBUILD_KERNELS != 0:
                         "flags_extra_hip": base_args["flags_extra_hip"],
                         "extra_include": base_args["extra_include"],
                         "blob_gen_cmd": v["blob_gen_cmd"],
+                        "third_party": base_args["third_party"],
                     }
                 )
             all_opts_args_build.extend(extra_args_build)
@@ -254,6 +255,7 @@ if PREBUILD_KERNELS != 0:
                 is_python_module=True,
                 is_standalone=False,
                 torch_exclude=False,
+                third_party=one_opt_args["third_party"],
             )
 
         prebuid_thread_num = 5
