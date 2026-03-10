@@ -88,8 +88,8 @@ jobs:
               fi \
            && pip install -r requirements.txt \
            && echo "Prebuilding kernels with GPU_ARCHS: ${{ env.GPU_ARCH_LIST }} and PREBUILD_KERNELS: 1" \
-           && PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" python setup.py build_ext --inplace \
-           && pip install -e . \
+           && PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" python setup.py bdist_wheel \
+           && pip install dist/*.whl \
            && echo "Prebuilding kernels completed"
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
@@ -131,16 +131,17 @@ jobs:
         run: |
           echo "Successfully prepared image: rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}"
 
-      - name: Build wheel from image
+      - name: Extract wheel from image
         if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
           set -ex
           IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
+          mkdir -p dist
           docker run --rm \
             -v "${{ github.workspace }}/dist:/dist" \
             $IMAGE_TAG \
-            bash -c "cd /aiter && python3 setup.py bdist_wheel && cp dist/*.whl /dist/"
-          echo "Built wheels:"
+            bash -c "cp /aiter/dist/*.whl /dist/"
+          echo "Extracted wheels:"
           ls -lh dist/*.whl
 
       - name: Upload wheel as artifact
