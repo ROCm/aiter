@@ -72,8 +72,18 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
             v_descale,
             delta_s,
         ) = sage_quant_mxfp4(
-            q, k, v, FP8_TYPE, FP8_MAX, BLKQ=config["BLOCK_M"], BLKK=64, layout=layout, R=R, BLOCK_R=BLOCK_R, q_smoothing=q_smooth
-        )  
+            q,
+            k,
+            v,
+            FP8_TYPE,
+            FP8_MAX,
+            BLKQ=config["BLOCK_M"],
+            BLKK=64,
+            layout=layout,
+            R=R,
+            BLOCK_R=BLOCK_R,
+            q_smoothing=q_smooth,
+        )
         # TODO: fused quant has perf downgrade
         # fused_sage_quant_mxfp4(
         #     q,

@@ -210,7 +210,7 @@ def _rotate_quantize_q_kernel(
     pid_b = pid % batch
     pid_h = pid // batch % heads_q
     pid_m = pid // (batch * heads_q)
-   
+
     # Offsets
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, D)
@@ -419,7 +419,6 @@ def _rotate_quantize_k_kernel(
         qk_quant_tile,
         mask=(offs_m[:, None] < seqlen),
     )
-
 
 
 @triton.jit

@@ -10,12 +10,14 @@ import logging
 import aiter
 
 from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
-    fav3_sage_mxfp4_wrapper, get_sage_fwd_configs_mxfp4, fav3_sage_mxfp4_func
+    fav3_sage_mxfp4_wrapper,
+    get_sage_fwd_configs_mxfp4,
+    fav3_sage_mxfp4_func,
 )
 
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     sage_quant_mxfp4,
-    fused_sage_quant_mxfp4
+    fused_sage_quant_mxfp4,
 )
 
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
@@ -73,7 +75,7 @@ def bench_kernel(q, k, v, args, provider):
         )
     else:
         config = get_sage_fwd_configs_mxfp4()
-        
+
         FP8_TYPE = aiter.dtypes.fp8
         FP8_MAX = torch.finfo(FP8_TYPE).max
         (
@@ -85,18 +87,46 @@ def bench_kernel(q, k, v, args, provider):
             v_descale,
             delta_s,
         ) = sage_quant_mxfp4(
-            q, k, v, FP8_TYPE, FP8_MAX, BLKQ=config["BLOCK_M"], BLKK=64, layout=args.layout, R=R, BLOCK_R=BLOCK_R, q_smoothing=args.qsmooth
+            q,
+            k,
+            v,
+            FP8_TYPE,
+            FP8_MAX,
+            BLKQ=config["BLOCK_M"],
+            BLKK=64,
+            layout=args.layout,
+            R=R,
+            BLOCK_R=BLOCK_R,
+            q_smoothing=args.qsmooth,
         )
 
         fn_unfused_quant = lambda: sage_quant_mxfp4(
-            q, k, v, FP8_TYPE, FP8_MAX, BLKQ=config["BLOCK_M"], BLKK=64, layout=args.layout, R=R, BLOCK_R=BLOCK_R, q_smoothing=args.qsmooth
+            q,
+            k,
+            v,
+            FP8_TYPE,
+            FP8_MAX,
+            BLKQ=config["BLOCK_M"],
+            BLKK=64,
+            layout=args.layout,
+            R=R,
+            BLOCK_R=BLOCK_R,
+            q_smoothing=args.qsmooth,
         )
 
         ms = triton.testing.do_bench_cudagraph(fn_unfused_quant)
         print("fn_unfused_quant (ms)", ms)
 
         fn_fused_quant = lambda: fused_sage_quant_mxfp4(
-            q, k, v, BLOCK_M=config["BLOCK_M"], layout=args.layout, R=R, BLOCK_R=BLOCK_R, q_smoothing=args.qsmooth, hadamard_rotation=args.hadamard_rotate
+            q,
+            k,
+            v,
+            BLOCK_M=config["BLOCK_M"],
+            layout=args.layout,
+            R=R,
+            BLOCK_R=BLOCK_R,
+            q_smoothing=args.qsmooth,
+            hadamard_rotation=args.hadamard_rotate,
         )
 
         ms = triton.testing.do_bench_cudagraph(fn_fused_quant)

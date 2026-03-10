@@ -158,7 +158,6 @@ def sage_quant_mxfp4(
     if sm_scale is None:
         sm_scale = head_dim**-0.5
 
-
     q, k, delta_s = rotation_smooth_qk(
         q,
         k,
@@ -191,10 +190,9 @@ def sage_quant_mxfp4(
     )
 
     downcast_func = downcast_to_mxfp
-    
+
     q_fp4, q_scale = downcast_func(q, torch.uint8, axis=-1)
     k_fp4, k_scale = downcast_func(k, torch.uint8, axis=-1)
-
 
     return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
 
@@ -326,10 +324,9 @@ def rotation_smooth_qk(
     q_smoothing=False,
     sm_scale=None,
     layout="bhsd",
-
 ):
-    
-    if R is None: # Generate Hadamard Matrix R if not given
+
+    if R is None:  # Generate Hadamard Matrix R if not given
         assert (
             BLOCK_R is not None
         ), "if not passing R (hadamard matrix), BLOCK_R (size of the hadamard matrix) must be provided."
@@ -443,7 +440,8 @@ def rotation_smooth_qk(
             delta_s.stride(1),
             delta_s.stride(2),
             delta_s.stride(3),
-            h_q,h_k,
+            h_q,
+            h_k,
             s_k,
             d,
             BLOCK_N=BLOCK_SIZE_M,
@@ -548,7 +546,6 @@ def smooth_rotate_downcast_qk(
         num_warps=4,
         num_stages=5,
     )
-
 
     grid_k = (b * h_k * K_NUM_BLKS,)
     _rotate_quantize_k_kernel[grid_k](
