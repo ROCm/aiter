@@ -24,5 +24,9 @@ export HIP_VISIBLE_DEVICES=5
 # DeepSeek-V3: E=128, topk=6, mdim=5120, idim=1536, shared_E=2, ep=8
 # python /workspace/aiter_dev/op_tests/test_moe_lqq.py -t 32 64 128 256 512 1024 -e 128 -k 6 -md 5120 -id 1536 -ep 8 -se 2 -x 32
 
-python /workspace/aiter_dev/op_tests/test_moe_lqq.py -t 256 512 1024 1664 -e 128 -k 6 -md 5120 -id 1536 -ep 8 -se 2 -x 64 80 --evenly
+# python /workspace/aiter_dev/op_tests/test_moe_lqq.py -t 256 512 1024 1664 -e 128 -k 6 -md 5120 -id 1536 -ep 8 -se 2 -x 64 # --evenly
 # python /workspace/aiter_dev/op_tests/test_moe_lqq.py -t 440 -e 128 -k 6 -md 5120 -id 1536 -ep 8 -se 2 -x 64
+
+
+# python /workspace/aiter_dev/op_tests/test_moe_lqq.py -t 256 512 1024 1664 2048 -e 16 -k 8 -md 3584 -id 1024 -ep 1 -se 0 -x 32 64 80 128 --evenly
+python /workspace/aiter_dev/op_tests/test_moe_lqq.py -t 256 512 1024 1536 1664 2048 4096 -e 384 -k 8 -md 3584 -id 1024 -ep 8 -se 0 -x 32 64 80 --evenly

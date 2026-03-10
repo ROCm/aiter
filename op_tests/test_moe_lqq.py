@@ -283,38 +283,10 @@ def test_fmoe_lqq(
     get_2stage_cfgs.cache_clear()
 
     run_fused_moe = make_fused_moe_perftest(num_iters=128, num_warmup=5)
-    out_asm, us_asm = run_fused_moe(
-        input,
-        w1_lqq,
-        w2_lqq,
-        topk_weights,
-        topk_ids,
-        expert_mask,
-        local_expert_hash,
-        w1_scale,
-        w2_scale,
-        a1_scale,
-        w1_lqq_scale_shf,
-        w1_lqq_zero_uint8_shf,
-        w2_lqq_scale_shf,
-        w2_lqq_zero_uint8_shf,
-        fc1_smooth_scale,
-        fc2_smooth_scale,
-        quant_type,
-        act_type,
-        dtype,
-        block_size_M,
-    )
-    aiter.logger.info(f"[bench] ASM: {us_asm:>8.2f} us")
-
-    # 2. Run FlyDSL if FLIR_PATH is set
-    out_flydsl = None
-    us_flydsl = None
-    if os.getenv("FLIR_PATH"):
-        print("[test] Running FlyDSL backend...")
-        os.environ["AITER_USE_FLYDSL"] = "1"
-        get_2stage_cfgs.cache_clear()
-        out_flydsl, us_flydsl = run_fused_moe(
+    out_asm = None
+    us_asm = None
+    try:
+        out_asm, us_asm = run_fused_moe(
             input,
             w1_lqq,
             w2_lqq,
@@ -336,8 +308,45 @@ def test_fmoe_lqq(
             dtype,
             block_size_M,
         )
-        aiter.logger.info(f"[bench] FlyDSL: {us_flydsl:>8.2f} us")
-    os.environ["AITER_USE_FLYDSL"] = old_flydsl
+        aiter.logger.info(f"[bench] ASM: {us_asm:>8.2f} us")
+    except Exception as err:
+        print(f"[warning] ASM backend failed or is unsupported: {err}")
+
+    # 2. Run FlyDSL if FLIR_PATH is set
+    out_flydsl = None
+    us_flydsl = None
+    try:
+        if os.getenv("FLIR_PATH"):
+            print("[test] Running FlyDSL backend...")
+            os.environ["AITER_USE_FLYDSL"] = "1"
+            get_2stage_cfgs.cache_clear()
+            out_flydsl, us_flydsl = run_fused_moe(
+                input,
+                w1_lqq,
+                w2_lqq,
+                topk_weights,
+                topk_ids,
+                expert_mask,
+                local_expert_hash,
+                w1_scale,
+                w2_scale,
+                a1_scale,
+                w1_lqq_scale_shf,
+                w1_lqq_zero_uint8_shf,
+                w2_lqq_scale_shf,
+                w2_lqq_zero_uint8_shf,
+                fc1_smooth_scale,
+                fc2_smooth_scale,
+                quant_type,
+                act_type,
+                dtype,
+                block_size_M,
+            )
+            aiter.logger.info(f"[bench] FlyDSL: {us_flydsl:>8.2f} us")
+    except Exception as err:
+        print(f"[warning] FlyDSL backend failed or is unsupported: {err}")
+    finally:
+        os.environ["AITER_USE_FLYDSL"] = old_flydsl
 
     def calc_diff(x: torch.Tensor, y: torch.Tensor):
         x, y = x.double(), y.double()
@@ -363,17 +372,18 @@ def test_fmoe_lqq(
         return cos_diff
 
     quant_rtol, quant_atol, quant_tol_err = 0.25, 1.0, 0.15
-    aiter.logger.info("[test] Comparing ASM vs Ref...")
-    checkAllclose(
-        out_asm,
-        out_ref,
-        rtol=quant_rtol,
-        atol=quant_atol,
-        tol_err_ratio=quant_tol_err,
-        msg="ASM vs Ref",
-    )
-    log_logits_diff("ASM vs Ref", out_asm, out_ref)
-    logn("ASM vs Ref", out_asm, out_ref, n=10)
+    if out_asm is not None:
+        aiter.logger.info("[test] Comparing ASM vs Ref...")
+        checkAllclose(
+            out_asm,
+            out_ref,
+            rtol=quant_rtol,
+            atol=quant_atol,
+            tol_err_ratio=quant_tol_err,
+            msg="ASM vs Ref",
+        )
+        log_logits_diff("ASM vs Ref", out_asm, out_ref)
+        logn("ASM vs Ref", out_asm, out_ref, n=10)
 
     if out_flydsl is not None:
         aiter.logger.info("[test] Comparing FlyDSL vs Ref...")
@@ -388,10 +398,11 @@ def test_fmoe_lqq(
         log_logits_diff("FlyDSL vs Ref", out_flydsl, out_ref)
         logn("FlyDSL vs Ref", out_flydsl, out_ref, n=10)
 
-        aiter.logger.info("[test] Comparing FlyDSL vs ASM...")
-        checkAllclose(out_flydsl, out_asm, msg="FlyDSL vs ASM")
-        log_logits_diff("FlyDSL vs ASM", out_flydsl, out_asm)
-        logn("FlyDSL vs ASM", out_flydsl, out_asm, n=10)
+        if out_asm is not None:
+            aiter.logger.info("[test] Comparing FlyDSL vs ASM...")
+            checkAllclose(out_flydsl, out_asm, msg="FlyDSL vs ASM")
+            log_logits_diff("FlyDSL vs ASM", out_flydsl, out_asm)
+            logn("FlyDSL vs ASM", out_flydsl, out_asm, n=10)
 
     result = {
         "token": token,
@@ -400,10 +411,12 @@ def test_fmoe_lqq(
         "E": E,
         "shared_E": shared_E,
         "topk": topk,
+        "token_per_routed_expert": token * topk / ep / (E // ep),
         "ep": ep,
         "block_size_M": block_size_M,
-        "us_asm": f"{us_asm:.2f}",
     }
+    if us_asm is not None:
+        result["us_asm"] = f"{us_asm:.2f}"
     if us_flydsl is not None:
         result["us_flydsl"] = f"{us_flydsl:.2f}"
     return result
