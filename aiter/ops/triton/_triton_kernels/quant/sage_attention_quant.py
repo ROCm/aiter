@@ -1,17 +1,11 @@
-import functools
 
 import torch
 import triton
 import triton.language as tl
-import aiter
 
 
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
-from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
-    map_dims,
-)
 
-from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
 ################# Sage V2 quantization kernels ####################
 
