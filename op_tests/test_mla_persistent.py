@@ -3,10 +3,10 @@
 
 import torch
 import aiter
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import checkAllclose, benchmark, run_perftest
 from aiter import dtypes
 
-# from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 import random
 import itertools
 import argparse
@@ -392,8 +392,8 @@ def torch_mla_extend_split_kv(
         nheads == 16
         or (nheads == 128 and is_fp8_q and is_fp8_kvc)
         or (
-            # get_gfx() == "gfx950"
-            nheads == 32
+            get_gfx() == "gfx950"
+            and nheads == 32
             and is_fp8_q
             and is_fp8_kvc
             and max_seqlen_q == 4
