@@ -43,8 +43,7 @@ def _sage_fwd_no_mask(
     block_max,
     alibi_slope,
     q_descale,
-    k_descale_base_ptr,
-    stride_ksblk,
+    k_descale,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     PRE_LOAD_V: tl.constexpr,
@@ -59,7 +58,6 @@ def _sage_fwd_no_mask(
     RETURN_SCORES: tl.constexpr,
     ACCUMULATOR_TYPE,
 ):
-    k_descale_ptr = k_descale_base_ptr
 
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
@@ -75,8 +73,6 @@ def _sage_fwd_no_mask(
         else:
             k = tl.load(k_ptrs)
 
-        k_descale = tl.load(k_descale_ptr)
-        k_descale_ptr += stride_ksblk
 
         # Optionally preload V
         if PRE_LOAD_V:
@@ -238,8 +234,7 @@ def _sage_fwd_mask(
     n_extra_tokens,
     alibi_slope,
     q_descale,
-    k_descale_base_ptr,
-    stride_ksblk,
+    k_descale,
     IS_CAUSAL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -261,8 +256,6 @@ def _sage_fwd_mask(
     # seqlen diff
     seqlen_delta_qk = seqlen_k - seqlen_q
 
-    k_descale_ptr = k_descale_base_ptr
-
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
         # get ptrs
@@ -281,8 +274,6 @@ def _sage_fwd_mask(
 
         # load k and if preload_v then v
         k = tl.load(k_ptrs, mask=k_mask, other=0.0)
-        k_descale = tl.load(k_descale_ptr)
-        k_descale_ptr += stride_ksblk
 
         if PRE_LOAD_V:
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
@@ -860,14 +851,11 @@ def sage_fwd(
     V,
     bias,
     Q_Descale,
-    K_Descale,
+    k_descale,
     V_Descale,
     stride_qsz,
     stride_qsh,
     stride_qsblk,
-    stride_ksz,
-    stride_ksh,
-    stride_ksblk,
     stride_vsz,
     stride_vsh,
     LSE,
@@ -1096,12 +1084,12 @@ def sage_fwd(
         + off_h_q * stride_qsh
         + (start_m + cu_seqlens_q_start) * stride_qsblk
     )
-    k_descale_offset = (
-        K_Descale
-        + off_z * stride_ksz
-        + off_h_k * stride_ksh
-        + cu_seqlens_k_start * stride_ksblk
-    )
+    # k_descale_offset = (
+    #     K_Descale
+    #     + off_z * stride_ksz
+    #     + off_h_k * stride_ksh
+    #     + cu_seqlens_k_start * stride_ksblk
+    # )
     v_descale_ptr = V_Descale + off_z * stride_vsz + off_h_k * stride_vsh + offs_d_v
 
     q_descale = tl.load(q_descale_ptr)  # MHA: use q head index
@@ -1141,7 +1129,7 @@ def sage_fwd(
         block_min = n_front_skip_blocks * BLOCK_N
         block_max = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
 
-        k_descale_ptr = k_descale_offset + n_front_skip_blocks * stride_ksblk
+        # k_descale_ptr = k_descale_offset + n_front_skip_blocks * stride_ksblk
 
         acc, l_i, m_i = _sage_fwd_mask(
             acc,
@@ -1176,8 +1164,7 @@ def sage_fwd(
             0,  # n_extra_tokens (0 for front blocks, only relevant for last block)
             alibi_slope,
             q_descale,
-            k_descale_ptr,
-            stride_ksblk,
+            k_descale,
             IS_CAUSAL,
             BLOCK_M,
             BLOCK_N,
@@ -1203,11 +1190,6 @@ def sage_fwd(
         block_max = (
             n_front_skip_blocks + n_front_masked_blocks + n_full_blocks
         ) * BLOCK_N
-
-        k_descale_ptr = (
-            k_descale_offset
-            + (n_front_skip_blocks + n_front_masked_blocks) * stride_ksblk
-        )
 
         acc, l_i, m_i = _sage_fwd_no_mask(
             acc,
@@ -1240,8 +1222,7 @@ def sage_fwd(
             block_max,  # End of range: n_full_blocks * BLOCK_N
             alibi_slope,
             q_descale,
-            k_descale_ptr,
-            stride_ksblk,
+            k_descale,
             BLOCK_M,
             BLOCK_N,
             PRE_LOAD_V,
@@ -1268,12 +1249,6 @@ def sage_fwd(
             + n_full_blocks
             + n_back_masked_blocks
         ) * BLOCK_N
-
-        k_descale_ptr = (
-            k_descale_offset
-            + (n_front_skip_blocks + n_front_masked_blocks + n_full_blocks)
-            * stride_ksblk
-        )
 
         acc, l_i, m_i = _sage_fwd_mask(
             acc,
@@ -1308,8 +1283,7 @@ def sage_fwd(
             n_extra_tokens,  # Padding tokens in last block
             alibi_slope,
             q_descale,
-            k_descale_ptr,
-            stride_ksblk,
+            k_descale,
             IS_CAUSAL,  # Use actual causal flag
             BLOCK_M,
             BLOCK_N,
@@ -1521,7 +1495,7 @@ def sage_quant(
         k = k - k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
 
     q_scale = torch.empty((b, h_qo, Q_NUM_BLKS), device=q.device, dtype=torch.float32)
-    k_scale = torch.empty((b, h_kv, K_NUM_BLKS), device=q.device, dtype=torch.float32)
+    # k_scale = torch.empty((b, h_kv, K_NUM_BLKS), device=q.device, dtype=torch.float32)
 
     v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
 
@@ -1532,9 +1506,27 @@ def sage_quant(
     k_task_count = b * h_kv * K_NUM_BLKS
     v_task_count = b * h_kv * K_NUM_BLKS
 
-    grid = (q_task_count + k_task_count + v_task_count,)
+    # grid = (q_task_count + k_task_count + v_task_count,)
+    grid = (q_task_count + v_task_count,)
 
     # call sage_quant_kernel
+    
+    # Perform per-tensor quantization
+    # Compute per-tensor scales
+    # q_scale = (q.abs().amax().to(torch.float32) / torch.iinfo(q_int8.dtype).max).item()
+    k_scale = (k.abs().amax().to(torch.float32) / torch.iinfo(k_int8.dtype).max).item()
+    # v_scale = v.abs().amax().to(torch.float32) / FP8_MAX
+    
+    # Apply scales to quantize tensors
+    # q_int8 = (q / q_scale).round().clamp(torch.iinfo(q_int8.dtype).min, torch.iinfo(q_int8.dtype).max).to(torch.int8)
+    k_int8 = (k / k_scale).round().clamp(torch.iinfo(k_int8.dtype).min, torch.iinfo(k_int8.dtype).max).to(torch.int8)
+    # v_fp8 = (v / v_scale).to(FP8_TYPE)
+    
+    # Incorporate sm_scale into q_scale
+    # q_scale = q_scale * sm_scale
+    # Broadcast scales to match output shape
+
+
     sage_quant_kernel[grid](
         q,
         q_int8,
@@ -1553,8 +1545,6 @@ def sage_quant(
         stride_seq_k,
         q_scale.stride(0),
         q_scale.stride(1),
-        k_scale.stride(0),
-        k_scale.stride(1),
         v_scale.stride(0),
         v_scale.stride(1),
         (sm_scale * 1.4426950408889634),
@@ -1599,8 +1589,6 @@ def sage_quant_kernel(
     stride_kn,
     stride_qsz,
     stride_qsh,
-    stride_ksz,
-    stride_ksh,
     stride_vsz,
     stride_vsh,
     sm_scale,
@@ -1650,34 +1638,10 @@ def sage_quant_kernel(
             offs_qn[:, None] < SEQLEN_Q,
             sm_scale=sm_scale,
         )
-    elif pid >= q_task_count and pid < q_task_count + k_task_count:
-        # here we do K
-        _pid = pid - q_task_count
-        off_blk, off_h, off_b = pid_grid_3d(_pid, K_NUM_BLKS, K_HEAD, BATCH)
-
-        offs_kn = off_blk * BLK_K + offs_blk_k
-
-        k_offs = (
-            off_b * stride_kz
-            + off_h * stride_kh
-            + offs_kn[:, None] * stride_kn
-            + offs_d[None, :]
-        )
-
-        k_input_ptrs = K_Input + k_offs
-        k_output_ptrs = K_Output + k_offs
-        k_scale_ptrs = K_Scale + off_b * stride_ksz + off_h * stride_ksh + off_blk
-
-        _general_quant_kernel(
-            k_input_ptrs,
-            k_output_ptrs,
-            k_scale_ptrs,
-            INT8_MAX,
-            offs_kn[:, None] < SEQLEN_K,
-        )
+    # V    
     else:
         # V
-        _pid = pid - (q_task_count + k_task_count)
+        _pid = pid - (q_task_count)
         off_blk, off_h, off_b = pid_grid_3d(_pid, K_NUM_BLKS, K_HEAD, BATCH)
         offs_kn = off_blk * BLK_K + offs_blk_k
 

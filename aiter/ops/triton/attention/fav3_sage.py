@@ -120,15 +120,15 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
         num_k_blocks = (seqlen_k + BLKK - 1) // BLKK
 
-        expected_q_ds = (batch, num_q_heads, num_q_blocks)
-        expected_k_ds = (batch, num_kv_heads, num_k_blocks)
+        # expected_q_ds = (batch, num_q_heads, num_q_blocks)
+        # expected_k_ds = (batch, num_kv_heads, num_k_blocks)
 
-        assert (
-            q_descale.shape == expected_q_ds
-        ), f"q_descale shape {q_descale.shape} != {expected_q_ds}"
-        assert (
-            k_descale.shape == expected_k_ds
-        ), f"k_descale shape {k_descale.shape} != {expected_k_ds}"
+        # assert (
+        #     q_descale.shape == expected_q_ds
+        # ), f"q_descale shape {q_descale.shape} != {expected_q_ds}"
+        # assert (
+        #     k_descale.shape == expected_k_ds
+        # ), f"k_descale shape {k_descale.shape} != {expected_k_ds}"
 
         # 5. Execution
         out, softmax_lse = fav3_sage_func(
@@ -283,8 +283,8 @@ def fav3_sage_func(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    q_descale: torch.Tensor,
-    k_descale: torch.Tensor,
+    q_descale,
+    k_descale,
     v_descale: torch.Tensor,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -352,9 +352,6 @@ def fav3_sage_func(
     num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
     num_k_blocks = (seqlen_k + BLKK - 1) // BLKK
 
-    assert q_descale.shape == (batch, nheads_q, num_q_blocks)
-    assert k_descale.shape == (batch, nheads_k, num_k_blocks)
-
     # --- 4. Output Allocation ---
     out_dtype = torch.bfloat16
     if layout == "thd":
@@ -387,7 +384,7 @@ def fav3_sage_func(
         softmax_lse.stride() if return_lse else (0, 0, 0)
     )
     stride_qsz, stride_qsh, stride_qsblk = q_descale.stride()
-    stride_ksz, stride_ksh, stride_ksblk = k_descale.stride()
+
     stride_vsz, stride_vsh, _ = v_descale.stride()
 
     # --- 6. Padding & Metadata ---
@@ -412,9 +409,6 @@ def fav3_sage_func(
         stride_qsz,
         stride_qsh,
         stride_qsblk,
-        stride_ksz,
-        stride_ksh,
-        stride_ksblk,
         stride_vsz,
         stride_vsh,
         softmax_lse,
