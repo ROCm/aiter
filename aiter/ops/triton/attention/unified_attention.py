@@ -30,7 +30,7 @@ def select_2d_config(
     )
 
     TILE_SIZE = 32 if arch.name == "gfx1201" else 16 if arch.is_rdna else 64
-    waves_per_eu = 6 if arch.is_rdna else 2
+    waves_per_eu = 8 if arch.name == "gfx1151" else 6 if arch.is_rdna else 2
 
     max_num_stages_2d = 2 if head_size > 128 else 4
 
