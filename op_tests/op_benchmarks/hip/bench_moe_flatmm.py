@@ -119,7 +119,9 @@ def build_cases():
         if topk1 != topk2 or expert1 != expert2:
             raise ValueError(f"Mismatched topk/expert between {s1} and {s2}.")
         if s2_m != s1_m * topk1:
-            raise ValueError(f"Expected stage2 M == stage1 M * topk, got {s1} and {s2}.")
+            raise ValueError(
+                f"Expected stage2 M == stage1 M * topk, got {s1} and {s2}."
+            )
         if s2_n != s1_k:
             raise ValueError(f"Expected stage2 N == stage1 K, got {s1} and {s2}.")
         cases.append(MoeCase(s1_m, s1_n, s1_k, topk1, expert1, s2_m, s2_n, s2_k))
@@ -136,7 +138,9 @@ def run_case(case: MoeCase, dtype, num_iters: int, num_warmup: int, seed: int):
     inter_dim = case.stage2_k
 
     hidden_states = torch.randn((token, model_dim), dtype=dtype, device=device)
-    w1_fp = torch.randn((case.expert, case.stage1_n, model_dim), dtype=dtype, device=device)
+    w1_fp = torch.randn(
+        (case.expert, case.stage1_n, model_dim), dtype=dtype, device=device
+    )
     w2_fp = torch.randn((case.expert, model_dim, inter_dim), dtype=dtype, device=device)
 
     topk_ids = torch.randint(
@@ -246,7 +250,9 @@ def main():
 
     cases = build_cases()
     if args.case_index >= len(cases):
-        raise ValueError(f"--case-index {args.case_index} out of range [0, {len(cases)-1}].")
+        raise ValueError(
+            f"--case-index {args.case_index} out of range [0, {len(cases)-1}]."
+        )
     if args.case_index >= 0:
         selected = [(args.case_index, cases[args.case_index])]
     else:
