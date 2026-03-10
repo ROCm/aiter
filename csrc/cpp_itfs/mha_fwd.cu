@@ -214,8 +214,7 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
        (a.data_type != "bf16" && a.data_type != "fp8bf16") || (a.bias_type != 0) || (a.p_drop > 0.f) ||
        ((arch_id != "gfx942") && (arch_id != "gfx950")))
     {
-        std::cout << "[Warning]unsupported condition in fwd_v3!!!" << std::endl;
-        std::cout << "data type" << a.data_type <<std::endl;
+        AITER_LOG_WARNING("unsupported condition in fwd_v3!!! data type: " << a.data_type);
         return -1;
     }
 
@@ -256,7 +255,7 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     impl_ptr = result.first->second.get();
 
     fmha_fwd_v3_args args;
-    int arg_size = sizeof(args);
+    size_t arg_size = sizeof(args);
     init_fmha_fwd_v3_args(args, a, cfg.ts_qo, arch_id);
 
     int bdx              = (a.hdim_q == 192 && a.hdim_v == 128) ? 256 : 512;
@@ -266,7 +265,7 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
         // Explicit assignment forces evaluation order and prevents compiler from
         // reordering operations that could lead to accessing uninitialized args
         void* args_ptr     = &args;
-        void* arg_size_ptr = &arg_size;
+        size_t* arg_size_ptr = &arg_size;
         impl_ptr->launch_kernel({args_ptr, arg_size_ptr, gdx, gdy, gdz, bdx, 1, 1, s_.stream_id_});
     });
 }

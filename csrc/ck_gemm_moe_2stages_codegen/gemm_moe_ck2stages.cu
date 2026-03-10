@@ -8,6 +8,7 @@
 #include "ck2stages_moe_stage1_heuristic_dispatch.hpp"
 #include "ck2stages_moe_stage2_heuristic_dispatch.hpp"
 #include "moe_ck.h"
+#include "aiter_logger.h"
 #include <cmath>
 
 using MoeKernelMap = std::unordered_map<std::string, MoeKernel>;
@@ -30,7 +31,7 @@ MoeKernel moe_dispatch(std::string &kernelName, int block_m, int inter_dim, at::
             auto kernel = it->second;
             return kernel;
         }
-        std::cout << "[aiter] ck kernel not found: " << kernelName << std::endl;
+        AITER_LOG_WARNING("ck kernel not found: " << kernelName);
     }
     if constexpr (stage == 1)
     {
