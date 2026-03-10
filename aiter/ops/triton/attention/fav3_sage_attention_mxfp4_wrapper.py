@@ -62,7 +62,7 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
         FP8_TYPE = aiter.dtypes.fp8
         FP8_MAX = torch.finfo(FP8_TYPE).max
 
-        # fused_quant = True
+        assert hadamard_rotation, "hadamard_rotation=False not supported at the moment"
         (
             q_quantized,
             q_descale,
@@ -72,8 +72,10 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
             v_descale,
             delta_s,
         ) = sage_quant_mxfp4(
-            q, k, v, FP8_TYPE, FP8_MAX, BLKQ=config["BLOCK_M"], BLKK=64, layout=layout
-        )  # if not fused_quant else fused_sage_quant_mxfp4(
+            q, k, v, FP8_TYPE, FP8_MAX, BLKQ=config["BLOCK_M"], BLKK=64, layout=layout, R=R, BLOCK_R=BLOCK_R, q_smoothing=q_smooth
+        )  
+        # TODO: fused quant has perf downgrade
+        # fused_sage_quant_mxfp4(
         #     q,
         #     k,
         #     v,

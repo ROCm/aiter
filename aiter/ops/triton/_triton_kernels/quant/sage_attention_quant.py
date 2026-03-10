@@ -408,7 +408,7 @@ def _rot_q_kernel(
     r_mat = tl.load(r_ptr)  # 32x32
 
     # Rotate: Q_rot = Q @ R
-    q_rot_tile = tl.dot(q_tile, r_mat)
+    q_rot_tile = tl.dot(q_tile.to(r_mat.dtype), r_mat)
     if sm_scale is not None:
         q_rot_tile *= sm_scale
 
@@ -499,7 +499,7 @@ def _rot_k_only_kernel(
     r_mat = tl.load(r_ptr)
 
     # Rotate K
-    k_rot_tile = tl.dot(k_tile, r_mat)
+    k_rot_tile = tl.dot(k_tile.to(r_mat.dtype), r_mat)
 
     # Store
     rot_ptr = (

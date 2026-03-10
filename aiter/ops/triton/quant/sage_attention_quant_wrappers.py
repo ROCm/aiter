@@ -109,12 +109,14 @@ def sage_quant_mxfp4(
     v,
     FP8_TYPE,
     FP8_MAX,
-    BLKQ=128,
-    BLKK=64,
+    BLKQ,
+    BLKK,
     sm_scale=None,
     q_smoothing=False,
     layout="bshd",
     USE_RNE=False,
+    R=None,
+    BLOCK_R=32,
 ):
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
 
@@ -149,7 +151,7 @@ def sage_quant_mxfp4(
     v_task_count = b * h_kv * K_NUM_BLKS
     grid = (v_task_count,)
 
-    padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
+    # padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
@@ -158,7 +160,8 @@ def sage_quant_mxfp4(
         q,
         k,
         BLKQ,
-        block_size=padded_head_dim,
+        R=R,
+        BLOCK_R=BLOCK_R,
         q_smoothing=q_smoothing,
         layout=layout,
         sm_scale=(sm_scale * 1.4426950408889634),
@@ -313,19 +316,23 @@ def sage_quant(
 def rotation_smooth_qk(
     q,
     k,
-    BLOCK_SIZE_M=256,
-    block_size=32,
+    BLOCK_SIZE_M,
+    R=None,
+    BLOCK_R=32,
     q_smoothing=False,
     sm_scale=None,
     layout="bhsd",
-):
-    # Generate Hadamard Matrix R (Rank 32)
-    # TODO we might want to manually define this matrix
-    R = create_hadamard_matrix(block_size, dtype=q.dtype, device=q.device) / (
-        block_size**0.5
-    )
 
-    # R = create_random_hadamard_matrix(block_size, dtype=q.dtype)
+):
+    
+    if R is None: # Generate Hadamard Matrix R if not given
+        assert (
+            BLOCK_R is not None
+        ), "if not passing R (hadamard matrix), BLOCK_R (size of the hadamard matrix) must be provided."
+        R = create_hadamard_matrix(BLOCK_R, dtype=q.dtype, device=q.device) / (BLOCK_R**0.5)
+    else:
+        BLOCK_R = R.shape[-1]
+
     bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
 
     # shapes
@@ -338,7 +345,6 @@ def rotation_smooth_qk(
     Q_NUM_BLKS = (s_q + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
     K_NUM_BLKS = (s_k + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
 
-    # TODO check the dtypes for scales
     if q_smoothing:
         q_mean = torch.empty(
             (b, h_q, Q_NUM_BLKS, d), dtype=torch.float32, device=q.device
@@ -354,8 +360,8 @@ def rotation_smooth_qk(
     stride_qob, stride_qom, stride_qoh, stride_qod = map_dims(Q_rot.stride(), bshd)
     stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k.stride(), bshd)
     stride_kob, stride_kon, stride_koh, stride_kod = map_dims(K_rot.stride(), bshd)
-    # Launch Q Kernel
-    grid_q = (b * h_q, Q_NUM_BLKS, d // block_size)
+    # rotate q and optionally smooth
+    grid_q = (b * h_q, Q_NUM_BLKS, d // BLOCK_R)
     _rot_q_kernel[grid_q](
         q,
         Q_rot,
@@ -381,11 +387,11 @@ def rotation_smooth_qk(
         d,
         q_smoothing=q_smoothing,
         BLOCK_M=BLOCK_SIZE_M,
-        BLOCK_D=block_size,
+        BLOCK_D=BLOCK_R,
     )
 
-    # 2. Rotate K (Only once!)
-    grid_k = (b * h_k, K_NUM_BLKS, d // block_size)
+    # rotate k
+    grid_k = (b * h_k, K_NUM_BLKS, d // BLOCK_R)
     _rot_k_only_kernel[grid_k](
         k,
         K_rot,
@@ -404,15 +410,18 @@ def rotation_smooth_qk(
         s_k,
         d,
         BLOCK_M=BLOCK_SIZE_M,
-        BLOCK_D=block_size,
+        BLOCK_D=BLOCK_R,
     )
 
-    # smooth k after rotation
+    # smooth k
     K_rot = K_rot - K_rot.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
 
     if q_smoothing:
-        # 3. Compute Smoothing Delta S
-        # Grid: Each Q-block x Each K-block
+        # compute delta s that needs to be added due to q smoothing
+        # Q x K = Q x H x H.T x K
+        # = ((Q x H - q_mean + q_mean) x H.T x K
+        # = Q_rot x K_rot + q_mean x K_rot
+        # = Q_rot x K_rot + delta_s
         grid_delta = (b * h_k, Q_NUM_BLKS, K_NUM_BLKS)
         _compute_delta_s_kernel[grid_delta](
             q_mean,
