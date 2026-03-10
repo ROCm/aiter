@@ -60,14 +60,16 @@ jobs:
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
             env_vars: ""
+            accuracy_test_threshold: "0.94"
             runner: aiter-8gpu-runner
             run_on_pr: true
           - model_name: "gpt-oss-120b"
             label: MI355
             model_path: "openai/gpt-oss-120b"
-            extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3"
+            extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.5"
             env_vars: |
               ATOM_GPT_OSS_MODEL=1
+            accuracy_test_threshold: "0.38"
             runner: linux-aiter-mi355-1
             run_on_pr: true
     runs-on: ${{ matrix.runner }}
@@ -175,7 +177,8 @@ jobs:
           fi
 
       - name: Run ATOM simple inference
-        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
+        # Skip simple inference; accuracy test already validates correctness
+        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && false
         timeout-minutes: 60
         run: |
           # Run the inference and capture output
@@ -210,7 +213,7 @@ jobs:
           cat atom_test_output.txt
         
       - name: Run ATOM accuracy test
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && matrix.model_name != 'DeepSeek-R1-0528'
+        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         timeout-minutes: 60
         run: |
           set -euo pipefail
@@ -228,7 +231,30 @@ jobs:
           echo "========== Running accuracy test =========="
           docker exec atom_aiter_test bash -lc "
             .github/scripts/atom_test.sh accuracy $model_path
-          "
+          " 2>&1 | tee atom_accuracy_output.txt
+
+      - name: Check accuracy test results
+        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && success()
+        run: |
+          result_file=$(ls -1t accuracy_test_results/*.json 2>/dev/null | head -n 1)
+          if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
+              echo "ERROR: No results JSON file found in accuracy_test_results/"
+              exit 2
+          else
+              echo "RESULT_FILE: $result_file"
+          fi
+          flexible_extract_value=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "$result_file")
+          echo "Flexible extract value: $flexible_extract_value"
+          echo "Accuracy test threshold: ${{ matrix.accuracy_test_threshold }}"
+
+          result=$(awk -v val="$flexible_extract_value" -v threshold="${{ matrix.accuracy_test_threshold }}" 'BEGIN {print (val < threshold) ? 1 : 0}')
+          if [ "$result" -eq 1 ]; then
+            echo "Accuracy test failed: Flexible extract value $flexible_extract_value is less than the threshold ${{ matrix.accuracy_test_threshold }}."
+            exit 1
+          else
+            echo "Accuracy test passed: Flexible extract value $flexible_extract_value is greater than or equal to the threshold ${{ matrix.accuracy_test_threshold }}."
+            exit 0
+          fi
 
       - name: Upload output
         if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && always()
