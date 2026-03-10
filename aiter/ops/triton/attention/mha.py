@@ -64,8 +64,9 @@ def _flash_attn_forward(
 
     if bias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
-    if window_size_left != -1 or window_size_right != -1:
-        raise ValueError("Sliding Window is not supported yet in the Triton Backend")
+    if window_size_right != -1:
+        raise ValueError("window_size_right is not supported yet in the Triton Backend")
+    sliding_window = window_size_left if window_size_left >= 0 else 0
 
     # FP8
     IS_FP8 = types._is_fp8(q)
@@ -246,6 +247,7 @@ def _flash_attn_forward(
         NUM_XCD=get_num_xcds(),
         USE_INT64_STRIDES=_USE_INT64_STRIDES,
         ENABLE_SINK=sink is not None,
+        SLIDING_WINDOW=sliding_window,
         **config,
     )
 
@@ -390,6 +392,7 @@ class _FlashAttnFunc(torch.autograd.Function):
                 USE_INT64_STRIDES=_USE_INT64_STRIDES,
                 sink=sink,
                 dsink=dsink,
+                sliding_window=int(ctx.window_size[0]) if int(ctx.window_size[0]) >= 0 else 0,
             )
 
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
@@ -650,6 +653,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
                 USE_INT64_STRIDES=_USE_INT64_STRIDES,
                 sink=sink,
                 dsink=dsink,
+                sliding_window=int(ctx.window_size[0]) if int(ctx.window_size[0]) >= 0 else 0,
             )
 
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
