@@ -244,8 +244,8 @@ void mla_decode_stage1_asm_fwd(
     int sub_Q = 128; // default value
     
     if(gqa_ratio == 128){
-        config_max_seqlen_q = 4;
-        sub_Q = 64;
+        config_max_seqlen_q = 0;
+        sub_Q = 128;
         if (q_type == "bf16" && kv_type == "bf16"){
             ps = 0; // not use ps
         }
