@@ -272,18 +272,19 @@ jobs:
           bash -c "pip show amd-aiter || true"
       
       - name: Tests
+        timeout-minutes: 60
         run: |
           set -ex
           if [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
             docker exec \
             -w /workspace \
             aiter_test \
-            bash -c "MAX_JOBS=20 SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh" 
+            bash -c "MAX_JOBS=20 SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh"
           else
             docker exec \
             -w /workspace \
             aiter_test \
-            bash -c "SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh" 
+            bash -c "SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh"
           fi
 
       - name: Collect test logs
@@ -416,6 +417,7 @@ jobs:
           bash -c "pip show amd-aiter || true"
 
       - name: Tests
+        timeout-minutes: 60
         run: |
           set -ex
           docker exec \
