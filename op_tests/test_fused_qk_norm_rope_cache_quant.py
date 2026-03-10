@@ -1388,7 +1388,7 @@ def test_qk_norm_rope_cache_block_quant(
     # ========== decode test 3: dtpb tokens per batch from block_offset=0 (fresh page) ==========
     if dtpb > 1:
         decode3_total = batch_size * dtpb
-        last_used_slot = int(chunk_slot_mapping[-1].item())
+
         decode3_page_base = decode2_page_base + batch_size * 2 * page_size
         pages_needed_d3 = batch_size + (decode3_page_base // page_size)
         assert (
@@ -1540,7 +1540,7 @@ def test_mixed_prefill_decode_block_quant(
     max_tpb = max(seq_lens)
     avg_tpb = (num_tokens + batch_size - 1) // batch_size
 
-    print(f"\n=== Mixed prefill/decode test ===")
+    print("\n=== Mixed prefill/decode test ===")
     print(f"  batch_size={batch_size}, num_tokens={num_tokens}")
     print(
         f"  seq_lens: {num_decode_batches}x1 (decode) + {num_prefill_batches}x{prefill_seq_len} (prefill)"
@@ -1714,7 +1714,7 @@ def test_mixed_prefill_decode_block_quant(
         rtol=1e-2,
         atol=0.01,
     )
-    print(f"  PASSED: mixed prefill/decode correctness verified")
+    print("  PASSED: mixed prefill/decode correctness verified")
     return {"mixed_fused_qk_us": avg_cu, "mixed_unfused_us": avg_torch}
 
 
