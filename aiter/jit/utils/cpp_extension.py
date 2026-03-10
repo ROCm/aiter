@@ -1724,10 +1724,14 @@ def _write_ninja_file(
     else:
         devlink_rule, devlink = [], []
 
+    aiter_build_static = os.environ.get("AITER_BUILD_STATIC", "0")
     emit_static_archive = (
-        library_target is not None
-        and os.environ.get("AITER_BUILD_STATIC", "0") == "1"
-        and os.path.basename(library_target) in {"libmha_fwd.so", "libmha_bwd.so"}
+        library_target is not None and
+        aiter_build_static != "0" and
+        (
+            aiter_build_static in ("1", "all") or
+            os.path.splitext(library_target)[0] in aiter_build_static.split(",")
+        )
     )
 
     if library_target is not None:
