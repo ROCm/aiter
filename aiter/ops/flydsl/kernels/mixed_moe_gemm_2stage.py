@@ -227,7 +227,8 @@ def compile_mixed_moe_gemm1(
             _use_cshuffle_epilog = bool(use_cshuffle_epilog)
             lds_x_bytes = 2 * int(tile_m) * int(lds_stride) * int(a_elem_bytes)
             lds_out_bytes = 4 * tile_m * (tile_n // 2) if _use_cshuffle_epilog else 0
-            lds_total_bytes = max(lds_x_bytes, lds_out_bytes)
+            lds_tid_bytes = int(tile_m) * 4
+            lds_total_bytes = max(lds_x_bytes, lds_out_bytes) + lds_tid_bytes
             lds_total_elems = (
                 lds_total_bytes if a_elem_bytes == 1 else (lds_total_bytes // 2)
             )
@@ -1599,7 +1600,7 @@ def compile_mixed_moe_gemm2(
     module_name = (
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"_vscale_fix3"
+        f"_vscale_fix3_v10"
     ).replace("-", "_")
 
     class _MOE2(flir.MlirModule):
@@ -1718,7 +1719,7 @@ def compile_mixed_moe_gemm2(
             # - blockIdx.x -> N dimension (tile along model_dim)
             # - blockIdx.y -> expert-block id / M dimension (tile along sorted M)
             by = gpu.block_id("x")  # tile along model_dim
-            bx = gpu.block_id("y")  # tile along sorted M
+            bx_persist = gpu.block_id("y")  # persistent WG index
 
             # XOR16 swizzle parameter (in bytes; constant, power-of-two in our configs).
             k_blocks16 = arith.constant(tile_k_bytes // 16, index=True)
@@ -1746,6 +1747,13 @@ def compile_mixed_moe_gemm2(
                 if _use_cshuffle_epilog
                 else None
             )
+
+            _lds_x_b = 2 * int(tile_m) * int(lds_stride) * int(a_elem_bytes)
+            _lds_out_b = 2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
+            _lds_tid_off = max(_lds_x_b, _lds_out_b)
+            lds_tid = SmemPtr(
+                base_ptr, lds_x_ptr.byte_offset + _lds_tid_off, I.i32, shape=(tile_m,)
+            ).get()
 
             # Buffer resources.
             # For dynamic memrefs, `max_size=False` cannot infer the logical size from the memref *type*,
@@ -1849,6 +1857,15 @@ def compile_mixed_moe_gemm2(
             expert_rsrc = buffer_ops.create_buffer_resource(
                 arg_expert_ids, max_size=False, num_records_bytes=eid_nbytes_i32
             )
+            _PERSIST_M = 4
+            _c0_p = arith.constant(0, index=True)
+            _c1_p = arith.constant(1, index=True)
+            _c_pm = arith.constant(_PERSIST_M, index=True)
+            _for_persist = scf.ForOp(_c0_p, _c_pm, _c1_p)
+            _for_ip = ir.InsertionPoint(_for_persist.body)
+            _for_ip.__enter__()
+            _mi_p = _for_persist.induction_variable
+            bx = bx_persist * _c_pm + _mi_p
             bx_m = bx * arith.constant(tile_m, index=True)
 
             # Early-exit guard (as in 2ce65fb): some routing paths can produce extra/garbage
@@ -2420,12 +2437,21 @@ def compile_mixed_moe_gemm2(
 
                     rocdl.sched_barrier(0)
 
-                # Prologue.
+                # Prologue -- B-first.
                 k0 = arith.index(0)
-                x_regs0 = load_x_tile(k0)
                 b_cur = load_b_tile(k0)
                 a_scale_pong, b_scale_pong = prefetch_ab_scale_tile(k0 // pack_K // 128)
+                x_regs0 = load_x_tile(k0)
                 store_x_tile_to_lds(x_regs0, lds_base_cur)
+                _c_tile_m_idx = arith.constant(tile_m, index=True)
+                _tid_in_range = arith.cmpu(tx, _c_tile_m_idx, "ult")
+                with scf.IfOp(_tid_in_range).then():
+                    _tid_row = bx_m + tx
+                    _tid_val = buffer_ops.buffer_load(
+                        sorted_rsrc, _tid_row, vec_width=1, dtype=i32
+                    )
+                    _tid_vec1 = vector.from_elements(I.vec(1, I.i32), [_tid_val])
+                    vector.store(_tid_vec1, lds_tid, [tx])
                 gpu.barrier()
 
                 acc = [acc_init] * num_acc_n * m_repeat
@@ -2663,13 +2689,7 @@ def compile_mixed_moe_gemm2(
                         vector.store(v1, lds_out, [lds_idx], alignment=2)
 
                 def precompute_row(*, row_local, row):
-                    # Precompute row context for cshuffle stores.
-                    # Return (fused_i32, row_valid_i1) so the epilogue can skip the entire row
-                    # for invalid tail rows, avoiding per-store branching.
-                    fused2 = buffer_ops.buffer_load(
-                        sorted_rsrc, row, vec_width=1, dtype=i32
-                    )
-
+                    fused2 = memref.load(lds_tid, [row_local])
                     row_i32 = arith.index_cast(i32, row)
                     row_valid0 = arith.cmpu(row_i32, num_valid_i32, "ult")
                     t = fused2 & mask24_i32
@@ -2677,30 +2697,24 @@ def compile_mixed_moe_gemm2(
                     t_ok = arith.cmpu(t, tokens_i32, "ult")
                     s_ok = arith.cmpu(s, topk_i32_v, "ult")
                     row_valid = arith.andi(row_valid0, arith.andi(t_ok, s_ok))
-
-                    return (fused2, row_valid)
-
-                def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
-                    fused = row_ctx
-                    t = fused & mask24_i32
-                    s = fused >> 24
                     t_idx = arith.index_cast(ir.IndexType.get(), t)
                     s_idx = arith.index_cast(ir.IndexType.get(), s)
+                    ts_idx = t_idx * arith.constant(topk, index=True) + s_idx
+                    row_byte_base = out_base_idx + ts_idx * arith.constant(
+                        model_dim * out_elem_bytes, index=True
+                    )
+                    return ((fused2, row_byte_base), row_valid)
+
+                def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
+                    fused, row_byte_base = row_ctx
                     if not bool(accumulate):
                         # ---- 64-bit global store path (avoids i32 offset overflow) ----
                         # Compute full element offset in i64 (index type) and use global_store.
-                        ts_idx = t_idx * arith.constant(topk, index=True) + s_idx
-                        col_idx = col_g0  # already index type
-                        elem_off = (
-                            ts_idx * arith.constant(model_dim, index=True) + col_idx
-                        )
-                        # Align to even element boundary for <2 x bf16/f16> stores
-                        c1_idx = arith.constant(1, index=True)
-                        elem_off_even = elem_off - (elem_off & c1_idx)
-                        byte_off_idx = elem_off_even * arith.constant(
+                        col_idx = col_g0
+                        byte_off_col = col_idx * arith.constant(
                             out_elem_bytes, index=True
                         )
-                        ptr_addr_idx = out_base_idx + byte_off_idx
+                        ptr_addr_idx = row_byte_base + byte_off_col
                         out_ptr = buffer_ops.create_llvm_ptr(
                             ptr_addr_idx, address_space=1
                         )
@@ -2708,23 +2722,22 @@ def compile_mixed_moe_gemm2(
                             out_ptr._value if hasattr(out_ptr, "_value") else out_ptr
                         )
                         frag_v = frag._value if hasattr(frag, "_value") else frag
-                        llvm.StoreOp(frag_v, out_ptr_v, alignment=4)
+                        llvm.StoreOp(
+                            frag_v,
+                            out_ptr_v,
+                            alignment=_e_vec * out_elem_bytes,
+                            nontemporal=True,
+                        )
                     else:
                         # ---- accumulate=True: 64-bit global atomic path ----
                         # Avoids i32 offset overflow when tokens*model_dim*2 > INT32_MAX
                         # (~150K tokens for model_dim=7168).
                         # Unified bf16/f16 path using llvm.AtomicRMWOp with 64-bit pointer.
-                        col_idx = col_g0  # already index type
-                        elem_off = (
-                            t_idx * arith.constant(model_dim, index=True) + col_idx
-                        )
-                        # Align to even element boundary for <2 x bf16/f16> atomics
-                        c1_idx = arith.constant(1, index=True)
-                        elem_off_even = elem_off - (elem_off & c1_idx)
-                        byte_off_idx = elem_off_even * arith.constant(
+                        col_idx = col_g0
+                        byte_off_col = col_idx * arith.constant(
                             out_elem_bytes, index=True
                         )
-                        ptr_addr_idx = out_base_idx + byte_off_idx
+                        ptr_addr_idx = row_byte_base + byte_off_col
                         out_ptr = buffer_ops.create_llvm_ptr(
                             ptr_addr_idx, address_space=1
                         )
@@ -2738,9 +2751,10 @@ def compile_mixed_moe_gemm2(
                             frag_v,
                             llvm.AtomicOrdering.monotonic,
                             syncscope="agent",
-                            alignment=4,
+                            alignment=_e_vec * out_elem_bytes,
                         )
 
+                _e_vec = min(tile_n // 32, 8)
                 c_shuffle_epilog(
                     arith=arith,
                     vector=vector,
@@ -2749,7 +2763,7 @@ def compile_mixed_moe_gemm2(
                     range_constexpr=range_constexpr,
                     tile_m=tile_m,
                     tile_n=tile_n,
-                    e_vec=2,
+                    e_vec=_e_vec,
                     m_repeat=m_repeat,
                     num_acc_n=num_acc_n,
                     tx=tx,
@@ -2773,6 +2787,10 @@ def compile_mixed_moe_gemm2(
                 with _ifexpert_of.then():
                     _moe_gemm2_then_body()
 
+            gpu.barrier()
+            scf.YieldOp([])
+            _for_ip.__exit__(None, None, None)
+
         @flir.jit
         def __call__(
             self: flir.T.i64,
@@ -2794,7 +2812,8 @@ def compile_mixed_moe_gemm2(
         ):
             bdx = 256
             gx = n_in / arith.index(tile_n)
-            gy = size_expert_ids_in
+            _c_pm_l = arith.index(4)
+            gy = (size_expert_ids_in + _c_pm_l - arith.index(1)) / _c_pm_l
 
             stream_token = stream_ptr_to_async_token(stream_ptr)
             flir.gpu_ext.LaunchFuncOp(
