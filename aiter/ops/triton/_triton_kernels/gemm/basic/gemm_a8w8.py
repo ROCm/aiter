@@ -172,8 +172,7 @@ def _gemm_a8w8_kernel(
 
         # Add bias (only when not splitting K; bias is added after reduce)
         if HAS_BIAS:
-            offs_bias = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N) % N
-            bias = tl.load(bias_ptr + offs_bias)
+            bias = tl.load(bias_ptr + offs_bn)
             accumulator = accumulator.to(bias_ptr.type.element_ty) + bias[None, :]
 
         c = accumulator.to(c_ptr.type.element_ty)
