@@ -1626,12 +1626,251 @@ def test_mha_varlen_with_sink(
         torch_dv,
         atol=bwd_atol,
         rtol=bwd_rtol,
-        msg=lambda msg: f"bwd dv mismatch\n\n{msg}\n",
+        msg=lambda msg: f"bwd dv mismatch (varlen)\n\n{msg}\n",
     )
     torch.testing.assert_close(
         triton_dsink,
         torch_dsink,
         atol=5e-2,  # higher tolerance due to summation over exp
         rtol=5e-2,  # higher tolerance due to summation over exp
+        msg=lambda msg: f"bwd dsink mismatch (varlen)\n\n{msg}\n",
+    )
+
+
+# Run sink + sliding window tests with:
+# pytest op_tests/triton_tests/attention/test_mha.py -k sink_sliding_window
+
+
+@pytest.mark.parametrize("BATCH", [1, 2])
+@pytest.mark.parametrize(
+    "SEQLEN_Q, SEQLEN_K", [(64, 64), (128, 128), (256, 256), (128, 64), (32, 128)]
+)
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(8, 1), (16, 4)])
+@pytest.mark.parametrize("HEAD_SZ", [32, 64])
+@pytest.mark.parametrize("CAUSAL", [True])
+@pytest.mark.parametrize("WINDOW_SIZE_LEFT", [4, 16, 64])
+def test_mha_with_sink_sliding_window(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    CAUSAL: bool,
+    WINDOW_SIZE_LEFT: int,
+):
+    device: str = "cuda"
+    dtype: torch.dtype = torch.bfloat16
+
+    torch.cuda.empty_cache()
+    torch.manual_seed(0)
+    q = torch.randn(
+        (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ),
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    k = torch.randn(
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ),
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    v = torch.randn(
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ),
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    sink = torch.randn(
+        (NUM_Q_HEADS,), device=device, dtype=torch.float32, requires_grad=True
+    )
+
+    window_size = (WINDOW_SIZE_LEFT, -1)
+
+    # Triton forward
+    with torch.set_grad_enabled(True):
+        triton_out = flash_attn_func(
+            q,
+            k,
+            v,
+            causal=CAUSAL,
+            window_size=window_size,
+            sink=sink,
+        )
+
+    # Torch reference forward
+    with torch.set_grad_enabled(True):
+        torch_out, _, _ = attention_ref(
+            q,
+            k,
+            v,
+            causal=CAUSAL,
+            window_size=window_size,
+            sink=sink,
+        )
+
+    # Forward assertion
+    fwd_atol: float = 1e-2
+    fwd_rtol: float = 1e-2
+    torch.testing.assert_close(
+        triton_out,
+        torch_out,
+        atol=fwd_atol,
+        rtol=fwd_rtol,
+        msg=lambda msg: f"fwd mismatch\n\n{msg}\n",
+    )
+
+    # Backward
+    do = torch.randn_like(q)
+
+    mha_set_use_fused_bwd_kernel(False)
+    triton_dq, triton_dk, triton_dv, triton_dsink = torch.autograd.grad(
+        triton_out, (q, k, v, sink), do
+    )
+
+    torch_dq, torch_dk, torch_dv, torch_dsink = torch.autograd.grad(
+        torch_out, (q, k, v, sink), do
+    )
+
+    bwd_atol = 1.5e-2
+    bwd_rtol = 1.5e-2
+    torch.testing.assert_close(
+        triton_dq,
+        torch_dq,
+        atol=bwd_atol,
+        rtol=bwd_rtol,
+        msg=lambda msg: f"bwd dq mismatch\n\n{msg}\n",
+    )
+    torch.testing.assert_close(
+        triton_dk,
+        torch_dk,
+        atol=bwd_atol,
+        rtol=bwd_rtol,
+        msg=lambda msg: f"bwd dk mismatch\n\n{msg}\n",
+    )
+    torch.testing.assert_close(
+        triton_dv,
+        torch_dv,
+        atol=bwd_atol,
+        rtol=bwd_rtol,
+        msg=lambda msg: f"bwd dv mismatch\n\n{msg}\n",
+    )
+    torch.testing.assert_close(
+        triton_dsink,
+        torch_dsink,
+        atol=5e-2,
+        rtol=5e-2,
         msg=lambda msg: f"bwd dsink mismatch\n\n{msg}\n",
+    )
+
+
+@pytest.mark.parametrize("BATCH", [1])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(128, 128), (64, 64)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(8, 1)])
+@pytest.mark.parametrize("HEAD_SZ", [64])
+@pytest.mark.parametrize("CAUSAL", [True])
+@pytest.mark.parametrize("WINDOW_SIZE_LEFT", [4, 32])
+def test_mha_sliding_window_no_sink(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    CAUSAL: bool,
+    WINDOW_SIZE_LEFT: int,
+):
+    """Test sliding window without sink to validate window masking alone."""
+    device: str = "cuda"
+    dtype: torch.dtype = torch.bfloat16
+
+    torch.cuda.empty_cache()
+    torch.manual_seed(0)
+    q = torch.randn(
+        (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ),
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    k = torch.randn(
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ),
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    v = torch.randn(
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ),
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+
+    window_size = (WINDOW_SIZE_LEFT, -1)
+
+    # Triton forward
+    with torch.set_grad_enabled(True):
+        triton_out = flash_attn_func(
+            q,
+            k,
+            v,
+            causal=CAUSAL,
+            window_size=window_size,
+        )
+
+    # Torch reference forward
+    with torch.set_grad_enabled(True):
+        torch_out, _, _ = attention_ref(
+            q,
+            k,
+            v,
+            causal=CAUSAL,
+            window_size=window_size,
+        )
+
+    # Forward assertion
+    fwd_atol: float = 1e-2
+    fwd_rtol: float = 1e-2
+    torch.testing.assert_close(
+        triton_out,
+        torch_out,
+        atol=fwd_atol,
+        rtol=fwd_rtol,
+        msg=lambda msg: f"fwd mismatch\n\n{msg}\n",
+    )
+
+    # Backward
+    do = torch.randn_like(q)
+
+    mha_set_use_fused_bwd_kernel(False)
+    triton_dq, triton_dk, triton_dv = torch.autograd.grad(
+        triton_out, (q, k, v), do
+    )
+
+    torch_dq, torch_dk, torch_dv = torch.autograd.grad(
+        torch_out, (q, k, v), do
+    )
+
+    bwd_atol = 1.5e-2
+    bwd_rtol = 1.5e-2
+    torch.testing.assert_close(
+        triton_dq,
+        torch_dq,
+        atol=bwd_atol,
+        rtol=bwd_rtol,
+        msg=lambda msg: f"bwd dq mismatch\n\n{msg}\n",
+    )
+    torch.testing.assert_close(
+        triton_dk,
+        torch_dk,
+        atol=bwd_atol,
+        rtol=bwd_rtol,
+        msg=lambda msg: f"bwd dk mismatch\n\n{msg}\n",
+    )
+    torch.testing.assert_close(
+        triton_dv,
+        torch_dv,
+        atol=bwd_atol,
+        rtol=bwd_rtol,
+        msg=lambda msg: f"bwd dv mismatch\n\n{msg}\n",
     )

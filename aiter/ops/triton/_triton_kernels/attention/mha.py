@@ -119,6 +119,7 @@ def _attn_fwd_inner(
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
     ENABLE_PIPELINING: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
 ):
     RCP_LN2: tl.constexpr = 1.4426950408889634
     HAS_PE: tl.constexpr = BLOCK_DMODEL_PE > 0
@@ -188,6 +189,12 @@ def _attn_fwd_inner(
             causal_mask = OFFS_M[:, None] >= causal_boundary[None, :]
             mask = mask & causal_mask
 
+        if SLIDING_WINDOW > 0:
+            k_pos = start_n + tl.arange(0, BLOCK_N)
+            q_adj = OFFS_M + seqlen_k - seqlen_q
+            window_mask = k_pos[None, :] >= (q_adj[:, None] - SLIDING_WINDOW)
+            mask = mask & window_mask
+
         qk = tl.where(mask, qk, float("-inf"))
 
         if alibi_slope is not None:
@@ -203,6 +210,11 @@ def _attn_fwd_inner(
 
         # Compute scaled QK and softmax probabilities
         p = tl.math.exp2(qk - m_ij[:, None])
+
+        if SLIDING_WINDOW > 0:
+            # When all qk in a row are -inf (fully out-of-window block) and m_i was -inf,
+            # exp2(-inf - (-inf)) = NaN. Sanitize by zeroing masked elements.
+            p = tl.where(mask, p, 0.0)
 
         # CAVEAT: Must update l_ij before applying dropout
         l_ij = tl.sum(p, 1)
@@ -227,6 +239,10 @@ def _attn_fwd_inner(
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
         # store the diff in maxes to adjust acc and li as we discover new maxes
         alpha = tl.math.exp2(m_i - m_ij)
+        if SLIDING_WINDOW > 0:
+            # When m_i == m_ij == -inf, exp2(-inf - (-inf)) = NaN. alpha should be 1.0
+            # (no rescaling needed since max didn't change).
+            alpha = tl.where(m_i == m_ij, 1.0, alpha)
         acc = acc * alpha[:, None]
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
@@ -272,6 +288,7 @@ _attn_fwd_repr = make_kernel_repr(
         "NUM_XCD",
         "USE_INT64_STRIDES",
         "ENABLE_SINK",
+        "SLIDING_WINDOW",
     ],
 )
 
@@ -344,6 +361,7 @@ def _attn_fwd(
     NUM_XCD: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
     ENABLE_SINK: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
 ):
     NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
     # calculate offsets
@@ -738,6 +756,7 @@ def _attn_fwd(
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
             ENABLE_PIPELINING=True,
+            SLIDING_WINDOW=SLIDING_WINDOW,
         )
         block_min = block_max
         block_max = n_blocks * BLOCK_N
@@ -802,6 +821,7 @@ def _attn_fwd(
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
             ENABLE_PIPELINING=False,
+            SLIDING_WINDOW=SLIDING_WINDOW,
         )
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
