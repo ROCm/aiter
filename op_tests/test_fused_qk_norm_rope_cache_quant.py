@@ -1738,7 +1738,7 @@ parser.add_argument(
     "--token",
     type=int,
     nargs="*",
-    default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 496, 8192, 16384],
+    default=[3, 127, 513, 778, 1024, 1257],
     help="""Number of tokens.
     e.g.: -t 513""",
 )
