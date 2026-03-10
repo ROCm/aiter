@@ -1,0 +1,3 @@
+gfx,dtype,batch,hq,hk,sq,sk,hdim_q,hdim_v,tile_pattern
+gfx950,bf16,130,2,2,16,2048,128,128,b32x32x128x128x32x128
+gfx942,bf16,130,2,2,16,2048,128,128,b16x128x64x128x32x128

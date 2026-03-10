@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Any, Optional, Tuple
+import csv
+import functools
+import os
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import Generator, Tensor
 
-from ..jit.core import CK_DIR, AITER_META_DIR, compile_ops
+from ..jit.core import AITER_CONFIGS, CK_DIR, AITER_META_DIR, compile_ops
 from ..jit.utils.chip_info import get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..jit.utils.mha_recipes import (
@@ -14,6 +17,99 @@ from ..jit.utils.mha_recipes import (
     get_mha_varlen_prebuild_variants_by_names,
 )
 from ..utility import dtypes
+
+
+def _iter_non_comment_csv_lines(path: str):
+    with open(path, "r", newline="") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            yield raw_line
+
+
+@functools.lru_cache(maxsize=8)
+def _load_tuned_fmha_rules_cached(csv_path: str, _mtime_ns: int) -> List[Dict[str, str]]:
+    try:
+        reader = csv.DictReader(_iter_non_comment_csv_lines(csv_path))
+    except FileNotFoundError:
+        return []
+
+    if reader.fieldnames is None:
+        return []
+
+    rules: List[Dict[str, str]] = []
+    for row in reader:
+        if row is None:
+            continue
+        normalized = {
+            str(key).replace("\ufeff", "").strip(): ""
+            if value is None
+            else str(value).strip()
+            for key, value in row.items()
+        }
+        rules.append(normalized)
+    return rules
+
+
+def load_tuned_fmha_rules() -> List[Dict[str, str]]:
+    csv_path = AITER_CONFIGS.AITER_CONFIG_FMHA_FILE
+    try:
+        mtime_ns = os.stat(csv_path).st_mtime_ns
+    except FileNotFoundError:
+        return []
+    return _load_tuned_fmha_rules_cached(csv_path, mtime_ns)
+
+
+def _to_int(value: str) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+
+def _normalize_gfx(value: str) -> str:
+    return str(value).strip().lower().split(":", 1)[0]
+
+
+def find_matching_tuned_fmha_rule(
+    gfx: str,
+    dtype: str,
+    batch: int,
+    hq: int,
+    hk: int,
+    sq: int,
+    sk: int,
+    hdim_q: int,
+    hdim_v: int,
+):
+    runtime_gfx = _normalize_gfx(gfx)
+    runtime_dtype = str(dtype).strip().lower()
+
+    for rule in load_tuned_fmha_rules():
+        if _normalize_gfx(rule.get("gfx", "")) != runtime_gfx:
+            continue
+        if str(rule.get("dtype", "")).strip().lower() != runtime_dtype:
+            continue
+        if _to_int(rule.get("batch")) != batch:
+            continue
+        if _to_int(rule.get("hq")) != hq:
+            continue
+        if _to_int(rule.get("hk")) != hk:
+            continue
+        if _to_int(rule.get("sq")) != sq:
+            continue
+        if _to_int(rule.get("sk")) != sk:
+            continue
+        if _to_int(rule.get("hdim_q")) != hdim_q:
+            continue
+        if _to_int(rule.get("hdim_v")) != hdim_v:
+            continue
+        return rule
+    return None
 
 
 def cmdGenFunc_mha_fwd(
@@ -39,7 +135,9 @@ def cmdGenFunc_mha_fwd(
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
 ):
-    _, seqlen_q, _, _ = q.shape
+    batch, seqlen_q, hq, hdim_q = q.shape
+    _, sk, hk, _ = k.shape
+    hdim_v = v.shape[3]
     # causal=true is the same as causal=false in this case
     causal = is_causal
     if seqlen_q == 1 and alibi_slopes is None:
@@ -93,6 +191,25 @@ def cmdGenFunc_mha_fwd(
         # only support per-tensor quantization for now
         md_name += "_pertensor"
         filter += "_pertensor*"
+
+    tuned_rule = None
+    if q.dtype == dtypes.bf16:
+        tuned_rule = find_matching_tuned_fmha_rule(
+            gfx=get_gfx(),
+            dtype="bf16",
+            batch=batch,
+            hq=hq,
+            hk=hk,
+            sq=seqlen_q,
+            sk=sk,
+            hdim_q=hdim_q,
+            hdim_v=hdim_v,
+        )
+    if tuned_rule is not None:
+        tile_pattern = tuned_rule.get("tile_pattern", "").strip()
+        if tile_pattern:
+            md_name += "_tunedfmha"
+            filter = f"*{tile_pattern}*"
 
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
