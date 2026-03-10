@@ -532,7 +532,6 @@ def flydsl_moe_stage2(
     if a_dtype == "fp4":
         inter_dim = inter_dim * 2
 
-    torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
 
     dev = inter_states.device
     sw = (
