@@ -19,8 +19,8 @@ def get_embedded_hsa_build_args():
     header_path_var = os.getenv("AITER_EMBEDDED_HSA_HEADER_PATH", "").strip()
     flags_extra_cc = []
 
-    # If header is provided, then make sure that include_dir is also provided,
-    # otherwise the embedded HSA header won't be found during compilation.
+    # If a header path is provided, derive its directory and pass it via -I so
+    # the embedded HSA header can be found during compilation (no separate include_dir).
     if header_path_var:
         header_path = Path(header_path_var)
         # aiter_hip_common.h uses: #include AITER_EMBEDDED_HSA_HEADER
