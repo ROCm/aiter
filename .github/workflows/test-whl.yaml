@@ -11,14 +11,14 @@ on:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - runners: aiter-1gpu-runner
+          - runner: aiter-1gpu-runner
             label: MI300
-          - runners: linux-aiter-mi355-1
+          - runner: linux-aiter-mi355-1
             label: MI355
-      fail-fast: false
-    runs-on: ${{ matrix.runners }}
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
     steps:
@@ -100,7 +100,7 @@ jobs:
         if: always()
         run: |
           echo "## Test Summary - ${{ matrix.label }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Runner**: ${{ matrix.runners }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Runner**: ${{ matrix.runner }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Install**: ${{ steps.install.outcome }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Tests**: ${{ steps.tests.outcome }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY

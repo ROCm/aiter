@@ -8,7 +8,7 @@ on:
     branches:
       - main
     paths:
-      - '.github/workflows/build-whl.yaml'
+      - '.github/workflows/aiter-release.yaml'
       - '.github/workflows/test-whl.yaml'
       - '.github/workflows/promote.yaml'
       - '.github/workflows/nightly.yaml'
@@ -19,12 +19,12 @@ on:
         description: 'Docker image for Python 3.10 build'
         type: string
         required: false
-        default: 'rocm/pytorch:rocm6.2_ubuntu22.04_py3.10_pytorch_release-2.3.0'
+        default: 'rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1'
       docker_image_py312:
         description: 'Docker image for Python 3.12 build'
         type: string
         required: false
-        default: 'rocm/vllm-dev:nightly'
+        default: 'rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1'
       gpu_archs:
         description: 'GPU architectures (e.g. gfx942;gfx950)'
         type: string
@@ -45,12 +45,14 @@ concurrency:
 
 jobs:
   build:
-    uses: ./.github/workflows/build-whl.yaml
+    uses: ./.github/workflows/aiter-release.yaml
     with:
       release_type: ${{ github.event_name == 'schedule' && 'nightlies' || github.event_name == 'pull_request' && 'devreleases' || 'devreleases' }}
-      docker_image_py310: ${{ inputs.docker_image_py310 || 'rocm/pytorch:rocm6.2_ubuntu22.04_py3.10_pytorch_release-2.3.0' }}
-      docker_image_py312: ${{ inputs.docker_image_py312 || 'rocm/vllm-dev:nightly' }}
-      gpu_archs: ${{ inputs.gpu_archs || 'gfx942;gfx950' }}
+      docker_image_py310: ${{ github.event.inputs.docker_image_py310 || 'rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1' }}
+      docker_image_py312: ${{ github.event.inputs.docker_image_py312 || 'rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1' }}
+      gpu_archs: ${{ github.event.inputs.gpu_archs || 'gfx942;gfx950' }}
+      runner: build-only-aiter
+      add_date_stamp: true
     permissions:
       id-token: write
       contents: read
@@ -60,7 +62,7 @@ jobs:
     if: ${{ !(inputs.skip_tests || false) }}
     uses: ./.github/workflows/test-whl.yaml
     with:
-      docker_image: ${{ inputs.docker_image_py312 || 'rocm/vllm-dev:nightly' }}
+      docker_image: ${{ github.event.inputs.docker_image_py312 || 'rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1' }}
     permissions:
       contents: read
 
