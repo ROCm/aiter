@@ -1,5 +1,4 @@
 import torch
-import sys
 import warnings
 import argparse
 import itertools

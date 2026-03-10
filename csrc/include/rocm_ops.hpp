@@ -1926,3 +1926,20 @@ namespace py = pybind11;
           py::arg("cache_seqlens")      = torch::Tensor(),                     \
           py::arg("conv_state_indices") = torch::Tensor(),                     \
           py::arg("pad_slot_id")        = -1);
+#define MLA_HK_PYBIND                   \
+    m.def("hk_mla_decode_fwd",          \
+          &hk_mla_decode_fwd,           \
+          "hk_mla_decode_fwd",          \
+          py::arg("query"),             \
+          py::arg("kv_buffer"),         \
+          py::arg("qo_indptr"),         \
+          py::arg("kv_indptr"),         \
+          py::arg("kv_page_indices"),   \
+          py::arg("kv_last_page_lens"), \
+          py::arg("work_indptr"),       \
+          py::arg("work_info_set"),     \
+          py::arg("max_seqlen_q"),      \
+          py::arg("softmax_scale"),     \
+          py::arg("split_output"),      \
+          py::arg("split_lse"),         \
+          py::arg("final_output"));
