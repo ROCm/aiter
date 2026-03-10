@@ -723,13 +723,13 @@ mkdir -p $OUTPUT_DIR
 echo "Starting comprehensive PA prefill benchmarks with all combinations..."
 
 # Define parameter arrays
-# Total combinations: 4 × 4 × 2 × 2 × 2 × 3 × 2 × 2 = 1,536
+# Total combinations: 4 × 4 × 2 × 2 × 2 × 3 × 2 × 2 = 1,536/3
 BATCH_SIZES=(1 4 8 16)
 SEQLENS=(512 1024 2048 4096)
 HQ_VALUES=(32 64)
 HK_VALUES=(8 32)
 DTYPES=(fp16 bf16)
-KV_CACHE_DTYPES=(auto fp16 bf16)
+#KV_CACHE_DTYPES=(auto fp16 bf16)
 COMPUTE_TYPES=(fp16 bf16)
 ALIBI_FLAGS=("" "-use_alibi_slope")
 
@@ -743,11 +743,11 @@ for BATCH in "${BATCH_SIZES[@]}"; do
         for HQ in "${HQ_VALUES[@]}"; do
             for HK in "${HK_VALUES[@]}"; do
                 for DTYPE in "${DTYPES[@]}"; do
-                    for KV_CACHE_DTYPE in "${KV_CACHE_DTYPES[@]}"; do
+                    #for KV_CACHE_DTYPE in "${KV_CACHE_DTYPES[@]}"; do
                         for COMPUTE_TYPE in "${COMPUTE_TYPES[@]}"; do
                             for ALIBI in "${ALIBI_FLAGS[@]}"; do
                                 CURRENT=$((CURRENT + 1))
-                                
+                                KV_CACHE_DTYPE=$DTYPE          
                                 # Build filename from parameters
                                 FILENAME="b${BATCH}_s${SEQLEN}_hq${HQ}_hk${HK}_d${DTYPE}_kvc${KV_CACHE_DTYPE}_c${COMPUTE_TYPE}"
                                 if [ -n "$ALIBI" ]; then
@@ -768,7 +768,7 @@ for BATCH in "${BATCH_SIZES[@]}"; do
                                 fi
                             done
                         done
-                    done
+                    #done
                 done
             done
         done
