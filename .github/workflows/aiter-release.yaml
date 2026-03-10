@@ -146,7 +146,7 @@ jobs:
         id: version
         run: |
           DATE_STAMP=$(date +%Y%m%d)
-          BASE_VERSION=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo "0.1.0")
+          BASE_VERSION=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' | sed 's/\.post[0-9]*$//' || echo "0.1.0")
           NIGHTLY_VERSION="${BASE_VERSION}+${DATE_STAMP}"
           echo "nightly_version=${NIGHTLY_VERSION}" >> $GITHUB_OUTPUT
           echo "Building version: ${NIGHTLY_VERSION}"
@@ -190,16 +190,23 @@ jobs:
           set -e
           echo "Building aiter whl packages for Python ${{ matrix.python_version }}..."
 
-          VERSION_ENV=""
           if [ "${{ env.ADD_DATE_STAMP }}" = "true" ] && [ -n "${{ steps.version.outputs.nightly_version }}" ]; then
-            VERSION_ENV="SETUPTOOLS_SCM_PRETEND_VERSION=${{ steps.version.outputs.nightly_version }}"
             echo "Using version: ${{ steps.version.outputs.nightly_version }}"
+            docker exec \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION="${{ steps.version.outputs.nightly_version }}" \
+            -e PREBUILD_KERNELS=1 \
+            -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
+            -w /workspace \
+            aiter_build_${{ matrix.python_version }} \
+            bash -c "python3 setup.py bdist_wheel && ls dist/*.whl"
+          else
+            docker exec \
+            -e PREBUILD_KERNELS=1 \
+            -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
+            -w /workspace \
+            aiter_build_${{ matrix.python_version }} \
+            bash -c "python3 setup.py bdist_wheel && ls dist/*.whl"
           fi
-
-          docker exec \
-          -w /workspace \
-          aiter_build_${{ matrix.python_version }} \
-          bash -c "${VERSION_ENV} PREBUILD_KERNELS=1 GPU_ARCHS=\"${{ env.GPU_ARCHS }}\" python3 setup.py bdist_wheel && ls dist/*.whl"
 
       - name: Upload whl file as artifact
         if: ${{ matrix.build_enabled }}
