@@ -14,6 +14,7 @@
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace py = pybind11;
 
@@ -22,6 +23,7 @@ namespace aiter {
 static std::unique_ptr<LRUCache<std::string, PaDecodeCacheEntry>> g_kernel_cache;
 static std::once_flag init_kernel_cache_flag;
 static std::mutex g_cache_mutex;
+static std::unordered_map<std::string, std::shared_ptr<std::mutex>> g_key_mutexes;
 
 static CachedKernel load_cached_kernel(
     const py::bytes& hsaco_bytes,
@@ -120,11 +122,67 @@ void pa_decode_gluon_aot(
     const torch::Tensor& sinks,
     void* stream)
 {
+    // ==================== DEVICE VALIDATION ====================
     TORCH_CHECK(query.is_cuda(), "pa_decode_gluon_aot: query must be a CUDA tensor");
     TORCH_CHECK(key_cache.is_cuda(), "pa_decode_gluon_aot: key_cache must be a CUDA tensor");
     TORCH_CHECK(value_cache.is_cuda(), "pa_decode_gluon_aot: value_cache must be a CUDA tensor");
     TORCH_CHECK(output.is_cuda(), "pa_decode_gluon_aot: output must be a CUDA tensor");
+    TORCH_CHECK(context_lengths.is_cuda(), "pa_decode_gluon_aot: context_lengths must be a CUDA tensor");
+    TORCH_CHECK(block_tables.is_cuda(), "pa_decode_gluon_aot: block_tables must be a CUDA tensor");
+    TORCH_CHECK(exp_sums.is_cuda(), "pa_decode_gluon_aot: exp_sums must be a CUDA tensor");
+    TORCH_CHECK(max_logits.is_cuda(), "pa_decode_gluon_aot: max_logits must be a CUDA tensor");
+    TORCH_CHECK(temporary_output.is_cuda(), "pa_decode_gluon_aot: temporary_output must be a CUDA tensor");
+    if (query_scale.defined())
+        TORCH_CHECK(query_scale.is_cuda(), "pa_decode_gluon_aot: query_scale must be a CUDA tensor");
+    if (key_scale.defined())
+        TORCH_CHECK(key_scale.is_cuda(), "pa_decode_gluon_aot: key_scale must be a CUDA tensor");
+    if (value_scale.defined())
+        TORCH_CHECK(value_scale.is_cuda(), "pa_decode_gluon_aot: value_scale must be a CUDA tensor");
+    if (sinks.defined())
+        TORCH_CHECK(sinks.is_cuda(), "pa_decode_gluon_aot: sinks must be a CUDA tensor");
 
+    // ==================== ARCHITECTURE VALIDATION ====================
+    const int cdna_ver = get_cdna_version();
+    TORCH_CHECK(cdna_ver == 3 || cdna_ver == 4,
+        "pa_decode_gluon_aot: unsupported GPU architecture (cdna_version=",
+        cdna_ver, "). Only gfx942 (CDNA3) and gfx950 (CDNA4) are supported.");
+
+    // gfx942 (CDNA3) -> Float8_e4m3fnuz, gfx950 (CDNA4) -> Float8_e4m3fn
+    const at::ScalarType arch_fp8_type = (cdna_ver == 3)
+        ? at::ScalarType::Float8_e4m3fnuz
+        : at::ScalarType::Float8_e4m3fn;
+
+    // ==================== DTYPE VALIDATION ====================
+    auto is_supported_data_dtype = [arch_fp8_type](at::ScalarType dt) {
+        return dt == arch_fp8_type ||
+               dt == at::ScalarType::BFloat16 ||
+               dt == at::ScalarType::Half;
+    };
+    TORCH_CHECK(is_supported_data_dtype(query.scalar_type()),
+        "pa_decode_gluon_aot: query dtype must be fp8/bf16/fp16, got ", query.scalar_type());
+    TORCH_CHECK(is_supported_data_dtype(key_cache.scalar_type()),
+        "pa_decode_gluon_aot: key_cache dtype must be fp8/bf16/fp16, got ", key_cache.scalar_type());
+    TORCH_CHECK(is_supported_data_dtype(value_cache.scalar_type()),
+        "pa_decode_gluon_aot: value_cache dtype must be fp8/bf16/fp16, got ", value_cache.scalar_type());
+    TORCH_CHECK(output.scalar_type() == at::ScalarType::BFloat16 ||
+                output.scalar_type() == at::ScalarType::Half,
+        "pa_decode_gluon_aot: output dtype must be bf16/fp16, got ", output.scalar_type());
+    TORCH_CHECK(context_lengths.scalar_type() == at::ScalarType::Int,
+        "pa_decode_gluon_aot: context_lengths dtype must be int32, got ", context_lengths.scalar_type());
+    TORCH_CHECK(block_tables.scalar_type() == at::ScalarType::Int,
+        "pa_decode_gluon_aot: block_tables dtype must be int32, got ", block_tables.scalar_type());
+    TORCH_CHECK(exp_sums.scalar_type() == at::ScalarType::Float,
+        "pa_decode_gluon_aot: exp_sums dtype must be float32, got ", exp_sums.scalar_type());
+    TORCH_CHECK(max_logits.scalar_type() == at::ScalarType::Float,
+        "pa_decode_gluon_aot: max_logits dtype must be float32, got ", max_logits.scalar_type());
+
+    // ==================== COMPUTE TYPE VALIDATION ====================
+    TORCH_CHECK(compute_type == at::ScalarType::BFloat16 ||
+                compute_type == at::ScalarType::Half ||
+                compute_type == arch_fp8_type,
+        "pa_decode_gluon_aot: compute_type must be bf16/fp16/fp8, got ", compute_type);
+
+    // ==================== SHAPE VALIDATION ====================
     TORCH_CHECK(query.dim() == 3,
         "pa_decode_gluon_aot: expected 3D query tensor, but got shape with dim=", query.dim());
     TORCH_CHECK(output.dim() == 3,
@@ -164,18 +222,51 @@ void pa_decode_gluon_aot(
     const bool value_transposed = (value_cache.dim() == 5);
     const bool use_sinks_flag   = sinks.defined();
 
+    // ==================== QUANTIZATION MODE CONFIGURATION ====================
     int query_quant_mode = -1;
     int kv_quant_mode    = -1;
-    if (query_scale.defined())
-        query_quant_mode = (query_scale.numel() == 1) ? 0 : 1;
-    if (key_scale.defined() && value_scale.defined())
-        kv_quant_mode = (key_scale.numel() == 1) ? 0 : 1;
+
+    if (query_scale.defined()) {
+        TORCH_CHECK(query_scale.scalar_type() == at::ScalarType::Float,
+            "pa_decode_gluon_aot: query_scale dtype must be float32, got ",
+            query_scale.scalar_type());
+        if (query_scale.numel() == 1) {
+            query_quant_mode = 0;
+        } else {
+            TORCH_CHECK(query_scale.dim() == 3,
+                "pa_decode_gluon_aot: expected 3D query_scale tensor for per-token mode, "
+                "but got dim=", query_scale.dim());
+            TORCH_CHECK(query_scale.size(-1) == 1,
+                "pa_decode_gluon_aot: query_scale.size(-1) must be 1, but got ",
+                query_scale.size(-1));
+            query_quant_mode = 1;
+        }
+    }
+
+    if (key_scale.defined() && value_scale.defined()) {
+        TORCH_CHECK(key_scale.scalar_type() == at::ScalarType::Float,
+            "pa_decode_gluon_aot: key_scale dtype must be float32, got ",
+            key_scale.scalar_type());
+        TORCH_CHECK(value_scale.scalar_type() == at::ScalarType::Float,
+            "pa_decode_gluon_aot: value_scale dtype must be float32, got ",
+            value_scale.scalar_type());
+        if (key_scale.numel() == 1) {
+            kv_quant_mode = 0;
+        } else {
+            TORCH_CHECK(key_scale.dim() == 4,
+                "pa_decode_gluon_aot: expected 4D key_scale tensor for per-token mode, "
+                "but got dim=", key_scale.dim());
+            TORCH_CHECK(key_scale.size(-1) == 1,
+                "pa_decode_gluon_aot: key_scale.size(-1) must be 1, but got ",
+                key_scale.size(-1));
+            kv_quant_mode = 1;
+        }
+        TORCH_CHECK(key_scale.sizes() == value_scale.sizes(),
+            "pa_decode_gluon_aot: key_scale and value_scale must have the same shape, "
+            "but got key_scale: ", key_scale.sizes(), ", value_scale: ", value_scale.sizes());
+    }
 
     const float fp8_max_val    = fp8_max_value(value_cache.scalar_type());
-    const int cdna_ver         = get_cdna_version();
-    TORCH_CHECK(cdna_ver == 3 || cdna_ver == 4,
-        "pa_decode_gluon_aot: unsupported GPU architecture (cdna_version=",
-        cdna_ver, "). Only gfx942 (CDNA3) and gfx950 (CDNA4) are supported.");
     const int head_size_pow2   = next_pow2(head_size);
     const std::string compute_type_str = scalar_type_to_str(compute_type);
 
@@ -219,17 +310,35 @@ void pa_decode_gluon_aot(
         init_lru_cache<std::string, PaDecodeCacheEntry>, g_kernel_cache);
 
     PaDecodeCacheEntry cache_entry;
-    bool found = false;
     {
         std::lock_guard<std::mutex> lock(g_cache_mutex);
         PaDecodeCacheEntry* entry_ptr = g_kernel_cache->get(key);
         if (entry_ptr != nullptr) {
             cache_entry = *entry_ptr;
-            found = true;
+            goto kernel_ready;
         }
     }
 
-    if (!found) {
+    {
+        std::shared_ptr<std::mutex> key_mtx;
+        {
+            std::lock_guard<std::mutex> lock(g_cache_mutex);
+            auto& m = g_key_mutexes[key];
+            if (!m) m = std::make_shared<std::mutex>();
+            key_mtx = m;
+        }
+
+        std::lock_guard<std::mutex> key_lock(*key_mtx);
+
+        {
+            std::lock_guard<std::mutex> lock(g_cache_mutex);
+            PaDecodeCacheEntry* entry_ptr = g_kernel_cache->get(key);
+            if (entry_ptr != nullptr) {
+                cache_entry = *entry_ptr;
+                goto kernel_ready;
+            }
+        }
+
         cache_entry = warmup_and_load(
             compute_type_str, query_length, query_group_size, head_size,
             kv_block_size, context_partition_size, query_quant_mode,
@@ -237,14 +346,13 @@ void pa_decode_gluon_aot(
             static_cast<int>(is_causal), static_cast<int>(use_sinks_flag),
             cdna_ver);
 
-        std::lock_guard<std::mutex> lock(g_cache_mutex);
-        PaDecodeCacheEntry* entry_ptr = g_kernel_cache->get(key);
-        if (entry_ptr != nullptr) {
-            cache_entry = *entry_ptr;
-        } else {
+        {
+            std::lock_guard<std::mutex> lock(g_cache_mutex);
             g_kernel_cache->put(key, cache_entry);
         }
     }
+
+kernel_ready:
 
     hipStream_t hip_stream;
     if (stream != nullptr) {
