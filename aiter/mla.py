@@ -288,7 +288,10 @@ def mla_decode_fwd(
         if (
             nhead == 16
             or (
-                nhead == 128 and q.dtype == dtypes.fp8 and kv_buffer.dtype == dtypes.fp8
+                get_gfx() == "gfx942"
+                and nhead == 128
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
             )
             or (
                 get_gfx() == "gfx950"

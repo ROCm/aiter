@@ -29,7 +29,7 @@ def get_git_commit_id_short():
             .strip()
         )
         return commit_id
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, FileNotFoundError):
         return None
 
 
