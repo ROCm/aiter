@@ -3,7 +3,7 @@
 import os
 import argparse
 import itertools
-from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list
+from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list, get_target_archs
 
 STG_INSTANCE_IMPL = """// SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
@@ -866,51 +866,78 @@ class ck_moe_2stage_gemm_codegen:
         self.preshuffle = preshuffle
         self.splitk = splitk
 
+    def get_arch_guard(self, tag, kernel):
+        """Determine C++ preprocessor guard for a kernel instance."""
+        if "FP4" in self.b_dtype:
+            return "#ifndef __gfx942__\n", "\n#endif\n"
+        if tag.endswith("_gfx950"):
+            return "#ifdef __gfx950__\n", "\n#endif\n"
+        if (
+            self.a_dtype.upper() in ("F8", "I8")
+            and self.b_dtype.upper() in ("F8", "I8")
+        ):
+            return "#ifndef __gfx950__\n", "\n#endif\n"
+        return "", ""
+
     def generate_instance_and_lookUpTable(self):
-        _, gemm1_kernel_list = get_gemm1_kernels_list(
-            self.a_dtype,
-            self.b_dtype,
-            self.c_dtype,
-            self.nswizzle,
-            self.quant_type,
-            self.activation,
-            self.mul_routed_weight_stage == 1,
-            self.preshuffle,
-            self.splitk,
-        )
-        tag, gemm2_kernel_list = get_gemm2_kernels_list(
-            self.a_dtype,
-            self.b_dtype,
-            self.c_dtype,
-            self.nswizzle,
-            self.quant_type,
-            self.mul_routed_weight_stage == 2,
-            self.preshuffle,
-        )
-        kernel_list = list(gemm1_kernel_list.values()) + list(
-            gemm2_kernel_list.values()
-        )
+        target_archs = get_target_archs()
+
+        # Collect unique kernels across all target arches
+        # Each entry: (kernel, tag, quanttype)
+        seen_names = set()
+        all_entries = []  # list of (kernel, tag)
+        all_tags = []
+
+        for arch in target_archs:
+            tag1, gemm1_kernel_list = get_gemm1_kernels_list(
+                self.a_dtype,
+                self.b_dtype,
+                self.c_dtype,
+                self.nswizzle,
+                self.quant_type,
+                self.activation,
+                self.mul_routed_weight_stage == 1,
+                self.preshuffle,
+                self.splitk,
+                arch=arch,
+            )
+            tag2, gemm2_kernel_list = get_gemm2_kernels_list(
+                self.a_dtype,
+                self.b_dtype,
+                self.c_dtype,
+                self.nswizzle,
+                self.quant_type,
+                self.mul_routed_weight_stage == 2,
+                self.preshuffle,
+                arch=arch,
+            )
+            for k in gemm1_kernel_list.values():
+                if k.name not in seen_names:
+                    seen_names.add(k.name)
+                    all_entries.append((k, tag1))
+            for k in gemm2_kernel_list.values():
+                if k.name not in seen_names:
+                    seen_names.add(k.name)
+                    all_entries.append((k, tag2))
+            if tag2 not in all_tags:
+                all_tags.append(tag2)
+
+        if self.quant_type in [4, 5]:
+            quanttype = "_blockscale"
+        elif "FP4" in self.a_dtype:
+            quanttype = "_mxfp4_bns" if any("bns" in t for t in all_tags) else "_mxfp4"
+        else:
+            quanttype = ""
 
         f_lookUpTable = os.path.join(self.working_path, "gemm_moe_ck2stages_lookup.h")
 
         with open(f_lookUpTable, "a") as f_lookup:
-            for kernel in kernel_list:
+            for kernel, tag in all_entries:
                 ## generate instance
                 os.makedirs(os.path.join(self.working_path, "instances"), exist_ok=True)
                 f_instance = os.path.join(
                     self.working_path, "instances", f"{kernel.name}.cu"
                 )
-                # if os.path.exists(f_instance):
-                #     os.remove(f_instance)
-                if self.quant_type in [4, 5]:
-                    quanttype = "_blockscale"
-                elif "FP4" in self.a_dtype:
-                    if "bns" in tag:
-                        quanttype = "_mxfp4_bns"
-                    else:
-                        quanttype = "_mxfp4"
-                else:
-                    quanttype = ""
                 gemm1_fp32 = (
                     self.splitk and (kernel.stage == 1) and (quanttype == "_blockscale")
                 )
@@ -942,11 +969,8 @@ class ck_moe_2stage_gemm_codegen:
                                 self.mul_routed_weight_stage == kernel.stage
                             ).lower(),
                         )
-                        if "FP4" in self.b_dtype:
-                            stage_instance = (
-                                "#ifndef __gfx942__\n" + stage_instance + "\n#endif\n"
-                            )
-                        f_ins.write(stage_instance)
+                        guard_begin, guard_end = self.get_arch_guard(tag, kernel)
+                        f_ins.write(guard_begin + stage_instance + guard_end)
 
                 ## generate lookUpTable
                 lookup_ele = LOOKUP_template.format(
@@ -973,45 +997,65 @@ class ck_moe_2stage_gemm_codegen:
                 )
                 f_lookup.write(lookup_ele)
 
-        f_gemm1_heuristic_dispatch = os.path.join(
-            self.working_path, "ck2stages_moe_stage1_heuristic_dispatch.hpp"
-        )
-        gemm1_heuristic_dispatch, gemm2_heuristic_dispatch = heuristic_dispatch_dict[
-            tag
-        ]
-        with open(f_gemm1_heuristic_dispatch, "a") as f_h:
+        # Heuristic dispatch: emit for each unique tag with arch guards
+        emitted_dispatch_tags = set()
+        for tag in all_tags:
+            if tag in emitted_dispatch_tags:
+                continue
+            if tag not in heuristic_dispatch_dict:
+                continue
+            emitted_dispatch_tags.add(tag)
+
+            gemm1_hd, gemm2_hd = heuristic_dispatch_dict[tag]
             gemm1_fp32 = self.splitk and (quanttype == "_blockscale")
-            gemm1_heuristic_dispatch_str = gemm1_heuristic_dispatch.format(
+
+            fmt_args_gemm1 = dict(
                 A0DataType=self.a_dtype,
                 B0DataType=self.b_dtype,
                 AccDataType="F32" if self.a_dtype != "I8" else "I32",
                 EDataType="F32" if gemm1_fp32 else self.c_dtype,
-                CDEElementOp=kernel_list[0].CDEElementOp,
+                CDEElementOp=all_entries[0][0].CDEElementOp,
                 Nswizzle=str(self.nswizzle).lower(),
                 Quant=self.quant_type,
                 ActOP=str(int(self.activation == "silu")),
                 MulRoutedWeight=str(self.mul_routed_weight_stage == 1).lower(),
                 Preshuffle=str(self.preshuffle).lower(),
             )
-            f_h.write(gemm1_heuristic_dispatch_str)
-
-        f_gemm2_heuristic_dispatch = os.path.join(
-            self.working_path, "ck2stages_moe_stage2_heuristic_dispatch.hpp"
-        )
-        with open(f_gemm2_heuristic_dispatch, "a") as f_h:
-            gemm2_heuristic_dispatch_str = gemm2_heuristic_dispatch.format(
+            fmt_args_gemm2 = dict(
                 A0DataType=self.a_dtype,
                 B0DataType=self.b_dtype,
                 AccDataType="F32" if self.a_dtype != "I8" else "I32",
                 EDataType=self.c_dtype,
-                CDEElementOp=kernel_list[-1].CDEElementOp,
+                CDEElementOp=all_entries[-1][0].CDEElementOp,
                 Nswizzle=str(self.nswizzle).lower(),
                 Quant=self.quant_type,
                 ActOP=0,
                 MulRoutedWeight=str(self.mul_routed_weight_stage == 2).lower(),
                 Preshuffle=str(self.preshuffle).lower(),
             )
-            f_h.write(gemm2_heuristic_dispatch_str)
+
+            hd_guard_begin = ""
+            hd_guard_end = ""
+            if tag.endswith("_gfx950"):
+                hd_guard_begin = "#ifdef __gfx950__\n"
+                hd_guard_end = "\n#endif\n"
+            elif len(all_tags) > 1 and not tag.endswith("_gfx950"):
+                hd_guard_begin = "#ifndef __gfx950__\n"
+                hd_guard_end = "\n#endif\n"
+
+            f_gemm1_heuristic_dispatch = os.path.join(
+                self.working_path, "ck2stages_moe_stage1_heuristic_dispatch.hpp"
+            )
+            with open(f_gemm1_heuristic_dispatch, "a") as f_h:
+                content = gemm1_hd.format(**fmt_args_gemm1)
+                f_h.write(hd_guard_begin + content + hd_guard_end)
+
+            f_gemm2_heuristic_dispatch = os.path.join(
+                self.working_path, "ck2stages_moe_stage2_heuristic_dispatch.hpp"
+            )
+            with open(f_gemm2_heuristic_dispatch, "a") as f_h:
+                content = gemm2_hd.format(**fmt_args_gemm2)
+                f_h.write(hd_guard_begin + content + hd_guard_end)
 
 
 if __name__ == "__main__":

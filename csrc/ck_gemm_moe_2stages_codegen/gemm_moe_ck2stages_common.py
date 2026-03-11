@@ -14,7 +14,15 @@ else:
     )  # develop mode
 sys.path.insert(0, AITER_CORE_DIR)
 
-from chip_info import get_gfx  # noqa: E402
+from chip_info import get_gfx, get_gfx_list  # noqa: E402
+
+
+def get_target_archs():
+    """Return list of target GPU architectures from GPU_ARCHS or native detection."""
+    try:
+        return get_gfx_list()
+    except Exception:
+        return [get_gfx()]
 
 
 @dataclass
@@ -369,8 +377,10 @@ def get_gemm1_kernels_list(
     MulRoutedWeight: bool,
     preshuffle: bool = False,
     splitk: bool = False,
+    arch: str = None,
 ) -> list:
-    arch = get_gfx()
+    if arch is None:
+        arch = get_gfx()
     if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
         if arch == "gfx950":
             tag = "a16w16_gfx950"
@@ -419,11 +429,11 @@ def get_gemm1_kernels_list(
                 kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscaleSplitk"
             else:
                 kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscale"
-        elif tag == "a8w8" or tag == "a4w4_bns":
+        elif tag in ("a8w8", "a8w8_gfx950", "a4w4_bns"):
             kernel.CDEElementOp = "MulABScale"
         elif tag == "a4w4":
             kernel.CDEElementOp = "MulABScaleShuffled"
-        elif tag == "a16w16":
+        elif tag in ("a16w16", "a16w16_gfx950"):
             if MulRoutedWeight:
                 kernel.CDEElementOp = "TypeCastExpertWeight"
             else:
@@ -439,9 +449,10 @@ def get_gemm2_kernels_list(
     QuantType: str,
     MulRoutedWeight: bool,
     preshuffle: bool = False,
+    arch: str = None,
 ) -> list:
-    arch = get_gfx()
-
+    if arch is None:
+        arch = get_gfx()
     if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
         if arch == "gfx950":
             tag = "a16w16_gfx950"
@@ -485,11 +496,11 @@ def get_gemm2_kernels_list(
             kernel.CDEElementOp = "MulABScaleExpertWeightWin4"
         elif tag == "a8w8blkscale":
             kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscale"
-        elif tag == "a8w8" or tag == "a4w4_bns":
+        elif tag in ("a8w8", "a8w8_gfx950", "a4w4_bns"):
             kernel.CDEElementOp = "MulABScaleExpertWeight"
         elif tag == "a4w4":
             kernel.CDEElementOp = "MulABScaleExpertWeightShuffled"
-        elif tag == "a16w16":
+        elif tag in ("a16w16", "a16w16_gfx950"):
             if MulRoutedWeight:
                 kernel.CDEElementOp = "TypeCastExpertWeight"
             else:
