@@ -9,11 +9,14 @@ import sys
 import argparse
 import itertools
 
-from aiter.ops.triton.mla_decode_rope import (
+from aiter.ops.triton.attention.mla_decode_rope import (
     decode_attention_fwd_grouped_rope,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
-from op_tests.triton_tests.test_mla_decode_rope import input_helper, ref_preprocess
+from op_tests.triton_tests.attention.test_mla_decode_rope import (
+    input_helper,
+    ref_preprocess,
+)
 
 arg_to_torch_dtype = {
     "fp16": torch.float16,

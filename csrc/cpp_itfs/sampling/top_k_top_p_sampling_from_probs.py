@@ -3,8 +3,9 @@
 
 
 from jinja2 import Template
+from csrc.cpp_itfs.sampling.util import get_seed_and_offset
 from csrc.cpp_itfs.utils import compile_template_op, AITER_CORE_DIR, str_to_bool
-
+import math
 
 MD_NAME = "top_k_top_p_sampling_from_probs"
 
@@ -16,7 +17,7 @@ with open(
 
 
 def compile(
-    d: int,
+    vec_size: int,
     deterministic: bool,
     folder: str = None,
 ):
@@ -28,7 +29,7 @@ def compile(
             f"{AITER_CORE_DIR}/csrc/cpp_itfs/sampling/sampling.cuh",
             f"{AITER_CORE_DIR}/csrc/cpp_itfs/sampling/vec_dtypes.cuh",
         ],
-        d=d,
+        vec_size=vec_size,
         deterministic=deterministic,
         folder=folder,
     )
@@ -47,8 +48,6 @@ def top_k_top_p_sampling_from_probs(
     import torch
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
 
-    if generator is None:
-        generator = torch.cuda.default_generators[probs.device.index]
     probs = probs.float()
     top_p_val = float(top_p_val)
     top_k_val = int(top_k_val)
@@ -57,12 +56,13 @@ def top_k_top_p_sampling_from_probs(
 
     batch_size = indices.size(0) if indices is not None else probs.size(0)
     vocab_size = probs.size(1)
-    philox_offset = generator.get_offset()
-    philox_seed = generator.seed()
+    philox_seed, philox_offset = get_seed_and_offset(
+        batch_size * 32, generator, probs.device
+    )
 
     output = torch.empty(batch_size, dtype=torch.int32, device=probs.device)
-
-    func = compile(vocab_size, deterministic)
+    vec_size = math.gcd(16 // probs.element_size(), vocab_size)
+    func = compile(vec_size, deterministic)
     (
         probs_ptr,
         output_ptr,
@@ -74,6 +74,7 @@ def top_k_top_p_sampling_from_probs(
         batch_size,
         philox_seed,
         philox_offset,
+        vocab_size,
         stream,
     ) = torch_to_c_types(
         probs,
@@ -86,6 +87,7 @@ def top_k_top_p_sampling_from_probs(
         batch_size,
         philox_seed,
         philox_offset,
+        vocab_size,
         torch.cuda.current_stream(),
     )
     func(
@@ -99,6 +101,7 @@ def top_k_top_p_sampling_from_probs(
         top_p_val,
         philox_seed,
         philox_offset,
+        vocab_size,
         stream,
     )
     return output

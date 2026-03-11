@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #pragma once
 
@@ -37,6 +37,7 @@ static_assert(kSizeMlaPartialTileInfoInDw == 2);
 
 void get_mla_metadata_v1(const torch::Tensor& seqlens_qo_indptr, // [batch size + 1]
                          const torch::Tensor& seqlens_kv_indptr, // [batch size + 1]
+                         const torch::Tensor& kv_last_page_lens, // [batch size]
                          const int32_t num_heads_per_head_k,
                          const int32_t num_heads_k,
                          const bool is_causal,
@@ -46,12 +47,16 @@ void get_mla_metadata_v1(const torch::Tensor& seqlens_qo_indptr, // [batch size 
                          torch::Tensor& reduce_indptr,
                          torch::Tensor& reduce_final_map,
                          torch::Tensor& reduce_partial_map,
+                         const int32_t page_size,
                          const int32_t kv_granularity,
                          const int32_t max_seqlen_qo,
                          const int32_t uni_seqlen_qo,
-                         const bool    fast_mode,
+                         const bool fast_mode,
                          const int32_t topk,
-                         const int32_t max_split_per_batch);
+                         const int32_t max_split_per_batch,
+                         const bool intra_batch_mode,
+                         const std::optional<at::ScalarType> dtype_q,
+                         const std::optional<at::ScalarType> dtype_kv);
 
 std::vector<torch::Tensor>
 get_mla_metadata_v1_no_redundant(const torch::Tensor& seqlens_qo_indptr, // [batch size + 1]
@@ -66,5 +71,39 @@ void mla_reduce_v1(const torch::Tensor& partial_output,
                    const torch::Tensor& reduce_indptr,
                    const std::optional<torch::Tensor>& reduce_final_map,
                    const torch::Tensor& reduce_partial_map,
+                   const int max_seqlen_q,
                    torch::Tensor& final_output,
                    std::optional<torch::Tensor>& final_lse);
+
+void get_pa_metadata_v1(const torch::Tensor& seqlens_qo_indptr, // [batch size + 1]
+                        const torch::Tensor& seqlens_kv_indptr, // [batch size + 1]
+                        const int32_t num_heads_per_head_k,
+                        const int32_t num_heads_k,
+                        const bool is_causal,
+                        torch::Tensor& work_metadata_ptrs,
+                        torch::Tensor& work_info_set,
+                        torch::Tensor& work_indptr,
+                        torch::Tensor& reduce_indptr,
+                        torch::Tensor& reduce_final_map,
+                        torch::Tensor& reduce_partial_map,
+                        const int32_t kv_granularity,
+                        const int32_t max_seqlen_qo,
+                        const int32_t uni_seqlen_qo,
+                        const bool fast_mode,
+                        const int32_t topk,
+                        const int32_t max_split_per_batch);
+
+void hk_mla_decode_fwd(
+    torch::Tensor& query,                   // [num_seqs, num_heads, head_size]
+    torch::Tensor& kv_buffer,               // [num_page, page_size, num_kv_heads, head_size]
+    const torch::Tensor& qo_indptr,         // [batch_size+1]
+    const torch::Tensor& kv_indptr,         // [batch_size+1]
+    const torch::Tensor& kv_page_indices,   // [num_page_used]
+    const torch::Tensor& kv_last_page_lens, // [batch_size]
+    const torch::Tensor& work_indptr,       // metadata
+    const torch::Tensor& work_info_set,
+    const int max_seqlen_q,
+    const float softmax_scale,
+    torch::Tensor& split_output,  // Output: [batch_size, num_kv_splits, num_heads, v_head_dim]
+    torch::Tensor& split_lse,     // Output: [batch_size, num_kv_splits, num_heads,  1]
+    torch::Tensor& final_output); // Output: [batch_size, num_heads, v_head_dim]

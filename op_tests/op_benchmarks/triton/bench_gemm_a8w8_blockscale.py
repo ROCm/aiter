@@ -1,13 +1,12 @@
-import sys
 import torch
 import triton
-from aiter.ops.triton.gemm_a8w8_blockscale import (
+from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
 )
 from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
 )
-from op_tests.triton_tests.test_gemm_a8w8_blockscale import (
+from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
     generate_gemm_a8w8_blockscale_inputs,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
@@ -30,7 +29,7 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, impl: callab
     block_shape_n, block_shape_k = block_shape
     c_dtype = torch.bfloat16
 
-    x, weight, x_scale, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
+    x, weight, _, x_scale, _, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
         M, N, K, block_shape_n, block_shape_k, layout=layout, output=True
     )
     # flops
@@ -140,7 +139,7 @@ def run_benchmark(args, defaults):
         run_shape_benchmark(args, impl)
 
 
-def parse_args():
+def parse_args(args: list[str] | None = None):
     parser = get_parser(kernel_name="A8W8 GEMM Blockscale")
     parser = add_argparse_ff(parser)
     parser.add_argument(
@@ -148,18 +147,18 @@ def parse_args():
         action="store_true",
         help="Use Gluon implementation (experimental, requires latest Triton from main)",
     )
-    return get_ff_args(parser)
+    return get_ff_args(parser, args=args)
 
 
-def main():
-    args, defaults = parse_args()
-    if args.print_vgpr:
+def main(args: list[str] | None = None) -> None:
+    parsed_args, defaults = parse_args(args=args)
+    if parsed_args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args, defaults)  # noqa: E731
+        fun = lambda: run_benchmark(parsed_args, defaults)  # noqa: E731
         print_vgpr(fun, get_caller_name_no_ext())
-        return 0
-    run_benchmark(args, defaults)
+        return
+    run_benchmark(parsed_args, defaults)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

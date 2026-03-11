@@ -4,9 +4,9 @@ import functools
 import os
 import re
 import subprocess
-from torch_guard import torch_compile_guard
 
 from cpp_extension import executable_path
+from torch_guard import torch_compile_guard
 
 GFX_MAP = {
     0: "native",
@@ -18,6 +18,15 @@ GFX_MAP = {
     6: "gfx945",
     7: "gfx1100",
     8: "gfx950",
+    9: "gfx1101",
+    10: "gfx1102",
+    11: "gfx1103",
+    12: "gfx1150",
+    13: "gfx1151",
+    14: "gfx1152",
+    15: "gfx1153",
+    16: "gfx1200",
+    17: "gfx1201",
 }
 
 
@@ -58,12 +67,14 @@ def get_gfx_custom_op_core() -> int:
             )
             output = result.stdout
             for line in output.split("\n"):
-                if "gfx" in line.lower():
+                match = re.search(r"\b(gfx\w+)\b", line, re.IGNORECASE)
+                if match:
+                    gfx_arch = match.group(1).lower()
                     try:
-                        return gfx_mapping[line.split(":")[-1].strip()]
+                        return gfx_mapping[gfx_arch]
                     except KeyError:
                         raise KeyError(
-                            f'Unknown GPU architecture: {line.split(":")[-1].strip()}. '
+                            f"Unknown GPU architecture: {gfx_arch}. "
                             f"Supported architectures: {list(gfx_mapping.keys())}"
                         )
 
@@ -91,9 +102,15 @@ def get_gfx_list() -> list[str]:
 
     gfx_env = os.getenv("GPU_ARCHS", "native")
     if gfx_env == "native":
-        return _detect_native()
+        try:
+            gfxs = _detect_native()
+        except RuntimeError:
+            gfxs = ["cpu"]
+    else:
+        gfxs = [g.strip() for g in gfx_env.split(";") if g.strip()]
+    os.environ["AITER_GPU_ARCHS"] = ";".join(gfxs)
 
-    return [g.strip() for g in gfx_env.split(";") if g.strip()]
+    return gfxs
 
 
 @torch_compile_guard()

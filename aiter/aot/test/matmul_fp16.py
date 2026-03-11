@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import triton
 import triton.language as tl
-from triton.tools.compile import compile_kernel, CompileArgs
+
+try:
+    from triton.tools.compile import compile_kernel, CompileArgs
+except ImportError:
+    print("Warning: compile_kernel or CompileArgs is not in triton.tools.compile!")
 
 
 @triton.jit
@@ -11,15 +15,15 @@ def matmul_fp16(
     C,
     A,
     B,
-    M,
-    N,
-    K,
-    stride_cm,
-    stride_cn,
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
+    M: int,
+    N: int,
+    K: int,
+    stride_cm: int,
+    stride_cn: int,
+    stride_am: int,
+    stride_ak: int,
+    stride_bk: int,
+    stride_bn: int,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,

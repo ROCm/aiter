@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import List, Optional, Tuple
 
@@ -26,18 +26,36 @@ def all_reduce(
     _fa: int,
     inp: torch.Tensor,
     out: torch.Tensor,
+    use_new: bool,
     open_fp8_quant: bool,
+    reg_input_buffer: Optional[torch.Tensor] = None,
+    reg_output_buffer: Optional[torch.Tensor] = None,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce")
+def reduce_scatter(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
     reg_buffer: Optional[torch.Tensor] = None,
 ) -> None: ...
 
 
 @compile_ops("module_custom_all_reduce")
-def all_gather_reg(_fa: int, inp: torch.Tensor, out: torch.Tensor) -> None: ...
+def all_gather_reg(
+    _fa: int, inp: torch.Tensor, out: torch.Tensor, last_dim_size: int, dim: int
+) -> None: ...
 
 
 @compile_ops("module_custom_all_reduce")
 def all_gather_unreg(
-    _fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor, out: torch.Tensor
+    _fa: int,
+    inp: torch.Tensor,
+    reg_buffer: torch.Tensor,
+    out: torch.Tensor,
+    last_dim_size: int,
+    dim: int,
 ) -> None: ...
 
 
@@ -51,6 +69,22 @@ def fused_allreduce_rmsnorm(
     w: torch.Tensor,
     eps: float,
     reg_buffer: Optional[torch.Tensor] = None,
+    use_1stage: bool = False,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce")
+def fused_allreduce_rmsnorm_quant(
+    _fa: int,
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    res_out: torch.Tensor,
+    out: torch.Tensor,
+    scale_out: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    reg_buffer: Optional[torch.Tensor] = None,
+    use_1stage: bool = False,
 ) -> None: ...
 
 
@@ -169,7 +203,13 @@ def meta_size() -> int: ...
 
 
 @compile_ops("module_custom_all_reduce")
-def register_buffer(
+def register_input_buffer(
+    _fa: int, t: torch.Tensor, handles: List[torch.Tensor], offsets: List[int]
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce")
+def register_output_buffer(
     _fa: int, t: torch.Tensor, handles: List[torch.Tensor], offsets: List[int]
 ) -> None: ...
 
