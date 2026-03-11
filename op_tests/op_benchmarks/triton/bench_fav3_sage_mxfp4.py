@@ -17,7 +17,6 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
 
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     sage_quant_mxfp4,
-    fused_sage_quant_mxfp4,
 )
 
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
