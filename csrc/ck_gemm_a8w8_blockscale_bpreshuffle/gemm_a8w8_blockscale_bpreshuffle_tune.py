@@ -28,6 +28,8 @@ from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 
 block_shape = (128, 128)
+DEFAULT_TUNED_CONFIG = "a8w8_blockscale_bpreshuffle_tuned_gemm.csv"
+DEFAULT_UNTUNED_CONFIG = "a8w8_blockscale_bpreshuffle_untuned_gemm.csv"
 
 
 def libtype_list(string):
@@ -36,6 +38,44 @@ def libtype_list(string):
         if value not in ["all", "asm", "ck"]:
             raise argparse.ArgumentTypeError(f"Invalid libtype: {value}")
     return values
+
+
+def get_current_cu_num():
+    cu_num = os.getenv("CU_NUM")
+    if cu_num:
+        return int(cu_num)
+    if torch.cuda.is_available():
+        gpu = torch.cuda.current_device()
+        return torch.cuda.get_device_properties(gpu).multi_processor_count
+    return None
+
+
+def resolve_machine_specific_config(config_path: str, config_kind: str) -> str:
+    default_name = (
+        DEFAULT_TUNED_CONFIG if config_kind == "tuned" else DEFAULT_UNTUNED_CONFIG
+    )
+    if Path(config_path).name != default_name:
+        return config_path
+
+    cu_num = get_current_cu_num()
+    if cu_num is None:
+        return config_path
+
+    model_config_dir = PROJECT_ROOT / "aiter" / "configs" / "model_configs"
+    pattern = f"a8w8_blockscale_bpreshuffle_{config_kind}_gemm_*_cu{cu_num}.csv"
+    matches = sorted(model_config_dir.glob(pattern))
+    if len(matches) == 1:
+        resolved_path = str(matches[0])
+        print(
+            f"Auto-selected cu{cu_num} {config_kind} config for tuning: {resolved_path}"
+        )
+        return resolved_path
+    if len(matches) > 1:
+        print(
+            f"Found multiple cu{cu_num} {config_kind} configs matching {pattern}, "
+            f"keeping requested path: {config_path}"
+        )
+    return config_path
 
 
 class Gemma8W8BlockScaleBPreShuffleTuner(GemmCommonTuner):
@@ -367,4 +407,6 @@ if __name__ == "__main__":
     )
 
     args = tuner.parse_args()
+    args.tune_file = resolve_machine_specific_config(args.tune_file, "tuned")
+    args.untune_file = resolve_machine_specific_config(args.untune_file, "untuned")
     tuner.run(args, False)  # fast_mode = False

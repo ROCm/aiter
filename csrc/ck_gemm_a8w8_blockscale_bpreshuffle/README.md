@@ -9,10 +9,16 @@
     |-----|-----|-----|
     |128  |1536 |7168 |
 
+   If split model configs such as `aiter/configs/model_configs/a8w8_blockscale_bpreshuffle_untuned_gemm_*_cu80.csv`
+   or `..._cu256.csv` exist, the tuning script will automatically pick the file matching the current machine's `cu_num`.
+   Passing `-i` or `-o` explicitly still overrides the auto-selection.
+
 3. Start tuning:
 Run the following cmd to start tuning, please wait a few minutes as it will build gemm_a8w8_blockscale_bpreshuffle_tune via jit:
-`python3 csrc/ck_gemm_a8w8_blockscale_bpreshuffle/gemm_a8w8_blockscale_bpreshuffle_tune.py -i aiter/configs/a8w8_blockscale_bpreshuffle_untuned_gemm.csv -o aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv`
-You can find the results of the tuning in `aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv`, like this:
+`python3 csrc/ck_gemm_a8w8_blockscale_bpreshuffle/gemm_a8w8_blockscale_bpreshuffle_tune.py`
+You can find the results of the tuning in the selected tuned config file, such as
+`aiter/configs/model_configs/a8w8_blockscale_bpreshuffle_tuned_gemm_dsv3_cu80.csv`
+or `aiter/configs/model_configs/a8w8_blockscale_bpreshuffle_tuned_gemm_dsv3_cu256.csv`, like this:
     |**cu_num**|**M**|**N**|**K**|**kernelId**|**splitK**|**us**|**kernelName**|**tflops**|**bw**|**errRatio**|
     |----------|-----|-----|-----|------------|----------|------|--------------|----------|------|------------|
     |80        |128  |1536 |7168 |23          |0         |32.99 |xxxxxxxx      |125.4     |89.5  |0.01        |
