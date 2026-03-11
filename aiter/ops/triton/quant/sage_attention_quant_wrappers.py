@@ -629,7 +629,7 @@ def smooth_rotate_downcast_qk(
 
 
 @functools.lru_cache(maxsize=16)
-def create_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
+def create_hadamard_matrix(block_size, device="cuda", dtype=torch.bfloat16):
     """
     Returns a Hadamard matrix of size block_size x block_size. Remember to normalize with sqrt(block_size) for it to be orthogonal.
     """
