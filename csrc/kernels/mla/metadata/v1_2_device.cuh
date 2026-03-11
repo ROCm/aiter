@@ -304,16 +304,16 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                             {
                                 if(params.qk_batch_ratio != 1)
                                 {
-                                    batch_tail = num_qo_tiles -
-                                                 (work_info.qo_start / params.qk_batch_ratio) %
-                                                     ori_seqlen_qo -
-                                                 1;
+                                    const int32_t qo_offset =
+                                        (work_info.qo_start / params.qk_batch_ratio) % ori_seqlen_qo;
+                                    const int32_t tile_idx_in_seq = qo_offset / qo_tile_size;
+                                    batch_tail = num_qo_tiles - 1 - tile_idx_in_seq;
                                 }
                             }
                             work_info.kv_end = ck_tile::min(
                                 work_info.kv_start + (consuming_blks * params.kv_granularity),
                                 curr_kv_end - batch_tail);
-                            work_info.kv_end = ck_tile::min(work_info.kv_end, curr_kv_end);
+
                             work_info.kv_offset = curr_kv_end - work_info.kv_end;
                         }
                         else
