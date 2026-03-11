@@ -102,51 +102,51 @@ def bench_kernel(q, k, v, args, provider):
 
         def fn_unfused_quant():
             return sage_quant_mxfp4(
-                    q,
-                    k,
-                    v,
-                    FP8_TYPE,
-                    FP8_MAX,
-                    BLKQ=config["BLOCK_M"],
-                    BLKK=64,
-                    layout=args.layout,
-                    R=R,
-                    BLOCK_R=BLOCK_R,
-                    q_smoothing=args.qsmooth,
-                )
+                q,
+                k,
+                v,
+                FP8_TYPE,
+                FP8_MAX,
+                BLKQ=config["BLOCK_M"],
+                BLKK=64,
+                layout=args.layout,
+                R=R,
+                BLOCK_R=BLOCK_R,
+                q_smoothing=args.qsmooth,
+            )
 
         ms = triton.testing.do_bench_cudagraph(fn_unfused_quant)
         print("fn_unfused_quant (ms)", ms)
 
         def fn_fused_quant():
             return fused_sage_quant_mxfp4(
-                    q,
-                    k,
-                    v,
-                    BLOCK_M=config["BLOCK_M"],
-                    layout=args.layout,
-                    R=R,
-                    BLOCK_R=BLOCK_R,
-                    q_smoothing=args.qsmooth,
-                    hadamard_rotation=args.hadamard_rotate,
-                )
+                q,
+                k,
+                v,
+                BLOCK_M=config["BLOCK_M"],
+                layout=args.layout,
+                R=R,
+                BLOCK_R=BLOCK_R,
+                q_smoothing=args.qsmooth,
+                hadamard_rotation=args.hadamard_rotate,
+            )
 
         ms = triton.testing.do_bench_cudagraph(fn_fused_quant)
         print("fn_fused_quant (ms)", ms)
 
         def fn():
             return fav3_sage_mxfp4_func(
-                    q=q_quantized,
-                    k=k_quantized,
-                    v=v_quantized,
-                    q_descale=q_descale,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                    bias=delta_s,
-                    causal=args.causal,
-                    layout=args.layout,
-                    config=config,
-                )
+                q=q_quantized,
+                k=k_quantized,
+                v=v_quantized,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                bias=delta_s,
+                causal=args.causal,
+                layout=args.layout,
+                config=config,
+            )
 
     ms = triton.testing.do_bench(fn)
     print("kernel (ms)", ms)
