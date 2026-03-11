@@ -13,10 +13,37 @@
  * The host compares output with input to verify correctness.
  */
 
-#include <hip/hip_runtime.h>
-#include <cstdio>
+#ifdef __HIP_DEVICE_COMPILE__
+// ── Device pass ─────────────────────────────────────────────────────────────
 #include "opus/opus.hpp"
-#include "test_async_load.h"
+
+template<int BLOCK_SIZE>
+__global__ void async_load_kernel(const float* __restrict__ src,
+                                  float* __restrict__ dst,
+                                  int n)
+{
+    __shared__ float smem_buf[BLOCK_SIZE];
+
+    int tid = __builtin_amdgcn_workitem_id_x();
+    int gid = __builtin_amdgcn_workgroup_id_x() * BLOCK_SIZE + tid;
+
+    if (gid >= n) return;
+
+    auto g_src = opus::make_gmem(src, static_cast<unsigned int>(n * sizeof(float)));
+    g_src.async_load<1>(smem_buf + tid, gid);
+    opus::s_waitcnt_vmcnt(opus::number<0>{});
+    __builtin_amdgcn_s_barrier();
+
+    dst[gid] = smem_buf[tid];
+}
+
+template __global__ void async_load_kernel<256>(const float*, float*, int);
+
+#else
+// ── Host pass ───────────────────────────────────────────────────────────────
+// #include <hip/hip_runtime.h>   // replaced by hip_host_minimal.h for faster builds
+#include "hip_host_minimal.h"
+#include <cstdio>
 
 #define HIP_CALL(call) do { \
     hipError_t err = (call); \
@@ -26,36 +53,10 @@
     } \
 } while(0)
 
-// Each thread loads one float via async_load from global memory into LDS,
-// then reads it back from LDS and writes to the output buffer.
-// This pattern mirrors the production usage in quant_kernels.cu.
 template<int BLOCK_SIZE>
 __global__ void async_load_kernel(const float* __restrict__ src,
                                   float* __restrict__ dst,
-                                  int n)
-{
-    __shared__ float smem_buf[BLOCK_SIZE];
-
-    int tid = threadIdx.x;
-    int gid = blockIdx.x * BLOCK_SIZE + tid;
-
-    if (gid >= n) return;
-
-    // Create gmem accessor for src with an explicit size (bytes) for the block.
-    auto g_src = opus::make_gmem(src, static_cast<uint32_t>(n * sizeof(float)));
-
-    // Phase 1: async_load one float from global memory into LDS.
-    // Each thread in the wavefront has a unique LDS destination (smem_buf + tid)
-    // and a unique global offset (gid).
-    g_src.async_load<1>(smem_buf + tid, gid);
-
-    // Phase 2: Wait for all async loads in this wavefront to complete.
-    opus::s_waitcnt_vmcnt(opus::number<0>{});
-    __syncthreads();
-
-    // Phase 3: Read from LDS and write to output global memory.
-    dst[gid] = smem_buf[tid];
-}
+                                  int n) {}
 
 extern "C" void run_async_load(
     const void* d_src,
@@ -75,3 +76,4 @@ extern "C" void run_async_load(
     HIP_CALL(hipGetLastError());
     HIP_CALL(hipDeviceSynchronize());
 }
+#endif

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import List, Optional, Tuple
 
@@ -43,12 +43,19 @@ def reduce_scatter(
 
 
 @compile_ops("module_custom_all_reduce")
-def all_gather_reg(_fa: int, inp: torch.Tensor, out: torch.Tensor) -> None: ...
+def all_gather_reg(
+    _fa: int, inp: torch.Tensor, out: torch.Tensor, last_dim_size: int, dim: int
+) -> None: ...
 
 
 @compile_ops("module_custom_all_reduce")
 def all_gather_unreg(
-    _fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor, out: torch.Tensor
+    _fa: int,
+    inp: torch.Tensor,
+    reg_buffer: torch.Tensor,
+    out: torch.Tensor,
+    last_dim_size: int,
+    dim: int,
 ) -> None: ...
 
 

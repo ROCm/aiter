@@ -1,7 +1,7 @@
 #pragma once
 /*
  * Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
- * Copyright (C) 2024-2025, The vLLM team.
+ * Copyright (C) 2024-2026, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,12 +16,20 @@
  * limitations under the License.
  */
 #ifdef USE_ROCM
+#ifndef AITER_CK_FREE
 #include "ck_tile/core.hpp"
+#endif
 #include <hip/hip_runtime.h>
 #endif
 
 #ifndef USE_ROCM
 constexpr int WARP_SIZE = 32;
+#elif defined(AITER_CK_FREE)
+#if defined(__AMDGCN_WAVEFRONT_SIZE__)
+constexpr int WARP_SIZE = __AMDGCN_WAVEFRONT_SIZE__;
+#else
+constexpr int WARP_SIZE = 64;
+#endif
 #else
 constexpr int WARP_SIZE = ck_tile::get_warp_size();
 #endif

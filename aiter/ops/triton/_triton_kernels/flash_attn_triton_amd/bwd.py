@@ -2686,11 +2686,18 @@ def _bwd_dkdv_inner(
                 print(f"qT: {qT.shape}\n", qT)
                 print(f"k: {k.shape}\n", k)
                 print(f"qkT scaled: {qkT.shape}\n", qkT_scaled)
-        # TODO: remove the scaling of m later when we removed re-scaling in fwd
+
+        # Compute probabilities - handle invalid rows where m is -inf
+        # For rows where m is -inf, no keys were valid, so pT should be 0
+        # We shift qkT by m to avoid numerical issues
+        qkT_shifted = tl.where(
+            m[None, :] == float("-inf"), float("-inf"), qkT_scaled - m[None, :]
+        )
+
         if USE_EXP2:
-            pT = tl.math.exp2(qkT_scaled * RCP_LN2 - m[None, :] * RCP_LN2)
+            pT = tl.math.exp2(qkT_shifted * RCP_LN2)
         else:
-            pT = tl.math.exp(qkT_scaled - m[None, :])
+            pT = tl.math.exp(qkT_shifted)
 
         # Autoregressive masking.
         if MASK:
@@ -2865,10 +2872,16 @@ def _bwd_dq_inner(
 
         if DEBUG_TRITON_DETAIL:
             print(f"qk scaled: {qk.shape}\n", qk_scaled)  # noqa: E701
+
+        # Compute probabilities - handle invalid rows where m is -inf
+        # For rows where m is -inf, no keys were valid, so p should be 0
+        # We shift qk by m to avoid numerical issues
+        qk_shifted = tl.where(m == float("-inf"), float("-inf"), qk_scaled - m)
+
         if USE_EXP2:
-            p = tl.math.exp2(qk_scaled * RCP_LN2 - m * RCP_LN2)
+            p = tl.math.exp2(qk_shifted * RCP_LN2)
         else:
-            p = tl.math.exp(qk_scaled - m)
+            p = tl.math.exp(qk_shifted)
 
         # Autoregressive masking.
         if MASK:
