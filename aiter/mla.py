@@ -183,7 +183,7 @@ def mla_decode_fwd(
     forced_head_pad = False
     o_out = o
 
-    if force_decode and nhead == 8 and not persistent_mode:
+    if force_decode and nhead == 8:
         forced_head_pad = True
         padded_nhead = 16
         q_padded = torch.zeros(
