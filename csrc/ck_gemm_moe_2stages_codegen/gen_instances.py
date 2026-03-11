@@ -3,7 +3,11 @@
 import os
 import argparse
 import itertools
-from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list, get_target_archs
+from gemm_moe_ck2stages_common import (
+    get_gemm1_kernels_list,
+    get_gemm2_kernels_list,
+    get_target_archs,
+)
 
 STG_INSTANCE_IMPL = """// SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
@@ -872,9 +876,9 @@ class ck_moe_2stage_gemm_codegen:
             return "#ifndef __gfx942__\n", "\n#endif\n"
         if tag.endswith("_gfx950"):
             return "#ifdef __gfx950__\n", "\n#endif\n"
-        if (
-            self.a_dtype.upper() in ("F8", "I8")
-            and self.b_dtype.upper() in ("F8", "I8")
+        if self.a_dtype.upper() in ("F8", "I8") and self.b_dtype.upper() in (
+            "F8",
+            "I8",
         ):
             return "#ifndef __gfx950__\n", "\n#endif\n"
         return "", ""
