@@ -126,18 +126,33 @@ def gelu_fast_vec_wrapper(input: torch.Tensor) -> torch.Tensor:
     return out
 
 @benchmark()
-def test_gelu_fast(m, n, dtype):
+def test_gelu_fast(m, n, dtype, output_dtype=None):
     ret = {}
     input = torch.randn(m, 1, n, dtype=dtype, device="cuda")
+    out_dtype = output_dtype if output_dtype is not None else dtype
     ref = torch_gelu_ref(input)
+
+    if output_dtype is not None:
+        ref = ref.to(output_dtype)
+
     out, us_aiter = run_perftest(
         gelu_fast_vec_wrapper,
         input)
 
     # Check if the results are close
     err = checkAllclose(ref, out)
+
+    # Record input/output types for clarity
+    dtype_map = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16"}
+    ret = {}
+    ret["input_dtype"] = dtype_map.get(dtype, str(dtype))
+    ret["output_dtype"] = dtype_map.get(out_dtype, str(out_dtype))
+    ret["M"] = m
+    ret["N"] = n
     ret["us"] = us_aiter
     ret["TB/s"] = (input.nbytes + out.nbytes) / us_aiter / 1e6
+    ret["RD TB/s"] = (input.nbytes) / us_aiter / 1e6
+    ret["WR TB/s"] = (out.nbytes) / us_aiter / 1e6
     ret["err"] = err
     return ret
 
