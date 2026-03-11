@@ -1264,7 +1264,22 @@ namespace py = pybind11;
           py::arg("kernel_name"),                                              \
           py::arg("fc2_smooth_scale") = std::nullopt,                          \
           py::arg("activation")       = ActivationType::Silu);                       \
-    m.def("fmoe_int8_g1u0_a16", &fmoe_int8_g1u0_a16);                          \
+    m.def("fmoe_int8_g1u0_a16",                                                \
+          &fmoe_int8_g1u0_a16,                                                \
+          py::arg("out"),                                                      \
+          py::arg("input"),                                                    \
+          py::arg("gate"),                                                     \
+          py::arg("down"),                                                     \
+          py::arg("sorted_token_ids"),                                         \
+          py::arg("sorted_weights"),                                           \
+          py::arg("sorted_expert_ids"),                                        \
+          py::arg("num_valid_ids"),                                            \
+          py::arg("topk"),                                                     \
+          py::arg("fc1_scale"),                                                \
+          py::arg("fc2_scale"),                                                \
+          py::arg("fc1_smooth_scale"),                                         \
+          py::arg("fc2_smooth_scale"),                                         \
+          py::arg("activation") = ActivationType::Silu);                      \
     m.def("fmoe_g1u1_a16",                                                     \
           &fmoe_g1u1_a16,                                                      \
           py::arg("out"),                                                      \
