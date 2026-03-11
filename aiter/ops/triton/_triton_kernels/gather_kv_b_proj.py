@@ -1,8 +1,34 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import triton
 import triton.language as tl
+
+
+@triton.jit
+def _shuffled_weight_offset(offs_n, offs_k, KV_CDim: tl.constexpr):
+    """Compute linear offset into a weight matrix that has been preshuffled
+    via shuffle_weight(layout=(16,16)) for fp8.
+
+    shuffle_weight transforms [N, K] with tile (BN=16, BK=32, K_pack=16):
+      view(N//16, 16, K//32, 2, 16)  ->  permute(0, 1, 3, 4, 2, 5)  ->  view(N, K)
+    Permuted shape: [batch, n_blk, k_blk, k_half, n_local, k_local]
+
+    flat offset = n_blk * (KV_CDim // 32) * 512
+               + k_blk * 512 + k_half * 256 + n_local * 16 + k_local
+    """
+    n_blk = offs_n // 16
+    n_local = offs_n % 16
+    k_blk = offs_k // 32
+    k_half = (offs_k % 32) // 16
+    k_local = offs_k % 16
+    return (
+        n_blk[:, None] * ((KV_CDim // 32) * 512)
+        + k_blk[None, :] * 512
+        + k_half[None, :] * 256
+        + n_local[:, None] * 16
+        + k_local[None, :]
+    )
 
 
 @triton.jit
@@ -23,6 +49,7 @@ def _triton_gather_kv_b_proj(
     KV_CDim: tl.constexpr,
     KV_PeDim: tl.constexpr,
     ChunkK: tl.constexpr,
+    WEIGHT_PRESHUFFLE: tl.constexpr = False,
 ):
     stride_k_buffer: tl.constexpr = KBlockSize * (KV_CDim + KV_PeDim)
     stride_k_prefix: tl.constexpr = TpNumHeads * (QkNopeHeadDim + KV_PeDim)
@@ -58,12 +85,6 @@ def _triton_gather_kv_b_proj(
     else:
         k_scalar_scale = tl.load(k_scale)
 
-    k_nope_weight_base_offset = (
-        kv_proj_weight
-        + pid_head * 2 * QkNopeHeadDim * KV_CDim
-        + tl.arange(0, QkNopeHeadDim)[:, None] * KV_CDim
-        + tl.arange(0, ScaleKGranularity)[None, :]
-    )
     k_nope_scale_base_offset = (
         kv_proj_scale
         + pid_head
@@ -76,31 +97,36 @@ def _triton_gather_kv_b_proj(
         * (KV_CDim // ScaleKGranularity)
     )
 
-    k_nope_weight_0 = tl.load(k_nope_weight_base_offset + 0 * ScaleKGranularity).to(
-        k_type
-    )
-    k_nope_weight_1 = tl.load(k_nope_weight_base_offset + 1 * ScaleKGranularity).to(
-        k_type
-    )
-    k_nope_weight_2 = tl.load(k_nope_weight_base_offset + 2 * ScaleKGranularity).to(
-        k_type
-    )
-    k_nope_weight_3 = tl.load(k_nope_weight_base_offset + 3 * ScaleKGranularity).to(
-        k_type
-    )
+    offs_n = tl.arange(0, QkNopeHeadDim)
+    offs_k = tl.arange(0, ScaleKGranularity)
+    k_head_base = kv_proj_weight + pid_head * 2 * QkNopeHeadDim * KV_CDim
+    v_head_base = k_head_base + QkNopeHeadDim * KV_CDim
 
-    v_nope_weight_0 = tl.load(
-        k_nope_weight_base_offset + QkNopeHeadDim * KV_CDim + 0 * ScaleKGranularity
-    ).to(k_type)
-    v_nope_weight_1 = tl.load(
-        k_nope_weight_base_offset + QkNopeHeadDim * KV_CDim + 1 * ScaleKGranularity
-    ).to(k_type)
-    v_nope_weight_2 = tl.load(
-        k_nope_weight_base_offset + QkNopeHeadDim * KV_CDim + 2 * ScaleKGranularity
-    ).to(k_type)
-    v_nope_weight_3 = tl.load(
-        k_nope_weight_base_offset + QkNopeHeadDim * KV_CDim + 3 * ScaleKGranularity
-    ).to(k_type)
+    if WEIGHT_PRESHUFFLE:
+        k_nope_weight_0 = tl.load(k_head_base + _shuffled_weight_offset(offs_n, offs_k + 0 * ScaleKGranularity, KV_CDim)).to(k_type)
+        k_nope_weight_1 = tl.load(k_head_base + _shuffled_weight_offset(offs_n, offs_k + 1 * ScaleKGranularity, KV_CDim)).to(k_type)
+        k_nope_weight_2 = tl.load(k_head_base + _shuffled_weight_offset(offs_n, offs_k + 2 * ScaleKGranularity, KV_CDim)).to(k_type)
+        k_nope_weight_3 = tl.load(k_head_base + _shuffled_weight_offset(offs_n, offs_k + 3 * ScaleKGranularity, KV_CDim)).to(k_type)
+
+        v_nope_weight_0 = tl.load(v_head_base + _shuffled_weight_offset(offs_n, offs_k + 0 * ScaleKGranularity, KV_CDim)).to(k_type)
+        v_nope_weight_1 = tl.load(v_head_base + _shuffled_weight_offset(offs_n, offs_k + 1 * ScaleKGranularity, KV_CDim)).to(k_type)
+        v_nope_weight_2 = tl.load(v_head_base + _shuffled_weight_offset(offs_n, offs_k + 2 * ScaleKGranularity, KV_CDim)).to(k_type)
+        v_nope_weight_3 = tl.load(v_head_base + _shuffled_weight_offset(offs_n, offs_k + 3 * ScaleKGranularity, KV_CDim)).to(k_type)
+    else:
+        k_nope_weight_base_offset = (
+            k_head_base
+            + offs_n[:, None] * KV_CDim
+            + offs_k[None, :]
+        )
+        k_nope_weight_0 = tl.load(k_nope_weight_base_offset + 0 * ScaleKGranularity).to(k_type)
+        k_nope_weight_1 = tl.load(k_nope_weight_base_offset + 1 * ScaleKGranularity).to(k_type)
+        k_nope_weight_2 = tl.load(k_nope_weight_base_offset + 2 * ScaleKGranularity).to(k_type)
+        k_nope_weight_3 = tl.load(k_nope_weight_base_offset + 3 * ScaleKGranularity).to(k_type)
+
+        v_nope_weight_0 = tl.load(k_nope_weight_base_offset + QkNopeHeadDim * KV_CDim + 0 * ScaleKGranularity).to(k_type)
+        v_nope_weight_1 = tl.load(k_nope_weight_base_offset + QkNopeHeadDim * KV_CDim + 1 * ScaleKGranularity).to(k_type)
+        v_nope_weight_2 = tl.load(k_nope_weight_base_offset + QkNopeHeadDim * KV_CDim + 2 * ScaleKGranularity).to(k_type)
+        v_nope_weight_3 = tl.load(k_nope_weight_base_offset + QkNopeHeadDim * KV_CDim + 3 * ScaleKGranularity).to(k_type)
 
     k_nope_scale_0 = tl.load(k_nope_scale_base_offset + 0)
     k_nope_scale_1 = tl.load(k_nope_scale_base_offset + 1)
