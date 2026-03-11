@@ -233,11 +233,20 @@ std::string get_heuristic_kernel(int m_num, int N, int blockk_size, CFG* cfgs, s
         }
         else if(local_round == round)
         {
-            if(empty_cu > (local_round * num_cu - tg_num))
+            uint32_t cand_empty = local_round * num_cu - tg_num;
+            if(empty_cu > cand_empty)
             {
                 round    = local_round;
                 selected = el.first;
-                empty_cu = local_round * num_cu - tg_num;
+                empty_cu = cand_empty;
+            }
+            else if(empty_cu == cand_empty)
+            {
+                // Tie-break: prefer non-buffer kernel when both have same tile
+                bool cur_is_buffer  = (selected.find("_buffer") != std::string::npos);
+                bool cand_is_buffer = (el.first.find("_buffer") != std::string::npos);
+                if(!cand_is_buffer && cur_is_buffer)
+                    selected = el.first;
             }
         }
     }
