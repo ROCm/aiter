@@ -785,7 +785,6 @@ def get_2stage_cfgs(
         logger.info("\033[0m")
 
     def use_cfg():
-        return False
         problem_type = (activation, dtype, q_dtype_a, q_dtype_w, q_type)
         bypass_type = (
             ActivationType.Silu,
