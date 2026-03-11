@@ -5,7 +5,9 @@
 // Include these 2 headers instead of torch/extension.h since we don't need all of the torch
 // headers.
 #include "aiter_hip_common.h"
+#if !ONLY_FAV3
 #include "fmha_bwd.hpp"
+#endif
 #include <variant>
 
 namespace aiter {
