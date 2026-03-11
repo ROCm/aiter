@@ -263,7 +263,7 @@ def get_asm_int8_config(
             return config
         elif inter_dim % 128 == 0:
             config.run_2stage = True
-            config.block_m = 48
+            config.block_m = 32
             config.ksplit = 0
             config.kernelName1 = ""
             config.kernelName2 = ""
