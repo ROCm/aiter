@@ -606,17 +606,10 @@ def nextPow2(n):
 
 def get_padded_M(M):
     padded_m = M
-    if M >= 1 and M <= 16:
-        # decoding policy may be changed in the future.
+    if M < 32768:
         padded_m = nextPow2(padded_m)
-    elif M < 1024:
-        padded_m = nextPow2(padded_m)
-    elif M < 2048:
-        padded_m = 1024
-    elif M < 16384:
-        padded_m = 2048
     else:
-        padded_m = 16384
+        padded_m = 32768
     return padded_m
 
 
