@@ -29,7 +29,7 @@ By gradlib, we can confirm the parameter of GEMMs with best performance in the s
 
     `cu_num` means the number of compute units, and it is used to distinguish between graphics.
     `bpreshuffle` means whether weight will be shuffled
-    `dtype` means the input data type
+    `dtype` means the input data type, hipblaslt support fp8/bf16/fp16 tuning, asm/triton support bf16/fp16 only
     `libtype` means the kernel library type: hipblaslt or rocblas or asm
     `splitK` only be valid in libtype==asm
     `tflops`  TFLOPS 

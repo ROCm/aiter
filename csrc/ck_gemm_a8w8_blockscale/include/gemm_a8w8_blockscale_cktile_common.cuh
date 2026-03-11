@@ -135,7 +135,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
     using TilePartitioner = ck_tile::GemmTile1DPartitioner<GemmShape>;
 
     using GemmTraits = ck_tile::TileGemmQuantTraits<
-        false, // PadM
+        true, // PadM
         PadN,
         PadK,
         false,       // PreshuffleQuant for A, not supported yet
@@ -192,7 +192,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
 
         using GemmPipeline = std::conditional_t<
             eight_warps,
-            ck_tile::ABQuantGemmPipelineAgBgCrAsync<PipelineProblem>,
+            ck_tile::ABQuantGemmPipelineAgBgCrEightWarps<PipelineProblem>,
             std::conditional_t<UseDoubleSmemBuffer && PreshuffleB,
                                ck_tile::WPABQuantBPipelineAgBgCrV2<PipelineProblem>,
                                ck_tile::ABQuantGemmPipelineAgBgCrCompV3<PipelineProblem>>>;
