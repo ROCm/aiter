@@ -63,7 +63,8 @@ def bench_kernel(q, k, v, args, provider):
     R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (BLOCK_R**0.5)
 
     if args.include_quant_overhead:
-        fn = lambda: fav3_sage_mxfp4_wrapper(
+        def fn():
+            return fav3_sage_mxfp4_wrapper(
             q,
             k,
             v,
@@ -99,41 +100,6 @@ def bench_kernel(q, k, v, args, provider):
             BLOCK_R=BLOCK_R,
             q_smoothing=args.qsmooth,
         )
-
-        def fn_unfused_quant():
-            return sage_quant_mxfp4(
-                q,
-                k,
-                v,
-                FP8_TYPE,
-                FP8_MAX,
-                BLKQ=config["BLOCK_M"],
-                BLKK=64,
-                layout=args.layout,
-                R=R,
-                BLOCK_R=BLOCK_R,
-                q_smoothing=args.qsmooth,
-            )
-
-        ms = triton.testing.do_bench_cudagraph(fn_unfused_quant)
-        print("fn_unfused_quant (ms)", ms)
-
-        def fn_fused_quant():
-            return fused_sage_quant_mxfp4(
-                q,
-                k,
-                v,
-                BLOCK_M=config["BLOCK_M"],
-                layout=args.layout,
-                R=R,
-                BLOCK_R=BLOCK_R,
-                q_smoothing=args.qsmooth,
-                hadamard_rotation=args.hadamard_rotate,
-            )
-
-        ms = triton.testing.do_bench_cudagraph(fn_fused_quant)
-        print("fn_fused_quant (ms)", ms)
-
         def fn():
             return fav3_sage_mxfp4_func(
                 q=q_quantized,
@@ -149,7 +115,7 @@ def bench_kernel(q, k, v, args, provider):
             )
 
     ms = triton.testing.do_bench(fn)
-    print("kernel (ms)", ms)
+    # print("kernel (ms)", ms)
 
     # Metrics calculation (MXFP4 treats elements as 0.5 bytes in memory traffic for Q/K)
     total_flops = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
