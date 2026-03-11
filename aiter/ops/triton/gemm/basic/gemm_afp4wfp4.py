@@ -10,6 +10,7 @@ from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_str
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
     _gemm_afp4wfp4_kernel,
     _gemm_afp4wfp4_preshuffle_kernel,
+    _gemm_afp4wfp4_kernel_preshuffle_scales,
     _gemm_afp4wfp4_reduce_kernel,
     _get_config,
 )
@@ -348,7 +349,7 @@ def gemm_afp4wfp4_preshuffled_scales(
         ),
     )
 
-    _gemm_afp4wfp4_kernel_preshuffled_scales[grid](
+    _gemm_afp4wfp4_kernel_preshuffle_scales[grid](
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,

@@ -9,10 +9,40 @@
  * Demonstrates OPUS make_gmem load / store in a grid-stride loop.
  */
 
-#include <hip/hip_runtime.h>
-#include <cstdio>
+#ifdef __HIP_DEVICE_COMPILE__
+// ── Device pass: opus.hpp + full kernel body, no hip_runtime.h ──────────────
 #include "opus/opus.hpp"
-#include "test_vector_add.h"
+
+template<int BLOCK_SIZE, int VECTOR_SIZE>
+__global__ void vector_add_kernel(const float* a, const float* b, float* result, int n)
+{
+    auto g_a = opus::make_gmem(a);
+    auto g_b = opus::make_gmem(b);
+    auto g_r = opus::make_gmem(result);
+
+    int idx = __builtin_amdgcn_workgroup_id_x() * BLOCK_SIZE + __builtin_amdgcn_workitem_id_x();
+    int stride = __builtin_amdgcn_grid_size_x();
+
+    for (int i = idx * VECTOR_SIZE; i < n; i += stride * VECTOR_SIZE) {
+        auto va = g_a.load<VECTOR_SIZE>(i);
+        auto vb = g_b.load<VECTOR_SIZE>(i);
+
+        decltype(va) vr;
+        for (int j = 0; j < VECTOR_SIZE; j++) {
+            vr[j] = va[j] + vb[j];
+        }
+
+        g_r.store<VECTOR_SIZE>(vr, i);
+    }
+}
+
+template __global__ void vector_add_kernel<256, 4>(const float*, const float*, float*, int);
+
+#else
+// ── Host pass: hip_runtime.h for launch API, empty kernel stubs ─────────────
+// #include <hip/hip_runtime.h>   // replaced by hip_host_minimal.h for faster builds
+#include "hip_host_minimal.h"
+#include <cstdio>
 
 #define HIP_CALL(call) do { \
     hipError_t err = (call); \
@@ -23,30 +53,7 @@
 } while(0)
 
 template<int BLOCK_SIZE, int VECTOR_SIZE>
-__global__ void vector_add_kernel(const float* a, const float* b, float* result, int n)
-{
-    auto g_a = opus::make_gmem(a);
-    auto g_b = opus::make_gmem(b);
-    auto g_r = opus::make_gmem(result);
-
-    // Each thread handles VECTOR_SIZE elements per iteration.
-    // Offsets passed to load/store are in units of the element type (float).
-    int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
-    int stride = gridDim.x * BLOCK_SIZE;
-
-    for (int i = idx * VECTOR_SIZE; i < n; i += stride * VECTOR_SIZE) {
-        auto va = g_a.load<VECTOR_SIZE>(i);
-        auto vb = g_b.load<VECTOR_SIZE>(i);
-
-        // Element-wise addition across the vector
-        decltype(va) vr;
-        for (int j = 0; j < VECTOR_SIZE; j++) {
-            vr[j] = va[j] + vb[j];
-        }
-
-        g_r.store<VECTOR_SIZE>(vr, i);
-    }
-}
+__global__ void vector_add_kernel(const float* a, const float* b, float* result, int n) {}
 
 extern "C" void run_vector_add(
     const void* d_a,
@@ -60,7 +67,6 @@ extern "C" void run_vector_add(
 
     constexpr int BLOCK_SIZE = 256;
     constexpr int VECTOR_SIZE = 4;
-    // n must be divisible by BLOCK_SIZE * VECTOR_SIZE for this simple kernel
     int blocks = n / (BLOCK_SIZE * VECTOR_SIZE);
 
     hipLaunchKernelGGL(
@@ -70,3 +76,4 @@ extern "C" void run_vector_add(
     HIP_CALL(hipGetLastError());
     HIP_CALL(hipDeviceSynchronize());
 }
+#endif

@@ -3,12 +3,14 @@
 
 import torch
 import aiter
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import checkAllclose, benchmark, run_perftest
 from aiter import dtypes
 import random
 import itertools
 import argparse
 import pandas as pd
+import math
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -197,6 +199,7 @@ def ref_masked_attention(
     is_fp8_kvc=False,
     q_scale=None,
     kv_scale=None,
+    causal_diagonal=None,
 ):
     if is_fp8_q and q_scale is not None:
         scale *= q_scale
@@ -207,8 +210,9 @@ def ref_masked_attention(
     if is_causal:
         s_q = query.shape[0]
         s_k = key.shape[0]
+        diagonal = causal_diagonal if causal_diagonal is not None else s_k - s_q
         attn_bias = torch.zeros(s_q, s_k, dtype=query.dtype)
-        temp_mask = torch.ones(s_q, s_k, dtype=torch.bool).tril(diagonal=s_k - s_q)
+        temp_mask = torch.ones(s_q, s_k, dtype=torch.bool).tril(diagonal=diagonal)
         attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
         attn_bias.to(query.dtype)
         attn_weights += attn_bias
@@ -341,6 +345,441 @@ def torch_mla_extend(
     return o, lse
 
 
+def torch_mla_extend_split_kv(
+    q,  # [total_q, nheads, headdim_q]
+    kvc_cache,  # [num_page, page_size, nhead_kv, qk_head_dim]
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    kv_last_page_lens,
+    sm_scale,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    dtype,
+    work_meta_data,
+    work_info_set,
+    work_indptr,
+    max_seqlen_q,
+    is_causal=True,
+    q_scale=None,
+    kv_scale=None,
+):
+
+    num_page, page_size, nhead_kv, _ = kvc_cache.shape
+    total_q, nheads, _ = q.shape
+    dev = kvc_cache.device
+    is_fp8_q = q.dtype == dtypes.fp8
+    is_fp8_kvc = kvc_cache.dtype == dtypes.fp8
+
+    if is_fp8_q:
+        q = q.to(torch.float)
+
+    if is_fp8_kvc:
+        kvc_cache = kvc_cache.to(torch.float)
+
+    kvc = torch.index_select(kvc_cache, 0, kv_indices)
+    kvs = torch.tensor_split(kvc, kv_indptr.tolist()[1:])
+    num_works = work_indptr[-1].item()
+    partial_os = []
+    partial_lses = []
+    final_out = torch.empty(total_q, nheads, kv_lora_rank, dtype=dtype, device=dev)
+    final_lse = torch.empty(total_q, nheads, dtype=torch.float32, device=dev)
+
+    io_transformed = False
+    q_ratio = 1
+    if (
+        nheads == 16
+        or (nheads == 128 and is_fp8_q and is_fp8_kvc)
+        or (
+            get_gfx() == "gfx950"
+            and nheads == 32
+            and is_fp8_q
+            and is_fp8_kvc
+            and max_seqlen_q == 4
+        )
+    ):
+        # Natively support cases
+        pass
+    elif nheads in range(32, 128 + 1, 16):
+        # we use nhead=16 to simulate such cases by customized metadata
+        # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
+        q_ratio = nheads // 16
+        total_s = total_q * q_ratio
+        nheads = 16
+        q = q.view(total_s, nheads, -1)
+        final_out = final_out.view(total_s, nheads, -1)
+        final_lse = final_lse.view(total_s, nheads)
+        io_transformed = True
+
+    for work_idx in range(num_works):
+        row = work_info_set[work_idx]
+        batch_idx = row[0].item() // q_ratio
+        partial_qo_loc = row[1].item()
+        qo_start = row[2].item()
+        qo_end = row[3].item()
+        kv_start = row[4].item()
+        # kv_end = row[5].item()
+        kv_offset = row[6].item()
+        cur_num_page = kvs[batch_idx].shape[0]
+        cur_real_kv_seq_len = (
+            cur_num_page - 1
+        ) * page_size + kv_last_page_lens.tolist()[batch_idx]
+        real_sum_kv_seq_len = (
+            kv_indptr.tolist()[batch_idx] * page_size + cur_real_kv_seq_len
+        )
+
+        slice_k = kvc.flatten(0, 1)[
+            kv_start * page_size : real_sum_kv_seq_len - kv_offset
+        ]
+        slice_q = q[qo_start:qo_end]
+
+        v, _ = torch.split(slice_k, [kv_lora_rank, qk_rope_head_dim], dim=-1)
+
+        if partial_qo_loc != -1:
+            out_dtype = torch.float32
+        else:
+            out_dtype = dtype
+
+        # Compute correct causal diagonal for this split chunk
+        # In the original full-batch attention, q[i] attends to k[j] if j <= i + (total_kv - total_q)
+        # For a split chunk, we need to account for the position offsets of Q and KV within the batch
+        causal_diagonal = None
+        if is_causal:
+            q_local_start = qo_start - qo_indptr[batch_idx].item()
+            kv_local_start = (kv_start - kv_indptr[batch_idx].item()) * page_size
+            total_q_len = qo_indptr[batch_idx + 1].item() - qo_indptr[batch_idx].item()
+            causal_diagonal = (
+                q_local_start - kv_local_start + cur_real_kv_seq_len - total_q_len
+            )
+
+        o, lse = ref_masked_attention(
+            slice_q,
+            slice_k,
+            v,
+            sm_scale,
+            out_dtype,
+            is_causal=is_causal,
+            is_fp8_q=is_fp8_q,
+            is_fp8_kvc=is_fp8_kvc,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+            causal_diagonal=causal_diagonal,
+        )
+
+        if partial_qo_loc == -1:
+            final_out[qo_start:qo_end, :, :] = o
+            final_lse[qo_start:qo_end, :] = lse.transpose(0, 1)  # [seq_q, num_heads]
+        else:
+            partial_os.append(o)
+            partial_lses.append(lse)
+
+    partial_o = (
+        torch.concat(partial_os)
+        if partial_os
+        else torch.empty(0, nheads, qk_rope_head_dim, dtype=torch.float32, device=dev)
+    )
+    partial_lse = (
+        torch.concat(partial_lses, dim=1).transpose(0, 1)
+        if partial_lses
+        else torch.empty(0, nheads, dtype=torch.float32, device=dev)
+    )
+    partial_o = torch.where(
+        torch.isnan(partial_o), torch.zeros_like(partial_o), partial_o
+    )
+
+    partial_lse = torch.where(
+        torch.isnan(partial_lse),
+        torch.full_like(partial_lse, float("-inf")),
+        partial_lse,
+    )
+
+    return partial_o, partial_lse, final_out, final_lse, io_transformed
+
+
+def torch_mla_reduce_v1(
+    partial_output: torch.Tensor,  # [max(reduce_partial_map)+s, h, dv]
+    partial_lse: torch.Tensor,  # [max(reduce_partial_map)+s, h]
+    reduce_indptr: torch.Tensor,  # [#work + 1]
+    reduce_final_map: torch.Tensor,  # [#work, 2] or None
+    reduce_partial_map: torch.Tensor,  # [reduce_indptr[-1]]
+    max_seqlen_q: int,
+    final_output: torch.Tensor,  # [bs, h, dv]
+    final_lse: torch.Tensor,  # [bs, h] or None
+) -> None:
+    device = partial_output.device
+    dtype = partial_output.dtype
+
+    # Check input types
+    assert partial_output.dtype == torch.float32, "partial_output must be float32"
+    assert partial_lse.dtype == torch.float32, "partial_lse must be float32"
+
+    num_reduce_tile = reduce_indptr.shape[0] - 1
+    num_heads = partial_output.shape[1]
+    head_dim = final_output.shape[2]
+
+    if num_reduce_tile == 0:
+        return
+
+    # Process each reduce tile
+    for tile_idx in range(num_reduce_tile):
+        reduce_tile_start = reduce_indptr[tile_idx].item()
+        reduce_tile_end = reduce_indptr[tile_idx + 1].item()
+
+        if reduce_tile_start == reduce_tile_end:
+            continue
+
+        num_splits = reduce_tile_end - reduce_tile_start
+
+        # Get reduce partial map for this tile
+        tile_reduce_partial_map = reduce_partial_map[reduce_tile_start:reduce_tile_end]
+
+        # Determine final output location
+        if reduce_final_map is not None:
+            # Use provided final map
+            q_start = reduce_final_map[tile_idx, 0].item()
+            q_end = reduce_final_map[tile_idx, 1].item()
+        else:
+            # Compute from reduce_partial_map
+            if num_splits >= 2:
+                reduce_partial_map_0 = tile_reduce_partial_map[0].item()
+                reduce_partial_map_1 = tile_reduce_partial_map[1].item()
+                qo_len = reduce_partial_map_1 - reduce_partial_map_0
+                q_start = tile_idx * qo_len
+                q_end = (tile_idx + 1) * qo_len
+            else:
+                # Fallback: use max_seqlen_q
+                q_start = tile_idx * max_seqlen_q
+                q_end = (tile_idx + 1) * max_seqlen_q
+
+        # Process each sequence position and head
+        for seq_idx in range(q_start, q_end):
+            for head_idx in range(num_heads):
+                local_seq_idx = seq_idx - q_start
+                partial_lses = []
+                partial_outputs = []
+
+                for split_idx in range(num_splits):
+                    partial_qo_loc = tile_reduce_partial_map[split_idx].item()
+
+                    partial_buffer_idx = partial_qo_loc + local_seq_idx
+
+                    # Get LSE value
+                    if (
+                        partial_buffer_idx < partial_lse.shape[0]
+                        and head_idx < partial_lse.shape[1]
+                    ):
+                        lse_val = partial_lse[partial_buffer_idx, head_idx].item()
+                        # Handle NaN
+                        if math.isnan(lse_val):
+                            lse_val = float("-inf")
+                    else:
+                        lse_val = float("-inf")
+
+                    # Get output values
+                    if (
+                        partial_buffer_idx < partial_output.shape[0]
+                        and head_idx < partial_output.shape[1]
+                    ):
+                        out_vals = partial_output[
+                            partial_buffer_idx, head_idx, :
+                        ].clone()
+                        # Handle NaN
+                        out_vals = torch.where(
+                            torch.isnan(out_vals), torch.zeros_like(out_vals), out_vals
+                        )
+                    else:
+                        out_vals = torch.zeros(head_dim, dtype=dtype, device=device)
+
+                    partial_lses.append(lse_val)
+                    partial_outputs.append(out_vals)
+
+                if len(partial_lses) == 0:
+                    continue
+
+                # Numerically stable online reduction (matching C++ implementation)
+                # Start with first split
+                if len(partial_lses) == 0:
+                    continue
+
+                # Initialize with first split
+                max_lse = partial_lses[0]
+                reg_out = partial_outputs[0].clone()  # [head_dim]
+                sum_e_lse = 1.0
+
+                # Online update for remaining splits
+                for split_idx in range(1, num_splits):
+                    lse = partial_lses[split_idx]
+                    oaccu = partial_outputs[split_idx]  # [head_dim]
+
+                    # Update max LSE
+                    new_max_lse = max(max_lse, lse)
+
+                    # Compute scales
+                    old_scale = math.exp(max_lse - new_max_lse)
+                    new_scale = math.exp(lse - new_max_lse)
+
+                    # Update output: old_scale * reg_out + new_scale * oaccu
+                    reg_out = old_scale * reg_out + new_scale * oaccu
+
+                    # Update sum
+                    max_lse = new_max_lse
+                    sum_e_lse = sum_e_lse * old_scale + new_scale
+
+                # Normalize by sum_e_lse
+                if sum_e_lse > 0 and not math.isnan(sum_e_lse):
+                    reg_out = reg_out / sum_e_lse
+                else:
+                    # Handle edge case
+                    reg_out = torch.zeros_like(reg_out)
+
+                # Write to final output
+                final_output[seq_idx, head_idx, :] = reg_out.to(final_output.dtype)
+
+                # Compute and write final LSE if needed
+                if final_lse is not None:
+                    if sum_e_lse > 0 and not math.isnan(sum_e_lse):
+                        final_lse_val = max_lse + math.log(sum_e_lse)
+                    else:
+                        final_lse_val = float("inf")
+                    final_lse[seq_idx, head_idx] = final_lse_val
+
+
+def torch_mla_split_kv_and_reduce(
+    q,
+    kv_cache,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    kv_last_page_lens,
+    sm_scale,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    dtype,
+    work_meta_data,
+    work_info_set,
+    work_indptr,
+    reduce_indptr,
+    reduce_final_map,
+    reduce_partial_map,
+    max_seqlen_q,
+    is_causal=True,
+    q_scale=None,
+    kv_scale=None,
+):
+    total_q, nhead, _ = q.shape
+    partial_out, partial_lse, split_out, split_lse, io_transformed = (
+        torch_mla_extend_split_kv(
+            q,
+            kv_cache,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            sm_scale,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            dtype=dtype,
+            work_meta_data=work_meta_data,
+            work_info_set=work_info_set,
+            work_indptr=work_indptr,
+            max_seqlen_q=max_seqlen_q,
+            is_causal=is_causal,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+        )
+    )
+
+    torch_mla_reduce_v1(
+        partial_out,
+        partial_lse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        max_seqlen_q,
+        split_out,
+        split_lse,
+    )
+
+    if io_transformed:
+        # import pdb; pdb.set_trace()
+        # partial_out = partial_out.reshape(-1, nhead, kv_lora_rank)
+        # partial_lse = partial_lse.reshape(-1, nhead)
+        split_out = split_out.reshape(total_q, nhead, kv_lora_rank)
+        split_lse = split_lse.reshape(total_q, nhead)
+
+    return partial_out, partial_lse, split_out, split_lse
+
+
+def torch_mla_extend_3buffer_split_kv_and_reduce(
+    q,  # [total_q, nheads, headdim_q]
+    kvc_cache,  # [num_page, page_size*(nhead_kv*(kv_lora_rank+scale_dim+qk_rope_head_dim))]
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    kv_last_page_lens,
+    page_size,
+    nhead_kv,
+    sm_scale,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    dtype,
+    work_meta_data,
+    work_info_set,
+    work_indptr,
+    reduce_indptr,
+    reduce_final_map,
+    reduce_partial_map,
+    max_seqlen_q,
+    is_causal=True,
+    q_scale=None,
+    kv_scale=None,
+    scale_dim=4,
+):
+
+    num_page = kvc_cache.shape[0]
+    kv_nope_buffer_fp8, kv_nope_scale_factors_fp32, kv_rope_buffer_bf16 = (
+        split_3buffer_kv_cache(
+            kvc_cache, page_size, nhead_kv, kv_lora_rank, qk_rope_head_dim, scale_dim
+        )
+    )
+
+    kv_nope_buffer_fp32 = kv_nope_buffer_fp8.to(torch.float32).reshape(
+        num_page, page_size, nhead_kv, scale_dim, -1
+    ) * kv_nope_scale_factors_fp32.reshape(num_page, page_size, nhead_kv, scale_dim, 1)
+    kvc_cache_bf16 = torch.cat(
+        [
+            kv_nope_buffer_fp32.reshape(num_page, page_size, nhead_kv, kv_lora_rank).to(
+                torch.bfloat16
+            ),
+            kv_rope_buffer_bf16,
+        ],
+        dim=-1,
+    )
+
+    return torch_mla_split_kv_and_reduce(
+        q,
+        kvc_cache_bf16,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+        sm_scale,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        dtype,
+        work_meta_data,
+        work_info_set,
+        work_indptr,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        max_seqlen_q,
+        is_causal,
+        q_scale,
+        kv_scale,
+    )
+
+
 @benchmark()
 def test_mla(
     ctx_lens,
@@ -395,26 +834,6 @@ def test_mla(
         else:
             kv_last_page_lens.fill_(ctx_lens % page_size)
 
-    # Temporarily work around for fp8/fp8 with gqa_ratio=32 kernel doesn't support bitmask
-    if (
-        nhead == 32
-        and decode_qlen == 4
-        and dtype == dtypes.fp8
-        and kvtype == dtypes.fp8
-    ):
-        remainder = seq_lens_kv % 64
-        need_pad = remainder != 0
-        if need_pad.any():
-            pad = torch.where(need_pad, 64 - remainder, torch.zeros_like(remainder))
-            seq_lens_kv += pad
-
-            kv_block_nums = (seq_lens_kv + page_size - 1) // page_size
-            kv_last_page_lens = torch.where(
-                (seq_lens_kv % page_size) == 0,
-                torch.full_like(kv_last_page_lens, page_size),
-                seq_lens_kv % page_size,
-            )
-
     kv_indptr[1 : batch_size + 1] = torch.cumsum(kv_block_nums, dim=0)
     num_page = kv_indptr[-1].item()
     kv_indices = torch.randperm(num_page, dtype=torch.int)
@@ -464,7 +883,6 @@ def test_mla(
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     total_q = qo_indptr[-1].item()
     q = torch.randn((total_q, nhead, qk_head_dim), dtype=torch.bfloat16)
-
     # troch implementation
     out_ref, lse_ref = torch_mla_extend(
         q,
@@ -553,6 +971,56 @@ def test_mla(
         dtype_kv=kvtype,
     )
 
+    # """ test code for decode_update_mla_metadata_v1 """
+    # torch.set_printoptions(linewidth=200)
+    # print(f"{kv_indptr=}")
+    # print(f"{work_indptr=}")
+    # print(f"{work_info_set[:32]=}")
+    # print(f"{reduce_indptr=}")
+    # print(f"{reduce_final_map=}")
+    # print(f"{reduce_partial_map=}")
+
+    # print("*************** decode_update_mla_metadata_v1 ********************")
+    # if decode_qlen > 1:
+    #     num_reject_tokens = torch.randint(0, 4, (batch_size,), dtype=torch.int32)
+    #     kv_len_delta_csum = torch.cumsum(num_reject_tokens - 1, dim=0).to(torch.int32)
+    #     kv_indptr[1:] = kv_indptr[1:] - kv_len_delta_csum
+    # else:
+    #     kv_indptr = kv_indptr + torch.arange(batch_size + 1, dtype=torch.int32)
+    #     num_reject_tokens = None
+    # num_page = kv_indptr[-1].item()
+    # kv_indices = torch.randperm(num_page, dtype=torch.int)
+    # from aiter.ops.attention import decode_update_mla_metadata_v1
+
+    # decode_update_mla_metadata_v1(
+    #     qo_indptr,
+    #     kv_indptr,
+    #     kv_last_page_lens,
+    #     nhead // nhead_kv,
+    #     nhead_kv,
+    #     False,
+    #     work_meta_data,
+    #     work_info_set,
+    #     work_indptr,
+    #     reduce_indptr,
+    #     reduce_final_map,
+    #     reduce_partial_map,
+    #     page_size=page_size,
+    #     kv_granularity=max(page_size, 16),
+    #     max_seqlen_qo=1,
+    #     dtype_q=dtype,
+    #     dtype_kv=kvtype,
+    #     num_reject_tokens=num_reject_tokens,
+    # )
+    # print(f"{num_reject_tokens=}")
+    # print(f"{kv_indptr=}")
+    # print(f"{work_info_set[:32]=}")
+    # print(f"{work_indptr=}")
+    # print(f"{reduce_indptr=}")
+    # print(f"{reduce_final_map=}")
+    # print(f"{reduce_partial_map=}")
+    # return
+
     def test_absorb_decode_bf16_fp8():
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
         kv_buffer_fp8 = kv_buffer.to(kvtype)
@@ -608,6 +1076,44 @@ def test_mla(
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
+
+        if not non_persistent_mode:
+            partial_out_ref, partial_lse_ref, split_out_ref, split_lse_ref = (
+                torch_mla_split_kv_and_reduce(
+                    q,
+                    kv_buffer_fp8,
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    kv_last_page_lens,
+                    sm_scale,
+                    kv_lora_rank,
+                    qk_rope_head_dim,
+                    dtype=out_dtype,
+                    work_meta_data=work_meta_data,
+                    work_info_set=work_info_set,
+                    work_indptr=work_indptr,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    max_seqlen_q=max_seqlen_qo,
+                    is_causal=True,
+                    q_scale=None,
+                    kv_scale=kv_scale,
+                )
+            )
+
+            checkAllclose(
+                split_out_ref,
+                out_asm,
+                msg=f"mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+            )
+            if partial_out_ref.shape[0] > 0:
+                checkAllclose(
+                    partial_out_ref,
+                    attn_logits[: partial_out_ref.shape[0]].flatten(0, 1),
+                    msg=f"mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
+                )
         return err, us_asm_decode
 
     def test_absorb_decode_bf16():
@@ -646,6 +1152,42 @@ def test_mla(
             out_asm,
             msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
+
+        if not non_persistent_mode:
+            partial_out_ref, partial_lse_ref, split_out_ref, split_lse_ref = (
+                torch_mla_split_kv_and_reduce(
+                    q,
+                    kv_buffer,
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    kv_last_page_lens,
+                    sm_scale,
+                    kv_lora_rank,
+                    qk_rope_head_dim,
+                    dtype=out_dtype,
+                    work_meta_data=work_meta_data,
+                    work_info_set=work_info_set,
+                    work_indptr=work_indptr,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    max_seqlen_q=max_seqlen_qo,
+                    is_causal=True,
+                )
+            )
+
+            checkAllclose(
+                split_out_ref,
+                out_asm,
+                msg=f"mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+            )
+            if partial_out_ref.shape[0] > 0:
+                checkAllclose(
+                    partial_out_ref,
+                    attn_logits[: partial_out_ref.shape[0]].flatten(0, 1),
+                    msg=f"mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
+                )
         return err, us_asm_decode
 
     def test_absorb_decode_fp8():
@@ -669,7 +1211,7 @@ def test_mla(
             kv_lora_rank,
             qk_rope_head_dim,
             dtype=out_dtype,
-            is_causal=False,
+            is_causal=True,
             q_scale=None,
             kv_scale=kv_scale,
         )
@@ -709,11 +1251,51 @@ def test_mla(
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
-        checkAllclose(
+
+        err = checkAllclose(
             out_ref_fp8,
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
+
+        if not non_persistent_mode:
+            partial_out_ref, partial_lse_ref, split_out_ref, split_lse_ref = (
+                torch_mla_split_kv_and_reduce(
+                    q_fp8 if dtype == dtypes.fp8 else q,
+                    kv_buffer_fp8,
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    kv_last_page_lens,
+                    sm_scale,
+                    kv_lora_rank,
+                    qk_rope_head_dim,
+                    dtype=out_dtype,
+                    work_meta_data=work_meta_data,
+                    work_info_set=work_info_set,
+                    work_indptr=work_indptr,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    max_seqlen_q=max_seqlen_qo,
+                    is_causal=True,
+                    q_scale=q_scale,
+                    kv_scale=kv_scale,
+                )
+            )
+
+            checkAllclose(
+                split_out_ref,
+                out_asm,
+                msg=f"mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+            )
+
+            if partial_out_ref.shape[0] > 0:
+                checkAllclose(
+                    partial_out_ref,
+                    attn_logits[: partial_out_ref.shape[0]].flatten(0, 1),
+                    msg=f"mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
+                )
 
         cal_diff(out_ref, out_asm, "out", True)
         return err, us_asm_decode
@@ -787,6 +1369,47 @@ def test_mla(
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
+
+        if not non_persistent_mode:
+            partial_out_ref, partial_lse_ref, split_out_ref, split_lse_ref = (
+                torch_mla_extend_3buffer_split_kv_and_reduce(
+                    q,
+                    kv_buffer_bytes,
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    kv_last_page_lens,
+                    page_size,
+                    nhead_kv,
+                    sm_scale,
+                    kv_lora_rank,
+                    qk_rope_head_dim,
+                    dtype=out_dtype,
+                    work_meta_data=work_meta_data,
+                    work_info_set=work_info_set,
+                    work_indptr=work_indptr,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    max_seqlen_q=max_seqlen_qo,
+                    is_causal=True,
+                    scale_dim=scale_dim,
+                )
+            )
+
+            checkAllclose(
+                split_out_ref,
+                out_asm,
+                msg=f"mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+            )
+
+            if partial_out_ref.shape[0] > 0:
+                checkAllclose(
+                    partial_out_ref,
+                    attn_logits[: partial_out_ref.shape[0]].flatten(0, 1),
+                    msg=f"mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
+                )
+
         cal_diff(out_ref, out_asm, "out", True)
         return err, us_asm_decode
 
@@ -819,15 +1442,6 @@ def test_mla(
 
     return ret
 
-
-kv_lora_rank = 512
-qk_nope_head_dim = 128
-qk_rope_head_dim = 64
-v_head_dim = 128
-block_size = 1
-list_dtype = ["bf16", "fp8"]
-l_kv_dtype = ["bf16", "fp8"]
-list_nhead = [(16, 1), (16, 2), (16, 4), (48, 1), (128, 2), (32, 4)]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -876,20 +1490,22 @@ parser.add_argument(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=["bf16", "fp8"],
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
     nargs="*",
-    default=["bf16", "fp8"],
+    default="bf16,fp8",
+    metavar="{bf16, fp8}",
     help="""Data type of Q.
     e.g.: -d bf16""",
 )
 parser.add_argument(
     "-kvd",
     "--kv_dtype",
-    type=str,
-    choices=["bf16", "fp8"],
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
     nargs="*",
-    default=["bf16", "fp8"],
+    metavar="{bf16, fp8}",
+    default="bf16,fp8",
     help="""Data type of KV.
     e.g.: -kvd bf16""",
 )
@@ -915,9 +1531,9 @@ parser.add_argument(
     "-n",
     "--nhead",
     type=dtypes.str2tuple,
-    nargs="?",
+    nargs="*",
     const=None,
-    default=None,
+    default=[(16, 1), (16, 2), (16, 4), (48, 1), (128, 2)],
     help="""Number of heads.
     e.g.: -n 16,1""",
 )
@@ -964,15 +1580,10 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
-list_dtype = [dtypes.d_dtypes[key] for key in args.dtype]
-l_kv_dtype = [dtypes.d_dtypes[key] for key in args.kv_dtype]
-if args.nhead is not None:
-    list_nhead = [args.nhead]
-
-for nhead, decode_qlen in list_nhead:
+for nhead, decode_qlen in args.nhead:
     df = []
     for dtype, kvtype, ctx_len, batch_size, max_split_per_batch in itertools.product(
-        list_dtype, l_kv_dtype, args.ctxLen, args.batchSize, args.max_split_per_batch
+        args.dtype, args.kv_dtype, args.ctxLen, args.batchSize, args.max_split_per_batch
     ):
         if check_support(dtype, kvtype, nhead):
             ret = test_mla(

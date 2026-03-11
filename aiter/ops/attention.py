@@ -5,6 +5,8 @@ import math
 from typing import Optional, Tuple
 
 import torch
+import triton
+import triton.language as tl
 from csrc.cpp_itfs.pa.pa import paged_attention_rocm as paged_attention_rocm_core
 from csrc.cpp_itfs.pa.pa_ragged import (
     paged_attention_ragged as paged_attention_ragged_core,
@@ -15,6 +17,7 @@ from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
 
 from aiter import dtypes
 
+from ..jit.utils.chip_info import get_gfx
 from ..jit.core import compile_ops
 
 MD_NAME = "module_attention"
@@ -817,7 +820,12 @@ def get_mla_metadata_info_v1(
     max_qo_tiles_per_batch = (
         int(math.ceil(max_seqlen_qo * num_head_qo / 128))
         if num_head_qo == 16
-        or (num_head_qo == 128 and kv_dtype == dtypes.fp8 and q_dtype == dtypes.fp8)
+        or (
+            get_gfx() == "gfx942"
+            and num_head_qo == 128
+            and kv_dtype == dtypes.fp8
+            and q_dtype == dtypes.fp8
+        )
         else int(math.ceil(max_seqlen_qo * num_head_qo / 16))
     )
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
@@ -972,4 +980,189 @@ def mla_reduce_v1(
     max_seqlen_q: int,
     final_output: torch.Tensor,
     final_lse: Optional[torch.Tensor] = None,
+) -> None: ...
+
+
+@triton.jit(do_not_specialize=["tile_reduce_cnt"])
+def decode_update_mla_metadata_v1_kernel(
+    seqlens_qo_indptr,
+    seqlens_kv_indptr,
+    kv_last_page_lens,
+    num_heads_per_head_k: tl.constexpr,
+    num_heads_k: tl.constexpr,
+    is_causal: tl.constexpr,
+    work_info,
+    work_indptr,
+    reduce_indptr,
+    reduce_final_map,
+    reduce_partial_map,
+    page_size: tl.constexpr,
+    kv_granularity: tl.constexpr,
+    cu_num: tl.constexpr,
+    qk_batch_ratio: tl.constexpr,
+    tile_reduce_cnt,
+    num_reject_tokens,
+    has_num_reject_tokens: tl.constexpr,
+):
+    work_id = tl.program_id(0)
+    num_workers = tl.load(work_indptr + cu_num)
+    if work_id >= num_workers:
+        return
+    batch_id = tl.load(work_info + work_id * 8 + 0)
+    real_batch_id = batch_id // qk_batch_ratio
+
+    # seq_kv_start = tl.load(seqlens_kv_indptr + real_batch_id).to(tl.int32)
+    seq_kv_end = tl.load(seqlens_kv_indptr + real_batch_id + 1).to(tl.int32)
+    # seq_kv_last = tl.load(kv_last_page_lens + real_batch_id).to(tl.int32)
+    # seq_kv_len = (seq_kv_end - seq_kv_start - 1) + seq_kv_last
+
+    seq_kv_delta = 1
+    if has_num_reject_tokens:
+        seq_kv_delta -= tl.load(num_reject_tokens + real_batch_id).to(tl.int32)
+
+    q_len = 1
+    partial_index = tl.load(work_info + work_id * 8 + 1)
+    q_start = tl.load(work_info + work_id * 8 + 2)
+    q_end = tl.load(work_info + work_id * 8 + 3)
+    kv_start = tl.load(work_info + work_id * 8 + 4)
+    kv_end = tl.load(work_info + work_id * 8 + 5)
+    kv_offset = tl.load(work_info + work_id * 8 + 6)
+    ori_partial_index = partial_index
+    work_kv_len = kv_end - kv_start
+    if kv_offset == 0:
+        if work_kv_len > 0:
+            kv_end = seq_kv_end
+            if work_kv_len + seq_kv_delta > 0:
+                kv_start = kv_end - work_kv_len - seq_kv_delta
+            else:
+                kv_start = kv_end - 1
+    else:
+        kv_offset += seq_kv_delta
+        if kv_offset <= 0:
+            work_kv_len += kv_offset - 1
+            if work_kv_len < 1:
+                work_kv_len = 1
+            kv_offset = 1
+        kv_end = seq_kv_end - kv_offset
+        kv_start = kv_end - work_kv_len
+
+    q_len = q_end - q_start
+    if q_len > 1:
+        q_start = batch_id
+        q_end = batch_id + 1
+        if partial_index >= 0:
+            partial_index = partial_index // q_len  # qlen must be same for all batches
+            # partial_index = work_id
+
+    tl.store(work_info + work_id * 8 + 1, partial_index)
+    tl.store(work_info + work_id * 8 + 2, q_start)
+    tl.store(work_info + work_id * 8 + 3, q_end)
+    tl.store(work_info + work_id * 8 + 4, kv_start)
+    tl.store(work_info + work_id * 8 + 5, kv_end)
+    tl.store(work_info + work_id * 8 + 6, kv_offset)
+    tl.store(work_info + work_id * 8 + 7, 0)
+
+    if q_len > 1 and ori_partial_index >= 0:
+        tile_idx = batch_id
+        partial_start = tl.load(reduce_indptr + tile_idx)
+        partial_end = tl.load(reduce_indptr + tile_idx + 1)
+        if kv_offset == 0:
+            tl.store(reduce_final_map + tile_idx * 2, q_start)
+            tl.store(reduce_final_map + tile_idx * 2 + 1, q_end)
+        found_partial_index = False
+        for i in range(partial_start, partial_end):
+            if not found_partial_index:
+                partial_index_i = tl.load(reduce_partial_map + i)
+                if partial_index_i == ori_partial_index:
+                    tl.store(reduce_partial_map + i, partial_index)
+                    found_partial_index = True
+
+
+def decode_update_mla_metadata_v1(
+    seqlens_qo_indptr: torch.Tensor,
+    seqlens_kv_indptr: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    num_heads_per_head_k: int,
+    num_heads_k: int,
+    is_causal: bool,
+    work_metadata_ptrs: torch.Tensor,
+    work_info_set: torch.Tensor,
+    work_indptr: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: torch.Tensor,
+    reduce_partial_map: torch.Tensor,
+    page_size: int = 1,
+    kv_granularity: int = 16,
+    max_seqlen_qo: int = 1,
+    dtype_q: torch.dtype = dtypes.bf16,
+    dtype_kv: torch.dtype = dtypes.bf16,
+    num_reject_tokens: Optional[torch.Tensor] = None,
+) -> None:
+    """
+    Update MLA metadata incrementally for decode steps where the batch
+    composition has not changed. It will also convert qlen > 1 to qlen = 1.
+    """
+    assert kv_granularity % page_size == 0
+    assert num_heads_k == 1
+    assert kv_granularity >= 16
+    assert page_size == 1
+    # assert not (dtype_q == dtypes.bf16 and dtype_kv == dtypes.bf16 and num_heads_per_head_k == 128), "In this case, use get_mla_metadata_v1 instead"
+    natively_supported = (num_heads_per_head_k == 16) or (
+        num_heads_per_head_k == 128 and dtype_q == dtypes.fp8 and dtype_kv == dtypes.fp8
+    )
+    cu_num = work_indptr.shape[0] - 1
+    tile_reduce_cnt = reduce_indptr.shape[0] - 1
+    max_work = work_info_set.shape[0]
+    batch_size = seqlens_qo_indptr.shape[0] - 1
+    qk_batch_ratio = 1
+    if not natively_supported and num_heads_per_head_k % 16 == 0:
+        qk_batch_ratio = num_heads_per_head_k // 16
+        num_heads_per_head_k = 16
+        batch_size *= qk_batch_ratio
+    grid = (max_work,)
+    decode_update_mla_metadata_v1_kernel[grid](
+        seqlens_qo_indptr,
+        seqlens_kv_indptr,
+        kv_last_page_lens,
+        num_heads_per_head_k,
+        num_heads_k,
+        is_causal,
+        work_info_set,
+        work_indptr,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        page_size,
+        kv_granularity,
+        cu_num,
+        qk_batch_ratio,
+        tile_reduce_cnt,
+        num_reject_tokens,
+        num_reject_tokens is not None,
+    )
+
+
+@compile_ops("module_hk_mla")
+def hk_mla_decode_fwd(
+    # [num_seqs, num_heads, head_size]
+    query: torch.Tensor,
+    # [num_page, page_size, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
+    kv_buffer: torch.Tensor,
+    # [batch_size+1]
+    qo_indptr: torch.Tensor,
+    # [batch_size+1]
+    kv_indptr: torch.Tensor,
+    # [num_page_used]
+    kv_page_indices: torch.Tensor,
+    # [batch_size]
+    kv_last_page_lens: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    max_seqlen_q: int,
+    softmax_scale: float,
+    # [batch_size, num_kv_splits, num_heads, v_head_dim]
+    split_output: torch.Tensor,
+    # [batch_size, num_kv_splits, num_heads,  1]
+    split_lse: torch.Tensor,
+    final_output: torch.Tensor,
 ) -> None: ...

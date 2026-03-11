@@ -4,7 +4,14 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
     branches: [main]  # Triggers on PRs targeting `main`
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+
   workflow_dispatch:
 
 concurrency:
@@ -16,9 +23,11 @@ env:
   GPU_ARCH_LIST: "gfx942;gfx950"
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
+  AITER_TEST: "op_tests"
 
 jobs:
   check-signal:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -31,8 +40,12 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   build_aiter_image:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     runs-on: build-only-aiter
     needs: check-signal
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - name: Checkout code
         if: ${{ !github.event.pull_request.head.repo.fork }}
@@ -75,7 +88,8 @@ jobs:
               fi \
            && pip install -r requirements.txt \
            && echo "Prebuilding kernels with GPU_ARCHS: ${{ env.GPU_ARCH_LIST }} and PREBUILD_KERNELS: 1" \
-           && PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" python setup.py develop \
+           && PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" python setup.py bdist_wheel \
+           && pip install dist/*.whl \
            && echo "Prebuilding kernels completed"
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
@@ -91,6 +105,20 @@ jobs:
           IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
           docker build --network=host --no-cache -t $IMAGE_TAG -f Dockerfile.mod .
 
+      - name: Verify prebuilt kernels
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        run: |
+          IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
+          echo "=== Prebuilt kernel validation ==="
+          KERNEL_COUNT=$(docker run --rm $IMAGE_TAG find /aiter/aiter/jit -name "*.so" | wc -l)
+          echo "Prebuilt kernel .so files: $KERNEL_COUNT"
+          docker run --rm $IMAGE_TAG find /aiter/aiter/jit -name "*.so" | sort
+          if [ "$KERNEL_COUNT" -lt 10 ]; then
+            echo "::warning::Prebuild may have failed: expected at least 10 kernel .so files, found $KERNEL_COUNT. This can cause JIT compilation and OOM at runtime."
+          else
+            echo "Prebuild validation passed: $KERNEL_COUNT kernels compiled"
+          fi
+
       - name: Push Docker image
         if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
@@ -102,18 +130,123 @@ jobs:
         if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
           echo "Successfully prepared image: rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}"
-      
+
+      - name: Extract wheel from image
+        if: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          set -ex
+          IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
+          mkdir -p dist
+          docker run --rm \
+            -v "${{ github.workspace }}/dist:/dist" \
+            $IMAGE_TAG \
+            bash -c "cp /aiter/dist/*.whl /dist/"
+          echo "Extracted wheels:"
+          ls -lh dist/*.whl
+
+      - name: Upload wheel as artifact
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiter-whl-main-${{ github.run_id }}
+          path: dist/*.whl
+
+      - name: Configure AWS credentials
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: us-east-1
+          role-to-assume: arn:aws:iam::661452401056:role/framework-aiter-nightlies
+
+      - name: Install AWS CLI
+        if: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          if ! command -v aws &> /dev/null; then
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip -q awscliv2.zip
+            sudo ./aws/install
+            rm -rf awscliv2.zip aws
+          fi
+
+      - name: Upload wheels to S3
+        if: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          for WHL in dist/*.whl; do
+            WHL_NAME=$(basename ${WHL})
+            echo "Uploading ${WHL_NAME} to S3..."
+            aws s3 cp ${WHL} s3://framework-whls-nightlies/whl-staging/gfx942-gfx950/${WHL_NAME}
+          done
+          echo "Wheels uploaded to S3 staging"
+
+  split_aiter_tests:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    runs-on: ubuntu-latest
+    needs: [check-signal, build_aiter_image]
+    outputs:
+      shard_count: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Split Aiter Tests (5 shards)
+        run: ./.github/scripts/split_tests.sh --shards 5 --test-type aiter
+
+      - name: Upload test shard lists as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiter_shards
+          path: aiter_shard_*.list
+
   standard:
+    if: >-
+      (!github.event.pull_request || github.event.pull_request.draft == false) &&
+      github.event.action != 'labeled'
     name: Standard Tests (1 GPU)
-    needs: build_aiter_image 
+    needs: [build_aiter_image, split_aiter_tests] 
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: linux-aiter-mi355-1
             label: MI355
+            shard_total: 5
+            shard_idx: 0
+          - runner: linux-aiter-mi355-1
+            label: MI355
+            shard_total: 5
+            shard_idx: 1
+          - runner: linux-aiter-mi355-1
+            label: MI355
+            shard_total: 5
+            shard_idx: 2
+          - runner: linux-aiter-mi355-1
+            label: MI355
+            shard_total: 5
+            shard_idx: 3
+          - runner: linux-aiter-mi355-1
+            label: MI355
+            shard_total: 5
+            shard_idx: 4
           - runner: aiter-1gpu-runner
             label: MI325
+            shard_total: 5
+            shard_idx: 0
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard_total: 5
+            shard_idx: 1
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard_total: 5
+            shard_idx: 2
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard_total: 5
+            shard_idx: 3
+          - runner: aiter-1gpu-runner
+            label: MI325
+            shard_total: 5
+            shard_idx: 4
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -125,6 +258,21 @@ jobs:
       - name: Docker login
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
       
+      - name: Download test shard lists
+        uses: actions/download-artifact@v4
+        with:
+          name: aiter_shards
+
+      - name: List test shard files
+        run: |
+          ls -l aiter_shard_*.list
+
+      - name: Export test file list for this shard as env
+        id: set_shard_files
+        run: |
+          echo "AITER_TEST=$(cat aiter_shard_${{ matrix.shard_idx }}.list)" >> $GITHUB_ENV
+          echo "$AITER_TEST"
+
       - name: Run the container
         run: |
           set -ex
@@ -148,6 +296,7 @@ jobs:
           --network=host \
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
+          -e AITER_TEST="${AITER_TEST}" \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name aiter_test \
@@ -173,18 +322,19 @@ jobs:
           bash -c "pip show amd-aiter || true"
       
       - name: Tests
+        timeout-minutes: 60
         run: |
           set -ex
           if [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
             docker exec \
             -w /workspace \
             aiter_test \
-            bash -c "MAX_JOBS=20 ./.github/scripts/aiter_test.sh" 
+            bash -c "MAX_JOBS=20 SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh"
           else
             docker exec \
             -w /workspace \
             aiter_test \
-            bash -c "./.github/scripts/aiter_test.sh" 
+            bash -c "SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh"
           fi
 
       - name: Collect test logs
@@ -196,9 +346,9 @@ jobs:
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
-        if: always()
+        if: success()
         with:
-          name: standard-test-log-${{ matrix.runner }}
+          name: standard-test-log-${{ matrix.runner }}-shard-${{ matrix.shard_idx }}
           path: latest_test.log
 
       - name: Cleanup container
@@ -206,9 +356,52 @@ jobs:
         run: |
           docker rm -f aiter_test || true
 
+  standard-test-finish:
+    if: >-
+      !github.event.pull_request.draft &&
+      github.event.action != 'labeled'
+    name: Standard Test Results
+    runs-on: ubuntu-latest
+    needs: [standard]
+    steps:
+      - name: Download all test logs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: standard-test-log-*-shard-*
+          path: .
+      
+      - name: List test logs
+        run: |
+          ls -l standard-test-log-*
+
+      - name: Check Standard Test Results
+        run: |
+          set -ex
+          echo "Checking Standard Test Results..."
+          all_passed=true
+          for shard in {0..4}; do
+            for runner in {linux-aiter-mi355-1,aiter-1gpu-runner}; do
+              if [ ! -f standard-test-log-${runner}-shard-${shard}/latest_test.log ]; then
+                echo "Test report for ${runner} shard ${shard} not found."
+                all_passed=false
+                break
+              fi
+            done
+          done
+          if [ "$all_passed" = true ]; then
+            echo "All tests passed."
+          else
+            echo "Test failures or errors detected."
+            exit 1
+          fi
+
   multi-gpu:
     name: Multi-GPU Tests (8 GPU)
-    if: github.ref == 'refs/heads/main'
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (contains(github.event.pull_request.labels.*.name, 'ci:multi-gpu') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))
     needs: build_aiter_image 
     strategy:
       fail-fast: false
@@ -274,6 +467,7 @@ jobs:
           bash -c "pip show amd-aiter || true"
 
       - name: Tests
+        timeout-minutes: 60
         run: |
           set -ex
           docker exec \
