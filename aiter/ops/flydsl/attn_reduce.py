@@ -72,6 +72,8 @@ def flydsl_attn_reduce_v1(
     )
 
     num_heads = partial_output.size(-2)  # [*, h, dv]
+    size_dv = final_output.size(-1)
+    out_elem_bytes = final_output.element_size()
 
     output_lse = final_lse is not None
     use_reduce_final_map = reduce_final_map is not None
@@ -146,6 +148,9 @@ def flydsl_attn_reduce_v1(
             max_splits,
             int(output_lse),
             int(use_reduce_final_map),
+            num_heads,
+            size_dv,
+            out_elem_bytes,
         )
     else:
         launch_attn_reduce_ps(

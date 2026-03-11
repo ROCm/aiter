@@ -362,16 +362,30 @@ def mla_decode_fwd(
             kv_scale,
         )
 
-        aiter.mla_reduce_v1(
-            logits,
-            attn_lse,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            max_seqlen_q,
-            o,
-            final_lse,
-        )
+        if False:
+            aiter.mla_reduce_v1(
+                logits,
+                attn_lse,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                max_seqlen_q,
+                o,
+                final_lse,
+            )
+        else:
+            from aiter.ops.flydsl import flydsl_attn_reduce_v1
+
+            flydsl_attn_reduce_v1(
+                logits,
+                attn_lse,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                max_seqlen_q,
+                o,
+                final_lse,
+            )
 
     if io_transformed:
         if return_logits:
