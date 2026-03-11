@@ -229,7 +229,7 @@ def _sage_fwd_no_mask_mxfp4(
             m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
         else:
             m_diff = m_i - m_ij
-        
+
         alpha = tl.math.exp2(m_diff)
         acc = acc * alpha[:, None]
 
