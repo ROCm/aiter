@@ -494,9 +494,11 @@ def _run_asm_moe_int8(
             a8, a8_scale = aiter.pertoken_quant(hidden_states, quant_dtype=w1.dtype)
     # two stage: only supported for g1u1 weights (w1.shape[1] == inter_dim * 2)
     if run_2stage:
-        # Pass global topk_ids when we kept it (ref path); else pass cloned original (topk_ids_for_scale or topk_ids if no clone).
+        # Pass global topk_ids when we kept it (ref path); else pass cloned original (topk_ids_for_scale if available, otherwise topk_ids).
         ids_for_scale = (
-            topk_ids if use_ref_input_quant else (topk_ids_for_scale or topk_ids)
+            topk_ids
+            if use_ref_input_quant
+            else (topk_ids_for_scale if topk_ids_for_scale is not None else topk_ids)
         )
         return _asm_moe_2stages_a8(
             M,
