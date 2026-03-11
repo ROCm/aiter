@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 
@@ -18,6 +18,7 @@ def gather_kv_b_proj(
     kv_proj_scale: torch.Tensor,  # [2 * 128 // TP, 4], blockscale=128 x 128
     k_prefix: torch.Tensor,  # [total_kv, tp_k_head_num, qk_nope_head_dim + kv_pe_dim]
     v_prefix: torch.Tensor,  # [total_kv, tp_k_head_num, qk_nope_head_dim]
+    weight_preshuffle: bool = False,
 ):
     num_block, block_size, hidden_dim = k_buffer.shape
     batch_size = kv_indptr.shape[0] - 1
@@ -55,5 +56,6 @@ def gather_kv_b_proj(
         KV_CDim=weight_k,
         KV_PeDim=qk_nope_pe_dim - qk_nope_dim,
         ChunkK=ChunkK,
+        WEIGHT_PRESHUFFLE=weight_preshuffle,
         num_stages=3,
     )

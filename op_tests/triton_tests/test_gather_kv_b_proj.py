@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import math
 import random
 import argparse
@@ -10,6 +10,7 @@ import torch
 from aiter.test_common import checkAllclose, run_perftest
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from aiter.ops.shuffle import shuffle_weight
+from aiter import dtypes
 
 
 def ref_gather_kv_b_proj(
@@ -128,9 +129,9 @@ def ref_gather_kv_b_proj(
 @pytest.mark.parametrize(
     "batch_size, block_size, num_tp, k_buffer_type, avg_kv_length",
     [
-        (4, 1, 4, torch.float8_e4m3fnuz, 512),
-        (8, 16, 4, torch.float8_e4m3fnuz, 1024),
-        (32, 32, 4, torch.float8_e4m3fnuz, 2048),
+        (4, 1, 4, dtypes.fp8, 512),
+        (8, 16, 4, dtypes.fp8, 1024),
+        (32, 32, 4, dtypes.fp8, 2048),
         (64, 1, 4, torch.bfloat16, 2048),
         (1, 1, 4, torch.bfloat16, 512),
     ],
@@ -147,7 +148,7 @@ def test_gather_kv_b_proj(
     tp_k_head_num = 128 // num_tp
     num_block = 2 * avg_kv_length // block_size
 
-    weight_preshuffle = False  # block_size % 16 == 0
+    weight_preshuffle = True
 
     device = "cuda"
     weight_dtype = torch.float8_e4m3fnuz
@@ -238,6 +239,7 @@ def test_gather_kv_b_proj(
         kv_proj_scale,
         k_prefix.view(-1, tp_k_head_num, qk_nope_head_dim + kv_pe_dim),
         v_prefix.view(-1, tp_k_head_num, qk_nope_head_dim),
+        weight_preshuffle=weight_preshuffle,
     )
 
     # Validate results
@@ -256,6 +258,7 @@ def test_gather_kv_b_proj(
             kv_proj_scale,
             k_prefix.view(-1, tp_k_head_num, qk_nope_head_dim + kv_pe_dim),
             v_prefix.view(-1, tp_k_head_num, qk_nope_head_dim),
+            weight_preshuffle=weight_preshuffle,
         )
         total_float_operations = (
             2
