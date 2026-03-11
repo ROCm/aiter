@@ -100,34 +100,36 @@ def bench_kernel(q, k, v, args, provider):
             q_smoothing=args.qsmooth,
         )
 
-        fn_unfused_quant = lambda: sage_quant_mxfp4(
-            q,
-            k,
-            v,
-            FP8_TYPE,
-            FP8_MAX,
-            BLKQ=config["BLOCK_M"],
-            BLKK=64,
-            layout=args.layout,
-            R=R,
-            BLOCK_R=BLOCK_R,
-            q_smoothing=args.qsmooth,
-        )
+        def fn_unfused_quant():
+            return sage_quant_mxfp4(
+                    q,
+                    k,
+                    v,
+                    FP8_TYPE,
+                    FP8_MAX,
+                    BLKQ=config["BLOCK_M"],
+                    BLKK=64,
+                    layout=args.layout,
+                    R=R,
+                    BLOCK_R=BLOCK_R,
+                    q_smoothing=args.qsmooth,
+                )
 
         ms = triton.testing.do_bench_cudagraph(fn_unfused_quant)
         print("fn_unfused_quant (ms)", ms)
 
-        fn_fused_quant = lambda: fused_sage_quant_mxfp4(
-            q,
-            k,
-            v,
-            BLOCK_M=config["BLOCK_M"],
-            layout=args.layout,
-            R=R,
-            BLOCK_R=BLOCK_R,
-            q_smoothing=args.qsmooth,
-            hadamard_rotation=args.hadamard_rotate,
-        )
+        def fn_fused_quant():
+            return fused_sage_quant_mxfp4(
+                    q,
+                    k,
+                    v,
+                    BLOCK_M=config["BLOCK_M"],
+                    layout=args.layout,
+                    R=R,
+                    BLOCK_R=BLOCK_R,
+                    q_smoothing=args.qsmooth,
+                    hadamard_rotation=args.hadamard_rotate,
+                )
 
         ms = triton.testing.do_bench_cudagraph(fn_fused_quant)
         print("fn_fused_quant (ms)", ms)
