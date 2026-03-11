@@ -152,15 +152,19 @@ def test_triton_unified_attn(
     k_descale = None
     v_descale = None
     if q_dtype is not None:
-        # QKV are drawn from N(0, 1): no need for a fp8 scaling factor
-        maybe_quantized_query = query.to(q_dtype)
-        maybe_quantized_key_cache = key_cache.to(q_dtype)
-        maybe_quantized_value_cache = value_cache.to(q_dtype)
+        fp8_max = torch.finfo(q_dtype).max
 
-        scale_shape = (num_seqs, num_kv_heads)
-        q_descale = None  # Not yet supported
-        k_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
-        v_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
+        q_abs_max = query.abs().amax().clamp(min=1e-9)
+        q_descale = (q_abs_max / fp8_max).to(torch.float32).unsqueeze(0)
+        maybe_quantized_query = (query * (fp8_max / q_abs_max)).to(q_dtype)
+
+        k_abs_max = key_cache.abs().amax().clamp(min=1e-9)
+        k_descale = (k_abs_max / fp8_max).to(torch.float32).unsqueeze(0)
+        maybe_quantized_key_cache = (key_cache * (fp8_max / k_abs_max)).to(q_dtype)
+
+        v_abs_max = value_cache.abs().amax().clamp(min=1e-9)
+        v_descale = (v_abs_max / fp8_max).to(torch.float32).unsqueeze(0)
+        maybe_quantized_value_cache = (value_cache * (fp8_max / v_abs_max)).to(q_dtype)
 
     unified_attention(
         q=maybe_quantized_query,

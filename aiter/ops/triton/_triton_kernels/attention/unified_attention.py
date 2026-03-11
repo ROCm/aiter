@@ -62,6 +62,7 @@ def kernel_unified_attention_2d(
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
     scale: tl.constexpr,  # float32
+    q_scale,  # float32
     k_scale,  # float32
     v_scale,  # float32
     out_scale,  # float32
@@ -96,6 +97,7 @@ def kernel_unified_attention_2d(
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
     USE_FP8: tl.constexpr,  # bool
+    USE_Q_DESCALE: tl.constexpr = False,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
     ALL_DECODE: tl.constexpr = False,  # bool
@@ -105,7 +107,13 @@ def kernel_unified_attention_2d(
 
     # needed to use exp2 (exp2 -> exp conversion)
     RCP_LN2 = 1.4426950408889634
-    qk_scale = scale * RCP_LN2
+    if USE_Q_DESCALE:
+        _q_ds = tl.load(q_scale)
+        _k_ds = tl.load(k_scale)
+        _v_ds = tl.load(v_scale)
+        qk_scale = scale * RCP_LN2 * _q_ds * _k_ds
+    else:
+        qk_scale = scale * RCP_LN2
 
     seq_idx = find_seq_idx(
         query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
@@ -354,7 +362,10 @@ def kernel_unified_attention_2d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P.to(V.dtype), V)
+        if USE_Q_DESCALE:
+            acc += tl.dot(P.to(V.dtype), V) * _v_ds
+        else:
+            acc += tl.dot(P.to(V.dtype), V)
 
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
@@ -392,6 +403,7 @@ def kernel_unified_attention_3d(
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
     scale,  # float32
+    q_scale,  # float32
     k_scale,  # float32
     v_scale,  # float32
     softcap,  # float32
@@ -423,6 +435,7 @@ def kernel_unified_attention_3d(
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
+    USE_Q_DESCALE: tl.constexpr = False,  # bool
     ALL_DECODE: tl.constexpr = False,  # bool
 ):
     q_block_global_idx = tl.program_id(0)
@@ -431,7 +444,13 @@ def kernel_unified_attention_3d(
 
     # needed to use exp2 (exp2 -> exp conversion)
     RCP_LN2 = 1.4426950408889634
-    qk_scale = scale * RCP_LN2
+    if USE_Q_DESCALE:
+        _q_ds = tl.load(q_scale)
+        _k_ds = tl.load(k_scale)
+        _v_ds = tl.load(v_scale)
+        qk_scale = scale * RCP_LN2 * _q_ds * _k_ds
+    else:
+        qk_scale = scale * RCP_LN2
 
     seq_idx = find_seq_idx(
         query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
@@ -666,7 +685,10 @@ def kernel_unified_attention_3d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P.to(V.dtype), V)
+        if USE_Q_DESCALE:
+            acc += tl.dot(P.to(V.dtype), V) * _v_ds
+        else:
+            acc += tl.dot(P.to(V.dtype), V)
 
     segm_output_offset = (
         query_offset_0[:, None].to(tl.int64)

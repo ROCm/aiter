@@ -124,7 +124,6 @@ def unified_attention(
     sinks=None,
 ):
     assert causal, "Only causal attention is supported"
-    assert q_descale is None, "Q scales not supported"
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -200,6 +199,7 @@ def unified_attention(
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
             scale=softmax_scale,
+            q_scale=q_descale,
             k_scale=k_descale,
             v_scale=v_descale,
             out_scale=1 / output_scale if output_scale is not None else 1.0,
@@ -231,6 +231,7 @@ def unified_attention(
             query_start_len_ptr=cu_seqlens_q,
             num_seqs=num_seqs,
             USE_FP8=output_scale is not None,
+            USE_Q_DESCALE=q_descale is not None,
             ALL_DECODE=ALL_DECODE,
             **config,
         )
@@ -281,6 +282,7 @@ def unified_attention(
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
             scale=softmax_scale,
+            q_scale=q_descale,
             k_scale=k_descale,
             v_scale=v_descale,
             softcap=softcap,
@@ -310,6 +312,7 @@ def unified_attention(
             BLOCK_Q=BLOCK_Q,
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
+            USE_Q_DESCALE=q_descale is not None,
             ALL_DECODE=ALL_DECODE,
             **attn_config,
         )
