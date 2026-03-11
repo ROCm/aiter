@@ -17,8 +17,8 @@ from flydsl.dialects.ext.python_control_flow import range_constexpr
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils import SmemAllocator, SmemPtr
 
-from _mlir import ir
-import _mlir.extras.types as T
+from flydsl._mlir import ir
+import flydsl._mlir.extras.types as T
 from flydsl.lang.ir.types import T as I
 
 from flydsl.dialects.ext import arith, gpu, buffer_ops, llvm, vector, rocdl, scf, memref

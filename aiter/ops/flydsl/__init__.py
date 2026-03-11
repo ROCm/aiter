@@ -18,8 +18,16 @@ if is_flydsl_available():
         flydsl_moe_stage1,
         flydsl_moe_stage2,
     )
+    from .gemm_kernels import (
+        flydsl_preshuffle_gemm_a8,
+        flydsl_select_tiles,
+        flydsl_parse_gemm_kernel_name,
+    )
 
     __all__ += [
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
+        "flydsl_preshuffle_gemm_a8",
+        "flydsl_select_tiles",
+        "flydsl_parse_gemm_kernel_name",
     ]

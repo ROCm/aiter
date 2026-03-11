@@ -18,8 +18,8 @@ from flydsl.dialects.ext.python_control_flow import range_constexpr
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils import SmemAllocator, SmemPtr
 
-from _mlir import ir
-import _mlir.extras.types as T
+from flydsl._mlir import ir
+import flydsl._mlir.extras.types as T
 from flydsl.lang.ir.types import T as I
 
 from flydsl.dialects.ext import arith, gpu, buffer_ops, llvm, vector, rocdl, scf, memref
@@ -2586,7 +2586,7 @@ def compile_moe_reduction(
             Y: lambda: T.memref(DYN, model_dim, _state["elem_type"]),
             m_tokens: lambda: T.index(),
         ):
-            from _mlir.dialects import vector as mlir_vector
+            from flydsl._mlir.dialects import vector as mlir_vector
 
             token_idx = flir.const_index(flir.block_idx("x"))
             tid = flir.const_index(flir.thread_idx("x"))
