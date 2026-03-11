@@ -233,6 +233,8 @@ def run_benchmark(args):
         max_block_per_request = 1024
 
         block_size = MAX_SEQ_LEN // max_block_per_request
+        if block_size == 0:
+            block_size = 1
 
         cache_size = max_block_per_request * BS
 

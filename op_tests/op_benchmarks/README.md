@@ -593,14 +593,15 @@ echo "Starting comprehensive PA decode benchmarks with all combinations..."
 
 # Define parameter arrays
 # Total combinations: 4 × 4 × 2 × 2 × 2 × 3 × 2 × 2 = 1,536
+# Total combinations: 4 × 4 × 2 × 2 × 2 = 128 KV_CACHE_DTYPES, COMPUTE_TYPES, OUTPUT_TYPES same as DTYPES
 BATCH_SIZES=(1 4 8 16)
 SEQLENS=(512 1024 2048 4096)
 HQ_VALUES=(32 64)
 HK_VALUES=(8 32)
 DTYPES=(fp16 bf16)
-KV_CACHE_DTYPES=(fp16 bf16 fp8)
-COMPUTE_TYPES=(fp16 bf16)
-OUTPUT_TYPES=(fp16 bf16)
+#KV_CACHE_DTYPES=(fp16 bf16 fp8)
+#COMPUTE_TYPES=(fp16 bf16)
+#OUTPUT_TYPES=(fp16 bf16)
 
 # Counter for tracking progress
 TOTAL=$(( ${#BATCH_SIZES[@]} * ${#SEQLENS[@]} * ${#HQ_VALUES[@]} * ${#HK_VALUES[@]} * ${#DTYPES[@]} * ${#KV_CACHE_DTYPES[@]} * ${#COMPUTE_TYPES[@]} * ${#OUTPUT_TYPES[@]} ))
@@ -612,11 +613,13 @@ for BATCH in "${BATCH_SIZES[@]}"; do
         for HQ in "${HQ_VALUES[@]}"; do
             for HK in "${HK_VALUES[@]}"; do
                 for DTYPE in "${DTYPES[@]}"; do
-                    for KV_CACHE_DTYPE in "${KV_CACHE_DTYPES[@]}"; do
-                        for COMPUTE_TYPE in "${COMPUTE_TYPES[@]}"; do
-                            for OUTPUT_TYPE in "${OUTPUT_TYPES[@]}"; do
+                    #for KV_CACHE_DTYPE in "${KV_CACHE_DTYPES[@]}"; do
+                        #for COMPUTE_TYPE in "${COMPUTE_TYPES[@]}"; do
+                            #for OUTPUT_TYPE in "${OUTPUT_TYPES[@]}"; do
                                 CURRENT=$((CURRENT + 1))
-                                
+                                KV_CACHE_DTYPE=$DTYPES
+                                COMPUTE_TYPE=$DTYPES
+                                OUTPUT_TYPE=$DTYPES           
                                 # Build filename from parameters
                                 FILENAME="b${BATCH}_s${SEQLEN}_hq${HQ}_hk${HK}_d${DTYPE}_kvc${KV_CACHE_DTYPE}_c${COMPUTE_TYPE}_o${OUTPUT_TYPE}"
                                 
@@ -632,9 +635,9 @@ for BATCH in "${BATCH_SIZES[@]}"; do
                                 if ls *.csv 1> /dev/null 2>&1; then
                                     mv *.csv $OUTPUT_DIR/${FILENAME}.csv 2>/dev/null || true
                                 fi
-                            done
-                        done
-                    done
+                            #done
+                        #done
+                    #done
                 done
             done
         done
@@ -723,7 +726,8 @@ mkdir -p $OUTPUT_DIR
 echo "Starting comprehensive PA prefill benchmarks with all combinations..."
 
 # Define parameter arrays
-# Total combinations: 4 × 4 × 2 × 2 × 2 × 3 × 2 × 2 = 1,536/3
+# Total combinations: 4 × 4 × 2 × 2 × 2 × 3 × 2 × 2 = 1,536 KV_CACHE_DTYPES=(auto fp16 bf16)
+# Total combinations: 4 × 4 × 2 × 2 × 2 × 2 × 2 = 512 KV_CACHE_DTYPES same as DTYPES.
 BATCH_SIZES=(1 4 8 16)
 SEQLENS=(512 1024 2048 4096)
 HQ_VALUES=(32 64)
