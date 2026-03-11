@@ -24,7 +24,7 @@ from ck_gemm_a8w8_blockscale_bpreshuffle.gemm_a8w8_blockscale_bpreshuffle_common
 from gemm_a8w8_blockscale_instance import candidate_kernels_dict
 
 # cktile
-from gemm_a8w8_blockscale_cktile_instance import candidate_kernels_cktile_dict
+from gemm_a8w8_blockscale_cktile_instance import candidate_kernels_cktile_dict, BLOCK_PER_CU_MAX
 
 block_shape = (128, 128)
 
@@ -156,6 +156,14 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             help="Enable B-matrix preshuffle for CK gemm a8w8 blockscale",
         )
 
+        self.parser.add_argument(
+            "--blockPerCu",
+            nargs="+",
+            type=int,
+            default=list(range(1, BLOCK_PER_CU_MAX + 1)),
+            help="List of BlockPerCu values to tune (CKTile only)",
+        )
+
     def calculate(self, results, bpes=(1, 1, 2)):
         """
         Calculate performance metrics based on results.
@@ -192,14 +200,13 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
     ):
         cu_num, M, N, K = info_keys
         # kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
-        kernel_list = candidate_kernels_cktile_dict
-        kernels_num = len(kernel_list)
+        kernel_list = {k: v for k, v in candidate_kernels_cktile_dict.items()
+                       if v.BlockPerCu in args.blockPerCu}
         # gemm_a8w8_idx = [0, 5 if preshuffleB else 1, 2, 3, 4]
         gemm_a8w8_idx = [0, 5, 6, 3, 4] if preshuffleB else [0, 1, 2, 3, 4]
         ref_data_idx = [0, 1, 2, 3]
         tasks_cktile = []
-        for i in range(kernels_num):
-            kernel = kernel_list[i]
+        for i, kernel in kernel_list.items():
             if not get_gfx().startswith("gfx95"):
                 if (kernel.M_Warp * kernel.N_Warp * kernel.K_Warp == 8) or (
                     kernel.K_Warp_Tile > 64  # gfx942 not support

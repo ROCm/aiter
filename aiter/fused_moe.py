@@ -1663,6 +1663,7 @@ def cktile_moe_stage1(
     activation=ActivationType.Silu,
     split_k=1,
     dtype=torch.bfloat16,
+    kernel_name="",
 ):
     token_num = hidden_states.shape[0]
     _, n1, k1 = w1.shape
@@ -1700,6 +1701,7 @@ def cktile_moe_stage1(
         activation,
         block_m,
         split_k,
+        kernel_name,
     )
 
     if split_k > 1:
@@ -1728,6 +1730,7 @@ def cktile_moe_stage2(
     n_pad_zeros=0,
     k_pad_zeros=0,
     bias2=None,
+    kernel_name="",
 ):
     token_num = a2.shape[0]
     D = w2.shape[1]
@@ -1757,6 +1760,7 @@ def cktile_moe_stage2(
         bias2,
         activation,
         block_m,
+        kernel_name=kernel_name,
     )
     return out
 

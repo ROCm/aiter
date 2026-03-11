@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+from copy import copy
 from dataclasses import dataclass
 import os
 import sys
@@ -42,6 +43,12 @@ class kernelInstance:
 
     @property
     def name(self) -> str:
+        """
+        Kernel name format in tuned CSV (BlockPerCu is in the flags segment):
+          a8w8_bpreshuffle_cktile_0x0x8x4x1x0x0x0x0x1_32x64x512_1x4x1_16x16x64_default
+          TransposeC..PadK..BlockPerCu-^  ^-MTile..     ^-MWarp..  ^-MWT..      ^-Sched
+          (BlockPerCu = 10th value in first flags group, value=1 here)
+        """
         return ("_").join(
             [
                 "a8w8_bpreshuffle_cktile",
@@ -70,6 +77,33 @@ class kernelInstance:
                 self.sScheduler.lower(),
             ]
         )
+
+
+BLOCK_PER_CU_MAX = 4
+
+
+def expand_blockpercu(base_dict, max_bpc=BLOCK_PER_CU_MAX, field_name='BlockPerCu'):
+    """Expand kernel instances with BlockPerCu 1..max_bpc variants.
+
+    For each unique tile configuration (all fields except BlockPerCu),
+    creates variants for every BPC value in 1..max_bpc that doesn't
+    already exist in base_dict.
+    """
+    expanded = dict(base_dict)
+    configs = {}  # tile_config_key -> {bpc: id, ...}
+    for idx, k in base_dict.items():
+        key = tuple(v for f, v in vars(k).items() if f != field_name)
+        configs.setdefault(key, {})[getattr(k, field_name)] = idx
+    next_id = max(base_dict.keys()) + 1
+    for key, existing_bpcs in configs.items():
+        template = base_dict[next(iter(existing_bpcs.values()))]
+        for bpc in range(1, max_bpc + 1):
+            if bpc not in existing_bpcs:
+                inst = copy(template)
+                inst.BlockPerCu = bpc
+                expanded[next_id] = inst
+                next_id += 1
+    return expanded
 
 
 # fmt: off
@@ -377,8 +411,11 @@ default_kernels_dict_950 = {
 
 arch = get_gfx()
 if arch == "gfx942":
-    kernels_list = kernels_list_942
+    kernels_list = expand_blockpercu(kernels_list_942)
     default_kernels_dict = default_kernels_dict_942
 else:
-    kernels_list = kernels_list_950
+    kernels_list = expand_blockpercu(kernels_list_950)
     default_kernels_dict = default_kernels_dict_950
+
+# Name-based reverse lookup for get_tune_dict() — built once at import time
+kernels_by_name = {v.name: v for v in kernels_list.values()}

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+from copy import copy
 from dataclasses import dataclass
 import os
 import sys
@@ -53,6 +54,12 @@ class kernelInstance:
 
     @property
     def name(self) -> str:
+        """
+        Kernel name format in tuned CSV (Block_Per_CU appears as "<N>perCU"):
+          moe_cktile2stages_gemm1_256x128x64x128_2x2_32x32x16_1perCU_fp8
+          prefix_stage            BlockxMxNxK     WaveMap WaveTile ^    ^-QuantType
+                                                           Block_Per_CU=1
+        """
         return ("_").join(
             element
             for element in [
@@ -99,6 +106,33 @@ class kernelInstance:
             ]
             if element != ""
         )
+
+
+BLOCK_PER_CU_MAX = 4
+
+
+def expand_blockpercu(base_dict, max_bpc=BLOCK_PER_CU_MAX, field_name='Block_Per_CU'):
+    """Expand kernel instances with Block_Per_CU 1..max_bpc variants.
+
+    For each unique tile configuration (all fields except Block_Per_CU),
+    creates variants for every BPC value in 1..max_bpc that doesn't
+    already exist in base_dict.
+    """
+    expanded = dict(base_dict)
+    configs = {}  # tile_config_key -> {bpc: id, ...}
+    for idx, k in base_dict.items():
+        key = tuple(v for f, v in vars(k).items() if f != field_name)
+        configs.setdefault(key, {})[getattr(k, field_name)] = idx
+    next_id = max(base_dict.keys()) + 1
+    for key, existing_bpcs in configs.items():
+        template = base_dict[next(iter(existing_bpcs.values()))]
+        for bpc in range(1, max_bpc + 1):
+            if bpc not in existing_bpcs:
+                inst = copy(template)
+                setattr(inst, field_name, bpc)
+                expanded[next_id] = inst
+                next_id += 1
+    return expanded
 
 
 # fmt: off
@@ -217,19 +251,25 @@ a8w4_gemm2_kernels_list_gfx950= {
 
 # fmt: on
 gemm1_kernels_dict = {
-    "a8w8_gfx950": a8w8_gemm1_kernels_list_gfx950,
-    "a8w8": a8w8_gemm1_kernels_list,
-    "a16w4_gfx950": a16w4_gemm1_kernels_list_gfx950,
-    "a16w4": a16w4_gemm1_kernels_list,
-    "a8w4_gfx950": a8w4_gemm1_kernels_list_gfx950,
+    tag: expand_blockpercu(kdict)
+    for tag, kdict in {
+        "a8w8_gfx950": a8w8_gemm1_kernels_list_gfx950,
+        "a8w8": a8w8_gemm1_kernels_list,
+        "a16w4_gfx950": a16w4_gemm1_kernels_list_gfx950,
+        "a16w4": a16w4_gemm1_kernels_list,
+        "a8w4_gfx950": a8w4_gemm1_kernels_list_gfx950,
+    }.items()
 }
 
 gemm2_kernels_dict = {
-    "a8w8_gfx950": a8w8_gemm2_kernels_list_gfx950,
-    "a8w8": a8w8_gemm2_kernels_list,
-    "a16w4_gfx950": a16w4_gemm2_kernels_list_gfx950,
-    "a16w4": a16w4_gemm2_kernels_list,
-    "a8w4_gfx950": a8w4_gemm2_kernels_list_gfx950,
+    tag: expand_blockpercu(kdict)
+    for tag, kdict in {
+        "a8w8_gfx950": a8w8_gemm2_kernels_list_gfx950,
+        "a8w8": a8w8_gemm2_kernels_list,
+        "a16w4_gfx950": a16w4_gemm2_kernels_list_gfx950,
+        "a16w4": a16w4_gemm2_kernels_list,
+        "a8w4_gfx950": a8w4_gemm2_kernels_list_gfx950,
+    }.items()
 }
 
 

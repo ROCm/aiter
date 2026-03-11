@@ -12,6 +12,7 @@ from gemm_a8w8_blockscale_cktile_instance import (
     default_kernels_cktile_dict,
     TileKernelInstance,
     candidate_kernels_cktile_dict,
+    candidate_kernels_by_name,
 )
 
 """
@@ -46,18 +47,35 @@ class gemm_a8w8_blockscale_codegen:
                 tune_df = tune_df[
                     (tune_df["cu_num"] == cu_num) & (tune_df["libtype"] == "cktile")
                 ].reset_index()
+            # NOTE: Matching by kernelName (not kernelId). The kernelId column in tuned
+            # CSVs is kept for human reference only and is NOT used for kernel selection.
+            # This allows instance lists to be reordered or expanded (e.g. changing
+            # BLOCK_PER_CU_MAX) without invalidating existing tuned CSVs.
+            use_name = "kernelName" in tune_df.columns
+            if not use_name:
+                print("[Warning]: tuned CSV has no kernelName column, falling back to kernelId. "
+                      "Re-run tuner to generate a CSV with kernelName for robust matching.")
             for i in range(len(tune_df)):
                 M = int(tune_df.loc[i, "M"])
                 N = int(tune_df.loc[i, "N"])
                 K = int(tune_df.loc[i, "K"])
-                kid = int(tune_df.loc[i, "kernelId"])
 
-                if kid in candidate_kernels_cktile_dict:
-                    tune_dict[(M, N, K)] = candidate_kernels_cktile_dict[kid]
+                if use_name:
+                    kname = str(tune_df.loc[i, "kernelName"])
+                    if kname in candidate_kernels_by_name:
+                        tune_dict[(M, N, K)] = candidate_kernels_by_name[kname]
+                    else:
+                        print(
+                            f"Warning: kernelName '{kname}' not found for shape ({M}, {N}, {K})"
+                        )
                 else:
-                    print(
-                        f"Warning: kernelId {kid} not found in candidate_kernels_cktile_dict for shape ({M}, {N}, {K})"
-                    )
+                    kid = int(tune_df.loc[i, "kernelId"])
+                    if kid in candidate_kernels_cktile_dict:
+                        tune_dict[(M, N, K)] = candidate_kernels_cktile_dict[kid]
+                    else:
+                        print(
+                            f"Warning: kernelId {kid} not found for shape ({M}, {N}, {K})"
+                        )
 
         return tune_dict
 
