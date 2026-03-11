@@ -33,6 +33,7 @@ def gen_gemm_a16w16_asm_fake_tensors(
     "module_gemm_a16w16_asm",
     fc_name="gemm_a16w16_asm",
     gen_fake=gen_gemm_a16w16_asm_fake_tensors,
+    torch_exclude=True,
 )
 def _gemm_a16w16_asm(
     A: Tensor,
