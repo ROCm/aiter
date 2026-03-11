@@ -185,7 +185,7 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         cxxflags += [
             "-DUSE_ROCM",
             "-DENABLE_FP8",
-            "-O3" if not AITER_DEBUG else "-O0",
+            "-O3",
             "-std=c++20",
             "-DLEGACY_HIPBLAS_DIRECT",
             "-DUSE_PROF_API=1",
@@ -228,17 +228,36 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         archs = validate_and_update_archs()
         cxxflags += [f"--offload-arch={arch}" for arch in archs]
         cxxflags = [flag for flag in set(cxxflags) if hip_flag_checker(flag)]
-        makefile_file = makefile_template.render(
-            includes=[f"-I{include_dir}"], sources=sources, cxxflags=cxxflags
-        )
-        with open(f"{sub_build_dir}/Makefile", "w") as f:
-            f.write(makefile_file)
-        subprocess.run(
-            f"cd {sub_build_dir} && make build -j{len(sources)}",
-            shell=True,
-            capture_output=AITER_LOG_MORE < 2,
-            check=True,
-        )
+
+        if AITER_DEBUG:
+            # Compile directly with absolute paths to get proper debug info
+            abs_sources = [f"{sub_build_dir}/{s}" for s in sources]
+            flags_str = " ".join(cxxflags)
+            include_str = f"-I{include_dir}"
+
+            # Compile each source to object file
+            obj_files = []
+            for src in abs_sources:
+                obj = src.replace(".cpp", ".o")
+                obj_files.append(obj)
+                compile_cmd = f"hipcc -fPIC {flags_str} {include_str} -c {src} -o {obj}"
+                subprocess.run(compile_cmd, shell=True, capture_output=AITER_LOG_MORE < 2, check=True)
+
+            # Link
+            link_cmd = f"hipcc -shared {' '.join(obj_files)} -o {sub_build_dir}/lib.so"
+            subprocess.run(link_cmd, shell=True, capture_output=AITER_LOG_MORE < 2, check=True)
+        else:
+            makefile_file = makefile_template.render(
+                includes=[f"-I{include_dir}"], sources=sources, cxxflags=cxxflags
+            )
+            with open(f"{sub_build_dir}/Makefile", "w") as f:
+                f.write(makefile_file)
+            subprocess.run(
+                f"cd {sub_build_dir} && make build -j{len(sources)}",
+                shell=True,
+                capture_output=AITER_LOG_MORE < 2,
+                check=True,
+            )
 
     def final_func():
         logger.info(
