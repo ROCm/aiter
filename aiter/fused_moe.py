@@ -612,6 +612,7 @@ def nextPow2(n):
         return 1
     return 1 << (n - 1).bit_length()
 
+
 def get_padded_M(M):
     padded_m = M
     if M < 32768:
@@ -619,6 +620,7 @@ def get_padded_M(M):
     else:
         padded_m = 32768
     return padded_m
+
 
 @dataclass
 class MOEMetadata:
