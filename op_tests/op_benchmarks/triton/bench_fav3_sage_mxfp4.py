@@ -132,18 +132,19 @@ def bench_kernel(q, k, v, args, provider):
         ms = triton.testing.do_bench_cudagraph(fn_fused_quant)
         print("fn_fused_quant (ms)", ms)
 
-        fn = lambda: fav3_sage_mxfp4_func(
-            q=q_quantized,
-            k=k_quantized,
-            v=v_quantized,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            bias=delta_s,
-            causal=args.causal,
-            layout=args.layout,
-            config=config,
-        )
+        def fn():
+            return fav3_sage_mxfp4_func(
+                    q=q_quantized,
+                    k=k_quantized,
+                    v=v_quantized,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    bias=delta_s,
+                    causal=args.causal,
+                    layout=args.layout,
+                    config=config,
+                )
 
     ms = triton.testing.do_bench(fn)
     print("kernel (ms)", ms)
