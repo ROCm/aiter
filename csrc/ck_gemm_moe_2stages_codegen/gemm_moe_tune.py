@@ -267,12 +267,12 @@ class FmoeTuner(TunerCommon):
     def run_flydsl_stage2_out(
         a2_qt,
         w1_qt,
-        w2_qt,
+        w2_shuffled,
         sorted_ids,
         sorted_expert_ids,
         sorted_weights,
         num_valid_ids,
-        w2_scale,
+        w2_scale_shuffled,
         a2_scale,
         moe_buf,
         dtype,
@@ -282,9 +282,6 @@ class FmoeTuner(TunerCommon):
         q_type,
         act_type,
     ):
-        w2_shuffled = shuffle_weight(w2_qt, layout=(16, 16))
-        if kparams["b_dtype"] == "fp4" and w2_scale is not None:
-            w2_scale = fp4_utils.e8m0_shuffle(w2_scale)
         return flydsl_moe_stage2(
             inter_states=a2_qt,
             w2=w2_shuffled,
@@ -300,7 +297,7 @@ class FmoeTuner(TunerCommon):
             b_dtype=kparams["b_dtype"],
             out_dtype=kparams["out_dtype"],
             mode=kparams.get("mode", "atomic"),
-            w2_scale=w2_scale,
+            w2_scale=w2_scale_shuffled,
             a2_scale=a2_scale,
             sorted_weights=sorted_weights,
         )
@@ -1899,7 +1896,7 @@ class FmoeTuner(TunerCommon):
                         ),
                         FmoeTuner.run_flydsl_stage2_out,
                         (
-                            [0, 10, 11, 5, 6, 7, 8, 4, 14, 9],
+                            [0, 10, 2, 5, 6, 7, 8, 15, 14, 9],
                             dtype,
                             topk,
                             kparams,
