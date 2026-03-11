@@ -554,7 +554,6 @@ def run_torch_fused_norm_rope_group_quant(
     kv_cache,
     q_out,
     slot_mapping,
-    k_scale,
     q_scale,
     positions,
     cos_cache,
@@ -608,7 +607,7 @@ def run_torch_fused_norm_rope_group_quant(
     num_tokens = k_nope.shape[0]
     # Vectorized version - much faster than nested for loops
     # Concatenate k_nope and k_pe along the last dimension: [num_tokens, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
-    k_concat = torch.cat([k_nope, k_pe], dim=-1)
+    k_concat = k_nope
 
     # Compute block indices and offsets for all tokens at once
     block_indices = slot_mapping // block_size
@@ -619,87 +618,46 @@ def run_torch_fused_norm_rope_group_quant(
     # Note: We need to handle each token separately due to potentially different block_idx/offset combinations
     # But we can still avoid the inner loop over heads
     for i in range(num_tokens):
-        kv_cache[block_indices[i], block_offsets[i], :, :] = k_concat[i]
+        kv_cache[block_indices[i], block_offsets[i], :, :kv_lora_rank] = k_concat[i]
     ##
     if kv_cache_dtype == "fp8":
-        # k_nope group quantization: quantize per-head separately
-        # k_nope_original has shape [num_tokens, num_kv_heads, kv_lora_rank]
-        num_groups_per_head = kv_lora_rank // group_size
-        scaleN_pad = (num_groups_per_head + 7) // 8 * 8
+        # FlashMLA-style tile-based group quantization for k_nope
+        # Ref: https://github.com/deepseek-ai/FlashMLA/blob/48c6dc4/tests/quant.py#L56-L73
+        # Layout per (block, offset, head): [kv_lora_rank fp8 data | num_tiles e8m0 scales]
+        tile_size = group_size
+        num_tiles = kv_lora_rank // tile_size
+        fp8_max = torch.finfo(dtypes.fp8).max
 
-        # k_scale_ref stores uint8 values in a flat buffer
-        total_uint8_values = (
-            kv_cache.shape[0] * kv_cache.shape[1] * num_kv_heads * scaleN_pad
-        )
-        k_scale_ref_uint8 = torch.zeros(
-            total_uint8_values, dtype=torch.uint8, device=k_nope_original.device
-        )
+        def _cast_scale_inv_to_ue8m0(scales_inv):
+            return torch.pow(2, torch.clamp_min(scales_inv, 1e-4).log2().ceil())
 
-        # Process each token
         for i in range(num_tokens):
             block_idx = block_indices[i]
             block_off = block_offsets[i]
 
-            # Quantize EACH kv_head's k_nope separately
             for kv_head in range(num_kv_heads):
-                k_nope_token = k_nope_original[i, kv_head, :]
-                k_nope_for_quant = k_nope_token.reshape(-1, group_size).contiguous()
-                k_nope_quant_token, scales_token = aiter.ops.quant.per_token_quant_hip(
-                    k_nope_for_quant,
-                    None,
-                    dtypes.fp8,
-                    None,
-                    1,
-                )
+                k_data = k_nope_original[i, kv_head, :].float()
 
-                # Extract exponent as uint8 using fp4_utils (matching kernel behavior)
-                scales_f32 = scales_token.squeeze(-1)
-                scales_exponent_e8m0 = fp4_utils.f32_to_e8m0(scales_f32)
-                scales_exponent = scales_exponent_e8m0.view(torch.uint8)
+                for tile_idx in range(num_tiles):
+                    tile_start = tile_idx * tile_size
+                    tile_end = tile_start + tile_size
+                    tile_data = k_data[tile_start:tile_end]
 
-                base_offset = (
-                    block_idx * kv_cache.shape[1] * num_kv_heads * scaleN_pad
-                    + block_off * num_kv_heads * scaleN_pad
-                    + kv_head * scaleN_pad
-                )
+                    cur_scale = tile_data.abs().max() / fp8_max
+                    cur_scale_e8m0 = _cast_scale_inv_to_ue8m0(cur_scale)
 
-                # Store exponents
-                for group_id in range(min(scales_exponent.shape[0], scaleN_pad)):
-                    k_scale_ref_uint8[base_offset + group_id] = scales_exponent[
-                        group_id
-                    ]
+                    quantized_tile = (tile_data / cur_scale_e8m0).to(dtypes.fp8)
+                    kv_cache[block_idx, block_off, kv_head, tile_start:tile_end] = (
+                        quantized_tile
+                    )
 
-                # Write quantized k_nope back to kv_cache
-                k_nope_quant_reshaped = k_nope_quant_token.reshape(-1)
-                kv_cache[block_idx, block_off, kv_head, :kv_lora_rank] = (
-                    k_nope_quant_reshaped
-                )
+                    # Store e8m0 scale byte into kv_cache after data region
+                    scale_byte = fp4_utils.f32_to_e8m0(cur_scale_e8m0.unsqueeze(0))
+                    kv_cache.view(torch.uint8)[
+                        block_idx, block_off, kv_head, kv_lora_rank + tile_idx
+                    ] = scale_byte.view(torch.uint8)[0]
 
-        # Convert to float32 buffer for comparison
-        num_float32 = (total_uint8_values + 3) // 4
-        k_scale_ref = torch.zeros(
-            num_float32, dtype=torch.float32, device=k_nope_original.device
-        )
-        k_scale_ref.view(torch.uint8)[:total_uint8_values] = k_scale_ref_uint8
-
-        k_scale = k_scale_ref
-        k_nope_quant = k_nope_original  # Not used after this
-    else:
-        # In non-fp8 mode, no quantization is needed
-        k_nope_quant = k_nope  # For swap logic below
-
-    # Swap nope and pe if needed (only affects the layout, not values)
-
-    if is_nope_first:
-        kv_cache_swapped = kv_cache
-    else:
-        kv_cache_swapped = torch.cat(
-            [
-                kv_cache[..., k_nope_quant.shape[-1] :],
-                kv_cache[..., : k_nope_quant.shape[-1]],
-            ],
-            dim=-1,
-        )
+    kv_cache_swapped = kv_cache
     if out_dtype == dtypes.fp8:
         q_nope_scale = (q_nope.to(torch.float32) / q_scale.item()).to(out_dtype)
         q_pe_scale = (q_pe.to(torch.float32) / q_scale.item()).to(out_dtype)
@@ -712,9 +670,10 @@ def run_torch_fused_norm_rope_group_quant(
             q_out = torch.cat((q_nope, q_pe), dim=-1)
         else:
             q_out = torch.cat((q_pe, q_nope), dim=-1)
-    return kv_cache_swapped, q_out, k_scale
+    return kv_cache_swapped, k_pe, q_out
 
 
+@perftest()
 def run_aiter_fused_norm_rope_group_quant(
     q_nope,
     q_pe,
@@ -724,7 +683,6 @@ def run_aiter_fused_norm_rope_group_quant(
     kv_cache,
     q_out,
     slot_mapping,
-    k_scale,
     q_scale,
     positions,
     cos_cache,
@@ -734,8 +692,7 @@ def run_aiter_fused_norm_rope_group_quant(
     is_neox,
     is_nope_first,
 ):
-
-    aiter.fused_qk_norm_rope_group_quantconcat_and_cache_mla(
+    aiter.fused_qk_norm_rope_group_quant_concat_and_cache_mla(
         q_nope,
         q_pe,
         kv_c,
@@ -744,7 +701,6 @@ def run_aiter_fused_norm_rope_group_quant(
         kv_cache,
         q_out,
         slot_mapping,
-        k_scale,
         q_scale,
         positions,
         cos_cache,
@@ -754,7 +710,7 @@ def run_aiter_fused_norm_rope_group_quant(
         is_neox,
         is_nope_first,
     )
-    return kv_cache, q_out, k_scale
+    return kv_cache
 
 
 @benchmark()
@@ -795,29 +751,14 @@ def test_fused_qk_norm_rope_group_quant_concat_and_cache_mla(
         num_tokens, num_heads, qk_rope_head_dim, dtype=dtype, device=device
     )
     k_weight = torch.ones(kv_lora_rank, dtype=dtype, device=device)
-    entry_size = kv_lora_rank + qk_rope_head_dim
+    # d=512, d_nope=448
+    d = kv_lora_rank + qk_rope_head_dim
+    entry_size = d  # + qk_rope_head_dim
     cos_cache, sin_cache = compute_cache(num_tokens, qk_rope_head_dim // 2, dtype)
     cos_cache = cos_cache.to(device)
     sin_cache = sin_cache.to(device)
 
     pos = torch.randint(0, num_tokens, (num_tokens,), device=device)
-    # k_scale stores uint8 exponents, but allocated as float32
-    # Kernel writes: reinterpret_cast<uint8_t*>(k_scale)[offset] = exponent
-    # Total uint8 values needed: num_blocks * block_size * num_kv_heads * scaleN_pad
-    # Since we allocate as float32 (4 bytes each), we need: total_uint8 / 4 float32 elements
-    num_groups = kv_lora_rank // group_size
-    scaleN_pad = (num_groups + 7) // 8 * 8  # Pad to multiple of 8
-
-    # Total uint8 values = num_blocks * block_size * num_kv_heads * scaleN_pad
-    # Allocate as float32, so divide by 4 (4 bytes per float32)
-    total_uint8_values = num_blocks * block_size * num_kv_heads * scaleN_pad
-    num_float32_elements = (total_uint8_values + 3) // 4  # Round up
-
-    k_scale = torch.empty(
-        num_float32_elements,
-        dtype=torch.float32,
-        device=device,
-    )
     q_scale = torch.tensor(1, dtype=torch.float32, device=device)
     cache_dtype = dtypes.fp8 if kv_cache_dtype == "fp8" else dtype
     q_out_dtype = dtypes.fp8 if q_dtype == "fp8" else dtype
@@ -842,7 +783,7 @@ def test_fused_qk_norm_rope_group_quant_concat_and_cache_mla(
         device=q_nope.device,
     )
     ref_temp = torch.zeros(*kv_cache.shape, dtype=cache_dtype, device=device)
-    ref_kv_cache, ref_q_out, ref_k_scale = run_torch_fused_norm_rope_group_quant(
+    ref_kv_cache, ref_k_pe, ref_q_out = run_torch_fused_norm_rope_group_quant(
         q_nope,
         q_pe,
         kv_c,
@@ -851,7 +792,6 @@ def test_fused_qk_norm_rope_group_quant_concat_and_cache_mla(
         ref_temp,
         q_out,
         slot_mapping,
-        k_scale,
         q_scale,
         pos,
         cos_cache,
@@ -863,9 +803,28 @@ def test_fused_qk_norm_rope_group_quant_concat_and_cache_mla(
         q_out_dtype,
         kv_cache_dtype,
     )
-
-    (kv_cache, q_out, k_scale), avg_us = run_perftest(
-        run_aiter_fused_norm_rope_group_quant,
+    # Correctness run: clone k_pe so in-place RoPE doesn't corrupt the original
+    k_pe_out = k_pe.clone()
+    aiter.fused_qk_norm_rope_group_quant_concat_and_cache_mla(
+        q_nope,
+        q_pe,
+        kv_c,
+        k_pe_out,
+        k_weight,
+        kv_cache,
+        q_out,
+        slot_mapping,
+        q_scale,
+        pos,
+        cos_cache,
+        sin_cache,
+        1e-6,
+        group_size,
+        is_neox,
+        is_nope_first,
+    )
+    # Perf run: k_pe already RoPE'd, timing is accurate (no clone overhead)
+    kv_cache, avg_us = run_aiter_fused_norm_rope_group_quant(
         q_nope,
         q_pe,
         kv_c,
@@ -874,7 +833,6 @@ def test_fused_qk_norm_rope_group_quant_concat_and_cache_mla(
         kv_cache,
         q_out,
         slot_mapping,
-        k_scale,
         q_scale,
         pos,
         cos_cache,
@@ -889,72 +847,88 @@ def test_fused_qk_norm_rope_group_quant_concat_and_cache_mla(
     kv_cache = kv_cache.reshape(
         num_tokens // block_size, block_size, num_kv_heads, entry_size
     )
+    num_tiles = kv_lora_rank // group_size
     if kv_cache_dtype == "fp8" and q_dtype == "fp8":
-        kv_result_temp = kv_cache.to(torch.float32)
-        kv_expected_temp = ref_kv_cache.to(torch.float32)
-        q_result_tmp = q_out.to(torch.float32) * q_scale
-        q_expected_tmp = ref_q_out.to(torch.float32) * q_scale
-        err_kv = checkAllclose(kv_result_temp, kv_expected_temp, atol=0.01, rtol=0.01)
-        err_q_out = checkAllclose(q_result_tmp, q_expected_tmp, atol=0.01, rtol=0.01)
-        err_k_scale = checkAllclose(
-            k_scale, ref_k_scale, msg="fp8 kscale result compared with ref"
-        )
-    elif kv_cache_dtype == "fp8" and q_dtype == "auto":
-        kv_result_temp = kv_cache.to(torch.float32)
-        kv_expected_temp = ref_kv_cache.to(torch.float32)
-        err_kv = checkAllclose(
-            kv_result_temp,
-            kv_expected_temp,
+        err_k_pe = checkAllclose(
+            k_pe_out.to(torch.float32),
+            ref_k_pe.to(torch.float32),
             atol=0.01,
             rtol=0.01,
-            msg="fp8 kv result compared with ref",
+            msg="k_pe inplace rope compared with ref",
+        )
+        err_kv = checkAllclose(
+            kv_cache[..., :kv_lora_rank].to(torch.float32),
+            ref_kv_cache[..., :kv_lora_rank].to(torch.float32),
+            atol=0.01,
+            rtol=0.01,
+            msg="fp8 kv nope data compared with ref",
         )
         err_q_out = checkAllclose(
-            q_out, ref_q_out, msg="bf16 qout result compared with ref"
+            q_out.to(torch.float32) * q_scale,
+            ref_q_out.to(torch.float32) * q_scale,
+            atol=0.01,
+            rtol=0.01,
+            msg="fp8 qout compared with ref",
         )
-
-        # Compare k_scale by converting uint8 exponents back to float32
-        scaleN_pad = (kv_lora_rank // group_size + 7) // 8 * 8
-        total_uint8_values = num_blocks * block_size * num_kv_heads * scaleN_pad
-
-        k_scale_uint8 = k_scale.view(torch.uint8)[:total_uint8_values]
-        ref_k_scale_uint8 = ref_k_scale.view(torch.uint8)[:total_uint8_values]
-
-        # Convert uint8 exponents back to float32 for comparison
-        k_scale_e8m0 = k_scale_uint8.view(dtypes.fp8_e8m0)
-        ref_k_scale_e8m0 = ref_k_scale_uint8.view(dtypes.fp8_e8m0)
-
-        k_scale_f32 = fp4_utils.e8m0_to_f32(k_scale_e8m0)
-        ref_k_scale_f32 = fp4_utils.e8m0_to_f32(ref_k_scale_e8m0)
-
-        # Reshape to [num_blocks, block_size, num_kv_heads, scaleN_pad] for better visualization
-        shape_4d = (num_blocks, block_size, num_kv_heads, scaleN_pad)
-        k_scale_f32 = k_scale_f32.reshape(shape_4d)
-        ref_k_scale_f32 = ref_k_scale_f32.reshape(shape_4d)
-
         err_k_scale = checkAllclose(
-            k_scale_f32,
-            ref_k_scale_f32,
-            atol=0.001,
-            rtol=0.05,
-            msg="fp8 kscale result compared with ref",
+            kv_cache.view(torch.uint8)[..., kv_lora_rank : kv_lora_rank + num_tiles],
+            ref_kv_cache.view(torch.uint8)[
+                ..., kv_lora_rank : kv_lora_rank + num_tiles
+            ],
+            msg="fp8 kscale (in kv_cache) compared with ref",
         )
-
+    elif kv_cache_dtype == "fp8" and q_dtype == "auto":
+        err_k_pe = checkAllclose(
+            k_pe_out.to(torch.float32),
+            ref_k_pe.to(torch.float32),
+            atol=0.01,
+            rtol=0.01,
+            msg="k_pe inplace rope compared with ref",
+        )
+        err_kv = checkAllclose(
+            kv_cache[..., :kv_lora_rank].to(torch.float32),
+            ref_kv_cache[..., :kv_lora_rank].to(torch.float32),
+            atol=0.01,
+            rtol=0.01,
+            msg="fp8 kv nope data compared with ref",
+        )
+        err_q_out = checkAllclose(
+            q_out,
+            ref_q_out,
+            msg="bf16 qout result compared with ref",
+        )
+        err_k_scale = checkAllclose(
+            kv_cache.view(torch.uint8)[..., kv_lora_rank : kv_lora_rank + num_tiles],
+            ref_kv_cache.view(torch.uint8)[
+                ..., kv_lora_rank : kv_lora_rank + num_tiles
+            ],
+            msg="fp8 kscale (in kv_cache) compared with ref",
+        )
     else:
         err_kv = checkAllclose(
-            kv_cache, ref_kv_cache, msg="bf16 kv result compared with ref"
+            kv_cache,
+            ref_kv_cache,
+            msg="bf16 kv result compared with ref",
         )
-
         err_q_out = checkAllclose(
-            q_out, ref_q_out, msg="bf16 qout result compared with ref"
+            q_out,
+            ref_q_out,
+            msg="bf16 qout result compared with ref",
+        )
+        err_k_pe = checkAllclose(
+            k_pe_out.to(torch.float32),
+            ref_k_pe.to(torch.float32),
+            atol=0.01,
+            rtol=0.01,
+            msg="k_pe inplace rope compared with ref",
         )
         err_k_scale = 0.0
 
     ret["fused_qk_us"] = avg_us
-    # ret["unfused_us"] = ref_us
     ret["hip_kv_err"] = err_kv
     ret["hip_q_err"] = err_q_out
     ret["hip_k_scale_err"] = err_k_scale
+    ret["hip_k_pe_err"] = err_k_pe
     ####
     ret["aiter_bw(TB/s)"] = (
         num_tokens
