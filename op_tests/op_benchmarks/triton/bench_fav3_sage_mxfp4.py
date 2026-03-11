@@ -62,17 +62,19 @@ def bench_kernel(q, k, v, args, provider):
     R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (BLOCK_R**0.5)
 
     if args.include_quant_overhead:
+
         def fn():
             return fav3_sage_mxfp4_wrapper(
-            q,
-            k,
-            v,
-            causal=args.causal,
-            layout=args.layout,
-            q_smooth=args.qsmooth,
-            hadamard_rotation=args.hadamard_rotate,
-            R=R,
-        )
+                q,
+                k,
+                v,
+                causal=args.causal,
+                layout=args.layout,
+                q_smooth=args.qsmooth,
+                hadamard_rotation=args.hadamard_rotate,
+                R=R,
+            )
+
     else:
         config = get_sage_fwd_configs_mxfp4()
 
@@ -99,6 +101,7 @@ def bench_kernel(q, k, v, args, provider):
             BLOCK_R=BLOCK_R,
             q_smoothing=args.qsmooth,
         )
+
         def fn():
             return fav3_sage_mxfp4_func(
                 q=q_quantized,
