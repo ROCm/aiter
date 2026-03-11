@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 // #ifdef __gfx908__
 // // Uncomment ifdef and endif only if you need to undef the HIP_HALF ops below
 // just for gfx908 and not for others
@@ -101,7 +101,9 @@ torch::Tensor dTensor;
 std::map<at::ScalarType, hipDataType> dtype_map{{at::kHalf, HIP_R_16F},
                                                 {at::kBFloat16, HIP_R_16BF},
                                                 {at::kFloat, HIP_R_32F},
-                                                {at::kChar, HIP_R_8I}
+                                                {at::kChar, HIP_R_8I},
+                                                {at::kShort, HIP_R_16I},
+                                                {at::kInt, HIP_R_32I}
 #ifdef ENABLE_TORCH_FP8
                                                 ,
                                                 {at::kFloat8_e4m3fnuz, HIP_R_8F_E4M3_FNUZ},
@@ -910,6 +912,22 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
                                                             request_solutions,
                                                             heuristicResult.data(),
                                                             &returnedAlgoCount));
+        if(returnedAlgoCount == 0)
+        {
+            std::cerr << "Error: hipblasLtMatmulAlgoGetHeuristic found 0 valid solutions for "
+                      << (op_A == HIPBLAS_OP_N ? "N" : "T") << (op_B == HIPBLAS_OP_N ? "N" : "T")
+                      << " (" << m << ", " << n << ", " << k << "), intype: " << intype
+                      << ", outtype: " << outtype
+                      << ", use_rowwise: " << use_rowwise
+                      << ", bpreshuffle: " << bpreshuffle
+                      << "request_solutions: " << request_solutions
+                      << std::endl;
+            CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescDestroy(matmul));
+            CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutDestroy(matA));
+            CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutDestroy(matB));
+            CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutDestroy(matC));
+            TORCH_CHECK(false, "hipblasLtMatmulAlgoGetHeuristic found 0 valid solutions");
+        }
         if((returnedAlgoCount != request_solutions) && cout_print)
         {
             std::cout << "less solution found! request: " << request_solutions
