@@ -6,29 +6,41 @@ import triton.language as tl
 
 
 @triton.jit
-def _shuffled_weight_offset(offs_n, offs_k, KV_CDim: tl.constexpr):
-    """Compute linear offset into a weight matrix that has been preshuffled
-    via shuffle_weight(layout=(16,16)) for fp8.
+def _load_unshuffle_segment(base_ptr, seg_idx,
+                            QkNopeHeadDim: tl.constexpr,
+                            KV_CDim: tl.constexpr,
+                            ScaleKGranularity: tl.constexpr):
+    """Load one [QkNopeHeadDim, ScaleKGranularity] weight segment from a
+    preshuffled weight matrix via coalesced row-major loads, then unshuffle
+    in registers.
 
-    shuffle_weight transforms [N, K] with tile (BN=16, BK=32, K_pack=16):
-      view(N//16, 16, K//32, 2, 16)  ->  permute(0, 1, 3, 4, 2, 5)  ->  view(N, K)
-    Permuted shape: [batch, n_blk, k_blk, k_half, n_local, k_local]
-
-    flat offset = n_blk * (KV_CDim // 32) * 512
-               + k_blk * 512 + k_half * 256 + n_local * 16 + k_local
+    Each n_blk (16 original N rows) occupies KV_CDim//32 shuffled rows.
+    A ScaleK segment of 128 K values spans SegKBlocks=4 consecutive rows
+    within each n_blk.  We gather these rows across all n_blks (with row
+    stride KV_CDim), producing a [NumNBlk*SegKBlocks, KV_CDim] tensor,
+    then reshape + permute to recover [QkNopeHeadDim, ScaleKGranularity].
     """
-    n_blk = offs_n // 16
-    n_local = offs_n % 16
-    k_blk = offs_k // 32
-    k_half = (offs_k % 32) // 16
-    k_local = offs_k % 16
-    return (
-        n_blk[:, None] * ((KV_CDim // 32) * 512)
-        + k_blk[None, :] * 512
-        + k_half[None, :] * 256
-        + n_local[:, None] * 16
-        + k_local[None, :]
+    NumNBlk: tl.constexpr = QkNopeHeadDim // 16
+    SegKBlocks: tl.constexpr = ScaleKGranularity // 32
+    NumKBlkTotal: tl.constexpr = KV_CDim // 32
+    TotalRows: tl.constexpr = NumNBlk * SegKBlocks
+
+    offs_nb = tl.arange(0, NumNBlk)
+    offs_kb = tl.arange(0, SegKBlocks)
+    row_indices = offs_nb[:, None] * NumKBlkTotal + seg_idx * SegKBlocks + offs_kb[None, :]
+    row_indices_flat = tl.reshape(row_indices, (TotalRows,))
+
+    offs_col = tl.arange(0, KV_CDim)
+    raw = tl.load(base_ptr + row_indices_flat[:, None] * KV_CDim + offs_col[None, :])
+
+    w = tl.reshape(
+        tl.permute(
+            tl.reshape(raw, (NumNBlk, SegKBlocks, 2, 16, 16)),
+            (0, 3, 1, 2, 4),
+        ),
+        (QkNopeHeadDim, ScaleKGranularity),
     )
+    return w
 
 
 @triton.jit
@@ -103,15 +115,15 @@ def _triton_gather_kv_b_proj(
     v_head_base = k_head_base + QkNopeHeadDim * KV_CDim
 
     if WEIGHT_PRESHUFFLE:
-        k_nope_weight_0 = tl.load(k_head_base + _shuffled_weight_offset(offs_n, offs_k + 0 * ScaleKGranularity, KV_CDim)).to(k_type)
-        k_nope_weight_1 = tl.load(k_head_base + _shuffled_weight_offset(offs_n, offs_k + 1 * ScaleKGranularity, KV_CDim)).to(k_type)
-        k_nope_weight_2 = tl.load(k_head_base + _shuffled_weight_offset(offs_n, offs_k + 2 * ScaleKGranularity, KV_CDim)).to(k_type)
-        k_nope_weight_3 = tl.load(k_head_base + _shuffled_weight_offset(offs_n, offs_k + 3 * ScaleKGranularity, KV_CDim)).to(k_type)
+        k_nope_weight_0 = _load_unshuffle_segment(k_head_base, 0, QkNopeHeadDim, KV_CDim, ScaleKGranularity).to(k_type)
+        k_nope_weight_1 = _load_unshuffle_segment(k_head_base, 1, QkNopeHeadDim, KV_CDim, ScaleKGranularity).to(k_type)
+        k_nope_weight_2 = _load_unshuffle_segment(k_head_base, 2, QkNopeHeadDim, KV_CDim, ScaleKGranularity).to(k_type)
+        k_nope_weight_3 = _load_unshuffle_segment(k_head_base, 3, QkNopeHeadDim, KV_CDim, ScaleKGranularity).to(k_type)
 
-        v_nope_weight_0 = tl.load(v_head_base + _shuffled_weight_offset(offs_n, offs_k + 0 * ScaleKGranularity, KV_CDim)).to(k_type)
-        v_nope_weight_1 = tl.load(v_head_base + _shuffled_weight_offset(offs_n, offs_k + 1 * ScaleKGranularity, KV_CDim)).to(k_type)
-        v_nope_weight_2 = tl.load(v_head_base + _shuffled_weight_offset(offs_n, offs_k + 2 * ScaleKGranularity, KV_CDim)).to(k_type)
-        v_nope_weight_3 = tl.load(v_head_base + _shuffled_weight_offset(offs_n, offs_k + 3 * ScaleKGranularity, KV_CDim)).to(k_type)
+        v_nope_weight_0 = _load_unshuffle_segment(v_head_base, 0, QkNopeHeadDim, KV_CDim, ScaleKGranularity).to(k_type)
+        v_nope_weight_1 = _load_unshuffle_segment(v_head_base, 1, QkNopeHeadDim, KV_CDim, ScaleKGranularity).to(k_type)
+        v_nope_weight_2 = _load_unshuffle_segment(v_head_base, 2, QkNopeHeadDim, KV_CDim, ScaleKGranularity).to(k_type)
+        v_nope_weight_3 = _load_unshuffle_segment(v_head_base, 3, QkNopeHeadDim, KV_CDim, ScaleKGranularity).to(k_type)
     else:
         k_nope_weight_base_offset = (
             k_head_base
