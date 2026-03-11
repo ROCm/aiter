@@ -28,7 +28,7 @@ jobs:
       - name: Download wheel artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: aiter-wheels-py*
+          pattern: aiter-whl-packages-py*
           path: dist
           merge-multiple: true
 
