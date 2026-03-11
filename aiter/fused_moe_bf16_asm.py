@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
 from dataclasses import dataclass
@@ -8,6 +7,7 @@ from typing import Optional
 
 import pandas as pd
 import torch
+import torch.nn.functional as F
 
 import aiter
 from aiter import (
@@ -719,7 +719,6 @@ def asm_moe(
         global_E = expert_mask.numel()
     M, topk = topk_ids.shape
     dtype = hidden_states.dtype
-    device = topk_ids.device
     lastdim_mul = 8 if w1.dtype in {dtypes.i32, torch.uint32} else 1
 
     # Check for 2-stage execution
