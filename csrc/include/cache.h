@@ -103,7 +103,7 @@ void fused_qk_rope_concat_and_cache_mla(
     bool is_neox,
     bool is_nope_first);
 
-void fused_qk_norm_rope_group_quantconcat_and_cache_mla(
+void fused_qk_norm_rope_group_quant_concat_and_cache_mla(
     torch::Tensor& q_nope,        // [num_tokens, num_heads, qk_lora_rank]
     torch::Tensor& q_pe,          // [num_tokens, num_heads, pe_dim]
     torch::Tensor& kv_c,          // [num_tokens, k_num_heads, kv_lora_rank]
@@ -112,7 +112,6 @@ void fused_qk_norm_rope_group_quantconcat_and_cache_mla(
     torch::Tensor& kv_cache,      // [num_blocks, block_size, k_num_heads, kv_lora_rank + pe_dim)]
     torch::Tensor& q_out,         // [num_tokens, num_heads, qk_lora_rank+pe_dim]
     torch::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
-    torch::Tensor& k_scale,       // [num_blocks, block_size, head_size // GROUP_SIZE] e8m0_t scale for k
     torch::Tensor& q_scale,       // scale for q
     torch::Tensor& positions,     // [num_tokens]
     torch::Tensor &cos_cache,     // [max_position, rot_dim//2]

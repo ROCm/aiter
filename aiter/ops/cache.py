@@ -137,7 +137,7 @@ def fused_qk_rope_concat_and_cache_mla(
 
 
 @compile_ops("module_cache")
-def fused_qk_norm_rope_group_quantconcat_and_cache_mla(
+def fused_qk_norm_rope_group_quant_concat_and_cache_mla(
     q_nope: Tensor,  # [num_tokens, num_heads, qk_lora_rank]
     q_pe: Tensor,  # [num_tokens, num_heads, pe_dim]
     kv_c: Tensor,  # [num_tokens, k_num_heads, kv_lora_rank]
@@ -146,7 +146,6 @@ def fused_qk_norm_rope_group_quantconcat_and_cache_mla(
     kv_cache: Tensor,  # [num_blocks, block_size, k_num_heads, kv_lora_rank + pe_dim)]
     q_out: Tensor,  # [num_tokens, num_heads, qk_lora_rank+pe_dim]
     slot_mapping: Tensor,  # [num_tokens]
-    k_scale: Tensor,  # [num_blocks, block_size, head_size // GROUP_SIZE] e8m0_t scale for k
     q_scale: Tensor,  # scale for q
     positions: Tensor,  # [num_tokens]
     cos_cache: Tensor,  # [max_position, rot_dim//2]
