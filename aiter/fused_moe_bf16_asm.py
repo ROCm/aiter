@@ -236,9 +236,25 @@ def get_asm_int8_config(
     if is_smoothquant and (
         dtype == dtypes.i8 or dtype == torch.int8 or str(dtype) == "torch.int8"
     ):
-        # Check if inter_dim is supported by the 2-stage Int8 kernel
+        # Check if inter_dim is supported by the 2-stage Int8 kernel.
+        # block_m must match available tile_m in the multix CSV
+        # (smoothquant 2-stage always uses multix path).
+        # Available multix kernels: 64x384, 64x320, 64x192, 48x128, 32x128
         if inter_dim % 384 == 0:
-            # The available kernel uses 64x384 tile, so block_m must be 64
+            config.run_2stage = True
+            config.block_m = 64
+            config.ksplit = 0
+            config.kernelName1 = ""
+            config.kernelName2 = ""
+            return config
+        elif inter_dim % 320 == 0:
+            config.run_2stage = True
+            config.block_m = 64
+            config.ksplit = 0
+            config.kernelName1 = ""
+            config.kernelName2 = ""
+            return config
+        elif inter_dim % 192 == 0:
             config.run_2stage = True
             config.block_m = 64
             config.ksplit = 0
@@ -246,9 +262,8 @@ def get_asm_int8_config(
             config.kernelName2 = ""
             return config
         elif inter_dim % 128 == 0:
-            # Support for 80x128 tile
             config.run_2stage = True
-            config.block_m = 80
+            config.block_m = 48
             config.ksplit = 0
             config.kernelName1 = ""
             config.kernelName2 = ""
