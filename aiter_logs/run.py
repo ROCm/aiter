@@ -71,7 +71,7 @@ def parse(json_file_path, output_file_name, function_name):
     sorted_kernels = sorted(kernels, key=lambda x: (x["ts"], x["pid"]))
 
     csv_file_name = output_file_name + ".csv"
-    json_file_out = output_file_name + ".json"
+    json_file_out = output_file_name + ".json.gz"
 
     json_data_out = {}
     json_data_out.setdefault("traceEvents", []).append({})
@@ -153,7 +153,7 @@ def parse(json_file_path, output_file_name, function_name):
                 i = 0
             i = i + 1
 
-        with open(json_file_out, "w") as jsonfileout:
+        with gzip.open(json_file_out, "wt") as jsonfileout:
             json.dump(json_data_out, jsonfileout, indent=4)
 
     print(f"Data successfully written to {csv_file_name} and {json_file_out}.")

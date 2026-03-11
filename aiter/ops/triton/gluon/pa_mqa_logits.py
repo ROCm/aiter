@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import math
 import triton
 import triton.language as tl
 
@@ -32,7 +31,7 @@ except ImportError:
 # for some newer triton>=3.5 version, a 3D instr_shape is required.
 try:
     _: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=3,
+        version=4,
         instr_shape=[16, 16],
         transposed=False,
         warps_per_cta=[1, 1],
@@ -124,7 +123,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
     )
 
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=3,
+        version=4,
         instr_shape=[16, 16],
         transposed=False,
         warps_per_cta=[1, NumWarps],
@@ -351,7 +350,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
 
     if _Use_2d_instr_shape_mfma_layout:
         mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=3,
+            version=4,
             instr_shape=[16, 16],
             transposed=False,
             warps_per_cta=[1, NumWarps],
@@ -359,7 +358,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
         )
     else:
         mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=3,
+            version=4,
             instr_shape=[16, 16, 32],
             transposed=False,
             warps_per_cta=[1, NumWarps],
@@ -1145,7 +1144,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
 
     if _Use_2d_instr_shape_mfma_layout:
         mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=3,
+            version=4,
             instr_shape=[16, 16],
             transposed=False,
             warps_per_cta=[1, NumWarps],
@@ -1153,7 +1152,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
         )
     else:
         mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=3,
+            version=4,
             instr_shape=[16, 16, 32],
             transposed=False,
             warps_per_cta=[1, NumWarps],
