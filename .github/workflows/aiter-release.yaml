@@ -120,6 +120,8 @@ jobs:
       - name: Checkout aiter repo
         if: ${{ matrix.build_enabled }}
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history and tags for version generation
 
       - name: Checkout to user-specified commit (if provided)
         if: ${{ matrix.build_enabled }}
