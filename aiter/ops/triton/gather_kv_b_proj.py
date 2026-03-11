@@ -39,7 +39,7 @@ def gather_kv_b_proj(
     assert ChunkK % block_size == 0
 
     grid = (batch_size * tp_k_head_num_k,)
-    kernel = _triton_gather_kv_b_proj[grid](
+    _triton_gather_kv_b_proj[grid](
         batch_size,
         k_buffer,
         k_scale,
