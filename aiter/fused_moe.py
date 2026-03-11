@@ -631,6 +631,54 @@ class MOEMetadata:
     use_non_temporal_load: bool = True
 
 
+def _flydsl_stage1_wrapper(
+    hidden_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    block_m=32,
+    kernelName="",
+    a1_scale=None,
+    w1_scale=None,
+    sorted_weights=None,
+    **_kwargs,
+):
+    parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
+    if parsed is None:
+        raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
+    if not hasattr(_flydsl_stage1_wrapper, "_logged"):
+        _flydsl_stage1_wrapper._logged = True
+        logger.info(
+            f"[FlyDSL stage1] shapes: hidden={hidden_states.shape} w1={w1.shape} "
+            f"out={out.shape} a1_scale={a1_scale.shape if a1_scale is not None else None} "
+            f"w1_scale={w1_scale.shape if w1_scale is not None else None} "
+            f"sorted_weights={sorted_weights is not None}"
+        )
+
+    return aiter.ops.flydsl.flydsl_moe_stage1(
+        a=hidden_states,
+        w1=w1,
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        out=out,
+        topk=topk,
+        tile_m=parsed["tile_m"],
+        tile_n=parsed["tile_n"],
+        tile_k=parsed["tile_k"],
+        a_dtype=parsed["a_dtype"],
+        b_dtype=parsed["b_dtype"],
+        out_dtype=parsed["out_dtype"],
+        w1_scale=w1_scale,
+        a1_scale=a1_scale,
+        sorted_weights=sorted_weights,
+    )
+
+
 def _flydsl_stage2_wrapper(
     inter_states,
     w1,
@@ -650,6 +698,7 @@ def _flydsl_stage2_wrapper(
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
+    mode = parsed.get("mode", "atomic")
     aiter.ops.flydsl.flydsl_moe_stage2(
         inter_states=inter_states,
         w2=w2,
@@ -664,7 +713,7 @@ def _flydsl_stage2_wrapper(
         a_dtype=parsed["a_dtype"],
         b_dtype=parsed["b_dtype"],
         out_dtype=parsed["out_dtype"],
-        mode=parsed.get("mode", "atomic"),
+        mode=mode,
         w2_scale=w2_scale,
         a2_scale=a2_scale,
         sorted_weights=sorted_weights,
@@ -952,6 +1001,8 @@ def get_2stage_cfgs(
         )
 
     if (kernelName1 and "ck2stages" in kernelName1) or (
+        kernelName1 and kernelName1.startswith("flydsl_")
+    ) or (
         not kernelName1
         and (
             (q_type == QuantType.per_1x128 and doweight_stage1)
@@ -978,8 +1029,13 @@ def get_2stage_cfgs(
                 quant_type=q_type,
                 use_non_temporal_load=use_non_temporal_load,
             )
-        return MOEMetadata(
-            functools.partial(
+        if kernelName1 and kernelName1.startswith("flydsl_") and is_flydsl_available():
+            stage1_func = functools.partial(
+                _flydsl_stage1_wrapper,
+                kernelName=kernelName1,
+            )
+        else:
+            stage1_func = functools.partial(
                 ck_moe_stage1,
                 kernelName=kernelName1,
                 activation=activation,
@@ -987,7 +1043,9 @@ def get_2stage_cfgs(
                 dtype=dtype,
                 splitk=ksplit,
                 use_non_temporal_load=use_non_temporal_load,
-            ),
+            )
+        return MOEMetadata(
+            stage1_func,
             stage2_func,
             block_m,
             int(ksplit),

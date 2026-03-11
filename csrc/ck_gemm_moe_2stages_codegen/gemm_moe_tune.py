@@ -1794,25 +1794,32 @@ class FmoeTuner(TunerCommon):
             doweight_stage1,
         ) = info
 
-        if q_type != QuantType.per_1x32 or q_dtype_w != dtypes.fp4x2:
-            return tasks_flydsl
-
         _a_dtype_map = {
             dtypes.fp8: "fp8",
             dtypes.fp4x2: "fp4",
             dtypes.fp16: "fp16",
             dtypes.bf16: "fp16",
         }
-        a_dtype_str = _a_dtype_map.get(q_dtype_a, "fp8")
-        b_dtype_str = "fp4"
+        _w_dtype_map = {
+            dtypes.fp4x2: "fp4",
+            dtypes.fp8: "fp8",
+        }
         out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
 
-        if a_dtype_str != "fp4":
+        if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp4x2:
+            a_dtype_str = _a_dtype_map.get(q_dtype_a, "fp8")
+            b_dtype_str = "fp4"
+        elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
+            a_dtype_str = "fp8"
+            b_dtype_str = "fp8"
+        else:
+            return tasks_flydsl
+
+        if a_dtype_str != "fp4" and b_dtype_str != "fp8":
             flydsl_s1_kernels = get_flydsl_stage1_kernels(
                 a_dtype_str, b_dtype_str, out_dtype_str
             )
         else:
-            # TODO: stage1 support fp4
             flydsl_s1_kernels = {}
         flydsl_s2_kernels = get_flydsl_stage2_kernels(
             a_dtype_str, b_dtype_str, out_dtype_str
