@@ -130,6 +130,7 @@ def asm_moe(
                 fc2_scale,
                 fc1_smooth_scale,
                 fc2_smooth_scale,
+                activation,
             )
         else:
             raise ValueError(f"Invalid args: {w1.dtype} {w1.shape=} {w2.shape=}")
