@@ -329,7 +329,9 @@ def rotation_smooth_qk(
         assert (
             BLOCK_R is not None
         ), "if not passing R (hadamard matrix), BLOCK_R (size of the hadamard matrix) must be provided."
-        R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (BLOCK_R**0.5)
+        R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (
+            BLOCK_R**0.5
+        )
     else:
         BLOCK_R = R.shape[-1]
 
@@ -465,7 +467,9 @@ def smooth_rotate_downcast_qk(
             assert (
                 BLOCK_R is not None
             ), "if using hadamard rotation, BLOCK_R (size of the hadamard matrix) must be provided."
-            R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (BLOCK_R**0.5)
+            R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (
+                BLOCK_R**0.5
+            )
         else:
             BLOCK_R = R.shape[-1]
 
