@@ -459,11 +459,7 @@ def _run_asm_moe_int8(
                 a8, hidden_states, fc1_smooth_scale, topk_ids, a8_scale
             )
     else:
-        if (
-            w1.dtype == dtypes.fp8
-            or w1.dtype == dtypes.i32
-            and w1.dtype == torch.uint32
-        ):
+        if w1.dtype == dtypes.fp8 or w1.dtype in (dtypes.i32, torch.uint32):
             a8 = torch.empty((M, model_dim), dtype=a8_type, device=device)
             a8_scale = torch.empty(M, dtype=dtypes.fp32, device=device)
             if per_tensor_quant_scale is None:
