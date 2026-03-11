@@ -62,9 +62,9 @@ struct __attribute__((packed)) KernelArgs
     p3 _p23;
     unsigned int ps_deno;
     p3 _p24;
-    void *ptr_Qscl;
+    void* ptr_Qscl;
     p2 _p25;
-    void *ptr_Qzero;
+    void* ptr_Qzero;
     p2 _p26;
     unsigned int eLQQs;
     p3 _p27;
@@ -126,8 +126,9 @@ static CFG* get_cfg(torch::Tensor& inp,
                     QuantType& quant_type,
                     bool do_weight)
 {
-    int E    = w1.size(0);
-    int dim1 = w1.size(1);
+    int E          = w1.size(0);
+    int dim1       = w1.size(1);
+    bool is_MultiX = (inp.numel() / inp.size(-1)) == (out.numel() / out.size(-1));
 
     if((inp.scalar_type() == torch_fp8) && (w1.scalar_type() == torch_fp8) &&
        out.scalar_type() == at::ScalarType::BFloat16 && quant_type == QuantType::per_Token &&
@@ -145,22 +146,14 @@ static CFG* get_cfg(torch::Tensor& inp,
             out.scalar_type() == at::ScalarType::BFloat16 && quant_type == QuantType::per_Token &&
             !do_weight)
     {
+        if(is_MultiX)
+            return &cfg_fmoe_stage1_bf16_pertokenInt8_g1u1_multix;
         return &cfg_fmoe_stage1_bf16_pertokenInt8_g1u1;
     }
     else if((inp.scalar_type() == torch_fp8) && (w1.scalar_type() == torch_fp8) &&
             (out.scalar_type() == torch_fp8) && quant_type == QuantType::per_1x128 && !do_weight)
     {
         return &cfg_fmoe_stage1_bf16_pertokenFp8_blockscale_g1u1;
-    }
-    else if(inp.scalar_type() == at::ScalarType::Char && w1.scalar_type() == at::ScalarType::Char &&
-            (out.scalar_type() == at::ScalarType::Char) && quant_type == QuantType::per_Token)
-    {
-        return &cfg_fmoe_stage1_int8_pertokenInt8_g1u1;
-    }
-    else if(inp.scalar_type() == at::ScalarType::Char && w1.scalar_type() == at::ScalarType::Int4 &&
-            (out.scalar_type() == at::ScalarType::BFloat16) && quant_type == QuantType::per_Token) // feifei : use lqq enum
-    {
-        return &cfg_fmoe_stage1_bf16_lqqInt4_g1u1;
     }
     else
     {
@@ -190,11 +183,6 @@ static CFG* get_cfg_stage2(torch::Tensor& inter_states,
        quant_type == QuantType::per_Token && do_weight)
     {
         return &cfg_fmoe_stage2_bf16_pertokenInt8_g1u1;
-    }
-    else if(inter_states.scalar_type() == at::ScalarType::Char && w2.scalar_type() == at::ScalarType::Int4 &&
-            (out.scalar_type() == at::ScalarType::BFloat16) && quant_type == QuantType::per_Token) 
-    {
-        return &cfg_fmoe_stage2_bf16_lqqInt4_g1u1;
     }
     else
     {
@@ -272,8 +260,10 @@ void moe_stage1_g1u1(
     QuantType quant_type                  = QuantType::No,
     std::optional<torch::Tensor> a1_scale = std::nullopt, // [token_cnt, 1], token scale
     std::optional<torch::Tensor> w1_scale = std::nullopt, // [expert, 1, inter_dim], gate(up) scale
-    std::optional<torch::Tensor> w1_lqq_scale = std::nullopt, // [expert, inter_dim*2, model_dim/group_in_k_lqq] N,Klqq
-    std::optional<torch::Tensor> w1_lqq_zero = std::nullopt, // [expert, inter_dim*2, model_dim/group_in_k_lqq] N,Klqq
+    std::optional<torch::Tensor> w1_lqq_scale =
+        std::nullopt, // [expert, inter_dim*2, model_dim/group_in_k_lqq] N,Klqq
+    std::optional<torch::Tensor> w1_lqq_zero =
+        std::nullopt, // [expert, inter_dim*2, model_dim/group_in_k_lqq] N,Klqq
     std::optional<torch::Tensor> fc2_smooth_scale = std::nullopt,
     std::optional<torch::Tensor> fc2_scale        = std::nullopt,
     std::optional<torch::Tensor> sorted_weights =
@@ -287,12 +277,13 @@ void moe_stage1_g1u1(
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
     int model_dim  = input.size(-1);
     int hidden_dim = inter_dim;
-    
+
     int model_dim_w1 = w1.size(2);
     int model_dim_w2 = w2.size(1);
-    int gu_int4 = (model_dim_w2 / model_dim_w1 == 2) ? 1 : 0;
-    
-    int token_cnt = input.size(-2);
+    int gu_int4      = (model_dim_w2 / model_dim_w1 == 2) ? 1 : 0;
+
+    // int token_cnt = input.size(-2);
+    int token_cnt = out.size(0);
     int topk      = out.size(1);
     int eprt      = w1.size(0);
 
@@ -391,7 +382,7 @@ void moe_stage1_g1u1(
     args.activation = static_cast<int>(activation);
     args.ptr_SW     = sorted_weights.has_value() ? sorted_weights.value().data_ptr() : nullptr;
     args.total_tgs  = 0;
-    args.ps_deno    = ((inter_dim+sub_GU-1)/sub_GU);
+    args.ps_deno    = ((inter_dim + sub_GU - 1) / sub_GU);
     args.ptr_Qscl   = w1_lqq_scale.has_value() ? w1_lqq_scale.value().data_ptr() : nullptr;
     args.ptr_Qzero  = w1_lqq_zero.has_value() ? w1_lqq_zero.value().data_ptr() : nullptr;
     args.eLQQs      = stride_expert_LQQ;
@@ -465,8 +456,10 @@ void moe_stage2_g1u1(
     int block_m,
     std::optional<torch::Tensor> w2_scale = std::nullopt, // [expert, 1, dim], down scale
     std::optional<torch::Tensor> a2_scale = std::nullopt, // [token_cnt, 1], inter scale
-    std::optional<torch::Tensor> w2_lqq_scale = std::nullopt, // [expert, inter_dim/group_in_k_lqq, model_dim] N,Klqq
-    std::optional<torch::Tensor> w2_lqq_zero = std::nullopt, // [expert, inter_dim/group_in_k_lqq, model_dim] N,Klqq
+    std::optional<torch::Tensor> w2_lqq_scale =
+        std::nullopt, // [expert, inter_dim/group_in_k_lqq, model_dim] N,Klqq
+    std::optional<torch::Tensor> w2_lqq_zero =
+        std::nullopt, // [expert, inter_dim/group_in_k_lqq, model_dim] N,Klqq
     std::optional<torch::Tensor> sorted_weights =
         std::nullopt, // [max_num_tokens_padded], do_weight==true need
     QuantType quant_type      = QuantType::No,
@@ -480,10 +473,10 @@ void moe_stage2_g1u1(
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
 
     int inter_dim = inter_states.size(-1); // inter_states: [..., inter_dim]
-    
+
     int model_dim_w1 = w1.size(2);
     int model_dim_w2 = w2.size(1);
-    int isInt4 = (model_dim_w2 / model_dim_w1 == 2) ? 1 : 0;
+    int isInt4       = (model_dim_w2 / model_dim_w1 == 2) ? 1 : 0;
 
     int sub_X_cnt       = sorted_expert_ids.size(0);
     std::string arch_id = get_gpu_arch();
@@ -534,11 +527,12 @@ void moe_stage2_g1u1(
 
     int stride_expert_scale_D = w2_scale.has_value() ? dim * sizeof(float) : 0;
 
-    int stride_expert_dequant_D =  w2_lqq_scale.has_value() ? w2_lqq_scale.value().stride(0) : 0;
+    int stride_expert_dequant_D = w2_lqq_scale.has_value() ? w2_lqq_scale.value().stride(0) : 0;
 
-    if (isInt4) {
-        stride_D         /= 2;
-        stride_expert_D  /= 2;
+    if(isInt4)
+    {
+        stride_D /= 2;
+        stride_expert_D /= 2;
     }
 
     int dbl_o    = (splitk > 1) ? 2 : 1;
@@ -571,7 +565,7 @@ void moe_stage2_g1u1(
     args.ptr_SWBuffer = sorted_weights.has_value() ? sorted_weights.value().data_ptr() : nullptr;
     args.stride_expert_dequant_D = stride_expert_dequant_D;
     args.ptr_DScaleBuffer = w2_lqq_scale.has_value() ? w2_lqq_scale.value().data_ptr() : nullptr;
-    args.ptr_DZeroBuffer = w2_lqq_zero.has_value() ? w2_lqq_zero.value().data_ptr() : nullptr;
+    args.ptr_DZeroBuffer  = w2_lqq_zero.has_value() ? w2_lqq_zero.value().data_ptr() : nullptr;
 
     uint32_t k_num = 1;
 
