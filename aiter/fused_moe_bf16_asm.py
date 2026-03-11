@@ -428,12 +428,14 @@ def _run_asm_moe_int8(
     device = topk_ids.device
     _, model_dim, inter_dim = w2.shape
 
+    # 2-stage path only supports g1u1 weights (w1 has inter_dim*2 columns)
+    is_g1u1 = w1.shape[1] == inter_dim * 2 * lastdim_mul
+    run_2stage = config.run_2stage and is_g1u1
+
     # Clone topk_ids only when 2-stage and we may overwrite it (fc1_smooth + moe_smoothquant_fwd path).
     use_ref_input_quant = False
     topk_ids_for_scale = (
-        topk_ids.clone()
-        if (config.run_2stage and fc1_smooth_scale is not None)
-        else None
+        topk_ids.clone() if (run_2stage and fc1_smooth_scale is not None) else None
     )
     if expert_mask is not None and local_expert_hash is None:
         local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32).clone()
@@ -446,7 +448,7 @@ def _run_asm_moe_int8(
     )
     is_int8 = w1.dtype == dtypes.i8 or w1.dtype == torch.int8
     if fc1_smooth_scale is not None:
-        use_ref_input_quant = config.run_2stage and is_int8
+        use_ref_input_quant = run_2stage and is_int8
         if use_ref_input_quant:
             # Reference path: smooth_per_token_scaled_quant for input; keep topk_ids (global) for stage2.
             a8 = torch.empty((topk * M, model_dim), dtype=a8_type, device=device)
@@ -490,8 +492,8 @@ def _run_asm_moe_int8(
         else:
             logger.warning("FMOE fall into pure torch quant...")
             a8, a8_scale = aiter.pertoken_quant(hidden_states, quant_dtype=w1.dtype)
-    # two stage: both paths handled inside _asm_moe_2stages_a8 via config.stage1_fused_quant
-    if config.run_2stage:
+    # two stage: only supported for g1u1 weights (w1.shape[1] == inter_dim * 2)
+    if run_2stage:
         # Pass global topk_ids when we kept it (ref path); else pass cloned original (topk_ids_for_scale or topk_ids if no clone).
         ids_for_scale = (
             topk_ids if use_ref_input_quant else (topk_ids_for_scale or topk_ids)
