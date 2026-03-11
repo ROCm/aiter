@@ -157,7 +157,7 @@ __global__ void mfma_swz_b_kernel_generic(
     }
 
     if constexpr (std::is_same_v<DOUT, d_c>) {
-        g_c.template store<8>(v_c, u_c);
+        g_c.template store<4>(v_c, u_c);
     } else if constexpr (std::is_same_v<DIN, opus::bf16_t>) {
         auto v_c_out = opus::cast<DOUT>(v_c, 0_I);
         g_c.template store<8>(v_c_out, u_c);

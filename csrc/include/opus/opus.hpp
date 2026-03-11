@@ -2086,12 +2086,15 @@ struct mfma_adaptor_swap_ab : mfma_adaptor<MFMA> {
 template<typename MFMA>
 struct mfma_adaptor_swap_ab_swizzle_b : mfma_adaptor_swap_ab<MFMA> {
     using base = mfma_adaptor_swap_ab<MFMA>;
-    static_assert(base::grpn_b == 32, "mfma_adaptor_swap_ab_swizzle_b requires grpn_b == 32 (B row decomposition 2*2*2*4)");
-    using base::shape_a; using base::dim_a;
+    static_assert(base::grpn_b == 32, "mfma_adaptor_swap_ab_swizzle_b requires grpn_b == 32");
+    using base::shape_a; using base::dim_a; using base::dim_c;
+
+    static constexpr index_t rept_c = base::rept_c / 2;
+    static constexpr index_t pack_c = base::pack_c * 2;
+
     OPUS_D static constexpr auto shape_b() { return tuple<number<2>, number<2>, number<2>, number<4>, number<base::rept_b>, number<base::grpk_b>, number<base::pack_b>>{}; }
-    OPUS_D static constexpr auto dim_b() { return tuple<tuple<p_dim, p_dim, p_dim, p_dim>, tuple<y_dim, p_dim, y_dim>>{}; }
-    OPUS_D static constexpr auto shape_c() { return tuple<number<base::grpn_c>, number<base::rept_c / 2>, number<base::grpm_c>, number<base::pack_c * 2>>{}; }
-    using base::dim_c;
+    OPUS_D static constexpr auto shape_c() { return tuple<number<base::grpn_c>, number<rept_c>, number<base::grpm_c>, number<pack_c>>{}; }
+    OPUS_D static constexpr auto dim_b()   { return tuple<tuple<p_dim, p_dim, p_dim, p_dim>, tuple<y_dim, p_dim, y_dim>>{}; }
 
     template<typename VA, typename VB, typename VC, index_t cbsz = 0, index_t abid = 0, index_t blgp = 0>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) {
