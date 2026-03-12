@@ -22,6 +22,8 @@ def fused_qkv_split_qk_norm_rope_cache(
     offsets: torch.Tensor = None,
     reuse_freqs_front_part: bool = True,
     attn_output_gate: bool = False,
+    k_scale: torch.Tensor = None,
+    v_scale: torch.Tensor = None,
     eps: float = 1e-5,
 ):
     T = qkv.shape[0]
@@ -73,6 +75,8 @@ def fused_qkv_split_qk_norm_rope_cache(
         slot_mapping_ptr=slot_mapping,
         T=T,
         eps=eps,
+        k_scale_ptr=k_scale,
+        v_scale_ptr=v_scale,
         stride_qkv_t=qkv.stride(0),
         stride_qkv_d=qkv.stride(1),
         stride_cos_t=cos.stride(0),
@@ -103,6 +107,8 @@ def fused_qkv_split_qk_norm_rope_cache(
         BLOCK_D=BLOCK_D,
         BLOCK_D_HALF=BLOCK_D_HALF,
         BLOCK_SIZE=block_size,
+        HAVE_K_SCALE=k_scale is not None,
+        HAVE_V_SCALE=v_scale is not None,
         num_warps=num_warps,
     )
 

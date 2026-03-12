@@ -152,6 +152,8 @@ def run_torch_with_cache(
     slot_mapping,
     num_blocks,
     block_size,
+    k_scale,
+    v_scale,
 ):
     q_size = QH_PER_KH * KH * D
     kv_size = KH * D
@@ -184,6 +186,17 @@ def run_torch_with_cache(
         nope_first=False,
     )
 
+    if k_scale is None:
+        k_scale = 1
+    if v_scale is None:
+        v_scale = 1
+
+    k_scale_rcprl = 1 / k_scale
+    k_descaled = k * k_scale_rcprl
+
+    v_scale_rcprl = 1 / v_scale
+    v_descaled = v * v_scale_rcprl
+
     # 4. Reference Caching (Paged)
     k_cache = torch.zeros(
         (num_blocks, KH, block_size, D), dtype=qkv.dtype, device="cuda"
@@ -197,8 +210,8 @@ def run_torch_with_cache(
         if slot >= 0:
             b = slot // block_size
             s = slot % block_size
-            k_cache[b, :, s, :] = k[i]
-            v_cache[b, :, s, :] = v[i]
+            k_cache[b, :, s, :] = k_descaled[i]
+            v_cache[b, :, s, :] = v_descaled[i]
 
     if attn_output_gate:
         return q, gate, k, v, k_cache, v_cache
@@ -215,6 +228,7 @@ def run_torch_with_cache(
 @pytest.mark.parametrize("max_embed_positions", [131072])
 @pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
 @pytest.mark.parametrize("attn_output_gate", [False, True])
+@pytest.mark.parametrize("use_kv_scale", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_fused_qkv_split_qk_rope_with_cache(
     B,
@@ -226,6 +240,7 @@ def test_fused_qkv_split_qk_rope_with_cache(
     max_embed_positions,
     reuse_freqs_front_part,
     attn_output_gate,
+    use_kv_scale,
     dtype,
 ):
     eps = 1e-5
@@ -233,6 +248,13 @@ def test_fused_qkv_split_qk_rope_with_cache(
     torch.manual_seed(1)
 
     qkv = generate_qkv_inputs(B, QH_PER_KH, KH, D, False, attn_output_gate, dtype)
+
+    if use_kv_scale:
+        k_scale = torch.randn((), dtype=torch.float32, device="cuda")
+        v_scale = torch.randn((), dtype=torch.float32, device="cuda")
+    else:
+        k_scale = v_scale = None
+
     pos, freqs, cos, sin = generate_rope_cached_freqs(
         B, max_embed_positions, (D // 2) if reuse_freqs_front_part else D, dtype
     )
@@ -266,6 +288,8 @@ def test_fused_qkv_split_qk_rope_with_cache(
         offsets=None,
         reuse_freqs_front_part=reuse_freqs_front_part,
         eps=eps,
+        k_scale=k_scale,
+        v_scale=v_scale,
         attn_output_gate=attn_output_gate,
     )
     if attn_output_gate:
@@ -289,6 +313,8 @@ def test_fused_qkv_split_qk_rope_with_cache(
         slot_mapping,
         num_blocks,
         block_size,
+        k_scale,
+        v_scale,
     )
 
     if attn_output_gate:

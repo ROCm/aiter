@@ -61,6 +61,8 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
     value_cache_stride_h,
     value_cache_stride_d,
     value_cache_stride_b,
+    k_scale_ptr,
+    v_scale_ptr,
     REUSE_FREQS_FRONT_PART: tl.constexpr,
     IS_NEOX: tl.constexpr,
     HAVE_POS: tl.constexpr,
@@ -72,6 +74,8 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_D_HALF: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,  # PagedAttention block size
+    HAVE_K_SCALE: tl.constexpr = False,
+    HAVE_V_SCALE: tl.constexpr = False,
 ):
     tl.assume(stride_qkv_t > 0)
     tl.assume(stride_qkv_d > 0)
@@ -177,6 +181,15 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
     tl.store(q_ptr + q_out_offs, q, mask=x_mask)
 
     if hq < KVH:
+        if HAVE_K_SCALE:
+            k_scale = tl.load(k_scale_ptr)
+        else:
+            k_scale = 1
+        if HAVE_V_SCALE:
+            v_scale = tl.load(v_scale_ptr)
+        else:
+            v_scale = 1
+
         Q_HEAD_DIM_STRIDE_MULT = 1
         if ENABLE_GATED_Q:
             Q_HEAD_DIM_STRIDE_MULT = 2
@@ -227,6 +240,12 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
 
         # We process a block of T. We need to handle mask for slots >= 0
         cache_mask = x_mask & (slots[:, None] >= 0)
+
+        k_scale_rcprl = 1 / k_scale
+        k = k * k_scale_rcprl
+
+        v_scale_rcprl = 1 / v_scale
+        v = v * v_scale_rcprl
 
         k_cache_offs = (
             t_slot_idx[:, None] * key_cache_stride_t
