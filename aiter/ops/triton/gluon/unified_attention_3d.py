@@ -411,12 +411,20 @@ def select_3d_config(
             )
         layout_configs["TILE_SIZE"] = TILE_SIZE
 
+    waves_per_eu = 2
+    occ = waves_per_eu * 4 // attn_warps
+    if (
+        2 * attn_stages * TILE_SIZE * head_size * kv_cache_dtype.itemsize * occ
+        >= 327680
+    ):
+        waves_per_eu = 0
+
     attn_config = {
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "WARP_SIZE": WARP_SIZE,
         "num_warps": attn_warps,
         "num_stages": attn_stages,
-        "waves_per_eu": 2,
+        "waves_per_eu": waves_per_eu,
         "IS_Q_FP8": (q_dtype == e4m3_dtype),
         "IS_KV_FP8": (kv_cache_dtype == e4m3_dtype),
         **layout_configs,

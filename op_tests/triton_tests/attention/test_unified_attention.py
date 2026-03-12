@@ -106,15 +106,9 @@ DEVICE_ARCH = arch_info.get_arch()
 
 import os
 
-SL = int(os.environ.get("SL", "1328"))
-HS = int(os.environ.get("HS", "128"))
-BS = int(os.environ.get("BS", "64"))
-SF = os.environ.get("SF", "F") == "T"
 NUM_HEADS = [(64, 8)]
 HEAD_SIZES = [64, 128]
-BLOCK_SIZES = [16, 64]
-HEAD_SIZES = [HS]
-BLOCK_SIZES = [BS]
+BLOCK_SIZES = [16, 64, 128]
 
 
 DTYPES = [torch.bfloat16]
@@ -228,17 +222,18 @@ def ref_paged_attn(
 # @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
 # @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 # @pytest.mark.parametrize("q_dtype", QDTYPES)
+@pytest.mark.parametrize("check_ref", [False])
 @pytest.mark.parametrize(
     "seq_lens",
     [
-        # [(1, 1328)] * SL,
-        [(1, 8192)] * SL,
-        # [(1, 8192)] * 4,
-        # [(1, 8192)] * 8,
-        # [(1, 8192)] * 16,
-        # [(1, 32768)],
-        # [(1, 523), (1, 37), (1, 2011)],
-        # [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)],
+        [(1, 1328)],
+        [(1, 8192)],
+        [(1, 8192)] * 4,
+        [(1, 8192)] * 8,
+        [(1, 8192)] * 16,
+        [(1, 32768)],
+        [(1, 523), (1, 37), (1, 2011)],
+        [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)],
     ],
 )
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
@@ -256,7 +251,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize("soft_cap", [None])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 # @pytest.mark.parametrize("shuffled_kv_cache", [True, False])
-@pytest.mark.parametrize("shuffled_kv_cache", [SF])
+@pytest.mark.parametrize("shuffled_kv_cache", [True, False])
 @pytest.mark.parametrize(
     "backend, use_tdm, num_tdm_gather, use_async",
     [
@@ -286,6 +281,7 @@ def test_triton_unified_attn(
     use_tdm: bool,
     num_tdm_gather: int,
     use_async: bool,
+    check_ref: bool,
 ) -> None:
     if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
         pytest.skip("block size must be at least 32 for fp8")
@@ -450,33 +446,34 @@ def test_triton_unified_attn(
             shuffled_kv_cache=shuffled_kv_cache,
         )
 
-    ref_output = ref_paged_attn(
-        query=query,
-        key_cache=key_cache,
-        value_cache=value_cache,
-        query_lens=query_lens,
-        kv_lens=kv_lens,
-        block_tables=block_tables,
-        scale=scale,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        sliding_window=sliding_window,
-        soft_cap=soft_cap,
-        sinks=sinks,
-        o_dtype=o_dtype,
-    )
+    if check_ref:
+        ref_output = ref_paged_attn(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            query_lens=query_lens,
+            kv_lens=kv_lens,
+            block_tables=block_tables,
+            scale=scale,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            sliding_window=sliding_window,
+            soft_cap=soft_cap,
+            sinks=sinks,
+            o_dtype=o_dtype,
+        )
 
-    atol, rtol = 1.5e-2, 1e-2
-    if q_dtype != torch.bfloat16:
-        atol, rtol = 1.5e-1, 1.5e-1
-    if kv_dtype != torch.bfloat16:
-        if use_async or (use_tdm and num_tdm_gather > 1):
-            # async_copy and TDM gather seems to require a more loose precision requirement for FP8 KV cache
+        atol, rtol = 1.5e-2, 1e-2
+        if q_dtype != torch.bfloat16:
             atol, rtol = 1.5e-1, 1.5e-1
-    torch.testing.assert_close(
-        output, ref_output, atol=atol, rtol=rtol
-    ), f"{torch.max(torch.abs(output - ref_output))}"
+        if kv_dtype != torch.bfloat16:
+            if use_async or (use_tdm and num_tdm_gather > 1):
+                # async_copy and TDM gather seems to require a more loose precision requirement for FP8 KV cache
+                atol, rtol = 1.5e-1, 1.5e-1
+        torch.testing.assert_close(
+            output, ref_output, atol=atol, rtol=rtol
+        ), f"{torch.max(torch.abs(output - ref_output))}"
 
 
 @pytest.mark.parametrize(
