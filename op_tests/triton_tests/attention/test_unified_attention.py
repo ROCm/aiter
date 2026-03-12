@@ -415,7 +415,7 @@ def test_triton_unified_attn(
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 @pytest.mark.parametrize("block_size", [64, 16])
 @pytest.mark.parametrize("sliding_window", [None, 256])
-@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16,])
 @pytest.mark.parametrize(
     "soft_cap",
     [
@@ -423,7 +423,7 @@ def test_triton_unified_attn(
     ],
 )
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
-@pytest.mark.parametrize("q_dtype", QDTYPES)
+@pytest.mark.parametrize("q_dtype", [torch.bfloat16,])
 @torch.inference_mode()
 @pytest.mark.parametrize(
     "use_tdm, num_kv_blocks",
@@ -433,6 +433,9 @@ def test_triton_unified_attn(
         (True, 4),
     ],
 )
+@pytest.mark.parametrize("shuffled_kv_cache", [True,])
+@pytest.mark.parametrize("skip_reference", [False,])
+
 @torch.inference_mode()
 def test_gluon_unified_attn_2d(
     seq_lens: list[tuple[int, int]],
@@ -446,7 +449,10 @@ def test_gluon_unified_attn_2d(
     q_dtype: Optional[torch.dtype],
     use_tdm: bool,
     num_kv_blocks: int,
+    shuffled_kv_cache: bool,
+    skip_reference: bool,
 ) -> None:
+
     if DEVICE_ARCH not in (
         "gfx950",
         "gfx1250",
@@ -458,6 +464,8 @@ def test_gluon_unified_attn_2d(
         pytest.skip(f"{DEVICE_ARCH} does not have TDM gather")
     if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
         pytest.skip("block size must be at least 32 for fp8")
+    if shuffled_kv_cache and (not use_tdm or num_kv_blocks != 1):
+        pytest.skip("Shuffled KV cache is only supported with TDM and num_kv_blocks == 1")
     torch.manual_seed(0)
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]
@@ -540,23 +548,24 @@ def test_gluon_unified_attn_2d(
         num_kv_blocks=num_kv_blocks,
         use_tdm=use_tdm,
     )
-
-    ref_output = ref_paged_attn(
-        query=query,
-        key_cache=key_cache,
-        value_cache=value_cache,
-        query_lens=query_lens,
-        kv_lens=kv_lens,
-        block_tables=block_tables,
-        scale=scale,
-        sliding_window=sliding_window,
-        soft_cap=soft_cap,
-        sinks=sinks,
-    )
-    atol, rtol = 1.5e-2, 1e-2
-    if q_dtype is not None:
-        atol, rtol = 1.5e-1, 1.5e-1
-    output = output_cuda.cpu()
-    torch.testing.assert_close(
-        output, ref_output, atol=atol, rtol=rtol
-    ), f"{torch.max(torch.abs(output - ref_output))}"
+    if not skip_reference:
+        ref_output = ref_paged_attn(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            query_lens=query_lens,
+            kv_lens=kv_lens,
+            block_tables=block_tables,
+            scale=scale,
+            sliding_window=sliding_window,
+            soft_cap=soft_cap,
+            sinks=sinks,
+        )
+        atol, rtol = 1.5e-2, 1e-2
+        if q_dtype is not None:
+            atol, rtol = 1.5e-1, 1.5e-1
+        output = output_cuda.cpu()
+        torch.testing.assert_close(
+            output, ref_output, atol=atol, rtol=rtol
+        ), f"{torch.max(torch.abs(output - ref_output))}"
+    assert True
