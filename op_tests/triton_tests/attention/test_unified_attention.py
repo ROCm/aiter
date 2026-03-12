@@ -166,38 +166,38 @@ def ref_paged_attn(
     return torch.cat(outputs, dim=0)
 
 
-# @pytest.mark.parametrize(
-#     "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
-# )
-# @pytest.mark.parametrize("num_heads", NUM_HEADS)
-# @pytest.mark.parametrize("head_size", HEAD_SIZES)
-# @pytest.mark.parametrize("block_size", BLOCK_SIZES)
-# @pytest.mark.parametrize("sliding_window", [None, 256])
-# @pytest.mark.parametrize("dtype", DTYPES)
-# @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
-# @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
-# @pytest.mark.parametrize("q_dtype", QDTYPES)
 @pytest.mark.parametrize(
-    "seq_lens",
-    [
-        [(1, 1328)],
-        # [(1, 8192)],
-        # [(1, 8192)] * 4,
-        # [(1, 8192)] * 8,
-        # [(1, 8192)] * 16,
-        # [(1, 32768)],
-        # [(1, 523), (1, 37), (1, 2011)],
-        # [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)],
-    ],
+    "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
 )
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
-@pytest.mark.parametrize("sliding_window", SLIDING_WINDOWS)
+@pytest.mark.parametrize("sliding_window", [None, 256])
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("soft_cap", [None])
+@pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("q_dtype", QDTYPES)
+# @pytest.mark.parametrize(
+#     "seq_lens",
+#     [
+#         [(1, 1328)],
+#         # [(1, 8192)],
+#         # [(1, 8192)] * 4,
+#         # [(1, 8192)] * 8,
+#         # [(1, 8192)] * 16,
+#         # [(1, 32768)],
+#         # [(1, 523), (1, 37), (1, 2011)],
+#         # [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)],
+#     ],
+# )
+# @pytest.mark.parametrize("num_heads", NUM_HEADS)
+# @pytest.mark.parametrize("head_size", HEAD_SIZES)
+# @pytest.mark.parametrize("block_size", BLOCK_SIZES)
+# @pytest.mark.parametrize("sliding_window", SLIDING_WINDOWS)
+# @pytest.mark.parametrize("dtype", DTYPES)
+# @pytest.mark.parametrize("soft_cap", [None])
+# @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
+# @pytest.mark.parametrize("q_dtype", QDTYPES)
 @pytest.mark.parametrize("shuffled_kv_cache", [True, False])
 @pytest.mark.parametrize(
     "backend, use_tdm, num_tdm_gather, use_async",
