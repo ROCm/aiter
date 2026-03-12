@@ -68,8 +68,10 @@ jobs:
           echo "Available wheels: ${{ inputs.wheel_names }}"
 
           # Find the wheel matching this Python version
+          WHEEL_NAME=""
           for WHL in ${{ inputs.wheel_names }}; do
             if [[ "${WHL}" == *"${CP_VERSION}"* ]]; then
+              WHEEL_NAME="${WHL}"
               echo "WHEEL_NAME=${WHL}" >> $GITHUB_ENV
               echo "✅ Selected wheel for testing: ${WHL}"
               break
@@ -84,7 +86,10 @@ jobs:
 
       - name: Wait for wheel availability
         run: |
-          WHEEL_INDEX_URL="https://rocm.frameworks-${{ inputs.release_type }}.amd.com/"
+          # Wheels are in S3 at: s3://framework-whls-{release_type}/whl-staging/gfx942-gfx950/{wheel}
+          # CloudFront serves from: https://rocm.frameworks-{release_type}.amd.com/whl-staging/gfx942-gfx950/{wheel}
+          WHEEL_BASE_URL="https://rocm.frameworks-${{ inputs.release_type }}.amd.com/whl-staging/gfx942-gfx950"
+          WHEEL_URL="${WHEEL_BASE_URL}/${WHEEL_NAME}"
           MAX_RETRIES=24
           RETRY_DELAY=5
           RETRY_COUNT=0
@@ -92,12 +97,12 @@ jobs:
           echo "============================================"
           echo "Checking wheel availability"
           echo "Wheel: ${WHEEL_NAME}"
-          echo "Index URL: ${WHEEL_INDEX_URL}"
+          echo "Full URL: ${WHEEL_URL}"
           echo "============================================"
 
           while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
             # Try to fetch the wheel with HTTP HEAD request
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${WHEEL_INDEX_URL}${WHEEL_NAME}" || echo "000")
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${WHEEL_URL}" || echo "000")
 
             if [ "$HTTP_CODE" = "200" ]; then
               echo "✅ Wheel is available! (HTTP $HTTP_CODE)"
@@ -152,24 +157,25 @@ jobs:
       - name: Install wheels
         id: install
         run: |
-          WHEEL_INDEX_URL="https://rocm.frameworks-${{ inputs.release_type }}.amd.com/"
+          # Construct full wheel URL
+          WHEEL_BASE_URL="https://rocm.frameworks-${{ inputs.release_type }}.amd.com/whl-staging/gfx942-gfx950"
+          WHEEL_URL="${WHEEL_BASE_URL}/${WHEEL_NAME}"
 
           echo "============================================"
           echo "Installing wheel"
           echo "Wheel: ${WHEEL_NAME}"
-          echo "Index: ${WHEEL_INDEX_URL}"
+          echo "Full URL: ${WHEEL_URL}"
           echo "Python: ${{ matrix.python_version }}"
           echo "============================================"
 
           docker exec aiter_test bash -c "python3 -m pip install -U pip setuptools"
           docker exec aiter_test bash -c "pip uninstall -y aiter amd-aiter || true"
 
-          # Install with verbose output for better debugging
-          if ! docker exec aiter_test bash -c "python3 -m pip install ${WHEEL_NAME} --extra-index-url ${WHEEL_INDEX_URL} -v"; then
+          # Install directly from URL
+          if ! docker exec aiter_test bash -c "python3 -m pip install ${WHEEL_URL} -v"; then
             echo "❌ Installation failed!"
             echo "Debug info:"
-            echo "- Wheel: ${WHEEL_NAME}"
-            echo "- Index: ${WHEEL_INDEX_URL}"
+            echo "- Wheel URL: ${WHEEL_URL}"
             docker exec aiter_test bash -c "python3 --version"
             docker exec aiter_test bash -c "pip --version"
             exit 1
@@ -213,13 +219,14 @@ jobs:
       - name: Test summary
         if: always()
         run: |
-          WHEEL_INDEX_URL="https://rocm.frameworks-${{ inputs.release_type }}.amd.com/"
+          WHEEL_BASE_URL="https://rocm.frameworks-${{ inputs.release_type }}.amd.com/whl-staging/gfx942-gfx950"
+          WHEEL_URL="${WHEEL_BASE_URL}/${WHEEL_NAME}"
 
           echo "## Test Summary - ${{ matrix.label }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Runner**: ${{ matrix.runner }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Python**: ${{ matrix.python_version }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Wheel**: \`${WHEEL_NAME}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Index URL**: ${WHEEL_INDEX_URL}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Wheel URL**: ${WHEEL_URL}" >> $GITHUB_STEP_SUMMARY
           echo "- **Install**: ${{ steps.install.outcome }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Tests**: ${{ steps.tests.outcome }}" >> $GITHUB_STEP_SUMMARY
 
