@@ -3,8 +3,12 @@ name: Test Wheels
 on:
   workflow_call:
     inputs:
-      docker_image:
-        description: 'Docker base image for testing'
+      release_type:
+        description: 'Release type (nightlies/devreleases) for S3 bucket path'
+        type: string
+        required: true
+      wheel_names:
+        description: 'Space-separated list of wheel filenames to test'
         type: string
         required: true
 
@@ -14,10 +18,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Python 3.12 tests
           - runner: aiter-1gpu-runner
-            label: MI300
+            label: MI300-py312
+            python_version: "3.12"
+            docker_image: rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1
           - runner: linux-aiter-mi355-1
-            label: MI355
+            label: MI355-py312
+            python_version: "3.12"
+            docker_image: rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1
+          # Python 3.10 tests
+          - runner: aiter-1gpu-runner
+            label: MI300-py310
+            python_version: "3.10"
+            docker_image: rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1
+          - runner: linux-aiter-mi355-1
+            label: MI355-py310
+            python_version: "3.10"
+            docker_image: rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -25,17 +43,78 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Download wheel artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: aiter-whl-packages-py*
-          path: dist
-          merge-multiple: true
-
-      - name: List downloaded wheels
+      - name: Validate inputs
         run: |
-          echo "Downloaded wheels:"
-          ls -lh dist/*.whl
+          # Validate release_type
+          if [[ ! "${{ inputs.release_type }}" =~ ^(nightlies|devreleases)$ ]]; then
+            echo "❌ ERROR: Invalid release_type: ${{ inputs.release_type }}"
+            echo "Must be 'nightlies' or 'devreleases'"
+            exit 1
+          fi
+
+          # Validate wheel_names
+          if [ -z "${{ inputs.wheel_names }}" ]; then
+            echo "❌ ERROR: wheel_names is empty"
+            exit 1
+          fi
+
+      - name: Determine wheel to test
+        run: |
+          # Convert Python version to wheel format (e.g., 3.12 -> cp312)
+          PYTHON_VERSION="${{ matrix.python_version }}"
+          CP_VERSION="cp${PYTHON_VERSION/./}"
+
+          echo "Looking for wheel matching: ${CP_VERSION}"
+          echo "Available wheels: ${{ inputs.wheel_names }}"
+
+          # Find the wheel matching this Python version
+          for WHL in ${{ inputs.wheel_names }}; do
+            if [[ "${WHL}" == *"${CP_VERSION}"* ]]; then
+              echo "WHEEL_NAME=${WHL}" >> $GITHUB_ENV
+              echo "✅ Selected wheel for testing: ${WHL}"
+              break
+            fi
+          done
+
+          if [ -z "${WHEEL_NAME}" ]; then
+            echo "❌ ERROR: No wheel found matching Python version ${CP_VERSION}"
+            echo "Available wheels: ${{ inputs.wheel_names }}"
+            exit 1
+          fi
+
+      - name: Wait for wheel availability
+        run: |
+          WHEEL_INDEX_URL="https://rocm.frameworks-${{ inputs.release_type }}.amd.com/"
+          MAX_RETRIES=24
+          RETRY_DELAY=5
+          RETRY_COUNT=0
+
+          echo "============================================"
+          echo "Checking wheel availability"
+          echo "Wheel: ${WHEEL_NAME}"
+          echo "Index URL: ${WHEEL_INDEX_URL}"
+          echo "============================================"
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            # Try to fetch the wheel with HTTP HEAD request
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${WHEEL_INDEX_URL}${WHEEL_NAME}" || echo "000")
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ Wheel is available! (HTTP $HTTP_CODE)"
+              break
+            fi
+
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              echo "⏳ Wheel not yet available (HTTP $HTTP_CODE), waiting... (attempt $RETRY_COUNT/$MAX_RETRIES)"
+              sleep $RETRY_DELAY
+            else
+              echo "❌ ERROR: Wheel not available after $((MAX_RETRIES * RETRY_DELAY)) seconds"
+              echo "Expected: ${WHEEL_INDEX_URL}${WHEEL_NAME}"
+              echo "Last HTTP code: $HTTP_CODE"
+              exit 1
+            fi
+          done
 
       - name: Start GPU test container
         run: |
@@ -49,22 +128,57 @@ jobs:
 
           docker run -dt --network=host --user root --device=/dev/kfd $DEVICE_FLAG \
             -v "${{ github.workspace }}:/workspace" \
-            -v "${{ github.workspace }}/dist:/wheels" \
             --ipc=host --group-add video \
             --shm-size 16g \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
             -w /workspace \
             --name aiter_test \
-            ${{ inputs.docker_image }}
+            ${{ matrix.docker_image }}
+
+      - name: Verify GPU accessibility
+        run: |
+          echo "============================================"
+          echo "Verifying GPU accessibility"
+          echo "============================================"
+
+          if ! docker exec aiter_test bash -c "rocm-smi --showproductname"; then
+            echo "❌ ERROR: GPU not accessible via rocm-smi"
+            exit 1
+          fi
+
+          docker exec aiter_test bash -c "python3 -c 'import torch; print(f\"GPU available: {torch.cuda.is_available()}\"); print(f\"GPU count: {torch.cuda.device_count()}\"); print(f\"GPU name: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}\")'"
 
       - name: Install wheels
         id: install
         run: |
+          WHEEL_INDEX_URL="https://rocm.frameworks-${{ inputs.release_type }}.amd.com/"
+
+          echo "============================================"
+          echo "Installing wheel"
+          echo "Wheel: ${WHEEL_NAME}"
+          echo "Index: ${WHEEL_INDEX_URL}"
+          echo "Python: ${{ matrix.python_version }}"
+          echo "============================================"
+
           docker exec aiter_test bash -c "python3 -m pip install -U pip setuptools"
           docker exec aiter_test bash -c "pip uninstall -y aiter amd-aiter || true"
-          docker exec aiter_test bash -c "python3 -m pip install --no-index --find-links=/wheels amd-aiter"
-          docker exec aiter_test bash -c "python3 -c 'import aiter; print(\"Aiter version:\", aiter.__version__)'"
+
+          # Install with verbose output for better debugging
+          if ! docker exec aiter_test bash -c "python3 -m pip install ${WHEEL_NAME} --extra-index-url ${WHEEL_INDEX_URL} -v"; then
+            echo "❌ Installation failed!"
+            echo "Debug info:"
+            echo "- Wheel: ${WHEEL_NAME}"
+            echo "- Index: ${WHEEL_INDEX_URL}"
+            docker exec aiter_test bash -c "python3 --version"
+            docker exec aiter_test bash -c "pip --version"
+            exit 1
+          fi
+
+          echo "============================================"
+          echo "Verifying installation"
+          echo "============================================"
+          docker exec aiter_test bash -c "python3 -c 'import aiter; print(\"✅ Aiter version:\", aiter.__version__)'"
 
       - name: Run single-GPU tests
         id: tests
@@ -99,13 +213,21 @@ jobs:
       - name: Test summary
         if: always()
         run: |
+          WHEEL_INDEX_URL="https://rocm.frameworks-${{ inputs.release_type }}.amd.com/"
+
           echo "## Test Summary - ${{ matrix.label }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Runner**: ${{ matrix.runner }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Python**: ${{ matrix.python_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Wheel**: \`${WHEEL_NAME}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Index URL**: ${WHEEL_INDEX_URL}" >> $GITHUB_STEP_SUMMARY
           echo "- **Install**: ${{ steps.install.outcome }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Tests**: ${{ steps.tests.outcome }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Tested Wheels" >> $GITHUB_STEP_SUMMARY
-          ls -lh dist/*.whl | awk '{print "- " $9}' >> $GITHUB_STEP_SUMMARY || true
+
+          # Add GPU info if available
+          GPU_INFO=$(docker exec aiter_test bash -c "rocm-smi --showproductname 2>/dev/null" || echo "N/A")
+          if [ "$GPU_INFO" != "N/A" ]; then
+            echo "- **GPU**: ${GPU_INFO}" >> $GITHUB_STEP_SUMMARY
+          fi
 
       - name: Clean up
         if: always()

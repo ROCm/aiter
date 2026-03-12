@@ -62,7 +62,8 @@ jobs:
     if: ${{ !(inputs.skip_tests || false) }}
     uses: ./.github/workflows/test-whl.yaml
     with:
-      docker_image: ${{ github.event.inputs.docker_image_py312 || 'rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1' }}
+      release_type: ${{ github.event_name == 'schedule' && 'nightlies' || 'devreleases' }}
+      wheel_names: ${{ needs.build.outputs.wheel_names }}
     permissions:
       contents: read
 
