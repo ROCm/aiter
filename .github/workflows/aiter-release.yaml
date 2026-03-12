@@ -31,7 +31,7 @@ on:
       runner:
         description: 'Select build host'
         required: true
-        default: 'aiter-k8s-build'
+        default: 'build-only-aiter'
         type: choice
         options:
           - build-only-aiter
@@ -76,7 +76,7 @@ on:
         description: 'Build host'
         type: string
         required: false
-        default: 'aiter-k8s-build'
+        default: 'build-only-aiter'
       add_date_stamp:
         description: 'Add date stamp to version'
         type: boolean
