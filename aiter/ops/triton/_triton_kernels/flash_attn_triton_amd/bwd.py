@@ -4338,12 +4338,13 @@ def attention_backward_triton_impl(
     if mode == "fused":
         seqlen = max(max_seqlen_q, max_seqlen_k)
 
-        grid = lambda META: (
-            nheads_k,
-            ((seqlen + META["BLOCK_N1"] - 1) // META["BLOCK_N1"]),
-            batch
-        )
-
+        def grid(META):
+            return (
+                    nheads_k,
+                    ((seqlen + META["BLOCK_N1"] - 1) // META["BLOCK_N1"]),
+                    batch
+                )
+        
         if causal:
 
             if DEBUG_TRITON:

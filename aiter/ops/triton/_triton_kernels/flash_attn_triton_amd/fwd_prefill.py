@@ -1728,8 +1728,8 @@ def attention_forward_prefill_triton_impl(
     force_masking = arch.is_rdna
 
     # launch kernel
-    grid = lambda META: (nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]), batch)
-
+    def grid(META):
+        return (nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]), batch)
 
     attn_fwd[grid](
         q,
