@@ -1030,7 +1030,7 @@ def get_args_of_build(ops_name: str, exclude=[]):
 
 
 def _ctypes_call(func, fc_name, md_name):
-    """Build a ctypes-based caller for a torch_exclude .so module."""
+    """Build a ctypes-based caller for a torch-free .so module."""
     import ctypes
     import inspect
     import torch
@@ -1144,12 +1144,12 @@ def compile_ops(
     fc_name: Optional[str] = None,
     gen_func: Optional[Callable[..., dict[str, Any]]] = None,
     gen_fake: Optional[Callable[..., Any]] = None,
-    torch_exclude: bool = False,
+    rm_torch: bool = False,
 ):
     def decorator(func):
         loadName = fc_name if fc_name is not None else func.__name__
 
-        if torch_exclude:
+        if rm_torch:
             ctypes_caller = _ctypes_call(func, loadName, _md_name)
 
             @functools.wraps(func)
@@ -1192,7 +1192,7 @@ def compile_ops(
                 verbose = d_args["verbose"]
                 is_python_module = d_args["is_python_module"]
                 is_standalone = d_args["is_standalone"]
-                _torch_exclude = d_args["torch_exclude"]
+                torch_exclude = d_args["torch_exclude"]
                 hipify = d_args.get("hipify", False)
                 hip_clang_path = d_args.get("hip_clang_path", None)
                 third_party = d_args.get("third_party", [])
