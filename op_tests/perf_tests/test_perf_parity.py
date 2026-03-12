@@ -76,12 +76,12 @@ def _skip_if_no_gpu():
 # ===================================================================
 GEMM_A8W8_SHAPES = [
     # (M, N, K) – representative decode / prefill shapes
-    (1, 7168, 2048),     # DeepSeek decode qkv_proj
-    (1, 2048, 7168),     # DeepSeek decode o_proj
-    (1, 18432, 7168),    # DeepSeek decode gate_up_proj
-    (1, 7168, 9216),     # DeepSeek decode down_proj
-    (32, 7168, 2048),    # small batch
-    (128, 7168, 2048),   # medium batch
+    (1, 7168, 2048),  # DeepSeek decode qkv_proj
+    (1, 2048, 7168),  # DeepSeek decode o_proj
+    (1, 18432, 7168),  # DeepSeek decode gate_up_proj
+    (1, 7168, 9216),  # DeepSeek decode down_proj
+    (32, 7168, 2048),  # small batch
+    (128, 7168, 2048),  # medium batch
     (256, 14336, 4096),  # Llama-style FFN
 ]
 
@@ -124,12 +124,10 @@ def test_gemm_a8w8_perf(M, N, K):
     aiter_ms = _bench(
         lambda: gemm_a8w8(x_fp8, w_fp8, x_scale, w_scale, bias, out_dtype, y)
     )
-    speedup = _record(
-        "gemm_a8w8", f"M={M} N={N} K={K}", torch_ms, aiter_ms
-    )
-    assert speedup >= MIN_SPEEDUP, (
-        f"gemm_a8w8 M={M} N={N} K={K}: speedup {speedup:.3f}x < {MIN_SPEEDUP}x"
-    )
+    speedup = _record("gemm_a8w8", f"M={M} N={N} K={K}", torch_ms, aiter_ms)
+    assert (
+        speedup >= MIN_SPEEDUP
+    ), f"gemm_a8w8 M={M} N={N} K={K}: speedup {speedup:.3f}x < {MIN_SPEEDUP}x"
 
 
 # ===================================================================
@@ -164,9 +162,9 @@ def test_rmsnorm_perf(M, N):
     torch_ms = _bench(lambda: _torch_rmsnorm(x, weight, eps))
     aiter_ms = _bench(lambda: rms_norm(x, weight, eps))
     speedup = _record("rmsnorm", f"M={M} N={N}", torch_ms, aiter_ms)
-    assert speedup >= MIN_SPEEDUP, (
-        f"rmsnorm M={M} N={N}: speedup {speedup:.3f}x < {MIN_SPEEDUP}x"
-    )
+    assert (
+        speedup >= MIN_SPEEDUP
+    ), f"rmsnorm M={M} N={N}: speedup {speedup:.3f}x < {MIN_SPEEDUP}x"
 
 
 # ===================================================================
@@ -206,19 +204,19 @@ def test_rmsnorm_add_perf(M, N):
 
     aiter_ms = _bench(aiter_fn)
     speedup = _record("rmsnorm_add", f"M={M} N={N}", torch_ms, aiter_ms)
-    assert speedup >= MIN_SPEEDUP, (
-        f"rmsnorm_add M={M} N={N}: speedup {speedup:.3f}x < {MIN_SPEEDUP}x"
-    )
+    assert (
+        speedup >= MIN_SPEEDUP
+    ), f"rmsnorm_add M={M} N={N}: speedup {speedup:.3f}x < {MIN_SPEEDUP}x"
 
 
 # ===================================================================
 # 4. TopK Softmax (MoE routing)
 # ===================================================================
 TOPK_SHAPES = [
-    (1, 256, 8),     # decode, 256 experts, top-8
-    (32, 256, 8),    # small batch
-    (128, 256, 8),   # medium batch
-    (1, 64, 6),      # GPT-OSS-120B style
+    (1, 256, 8),  # decode, 256 experts, top-8
+    (32, 256, 8),  # small batch
+    (128, 256, 8),  # medium batch
+    (1, 64, 6),  # GPT-OSS-120B style
     (32, 64, 6),
 ]
 
@@ -231,18 +229,14 @@ def _torch_topk_softmax(gating_output, top_k, renormalize):
     return topk_weights, topk_indices
 
 
-@pytest.mark.parametrize(
-    "tokens,experts,top_k", TOPK_SHAPES, ids=lambda *a: f"{a}"
-)
+@pytest.mark.parametrize("tokens,experts,top_k", TOPK_SHAPES, ids=lambda *a: f"{a}")
 def test_topk_softmax_perf(tokens, experts, top_k):
     from aiter import topk_softmax
 
     gating = torch.randn(tokens, experts, device=DEVICE, dtype=torch.float32)
     topk_w = torch.empty(tokens, top_k, device=DEVICE, dtype=torch.float32)
     topk_i = torch.empty(tokens, top_k, device=DEVICE, dtype=torch.int32)
-    token_expert_i = torch.empty(
-        tokens, top_k, device=DEVICE, dtype=torch.int32
-    )
+    token_expert_i = torch.empty(tokens, top_k, device=DEVICE, dtype=torch.int32)
 
     torch_ms = _bench(lambda: _torch_topk_softmax(gating, top_k, True))
 
@@ -268,9 +262,9 @@ def test_topk_softmax_perf(tokens, experts, top_k):
 # ===================================================================
 MOE_SHAPES = [
     # (tokens, hidden, intermediate, experts, top_k)
-    (1, 7168, 2048, 256, 8),      # DeepSeek V3 decode
-    (32, 7168, 2048, 256, 8),     # small batch
-    (1, 4096, 14336, 8, 2),       # Mixtral-style
+    (1, 7168, 2048, 256, 8),  # DeepSeek V3 decode
+    (32, 7168, 2048, 256, 8),  # small batch
+    (1, 4096, 14336, 8, 2),  # Mixtral-style
 ]
 
 
@@ -320,13 +314,15 @@ def test_fused_moe_perf(tokens, hidden, inter, experts, top_k):
     topk_w = (topk_w / topk_w.sum(dim=-1, keepdim=True)).to(dtype)
     topk_i = topk_i.to(torch.int32)
 
-    torch_ms = _bench(
-        lambda: _torch_fused_moe(h, w1, w2, topk_w, topk_i, experts)
-    )
+    torch_ms = _bench(lambda: _torch_fused_moe(h, w1, w2, topk_w, topk_i, experts))
 
     aiter_ms = _bench(
         lambda: fused_moe(
-            h, w1, w2, topk_w, topk_i,
+            h,
+            w1,
+            w2,
+            topk_w,
+            topk_i,
             None,
             ActivationType.Swiglu,
             QuantType.No,
@@ -339,9 +335,9 @@ def test_fused_moe_perf(tokens, hidden, inter, experts, top_k):
         torch_ms,
         aiter_ms,
     )
-    assert speedup >= MIN_SPEEDUP, (
-        f"fused_moe tok={tokens}: speedup {speedup:.3f}x < {MIN_SPEEDUP}x"
-    )
+    assert (
+        speedup >= MIN_SPEEDUP
+    ), f"fused_moe tok={tokens}: speedup {speedup:.3f}x < {MIN_SPEEDUP}x"
 
 
 # ===================================================================
@@ -349,10 +345,10 @@ def test_fused_moe_perf(tokens, hidden, inter, experts, top_k):
 # ===================================================================
 MLA_DECODE_SHAPES = [
     # (batch, nhead, kv_len, kv_lora_rank, qk_rope_head_dim)
-    (1, 16, 4096, 512, 64),     # TP=2, 4K context
-    (1, 16, 16384, 512, 64),    # TP=2, 16K context
-    (8, 16, 4096, 512, 64),     # batch=8
-    (1, 128, 4096, 512, 64),    # TP=1
+    (1, 16, 4096, 512, 64),  # TP=2, 4K context
+    (1, 16, 16384, 512, 64),  # TP=2, 16K context
+    (8, 16, 4096, 512, 64),  # batch=8
+    (1, 128, 4096, 512, 64),  # TP=1
 ]
 
 
@@ -389,18 +385,14 @@ def test_mla_decode_perf(batch, nhead, kv_len, lora_rank, rope_dim):
     o = torch.zeros(batch, nhead, lora_rank, device=DEVICE, dtype=dtype)
 
     # Build paged KV metadata (contiguous, 1 token per page)
-    qo_indptr = torch.arange(
-        0, batch + 1, device=DEVICE, dtype=torch.int32
-    )
+    qo_indptr = torch.arange(0, batch + 1, device=DEVICE, dtype=torch.int32)
     kv_indptr = torch.arange(
         0, (batch + 1) * kv_len, kv_len, device=DEVICE, dtype=torch.int32
     )
-    kv_indices = torch.arange(
-        0, batch * kv_len, device=DEVICE, dtype=torch.int32
-    )
+    kv_indices = torch.arange(0, batch * kv_len, device=DEVICE, dtype=torch.int32)
     kv_last_page_lens = torch.ones(batch, device=DEVICE, dtype=torch.int32)
 
-    sm_scale = 1.0 / (D ** 0.5)
+    sm_scale = 1.0 / (D**0.5)
     kv_flat = kv_buffer.view(-1, D)
 
     torch_ms = _bench(
@@ -410,9 +402,15 @@ def test_mla_decode_perf(batch, nhead, kv_len, lora_rank, rope_dim):
     def aiter_fn():
         o.zero_()
         mla_decode_fwd(
-            q, kv_buffer, o, qo_indptr,
-            kv_indptr, kv_indices, kv_last_page_lens,
-            max_seqlen_q=1, sm_scale=sm_scale,
+            q,
+            kv_buffer,
+            o,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            max_seqlen_q=1,
+            sm_scale=sm_scale,
         )
         return o
 
@@ -460,9 +458,7 @@ def _write_report(request):
     print(f"Results: {passed}/{total} passed\n")
 
     # Write JSON report
-    report_path = os.getenv(
-        "AITER_PERF_REPORT_PATH", "perf_parity_report.json"
-    )
+    report_path = os.getenv("AITER_PERF_REPORT_PATH", "perf_parity_report.json")
     report = {
         "timestamp": datetime.datetime.now().isoformat(),
         "config": {
