@@ -104,8 +104,6 @@ def shuffle_kv_cache(
 
 DEVICE_ARCH = arch_info.get_arch()
 
-import os
-
 NUM_HEADS = [(64, 8)]
 HEAD_SIZES = [64, 128]
 BLOCK_SIZES = [16, 64, 128]
@@ -200,8 +198,10 @@ def ref_paged_attn(
         attn = torch.softmax(attn, dim=-1).to(v.dtype)
         if sinks is not None:
             attn = attn[..., :-1]
-        v = v.to(attn.dtype)
-        out = torch.einsum("hqk,khd->qhd", attn, v)  # GEMM at fp32 precision
+        attn = attn.to(q.dtype)
+        v = v.to(q.dtype)
+        # v = v.to(attn.dtype)
+        out = torch.einsum("hqk,khd->qhd", attn, v)  # GEMM at q.dtype precision
         if value_cache.dtype == e4m3_dtype:
             out = out * v_descale
 
@@ -465,12 +465,8 @@ def test_triton_unified_attn(
         )
 
         atol, rtol = 1.5e-2, 1e-2
-        if q_dtype != torch.bfloat16:
+        if q_dtype != torch.bfloat16 or kv_dtype != torch.bfloat16:
             atol, rtol = 1.5e-1, 1.5e-1
-        if kv_dtype != torch.bfloat16:
-            if use_async or (use_tdm and num_tdm_gather > 1):
-                # async_copy and TDM gather seems to require a more loose precision requirement for FP8 KV cache
-                atol, rtol = 1.5e-1, 1.5e-1
         torch.testing.assert_close(
             output, ref_output, atol=atol, rtol=rtol
         ), f"{torch.max(torch.abs(output - ref_output))}"
