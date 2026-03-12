@@ -1266,7 +1266,7 @@ def test_mla(
         #     attn_lse,
         #     msg=f"mla_decode-absorb_fp8 lse    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         # )
-        
+
         if not non_persistent_mode:
             partial_out_ref, partial_lse_ref, split_out_ref, split_lse_ref = (
                 torch_mla_split_kv_and_reduce(
