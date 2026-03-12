@@ -140,26 +140,12 @@ def ref_paged_attn(
     block_tables = block_tables.cpu().numpy()
     _, block_size, num_kv_heads, head_size = key_cache.shape
 
-    if (
-        query.dtype == key_cache.dtype and query.dtype in [torch.bfloat16, e4m3_dtype]
-    ) or (query.dtype == torch.bfloat16 and key_cache.dtype == e4m3_dtype):
-        if query.dtype == e4m3_dtype:
-            query = query.to(q_descale.dtype) * q_descale
-        if key_cache.dtype == e4m3_dtype:
-            key_cache = key_cache.to(k_descale.dtype) * k_descale
-            value_cache = value_cache.to(v_descale.dtype) * v_descale
-    else:
-        raise ValueError(
-            f"Unsupported dtype combination: Q dtype {query.dtype}, K cache dtype {key_cache.dtype}, and V cache dtype {value_cache.dtype}"
-        )
-
     outputs: list[torch.Tensor] = []
     start_idx = 0
     for i in range(num_seqs):
         query_len = query_lens[i]
         kv_len = kv_lens[i]
         q = query[start_idx : start_idx + query_len]
-        q *= scale
 
         num_kv_blocks = (kv_len + block_size - 1) // block_size
         block_indices = block_tables[i, :num_kv_blocks]
@@ -172,8 +158,11 @@ def ref_paged_attn(
         if q.shape[1] != k.shape[1]:
             k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
             v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
+        if q.dtype == e4m3_dtype:
+            q = q.to(torch.bfloat16)
         k = k.to(q.dtype)
         attn = torch.einsum("qhd,khd->hqk", q, k).float()  # GEMM at q.dtype precision
+        attn *= scale
         if query.dtype == e4m3_dtype:
             attn = attn * q_descale
         if key_cache.dtype == e4m3_dtype:
