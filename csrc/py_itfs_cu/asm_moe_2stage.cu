@@ -363,12 +363,18 @@ void moe_stage1_g1u1(
         stride_expert_GU *= 2;
     }
 
+    // Determine if this kernel uses the extended args layout (multix/lqq kernels)
+    // Old .co files expect the legacy arg size (up to ptr_SW + padding).
+    bool use_extended_args = (config_map == &cfg_fmoe_stage1_bf16_pertokenInt8_g1u1_multix);
+    static constexpr size_t legacy_arg_size = offsetof(KernelArgs, total_tgs);
+
     KernelArgs args;
-    size_t arg_size = sizeof(args);
-    args.ptr_O      = out.data_ptr();
-    args.ptr_X      = input.data_ptr();
-    args.ptr_GU     = w1.data_ptr();
-    args.ptr_XC     = num_valid_ids.data_ptr();
+    size_t arg_size = use_extended_args ? sizeof(args) : legacy_arg_size;
+    memset(&args, 0, sizeof(args));
+    args.ptr_O  = out.data_ptr();
+    args.ptr_X  = input.data_ptr();
+    args.ptr_GU = w1.data_ptr();
+    args.ptr_XC = num_valid_ids.data_ptr();
 
     args.ptr_XQ  = a1_scale.has_value() ? a1_scale.value().data_ptr() : nullptr;
     args.ptr_GUQ = w1_scale.has_value() ? w1_scale.value().data_ptr() : nullptr;
@@ -412,7 +418,7 @@ void moe_stage1_g1u1(
 
     int bdx = 256;
     int gdx = ((hidden_dim + sub_GU - 1) / sub_GU);
-    int gdy = sz_stp; // sub_X_cnt;
+    int gdy = use_extended_args ? sz_stp : sub_X_cnt;
     int gdz = k_num;
 
     // printf("####stage1 arg start############ \n");
