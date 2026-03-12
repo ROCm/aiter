@@ -433,8 +433,8 @@ def test_triton_unified_attn(
         (True, 4),
     ],
 )
-@pytest.mark.parametrize("shuffled_kv_cache", [True,])
-@pytest.mark.parametrize("skip_reference", [False,])
+@pytest.mark.parametrize("shuffled_kv_cache", [True, False])
+@pytest.mark.parametrize("check_ref", [False,])
 
 @torch.inference_mode()
 def test_gluon_unified_attn_2d(
@@ -450,7 +450,7 @@ def test_gluon_unified_attn_2d(
     use_tdm: bool,
     num_kv_blocks: int,
     shuffled_kv_cache: bool,
-    skip_reference: bool,
+    check_ref: bool,
 ) -> None:
 
     if DEVICE_ARCH not in (
@@ -555,7 +555,7 @@ def test_gluon_unified_attn_2d(
         use_tdm=use_tdm,
         shuffled_kv_cache=shuffled_kv_cache,
     )
-    if not skip_reference:
+    if check_ref:
         ref_output = ref_paged_attn(
             query=query,
             key_cache=key_cache,
