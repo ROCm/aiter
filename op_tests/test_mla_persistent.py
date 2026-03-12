@@ -746,6 +746,14 @@ def test_mla(
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
 
+        # # Turn on this if kernel has lse output
+        # lse_ref_reshaped = lse_ref_fp8.reshape(decode_qlen, batch_size, nhead).permute(1, 0, 2).reshape(total_q, nhead)
+        # checkAllclose(
+        #     lse_ref_reshaped,
+        #     attn_lse,
+        #     msg=f"mla_decode-absorb_fp8 lse    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+        # )
+
         cal_diff(out_ref, out_asm, "out", True)
         return err, us_asm_decode
 
