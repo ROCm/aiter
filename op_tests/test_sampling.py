@@ -41,6 +41,83 @@ def test_top_p_sampling(batch_size, vocab_size, p):
         assert torch.all(mask[torch.arange(batch_size), samples] == 1)
 
 
+def _create_controlled_probs_topp(scenario: str, vocab_size: int = 1000):
+    """
+    Create probability distributions for top-p sampling with well-separated values
+    where floating-point calculation errors cannot affect the boundary.
+
+    Returns: (probs, p, expected_valid_tokens)
+    """
+    probs = torch.zeros(vocab_size)
+
+    if scenario == "dominant":
+        # Single dominant token with prob > p threshold
+        probs[0] = 0.95
+        probs[1:] = 0.05 / (vocab_size - 1)
+        probs = probs / probs.sum()
+        p = 0.9
+        # Token 0 alone has prob ~0.95 > 0.9, so it's the only valid token
+        expected_valid = {0}
+
+    elif scenario == "two_valid":
+        # Two tokens with clear separation from the rest
+        probs[0] = 0.55
+        probs[1] = 0.40
+        probs[2:] = 0.05 / (vocab_size - 2)
+        probs = probs / probs.sum()
+        p = 0.9
+
+        expected_valid = {0, 1}
+
+    elif scenario == "boundary":
+        # Clear boundary where cumsum reaches p at a well-defined point
+        probs[0] = 0.50
+        probs[1] = 0.30
+        probs[2] = 0.12
+        probs[3:] = 0.08 / (vocab_size - 3)
+        probs = probs / probs.sum()
+        p = 0.7
+
+        expected_valid = {0, 1}
+
+    else:
+        raise ValueError(f"Unknown scenario: {scenario}")
+
+    return probs, p, expected_valid
+
+
+@pytest.mark.parametrize("scenario", ["dominant", "two_valid", "boundary"])
+@pytest.mark.parametrize("batch_size", [1, 10, 100])
+def test_top_p_deterministic_controlled(scenario, batch_size):
+    """
+    Test top-p sampling with controlled probability distributions where
+    floating-point calculation errors cannot affect the outcome.
+    """
+    torch.manual_seed(42)
+
+    probs_single, p, expected_valid = _create_controlled_probs_topp(scenario)
+
+    # Expand to batch
+    probs = probs_single.unsqueeze(0).expand(batch_size, -1).contiguous().to(0)
+
+    num_trials = 100
+    for trial in range(num_trials):
+        samples = torch.ops.aiter.top_p_sampling_from_probs(
+            probs,
+            None,
+            *_to_tensor_scalar_tuple(p),
+            deterministic=True,
+        )
+
+        # Verify all samples are within expected valid set
+        for b in range(batch_size):
+            sample_val = samples[b].item()
+            assert sample_val in expected_valid, (
+                f"Scenario '{scenario}', trial {trial}, batch {b}: "
+                f"sampled token {sample_val} not in expected valid set {expected_valid}"
+            )
+
+
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
@@ -115,7 +192,7 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p, k):
         ]
 
 
-def _create_controlled_probs(scenario: str, vocab_size: int = 1000):
+def _create_controlled_probs_topk_topp(scenario: str, vocab_size: int = 1000):
     """
     Create probability distributions with well-separated values where
     floating-point calculation errors cannot affect the top-k/top-p boundary.
@@ -185,7 +262,7 @@ def test_top_k_top_p_deterministic_controlled(scenario, batch_size):
     """
     torch.manual_seed(42)
 
-    probs_single, k, p, expected_valid = _create_controlled_probs(scenario)
+    probs_single, k, p, expected_valid = _create_controlled_probs_topk_topp(scenario)
 
     # Expand to batch
     probs = probs_single.unsqueeze(0).expand(batch_size, -1).contiguous()
