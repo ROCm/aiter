@@ -120,9 +120,9 @@ def torch_gelu_ref(x: torch.Tensor) -> torch.Tensor:
     out = ACT2FN["gelu_pytorch_tanh"](x)
     return out
 
-def gelu_fast_vec_wrapper(input: torch.Tensor) -> torch.Tensor:
+def gelu_fast_wrapper(input: torch.Tensor) -> torch.Tensor:
     out = torch.randn_like(input)
-    aiter.gelu_fast_vec(out, input)
+    aiter.gelu_fast(out, input)
     return out
 
 @benchmark()
@@ -130,14 +130,16 @@ def test_gelu_fast(m, n, dtype, output_dtype=None):
     ret = {}
     input = torch.randn(m, 1, n, dtype=dtype, device="cuda")
     out_dtype = output_dtype if output_dtype is not None else dtype
-    ref = torch_gelu_ref(input)
+
+    out, us_aiter = run_perftest(
+        gelu_fast_wrapper,
+        input)
+    ref, us_torch = run_perftest(
+        torch_gelu_ref,
+        input)
 
     if output_dtype is not None:
         ref = ref.to(output_dtype)
-
-    out, us_aiter = run_perftest(
-        gelu_fast_vec_wrapper,
-        input)
 
     # Check if the results are close
     err = checkAllclose(ref, out)
@@ -150,6 +152,9 @@ def test_gelu_fast(m, n, dtype, output_dtype=None):
     ret["M"] = m
     ret["N"] = n
     ret["us"] = us_aiter
+    ret["torch_us"] = us_torch
+    ret["speedup_vs_torch"] = us_torch / us_aiter
+    ret["perf_gain_vs_torch_pct"] = (us_torch - us_aiter) / us_torch * 100.0
     ret["TB/s"] = (input.nbytes + out.nbytes) / us_aiter / 1e6
     ret["RD TB/s"] = (input.nbytes) / us_aiter / 1e6
     ret["WR TB/s"] = (out.nbytes) / us_aiter / 1e6
