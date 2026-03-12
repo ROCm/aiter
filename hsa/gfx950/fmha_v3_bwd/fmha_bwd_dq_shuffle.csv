@@ -1,0 +1,5 @@
+dtype,hdim_q,hdim_v,mask,atomic32,pssk,pddv,mode,bf16_cvt,ts_qo,ts,knl_name,co_name
+bf16,192,192,0,0,0,0,0,3,0,64,_ZN5aiter25fmha_bwd_hd192_dq_shuffleE,bwd_hd192_dq_shuffle.co
+bf16,192,192,0,0,0,0,1,3,0,64,_ZN5aiter31fmha_bwd_hd192_dq_shuffle_groupE,bwd_hd192_dq_shuffle_group.co
+bf16,128,128,0,0,0,0,0,3,0,64,_ZN5aiter25fmha_bwd_hd128_dq_shuffleE,bwd_hd128_dq_shuffle.co
+bf16,128,128,0,0,0,0,1,3,0,64,_ZN5aiter31fmha_bwd_hd128_dq_shuffle_groupE,bwd_hd128_dq_shuffle_group.co

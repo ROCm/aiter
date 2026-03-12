@@ -29,7 +29,6 @@ from typing import Callable, Dict, Optional
 import threading
 import triton.compiler.compiler as triton_compiler
 
-
 # Use thread-local storage to avoid multi-threading race conditions
 _thread_local = threading.local()
 

@@ -25,6 +25,8 @@ GFX_MAP = {
     13: "gfx1151",
     14: "gfx1152",
     15: "gfx1153",
+    16: "gfx1200",
+    17: "gfx1201",
 }
 
 
@@ -65,12 +67,14 @@ def get_gfx_custom_op_core() -> int:
             )
             output = result.stdout
             for line in output.split("\n"):
-                if "gfx" in line.lower():
+                match = re.search(r"\b(gfx\w+)\b", line, re.IGNORECASE)
+                if match:
+                    gfx_arch = match.group(1).lower()
                     try:
-                        return gfx_mapping[line.split(":")[-1].strip()]
+                        return gfx_mapping[gfx_arch]
                     except KeyError:
                         raise KeyError(
-                            f'Unknown GPU architecture: {line.split(":")[-1].strip()}. '
+                            f"Unknown GPU architecture: {gfx_arch}. "
                             f"Supported architectures: {list(gfx_mapping.keys())}"
                         )
 

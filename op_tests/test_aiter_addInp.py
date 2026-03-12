@@ -1,11 +1,92 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
 from torch.profiler import profile, ProfilerActivity
 from aiter import dtypes
+import argparse
 
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
+parser.add_argument(
+    "-s",
+    "--shape",
+    nargs="*",
+    type=dtypes.str2tuple,
+    choices=[
+        (512,),
+        (1280, 232, 256),
+        (256, 256),
+        (256, 8192),
+        (256,),
+        (1280, 32, 256),
+        (384, 256),
+        (384,),
+        (65536,),
+        (65536, 256),
+        (1, 8, 256),
+        (512, 256),
+        (1280, 532, 256),
+    ],
+    default=[
+        (512,),
+        (1280, 232, 256),
+        (256, 256),
+        (256, 8192),
+        (256,),
+        (1280, 32, 256),
+        (384, 256),
+        (384,),
+        (65536,),
+        (65536, 256),
+        (1, 8, 256),
+        (512, 256),
+        (1280, 532, 256),
+    ],
+    help="""Input shapes.  Dimensionality must match dimensionality of stride (-st).
+    e.g.: -s 1280,232,256""",
+)
+parser.add_argument(
+    "-st",
+    "--stride",
+    nargs="*",
+    type=dtypes.str2tuple,
+    choices=[
+        (1,),
+        (59392, 256, 1),
+        (256, 1),
+        (8192, 1),
+        (1,),
+        (8192, 256, 1),
+        (256, 1),
+        (1,),
+        (1,),
+        (256, 1),
+        (2048, 256, 1),
+        (256, 1),
+        (136192, 256, 1),
+    ],
+    default=[
+        (1,),
+        (59392, 256, 1),
+        (256, 1),
+        (8192, 1),
+        (1,),
+        (8192, 256, 1),
+        (256, 1),
+        (1,),
+        (1,),
+        (256, 1),
+        (2048, 256, 1),
+        (256, 1),
+        (136192, 256, 1),
+    ],
+    help="""Input strides. Dimensionality must match dimensionality of shape (-s).
+    e.g.: -st 59392,256,1""",
+)
 # input shape: torch.Size([4096, 64, 160]) (20480, 1, 128)
 # other shape: torch.Size([4096, 64, 160]) (10240, 160, 1)
 
@@ -28,47 +109,15 @@ from aiter import dtypes
 # stride1 = (160, 160, 1)
 # stride0 = (655360, 160, 1)
 
-shapes = [
-    (512,),
-    (1280, 232, 256),
-    (256, 256),
-    (256, 8192),
-    (256,),
-    (1280, 32, 256),
-    (384, 256),
-    (384,),
-    (65536,),
-    (65536, 256),
-    (1, 8, 256),
-    (512, 256),
-    (1280, 532, 256),
-]
-strides = [
-    (1,),
-    (59392, 256, 1),
-    (256, 1),
-    (8192, 1),
-    (1,),
-    (8192, 256, 1),
-    (256, 1),
-    (1,),
-    (1,),
-    (256, 1),
-    (2048, 256, 1),
-    (256, 1),
-    (136192, 256, 1),
-]
-
-# shapes = [(32,)]
-# strides = [(1,)]
+args = parser.parse_args()
 
 tensors0 = [
     torch.empty_strided(shape, stride, dtype=dtypes.bf16, device="cuda")
-    for shape, stride in zip(shapes, strides)
+    for shape, stride in zip(args.shape, args.stride)
 ]
 tensors1 = [
     torch.empty_strided(shape, stride, dtype=dtypes.bf16, device="cuda")
-    for shape, stride in zip(shapes, strides)
+    for shape, stride in zip(args.shape, args.stride)
 ]
 for tensor in tensors0:
     tensor.copy_(torch.rand_like(tensor))

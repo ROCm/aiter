@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
 # Imports.
@@ -15,10 +15,9 @@ import triton
 import triton.language as tl
 
 # AITER
-from ..utils.core import AITER_TRITON_CONFIGS_PATH
-from ..utils._triton import arch_info
-from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
-
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 # Kernel config.
 # ------------------------------------------------------------------------------
@@ -34,9 +33,8 @@ def get_config(
         "nptgmm",
     }, f"'{gmm_type}' is an invalid GMM variant."
     if not hasattr(get_config, "_config_dict"):
-        config_filename = os.path.join(
-            AITER_TRITON_CONFIGS_PATH, f"{arch_info.get_arch()}-GMM.json"
-        )
+        dev = arch_info.get_arch()
+        config_filename = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-GMM.json"
         assert os.path.exists(config_filename) and os.path.isfile(
             config_filename
         ), f"'{config_filename}' isn't an existent file."

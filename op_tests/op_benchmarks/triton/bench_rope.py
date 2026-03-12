@@ -1,10 +1,8 @@
 import argparse
-import sys
 import torch
 from triton.testing import runtime
-from op_tests.triton_tests.rope.test_rope import generate_rope_inputs
-from aiter.ops.triton.rope import RotateStyle
-from aiter.ops.triton.rope import (
+from aiter.ops.triton.rope.rope import RotateStyle
+from aiter.ops.triton.rope.rope import (
     rope_fwd,
     rope_fwd_inplace,
     rope_bwd,
@@ -29,6 +27,7 @@ from aiter.ops.triton.rope import (
     # rope_fwd_2d,
     # rope_fwd_2d_inplace,
 )
+from op_tests.triton_tests.rope.test_rope import generate_rope_inputs
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_available_models,
@@ -531,7 +530,7 @@ def run_benchmark(args):
     )
 
 
-def parse_args():
+def parse_args(args: list[str] | None = None):
     parser = argparse.ArgumentParser(
         prog="Benchmark RoPE",
         description="This script will not print out runtime as short running kernels cannot be measured accurately through triton.testing.do_bench function, please use rocprof to measure accurate runtime. For instance, try \"rocprofv2 --kernel-trace python bench_rope.py -l 'thd' -T 1 -H 128 -D 64 --two_inputs=true\"",
@@ -603,14 +602,14 @@ def parse_args():
     parser.add_argument(
         "--repeat", type=int, help="number of repetition for benchmark", default=1000
     )
-    args = parser.parse_args()
+    args = parser.parse_args(args=args)
     return args
 
 
-def main():
-    args = parse_args()
-    run_benchmark(args)
+def main(args: list[str] | None = None) -> None:
+    parsed_args = parse_args(args=args)
+    run_benchmark(parsed_args)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

@@ -1,8 +1,8 @@
 # Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
-# Copyright (C) 2023-2025 The vLLM team.
+# Copyright (C) 2023-2026 The vLLM team.
 # Adapted from
 # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/parallel_state.py
-# Copyright (C) 2022-2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (C) 2022-2026, NVIDIA CORPORATION. All rights reserved.
 """vLLM distributed state.
 It takes over the control of the distributed environment from PyTorch.
 The typical workflow is:
@@ -20,6 +20,7 @@ If you only need to use the distributed environment without model/pipeline
  parallelism, you can skip the model parallel initialization and destruction
  steps.
 """
+
 import contextlib
 import pickle
 import weakref
@@ -142,15 +143,55 @@ def fused_allreduce_rmsnorm_(
     return group._fused_allreduce_rmsnorm_out_place(inp, res_inp, w, eps)
 
 
+def fused_allreduce_rmsnorm_quant_fake(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty_like(res_inp),
+        torch.empty_like(inp),
+        torch.empty(inp.shape[:-1] + (1,), dtype=torch.float32, device=inp.device()),
+    )
+
+
+@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_fake)
+def fused_allreduce_rmsnorm_quant_(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_allreduce_rmsnorm_quant_out_place(inp, res_inp, w, eps)
+
+
 if supports_custom_op():
 
     # @torch.library.custom_op("aiter::outplace_all_gather", mutates_args=[])
-    def outplace_all_gather(input: torch.Tensor, group_name: str) -> torch.Tensor:
+    def outplace_all_gather(
+        input: torch.Tensor, group_name: str, dim: int = 0
+    ) -> torch.Tensor:
         assert group_name in _groups, f"Group {group_name} is not found."
         group = _groups[group_name]()
         if group is None:
             raise ValueError(f"Group {group_name} is destroyed.")
-        return group._all_gather_out_place(input)
+        return group._all_gather_out_place(input, dim)
+
+    def outplace_reduce_scatter(
+        input: torch.Tensor, output: torch.Tensor, group_name: str, dim: int
+    ) -> torch.Tensor:
+        assert group_name in _groups, f"Group {group_name} is not found."
+        group = _groups[group_name]()
+        if group is None:
+            raise ValueError(f"Group {group_name} is destroyed.")
+        return group._reduce_scatter_out_place(input, output, dim)
 
 
 class GroupCoordinator:
@@ -366,6 +407,17 @@ class GroupCoordinator:
             input_, residual_inp_, weight_, eps, group_name=self.unique_name
         )
 
+    def fused_allreduce_rmsnorm_quant(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return fused_allreduce_rmsnorm_quant_(
+            input_, residual_inp_, weight_, eps, group_name=self.unique_name
+        )
+
     def _fused_allreduce_rmsnorm_out_place(
         self,
         input_: torch.Tensor,
@@ -379,27 +431,68 @@ class GroupCoordinator:
             input_, residual_inp_, weight_, eps
         )
 
-    def _all_gather_out_place(self, input_: torch.Tensor) -> torch.Tensor:
+    def _fused_allreduce_rmsnorm_quant_out_place(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_rmsnorm_quant(
+            input_, residual_inp_, weight_, eps
+        )
+
+    def _all_gather_out_place(self, input_: torch.Tensor, dim: int = 0) -> torch.Tensor:
         ca_comm = self.device_communicator.ca_comm
         assert ca_comm is not None
         assert not ca_comm.disabled
-        out = ca_comm.custom_all_gather(input_)
+        out = ca_comm.custom_all_gather(input_, dim)
         assert out is not None
         return out
 
     def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor:
         return outplace_all_gather(input_, group_name=self.unique_name)
 
-    def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
+    # didn't support dim in custom reduce_scatter
+    def _reduce_scatter_out_place(
+        self, input_: torch.Tensor, output_: torch.Tensor, dim: int = 0
+    ):
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.reduce_scatter(input_, dim)
+        return self.device_communicator.reduce_scatter(input_, output_, dim)
+
+    def reduce_scatter_tensor(
+        self, input_: torch.Tensor, use_custom: bool = True, dim: int = 0
+    ):
+        # return outplace_reduce_scatter(input_, group_name=self.unique_name, dim=dim)
+        world_size = self.world_size
+        assert world_size > 1, "error! world_size = 1"
+        assert (
+            input_.numel() % world_size == 0
+        ), "input shape error, input.numel() % world_size should equals to 0"
+        if input_.shape[0] % world_size == 0:
+            out_dim0 = input_.shape[0] // world_size
+            out_shape = (out_dim0,) + input_.shape[1:]
+        else:
+            out_shape = (input_.numel() // world_size,)
+
+        output_ = torch.empty(out_shape, dtype=input_.dtype, device=input_.device)
+        if use_custom:
+            outplace_reduce_scatter(
+                input_, output_, group_name=self.unique_name, dim=dim
+            )
+        else:
+            torch.distributed.reduce_scatter_tensor(
+                output_, input_, group=self.device_group
+            )
+        return output_
 
     def all_gather(
         self, input_: torch.Tensor, use_custom: bool = False, dim: int = -1
     ) -> torch.Tensor:
         world_size = self.world_size
-        # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
         assert (
@@ -407,22 +500,25 @@ class GroupCoordinator:
         ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
 
         if dim < 0:
-            # Convert negative dim to positive.
             dim += input_.dim()
         input_size = input_.size()
-        if use_custom:
-            output_tensor = outplace_all_gather(input_, group_name=self.unique_name)
-            output_tensor = output_tensor.reshape((world_size,) + input_size)
-        else:
-            # Allocate output tensor.
-            output_tensor = torch.empty(
-                (world_size,) + input_size, dtype=input_.dtype, device=input_.device
-            )
-            # All-gather.
-            torch.distributed.all_gather_into_tensor(
-                output_tensor, input_, group=self.device_group
-            )
-        # Reshape
+
+        is_last_dim = dim == input_.dim() - 1
+        can_use_custom = use_custom and (
+            dim == 0
+            or (is_last_dim and input_size[-1] * input_.element_size() % 16 == 0)
+        )
+
+        if can_use_custom:
+            return outplace_all_gather(input_, group_name=self.unique_name, dim=dim)
+
+        # NCCL path
+        output_tensor = torch.empty(
+            (world_size,) + input_size, dtype=input_.dtype, device=input_.device
+        )
+        torch.distributed.all_gather_into_tensor(
+            output_tensor, input_, group=self.device_group
+        )
         output_tensor = output_tensor.movedim(0, dim)
         output_tensor = output_tensor.reshape(
             input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
@@ -1215,6 +1311,16 @@ def destroy_model_parallel():
     if _PP:
         _PP.destroy()
     _PP = None
+
+    global _DP
+    if _DP:
+        _DP.destroy()
+    _DP = None
+
+    global _EP
+    if _EP:
+        _EP.destroy()
+    _EP = None
 
 
 def destroy_distributed_environment():

@@ -1,13 +1,24 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import pytest
 import torch.nn.functional as F
-from aiter.ops.triton.gemm_a8w8 import gemm_a8w8
+from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8 as triton_gemm_a8w8
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8 import _get_config
+from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
+from aiter.ops.triton.gluon.gemm_a8w8 import (
+    gemm_a8w8 as gluon_gemm_a8w8,
+    gemm_a8w8_preshuffle as gluon_gemm_a8w8_preshuffle,
+)
 from aiter.ops.triton.utils.types import get_fp8_dtypes
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from typing import Union
+
+from aiter.ops.shuffle import shuffle_weight
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+
+DEVICE_ARCH = arch_info.get_arch()
 
 
 def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
@@ -19,8 +30,10 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
     return out.to(dtype)
 
 
-def run_triton(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16, y=None):
-    return gemm_a8w8(x, weight, x_scale, w_scale, bias, dtype, y)
+def run_triton(
+    x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16, y=None, impl=None
+):
+    return impl(x, weight, x_scale, w_scale, bias, dtype, y)
 
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
@@ -73,6 +86,27 @@ def get_x_vals():
     return x_vals
 
 
+def get_splitk_x_vals():
+    return [
+        (1, 1280, 8192),
+        (32, 1280, 8192),
+        (64, 1280, 8192),
+        (128, 1280, 8192),
+        (256, 1280, 8192),
+        (1, 8192, 1024),
+        (32, 8192, 1024),
+        (64, 8192, 1024),
+        (128, 8192, 1024),
+        (256, 8192, 1024),
+        (1024, 1024, 1000),
+        (1024, 1024, 1024),
+        (1024, 1024, 4096),
+        (1024, 4096, 4096),
+        (2048, 2048, 2048),
+        (4096, 4096, 4096),
+    ]
+
+
 def generate_gemm_a8w8_inputs(
     M: int,
     N: int,
@@ -80,7 +114,8 @@ def generate_gemm_a8w8_inputs(
     in_dtype: Union[torch.dtype, str],
     out_dtype: Union[torch.dtype, str],
     layout: str = "TN",
-    output=False,
+    output: bool = False,
+    shuffle: bool = False,
 ):
     """
     The GEMM kernel expects:
@@ -110,11 +145,20 @@ def generate_gemm_a8w8_inputs(
 
     bias = torch.rand([1, N], dtype=torch.float32, device="cuda") * 10
 
+    if shuffle:
+        weight_shuffle_layout = (16, 16)
+        weight_shuffled = shuffle_weight(weight, weight_shuffle_layout).reshape(
+            weight.shape[0] // weight_shuffle_layout[0],
+            weight.shape[1] * weight_shuffle_layout[0],
+        )
+    else:
+        weight_shuffled = weight
+
     y = None
     if output:
         y = torch.empty((M, N), dtype=out_dtype, device="cuda")
 
-    return x, weight, x_scale, w_scale, bias, y
+    return x, weight, weight_shuffled, x_scale, w_scale, bias, y
 
 
 @pytest.mark.parametrize(
@@ -122,19 +166,42 @@ def generate_gemm_a8w8_inputs(
     [
         (in_dtype, out_dtype, *shape, layout, output)
         for in_dtype in ["fp8e4m3", "fp8e5m2", "int8"]
-        for out_dtype in ["bf16"]
+        for out_dtype in ["bf16", "fp16", "fp32", "int32"]
         for shape in get_x_vals()
         for layout in ["TN", "TT", "NN", "NT"]
         for output in [True, False]
     ],
 )
-def test_gemm(in_dtype, out_dtype, m, n, k, layout, output):
+@pytest.mark.parametrize(
+    "impl",
+    [
+        "triton",
+        "gluon",
+        "gluon_shuffle",
+    ],
+)
+def test_gemm(in_dtype, out_dtype, m, n, k, layout, output, impl: str):
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
+    if out_dtype == "int32" and in_dtype in ["fp8e4m3", "fp8e5m2"]:
+        pytest.skip(
+            "This kernel is not supported for in_dtype of float and out_dtype of int."
+        )
+
+    if impl in ["gluon", "gluon_shuffle"] and DEVICE_ARCH != "gfx950":
+        pytest.skip(
+            "Gluon implementation is not supported on this device (requires CDNA4)."
+        )
+
+    if impl == "gluon_shuffle" and (n % 16 != 0 or k % 32 != 0):
+        pytest.skip(
+            "For preshuffle, N must be multiple of 16 and K must be multiple of 32."
+        )
+
     in_dtype = str_to_torch_dtype[in_dtype]
     out_dtype = str_to_torch_dtype[out_dtype]
-    x, weight, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
+    x, weight, weight_triton, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
         M=m,
         N=n,
         K=k,
@@ -142,9 +209,133 @@ def test_gemm(in_dtype, out_dtype, m, n, k, layout, output):
         out_dtype=out_dtype,
         layout=layout,
         output=output,
+        shuffle=("_shuffle" in impl),
     )
 
     a = run_torch(x, weight, x_scale, w_scale, bias, out_dtype)
-    b = run_triton(x, weight, x_scale, w_scale, bias, out_dtype, y)
+    if impl == "triton":
+        impl = triton_gemm_a8w8
+    elif impl == "gluon":
+        impl = gluon_gemm_a8w8
+    elif impl == "gluon_shuffle":
+        impl = gluon_gemm_a8w8_preshuffle
+    else:
+        raise ValueError(f"Unknown implementation: {impl}")
+    b = run_triton(x, weight_triton, x_scale, w_scale, bias, out_dtype, y, impl)
 
+    if out_dtype in [torch.int8, torch.int32]:
+        torch.testing.assert_close(a, b, atol=1, rtol=1e-2)
+    else:
+        torch.testing.assert_close(a, b, atol=0.02, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "in_dtype, out_dtype, m, n, k",
+    [
+        (in_dtype, out_dtype, *shape)
+        for in_dtype in ["fp8e4m3", "fp8e5m2", "int8"]
+        for out_dtype in ["bf16", "fp32"]
+        for shape in get_splitk_x_vals()
+    ],
+)
+@pytest.mark.parametrize("num_ksplit", [2, 4, 8])
+@pytest.mark.parametrize("has_bias", [True, False])
+def test_gemm_splitk(in_dtype, out_dtype, m, n, k, num_ksplit, has_bias):
+
+    torch.cuda.empty_cache()
+
+    if out_dtype == "int32" and in_dtype in ["fp8e4m3", "fp8e5m2"]:
+        pytest.skip(
+            "This kernel is not supported for in_dtype of float and out_dtype of int."
+        )
+
+    in_dtype = str_to_torch_dtype[in_dtype]
+    out_dtype = str_to_torch_dtype[out_dtype]
+    x, weight, weight_triton, x_scale, w_scale, bias, _ = generate_gemm_a8w8_inputs(
+        M=m,
+        N=n,
+        K=k,
+        in_dtype=in_dtype,
+        out_dtype=out_dtype,
+        layout="TN",
+        output=False,
+    )
+
+    if not has_bias:
+        bias = None
+
+    config, _ = _get_config(m, n, k)
+    config["NUM_KSPLIT"] = num_ksplit
+    compute_splitk_params(config, k)
+
+    a = run_torch(x, weight, x_scale, w_scale, bias, out_dtype)
+    b = triton_gemm_a8w8(
+        x,
+        weight_triton,
+        x_scale,
+        w_scale,
+        bias,
+        out_dtype,
+        config=config,
+    )
+
+    if out_dtype in [torch.int8, torch.int32]:
+        torch.testing.assert_close(a, b, atol=1, rtol=1e-2)
+    else:
+        torch.testing.assert_close(a, b, atol=0.02, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "in_dtype, out_dtype, m, n, k",
+    [
+        (in_dtype, out_dtype, *shape)
+        for in_dtype in ["fp8e4m3"]
+        for out_dtype in ["bf16"]
+        for shape in [
+            (64, 1280, 8192),
+            (128, 1280, 8192),
+            (1024, 4096, 4096),
+        ]
+    ],
+)
+@pytest.mark.parametrize("num_ksplit", [2, 4])
+def test_gemm_splitk_skip_reduce(in_dtype, out_dtype, m, n, k, num_ksplit):
+
+    torch.cuda.empty_cache()
+
+    in_dtype = str_to_torch_dtype[in_dtype]
+    out_dtype = str_to_torch_dtype[out_dtype]
+    x, weight, weight_triton, x_scale, w_scale, bias, _ = generate_gemm_a8w8_inputs(
+        M=m,
+        N=n,
+        K=k,
+        in_dtype=in_dtype,
+        out_dtype=out_dtype,
+        layout="TN",
+        output=False,
+    )
+
+    config, _ = _get_config(m, n, k)
+    config["NUM_KSPLIT"] = num_ksplit
+    compute_splitk_params(config, k)
+
+    a = run_torch(x, weight, x_scale, w_scale, None, out_dtype)
+
+    y_pp = triton_gemm_a8w8(
+        x,
+        weight_triton,
+        x_scale,
+        w_scale,
+        None,
+        out_dtype,
+        config=config,
+        skip_reduce=True,
+    )
+
+    assert y_pp.dim() == 3, f"Expected 3D tensor, got {y_pp.dim()}D"
+    assert (
+        y_pp.shape[1] == m and y_pp.shape[2] == n
+    ), f"Expected shape (*, {m}, {n}), got {y_pp.shape}"
+
+    b = y_pp.sum(dim=0).to(out_dtype)
     torch.testing.assert_close(a, b, atol=0.02, rtol=1e-2)

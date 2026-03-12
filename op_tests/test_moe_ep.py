@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
@@ -67,6 +67,7 @@ def asm_moe_test(
     fc2_smooth_scale=None,  # [expert, 1, inter_dim]
     a16=False,
     expert_mask=None,
+    local_expert_hash=None,
 ):
 
     return asm_moe(
@@ -81,6 +82,7 @@ def asm_moe_test(
         fc2_smooth_scale,
         a16,
         expert_mask=expert_mask,
+        local_expert_hash=local_expert_hash,
     )
 
 
@@ -269,6 +271,11 @@ def test_fmoe_ep(
         # b implement
         w1b = shuffle_weight(w1)
         w2b = shuffle_weight(w2)
+        local_expert_hash = None
+        if expert_mask is not None and use_smooth:
+            local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
+            local_expert_hash[local_expert_hash > 0] -= 1
+            local_expert_hash[expert_mask == 0] = -1
         out_b, avg_b = asm_moe_test(
             input,
             w1b,
@@ -280,6 +287,7 @@ def test_fmoe_ep(
             fc1_smooth_scale,
             fc2_smooth_scale,
             expert_mask=expert_mask,
+            local_expert_hash=local_expert_hash,
         )
 
         def calculateTensorsSize(*args):
@@ -345,21 +353,21 @@ parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="select test",
 )
-l_test = [
-    "test_fmoe_16_bit",
-    "g1u1_no_quant",
-    "g1u1_int8quant",
-    "g1u1_fp8quant",
-    "g1u0_int8smoothquant",
-    "g1u1_int8smoothquant",
-    "g1u1_fp8smoothquant",
-]
+
 parser.add_argument(
     "-t",
     "--test",
     type=str,
-    choices=l_test,
-    default=None,
+    nargs="*",
+    default=[
+        "test_fmoe_16_bit",
+        "g1u1_no_quant",
+        "g1u1_int8quant",
+        "g1u1_fp8quant",
+        "g1u0_int8smoothquant",
+        "g1u1_int8smoothquant",
+        "g1u1_fp8smoothquant",
+    ],
     help="""Select test to run.
     e.g.: -t g1u1_int8quant
           or -t test_fmoe_16_bit
@@ -373,9 +381,9 @@ parser.add_argument(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    nargs="?",
-    default=None,
+    type=dtypes.str2Dtype,
+    nargs="*",
+    default=[dtypes.d_dtypes["bf16"]],
     help="""Data type.
     e.g.: -d bf16""",
 )
@@ -384,7 +392,7 @@ parser.add_argument(
     "--token",
     type=int,
     nargs="*",
-    default=None,
+    default=[128],
     help="""Token Num.
     e.g.: -m 128""",
 )
@@ -393,7 +401,7 @@ parser.add_argument(
     "--hidden_dim",
     type=int,
     nargs="*",
-    default=None,
+    default=[4096],
     help="""Hidden states dim.
     e.g.: -hd 4096""",
 )
@@ -402,7 +410,7 @@ parser.add_argument(
     "--inter_dim",
     type=int,
     nargs="*",
-    default=None,
+    default=[1024],
     help="""Intermediate dim.
     e.g.: -id 1024""",
 )
@@ -411,7 +419,7 @@ parser.add_argument(
     "--expert",
     type=int,
     nargs="?",
-    default=None,
+    default=32,
     help="""Number of experts.
     e.g.: -e 32""",
 )
@@ -420,7 +428,7 @@ parser.add_argument(
     "--topk",
     type=int,
     nargs="?",
-    default=None,
+    default=5,
     help="""Top-k value.
     e.g.: -k 5""",
 )
@@ -429,16 +437,14 @@ parser.add_argument(
     "--expert_parallelism",
     type=int,
     nargs="*",
-    default=None,
+    default=[8],
     help="""Expert Parallelism.
     e.g.: -ep 8""",
 )
 
 args = parser.parse_args()
-if args.test is not None:
-    l_test = [args.test]
 
-for test in l_test:
+for test in args.test:
     print(f"\nRunning test: {test}")
     if test == "test_fmoe_16_bit":
         print("test test_fmoe 16 bit")
@@ -453,25 +459,13 @@ for test in l_test:
         #                     )
 
     elif test == "g1u1_no_quant":
-        for dtype in (
-            [dtypes.fp16, dtypes.bf16]
-            if args.dtype is None
-            else [dtypes.d_dtypes[args.dtype]]
-        ):
-            for m in [7, 128, 256] if args.token is None else args.token:
-                for hdim in (
-                    [4096, 8192] if args.hidden_dim is None else args.hidden_dim
-                ):
-                    for idim in (
-                        [1024, 1280] if args.inter_dim is None else args.inter_dim
-                    ):
-                        for ep in (
-                            [4, 8]
-                            if args.expert_parallelism is None
-                            else args.expert_parallelism
-                        ):
-                            expert = 128 if args.expert is None else args.expert
-                            topk = 9 if args.topk is None else args.topk
+        for dtype in args.dtype:
+            for m in args.token:
+                for hdim in args.hidden_dim:
+                    for idim in args.inter_dim:
+                        for ep in args.expert_parallelism:
+                            expert = args.expert
+                            topk = args.topk
                             test_fmoe_ep(
                                 dtype,
                                 m,
@@ -485,21 +479,13 @@ for test in l_test:
                                 ep=ep,
                             )
     elif test == "g1u1_int8quant":
-        for dtype in (
-            [dtypes.bf16] if args.dtype is None else [dtypes.d_dtypes[args.dtype]]
-        ):
-            for m in [128, 256] if args.token is None else args.token:
-                for hdim in (
-                    [4096, 8192] if args.hidden_dim is None else args.hidden_dim
-                ):
-                    for idim in [1024] if args.inter_dim is None else args.inter_dim:
-                        expert = 32 if args.expert is None else args.expert
-                        topk = 5 if args.topk is None else args.topk
-                        for ep in (
-                            [4, 8]
-                            if args.expert_parallelism is None
-                            else args.expert_parallelism
-                        ):
+        for dtype in args.dtype:
+            for m in args.token:
+                for hdim in args.hidden_dim:
+                    for idim in args.inter_dim:
+                        expert = args.expert
+                        topk = args.topk
+                        for ep in args.expert_parallelism:
                             test_fmoe_ep(
                                 dtype,
                                 m,
@@ -513,21 +499,13 @@ for test in l_test:
                                 ep=ep,
                             )
     elif test == "g1u1_fp8quant":
-        for dtype in (
-            [dtypes.bf16] if args.dtype is None else [dtypes.d_dtypes[args.dtype]]
-        ):
-            for m in [128, 256] if args.token is None else args.token:
-                for hdim in (
-                    [4096, 8192] if args.hidden_dim is None else args.hidden_dim
-                ):
-                    for idim in [1024] if args.inter_dim is None else args.inter_dim:
-                        expert = 32 if args.expert is None else args.expert
-                        topk = 5 if args.topk is None else args.topk
-                        for ep in (
-                            [4, 8]
-                            if args.expert_parallelism is None
-                            else args.expert_parallelism
-                        ):
+        for dtype in args.dtype:
+            for m in args.token:
+                for hdim in args.hidden_dim:
+                    for idim in args.inter_dim:
+                        expert = args.expert
+                        topk = args.topk
+                        for ep in args.expert_parallelism:
                             test_fmoe_ep(
                                 dtype,
                                 m,
@@ -541,23 +519,13 @@ for test in l_test:
                                 ep=ep,
                             )
     elif test == "g1u0_int8smoothquant":
-        for dtype in (
-            [dtypes.bf16] if args.dtype is None else [dtypes.d_dtypes[args.dtype]]
-        ):
-            for m in [128] if args.token is None else args.token:
-                for hdim in (
-                    [4096, 6144, 8192] if args.hidden_dim is None else args.hidden_dim
-                ):
-                    for idim in (
-                        [512, 1024] if args.inter_dim is None else args.inter_dim
-                    ):
-                        expert = 32 if args.expert is None else args.expert
-                        topk = 5 if args.topk is None else args.topk
-                        for ep in (
-                            [4, 8]
-                            if args.expert_parallelism is None
-                            else args.expert_parallelism
-                        ):
+        for dtype in args.dtype:
+            for m in args.token:
+                for hdim in args.hidden_dim:
+                    for idim in args.inter_dim:
+                        expert = args.expert
+                        topk = args.topk
+                        for ep in args.expert_parallelism:
                             test_fmoe_ep(
                                 dtype,
                                 m,
@@ -571,19 +539,13 @@ for test in l_test:
                                 ep=ep,
                             )
     elif test == "g1u1_int8smoothquant":
-        for dtype in (
-            [dtypes.bf16] if args.dtype is None else [dtypes.d_dtypes[args.dtype]]
-        ):
-            for m in [128] if args.token is None else args.token:
-                for hdim in [4096] if args.hidden_dim is None else args.hidden_dim:
-                    for idim in [1280] if args.inter_dim is None else args.inter_dim:
-                        expert = 128 if args.expert is None else args.expert
-                        topk = 6 if args.topk is None else args.topk
-                        for ep in (
-                            [8]
-                            if args.expert_parallelism is None
-                            else args.expert_parallelism
-                        ):
+        for dtype in args.dtype:
+            for m in args.token:
+                for hdim in args.hidden_dim:
+                    for idim in args.inter_dim:
+                        expert = args.expert
+                        topk = args.topk
+                        for ep in args.expert_parallelism:
                             test_fmoe_ep(
                                 dtype,
                                 m,
@@ -593,27 +555,17 @@ for test in l_test:
                                 topk,
                                 quant="int8smoothquant",
                                 use_g1u1=True,
-                                shared_E=2,
+                                shared_E=0,
                                 ep=ep,
                             )
     elif test == "g1u1_fp8smoothquant":
-        for dtype in (
-            [dtypes.bf16] if args.dtype is None else [dtypes.d_dtypes[args.dtype]]
-        ):
-            for m in [128] if args.token is None else args.token:
-                for hdim in (
-                    [4096, 6144, 8192] if args.hidden_dim is None else args.hidden_dim
-                ):
-                    for idim in (
-                        [512, 1024, 1280] if args.inter_dim is None else args.inter_dim
-                    ):
-                        expert = 32 if args.expert is None else args.expert
-                        topk = 5 if args.topk is None else args.topk
-                        for ep in (
-                            [4, 8]
-                            if args.expert_parallelism is None
-                            else args.expert_parallelism
-                        ):
+        for dtype in args.dtype:
+            for m in args.token:
+                for hdim in args.hidden_dim:
+                    for idim in args.inter_dim:
+                        expert = args.expert
+                        topk = args.topk
+                        for ep in args.expert_parallelism:
                             test_fmoe_ep(
                                 dtype,
                                 m,

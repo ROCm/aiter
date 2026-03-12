@@ -1,24 +1,22 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
-import sys
 import os
+import sys
 
 # Add parent directory to path to ensure we use local aiter module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import aiter
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from einops import rearrange
-from einops import repeat as eirp
-from typing_extensions import List
-
-import aiter
 from aiter import dtypes
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
+from einops import rearrange
+from einops import repeat as eirp
 
 block_shape = (128, 128)
 
@@ -49,12 +47,12 @@ def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @perftest()
-def run_gemm_ck(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
+def run_gemm(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype)
 
 
 @perftest()
-def run_gemm_bpreshuffle_ck(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
+def run_gemm_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_blockscale_bpreshuffle(
         x, weightshuffle, x_scale, w_scale, dtype
     )
@@ -63,7 +61,6 @@ def run_gemm_bpreshuffle_ck(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf1
 @benchmark()
 def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     ret = {}
-    dim = (m, n, k)
     block_shape_n, block_shape_k = block_shape
     scale_m = m
     scale_n = (n + block_shape_n - 1) // block_shape_n
@@ -78,7 +75,7 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
     gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
     gemm_weight = shuffle_weight(weight, layout=(16, 16)) if ck_preshuffle else weight
-    run_func = run_gemm_bpreshuffle_ck if ck_preshuffle else run_gemm_ck
+    run_func = run_gemm_bpreshuffle if ck_preshuffle else run_gemm
     b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
 
     err_ck = checkAllclose(a, b, msg="ck")
@@ -87,18 +84,16 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
     ret["ck err"] = err_ck
 
-    tag = "asm"
-    weight_asm = shuffle_weight(weight, layout=(32, 16))
-    # kernel_name = "_ZN5aiter43fp8gemm_bf16_blockscale_BpreShuffle_128x128E"
-    # c, avg_c = run_asm(x, weight_asm, x_scale, w_scale, dtype, kernel_name=kernel_name)
-    c, avg_c = run_asm(x, weight_asm, x_scale, w_scale, dtype)
+    # tag = "asm"
+    # weight_asm = shuffle_weight(weight, layout=(16, 16))
+    # c, avg_c = run_asm(x, weight_asm, x_scale_t, w_scale, dtype)
 
-    err_asm = checkAllclose(a, c, msg=f"{tag}")
-    ret[f"{tag} us"] = avg_c
-    ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
-    ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
-    ret[f"{tag} err"] = err_asm
-    ret["asm/ck"] = avg_c / avg_b
+    # err_asm = checkAllclose(a, c, msg=f"{tag}")
+    # ret[f"{tag} us"] = avg_c
+    # ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
+    # ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
+    # ret[f"{tag} err"] = err_asm
+    # ret["asm/ck"] = avg_c / avg_b
 
     return ret
 
@@ -138,54 +133,19 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=["bf16"],
-    nargs="?",
-    const=None,
-    default=None,
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["bf16"]],
+    nargs="*",
+    default=[dtypes.d_dtypes["bf16"]],
+    metavar="{bf16}",
     help="""Data type.
     e.g.: -d bf16""",
 )
 parser.add_argument(
     "-m",
     type=int,
-    nargs="?",
-    const=None,
-    default=None,
-    help="""M of mnk.
-    e.g.: -m 32""",
-)
-parser.add_argument(
-    "-nk",
-    type=dtypes.str2tuple,
-    nargs="?",
-    const=None,
-    default=None,
-    help="""N&K of mnk.
-    e.g.: -nk 4096,512""",
-)
-parser.add_argument(
-    "--ck_preshuffle",
-    nargs="?",
-    default=[True, False],
-    help="weight ck_preshuffle or not",
-)
-
-args = parser.parse_args()
-if args.dtype is None:
-    l_dtype = [dtypes.d_dtypes[key] for key in ["bf16"]]
-else:
-    l_dtype = [dtypes.d_dtypes[args.dtype]]
-if args.m is not None:
-    l_m = [args.m]
-if args.nk is not None:
-    l_nk = [args.nk]
-l_preshuffle: List[bool] = args.ck_preshuffle
-
-df = []
-for dtype in [dtypes.bf16]:
-    # deepseek-r1
-    for m in [
+    nargs="*",
+    choices=[
         1,
         2,
         4,
@@ -213,15 +173,73 @@ for dtype in [dtypes.bf16]:
         6144,
         8192,
         10240,
-    ]:
-        for n, k in [
-            (24576, 1536),
-            # (32768, 512),
-            # (7168, 16384),
-            # (36864, 7168),
-        ]:
-            ret = test_gemm(dtype, m, n, k)
-            df.append(ret)
+    ],
+    default=[
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        96,
+        128,
+        160,
+        192,
+        224,
+        256,
+        288,
+        320,
+        352,
+        384,
+        416,
+        448,
+        480,
+        512,
+        1024,
+        2048,
+        4096,
+        6144,
+        8192,
+        10240,
+    ],
+    help="""M of mnk.
+    e.g.: -m 32""",
+)
+parser.add_argument(
+    "-nk",
+    type=dtypes.str2tuple,
+    nargs="*",
+    default=[
+        (24576, 1536),
+        # (32768, 512),
+        # (7168, 16384),
+        # (36864, 7168),
+    ],
+    help="""N&K of mnk.
+    e.g.: -nk 24576,1536""",
+)
+parser.add_argument(
+    "--ck_preshuffle",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[True, False],
+    help="""weight ck_preshuffle or not.
+    e.g.: --ck_preshuffle True
+        or --ck_preshuffle False
+    """,
+)
+
+args = parser.parse_args()
+
+df = []
+for dtype in args.dtype:
+    # deepseek-r1
+    for m in args.m:
+        for n, k in args.nk:
+            for ck_p in args.ck_preshuffle:
+                ret = test_gemm(dtype, m, n, k, ck_preshuffle=ck_p)
+                df.append(ret)
 df = pd.DataFrame(df)
 
 # Configure pandas to show all columns without truncation
@@ -236,4 +254,5 @@ print("=" * 150)
 print(df.to_string(index=False))
 print("=" * 150)
 
-aiter.logger.info(f"summary:\n{df}")
+df_md = df.to_markdown(index=False)
+aiter.logger.info("gemm_a8w8_blockscale summary (markdown):\n%s", df_md)

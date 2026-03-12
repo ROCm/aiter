@@ -37,7 +37,7 @@ on:
           - aiter-k8s-build
           - aiter-mi300-1gpu
           - aiter-mi325-1gpu
-          - aiter-mi355-1gpu
+          - linux-aiter-mi355-1
           - aiter-1gpu-runner
 
 concurrency:

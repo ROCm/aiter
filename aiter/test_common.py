@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 import torch.profiler as tpf
 import os
@@ -82,19 +82,7 @@ def perftest(
                     latencies.append(start_event.elapsed_time(end_event))
                 avg = np.mean(latencies) * 1000
                 logger.info(f"avg: {avg} us/iter from cuda.Event")
-            if testGraph:
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    data = run_iters_rotate(num_iters, func, rotate_args)
-                with tpf.profile(
-                    activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
-                    profile_memory=True,
-                    with_stack=True,
-                    with_modules=True,
-                ) as prof:
-                    run_iters(1, graph.replay)
-                avg = get_trace_perf(prof, num_iters)
-                logger.info(f"avg: {avg} us/iter with hipgraph")
+
             with tpf.profile(
                 activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
                 profile_memory=False,
@@ -110,8 +98,22 @@ def perftest(
                 data = run_iters_rotate(num_iters, func, rotate_args)
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
-
             avg = get_trace_perf(prof, num_iters)
+
+            if testGraph:
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    data = run_iters_rotate(num_iters, func, rotate_args)
+                with tpf.profile(
+                    activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
+                    profile_memory=True,
+                    with_stack=True,
+                    with_modules=True,
+                ) as prof:
+                    run_iters(1, graph.replay)
+                avg = get_trace_perf(prof, num_iters)
+                logger.info(f"avg: {avg} us/iter with hipgraph")
+
             return data, avg
 
         return wrapper
@@ -353,6 +355,9 @@ def get_trace_perf(prof, num_iters):
             else:
                 r["host_time_sum"] = r["self_device_time_total"]
                 r["device_time_sum"] = 0
+            r["device_time_avg"] = (
+                r["device_time_sum"] / r["cnt"] if r["cnt"] > 0 else 0
+            )
         rets.append(r)
     df = pd.DataFrame(rets)
     cols = [
@@ -360,6 +365,7 @@ def get_trace_perf(prof, num_iters):
         "cnt",
         "host_time_sum",
         "device_time_sum",
+        "device_time_avg",
         "device_type",
         "device_index",
     ]
@@ -409,7 +415,7 @@ def checkAllclose(
             a_msked = a[mask]
             b_msked = b[mask]
             delta = (a_msked - b_msked).abs()
-        except RuntimeError as e:
+        except RuntimeError:
             mask = ~isClose.to("cpu")
             num = mask.sum()
             printNum = min(printNum, num)
@@ -420,15 +426,13 @@ def checkAllclose(
             b_msked = b[mask]
             delta = (a_msked - b_msked).abs()
         if percent > tol_err_ratio:
-            logger.info(
-                f"""{msg}[checkAllclose {atol=} {rtol=} \033[31mfailed!\033[0m]
+            logger.info(f"""{msg}[checkAllclose {atol=} {rtol=} \033[31mfailed!\033[0m]
     a    : {a.shape}
            {a_msked[:printNum]}
     b    : {b.shape}
            {b_msked[:printNum]}
     delta:
-           {delta[:printNum]}"""
-            )
+           {delta[:printNum]}""")
         else:
             logger.info(
                 f"""{msg}[checkAllclose {atol=} {rtol=} \033[33mwarning!\033[0m] a and b results are not all close"""

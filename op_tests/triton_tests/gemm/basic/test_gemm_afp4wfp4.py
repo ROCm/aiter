@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import pytest
-import os
 import torch
-from aiter.ops.triton.gemm_afp4wfp4 import (
-    gemm_afp4wfp4,
+from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
+    gemm_afp4wfp4 as triton_gemm_afp4wfp4,
     gemm_afp4wfp4_preshuffle,
 )
+from aiter.ops.triton.gluon.gemm_afp4wfp4 import gemm_afp4wfp4 as gluon_gemm_afp4wfp4
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from aiter.ops.shuffle import shuffle_weight
+
+DEVICE_ARCH = arch_info.get_arch()
 
 
 def shuffle_scales(scales: torch.Tensor):
@@ -129,7 +131,6 @@ def generate_gemm_afp4wfp4_inputs(
 
 
 def get_x_vals():
-
     x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
     x_vals += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
     x_vals += [
@@ -165,14 +166,14 @@ def get_x_vals():
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
     x_vals += [(256, 3584, 2112)]
     x_vals += [(7, 4608, 7168), (7, 7168, 2304)]
-    x_vals += [(v, 106496, 16384) for v in [1, 8, 16, 32, 64, 128, 256]]
-    x_vals += [(v, 16384, 53248) for v in [1, 8, 16, 32, 64, 128, 256]]
-    x_vals += [(v, 18432, 16384) for v in [1, 8, 16, 32, 64, 128, 256]]
-    x_vals += [(v, 16384, 16384) for v in [1, 8, 16, 32, 64, 128, 256]]
-    x_vals += [(v, 10240, 8192) for v in [1, 2, 4, 8, 16, 32, 64]]
-    x_vals += [(v, 8192, 8192) for v in [1, 2, 4, 8, 16, 32, 64]]
-    x_vals += [(v, 57344, 8192) for v in [1, 2, 4, 8, 16, 32, 64]]
-    x_vals += [(v, 8192, 28672) for v in [1, 2, 4, 8, 16, 32, 64]]
+    x_vals += [(v, 106496, 16384) for v in [1, 8, 16, 31, 32, 64, 128, 256]]
+    x_vals += [(v, 16384, 53248) for v in [1, 8, 16, 31, 32, 64, 128, 256]]
+    x_vals += [(v, 18432, 16384) for v in [1, 8, 16, 31, 32, 64, 128, 256]]
+    x_vals += [(v, 16384, 16384) for v in [1, 8, 16, 31, 32, 64, 128, 256]]
+    x_vals += [(v, 10240, 8192) for v in [1, 2, 4, 8, 31, 16, 32, 64]]
+    x_vals += [(v, 8192, 8192) for v in [1, 2, 4, 8, 31, 16, 32, 64]]
+    x_vals += [(v, 57344, 8192) for v in [1, 2, 4, 8, 31, 16, 32, 64]]
+    x_vals += [(v, 8192, 28672) for v in [1, 2, 4, 8, 31, 16, 32, 64]]
     x_vals += [(1, 1, 32)]  # minimal case
     return x_vals
 
@@ -224,6 +225,12 @@ def run_torch(x, w, x_scales, w_scales, dtype):
     return torch.mm(x_f32, w_f32.T).to(dtype)
 
 
+def run_triton(
+    x, w, x_scales, w_scales, dtype=torch.bfloat16, y=None, skip_reduce=False, impl=None
+):
+    return impl(x, w, x_scales, w_scales, dtype, y, skip_reduce=skip_reduce)
+
+
 @pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
@@ -232,9 +239,27 @@ def run_torch(x, w, x_scales, w_scales, dtype):
     "shuffle_weight_scales",
     [True, False],
 )
+@pytest.mark.parametrize("skip_reduce", [True, False])
+@pytest.mark.parametrize("impl", ["triton", "gluon"])
 def test_gemm_afp4_wfp4(
-    M: int, N: int, K: int, dtype, layout, output, shuffle_weight_scales
+    M: int,
+    N: int,
+    K: int,
+    dtype,
+    layout,
+    output,
+    shuffle_weight_scales,
+    skip_reduce,
+    impl,
 ):
+    if impl == "gluon" and DEVICE_ARCH != "gfx950":
+        pytest.skip(
+            "Gluon implementation is not supported on this device (requires CDNA4)."
+        )
+
+    if impl == "gluon" and shuffle_weight_scales:
+        pytest.skip("Gluon kernel does not have a preshuffled implementation.")
+
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
@@ -281,6 +306,7 @@ def test_gemm_afp4_wfp4(
                 dtype,
                 y,
                 use_aot=(dtype == torch.bfloat16 and layout == "TN"),
+                skip_reduce=skip_reduce,
             )
         else:
             triton_out = gemm_afp4wfp4_preshuffle(
@@ -290,6 +316,7 @@ def test_gemm_afp4_wfp4(
                 w_scales_triton,
                 dtype,
                 use_aot=(dtype == torch.bfloat16 and layout == "TN"),
+                skip_reduce=skip_reduce,
             )
         # TODO: remove in the future
         # if output:
@@ -301,13 +328,36 @@ def test_gemm_afp4_wfp4(
         #         x, w_triton, x_scales_triton, w_scales_triton, dtype
         #     )
     else:
+        if impl == "triton":
+            impl = triton_gemm_afp4wfp4
+        elif impl == "gluon":
+            impl = gluon_gemm_afp4wfp4
+        else:
+            raise ValueError(f"Unknown implementation: {impl}")
+
         if output:
-            triton_out = gemm_afp4wfp4(
-                x, w_triton, x_scales_triton, w_scales_triton, dtype, y
+            triton_out = run_triton(
+                x,
+                w_triton,
+                x_scales_triton,
+                w_scales_triton,
+                dtype,
+                y,
+                skip_reduce=skip_reduce,
+                impl=impl,
             )
         else:
-            triton_out = gemm_afp4wfp4(
-                x, w_triton, x_scales_triton, w_scales_triton, dtype
+            triton_out = run_triton(
+                x,
+                w_triton,
+                x_scales_triton,
+                w_scales_triton,
+                dtype,
+                skip_reduce=skip_reduce,
+                impl=impl,
             )
+
+    if triton_out.dim() == 3:
+        triton_out = triton_out.sum(dim=0).to(dtype)
 
     torch.testing.assert_close(torch_out, triton_out)

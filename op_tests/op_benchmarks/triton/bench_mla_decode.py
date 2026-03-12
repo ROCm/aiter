@@ -1,4 +1,10 @@
+import argparse
+
+import torch
 import triton
+
+from aiter.ops.triton.utils.types import str_to_torch_dtype
+from aiter.ops.triton.attention.mla_decode_rope import decode_attention_fwd_grouped_rope
 
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
@@ -6,10 +12,6 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
     get_caller_name_no_ext,
 )
-from aiter.ops.triton.mla_decode_rope import decode_attention_fwd_grouped_rope
-import torch
-import argparse
-from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.triton_tests.attention.test_mla_decode_rope import input_helper
 
 
@@ -49,8 +51,9 @@ def model_benchmark_configs(args):
     x_vals_list = []
 
     for model_name, config in configs.items():
-        H = config["num_attention_heads"] // 8  # tp8
+        H = config["num_attention_heads"] // args.tensor_parallelism
         S = args.seqlen
+        # TODO: Evaluate other `num_kv_splits` values, according to TP degree.
         # attn_impl = args.attn_impl if args.attn_impl else "non-absorb"
         x_vals_list.append((model_name, batch_size, H, S, 512, 64, 64, 32))
 
@@ -149,7 +152,7 @@ def benchmark(args):
     return x_vals_list, x_names, line_vals
 
 
-def parse_args():
+def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="Benchmark MLA Prefill",
         allow_abbrev=False,
@@ -177,6 +180,14 @@ def parse_args():
         default=False,
         help="Equal sequence lengths, i.e. total (prefix|extend) tokens = B * (prefix|extend). Otherwise we have randint(1, (prefix|extend), (B,)) as sequence lengths.",
     )
+    parser.add_argument(
+        "-tp",
+        "--tensor-parallelism",
+        type=int,
+        choices=[1, 2, 4, 8],
+        default=8,
+        help="tensor parallelism degree (default: 8)",
+    )
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
@@ -193,7 +204,7 @@ def parse_args():
         default=False,
         help="Write performance results to CSV file",
     )
-    return parser.parse_args()
+    return parser.parse_args(args=args)
 
 
 def run_bench(args):
@@ -202,12 +213,12 @@ def run_bench(args):
     benchmark(args)
 
 
-def main():
-    args = parse_args()
-    if args.print_vgpr:  # print the vgpr usage of the kernel
-        print_vgpr(lambda: run_bench(args), table_start=get_caller_name_no_ext())
-        return 0
-    run_bench(args)
+def main(args: list[str] | None = None) -> None:
+    parsed_args = parse_args(args=args)
+    if parsed_args.print_vgpr:  # print the vgpr usage of the kernel
+        print_vgpr(lambda: run_bench(parsed_args), table_start=get_caller_name_no_ext())
+        return
+    run_bench(parsed_args)
 
 
 if __name__ == "__main__":

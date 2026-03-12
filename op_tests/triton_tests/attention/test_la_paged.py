@@ -3,7 +3,7 @@ import pytest
 import torch
 import random
 
-from aiter.ops.triton.lean_atten_paged import persistent_lean_attention_paged
+from aiter.ops.triton.attention.lean_atten_paged import persistent_lean_attention_paged
 
 
 @pytest.mark.parametrize(

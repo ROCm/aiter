@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-import argparse
 import os
 
 import pandas as pd
@@ -149,10 +148,10 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         shuffle_df = (
             df[df["bpreshuffle"] == 1]
             .reset_index()
-            .sort_values(by=["tile_m", "tile_n", "splitK"])
+            .sort_values(by=["tile_M", "tile_N", "splitK"])
         )
         kernel_dict = (
-            shuffle_df.groupby(["tile_m", "tile_n", "splitK"])["knl_name"]
+            shuffle_df.groupby(["tile_M", "tile_N", "splitK"])["knl_name"]
             .apply(list)
             .to_dict()
         )
@@ -297,7 +296,16 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
 
         ret = []
         if task:
-            ret = mp_tuner(task, tasks_in_data, mp_num, False, shape_grouped, errRatio)
+            ret = mp_tuner(
+                task,
+                tasks_in_data,
+                mp_num,
+                False,
+                shape_grouped,
+                errRatio,
+                timeout=args.timeout,
+                verbose=args.verbose,
+            )
         return ret
 
 

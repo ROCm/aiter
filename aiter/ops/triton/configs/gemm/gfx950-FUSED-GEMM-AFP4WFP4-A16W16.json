@@ -1,14 +1,14 @@
 {
-  "any": {
-    "BLOCK_SIZE_M": 32,
-    "BLOCK_SIZE_N": 64,
-    "BLOCK_SIZE_K": 256,
-    "GROUP_SIZE_M": 4,
-    "num_warps": 2,
-    "num_stages": 2,
-    "waves_per_eu": 1,
-    "matrix_instr_nonkdim": 16,
-    "cache_modifier": ".cg",
-    "NUM_KSPLIT": 1
-  }
+    "any": {
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 256,
+        "GROUP_SIZE_M": 4,
+        "num_warps": 2,
+        "num_stages": 2,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": ".cg",
+        "NUM_KSPLIT": 1
+    }
 }

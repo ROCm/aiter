@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+from typing import Any
 
 import torch
 import pytest
 
-from aiter.ops.triton.mla_decode_rope import (
+from aiter.ops.triton.attention.mla_decode_rope import (
     _decode_grouped_att_m_fwd_rope,
     decode_attention_fwd_grouped_rope,
     _get_config,
@@ -242,6 +244,19 @@ def ref_compute_full_fwd(
     return attn_logits, o, k_pe_t.squeeze()
 
 
+def get_config(dtype: torch.dtype):
+    config: dict[str, Any] = _get_config()
+    base_config_key: str = "fwd_grouped_kernel_stage1_rope"
+    fp32_config_key: str = f"{base_config_key}_fp32"
+    config_key: str = (
+        fp32_config_key
+        if dtype == torch.float32 and fp32_config_key in config
+        else base_config_key
+    )
+    assert config_key in config
+    return config[config_key]
+
+
 # We assume rotary_dim is always of power of 2 and rotary_dim <= qk_rope_head_dim
 @pytest.mark.parametrize(
     "B, H, S, kv_lora_rank, qk_rope_head_dim, rotary_dim",
@@ -310,7 +325,7 @@ def test_op_fwd_rope(
         logit_cap,
         use_rope,
         is_neox_style=True,
-        config=_get_config()["fwd_grouped_kernel_stage1_rope"],
+        config=get_config(dtype),
     )
 
     tri_logits = attn_logits
@@ -415,7 +430,7 @@ def test_op_fwd_rope_neox(
         logit_cap,
         use_rope,
         is_neox_style=is_neox_style,
-        config=_get_config()["fwd_grouped_kernel_stage1_rope"],
+        config=get_config(dtype),
     )
 
     tri_logits = attn_logits
