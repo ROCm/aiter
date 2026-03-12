@@ -61,60 +61,17 @@ def bench_kernel(q, k, v, args, provider):
     BLOCK_R = args.BLOCK_R
     R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (BLOCK_R**0.5)
 
-    if args.include_quant_overhead:
-
-        def fn():
-            return fav3_sage_mxfp4_wrapper(
-                q,
-                k,
-                v,
-                causal=args.causal,
-                layout=args.layout,
-                q_smooth=args.qsmooth,
-                hadamard_rotation=args.hadamard_rotate,
-                R=R,
-            )
-
-    else:
-        config = get_sage_fwd_configs_mxfp4()
-
-        FP8_TYPE = aiter.dtypes.fp8
-        FP8_MAX = torch.finfo(FP8_TYPE).max
-        (
-            q_quantized,
-            q_descale,
-            k_quantized,
-            k_descale,
-            v_quantized,
-            v_descale,
-            delta_s,
-        ) = sage_quant_mxfp4(
+    def fn():
+        return fav3_sage_mxfp4_wrapper(
             q,
             k,
             v,
-            FP8_TYPE,
-            FP8_MAX,
-            BLKQ=config["BLOCK_M"],
-            BLKK=64,
+            causal=args.causal,
             layout=args.layout,
+            q_smooth=args.qsmooth,
+            hadamard_rotation=args.hadamard_rotate,
             R=R,
-            BLOCK_R=BLOCK_R,
-            q_smoothing=args.qsmooth,
         )
-
-        def fn():
-            return fav3_sage_mxfp4_func(
-                q=q_quantized,
-                k=k_quantized,
-                v=v_quantized,
-                q_descale=q_descale,
-                k_descale=k_descale,
-                v_descale=v_descale,
-                bias=delta_s,
-                causal=args.causal,
-                layout=args.layout,
-                config=config,
-            )
 
     ms = triton.testing.do_bench(fn)
     # print("kernel (ms)", ms)

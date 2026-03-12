@@ -125,7 +125,7 @@ def _compute_mx_quant_and_scale_rne(
 
 
 @triton.jit
-def sage_quant_v_kernel(
+def sage_quant_v_bhsd_kernel(
     V_Input,
     V_Output,
     V_Scale,
@@ -169,6 +169,44 @@ def sage_quant_v_kernel(
     v_quant = v / v_scales
     v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
     tl.store(v_output_ptrs, v_quant, mask=offs_kn[:, None] < SEQLEN_K)
+
+
+
+@triton.jit
+def sage_quant_v_kernel(
+    V_Input,
+    V_Output,
+    V_Descale,
+    stride_t,
+    stride_h,
+    stride_sh,
+    num_tokens,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    pid = tl.program_id(0).to(tl.int64)
+    pid_h = tl.program_id(1).to(tl.int64)
+
+    offs_token = pid * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    mask = offs_token < num_tokens
+    offs_d = tl.arange(0, D)
+
+    v_offs = (
+        offs_token * stride_t
+        + pid_h * stride_h
+        + offs_d[None, :]
+    )
+
+    v_input_ptrs = V_Input + v_offs
+    v_output_ptrs = V_Output + v_offs
+
+    # just apply the per channel v_scales that have been computed outside
+    v_descale_ptrs = V_Descale + pid_h * stride_sh + offs_d
+    v = tl.load(v_input_ptrs, mask=mask, other=0.0)
+    v_descales = tl.load(v_descale_ptrs)
+    v_quant = v / v_descales
+    v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
+    tl.store(v_output_ptrs, v_quant, mask=mask)
 
 
 @triton.jit
@@ -296,100 +334,122 @@ def _rotate_quantize_q_kernel(
 
 
 @triton.jit
-def _rotate_quantize_k_kernel(
+def perblock_quantize_k_kernel(
     Q,
     Q_q,
     Q_descale,
-    Q_mean,
+    stride_t,
+    query_start_len_ptr,
+    num_seqs,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_R: tl.constexpr,  # rotation block size
+    D: tl.constexpr,  # D is 128
+    sm_scale: tl.constexpr,
+    SCALE_GROUP_SIZE: tl.constexpr = 32,
+):
+
+    kv_head_idx = tl.program_id(0)
+    q_block_global_idx = tl.program_id(1)
+
+    seq_idx = find_seq_idx(
+        query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
+    )
+
+    q_block_start_idx = tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
+
+    q_block_local_idx = q_block_global_idx - q_block_start_idx
+
+    cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
+    cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
+
+    cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
+
+    if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
+        return
+
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+    offs_t = tl.arange(0, TILE_SIZE)
+    query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+
+    query_offset_0 = cur_batch_in_all_start_index + query_pos
+    query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
+    query_offset = (
+        query_offset_0[:, None] * query_stride_0
+        + query_offset_1[:, None] * query_stride_1
+        + offs_d[None, :]
+    )
+
+    if HEAD_SIZE_PADDED != HEAD_SIZE:
+        dim_mask = offs_d < HEAD_SIZE
+    else:
+        dim_mask = tl.full((1,), 1, dtype=tl.int1)
+    query_mask_0 = query_pos < cur_batch_query_len
+    query_mask_1 = query_offset_1 < num_query_heads
+
+    if ALL_DECODE or BLOCK_M >= num_query_heads:
+        Q_cache_modifier: tl.constexpr = ".cg"
+    else:
+        Q_cache_modifier: tl.constexpr = ""
+    # Q : (BLOCK_M, HEAD_SIZE_PADDED)
+    Q = tl.load(
+        query_ptr + query_offset,
+        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+        other=0.0,
+        cache_modifier=Q_cache_modifier,
+    )
+
+
+@triton.jit
+def _rotate_mxfp_quantize_k_kernel(
     K,
     K_q,
     K_descale,
     R,  # Hadamard matrix
-    sm_scale: tl.constexpr,
-    stride_qb,
-    stride_qh,
-    stride_qm,
-    stride_qd,
-    stride_qqb,
-    stride_qqm,
-    stride_qqh,
-    stride_qqd,
-    stride_qsb,
-    stride_qsm,
-    stride_qsh,
-    stride_qsd,
-    stride_mb,
-    stride_mh,
-    stride_mm,
-    stride_md,
-    stride_kb,
-    stride_kh,
-    stride_km,
-    stride_kd,
-    stride_kqb,
-    stride_kqn,
-    stride_kqh,
-    stride_kqd,
-    stride_ksb,
-    stride_ksn,
-    stride_ksh,
-    stride_ksd,
-    batch,
-    heads_q,
-    heads_k,
-    seqlen_q,
-    seqlen_k,
-    d_model,
-    q_smoothing: tl.constexpr,
+    stride_t,
+    stride_tq,
+    stride_ts,
+    num_tokens,
     hadamard_rotation: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_R: tl.constexpr,  # rotation block size
     D: tl.constexpr,  # D is 128
+    sm_scale: tl.constexpr,
+    SCALE_GROUP_SIZE: tl.constexpr = 32,
 ):
-    SCALE_GROUP_SIZE: tl.constexpr = 32
 
     pid = tl.program_id(0).to(tl.int64)
 
-    pid_b = pid % batch
-    pid_h = pid // batch % heads_k
-    pid_m = pid // (batch * heads_k)
-
     # Offsets
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, D)
+    offs_t = pid * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    mask = (offs_t < num_tokens)
 
+    offs_d = tl.arange(0, D)
     offs_dq = tl.arange(0, D // 2)
     offs_ds = tl.arange(0, D // SCALE_GROUP_SIZE)
 
     # set pointers to either Q or K tensor, descale, quantized output
     # Q block shape: [BLOCK_M, D]
     tensor_offset = K + (
-        pid_b * stride_kb
-        + pid_h * stride_kh
-        + offs_m[:, None] * stride_km
-        + offs_d[None, :] * stride_kd
+        offs_t * stride_t
+        + offs_d[None, :]
     )
     descale_offset = K_descale + (
-        pid_b * stride_ksb
-        + pid_h * stride_ksh
-        + offs_m[:, None] * stride_ksn
-        + offs_ds[None, :] * stride_ksd
+        offs_t * stride_ts
+        + offs_ds[None, :]
     )  # we group 32 values together for quantization
 
     quant_tensor_offset = K_q + (
-        pid_b * stride_kqb
-        + pid_h * stride_kqh
-        + offs_m[:, None] * stride_kqn
-        + offs_dq[None, :] * stride_kqd
+        offs_t * stride_tq
+        + offs_dq[None, :]
     )
-    seqlen = seqlen_k
 
     qk_ptr = tensor_offset
     qk_descale_ptr = descale_offset
     qk_quant_ptr = quant_tensor_offset
 
     qk_tile = tl.load(
-        qk_ptr, mask=(offs_m[:, None] < seqlen) & (offs_d[None, :] < d_model), other=0.0
+        qk_ptr, mask=mask & (offs_d[None, :] < D), other=0.0
     )  # (BLOCK_M, D)
 
     if hadamard_rotation:
@@ -408,16 +468,19 @@ def _rotate_quantize_k_kernel(
     else:
         qk_rot_tile = qk_tile.to(tl.float32)
 
+    if sm_scale is not None:
+        qk_rot_tile *= sm_scale
+    
     qk_quant_tile, qk_descale = _compute_mx_quant_and_scale_rne(
-        qk_rot_tile, offs_m[:, None] < seqlen, tl.uint8
+        qk_rot_tile, mask, tl.uint8
     )
 
-    tl.store(qk_descale_ptr, qk_descale, mask=(offs_m[:, None] < seqlen))
+    tl.store(qk_descale_ptr, qk_descale, mask=mask)
 
     tl.store(
         qk_quant_ptr,
         qk_quant_tile,
-        mask=(offs_m[:, None] < seqlen),
+        mask=mask,
     )
 
 

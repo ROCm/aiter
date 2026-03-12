@@ -11,13 +11,20 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     _rot_k_only_kernel,
     _rot_q_kernel,
     _rotate_quantize_q_kernel,
-    _rotate_quantize_k_kernel,
+    _rotate_mxfp_quantize_k_kernel,
     _compute_delta_s_kernel,
+    sage_quant_v_bhsd_kernel
 )
 
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
+"""
+q.shape: (b,h,s,d) or (t,h,d)
+k/v.shape: (b,h,s,d) or (t,h,d) or (num_blocks, block_size, h, d)
 
+k_descale: (num_blocks, block_size, h, d//32)
+v_descale: (h,d)
+"""
 def fused_sage_quant_mxfp4(
     q,
     k,
@@ -28,80 +35,102 @@ def fused_sage_quant_mxfp4(
     BLOCK_R=None,
     q_smoothing=False,
     layout="bshd",
+    v_descale = None,
+    QK_type="mxfp4"
 ):
 
-    if layout == "bhsd":
-        b, h_qo, qo_len, head_dim = q.shape
-        _, h_kv, kv_len, _ = v.shape
+    assert q_smoothing==False, "no qsmoothing supported"
+    
+    if hadamard_rotation:
+        if R is None:
+            assert (
+                BLOCK_R is not None
+            ), "if using hadamard rotation, BLOCK_R (size of the hadamard matrix) must be provided."
+            R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (
+                BLOCK_R**0.5
+            )
+        else:
+            BLOCK_R = R.shape[-1]
+    
+    d = q.shape[-1]
+    sm_scale = d**-0.5
 
-        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            v.stride(3),
+    if QK_type=="mxfp4":
+        # this is easy as its per token
+        q_fp4, q_descale = pertoken_rotate_quantize_mxfp4(
+            q,
+            R=R,
+            BLOCK_R=BLOCK_R,
+            BLOCK_SIZE_M=BLOCK_M,
+            hadamard_rotation=hadamard_rotation,
+            sm_scale=(sm_scale * 1.4426950408889634),
         )
 
-    elif layout == "bshd":
-        b, qo_len, h_qo, head_dim = q.shape
-        _, kv_len, h_kv, _ = v.shape
-
-        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
-            v.stride(0),
-            v.stride(2),
-            v.stride(1),
-            v.stride(3),
+        k_fp4, k_descale = pertoken_rotate_quantize_mxfp4(
+            k,
+            R=R,
+            BLOCK_R=BLOCK_R,
+            BLOCK_SIZE_M=BLOCK_M,
+            hadamard_rotation=hadamard_rotation,
+            sm_scale=None, # do not apply sm scale to k tensor!
         )
+    elif QK_type=="int8":
+        # this is pain in the ass as it groups tokens, so we must know seqlens
+        q_fp4, q_descale = perblock_quantize_int8(
+            q,
+            R=R,
+            BLOCK_R=BLOCK_R,
+            BLOCK_SIZE_M=BLOCK_M,
+            hadamard_rotation=hadamard_rotation,
+            sm_scale=(sm_scale * 1.4426950408889634),
+        )
+        pass
     else:
-        raise ValueError(f"Unknown tensor layout: {layout}")
-
-    # padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
-    sm_scale = head_dim**-0.5
-
-    q_fp4, q_scale, k_fp4, k_scale, delta_s = smooth_rotate_downcast_qk(
-        q,
-        k,
-        BLOCK_SIZE_M=BLOCK_M,
-        hadamard_rotation=hadamard_rotation,
-        R=R,
-        BLOCK_R=BLOCK_R,
-        q_smoothing=q_smoothing,
-        layout=layout,
-        sm_scale=(sm_scale * 1.4426950408889634),
-    )
+        raise ValueError(f"Unsupported QK_type: {QK_type}. Must be 'mxfp4' or 'int8'.")
 
     FP8_TYPE = aiter.dtypes.fp8
     FP8_MAX = torch.finfo(FP8_TYPE).max
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
 
-    BLOCK_K = 1024
-    K_NUM_BLKS = (kv_len + BLOCK_K - 1) // BLOCK_K
-
-    # V tensor per channel quantization
-    v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
-
-    v_task_count = b * h_kv * K_NUM_BLKS
-    grid = (v_task_count,)
-    sage_quant_v_kernel[grid](
+    if v_descale is None:
+        if layout=="bhsd":
+            reduce_dims = (0,2)
+            stride_h = v.stride(1)
+            num_heads = v.shape[1]
+        elif layout=="bshd":
+            reduce_dims = (0,1)
+            stride_h = v.stride(2)
+            num_heads = v.shape[2]
+        elif layout=="thd":
+            reduce_dims = (0)
+            stride_h = v.stride(1)
+            num_heads = v.shape[1]
+        else: # (num_blocks, block_size, h, d)
+            reduce_dims = (0,1)
+            stride_h = v.stride(2)
+            num_heads = v.shape[2]    
+        v_descale = v.abs().amax(dim=reduce_dims).to(torch.float32) / FP8_MAX
+        stride_sh = v_descale.stride(0)
+    
+    num_tokens = v.shape.numel() // (d*num_heads)
+    stride_t = v.stride(-2)
+    
+    num_pid_v = (num_tokens + BLOCK_M - 1) // BLOCK_M
+    grid_v = (num_pid_v, num_heads)
+    sage_quant_v_kernel[grid_v](
         v,
         v_fp8,
-        v_scale,
-        stride_bz_v,
-        stride_h_v,
-        stride_seq_v,
-        stride_d_v,
-        v_scale.stride(0),
-        v_scale.stride(1),
-        b,
-        h_kv,
-        K_NUM_BLKS,
-        kv_len,
-        D=head_dim,
-        BLK_K=BLOCK_K,
-        num_stages=5,
+        v_descale,
+        stride_t,
+        stride_h,
+        stride_sh,
+        num_tokens,
+        D=d,
+        BLOCK_M=BLOCK_M,
+        num_stages=3,
         num_warps=8,
     )
-
-    return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
+    return q_fp4, q_descale, k_fp4, k_descale, v_fp8, v_descale, None
 
 
 def sage_quant_mxfp4(
@@ -168,7 +197,7 @@ def sage_quant_mxfp4(
         sm_scale=(sm_scale * 1.4426950408889634),
     )
 
-    sage_quant_v_kernel[grid](
+    sage_quant_v_bhsd_kernel[grid](
         v,
         v_fp8,
         v_scale,
@@ -451,185 +480,95 @@ def rotation_smooth_qk(
     return Q_rot, K_rot, delta_s
 
 
-def smooth_rotate_downcast_qk(
+"""
+expected shape (bshd), (thd) or (num_blocks,block_size,h,d)
+
+
+
+
+
+(num_blocks,block_size,h,d) = (b,s,h,d)
+(b,s//BLOCK_M,h,1)
+
+"""
+def perblock_quantize_int8(
     q,
-    k,
     BLOCK_SIZE_M,
-    hadamard_rotation=False,
-    R=None,
-    BLOCK_R=None,
-    q_smoothing=False,
-    sm_scale=None,
+    cu_seqlens,
     layout="bhsd",
-):
-    if hadamard_rotation:
-        if R is None:
-            assert (
-                BLOCK_R is not None
-            ), "if using hadamard rotation, BLOCK_R (size of the hadamard matrix) must be provided."
-            R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (
-                BLOCK_R**0.5
-            )
-        else:
-            BLOCK_R = R.shape[-1]
-
-    bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
-
-    # shapes
-    b, s_q, h_q, d = map_dims(q.shape, bshd)
-    _, s_k, h_k, _ = map_dims(k.shape, bshd)
-
-    Q_NUM_BLKS = (s_q + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
-    K_NUM_BLKS = (s_k + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
-
-    if q_smoothing:
-        q_mean = torch.empty(
-            (b, h_q, Q_NUM_BLKS, d), dtype=torch.float32, device=q.device
-        )
-        delta_s = torch.empty(
-            (b, h_q, Q_NUM_BLKS, s_k), dtype=torch.float32, device=q.device
-        )
-    else:
-        q_mean = None
-        delta_s = None
-
-    stride_qb, stride_qm, stride_qh, stride_qd = map_dims(q.stride(), bshd)
-    stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k.stride(), bshd)
+    sm_scale=None,
+):  
+    d = q.shape[-1]
+    num_seqs = len(cu_seqlens)
+    if layout=="thd":
+        total_num_blocks = q.shape[0] // BLOCK_SIZE_M + num_seqs
+    elif layout=="bshd":
+        b,s,h,d = q.shape
+        total_num_blocks = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * b * h
+    elif layout=="bhsd":
+        b,h,s,d = q.shape
+        total_num_blocks = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * b * h
+    else: # 
+        num_blocks,block_size,h,d = q.shape
+        total_num_blocks = num_blocks * (block_size + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * h
 
     Q_q = torch.empty((*q.shape[:-1], d // 2), dtype=torch.uint8, device=q.device)
     Q_descale = torch.empty(
-        (*q.shape[:-1], d // 32), dtype=torch.uint8, device=q.device
+        (total_num_blocks, h, d // 32), dtype=torch.uint8, device=q.device
     )
+
+    
+    
+    
+ 
+    return K_q, K_descale
+
+
+
+"""
+tensor shapes expected here
+
+q.shape: (b,h,s,d) or (t,h,d)
+k/v.shape: (b,h,s,d) or (t,h,d) or (num_blocks, block_size, h, d)
+"""
+
+def pertoken_rotate_quantize_mxfp4(
+    k,
+    BLOCK_SIZE_M,
+    R,
+    BLOCK_R,
+    hadamard_rotation=False,
+    sm_scale=None,
+):  
+    d = k.shape[-1]
     K_q = torch.empty((*k.shape[:-1], d // 2), dtype=torch.uint8, device=k.device)
     K_descale = torch.empty(
         (*k.shape[:-1], d // 32), dtype=torch.uint8, device=k.device
     )
-
-    stride_qqb, stride_qqm, stride_qqh, stride_qqd = map_dims(Q_q.stride(), bshd)
-    stride_kqb, stride_kqn, stride_kqh, stride_kqd = map_dims(K_q.stride(), bshd)
-
-    stride_qsb, stride_qsm, stride_qsh, stride_qsd = map_dims(Q_descale.stride(), bshd)
-    stride_ksb, stride_ksn, stride_ksh, stride_ksd = map_dims(K_descale.stride(), bshd)
-
-    grid_q = (b * h_q * Q_NUM_BLKS,)
-    _rotate_quantize_q_kernel[grid_q](
-        q,
-        Q_q,
-        Q_descale,
-        q_mean,
-        R,
-        sm_scale,
-        stride_qb,
-        stride_qh,
-        stride_qm,
-        stride_qd,
-        stride_qqb,
-        stride_qqm,
-        stride_qqh,
-        stride_qqd,
-        stride_qsb,
-        stride_qsm,
-        stride_qsh,
-        stride_qsd,
-        q_mean.stride(0) if q_smoothing else None,
-        q_mean.stride(1) if q_smoothing else None,
-        q_mean.stride(2) if q_smoothing else None,
-        q_mean.stride(3) if q_smoothing else None,
-        b,
-        h_q,
-        s_q,
-        d,
-        q_smoothing=q_smoothing,
-        hadamard_rotation=hadamard_rotation,
-        BLOCK_M=BLOCK_SIZE_M,
-        BLOCK_R=BLOCK_R,
-        D=d,
-        num_warps=4,
-        num_stages=5,
-    )
-
-    grid_k = (b * h_k * K_NUM_BLKS,)
-    _rotate_quantize_k_kernel[grid_k](
-        q,
-        Q_q,
-        Q_descale,
-        q_mean,
+    num_tokens = k.shape.numel() // d
+    stride_t = k.stride(-2)
+    stride_ts = K_descale.stride(-2)
+    stride_tq = K_q.stride(-2)
+    num_pid_k = (num_tokens + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+    grid_k = (num_pid_k,)
+    _rotate_mxfp_quantize_k_kernel[grid_k](
         k,
         K_q,
         K_descale,
         R,
-        sm_scale,
-        stride_qb,
-        stride_qh,
-        stride_qm,
-        stride_qd,
-        stride_qqb,
-        stride_qqm,
-        stride_qqh,
-        stride_qqd,
-        stride_qsb,
-        stride_qsm,
-        stride_qsh,
-        stride_qsd,
-        q_mean.stride(0) if q_smoothing else None,
-        q_mean.stride(1) if q_smoothing else None,
-        q_mean.stride(2) if q_smoothing else None,
-        q_mean.stride(3) if q_smoothing else None,
-        stride_kb,
-        stride_kh,
-        stride_kn,
-        stride_kd,
-        stride_kqb,
-        stride_kqn,
-        stride_kqh,
-        stride_kqd,
-        stride_ksb,
-        stride_ksn,
-        stride_ksh,
-        stride_ksd,
-        b,
-        h_q,
-        h_k,
-        s_q,
-        s_k,
-        d,
-        q_smoothing=q_smoothing,
+        stride_t,
+        stride_tq,
+        stride_ts,
+        num_tokens,
         hadamard_rotation=hadamard_rotation,
         BLOCK_M=BLOCK_SIZE_M,
         BLOCK_R=BLOCK_R,
         D=d,
+        sm_scale=sm_scale,
         num_warps=4,
         num_stages=5,
     )
-
-    if q_smoothing:
-        # 3. Compute Smoothing Delta S
-        # Grid: Each Q-block x Each K-block
-        grid_delta = (b * h_q, Q_NUM_BLKS, K_NUM_BLKS)
-        _compute_delta_s_kernel[grid_delta](
-            q_mean,
-            k,
-            delta_s,
-            q_mean.stride(0),
-            q_mean.stride(1),
-            q_mean.stride(2),
-            q_mean.stride(3),
-            stride_kb,
-            stride_kh,
-            stride_kn,
-            stride_kd,
-            delta_s.stride(0),
-            delta_s.stride(1),
-            delta_s.stride(2),
-            delta_s.stride(3),
-            h_k,
-            h_q,
-            s_k,
-            d,
-            BLOCK_N=BLOCK_SIZE_M,
-        )
-
-    return Q_q, Q_descale, K_q, K_descale, delta_s
+    return K_q, K_descale
 
 
 @functools.lru_cache(maxsize=16)
