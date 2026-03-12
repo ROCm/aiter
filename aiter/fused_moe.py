@@ -892,7 +892,10 @@ def get_2stage_cfgs(
             return 16 if token < 2048 else 32 if token < 16384 else 64
 
     if run_1stage:
-        tkn_per_epr = token * topk / expert
+        # TODO: enable this approach for other quant types
+        if q_type == QuantType.per_1x128:
+            tkn_per_epr = token * topk / expert
+            block_m = 64 if tkn_per_epr > 32 else block_m
         return MOEMetadata(
             functools.partial(
                 fused_moe_1stage,
@@ -901,7 +904,7 @@ def get_2stage_cfgs(
                 quant_type=q_type,
             ),
             None,
-            64 if tkn_per_epr > 32 else block_m,
+            block_m,
             ksplit,
             run_1stage,
         )
