@@ -271,6 +271,9 @@ jobs:
     if: ${{ inputs.release_type != '' }}
     needs: build_whl_package
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     outputs:
       wheel_names: ${{ steps.collect-wheels.outputs.wheel_names }}
     steps:
