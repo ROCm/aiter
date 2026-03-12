@@ -50,15 +50,75 @@ def find_seq_idx(
     return left - 1
 
 
-def q_scale_process(q, q_scale, QUANT_SCHEME):
+def q_scale_process(Q_Descale,
+                    q_block_global_idx,
+                    offs_d_scale,
+                    query_offset_seq,
+                    query_offset_head,
+                    seq_mask,
+                    query_scale_stride_0: tl.int64,  
+                    query_scale_stride_1: tl.int64,  
+                    query_scale_stride_2: tl.int64,
+                    SAGE_VERSION: tl.constexpr = None):
     # TODO Load q scale off
+
+    if SAGE_VERSION == None:
+        return Q_Descale # Q_Descale is none
+    elif SAGE_VERSION == 1: # SAGE v1
+        q_descale_ptr = (
+            Q_Descale
+            + q_block_global_idx * query_scale_stride_0
+            + query_offset_head * query_scale_stride_1
+        )
+        return tl.load(q_descale_ptr)
+    elif SAGE_VERSION == 2: # SAGE v2
+        # TODO fix: The seq dim offset is from the loop up
+        q_descale_ptr = (
+            Q_Descale
+            + query_offset_seq[:, None] * query_scale_stride_0
+            + query_offset_head * query_scale_stride_1
+            + offs_d_scale[None, :] * query_scale_stride_2
+        )
+        return tl.load(q_descale_ptr, mask = seq_mask, other=0.0)
+
+def k_scale_ptr_process(K_Descale,
+                        physical_block_idx,
+                        seq_offset,
+                        BLOCK_SIZE,
+                        kv_head_idx,
+                        offs_d_scale,
+                        stride_k_cache_scale_0: tl.int64,  # int
+                        stride_k_cache_scale_1: tl.int64,  # int
+                        stride_k_cache_scale_2: tl.int64,  # int
+                        stride_k_cache_scale_3: tl.int64,  # int
+                        SAGE_VERSION):
+        # Each block_size has its own scale
+        if SAGE_VERSION == 1: # SAGE v1
+            k_descale_ptr = (
+                K_Descale
+                + physical_block_idx * stride_k_cache_scale_0
+                + kv_head_idx * stride_k_cache_scale_1
+            )
+        elif SAGE_VERSION == 2:
+
+        k_offset = (
+            physical_block_idx[None, :] * stride_k_cache_0
+            + kv_head_idx * stride_k_cache_2
+            + offs_d[:, None] * stride_k_cache_3
+            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+        )
+
+
+        # K : (HEAD_SIZE, TILE_SIZE)
+        K_load = tl.load(
+            key_cache_ptr + k_offset,
+            mask=dim_mask[:, None] & tile_mask[None, :],
+            other=0.0,
+            cache_modifier=KV_cache_modifier,
+        )
     pass
 
-def k_scale_process(k, k_scale, QUANT_SCHEME):
-    # TODO Get K scale off
-    pass
-
-def v_scale_process(v, v_scale, QUANT_SCHEME):
+def v_scale_process(v, v_scale, SAGE_VERSION):
     # TODO Load v scale off
     pass
 
@@ -75,9 +135,9 @@ def kernel_unified_attention_2d(
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
     scale: tl.constexpr,  # float32
-    q_scale,  # None if fp8 quant, per block if sage, mxfp4 if sage_mxfp4
-    k_scale,  # float32 if fp8 quant, per block if sage, mxfp4 if sage_mxfp4
-    v_scale,  # float32 if fp8 quant, per block if sage, mxfp4 if sage_mxfp4
+    q_scale,  # None if fp8 quant, [num_tokens // BLOCK_M, num_query_heads] if sage, [num_tokens, num_query_heads, head_size // 32] if sage_mxfp4
+    k_scale,  # float32 if fp8 quant, [num_blks, num_kv_heads] if sage, [num_blks, blk_size, num_kv_heads, head_size // 32] if sage_mxfp4
+    v_scale,  # float32 if fp8 quant, [num_blks, num_kv_heads] if sage, [num_blks, blk_size, num_kv_heads, head_size // 32] if sage_mxfp4
     out_scale,  # float32
     softcap,  # float32
     num_query_heads: tl.constexpr,  # int
@@ -124,7 +184,7 @@ def kernel_unified_attention_2d(
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
     ALL_DECODE: tl.constexpr = False,  # bool
-    QUANT_SCHEME: tl.constexpr = None # bool
+    SAGE_VERSION: tl.constexpr = None # bool
 ):
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
@@ -151,7 +211,7 @@ def kernel_unified_attention_2d(
 
     offs_m = tl.arange(0, BLOCK_M)
     # MXFP4
-    if QUANT_SCHEME == 2:
+    if SAGE_VERSION == 2:
         offs_d = tl.arange(0, HEAD_SIZE_PADDED // 2)
         offs_d_scale = tl.arange(0, HEAD_SIZE_PADDED // 32)
     else:
@@ -186,6 +246,19 @@ def kernel_unified_attention_2d(
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
         cache_modifier=Q_cache_modifier,
+    )
+
+    q_scale_loaded = q_scale_process(
+        q_scale,
+        q_block_global_idx,
+        offs_d_scale,
+        query_offset_seq=query_offset_0,
+        query_offset_head=query_offset_1,
+        seq_mask=query_mask_0[:, None] & query_mask_1[:, None],
+        query_scale_stride_0=query_scale_stride_0,  
+        query_scale_stride_1=query_scale_stride_1,  
+        query_scale_stride_2=query_scale_stride_2,  
+        SAGE_VERSION=SAGE_VERSION
     )
 
     block_table_offset = seq_idx * block_table_stride
@@ -306,6 +379,8 @@ def kernel_unified_attention_2d(
             else:
                 K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
         else:
+            k_descale_offset = 
+
             K = K_load
 
         # V : (TILE_SIZE, HEAD_SIZE)

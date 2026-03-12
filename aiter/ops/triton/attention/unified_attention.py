@@ -101,12 +101,11 @@ def use_2d_kernel(
         or (num_2d_prgms > target_num_prgms)
     )
 
-class UNIFIED_ATTN_QUANT_SCHEME(Enum):
-    FP8 = 0
+class SAGE_VERSION(Enum):
     SAGE = 1
     SAGE_MXFP4 = 2
 
-def check_quant_args(q, q_descale, k, k_descale, v, v_descale, quant_scheme):
+def check_quant_args(q, q_descale, k, k_descale, v, v_descale, sage_version):
     # TODO check up of quant args
     pass
 
@@ -133,12 +132,12 @@ def unified_attention(
     qq_bias=None,
     # Optional tensor for sinks
     sinks=None,
-    quant_scheme: UNIFIED_ATTN_QUANT_SCHEME = None
+    sage_version: SAGE_VERSION = None
 ):
     assert causal, "Only causal attention is supported"
 
     if sage_quant_mxfp4 is not None:
-        check_quant_args(q, q_descale, k, k_descale, v, v_descale, quant_scheme)
+        check_quant_args(q, q_descale, k, k_descale, v, v_descale, sage_version)
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -248,7 +247,7 @@ def unified_attention(
             num_seqs=num_seqs,
             USE_FP8=output_scale is not None,
             ALL_DECODE=ALL_DECODE,
-            QUANT_SCHEME=quant_scheme,
+            sage_version=sage_version,
             **config,
         )
 
@@ -329,7 +328,7 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             ALL_DECODE=ALL_DECODE,
-            QUANT_SCHEME=quant_scheme,
+            sage_version=sage_version,
             **attn_config,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
