@@ -117,7 +117,7 @@ QDTYPES = [None]
 # one value large enough to test overflow in index calculation.
 # one value small enough to test the schema op check
 NUM_BLOCKS = [
-    128,
+    2048,
 ]
 SLIDING_WINDOWS = [None]
 
