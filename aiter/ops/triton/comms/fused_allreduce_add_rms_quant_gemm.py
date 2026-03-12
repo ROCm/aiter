@@ -584,7 +584,7 @@ class _AllReduceManager:
         heap_bases = shmem.get_heap_bases()
 
         # ---- Tunable parameters ----
-        BLOCK_SIZE_M = 16
+        BLOCK_SIZE_M = 2
         BLOCK_SIZE_N = triton.next_power_of_2(N)
         ACTUAL_N = N
         PADDED_N = BLOCK_SIZE_N != N
