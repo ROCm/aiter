@@ -91,6 +91,7 @@ class AttentionConfig:
     IS_Q_FP8: gl.constexpr
     IS_KV_FP8: gl.constexpr
     K_WIDTH: gl.constexpr
+    ALL_DECODE: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -117,6 +118,7 @@ class AttentionConfig:
         SHUFFLED_KV_CACHE,
         IS_Q_FP8,
         IS_KV_FP8,
+        ALL_DECODE,
     ):
         # Constants
         self.HEAD_SIZE = gl.constexpr(HEAD_SIZE)
@@ -131,6 +133,7 @@ class AttentionConfig:
         self.SHUFFLED_KV_CACHE = gl.constexpr(SHUFFLED_KV_CACHE)
         self.IS_Q_FP8 = gl.constexpr(IS_Q_FP8)
         self.IS_KV_FP8 = gl.constexpr(IS_KV_FP8)
+        self.ALL_DECODE = gl.constexpr(ALL_DECODE)
         # Derived constants
         self.TILE_SIZE = gl.constexpr(BLOCK_SIZE * NUM_BLOCKS_GATHER_PER_TILE)
         self.NUM_QUERIES_PER_KV = gl.constexpr(NUM_QUERY_HEADS // NUM_KV_HEADS)
@@ -1467,6 +1470,7 @@ def gluon_kernel_unified_attention_3d_tdm(
         SHUFFLED_KV_CACHE,
         IS_Q_FP8,
         IS_KV_FP8,
+        ALL_DECODE,
     )
 
     # Workgroup offsets
@@ -1475,9 +1479,12 @@ def gluon_kernel_unified_attention_3d_tdm(
     segm_idx = gl.program_id(2)
 
     # Find sequence index using binary search
-    seq_idx = find_seq_idx(
-        query_start_len_ptr, q_block_global_idx, num_seqs, cfg.BLOCK_Q, True
-    )
+    if cfg.ALL_DECODE:
+        seq_idx = q_block_global_idx
+    else:
+        seq_idx = find_seq_idx(
+            query_start_len_ptr, q_block_global_idx, num_seqs, cfg.BLOCK_Q, True
+        )
 
     # Get query block start and local index
     q_block_local_idx, cur_batch_query_len, cur_batch_in_all_start_index = (

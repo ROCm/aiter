@@ -527,10 +527,13 @@ def unified_attention(
     #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
     #    = floor(num_tokens / BLOCK_Q) + num_seqs
     cu_count = get_num_sms()
-    total_num_q_blocks = num_tokens // BLOCK_Q + num_seqs
+    ALL_DECODE = max_seqlen_q == 1
+    if ALL_DECODE:
+        total_num_q_blocks = num_seqs
+    else:
+        total_num_q_blocks = num_tokens // BLOCK_Q + num_seqs
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
-    ALL_DECODE = max_seqlen_q == 1
     # if batch contains a prefill
     if use_2d_kernel(
         head_size,
