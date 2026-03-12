@@ -10,6 +10,7 @@ from .utils import (
     FWD_CONF_OVERRIDE,
     get_arch,
     is_fp8,
+    remap_xcd,
 )
 
 FWD_PREFILL_AUTOTUNE_KEYS = [
@@ -47,7 +48,37 @@ def get_fwd_prefill_configs(autotune: bool):
                     },
                     num_stages=1,
                     num_warps=4,
-                )
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M": 128,
+                        "BLOCK_N": 64,
+                        "waves_per_eu": 2,
+                        "PRE_LOAD_V": False,
+                    },
+                    num_stages=1,
+                    num_warps=2,
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M": 128,
+                        "BLOCK_N": 64,
+                        "waves_per_eu": 2,
+                        "PRE_LOAD_V": False,
+                    },
+                    num_stages=2,
+                    num_warps=4,
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M": 128,
+                        "BLOCK_N": 128,
+                        "waves_per_eu": 2,
+                        "PRE_LOAD_V": False,
+                    },
+                    num_stages=2,
+                    num_warps=4,
+                ),
             ]
         elif arch.name == "gfx942":
             if arch.cu_count < 304:
@@ -846,14 +877,18 @@ def attn_fwd(
     FP8_P_DESCALE: tl.constexpr,
     USE_SEQUSED: tl.constexpr,
     FORCE_MASKING: tl.constexpr,
+    NUM_XCD: tl.constexpr = 1,
 ):
     # set params
     ACCUMULATOR_TYPE = tl.float32
 
     # compute offsets
-    off_z = tl.program_id(0)
-    off_h_q = tl.program_id(1)
-    start_m = tl.program_id(2)
+    off_h_q = tl.program_id(0)
+    # apply the xcd remapping for the hq dim
+    off_h_q = remap_xcd(off_h_q, NUM_XCD)
+
+    start_m = tl.program_id(1)
+    off_z = tl.program_id(2)
     # If MQA / GQA, set the K and V head offsets appropriately.
     GROUP_SIZE: tl.constexpr = HQ // HK
     if GROUP_SIZE != 1:
@@ -1693,8 +1728,8 @@ def attention_forward_prefill_triton_impl(
     force_masking = arch.is_rdna
 
     # launch kernel
-    def grid(META):
-        return (batch, nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]))
+    grid = lambda META: (nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]), batch)
+
 
     attn_fwd[grid](
         q,
@@ -1771,4 +1806,5 @@ def attention_forward_prefill_triton_impl(
         FP8_P_DESCALE=False,
         USE_SEQUSED=(seqused_q is not None or seqused_k is not None),
         FORCE_MASKING=force_masking,
+        NUM_XCD=8,
     )

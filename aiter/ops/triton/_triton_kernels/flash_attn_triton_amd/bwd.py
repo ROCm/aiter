@@ -8,6 +8,7 @@ from .utils import (
     AUTOTUNE,
     is_fp8,
     get_arch,
+    remap_xcd,
 )
 
 PREPROCESS_AUTOTUNE_KEYS = [
@@ -291,6 +292,30 @@ def get_bwd_configs(autotune: bool):
                     num_stages=1,
                     num_warps=4,
                 ),
+                triton.Config(
+                    {
+                        "BLOCK_M1": 32,
+                        "BLOCK_N1": 256,
+                        "BLOCK_M2": 256,
+                        "BLOCK_N2": 64,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 1,
+                    },
+                    num_stages=2,
+                    num_warps=8,
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M1": 32,
+                        "BLOCK_N1": 256,
+                        "BLOCK_M2": 256,
+                        "BLOCK_N2": 64,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 2,
+                    },
+                    num_stages=2,
+                    num_warps=8,
+                ),
             ]
             causal_configs = [
                 triton.Config(
@@ -315,6 +340,30 @@ def get_bwd_configs(autotune: bool):
                         "waves_per_eu": 1,
                     },
                     num_stages=1,
+                    num_warps=4,
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M1": 32,
+                        "BLOCK_N1": 128,
+                        "BLOCK_M2": 128,
+                        "BLOCK_N2": 64,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 1,
+                    },
+                    num_stages=2,
+                    num_warps=4,
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M1": 32,
+                        "BLOCK_N1": 128,
+                        "BLOCK_M2": 128,
+                        "BLOCK_N2": 64,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 2,
+                    },
+                    num_stages=2,
                     num_warps=4,
                 ),
             ]
@@ -2974,8 +3023,8 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
     stride_descale_v_z,
     stride_az,
     stride_ah,
-    HQ,
-    HK,
+    HQ : tl.constexpr,
+    HK : tl.constexpr,
     cu_seqlens_q,
     cu_seqlens_k,
     seqused_q,
@@ -3008,11 +3057,16 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
     USE_SEQUSED: tl.constexpr,  # Add flag for seqused
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
+    NUM_XCD: tl.constexpr = 1,
 ):
     # program ids
     hkid = tl.program_id(0)
     pid = tl.program_id(1)
     bid = tl.program_id(2)
+
+    # apply the xcd remapping for the hq dim
+    hkid = remap_xcd(hkid, HK, NUM_XCD)
+
     if DEBUG_TRITON:
         print(f"\npid: {pid}, bid: {bid}, hkid: {hkid}")  # noqa: E701
     # figure out varlen start and end
@@ -3048,8 +3102,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
     PADDED_HEAD_V: tl.constexpr = ACTUAL_HEAD_DIM_V != HEAD_DIM_V
     offs_d_qk = tl.arange(0, HEAD_DIM_QK)
     offs_d_v = tl.arange(0, HEAD_DIM_V)
-    GROUP_SIZE: tl.constexpr = HQ // HK
-
+    GROUP_SIZE : tl.constexpr = HQ // HK
     # align the delta_qk
     start_n = pid * BLOCK_N1
     if start_n < seqlen_k:
@@ -3553,8 +3606,8 @@ def bwd_kernel_fused_noncausal(
     stride_descale_v_z,
     stride_az,
     stride_ah,
-    HQ,
-    HK,
+    HQ : tl.constexpr,
+    HK : tl.constexpr,
     cu_seqlens_q,
     cu_seqlens_k,
     seqused_q,
@@ -3587,11 +3640,16 @@ def bwd_kernel_fused_noncausal(
     USE_SEQUSED: tl.constexpr,  # Add flag for seqused
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
+    NUM_XCD: tl.constexpr = 1,
 ):
     # program ids
     hkid = tl.program_id(0)
     pid = tl.program_id(1)
     bid = tl.program_id(2)
+
+    # apply the xcd remapping for the hq dim
+    hkid = remap_xcd(hkid, HK, NUM_XCD)
+
     if DEBUG_TRITON:
         print(f"\npid: {pid}, bid: {bid}, hkid: {hkid}")  # noqa: E701
     # figure out varlen start and end
@@ -4280,14 +4338,14 @@ def attention_backward_triton_impl(
     if mode == "fused":
         seqlen = max(max_seqlen_q, max_seqlen_k)
 
-        def grid(META):
-            return (
-                nheads_k,
-                (seqlen + META["BLOCK_N1"] - 1) // META["BLOCK_N1"],
-                batch,
-            )
+        grid = lambda META: (
+            nheads_k,
+            ((seqlen + META["BLOCK_N1"] - 1) // META["BLOCK_N1"]),
+            batch
+        )
 
         if causal:
+
             if DEBUG_TRITON:
                 print(f"bwd_kernel: grid = {grid}")  # noqa: E701
             bwd_kernel_fused_causal[grid](
@@ -4375,6 +4433,7 @@ def attention_backward_triton_impl(
                 ),  # Add flag for seqused
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                NUM_XCD = 8,
             )
         else:
             bwd_kernel_fused_noncausal[grid](
@@ -4462,6 +4521,7 @@ def attention_backward_triton_impl(
                 ),  # Add flag for seqused
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                NUM_XCD = 8,
             )
     elif mode == "fused_atomic":
         NUM_WARPS, NUM_STAGES = 4, 1
