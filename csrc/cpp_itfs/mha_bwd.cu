@@ -369,7 +369,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     AiterAsmKernel* impl_ptr_pre    = nullptr;
     AiterAsmKernel* impl_ptr_dqdkdv = nullptr;
     AiterAsmKernel* impl_ptr_post   = nullptr;
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
 
     auto it_pre = pre_cfgs->find(pre_kernel);
     if(it_pre != pre_cfgs->end())
@@ -379,13 +379,8 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         const char* co_name = cfg.co_name.c_str();
         ts_odo              = cfg.ts;
 
-        auto result = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-
-        impl_ptr_pre = result.first->second.get();
+        impl_ptr_pre =
+            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
     }
     else
     {
@@ -400,13 +395,8 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         const char* co_name = cfg.co_name.c_str();
         ts_kv               = cfg.ts;
 
-        auto result = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-
-        impl_ptr_dqdkdv = result.first->second.get();
+        impl_ptr_dqdkdv =
+            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
     }
     else
     {
@@ -423,13 +413,8 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
             const char* co_name = cfg.co_name.c_str();
             ts_dq               = cfg.ts;
 
-            auto result = impl_ptr_map.emplace(name, nullptr);
-            if(result.second)
-            {
-                result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-            }
-
-            impl_ptr_post = result.first->second.get();
+            impl_ptr_post =
+                &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
         }
         else
         {

@@ -240,19 +240,14 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     };
 
     AiterAsmKernel* impl_ptr = nullptr;
-    static thread_local std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>>
-        impl_ptr_map;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
 
     const auto& cfg     = it->second;
     const char* name    = cfg.knl_name.c_str();
     std::string co_name = get_kernel_co_name(cfg.co_name, arch_id);
 
-    auto result = impl_ptr_map.emplace(name, nullptr);
-    if(result.second)
-    {
-        result.first->second = std::make_unique<AiterAsmKernel>(name, co_name.c_str());
-    }
-    impl_ptr = result.first->second.get();
+    impl_ptr =
+        &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name.c_str()); });
 
     fmha_fwd_v3_args args;
     size_t arg_size = sizeof(args);

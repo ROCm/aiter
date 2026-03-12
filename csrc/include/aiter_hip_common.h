@@ -6,6 +6,9 @@
 #include <cstdint>
 #include <hip/hip_runtime.h>
 #include <iostream>
+#include <fstream>
+#include <mutex>
+#include <memory>
 #ifdef AITER_EMBEDDED_HSA_HEADER
 #include AITER_EMBEDDED_HSA_HEADER
 #endif
@@ -72,93 +75,82 @@ struct AiterAsmKernelArgs
 
 static const std::string get_gpu_arch();
 
-inline void load_asm_kernel(const char* name,
-                            const char* hsaco,
-                            hipModule_t& module,
-                            hipFunction_t& kernel_func)
+namespace detail {
+struct FatBinaryWrapper
 {
-    const char* AITER_ASM_DIR = std::getenv("AITER_ASM_DIR");
-    std::string arch_name     = get_gpu_arch();
-    if(AITER_ASM_DIR != nullptr)
-    {
-        std::string hsa_path = std::string(AITER_ASM_DIR) + "/" + arch_name + "/" + hsaco;
-        AITER_LOG_INFO("hipModuleLoad: " << hsa_path << " GetFunction: " << name);
-        HIP_CALL(hipModuleLoad(&module, hsa_path.c_str()));
-    }
-    else
-    {
-#if defined(AITER_EMBEDDED_HSA_HEADER) && defined(AITER_EMBEDDED_HSA_MAP)
-        std::string fname = "hsa/" + arch_name + "/" + hsaco;
-        auto hasco_obj    = AITER_EMBEDDED_HSA_MAP.find(fname);
-        CHECK_COND(hasco_obj != AITER_EMBEDDED_HSA_MAP.end());
-        CHECK_COND(hasco_obj->second.data() != nullptr);
-        AITER_LOG_INFO("hipModuleLoad: " << fname << " GetFunction: " << name);
-        HIP_CALL(hipModuleLoadData(&module, hasco_obj->second.data()));
-#endif
-    }
-    HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
-    AITER_LOG_INFO("hipModuleGetFunction: " << name << " Success");
-}
-
-class AiterAsmKernel
-{
-    private:
-    hipModule_t module;
-    hipFunction_t kernel_func;
-
-    public:
-    AiterAsmKernel(const char* name, const char* hsaco)
-    {
-        load_asm_kernel(name, hsaco, module, kernel_func);
-    };
-
-    ~AiterAsmKernel() { HIP_CALL(hipModuleUnload(module)); }
-
-    void launch_kernel(const AiterAsmKernelArgs& kargs)
-    {
-        void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER,
-                          kargs.args_ptr,
-                          HIP_LAUNCH_PARAM_BUFFER_SIZE,
-                          kargs.arg_size_ptr,
-                          HIP_LAUNCH_PARAM_END};
-
-        HIP_CALL(hipModuleLaunchKernel(kernel_func,
-                                       kargs.gdx,
-                                       kargs.gdy,
-                                       kargs.gdz,
-                                       kargs.bdx,
-                                       kargs.bdy,
-                                       kargs.bdz,
-                                       0,
-                                       kargs.stream,
-                                       nullptr,
-                                       (void**)&config));
-    };
+    uint32_t magic        = 0x48495046; // "HIPF";
+    uint32_t version      = 1;
+    const void* binary = nullptr;
+    intptr_t __pad        = 0;
 };
+
+extern "C" void* __hipRegisterFatBinary(const FatBinaryWrapper* data) noexcept;
+extern "C" void __hipUnregisterFatBinary(void* module) noexcept;
+extern "C" void __hipRegisterFunction(void* module,
+                                      const void* hostFunction,
+                                      const char* deviceFunction,
+                                      const char* deviceName,
+                                      int threadLimit,
+                                      void* tid,
+                                      void* bid,
+                                      void* blockDim,
+                                      void* gridDim,
+                                      void* wSize) noexcept;
+} // namespace detail
+
+
+namespace {
 
 class AiterAsmKernelFast
 {
     private:
-    hipModule_t module;
-    hipFunction_t kernel_func;
+    void* module = nullptr;
+
+    protected:
+    AiterAsmKernelFast() = default;
+    void init(const char* kernel_name, const void* hsaco)
+    {
+        detail::FatBinaryWrapper fat_bin{};
+        fat_bin.binary = hsaco;
+        module         = detail::__hipRegisterFatBinary(&fat_bin);
+        CHECK_COND(module != nullptr);
+        detail::__hipRegisterFunction(module,
+                                      static_cast<void*>(this),
+                                      kernel_name,
+                                      kernel_name,
+                                      -1,
+                                      nullptr,
+                                      nullptr,
+                                      nullptr,
+                                      nullptr,
+                                      nullptr);
+    }
 
     public:
-    AiterAsmKernelFast(const char* name, void* hsaco)
+    AiterAsmKernelFast(const char* kernel_name, const void* hsaco)
     {
-        HIP_CALL(hipModuleLoadData(&module, hsaco));
-        HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
-        AITER_LOG_INFO("hipModuleGetFunction: " << name << " Success");
+        init(kernel_name, hsaco);
     };
 
-    ~AiterAsmKernelFast() { HIP_CALL(hipModuleUnload(module)); }
+    ~AiterAsmKernelFast() { detail::__hipUnregisterFatBinary(module); }
+
+    AiterAsmKernelFast(AiterAsmKernelFast&)             = delete;
+    AiterAsmKernelFast(AiterAsmKernelFast&&)            = delete;
+    AiterAsmKernelFast& operator=(AiterAsmKernelFast&)  = delete;
+    AiterAsmKernelFast& operator=(AiterAsmKernelFast&&) = delete;
 
     void launch_kernel(const AiterAsmKernelArgs& kargs)
     {
-        void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER,
-                          kargs.args_ptr,
-                          HIP_LAUNCH_PARAM_BUFFER_SIZE,
-                          kargs.arg_size_ptr,
-                          HIP_LAUNCH_PARAM_END};
+        void* config[]            = {HIP_LAUNCH_PARAM_BUFFER_POINTER,
+                                     kargs.args_ptr,
+                                     HIP_LAUNCH_PARAM_BUFFER_SIZE,
+                                     kargs.arg_size_ptr,
+                                     HIP_LAUNCH_PARAM_END};
+        hipFunction_t kernel_func = nullptr;
+        // TODO Ask runtime folks to provide an API for hipLaunchKernel with extra arg
+        // Don't error check here.
+        // Failure to load the func would cause hipModuleLaunchKernel to fail anyways.
+        (void)hipGetFuncBySymbol(&kernel_func, reinterpret_cast<void*>(this));
 
         HIP_CALL(hipModuleLaunchKernel(kernel_func,
                                        kargs.gdx,
@@ -173,6 +165,58 @@ class AiterAsmKernelFast
                                        (void**)&config));
     };
 };
+
+
+class AiterAsmKernel: private AiterAsmKernelFast
+{
+    private:
+    std::unique_ptr<char[]> hsaco_data;
+
+    const void* load_hsaco_file(const char* hsaco_path)
+    {
+        const char* AITER_ASM_DIR = std::getenv("AITER_ASM_DIR");
+        std::string arch_name     = get_gpu_arch();
+        if(AITER_ASM_DIR != nullptr)
+        {
+            std::string full_path = std::string(AITER_ASM_DIR) + "/" + arch_name + "/" + hsaco_path;
+
+            std::ifstream file(full_path, std::ios::binary | std::ios::ate);
+
+            CHECK_COND(file.is_open());
+
+            size_t file_size = file.tellg();
+            hsaco_data.reset(new char[file_size]);
+
+            file.seekg(0, std::ios::beg);
+            CHECK_COND(file.read(hsaco_data.get(), file_size));
+            return hsaco_data.get();
+        }
+        else
+        {
+#if defined(AITER_EMBEDDED_HSA_HEADER) && defined(AITER_EMBEDDED_HSA_MAP)
+            std::string fname = "hsa/" + arch_name + "/" + hsaco;
+            auto hasco_obj    = AITER_EMBEDDED_HSA_MAP.find(fname);
+            CHECK_COND(hasco_obj != AITER_EMBEDDED_HSA_MAP.end());
+            CHECK_COND(hasco_obj->second.data() != nullptr);
+            return hasco_obj->second.data();
+#else
+            CHECK_COND(AITER_ASM_DIR != nullptr);
+            return nullptr;
+#endif
+        }
+    }
+
+    public:
+    AiterAsmKernel(const char* kernel_name, const char* hsaco_path)
+    {
+        init(kernel_name, load_hsaco_file(hsaco_path));
+    };
+
+    using AiterAsmKernelFast::launch_kernel;
+};
+
+
+} // namespace
 
 static const std::string get_gpu_arch()
 {
@@ -212,3 +256,27 @@ static uint32_t get_num_cu_func()
     static const uint32_t num_cu = get_num_cu_local();
     return num_cu;
 }
+
+template <class Key, class T, class Hash = std::hash<Key>, class KeyEqual = std::equal_to<Key>>
+struct SynchronizedCache
+{
+    template <typename K, typename F>
+    inline T& get_or_create(K&& k, F&& factory)
+    {
+        std::lock_guard<std::mutex> map_mu_guard(map_mu);
+
+        struct Wrapper
+        {
+            F& f;
+            // Makes usre we only invoke lambda on insert
+            operator T() && { return f(); }
+        };
+
+        auto [it, _] = map.try_emplace(std::forward<K>(k), Wrapper{factory});
+        return it->second;
+    }
+
+    private:
+    std::mutex map_mu;
+    std::unordered_map<Key, T, Hash, KeyEqual> map;
+};

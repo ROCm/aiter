@@ -169,7 +169,7 @@ void moe_stage1_g1u1(
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     CFG *config_map = get_cfg(input, out, w1, quant_type, sorted_weights.has_value());
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     int model_dim = input.size(1);
     int hidden_dim = inter_dim;
     int sub_X_cnt = sorted_expert_ids.size(0);
@@ -190,12 +190,8 @@ void moe_stage1_g1u1(
 
         TORCH_CHECK(inter_dim % cfg.tile_n == 0, "ASM kernel " + std::string(name) + " is not supported for inter_dim = " + std::to_string(inter_dim));
 
-        auto result = impl_ptr_map.emplace(name, nullptr);
-        if (result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
+        impl_ptr =
+            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
     }
     else
         TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
