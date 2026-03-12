@@ -116,8 +116,6 @@ def flydsl_moe_stage1(
     if sorted_weights is None:
         sorted_weights = torch.empty(0, device=out.device, dtype=torch.float32)
 
-    out.zero_()
-
     exe(
         out,
         input,
@@ -175,10 +173,6 @@ def flydsl_moe_stage2(
     if mode not in ("atomic", "reduce"):
         raise ValueError(f"Unsupported moe gemm2 mode: {mode}")
     use_valid_mask = valid_mask is not None
-    if mode == "reduce" and not zero_intermediate and intermediate is None:
-        raise ValueError(
-            "zero_intermediate=False requires a caller-provided intermediate buffer"
-        )
 
     exe = _manager.get_exe(
         compile_moe_gemm2_ex,
@@ -209,6 +203,17 @@ def flydsl_moe_stage2(
         valid_mask = valid_mask.contiguous()
 
     if mode == "reduce":
+        expected_intermediate_shape = (token_num * topk, model_dim)
+        if intermediate is not None:
+            if (
+                intermediate.device != out.device
+                or intermediate.dtype != out.dtype
+                or intermediate.numel()
+                != expected_intermediate_shape[0] * expected_intermediate_shape[1]
+            ):
+                intermediate = None
+            else:
+                intermediate = intermediate.view(expected_intermediate_shape)
         exe(
             out,
             inter_states,

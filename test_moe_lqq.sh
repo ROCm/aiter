@@ -32,8 +32,8 @@ export HIP_VISIBLE_DEVICES=5
 # AITER_FLYDSL_GEMM2_MODE=REDUCE python /workspace/aiter_dev/op_tests/test_moe_lqq.py -t 256 512 1024 1664 2048 -e 384 -k 8 -md 3584 -id 1024 -ep 8 -se 0 -x 32 64 80 --evenly
 # AITER_FLYDSL_GEMM2_MODE=REDUCE AITER_FLYDSL_GEMM2_VALID_MASK=1 python /workspace/aiter_dev/op_tests/test_moe_lqq.py -t 256 512 1024 1664 2048 -e 384 -k 8 -md 3584 -id 1024 -ep 8 -se 0 -x 32 64 80 --evenly
 
-AITER_FLYDSL_GEMM2_MODE=REDUCE python /workspace/aiter_dev/op_tests/test_moe_lqq.py -t 1024 -e 384 -k 8 -md 3584 -id 1024 -ep 8 -se 0 -x 32 --evenly
-# AITER_FLYDSL_GEMM2_MODE=REDUCE AITER_FLYDSL_GEMM2_VALID_MASK=1 python /workspace/aiter_dev/op_tests/test_moe_lqq.py -t 1024 -e 384 -k 8 -md 3584 -id 1024 -ep 8 -se 0 -x 32 --evenly
+AITER_FLYDSL_GEMM2_MODE=ATOMIC python /workspace/aiter_dev/op_tests/test_moe_lqq.py -t 1024 -e 384 -k 8 -md 3584 -id 1024 -ep 8 -se 0 -x 32 --evenly
+ AITER_FLYDSL_GEMM2_MODE=REDUCE AITER_FLYDSL_GEMM2_VALID_MASK=0 python /workspace/aiter_dev/op_tests/test_moe_lqq.py -t 1024 -e 384 -k 8 -md 3584 -id 1024 -ep 8 -se 0 -x 32 --evenly
 # AITER_FLYDSL_GEMM2_MODE=REDUCE python /workspace/aiter_dev/op_tests/test_moe_lqq.py -t 32 -e 384 -k 8 -md 3584 -id 1024 -ep 1 -se 0 -x 32 --evenly
 # AITER_FLYDSL_GEMM2_MODE=ATOMIC python /workspace/aiter_dev/op_tests/test_moe_lqq.py -t 32 -e 48 -k 8 -md 3584 -id 1024 -ep 1 -se 0 -x 32 --evenly
 # AITER_FLYDSL_GEMM2_MODE=REDUCE python /workspace/aiter_dev/op_tests/test_moe_lqq.py -t 32 -e 48 -k 8 -md 3584 -id 1024 -ep 1 -se 0 -x 32 --evenly

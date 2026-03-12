@@ -46,7 +46,7 @@ def _moe_sorting_impl(
     num_local_tokens,
     dispatch_policy,
     use_opus,
-    is_reduce,
+    need_reduce,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -59,7 +59,10 @@ def _moe_sorting_impl(
     )
     sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+    print(f"need_reduce: {need_reduce}")
+    moe_buf = torch.empty(
+        (M, topk if need_reduce else 1, model_dim), dtype=moebuf_dtype, device=device
+    )
 
     fwd_fn = aiter.moe_sorting_opus_fwd if use_opus else aiter.moe_sorting_fwd
     fwd_fn(
@@ -89,7 +92,7 @@ def moe_sorting(
     expert_mask=None,
     num_local_tokens=None,
     dispatch_policy=0,
-    is_reduce=False,
+    need_reduce=False,
 ):
     try:
         return _moe_sorting_impl(
@@ -103,7 +106,7 @@ def moe_sorting(
             num_local_tokens,
             dispatch_policy,
             use_opus=_USE_OPUS_MOE_SORTING,
-            is_reduce=is_reduce,
+            need_reduce=need_reduce,
         )
     except Exception as e:
         logger.error(f"Error in moe_sorting: {e}")
@@ -144,6 +147,11 @@ def is_reduce() -> bool:
     if mode in ("atomic", "reduce"):
         return mode == "reduce"
     raise Exception(f"Invalid mode: {mode}")
+
+
+def _supports_stage2_reduce(stage2: Callable) -> bool:
+    stage2_fn = getattr(stage2, "func", stage2)
+    return stage2_fn in (flydsl_moe_stage2, _flydsl_stage2_wrapper)
 
 
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
@@ -372,7 +380,7 @@ def fused_moe_(
         expert_mask,
         num_local_tokens,
         moe_sorting_dispatch_policy,
-        is_reduce(),
+        is_reduce() and _supports_stage2_reduce(metadata.stage2),
     )
 
     if metadata.run_1stage:
@@ -1176,6 +1184,11 @@ def fused_moe_2stages(
     bias1=None,
     bias2=None,
 ):
+    def _normalize_moe_output_shape(x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 3 and x.shape[1] == 1:
+            return x[:, 0, :]
+        return x
+
     quant_func = get_quant(quant_type)
     token_num_quant_moe_sort_switch = 1024
     token_num, _ = hidden_states.shape
@@ -1437,7 +1450,7 @@ def fused_moe_2stages(
         a2 = a2.view(token_num, topk, inter_dim)
     # Build valid_mask for EP mode, comment it out for hotfix
     extra_stage2_args = {}
-    use_reduce = is_reduce()
+    use_reduce = is_reduce() and _supports_stage2_reduce(metadata.stage2)
     use_valid_mask = int(os.environ.get("AITER_FLYDSL_GEMM2_VALID_MASK", "0"))
     if use_reduce and use_valid_mask:
         valid_mask = None
@@ -1446,9 +1459,12 @@ def fused_moe_2stages(
         # Add valid_mask to extra_stage2_args if available
         if valid_mask is not None:
             extra_stage2_args["valid_mask"] = valid_mask
+    print(f"use_reduce: {use_reduce} is_reduce: {is_reduce()}")
     if use_reduce:
         extra_stage2_args["intermediate"] = moe_out
+        intermediate = moe_out
         moe_out = torch.empty(token_num, model_dim, dtype=moe_out.dtype, device=device)
+        print(f"use_reduce with buffer {moe_out.shape}  {intermediate.shape}")
 
     metadata.stage2(
         a2,
@@ -1469,8 +1485,8 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if not doweight_stage1 else None,
         **extra_stage2_args,
     )
-
-    return moe_out
+    print(f"use_reduce with buffer {moe_out.shape}")
+    return _normalize_moe_output_shape(moe_out)
 
 
 def torch_moe_act(act_input, torch_act, inter_dim):
@@ -1568,6 +1584,9 @@ def asm_stage2(
     w2_lqq_scale=None,
     w2_lqq_zero=None,
     sorted_weights=None,
+    intermediate=None,
+    valid_mask=None,
+    **_kwargs,
 ):
     return aiter.moe_stage2_g1u1(
         inter_states,
