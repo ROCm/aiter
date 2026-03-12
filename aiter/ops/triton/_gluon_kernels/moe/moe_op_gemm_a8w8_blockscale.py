@@ -80,10 +80,10 @@ def unshuffle_b_to_kn(
 ):
     """converts preshuffled (BLOCK_N//16, BLOCK_K*16) to logical (BLOCK_K, BLOCK_N)."""
     return (
-        b.reshape(1, BLOCK_N // 16, BLOCK_K // 32, 2, 16, 16)
-        .permute(0, 1, 4, 2, 3, 5)
-        .reshape(BLOCK_N, BLOCK_K)
-        .trans(1, 0)
+        b.reshape((1, BLOCK_N // 16, BLOCK_K // 32, 2, 16, 16))
+        .permute((0, 1, 4, 2, 3, 5))
+        .reshape((BLOCK_N, BLOCK_K))
+        .permute((1, 0))
     )
 
 
@@ -313,10 +313,9 @@ def consume_scaled_tile(
     is_w_blockscale: gl.constexpr,
 ):
     cur_a = a_buffer.index(m % NUM_BUFFERS).load(layout=DOT_A_LAYOUT)
-    b_shuffled = b_buffer.index(m % NUM_BUFFERS).load(layout=BLOCKED_B)
-    cur_b = gl.convert_layout(
-        unshuffle_b_to_kn(b_shuffled, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K), DOT_B_LAYOUT
-    )
+    b_shuffled = b_buffer.index(m % NUM_BUFFERS)
+    b_slice = unshuffle_b_to_kn(b_shuffled, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K)
+    cur_b = b_slice.load(layout=DOT_B_LAYOUT)
 
     offs_k_scale = (k_offset_start // BLOCKSCALE_K) + m * gl.cdiv(BLOCK_K, BLOCKSCALE_K)
     if is_x_blockscale:
@@ -539,7 +538,7 @@ def _moe_gemm_a8w8_blockscale(
 
     Key parameters:
     - X: Matrix X with shape (M, K).
-    - E: Matrix E with shape (E, K, N).
+    - W: Matrix E with shape (E, K, N).
     - Y: Matrix C with shape (E, M, N).
     - x_scale: Scale tensor for A with shape (M // blockscale_m, K // blockscale_k) or (M, K // blockscale_k)
     - w_scale: Scale tensor for B with shape (K // blockscale_k, N // blockscale_n)
@@ -593,6 +592,7 @@ def _moe_gemm_a8w8_blockscale(
     start_m = start_m.to(index_type)
     pid_n, pid_k = pid_n.to(index_type), pid_k.to(index_type)
 
+    # Create layouts
     num_warps: gl.constexpr = gl.num_warps()
     threads_per_elem_mk: gl.constexpr = gl.cdiv(BLOCK_M * BLOCK_K // (num_warps * 32), 16)
     threads_per_elem_kn: gl.constexpr = gl.cdiv(BLOCK_K * BLOCK_N // (num_warps * 32), 16)
@@ -634,16 +634,6 @@ def _moe_gemm_a8w8_blockscale(
         operand_index=1, parent=WMMA_LAYOUT, k_width=16
     )
 
-    # Allocate shared memory buffers
-    a_buffer = gl.allocate_shared_memory(
-        X.type.element_ty, [NUM_BUFFERS, BLOCK_M, BLOCK_K], layout=SHARED_A
-    )
-    b_buffer = gl.allocate_shared_memory(
-        W.type.element_ty,
-        [NUM_BUFFERS, BLOCK_N // 16, BLOCK_K * 16],
-        layout=SHARED_B,
-    )
-
     # Create tensor descriptors
     a_desc, b_desc, gathered_m = create_descriptor(
         X,
@@ -672,6 +662,18 @@ def _moe_gemm_a8w8_blockscale(
         BLOCKED_KN,
         SHARED_A,
         SHARED_B,
+    )
+
+    # Allocate shared memory buffers
+    a_buffer = gl.allocate_shared_memory(
+        a_desc.dtype,
+        [NUM_BUFFERS] + a_desc.block_shape,
+        layout=a_desc.layout,
+    )
+    b_buffer = gl.allocate_shared_memory(
+        b_desc.dtype,
+        [NUM_BUFFERS] + b_desc.block_shape,
+        layout=b_desc.layout,
     )
 
     k = 0
