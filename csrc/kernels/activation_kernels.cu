@@ -441,21 +441,7 @@ void gelu_tanh_and_mul(torch::Tensor& out,   // [..., d]
 
 namespace aiter {
 
-// Element-wise activation kernel template.
-template <typename scalar_t, scalar_t (*ACT_FN)(const scalar_t&)>
-__global__ void activation_kernel(scalar_t* __restrict__ out,         // [..., d]
-                                  const scalar_t* __restrict__ input, // [..., d]
-                                  const int d)
-{
-    const int64_t token_idx = blockIdx.x;
-    for(int64_t idx = threadIdx.x; idx < d; idx += blockDim.x)
-    {
-        const scalar_t x         = VLLM_LDG(&input[token_idx * d + idx]);
-        out[token_idx * d + idx] = ACT_FN(x);
-    }
-}
-
-__device__ __forceinline__ float aiter_tanh_fast(float x)
+__device__ __forceinline__ float fast_tanh(float x)
 {
     // return tanhf(x);
     // Target: max abs error <= 1e-3 by saturating for |x|>=3.8
@@ -502,20 +488,10 @@ __global__ void activation_kernel_vec(DTYPE_I* __restrict__ out,
         // Process both vectors with inline GELU (compiler can interleave instructions)
         #pragma unroll
         for(size_t j = 0; j < VEC_SIZE_I; j++) {
-            // Inline GELU for x0
-            float f0 = ck_tile::type_convert<float>(x0_ptr[j]);
-            float f0_sq = f0 * f0;
-            float inner0 = fmaf(0.035677408f, f0_sq * f0, 0.79788456f * f0);
-            float t0 = aiter_tanh_fast(inner0);
-            x0_ptr[j] = ck_tile::type_convert<DTYPE_I>(0.5f * fmaf(f0, t0, f0));
+            x0_ptr[j] = ck_tile::type_convert<DTYPE_I>(ACT_FN(x0_ptr[j]));
 
-            // Inline GELU for x1 (if exists)
             if (has_second) {
-                float f1 = ck_tile::type_convert<float>(x1_ptr[j]);
-                float f1_sq = f1 * f1;
-                float inner1 = fmaf(0.035677408f, f1_sq * f1, 0.79788456f * f1);
-                float t1 = aiter_tanh_fast(inner1);
-                x1_ptr[j] = ck_tile::type_convert<DTYPE_I>(0.5f * fmaf(f1, t1, f1));
+                x1_ptr[j] = ck_tile::type_convert<DTYPE_I>(ACT_FN(x1_ptr[j]));
             }
         }
 
@@ -528,19 +504,6 @@ __global__ void activation_kernel_vec(DTYPE_I* __restrict__ out,
 }
 
 } // namespace aiter
-
-// Launch element-wise activation kernel.
-#define LAUNCH_ACTIVATION_KERNEL(KERNEL)                                                           \
-    int d              = input.size(-1);                                                           \
-    int64_t num_tokens = input.numel() / d;                                                        \
-    dim3 grid(num_tokens);                                                                         \
-    dim3 block(std::min(d, 1024));                                                                 \
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));              \
-    const hipStream_t stream = at::hip::getCurrentHIPStream();                                     \
-    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "activation_kernel", [&] {                \
-        aiter::activation_kernel<scalar_t, KERNEL<scalar_t>>                                       \
-            <<<grid, block, 0, stream>>>(out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), d); \
-    });
 
 #define LAUNCH_ACTIVATION_KERNEL_VEC(KERNEL)                                                \
     int64_t numel      = input.numel();                                                            \
@@ -570,47 +533,21 @@ __global__ void activation_kernel_vec(DTYPE_I* __restrict__ out,
 
 namespace aiter {
 
+// Float-returning GELU used by vectorized activation kernel.
 template <typename T>
-__device__ __forceinline__ T gelu_new_kernel(const T& x)
-{
-    const float x3 = (float)(x * x * x);
-    const T t      = (T)tanhf((T)(0.79788456f * (float)(x + (T)(0.044715f * x3))));
-    return ((T)0.5) * x * (((T)1.0) + t);
-}
-
-template <typename T>
-__device__ __forceinline__ T gelu_fast_kernel(const T& x)
-{
-    const float f = (float)x;
-    const T t     = (T)tanhf(((T)(f * 0.79788456f)) * (((T)1.0) + (T)(0.044715f * f) * x));
-    return ((T)0.5) * x * (((T)1.0) + t);
-}
-
-// Float-returning version for vectorized kernel
-template <typename T>
-__device__ __forceinline__ float gelu_fast_kernel_float(const T& x)
+__device__ __forceinline__ float gelu_fast_kernel(const T& x)
 {
     const float f = ck_tile::type_convert<float>(x);
-    const float t = tanhf((f * 0.79788456f) * (1.0f + 0.044715f * f * f));
-    return 0.5f * f * (1.0f + t);
-}
-
-void gelu_new(torch::Tensor& out,   // [..., d]
-              torch::Tensor& input) // [..., d]
-{
-    LAUNCH_ACTIVATION_KERNEL(aiter::gelu_new_kernel);
+    const float f_sq = f * f;
+    const float inner = fmaf(0.035677408f, f_sq * f, 0.79788456f * f);
+    const float t = fast_tanh(inner);
+    return 0.5f * fmaf(f, t, f);
 }
 
 void gelu_fast(torch::Tensor& out,   // [..., d]
                torch::Tensor& input) // [..., d]
 {
-    LAUNCH_ACTIVATION_KERNEL(aiter::gelu_fast_kernel);
-}
-
-void gelu_fast_vec(torch::Tensor& out,   // [..., d]
-                   torch::Tensor& input) // [..., d]
-{
-    LAUNCH_ACTIVATION_KERNEL_VEC(aiter::gelu_fast_kernel_float);
+    LAUNCH_ACTIVATION_KERNEL_VEC(aiter::gelu_fast_kernel);
 }
 
 } // namespace aiter
