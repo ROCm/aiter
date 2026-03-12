@@ -23,10 +23,19 @@ def _ensure_flir():
     if FLIR_PATH not in sys.path:
         sys.path.insert(0, FLIR_PATH)
     try:
-        from kernels.moe_gemm_2stage import compile_moe_gemm1, compile_moe_gemm2
+        from kernels.moe_gemm_2stage import (
+            compile_moe_gemm1,
+            compile_moe_gemm2,
+            compile_moe_gemm2_ex,
+        )
         from tests.utils import shuffle_weight as flir_shuffle_weight
 
-        return compile_moe_gemm1, compile_moe_gemm2, flir_shuffle_weight
+        return (
+            compile_moe_gemm1,
+            compile_moe_gemm2,
+            compile_moe_gemm2_ex,
+            flir_shuffle_weight,
+        )
     except ImportError as e:
         logger.error(f"Failed to import FLIR kernels from FLIR_PATH={FLIR_PATH}: {e}")
         raise e
@@ -76,7 +85,7 @@ def flydsl_moe_stage1(
     model_dim=0,
     inter_dim=0,
 ):
-    compile_moe_gemm1, _, _ = _ensure_flir()
+    compile_moe_gemm1, _, _, _ = _ensure_flir()
 
     token_num = out.shape[0]
     tile_m = block_m if block_m else 16
@@ -150,18 +159,29 @@ def flydsl_moe_stage2(
     experts=0,
     model_dim=0,
     inter_dim=0,
+    mode=None,
+    valid_mask=None,
+    intermediate=None,
 ):
-    _, compile_moe_gemm2, _ = _ensure_flir()
+    _, _, compile_moe_gemm2_ex, _ = _ensure_flir()
 
     token_num = out.shape[0]
     tile_m = block_m if block_m else 16
     tile_n = int(os.environ.get(_ENV_TILE_N2, "128"))
     tile_k = int(os.environ.get(_ENV_TILE_K2, "256"))
-
-    out.zero_()
+    if mode is None:
+        mode = os.environ.get("AITER_FLYDSL_GEMM2_MODE", "ATOMIC")
+    mode = str(mode).strip().lower()
+    if mode not in ("atomic", "reduce"):
+        raise ValueError(f"Unsupported moe gemm2 mode: {mode}")
+    use_valid_mask = valid_mask is not None
+    if mode == "reduce" and not zero_intermediate and intermediate is None:
+        raise ValueError(
+            "zero_intermediate=False requires a caller-provided intermediate buffer"
+        )
 
     exe = _manager.get_exe(
-        compile_moe_gemm2,
+        compile_moe_gemm2_ex,
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=experts,
@@ -172,7 +192,9 @@ def flydsl_moe_stage2(
         doweight_stage2=sorted_weights is not None,
         in_dtype="a8w4smooth",
         out_dtype="bf16",
-        accumulate=True,
+        mode=mode,
+        valid_mask=True if use_valid_mask else None,
+        zero_intermediate=False,
     )
 
     qs = w2_lqq_scale.view(torch.int32)
@@ -183,24 +205,48 @@ def flydsl_moe_stage2(
 
     if sorted_weights is None:
         sorted_weights = torch.empty(0, device=out.device, dtype=torch.float32)
+    if valid_mask is not None:
+        valid_mask = valid_mask.contiguous()
 
-    exe(
-        out,
-        inter_states,
-        w2,
-        a2_scale,
-        w2_scale,
-        qs,
-        qz,
-        sorted_token_ids,
-        sorted_expert_ids,
-        sorted_weights,
-        num_valid_ids,
-        token_num,
-        model_dim,
-        inter_dim,
-        int(num_expert_blocks),
-        stream_ptr,
-    )
+    if mode == "reduce":
+        exe(
+            out,
+            inter_states,
+            w2,
+            a2_scale,
+            w2_scale,
+            qs,
+            qz,
+            sorted_token_ids,
+            sorted_expert_ids,
+            sorted_weights,
+            num_valid_ids,
+            token_num,
+            model_dim,
+            inter_dim,
+            int(num_expert_blocks),
+            intermediate=intermediate,
+            valid_mask=valid_mask,
+            stream_ptr=stream_ptr,
+        )
+    else:
+        exe(
+            out,
+            inter_states,
+            w2,
+            a2_scale,
+            w2_scale,
+            qs,
+            qz,
+            sorted_token_ids,
+            sorted_expert_ids,
+            sorted_weights,
+            num_valid_ids,
+            token_num,
+            model_dim,
+            inter_dim,
+            int(num_expert_blocks),
+            stream_ptr,
+        )
 
     return out

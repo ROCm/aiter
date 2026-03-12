@@ -46,6 +46,7 @@ def _moe_sorting_impl(
     num_local_tokens,
     dispatch_policy,
     use_opus,
+    is_reduce,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -88,6 +89,7 @@ def moe_sorting(
     expert_mask=None,
     num_local_tokens=None,
     dispatch_policy=0,
+    is_reduce=False,
 ):
     try:
         return _moe_sorting_impl(
@@ -101,6 +103,7 @@ def moe_sorting(
             num_local_tokens,
             dispatch_policy,
             use_opus=_USE_OPUS_MOE_SORTING,
+            is_reduce=is_reduce,
         )
     except Exception as e:
         logger.error(f"Error in moe_sorting: {e}")
@@ -112,6 +115,35 @@ def moe_sorting(
             f"Moe_sorting info: {max_num_tokens_padded=} {block_size=} {num_experts=} {topk=} {topk_ids.shape=}"
         )
         raise e
+
+
+def get_topk_valid_mask(
+    topk_ids: torch.Tensor,
+    expert_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Build valid_mask [token_num, topk] for EP mode.
+
+    Args:
+        topk_ids: [token_num, topk] i32 - Global expert IDs
+        expert_mask: [total_experts] i32 - Binary mask (1=valid, 0=fake/masked)
+
+    Returns:
+        valid_mask: [token_num, topk] i8 - 1 for valid slots, 0 for fake experts
+    """
+    if expert_mask is None:
+        # Non-EP mode: all slots are valid
+        return torch.ones(topk_ids.shape, dtype=dtypes.i8, device=topk_ids.device)
+    else:
+        # EP mode: mask based on expert_mask
+        return expert_mask[topk_ids].to(dtypes.i8)
+
+
+def is_reduce() -> bool:
+    mode = os.environ.get("AITER_FLYDSL_GEMM2_MODE", "ATOMIC")
+    mode = mode.strip().lower()
+    if mode in ("atomic", "reduce"):
+        return mode == "reduce"
+    raise Exception(f"Invalid mode: {mode}")
 
 
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
@@ -340,6 +372,7 @@ def fused_moe_(
         expert_mask,
         num_local_tokens,
         moe_sorting_dispatch_policy,
+        is_reduce(),
     )
 
     if metadata.run_1stage:
@@ -400,7 +433,6 @@ def fused_moe_(
             fc1_smooth_scale=fc1_smooth_scale,
             fc2_smooth_scale=fc2_smooth_scale,
             num_local_tokens=num_local_tokens,
-            # following for cktile support
             hidden_pad=hidden_pad,
             intermediate_pad=intermediate_pad,
             bias1=bias1,
@@ -683,12 +715,20 @@ def _flydsl_stage2_wrapper(
     w2_scale=None,
     a2_scale=None,
     sorted_weights=None,
+    valid_mask=None,
+    intermediate=None,
+    zero_intermediate=True,
     **_kwargs,
 ):
-
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
+    mode = parsed.get("mode", "atomic")
+    env_mode = os.environ.get("AITER_FLYDSL_GEMM2_MODE")
+    if env_mode is not None:
+        env_mode = env_mode.strip().lower()
+        if env_mode in ("atomic", "reduce"):
+            mode = env_mode
     aiter.ops.flydsl.flydsl_moe_stage2(
         inter_states=inter_states,
         w2=w2,
@@ -703,10 +743,12 @@ def _flydsl_stage2_wrapper(
         a_dtype=parsed["a_dtype"],
         b_dtype=parsed["b_dtype"],
         out_dtype=parsed["out_dtype"],
-        mode=parsed.get("mode", "atomic"),
+        mode=mode,
         w2_scale=w2_scale,
         a2_scale=a2_scale,
         sorted_weights=sorted_weights,
+        valid_mask=valid_mask,
+        intermediate=intermediate,
     )
 
 
@@ -1393,6 +1435,21 @@ def fused_moe_2stages(
             num_rows_factor=topk,
         )
         a2 = a2.view(token_num, topk, inter_dim)
+    # Build valid_mask for EP mode, comment it out for hotfix
+    extra_stage2_args = {}
+    use_reduce = is_reduce()
+    use_valid_mask = int(os.environ.get("AITER_FLYDSL_GEMM2_VALID_MASK", "0"))
+    if use_reduce and use_valid_mask:
+        valid_mask = None
+        if topk_ids is not None and expert_mask is not None:
+            valid_mask = get_topk_valid_mask(topk_ids, expert_mask)
+        # Add valid_mask to extra_stage2_args if available
+        if valid_mask is not None:
+            extra_stage2_args["valid_mask"] = valid_mask
+    if use_reduce:
+        extra_stage2_args["intermediate"] = moe_out
+        moe_out = torch.empty(token_num, model_dim, dtype=moe_out.dtype, device=device)
+
     metadata.stage2(
         a2,
         w1,
