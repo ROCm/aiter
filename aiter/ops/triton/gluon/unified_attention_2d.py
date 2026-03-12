@@ -9,7 +9,6 @@ import os
 
 PRINT_IRS = os.environ.get("PRINT_IRS", "0") == "1"
 
-
 @aggregate
 class AsyncKVLoaderConfig:
     """Configuration for asynchronous KV loader."""
@@ -233,6 +232,10 @@ class TDMKVLoaderConfig:
     k_reg_layout: gl.constexpr
     v_reg_layout: gl.constexpr
     BLOCK_SIZE: gl.constexpr
+    HEAD_SIZE: gl.constexpr
+    NUM_KV_HEADS: gl.constexpr
+    K_WIDTH: gl.constexpr
+    SHUFFLED_KV_CACHE: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(self, cfg):
@@ -241,23 +244,33 @@ class TDMKVLoaderConfig:
         #     gl.SwizzledSharedLayout(vec=8, per_phase=2, max_phase=8, order=[0, 1]))
         # self.shared_v_layout = gl.constexpr(
         #     gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0]))
-        self.shared_k_layout = gl.constexpr(
-            gl.PaddedSharedLayout.with_identity_for(
-                [[cfg.HEAD_SIZE, 8]], [cfg.BLOCK_SIZE, cfg.HEAD_SIZE], [1, 0]
+        if cfg.SHUFFLED_KV_CACHE:
+            self.shared_k_layout = gl.constexpr(
+                gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
             )
-        )
-        self.shared_v_layout = gl.constexpr(
-            gl.PaddedSharedLayout.with_identity_for(
-                [[cfg.HEAD_SIZE, 16]], [cfg.BLOCK_SIZE, cfg.HEAD_SIZE], [1, 0]
+            self.shared_v_layout = gl.constexpr(
+                gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
             )
-        )
-        self.KV_CACHE_MODIFIER = cfg.KV_CACHE_MODIFIER
-        self.USE_LOAD_BUFFER_OP = cfg.USE_LOAD_BUFFER_OP
-
+        else:
+            self.shared_k_layout = gl.constexpr(
+                gl.PaddedSharedLayout.with_identity_for(
+                    [[cfg.HEAD_SIZE, 8]], [cfg.BLOCK_SIZE, cfg.HEAD_SIZE], [1, 0]
+                )
+            )
+            self.shared_v_layout = gl.constexpr(
+                gl.PaddedSharedLayout.with_identity_for(
+                    [[cfg.HEAD_SIZE, 16]], [cfg.BLOCK_SIZE, cfg.HEAD_SIZE], [1, 0]
+                )
+            )
+        self.KV_CACHE_MODIFIER = gl.constexpr(cfg.KV_CACHE_MODIFIER)
+        self.USE_LOAD_BUFFER_OP = gl.constexpr(cfg.USE_LOAD_BUFFER_OP)
+        self.SHUFFLED_KV_CACHE = gl.constexpr(cfg.SHUFFLED_KV_CACHE)
         self.k_reg_layout = gl.constexpr(cfg.k_layout)
         self.v_reg_layout = gl.constexpr(cfg.v_layout)
         self.BLOCK_SIZE = gl.constexpr(cfg.BLOCK_SIZE)
-
+        self.HEAD_SIZE = gl.constexpr(cfg.HEAD_SIZE)
+        self.K_WIDTH = gl.constexpr(8) #jsut hardcode for now
+        self.NUM_KV_HEADS = gl.constexpr(cfg.NUM_KV_HEADS)
 
 @aggregate
 class TDMKVLoader:
@@ -312,29 +325,32 @@ class TDMKVLoader:
         stride_v_cache_3,
     ):
         kv_cfg = TDMKVLoaderConfig(cfg)
-        k_shared = gl.allocate_shared_memory(
-            key_cache_ptr.type.element_ty,
-            [2, cfg.BLOCK_SIZE, cfg.HEAD_SIZE],
-            layout=kv_cfg.shared_k_layout,
-        )
-        v_shared = gl.allocate_shared_memory(
-            value_cache_ptr.type.element_ty,
-            [2, cfg.BLOCK_SIZE, cfg.HEAD_SIZE],
-            layout=kv_cfg.shared_v_layout,
-        )
-
+        # if cfg.SHUFFLED_KV_CACHE:
+        #     block_shape = [1, cfg.BLOCK_SIZE * cfg.HEAD_SIZE]
+        # else:
         k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=key_cache_ptr,
-            shape=(num_blocks * cfg.BLOCK_SIZE, cfg.NUM_KV_HEADS * cfg.HEAD_SIZE),
+            shape=(num_blocks * cfg.NUM_KV_HEADS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE) if cfg.SHUFFLED_KV_CACHE else (num_blocks * cfg.BLOCK_SIZE, cfg.NUM_KV_HEADS * cfg.HEAD_SIZE),
             strides=(stride_k_cache_1, stride_k_cache_3),
-            block_shape=(cfg.BLOCK_SIZE, cfg.HEAD_SIZE),
+            block_shape=(1, cfg.BLOCK_SIZE * cfg.HEAD_SIZE) if cfg.SHUFFLED_KV_CACHE else (cfg.BLOCK_SIZE, cfg.HEAD_SIZE),
             layout=kv_cfg.shared_k_layout,
         )
         v_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=value_cache_ptr,
-            shape=(num_blocks * cfg.BLOCK_SIZE, cfg.NUM_KV_HEADS * cfg.HEAD_SIZE),
+            shape=(num_blocks * cfg.NUM_KV_HEADS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE) if cfg.SHUFFLED_KV_CACHE else (num_blocks * cfg.BLOCK_SIZE, cfg.NUM_KV_HEADS * cfg.HEAD_SIZE),
             strides=(stride_v_cache_1, stride_v_cache_3),
-            block_shape=(cfg.BLOCK_SIZE, cfg.HEAD_SIZE),
+            block_shape=(1, cfg.BLOCK_SIZE * cfg.HEAD_SIZE) if cfg.SHUFFLED_KV_CACHE else (cfg.BLOCK_SIZE, cfg.HEAD_SIZE),
+            layout=kv_cfg.shared_v_layout,
+        )
+
+        k_shared = gl.allocate_shared_memory(
+            key_cache_ptr.type.element_ty,
+            [2] + k_desc.block_shape, 
+            layout=kv_cfg.shared_k_layout,
+        )
+        v_shared = gl.allocate_shared_memory(
+            value_cache_ptr.type.element_ty,
+            [2] + v_desc.block_shape,
             layout=kv_cfg.shared_v_layout,
         )
 
@@ -352,20 +368,32 @@ class TDMKVLoader:
 
     @gluon.jit
     def load_k_to_shared(self, k_offset, buffer_id):
-        offsets = [
-            (k_offset * (self.kv_cfg.BLOCK_SIZE)).to(gl.int32),
-            (self.kv_head_idx * self.stride_k_cache_2).to(gl.int32),
-        ]
+        if self.kv_cfg.SHUFFLED_KV_CACHE:
+            offsets = [
+                (k_offset * self.kv_cfg.NUM_KV_HEADS + self.kv_head_idx).to(gl.int32),
+                0,
+            ]
+        else:
+            offsets = [
+                (k_offset * (self.kv_cfg.BLOCK_SIZE)).to(gl.int32),
+                (self.kv_head_idx * self.stride_k_cache_2).to(gl.int32),
+            ]
         gl.amd.gfx1250.tdm.async_load(
             self.k_desc, offsets, self.k_shared.index(buffer_id)
         )
 
     @gluon.jit
     def load_v_to_shared(self, v_offset, buffer_id):
-        offsets = [
-            (v_offset * (self.kv_cfg.BLOCK_SIZE)).to(gl.int32),
-            (self.kv_head_idx * self.stride_v_cache_2).to(gl.int32),
-        ]
+        if self.kv_cfg.SHUFFLED_KV_CACHE:
+            offsets = [
+                (v_offset * self.kv_cfg.NUM_KV_HEADS + self.kv_head_idx).to(gl.int32),
+                0,
+            ]
+        else:
+            offsets = [
+                (v_offset * (self.kv_cfg.BLOCK_SIZE)).to(gl.int32),
+                (self.kv_head_idx * self.stride_v_cache_2).to(gl.int32),
+            ]
         gl.amd.gfx1250.tdm.async_load(
             self.v_desc, offsets, self.v_shared.index(buffer_id)
         )
@@ -373,20 +401,78 @@ class TDMKVLoader:
     @gluon.jit
     def load_k_from_shared(self, wait_count, buffer_id):
         gl.amd.gfx1250.tdm.async_wait(wait_count)
-        return (
-            self.k_shared.index(buffer_id)
-            .permute([1, 0])
-            .load(layout=self.kv_cfg.k_reg_layout)
-        )
+        if self.kv_cfg.SHUFFLED_KV_CACHE:
+            return (
+                self.lds_unshuffle_k(buffer_id)
+                .load(layout=self.kv_cfg.k_reg_layout)
+            )
+        else:
+            return (
+                self.k_shared.index(buffer_id)
+                .permute([1, 0])
+                .load(layout=self.kv_cfg.k_reg_layout)
+            )
 
     @gluon.jit
     def load_v_from_shared(self, wait_count, buffer_id):
         gl.amd.gfx1250.tdm.async_wait(wait_count)
-        return self.v_shared.index(buffer_id).load(layout=self.kv_cfg.v_reg_layout)
+        if self.kv_cfg.SHUFFLED_KV_CACHE:
+            return (
+                self.lds_unshuffle_v(buffer_id)
+                .load(layout=self.kv_cfg.v_reg_layout)
+            )
+        else:
+            return self.v_shared.index(buffer_id).load(layout=self.kv_cfg.v_reg_layout)
 
     @gluon.jit
     def load_block_ids(self, i):
         return gl.load(self.block_tables_ptr_shifted + i)
+
+    @gluon.jit
+    def lds_unshuffle_k(self, buffer_id):
+        return (
+            self.k_shared.index(buffer_id)
+            .reshape(
+                (
+                    1,
+                    self.kv_cfg.BLOCK_SIZE // 16,
+                    self.kv_cfg.HEAD_SIZE // (2 * self.kv_cfg.K_WIDTH),
+                    2,
+                    16,
+                    self.kv_cfg.K_WIDTH,
+                )
+            )
+            .permute((0, 1, 4, 2, 3, 5))
+            .reshape((self.kv_cfg.BLOCK_SIZE, self.kv_cfg.HEAD_SIZE))
+            .permute((1, 0))
+        )
+
+    @gluon.jit
+    def lds_unshuffle_v(self, buffer_id):
+        return (
+            self.v_shared.index(buffer_id)
+            .reshape(
+                (
+                    1,
+                    self.kv_cfg.HEAD_SIZE // 16,
+                    self.kv_cfg.BLOCK_SIZE // (2 * self.kv_cfg.K_WIDTH),
+                    2,
+                    16,
+                    self.kv_cfg.K_WIDTH,
+                )
+            )
+            .permute((0, 1, 4, 2, 3, 5))
+            .reshape(
+                (
+                    1,
+                    self.kv_cfg.HEAD_SIZE,
+                    self.kv_cfg.BLOCK_SIZE,
+                )
+            )
+            .permute((1, 0, 2))
+            .reshape((self.kv_cfg.HEAD_SIZE, self.kv_cfg.BLOCK_SIZE))
+            .permute((1, 0))
+        )
 
 @aggregate
 class TDMGatherKVLoaderConfig:
@@ -600,10 +686,10 @@ class AttentionConfig:
 
     Q_CACHE_MODIFIER: gl.constexpr
     KV_CACHE_MODIFIER: gl.constexpr
-
     USE_LOAD_BUFFER_OP: gl.constexpr
     USE_STORE_BUFFER_OP: gl.constexpr
     ALL_DECODE: gl.constexpr
+    SHUFFLED_KV_CACHE: gl.constexpr
     @gluon.constexpr_function
     def __init__(
         self,
@@ -621,6 +707,7 @@ class AttentionConfig:
         USE_LOAD_BUFFER_OP,
         USE_STORE_BUFFER_OP,
         ALL_DECODE,
+        SHUFFLED_KV_CACHE,
     ):
 
         # Constants
@@ -640,14 +727,17 @@ class AttentionConfig:
         self.USE_LOAD_BUFFER_OP = gl.constexpr(USE_LOAD_BUFFER_OP)
         self.USE_STORE_BUFFER_OP = gl.constexpr(USE_STORE_BUFFER_OP)
         self.ALL_DECODE = gl.constexpr(ALL_DECODE)
+        self.SHUFFLED_KV_CACHE = gl.constexpr(SHUFFLED_KV_CACHE)
         self.ARCH_NAME = gl.constexpr(ARCH_NAME)
         self.WARP_SIZE = gl.constexpr(32 if ARCH_NAME == "gfx1250" else 64)
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
         # Operator layouts (gfx1250 WMMA)
         if ARCH_NAME == "gfx1250":
-            assert NUM_WARPS == 4 or NUM_WARPS == 8
+            assert NUM_WARPS == 2 or NUM_WARPS == 4 or NUM_WARPS == 8
 
-            if NUM_WARPS == 4:
+            if NUM_WARPS == 2:
+                warp_bases = [[1, 0]]
+            elif NUM_WARPS == 4:
                 warp_bases = [[1, 0], [2, 0]]
             else:
                 warp_bases = [[1, 0], [2, 0], [4, 0]]
@@ -855,9 +945,9 @@ class AttentionProgram:
             layout=self.cfg.qk_layout,
         )
         if self.cfg.ARCH_NAME == "gfx1250":
-            return gl.amd.gfx1250.wmma(self.q, k, S) * self.cfg.QK_SCALE
+            return gl.amd.gfx1250.wmma(self.q, k, S)# * self.cfg.QK_SCALE
         else:
-            return gl.amd.cdna4.mfma(self.q, k, S) * self.cfg.QK_SCALE
+            return gl.amd.cdna4.mfma(self.q, k, S)# * self.cfg.QK_SCALE
 
     @gluon.jit
     def apply_mask_qk(self, S, j):
@@ -877,12 +967,23 @@ class AttentionProgram:
         S = gl.where(full_mask, S, float("-inf"))
         return S
 
+    # @gluon.jit
+    # def softmax_part0(self, S, M):
+    #     m_ij = gl.maximum(M, gl.max(S, axis=1))
+    #     m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
+    #     p = gl.exp2(S - m_ij[:, None])
+    #     alpha = gl.exp2(M - m_ij)
+    #     return p, alpha, m_ij
+
     @gluon.jit
     def softmax_part0(self, S, M):
         m_ij = gl.maximum(M, gl.max(S, axis=1))
         m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
-        p = gl.exp2(S - m_ij[:, None])
-        alpha = gl.exp2(M - m_ij)
+        m_ij_scaled = m_ij * self.cfg.QK_SCALE
+        q_shifted = S * self.cfg.QK_SCALE - m_ij_scaled[:, None]
+        p = gl.exp2(q_shifted)
+        m_diff_scaled = M * self.cfg.QK_SCALE - m_ij_scaled
+        alpha = gl.exp2(m_diff_scaled)
         return p, alpha, m_ij
 
     @gluon.jit
@@ -895,7 +996,6 @@ class AttentionProgram:
 
     @gluon.jit
     def compute_pv(self, p, v, acc):
-        p = gl.convert_layout(p, self.cfg.p_layout)
         if self.cfg.ARCH_NAME == "gfx1250":
             return gl.amd.gfx1250.wmma(p, v, acc)
         else:
@@ -1007,6 +1107,7 @@ def kernel_unified_attention_2d(
     USE_STORE_BUFFER_OP: gl.constexpr = False,
     ALL_DECODE: gl.constexpr = False,
     USE_TDM: gl.constexpr = False,
+    SHUFFLED_KV_CACHE: gl.constexpr = False,
 ):
     NUM_WARPS: gl.constexpr = gl.num_warps()
     # Workgroup offsets
@@ -1028,6 +1129,7 @@ def kernel_unified_attention_2d(
         USE_LOAD_BUFFER_OP,
         USE_STORE_BUFFER_OP,
         ALL_DECODE,
+        SHUFFLED_KV_CACHE,
     )
 
     # Cast strides to int64 when not using buffer ops
@@ -1078,11 +1180,12 @@ def kernel_unified_attention_2d(
         + offs_d[None, :]
     )
 
-    q = gl.load(
-        query_ptr + q_offs,
+    q = gl.amd.cdna4.buffer_load(
+        ptr=query_ptr,
+        offsets=q_offs,
         mask=query_mask,
         other=0.0,
-        cache_modifier=cfg.Q_CACHE_MODIFIER,
+        cache=cfg.Q_CACHE_MODIFIER,
     )
 
     seq_len = gl.load(seq_lens_ptr + seq_idx)
@@ -1152,14 +1255,14 @@ def kernel_unified_attention_2d(
             kv_head_idx * cfg.NUM_QUERIES_PER_KV + offs_m_pv % cfg.NUM_QUERIES_PER_KV
         )
         query_mask_1_pv = query_offset_1_pv < NUM_QUERY_HEADS
-        # Prescale with RCP_LN2, needed for exp2
+        # Using regular approach: Prescale with RCP_LN2, needed for exp2
+        # FMA based approach: Prescale with / SCALE
         M = (
             gl.load(
                 sink_ptr + query_offset_1_pv,
                 mask=query_mask_1_pv,
                 other=float("-inf"),
-            ).to(dtype=gl.float32)
-            * cfg.RCP_LN2
+            ).to(dtype=gl.float32) / SCALE
         )
 
     L = gl.full(
@@ -1178,9 +1281,7 @@ def kernel_unified_attention_2d(
     # Main attention loop over KV tiles (staged, num_stages=2)
     for j in range(pgm.tile_start, pgm.tile_end - 1):
         next_physical_block_idx = kv_loader.load_block_ids(j + 1)
-
         k = kv_loader.load_k_from_shared(wait_count=1, buffer_id=buffer_id)
-
         # Prefetch next tile (shared is free since k, v are in registers)
         kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
         kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
@@ -1192,8 +1293,10 @@ def kernel_unified_attention_2d(
         p, alpha, M = pgm.softmax_part0(S, M)
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
         v = kv_loader.load_v_from_shared(wait_count=2, buffer_id=buffer_id)
+        p = gl.convert_layout(p, pgm.cfg.p_layout)
         acc = pgm.compute_pv(p, v, acc)
         buffer_id = 1 - buffer_id
+        
 
     # Load k_i, v_i from shared into registers
     k = kv_loader.load_k_from_shared(wait_count=1, buffer_id=buffer_id)
@@ -1203,6 +1306,7 @@ def kernel_unified_attention_2d(
     p, alpha, M = pgm.softmax_part0(S, M)
     p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
     v = kv_loader.load_v_from_shared(wait_count=0, buffer_id=buffer_id)
+    p = gl.convert_layout(p, pgm.cfg.p_layout)
     acc = pgm.compute_pv(p, v, acc)
     # Normalize and store output
     l_recip = 1 / L[:, None]
@@ -1240,6 +1344,9 @@ def unified_attention(
     new_kv_layout=False,
     num_kv_blocks=1,
     use_tdm=False,
+    waves_per_eu=1,
+    shuffled_kv_cache=False,
+    num_warps=4,
 ):
     """
     Run the unified attention kernel with paged KV cache.
@@ -1267,14 +1374,23 @@ def unified_attention(
     NUM_Q_HEADS = q.shape[1]
     HEAD_SIZE = q.shape[2]
     num_blocks = k.shape[0]
-    if new_kv_layout:
-        assert use_tdm, "With new kv layout, USE_TDM must be True"
-        BLOCK_SIZE = k.shape[2]
-        NUM_KV_HEADS = k.shape[1]
+    if shuffled_kv_cache:
+        # key_cache: num_blocks, num_kv_heads, block_size // 16, head_size * 16
+        # value_cache: num_blocks, num_kv_heads, head_size // 16, block_size * 16
+        _, NUM_KV_HEADS, block_size, _ = k.shape
+        BLOCK_SIZE = block_size * 16
+         
     else:
-        assert num_kv_blocks == 1, "With original kv layout, num_kv_blocks must be 1"
-        BLOCK_SIZE = k.shape[1]
-        NUM_KV_HEADS = k.shape[2]
+        if new_kv_layout:
+            assert use_tdm, "With new kv layout, USE_TDM must be True"
+            BLOCK_SIZE = k.shape[2]
+            NUM_KV_HEADS = k.shape[1]
+        else:
+            # key_cache: num_blocks, num_kv_heads, block_size, head_size
+            # value_cache: num_blocks, num_kv_heads, block_size, head_size
+            assert num_kv_blocks == 1, "With original kv layout, num_kv_blocks must be 1"
+            BLOCK_SIZE = k.shape[1]
+            NUM_KV_HEADS = k.shape[2]
     # if use_tdm:
     #     assert ARCH_NAME == "gfx1250", "With TDM, ARCH must be gfx1250"
     BLOCK_M = 128
@@ -1286,13 +1402,12 @@ def unified_attention(
     assert num_kv_blocks & (num_kv_blocks - 1) == 0, "num_kv_blocks must be a power of 2"
     TILE_SIZE = num_kv_blocks * BLOCK_SIZE
     ARCH_NAME = arch_info.get_arch()
-    NUM_WARPS = 4
+    NUM_WARPS = num_warps
     kv_size = k.nelement() * k.element_size()
     MAX_INT32 = 2**31 - 1
     USE_LOAD_BUFFER_OP = ARCH_NAME != "gfx1250" and kv_size <= MAX_INT32
     USE_STORE_BUFFER_OP = out.nelement() * out.element_size() <= MAX_INT32
     #waves_per_eu = 2 if HEAD_SIZE < 128 else 2
-    waves_per_eu = 2
     grid = (NUM_KV_HEADS, total_query_blocks)
     attn_kernel = kernel_unified_attention_2d[grid](
         query_ptr=q,
@@ -1335,12 +1450,13 @@ def unified_attention(
         num_warps=NUM_WARPS,
         ALL_DECODE=ALL_DECODE,
         USE_TDM=use_tdm,
+        SHUFFLED_KV_CACHE=shuffled_kv_cache,
 
     )
 
     if PRINT_IRS and getattr(unified_attention, "print", False) == False:
         setattr(unified_attention, "print", True)
-        print_irs_to_files(attn_kernel, f"unified_attention_2d_gluon_block_m_{BLOCK_M}_tile_size_{TILE_SIZE}_block_size_{BLOCK_SIZE}_head_size_{HEAD_SIZE}")
+        print_irs_to_files(attn_kernel, f"unified_attention_2d_gluon_num_warps_{NUM_WARPS}_block_m_{BLOCK_M}_tile_size_{TILE_SIZE}_block_size_{BLOCK_SIZE}_head_size_{HEAD_SIZE}_sfl_{shuffled_kv_cache}")
     return attn_kernel
 
 
