@@ -19,7 +19,13 @@ if is_flydsl_available():
         flydsl_moe_stage2,
     )
 
+    from .gdr_decode_kernels import (
+        flydsl_gdr_decode,
+    )
+
     __all__ += [
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
+        
+        "flydsl_gdr_decode",
     ]
