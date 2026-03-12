@@ -278,7 +278,6 @@ def _torch_fused_moe(hidden, w1, w2, topk_weights, topk_ids, num_experts):
     """Simple torch reference for MoE: scatter-gather approach."""
     tokens, D = hidden.shape
     _, top_k = topk_ids.shape
-    N = w2.shape[1]  # intermediate_size for w2
 
     out = torch.zeros(tokens, D, device=hidden.device, dtype=hidden.dtype)
     for e in range(num_experts):
@@ -360,7 +359,6 @@ MLA_DECODE_SHAPES = [
 def _torch_mla_decode_ref(q, kv_flat, sm_scale, kv_lora_rank):
     """Simple torch MLA decode reference: q @ K^T * scale, softmax, @ V."""
     B, nhead, D = q.shape
-    S = kv_flat.shape[0]
     V_dim = kv_lora_rank
 
     q_f = q.float()
@@ -450,7 +448,6 @@ def _write_report(request):
     )
     print("-" * 80)
     for r in RESULTS:
-        status = "PASS" if r["pass"] else "FAIL"
         print(
             f"{r['kernel']:<20} {r['shape']:<45} {r['torch_ms']:>10.4f} "
             f"{r['aiter_ms']:>10.4f} {r['speedup']:>7.3f}x "
