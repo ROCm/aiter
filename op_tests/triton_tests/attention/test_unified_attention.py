@@ -525,6 +525,12 @@ def test_gluon_unified_attn_2d(
     if num_kv_blocks > 1:
         maybe_quantized_key_cache = maybe_quantized_key_cache.permute(0, 2, 1, 3).contiguous()
         maybe_quantized_value_cache = maybe_quantized_value_cache.permute(0, 2, 1, 3).contiguous()
+    
+    if shuffled_kv_cache:
+        maybe_quantized_key_cache, maybe_quantized_value_cache = shuffle_kv_cache(
+            maybe_quantized_key_cache,
+            maybe_quantized_value_cache,
+        )
     output_cuda = output.cuda()
     gluon_unified_attention_2d(
         q=maybe_quantized_query.cuda(),
@@ -547,6 +553,7 @@ def test_gluon_unified_attn_2d(
         new_kv_layout=num_kv_blocks > 1,
         num_kv_blocks=num_kv_blocks,
         use_tdm=use_tdm,
+        shuffled_kv_cache=shuffled_kv_cache,
     )
     if not skip_reference:
         ref_output = ref_paged_attn(
