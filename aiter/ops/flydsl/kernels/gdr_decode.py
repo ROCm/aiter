@@ -1,32 +1,21 @@
-import time
 import torch
-import torch.nn.functional as F
-import argparse
-import numpy as np
 from dataclasses import dataclass
+from _mlir import ir
+from _mlir.ir import F16Type, BF16Type, F32Type, VectorType
+from .ftensor import GTensor, STensor
+import _mlir.extras.types as T
 import functools
-from torch.profiler import profile, ProfilerActivity
-from typing import Optional, Any, Callable, Dict, Literal, Optional, Tuple
-import triton
-import triton.language as tl
 
 import flydsl
-from flydsl.dialects.ext import flir, gpu, arith, rocdl, vector, buffer_ops, math
+from flydsl.dialects.ext import flir, gpu, arith, vector
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.compiler.pipeline import Pipeline, run_pipeline
 from flydsl.dialects.ext.python_control_flow import (
     range_constexpr,
-    lower_range_for_loops,
 )
 from flydsl.utils import SmemAllocator
 
 fm_fast = flir.arith.FastMathFlags.fast
-
-from _mlir import ir
-from _mlir.ir import F16Type, BF16Type, F32Type, IntegerType, VectorType
-import _mlir.extras.types as T
-
-from .ftensor import GTensor, STensor
 
 
 @dataclass
@@ -152,11 +141,11 @@ def create_fused_preshuffle_gdn_kernel(
             batch_size: lambda: T.index(),
             scale: lambda: T.f32(),
         ):
-            i32_0 = arith.constant(0, type=T.i32())
+            # i32_0 = arith.constant(0, type=T.i32())
             width_i32 = arith.as_value(arith.constant(WARP_SIZE, type=T.i32()))
             acc_vec_t = VectorType.get([VALUES_PER_THREAD_K], self.acc_type)
             prefetch_acc_vec_t = VectorType.get([PREFETCH_VEC_SIZE], self.acc_type)
-            vec_t = VectorType.get([VALUES_PER_THREAD_K], self.dtype)
+            # vec_t = VectorType.get([VALUES_PER_THREAD_K], self.dtype)
 
             tidx = flir.thread_idx("x")
             bidx = flir.block_idx("x")
@@ -431,7 +420,7 @@ def create_fused_preshuffle_gdn_kernel(
                         r_g = flir.math.exp(_asv(r_g_value), fastmath=fm_fast)
 
                     r_g_vec = vector.BroadcastOp(acc_vec_t, _asv(r_g))
-                    r_beta_vec = vector.BroadcastOp(acc_vec_t, _asv(r_beta))
+                    # r_beta_vec = vector.BroadcastOp(acc_vec_t, _asv(r_beta))
 
                     sq_vecs = [0] * WARP_TILE_K_ITERS
                     sk_vecs = [0] * WARP_TILE_K_ITERS

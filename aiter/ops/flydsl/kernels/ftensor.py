@@ -1,32 +1,16 @@
 import numpy as np
 from itertools import product
 from abc import ABC, abstractmethod
+from _mlir.ir import VectorType
 
-import flydsl
-from flydsl.dialects.ext import flir, gpu, arith, buffer_ops, math
-from flydsl.runtime.device import get_rocm_arch
-from flydsl.compiler.pipeline import Pipeline, run_pipeline
+from flydsl.dialects.ext import flir, arith
 from flydsl.dialects.ext.python_control_flow import (
     range_constexpr,
-    lower_range_for_loops,
 )
-from flydsl.utils import SmemAllocator
 
 fm_fast = flir.arith.FastMathFlags.fast
 _asid = flir.const_index
 _asv = arith.as_value
-from _mlir import ir
-from _mlir.ir import (
-    F16Type,
-    BF16Type,
-    F32Type,
-    IntegerType,
-    VectorType,
-    IndexType,
-    IntegerAttr,
-)
-import _mlir.extras.types as T
-from _mlir.dialects.arith import addi
 
 
 class FTensorView:

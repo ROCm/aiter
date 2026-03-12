@@ -1,5 +1,3 @@
-import functools
-from typing import Dict, Optional
 import torch
 
 
@@ -33,7 +31,7 @@ def flydsl_gdr_decode(
     out = torch.zeros(
         (b, sq, num_v_heads, head_v_dim), dtype=args_.dtype, device=q.device
     )
-    EXE = gdr_decode(args_)
+    EXE = get_func(args_)
     EXE(
         q,
         k,
