@@ -198,19 +198,19 @@ def persistent_fused_allreduce_rmsnorm_quant_gemm(
             # Store FP8 to scratch (L1 re-read for GEMM)
             tl.store(quant_heap_ptr + qh_offset, quantized)
 
-            # Step 3: Inline GEMM — tile over output cols and reduction dim
+            # Step 3: Inline GEMM — tiled matmul using tl.dot
             for n_tile_idx in range(num_n_tiles):
                 offs_n = n_tile_idx * GEMM_BLOCK_N + tl.arange(0, GEMM_BLOCK_N)
                 n_valid = offs_n < K_GEMM
 
-                gemm_acc = tl.zeros((GEMM_BLOCK_N,), dtype=tl.float32)
+                gemm_acc = tl.zeros((BLOCK_SIZE_M, GEMM_BLOCK_N), dtype=tl.float32)
 
                 for k_tile_idx in range(num_k_tiles):
                     offs_k = k_tile_idx * GEMM_BLOCK_K + tl.arange(0, GEMM_BLOCK_K)
 
-                    # Load FP8 row slice from scratch (L1 hit)
-                    q_offsets = row_base * stride_qh_m + offs_k * stride_qh_n
-                    q_vec = tl.load(quant_heap_ptr + q_offsets).to(tl.float32)
+                    # Load FP8 block: (BLOCK_SIZE_M, GEMM_BLOCK_K)
+                    q_offsets = rm[:, None] * stride_qh_m + offs_k[None, :] * stride_qh_n
+                    q_block = tl.load(quant_heap_ptr + q_offsets)
 
                     # Load weight tile: (GEMM_BLOCK_K, GEMM_BLOCK_N)
                     w_offsets = (
@@ -219,23 +219,23 @@ def persistent_fused_allreduce_rmsnorm_quant_gemm(
                     )
                     w_tile = tl.load(
                         gemm_weight_ptr + w_offsets, mask=n_valid[None, :], other=0.0
-                    ).to(tl.float32)
+                    )
 
-                    # Vector-matrix: (K,1) * (K,N) -> sum axis=0 -> (N,)
-                    gemm_acc += tl.sum(q_vec[:, None] * w_tile, axis=0)
+                    # (BLOCK_SIZE_M, GEMM_BLOCK_K) @ (GEMM_BLOCK_K, GEMM_BLOCK_N)
+                    gemm_acc += tl.dot(q_block, w_tile)
 
                 # Apply per-row activation scale and per-tensor weight scale
-                gemm_result = gemm_acc * scale * ws
+                gemm_result = gemm_acc * scale[:, None] * ws
 
                 if HAS_BIAS:
                     bias_val = tl.load(bias_ptr + offs_n, mask=n_valid, other=0.0)
-                    gemm_result += bias_val.to(tl.float32)
+                    gemm_result += bias_val[None, :].to(tl.float32)
 
                 gemm_val = gemm_result.to(gemm_out_ptr.type.element_ty)
 
                 # Store GEMM output + broadcast to peers
-                go_offsets = row_base * stride_go_m + offs_n * stride_go_n
-                tl.store(gemm_out_ptr + go_offsets, gemm_val, mask=n_valid)
+                go_offsets = rm[:, None] * stride_go_m + offs_n[None, :] * stride_go_n
+                tl.store(gemm_out_ptr + go_offsets, gemm_val, mask=n_valid[None, :])
 
                 for i in tl.static_range(0, world_size):
                     remote_rank = rank_start + i * rank_stride
@@ -246,7 +246,7 @@ def persistent_fused_allreduce_rmsnorm_quant_gemm(
                             iris_rank,
                             remote_rank,
                             heap_bases,
-                            mask=n_valid,
+                            mask=n_valid[None, :],
                         )
 
             # Broadcast residual to peers
@@ -304,22 +304,25 @@ def persistent_fused_allreduce_rmsnorm_quant_gemm(
             # Store FP8 to scratch (L1 re-read for GEMM)
             tl.store(quant_heap_ptr + qh_offset, quantized, mask=mask)
 
-            # Step 3: Inline GEMM — tile over output cols and reduction dim
+            # Step 3: Inline GEMM — tiled matmul using tl.dot
             for n_tile_idx in range(num_n_tiles):
                 offs_n = n_tile_idx * GEMM_BLOCK_N + tl.arange(0, GEMM_BLOCK_N)
                 n_valid = offs_n < K_GEMM
+                gemm_mask = row_mask[:, None] & n_valid[None, :]
 
-                gemm_acc = tl.zeros((GEMM_BLOCK_N,), dtype=tl.float32)
+                gemm_acc = tl.zeros((BLOCK_SIZE_M, GEMM_BLOCK_N), dtype=tl.float32)
 
                 for k_tile_idx in range(num_k_tiles):
                     offs_k = k_tile_idx * GEMM_BLOCK_K + tl.arange(0, GEMM_BLOCK_K)
                     k_valid = offs_k < ACTUAL_N
 
-                    # Load FP8 row slice from scratch (L1 hit)
-                    q_offsets = row_base * stride_qh_m + offs_k * stride_qh_n
-                    q_vec = tl.load(
-                        quant_heap_ptr + q_offsets, mask=k_valid, other=0.0
-                    ).to(tl.float32)
+                    # Load FP8 block: (BLOCK_SIZE_M, GEMM_BLOCK_K)
+                    q_offsets = rm[:, None] * stride_qh_m + offs_k[None, :] * stride_qh_n
+                    q_block = tl.load(
+                        quant_heap_ptr + q_offsets,
+                        mask=row_mask[:, None] & k_valid[None, :],
+                        other=0.0,
+                    )
 
                     # Load weight tile: (GEMM_BLOCK_K, GEMM_BLOCK_N)
                     w_offsets = (
@@ -330,23 +333,23 @@ def persistent_fused_allreduce_rmsnorm_quant_gemm(
                         gemm_weight_ptr + w_offsets,
                         mask=k_valid[:, None] & n_valid[None, :],
                         other=0.0,
-                    ).to(tl.float32)
+                    )
 
-                    # Vector-matrix: (K,1) * (K,N) -> sum axis=0 -> (N,)
-                    gemm_acc += tl.sum(q_vec[:, None] * w_tile, axis=0)
+                    # (BLOCK_SIZE_M, GEMM_BLOCK_K) @ (GEMM_BLOCK_K, GEMM_BLOCK_N)
+                    gemm_acc += tl.dot(q_block, w_tile)
 
                 # Apply per-row activation scale and per-tensor weight scale
-                gemm_result = gemm_acc * scale * ws
+                gemm_result = gemm_acc * scale[:, None] * ws
 
                 if HAS_BIAS:
                     bias_val = tl.load(bias_ptr + offs_n, mask=n_valid, other=0.0)
-                    gemm_result += bias_val.to(tl.float32)
+                    gemm_result += bias_val[None, :].to(tl.float32)
 
                 gemm_val = gemm_result.to(gemm_out_ptr.type.element_ty)
 
                 # Store GEMM output + broadcast to peers
-                go_offsets = row_base * stride_go_m + offs_n * stride_go_n
-                tl.store(gemm_out_ptr + go_offsets, gemm_val, mask=n_valid)
+                go_offsets = rm[:, None] * stride_go_m + offs_n[None, :] * stride_go_n
+                tl.store(gemm_out_ptr + go_offsets, gemm_val, mask=gemm_mask)
 
                 for i in tl.static_range(0, world_size):
                     remote_rank = rank_start + i * rank_stride
@@ -357,7 +360,7 @@ def persistent_fused_allreduce_rmsnorm_quant_gemm(
                             iris_rank,
                             remote_rank,
                             heap_bases,
-                            mask=n_valid,
+                            mask=gemm_mask,
                         )
 
             # Broadcast residual to peers
@@ -581,7 +584,7 @@ class _AllReduceManager:
         heap_bases = shmem.get_heap_bases()
 
         # ---- Tunable parameters ----
-        BLOCK_SIZE_M = 1
+        BLOCK_SIZE_M = 16
         BLOCK_SIZE_N = triton.next_power_of_2(N)
         ACTUAL_N = N
         PADDED_N = BLOCK_SIZE_N != N
