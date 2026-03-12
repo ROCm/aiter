@@ -46,4 +46,13 @@ void partial_transpose(torch::Tensor& out,         // [rows, d]
                        torch::Tensor const& input, // [rows, d]
                        torch::Tensor const& num_rows);
 
+void moe_smooth_per_token_scaled_quant(
+    torch::Tensor& out,         // [..., d]
+    torch::Tensor const& input, // [..., d]
+    torch::Tensor& scales,
+    torch::Tensor const& smooth_scale,
+    torch::Tensor const& smooth_scale_map,
+    bool shuffle_scale                                   = false,
+    std::optional<torch::Tensor> const& smooth_scale_map_hash = std::nullopt,
+    bool transpose_out = false);
 } // namespace aiter

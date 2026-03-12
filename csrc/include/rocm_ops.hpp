@@ -1411,7 +1411,17 @@ namespace py = pybind11;
           py::arg("num_rows")              = std::nullopt,               \
           py::arg("num_rows_factor")       = 1,                          \
           py::arg("smooth_scale_map_hash") = std::nullopt,               \
-          py::arg("enable_ps")             = true);                                  \
+          py::arg("enable_ps")             = true);                      \
+    m.def("moe_smooth_per_token_scaled_quant",                           \
+          &aiter::moe_smooth_per_token_scaled_quant,                     \
+          py::arg("out"),                                                \
+          py::arg("input"),                                              \
+          py::arg("scales"),                                             \
+          py::arg("smooth_scale"),                                       \
+          py::arg("smooth_scale_map"),                                   \
+          py::arg("shuffle_scale") = false,                              \
+          py::arg("smooth_scale_map_hash") = std::nullopt,               \
+          py::arg("transpose_out") = false);                             \
     m.def("partial_transpose",                                           \
           &aiter::partial_transpose,                                     \
           py::arg("out"),                                                \

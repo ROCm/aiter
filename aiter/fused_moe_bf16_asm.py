@@ -288,14 +288,23 @@ def asm_moe(
             # aiter.moe_smoothquant_fwd(
             #     a8, hidden_states, fc1_smooth_scale, topk_ids, a8_scale
             # )
-            aiter.smooth_per_token_scaled_quant(
-                a8.view(topk, M, model_dim).transpose(0, 1),
-                hidden_states.view(M, 1, model_dim).expand(-1, topk, -1),
+            # aiter.smooth_per_token_scaled_quant(
+            #     a8.view(topk, M, model_dim).transpose(0, 1),
+            #     hidden_states.view(M, 1, model_dim).expand(-1, topk, -1),
+            #     a8_scale,
+            #     fc1_smooth_scale,
+            #     topk_ids,
+            #     smooth_scale_map_hash=local_expert_hash,
+            #     enable_ps=True,
+            # )
+            aiter.moe_smooth_per_token_scaled_quant(
+                a8,
+                hidden_states,
                 a8_scale,
                 fc1_smooth_scale,
                 topk_ids,
                 smooth_scale_map_hash=local_expert_hash,
-                enable_ps=True,
+                transpose_out=True,
             )
             a8 = a8.view(-1, model_dim).view(topk, M, model_dim)
         else:
