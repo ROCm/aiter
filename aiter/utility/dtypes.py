@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-import ctypes
 import torch
 from ..jit.utils.chip_info import get_gfx
 from ..ops.enum import QuantType, ActivationType
