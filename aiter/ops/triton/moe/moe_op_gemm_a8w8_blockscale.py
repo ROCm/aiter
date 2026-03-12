@@ -131,12 +131,13 @@ def get_kernel_config(m, n, k, routing_data, use_gluon=False):
 
 def preshuffle_weights(w: torch.Tensor) -> torch.Tensor:
     """
-    Preshuffle weights from (E, K, N) to (E, N//16, K*16).
+    Preshuffle weights from (E, K, N) to (E, K*16, N//16).
 
     1. Transpose to (E, N, K)
     2. View as (E, N//16, 16, K//32, 2, 16)
     3. Permute to (E, N//16, K//32, 2, 16, 16)
     4. View as (E, N//16, K*16)
+    5. Transpose to (E, K*16, N//16)
     """
     fp8e4_dtype = (
         torch.float8_e4m3fn if get_arch() != "gfx942" else torch.float8_e4m3fnuz
@@ -147,10 +148,11 @@ def preshuffle_weights(w: torch.Tensor) -> torch.Tensor:
     assert K % 32 == 0
     assert N % 16 == 0
 
-    w = w.transpose(1, 2)  # (E, N, K)
-    w = w.view(E, N // 16, 16, K // 32, 2, 16)
+    w = w.transpose(-1, -2)  # (E, N, K)
+    w = w.view(E, N // 16, 16, K // 32, 2, 16) # (E, N//16, 16, K//32, 2, 16)
     w = w.permute(0, 1, 3, 4, 2, 5).contiguous()  # (E, N//16, K//32, 2, 16, 16)
-    w = w.view(E, N // 16, K * 16)
+    w = w.view(E, N // 16, K * 16) # (E, N//16, K*16)
+    w = w.transpose(-1, -2)  # (E, K*16, N//16)
     return w
 
 
@@ -305,10 +307,10 @@ def moe_gemm_a8w8_blockscale(
     # determine shapes
     M = x.shape[-2] if gather_indx is None else gather_indx.shape[0]
     if use_gluon:
-        # gluon uses preshuffled weights, W is (E, N//16, K*16)
+        # gluon uses preshuffled weights, W is (E, K*16, N//16)
         K = x.shape[-1]
-        N = w.shape[-2] * 16
-        K_w = w.shape[-1] // 16
+        N = w.shape[-1] * 16
+        K_w = w.shape[-2] // 16
         assert K == K_w, f"K dimension mismatch: x has K={K}, w has K={K_w}"
     else:
         K, N = x.shape[-1], w.shape[-1]
@@ -375,8 +377,8 @@ def moe_gemm_a8w8_blockscale(
             stride_x_bs_k,
             w,
             w.stride(0),
-            w.stride(2),
             w.stride(1),
+            w.stride(2),
             w_block_scales,
             stride_w_bs_e,
             stride_w_bs_k,
@@ -590,9 +592,9 @@ def main():
     from aiter.ops.triton.moe.quant_moe import dequant_x_blockscale, dequant_w_blockscale
 
     parser = argparse.ArgumentParser(description="Run MoE GEMM A8W8 BlockScale like unit tests")
-    parser.add_argument("--M", type=int, default=2048)
-    parser.add_argument("--N", type=int, default=1024)
-    parser.add_argument("--K", type=int, default=7168)
+    parser.add_argument("--M", type=int, default=128)
+    parser.add_argument("--N", type=int, default=128)
+    parser.add_argument("--K", type=int, default=128)
     parser.add_argument("--E", type=int, default=1, help="Total experts")
     parser.add_argument("--n_expts_act", type=int, default=1, help="Active experts per token")
     parser.add_argument(
