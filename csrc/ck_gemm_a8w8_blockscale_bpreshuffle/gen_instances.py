@@ -19,42 +19,6 @@ a8w8_blockscale_bpreshuffle_gemm instance gen
 
 """
 
-DEFAULT_TUNED_CONFIG = "a8w8_blockscale_bpreshuffle_tuned_gemm.csv"
-
-
-def get_current_cu_num():
-    cu_num = os.getenv("CU_NUM")
-    if cu_num:
-        return int(cu_num)
-    if torch.cuda.is_available():
-        gpu = torch.cuda.current_device()
-        return torch.cuda.get_device_properties(gpu).multi_processor_count
-    return None
-
-
-def resolve_machine_specific_tuned_file(tune_file: str) -> str:
-    if Path(tune_file).name != DEFAULT_TUNED_CONFIG:
-        return tune_file
-
-    cu_num = get_current_cu_num()
-    if cu_num is None:
-        return tune_file
-
-    project_root = Path(__file__).resolve().parents[2]
-    model_config_dir = project_root / "aiter" / "configs" / "model_configs"
-    pattern = f"a8w8_blockscale_bpreshuffle_tuned_gemm_*_cu{cu_num}.csv"
-    matches = sorted(model_config_dir.glob(pattern))
-    if len(matches) == 1:
-        resolved_path = str(matches[0])
-        print(f"Auto-selected cu{cu_num} tuned config for codegen: {resolved_path}")
-        return resolved_path
-    if len(matches) > 1:
-        print(
-            f"Found multiple cu{cu_num} tuned configs matching {pattern}, "
-            f"keeping requested path: {tune_file}"
-        )
-    return tune_file
-
 
 class gemm_a8w8_blockscale_bpreshuffle_codegen:
     def __init__(self, working_path, istune=False):
@@ -342,6 +306,4 @@ if __name__ == "__main__":
     if args.tune:
         codegen.gen_instances(kernels_list)
     else:
-        codegen.gen_instances(
-            get_tune_dict(resolve_machine_specific_tuned_file(args.tune_file))
-        )
+        codegen.gen_instances(get_tune_dict(args.tune_file))
