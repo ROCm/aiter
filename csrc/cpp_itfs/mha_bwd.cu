@@ -4,33 +4,6 @@
 #include <memory>
 #include <string>
 
-#if ONLY_FAV3
-namespace {
-enum class mask_enum
-{
-    no_mask = 0,
-    mask_top_left,
-    mask_bottom_right,
-    window_generic,
-};
-
-std::pair<int, int> compute_mask_coordinates(int left_size,
-                                             int right_size,
-                                             int y_total,
-                                             int x_total,
-                                             bool is_top_left)
-{
-    int left_tmp  = is_top_left ? y_total - 1 : x_total - 1;
-    int right_tmp = is_top_left ? x_total - 1 : y_total - 1;
-    left_size     = left_size < 0 ? left_tmp : left_size;
-    right_size    = right_size < 0 ? right_tmp : right_size;
-    int x_off     = is_top_left ? 0 : x_total - y_total;
-    int y_off     = is_top_left ? 0 : y_total - x_total;
-    return {1 + left_size + y_off, 1 + right_size + x_off};
-}
-} // namespace
-#endif
-
 namespace aiter {
 std::tuple<int, int> get_padded_hdim(int hdim_q, int hdim_v, std::string arch_id)
 {
@@ -562,7 +535,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         bool is_top_left = (a.mask_type == static_cast<int>(mask_enum::mask_top_left) ||
                             a.mask_type == static_cast<int>(mask_enum::window_generic));
         auto [mask_y, mask_x] = compute_mask_coordinates(
-            a.window_size_left, a.window_size_right,
+            a.window_size_left, a.window_size_right, 0,
             a.seqlen_q, a.seqlen_k, is_top_left);
         dqdkdv_args.mask_y = mask_y;
         dqdkdv_args.mask_x = mask_x;
