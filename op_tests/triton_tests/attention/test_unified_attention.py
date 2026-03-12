@@ -575,4 +575,5 @@ def test_gluon_unified_attn_2d(
         torch.testing.assert_close(
             output, ref_output, atol=atol, rtol=rtol
         ), f"{torch.max(torch.abs(output - ref_output))}"
-    assert True
+    else:
+        assert True
