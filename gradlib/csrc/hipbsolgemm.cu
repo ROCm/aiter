@@ -914,19 +914,20 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
                                                             &returnedAlgoCount));
         if(returnedAlgoCount == 0)
         {
-            std::cerr << "Error: hipblasLtMatmulAlgoGetHeuristic found 0 valid solutions for "
-                      << (op_A == HIPBLAS_OP_N ? "N" : "T") << (op_B == HIPBLAS_OP_N ? "N" : "T")
-                      << " (" << m << ", " << n << ", " << k << "), intype: " << intype
-                      << ", outtype: " << outtype
-                      << ", use_rowwise: " << use_rowwise
-                      << ", bpreshuffle: " << bpreshuffle
-                      << "request_solutions: " << request_solutions
-                      << std::endl;
             CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescDestroy(matmul));
             CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutDestroy(matA));
             CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutDestroy(matB));
             CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutDestroy(matC));
-            TORCH_CHECK(false, "hipblasLtMatmulAlgoGetHeuristic found 0 valid solutions");
+            TORCH_CHECK(
+                false,
+                "hipblasLtMatmulAlgoGetHeuristic found 0 valid solutions for ",
+                (op_A == HIPBLAS_OP_N ? "N" : "T"),
+                (op_B == HIPBLAS_OP_N ? "N" : "T"),
+                " (", m, ", ", n, ", ", k, "), intype: ", intype,
+                ", outtype: ", outtype,
+                ", use_rowwise: ", use_rowwise,
+                ", bpreshuffle: ", bpreshuffle,
+                ", request_solutions: ", request_solutions);
         }
         if((returnedAlgoCount != request_solutions) && cout_print)
         {
