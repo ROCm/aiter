@@ -1,4 +1,5 @@
-cu_num,M,N,K,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio64,1,2560,2048,ck,7,0,14.4982,a8w8_blockscale_1x128x128_256x16x128x256_16x16_16x16_1x2_16x16x1_16x16x1_1x16x1x16_8_1x2_intrawave_v1,0.72,362.12,0.0
+cu_num,M,N,K,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
+64,1,2560,2048,ck,7,0,14.4982,a8w8_blockscale_1x128x128_256x16x128x256_16x16_16x16_1x2_16x16x1_16x16x1_1x16x1x16_8_1x2_intrawave_v1,0.72,362.12,0.0
 64,2,2560,2048,ck,7,0,13.2106,a8w8_blockscale_1x128x128_256x16x128x256_16x16_16x16_1x2_16x16x1_16x16x1_1x16x1x16_8_1x2_intrawave_v1,1.59,397.95,0.0
 64,4,2560,2048,ck,7,0,13.2387,a8w8_blockscale_1x128x128_256x16x128x256_16x16_16x16_1x2_16x16x1_16x16x1_1x16x1x16_8_1x2_intrawave_v1,3.17,398.19,0.0
 64,8,2560,2048,ck,7,0,13.3632,a8w8_blockscale_1x128x128_256x16x128x256_16x16_16x16_1x2_16x16x1_16x16x1_1x16x1x16_8_1x2_intrawave_v1,6.28,396.63,0.0
