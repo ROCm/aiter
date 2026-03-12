@@ -366,15 +366,33 @@ def test_fmoe_lqq(
         print("    diff :")
         print(f"           {diff}")
 
+    def log_top_abs_diff(tag: str, x: torch.Tensor, y: torch.Tensor, n: int = 10):
+        a = x.reshape(-1)
+        b = y.reshape(-1)
+        abs_diff = (a - b).abs()
+        k = min(n, abs_diff.numel())
+        if k == 0:
+            return
+        top_vals, top_idx = torch.topk(abs_diff, k=k)
+        print(f"[a vs b] {tag} (top {k} abs diff)")
+        print(f"    idx  : {top_idx}")
+        print(f"    a    : {a[top_idx]}")
+        print(f"    b    : {b[top_idx]}")
+        print("    |diff|:")
+        print(f"           {top_vals}")
+
     def log_logits_diff(tag: str, x: torch.Tensor, y: torch.Tensor):
         cos_diff = calc_diff(x, y)
         aiter.logger.info(f"[logits_diff] {tag} {cos_diff:.2e}")
         return cos_diff
 
     quant_rtol, quant_atol, quant_tol_err = 0.25, 1.0, 0.15
+    asm_vs_ref_diff = None
+    flydsl_vs_ref_diff = None
+    flydsl_vs_asm_diff = None
     if out_asm is not None:
         aiter.logger.info("[test] Comparing ASM vs Ref...")
-        checkAllclose(
+        asm_vs_ref_diff = checkAllclose(
             out_asm,
             out_ref,
             rtol=quant_rtol,
@@ -383,11 +401,12 @@ def test_fmoe_lqq(
             msg="ASM vs Ref",
         )
         log_logits_diff("ASM vs Ref", out_asm, out_ref)
+        log_top_abs_diff("ASM vs Ref", out_asm, out_ref, n=10)
         logn("ASM vs Ref", out_asm, out_ref, n=10)
 
     if out_flydsl is not None:
         aiter.logger.info("[test] Comparing FlyDSL vs Ref...")
-        checkAllclose(
+        flydsl_vs_ref_diff = checkAllclose(
             out_flydsl,
             out_ref,
             rtol=quant_rtol,
@@ -396,12 +415,14 @@ def test_fmoe_lqq(
             msg="FlyDSL vs Ref",
         )
         log_logits_diff("FlyDSL vs Ref", out_flydsl, out_ref)
+        log_top_abs_diff("FlyDSL vs Ref", out_flydsl, out_ref, n=10)
         logn("FlyDSL vs Ref", out_flydsl, out_ref, n=10)
 
         if out_asm is not None:
             aiter.logger.info("[test] Comparing FlyDSL vs ASM...")
-            checkAllclose(out_flydsl, out_asm, msg="FlyDSL vs ASM")
+            flydsl_vs_asm_diff = checkAllclose(out_flydsl, out_asm, msg="FlyDSL vs ASM")
             log_logits_diff("FlyDSL vs ASM", out_flydsl, out_asm)
+            log_top_abs_diff("FlyDSL vs ASM", out_flydsl, out_asm, n=10)
             logn("FlyDSL vs ASM", out_flydsl, out_asm, n=10)
 
     result = {
@@ -419,6 +440,12 @@ def test_fmoe_lqq(
         result["us_asm"] = f"{us_asm:.2f}"
     if us_flydsl is not None:
         result["us_flydsl"] = f"{us_flydsl:.2f}"
+    if asm_vs_ref_diff is not None:
+        result["asm_vs_ref_diff"] = f"{asm_vs_ref_diff:.6f}"
+    if flydsl_vs_ref_diff is not None:
+        result["flydsl_vs_ref_diff"] = f"{flydsl_vs_ref_diff:.6f}"
+    if flydsl_vs_asm_diff is not None:
+        result["flydsl_vs_asm_diff"] = f"{flydsl_vs_asm_diff:.6f}"
     return result
 
 
