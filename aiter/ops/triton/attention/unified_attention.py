@@ -9,6 +9,8 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     kernel_unified_attention_3d,
     reduce_segments,
 )
+from aiter.ops.triton.quant.sage_attention_quant_wrappers import (sage_quant, sage_quant_mxfp4)
+from enum import Enum
 
 
 def select_2d_config(
@@ -99,6 +101,15 @@ def use_2d_kernel(
         or (num_2d_prgms > target_num_prgms)
     )
 
+class UNIFIED_ATTN_QUANT_SCHEME(Enum):
+    FP8 = 0
+    SAGE = 1
+    SAGE_MXFP4 = 2
+
+def check_quant_args(q, q_descale, k, k_descale, v, v_descale, quant_scheme):
+    # TODO check up of quant args
+    pass
+
 
 def unified_attention(
     q,
@@ -122,9 +133,12 @@ def unified_attention(
     qq_bias=None,
     # Optional tensor for sinks
     sinks=None,
+    quant_scheme: UNIFIED_ATTN_QUANT_SCHEME = None
 ):
     assert causal, "Only causal attention is supported"
-    assert q_descale is None, "Q scales not supported"
+
+    if sage_quant_mxfp4 is not None:
+        check_quant_args(q, q_descale, k, k_descale, v, v_descale, quant_scheme)
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -144,6 +158,7 @@ def unified_attention(
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
+
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     assert BLOCK_Q >= 1
     # Ideally we would launch with kernel with:
@@ -200,6 +215,7 @@ def unified_attention(
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
             scale=softmax_scale,
+            q_scale=q_descale,
             k_scale=k_descale,
             v_scale=v_descale,
             out_scale=1 / output_scale if output_scale is not None else 1.0,
@@ -232,6 +248,7 @@ def unified_attention(
             num_seqs=num_seqs,
             USE_FP8=output_scale is not None,
             ALL_DECODE=ALL_DECODE,
+            QUANT_SCHEME=quant_scheme,
             **config,
         )
 
@@ -281,6 +298,7 @@ def unified_attention(
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
             scale=softmax_scale,
+            q_scale=q_descale,
             k_scale=k_descale,
             v_scale=v_descale,
             softcap=softcap,
@@ -311,6 +329,7 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             ALL_DECODE=ALL_DECODE,
+            QUANT_SCHEME=quant_scheme,
             **attn_config,
         )
         reduce_segments[(q.shape[0], num_query_heads)](

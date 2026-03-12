@@ -50,6 +50,19 @@ def find_seq_idx(
     return left - 1
 
 
+def q_scale_process(q, q_scale, QUANT_SCHEME):
+    # TODO Load q scale off
+    pass
+
+def k_scale_process(k, k_scale, QUANT_SCHEME):
+    # TODO Get K scale off
+    pass
+
+def v_scale_process(v, v_scale, QUANT_SCHEME):
+    # TODO Load v scale off
+    pass
+
+
 @triton.jit
 def kernel_unified_attention_2d(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
@@ -62,8 +75,9 @@ def kernel_unified_attention_2d(
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
     scale: tl.constexpr,  # float32
-    k_scale,  # float32
-    v_scale,  # float32
+    q_scale,  # None if fp8 quant, per block if sage, mxfp4 if sage_mxfp4
+    k_scale,  # float32 if fp8 quant, per block if sage, mxfp4 if sage_mxfp4
+    v_scale,  # float32 if fp8 quant, per block if sage, mxfp4 if sage_mxfp4
     out_scale,  # float32
     softcap,  # float32
     num_query_heads: tl.constexpr,  # int
@@ -71,6 +85,9 @@ def kernel_unified_attention_2d(
     block_table_stride: tl.int64,  # int
     query_stride_0: tl.int64,  # int
     query_stride_1: tl.int64,  # int, should be equal to head_size
+    query_scale_stride_0: tl.int64,  
+    query_scale_stride_1: tl.int64,  
+    query_scale_stride_2: tl.int64,  
     output_stride_0: tl.int64,  # int
     output_stride_1: tl.int64,  # int, should be equal to head_size
     qq_bias_stride_0: tl.int64,  # int
@@ -91,6 +108,14 @@ def kernel_unified_attention_2d(
     stride_v_cache_1: tl.int64,  # int
     stride_v_cache_2: tl.int64,  # int
     stride_v_cache_3: tl.constexpr,  # int
+    stride_k_cache_scale_0: tl.int64,  # int
+    stride_k_cache_scale_1: tl.int64,  # int
+    stride_k_cache_scale_2: tl.int64,  # int
+    stride_k_cache_scale_3: tl.int64,  # int
+    stride_v_cache_scale_0: tl.int64,  # int
+    stride_v_cache_scale_1: tl.int64,  # int
+    stride_v_cache_scale_2: tl.int64,  # int
+    stride_v_cache_scale_3: tl.int64,  # int
     query_start_len_ptr,  # [num_seqs+1]
     BLOCK_Q: tl.constexpr,  # int
     num_seqs: tl.int32,
@@ -99,6 +124,7 @@ def kernel_unified_attention_2d(
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
     ALL_DECODE: tl.constexpr = False,  # bool
+    QUANT_SCHEME: tl.constexpr = None # bool
 ):
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
@@ -124,7 +150,14 @@ def kernel_unified_attention_2d(
         return
 
     offs_m = tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+    # MXFP4
+    if QUANT_SCHEME == 2:
+        offs_d = tl.arange(0, HEAD_SIZE_PADDED // 2)
+        offs_d_scale = tl.arange(0, HEAD_SIZE_PADDED // 32)
+    else:
+        offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+        offs_d_scale = None
+
     offs_t = tl.arange(0, TILE_SIZE)
     query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
 
