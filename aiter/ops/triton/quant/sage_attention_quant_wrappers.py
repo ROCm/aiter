@@ -13,7 +13,8 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     _rotate_quantize_q_kernel,
     _rotate_mxfp_quantize_k_kernel,
     _compute_delta_s_kernel,
-    sage_quant_v_bhsd_kernel
+    sage_quant_v_bhsd_kernel,
+    perblock_quantize_q_kernel
 )
 
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
@@ -481,22 +482,18 @@ def rotation_smooth_qk(
 
 
 """
-expected shape (bshd), (thd) or (num_blocks,block_size,h,d)
-
-
-
-
-
-(num_blocks,block_size,h,d) = (b,s,h,d)
-(b,s//BLOCK_M,h,1)
-
+expected shapes
+tensors (and quantized tensors) (bshd), (thd) or (num_blocks,block_size,h,d)
+descales (b,cdiv(s, BLOCK_M),h,1), (cdiv(max_seqlen, BLOCK_M),h,1) or (num_blocks,cdiv(block_size, BLOCK_M), h,1)
 """
-def perblock_quantize_int8(
+def q_perblock_quantize_int8(
     q,
     BLOCK_SIZE_M,
     cu_seqlens,
     layout="bhsd",
     sm_scale=None,
+    is_unified
+    num_queries_per_kv=None,
 ):  
     d = q.shape[-1]
     num_seqs = len(cu_seqlens)
@@ -513,11 +510,21 @@ def perblock_quantize_int8(
         total_num_blocks = num_blocks * (block_size + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * h
 
     Q_q = torch.empty((*q.shape[:-1], d // 2), dtype=torch.uint8, device=q.device)
+    num_heads = h // num_queries_per_kv if num_queries_per_kv is not None else h
+    
     Q_descale = torch.empty(
         (total_num_blocks, h, d // 32), dtype=torch.uint8, device=q.device
     )
 
-    
+    perblock_quantize_q_kernel[(
+                num_heads,
+                total_num_blocks,
+            )](
+                q,
+                Q_q,
+                Q_descale,
+                
+            )
     
     
  

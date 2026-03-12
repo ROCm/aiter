@@ -333,19 +333,28 @@ def _rotate_quantize_q_kernel(
     )
 
 
+
+from aiter.ops.triton._triton_kernels.attention.unified_attention import find_seq_idx
+
 @triton.jit
-def perblock_quantize_k_kernel(
-    Q,
+def perblock_quantize_q_kernel(
+    query_ptr,
     Q_q,
     Q_descale,
-    stride_t,
     query_start_len_ptr,
     num_seqs,
+    num_query_heads,
+    num_queries_per_kv,
+    query_stride_0,
+    query_stride_1,
+    scale_stride_0,
+    scale_stride_1,
     BLOCK_Q: tl.constexpr,
-    BLOCK_R: tl.constexpr,  # rotation block size
-    D: tl.constexpr,  # D is 128
+    BLOCK_M: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
     sm_scale: tl.constexpr,
-    SCALE_GROUP_SIZE: tl.constexpr = 32,
+    DTYPE_MAX: tl.constexpr,
 ):
 
     kv_head_idx = tl.program_id(0)
@@ -369,7 +378,6 @@ def perblock_quantize_k_kernel(
 
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
-    offs_t = tl.arange(0, TILE_SIZE)
     query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
 
     query_offset_0 = cur_batch_in_all_start_index + query_pos
@@ -387,10 +395,7 @@ def perblock_quantize_k_kernel(
     query_mask_0 = query_pos < cur_batch_query_len
     query_mask_1 = query_offset_1 < num_query_heads
 
-    if ALL_DECODE or BLOCK_M >= num_query_heads:
-        Q_cache_modifier: tl.constexpr = ".cg"
-    else:
-        Q_cache_modifier: tl.constexpr = ""
+    Q_cache_modifier: tl.constexpr = ""
     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
     Q = tl.load(
         query_ptr + query_offset,
@@ -398,6 +403,24 @@ def perblock_quantize_k_kernel(
         other=0.0,
         cache_modifier=Q_cache_modifier,
     )
+
+    Q = Q.to(tl.float32)
+    if sm_scale is not None:
+        Q *= sm_scale
+    scale = tl.max(tl.abs(Q)) / DTYPE_MAX
+    Q_quant = Q / scale
+    Q_quant = Q_quant.to(Q_q.dtype.element_ty)
+
+    # scale (total num blocks, hk)
+    scale_ptrs = Q_descale + q_block_global_idx * scale_stride_0 + kv_head_idx * scale_stride_1
+    tl.store(scale_ptrs, scale)
+    tl.store(
+        Q_q + query_offset,
+        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None])
+
+
+
+
 
 
 @triton.jit
