@@ -15,7 +15,8 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     _compute_delta_s_kernel,
     perblock_quantize_q_kernel,
     perblock_quantize_kernel,
-    _rotate_mxfp_quantize_k_kernel
+    _rotate_mxfp_quantize_k_kernel,
+    perchannel_quantize_v_kernel
 )
 
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
@@ -30,20 +31,21 @@ def unified_perblock_quantize_int8(
     sm_scale,
     config,
     num_queries_per_kv,
-    DTYPE_MAX: int = 256,
 ):  
     # q is expected to have layout thd
     d = q.shape[-1]
     hq = q.shape[1]
-    Q_q = torch.empty((*q.shape[:-1], d // 2), dtype=torch.uint8, device=q.device)
+    Q_q = torch.empty((*q.shape[:-1], d), dtype=torch.int8, device=q.device)
+    DTYPE_MAX = torch.iinfo(torch.int8).max
     num_seqs = len(cu_seqlens)
     total_num_blocks = q.shape[0] // BLOCK_SIZE_M + num_seqs
     
-    assert num_queries_per_kv is not None and config is not None
+    assert num_queries_per_kv is not None # and config is not None
     num_heads = hq // num_queries_per_kv
     Q_descale = torch.empty(
         (total_num_blocks, num_heads), dtype=torch.uint8, device=q.device
     )
+    BLOCK_Q = BLOCK_SIZE_M // num_queries_per_kv
     perblock_quantize_q_kernel[(
                 num_heads,
                 total_num_blocks,
@@ -60,7 +62,10 @@ def unified_perblock_quantize_int8(
                 Q_descale.stride(0),
                 Q_descale.stride(1),
                 sm_scale=sm_scale,
-                **config,
+                HEAD_SIZE_PADDED=d,
+                HEAD_SIZE=d,
+                BLOCK_M=BLOCK_SIZE_M,
+                BLOCK_Q=BLOCK_Q,
                 DTYPE_MAX=DTYPE_MAX,
             )
     return Q_q, Q_descale
@@ -76,7 +81,6 @@ def perblock_quantize_int8(
     cu_seqlens,
     layout="bhsd",
     sm_scale=None,
-    DTYPE_MAX: int = 256,
 ):  
     d = q.shape[-1]
     if layout=="thd":
@@ -99,8 +103,9 @@ def perblock_quantize_int8(
         total_num_blocks = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * b * h
         stride_m = h * d
 
-    Q_q = torch.empty((*q.shape[:-1], d // 2), dtype=torch.uint8, device=q.device)
-    
+    Q_q = torch.empty((*q.shape[:-1], d), dtype=torch.int8, device=q.device)
+    DTYPE_MAX = torch.iinfo(torch.int8).max
+
     # bshd, thd and cache layout can be dealt with one kernel that has stride_t = h*d and:
     # bhsd: cu_seqlens = s,2s,3s,...
     # thd: cu_seqlens = cu_seqlens
@@ -205,7 +210,7 @@ def perchannel_quantize_fp8(
     
     num_pid_v = (num_tokens + BLOCK_M - 1) // BLOCK_M
     grid_v = (num_pid_v, num_heads)
-    sage_quant_v_kernel[grid_v](
+    perchannel_quantize_v_kernel[grid_v](
         v,
         v_q,
         v_descale,
@@ -226,8 +231,8 @@ def sage_quant_v1(
     v,
     BLOCK_M,
     BLOCK_N,
-    layout_q="bshd", # options: "unified", "bshd", "bhsd", "thd", "cache"
-    layout_k="bshd", # options: "bshd", "bhsd", "thd", "cache". same for v
+    layout_q, # options: "unified", "bshd", "bhsd", "thd", "cache"
+    layout_k, # options: "bshd", "bhsd", "thd", "cache". same for v
     v_descale = None,
     cu_seqlens_q= None,
     cu_seqlens_k= None,
@@ -235,16 +240,23 @@ def sage_quant_v1(
 ):
     d = q.shape[-1]
     sm_scale = d**-0.5 * 1.4426950408889634
-
+    
     # this is pain in the ass as it groups tokens, so we have to consider the layouting
     if layout_q == "unified":
+        if layout_k in ("cache", "bshd", "thd"):
+            num_kv_heads = k.shape[-2] 
+        elif layout_k == "bhsd":
+            num_kv_heads = k.shape[1] 
+        num_queries_per_kv = q.shape[1] // num_kv_heads
+        
+        
         q_q, q_descale = unified_perblock_quantize_int8(
             q,
             BLOCK_M,
             cu_seqlens_q,
             sm_scale=sm_scale,
+            num_queries_per_kv=num_queries_per_kv,
             config=config,
-            DTYPE_MAX=256
         )
     else:
         q_q, q_descale = perblock_quantize_int8(
@@ -253,7 +265,6 @@ def sage_quant_v1(
             cu_seqlens_q,
             layout=layout_q,
             sm_scale=sm_scale,
-            DTYPE_MAX=256
         )
 
     k_q, k_descale = perblock_quantize_int8(
@@ -262,7 +273,6 @@ def sage_quant_v1(
         cu_seqlens_k,
         layout=layout_k,
         sm_scale=None,
-        DTYPE_MAX=256
     )
 
     v_q, v_descale = perchannel_quantize_fp8(v, 256, layout_k=layout_k, v_descale=v_descale)

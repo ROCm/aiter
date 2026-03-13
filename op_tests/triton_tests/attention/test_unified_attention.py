@@ -6,7 +6,7 @@ from typing import Optional
 import pytest
 import torch
 
-from aiter.ops.triton.attention.unified_attention import unified_attention
+from aiter.ops.triton.attention.unified_attention import unified_attention, get_config
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
@@ -106,6 +106,7 @@ def test_triton_unified_attn(
     soft_cap: Optional[float],
     num_blocks: int,
     q_dtype: Optional[torch.dtype],
+    quant_scheme: Optional[str],
 ) -> None:
     if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
         pytest.skip("block size must be at least 32 for fp8")
@@ -151,16 +152,48 @@ def test_triton_unified_attn(
     q_descale = None
     k_descale = None
     v_descale = None
-    if q_dtype is not None:
-        # QKV are drawn from N(0, 1): no need for a fp8 scaling factor
-        maybe_quantized_query = query.to(q_dtype)
-        maybe_quantized_key_cache = key_cache.to(q_dtype)
-        maybe_quantized_value_cache = value_cache.to(q_dtype)
+    
+    
+    if quant_scheme == "v1":
+        from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v1
+        config = get_config(query.shape[0], len(cu_query_lens), num_query_heads//num_kv_heads, num_kv_heads, query.shape[-1], window_size, max_query_len, max_kv_len, block_size, query.element_size())
+        BLOCK_M = config["BLOCK_M"] # these need to correspond to the unified attention configs
+        BLOCK_N = config["TILE_SIZE"]
+        maybe_quantized_query, q_descale, maybe_quantized_key_cache, k_descale, maybe_quantized_value_cache, v_descale = sage_quant_v1(query, key_cache, value_cache, BLOCK_M, BLOCK_N, layout_q="unified", layout_k="cache", v_descale=None, cu_seqlens_q=cu_query_lens, cu_seqlens_k=cu_query_lens, config=config)
+        print("query.shape:", query.shape)
+        print("key_cache.shape:", key_cache.shape)
+        print("value_cache.shape:", value_cache.shape)
+        print("maybe_quantized_query.shape:", maybe_quantized_query.shape)
+        print("q_descale.shape:", q_descale.shape)
+        print("maybe_quantized_key_cache.shape:", maybe_quantized_key_cache.shape)
+        print("k_descale.shape:", k_descale.shape)
+        print("maybe_quantized_value_cache.shape:", maybe_quantized_value_cache.shape)
+        print("v_descale.shape:", v_descale.shape)
 
-        scale_shape = (num_seqs, num_kv_heads)
-        q_descale = None  # Not yet supported
-        k_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
-        v_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
+        print("maybe_quantized_query.flatten()[:100]", maybe_quantized_query.flatten()[:100])
+        print("maybe_quantized_key_cache.flatten()[:100]", maybe_quantized_key_cache.flatten()[:100])
+    elif quant_scheme == "v2":
+        from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v2
+        config = get_config(query.shape[0], len(cu_query_lens), num_query_heads//num_kv_heads, num_kv_heads, query.shape[-1], window_size, max_query_len, max_kv_len, block_size, query.element_size())
+        print("config", config)
+        BLOCK_M = config["BLOCK_M"] # these need to correspond to the unified attention configs
+        BLOCK_N = config["TILE_SIZE"]
+        maybe_quantized_query, q_descale, maybe_quantized_key_cache, k_descale, maybe_quantized_value_cache, v_descale = sage_quant_v2(query, key_cache, value_cache, BLOCK_M, BLOCK_N, hadamard_rotation=True, R=None, BLOCK_R=128, layout_k="cache", v_descale=None)
+        # print("query.shape:", query.shape)
+        # print("key_cache.shape:", key_cache.shape)
+        # print("value_cache.shape:", value_cache.shape)
+        # print("maybe_quantized_query.shape:", maybe_quantized_query.shape)
+        # print("q_descale.shape:", q_descale.shape)
+        # print("maybe_quantized_key_cache.shape:", maybe_quantized_key_cache.shape)
+        # print("k_descale.shape:", k_descale.shape)
+        # print("maybe_quantized_value_cache.shape:", maybe_quantized_value_cache.shape)
+        # print("v_descale.shape:", v_descale.shape)
+
+        # print("maybe_quantized_query.flatten()[:100]", maybe_quantized_query.flatten()[:100])
+        # print("maybe_quantized_key_cache.flatten()[:100]", maybe_quantized_key_cache.flatten()[:100])
+
+        
+
 
     unified_attention(
         q=maybe_quantized_query,
@@ -200,3 +233,31 @@ def test_triton_unified_attn(
     torch.testing.assert_close(
         output, ref_output, atol=atol, rtol=rtol
     ), f"{torch.max(torch.abs(output - ref_output))}"
+
+
+
+if __name__ == "__main__":
+    # Pick one concrete test case
+    seq_lens = [(1, 1328), (5, 18), (129, 463)]
+    num_heads = (16, 8)          # example from NUM_HEADS
+    head_size = 128              # example from HEAD_SIZES
+    block_size = 128             # example from BLOCK_SIZES
+    sliding_window = None        # or 256
+    dtype = torch.bfloat16       # example from DTYPES
+    soft_cap = None              # or 10.0 / 50.0
+    num_blocks = 64              # example from NUM_BLOCKS
+    q_dtype = None               # or torch.float8_e4m3fn, etc.
+    quant_scheme = "v1"
+
+    test_triton_unified_attn(
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        head_size=head_size,
+        sliding_window=sliding_window,
+        dtype=dtype,
+        block_size=block_size,
+        soft_cap=soft_cap,
+        num_blocks=num_blocks,
+        q_dtype=q_dtype,
+        quant_scheme=quant_scheme,
+    )

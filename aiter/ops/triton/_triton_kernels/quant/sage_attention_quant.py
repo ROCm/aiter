@@ -90,7 +90,7 @@ def perblock_quantize_q_kernel(
     scale_ptrs = Q_descale + q_block_global_idx * scale_stride_0 + kv_head_idx * scale_stride_1
     tl.store(scale_ptrs, scale)
     tl.store(
-        Q_q + query_offset,
+        Q_q + query_offset, Q_quant,
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None])
 
 
@@ -127,8 +127,8 @@ def perblock_quantize_kernel(
     num_pid_m = tl.cdiv(max_seqlen, BLOCK_M)
     global_blk_idx = pid_b * num_pid_m + pid_m
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, D)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    offs_d = tl.arange(0, D)[None,:]
     mask = offs_m < seqlen
     tile_offsets = offs_m * stride_m + offs_d
     tile_ptrs = query_ptr + tile_offsets
@@ -151,7 +151,7 @@ def perblock_quantize_kernel(
     
     qtile_ptrs = Q_q + tile_offsets
     tl.store(
-        qtile_ptrs,
+        qtile_ptrs, Q_quant,
         mask=mask)
 
 
@@ -239,6 +239,43 @@ def _rotate_mxfp_quantize_k_kernel(
         mask=mask,
     )
 
+
+
+@triton.jit
+def perchannel_quantize_v_kernel(
+    V_Input,
+    V_Output,
+    V_Descale,
+    stride_t,
+    stride_h,
+    stride_sh,
+    num_tokens,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    pid = tl.program_id(0).to(tl.int64)
+    pid_h = tl.program_id(1).to(tl.int64)
+
+    offs_token = pid * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    mask = offs_token < num_tokens
+    offs_d = tl.arange(0, D)
+
+    v_offs = (
+        offs_token * stride_t
+        + pid_h * stride_h
+        + offs_d[None, :]
+    )
+
+    v_input_ptrs = V_Input + v_offs
+    v_output_ptrs = V_Output + v_offs
+
+    # just apply the per channel v_scales that have been computed outside
+    v_descale_ptrs = V_Descale + pid_h * stride_sh + offs_d
+    v = tl.load(v_input_ptrs, mask=mask, other=0.0)
+    v_descales = tl.load(v_descale_ptrs)
+    v_quant = v / v_descales
+    v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
+    tl.store(v_output_ptrs, v_quant, mask=mask)
 
 
 
