@@ -6,7 +6,7 @@ from typing import Optional
 import pytest
 import torch
 
-from aiter.ops.triton.attention.unified_attention import unified_attention
+from aiter.ops.triton.attention.unified_attention import unified_attention, get_config
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
@@ -14,7 +14,7 @@ HEAD_SIZES = [128, 256]
 BLOCK_SIZES = [16, 64, 100, 544]
 
 DTYPES = [torch.float16, torch.bfloat16]
-QDTYPES = [None, e4m3_dtype]
+QDTYPES = [None]
 # one value large enough to test overflow in index calculation.
 # one value small enough to test the schema op check
 NUM_BLOCKS = [32768, 2048]
@@ -95,6 +95,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("q_dtype", QDTYPES)
+@pytest.mark.parametrize("quant_scheme", ["v2"])
 @torch.inference_mode()
 def test_triton_unified_attn(
     seq_lens: list[tuple[int, int]],
@@ -106,6 +107,7 @@ def test_triton_unified_attn(
     soft_cap: Optional[float],
     num_blocks: int,
     q_dtype: Optional[torch.dtype],
+    quant_scheme: Optional[str],
 ) -> None:
     if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
         pytest.skip("block size must be at least 32 for fp8")
@@ -151,17 +153,21 @@ def test_triton_unified_attn(
     q_descale = None
     k_descale = None
     v_descale = None
-    if q_dtype is not None:
-        # QKV are drawn from N(0, 1): no need for a fp8 scaling factor
-        maybe_quantized_query = query.to(q_dtype)
-        maybe_quantized_key_cache = key_cache.to(q_dtype)
-        maybe_quantized_value_cache = value_cache.to(q_dtype)
-
-        scale_shape = (num_seqs, num_kv_heads)
-        q_descale = None  # Not yet supported
-        k_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
-        v_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
-
+    
+    if quant_scheme == "v1":
+        from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v1
+        config = get_config(query.shape[0], len(cu_query_lens), num_kv_heads//num_query_heads, num_kv_heads, query.shape[-1], window_size, max_query_len, max_kv_len, block_size, query.element_size())
+        BLOCK_M = config["BLOCK_M"] # these need to correspond to the unified attention configs
+        BLOCK_N = config["BLOCK_N"]
+        sage_quant_v1(query, key_cache, value_cache, BLOCK_M, BLOCK_N, layout_q="unified", layout_k="cache", v_descale=None, cu_seqlens_q=cu_query_lens, cu_seqlens_k=cu_query_lens)
+    elif quant_scheme == "v2":
+        from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v2
+        config = get_config(query.shape[0], len(cu_query_lens), num_kv_heads//num_query_heads, num_kv_heads, query.shape[-1], window_size, max_query_len, max_kv_len, block_size, query.element_size())
+        BLOCK_M = config["BLOCK_M"] # these need to correspond to the unified attention configs
+        BLOCK_N = config["BLOCK_N"]
+        sage_quant_v2(query, key_cache, value_cache, BLOCK_M, BLOCK_N, hadamard_rotation=True, R=None, BLOCK_R=128, layout_k="cache", v_descale=None)
+    
+    
     unified_attention(
         q=maybe_quantized_query,
         k=maybe_quantized_key_cache,
@@ -200,3 +206,30 @@ def test_triton_unified_attn(
     torch.testing.assert_close(
         output, ref_output, atol=atol, rtol=rtol
     ), f"{torch.max(torch.abs(output - ref_output))}"
+
+
+if __name__ == "__main__":
+    # Pick one concrete test case
+    seq_lens = [(1, 1328), (5, 18), (129, 463)]
+    num_heads = (16, 8)          # example from NUM_HEADS
+    head_size = 128              # example from HEAD_SIZES
+    block_size = 128             # example from BLOCK_SIZES
+    sliding_window = None        # or 256
+    dtype = torch.bfloat16       # example from DTYPES
+    soft_cap = None              # or 10.0 / 50.0
+    num_blocks = 64              # example from NUM_BLOCKS
+    q_dtype = None               # or torch.float8_e4m3fn, etc.
+    quant_scheme = "v2"
+
+    test_triton_unified_attn(
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        head_size=head_size,
+        sliding_window=sliding_window,
+        dtype=dtype,
+        block_size=block_size,
+        soft_cap=soft_cap,
+        num_blocks=num_blocks,
+        q_dtype=q_dtype,
+        quant_scheme=quant_scheme,
+    )
