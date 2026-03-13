@@ -154,6 +154,7 @@ def kernel_unified_attention_2d(
         other=0.0,
         cache_modifier=Q_cache_modifier,
     )
+    Q = Q.to(tl.float8e4nv)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -485,6 +486,7 @@ def kernel_unified_attention_3d(
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
     )
+    Q = Q.to(tl.float8e4nv)
 
     block_table_offset = seq_idx * block_table_stride
 
