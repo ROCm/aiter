@@ -57,6 +57,7 @@ def q_scale_process(
         offs_d_scale,
         query_offset_seq,
         kv_head_idx,
+        query_offset_head,
         seq_mask,
         query_scale_stride_0: tl.int64,  
         query_scale_stride_1: tl.int64,  
@@ -247,10 +248,12 @@ def kernel_unified_attention_2d(
 
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
-    # MXFP4
     if SAGE_VERSION == 2:
         offs_d_qk = tl.arange(0, HEAD_SIZE_PADDED // 2)
         offs_d_scale = tl.arange(0, HEAD_SIZE_PADDED // 32)
+    elif SAGE_VERSION == 1:
+        offs_d_qk = tl.arange(0, HEAD_SIZE_PADDED)
+        offs_d_scale = tl.arange(0, HEAD_SIZE_PADDED)
     else:
         offs_d_qk = tl.arange(0, HEAD_SIZE_PADDED)
         offs_d_scale = None
@@ -296,6 +299,7 @@ def kernel_unified_attention_2d(
         offs_d_scale,
         query_offset_seq=query_offset_0,
         kv_head_idx=kv_head_idx,
+        query_offset_head=query_offset_1,
         seq_mask=query_mask_0[:, None] & query_mask_1[:, None],
         query_scale_stride_0=query_scale_stride_0,  
         query_scale_stride_1=query_scale_stride_1,  
@@ -542,8 +546,8 @@ def kernel_unified_attention_2d(
         v_scale_loaded = v_scale_process(
             v_scale,
             kv_head_idx,
-            offs_d,
-            tile_mask[None, :],
+            offs_d_scale,
+            dim_mask[None, :],
             stride_v_cache_scale_0,
             stride_v_cache_scale_1,
             SAGE_VERSION
@@ -711,6 +715,7 @@ def kernel_unified_attention_3d(
         offs_d_scale,
         query_offset_seq=query_offset_0,
         kv_head_idx=kv_head_idx,
+        query_offset_head=query_offset_1,
         seq_mask=query_mask_0[:, None] & query_mask_1[:, None],
         query_scale_stride_0=query_scale_stride_0,  
         query_scale_stride_1=query_scale_stride_1,  

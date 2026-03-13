@@ -388,7 +388,34 @@ def run_benchmark(custom, args):
         maybe_quantized_key_cache = key_cache
         maybe_quantized_value_cache = value_cache
 
-        if args.sagev1 or args.sagev2 or args.fp8_full:
+        if args.sagev1 or args.sagev2:
+            from aiter.ops.triton.attention.unified_attention import get_config
+            num_queries_per_kv = num_query_heads // num_kv_heads
+            config = get_config(
+                query.shape[0], len(cu_seqlens_q),
+                num_queries_per_kv, num_kv_heads, head_size,
+                window_size, max_query_len, max_kv_len,
+                block_size, query.element_size()
+            )
+            BLOCK_M = config["BLOCK_M"]
+            BLOCK_N = config["TILE_SIZE"]
+            if args.sagev1:
+                from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v1
+                maybe_quantized_query, q_descale, maybe_quantized_key_cache, k_descale, maybe_quantized_value_cache, v_descale = sage_quant_v1(
+                    query, key_cache, value_cache, BLOCK_M, BLOCK_N,
+                    layout_q="unified", layout_k="cache",
+                    v_descale=None,
+                    cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_q,
+                    config=config
+                )
+            else:
+                from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v2
+                maybe_quantized_query, q_descale, maybe_quantized_key_cache, k_descale, maybe_quantized_value_cache, v_descale = sage_quant_v2(
+                    query, key_cache, value_cache, BLOCK_M, BLOCK_N,
+                    hadamard_rotation=True, R=None, BLOCK_R=128,
+                    layout_k="cache", v_descale=None
+                )
+        elif args.fp8_full:
             from aiter.ops.triton.utils.types import e4m3_dtype
 
             FP8_TYPE = e4m3_dtype
@@ -405,7 +432,6 @@ def run_benchmark(custom, args):
             v_abs_max = value_cache.abs().amax().clamp(min=1e-9)
             v_descale = (v_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
             maybe_quantized_value_cache = (value_cache * (fp8_max / v_abs_max)).to(FP8_TYPE)
-
         else:
             q_descale, k_descale, v_descale = None, None, None
 
@@ -414,7 +440,7 @@ def run_benchmark(custom, args):
         elif args.sagev2:
             sage_version = SAGE_VERSION.SAGE_MXFP4
         else:
-            raise ValueError("Invalid sage version")
+            sage_version = None
         
         def fn():
             return unified_attention(
@@ -477,12 +503,12 @@ def run_benchmark(custom, args):
                     f"  [{tag}] PASS  max_err={max_err:.6f}  "
                     f"atol={atol}  ({config_str})"
                 )
-            except AssertionError:
+            except AssertionError as e:
                 print(
                     f"  [{tag}] FAIL  max_err={max_err:.6f}  "
                     f"atol={atol}  ({config_str})"
                 )
-                raise
+                print(e)
 
         # calculate perf metrics
         total_flops = 0

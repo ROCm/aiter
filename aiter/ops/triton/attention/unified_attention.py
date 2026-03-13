@@ -158,19 +158,21 @@ def get_sage_scale_strides(
         TILE_SIZE,
         sage_version: SAGE_VERSION = None
     ):
-    if sage_version == None:
-        query_scale_stride_0 = query_scale_stride_1 = query_scale_stride_2 = None
-        stride_k_cache_scale_0 = stride_k_cache_scale_1 = stride_k_cache_scale_2 = stride_k_cache_scale_3 = None
-        stride_v_cache_scale_0 = stride_v_cache_scale_1 = None
-    elif sage_version == SAGE_VERSION.SAGE:
-        k_descale = k_descale.view(num_blks * triton.cdiv(BLOCK_SIZE, TILE_SIZE), -1)
-        stride_k_cache_scale_0, stride_k_cache_scale_1, stride_k_cache_scale_2 = k_descale.strides()
-        stride_k_cache_scale_3 = None
+    if sage_version == SAGE_VERSION.SAGE:
+        tiles_per_block = triton.cdiv(BLOCK_SIZE, TILE_SIZE)
+        k_descale_2d = k_descale[:num_blks * tiles_per_block, :]
+        stride_k_cache_scale_1 = k_descale_2d.stride(0)
+        stride_k_cache_scale_0 = tiles_per_block * stride_k_cache_scale_1
+        stride_k_cache_scale_2 = k_descale_2d.stride(1)
+        stride_k_cache_scale_3 = 0
     elif sage_version == SAGE_VERSION.SAGE_MXFP4:
-        stride_k_cache_scale_0, stride_k_cache_scale_1, stride_k_cache_scale_2, stride_k_cache_scale_3 = k_descale.strides()
+        stride_k_cache_scale_0, stride_k_cache_scale_1, stride_k_cache_scale_2, stride_k_cache_scale_3 = k_descale.stride()
+    else:
+        raise ValueError(f"Invalid sage version: {sage_version}")
 
-    query_scale_stride_0, query_scale_stride_1, query_scale_stride_2 = q_descale.stides()
-    stride_v_cache_scale_0, stride_v_cache_scale_1 = v_descale.stides()
+    query_scale_stride_0, query_scale_stride_1 = q_descale.stride()
+    query_scale_stride_2 = 0
+    stride_v_cache_scale_0, stride_v_cache_scale_1 = v_descale.stride()
 
     return (
         query_scale_stride_0,
@@ -211,18 +213,21 @@ def check_quant_args_get_strides(
         num_blks, blk_size, num_kv_heads, head_size = k.shape
 
         if sage_version == SAGE_VERSION.SAGE:
-            expected_q_descale_shape = (num_tokens // BLOCK_M, num_kv_heads)
+            assert q_descale.ndim == 2, f"expect q_descale to be 2D, got {q_descale.ndim}D with SAGE_VERSION={sage_version}"
+            assert q_descale.shape[0] >= math.ceil(num_tokens / BLOCK_M), f"expect q_descale dim 0 >= {math.ceil(num_tokens / BLOCK_M)}, got {q_descale.shape[0]} with SAGE_VERSION={sage_version}"
+            assert q_descale.shape[1] == num_kv_heads, f"expect q_descale dim 1 == {num_kv_heads}, got {q_descale.shape[1]} with SAGE_VERSION={sage_version}"
         elif sage_version == SAGE_VERSION.SAGE_MXFP4:
             expected_q_descale_shape = (num_tokens, num_kv_heads, head_size // 32)
-        assert q_descale.shape == expected_q_descale_shape, f"expect q_descale to have shape {expected_q_descale_shape} with SAGE_VERSION={sage_version}"
+            assert q_descale.shape == expected_q_descale_shape, f"expect q_descale to have shape {expected_q_descale_shape} with SAGE_VERSION={sage_version}"
 
         if sage_version == SAGE_VERSION.SAGE:
-            expected_k_descale_shape = (
-                num_blks *
-                math.ceil(BLOCK_SIZE / TILE_SIZE),
-                num_kv_heads,
+            assert k_descale.ndim == 2, f"expect k_descale to be 2D, got {k_descale.ndim}D with SAGE_VERSION={sage_version}"
+            assert k_descale.shape[0] >= num_blks * math.ceil(BLOCK_SIZE / TILE_SIZE), (
+                f"expect k_descale dim 0 >= {num_blks * math.ceil(BLOCK_SIZE / TILE_SIZE)}, "
+                f"got {k_descale.shape[0]} with SAGE_VERSION={sage_version}"
             )
-            expected_v_descale_shape = (num_kv_heads, head_size)
+            assert v_descale.ndim == 2, f"expect v_descale to be 2D, got {v_descale.ndim}D with SAGE_VERSION={sage_version}"
+            assert v_descale.shape[0] == num_kv_heads, f"expect v_descale dim 0 == {num_kv_heads}, got {v_descale.shape[0]} with SAGE_VERSION={sage_version}"
         elif sage_version == SAGE_VERSION.SAGE_MXFP4:
             expected_k_descale_shape = (
                 num_blks,
@@ -231,18 +236,20 @@ def check_quant_args_get_strides(
                 head_size // 32,
             )
             expected_v_descale_shape = (num_kv_heads, head_size // 32)
-        assert k_descale.shape == expected_k_descale_shape, f"expect k_descale to have shape {expected_k_descale_shape} with SAGE_VERSION={sage_version}"
-        assert v_descale.shape == expected_v_descale_shape, f"expect v_descale to have shape {expected_v_descale_shape} with SAGE_VERSION={sage_version}"
+            assert k_descale.shape == expected_k_descale_shape, f"expect k_descale to have shape {expected_k_descale_shape} with SAGE_VERSION={sage_version}"
+            assert v_descale.shape == expected_v_descale_shape, f"expect v_descale to have shape {expected_v_descale_shape} with SAGE_VERSION={sage_version}"
 
-    return get_sage_scale_strides(
-        q_descale,
-        k_descale,
-        v_descale,
-        num_blks,
-        BLOCK_SIZE,
-        TILE_SIZE,
-        sage_version
-    )
+        return get_sage_scale_strides(
+            q_descale,
+            k_descale,
+            v_descale,
+            num_blks,
+            BLOCK_SIZE,
+            TILE_SIZE,
+            sage_version
+        )
+    # if sage_version is None, return dummy strides
+    return (0, 0, 0, 0, 0, 0, 0, 0, 0)
 
 
 
@@ -346,7 +353,7 @@ def unified_attention(
             k,
             k_descale,
             v_descale,
-            BLOCK_M,
+            config["BLOCK_M"],
             BLOCK_SIZE=block_size,
             TILE_SIZE=TILE_SIZE,
             sage_version=sage_version

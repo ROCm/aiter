@@ -1,0 +1,336 @@
+diff --git a/aiter/jit/core.py b/aiter/jit/core.py
+index 5a7eaf1ab..834cf517c 100644
+--- a/aiter/jit/core.py
++++ b/aiter/jit/core.py
+@@ -20,9 +20,9 @@ from packaging.version import Version, parse
+ 
+ this_dir = os.path.dirname(os.path.abspath(__file__))
+ sys.path.insert(0, f"{this_dir}/utils/")
+-from chip_info import get_gfx, get_gfx_list
+-from cpp_extension import _jit_compile, get_hip_version
+-from file_baton import FileBaton
++from chip_info import get_gfx, get_gfx_list  # noqa: E402
++from cpp_extension import _jit_compile, get_hip_version  # noqa: E402
++from file_baton import FileBaton  # noqa: E402
+ from torch_guard import torch_compile_guard  # noqa: E402
+ 
+ AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
+diff --git a/aiter/jit/utils/torch_guard.py b/aiter/jit/utils/torch_guard.py
+index 3985772f7..6c51a9643 100644
+--- a/aiter/jit/utils/torch_guard.py
++++ b/aiter/jit/utils/torch_guard.py
+@@ -197,7 +197,7 @@ def torch_compile_guard(
+ 
+         try:
+             import torch
+-            from torch.library import Library
++            from torch.library import Library  # noqa: F401
+             import inspect
+         except ImportError:
+             return wrapper
+diff --git a/aiter/mla.py b/aiter/mla.py
+index e15e50441..63ad57733 100644
+--- a/aiter/mla.py
++++ b/aiter/mla.py
+@@ -21,7 +21,7 @@ import os
+ def _fwd_kernel_stage2_asm(
+     Mid_O,
+     Mid_lse,
+-    O,
++    O,  # noqa: E741
+     qo_indptr,
+     kv_indptr,
+     num_kv_splits_indptr,
+diff --git a/aiter/ops/quant.py b/aiter/ops/quant.py
+index 78699be3e..38cbc3930 100644
+--- a/aiter/ops/quant.py
++++ b/aiter/ops/quant.py
+@@ -33,7 +33,7 @@ def moe_smoothquant_fwd(
+ def get_dtype_max(dtype):
+     try:
+         dtypeMax = torch.finfo(dtype).max
+-    except:
++    except Exception:
+         dtypeMax = torch.iinfo(dtype).max
+     return dtypeMax
+ 
+diff --git a/aiter/ops/triton/__init__.py b/aiter/ops/triton/__init__.py
+index 2004b8785..00216c74b 100644
+--- a/aiter/ops/triton/__init__.py
++++ b/aiter/ops/triton/__init__.py
+@@ -13,10 +13,10 @@ try:
+ 
+     # Re-export communication primitives at this level for convenience
+     from .comms import (
+-        IrisCommContext,
+-        reduce_scatter,
+-        all_gather,
+-        reduce_scatter_rmsnorm_quant_all_gather,
++        IrisCommContext,  # noqa: F401
++        reduce_scatter,  # noqa: F401
++        all_gather,  # noqa: F401
++        reduce_scatter_rmsnorm_quant_all_gather,  # noqa: F401
+         IRIS_COMM_AVAILABLE,
+     )
+ 
+diff --git a/aiter/ops/triton/_triton_kernels/attention/lean_atten.py b/aiter/ops/triton/_triton_kernels/attention/lean_atten.py
+index 0f5ae697c..4c246ab7e 100644
+--- a/aiter/ops/triton/_triton_kernels/attention/lean_atten.py
++++ b/aiter/ops/triton/_triton_kernels/attention/lean_atten.py
+@@ -21,7 +21,6 @@ import functools
+ import json
+ import triton
+ import triton.language as tl
+-from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
+ from aiter.ops.triton.utils._triton import arch_info
+ from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+diff --git a/aiter/ops/triton/_triton_kernels/attention/mla_decode_rope.py b/aiter/ops/triton/_triton_kernels/attention/mla_decode_rope.py
+index 434dfb8a9..e1c40d222 100644
+--- a/aiter/ops/triton/_triton_kernels/attention/mla_decode_rope.py
++++ b/aiter/ops/triton/_triton_kernels/attention/mla_decode_rope.py
+@@ -343,7 +343,7 @@ _fwd_kernel_stage2_repr = make_kernel_repr(
+ @triton.jit(repr=_fwd_kernel_stage2_repr)
+ def _fwd_kernel_stage2(
+     Mid_O,
+-    O,
++    O,  # noqa: E741
+     kv_indptr,
+     stride_mid_ob,
+     stride_mid_oh,
+diff --git a/aiter/ops/triton/activation.py b/aiter/ops/triton/activation.py
+index 1fdc56b06..2827d082c 100644
+--- a/aiter/ops/triton/activation.py
++++ b/aiter/ops/triton/activation.py
+@@ -4,8 +4,8 @@ import torch
+ import aiter
+ 
+ fp8_dtype = aiter.dtypes.fp8
+-from aiter.ops.triton.utils.logger import AiterTritonLogger
+-from aiter.ops.triton._triton_kernels.activation import (
++from aiter.ops.triton.utils.logger import AiterTritonLogger  # noqa: E402
++from aiter.ops.triton._triton_kernels.activation import (  # noqa: E402
+     _act_mul_and_dynamic_mxfp4_quant_kernel,
+     _act_mul_and_dynamic_fp8_group_quant_kernel,
+ )
+diff --git a/aiter/ops/triton/gluon/gemm_a8w8_blockscale.py b/aiter/ops/triton/gluon/gemm_a8w8_blockscale.py
+index 499f2025d..443a2e4af 100644
+--- a/aiter/ops/triton/gluon/gemm_a8w8_blockscale.py
++++ b/aiter/ops/triton/gluon/gemm_a8w8_blockscale.py
+@@ -14,8 +14,8 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
+ from triton import language as tl
+ 
+ _LOGGER = AiterTritonLogger()
+-from triton.experimental import gluon
+-from triton.experimental.gluon import language as gl
++from triton.experimental import gluon  # noqa: E402
++from triton.experimental.gluon import language as gl  # noqa: E402
+ 
+ 
+ @triton.heuristics(
+diff --git a/csrc/ck_tile_gemm_moe_2stages/moe_cktile2stages_common.py b/csrc/ck_tile_gemm_moe_2stages/moe_cktile2stages_common.py
+index db5ac840e..e2c7be3cd 100644
+--- a/csrc/ck_tile_gemm_moe_2stages/moe_cktile2stages_common.py
++++ b/csrc/ck_tile_gemm_moe_2stages/moe_cktile2stages_common.py
+@@ -108,7 +108,7 @@ a8w8_gemm1_kernels_list_gfx950= {
+     # 0: kernelInstance(       1,        256,       32,         64,       256,           16,         16,         128,          1,        4,),
+     1: kernelInstance(       1,        256,       32,        128,       128,           16,         16,         128,          1,        4,),
+     2: kernelInstance(       1,        256,       64,        128,       128,           16,         16,         128,          1,        4,),
+-    4: kernelInstance(       1,        256,       64,        128,       256,           16,         16,         128,          1,        4,),
++    3: kernelInstance(       1,        256,       64,        128,       256,           16,         16,         128,          1,        4,),
+     4: kernelInstance(       1,        256,      128,        128,       128,           16,         16,         128,          1,        4,),
+     5: kernelInstance(       1,        256,      128,        128,       128,           16,         16,         128,          1,        4,),
+     6: kernelInstance(       1,        256,      256,        128,       128,           16,         16,         128,          1,        4,),
+diff --git a/gradlib/gradlib/gemm_tuner.py b/gradlib/gradlib/gemm_tuner.py
+index e739dbfb0..299be45fb 100644
+--- a/gradlib/gradlib/gemm_tuner.py
++++ b/gradlib/gradlib/gemm_tuner.py
+@@ -160,7 +160,7 @@ def clean():
+                 for name in list(mp.resource_tracker._CLEANUP_FUNCS.keys()):
+                     try:
+                         mp.resource_tracker._CLEANUP_FUNCS.pop(name)()
+-                    except:
++                    except Exception:
+                         pass
+     except Exception as e:
+         print(f"Resource cleanup warning: {e}")
+diff --git a/gradlib/setup.py b/gradlib/setup.py
+index a359fea51..b31c70069 100644
+--- a/gradlib/setup.py
++++ b/gradlib/setup.py
+@@ -22,11 +22,11 @@ from setuptools import setup
+ 
+ aiter_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ sys.path.insert(0, f"{aiter_dir}/aiter/")
+-from jit.utils.cpp_extension import (
++from jit.utils.cpp_extension import (  # noqa: E402
+     BuildExtension,
+     CUDAExtension,
+ )
+-from jit.utils.hipify import hipify_python
++from jit.utils.hipify import hipify_python  # noqa: E402
+ 
+ this_dir = os.path.dirname(os.path.abspath(__file__))
+ # gpus = subprocess.check_output("/opt/rocm/bin/rocminfo").decode(
+diff --git a/op_tests/test_mha_varlen.py b/op_tests/test_mha_varlen.py
+index 751c45c16..aa2301989 100644
+--- a/op_tests/test_mha_varlen.py
++++ b/op_tests/test_mha_varlen.py
+@@ -710,11 +710,13 @@ def test_varlen_flash_attn_seq_padding(
+     # Dynamically generate padding configurations
+     q_padded_lens = torch.randint(seqlen_q // 2, seqlen_q + 1, (batch_size,)).tolist()
+     q_actual_lens = [
+-        torch.randint(max(1, l // 2), l + 1, (1,)).item() for l in q_padded_lens
++        torch.randint(max(1, pad_len // 2), pad_len + 1, (1,)).item()
++        for pad_len in q_padded_lens
+     ]
+     k_padded_lens = torch.randint(seqlen_k // 2, seqlen_k + 1, (batch_size,)).tolist()
+     k_actual_lens = [
+-        torch.randint(max(1, l // 2), l + 1, (1,)).item() for l in k_padded_lens
++        torch.randint(max(1, pad_len // 2), pad_len + 1, (1,)).item()
++        for pad_len in k_padded_lens
+     ]
+ 
+     if padding_scenario == "q_only":
+diff --git a/op_tests/test_moe.py b/op_tests/test_moe.py
+index 62be3c1aa..9e0ecef98 100755
+--- a/op_tests/test_moe.py
++++ b/op_tests/test_moe.py
+@@ -8,7 +8,7 @@ from aiter.fused_moe import torch_moe, fused_topk
+ from aiter.fused_moe_bf16_asm import asm_moe
+ from aiter.ops.shuffle import shuffle_weight
+ from aiter import pertoken_quant
+-from aiter.int4_utils import *
++from aiter.int4_utils import rearrange_4bit_elements, convert_int8_to_uint32_int4
+ from aiter import ActivationType
+ import argparse
+ 
+diff --git a/op_tests/test_moe_2stage.py b/op_tests/test_moe_2stage.py
+index 32d75a880..c878223d7 100644
+--- a/op_tests/test_moe_2stage.py
++++ b/op_tests/test_moe_2stage.py
+@@ -6,7 +6,7 @@ import itertools
+ import aiter
+ from aiter import dtypes
+ from aiter.test_common import checkAllclose, benchmark, run_perftest
+-from aiter.int4_utils import *
++from aiter.int4_utils import rearrange_4bit_elements, convert_int8_to_uint32_int4
+ from aiter.utility import fp4_utils
+ from aiter.jit.utils.chip_info import get_gfx
+ import argparse
+diff --git a/op_tests/test_moe_dp_share_expert.py b/op_tests/test_moe_dp_share_expert.py
+index 3374e736d..aa86e1c12 100644
+--- a/op_tests/test_moe_dp_share_expert.py
++++ b/op_tests/test_moe_dp_share_expert.py
+@@ -5,7 +5,6 @@ import torch
+ from aiter.test_common import checkAllclose, run_perftest, benchmark
+ from aiter import dtypes
+ from aiter.ops.shuffle import shuffle_weight
+-from aiter.int4_utils import *
+ from aiter import QuantType
+ from aiter.fused_moe_dp_shared_expert import (
+     torch_moe,
+diff --git a/op_tests/test_moe_tkw1.py b/op_tests/test_moe_tkw1.py
+index be6b46c1e..480cb42dc 100644
+--- a/op_tests/test_moe_tkw1.py
++++ b/op_tests/test_moe_tkw1.py
+@@ -11,7 +11,7 @@ from aiter.fused_moe_bf16_asm import (
+ from aiter.fused_moe import fused_topk
+ from aiter.ops.shuffle import shuffle_weight
+ from aiter import pertoken_quant
+-from aiter.int4_utils import *
++from aiter.int4_utils import rearrange_4bit_elements, convert_int8_to_uint32_int4
+ from aiter import ActivationType
+ import argparse
+ 
+diff --git a/op_tests/test_pa_mtp.py b/op_tests/test_pa_mtp.py
+index e6de5221b..77b909cd5 100644
+--- a/op_tests/test_pa_mtp.py
++++ b/op_tests/test_pa_mtp.py
+@@ -254,38 +254,6 @@ def run_aiter_asm(
+     )
+ 
+ 
+-@perftest()
+-def run_aiter_hip(
+-    query,
+-    k_cache,
+-    v_cache,
+-    block_tables,
+-    seq_lens,
+-    max_seq_len,
+-    max_qlen,
+-    kv_cache_dtype,
+-    num_kv_heads,
+-    scale,
+-    k_scale=None,
+-    v_scale=None,
+-):
+-    return ops.PagedAttention.forward_decode(
+-        query,
+-        k_cache,
+-        v_cache,
+-        block_tables,
+-        seq_lens,
+-        max_seq_len,
+-        kv_cache_dtype,
+-        num_kv_heads,
+-        scale,
+-        None,
+-        k_scale,
+-        v_scale,
+-        mtp=max_qlen,
+-    )
+-
+-
+ @perftest()
+ def run_aiter_hip(
+     query,
+diff --git a/op_tests/test_sample.py b/op_tests/test_sample.py
+index 01e6db104..0ab7a75e3 100644
+--- a/op_tests/test_sample.py
++++ b/op_tests/test_sample.py
+@@ -7,6 +7,7 @@ from aiter.test_common import checkAllclose, run_perftest, benchmark
+ from aiter.ops.triton.topk import topk
+ from aiter.ops.triton.softmax import softmax
+ from aiter import dtypes
++import pandas as pd
+ import argparse
+ 
+ torch.set_default_device("cuda")
+@@ -170,7 +171,6 @@ d_sample = {
+ list_dtype = ["bf16"]
+ l_n = [129280, 151936][-1:]
+ l_m = [1, 8, 16, 32, 64, 128, 192, 256, 512]
+-import pandas as pd
+ 
+ parser = argparse.ArgumentParser(
+     formatter_class=argparse.RawTextHelpFormatter,
+diff --git a/op_tests/triton_tests/utils/__init__.py b/op_tests/triton_tests/utils/__init__.py
+index de76df1a5..8b18043a7 100644
+--- a/op_tests/triton_tests/utils/__init__.py
++++ b/op_tests/triton_tests/utils/__init__.py
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: MIT
+ # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+ 
+-from .mla_decode_ref import *
+-from .mla_extend_ref import *
+-from .rotary_embedding import *
++from .mla_decode_ref import *  # noqa: F403
++from .mla_extend_ref import *  # noqa: F403
++from .rotary_embedding import *  # noqa: F403
+ from .types import *  # noqa: F403
+diff --git a/op_tests/triton_tests/utils/mla_decode_ref.py b/op_tests/triton_tests/utils/mla_decode_ref.py
+index d25c02751..966898829 100644
+--- a/op_tests/triton_tests/utils/mla_decode_ref.py
++++ b/op_tests/triton_tests/utils/mla_decode_ref.py
+@@ -476,7 +476,7 @@ def _decode_grouped_att_m_fwd(
+ @triton.jit
+ def _fwd_kernel_stage2(
+     Mid_O,
+-    O,
++    O,  # noqa: E741
+     kv_indptr,
+     stride_mid_ob,
+     stride_mid_oh,
