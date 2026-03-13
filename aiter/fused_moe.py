@@ -884,6 +884,7 @@ def get_2stage_cfgs(
     logger.info(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
     )
+
     def get_block_m() -> int:
         if q_dtype_a == dtypes.fp8:
             return 32
