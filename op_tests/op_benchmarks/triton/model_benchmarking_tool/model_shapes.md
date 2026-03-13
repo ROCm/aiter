@@ -77,8 +77,6 @@ For a new kernel to be run by the script, the corresponding benchmark must be im
 
 ### MLA — Multi-head Latent Attention (`mla`)
 
-Uses the same shape fields as `mha`:
-
 | Field     | Type   | Description |
 |----------|--------|-------------|
 | `hq`     | int    | Number of query heads. |
@@ -86,6 +84,16 @@ Uses the same shape fields as `mha`:
 | `dqk`    | int    | Query/key head dimension. |
 | `dv`     | int    | Value head dimension. |
 | `comment`| string | Optional label (e.g. `"Decode"`). |
+
+### Unified Attention (unified_attention)
+
+| Field        | Type   | Description |
+|-------------|--------|-------------|
+| `hq`        | int    | Number of query heads. |
+| `hkv`       | int    | Number of key/value heads. |
+| `head_size` | int    | Head dimension (same for Q, K, V). |
+| `block_size`| int    | Optional. KV cache block size (default: `16`). |
+| `window_size` | int  | Optional. Sliding window size; `0` means no window (default: `0`). |
 
 ## Example
 
@@ -111,6 +119,9 @@ Uses the same shape fields as `mha`:
     ],
     "mha": [
       { "hq": 128, "hkv": 8, "dqk": 128, "dv": 128 }
+    ],
+    "unified_attention": [
+      { "hq": 128, "hkv": 8, "head_size": 128 },
     ]
   }
 }
