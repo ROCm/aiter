@@ -381,8 +381,7 @@ def _mla_3d_kernel(
     seq_lens_ptr,  # [num_seqs]
     scale,  # float32
     q_scale_ptr,  # float32
-    k_scale_ptr,  # float32
-    v_scale_ptr,  # float32
+    kv_scale_ptr,  # float32
     num_query_heads: tl.constexpr,  # int
     num_queries_per_kv: tl.constexpr,  # int
     block_tables_stride: tl.int64,  # int
@@ -403,8 +402,6 @@ def _mla_3d_kernel(
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     num_warps: tl.constexpr,  # int
     num_stages: tl.constexpr,  # int
-    IS_Q_FP8: tl.constexpr = False,  # bool
-    IS_KV_FP8: tl.constexpr = False,  # bool
     ALL_DECODE: tl.constexpr = False,  # bool
 ):
     q_block_global_idx = tl.program_id(0)
@@ -434,14 +431,18 @@ def _mla_3d_kernel(
     if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
         return
 
-    q_scale: tl.float32 = 1.0
-    k_scale: tl.float32 = 1.0
-    v_scale: tl.float32 = 1.0
-    if IS_Q_FP8:
+    qk_factor: tl.float32 = qk_scale
+    if q_scale_ptr is not None:
         q_scale = tl.load(q_scale_ptr)
-    if IS_KV_FP8:
-        k_scale = tl.load(k_scale_ptr)
-        v_scale = tl.load(v_scale_ptr)
+        qk_factor = qk_factor * q_scale
+    else:
+        q_scale = None
+
+    if kv_scale_ptr is not None:
+        kv_scale = tl.load(kv_scale_ptr)
+        qk_factor = qk_factor * kv_scale
+    else:
+        kv_scale = None
 
     offs_m = tl.arange(0, BLOCK_M)
     offs_lora_rank = tl.arange(0, KV_LORA_RANK)
@@ -503,12 +504,6 @@ def _mla_3d_kernel(
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
     seq_offset = segm_idx * tiles_per_segment * TILE_SIZE + offs_t
 
-    qk_factor: tl.float32 = qk_scale
-    if IS_Q_FP8 and IS_KV_FP8:
-        qk_factor = qk_factor * q_scale * k_scale
-    elif IS_Q_FP8:
-        qk_factor = qk_factor * k_scale
-
     # iterate through tiles within current segment
     for j in range(
         segm_idx * tiles_per_segment,
@@ -544,8 +539,8 @@ def _mla_3d_kernel(
 
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
-        S_lora = tl.dot(Q_lora, KV_lora.trans(1, 0))
-        S_rope = tl.dot(Q_rope, K_rope)
+        S_lora = tl.dot(Q_lora, KV_lora.trans(1, 0).to(Q_lora.dtype))
+        S_rope = tl.dot(Q_rope, K_rope.to(Q_lora.dtype))
         S = qk_factor * (S_lora + S_rope)
 
         S = tl.where(
@@ -578,10 +573,11 @@ def _mla_3d_kernel(
 
         # acc : (BLOCK_M, KV_LORA_RANK)
         pv = tl.dot(P.to(KV_lora.dtype), KV_lora)
-        if IS_KV_FP8:
-            pv = pv * v_scale
         acc += pv
         seq_offset += TILE_SIZE
+
+    if kv_scale_ptr is not None:
+        acc = acc * kv_scale
 
     segm_output_offset = (
         query_offset_0[:, None].to(tl.int64)
@@ -612,6 +608,7 @@ def _mla_3d_reduce_kernel(
     segm_max_ptr,  # [num_tokens, num_query_heads, max_num_segments]
     segm_expsum_ptr,  # [num_tokens, num_query_heads, max_num_segments]
     seq_lens_ptr,  # [num_seqs]
+    out_scale_ptr,  # float32
     num_seqs,  # int
     num_query_heads: tl.constexpr,  # int
     output_stride_0: tl.int64,  # int
@@ -627,6 +624,10 @@ def _mla_3d_reduce_kernel(
 ):
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
+
+    out_scale = None
+    if out_scale_ptr is not None:
+        out_scale = 1 / tl.load(out_scale_ptr)
 
     if ALL_DECODE:
         seq_idx = query_token_idx
@@ -677,6 +678,9 @@ def _mla_3d_reduce_kernel(
     acc_sum = tl.sum(segm_output, axis=0)
     # safely divide by overall_expsum, returning 0.0 if overall_expsum is 0
     acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
+
+    if out_scale_ptr is not None:
+        acc = acc * out_scale
 
     # write result
     output_offset = (

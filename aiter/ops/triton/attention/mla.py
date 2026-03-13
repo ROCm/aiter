@@ -112,8 +112,8 @@ def mla_decode_fwd(
     qk_rope_head_dim: int,
     causal: bool,
     q_descale=None,
-    k_descale=None,
-    v_descale=None,
+    kv_descale=None,
+    out_scale=None,
 ):
     assert causal, "Only causal attention is supported"
 
@@ -189,8 +189,7 @@ def mla_decode_fwd(
         seq_lens_ptr=seqused_k,
         scale=softmax_scale,
         q_scale_ptr=q_descale,
-        k_scale_ptr=k_descale,
-        v_scale_ptr=v_descale,
+        kv_scale_ptr=kv_descale,
         num_query_heads=num_query_heads,
         num_queries_per_kv=num_queries_per_kv,
         block_tables_stride=block_tables.stride(0),
@@ -216,6 +215,7 @@ def mla_decode_fwd(
         segm_max_ptr=segm_max,
         segm_expsum_ptr=segm_expsum,
         seq_lens_ptr=seqused_k,
+        out_scale_ptr=out_scale,
         num_seqs=num_seqs,
         num_query_heads=num_query_heads,
         output_stride_0=out.stride(0),
