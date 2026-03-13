@@ -41,8 +41,9 @@ def reshape_and_cache_flash(
     value_cache: Tensor,
     slot_mapping: Tensor,
     kv_cache_dtype: str,
-    k_scale: Tensor,
-    v_scale: Tensor,
+    k_scale: Optional[torch.Tensor] = None,
+    v_scale: Optional[torch.Tensor] = None,
+    swa_slot_mapping: Optional[torch.Tensor] = None,
 ) -> None: ...
 
 
