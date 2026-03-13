@@ -13,6 +13,50 @@ from aiter.ops.triton.quant.sage_attention_quant_wrappers import (sage_quant, sa
 from enum import IntEnum
 
 
+def get_config(num_tokens, num_seqs, num_queries_per_kv, num_kv_heads, head_size, window_size, max_seqlen_q, max_seqlen_k, block_size, q_element_size):
+    SLIDING_WINDOW = 1 + window_size[0]
+    ALL_DECODE = max_seqlen_q == 1
+    cu_count = get_num_sms()
+    
+    BLOCK_M = (
+        16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
+    )
+
+    BLOCK_Q = BLOCK_M // num_queries_per_kv
+    
+    total_num_q_blocks = num_tokens // BLOCK_Q + num_seqs
+    target_num_prgms = cu_count * 4
+    num_2d_prgms = total_num_q_blocks * num_kv_heads
+    # if use_2d_kernel(
+    #     head_size,
+    #     SLIDING_WINDOW,
+    #     ALL_DECODE,
+    #     max_seqlen_q,
+    #     max_seqlen_k,
+    #     target_num_prgms,
+    #     num_2d_prgms,
+    # ):
+    return select_2d_config(
+        block_size,
+        head_size,
+        SLIDING_WINDOW,
+        ALL_DECODE,
+        max_seqlen_q,
+        max_seqlen_k,
+        num_queries_per_kv,
+        num_2d_prgms,
+    )
+    # else:
+    #     attn_config, reduce_config = select_3d_config(
+    #         head_size,
+    #         block_size,
+    #         q_element_size,
+    #         max_seqlen_k,
+    #         target_num_prgms,
+    #         num_2d_prgms,
+    #     )
+    #     return attn_config
+
 def select_2d_config(
     block_size,
     head_size,
@@ -407,6 +451,28 @@ def unified_attention(
             device=q.device,
         )
 
+        TILE_SIZE=config["TILE_SIZE"]
+        (
+            query_scale_stride_0,
+            query_scale_stride_1,
+            query_scale_stride_2,
+            stride_k_cache_scale_0,
+            stride_k_cache_scale_1,
+            stride_k_cache_scale_2,
+            stride_k_cache_scale_3,
+            stride_v_cache_scale_0,
+            stride_v_cache_scale_1 
+        ) = check_quant_args_get_strides(
+            q,
+            q_descale,
+            k,
+            k_descale,
+            v_descale,
+            BLOCK_M,
+            BLOCK_SIZE=block_size,
+            TILE_SIZE=TILE_SIZE,
+            sage_version=sage_version
+        )
         kernel_unified_attention_3d[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,
@@ -429,6 +495,9 @@ def unified_attention(
             block_table_stride=block_table.stride(0),
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
+            query_scale_stride_0=query_scale_stride_0,
+            query_scale_stride_1=query_scale_stride_1,
+            query_scale_stride_2=query_scale_stride_2,
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
             BLOCK_SIZE=block_size,
             HEAD_SIZE=head_size,
@@ -446,12 +515,19 @@ def unified_attention(
             stride_v_cache_1=v.stride(1),
             stride_v_cache_2=v.stride(2),
             stride_v_cache_3=v.stride(3),
+            stride_k_cache_scale_0=stride_k_cache_scale_0,
+            stride_k_cache_scale_1=stride_k_cache_scale_1,
+            stride_k_cache_scale_2=stride_k_cache_scale_2,
+            stride_k_cache_scale_3=stride_k_cache_scale_3,
+            stride_v_cache_scale_0=stride_v_cache_scale_0,
+            stride_v_cache_scale_1=stride_v_cache_scale_1,
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             USE_Q_DESCALE=q_descale is not None,
             ALL_DECODE=ALL_DECODE,
+            SAGE_VERSION=sage_version,
             **attn_config,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
