@@ -843,10 +843,12 @@ def get_2stage_cfgs(
         ) in fused_moe_1stage_dict[get_gfx()]:
             if q_type == QuantType.per_1x128:
                 run_1stage = token > 32 and (inter_dim % 256 == 0)
-                # For small batches quantization runtime is comparable with moe,
-                # embedding it into moe is beneficial
+                # Use 1-stage kernel for small batches where quantization cost is comparable
+                # to MoE cost. For larger dimensions split-K 2-stage dominates instead.
                 run_1stage_xbf16 = (
-                    get_gfx() == "gfx950" and token < 16 and (inter_dim % 128 == 0)
+                    get_gfx() == "gfx950"
+                    and token > 1 and token < 16
+                    and model_dim <= 2048
                 )
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
