@@ -27,6 +27,7 @@ def make_kv_cache_shuffled_layout(
     BLOCK_SIZE_N_SHFL,
     BLOCK_SIZE_INNER_DIM_SHFL,
     fastest_dim_num_warps,
+    total_num_warps,
     dtype=torch.bfloat16,
 ):
     num_warps_log2 = int(math.log2(fastest_dim_num_warps))
@@ -65,6 +66,8 @@ def make_kv_cache_shuffled_layout(
     ]
     if num_warps_log2 > 0:
         warp_bases = [[1 << v, 0] for v in range(0, num_warps_log2)]
+    elif total_num_warps == 1:
+        warp_bases = []
     else:
         warp_bases = [[0, 0]]
 
@@ -257,9 +260,10 @@ def make_layout_3d(
             TILE_SIZE // 16,
             HEAD_SIZE_PADDED * 16,
             1 if (use_async or IS_DEVICE_ARCH_GFX12) else num_warps,
+            num_warps,
         )
         V_LOAD_LAYOUT = make_kv_cache_shuffled_layout(
-            HEAD_SIZE_PADDED // 16, TILE_SIZE * 16, num_warps
+            HEAD_SIZE_PADDED // 16, TILE_SIZE * 16, num_warps, num_warps
         )
     else:
         K_LOAD_LAYOUT: gl.constexpr = gl.BlockedLayout(
