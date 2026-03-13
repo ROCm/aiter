@@ -97,8 +97,12 @@ def crd2idx(crd, layout):
         crd_i32 = []
         for c in crd:
             cv = c
-            if isinstance(cv, ArithValue):
+            # Unwrap DSL Numeric (fx.Index, fx.Int32, etc.) to ir.Value
+            if not isinstance(cv, ir.Value) and hasattr(cv, 'ir_value'):
+                cv = cv.ir_value()
+            elif isinstance(cv, ArithValue):
                 cv = cv.ir_value() if hasattr(cv, 'ir_value') else cv
+            # Cast index type to i32 (fly.make_coord requires i32/i64)
             if isinstance(cv, ir.Value) and isinstance(cv.type, ir.IndexType):
                 cv = arith.index_cast(T.i32, cv)
             crd_i32.append(cv)

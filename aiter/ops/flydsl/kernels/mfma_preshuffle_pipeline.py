@@ -31,9 +31,9 @@ def _buffer_load_vec(buffer_ops, vector, rsrc, idx, *, elem_type, vec_elems, ele
     vec_width = load_bytes // 4
 
     if offset_in_bytes:
-        idx_i32 = idx / 4
+        idx_i32 = idx // 4
     elif elem_bytes == 2:
-        idx_i32 = (idx * 2) / 4
+        idx_i32 = (idx * 2) // 4
     else:
         idx_i32 = idx
 
@@ -65,18 +65,18 @@ def make_preshuffle_b_layout(
     if kpack_bytes not in (8, 16):
         raise ValueError(f"kpack_bytes must be 8 or 16, got {kpack_bytes!r}")
 
-    c16 = arith.constant(16, index=True)
-    c64 = arith.constant(64, index=True)
-    c4 = arith.constant(4, index=True)
-    c_kpack = arith.constant(kpack_bytes, index=True)
+    c16 = fx.Index(16)
+    c64 = fx.Index(64)
+    c4 = fx.Index(4)
+    c_kpack = fx.Index(kpack_bytes)
 
     if elem_bytes not in (1, 2):
         raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
     c_k_bytes = c_k * arith.constant(int(elem_bytes), index=True)
-    c_k0 = c_k_bytes / c64
-    n0 = c_n / c16
+    c_k0 = c_k_bytes // c64
+    n0 = c_n // c16
 
-    c_kpack_elems = c_kpack if elem_bytes == 1 else (c_kpack / arith.constant(int(elem_bytes), index=True))
+    c_kpack_elems = c_kpack if elem_bytes == 1 else (c_kpack // arith.constant(int(elem_bytes), index=True))
 
     stride_nlane = c_kpack_elems
     stride_klane = c16 * stride_nlane
@@ -105,13 +105,10 @@ def _i8x4_in_i32_to_bf16x4_i64(val_i32, arith, vector, scale_val=None):
     which on gfx942 expands to ~5 VALU per element. The shift is exact for
     unscaled int8 values and introduces <0.5 ULP error for scaled values.
     """
-    i8 = ir.IntegerType.get_signless(8)
-    i32 = ir.IntegerType.get_signless(32)
-    f32 = ir.F32Type.get()
-    vec1_i32_t = ir.VectorType.get([1], i32)
-    vec2_i32 = ir.VectorType.get([2], i32)
-    vec4_i8 = ir.VectorType.get([4], i8)
-    vec1_i64 = ir.VectorType.get([1], ir.IntegerType.get_signless(64))
+    vec1_i32_t = T.vec(1, T.i32)
+    vec2_i32 = T.i32x2
+    vec4_i8 = T.i8x4
+    vec1_i64 = T.vec(1, T.i64)
 
     v1 = vector.from_elements(vec1_i32_t, [val_i32])
     i8x4 = vector.bitcast(vec4_i8, v1)
@@ -119,19 +116,19 @@ def _i8x4_in_i32_to_bf16x4_i64(val_i32, arith, vector, scale_val=None):
     f32_vals = []
     for i in range(4):
         val_i8 = vector.extract(i8x4, static_position=[i], dynamic_position=[])
-        v = arith.sitofp(f32, val_i8)
+        v = arith.sitofp(T.f32, val_i8)
         if scale_val is not None:
             v = v * scale_val
         f32_vals.append(v)
 
-    c16 = arith.constant(16, type=i32)
-    c_ffff0000 = arith.constant(0xFFFF0000, type=i32)
-    bits0 = arith.bitcast(i32, f32_vals[0])
-    bits1 = arith.bitcast(i32, f32_vals[1])
-    bits2 = arith.bitcast(i32, f32_vals[2])
-    bits3 = arith.bitcast(i32, f32_vals[3])
-    i32_lo = arith.ori(arith.shrui(bits0, c16), arith.andi(bits1, c_ffff0000))
-    i32_hi = arith.ori(arith.shrui(bits2, c16), arith.andi(bits3, c_ffff0000))
+    c16 = fx.Int32(16)
+    c_ffff0000 = fx.Int32(0xFFFF0000)
+    bits0 = arith.bitcast(T.i32, f32_vals[0])
+    bits1 = arith.bitcast(T.i32, f32_vals[1])
+    bits2 = arith.bitcast(T.i32, f32_vals[2])
+    bits3 = arith.bitcast(T.i32, f32_vals[3])
+    i32_lo = (bits0 >> c16) | (bits1 & c_ffff0000)
+    i32_hi = (bits2 >> c16) | (bits3 & c_ffff0000)
 
     v2 = vector.from_elements(vec2_i32, [i32_lo, i32_hi])
     v64 = vector.bitcast(vec1_i64, v2)
@@ -162,21 +159,21 @@ def load_b_raw_w4a16(
     if kpack_bytes != 8:
         raise ValueError(f"W4A16 requires kpack_bytes=8, got {kpack_bytes!r}")
 
-    c64 = arith.constant(64, index=True)
+    c64 = fx.Index(64)
     half_bytes = kpack_bytes // 2
-    c2_idx = arith.constant(2, index=True)
-    c4_idx = arith.constant(4, index=True)
+    c2_idx = fx.Index(2)
+    c4_idx = fx.Index(4)
 
-    k0_base = base_k / c64
+    k0_base = base_k // c64
     k1_layout_offset = ku * 2
-    lane_div_32 = lane_div_16 / c2_idx
-    total_k1 = arith.constant(k1_layout_offset, index=True) + lane_div_32
-    k0 = k0_base + (total_k1 / c4_idx)
+    lane_div_32 = lane_div_16 // c2_idx
+    total_k1 = fx.Index(k1_layout_offset) + lane_div_32
+    k0 = k0_base + (total_k1 // c4_idx)
     k1_local = total_k1 % c4_idx
     lane_odd = lane_div_16 % c2_idx
-    k2_base = lane_odd * arith.constant(half_bytes, index=True)
+    k2_base = lane_odd * fx.Index(half_bytes)
 
-    coord_pack = (n_blk, k0, k1_local, n_intra, arith.constant(0, index=True))
+    coord_pack = (n_blk, k0, k1_local, n_intra, fx.Index(0))
     idx_pack = crd2idx(coord_pack, layout_b)
     idx_bytes = idx_pack + k2_base
 
@@ -198,10 +195,10 @@ def unpack_b_w4a16(packed32, arith, vector, scale_val=None):
     Takes raw packed32 from load_b_raw_w4a16 and produces (b0, b1) --
     two i64 values each containing 4 bf16 for one MFMA.
     """
-    c_08080808 = arith.constant(0x08080808, type=T.i32)
-    c_0f0f0f0f = arith.constant(0x0F0F0F0F, type=T.i32)
-    c_1e = arith.constant(0x1E, type=T.i32)
-    c_4_i32 = arith.constant(4, type=T.i32)
+    c_08080808 = fx.Int32(0x08080808)
+    c_0f0f0f0f = fx.Int32(0x0F0F0F0F)
+    c_1e = fx.Int32(0x1E)
+    c_4_i32 = fx.Int32(4)
 
     s0 = (packed32 & c_08080808) * c_1e
     even = (packed32 & c_0f0f0f0f) | s0
@@ -244,15 +241,15 @@ def load_b_pack_k32(
     if elem_bytes not in (1, 2):
         raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
 
-    c64 = arith.constant(64, index=True)
+    c64 = fx.Index(64)
     base_k_bytes = base_k * arith.constant(int(elem_bytes), index=True)
-    k0_base = base_k_bytes / c64
+    k0_base = base_k_bytes // c64
     k0 = k0_base + arith.constant(ki_step // 2, index=True)
     k1 = lane_div_16
     half_bytes = kpack_bytes // 2
     k2_base = arith.constant((ki_step % 2) * half_bytes, index=True)
 
-    coord_pack = (n_blk, k0, k1, n_intra, arith.constant(0, index=True))
+    coord_pack = (n_blk, k0, k1, n_intra, fx.Index(0))
     idx_pack = crd2idx(coord_pack, layout_b)
 
     if unpack_int4:
@@ -267,10 +264,10 @@ def load_b_pack_k32(
             dynamic_position=[],
         )
 
-        c_08080808 = arith.constant(0x08080808, type=T.i32)
-        c_0f0f0f0f = arith.constant(0x0F0F0F0F, type=T.i32)
-        c_1e = arith.constant(0x1E, type=T.i32)
-        c_4_i32 = arith.constant(4, type=T.i32)
+        c_08080808 = fx.Int32(0x08080808)
+        c_0f0f0f0f = fx.Int32(0x0F0F0F0F)
+        c_1e = fx.Int32(0x1E)
+        c_4_i32 = fx.Int32(4)
 
         s0 = (packed32 & c_08080808) * c_1e
         even = (packed32 & c_0f0f0f0f) | s0
@@ -365,7 +362,7 @@ def lds_store_16b_xor16(
         raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
     col_local_bytes = col_local_i32 * tx_c4
     col_swz_bytes = swizzle_xor16(row_local, col_local_bytes, k_blocks16)
-    col_swz = col_swz_bytes if elem_bytes == 1 else col_swz_bytes / 2
+    col_swz = col_swz_bytes if elem_bytes == 1 else col_swz_bytes // 2
     coord_store = (row_local, col_swz)
     idx0 = crd2idx(coord_store, layout_lds) + lds_base
     v16 = vector.bitcast(vec16_ty, vec_part_i32x4)
@@ -392,7 +389,7 @@ def lds_store_8b_xor16(
         raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
     col_local_bytes = col_local_i32 * tx_c4
     col_swz_bytes = swizzle_xor16(row_local, col_local_bytes, k_blocks16)
-    col_swz = col_swz_bytes if elem_bytes == 1 else col_swz_bytes / 2
+    col_swz = col_swz_bytes if elem_bytes == 1 else col_swz_bytes // 2
     coord_store = (row_local, col_swz)
     idx0 = crd2idx(coord_store, layout_lds) + lds_base
     v8 = vector.bitcast(vec8_ty, vec_part_i32x2)
@@ -419,7 +416,7 @@ def lds_store_4b_xor16(
         raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
     col_local_bytes = col_local_i32 * tx_c4
     col_swz_bytes = swizzle_xor16(row_local, col_local_bytes, k_blocks16)
-    col_swz = col_swz_bytes if elem_bytes == 1 else col_swz_bytes / 2
+    col_swz = col_swz_bytes if elem_bytes == 1 else col_swz_bytes // 2
     coord_store = (row_local, col_swz)
     idx0 = crd2idx(coord_store, layout_lds) + lds_base
     v4 = vector.bitcast(vec4_ty, vec_part_i32x1)

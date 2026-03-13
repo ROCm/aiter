@@ -30,6 +30,7 @@ from contextlib import contextmanager
 from typing import Callable
 
 from flydsl._mlir import ir
+import flydsl.expr as fx
 from flydsl.expr.typing import T
 
 
@@ -69,7 +70,7 @@ def default_epilog(
     """
     bx_m_v = bx_m
     lane_div_16_mul4 = lane_div_16 * 4
-    ii_idx_list = [arith.constant(ii, index=True) for ii in range(4)]
+    ii_idx_list = [fx.Index(ii) for ii in range(4)]
 
     for mi in range_constexpr(m_repeat):
         mi_base = arith.constant(mi * 16, index=True)
@@ -177,10 +178,10 @@ def c_shuffle_epilog(
     m_reps_shuffle = int(tile_m) // CShuffleMLane
     n_reps_shuffle = int(tile_n) // (CShuffleNLane * EVec)
 
-    c_nlane = arith.constant(CShuffleNLane, index=True)
-    m_lane = tx / c_nlane
+    c_nlane = fx.Index(CShuffleNLane)
+    m_lane = tx // c_nlane
     n_lane = tx % c_nlane
-    c_evec = arith.constant(EVec, index=True)
+    c_evec = fx.Index(EVec)
 
     if frag_elem_type is None:
         frag_elem_type = T.f16
