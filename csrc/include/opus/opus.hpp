@@ -2084,7 +2084,7 @@ struct mfma_adaptor_swap_ab : mfma_adaptor<MFMA> {
 
     template<typename VA, typename VB>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b) {
-        typename MFMA::vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b);
+        typename MFMA::vtype_c c{0}; return operator()(b, a, c, scale_b, scale_a);
     }
 
     OPUS_ADAPTOR_LAYOUT_API_DEFINE
