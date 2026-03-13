@@ -63,29 +63,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi355-1
+            label: MI355
             shard: 0
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi355-1
+            label: MI355
             shard: 1
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi355-1
+            label: MI355
             shard: 2
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi355-1
+            label: MI355
             shard: 3
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi355-1
+            label: MI355
             shard: 4
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi355-1
+            label: MI355
             shard: 5
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi355-1
+            label: MI355
             shard: 6
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi355-1
+            label: MI355
             shard: 7
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
