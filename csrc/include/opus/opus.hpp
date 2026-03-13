@@ -2077,6 +2077,16 @@ struct mfma_adaptor_swap_ab : mfma_adaptor<MFMA> {
         typename MFMA::vtype_c c{0}; return operator()(b, a, c, number<cbsz>{}, number<abid>{}, number<blgp>{});
     }
 
+    template<typename VA, typename VB, typename VC>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
+        return base::operator()(b, a, c, scale_b, scale_a);
+    }
+
+    template<typename VA, typename VB>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b) {
+        typename MFMA::vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b);
+    }
+
     OPUS_ADAPTOR_LAYOUT_API_DEFINE
 };
 
@@ -2202,6 +2212,53 @@ struct tiled_mma_adaptor : public MMA_ {
         vtype_c c{0};
         return operator()(a, b, c, number<cbsz>{}, number<abid>{}, number<blgp>{});
     }
+
+    // Scaled MFMA (f8f6f4): forward scale_a, scale_b to underlying MMA
+    template<typename VA, typename VB, typename VC,
+             std::enable_if_t< (is_array_v< remove_cvref_t<VA> > && is_array_v< remove_cvref_t<VB> > && is_array_v< remove_cvref_t<VC> >), bool > = true>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
+        VC c_ {c};
+        static_ford<EXPAND_K, EXPAND_M, EXPAND_N>([&](auto i_k, auto i_m, auto i_n){
+            auto s_a = a[i_m * EXPAND_K + i_k];
+            auto s_b = b[i_n * EXPAND_K + i_k];
+            auto s_c = c_[i_m * EXPAND_N + i_n];
+            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b);
+            c_[i_m * EXPAND_N + i_n] = s_c;
+        });
+        return c_;
+    }
+
+    template<typename VA, typename VB, typename VC,
+             std::enable_if_t< (is_vector_v< remove_cvref_t<VA> > && is_vector_v< remove_cvref_t<VB> > && is_vector_v< remove_cvref_t<VC> >), bool > = true>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
+        static_assert(size<VA>() == get<0>(reduce_tuple_mul(y_shape_a())));
+        static_assert(size<VB>() == get<0>(reduce_tuple_mul(y_shape_b())));
+        static_assert(size<VC>() == get<0>(reduce_tuple_mul(y_shape_c())));
+
+        constexpr auto a_len = get<0>(reduce_tuple_mul(MMA::y_shape_a()));
+        constexpr auto b_len = get<0>(reduce_tuple_mul(MMA::y_shape_b()));
+        constexpr auto c_len = get<0>(reduce_tuple_mul(MMA::y_shape_c()));
+
+        VC c_ {c};
+        static_ford<EXPAND_K, EXPAND_M, EXPAND_N>([&](auto i_k, auto i_m, auto i_n){
+            constexpr index_t i_tile_a = i_m * EXPAND_K + i_k;
+            constexpr index_t i_tile_b = i_n * EXPAND_K + i_k;
+            constexpr index_t i_tile_c = i_m * EXPAND_N + i_n;
+            auto s_a = slice(a, number<i_tile_a * a_len>{}, number<i_tile_a * a_len + a_len>{});
+            auto s_b = slice(b, number<i_tile_b * b_len>{}, number<i_tile_b * b_len + b_len>{});
+            auto s_c = slice(c_, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
+            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b);
+            set_slice(c_, s_c, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
+        });
+        return c_;
+    }
+
+    template<typename VA, typename VB>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b) {
+        vtype_c c{0};
+        return operator()(a, b, c, scale_a, scale_b);
+    }
+
     OPUS_ADAPTOR_LAYOUT_API_DEFINE
 };
 }
