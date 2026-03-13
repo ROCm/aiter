@@ -67,6 +67,7 @@ jobs:
       wheel_names: ${{ needs.build.outputs.wheel_names }}
     permissions:
       contents: read
+      actions: read
 
   promote:
     needs: [build, test]
