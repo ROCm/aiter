@@ -265,7 +265,7 @@ def unified_attention(
     ALL_DECODE = max_seqlen_q == 1
 
     # 3D kernel does not support sage attention yet; force 2D path when sage is active.
-    if sage_version is not None or use_2d_kernel(
+    if use_2d_kernel(
         head_size,
         SLIDING_WINDOW,
         ALL_DECODE,
