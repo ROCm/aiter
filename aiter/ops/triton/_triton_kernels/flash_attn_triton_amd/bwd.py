@@ -3023,8 +3023,8 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
     stride_descale_v_z,
     stride_az,
     stride_ah,
-    HQ : tl.constexpr,
-    HK : tl.constexpr,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
     cu_seqlens_q,
     cu_seqlens_k,
     seqused_q,
@@ -3102,7 +3102,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
     PADDED_HEAD_V: tl.constexpr = ACTUAL_HEAD_DIM_V != HEAD_DIM_V
     offs_d_qk = tl.arange(0, HEAD_DIM_QK)
     offs_d_v = tl.arange(0, HEAD_DIM_V)
-    GROUP_SIZE : tl.constexpr = HQ // HK
+    GROUP_SIZE: tl.constexpr = HQ // HK
     # align the delta_qk
     start_n = pid * BLOCK_N1
     if start_n < seqlen_k:
@@ -3606,8 +3606,8 @@ def bwd_kernel_fused_noncausal(
     stride_descale_v_z,
     stride_az,
     stride_ah,
-    HQ : tl.constexpr,
-    HK : tl.constexpr,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
     cu_seqlens_q,
     cu_seqlens_k,
     seqused_q,
@@ -4340,11 +4340,11 @@ def attention_backward_triton_impl(
 
         def grid(META):
             return (
-                    nheads_k,
-                    ((seqlen + META["BLOCK_N1"] - 1) // META["BLOCK_N1"]),
-                    batch
-                )
-        
+                nheads_k,
+                ((seqlen + META["BLOCK_N1"] - 1) // META["BLOCK_N1"]),
+                batch,
+            )
+
         if causal:
 
             if DEBUG_TRITON:
@@ -4434,7 +4434,7 @@ def attention_backward_triton_impl(
                 ),  # Add flag for seqused
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
-                NUM_XCD = 8,
+                NUM_XCD=8,
             )
         else:
             bwd_kernel_fused_noncausal[grid](
@@ -4522,7 +4522,7 @@ def attention_backward_triton_impl(
                 ),  # Add flag for seqused
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
-                NUM_XCD = 8,
+                NUM_XCD=8,
             )
     elif mode == "fused_atomic":
         NUM_WARPS, NUM_STAGES = 4, 1
