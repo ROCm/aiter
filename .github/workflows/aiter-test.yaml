@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]  # Triggers on PRs targeting `main`
     paths-ignore:
       - '**/*.md'
@@ -397,11 +397,7 @@ jobs:
 
   multi-gpu:
     name: Multi-GPU Tests (8 GPU)
-    if: >-
-      github.event_name != 'pull_request' ||
-      (github.event.pull_request.draft == false &&
-      (contains(github.event.pull_request.labels.*.name, 'ci:multi-gpu') ||
-      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+    if: github.ref == 'refs/heads/main'
     needs: build_aiter_image 
     strategy:
       fail-fast: false

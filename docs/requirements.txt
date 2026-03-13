@@ -1,0 +1,25 @@
+# Sphinx documentation dependencies
+
+# Core Sphinx
+sphinx>=7.2.6
+sphinx-rtd-theme>=2.0.0
+
+# Extensions
+sphinx-autodoc-typehints>=1.25.0
+sphinx-copybutton>=0.5.2
+myst-parser>=2.0.0
+
+# API documentation
+sphinxcontrib-napoleon>=0.7
+
+# Diagrams and visualizations (optional)
+sphinxcontrib-mermaid>=0.9.2
+
+# Code highlighting
+Pygments>=2.17.0
+
+# For better math rendering
+sphinxcontrib-katex>=0.9.9
+
+# Version management
+sphinx-multiversion>=0.2.4
