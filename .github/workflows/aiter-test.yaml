@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]  # Triggers on PRs targeting `main`
     paths-ignore:
       - '**/*.md'
@@ -43,6 +43,9 @@ jobs:
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     runs-on: build-only-aiter
     needs: check-signal
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - name: Checkout code
         if: ${{ !github.event.pull_request.head.repo.fork }}
@@ -85,8 +88,8 @@ jobs:
               fi \
            && pip install -r requirements.txt \
            && echo "Prebuilding kernels with GPU_ARCHS: ${{ env.GPU_ARCH_LIST }} and PREBUILD_KERNELS: 1" \
-           && PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" python setup.py build_ext --inplace \
-           && pip install -e . \
+           && PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" python setup.py bdist_wheel \
+           && pip install dist/*.whl \
            && echo "Prebuilding kernels completed"
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
@@ -127,7 +130,54 @@ jobs:
         if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
           echo "Successfully prepared image: rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}"
-      
+
+      - name: Extract wheel from image
+        if: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          set -ex
+          IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
+          mkdir -p dist
+          docker run --rm \
+            -v "${{ github.workspace }}/dist:/dist" \
+            $IMAGE_TAG \
+            bash -c "cp /aiter/dist/*.whl /dist/"
+          echo "Extracted wheels:"
+          ls -lh dist/*.whl
+
+      - name: Upload wheel as artifact
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiter-whl-main-${{ github.run_id }}
+          path: dist/*.whl
+
+      - name: Configure AWS credentials
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: us-east-1
+          role-to-assume: arn:aws:iam::661452401056:role/framework-aiter-nightlies
+
+      - name: Install AWS CLI
+        if: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          if ! command -v aws &> /dev/null; then
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip -q awscliv2.zip
+            sudo ./aws/install
+            rm -rf awscliv2.zip aws
+          fi
+
+      - name: Upload wheels to S3
+        if: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          for WHL in dist/*.whl; do
+            WHL_NAME=$(basename ${WHL})
+            echo "Uploading ${WHL_NAME} to S3..."
+            aws s3 cp ${WHL} s3://framework-whls-nightlies/whl-staging/gfx942-gfx950/${WHL_NAME}
+          done
+          echo "Wheels uploaded to S3 staging"
+
   split_aiter_tests:
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
@@ -347,11 +397,7 @@ jobs:
 
   multi-gpu:
     name: Multi-GPU Tests (8 GPU)
-    if: >-
-      github.event_name != 'pull_request' ||
-      (github.event.pull_request.draft == false &&
-      (contains(github.event.pull_request.labels.*.name, 'ci:multi-gpu') ||
-      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+    if: github.ref == 'refs/heads/main'
     needs: build_aiter_image 
     strategy:
       fail-fast: false

@@ -7,12 +7,19 @@ import sys
 import argparse
 import triton
 import logging
+import aiter
 
 from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_wrapper,
+    get_sage_fwd_configs_mxfp4,
+    fav3_sage_mxfp4_func,
 )
 
-from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import (
+from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
+    sage_quant_mxfp4,
+)
+
+from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     create_hadamard_matrix,
 )
 
@@ -21,9 +28,7 @@ from op_tests.triton_tests.attention.test_fav3_sage import (
     input_helper,
 )
 from op_tests.op_benchmarks.triton.bench_fav3_sage import fav2_forward_func
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    print_vgpr,
-)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import print_vgpr
 
 # Configuration
 logging.getLogger().setLevel(logging.INFO)
@@ -54,19 +59,62 @@ def bench_kernel(q, k, v, args, provider):
         _, HK, N_CTX_K, D_HEAD_V = v.shape
 
     BLOCK_R = args.BLOCK_R
-    R = create_hadamard_matrix(BLOCK_R, q.device) / (BLOCK_R**0.5)
+    R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (BLOCK_R**0.5)
 
-    def fn():
-        return fav3_sage_mxfp4_wrapper(
+    if args.include_quant_overhead:
+
+        def fn():
+            return fav3_sage_mxfp4_wrapper(
+                q,
+                k,
+                v,
+                causal=args.causal,
+                layout=args.layout,
+                q_smooth=args.qsmooth,
+                hadamard_rotation=args.hadamard_rotate,
+                R=R,
+            )
+
+    else:
+        config = get_sage_fwd_configs_mxfp4()
+
+        FP8_TYPE = aiter.dtypes.fp8
+        FP8_MAX = torch.finfo(FP8_TYPE).max
+        (
+            q_quantized,
+            q_descale,
+            k_quantized,
+            k_descale,
+            v_quantized,
+            v_descale,
+            delta_s,
+        ) = sage_quant_mxfp4(
             q,
             k,
             v,
-            causal=args.causal,
+            FP8_TYPE,
+            FP8_MAX,
+            BLKQ=config["BLOCK_M"],
+            BLKK=64,
             layout=args.layout,
-            q_smooth=args.qsmooth,
-            hadamard_rotation=args.hadamard_rotate,
             R=R,
+            BLOCK_R=BLOCK_R,
+            q_smoothing=args.qsmooth,
         )
+
+        def fn():
+            return fav3_sage_mxfp4_func(
+                q=q_quantized,
+                k=k_quantized,
+                v=v_quantized,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                bias=delta_s,
+                causal=args.causal,
+                layout=args.layout,
+                config=config,
+            )
 
     ms = triton.testing.do_bench(fn)
     # print("kernel (ms)", ms)
@@ -175,6 +223,17 @@ def parse_args():
         action="store_true",
         help="Causal masking",
     )
+    parser.add_argument(
+        "-test",
+        action="store_true",
+        help="Test benchmark shape correctness.",
+    )
+    parser.add_argument(
+        "-include_quant_overhead",
+        action="store_true",
+        help="Include quantization overhead to bench.",
+    )
+
     return parser.parse_args()
 
 
@@ -202,7 +261,7 @@ def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
 def test_accuracy(q, k, v, args):
 
     BLOCK_R = args.BLOCK_R
-    R = create_hadamard_matrix(BLOCK_R, q.device) / (BLOCK_R**0.5)
+    R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (BLOCK_R**0.5)
 
     triton_out = fav3_sage_mxfp4_wrapper(
         q,
@@ -292,15 +351,16 @@ def main():
 
     assert args.BLOCK_R <= args.d, "Rotation block size should be <= d"
 
-    if args.captured_dir is not None:
-        test_accuracy_with_captured_inputs(args)
-    else:
-        test_accuracy_with_shape(args)
-
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
         print_vgpr(lambda: run_benchmark(args), "MXFP4_Attention_Performance")
         return 0
+
+    if args.test:
+        if args.captured_dir is not None:
+            test_accuracy_with_captured_inputs(args)
+        else:
+            test_accuracy_with_shape(args)
 
     run_benchmark(args)
 

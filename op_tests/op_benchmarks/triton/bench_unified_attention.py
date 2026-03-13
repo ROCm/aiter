@@ -7,7 +7,7 @@ import itertools
 import torch
 import triton
 
-from aiter.ops.triton.attention.unified_attention import unified_attention
+from aiter.ops.triton.attention.unified_attention import unified_attention, SAGE_VERSION
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
@@ -251,7 +251,7 @@ def create_benchmark_configs(custom, args):
                 "DECODE_P",
             ]
             plot_name = (
-                f"fused-attention-layout-{args.layout}-fp8-{args.fp8}-causal-{causal}"
+                f"fused-attention-layout-{args.layout}-sagev1-{args.sagev1}-sagev2-{args.sagev2}-causal-{causal}"
             )
             extra_args = {"dtype": dtype, "causal": causal}
 
@@ -388,20 +388,34 @@ def run_benchmark(custom, args):
         maybe_quantized_key_cache = key_cache
         maybe_quantized_value_cache = value_cache
 
-        if args.fp8:
+        if args.sagev1 or args.sagev2:
             from aiter.ops.triton.utils.types import e4m3_dtype
 
             FP8_TYPE = e4m3_dtype
-            maybe_quantized_query = (query).to(FP8_TYPE)
-            maybe_quantized_key_cache = (key_cache).to(FP8_TYPE)
-            maybe_quantized_value_cache = (value_cache).to(FP8_TYPE)
-            scale_shape = (1,)
-            q_descale = None
-            k_descale = torch.ones(scale_shape, dtype=torch.float32, device="cuda")
-            v_descale = torch.ones(scale_shape, dtype=torch.float32, device="cuda")
+            fp8_max = torch.finfo(FP8_TYPE).max
+
+            q_abs_max = query.abs().amax().clamp(min=1e-9)
+            q_descale = (q_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
+            maybe_quantized_query = (query * (fp8_max / q_abs_max)).to(FP8_TYPE)
+
+            k_abs_max = key_cache.abs().amax().clamp(min=1e-9)
+            k_descale = (k_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
+            maybe_quantized_key_cache = (key_cache * (fp8_max / k_abs_max)).to(FP8_TYPE)
+
+            v_abs_max = value_cache.abs().amax().clamp(min=1e-9)
+            v_descale = (v_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
+            maybe_quantized_value_cache = (value_cache * (fp8_max / v_abs_max)).to(FP8_TYPE)
+
         else:
             q_descale, k_descale, v_descale = None, None, None
 
+        if args.sagev1:
+            sage_version = SAGE_VERSION.SAGE
+        elif args.sagev2:
+            sage_version = SAGE_VERSION.SAGE_MXFP4
+        else:
+            raise ValueError("Invalid sage version")
+        
         def fn():
             return unified_attention(
                 q=maybe_quantized_query,
@@ -421,11 +435,13 @@ def run_benchmark(custom, args):
                 k_descale=k_descale,
                 v_descale=v_descale,
                 sinks=sinks,
+                sage_version=sage_version,
             )
 
         ms = triton.testing.do_bench(fn)
 
-        if args.test:
+        run_correctness = args.test
+        if run_correctness:
             fn()
             ref_output = ref_paged_attn(
                 query=query,
@@ -439,12 +455,30 @@ def run_benchmark(custom, args):
                 soft_cap=soft_cap,
                 sinks=sinks,
             )
-            atol, rtol = 1.5e-2, 1e-2
-            if args.fp8:
+            if args.sagev1 or args.sagev2:
                 atol, rtol = 1.5e-1, 1.5e-1
-            torch.testing.assert_close(
-                output, ref_output, atol=atol, rtol=rtol
-            ), f"{torch.max(torch.abs(output - ref_output))}"
+            else:
+                atol, rtol = 1.5e-2, 1e-2
+            max_err = torch.max(torch.abs(output - ref_output)).item()
+            tag = "sagev1" if args.sagev1 else ("sagev2" if args.sagev2 else "default")
+            config_str = (
+                f"BATCH={BATCH}, HQ={HQ}, HK={HK}, "
+                f"N_CTX_Q={N_CTX_Q}, N_CTX_K={N_CTX_K}"
+            )
+            try:
+                torch.testing.assert_close(
+                    output, ref_output, atol=atol, rtol=rtol
+                )
+                print(
+                    f"  [{tag}] PASS  max_err={max_err:.6f}  "
+                    f"atol={atol}  ({config_str})"
+                )
+            except AssertionError:
+                print(
+                    f"  [{tag}] FAIL  max_err={max_err:.6f}  "
+                    f"atol={atol}  ({config_str})"
+                )
+                raise
 
         # calculate perf metrics
         total_flops = 0
@@ -590,7 +624,8 @@ def parse_args():
         metavar="P",  # shown as -decode P in help
         help="portion of decode samples in batch (omit P for all=1.0)",
     )
-    parser.add_argument("-fp8", action="store_true", default=False)
+    parser.add_argument("-sagev1", action="store_true", default=False)
+    parser.add_argument("-sagev2", action="store_true", default=False)
     parser.add_argument("-dtype", default="fp16")
     parser.add_argument("-print_vgpr", action="store_true", default=False)
 

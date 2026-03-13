@@ -33,8 +33,9 @@ skip_tests=(
 )
 
 # When AITER_TEST is set, files are already the exact list for this shard (from artifact).
+# Multi-GPU tests should always run all files without sharding.
 # Otherwise, apply modulo to split "all files" into shards by index.
-if [[ -n "${AITER_TEST:-}" ]]; then
+if [[ -n "${AITER_TEST:-}" ]] || [[ "$MULTIGPU" == "TRUE" ]]; then
     sharded_files=("${files[@]}")
 else
     sharded_files=()

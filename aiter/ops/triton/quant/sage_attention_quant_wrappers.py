@@ -10,7 +10,8 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     sage_quant_kernel,
     _rot_k_only_kernel,
     _rot_q_kernel,
-    _rotate_quantize_qk_kernel,
+    _rotate_quantize_q_kernel,
+    _rotate_quantize_k_kernel,
     _compute_delta_s_kernel,
     perblock_quantize_q_kernel,
     perblock_quantize_kernel,
@@ -392,7 +393,7 @@ def fused_sage_quant_mxfp4(
     BLOCK_K = 1024
     K_NUM_BLKS = (kv_len + BLOCK_K - 1) // BLOCK_K
 
-    # Apply K tensor smoothing following SageAttention approach
+    # V tensor per channel quantization
     v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
 
     v_task_count = b * h_kv * K_NUM_BLKS
@@ -426,12 +427,14 @@ def sage_quant_mxfp4(
     v,
     FP8_TYPE,
     FP8_MAX,
-    BLKQ=128,
-    BLKK=64,
+    BLKQ,
+    BLKK,
     sm_scale=None,
     q_smoothing=False,
     layout="bshd",
     USE_RNE=False,
+    R=None,
+    BLOCK_R=32,
 ):
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
 
@@ -466,7 +469,7 @@ def sage_quant_mxfp4(
     v_task_count = b * h_kv * K_NUM_BLKS
     grid = (v_task_count,)
 
-    padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
+    # padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
@@ -475,7 +478,8 @@ def sage_quant_mxfp4(
         q,
         k,
         BLKQ,
-        block_size=padded_head_dim,
+        R=R,
+        BLOCK_R=BLOCK_R,
         q_smoothing=q_smoothing,
         layout=layout,
         sm_scale=(sm_scale * 1.4426950408889634),
@@ -630,19 +634,24 @@ def sage_quant(
 def rotation_smooth_qk(
     q,
     k,
-    BLOCK_SIZE_M=256,
-    block_size=32,
+    BLOCK_SIZE_M,
+    R=None,
+    BLOCK_R=32,
     q_smoothing=False,
     sm_scale=None,
     layout="bhsd",
 ):
-    # Generate Hadamard Matrix R (Rank 32)
-    # TODO we might want to manually define this matrix
-    R = create_hadamard_matrix(block_size, dtype=q.dtype, device=q.device) / (
-        block_size**0.5
-    )
 
-    # R = create_random_hadamard_matrix(block_size, dtype=q.dtype)
+    if R is None:  # Generate Hadamard Matrix R if not given
+        assert (
+            BLOCK_R is not None
+        ), "if not passing R (hadamard matrix), BLOCK_R (size of the hadamard matrix) must be provided."
+        R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (
+            BLOCK_R**0.5
+        )
+    else:
+        BLOCK_R = R.shape[-1]
+
     bshd = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
 
     # shapes
@@ -655,7 +664,6 @@ def rotation_smooth_qk(
     Q_NUM_BLKS = (s_q + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
     K_NUM_BLKS = (s_k + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
 
-    # TODO check the dtypes for scales
     if q_smoothing:
         q_mean = torch.empty(
             (b, h_q, Q_NUM_BLKS, d), dtype=torch.float32, device=q.device
@@ -671,8 +679,8 @@ def rotation_smooth_qk(
     stride_qob, stride_qom, stride_qoh, stride_qod = map_dims(Q_rot.stride(), bshd)
     stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k.stride(), bshd)
     stride_kob, stride_kon, stride_koh, stride_kod = map_dims(K_rot.stride(), bshd)
-    # Launch Q Kernel
-    grid_q = (b * h_q, Q_NUM_BLKS, d // block_size)
+    # rotate q and optionally smooth
+    grid_q = (b * h_q, Q_NUM_BLKS, d // BLOCK_R)
     _rot_q_kernel[grid_q](
         q,
         Q_rot,
@@ -698,11 +706,11 @@ def rotation_smooth_qk(
         d,
         q_smoothing=q_smoothing,
         BLOCK_M=BLOCK_SIZE_M,
-        BLOCK_D=block_size,
+        BLOCK_D=BLOCK_R,
     )
 
-    # 2. Rotate K (Only once!)
-    grid_k = (b * h_k, K_NUM_BLKS, d // block_size)
+    # rotate k
+    grid_k = (b * h_k, K_NUM_BLKS, d // BLOCK_R)
     _rot_k_only_kernel[grid_k](
         k,
         K_rot,
@@ -721,16 +729,19 @@ def rotation_smooth_qk(
         s_k,
         d,
         BLOCK_M=BLOCK_SIZE_M,
-        BLOCK_D=block_size,
+        BLOCK_D=BLOCK_R,
     )
 
-    # smooth k after rotation
+    # smooth k
     K_rot = K_rot - K_rot.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
 
     if q_smoothing:
-        # 3. Compute Smoothing Delta S
-        # Grid: Each Q-block x Each K-block
-        grid_delta = (b * h_k, Q_NUM_BLKS, K_NUM_BLKS)
+        # compute delta s that needs to be added due to q smoothing
+        # Q x K = Q x H x H.T x K
+        # = ((Q x H - q_mean + q_mean) x H.T x K
+        # = Q_rot x K_rot + q_mean x K_rot
+        # = Q_rot x K_rot + delta_s
+        grid_delta = (b * h_q, Q_NUM_BLKS, K_NUM_BLKS)
         _compute_delta_s_kernel[grid_delta](
             q_mean,
             K_rot,
@@ -747,6 +758,7 @@ def rotation_smooth_qk(
             delta_s.stride(1),
             delta_s.stride(2),
             delta_s.stride(3),
+            h_q,
             h_k,
             s_k,
             d,
@@ -772,9 +784,9 @@ def smooth_rotate_downcast_qk(
             assert (
                 BLOCK_R is not None
             ), "if using hadamard rotation, BLOCK_R (size of the hadamard matrix) must be provided."
-            R = create_hadamard_matrix(BLOCK_R, q.device).to(
-                dtype=q.dtype, device=q.device
-            ) / (BLOCK_R**0.5)
+            R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (
+                BLOCK_R**0.5
+            )
         else:
             BLOCK_R = R.shape[-1]
 
@@ -816,8 +828,45 @@ def smooth_rotate_downcast_qk(
     stride_qsb, stride_qsm, stride_qsh, stride_qsd = map_dims(Q_descale.stride(), bshd)
     stride_ksb, stride_ksn, stride_ksh, stride_ksd = map_dims(K_descale.stride(), bshd)
 
-    grid = (b * (h_q * Q_NUM_BLKS + h_k * K_NUM_BLKS),)
-    _rotate_quantize_qk_kernel[grid](
+    grid_q = (b * h_q * Q_NUM_BLKS,)
+    _rotate_quantize_q_kernel[grid_q](
+        q,
+        Q_q,
+        Q_descale,
+        q_mean,
+        R,
+        sm_scale,
+        stride_qb,
+        stride_qh,
+        stride_qm,
+        stride_qd,
+        stride_qqb,
+        stride_qqm,
+        stride_qqh,
+        stride_qqd,
+        stride_qsb,
+        stride_qsm,
+        stride_qsh,
+        stride_qsd,
+        q_mean.stride(0) if q_smoothing else None,
+        q_mean.stride(1) if q_smoothing else None,
+        q_mean.stride(2) if q_smoothing else None,
+        q_mean.stride(3) if q_smoothing else None,
+        b,
+        h_q,
+        s_q,
+        d,
+        q_smoothing=q_smoothing,
+        hadamard_rotation=hadamard_rotation,
+        BLOCK_M=BLOCK_SIZE_M,
+        BLOCK_R=BLOCK_R,
+        D=d,
+        num_warps=4,
+        num_stages=5,
+    )
+
+    grid_k = (b * h_k * K_NUM_BLKS,)
+    _rotate_quantize_k_kernel[grid_k](
         q,
         Q_q,
         Q_descale,
@@ -901,7 +950,7 @@ def smooth_rotate_downcast_qk(
 
 
 @functools.lru_cache(maxsize=16)
-def create_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
+def create_hadamard_matrix(block_size, device="cuda", dtype=torch.bfloat16):
     """
     Returns a Hadamard matrix of size block_size x block_size. Remember to normalize with sqrt(block_size) for it to be orthogonal.
     """
