@@ -43,6 +43,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: aiter-whl-packages-py*
+          path: dist
+          merge-multiple: true
+
       - name: Validate inputs
         run: |
           # Validate release_type
@@ -84,43 +91,6 @@ jobs:
             exit 1
           fi
 
-      - name: Wait for wheel availability
-        run: |
-          # Wheels are in S3 at: s3://framework-whls-{release_type}/whl-staging/gfx942-gfx950/{wheel}
-          # CloudFront serves from: https://rocm.frameworks-{release_type}.amd.com/whl-staging/gfx942-gfx950/{wheel}
-          WHEEL_BASE_URL="https://rocm.frameworks-${{ inputs.release_type }}.amd.com/whl-staging/gfx942-gfx950"
-          WHEEL_URL="${WHEEL_BASE_URL}/${WHEEL_NAME}"
-          MAX_RETRIES=24
-          RETRY_DELAY=5
-          RETRY_COUNT=0
-
-          echo "============================================"
-          echo "Checking wheel availability"
-          echo "Wheel: ${WHEEL_NAME}"
-          echo "Full URL: ${WHEEL_URL}"
-          echo "============================================"
-
-          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            # Try to fetch the wheel with HTTP HEAD request
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${WHEEL_URL}" || echo "000")
-
-            if [ "$HTTP_CODE" = "200" ]; then
-              echo "✅ Wheel is available! (HTTP $HTTP_CODE)"
-              break
-            fi
-
-            RETRY_COUNT=$((RETRY_COUNT + 1))
-            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-              echo "⏳ Wheel not yet available (HTTP $HTTP_CODE), waiting... (attempt $RETRY_COUNT/$MAX_RETRIES)"
-              sleep $RETRY_DELAY
-            else
-              echo "❌ ERROR: Wheel not available after $((MAX_RETRIES * RETRY_DELAY)) seconds"
-              echo "Expected: ${WHEEL_INDEX_URL}${WHEEL_NAME}"
-              echo "Last HTTP code: $HTTP_CODE"
-              exit 1
-            fi
-          done
-
       - name: Start GPU test container
         run: |
           docker ps -aq -f name=aiter_test | xargs -r docker stop | xargs -r docker rm || true
@@ -157,25 +127,24 @@ jobs:
       - name: Install wheels
         id: install
         run: |
-          # Construct full wheel URL
-          WHEEL_BASE_URL="https://rocm.frameworks-${{ inputs.release_type }}.amd.com/whl-staging/gfx942-gfx950"
-          WHEEL_URL="${WHEEL_BASE_URL}/${WHEEL_NAME}"
-
           echo "============================================"
           echo "Installing wheel"
           echo "Wheel: ${WHEEL_NAME}"
-          echo "Full URL: ${WHEEL_URL}"
+          echo "From: dist/${WHEEL_NAME}"
           echo "Python: ${{ matrix.python_version }}"
           echo "============================================"
+
+          # Copy wheel into container
+          docker cp dist/${WHEEL_NAME} aiter_test:/tmp/${WHEEL_NAME}
 
           docker exec aiter_test bash -c "python3 -m pip install -U pip setuptools"
           docker exec aiter_test bash -c "pip uninstall -y aiter amd-aiter || true"
 
-          # Install directly from URL
-          if ! docker exec aiter_test bash -c "python3 -m pip install ${WHEEL_URL} -v"; then
+          # Install from local file in container
+          if ! docker exec aiter_test bash -c "python3 -m pip install /tmp/${WHEEL_NAME} -v"; then
             echo "❌ Installation failed!"
             echo "Debug info:"
-            echo "- Wheel URL: ${WHEEL_URL}"
+            echo "- Wheel: ${WHEEL_NAME}"
             docker exec aiter_test bash -c "python3 --version"
             docker exec aiter_test bash -c "pip --version"
             exit 1
@@ -219,14 +188,11 @@ jobs:
       - name: Test summary
         if: always()
         run: |
-          WHEEL_BASE_URL="https://rocm.frameworks-${{ inputs.release_type }}.amd.com/whl-staging/gfx942-gfx950"
-          WHEEL_URL="${WHEEL_BASE_URL}/${WHEEL_NAME}"
-
           echo "## Test Summary - ${{ matrix.label }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Runner**: ${{ matrix.runner }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Python**: ${{ matrix.python_version }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Wheel**: \`${WHEEL_NAME}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Wheel URL**: ${WHEEL_URL}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Source**: GitHub Actions artifact" >> $GITHUB_STEP_SUMMARY
           echo "- **Install**: ${{ steps.install.outcome }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Tests**: ${{ steps.tests.outcome }}" >> $GITHUB_STEP_SUMMARY
 
