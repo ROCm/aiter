@@ -204,9 +204,7 @@ def kernel_unified_attention_2d(
     stride_k_cache_scale_1: tl.int64,  # int
     stride_k_cache_scale_2: tl.int64,  # int
     stride_k_cache_scale_3: tl.int64,  # int
-    stride_v_cache_scale_0: tl.int64,  # int
-    stride_v_cache_scale_1: tl.int64,  # int
-    query_start_len_ptr,  # [num_seqs+1
+    query_start_len_ptr,  # [num_seqs+1]
     BLOCK_Q: tl.constexpr,  # int
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
