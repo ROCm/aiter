@@ -56,3 +56,27 @@ aiter_logs
 # artifacts
 aiter_meta
 aiter/install_mode
+
+# Large test data - should be stored externally or use Git LFS
+*.pt
+*.pth
+*.bin
+*.ckpt
+op_tests/test_jenga_vsa/
+op_tests/dump_data/
+
+# Temporary and debug files
+debug_log.txt
+*.debug
+
+# Build outputs and compilation artifacts
+OUT_FOLDER/
+*.att
+
+# Large benchmark results - archive to Wiki or external storage
+op_tests/moe_benchmarking_profiling/results/*.csv
+scripts/results/*.csv
+
+# Jupyter notebook checkpoints and outputs
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
