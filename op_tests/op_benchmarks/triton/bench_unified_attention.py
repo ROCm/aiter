@@ -7,7 +7,7 @@ import itertools
 import torch
 import triton
 
-from aiter.ops.triton.attention.unified_attention import unified_attention
+from aiter.ops.triton.attention.unified_attention import unified_attention, SAGE_VERSION
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
@@ -251,7 +251,7 @@ def create_benchmark_configs(custom, args):
                 "DECODE_P",
             ]
             plot_name = (
-                f"fused-attention-layout-{args.layout}-fp8-{args.fp8}-causal-{causal}"
+                f"fused-attention-layout-{args.layout}-sagev1-{args.sagev1}-sagev2-{args.sagev2}-causal-{causal}"
             )
             extra_args = {"dtype": dtype, "causal": causal}
 
@@ -388,7 +388,7 @@ def run_benchmark(custom, args):
         maybe_quantized_key_cache = key_cache
         maybe_quantized_value_cache = value_cache
 
-        if args.fp8_full:
+        if args.sagev1 or args.sagev2 or args.fp8_full:
             from aiter.ops.triton.utils.types import e4m3_dtype
 
             FP8_TYPE = e4m3_dtype
@@ -405,20 +405,17 @@ def run_benchmark(custom, args):
             v_abs_max = value_cache.abs().amax().clamp(min=1e-9)
             v_descale = (v_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
             maybe_quantized_value_cache = (value_cache * (fp8_max / v_abs_max)).to(FP8_TYPE)
-        elif args.fp8:
-            from aiter.ops.triton.utils.types import e4m3_dtype
 
-            FP8_TYPE = e4m3_dtype
-            maybe_quantized_query = (query).to(FP8_TYPE)
-            maybe_quantized_key_cache = (key_cache).to(FP8_TYPE)
-            maybe_quantized_value_cache = (value_cache).to(FP8_TYPE)
-            scale_shape = (1,)
-            q_descale = None
-            k_descale = torch.ones(scale_shape, dtype=torch.float32, device="cuda")
-            v_descale = torch.ones(scale_shape, dtype=torch.float32, device="cuda")
         else:
             q_descale, k_descale, v_descale = None, None, None
 
+        if args.sagev1:
+            sage_version = SAGE_VERSION.SAGE
+        elif args.sagev2:
+            sage_version = SAGE_VERSION.SAGE_MXFP4
+        else:
+            raise ValueError("Invalid sage version")
+        
         def fn():
             return unified_attention(
                 q=maybe_quantized_query,
@@ -438,11 +435,12 @@ def run_benchmark(custom, args):
                 k_descale=k_descale,
                 v_descale=v_descale,
                 sinks=sinks,
+                sage_version=sage_version,
             )
 
         ms = triton.testing.do_bench(fn)
 
-        run_correctness = args.test or args.fp8_full
+        run_correctness = args.test
         if run_correctness:
             fn()
             ref_output = ref_paged_attn(
@@ -457,12 +455,16 @@ def run_benchmark(custom, args):
                 soft_cap=soft_cap,
                 sinks=sinks,
             )
-            if args.fp8 or args.fp8_full:
+            if args.fp8 or args.fp8_full or args.sagev1 or args.sagev2:
                 atol, rtol = 1.5e-1, 1.5e-1
             else:
                 atol, rtol = 1.5e-2, 1e-2
             max_err = torch.max(torch.abs(output - ref_output)).item()
-            tag = "fp8_full" if args.fp8_full else ("fp8" if args.fp8 else "default")
+            tag = "fp8_full" if args.fp8_full else \
+                    "fp8" if args.fp8 else \
+                    "sagev1" if args.sagev1 else \
+                    "sagev2" if args.sagev2 else \
+                    "default"
             config_str = (
                 f"BATCH={BATCH}, HQ={HQ}, HK={HK}, "
                 f"N_CTX_Q={N_CTX_Q}, N_CTX_K={N_CTX_K}"
@@ -633,6 +635,8 @@ def parse_args():
         default=False,
         help="Full FP8 path: quantize Q, K, V to FP8 with q_descale, k_descale, v_descale",
     )
+    parser.add_argument("-sagev1", action="store_true", default=False)
+    parser.add_argument("-sagev2", action="store_true", default=False)
     parser.add_argument("-dtype", default="fp16")
     parser.add_argument("-print_vgpr", action="store_true", default=False)
 
