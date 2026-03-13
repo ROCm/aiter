@@ -7,6 +7,7 @@ import torch
 
 import aiter
 from aiter.ops.triton.attention.mla import mla_decode_fwd as triton_mla_decode_fwd
+from aiter.ops.triton.attention.mla import mla_prefill_fwd as triton_mla_prefill_fwd
 
 from aiter.ops.triton.utils.types import e4m3_dtype
 from typing import Optional
@@ -126,9 +127,9 @@ def torch_mla_extend(
     return out.to(o_dtype)
 
 
-@pytest.mark.parametrize("batch_size", [1, 4, 8, 32])
-@pytest.mark.parametrize("decode_qlen", [1, 2, 4])
-@pytest.mark.parametrize("ctx_lens", [512, 1024])
+@pytest.mark.parametrize("batch_size", [1, 4, 7, 8, 32])
+@pytest.mark.parametrize("decode_qlen", [1, 2, 4, -1])
+@pytest.mark.parametrize("ctx_lens", [1024, 8192])
 @pytest.mark.parametrize("num_heads", [(16, 1)])
 @pytest.mark.parametrize("kv_lora_rank, qk_rope_head_dim", [(512, 64)])
 @pytest.mark.parametrize("block_size", [64])
@@ -169,15 +170,27 @@ def test_mla(
     num_query_heads, num_kv_heads = num_heads
     cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int, device="cuda")
     seq_lens_qo = torch.empty(batch_size, dtype=torch.int, device="cuda")
-    seq_lens_qo.fill_(decode_qlen)
-    cu_seqlens_q[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
-    total_num_query_tokens = cu_seqlens_q[-1].item()
     seq_lens_kv = torch.empty(batch_size, dtype=torch.int, device="cuda")
     if varlen:
         for i in range(batch_size):
             seq_lens_kv[i] = max(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens)
     else:
         seq_lens_kv.fill_(ctx_lens)
+    if decode_qlen > -1:
+        seq_lens_qo.fill_(decode_qlen)
+    else:
+        seq_lens_qo.fill_(ctx_lens)
+        if varlen:
+            for i in range(batch_size):
+                seq_lens_qo[i] = max(
+                    min(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens), 1
+                )
+        else:
+            seq_lens_qo.fill_(ctx_lens)
+
+    cu_seqlens_q[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
+    total_num_query_tokens = cu_seqlens_q[-1].item()
+
     max_seqlen_kv = seq_lens_kv.max().item()
     max_num_blocks_per_seq = (max_seqlen_kv + block_size - 1) // block_size
     block_tables = torch.randint(
@@ -217,22 +230,40 @@ def test_mla(
     )
 
     if backend == "triton":
-        triton_mla_decode_fwd(
-            q,
-            kv_buffer,
-            out,
-            cu_seqlens_q=cu_seqlens_q,
-            seqused_k=seq_lens_kv,
-            max_seqlen_kv=max_seqlen_kv,
-            block_tables=block_tables,
-            softmax_scale=sm_scale,
-            kv_lora_rank=kv_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-            causal=True,
-            q_descale=q_descale,
-            kv_descale=kv_descale,
-            out_scale=out_scale,
-        )
+        if decode_qlen > -1:
+            triton_mla_decode_fwd(
+                q,
+                kv_buffer,
+                out,
+                cu_seqlens_q=cu_seqlens_q,
+                seqused_k=seq_lens_kv,
+                max_seqlen_kv=max_seqlen_kv,
+                block_tables=block_tables,
+                softmax_scale=sm_scale,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                causal=True,
+                q_descale=q_descale,
+                kv_descale=kv_descale,
+                out_scale=out_scale,
+            )
+        else:
+            triton_mla_prefill_fwd(
+                q,
+                kv_buffer,
+                out,
+                cu_seqlens_q=cu_seqlens_q,
+                seqused_k=seq_lens_kv,
+                max_seqlen_kv=max_seqlen_kv,
+                block_tables=block_tables,
+                softmax_scale=sm_scale,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                causal=True,
+                q_descale=q_descale,
+                kv_descale=kv_descale,
+                out_scale=out_scale,
+            )
 
     out_ref = torch_mla_extend(
         q,
