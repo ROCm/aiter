@@ -62,9 +62,9 @@ def kernel_unified_attention_2d(
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
     scale: tl.constexpr,  # float32
-    k_scale,  # float32
-    v_scale,  # float32
-    out_scale,  # float32
+    k_scale_ptr,  # float32
+    v_scale_ptr,  # float32
+    out_scale_ptr,  # float32
     softcap,  # float32
     num_query_heads: tl.constexpr,  # int
     num_queries_per_kv: tl.constexpr,  # int
@@ -230,7 +230,13 @@ def kernel_unified_attention_2d(
         # Convert to tile indices and clamp
         tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
         tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
-
+    if k_scale_ptr is not None and v_scale_ptr is not None:
+        k_scale = tl.load(k_scale_ptr)
+        v_scale = tl.load(v_scale_ptr)
+        qk_scale = qk_scale * k_scale
+    else:
+        k_scale = None
+        v_scale = None
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
     # iterate through tiles (now limited to the sliding window range)
     for j in range(tile_start, tile_end):
@@ -267,13 +273,7 @@ def kernel_unified_attention_2d(
             cache_modifier=KV_cache_modifier,
         )
 
-        if K_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
-                K = K_load
-            else:
-                K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
-        else:
-            K = K_load
+        K = K_load.to(Q.dtype)
 
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
@@ -283,13 +283,7 @@ def kernel_unified_attention_2d(
             cache_modifier=KV_cache_modifier,
         )
 
-        if V_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
-                V = V_load
-            else:
-                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
-        else:
-            V = V_load
+        V = V_load.to(Q.dtype)
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
@@ -358,10 +352,13 @@ def kernel_unified_attention_2d(
 
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
-    one_over_L = 1.0 / L[:, None]
+    if v_scale is not None:
+        one_over_L = v_scale / L[:, None]
+    else:
+        one_over_L = 1.0 / L[:, None]
     acc = acc * one_over_L
     if USE_FP8:
-        acc = acc * tl.load(out_scale)
+        acc = acc * tl.load(out_scale_ptr)
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
 
     output_offset = (
@@ -392,8 +389,8 @@ def kernel_unified_attention_3d(
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
     scale,  # float32
-    k_scale,  # float32
-    v_scale,  # float32
+    k_scale_ptr,  # float32
+    v_scale_ptr,  # float32
     softcap,  # float32
     num_query_heads: tl.constexpr,  # int
     num_queries_per_kv: tl.constexpr,  # int
@@ -541,6 +538,14 @@ def kernel_unified_attention_3d(
     num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
+    if k_scale_ptr is not None and v_scale_ptr is not None:
+        k_scale = tl.load(k_scale_ptr)
+        v_scale = tl.load(v_scale_ptr)
+        qk_scale = qk_scale * k_scale
+    else:
+        k_scale = None
+        v_scale = None
+
     # iterate through tiles within current segment
     for j in range(
         segm_idx * tiles_per_segment,
@@ -578,13 +583,7 @@ def kernel_unified_attention_3d(
             cache_modifier=KV_cache_modifier,
         )
 
-        if K_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
-                K = K_load
-            else:
-                K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
-        else:
-            K = K_load
+        K = K_load.to(Q.dtype)
 
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
@@ -594,13 +593,7 @@ def kernel_unified_attention_3d(
             cache_modifier=KV_cache_modifier,
         )
 
-        if V_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
-                V = V_load
-            else:
-                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
-        else:
-            V = V_load
+        V = V_load.to(Q.dtype)
 
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
@@ -667,6 +660,9 @@ def kernel_unified_attention_3d(
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         acc += tl.dot(P.to(V.dtype), V)
+
+    if v_scale is not None:
+        acc = acc * v_scale
 
     segm_output_offset = (
         query_offset_0[:, None].to(tl.int64)
