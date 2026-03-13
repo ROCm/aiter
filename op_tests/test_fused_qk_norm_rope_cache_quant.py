@@ -1784,7 +1784,9 @@ def test_partial_rotary_pts_quant(
     qw = torch.randn(head_size, dtype=dtype, device="cuda")
     kw = torch.randn(head_size, dtype=dtype, device="cuda")
     cos_sin = torch.randn((max_pos, rotary_dim), dtype=dtype, device="cuda")
-    positions = torch.randint(0, max_pos, (num_tokens,), dtype=torch.int64, device="cuda")
+    positions = torch.randint(
+        0, max_pos, (num_tokens,), dtype=torch.int64, device="cuda"
+    )
 
     k_cache = torch.zeros(
         (num_slots, num_heads_k, head_size), dtype=dtype, device="cuda"
@@ -1807,19 +1809,46 @@ def test_partial_rotary_pts_quant(
     )
 
     q_ref, k_ref, v_ref = ref_partial_rotary_pts_quant(
-        qkv, qw, kw, cos_sin, positions,
-        num_tokens, num_heads_q, num_heads_k, num_heads_v,
-        head_size, rotary_dim, is_neox_style, eps,
+        qkv,
+        qw,
+        kw,
+        cos_sin,
+        positions,
+        num_tokens,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_size,
+        rotary_dim,
+        is_neox_style,
+        eps,
     )
 
     aiter.fused_qk_norm_rope_cache_pts_quant_shuffle(
-        qkv.clone(), qw, kw, cos_sin, positions,
-        num_tokens, num_heads_q, num_heads_k, num_heads_v, head_size,
-        is_neox_style, eps,
-        q_out, k_cache, v_cache, slot_mapping,
-        per_tensor_k_scale, per_tensor_v_scale,
-        k_out, v_out, True,
-        False, 0, 0,
+        qkv.clone(),
+        qw,
+        kw,
+        cos_sin,
+        positions,
+        num_tokens,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_size,
+        is_neox_style,
+        eps,
+        q_out,
+        k_cache,
+        v_cache,
+        slot_mapping,
+        per_tensor_k_scale,
+        per_tensor_v_scale,
+        k_out,
+        v_out,
+        True,
+        False,
+        0,
+        0,
         rotary_dim,
     )
 
@@ -1828,12 +1857,27 @@ def test_partial_rotary_pts_quant(
         f"Hq={num_heads_q}, Hk={num_heads_k}, D={head_size}, "
         f"rotary_dim={rotary_dim}, neox={is_neox_style}"
     )
-    checkAllclose(q_ref.reshape(num_tokens, -1), q_out.reshape(num_tokens, -1),
-                  msg=f"q  {tag}", rtol=1e-2, atol=0.05)
-    checkAllclose(k_ref.reshape(num_tokens, -1), k_out.reshape(num_tokens, -1),
-                  msg=f"k  {tag}", rtol=1e-2, atol=0.05)
-    checkAllclose(v_ref.reshape(num_tokens, -1), v_out.reshape(num_tokens, -1),
-                  msg=f"v  {tag}", rtol=1e-2, atol=0.05)
+    checkAllclose(
+        q_ref.reshape(num_tokens, -1),
+        q_out.reshape(num_tokens, -1),
+        msg=f"q  {tag}",
+        rtol=1e-2,
+        atol=0.05,
+    )
+    checkAllclose(
+        k_ref.reshape(num_tokens, -1),
+        k_out.reshape(num_tokens, -1),
+        msg=f"k  {tag}",
+        rtol=1e-2,
+        atol=0.05,
+    )
+    checkAllclose(
+        v_ref.reshape(num_tokens, -1),
+        v_out.reshape(num_tokens, -1),
+        msg=f"v  {tag}",
+        rtol=1e-2,
+        atol=0.05,
+    )
     print(f"[PASS] {tag}", flush=True)
 
 
@@ -2065,10 +2109,16 @@ if __name__ == "__main__":
     # partial rotary tests (Qwen3.5-style: head_size=256, rotary_dim=64)
     print("\n=== Partial Rotary RoPE Tests ===", flush=True)
     for nt in [3, 127, 512]:
-        for (hq, hk) in [(32, 4), (8, 1)]:
-            for (hs, rd) in [(256, 64), (128, 32)]:
+        for hq, hk in [(32, 4), (8, 1)]:
+            for hs, rd in [(256, 64), (128, 32)]:
                 for neox in [True, False]:
                     test_partial_rotary_pts_quant(
-                        torch.bfloat16, nt, hq, hk, hk,
-                        hs, rd, neox,
+                        torch.bfloat16,
+                        nt,
+                        hq,
+                        hk,
+                        hk,
+                        hs,
+                        rd,
+                        neox,
                     )

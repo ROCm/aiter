@@ -507,7 +507,9 @@ def test_mrope_3d_rms_set_kv_shuffle(
         v_cache = v_cache_ref.clone()
         k_cache_ref_flat = k_cache_ref
         v_cache_ref_flat = v_cache_ref
-    kv_loc = torch.randperm(max_positions, device="cuda", dtype=torch.int64)[:num_tokens]
+    kv_loc = torch.randperm(max_positions, device="cuda", dtype=torch.int64)[
+        :num_tokens
+    ]
     k_scale = 1.5
     v_scale = 2.0
 
@@ -728,8 +730,8 @@ mrope_sections_dict = {64: [12, 10, 10], 128: [24, 20, 20], 256: [48, 40, 40]}
 
 # MRoPE sections for partial rotary: sum(section) == rotary_dim / 2
 mrope_partial_sections_dict = {
-    (256, 64): [8, 12, 12],   # Qwen3.5: head_size=256, rotary_dim=64, sum=32
-    (128, 32): [4, 6, 6],     # head_size=128, rotary_dim=32, sum=16
+    (256, 64): [8, 12, 12],  # Qwen3.5: head_size=256, rotary_dim=64, sum=32
+    (128, 32): [4, 6, 6],  # head_size=128, rotary_dim=32, sum=16
 }
 
 if __name__ == "__main__":
@@ -840,7 +842,10 @@ if __name__ == "__main__":
                 for is_neox_style in args.neox_style:
                     for num_token in partial_rotary_tokens:
                         for num_head_q, num_head_kv in partial_rotary_heads:
-                            for (head_size, rotary_dim), mrope_sec in mrope_partial_sections_dict.items():
+                            for (
+                                head_size,
+                                rotary_dim,
+                            ), mrope_sec in mrope_partial_sections_dict.items():
                                 for is_interleaved in args.is_interleaved:
                                     test_mrope_3d_rms_set_kv_shuffle(
                                         args.dtype,
