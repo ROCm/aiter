@@ -902,7 +902,7 @@ def get_2stage_cfgs(
                 kernelName=kernelName1,
                 activation=activation,
                 quant_type=q_type,
-                xbf16=run_1stage_xbf16
+                xbf16=run_1stage_xbf16,
             ),
             None,
             block_m,
