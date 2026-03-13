@@ -54,27 +54,16 @@ def apply_rotary_emb_torch(
 
 
 def apply_rotary_emb_dispatch(
-    x: Tensor, cos: Tensor, sin: Tensor, is_neox_style: bool
+    x: Tensor, cos: Tensor, sin: Tensor, is_neox_style: bool, rotary_dim: int = 0
 ) -> Tensor:
-    """
-    Args:
-        x: [num_tokens, num_heads, head_size]
-        cos: [num_tokens, head_size // 2]
-        sin: [num_tokens, head_size // 2]
-        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
-            positional embeddings.
-    """
+    """Apply rotary embeddings. If rotary_dim > 0 and < head_size, only the
+    first rotary_dim elements are rotated; the rest pass through unchanged."""
+    head_size = x.shape[-1]
+    rd = rotary_dim if rotary_dim > 0 else head_size
+    if rd < head_size:
+        x_rot = apply_rotary_emb_torch(x[..., :rd], cos, sin, is_neox_style)
+        return torch.cat((x_rot, x[..., rd:]), dim=-1)
     return apply_rotary_emb_torch(x, cos, sin, is_neox_style)
-
-
-def apply_partial_rotary_emb(
-    x: Tensor, cos: Tensor, sin: Tensor, rotary_dim: int, is_neox_style: bool
-) -> Tensor:
-    """Apply RoPE only to the first rotary_dim elements, pass through the rest."""
-    x_rot = x[..., :rotary_dim]
-    x_pass = x[..., rotary_dim:]
-    x_rot = apply_rotary_emb_torch(x_rot, cos, sin, is_neox_style)
-    return torch.cat((x_rot, x_pass), dim=-1)
 
 
 @triton.jit
@@ -246,18 +235,12 @@ def run_torch_mrope_3d_rms_set_kv_shuffle(
 
     q_shape = q.shape
     q = q.view(num_tokens, -1, head_size)
-    if rotary_dim_ < head_size:
-        q = apply_partial_rotary_emb(q, cos, sin, rotary_dim_, is_neox_style)
-    else:
-        q = apply_rotary_emb_dispatch(q, cos, sin, is_neox_style)
+    q = apply_rotary_emb_dispatch(q, cos, sin, is_neox_style, rotary_dim_)
     q = q.reshape(q_shape)
 
     k_shape = k.shape
     k = k.view(num_tokens, -1, head_size)
-    if rotary_dim_ < head_size:
-        k = apply_partial_rotary_emb(k, cos, sin, rotary_dim_, is_neox_style)
-    else:
-        k = apply_rotary_emb_dispatch(k, cos, sin, is_neox_style)
+    k = apply_rotary_emb_dispatch(k, cos, sin, is_neox_style, rotary_dim_)
     k = k.reshape(k_shape)
 
     # Quantize k and v for cache storage
