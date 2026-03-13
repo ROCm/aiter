@@ -31,6 +31,7 @@ def ref_paged_attn(
     sliding_window: Optional[int] = None,
     soft_cap: Optional[float] = None,
     sinks: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     output_scale: Optional[torch.Tensor] = None,
@@ -44,6 +45,8 @@ def ref_paged_attn(
     query = query.to(torch.float32)
     key_cache = key_cache.to(torch.float32)
     value_cache = value_cache.to(torch.float32)
+    if q_descale is not None:
+        query = query * q_descale
     if k_descale is not None:
         key_cache = key_cache * k_descale
     if v_descale is not None:
@@ -107,13 +110,13 @@ def ref_paged_attn(
 @pytest.mark.parametrize("soft_cap", [None, 50.0])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize(
-    "q_dtype, kv_dtype, use_kv_descale, use_out_scale",
+    "q_dtype, kv_dtype, use_kv_descale, use_out_scale, use_q_descale",
     [
-        (torch.bfloat16, torch.bfloat16, False, False),
-        (e4m3_dtype, e4m3_dtype, True, True),
-        (e4m3_dtype, e4m3_dtype, True, False),
-        (torch.bfloat16, e4m3_dtype, True, False),
-        (torch.bfloat16, e4m3_dtype, True, False),
+        (torch.bfloat16, torch.bfloat16, False, False, False),
+        (e4m3_dtype, e4m3_dtype, True, True, True),
+        (e4m3_dtype, e4m3_dtype, True, False, True),
+        (torch.bfloat16, e4m3_dtype, True, False, False),
+        (torch.bfloat16, e4m3_dtype, True, False, False),
     ],
 )
 @torch.inference_mode()
@@ -129,6 +132,7 @@ def test_triton_unified_attn(
     kv_dtype: torch.dtype,
     use_kv_descale: bool,
     use_out_scale: bool,
+    use_q_descale: bool,
 ) -> None:
     if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
         pytest.skip("block size must be at least 32 for fp8")
@@ -183,11 +187,15 @@ def test_triton_unified_attn(
     k_descale = None
     v_descale = None
     out_scale = None
+    # QKV are drawn from N(0, 1): no need to calculate the descales from the original tensors
+    # generate random descales for testing
     if use_kv_descale:
         k_descale = torch.rand(1, dtype=torch.float32, device="cuda")
         v_descale = torch.rand(1, dtype=torch.float32, device="cuda")
     if use_out_scale:
         out_scale = 1 / torch.rand(1, dtype=torch.float32, device="cuda")
+    if use_q_descale:
+        q_descale = torch.rand(1, dtype=torch.float32, device="cuda")
 
     unified_attention(
         q=maybe_quantized_query,
@@ -221,6 +229,7 @@ def test_triton_unified_attn(
         sliding_window=sliding_window,
         soft_cap=soft_cap,
         sinks=sinks,
+        q_descale=q_descale,
         k_descale=k_descale,
         v_descale=v_descale,
         output_scale=out_scale,
