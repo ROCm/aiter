@@ -68,10 +68,10 @@ expected format of aiter_dtypes: {
 class AiterTensor(ctypes.Structure):
     _fields_ = [
         ("ptr", ctypes.c_void_p),
-        ("size", ctypes.c_size_t),
+        ("numel_", ctypes.c_size_t),
         ("ndim", ctypes.c_int),
         ("shape", ctypes.c_int64 * 8),
         ("strides", ctypes.c_int64 * 8),
-        ("dtype", ctypes.c_int),
+        ("dtype_", ctypes.c_int),
         ("device_id", ctypes.c_int),
     ]

@@ -913,6 +913,7 @@ def _ctypes_call(func, fc_name, md_name):
         c_func = getattr(lib, fc_name)
         c_func.restype = None
 
+        # declare argument types for ctypes
         hints = typing.get_type_hints(func)
         argtypes = []
         for pname in inspect.signature(func).parameters:
@@ -953,7 +954,7 @@ def _ctypes_call(func, fc_name, md_name):
         aiter_refs = []
         ret_tensor = None
 
-        ### convert arguments
+        ### convert values to ctypes arguments
         for pname, value in bound.arguments.items():
             hint = hints.get(pname)
             origin = typing.get_origin(hint)

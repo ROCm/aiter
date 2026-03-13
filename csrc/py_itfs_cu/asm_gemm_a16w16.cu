@@ -63,8 +63,8 @@ get_heuristic_kernel(int M,
                      std::string arch_id,
                      bool bpreshuffle,
                      int add_bias,
-                     std::optional<int> splitk             = std::nullopt,
-                     std::optional<std::string> kernelName = std::nullopt)
+                     int splitk           = -1,
+                     const char* kernelName = nullptr)
 {
     AITER_CHECK(K % 64 == 0, __func__ << " Kdim must be divisible by 64 !"); // load min size is 128b
     hipDevice_t dev;
@@ -87,10 +87,10 @@ get_heuristic_kernel(int M,
         if(el.first.find(arch_id) != 0)
             continue;
         const auto& cfg = el.second;
-        if(kernelName.has_value() && el.first != (arch_id + kernelName.value()))
+        if(kernelName && el.first != (arch_id + kernelName))
             continue;
         // check specified kernel name
-        if(kernelName.has_value())
+        if(kernelName)
         {
             AITER_CHECK(N % cfg.tileN == 0 && cfg.bPreshuffle == (bpreshuffle ? 1 : 0) &&
                             (add_bias == 0 || cfg.bias == 1),
@@ -100,9 +100,9 @@ get_heuristic_kernel(int M,
                         << ") or bias/preshuffle setting (preshuffle=" << bpreshuffle
                         << ", bias=" << add_bias << ").");
             selectedKernelName = el.first;
-            if(splitk.has_value())
+            if(splitk >= 0)
             {
-                selectedsplitK = splitk.value();
+                selectedsplitK = splitk;
                 selectedsplitK = std::min({selectedsplitK, 16, static_cast<int>(K / cfg.subK)});
                 AITER_CHECK((selectedsplitK > 1 && cfg.splitK == 1) ||
                                 (selectedsplitK <= 1 && cfg.splitK == 0),
@@ -191,20 +191,20 @@ extern "C" __attribute__((visibility("default"))) void gemm_a16w16_asm(AiterTens
                      int          bpreshuffle,
                      hipStream_t  stream)
 {
-    AITER_CHECK(out->dtype == AITER_DTYPE_fp32 || out->dtype == AITER_DTYPE_bf16,
-                "GEMM A16W16 asm only support Float32 or Bf16 output now!");
+    AITER_CHECK(A->dtype() == AITER_DTYPE_bf16 || A->dtype() == AITER_DTYPE_fp16,
+                "GEMM A16W16 asm: A must be Bf16 or Fp16, got " << AiterDtype_to_str(A->dtype()));
+    AITER_CHECK(B->dtype() == AITER_DTYPE_bf16 || B->dtype() == AITER_DTYPE_fp16,
+                "GEMM A16W16 asm: B must be Bf16 or Fp16, got " << AiterDtype_to_str(B->dtype()));
+    AITER_CHECK(out->dtype() == AITER_DTYPE_fp32 || out->dtype() == AITER_DTYPE_bf16,
+                "GEMM A16W16 asm: out must be Float32 or Bf16, got " << AiterDtype_to_str(out->dtype()));
 
     std::string arch_id = get_gpu_arch();
-    int Mdim            = A->shape[0];
-    int Ndim            = B->shape[0];
-    int Kdim            = A->shape[1];
+    int Mdim            = A->size(0);
+    int Ndim            = B->size(0);
+    int Kdim            = A->size(1);
 
     unsigned int SUBM = 32;
     unsigned int SUBN = 64;
-
-    size_t A_elem_size   = AiterDtype_element_size(A->dtype);
-    size_t B_elem_size   = AiterDtype_element_size(B->dtype);
-    size_t out_elem_size = AiterDtype_element_size(out->dtype);
 
     KernelArgs args = {};
     args.ptr_D      = out->ptr;
@@ -214,22 +214,19 @@ extern "C" __attribute__((visibility("default"))) void gemm_a16w16_asm(AiterTens
     args.ptr_Bias   = bias ? bias->ptr : nullptr;
     args.alpha      = 1.0f;
     args.beta       = 0.0f;
-    args.stride_A0  = A->strides[0] * A_elem_size;
-    args.stride_B0  = B->strides[0] * B_elem_size;
-    args.stride_C0 = args.stride_D0 = Ndim * out_elem_size;
+    args.stride_A0  = A->stride(0) * A->element_size();
+    args.stride_B0  = B->stride(0) * B->element_size();
+    args.stride_C0 = args.stride_D0 = Ndim * out->element_size();
     args.M                          = Mdim;
     args.N                          = Ndim;
     args.K                          = Kdim;
-    args.is_out_b16                 = (out->dtype == AITER_DTYPE_bf16) ? 1 : 0;
+    args.is_out_b16                 = (out->dtype() == AITER_DTYPE_bf16) ? 1 : 0;
     args.add_bias                   = bias ? 1 : 0;
 
     CFG* config_map = &cfg_bf16gemm_fp32bf16;
 
-    std::optional<int> optSplitK = splitK >= 0 ? std::optional<int>(splitK) : std::nullopt;
-    std::optional<std::string> optKernelName = kernelName ? std::optional<std::string>(kernelName) : std::nullopt;
-
     auto [name, split] = get_heuristic_kernel(
-        Mdim, Ndim, Kdim, config_map, arch_id, bpreshuffle, args.add_bias, optSplitK, optKernelName);
+        Mdim, Ndim, Kdim, config_map, arch_id, bpreshuffle, args.add_bias, splitK, kernelName);
     args.splitk              = split;
     AiterAsmKernel* impl_ptr = get_or_load_kernel(name, config_map, SUBM, SUBN);
     hipSetDevice(A->device_id);
@@ -242,7 +239,7 @@ extern "C" __attribute__((visibility("default"))) void gemm_a16w16_asm(AiterTens
     {
         AITER_CHECK(gdx * gdy <= 1024, __func__ << " gdx * gdy (" << gdx * gdy << ") must be <= 16*64");
     }
-    if(split > 1 && semaphore->size > 0)
+    if(split > 1 && semaphore->numel() > 0)
     {
         args.ptr_semaphore = semaphore->ptr;
     }
