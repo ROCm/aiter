@@ -102,7 +102,8 @@ def k_scale_process(
         k_descale_ptr = (
             K_Descale
             + physical_block_idx * stride_k_cache_scale_0
-            + kv_head_idx * stride_k_cache_scale_1
+            + seq_offset % BLOCK_SIZE * stride_k_cache_scale_1
+            + kv_head_idx * stride_k_cache_scale_2
         )
         return tl.load(k_descale_ptr)
     elif SAGE_VERSION == 2: # SAGE mxfp4
@@ -166,9 +167,9 @@ def kernel_unified_attention_2d(
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
     scale: tl.constexpr,  # float32
-    q_scale,  # None if fp8 quant, [num_tokens // BLOCK_M, num_kv_heads] if sage, [num_tokens, num_kv_heads, head_size // 32] if sage_mxfp4
-    k_scale,  # float32 if fp8 quant, [num_blks, num_kv_heads] if sage, [num_blks, blk_size, num_kv_heads, head_size // 32] if sage_mxfp4
-    v_scale,  # float32 if fp8 quant, [num_kv_heads, head_size] if sage or sage_mxfp4
+    q_scale,  # [num_tokens // BLOCK_M, num_kv_heads] if sage, [num_tokens, num_kv_heads, head_size // 32] if sage_mxfp4
+    k_scale,  # [num_blks, tl.cdiv(block_size, TILE_SIZE), num_kv_heads] if sage, [num_blks, blk_size, num_kv_heads, head_size // 32] if sage_mxfp4
+    v_scale,  # [num_kv_heads, head_size] if sage or sage_mxfp4
     out_scale,  # float32
     softcap,  # float32
     num_query_heads: tl.constexpr,  # int
