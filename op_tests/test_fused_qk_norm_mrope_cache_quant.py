@@ -220,7 +220,7 @@ def run_torch_mrope_3d_rms_set_kv_shuffle(
     k = k_by_head.view(k.shape)
 
     # Infer max_positions from cos_sin shape
-    cos_sin_dim = rotary_dim_ if not is_mrope else head_size
+    cos_sin_dim = rotary_dim_
     max_positions = (
         cos_sin.shape[0] // cos_sin_dim if cos_sin.ndim == 1 else cos_sin.shape[0]
     )
@@ -246,7 +246,7 @@ def run_torch_mrope_3d_rms_set_kv_shuffle(
 
     q_shape = q.shape
     q = q.view(num_tokens, -1, head_size)
-    if rotary_dim_ < head_size and not is_mrope:
+    if rotary_dim_ < head_size:
         q = apply_partial_rotary_emb(q, cos, sin, rotary_dim_, is_neox_style)
     else:
         q = apply_rotary_emb_dispatch(q, cos, sin, is_neox_style)
@@ -254,7 +254,7 @@ def run_torch_mrope_3d_rms_set_kv_shuffle(
 
     k_shape = k.shape
     k = k.view(num_tokens, -1, head_size)
-    if rotary_dim_ < head_size and not is_mrope:
+    if rotary_dim_ < head_size:
         k = apply_partial_rotary_emb(k, cos, sin, rotary_dim_, is_neox_style)
     else:
         k = apply_rotary_emb_dispatch(k, cos, sin, is_neox_style)
@@ -389,6 +389,7 @@ def run_fused_mrope_3d_rms_set_kv_shuffle(
             use_shuffle_layout,
             block_size,
             x,
+            rotary_dim,
         )
     else:
         aiter.fused_qk_norm_rope_cache_pts_quant_shuffle(
@@ -442,7 +443,7 @@ def test_mrope_3d_rms_set_kv_shuffle(
     rotary_dim=0,  # Partial rotary dim (0 = full rotary = head_size)
 ):
     rotary_dim_ = rotary_dim if rotary_dim > 0 else head_size
-    cos_sin_dim = rotary_dim_ if not is_mrope else head_size
+    cos_sin_dim = rotary_dim_
     qkv = torch.randn(
         (num_tokens, num_heads_q + num_heads_k + num_heads_v, head_size),
         dtype=dtype,
@@ -506,9 +507,7 @@ def test_mrope_3d_rms_set_kv_shuffle(
         v_cache = v_cache_ref.clone()
         k_cache_ref_flat = k_cache_ref
         v_cache_ref_flat = v_cache_ref
-    kv_loc = torch.randint(
-        0, max_positions, (num_tokens,), dtype=torch.int64, device="cuda"
-    )
+    kv_loc = torch.randperm(max_positions, device="cuda", dtype=torch.int64)[:num_tokens]
     k_scale = 1.5
     v_scale = 2.0
 
@@ -727,12 +726,21 @@ parser.add_argument(
 
 mrope_sections_dict = {64: [12, 10, 10], 128: [24, 20, 20], 256: [48, 40, 40]}
 
+# MRoPE sections for partial rotary: sum(section) == rotary_dim / 2
+mrope_partial_sections_dict = {
+    (256, 64): [8, 12, 12],   # Qwen3.5: head_size=256, rotary_dim=64, sum=32
+    (128, 32): [4, 6, 6],     # head_size=128, rotary_dim=32, sum=16
+}
+
 if __name__ == "__main__":
     args = parser.parse_args()
     kv_cache_dtypes = [torch.bfloat16, torch.float8_e4m3fn, torch.float8_e4m3fnuz]
     test_return_kv_flags = [True, False]
     use_shuffle_layouts = [True]  # Test both normal and shuffle layouts
     page_sizes = [16]  # Test two page sizes for shuffle layout
+    partial_rotary_configs = [(256, 64), (128, 32)]
+    partial_rotary_tokens = [3, 127, 512]
+    partial_rotary_heads = [(32, 4), (8, 2)]
 
     for kv_cache_dtype in kv_cache_dtypes:
         for test_return_kv in test_return_kv_flags:
@@ -795,9 +803,6 @@ if __name__ == "__main__":
 
     # Partial rotary tests (Qwen3.5-style: head_size=256, rotary_dim=64)
     print("\n=== Partial Rotary RoPE Tests (non-mrope) ===", flush=True)
-    partial_rotary_configs = [(256, 64), (128, 32)]
-    partial_rotary_tokens = [3, 127, 512]
-    partial_rotary_heads = [(32, 4), (8, 2)]
     for kv_cache_dtype in kv_cache_dtypes:
         for use_shuffle_layout in use_shuffle_layouts:
             page_size_list = page_sizes if use_shuffle_layout else [0]
@@ -825,3 +830,34 @@ if __name__ == "__main__":
                                     max_positions=args.max_positions,
                                     rotary_dim=rotary_dim,
                                 )
+
+    # MRoPE + Partial rotary tests (Qwen3.5 multimodal: head_size=256, rotary_dim=64)
+    print("\n=== Partial Rotary MRoPE Tests ===", flush=True)
+    for kv_cache_dtype in kv_cache_dtypes:
+        for use_shuffle_layout in use_shuffle_layouts:
+            page_size_list = page_sizes if use_shuffle_layout else [0]
+            for page_size in page_size_list:
+                for is_neox_style in args.neox_style:
+                    for num_token in partial_rotary_tokens:
+                        for num_head_q, num_head_kv in partial_rotary_heads:
+                            for (head_size, rotary_dim), mrope_sec in mrope_partial_sections_dict.items():
+                                for is_interleaved in args.is_interleaved:
+                                    test_mrope_3d_rms_set_kv_shuffle(
+                                        args.dtype,
+                                        num_token,
+                                        num_head_q,
+                                        num_head_kv,
+                                        num_head_kv,
+                                        head_size,
+                                        is_neox_style,
+                                        mrope_sec,
+                                        is_interleaved,
+                                        eps=1e-6,
+                                        is_mrope=True,
+                                        kv_cache_dtype=kv_cache_dtype,
+                                        test_return_kv=True,
+                                        use_shuffle_layout=use_shuffle_layout,
+                                        page_size=page_size,
+                                        max_positions=args.max_positions,
+                                        rotary_dim=rotary_dim,
+                                    )

@@ -4634,24 +4634,26 @@ __device__ __forceinline__ void mrope_load_cos_sin_vec(vec_t<T, VEC_SIZE>& out,
                                                        int64_t token_id,
                                                        int64_t num_tokens,
                                                        int access_id_in_head,
-                                                       std::array<int64_t, M>& mrope_section)
+                                                       std::array<int64_t, M>& mrope_section,
+                                                       int rotary_dim = 0)
 {
-    constexpr int HALF_HEAD_SIZE = HEAD_SIZE / 2;
+    const int rd   = rotary_dim > 0 ? rotary_dim : HEAD_SIZE;
+    const int half = rd / 2;
     if constexpr(IS_INTERLEAVED)
     {
         for(int i = 0; i < VEC_SIZE; ++i)
         {
             auto id   = access_id_in_head + i;
-            auto id_  = (access_id_in_head < HALF_HEAD_SIZE) ? id : id - HALF_HEAD_SIZE;
+            auto id_  = (access_id_in_head < half) ? id : id - half;
             auto mid_ = id_ % M;
             if(mid_ >= 1 && id_ < mrope_section[mid_] * M)
             {
                 auto p = positions[mid_ * ps0 + token_id * ps1];
-                out[i] = cos_sin[p * HEAD_SIZE + id];
+                out[i] = cos_sin[p * rd + id];
             }
             else
             {
-                out[i] = cos_sin[positions[token_id * ps1] * HEAD_SIZE + id];
+                out[i] = cos_sin[positions[token_id * ps1] * rd + id];
             }
         }
     }
@@ -4660,7 +4662,7 @@ __device__ __forceinline__ void mrope_load_cos_sin_vec(vec_t<T, VEC_SIZE>& out,
         for(int i = 0; i < VEC_SIZE; ++i)
         {
             auto id  = access_id_in_head + i;
-            auto id_ = (access_id_in_head < HALF_HEAD_SIZE) ? id : id - HALF_HEAD_SIZE;
+            auto id_ = (access_id_in_head < half) ? id : id - half;
             int mid;
             int end = 0;
             for(mid = 0; mid < M; ++mid)
@@ -4670,7 +4672,7 @@ __device__ __forceinline__ void mrope_load_cos_sin_vec(vec_t<T, VEC_SIZE>& out,
                     break;
             }
             auto p = positions[mid * ps0 + token_id * ps1];
-            out[i] = cos_sin[p * HEAD_SIZE + id];
+            out[i] = cos_sin[p * rd + id];
         }
     }
 }
@@ -4877,16 +4879,20 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
             vec_t<T, VEC_SIZE> cos_sin_vec;
             if constexpr(IS_MROPE)
             {
-                mrope_load_cos_sin_vec<T, VEC_SIZE, HEAD_SIZE, IS_INTERLEAVED, M>(
-                    cos_sin_vec,
-                    cos_sin,
-                    positions,
-                    positions_stride_0,
-                    positions_stride_1,
-                    token_id,
-                    num_tokens,
-                    access_id_in_head,
-                    mrope_section);
+                if(in_rotary)
+                {
+                    mrope_load_cos_sin_vec<T, VEC_SIZE, HEAD_SIZE, IS_INTERLEAVED, M>(
+                        cos_sin_vec,
+                        cos_sin,
+                        positions,
+                        positions_stride_0,
+                        positions_stride_1,
+                        token_id,
+                        num_tokens,
+                        access_id_in_head,
+                        mrope_section,
+                        rotary_dim_);
+                }
             }
             else
             {
@@ -4939,26 +4945,31 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
             vec_t<T, VEC_SIZE> cos_vec, sin_vec;
             if constexpr(IS_MROPE)
             {
-                mrope_load_cos_sin_vec<T, VEC_SIZE, HEAD_SIZE, IS_INTERLEAVED, M>(
-                    cos_vec,
-                    cos_sin,
-                    positions,
-                    positions_stride_0,
-                    positions_stride_1,
-                    token_id,
-                    num_tokens,
-                    access_id_in_head / 2,
-                    mrope_section);
-                mrope_load_cos_sin_vec<T, VEC_SIZE, HEAD_SIZE, IS_INTERLEAVED, M>(
-                    sin_vec,
-                    cos_sin,
-                    positions,
-                    positions_stride_0,
-                    positions_stride_1,
-                    token_id,
-                    num_tokens,
-                    access_id_in_head / 2 + HALF_HEAD_SIZE,
-                    mrope_section);
+                if(in_rotary)
+                {
+                    mrope_load_cos_sin_vec<T, VEC_SIZE, HEAD_SIZE, IS_INTERLEAVED, M>(
+                        cos_vec,
+                        cos_sin,
+                        positions,
+                        positions_stride_0,
+                        positions_stride_1,
+                        token_id,
+                        num_tokens,
+                        access_id_in_head / 2,
+                        mrope_section,
+                        rotary_dim_);
+                    mrope_load_cos_sin_vec<T, VEC_SIZE, HEAD_SIZE, IS_INTERLEAVED, M>(
+                        sin_vec,
+                        cos_sin,
+                        positions,
+                        positions_stride_0,
+                        positions_stride_1,
+                        token_id,
+                        num_tokens,
+                        access_id_in_head / 2 + half_rotary,
+                        mrope_section,
+                        rotary_dim_);
+                }
             }
             else
             {
@@ -5090,11 +5101,14 @@ void fused_mrope_rms_set_kv(const T* qkv,
                             KVT* v_out               = nullptr,
                             bool use_shuffle_layout  = false,
                             int64_t block_size       = 0,
-                            int64_t x                = 0)
+                            int64_t x                = 0,
+                            int64_t rotary_dim       = 0)
 {
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     auto dim = std::accumulate(mrope_section.begin(), mrope_section.end(), 0);
-    TORCH_CHECK(dim == head_size / 2);
+    auto expected_half = rotary_dim > 0 ? rotary_dim / 2 : head_size / 2;
+    TORCH_CHECK(dim == expected_half,
+                "mrope_section sum (", dim, ") must equal rotary_dim/2 (", expected_half, ")");
     constexpr int THREAD_BLOCK_SIZE = 256;
     auto total_warps                = num_tokens * (num_heads_q + num_heads_k + num_heads_v);
     auto num_warps_per_block        = THREAD_BLOCK_SIZE / WARP_SIZE;
@@ -5129,7 +5143,8 @@ void fused_mrope_rms_set_kv(const T* qkv,
                                                         v_out,                       \
                                                         use_shuffle_layout,          \
                                                         block_size,                  \
-                                                        x);                          \
+                                                        x,                           \
+                                                        (int)rotary_dim);            \
     }                                                                                \
     else                                                                             \
     {                                                                                \
@@ -5158,7 +5173,8 @@ void fused_mrope_rms_set_kv(const T* qkv,
                                                         v_out,                       \
                                                         use_shuffle_layout,          \
                                                         block_size,                  \
-                                                        x);                          \
+                                                        x,                           \
+                                                        (int)rotary_dim);            \
     }
 
     if(is_interleaved)
