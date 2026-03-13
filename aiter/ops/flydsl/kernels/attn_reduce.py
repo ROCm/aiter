@@ -399,14 +399,14 @@ def kn_attn_reduce_ps(
         )
         reduce_tile_start = vector.extract(reduce_tile_range, [0])
         reduce_tile_end = vector.extract(reduce_tile_range, [1])
-        if reduce_tile_start == last_reduce_tile:
-            return False
-        else:
+
+        ret = reduce_tile_start != last_reduce_tile
+        if ret:
             num_splits = reduce_tile_end - reduce_tile_start
             # if num_splits >= MASSIVE_THRESHOLD:
             if False:
                 pass
-            else:
+            elif num_splits > 1:
                 attn_reduce_simple(
                     reduce_final_map_rsrc,
                     reduce_partial_map_rsrc,
@@ -429,19 +429,19 @@ def kn_attn_reduce_ps(
                     reduce_tile_start,
                     reduce_tile_end,
                 )
-            return True
+        return ret
 
     work_idx = arith.index_cast(T.i32, gpu.block_id("x"))
     if work_idx < total_wg_cnt:
         continue_flag = main_loop(work_idx)
         if continue_flag:
-            work_idx += gpu.grid_dim("x")
+            work_idx += gpu.grid_dim.x
             while work_idx < total_wg_cnt:
                 gpu.barrier()
                 continue_flag = main_loop(work_idx)
                 if not continue_flag:
                     break
-                work_idx += gpu.grid_dim("x")
+                work_idx += gpu.grid_dim.x
 
 
 @flyc.jit
