@@ -262,7 +262,7 @@ __device__ void scaled_quant_impl(DTYPE_O* __restrict__ out,
 {
 
     const float inverted_scale =
-        std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? (*scale) : 1.0f / (*scale);
+        std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? (*scale) : __builtin_amdgcn_rcpf(*scale);
     static constexpr int32_t vec_size_i = 16 / sizeof(DTYPE_O);
     static constexpr int32_t vec_size_o =
         std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? vec_size_i / 2 : vec_size_i;
@@ -336,13 +336,13 @@ __device__ void scaled_quant_vgpr_impl(DTYPE_O* __restrict__ out,
 {
 
     const float inverted_scale =
-        std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? (*scale) : 1.0f / (*scale);
+        std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? (*scale) : __builtin_amdgcn_rcpf(*scale);
     static constexpr int32_t vec_size_i = thread_data_size;
     static constexpr int32_t vec_size_o =
         std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? vec_size_i / 2 : vec_size_i;
 
-    using vec_i       = ck_tile::vec_t<DTYPE_I, vec_size_i>;
-    using DTYPE_STORE = typename ck_tile::vector_traits<DTYPE_O>::scalar_type;
+    using vec_i       = opus::vector_t<DTYPE_I, vec_size_i>;
+    using DTYPE_STORE = std::conditional_t<std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>, uint8_t, DTYPE_O>;
 
     auto const* ptr_i               = reinterpret_cast<DTYPE_I const*>(input);
     auto const* input_vecs          = reinterpret_cast<vec_i const*>(ptr_i);
@@ -355,33 +355,12 @@ __device__ void scaled_quant_vgpr_impl(DTYPE_O* __restrict__ out,
     const int32_t oob_i             = (cols + ooba_i - 1) / ooba_i * ooba_i;
     const int32_t oob_o             = (cols + ooba_o - 1) / ooba_o * ooba_o;
 
-    auto buffer_o = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_o, oob_o);
-    buffer_o.init_raw();
-
+    auto buffer_o = opus::make_gmem<DTYPE_STORE>(ptr_o, oob_o * sizeof(DTYPE_STORE));
     const int32_t num_vecs = (cols + vec_size_i - 1) / vec_size_i;
 
     if(threadIdx.x < num_vecs)
     {
-        auto out = ck_tile::vec_convert<DTYPE_O, DTYPE_I, vec_size_i>(*input_vecs, inverted_scale)
-                       .template get_as<DTYPE_STORE>();
-        if constexpr(vec_size_i <= 16)
-        {
-
-            buffer_o.template set(threadIdx.x * vec_size_o, 0, true, out);
-        }
-        else
-        {
-            static constexpr int32_t o_step = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? 8 : 16;
-            assert(vec_size_i % 16 == 0);
-            using vecT                        = ck_tile::vec_t<DTYPE_STORE, o_step>;
-            auto vec                          = out.template get_as<vecT>();
-            static constexpr int32_t num_iter = vec_size_i / 16;
-
-            for(size_t j = 0; j < num_iter; j++)
-            {
-                buffer_o.template set(threadIdx.x * vec_size_o + j * o_step, 0, true, vec[j]);
-            }
-        }
+        store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT, false, 1, DTYPE_O>(buffer_o, *input_vecs, threadIdx.x * vec_size_o, inverted_scale);
     }
 }
 
@@ -451,8 +430,7 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
         thread_data_size == 0 ? 16 / sizeof(DTYPE_O) : thread_data_size;
     static constexpr int32_t vec_size_o =
         std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? vec_size_i / 2 : vec_size_i;
-    using vec_i = ck_tile::vec_t<DTYPE_I, vec_size_i>;
-    using vec_s = ck_tile::vec_t<float, vec_size_i>;
+    using vec_s = opus::vector_t<float, vec_size_i>;
     const float inverted_DTYPE_MAX =
         std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
             ? 0.25
@@ -460,9 +438,7 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
 
     auto const* ptr_smscale = reinterpret_cast<float const*>(smooth_scale + smscale_map_idx * cols);
     auto const* smscale_vecs = reinterpret_cast<vec_s const*>(ptr_smscale);
-    auto buffer_s =
-        ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_smscale, cols);
-    buffer_s.init_raw();
+    auto buffer_s = opus::make_gmem<float>(ptr_smscale, cols * sizeof(float));
 
     const int32_t num_vecs = (cols + vec_size_i - 1) / vec_size_i;
     vec_s smscale_cur;
@@ -470,7 +446,7 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
     float absMax   = 1e-10f;
     if(vec_idx < num_vecs)
     {
-        smscale_cur = buffer_s.template get<vec_s>(vec_idx * vec_size_i, 0, true);
+        smscale_cur = load_vector_nbytes<float, thread_data_size, 16>(buffer_s, vec_idx * vec_size_i);
 #pragma unroll
         for(size_t j = 0; j < vec_size_i; j++)
         {
@@ -1230,12 +1206,6 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ o
         thread_data_size == 0 ? 16 / sizeof(DTYPE_I) : thread_data_size;
     static constexpr int32_t load_chunk_bytes = 
         (sizeof(DTYPE_I) * vec_size_i % 16 == 0 ? 16 : (sizeof(DTYPE_I) * vec_size_i % 8 == 0 ? 8 : 4));
-    using vec_i = opus::vector_t<DTYPE_I, vec_size_i>;
-    using vec_f = opus::vector_t<float, vec_size_i>;
-    vec_f vec_input_f;
-    float* input_f_ptr = reinterpret_cast<float*>(&vec_input_f);
-    auto buffer_input = opus::make_gmem<DTYPE_I>(input + (int64_t)token_idx * (int64_t)input_stride, cols * sizeof(DTYPE_I));
-    vec_i vec_input = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes, RT>(buffer_input, threadIdx.x * vec_size_i);
     if constexpr(has_smscale_hash)
     {
         auto buffer_hash = opus::make_gmem<int>(smooth_scale_map_hash, smooth_scale_map_hash_size * sizeof(int));
@@ -1255,11 +1225,13 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ o
     int smscale_map_idx_list = 0;
     auto buffer_map = opus::make_gmem<int>(smooth_scale_map + token_idx * m_repeat, m_repeat * sizeof(int));
     smscale_map_idx_list = buffer_map.load(lane_idx)[0];
-    for(int i = 0; i < vec_size_i; i++)
-    {
-        vec_input_f[i] = ck_tile::type_convert<float>(vec_input[i]);
-    }
-    opus::s_waitcnt_vmcnt(opus::number<0>{});
+    using vec_i = opus::vector_t<DTYPE_I, vec_size_i>;
+    using vec_f = opus::vector_t<float, vec_size_i>;
+    vec_f vec_input_f;
+    float* input_f_ptr = reinterpret_cast<float*>(&vec_input_f);
+    auto buffer_input = opus::make_gmem<DTYPE_I>(input + (int64_t)token_idx * (int64_t)input_stride, cols * sizeof(DTYPE_I));
+    vec_i vec_input = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes, RT>(buffer_input, threadIdx.x * vec_size_i);
+    opus::s_waitcnt_vmcnt(opus::number<vec_size_i * sizeof(DTYPE_I) / load_chunk_bytes>{});
     __syncthreads();
     if constexpr(has_smscale_hash)
     {
@@ -1267,6 +1239,10 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ o
         {
             smscale_map_idx_list = smooth_scale_map_hash_shared[smscale_map_idx_list];
         }
+    }
+    for(int i = 0; i < vec_size_i; i++)
+    {
+        vec_input_f[i] = ck_tile::type_convert<float>(vec_input[i]);
     }
     for(int i = 0; i < m_repeat; i++)
     {
