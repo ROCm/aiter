@@ -56,7 +56,7 @@ jobs:
   # Step 2: matrix jobs consume shard file lists
   triton:
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
-    name: Triton Tests (1 GPU) / Shard ${{ matrix.shard }}
+    name: Triton Tests (1 GPU, ${{ matrix.label }}) / Shard ${{ matrix.shard }}
     runs-on: ${{ matrix.runner }}
     needs: [split_triton_tests, check-signal]
     strategy:
