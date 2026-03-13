@@ -45,12 +45,12 @@ def torch_to_aiter(tensor: torch.Tensor) -> AiterTensor:
 
     at = AiterTensor()
     at.ptr = tensor.data_ptr()
-    at.size = tensor.numel()
+    at.numel_ = tensor.numel()
     at.ndim = tensor.ndim
     for i in range(tensor.ndim):
         at.shape[i] = tensor.shape[i]
         at.strides[i] = tensor.stride(i)
-    at.dtype = _torch_to_aiter_dtype[tensor.dtype]
+    at.dtype_ = _torch_to_aiter_dtype[tensor.dtype]
     at.device_id = tensor.device.index or 0
     return at
 
