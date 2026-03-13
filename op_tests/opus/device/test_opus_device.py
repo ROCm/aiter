@@ -85,6 +85,20 @@ class OpusDeviceLib:
             int(C.stride(0)),
         )
 
+    # -- MFMA swap_ab_swizzle_b (swz_b): B row swizzle + C fp16x8 store
+    def run_mfma_swz_b(self, A, B, C, variant):
+        fn = getattr(self._lib, f"run_mfma_swz_b_{variant}")
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _VP, _I, _I, _I]
+        fn(
+            self._ptr(A),
+            self._ptr(B),
+            self._ptr(C),
+            int(A.stride(0)),
+            int(B.stride(0)),
+            int(C.stride(0)),
+        )
+
     # -- MXFP --
     def run_mxfp(self, A, B, C, variant, scale_a=127, scale_b=127):
         fn = getattr(self._lib, f"run_{variant}")
@@ -264,6 +278,42 @@ def _test_mfma_variant(mod, variant, M, N, K, dtype, supported_archs):
     return 0
 
 
+def _test_mfma_swz_b_variant(mod, variant, M, N, K, dtype, supported_archs):
+    """Test a single mfma_adaptor_swap_ab_swizzle_b variant (B swizzle + C fp16x8 store)."""
+    arch = _get_gpu_arch()
+    if arch not in supported_archs:
+        print(f"  SKIP: mfma_swz_b_{variant} requires {supported_archs}, got '{arch}'")
+        return 0
+
+    device = torch.device("cuda")
+    torch.manual_seed(12345)
+    A = torch.randint(-10, 11, (M, K), device=device).to(dtype)
+    B = torch.randint(-10, 11, (N, K), device=device).to(dtype)
+    C = torch.empty(M, N, device=device, dtype=dtype)
+
+    mod.run_mfma_swz_b(A, B, C, variant)
+
+    C_ref = torch.mm(A.float(), B.float().t()).to(dtype)
+    atol, rtol = 1e-3, 1e-3
+    ok = torch.allclose(C.float(), C_ref.float(), atol=atol, rtol=rtol)
+    max_diff = (C.float() - C_ref.float()).abs().max().item()
+    if not ok:
+        diff_count = (
+            (C.float() - C_ref.float())
+            .abs()
+            .gt(atol + rtol * C_ref.float().abs())
+            .sum()
+            .item()
+        )
+        print(
+            f"  FAIL: mfma_swz_b_{variant} max_diff={max_diff:.4f}, "
+            f"{diff_count} elements outside tol"
+        )
+        return 1
+    print(f"  PASS: mfma_swz_b_{variant}, max_diff={max_diff:.4f}")
+    return 0
+
+
 def test_mfma_32x32x2_f32(mod):
     """Test MFMA 32x32x2 fp32 kernel (gfx942 + gfx950)."""
     return _test_mfma_variant(
@@ -331,6 +381,34 @@ def test_mfma_16x16x32_bf16(mod):
     """Test MFMA 16x16x32 bf16 kernel (gfx942 step_k + gfx950 native)."""
     return _test_mfma_variant(
         mod, "16x16x32_bf16", 16, 16, 32, torch.bfloat16, _MFMA_ARCHS_GFX942_GFX950
+    )
+
+
+def test_mfma_swz_b_32x32x8_f16(mod):
+    """Test mfma_adaptor_swap_ab_swizzle_b 32x32x8 fp16 (gfx942)."""
+    return _test_mfma_swz_b_variant(
+        mod, "32x32x8_f16", 32, 32, 8, torch.float16, _MFMA_ARCHS_GFX942
+    )
+
+
+def test_mfma_swz_b_32x32x8_bf16(mod):
+    """Test mfma_adaptor_swap_ab_swizzle_b 32x32x8 bf16 (gfx942)."""
+    return _test_mfma_swz_b_variant(
+        mod, "32x32x8_bf16", 32, 32, 8, torch.bfloat16, _MFMA_ARCHS_GFX942
+    )
+
+
+def test_mfma_swz_b_32x32x16_f16(mod):
+    """Test mfma_adaptor_swap_ab_swizzle_b 32x32x16 fp16 (gfx942 step_k + gfx950)."""
+    return _test_mfma_swz_b_variant(
+        mod, "32x32x16_f16", 32, 32, 16, torch.float16, _MFMA_ARCHS_GFX942_GFX950
+    )
+
+
+def test_mfma_swz_b_32x32x16_bf16(mod):
+    """Test mfma_adaptor_swap_ab_swizzle_b 32x32x16 bf16 (gfx942 step_k + gfx950)."""
+    return _test_mfma_swz_b_variant(
+        mod, "32x32x16_bf16", 32, 32, 16, torch.bfloat16, _MFMA_ARCHS_GFX942_GFX950
     )
 
 
@@ -1370,6 +1448,10 @@ def main():
     failures += test_mfma_32x32x16_bf16(mod)
     failures += test_mfma_16x16x32_f16(mod)
     failures += test_mfma_16x16x32_bf16(mod)
+    failures += test_mfma_swz_b_32x32x8_f16(mod)
+    failures += test_mfma_swz_b_32x32x8_bf16(mod)
+    failures += test_mfma_swz_b_32x32x16_f16(mod)
+    failures += test_mfma_swz_b_32x32x16_bf16(mod)
     failures += test_mfma_32x32x16_fp8(mod)
     failures += test_mfma_32x32x16_bf8(mod)
     failures += test_mfma_16x16x32_fp8(mod)

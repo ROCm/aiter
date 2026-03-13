@@ -169,6 +169,9 @@ auto mma = make_mfma<fp16_t, fp16_t, fp32_t>(32_I, 32_I, 8_I);
 // 32x32x8 f16 matrix core, with A/B swapped
 auto mma = make_mfma<fp16_t, fp16_t, fp32_t>(32_I, 32_I, 8_I, mfma_adaptor_swap_ab{});
 
+// 32x32x8 f16 with swap_ab + B row swizzle for larger C vector size
+auto mma = make_mfma<fp16_t, fp16_t, fp32_t>(32_I, 32_I, 8_I, mfma_adaptor_swap_ab_swizzle_b{});
+
 // 2x2 warp GEMM of 16x16x16 MFMA, A/B swapped, each wave repeats 2x along M
 // Block tile: 64x32x16
 auto mma = make_tiled_mma<fp16_t, fp16_t, fp32_t>(seq<2, 1, 1>{}, seq<2, 2, 1>{}, seq<16, 16, 16>{}, mfma_adaptor_swap_ab{});
