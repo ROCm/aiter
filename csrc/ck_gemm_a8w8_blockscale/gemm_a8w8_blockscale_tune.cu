@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (c) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+#include <cmath>
+#include <functional>
+#include <unordered_map>
+
+#include <torch/extension.h>
 
 #include <cmath>
 #include <functional>
