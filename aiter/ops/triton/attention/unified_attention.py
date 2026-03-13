@@ -406,6 +406,28 @@ def unified_attention(
             device=q.device,
         )
 
+        TILE_SIZE=config["TILE_SIZE"]
+        (
+            query_scale_stride_0,
+            query_scale_stride_1,
+            query_scale_stride_2,
+            stride_k_cache_scale_0,
+            stride_k_cache_scale_1,
+            stride_k_cache_scale_2,
+            stride_k_cache_scale_3,
+            stride_v_cache_scale_0,
+            stride_v_cache_scale_1 
+        ) = check_quant_args_get_strides(
+            q,
+            q_descale,
+            k,
+            k_descale,
+            v_descale,
+            BLOCK_M,
+            BLOCK_SIZE=block_size,
+            TILE_SIZE=TILE_SIZE,
+            sage_version=sage_version
+        )
         kernel_unified_attention_3d[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,
@@ -419,6 +441,7 @@ def unified_attention(
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
             scale=softmax_scale,
+            q_scale=q_descale,
             k_scale=k_descale,
             v_scale=v_descale,
             softcap=softcap,
@@ -427,6 +450,9 @@ def unified_attention(
             block_table_stride=block_table.stride(0),
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
+            query_scale_stride_0=query_scale_stride_0,
+            query_scale_stride_1=query_scale_stride_1,
+            query_scale_stride_2=query_scale_stride_2,
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
             BLOCK_SIZE=block_size,
             HEAD_SIZE=head_size,
@@ -444,11 +470,18 @@ def unified_attention(
             stride_v_cache_1=v.stride(1),
             stride_v_cache_2=v.stride(2),
             stride_v_cache_3=v.stride(3),
+            stride_k_cache_scale_0=stride_k_cache_scale_0,
+            stride_k_cache_scale_1=stride_k_cache_scale_1,
+            stride_k_cache_scale_2=stride_k_cache_scale_2,
+            stride_k_cache_scale_3=stride_k_cache_scale_3,
+            stride_v_cache_scale_0=stride_v_cache_scale_0,
+            stride_v_cache_scale_1=stride_v_cache_scale_1,
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             ALL_DECODE=ALL_DECODE,
+            SAGE_VERSION=sage_version,
             **attn_config,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
