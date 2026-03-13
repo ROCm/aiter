@@ -533,6 +533,32 @@ def test_mla(
         dtype_kv=kvtype,
     )
 
+    # Print metadata tensors
+    valid_work_cnt = valid_work_cnt = work_indptr[-1].item()
+    valid_batch_size = batch_size * (
+        (nhead // 16)
+        if (nhead != 128 and nhead % 16 == 0)
+        else (nhead + 128 - 1) // 128
+    )
+    valid_reduce_partial_cnt = reduce_indptr[valid_batch_size].item()
+
+    # print(f"seq_lens_kv({seq_lens_kv.shape}):")
+    # print(seq_lens_kv)
+    # print(f"kv_indptr({kv_indptr.shape}):")
+    # print(kv_indptr)
+    # print(f"kv_indices({kv_indices.shape}):")
+    # print(kv_indices)
+    print(f"work_indptr({work_indptr.shape}):")
+    print(work_indptr)
+    print(f"work_info_set({work_info_set.shape}.{valid_work_cnt}):")
+    print(work_info_set[:valid_work_cnt])
+    print(f"reduce_indptr({valid_batch_size + 1}):")
+    print(reduce_indptr[: valid_batch_size + 1])
+    print(f"reduce_final_map({valid_batch_size}):")
+    print(reduce_final_map[:valid_batch_size])
+    print(f"reduce_partial_map({reduce_partial_map.shape}.{valid_reduce_partial_cnt}):")
+    print(reduce_partial_map[:valid_reduce_partial_cnt])
+
     def test_absorb_decode_bf16_fp8():
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
         kv_buffer_fp8 = kv_buffer.to(kvtype)
@@ -654,8 +680,32 @@ def test_mla(
             kv_scale=kv_scale,
         )
 
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
-            aiter.mla.mla_decode_fwd,
+        # (attn_logits, attn_lse), us_asm_decode = run_perftest(
+        #     aiter.mla.mla_decode_fwd,
+        #     q_fp8 if dtype == dtypes.fp8 else q,
+        #     kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
+        #     out_asm,
+        #     qo_indptr,
+        #     kv_indptr,
+        #     kv_indices,
+        #     kv_last_page_lens,
+        #     max_seqlen_qo,
+        #     page_size,
+        #     nhead_kv,
+        #     sm_scale,
+        #     num_kv_splits=max_split_per_batch,
+        #     q_scale=q_scale,
+        #     kv_scale=kv_scale,
+        #     work_meta_data=work_meta_data,
+        #     work_indptr=work_indptr,
+        #     work_info_set=work_info_set,
+        #     reduce_indptr=reduce_indptr,
+        #     reduce_final_map=reduce_final_map,
+        #     reduce_partial_map=reduce_partial_map,
+        #     intra_batch_mode=non_persistent_mode,
+        # )
+
+        attn_logits, attn_lse = aiter.mla.mla_decode_fwd(
             q_fp8 if dtype == dtypes.fp8 else q,
             kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
             out_asm,

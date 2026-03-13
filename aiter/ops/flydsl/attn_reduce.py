@@ -142,10 +142,9 @@ def flydsl_attn_reduce_v1(
     if total_work <= ps_grid_size:
         launch_attn_reduce(
             *common_args,
-            num_heads,
-            num_wg_per_bh,
             lds_size,
             max_splits,
+            num_wg_per_bh,
             int(output_lse),
             int(use_reduce_final_map),
             num_heads,
@@ -158,6 +157,10 @@ def flydsl_attn_reduce_v1(
             ps_grid_size,
             lds_size,
             max_splits,
+            num_wg_per_bh,
             int(output_lse),
             int(use_reduce_final_map),
+            num_heads,
+            size_dv,
+            out_elem_bytes,
         )

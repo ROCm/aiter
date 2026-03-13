@@ -139,7 +139,7 @@ def attn_reduce_simple(
     thread_id_i32 = arith.index_cast(T.i32, thread_id)
     q_start_idx = _to_index(arith.index_cast(T.index, _raw(q_start + block_idx)))
     q_end_idx = _to_index(arith.index_cast(T.index, _raw(q_end)))
-    num_wg_idx = _to_index(arith.index_cast(T.index, _raw(num_wg_per_bh)))
+    num_wg_idx = _to_index(num_wg_per_bh)
 
     f32_ty = ir.F32Type.get()
     use_vec = VEC_WIDTH > 1
@@ -308,12 +308,8 @@ def kn_attn_reduce(
     num_heads_q: fx.Constexpr[int],
     size_dv: fx.Constexpr[int],
     out_elem_bytes: fx.Constexpr[int],
-    num_wg_per_bh: fx.Int32,
+    num_wg_per_bh: fx.Constexpr[int],
 ):
-    head_idx = arith.index_cast(T.i32, gpu.block_id("x"))
-    block_idx = arith.index_cast(T.i32, gpu.block_id("y"))
-    tile_idx = arith.index_cast(T.i32, gpu.block_id("z"))
-
     reduce_indptr_rsrc = buffer_ops.create_buffer_resource(reduce_indptr)
     reduce_final_map_rsrc = buffer_ops.create_buffer_resource(reduce_final_map)
     reduce_partial_map_rsrc = buffer_ops.create_buffer_resource(reduce_partial_map)
@@ -321,6 +317,10 @@ def kn_attn_reduce(
     final_output_rsrc = buffer_ops.create_buffer_resource(final_output)
     partial_lse_rsrc = buffer_ops.create_buffer_resource(partial_lse)
     partial_output_rsrc = buffer_ops.create_buffer_resource(partial_output)
+
+    head_idx = arith.index_cast(T.i32, gpu.block_id("x"))
+    block_idx = arith.index_cast(T.i32, gpu.block_id("y"))
+    tile_idx = arith.index_cast(T.i32, gpu.block_id("z"))
 
     reduce_tile_range = buffer_ops.buffer_load(
         reduce_indptr_rsrc, tile_idx, vec_width=2, dtype=T.i32
@@ -332,7 +332,7 @@ def kn_attn_reduce(
     # if num_splits >= MASSIVE_THRESHOLD:
     if False:
         pass
-    else:
+    elif num_splits > 1:
         attn_reduce_simple(
             reduce_final_map_rsrc,
             reduce_partial_map_rsrc,
@@ -372,9 +372,76 @@ def kn_attn_reduce_ps(
     max_splits: fx.Int32,
     output_lse: fx.Constexpr[int],
     use_reduce_final_map: fx.Constexpr[int],
+    num_heads_q: fx.Constexpr[int],
+    size_dv: fx.Constexpr[int],
+    out_elem_bytes: fx.Constexpr[int],
+    num_wg_per_bh: fx.Constexpr[int],
 ):
-    # Empty kernel body -- persistent scheduling variant, to be implemented later.
-    pass
+    reduce_indptr_rsrc = buffer_ops.create_buffer_resource(reduce_indptr)
+    reduce_final_map_rsrc = buffer_ops.create_buffer_resource(reduce_final_map)
+    reduce_partial_map_rsrc = buffer_ops.create_buffer_resource(reduce_partial_map)
+    final_lse_rsrc = buffer_ops.create_buffer_resource(final_lse)
+    final_output_rsrc = buffer_ops.create_buffer_resource(final_output)
+    partial_lse_rsrc = buffer_ops.create_buffer_resource(partial_lse)
+    partial_output_rsrc = buffer_ops.create_buffer_resource(partial_output)
+
+    total_wg_cnt = num_heads_q * num_wg_per_bh * num_reduce_tile
+    last_reduce_tile = buffer_ops.buffer_load(
+        reduce_indptr_rsrc, num_reduce_tile, vec_width=1, dtype=T.i32
+    )
+
+    def main_loop(work_idx):
+        head_idx = work_idx % num_heads_q
+        block_idx = (work_idx // num_heads_q) % num_wg_per_bh
+        tile_idx = (work_idx // num_heads_q) // num_wg_per_bh
+        reduce_tile_range = buffer_ops.buffer_load(
+            reduce_indptr_rsrc, tile_idx, vec_width=2, dtype=T.i32
+        )
+        reduce_tile_start = vector.extract(reduce_tile_range, [0])
+        reduce_tile_end = vector.extract(reduce_tile_range, [1])
+        if reduce_tile_start == last_reduce_tile:
+            return False
+        else:
+            num_splits = reduce_tile_end - reduce_tile_start
+            # if num_splits >= MASSIVE_THRESHOLD:
+            if False:
+                pass
+            else:
+                attn_reduce_simple(
+                    reduce_final_map_rsrc,
+                    reduce_partial_map_rsrc,
+                    final_lse_rsrc,
+                    final_output_rsrc,
+                    partial_lse_rsrc,
+                    partial_output_rsrc,
+                    stride_s_o,
+                    stride_h_o,
+                    max_splits,
+                    output_lse,
+                    use_reduce_final_map,
+                    num_heads_q,
+                    size_dv,
+                    out_elem_bytes,
+                    num_wg_per_bh,
+                    head_idx,
+                    block_idx,
+                    tile_idx,
+                    reduce_tile_start,
+                    reduce_tile_end,
+                )
+            return True
+
+    work_idx = arith.index_cast(T.i32, gpu.block_id("x"))
+    if work_idx < total_wg_cnt:
+        continue_flag = main_loop(work_idx)
+        if continue_flag:
+            work_idx += gpu.grid_dim("x")
+            while work_idx < total_wg_cnt:
+                gpu.barrier()
+                continue_flag = main_loop(work_idx)
+                if not continue_flag:
+                    break
+                work_idx += gpu.grid_dim("x")
 
 
 @flyc.jit
@@ -389,10 +456,9 @@ def launch_attn_reduce(
     stride_s_o: fx.Int32,
     stride_h_o: fx.Int32,
     num_reduce_tile: fx.Int32,
-    num_heads: fx.Int32,
-    num_wg_per_bh: fx.Int32,
     lds_size: fx.Int32,
     max_splits: fx.Int32,
+    num_wg_per_bh: fx.Constexpr[int],
     output_lse: fx.Constexpr[int],
     use_reduce_final_map: fx.Constexpr[int],
     num_heads_q: fx.Constexpr[int],
@@ -418,7 +484,7 @@ def launch_attn_reduce(
         out_elem_bytes,
         num_wg_per_bh,
     ).launch(
-        grid=(num_heads, num_wg_per_bh, num_reduce_tile),
+        grid=(num_heads_q, num_wg_per_bh, num_reduce_tile),
         block=(NUM_THREADS, 1, 1),
         # smem=lds_size,
         stream=stream,
@@ -440,13 +506,14 @@ def launch_attn_reduce_ps(
     ps_grid_size: fx.Int32,
     lds_size: fx.Int32,
     max_splits: fx.Int32,
+    num_wg_per_bh: fx.Constexpr[int],
     output_lse: fx.Constexpr[int],
     use_reduce_final_map: fx.Constexpr[int],
+    num_heads_q: fx.Constexpr[int],
+    size_dv: fx.Constexpr[int],
+    out_elem_bytes: fx.Constexpr[int],
     stream: fx.Stream = fx.Stream(None),
 ):
-    arch = get_hip_arch()
-    lds_allocator = SmemAllocator(None, arch=arch)
-
     kn_attn_reduce_ps(
         reduce_indptr,
         reduce_final_map,
@@ -461,6 +528,10 @@ def launch_attn_reduce_ps(
         max_splits,
         output_lse,
         use_reduce_final_map,
+        num_heads_q,
+        size_dv,
+        out_elem_bytes,
+        num_wg_per_bh,
     ).launch(
         grid=(ps_grid_size, 1, 1),
         block=(NUM_THREADS, 1, 1),
