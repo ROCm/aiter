@@ -195,17 +195,6 @@ def compare_arrays(
         }
     )
 
-    # print("\nTop differences:")
-    # for item in result['top_k_diff']:
-    #     print(f"Position {item['position']}: arr1 = {arr1[item['position']]:.6f}, arr2 = {arr2[item['position']]:.6f}, Diff = {item['value']:.6f}")
-
-    # print("\nThreshold statistics:")
-    # for stat in result['threshold_stats']:
-    #     print(f"{stat['range']}: {stat['count']} ({stat['percentage']:.2f}%)")
-
-    # print("\nNaN info:")
-    # print(result["nan_info"])
-
     return result
 
 
@@ -1012,32 +1001,45 @@ def quantize_kv_cache_per_tensor(
 
 
 @perftest()
-def run_aiter_assembly_kernel(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    block_tables: torch.Tensor,
-    context_lengths: torch.Tensor,
-    block_tables_stride0: int,
-    max_query_length: int,
-    key_scale: Optional[torch.Tensor] = None,
-    value_scale: Optional[torch.Tensor] = None,
-    query_output_indptr: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Run AIT assembly kernel for paged attention."""
-    return aiter.pa_fwd_asm(
-        query,
-        key_cache,
-        value_cache,
-        block_tables,
-        context_lengths,
-        block_tables_stride0,
-        max_query_length,
-        key_scale,
-        value_scale,
-        None,
-        query_output_indptr,
-        high_precision=0,
+def run_aiter_asm_ps(
+    Q,
+    K,
+    V,
+    output,
+    max_qlen,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    context_lens,
+    K_QScale,
+    V_QScale,
+    work_indptr,
+    work_info,
+    reduce_indptr,
+    reduce_final_map,
+    reduce_partial_map,
+    softmax_scale,
+    mask,
+):
+    return aiter.pa_persistent_fwd(
+        Q=Q,
+        K=K,
+        V=V,
+        output=output,
+        max_qlen=max_qlen,
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr,
+        kv_indices=kv_indices,
+        context_lens=context_lens,
+        K_QScale=K_QScale,
+        V_QScale=V_QScale,
+        work_indptr=work_indptr,
+        work_info=work_info,
+        reduce_indptr=reduce_indptr,
+        reduce_final_map=reduce_final_map,
+        reduce_partial_map=reduce_partial_map,
+        softmax_scale=softmax_scale,
+        mask=mask,
     )
 
 
@@ -1260,7 +1262,6 @@ def run_pa_gluon_test(
         data_type = torch.bfloat16
     results = {}
     seed = 123
-    # seed = 371
     setup_seed(seed)
     device = "cuda:0"
     torch.set_default_device(device)
@@ -1514,11 +1515,15 @@ def run_pa_gluon_test(
         if sliding_window > 0
         else context_lengths.max().item()
     )
-    if sliding_window > 0:
-
-        max_context_partition_num = 1
-    elif ps:
-        max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
+    if ps and not (sliding_window > 0):
+        split_kv_blocks = triton.cdiv(block_size, context_partition_size)
+        max_context_partition_num = get_recommended_splits(
+            num_seqs, num_kv_heads, split_kv_blocks
+        )
+    elif sliding_window > 0:
+        max_context_partition_num = (
+            triton.cdiv(sliding_window, context_partition_size) + 1
+        )
     else:
         max_context_partition_num = triton.cdiv(
             max_context_length, context_partition_size
@@ -1580,7 +1585,6 @@ def run_pa_gluon_test(
         rtol=diff_tolerance,
         msg=f"[PyTorch vs Gluon_FP8][{quant_mode}] (vs orig ref): {gluon_time:>8.2f} us......",
     )
-
     if err_gluon > 0:
         err_gluon = 1
     print("\n=== Detailed Error Analysis ===")
@@ -1633,10 +1637,10 @@ def run_pa_gluon_test(
     bandwidth_tb_per_sec = pa_rw_bytes / (kernel_time_us * 1e6 * 1.024**4)
     results["gluon_bandwith(TB/s)"] = bandwidth_tb_per_sec
 
-    # Test Assembly
+    # Test Assembly (PA Persistent Scheduling)
     query_group_size = num_query_heads // num_kv_heads
     skip_assembly = (
-        (block_size == 1024 and num_heads != (10, 1))
+        (block_size != 1024)
         or (block_size == 1024 and arch_info.get_arch() in ["gfx950"])
         or (block_size == 16 and query_group_size == 8 and query_length == 3)
         or (query_group_size == 5 and query_length == 3)
@@ -1648,24 +1652,91 @@ def run_pa_gluon_test(
         or True
     )
 
-    # aiter_assembly_kernel do not support per-tensor quantization, we always use per-token quantization here
     if quant_kv and quant_mode == "per_tensor":
         key_scale_original = key_scale_factors_flat.contiguous()
         value_scale_original = value_scale_factors_flat.contiguous()
     if not skip_assembly:
-        assembly_output, assembly_time = run_aiter_assembly_kernel(
-            query,
-            quantized_keys,
-            quantized_values,
-            block_tables,
-            context_lengths,
-            block_tables.size(1),
-            max_query_length,
-            key_scale_original,
-            value_scale_original,
-            query_output_indptr,
+        actual_blocks = (context_lengths + block_size - 1) // block_size
+        kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+        kv_indptr[1 : batch_size + 1] = torch.cumsum(actual_blocks, dim=0)
+        kv_indices_lst = []
+        for i in range(batch_size):
+            kv_indices_lst += block_tables_list[i][: actual_blocks[i]]
+        kv_indices = torch.tensor(kv_indices_lst, dtype=torch.int32, device=device)
+
+        (
+            (work_meta_data_size, work_meta_data_type),
+            (work_indptr_size, work_indptr_type),
+            (work_info_set_size, work_info_set_type),
+            (reduce_indptr_size, reduce_indptr_type),
+            (reduce_final_map_size, reduce_final_map_type),
+            (reduce_partial_map_size, reduce_partial_map_type),
+        ) = aiter.get_pa_metadata_info_v1(batch_size, num_kv_heads)
+
+        work_metadata_ptrs = torch.empty(work_meta_data_size, dtype=work_meta_data_type)
+        work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type)
+        work_info = torch.empty(work_info_set_size, dtype=work_info_set_type)
+        reduce_indptr = torch.empty(reduce_indptr_size, dtype=reduce_indptr_type)
+        reduce_final_map = torch.empty(
+            reduce_final_map_size, dtype=reduce_final_map_type
         )
-        print("\nAIT_Assembly vs Original Ref:")
+        reduce_partial_map = torch.empty(
+            reduce_partial_map_size, dtype=reduce_partial_map_type
+        )
+
+        aiter.get_pa_metadata_v1(
+            query_output_indptr,
+            kv_indptr,
+            context_lengths,
+            query_group_size,
+            num_kv_heads,
+            True,
+            work_metadata_ptrs,
+            work_indptr,
+            work_info,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            kv_granularity=max(block_size, 16),
+            block_size=block_size,
+            max_seqlen_qo=int(max_query_length),
+            uni_seqlen_qo=query_length,
+            fast_mode=True,
+            max_split_per_batch=-1,
+        )
+
+        ps_values = quantized_values
+        if ps_values.ndim == 4:
+            x = 16 // ps_values.element_size()
+            nb, nh, hs, bs_ = ps_values.shape
+            ps_values = (
+                ps_values.view(nb, nh, hs, bs_ // x, x)
+                .permute(0, 1, 3, 2, 4)
+                .contiguous()
+            )
+
+        assembly_output = torch.empty_like(query)
+        _, assembly_time = run_aiter_asm_ps(
+            Q=query,
+            K=quantized_keys,
+            V=ps_values,
+            output=assembly_output,
+            max_qlen=max_query_length,
+            qo_indptr=query_output_indptr,
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            context_lens=context_lengths,
+            K_QScale=key_scale_original,
+            V_QScale=value_scale_original,
+            work_indptr=work_indptr,
+            work_info=work_info,
+            reduce_indptr=reduce_indptr,
+            reduce_final_map=reduce_final_map,
+            reduce_partial_map=reduce_partial_map,
+            softmax_scale=softmax_scale,
+            mask=1,
+        )
+        print("\nAIT_Assembly(PS) vs Original Ref:")
         compare_arrays(
             assembly_output.to(torch.float32).detach().cpu().numpy(),
             reference_output_quant.to(torch.float32).detach().cpu().numpy(),
@@ -2400,22 +2471,23 @@ def sliding_window_accuracy_test():
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
 
     SINKS_OPTIONS = [True, False]
-    SLIDING_WINDOW_OPTIONS = [0, 128]
-    HEAD_DIMENSION_OPTIONS = [64]
+    SLIDING_WINDOW_OPTIONS = [0, 128, 1023]
+    HEAD_DIMENSION_OPTIONS = [64, 128]
     CONTEXT_LENGTH_OPTIONS = [1024, 8192]
     BATCH_SIZE_OPTIONS = [1, 4, 128]
     QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
     COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["bf16", False, True]]
-    QUANT_MODE_OPTIONS = ["per_token"]
+    QUANT_MODE_OPTIONS = ["per_tensor"]
     TRANS_V_OPTIONS = [False]
     KV_VARLEN_OPTIONS = [True]
-    HEAD_CONFIGURATIONS = [(64, 8)]
+    HEAD_CONFIGURATIONS = [(64, 8), (16, 1)]
     USE_AOT_IMPL_OPTIONS = [False]
     PS_OPTIONS = [True]
     BLOCK_SIZE_OPTIONS = [16]
     parse_arg_and_run_test()
-    # BLOCK_SIZE_OPTIONS = [64]
-    # parse_arg_and_run_test()
+    TRANS_V_OPTIONS = [True]
+    BLOCK_SIZE_OPTIONS = [1024]
+    parse_arg_and_run_test()
 
 
 def sliding_window_performance_test():
