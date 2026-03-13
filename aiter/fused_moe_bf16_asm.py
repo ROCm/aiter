@@ -448,9 +448,9 @@ def _run_asm_moe_int8(
     )
     is_int8 = w1.dtype == dtypes.i8 or w1.dtype == torch.int8
     if fc1_smooth_scale is not None:
-        use_ref_input_quant = run_2stage and is_int8
+        use_ref_input_quant = is_int8
         if use_ref_input_quant:
-            # Reference path: smooth_per_token_scaled_quant for input; keep topk_ids (global) for stage2.
+            # smooth_per_token_scaled_quant for input; keep topk_ids (global) for stage2.
             a8 = torch.empty((topk * M, model_dim), dtype=a8_type, device=device)
             a8_scale = torch.empty((topk * M), dtype=dtypes.fp32, device=device)
             aiter.smooth_per_token_scaled_quant(
@@ -462,14 +462,13 @@ def _run_asm_moe_int8(
                 smooth_scale_map_hash=local_expert_hash,
                 enable_ps=True,
             )
-            a8 = a8.view(-1, model_dim).view(topk, M, model_dim)
-        else:
-            if is_int8:
-                a8 = torch.empty((topk, M, model_dim), dtype=a8_type, device=device)
-                a8_scale = torch.empty((topk, M, 1), dtype=dtypes.fp32, device=device)
+            if run_2stage:
+                a8 = a8.view(-1, model_dim).view(topk, M, model_dim)
             else:
-                a8 = torch.empty((topk * M, model_dim), dtype=a8_type, device=device)
-                a8_scale = torch.empty((topk * M), dtype=dtypes.fp32, device=device)
+                a8 = a8.view(-1, model_dim)
+        else:
+            a8 = torch.empty((topk * M, model_dim), dtype=a8_type, device=device)
+            a8_scale = torch.empty((topk * M), dtype=dtypes.fp32, device=device)
             if expert_mask is not None:
                 topk_ids = local_expert_hash[topk_ids]
             aiter.moe_smoothquant_fwd(
