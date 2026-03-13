@@ -3,7 +3,6 @@
 
 import functools
 import importlib
-import inspect
 import json
 import logging
 import multiprocessing
@@ -1038,15 +1037,9 @@ def compile_ops(
 ):
     def decorator(func):
         func.arg_checked = False
-        func._cached_sig = inspect.signature(func)
 
         @functools.wraps(func)
         def wrapper(*args, custom_build_args={}, **kwargs):
-            bound = func._cached_sig.bind(*args, **kwargs)
-            bound.apply_defaults()
-            args = bound.args
-            kwargs = bound.kwargs
-
             loadName = fc_name
             md_name = _md_name
             if fc_name is None:
