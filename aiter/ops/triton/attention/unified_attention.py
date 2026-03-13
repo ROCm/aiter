@@ -10,7 +10,7 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     reduce_segments,
 )
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (sage_quant, sage_quant_mxfp4)
-from enum import Enum
+from enum import IntEnum
 
 
 def select_2d_config(
@@ -101,7 +101,7 @@ def use_2d_kernel(
         or (num_2d_prgms > target_num_prgms)
     )
 
-class SAGE_VERSION(Enum):
+class SAGE_VERSION(IntEnum):
     SAGE = 1
     SAGE_MXFP4 = 2
 
@@ -175,8 +175,8 @@ def unified_attention(
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
 
-    # if batch contains a prefill
-    if use_2d_kernel(
+    # 3D kernel does not support sage attention yet; force 2D path when sage is active.
+    if sage_version is not None or use_2d_kernel(
         head_size,
         SLIDING_WINDOW,
         ALL_DECODE,
@@ -224,6 +224,9 @@ def unified_attention(
             block_table_stride=block_table.stride(0),
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
+            query_scale_stride_0=q_descale.stride(0) if q_descale is not None else 0,
+            query_scale_stride_1=q_descale.stride(1) if q_descale is not None and q_descale.ndim >= 2 else 0,
+            query_scale_stride_2=q_descale.stride(2) if q_descale is not None and q_descale.ndim >= 3 else 0,
             output_stride_0=out.stride(0),
             output_stride_1=out.stride(1),
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
@@ -243,11 +246,17 @@ def unified_attention(
             stride_v_cache_1=v.stride(1),
             stride_v_cache_2=v.stride(2),
             stride_v_cache_3=v.stride(3),
+            stride_k_cache_scale_0=k_descale.stride(0) if k_descale is not None else 0,
+            stride_k_cache_scale_1=k_descale.stride(1) if k_descale is not None and k_descale.ndim >= 2 else 0,
+            stride_k_cache_scale_2=k_descale.stride(2) if k_descale is not None and k_descale.ndim >= 3 else 0,
+            stride_k_cache_scale_3=k_descale.stride(3) if k_descale is not None and k_descale.ndim >= 4 else 0,
+            stride_v_cache_scale_0=v_descale.stride(0) if v_descale is not None else 0,
+            stride_v_cache_scale_1=v_descale.stride(1) if v_descale is not None and v_descale.ndim >= 2 else 0,
             query_start_len_ptr=cu_seqlens_q,
             num_seqs=num_seqs,
             USE_FP8=output_scale is not None,
             ALL_DECODE=ALL_DECODE,
-            sage_version=sage_version,
+            SAGE_VERSION=sage_version,
             **config,
         )
 
@@ -297,7 +306,6 @@ def unified_attention(
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
             scale=softmax_scale,
-            q_scale=q_descale,
             k_scale=k_descale,
             v_scale=v_descale,
             softcap=softcap,
@@ -328,7 +336,6 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             ALL_DECODE=ALL_DECODE,
-            sage_version=sage_version,
             **attn_config,
         )
         reduce_segments[(q.shape[0], num_query_heads)](

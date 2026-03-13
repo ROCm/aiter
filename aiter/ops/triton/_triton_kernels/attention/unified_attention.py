@@ -50,6 +50,7 @@ def find_seq_idx(
     return left - 1
 
 
+@triton.jit
 def q_scale_process(
         Q_Descale,
         q_block_global_idx,
@@ -63,9 +64,7 @@ def q_scale_process(
         query_scale_stride_2: tl.int64,
         SAGE_VERSION: tl.constexpr = None
     ):
-    if SAGE_VERSION == None:
-        return Q_Descale # Q_Descale is none
-    elif SAGE_VERSION == 1: # SAGE v1
+    if SAGE_VERSION == 1: # SAGE v1
         q_descale_ptr = (
             Q_Descale
             + q_block_global_idx * query_scale_stride_0
@@ -73,15 +72,18 @@ def q_scale_process(
         )
         return tl.load(q_descale_ptr)
     elif SAGE_VERSION == 2: # SAGE mxfp4
-        # TODO fix: The seq dim offset is from the loop up
         q_descale_ptr = (
             Q_Descale
             + query_offset_seq[:, None] * query_scale_stride_0
-            + query_offset_head * query_scale_stride_1
+            + kv_head_idx * query_scale_stride_1
             + offs_d_scale[None, :] * query_scale_stride_2
         )
         return tl.load(q_descale_ptr, mask=seq_mask, other=0.0)
+    else:
+        # SAGE_VERSION == None
+        return Q_Descale # Q_Descale is none
 
+@triton.jit
 def k_scale_process(
         K_Descale,
         physical_block_idx,
@@ -115,6 +117,7 @@ def k_scale_process(
         return tl.load(k_descale_ptr, mask=tile_mask, other=0.0)
 
 
+@triton.jit
 def qk_dot(
         Q,
         K,
@@ -133,6 +136,7 @@ def qk_dot(
         return qk_scale * tl.dot(Q, K)
 
 
+@triton.jit
 def v_scale_process(
         V_Descale,
         kv_head_idx,
@@ -202,7 +206,7 @@ def kernel_unified_attention_2d(
     stride_k_cache_scale_3: tl.int64,  # int
     stride_v_cache_scale_0: tl.int64,  # int
     stride_v_cache_scale_1: tl.int64,  # int
-    query_start_len_ptr,  # [num_seqs+1]
+    query_start_len_ptr,  # [num_seqs+1
     BLOCK_Q: tl.constexpr,  # int
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
@@ -240,6 +244,9 @@ def kernel_unified_attention_2d(
     if SAGE_VERSION == 2:
         offs_d = tl.arange(0, HEAD_SIZE_PADDED // 2)
         offs_d_scale = tl.arange(0, HEAD_SIZE_PADDED // 32)
+    elif SAGE_VERSION == 1:
+        offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+        offs_d_scale = tl.arange(0, HEAD_SIZE_PADDED)
     else:
         offs_d = tl.arange(0, HEAD_SIZE_PADDED)
         offs_d_scale = None
@@ -432,7 +439,9 @@ def kernel_unified_attention_2d(
             cache_modifier=KV_cache_modifier,
         )
 
-        if V_load.dtype.is_fp8():
+        if SAGE_VERSION != None:
+            V = V_load
+        elif V_load.dtype.is_fp8():
             if Q.dtype.is_fp8():
                 V = V_load
             else:
@@ -512,7 +521,6 @@ def kernel_unified_attention_2d(
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         acc += tl.dot(P.to(V.dtype), V)
-
 
 
     # epilogue
