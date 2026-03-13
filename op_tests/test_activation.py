@@ -277,7 +277,7 @@ for dtype in args.dtype:
             df.append(ret)
 df = pd.DataFrame(df)
 df = df[
-    ["M", "N", "input_dtype", "output_dtype", "us", "TB/s", "RD TB/s", "WR TB/s", "err"]
+    ["M", "N", "input_dtype", "output_dtype", "us", "torch_us", "speedup_vs_torch", "perf_gain_vs_torch_pct", "TB/s", "RD TB/s", "WR TB/s", "err"]
 ]
 df_md = df.to_markdown(index=False)
 aiter.logger.info("gelu_fast summary (markdown):\n%s", df_md)
