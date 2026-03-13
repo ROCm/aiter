@@ -1,0 +1,486 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Core Operators &mdash; AITER 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../_static/documentation_options.js?v=01f34227"></script>
+      <script src="../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="prev" title="GEMM Operations" href="gemm.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="../index.html" class="icon icon-home">
+            AITER
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../installation.html#requirements">Requirements</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../installation.html#system-requirements">System Requirements</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../installation.html#software-dependencies">Software Dependencies</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../installation.html#installation-methods">Installation Methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../installation.html#method-1-from-pypi-recommended">Method 1: From PyPI (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../installation.html#method-2-from-source">Method 2: From Source</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../installation.html#basic-installation">Basic Installation</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../installation.html#development-mode-jit">Development Mode (JIT)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../installation.html#precompiled-installation">Precompiled Installation</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="../installation.html#environment-variables">Environment Variables</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../installation.html#example-configurations">Example Configurations</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="../installation.html#method-3-docker">Method 3: Docker</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../installation.html#verifying-installation">Verifying Installation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation.html#optional-triton-communication-support">Optional: Triton Communication Support</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation.html#troubleshooting">Troubleshooting</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../installation.html#rocm-not-found">ROCm Not Found</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../installation.html#compilation-errors">Compilation Errors</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../installation.html#import-errors">Import Errors</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../installation.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../quickstart.html">Quickstart</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#installation">Installation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#verify-installation">Verify Installation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#first-example-flash-attention">First Example: Flash Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#variable-length-sequences">Variable-Length Sequences</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#mixture-of-experts-moe">Mixture of Experts (MoE)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#rmsnorm">RMSNorm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#performance-tips">Performance Tips</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#next-steps">Next Steps</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#common-issues">Common Issues</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#get-help">Get Help</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../tutorials/index.html">Tutorials</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../tutorials/basic_usage.html">Basic Usage</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/basic_usage.html#installation-check">Installation Check</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/basic_usage.html#hello-world-flash-attention">Hello World: Flash Attention</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../tutorials/basic_usage.html#understanding-the-parameters">Understanding the Parameters</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../tutorials/basic_usage.html#comparing-with-pytorch">Comparing with PyTorch</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/basic_usage.html#working-with-different-precisions">Working with Different Precisions</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/basic_usage.html#rmsnorm-example">RMSNorm Example</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/basic_usage.html#batched-operations">Batched Operations</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/basic_usage.html#error-handling">Error Handling</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/basic_usage.html#memory-management">Memory Management</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/basic_usage.html#next-steps">Next Steps</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/basic_usage.html#common-gotchas">Common Gotchas</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../tutorials/add_new_op.html">How to Add a New Operator</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/add_new_op.html#overview">Overview</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/add_new_op.html#step-1-define-the-operator-interface">Step 1: Define the Operator Interface</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/add_new_op.html#step-2-implement-the-rocm-kernel">Step 2: Implement the ROCm Kernel</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/add_new_op.html#step-3-create-python-bindings">Step 3: Create Python Bindings</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/add_new_op.html#step-4-update-build-configuration">Step 4: Update Build Configuration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/add_new_op.html#step-5-add-tests">Step 5: Add Tests</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/add_new_op.html#step-6-build-and-install">Step 6: Build and Install</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/add_new_op.html#step-7-register-in-main-module">Step 7: Register in Main Module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/add_new_op.html#advanced-optimizations">Advanced: Optimizations</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../tutorials/add_new_op.html#use-ck-composable-kernel-for-better-performance">Use CK (Composable Kernel) for Better Performance</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../tutorials/add_new_op.html#use-triton-for-easier-kernel-development">Use Triton for Easier Kernel Development</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/add_new_op.html#common-patterns">Common Patterns</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../tutorials/add_new_op.html#pattern-1-fused-operations">Pattern 1: Fused Operations</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../tutorials/add_new_op.html#pattern-2-in-place-operations">Pattern 2: In-Place Operations</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../tutorials/add_new_op.html#pattern-3-autograd-support">Pattern 3: Autograd Support</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/add_new_op.html#best-practices">Best Practices</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/add_new_op.html#debugging-tips">Debugging Tips</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../tutorials/add_new_op.html#print-kernel-launches">Print Kernel Launches</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../tutorials/add_new_op.html#check-for-memory-errors">Check for Memory Errors</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../tutorials/add_new_op.html#profile-your-operator">Profile Your Operator</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/add_new_op.html#example-complete-rmsnorm-implementation">Example: Complete RMSNorm Implementation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/add_new_op.html#next-steps">Next Steps</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/add_new_op.html#contributing">Contributing</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../tutorials/index.html#tutorial-overview">Tutorial Overview</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/index.html#basic-tutorials">Basic Tutorials</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/index.html#advanced-topics">Advanced Topics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../tutorials/index.html#integration-guides">Integration Guides</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../tutorials/index.html#prerequisites">Prerequisites</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../tutorials/index.html#example-data">Example Data</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../tutorials/index.html#jupyter-notebooks">Jupyter Notebooks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../tutorials/index.html#running-examples">Running Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../tutorials/index.html#community-examples">Community Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../tutorials/index.html#contributing-tutorials">Contributing Tutorials</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="attention.html">Attention Operations</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="attention.html#flash-attention">Flash Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="attention.html#flash-attention-with-kv-cache">Flash Attention with KV Cache</a></li>
+<li class="toctree-l2"><a class="reference internal" href="attention.html#grouped-query-attention-gqa">Grouped Query Attention (GQA)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="attention.html#multi-query-attention-mqa">Multi-Query Attention (MQA)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="attention.html#variable-sequence-attention">Variable Sequence Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="attention.html#supported-architectures">Supported Architectures</a></li>
+<li class="toctree-l2"><a class="reference internal" href="attention.html#performance-characteristics">Performance Characteristics</a></li>
+<li class="toctree-l2"><a class="reference internal" href="attention.html#see-also">See Also</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="gemm.html">GEMM Operations</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="gemm.html#grouped-gemm">Grouped GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gemm.html#batched-gemm">Batched GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gemm.html#fused-gemm-operations">Fused GEMM Operations</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="gemm.html#gemm-bias">GEMM + Bias</a></li>
+<li class="toctree-l3"><a class="reference internal" href="gemm.html#gemm-gelu">GEMM + GELU</a></li>
+<li class="toctree-l3"><a class="reference internal" href="gemm.html#gemm-relu">GEMM + ReLU</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="gemm.html#cutlass-style-gemm">CUTLASS-style GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gemm.html#sparse-gemm">Sparse GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gemm.html#int8-quantized-gemm">INT8 Quantized GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gemm.html#performance-characteristics">Performance Characteristics</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gemm.html#optimization-tips">Optimization Tips</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gemm.html#example-optimal-moe-forward-pass">Example: Optimal MoE Forward Pass</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gemm.html#see-also">See Also</a></li>
+</ul>
+</li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Core Operators</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#rmsnorm">RMSNorm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#layernorm">LayerNorm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#softmax">SoftMax</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#gelu">GELU</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#swiglu">SwiGLU</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#rotary-position-embedding-rope">Rotary Position Embedding (RoPE)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#sampling-operations">Sampling Operations</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#top-k-sampling">Top-K Sampling</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#top-p-nucleus-sampling">Top-P (Nucleus) Sampling</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#performance-notes">Performance Notes</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#supported-data-types">Supported Data Types</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#see-also">See Also</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../index.html">AITER</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Core Operators</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../_sources/api/operators.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="core-operators">
+<h1>Core Operators<a class="headerlink" href="#core-operators" title="Link to this heading"></a></h1>
+<section id="rmsnorm">
+<h2>RMSNorm<a class="headerlink" href="#rmsnorm" title="Link to this heading"></a></h2>
+<p>Root Mean Square Layer Normalization, commonly used in LLMs like Llama.</p>
+<p><strong>Parameters:</strong></p>
+<ul class="simple">
+<li><p><strong>x</strong> (<em>torch.Tensor</em>) - Input tensor of shape <code class="docutils literal notranslate"><span class="pre">(...,</span> <span class="pre">hidden_dim)</span></code></p></li>
+<li><p><strong>weight</strong> (<em>torch.Tensor</em>) - Scaling weights of shape <code class="docutils literal notranslate"><span class="pre">(hidden_dim,)</span></code></p></li>
+<li><p><strong>eps</strong> (<em>float</em>, optional) - Epsilon for numerical stability. Default: <code class="docutils literal notranslate"><span class="pre">1e-6</span></code></p></li>
+</ul>
+<p><strong>Returns:</strong></p>
+<ul class="simple">
+<li><p><strong>output</strong> (<em>torch.Tensor</em>) - Normalized tensor with same shape as input</p></li>
+</ul>
+<p><strong>Example:</strong></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">aiter</span>
+
+<span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="mi">4096</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cuda&#39;</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span>
+<span class="n">weight</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="mi">4096</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cuda&#39;</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span>
+
+<span class="n">output</span> <span class="o">=</span> <span class="nb">aiter</span><span class="o">.</span><span class="n">rmsnorm</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">eps</span><span class="o">=</span><span class="mf">1e-6</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="layernorm">
+<h2>LayerNorm<a class="headerlink" href="#layernorm" title="Link to this heading"></a></h2>
+<p>Standard layer normalization with optional bias.</p>
+<p><strong>Parameters:</strong></p>
+<ul class="simple">
+<li><p><strong>x</strong> (<em>torch.Tensor</em>) - Input tensor <code class="docutils literal notranslate"><span class="pre">(...,</span> <span class="pre">hidden_dim)</span></code></p></li>
+<li><p><strong>weight</strong> (<em>torch.Tensor</em>) - Weights <code class="docutils literal notranslate"><span class="pre">(hidden_dim,)</span></code></p></li>
+<li><p><strong>bias</strong> (<em>torch.Tensor</em>, optional) - Bias <code class="docutils literal notranslate"><span class="pre">(hidden_dim,)</span></code></p></li>
+<li><p><strong>eps</strong> (<em>float</em>, optional) - Epsilon. Default: <code class="docutils literal notranslate"><span class="pre">1e-5</span></code></p></li>
+</ul>
+<p><strong>Returns:</strong></p>
+<ul class="simple">
+<li><p><strong>output</strong> (<em>torch.Tensor</em>) - Normalized output</p></li>
+</ul>
+</section>
+<section id="softmax">
+<h2>SoftMax<a class="headerlink" href="#softmax" title="Link to this heading"></a></h2>
+<p>Optimized softmax operation with optional masking.</p>
+<p><strong>Parameters:</strong></p>
+<ul class="simple">
+<li><p><strong>x</strong> (<em>torch.Tensor</em>) - Input tensor</p></li>
+<li><p><strong>dim</strong> (<em>int</em>) - Dimension to apply softmax</p></li>
+<li><p><strong>mask</strong> (<em>torch.Tensor</em>, optional) - Attention mask</p></li>
+</ul>
+<p><strong>Returns:</strong></p>
+<ul class="simple">
+<li><p><strong>output</strong> (<em>torch.Tensor</em>) - Softmax output</p></li>
+</ul>
+</section>
+<section id="gelu">
+<h2>GELU<a class="headerlink" href="#gelu" title="Link to this heading"></a></h2>
+<p>Fast GELU activation function.</p>
+<p><strong>Parameters:</strong></p>
+<ul class="simple">
+<li><p><strong>x</strong> (<em>torch.Tensor</em>) - Input tensor</p></li>
+<li><p><strong>approximate</strong> (<em>str</em>, optional) - Approximation method. Options: <code class="docutils literal notranslate"><span class="pre">'none'</span></code>, <code class="docutils literal notranslate"><span class="pre">'tanh'</span></code>. Default: <code class="docutils literal notranslate"><span class="pre">'none'</span></code></p></li>
+</ul>
+<p><strong>Returns:</strong></p>
+<ul class="simple">
+<li><p><strong>output</strong> (<em>torch.Tensor</em>) - GELU output</p></li>
+</ul>
+<p><strong>Example:</strong></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">aiter</span>
+
+<span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="mi">4096</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cuda&#39;</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span>
+
+<span class="c1"># Exact GELU</span>
+<span class="n">output_exact</span> <span class="o">=</span> <span class="nb">aiter</span><span class="o">.</span><span class="n">gelu</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+
+<span class="c1"># Fast approximate GELU</span>
+<span class="n">output_approx</span> <span class="o">=</span> <span class="nb">aiter</span><span class="o">.</span><span class="n">gelu</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">approximate</span><span class="o">=</span><span class="s1">&#39;tanh&#39;</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="swiglu">
+<h2>SwiGLU<a class="headerlink" href="#swiglu" title="Link to this heading"></a></h2>
+<p>Swish-Gated Linear Unit activation.</p>
+<p><strong>Parameters:</strong></p>
+<ul class="simple">
+<li><p><strong>x</strong> (<em>torch.Tensor</em>) - Input tensor <code class="docutils literal notranslate"><span class="pre">(...,</span> <span class="pre">2</span> <span class="pre">*</span> <span class="pre">hidden_dim)</span></code></p></li>
+<li><p><strong>dim</strong> (<em>int</em>, optional) - Dimension to split. Default: <code class="docutils literal notranslate"><span class="pre">-1</span></code></p></li>
+</ul>
+<p><strong>Returns:</strong></p>
+<ul class="simple">
+<li><p><strong>output</strong> (<em>torch.Tensor</em>) - SwiGLU output <code class="docutils literal notranslate"><span class="pre">(...,</span> <span class="pre">hidden_dim)</span></code></p></li>
+</ul>
+</section>
+<section id="rotary-position-embedding-rope">
+<h2>Rotary Position Embedding (RoPE)<a class="headerlink" href="#rotary-position-embedding-rope" title="Link to this heading"></a></h2>
+<p>Apply rotary position embeddings to query and key tensors.</p>
+<p><strong>Parameters:</strong></p>
+<ul class="simple">
+<li><p><strong>q</strong> (<em>torch.Tensor</em>) - Query tensor <code class="docutils literal notranslate"><span class="pre">(batch,</span> <span class="pre">seq_len,</span> <span class="pre">num_heads,</span> <span class="pre">head_dim)</span></code></p></li>
+<li><p><strong>k</strong> (<em>torch.Tensor</em>) - Key tensor <code class="docutils literal notranslate"><span class="pre">(batch,</span> <span class="pre">seq_len,</span> <span class="pre">num_heads,</span> <span class="pre">head_dim)</span></code></p></li>
+<li><p><strong>cos</strong> (<em>torch.Tensor</em>) - Cosine embeddings <code class="docutils literal notranslate"><span class="pre">(seq_len,</span> <span class="pre">head_dim</span> <span class="pre">//</span> <span class="pre">2)</span></code></p></li>
+<li><p><strong>sin</strong> (<em>torch.Tensor</em>) - Sine embeddings <code class="docutils literal notranslate"><span class="pre">(seq_len,</span> <span class="pre">head_dim</span> <span class="pre">//</span> <span class="pre">2)</span></code></p></li>
+<li><p><strong>position_ids</strong> (<em>torch.Tensor</em>, optional) - Position indices</p></li>
+</ul>
+<p><strong>Returns:</strong></p>
+<ul class="simple">
+<li><p><strong>q_rot</strong> (<em>torch.Tensor</em>) - Rotated query</p></li>
+<li><p><strong>k_rot</strong> (<em>torch.Tensor</em>) - Rotated key</p></li>
+</ul>
+<p><strong>Example:</strong></p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">aiter</span>
+
+<span class="n">seq_len</span><span class="p">,</span> <span class="n">head_dim</span> <span class="o">=</span> <span class="mi">1024</span><span class="p">,</span> <span class="mi">64</span>
+<span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="n">seq_len</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="n">head_dim</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cuda&#39;</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span>
+<span class="n">k</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="n">seq_len</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="n">head_dim</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cuda&#39;</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span>
+
+<span class="c1"># Precompute RoPE embeddings</span>
+<span class="n">cos</span><span class="p">,</span> <span class="n">sin</span> <span class="o">=</span> <span class="nb">aiter</span><span class="o">.</span><span class="n">precompute_rope_embeddings</span><span class="p">(</span><span class="n">seq_len</span><span class="p">,</span> <span class="n">head_dim</span><span class="p">)</span>
+
+<span class="c1"># Apply rotation</span>
+<span class="n">q_rot</span><span class="p">,</span> <span class="n">k_rot</span> <span class="o">=</span> <span class="nb">aiter</span><span class="o">.</span><span class="n">apply_rotary_pos_emb</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="sampling-operations">
+<h2>Sampling Operations<a class="headerlink" href="#sampling-operations" title="Link to this heading"></a></h2>
+<section id="top-k-sampling">
+<h3>Top-K Sampling<a class="headerlink" href="#top-k-sampling" title="Link to this heading"></a></h3>
+<p>Sample from top-k logits.</p>
+<p><strong>Parameters:</strong></p>
+<ul class="simple">
+<li><p><strong>logits</strong> (<em>torch.Tensor</em>) - Logits <code class="docutils literal notranslate"><span class="pre">(batch,</span> <span class="pre">vocab_size)</span></code></p></li>
+<li><p><strong>k</strong> (<em>int</em>) - Number of top candidates</p></li>
+<li><p><strong>temperature</strong> (<em>float</em>, optional) - Sampling temperature. Default: <code class="docutils literal notranslate"><span class="pre">1.0</span></code></p></li>
+</ul>
+<p><strong>Returns:</strong></p>
+<ul class="simple">
+<li><p><strong>tokens</strong> (<em>torch.Tensor</em>) - Sampled token IDs <code class="docutils literal notranslate"><span class="pre">(batch,)</span></code></p></li>
+</ul>
+</section>
+<section id="top-p-nucleus-sampling">
+<h3>Top-P (Nucleus) Sampling<a class="headerlink" href="#top-p-nucleus-sampling" title="Link to this heading"></a></h3>
+<p>Nucleus sampling with probability threshold.</p>
+<p><strong>Parameters:</strong></p>
+<ul class="simple">
+<li><p><strong>logits</strong> (<em>torch.Tensor</em>) - Logits <code class="docutils literal notranslate"><span class="pre">(batch,</span> <span class="pre">vocab_size)</span></code></p></li>
+<li><p><strong>p</strong> (<em>float</em>) - Cumulative probability threshold (0.0 to 1.0)</p></li>
+<li><p><strong>temperature</strong> (<em>float</em>, optional) - Temperature. Default: <code class="docutils literal notranslate"><span class="pre">1.0</span></code></p></li>
+</ul>
+<p><strong>Returns:</strong></p>
+<ul class="simple">
+<li><p><strong>tokens</strong> (<em>torch.Tensor</em>) - Sampled tokens <code class="docutils literal notranslate"><span class="pre">(batch,)</span></code></p></li>
+</ul>
+</section>
+</section>
+<section id="performance-notes">
+<h2>Performance Notes<a class="headerlink" href="#performance-notes" title="Link to this heading"></a></h2>
+<p>All operators are optimized for AMD GPUs:</p>
+<ul class="simple">
+<li><p><strong>FP16/BF16 preferred</strong>: Best performance on MI300X</p></li>
+<li><p><strong>Large batches</strong>: Better GPU utilization</p></li>
+<li><p><strong>Fused operations</strong>: Many ops fused into single kernels</p></li>
+<li><p><strong>In-place when possible</strong>: Reduces memory allocations</p></li>
+</ul>
+</section>
+<section id="supported-data-types">
+<h2>Supported Data Types<a class="headerlink" href="#supported-data-types" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 30.0%" />
+<col style="width: 25.0%" />
+<col style="width: 25.0%" />
+<col style="width: 20.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Operator</p></th>
+<th class="head"><p>FP32</p></th>
+<th class="head"><p>FP16</p></th>
+<th class="head"><p>BF16</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>rmsnorm</p></td>
+<td><p>✓</p></td>
+<td><p>✓ (fastest)</p></td>
+<td><p>✓</p></td>
+</tr>
+<tr class="row-odd"><td><p>layernorm</p></td>
+<td><p>✓</p></td>
+<td><p>✓ (fastest)</p></td>
+<td><p>✓</p></td>
+</tr>
+<tr class="row-even"><td><p>gelu</p></td>
+<td><p>✓</p></td>
+<td><p>✓ (fastest)</p></td>
+<td><p>✓</p></td>
+</tr>
+<tr class="row-odd"><td><p>swiglu</p></td>
+<td><p>✓</p></td>
+<td><p>✓ (fastest)</p></td>
+<td><p>✓</p></td>
+</tr>
+<tr class="row-even"><td><p>apply_rotary_pos_emb</p></td>
+<td><p>✓</p></td>
+<td><p>✓ (fastest)</p></td>
+<td><p>✓</p></td>
+</tr>
+<tr class="row-odd"><td><p>sampling ops</p></td>
+<td><p>✓</p></td>
+<td><p>✓</p></td>
+<td><p>✓</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="see-also">
+<h2>See Also<a class="headerlink" href="#see-also" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p><span class="xref std std-doc">../tutorials/normalization</span> - Normalization tutorial</p></li>
+<li><p><span class="xref std std-doc">../tutorials/custom_ops</span> - Adding custom operators</p></li>
+<li><p><a class="reference internal" href="gemm.html"><span class="doc">GEMM Operations</span></a> - Matrix multiplication operations</p></li>
+</ul>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="gemm.html" class="btn btn-neutral float-left" title="GEMM Operations" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

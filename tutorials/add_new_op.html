@@ -1,0 +1,727 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>How to Add a New Operator &mdash; AITER 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../_static/documentation_options.js?v=01f34227"></script>
+      <script src="../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Attention Operations" href="../api/attention.html" />
+    <link rel="prev" title="Basic Usage" href="basic_usage.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="../index.html" class="icon icon-home">
+            AITER
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../installation.html#requirements">Requirements</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../installation.html#system-requirements">System Requirements</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../installation.html#software-dependencies">Software Dependencies</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../installation.html#installation-methods">Installation Methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../installation.html#method-1-from-pypi-recommended">Method 1: From PyPI (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../installation.html#method-2-from-source">Method 2: From Source</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../installation.html#basic-installation">Basic Installation</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../installation.html#development-mode-jit">Development Mode (JIT)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../installation.html#precompiled-installation">Precompiled Installation</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="../installation.html#environment-variables">Environment Variables</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../installation.html#example-configurations">Example Configurations</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="../installation.html#method-3-docker">Method 3: Docker</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../installation.html#verifying-installation">Verifying Installation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation.html#optional-triton-communication-support">Optional: Triton Communication Support</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation.html#troubleshooting">Troubleshooting</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../installation.html#rocm-not-found">ROCm Not Found</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../installation.html#compilation-errors">Compilation Errors</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../installation.html#import-errors">Import Errors</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../installation.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../quickstart.html">Quickstart</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#installation">Installation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#verify-installation">Verify Installation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#first-example-flash-attention">First Example: Flash Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#variable-length-sequences">Variable-Length Sequences</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#mixture-of-experts-moe">Mixture of Experts (MoE)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#rmsnorm">RMSNorm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#performance-tips">Performance Tips</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#next-steps">Next Steps</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#common-issues">Common Issues</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../quickstart.html#get-help">Get Help</a></li>
+</ul>
+</li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">Tutorials</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="basic_usage.html">Basic Usage</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="basic_usage.html#installation-check">Installation Check</a></li>
+<li class="toctree-l3"><a class="reference internal" href="basic_usage.html#hello-world-flash-attention">Hello World: Flash Attention</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="basic_usage.html#understanding-the-parameters">Understanding the Parameters</a></li>
+<li class="toctree-l4"><a class="reference internal" href="basic_usage.html#comparing-with-pytorch">Comparing with PyTorch</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="basic_usage.html#working-with-different-precisions">Working with Different Precisions</a></li>
+<li class="toctree-l3"><a class="reference internal" href="basic_usage.html#rmsnorm-example">RMSNorm Example</a></li>
+<li class="toctree-l3"><a class="reference internal" href="basic_usage.html#batched-operations">Batched Operations</a></li>
+<li class="toctree-l3"><a class="reference internal" href="basic_usage.html#error-handling">Error Handling</a></li>
+<li class="toctree-l3"><a class="reference internal" href="basic_usage.html#memory-management">Memory Management</a></li>
+<li class="toctree-l3"><a class="reference internal" href="basic_usage.html#next-steps">Next Steps</a></li>
+<li class="toctree-l3"><a class="reference internal" href="basic_usage.html#common-gotchas">Common Gotchas</a></li>
+</ul>
+</li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">How to Add a New Operator</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#overview">Overview</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#step-1-define-the-operator-interface">Step 1: Define the Operator Interface</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#step-2-implement-the-rocm-kernel">Step 2: Implement the ROCm Kernel</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#step-3-create-python-bindings">Step 3: Create Python Bindings</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#step-4-update-build-configuration">Step 4: Update Build Configuration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#step-5-add-tests">Step 5: Add Tests</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#step-6-build-and-install">Step 6: Build and Install</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#step-7-register-in-main-module">Step 7: Register in Main Module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#advanced-optimizations">Advanced: Optimizations</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#use-ck-composable-kernel-for-better-performance">Use CK (Composable Kernel) for Better Performance</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#use-triton-for-easier-kernel-development">Use Triton for Easier Kernel Development</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#common-patterns">Common Patterns</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#pattern-1-fused-operations">Pattern 1: Fused Operations</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#pattern-2-in-place-operations">Pattern 2: In-Place Operations</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#pattern-3-autograd-support">Pattern 3: Autograd Support</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#best-practices">Best Practices</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#debugging-tips">Debugging Tips</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#print-kernel-launches">Print Kernel Launches</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#check-for-memory-errors">Check for Memory Errors</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#profile-your-operator">Profile Your Operator</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#example-complete-rmsnorm-implementation">Example: Complete RMSNorm Implementation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#next-steps">Next Steps</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#contributing">Contributing</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#tutorial-overview">Tutorial Overview</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="index.html#basic-tutorials">Basic Tutorials</a></li>
+<li class="toctree-l3"><a class="reference internal" href="index.html#advanced-topics">Advanced Topics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="index.html#integration-guides">Integration Guides</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#prerequisites">Prerequisites</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#example-data">Example Data</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#jupyter-notebooks">Jupyter Notebooks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#running-examples">Running Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#community-examples">Community Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#contributing-tutorials">Contributing Tutorials</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../api/attention.html">Attention Operations</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../api/attention.html#flash-attention">Flash Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../api/attention.html#flash-attention-with-kv-cache">Flash Attention with KV Cache</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../api/attention.html#grouped-query-attention-gqa">Grouped Query Attention (GQA)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../api/attention.html#multi-query-attention-mqa">Multi-Query Attention (MQA)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../api/attention.html#variable-sequence-attention">Variable Sequence Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../api/attention.html#supported-architectures">Supported Architectures</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../api/attention.html#performance-characteristics">Performance Characteristics</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../api/attention.html#see-also">See Also</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../api/gemm.html">GEMM Operations</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../api/gemm.html#grouped-gemm">Grouped GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../api/gemm.html#batched-gemm">Batched GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../api/gemm.html#fused-gemm-operations">Fused GEMM Operations</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../api/gemm.html#gemm-bias">GEMM + Bias</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../api/gemm.html#gemm-gelu">GEMM + GELU</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../api/gemm.html#gemm-relu">GEMM + ReLU</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../api/gemm.html#cutlass-style-gemm">CUTLASS-style GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../api/gemm.html#sparse-gemm">Sparse GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../api/gemm.html#int8-quantized-gemm">INT8 Quantized GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../api/gemm.html#performance-characteristics">Performance Characteristics</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../api/gemm.html#optimization-tips">Optimization Tips</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../api/gemm.html#example-optimal-moe-forward-pass">Example: Optimal MoE Forward Pass</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../api/gemm.html#see-also">See Also</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../api/operators.html">Core Operators</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../api/operators.html#rmsnorm">RMSNorm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../api/operators.html#layernorm">LayerNorm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../api/operators.html#softmax">SoftMax</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../api/operators.html#gelu">GELU</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../api/operators.html#swiglu">SwiGLU</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../api/operators.html#rotary-position-embedding-rope">Rotary Position Embedding (RoPE)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../api/operators.html#sampling-operations">Sampling Operations</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../api/operators.html#top-k-sampling">Top-K Sampling</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../api/operators.html#top-p-nucleus-sampling">Top-P (Nucleus) Sampling</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../api/operators.html#performance-notes">Performance Notes</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../api/operators.html#supported-data-types">Supported Data Types</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../api/operators.html#see-also">See Also</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../index.html">AITER</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">Tutorials</a></li>
+      <li class="breadcrumb-item active">How to Add a New Operator</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../_sources/tutorials/add_new_op.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="how-to-add-a-new-operator">
+<h1>How to Add a New Operator<a class="headerlink" href="#how-to-add-a-new-operator" title="Link to this heading"></a></h1>
+<p>This tutorial shows you how to add a custom operator to AITER.</p>
+<section id="overview">
+<h2>Overview<a class="headerlink" href="#overview" title="Link to this heading"></a></h2>
+<p>Adding a new operator involves:</p>
+<ol class="arabic simple">
+<li><p><strong>Define the operator interface</strong> (Python)</p></li>
+<li><p><strong>Implement the kernel</strong> (ROCm/HIP C++)</p></li>
+<li><p><strong>Create Python bindings</strong> (PyBind11)</p></li>
+<li><p><strong>Add tests</strong></p></li>
+<li><p><strong>Register the operator</strong></p></li>
+</ol>
+</section>
+<section id="step-1-define-the-operator-interface">
+<h2>Step 1: Define the Operator Interface<a class="headerlink" href="#step-1-define-the-operator-interface" title="Link to this heading"></a></h2>
+<p>Create your operator’s Python interface in <code class="docutils literal notranslate"><span class="pre">aiter/ops/</span></code>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># aiter/ops/my_custom_op.py</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Optional</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">my_custom_op</span><span class="p">(</span>
+    <span class="nb">input</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">weight</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">bias</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">activation</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;gelu&quot;</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    Custom operator that does something awesome.</span>
+
+<span class="sd">    Args:</span>
+<span class="sd">        input: Input tensor (batch, seq_len, hidden_dim)</span>
+<span class="sd">        weight: Weight tensor (hidden_dim, output_dim)</span>
+<span class="sd">        bias: Optional bias tensor (output_dim,)</span>
+<span class="sd">        activation: Activation function (&#39;gelu&#39;, &#39;relu&#39;, &#39;none&#39;)</span>
+
+<span class="sd">    Returns:</span>
+<span class="sd">        Output tensor (batch, seq_len, output_dim)</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="c1"># Import the C++ extension</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">aiter._C</span><span class="w"> </span><span class="kn">import</span> <span class="n">my_custom_op_impl</span>
+
+    <span class="c1"># Input validation</span>
+    <span class="k">assert</span> <span class="nb">input</span><span class="o">.</span><span class="n">is_cuda</span><span class="p">,</span> <span class="s2">&quot;Input must be on CUDA device&quot;</span>
+    <span class="k">assert</span> <span class="nb">input</span><span class="o">.</span><span class="n">dtype</span> <span class="ow">in</span> <span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">],</span> \
+        <span class="s2">&quot;Only FP16/BF16 supported&quot;</span>
+
+    <span class="c1"># Call C++ implementation</span>
+    <span class="k">return</span> <span class="n">my_custom_op_impl</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">bias</span><span class="p">,</span> <span class="n">activation</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="step-2-implement-the-rocm-kernel">
+<h2>Step 2: Implement the ROCm Kernel<a class="headerlink" href="#step-2-implement-the-rocm-kernel" title="Link to this heading"></a></h2>
+<p>Create the kernel implementation in <code class="docutils literal notranslate"><span class="pre">csrc/</span></code>:</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="c1">// csrc/my_custom_op.hip</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;hip/hip_runtime.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;torch/extension.h&gt;</span>
+
+<span class="c1">// Kernel implementation</span>
+<span class="k">template</span><span class="o">&lt;</span><span class="k">typename</span><span class="w"> </span><span class="nc">T</span><span class="o">&gt;</span>
+<span class="n">__global__</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="n">my_custom_kernel</span><span class="p">(</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="n">T</span><span class="o">*</span><span class="w"> </span><span class="n">input</span><span class="p">,</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="n">T</span><span class="o">*</span><span class="w"> </span><span class="n">weight</span><span class="p">,</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="n">T</span><span class="o">*</span><span class="w"> </span><span class="n">bias</span><span class="p">,</span>
+<span class="w">    </span><span class="n">T</span><span class="o">*</span><span class="w"> </span><span class="n">output</span><span class="p">,</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">batch_size</span><span class="p">,</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">seq_len</span><span class="p">,</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">hidden_dim</span><span class="p">,</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">output_dim</span>
+<span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">idx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">blockIdx</span><span class="p">.</span><span class="n">x</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">blockDim</span><span class="p">.</span><span class="n">x</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">threadIdx</span><span class="p">.</span><span class="n">x</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">total_elements</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">batch_size</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">seq_len</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">output_dim</span><span class="p">;</span>
+
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">idx</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">total_elements</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">int</span><span class="w"> </span><span class="n">b</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">idx</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="p">(</span><span class="n">seq_len</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">output_dim</span><span class="p">);</span>
+<span class="w">        </span><span class="kt">int</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">idx</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">output_dim</span><span class="p">)</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">seq_len</span><span class="p">;</span>
+<span class="w">        </span><span class="kt">int</span><span class="w"> </span><span class="n">o</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">idx</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">output_dim</span><span class="p">;</span>
+
+<span class="w">        </span><span class="c1">// Your computation here</span>
+<span class="w">        </span><span class="n">T</span><span class="w"> </span><span class="n">sum</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">h</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">h</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">hidden_dim</span><span class="p">;</span><span class="w"> </span><span class="n">h</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="kt">int</span><span class="w"> </span><span class="n">input_idx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">b</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">seq_len</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">hidden_dim</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">hidden_dim</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">h</span><span class="p">;</span>
+<span class="w">            </span><span class="kt">int</span><span class="w"> </span><span class="n">weight_idx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">h</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">output_dim</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">o</span><span class="p">;</span>
+<span class="w">            </span><span class="n">sum</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">input</span><span class="p">[</span><span class="n">input_idx</span><span class="p">]</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">weight</span><span class="p">[</span><span class="n">weight_idx</span><span class="p">];</span>
+<span class="w">        </span><span class="p">}</span>
+
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">bias</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="k">nullptr</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">sum</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">bias</span><span class="p">[</span><span class="n">o</span><span class="p">];</span>
+<span class="w">        </span><span class="p">}</span>
+
+<span class="w">        </span><span class="c1">// Apply activation</span>
+<span class="w">        </span><span class="c1">// (GELU, ReLU, etc.)</span>
+<span class="w">        </span><span class="n">output</span><span class="p">[</span><span class="n">idx</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">sum</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+
+<span class="c1">// Host function</span>
+<span class="n">torch</span><span class="o">::</span><span class="n">Tensor</span><span class="w"> </span><span class="n">my_custom_op_cuda</span><span class="p">(</span>
+<span class="w">    </span><span class="n">torch</span><span class="o">::</span><span class="n">Tensor</span><span class="w"> </span><span class="n">input</span><span class="p">,</span>
+<span class="w">    </span><span class="n">torch</span><span class="o">::</span><span class="n">Tensor</span><span class="w"> </span><span class="n">weight</span><span class="p">,</span>
+<span class="w">    </span><span class="n">torch</span><span class="o">::</span><span class="n">Tensor</span><span class="w"> </span><span class="n">bias</span><span class="p">,</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="w"> </span><span class="n">activation</span>
+<span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// Get dimensions</span>
+<span class="w">    </span><span class="k">auto</span><span class="w"> </span><span class="n">batch_size</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">input</span><span class="p">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+<span class="w">    </span><span class="k">auto</span><span class="w"> </span><span class="n">seq_len</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">input</span><span class="p">.</span><span class="n">size</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="k">auto</span><span class="w"> </span><span class="n">hidden_dim</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">input</span><span class="p">.</span><span class="n">size</span><span class="p">(</span><span class="mi">2</span><span class="p">);</span>
+<span class="w">    </span><span class="k">auto</span><span class="w"> </span><span class="n">output_dim</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">weight</span><span class="p">.</span><span class="n">size</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// Allocate output</span>
+<span class="w">    </span><span class="k">auto</span><span class="w"> </span><span class="n">output</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">torch</span><span class="o">::</span><span class="n">empty</span><span class="p">(</span>
+<span class="w">        </span><span class="p">{</span><span class="n">batch_size</span><span class="p">,</span><span class="w"> </span><span class="n">seq_len</span><span class="p">,</span><span class="w"> </span><span class="n">output_dim</span><span class="p">},</span>
+<span class="w">        </span><span class="n">input</span><span class="p">.</span><span class="n">options</span><span class="p">()</span>
+<span class="w">    </span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// Launch kernel</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">total_elements</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">batch_size</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">seq_len</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">output_dim</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">threads</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">256</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">blocks</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">total_elements</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">threads</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">threads</span><span class="p">;</span>
+
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">input</span><span class="p">.</span><span class="n">dtype</span><span class="p">()</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">torch</span><span class="o">::</span><span class="n">kFloat16</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">my_custom_kernel</span><span class="o">&lt;</span><span class="n">__half</span><span class="o">&gt;&lt;&lt;&lt;</span><span class="n">blocks</span><span class="p">,</span><span class="w"> </span><span class="n">threads</span><span class="o">&gt;&gt;&gt;</span><span class="p">(</span>
+<span class="w">            </span><span class="k">reinterpret_cast</span><span class="o">&lt;</span><span class="n">__half</span><span class="o">*&gt;</span><span class="p">(</span><span class="n">input</span><span class="p">.</span><span class="n">data_ptr</span><span class="p">()),</span>
+<span class="w">            </span><span class="k">reinterpret_cast</span><span class="o">&lt;</span><span class="n">__half</span><span class="o">*&gt;</span><span class="p">(</span><span class="n">weight</span><span class="p">.</span><span class="n">data_ptr</span><span class="p">()),</span>
+<span class="w">            </span><span class="n">bias</span><span class="p">.</span><span class="n">defined</span><span class="p">()</span><span class="w"> </span><span class="o">?</span><span class="w"> </span><span class="k">reinterpret_cast</span><span class="o">&lt;</span><span class="n">__half</span><span class="o">*&gt;</span><span class="p">(</span><span class="n">bias</span><span class="p">.</span><span class="n">data_ptr</span><span class="p">())</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="k">nullptr</span><span class="p">,</span>
+<span class="w">            </span><span class="k">reinterpret_cast</span><span class="o">&lt;</span><span class="n">__half</span><span class="o">*&gt;</span><span class="p">(</span><span class="n">output</span><span class="p">.</span><span class="n">data_ptr</span><span class="p">()),</span>
+<span class="w">            </span><span class="n">batch_size</span><span class="p">,</span><span class="w"> </span><span class="n">seq_len</span><span class="p">,</span><span class="w"> </span><span class="n">hidden_dim</span><span class="p">,</span><span class="w"> </span><span class="n">output_dim</span>
+<span class="w">        </span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// BF16 case</span>
+<span class="w">        </span><span class="n">my_custom_kernel</span><span class="o">&lt;</span><span class="n">__nv_bfloat16</span><span class="o">&gt;&lt;&lt;&lt;</span><span class="n">blocks</span><span class="p">,</span><span class="w"> </span><span class="n">threads</span><span class="o">&gt;&gt;&gt;</span><span class="p">(</span>
+<span class="w">            </span><span class="k">reinterpret_cast</span><span class="o">&lt;</span><span class="n">__nv_bfloat16</span><span class="o">*&gt;</span><span class="p">(</span><span class="n">input</span><span class="p">.</span><span class="n">data_ptr</span><span class="p">()),</span>
+<span class="w">            </span><span class="k">reinterpret_cast</span><span class="o">&lt;</span><span class="n">__nv_bfloat16</span><span class="o">*&gt;</span><span class="p">(</span><span class="n">weight</span><span class="p">.</span><span class="n">data_ptr</span><span class="p">()),</span>
+<span class="w">            </span><span class="n">bias</span><span class="p">.</span><span class="n">defined</span><span class="p">()</span><span class="w"> </span><span class="o">?</span><span class="w"> </span><span class="k">reinterpret_cast</span><span class="o">&lt;</span><span class="n">__nv_bfloat16</span><span class="o">*&gt;</span><span class="p">(</span><span class="n">bias</span><span class="p">.</span><span class="n">data_ptr</span><span class="p">())</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="k">nullptr</span><span class="p">,</span>
+<span class="w">            </span><span class="k">reinterpret_cast</span><span class="o">&lt;</span><span class="n">__nv_bfloat16</span><span class="o">*&gt;</span><span class="p">(</span><span class="n">output</span><span class="p">.</span><span class="n">data_ptr</span><span class="p">()),</span>
+<span class="w">            </span><span class="n">batch_size</span><span class="p">,</span><span class="w"> </span><span class="n">seq_len</span><span class="p">,</span><span class="w"> </span><span class="n">hidden_dim</span><span class="p">,</span><span class="w"> </span><span class="n">output_dim</span>
+<span class="w">        </span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">output</span><span class="p">;</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+<section id="step-3-create-python-bindings">
+<h2>Step 3: Create Python Bindings<a class="headerlink" href="#step-3-create-python-bindings" title="Link to this heading"></a></h2>
+<p>Add PyBind11 bindings in <code class="docutils literal notranslate"><span class="pre">csrc/my_custom_op_bindings.cpp</span></code>:</p>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;torch/extension.h&gt;</span>
+
+<span class="c1">// Forward declare CUDA function</span>
+<span class="n">torch</span><span class="o">::</span><span class="n">Tensor</span><span class="w"> </span><span class="nf">my_custom_op_cuda</span><span class="p">(</span>
+<span class="w">    </span><span class="n">torch</span><span class="o">::</span><span class="n">Tensor</span><span class="w"> </span><span class="n">input</span><span class="p">,</span>
+<span class="w">    </span><span class="n">torch</span><span class="o">::</span><span class="n">Tensor</span><span class="w"> </span><span class="n">weight</span><span class="p">,</span>
+<span class="w">    </span><span class="n">torch</span><span class="o">::</span><span class="n">Tensor</span><span class="w"> </span><span class="n">bias</span><span class="p">,</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="w"> </span><span class="n">activation</span>
+<span class="p">);</span>
+
+<span class="c1">// Wrapper for Python</span>
+<span class="n">torch</span><span class="o">::</span><span class="n">Tensor</span><span class="w"> </span><span class="nf">my_custom_op_impl</span><span class="p">(</span>
+<span class="w">    </span><span class="n">torch</span><span class="o">::</span><span class="n">Tensor</span><span class="w"> </span><span class="n">input</span><span class="p">,</span>
+<span class="w">    </span><span class="n">torch</span><span class="o">::</span><span class="n">Tensor</span><span class="w"> </span><span class="n">weight</span><span class="p">,</span>
+<span class="w">    </span><span class="n">torch</span><span class="o">::</span><span class="n">Tensor</span><span class="w"> </span><span class="n">bias</span><span class="p">,</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="w"> </span><span class="n">activation</span>
+<span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">TORCH_CHECK</span><span class="p">(</span><span class="n">input</span><span class="p">.</span><span class="n">is_cuda</span><span class="p">(),</span><span class="w"> </span><span class="s">&quot;Input must be CUDA tensor&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">my_custom_op_cuda</span><span class="p">(</span><span class="n">input</span><span class="p">,</span><span class="w"> </span><span class="n">weight</span><span class="p">,</span><span class="w"> </span><span class="n">bias</span><span class="p">,</span><span class="w"> </span><span class="n">activation</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="n">PYBIND11_MODULE</span><span class="p">(</span><span class="n">TORCH_EXTENSION_NAME</span><span class="p">,</span><span class="w"> </span><span class="n">m</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">m</span><span class="p">.</span><span class="n">def</span><span class="p">(</span><span class="s">&quot;my_custom_op_impl&quot;</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">my_custom_op_impl</span><span class="p">,</span>
+<span class="w">          </span><span class="s">&quot;My custom operator (CUDA)&quot;</span><span class="p">,</span>
+<span class="w">          </span><span class="n">py</span><span class="o">::</span><span class="n">arg</span><span class="p">(</span><span class="s">&quot;input&quot;</span><span class="p">),</span>
+<span class="w">          </span><span class="n">py</span><span class="o">::</span><span class="n">arg</span><span class="p">(</span><span class="s">&quot;weight&quot;</span><span class="p">),</span>
+<span class="w">          </span><span class="n">py</span><span class="o">::</span><span class="n">arg</span><span class="p">(</span><span class="s">&quot;bias&quot;</span><span class="p">),</span>
+<span class="w">          </span><span class="n">py</span><span class="o">::</span><span class="n">arg</span><span class="p">(</span><span class="s">&quot;activation&quot;</span><span class="p">));</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+<section id="step-4-update-build-configuration">
+<h2>Step 4: Update Build Configuration<a class="headerlink" href="#step-4-update-build-configuration" title="Link to this heading"></a></h2>
+<p>Add your operator to <code class="docutils literal notranslate"><span class="pre">setup.py</span></code>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># setup.py</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">setuptools</span><span class="w"> </span><span class="kn">import</span> <span class="n">setup</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">torch.utils.cpp_extension</span><span class="w"> </span><span class="kn">import</span> <span class="n">BuildExtension</span><span class="p">,</span> <span class="n">CUDAExtension</span>
+
+<span class="n">setup</span><span class="p">(</span>
+    <span class="n">name</span><span class="o">=</span><span class="s1">&#39;aiter&#39;</span><span class="p">,</span>
+    <span class="n">ext_modules</span><span class="o">=</span><span class="p">[</span>
+        <span class="n">CUDAExtension</span><span class="p">(</span>
+            <span class="n">name</span><span class="o">=</span><span class="s1">&#39;aiter._C&#39;</span><span class="p">,</span>
+            <span class="n">sources</span><span class="o">=</span><span class="p">[</span>
+                <span class="s1">&#39;csrc/my_custom_op.hip&#39;</span><span class="p">,</span>
+                <span class="s1">&#39;csrc/my_custom_op_bindings.cpp&#39;</span><span class="p">,</span>
+                <span class="c1"># ... other sources</span>
+            <span class="p">],</span>
+            <span class="n">extra_compile_args</span><span class="o">=</span><span class="p">{</span>
+                <span class="s1">&#39;cxx&#39;</span><span class="p">:</span> <span class="p">[</span><span class="s1">&#39;-O3&#39;</span><span class="p">,</span> <span class="s1">&#39;-std=c++17&#39;</span><span class="p">],</span>
+                <span class="s1">&#39;nvcc&#39;</span><span class="p">:</span> <span class="p">[</span>
+                    <span class="s1">&#39;-O3&#39;</span><span class="p">,</span>
+                    <span class="s1">&#39;--use_fast_math&#39;</span><span class="p">,</span>
+                    <span class="s1">&#39;-gencode&#39;</span><span class="p">,</span> <span class="s1">&#39;arch=compute_90a,code=sm_90a&#39;</span><span class="p">,</span>  <span class="c1"># MI250X</span>
+                    <span class="s1">&#39;-gencode&#39;</span><span class="p">,</span> <span class="s1">&#39;arch=compute_942,code=sm_942&#39;</span><span class="p">,</span>  <span class="c1"># MI300X</span>
+                <span class="p">]</span>
+            <span class="p">}</span>
+        <span class="p">),</span>
+    <span class="p">],</span>
+    <span class="n">cmdclass</span><span class="o">=</span><span class="p">{</span><span class="s1">&#39;build_ext&#39;</span><span class="p">:</span> <span class="n">BuildExtension</span><span class="p">}</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="step-5-add-tests">
+<h2>Step 5: Add Tests<a class="headerlink" href="#step-5-add-tests" title="Link to this heading"></a></h2>
+<p>Create tests in <code class="docutils literal notranslate"><span class="pre">tests/test_my_custom_op.py</span></code>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">pytest</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">aiter.ops</span><span class="w"> </span><span class="kn">import</span> <span class="n">my_custom_op</span>
+
+<span class="nd">@pytest</span><span class="o">.</span><span class="n">mark</span><span class="o">.</span><span class="n">parametrize</span><span class="p">(</span><span class="s2">&quot;dtype&quot;</span><span class="p">,</span> <span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">])</span>
+<span class="nd">@pytest</span><span class="o">.</span><span class="n">mark</span><span class="o">.</span><span class="n">parametrize</span><span class="p">(</span><span class="s2">&quot;batch_size&quot;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">16</span><span class="p">])</span>
+<span class="nd">@pytest</span><span class="o">.</span><span class="n">mark</span><span class="o">.</span><span class="n">parametrize</span><span class="p">(</span><span class="s2">&quot;seq_len&quot;</span><span class="p">,</span> <span class="p">[</span><span class="mi">128</span><span class="p">,</span> <span class="mi">512</span><span class="p">,</span> <span class="mi">2048</span><span class="p">])</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">test_my_custom_op_correctness</span><span class="p">(</span><span class="n">dtype</span><span class="p">,</span> <span class="n">batch_size</span><span class="p">,</span> <span class="n">seq_len</span><span class="p">):</span>
+    <span class="n">hidden_dim</span> <span class="o">=</span> <span class="mi">512</span>
+    <span class="n">output_dim</span> <span class="o">=</span> <span class="mi">2048</span>
+
+    <span class="c1"># Create inputs</span>
+    <span class="nb">input</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">seq_len</span><span class="p">,</span> <span class="n">hidden_dim</span><span class="p">,</span>
+                       <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cuda&#39;</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+    <span class="n">weight</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">hidden_dim</span><span class="p">,</span> <span class="n">output_dim</span><span class="p">,</span>
+                        <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cuda&#39;</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+    <span class="n">bias</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">output_dim</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cuda&#39;</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+
+    <span class="c1"># Run custom op</span>
+    <span class="n">output</span> <span class="o">=</span> <span class="n">my_custom_op</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">bias</span><span class="p">,</span> <span class="n">activation</span><span class="o">=</span><span class="s1">&#39;gelu&#39;</span><span class="p">)</span>
+
+    <span class="c1"># Reference implementation (PyTorch)</span>
+    <span class="n">ref_output</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">matmul</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">weight</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">bias</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">ref_output</span> <span class="o">=</span> <span class="n">ref_output</span> <span class="o">+</span> <span class="n">bias</span>
+    <span class="n">ref_output</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">gelu</span><span class="p">(</span><span class="n">ref_output</span><span class="p">)</span>
+
+    <span class="c1"># Check correctness</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">testing</span><span class="o">.</span><span class="n">assert_close</span><span class="p">(</span>
+        <span class="n">output</span><span class="p">,</span> <span class="n">ref_output</span><span class="p">,</span>
+        <span class="n">rtol</span><span class="o">=</span><span class="mf">1e-2</span><span class="p">,</span> <span class="n">atol</span><span class="o">=</span><span class="mf">1e-2</span>  <span class="c1"># FP16/BF16 tolerance</span>
+    <span class="p">)</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">test_my_custom_op_performance</span><span class="p">():</span>
+    <span class="n">batch_size</span><span class="p">,</span> <span class="n">seq_len</span> <span class="o">=</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">2048</span>
+    <span class="n">hidden_dim</span><span class="p">,</span> <span class="n">output_dim</span> <span class="o">=</span> <span class="mi">4096</span><span class="p">,</span> <span class="mi">4096</span>
+
+    <span class="nb">input</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">seq_len</span><span class="p">,</span> <span class="n">hidden_dim</span><span class="p">,</span>
+                       <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cuda&#39;</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span>
+    <span class="n">weight</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">hidden_dim</span><span class="p">,</span> <span class="n">output_dim</span><span class="p">,</span>
+                        <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cuda&#39;</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span>
+    <span class="n">bias</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">output_dim</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s1">&#39;cuda&#39;</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">)</span>
+
+    <span class="c1"># Warmup</span>
+    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">10</span><span class="p">):</span>
+        <span class="n">_</span> <span class="o">=</span> <span class="n">my_custom_op</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">bias</span><span class="p">)</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+
+    <span class="c1"># Benchmark</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+    <span class="n">start</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">100</span><span class="p">):</span>
+        <span class="n">output</span> <span class="o">=</span> <span class="n">my_custom_op</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">bias</span><span class="p">)</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+    <span class="n">elapsed</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span> <span class="o">-</span> <span class="n">start</span>
+
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Average time: </span><span class="si">{</span><span class="n">elapsed</span><span class="o">/</span><span class="mi">100</span><span class="o">*</span><span class="mi">1000</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> ms&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Throughput: </span><span class="si">{</span><span class="n">batch_size</span><span class="o">*</span><span class="n">seq_len</span><span class="o">*</span><span class="mi">100</span><span class="o">/</span><span class="n">elapsed</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> tokens/sec&quot;</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="step-6-build-and-install">
+<h2>Step 6: Build and Install<a class="headerlink" href="#step-6-build-and-install" title="Link to this heading"></a></h2>
+<p>Build your extension:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Clean build</span>
+python<span class="w"> </span>setup.py<span class="w"> </span>clean
+rm<span class="w"> </span>-rf<span class="w"> </span>build/
+
+<span class="c1"># Build and install</span>
+python<span class="w"> </span>setup.py<span class="w"> </span>develop
+
+<span class="c1"># Or for production</span>
+python<span class="w"> </span>setup.py<span class="w"> </span>install
+</pre></div>
+</div>
+</section>
+<section id="step-7-register-in-main-module">
+<h2>Step 7: Register in Main Module<a class="headerlink" href="#step-7-register-in-main-module" title="Link to this heading"></a></h2>
+<p>Add to <code class="docutils literal notranslate"><span class="pre">aiter/__init__.py</span></code>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># aiter/__init__.py</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">aiter.ops.my_custom_op</span><span class="w"> </span><span class="kn">import</span> <span class="n">my_custom_op</span>
+
+<span class="n">__all__</span> <span class="o">=</span> <span class="p">[</span>
+    <span class="s1">&#39;my_custom_op&#39;</span><span class="p">,</span>
+    <span class="c1"># ... other exports</span>
+<span class="p">]</span>
+</pre></div>
+</div>
+</section>
+<section id="advanced-optimizations">
+<h2>Advanced: Optimizations<a class="headerlink" href="#advanced-optimizations" title="Link to this heading"></a></h2>
+<section id="use-ck-composable-kernel-for-better-performance">
+<h3>Use CK (Composable Kernel) for Better Performance<a class="headerlink" href="#use-ck-composable-kernel-for-better-performance" title="Link to this heading"></a></h3>
+<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;ck/tensor_operation/gpu/device/device_gemm.hpp&quot;</span>
+
+<span class="c1">// Use CK&#39;s optimized GEMM</span>
+<span class="k">using</span><span class="w"> </span><span class="n">DeviceGemmInstance</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ck</span><span class="o">::</span><span class="n">tensor_operation</span><span class="o">::</span><span class="n">device</span><span class="o">::</span><span class="n">DeviceGemm</span><span class="o">&lt;</span>
+<span class="w">    </span><span class="cm">/* ... template parameters ... */</span>
+<span class="o">&gt;</span><span class="p">;</span>
+</pre></div>
+</div>
+</section>
+<section id="use-triton-for-easier-kernel-development">
+<h3>Use Triton for Easier Kernel Development<a class="headerlink" href="#use-triton-for-easier-kernel-development" title="Link to this heading"></a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">triton</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">triton.language</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">tl</span>
+
+<span class="nd">@triton</span><span class="o">.</span><span class="n">jit</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">my_custom_kernel</span><span class="p">(</span>
+    <span class="n">input_ptr</span><span class="p">,</span> <span class="n">weight_ptr</span><span class="p">,</span> <span class="n">output_ptr</span><span class="p">,</span>
+    <span class="n">M</span><span class="p">,</span> <span class="n">N</span><span class="p">,</span> <span class="n">K</span><span class="p">,</span>
+    <span class="n">BLOCK_M</span><span class="p">:</span> <span class="n">tl</span><span class="o">.</span><span class="n">constexpr</span><span class="p">,</span> <span class="n">BLOCK_N</span><span class="p">:</span> <span class="n">tl</span><span class="o">.</span><span class="n">constexpr</span><span class="p">,</span> <span class="n">BLOCK_K</span><span class="p">:</span> <span class="n">tl</span><span class="o">.</span><span class="n">constexpr</span>
+<span class="p">):</span>
+    <span class="c1"># Triton kernel implementation</span>
+    <span class="c1"># (Much easier than raw HIP/CUDA!)</span>
+    <span class="k">pass</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="common-patterns">
+<h2>Common Patterns<a class="headerlink" href="#common-patterns" title="Link to this heading"></a></h2>
+<section id="pattern-1-fused-operations">
+<h3>Pattern 1: Fused Operations<a class="headerlink" href="#pattern-1-fused-operations" title="Link to this heading"></a></h3>
+<p>Combine multiple ops into one kernel:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">fused_linear_gelu</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">bias</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    Fuses: output = GELU(input @ weight + bias)</span>
+<span class="sd">    Faster than separate ops!</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="k">pass</span>
+</pre></div>
+</div>
+</section>
+<section id="pattern-2-in-place-operations">
+<h3>Pattern 2: In-Place Operations<a class="headerlink" href="#pattern-2-in-place-operations" title="Link to this heading"></a></h3>
+<p>Modify tensors in-place to save memory:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">inplace_rmsnorm_</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">eps</span><span class="o">=</span><span class="mf">1e-6</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    In-place RMSNorm (modifies input)</span>
+<span class="sd">    Note the trailing underscore!</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="k">pass</span>
+</pre></div>
+</div>
+</section>
+<section id="pattern-3-autograd-support">
+<h3>Pattern 3: Autograd Support<a class="headerlink" href="#pattern-3-autograd-support" title="Link to this heading"></a></h3>
+<p>Add backward pass for training:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">MyCustomOpFunction</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">Function</span><span class="p">):</span>
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="n">ctx</span><span class="p">,</span> <span class="nb">input</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">bias</span><span class="p">):</span>
+        <span class="n">ctx</span><span class="o">.</span><span class="n">save_for_backward</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">bias</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">my_custom_op_impl</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">bias</span><span class="p">)</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">backward</span><span class="p">(</span><span class="n">ctx</span><span class="p">,</span> <span class="n">grad_output</span><span class="p">):</span>
+        <span class="nb">input</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">bias</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">saved_tensors</span>
+        <span class="c1"># Compute gradients</span>
+        <span class="n">grad_input</span> <span class="o">=</span> <span class="o">...</span>
+        <span class="n">grad_weight</span> <span class="o">=</span> <span class="o">...</span>
+        <span class="n">grad_bias</span> <span class="o">=</span> <span class="o">...</span>
+        <span class="k">return</span> <span class="n">grad_input</span><span class="p">,</span> <span class="n">grad_weight</span><span class="p">,</span> <span class="n">grad_bias</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="best-practices">
+<h2>Best Practices<a class="headerlink" href="#best-practices" title="Link to this heading"></a></h2>
+<ol class="arabic simple">
+<li><p><strong>Start Simple</strong>: Get it working first, optimize later</p></li>
+<li><p><strong>Test Correctness</strong>: Always compare with PyTorch reference</p></li>
+<li><p><strong>Profile First</strong>: Use <code class="docutils literal notranslate"><span class="pre">rocprof</span></code> to find bottlenecks</p></li>
+<li><p><strong>Use CK/Triton</strong>: Don’t write raw kernels unless necessary</p></li>
+<li><p><strong>Document Everything</strong>: Add docstrings and comments</p></li>
+<li><p><strong>Add Type Hints</strong>: Makes the API clearer</p></li>
+<li><p><strong>Handle Edge Cases</strong>: Check for invalid inputs</p></li>
+</ol>
+</section>
+<section id="debugging-tips">
+<h2>Debugging Tips<a class="headerlink" href="#debugging-tips" title="Link to this heading"></a></h2>
+<section id="print-kernel-launches">
+<h3>Print Kernel Launches<a class="headerlink" href="#print-kernel-launches" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">HIP_VISIBLE_DEVICES</span><span class="o">=</span><span class="m">0</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">AMD_LOG_LEVEL</span><span class="o">=</span><span class="m">3</span><span class="w">  </span><span class="c1"># Verbose logging</span>
+</pre></div>
+</div>
+</section>
+<section id="check-for-memory-errors">
+<h3>Check for Memory Errors<a class="headerlink" href="#check-for-memory-errors" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Use compute-sanitizer (if available)</span>
+rocm-compute-sanitizer<span class="w"> </span>python<span class="w"> </span>test_my_op.py
+</pre></div>
+</div>
+</section>
+<section id="profile-your-operator">
+<h3>Profile Your Operator<a class="headerlink" href="#profile-your-operator" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>rocprof<span class="w"> </span>--stats<span class="w"> </span>python<span class="w"> </span>benchmark_my_op.py
+</pre></div>
+</div>
+</section>
+</section>
+<section id="example-complete-rmsnorm-implementation">
+<h2>Example: Complete RMSNorm Implementation<a class="headerlink" href="#example-complete-rmsnorm-implementation" title="Link to this heading"></a></h2>
+<p>Here’s a complete example you can use as a template:</p>
+<p><strong>Python Interface</strong> (<code class="docutils literal notranslate"><span class="pre">aiter/ops/rmsnorm.py</span></code>):</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">aiter._C</span><span class="w"> </span><span class="kn">import</span> <span class="n">rmsnorm_forward</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">rmsnorm</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">weight</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">eps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1e-6</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    Root Mean Square Layer Normalization.</span>
+
+<span class="sd">    Args:</span>
+<span class="sd">        x: Input tensor (..., hidden_dim)</span>
+<span class="sd">        weight: Scaling weights (hidden_dim,)</span>
+<span class="sd">        eps: Epsilon for numerical stability</span>
+
+<span class="sd">    Returns:</span>
+<span class="sd">        Normalized tensor with same shape as input</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="k">assert</span> <span class="n">x</span><span class="o">.</span><span class="n">is_cuda</span> <span class="ow">and</span> <span class="n">weight</span><span class="o">.</span><span class="n">is_cuda</span>
+    <span class="k">assert</span> <span class="n">x</span><span class="o">.</span><span class="n">dtype</span> <span class="ow">in</span> <span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">float16</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">]</span>
+    <span class="k">return</span> <span class="n">rmsnorm_forward</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">eps</span><span class="p">)</span>
+</pre></div>
+</div>
+<p><strong>See Full Code</strong>: Check <code class="docutils literal notranslate"><span class="pre">csrc/</span></code> directory for complete implementations!</p>
+</section>
+<section id="next-steps">
+<h2>Next Steps<a class="headerlink" href="#next-steps" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="../api/operators.html"><span class="doc">Core Operators</span></a> - See existing operator implementations</p></li>
+<li><p><span class="xref std std-doc">../benchmarks</span> - Learn how to benchmark your operator</p></li>
+<li><p><span class="xref std std-doc">profiling</span> - Profile and optimize performance</p></li>
+</ul>
+</section>
+<section id="contributing">
+<h2>Contributing<a class="headerlink" href="#contributing" title="Link to this heading"></a></h2>
+<p>Want to contribute your operator to AITER?</p>
+<ol class="arabic simple">
+<li><p>Follow the coding style</p></li>
+<li><p>Add comprehensive tests</p></li>
+<li><p>Benchmark vs existing solutions</p></li>
+<li><p>Submit a PR with clear description</p></li>
+</ol>
+<p>See <code class="docutils literal notranslate"><span class="pre">CONTRIBUTING.md</span></code> for details!</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="basic_usage.html" class="btn btn-neutral float-left" title="Basic Usage" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="../api/attention.html" class="btn btn-neutral float-right" title="Attention Operations" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

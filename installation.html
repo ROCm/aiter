@@ -1,0 +1,437 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Installation &mdash; AITER 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=01f34227"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="Quickstart" href="quickstart.html" />
+    <link rel="prev" title="AITER Documentation" href="index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            AITER
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#requirements">Requirements</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#system-requirements">System Requirements</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#software-dependencies">Software Dependencies</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#installation-methods">Installation Methods</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#method-1-from-pypi-recommended">Method 1: From PyPI (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#method-2-from-source">Method 2: From Source</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#basic-installation">Basic Installation</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#development-mode-jit">Development Mode (JIT)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#precompiled-installation">Precompiled Installation</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#environment-variables">Environment Variables</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#example-configurations">Example Configurations</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#method-3-docker">Method 3: Docker</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#verifying-installation">Verifying Installation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#optional-triton-communication-support">Optional: Triton Communication Support</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#troubleshooting">Troubleshooting</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#rocm-not-found">ROCm Not Found</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#compilation-errors">Compilation Errors</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#import-errors">Import Errors</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#next-steps">Next Steps</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#installation">Installation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#verify-installation">Verify Installation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#first-example-flash-attention">First Example: Flash Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#variable-length-sequences">Variable-Length Sequences</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mixture-of-experts-moe">Mixture of Experts (MoE)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#rmsnorm">RMSNorm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#performance-tips">Performance Tips</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#common-issues">Common Issues</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#get-help">Get Help</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="tutorials/index.html">Tutorials</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="tutorials/basic_usage.html">Basic Usage</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/basic_usage.html#installation-check">Installation Check</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/basic_usage.html#hello-world-flash-attention">Hello World: Flash Attention</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="tutorials/basic_usage.html#understanding-the-parameters">Understanding the Parameters</a></li>
+<li class="toctree-l4"><a class="reference internal" href="tutorials/basic_usage.html#comparing-with-pytorch">Comparing with PyTorch</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/basic_usage.html#working-with-different-precisions">Working with Different Precisions</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/basic_usage.html#rmsnorm-example">RMSNorm Example</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/basic_usage.html#batched-operations">Batched Operations</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/basic_usage.html#error-handling">Error Handling</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/basic_usage.html#memory-management">Memory Management</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/basic_usage.html#next-steps">Next Steps</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/basic_usage.html#common-gotchas">Common Gotchas</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="tutorials/add_new_op.html">How to Add a New Operator</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#overview">Overview</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#step-1-define-the-operator-interface">Step 1: Define the Operator Interface</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#step-2-implement-the-rocm-kernel">Step 2: Implement the ROCm Kernel</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#step-3-create-python-bindings">Step 3: Create Python Bindings</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#step-4-update-build-configuration">Step 4: Update Build Configuration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#step-5-add-tests">Step 5: Add Tests</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#step-6-build-and-install">Step 6: Build and Install</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#step-7-register-in-main-module">Step 7: Register in Main Module</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#advanced-optimizations">Advanced: Optimizations</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="tutorials/add_new_op.html#use-ck-composable-kernel-for-better-performance">Use CK (Composable Kernel) for Better Performance</a></li>
+<li class="toctree-l4"><a class="reference internal" href="tutorials/add_new_op.html#use-triton-for-easier-kernel-development">Use Triton for Easier Kernel Development</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#common-patterns">Common Patterns</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="tutorials/add_new_op.html#pattern-1-fused-operations">Pattern 1: Fused Operations</a></li>
+<li class="toctree-l4"><a class="reference internal" href="tutorials/add_new_op.html#pattern-2-in-place-operations">Pattern 2: In-Place Operations</a></li>
+<li class="toctree-l4"><a class="reference internal" href="tutorials/add_new_op.html#pattern-3-autograd-support">Pattern 3: Autograd Support</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#best-practices">Best Practices</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#debugging-tips">Debugging Tips</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="tutorials/add_new_op.html#print-kernel-launches">Print Kernel Launches</a></li>
+<li class="toctree-l4"><a class="reference internal" href="tutorials/add_new_op.html#check-for-memory-errors">Check for Memory Errors</a></li>
+<li class="toctree-l4"><a class="reference internal" href="tutorials/add_new_op.html#profile-your-operator">Profile Your Operator</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#example-complete-rmsnorm-implementation">Example: Complete RMSNorm Implementation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#next-steps">Next Steps</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/add_new_op.html#contributing">Contributing</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="tutorials/index.html#tutorial-overview">Tutorial Overview</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/index.html#basic-tutorials">Basic Tutorials</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/index.html#advanced-topics">Advanced Topics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="tutorials/index.html#integration-guides">Integration Guides</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="tutorials/index.html#prerequisites">Prerequisites</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tutorials/index.html#example-data">Example Data</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tutorials/index.html#jupyter-notebooks">Jupyter Notebooks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tutorials/index.html#running-examples">Running Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tutorials/index.html#community-examples">Community Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tutorials/index.html#contributing-tutorials">Contributing Tutorials</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/attention.html">Attention Operations</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/attention.html#flash-attention">Flash Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/attention.html#flash-attention-with-kv-cache">Flash Attention with KV Cache</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/attention.html#grouped-query-attention-gqa">Grouped Query Attention (GQA)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/attention.html#multi-query-attention-mqa">Multi-Query Attention (MQA)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/attention.html#variable-sequence-attention">Variable Sequence Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/attention.html#supported-architectures">Supported Architectures</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/attention.html#performance-characteristics">Performance Characteristics</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/attention.html#see-also">See Also</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/gemm.html">GEMM Operations</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/gemm.html#grouped-gemm">Grouped GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/gemm.html#batched-gemm">Batched GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/gemm.html#fused-gemm-operations">Fused GEMM Operations</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="api/gemm.html#gemm-bias">GEMM + Bias</a></li>
+<li class="toctree-l3"><a class="reference internal" href="api/gemm.html#gemm-gelu">GEMM + GELU</a></li>
+<li class="toctree-l3"><a class="reference internal" href="api/gemm.html#gemm-relu">GEMM + ReLU</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="api/gemm.html#cutlass-style-gemm">CUTLASS-style GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/gemm.html#sparse-gemm">Sparse GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/gemm.html#int8-quantized-gemm">INT8 Quantized GEMM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/gemm.html#performance-characteristics">Performance Characteristics</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/gemm.html#optimization-tips">Optimization Tips</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/gemm.html#example-optimal-moe-forward-pass">Example: Optimal MoE Forward Pass</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/gemm.html#see-also">See Also</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/operators.html">Core Operators</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/operators.html#rmsnorm">RMSNorm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/operators.html#layernorm">LayerNorm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/operators.html#softmax">SoftMax</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/operators.html#gelu">GELU</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/operators.html#swiglu">SwiGLU</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/operators.html#rotary-position-embedding-rope">Rotary Position Embedding (RoPE)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/operators.html#sampling-operations">Sampling Operations</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="api/operators.html#top-k-sampling">Top-K Sampling</a></li>
+<li class="toctree-l3"><a class="reference internal" href="api/operators.html#top-p-nucleus-sampling">Top-P (Nucleus) Sampling</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="api/operators.html#performance-notes">Performance Notes</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/operators.html#supported-data-types">Supported Data Types</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/operators.html#see-also">See Also</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">AITER</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Installation</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/installation.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="installation">
+<h1>Installation<a class="headerlink" href="#installation" title="Link to this heading"></a></h1>
+<section id="requirements">
+<h2>Requirements<a class="headerlink" href="#requirements" title="Link to this heading"></a></h2>
+<section id="system-requirements">
+<h3>System Requirements<a class="headerlink" href="#system-requirements" title="Link to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>Operating System</strong>: Linux (Ubuntu 20.04+, RHEL 8+, or SLES 15+)</p></li>
+<li><p><strong>Python</strong>: 3.8 or later</p></li>
+<li><p><strong>ROCm</strong>: 5.7 or later (6.0+ recommended)</p></li>
+<li><p><strong>GPU</strong>: AMD GPU with gfx90a, gfx942, or gfx950 architecture</p></li>
+</ul>
+</section>
+<section id="software-dependencies">
+<h3>Software Dependencies<a class="headerlink" href="#software-dependencies" title="Link to this heading"></a></h3>
+<ul class="simple">
+<li><p>PyTorch 2.0+ with ROCm support</p></li>
+<li><p>ROCm libraries (hipBLAS, rocBLAS, MIOpen)</p></li>
+<li><p>Optional: Triton for Triton-based kernels</p></li>
+</ul>
+</section>
+</section>
+<section id="installation-methods">
+<h2>Installation Methods<a class="headerlink" href="#installation-methods" title="Link to this heading"></a></h2>
+<section id="method-1-from-pypi-recommended">
+<h3>Method 1: From PyPI (Recommended)<a class="headerlink" href="#method-1-from-pypi-recommended" title="Link to this heading"></a></h3>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>PyPI package is coming soon!</p>
+</div>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>amd-aiter
+</pre></div>
+</div>
+</section>
+<section id="method-2-from-source">
+<h3>Method 2: From Source<a class="headerlink" href="#method-2-from-source" title="Link to this heading"></a></h3>
+<section id="basic-installation">
+<h4>Basic Installation<a class="headerlink" href="#basic-installation" title="Link to this heading"></a></h4>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Clone the repository</span>
+git<span class="w"> </span>clone<span class="w"> </span>--recursive<span class="w"> </span>https://github.com/ROCm/aiter.git
+<span class="nb">cd</span><span class="w"> </span>aiter
+
+<span class="c1"># Install in development mode</span>
+python3<span class="w"> </span>setup.py<span class="w"> </span>develop
+</pre></div>
+</div>
+</section>
+<section id="development-mode-jit">
+<h4>Development Mode (JIT)<a class="headerlink" href="#development-mode-jit" title="Link to this heading"></a></h4>
+<p>Kernels are compiled on first use:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>setup.py<span class="w"> </span>develop
+</pre></div>
+</div>
+</section>
+<section id="precompiled-installation">
+<h4>Precompiled Installation<a class="headerlink" href="#precompiled-installation" title="Link to this heading"></a></h4>
+<p>Precompile kernels at install time:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">PREBUILD_KERNELS</span><span class="o">=</span><span class="m">2</span><span class="w"> </span><span class="nv">GPU_ARCHS</span><span class="o">=</span><span class="s2">&quot;gfx942&quot;</span><span class="w"> </span>python3<span class="w"> </span>setup.py<span class="w"> </span>install
+</pre></div>
+</div>
+</section>
+</section>
+<section id="environment-variables">
+<h3>Environment Variables<a class="headerlink" href="#environment-variables" title="Link to this heading"></a></h3>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 20.0%" />
+<col style="width: 60.0%" />
+<col style="width: 20.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Description</p></th>
+<th class="head"><p>Default</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">GPU_ARCHS</span></code></p></td>
+<td><p>Target GPU architecture(s), semicolon-separated. Use <code class="docutils literal notranslate"><span class="pre">native</span></code> to auto-detect.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">native</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">PREBUILD_KERNELS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code> = JIT only, <code class="docutils literal notranslate"><span class="pre">1</span></code> = core kernels, <code class="docutils literal notranslate"><span class="pre">2</span></code> = inference kernels, <code class="docutils literal notranslate"><span class="pre">3</span></code> = MHA only</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MAX_JOBS</span></code></p></td>
+<td><p>Max parallel compilation threads</p></td>
+<td><p>Auto-calculated</p></td>
+</tr>
+</tbody>
+</table>
+<section id="example-configurations">
+<h4>Example Configurations<a class="headerlink" href="#example-configurations" title="Link to this heading"></a></h4>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># For MI300X with full precompilation</span>
+<span class="nv">PREBUILD_KERNELS</span><span class="o">=</span><span class="m">2</span><span class="w"> </span><span class="nv">GPU_ARCHS</span><span class="o">=</span><span class="s2">&quot;gfx942&quot;</span><span class="w"> </span>python3<span class="w"> </span>setup.py<span class="w"> </span>install
+
+<span class="c1"># For MI250X + MI300X multi-arch</span>
+<span class="nv">GPU_ARCHS</span><span class="o">=</span><span class="s2">&quot;gfx90a;gfx942&quot;</span><span class="w"> </span>python3<span class="w"> </span>setup.py<span class="w"> </span>install
+
+<span class="c1"># Auto-detect current GPU</span>
+<span class="nv">GPU_ARCHS</span><span class="o">=</span><span class="s2">&quot;native&quot;</span><span class="w"> </span>python3<span class="w"> </span>setup.py<span class="w"> </span>install
+</pre></div>
+</div>
+</section>
+</section>
+<section id="method-3-docker">
+<h3>Method 3: Docker<a class="headerlink" href="#method-3-docker" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Coming soon</span>
+docker<span class="w"> </span>pull<span class="w"> </span>amd/aiter:latest
+docker<span class="w"> </span>run<span class="w"> </span>--device<span class="o">=</span>/dev/kfd<span class="w"> </span>--device<span class="o">=</span>/dev/dri<span class="w"> </span>amd/aiter:latest
+</pre></div>
+</div>
+</section>
+</section>
+<section id="verifying-installation">
+<h2>Verifying Installation<a class="headerlink" href="#verifying-installation" title="Link to this heading"></a></h2>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">aiter</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+
+<span class="c1"># Check ROCm availability</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;PyTorch version: </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">__version__</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;ROCm available: </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;ROCm version: </span><span class="si">{</span><span class="n">torch</span><span class="o">.</span><span class="n">version</span><span class="o">.</span><span class="n">hip</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="nb">hasattr</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">version</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;hip&#39;</span><span class="p">)</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">&#39;N/A&#39;</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+<span class="c1"># Verify AITER can import key operators</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">aiter</span><span class="w"> </span><span class="kn">import</span> <span class="n">flash_attn_with_kvcache</span><span class="p">,</span> <span class="n">rmsnorm</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;AITER operators loaded successfully!&quot;</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="optional-triton-communication-support">
+<h2>Optional: Triton Communication Support<a class="headerlink" href="#optional-triton-communication-support" title="Link to this heading"></a></h2>
+<p>For Triton-based communication primitives:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </span>requirements-triton-comms.txt
+</pre></div>
+</div>
+<p>See <span class="xref std std-doc">tutorials/triton_comms</span> for more details.</p>
+</section>
+<section id="troubleshooting">
+<h2>Troubleshooting<a class="headerlink" href="#troubleshooting" title="Link to this heading"></a></h2>
+<section id="rocm-not-found">
+<h3>ROCm Not Found<a class="headerlink" href="#rocm-not-found" title="Link to this heading"></a></h3>
+<p>If ROCm is not detected:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">ROCM_PATH</span><span class="o">=</span>/opt/rocm
+<span class="nb">export</span><span class="w"> </span><span class="nv">PATH</span><span class="o">=</span><span class="nv">$ROCM_PATH</span>/bin:<span class="nv">$PATH</span>
+</pre></div>
+</div>
+</section>
+<section id="compilation-errors">
+<h3>Compilation Errors<a class="headerlink" href="#compilation-errors" title="Link to this heading"></a></h3>
+<p>For compilation issues:</p>
+<ol class="arabic simple">
+<li><p>Ensure ROCm is properly installed: <code class="docutils literal notranslate"><span class="pre">rocm-smi</span></code></p></li>
+<li><p>Check Python version: <code class="docutils literal notranslate"><span class="pre">python3</span> <span class="pre">--version</span></code></p></li>
+<li><p>Verify GPU architecture: <code class="docutils literal notranslate"><span class="pre">rocminfo</span> <span class="pre">|</span> <span class="pre">grep</span> <span class="pre">gfx</span></code></p></li>
+</ol>
+</section>
+<section id="import-errors">
+<h3>Import Errors<a class="headerlink" href="#import-errors" title="Link to this heading"></a></h3>
+<p>If you get import errors:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Ensure ROCm libraries are in library path</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">LD_LIBRARY_PATH</span><span class="o">=</span><span class="nv">$ROCM_PATH</span>/lib:<span class="nv">$LD_LIBRARY_PATH</span>
+</pre></div>
+</div>
+</section>
+</section>
+<section id="next-steps">
+<h2>Next Steps<a class="headerlink" href="#next-steps" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="quickstart.html"><span class="doc">Quickstart</span></a> - Get started with your first AITER program</p></li>
+<li><p><a class="reference internal" href="tutorials/index.html"><span class="doc">Tutorials</span></a> - Learn through examples</p></li>
+<li><p><a class="reference internal" href="api/attention.html"><span class="doc">Attention Operations</span></a> - Explore the API reference</p></li>
+</ul>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="index.html" class="btn btn-neutral float-left" title="AITER Documentation" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="quickstart.html" class="btn btn-neutral float-right" title="Quickstart" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
