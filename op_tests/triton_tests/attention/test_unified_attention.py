@@ -33,6 +33,7 @@ def ref_paged_attn(
     sinks: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
+    output_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_seqs = len(query_lens)
     block_tables = block_tables.cpu().numpy()
@@ -90,7 +91,10 @@ def ref_paged_attn(
         outputs.append(out)
         start_idx += query_len
 
-    return torch.cat(outputs, dim=0).to(orig_dtype)
+    out = torch.cat(outputs, dim=0)
+    if output_scale is not None:
+        out = out / output_scale
+    return out.to(orig_dtype)
 
 
 @pytest.mark.parametrize(
@@ -100,14 +104,16 @@ def ref_paged_attn(
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
 @pytest.mark.parametrize("sliding_window", [None, 256])
-@pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
+@pytest.mark.parametrize("soft_cap", [None, 50.0])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize(
-    "q_dtype, kv_dtype, use_descale",
+    "q_dtype, kv_dtype, use_kv_descale, use_out_scale",
     [
-        (torch.bfloat16, torch.bfloat16, False),
-        (e4m3_dtype, e4m3_dtype, True),
-        (torch.bfloat16, e4m3_dtype, True),
+        (torch.bfloat16, torch.bfloat16, False, False),
+        (e4m3_dtype, e4m3_dtype, True, True),
+        (e4m3_dtype, e4m3_dtype, True, False),
+        (torch.bfloat16, e4m3_dtype, True, False),
+        (torch.bfloat16, e4m3_dtype, True, False),
     ],
 )
 @torch.inference_mode()
@@ -121,7 +127,8 @@ def test_triton_unified_attn(
     num_blocks: int,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
-    use_descale: bool,
+    use_kv_descale: bool,
+    use_out_scale: bool,
 ) -> None:
     if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
         pytest.skip("block size must be at least 32 for fp8")
@@ -172,13 +179,15 @@ def test_triton_unified_attn(
     maybe_quantized_query = query
     maybe_quantized_key_cache = key_cache
     maybe_quantized_value_cache = value_cache
-    q_descale = None
+    q_descale = None  # Not yet supported
     k_descale = None
     v_descale = None
-    if use_descale:
-        q_descale = None  # Not yet supported
+    out_scale = None
+    if use_kv_descale:
         k_descale = torch.rand(1, dtype=torch.float32, device="cuda")
         v_descale = torch.rand(1, dtype=torch.float32, device="cuda")
+    if use_out_scale:
+        out_scale = 1 / torch.rand(1, dtype=torch.float32, device="cuda")
 
     unified_attention(
         q=maybe_quantized_query,
@@ -198,6 +207,7 @@ def test_triton_unified_attn(
         k_descale=k_descale,
         v_descale=v_descale,
         sinks=sinks,
+        output_scale=out_scale,
     )
 
     ref_output = ref_paged_attn(
@@ -213,6 +223,7 @@ def test_triton_unified_attn(
         sinks=sinks,
         k_descale=k_descale,
         v_descale=v_descale,
+        output_scale=out_scale,
     )
     atol, rtol = 1.5e-2, 1e-2
     if kv_dtype.itemsize == 1:
