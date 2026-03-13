@@ -141,7 +141,7 @@ def v_scale_process(
         V_Descale,
         kv_head_idx,
         offs_d_scale,
-        dim_mask,
+        head_mask,
         stride_v_cache_scale_0: tl.int64,  # int
         stride_v_cache_scale_1: tl.int64,  # int
         SAGE_VERSION: tl.constexpr = None
@@ -152,7 +152,7 @@ def v_scale_process(
             + kv_head_idx * stride_v_cache_scale_0
             + offs_d_scale[None, :] * stride_v_cache_scale_1
         )
-        return tl.load(v_descale_ptr, mask=dim_mask, other=0.0)
+        return tl.load(v_descale_ptr, mask=head_mask, other=0.0)
 
 
 @triton.jit
@@ -204,6 +204,8 @@ def kernel_unified_attention_2d(
     stride_k_cache_scale_1: tl.int64,  # int
     stride_k_cache_scale_2: tl.int64,  # int
     stride_k_cache_scale_3: tl.int64,  # int
+    stride_v_cache_scale_0: tl.int64,  # int
+    stride_v_cache_scale_1: tl.int64,  # int
     query_start_len_ptr,  # [num_seqs+1]
     BLOCK_Q: tl.constexpr,  # int
     num_seqs: tl.int32,
@@ -528,16 +530,11 @@ def kernel_unified_attention_2d(
     if SAGE_VERSION != None:
         v_scale_loaded = v_scale_process(
             v_scale,
-            physical_block_idx,
-            seq_offset,
-            BLOCK_SIZE,
             kv_head_idx,
             offs_d_scale,
             tile_mask[None, :],
-            stride_k_cache_scale_0,
-            stride_k_cache_scale_1,
-            stride_k_cache_scale_2,
-            stride_k_cache_scale_3,
+            stride_v_cache_scale_0,
+            stride_v_cache_scale_1,
             SAGE_VERSION
         )
         acc *= v_scale_loaded
@@ -915,7 +912,7 @@ def reduce_segments(
     )
 
     if HEAD_SIZE_PADDED != HEAD_SIZE:
-        dim_mask = offs_d < HEAD_SIZE
+        dim_mask = tl.arange(0, HEAD_SIZE_PADDED) < HEAD_SIZE
     else:
         dim_mask = tl.full((1,), 1, dtype=tl.int1)
 
