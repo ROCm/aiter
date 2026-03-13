@@ -139,6 +139,7 @@ def test_fmoe_lqq(
     ep=8,
     block_size_M=32,
     evenly=False,
+    flydsl_only=False,
 ):
     dtype = dtypes.bf16
     use_g1u1 = True
@@ -277,7 +278,6 @@ def test_fmoe_lqq(
     ######################################################################################
     # 1. Run ASM
     old_flydsl = os.environ.get("AITER_USE_FLYDSL", "0")
-    os.environ["AITER_USE_FLYDSL"] = "0"
     from aiter.fused_moe import get_2stage_cfgs
 
     get_2stage_cfgs.cache_clear()
@@ -285,32 +285,34 @@ def test_fmoe_lqq(
     run_fused_moe = make_fused_moe_perftest(num_iters=128, num_warmup=5)
     out_asm = None
     us_asm = None
-    try:
-        out_asm, us_asm = run_fused_moe(
-            input,
-            w1_lqq,
-            w2_lqq,
-            topk_weights,
-            topk_ids,
-            expert_mask,
-            local_expert_hash,
-            w1_scale,
-            w2_scale,
-            a1_scale,
-            w1_lqq_scale_shf,
-            w1_lqq_zero_uint8_shf,
-            w2_lqq_scale_shf,
-            w2_lqq_zero_uint8_shf,
-            fc1_smooth_scale,
-            fc2_smooth_scale,
-            quant_type,
-            act_type,
-            dtype,
-            block_size_M,
-        )
-        aiter.logger.info(f"[bench] ASM: {us_asm:>8.2f} us")
-    except Exception as err:
-        print(f"[warning] ASM backend failed or is unsupported: {err}")
+    if not flydsl_only:
+        os.environ["AITER_USE_FLYDSL"] = "0"
+        try:
+            out_asm, us_asm = run_fused_moe(
+                input,
+                w1_lqq,
+                w2_lqq,
+                topk_weights,
+                topk_ids,
+                expert_mask,
+                local_expert_hash,
+                w1_scale,
+                w2_scale,
+                a1_scale,
+                w1_lqq_scale_shf,
+                w1_lqq_zero_uint8_shf,
+                w2_lqq_scale_shf,
+                w2_lqq_zero_uint8_shf,
+                fc1_smooth_scale,
+                fc2_smooth_scale,
+                quant_type,
+                act_type,
+                dtype,
+                block_size_M,
+            )
+            aiter.logger.info(f"[bench] ASM: {us_asm:>8.2f} us")
+        except Exception as err:
+            print(f"[warning] ASM backend failed or is unsupported: {err}")
 
     # 2. Run FlyDSL if FLIR_PATH is set
     out_flydsl = None
@@ -532,6 +534,13 @@ parser.add_argument(
     default=False,
     help="Use evenly distributed expert ids.",
 )
+parser.add_argument(
+    "-flydsl_only",
+    "--flydsl_only",
+    action="store_true",
+    default=False,
+    help="Skip ASM and run only the FlyDSL backend.",
+)
 args = parser.parse_args()
 
 
@@ -557,6 +566,7 @@ for m in token_list:
             ep=ep,
             block_size_M=block_m,
             evenly=args.evenly,
+            flydsl_only=args.flydsl_only,
         )
         if ret is not None:
             df.append(ret)

@@ -59,9 +59,8 @@ def _moe_sorting_impl(
     )
     sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    print(f"need_reduce: {need_reduce}")
     moe_buf = torch.empty(
-        (M, topk if need_reduce else 1, model_dim), dtype=moebuf_dtype, device=device
+        (M * (topk if need_reduce else 1), model_dim), dtype=moebuf_dtype, device=device
     )
 
     fwd_fn = aiter.moe_sorting_opus_fwd if use_opus else aiter.moe_sorting_fwd
@@ -72,13 +71,17 @@ def _moe_sorting_impl(
         sorted_weights,
         sorted_expert_ids,
         num_valid_ids,
-        moe_buf,
+        moe_buf.view(M, (topk if need_reduce else 1) * model_dim),
         num_experts,
         int(block_size),
         expert_mask,
         num_local_tokens,
         dispatch_policy,
     )
+    # check moe_buffer is all zero
+    # print(f"moe_buffer is all zero: {moe_buf.allclose(torch.zeros_like(moe_buf))}")
+    # if not moe_buf.allclose(torch.zeros_like(moe_buf)):
+    #     raise Exception("moe_buffer is not all zero")
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
 
@@ -1459,7 +1462,7 @@ def fused_moe_2stages(
         # Add valid_mask to extra_stage2_args if available
         if valid_mask is not None:
             extra_stage2_args["valid_mask"] = valid_mask
-    print(f"use_reduce: {use_reduce} is_reduce: {is_reduce()}")
+    # print(f"use_reduce: {use_reduce} is_reduce: {is_reduce()} _supports_stage2_reduce: {_supports_stage2_reduce(metadata.stage2)}")
     if use_reduce:
         extra_stage2_args["intermediate"] = moe_out
         intermediate = moe_out
@@ -1485,7 +1488,6 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if not doweight_stage1 else None,
         **extra_stage2_args,
     )
-    print(f"use_reduce with buffer {moe_out.shape}")
     return _normalize_moe_output_shape(moe_out)
 
 
