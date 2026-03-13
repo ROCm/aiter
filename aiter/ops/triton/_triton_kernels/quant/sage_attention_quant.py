@@ -333,6 +333,68 @@ def _rotate_quantize_q_kernel(
     )
 
 
+@triton.jit
+def perblock_quantize_kernel(
+    query_ptr,
+    Q_q,
+    Q_descale,
+    max_seqlen,
+    query_start_len_ptr,
+    stride_m,
+    scale_stride_0,
+    scale_stride_1,
+    BLOCK_M: tl.constexpr,
+    D: tl.constexpr,
+    sm_scale: tl.constexpr,
+    DTYPE_MAX: tl.constexpr,
+):
+    
+    pid_b = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_h = tl.program_id(2)
+    
+    if query_start_len_ptr is not None:
+        cur_batch_in_all_start_index = tl.load(query_start_len_ptr + pid_b)
+        cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + pid_b + 1)
+        seqlen = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
+    else:
+        seqlen = max_seqlen
+
+    if pid_m * BLOCK_M >= seqlen:
+        return
+
+    num_pid_m = tl.cdiv(max_seqlen, BLOCK_M)
+    global_blk_idx = pid_b * num_pid_m + pid_m
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, D)
+    mask = offs_m < seqlen
+    tile_offsets = offs_m * stride_m + offs_d
+    tile_ptrs = query_ptr + tile_offsets
+    Q = tl.load(
+        tile_ptrs,
+        mask=mask,
+        other=0.0,
+    )
+
+    Q = Q.to(tl.float32)
+    if sm_scale is not None:
+        Q *= sm_scale
+    scale = tl.max(tl.abs(Q)) / DTYPE_MAX
+    Q_quant = Q / scale
+    Q_quant = Q_quant.to(Q_q.dtype.element_ty)
+
+    # scale (total num blocks)
+    scale_ptrs = Q_descale + global_blk_idx * scale_stride_0 + pid_h * scale_stride_1
+    tl.store(scale_ptrs, scale)
+    
+    qtile_ptrs = Q_q + tile_offsets
+    tl.store(
+        qtile_ptrs,
+        mask=mask)
+
+
+
 
 from aiter.ops.triton._triton_kernels.attention.unified_attention import find_seq_idx
 
