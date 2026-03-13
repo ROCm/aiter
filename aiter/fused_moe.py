@@ -389,6 +389,7 @@ def fused_moe_1stage(
     block_size_M=32,
     activation=ActivationType.Silu,
     quant_type=QuantType.No,
+    xbf16=False,
     kernelName: str = "",
     # following for quant
     q_dtype_a=None,
@@ -441,13 +442,7 @@ def fused_moe_1stage(
             activation,
         )
     else:
-        # Skip quantization if kernel in the config embeds it
-        skip_1x128_quant = (
-            quant_type == QuantType.per_1x128
-            and hidden_states.dtype == torch.bfloat16
-            and q_dtype_a == torch.float8_e4m3fn
-        ) and ("blockscaleBf16" in kernelName)
-        if skip_1x128_quant:
+        if xbf16:
             # xquant happens inside the asm kernel for per_1x128
             a1 = hidden_states
             a1_scale = torch.empty(0)
@@ -836,6 +831,7 @@ def get_2stage_cfgs(
         kernelName1 = ""
         kernelName2 = ""
         run_1stage = False
+        run_1stage_xbf16 = False
         if (
             activation,
             q_type,
@@ -846,14 +842,18 @@ def get_2stage_cfgs(
             doweight_stage1,
         ) in fused_moe_1stage_dict[get_gfx()]:
             if q_type == QuantType.per_1x128:
-                # for fp8 blockscale, ck has better performance so disable assembly kernel
                 run_1stage = token > 32 and (inter_dim % 256 == 0)
+                # For small batches quantization runtime is comparable with moe,
+                # embedding it into moe is beneficial
+                run_1stage_xbf16 = token < 8 and (inter_dim % 128 == 0)
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
                 run_1stage = token > 16 or inter_dim % 128 != 0
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
+
+        run_1stage = run_1stage or run_1stage_xbf16
 
         block_m = (
             BLOCK_SIZE_M
@@ -902,6 +902,7 @@ def get_2stage_cfgs(
                 kernelName=kernelName1,
                 activation=activation,
                 quant_type=q_type,
+                xbf16=run_1stage_xbf16
             ),
             None,
             block_m,
