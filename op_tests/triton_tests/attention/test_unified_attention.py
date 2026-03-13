@@ -154,8 +154,11 @@ def test_triton_unified_attn(
     v_descale = None
     
     
+    sage_version = None
+
     if quant_scheme == "v1":
         from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v1
+        sage_version = 1
         config = get_config(query.shape[0], len(cu_query_lens), num_query_heads//num_kv_heads, num_kv_heads, query.shape[-1], window_size, max_query_len, max_kv_len, block_size, query.element_size())
         BLOCK_M = config["BLOCK_M"] # these need to correspond to the unified attention configs
         BLOCK_N = config["TILE_SIZE"]
@@ -174,6 +177,7 @@ def test_triton_unified_attn(
         print("maybe_quantized_key_cache.flatten()[:100]", maybe_quantized_key_cache.flatten()[:100])
     elif quant_scheme == "v2":
         from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v2
+        sage_version = 2
         config = get_config(query.shape[0], len(cu_query_lens), num_query_heads//num_kv_heads, num_kv_heads, query.shape[-1], window_size, max_query_len, max_kv_len, block_size, query.element_size())
         print("config", config)
         BLOCK_M = config["BLOCK_M"] # these need to correspond to the unified attention configs
@@ -191,8 +195,6 @@ def test_triton_unified_attn(
 
         # print("maybe_quantized_query.flatten()[:100]", maybe_quantized_query.flatten()[:100])
         # print("maybe_quantized_key_cache.flatten()[:100]", maybe_quantized_key_cache.flatten()[:100])
-
-        
 
 
     unified_attention(
@@ -213,6 +215,7 @@ def test_triton_unified_attn(
         k_descale=k_descale,
         v_descale=v_descale,
         sinks=sinks,
+        sage_version=sage_version
     )
 
     ref_output = ref_paged_attn(
