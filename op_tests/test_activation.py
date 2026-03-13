@@ -121,7 +121,7 @@ def torch_gelu_ref(x: torch.Tensor) -> torch.Tensor:
     return out
 
 def gelu_fast_wrapper(input: torch.Tensor) -> torch.Tensor:
-    out = torch.randn_like(input)
+    out = torch.empty_like(input)
     aiter.gelu_fast(out, input)
     return out
 
