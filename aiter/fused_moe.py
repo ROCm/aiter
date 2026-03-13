@@ -1467,7 +1467,6 @@ def fused_moe_2stages(
         extra_stage2_args["intermediate"] = moe_out
         intermediate = moe_out
         moe_out = torch.empty(token_num, model_dim, dtype=moe_out.dtype, device=device)
-        print(f"use_reduce with buffer {moe_out.shape}  {intermediate.shape}")
 
     metadata.stage2(
         a2,
