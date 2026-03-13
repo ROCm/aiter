@@ -847,7 +847,8 @@ def get_2stage_cfgs(
                 # to MoE cost. For larger dimensions split-K 2-stage dominates instead.
                 run_1stage_xbf16 = (
                     get_gfx() == "gfx950"
-                    and token > 1 and token < 16
+                    and token > 1
+                    and token < 16
                     and model_dim <= 2048
                 )
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
