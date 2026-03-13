@@ -1,0 +1,84 @@
+name: Nightly Build
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/aiter-release.yaml'
+      - '.github/workflows/test-whl.yaml'
+      - '.github/workflows/promote.yaml'
+      - '.github/workflows/nightly.yaml'
+      - 'scripts/generate_summary.py'
+  workflow_dispatch:
+    inputs:
+      docker_image_py310:
+        description: 'Docker image for Python 3.10 build'
+        type: string
+        required: false
+        default: 'rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1'
+      docker_image_py312:
+        description: 'Docker image for Python 3.12 build'
+        type: string
+        required: false
+        default: 'rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1'
+      gpu_archs:
+        description: 'GPU architectures (e.g. gfx942;gfx950)'
+        type: string
+        required: false
+        default: 'gfx942;gfx950'
+      skip_tests:
+        description: 'Skip test job for faster iteration'
+        type: boolean
+        default: false
+      skip_promote:
+        description: 'Skip promote job (build + test only)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: ./.github/workflows/aiter-release.yaml
+    with:
+      release_type: ${{ github.event_name == 'schedule' && 'nightlies' || github.event_name == 'pull_request' && 'devreleases' || 'devreleases' }}
+      docker_image_py310: ${{ github.event.inputs.docker_image_py310 || 'rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1' }}
+      docker_image_py312: ${{ github.event.inputs.docker_image_py312 || 'rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1' }}
+      gpu_archs: ${{ github.event.inputs.gpu_archs || 'gfx942;gfx950' }}
+      runner: build-only-aiter
+      add_date_stamp: true
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+
+  test:
+    needs: build
+    if: ${{ !(inputs.skip_tests || false) }}
+    uses: ./.github/workflows/test-whl.yaml
+    with:
+      release_type: ${{ github.event_name == 'schedule' && 'nightlies' || 'devreleases' }}
+      wheel_names: ${{ needs.build.outputs.wheel_names }}
+    permissions:
+      contents: read
+      actions: read
+
+  promote:
+    needs: [build, test]
+    if: >-
+      ${{ github.repository_owner == 'ROCm'
+          && github.event_name != 'pull_request'
+          && !(inputs.skip_promote || false) }}
+    uses: ./.github/workflows/promote.yaml
+    with:
+      release_type: ${{ github.event_name == 'schedule' && 'nightlies' || 'devreleases' }}
+      wheel_names: ${{ needs.build.outputs.wheel_names }}
+    permissions:
+      id-token: write
+      contents: read
