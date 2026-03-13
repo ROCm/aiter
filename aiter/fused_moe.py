@@ -845,7 +845,9 @@ def get_2stage_cfgs(
                 run_1stage = token > 32 and (inter_dim % 256 == 0)
                 # For small batches quantization runtime is comparable with moe,
                 # embedding it into moe is beneficial
-                run_1stage_xbf16 =  get_gfx() == "gfx950" and token < 16 and (inter_dim % 128 == 0)
+                run_1stage_xbf16 = (
+                    get_gfx() == "gfx950" and token < 16 and (inter_dim % 128 == 0)
+                )
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
