@@ -6,6 +6,7 @@ from typing import Optional, Tuple, Union
 import torch
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import is_fp8
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
@@ -102,10 +103,11 @@ class _FlashAttnV3Func(torch.autograd.Function):
     def backward(ctx, dout: torch.Tensor):
         q, k, v, out, softmax_lse, q_descale, k_descale, v_descale = ctx.saved_tensors
 
-        # Allocate gradients - upstream pattern
-        dq = torch.empty_like(q)
-        dk = torch.empty_like(k)
-        dv = torch.empty_like(v)
+        # For FP8 inputs, allocate gradients in float32 to avoid truncation
+        grad_dtype = torch.float32 if is_fp8(q) else q.dtype
+        dq = torch.empty(q.shape, dtype=grad_dtype, device=q.device)
+        dk = torch.empty(k.shape, dtype=grad_dtype, device=k.device)
+        dv = torch.empty(v.shape, dtype=grad_dtype, device=v.device)
 
         _delta = flash_attn_3.bwd(
             dout,
@@ -282,10 +284,11 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
     def backward(ctx, dout: torch.Tensor):
         q, k, v, out, softmax_lse, q_descale, k_descale, v_descale = ctx.saved_tensors
 
-        # Allocate gradients - upstream pattern
-        dq = torch.empty_like(q)
-        dk = torch.empty_like(k)
-        dv = torch.empty_like(v)
+        # For FP8 inputs, allocate gradients in float32 to avoid truncation
+        grad_dtype = torch.float32 if is_fp8(q) else q.dtype
+        dq = torch.empty(q.shape, dtype=grad_dtype, device=q.device)
+        dk = torch.empty(k.shape, dtype=grad_dtype, device=k.device)
+        dv = torch.empty(v.shape, dtype=grad_dtype, device=v.device)
 
         _delta = flash_attn_3.bwd(
             dout,
@@ -409,7 +412,7 @@ def flash_attn_with_kvcache_fake_tensor(
 ):
 
     # https://github.com/ROCm/aiter/blob/7411c99753f0661a3eecdbdb1b36feb58539f62b/aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/interface_v3.py#L218
-    out_dtype = torch.float32 if q.dtype == torch.float8_e4m3fnuz else q.dtype
+    out_dtype = torch.float32 if is_fp8(q) else q.dtype
 
     # establish layout / varlen & max seq lens
     # https://github.com/ROCm/aiter/blob/7411c99753f0661a3eecdbdb1b36feb58539f62b/aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/interface_v3.py#L156C5-L156C47
@@ -974,10 +977,10 @@ class _FlashAttnFP8Wrapper(torch.autograd.Function):
             ctx.saved_tensors
         )
 
-        # Allocate gradients - upstream pattern
-        dq = torch.empty_like(q_fp8)
-        dk = torch.empty_like(k_fp8)
-        dv = torch.empty_like(v_fp8)
+        # Float32 gradients to avoid FP8 truncation in tl.store
+        dq = torch.empty(q_fp8.shape, dtype=torch.float32, device=q_fp8.device)
+        dk = torch.empty(k_fp8.shape, dtype=torch.float32, device=k_fp8.device)
+        dv = torch.empty(v_fp8.shape, dtype=torch.float32, device=v_fp8.device)
 
         # Call flash attention backward - gradients are written in-place
         _delta = flash_attn_3.bwd(
@@ -1008,7 +1011,7 @@ class _FlashAttnFP8Wrapper(torch.autograd.Function):
             v_descale=v_descale,
         )
 
-        # Convert gradients to input dtype (FP32 -> BF16 if needed)
+        # Convert gradients to input dtype (FP32 -> BF16/FP16)
         dq = dq.to(ctx.input_dtype)
         dk = dk.to(ctx.input_dtype)
         dv = dv.to(ctx.input_dtype)
@@ -1272,10 +1275,10 @@ class _FlashAttnVarlenFP8Wrapper(torch.autograd.Function):
             ctx.saved_tensors
         )
 
-        # Allocate gradients - upstream pattern
-        dq = torch.empty_like(q_fp8)
-        dk = torch.empty_like(k_fp8)
-        dv = torch.empty_like(v_fp8)
+        # Float32 gradients to avoid FP8 truncation in tl.store
+        dq = torch.empty(q_fp8.shape, dtype=torch.float32, device=q_fp8.device)
+        dk = torch.empty(k_fp8.shape, dtype=torch.float32, device=k_fp8.device)
+        dv = torch.empty(v_fp8.shape, dtype=torch.float32, device=v_fp8.device)
 
         # Call flash attention varlen backward - gradients are written in-place
         _delta = flash_attn_3.bwd(
@@ -1306,7 +1309,7 @@ class _FlashAttnVarlenFP8Wrapper(torch.autograd.Function):
             v_descale=v_descale,
         )
 
-        # Convert gradients to input dtype (FP32 -> BF16 if needed)
+        # Convert gradients to input dtype (FP32 -> BF16/FP16)
         dq = dq.to(ctx.input_dtype)
         dk = dk.to(ctx.input_dtype)
         dv = dv.to(ctx.input_dtype)
