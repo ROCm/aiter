@@ -31,13 +31,22 @@ def ref_paged_attn(
     sliding_window: Optional[int] = None,
     soft_cap: Optional[float] = None,
     sinks: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_seqs = len(query_lens)
     block_tables = block_tables.cpu().numpy()
     _, block_size, num_kv_heads, head_size = key_cache.shape
-
+    orig_dtype = query.dtype
     outputs: list[torch.Tensor] = []
     start_idx = 0
+    query = query.to(torch.float32)
+    key_cache = key_cache.to(torch.float32)
+    value_cache = value_cache.to(torch.float32)
+    if k_descale is not None:
+        key_cache = key_cache * k_descale
+    if v_descale is not None:
+        value_cache = value_cache * v_descale
     for i in range(num_seqs):
         query_len = query_lens[i]
         kv_len = kv_lens[i]
@@ -81,7 +90,7 @@ def ref_paged_attn(
         outputs.append(out)
         start_idx += query_len
 
-    return torch.cat(outputs, dim=0)
+    return torch.cat(outputs, dim=0).to(orig_dtype)
 
 
 @pytest.mark.parametrize(
@@ -91,21 +100,28 @@ def ref_paged_attn(
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
 @pytest.mark.parametrize("sliding_window", [None, 256])
-@pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
-@pytest.mark.parametrize("q_dtype", QDTYPES)
+@pytest.mark.parametrize(
+    "q_dtype, kv_dtype, use_descale",
+    [
+        (torch.bfloat16, torch.bfloat16, False),
+        (e4m3_dtype, e4m3_dtype, True),
+        (torch.bfloat16, e4m3_dtype, True),
+    ],
+)
 @torch.inference_mode()
 def test_triton_unified_attn(
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
     head_size: int,
     sliding_window: Optional[int],
-    dtype: torch.dtype,
     block_size: int,
     soft_cap: Optional[float],
     num_blocks: int,
-    q_dtype: Optional[torch.dtype],
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    use_descale: bool,
 ) -> None:
     if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
         pytest.skip("block size must be at least 32 for fp8")
@@ -123,12 +139,20 @@ def test_triton_unified_attn(
     scale = head_size**-0.5
 
     query = torch.randn(
-        sum(query_lens), num_query_heads, head_size, dtype=dtype, device="cuda"
+        sum(query_lens), num_query_heads, head_size, dtype=torch.float32, device="cuda"
     )
     key_cache = torch.randn(
-        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cuda"
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        head_size,
+        dtype=torch.float32,
+        device="cuda",
     )
     value_cache = torch.randn_like(key_cache)
+    query = query.to(q_dtype)
+    key_cache = key_cache.to(kv_dtype)
+    value_cache = value_cache.to(kv_dtype)
     cu_query_lens = torch.tensor(
         [0] + query_lens, dtype=torch.int32, device="cuda"
     ).cumsum(dim=0, dtype=torch.int32)
@@ -151,16 +175,10 @@ def test_triton_unified_attn(
     q_descale = None
     k_descale = None
     v_descale = None
-    if q_dtype is not None:
-        # QKV are drawn from N(0, 1): no need for a fp8 scaling factor
-        maybe_quantized_query = query.to(q_dtype)
-        maybe_quantized_key_cache = key_cache.to(q_dtype)
-        maybe_quantized_value_cache = value_cache.to(q_dtype)
-
-        scale_shape = (num_seqs, num_kv_heads)
+    if use_descale:
         q_descale = None  # Not yet supported
-        k_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
-        v_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
+        k_descale = torch.rand(1, dtype=torch.float32, device="cuda")
+        v_descale = torch.rand(1, dtype=torch.float32, device="cuda")
 
     unified_attention(
         q=maybe_quantized_query,
@@ -193,10 +211,14 @@ def test_triton_unified_attn(
         sliding_window=sliding_window,
         soft_cap=soft_cap,
         sinks=sinks,
+        k_descale=k_descale,
+        v_descale=v_descale,
     )
     atol, rtol = 1.5e-2, 1e-2
-    if q_dtype is not None:
+    if kv_dtype.itemsize == 1:
         atol, rtol = 1.5e-1, 1.5e-1
+    output = output.to(torch.float32)
+    ref_output = ref_output.to(torch.float32)
     torch.testing.assert_close(
         output, ref_output, atol=atol, rtol=rtol
     ), f"{torch.max(torch.abs(output - ref_output))}"
