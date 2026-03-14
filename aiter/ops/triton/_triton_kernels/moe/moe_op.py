@@ -334,11 +334,12 @@ def _fused_moe_kernel_gptq_awq(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-# @triton.heuristics(
-#     {
-#         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-#     }
-# )
+@triton.heuristics(
+    {
+        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
+        "UNROLL_TIMES": lambda args: (args["K"] + args["BLOCK_SIZE_K"] - 1) // args["BLOCK_SIZE_K"]
+    }
+)
 @gluon.jit(repr=_fused_moe_kernel_repr)
 def _gluon_fused_moe_unroll_k_kernel(
     # Pointers to matrices
@@ -353,7 +354,7 @@ def _gluon_fused_moe_unroll_k_kernel(
     num_tokens_post_padded_ptr,
     # Matrix dimensions
     N,
-    # K,
+    K,
     num_valid_tokens,
     # The stride variables represent how much to increase the ptr by when
     # moving by 1 element in a particular dimension. E.g. `stride_am` is
@@ -379,6 +380,7 @@ def _gluon_fused_moe_unroll_k_kernel(
     BLOCK_SIZE_N: gl.constexpr,
     BLOCK_SIZE_K: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
+    EVEN_K: tl.constexpr,
     MUL_ROUTED_WEIGHT: gl.constexpr,
     top_k: gl.constexpr,
     compute_type: gl.constexpr,
@@ -386,7 +388,7 @@ def _gluon_fused_moe_unroll_k_kernel(
     use_int8_w8a16: gl.constexpr,
     NUM_XCDS: gl.constexpr,
     # Unroll K loop
-    K: gl.constexpr,
+    UNROLL_TIMES: gl.constexpr,
     num_warps: gl.constexpr,
 ):
     """
@@ -414,10 +416,23 @@ def _gluon_fused_moe_unroll_k_kernel(
     `sorted_token_ids` by expert index and padding ensures divisibility by
     BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
     multiplication across different blocks processed by the same expert.
+
+    Optimization Details:
+    - UNROLL_TIMES: Controls how many times to unroll the K-dimension loop (1-3)
+    - Pre-loads A matrix data outside the N-dimension loop (manual LICM)
+    - Uses optimized BlockedLayout for efficient memory access patterns
+    - Leverages AMD CDNA3 MFMA instructions for matrix multiplication
+    - Supports FP8 and INT8 quantization with per-tensor or block-wise scaling
     """
 
+    # Assert that UNROLL_TIMES is within supported range (1-3)
+    gl.static_assert(UNROLL_TIMES >= 1 and UNROLL_TIMES <= 3)
+
+    # Sub-block size for N dimension - allows processing larger BLOCK_N in chunks
     SUB_BLOCK_SIZE_N: gl.constexpr = 64
-    EVEN_K: gl.constexpr = K % BLOCK_SIZE_K == 0
+
+    # Define blocked layout for A, B, C and MFMA
+    # This layout is optimized for efficient memory access and MFMA operations
 
     blocked_a: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 16],
@@ -474,19 +489,15 @@ def _gluon_fused_moe_unroll_k_kernel(
 
     GRID_MN = num_pid_n * num_pid_m
     if pid < GRID_MN:
-        # TODO: gluon
         pid = remap_xcd(pid, GRID_MN, NUM_XCDS)
     else:
         return
-    # TODO: gluon
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
-    # TODO: i64
     offs_token_id = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_a))
     offs_token = gl.amd.cdna3.buffer_load(sorted_token_ids_ptr, offs_token_id)
     token_mask = offs_token < num_valid_tokens
 
-    # TODO: i64
     off_experts = gl.load(expert_ids_ptr + pid_m)
     if off_experts == -1:
         # -----------------------------------------------------------
@@ -510,24 +521,32 @@ def _gluon_fused_moe_unroll_k_kernel(
     offs_ak = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(0, blocked_a))
 
     #####################################
-    # preload scales
+    # Preload scales for FP8 quantization
+    # This is a manual implementation of loop-invariant code motion (LICM)
+    # since Gluon doesn't support automatic LICM
     #####################################
 
     if use_fp8_w8a8:
         if group_k > 0 and group_n > 0:
             offs_ks = 0
             a_scale0 = gl.amd.cdna3.buffer_load(a_scale_ptr + offs_ks * stride_ask, (offs_token // top_k) * stride_asm, mask=token_mask, other=0.0)
-            offs_ks += (BLOCK_SIZE_K // group_k)
-            a_scale1 = gl.amd.cdna3.buffer_load(a_scale_ptr + offs_ks * stride_ask, (offs_token // top_k) * stride_asm, mask=token_mask, other=0.0)
-            offs_ks += (BLOCK_SIZE_K // group_k)
-            a_scale2 = gl.amd.cdna3.buffer_load(a_scale_ptr + offs_ks * stride_ask, (offs_token // top_k) * stride_asm, mask=token_mask, other=0.0)
+            if UNROLL_TIMES > 1:
+                offs_ks += (BLOCK_SIZE_K // group_k)
+                a_scale1 = gl.amd.cdna3.buffer_load(a_scale_ptr + offs_ks * stride_ask, (offs_token // top_k) * stride_asm, mask=token_mask, other=0.0)
+            if UNROLL_TIMES > 2:
+                offs_ks += (BLOCK_SIZE_K // group_k)
+                a_scale2 = gl.amd.cdna3.buffer_load(a_scale_ptr + offs_ks * stride_ask, (offs_token // top_k) * stride_asm, mask=token_mask, other=0.0)
         else:
             a_scale = gl.load(a_scale_ptr)
             b_scale = gl.load(b_scale_ptr + off_experts)
 
     #####################################
-    # pre-load a
+    # Preload A matrix data
+    # This is a manual implementation of loop-invariant code motion (LICM)
+    # since Gluon doesn't support automatic LICM
+    # By preloading A matrix data outside the N-dimension loop, we reduce memory traffic
     #####################################
+
     if EVEN_K:
         a0 = gl.amd.cdna3.buffer_load(a_ptr,
                                       offs_token[:, None] // top_k * stride_am + offs_ak[None, :] * stride_ak,
@@ -535,18 +554,24 @@ def _gluon_fused_moe_unroll_k_kernel(
                                       other=0.0
         )
         a_ptr += BLOCK_SIZE_K * stride_ak
-        a1 = gl.amd.cdna3.buffer_load(a_ptr,
-                                      offs_token[:, None] // top_k * stride_am + offs_ak[None, :] * stride_ak,
-                                      mask=token_mask[:, None],
-                                      other=0.0
-        )
-        a_ptr += BLOCK_SIZE_K * stride_ak
-        a2 = gl.amd.cdna3.buffer_load(a_ptr,
-                                      offs_token[:, None] // top_k * stride_am + offs_ak[None, :] * stride_ak,
-                                      mask=token_mask[:, None],
-                                      other=0.0
-        )
-        a_ptr += BLOCK_SIZE_K * stride_ak
+
+        # If unrolling more than once, load second K block
+        if UNROLL_TIMES > 1:
+            a1 = gl.amd.cdna3.buffer_load(a_ptr,
+                                        offs_token[:, None] // top_k * stride_am + offs_ak[None, :] * stride_ak,
+                                        mask=token_mask[:, None],
+                                        other=0.0
+            )
+            a_ptr += BLOCK_SIZE_K * stride_ak
+
+        # If unrolling more than twice, load third K block
+        if UNROLL_TIMES > 2:
+            a2 = gl.amd.cdna3.buffer_load(a_ptr,
+                                        offs_token[:, None] // top_k * stride_am + offs_ak[None, :] * stride_ak,
+                                        mask=token_mask[:, None],
+                                        other=0.0
+            )
+            a_ptr += BLOCK_SIZE_K * stride_ak
     else:
         k = 0
         a0 = gl.amd.cdna3.buffer_load(a_ptr,
@@ -555,30 +580,33 @@ def _gluon_fused_moe_unroll_k_kernel(
                                       other=0.0
         )
         a_ptr += BLOCK_SIZE_K * stride_ak
-        k += BLOCK_SIZE_K
-        a1 = gl.amd.cdna3.buffer_load(a_ptr,
-                                      offs_token[:, None] // top_k * stride_am + offs_ak[None, :] * stride_ak,
-                                      mask=token_mask[:, None] & (offs_ak[None, :] < K - k),
-                                      other=0.0
-        )
-        a_ptr += BLOCK_SIZE_K * stride_ak
-        k += BLOCK_SIZE_K
-        a2 = gl.amd.cdna3.buffer_load(a_ptr,
-                                      offs_token[:, None] // top_k * stride_am + offs_ak[None, :] * stride_ak,
-                                      mask=token_mask[:, None] & (offs_ak[None, :] < K - k),
-                                      other=0.0
-        )
-        a_ptr += BLOCK_SIZE_K * stride_ak
+        if UNROLL_TIMES > 1:
+            k += BLOCK_SIZE_K
+            a1 = gl.amd.cdna3.buffer_load(a_ptr,
+                                        offs_token[:, None] // top_k * stride_am + offs_ak[None, :] * stride_ak,
+                                        mask=token_mask[:, None] & (offs_ak[None, :] < K - k),
+                                        other=0.0
+            )
+            a_ptr += BLOCK_SIZE_K * stride_ak
+        if UNROLL_TIMES > 2:
+            k += BLOCK_SIZE_K
+            a2 = gl.amd.cdna3.buffer_load(a_ptr,
+                                        offs_token[:, None] // top_k * stride_am + offs_ak[None, :] * stride_ak,
+                                        mask=token_mask[:, None] & (offs_ak[None, :] < K - k),
+                                        other=0.0
+            )
+            a_ptr += BLOCK_SIZE_K * stride_ak
     a0_converted = gl.convert_layout(a0, mfma_a_layout)
-    a1_converted = gl.convert_layout(a1, mfma_a_layout)
-    a2_converted = gl.convert_layout(a2, mfma_a_layout)
+    if UNROLL_TIMES > 1:
+        a1_converted = gl.convert_layout(a1, mfma_a_layout)
+    if UNROLL_TIMES > 2:
+        a2_converted = gl.convert_layout(a2, mfma_a_layout)
 
     #####################################
     # loop n
     #####################################
 
     for n_start in range(0, BLOCK_SIZE_N, SUB_BLOCK_SIZE_N):
-        # TODO: i64
         offs_bn = (pid_n * BLOCK_SIZE_N + n_start + gl.arange(0, SUB_BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_b))) % N
 
         #####################################
@@ -604,16 +632,16 @@ def _gluon_fused_moe_unroll_k_kernel(
             b0 = gl.amd.cdna3.buffer_load(b0_ptr + off_experts * stride_be,
                                           offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
             )
-            # b1
-            b1_ptr = b0_ptr + BLOCK_SIZE_K * stride_bk
-            b1 = gl.amd.cdna3.buffer_load(b1_ptr + off_experts * stride_be,
-                                          offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-            )
-            # b2
-            b2_ptr = b1_ptr + BLOCK_SIZE_K * stride_bk
-            b2 = gl.amd.cdna3.buffer_load(b2_ptr + off_experts * stride_be,
-                                          offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-            )
+            if UNROLL_TIMES > 1:
+                b1_ptr = b0_ptr + BLOCK_SIZE_K * stride_bk
+                b1 = gl.amd.cdna3.buffer_load(b1_ptr + off_experts * stride_be,
+                                            offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+                )
+            if UNROLL_TIMES > 2:
+                b2_ptr = b1_ptr + BLOCK_SIZE_K * stride_bk
+                b2 = gl.amd.cdna3.buffer_load(b2_ptr + off_experts * stride_be,
+                                            offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+                )
         else:
             # b0
             k = 0
@@ -623,61 +651,77 @@ def _gluon_fused_moe_unroll_k_kernel(
                                           mask=offs_bk[:, None] < K - k,
                                           other=0.0
             )
-            # b1
-            k += BLOCK_SIZE_K
-            b1_ptr = b0_ptr + BLOCK_SIZE_K * stride_bk
-            b1 = gl.amd.cdna3.buffer_load(b1_ptr + off_experts * stride_be,
-                                          offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn,
-                                          mask=offs_bk[:, None] < K - k,
-                                          other=0.0
-            )
-            # b2
-            k += BLOCK_SIZE_K
-            b2_ptr = b1_ptr + BLOCK_SIZE_K * stride_bk
-            b2 = gl.amd.cdna3.buffer_load(b2_ptr + off_experts * stride_be,
-                                          offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn,
-                                          mask=offs_bk[:, None] < K - k,
-                                          other=0.0
-            )
+            if UNROLL_TIMES > 1:
+                k += BLOCK_SIZE_K
+                b1_ptr = b0_ptr + BLOCK_SIZE_K * stride_bk
+                b1 = gl.amd.cdna3.buffer_load(b1_ptr + off_experts * stride_be,
+                                            offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn,
+                                            mask=offs_bk[:, None] < K - k,
+                                            other=0.0
+                )
+            if UNROLL_TIMES > 2:
+                k += BLOCK_SIZE_K
+                b2_ptr = b1_ptr + BLOCK_SIZE_K * stride_bk
+                b2 = gl.amd.cdna3.buffer_load(b2_ptr + off_experts * stride_be,
+                                            offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn,
+                                            mask=offs_bk[:, None] < K - k,
+                                            other=0.0
+                )
 
         b0_converted = gl.convert_layout(b0, mfma_b_layout)
-        b1_converted = gl.convert_layout(b1, mfma_b_layout)
-        b2_converted = gl.convert_layout(b2, mfma_b_layout)
+        if UNROLL_TIMES > 1:
+            b1_converted = gl.convert_layout(b1, mfma_b_layout)
+        if UNROLL_TIMES > 2:
+            b2_converted = gl.convert_layout(b2, mfma_b_layout)
 
         #####################################
         # We accumulate along the K dimension.
         #####################################
         if use_int8_w8a16:
             accumulator = gl.amd.cdna3.mfma(a0_converted, b0_converted.to(compute_type), accumulator)
-            accumulator = gl.amd.cdna3.mfma(a1_converted, b1_converted.to(compute_type), accumulator)
-            accumulator = gl.amd.cdna3.mfma(a2_converted, b2_converted.to(compute_type), accumulator)
+            if UNROLL_TIMES > 1:
+                accumulator = gl.amd.cdna3.mfma(a1_converted, b1_converted.to(compute_type), accumulator)
+            if UNROLL_TIMES > 2:
+                accumulator = gl.amd.cdna3.mfma(a2_converted, b2_converted.to(compute_type), accumulator)
         elif use_fp8_w8a8:
             if group_k > 0 and group_n > 0:
                 offs_ks = 0
                 b_scale0 = gl.amd.cdna3.buffer_load(b_scale_ptr + offs_ks * stride_bsk + off_experts * stride_bse, offs_bn * stride_bsn)
-                offs_ks += (BLOCK_SIZE_K // group_k)
-                b_scale1 = gl.amd.cdna3.buffer_load(b_scale_ptr + offs_ks * stride_bsk + off_experts * stride_bse, offs_bn * stride_bsn)
-                offs_ks += (BLOCK_SIZE_K // group_k)
-                b_scale2 = gl.amd.cdna3.buffer_load(b_scale_ptr + offs_ks * stride_bsk + off_experts * stride_bse, offs_bn * stride_bsn)
+                if UNROLL_TIMES > 1:
+                    offs_ks += (BLOCK_SIZE_K // group_k)
+                    b_scale1 = gl.amd.cdna3.buffer_load(b_scale_ptr + offs_ks * stride_bsk + off_experts * stride_bse, offs_bn * stride_bsn)
+                if UNROLL_TIMES > 2:
+                    offs_ks += (BLOCK_SIZE_K // group_k)
+                    b_scale2 = gl.amd.cdna3.buffer_load(b_scale_ptr + offs_ks * stride_bsk + off_experts * stride_bse, offs_bn * stride_bsn)
                 
                 a0_scale_converted = gl.convert_layout(a_scale0, gl.SliceLayout(1, mfma_layout))
-                a1_scale_converted = gl.convert_layout(a_scale1, gl.SliceLayout(1, mfma_layout))
-                a2_scale_converted = gl.convert_layout(a_scale2, gl.SliceLayout(1, mfma_layout))
+                if UNROLL_TIMES > 1:
+                    a1_scale_converted = gl.convert_layout(a_scale1, gl.SliceLayout(1, mfma_layout))
+                if UNROLL_TIMES > 2:
+                    a2_scale_converted = gl.convert_layout(a_scale2, gl.SliceLayout(1, mfma_layout))
                 b0_scale_converted = gl.convert_layout(b_scale0, gl.SliceLayout(0, mfma_layout))
-                b1_scale_converted = gl.convert_layout(b_scale1, gl.SliceLayout(0, mfma_layout))
-                b2_scale_converted = gl.convert_layout(b_scale2, gl.SliceLayout(0, mfma_layout))
+                if UNROLL_TIMES > 1:
+                    b1_scale_converted = gl.convert_layout(b_scale1, gl.SliceLayout(0, mfma_layout))
+                if UNROLL_TIMES > 2:
+                    b2_scale_converted = gl.convert_layout(b_scale2, gl.SliceLayout(0, mfma_layout))
 
                 accumulator = gl.amd.cdna3.mfma(a0_converted, b0_converted, accumulator) * a0_scale_converted[:, None] * b0_scale_converted[None, :]
-                accumulator = gl.amd.cdna3.mfma(a1_converted, b1_converted, accumulator) * a1_scale_converted[:, None] * b1_scale_converted[None, :]
-                accumulator = gl.amd.cdna3.mfma(a2_converted, b2_converted, accumulator) * a2_scale_converted[:, None] * b2_scale_converted[None, :]
+                if UNROLL_TIMES > 1:
+                    accumulator = gl.amd.cdna3.mfma(a1_converted, b1_converted, accumulator) * a1_scale_converted[:, None] * b1_scale_converted[None, :]
+                if UNROLL_TIMES > 2:
+                    accumulator = gl.amd.cdna3.mfma(a2_converted, b2_converted, accumulator) * a2_scale_converted[:, None] * b2_scale_converted[None, :]
             else:
                 accumulator = gl.amd.cdna3.mfma(a0_converted, b0_converted, accumulator)
-                accumulator = gl.amd.cdna3.mfma(a1_converted, b1_converted, accumulator)
-                accumulator = gl.amd.cdna3.mfma(a2_converted, b2_converted, accumulator)
+                if UNROLL_TIMES > 1:
+                    accumulator = gl.amd.cdna3.mfma(a1_converted, b1_converted, accumulator)
+                if UNROLL_TIMES > 2:
+                    accumulator = gl.amd.cdna3.mfma(a2_converted, b2_converted, accumulator)
         else:
             accumulator = gl.amd.cdna3.mfma(a0_converted, b0_converted, accumulator)
-            accumulator = gl.amd.cdna3.mfma(a1_converted, b1_converted, accumulator)
-            accumulator = gl.amd.cdna3.mfma(a2_converted, b2_converted, accumulator)
+            if UNROLL_TIMES > 1:
+                accumulator = gl.amd.cdna3.mfma(a1_converted, b1_converted, accumulator)
+            if UNROLL_TIMES > 2:
+                accumulator = gl.amd.cdna3.mfma(a2_converted, b2_converted, accumulator)
 
         if MUL_ROUTED_WEIGHT:
             moe_weight = gl.amd.cdna3.buffer_load(topk_weights_ptr, offs_token, mask=token_mask, other=0)
