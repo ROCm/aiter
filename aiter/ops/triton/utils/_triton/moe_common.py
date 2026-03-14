@@ -3,8 +3,9 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-# NOTE: _write_zeros_to_output and _gluon_write_zeros_to_output
-# must be kept in sync. Any changes to one should be applied to both.
+# NOTE: _write_zeros_to_output and _gluon_write_zeros_to_output must be kept in
+# sync. Any changes to one should be applied to both.
+
 
 @triton.jit
 def _write_zeros_to_output(
@@ -24,6 +25,7 @@ def _write_zeros_to_output(
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
+
 
 @gluon.jit
 def _gluon_write_zeros_to_output(

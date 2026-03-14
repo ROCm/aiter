@@ -305,28 +305,34 @@ def fused_moe(
             # These optimizations make the Gluon kernel particularly efficient for
             # small K and large N dimensions, which is common in MoE models.
             use_gluon_impl = False
+
             def is_within_2gb(arg):
-                '''
+                """
                 Check if a tensor's storage is within 2GB limit.
                 gl.amd.cdna3.buffer_load only supports buffer size <= 2GB
-                '''
+                """
                 MAX_INT_32 = 2**31 - 1
                 if isinstance(arg, torch.Tensor) and hasattr(arg, "untyped_storage"):
                     return arg.untyped_storage().size() <= MAX_INT_32
                 return False
+
             arch = arch_info.get_arch()
             # Check if conditions are met for using the optimized Gluon kernel
-            if (arch == "gfx942" and
-                A.shape[1] - _PADDING_SIZE <= 192 and
-                B.shape[1] >= 1024 and
-                is_within_2gb(sorted_token_ids) and
-                is_within_2gb(topk_weights) and
-                is_within_2gb(A) and
-                is_within_2gb(B) and
-                is_within_2gb(C)):
+            if (
+                arch == "gfx942"
+                and A.shape[1] - _PADDING_SIZE <= 192
+                and B.shape[1] >= 1024
+                and is_within_2gb(sorted_token_ids)
+                and is_within_2gb(topk_weights)
+                and is_within_2gb(A)
+                and is_within_2gb(B)
+                and is_within_2gb(C)
+            ):
+                # Enable gluon kernel
                 use_gluon_impl = True
                 # Set optimal configuration parameters for the Gluon kerne
                 import copy
+
                 gluon_config = copy.deepcopy(config)
                 gluon_config["BLOCK_SIZE_K"] = 64
                 gluon_config["BLOCK_SIZE_N"] = 1024 if B.shape[1] % 1024 == 0 else 512
@@ -358,11 +364,31 @@ def fused_moe(
                     B.stride(1),
                     C.stride(1),
                     C.stride(2),
-                    A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
-                    A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
-                    B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
-                    B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
-                    B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
+                    (
+                        A_scale.stride(0)
+                        if A_scale is not None and A_scale.ndim == 2
+                        else 0
+                    ),
+                    (
+                        A_scale.stride(1)
+                        if A_scale is not None and A_scale.ndim == 2
+                        else 0
+                    ),
+                    (
+                        B_scale.stride(0)
+                        if B_scale is not None and B_scale.ndim >= 2
+                        else 0
+                    ),
+                    (
+                        B_scale.stride(2)
+                        if B_scale is not None and B_scale.ndim == 3
+                        else 0
+                    ),
+                    (
+                        B_scale.stride(1)
+                        if B_scale is not None and B_scale.ndim >= 2
+                        else 0
+                    ),
                     0 if block_shape is None else block_shape[0],
                     0 if block_shape is None else block_shape[1],
                     MUL_ROUTED_WEIGHT=mul_routed_weight,
@@ -394,11 +420,31 @@ def fused_moe(
                     B.stride(1),
                     C.stride(1),
                     C.stride(2),
-                    A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
-                    A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
-                    B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
-                    B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
-                    B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
+                    (
+                        A_scale.stride(0)
+                        if A_scale is not None and A_scale.ndim == 2
+                        else 0
+                    ),
+                    (
+                        A_scale.stride(1)
+                        if A_scale is not None and A_scale.ndim == 2
+                        else 0
+                    ),
+                    (
+                        B_scale.stride(0)
+                        if B_scale is not None and B_scale.ndim >= 2
+                        else 0
+                    ),
+                    (
+                        B_scale.stride(2)
+                        if B_scale is not None and B_scale.ndim == 3
+                        else 0
+                    ),
+                    (
+                        B_scale.stride(1)
+                        if B_scale is not None and B_scale.ndim >= 2
+                        else 0
+                    ),
                     0 if block_shape is None else block_shape[0],
                     0 if block_shape is None else block_shape[1],
                     MUL_ROUTED_WEIGHT=mul_routed_weight,
