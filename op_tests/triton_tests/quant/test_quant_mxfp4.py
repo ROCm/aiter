@@ -241,13 +241,19 @@ def test_fp4_utils_dynamic_mxfp4_quant(M: int, N: int, dtype):
 
     fp4_utils_out, fp4_utils_scale = fp4_utils_dynamic_mxfp4_quant(x)
     if DEBUG_MODE:
-        print(f"fp4_utils_out.shape={fp4_utils_out.shape} fp4_utils_out={fp4_utils_out}")
-        print(f"fp4_utils_scale.shape={fp4_utils_scale.shape} fp4_utils_scale={fp4_utils_scale}")
+        print(
+            f"fp4_utils_out.shape={fp4_utils_out.shape} fp4_utils_out={fp4_utils_out}"
+        )
+        print(
+            f"fp4_utils_scale.shape={fp4_utils_scale.shape} fp4_utils_scale={fp4_utils_scale}"
+        )
 
     torch_out, torch_scale = torch_dynamic_mxfp4_quant(x)
     if DEBUG_MODE:
         print(f"torch_out.shape={torch_out.shape} torch_out={torch_out}")
         print(f"torch_scale.shape={torch_scale.shape} torch_scale={torch_scale}")
 
-    torch.testing.assert_close(fp4_utils_scale.view(torch.uint8).cpu(), torch_scale.cpu())
+    torch.testing.assert_close(
+        fp4_utils_scale.view(torch.uint8).cpu(), torch_scale.cpu()
+    )
     torch.testing.assert_close(fp4_utils_out.view(torch.uint8).cpu(), torch_out.cpu())
