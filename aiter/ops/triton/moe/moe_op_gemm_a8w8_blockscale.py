@@ -592,9 +592,9 @@ def main():
     from aiter.ops.triton.moe.quant_moe import dequant_x_blockscale, dequant_w_blockscale
 
     parser = argparse.ArgumentParser(description="Run MoE GEMM A8W8 BlockScale like unit tests")
-    parser.add_argument("--M", type=int, default=128)
-    parser.add_argument("--N", type=int, default=128)
-    parser.add_argument("--K", type=int, default=128)
+    parser.add_argument("--M", type=int, default=32)
+    parser.add_argument("--N", type=int, default=1024)
+    parser.add_argument("--K", type=int, default=7168)
     parser.add_argument("--E", type=int, default=1, help="Total experts")
     parser.add_argument("--n_expts_act", type=int, default=1, help="Active experts per token")
     parser.add_argument(

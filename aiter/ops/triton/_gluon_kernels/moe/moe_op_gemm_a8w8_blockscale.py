@@ -320,17 +320,20 @@ def consume_scaled_tile(
     offs_k_scale = (k_offset_start // BLOCKSCALE_K) + m * gl.cdiv(BLOCK_K, BLOCKSCALE_K)
     if is_x_blockscale:
         if PER_ROW_X_SCALE:
-            x_scale_ptrs = (
-                XBlockScale + gathered_m * stride_x_bs_m + offs_k_scale * stride_x_bs_k
+            x_scale_offs = (
+                gathered_m * stride_x_bs_m + offs_k_scale * stride_x_bs_k
             )
         else:
             offs_x_scale_m = gathered_m // BLOCKSCALE_M
-            x_scale_ptrs = (
-                XBlockScale
-                + offs_x_scale_m * stride_x_bs_m
+            x_scale_offs = (
+                offs_x_scale_m * stride_x_bs_m
                 + offs_k_scale * stride_x_bs_k
             )
-        cur_a_scale = gl.load(x_scale_ptrs)
+        cur_a_scale = gl.amd.cdna4.buffer_load(
+            ptr=XBlockScale,
+            offsets=x_scale_offs,
+            cache="",
+        )
     else:
         cur_a_scale = gl.full(
             (BLOCK_M,), 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, WMMA_LAYOUT)
@@ -350,14 +353,17 @@ def consume_scaled_tile(
         w_scale_ptrs = (
             w_scale_base + offs_k_scale * stride_w_bs_k + offs_w_scale_n * stride_w_bs_n
         )
-        cur_b_scale = gl.load(w_scale_ptrs)
+        cur_b_scale = gl.amd.cdna4.buffer_load(
+            ptr=w_scale_base,
+            offsets=offs_k_scale * stride_w_bs_k + offs_w_scale_n * stride_w_bs_n,
+            cache="",
+        )
     else:
         cur_b_scale = gl.full(
             (BLOCK_N,), 1.0, dtype=gl.float32, layout=gl.SliceLayout(0, WMMA_LAYOUT)
         )
 
     cur_a_scale = gl.convert_layout(cur_a_scale, gl.SliceLayout(1, WMMA_LAYOUT))
-    cur_b_scale = gl.convert_layout(cur_b_scale, gl.SliceLayout(0, WMMA_LAYOUT))
 
     zeros = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
     partial = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
