@@ -507,7 +507,7 @@ def test_mha_backward(
                 return_attn_probs=HAS_DROPOUT,
             )
             if HAS_DROPOUT:
-                dropout_mask = triton_out[2] > 0
+                dropout_mask = triton_out[2] >= 0
                 triton_out = triton_out[0]
             else:
                 dropout_mask = None
@@ -639,7 +639,7 @@ def test_mha_backward_varlen(
             if HAS_DROPOUT:
                 dropout_mask = (
                     pad_rearrange_dropout_mask(
-                        triton_out[2] > 0,
+                        triton_out[2] >= 0,
                         cu_seqlens_q,
                         cu_seqlens_k,
                         max_seqlen_q,
