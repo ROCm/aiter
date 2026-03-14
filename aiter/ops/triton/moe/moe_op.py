@@ -329,7 +329,7 @@ def fused_moe(
                 import copy
                 gluon_config = copy.deepcopy(config)
                 gluon_config["BLOCK_SIZE_K"] = 64
-                gluon_config["BLOCK_SIZE_N"] = 1024
+                gluon_config["BLOCK_SIZE_N"] = 1024 if B.shape[1] % 1024 == 0 else 512
                 gluon_config["num_warps"] = 4
 
             grid = lambda META: (  # noqa: E731
