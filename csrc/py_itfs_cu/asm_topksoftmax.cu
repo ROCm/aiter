@@ -27,32 +27,39 @@ struct __attribute__((packed)) KernelArgs
     p3 _p8;
 };
 
-std::string get_heuristic_kernel_topksoftmax(std::string arch_id,
+std::pair<std::string, int> get_heuristic_kernel_topksoftmax(std::string arch_id,
     std::string dtype,
-    int subm,
+    int max_subm,
     int num_experts,
     int topk,
     CFG* cfgs)
 {
+    int subm = -1;
+    std::string kernelName = "";
     for(const auto& el : *cfgs)
     {
         if (el.first.find(arch_id) != 0)
             continue;
         const auto& cfg = el.second;
-        if (cfg.dtype != dtype || cfg.subm != subm || cfg.num_experts != num_experts || cfg.topk != topk)
+        if (cfg.dtype != dtype || cfg.subm > max_subm || cfg.num_experts != num_experts || cfg.topk != topk)
             continue;
-        return el.first;
+        
+        if (cfg.subm > subm)
+        {
+            kernelName = el.first;
+            subm = cfg.subm;
+        }
     }
 
-    TORCH_CHECK(false,
+    TORCH_CHECK(!kernelName.empty(),
     __func__,
     ": cannot get heuristic kernel!"
     " arch_id:", arch_id,
     " dtype:", dtype,
-    " subm:", subm,
+    " max_subm:", max_subm,
     " num_experts:", num_experts,
     " topk:", topk);
-    return "";
+    return {kernelName, subm};
 }
 
 void topk_softmax_asm(torch::Tensor& topk_weights,         // [num_tokens, topk]
@@ -66,7 +73,7 @@ void topk_softmax_asm(torch::Tensor& topk_weights,         // [num_tokens, topk]
     const uint num_tokens  = gating_output.numel() / num_experts;
     const uint topk        = topk_weights.size(-1);
     const uint out_stride  = topk_weights.stride(0);
-    const uint SUBM        = num_tokens < 10000 ? 4 : 12;
+    const uint MAX_SUBM    = num_tokens < 10000 ? 4 : 12;
     std::string dtype;
     if(gating_output.dtype() == at::ScalarType::Float)
         dtype = "fp32";
@@ -90,7 +97,7 @@ void topk_softmax_asm(torch::Tensor& topk_weights,         // [num_tokens, topk]
     CFG* config_map = &cfg_topksoftmax;
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
     AiterAsmKernel* impl_ptr = nullptr;
-    std::string kernelName = get_heuristic_kernel_topksoftmax(arch_id, dtype, SUBM, num_experts, topk, config_map);
+    auto [kernelName, subm] = get_heuristic_kernel_topksoftmax(arch_id, dtype, MAX_SUBM, num_experts, topk, config_map);
 
     auto it = config_map->find(kernelName);
     if(it != config_map->end())
@@ -111,7 +118,7 @@ void topk_softmax_asm(torch::Tensor& topk_weights,         // [num_tokens, topk]
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(gating_output));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    uint gdx = (num_tokens + SUBM - 1) / SUBM;
+    uint gdx = (num_tokens + subm - 1) / subm;
     TORCH_CHECK(gdx >> 31 == 0, "num_tokens too large: ", num_tokens);
     impl_ptr->launch_kernel({&args,
                              &arg_size,

@@ -52,7 +52,7 @@ template<typename T> using remove_cvref_t = remove_cv_t<remove_reference_t<T>>;
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // constant
 using index_t = int;
-using long_index_t = int64_t;
+using long_index_t = long long;
 
 template<index_t I> struct number : public std::integral_constant<index_t, I> {};
 template<bool B>    struct bool_constant : public std::bool_constant<B> {};
@@ -818,21 +818,21 @@ REGISTER_DTYPE(fp16, _Float16)
 #endif
 REGISTER_DTYPE(fp8 , _BitInt(8))
 REGISTER_DTYPE(bf8 , unsigned _BitInt(8))
-REGISTER_DTYPE(i32 , int32_t)
-REGISTER_DTYPE(u32 , uint32_t)
-REGISTER_DTYPE(i16 , int16_t)
+REGISTER_DTYPE(i32 , int)
+REGISTER_DTYPE(u32 , unsigned int)
+REGISTER_DTYPE(i16 , short)
 #if __clang_major__ >= 20
-REGISTER_DTYPE(u16 , uint16_t)
+REGISTER_DTYPE(u16 , unsigned short)
 #endif
-REGISTER_DTYPE(i8  , int8_t)
-REGISTER_DTYPE(u8  , uint8_t)
+REGISTER_DTYPE(i8  , signed char)
+REGISTER_DTYPE(u8  , unsigned char)
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////
-// numeric_limits — min/max/lowest/quiet_nan/infinity for all registered dtypes
+// numeric_limits -- min/max/lowest/quiet_nan/infinity for all registered dtypes
 template<typename T> struct numeric_limits;
 
 template<> struct numeric_limits<fp32_t> {
-    static constexpr uint32_t bin_min = 0x00800000, bin_max = 0x7F7FFFFF, bin_lowest = 0xFF7FFFFF, bin_qnan = 0x7FC00000, bin_inf = 0x7F800000;
+    static constexpr unsigned int bin_min = 0x00800000, bin_max = 0x7F7FFFFF, bin_lowest = 0xFF7FFFFF, bin_qnan = 0x7FC00000, bin_inf = 0x7F800000;
     OPUS_H_D static constexpr fp32_t min()       { return __builtin_bit_cast(fp32_t, bin_min); }
     OPUS_H_D static constexpr fp32_t max()       { return __builtin_bit_cast(fp32_t, bin_max); }
     OPUS_H_D static constexpr fp32_t lowest()    { return __builtin_bit_cast(fp32_t, bin_lowest); }
@@ -840,7 +840,7 @@ template<> struct numeric_limits<fp32_t> {
     OPUS_H_D static constexpr fp32_t infinity()  { return __builtin_bit_cast(fp32_t, bin_inf); }
 };
 template<> struct numeric_limits<fp16_t> {
-    static constexpr uint16_t bin_min = 0x0400, bin_max = 0x7BFF, bin_lowest = 0xFBFF, bin_qnan = 0x7E00, bin_inf = 0x7C00;
+    static constexpr unsigned short bin_min = 0x0400, bin_max = 0x7BFF, bin_lowest = 0xFBFF, bin_qnan = 0x7E00, bin_inf = 0x7C00;
     OPUS_H_D static constexpr fp16_t min()       { return __builtin_bit_cast(fp16_t, bin_min); }
     OPUS_H_D static constexpr fp16_t max()       { return __builtin_bit_cast(fp16_t, bin_max); }
     OPUS_H_D static constexpr fp16_t lowest()    { return __builtin_bit_cast(fp16_t, bin_lowest); }
@@ -848,7 +848,7 @@ template<> struct numeric_limits<fp16_t> {
     OPUS_H_D static constexpr fp16_t infinity()  { return __builtin_bit_cast(fp16_t, bin_inf); }
 };
 template<> struct numeric_limits<bf16_t> {
-    static constexpr uint16_t bin_min = 0x0080, bin_max = 0x7F7F, bin_lowest = 0xFF7F, bin_qnan = 0x7FC0, bin_inf = 0x7F80;
+    static constexpr unsigned short bin_min = 0x0080, bin_max = 0x7F7F, bin_lowest = 0xFF7F, bin_qnan = 0x7FC0, bin_inf = 0x7F80;
     OPUS_H_D static constexpr bf16_t min()       { return __builtin_bit_cast(bf16_t, bin_min); }
     OPUS_H_D static constexpr bf16_t max()       { return __builtin_bit_cast(bf16_t, bin_max); }
     OPUS_H_D static constexpr bf16_t lowest()    { return __builtin_bit_cast(bf16_t, bin_lowest); }
@@ -856,25 +856,25 @@ template<> struct numeric_limits<bf16_t> {
     OPUS_H_D static constexpr bf16_t infinity()  { return __builtin_bit_cast(bf16_t, bin_inf); }
 };
 // fp8 E4M3: gfx950=OCP(ieee-like, NaN=0x7F), gfx942=fnuz(NaN=0x80). No infinity in either format.
-// NOTE: __builtin_bit_cast with _BitInt(8) is not yet constexpr in clang, so use static_cast via int8_t.
+// NOTE: __builtin_bit_cast with _BitInt(8) is not yet constexpr in clang, so use static_cast via signed char.
 template<> struct numeric_limits<fp8_t> {
 #if defined(__gfx950__)
-    static constexpr uint8_t bin_min = 0x08, bin_max = 0x7E, bin_lowest = 0xFE, bin_qnan = 0x7F, bin_inf = 0x00;
+    static constexpr unsigned char bin_min = 0x08, bin_max = 0x7E, bin_lowest = 0xFE, bin_qnan = 0x7F, bin_inf = 0x00;
 #else
-    static constexpr uint8_t bin_min = 0x08, bin_max = 0x7F, bin_lowest = 0xFF, bin_qnan = 0x80, bin_inf = 0x00;
+    static constexpr unsigned char bin_min = 0x08, bin_max = 0x7F, bin_lowest = 0xFF, bin_qnan = 0x80, bin_inf = 0x00;
 #endif
-    OPUS_H_D static constexpr fp8_t min()       { return static_cast<fp8_t>(static_cast<int8_t>(bin_min)); }
-    OPUS_H_D static constexpr fp8_t max()       { return static_cast<fp8_t>(static_cast<int8_t>(bin_max)); }
-    OPUS_H_D static constexpr fp8_t lowest()    { return static_cast<fp8_t>(static_cast<int8_t>(bin_lowest)); }
-    OPUS_H_D static constexpr fp8_t quiet_nan() { return static_cast<fp8_t>(static_cast<int8_t>(bin_qnan)); }
-    OPUS_H_D static constexpr fp8_t infinity()  { return static_cast<fp8_t>(static_cast<int8_t>(bin_inf)); }
+    OPUS_H_D static constexpr fp8_t min()       { return static_cast<fp8_t>(static_cast<signed char>(bin_min)); }
+    OPUS_H_D static constexpr fp8_t max()       { return static_cast<fp8_t>(static_cast<signed char>(bin_max)); }
+    OPUS_H_D static constexpr fp8_t lowest()    { return static_cast<fp8_t>(static_cast<signed char>(bin_lowest)); }
+    OPUS_H_D static constexpr fp8_t quiet_nan() { return static_cast<fp8_t>(static_cast<signed char>(bin_qnan)); }
+    OPUS_H_D static constexpr fp8_t infinity()  { return static_cast<fp8_t>(static_cast<signed char>(bin_inf)); }
 };
 // bf8 E5M2: gfx950=OCP(ieee, has inf=0x7C, NaN=0x7E), gfx942=fnuz(no inf, NaN=0x80)
 template<> struct numeric_limits<bf8_t> {
 #if defined(__gfx950__)
-    static constexpr uint8_t bin_min = 0x04, bin_max = 0x7B, bin_lowest = 0xFB, bin_qnan = 0x7F, bin_inf = 0x7C;
+    static constexpr unsigned char bin_min = 0x04, bin_max = 0x7B, bin_lowest = 0xFB, bin_qnan = 0x7F, bin_inf = 0x7C;
 #else
-    static constexpr uint8_t bin_min = 0x04, bin_max = 0x7F, bin_lowest = 0xFF, bin_qnan = 0x80, bin_inf = 0x00;
+    static constexpr unsigned char bin_min = 0x04, bin_max = 0x7F, bin_lowest = 0xFF, bin_qnan = 0x80, bin_inf = 0x00;
 #endif
     OPUS_H_D static constexpr bf8_t min()       { return static_cast<bf8_t>(bin_min); }
     OPUS_H_D static constexpr bf8_t max()       { return static_cast<bf8_t>(bin_max); }
@@ -940,13 +940,13 @@ OPUS_D bf16_t fp32_to_bf16_rtn_asm(const float& x) {
 
 OPUS_D constexpr auto fp16_to_fp32(const fp16_t& x) { return static_cast<fp32_t>(x); }
 OPUS_D constexpr auto fp32_to_fp16(const fp32_t& x) { return static_cast<fp16_t>(x); }
-OPUS_D constexpr auto bf16_to_fp32(const bf16_t& x) { union { u32_t i; float f; } u = {static_cast<u32_t>(__builtin_bit_cast(uint16_t, x)) << 16}; return u.f;}
-OPUS_D constexpr uint16_t fp32_to_bf16_rtn_raw(float f)
+OPUS_D constexpr auto bf16_to_fp32(const bf16_t& x) { union { u32_t i; float f; } u = {static_cast<u32_t>(__builtin_bit_cast(unsigned short, x)) << 16}; return u.f;}
+OPUS_D constexpr unsigned short fp32_to_bf16_rtn_raw(float f)
 {
-    uint32_t bits = __builtin_bit_cast(uint32_t, f);
+    unsigned int bits = __builtin_bit_cast(unsigned int, f);
     if(~bits & 0x7f800000) { bits += 0x7fff + ((bits >> 16) & 1); /* Round to nearest even */ }
     else if(bits & 0xffff) { bits |= 0x10000; /* Preserve signaling NaN */ }
-    return uint16_t(bits >> 16);
+    return static_cast<unsigned short>(bits >> 16);
 }
 #if defined(__gfx950__) && __clang_major__ >= 20
 template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // gfx950 has instruction conversion, leave 'rm' here for compatiblity
@@ -955,8 +955,8 @@ OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) { return st
 template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // 0:standard, 1:truncate_with_nan, 2:truncate, 3:standard asm 4:rta_asm(round to nearest away)
 OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) {
     if      constexpr (rm == 0) {return __builtin_bit_cast(bf16_t, fp32_to_bf16_rtn_raw(x)); }
-    else if constexpr (rm == 1) {u32_t z = __builtin_bit_cast(u32_t, x); return __builtin_bit_cast(bf16_t, static_cast<uint16_t>(z | (!(~z & 0x7f800000) && (z & 0xffff) ? 0x10000 : 0) >> 16)); }
-    else if constexpr (rm == 2) {u32_t z = __builtin_bit_cast(u32_t, x); return __builtin_bit_cast(bf16_t, static_cast<uint16_t>(z >> 16)); }
+    else if constexpr (rm == 1) {u32_t z = __builtin_bit_cast(u32_t, x); return __builtin_bit_cast(bf16_t, static_cast<unsigned short>(z | (!(~z & 0x7f800000) && (z & 0xffff) ? 0x10000 : 0) >> 16)); }
+    else if constexpr (rm == 2) {u32_t z = __builtin_bit_cast(u32_t, x); return __builtin_bit_cast(bf16_t, static_cast<unsigned short>(z >> 16)); }
     else if constexpr (rm == 3) { return fp32_to_bf16_rtn_asm(x); }
 }
 #endif
@@ -970,10 +970,10 @@ OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) {
 // TODO: we may remove constexpr from cast in the future
 OPUS_D auto fp32_to_fp8(const fp32_t& x) {
     int w; w = __builtin_amdgcn_cvt_pk_fp8_f32(x, 0.0f, w, /*sel=lo*/0);
-    return __builtin_bit_cast(fp8_t, static_cast<int8_t>(w));
+    return __builtin_bit_cast(fp8_t, static_cast<signed char>(w));
 }
 OPUS_D auto fp8_to_fp32(const fp8_t& x) {
-    int w = static_cast<int>(__builtin_bit_cast(uint8_t, x));
+    int w = static_cast<int>(__builtin_bit_cast(unsigned char, x));
     return __builtin_amdgcn_cvt_f32_fp8(w, /*byte=*/0);
 }
 #pragma clang diagnostic pop
@@ -989,28 +989,28 @@ OPUS_CAST_DEFINE(fp32, fp8)
 
 namespace impl {
 // implement a "pack" of data, storage should pad to multiple of byte(8bit)
-template<typename storage_, uint32_t bits_, bool is_signed_ = true>
+template<typename storage_, unsigned int bits_, bool is_signed_ = true>
 struct dpacks {
     using storage = remove_cvref_t<storage_>;
-    static constexpr uint32_t bits = bits_;
-    static constexpr uint32_t mask = (1 << bits) - 1;
+    static constexpr unsigned int bits = bits_;
+    static constexpr unsigned int mask = (1 << bits) - 1;
     static constexpr bool is_signed = is_signed_;
-    static constexpr uint32_t num_packs = sizeof(storage) * 8 / bits;   // we will not check if evenly divided or not here
+    static constexpr unsigned int num_packs = sizeof(storage) * 8 / bits;   // we will not check if evenly divided or not here
     OPUS_H_D                     constexpr storage operator[](index_t i) const { return (value >> (i * bits)) & mask; } // NOTE: not efficient, better use v_bfi/v_bfe/v_perm on device
     template<index_t I> OPUS_H_D constexpr storage operator[](number<I>) const { return (value >> (I * bits)) & mask; } // NOTE: not efficient, better use v_bfi/v_bfe/v_perm on device
     storage value;
 };
 
-template<typename storage_, uint32_t bits_, uint32_t exp_bits_, uint32_t mantissa_bits_, bool is_signed_ = true>
+template<typename storage_, unsigned int bits_, unsigned int exp_bits_, unsigned int mantissa_bits_, bool is_signed_ = true>
 struct fpacks : dpacks<storage_, bits_, is_signed_> {
-    static constexpr uint32_t exp_bits = exp_bits_;
-    static constexpr uint32_t mantissa_bits = mantissa_bits_;
+    static constexpr unsigned int exp_bits = exp_bits_;
+    static constexpr unsigned int mantissa_bits = mantissa_bits_;
 };
 } // namespace impl
 
 template <typename> struct is_packs : false_type {};
-template <typename S, uint32_t B, bool X> struct is_packs<impl::dpacks<S, B, X>> : true_type {};
-template <typename S, uint32_t B, uint32_t E, uint32_t M, bool X> struct is_packs<impl::fpacks<S, B, E, M, X>> : true_type {};
+template <typename S, unsigned int B, bool X> struct is_packs<impl::dpacks<S, B, X>> : true_type {};
+template <typename S, unsigned int B, unsigned int E, unsigned int M, bool X> struct is_packs<impl::fpacks<S, B, E, M, X>> : true_type {};
 template <typename T> static constexpr bool is_packs_v = is_packs<remove_cvref_t<T>>::value;
 
 // how many real data within one byte
@@ -1020,8 +1020,8 @@ template <typename T> static constexpr int num_packs_v = num_packs<T>::value;
 
 template <typename T> struct sizeof_bits { static constexpr int value = int(sizeof(T) * 8); };
 template <> struct sizeof_bits<void> { static constexpr int value = 0; };
-template <typename S, uint32_t B, bool X> struct sizeof_bits<impl::dpacks<S, B, X>> { static constexpr int value = impl::dpacks<S, B, X>::bits; };
-template <typename S, uint32_t B, uint32_t E, uint32_t M, bool X> struct sizeof_bits<impl::fpacks<S, B, E, M, X>> { static constexpr int value = impl::fpacks<S, B, E, M, X>::bits; };
+template <typename S, unsigned int B, bool X> struct sizeof_bits<impl::dpacks<S, B, X>> { static constexpr int value = impl::dpacks<S, B, X>::bits; };
+template <typename S, unsigned int B, unsigned int E, unsigned int M, bool X> struct sizeof_bits<impl::fpacks<S, B, E, M, X>> { static constexpr int value = impl::fpacks<S, B, E, M, X>::bits; };
 template <class T> static constexpr auto sizeof_bits_v = sizeof_bits<T>::value;
 
 #define OPUS_DEFINE_DPACKS(name_, storage_, bits_, is_signed_) \
@@ -1033,11 +1033,11 @@ template <class T> static constexpr auto sizeof_bits_v = sizeof_bits<T>::value;
     template<> struct sizeof_bits<name_> { static constexpr int value = name_::bits; }; template<> struct is_packs<name_> : true_type {}; template<> struct is_dtype<name_> : true_type {};
 
 // NOTE: convention here. The subbyte type below is indeed "packed" data. e.g. fp4_t, underneath it is fp4x2 in one byte, but we don't name it this way
-// This is different from cutlass convention (e.g float4_e2m1_t, but storage is uint8_t, hence an array of float4_e2m1_t will be expanded), and different from ck convention(explicitly name it fp4x2_t)
-OPUS_DEFINE_DPACKS(int4_t , uint8_t, 4, true)           // int4x2
-OPUS_DEFINE_DPACKS(uint4_t, uint8_t, 4, false)          // uint4x2
-OPUS_DEFINE_FPACKS(fp4_t,   uint8_t, 4, 2, 1, true)     // fp4x2
-OPUS_DEFINE_FPACKS(e8m0_t,  uint8_t, 8, 8, 0, false)    // fp4x2
+// This is different from cutlass convention (e.g float4_e2m1_t, but storage is unsigned char, hence an array of float4_e2m1_t will be expanded), and different from ck convention(explicitly name it fp4x2_t)
+OPUS_DEFINE_DPACKS(int4_t , unsigned char, 4, true)           // int4x2
+OPUS_DEFINE_DPACKS(uint4_t, unsigned char, 4, false)          // uint4x2
+OPUS_DEFINE_FPACKS(fp4_t,   unsigned char, 4, 2, 1, true)     // fp4x2
+OPUS_DEFINE_FPACKS(e8m0_t,  unsigned char, 8, 8, 0, false)    // fp4x2
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wuninitialized"
@@ -1045,7 +1045,7 @@ OPUS_DEFINE_FPACKS(e8m0_t,  uint8_t, 8, 8, 0, false)    // fp4x2
 template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp32_to_fp8_packed_x2(const S& s, number<sel> = {}) {
     int w ; w = __builtin_amdgcn_cvt_pk_fp8_f32(s[0], s[1], w, sel);
-    return __builtin_bit_cast(fp8x2_t, static_cast<int16_t>(w));
+    return __builtin_bit_cast(fp8x2_t, static_cast<short>(w));
 }
 template<typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp32_to_fp8_packed_x4(const S& s) {
@@ -1145,7 +1145,7 @@ OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x8(const S& s, float scale = 
 
 template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, bf16x2_t>, bool> = true>
 OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) {
-    union { uint32_t bitwise; fp4_t f4_pack[4]; } value;
+    union { unsigned int bitwise; fp4_t f4_pack[4]; } value;
     value.bitwise = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(value.bitwise, s, scale, sel);
     return value.fp4_pack[0];
 }
@@ -1261,6 +1261,8 @@ OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
 //   During the host pass (arch macros absent), they return safe defaults:
 //     get_warp_size() -> 64 (GFX9 default)
 //     get_smem_size() -> 65536 (64 KB, non-gfx950 default)
+//   Note: __builtin_amdgcn_wavefrontsize() is NOT constexpr in clang, so it cannot be used in template arguments, static_assert, or if constexpr. Prefer get_warp_size() which uses
+//   preprocessor arch detection to provide a constexpr result.
 //
 // ---- query_warp_size() / query_smem_size() ----
 //   OPUS_H only -- runtime HIP API queries (hipGetDeviceProperties). Use when you need the true hardware value on the host (e.g. occupancy calculations).
@@ -1293,30 +1295,30 @@ OPUS_H index_t query_num_cu()    { int d; (void)hipGetDevice(&d); hipDeviceProp_
 // Uses compiler builtins (__builtin_amdgcn_*) instead of HIP runtime APIs, so no <hip/hip_runtime.h> dependency.
 #ifdef __HIPCC__
 struct workgroup_barrier {
-    OPUS_D workgroup_barrier(uint32_t* ptr) : base_ptr(ptr) {}
-    OPUS_D uint32_t ld(uint32_t offset = 0) { return __atomic_load_n(base_ptr + offset, __ATOMIC_RELAXED); }
-    OPUS_D void wait_eq(uint32_t value, uint32_t offset = 0) { if (__builtin_amdgcn_workitem_id_x() == 0) while (ld(offset) != value) {} __builtin_amdgcn_s_barrier(); }
-    OPUS_D void wait_lt(uint32_t value, uint32_t offset = 0) { if (__builtin_amdgcn_workitem_id_x() == 0) while (ld(offset) < value) {} __builtin_amdgcn_s_barrier(); }
-    OPUS_D void inc(uint32_t offset = 0) { __builtin_amdgcn_s_barrier(); if (__builtin_amdgcn_workitem_id_x() == 0) __atomic_fetch_add(base_ptr + offset, 1u, __ATOMIC_RELAXED); }
-    uint32_t* base_ptr;
+    OPUS_D workgroup_barrier(unsigned int* ptr) : base_ptr(ptr) {}
+    OPUS_D unsigned int ld(unsigned int offset = 0) { return __atomic_load_n(base_ptr + offset, __ATOMIC_RELAXED); }
+    OPUS_D void wait_eq(unsigned int value, unsigned int offset = 0) { if (__builtin_amdgcn_workitem_id_x() == 0) while (ld(offset) != value) {} __builtin_amdgcn_s_barrier(); }
+    OPUS_D void wait_lt(unsigned int value, unsigned int offset = 0) { if (__builtin_amdgcn_workitem_id_x() == 0) while (ld(offset) < value) {} __builtin_amdgcn_s_barrier(); }
+    OPUS_D void inc(unsigned int offset = 0) { __builtin_amdgcn_s_barrier(); if (__builtin_amdgcn_workitem_id_x() == 0) __atomic_fetch_add(base_ptr + offset, 1u, __ATOMIC_RELAXED); }
+    unsigned int* base_ptr;
 };
 #endif
 
 // NOTE: all data in unsigned int. Prefer usage, construct a mdiv structure on host, pass the structure to kernel, and use div/divmod
 struct mdiv {
-    uint32_t divisor;   uint32_t multiplier;    uint32_t shift;
+    unsigned int divisor;   unsigned int multiplier;    unsigned int shift;
     OPUS_H_D mdiv() : divisor(0), multiplier(0), shift(0) {}
-    OPUS_H_D mdiv(uint32_t divisor_) : divisor(divisor_) {
-        uint32_t shift_u32 = 0;
+    OPUS_H_D mdiv(unsigned int divisor_) : divisor(divisor_) {
+        unsigned int shift_u32 = 0;
         while ((1U << shift_u32) < divisor_) shift_u32++;
-        uint64_t tmp_u64 = static_cast<uint64_t>((1UL << shift_u32) - divisor_) << 32;
-        multiplier       = static_cast<uint32_t>(tmp_u64 / divisor_ + 1);
+        unsigned long long tmp_u64 = static_cast<unsigned long long>((1UL << shift_u32) - divisor_) << 32;
+        multiplier       = static_cast<unsigned int>(tmp_u64 / divisor_ + 1);
         shift            = shift_u32;
     }
     // previously we use __umulhi(), which is defined in <hip/hip_runtime.hpp>, for __device__ compilation. Today compiler is smart enough to generate s_mul_hi_u32 / v_mul_hi_u32
-    OPUS_H_D uint32_t div(uint32_t dividend) const { uint32_t tmp = static_cast<uint32_t>((static_cast<uint64_t>(dividend) * multiplier) >> 32); return (tmp + dividend) >> shift; }
-    OPUS_H_D void divmod(uint32_t dividend, uint32_t& quotient, uint32_t& remainder) const { quotient  = div(dividend);  remainder = dividend - (quotient * divisor); }
-    OPUS_H_D uint32_t get() const { return divisor; }
+    OPUS_H_D unsigned int div(unsigned int dividend) const { unsigned int tmp = static_cast<unsigned int>((static_cast<unsigned long long>(dividend) * multiplier) >> 32); return (tmp + dividend) >> shift; }
+    OPUS_H_D void divmod(unsigned int dividend, unsigned int& quotient, unsigned int& remainder) const { quotient  = div(dividend);  remainder = dividend - (quotient * divisor); }
+    OPUS_H_D unsigned int get() const { return divisor; }
 };
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // math
@@ -1328,6 +1330,19 @@ OPUS_D T mov_dpp(T x, number<dpp_i>, number<row_mask> = {}, number<bank_mask> = 
 template<typename O, typename T, int dpp_i, int row_mask = 0xf, int bank_mask = 0xf, bool bound_ctrl = true>
 OPUS_D T upd_dpp(const O& old, T x, number<dpp_i>, number<row_mask> = {}, number<bank_mask> = {}, bool_constant<bound_ctrl> = {}) {
     static_assert(sizeof(T) == 4); return __builtin_bit_cast(T, __builtin_amdgcn_update_dpp(__builtin_bit_cast(int, old), __builtin_bit_cast(int, x), dpp_i, row_mask, bank_mask, bound_ctrl));
+}
+
+// lane index within wavefront (threadIdx.x % warp_size, e.g. wave64: tid=3->3, tid=70->6)
+OPUS_D unsigned int lane_id() {
+    if constexpr (get_warp_size() == 32) return __builtin_amdgcn_mbcnt_lo(-1, 0);
+    else return __builtin_amdgcn_mbcnt_hi(-1, __builtin_amdgcn_mbcnt_lo(-1, 0));
+}
+
+// cross-lane shuffle via ds_bpermute (no hip_runtime.h dependency)
+template<typename T>
+OPUS_D T shfl(T var, int src_lane, int width = get_warp_size()) {
+    static_assert(sizeof(T) == 4);  int self = lane_id();   int index = (src_lane & (width - 1)) + (self & ~(width - 1));
+    return __builtin_bit_cast(T, __builtin_amdgcn_ds_bpermute(index << 2, __builtin_bit_cast(int, var)));
 }
 
 template<typename T> OPUS_D T max(const T&a, const T&b)                { return a > b ? a : b; }
@@ -1351,13 +1366,13 @@ OPUS_D constexpr auto buffer_default_config() {
     return 0xffffffff;
 #endif
 }
-OPUS_D __amdgpu_buffer_rsrc_t make_buffer_rsrc(const void* ptr, uint32_t size = 0xffffffff, uint32_t config = buffer_default_config()) {
+OPUS_D __amdgpu_buffer_rsrc_t make_buffer_rsrc(const void* ptr, unsigned int size = 0xffffffff, unsigned int config = buffer_default_config()) {
     return __builtin_amdgcn_make_buffer_rsrc(const_cast<void*>(static_cast<const void*>(ptr)), 0, size, config); // void *p, short stride, int num, int flags
 }
 #if __clang_major__ < 20
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wundefined-inline"
-OPUS_D void llvm_amdgcn_raw_buffer_load_lds(i32x4_t r, OPUS_LDS_ADDR uint32_t* p, index_t size, index_t vos, index_t sos, index_t ios, index_t aux) __asm("llvm.amdgcn.raw.buffer.load.lds");
+OPUS_D void llvm_amdgcn_raw_buffer_load_lds(i32x4_t r, OPUS_LDS_ADDR unsigned int* p, index_t size, index_t vos, index_t sos, index_t ios, index_t aux) __asm("llvm.amdgcn.raw.buffer.load.lds");
 #pragma clang diagnostic pop
 #endif
 template<typename T_>
@@ -1367,7 +1382,7 @@ struct gmem {
     static constexpr index_t vector_size = vector_traits<T>::size();
     template<index_t vec = 1> using vector_type = vector_t<scalar_type, vec * vector_size>;
 
-    OPUS_D gmem(const void* ptr, uint32_t size = 0xffffffff, uint32_t config = buffer_default_config()) : cached_rsrc(make_buffer_rsrc(ptr, size, config)) {}
+    OPUS_D gmem(const void* ptr, unsigned int size = 0xffffffff, unsigned int config = buffer_default_config()) : cached_rsrc(make_buffer_rsrc(ptr, size, config)) {}
 
     template<index_t vec = 1, index_t aux = 0>   // os in unit of byte
     OPUS_D auto _load(int v_os, int s_os = 0, number<aux> = {}) {
@@ -1417,7 +1432,7 @@ struct gmem {
     OPUS_D auto load(int v_os, int s_os = 0, number<aux> = {}) { return _load<vec>(v_os * sizeof(T), s_os * sizeof(T), number<aux>{}); }
 
     template<index_t vec = 1, index_t aux = 0>   // os in unit of T and cast to vector with vec
-    OPUS_D void async_load(void* dst, int v_os, int s_os = 0, number<aux> = {}) { _async_load<vec>(reinterpret_cast<OPUS_LDS_ADDR void*>(reinterpret_cast<uintptr_t>(dst)), v_os * sizeof(T), s_os * sizeof(T), number<aux>{}); }
+    OPUS_D void async_load(void* dst, int v_os, int s_os = 0, number<aux> = {}) { _async_load<vec>(reinterpret_cast<OPUS_LDS_ADDR void*>(reinterpret_cast<__UINTPTR_TYPE__>(dst)), v_os * sizeof(T), s_os * sizeof(T), number<aux>{}); }
 
     template<index_t vec = 1, typename V, index_t aux = 0, std::enable_if_t<(is_vector_v<V> || is_dtype_v<V> || is_array_v<V>), bool> = true>   // os in unit of T and cast to vector with vec
     OPUS_D void store(const V& x, int v_os, int s_os = 0, number<aux> = {}) {
@@ -1479,9 +1494,9 @@ struct gmem {
     OPUS_D void async_load(void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, int s_os = 0, number<aux> = {}) {
         constexpr auto issue_space = layout_to_issue_space<LayoutG>();
         constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
-        auto smem_ptr = reinterpret_cast<OPUS_LDS_ADDR scalar_type*>(reinterpret_cast<uintptr_t>(smem_base));
+        auto smem_ptr = reinterpret_cast<OPUS_LDS_ADDR scalar_type*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_base));
         static_ford(issue_space_vec, [&](auto... ids) {
-            async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(smem_ptr + u_smem(ids...))), u_gmem(ids...), s_os, number<aux>{});
+            async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_ptr + u_smem(ids...))), u_gmem(ids...), s_os, number<aux>{});
         });
     }
 
@@ -1535,11 +1550,11 @@ struct gmem {
     OPUS_D void async_load_if(const Predicate& pred, void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, int s_os = 0, number<aux> = {}) {
         constexpr auto issue_space = layout_to_issue_space<LayoutG>();
         constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
-        auto smem_ptr = reinterpret_cast<OPUS_LDS_ADDR scalar_type*>(reinterpret_cast<uintptr_t>(smem_base));
+        auto smem_ptr = reinterpret_cast<OPUS_LDS_ADDR scalar_type*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_base));
 
         static_ford(issue_space_vec, [&](auto... ids) {
             if (pred(ids...)) {
-                async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(smem_ptr + u_smem(ids...))), u_gmem(ids...), s_os, number<aux>{});
+                async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_ptr + u_smem(ids...))), u_gmem(ids...), s_os, number<aux>{});
             } else {
                 using type = vector_type<vec>;
                 type z = {0};
@@ -1551,7 +1566,7 @@ struct gmem {
     __amdgpu_buffer_rsrc_t cached_rsrc;
 };
 
-template<typename T_> OPUS_D decltype(auto) make_gmem(const T_* ptr, uint32_t size = 0xffffffff, uint32_t config = buffer_default_config()) { return gmem<T_>{ptr, size, config}; }
+template<typename T_> OPUS_D decltype(auto) make_gmem(const T_* ptr, unsigned int size = 0xffffffff, unsigned int config = buffer_default_config()) { return gmem<T_>{ptr, size, config}; }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // smem load/store related. TODO: tr_load
 template<typename T_>
@@ -1561,7 +1576,7 @@ struct smem {
     static constexpr index_t vector_size = vector_traits<T>::size();
     template<index_t vec = 1> using vector_type = vector_t<scalar_type, vec * vector_size>;
 
-    OPUS_D smem(void* ptr_) : ptr(reinterpret_cast<OPUS_LDS_ADDR char*>(reinterpret_cast<uintptr_t>(ptr_))) {}
+    OPUS_D smem(void* ptr_) : ptr(reinterpret_cast<OPUS_LDS_ADDR char*>(reinterpret_cast<__UINTPTR_TYPE__>(ptr_))) {}
 
     template<index_t vec = 1> OPUS_D auto _load(int v_os/* in unit of byte*/) { using type = vector_type<vec>; return *reinterpret_cast<OPUS_LDS_ADDR type*>(ptr + v_os); }
 

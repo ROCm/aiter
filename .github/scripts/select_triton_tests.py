@@ -696,22 +696,42 @@ def build_dependency_graph(
 
 
 def find_tests_to_run(graph: nx.DiGraph, diff_inter_triton: list[Path]) -> list[Path]:
-    tests_to_run: set[Path] = set()
-
+    # Filter out unreachable files, i.e. Triton source files that are in the diff content but
+    # aren't in the dependency graph.
+    reachable_diff_inter_triton: list[Path] = []
     for p in diff_inter_triton:
         p_str = str(p)
-        logging.debug(
-            "Searching for tests related to Triton source file [%s]...", p_str
-        )
-        if p_str not in graph:
+        if p_str in graph:
+            reachable_diff_inter_triton.append(p)
+        else:
             logging.warning(
                 "Triton source file [%s] isn't in the dependency graph, it's unreachable.",
                 p_str,
             )
-            continue
+    if not reachable_diff_inter_triton:
+        logging.warning("There are no reachable tests from the Triton diff.")
+        logging.warning(
+            "Please check test selection script, there might be a bug in it."
+        )
+        logging.warning(
+            "Please check Triton code base, there may be some filesystem organizations that aren't taken into account."
+        )
+        return []
 
-        is_bench = graph.nodes[p_str].get("type") == "bench"
-        if not is_bench:
+    # Figure out if all reachable files are benchmarks. If this is the case, then we should use
+    # other graph traversal approach.
+    is_all_bench: bool = all(
+        graph.nodes[str(p)].get("type") == "bench" for p in reachable_diff_inter_triton
+    )
+
+    # Traverse the dependency graph, searching from tests that are reachable from the diff content.
+    tests_to_run: set[Path] = set()
+    for p in reachable_diff_inter_triton:
+        p_str = str(p)
+        logging.debug(
+            "Searching for tests related to Triton source file [%s]...", p_str
+        )
+        if not is_all_bench:
             # Forward traversal for non-benchmarks.
             reachable_files = nx.descendants(graph, p_str) | {p_str}
         else:

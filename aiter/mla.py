@@ -14,6 +14,8 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 
+import os
+
 
 @triton.jit
 def _fwd_kernel_stage2_asm(
@@ -286,7 +288,10 @@ def mla_decode_fwd(
         if (
             nhead == 16
             or (
-                nhead == 128 and q.dtype == dtypes.fp8 and kv_buffer.dtype == dtypes.fp8
+                get_gfx() == "gfx942"
+                and nhead == 128
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
             )
             or (
                 get_gfx() == "gfx950"
@@ -303,7 +308,22 @@ def mla_decode_fwd(
             # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
             total_s = ori_total_s * (ori_nhead // 16)
             nhead = 16
-            q = q.view(total_s, nhead, -1)
+            if max_seqlen_q == 1:
+                q = q.view(total_s, nhead, -1)
+            else:
+                q = (
+                    q.reshape(
+                        ori_total_s // max_seqlen_q,
+                        max_seqlen_q,
+                        ori_nhead // nhead,
+                        nhead,
+                        -1,
+                    )
+                    .permute(0, 2, 1, 3, 4)
+                    .reshape(total_s, nhead, -1)
+                )
+                o_orig = o
+
             o = o.view(total_s, nhead, -1)
             io_transformed = True
         else:
@@ -325,27 +345,52 @@ def mla_decode_fwd(
             else None
         )
 
-        aiter.mla_decode_stage1_asm_fwd(
-            q,
-            kv_buffer,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
-            num_kv_splits_indptr,
-            work_meta_data,
-            work_indptr,
-            work_info_set,
-            max_seqlen_q,
-            page_size,
-            nhead_kv,
-            sm_scale,
-            logits,
-            attn_lse,
-            o,
-            q_scale,
-            kv_scale,
+        use_hk = (
+            nhead == 128
+            and q.dtype == dtypes.fp8
+            and kv_buffer.dtype == dtypes.fp8
+            and page_size == 1
+            and os.getenv("AITER_ENABLE_EXPERIMENTAL", False)
         )
+
+        if use_hk:
+            aiter.hk_mla_decode_fwd(
+                q,
+                kv_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                kv_last_page_lens,
+                work_indptr,
+                work_info_set,
+                max_seqlen_q,
+                sm_scale,
+                logits,
+                attn_lse,
+                o,
+            )
+        else:
+            aiter.mla_decode_stage1_asm_fwd(
+                q,
+                kv_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                kv_last_page_lens,
+                num_kv_splits_indptr,
+                work_meta_data,
+                work_indptr,
+                work_info_set,
+                max_seqlen_q,
+                page_size,
+                nhead_kv,
+                sm_scale,
+                logits,
+                attn_lse,
+                o,
+                q_scale,
+                kv_scale,
+            )
 
         aiter.mla_reduce_v1(
             logits,
@@ -362,8 +407,25 @@ def mla_decode_fwd(
         if return_logits:
             logits = logits.view(-1, 1, ori_nhead, v_head_dim)
 
-        q = q.view(ori_total_s, ori_nhead, -1)
-        o = o.view(ori_total_s, ori_nhead, -1)
+        if max_seqlen_q == 1:
+            q = q.view(ori_total_s, ori_nhead, -1)
+            o = o.view(ori_total_s, ori_nhead, -1)
+        else:
+            # for test, q need to be transpose into the original shape
+            new_o = (
+                o.reshape(
+                    ori_total_s // max_seqlen_q,
+                    ori_nhead // nhead,
+                    max_seqlen_q,
+                    nhead,
+                    -1,
+                )
+                .permute(0, 2, 1, 3, 4)
+                .reshape(ori_total_s, ori_nhead, -1)
+                .contiguous()
+            )
+            o_orig.set_(new_o)
+            o = o_orig
 
     return logits, final_lse
 
