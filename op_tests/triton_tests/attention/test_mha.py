@@ -29,6 +29,60 @@ logger = logging.getLogger(__name__)
 DEBUG_MODE = False
 
 
+def _attention_ref_with_tol(q, k, v, do, is_fp8=False, **kwargs):
+    """Run attention reference and compute adaptive tolerances.
+
+    Follows the upstream flash attention tolerance pattern
+    (see tests/test_flash_attn.py in Dao-AILab/flash-attention). Runs two
+    PyTorch references (upcast and non-upcast) and uses the gap between them as
+    a baseline for tolerance.
+
+    Returns (out, (dq, dk, dv), fwd_tol, [dq_tol, dk_tol, dv_tol])
+    where each tol is (atol, rtol).
+    """
+    has_dropout = kwargs.get("dropout_p", 0.0) > 0.0
+
+    def _run_ref(upcast, reorder_ops=False):
+        q_ = q.detach().clone().requires_grad_(True)
+        k_ = k.detach().clone().requires_grad_(True)
+        v_ = v.detach().clone().requires_grad_(True)
+        with torch.enable_grad():
+            out, _, _ = attention_ref(
+                q_, k_, v_, upcast=upcast, reorder_ops=reorder_ops, **kwargs
+            )
+        dq, dk, dv = torch.autograd.grad(out, (q_, k_, v_), do)
+        return out, dq, dk, dv
+
+    def _tol(ref_val, pt_val, is_forward=False):
+        baseline = (pt_val - ref_val).abs().max().item()
+        if is_fp8:
+            mult = 4
+            atol_floor = 3e-1 if is_forward else 1.0
+            rtol_floor = 1e-1
+        elif has_dropout:
+            # Dropout scaling (1/(1-p)) amplifies precision errors in the
+            # fused kernel differently than in the reference. The baseline
+            # between two references uses the same mask so it underestimates
+            # the kernel-vs-reference gap.
+            mult = 2
+            atol_floor = 1e-1 if is_forward else 2.0
+            rtol_floor = 1e-1
+        else:
+            mult = 2
+            atol_floor = 1e-2 if is_forward else 1.5e-2
+            rtol_floor = 1e-5
+        atol = max(mult * baseline, atol_floor)
+        return atol, rtol_floor
+
+    out, dq, dk, dv = _run_ref(upcast=True)
+    out_pt, dq_pt, dk_pt, dv_pt = _run_ref(upcast=False, reorder_ops=True)
+
+    fwd_tol = _tol(out, out_pt, is_forward=True)
+    bwd_tols = [_tol(dq, dq_pt), _tol(dk, dk_pt), _tol(dv, dv_pt)]
+
+    return out, (dq, dk, dv), fwd_tol, bwd_tols
+
+
 def pad_rearrange_dropout_mask(
     S_dmask,
     cu_seqlens_q,
@@ -60,6 +114,18 @@ def pad_rearrange_dropout_mask(
     return padded_dropout_mask
 
 
+def assert_cosine_similarity(actual, expected, threshold=0.96, norm_floor=1e-3):
+    """Assert that two tensors have high cosine similarity."""
+    a = actual.float().flatten()
+    b = expected.float().flatten()
+    # NOTE: cosine similarity is unstable for near-zero tensors
+    if b.norm().item() > norm_floor:
+        cos_sim = torch.nn.functional.cosine_similarity(
+            a.unsqueeze(0), b.unsqueeze(0)
+        ).item()
+        assert cos_sim >= threshold, f"Cosine similarity {cos_sim:.6f} < {threshold}"
+
+
 def fp8_assert_close(tensor_a, tensor_b, atol=1.0, cos_sim_threshold=0.96):
     """FP8 quality check: max absolute error + cosine similarity."""
     a = tensor_a.float().flatten()
@@ -68,13 +134,7 @@ def fp8_assert_close(tensor_a, tensor_b, atol=1.0, cos_sim_threshold=0.96):
     max_abs = (a - b).abs().max().item()
     assert max_abs <= atol, f"Max absolute error {max_abs:.4f} > {atol}"
 
-    if b.norm().item() > 1e-3:
-        cos_sim = torch.nn.functional.cosine_similarity(
-            a.unsqueeze(0), b.unsqueeze(0)
-        ).item()
-        assert (
-            cos_sim >= cos_sim_threshold
-        ), f"Cosine similarity {cos_sim:.6f} < {cos_sim_threshold}"
+    assert_cosine_similarity(tensor_a, tensor_b, cos_sim_threshold)
 
 
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
@@ -507,7 +567,7 @@ def test_mha_backward(
                 return_attn_probs=HAS_DROPOUT,
             )
             if HAS_DROPOUT:
-                dropout_mask = triton_out[2] > 0
+                dropout_mask = triton_out[2] >= 0
                 triton_out = triton_out[0]
             else:
                 dropout_mask = None
@@ -515,28 +575,27 @@ def test_mha_backward(
         triton_out, (q, k, v), do.clone()
     )
 
-    # Reference forward + backward
-    with torch.enable_grad():
-        torch_out, _, _ = attention_ref(
-            q, k, v, dropout_p=DROPOUT, dropout_mask=dropout_mask, causal=CAUSAL
-        )
-    torch_dq, torch_dk, torch_dv = torch.autograd.grad(torch_out, (q, k, v), do)
+    # Reference forward + backward with adaptive tolerances
+    torch_out, torch_grads, fwd_tol, bwd_tols = _attention_ref_with_tol(
+        q,
+        k,
+        v,
+        do,
+        is_fp8=FP8,
+        dropout_p=DROPOUT,
+        dropout_mask=dropout_mask,
+        causal=CAUSAL,
+    )
+    torch_dq, torch_dk, torch_dv = torch_grads
 
     # Check quality
-    if FP8:
-        fp8_assert_close(triton_out, torch_out.to(triton_out.dtype))
-        fp8_assert_close(triton_dq, torch_dq.to(triton_dq.dtype))
-        fp8_assert_close(triton_dk, torch_dk.to(triton_dk.dtype))
-        fp8_assert_close(triton_dv, torch_dv.to(triton_dv.dtype))
-    else:
-        bwd_atol = 1e-1 if HAS_DROPOUT else 1.5e-2
-        bwd_rtol = 1e-1 if HAS_DROPOUT else 1.5e-2
-        torch.testing.assert_close(
-            triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-        )
-        torch.testing.assert_close(triton_dq, torch_dq, atol=bwd_atol, rtol=bwd_rtol)
-        torch.testing.assert_close(triton_dk, torch_dk, atol=bwd_atol, rtol=bwd_rtol)
-        torch.testing.assert_close(triton_dv, torch_dv, atol=bwd_atol, rtol=bwd_rtol)
+    triton_vals = [triton_out, triton_dq, triton_dk, triton_dv]
+    ref_vals = [torch_out, torch_dq, torch_dk, torch_dv]
+    tols = [fwd_tol] + bwd_tols
+    for tri, ref, (atol, rtol) in zip(triton_vals, ref_vals, tols):
+        torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
+        if FP8:
+            assert_cosine_similarity(tri, ref)
 
 
 @pytest.mark.parametrize("BATCH", [1, 4])
@@ -639,7 +698,7 @@ def test_mha_backward_varlen(
             if HAS_DROPOUT:
                 dropout_mask = (
                     pad_rearrange_dropout_mask(
-                        triton_out[2] > 0,
+                        triton_out[2] >= 0,
                         cu_seqlens_q,
                         cu_seqlens_k,
                         max_seqlen_q,
@@ -661,36 +720,29 @@ def test_mha_backward_varlen(
     triton_dk = dk_pad_fn(triton_dk)
     triton_dv = dk_pad_fn(triton_dv)
 
-    # Reference forward + backward
-    with torch.enable_grad():
-        torch_out, _, _ = attention_ref(
-            q,
-            k,
-            v,
-            query_padding_mask=query_padding_mask,
-            key_padding_mask=key_padding_mask,
-            dropout_p=DROPOUT,
-            dropout_mask=dropout_mask,
-            causal=CAUSAL,
-        )
-    torch_dq, torch_dk, torch_dv = torch.autograd.grad(torch_out, (q, k, v), do)
+    # Reference forward + backward with adaptive tolerances
+    torch_out, torch_grads, fwd_tol, bwd_tols = _attention_ref_with_tol(
+        q,
+        k,
+        v,
+        do,
+        is_fp8=FP8,
+        query_padding_mask=query_padding_mask,
+        key_padding_mask=key_padding_mask,
+        dropout_p=DROPOUT,
+        dropout_mask=dropout_mask,
+        causal=CAUSAL,
+    )
+    torch_dq, torch_dk, torch_dv = torch_grads
 
     # Check quality
-    if FP8:
-        fp8_assert_close(triton_out, torch_out.to(triton_out.dtype))
-        fp8_assert_close(triton_dq, torch_dq.to(triton_dq.dtype))
-        fp8_assert_close(triton_dk, torch_dk.to(triton_dk.dtype))
-        fp8_assert_close(triton_dv, torch_dv.to(triton_dv.dtype))
-    else:
-        # Varlen dropout backward has larger errors at production sizes
-        bwd_atol = 5e-1 if HAS_DROPOUT else 1.5e-2
-        bwd_rtol = 5e-1 if HAS_DROPOUT else 1.5e-2
-        torch.testing.assert_close(
-            triton_out, torch_out.to(triton_out.dtype), atol=1e-1, rtol=1e-1
-        )
-        torch.testing.assert_close(triton_dq, torch_dq, atol=bwd_atol, rtol=bwd_rtol)
-        torch.testing.assert_close(triton_dk, torch_dk, atol=bwd_atol, rtol=bwd_rtol)
-        torch.testing.assert_close(triton_dv, torch_dv, atol=bwd_atol, rtol=bwd_rtol)
+    triton_vals = [triton_out, triton_dq, triton_dk, triton_dv]
+    ref_vals = [torch_out, torch_dq, torch_dk, torch_dv]
+    tols = [fwd_tol] + bwd_tols
+    for tri, ref, (atol, rtol) in zip(triton_vals, ref_vals, tols):
+        torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
+        if FP8:
+            assert_cosine_similarity(tri, ref)
 
 
 # Run PE tests with:

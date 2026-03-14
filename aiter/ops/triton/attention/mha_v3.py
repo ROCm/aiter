@@ -103,8 +103,8 @@ class _FlashAttnV3Func(torch.autograd.Function):
     def backward(ctx, dout: torch.Tensor):
         q, k, v, out, softmax_lse, q_descale, k_descale, v_descale = ctx.saved_tensors
 
-        # For FP8 inputs, allocate gradients in float32 to avoid truncation
-        grad_dtype = torch.float32 if is_fp8(q) else q.dtype
+        # Float32 gradients to avoid FP8 truncation in tl.store
+        grad_dtype = torch.float32 if is_fp8([q, k, v]) else q.dtype
         dq = torch.empty(q.shape, dtype=grad_dtype, device=q.device)
         dk = torch.empty(k.shape, dtype=grad_dtype, device=k.device)
         dv = torch.empty(v.shape, dtype=grad_dtype, device=v.device)
@@ -284,8 +284,8 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
     def backward(ctx, dout: torch.Tensor):
         q, k, v, out, softmax_lse, q_descale, k_descale, v_descale = ctx.saved_tensors
 
-        # For FP8 inputs, allocate gradients in float32 to avoid truncation
-        grad_dtype = torch.float32 if is_fp8(q) else q.dtype
+        # Float32 gradients to avoid FP8 truncation in tl.store
+        grad_dtype = torch.float32 if is_fp8([q, k, v]) else q.dtype
         dq = torch.empty(q.shape, dtype=grad_dtype, device=q.device)
         dk = torch.empty(k.shape, dtype=grad_dtype, device=k.device)
         dv = torch.empty(v.shape, dtype=grad_dtype, device=v.device)
@@ -412,7 +412,7 @@ def flash_attn_with_kvcache_fake_tensor(
 ):
 
     # https://github.com/ROCm/aiter/blob/7411c99753f0661a3eecdbdb1b36feb58539f62b/aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/interface_v3.py#L218
-    out_dtype = torch.float32 if is_fp8(q) else q.dtype
+    out_dtype = torch.float32 if is_fp8([q, k_cache, v_cache]) else q.dtype
 
     # establish layout / varlen & max seq lens
     # https://github.com/ROCm/aiter/blob/7411c99753f0661a3eecdbdb1b36feb58539f62b/aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/interface_v3.py#L156C5-L156C47
