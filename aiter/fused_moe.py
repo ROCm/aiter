@@ -888,6 +888,7 @@ def get_2stage_cfgs(
         kernelName1 = cfg["kernelName1"]
         kernelName2 = cfg["kernelName2"]
         run_1stage = cfg.get("run_1stage", False)
+        run_1stage_xbf16 = run_1stage and "blockscaleBf16" in kernelName1
 
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
