@@ -455,6 +455,10 @@ def dynamic_mxfp4_quant(
         SHUFFLE=shuffle,
     )
 
+    if not shuffle:
+        # Trim the padding if not shuffled
+        blockscale_e8m0 = blockscale_e8m0[:M, :scaleN_valid].contiguous()
+
     return (x_fp4.view(dtypes.fp4x2), blockscale_e8m0.view(dtypes.fp8_e8m0))
 
 
