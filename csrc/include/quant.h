@@ -52,7 +52,18 @@ void moe_smooth_per_token_scaled_quant(
     torch::Tensor& scales,
     torch::Tensor const& smooth_scale,
     torch::Tensor const& smooth_scale_map,
-    bool shuffle_scale                                   = false,
+    bool shuffle_scale                                        = false,
     std::optional<torch::Tensor> const& smooth_scale_map_hash = std::nullopt,
-    bool transpose_out = false);
+    bool transpose_out                                        = false);
+
+void moe_smooth_per_token_scaled_quant_v2(torch::Tensor& out,         // [..., d]
+                                          torch::Tensor const& input, // [..., d]
+                                          torch::Tensor& scales,
+                                          torch::Tensor const& smooth_scale,
+                                          torch::Tensor const& sorted_token_ids,
+                                          torch::Tensor const& sorted_expert_ids,
+                                          torch::Tensor const& num_valid_ids,
+                                          int block_m,
+                                          bool shuffle_scale = false,
+                                          bool transpose_out = false);
 } // namespace aiter

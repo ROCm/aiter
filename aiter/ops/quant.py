@@ -464,6 +464,22 @@ def moe_smooth_per_token_scaled_quant(
     transpose_out: bool = False,
 ) -> None: ...
 
+
+@compile_ops("module_quant")
+def moe_smooth_per_token_scaled_quant_v2(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    scales: torch.Tensor,
+    smooth_scale: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    block_m: int,
+    shuffle_scale: bool = False,
+    transpose_out: bool = False,
+) -> None: ...
+
+
 @compile_ops("module_quant")
 def partial_transpose(
     out: Tensor,

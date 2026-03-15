@@ -110,7 +110,7 @@ def get_2stage_config_simple(
             # return True, 64, 0, "", "", True
         # elif inter_dim % 128 == 0:
         #     return True, 64, 0, "", "", False
-            # return True, 80, 0, "", "", True
+        # return True, 80, 0, "", "", True
     return False, 32, 0, "", "", False
 
 
@@ -145,17 +145,22 @@ def asm_moe(
     is_smoothquant = fc1_smooth_scale is not None
     run_2stage = False
     if is_smoothquant:
-        run_2stage, block_m_2s, ksplit_2s, kernelName1, kernelName2, stage1_fused_quant = (
-            get_2stage_config_simple(
-                M,
-                model_dim,
-                inter_dim,
-                global_E,
-                topk,
-                QuantType.per_Token,
-                w1.dtype,
-                is_smoothquant,
-            )
+        (
+            run_2stage,
+            block_m_2s,
+            ksplit_2s,
+            kernelName1,
+            kernelName2,
+            stage1_fused_quant,
+        ) = get_2stage_config_simple(
+            M,
+            model_dim,
+            inter_dim,
+            global_E,
+            topk,
+            QuantType.per_Token,
+            w1.dtype,
+            is_smoothquant,
         )
 
     block_m_sorting = BLOCK_SIZE_M
@@ -297,13 +302,24 @@ def asm_moe(
             #     smooth_scale_map_hash=local_expert_hash,
             #     enable_ps=True,
             # )
-            aiter.moe_smooth_per_token_scaled_quant(
+            # aiter.moe_smooth_per_token_scaled_quant(
+            #     a8,
+            #     hidden_states,
+            #     a8_scale,
+            #     fc1_smooth_scale,
+            #     topk_ids,
+            #     smooth_scale_map_hash=local_expert_hash,
+            #     transpose_out=True,
+            # )
+            aiter.moe_smooth_per_token_scaled_quant_v2(
                 a8,
                 hidden_states,
                 a8_scale,
                 fc1_smooth_scale,
-                topk_ids,
-                smooth_scale_map_hash=local_expert_hash,
+                sorted_ids,
+                sorted_expert_ids,
+                num_valid_ids,
+                block_m_sorting,
                 transpose_out=True,
             )
             a8 = a8.view(-1, model_dim).view(topk, M, model_dim)
@@ -355,7 +371,9 @@ def asm_moe(
                 num_scales = inter_dim // 128
                 a2_scale = scale_view.view(M, topk, num_scales)
             else:
-                inter_states = torch.empty((M, topk, inter_dim), dtype=dtype, device=device)
+                inter_states = torch.empty(
+                    (M, topk, inter_dim), dtype=dtype, device=device
+                )
                 a2 = torch.empty((M, topk, inter_dim), dtype=dtypes.i8, device=device)
                 a2_scale = torch.empty((M, topk), dtype=dtypes.fp32, device=device)
 
@@ -383,16 +401,25 @@ def asm_moe(
             if stage1_fused_quant:
                 a2 = inter_states
             else:
-                aiter.smooth_per_token_scaled_quant(
+                # aiter.smooth_per_token_scaled_quant(
+                #     a2,
+                #     inter_states.view(M, topk, inter_dim),
+                #     a2_scale,
+                #     fc2_smooth_scale,
+                #     topk_ids,
+                #     smooth_scale_map_hash=local_expert_hash,
+                #     enable_ps=True,
+                # )
+                aiter.moe_smooth_per_token_scaled_quant_v2(
                     a2,
                     inter_states.view(M, topk, inter_dim),
                     a2_scale,
                     fc2_smooth_scale,
-                    topk_ids,
-                    smooth_scale_map_hash=local_expert_hash,
-                    enable_ps=True,
+                    sorted_ids,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    block_m_2s,
                 )
-
 
             # Stage 2: ASM Kernel
             # moe_buf is initialized as [M, model_dim] in moe_sorting_ck
