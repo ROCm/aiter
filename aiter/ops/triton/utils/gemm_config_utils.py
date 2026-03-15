@@ -76,8 +76,10 @@ def _get_gemm_config_cached(
     if cache_key not in _get_gemm_config_cached._config_cache:
         _get_gemm_config_cached._config_cache[cache_key] = {}
 
-        # Load default config (must exist)
+        # Load default config, fallback to gfx950 if arch-specific config not found
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}.json"
+        if not os.path.exists(fpath):
+            fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/gfx950-{config_name}.json"
         _load_config_file(
             _get_gemm_config_cached._config_cache,
             cache_key,
