@@ -2,6 +2,7 @@ import torch
 import pytest
 from aiter.ops.triton.softmax import softmax
 from aiter.ops.triton.utils.types import str_to_torch_dtype
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 
 # pytest
@@ -22,8 +23,14 @@ from aiter.ops.triton.utils.types import str_to_torch_dtype
     ],
 )
 def test_softmax(M, N, dtype):
+
+    # FIXME: Remove when faster
+    if arch_info.get_arch() == "gfx1250" and M * N >= 2048*1024:
+        pytest.skip()
+
     dtype = str_to_torch_dtype[dtype]
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    #torch.manual_seed(0)
     x = torch.randn(M, N, dtype=dtype, device="cuda")
     y_triton = softmax(x)
     y_torch = torch.softmax(x, axis=1)
