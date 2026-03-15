@@ -177,6 +177,10 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     // int block_tables_stride0 = block_tables.size(1);
     int num_heads       = Q.size(1);
     int head_size       = Q.size(2);
+    TORCH_CHECK(head_size == 128,
+        __func__,
+        ": ASM PA only supports head_size=128, got ",
+        head_size);
     int num_kv_heads    = K.size(1);
     int block_size      = K.size(3);
     const int gqa_ratio = num_heads / num_kv_heads;
