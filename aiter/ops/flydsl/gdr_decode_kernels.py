@@ -41,6 +41,7 @@ def _get_compiled_gdr_decode(
         batch_size: int,
         scale: float,
     ) -> None:
+        stream = torch.cuda.current_stream().cuda_stream
         exe(
             q,
             k,
@@ -54,6 +55,7 @@ def _get_compiled_gdr_decode(
             out,
             batch_size,
             scale,
+            stream,
         )
 
     return tensor_api

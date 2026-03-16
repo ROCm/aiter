@@ -14,6 +14,7 @@ from flydsl.dialects.ext.python_control_flow import (
     range_constexpr,
 )
 from flydsl.utils import SmemAllocator
+from flydsl.kernels.kernels_common import stream_ptr_to_async_token
 
 fm_fast = flir.arith.FastMathFlags.fast
 
@@ -673,10 +674,12 @@ def create_fused_preshuffle_gdn_kernel(
             out: lambda: T.memref(DYN, dtype.get()),
             batch_size: lambda: T.index(),
             scale: lambda: T.f32(),
+            stream_ptr: lambda: T.i64(),
         ):
             c1 = arith.index(1)
             bx = arith.index(BLOCK_THREADS)
             gx = batch_size * num_v_heads * arith.index(NUM_BLOCKS_PER_V_DIM)
+            stream_token = stream_ptr_to_async_token(stream_ptr)
             flir.gpu_ext.LaunchFuncOp(
                 [self.GPU_MODULE_NAME, "fused_gdn_kernel"],
                 grid_size=(gx, c1, c1),
@@ -695,6 +698,7 @@ def create_fused_preshuffle_gdn_kernel(
                     batch_size,
                     scale,
                 ],
+                async_dependencies=[stream_token],
             )
 
     return FGDN().module
