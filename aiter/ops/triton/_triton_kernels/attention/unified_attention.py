@@ -76,14 +76,10 @@ def q_scale_process(
             Q_Descale
             + query_offset_seq[:, None] * query_scale_stride_0
             + query_offset_head[:, None] * query_scale_stride_1
-            # + kv_head_idx * query_scale_stride_1
             + offs_d_scale[None, :] * query_scale_stride_2
         )
         
         return tl.load(q_descale_ptr, mask=seq_mask, other=0.0)
-    # else:
-    #     # SAGE_VERSION == None
-    #     return Q_Descale # Q_Descale is none
 
 @triton.jit
 def k_scale_process(
@@ -578,8 +574,7 @@ def kernel_unified_attention_2d(
 
 @triton.jit
 def kernel_unified_attention_3d(
-    segm_output_ptr,
-    # [num_tokens, num_query_heads, num_segments, head_size]
+    segm_output_ptr, # [num_tokens, num_query_heads, num_segments, head_size]
     segm_max_ptr,  # [num_tokens, num_query_heads, num_segments]
     segm_expsum_ptr,  # [num_tokens, num_query_heads, num_segments]
     query_ptr,  # [num_tokens, num_query_heads, head_size]
@@ -591,7 +586,7 @@ def kernel_unified_attention_3d(
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
     scale,  # float32
-    q_scale,  # [num_tokens // BLOCK_M, num_kv_heads] if sage, [num_tokens, num_kv_heads, head_size // 32] if sage_mxfp4
+    q_scale,  # [num_tokens // BLOCK_M, num_kv_heads] if sage, [num_tokens, num_query_heads, head_size // 32] if sage_mxfp4
     k_scale,  # [num_blks, tl.cdiv(block_size, TILE_SIZE), num_kv_heads] if sage, [num_blks, blk_size, num_kv_heads, head_size // 32] if sage_mxfp4
     v_scale,  # [num_kv_heads, head_size] if sage or sage_mxfp4
     softcap,  # float32
@@ -715,19 +710,21 @@ def kernel_unified_attention_3d(
         mask=dim_mask_qk[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
     )
-    q_scale_loaded = q_scale_process(
-        q_scale,
-        q_block_global_idx,
-        offs_d_scale,
-        query_offset_seq=query_offset_0,
-        kv_head_idx=kv_head_idx,
-        query_offset_head=query_offset_1,
-        seq_mask=query_mask_0[:, None] & query_mask_1[:, None],
-        query_scale_stride_0=query_scale_stride_0,  
-        query_scale_stride_1=query_scale_stride_1,  
-        query_scale_stride_2=query_scale_stride_2,  
-        SAGE_VERSION=SAGE_VERSION
-    )
+    q_scale_loaded = None
+    if SAGE_VERSION != None:
+        q_scale_loaded = q_scale_process(
+            q_scale,
+            q_block_global_idx,
+            offs_d_scale,
+            query_offset_seq=query_offset_0,
+            kv_head_idx=kv_head_idx,
+            query_offset_head=query_offset_1,
+            seq_mask=query_mask_0[:, None] & query_mask_1[:, None],
+            query_scale_stride_0=query_scale_stride_0,  
+            query_scale_stride_1=query_scale_stride_1,  
+            query_scale_stride_2=query_scale_stride_2,  
+            SAGE_VERSION=SAGE_VERSION
+        )
 
     block_table_offset = seq_idx * block_table_stride
 
