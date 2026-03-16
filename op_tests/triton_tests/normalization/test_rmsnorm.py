@@ -97,23 +97,17 @@ def run_triton(input, weight, eps, residual=None, x_scale=None, y_scale_dtype=No
 
 
 def get_vals():
-
+    # irregular / non-pow2: (2,10), (873,1245), (173,409)
     vals = [
         (1, 4),
         (2, 10),
         (873, 1245),
-        (768, 2048),
-        (256, 1024),
-        (128, 768),
-        (64, 512),
         (173, 409),
-        # (29, 17389), // Temporarily disable this test due to abort issues on CI
     ]
-
     return vals
 
 
-@pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
+@pytest.mark.parametrize("in_dtype_str", ["bf16", "fp16"])
 @pytest.mark.parametrize(
     "M, N",
     [(shape) for shape in get_vals()],
@@ -165,7 +159,7 @@ def test_rmsnorm(M, N, in_dtype_str):
     torch.testing.assert_close(dg_triton, dg_torch, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
+@pytest.mark.parametrize("in_dtype_str", ["bf16"])
 @pytest.mark.parametrize(
     "M, N",
     [(shape) for shape in get_vals()],

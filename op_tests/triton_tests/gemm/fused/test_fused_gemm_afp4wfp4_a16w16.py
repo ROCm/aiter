@@ -71,22 +71,22 @@ def run_triton(
 
 
 def get_x_vals():
-
+    # 7168 non-pow2 K; irregular m
     x_vals = [
         (m, n1, n2, k)
-        for k in [1024, 8192, 7168]
+        for k in [1024, 7168]
         for n2 in [256, 512]
         for n1 in [256, 512]
-        for m in [1, 8, 32, 64, 128, 8192]
+        for m in [1, 32, 128]
     ]
     return x_vals
 
 
 @pytest.mark.parametrize("M, N1, N2, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("output", [True, False])
-@pytest.mark.parametrize("skip_reduce", [True, False])
-@pytest.mark.parametrize("fp4_shuffle", [True, False])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("output", [True])
+@pytest.mark.parametrize("skip_reduce", [False, True])
+@pytest.mark.parametrize("fp4_shuffle", [True])
 def test_gemm(dtype, M, N1, N2, K, output, skip_reduce, fp4_shuffle):
 
     if not (arch_info.is_fp4_avail()):

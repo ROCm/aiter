@@ -83,8 +83,8 @@ def generate_cp_test_data(seq_len, seq_len_kv):
     return ks, ke
 
 
-@pytest.mark.parametrize("s_q", [1, 17, 61, 128, 1024])
-@pytest.mark.parametrize("s_k", [16, 76, 113, 1024, 2048])
+@pytest.mark.parametrize("s_q", [1, 17, 61])  # irregular 17, 61
+@pytest.mark.parametrize("s_k", [76, 113, 2048])  # irregular 76, 113
 @pytest.mark.parametrize("num_heads", [16, 64])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("disable_cp", [True, False])

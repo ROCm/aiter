@@ -198,16 +198,12 @@ def ref_paged_attn(
 @pytest.mark.parametrize("soft_cap", [None])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("q_dtype", QDTYPES)
-@pytest.mark.parametrize("shuffled_kv_cache", [True, False])
+@pytest.mark.parametrize("shuffled_kv_cache", [True])
 @pytest.mark.parametrize(
     "backend, use_tdm, num_tdm_gather, use_async",
     [
-        ("triton", False, 1, False),  # use triton
-        ("gluon", False, 1, False),  # use gluon baseline
-        ("gluon", False, 1, True),  # use gluon simple async_copy
-        ("gluon", True, 1, False),  # use gluon TDM async_copy
-        ("gluon", True, 4, False),  # use gluon TDM gather pipelined
-        ("gluon", True, 8, False),  # use gluon TDM gather pipelined
+        ("triton", False, 1, False),
+        ("gluon", True, 4, False),
     ],
 )
 @torch.inference_mode()

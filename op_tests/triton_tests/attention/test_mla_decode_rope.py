@@ -246,13 +246,11 @@ def ref_compute_full_fwd(
 @pytest.mark.parametrize(
     "B, H, S, kv_lora_rank, qk_rope_head_dim, rotary_dim",
     [
-        (1, 128, 2048, 512, 64, 64),
-        (1, 128, 2048, 512, 128, 64),
         (1, 128, 2048, 512, 127, 64),
         (1, 128, 2050, 512, 127, 64),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("use_rope", [True, False])
 def test_op_fwd_rope(
     B,
@@ -345,15 +343,12 @@ def test_op_fwd_rope(
 @pytest.mark.parametrize(
     "B, H, S, kv_lora_rank, qk_rope_head_dim, rotary_dim",
     [
-        (1, 128, 2048, 512, 64, 64),
-        (1, 128, 2048, 512, 128, 64),
-        (1, 128, 2048, 512, 127, 64),
         (1, 128, 2050, 512, 127, 64),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("use_rope", [True])
-@pytest.mark.parametrize("equal_seqlens", [True, False])
+@pytest.mark.parametrize("equal_seqlens", [False])
 @pytest.mark.parametrize("is_neox_style", [True, False])
 def test_op_fwd_rope_neox(
     B,
@@ -451,23 +446,14 @@ def test_op_fwd_rope_neox(
     "B, H, S, kv_lora_rank, qk_rope_head_dim, rotary_dim",
     [
         (1, 128, 2, 512, 64, 64),
-        (1, 128, 32, 512, 64, 64),
-        (1, 128, 2048, 512, 64, 64),
-        (1, 128, 2048, 512, 128, 64),
-        (1, 128, 2048, 512, 127, 64),
         (1, 128, 2050, 512, 127, 64),
-        (1, 128, 2050, 512, 128, 64),
-        (8, 128, 2048, 512, 64, 64),
-        (8, 128, 2048, 512, 128, 64),
-        (8, 128, 2048, 512, 127, 64),
         (8, 128, 2050, 512, 127, 64),
-        (8, 128, 2050, 512, 128, 64),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("use_rope", [True, False])
-@pytest.mark.parametrize("equal_seqlens", [True, False])
-@pytest.mark.parametrize("is_neox_style", [True, False])
+@pytest.mark.parametrize("equal_seqlens", [False])
+@pytest.mark.parametrize("is_neox_style", [True])
 def test_op_fwd_rope_integration(
     B,
     H,

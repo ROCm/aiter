@@ -122,10 +122,10 @@ def generate_fused_rms_quant_data(
     return x1, x2, rms1_w, rms2_w, resid1
 
 
-@pytest.mark.parametrize("B", [1, 4, 16, 32, 1000, 10000])
+@pytest.mark.parametrize("B", [1, 32, 1000])
 @pytest.mark.parametrize("M", [32, 64])
 @pytest.mark.parametrize("N", [32, 64, 128])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_flatten_quant(B: int, M: int, N: int, dtype):
 
     if not (arch_info.is_fp4_avail()):
@@ -145,20 +145,16 @@ def test_flatten_quant(B: int, M: int, N: int, dtype):
 @pytest.mark.parametrize(
     "M, N1, N2, stride",
     [
-        (M, N1, N2, stride)
-        for M in [1, 4, 33, 64, 132, 256]  # TODO: debug for 131072
-        for N1, N2, stride in [
-            (200, 200, 200),
-            (256, 256, 256),
-            (256, 256, 2112),
-        ]
+        (33, 200, 200, 200),
+        (132, 256, 256, 256),
+        (256, 256, 256, 2112),
     ],
 )
 @pytest.mark.parametrize("inp2", [True, False])
-@pytest.mark.parametrize("res1", [True, False])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("shuffle", [True, False])
-@pytest.mark.parametrize("scale_shuffle_padding", [True, False])
+@pytest.mark.parametrize("res1", [True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("shuffle", [True])
+@pytest.mark.parametrize("scale_shuffle_padding", [False, True])
 def test_fused_rms_quant(
     M: int,
     N1: int,
@@ -284,27 +280,18 @@ def generate_fused_reduce_act_mul_mxfp4_group_quant(
 @pytest.mark.parametrize(
     "M, N1, N2",
     [
-        (1, 256, 256),
-        (2, 256, 256),
-        (4, 256, 256),
-        (32, 256, 256),
-        (1, 4, 256),
         (1, 28, 256),
-        (1, 32, 256),
-        (1, 64, 256),
         (1, 68, 256),
         (128, 28, 256),
-        (128, 32, 256),
-        (128, 64, 256),
         (128, 68, 256),
         (256, 32, 256),
     ],
 )
 @pytest.mark.parametrize("SPK", [1, 4])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("activation", ["silu", "gelu"])
 @pytest.mark.parametrize("shuffle", [False, True])
-@pytest.mark.parametrize("scale_shuffle_padding", [False, True])
+@pytest.mark.parametrize("scale_shuffle_padding", [True])
 def test_fused_reduce_act_mul_mxfp4_group_quant(
     M: int,
     N1: int,

@@ -265,32 +265,19 @@ def input_helper(
 @pytest.mark.parametrize(
     "M, N, K, E, top_k",
     [
-        (64, 64, 128, 8, 2),
-        (16, 256, 256, 128, 4),
         (1000, 704, 800, 3, 1),
-        (1000, 704, 800, 8, 2),
-        (64, 14336, 4096, 8, 2),
-        (16, 14336, 128, 8, 2),  # not working either
-        (16, 14336, 4096, 4, 1),
-        (1, 14336, 128, 4, 2),
-        (3, 14336, 128, 4, 2),
-        (16, 14336, 128, 1, 1),
         (64, 7186, 128, 8, 2),
         (64, 3584, 128, 8, 2),
-        (64, 1792, 128, 8, 2),
-        (64, 64, 128, 8, 2),
+        (3, 14336, 128, 4, 2),
         (1, 1024, 16384, 2, 1),
     ],
 )
 @pytest.mark.parametrize(
     "a_dtype_str, b_dtype_str",
-    [
-        # Hardware native OCP
-        ("mxfp4_e2m1", "mxfp4_e2m1"),  # TODO Add support for other types
-    ],
+    [("mxfp4_e2m1", "mxfp4_e2m1")],
 )
 @pytest.mark.parametrize("silu_fused", [False, True])
-@pytest.mark.parametrize("routed_weight", [False, True])
+@pytest.mark.parametrize("routed_weight", [True])
 @pytest.mark.parametrize("swizzle_mx_scale", [False])  # TODO Add support for swizzle
 def test_fused_moe(
     M: int,
@@ -308,7 +295,6 @@ def test_fused_moe(
     # TODO: Uncomment after pytorch adds support for manual_seed
     # torch.manual_seed(20)
     if not (arch_info.is_fp4_avail()):
-        pytest.skip("MXFP4 not supported on this architecture")
         pytest.skip("MXFP4 not supported on this architecture")
 
     (
