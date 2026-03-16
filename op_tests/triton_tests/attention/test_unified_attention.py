@@ -107,7 +107,7 @@ def test_triton_unified_attn(
     block_size: int,
     soft_cap: Optional[float],
     num_blocks: int,
-    # q_dtype: Optional[torch.dtype],
+    q_dtype: Optional[torch.dtype],
     quant_scheme: Optional[str],
 ) -> None:
     # if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
@@ -169,7 +169,7 @@ def test_triton_unified_attn(
     
     sagev1 = quant_scheme=="v1"
     sagev2 = quant_scheme=="v2"
-    fp8_full = quant_scheme="fp8"
+    fp8_full = quant_scheme == "fp8"
 
     if sagev1 or sagev2:
         from aiter.ops.triton.attention.unified_attention import get_config
