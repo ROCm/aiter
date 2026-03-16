@@ -587,6 +587,7 @@ def test_mla(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
+            return_lse=True,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")

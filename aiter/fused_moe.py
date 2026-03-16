@@ -6,28 +6,19 @@ import os
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-import torch
-
 import aiter
+import torch
 
 # from aiter import get_torch_quant as get_quant
 from aiter import ActivationType, QuantType, dtypes
 from aiter import get_hip_quant as get_quant
 from aiter import logger
-from aiter.jit.core import (
-    AITER_CONFIGS,
-    AITER_CSRC_DIR,
-    PY,
-    bd_dir,
-    mp_lock,
-)
+from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
 from aiter.utility import fp4_utils
-
-
-from aiter.ops.flydsl.utils import is_flydsl_available
 
 BLOCK_SIZE_M = 32
 
@@ -265,6 +256,14 @@ def fused_moe_(
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
+    # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
+    # use FP8 as activation dtype to skip redundant re-quantization
+    if (
+        quant_type == QuantType.per_1x128
+        and hidden_states.dtype == dtypes.fp8
+        and a1_scale is not None
+    ):
+        q_dtype_a = dtypes.fp8
     bf16_fp8_bound = 512
     if quant_type == QuantType.per_1x32:
         if activation == ActivationType.Swiglu:
@@ -297,7 +296,6 @@ def fused_moe_(
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
     if block_size_M is not None:
         block_size_M = int(block_size_M)
-
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
         topk_ids,
         topk_weight,
@@ -471,6 +469,7 @@ def fused_moe_1stage(
                 aiter.fmoe_fp8_blockscale_g1u1,
                 fc_scale_blkn=128,
                 fc_scale_blkk=128,
+                block_size_M=block_size_M,
             )
         elif isG1U1:
             fmoe_func = aiter.fmoe_g1u1
@@ -587,6 +586,7 @@ fused_moe_1stage_dict = {
     {
         (ActivationType.Silu,    QuantType.per_1x32,   dtypes.bf16,   dtypes.fp4x2,  dtypes.fp4x2,    True,   False) : aiter.fmoe_g1u1,
         (ActivationType.Silu,   QuantType.per_1x128,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True,   False) : aiter.fmoe_fp8_blockscale_g1u1,
+        (ActivationType.Gelu,   QuantType.per_1x128,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True,   False) : aiter.fmoe_fp8_blockscale_g1u1,
         (ActivationType.Silu,   QuantType.per_Token,   dtypes.bf16,    dtypes.bf16,   dtypes.bf16,   False,   False) : aiter.fmoe,
         (ActivationType.Silu,   QuantType.per_Token,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True,   True)  : aiter.fmoe_g1u1_tkw1,
         (ActivationType.Silu,   QuantType.per_Token,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True,   False) : aiter.fmoe_g1u1,
@@ -883,6 +883,11 @@ def get_2stage_cfgs(
             return 16 if token < 2048 else 32 if token < 16384 else 64
 
     if run_1stage:
+        # never hard code block_m for 1-stage since it can be tuned by kernel itself, and we have different heuristics for different quant types
+        # # TODO: enable this approach for other quant types and archs
+        # if q_type == QuantType.per_1x128 and get_gfx() == "gfx950":
+        #     tkn_per_epr = token * topk // expert
+        #     block_m = 64 if tkn_per_epr > 32 else block_m
         return MOEMetadata(
             functools.partial(
                 fused_moe_1stage,
@@ -1090,7 +1095,18 @@ def fused_moe_2stages(
         a1_scale = torch.ones([M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device)
 
     elif quant_type == QuantType.per_1x32:
-        if token_num <= token_num_quant_moe_sort_switch:
+        if hidden_states.dtype == dtypes.fp4x2 and a1_scale is not None:
+            # Input is already quantized to fp4x2 (e.g., from FP4 dispatch),
+            # skip re-quantization, only sort the scale
+            a1 = hidden_states
+            a1_scale = fp4_utils.moe_mxfp4_sort(
+                a1_scale,
+                sorted_ids=sorted_ids,
+                num_valid_ids=num_valid_ids,
+                token_num=token_num,
+                block_size=block_size_M,
+            )
+        elif token_num <= token_num_quant_moe_sort_switch:
             a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
                 hidden_states,
                 sorted_ids=sorted_ids,
