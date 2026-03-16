@@ -453,6 +453,42 @@ def smooth_per_token_scaled_quant(
 
 
 @compile_ops("module_quant")
+def moe_smooth_per_token_scaled_quant_v1(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    scales: torch.Tensor,
+    smooth_scale: torch.Tensor,
+    smooth_scale_map: torch.Tensor,
+    shuffle_scale: bool = False,
+    smooth_scale_map_hash: Optional[torch.Tensor] = None,
+    transpose_out: bool = False,
+) -> None:
+    """
+    v1: token loops along topk experts. Only supports moe stage1.
+    """
+    ...
+
+
+@compile_ops("module_quant")
+def moe_smooth_per_token_scaled_quant_v2(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    scales: torch.Tensor,
+    smooth_scale: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    block_m: int,
+    shuffle_scale: bool = False,
+    transpose_out: bool = False,
+) -> None:
+    """
+    v2: expert loops along sorted_token_ids. Supports both moe stage1 and stage2.
+    """
+    ...
+
+
+@compile_ops("module_quant")
 def partial_transpose(
     out: Tensor,
     input: Tensor,
