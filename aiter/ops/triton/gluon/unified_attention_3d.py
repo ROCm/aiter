@@ -7,12 +7,17 @@ import math
 from aiter.ops.triton.gluon.unified_attention_3d_kernel import (
     gluon_kernel_unified_attention_3d,
     gluon_kernel_unified_attention_3d_async,
+    gluon_kernel_unified_attention_3d_async,
     gluon_reduce_segments,
 )
 from aiter.ops.triton.gluon.unified_attention_3d_kernel_tdm import (
     gluon_kernel_unified_attention_3d_tdm,
 )
+from aiter.ops.triton.gluon.unified_attention_3d_kernel_tdm import (
+    gluon_kernel_unified_attention_3d_tdm,
+)
 from triton.experimental import gluon
+import triton.experimental.gluon.language as gl
 import triton.experimental.gluon.language as gl
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 
@@ -95,35 +100,44 @@ def make_layout_3d(
     kv_cache_dtype: torch.dtype,
     use_tdm: bool,
     use_async: bool,
+    use_async: bool,
     use_swizzle: bool = False,
     use_gather: bool = False,
 ):
 
     if IS_DEVICE_ARCH_GFX12:
         QK_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
+        QK_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
             version=3,
             transposed=True,
+            warp_bases=[(1 << i, 0) for i in range(int(math.log2(num_warps)))],
             warp_bases=[(1 << i, 0) for i in range(int(math.log2(num_warps)))],
             reg_bases=[],
             instr_shape=[16, 16, 32 if q_dtype == torch.bfloat16 else 64],
         )
 
         PV_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
+        PV_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
             version=3,
             transposed=True,
+            warp_bases=[(0, 1 << i) for i in range(int(math.log2(num_warps)))],
             warp_bases=[(0, 1 << i) for i in range(int(math.log2(num_warps)))],
             reg_bases=[],
             instr_shape=[16, 16, 32 if kv_cache_dtype == torch.bfloat16 else 64],
         )
         Q_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
+        Q_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
             operand_index=0, parent=QK_WMMA_LAYOUT, k_width=8
         )
+        K_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
         K_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
             operand_index=1, parent=QK_WMMA_LAYOUT, k_width=8
         )
         P_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
+        P_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
             operand_index=0, parent=PV_WMMA_LAYOUT, k_width=8
         )
+        V_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
         V_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
             operand_index=1, parent=PV_WMMA_LAYOUT, k_width=8
         )
@@ -154,12 +168,14 @@ def make_layout_3d(
         V_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
             operand_index=1, parent=PV_WMMA_LAYOUT, k_width=4 if TILE_SIZE <= 16 else 8
         )
-    else:
+    elif shuffled_kv_cache:
         QK_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDMFMALayout(
             version=4,
             instr_shape=[16, 16, 32],
             transposed=True,
-            warps_per_cta=[num_warps, 1],
+            warps_per_cta=[num_warps, 1] if use_async else [1, num_warps],
+            # warps_per_cta=[1, num_warps],
+            # warps_per_cta=[num_warps, 1],
         )
         PV_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDMFMALayout(
             version=4,
@@ -174,19 +190,55 @@ def make_layout_3d(
             operand_index=1, parent=QK_WMMA_LAYOUT, k_width=8
         )
         P_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
+            operand_index=0, parent=PV_WMMA_LAYOUT, k_width=4 if TILE_SIZE <= 16 else 8
+        )
+        V_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
+            operand_index=1, parent=PV_WMMA_LAYOUT, k_width=4 if TILE_SIZE <= 16 else 8
+        )
+    else:
+        QK_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDMFMALayout(
+        QK_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDMFMALayout(
+            version=4,
+            instr_shape=[16, 16, 32],
+            transposed=True,
+            warps_per_cta=[num_warps, 1],
+            warps_per_cta=[num_warps, 1],
+        )
+        PV_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDMFMALayout(
+        PV_WMMA_LAYOUT: gl.constexpr = gl.amd.AMDMFMALayout(
+            version=4,
+            instr_shape=[16, 16, 16 if TILE_SIZE <= 16 else 32],
+            instr_shape=[16, 16, 16 if TILE_SIZE <= 16 else 32],
+            transposed=True,
+            warps_per_cta=[1, num_warps],
+            warps_per_cta=[1, num_warps],
+        )
+        Q_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
+        Q_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
+            operand_index=0, parent=QK_WMMA_LAYOUT, k_width=8
+        )
+        K_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
+        K_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
+            operand_index=1, parent=QK_WMMA_LAYOUT, k_width=8
+        )
+        P_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
+        P_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
             operand_index=0, parent=PV_WMMA_LAYOUT, k_width=4
         )
+        V_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
         V_DOT_LAYOUT: gl.constexpr = gl.DotOperandLayout(
             operand_index=1, parent=PV_WMMA_LAYOUT, k_width=4
         )
 
     if use_tdm or not use_swizzle:
         Q_SHARED_LAYOUT: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        Q_SHARED_LAYOUT: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
             interval_padding_pairs=[[HEAD_SIZE_PADDED, 8]],
             shape=[BLOCK_M, HEAD_SIZE_PADDED],
             order=[1, 0],
         )
         if use_gather:
+            K_SHARED_LAYOUT: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
             K_SHARED_LAYOUT: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
                 interval_padding_pairs=[[BLOCK_SIZE * HEAD_SIZE_PADDED, 8]],
                 shape=(
@@ -197,11 +249,13 @@ def make_layout_3d(
                 order=[1, 0],
             )
             V_SHARED_LAYOUT: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            V_SHARED_LAYOUT: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
                 interval_padding_pairs=[[BLOCK_SIZE * HEAD_SIZE_PADDED, 8]],
                 shape=[NUM_BLOCKS_GATHER_PER_TILE, BLOCK_SIZE * HEAD_SIZE_PADDED],
                 order=[1, 0],
             )
         else:
+            K_SHARED_LAYOUT: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
             K_SHARED_LAYOUT: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
                 interval_padding_pairs=[[HEAD_SIZE_PADDED, 8]],
                 shape=(
@@ -212,6 +266,7 @@ def make_layout_3d(
                 order=[1, 0],
             )
             V_SHARED_LAYOUT: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            V_SHARED_LAYOUT: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
                 interval_padding_pairs=[[HEAD_SIZE_PADDED, 8]],
                 shape=[TILE_SIZE, HEAD_SIZE_PADDED],
                 order=[1, 0],
@@ -219,7 +274,23 @@ def make_layout_3d(
     else:
         Q_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
             vec=8, per_phase=2, max_phase=8, order=[1, 0]
+        Q_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
+            vec=8, per_phase=2, max_phase=8, order=[1, 0]
         )
+        if shuffled_kv_cache:
+            K_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
+                vec=1, per_phase=1, max_phase=1, order=[1, 0]
+            )
+            V_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
+                vec=1, per_phase=1, max_phase=1, order=[1, 0]
+            )
+        else:
+            K_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
+                vec=8, per_phase=2, max_phase=8, order=[0, 1]
+            )
+            V_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
+                vec=1, per_phase=1, max_phase=1, order=[1, 0]
+            )
         if shuffled_kv_cache:
             K_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
                 vec=1, per_phase=1, max_phase=1, order=[1, 0]
@@ -243,9 +314,12 @@ def make_layout_3d(
     # clamp the threads_per_warp along the fastest moving dimension to 1 ~ WARP_SIZE
     threads_per_warp_fastest_dim = max(
         min((HEAD_SIZE_PADDED // size_per_thread_fastest_dim), WARP_SIZE), 1
+    threads_per_warp_fastest_dim = max(
+        min((HEAD_SIZE_PADDED // size_per_thread_fastest_dim), WARP_SIZE), 1
     )
 
     # in gfx950, ttg.async_copy_global_to_local will fail if threads_per_warp=[WARP_SIZE//4, 4] is used
+    Q_LOAD_LAYOUT: gl.constexpr = gl.BlockedLayout(
     Q_LOAD_LAYOUT: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, size_per_thread_fastest_dim],
         threads_per_warp=[
@@ -316,6 +390,9 @@ def make_layout_3d(
         "Q_LOAD_LAYOUT": Q_LOAD_LAYOUT,
         "K_LOAD_LAYOUT": K_LOAD_LAYOUT,
         "V_LOAD_LAYOUT": V_LOAD_LAYOUT,
+        "Q_LOAD_LAYOUT": Q_LOAD_LAYOUT,
+        "K_LOAD_LAYOUT": K_LOAD_LAYOUT,
+        "V_LOAD_LAYOUT": V_LOAD_LAYOUT,
     }
 
 
@@ -335,6 +412,7 @@ def select_3d_config(
     use_async: bool = True,
     use_swizzle: bool = True,
     shuffled_kv_cache: bool = False,
+    shuffled_kv_cache: bool = False,
 ):
     """
     if use_tdm is True, use_async and use_swizzle will be ignored
@@ -350,8 +428,14 @@ def select_3d_config(
             block_size >= 64
         ), "Only block_size >= 64 is supported for shuffled KV cache"
 
+    if shuffled_kv_cache:
+        assert (
+            block_size >= 64
+        ), "Only block_size >= 64 is supported for shuffled KV cache"
+
     if use_tdm and num_tdm_gather > 1:
         assert num_tdm_gather in [4, 8], "num_tdm_gather must be 4 or 8"
+
 
     TILE_SIZE = block_size * num_tdm_gather
 
@@ -371,6 +455,7 @@ def select_3d_config(
         reduce_num_warps = 1
 
     config_parms = (
+    config_parms = (
         attn_warps,
         BLOCK_M,
         TILE_SIZE,
@@ -383,6 +468,10 @@ def select_3d_config(
         use_tdm,
         use_async,
     )
+
+    # num_tiles_per_seq = (max_seqlen_k // num_segments + TILE_SIZE - 1) // TILE_SIZE
+
+    attn_stages = 1
 
     # num_tiles_per_seq = (max_seqlen_k // num_segments + TILE_SIZE - 1) // TILE_SIZE
 
@@ -425,6 +514,7 @@ def select_3d_config(
 
     attn_config = {
         "NUM_SEGMENTS_PER_SEQ": num_segments,
+        "WARP_SIZE": WARP_SIZE,
         "WARP_SIZE": WARP_SIZE,
         "num_warps": attn_warps,
         "num_stages": attn_stages,
@@ -487,6 +577,7 @@ def unified_attention(
     num_tdm_gather: int = 1,
     use_async: bool = True,
     shuffled_kv_cache: bool = False,
+    shuffled_kv_cache: bool = False,
 ):
     assert causal, "Only causal attention is supported"
 
@@ -513,6 +604,13 @@ def unified_attention(
             # key_cache and value_cache: num_blocks, block_size, num_kv_heads, head_size
             num_blocks, block_size, num_kv_heads, _ = k.shape
 
+        if use_tdm and num_tdm_gather > 1:
+            # key_cache and value_cache: num_blocks, num_kv_heads, block_size, head_size
+            num_blocks, num_kv_heads, block_size, _ = k.shape
+        else:
+            # key_cache and value_cache: num_blocks, block_size, num_kv_heads, head_size
+            num_blocks, block_size, num_kv_heads, _ = k.shape
+
     num_seqs = len(seqused_k)
     num_queries_per_kv = num_query_heads // num_kv_heads
 
@@ -529,6 +627,7 @@ def unified_attention(
     #   <= \sum_i[floor(query_len[i] / BLOCK_Q) + 1]
     #    = \sum_i[floor(query_len[i] / BLOCK_Q)] + num_seqs
     #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
+    #    = floor(num_tokens / BLOCK_Q) + num_seqs
     #    = floor(num_tokens / BLOCK_Q) + num_seqs
     cu_count = get_num_sms()
     ALL_DECODE = max_seqlen_q == 1
@@ -551,6 +650,7 @@ def unified_attention(
         raise NotImplementedError("2D Gluon Unified Attention is not yet implemented.")
     else:
         head_size_padded = triton.next_power_of_2(head_size)
+        assert head_size_padded == head_size, "head_size must be a power of 2"
         assert head_size_padded == head_size, "head_size must be a power of 2"
 
         if not IS_DEVICE_ARCH_GFX12:
@@ -580,9 +680,11 @@ def unified_attention(
             use_async,
             use_swizzle,
             shuffled_kv_cache,
+            shuffled_kv_cache,
         )
         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
         segm_output = torch.empty(
+            num_tokens,
             num_tokens,
             num_query_heads,
             NUM_SEGMENTS,
@@ -592,12 +694,14 @@ def unified_attention(
         )
         segm_max = torch.empty(
             num_tokens,
+            num_tokens,
             num_query_heads,
             NUM_SEGMENTS,
             dtype=torch.float32,
             device=q.device,
         )
         segm_expsum = torch.empty(
+            num_tokens,
             num_tokens,
             num_query_heads,
             NUM_SEGMENTS,
@@ -623,6 +727,8 @@ def unified_attention(
             softcap=softcap,
             num_seqs=num_seqs,
             num_blocks=num_blocks,
+            num_seqs=num_seqs,
+            num_blocks=num_blocks,
             block_table_stride=block_table.stride(0),
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
@@ -646,9 +752,13 @@ def unified_attention(
             SCALE=softmax_scale,
             NUM_QUERY_HEADS=num_query_heads,
             NUM_KV_HEADS=num_kv_heads,
+            SCALE=softmax_scale,
+            NUM_QUERY_HEADS=num_query_heads,
+            NUM_KV_HEADS=num_kv_heads,
             BLOCK_Q=BLOCK_Q,
             BLOCK_M=BLOCK_M,
             ALL_DECODE=ALL_DECODE,
+            SHUFFLED_KV_CACHE=shuffled_kv_cache,
             SHUFFLED_KV_CACHE=shuffled_kv_cache,
             **attn_config,
         )
