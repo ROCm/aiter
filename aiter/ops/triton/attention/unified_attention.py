@@ -1,6 +1,7 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
 import triton
+import aiter
 import torch
 from aiter.ops.triton.utils.device_info import get_num_sms
 import math
@@ -320,9 +321,8 @@ def unified_attention(
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
-
     # 3D kernel does not support sage attention yet; force 2D path when sage is active.
-    if sage_version is not None or use_2d_kernel(
+    if use_2d_kernel(
         head_size,
         SLIDING_WINDOW,
         ALL_DECODE,
@@ -343,6 +343,7 @@ def unified_attention(
         )
 
         TILE_SIZE=config["TILE_SIZE"]
+        BLOCK_M=config["BLOCK_M"]
         (
             query_scale_stride_0,
             query_scale_stride_1,
@@ -360,7 +361,7 @@ def unified_attention(
             k_descale,
             v,
             v_descale,
-            config["BLOCK_M"],
+            BLOCK_M,
             BLOCK_SIZE=block_size,
             TILE_SIZE=TILE_SIZE,
             sage_version=sage_version
@@ -465,7 +466,7 @@ def unified_attention(
             device=q.device,
         )
 
-        TILE_SIZE=config["TILE_SIZE"]
+        TILE_SIZE=attn_config["TILE_SIZE"]
         (
             query_scale_stride_0,
             query_scale_stride_1,

@@ -165,7 +165,7 @@ def kernel_unified_attention_2d(
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
     scale: tl.constexpr,  # float32
-    q_scale,  # [num_tokens // BLOCK_M, num_kv_heads] if sage, [num_tokens, num_kv_heads, head_size // 32] if sage_mxfp4
+    q_scale,  # [num_tokens // BLOCK_M, num_kv_heads] if sage, [num_tokens, num_query_heads, head_size // 32] if sage_mxfp4
     k_scale,  # [num_blks, tl.cdiv(block_size, TILE_SIZE), num_kv_heads] if sage, [num_blks, blk_size, num_kv_heads, head_size // 32] if sage_mxfp4
     v_scale,  # [num_kv_heads, head_size] if sage or sage_mxfp4
     out_scale,  # float32
@@ -429,7 +429,7 @@ def kernel_unified_attention_2d(
                 BLOCK_SIZE,
                 kv_head_idx,
                 offs_d_scale,
-                tile_mask[:, None],
+                tile_mask[:, None], # For mxfp4 scale load only
                 stride_k_cache_scale_0,
                 stride_k_cache_scale_1,
                 stride_k_cache_scale_2,
@@ -828,7 +828,7 @@ def kernel_unified_attention_3d(
                 BLOCK_SIZE,
                 kv_head_idx,
                 offs_d_scale,
-                tile_mask[None, :],
+                tile_mask[:, None], # For mxfp4 scale load only
                 stride_k_cache_scale_0,
                 stride_k_cache_scale_1,
                 stride_k_cache_scale_2,
