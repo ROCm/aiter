@@ -356,6 +356,7 @@ class TunerCommon:
 
         if fast_mode or topk == -1:
             return rets
+        initial_topk = topk
         tol_err_ratio = args.errRatio
         from collections import defaultdict
 
@@ -368,6 +369,7 @@ class TunerCommon:
         grouped_results = list(grouped_rets.items())
 
         for info_key, time_list in grouped_results:
+            topk = initial_topk
             sorted_time = sorted(time_list, key=lambda x: x[1])
             filtered_time = [
                 (info_ex, round(us, 4), max_err_ratio)
