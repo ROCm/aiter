@@ -264,10 +264,12 @@ __global__ void reshape_and_cache_flash_kernel(
     const int head_size,
     const int block_size,
     const float* k_scale,
-    const float* v_scale)
+    const float* v_scale,
+    const int64_t* __restrict__ swa_slot_mapping)
 {
     const int64_t token_idx = blockIdx.x;
-    const int64_t slot_idx  = slot_mapping[token_idx];
+    const int64_t slot_idx  = swa_slot_mapping == nullptr ? slot_mapping[token_idx] : swa_slot_mapping[slot_mapping[token_idx]];
+
     // NOTE: slot_idx can be -1 if the token is padded
     if(slot_idx < 0)
     {
@@ -276,8 +278,8 @@ __global__ void reshape_and_cache_flash_kernel(
     const int64_t block_idx     = slot_idx / block_size;
     const int64_t block_offset  = slot_idx % block_size;
     const int n                 = num_heads * head_size;
-    const float inverted_kscale = 1 / (*k_scale);
-    const float inverted_vscale = 1 / (*v_scale);
+    const float inverted_kscale = k_scale == nullptr ? 1.0f : 1 / (*k_scale);
+    const float inverted_vscale = v_scale == nullptr ? 1.0f : 1 / (*v_scale);
     for(int i = threadIdx.x; i < n; i += blockDim.x)
     {
         const int64_t src_key_idx       = token_idx * key_stride + i;
@@ -2739,8 +2741,9 @@ void reshape_and_cache(
                                      num_heads,                                          \
                                      head_size,                                          \
                                      block_size,                                         \
-                                     k_scale.data_ptr<float>(),                          \
-                                     v_scale.data_ptr<float>());
+				     k_scale.has_value() ? k_scale->data_ptr<float>() : nullptr, \
+				     v_scale.has_value() ? v_scale->data_ptr<float>() : nullptr, \
+				     swa_slot_mapping.has_value() ? swa_slot_mapping->data_ptr<int64_t>() : nullptr);
 
 namespace aiter {
 
@@ -2751,8 +2754,9 @@ void reshape_and_cache_flash(
     torch::Tensor& value_cache,  // [num_blocks, block_size, num_heads, head_size]
     torch::Tensor& slot_mapping, // [num_tokens]
     const std::string& kv_cache_dtype,
-    torch::Tensor& k_scale,
-    torch::Tensor& v_scale)
+    std::optional<torch::Tensor> k_scale,
+    std::optional<torch::Tensor> v_scale,
+    std::optional<torch::Tensor> swa_slot_mapping)
 {
     int num_tokens = key.size(0);
     int num_heads  = key.size(1);
