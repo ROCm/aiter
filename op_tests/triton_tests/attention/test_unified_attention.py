@@ -8,6 +8,7 @@ import torch
 
 from aiter.ops.triton.attention.unified_attention import SAGE_VERSION, unified_attention, get_config
 from aiter.ops.triton.utils.types import e4m3_dtype
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
 HEAD_SIZES = [128, 256]
@@ -94,7 +95,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
-# @pytest.mark.parametrize("q_dtype", QDTYPES)
+@pytest.mark.parametrize("q_dtype", QDTYPES)
 @pytest.mark.parametrize("quant_scheme", ["v1", "v2", "fp8", None])
 @torch.inference_mode()
 def test_triton_unified_attn(
@@ -115,7 +116,12 @@ def test_triton_unified_attn(
     # TODO: better block size checking
     if is_reduced_precision and block_size < 32:
         pytest.skip("block size must be at least 32 for fp8")
+    if quant_scheme is not None and q_dtype is not None:
+        pytest.skip("SAGE quant and fp8 q_dtype are mutually exclusive")
+    if quant_scheme == "v2" and not arch_info.is_fp4_avail():
+        pytest.skip("FP4 dot product is not supported on this GPU")
 
+    torch.cuda.empty_cache()
     torch.manual_seed(0)
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]

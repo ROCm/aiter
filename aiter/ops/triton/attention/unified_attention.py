@@ -426,7 +426,7 @@ def unified_attention(
             query_start_len_ptr=cu_seqlens_q,
             num_seqs=num_seqs,
             USE_FP8=output_scale is not None,
-            USE_Q_DESCALE=q_descale is not None,
+            USE_Q_DESCALE=q_descale is not None and sage_version is None,
             ALL_DECODE=ALL_DECODE,
             SAGE_VERSION=sage_version,
             **config,
@@ -465,7 +465,7 @@ def unified_attention(
             device=q.device,
         )
 
-        TILE_SIZE=config["TILE_SIZE"]
+        TILE_SIZE=attn_config["TILE_SIZE"]
         (
             query_scale_stride_0,
             query_scale_stride_1,
@@ -540,7 +540,7 @@ def unified_attention(
             BLOCK_Q=BLOCK_Q,
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
-            USE_Q_DESCALE=q_descale is not None,
+            USE_Q_DESCALE=q_descale is not None and sage_version is None,
             ALL_DECODE=ALL_DECODE,
             SAGE_VERSION=sage_version,
             **attn_config,
