@@ -132,7 +132,7 @@ def qk_dot(
         return tl.dot(Q, K) * q_descale * k_descale
     elif SAGE_VERSION == 2:
         return tl.dot_scaled(
-            Q, q_descale, "e4m3", K, k_descale, "e4m3", fast_math=True
+            Q, q_descale, "e2m1", K, k_descale, "e2m1", fast_math=True
         )
     else:
         return qk_scale * tl.dot(Q, K)
