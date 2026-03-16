@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+import os
+import signal
+import threading
 import torch
 import multiprocessing as mp
 import time
@@ -491,10 +494,21 @@ def mp_tuner(
                 print(f"Remaining tasks: {len(remaining_tasks)}")
                 print(f"{'='*60}\n")
 
-            # Terminate old pool
+            # Terminate old pool - use timeout to avoid hanging on stuck GPU processes
             try:
                 pool.terminate()
-                pool.join()
+                # Give processes a few seconds to terminate gracefully
+                join_thread = threading.Thread(target=pool.join)
+                join_thread.start()
+                join_thread.join(timeout=10)
+                if join_thread.is_alive():
+                    print("Warning: Pool join timed out after 10s, force killing workers...")
+                    # Force kill any remaining worker processes
+                    for w in pool._pool:
+                        try:
+                            os.kill(w.pid, signal.SIGKILL)
+                        except (ProcessLookupError, OSError):
+                            pass
             except Exception as e:
                 print(f"Warning: Error during pool termination: {e}")
             # Create new pool

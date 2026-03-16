@@ -3,8 +3,10 @@
 #pragma once
 #include "ck_tile/core.hpp"
 #include <cstdint>
+#include <cstdio>
 #include <hip/hip_runtime.h>
 #include <iostream>
+#include <stdexcept>
 #ifdef AITER_EMBEDDED_HSA_HEADER
 #include AITER_EMBEDDED_HSA_HEADER
 #endif
@@ -25,19 +27,36 @@ enum class GPUArch
         }                                                                                         \
     } while(0)
 
-#define HIP_CALL(call)                                                       \
-    do                                                                       \
-    {                                                                        \
-        hipError_t err = call;                                               \
-        if(err != hipSuccess)                                                \
-        {                                                                    \
-            printf("\n[AITER] %s:%d fail to call %s ---> [HIP error](%s)\n", \
-                   __FILE__,                                                 \
-                   __LINE__,                                                 \
-                   #call,                                                    \
-                   hipGetErrorString(err));                                  \
-            exit(0);                                                         \
-        }                                                                    \
+#define HIP_CALL(call)                                                            \
+    do                                                                            \
+    {                                                                             \
+        hipError_t err = call;                                                    \
+        if(err != hipSuccess)                                                     \
+        {                                                                         \
+            char msg[512];                                                        \
+            snprintf(msg,                                                         \
+                     sizeof(msg),                                                 \
+                     "[AITER] %s:%d fail to call %s ---> [HIP error](%s)",        \
+                     __FILE__,                                                    \
+                     __LINE__,                                                    \
+                     #call,                                                       \
+                     hipGetErrorString(err));                                     \
+            throw std::runtime_error(msg);                                        \
+        }                                                                         \
+    } while(0)
+
+#define HIP_CALL_NOTHROW(call)                                                    \
+    do                                                                            \
+    {                                                                             \
+        hipError_t err = call;                                                    \
+        if(err != hipSuccess)                                                     \
+        {                                                                         \
+            printf("\n[AITER] %s:%d fail to call %s ---> [HIP error](%s)\n",      \
+                   __FILE__,                                                      \
+                   __LINE__,                                                      \
+                   #call,                                                         \
+                   hipGetErrorString(err));                                       \
+        }                                                                         \
     } while(0)
 
 struct p3
@@ -111,7 +130,7 @@ class AiterAsmKernel
         load_asm_kernel(name, hsaco, module, kernel_func);
     };
 
-    ~AiterAsmKernel() { HIP_CALL(hipModuleUnload(module)); }
+    ~AiterAsmKernel() { HIP_CALL_NOTHROW(hipModuleUnload(module)); }
 
     void launch_kernel(const AiterAsmKernelArgs& kargs)
     {
@@ -149,7 +168,7 @@ class AiterAsmKernelFast
         std::cout << " Success" << std::endl;
     };
 
-    ~AiterAsmKernelFast() { HIP_CALL(hipModuleUnload(module)); }
+    ~AiterAsmKernelFast() { HIP_CALL_NOTHROW(hipModuleUnload(module)); }
 
     void launch_kernel(const AiterAsmKernelArgs& kargs)
     {
