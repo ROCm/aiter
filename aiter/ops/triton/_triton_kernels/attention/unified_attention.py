@@ -111,10 +111,10 @@ def k_scale_process(
     elif SAGE_VERSION == 2: # SAGE mxfp4
         k_descale_ptr = (
             K_Descale
-            + physical_block_idx[None, :] * stride_k_cache_scale_0
+            + physical_block_idx[:, None] * stride_k_cache_scale_0
             + kv_head_idx * stride_k_cache_scale_2
-            + offs_d_scale[:, None] * stride_k_cache_scale_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_scale_1
+            + offs_d_scale[None, :] * stride_k_cache_scale_3
+            + (seq_offset % BLOCK_SIZE)[:, None] * stride_k_cache_scale_1
         )
         return tl.load(k_descale_ptr, mask=tile_mask, other=0.0)
 
@@ -433,7 +433,7 @@ def kernel_unified_attention_2d(
                 BLOCK_SIZE,
                 kv_head_idx,
                 offs_d_scale,
-                tile_mask[None, :],
+                tile_mask[:, None],
                 stride_k_cache_scale_0,
                 stride_k_cache_scale_1,
                 stride_k_cache_scale_2,
