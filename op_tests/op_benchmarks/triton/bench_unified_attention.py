@@ -408,6 +408,7 @@ def run_benchmark(custom, args):
                     cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_q,
                     config=config
                 )
+                
             else:
                 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v2
                 maybe_quantized_query, q_descale, maybe_quantized_key_cache, k_descale, maybe_quantized_value_cache, v_descale = sage_quant_v2(

@@ -78,10 +78,13 @@ def q_scale_process(
             + kv_head_idx * query_scale_stride_1
             + offs_d_scale[None, :] * query_scale_stride_2
         )
+        tl.static_print("q_descale_ptr", q_descale_ptr)
+        tl.static_print("seq_mask", seq_mask)
+        
         return tl.load(q_descale_ptr, mask=seq_mask, other=0.0)
-    else:
-        # SAGE_VERSION == None
-        return Q_Descale # Q_Descale is none
+    # else:
+    #     # SAGE_VERSION == None
+    #     return Q_Descale # Q_Descale is none
 
 @triton.jit
 def k_scale_process(
@@ -130,7 +133,7 @@ def qk_dot(
         return tl.dot(Q, K) * q_descale * k_descale
     elif SAGE_VERSION == 2:
         return tl.dot_scaled(
-            Q, q_descale, "e4m3", Q, k_descale, "e4m3", fast_math=True
+            Q, q_descale, "e4m3", K, k_descale, "e4m3", fast_math=True
         )
     else:
         return qk_scale * tl.dot(Q, K)
@@ -152,7 +155,7 @@ def v_scale_process(
             + kv_head_idx * stride_v_cache_scale_0
             + offs_d_scale[None, :] * stride_v_cache_scale_1
         )
-        return tl.load(v_descale_ptr, mask=head_mask, other=0.0)
+        return tl.load(v_descale_ptr, mask=head_mask[None, :], other=0.0)
 
 
 @triton.jit
@@ -248,10 +251,10 @@ def kernel_unified_attention_2d(
 
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
-    if SAGE_VERSION == 2:
+    if SAGE_VERSION == 2: # per token mxfp4
         offs_d_qk = tl.arange(0, HEAD_SIZE_PADDED // 2)
         offs_d_scale = tl.arange(0, HEAD_SIZE_PADDED // 32)
-    elif SAGE_VERSION == 1:
+    elif SAGE_VERSION == 1: # per block int8
         offs_d_qk = tl.arange(0, HEAD_SIZE_PADDED)
         offs_d_scale = tl.arange(0, HEAD_SIZE_PADDED)
     else:
@@ -293,19 +296,21 @@ def kernel_unified_attention_2d(
         cache_modifier=Q_cache_modifier,
     )
 
-    q_scale_loaded = q_scale_process(
-        q_scale,
-        q_block_global_idx,
-        offs_d_scale,
-        query_offset_seq=query_offset_0,
-        kv_head_idx=kv_head_idx,
-        query_offset_head=query_offset_1,
-        seq_mask=query_mask_0[:, None] & query_mask_1[:, None],
-        query_scale_stride_0=query_scale_stride_0,  
-        query_scale_stride_1=query_scale_stride_1,  
-        query_scale_stride_2=query_scale_stride_2,  
-        SAGE_VERSION=SAGE_VERSION
-    )
+    q_scale_loaded = None
+    if SAGE_VERSION != None:
+        q_scale_loaded = q_scale_process(
+            q_scale,
+            q_block_global_idx,
+            offs_d_scale,
+            query_offset_seq=query_offset_0,
+            kv_head_idx=kv_head_idx,
+            query_offset_head=query_offset_1,
+            seq_mask=query_mask_0[:, None] & query_mask_1[:, None],
+            query_scale_stride_0=query_scale_stride_0,  
+            query_scale_stride_1=query_scale_stride_1,  
+            query_scale_stride_2=query_scale_stride_2,  
+            SAGE_VERSION=SAGE_VERSION
+        )
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -542,12 +547,14 @@ def kernel_unified_attention_2d(
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
     one_over_L = 1.0 / L[:, None]
     acc = acc * one_over_L
+        
     if SAGE_VERSION != None:
+        offs_d_scale_v = tl.arange(0, HEAD_SIZE_PADDED)
         v_scale_loaded = v_scale_process(
             v_scale,
             kv_head_idx,
-            offs_d_scale,
-            dim_mask[None, :],
+            offs_d_scale_v,
+            offs_d_scale_v < HEAD_SIZE,
             stride_v_cache_scale_0,
             stride_v_cache_scale_1,
             SAGE_VERSION
@@ -556,13 +563,14 @@ def kernel_unified_attention_2d(
     if USE_FP8:
         acc = acc * tl.load(out_scale)
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
-
+    
+    
     output_offset = (
         query_offset_0[:, None] * output_stride_0
         + query_offset_1[:, None] * output_stride_1
         + offs_d[None, :]
     )
-
+    
     tl.store(
         output_ptr + output_offset,
         acc,
