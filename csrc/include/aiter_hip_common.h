@@ -3,6 +3,7 @@
 #pragma once
 #include "aiter_logger.h"
 #include "aiter_enum.h"
+#include "aiter_tensor.h"
 #include "ck_tile/core.hpp"
 #include <cstdint>
 #include <hip/hip_runtime.h>
@@ -224,22 +225,3 @@ static uint32_t get_num_cu_func()
     static const uint32_t num_cu = get_num_cu_local();
     return num_cu;
 }
-
-struct AiterTensor {
-    void*      ptr;        // data_ptr, pointer to GPU memory
-    size_t     numel_;     // total number of elements
-    int        ndim;       // number of dimensions
-    int64_t    shape[8];   // size of each dimension, up to 8 dims (PyTorch limit)
-    int64_t    strides[8]; // stride of each dimension
-    AiterDtype dtype_;     // data type
-    int        device_id;  // GPU device index: 0, 1, 2, ...
-
-    // torch::Tensor-compatible accessors
-    int64_t    size(int i)      const { return (i < 0) ? shape[ndim + i] : shape[i]; }
-    int64_t    stride(int i)    const { return (i < 0) ? strides[ndim + i] : strides[i]; }
-    void*      data_ptr()       const { return ptr; }
-    size_t     numel()          const { return numel_; }
-    int        dim()            const { return ndim; }
-    AiterDtype dtype()          const { return dtype_; }
-    size_t     element_size()   const { return AiterDtype_element_size(dtype_); }
-};
