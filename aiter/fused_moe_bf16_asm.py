@@ -372,14 +372,17 @@ def _run_asm_moe_int8(
             a8 = torch.empty((topk * M, model_dim), dtype=a8_type, device=device)
             a8_scale = torch.empty((topk * M), dtype=dtypes.fp32, device=device)
 
-        # moe_smoothquant_fwd need topk_ids which contains local_expert_id
-        if expert_mask is not None:
-            local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
-            local_expert_hash[local_expert_hash > 0] -= 1
-            topk_ids = local_expert_hash[topk_ids]
-
-        aiter.moe_smoothquant_fwd(
-            a8, hidden_states, fc1_smooth_scale, topk_ids, a8_scale
+        # Reuse sorted expert routing to quantize in expert-major order.
+        aiter.moe_smooth_per_token_scaled_quant_v2(
+            a8,
+            hidden_states,
+            a8_scale,
+            fc1_smooth_scale,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            config.block_m if config.block_m > 0 else BLOCK_SIZE_M,
+            transpose_out=True,
         )
     else:
         if (
@@ -744,7 +747,6 @@ def asm_moe(
             expert_mask,
             lastdim_mul,
         )
-
     return moe_buf
 
 
