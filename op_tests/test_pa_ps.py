@@ -530,9 +530,14 @@ def test_pa_ps(
         k_scale_ = k_scale_asm
         v_scale_ = v_scale_asm
     else:
-        k_quant_, k_scale_, v_quant_, v_scale_, k_scale_asm, v_scale_asm = (
-            pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
-        )
+        (
+            k_quant_,
+            k_scale_,
+            v_quant_,
+            v_scale_,
+            k_scale_asm,
+            v_scale_asm,
+        ) = pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
 
     # torch ref
     out_ref = torch_mha_extend(
@@ -682,28 +687,32 @@ def test_pa_ps(
         )
 
         # Profile kernel breakdown for PA PS
-        _, pa_ps_ratio, reduce_ratio, us_pa_ps_kernel, us_reduce_kernel = (
-            profile_kernel_breakdown(
-                lambda: aiter.pa_persistent_fwd(
-                    Q=query,
-                    K=k_quant_,
-                    V=v_shuffled,
-                    output=output,
-                    max_qlen=max_qlen,
-                    qo_indptr=qo_indptr,
-                    kv_indptr=kv_indptr,
-                    kv_indices=kv_indices,
-                    context_lens=seq_lens_kv,
-                    K_QScale=k_scale_asm,
-                    V_QScale=v_scale_asm,
-                    work_indptr=work_indptr,
-                    work_info=work_info,
-                    reduce_indptr=reduce_indptr,
-                    reduce_final_map=reduce_final_map,
-                    reduce_partial_map=reduce_partial_map,
-                    softmax_scale=scale,
-                    mask=1,
-                )
+        (
+            _,
+            pa_ps_ratio,
+            reduce_ratio,
+            us_pa_ps_kernel,
+            us_reduce_kernel,
+        ) = profile_kernel_breakdown(
+            lambda: aiter.pa_persistent_fwd(
+                Q=query,
+                K=k_quant_,
+                V=v_shuffled,
+                output=output,
+                max_qlen=max_qlen,
+                qo_indptr=qo_indptr,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
+                context_lens=seq_lens_kv,
+                K_QScale=k_scale_asm,
+                V_QScale=v_scale_asm,
+                work_indptr=work_indptr,
+                work_info=work_info,
+                reduce_indptr=reduce_indptr,
+                reduce_final_map=reduce_final_map,
+                reduce_partial_map=reduce_partial_map,
+                softmax_scale=scale,
+                mask=1,
             )
         )
 
@@ -926,7 +935,7 @@ for dtype in args.dtype:
             args.load_metadata,
             args.dump_metadata,
             args.profile,
-            l_quant_type,
+            getattr(QuantType, args.quant_type),
         )
         df.append(ret)
     df = pd.DataFrame(df)
