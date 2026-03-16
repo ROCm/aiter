@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-import math
 import random
 import argparse
 
@@ -268,7 +267,7 @@ def test_gather_kv_b_proj(
         )
         tflops = total_float_operations / elapsed_us * 1e-6
 
-        print(f">>> Performance gather_kv_b_proj:")
+        print(">>> Performance gather_kv_b_proj:")
         print(
             f">>>   batch {batch_size}, block_size {block_size}, tp_k_head_num {tp_k_head_num}, kv_c_dim {kv_c_dim}, qk_nope_head_dim {qk_nope_head_dim}, kv_length {avg_kv_length}\n"
             f">>>       elapsed={elapsed_us:.2f}us, TFLOPS={tflops:.2f}"
