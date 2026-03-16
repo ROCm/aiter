@@ -7,7 +7,7 @@ import itertools
 import torch
 import triton
 
-from aiter.ops.triton.attention.unified_attention import unified_attention, SAGE_VERSION
+from aiter.ops.triton.attention.unified_attention import unified_attention, QK_QUANT_SCHEME, get_pv_quant_scheme
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
@@ -320,12 +320,17 @@ def run_benchmark(custom, args):
             q_descale, k_descale, v_descale = None, None, None
 
         if args.sagev1:
-            sage_version = SAGE_VERSION.SAGE
+            qk_quant_scheme = QK_QUANT_SCHEME.SAGE_V1
         elif args.sagev2:
-            sage_version = SAGE_VERSION.SAGE_MXFP4
+            qk_quant_scheme = QK_QUANT_SCHEME.SAGE_V2
+        elif args.fp8_full:
+            qk_quant_scheme = QK_QUANT_SCHEME.FP8_DESCALE
+        elif args.fp8:
+            qk_quant_scheme = QK_QUANT_SCHEME.BF16Q_FP8K
         else:
-            sage_version = None
-        
+            qk_quant_scheme = None
+        pv_quant_scheme = get_pv_quant_scheme(qk_quant_scheme) if qk_quant_scheme is not None else None
+
         def fn():
             return unified_attention(
                 q=maybe_quantized_query,
@@ -345,7 +350,8 @@ def run_benchmark(custom, args):
                 k_descale=k_descale,
                 v_descale=v_descale,
                 sinks=sinks,
-                sage_version=sage_version,
+                qk_quant_scheme=qk_quant_scheme,
+                pv_quant_scheme=pv_quant_scheme,
             )
 
         ms = triton.testing.do_bench(fn)

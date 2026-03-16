@@ -6,7 +6,7 @@ from typing import Optional
 import pytest
 import torch
 
-from aiter.ops.triton.attention.unified_attention import SAGE_VERSION, unified_attention, get_config
+from aiter.ops.triton.attention.unified_attention import QK_QUANT_SCHEME, unified_attention, get_config, get_pv_quant_scheme
 from aiter.ops.triton.utils.types import e4m3_dtype
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 
@@ -96,7 +96,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("q_dtype", QDTYPES)
-@pytest.mark.parametrize("quant_scheme", ["v1", "v2", "fp8", None])
+@pytest.mark.parametrize("quant_scheme", ["sage_v1", "sage_v2", "fp8_descale", None])
 @torch.inference_mode()
 def test_triton_unified_attn(
     seq_lens: list[tuple[int, int]],
@@ -112,13 +112,12 @@ def test_triton_unified_attn(
 ) -> None:
     # if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
     #     pytest.skip("block size must be at least 32 for fp8")
-    is_reduced_precision = quant_scheme in ("v1", "v2", "fp8")
-    # TODO: better block size checking
+    is_reduced_precision = quant_scheme in ("sage_v1", "sage_v2", "fp8_descale")
     if is_reduced_precision and block_size < 32:
-        pytest.skip("block size must be at least 32 for fp8")
+        pytest.skip("block size must be at least 32 for reduced precision")
     if quant_scheme is not None and q_dtype is not None:
-        pytest.skip("SAGE quant and fp8 q_dtype are mutually exclusive")
-    if quant_scheme == "v2" and not arch_info.is_fp4_avail():
+        pytest.skip("quant_scheme and fp8 q_dtype are mutually exclusive")
+    if quant_scheme == "sage_v2" and not arch_info.is_fp4_avail():
         pytest.skip("FP4 dot product is not supported on this GPU")
 
     torch.cuda.empty_cache()
@@ -167,11 +166,7 @@ def test_triton_unified_attn(
     k_descale = None
     v_descale = None
     
-    sagev1 = quant_scheme=="v1"
-    sagev2 = quant_scheme=="v2"
-    fp8_full = quant_scheme == "fp8"
-
-    if sagev1 or sagev2:
+    if quant_scheme == "sage_v1":
         from aiter.ops.triton.attention.unified_attention import get_config
         num_queries_per_kv = num_query_heads // num_kv_heads
         config = get_config(
@@ -182,49 +177,56 @@ def test_triton_unified_attn(
         )
         BLOCK_M = config["BLOCK_M"]
         BLOCK_N = config["TILE_SIZE"]
-        if sagev1:
-            from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v1
-            maybe_quantized_query, q_descale, maybe_quantized_key_cache, k_descale, maybe_quantized_value_cache, v_descale = sage_quant_v1(
-                query, key_cache, value_cache, BLOCK_M, BLOCK_N,
-                layout_q="unified", layout_k="cache",
-                v_descale=None,
-                cu_seqlens_q=cu_query_lens, cu_seqlens_k=cu_key_lens,
-                config=config
-            )
-            
-        else:
-            from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v2
-            maybe_quantized_query, q_descale, maybe_quantized_key_cache, k_descale, maybe_quantized_value_cache, v_descale = sage_quant_v2(
-                query, key_cache, value_cache, BLOCK_M, BLOCK_N,
-                hadamard_rotation=True, R=None, BLOCK_R=128,
-                layout_k="cache", v_descale=None
-            )
-    elif fp8_full:
-            from aiter.ops.triton.utils.types import e4m3_dtype
+        from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v1
+        maybe_quantized_query, q_descale, maybe_quantized_key_cache, k_descale, maybe_quantized_value_cache, v_descale = sage_quant_v1(
+            query, key_cache, value_cache, BLOCK_M, BLOCK_N,
+            layout_q="unified", layout_k="cache",
+            v_descale=None,
+            cu_seqlens_q=cu_query_lens, cu_seqlens_k=cu_key_lens,
+            config=config
+        )
+        qk_quant_scheme = QK_QUANT_SCHEME.SAGE_V1
+    elif quant_scheme == "sage_v2":
+        from aiter.ops.triton.attention.unified_attention import get_config
+        num_queries_per_kv = num_query_heads // num_kv_heads
+        config = get_config(
+            query.shape[0], len(cu_query_lens),
+            num_queries_per_kv, num_kv_heads, head_size,
+            window_size, max_query_len, max_kv_len,
+            block_size, query.element_size()
+        )
+        BLOCK_M = config["BLOCK_M"]
+        BLOCK_N = config["TILE_SIZE"]
+        from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v2
+        maybe_quantized_query, q_descale, maybe_quantized_key_cache, k_descale, maybe_quantized_value_cache, v_descale = sage_quant_v2(
+            query, key_cache, value_cache, BLOCK_M, BLOCK_N,
+            hadamard_rotation=True, R=None, BLOCK_R=128,
+            layout_k="cache", v_descale=None
+        )
+        qk_quant_scheme = QK_QUANT_SCHEME.SAGE_V2
+    elif quant_scheme == "fp8_descale":
+        from aiter.ops.triton.utils.types import e4m3_dtype
 
-            FP8_TYPE = e4m3_dtype
-            fp8_max = torch.finfo(FP8_TYPE).max
+        FP8_TYPE = e4m3_dtype
+        fp8_max = torch.finfo(FP8_TYPE).max
 
-            q_abs_max = query.abs().amax().clamp(min=1e-9)
-            q_descale = (q_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
-            maybe_quantized_query = (query * (fp8_max / q_abs_max)).to(FP8_TYPE)
+        q_abs_max = query.abs().amax().clamp(min=1e-9)
+        q_descale = (q_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
+        maybe_quantized_query = (query * (fp8_max / q_abs_max)).to(FP8_TYPE)
 
-            k_abs_max = key_cache.abs().amax().clamp(min=1e-9)
-            k_descale = (k_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
-            maybe_quantized_key_cache = (key_cache * (fp8_max / k_abs_max)).to(FP8_TYPE)
+        k_abs_max = key_cache.abs().amax().clamp(min=1e-9)
+        k_descale = (k_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
+        maybe_quantized_key_cache = (key_cache * (fp8_max / k_abs_max)).to(FP8_TYPE)
 
-            v_abs_max = value_cache.abs().amax().clamp(min=1e-9)
-            v_descale = (v_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
-            maybe_quantized_value_cache = (value_cache * (fp8_max / v_abs_max)).to(FP8_TYPE)
+        v_abs_max = value_cache.abs().amax().clamp(min=1e-9)
+        v_descale = (v_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
+        maybe_quantized_value_cache = (value_cache * (fp8_max / v_abs_max)).to(FP8_TYPE)
+        qk_quant_scheme = QK_QUANT_SCHEME.FP8_DESCALE
     else:
         q_descale, k_descale, v_descale = None, None, None
+        qk_quant_scheme = None
 
-    if sagev1:
-        sage_version = SAGE_VERSION.SAGE
-    elif sagev2:
-        sage_version = SAGE_VERSION.SAGE_MXFP4
-    else:
-        sage_version = None
+    pv_quant_scheme = get_pv_quant_scheme(qk_quant_scheme) if qk_quant_scheme is not None else None
 
     unified_attention(
         q=maybe_quantized_query,
@@ -244,7 +246,8 @@ def test_triton_unified_attn(
         k_descale=k_descale,
         v_descale=v_descale,
         sinks=sinks,
-        sage_version=sage_version
+        qk_quant_scheme=qk_quant_scheme,
+        pv_quant_scheme=pv_quant_scheme,
     )
 
     ref_output = ref_paged_attn(
@@ -279,7 +282,7 @@ if __name__ == "__main__":
     soft_cap = None              # or 10.0 / 50.0
     num_blocks = 64              # example from NUM_BLOCKS
     q_dtype = None               # or torch.float8_e4m3fn, etc.
-    quant_scheme = "v1"
+    quant_scheme = "sage_v1"
 
     test_triton_unified_attn(
         seq_lens=seq_lens,
