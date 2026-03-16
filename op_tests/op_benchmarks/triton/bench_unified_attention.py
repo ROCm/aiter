@@ -316,6 +316,21 @@ def run_benchmark(custom, args):
             v_abs_max = value_cache.abs().amax().clamp(min=1e-9)
             v_descale = (v_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
             maybe_quantized_value_cache = (value_cache * (fp8_max / v_abs_max)).to(FP8_TYPE)
+        elif args.fp8:
+            from aiter.ops.triton.utils.types import e4m3_dtype
+
+            FP8_TYPE = e4m3_dtype
+            fp8_max = torch.finfo(FP8_TYPE).max
+
+            q_descale = None
+
+            k_abs_max = key_cache.abs().amax().clamp(min=1e-9)
+            k_descale = (k_abs_max / fp8_max).to(torch.float32).cuda()
+            maybe_quantized_key_cache = (key_cache * (fp8_max / k_abs_max)).to(FP8_TYPE)
+
+            v_abs_max = value_cache.abs().amax().clamp(min=1e-9)
+            v_descale = (v_abs_max / fp8_max).to(torch.float32).cuda()
+            maybe_quantized_value_cache = (value_cache * (fp8_max / v_abs_max)).to(FP8_TYPE)
         else:
             q_descale, k_descale, v_descale = None, None, None
 

@@ -96,7 +96,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("q_dtype", QDTYPES)
-@pytest.mark.parametrize("quant_scheme", ["sage_v1", "sage_v2", "fp8_descale", None])
+@pytest.mark.parametrize("quant_scheme", ["sage_v1", "sage_v2", "fp8_descale", "bf16q_fp8k", None])
 @torch.inference_mode()
 def test_triton_unified_attn(
     seq_lens: list[tuple[int, int]],
@@ -112,7 +112,7 @@ def test_triton_unified_attn(
 ) -> None:
     # if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
     #     pytest.skip("block size must be at least 32 for fp8")
-    is_reduced_precision = quant_scheme in ("sage_v1", "sage_v2", "fp8_descale")
+    is_reduced_precision = quant_scheme in ("sage_v1", "sage_v2", "fp8_descale", "bf16q_fp8k")
     if is_reduced_precision and block_size < 32:
         pytest.skip("block size must be at least 32 for reduced precision")
     if quant_scheme is not None and q_dtype is not None:
@@ -222,6 +222,22 @@ def test_triton_unified_attn(
         v_descale = (v_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
         maybe_quantized_value_cache = (value_cache * (fp8_max / v_abs_max)).to(FP8_TYPE)
         qk_quant_scheme = QK_QUANT_SCHEME.FP8_DESCALE
+    elif quant_scheme == "bf16q_fp8k":
+        from aiter.ops.triton.utils.types import e4m3_dtype
+
+        FP8_TYPE = e4m3_dtype
+        fp8_max = torch.finfo(FP8_TYPE).max
+
+        q_descale = None
+
+        k_abs_max = key_cache.abs().amax().clamp(min=1e-9)
+        k_descale = (k_abs_max / fp8_max).to(torch.float32).cuda()
+        maybe_quantized_key_cache = (key_cache * (fp8_max / k_abs_max)).to(FP8_TYPE)
+
+        v_abs_max = value_cache.abs().amax().clamp(min=1e-9)
+        v_descale = (v_abs_max / fp8_max).to(torch.float32).cuda()
+        maybe_quantized_value_cache = (value_cache * (fp8_max / v_abs_max)).to(FP8_TYPE)
+        qk_quant_scheme = QK_QUANT_SCHEME.BF16Q_FP8K
     else:
         q_descale, k_descale, v_descale = None, None, None
         qk_quant_scheme = None

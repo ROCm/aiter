@@ -337,6 +337,8 @@ def unified_attention(
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
+    if qk_quant_scheme in (QK_QUANT_SCHEME.SAGE_V1, QK_QUANT_SCHEME.SAGE_V2):
+        BLOCK_M = max(BLOCK_M, 128)
 
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     assert BLOCK_Q >= 1
@@ -354,7 +356,6 @@ def unified_attention(
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
-    # 3D kernel does not support sage attention yet; force 2D path when sage is active.
     if use_2d_kernel(
         head_size,
         SLIDING_WINDOW,
