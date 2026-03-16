@@ -208,7 +208,7 @@ def cmdGenFunc_mha_fwd(
     if tuned_rule is not None:
         tile_pattern = tuned_rule.get("tile_pattern", "").strip()
         if tile_pattern:
-            md_name += "_tunedfmha"
+            md_name += f"_tunedfmha_{tile_pattern}"
             filter = f"*{tile_pattern}*"
 
     blob_gen_cmd = [
