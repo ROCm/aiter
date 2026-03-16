@@ -191,7 +191,7 @@ def generate_gemm_a8w8_blockscale_inputs(
 @pytest.mark.parametrize(
     "impl",
     [
-        # "gluon",
+        "gluon",
         "triton",
         "triton_shuffle",
     ],
@@ -202,7 +202,7 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
 
     block_shape_n, block_shape_k = block_shape
 
-    if impl == "gluon" and DEVICE_ARCH not in ("gfx950",):
+    if impl == "gluon" and DEVICE_ARCH not in ("gfx950", "gfx1250"):
         pytest.skip(
             "Gluon implementation is not supported on this device (requires CDNA4/gfx950)."
         )
@@ -245,7 +245,7 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
 
     if impl == "gluon" and DEVICE_ARCH in ("gfx1250",):
         impl = gluon_gemm_a8w8_blockscale_gfx12
-    elif impl == "gluon":
+    elif impl == "gluon" and DEVICE_ARCH in ("gfx950",):
         impl = gluon_gemm_a8w8_blockscale
     elif impl == "triton":
         impl = triton_gemm_a8w8_blockscale
