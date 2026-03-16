@@ -1239,6 +1239,7 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
+            return_lse=True,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -1257,6 +1258,14 @@ def test_mla(
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
+
+        # # Turn on this if kernel has lse output
+        # lse_ref_reshaped = lse_ref_fp8.reshape(decode_qlen, batch_size, nhead).permute(1, 0, 2).reshape(total_q, nhead)
+        # checkAllclose(
+        #     lse_ref_reshaped,
+        #     attn_lse,
+        #     msg=f"mla_decode-absorb_fp8 lse    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+        # )
 
         if not non_persistent_mode:
             partial_out_ref, partial_lse_ref, split_out_ref, split_lse_ref = (
