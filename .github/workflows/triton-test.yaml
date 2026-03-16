@@ -13,6 +13,7 @@ on:
       - ".github/workflows/triton-test.yaml"
       - ".github/scripts/build_aiter_triton.sh"
       - ".github/scripts/select_triton_tests.py"
+      - ".github/scripts/split_tests.sh"
   workflow_dispatch:
 
 concurrency:
