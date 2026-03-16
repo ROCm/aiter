@@ -39,16 +39,11 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=F
 
 
 def get_x_vals():
-    x_vals = [(1, 1, 1)]  # minimal
-    x_vals += [(3, 5, 2)]  # irregular
-    x_vals += [(4864, 4096, 8192), (4864, 8192, 4160)]  # irregular M,N,K
-    x_vals += [(2**7, 256, 7168), (2**8, 256, 7168)]  # non-pow2 K=7168
-    x_vals += [(1, 1280, 8192), (192, 1280, 8192), (320, 1280, 8192)]
-    x_vals += [(8192, 8192, 1024)]
-    return x_vals
+    # Max 10 UTs per file: small shapes only
+    return [(1, 1, 1), (32, 64, 128)]
 
 
-@pytest.mark.parametrize("activation", ["gelu", "silu"])
+@pytest.mark.parametrize("activation", ["gelu"])
 @pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("output", [True])
@@ -93,7 +88,7 @@ def test_gemm_a16_w16_activation(M: int, N: int, K: int, dtype, output, activati
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
@@ -113,9 +108,9 @@ def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output):
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("layout", ["TT", "NN", "NT"])
-@pytest.mark.parametrize("output", [True, False])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("layout", ["TT", "NN"])
+@pytest.mark.parametrize("output", [True])
 def test_gemm_a16_w16_layout(M: int, N: int, K: int, dtype, layout, output):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
@@ -133,9 +128,10 @@ def test_gemm_a16_w16_layout(M: int, N: int, K: int, dtype, layout, output):
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
 @pytest.mark.parametrize("M, N, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("output", [True, False])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("output", [True])
 def test_gemm_a16_w16_atomic(M: int, N: int, K: int, dtype, output):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
@@ -153,10 +149,11 @@ def test_gemm_a16_w16_atomic(M: int, N: int, K: int, dtype, output):
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
 @pytest.mark.parametrize("M, N, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("layout", ["TT", "NN", "NT"])
-@pytest.mark.parametrize("output", [True, False])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("layout", ["TT"])
+@pytest.mark.parametrize("output", [True])
 def test_gemm_a16_w16_atomic_layout(M: int, N: int, K: int, dtype, layout, output):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 

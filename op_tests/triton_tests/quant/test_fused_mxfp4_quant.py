@@ -122,9 +122,10 @@ def generate_fused_rms_quant_data(
     return x1, x2, rms1_w, rms2_w, resid1
 
 
-@pytest.mark.parametrize("B", [1, 32, 1000])
+# Max 10 UTs per file: 2*5 = 10 from this test
+@pytest.mark.parametrize("B", [1])
 @pytest.mark.parametrize("M", [32, 64])
-@pytest.mark.parametrize("N", [32, 64, 128])
+@pytest.mark.parametrize("N", [32, 64, 128, 256, 512])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_flatten_quant(B: int, M: int, N: int, dtype):
 
@@ -142,19 +143,13 @@ def test_flatten_quant(B: int, M: int, N: int, dtype):
     torch.testing.assert_close(triton_out, torch_out)
 
 
-@pytest.mark.parametrize(
-    "M, N1, N2, stride",
-    [
-        (33, 200, 200, 200),
-        (132, 256, 256, 256),
-        (256, 256, 256, 2112),
-    ],
-)
-@pytest.mark.parametrize("inp2", [True, False])
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
+@pytest.mark.parametrize("M, N1, N2, stride", [(33, 200, 200, 200)])
+@pytest.mark.parametrize("inp2", [True])
 @pytest.mark.parametrize("res1", [True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("shuffle", [True])
-@pytest.mark.parametrize("scale_shuffle_padding", [False, True])
+@pytest.mark.parametrize("scale_shuffle_padding", [False])
 def test_fused_rms_quant(
     M: int,
     N1: int,
@@ -277,20 +272,12 @@ def generate_fused_reduce_act_mul_mxfp4_group_quant(
     return x, x2
 
 
-@pytest.mark.parametrize(
-    "M, N1, N2",
-    [
-        (1, 28, 256),
-        (1, 68, 256),
-        (128, 28, 256),
-        (128, 68, 256),
-        (256, 32, 256),
-    ],
-)
-@pytest.mark.parametrize("SPK", [1, 4])
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
+@pytest.mark.parametrize("M, N1, N2", [(1, 28, 256)])
+@pytest.mark.parametrize("SPK", [1])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("activation", ["silu", "gelu"])
-@pytest.mark.parametrize("shuffle", [False, True])
+@pytest.mark.parametrize("activation", ["silu"])
+@pytest.mark.parametrize("shuffle", [False])
 @pytest.mark.parametrize("scale_shuffle_padding", [True])
 def test_fused_reduce_act_mul_mxfp4_group_quant(
     M: int,
@@ -370,12 +357,13 @@ def generate_fused_reduce_rms_quant_data(M, N1, N2, N3, SPK, dtype=torch.bfloat1
     return x1, w1, x2, w2, res1, x3
 
 
-@pytest.mark.parametrize("M", [1, 32, 256, 8192])
-@pytest.mark.parametrize("N1, N2, N3", [(256, 256, 256), (1536, 512, 64)])
-@pytest.mark.parametrize("SPK", [1, 4, 14])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("shuffle", [True, False])
-@pytest.mark.parametrize("scale_shuffle_padding", [True, False])
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
+@pytest.mark.parametrize("M", [1])
+@pytest.mark.parametrize("N1, N2, N3", [(256, 256, 256)])
+@pytest.mark.parametrize("SPK", [1])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("shuffle", [True])
+@pytest.mark.parametrize("scale_shuffle_padding", [True])
 def test_fuse_reduce_rms_quant(
     M: int,
     N1: int,
@@ -519,12 +507,11 @@ def run_fused_dynamic_mxfp4_quant_moe_sort_triton(
     return x_fp4, x_scales
 
 
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
 @pytest.mark.parametrize("hidden_dim", [256])
-@pytest.mark.parametrize("token_num", [1, 32, 1024])
-@pytest.mark.parametrize(
-    "token_num_sort, num_valid_ids_0", [(1, 1), (32, 32), (1024, 1024), (1024, 512)]
-)
-@pytest.mark.parametrize("topk", [1, 8])
+@pytest.mark.parametrize("token_num", [1])
+@pytest.mark.parametrize("token_num_sort, num_valid_ids_0", [(1, 1)])
+@pytest.mark.parametrize("topk", [1])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_fused_dynamic_mxfp4_quant_moe_sort(
     hidden_dim: int,

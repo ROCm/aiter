@@ -158,16 +158,10 @@ def torch_dynamic_mxfp4_quant(
     return x_mxfp4, bs_e8m0
 
 
+# Max 10 UTs per file: small shapes
 @pytest.mark.parametrize(
     "M, N",
-    [
-        (1, 28),
-        (1, 68),
-        (128, 28),
-        (128, 68),
-        (160, 40),
-        (280, 20),
-    ],
+    [(1, 28), (1, 68), (8, 32), (16, 64), (32, 64), (64, 128), (128, 28), (128, 68), (32, 32), (64, 64)],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_dynamic_mxfp4_quant(M: int, N: int, dtype):

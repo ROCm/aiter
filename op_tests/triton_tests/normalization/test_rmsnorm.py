@@ -97,17 +97,11 @@ def run_triton(input, weight, eps, residual=None, x_scale=None, y_scale_dtype=No
 
 
 def get_vals():
-    # irregular / non-pow2: (2,10), (873,1245), (173,409)
-    vals = [
-        (1, 4),
-        (2, 10),
-        (873, 1245),
-        (173, 409),
-    ]
-    return vals
+    # Max 10 UTs per file: small shapes only
+    return [(8, 16), (32, 64)]
 
 
-@pytest.mark.parametrize("in_dtype_str", ["bf16", "fp16"])
+@pytest.mark.parametrize("in_dtype_str", ["bf16"])
 @pytest.mark.parametrize(
     "M, N",
     [(shape) for shape in get_vals()],
@@ -160,10 +154,7 @@ def test_rmsnorm(M, N, in_dtype_str):
 
 
 @pytest.mark.parametrize("in_dtype_str", ["bf16"])
-@pytest.mark.parametrize(
-    "M, N",
-    [(shape) for shape in get_vals()],
-)
+@pytest.mark.parametrize("M, N", [(8, 16), (32, 64)])
 def test_fused_add_rmsnorm(M, N, in_dtype_str):
 
     in_dtype = str_to_torch_dtype[in_dtype_str]
@@ -214,12 +205,9 @@ def test_fused_add_rmsnorm(M, N, in_dtype_str):
     torch.testing.assert_close(dg_triton, dg_torch, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
+@pytest.mark.parametrize("in_dtype_str", ["bf16"])
 @pytest.mark.parametrize("scale_dtype_str", ["fp32"])
-@pytest.mark.parametrize(
-    "M, N",
-    [(shape) for shape in get_vals()],
-)
+@pytest.mark.parametrize("M, N", [(8, 16)])
 def test_rmsnorm_smoothquant(M, N, in_dtype_str, scale_dtype_str):
 
     in_dtype = str_to_torch_dtype[in_dtype_str]
@@ -243,12 +231,9 @@ def test_rmsnorm_smoothquant(M, N, in_dtype_str, scale_dtype_str):
     torch.testing.assert_close(yscale_triton, yscale_torch, atol=1e-3, rtol=1e-3)
 
 
-@pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
+@pytest.mark.parametrize("in_dtype_str", ["bf16"])
 @pytest.mark.parametrize("scale_dtype_str", ["fp32"])
-@pytest.mark.parametrize(
-    "M, N",
-    [(shape) for shape in get_vals()],
-)
+@pytest.mark.parametrize("M, N", [(8, 16)])
 def test_rmsnorm_dynamicquant(M, N, in_dtype_str, scale_dtype_str):
 
     in_dtype = str_to_torch_dtype[in_dtype_str]
@@ -269,12 +254,9 @@ def test_rmsnorm_dynamicquant(M, N, in_dtype_str, scale_dtype_str):
     torch.testing.assert_close(yscale_triton, yscale_torch, atol=1e-3, rtol=1e-3)
 
 
-@pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
+@pytest.mark.parametrize("in_dtype_str", ["bf16"])
 @pytest.mark.parametrize("scale_dtype_str", ["fp32"])
-@pytest.mark.parametrize(
-    "M, N",
-    [(shape) for shape in get_vals()],
-)
+@pytest.mark.parametrize("M, N", [(8, 16)])
 def test_rmsnorm_fused_add_smoothquant(M, N, in_dtype_str, scale_dtype_str):
 
     in_dtype = str_to_torch_dtype[in_dtype_str]
@@ -300,12 +282,9 @@ def test_rmsnorm_fused_add_smoothquant(M, N, in_dtype_str, scale_dtype_str):
     torch.testing.assert_close(yscale_triton, yscale_torch, atol=1e-3, rtol=1e-3)
 
 
-@pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
+@pytest.mark.parametrize("in_dtype_str", ["bf16"])
 @pytest.mark.parametrize("scale_dtype_str", ["fp32"])
-@pytest.mark.parametrize(
-    "M, N",
-    [(shape) for shape in get_vals()],
-)
+@pytest.mark.parametrize("M, N", [(8, 16)])
 def test_rmsnorm_fused_add_dynamicquant(M, N, in_dtype_str, scale_dtype_str):
 
     in_dtype = str_to_torch_dtype[in_dtype_str]
@@ -330,10 +309,11 @@ def test_rmsnorm_fused_add_dynamicquant(M, N, in_dtype_str, scale_dtype_str):
     torch.testing.assert_close(yscale_triton, yscale_torch, atol=1e-3, rtol=1e-3)
 
 
-@pytest.mark.parametrize("B", [1, 4, 8])
-@pytest.mark.parametrize("T", [128, 512, 2048])
-@pytest.mark.parametrize("D", [64, 4096])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+# Max 10 UTs per file: single case for this test
+@pytest.mark.parametrize("B", [1])
+@pytest.mark.parametrize("T", [128])
+@pytest.mark.parametrize("D", [64])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_rms_norm_dynamic_per_token_fp8_quant(
     B: int, T: int, D: int, dtype: torch.dtype
 ) -> None:

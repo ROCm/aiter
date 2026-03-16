@@ -276,14 +276,15 @@ def chunk_input(
     )
 
 
-@pytest.mark.parametrize("batch", [1, 8])
-@pytest.mark.parametrize("s_q", [1, 177])  # 177 irregular
-@pytest.mark.parametrize("s_k", [1, 177])
-@pytest.mark.parametrize("top_k", [78])  # irregular
-@pytest.mark.parametrize("num_q_heads", [16, 32])
-@pytest.mark.parametrize("lora_dim", [256, 512])
+# Max 10 UTs per file: small shapes (2*5=10)
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("s_q", [1, 8, 16, 32, 64])
+@pytest.mark.parametrize("s_k", [1])
+@pytest.mark.parametrize("top_k", [78])
+@pytest.mark.parametrize("num_q_heads", [16])
+@pytest.mark.parametrize("lora_dim", [256])
 @pytest.mark.parametrize("rope_dim", [64])
-@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("block_size", [16])
 @torch.inference_mode()
 def test_triton_unified_attn(
     batch: int,

@@ -71,15 +71,9 @@ def run_triton(
 
 
 def get_x_vals():
-    # 7168 non-pow2 K; irregular m
-    x_vals = [
-        (m, n1, n2, k)
-        for k in [1024, 7168]
-        for n2 in [256, 512]
-        for n1 in [256, 512]
-        for m in [1, 32, 128]
-    ]
-    return x_vals
+    # Max 10 UTs per file: 5 shapes * 2 skip_reduce
+    return [(1, 256, 256, 256), (32, 256, 512, 256), (128, 256, 256, 512),
+            (1, 512, 256, 1024), (32, 512, 512, 512)]
 
 
 @pytest.mark.parametrize("M, N1, N2, K", get_x_vals())

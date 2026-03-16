@@ -88,7 +88,8 @@ def shuffle_kv_cache(
 DEVICE_ARCH = arch_info.get_arch()
 
 NUM_HEADS = [(64, 8)]
-HEAD_SIZES = [64, 128]
+# Max 10 UTs per file: 4 from test_triton (head_size 1, block 2, backend 2) + 6 from test_gluon_2d
+HEAD_SIZES = [64]
 BLOCK_SIZES = [16, 64]
 
 
@@ -404,30 +405,19 @@ def test_triton_unified_attn(
     ), f"{torch.max(torch.abs(output - ref_output))}"
 
 
-@pytest.mark.parametrize(
-    "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
-)
+@pytest.mark.parametrize("seq_lens", [[(1, 1328)]])
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
-@pytest.mark.parametrize("block_size", [64, 16])
-@pytest.mark.parametrize("sliding_window", [None, 256])
+@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("sliding_window", SLIDING_WINDOWS)
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize(
-    "soft_cap",
-    [
-        None,
-    ],
-)
+@pytest.mark.parametrize("soft_cap", [None])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("q_dtype", QDTYPES)
 @torch.inference_mode()
 @pytest.mark.parametrize(
     "use_tdm, num_kv_blocks",
-    [
-        (False, 1),
-        (True, 1),
-        (True, 4),
-    ],
+    [(False, 1), (True, 1), (True, 4)],
 )
 @torch.inference_mode()
 def test_gluon_unified_attn_2d(

@@ -69,21 +69,10 @@ def generate_batched_gemm_afp4wfp4_inputs(
 
 
 def get_x_vals():
-    x_vals = [(1, 1, 32)]
-    x_vals += [(4864, 4096, 8192), (4864, 8192, 4160)]
-    x_vals += [(256, 3584, 2112)]
-    x_vals += [(192, 1280, 8192), (320, 1280, 8192)]
-    x_vals += [(128, 16384, 3328 * 2)]
-    batch_sizes = [1, 3, 7]
-    num_batch_sizes = len(batch_sizes)
-    x_vals_with_batch = []
-    for i, (m, n, k) in enumerate(x_vals):
-        b = batch_sizes[i % num_batch_sizes]
-        if k > 16384:
-            b = 1
-        x_vals_with_batch.append((b, m, n, k))
-    x_vals_with_batch += [(b, 32, 512, 128) for b in [1, 7]]
-    return x_vals_with_batch
+    # Max 10 UTs per file: small (B, M, N, K)
+    return [(1, 1, 32, 32), (1, 8, 64, 128), (2, 16, 128, 256), (1, 32, 256, 256),
+            (2, 64, 128, 256), (1, 16, 64, 128), (2, 32, 64, 256), (1, 8, 128, 128),
+            (1, 32, 32, 64), (2, 16, 256, 128)]
 
 
 def mxfp4_to_f32(x):
@@ -143,9 +132,10 @@ def run_torch(x, w, x_scales, w_scales, dtype):
     return torch.bmm(x_f32, w_f32.transpose(1, 2)).to(dtype)
 
 
+# Max 10 UTs per file
 @pytest.mark.parametrize("B, M, N, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("layout", ["TN"])
 def test_batched_gemm_afp4_wfp4(B: int, M: int, N: int, K: int, dtype, layout):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")

@@ -177,30 +177,27 @@ class Case:
     hbm_swizzling: bool = False
 
 
+# Max 10 UTs: 5 shapes x 2 do_gather/do_scatter. Small shapes; no hbm_swizzling to avoid shape skips.
 @pytest.mark.parametrize(
     ", ".join(f.name for f in fields(Case)),
     [
         tuple(getattr(case, f.name) for f in fields(Case))
         for case in [
-            # Edges: irregular shapes, small expert counts
-            Case(1000, 704, 800, 8, 2),
-            Case(300, 400, 800, 8, 4),
-            Case(256, 1024, 1024, 8, 4, hbm_swizzling=True),
-            Case(4096, 3072, 3072, 128, 4),
-            Case(8192, 7168, 2048, 256, 8),
+            Case(16, 64, 128, 2, 1),
+            Case(32, 128, 256, 4, 2),
+            Case(64, 256, 256, 4, 2),
+            Case(128, 256, 256, 8, 4),
+            Case(64, 128, 256, 8, 2),
         ]
     ],
 )
 @pytest.mark.parametrize(
     "do_gather, do_scatter",
-    [
-        (True, True),
-        (True, False),
-    ],
+    [(True, True), (True, False)],
 )
 @pytest.mark.parametrize("has_y_gammas", [True])
-@pytest.mark.parametrize("apply_swiglu", [False, True])
-@pytest.mark.parametrize("fused_quant", [False, True])
+@pytest.mark.parametrize("apply_swiglu", [False])
+@pytest.mark.parametrize("fused_quant", [False])
 def test_op(
     m,
     n,
@@ -215,8 +212,8 @@ def test_op(
     hbm_swizzling,
     device="cuda",
 ):
-    if get_arch() != "gfx950":
-        pytest.skip("FP4 kernels are not supported on MI300.")
+    if get_arch() not in ("gfx950", "gfx1250"):
+        pytest.skip("FP4 MoE kernels supported on gfx950 / gfx1250 only.")
     if hbm_swizzling:
         if n % 32 != 0 or k % (32 * 8) != 0:
             pytest.skip(

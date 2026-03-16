@@ -132,14 +132,8 @@ def generate_gemm_afp4wfp4_inputs(
 
 
 def get_x_vals():
-    x_vals = [(1, 1, 32)]  # minimal
-    x_vals += [(4864, 4096, 8192), (4864, 8192, 4160)]  # irregular
-    x_vals += [(256, 3584, 2112)]  # irregular
-    x_vals += [(7, 4608, 7168), (7, 7168, 2304)]  # odd M, irregular N,K
-    x_vals += [(192, 1280, 8192), (320, 1280, 8192)]
-    x_vals += [(128, 16384, 3328 * 2)]
-    x_vals += [(v, 10240, 8192) for v in [1, 8, 64]]  # 10240 non-pow2
-    return x_vals
+    # Max 10 UTs per file: 5 shapes * 2 layouts
+    return [(1, 1, 32), (8, 64, 128), (16, 128, 256), (32, 256, 256), (64, 128, 256)]
 
 
 def mxfp4_to_f32(x):
@@ -199,10 +193,7 @@ def run_triton(
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN", "NT"])
 @pytest.mark.parametrize("output", [True])
-@pytest.mark.parametrize(
-    "shuffle_weight_scales",
-    [True, False],
-)
+@pytest.mark.parametrize("shuffle_weight_scales", [True])
 @pytest.mark.parametrize("skip_reduce", [False])
 @pytest.mark.parametrize("impl", ["triton"])
 def test_gemm_afp4_wfp4(

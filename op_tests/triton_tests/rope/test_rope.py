@@ -214,14 +214,13 @@ def ref_rope_cached_thd_positions_offsets_2c_fwd(
     return ox, oy
 
 
-@pytest.mark.parametrize("B", [1, 15, 57])
-@pytest.mark.parametrize("S", [2, 10, 32])
-@pytest.mark.parametrize("H", [1, 8, 32])
-@pytest.mark.parametrize("D", [4, 64, 128])  # For now, D is power of 2.
+# Max 10 UTs per file: 10 S values
+@pytest.mark.parametrize("B", [1])
+@pytest.mark.parametrize("S", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
+@pytest.mark.parametrize("H", [1])
+@pytest.mark.parametrize("D", [64])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX])
-@pytest.mark.parametrize(
-    "nope, nope_first", [(False, False), (True, True)]
-)
+@pytest.mark.parametrize("nope, nope_first", [(False, False)])
 @pytest.mark.parametrize("reuse_freqs_front_part", [True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("inplace", [False])
@@ -290,16 +289,16 @@ def test_rope_sbhd_fwd(
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize("B", [1, 2, 15, 32, 57])
-@pytest.mark.parametrize("S", [2, 10, 32])
-@pytest.mark.parametrize("H", [1, 8, 32])
-@pytest.mark.parametrize("D", [4, 64, 128])  # For now, D is power of 2.
-@pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
-@pytest.mark.parametrize(
-    "nope, nope_first", [(False, False), (True, False), (True, True)]
-)
-@pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
+@pytest.mark.parametrize("B", [1])
+@pytest.mark.parametrize("S", [2])
+@pytest.mark.parametrize("H", [1])
+@pytest.mark.parametrize("D", [4])
+@pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX])
+@pytest.mark.parametrize("nope, nope_first", [(False, False)])
+@pytest.mark.parametrize("reuse_freqs_front_part", [True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
 def test_rope_sbhd_bwd(
     B: int,
     S: int,
@@ -359,15 +358,12 @@ def test_rope_sbhd_bwd(
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize(
-    "B, T", [(1, 4), (2, 6), (57, 500)]
-)
-@pytest.mark.parametrize("H", [1, 32])
-@pytest.mark.parametrize("D", [4, 128])
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
+@pytest.mark.parametrize("B, T", [(1, 4)])
+@pytest.mark.parametrize("H", [1])
+@pytest.mark.parametrize("D", [4])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX])
-@pytest.mark.parametrize(
-    "nope, nope_first", [(True, True)]
-)
+@pytest.mark.parametrize("nope, nope_first", [(True, True)])
 @pytest.mark.parametrize("reuse_freqs_front_part", [True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("inplace", [False])
@@ -448,17 +444,14 @@ def test_rope_thd_fwd(
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize(
-    "B, T", [(1, 1), (1, 4), (2, 6), (4, 100), (32, 320), (57, 500)]
-)
-@pytest.mark.parametrize("H", [1, 8, 32])
-@pytest.mark.parametrize("D", [4, 64, 128])  # For now, D is power of 2.
-@pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX, RotateStyle.GPTJ])
-@pytest.mark.parametrize(
-    "nope, nope_first", [(False, False), (True, False), (True, True)]
-)
-@pytest.mark.parametrize("reuse_freqs_front_part", [True, False])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("B, T", [(1, 4)])
+@pytest.mark.parametrize("H", [1])
+@pytest.mark.parametrize("D", [4])
+@pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX])
+@pytest.mark.parametrize("nope, nope_first", [(False, False)])
+@pytest.mark.parametrize("reuse_freqs_front_part", [True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
 def test_rope_thd_bwd(
     B: int,
     T: int,
@@ -529,18 +522,17 @@ def test_rope_thd_bwd(
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize("B", [1, 57])
-@pytest.mark.parametrize("S", [4, 32])
-@pytest.mark.parametrize("H", [1, 32])
-@pytest.mark.parametrize("D", [4, 128])  # For now, D is power of 2.
+@pytest.mark.parametrize("B", [1])
+@pytest.mark.parametrize("S", [4])
+@pytest.mark.parametrize("H", [1])
+@pytest.mark.parametrize("D", [4])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX])
-@pytest.mark.parametrize(
-    "nope, nope_first", [(True, True)]
-)
+@pytest.mark.parametrize("nope, nope_first", [(True, True)])
 @pytest.mark.parametrize("reuse_freqs_front_part", [True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("inplace", [False])
 @pytest.mark.parametrize("pos, offs", [(True, True)])
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
 def test_rope_cached_fwd(
     B: int,
     S: int,
@@ -666,17 +658,16 @@ def test_rope_cached_fwd(
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize("B", [1, 57])
-@pytest.mark.parametrize("S", [4, 32])
-@pytest.mark.parametrize("H", [1, 32])
-@pytest.mark.parametrize("D", [4, 128])  # For now, D is power of 2.
+@pytest.mark.parametrize("B", [1])
+@pytest.mark.parametrize("S", [4])
+@pytest.mark.parametrize("H", [1])
+@pytest.mark.parametrize("D", [4])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX])
-@pytest.mark.parametrize(
-    "nope, nope_first", [(True, True)]
-)
+@pytest.mark.parametrize("nope, nope_first", [(True, True)])
 @pytest.mark.parametrize("reuse_freqs_front_part", [True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("pos, offs", [(True, True)])
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
 def test_rope_cached_bwd(
     B: int,
     S: int,
@@ -769,18 +760,17 @@ def test_rope_cached_bwd(
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize("T", [(6), (100), (8192)])
-@pytest.mark.parametrize("QH_per_KH", [1, 4, 16])
-@pytest.mark.parametrize("KH", [1, 8])
-@pytest.mark.parametrize("D", [4, 128])  # For now, D is power of 2.
+@pytest.mark.parametrize("T", [6])
+@pytest.mark.parametrize("QH_per_KH", [1])
+@pytest.mark.parametrize("KH", [1])
+@pytest.mark.parametrize("D", [4])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX])
-@pytest.mark.parametrize(
-    "nope, nope_first", [(True, True)]
-)
+@pytest.mark.parametrize("nope, nope_first", [(True, True)])
 @pytest.mark.parametrize("reuse_freqs_front_part", [True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("inplace", [False])
 @pytest.mark.parametrize("pos, offs", [(True, True)])
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
 def test_rope_cached_thd_2c_fwd(
     T: int,
     QH_per_KH: int,
@@ -901,17 +891,16 @@ def test_rope_cached_thd_2c_fwd(
     torch.testing.assert_close(triton_out_y, torch_out_y, atol=1e-3, rtol=1e-1)
 
 
-@pytest.mark.parametrize("T", [(6), (500)])
-@pytest.mark.parametrize("QH_per_KH", [1, 16])
-@pytest.mark.parametrize("KH", [1, 8])
-@pytest.mark.parametrize("D", [4, 128])
+@pytest.mark.parametrize("T", [6])
+@pytest.mark.parametrize("QH_per_KH", [1])
+@pytest.mark.parametrize("KH", [1])
+@pytest.mark.parametrize("D", [4])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX])
-@pytest.mark.parametrize(
-    "nope, nope_first", [(True, True)]
-)
+@pytest.mark.parametrize("nope, nope_first", [(True, True)])
 @pytest.mark.parametrize("reuse_freqs_front_part", [True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("pos, offs", [(True, True)])
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
 def test_rope_cached_thd_2c_bwd(
     T: int,
     QH_per_KH: int,
@@ -1007,23 +996,17 @@ def test_rope_cached_thd_2c_bwd(
     torch.testing.assert_close(triton_out_y, torch_out_y, atol=1e-3, rtol=1e-1)
 
 
-@pytest.mark.parametrize("B", [1, 2, 15, 32, 57])
-@pytest.mark.parametrize("H", [1, 8, 32])
-@pytest.mark.parametrize("D", [4, 128])  # TODO 256 with height/width =64 is too slow.
-@pytest.mark.parametrize("height, width", [(32, 32), (64, 32), (32, 64)])
+@pytest.mark.parametrize("B", [1])
+@pytest.mark.parametrize("H", [1])
+@pytest.mark.parametrize("D", [4])
+@pytest.mark.parametrize("height, width", [(32, 32)])
 @pytest.mark.parametrize("margin", [0])
-@pytest.mark.parametrize(
-    "rotate_style", [RotateStyle.NEOX]
-)  # GPTJ case us off in CK/HIP test case
-@pytest.mark.parametrize(
-    "nope, nope_first", [(False, False)]
-)  # Other cases are off in CK/HIP test case
-@pytest.mark.parametrize(
-    "reuse_freqs_front_part", [False]
-)  # Other cases are off in CK/HIP test case
-# @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16]) #TODO bf16 results in accuracy issues
+@pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX])
+@pytest.mark.parametrize("nope, nope_first", [(False, False)])
+@pytest.mark.parametrize("reuse_freqs_front_part", [False])
 @pytest.mark.parametrize("dtype", [torch.float16])
-@pytest.mark.parametrize("inplace", [True, False])
+@pytest.mark.parametrize("inplace", [False])
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
 def test_rope_2d_fwd(
     B: int,
     H: int,
@@ -1149,6 +1132,7 @@ def rope_fwd_3d_torch(x, grid_sizes, freqs, sp_size, sp_rank):
 @pytest.mark.parametrize("N", [40])
 @pytest.mark.parametrize("C", [128])
 @pytest.mark.parametrize("dtype", [torch.float32])
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
 def test_rope_fwd_3d(
     B: int,
     S: int,

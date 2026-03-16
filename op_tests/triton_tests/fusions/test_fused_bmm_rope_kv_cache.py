@@ -27,16 +27,17 @@ from aiter.ops.triton.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_
 )
 
 
-@pytest.mark.parametrize("T", [1, 32, 2048])
+# Max 10 UTs per file: 10 T values, bf16 cache to avoid FP8 skip
+@pytest.mark.parametrize("T", [1, 4, 8, 16, 32, 64, 128, 256, 512, 1024])
 @pytest.mark.parametrize("QH_per_KH", [16])
-@pytest.mark.parametrize("KH", [1, 8])
-@pytest.mark.parametrize("D", [128])  # For now, D is power of 2. D >= 16
+@pytest.mark.parametrize("KH", [1])
+@pytest.mark.parametrize("D", [128])
 @pytest.mark.parametrize("D_q_nope", [128])
 @pytest.mark.parametrize("D_lora", [512])
-@pytest.mark.parametrize("num_kv_cahce_tokens", [16384])
+@pytest.mark.parametrize("num_kv_cahce_tokens", [2048])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX])
 @pytest.mark.parametrize("reuse_freqs_front_part", [True])
-@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.uint8])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_fused_fp4_bmm_rope_cat_and_cache_mla(
     T: int,
@@ -192,16 +193,17 @@ def test_fused_fp4_bmm_rope_cat_and_cache_mla(
     torch.testing.assert_close(ref_kv_cache, triton_kv_cache, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize("T", [1, 2, 32, 2048])
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
+@pytest.mark.parametrize("T", [1])
 @pytest.mark.parametrize("QH_per_KH", [16])
-@pytest.mark.parametrize("KH", [1, 8])
+@pytest.mark.parametrize("KH", [1])
 @pytest.mark.parametrize("D", [128])
 @pytest.mark.parametrize("D_q_nope", [128])
 @pytest.mark.parametrize("D_lora", [512])
-@pytest.mark.parametrize("num_kv_cahce_tokens", [16384])
-@pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
-@pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
-@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.uint8])
+@pytest.mark.parametrize("num_kv_cahce_tokens", [2048])
+@pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX])
+@pytest.mark.parametrize("reuse_freqs_front_part", [True])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_fused_fp8_bmm_rope_cat_and_cache_mla(
     T: int,

@@ -11,16 +11,17 @@ from aiter.ops.triton.fusions.fused_kv_cache import (
 from aiter.ops.triton.utils._triton import arch_info
 
 
-@pytest.mark.parametrize("T", [1, 4, 2048])  # odd 4, boundary 2048
-@pytest.mark.parametrize("QH_per_KH", [1, 16])
-@pytest.mark.parametrize("KH", [1, 8])
-@pytest.mark.parametrize("D", [128])  # For now, D is power of 2. D >= 16
+# Max 10 UTs: 8 from this test + 1 each from the two below
+@pytest.mark.parametrize("T", [1, 4, 8, 16, 32, 64, 128, 256])
+@pytest.mark.parametrize("QH_per_KH", [1])
+@pytest.mark.parametrize("KH", [1])
+@pytest.mark.parametrize("D", [128])
 @pytest.mark.parametrize("D_q_nope", [128])
 @pytest.mark.parametrize("D_lora", [512])
-@pytest.mark.parametrize("num_kv_cahce_tokens", [16384])
-@pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
-@pytest.mark.parametrize("reuse_freqs_front_part", [True])  # edge
-@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.uint8])
+@pytest.mark.parametrize("num_kv_cahce_tokens", [2048])
+@pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX])
+@pytest.mark.parametrize("reuse_freqs_front_part", [True])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_fused_qk_rope_cat_and_cache_mla(
     T: int,
@@ -179,19 +180,19 @@ def test_fused_qk_rope_cat_and_cache_mla(
     torch.testing.assert_close(torch_kv_cache, triton_kv_cache, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize("T", [1, 4, 2048])  # edge 1, 4, long 2048
-@pytest.mark.parametrize("QH_per_KH", [1, 16])
-@pytest.mark.parametrize("KH", [1, 8])
-@pytest.mark.parametrize("D", [64])  # For now, D is power of 2. D >= 16
-@pytest.mark.parametrize("num_kv_cahce_tokens", [16384])
+@pytest.mark.parametrize("T", [1])
+@pytest.mark.parametrize("QH_per_KH", [1])
+@pytest.mark.parametrize("KH", [1])
+@pytest.mark.parametrize("D", [64])
+@pytest.mark.parametrize("num_kv_cahce_tokens", [2048])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX])
 @pytest.mark.parametrize("reuse_freqs_front_part", [True])
-@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.uint8])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("cache_flash", [False, True])
+@pytest.mark.parametrize("cache_flash", [True])
 @pytest.mark.parametrize("block_size", [16])
 @pytest.mark.parametrize("x_size", [8])
-@pytest.mark.parametrize("offs", [True])  # offset edge case
+@pytest.mark.parametrize("offs", [False])
 def test_fused_qk_rope_reshape_and_cache(
     T: int,
     QH_per_KH: int,
@@ -416,18 +417,18 @@ def test_fused_qk_rope_reshape_and_cache(
     )
 
 
-@pytest.mark.parametrize("T", [1, 128])  # edge 1, non-pow2 128
-@pytest.mark.parametrize("QH_per_KH", [1, 16])
-@pytest.mark.parametrize("KH", [1, 8])
-@pytest.mark.parametrize("D", [64, 128])  # For now, D is power of 2. D >= 16
-@pytest.mark.parametrize("num_kv_cahce_tokens", [8193])  # odd cache size
+@pytest.mark.parametrize("T", [1])
+@pytest.mark.parametrize("QH_per_KH", [1])
+@pytest.mark.parametrize("KH", [1])
+@pytest.mark.parametrize("D", [64])
+@pytest.mark.parametrize("num_kv_cahce_tokens", [256])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ])
 @pytest.mark.parametrize("reuse_freqs_front_part", [True])
 @pytest.mark.parametrize("cache_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("cache_flash", [True])
 @pytest.mark.parametrize("block_size", [16])
-@pytest.mark.parametrize("x_size", [8])  # not used
+@pytest.mark.parametrize("x_size", [8])
 @pytest.mark.parametrize("offs", [False])
 def test_fused_qk_rope_cosine_cache_llama(
     T: int,

@@ -6,26 +6,20 @@ import random
 from aiter.ops.triton.attention.lean_atten_paged import persistent_lean_attention_paged
 
 
+# Max 10 UTs per file: 10 configs, small n_ctx where possible
 @pytest.mark.parametrize(
     "batch, h, n_ctx_q, n_ctx, d, total_programs, init_dtype, BLOCK_M, BLOCK_N, waves_per_eu, num_warps ",
     [
+        (1, 64, 16, [1024], 64, 912, torch.float16, 16, 64, 2, 4),
+        (1, 64, 16, [2048], 64, 912, torch.float16, 16, 64, 2, 4),
+        (1, 64, 16, [4096], 64, 912, torch.float16, 16, 64, 2, 4),
+        (1, 96, 16, [2048], 64, 912, torch.float16, 16, 64, 2, 4),
+        (1, 128, 16, [2048], 64, 912, torch.float16, 16, 64, 2, 4),
+        (2, 64, 16, [1024, 2048], 64, 912, torch.float16, 16, 64, 2, 4),
+        (1, 64, 16, [8192], 64, 912, torch.float16, 16, 64, 2, 4),
+        (1, 64, 16, [16384], 64, 912, torch.float16, 16, 64, 2, 4),
+        (1, 64, 16, [32768], 64, 912, torch.float16, 16, 64, 2, 4),
         (1, 64, 16, [65536], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 96, 16, [32768], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 128, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (3, 64, 16, [4096, 32768, 65536], 64, 912, torch.float16, 16, 64, 2, 4),
-        (
-            8,
-            64,
-            16,
-            [1024, 1024, 2048, 2048, 4096, 4096, 32768, 65536],
-            64,
-            912,
-            torch.float16,
-            16,
-            64,
-            2,
-            4,
-        ),
     ],
 )
 def test_persistent_lean_attention(

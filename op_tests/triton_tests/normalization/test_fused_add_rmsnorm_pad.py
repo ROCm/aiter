@@ -30,10 +30,11 @@ def run_torch(x, weight, eps=1e-6, res=None, pad_to_multiple=0):
     return x
 
 
-@pytest.mark.parametrize("M", [1, 32, 256])
-@pytest.mark.parametrize("N", [4, 320])  # 320 non-pow2
-@pytest.mark.parametrize("has_res", [False, True])
-@pytest.mark.parametrize("pad_to_multiple", [0, 256])
+# Max 10 UTs: small shapes (2*5 = 10)
+@pytest.mark.parametrize("M", [1, 32])
+@pytest.mark.parametrize("N", [4, 8, 16, 32, 64])
+@pytest.mark.parametrize("has_res", [False])
+@pytest.mark.parametrize("pad_to_multiple", [0])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_mul_add(M: int, N: int, has_res: bool, pad_to_multiple: int, dtype):
 

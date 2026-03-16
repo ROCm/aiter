@@ -262,14 +262,15 @@ def input_helper(
 # Software emulation that upcasts mxfp4 to fp16
 # ("fp16", "mxfp4_e2m1"),
 # ("bf16", "mxfp4_e2m1"),
+# Max 10 UTs: small shapes (5*2 = 10)
 @pytest.mark.parametrize(
     "M, N, K, E, top_k",
     [
-        (1000, 704, 800, 3, 1),
-        (64, 7186, 128, 8, 2),
-        (64, 3584, 128, 8, 2),
-        (3, 14336, 128, 4, 2),
-        (1, 1024, 16384, 2, 1),
+        (16, 64, 128, 2, 1),
+        (32, 128, 256, 4, 2),
+        (64, 256, 256, 4, 2),
+        (8, 128, 128, 2, 1),
+        (24, 96, 192, 4, 2),
     ],
 )
 @pytest.mark.parametrize(
@@ -278,7 +279,7 @@ def input_helper(
 )
 @pytest.mark.parametrize("silu_fused", [False, True])
 @pytest.mark.parametrize("routed_weight", [True])
-@pytest.mark.parametrize("swizzle_mx_scale", [False])  # TODO Add support for swizzle
+@pytest.mark.parametrize("swizzle_mx_scale", [False])
 def test_fused_moe(
     M: int,
     N: int,

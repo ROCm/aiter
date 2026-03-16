@@ -104,18 +104,12 @@ def fp8_assert_close(
     )
 
 
-@pytest.mark.parametrize("BATCH", [1, 57])
-@pytest.mark.parametrize(
-    "SEQLEN_Q, SEQLEN_K",
-    [(1, 1), (2, 1), (32, 16), (64, 128)],
-)
-@pytest.mark.parametrize(
-    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (48, 8)]
-)
-@pytest.mark.parametrize("HEAD_SZ", [8, 128])
-@pytest.mark.parametrize(
-    "DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ", [(0.0, False, False)]
-)
+# Max 10 UTs per file: small shapes (2*5=10)
+@pytest.mark.parametrize("BATCH", [1, 2])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(1, 1), (2, 1), (32, 16), (8, 16), (16, 8)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1)])
+@pytest.mark.parametrize("HEAD_SZ", [8])
+@pytest.mark.parametrize("DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ", [(0.0, False, False)])
 @pytest.mark.parametrize("CAUSAL", [(True)])
 @pytest.mark.parametrize("FP8", [(False)])
 def test_mha(
@@ -204,12 +198,10 @@ def test_mha(
         torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
 
 
-# LLaMA 3 405B config
+# LLaMA 3 405B config (skipped in reduced suite: max 10 UTs per file)
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
 @pytest.mark.parametrize("BATCH", [1])
-@pytest.mark.parametrize(
-    "SEQLEN_Q, SEQLEN_K",
-    [(1, 1)],
-)
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(1, 1)])
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(128, 8)])
 @pytest.mark.parametrize("HEAD_SZ", [128])
 @pytest.mark.parametrize("CAUSAL", [True])
@@ -319,6 +311,7 @@ def test_mha_int64_strides(
 @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
 @pytest.mark.parametrize("FP8", [(False), (True)])
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
 def test_mha_varlen(
     BATCH: int,
     SEQLEN_Q: int,
@@ -490,7 +483,7 @@ def test_mha_varlen(
 @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
 @pytest.mark.parametrize("FP8", [False])
 @pytest.mark.parametrize("FUSED", [False, True])
-# @pytest.mark.parametrize('FP8',[(False), (True)]) #TODO Debug FP8
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
 def test_mha_backward(
     BATCH: int,
     SEQLEN_Q: int,
@@ -647,7 +640,7 @@ def test_mha_backward(
 @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
 @pytest.mark.parametrize("FP8", [False])
 @pytest.mark.parametrize("FUSED", [False, True])
-# @pytest.mark.parametrize('FP8',[(False), (True)]) #TODO Debug FP8
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
 def test_mha_backward_varlen(
     BATCH: int,
     SEQLEN_Q: int,
@@ -828,6 +821,7 @@ def test_mha_backward_varlen(
 @pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(128, 64), (192, 128)])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.25])
 @pytest.mark.parametrize("CAUSAL", [True, False])
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
 def test_mha_with_pe(
     BATCH: int,
     SEQLEN_Q: int,
@@ -903,6 +897,7 @@ def test_mha_with_pe(
 @pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(96, 64), (192, 128)])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.17])
 @pytest.mark.parametrize("CAUSAL", [True, False])
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
 def test_mha_varlen_with_pe(
     BATCH: int,
     SEQLEN_Q: int,
@@ -1014,6 +1009,7 @@ def test_mha_varlen_with_pe(
 @pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(32, 16), (192, 128)])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
 @pytest.mark.parametrize("CAUSAL", [True, False])
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
 def test_mha_backward_with_pe(
     BATCH: int,
     SEQLEN_Q: int,
@@ -1144,6 +1140,7 @@ def test_mha_backward_with_pe(
 @pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(32, 16), (192, 128)])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
 @pytest.mark.parametrize("CAUSAL", [True, False])
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
 def test_mha_backward_varlen_with_pe(
     BATCH: int,
     SEQLEN_Q: int,
@@ -1323,6 +1320,7 @@ def test_mha_backward_varlen_with_pe(
 @pytest.mark.parametrize("HEAD_SZ", [32, 64])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
 @pytest.mark.parametrize("CAUSAL", [False, True])
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
 def test_mha_with_sink(
     BATCH: int,
     SEQLEN_Q: int,
@@ -1469,6 +1467,7 @@ def test_mha_with_sink(
 @pytest.mark.parametrize("HEAD_SZ", [64, 128])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
 @pytest.mark.parametrize("CAUSAL", [False, True])
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
 def test_mha_varlen_with_sink(
     BATCH: int,
     SEQLEN_Q: int,

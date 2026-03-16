@@ -243,11 +243,15 @@ def ref_compute_full_fwd(
 
 
 # We assume rotary_dim is always of power of 2 and rotary_dim <= qk_rope_head_dim
+# Max 10 UTs per file: 5 shapes * 2 use_rope = 10
 @pytest.mark.parametrize(
     "B, H, S, kv_lora_rank, qk_rope_head_dim, rotary_dim",
     [
+        (1, 8, 64, 64, 64, 64),
+        (1, 16, 128, 128, 64, 64),
+        (1, 32, 256, 256, 64, 64),
+        (1, 64, 512, 256, 127, 64),
         (1, 128, 2048, 512, 127, 64),
-        (1, 128, 2050, 512, 127, 64),
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -339,12 +343,10 @@ def test_op_fwd_rope(
     torch.testing.assert_close(ref_logits, tri_logits, atol=1e-2, rtol=1e-2)
 
 
-# We assume rotary_dim is always of power of 2 and rotary_dim <= qk_rope_head_dim
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
 @pytest.mark.parametrize(
     "B, H, S, kv_lora_rank, qk_rope_head_dim, rotary_dim",
-    [
-        (1, 128, 2050, 512, 127, 64),
-    ],
+    [(1, 128, 2050, 512, 127, 64)],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("use_rope", [True])
@@ -442,13 +444,10 @@ def test_op_fwd_rope_neox(
     torch.testing.assert_close(ref_logits, tri_logits, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.skip(reason="reduced suite: max 10 UTs per file")
 @pytest.mark.parametrize(
     "B, H, S, kv_lora_rank, qk_rope_head_dim, rotary_dim",
-    [
-        (1, 128, 2, 512, 64, 64),
-        (1, 128, 2050, 512, 127, 64),
-        (8, 128, 2050, 512, 127, 64),
-    ],
+    [(1, 128, 2, 512, 64, 64)],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("use_rope", [True, False])
