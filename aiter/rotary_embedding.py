@@ -1010,7 +1010,6 @@ class MRotaryEmbedding(RotaryEmbedding):
         assert positions.ndim == 1 or positions.ndim == 2
 
         num_tokens = positions.shape[-1]
-        # cos_sin = self.cos_sin_cache[positions]
         cos, sin = self.cos_cache[positions], self.sin_cache[positions]
         if positions.ndim == 2:
             assert self.mrope_section
@@ -1748,7 +1747,6 @@ def get_rope(
     )
     if key in _ROPE_DICT:
         return _ROPE_DICT[key]
-    print("rope scaling: ", rope_scaling, flush=True)
     if dual_chunk_attention_config is not None:
         extra_kwargs = {
             k: v
