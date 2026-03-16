@@ -20,9 +20,9 @@ from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
-from chip_info import get_gfx, get_gfx_list
-from cpp_extension import _jit_compile, get_hip_version
-from file_baton import FileBaton
+from chip_info import get_gfx, get_gfx_list  # noqa: E402
+from cpp_extension import _jit_compile, get_hip_version  # noqa: E402
+from file_baton import FileBaton  # noqa: E402
 from torch_guard import torch_compile_guard  # noqa: E402
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
@@ -223,11 +223,17 @@ class AITER_CONFIG(object):
             if "cu_num" not in keys:
                 keys.append("cu_num")
             dedup_keys = keys + ["_tag"] if has_tag else keys
-            merge_df = (
-                merge_df.sort_values("us")
-                .drop_duplicates(subset=dedup_keys, keep="first")
-                .reset_index(drop=True)
-            )
+            sorted_df = merge_df.sort_values("us")
+            duplicated_mask = sorted_df.duplicated(subset=dedup_keys, keep="first")
+            if duplicated_mask.any():
+                dup_rows = sorted_df[duplicated_mask]
+                logger.warning(
+                    f"Dropping {len(dup_rows)} duplicate rows during merge of '{merge_name}':\n"
+                    f"{dup_rows.to_string(index=False)}"
+                )
+            merge_df = sorted_df.drop_duplicates(
+                subset=dedup_keys, keep="first"
+            ).reset_index(drop=True)
         else:
             logger.warning(
                 f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."

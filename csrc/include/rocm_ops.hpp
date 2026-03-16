@@ -63,6 +63,7 @@ namespace py = pybind11;
           py::arg("splitData"),                \
           py::arg("splitLse"),                 \
           py::arg("output"),                   \
+          py::arg("lse")  = std::nullopt,      \
           py::arg("q_scale")  = std::nullopt,  \
           py::arg("kv_scale") = std::nullopt); \
     m.def("mla_prefill_asm_fwd",               \
@@ -1299,7 +1300,8 @@ namespace py = pybind11;
           py::arg("fc_scale_blkn")    = 128,                                   \
           py::arg("fc_scale_blkk")    = 128,                                   \
           py::arg("fc2_smooth_scale") = std::nullopt,                          \
-          py::arg("activation")       = ActivationType::Silu);                       \
+          py::arg("activation")       = ActivationType::Silu,                        \
+          py::arg("block_size_M")     = 32);                                         \
     m.def("moe_stage1_g1u1",                                                   \
           &moe_stage1_g1u1,                                                    \
           py::arg("input"),                                                    \
@@ -1588,13 +1590,32 @@ namespace py = pybind11;
     m.def("fused_qk_norm_mrope_3d_cache_pts_quant_shuffle", \
           &fused_qk_norm_mrope_3d_cache_pts_quant_shuffle);
 
-#define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                     \
-    m.def("fused_qk_norm_rope_cache_quant_shuffle",              \
-          &aiter::fused_qk_norm_rope_cache_quant_shuffle);       \
-    m.def("fused_qk_norm_rope_cache_pts_quant_shuffle",          \
-          &aiter::fused_qk_norm_rope_cache_pts_quant_shuffle);   \
-    m.def("fused_qk_norm_rope_cache_block_quant_shuffle",        \
-          &aiter::fused_qk_norm_rope_cache_block_quant_shuffle); \
+#define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                    \
+    m.def("fused_qk_norm_rope_cache_quant_shuffle",             \
+          &aiter::fused_qk_norm_rope_cache_quant_shuffle);      \
+    m.def("fused_qk_norm_rope_cache_pts_quant_shuffle",         \
+          &aiter::fused_qk_norm_rope_cache_pts_quant_shuffle);  \
+    m.def("fused_qk_norm_rope_cache_block_quant_shuffle",       \
+          &aiter::fused_qk_norm_rope_cache_block_quant_shuffle, \
+          py::arg("qkv"),                                       \
+          py::arg("num_heads_q"),                               \
+          py::arg("num_heads_k"),                               \
+          py::arg("num_heads_v"),                               \
+          py::arg("head_dim"),                                  \
+          py::arg("eps"),                                       \
+          py::arg("q_weight"),                                  \
+          py::arg("k_weight"),                                  \
+          py::arg("cos_sin_cache"),                             \
+          py::arg("is_neox"),                                   \
+          py::arg("position_ids"),                              \
+          py::arg("k_cache"),                                   \
+          py::arg("v_cache"),                                   \
+          py::arg("slot_mapping"),                              \
+          py::arg("cu_q_len"),                                  \
+          py::arg("kv_cache_dtype"),                            \
+          py::arg("k_scale"),                                   \
+          py::arg("v_scale"),                                   \
+          py::arg("max_tokens_per_batch") = 0);                 \
     m.def("fused_qk_norm_rope_2way", &aiter::fused_qk_norm_rope_2way);
 
 #define SMOOTHQUANT_PYBIND                      \
@@ -1907,7 +1928,6 @@ namespace py = pybind11;
           py::arg("cache_seqlens")      = torch::Tensor(),                     \
           py::arg("conv_state_indices") = torch::Tensor(),                     \
           py::arg("pad_slot_id")        = -1);
-
 #define MLA_HK_PYBIND                   \
     m.def("hk_mla_decode_fwd",          \
           &hk_mla_decode_fwd,           \

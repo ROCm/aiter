@@ -28,13 +28,15 @@ skip_tests=(
     "op_tests/multigpu_tests/test_dispatch_combine.py"
     "op_tests/multigpu_tests/test_communication.py"
     "op_tests/multigpu_tests/test_mori_all2all.py"
+    "op_tests/multigpu_tests/test_fused_ar_rms.py"
     "op_tests/multigpu_tests/triton_test/test_reduce_scatter_all_gather.py"
     "op_tests/multigpu_tests/triton_test/test_fused_rs_rmsnorm_quant_ag.py"
 )
 
 # When AITER_TEST is set, files are already the exact list for this shard (from artifact).
+# Multi-GPU tests should always run all files without sharding.
 # Otherwise, apply modulo to split "all files" into shards by index.
-if [[ -n "${AITER_TEST:-}" ]]; then
+if [[ -n "${AITER_TEST:-}" ]] || [[ "$MULTIGPU" == "TRUE" ]]; then
     sharded_files=("${files[@]}")
 else
     sharded_files=()

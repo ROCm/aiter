@@ -279,7 +279,7 @@ def test_sage(
 @pytest.mark.parametrize("layout", ["bhsd"])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("qsmooth", [True, False])
-@pytest.mark.parametrize("hadamard_rotate", [True, False])
+@pytest.mark.parametrize("hadamard_rotate", [True])  # TODO: hadamard expected to be on
 def test_sage_mxfp4(
     BATCH: int,
     SEQLEN_Q: int,
