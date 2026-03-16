@@ -14,7 +14,7 @@ from aiter.ops.triton.quant.sage_attention_quant_wrappers import (sage_quant, sa
 from enum import IntEnum
 
 
-def get_config(num_tokens, num_seqs, num_queries_per_kv, num_kv_heads, head_size, window_size, max_seqlen_q, max_seqlen_k, block_size, q_element_size):
+def get_config(num_tokens, num_seqs, num_queries_per_kv, num_kv_heads, head_size, window_size, max_seqlen_q, max_seqlen_k, block_size, q_element_size, qk_quant_scheme=None):
     SLIDING_WINDOW = 1 + window_size[0]
     ALL_DECODE = max_seqlen_q == 1
     cu_count = get_num_sms()
@@ -22,6 +22,8 @@ def get_config(num_tokens, num_seqs, num_queries_per_kv, num_kv_heads, head_size
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
+    if qk_quant_scheme in (QK_QUANT_SCHEME.SAGE_V1, QK_QUANT_SCHEME.SAGE_V2):
+        BLOCK_M = max(BLOCK_M, 128)
 
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     
@@ -37,7 +39,7 @@ def get_config(num_tokens, num_seqs, num_queries_per_kv, num_kv_heads, head_size
     #     target_num_prgms,
     #     num_2d_prgms,
     # ):
-    return select_2d_config(
+    config = select_2d_config(
         block_size,
         head_size,
         SLIDING_WINDOW,
@@ -47,6 +49,10 @@ def get_config(num_tokens, num_seqs, num_queries_per_kv, num_kv_heads, head_size
         num_queries_per_kv,
         num_2d_prgms,
     )
+    if qk_quant_scheme in (QK_QUANT_SCHEME.SAGE_V1, QK_QUANT_SCHEME.SAGE_V2):
+        config["BLOCK_M"] = max(config["BLOCK_M"], 128)
+        config["BLOCK_Q"] = config["BLOCK_M"] // num_queries_per_kv
+    return config
     # else:
     #     attn_config, reduce_config = select_3d_config(
     #         head_size,
@@ -377,7 +383,10 @@ def unified_attention(
         )
 
         TILE_SIZE=config["TILE_SIZE"]
-        BLOCK_M=config["BLOCK_M"]
+        if qk_quant_scheme in (QK_QUANT_SCHEME.SAGE_V1, QK_QUANT_SCHEME.SAGE_V2):
+            config["BLOCK_M"] = max(config["BLOCK_M"], 128)
+            config["BLOCK_Q"] = config["BLOCK_M"] // num_queries_per_kv
+
         (
             query_scale_stride_0,
             query_scale_stride_1,

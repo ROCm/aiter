@@ -274,11 +274,13 @@ def run_benchmark(custom, args):
         if args.sagev1 or args.sagev2:
             from aiter.ops.triton.attention.unified_attention import get_config
             num_queries_per_kv = num_query_heads // num_kv_heads
+            _sage_scheme = QK_QUANT_SCHEME.SAGE_V1 if args.sagev1 else QK_QUANT_SCHEME.SAGE_V2
             config = get_config(
                 query.shape[0], len(cu_seqlens_q),
                 num_queries_per_kv, num_kv_heads, head_size,
                 window_size, max_query_len, max_kv_len,
-                block_size, query.element_size()
+                block_size, query.element_size(),
+                qk_quant_scheme=_sage_scheme,
             )
             BLOCK_M = config["BLOCK_M"]
             BLOCK_N = config["TILE_SIZE"]

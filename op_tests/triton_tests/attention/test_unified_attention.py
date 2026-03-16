@@ -173,7 +173,8 @@ def test_triton_unified_attn(
             query.shape[0], len(cu_query_lens),
             num_queries_per_kv, num_kv_heads, head_size,
             window_size, max_query_len, max_kv_len,
-            block_size, query.element_size()
+            block_size, query.element_size(),
+            qk_quant_scheme=QK_QUANT_SCHEME.SAGE_V1,
         )
         BLOCK_M = config["BLOCK_M"]
         BLOCK_N = config["TILE_SIZE"]
@@ -193,7 +194,8 @@ def test_triton_unified_attn(
             query.shape[0], len(cu_query_lens),
             num_queries_per_kv, num_kv_heads, head_size,
             window_size, max_query_len, max_kv_len,
-            block_size, query.element_size()
+            block_size, query.element_size(),
+            qk_quant_scheme=QK_QUANT_SCHEME.SAGE_V2,
         )
         BLOCK_M = config["BLOCK_M"]
         BLOCK_N = config["TILE_SIZE"]
