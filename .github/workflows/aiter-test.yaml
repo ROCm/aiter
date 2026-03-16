@@ -329,7 +329,7 @@ jobs:
             docker exec \
             -w /workspace \
             aiter_test \
-            bash -c "MAX_JOBS=20 SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh"
+            bash -c "MAX_JOBS=64 SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh"
           else
             docker exec \
             -w /workspace \
