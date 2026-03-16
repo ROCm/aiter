@@ -127,13 +127,17 @@ def torch_mla_extend(
     return out.to(o_dtype)
 
 
-@pytest.mark.parametrize("batch_size", [1, 4, 7, 8, 32])
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 4, 5, 8, 10, 16, 24, 32])
 @pytest.mark.parametrize("decode_qlen", [1, 2, 4, -1])
-@pytest.mark.parametrize("ctx_lens", [1024, 8192])
-@pytest.mark.parametrize("num_heads", [(16, 1)])
-@pytest.mark.parametrize("kv_lora_rank, qk_rope_head_dim", [(512, 64)])
+@pytest.mark.parametrize(
+    "ctx_lens", [21, 32, 64, 256, 512, 1000, 1024, 1200, 2048, 2400, 3200]
+)
+@pytest.mark.parametrize("num_heads", [(128, 8), (64, 8), (16, 1)])
+@pytest.mark.parametrize(
+    "kv_lora_rank, qk_rope_head_dim", [(128, 64), (128, 128), (512, 64)]
+)
 @pytest.mark.parametrize("block_size", [64])
-@pytest.mark.parametrize("num_blocks", [2048])
+@pytest.mark.parametrize("num_blocks", [8192, 2048])
 @pytest.mark.parametrize("varlen", [True, False])
 @pytest.mark.parametrize(
     "q_dtype, kv_dtype, out_dtype, use_out_scale",

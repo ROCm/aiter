@@ -186,7 +186,9 @@ def mla_decode_fwd(
         kv_lora_rank + qk_rope_head_dim == qk_head_dim
     ), "qk_head_dim must be equal to kv_lora_rank + qk_rope_head_dim"
 
-    BLOCK_M = 16
+    BLOCK_M = (
+        16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
+    )
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     assert BLOCK_Q >= 1
     # Ideally we would launch with kernel with:
