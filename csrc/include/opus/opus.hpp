@@ -2074,7 +2074,7 @@ struct mfma_adaptor_swap_ab : mfma_adaptor<MFMA> {
 
     template<typename VA, typename VB, index_t cbsz = 0, index_t abid = 0, index_t blgp = 0>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) {
-        typename MFMA::vtype_c c{0}; return operator()(b, a, c, number<cbsz>{}, number<abid>{}, number<blgp>{});
+        typename MFMA::vtype_c c{0}; return operator()(a, b, c, number<cbsz>{}, number<abid>{}, number<blgp>{});
     }
 
     template<typename VA, typename VB, typename VC>
@@ -2084,7 +2084,7 @@ struct mfma_adaptor_swap_ab : mfma_adaptor<MFMA> {
 
     template<typename VA, typename VB>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b) {
-        typename MFMA::vtype_c c{0}; return operator()(b, a, c, scale_b, scale_a);
+        typename MFMA::vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b);
     }
 
     OPUS_ADAPTOR_LAYOUT_API_DEFINE
@@ -2114,6 +2114,17 @@ struct mfma_adaptor_swap_ab_swizzle_b : mfma_adaptor_swap_ab<MFMA> {
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) {
         typename MFMA::vtype_c c{0}; return operator()(a, b, c, number<cbsz>{}, number<abid>{}, number<blgp>{});
     }
+
+    template<typename VA, typename VB, typename VC>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
+        return base::operator()(a, b, c, scale_a, scale_b);
+    }
+
+    template<typename VA, typename VB>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b) {
+        typename MFMA::vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b);
+    }
+
     OPUS_ADAPTOR_LAYOUT_API_DEFINE
 };
 }
