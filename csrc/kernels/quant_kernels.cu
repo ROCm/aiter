@@ -556,8 +556,13 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         int32_t smscale_map_idx = smooth_scale_map == nullptr ? 0 : smooth_scale_map[token_idx];
         if(smooth_scale_map != nullptr && smooth_scale_map_hash != nullptr)
         {
+#if defined(__gfx1250__)
+            __threadfence_block();
+            __syncthreads();
+#else
             asm volatile("s_waitcnt vmcnt(%0)" : : "n"(0) : "memory");
             __syncthreads();
+#endif
             smscale_map_idx = smscale_map_idx < smooth_scale_map_hash_size ? smooth_scale_map_hash_shared[smscale_map_idx] : -1;
         }
         if (smscale_map_idx < 0)

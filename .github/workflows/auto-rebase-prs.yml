@@ -1,0 +1,72 @@
+name: Auto-Rebase PRs
+
+on:
+  workflow_run:
+    workflows: ["Sync Fork", "Sync Upstream"]
+    types: [completed]
+  workflow_dispatch:
+
+jobs:
+  rebase:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Rebase open PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DEFAULT_BRANCH=$(gh api "repos/${{ github.repository }}" --jq '.default_branch')
+          echo "Default branch: $DEFAULT_BRANCH"
+
+          # Get all open PRs authored by the repo owner
+          PRS=$(gh pr list --state open --json number,headRefName,mergeable --jq '.[] | "\(.number) \(.headRefName) \(.mergeable)"')
+
+          if [ -z "$PRS" ]; then
+            echo "No open PRs found"
+            exit 0
+          fi
+
+          echo "$PRS" | while read -r pr_number branch mergeable; do
+            echo ""
+            echo "=== PR #${pr_number} (${branch}) mergeable=${mergeable} ==="
+
+            # Fetch and checkout the PR branch
+            if ! git fetch origin "$branch" 2>/dev/null; then
+              echo "  SKIP: branch $branch not found on origin"
+              continue
+            fi
+            git checkout "$branch"
+            git reset --hard "origin/$branch"
+
+            # Check if rebase is needed
+            git fetch origin "$DEFAULT_BRANCH"
+            if git merge-base --is-ancestor "origin/$DEFAULT_BRANCH" HEAD; then
+              echo "  OK: already up to date with $DEFAULT_BRANCH"
+              continue
+            fi
+
+            # Attempt rebase
+            echo "  Rebasing onto origin/$DEFAULT_BRANCH..."
+            if git rebase "origin/$DEFAULT_BRANCH" 2>/dev/null; then
+              echo "  Pushing rebased branch..."
+              git push --force-with-lease origin "$branch"
+              echo "  REBASED: PR #${pr_number} successfully rebased"
+              gh pr comment "$pr_number" --body "Auto-rebased onto \`${DEFAULT_BRANCH}\` after nightly upstream sync." 2>/dev/null || true
+            else
+              git rebase --abort 2>/dev/null || true
+              echo "  CONFLICT: PR #${pr_number} has merge conflicts"
+              # Label the PR for manual attention
+              gh pr edit "$pr_number" --add-label "needs-rebase" 2>/dev/null || true
+              gh pr comment "$pr_number" --body "Auto-rebase failed due to merge conflicts with \`${DEFAULT_BRANCH}\`. Manual rebase needed." 2>/dev/null || true
+            fi
+          done
