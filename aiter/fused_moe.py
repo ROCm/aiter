@@ -851,11 +851,6 @@ def get_2stage_cfgs(
                 else get_block_size_M(token, topk, expert, inter_dim)
             )
         )
-        # TODO: enable this approach for other quant types and archs
-        if q_type == QuantType.per_1x128 and get_gfx() == "gfx950":
-            tkn_per_epr = token * topk // expert
-            block_m = 64 if tkn_per_epr > 32 else block_m
-
         ksplit = (
             ksplit
             if (run_1stage)
@@ -881,7 +876,18 @@ def get_2stage_cfgs(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
     )
 
+    def get_block_m() -> int:
+        if q_dtype_a == dtypes.fp8:
+            return 32
+        else:
+            return 16 if token < 2048 else 32 if token < 16384 else 64
+
     if run_1stage:
+        # never hard code block_m for 1-stage since it can be tuned by kernel itself, and we have different heuristics for different quant types
+        # # TODO: enable this approach for other quant types and archs
+        # if q_type == QuantType.per_1x128 and get_gfx() == "gfx950":
+        #     tkn_per_epr = token * topk // expert
+        #     block_m = 64 if tkn_per_epr > 32 else block_m
         return MOEMetadata(
             functools.partial(
                 fused_moe_1stage,
@@ -912,7 +918,7 @@ def get_2stage_cfgs(
                 k_pad_zeros=intermediate_pad // 128 * 128,
                 activation=activation,
             ),
-            block_m,
+            get_block_m(),
             ksplit,
             False,
             True,
