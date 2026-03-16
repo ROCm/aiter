@@ -45,7 +45,7 @@ class Args:
         )
 
 
-def create_fused_preshuffle_gdn_kernel(
+def create_fused_preshuffle_gdr_decode_kernel(
     dtype,
     VEC_SIZE: int,
     seq_length: int,
@@ -114,7 +114,7 @@ def create_fused_preshuffle_gdn_kernel(
         WARP_SIZE_SHFL_OFFSETS.append(int(offsets_))
         offsets_ /= 2
 
-    class FGDN(flir.MlirModule):
+    class FusedGDRDecode(flir.MlirModule):
         GPU_MODULE_NAME = "linear_attention_kernels"
         GPU_MODULE_TARGETS = [f'#rocdl.target<chip = "{ARCH}">']
 
@@ -127,7 +127,7 @@ def create_fused_preshuffle_gdn_kernel(
             allocator.finalize()
 
         @flir.kernel
-        def fused_gdn_kernel(
+        def fused_gdr_decode_kernel(
             self: flir.T.i64,
             query: lambda: T.memref(DYN, dtype.get()),
             key: lambda: T.memref(DYN, dtype.get()),
@@ -681,7 +681,7 @@ def create_fused_preshuffle_gdn_kernel(
             gx = batch_size * num_v_heads * arith.index(NUM_BLOCKS_PER_V_DIM)
             stream_token = stream_ptr_to_async_token(stream_ptr)
             flir.gpu_ext.LaunchFuncOp(
-                [self.GPU_MODULE_NAME, "fused_gdn_kernel"],
+                [self.GPU_MODULE_NAME, "fused_gdr_decode_kernel"],
                 grid_size=(gx, c1, c1),
                 block_size=(bx, c1, c1),
                 kernel_operands=[
@@ -701,7 +701,7 @@ def create_fused_preshuffle_gdn_kernel(
                 async_dependencies=[stream_token],
             )
 
-    return FGDN().module
+    return FusedGDRDecode().module
 
 
 def choose_kwargs(args):
@@ -716,7 +716,7 @@ def choose_kwargs(args):
 @functools.lru_cache(maxsize=1024)
 def get_func(args):
     kwargs = choose_kwargs(args)
-    func = create_fused_preshuffle_gdn_kernel
+    func = create_fused_preshuffle_gdr_decode_kernel
     if args.dtype == torch.float:
         module = func(
             F32Type,
