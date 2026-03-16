@@ -75,7 +75,8 @@ def q_scale_process(
         q_descale_ptr = (
             Q_Descale
             + query_offset_seq[:, None] * query_scale_stride_0
-            + kv_head_idx * query_scale_stride_1
+            + query_offset_head[:, None] * query_scale_stride_1
+            # + kv_head_idx * query_scale_stride_1
             + offs_d_scale[None, :] * query_scale_stride_2
         )
         
