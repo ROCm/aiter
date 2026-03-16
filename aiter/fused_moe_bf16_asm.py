@@ -215,15 +215,28 @@ def asm_moe(
             #     smooth_scale_map_hash=local_expert_hash,
             #     transpose_out=True,
             # )
-            aiter.moe_smooth_per_token_scaled_quant_v2(
+            # aiter.moe_smooth_per_token_scaled_quant_v2(
+            #     a8,
+            #     hidden_states,
+            #     a8_scale,
+            #     fc1_smooth_scale,
+            #     sorted_ids,
+            #     sorted_expert_ids,
+            #     num_valid_ids,
+            #     BLOCK_SIZE_M,
+            #     transpose_out=True,
+            # )
+            aiter.moe_smooth_per_token_scaled_quant(
                 a8,
                 hidden_states,
                 a8_scale,
                 fc1_smooth_scale,
+                topk_ids,
                 sorted_ids,
                 sorted_expert_ids,
                 num_valid_ids,
                 BLOCK_SIZE_M,
+                local_expert_hash,
                 transpose_out=True,
             )
             a8 = a8.view(-1, model_dim)
