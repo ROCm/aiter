@@ -1102,6 +1102,7 @@ def _ctypes_call(func, fc_name, md_name):
         c_args = []
         aiter_refs = []
         ret_tensor = None
+        tensor_device = None
 
         ### convert values to ctypes arguments
         for pname, value in bound.arguments.items():
@@ -1110,6 +1111,8 @@ def _ctypes_call(func, fc_name, md_name):
             type_args = typing.get_args(hint)
 
             if hint is torch.Tensor:
+                if tensor_device is None:
+                    tensor_device = value.device
                 at = torch_to_aiter(value)
                 aiter_refs.append(at)
                 c_args.append(ctypes.byref(at))
@@ -1117,6 +1120,8 @@ def _ctypes_call(func, fc_name, md_name):
                     ret_tensor = value
             elif origin is typing.Union and torch.Tensor in type_args:
                 if value is not None:
+                    if tensor_device is None:
+                        tensor_device = value.device
                     at = torch_to_aiter(value)
                     aiter_refs.append(at)
                     c_args.append(ctypes.byref(at))
@@ -1132,8 +1137,8 @@ def _ctypes_call(func, fc_name, md_name):
                 c_args.append(value)
 
         c_args.append(
-            ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
-        )  # stream
+            ctypes.c_void_p(torch.cuda.current_stream(tensor_device).cuda_stream)
+        )
         c_func(*c_args)  # invoke
         return ret_tensor
 

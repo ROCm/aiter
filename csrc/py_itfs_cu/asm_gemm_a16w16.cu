@@ -229,7 +229,9 @@ extern "C" __attribute__((visibility("default"))) void gemm_a16w16_asm(AiterTens
         Mdim, Ndim, Kdim, config_map, arch_id, bpreshuffle, args.add_bias, splitK, kernelName);
     args.splitk              = split;
     AiterAsmKernel* impl_ptr = get_or_load_kernel(name, config_map, SUBM, SUBN);
-    hipSetDevice(A->device_id);
+    int prev_device;
+    HIP_CALL(hipGetDevice(&prev_device));
+    HIP_CALL(hipSetDevice(A->device_id));
 
     int gdx = (Ndim + SUBN - 1) / SUBN;
     int gdy = (Mdim + SUBM - 1) / SUBM;
@@ -250,4 +252,6 @@ extern "C" __attribute__((visibility("default"))) void gemm_a16w16_asm(AiterTens
 
     size_t arg_size = sizeof(args);
     impl_ptr->launch_kernel({&args, &arg_size, gdx, gdy, gdz, 256, 1, 1, stream});
+
+    HIP_CALL(hipSetDevice(prev_device));
 }
