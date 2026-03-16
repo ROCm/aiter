@@ -1585,15 +1585,67 @@ namespace py = pybind11;
     m.def("rope_cached_positions_offsets_fwd_impl", &rope_cached_positions_offsets_fwd_impl); \
     m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl);
 
-#define FUSED_QKNORM_MROPE_CACHE_QUANT_PYBIND               \
-    m.def("fused_qk_norm_mrope_3d_cache_pts_quant_shuffle", \
-          &fused_qk_norm_mrope_3d_cache_pts_quant_shuffle);
+#define FUSED_QKNORM_MROPE_CACHE_QUANT_PYBIND                                      \
+    m.def("fused_qk_norm_mrope_3d_cache_pts_quant_shuffle",                        \
+          &fused_qk_norm_mrope_3d_cache_pts_quant_shuffle,                         \
+          py::arg("qkv"),                                                          \
+          py::arg("qw"),                                                           \
+          py::arg("kw"),                                                           \
+          py::arg("cos_sin"),                                                      \
+          py::arg("positions"),                                                    \
+          py::arg("num_tokens"),                                                   \
+          py::arg("num_heads_q"),                                                  \
+          py::arg("num_heads_k"),                                                  \
+          py::arg("num_heads_v"),                                                  \
+          py::arg("head_size"),                                                    \
+          py::arg("is_neox_style"),                                                \
+          py::arg("mrope_section_"),                                               \
+          py::arg("is_interleaved"),                                               \
+          py::arg("eps"),                                                          \
+          py::arg("q_out"),                                                        \
+          py::arg("k_cache"),                                                      \
+          py::arg("v_cache"),                                                      \
+          py::arg("slot_mapping"),                                                 \
+          py::arg("per_tensor_k_scale"),                                           \
+          py::arg("per_tensor_v_scale"),                                           \
+          py::arg("k_out"),                                                        \
+          py::arg("v_out"),                                                        \
+          py::arg("return_kv"),                                                    \
+          py::arg("use_shuffle_layout"),                                           \
+          py::arg("block_size"),                                                   \
+          py::arg("x"),                                                            \
+          py::arg("rotary_dim") = 0);
 
-#define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                    \
-    m.def("fused_qk_norm_rope_cache_quant_shuffle",             \
-          &aiter::fused_qk_norm_rope_cache_quant_shuffle);      \
-    m.def("fused_qk_norm_rope_cache_pts_quant_shuffle",         \
-          &aiter::fused_qk_norm_rope_cache_pts_quant_shuffle);  \
+#define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                     \
+    m.def("fused_qk_norm_rope_cache_quant_shuffle",              \
+          &aiter::fused_qk_norm_rope_cache_quant_shuffle);       \
+    m.def("fused_qk_norm_rope_cache_pts_quant_shuffle",          \
+          &aiter::fused_qk_norm_rope_cache_pts_quant_shuffle,    \
+          py::arg("qkv"),                                        \
+          py::arg("qw"),                                         \
+          py::arg("kw"),                                         \
+          py::arg("cos_sin"),                                    \
+          py::arg("positions"),                                  \
+          py::arg("num_tokens"),                                 \
+          py::arg("num_heads_q"),                                \
+          py::arg("num_heads_k"),                                \
+          py::arg("num_heads_v"),                                \
+          py::arg("head_size"),                                  \
+          py::arg("is_neox_style"),                              \
+          py::arg("eps"),                                        \
+          py::arg("q_out"),                                      \
+          py::arg("k_cache"),                                    \
+          py::arg("v_cache"),                                    \
+          py::arg("slot_mapping"),                               \
+          py::arg("per_tensor_k_scale"),                         \
+          py::arg("per_tensor_v_scale"),                         \
+          py::arg("k_out"),                                      \
+          py::arg("v_out"),                                      \
+          py::arg("return_kv"),                                  \
+          py::arg("use_shuffle_layout"),                         \
+          py::arg("block_size"),                                 \
+          py::arg("x"),                                          \
+          py::arg("rotary_dim") = 0);                            \
     m.def("fused_qk_norm_rope_cache_block_quant_shuffle",       \
           &aiter::fused_qk_norm_rope_cache_block_quant_shuffle, \
           py::arg("qkv"),                                       \
