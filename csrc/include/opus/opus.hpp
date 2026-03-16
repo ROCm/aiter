@@ -39,6 +39,14 @@
 #define OPUS_FP32_to_BF16_DEFAULT 2 // truncate, valid on gfx94* and before
 #endif
 
+// gfx1250 (MI450) does not support buffer resource instructions yet.
+// Disable OPUS buffer operations and fall back to standard global memory ops.
+#if defined(__gfx1250__)
+#define OPUS_GFX1250_DISABLED 1
+#else
+#define OPUS_GFX1250_DISABLED 0
+#endif
+
 #ifndef OPUS_TILE_CONTAINER
 #define OPUS_TILE_CONTAINER 0 // 0:vector, 1:array of vector, 2:flattened array
 #endif
@@ -1360,7 +1368,7 @@ OPUS_D constexpr auto buffer_default_config() {
     return 0x00020000;
 #elif defined(__gfx103__)
     return 0x31014000;
-#elif defined(__gfx11__) || defined(__gfx12__)
+#elif defined(__gfx11__) || defined(__gfx12__) || defined(__gfx1250__)
     return 0x31004000;
 #else
     return 0xffffffff;
@@ -1382,22 +1390,36 @@ struct gmem {
     static constexpr index_t vector_size = vector_traits<T>::size();
     template<index_t vec = 1> using vector_type = vector_t<scalar_type, vec * vector_size>;
 
-    OPUS_D gmem(const void* ptr, unsigned int size = 0xffffffff, unsigned int config = buffer_default_config()) : cached_rsrc(make_buffer_rsrc(ptr, size, config)) {}
+    OPUS_D gmem(const void* ptr, unsigned int size = 0xffffffff, unsigned int config = buffer_default_config())
+#if !OPUS_GFX1250_DISABLED
+        : cached_rsrc(make_buffer_rsrc(ptr, size, config)) {}
+#else
+        : cached_rsrc(make_buffer_rsrc(ptr, size, config)), res_ptr(reinterpret_cast<const char*>(ptr)) {}
+    const char* res_ptr;  // raw pointer for gfx1250 fallback global memory ops
+#endif
 
     template<index_t vec = 1, index_t aux = 0>   // os in unit of byte
     OPUS_D auto _load(int v_os, int s_os = 0, number<aux> = {}) {
         using type = vector_type<vec>;
+#if OPUS_GFX1250_DISABLED
+        return *reinterpret_cast<const type*>(res_ptr + v_os + s_os);
+#else
         if      constexpr (sizeof(type) == 1)  { return __builtin_bit_cast(type, __builtin_amdgcn_raw_buffer_load_b8  (cached_rsrc, v_os, s_os, aux)); }
         else if constexpr (sizeof(type) == 2)  { return __builtin_bit_cast(type, __builtin_amdgcn_raw_buffer_load_b16 (cached_rsrc, v_os, s_os, aux)); }
         else if constexpr (sizeof(type) == 4)  { return __builtin_bit_cast(type, __builtin_amdgcn_raw_buffer_load_b32 (cached_rsrc, v_os, s_os, aux)); }
         else if constexpr (sizeof(type) == 8)  { return __builtin_bit_cast(type, __builtin_amdgcn_raw_buffer_load_b64 (cached_rsrc, v_os, s_os, aux)); }
         else if constexpr (sizeof(type) == 16) { return __builtin_bit_cast(type, __builtin_amdgcn_raw_buffer_load_b128(cached_rsrc, v_os, s_os, aux)); }
+#endif
     }
 
     template<index_t vec = 1, index_t aux = 0>   // os in unit of byte
     OPUS_D void _async_load(OPUS_LDS_ADDR void* dst, int v_os, int s_os = 0, number<aux> = {}) {
         using type = vector_type<vec>;
-#if __clang_major__ >= 20   // start from rocm 7.0,introduced by https://github.com/llvm/llvm-project/pull/132048, 133055, 132957
+#if OPUS_GFX1250_DISABLED
+        // Fallback: synchronous load from global to LDS via registers
+        auto val = *reinterpret_cast<const type*>(res_ptr + v_os + s_os);
+        *reinterpret_cast<OPUS_LDS_ADDR type*>(dst) = val;
+#elif __clang_major__ >= 20   // start from rocm 7.0,introduced by https://github.com/llvm/llvm-project/pull/132048, 133055, 132957
         if      constexpr (sizeof(type) == 1)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  1, v_os, s_os, 0, aux); }
         else if constexpr (sizeof(type) == 2)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  2, v_os, s_os, 0, aux); }
         else if constexpr (sizeof(type) == 4)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  4, v_os, s_os, 0, aux); }
@@ -1421,11 +1443,15 @@ struct gmem {
     template<index_t vec = 1, typename V, index_t aux = 0>   // os in unit of byte
     OPUS_D void _store(const V& x, int v_os, int s_os = 0, number<aux> = {}) {
         static_assert((vec * vector_size) == vector_traits<V>::size(), "vector size need to be same, please check");
+#if OPUS_GFX1250_DISABLED
+        *reinterpret_cast<vector_type<vec>*>(const_cast<char*>(res_ptr) + v_os + s_os) = __builtin_bit_cast(vector_type<vec>, x);
+#else
         if      constexpr (sizeof(vector_type<vec>) == 1)  { __builtin_amdgcn_raw_buffer_store_b8  (__builtin_bit_cast(i8_t,    x), cached_rsrc, v_os, s_os, aux); }
         else if constexpr (sizeof(vector_type<vec>) == 2)  { __builtin_amdgcn_raw_buffer_store_b16 (__builtin_bit_cast(i16_t,   x), cached_rsrc, v_os, s_os, aux); }
         else if constexpr (sizeof(vector_type<vec>) == 4)  { __builtin_amdgcn_raw_buffer_store_b32 (__builtin_bit_cast(i32_t,   x), cached_rsrc, v_os, s_os, aux); }
         else if constexpr (sizeof(vector_type<vec>) == 8)  { __builtin_amdgcn_raw_buffer_store_b64 (__builtin_bit_cast(i32x2_t, x), cached_rsrc, v_os, s_os, aux); }
         else if constexpr (sizeof(vector_type<vec>) == 16) { __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(i32x4_t, x), cached_rsrc, v_os, s_os, aux); }
+#endif
     }
 
     template<index_t vec = 1, index_t aux = 0>   // os in unit of T and cast to vector with vec
