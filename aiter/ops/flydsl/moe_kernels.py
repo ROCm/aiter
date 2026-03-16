@@ -41,7 +41,7 @@ def get_flydsl_stage1_kernels(
     is_fp4 = b_dtype == "fp4"
     tile_ns = [256] if is_fp4 else [128]
     tile_ks = [256] if is_fp4 else [128]
-    tile_ms = [16, 32, 64]
+    tile_ms = [16, 32, 64, 128]
 
     for tm in tile_ms:
         for tn in tile_ns:
@@ -67,8 +67,8 @@ def get_flydsl_stage2_kernels(
     kernels = {}
     is_fp4 = b_dtype == "fp4"
     tile_ns = [128, 256] if is_fp4 else [128]
-    tile_ks = [256] if is_fp4 else [128]
-    tile_ms = [32, 64]
+    tile_ks = [128, 256] if is_fp4 else [128]
+    tile_ms = [32, 64, 128]
     modes = ["atomic", "reduce"]
 
     for tm in tile_ms:
@@ -165,6 +165,7 @@ def compile_flydsl_moe_stage2(
     b_dtype: str,
     out_dtype: str,
     accumulate: bool = True,
+    persist_m: int = 1,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -304,6 +305,7 @@ def _get_compiled_stage2(
     b_dtype: str,
     out_dtype: str,
     accumulate: bool = True,
+    persist_m: int = 1,
 ):
     """Compile and cache stage2 kernel, return a tensor_api closure."""
     exe = compile_flydsl_moe_stage2(
@@ -319,6 +321,7 @@ def _get_compiled_stage2(
         b_dtype=b_dtype,
         out_dtype=out_dtype,
         accumulate=accumulate,
+        persist_m=persist_m,
     )
     is_fp4 = b_dtype == "fp4"
     _n_in = model_dim
@@ -515,6 +518,9 @@ def flydsl_moe_stage2(
     a: (token_num, topk, inter_dim), w1: (E, model_dim, inter_dim) pre-shuffled.
     Returns (token_num, model_dim).
     """
+
+    assert out is not None
+
     token_num = inter_states.shape[0]
     E = w2.shape[0]
     model_dim = w2.shape[1]
@@ -525,21 +531,15 @@ def flydsl_moe_stage2(
     if a_dtype == "fp4":
         inter_dim = inter_dim * 2
 
-    torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
-
-    if out is None:
-        out = torch.zeros(
-            (token_num, model_dim), dtype=torch_out_dtype, device=inter_states.device
-        )
-    elif accumulate:
-        out.zero_()
-
     dev = inter_states.device
     sw = (
         sorted_weights
         if sorted_weights is not None
-        else torch.zeros(sorted_token_ids.shape, dtype=torch.float32, device=dev)
+        else torch.empty(sorted_token_ids.shape, dtype=torch.float32, device=dev)
     )
+
+    # Auto-select persistent M: PM=4 for large batches (>16 M blocks), PM=1 for small
+    _persist_m = 4 if int(sorted_expert_ids.numel()) > 256 else 1
 
     tensor_api = _get_compiled_stage2(
         model_dim=model_dim,
@@ -554,6 +554,7 @@ def flydsl_moe_stage2(
         b_dtype=b_dtype,
         out_dtype=out_dtype,
         accumulate=accumulate,
+        persist_m=_persist_m,
     )
     tensor_api(
         out,

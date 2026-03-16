@@ -329,7 +329,7 @@
           typename kv_cache_scalar_t,
           int head_dim,
           bool interleave,
-          int num_kv_heads,
+          int X,
           int wg_size = 64,
           vllm::Fp8KVCacheDataType kv_dt>
  __global__ void fusedQKNormRopeBlockQuantCacheShuffleKernel(
@@ -343,64 +343,56 @@
     scalar_t const* cos_sin_cache, // Pre-computed cos/sin cache
     int64_t const* position_ids,   // Position IDs for RoPE
     kv_cache_scalar_t*
-        k_cache, // Key cache [num_blocks, num_kv_heads, head_size // x, block_size, x]
+        k_cache, // Key cache [num_blocks, num_heads_k, head_size // X, block_size, X]
     kv_cache_scalar_t*
-        v_cache,           // Value cache [num_blocks, num_kv_heads, block_size // x, head_size, x]
+        v_cache,           // Value cache [num_blocks, num_heads_v, block_size // X, head_size, X]
     int64_t* slot_mapping,  // Slot mapping
     int64_t const* cu_q_len, // Cu Q len tensor [0, batch0_seq_len, batch0_seq_len + batch1_seq_len, ...]
-    float* k_scale,        // Key scale for quantized key cache [num_blocks, num_kv_heads]
-    float* v_scale,        // Value scale for quantized value cache [num_blocks, num_kv_heads]
+    float* k_scale,        // Key scale for quantized key cache [num_blocks, num_heads_k]
+    float* v_scale,        // Value scale for quantized value cache [num_blocks, num_heads_v]
     int const num_tokens,  // Number of tokens
     int const page_size,   // Page size for kv cache
-    int x,                 // kv cache tiling size
-    int const batch_size   // Batch size
+    int const batch_size,  // Batch size
+    int const blocks_per_batch // Uniform blocks per batch (>0: division mapping, 0: prefix-sum fallback)
 )
 {
-    // per block deal with one cache page (page_size tokens)
-    // gridDim = (1, gridSize, num_heads_q + num_heads_k + num_heads_v)
-    // blockIdx.y is the global block index across all batches
-    // Each batch needs ceil(seq_len/page_size) + 1 blocks (align with cache pages like cache_kernels.cu)
-    int const laneId        = threadIdx.x % WARP_SIZE;
+    int const num_heads        = num_heads_q + num_heads_k + num_heads_v;
+    int const localHeadIdx     = blockIdx.z;
+    int const page_size_log2   = __builtin_ctz(page_size);
+    int const page_mask        = page_size - 1;
 
-    int const num_heads    = num_heads_q + num_heads_k + num_heads_v;
-    int const localHeadIdx = blockIdx.z;  // head index
-
-    // page_size is power of 2: use shift/AND instead of div/mod/mul
-    int const page_size_log2 = __builtin_ctz(page_size);
-    int const page_mask     = page_size - 1;
-
-    // Map blockIdx.y -> (batch_id, block_within_batch) -> first_token_idx
-    // Stride by page_size to match cache block layout (blockDim.x may be 64 for reduce, but assignment is per page)
     int batch_id = -1;
     int cum_blocks = 0;
-    for(int i = 0; i < batch_size; i++)
+    if(gridDim.x > 1)
     {
-        int64_t seq_len_i = cu_q_len[i + 1] - cu_q_len[i];
-        int blocks_i     = ((seq_len_i + page_mask) >> page_size_log2) + 1;
-        if(cum_blocks + blocks_i > (int)blockIdx.y)
-        {
-            batch_id = i;
-            break;
-        }
-        cum_blocks += blocks_i;
+        // Decode fast path: batch_id = blockIdx.x, no overhead
+        batch_id = blockIdx.x;
     }
-    // Extra blocks beyond all batches — nothing to do
+    else if(blocks_per_batch > 0)
+    {
+        // Uniform allocation: simple integer division, no shared memory / syncthreads.
+        // Used when max_tokens_per_batch is known (prefill, mixed, etc.)
+        batch_id = (int)blockIdx.y / blocks_per_batch;
+        if(batch_id >= batch_size)
+            return;
+        cum_blocks = batch_id * blocks_per_batch;
+    }
+    else
+    {
+        // Fallback: batch_size <= 1 or max_tokens_per_batch unknown
+        batch_id = 0;
+        cum_blocks = 0;
+    }
     if(batch_id < 0)
         return;
     int block_within_batch = (int)blockIdx.y - cum_blocks;
 
-    // Calculate current batch's sequence range
     int64_t batch_start_idx = cu_q_len[batch_id];
     int64_t batch_end_idx   = cu_q_len[batch_id + 1];
-    int64_t seq_len         = batch_end_idx - batch_start_idx;
-
-    // first_token_idx: stride by page_size (like cache_kernels blockIdx.y * block_size)
     int64_t first_token_idx = batch_start_idx + block_within_batch * page_size;
-
     int64_t slot_idx;
     int64_t block_idx;
     int64_t block_offset;
-
     // ============================================================================
     // BOUNDARY HANDLING: Similar to cache_kernels.cu lines 504-521
     // Handle case where GPU block extends beyond current batch's sequence length
@@ -410,40 +402,31 @@
     {
         // This is the extra block for this batch (boundary handler)
         // Check if we need to process remaining tokens from a different cache page
-
         // Get the previous GPU block's first token
         int64_t prev_first_token_idx = batch_start_idx + (block_within_batch - 1) * page_size;
         if(prev_first_token_idx < batch_start_idx || prev_first_token_idx >= batch_end_idx)
         {
-            return;  // Invalid, just return
+            return;
         }
-
         int64_t prev_slot_idx = slot_mapping[prev_first_token_idx];
         int64_t preTg_block_idx = prev_slot_idx >> page_size_log2;
-
-        // Get the last token's cache block_idx (page)
         int64_t last_token_idx = batch_end_idx - 1;
         slot_idx = slot_mapping[last_token_idx];
         block_idx = slot_idx >> page_size_log2;
-        // If they are in the same cache page, the previous GPU block already handled it
         if(preTg_block_idx == block_idx)
         {
-            return;  // Already processed by previous GPU block
+            return;
         }
-        // Different page: keep slot_idx/block_idx from last token; set block_offset and first_token_idx (like cache_kernels.cu)
         block_offset = slot_idx & page_mask;
     }
     else
     {
-        // Normal case: GPU block starts within the valid token range
         slot_idx = slot_mapping[first_token_idx];
         block_idx = slot_idx >> page_size_log2;
         block_offset = slot_idx & page_mask;
     }
-
     if(slot_idx < 0)
     {
-        // Invalid slot, skip
         return;
     }
     if(first_token_idx > batch_start_idx && block_offset > 0)
@@ -452,7 +435,7 @@
         if(threadIdx.x < page_size)
         {
             int64_t token_idx  = first_token_idx - (threadIdx.x + 1);
-            if(token_idx >= batch_start_idx)
+            if(token_idx >= batch_start_idx && token_idx < batch_end_idx)
             {
                 int64_t block_idx1 = slot_mapping[token_idx] >> page_size_log2;
                 int64_t slot_idx2  = slot_mapping[token_idx + 1];
@@ -464,7 +447,6 @@
                 }
             }
         }
-
         __syncthreads();
         first_token_idx = idx_smem[0];
         slot_idx        = idx_smem[1];
@@ -475,7 +457,6 @@
     int64_t actual_slot_id = -1;
     int64_t actual_block_offset = 0;
     int64_t actual_block_idx = -1;
-
     // Calculate the num_tokens that are in the same cache block (page)
     int tokens_in_block = 0;
     if(first_token_idx + threadIdx.x < batch_end_idx)
@@ -493,7 +474,6 @@
     numtokens_in_block = block_reduce<float, decltype(sum), wg_size, true>(static_cast<float>(tokens_in_block), sum);
     // Calculate tokenIdx for current thread
     int tokenIdx = first_token_idx + threadIdx.x;
-
     bool const isQ                  = localHeadIdx < num_heads_q;
     bool const isK                  = (localHeadIdx < num_heads_q + num_heads_k) & !isQ;
     bool const isV                  = !isQ & !isK;
@@ -501,7 +481,6 @@
                                      : isK ? localHeadIdx - num_heads_q
                                            : localHeadIdx;
     constexpr int numElemsPerThread = head_dim;
-
     constexpr int best_vec_size = sizeof(float4) / sizeof(scalar_t);
     constexpr int vec_size      = std::min(best_vec_size, numElemsPerThread);
     constexpr int load_loop_cnt = numElemsPerThread / vec_size;
@@ -510,8 +489,6 @@
     ltype elements;
     ltype next_elements;
     float block_max = 0.0f;
-    // Load data first, suppose have no tail since we check the head_dim is multiple of 32 before
-    // kernel launch
     auto cur_element_offset = head_dim * threadIdx.x;
     auto f_absmax_f32 = [](float v_0_, float v_1_) {
         return __builtin_fmaxf(abs(v_0_), abs(v_1_));
@@ -568,7 +545,6 @@
                     cos = reinterpret_cast<const cos_sin_ltype*>(cos_ptr)[vec_slot];
                     cos_sin_ltype sin;
                     sin = reinterpret_cast<const cos_sin_ltype*>(sin_ptr)[vec_slot];
-
                     #pragma unroll
                     for(int k = 0; k < vec_size; k += 2)
                     {
@@ -645,21 +621,17 @@
             }
             // store q
     }
-
     if(isQ)
     {
         // For Q, we are done.
         return;
     }
-
     float dtype_max = opus::cast<float>(opus::numeric_limits<opus::fp8_t>::max());
-
     auto f_max_f32 = [](float v_0_, float v_1_) { return __builtin_fmaxf(v_0_, v_1_); };
     if(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
     {
         block_max = block_reduce<float, decltype(f_max_f32), wg_size, true>(block_max, f_max_f32);
     }
-
     if(isK)
     {
         float k_scale_val = 1.0f;
@@ -668,74 +640,61 @@
         {
             k_scale_val = block_max / dtype_max;
             inv_scale_val = dtype_max / block_max;
-            // Fix: correct scale index calculation [num_blocks, num_kv_heads]
-            int64_t scale_offset = block_idx * num_kv_heads + headIdx;
-
+            int64_t scale_offset = block_idx * num_heads_k + headIdx;
             if(block_offset > 0)
             {
                 float k_scale_global = k_scale[scale_offset];
                 if(k_scale_global < k_scale_val)
                 {
-                    // New data has larger dynamic range, need to requantize old data
+                    // k_cache layout: [num_blocks, num_heads_k, head_size//X, page_size, X]
                     int64_t cache_base = block_idx * page_size * num_heads_k * head_dim +
                                         headIdx * head_dim * page_size;
-
-                    // Requantize existing data [0, block_offset) - same indexing as quant write below
-                    // [num_blocks, num_kv_heads, head_size // x, block_size, x]
-                    int total_elements = block_offset * head_dim;
-                    int x_mask         = x - 1;
-                    int x_shift        = __builtin_ctz(x);
-                    for(int idx = threadIdx.x; idx < total_elements / vec_size; idx += blockDim.x)
+                    float rescale = k_scale_global * inv_scale_val;
+                    constexpr int num_hc     = head_dim / X;
+                    constexpr int vecs_per_x = X / vec_size;
+                    for(int hc = 0; hc < num_hc; hc++)
                     {
-                        int old_offset       = idx * vec_size / head_dim;
-                        int head_offset      = (idx * vec_size) % head_dim;
-                        int head_offset_divX = head_offset >> x_shift;
-                        int head_offset_modX = head_offset & x_mask;
-                        int64_t vec_off      = cache_base + head_offset_divX * page_size * x + old_offset * x + head_offset_modX;
-                        kv_cache_ltype data = *reinterpret_cast<kv_cache_ltype*>(&k_cache[vec_off]);
-                        #pragma unroll
-                        for(int j = 0; j < vec_size; j++)
+                        int64_t hc_base = cache_base + hc * page_size * X;
+                        for(int xo = 0; xo < vecs_per_x; xo++)
                         {
-                            float tmp = opus::cast<float>(data[j]);
-                            tmp       = tmp * k_scale_global * inv_scale_val;
-                            data[j]   = opus::cast<kv_cache_scalar_t>(tmp);
+                            for(int tok = threadIdx.x; tok < block_offset; tok += blockDim.x)
+                            {
+                                int64_t addr = hc_base + tok * X + xo * vec_size;
+                                kv_cache_ltype data = *reinterpret_cast<kv_cache_ltype*>(&k_cache[addr]);
+                                #pragma unroll
+                                for(int j = 0; j < vec_size; j++)
+                                {
+                                    data[j] = opus::cast<kv_cache_scalar_t>(
+                                        opus::cast<float>(data[j]) * rescale);
+                                }
+                                *reinterpret_cast<kv_cache_ltype*>(&k_cache[addr]) = data;
+                            }
                         }
-                        *reinterpret_cast<kv_cache_ltype*>(&k_cache[vec_off]) = data;
                     }
                     k_scale[scale_offset] = k_scale_val;
                 }
                 else
                 {
-                    // Old scale is sufficient, use it for new data
                     k_scale_val   = k_scale_global;
-                    inv_scale_val = 1.0f / k_scale_global;  // Must use global scale for quant
+                    inv_scale_val = 1.0f / k_scale_global;
                 }
             }
             else
             {
-                // New block, directly write scale
                 k_scale[scale_offset] = k_scale_val;
             }
         }
         int64_t cache_offset = block_idx * page_size * num_heads_k * head_dim +
                                headIdx * head_dim * page_size;
         int64_t total_elements = numtokens_in_block * head_dim;
-        int const x_mask       = x - 1;
-        int const x_shift      = __builtin_ctz(x);
-        int const k_row_stride = page_size * x;
-
         for(int64_t idx = threadIdx.x; idx < total_elements / vec_size; idx += blockDim.x)
         {
             int token_idx          = first_token_idx + idx * vec_size / head_dim;
             int head_offset        = (idx * vec_size) % head_dim;
             int block_offset_local = (token_idx - first_token_idx + block_offset) & page_mask;
-
             int64_t offsetWarp = (token_idx * num_heads * head_dim + localHeadIdx * head_dim) / vec_size;
             elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + head_offset / vec_size];
-            // vec_size=8, x=16: head_offset can be 0,8,16,...; need head_offset_modX when head_offset=8,24,...
-            int head_offset_divX = head_offset >> x_shift;
-            int head_offset_modX = head_offset & x_mask;
-            int64_t vec_offset = cache_offset + head_offset_divX * page_size * x + block_offset_local * x + head_offset_modX;
+            int64_t vec_offset = cache_offset + (head_offset / X) * page_size * X + block_offset_local * X + head_offset % X;
             if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
             {
                 *reinterpret_cast<ltype*>(k_cache + vec_offset) = elements;
@@ -746,7 +705,6 @@
                 for(int j = 0; j < vec_size; j++)
                 {
                     out_vec[j] = opus::cast<kv_cache_scalar_t>(float(elements[j]) * inv_scale_val);
-
                 }
                 *reinterpret_cast<kv_cache_ltype*>(k_cache + vec_offset) = out_vec;
             }
@@ -759,29 +717,20 @@
         if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
         {
             v_scale_val = block_max / dtype_max;
-            // Fix: correct scale index calculation [num_blocks, num_kv_heads]
             inv_scale_val = dtype_max / block_max;
-            int64_t scale_offset = block_idx * num_kv_heads + headIdx;
-            // Handle incremental updates: check for scale conflicts
+            int64_t scale_offset = block_idx * num_heads_k + headIdx;
             if(block_offset > 0)
             {
                 float v_scale_global = v_scale[scale_offset];
-
                 if(v_scale_global < v_scale_val)
                 {
-                    // New data has larger dynamic range, need to requantize old data
+                    // v_cache layout: [num_blocks, num_heads_k, page_size//X, head_size, X]
                     int64_t cache_base = block_idx * page_size * num_heads_v * head_dim +
                                         headIdx * head_dim * page_size;
-                    // Requantize existing data [0, block_offset) - vec load/store
-                    // v_cache [num_blocks, num_kv_heads, block_size//x, head_size, x]
-                    // For fixed (block_offset_divX, head_offset), x-dim is consecutive -> vec friendly
-                    int const v_x_mask     = x - 1;
-                    int const v_x_shift    = __builtin_ctz(x);
-                    int vec_per_x         = x / vec_size;
-                    int vecs_per_bh     = vec_per_x * head_dim;
-                    int n_full_blocks   = block_offset >> v_x_shift;
+                    float rescale = v_scale_global * inv_scale_val;
+                    constexpr int vecs_per_bh = (X / vec_size) * head_dim;
+                    int n_full_blocks   = block_offset / X;
                     int full_vecs       = n_full_blocks * vecs_per_bh;
-
                     for(int idx = threadIdx.x; idx < full_vecs; idx += blockDim.x)
                     {
                         kv_cache_ltype data =
@@ -789,30 +738,27 @@
                         #pragma unroll
                         for(int j = 0; j < vec_size; j++)
                         {
-                            float tmp = opus::cast<float>(data[j]);
-                            tmp       = tmp * v_scale_global * inv_scale_val;
-                            data[j]   = opus::cast<kv_cache_scalar_t>(tmp);
+                            data[j] = opus::cast<kv_cache_scalar_t>(
+                                opus::cast<float>(data[j]) * rescale);
                         }
                         *reinterpret_cast<kv_cache_ltype*>(v_cache + cache_base + idx * vec_size) = data;
                     }
-                    // Last partial block (only when block_offset % x != 0): vec + scalar tail
-                    if((block_offset & v_x_mask) != 0) {
-                        int last_block_divX = (block_offset - 1) >> v_x_shift;
-                        int last_x_idx      = (block_offset - 1) & v_x_mask;
+                    if((block_offset % X) != 0) {
+                        int last_block_divX = (block_offset - 1) / X;
+                        int last_x_idx      = (block_offset - 1) % X;
                         int last_full_vec   = (last_x_idx + 1) / vec_size;
                         int partial_vecs   = last_full_vec * head_dim;
                         for(int idx = threadIdx.x; idx < partial_vecs; idx += blockDim.x) {
                             int head_offset = idx / last_full_vec;
                             int vec_chunk   = idx % last_full_vec;
-                            int64_t vec_off = cache_base + last_block_divX * head_dim * x +
-                                              head_offset * x + vec_chunk * vec_size;
+                            int64_t vec_off = cache_base + last_block_divX * head_dim * X +
+                                              head_offset * X + vec_chunk * vec_size;
                             kv_cache_ltype data =
                                 *reinterpret_cast<kv_cache_ltype*>(&v_cache[vec_off]);
                             #pragma unroll
                             for(int j = 0; j < vec_size; j++) {
-                                float tmp = opus::cast<float>(data[j]);
-                                tmp       = tmp * v_scale_global * inv_scale_val;
-                                data[j]   = opus::cast<kv_cache_scalar_t>(tmp);
+                                data[j] = opus::cast<kv_cache_scalar_t>(
+                                    opus::cast<float>(data[j]) * rescale);
                             }
                             *reinterpret_cast<kv_cache_ltype*>(&v_cache[vec_off]) = data;
                         }
@@ -820,51 +766,40 @@
                         for(int idx = threadIdx.x; idx < tail_count; idx += blockDim.x) {
                             int head_offset = idx % head_dim;
                             int x_idx       = last_full_vec * vec_size + idx / head_dim;
-                            int64_t v_base  = cache_base + last_block_divX * head_dim * x +
-                                              head_offset * x + x_idx;
-                            float tmp = opus::cast<float>(v_cache[v_base]);
-                            tmp       = tmp * v_scale_global * inv_scale_val;
-                            v_cache[v_base] = opus::cast<kv_cache_scalar_t>(tmp);
+                            int64_t v_base  = cache_base + last_block_divX * head_dim * X +
+                                              head_offset * X + x_idx;
+                            v_cache[v_base] = opus::cast<kv_cache_scalar_t>(
+                                opus::cast<float>(v_cache[v_base]) * rescale);
                         }
                     }
                     v_scale[scale_offset] = v_scale_val;
-
                 }
                 else
                 {
-                    // Old scale is sufficient, use it for new data
                     v_scale_val   = v_scale_global;
-                    inv_scale_val = 1.0f / v_scale_global;  // Must use global scale for quant
+                    inv_scale_val = 1.0f / v_scale_global;
                 }
             }
             else
             {
-                // New block, directly write scale
                 v_scale[scale_offset] = v_scale_val;
             }
         }
         int64_t cache_offset = block_idx * page_size * num_heads_v * head_dim +
                                headIdx * head_dim * page_size;
         int64_t total_elements = numtokens_in_block * head_dim;
-        int const v_x_mask     = x - 1;
-        int const v_x_shift    = __builtin_ctz(x);
-
         for(int64_t idx = threadIdx.x; idx < total_elements / vec_size; idx += blockDim.x)
         {
             int token_idx          = first_token_idx + idx * vec_size / head_dim;
             int head_offset        = (idx * vec_size) % head_dim;
             int block_offset_local = (token_idx - first_token_idx + block_offset) & page_mask;
-            int block_offset_divX  = block_offset_local >> v_x_shift;
-            int x_idx              = block_offset_local & v_x_mask;
-            int64_t v_base         = cache_offset + block_offset_divX * head_dim * x + head_offset * x + x_idx;
-
+            int64_t v_base         = cache_offset + (block_offset_local / X) * head_dim * X + head_offset * X + block_offset_local % X;
             int64_t offsetWarp = (token_idx * num_heads * head_dim + localHeadIdx * head_dim) / vec_size;
             elements = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + head_offset / vec_size];
-
 #pragma unroll
             for(int j = 0; j < vec_size; j++)
             {
-                int64_t offset = v_base + j * x;
+                int64_t offset = v_base + j * X;
                 if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
                 {
                     v_cache[offset] = elements[j];
@@ -878,7 +813,6 @@
         }
     }
 }
-
  #define DISPATCH_KV_HEAD(num_kv_heads, ...)                             \
      if(num_kv_heads == 1)                                               \
      {                                                                   \
@@ -1066,49 +1000,97 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
                                             int page_size,
                                             int x,
                                             int batch_size,
+                                            int max_tokens_per_batch,
                                             hipStream_t stream)
 {
-    // blockSize (wg_size): match page_size when sufficient for reduce_per_group.
-    // When page_size < 64 and head_thread > page_size (e.g. head_dim=256, page_size=16),
-    // use 64 threads so reduce_per_group has enough lanes.
     int blockSize = page_size < 64 ? 64 : page_size;
 
-    // Kernel uses cum_blocks: each batch needs ceil(seq_len_i/blockSize) + 1 blocks.
-    int const gridSize = (num_tokens + page_size - 1) / page_size + 2 * batch_size;
-    dim3 gridDim(1, gridSize, num_heads_q + num_heads_k + num_heads_v);
+    // Three batch-mapping modes, chosen at launch time:
+    //
+    // Mode A: best when max_tpb < page_size (gridSizeY small, each batch few Y-blocks)
+    // Mode B: best when max_tpb known but large (no prefix-sum, simple division)
+    // Mode C: only when max_tpb unknown AND avg >= page_size
+    int max_tpb = max_tokens_per_batch > 0
+        ? max_tokens_per_batch
+        : (batch_size > 0 ? (num_tokens + batch_size - 1) / batch_size : num_tokens);
+    int gridSizeY_decode  = (max_tpb + page_size - 1) / page_size + 1;
+    int gridSizeY_general = (num_tokens + page_size - 1) / page_size + 2 * batch_size;
+
+    int gridSizeY;
+    int gridDimX;
+    int blocks_per_batch_param = 0; // 0 = not using uniform division
+
+    if(batch_size > 1 && max_tpb < page_size)
+    {
+        // Mode A: decode fast path — batch_id = blockIdx.x
+        gridDimX = batch_size;
+        gridSizeY = gridSizeY_decode;
+    }
+    else if(batch_size > 1)
+    {
+        // Mode B: uniform division — batch_id = blockIdx.y / blocks_per_batch
+        // When max_tokens_per_batch provided: use actual max (exact).
+        // When max_tokens_per_batch=0: use num_tokens as conservative upper bound
+        // (safe for any distribution; may over-allocate Y-blocks for small batches).
+        gridDimX = 1;
+        blocks_per_batch_param = max_tokens_per_batch > 0
+            ? gridSizeY_decode
+            : ((num_tokens + page_size - 1) / page_size + 1);
+        gridSizeY = batch_size * blocks_per_batch_param;
+    }
+    else
+    {
+        // batch_size <= 1: single batch, batch_id = 0
+        gridDimX = 1;
+        gridSizeY = (num_tokens + page_size - 1) / page_size + 1;
+    }
+
+    dim3 gridDim(gridDimX, gridSizeY, num_heads_q + num_heads_k + num_heads_v);
     dim3 blockDim(blockSize);
+
+#define DISPATCH_X_VALUE(x_val, ...)                                            \
+    if(x_val == 16) { constexpr int X_VAL = 16; __VA_ARGS__ }                  \
+    else if(x_val == 8) { constexpr int X_VAL = 8; __VA_ARGS__ }               \
+    else if(x_val == 4) { constexpr int X_VAL = 4; __VA_ARGS__ }               \
+    else { TORCH_CHECK(false, "Unsupported x: ", x_val); }
+
+#define DISPATCH_INTERLEAVE_BQ(interleave, ...)                                 \
+    if(interleave) { const bool INTERLEAVE = true; __VA_ARGS__ }                \
+    else           { const bool INTERLEAVE = false; __VA_ARGS__ }
+
+#define LAUNCH_BLOCK_QUANT_ARGS                                                 \
+                                                       num_heads_q,             \
+                                                       num_heads_k,             \
+                                                       num_heads_v,             \
+                                                       eps,                     \
+                                                       q_weight,                \
+                                                       k_weight,                \
+                                                       cos_sin_cache,           \
+                                                       position_ids,            \
+                                                       k_cache,                 \
+                                                       v_cache,                 \
+                                                       slot_mapping,            \
+                                                       cu_q_len,                \
+                                                       k_scale,                 \
+                                                       v_scale,                 \
+                                                       num_tokens,              \
+                                                       page_size,               \
+                                                       batch_size,              \
+                                                       blocks_per_batch_param
+
 #define LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, WG_SIZE)                            \
-        DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {                           \
-            fusedQKNormRopeBlockQuantCacheShuffleKernel<scalar_t,               \
-                                                       kv_cache_scalar_t,      \
-                                                       HEAD_DIM,               \
-                                                       INTERLEAVE,             \
-                                                       NUM_KV_HEADS,           \
-                                                       WG_SIZE,                \
-                                                       kv_dt>                  \
-                <<<gridDim, blockDim, 0, stream>>>(qkv,                        \
-                                                   num_heads_q,                \
-                                                   num_heads_k,                \
-                                                   num_heads_v,                \
-                                                   eps,                        \
-                                                   q_weight,                   \
-                                                   k_weight,                   \
-                                                   cos_sin_cache,              \
-                                                   position_ids,               \
-                                                   k_cache,                    \
-                                                   v_cache,                    \
-                                                   slot_mapping,               \
-                                                   cu_q_len,                   \
-                                                   k_scale,                    \
-                                                   v_scale,                    \
-                                                   num_tokens,                 \
-                                                   page_size,                  \
-                                                   x,                          \
-                                                   batch_size);                \
+        DISPATCH_INTERLEAVE_BQ(interleave, {                                    \
+            DISPATCH_X_VALUE(x, {                                               \
+                fusedQKNormRopeBlockQuantCacheShuffleKernel<scalar_t,            \
+                    kv_cache_scalar_t, HEAD_DIM, INTERLEAVE,                    \
+                    X_VAL, WG_SIZE, kv_dt>                                      \
+                    <<<gridDim, blockDim, 0, stream>>>(qkv,                     \
+                        LAUNCH_BLOCK_QUANT_ARGS);                               \
+            });                                                                 \
         });
 
 #define DISPATCH_BLOCK_SIZE(HEAD_DIM)                                            \
-    if(blockSize == 64) { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 64)  }       \
+    if(blockSize == 64) { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 64) }             \
     else if(blockSize == 128) { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 128) }      \
     else if(blockSize == 256) { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 256) }      \
     else { TORCH_CHECK(false, "Unsupported blockSize: ", blockSize); }
@@ -1121,6 +1103,8 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
         
 #undef LAUNCH_BLOCK_QUANT_KERNEL
 #undef DISPATCH_BLOCK_SIZE
+#undef DISPATCH_X_VALUE
+#undef DISPATCH_INTERLEAVE_BQ
     default: TORCH_CHECK(false, "Unsupported head dimension for fusedQKNormRope: ", head_dim);
     }
 }
@@ -1170,6 +1154,7 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
              page_size,                                                    \
              x,                                                            \
              batch_size,                                                   \
+             max_tokens_per_batch,                                         \
              stream);
 
 #define CALL_QK_NORM_ROPE_CACHE_QUANT(SRC_T, CACHE_T, KV_DTYPE)       \
@@ -1793,7 +1778,8 @@ void fused_qk_norm_rope_cache_block_quant_shuffle(
     at::Tensor& cu_q_len,              // cu q len tensor [0, batch0_seq_len, batch0_seq_len + batch1_seq_len, ...]
     const std::string& kv_cache_dtype, // kv cache data type
     std::optional<at::Tensor> k_scale, // k scale tensor for quantized k cache
-    std::optional<at::Tensor> v_scale  // v scale tensor for quantized v cache
+    std::optional<at::Tensor> v_scale, // v scale tensor for quantized v cache
+    int64_t max_tokens_per_batch       // max tokens in any single batch (0 = use avg, safe for uniform distributions)
 )
  {
      // Input validation

@@ -48,6 +48,7 @@ def fused_qk_norm_rope_cache_block_quant_shuffle(
     kv_cache_dtype: str,
     k_scale: Tensor,
     v_scale: Tensor,
+    max_tokens_per_batch: int = 0,
 ) -> None: ...
 
 

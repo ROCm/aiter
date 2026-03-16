@@ -128,9 +128,19 @@ def pa_fwd_asm(
 def _should_use_asm_kernel(
     num_seqs: int,
     num_heads: int,
+    head_size: int,
     kv_cache_tensor_dtype: torch.dtype,
+    high_precision: int,
 ) -> bool:
+    # ASM kernel only supports head_size == 128; all other head sizes use HIP.
+    if head_size != 128:
+        return False
 
+    # high_precision == 2 forces ASM for maximum precision (fp8 kvcache only)
+    if high_precision == 2:
+        return True
+
+    # int8 kv cache always uses ASM
     if kv_cache_tensor_dtype == torch.int8:
         return True
 
@@ -183,9 +193,8 @@ def paged_attention_common(
     )
     num_seqs, num_heads, head_size = Q.shape
 
-    use_asm_kernel = (
-        _should_use_asm_kernel(num_seqs, num_heads, kv_cache_tensor_dtype)
-        or high_precision == 2
+    use_asm_kernel = _should_use_asm_kernel(
+        num_seqs, num_heads, head_size, kv_cache_tensor_dtype, high_precision
     )
 
     if use_asm_kernel:
@@ -578,6 +587,8 @@ def mla_decode_stage1_asm_fwd(
     splitLse: torch.Tensor,
     output: torch.Tensor,
     # [batch_size, num_heads, v_head_dim]
+    lse: Optional[torch.Tensor] = None,
+    # [batch_size, num_heads]
     q_scale: Optional[torch.Tensor] = None,
     kv_scale: Optional[torch.Tensor] = None,
     # [1] pertensor
