@@ -467,11 +467,25 @@ def mp_tuner(
                 if is_mapping_error:
                     error_msg = f"[Mapping Error] Task {k} - Process PID not in GPU map (triggering pool restart): {error_type} - {e}"
                     dummy_failed_tasks.append((k, "mapping error"))
-                    # pool_restart_needed = True
+
+                    dummy_results = []
+                    add_dummy_result(k, dummy_results)
+                    result_dict[k] = (
+                        dummy_results if shape_grouped else [dummy_results[0]]
+                    )
+                    completed_this_round.append((k, async_result))
+                    pool_restart_needed = True
                 else:
                     error_msg = f"[Failed] Task {k} failed with {error_type}: {e}"
-                    failed_tasks.append((k, "timeout"))
+                    failed_tasks.append((k, "crash"))
+
+                    dummy_results = []
+                    add_dummy_result(k, dummy_results)
+                    result_dict[k] = (
+                        dummy_results if shape_grouped else [dummy_results[0]]
+                    )
                     completed_this_round.append((k, async_result))
+                    pool_restart_needed = True
 
                 # Only log error once per error type
                 if error_type not in logged_error_types:
@@ -529,6 +543,11 @@ def mp_tuner(
     result = []
     for k in range(len(rets)):
         task_result = result_dict.get(k, [])
+        if not task_result:
+            dummy_results = []
+            add_dummy_result(k, dummy_results)
+            task_result = dummy_results if shape_grouped else [dummy_results[0]]
+            logger.warning(f"Task {k} had no result during reconstruction, using dummy")
         if shape_grouped:
             result.extend(task_result)
         else:

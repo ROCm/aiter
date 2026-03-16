@@ -327,8 +327,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             N = untunedf.loc[i, "N"]
             K = untunedf.loc[i, "K"]
             seed = seed + 1
-            total_kernel_nums = 0
-            # kernels_num = len(candidate_kernels_dict)
+            task_count_before = len(task)
             info_keys = (cu_num, M, N, K)
             if args.libtype == "ck" or args.libtype == "both":
                 task.extend(
@@ -354,9 +353,9 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                             info_keys, useSplitK, seed, preshuffleB
                         )
                     )
-            total_kernel_nums = len(task)
+            kernels_for_shape = len(task) - task_count_before
 
-            tasks_data.append((total_kernel_nums, ()))
+            tasks_data.append((kernels_for_shape, ()))
         ret = []
         if task:
             ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)
