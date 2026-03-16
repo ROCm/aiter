@@ -992,7 +992,8 @@
             "f'{AITER_CSRC_DIR}/pybind/mha_bwd_asm_pybind.cu'"
         ],
         "flags_extra_cc": [
-            "'-DONLY_FAV3=1'"
+            "'-DONLY_FAV3=1'",
+            "'-DDISABLE_CK=1'"
         ],
         "flags_extra_hip": [],
         "extra_ldflags": "None",
@@ -1010,7 +1011,8 @@
             "f'{AITER_CSRC_DIR}/pybind/mha_varlen_bwd_asm_pybind.cu'"
         ],
         "flags_extra_cc": [
-            "'-DONLY_FAV3=1'"
+            "'-DONLY_FAV3=1'",
+            "'-DDISABLE_CK=1'"
         ],
         "flags_extra_hip": [],
         "extra_ldflags": "None",

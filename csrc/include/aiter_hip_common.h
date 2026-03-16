@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #include "aiter_logger.h"
-#if ONLY_FAV3
+#if DISABLE_CK
 #include "ck_tile_shim.h"
 #else
 #include "ck_tile/core.hpp"
