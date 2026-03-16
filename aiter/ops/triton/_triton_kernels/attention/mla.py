@@ -51,8 +51,25 @@ def _find_seq_idx(
     return left - 1
 
 
-@triton.jit
-def _mla_2d_kernel(
+_mla_prefill_fwd_kernel_repr = make_kernel_repr(
+    "_mla_prefill_fwd_kernel",
+    [
+        "num_query_heads",
+        "num_kv_heads",
+        "TILE_SIZE",
+        "KV_LORA_RANK",
+        "QK_ROPE_HEAD_DIM",
+        "BLOCK_Q",
+        "BLOCK_M",
+        "NUM_SEGMENTS_PER_SEQ",
+        "num_warps",
+        "num_stages",
+    ],
+)
+
+
+@triton.jit(repr=_mla_prefill_fwd_kernel_repr)
+def _mla_prefill_fwd_kernel(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
     query_ptr,  # [num_tokens, num_query_heads, head_size]
     kv_buffer_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
@@ -63,7 +80,7 @@ def _mla_2d_kernel(
     kv_scale_ptr,  # float32
     out_scale_ptr,  # float32
     num_query_heads: tl.constexpr,  # int
-    num_queries_per_kv: tl.constexpr,  # int
+    num_kv_heads: tl.constexpr,  # int
     block_tables_stride: tl.int64,  # int
     query_stride_0: tl.int64,  # int
     query_stride_1: tl.int64,  # int, should be equal to head_size
@@ -129,6 +146,8 @@ def _mla_2d_kernel(
     offs_lora_rank = tl.arange(0, KV_LORA_RANK)
     offs_rope_head_dim = tl.arange(0, QK_ROPE_HEAD_DIM)
     offs_t = tl.arange(0, TILE_SIZE)
+
+    num_queries_per_kv: tl.constexpr = num_query_heads // num_kv_heads
     query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
 
     query_offset_0 = cur_batch_in_all_start_index + query_pos
@@ -245,7 +264,7 @@ def _mla_2d_kernel(
         # alpha : (BLOCK_M, )
         alpha = tl.math.exp2(M - m_j)
 
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+        # acc : (BLOCK_M, KV_LORA_RANK)
         acc = acc * alpha[:, None]
 
         # update constants
@@ -281,23 +300,26 @@ def _mla_2d_kernel(
     )
 
 
-# kernel_unified_attention_3d_repr = make_kernel_repr(
-#     "kernel_unified_attention_3d",
-#     [
-#         "num_query_heads",
-#         "num_queries_per_kv",
-#         "BLOCK_SIZE",
-#         "TILE_SIZE",
-#         "HEAD_SIZE",
-#         "num_warps",
-#         "num_stages",
-#         "SHUFFLED_KV_CACHE",
-#     ],
-# )
+_mla_decode_fwd_kernel_repr = make_kernel_repr(
+    "_mla_decode_fwd_kernel",
+    [
+        "num_query_heads",
+        "num_kv_heads",
+        "num_tokens_per_seq",
+        "TILE_SIZE",
+        "KV_LORA_RANK",
+        "QK_ROPE_HEAD_DIM",
+        "BLOCK_Q",
+        "BLOCK_M",
+        "NUM_SEGMENTS_PER_SEQ",
+        "num_warps",
+        "num_stages",
+    ],
+)
 
 
-@triton.jit()
-def _mla_3d_kernel(
+@triton.jit(repr=_mla_decode_fwd_kernel_repr)
+def _mla_decode_fwd_kernel(
     segm_output_ptr,  # [total_num_tokens, num_query_heads, KV_LORA_RANK + qk_rope_head_dim]
     segm_max_ptr,  # [total_num_tokens, num_query_heads, num_segments]
     segm_expsum_ptr,  # [total_num_tokens, num_query_heads, num_segments]
@@ -309,7 +331,7 @@ def _mla_3d_kernel(
     q_scale_ptr,  # float32
     kv_scale_ptr,  # float32
     num_query_heads: tl.constexpr,  # int
-    num_queries_per_kv: tl.constexpr,  # int
+    num_kv_heads: tl.constexpr,  # int
     block_tables_stride: tl.int64,  # int
     query_stride_0: tl.int64,  # int
     query_stride_1: tl.int64,  # int, should be equal to head_size
@@ -374,6 +396,7 @@ def _mla_3d_kernel(
     offs_rope_head_dim = tl.arange(0, QK_ROPE_HEAD_DIM)
     offs_t = tl.arange(0, TILE_SIZE)
 
+    num_queries_per_kv: tl.constexpr = num_query_heads // num_kv_heads
     query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
 
     query_offset_0 = q_start_idx + query_pos
@@ -489,7 +512,7 @@ def _mla_3d_kernel(
         # alpha : (BLOCK_M, )
         alpha = tl.math.exp2(M - m_j)
 
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+        # acc : (BLOCK_M, KV_LORA_RANK)
         acc = acc * alpha[:, None]
 
         # update constants
@@ -525,7 +548,7 @@ def _mla_3d_kernel(
 
 
 @triton.jit
-def _mla_3d_reduce_kernel(
+def _mla_decode_fwd_reduce_kernel(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
     segm_output_ptr,
     # [num_tokens, num_query_heads, max_num_segments, head_size]

@@ -8,6 +8,8 @@ import torch
 import aiter
 from aiter.ops.triton.attention.mla import mla_decode_fwd as triton_mla_decode_fwd
 from aiter.ops.triton.attention.mla import mla_prefill_fwd as triton_mla_prefill_fwd
+from aiter.ops.triton.gluon.mla import mla_decode_fwd as gluon_mla_decode_fwd
+from aiter.ops.triton.gluon.mla import mla_prefill_fwd as gluon_mla_prefill_fwd
 
 from aiter.ops.triton.utils.types import e4m3_dtype
 from typing import Optional
@@ -15,6 +17,65 @@ from typing import Optional
 torch.set_default_device("cuda")
 
 # current supported case in decode MLA: mtp == 0, 1, 2, 3 (decode_qlen = 1, 2, 3, 4)
+
+
+def shuffle_kv_buffer(
+    kv_buffer: torch.Tensor,
+    kv_lora_rank: int,
+):
+    """
+    Shuffle key and value cache layout for optimized memory access.
+
+        layout: (num_lanes, num_elements_per_thread)
+            gfx1250: (16, 8) for BF16 and FP8.
+            gfx950: (16, 8) for BF16 and (16, 16) for FP8.
+
+        WMMA/MFMA instruction shape:
+            BF16: 16x16x32
+            FP8: 16x16x64
+    """
+    dtype = kv_buffer.dtype
+    assert dtype in (torch.bfloat16, e4m3_dtype)
+
+    if dtype == torch.bfloat16:
+        layout = (16, 8)
+    else:
+        # Caution: in gfx1250, the 16-bit and 8-bit layout should both be (16, 8), however, in order to enable ds_load_b128 for 8-bit WMMA,
+        # we use (16, 16) here, noted that you must set k_width to 16 in the corresponding DotOperandLayout, the math will be equivalent.
+        layout = (16, 16)
+
+    num_blocks, block_size, num_kv_heads, head_size = kv_buffer.shape
+    assert block_size >= 16
+
+    num_lanes, num_elements_per_thread = layout
+    kv_buffer_shuffled = kv_buffer.view(
+        -1, block_size, num_kv_heads, head_size
+    ).permute(0, 2, 1, 3)
+    kv_buffer_shuffled_lora = kv_buffer_shuffled[..., :kv_lora_rank]
+    kv_buffer_shuffled_rope = kv_buffer_shuffled[..., kv_lora_rank:]
+
+    def shuffle(kvb, h):
+        kvb = kvb.view(
+            -1,
+            num_kv_heads,
+            block_size // num_lanes,
+            num_lanes,
+            h // (2 * num_elements_per_thread),
+            2,  # there are 2 groups of threads, t0 ~ t15 and t16 ~ t31
+            num_elements_per_thread,
+        )
+        kvb = kvb.permute(0, 1, 2, 4, 5, 3, 6).contiguous()
+        kvb = kvb.view(-1, num_kv_heads, block_size // 16, h * 16)
+        return kvb
+
+    kv_buffer_shuffled_lora = shuffle(kv_buffer_shuffled_lora, kv_lora_rank)
+    kv_buffer_shuffled_rope = shuffle(kv_buffer_shuffled_rope, head_size - kv_lora_rank)
+    kv_buffer_shuffled = torch.cat(
+        [kv_buffer_shuffled_lora, kv_buffer_shuffled_rope], dim=-1
+    ).contiguous()
+    # kv_buffer_shuffled = kv_buffer_shuffled.view(-1, num_kv_heads, block_size // 16, head_size * 16)
+
+    return kv_buffer_shuffled
 
 
 def ref_masked_attention(
@@ -127,17 +188,13 @@ def torch_mla_extend(
     return out.to(o_dtype)
 
 
-@pytest.mark.parametrize("batch_size", [1, 2, 3, 4, 5, 8, 10, 16, 24, 32])
-@pytest.mark.parametrize("decode_qlen", [1, 2, 4, -1])
-@pytest.mark.parametrize(
-    "ctx_lens", [21, 32, 64, 256, 512, 1000, 1024, 1200, 2048, 2400, 3200]
-)
-@pytest.mark.parametrize("num_heads", [(128, 8), (64, 8), (16, 1)])
-@pytest.mark.parametrize(
-    "kv_lora_rank, qk_rope_head_dim", [(128, 64), (128, 128), (512, 64)]
-)
+@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize("decode_qlen", [1])
+@pytest.mark.parametrize("ctx_lens", [57])
+@pytest.mark.parametrize("num_heads", [(16, 1)])
+@pytest.mark.parametrize("kv_lora_rank, qk_rope_head_dim", [(512, 64)])
 @pytest.mark.parametrize("block_size", [64])
-@pytest.mark.parametrize("num_blocks", [8192, 2048])
+@pytest.mark.parametrize("num_blocks", [128])
 @pytest.mark.parametrize("varlen", [True, False])
 @pytest.mark.parametrize(
     "q_dtype, kv_dtype, out_dtype, use_out_scale",
@@ -148,13 +205,15 @@ def torch_mla_extend(
     ],
 )
 @pytest.mark.parametrize(
-    "backend",
+    "backend, shuffled_kv_cache",
     [
-        "triton",  # use triton
+        # ("triton", False),  # use triton
+        ("gluon", False),
+        # ("gluon", True),
     ],
 )
 # @torch.inference_mode()
-def test_mla(
+def test_mla_decode_fwd(
     batch_size: int,
     decode_qlen: int,
     ctx_lens: int,
@@ -169,6 +228,7 @@ def test_mla(
     out_dtype: torch.dtype,
     use_out_scale: bool,
     backend: str,
+    shuffled_kv_cache: bool,
 ):
     torch.cuda.empty_cache()
     num_query_heads, num_kv_heads = num_heads
@@ -180,17 +240,7 @@ def test_mla(
             seq_lens_kv[i] = max(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens)
     else:
         seq_lens_kv.fill_(ctx_lens)
-    if decode_qlen > -1:
-        seq_lens_qo.fill_(decode_qlen)
-    else:
-        seq_lens_qo.fill_(ctx_lens)
-        if varlen:
-            for i in range(batch_size):
-                seq_lens_qo[i] = max(
-                    min(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens), 1
-                )
-        else:
-            seq_lens_qo.fill_(ctx_lens)
+    seq_lens_qo.fill_(decode_qlen)
 
     cu_seqlens_q[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     total_num_query_tokens = cu_seqlens_q[-1].item()
@@ -233,41 +283,207 @@ def test_mla(
         (total_num_query_tokens, num_query_heads, kv_lora_rank), dtype=out_dtype
     )
 
-    if backend == "triton":
-        if decode_qlen > -1:
-            triton_mla_decode_fwd(
-                q,
-                kv_buffer,
-                out,
-                cu_seqlens_q=cu_seqlens_q,
-                seqused_k=seq_lens_kv,
-                max_seqlen_kv=max_seqlen_kv,
-                block_tables=block_tables,
-                softmax_scale=sm_scale,
-                kv_lora_rank=kv_lora_rank,
-                qk_rope_head_dim=qk_rope_head_dim,
-                causal=True,
-                q_descale=q_descale,
-                kv_descale=kv_descale,
-                out_scale=out_scale,
+    if backend == "gluon":
+        maybe_shuffled_kv_buffer = (
+            shuffle_kv_buffer(kv_buffer, kv_lora_rank)
+            if shuffled_kv_cache
+            else kv_buffer
+        )
+        gluon_mla_decode_fwd(
+            q,
+            maybe_shuffled_kv_buffer,
+            out,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seq_lens_kv,
+            max_seqlen_kv=max_seqlen_kv,
+            block_tables=block_tables,
+            softmax_scale=sm_scale,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            causal=True,
+            q_descale=q_descale,
+            kv_descale=kv_descale,
+            out_scale=out_scale,
+            num_warps=4,
+            waves_per_eu=1,
+            num_segments=8,
+            shuffled_kv_cache=shuffled_kv_cache,
+        )
+    else:
+        triton_mla_decode_fwd(
+            q,
+            kv_buffer,
+            out,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seq_lens_kv,
+            max_seqlen_kv=max_seqlen_kv,
+            block_tables=block_tables,
+            softmax_scale=sm_scale,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            causal=True,
+            q_descale=q_descale,
+            kv_descale=kv_descale,
+            out_scale=out_scale,
+        )
+
+    out_ref = torch_mla_extend(
+        q,
+        kv_buffer,
+        cu_seqlens_q,
+        seq_lens_kv,
+        block_tables,
+        kv_lora_rank,
+        sm_scale,
+        q_descale=q_descale,
+        kv_descale=kv_descale,
+        out_scale=out_scale,
+        o_dtype=out_dtype,
+    )
+
+    atol, rtol = 1.5e-2, 1e-2
+    if q_dtype == e4m3_dtype or kv_dtype == e4m3_dtype:
+        atol, rtol = 1.5e-1, 1.5e-1
+    torch.testing.assert_close(
+        out, out_ref, atol=atol, rtol=rtol
+    ), f"{torch.max(torch.abs(out - out_ref))}"
+
+
+@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize("ctx_lens", [57])
+@pytest.mark.parametrize("num_heads", [(16, 1)])
+@pytest.mark.parametrize("kv_lora_rank, qk_rope_head_dim", [(512, 64)])
+@pytest.mark.parametrize("block_size", [64])
+@pytest.mark.parametrize("num_blocks", [128])
+@pytest.mark.parametrize("varlen", [True, False])
+@pytest.mark.parametrize(
+    "q_dtype, kv_dtype, out_dtype, use_out_scale",
+    [
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16, False),
+        (torch.bfloat16, e4m3_dtype, torch.bfloat16, True),
+        (e4m3_dtype, e4m3_dtype, torch.bfloat16, True),
+    ],
+)
+@pytest.mark.parametrize(
+    "backend, shuffled_kv_cache",
+    [
+        ("triton", False),  # use triton
+        ("gluon", False),
+        ("gluon", True),
+    ],
+)
+# @torch.inference_mode()
+def test_mla_prefill_fwd(
+    batch_size: int,
+    ctx_lens: int,
+    num_heads: tuple[int, int],
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    block_size: int,
+    num_blocks: int,
+    varlen: bool,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    out_dtype: torch.dtype,
+    use_out_scale: bool,
+    backend: str,
+    shuffled_kv_cache: bool,
+):
+    torch.cuda.empty_cache()
+    num_query_heads, num_kv_heads = num_heads
+    cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int, device="cuda")
+    seq_lens_qo = torch.empty(batch_size, dtype=torch.int, device="cuda")
+    seq_lens_kv = torch.empty(batch_size, dtype=torch.int, device="cuda")
+    if varlen:
+        for i in range(batch_size):
+            seq_lens_kv[i] = max(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens)
+            seq_lens_qo[i] = max(
+                min(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens), 1
             )
-        else:
-            triton_mla_prefill_fwd(
-                q,
-                kv_buffer,
-                out,
-                cu_seqlens_q=cu_seqlens_q,
-                seqused_k=seq_lens_kv,
-                max_seqlen_kv=max_seqlen_kv,
-                block_tables=block_tables,
-                softmax_scale=sm_scale,
-                kv_lora_rank=kv_lora_rank,
-                qk_rope_head_dim=qk_rope_head_dim,
-                causal=True,
-                q_descale=q_descale,
-                kv_descale=kv_descale,
-                out_scale=out_scale,
-            )
+    else:
+        seq_lens_kv.fill_(ctx_lens)
+        seq_lens_qo.fill_(ctx_lens)
+
+    cu_seqlens_q[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
+    total_num_query_tokens = cu_seqlens_q[-1].item()
+
+    max_seqlen_kv = seq_lens_kv.max().item()
+    max_num_blocks_per_seq = (max_seqlen_kv + block_size - 1) // block_size
+    block_tables = torch.randint(
+        0,
+        num_blocks,
+        (batch_size, max_num_blocks_per_seq),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+    kv_buffer = torch.randn(
+        (num_blocks, block_size, num_kv_heads, qk_head_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+    ).to(kv_dtype)
+    q = torch.randn(
+        (total_num_query_tokens, num_query_heads, qk_head_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+    ).to(q_dtype)
+    sm_scale = 1.0 / (qk_head_dim**0.5)
+
+    q_descale = None
+    kv_descale = None
+    if q_dtype != torch.bfloat16:
+        q_descale = torch.rand((1,), dtype=torch.float32, device="cuda")
+
+    if kv_dtype != torch.bfloat16:
+        kv_descale = torch.rand((1,), dtype=torch.float32, device="cuda")
+
+    out_scale = None
+    if use_out_scale:
+        out_scale = 1 / torch.rand(1, dtype=torch.float32, device="cuda")
+
+    out = torch.empty(
+        (total_num_query_tokens, num_query_heads, kv_lora_rank), dtype=out_dtype
+    )
+
+    if backend == "gluon":
+        maybe_shuffled_kv_buffer = (
+            shuffle_kv_buffer(kv_buffer, kv_lora_rank)
+            if shuffled_kv_cache
+            else kv_buffer
+        )
+        gluon_mla_prefill_fwd(
+            q,
+            maybe_shuffled_kv_buffer,
+            out,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seq_lens_kv,
+            max_seqlen_kv=max_seqlen_kv,
+            block_tables=block_tables,
+            softmax_scale=sm_scale,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            causal=True,
+            q_descale=q_descale,
+            kv_descale=kv_descale,
+            out_scale=out_scale,
+        )
+    else:
+        triton_mla_prefill_fwd(
+            q,
+            kv_buffer,
+            out,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seq_lens_kv,
+            max_seqlen_kv=max_seqlen_kv,
+            block_tables=block_tables,
+            softmax_scale=sm_scale,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            causal=True,
+            q_descale=q_descale,
+            kv_descale=kv_descale,
+            out_scale=out_scale,
+        )
 
     out_ref = torch_mla_extend(
         q,

@@ -5,9 +5,9 @@ import torch
 from aiter.ops.triton.utils.device_info import get_num_sms
 import math
 from aiter.ops.triton._triton_kernels.attention.mla import (
-    _mla_2d_kernel,
-    _mla_3d_kernel,
-    _mla_3d_reduce_kernel,
+    _mla_prefill_fwd_kernel,
+    _mla_decode_fwd_kernel,
+    _mla_decode_fwd_reduce_kernel,
 )
 
 
@@ -88,9 +88,9 @@ def mla_prefill_fwd(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     causal: bool,
-    q_descale=None,
-    kv_descale=None,
-    out_scale=None,
+    q_descale,
+    kv_descale,
+    out_scale,
 ):
     assert causal, "Only causal attention is supported"
 
@@ -127,7 +127,7 @@ def mla_prefill_fwd(
         num_2d_prgms,
     )
 
-    _mla_2d_kernel[(num_kv_heads, total_num_q_blocks)](
+    _mla_prefill_fwd_kernel[(num_kv_heads, total_num_q_blocks)](
         output_ptr=out,
         query_ptr=q,
         kv_buffer_ptr=kv_buffer,
@@ -138,7 +138,7 @@ def mla_prefill_fwd(
         kv_scale_ptr=kv_descale,
         out_scale_ptr=out_scale,
         num_query_heads=num_query_heads,
-        num_queries_per_kv=num_queries_per_kv,
+        num_kv_heads=num_kv_heads,
         block_tables_stride=block_tables.stride(0),
         query_stride_0=q.stride(0),
         query_stride_1=q.stride(1),
@@ -170,9 +170,9 @@ def mla_decode_fwd(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     causal: bool,
-    q_descale=None,
-    kv_descale=None,
-    out_scale=None,
+    q_descale,
+    kv_descale,
+    out_scale,
 ):
     assert causal, "Only causal attention is supported"
 
@@ -240,7 +240,7 @@ def mla_decode_fwd(
         device=q.device,
     )
 
-    _mla_3d_kernel[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
+    _mla_decode_fwd_kernel[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,
         segm_expsum_ptr=segm_expsum,
@@ -252,7 +252,7 @@ def mla_decode_fwd(
         q_scale_ptr=q_descale,
         kv_scale_ptr=kv_descale,
         num_query_heads=num_query_heads,
-        num_queries_per_kv=num_queries_per_kv,
+        num_kv_heads=num_kv_heads,
         block_tables_stride=block_tables.stride(0),
         query_stride_0=q.stride(0),
         query_stride_1=q.stride(1),
@@ -269,7 +269,7 @@ def mla_decode_fwd(
         ALL_DECODE=ALL_DECODE,
         **attn_config,
     )
-    _mla_3d_reduce_kernel[(total_num_tokens, num_query_heads)](
+    _mla_decode_fwd_reduce_kernel[(total_num_tokens, num_query_heads)](
         output_ptr=out,
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,
