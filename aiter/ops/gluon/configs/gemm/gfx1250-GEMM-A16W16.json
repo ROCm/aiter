@@ -1,10 +1,10 @@
 {
     "any": {
-        "BLOCK_M": 64,
-        "BLOCK_N": 128,
-        "BLOCK_K": 128,
+        "BLOCK_M": 256,
+        "BLOCK_N": 256,
+        "BLOCK_K": 64,
         "NUM_BUFFERS": 2,
         "num_warps": 8,
-        "L2_PREFETCH_DISTANCE": 2
+        "L2_PREFETCH_DISTANCE": 0
     }
 }
