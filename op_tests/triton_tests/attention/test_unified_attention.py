@@ -239,7 +239,6 @@ def ref_paged_attn(
 )
 @pytest.mark.parametrize("soft_cap", [None])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
-# @pytest.mark.parametrize("shuffled_kv_cache", [True, False])
 @pytest.mark.parametrize("shuffled_kv_cache", [True, False])
 @pytest.mark.parametrize(
     "backend, use_tdm, num_tdm_gather, use_async",
