@@ -445,15 +445,9 @@ class GroupCoordinator:
         )
 
     def _all_gather_out_place(self, input_: torch.Tensor, dim: int = 0) -> torch.Tensor:
-        ca_comm = self.device_communicator.ca_comm
-        assert ca_comm is not None
-        assert not ca_comm.disabled
-        out = ca_comm.custom_all_gather(input_, dim)
-        assert out is not None
-        return out
-
-    def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor:
-        return outplace_all_gather(input_, group_name=self.unique_name)
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.all_gather(input_, dim)
 
     # didn't support dim in custom reduce_scatter
     def _reduce_scatter_out_place(
@@ -501,29 +495,8 @@ class GroupCoordinator:
 
         if dim < 0:
             dim += input_.dim()
-        input_size = input_.size()
 
-        is_last_dim = dim == input_.dim() - 1
-        can_use_custom = use_custom and (
-            dim == 0
-            or (is_last_dim and input_size[-1] * input_.element_size() % 16 == 0)
-        )
-
-        if can_use_custom:
-            return outplace_all_gather(input_, group_name=self.unique_name, dim=dim)
-
-        # NCCL path
-        output_tensor = torch.empty(
-            (world_size,) + input_size, dtype=input_.dtype, device=input_.device
-        )
-        torch.distributed.all_gather_into_tensor(
-            output_tensor, input_, group=self.device_group
-        )
-        output_tensor = output_tensor.movedim(0, dim)
-        output_tensor = output_tensor.reshape(
-            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
-        )
-        return output_tensor
+        return outplace_all_gather(input_, group_name=self.unique_name, dim=dim)
 
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1

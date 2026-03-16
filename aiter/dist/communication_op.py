@@ -48,10 +48,6 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
     )
 
 
-def tensor_model_parallel_custom_all_gather(input_: torch.Tensor) -> torch.Tensor:
-    return get_tp_group().custom_all_gather(input_)
-
-
 def tensor_model_parallel_reduce_scatter(
     input_: torch.Tensor, use_custom: bool = True, dim: int = 0
 ) -> torch.Tensor:

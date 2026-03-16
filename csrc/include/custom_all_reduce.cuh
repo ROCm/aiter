@@ -907,15 +907,41 @@ struct AbsMaxFunctor
     }
 };
 
+// cross-lane butterfly shuffle (XOR) via ds_bpermute
+template<typename T>
+DINLINE T shfl_xor(T var, int mask, int width = opus::get_warp_size())
+{
+    static_assert(sizeof(T) == 4); 
+    int self = lane_id();
+    int index = (self & ~(width - 1)) + ((self ^ mask) & (width - 1));
+    return __builtin_bit_cast(T, __builtin_amdgcn_ds_bpermute(index << 2, __builtin_bit_cast(int, var)));
+}
+
+// shfl_xor support 4bytes dtype only
 template <template <typename> class functor, typename T, int reduce_range, int stop_stride = 0>
 DINLINE T warpReduce(T val)
 {
-    auto op = functor<T>();
-#pragma unroll
-    for(int stride = reduce_range / 2; stride > stop_stride; stride >>= 1)
+    constexpr if (sizeof(T) == 4)
     {
-        T tmp = __shfl_xor(val, stride, reduce_range);
-        val   = op(val, tmp);
+        auto op = functor<T>();
+#pragma unroll
+        for(int stride = reduce_range / 2; stride > stop_stride; stride >>= 1)
+        {
+            T tmp = shfl_xor(val, stride, reduce_range);
+            val   = op(val, tmp);
+        }
+    }
+    else
+    {
+        auto op = functor<float>();
+#pragma unroll
+        for(int stride = reduce_range / 2; stride > stop_stride; stride >>= 1)
+        {
+            float val_fp32 = upcast_s(val);
+            float tmp = shfl_xor(val_fp32, stride, reduce_range);
+            val_fp32  = op(val_fp32, tmp);
+        }
+        val = downcast_s<T>(val_fp32);
     }
     return val;
 }
@@ -1040,7 +1066,9 @@ __global__ __forceinline__ void __launch_bounds__(512, 1) allReduceQuantFp8(
                 {
                     scale_factor = *(reinterpret_cast<T*>(&tmps[i][part]) + idx / factor_stride);
                 }
-                scale_factor = __shfl(scale_factor, (threadIdx.x / factor_stride) * factor_stride);
+                float scale_factor_fp32 = upcast_s(scale_factor);
+                scale_factor_fp32 = opus::shfl(scale_factor_fp32, (threadIdx.x / factor_stride) * factor_stride);
+                scale_factor = downcast_s<T>(scale_factor_fp32);
                 inp_pack half8_reg = packDequant<T, pack_size>(tmps[i][idx], scale_factor);
                 int dst_idx        = gather_from_rank * part + idx;
                 ((inp_pack*)result)[dst_idx] = half8_reg;
