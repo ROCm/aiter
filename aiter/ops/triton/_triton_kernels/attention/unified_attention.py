@@ -851,7 +851,9 @@ def kernel_unified_attention_3d(
             cache_modifier=KV_cache_modifier,
         )
 
-        if V_load.dtype.is_fp8():
+        if SAGE_VERSION != None:
+            V = V_load
+        elif V_load.dtype.is_fp8():
             if Q.dtype.is_fp8():
                 V = V_load
             else:
@@ -941,7 +943,7 @@ def kernel_unified_attention_3d(
             v_scale,
             kv_head_idx,
             offs_d,
-            tile_mask[None, :],
+            dim_mask,
             stride_v_cache_scale_0,
             stride_v_cache_scale_1,
             SAGE_VERSION
