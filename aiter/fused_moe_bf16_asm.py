@@ -448,7 +448,7 @@ def _run_asm_moe_int8(
     )
     is_int8 = w1.dtype == dtypes.i8 or w1.dtype == torch.int8
     if fc1_smooth_scale is not None:
-        use_ref_input_quant = is_int8
+        use_ref_input_quant = is_int8 or (expert_mask is not None)
         if use_ref_input_quant:
             # smooth_per_token_scaled_quant for input; keep topk_ids (global) for stage2.
             a8 = torch.empty((topk * M, model_dim), dtype=a8_type, device=device)
