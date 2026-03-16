@@ -4,7 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
   workflow_dispatch:
 
 concurrency:
@@ -20,6 +26,11 @@ env:
 
 jobs:
   check-signal:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (contains(github.event.pull_request.labels.*.name, 'ci:atom') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -32,38 +43,51 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   atom_benchmark:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (contains(github.event.pull_request.labels.*.name, 'ci:atom') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))
     needs: [check-signal]
     name: ATOM Benchmark 
     strategy:
       fail-fast: false
       matrix:
         include:
+          # run_on_pr: true = run on all events; false = skip on PR (still runs on push/schedule/workflow_dispatch)
           - model_name: "DeepSeek-R1-0528"
             label: MI325
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
             env_vars: ""
+            accuracy_test_threshold: "0.94"
             runner: aiter-8gpu-runner
+            run_on_pr: true
           - model_name: "gpt-oss-120b"
             label: MI355
             model_path: "openai/gpt-oss-120b"
-            extraArgs: "--kv_cache_dtype fp8"
+            extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3"
             env_vars: |
               ATOM_GPT_OSS_MODEL=1
+            accuracy_test_threshold: "0.38"
             runner: linux-aiter-mi355-1
+            run_on_pr: true
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code
+        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         uses: actions/checkout@v4
         with:
           repository: ${{ env.ATOM_REPOSITORY_URL }}
           branch: ${{ env.ATOM_BRANCH }}
 
       - name: Download the ATOM base image
+        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         run: |
           docker pull ${{ env.BASE_IMAGE }}
 
       - name: Generate Dockerfile
+        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         run: |
           cat <<EOF > Dockerfile.mod
           FROM ${{ env.BASE_IMAGE }}
@@ -82,6 +106,7 @@ jobs:
           EOF
 
       - name: Build the ATOM test image
+        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         run: |
           docker build --network=host \
             --no-cache \
@@ -89,6 +114,7 @@ jobs:
             -f Dockerfile.mod .
 
       - name: Start CI container
+        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         run: |
           echo "Clean up containers..."
           docker ps -aq -f name=atom_test | xargs -r docker stop | xargs -r docker rm
@@ -117,6 +143,7 @@ jobs:
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
           -e ATOM_DISABLE_MMAP=true \
+          -e HF_TOKEN="${HF_TOKEN:-${{ secrets.HF_TOKEN_TEST }}}" \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name atom_aiter_test \
@@ -125,17 +152,19 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Check shm size
+        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         run: |
           df -h # for testing
           df -h /dev/shm
           docker exec atom_aiter_test df -h /dev/shm
     
       - name: Check version
+        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         run: |
           docker exec atom_aiter_test bash -lc "pip show amd-aiter atom && pip list"
 
       - name: Download Models
-        if: ${{ matrix.model_name == 'DeepSeek-R1-0528' }}
+        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && matrix.model_name == 'DeepSeek-R1-0528'
         run: |
           if [ -d "/run" ]; then
             echo "/run directory found, downloading model to /run/${{ matrix.model_path }}"
@@ -147,42 +176,14 @@ jobs:
             echo "/run directory not found, skipping model download"
           fi
 
-      - name: Run ATOM simple inference
-        timeout-minutes: 30
-        run: |
-          # Run the inference and capture output
-          set -euo pipefail
-          echo ""
-          echo "========== Running test =========="
-  
-          if [ -d "/run" && ${{ matrix.model_name == 'DeepSeek-R1-0528' }}]; then
-            model_path="/run/${{ matrix.model_path }}"
-          else
-            model_path="${{ matrix.model_path }}"
-          fi
-          echo "Model path: $model_path"
-
-          docker exec atom_aiter_test bash -lc "
-            set -euo pipefail
-            python3 -m atom.examples.simple_inference \
-              --model \"$model_path\" \
-              ${{ matrix.extraArgs }} \
-              --temperature 0 \
-            | grep -E '^Prompt: |^Completion:'
-          " > atom_test_output.txt
-          
-          echo ""
-          echo "========== Showing test output below =========="
-          cat atom_test_output.txt
-        
       - name: Run ATOM accuracy test
-        if: ${{ matrix.model_name != 'DeepSeek-R1-0528' }}
-        timeout-minutes: 30
+        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
+        timeout-minutes: 60
         run: |
           set -euo pipefail
           echo ""
           echo "========== Launching ATOM server =========="
-          if [ -d "/run" && ${{ matrix.model_name == 'DeepSeek-R1-0528' }}]; then
+          if [ -d "/run/${{ matrix.model_path }}" ]; then
             model_path="/run/${{ matrix.model_path }}"
           else
             model_path="${{ matrix.model_path }}"
@@ -194,17 +195,46 @@ jobs:
           echo "========== Running accuracy test =========="
           docker exec atom_aiter_test bash -lc "
             .github/scripts/atom_test.sh accuracy $model_path
-          "
+          " 2>&1 | tee atom_accuracy_output.txt
+
+      - name: Check accuracy test results
+        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && success()
+        run: |
+          result_file=$(ls -1t accuracy_test_results/*.json 2>/dev/null | head -n 1)
+          if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
+              echo "ERROR: No results JSON file found in accuracy_test_results/"
+              exit 2
+          else
+              echo "RESULT_FILE: $result_file"
+          fi
+          flexible_extract_value=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "$result_file")
+          echo "Flexible extract value: $flexible_extract_value"
+          echo "Accuracy test threshold: ${{ matrix.accuracy_test_threshold }}"
+
+          result=$(awk -v val="$flexible_extract_value" -v threshold="${{ matrix.accuracy_test_threshold }}" 'BEGIN {print (val < threshold) ? 1 : 0}')
+          if [ "$result" -eq 1 ]; then
+            echo "Accuracy test failed: Flexible extract value $flexible_extract_value is less than the threshold ${{ matrix.accuracy_test_threshold }}."
+            exit 1
+          else
+            echo "Accuracy test passed: Flexible extract value $flexible_extract_value is greater than or equal to the threshold ${{ matrix.accuracy_test_threshold }}."
+            exit 0
+          fi
+
+      - name: Collect Test Summary
+        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && success()
+        run: |
+          echo "Accuracy Test Summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
+          awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' atom_accuracy_output.txt >> $GITHUB_STEP_SUMMARY
 
       - name: Upload output
-        if: always()
+        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.model_name }}_atom_test_output.txt
-          path: atom_test_output.txt
+          name: ${{ matrix.model_name }}_atom_accuracy_output.txt
+          path: atom_accuracy_output.txt
 
       - name: Clean Up
-        if: always()
+        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && always()
         run: |
           docker stop atom_aiter_test || true
           docker rm atom_aiter_test || true

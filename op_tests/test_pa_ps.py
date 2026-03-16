@@ -806,31 +806,9 @@ def test_pa_ps(
     return ret
 
 
-head_dim = 128
-l_block_size = [1024]
-l_dtype = ["bf16"]
-l_num_heads = [
-    (10, 1),
-    (16, 2),
-    # (16, 1),
-]
-l_qlen = [1, 2, 3, 4]
-l_ctx_len = [
-    7,
-    109,
-    256,
-    282,
-    1024,
-    2580,
-    4097,
-    8192,
-    10240,
-]
 gpu = torch.cuda.current_device()
 device_properties = torch.cuda.get_device_properties(gpu)
 cu_num = device_properties.multi_processor_count
-l_batch_size = [64, 158, cu_num // 2]
-l_batch_size.sort()
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -839,11 +817,9 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
+    type=dtypes.str2Dtype,
+    nargs="*",
+    default=[dtypes.d_dtypes["bf16"]],
     help="""Data type.
     e.g.: -d bf16""",
 )
@@ -851,16 +827,25 @@ parser.add_argument(
     "-n",
     "--num_heads",
     type=dtypes.str2tuple,
-    default=None,
+    nargs="*",
+    default=[(10, 1), (16, 2)],
     help="""Number of heads.
     e.g. -n 8,1""",
+)
+parser.add_argument(
+    "-hd",
+    "--head_dim",
+    type=int,
+    default=128,
+    help="""Head dimension.
+    e.g. -hd 128""",
 )
 parser.add_argument(
     "-q",
     "--qlen",
     type=int,
-    choices=l_qlen,
-    default=None,
+    nargs="*",
+    default=[1, 2, 3, 4],
     help="""Query length.
     e.g. -q 1""",
 )
@@ -868,7 +853,8 @@ parser.add_argument(
     "-c",
     "--ctx_len",
     type=int,
-    default=None,
+    nargs="*",
+    default=[7, 109, 256, 282, 1024, 2580, 4097, 8192, 10240],
     help="""Context length.
     e.g. -c 128""",
 )
@@ -876,7 +862,8 @@ parser.add_argument(
     "-b",
     "--batch_size",
     type=int,
-    default=None,
+    nargs="*",
+    default=sorted([64, 158, cu_num // 2]),
     help="""Batch size.
     e.g. -b 128""",
 )
@@ -884,9 +871,9 @@ parser.add_argument(
     "--block_size",
     type=int,
     nargs="*",
-    default=l_block_size,
-    help="""Batch size.
-    e.g. -b 128""",
+    default=[1024],
+    help="""Block size.
+    e.g. --block_size 1024""",
 )
 parser.add_argument(
     "--varlen",
@@ -921,43 +908,21 @@ parser.add_argument(
     --per_block_quant # Enable per-block quantization""",
 )
 args = parser.parse_args()
-if args.dtype is None:
-    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-else:
-    l_dtype = [dtypes.d_dtypes[args.dtype]]
-if args.num_heads is not None:
-    l_num_heads = [args.num_heads]
-if args.qlen is not None:
-    l_qlen = [args.qlen]
-if args.ctx_len is not None:
-    l_ctx_len = [args.ctx_len]
-if args.batch_size is not None:
-    l_batch_size = [args.batch_size]
-l_block_size = args.block_size
-l_varlen = args.varlen
 
-# Convert string to QuantType enum
-quant_type_map = {
-    "per_Token": QuantType.per_Token,
-    "per_256x128": QuantType.per_256x128,
-    "per_1024x128": QuantType.per_1024x128,
-}
-l_quant_type = quant_type_map.get(args.quant_type, QuantType.per_Token)
-
-for dtype in l_dtype:
+for dtype in args.dtype:
     df = []
     for num_heads, qlen, ctx_len, batch_size, block_size in itertools.product(
-        l_num_heads, l_qlen, l_ctx_len, l_batch_size, l_block_size
+        args.num_heads, args.qlen, args.ctx_len, args.batch_size, args.block_size
     ):
         ret = test_pa_ps(
             ctx_len,
             batch_size,
             num_heads,
-            head_dim,
+            args.head_dim,
             block_size,
             dtype,
             qlen,
-            l_varlen,
+            args.varlen,
             args.load_metadata,
             args.dump_metadata,
             args.profile,

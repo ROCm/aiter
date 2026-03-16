@@ -92,11 +92,11 @@ n_tokens = [4, 7, 8, 64, 255, 256, 371, 911, 1023, 1024, 4096, 8192]
 
 @pytest.mark.parametrize("n_tokens", n_tokens)
 @pytest.mark.parametrize(
-    "n_expts_tot, n_expts_act", [(128, 4), (128, 32), (1500, 8), (256, 8), (8, 2)]
+    "n_expts_tot, n_expts_act",
+    [(128, 4), (128, 6), (128, 32), (1500, 8), (256, 8), (8, 2)],
 )
-@pytest.mark.parametrize("use_expt_indx", [False, True])
 @pytest.mark.parametrize("sm_first", [True, False])
-def test_op(n_tokens, n_expts_tot, n_expts_act, sm_first, use_expt_indx):
+def test_op(n_tokens, n_expts_tot, n_expts_act, sm_first):
     if get_arch() != "gfx950":
         pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
 
@@ -109,19 +109,11 @@ def test_op(n_tokens, n_expts_tot, n_expts_act, sm_first, use_expt_indx):
     tri_logits[n_tokens:, :] = float("inf")  # should not be used
     ref_logits = tri_logits.clone().detach()
 
-    if use_expt_indx:
-        rand_idx = lambda: torch.randperm(n_expts_tot, device="cuda", dtype=torch.int64)
-        tri_expt_indx = torch.stack([rand_idx()[:n_expts_act] for _ in range(n_tokens)])
-        tri_expt_indx, _ = torch.sort(tri_expt_indx, dim=1)
-        tri_expt_indx[n_tokens:] = -99999  # should not be used
-        ref_expt_indx = tri_expt_indx[:n_tokens]
-    else:
-        tri_expt_indx = ref_expt_indx = None
     ref_routing_data, ref_gather, ref_scatter = routing_torch(
-        ref_logits, n_expts_act, sm_first, ref_expt_indx
+        ref_logits, n_expts_act, sm_first
     )
     tri_routing_data, tri_gather, tri_scatter = routing(
-        tri_logits, n_expts_act, sm_first, tri_expt_indx
+        tri_logits, n_expts_act, sm_first
     )
 
     def _assert_indx_equal(ref, tri):
@@ -140,8 +132,8 @@ def test_op(n_tokens, n_expts_tot, n_expts_act, sm_first, use_expt_indx):
     assert_equal(ref_expt_data.token_offs_pad, tri_expt_data.token_offs_pad)
     assert_equal(ref_expt_data.block_pid_map, tri_expt_data.block_pid_map)
 
-    assert ref_routing_data.n_expts_tot == ref_routing_data.n_expts_tot
-    assert ref_routing_data.n_expts_act == ref_routing_data.n_expts_act
+    assert ref_routing_data.n_expts_tot == tri_routing_data.n_expts_tot
+    assert ref_routing_data.n_expts_act == tri_routing_data.n_expts_act
 
     _assert_indx_equal(ref_gather, tri_gather)
     _assert_indx_equal(ref_scatter, tri_scatter)

@@ -132,8 +132,8 @@ __global__ void add_rmsnorm_quant_kernel(
             float square_sum = 0.0f;
             for(int i = 0; i < thread_data_size; i++)
             {
-                asm volatile("v_fmac_f32_e32 %0, %1, %1" : "+v"(square_sum) : "v"(thread_data_float[i]));
-                // square_sum += (thread_data_float[i] * thread_data_float[i]);
+                // asm volatile("v_fmac_f32_e32 %0, %1, %1" : "+v"(square_sum) : "v"(thread_data_float[i]));
+                square_sum += (thread_data_float[i] * thread_data_float[i]);
             }
             
             auto sum_f = [](float a, float b) { return a + b; };

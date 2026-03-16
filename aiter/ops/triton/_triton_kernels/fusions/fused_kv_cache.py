@@ -420,6 +420,8 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     value_cache_stride_h,
     value_cache_stride_d,
     value_cache_stride_b,
+    value_cache_stride_slot_chunk,
+    value_cache_stride_x,
     zeros_out_stride_t,
     zeros_out_stride_h,
     zeros_out_stride_d,
@@ -435,6 +437,7 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     BLOCK_SIZE: tl.constexpr,
     X_SIZE: tl.constexpr,
     FLASH_LAYOUT: tl.constexpr,
+    VALUE_SHUFFLE_LAYOUT: tl.constexpr = False,
     HAVE_POS: tl.constexpr = False,
     HAVE_K_SCALE: tl.constexpr = False,
     HAVE_V_SCALE: tl.constexpr = False,
@@ -467,6 +470,8 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     tl.assume(value_cache_stride_h >= 0)
     tl.assume(value_cache_stride_d >= 0)
     tl.assume(value_cache_stride_b >= 0)
+    tl.assume(value_cache_stride_slot_chunk >= 0)
+    tl.assume(value_cache_stride_x >= 0)
     tl.assume(zeros_out_stride_t >= 0)
     tl.assume(zeros_out_stride_h >= 0)
     tl.assume(zeros_out_stride_d >= 0)
@@ -605,13 +610,25 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                     v_scale = 1
                 v_scale_rcprl = 1 / v_scale
                 v = tl.load(v_ptrs) * v_scale_rcprl
-                v_out_ptrs = (
-                    value_cache_ptr
-                    + pid_t_slot * value_cache_stride_t
-                    + pid_hk * value_cache_stride_h
-                    + d_pe_offs.to(tl.int64) * value_cache_stride_d
-                    + pid_b * value_cache_stride_b
-                )
+                if VALUE_SHUFFLE_LAYOUT:
+                    slot_chunk = pid_b // X_SIZE
+                    x_off = pid_b % X_SIZE
+                    v_out_ptrs = (
+                        value_cache_ptr
+                        + pid_t_slot * value_cache_stride_t
+                        + pid_hk * value_cache_stride_h
+                        + slot_chunk * value_cache_stride_slot_chunk
+                        + d_pe_offs.to(tl.int64) * value_cache_stride_d
+                        + x_off * value_cache_stride_x
+                    )
+                else:
+                    v_out_ptrs = (
+                        value_cache_ptr
+                        + pid_t_slot * value_cache_stride_t
+                        + pid_hk * value_cache_stride_h
+                        + d_pe_offs.to(tl.int64) * value_cache_stride_d
+                        + pid_b * value_cache_stride_b
+                    )
                 tl.store(v_out_ptrs, v.to(value_cache_ptr.dtype.element_ty))
     else:
         pid = pid - T * QH + T * KH
@@ -680,13 +697,25 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                     v_scale = 1
                 v_scale_rcprl = 1 / v_scale
                 v = tl.load(v_ptrs) * v_scale_rcprl
-                v_out_ptrs = (
-                    value_cache_ptr
-                    + pid_t_slot * value_cache_stride_t
-                    + pid_hk * value_cache_stride_h
-                    + d_pe_offs * value_cache_stride_d
-                    + pid_b * value_cache_stride_b
-                )
+                if VALUE_SHUFFLE_LAYOUT:
+                    slot_chunk = pid_b // X_SIZE
+                    x_off = pid_b % X_SIZE
+                    v_out_ptrs = (
+                        value_cache_ptr
+                        + pid_t_slot * value_cache_stride_t
+                        + pid_hk * value_cache_stride_h
+                        + slot_chunk * value_cache_stride_slot_chunk
+                        + d_pe_offs * value_cache_stride_d
+                        + x_off * value_cache_stride_x
+                    )
+                else:
+                    v_out_ptrs = (
+                        value_cache_ptr
+                        + pid_t_slot * value_cache_stride_t
+                        + pid_hk * value_cache_stride_h
+                        + d_pe_offs * value_cache_stride_d
+                        + pid_b * value_cache_stride_b
+                    )
                 tl.store(v_out_ptrs, v.to(value_cache_ptr.dtype.element_ty))
 
 

@@ -457,7 +457,7 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
         std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
             ? 0.25
             : (1. / ck_tile::type_convert<float>(ck_tile::numeric<DTYPE_O>::max()));
-    const int64_t row_offset      = token_idx * cols;
+    const int64_t row_offset      = (int64_t)token_idx * cols;
     auto const* ptr_i             = reinterpret_cast<DTYPE_I const*>(input + row_offset);
     auto const* input_vecs        = reinterpret_cast<vec_i const*>(ptr_i);
     static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
@@ -507,7 +507,7 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
     return std::make_tuple(row_scale, reinterpret_cast<float*>(&smscale_cur));
 }
 
-template <typename DTYPE_I, typename DTYPE_O, int block_size, int thread_data_size = 16, bool transpose_out_dim01 = false>
+template <typename DTYPE_I, typename DTYPE_O, int block_size, int thread_data_size = 16, bool transpose_out_dim01 = false, int max_smscale_map_hash_size = 1024>
 __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                                      float* __restrict__ scale,
                                                      DTYPE_I* __restrict__ input,
@@ -525,14 +525,27 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                                      const int32_t out_stride1_cols       = 1,
                                                      const int32_t smooth_scale_map_hash_size = 256)
 {
-    __shared__ int32_t smooth_scale_map_hash_shared[256];
+    __shared__ int32_t smooth_scale_map_hash_shared[1024];
     int token_idx = blockIdx.x;
     int num_tg = gridDim.x;
     int rows = num_rows == nullptr ? input_dim0 * input_dim1 : *num_rows * num_rows_factor;
     if(smooth_scale_map != nullptr && smooth_scale_map_hash != nullptr)
     {
         auto buffer_hash = opus::make_gmem<int>(smooth_scale_map_hash, smooth_scale_map_hash_size * sizeof(int));
-        buffer_hash.async_load(smooth_scale_map_hash_shared + threadIdx.x, threadIdx.x);
+        constexpr int32_t async_load_num = (max_smscale_map_hash_size + block_size - 1) / block_size;
+        static_assert(max_smscale_map_hash_size <= 1024, "max_smscale_map_hash_size must be less than 1024");
+        #pragma unroll
+        for(int i = 0; i < async_load_num; i++)
+        {
+            // buffer_hash.async_load(smooth_scale_map_hash_shared + threadIdx.x + i * block_size, threadIdx.x + i * block_size);
+            const int lds_ptr_sgpr = __builtin_amdgcn_readfirstlane((reinterpret_cast<uintptr_t>((smooth_scale_map_hash_shared + threadIdx.x / WARP_SIZE * WARP_SIZE + i * block_size))));
+            uint32_t offset = threadIdx.x * sizeof(int) + i * block_size * sizeof(int);
+            asm volatile( "s_mov_b32 m0 %0\n\t"
+                "buffer_load_dword %1, %2, 0 offen offset:0 lds\n\t"
+                ::"s"(lds_ptr_sgpr), "v"(offset), "s"(buffer_hash.cached_rsrc): "memory", "m0");
+        }
+        opus::s_waitcnt_vmcnt(opus::number<0>{});
+        __syncthreads();
     }
     for(; token_idx < rows; token_idx += num_tg)
     {
@@ -582,8 +595,7 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                 scale[out_token_idx] = row_scale;
             }
         }
-
-        int64_t out_offset = out_token_idx * cols;    
+        int64_t out_offset = (int64_t)out_token_idx * cols;
         scaled_quant_vgpr_impl<float, DTYPE_O, thread_data_size>(out, vec_ptr, &row_scale, cols, out_offset);
     }
 }
@@ -903,7 +915,7 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
         const int warp_per_simd = BLOCK_SIZE / (opus::get_warp_size() * 4);                                            \
         int grid_size = enable_ps ? max_warp_per_simd / warp_per_simd * cu_num : rows;                                 \
         dim3 const grid(grid_size);                                                                                    \
-        aiter::quant_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA, TRANSPOSE_OUT_DIM01>                        \
+        aiter::quant_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA, TRANSPOSE_OUT_DIM01, MAX_EXPERT_SIZE>       \
             <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                                                   \
                 reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                                            \
                 scales.data_ptr<float>(),                                                                              \
@@ -985,10 +997,11 @@ void smooth_per_token_scaled_quant(
     int32_t input_stride1_cols = input_stride1 / cols;
     int32_t out_stride0_cols = out_stride0 / cols;
     int32_t out_stride1_cols = out_stride1 / cols;
+    constexpr int32_t MAX_EXPERT_SIZE = 1024;
     int32_t smooth_scale_map_hash_size =
         smooth_scale_map_hash.has_value() ? smooth_scale_map_hash->numel() : 0;
     TORCH_CHECK(
-        smooth_scale_map_hash_size <= 256, __func__, " smooth_scale_map_hash_size is too large, only support <= 256");
+        smooth_scale_map_hash_size <= MAX_EXPERT_SIZE, __func__, " smooth_scale_map_hash_size is too large, only support <= ", MAX_EXPERT_SIZE);
     TORCH_CHECK((input_dim0 * input_dim1 == out_dim0 * out_dim1) && (input_dim0 == out_dim0 || input_dim0 == out_dim1), 
         __func__, "This kernel view input as 3D (m,k,n) and output as 3D (m,k,n)/(k,m,n)");
     const bool transpose_out_dim01 = input_dim0 != out_dim0;
@@ -1007,7 +1020,7 @@ void smooth_per_token_scaled_quant(
             smooth_per_token_scaled_quant_kernel, ck_tile::int8_t, cols);
     }
 #if defined(__Float4_e2m1fn_x2)
-    else if(out.dtype() == torch::kFloat4_e2m1fn_x2 || out.dtype() == torch::kUInt8)
+    else if(out.dtype() == torch_fp4x2 || out.dtype() == torch::kUInt8)
     {
         SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
             smooth_per_token_scaled_quant_kernel, ck_tile::fp4x2_t, cols);

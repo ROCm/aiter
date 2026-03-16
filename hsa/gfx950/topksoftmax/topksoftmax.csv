@@ -4,6 +4,7 @@ _ZN5aiter19topksoftmax_4x128x6E,topksoftmax_4x128x6.co,4,128,6,fp32
 _ZN5aiter19topksoftmax_4x128x8E,topksoftmax_4x128x8.co,4,128,8,fp32
 _ZN5aiter19topksoftmax_4x256x6E,topksoftmax_4x256x6.co,4,256,6,fp32
 _ZN5aiter19topksoftmax_4x256x8E,topksoftmax_4x256x8.co,4,256,8,fp32
+_ZN5aiter19topksoftmax_4x384x8E,topksoftmax_4x384x8.co,4,384,8,fp32
 _ZN5aiter20topksoftmax_12x128x4E,topksoftmax_12x128x4.co,12,128,4,fp32
 _ZN5aiter20topksoftmax_12x128x6E,topksoftmax_12x128x6.co,12,128,6,fp32
 _ZN5aiter20topksoftmax_12x128x8E,topksoftmax_12x128x8.co,12,128,8,fp32
@@ -14,6 +15,7 @@ _ZN5aiter24topksoftmax_4x128x6_bf16E,topksoftmax_4x128x6_bf16.co,4,128,6,bf16
 _ZN5aiter24topksoftmax_4x128x8_bf16E,topksoftmax_4x128x8_bf16.co,4,128,8,bf16
 _ZN5aiter24topksoftmax_4x256x6_bf16E,topksoftmax_4x256x6_bf16.co,4,256,6,bf16
 _ZN5aiter24topksoftmax_4x256x8_bf16E,topksoftmax_4x256x8_bf16.co,4,256,8,bf16
+_ZN5aiter24topksoftmax_4x384x8_bf16E,topksoftmax_4x384x8_bf16.co,4,384,8,bf16
 _ZN5aiter25topksoftmax_12x128x4_bf16E,topksoftmax_12x128x4_bf16.co,12,128,4,bf16
 _ZN5aiter25topksoftmax_12x128x6_bf16E,topksoftmax_12x128x6_bf16.co,12,128,6,bf16
 _ZN5aiter25topksoftmax_12x128x8_bf16E,topksoftmax_12x128x8_bf16.co,12,128,8,bf16

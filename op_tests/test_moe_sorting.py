@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 from typing import Tuple
 import aiter
@@ -7,6 +7,7 @@ from aiter.test_common import checkAllclose, run_perftest, benchmark
 from aiter.fused_moe import moe_sorting, fused_topk
 from aiter import dtypes
 import argparse
+import pandas as pd
 
 BLOCK_SIZE_M = 32
 
@@ -103,11 +104,14 @@ def test_moe_sorting(
         num_local_tokens = None
 
     (
-        sorted_ids_a,
-        sorted_weights_a,
-        sorted_expert_ids_a,
-        num_tokens_post_padded_a,
-    ), avg_a = run_perftest(
+        (
+            sorted_ids_a,
+            sorted_weights_a,
+            sorted_expert_ids_a,
+            num_tokens_post_padded_a,
+        ),
+        avg_a,
+    ) = run_perftest(
         moe_sorting_native,
         topk_ids,
         topk_weights,
@@ -120,12 +124,15 @@ def test_moe_sorting(
     )
 
     (
-        sorted_ids_b,
-        sorted_weights_b,
-        sorted_expert_ids_b,
-        num_tokens_post_padded_b,
-        moe_buf,
-    ), avg_b = run_perftest(
+        (
+            sorted_ids_b,
+            sorted_weights_b,
+            sorted_expert_ids_b,
+            num_tokens_post_padded_b,
+            moe_buf,
+        ),
+        avg_b,
+    ) = run_perftest(
         moe_sorting,
         topk_ids,
         topk_weights,
@@ -139,7 +146,7 @@ def test_moe_sorting(
     )
 
     print(
-        f"[perf] {token=}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+        f"[perf] {token=}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a / avg_b - 1:<5.1%}"
     )
     checkAllclose(
         num_tokens_post_padded_a,
@@ -169,15 +176,6 @@ def test_moe_sorting(
     return {"us": avg_b}
 
 
-import pandas as pd
-
-l_dtype = ["bf16"]
-l_m = [1, 7, 31, 64, 128, 256, 163840]
-l_expert = [32, 256]
-l_topk = [5, 8]
-l_padding_token = [0, 1000]
-l_expert_mask = [False, True]
-l_dispatch_policy = [0, 1]
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -185,29 +183,28 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "-d",
     "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["bf16"]],
+    nargs="*",
+    default=[dtypes.d_dtypes["bf16"]],
+    metavar="{bf16}",
     help="""Data type.
     e.g.: -d bf16""",
 )
 parser.add_argument(
     "-m",
     type=int,
-    default=None,
-    help="""number of token.
+    nargs="*",
+    default=[1, 7, 31, 64, 128, 256, 163840],
+    help="""Number of tokens.
     e.g.: -m 64""",
 )
 parser.add_argument(
     "-e",
     "--expert",
     type=int,
-    choices=l_expert,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    default=[32, 256],
     help="""Number of experts.
     e.g.: -e 32""",
 )
@@ -215,10 +212,8 @@ parser.add_argument(
     "-t",
     "--topk",
     type=int,
-    choices=l_topk,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    default=[5, 8],
     help="""Number of top experts.
     e.g.: -t 5""",
 )
@@ -226,7 +221,8 @@ parser.add_argument(
     "-p",
     "--padding",
     type=int,
-    default=None,
+    nargs="*",
+    default=[0, 1000],
     help="""Padding token.
     e.g.: -p 0""",
 )
@@ -234,51 +230,34 @@ parser.add_argument(
     "-dp",
     "--dispatch_policy",
     type=int,
-    choices=[0, 1, 2],
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    default=[0, 1],
     help="""Dispatch policy.
     e.g.: -dp 0""",
 )
 parser.add_argument(
     "-em",
-    "--epert_mask",
-    action="store_true",
-    default=None,
-    help="""Add expert mask to the test.""",
+    "--expert_mask",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[True, False],
+    help="""Expert mask default is [True, False].
+    e.g.: -em f    # false
+          -em t    # true""",
 )
 
 args = parser.parse_args()
-if args.dtype is None:
-    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-else:
-    l_dtype = [dtypes.d_dtypes[args.dtype]]
-if args.m is not None:
-    l_m = [args.m]
-if args.expert is not None:
-    l_expert = [args.expert]
-if args.topk is not None:
-    l_topk = [args.topk]
-if args.padding is not None:
-    l_padding_token = [args.padding]
-if args.dispatch_policy is not None:
-    l_dispatch_policy = [args.dispatch_policy]
-if args.epert_mask is not None:
-    l_expert_mask = [args.epert_mask]
 
-l_expert_topk = [(l_expert[i], l_topk[i]) for i in range(len(l_expert))]
-
-for padding_token in l_padding_token:
-    for expert_mask in l_expert_mask:
-        for dispatch_policy in l_dispatch_policy:
+for padding_token in args.padding:
+    for expert_mask in args.expert_mask:
+        for dispatch_policy in args.dispatch_policy:
             df = []
             print(
-                f"test test_moe_sorting, expert mask:{expert_mask}, padding_token:{padding_token}, dispatch_policy={dispatch_policy}"
+                f"test test_moe_sorting, expert mask:{bool(expert_mask)}, padding_token:{padding_token}, dispatch_policy={dispatch_policy}"
             )
-            for dtype in l_dtype:
-                for m in l_m:
-                    for E, top in l_expert_topk:
+            for dtype in args.dtype:
+                for m in args.m:
+                    for E, top in zip(args.expert, args.topk):
                         ret = test_moe_sorting(
                             dtype,
                             m,
