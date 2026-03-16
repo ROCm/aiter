@@ -183,6 +183,10 @@ def _gemm_a16w16_gfx1250_kernel(
     num_k_tiles = gl.cdiv(K, BLOCK_K)
     
     for _ in range(num_k_tiles - (NUM_BUFFERS - 1)):
+        # Wait for the next tile to be ready for compute
+        # (NUM_BUFFERS - 1) * 2 ensures the current compute tile is loaded while allowing next loads to proceed
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+        
         if PHYSICAL_MK:
             gl.amd.gfx1250.tdm.async_load(
                 a_desc,
@@ -214,10 +218,6 @@ def _gemm_a16w16_gfx1250_kernel(
         if USE_L2_PREFETCH:
             gemm_l2_prefetch(L2_PREFETCH_DISTANCE - 1, load_idx, a_desc, b_desc,
                                   off_am, off_bn, BLOCK_K, not PHYSICAL_MK, not PHYSICAL_KN)
-        
-        # Wait for the next tile to be ready for compute
-        # (NUM_BUFFERS - 1) * 2 ensures the current compute tile is loaded while allowing next loads to proceed
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
         
         if PHYSICAL_MK:
             cur_a = a_buffer.index(compute_idx % NUM_BUFFERS).load(layout=OPERAND_LAYOUT_A)
