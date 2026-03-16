@@ -78,8 +78,6 @@ def q_scale_process(
             + kv_head_idx * query_scale_stride_1
             + offs_d_scale[None, :] * query_scale_stride_2
         )
-        tl.static_print("q_descale_ptr", q_descale_ptr)
-        tl.static_print("seq_mask", seq_mask)
         
         return tl.load(q_descale_ptr, mask=seq_mask, other=0.0)
     # else:
@@ -549,12 +547,11 @@ def kernel_unified_attention_2d(
     acc = acc * one_over_L
         
     if SAGE_VERSION != None:
-        offs_d_scale_v = tl.arange(0, HEAD_SIZE_PADDED)
         v_scale_loaded = v_scale_process(
             v_scale,
             kv_head_idx,
-            offs_d_scale_v,
-            offs_d_scale_v < HEAD_SIZE,
+            offs_d,
+            dim_mask,
             stride_v_cache_scale_0,
             stride_v_cache_scale_1,
             SAGE_VERSION
