@@ -1303,7 +1303,7 @@ def run_pa_gluon_test(
         kv_len_list = [context_length] * batch_size
 
     context_lengths = torch.tensor(kv_len_list, dtype=torch.int32, device=device)
-    # print(f"context_lengths={context_lengths}")
+
     if use_sinks:
         sinks = torch.randn(num_query_heads, device=query.device, dtype=data_type)
     else:
@@ -1346,7 +1346,7 @@ def run_pa_gluon_test(
 
         # Per-token quantization for KV cache (if enabled)
         if quant_kv:
-            if compute_type not in [aiter.dtypes.fp8]:
+            if compute_type in [aiter.dtypes.fp8]:
                 (
                     quantized_keys,
                     key_scale_factors_flat,
@@ -1428,7 +1428,6 @@ def run_pa_gluon_test(
 
     if trans_v:
         quantized_values = shuffle_value_cache_layout(quantized_values)
-        # print(f"Transformed quantized_values.shape={quantized_values.shape}")
 
     diff_tolerance = 5e-3
     if compute_type != aiter.dtypes.fp8 and not quant_q and not quant_kv:
