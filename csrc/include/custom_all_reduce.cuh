@@ -912,7 +912,7 @@ template<typename T>
 DINLINE T shfl_xor(T var, int mask, int width = opus::get_warp_size())
 {
     static_assert(sizeof(T) == 4); 
-    int self = lane_id();
+    int self = opus::lane_id();
     int index = (self & ~(width - 1)) + ((self ^ mask) & (width - 1));
     return __builtin_bit_cast(T, __builtin_amdgcn_ds_bpermute(index << 2, __builtin_bit_cast(int, var)));
 }
@@ -921,7 +921,7 @@ DINLINE T shfl_xor(T var, int mask, int width = opus::get_warp_size())
 template <template <typename> class functor, typename T, int reduce_range, int stop_stride = 0>
 DINLINE T warpReduce(T val)
 {
-    constexpr if (sizeof(T) == 4)
+    if constexpr (sizeof(T) == 4)
     {
         auto op = functor<T>();
 #pragma unroll
@@ -934,10 +934,10 @@ DINLINE T warpReduce(T val)
     else
     {
         auto op = functor<float>();
+        float val_fp32 = upcast_s(val);
 #pragma unroll
         for(int stride = reduce_range / 2; stride > stop_stride; stride >>= 1)
         {
-            float val_fp32 = upcast_s(val);
             float tmp = shfl_xor(val_fp32, stride, reduce_range);
             val_fp32  = op(val_fp32, tmp);
         }

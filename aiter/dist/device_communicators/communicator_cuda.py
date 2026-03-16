@@ -261,7 +261,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if (
             ca_comm is not None
             and not ca_comm.disabled
-            and ca_comm.should_custom_ar(input_)
+            and ca_comm.should_custom_ag(input_)
             and (
                 dim == 0
                 or (is_last_dim and input_size[-1] * input_.element_size() % 16 == 0)
