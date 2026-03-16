@@ -779,9 +779,6 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
             else:
                 qk_scale_value = softmax_scale
 
-        # Apply scaling to QK scores
-        qk_matrix = qk_scale_value * qk_matrix
-
         # ==================== Attention Masking ====================
         # Apply causal masking if required
         if IS_CAUSAL:
@@ -808,13 +805,15 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
 
         # Combine masks
         combined_mask = qk_row_mask[:, None] & causal_mask
-
+        qk_matrix = gl.convert_layout(qk_matrix, layout=qk_linear_layout)
+        # Apply scaling to QK scores
+        qk_matrix = qk_scale_value * qk_matrix
         # Apply masking to QK scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
         qk_matrix = gl.where(combined_mask, qk_matrix, float(-3.4e38))
 
         # ==================== Softmax Computation ====================
         # Compute new maximum logits
-        qk_matrix = gl.convert_layout(qk_matrix, layout=qk_linear_layout)
+
         current_max_logits = gl.max(qk_matrix, axis=1)
         new_max_logits = gl.maximum(max_logits, current_max_logits)
 
@@ -1732,8 +1731,7 @@ def paged_attention_decode_sliding_window_head_1(
                 qk_scale_value = softmax_scale * query_scale_value
             else:
                 qk_scale_value = softmax_scale
-        attention_scores = gl.convert_layout(attention_scores, layout=qk_linear_layout)
-        attention_scores = qk_scale_value * attention_scores
+
         # ==================== ATTENTION MASKING ====================
         qk_column_offsets = kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE + gl.arange(
             0, CONTEXT_PARTITION_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
@@ -1809,6 +1807,8 @@ def paged_attention_decode_sliding_window_head_1(
         )
         boundary_mask = qk_row_mask[:, None] & causal_mask
 
+        attention_scores = gl.convert_layout(attention_scores, layout=qk_linear_layout)
+        attention_scores = qk_scale_value * attention_scores
         # Apply masking to attention scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
         attention_scores = gl.where(boundary_mask, attention_scores, float(-3.4e38))
 
@@ -2736,8 +2736,7 @@ def paged_attention_decode_sliding_window(
                 qk_scale_value = softmax_scale * query_scale_value
             else:
                 qk_scale_value = softmax_scale
-        attention_scores = gl.convert_layout(attention_scores, layout=qk_linear_layout)
-        attention_scores = qk_scale_value * attention_scores
+
         # ==================== ATTENTION MASKING ====================
         # Compute query token index (0 to query_seq_len-1)
         query_token_idx = qk_row_offsets // ONE_QUERY_GROUP_SIZE_POW2
@@ -2775,9 +2774,10 @@ def paged_attention_decode_sliding_window(
                 )
 
         boundary_mask = qk_row_mask[:, None] & causal_mask
-
+        attention_scores = gl.convert_layout(attention_scores, layout=qk_linear_layout)
+        attention_scores = qk_scale_value * attention_scores
         # Apply masking to attention scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
-        attention_scores = tl.where(boundary_mask, attention_scores, float(-3.4e38))
+        attention_scores = gl.where(boundary_mask, attention_scores, float(-3.4e38))
 
         # ==================== SOFTMAX COMPUTATION ====================
         # Update running maximum for numerical stability
@@ -3603,8 +3603,6 @@ def paged_attention_decode_v2_gluon_dot_kernel(
                 qk_scale_value = softmax_scale * query_scale_value
             else:
                 qk_scale_value = softmax_scale
-        attention_scores = gl.convert_layout(attention_scores, layout=qk_linear_layout)
-        attention_scores = qk_scale_value * attention_scores
 
         # ==================== ATTENTION MASKING ====================
         # Create boundary mask for valid sequence positions
@@ -3635,6 +3633,9 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         boundary_mask = qk_row_mask[:, None] & causal_mask
         if SLIDING_WINDOW > 0:
             boundary_mask = boundary_mask & is_valid_partition
+
+        attention_scores = gl.convert_layout(attention_scores, layout=qk_linear_layout)
+        attention_scores = qk_scale_value * attention_scores
 
         # Apply masking to attention scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
         attention_scores = gl.where(boundary_mask, attention_scores, float(-3.4e38))
