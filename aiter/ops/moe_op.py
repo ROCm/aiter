@@ -183,6 +183,7 @@ def fmoe_fp8_blockscale_g1u1(
     fc_scale_blkk: int = 128,
     fc2_smooth_scale: Optional[Tensor] = None,
     activation: Optional[Enum] = ActivationType.Silu.value,
+    block_size_M: int = 32,
 ) -> None: ...
 
 

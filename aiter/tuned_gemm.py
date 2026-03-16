@@ -22,19 +22,12 @@ from typing import Optional
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from torch import Tensor
-
-from aiter import (
-    dtypes,
-    gemm_a16w16_asm,
-    hipb_create_extension,
-    hipb_mm,
-    logger,
-)
+from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gemm_op_common import get_padded_m
+from torch import Tensor
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -209,13 +202,12 @@ def gen_gemm_a16w16_fake_tensor(
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
 ) -> Tensor:
-    out = torch.empty(
-        A.view(-1, A.size(-1)).shape[0],
+    return torch.empty(
+        *A.shape[:-1],
         B.shape[0],
         dtype=otype or A.dtype,
         device=A.device,
     )
-    return out.view(*A.shape[:-1], B.shape[0])
 
 
 @torch_compile_guard(gen_fake=gen_gemm_a16w16_fake_tensor)
