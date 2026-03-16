@@ -794,6 +794,179 @@ chmod +x bench_pa_prefill_comprehensive.sh
 ./bench_pa_prefill_comprehensive.sh
 ```
 
+###### How to Run MOE
+
+Run MoE (Mixture of Experts) benchmarks:
+
+```bash
+# Navigate to benchmarks directory
+cd op_tests/op_benchmarks/triton
+
+# List available models
+python bench_moe.py --help
+
+# Run MoE benchmark with model configuration
+python bench_moe.py --model mixtral-7B
+
+# Run with custom M dimension
+python bench_moe.py --model mixtral-7B -M 4096
+
+# Run with different data types
+python bench_moe.py --model mixtral-7B -M 4096 -dtype bf16
+
+# Run with FP8 precision
+python bench_moe.py --model mixtral-7B -M 4096 -fp8_w8a8
+
+# Run with INT8 precision
+python bench_moe.py --model mixtral-7B -M 4096 -int8_w8a16
+
+# Run with INT4 precision (requires group_size)
+python bench_moe.py --model mixtral-7B -M 4096 -int4_w4a16 -group_size 128
+
+# Run with routed weight
+python bench_moe.py --model mixtral-7B -M 4096 -routed_weight
+
+# Run with SiLU fused
+python bench_moe.py --model mixtral-7B -M 4096 -silu_fused
+
+# Skip stage 2 benchmarking
+python bench_moe.py --model mixtral-7B -M 4096 -no_bench_stage2
+
+# Print only time metric
+python bench_moe.py --model mixtral-7B -M 4096 -print_time
+
+# Save results to CSV
+python bench_moe.py --model mixtral-7B -M 4096 -o
+
+# Print VGPR usage
+python bench_moe.py --model mixtral-7B -M 4096 -print_vgpr
+```
+
+**Common MoE Benchmark Arguments:**
+
+- `--model`: Model name (e.g., `mixtral-7B`, `mixtral-22B`, use `all` to benchmark all models)
+- `-M`: M dimension (batch size × sequence length, default: 4096 if not specified)
+- `-dtype`: Data type (`fp16`, `bf16`, `fp32`, default: `fp16`)
+- `-fp8_type`: FP8 data type (`e5m2fnuz`, `e4m3fnuz`, default: `e5m2fnuz`)
+- `-routed_weight`: Enable routed weight mechanism
+- `-int8_w8a16`: Use INT8 weight with FP16 activation
+- `-fp8_w8a8`: Use FP8 weight and activation
+- `-int4_w4a16`: Use INT4 weight with FP16 activation (requires `-group_size`)
+- `-group_size`: Group size for INT4 quantization (required when using `-int4_w4a16`)
+- `-has_zp`: Enable zero point for quantization
+- `-silu_fused`: Enable SiLU activation fusion (automatically sets `-no_bench_stage2`)
+- `-no_bench_stage2`: Skip stage 2 benchmarking (default: enabled)
+- `-print_time`: Print only time metric (default: prints time, TFLOPS, and bandwidth)
+- `-print_vgpr`: Print VGPR usage of the compiled Triton kernel
+- `-o`: Save results to CSV file
+- `-model_configs`: Path to model config JSON file (default: `utils/model_configs.json`)
+
+**Note**: MoE benchmarks use model configurations from `utils/model_configs.json`. The M, N, K, E, and top_k parameters are typically derived from the model configuration, but you can override M with the `-M` flag. When using `-int4_w4a16`, you must specify `-group_size` (e.g., `-group_size 128`).
+
+**Comprehensive Benchmark Script:**
+
+Here's a bash script to run `bench_moe.py` with all combinations of flags:
+
+```bash
+#!/bin/bash
+# Comprehensive benchmark script for bench_moe.py
+# Tests all combinations of parameters
+# Total combinations: 4 (M) × 2 (dtype) × 2 (routed_weight) × 2 (int8) × 2 (fp8) × 2 (silu_fused) × 2 (no_bench_stage2) = 256 combinations
+
+MODEL="mixtral-7B"
+OUTPUT_DIR="moe_benchmark_results"
+mkdir -p $OUTPUT_DIR
+
+echo "Starting comprehensive MoE benchmarks with all combinations..."
+
+# Define parameter arrays
+# Total combinations: 4 × 2 × 2 × 2 × 2 × 2 × 2 = 256
+M_VALUES=(1024 2048 4096 8192)
+DTYPES=(fp16 bf16)
+ROUTED_WEIGHT_FLAGS=("" "-routed_weight")
+INT8_FLAGS=("" "-int8_w8a16")
+FP8_FLAGS=("" "-fp8_w8a8")
+SILU_FUSED_FLAGS=("" "-silu_fused")
+NO_BENCH_STAGE2_FLAGS=("" "-no_bench_stage2")
+
+# Counter for tracking progress
+TOTAL=$(( ${#M_VALUES[@]} * ${#DTYPES[@]} * ${#ROUTED_WEIGHT_FLAGS[@]} * ${#INT8_FLAGS[@]} * ${#FP8_FLAGS[@]} * ${#SILU_FUSED_FLAGS[@]} * ${#NO_BENCH_STAGE2_FLAGS[@]} ))
+CURRENT=0
+
+# Nested loops to test all combinations
+for M in "${M_VALUES[@]}"; do
+    for DTYPE in "${DTYPES[@]}"; do
+        for ROUTED in "${ROUTED_WEIGHT_FLAGS[@]}"; do
+            for INT8 in "${INT8_FLAGS[@]}"; do
+                for FP8 in "${FP8_FLAGS[@]}"; do
+                    for SILU in "${SILU_FUSED_FLAGS[@]}"; do
+                        for NO_STAGE2 in "${NO_BENCH_STAGE2_FLAGS[@]}"; do
+                            CURRENT=$((CURRENT + 1))
+                            
+                            # Skip invalid combinations
+                            # FP8 and INT8 cannot be used together
+                            if [ -n "$FP8" ] && [ -n "$INT8" ]; then
+                                continue
+                            fi
+                            
+                            # SiLU fused automatically sets no_bench_stage2
+                            if [ -n "$SILU" ] && [ -n "$NO_STAGE2" ]; then
+                                continue
+                            fi
+                            
+                            # Build filename from parameters
+                            FILENAME="M${M}_${DTYPE}"
+                            if [ -n "$ROUTED" ]; then
+                                FILENAME="${FILENAME}_routed"
+                            fi
+                            if [ -n "$INT8" ]; then
+                                FILENAME="${FILENAME}_int8"
+                            fi
+                            if [ -n "$FP8" ]; then
+                                FILENAME="${FILENAME}_fp8"
+                            fi
+                            if [ -n "$SILU" ]; then
+                                FILENAME="${FILENAME}_silu"
+                            fi
+                            if [ -n "$NO_STAGE2" ]; then
+                                FILENAME="${FILENAME}_nostage2"
+                            fi
+                            
+                            echo "[$CURRENT/$TOTAL] Testing: M=$M, dtype=$DTYPE, routed=${ROUTED:--}, int8=${INT8:--}, fp8=${FP8:--}, silu=${SILU:--}, no_stage2=${NO_STAGE2:--}"
+                            
+                            # Build command
+                            CMD="python bench_moe.py --model $MODEL -M $M -dtype $DTYPE $ROUTED $INT8 $FP8 $SILU $NO_STAGE2 -o"
+                            
+                            # Run benchmark
+                            $CMD > /dev/null 2>&1
+                            
+                            # Move CSV file if it exists
+                            if ls *.csv 1> /dev/null 2>&1; then
+                                mv *.csv $OUTPUT_DIR/${FILENAME}.csv 2>/dev/null || true
+                            fi
+                        done
+                    done
+                done
+            done
+        done
+    done
+done
+
+# Test VGPR usage separately (only need to run once)
+echo "Testing VGPR usage..."
+python bench_moe.py --model $MODEL -M 4096 -print_vgpr > $OUTPUT_DIR/vgpr_usage.txt 2>&1
+
+echo "Benchmarking complete! Results saved in $OUTPUT_DIR/"
+echo "Total combinations tested: $TOTAL"
+```
+
+Save this script as `bench_moe_comprehensive.sh`, make it executable, and run it:
+
+```bash
+chmod +x bench_moe_comprehensive.sh
+./bench_moe_comprehensive.sh
+```
+
 ##### KV Cache Tests
 
 Run FlashAttention with KV cache tests:
