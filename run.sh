@@ -353,6 +353,8 @@ function get_triton_pa_thread_trace {
 # pip install -e .
 
 
+# wget https://github.com/ROCm/rocprof-trace-decoder/releases/download/0.1.6/rocprof-trace-decoder-manylinux-2.28-0.1.6-Linux.sh
+# chmod a+x rocprof-trace-decoder-manylinux-2.28-0.1.6-Linux.sh
 # # Press y then n while install
 # ./rocprof-trace-decoder-manylinux-2.28-0.1.6-Linux.sh --prefix=/opt/rocm/
 # cd /opt/rocm/
