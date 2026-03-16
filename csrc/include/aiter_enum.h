@@ -17,4 +17,5 @@ enum class QuantType : int
     per_1x32,
     per_1x128,
     per_128x128,
+    lqq_1x64,
 };
