@@ -20,8 +20,8 @@ from triton.experimental.gluon import language as gl
 
 @gluon.jit
 def create_tensor_descriptors(a_ptr, b_ptr, off_am, off_bn, stride_am, stride_ak, stride_bn, stride_bk,
-                              shared_layout_a: gl.constexpr, shared_layout_b: gl.constexpr, M,
-                              N, K, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+                              shared_layout_a: gl.constexpr, shared_layout_b: gl.constexpr, M: gl.constexpr,
+                              N: gl.constexpr, K: gl.constexpr, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
                               BLOCK_K: gl.constexpr, TRANSPOSE_B: gl.constexpr):
 
     a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(base=a_ptr + off_am, shape=(M, K),
@@ -38,6 +38,23 @@ def create_tensor_descriptors(a_ptr, b_ptr, off_am, off_bn, stride_am, stride_ak
 
     return a_desc, b_desc
 
+# TODO edit this
+@gluon.jit
+def create_scale_tensor_descriptors(a_ptr, b_ptr, off_am, off_bn, stride_am, stride_ak, stride_bn, stride_bk,
+                              shared_layout_a: gl.constexpr, shared_layout_b: gl.constexpr, M: gl.constexpr,
+                              N: gl.constexpr, K: gl.constexpr, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+                              BLOCK_K: gl.constexpr):
+
+    a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(base=a_ptr + off_am, shape=(M,),
+                                                         strides=(stride_am,), block_shape=(BLOCK_M,),
+                                                         layout=shared_layout_a)
+    b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(base=b_ptr + off_bn, shape=(N,),
+                                                             strides=(stride_bn,),
+                                                             block_shape=(BLOCK_N,), layout=shared_layout_b)
+    
+    return a_desc, b_desc
+
+
 @gluon.jit
 def issue_loads(producer, a_desc, b_desc, off_am, off_bn, a_buffer, b_buffer, BLOCK_K: gl.constexpr,
                 NUM_BUFFERS: gl.constexpr, TRANSPOSE_B: gl.constexpr, pred=1):
@@ -45,13 +62,31 @@ def issue_loads(producer, a_desc, b_desc, off_am, off_bn, a_buffer, b_buffer, BL
     # Convert boolean pred to i32 for hardware predicate (i1 -> i32)
     pred_i32 = pred.to(gl.int32) if hasattr(pred, 'to') else pred
     gl.amd.gfx1250.tdm.async_load(a_desc, [off_am, producer * BLOCK_K], a_buffer.index(producer % NUM_BUFFERS),
-                                    pred=1)
+                                    pred=pred_i32)
     if not TRANSPOSE_B:
         gl.amd.gfx1250.tdm.async_load(b_desc, [producer * BLOCK_K, off_bn], b_buffer.index(producer % NUM_BUFFERS),
-                                        pred=1)
+                                        pred=pred_i32)
     else:
         gl.amd.gfx1250.tdm.async_load(b_desc, [off_bn, producer * BLOCK_K], b_buffer.index(producer % NUM_BUFFERS),
-                                        pred=1)
+                                        pred=pred_i32)
+    producer += 1
+    return producer
+
+# TODO edit this fxn header
+@gluon.jit
+def issue_scale_loads(producer, a_desc, b_desc, off_am, off_bn, a_buffer, b_buffer, BLOCK_K: gl.constexpr,
+                NUM_BUFFERS: gl.constexpr, TRANSPOSE_B: gl.constexpr, pred=1):
+    # pred is a hardware predicate passed to async_load for conditional execution without branch divergence
+    # Convert boolean pred to i32 for hardware predicate (i1 -> i32)
+    pred_i32 = pred.to(gl.int32) if hasattr(pred, 'to') else pred
+    gl.amd.gfx1250.tdm.async_load(a_desc, [off_am, producer * BLOCK_K], a_buffer.index(producer),
+                                    pred=pred_i32)
+    if not TRANSPOSE_B:
+        gl.amd.gfx1250.tdm.async_load(b_desc, [producer * BLOCK_K, off_bn], b_buffer.index(producer),
+                                        pred=pred_i32)
+    else:
+        gl.amd.gfx1250.tdm.async_load(b_desc, [off_bn, producer * BLOCK_K], b_buffer.index(producer),
+                                        pred=pred_i32)
     producer += 1
     return producer
 
@@ -201,26 +236,28 @@ def _gemm_a8w8_blockscale_kernel(
 
     # Setup
     if NUM_KSPLIT == 1:
+        remap_xcd(pid, GRID_MN)
+
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
         pid_m = pid // num_pid_n
         pid_n = pid % num_pid_n
 
-    threads_per_elem_mk: gl.constexpr = 1#triton.cdiv(
-    #     BLOCK_SIZE_M * BLOCK_SIZE_K // (NUM_WARPS * 64), 16
-    # )
-    threads_per_elem_kn: gl.constexpr = 1#triton.cdiv(
-    #     BLOCK_SIZE_K * BLOCK_SIZE_N // (NUM_WARPS * 64), 16
-    # )
+    threads_per_elem_mk: gl.constexpr = triton.cdiv(
+        BLOCK_SIZE_M * BLOCK_SIZE_K // (NUM_WARPS * 64), 16
+    )
+    threads_per_elem_kn: gl.constexpr = triton.cdiv(
+        BLOCK_SIZE_K * BLOCK_SIZE_N // (NUM_WARPS * 64), 16
+    )
     blocked_mk: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[threads_per_elem_mk, 16],
-        threads_per_warp=[4, 8], # 32 bc its 32 threads in a warp
+        threads_per_warp=[8, 4], # 32
         warps_per_cta=[NUM_WARPS, 1],
         order=[1, 0],
     )
     blocked_kn: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[16, threads_per_elem_kn],
-        threads_per_warp=[8, 4], # 32
+        threads_per_warp=[4, 8], # 32
         warps_per_cta=[1, NUM_WARPS],
         order=[0, 1],
     )
@@ -232,16 +269,17 @@ def _gemm_a8w8_blockscale_kernel(
     # TDM Shared Layouts
     tdm_shared_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_SIZE_K, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_K],
                                                                                 [1, 0])
-    tdm_shared_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_K, BLOCK_SIZE_N],
-                                                                                    [0, 1])
+    tdm_shared_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_SIZE_N, 16]], [BLOCK_SIZE_K, BLOCK_SIZE_N],
+                                                                                    [1, 0])
     
     # unswizzled scales
     shared_a_scale: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=1, per_phase=1, max_phase=1, order=[0]
+        vec=16, per_phase=1, max_phase=1, order=[0]
     )
     shared_b_scale: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=1, per_phase=1, max_phase=1, order=[0]
+        vec=16, per_phase=1, max_phase=1, order=[0]
     )
+
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=wmma_layout, k_width=8
     )
@@ -279,10 +317,12 @@ def _gemm_a8w8_blockscale_kernel(
         # Create pointers for the scales
         offs_k_scale = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K
         offs_a_scale = offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
-        
+        offs_b = offs_bk_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+        offs_b_scale_n = offs_bn // GROUP_N
+        offs_b_scale = offs_k_scale * stride_bscale_k + offs_b_scale_n * stride_bscale_n
         
         # TDM tensor descriptors and shared mem
-        a_desc, b_desc = create_tensor_descriptors(a_ptr, b_ptr, 0, 0,
+        a_desc, b_desc = create_tensor_descriptors(a_ptr, b_ptr, pid_m * BLOCK_SIZE_M * stride_am, pid_n * BLOCK_SIZE_N * stride_bn,
                                                stride_am, stride_ak, stride_bn, stride_bk, tdm_shared_a,
                                                tdm_shared_b, M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, False)
         tdm_smem_a = gl.allocate_shared_memory(a_desc.dtype, shape=[NUM_BUFFERS] + a_desc.block_shape, layout=a_desc.layout)
@@ -292,17 +332,26 @@ def _gemm_a8w8_blockscale_kernel(
         producer = 0 # producer
         consumer = 0 # consumer
 
-        # Load A scale from global
+        # scale
+        # TDM tensor descriptors and shared mem
+        a_scale_desc, b_scale_desc = create_scale_tensor_descriptors(a_scale_ptr, b_scale_ptr, pid_m * BLOCK_SIZE_M * stride_am, pid_n * BLOCK_SIZE_N * stride_bn,
+                                               stride_am, stride_ak, stride_bn, stride_bk, shared_a_scale,
+                                               shared_b_scale, M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K)
+        tdm_scalemem_a = gl.allocate_shared_memory(a_scale_desc.dtype, shape=[BLOCK_SIZE_M], layout=a_scale_desc.layout)
+        tdm_scalemem_b = gl.allocate_shared_memory(b_scale_desc.dtype, shape=[BLOCK_SIZE_N], layout=b_scale_desc.layout)
+        # TODO change these names like above
+        scale_producer = 0
+        scale_consumer = 0
+
+        # # # Load A scale from global
         a_scale = gl.amd.cdna4.buffer_load(
             ptr=a_scale_ptr,
             offsets=offs_a_scale,
             cache=cache_modifier,
         )
 
-        offs_b = offs_bk_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-        offs_b_scale_n = offs_bn // GROUP_N
-        offs_b_scale = offs_k_scale * stride_bscale_k + offs_b_scale_n * stride_bscale_n
-        # Load b scale from global
+        
+        # # Load b scale from global
         b_scale = gl.amd.cdna4.buffer_load(
             ptr=b_scale_ptr,
             offsets=offs_b_scale,
@@ -311,15 +360,16 @@ def _gemm_a8w8_blockscale_kernel(
         # prefetch lds
         #issue_l2_prefetches_prologue(L2_PREFETCH_DISTANCE, producer, a_desc, b_desc, 0, 0, BLOCK_SIZE_K, NUM_BUFFERS,
                                  #False)
-        off_am_tdm: gl.int32 = pid_m * BLOCK_SIZE_M
-        off_bm_tdm: gl.int32 = pid_n * BLOCK_SIZE_N
         # Loading initial batch of a and b to be in the queue. now 2 things in queue (with num buffers 2)
         for _ in gl.static_range(NUM_BUFFERS - 1):
-            producer = issue_loads(producer, a_desc, b_desc, off_am_tdm, off_bm_tdm, tdm_smem_a, tdm_smem_b, BLOCK_SIZE_K, NUM_BUFFERS, False)
-       
-        # Store scales in WMMA slice order so load(SliceLayout(1/0, wmma_layout)) aligns scale[i] with row/col i
-        smem_scale_a.store(gl.convert_layout(a_scale, gl.SliceLayout(1, wmma_layout)))
-        smem_scale_b.store(gl.convert_layout(b_scale, gl.SliceLayout(0, wmma_layout))) 
+            producer = issue_loads(producer, a_desc, b_desc, 0, 0, tdm_smem_a, tdm_smem_b, BLOCK_SIZE_K, NUM_BUFFERS, False)
+            scale_producer = issue_scale_loads(scale_producer, a_scale_desc, b_scale_desc, 0, 0, tdm_scalemem_a, tdm_scalemem_b, BLOCK_SIZE_K, NUM_BUFFERS, False)
+        # load a & b from the last load
+        # a = tdm_smem_a.index((producer - 1) % NUM_BUFFERS).load(layout=dot_a_layout)
+        # b = tdm_smem_b.index((producer - 1) % NUM_BUFFERS).load(layout=dot_b_layout)
+
+        smem_scale_a.store(a_scale)
+        smem_scale_b.store(b_scale) 
 
         acc_dtype = gl.float32 if c_ptr.type.element_ty != gl.int8 else gl.int32
         acc = gl.zeros(
@@ -353,29 +403,30 @@ def _gemm_a8w8_blockscale_kernel(
 
             
             # Load A for tiling. now loads both A and B
-            producer = issue_loads(producer, a_desc, b_desc, off_am_tdm, off_bm_tdm, tdm_smem_a, tdm_smem_b, BLOCK_SIZE_K, NUM_BUFFERS, False)
+            producer = issue_loads(producer, a_desc, b_desc, 0, 0, tdm_smem_a, tdm_smem_b, BLOCK_SIZE_K, NUM_BUFFERS, False)
             
             # prefetching
             #issue_l2_prefetches(L2_PREFETCH_DISTANCE - 1, producer, a_desc, b_desc, 0, 0, BLOCK_SIZE_K, False)
 
             # WMMA but the legit way
-            consumer, zeros = issue_wmma(consumer, tdm_smem_a, dot_a_layout, tdm_smem_b, dot_b_layout, zeros, 0, NUM_BUFFERS, False)
+            consumer, zeros = issue_wmma(consumer, tdm_smem_a, dot_a_layout, tdm_smem_b, dot_b_layout, zeros, 2, NUM_BUFFERS, False)
             acc += zeros * cur_a_scale[:, None] * cur_b_scale[None, :]
             zeros = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=wmma_layout)
 
             #tdm_smem_a.index(curr_buf_a % NUM_BUFFERS).store(a)
-            # Store in WMMA slice order so next iteration's load aligns scale[i] with row/col i
-            smem_scale_a.store(gl.convert_layout(a_scale, gl.SliceLayout(1, wmma_layout)))
-            smem_scale_b.store(gl.convert_layout(b_scale, gl.SliceLayout(0, wmma_layout))) 
+            smem_scale_a.store(a_scale)
+            smem_scale_b.store(b_scale) 
 
         # ======= Epilogue ========
-
+        #tdm_smem_b.index(curr_buf_b % NUM_BUFFERS).store(b)
+        #smem_scale_b.store(b_scale)
         # load a from the last load
         cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
         cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
 
+        #zeros = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
         for i in gl.static_range(NUM_BUFFERS - 1):
-            consumer, zeros = issue_wmma(consumer, tdm_smem_a, dot_a_layout, tdm_smem_b, dot_b_layout, zeros, 0, NUM_BUFFERS, False)
+            consumer, zeros = issue_wmma(consumer, tdm_smem_a, dot_a_layout, tdm_smem_b, dot_b_layout, zeros, 2, NUM_BUFFERS, False)
             acc += zeros * cur_a_scale[:, None] * cur_b_scale[None, :]
             zeros = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=wmma_layout)
 
@@ -396,13 +447,8 @@ def _gemm_a8w8_blockscale_kernel(
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
 
-        # gl.amd.cdna4.buffer_store(
-        #     stored_value=c, ptr=c_ptr, offsets=c_offs, mask=c_mask
-        # )
-        gl.store(
-            c_ptr + c_offs,
-            c,
-            mask=c_mask,
+        gl.amd.cdna4.buffer_store(
+            stored_value=c, ptr=c_ptr, offsets=c_offs, mask=c_mask
         )
 
 
@@ -654,11 +700,9 @@ def gemm_a8w8_blockscale(
         **config,
     )
     print("complete")
-    # print(y)
+    print(y)
 
-    if config["NUM_KSPLIT"] > 1:
-        print("tried to enter num ksplit")
-        print(config["NUM_KSPLIT"])
+    # if config["NUM_KSPLIT"] > 1:
     #     REDUCE_BLOCK_SIZE_M = 32
     #     REDUCE_BLOCK_SIZE_N = 32
     #     ACTUAL_KSPLIT = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])

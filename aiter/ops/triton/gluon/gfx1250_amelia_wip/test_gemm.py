@@ -3,7 +3,7 @@
 
 import torch
 import pytest
-from aiter.ops.triton.gluon.gfx1250_amelia_wip.gemma8w8_1250_take2 import (
+from aiter.ops.triton.gluon.gfx1250_amelia_wip.gemma8w8_1250_v2 import (
     gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
 )
 from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
@@ -218,19 +218,9 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
             shuffle=("_shuffle" in impl),
         )
     )
-    x, weight, weight_triton, x_scale, x_scale_shuffled, w_scale, y = (
-        generate_gemm_a8w8_blockscale_inputs(
-            M,
-            N,
-            K,
-            block_shape_n,
-            block_shape_k,
-            dtype=dtype,
-            layout=layout,
-            output=output,
-            shuffle=("_shuffle" in impl),
-        )
-    )
+    # x_scale.fill_(1.0)
+    # x_scale_shuffled.fill_(1.0)
+    # w_scale.fill_(1.0)
 
     if impl == "gluon":
         impl = gluon_gemm_a8w8_blockscale
@@ -239,6 +229,9 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
     
     a = run_torch(x, weight, x_scale, w_scale, dtype)
 
-    b = run_triton(x, weight_triton, x_scale_shuffled, w_scale, dtype, y, impl)
+    b = run_triton(x, weight_triton, x_scale, w_scale, dtype, y, impl)
 
+    print(a)
+    print(b)
     torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
+test_gemm("bf16", 32, 5120, 2944, "TN", True, "gluon")
