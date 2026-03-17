@@ -1557,12 +1557,18 @@ class FmoeTuner(TunerCommon):
         else:
             quantDtype = ""
         asm_kernels = self.get_kernels_dict(
-            kernels_list_csv.format(quantDtype=quantDtype, extraInfo=extraInfo)
+            kernels_list_csv.format(quantDtype=quantDtype, extraInfo=extraInfo),
+            key=["tile_m", "tile_n"],
         )
         for blockM in blockMs:
             if use_g1u1 and q_dtype_w != torch.int4:
-                for el in asm_kernels.get(blockM, []):
-                    tasks.append(
+                for (tile_m, tile_n), knl_list in asm_kernels.items():
+                    if tile_m != blockM:
+                        continue
+                    if inter_dim % tile_n != 0:
+                        continue
+                    for el in knl_list:
+                        tasks.append(
                         (
                             (info, "stage1", el, blockM),  # tag
                             FmoeTuner.generate_asm_stage1,
@@ -1669,10 +1675,20 @@ class FmoeTuner(TunerCommon):
             not doweight_stage1,
             True,  # bpreshuffle
         )
+        # CK stage1 GEMM: A=[token, model_dim] x B=[expert, 2*inter_dim, model_dim]^T
+        # N = 2*inter_dim (g1u1), K = model_dim
+        # CK stage2 GEMM: A=[token, inter_dim] x B=[expert, model_dim, inter_dim]^T
+        # N = model_dim, K = inter_dim
+        stage1_N = inter_dim * 2 if use_g1u1 else inter_dim
+        stage1_K = model_dim
+        stage2_N = model_dim
+        stage2_K = inter_dim
         for blockM in blockMs:
             if blockM in [16, 32, 64, 128] and use_g1u1:
                 for kernel in ck_stage1_kernels.values():
                     if kernel.MPerBlock != blockM:
+                        continue
+                    if stage1_N % kernel.NPerBlock != 0 or stage1_K % kernel.KPerBlock != 0:
                         continue
                     tasks_ck.append(
                         (
@@ -1725,6 +1741,8 @@ class FmoeTuner(TunerCommon):
 
                 for kernel in ck_stage2_kernels.values():
                     if kernel.MPerBlock != blockM:
+                        continue
+                    if stage2_N % kernel.NPerBlock != 0 or stage2_K % kernel.KPerBlock != 0:
                         continue
                     tasks_ck.append(
                         (
