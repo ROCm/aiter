@@ -307,7 +307,6 @@ def consume_scaled_tile(
     WMMA_LAYOUT: gl.constexpr,
     DOT_A_LAYOUT: gl.constexpr,
     DOT_B_LAYOUT: gl.constexpr,
-    BLOCKED_B: gl.constexpr,
     PER_ROW_X_SCALE: gl.constexpr,
     is_x_blockscale: gl.constexpr,
     is_w_blockscale: gl.constexpr,
@@ -320,18 +319,20 @@ def consume_scaled_tile(
     offs_k_scale = (k_offset_start // BLOCKSCALE_K) + m * gl.cdiv(BLOCK_K, BLOCKSCALE_K)
     if is_x_blockscale:
         if PER_ROW_X_SCALE:
-            x_scale_offs = (
+            # XScale: [M, K_blocks]
+            a_scale_offs = (
                 gathered_m * stride_x_bs_m + offs_k_scale * stride_x_bs_k
             )
         else:
+            # XScale: [M_blocks, K_blocks]
             offs_x_scale_m = gathered_m // BLOCKSCALE_M
-            x_scale_offs = (
+            a_scale_offs = (
                 offs_x_scale_m * stride_x_bs_m
                 + offs_k_scale * stride_x_bs_k
             )
         cur_a_scale = gl.amd.cdna4.buffer_load(
             ptr=XBlockScale,
-            offsets=x_scale_offs,
+            offsets=a_scale_offs,
             cache="",
         )
     else:
@@ -340,7 +341,8 @@ def consume_scaled_tile(
         )
 
     if is_w_blockscale:
-        w_scale_base = WBlockScale + expt_id * stride_w_bs_e
+        # WScale: [K_blocks, N_blocks]
+        b_scale_base = WBlockScale + expt_id * stride_w_bs_e
         offs_w_n = pid_n * BLOCK_N + gl.arange(
             0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
         )
@@ -348,22 +350,20 @@ def consume_scaled_tile(
             gl.multiple_of(offs_w_n % N, BLOCK_N),
             BLOCK_N,
         )
+
         offs_w_scale_n = offs_w_n // BLOCKSCALE_N
-        # WScale: [K_blocks, N_blocks]
-        w_scale_ptrs = (
-            w_scale_base + offs_k_scale * stride_w_bs_k + offs_w_scale_n * stride_w_bs_n
+        b_scale_offs = (
+            offs_k_scale * stride_w_bs_k + offs_w_scale_n * stride_w_bs_n
         )
         cur_b_scale = gl.amd.cdna4.buffer_load(
-            ptr=w_scale_base,
-            offsets=offs_k_scale * stride_w_bs_k + offs_w_scale_n * stride_w_bs_n,
+            ptr=b_scale_base,
+            offsets=b_scale_offs,
             cache="",
         )
     else:
         cur_b_scale = gl.full(
             (BLOCK_N,), 1.0, dtype=gl.float32, layout=gl.SliceLayout(0, WMMA_LAYOUT)
         )
-
-    cur_a_scale = gl.convert_layout(cur_a_scale, gl.SliceLayout(1, WMMA_LAYOUT))
 
     zeros = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
     partial = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
@@ -399,6 +399,7 @@ def create_descriptor(
     BLOCKED_KN: gl.constexpr,
     SHARED_A: gl.constexpr,
     SHARED_B: gl.constexpr,
+    WMMA_LAYOUT: gl.constexpr,
 ):
     """
     Create tensor descriptors for X, W, and their scales.
@@ -407,26 +408,23 @@ def create_descriptor(
     Returns:
         a_desc: Tensor descriptor or AsyncCopyDescriptor for X
         b_desc: Tensor descriptor for W
-        a_scale_desc: Tensor descriptor for X scales (or None)
-        b_scale_desc: Tensor descriptor for W scales (or None)
-        gathered_m: Gathered row indices [BLOCK_M] (irregular)
+        gathered_m_idx: Row indices in blocked layout for async_gather
+        gathered_m_scale: Row indices in WMMA layout for scale buffer_load
 
     Notes:
         For this kernel implementation, BLOCKSCALE_K must equal BLOCK_K.
     """
-    splitk_block_size = gl.cdiv(K, SPLIT_K)
-
-    offs_x_m = BLOCK_M * block_id + gl.arange(
-        0, BLOCK_M, layout=gl.SliceLayout(1, BLOCKED_MK)
-    )
-    offs_x_m = gl.max_contiguous(gl.multiple_of(offs_x_m % M, BLOCK_M), BLOCK_M)
-
     # A descriptor
     in_m = grid_m * BLOCK_M
     if GatherIndx is None:
-        gathered_m = (start_m + offs_x_m).to(index_type)
-        offs_x_m = start_m + offs_x_m
-        in_m = grid_m * BLOCK_M
+        # blocked layout for async_gather
+        gathered_m_idx = start_m + BLOCK_M * block_id + gl.arange(
+        0, BLOCK_M, layout=gl.SliceLayout(1, BLOCKED_MK)
+        )
+        # wmma layout for buffer_load
+        gathered_m_scale = start_m + BLOCK_M * block_id + gl.arange(
+            0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
+        )
         a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=X + start_m * stride_x_m,
             shape=(in_m, K),
@@ -445,8 +443,17 @@ def create_descriptor(
         )
         IDX_LAYOUT: gl.constexpr = gl.SliceLayout(1, IDX_BASE_LAYOUT)
         idx_offs = BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=IDX_LAYOUT)
+        gathered_m_idx = gl.load(GatherIndx + idx_offs) // N_EXPTS_ACT
 
-        gathered_m = (gl.load(GatherIndx + idx_offs) // N_EXPTS_ACT).to(index_type)
+        wmma_idx_offs = BLOCK_M * block_id + gl.arange(
+            0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
+        )
+        gathered_m_scale = gl.amd.cdna4.buffer_load(
+            ptr=GatherIndx,
+            offsets=wmma_idx_offs,
+            cache=".cg",
+        ) // N_EXPTS_ACT
+
         a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=X,
             shape=(in_m, K),
@@ -473,7 +480,7 @@ def create_descriptor(
         layout=SHARED_B,
     )
 
-    return a_desc, b_desc, gathered_m
+    return a_desc, b_desc, gathered_m_idx, gathered_m_scale
 
 
 @gluon.jit(launch_metadata=matmul_launch_metadata)
@@ -614,12 +621,6 @@ def _moe_gemm_a8w8_blockscale(
         warps_per_cta=[1, num_warps],
         order=[0, 1],
     )
-    BLOCKED_B: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[BLOCK_N // 16, 16],
-        threads_per_warp=[1, 32],
-        warps_per_cta=[1, num_warps],
-        order=[0, 1],
-    )
     if num_warps == 4:
         warp_bases: gl.constexpr = [[0, 1], [1, 0]]
     else:
@@ -641,7 +642,7 @@ def _moe_gemm_a8w8_blockscale(
     )
 
     # Create tensor descriptors
-    a_desc, b_desc, gathered_m = create_descriptor(
+    a_desc, b_desc, gathered_m_idx, gathered_m_scale = create_descriptor(
         X,
         stride_x_m,
         stride_x_k,
@@ -668,6 +669,7 @@ def _moe_gemm_a8w8_blockscale(
         BLOCKED_KN,
         SHARED_A,
         SHARED_B,
+        WMMA_LAYOUT,
     )
 
     # Allocate shared memory buffers
@@ -695,7 +697,7 @@ def _moe_gemm_a8w8_blockscale(
             a_desc,
             b_desc,
             GatherIndx,
-            gathered_m,
+            gathered_m_idx,
             block_id,
             pid_n,
             k_offset_start,
@@ -715,7 +717,7 @@ def _moe_gemm_a8w8_blockscale(
             a_desc,
             b_desc,
             GatherIndx,
-            gathered_m,
+            gathered_m_idx,
             block_id,
             pid_n,
             k_offset_start,
@@ -741,7 +743,7 @@ def _moe_gemm_a8w8_blockscale(
             stride_w_bs_e,
             stride_w_bs_k,
             stride_w_bs_n,
-            gathered_m,
+            gathered_m_scale,
             expt_id,
             pid_n,
             N,
@@ -756,7 +758,6 @@ def _moe_gemm_a8w8_blockscale(
             WMMA_LAYOUT,
             DOT_A_LAYOUT,
             DOT_B_LAYOUT,
-            BLOCKED_B,
             PER_ROW_X_SCALE,
             is_x_blockscale,
             is_w_blockscale,
@@ -777,7 +778,7 @@ def _moe_gemm_a8w8_blockscale(
             stride_w_bs_e,
             stride_w_bs_k,
             stride_w_bs_n,
-            gathered_m,
+            gathered_m_scale,
             expt_id,
             pid_n,
             N,
@@ -792,7 +793,6 @@ def _moe_gemm_a8w8_blockscale(
             WMMA_LAYOUT,
             DOT_A_LAYOUT,
             DOT_B_LAYOUT,
-            BLOCKED_B,
             PER_ROW_X_SCALE,
             is_x_blockscale,
             is_w_blockscale,
@@ -853,7 +853,9 @@ def _moe_gemm_a8w8_blockscale(
     # quant
     if Quant_static_scale is not None:
         out = _compute_static_fp8_quant(out, gl.load(Quant_static_scale))
+    else:
+        out = out.to(gl.bfloat16)
     # write-back
     offs_c = stride_y_m * offs_cm[:, None] + stride_y_n * offs_cn[None, :]
     mask_c = mask_m[:, None] & mask_n[None, :]
-    gl.amd.gfx1250.buffer_store(out.to(Y.type.element_ty), Y, offs_c, mask=mask_c)
+    gl.amd.gfx1250.buffer_store(out, Y, offs_c, mask=mask_c)
