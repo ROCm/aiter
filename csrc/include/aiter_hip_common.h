@@ -2,6 +2,8 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #include "aiter_logger.h"
+#include "aiter_enum.h"
+#include "aiter_tensor.h"
 #include "ck_tile/core.hpp"
 #include <cstdint>
 #include <hip/hip_runtime.h>
@@ -24,6 +26,17 @@ enum class GPUArch
             std::cerr << "check failed, file=" << __FILE__ << ", line=" << __LINE__ << std::endl; \
             std::terminate();                                                                     \
         }                                                                                         \
+    } while(0)
+
+#define AITER_CHECK(x, ...)                                                                        \
+    do                                                                                             \
+    {                                                                                              \
+        if(!(x))                                                                                   \
+        {                                                                                          \
+            std::cerr << "[AITER] " << __FILE__ << ":" << __LINE__ << " " << __VA_ARGS__           \
+                      << std::endl;                                                                \
+            std::terminate();                                                                      \
+        }                                                                                          \
     } while(0)
 
 #define HIP_CALL(call)                                                       \
