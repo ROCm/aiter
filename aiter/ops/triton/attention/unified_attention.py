@@ -264,6 +264,7 @@ def unified_attention(
     v,
     out,
     cu_seqlens_q,
+    
     max_seqlen_q,
     seqused_k,
     max_seqlen_k,
@@ -280,10 +281,11 @@ def unified_attention(
     qq_bias=None,
     # Optional tensor for sinks
     sinks=None,
-    sage_version: SAGE_VERSION = None
+    sage_version: SAGE_VERSION = None,
+    cu_seqlens_k=None, # is only needed if kv_layout is not cache
+    kv_layout: str = "cache", # other options "bhsd", "bshd", "thd"
 ):
     assert causal, "Only causal attention is supported"
-
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
 
@@ -322,7 +324,7 @@ def unified_attention(
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
     # 3D kernel does not support sage attention yet; force 2D path when sage is active.
-    if use_2d_kernel(
+    if sage_version is not None or use_2d_kernel(
         head_size,
         SLIDING_WINDOW,
         ALL_DECODE,
@@ -370,6 +372,55 @@ def unified_attention(
         assert config["BLOCK_Q"] >= 1
         total_num_q_blocks = q.shape[0] // config["BLOCK_Q"] + num_seqs
 
+        if kv_layout == "cache":
+            KV_LAYOUT = 1
+            stride_k_cache_0=k.stride(0)
+            stride_k_cache_1=k.stride(1)
+            stride_k_cache_2=k.stride(2)
+            stride_k_cache_3=k.stride(3)
+            stride_v_cache_0=v.stride(0)
+            stride_v_cache_1=v.stride(1)
+            stride_v_cache_2=v.stride(2)
+            stride_v_cache_3=v.stride(3)
+            block_table_stride=block_table.stride(0)
+        elif kv_layout == "bshd":
+            KV_LAYOUT = 2
+            stride_k_cache_0=k.stride(0)
+            stride_k_cache_1=k.stride(1)
+            stride_k_cache_2=k.stride(2)
+            stride_k_cache_3=k.stride(3)
+            stride_v_cache_0=v.stride(0)
+            stride_v_cache_1=v.stride(1)
+            stride_v_cache_2=v.stride(2)
+            stride_v_cache_3=v.stride(3)
+            block_table_stride=0
+        elif kv_layout == "bhsd":
+            KV_LAYOUT = 2
+            stride_k_cache_0=k.stride(0)
+            stride_k_cache_1=k.stride(2)
+            stride_k_cache_2=k.stride(1)
+            stride_k_cache_3=k.stride(3)
+            stride_v_cache_0=v.stride(0)
+            stride_v_cache_1=v.stride(2)
+            stride_v_cache_2=v.stride(1)
+            stride_v_cache_3=v.stride(3)
+            block_table_stride=0
+        elif kv_layout=="thd":
+            assert cu_seqlens_k, "need cu_seqlens_k if kv_layout is thd"
+            KV_LAYOUT = 3
+            stride_k_cache_0=0
+            stride_k_cache_1=k.stride(0)
+            stride_k_cache_2=k.stride(1)
+            stride_k_cache_3=k.stride(2)
+            stride_v_cache_0=0
+            stride_v_cache_1=v.stride(0)
+            stride_v_cache_2=v.stride(1)
+            stride_v_cache_3=v.stride(2)
+            block_table_stride=0
+        else:
+            assert False, "unsupported kv layout"
+        
+        
         kernel_unified_attention_2d[
             (
                 num_kv_heads,
@@ -393,7 +444,7 @@ def unified_attention(
             softcap=softcap,
             num_query_heads=num_query_heads,
             num_queries_per_kv=num_queries_per_kv,
-            block_table_stride=block_table.stride(0),
+            block_table_stride=block_table_stride,
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
             query_scale_stride_0=query_scale_stride_0,
@@ -410,14 +461,14 @@ def unified_attention(
             USE_SOFTCAP=(softcap > 0),
             USE_SINKS=(sinks is not None),
             SLIDING_WINDOW=SLIDING_WINDOW,
-            stride_k_cache_0=k.stride(0),
-            stride_k_cache_1=k.stride(1),
-            stride_k_cache_2=k.stride(2),
-            stride_k_cache_3=k.stride(3),
-            stride_v_cache_0=v.stride(0),
-            stride_v_cache_1=v.stride(1),
-            stride_v_cache_2=v.stride(2),
-            stride_v_cache_3=v.stride(3),
+            stride_k_cache_0=stride_k_cache_0,
+            stride_k_cache_1=stride_k_cache_1,
+            stride_k_cache_2=stride_k_cache_2,
+            stride_k_cache_3=stride_k_cache_3,
+            stride_v_cache_0=stride_v_cache_0,
+            stride_v_cache_1=stride_v_cache_1,
+            stride_v_cache_2=stride_v_cache_2,
+            stride_v_cache_3=stride_v_cache_3,
             stride_k_cache_scale_0=stride_k_cache_scale_0,
             stride_k_cache_scale_1=stride_k_cache_scale_1,
             stride_k_cache_scale_2=stride_k_cache_scale_2,
@@ -425,10 +476,12 @@ def unified_attention(
             stride_v_cache_scale_0=stride_v_cache_scale_0,
             stride_v_cache_scale_1=stride_v_cache_scale_1,
             query_start_len_ptr=cu_seqlens_q,
+            key_start_len_ptr=cu_seqlens_k,
             num_seqs=num_seqs,
             OUTPUT_FP8=output_scale is not None,
             ALL_DECODE=ALL_DECODE,
             SAGE_VERSION=sage_version,
+            KV_LAYOUT=KV_LAYOUT,
             **config,
         )
 

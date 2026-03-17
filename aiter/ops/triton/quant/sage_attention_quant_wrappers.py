@@ -43,7 +43,7 @@ def unified_perblock_quantize_int8(
     assert num_queries_per_kv is not None # and config is not None
     num_heads = hq // num_queries_per_kv
     Q_descale = torch.empty(
-        (total_num_blocks, num_heads), dtype=torch.uint8, device=q.device
+        (total_num_blocks, num_heads), dtype=torch.float32, device=q.device
     )
     BLOCK_Q = BLOCK_SIZE_M // num_queries_per_kv
     perblock_quantize_q_kernel[(
@@ -87,20 +87,20 @@ def perblock_quantize_int8(
         b = len(cu_seqlens)
         h = q.shape[1]
         s = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item() 
-        total_num_blocks = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * b * h
+        total_num_blocks = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * b
         stride_m = h * d
     elif layout=="bhsd":
         b,h,s,_ = q.shape
-        total_num_blocks = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * b * h
+        total_num_blocks = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * b
         stride_m = d
     elif layout=="bshd":
         b,s,h,d = q.shape
-        total_num_blocks = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * b * h
+        total_num_blocks = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * b
         stride_m = h * d
     else: # num_blocks,block_size,h,d = q.shape
         # cached layout can be thought of as
         b,s,h,d = q.shape
-        total_num_blocks = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * b * h
+        total_num_blocks = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * b 
         stride_m = h * d
 
     Q_q = torch.empty((*q.shape[:-1], d), dtype=torch.int8, device=q.device)
@@ -111,7 +111,7 @@ def perblock_quantize_int8(
     # thd: cu_seqlens = cu_seqlens
     # cache: cu_seqlens = block_size, 2 block_size, 3 block_size,...
     Q_descale = torch.empty(
-        (total_num_blocks, h), dtype=torch.uint8, device=q.device
+        (total_num_blocks, h), dtype=torch.float32, device=q.device
     )
     num_pid_m = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
     grid = (b, num_pid_m, h)

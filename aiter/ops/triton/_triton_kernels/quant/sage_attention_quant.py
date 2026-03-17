@@ -117,7 +117,7 @@ def perblock_quantize_kernel(
     if query_start_len_ptr is not None:
         cur_batch_in_all_start_index = tl.load(query_start_len_ptr + pid_b)
         cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + pid_b + 1)
-        seqlen = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
+        seqlen = min(cur_batch_in_all_stop_index - cur_batch_in_all_start_index, max_seqlen)
     else:
         seqlen = max_seqlen
 

@@ -152,6 +152,9 @@ def v_scale_process(
         )
         return tl.load(v_descale_ptr, mask=head_mask[None, :], other=0.0)
 
+def get_base_offset()
+
+
 
 @triton.jit
 def kernel_unified_attention_2d(
@@ -205,6 +208,7 @@ def kernel_unified_attention_2d(
     stride_v_cache_scale_0: tl.int64,  # int
     stride_v_cache_scale_1: tl.int64,  # int
     query_start_len_ptr,  # [num_seqs+1]
+    key_start_len_ptr,  # [num_seqs+1]
     BLOCK_Q: tl.constexpr,  # int
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
@@ -213,8 +217,8 @@ def kernel_unified_attention_2d(
     FP8_MAX: tl.constexpr = float8_info.max,
     ALL_DECODE: tl.constexpr = False,  # bool
     SAGE_VERSION: tl.constexpr = None, # bool
-    IS_PAGING: tl.constexpr = True, # bool
     PRELOAD_V: tl.constexpr = False,
+    KV_LAYOUT: tl.constexpr = 1
 ):
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
@@ -308,7 +312,7 @@ def kernel_unified_attention_2d(
             SAGE_VERSION=SAGE_VERSION
         )
 
-    block_table_offset = seq_idx * block_table_stride
+    
 
     if not USE_SINKS:
         M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
@@ -387,13 +391,20 @@ def kernel_unified_attention_2d(
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
     # iterate through tiles (now limited to the sliding window range)
     
-    if not IS_PAGING:
-        seq_offset = tile_start * TILE_SIZE + offs_t
-        physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-        ).to(tl.int64)
+    
+    if KV_LAYOUT==2: # bshd
+        k_base_offset = (seq_idx * stride_k_cache_0).to(tl.int64)
+        v_base_offset = (seq_idx * stride_v_cache_0).to(tl.int64)
+    elif KV_LAYOUT==3: # thd
+        start_kv_token_idx = tl.load(key_start_len_ptr + seq_idx)
+        k_base_offset = (start_kv_token_idx * stride_k_cache_1).to(tl.int64)
+        v_base_offset = (start_kv_token_idx * stride_v_cache_1).to(tl.int64)
     
     
+    block_table_offset = seq_idx * block_table_stride
+    num_tiles_in_block = tl.cdiv(BLOCK_SIZE, TILE_SIZE)
+
+
     for j in range(tile_start, tile_end):
         seq_offset = j * TILE_SIZE + offs_t
         # to reduce the masking effect when not needed
@@ -402,20 +413,22 @@ def kernel_unified_attention_2d(
         else:
             tile_mask = seq_offset < max_seq_prefix_len
 
-        if IS_PAGING:
+        if KV_LAYOUT==1: # cache layout
             physical_block_idx = tl.load(
                 block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
             ).to(tl.int64)
+            k_base_offset = physical_block_idx * stride_k_cache_0
+            v_base_offset = physical_block_idx* stride_k_cache_0
 
         v_offset = (
-            physical_block_idx[:, None] * stride_v_cache_0
+            v_base_offset[:, None] 
             + kv_head_idx * stride_v_cache_2
             + offs_d[None, :] * stride_v_cache_3
             + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
         )
 
         k_offset = (
-            physical_block_idx[None, :] * stride_k_cache_0
+            k_base_offset[None, :]
             + kv_head_idx * stride_k_cache_2
             + offs_d_qk[:, None] * stride_k_cache_3
             + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
@@ -432,26 +445,31 @@ def kernel_unified_attention_2d(
         k_scale_loaded = None
         if SAGE_VERSION != None:
             K = K_load
-            k_scale_loaded = k_scale_process(
-                k_scale,
-                physical_block_idx,
-                seq_offset,
-                BLOCK_SIZE,
-                kv_head_idx,
-                offs_d_scale,
-                tile_mask[:, None], # For mxfp4 scale load only
-                stride_k_cache_scale_0,
-                stride_k_cache_scale_1,
-                stride_k_cache_scale_2,
-                stride_k_cache_scale_3,
-                SAGE_VERSION
-            )
-        # elif K_load.dtype.is_fp8():
-        #     # if Q.dtype.is_fp8():
-        #     #     K = K_load
-        #     # else:
-        #     #     K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
-        #     K = K_load.to(Q.dtype)
+            if SAGE_VERSION == 1: # SAGE V1 Each tile has its own scale
+                if KV_LAYOUT==1: # descale has size (num_blocks,cdiv(block_size, BLOCK_M),h)
+                    descale_blk_index = physical_block_idx * stride_k_cache_scale_0 + j % num_tiles_in_block * stride_k_cache_scale_0
+                elif KV_LAYOUT==2: # descale has size (b,cdiv(s, BLOCK_M),h)
+                    descale_blk_index = seq_idx * stride_k_cache_scale_0 + j * stride_k_cache_scale_0
+                
+                k_descale_ptr = (
+                    k_scale
+                    + descale_blk_index
+                    + kv_head_idx * stride_k_cache_scale_1
+                )
+                k_scale_loaded = tl.load(k_descale_ptr)
+            elif SAGE_VERSION == 2: # SAGE V2 Each token has its own scale
+                if KV_LAYOUT==1:
+                    descale_token_index = physical_block_idx * stride_k_cache_scale_0 + (seq_offset % BLOCK_SIZE) * stride_k_cache_scale_1
+                elif KV_LAYOUT==2:
+                    descale_token_index = seq_idx * stride_k_cache_scale_0 + (seq_offset % BLOCK_SIZE) * stride_k_cache_scale_1
+            
+                k_descale_ptr = (
+                    k_scale
+                    + descale_token_index[:, None]
+                    + kv_head_idx * stride_k_cache_scale_2
+                    + offs_d_scale[None, :] * stride_k_cache_scale_3
+                )
+                k_scale_loaded = tl.load(k_descale_ptr, mask=tile_mask[:, None], other=0.0)
         else:  # TODO: check convert effect on perf
             K = K_load.to(Q.dtype)
 
