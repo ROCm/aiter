@@ -1282,20 +1282,18 @@ def fused_moe_2stages(
                 a8_scale = torch.empty(
                     (topk, token_num, 1), dtype=dtypes.fp32, device=device
                 )
-                aiter.smooth_per_token_scaled_quant(
-                    a8.view(topk, token_num, model_dim).transpose(
-                        0, 1
-                    ),  # [token, topk, model_dim]
-                    hidden_states.view(token_num, 1, model_dim).expand(
-                        -1, topk, -1
-                    ),  # [token, topk, model_dim]
-                    a8_scale.view(topk * token_num),
-                    fc1_smooth_scale.to(dtypes.fp32).contiguous(),  # [E, model_dim]
-                    topk_ids.to(
-                        dtypes.i32
-                    ),  # [token, topk] - global expert ids as smooth_scale_map
-                    smooth_scale_map_hash=local_expert_hash,
-                    enable_ps=True,
+                aiter.moe_smooth_per_token_scaled_quant(
+                    a8,
+                    hidden_states,
+                    a8_scale,
+                    fc1_smooth_scale.to(dtypes.fp32).contiguous(),
+                    topk_ids.to(dtypes.i32),
+                    sorted_ids,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    block_size_M,
+                    local_expert_hash,
+                    transpose_out=True,
                 )
             else:
                 a8, a8_scale = aiter.pertoken_quant(
@@ -1432,15 +1430,17 @@ def fused_moe_2stages(
             (token_num, topk, inter_dim), dtype=dtypes.i8, device=device
         )
         a2_scale = torch.empty((token_num, topk, 1), dtype=dtypes.fp32, device=device)
-        aiter.smooth_per_token_scaled_quant(
+        aiter.moe_smooth_per_token_scaled_quant(
             a2_out,
             a2,
             a2_scale,
             fc2_smooth_scale.to(dtypes.fp32).contiguous(),
-            topk_ids.contiguous(),
-            smooth_scale_map_hash=local_expert_hash,  # Optional EP hash for global->local mapping
-            num_rows=num_local_tokens,
-            num_rows_factor=topk,
+            topk_ids.to(dtypes.i32).contiguous(),
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            block_size_M,
+            local_expert_hash,
         )
         a2 = a2_out
     else:
