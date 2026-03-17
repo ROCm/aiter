@@ -1336,6 +1336,14 @@ def fused_moe_2stages(
         )
     extra_stage1_args = {}
     extra_stage2_args = {}
+    if w1_lqq_scale is not None:
+        extra_stage1_args["w1_lqq_scale"] = w1_lqq_scale
+    if w1_lqq_zero is not None:
+        extra_stage1_args["w1_lqq_zero"] = w1_lqq_zero
+    if w2_lqq_scale is not None:
+        extra_stage2_args["w2_lqq_scale"] = w2_lqq_scale
+    if w2_lqq_zero is not None:
+        extra_stage2_args["w2_lqq_zero"] = w2_lqq_zero
     if (
         not metadata.run_1stage
         and metadata.has_bias
@@ -1359,8 +1367,6 @@ def fused_moe_2stages(
         w1_scale=(
             w1_scale.view(dtypes.fp8_e8m0) if w1.dtype == dtypes.fp4x2 else w1_scale
         ),
-        w1_lqq_scale=w1_lqq_scale,
-        w1_lqq_zero=w1_lqq_zero,
         sorted_weights=sorted_weights if doweight_stage1 else None,
         **extra_stage1_args,
     )
@@ -1481,8 +1487,6 @@ def fused_moe_2stages(
             w2_scale.view(dtypes.fp8_e8m0) if w2.dtype == dtypes.fp4x2 else w2_scale
         ),
         a2_scale=a2_scale,
-        w2_lqq_scale=w2_lqq_scale,
-        w2_lqq_zero=w2_lqq_zero,
         block_m=block_size_M,
         sorted_weights=sorted_weights if not doweight_stage1 else None,
         **extra_stage2_args,
