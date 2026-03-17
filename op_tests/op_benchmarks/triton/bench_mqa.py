@@ -4,6 +4,13 @@ import warnings
 import argparse
 import itertools
 import triton
+import os
+import glob
+try:
+    import pandas as pd
+    HAS_PANDAS = True
+except ImportError:
+    HAS_PANDAS = False
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -138,7 +145,7 @@ def create_benchmark_configs(custom, args):
     }
 
     if custom:
-        x_vals_list = [(args.b, args.hq, hk, args.sq, sk)]
+        x_vals_list = [(int(args.b), int(args.hq), int(hk), int(args.sq), int(sk))]
     else:
         if varlen:
             x_vals_list = varlen_benchmark_configs()
@@ -200,6 +207,39 @@ def create_benchmark_configs(custom, args):
     return configs
 
 
+def _post_process_csv_files(save_path):
+    """Post-process CSV files to convert integer columns to int type."""
+    if not HAS_PANDAS:
+        return
+    
+    if save_path is None:
+        return
+    
+    # Find all CSV files in the save path
+    csv_files = glob.glob(os.path.join(save_path, "*.csv"))
+    
+    # Integer column names that should be converted to int
+    int_columns = ["BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K", "D_HEAD", "D_HEAD_V"]
+    
+    for csv_file in csv_files:
+        try:
+            df = pd.read_csv(csv_file)
+            
+            # Convert integer columns to int, if they exist
+            for col in int_columns:
+                if col in df.columns:
+                    # Check if all values can be converted to int (no NaN, and whole numbers)
+                    if df[col].notna().all():
+                        # Check if values are whole numbers
+                        if (df[col] % 1 == 0).all():
+                            df[col] = df[col].astype(int)
+            
+            # Save the updated CSV
+            df.to_csv(csv_file, index=False)
+        except Exception as e:
+            warnings.warn(f"Failed to post-process CSV file {csv_file}: {e}", category=RuntimeWarning)
+
+
 def run_benchmark(custom, args):
     torch.manual_seed(20)
 
@@ -226,6 +266,15 @@ def run_benchmark(custom, args):
         In MQA, HK=1 (single key/value head) while HQ can be multiple heads.
         In test_mode, verifies output matching with non-varlen inputs.
         """
+        # Convert integer parameters to int to ensure CSV output shows integers
+        BATCH = int(BATCH)
+        HQ = int(HQ)
+        HK = int(HK)
+        N_CTX_Q = int(N_CTX_Q)
+        N_CTX_K = int(N_CTX_K)
+        D_HEAD = int(D_HEAD)
+        D_HEAD_V = int(D_HEAD_V)
+        
         assert dropout <= 0.0, "Dropout not supported in this benchmark."
         requires_grad = mode == "bwd" or args.test_mode
         return_lse = True
@@ -594,6 +643,10 @@ def run_benchmark(custom, args):
             return mem / ms * 1e-6
 
     bench_mqa.run(save_path="." if args.o else None, print_data=True)
+    
+    # Post-process CSV files to convert integer columns to int
+    if args.o:
+        _post_process_csv_files(".")
 
 
 def supported_layouts():

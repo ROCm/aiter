@@ -567,7 +567,12 @@ for BATCH in "${BATCH_SIZES[@]}"; do
                                     echo "[$CURRENT/$TOTAL] Testing: batch=$BATCH, seqlen=$SEQLEN, hq=$HQ, hk=$HK, d=$HEAD_DIM, mode=$MODE, dtype=$DTYPE, causal=${CAUSAL:--}, fp8=${FP8:--}, metric=$METRIC"
                                     
                                     # Build command without --model flag (sq and sk use same value)
-                                    CMD="python bench_mqa.py -b $BATCH -hq $HQ -hk $HK -sq $SEQLEN -sk $SEQLEN -d $HEAD_DIM -mode $MODE --dtype $DTYPE $CAUSAL $FP8 -metric $METRIC -o"
+                                    # Handle causal flag: if set, pass -causal true
+                                    CAUSAL_ARG=""
+                                    if [ -n "$CAUSAL" ]; then
+                                        CAUSAL_ARG="-causal true"
+                                    fi
+                                    CMD="python bench_mqa.py -b $BATCH -hq $HQ -hk $HK -sq $SEQLEN -sk $SEQLEN -d $HEAD_DIM -mode $MODE --dtype $DTYPE $CAUSAL_ARG $FP8 -metric $METRIC -o"
                                     
                                     # Run benchmark
                                     $CMD > /dev/null 2>&1
