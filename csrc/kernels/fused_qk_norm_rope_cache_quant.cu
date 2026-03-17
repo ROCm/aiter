@@ -15,6 +15,7 @@
  */
 
 #include <cmath>
+#include <cstdint>
 #include <type_traits>
 
 #include "hip_compat.h"
@@ -1376,6 +1377,157 @@ __global__ void fused_rope_rms_2way_kernel(const T* q0_,
     }
 }
 
+template <typename T, int BLOCK_SIZE>
+__global__ void fusedQKNormKernel(T* q_ptr,
+                                  T const* q_weight_ptr,
+                                  T* k_ptr,
+                                  T const* k_weight_ptr,
+                                  int64_t m,
+                                  int64_t q_n,
+                                  int64_t k_n,
+                                  int64_t q_row_stride,
+                                  int64_t q_col_stride,
+                                  int64_t k_row_stride,
+                                  int64_t k_col_stride,
+                                  float q_eps,
+                                  float k_eps)
+{
+    int const row = blockIdx.x;
+    if(row >= m)
+    {
+        return;
+    }
+
+    int const tid = threadIdx.x;
+    T* q_row      = q_ptr + row * q_row_stride;
+    T* k_row      = k_ptr + row * k_row_stride;
+    auto sum_op              = [](float a, float b) { return a + b; };
+    constexpr int WAVE_SIZE  = 64;
+    constexpr int VEC_SIZE   = sizeof(float4) / sizeof(T);
+    using vec_type           = vec_t<T, VEC_SIZE>;
+
+    bool const q_can_vec = q_col_stride == 1 && q_n % VEC_SIZE == 0 &&
+                           (reinterpret_cast<uintptr_t>(q_row) % alignof(vec_type) == 0) &&
+                           (reinterpret_cast<uintptr_t>(q_weight_ptr) % alignof(vec_type) == 0);
+    bool const k_can_vec = k_col_stride == 1 && k_n % VEC_SIZE == 0 &&
+                           (reinterpret_cast<uintptr_t>(k_row) % alignof(vec_type) == 0) &&
+                           (reinterpret_cast<uintptr_t>(k_weight_ptr) % alignof(vec_type) == 0);
+
+    float q_sum_sq = 0.0f;
+    if(q_can_vec)
+    {
+        int64_t const q_vec_n = q_n / VEC_SIZE;
+        for(int64_t vec_idx = tid; vec_idx < q_vec_n; vec_idx += BLOCK_SIZE)
+        {
+            vec_type in_vec;
+            in_vec.load(q_row + vec_idx * VEC_SIZE);
+#pragma unroll
+            for(int i = 0; i < VEC_SIZE; ++i)
+            {
+                float const v = static_cast<float>(in_vec[i]);
+                q_sum_sq += v * v;
+            }
+        }
+    }
+    else
+    {
+        for(int64_t col = tid; col < q_n; col += BLOCK_SIZE)
+        {
+            float const v = static_cast<float>(q_row[col * q_col_stride]);
+            q_sum_sq += v * v;
+        }
+    }
+    q_sum_sq = wave_reduce<float, decltype(sum_op), WAVE_SIZE, true>(q_sum_sq, sum_op);
+    float const q_rms_rcp = rsqrtf(q_sum_sq / static_cast<float>(q_n) + q_eps);
+
+    if(q_can_vec)
+    {
+        int64_t const q_vec_n = q_n / VEC_SIZE;
+        for(int64_t vec_idx = tid; vec_idx < q_vec_n; vec_idx += BLOCK_SIZE)
+        {
+            vec_type in_vec;
+            vec_type w_vec;
+            vec_type out_vec;
+            in_vec.load(q_row + vec_idx * VEC_SIZE);
+            w_vec.load(q_weight_ptr + vec_idx * VEC_SIZE);
+#pragma unroll
+            for(int i = 0; i < VEC_SIZE; ++i)
+            {
+                float const v = static_cast<float>(in_vec[i]);
+                float const w = static_cast<float>(w_vec[i]);
+                out_vec[i]    = static_cast<T>(v * q_rms_rcp * w);
+            }
+            out_vec.store(q_row + vec_idx * VEC_SIZE);
+        }
+    }
+    else
+    {
+        for(int64_t col = tid; col < q_n; col += BLOCK_SIZE)
+        {
+            float const v = static_cast<float>(q_row[col * q_col_stride]);
+            float const w = static_cast<float>(q_weight_ptr[col]);
+            q_row[col * q_col_stride] = static_cast<T>(v * q_rms_rcp * w);
+        }
+    }
+
+    float k_sum_sq = 0.0f;
+    if(k_can_vec)
+    {
+        int64_t const k_vec_n = k_n / VEC_SIZE;
+        for(int64_t vec_idx = tid; vec_idx < k_vec_n; vec_idx += BLOCK_SIZE)
+        {
+            vec_type in_vec;
+            in_vec.load(k_row + vec_idx * VEC_SIZE);
+#pragma unroll
+            for(int i = 0; i < VEC_SIZE; ++i)
+            {
+                float const v = static_cast<float>(in_vec[i]);
+                k_sum_sq += v * v;
+            }
+        }
+    }
+    else
+    {
+        for(int64_t col = tid; col < k_n; col += BLOCK_SIZE)
+        {
+            float const v = static_cast<float>(k_row[col * k_col_stride]);
+            k_sum_sq += v * v;
+        }
+    }
+    k_sum_sq = wave_reduce<float, decltype(sum_op), WAVE_SIZE, true>(k_sum_sq, sum_op);
+    float const k_rms_rcp = rsqrtf(k_sum_sq / static_cast<float>(k_n) + k_eps);
+
+    if(k_can_vec)
+    {
+        int64_t const k_vec_n = k_n / VEC_SIZE;
+        for(int64_t vec_idx = tid; vec_idx < k_vec_n; vec_idx += BLOCK_SIZE)
+        {
+            vec_type in_vec;
+            vec_type w_vec;
+            vec_type out_vec;
+            in_vec.load(k_row + vec_idx * VEC_SIZE);
+            w_vec.load(k_weight_ptr + vec_idx * VEC_SIZE);
+#pragma unroll
+            for(int i = 0; i < VEC_SIZE; ++i)
+            {
+                float const v = static_cast<float>(in_vec[i]);
+                float const w = static_cast<float>(w_vec[i]);
+                out_vec[i]    = static_cast<T>(v * k_rms_rcp * w);
+            }
+            out_vec.store(k_row + vec_idx * VEC_SIZE);
+        }
+    }
+    else
+    {
+        for(int64_t col = tid; col < k_n; col += BLOCK_SIZE)
+        {
+            float const v = static_cast<float>(k_row[col * k_col_stride]);
+            float const w = static_cast<float>(k_weight_ptr[col]);
+            k_row[col * k_col_stride] = static_cast<T>(v * k_rms_rcp * w);
+        }
+    }
+}
+
 template <typename T>
 void fused_rope_rms_2way(const T* q0,
                          const T* k0,
@@ -1757,6 +1909,65 @@ void fused_qk_norm_rope_2way(at::Tensor& q0,
                                    (T*)out_q01.data_ptr<scalar_t>(),
                                    (T*)out_k01.data_ptr<scalar_t>(),
                                    stream);
+        });
+}
+
+void fused_qk_rmsnorm(at::Tensor& q,
+                      at::Tensor& q_weight,
+                      double q_eps,
+                      at::Tensor& k,
+                      at::Tensor& k_weight,
+                      double k_eps)
+{
+    CHECK_INPUT(q);
+    CHECK_INPUT(k);
+    CHECK_INPUT(q_weight);
+    CHECK_INPUT(k_weight);
+
+    TORCH_CHECK(q.dim() == 2, "q must be 2D: [M, N1]");
+    TORCH_CHECK(k.dim() == 2, "k must be 2D: [M, N2]");
+    TORCH_CHECK(q_weight.dim() == 1, "q_weight must be 1D: [N1]");
+    TORCH_CHECK(k_weight.dim() == 1, "k_weight must be 1D: [N2]");
+    TORCH_CHECK(q.size(0) == k.size(0), "q and k must have the same leading dimension M");
+    TORCH_CHECK(q.size(1) == q_weight.size(0), "q_weight size must match q.shape[1]");
+    TORCH_CHECK(k.size(1) == k_weight.size(0), "k_weight size must match k.shape[1]");
+    TORCH_CHECK(q.scalar_type() == k.scalar_type(), "q and k must have the same dtype");
+    TORCH_CHECK(q.scalar_type() == q_weight.scalar_type() &&
+                    q.scalar_type() == k_weight.scalar_type(),
+                "q, k, q_weight and k_weight must share dtype");
+    TORCH_CHECK(q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16,
+                "fused_qk_rmsnorm only supports float16 or bfloat16");
+
+    int64_t const m = q.size(0);
+    int64_t const q_n = q.size(1);
+    int64_t const k_n = k.size(1);
+    if(m == 0)
+    {
+        return;
+    }
+
+    constexpr int block_size = 64;
+    dim3 const block_dim(block_size);
+    dim3 const grid_dim(m);
+    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::kBFloat16, at::kHalf, q.scalar_type(), "fused_qk_rmsnorm", [&] {
+            using T = KernelElementType<scalar_t>::type;
+            fusedQKNormKernel<T, block_size><<<grid_dim, block_dim, 0, stream>>>(
+                reinterpret_cast<T*>(q.data_ptr<scalar_t>()),
+                reinterpret_cast<T const*>(q_weight.data_ptr<scalar_t>()),
+                reinterpret_cast<T*>(k.data_ptr<scalar_t>()),
+                reinterpret_cast<T const*>(k_weight.data_ptr<scalar_t>()),
+                m,
+                q_n,
+                k_n,
+                q.stride(0),
+                q.stride(1),
+                k.stride(0),
+                k.stride(1),
+                static_cast<float>(q_eps),
+                static_cast<float>(k_eps));
         });
 }
 void fused_qk_norm_rope_cache_block_quant_shuffle(
