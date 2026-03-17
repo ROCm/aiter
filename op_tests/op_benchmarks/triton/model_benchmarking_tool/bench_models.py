@@ -149,6 +149,13 @@ class KernelHandler(ABC):
             f"shape={{ {shape_str} }}"
         )
 
+    def _shard(self, value: int) -> int:
+        return max(value // self._tp, 1)
+
+    def _shard_keys(self, s: dict, keys: list[str]) -> None:
+        for key in keys:
+            s[key] = self._shard(s[key])
+
     @abstractmethod
     def get_tp_shapes(self, shapes: list[ShapeDict]) -> list[ShapeDict]:
         """Return shapes adjusted for tensor parallelism."""
@@ -179,7 +186,7 @@ class GemmKernelHandler(KernelHandler):
             s = shape.copy()
             if s.get("TP_dim") in ("N", "K", "B"):
                 key = s["TP_dim"]
-                s[key] = max(s[key] // self._tp, 1)
+                s[key] = self._shard(s[key])
             result.append(s)
         return result
 
@@ -223,7 +230,7 @@ class MoeKernelHandler(KernelHandler):
     """Handler for MoE benchmarks."""
 
     def get_tp_shapes(self, shapes: list[ShapeDict]) -> list[ShapeDict]:
-        return [{**s, "Dim2": max(s["Dim2"] // self._tp, 1)} for s in shapes]
+        return [{**s, "Dim2": self._shard(s["Dim2"])} for s in shapes]
 
     def build_args(self) -> str:
         shape = self._shape
@@ -308,8 +315,7 @@ class RopeKernelHandler(KernelHandler):
         result = []
         for shape in shapes:
             s = shape.copy()
-            s["num_heads"] = max(s["num_heads"] // self._tp, 1)
-            s["num_kv_heads"] = max(s["num_kv_heads"] // self._tp, 1)
+            self._shard_keys(s, ["num_heads", "num_kv_heads"])
             result.append(s)
         return result
 
@@ -366,8 +372,7 @@ class MhaKernelHandler(KernelHandler):
         result = []
         for shape in shapes:
             s = shape.copy()
-            s["hq"] = max(shape["hq"] // self._tp, 1)
-            s["hkv"] = max(shape["hkv"] // self._tp, 1)
+            self._shard_keys(s, ["hq", "hkv"])
             result.append(s)
         return result
 
@@ -415,8 +420,7 @@ class MlaKernelHandler(KernelHandler):
         result = []
         for shape in shapes:
             s = shape.copy()
-            s["hq"] = max(shape["hq"] // self._tp, 1)
-            s["hkv"] = max(shape["hkv"] // self._tp, 1)
+            self._shard_keys(s, ["hq", "hkv"])
             result.append(s)
         return result
 
@@ -461,8 +465,7 @@ class UnifiedAttnKernelHandler(KernelHandler):
         result = []
         for shape in shapes:
             s = shape.copy()
-            s["hq"] = max(shape["hq"] // self._tp, 1)
-            s["hkv"] = max(shape["hkv"] // self._tp, 1)
+            self._shard_keys(s, ["hq", "hkv"])
             result.append(s)
         return result
 
@@ -506,21 +509,21 @@ class UnifiedAttnKernelHandler(KernelHandler):
         }
 
 
+_HANDLER_RULES: list[tuple[Callable[[str], bool], type[KernelHandler]]] = [
+    (lambda k: "moe" in k, MoeKernelHandler),
+    (lambda k: "gemm" in k and "moe" not in k, GemmKernelHandler),
+    (lambda k: k == "rmsnorm", RmsnormKernelHandler),
+    (lambda k: k == "rope", RopeKernelHandler),
+    (lambda k: k == "mha", MhaKernelHandler),
+    (lambda k: k == "mla", MlaKernelHandler),
+    (lambda k: k == "unified_attention", UnifiedAttnKernelHandler),
+]
+
+
 def _get_handler(kernel: str) -> KernelHandler:
-    if "moe" in kernel:
-        return MoeKernelHandler()
-    if kernel == "rmsnorm":
-        return RmsnormKernelHandler()
-    if kernel == "rope":
-        return RopeKernelHandler()
-    if kernel == "mha":
-        return MhaKernelHandler()
-    if kernel == "mla":
-        return MlaKernelHandler()
-    if kernel == "unified_attention":
-        return UnifiedAttnKernelHandler()
-    if "gemm" in kernel and "moe" not in kernel:
-        return GemmKernelHandler()
+    for rule, handler in _HANDLER_RULES:
+        if rule(kernel):
+            return handler()
     raise ValueError(f"Kernel {kernel} not supported")
 
 
