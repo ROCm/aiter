@@ -24,7 +24,7 @@ class TunerCommon:
         "errRatio": 0.05,
         "batch": 100,
         "profile_file": "",  # for all results
-        "timeout": 120,  # 120s timeout per task group to avoid GPU hang
+        "timeout": 300,  # 120s timeout per task group to avoid GPU hang
         "warmup": 5,  # 5 warmup iters for profiling
         "iters": 101,  # 101 run iters for profiling
     }
