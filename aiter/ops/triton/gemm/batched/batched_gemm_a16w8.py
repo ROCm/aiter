@@ -45,7 +45,7 @@ def batched_gemm_a16w8_(
 ) -> torch.Tensor:
     """
     Computes batched A16W8 matrix multiplication Y[i] = X[i] @ W[i]^T with blockscale quantization.
-    
+
     Args:
         X: Batch tensor X with shape (B, M, K) in FP16/BF16.
         W: Batch tensor W with shape (B, N, K) in FP8.
@@ -98,7 +98,6 @@ def batched_gemm_a16w8_(
     config["GROUP_K"] = triton.next_power_of_2(triton.cdiv(K, w_scale.shape[1]))
     config["GROUP_N"] = triton.next_power_of_2(triton.cdiv(N, w_scale.shape[2]))
 
-
     # Handle bias
     has_bias = bias is not None
     if has_bias:
@@ -124,10 +123,11 @@ def batched_gemm_a16w8_(
         else torch.iinfo(w.dtype).max
     )
 
-    grid = lambda META: (
-        B,
-        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-    )
+    def grid(META):
+        return (
+            B,
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
 
     _batched_gemm_a16w8_kernel[grid](
         x,
@@ -160,6 +160,7 @@ def batched_gemm_a16w8_(
 
     return y
 
+
 def batched_gemm_a16w8(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -172,7 +173,7 @@ def batched_gemm_a16w8(
 ) -> torch.Tensor:
     """
     Public API for batched GEMM A16W8.
-    
+
     Computes batched matrix multiplication Y[i] = X[i] @ W[i]^T with FP16/BF16 activations and FP8 weights.
     """
     config_hashable = serialize_dict(config) if config else None

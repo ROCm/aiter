@@ -26,6 +26,7 @@ _batched_gemm_a16w8_repr = make_kernel_repr(
     ],
 )
 
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
@@ -36,11 +37,11 @@ _batched_gemm_a16w8_repr = make_kernel_repr(
 @triton.jit(repr=_batched_gemm_a16w8_repr)
 def _batched_gemm_a16w8_kernel(
     # Pointers to matrices
-    a_ptr,          # (B, M, K) fp16 / bf16
-    b_ptr,          # (B, K, N) fp8
-    c_ptr,          # (B, M, N)
-    b_scale_ptr,    # (B, scale_k, scale_n)
-    bias_ptr,       # (B, N)
+    a_ptr,  # (B, M, K) fp16 / bf16
+    b_ptr,  # (B, K, N) fp8
+    c_ptr,  # (B, M, N)
+    b_scale_ptr,  # (B, scale_k, scale_n)
+    bias_ptr,  # (B, N)
     # Matrix sizes
     M,
     N,
@@ -82,8 +83,8 @@ def _batched_gemm_a16w8_kernel(
     Note: this is Triton jited function and not meant to be called directly. Call batched_gemm_a16w8 function
     below
 
-    Batched GEMM: 
-        Computes the matmul C[i] = A[i] x B[i] where A is FP16BF/16 and B is INT8, applying blockscale weight dequantization 
+    Batched GEMM:
+        Computes the matmul C[i] = A[i] x B[i] where A is FP16BF/16 and B is INT8, applying blockscale weight dequantization
         for every i in a given batch. Optionally, adds a bias to each result.
 
     The dequantization uses blockscale quantization where weights are divided into blocks
@@ -114,12 +115,11 @@ def _batched_gemm_a16w8_kernel(
     tl.assume(stride_bscale_n > 0)
     tl.assume(stride_biasb > 0)
 
-    
     # Get batch program ID
-    batch_id = tl.program_id(axis = 0)
+    batch_id = tl.program_id(axis=0)
     # Map program IDs 'pid' to the block of C it should compute
     # This is done in a grouped ordering to promote L2 data reuse
-    pid = tl.program_id(axis = 1)
+    pid = tl.program_id(axis=1)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
@@ -137,14 +137,13 @@ def _batched_gemm_a16w8_kernel(
     tl.assume(pid_m >= 0)
     tl.assume(pid_n >= 0)
 
-    
     # Cast to int64 for safe addressing (avoids int32 overflow during offset calculation)
     batch_id = tl.cast(batch_id, tl.int64)
     stride_ab = tl.cast(stride_ab, tl.int64)
     stride_bb = tl.cast(stride_bb, tl.int64)
     stride_cb = tl.cast(stride_cb, tl.int64)
     stride_bscaleb = tl.cast(stride_bscaleb, tl.int64)
-        
+
     # Offsets
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
@@ -154,27 +153,18 @@ def _batched_gemm_a16w8_kernel(
     a_batch_ptr = a_ptr + batch_id * stride_ab
     b_batch_ptr = b_ptr + batch_id * stride_bb
     b_scale_batch_ptr = b_scale_ptr + batch_id * stride_bscaleb
-    
+
     # A & B pointers
-    a_ptrs = a_batch_ptr + (
-        offs_am[:, None] * stride_am
-        + offs_k[None, :] * stride_ak
-    )
-    b_ptrs = b_batch_ptr + (
-        offs_k[:, None] * stride_bk
-        + offs_bn[None, :] * stride_bn
-    )
+    a_ptrs = a_batch_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_batch_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
     # Create pointers for the blockscale tensor
     # B_scale has shape (B, scale_k, scale_n)
     offs_bsn = offs_bn // GROUP_N
     # Scale rows to advance per K block
-    offs_ks_step = BLOCK_SIZE_K // GROUP_K          
-    b_scale_ptrs = (
-        b_scale_batch_ptr
-        + offs_bsn * stride_bscale_n              
-    )
-    
+    offs_ks_step = BLOCK_SIZE_K // GROUP_K
+    b_scale_ptrs = b_scale_batch_ptr + offs_bsn * stride_bscale_n
+
     # Accumulator (FP32)
     # Why choose FP32 accumulation? FP8 x FP8 or FP16 x FP8 accumulation will overflow
     # Maintains model accuracy, prevents acc error and numerical stability
@@ -213,7 +203,7 @@ def _batched_gemm_a16w8_kernel(
             )
             a = a.to(b_ptr.type.element_ty).reshape(BLOCK_SIZE_M, BLOCK_SIZE_K)
             a_scale = a_scale.reshape(BLOCK_SIZE_M)
-                
+
             # FP8 × FP8 → FP32, apply both scales
             fused_scale = a_scale[:, None] * b_scale[None, :]
             accumulator += tl.dot(a, b, input_precision="ieee") * fused_scale
@@ -247,7 +237,7 @@ def _batched_gemm_a16w8_kernel(
         + offs_cm[:, None] * stride_cm
         + offs_cn[None, :] * stride_cn
     )
-    
+
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
 

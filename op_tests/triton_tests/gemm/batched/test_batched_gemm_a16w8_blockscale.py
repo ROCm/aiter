@@ -21,7 +21,7 @@ def generate_batched_gemm_a16w8_inputs(
 ):
     """
     Generate inputs for batched GEMM A16W8.
-    
+
     Returns:
         x: (B, M, K) in FP16/BF16
         w: (B, N, K) in FP8
@@ -30,12 +30,12 @@ def generate_batched_gemm_a16w8_inputs(
         y: (B, M, N) in dtype or None
     """
     e5m2_type, e4m3_type = get_fp8_dtypes()
-    
+
     scale_n = (N + block_shape_n - 1) // block_shape_n
     scale_k = (K + block_shape_k - 1) // block_shape_k
 
     torch.manual_seed(42)
-    
+
     # Generate input tensor A
     x = torch.randn((B, M, K), dtype=dtype, device="cuda") / 10
 
@@ -61,7 +61,7 @@ def generate_batched_gemm_a16w8_inputs(
 def run_torch(x, weight, w_scale, bias=None, dtype=torch.bfloat16):
     """
     Reference implementation using PyTorch.
-    
+
     Args:
         x: (B, M, K) tensor
         weight: (B, N, K) tensor in FP8
@@ -71,58 +71,58 @@ def run_torch(x, weight, w_scale, bias=None, dtype=torch.bfloat16):
     block_shape_n, block_shape_k = block_shape
     B, M, K = x.shape
     _, N, _ = weight.shape
-    
+
     outputs = []
     for b in range(B):
         x_b = x[b]  # (M, K)
         w_b = weight[b]  # (N, K)
         w_scale_b = w_scale[b]  # (scale_n, scale_k)
-        
+
         # Dequantize weights using blockscale
         w_scale_expanded = w_scale_b.repeat_interleave(block_shape_n, dim=0)
         w_scale_expanded = w_scale_expanded.repeat_interleave(block_shape_k, dim=1)
         w_dequant = w_b.to(w_scale_expanded.dtype) * w_scale_expanded[:N, :K]
-        
+
         # Compute matmul: (M, K) x (N, K)^T = (M, N)
         out = F.linear(x_b.to(torch.float32), w_dequant.to(torch.float32))
-        
+
         # Add bias if provided
         if bias is not None:
             out = out + bias[b].to(torch.float32)
-        
+
         outputs.append(out.to(dtype))
-    
+
     return torch.stack(outputs, dim=0)
 
 
 def get_x_vals():
     """Generate test shapes (B, M, N, K)"""
     x_vals = []
-    
+
     # Small batch sizes with various M, N, K
     x_vals += [(2, 256, 256, 256), (4, 512, 512, 512)]
     x_vals += [(2, 1024, 1024, 1024), (4, 2048, 2048, 2048)]
-    
+
     # Larger batches
     x_vals += [(8, 256, 256, 256), (16, 512, 512, 512)]
-    
+
     # Non-square matrices
     x_vals += [(2, 128, 256, 512), (4, 256, 512, 1024)]
     x_vals += [(2, 1280, 8192, 1024), (4, 8192, 1024, 1280)]
-    
+
     # Edge cases
     x_vals += [(1, 128, 128, 128)]  # Single batch
-    x_vals += [(2, 64, 64, 64)]     # Small dimensions
-    
+    x_vals += [(2, 64, 64, 64)]  # Small dimensions
+
     # Realistic LLM shapes
     x_vals += [(2, 2048, 8192, 1024), (4, 1024, 4096, 8192)]
-    
+
     # Varying batch sizes with fixed shapes
     x_vals += [(b, 512, 512, 512) for b in [1, 2, 3, 5, 7, 8]]
-    
+
     # Minimal case
     x_vals += [(1, 1, 128, 128)]
-    
+
     return x_vals
 
 
@@ -137,12 +137,20 @@ def test_batched_gemm_a16w8(B: int, M: int, N: int, K: int, dtype, with_bias, pr
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     x, w, w_scale, bias, y = generate_batched_gemm_a16w8_inputs(
-        B, M, N, K, block_shape_n, block_shape_k, dtype=dtype, with_bias=with_bias, output=True
+        B,
+        M,
+        N,
+        K,
+        block_shape_n,
+        block_shape_k,
+        dtype=dtype,
+        with_bias=with_bias,
+        output=True,
     )
 
     # Run reference implementation
     torch_out = run_torch(x, w, w_scale, bias, dtype)
-    
+
     # Run Triton implementation
     batched_gemm_a16w8(x, w, w_scale, bias, dtype, y, prequant=prequant)
 
@@ -150,7 +158,7 @@ def test_batched_gemm_a16w8(B: int, M: int, N: int, K: int, dtype, with_bias, pr
     # Use relaxed tolerances for FP8 operations
     atol = 0.15 if prequant else 0.1
     rtol = 0.15 if prequant else 0.1
-    
+
     torch.testing.assert_close(torch_out, y, atol=atol, rtol=rtol)
 
 
@@ -159,14 +167,22 @@ def test_batched_gemm_a16w8(B: int, M: int, N: int, K: int, dtype, with_bias, pr
 def test_batched_gemm_a16w8_no_output_alloc(B: int, M: int, N: int, K: int, dtype):
     """Test that the kernel can allocate output internally."""
     block_shape_n, block_shape_k = block_shape
-    
+
     x, w, w_scale, bias, _ = generate_batched_gemm_a16w8_inputs(
-        B, M, N, K, block_shape_n, block_shape_k, dtype=dtype, with_bias=False, output=False
+        B,
+        M,
+        N,
+        K,
+        block_shape_n,
+        block_shape_k,
+        dtype=dtype,
+        with_bias=False,
+        output=False,
     )
-    
+
     torch_out = run_torch(x, w, w_scale, None, dtype)
     triton_out = batched_gemm_a16w8(x, w, w_scale, None, dtype, None, prequant=False)
-    
+
     torch.testing.assert_close(torch_out, triton_out, atol=0.1, rtol=0.1)
 
 
@@ -174,18 +190,18 @@ def test_batched_gemm_a16w8_shape_mismatch():
     """Test that shape mismatches raise appropriate errors."""
     B, M, N, K = 2, 256, 256, 256
     block_shape_n, block_shape_k = block_shape
-    
+
     x, w, w_scale, _, _ = generate_batched_gemm_a16w8_inputs(
         B, M, N, K, block_shape_n, block_shape_k
     )
-    
+
     # Test batch size mismatch
     w_wrong_batch = w[:1]  # Different batch size
     with pytest.raises(AssertionError, match="Batch size mismatch"):
         batched_gemm_a16w8(x, w_wrong_batch, w_scale)
-    
+
     # Test K dimension mismatch
-    x_wrong_k = x[:, :, :K//2]
+    x_wrong_k = x[:, :, : K // 2]
     with pytest.raises(AssertionError, match="K dimension mismatch"):
         batched_gemm_a16w8(x_wrong_k, w, w_scale)
 

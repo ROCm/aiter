@@ -39,12 +39,20 @@ def bench_gemm_fn(
     """Benchmark function for batched GEMM A16W8."""
     c_dtype = torch.bfloat16
     x, w, w_scale, bias, y = generate_batched_gemm_a16w8_inputs(
-        batch, M, N, K, BLOCK_SHAPE_N, BLOCK_SHAPE_K, dtype=c_dtype, with_bias=with_bias, output=True
+        batch,
+        M,
+        N,
+        K,
+        BLOCK_SHAPE_N,
+        BLOCK_SHAPE_K,
+        dtype=c_dtype,
+        with_bias=with_bias,
+        output=True,
     )
-    
+
     # FLOPS calculation
     flops = 2.0 * M * N * K * batch
-    
+
     # Memory transfer calculation
     mem_read = x.numel() * x.element_size() + w.numel() * w.element_size()
     mem_read += w_scale.numel() * w_scale.element_size()
