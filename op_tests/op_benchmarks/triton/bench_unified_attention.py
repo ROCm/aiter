@@ -371,13 +371,10 @@ def run_benchmark(custom, args):
         cu_seqlens_q[1:] = seqlens_q.cumsum(dim=0, dtype=torch.int32)
         cu_seqlens_k = torch.zeros(len(seqlens_k) + 1, dtype=torch.int32, device="cuda")
         cu_seqlens_k[1:] = seqlens_k.cumsum(dim=0, dtype=torch.int32)
-        block_tables = torch.randint(
-            0,
-            num_blocks,
-            (num_seqs, max_num_blocks_per_seq),
-            dtype=torch.int32,
-            device="cuda",
-        )
+        total_ind_count = num_seqs * max_num_blocks_per_seq
+        values = torch.arange(0, total_ind_count, dtype=torch.int32)
+        values = values[torch.randperm(total_ind_count)]
+        block_tables = values.view(num_seqs, max_num_blocks_per_seq).contiguous().cuda()
         if args.use_sinks:
             sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
         else:
