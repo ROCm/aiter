@@ -129,6 +129,9 @@ def extend_attention_fwd(
         window_kv_offsets (Optional[torch.Tensor]): Per-sequence KV offset for SWA+custom_mask.
         xai_temperature_len (int): XAI temperature context length, -1 to disable.
         config (Optional[dict]): Kernel tuning parameters (BLOCK_M, BLOCK_N).
+        min_len_extend (Optional[int]): Minimum extend length in batch, avoids GPU sync when provided.
+        total_prefix_len (Optional[int]): Sum of prefix lengths across batch, avoids GPU sync when provided.
+        total_extend_len (Optional[int]): Sum of extend lengths across batch, avoids GPU sync when provided.
 
     Returns:
         None. Results written in-place to o_extend.
