@@ -285,6 +285,8 @@ def mla_decode_fwd(
     else:
         if num_kv_splits is None:
             num_kv_splits = get_cu_num()
+        head_padded = False
+        o_orig = None
         if (
             nhead == 16
             or (
@@ -303,6 +305,14 @@ def mla_decode_fwd(
         ):
             # Natively support cases
             pass
+        elif nhead < 16 and (16 % nhead == 0):
+            pad = 16 - nhead
+            q = torch.cat([q, q.new_zeros(total_s, pad, q.shape[-1])], dim=1)
+            o_orig = o
+            o = torch.zeros(total_s, 16, v_head_dim, dtype=o.dtype, device=o.device)
+            nhead = 16
+            head_padded = True
+            io_transformed = True
         elif nhead in range(32, 128 + 1, 16) and persistent_mode:
             # we use nhead=16 to simulate such cases by customized metadata
             # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
@@ -407,11 +417,13 @@ def mla_decode_fwd(
         if return_logits:
             logits = logits.view(-1, 1, ori_nhead, v_head_dim)
 
-        if max_seqlen_q == 1:
+        if head_padded:
+            o_orig.copy_(o[:, :ori_nhead, :])
+            o = o_orig
+        elif max_seqlen_q == 1:
             q = q.view(ori_total_s, ori_nhead, -1)
             o = o.view(ori_total_s, ori_nhead, -1)
         else:
-            # for test, q need to be transpose into the original shape
             new_o = (
                 o.reshape(
                     ori_total_s // max_seqlen_q,
