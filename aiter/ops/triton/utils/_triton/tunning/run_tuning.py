@@ -115,12 +115,12 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_screen_cmd(ut_script, m, n, k, lds_args):
+def build_screen_cmd(ut_script, m, n, k, gpu_id, lds_args):
     """Build the screen.py command for a given shape.
 
-    GPU ID is always 0 because HIP_VISIBLE_DEVICES remaps the device.
+    GPU ID is passed directly to screen.py which sets HIP_VISIBLE_DEVICES internally.
     """
-    cmd = f"python screen.py {m} {n} {k} 0 {ut_script}"
+    cmd = f"python screen.py {m} {n} {k} {gpu_id} {ut_script}"
     if lds_args:
         cmd += f" {lds_args}"
     cmd += " --num-stages-range 2 3"
@@ -150,9 +150,9 @@ def run_tuning(args):
     if dry_run:
         print("\n=== DRY RUN: Work queue and commands ===\n")
         for i, (m, n, k) in enumerate(work_queue):
-            cmd = build_screen_cmd(ut_script, m, n, k, lds_args)
             gpu = gpu_ids[i % len(gpu_ids)]
-            print(f"[GPU {gpu}] HIP_VISIBLE_DEVICES={gpu} {cmd}")
+            cmd = build_screen_cmd(ut_script, m, n, k, gpu, lds_args)
+            print(f"[GPU {gpu}] {cmd}")
         return work_queue
 
     # Progress tracking
@@ -208,15 +208,12 @@ def run_tuning(args):
             if work_queue and gpu_id not in active:
                 m, n, k = work_queue.pop(0)
                 key_str = shape_key(m, n, k)
-                cmd = build_screen_cmd(ut_script, m, n, k, lds_args)
-                env = os.environ.copy()
-                env["HIP_VISIBLE_DEVICES"] = str(gpu_id)
+                cmd = build_screen_cmd(ut_script, m, n, k, gpu_id, lds_args)
                 print(f"Launching {key_str} on GPU {gpu_id}: {cmd}")
                 proc = subprocess.Popen(
                     cmd,
                     shell=True,
                     cwd=tunning_dir,
-                    env=env,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
