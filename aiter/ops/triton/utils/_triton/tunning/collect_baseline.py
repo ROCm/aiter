@@ -27,7 +27,7 @@ KERNEL_MAP = {
     "a16w16": {
         "bench": "bench_gemm_a16w16.py",
         "ut": "ut_a16w16_gemm.py",
-        "pattern": ["_gemm_a16w16_kernel"],
+        "pattern": ["_gemm_a16_w16_kernel"],
     },
     "a16w16_agnostic": {
         "bench": None,
@@ -37,12 +37,12 @@ KERNEL_MAP = {
     "a16w16_atomic": {
         "bench": None,
         "ut": "ut_a16w16_gemm_atomic.py",
-        "pattern": ["_gemm_a16w16_atomic"],
+        "pattern": ["_gemm_a16_w16_kernel"],
     },
     "a16w16_gated": {
         "bench": "bench_gemm_a16w16.py",
         "ut": "ut_a16w16_gemm_gated.py",
-        "pattern": ["_gemm_a16w16_gated"],
+        "pattern": ["_gemm_a16_w16_gated"],
     },
     "a16w8_blockscale": {
         "bench": None,
