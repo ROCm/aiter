@@ -471,6 +471,24 @@ class TunerCommon:
                     logger.info(
                         f"tune result is none or all shape is tuned in {args.tune_file}!"
                     )
+            # Retry shapes that failed due to transient timeouts or crashes.
+            max_retries = 2
+            for retry in range(max_retries):
+                if self.failed.empty:
+                    break
+                retry_keys = self.failed[self.keys].drop_duplicates().reset_index(drop=True)
+                logger.info(
+                    f"Retrying {len(retry_keys)} failed shapes (attempt {retry + 1}/{max_retries})"
+                )
+                self.failed = pd.DataFrame(columns=self.columns)
+                retry_batches = (len(retry_keys) + batch_size - 1) // batch_size
+                for j in range(0, len(retry_keys), batch_size):
+                    retry_batch = retry_keys.iloc[j : j + batch_size].reset_index(drop=True)
+                    all_results = self.tune(retry_batch, self.tunedf, args)
+                    if all_results:
+                        results = self.post_process(all_results, args, topk)
+                        self.result_to_csv(results, output_file, not args.all)
+
             self.sortResults(output_file, args.sort, self.sort_keys)
         except KeyboardInterrupt:
             tuning_status = "Interrupted"
