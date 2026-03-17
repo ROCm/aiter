@@ -208,25 +208,26 @@ def kernel_unified_attention_2d(
     BLOCK_Q: tl.constexpr,  # int
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
-    USE_FP8: tl.constexpr,  # bool
-    USE_Q_DESCALE: tl.constexpr = False,  # bool
+    OUTPUT_FP8: tl.constexpr,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
     ALL_DECODE: tl.constexpr = False,  # bool
-    SAGE_VERSION: tl.constexpr = None # bool
+    SAGE_VERSION: tl.constexpr = None, # bool
+    IS_PAGING: tl.constexpr = True, # bool
+    PRELOAD_V: tl.constexpr = False,
 ):
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
 
     # needed to use exp2 (exp2 -> exp conversion)
     RCP_LN2 = 1.4426950408889634
-    if USE_Q_DESCALE:
-        _q_ds = tl.load(q_scale)
-        _k_ds = tl.load(k_scale)
-        _v_ds = tl.load(v_scale)
+        
+    if not SAGE_VERSION:
+        _q_ds = tl.load(q_scale) if q_scale is not None else 1.0
+        _k_ds = tl.load(k_scale) if k_scale is not None else 1.0
         qk_scale = scale * RCP_LN2 * _q_ds * _k_ds
     else:
-        qk_scale = scale * RCP_LN2
+        qk_scale = None
 
     seq_idx = find_seq_idx(
         query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
@@ -385,6 +386,14 @@ def kernel_unified_attention_2d(
 
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
     # iterate through tiles (now limited to the sliding window range)
+    
+    if not IS_PAGING:
+        seq_offset = tile_start * TILE_SIZE + offs_t
+        physical_block_idx = tl.load(
+            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+        ).to(tl.int64)
+    
+    
     for j in range(tile_start, tile_end):
         seq_offset = j * TILE_SIZE + offs_t
         # to reduce the masking effect when not needed
@@ -393,9 +402,10 @@ def kernel_unified_attention_2d(
         else:
             tile_mask = seq_offset < max_seq_prefix_len
 
-        physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-        ).to(tl.int64)
+        if IS_PAGING:
+            physical_block_idx = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            ).to(tl.int64)
 
         v_offset = (
             physical_block_idx[:, None] * stride_v_cache_0
@@ -436,31 +446,24 @@ def kernel_unified_attention_2d(
                 stride_k_cache_scale_3,
                 SAGE_VERSION
             )
-        elif K_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
-                K = K_load
-            else:
-                K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
-        else:
-            K = K_load
+        # elif K_load.dtype.is_fp8():
+        #     # if Q.dtype.is_fp8():
+        #     #     K = K_load
+        #     # else:
+        #     #     K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+        #     K = K_load.to(Q.dtype)
+        else:  # TODO: check convert effect on perf
+            K = K_load.to(Q.dtype)
 
-        # V : (TILE_SIZE, HEAD_SIZE)
-        V_load = tl.load(
-            value_cache_ptr + v_offset,
-            mask=dim_mask[None, :] & tile_mask[:, None],
-            other=0.0,
-            cache_modifier=KV_cache_modifier,
-        )
+        if PRELOAD_V:
+            # V : (TILE_SIZE, HEAD_SIZE)
+            V = tl.load(
+                value_cache_ptr + v_offset,
+                mask=dim_mask[None, :] & tile_mask[:, None],
+                other=0.0,
+                cache_modifier=KV_cache_modifier,
+            )
 
-        if SAGE_VERSION != None:
-            V = V_load
-        elif V_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
-                V = V_load
-            else:
-                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
-        else:
-            V = V_load
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
@@ -527,15 +530,20 @@ def kernel_unified_attention_2d(
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         acc = acc * alpha[:, None]
 
+        if not PRELOAD_V:
+            # V : (TILE_SIZE, HEAD_SIZE)
+            V = tl.load(
+                value_cache_ptr + v_offset,
+                mask=dim_mask[None, :] & tile_mask[:, None],
+                other=0.0,
+                cache_modifier=KV_cache_modifier,
+            )
         # update constants
         L = L * alpha + l_j
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        if USE_Q_DESCALE:
-            acc += tl.dot(P.to(V.dtype), V) * _v_ds
-        else:
-            acc += tl.dot(P.to(V.dtype), V)
+        acc += tl.dot(P.to(V.dtype), V)
 
 
     # epilogue
@@ -554,7 +562,12 @@ def kernel_unified_attention_2d(
             SAGE_VERSION
         )
         acc *= v_scale_loaded
-    if USE_FP8:
+    elif v_scale is not None:
+        v_scale_loaded = tl.load(v_scale)
+        acc *= v_scale_loaded
+
+    
+    if OUTPUT_FP8:
         acc = acc * tl.load(out_scale)
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
     
@@ -627,7 +640,7 @@ def kernel_unified_attention_3d(
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
-    USE_Q_DESCALE: tl.constexpr = False,  # bool
+    USE_DESCALE: tl.constexpr = False,  # bool
     ALL_DECODE: tl.constexpr = False,  # bool
     SAGE_VERSION: tl.constexpr = None # bool
 ):
@@ -637,7 +650,7 @@ def kernel_unified_attention_3d(
 
     # needed to use exp2 (exp2 -> exp conversion)
     RCP_LN2 = 1.4426950408889634
-    if USE_Q_DESCALE:
+    if USE_DESCALE:
         _q_ds = tl.load(q_scale)
         _k_ds = tl.load(k_scale)
         _v_ds = tl.load(v_scale)
@@ -932,7 +945,7 @@ def kernel_unified_attention_3d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        if USE_Q_DESCALE:
+        if USE_DESCALE:
             acc += tl.dot(P.to(V.dtype), V) * _v_ds
         else:
             acc += tl.dot(P.to(V.dtype), V)
@@ -991,7 +1004,7 @@ def reduce_segments(
     query_start_len_ptr,  # [num_seqs+1]
     BLOCK_Q: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
-    USE_FP8: tl.constexpr,  # bool
+    OUTPUT_FP8: tl.constexpr,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -1052,7 +1065,7 @@ def reduce_segments(
     # safely divide by overall_expsum, returning 0.0 if overall_expsum is 0
     acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
 
-    if USE_FP8:
+    if OUTPUT_FP8:
         acc = acc * tl.load(out_scale_inv)
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
 
