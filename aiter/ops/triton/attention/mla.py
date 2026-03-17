@@ -32,7 +32,7 @@ def select_2d_config(
 
 def select_3d_config(block_size, max_seqlen_k, target_num_prgms, num_2d_prgms):
     reduce_num_warps = 2
-    attn_warps = 2
+    attn_warps = 4
     TILE_SIZE = block_size
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     num_segments = math.ceil(target_num_prgms / num_2d_prgms)

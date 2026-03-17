@@ -209,15 +209,15 @@ class MLAConfig:
         elif NUM_BLOCKS_GATHER_PER_TILE == 1:
             self.KV_LORA_SHARED_LAYOUT = gl.constexpr(
                 gl.PaddedSharedLayout.with_identity_for(
-                    interval_padding_pairs=[[KV_LORA_RANK, 8]],
-                    shape=([BLOCK_SIZE, KV_LORA_RANK]),
+                    interval_padding_pairs=[[BLOCK_SIZE, 8]],
+                    shape=([KV_LORA_RANK, BLOCK_SIZE]),
                     order=[1, 0],
                 )
             )
             self.K_ROPE_SHARED_LAYOUT = gl.constexpr(
                 gl.PaddedSharedLayout.with_identity_for(
-                    interval_padding_pairs=[[QK_ROPE_HEAD_DIM, 8]],
-                    shape=[BLOCK_SIZE, QK_ROPE_HEAD_DIM],
+                    interval_padding_pairs=[[BLOCK_SIZE, 8]],
+                    shape=[QK_ROPE_HEAD_DIM, BLOCK_SIZE],
                     order=[1, 0],
                 )
             )
@@ -815,7 +815,7 @@ def _mla_decode_fwd_kernel(
     )
     kv_lora_shared = gl.allocate_shared_memory(
         kv_buffer_ptr.type.element_ty,
-        [TILE_SIZE, KV_LORA_RANK],
+        [KV_LORA_RANK, TILE_SIZE],
         layout=cfg.KV_LORA_SHARED_LAYOUT,
     )
     k_rope_shared = gl.allocate_shared_memory(
@@ -840,32 +840,32 @@ def _mla_decode_fwd_kernel(
     offs_q_m_lora = gl.arange(
         0, BLOCK_M, layout=gl.SliceLayout(1, cfg.Q_LORA_LOAD_LAYOUT)
     )
-    offs_q_m_rope = gl.arange(
-        0, BLOCK_M, layout=gl.SliceLayout(1, cfg.Q_ROPE_LOAD_LAYOUT)
-    )
     offs_q_d_lora = gl.arange(
         0, KV_LORA_RANK, layout=gl.SliceLayout(0, cfg.Q_LORA_LOAD_LAYOUT)
+    )
+    offs_q_m_rope = gl.arange(
+        0, BLOCK_M, layout=gl.SliceLayout(1, cfg.Q_ROPE_LOAD_LAYOUT)
     )
     offs_q_d_rope = gl.arange(
         0, QK_ROPE_HEAD_DIM, layout=gl.SliceLayout(0, cfg.Q_ROPE_LOAD_LAYOUT)
     )
     KV_LORA_LOAD_LAYOUT: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[8, 1],
-        threads_per_warp=[8, 4],
+        threads_per_warp=[32, 1],
         warps_per_cta=[1, num_warps],
-        order=[1, 0],
+        order=[0, 1],
     )
     K_ROPE_LOAD_LAYOUT: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[8, 1],
         threads_per_warp=[8, 4],
         warps_per_cta=[1, num_warps],
-        order=[1, 0],
+        order=[0, 1],
     )
     offs_kv_t_lora = gl.arange(
-        0, TILE_SIZE, layout=gl.SliceLayout(1, KV_LORA_LOAD_LAYOUT)
+        0, TILE_SIZE, layout=gl.SliceLayout(0, KV_LORA_LOAD_LAYOUT)
     )
     offs_kv_d_lora = gl.arange(
-        0, KV_LORA_RANK, layout=gl.SliceLayout(0, KV_LORA_LOAD_LAYOUT)
+        0, KV_LORA_RANK, layout=gl.SliceLayout(1, KV_LORA_LOAD_LAYOUT)
     )
     offs_k_t_rope = gl.arange(
         0, TILE_SIZE, layout=gl.SliceLayout(0, K_ROPE_LOAD_LAYOUT)
@@ -926,10 +926,6 @@ def _mla_decode_fwd_kernel(
     query_offset_1_qk = (
         kv_head_idx * cfg.NUM_QUERIES_PER_KV + offs_q_m_qk % cfg.NUM_QUERIES_PER_KV
     )
-    query_offset_qk = (
-        query_offset_0_qk[:, None] * query_stride_0
-        + query_offset_1_qk[:, None] * query_stride_1
-    )
     query_mask_0_qk = query_pos_qk < num_tokens_per_seq
     query_mask_1_qk = query_offset_1_qk < num_query_heads
     offs_seq_t = gl.arange(0, TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_LAYOUT))
@@ -983,8 +979,8 @@ def _mla_decode_fwd_kernel(
 
         kv_lora_offset = (
             kv_offset
-            + offs_kv_t_lora[:, None] * stride_kv_buffer_1
-            + offs_kv_d_lora[None, :] * stride_kv_buffer_3
+            + offs_kv_t_lora[None, :] * stride_kv_buffer_1
+            + offs_kv_d_lora[:, None] * stride_kv_buffer_3
         )
         # KV_lora : (BLOCK_M, KV_LORA_RANK)
         KV_lora_load = gl.load(
@@ -992,7 +988,7 @@ def _mla_decode_fwd_kernel(
             cache_modifier=cfg.kv_cache_modifier,
         )
         kv_lora_shared.store(KV_lora_load)
-        KV_lora_trans = kv_lora_shared.permute((1, 0)).load(layout=cfg.K_DOT_LAYOUT)
+        KV_lora = kv_lora_shared.load(layout=cfg.K_DOT_LAYOUT)
 
         k_rope_offset = (
             kv_offset
@@ -1010,7 +1006,7 @@ def _mla_decode_fwd_kernel(
         seq_mask = seq_offset[None, :] < context_len + query_pos_qk[:, None] + 1
 
         S = gl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32, layout=cfg.QK_WMMA_LAYOUT)
-        S = gl.amd.gfx1250.wmma(Q_lora, KV_lora_trans.to(Q_lora.dtype), S)
+        S = gl.amd.gfx1250.wmma(Q_lora, KV_lora.to(Q_lora.dtype), S)
         S = gl.amd.gfx1250.wmma(Q_rope, K_rope.to(Q_lora.dtype), S) * qk_factor
 
         S = gl.where(
@@ -1044,10 +1040,10 @@ def _mla_decode_fwd_kernel(
         M = m_j
 
         # acc : (BLOCK_M, KV_LORA_RANK)
-        KV_lora = kv_lora_shared.load(layout=cfg.V_DOT_LAYOUT)
+        KV_lora_trans = kv_lora_shared.permute((1, 0)).load(layout=cfg.V_DOT_LAYOUT)
         P = P.to(KV_lora.dtype)
         P = gl.convert_layout(P, layout=cfg.P_DOT_LAYOUT)
-        acc = gl.amd.gfx1250.wmma(P, KV_lora, acc)
+        acc = gl.amd.gfx1250.wmma(P, KV_lora_trans, acc)
         seq_offset += TILE_SIZE
 
     if kv_scale_ptr is not None:
