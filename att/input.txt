@@ -1,0 +1,6 @@
+att: TARGET_CU=0 
+SE_MASK=0xFF 
+SIMD_SELECT=0xF 
+ISA_CAPTURE_MODE=2 
+# you can use filter the kernels you profile 
+KERNEL=_ZN5aiter60fmoe_stage1_bf16_pertokenLqqUint4_g1u1_multix_80x128_1tg_pf3E
