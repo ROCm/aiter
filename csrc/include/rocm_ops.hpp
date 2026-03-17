@@ -63,7 +63,7 @@ namespace py = pybind11;
           py::arg("splitData"),                \
           py::arg("splitLse"),                 \
           py::arg("output"),                   \
-          py::arg("lse")  = std::nullopt,      \
+          py::arg("lse")      = std::nullopt,  \
           py::arg("q_scale")  = std::nullopt,  \
           py::arg("kv_scale") = std::nullopt); \
     m.def("mla_prefill_asm_fwd",               \
@@ -1300,8 +1300,8 @@ namespace py = pybind11;
           py::arg("fc_scale_blkn")    = 128,                                   \
           py::arg("fc_scale_blkk")    = 128,                                   \
           py::arg("fc2_smooth_scale") = std::nullopt,                          \
-          py::arg("activation")       = ActivationType::Silu,                        \
-          py::arg("block_size_M")     = 32);                                         \
+          py::arg("activation")       = ActivationType::Silu,                  \
+          py::arg("block_size_M")     = 32);                                       \
     m.def("moe_stage1_g1u1",                                                   \
           &moe_stage1_g1u1,                                                    \
           py::arg("input"),                                                    \
@@ -1462,6 +1462,28 @@ namespace py = pybind11;
           py::arg("num_rows_factor")       = 1,                          \
           py::arg("smooth_scale_map_hash") = std::nullopt,               \
           py::arg("enable_ps")             = true);                                  \
+    m.def("moe_smooth_per_token_scaled_quant_v1",                        \
+          &aiter::moe_smooth_per_token_scaled_quant_v1,                  \
+          py::arg("out"),                                                \
+          py::arg("input"),                                              \
+          py::arg("scales"),                                             \
+          py::arg("smooth_scale"),                                       \
+          py::arg("smooth_scale_map"),                                   \
+          py::arg("shuffle_scale")         = false,                      \
+          py::arg("smooth_scale_map_hash") = std::nullopt,               \
+          py::arg("transpose_out")         = false);                             \
+    m.def("moe_smooth_per_token_scaled_quant_v2",                        \
+          &aiter::moe_smooth_per_token_scaled_quant_v2,                  \
+          py::arg("out"),                                                \
+          py::arg("input"),                                              \
+          py::arg("scales"),                                             \
+          py::arg("smooth_scale"),                                       \
+          py::arg("sorted_token_ids"),                                   \
+          py::arg("sorted_expert_ids"),                                  \
+          py::arg("num_valid_ids"),                                      \
+          py::arg("block_m"),                                            \
+          py::arg("shuffle_scale") = false,                              \
+          py::arg("transpose_out") = false);                             \
     m.def("partial_transpose",                                           \
           &aiter::partial_transpose,                                     \
           py::arg("out"),                                                \
