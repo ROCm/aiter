@@ -158,6 +158,8 @@ def flydsl_moe_stage2(
     model_dim=0,
     inter_dim=0,
     mode=None,
+    topk_ids=None,
+    expert_mask=None,
     valid_mask=None,
     intermediate=None,
 ):
@@ -172,7 +174,9 @@ def flydsl_moe_stage2(
     mode = str(mode).strip().lower()
     if mode not in ("atomic", "reduce"):
         raise ValueError(f"Unsupported moe gemm2 mode: {mode}")
-    use_valid_mask = valid_mask is not None
+    use_valid_mask = (
+        topk_ids is not None and expert_mask is not None
+    ) or valid_mask is not None
 
     exe = _manager.get_exe(
         compile_moe_gemm2_ex,
@@ -187,7 +191,7 @@ def flydsl_moe_stage2(
         in_dtype="a8w4smooth",
         out_dtype="bf16",
         mode=mode,
-        valid_mask=True if use_valid_mask else None,
+        expert_mask=True if use_valid_mask else None,
         zero_intermediate=False,
     )
 
@@ -199,6 +203,10 @@ def flydsl_moe_stage2(
 
     if sorted_weights is None:
         sorted_weights = torch.empty(0, device=out.device, dtype=torch.float32)
+    if topk_ids is not None:
+        topk_ids = topk_ids.contiguous()
+    if expert_mask is not None:
+        expert_mask = expert_mask.contiguous()
     if valid_mask is not None:
         valid_mask = valid_mask.contiguous()
 
@@ -231,6 +239,8 @@ def flydsl_moe_stage2(
             inter_dim,
             int(num_expert_blocks),
             intermediate=intermediate,
+            topk_ids=topk_ids,
+            expert_mask=expert_mask,
             valid_mask=valid_mask,
             stream_ptr=stream_ptr,
         )

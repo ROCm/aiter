@@ -47,6 +47,7 @@ def _moe_sorting_impl(
     dispatch_policy,
     use_opus,
     need_reduce,
+    has_reduce_mask,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -59,9 +60,14 @@ def _moe_sorting_impl(
     )
     sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    moe_buf = torch.empty(
-        (M * (topk if need_reduce else 1), model_dim), dtype=moebuf_dtype, device=device
-    )
+    if need_reduce and has_reduce_mask:
+        moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
+    else:
+        moe_buf = torch.empty(
+            (M, (topk if need_reduce else 1) * model_dim),
+            dtype=moebuf_dtype,
+            device=device,
+        )
 
     fwd_fn = aiter.moe_sorting_opus_fwd if use_opus else aiter.moe_sorting_fwd
     fwd_fn(
@@ -71,7 +77,7 @@ def _moe_sorting_impl(
         sorted_weights,
         sorted_expert_ids,
         num_valid_ids,
-        moe_buf.view(M, (topk if need_reduce else 1) * model_dim),
+        moe_buf,
         num_experts,
         int(block_size),
         expert_mask,
@@ -96,6 +102,7 @@ def moe_sorting(
     num_local_tokens=None,
     dispatch_policy=0,
     need_reduce=False,
+    has_reduce_mask=False,
 ):
     try:
         return _moe_sorting_impl(
@@ -110,6 +117,7 @@ def moe_sorting(
             dispatch_policy,
             use_opus=_USE_OPUS_MOE_SORTING,
             need_reduce=need_reduce,
+            has_reduce_mask=has_reduce_mask,
         )
     except Exception as e:
         logger.error(f"Error in moe_sorting: {e}")
@@ -138,10 +146,10 @@ def get_topk_valid_mask(
     """
     if expert_mask is None:
         # Non-EP mode: all slots are valid
-        return torch.ones(topk_ids.shape, dtype=dtypes.i8, device=topk_ids.device)
+        return torch.ones(topk_ids.shape, dtype=dtypes.i32, device=topk_ids.device)
     else:
         # EP mode: mask based on expert_mask
-        return expert_mask[topk_ids].to(dtypes.i8)
+        return expert_mask[topk_ids]
 
 
 def is_reduce() -> bool:
@@ -150,6 +158,10 @@ def is_reduce() -> bool:
     if mode in ("atomic", "reduce"):
         return mode == "reduce"
     raise Exception(f"Invalid mode: {mode}")
+
+
+def has_reduce_mask() -> bool:
+    return os.environ.get("AITER_FLYDSL_GEMM2_VALID_MASK", "0") == "1"
 
 
 def _supports_stage2_reduce(stage2: Callable) -> bool:
@@ -385,6 +397,7 @@ def fused_moe_(
         num_local_tokens,
         moe_sorting_dispatch_policy,
         is_reduce() and _supports_stage2_reduce(metadata.stage2),
+        has_reduce_mask(),
     )
 
     if metadata.run_1stage:
@@ -727,7 +740,8 @@ def _flydsl_stage2_wrapper(
     w2_scale=None,
     a2_scale=None,
     sorted_weights=None,
-    valid_mask=None,
+    topk_ids=None,
+    expert_mask=None,
     intermediate=None,
     zero_intermediate=True,
     **_kwargs,
@@ -759,7 +773,8 @@ def _flydsl_stage2_wrapper(
         w2_scale=w2_scale,
         a2_scale=a2_scale,
         sorted_weights=sorted_weights,
-        valid_mask=valid_mask,
+        topk_ids=topk_ids,
+        expert_mask=expert_mask,
         intermediate=intermediate,
     )
 
@@ -1453,16 +1468,14 @@ def fused_moe_2stages(
         )
         a2 = a2.view(token_num, topk, inter_dim)
 
-    # Build valid_mask for EP mode only when reduce mode requests it.
+    # Pass routing metadata for fused valid-mask generation in the reduce kernel.
     extra_stage2_args = {}
     use_reduce = is_reduce() and _supports_stage2_reduce(metadata.stage2)
     use_valid_mask = int(os.environ.get("AITER_FLYDSL_GEMM2_VALID_MASK", "0"))
     if use_reduce and use_valid_mask:
-        valid_mask = None
         if topk_ids is not None and expert_mask is not None:
-            valid_mask = get_topk_valid_mask(topk_ids, expert_mask)
-        if valid_mask is not None:
-            extra_stage2_args["valid_mask"] = valid_mask
+            extra_stage2_args["topk_ids"] = topk_ids
+            extra_stage2_args["expert_mask"] = expert_mask
     if use_reduce:
         extra_stage2_args["intermediate"] = moe_out
         moe_out = torch.empty(token_num, model_dim, dtype=moe_out.dtype, device=device)
