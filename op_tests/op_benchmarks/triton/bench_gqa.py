@@ -95,11 +95,11 @@ def model_benchmark_configs(args):
         if isinstance(N_CTX_Q, list):
             for seq_len in N_CTX_Q:
                 fa_configs.append(
-                    (model_name, batch_size, HQ, HK, seq_len, seq_len, HEAD_DIM, HEAD_DIM)
+                    (model_name, batch_size, HQ, HK, seq_len, seq_len, HEAD_DIM)
                 )
         else:
             fa_configs.append(
-                (model_name, batch_size, HQ, HK, N_CTX_Q, N_CTX_K, HEAD_DIM, HEAD_DIM)
+                (model_name, batch_size, HQ, HK, N_CTX_Q, N_CTX_K, HEAD_DIM)
             )
 
     return fa_configs
@@ -179,9 +179,16 @@ def create_benchmark_configs(custom, args):
 
         if args.model:
             x_vals_list = model_benchmark_configs(args)
-            x_names = ["model", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K", "D_HEAD", "D_HEAD_V"]
+            x_names = ["model", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K", "D_HEAD"]
             plot_name = f"gqa-attention-{mode}-layout-{args.layout}-fp8-{args.fp8}-causal-{causal}"
-            extra_args = {"dtype": dtype, "causal": causal, "mode": mode}
+            # When using model configs, D_HEAD_V defaults to D_HEAD (from model config)
+            # We need to extract D_HEAD from the first config to set D_HEAD_V in extra_args
+            if x_vals_list:
+                first_config = x_vals_list[0]
+                model_d_head = first_config[-1]  # D_HEAD is the last element
+                extra_args = {"dtype": dtype, "causal": causal, "mode": mode, "D_HEAD_V": model_d_head}
+            else:
+                extra_args = {"dtype": dtype, "causal": causal, "mode": mode}
 
     if args.metric == "time":
         unit = "ms"

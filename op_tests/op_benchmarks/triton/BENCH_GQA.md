@@ -653,16 +653,15 @@ for BATCH in "${BATCH_SIZES[@]}"; do
                                                 
                                                 echo "[$CURRENT/$TOTAL] Testing: batch=$BATCH, seqlen=$SEQLEN, hq=$HQ, hk=$HK (ratio=$ratio:1), d=$HEAD_DIM, mode=$MODE, dtype=$DTYPE, causal=${CAUSAL:--}, fp8=${FP8:--}, metric=$METRIC"
                                                 
-                                                # Build command
-                                                CMD="python bench_gqa.py -b $BATCH -hq $HQ -hk $HK -sq $SEQLEN -sk $SEQLEN -d $HEAD_DIM --dtype $DTYPE -mode $MODE -metric $METRIC $CAUSAL $FP8 -o"
+                                                # Build command without --model flag (sq and sk use same value)
+                                                CMD="python bench_gqa.py -b $BATCH -hq $HQ -hk $HK -sq $SEQLEN -sk $SEQLEN -d $HEAD_DIM -mode $MODE --dtype $DTYPE $CAUSAL $FP8 -metric $METRIC -o"
                                                 
-                                                # Run benchmark and save output
-                                                $CMD > "$OUTPUT_DIR/${FILENAME}.log" 2>&1
+                                                # Run benchmark
+                                                $CMD > /dev/null 2>&1
                                                 
-                                                if [ $? -eq 0 ]; then
-                                                    echo "  ✓ Success: $FILENAME"
-                                                else
-                                                    echo "  ✗ Failed: $FILENAME (check $OUTPUT_DIR/${FILENAME}.log)"
+                                                # Move CSV file if it exists
+                                                if ls *.csv 1> /dev/null 2>&1; then
+                                                    mv *.csv $OUTPUT_DIR/${FILENAME}.csv 2>/dev/null || true
                                                 fi
                                             done
                                         done
@@ -677,8 +676,19 @@ for BATCH in "${BATCH_SIZES[@]}"; do
     done
 done
 
+# Test VGPR usage separately (only need to run once)
+echo "Testing VGPR usage..."
+python bench_gqa.py -b 4 -hq 32 -hk 8 -sq 2048 -sk 2048 -d 128 -print_vgpr > $OUTPUT_DIR/vgpr_usage.txt 2>&1
+
 echo "Benchmarking complete! Results saved in $OUTPUT_DIR/"
 echo "Total combinations tested: $CURRENT"
 ```
 
-This script will systematically test all parameter combinations for GQA with valid head ratios and save the results in the `gqa_benchmark_results/` directory. Each run generates a log file and CSV output (when using `-o`).
+Save this script as `bench_gqa_comprehensive.sh`, make it executable, and run it:
+
+```bash
+chmod +x bench_gqa_comprehensive.sh
+./bench_gqa_comprehensive.sh
+```
+
+**Note**: The script includes logic to skip invalid combinations (e.g., `-fp8` flag requires `--dtype fp8`). You may want to adjust the parameter arrays based on your specific testing needs, as the combinations can take a very long time to complete.
