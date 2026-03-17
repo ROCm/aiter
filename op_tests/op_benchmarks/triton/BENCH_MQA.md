@@ -425,3 +425,170 @@ For issues or questions:
 2. Review the benchmark script help: `python bench_mqa.py --help`
 3. Check existing GitHub issues
 4. Create a new issue with benchmark configuration and error details
+
+## Performance Benchmarks
+
+### How to Run MQA
+
+Run Multi-Query Attention performance benchmarks:
+
+```bash
+# Navigate to benchmarks directory
+cd op_tests/op_benchmarks/triton
+
+# List available models (check --help for available model names)
+python bench_mqa.py --help
+
+# Run MQA benchmark with model configurations
+# Note: Model names use format "family-size" with capital letters (e.g., "70B" not "70b")
+# Note: HK is automatically set to 1 for MQA
+python bench_mqa.py --model llama3-70B
+
+# Run all models in a family
+python bench_mqa.py --model llama3
+
+# Run with custom parameters (without model config)
+# Note: HK defaults to 1 for MQA, so -hk can be omitted
+python bench_mqa.py \
+    -b 4 \
+    -hq 32 \
+    -sq 2048 \
+    -sk 2048 \
+    -d 128 \
+    --dtype fp16 \
+    -metric throughput \
+    -mode fwd
+
+# Run with FP8 precision
+python bench_mqa.py -fp8 -b 4 -hq 32 -sq 2048 -sk 2048 -d 128
+
+# Run backward pass benchmark
+python bench_mqa.py -mode bwd -b 4 -hq 32 -sq 2048 -sk 2048 -d 128
+
+# Run with model-specific configurations
+python bench_mqa.py --model llama3-70B -b 1 -sq 4096 -metric throughput
+
+# Test correctness against PyTorch SDPA
+python bench_mqa.py -test_mode -b 4 -hq 32 -sq 1024 -sk 1024 -d 128
+```
+
+**Available Model Names:**
+
+The model configuration file (`utils/model_configs.json`) contains the following models:
+- `llama3-8B`, `llama3-70B`, `llama3-405B`
+- `mixtral-7B`, `mixtral-22B`
+- `deepseek-V3`
+
+You can also use just the family name (e.g., `llama3`) to benchmark all models in that family, or use `all` to benchmark all available models.
+
+**Important:** Model names are case-sensitive. Use capital letters for model sizes (e.g., `70B` not `70b`).
+
+**Common MQA Benchmark Arguments:**
+
+- `-b`: Batch size
+- `-hq`: Number of query heads
+- `-hk`: Number of key/value heads (defaults to 1 for MQA, can be omitted)
+- `-sq`: Query sequence length
+- `-sk`: Key sequence length
+- `-d`: Head dimension (Q and K)
+- `-dv`: Value head dimension (optional)
+- `--dtype`: Data type (`fp16`, `bf16`, `fp32`)
+- `-mode`: Kernel mode (`fwd` for forward, `bwd` for backward)
+- `-metric`: Performance metric (`throughput`, `time`, `bandwidth`)
+- `-causal`: Enable causal attention mask
+- `-fp8`: Use FP8 precision
+- `--model`: Model name (uses model configs from `utils/model_configs.json`)
+- `-test_mode`: Run correctness tests comparing to PyTorch SDPA
+- `-o`: Save results to CSV file
+
+**Comprehensive Benchmark Script:**
+
+Here's a bash script to run `bench_mqa.py` with all combinations of flags:
+
+```bash
+#!/bin/bash
+# Comprehensive benchmark script for bench_mqa.py
+# Tests all combinations of parameters without using --model flag
+# Note: For MQA, HK is always 1, so we don't vary HK
+# Total combinations: 4 (batch) × 4 (seqlen) × 3 (hq) × 3 (head_dim) × 2 (mode) × 3 (dtype) × 2 (causal) × 2 (fp8) × 3 (metric) = 5,184 combinations
+# Note: Some combinations are skipped (fp8 flag without fp8 dtype), so actual number may be slightly less
+# Note: sq and sk use the same value (seqlen) for both query and key sequence lengths
+
+OUTPUT_DIR="mqa_benchmark_results"
+mkdir -p $OUTPUT_DIR
+
+echo "Starting comprehensive MQA benchmarks with all combinations (using custom parameters, no --model flag)..."
+echo "Note: HK is fixed at 1 for MQA"
+
+# Define parameter arrays
+# For MQA, HK is always 1, so we don't include it in the loop
+BATCH_SIZES=(1 4 8 16)
+SEQLENS=(512 1024 2048 4096)
+HQ_VALUES=(32 64 128)
+HK=1  # Fixed for MQA
+HEAD_DIMS=(64 128 256)
+MODES=(fwd bwd)
+DTYPES=(fp16 bf16 fp8)
+CAUSAL_FLAGS=("" "-causal")
+FP8_FLAGS=("" "-fp8")
+METRICS=(time throughput bandwidth)
+
+# Counter for tracking progress
+TOTAL=$(( ${#BATCH_SIZES[@]} * ${#SEQLENS[@]} * ${#HQ_VALUES[@]} * ${#HEAD_DIMS[@]} * ${#MODES[@]} * ${#DTYPES[@]} * ${#CAUSAL_FLAGS[@]} * ${#FP8_FLAGS[@]} * ${#METRICS[@]} ))
+CURRENT=0
+
+# Nested loops to test all combinations
+for BATCH in "${BATCH_SIZES[@]}"; do
+    for SEQLEN in "${SEQLENS[@]}"; do
+        for HQ in "${HQ_VALUES[@]}"; do
+            for HEAD_DIM in "${HEAD_DIMS[@]}"; do
+                for MODE in "${MODES[@]}"; do
+                    for DTYPE in "${DTYPES[@]}"; do
+                        for CAUSAL in "${CAUSAL_FLAGS[@]}"; do
+                            for FP8 in "${FP8_FLAGS[@]}"; do
+                                for METRIC in "${METRICS[@]}"; do
+                                    CURRENT=$((CURRENT + 1))
+                                    
+                                    # Skip invalid combinations (fp8 requires fp8 dtype)
+                                    if [ -n "$FP8" ] && [ "$DTYPE" != "fp8" ]; then
+                                        continue
+                                    fi
+                                    
+                                    # Build filename from parameters
+                                    FILENAME="b${BATCH}_s${SEQLEN}_hq${HQ}_hk${HK}_d${HEAD_DIM}_${MODE}_${DTYPE}"
+                                    if [ -n "$CAUSAL" ]; then
+                                        FILENAME="${FILENAME}_causal"
+                                    fi
+                                    if [ -n "$FP8" ]; then
+                                        FILENAME="${FILENAME}_fp8"
+                                    fi
+                                    FILENAME="${FILENAME}_${METRIC}"
+                                    
+                                    echo "[$CURRENT/$TOTAL] Testing: batch=$BATCH, seqlen=$SEQLEN, hq=$HQ, hk=$HK, d=$HEAD_DIM, mode=$MODE, dtype=$DTYPE, causal=${CAUSAL:--}, fp8=${FP8:--}, metric=$METRIC"
+                                    
+                                    # Build command
+                                    CMD="python bench_mqa.py -b $BATCH -hq $HQ -hk $HK -sq $SEQLEN -sk $SEQLEN -d $HEAD_DIM --dtype $DTYPE -mode $MODE -metric $METRIC $CAUSAL $FP8 -o"
+                                    
+                                    # Run benchmark and save output
+                                    $CMD > "$OUTPUT_DIR/${FILENAME}.log" 2>&1
+                                    
+                                    if [ $? -eq 0 ]; then
+                                        echo "  ✓ Success: $FILENAME"
+                                    else
+                                        echo "  ✗ Failed: $FILENAME (check $OUTPUT_DIR/${FILENAME}.log)"
+                                    fi
+                                done
+                            done
+                        done
+                    done
+                done
+            done
+        done
+    done
+done
+
+echo "Benchmarking complete! Results saved in $OUTPUT_DIR/"
+echo "Total combinations tested: $CURRENT"
+```
+
+This script will systematically test all parameter combinations for MQA and save the results in the `mqa_benchmark_results/` directory. Each run generates a log file and CSV output (when using `-o`).
