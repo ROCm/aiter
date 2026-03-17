@@ -8,6 +8,46 @@ from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 import triton
 
+@triton.jit
+def packed_nonzero(x):
+    low = (x & 0xFFFF)
+    high = (x >> 16)
+    _1u = tl.full([],1,dtype=tl.uint16)
+    combined = tl.join(low, high).to(tl.uint16)
+    combined = tl.minimum(combined, _1u)
+    combined -= _1u
+    low, high = tl.split(combined.to(tl.uint32))
+    y = (high<<16) | low
+    return y.to(tl.uint32, bitcast=True)
+
+@triton.jit
+def dequant_fp4_fp8e5m2_with_scale(x, sc):
+    # 'x' is a tensor of dtype uint8, packed two fp4 values per byte.
+    # 'sc' is a tensor of e8m0 scale values (uint8).
+    # Returns a tensor of float8e5 values, two per input byte.
+    x = x.to(tl.uint32)
+    x = (x*0x2002) & 0x1E001E
+    x = ((x & 0x100010)<<3) + (x & 0x0E000E)
+
+    bias = (sc.to(tl.uint32)-113)*0x40004
+    y = x+bias
+
+    mask0 = packed_nonzero(x & (0x60006<<1))
+    mask1 = packed_nonzero(x & (0x70007<<1))
+    signed_05 = (y & 0x800080) | bias
+    # ?001 -> +/-0.5
+    y = (y & ~mask0) | (signed_05 & mask0)
+
+    # ?000 -> +/-0
+    y = (y & ~mask1)
+
+    low_u8 = (y & 0xFF).to(tl.uint8)
+    high_u8 = (y >> 16).to(tl.uint8)
+    combined = tl.join(low_u8, high_u8)
+    return combined.to(tl.float8e5, bitcast=True)
+
+
+
 _gemm_afp4wfp4_repr = make_kernel_repr(
     "_gemm_afp4wfp4_kernel",
     [
@@ -53,6 +93,7 @@ def _gemm_afp4wfp4_kernel(
     stride_ask,
     stride_bsn,
     stride_bsk,
+    emu: tl.constexpr,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -161,9 +202,20 @@ def _gemm_afp4wfp4_kernel(
                     cache_modifier=cache_modifier,
                 )
 
-            accumulator = tl.dot_scaled(
-                a, a_scales, "e2m1", b, b_scales, "e2m1", accumulator
-            )
+            if emu:
+                # FP4 -> FP8E5M2 dequantization, then tl.dot
+                a_scales = tl.minimum(tl.maximum(a_scales, 114), 140)
+                b_scales = tl.minimum(tl.maximum(b_scales, 114), 140)
+                a8 = dequant_fp4_fp8e5m2_with_scale(a.reshape([BLOCK_SIZE_M, BLOCK_SIZE_K//SCALE_GROUP_SIZE, SCALE_GROUP_SIZE//2]), a_scales[:, :, None])
+                b8 = dequant_fp4_fp8e5m2_with_scale(b.reshape([BLOCK_SIZE_K//SCALE_GROUP_SIZE, SCALE_GROUP_SIZE//2, BLOCK_SIZE_N]), b_scales.T[:,None,:])
+                b8 = b8.permute([0,1,3,2])
+                a8 = a8.reshape([BLOCK_SIZE_M, BLOCK_SIZE_K])
+                b8 = b8.reshape([BLOCK_SIZE_K, BLOCK_SIZE_N])
+                accumulator = tl.dot(a8, b8, accumulator)
+            else:
+                accumulator = tl.dot_scaled(
+                    a, a_scales, "e2m1", b, b_scales, "e2m1", accumulator
+                )
 
             # Advance the ptrs to the next K block.
             a_ptrs += (BLOCK_SIZE_K // 2) * stride_ak
