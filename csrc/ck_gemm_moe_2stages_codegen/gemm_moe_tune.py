@@ -150,7 +150,10 @@ class FmoeTuner(TunerCommon):
         q_type,
         act_type,
     ):
-        inter_dim = w1_qt_shffle_ck.shape[1] // 2
+        if w1_qt_shffle_ck.shape[1] == w2_qt_shffle_ck.shape[2]:
+            inter_dim = w1_qt_shffle_ck.shape[1]
+        else:
+            inter_dim = w1_qt_shffle_ck.shape[1] // 2
         token_num = a1_qt.shape[0]
         out = torch.empty(
             (token_num, topk, inter_dim),
@@ -203,13 +206,12 @@ class FmoeTuner(TunerCommon):
     ):
         model_dim = w2_qt_shffle_ck.shape[1]
         token_num = a2_qt.shape[0]
-
         out = torch.zeros(
             (token_num, model_dim),
             dtype=dtype,
             device=a2_qt.device,
         )
-        return ck_moe_stage2_fwd(
+        outr = ck_moe_stage2_fwd(
             a2_qt,
             w1_qt_shffle_ck,
             w2_qt_shffle_ck,
@@ -226,6 +228,7 @@ class FmoeTuner(TunerCommon):
             q_type,
             act_type,
         )
+        return outr
 
     @staticmethod
     def run_flydsl_stage1_out(
@@ -1670,10 +1673,12 @@ class FmoeTuner(TunerCommon):
             True,  # bpreshuffle
         )
         for blockM in blockMs:
-            if blockM in [16, 32, 64, 128] and use_g1u1:
+            if blockM in [16, 32, 64, 128]:# and use_g1u1:
                 for kernel in ck_stage1_kernels.values():
                     if kernel.MPerBlock != blockM:
                         continue
+                    # if kernel.name != "moe_ck2stages_gemm1_256x32x64x128_1x4_TypeCast_v1_Nswizzle0_Quant2_MulRoutedWeight0_gelu_I8_I8_B16":
+                    #     continue
                     tasks_ck.append(
                         (
                             (info, "stage1", kernel.name, blockM),  # tag
@@ -1959,12 +1964,12 @@ class FmoeTuner(TunerCommon):
             q_type = eval(q_type)
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             print("\nStart tuning", line)
-            if get_gfx() not in ["gfx950"] and q_type == aiter.QuantType.per_1x32:
-                print(f"{q_type} is not supported on {get_gfx()}")
-                return []
-            if not use_g1u1:
-                print("no moe solution(g1u0) can tune for ", line)
-                continue
+            #if get_gfx() not in ["gfx950"] and q_type == aiter.QuantType.per_1x32:
+            #    print(f"{q_type} is not supported on {get_gfx()}")
+            #    return []
+            #if not use_g1u1:
+            #    print("no moe solution(g1u0) can tune for ", line)
+            #    continue
             act_type = eval(act_type)
             info = (
                 cu_num,

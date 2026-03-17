@@ -342,6 +342,8 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
             "wrong! device_gemm with the specified compilation parameters does "
             "not support this GEMM problem");
     }
+    printf("%s:%d - %s", __FILE__, __LINE__, __PRETTY_FUNCTION__);
+    fflush(stdout);
     invoker.Run(argument, StreamConfig{stream});
 }
 

@@ -83,8 +83,19 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
     int sorted_size = std::min(int64_t(tokens * topk * block_m.value()), sorted_token_ids.size(0));
     int E = w1.size(0);
     int N = w1.size(1) / 2;
+    if (w1.size(1) == w2.size(2))
+        N = w1.size(1);
     int K = hidden_states.size(-1);
     int MPerBlock = block_m.value();
+
+    std::cerr << "[ck_moe_stage1] hidden_states: " << hidden_states.sizes()
+              << " w1: " << w1.sizes()
+              << " w2: " << w2.sizes()
+              << " out: " << out.sizes()
+              << " E=" << E << " N=" << N << " K=" << K
+              << " tokens=" << tokens << " sorted_size=" << sorted_size
+              << " g1u1=" << (w1.size(1) != w2.size(2) ? "yes" : "no")
+              << std::endl;
 
     void *hidden_states_ptr = hidden_states.data_ptr();
     void *w1_ptr = w1.transpose(1, 2).data_ptr();

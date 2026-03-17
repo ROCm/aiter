@@ -963,6 +963,7 @@ def get_2stage_cfgs(
                 torch.uint32,
                 dtypes.fp4x2,
                 dtypes.fp8,
+                dtypes.i8,
             ]
         )
     ):
