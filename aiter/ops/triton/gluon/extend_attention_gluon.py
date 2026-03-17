@@ -5466,6 +5466,26 @@ def _launch_persistent(
     )
 
 
+_dummy_cm = None
+_dummy_mi = None
+_dummy_mi_size = 0
+_dummy_wkvo = None
+_dummy_wkvo_size = 0
+
+
+def _ensure_dummies(device, mi_size, wkvo_size):
+    """Lazy-init module-level singleton dummy tensors on first use."""
+    global _dummy_cm, _dummy_mi, _dummy_mi_size, _dummy_wkvo, _dummy_wkvo_size
+    if _dummy_cm is None:
+        _dummy_cm = torch.empty(0, dtype=torch.uint8, device=device)
+    if _dummy_mi is None or _dummy_mi_size < mi_size:
+        _dummy_mi = torch.zeros(mi_size, dtype=torch.int64, device=device)
+        _dummy_mi_size = mi_size
+    if _dummy_wkvo is None or _dummy_wkvo_size < wkvo_size:
+        _dummy_wkvo = torch.zeros(wkvo_size, dtype=torch.int32, device=device)
+        _dummy_wkvo_size = wkvo_size
+
+
 def gluon_extend_attention_fwd(
     q_extend,
     k_extend,
@@ -5499,33 +5519,117 @@ def gluon_extend_attention_fwd(
     _force_use_persistent=None,
     _mask_split_ext_threshold=1024,
     min_len_extend=None,
+    total_prefix_len=None,
+    total_extend_len=None,
 ):
     Lq = q_extend.shape[-1]
-    Lv = v_extend.shape[-1]
-
-    assert Lq == Lv, "BLOCK_DV != BLOCK_DMODEL not yet supported"
-
     batch_size = qo_indptr.shape[0] - 1
-    if min_len_extend is None:
-        extend_lens = qo_indptr[1:] - qo_indptr[:-1]
-        min_len_extend = int(extend_lens.min().item())
     head_num = q_extend.shape[1]
 
-    # -- Dispatch: persistent CTA vs request-centric --
-    # Persistent CTA eliminates grid waste on heterogeneous batches and
-    # rebalances causal-triangle imbalance across CTAs.
-    # Oracle sweep (358 cases, 8 GPUs): 99.15% geomean TF efficiency.
-    # Three persistent paths:
-    #   1) High ext heterogeneity (er>20, ext>=1024, ppct<0.95): grid waste.
-    #   2) Moderate ext heterogeneity (er>4, ext>=2048, B>=2): causal triangle.
-    #   3) Per-request FLOP imbalance (work_ratio>1.5, ext>=2048, B>=2):
-    #      catches cases where prefix differences amplify work imbalance
-    #      even when ext_ratio is small (e.g. B=2, similar ext but different pfx).
-    #      work_ratio = max(ext_i*(pfx_i+ext_i)) / min(ext_i*(pfx_i+ext_i))
-    #
-    # PERF: .item()/.tolist() on GPU tensors trigger GPU->CPU sync (~5-10us each).
-    # Short kernels (0.1ms) are sensitive to this, so defer all syncs behind
-    # fast CPU-only checks and avoid redundant computation.
+    # -- Fast path: no custom mask, no test overrides, uniform batch or B=1 --
+    # Skips all heuristic computation and launches with hardcoded constants.
+    # 4w-s4 dispatch: BM=64/NW=4/NS=4 when total KV per request is moderate.
+    if (
+        _force_block_m is None
+        and _force_use_persistent is None
+        and custom_mask is None
+        and (batch_size <= 1 or min_len_extend == max_len_extend)
+    ):
+        _sm = (sm_scale if sm_scale is not None else Lq**-0.5) * k_scale
+        _kv_gn = head_num // k_extend.shape[1]
+        _BLOCK_DMODEL = (
+            Lq
+            if (Lq & (Lq - 1) == 0 and Lq >= 16)
+            else max(triton.next_power_of_2(Lq), 16)
+        )
+        _wkvo = window_kv_offsets
+        if _wkvo is None or _dummy_cm is None:
+            _ensure_dummies(q_extend.device, q_extend.shape[0] + 1, batch_size)
+        if _wkvo is None:
+            _wkvo = _dummy_wkvo[:batch_size]
+
+        _BM, _NW, _NS = 128, 8, 4
+        if max_len_extend <= 512:
+            _total_pfx = kv_indices.shape[0]
+            _avg_pfx = _total_pfx // max(1, batch_size)
+            if batch_size == 1 and _avg_pfx >= 256:
+                _avg_total = _avg_pfx + max_len_extend
+                if 512 <= _avg_total <= 1024:
+                    _BM, _NW, _NS = 64, 4, 4
+            elif batch_size <= 8 and max_len_extend <= 64 and 768 <= _avg_pfx <= 1280:
+                _BM, _NW, _NS = 64, 4, 4
+            elif batch_size > 8 and max_len_extend <= 64 and 384 <= _avg_pfx <= 768:
+                _BM, _NW, _NS = 64, 4, 4
+
+        gluon_extend_attn_fwd.run(
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            _dummy_cm,
+            _dummy_mi[: q_extend.shape[0] + 1],
+            _wkvo,
+            _sm,
+            _kv_gn,
+            q_extend.stride(0),
+            q_extend.stride(1),
+            k_extend.stride(0),
+            k_extend.stride(1),
+            v_extend.stride(0),
+            v_extend.stride(1),
+            o_extend.stride(0),
+            o_extend.stride(1),
+            k_buffer.stride(0),
+            k_buffer.stride(1),
+            v_buffer.stride(0),
+            v_buffer.stride(1),
+            IS_CAUSAL=is_causal,
+            USE_CUSTOM_MASK=False,
+            SKIP_PREFIX_CUSTOM_MASK=skip_prefix_custom_mask,
+            ENABLE_PREFIX_UNMASKED=False,
+            ENABLE_MASK_SPLIT=False,
+            BLOCK_M=_BM,
+            BLOCK_N=64,
+            BLOCK_DMODEL=_BLOCK_DMODEL,
+            ACTUAL_BLOCK_DMODEL=Lq,
+            NUM_STAGES=_NS,
+            MMA_INSTR_M=16,
+            MMA_INSTR_N=16,
+            MMA_INSTR_K=32,
+            QK_K_WIDTH=8,
+            PV_K_WIDTH=4,
+            ASYNC_PAD_K=16,
+            ASYNC_PAD_V=16,
+            Sinks=sinks,
+            HAS_SINK=sinks is not None,
+            LOGIT_CAP=logit_cap,
+            XAI_TEMPERATURE_LEN=xai_temperature_len,
+            SLIDING_WINDOW_SIZE=sliding_window_size,
+            V_SCALE=v_scale,
+            num_warps=_NW,
+            num_stages=1,
+            waves_per_eu=2,
+            matrix_instr_nonkdim=32,
+            grid=(batch_size, head_num, (max_len_extend + _BM - 1) // _BM),
+            warmup=False,
+        )
+        return
+
+    # -- Full dispatch path (heterogeneous batches, custom mask, test overrides) --
+    Lv = v_extend.shape[-1]
+    assert Lq == Lv, "BLOCK_DV != BLOCK_DMODEL not yet supported"
+
+    if min_len_extend is None:
+        min_len_extend = int((qo_indptr[1:] - qo_indptr[:-1]).min().item())
+
+    _ensure_dummies(q_extend.device, q_extend.shape[0] + 1, batch_size)
+
+    # Persistent CTA dispatch.  Uses CPU-side totals when available.
     needs_detailed_check = False
     if _force_use_persistent is not None:
         use_persistent = bool(_force_use_persistent)
@@ -5533,13 +5637,16 @@ def gluon_extend_attention_fwd(
         ext_ratio = max_len_extend / max(1, min_len_extend)
         use_persistent = False
 
-        # Fast path: skip GPU syncs entirely for short extends
         needs_detailed_check = (ext_ratio > 20.0 and max_len_extend >= 1024) or (
             max_len_extend >= 2048 and batch_size >= 2
         )
         if needs_detailed_check:
-            total_prefix = int((kv_indptr[-1] - kv_indptr[0]).item())
-            total_extend = int((qo_indptr[-1] - qo_indptr[0]).item())
+            if total_prefix_len is not None and total_extend_len is not None:
+                total_prefix = total_prefix_len
+                total_extend = total_extend_len
+            else:
+                total_prefix = int((kv_indptr[-1] - kv_indptr[0]).item())
+                total_extend = int((qo_indptr[-1] - qo_indptr[0]).item())
             ppct = total_prefix / max(1, total_prefix + total_extend)
 
             work_ratio = 1.0
@@ -5590,14 +5697,15 @@ def gluon_extend_attention_fwd(
         )
         return
 
-    # -- Request-centric path with optional mask-split optimization --
-    # Oracle sweep: mask-split wins for long extends (>=2048) when extend-heavy
-    # (ppct<0.60) and batched (B>=2).  B=1 masksplit regresses vs basic.
-    # Reuse ppct from persistent dispatch if already computed.
+    # Mask-split dispatch.
     if max_len_extend >= 2048 and batch_size >= 2:
         if not needs_detailed_check:
-            total_prefix = int((kv_indptr[-1] - kv_indptr[0]).item())
-            total_extend = int((qo_indptr[-1] - qo_indptr[0]).item())
+            if total_prefix_len is not None and total_extend_len is not None:
+                total_prefix = total_prefix_len
+                total_extend = total_extend_len
+            else:
+                total_prefix = int((kv_indptr[-1] - kv_indptr[0]).item())
+                total_extend = int((qo_indptr[-1] - qo_indptr[0]).item())
             ppct = total_prefix / max(1, total_prefix + total_extend)
         enable_mask_split = ppct < 0.60
     else:
@@ -5605,35 +5713,35 @@ def gluon_extend_attention_fwd(
     enable_prefix_unmasked = enable_mask_split
 
     USE_CUSTOM_MASK = custom_mask is not None
-    SKIP_PREFIX_CUSTOM_MASK = skip_prefix_custom_mask
     if not USE_CUSTOM_MASK:
-        custom_mask = torch.empty(0, dtype=torch.uint8, device=q_extend.device)
-        mask_indptr = torch.zeros(
-            q_extend.shape[0] + 1, dtype=torch.int64, device=q_extend.device
-        )
+        custom_mask = _dummy_cm
+        mask_indptr = _dummy_mi[: q_extend.shape[0] + 1]
     if window_kv_offsets is None:
-        window_kv_offsets = torch.zeros(
-            qo_indptr.shape[0] - 1, dtype=torch.int32, device=q_extend.device
-        )
-    assert (
-        q_extend.shape[1] % k_extend.shape[1] == 0
-    ), f"H_q ({q_extend.shape[1]}) must be divisible by H_kv ({k_extend.shape[1]})"
+        window_kv_offsets = _dummy_wkvo[:batch_size]
 
     BLOCK_DMODEL = max(triton.next_power_of_2(Lq), 16)
     BLOCK_N = 64
 
-    # Occupancy-aware dispatch.
-    # BM=128 is the safe default -- it wins for decode, short extend, initial
-    # prefill, and mixed batches.  BM=256 only helps when the batch is large
-    # (B>4), every item has a meaningful extend (min_ext>=64), and extends are
-    # long enough to fill the wider tile (max_ext>=256).
+    # 4w-s4 dispatch for moderate-prefix short-extend (full dispatch path).
+    use_4w_dispatch = False
+    if _force_block_m is None and _force_num_warps is None and max_len_extend <= 512:
+        total_prefix = kv_indices.shape[0]
+        avg_pfx = total_prefix // max(1, batch_size)
+        if batch_size == 1 and avg_pfx >= 256:
+            avg_total = avg_pfx + max_len_extend
+            use_4w_dispatch = 512 <= avg_total <= 1024
+        elif batch_size <= 8 and max_len_extend <= 64:
+            use_4w_dispatch = 768 <= avg_pfx <= 1280
+        elif batch_size > 8 and max_len_extend <= 64:
+            use_4w_dispatch = 384 <= avg_pfx <= 768
+
     if _force_block_m is not None and _force_num_warps is not None:
         BLOCK_M = _force_block_m
         num_warps = _force_num_warps
-    elif max_len_extend <= 128:
-        BLOCK_M = 128
-        num_warps = 8
-    elif batch_size <= 4:
+    elif use_4w_dispatch:
+        BLOCK_M = 64
+        num_warps = 4
+    elif max_len_extend <= 128 or batch_size <= 4:
         BLOCK_M = 128
         num_warps = 8
     elif BLOCK_DMODEL >= 128 and min_len_extend >= 64 and max_len_extend >= 256:
@@ -5645,12 +5753,13 @@ def gluon_extend_attention_fwd(
 
     if _force_num_stages is not None:
         NUM_STAGES = _force_num_stages
+    elif use_4w_dispatch:
+        NUM_STAGES = 4
     elif BLOCK_M == 64:
         NUM_STAGES = 1
     else:
         NUM_STAGES = 4
 
-    # 8w128-s2 has a known DMA race. Floor at 3 stages.
     if (
         BLOCK_M == 128
         and num_warps == 8
@@ -5660,17 +5769,11 @@ def gluon_extend_attention_fwd(
         NUM_STAGES = 3
 
     if _force_mma_shape == "32x32x16":
-        MMA_INSTR_M = 32
-        MMA_INSTR_N = 32
-        MMA_INSTR_K = 16
-        QK_K_WIDTH = 32
-        PV_K_WIDTH = 4
+        MMA_INSTR_M, MMA_INSTR_N, MMA_INSTR_K = 32, 32, 16
+        QK_K_WIDTH, PV_K_WIDTH = 32, 4
     else:
-        MMA_INSTR_M = 16
-        MMA_INSTR_N = 16
-        MMA_INSTR_K = 32
-        QK_K_WIDTH = 8
-        PV_K_WIDTH = 4
+        MMA_INSTR_M, MMA_INSTR_N, MMA_INSTR_K = 16, 16, 32
+        QK_K_WIDTH, PV_K_WIDTH = 8, 4
 
     ASYNC_PAD_K = _force_async_pad_k if _force_async_pad_k is not None else 16
     ASYNC_PAD_V = _force_async_pad_v if _force_async_pad_v is not None else 16
@@ -5679,9 +5782,7 @@ def gluon_extend_attention_fwd(
     sm_scale = sm_scale * k_scale
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
 
-    grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
-
-    gluon_extend_attn_fwd[grid](
+    gluon_extend_attn_fwd.run(
         q_extend,
         k_extend,
         v_extend,
@@ -5710,7 +5811,7 @@ def gluon_extend_attention_fwd(
         v_buffer.stride(1),
         IS_CAUSAL=is_causal,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
-        SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
+        SKIP_PREFIX_CUSTOM_MASK=skip_prefix_custom_mask,
         ENABLE_PREFIX_UNMASKED=enable_prefix_unmasked,
         ENABLE_MASK_SPLIT=enable_mask_split,
         BLOCK_M=BLOCK_M,
@@ -5735,6 +5836,8 @@ def gluon_extend_attention_fwd(
         num_stages=1,
         waves_per_eu=_force_waves_per_eu if _force_waves_per_eu is not None else 2,
         matrix_instr_nonkdim=32,
+        grid=(batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M)),
+        warmup=False,
     )
 
 
