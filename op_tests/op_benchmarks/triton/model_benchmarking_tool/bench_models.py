@@ -99,7 +99,8 @@ class KernelHandler(ABC):
         self._model: str | None = None
         self._kernel: str | None = None
         self._metric: str | None = None
-        self._layout: str | None = None
+        self._gemm_layout: str | None = None
+        self._mha_layout: str | None = None
         self._shape: ShapeDict | None = None
         self._batch_size: int | None = None
         self._seq_len: int | None = None
@@ -111,14 +112,16 @@ class KernelHandler(ABC):
         model: str,
         kernel: str,
         metric: str,
-        layout: str,
+        gemm_layout: str,
+        mha_layout: str,
         tp: int,
     ) -> None:
         """Set run-level parameters (constant for all shapes for this kernel)."""
         self._model = model
         self._kernel = kernel
         self._metric = metric
-        self._layout = layout
+        self._gemm_layout = gemm_layout
+        self._mha_layout = mha_layout
         self._tp = tp
 
     def set_iteration(self, shape: ShapeDict, batch_size: int, seq_len: int) -> None:
@@ -164,6 +167,8 @@ class KernelHandler(ABC):
 
 
 class GemmKernelHandler(KernelHandler):
+    """Handler for GEMM and batched GEMM benchmarks."""
+
     def get_tp_shapes(self, shapes: list[ShapeDict]) -> list[ShapeDict]:
         result = []
         for shape in shapes:
@@ -181,8 +186,10 @@ class GemmKernelHandler(KernelHandler):
         K = shape["K"]
         if "B" in shape:
             B = shape["B"]
-            return f"--shape {B} {M} {N} {K} --metric {self._metric} --layout {self._layout}"
-        return f"--shape {M} {N} {K} --metric {self._metric} --layout {self._layout}"
+            return f"--shape {B} {M} {N} {K} --metric {self._metric} --layout {self._gemm_layout}"
+        return (
+            f"--shape {M} {N} {K} --metric {self._metric} --layout {self._gemm_layout}"
+        )
 
     def parse_stdout(self, stdout: str) -> float:
         lines = [line for line in stdout.splitlines() if line.strip()]
@@ -203,12 +210,14 @@ class GemmKernelHandler(KernelHandler):
             "M": self._M,
             "N": shape["N"],
             "K": shape["K"],
-            "gemm_layout": self._layout,
+            "gemm_layout": self._gemm_layout,
             self._metric: bench_result,
         }
 
 
 class MoeKernelHandler(KernelHandler):
+    """Handler for MoE benchmarks."""
+
     def get_tp_shapes(self, shapes: list[ShapeDict]) -> list[ShapeDict]:
         return [{**s, "Dim2": max(s["Dim2"] // self._tp, 1)} for s in shapes]
 
@@ -256,6 +265,8 @@ class MoeKernelHandler(KernelHandler):
 
 
 class RmsnormKernelHandler(KernelHandler):
+    """Handler for RMSNorm benchmarks."""
+
     def get_tp_shapes(self, shapes: list[ShapeDict]) -> list[ShapeDict]:
         return shapes
 
@@ -287,6 +298,8 @@ class RmsnormKernelHandler(KernelHandler):
 
 
 class RopeKernelHandler(KernelHandler):
+    """Handler for RoPE benchmarks."""
+
     def get_tp_shapes(self, shapes: list[ShapeDict]) -> list[ShapeDict]:
         result = []
         for shape in shapes:
@@ -357,7 +370,7 @@ class MhaKernelHandler(KernelHandler):
     def build_args(self) -> str:
         shape = self._shape
         return (
-            f"-mode fwd -causal true --layout bshd --dtype bf16 -b {self._batch_size} "
+            f"-mode fwd -causal true --layout {self._mha_layout} --dtype bf16 -b {self._batch_size} "
             f"-hq {shape['hq']} -hk {shape['hkv']} -sq {self._seq_len} -sk {self._seq_len} "
             f"-d {shape['dqk']} -dv {shape['dv']} -metric {self._metric}"
         )
@@ -386,6 +399,7 @@ class MhaKernelHandler(KernelHandler):
             "hkv": shape["hkv"],
             "dqk": shape["dqk"],
             "dv": shape["dv"],
+            "mha_layout": self._mha_layout,
             self._metric: bench_result,
         }
 
@@ -618,7 +632,8 @@ def run_benchmarks(
     batch_sizes: list[int],
     seq_lens: list[int],
     TP: int,
-    layout: str,
+    gemm_layout: str,
+    mha_layout: str,
     metric: str,
 ) -> list[ResultRow]:
     results: list[ResultRow] = []
@@ -643,7 +658,7 @@ def run_benchmarks(
             handler = _get_handler(kernel)
             # MLA only reports time (ms); use "time" metric for it
             run_metric = "time" if kernel == "mla" else metric
-            handler.set_run(model, kernel, run_metric, layout, TP)
+            handler.set_run(model, kernel, run_metric, gemm_layout, mha_layout, TP)
             tp_shapes = handler.get_tp_shapes(shapes)
             for shape in tp_shapes:
                 for batch_size in batch_sizes:
@@ -761,11 +776,18 @@ def parse_args(available_models: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--layout",
+        "--gemm_layout",
         type=str,
         choices=["TN", "TT", "NN", "NT"],
         default="TN",
         help="GEMM layout. Default: TN.",
+    )
+    parser.add_argument(
+        "--mha_layout",
+        type=str,
+        choices=["bshd", "thd"],
+        default="thd",
+        help="Multi-head attention (MHA) layout (bshd or thd). Default: thd.",
     )
     parser.add_argument(
         "--output_file",
@@ -791,7 +813,8 @@ def main() -> None:
     seq_lens = args.seq_len
     TP = args.TP
     metric = args.metric
-    layout = args.layout
+    gemm_layout = args.gemm_layout
+    mha_layout = args.mha_layout
     output_file = args.output_file
 
     if models is not None:
@@ -804,7 +827,9 @@ def main() -> None:
         except re.error:
             print(f"Invalid model filter regex: {models!r} - running all models.")
 
-    results = run_benchmarks(data, batch_sizes, seq_lens, TP, layout, metric)
+    results = run_benchmarks(
+        data, batch_sizes, seq_lens, TP, gemm_layout, mha_layout, metric
+    )
 
     print_and_save_results(results, metric, output_file)
 
