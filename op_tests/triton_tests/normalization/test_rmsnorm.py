@@ -358,7 +358,8 @@ def test_rms_norm_dynamic_per_token_fp8_quant(
     )
 
     EPS = 1e-6
-    quant_dtype = torch.float8_e4m3fnuz
+    from aiter.utility.dtypes import fp8
+    quant_dtype = fp8
 
     xq_fused_triton = torch.empty(x.shape, dtype=quant_dtype, device="cuda")
     x_scale_fused = torch.empty(x.shape[0], 1, dtype=torch.float32, device="cuda")
