@@ -6,9 +6,10 @@ from triton.language.core import _aggregate as aggregate
 import pytest
 from aiter.ops.triton.utils._triton import arch_info
 import os
+from aiter.ops.triton.utils.types import e4m3_dtype
 
+float8_info = torch.finfo(e4m3_dtype)
 PRINT_IRS = os.environ.get("PRINT_IRS", "0") == "1"
-
 @aggregate
 class AsyncKVLoaderConfig:
     """Configuration for asynchronous KV loader."""
@@ -19,9 +20,9 @@ class AsyncKVLoaderConfig:
     shared_v_layout: gl.constexpr
     USE_LOAD_BUFFER_OP: gl.constexpr
     KV_CACHE_MODIFIER: gl.constexpr
-
     k_reg_layout: gl.constexpr
     v_reg_layout: gl.constexpr
+    K_WIDTH: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(self, cfg):
@@ -44,20 +45,27 @@ class AsyncKVLoaderConfig:
                 order=[0, 1],
             )
         )
-
-        # Swizzled shared memory layouts for K and V
-        self.shared_k_layout = gl.constexpr(
-            gl.SwizzledSharedLayout(vec=8, per_phase=2, max_phase=8, order=[0, 1])
-        )
-        self.shared_v_layout = gl.constexpr(
-            gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
-        )
+        if cfg.SHUFFLED_KV_CACHE:
+            self.shared_k_layout = gl.constexpr(
+                gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+            )
+            self.shared_v_layout = gl.constexpr(
+                gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+            )
+        else:
+            self.shared_k_layout = gl.constexpr(
+                gl.SwizzledSharedLayout(vec=8, per_phase=2, max_phase=8, order=[0, 1])
+            )
+            self.shared_v_layout = gl.constexpr(
+                gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+            )
 
         self.KV_CACHE_MODIFIER = cfg.KV_CACHE_MODIFIER
         self.USE_LOAD_BUFFER_OP = cfg.USE_LOAD_BUFFER_OP
 
         self.k_reg_layout = gl.constexpr(cfg.k_layout)
         self.v_reg_layout = gl.constexpr(cfg.v_layout)
+        self.K_WIDTH = gl.constexpr(cfg.K_WIDTH)
 
 
 @aggregate
@@ -200,20 +208,20 @@ class AsyncKVLoader:
         gl.amd.cdna4.async_copy.commit_group()
 
     @gluon.jit
-    def load_k_from_shared(self, wait_count, buffer_id):
+    def load_k_from_shared(self, wait_count, target_dtype, buffer_id):
         # Wait for async K copy and load from shared memory
         gl.amd.cdna4.async_copy.wait_group(wait_count)
         return gl.amd.cdna4.async_copy.load_shared_relaxed(
             self.k_shared.index(buffer_id), self.kv_cfg.k_reg_layout
-        )
+        ).to(target_dtype)
 
     @gluon.jit
-    def load_v_from_shared(self, wait_count, buffer_id):
+    def load_v_from_shared(self, wait_count, target_dtype, buffer_id):
         # Wait for async V copy and load from shared memory
         gl.amd.cdna4.async_copy.wait_group(wait_count)
         return gl.amd.cdna4.async_copy.load_shared_relaxed(
             self.v_shared.index(buffer_id), self.kv_cfg.v_reg_layout
-        )
+        ).to(target_dtype)
 
     @gluon.jit
     def load_block_ids(self, i):
@@ -240,10 +248,6 @@ class TDMKVLoaderConfig:
     @gluon.constexpr_function
     def __init__(self, cfg):
         # Swizzled shared memory layouts for K and V
-        # self.shared_k_layout = gl.constexpr(
-        #     gl.SwizzledSharedLayout(vec=8, per_phase=2, max_phase=8, order=[0, 1]))
-        # self.shared_v_layout = gl.constexpr(
-        #     gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0]))
         if cfg.SHUFFLED_KV_CACHE:
             self.shared_k_layout = gl.constexpr(
                 gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
@@ -254,7 +258,7 @@ class TDMKVLoaderConfig:
         else:
             self.shared_k_layout = gl.constexpr(
                 gl.PaddedSharedLayout.with_identity_for(
-                    [[cfg.HEAD_SIZE, 8]], [cfg.BLOCK_SIZE, cfg.HEAD_SIZE], [1, 0]
+                    [[cfg.HEAD_SIZE, 16]], [cfg.BLOCK_SIZE, cfg.HEAD_SIZE], [1, 0]
                 )
             )
             self.shared_v_layout = gl.constexpr(
@@ -269,7 +273,7 @@ class TDMKVLoaderConfig:
         self.v_reg_layout = gl.constexpr(cfg.v_layout)
         self.BLOCK_SIZE = gl.constexpr(cfg.BLOCK_SIZE)
         self.HEAD_SIZE = gl.constexpr(cfg.HEAD_SIZE)
-        self.K_WIDTH = gl.constexpr(8) #jsut hardcode for now
+        self.K_WIDTH = gl.constexpr(cfg.K_WIDTH)
         self.NUM_KV_HEADS = gl.constexpr(cfg.NUM_KV_HEADS)
 
 @aggregate
@@ -399,30 +403,30 @@ class TDMKVLoader:
         )
 
     @gluon.jit
-    def load_k_from_shared(self, wait_count, buffer_id):
+    def load_k_from_shared(self, wait_count, target_dtype, buffer_id):
         gl.amd.gfx1250.tdm.async_wait(wait_count)
         if self.kv_cfg.SHUFFLED_KV_CACHE:
             return (
                 self.lds_unshuffle_k(buffer_id)
                 .load(layout=self.kv_cfg.k_reg_layout)
-            )
+            ).to(target_dtype)
         else:
             return (
                 self.k_shared.index(buffer_id)
                 .permute([1, 0])
                 .load(layout=self.kv_cfg.k_reg_layout)
-            )
+            ).to(target_dtype)
 
     @gluon.jit
-    def load_v_from_shared(self, wait_count, buffer_id):
+    def load_v_from_shared(self, wait_count, target_dtype, buffer_id):
         gl.amd.gfx1250.tdm.async_wait(wait_count)
         if self.kv_cfg.SHUFFLED_KV_CACHE:
             return (
                 self.lds_unshuffle_v(buffer_id)
                 .load(layout=self.kv_cfg.v_reg_layout)
-            )
+            ).to(target_dtype)
         else:
-            return self.v_shared.index(buffer_id).load(layout=self.kv_cfg.v_reg_layout)
+            return self.v_shared.index(buffer_id).load(layout=self.kv_cfg.v_reg_layout).to(target_dtype)
 
     @gluon.jit
     def load_block_ids(self, i):
@@ -628,22 +632,22 @@ class TDMGatherKVLoader:
         )
 
     @gluon.jit
-    def load_k_from_shared(self, wait_count, buffer_id):
+    def load_k_from_shared(self, wait_count, target_dtype, buffer_id):
         gl.amd.gfx1250.tdm.async_wait(wait_count)
         return (
             self.k_shared.index(buffer_id)
             .reshape([self.kv_cfg.TILE_SIZE, self.kv_cfg.HEAD_SIZE])
             .permute([1, 0])
             .load(layout=self.kv_cfg.k_reg_layout)
-        )
+        ).to(target_dtype)
 
     @gluon.jit
-    def load_v_from_shared(self, wait_count, buffer_id):
+    def load_v_from_shared(self, wait_count, target_dtype, buffer_id):
         gl.amd.gfx1250.tdm.async_wait(wait_count)
         return (self.v_shared.index(buffer_id)
                 .reshape([self.kv_cfg.TILE_SIZE, self.kv_cfg.HEAD_SIZE])
                 .load(layout=self.kv_cfg.v_reg_layout)
-        )
+        ).to(target_dtype)
 
     @gluon.jit
     def load_block_ids(self, i):
@@ -669,6 +673,7 @@ class AttentionConfig:
     BLOCK_Q: gl.constexpr
     RCP_LN2: gl.constexpr
     QK_SCALE: gl.constexpr
+    SOFTMAX_SCALE: gl.constexpr
     WARP_SIZE: gl.constexpr
     NUM_WARPS: gl.constexpr
     # Operator layouts
@@ -690,6 +695,10 @@ class AttentionConfig:
     USE_STORE_BUFFER_OP: gl.constexpr
     ALL_DECODE: gl.constexpr
     SHUFFLED_KV_CACHE: gl.constexpr
+
+    Q_FP8: gl.constexpr
+    KV_FP8: gl.constexpr
+    K_WIDTH: gl.constexpr
     @gluon.constexpr_function
     def __init__(
         self,
@@ -708,6 +717,8 @@ class AttentionConfig:
         USE_STORE_BUFFER_OP,
         ALL_DECODE,
         SHUFFLED_KV_CACHE,
+        Q_FP8,
+        KV_FP8,
     ):
 
         # Constants
@@ -723,14 +734,19 @@ class AttentionConfig:
         self.NUM_KV_BLOCKS = gl.constexpr(TILE_SIZE // BLOCK_SIZE)
         self.TILE_SIZE = gl.constexpr(TILE_SIZE)
         self.RCP_LN2 = gl.constexpr(1.4426950408889634)
-        self.QK_SCALE = gl.constexpr(SCALE * self.RCP_LN2)
+        self.QK_SCALE = gl.constexpr(self.RCP_LN2 * SCALE)
+        self.SOFTMAX_SCALE = gl.constexpr(SCALE)
         self.USE_LOAD_BUFFER_OP = gl.constexpr(USE_LOAD_BUFFER_OP)
         self.USE_STORE_BUFFER_OP = gl.constexpr(USE_STORE_BUFFER_OP)
         self.ALL_DECODE = gl.constexpr(ALL_DECODE)
         self.SHUFFLED_KV_CACHE = gl.constexpr(SHUFFLED_KV_CACHE)
+        self.Q_FP8 = gl.constexpr(Q_FP8)
+        self.KV_FP8 = gl.constexpr(KV_FP8)
         self.ARCH_NAME = gl.constexpr(ARCH_NAME)
         self.WARP_SIZE = gl.constexpr(32 if ARCH_NAME == "gfx1250" else 64)
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
+        FP8_DOT: gl.constexpr = Q_FP8 and KV_FP8
+        self.K_WIDTH = gl.constexpr(8 if FP8_DOT else 8)
         # Operator layouts (gfx1250 WMMA)
         if ARCH_NAME == "gfx1250":
             assert NUM_WARPS == 2 or NUM_WARPS == 4 or NUM_WARPS == 8
@@ -745,26 +761,27 @@ class AttentionConfig:
                 gl.amd.AMDWMMALayout(
                     version=3,
                     transposed=True,
-                    instr_shape=[16, 16, 32],
+                    instr_shape=[16, 16, 32] if not FP8_DOT else [16, 16, 64],
                     warp_bases=warp_bases,
                 )
             )
+ 
         else:
             self.qk_layout = gl.constexpr(
                 gl.amd.AMDMFMALayout(
                     version=4,
                     transposed=True,
-                    instr_shape=[32, 32, 16],
+                    instr_shape=[32, 32, 16] if not FP8_DOT else [32, 32, 64],
                     warps_per_cta=[NUM_WARPS, 1],
                 )
             )
         self.pv_layout = self.qk_layout
 
         # Dot operand layouts
-        self.q_layout = gl.constexpr(gl.DotOperandLayout(0, self.qk_layout, 8))
-        self.k_layout = gl.constexpr(gl.DotOperandLayout(1, self.qk_layout, 8))
-        self.v_layout = gl.constexpr(gl.DotOperandLayout(1, self.pv_layout, 8))
-        self.p_layout = gl.constexpr(gl.DotOperandLayout(0, self.pv_layout, 8))
+        self.q_layout = gl.constexpr(gl.DotOperandLayout(0, self.qk_layout, self.K_WIDTH))
+        self.k_layout = gl.constexpr(gl.DotOperandLayout(1, self.qk_layout, self.K_WIDTH))
+        self.v_layout = gl.constexpr(gl.DotOperandLayout(1, self.pv_layout, self.K_WIDTH))
+        self.p_layout = gl.constexpr(gl.DotOperandLayout(0, self.pv_layout, self.K_WIDTH))
 
         # Blocked layouts for global-to-shared memory loads
         HEAD_SIZE_DIV = HEAD_SIZE // 8
@@ -799,6 +816,8 @@ class AttentionProgram:
     query_mask_qk: gl.tensor
     # context_len: gl.tensor
     context_len_q_pos_qk: gl.tensor
+    QK_scale: gl.tensor
+    out_scale: gl.tensor
     
     @gluon.constexpr_function
     def __init__(
@@ -813,6 +832,8 @@ class AttentionProgram:
         safe_tile_end,
         query_mask_qk,
         context_len_q_pos_qk,
+        QK_scale,
+        out_scale,
     ):
         self.cfg = cfg
         self.q = q
@@ -824,7 +845,8 @@ class AttentionProgram:
         self.safe_tile_end = safe_tile_end
         self.query_mask_qk = query_mask_qk
         self.context_len_q_pos_qk = context_len_q_pos_qk
-
+        self.QK_scale = QK_scale
+        self.out_scale = out_scale
     @gluon.jit
     def initialize(
         cfg,
@@ -832,6 +854,10 @@ class AttentionProgram:
         key_cache_ptr,
         value_cache_ptr,
         output_ptr,
+        q_descale_ptr,
+        k_descale_ptr,
+        v_descale_ptr,
+        out_scale_ptr,
         max_seq_prefix_len,
         q_block_local_idx,
         cur_batch_query_len,
@@ -843,6 +869,7 @@ class AttentionProgram:
         num_tiles = (max_seq_prefix_len + cfg.TILE_SIZE - 1) // cfg.TILE_SIZE
         tile_start = 0
         tile_end = num_tiles
+        
         if cfg.SLIDING_WINDOW > 0:
             qpos_lo = q_block_local_idx * cfg.BLOCK_Q
             qpos_hi = gl.minimum(
@@ -870,6 +897,20 @@ class AttentionProgram:
         safe_tile_end = gl.minimum(safe_tile_end, tile_end)
         safe_tile_end = gl.maximum(safe_tile_end, tile_start)
 
+        QK_scale = cfg.RCP_LN2 * cfg.SOFTMAX_SCALE
+
+        if q_descale_ptr is not None:
+            QK_scale = QK_scale * gl.load(q_descale_ptr)
+        if k_descale_ptr is not None:
+            QK_scale = QK_scale * gl.load(k_descale_ptr)
+        
+        if out_scale_ptr is not None:
+            out_scale = 1.0 / gl.load(out_scale_ptr)
+        else:
+            out_scale = 1.0
+        if v_descale_ptr is not None:
+            out_scale = out_scale * gl.load(v_descale_ptr)
+
         return AttentionProgram(
             cfg,
             q,
@@ -881,6 +922,8 @@ class AttentionProgram:
             safe_tile_end,
             query_mask_qk,
             context_len_q_pos_qk,
+            QK_scale,
+            out_scale,
         )
 
 
@@ -945,10 +988,9 @@ class AttentionProgram:
             layout=self.cfg.qk_layout,
         )
         if self.cfg.ARCH_NAME == "gfx1250":
-            return gl.amd.gfx1250.wmma(self.q, k, S)# * self.cfg.QK_SCALE
+            return gl.amd.gfx1250.wmma(self.q, k, S)# * self.QK_scale
         else:
-            return gl.amd.cdna4.mfma(self.q, k, S)# * self.cfg.QK_SCALE
-
+            return gl.amd.cdna4.mfma(self.q, k, S)# * self.QK_scale
     @gluon.jit
     def apply_mask_qk(self, S, j):
         seq_offset = (
@@ -970,7 +1012,7 @@ class AttentionProgram:
     # @gluon.jit
     # def softmax_part0(self, S, M):
     #     m_ij = gl.maximum(M, gl.max(S, axis=1))
-    #     m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
+    #     # m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
     #     p = gl.exp2(S - m_ij[:, None])
     #     alpha = gl.exp2(M - m_ij)
     #     return p, alpha, m_ij
@@ -979,28 +1021,31 @@ class AttentionProgram:
     def softmax_part0(self, S, M):
         m_ij = gl.maximum(M, gl.max(S, axis=1))
         m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
-        m_ij_scaled = m_ij * self.cfg.QK_SCALE
-        q_shifted = S * self.cfg.QK_SCALE - m_ij_scaled[:, None]
+        m_ij_scaled = m_ij * self.QK_scale
+        q_shifted = S * self.QK_scale - m_ij_scaled[:, None]
         p = gl.exp2(q_shifted)
-        m_diff_scaled = M * self.cfg.QK_SCALE - m_ij_scaled
+        m_diff_scaled = M * self.QK_scale - m_ij_scaled
         alpha = gl.exp2(m_diff_scaled)
         return p, alpha, m_ij
 
     @gluon.jit
-    def softmax_part1(self, p, L, acc, alpha):
+    def softmax_part1(self, p, L, acc, alpha, target_dtype=gl.bfloat16):
         l_ij = gl.sum(p, 1)
         acc = acc * alpha[:, None]
-        p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
+        if target_dtype != gl.bfloat16:
+            p = p.to(target_dtype)
+        else:
+            p = p.to(target_dtype, fp_downcast_rounding="rtz")
         L = L * alpha + l_ij
         return p, L, acc
 
     @gluon.jit
     def compute_pv(self, p, v, acc):
+        p = gl.convert_layout(p, self.cfg.p_layout)
         if self.cfg.ARCH_NAME == "gfx1250":
             return gl.amd.gfx1250.wmma(p, v, acc)
         else:
             return gl.amd.cdna4.mfma(p, v, acc)
-
     @gluon.jit
     def store_output(
         self,
@@ -1081,6 +1126,10 @@ def kernel_unified_attention_2d(
     query_stride_1,
     output_stride_0,
     output_stride_1,
+    k_descale_ptr,
+    v_descale_ptr,
+    q_descale_ptr,
+    out_scale_ptr,
     USE_SINKS: gl.constexpr,  # bool
     SLIDING_WINDOW: gl.constexpr,  # int
     num_blocks,
@@ -1108,11 +1157,17 @@ def kernel_unified_attention_2d(
     ALL_DECODE: gl.constexpr = False,
     USE_TDM: gl.constexpr = False,
     SHUFFLED_KV_CACHE: gl.constexpr = False,
+    FP8_MIN: gl.constexpr = float8_info.min,
+    FP8_MAX: gl.constexpr = float8_info.max,
 ):
     NUM_WARPS: gl.constexpr = gl.num_warps()
     # Workgroup offsets
     kv_head_idx = gl.program_id(0)
     q_block_global_idx = gl.num_programs(1) - 1 - gl.program_id(1)
+    # Q dtype determines the dot product dtype
+    # KV gets casted to Q dtype for dot product
+    Q_FP8: gl.constexpr = query_ptr.dtype.is_fp8()
+    KV_FP8: gl.constexpr = key_cache_ptr.dtype.is_fp8()
     # Build config with all layouts and derived constants
     cfg = AttentionConfig(
         ARCH_NAME,
@@ -1130,6 +1185,8 @@ def kernel_unified_attention_2d(
         USE_STORE_BUFFER_OP,
         ALL_DECODE,
         SHUFFLED_KV_CACHE,
+        Q_FP8,
+        KV_FP8,
     )
 
     # Cast strides to int64 when not using buffer ops
@@ -1208,6 +1265,10 @@ def kernel_unified_attention_2d(
         key_cache_ptr,
         value_cache_ptr,
         output_ptr,
+        q_descale_ptr,
+        k_descale_ptr,
+        v_descale_ptr,
+        out_scale_ptr,
         max_seq_prefix_len,
         q_block_local_idx,
         cur_batch_query_len,
@@ -1279,38 +1340,58 @@ def kernel_unified_attention_2d(
     kv_loader.load_k_to_shared(physical_block_idx, buffer_id=buffer_id)
     kv_loader.load_v_to_shared(physical_block_idx, buffer_id=buffer_id)
     # Main attention loop over KV tiles (staged, num_stages=2)
-    for j in range(pgm.tile_start, pgm.tile_end - 1):
+    for j in range(pgm.tile_start, pgm.safe_tile_end):
+        #with gl.amd.warp_pipeline_stage("stage0", priority=2):
         next_physical_block_idx = kv_loader.load_block_ids(j + 1)
-        k = kv_loader.load_k_from_shared(wait_count=1, buffer_id=buffer_id)
+        k = kv_loader.load_k_from_shared(wait_count=1, target_dtype=q.dtype, buffer_id=buffer_id)
         # Prefetch next tile (shared is free since k, v are in registers)
         kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
         kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
-
         # Compute attention for current tile
         S = pgm.compute_qk(k)
-        if j >= pgm.safe_tile_end or SLIDING_WINDOW > 0:
+        if SLIDING_WINDOW > 0:
             S = pgm.apply_mask_qk(S, j)
+
         p, alpha, M = pgm.softmax_part0(S, M)
-        p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
-        v = kv_loader.load_v_from_shared(wait_count=2, buffer_id=buffer_id)
-        p = gl.convert_layout(p, pgm.cfg.p_layout)
+        p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
+        #with gl.amd.warp_pipeline_stage("stage2", priority=0):
+        v = kv_loader.load_v_from_shared(wait_count=2, target_dtype=q.dtype, buffer_id=buffer_id)
         acc = pgm.compute_pv(p, v, acc)
         buffer_id = 1 - buffer_id
-        
+
+    for j in range(pgm.safe_tile_end, pgm.tile_end - 1):
+        #with gl.amd.warp_pipeline_stage("stage0", priority=2):
+        next_physical_block_idx = kv_loader.load_block_ids(j + 1)
+        k = kv_loader.load_k_from_shared(wait_count=1, target_dtype=q.dtype, buffer_id=buffer_id)
+        # Prefetch next tile (shared is free since k, v are in registers)
+        kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
+        kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
+        # Compute attention for current tile
+        S = pgm.compute_qk(k)
+        S = pgm.apply_mask_qk(S, j)
+        p, alpha, M = pgm.softmax_part0(S, M)
+        p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
+        #with gl.amd.warp_pipeline_stage("stage2", priority=0):
+        v = kv_loader.load_v_from_shared(wait_count=2, target_dtype=q.dtype, buffer_id=buffer_id)
+        acc = pgm.compute_pv(p, v, acc)
+        buffer_id = 1 - buffer_id       
 
     # Load k_i, v_i from shared into registers
-    k = kv_loader.load_k_from_shared(wait_count=1, buffer_id=buffer_id)
+    k = kv_loader.load_k_from_shared(wait_count=1, target_dtype=q.dtype, buffer_id=buffer_id)
     # Compute attention for current tile
     S = pgm.compute_qk(k)
     S = pgm.apply_mask_qk(S, pgm.tile_end - 1)
     p, alpha, M = pgm.softmax_part0(S, M)
-    p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
-    v = kv_loader.load_v_from_shared(wait_count=0, buffer_id=buffer_id)
-    p = gl.convert_layout(p, pgm.cfg.p_layout)
+    p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
+    v = kv_loader.load_v_from_shared(wait_count=0, target_dtype=q.dtype, buffer_id=buffer_id)
     acc = pgm.compute_pv(p, v, acc)
     # Normalize and store output
-    l_recip = 1 / L[:, None]
+    l_recip = pgm.out_scale / L[:, None]
     acc = acc * l_recip
+    if output_ptr.dtype.is_fp8():
+        # clamp to FP8 range
+        acc = gl.minimum(acc, FP8_MAX)
+        acc = gl.maximum(acc, FP8_MIN)
 
     pgm.store_output(
         acc,
@@ -1341,6 +1422,7 @@ def unified_attention(
     k_descale,
     v_descale,
     sinks,
+    output_scale=None,
     new_kv_layout=False,
     num_kv_blocks=1,
     use_tdm=False,
@@ -1368,6 +1450,7 @@ def unified_attention(
         q_descale: Query scale
         k_descale: Key scale
         v_descale: Value scale
+        output_scale: Output scale
         sinks: Sinks tensor [num_query_heads,]
     """
     NUM_SEQS = len(seqused_k)
@@ -1383,14 +1466,18 @@ def unified_attention(
     else:
         if new_kv_layout:
             assert use_tdm, "With new kv layout, USE_TDM must be True"
+            assert not shuffled_kv_cache, "With new kv layout, SHUFFLED_KV_CACHE must be False"
             BLOCK_SIZE = k.shape[2]
             NUM_KV_HEADS = k.shape[1]
         else:
             # key_cache: num_blocks, num_kv_heads, block_size, head_size
             # value_cache: num_blocks, num_kv_heads, block_size, head_size
             assert num_kv_blocks == 1, "With original kv layout, num_kv_blocks must be 1"
+            if not use_tdm:
+                assert not shuffled_kv_cache, "Shuffling is only supported with TDM, without TDM-Gather"
             BLOCK_SIZE = k.shape[1]
             NUM_KV_HEADS = k.shape[2]
+    
     # if use_tdm:
     #     assert ARCH_NAME == "gfx1250", "With TDM, ARCH must be gfx1250"
     BLOCK_M = 128
@@ -1407,6 +1494,8 @@ def unified_attention(
     MAX_INT32 = 2**31 - 1
     USE_LOAD_BUFFER_OP = ARCH_NAME != "gfx1250" and kv_size <= MAX_INT32
     USE_STORE_BUFFER_OP = out.nelement() * out.element_size() <= MAX_INT32
+    Q_FP8 = q.element_size() == 1
+    KV_FP8 = k.element_size() == 1
     #waves_per_eu = 2 if HEAD_SIZE < 128 else 2
     grid = (NUM_KV_HEADS, total_query_blocks)
     attn_kernel = kernel_unified_attention_2d[grid](
@@ -1422,6 +1511,10 @@ def unified_attention(
         query_stride_1=q.stride(1),
         output_stride_0=out.stride(0),
         output_stride_1=out.stride(1),
+        k_descale_ptr=k_descale,
+        v_descale_ptr=v_descale,
+        q_descale_ptr=q_descale,
+        out_scale_ptr=output_scale,
         USE_SINKS=(sinks is not None),
         SLIDING_WINDOW=SLIDING_WINDOW,
         num_blocks=num_blocks,
@@ -1451,9 +1544,10 @@ def unified_attention(
         ALL_DECODE=ALL_DECODE,
         USE_TDM=use_tdm,
         SHUFFLED_KV_CACHE=shuffled_kv_cache,
-
     )
 
+    print("unified_attention_2d_gather compiled successfully")
+    print("*"*100)
     if PRINT_IRS and getattr(unified_attention, "print", False) == False:
         setattr(unified_attention, "print", True)
         print_irs_to_files(attn_kernel, f"unified_attention_2d_gluon_num_warps_{NUM_WARPS}_block_m_{BLOCK_M}_tile_size_{TILE_SIZE}_block_size_{BLOCK_SIZE}_head_size_{HEAD_SIZE}_sfl_{shuffled_kv_cache}")
