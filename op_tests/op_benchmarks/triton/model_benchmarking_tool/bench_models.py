@@ -31,6 +31,9 @@ from op_tests.op_benchmarks.triton.bench_batched_gemm_a8w8 import (
 from op_tests.op_benchmarks.triton.bench_batched_gemm_afp4wfp4 import (
     main as bench_batched_gemm_afp4wfp4_main,
 )
+from op_tests.op_benchmarks.triton.bench_batched_gemm_a16wfp4 import (
+    main as bench_batched_gemm_a16wfp4_main,
+)
 from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w8 import (
     main as bench_moe_gemm_a8w8_main,
 )
@@ -65,6 +68,7 @@ KERNEL_DICT: dict[str, Callable[[list[str]], None]] = {
     "gemm_afp4wfp4": bench_gemm_afp4wfp4_main,
     "batched_gemm_a8w8": bench_batched_gemm_a8w8_main,
     "batched_gemm_afp4wfp4": bench_batched_gemm_afp4wfp4_main,
+    "batched_gemm_a16wfp4": bench_batched_gemm_a16wfp4_main,
     "moe_op_gemm_a8w8": bench_moe_gemm_a8w8_main,
     "moe_op_gemm_a8w8_blockscale": bench_moe_gemm_a8w8_blockscale_main,
     "moe_op_gemm_a8w4": bench_moe_gemm_a8w4_main,

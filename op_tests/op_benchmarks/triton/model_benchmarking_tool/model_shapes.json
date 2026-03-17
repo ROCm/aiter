@@ -376,6 +376,20 @@
                 "TP_dim": null
             }
         ],
+        "batched_gemm_a16wfp4": [
+            {
+                "B": 128,
+                "N": 512,
+                "K": 128,
+                "TP_dim": "B"
+            },
+            {
+                "B": 128,
+                "N": 128,
+                "K": 512,
+                "TP_dim": "B"
+            }
+        ],
         "batched_gemm_a8w8": [
             {
                 "B": 128,
