@@ -77,6 +77,11 @@ def gemm_a8wfp4(
         config, _ = _get_config(M, N, K)
 
     if M <= 128:
+        # Disable split-K when M < BLOCK_SIZE_M to work around incorrect
+        # partial sums produced by the split-K kernel on gfx950 for small M.
+        if M < config["BLOCK_SIZE_M"]:
+            config["NUM_KSPLIT"] = 1
+            config["SPLITK_BLOCK_SIZE"] = 2 * K
         if _USE_GEMM_SPLITK_BF16:
             y_pp = torch.empty(
                 (config["NUM_KSPLIT"], M, N), dtype=y.dtype, device=y.device
