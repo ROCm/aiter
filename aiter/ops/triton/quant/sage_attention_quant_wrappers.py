@@ -198,28 +198,32 @@ def perchannel_quantize_fp8(
     FP8_MAX = torch.finfo(FP8_TYPE).max
     v_q = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
 
+    if layout_k=="bhsd":
+        reduce_dims = (0,2)
+        stride_h = v.stride(1)
+        stride_t = v.stride(2)
+        num_heads = v.shape[1]
+    elif layout_k=="bshd":
+        reduce_dims = (0,1)
+        stride_h = v.stride(2)
+        stride_t = v.stride(1)
+        num_heads = v.shape[2]
+    elif layout_k=="thd":
+        reduce_dims = (0,)
+        stride_h = v.stride(1)
+        stride_t = v.stride(0)
+        num_heads = v.shape[1]
+    else: # (num_blocks, block_size, h, d)
+        reduce_dims = (0,1)
+        stride_h = v.stride(2)
+        stride_t = v.stride(1)
+        num_heads = v.shape[2]
+
     if v_descale is None:
-        if layout_k=="bhsd":
-            reduce_dims = (0,2)
-            stride_h = v.stride(1)
-            num_heads = v.shape[1]
-        elif layout_k=="bshd":
-            reduce_dims = (0,1)
-            stride_h = v.stride(2)
-            num_heads = v.shape[2]
-        elif layout_k=="thd":
-            reduce_dims = (0)
-            stride_h = v.stride(1)
-            num_heads = v.shape[1]
-        else: # (num_blocks, block_size, h, d)
-            reduce_dims = (0,1)
-            stride_h = v.stride(2)
-            num_heads = v.shape[2]    
         v_descale = v.abs().amax(dim=reduce_dims).to(torch.float32) / FP8_MAX
-        stride_sh = v_descale.stride(0)
+    stride_sh = v_descale.stride(0)
     
     num_tokens = v.shape.numel() // (d*num_heads)
-    stride_t = v.stride(-2)
     
     FP8_MIN = torch.finfo(FP8_TYPE).min
     num_pid_v = (num_tokens + BLOCK_M - 1) // BLOCK_M
