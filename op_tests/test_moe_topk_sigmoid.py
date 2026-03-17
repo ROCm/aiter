@@ -107,11 +107,14 @@ def benchmark_topk_sigmoid(
 
 
 # Pytest-parametrized test functions
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("topk", [1, 2, 4, 8])
 @pytest.mark.parametrize("num_tokens", [64, 1024, 2048])
-@pytest.mark.parametrize("num_experts", [64, 128])
+@pytest.mark.parametrize("num_experts", [64, 128, 256, 512])
 def test_topk_sigmoid_correctness(num_experts, num_tokens, topk, dtype):
+    _run_correctness_test(num_experts, num_tokens, topk, dtype)
+
+def _run_correctness_test(num_experts, num_tokens, topk, dtype):
     """Pytest test for correctness of topk_sigmoid operation."""
     torch.random.manual_seed(0)
 
