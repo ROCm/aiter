@@ -50,9 +50,6 @@ from op_tests.op_benchmarks.triton.bench_rmsnorm import main as bench_rmsnorm_ma
 from op_tests.op_benchmarks.triton.bench_rope import main as bench_rope_main
 from op_tests.op_benchmarks.triton.bench_mha import main as bench_mha_main
 from op_tests.op_benchmarks.triton.bench_mla_decode import main as bench_mla_main
-from op_tests.op_benchmarks.triton.bench_unified_attention import (
-    main as bench_unified_attention_main,
-)
 
 
 def disable_aiter_logs() -> None:
@@ -77,7 +74,6 @@ KERNEL_DICT: dict[str, Callable[[list[str]], None]] = {
     "rope": bench_rope_main,
     "mha": bench_mha_main,
     "mla": bench_mla_main,
-    "unified_attention": bench_unified_attention_main,
 }
 
 # Shape dicts from model_shapes.json (int, str values)
@@ -458,57 +454,6 @@ class MlaKernelHandler(KernelHandler):
         }
 
 
-class UnifiedAttnKernelHandler(KernelHandler):
-    """Handler for unified attention benchmarks (bench_unified_attention.py)."""
-
-    def get_tp_shapes(self, shapes: list[ShapeDict]) -> list[ShapeDict]:
-        result = []
-        for shape in shapes:
-            s = shape.copy()
-            self._shard_keys(s, ["hq", "hkv"])
-            result.append(s)
-        return result
-
-    def build_args(self) -> str:
-        shape = self._shape
-        block_size = int(shape.get("block_size", 16))
-        window_size = int(shape.get("window_size", 0))
-        return (
-            f"--bs {self._batch_size} --num_heads_q {shape['hq']} --num_heads_k {shape['hkv']} "
-            f"--head_size {shape['head_size']} --seq_q_l {self._seq_len} --seq_kv_l {self._seq_len} "
-            f"--block_size {block_size} --window_size {window_size} --dtype bf16 --metric {self._metric}"
-        )
-
-    def parse_stdout(self, stdout: str) -> float:
-        lines = [line.split() for line in stdout.strip().splitlines() if line.strip()]
-        if len(lines) < 3:
-            raise ValueError(
-                f"Unexpected unified_attention bench output: expected at least 3 lines, got {len(lines)}"
-            )
-        if lines[0] != ["bench_unified_attention:"]:
-            raise ValueError(
-                f"Unexpected unified_attention bench output: first line {lines[0]!r}"
-            )
-        data = lines[2]
-        if len(data) < 10:
-            raise ValueError(f"Unexpected unified_attention bench data line: {data!r}")
-        return float(data[9])
-
-    def build_result_row(self, bench_result: float | str) -> ResultRow:
-        shape = self._shape
-        return {
-            "Model": self._model,
-            "Kernel": self._kernel,
-            "batch_size": self._batch_size,
-            "seq_len": self._seq_len,
-            "hq": shape["hq"],
-            "hkv": shape["hkv"],
-            "dqk": shape["head_size"],
-            "dv": shape["head_size"],
-            self._metric: bench_result,
-        }
-
-
 _HANDLER_RULES: list[tuple[Callable[[str], bool], type[KernelHandler]]] = [
     (lambda k: "moe" in k, MoeKernelHandler),
     (lambda k: "gemm" in k and "moe" not in k, GemmKernelHandler),
@@ -516,7 +461,6 @@ _HANDLER_RULES: list[tuple[Callable[[str], bool], type[KernelHandler]]] = [
     (lambda k: k == "rope", RopeKernelHandler),
     (lambda k: k == "mha", MhaKernelHandler),
     (lambda k: k == "mla", MlaKernelHandler),
-    (lambda k: k == "unified_attention", UnifiedAttnKernelHandler),
 ]
 
 

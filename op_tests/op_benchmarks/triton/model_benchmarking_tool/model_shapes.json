@@ -66,13 +66,6 @@
                 "dqk": 128,
                 "dv": 128
             }
-        ],
-        "unified_attention": [
-            {
-                "hq": 128,
-                "hkv": 8,
-                "head_size": 128
-            }
         ]
     },
     "Llama3 70B": {
@@ -141,13 +134,6 @@
                 "hkv": 8,
                 "dqk": 128,
                 "dv": 128
-            }
-        ],
-        "unified_attention": [
-            {
-                "hq": 64,
-                "hkv": 8,
-                "head_size": 128
             }
         ]
     },
@@ -218,13 +204,6 @@
                 "dqk": 128,
                 "dv": 128
             }
-        ],
-        "unified_attention": [
-            {
-                "hq": 32,
-                "hkv": 8,
-                "head_size": 128
-            }
         ]
     },
     "GPT-OSS 120B": {
@@ -274,13 +253,6 @@
                 "hkv": 8,
                 "dqk": 64,
                 "dv": 64
-            }
-        ],
-        "unified_attention": [
-            {
-                "hq": 64,
-                "hkv": 8,
-                "head_size": 64
             }
         ]
     },
@@ -560,13 +532,6 @@
                 "dqk": 88,
                 "dv": 88
             }
-        ],
-        "unified_attention": [
-            {
-                "hq": 40,
-                "hkv": 8,
-                "head_size": 128
-            }
         ]
     },
     "Qwen3-235B-A22B": {
@@ -621,13 +586,6 @@
                 "hkv": 4,
                 "dqk": 128,
                 "dv": 128
-            }
-        ],
-        "unified_attention": [
-            {
-                "hq": 64,
-                "hkv": 4,
-                "head_size": 128
             }
         ]
     }
