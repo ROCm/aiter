@@ -101,7 +101,9 @@ def perblock_quantize_kernel(
     Q_descale,
     max_seqlen,
     query_start_len_ptr,
-    stride_m,
+    stride_b: tl.int64,
+    stride_m: tl.int64,
+    stride_h: tl.int64,
     scale_stride_0,
     scale_stride_1,
     BLOCK_M: tl.constexpr,
@@ -118,8 +120,10 @@ def perblock_quantize_kernel(
         cur_batch_in_all_start_index = tl.load(query_start_len_ptr + pid_b)
         cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + pid_b + 1)
         seqlen = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
+        batch_offset = cur_batch_in_all_start_index.to(tl.int64) * stride_m
     else:
         seqlen = max_seqlen
+        batch_offset = pid_b.to(tl.int64) * stride_b
 
     if pid_m * BLOCK_M >= seqlen:
         return
@@ -130,7 +134,8 @@ def perblock_quantize_kernel(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
     offs_d = tl.arange(0, D)[None,:]
     mask = offs_m < seqlen
-    tile_offsets = offs_m * stride_m + offs_d
+    head_offset = pid_h.to(tl.int64) * stride_h
+    tile_offsets = batch_offset + offs_m * stride_m + head_offset + offs_d
     tile_ptrs = query_ptr + tile_offsets
     Q = tl.load(
         tile_ptrs,
@@ -252,6 +257,8 @@ def perchannel_quantize_v_kernel(
     num_tokens,
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    CLAMP_DTYPE_MIN: tl.constexpr = -240.0,
+    CLAMP_DTYPE_MAX: tl.constexpr = 240.0,
 ):
     pid = tl.program_id(0).to(tl.int64)
     pid_h = tl.program_id(1).to(tl.int64)
@@ -274,6 +281,8 @@ def perchannel_quantize_v_kernel(
     v = tl.load(v_input_ptrs, mask=mask, other=0.0)
     v_descales = tl.load(v_descale_ptrs)
     v_quant = v / v_descales
+    # clamp dtype min/max to avoid NaN after casting
+    v_quant = tl.clamp(v_quant, CLAMP_DTYPE_MIN, CLAMP_DTYPE_MAX)
     v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
     tl.store(v_output_ptrs, v_quant, mask=mask)
 

@@ -43,7 +43,7 @@ def unified_perblock_quantize_int8(
     assert num_queries_per_kv is not None # and config is not None
     num_heads = hq // num_queries_per_kv
     Q_descale = torch.empty(
-        (total_num_blocks, num_heads), dtype=torch.uint8, device=q.device
+        (total_num_blocks, num_heads), dtype=torch.float32, device=q.device
     )
     BLOCK_Q = BLOCK_SIZE_M // num_queries_per_kv
     perblock_quantize_q_kernel[(
@@ -84,24 +84,34 @@ def perblock_quantize_int8(
 ):  
     d = q.shape[-1]
     if layout=="thd":
-        b = len(cu_seqlens)
+        b = len(cu_seqlens) - 1 # skip the last element since it's len(seqlens)
         h = q.shape[1]
         s = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item() 
-        total_num_blocks = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * b * h
+        stride_b = 0
         stride_m = h * d
+        stride_h = d
+        kernel_cu_seqlens = cu_seqlens
     elif layout=="bhsd":
         b,h,s,_ = q.shape
-        total_num_blocks = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * b * h
-        stride_m = d
+        stride_b = q.stride(0)
+        stride_m = q.stride(2)
+        stride_h = q.stride(1)
+        kernel_cu_seqlens = None
     elif layout=="bshd":
         b,s,h,d = q.shape
-        total_num_blocks = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * b * h
-        stride_m = h * d
+        stride_b = q.stride(0)
+        stride_m = q.stride(1)
+        stride_h = q.stride(2)
+        kernel_cu_seqlens = None
     else: # num_blocks,block_size,h,d = q.shape
-        # cached layout can be thought of as
         b,s,h,d = q.shape
-        total_num_blocks = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * b * h
-        stride_m = h * d
+        stride_b = q.stride(0)
+        stride_m = q.stride(1)
+        stride_h = q.stride(2)
+        kernel_cu_seqlens = None
+
+    num_pid_m = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+    total_num_blocks = num_pid_m * b
 
     Q_q = torch.empty((*q.shape[:-1], d), dtype=torch.int8, device=q.device)
     DTYPE_MAX = torch.iinfo(torch.int8).max
@@ -111,13 +121,16 @@ def perblock_quantize_int8(
     # thd: cu_seqlens = cu_seqlens
     # cache: cu_seqlens = block_size, 2 block_size, 3 block_size,...
     Q_descale = torch.empty(
-        (total_num_blocks, h), dtype=torch.uint8, device=q.device
+        (total_num_blocks, h), dtype=torch.float32, device=q.device
     )
     num_pid_m = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
     grid = (b, num_pid_m, h)
 
     perblock_quantize_kernel[grid](
-        q, Q_q, Q_descale, s, cu_seqlens, stride_m, Q_descale.stride(0), Q_descale.stride(1), BLOCK_SIZE_M, d, sm_scale, DTYPE_MAX)
+        q, Q_q, Q_descale, s, kernel_cu_seqlens,
+        stride_b, stride_m, stride_h,
+        Q_descale.stride(0), Q_descale.stride(1),
+        BLOCK_SIZE_M, d, sm_scale, DTYPE_MAX)
     
     return Q_q, Q_descale
 
@@ -208,6 +221,7 @@ def perchannel_quantize_fp8(
     num_tokens = v.shape.numel() // (d*num_heads)
     stride_t = v.stride(-2)
     
+    FP8_MIN = torch.finfo(FP8_TYPE).min
     num_pid_v = (num_tokens + BLOCK_M - 1) // BLOCK_M
     grid_v = (num_pid_v, num_heads)
     perchannel_quantize_v_kernel[grid_v](
@@ -220,6 +234,8 @@ def perchannel_quantize_fp8(
         num_tokens,
         D=d,
         BLOCK_M=BLOCK_M,
+        CLAMP_DTYPE_MIN=FP8_MIN,
+        CLAMP_DTYPE_MAX=FP8_MAX,
         num_stages=3,
         num_warps=8,
     )

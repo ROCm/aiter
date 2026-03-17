@@ -163,8 +163,8 @@ def get_sage_scale_strides(
     if sage_version == SAGE_VERSION.SAGE:
         tiles_per_block = triton.cdiv(BLOCK_SIZE, TILE_SIZE)
         k_descale_2d = k_descale[:num_blks * tiles_per_block, :]
-        stride_k_cache_scale_1 = k_descale_2d.stride(0)
-        stride_k_cache_scale_0 = tiles_per_block * stride_k_cache_scale_1
+        stride_k_cache_scale_0 = tiles_per_block * k_descale_2d.stride(0)
+        stride_k_cache_scale_1 = 0
         stride_k_cache_scale_2 = k_descale_2d.stride(1)
         stride_k_cache_scale_3 = 0
 
@@ -321,7 +321,6 @@ def unified_attention(
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
-    # 3D kernel does not support sage attention yet; force 2D path when sage is active.
     if use_2d_kernel(
         head_size,
         SLIDING_WINDOW,
