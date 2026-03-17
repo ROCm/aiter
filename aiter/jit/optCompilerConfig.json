@@ -992,15 +992,12 @@
             "f'{AITER_CSRC_DIR}/pybind/mha_bwd_asm_pybind.cu'"
         ],
         "flags_extra_cc": [
-            "'-DONLY_FAV3=1'"
+            "'-DONLY_FAV3=1'",
+            "'-DDISABLE_CK=1'"
         ],
-        "flags_extra_hip": [
-            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'"
-        ],
+        "flags_extra_hip": [],
         "extra_ldflags": "None",
-        "extra_include": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha'"
-        ],
+        "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": [
             "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}'"
@@ -1014,15 +1011,12 @@
             "f'{AITER_CSRC_DIR}/pybind/mha_varlen_bwd_asm_pybind.cu'"
         ],
         "flags_extra_cc": [
-            "'-DONLY_FAV3=1'"
+            "'-DONLY_FAV3=1'",
+            "'-DDISABLE_CK=1'"
         ],
-        "flags_extra_hip": [
-            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'"
-        ],
+        "flags_extra_hip": [],
         "extra_ldflags": "None",
-        "extra_include": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha'"
-        ],
+        "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": [
             "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}'"
