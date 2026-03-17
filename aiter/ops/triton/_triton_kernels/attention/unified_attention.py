@@ -141,15 +141,13 @@ def v_scale_process(
         head_mask,
         stride_v_cache_scale_0: tl.int64,
         stride_v_cache_scale_1: tl.int64,
-        PV_QUANT_SCHEME: tl.constexpr = None
     ):
-    if PV_QUANT_SCHEME == 1:  # DESCALE_EPILOGUE
-        v_descale_ptr = (
-            V_Descale
-            + kv_head_idx * stride_v_cache_scale_0
-            + offs_d_scale[None, :] * stride_v_cache_scale_1
-        )
-        return tl.load(v_descale_ptr, mask=head_mask[None, :], other=0.0)
+    v_descale_ptr = (
+        V_Descale
+        + kv_head_idx * stride_v_cache_scale_0
+        + offs_d_scale[None, :] * stride_v_cache_scale_1
+    )
+    return tl.load(v_descale_ptr, mask=head_mask[None, :], other=0.0)
 
 
 @triton.jit
@@ -212,7 +210,6 @@ def kernel_unified_attention_2d(
     FP8_MAX: tl.constexpr = float8_info.max,
     ALL_DECODE: tl.constexpr = False,  # bool
     QK_QUANT_SCHEME: tl.constexpr = None,
-    PV_QUANT_SCHEME: tl.constexpr = None,
 ):
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
@@ -222,9 +219,6 @@ def kernel_unified_attention_2d(
         qk_scale = scale * RCP_LN2 * tl.load(q_scale) * tl.load(k_scale)
     else:
         qk_scale = scale * RCP_LN2
-
-    if PV_QUANT_SCHEME == 2:  # DESCALE_LOOP: load scalar v_descale once
-        _v_ds = tl.load(v_scale)
 
     seq_idx = find_seq_idx(
         query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
@@ -517,16 +511,13 @@ def kernel_unified_attention_2d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        if PV_QUANT_SCHEME == 2:  # DESCALE_LOOP
-            acc += tl.dot(P.to(V.dtype), V) * _v_ds
-        else:
-            acc += tl.dot(P.to(V.dtype), V)
+        acc += tl.dot(P.to(V.dtype), V)
 
     # epilogue
     one_over_L = 1.0 / L[:, None]
     acc = acc * one_over_L
 
-    if PV_QUANT_SCHEME == 1:  # DESCALE_EPILOGUE
+    if QK_QUANT_SCHEME != None and QK_QUANT_SCHEME != 1:  # V descale for all quantized modes except FP8_NO_DESCALE
         v_scale_loaded = v_scale_process(
             v_scale,
             kv_head_idx,
@@ -534,7 +525,6 @@ def kernel_unified_attention_2d(
             dim_mask,
             stride_v_cache_scale_0,
             stride_v_cache_scale_1,
-            PV_QUANT_SCHEME
         )
         acc *= v_scale_loaded
     if USE_FP8:
@@ -612,7 +602,6 @@ def kernel_unified_attention_3d(
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     ALL_DECODE: tl.constexpr = False,  # bool
     QK_QUANT_SCHEME: tl.constexpr = None,
-    PV_QUANT_SCHEME: tl.constexpr = None,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -623,9 +612,6 @@ def kernel_unified_attention_3d(
         qk_scale = scale * RCP_LN2 * tl.load(q_scale) * tl.load(k_scale)
     else:
         qk_scale = scale * RCP_LN2
-
-    if PV_QUANT_SCHEME == 2:  # DESCALE_LOOP
-        _v_ds = tl.load(v_scale)
 
     seq_idx = find_seq_idx(
         query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
@@ -903,12 +889,9 @@ def kernel_unified_attention_3d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        if PV_QUANT_SCHEME == 2:  # DESCALE_LOOP
-            acc += tl.dot(P.to(V.dtype), V) * _v_ds
-        else:
-            acc += tl.dot(P.to(V.dtype), V)
+        acc += tl.dot(P.to(V.dtype), V)
 
-    if PV_QUANT_SCHEME == 1:  # DESCALE_EPILOGUE
+    if QK_QUANT_SCHEME != None and QK_QUANT_SCHEME != 1:  # V descale for all quantized modes except FP8_NO_DESCALE
         v_scale_loaded = v_scale_process(
             v_scale,
             kv_head_idx,
@@ -916,7 +899,6 @@ def kernel_unified_attention_3d(
             dim_mask,
             stride_v_cache_scale_0,
             stride_v_cache_scale_1,
-            PV_QUANT_SCHEME
         )
         acc *= v_scale_loaded
 

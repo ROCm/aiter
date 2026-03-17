@@ -7,7 +7,7 @@ import itertools
 import torch
 import triton
 
-from aiter.ops.triton.attention.unified_attention import unified_attention, QK_QUANT_SCHEME, get_pv_quant_scheme
+from aiter.ops.triton.attention.unified_attention import unified_attention, QK_QUANT_SCHEME
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
@@ -346,8 +346,6 @@ def run_benchmark(custom, args):
             qk_quant_scheme = QK_QUANT_SCHEME.BF16Q_FP8K
         else:
             qk_quant_scheme = None
-        pv_quant_scheme = get_pv_quant_scheme(qk_quant_scheme) if qk_quant_scheme is not None else None
-
         def fn():
             return unified_attention(
                 q=maybe_quantized_query,
@@ -368,7 +366,6 @@ def run_benchmark(custom, args):
                 v_descale=v_descale,
                 sinks=sinks,
                 qk_quant_scheme=qk_quant_scheme,
-                pv_quant_scheme=pv_quant_scheme,
             )
 
         ms = triton.testing.do_bench(fn)

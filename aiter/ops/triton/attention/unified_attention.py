@@ -159,18 +159,6 @@ class QK_QUANT_SCHEME(IntEnum):
     SAGE_V1 = 4
     SAGE_V2 = 5
 
-class PV_QUANT_SCHEME(IntEnum):
-    DESCALE_EPILOGUE = 1
-    DESCALE_LOOP = 2
-
-
-def get_pv_quant_scheme(qk_quant_scheme):
-    if qk_quant_scheme in (QK_QUANT_SCHEME.SAGE_V1, QK_QUANT_SCHEME.SAGE_V2, QK_QUANT_SCHEME.BF16Q_FP8K):
-        return PV_QUANT_SCHEME.DESCALE_EPILOGUE
-    elif qk_quant_scheme == QK_QUANT_SCHEME.FP8_DESCALE:
-        return PV_QUANT_SCHEME.DESCALE_LOOP
-    return None
-
 def get_scale_strides(
         q_descale,
         k_descale,
@@ -199,8 +187,10 @@ def get_scale_strides(
     else:
         raise ValueError(f"Invalid qk_quant_scheme: {qk_quant_scheme}")
 
-    stride_v_cache_scale_0 = v_descale.stride(0) if v_descale is not None and v_descale.ndim >= 1 else 0
-    stride_v_cache_scale_1 = v_descale.stride(1) if v_descale is not None and v_descale.ndim >= 2 else 0
+    if qk_quant_scheme in (QK_QUANT_SCHEME.SAGE_V1, QK_QUANT_SCHEME.SAGE_V2):
+        stride_v_cache_scale_0, stride_v_cache_scale_1 = v_descale.stride()
+    else:
+        stride_v_cache_scale_0, stride_v_cache_scale_1 = 0, 0
 
     return (
         query_scale_stride_0,
@@ -316,12 +306,8 @@ def unified_attention(
     qq_bias=None,
     sinks=None,
     qk_quant_scheme: QK_QUANT_SCHEME = None,
-    pv_quant_scheme: PV_QUANT_SCHEME = None,
 ):
     assert causal, "Only causal attention is supported"
-
-    if pv_quant_scheme is None and qk_quant_scheme is not None:
-        pv_quant_scheme = get_pv_quant_scheme(qk_quant_scheme)
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -472,7 +458,6 @@ def unified_attention(
             USE_FP8=output_scale is not None,
             ALL_DECODE=ALL_DECODE,
             QK_QUANT_SCHEME=qk_quant_scheme,
-            PV_QUANT_SCHEME=pv_quant_scheme,
             **config,
         )
 
@@ -586,7 +571,6 @@ def unified_attention(
             BLOCK_M=BLOCK_M,
             ALL_DECODE=ALL_DECODE,
             QK_QUANT_SCHEME=qk_quant_scheme,
-            PV_QUANT_SCHEME=pv_quant_scheme,
             **attn_config,
         )
         reduce_segments[(q.shape[0], num_query_heads)](

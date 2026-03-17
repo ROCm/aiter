@@ -6,7 +6,7 @@ from typing import Optional
 import pytest
 import torch
 
-from aiter.ops.triton.attention.unified_attention import QK_QUANT_SCHEME, unified_attention, get_config, get_pv_quant_scheme
+from aiter.ops.triton.attention.unified_attention import QK_QUANT_SCHEME, unified_attention, get_config
 from aiter.ops.triton.utils.types import e4m3_dtype
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 
@@ -244,8 +244,6 @@ def test_triton_unified_attn(
         q_descale, k_descale, v_descale = None, None, None
         qk_quant_scheme = None
 
-    pv_quant_scheme = get_pv_quant_scheme(qk_quant_scheme) if qk_quant_scheme is not None else None
-
     unified_attention(
         q=maybe_quantized_query,
         k=maybe_quantized_key_cache,
@@ -265,7 +263,6 @@ def test_triton_unified_attn(
         v_descale=v_descale,
         sinks=sinks,
         qk_quant_scheme=qk_quant_scheme,
-        pv_quant_scheme=pv_quant_scheme,
     )
 
     ref_output = ref_paged_attn(
