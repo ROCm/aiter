@@ -37,7 +37,7 @@ KERNEL_MAP = {
     "a16w16_atomic": {
         "bench": None,
         "ut": "ut_a16w16_gemm_atomic.py",
-        "pattern": ["_gemm_a16_w16_kernel"],
+        "pattern": ["_gemm_a16_w16_atomic"],
     },
     "a16w16_gated": {
         "bench": "bench_gemm_a16w16.py",
