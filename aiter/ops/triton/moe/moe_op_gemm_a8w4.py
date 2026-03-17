@@ -6,13 +6,14 @@ import torch
 import triton
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w4 import (
-    _moe_gemm_a8w4,
+    _moe_gemm_a8w4 as _moe_gemm_a8w4_triton,
     _reduce_grouped,
 )
-
-# -----------------------------------------------------------------------------
-#                    Matrix Multiplication + Outer Gather/Scatter
-# -----------------------------------------------------------------------------
+from aiter.ops.triton._gluon_kernels.moe.moe_op_gemm_a8w4 import (
+    _moe_gemm_a8w4 as _moe_gemm_a8w4_gluon,
+)
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.device_info import get_num_sms
 
 
 def can_overflow_int32(tensor: torch.Tensor):
@@ -28,8 +29,8 @@ def should_upcast_indices(*args):
 
 
 def allocate_output(
-    x,
-    w,
+    M,
+    N,
     out_dtype,
     reduction_n_matmul,
     reduction_n_reduction,
@@ -38,15 +39,8 @@ def allocate_output(
     scatter_indx,
     block_m,
     split_k,
+    device,
 ):
-    # ---- output ------
-    N = w.shape[-1]
-    # by default - M is number of rows in the activations
-    M = x.shape[-2]
-    # if the activations are gathered, then M is number of gather indices
-    if gather_indx is not None:
-        M = gather_indx.shape[0]
-    # final output
     if routing_data.n_expts_act == 1 or scatter_indx is None:
         y_rows = M
     else:
@@ -55,15 +49,15 @@ def allocate_output(
         )  # compressed number of rows
     matmul_shape = (split_k, M, N // reduction_n_matmul)
     final_shape = (y_rows, N // reduction_n_matmul // reduction_n_reduction)
-    matmul_output = torch.empty(matmul_shape, device=x.device, dtype=out_dtype)
+    matmul_output = torch.empty(matmul_shape, device=device, dtype=out_dtype)
     if scatter_indx is not None or split_k > 1:
-        final_output = torch.empty(final_shape, device=x.device, dtype=out_dtype)
+        final_output = torch.empty(final_shape, device=device, dtype=out_dtype)
     else:
         final_output = None
     return matmul_output, final_output
 
 
-def get_kernel_config(m, n, k, routing_data):
+def get_kernel_config_triton(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
     num_xcds = 8
@@ -80,7 +74,7 @@ def get_kernel_config(m, n, k, routing_data):
         grid_m = routing_data.n_blocks(m, block_m)
         grid_n = triton.cdiv(n, block_n)
         grid = grid_m * grid_n * split_k
-        while block_n >= 64 and grid < 256:
+        while block_n >= 64 and grid < get_num_sms():
             block_n = block_n // 2
             grid_m = routing_data.n_blocks(m, block_m)
             grid_n = triton.cdiv(n, block_n)
@@ -118,7 +112,57 @@ def get_kernel_config(m, n, k, routing_data):
     return ret
 
 
-def swizzle_scales(data):
+def get_kernel_config_gluon(m, n, k, routing_data):
+    block_m = routing_data.block_m
+    num_xcds = 1
+    w_cache_modifier = ".cg" if block_m <= 32 else None
+    num_stages = 2
+    split_k = 1
+    block_k = 256
+
+    if block_m == 16:
+        block_n = 128
+        num_warps = 4
+
+        grid_m = routing_data.n_blocks(m, block_m)
+        grid_n = triton.cdiv(n, block_n)
+        grid = grid_m * grid_n * split_k
+        while block_n >= 64 and grid < get_num_sms():
+            block_n = block_n // 2
+            grid_m = routing_data.n_blocks(m, block_m)
+            grid_n = triton.cdiv(n, block_n)
+            grid = grid_m * grid_n * split_k
+
+    elif block_m == 32:
+        if n <= 1024:
+            block_n = 128
+            num_warps = 4
+        elif n <= 4096:
+            block_n = 256
+            num_warps = 4
+        else:
+            block_n = 512
+            num_warps = 4
+
+    else:
+        block_n = 512
+        num_warps = 4
+
+    ret = {
+        "block_m": block_m,
+        "block_n": block_n,
+        "block_k": block_k,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+        "xcd_swizzle": num_xcds,
+        "split_k": split_k,
+        "w_cache_modifier": w_cache_modifier,
+        "waves_per_eu": 0,
+    }
+    return ret
+
+
+def swizzle_scales_gfx950(data):
     NON_K_PRESHUFFLE_BLOCK_SIZE = 32
     block_shape = data.shape
     SCALE_K = block_shape[-2]
@@ -129,6 +173,24 @@ def swizzle_scales(data):
     E = block_shape[0]
     data = data.reshape(E, N // 32, SCALE_K * 32)
     return data.transpose(-1, -2)
+
+
+def swizzle_scales_gfx1250(data):
+    E, K_SCALE, N = data.shape
+    preshuffle_factor = 128
+    num_chunk_n = N // preshuffle_factor
+    SCALE_KWIDTH = 4 if K_SCALE >= 4 else K_SCALE
+    num_chunk_k = K_SCALE // SCALE_KWIDTH
+
+    data = data.transpose(-1, -2)
+    data = data.view(
+        E, num_chunk_n, 4, preshuffle_factor // 4, num_chunk_k, SCALE_KWIDTH
+    )
+    data = data.permute(0, 1, 4, 3, 2, 5).contiguous()
+    data = data.view(E, N // preshuffle_factor, K_SCALE * preshuffle_factor)
+    data = data.transpose(-1, -2)
+
+    return data
 
 
 def reduce_grouped(
@@ -235,6 +297,7 @@ def moe_gemm_a8w4(
     for e in num_experts:
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
     """
+    use_gluon = get_arch() == "gfx1250"
     assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
     x_has_mx = x_scales is not None
     if x_has_mx:
@@ -246,15 +309,22 @@ def moe_gemm_a8w4(
         stride_x_mx_m = 0
         stride_x_mx_k = 0
     # determine shapes
-    M = x.shape[-2] if gather_indx is None else gather_indx.shape[0]
+    num_tokens = x.shape[-2]
+    M = num_tokens if gather_indx is None else gather_indx.shape[0]
     K, N = x.shape[-1], w.shape[-1]
     block_m = routing_data.block_m
     if unpadded_N and block_m == 16:
         N = unpadded_N
     if unpadded_K and block_m == 16:
         K = unpadded_K
+    if use_gluon:
+        w = w.transpose(1, 2)
+        w_scales = w_scales.transpose(1, 2)
     # compute optimization flags
-    config = get_kernel_config(M, N, K, routing_data)
+    if use_gluon:
+        config = get_kernel_config_gluon(M, N, K, routing_data)
+    else:
+        config = get_kernel_config_triton(M, N, K, routing_data)
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
         reduction_n_matmul = 1
@@ -272,8 +342,8 @@ def moe_gemm_a8w4(
         reduction_n_reduction = 1
     # allocate output memory
     y, y_final = allocate_output(
-        x,
-        w,
+        M,
+        N,
         out_dtype,
         reduction_n_matmul,
         reduction_n_reduction,
@@ -282,6 +352,7 @@ def moe_gemm_a8w4(
         scatter_indx,
         config["block_m"],
         config["split_k"],
+        x.device,
     )
     stride_bias = None if bias is None else bias.stride(0)
     # moe metadata
@@ -290,66 +361,121 @@ def moe_gemm_a8w4(
     expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[-1]
     expt_token_offs_raw = None if expt_data is None else expt_data.token_offs_raw
     expt_block_pid_map = None if expt_data is None else expt_data.block_pid_map
-    # spmd grid
+    # pid grid
     grid_m = routing_data.n_blocks(M, config["block_m"])
     grid_n = triton.cdiv(N, config["block_n"])
     grid = grid_m * grid_n * config["split_k"]
     # launch kernel
-    _moe_gemm_a8w4[(grid,)](
-        y,
-        y.stride(0),
-        y.stride(1),
-        y.stride(2),
-        x,
-        x.stride(0),
-        x.stride(1),
-        x_scales,
-        stride_x_mx_m,
-        stride_x_mx_k,
-        w,
-        w.stride(0),
-        w.stride(1),
-        w.stride(2),
-        w_scales,
-        w_scales.stride(0),
-        w_scales.stride(1),
-        w_scales.stride(2),
-        x_static_scale,
-        quant_static_scale,
-        bias,
-        stride_bias,
-        gammas,
-        N,
-        K,
-        gather_indx,
-        expt_hist,
-        expt_token_offs_raw,
-        expt_hist_sum,
-        expt_block_pid_map,
-        grid_m,
-        grid_n,
-        apply_swiglu_matmul,
-        alpha,
-        limit,
-        reduction_n_matmul,
-        routing_data.n_expts_act,
-        config["block_m"],
-        config["block_n"],
-        config["block_k"],
-        config["group_m"],
-        XCD_SWIZZLE=config["xcd_swizzle"],
-        SWIZZLE_MX_SCALE=swizzle_mx_scale,
-        SPLIT_K=config["split_k"],
-        EVEN_K=K % config["block_k"] == 0,
-        MASK_K_LIMIT=K % config["block_k"],
-        W_CACHE_MODIFIER=config["w_cache_modifier"],
-        num_warps=config["num_warps"],
-        num_stages=config["num_stages"],
-        UPCAST_INDICES=should_upcast_indices(x, w, y),
-        waves_per_eu=config["waves_per_eu"],
-        matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
-        kpack=config["kpack"],
-    )
+    if use_gluon:
+        _moe_gemm_a8w4_gluon[(grid,)](
+            y,
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            x,
+            x.stride(0),
+            x.stride(1),
+            x_scales,
+            stride_x_mx_m,
+            stride_x_mx_k,
+            w,
+            w.stride(0),
+            w.stride(1),
+            w.stride(2),
+            w_scales,
+            w_scales.stride(0),
+            w_scales.stride(1),
+            w_scales.stride(2),
+            x_static_scale,
+            quant_static_scale,
+            bias,
+            stride_bias,
+            gammas,
+            num_tokens,
+            N,
+            K,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_hist_sum,
+            expt_block_pid_map,
+            grid_m,
+            grid_n,
+            apply_swiglu_matmul,
+            alpha,
+            limit,
+            reduction_n_matmul,
+            routing_data.n_expts_act,
+            config["block_m"],
+            config["block_n"],
+            config["block_k"],
+            XCD_SWIZZLE=config["xcd_swizzle"],
+            NUM_BUFFERS=config["num_stages"],
+            SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            EVEN_K=K % config["block_k"] == 0,
+            MASK_K_LIMIT=K % config["block_k"],
+            W_CACHE_MODIFIER=config["w_cache_modifier"],
+            num_warps=config["num_warps"],
+            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            waves_per_eu=config["waves_per_eu"],
+        )
+    else:
+        _moe_gemm_a8w4_triton[(grid,)](
+            y,
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            x,
+            x.stride(0),
+            x.stride(1),
+            x_scales,
+            stride_x_mx_m,
+            stride_x_mx_k,
+            w,
+            w.stride(0),
+            w.stride(1),
+            w.stride(2),
+            w_scales,
+            w_scales.stride(0),
+            w_scales.stride(1),
+            w_scales.stride(2),
+            x_static_scale,
+            quant_static_scale,
+            bias,
+            stride_bias,
+            gammas,
+            N,
+            K,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_hist_sum,
+            expt_block_pid_map,
+            grid_m,
+            grid_n,
+            apply_swiglu_matmul,
+            alpha,
+            limit,
+            reduction_n_matmul,
+            routing_data.n_expts_act,
+            config["block_m"],
+            config["block_n"],
+            config["block_k"],
+            config["group_m"],
+            XCD_SWIZZLE=config["xcd_swizzle"],
+            SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            SPLIT_K=config["split_k"],
+            EVEN_K=K % config["block_k"] == 0,
+            MASK_K_LIMIT=K % config["block_k"],
+            W_CACHE_MODIFIER=config["w_cache_modifier"],
+            num_warps=config["num_warps"],
+            num_stages=config["num_stages"],
+            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            waves_per_eu=config["waves_per_eu"],
+            matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
+            kpack=config["kpack"],
+        )
+
     # Build grouped reduction inputs in a uniform way
     group_indx = (
         None
