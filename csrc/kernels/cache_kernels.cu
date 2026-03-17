@@ -2191,317 +2191,379 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
           }
       }
     }
-    template <typename scalar_t, typename cache_t, typename query_t, vllm::Fp8KVCacheDataType kv_dt, vllm::Fp8KVCacheDataType q_dt, bool is_neox, bool is_nope_first>
-    __device__ void fuse_qk_norm_rope_concat_and_cache_mla_kernel_prefill_opt(
-        const scalar_t* __restrict__ q_nope,  // [num_tokens, num_heads, kv_lora_rank]
-        const scalar_t* __restrict__ q_pe,    // [num_tokens, num_heads, pe_dim]
-        const scalar_t* __restrict__ kv_c,    // [num_tokens, num_kv_heads, kv_lora_rank]
-        scalar_t* __restrict__ k_pe,    // [num_tokens, num_kv_heads, pe_dim]
-        const scalar_t* __restrict__ k_weight, // RMSNorm weights for key [kv_lora_rank]
-        // const scalar_t* __restrict__ q_weight, // [num_heads, kv_lora_rank]
-        cache_t* __restrict__ kv_cache,       // [num_blocks, block_size, num_kv_heads, (kv_lora_rank + scale_dim)]
-        query_t* __restrict__ q_out,          // [num_tokens, num_heads, kv_lora_rank + pe_dim]
-        const int64_t* __restrict__ slot_mapping,  // [num_tokens]
-        const int64_t* __restrict__ positions,     // [num_tokens]
-        const scalar_t *__restrict__ cos_cache,        // [max_position, rot_dim //2]
-        const scalar_t *__restrict__ sin_cache,        // [max_position, rot_dim //2]
-        double eps,
-        const int block_stride, const int entry_stride, const int kv_cache_stride_h,
-        const int q_nope_stride_0, const int q_nope_stride_1, 
-        const int q_pe_stride_0,const int q_pe_stride_1,
-        const int q_out_stride_0, const int q_out_stride_1, 
-        const int num_heads, const int num_kv_heads,
-        const int kv_c_stride_0, const int kv_c_stride_1, 
-        const int k_pe_stride_0, const int k_pe_stride_1,
-        const int kv_lora_rank, const int pe_dim,
-        const int block_size, const int group_size,
-       const float* q_scale // kscale: [num_blocks, block_size, head_size // GROUP_SIZE]
-    ) {
-      const int64_t token_idx = blockIdx.x;
-      const int64_t slot_idx = slot_mapping[token_idx];
-      // NOTE: slot_idx can be -1 if the token is padded
-      if (slot_idx < 0) {
-        return;
-      }
-      //concat
-      const int64_t block_idx = slot_idx / block_size;
-      const int64_t block_offset = slot_idx % block_size;
+    // Packed stride/size params to reduce SGPR usage
+    // Removed: num_heads (→gridDim.y), num_kv_heads (→gridDim.z), pe_dim (constexpr 64), group_size (constexpr 64)
+    // kv_lora_rank is template param (KV_LORA_DIM), block_size stored as log2 for bitwise ops
+    struct MlaKernelParams {
+        int block_stride, entry_stride, kv_cache_stride_h;
+        int q_nope_stride_0, q_nope_stride_1;
+        int q_pe_stride_0, q_pe_stride_1;
+        int q_out_stride_0, q_out_stride_1;
+        int kv_c_stride_0, kv_c_stride_1;
+        int k_pe_stride_0, k_pe_stride_1;
+        int block_size_log2;  // log2(block_size), block_size must be power of 2
+    };
 
-      const int64_t kv_cache_offset = block_idx * block_stride + block_offset * entry_stride;
-      static constexpr int32_t vec_size_i = std::is_same_v<scalar_t, float> ? 4 : 8;
-      static constexpr int32_t vec_size_o = vec_size_i;
+    template <typename scalar_t, typename cache_t, typename query_t, vllm::Fp8KVCacheDataType kv_dt, vllm::Fp8KVCacheDataType q_dt, bool is_neox, bool is_nope_first, bool do_q_norm = false, int KV_LORA_DIM = 512>
+    __device__ void fuse_qk_norm_rope_concat_and_cache_mla_kernel_prefill_opt(
+        const scalar_t* __restrict__ q_nope,
+        scalar_t* __restrict__ q_pe,
+        const scalar_t* __restrict__ kv_c,
+        scalar_t* __restrict__ k_pe,
+        const scalar_t* __restrict__ k_weight,
+        const scalar_t* __restrict__ q_weight,
+        cache_t* __restrict__ kv_cache,
+        query_t* __restrict__ q_out,
+        const int64_t* __restrict__ slot_mapping,
+        const int64_t* __restrict__ positions,
+        const scalar_t *__restrict__ cos_cache,
+        const scalar_t *__restrict__ sin_cache,
+        float eps,
+        const MlaKernelParams& __restrict__ params,
+        const float* q_scale
+    ) {
+      // ---- All compile-time constants ----
+      constexpr int32_t kv_lora_dim = KV_LORA_DIM;
+      constexpr int32_t pe_dim = 64;
+      constexpr int32_t head_size = kv_lora_dim + pe_dim;
+      constexpr int32_t embed_dim = pe_dim / 2;  // 32
+      constexpr int32_t vec_size_i = std::is_same_v<scalar_t, float> ? 4 : 8;
+      constexpr int32_t vec_size_o = vec_size_i;
+      constexpr uint32_t kv_lora_vec = kv_lora_dim / vec_size_o;
+      constexpr uint32_t vec_stride = 64;
+      constexpr int32_t GROUP_SIZE = 64;
+      constexpr int32_t nope_offset = is_nope_first ? 0 : pe_dim;
+      // Compile-time OOB sizes for make_gmem
+      constexpr int32_t ooba_i = 4 / sizeof(scalar_t);
+      constexpr int32_t ooba_o = 4 / sizeof(cache_t);
+      constexpr int32_t oob_i = (kv_lora_dim + ooba_i - 1) / ooba_i * ooba_i;
+      constexpr int32_t oob_o = (head_size + ooba_o - 1) / ooba_o * ooba_o;
+      constexpr int32_t q_ooba_o = 4 / sizeof(query_t);
+      constexpr int32_t q_oob_i = (kv_lora_dim + ooba_i - 1) / ooba_i * ooba_i;
+      constexpr int32_t q_oob_o = (head_size + q_ooba_o - 1) / q_ooba_o * q_ooba_o;
+      // group quant reduce size (compile-time since GROUP_SIZE and vec_size_i are constexpr)
+      constexpr int32_t reduce_thread_size = GROUP_SIZE / vec_size_i;
+
       using vec_i = ck_tile::vec_t<scalar_t, vec_size_i>;
       using opus_vec_i = opus::vector_t<scalar_t, vec_size_i>;
       using opus_vec_o = opus::vector_t<cache_t, vec_size_o>;
-      static constexpr int32_t ooba_i = 4 / sizeof(scalar_t);
-      static constexpr int32_t ooba_o = 4 / sizeof(cache_t);
-      const int64_t qH_per_kH = num_heads;
-      //const int64_t kv_lora_dim = 512; // extend: = kv_lora_rank
-      const int64_t kv_lora_dim = kv_lora_rank;
-      const int64_t head_size = kv_lora_dim + pe_dim;
-      const int32_t oob_i             = (kv_lora_dim + ooba_i - 1) / ooba_i * ooba_i;
-      const int32_t oob_o             = (head_size + ooba_o - 1) / ooba_o * ooba_o;
-      int32_t nope_offset = 0;
-      if constexpr (!is_nope_first) {
-        nope_offset = pe_dim;
-      } 
-      const int32_t num_kv_vecs = (kv_lora_dim + vec_size_i - 1) / vec_size_i;
-      const uint32_t kv_lora_vec = kv_lora_dim / vec_size_o;
-      
       using opus_vec_q = opus::vector_t<query_t, vec_size_o>;
-      constexpr uint32_t vec_stride = 64;
-      //constexpr float eps = 1e-6f;
-      constexpr int32_t GROUP_SIZE = 64;  // group quantization size
-      
-      // Prepare RoPE cos/sin pointers (needed for both Q and K RoPE)
-      const int32_t cos_sin_cache_offset = positions[token_idx] * (pe_dim >> 1);
-      const scalar_t *cos_ptr = cos_cache + cos_sin_cache_offset;
-      const scalar_t *sin_ptr = sin_cache + cos_sin_cache_offset;
-      constexpr int32_t embed_dim = 32;
-      
-      // ============ K_nope Processing with RMS Norm and Group Quant ============
-      // blockIdx.y represents Q head index, map to KV head for GQA
-      const int32_t q_head_idx = blockIdx.y;
-      const int32_t group_size_gqa = num_heads / num_kv_heads;  // GQA group size
-      const int32_t kv_head = q_head_idx / group_size_gqa;  // Map Q head to KV head
-      const bool is_first_in_group = (blockIdx.y < num_kv_heads);  // Only first Q head processes K
-      auto const* ptr_i               = reinterpret_cast<scalar_t const*>(kv_c + token_idx * kv_c_stride_0 + blockIdx.y * kv_c_stride_1);
-      auto* ptr_o                     = reinterpret_cast<cache_t*>(kv_cache + kv_cache_offset + nope_offset + blockIdx.y * kv_cache_stride_h);
-      
-      // FIX: oob_i is in elements, but make_gmem expects size in BYTES
+
+      // ---- Runtime: read slot_mapping early, exit fast ----
+      const int32_t token_idx = static_cast<int32_t>(blockIdx.x);
+      const int64_t slot_idx = slot_mapping[token_idx];
+      if (slot_idx < 0) return;
+
+      // ---- Compute kv_cache base offset (bitwise ops since block_size is power of 2) ----
+      const int32_t s = static_cast<int32_t>(slot_idx);
+      const int32_t bs_log2 = params.block_size_log2;
+      const int32_t kv_cache_offset = (s >> bs_log2) * params.block_stride + (s & ((1 << bs_log2) - 1)) * params.entry_stride;
+
+      // ---- Pre-compute common pointer bases (avoid repeated stride multiplies) ----
+      const int32_t q_head_idx = static_cast<int32_t>(blockIdx.y);
+      const int32_t kv_head_idx = static_cast<int32_t>(blockIdx.z);
+      const bool is_first_in_group = (q_head_idx == kv_head_idx);
+
+      // Token-level base offsets (int32_t to save SALU)
+      const int32_t token_kvc_base = token_idx * params.kv_c_stride_0;
+      const int32_t token_qnope_base = token_idx * params.q_nope_stride_0;
+      const int32_t token_qpe_base = token_idx * params.q_pe_stride_0;
+      const int32_t token_qout_base = token_idx * params.q_out_stride_0;
+      const int32_t token_kpe_base = token_idx * params.k_pe_stride_0;
+
+      // K/Q pointers
+      auto const* ptr_i = kv_c + token_kvc_base + kv_head_idx * params.kv_c_stride_1;
+      auto* ptr_o = kv_cache + kv_cache_offset + nope_offset + kv_head_idx * params.kv_cache_stride_h;
       auto buffer_i = opus::make_gmem<scalar_t>(ptr_i, oob_i * sizeof(scalar_t));
       auto buffer_o = opus::make_gmem<cache_t>(ptr_o, oob_o * sizeof(cache_t));
-      
-      // Step 1: Vectorized load K data and compute RMS norm variance (only if first in group)
+
+      // RoPE cos/sin pointers (shared between K and Q phases)
+      const int32_t cos_sin_offset = static_cast<int32_t>(positions[token_idx]) * (pe_dim >> 1);
+      const scalar_t *cos_ptr = cos_cache + cos_sin_offset;
+      const scalar_t *sin_ptr = sin_cache + cos_sin_offset;
+
+      const uint32_t tid = threadIdx.x;
+
+      // ============ K_nope Processing with RMS Norm and Group Quant ============
       if (is_first_in_group) {
         float sum_sq = 0.0f;
-        
         opus_vec_i vec_k;
-        uint32_t vec_idx_k = threadIdx.x;
-        bool has_k_data = (vec_idx_k < kv_lora_vec);
-      
-      // Load K data with vectorization
-      if (has_k_data) {
-        uint32_t kv_c_offset =  vec_idx_k * vec_size_i;
-        vec_k = buffer_i.template load<vec_size_i>(kv_c_offset);
-      } else {
-        vec_k = opus::vector_t<scalar_t, vec_size_i>(0.0f);
-      }
-      
-      // Compute squared sum for RMS norm
-      if (has_k_data) {
-        #pragma unroll
-        for (int i = 0; i < vec_size_i; ++i) {
-          float val = ck_tile::type_convert<float>(vec_k[i]);
-          sum_sq += val * val;
-        }
-      }
-      
-      
-      // Block-level reduction for sum of squares
-      auto sum_func = [](float a, float b) { return a + b; };
-      sum_sq = wave_reduce<float, decltype(sum_func), vec_stride, true>(sum_sq, sum_func);
-      // Compute RMS norm scale (broadcast to all threads)
-      float rms_scale = rsqrtf(sum_sq / kv_lora_dim + eps);
-      uint32_t x_idx, y_idx;
-      float f32_cos, f32_sin;
-      scalar_t kx, ky;
-      scalar_t* k_in = k_pe + token_idx * k_pe_stride_0 + blockIdx.y * k_pe_stride_1;
-      if(threadIdx.x < embed_dim)
-      {        
-        if constexpr (is_neox) {
-          x_idx = threadIdx.x;
-          y_idx = embed_dim + threadIdx.x;
-          f32_cos = ck_tile::type_convert<float>(VLLM_LDG(cos_ptr + x_idx));
-          f32_sin = ck_tile::type_convert<float>(VLLM_LDG(sin_ptr + x_idx));
-        } else {
-          x_idx = threadIdx.x << 1;
-          y_idx = x_idx + 1;
-          f32_cos = ck_tile::type_convert<float>(VLLM_LDG(cos_ptr + (x_idx >> 1)));
-          f32_sin = ck_tile::type_convert<float>(VLLM_LDG(sin_ptr + (x_idx >> 1)));
-        }
-         kx = k_in[x_idx];
-         ky = k_in[y_idx];
-      }
-      // Step 2: Apply RMS norm and k_weight
-      if (has_k_data) {
-        for (int i = 0; i < vec_size_i; i++) {
-          float val = ck_tile::type_convert<float>(vec_k[i]);
-          float weight = ck_tile::type_convert<float>(k_weight[vec_idx_k * vec_size_i + i]);
-          float normalized_val = val * rms_scale * weight;
-          vec_k[i] = ck_tile::type_convert<scalar_t>(normalized_val);
-        }
-      }
-      const int32_t num_groups = (kv_lora_dim + GROUP_SIZE - 1) / GROUP_SIZE;
-      __shared__ float smem_group_max[64];  // Support up to 16 groups (1024 dim / 64)
-      
-      // step 3: Compute scale for each group (absmax)
-      if constexpr (kv_dt != vllm::Fp8KVCacheDataType::kAuto) {
-        float thread_max = 1e-10f;
-        int reduce_thread_size = group_size / vec_size_i;
+        const bool has_k_data = (tid < kv_lora_vec);
+
+        // Load K data
         if (has_k_data) {
-          for(int i = 0; i < vec_size_i; i++)
-          {
-              thread_max = fmaxf(thread_max, fabsf(ck_tile::type_convert<float>(vec_k[i])));
+          vec_k = buffer_i.template load<vec_size_i>(tid * vec_size_i);
+          #pragma unroll
+          for (int i = 0; i < vec_size_i; ++i) {
+            float val = ck_tile::type_convert<float>(vec_k[i]);
+            sum_sq += val * val;
           }
         }
-        auto max_func = [](float a, float b) { return fmaxf(a, b); };
-        thread_max = multithread_reduce(thread_max, max_func, reduce_thread_size);
-        const float inverted_DTYPE_MAX =
-              std::is_same_v<cache_t, ck_tile::fp4x2_t>
-                  ? 0.25
-                  : (1. / ck_tile::type_convert<float>(ck_tile::numeric<cache_t>::max()));
-        float max_val = thread_max * inverted_DTYPE_MAX;
-        float group_scale = max_val;
-        
-        if(threadIdx.x % reduce_thread_size == 0) {
-          int group_id = (threadIdx.x * vec_size_i) / GROUP_SIZE;
-          if (threadIdx.x * vec_size_i < kv_lora_dim) {
-            if constexpr(std::is_same_v<cache_t, ck_tile::fp8_t>)
-            {
+
+        // Wave-level reduction for sum of squares
+        auto sum_func = [](float a, float b) { return a + b; };
+        sum_sq = wave_reduce<float, decltype(sum_func), vec_stride, true>(sum_sq, sum_func);
+        const float rms_scale = rsqrtf(sum_sq / static_cast<float>(kv_lora_dim) + eps);
+
+        // Pre-load K RoPE data while RMS norm result propagates
+        uint32_t x_idx, y_idx;
+        float f32_cos, f32_sin;
+        scalar_t kx, ky;
+        scalar_t* k_in = k_pe + token_kpe_base + kv_head_idx * params.k_pe_stride_1;
+        if (tid < embed_dim) {
+          if constexpr (is_neox) {
+            x_idx = tid;
+            y_idx = embed_dim + tid;
+            f32_cos = ck_tile::type_convert<float>(VLLM_LDG(cos_ptr + x_idx));
+            f32_sin = ck_tile::type_convert<float>(VLLM_LDG(sin_ptr + x_idx));
+          } else {
+            x_idx = tid << 1;
+            y_idx = x_idx + 1;
+            f32_cos = ck_tile::type_convert<float>(VLLM_LDG(cos_ptr + (x_idx >> 1)));
+            f32_sin = ck_tile::type_convert<float>(VLLM_LDG(sin_ptr + (x_idx >> 1)));
+          }
+          kx = k_in[x_idx];
+          ky = k_in[y_idx];
+        }
+
+        // Apply RMS norm and k_weight
+        if (has_k_data) {
+          const uint32_t k_weight_base = tid * vec_size_i;
+          #pragma unroll
+          for (int i = 0; i < vec_size_i; i++) {
+            float val = ck_tile::type_convert<float>(vec_k[i]);
+            float weight = ck_tile::type_convert<float>(k_weight[k_weight_base + i]);
+            vec_k[i] = ck_tile::type_convert<scalar_t>(val * rms_scale * weight);
+          }
+        }
+
+        // Compute group scale and quantize
+        __shared__ float smem_group_max[KV_LORA_DIM / GROUP_SIZE + 1];
+        if constexpr (kv_dt != vllm::Fp8KVCacheDataType::kAuto) {
+          float thread_max = 1e-10f;
+          if (has_k_data) {
+            #pragma unroll
+            for (int i = 0; i < vec_size_i; i++) {
+              thread_max = fmaxf(thread_max, fabsf(ck_tile::type_convert<float>(vec_k[i])));
+            }
+          }
+          auto max_func = [](float a, float b) { return fmaxf(a, b); };
+          thread_max = multithread_reduce(thread_max, max_func, reduce_thread_size);
+          const float inverted_DTYPE_MAX =
+                std::is_same_v<cache_t, ck_tile::fp4x2_t>
+                    ? 0.25f
+                    : (1.f / ck_tile::type_convert<float>(ck_tile::numeric<cache_t>::max()));
+          const float group_scale = thread_max * inverted_DTYPE_MAX;
+
+          if (tid % reduce_thread_size == 0) {
+            // Use bit-shift instead of division: group_id = (tid * vec_size_i) / 64 = (tid * vec_size_i) >> 6
+            const int group_id = (tid * vec_size_i) >> 6;
+            if (tid < kv_lora_vec) {
+              if constexpr (std::is_same_v<cache_t, ck_tile::fp8_t>) {
                 auto* tmp = reinterpret_cast<uint8_t*>(ptr_o + kv_lora_dim);
                 uint32_t u32 = ck_tile::bit_cast<uint32_t>(group_scale);
                 uint32_t exponent = (u32 >> 23) & 0xFF;
-                if (u32 & 0x7FFFFF) {
-                    exponent += 1;
-                }
+                if (u32 & 0x7FFFFF) exponent += 1;
                 tmp[group_id] = static_cast<uint8_t>(exponent);
-                // Reconstruct e8m0 as float: 2^(exponent - 127)
-                uint32_t e8m0_u32 = static_cast<uint32_t>(exponent) << 23;
-                float scale_e8m0 = ck_tile::bit_cast<float>(e8m0_u32);
-                smem_group_max[group_id] = 1.0f / scale_e8m0;
-            } else {
+                uint32_t e8m0_u32 = exponent << 23;
+                smem_group_max[group_id] = 1.0f / ck_tile::bit_cast<float>(e8m0_u32);
+              } else {
                 smem_group_max[group_id] = 1.0f / group_scale;
-            }
-          } else {
-            if constexpr(std::is_same_v<cache_t, ck_tile::fp8_t>)
-            {
+              }
+            } else {
+              if constexpr (std::is_same_v<cache_t, ck_tile::fp8_t>) {
                 auto* tmp = reinterpret_cast<uint8_t*>(ptr_o + kv_lora_dim);
                 tmp[group_id] = 0;
+              }
+              smem_group_max[group_id] = 0.0f;
             }
-            smem_group_max[group_id] = 0.0f;
           }
+          __syncthreads();
         }
-        
-        __syncthreads();
-      }
-      
-      
-      // Step 3: Vectorized apply RMS norm, weight, and quantize with group scales
-      vec_idx_k = threadIdx.x;
-      has_k_data = (vec_idx_k < kv_lora_vec);
-      uint32_t kv_c_offset = vec_idx_k * vec_size_i;
-      if (has_k_data) { 
-        if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
-          buffer_o.template store<vec_size_o>(vec_k, kv_c_offset);
-        } else {
+
+        // Store quantized K data
+        if (has_k_data) {
+          const uint32_t kv_c_offset = tid * vec_size_i;
+          if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
+            buffer_o.template store<vec_size_o>(vec_k, kv_c_offset);
+          } else {
             opus_vec_o vec_out;
+            // Pre-compute group_id base: tid * vec_size_i / 64
+            const int group_id_base = (tid * vec_size_i) >> 6;
+            const float inv_scale = smem_group_max[group_id_base];
+            #pragma unroll
             for (int i = 0; i < vec_size_i; i++) {
-              int group_id = (vec_idx_k * vec_size_i + i) / GROUP_SIZE;
+              // Within one vec of 8 elements, group_id only changes if crossing 64-element boundary
+              // For vec_size_i=8 and GROUP_SIZE=64: each vec is exactly one group
               float val = ck_tile::type_convert<float>(vec_k[i]);
-              float quant_val = val * smem_group_max[group_id];
-              vec_out[i] = ck_tile::type_convert<cache_t>(quant_val);
+              vec_out[i] = ck_tile::type_convert<cache_t>(val * inv_scale);
             }
             buffer_o.template store<vec_size_o>(vec_out, kv_c_offset);
+          }
         }
 
-      }
-        // inplace K RoPE processing for K_pe
-        // All threads in block process K RoPE elements in parallel
-        if (threadIdx.x < embed_dim)
-        {
+        // Inplace K RoPE
+        if (tid < embed_dim) {
           float fkx = ck_tile::type_convert<float>(kx);
           float fky = ck_tile::type_convert<float>(ky);
-          float fk_rot_x = fkx * f32_cos - fky * f32_sin;
-          float fk_rot_y = fky * f32_cos + fkx * f32_sin;
-          k_in[x_idx] = ck_tile::type_convert<scalar_t>(fk_rot_x);
-          k_in[y_idx] = ck_tile::type_convert<scalar_t>(fk_rot_y);
+          k_in[x_idx] = ck_tile::type_convert<scalar_t>(fkx * f32_cos - fky * f32_sin);
+          k_in[y_idx] = ck_tile::type_convert<scalar_t>(fky * f32_cos + fkx * f32_sin);
         }
-      } // end if (is_first_in_group) for K processing
+      } // end K processing
 
+      // ============ Q_nope Processing ============
       const float inverted_qscale = 1.0f / *q_scale;
-      const int32_t size =  kv_lora_dim;
-      static constexpr int32_t q_ooba_o = 4 / sizeof(query_t);
-      const int32_t q_oob_i = (size + ooba_i - 1) / ooba_i * ooba_i;
-      const int32_t q_oob_o = ( head_size + q_ooba_o - 1) / q_ooba_o * q_ooba_o;
-      
-      // Use opus::make_gmem for Q buffers, size in BYTES
-      auto q_buffer_i = opus::make_gmem<scalar_t>(q_nope + token_idx * q_nope_stride_0 + q_head_idx * q_nope_stride_1, q_oob_i * sizeof(scalar_t));
-      auto q_buffer_o = opus::make_gmem<query_t>(q_out + q_out_stride_0 * token_idx + q_head_idx * q_out_stride_1 + nope_offset, q_oob_o * sizeof(query_t));
-      // ============ Q_nope Processing (no RMS norm, direct quantization) ============
-      // Each block processes one Q head (blockIdx.y = q_head_idx)
-      // All threads in block process elements of this Q head in parallel
-      const scalar_t* q_nope_in = q_nope + token_idx * q_nope_stride_0 + q_head_idx * q_nope_stride_1;
-      query_t* q_nope_out_ptr = q_out + token_idx * q_out_stride_0 + q_head_idx * q_out_stride_1;
-      if constexpr (!is_nope_first) {
-        q_nope_out_ptr += pe_dim;
-      } 
-      
-      // Process elements with vectorization, threads process in parallel
-      for (uint32_t vec_idx = threadIdx.x; vec_idx < kv_lora_vec; vec_idx += vec_stride) {
-        uint32_t offset = vec_idx * vec_size_i;
-        opus_vec_i vec_in = q_buffer_i.template load<vec_size_i>(offset);
-        
-        if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
-          q_buffer_o.template store<vec_size_o>(vec_in, offset);
-        } else {
-          opus_vec_q vec_out = ck_tile::bit_cast<opus_vec_q>(
-              ck_tile::vec_convert<query_t, scalar_t, vec_size_i>(
-                  ck_tile::bit_cast<vec_i>(vec_in), inverted_qscale));
-          q_buffer_o.template store<vec_size_o>(vec_out, offset);
+
+      // Q buffer pointers (compute once)
+      auto q_buffer_i = opus::make_gmem<scalar_t>(q_nope + token_qnope_base + q_head_idx * params.q_nope_stride_1, q_oob_i * sizeof(scalar_t));
+      auto q_buffer_o = opus::make_gmem<query_t>(q_out + token_qout_base + q_head_idx * params.q_out_stride_1 + nope_offset, q_oob_o * sizeof(query_t));
+
+      if constexpr (do_q_norm) {
+        float q_sum_sq = 0.0f;
+        opus_vec_i vec_q;
+        const bool has_q_data = (tid < kv_lora_vec);
+
+        if (has_q_data) {
+          vec_q = q_buffer_i.template load<vec_size_i>(tid * vec_size_i);
+          #pragma unroll
+          for (int i = 0; i < vec_size_i; ++i) {
+            float val = static_cast<float>(vec_q[i]);
+            q_sum_sq += val * val;
+          }
         }
-      }
-      
-      // Handle tail elements
-      for (uint32_t idx = kv_lora_vec * vec_size_i + threadIdx.x; idx < kv_lora_dim; idx += vec_stride) {
-        float val = ck_tile::type_convert<float>(q_nope_in[idx]);
-        if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
-          q_nope_out_ptr[idx] = ck_tile::type_convert<query_t>(val);
+
+        auto sum_func = [](float a, float b) { return a + b; };
+        q_sum_sq = wave_reduce<float, decltype(sum_func), vec_stride, true>(q_sum_sq, sum_func);
+        const float q_rms_scale = rsqrtf(q_sum_sq / static_cast<float>(kv_lora_dim) + eps);
+
+        // Fused: apply RMS norm * weight + compute group max_abs
+        float q_fp32[vec_size_i];
+        __shared__ float q_smem_group_max[KV_LORA_DIM / GROUP_SIZE + 1];
+        float thread_max = 1e-10f;
+        if (has_q_data) {
+          const uint32_t q_weight_base = tid * vec_size_i;
+          #pragma unroll
+          for (int i = 0; i < vec_size_i; i++) {
+            float val = static_cast<float>(vec_q[i]);
+            float weight = static_cast<float>(q_weight[q_weight_base + i]);
+            q_fp32[i] = val * q_rms_scale * weight;
+            if constexpr (q_dt != vllm::Fp8KVCacheDataType::kAuto) {
+              thread_max = fmaxf(thread_max, fabsf(q_fp32[i]));
+            }
+          }
         } else {
-          q_nope_out_ptr[idx] = ck_tile::type_convert<query_t>(val * inverted_qscale);
+          #pragma unroll
+          for (int i = 0; i < vec_size_i; i++) q_fp32[i] = 0.0f;
         }
-      }
-    
-      // ============ RoPE Phase ============
-      // Phase 2: Process Q RoPE (each block processes its Q head)
-      
-      query_t* q_out_ptr = q_out + token_idx * q_out_stride_0 + q_head_idx * q_out_stride_1;
-      if constexpr (is_nope_first) {
-        q_out_ptr += kv_lora_dim;
-      }
-      
-      // All threads in block process Q RoPE elements in parallel
-      for (uint32_t rot_off = threadIdx.x; rot_off < embed_dim; rot_off += vec_stride) {
+
+        if constexpr (q_dt != vllm::Fp8KVCacheDataType::kAuto) {
+          auto max_func = [](float a, float b) { return fmaxf(a, b); };
+          thread_max = multithread_reduce(thread_max, max_func, reduce_thread_size);
+          const float inverted_DTYPE_MAX =
+                std::is_same_v<query_t, ck_tile::fp4x2_t>
+                    ? 0.25f
+                    : (1.f / ck_tile::type_convert<float>(ck_tile::numeric<cache_t>::max()));
+          const float q_group_scale = thread_max * inverted_DTYPE_MAX;
+
+          query_t* q_nope_out_base = reinterpret_cast<query_t*>(
+              q_out + token_qout_base + q_head_idx * params.q_out_stride_1 + (is_nope_first ? 0 : pe_dim));
+          if (tid % reduce_thread_size == 0) {
+            const int group_id = (tid * vec_size_i) >> 6;
+            if (tid < kv_lora_vec) {
+              if constexpr (std::is_same_v<query_t, ck_tile::fp8_t>) {
+                auto* tmp = reinterpret_cast<uint8_t*>(q_nope_out_base + kv_lora_dim);
+                uint32_t u32 = __builtin_bit_cast(uint32_t, q_group_scale);
+                uint32_t exponent = (u32 >> 23) & 0xFF;
+                if (u32 & 0x7FFFFF) exponent += 1;
+                tmp[group_id] = static_cast<uint8_t>(exponent);
+                uint32_t e8m0_u32 = exponent << 23;
+                q_smem_group_max[group_id] = 1.0f / __builtin_bit_cast(float, e8m0_u32);
+              } else {
+                q_smem_group_max[group_id] = 1.0f / q_group_scale;
+              }
+            } else {
+              if constexpr (std::is_same_v<query_t, ck_tile::fp8_t>) {
+                auto* tmp = reinterpret_cast<uint8_t*>(q_nope_out_base + kv_lora_dim);
+                tmp[group_id] = 0;
+              }
+              q_smem_group_max[group_id] = 0.0f;
+            }
+          }
+          __syncthreads();
+        }
+
+        // Store quantized Q data
+        if (has_q_data) {
+          const uint32_t q_offset = tid * vec_size_i;
+          if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
+            opus_vec_i vec_out_bf16;
+            #pragma unroll
+            for (int i = 0; i < vec_size_i; i++) {
+              vec_out_bf16[i] = static_cast<scalar_t>(q_fp32[i]);
+            }
+            q_buffer_o.template store<vec_size_o>(vec_out_bf16, q_offset);
+          } else {
+            opus_vec_q vec_out;
+            const int group_id_base = (tid * vec_size_i) >> 6;
+            const float inv_scale = q_smem_group_max[group_id_base];
+            #pragma unroll
+            for (int i = 0; i < vec_size_i; i++) {
+              vec_out[i] = ck_tile::type_convert<cache_t>(q_fp32[i] * inv_scale);
+            }
+            q_buffer_o.template store<vec_size_o>(vec_out, q_offset);
+          }
+        }
+      } else {
+        // Q_nope: direct quantization with global scale
+        for (uint32_t vec_idx = tid; vec_idx < kv_lora_vec; vec_idx += vec_stride) {
+          const uint32_t offset = vec_idx * vec_size_i;
+          opus_vec_i vec_in = q_buffer_i.template load<vec_size_i>(offset);
+          if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
+            q_buffer_o.template store<vec_size_o>(vec_in, offset);
+          } else {
+            auto vec_converted_ck = ck_tile::vec_convert<query_t, scalar_t, vec_size_i>(
+                ck_tile::bit_cast<vec_i>(vec_in), inverted_qscale);
+            opus_vec_q vec_out = ck_tile::bit_cast<opus_vec_q>(vec_converted_ck);
+            q_buffer_o.template store<vec_size_o>(vec_out, offset);
+          }
+        }
+      } // end Q_nope
+
+      // ============ Q RoPE Phase ============
+      // Compute Q pe pointer once (not inside loop)
+      scalar_t* q_pe_ptr = q_pe + token_qpe_base + q_head_idx * params.q_pe_stride_1;
+      if (tid < embed_dim) {
         uint32_t x_idx, y_idx;
         float f32_cos, f32_sin;
-        //scalar_t qx, qy;
-        const scalar_t* q_in = q_pe + token_idx * q_pe_stride_0 + q_head_idx * q_pe_stride_1;
         if constexpr (is_neox) {
-          x_idx = rot_off;
-          y_idx = embed_dim + rot_off;
-          f32_cos = ck_tile::type_convert<float>(VLLM_LDG(cos_ptr + x_idx));
-          f32_sin = ck_tile::type_convert<float>(VLLM_LDG(sin_ptr + x_idx));
+          x_idx = tid;
+          y_idx = embed_dim + tid;
+          f32_cos = static_cast<float>(VLLM_LDG(cos_ptr + x_idx));
+          f32_sin = static_cast<float>(VLLM_LDG(sin_ptr + x_idx));
         } else {
-          x_idx = rot_off << 1;
+          x_idx = tid << 1;
           y_idx = x_idx + 1;
-          f32_cos = ck_tile::type_convert<float>(VLLM_LDG(cos_ptr + (x_idx >> 1)));
-          f32_sin = ck_tile::type_convert<float>(VLLM_LDG(sin_ptr + (x_idx >> 1)));
+          f32_cos = static_cast<float>(VLLM_LDG(cos_ptr + (x_idx >> 1)));
+          f32_sin = static_cast<float>(VLLM_LDG(sin_ptr + (x_idx >> 1)));
         }
-        
-        ///qx = q_in[x_idx];
-        ///qy = q_in[y_idx];
-      
-        float fqx = ck_tile::type_convert<float>(q_in[x_idx]);
-        float fqy = ck_tile::type_convert<float>(q_in[y_idx]);
+
+        float fqx = static_cast<float>(q_pe_ptr[x_idx]);
+        float fqy = static_cast<float>(q_pe_ptr[y_idx]);
         float q_rot_x = fqx * f32_cos - fqy * f32_sin;
         float q_rot_y = fqy * f32_cos + fqx * f32_sin;
-        
-        if constexpr (std::is_same_v<query_t, ck_tile::fp8_t>) {
-          q_out_ptr[x_idx] = ck_tile::type_convert<query_t>(q_rot_x * inverted_qscale);
-          q_out_ptr[y_idx] = ck_tile::type_convert<query_t>(q_rot_y * inverted_qscale);
+        if constexpr (do_q_norm) {
+          q_pe_ptr[x_idx] = static_cast<scalar_t>(q_rot_x);
+          q_pe_ptr[y_idx] = static_cast<scalar_t>(q_rot_y);
         } else {
-          q_out_ptr[x_idx] = ck_tile::type_convert<query_t>(q_rot_x);
-          q_out_ptr[y_idx] = ck_tile::type_convert<query_t>(q_rot_y);
+          query_t* q_rope_out = q_out + token_qout_base + q_head_idx * params.q_out_stride_1;
+          if constexpr (is_nope_first) { q_rope_out += kv_lora_dim; }
+          if constexpr (std::is_same_v<query_t, ck_tile::fp8_t>) {
+            q_rope_out[x_idx] = opus::cast<opus::fp8_t>(q_rot_x * inverted_qscale);
+            q_rope_out[y_idx] = opus::cast<opus::fp8_t>(q_rot_y * inverted_qscale);
+          } else {
+            q_rope_out[x_idx] = static_cast<query_t>(q_rot_x);
+            q_rope_out[y_idx] = static_cast<query_t>(q_rot_y);
+          }
         }
       }
     }
@@ -2855,61 +2917,44 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
     }
 
     // NEW: Optimized prefill kernel with RMS Norm and Group Quantization
-    template <typename scalar_t, typename cache_t, typename query_t, vllm::Fp8KVCacheDataType kv_dt, vllm::Fp8KVCacheDataType q_dt>
-    __global__ void fuse_qk_norm_rope_concat_and_cache_mla_kernel_prefill_blockquant(
-        const scalar_t* __restrict__ q_nope,  // [num_tokens, num_heads, kv_lora_rank]
-        const scalar_t* __restrict__ q_pe,    // [num_tokens, num_heads, pe_dim]
-        const scalar_t* __restrict__ kv_c,    // [num_tokens, num_kv_heads, kv_lora_rank]
-        scalar_t* __restrict__ k_pe,    // [num_tokens, num_kv_heads, pe_dim]
-        const scalar_t* __restrict__ k_weight, // RMSNorm weights for key [kv_lora_rank]
-        cache_t* __restrict__ kv_cache,       // [num_blocks, block_size, num_kv_heads, (qk_lora_rank + pe_dim)]
-        query_t* __restrict__ q_out,          // [num_tokens, num_heads, kv_lora_rank + pe_dim]
-        const int64_t* __restrict__ slot_mapping,  // [num_tokens]
-        const int64_t* __restrict__ positions,     // [num_tokens]
-        const scalar_t *__restrict__ cos_cache,        // [max_position, rot_dim //2]
-        const scalar_t *__restrict__ sin_cache,        // [max_position, rot_dim //2]
-        double eps,
-        const int block_stride, const int entry_stride, const int kv_cache_stride_h,
-        const int q_nope_stride_0, const int q_nope_stride_1,
-        const int q_pe_stride_0, const int q_pe_stride_1,
-        const int q_out_stride_0, const int q_out_stride_1, 
-        const int num_heads, const int num_kv_heads,
-        const int kv_c_stride_0, const int kv_c_stride_1, 
-        const int k_pe_stride_0, const int k_pe_stride_1,
-        const int kv_lora_rank, const int pe_dim,
-        const int block_size, const int group_size,
+    // __launch_bounds__(64, 8): 64 threads/block, target 8 waves/SIMD for max occupancy
+    template <typename scalar_t, typename cache_t, typename query_t, vllm::Fp8KVCacheDataType kv_dt, vllm::Fp8KVCacheDataType q_dt, int KV_LORA_DIM = 512>
+    __global__ __launch_bounds__(64, 8)
+    void fuse_qk_norm_rope_concat_and_cache_mla_kernel_prefill_blockquant(
+        const scalar_t* __restrict__ q_nope,
+        scalar_t* __restrict__ q_pe,
+        const scalar_t* __restrict__ kv_c,
+        scalar_t* __restrict__ k_pe,
+        const scalar_t* __restrict__ k_weight,
+        const scalar_t* __restrict__ q_weight,
+        cache_t* __restrict__ kv_cache,
+        query_t* __restrict__ q_out,
+        const int64_t* __restrict__ slot_mapping,
+        const int64_t* __restrict__ positions,
+        const scalar_t *__restrict__ cos_cache,
+        const scalar_t *__restrict__ sin_cache,
+        float eps,
+        const MlaKernelParams params,
         const float* q_scale,
         bool is_neox, bool is_nope_first
     ) {
-      if (is_neox && is_nope_first) {
-        fuse_qk_norm_rope_concat_and_cache_mla_kernel_prefill_opt<scalar_t,cache_t,query_t, kv_dt, q_dt, true, true>(
-            q_nope, q_pe, kv_c, k_pe, k_weight, kv_cache, q_out, slot_mapping, positions, 
-            cos_cache, sin_cache, eps, block_stride, entry_stride, kv_cache_stride_h, 
-            q_nope_stride_0, q_nope_stride_1, q_pe_stride_0, q_pe_stride_1, q_out_stride_0,
-            q_out_stride_1, num_heads, num_kv_heads, kv_c_stride_0, kv_c_stride_1, 
-            k_pe_stride_0, k_pe_stride_1, kv_lora_rank, pe_dim, block_size, group_size,  q_scale);
-      } else if (is_neox && !is_nope_first) {
-        fuse_qk_norm_rope_concat_and_cache_mla_kernel_prefill_opt<scalar_t,cache_t,query_t, kv_dt, q_dt, true, false>(
-            q_nope, q_pe, kv_c, k_pe, k_weight, kv_cache, q_out, slot_mapping, positions, 
-            cos_cache, sin_cache, eps, block_stride, entry_stride, kv_cache_stride_h, 
-            q_nope_stride_0, q_nope_stride_1, q_pe_stride_0, q_pe_stride_1, q_out_stride_0, 
-            q_out_stride_1, num_heads, num_kv_heads, kv_c_stride_0, kv_c_stride_1, 
-            k_pe_stride_0, k_pe_stride_1, kv_lora_rank, pe_dim, block_size, group_size, q_scale);
-      } else if (!is_neox && is_nope_first) {
-        fuse_qk_norm_rope_concat_and_cache_mla_kernel_prefill_opt<scalar_t,cache_t,query_t, kv_dt, q_dt, false, true>(
-            q_nope, q_pe, kv_c, k_pe, k_weight, kv_cache, q_out, slot_mapping, positions, 
-            cos_cache, sin_cache, eps, block_stride, entry_stride, kv_cache_stride_h, 
-            q_nope_stride_0, q_nope_stride_1, q_pe_stride_0, q_pe_stride_1, q_out_stride_0, 
-            q_out_stride_1, num_heads, num_kv_heads, kv_c_stride_0, kv_c_stride_1, 
-            k_pe_stride_0, k_pe_stride_1, kv_lora_rank, pe_dim, block_size, group_size, q_scale);
+      #define DISPATCH_QK_NORM(NEOX, NOPE_FIRST, DO_Q_NORM) \
+        fuse_qk_norm_rope_concat_and_cache_mla_kernel_prefill_opt<scalar_t,cache_t,query_t, kv_dt, q_dt, NEOX, NOPE_FIRST, DO_Q_NORM, KV_LORA_DIM>( \
+            q_nope, q_pe, kv_c, k_pe, k_weight, q_weight, kv_cache, q_out, slot_mapping, positions, \
+            cos_cache, sin_cache, eps, params, q_scale)
+
+      if (q_weight != nullptr) {
+        if (is_neox && is_nope_first)        { DISPATCH_QK_NORM(true, true, true); }
+        else if (is_neox && !is_nope_first)  { DISPATCH_QK_NORM(true, false, true); }
+        else if (!is_neox && is_nope_first)  { DISPATCH_QK_NORM(false, true, true); }
+        else                                 { DISPATCH_QK_NORM(false, false, true); }
       } else {
-        fuse_qk_norm_rope_concat_and_cache_mla_kernel_prefill_opt<scalar_t,cache_t,query_t, kv_dt, q_dt, false, false>(
-            q_nope, q_pe, kv_c, k_pe, k_weight, kv_cache, q_out, slot_mapping, positions, 
-            cos_cache, sin_cache, eps, block_stride, entry_stride, kv_cache_stride_h, 
-            q_nope_stride_0, q_nope_stride_1, q_pe_stride_0, q_pe_stride_1, q_out_stride_0, 
-            q_out_stride_1, num_heads, num_kv_heads, kv_c_stride_0, kv_c_stride_1, 
-            k_pe_stride_0, k_pe_stride_1, kv_lora_rank, pe_dim, block_size, group_size, q_scale);
+        if (is_neox && is_nope_first)        { DISPATCH_QK_NORM(true, true, false); }
+        else if (is_neox && !is_nope_first)  { DISPATCH_QK_NORM(true, false, false); }
+        else if (!is_neox && is_nope_first)  { DISPATCH_QK_NORM(false, true, false); }
+        else                                 { DISPATCH_QK_NORM(false, false, false); }
       }
+      #undef DISPATCH_QK_NORM
     }
 
     // General version kernel wrapper with rope_dim parameter
@@ -3354,25 +3399,22 @@ void reshape_and_cache_flash(
 
 // NEW: Macro for prefill kernel with RMS Norm and Group Quantization
 #define CALL_PREFILL_FUSED_QK_NORM_ROPE_CONCAT_AND_CACHE_MLA(KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE)   \
-         aiter::fuse_qk_norm_rope_concat_and_cache_mla_kernel_prefill_blockquant<KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE>      \
+         aiter::fuse_qk_norm_rope_concat_and_cache_mla_kernel_prefill_blockquant<KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE, kv_lora_rank_val> \
                <<<grid, block, 0, stream>>>(                                                             \
                  reinterpret_cast<KV_T*>(q_nope.data_ptr()),                                             \
                  reinterpret_cast<KV_T*>(q_pe.data_ptr()),                                               \
                  reinterpret_cast<KV_T*>(kv_c.data_ptr()),                                               \
                  reinterpret_cast<KV_T*>(k_pe.data_ptr()),                                               \
                  reinterpret_cast<KV_T*>(k_weight.data_ptr()),                                           \
+                 reinterpret_cast<const KV_T*>(q_weight_ptr),                                              \
                  reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                                        \
                  reinterpret_cast<QUERY_T*>(q_out.data_ptr()),                                           \
                  slot_mapping.data_ptr<int64_t>(),                                                       \
                  positions.data_ptr<int64_t>(),                                                          \
                  reinterpret_cast<KV_T*>(cos_cache.data_ptr()),                                          \
                  reinterpret_cast<KV_T*>(sin_cache.data_ptr()),                                          \
-                 eps,                                                                                    \
-                 block_stride, entry_stride, kv_cache_stride_h,                                             \
-                 q_nope_stride_0, q_nope_stride_1, q_pe_stride_0, q_pe_stride_1,                         \
-                 q_out_stride_0, q_out_stride_1, num_heads, num_kv_heads,                                \
-                 kv_c_stride_0, kv_c_stride_1, k_pe_stride_0, k_pe_stride_1,                             \
-                 kv_lora_rank, pe_dim, block_size, group_size,                                           \
+                 static_cast<float>(eps),                                                                    \
+                 mla_params,                                                                             \
                  reinterpret_cast<const float*>(q_scale.data_ptr()),                                     \
                  is_neox, is_nope_first);
 
@@ -3998,8 +4040,9 @@ void fused_qk_norm_rope_group_quant_concat_and_cache_mla(
     torch::Tensor& kv_c,          // [num_tokens, k_num_heads, kv_lora_rank]
     torch::Tensor& k_pe,          // [num_tokens, k_num_heads, pe_dim]
     torch::Tensor& k_weight,      // [kv_lora_rank] RMSNorm weights for K
+    std::optional<torch::Tensor> q_weight_opt,  // [kv_lora_rank] RMSNorm weights for Q (optional, nullptr = no Q norm)
     torch::Tensor& kv_cache,      // [num_blocks, block_size, k_num_heads, 512)]
-    torch::Tensor& q_out,         // [num_tokens, num_heads, qk_lora_rank+pe_dim]
+    torch::Tensor& q_out,         // do_q_norm: [num_tokens, num_heads, qk_lora_rank+num_tiles], else: [num_tokens, num_heads, qk_lora_rank+pe_dim]
     torch::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
     torch::Tensor& q_scale,       // scale for q
     torch::Tensor& positions,     // [num_tokens]
@@ -4092,17 +4135,48 @@ void fused_qk_norm_rope_group_quant_concat_and_cache_mla(
     kv_lora_rank <= OPTIMIZED_KV_LORA_RANK
   );
   
+  // Resolve q_weight pointer (nullptr if not provided)
+  const void* q_weight_ptr = q_weight_opt.has_value() ? q_weight_opt->data_ptr() : nullptr;
+
+  // Pack stride/size params into struct to reduce kernel SGPR usage
+  aiter::MlaKernelParams mla_params;
+  mla_params.block_stride = block_stride;
+  mla_params.entry_stride = entry_stride;
+  mla_params.kv_cache_stride_h = kv_cache_stride_h;
+  mla_params.q_nope_stride_0 = q_nope_stride_0;
+  mla_params.q_nope_stride_1 = q_nope_stride_1;
+  mla_params.q_pe_stride_0 = q_pe_stride_0;
+  mla_params.q_pe_stride_1 = q_pe_stride_1;
+  mla_params.q_out_stride_0 = q_out_stride_0;
+  mla_params.q_out_stride_1 = q_out_stride_1;
+  mla_params.kv_c_stride_0 = kv_c_stride_0;
+  mla_params.kv_c_stride_1 = kv_c_stride_1;
+  mla_params.k_pe_stride_0 = k_pe_stride_0;
+  mla_params.k_pe_stride_1 = k_pe_stride_1;
+  // block_size must be power of 2; store log2 for bitwise div/mod in kernel
+  TORCH_CHECK(block_size > 0 && (block_size & (block_size - 1)) == 0,
+              "block_size must be a power of 2, got ", block_size);
+  mla_params.block_size_log2 = __builtin_ctz(block_size);
+
   if (use_optimized_prefill) {
-    // Use 2D grid: x=tokens, y=kv_heads for parallelization
-    constexpr int vec_size = 8;
-    dim3 grid(num_tokens, num_heads);
-    dim3 block(64);//std::min<int64_t>(kv_lora_rank, OPTIMIZED_KV_LORA_RANK) / vec_size
-    DISPATCH_BY_KV_CACHE_QUERY_DTYPE(kv_c.dtype(), kv_cache_dtype, q_out_type,
-                                      CALL_PREFILL_FUSED_QK_NORM_ROPE_CONCAT_AND_CACHE_MLA);
+    dim3 grid(num_tokens, num_heads, num_kv_heads);  // 3D grid
+    dim3 block(64);
+    if (kv_lora_rank <= 448) {
+      constexpr int kv_lora_rank_val = 448;
+      DISPATCH_BY_KV_CACHE_QUERY_DTYPE(kv_c.dtype(), kv_cache_dtype, q_out_type,
+                                        CALL_PREFILL_FUSED_QK_NORM_ROPE_CONCAT_AND_CACHE_MLA);
+    } else if (kv_lora_rank <= 512) {
+      constexpr int kv_lora_rank_val = 512;
+      DISPATCH_BY_KV_CACHE_QUERY_DTYPE(kv_c.dtype(), kv_cache_dtype, q_out_type,
+                                        CALL_PREFILL_FUSED_QK_NORM_ROPE_CONCAT_AND_CACHE_MLA);
+    } else {
+      TORCH_CHECK(false, "Unsupported kv_lora_rank=", kv_lora_rank,
+                  ". Supported: kv_lora_rank <= 512");
+    }
   } else {
     TORCH_CHECK(false, 
                 "fused_qk_norm_rope_concat_and_cache_mla currently only supports "
-                "kv_lora_rank=512 and rot_dim=64. Got kv_lora_rank=", kv_lora_rank, 
+                "kv_lora_rank<=512 and rot_dim=64. Got kv_lora_rank=", kv_lora_rank, 
                 " and rot_dim=", rot_dim);
   }
 }
