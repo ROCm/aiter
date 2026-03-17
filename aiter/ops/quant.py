@@ -14,6 +14,7 @@ from ..jit.core import compile_ops
 from ..utility import dtypes, fp4_utils
 from . import triton
 from .enum import ActivationType, QuantType
+from ..jit.utils.chip_info import get_cu_num
 
 
 @compile_ops("module_smoothquant")
@@ -401,6 +402,49 @@ def get_torch_act(aType):
     return tmp.get(aType, NotImplementedError)
 
 
+def moe_smooth_per_token_scaled_quant(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    scales: torch.Tensor,
+    smooth_scale: torch.Tensor,
+    topk_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    block_m: int,
+    local_expert_hash: Optional[torch.Tensor] = None,
+    shuffle_scale: bool = False,
+    transpose_out: bool = False,
+) -> None:
+    cu_num = get_cu_num()
+    is_moe_stage1 = input.numel() != out.numel()
+    token_num = input.shape[0]
+    if is_moe_stage1 and local_expert_hash is not None and token_num < cu_num * 8:
+        moe_smooth_per_token_scaled_quant_v1(
+            out,
+            input,
+            scales,
+            smooth_scale,
+            topk_ids,
+            shuffle_scale,
+            local_expert_hash,
+            transpose_out,
+        )
+    else:
+        moe_smooth_per_token_scaled_quant_v2(
+            out,
+            input,
+            scales,
+            smooth_scale,
+            sorted_token_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            block_m,
+            shuffle_scale,
+            transpose_out,
+        )
+
+
 @compile_ops("module_quant")
 def static_per_tensor_quant(out: Tensor, input: Tensor, scale: Tensor) -> None: ...
 
@@ -450,6 +494,42 @@ def smooth_per_token_scaled_quant(
     smooth_scale_map_hash: Optional[torch.Tensor] = None,
     enable_ps: bool = True,
 ) -> None: ...
+
+
+@compile_ops("module_quant")
+def moe_smooth_per_token_scaled_quant_v1(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    scales: torch.Tensor,
+    smooth_scale: torch.Tensor,
+    smooth_scale_map: torch.Tensor,
+    shuffle_scale: bool = False,
+    smooth_scale_map_hash: Optional[torch.Tensor] = None,
+    transpose_out: bool = False,
+) -> None:
+    """
+    v1: token loops along topk experts. Only supports moe stage1.
+    """
+    ...
+
+
+@compile_ops("module_quant")
+def moe_smooth_per_token_scaled_quant_v2(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    scales: torch.Tensor,
+    smooth_scale: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    block_m: int,
+    shuffle_scale: bool = False,
+    transpose_out: bool = False,
+) -> None:
+    """
+    v2: expert loops along sorted_token_ids. Supports both moe stage1 and stage2.
+    """
+    ...
 
 
 @compile_ops("module_quant")

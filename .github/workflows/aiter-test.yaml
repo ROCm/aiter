@@ -13,16 +13,18 @@ on:
       - '.gitignore'
 
   workflow_dispatch:
+  schedule:
+    - cron: '0 22 * * *'  # 6:00 AM Beijing Time (UTC+8)
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  DOCKER_IMAGE: "rocm/pytorch:latest@sha256:683765a52c61341e1674fe730ab3be861a444a45a36c0a8caae7653a08a0e208"
+  DOCKER_IMAGE: "rocm/pytorch:latest"
   GPU_ARCH_LIST: "gfx942;gfx950"
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
-  GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
+  GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
   AITER_TEST: "op_tests"
 
 jobs:
@@ -76,13 +78,13 @@ jobs:
            && git clone ${{ env.GITHUB_REPO_URL }} aiter \
            && cd aiter \
            && git checkout ${{ env.GITHUB_COMMIT_SHA }} \
-           && if [ "${GITHUB_REF:-}" = "refs/heads/main" ]; then \
-                echo "It's main branch, syncing latest CK..."; \
+           && if [ "${{ github.event_name }}" = "schedule" ]; then \
+                echo "It's nightly build, syncing latest CK..."; \
                 git submodule set-branch --branch develop 3rdparty/composable_kernel; \
                 git submodule sync && \
                 git submodule update --init --recursive --remote --jobs 4; \
               else \
-                echo "It's a PR branch, syncing specific CK..."; \
+                echo "Using pinned CK commit..."; \
                 git submodule sync && \
                 git submodule update --init --recursive --depth 1 --jobs 4; \
               fi \
@@ -132,7 +134,7 @@ jobs:
           echo "Successfully prepared image: rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}"
 
       - name: Extract wheel from image
-        if: ${{ github.ref == 'refs/heads/main' }}
+        if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'schedule' }}
         run: |
           set -ex
           IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
@@ -145,21 +147,21 @@ jobs:
           ls -lh dist/*.whl
 
       - name: Upload wheel as artifact
-        if: ${{ github.ref == 'refs/heads/main' }}
+        if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'schedule' }}
         uses: actions/upload-artifact@v4
         with:
           name: aiter-whl-main-${{ github.run_id }}
           path: dist/*.whl
 
       - name: Configure AWS credentials
-        if: ${{ github.ref == 'refs/heads/main' }}
+        if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'schedule' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: us-east-1
           role-to-assume: arn:aws:iam::661452401056:role/framework-aiter-nightlies
 
       - name: Install AWS CLI
-        if: ${{ github.ref == 'refs/heads/main' }}
+        if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'schedule' }}
         run: |
           if ! command -v aws &> /dev/null; then
             curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
@@ -169,7 +171,7 @@ jobs:
           fi
 
       - name: Upload wheels to S3
-        if: ${{ github.ref == 'refs/heads/main' }}
+        if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'schedule' }}
         run: |
           for WHL in dist/*.whl; do
             WHL_NAME=$(basename ${WHL})
@@ -322,14 +324,14 @@ jobs:
           bash -c "pip show amd-aiter || true"
       
       - name: Tests
-        timeout-minutes: 60
+        timeout-minutes: 90
         run: |
           set -ex
           if [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
             docker exec \
             -w /workspace \
             aiter_test \
-            bash -c "MAX_JOBS=20 SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh"
+            bash -c "MAX_JOBS=64 SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh"
           else
             docker exec \
             -w /workspace \
@@ -398,7 +400,7 @@ jobs:
   multi-gpu:
     name: Multi-GPU Tests (8 GPU)
     if: github.ref == 'refs/heads/main'
-    needs: build_aiter_image 
+    needs: build_aiter_image
     strategy:
       fail-fast: false
       matrix:

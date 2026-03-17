@@ -92,7 +92,8 @@ void fused_qk_norm_rope_cache_block_quant_shuffle(
     at::Tensor& cu_q_len,              // cu q len tensor
     const std::string& kv_cache_dtype, // kv cache data type
     std::optional<at::Tensor> k_scale, // k scale tensor for quantized k cache
-    std::optional<at::Tensor> v_scale  // v scale tensor for quantized v cache
+    std::optional<at::Tensor> v_scale, // v scale tensor for quantized v cache
+    int64_t max_tokens_per_batch = 0   // max tokens in any single batch (0 = use avg)
 );
 
 } // namespace aiter
