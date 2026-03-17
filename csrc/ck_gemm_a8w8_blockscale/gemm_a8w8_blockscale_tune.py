@@ -358,7 +358,10 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             tasks_data.append((kernels_for_shape, ()))
         ret = []
         if task:
-            ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)
+            ret = mp_tuner(
+                task, tasks_data, mp_num, False, shape_grouped, errRatio,
+                timeout=args.timeout, verbose=args.verbose,
+            )
         # print(ret)
         return ret
 
