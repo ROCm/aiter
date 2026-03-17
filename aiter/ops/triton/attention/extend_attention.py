@@ -93,6 +93,9 @@ def extend_attention_fwd(
     window_kv_offsets=None,
     xai_temperature_len=-1,
     config: Optional[dict[str, any]] = None,
+    min_len_extend=None,
+    total_prefix_len=None,
+    total_extend_len=None,
 ):
     """
     Attention for prefill with KV cache (extend phase).
@@ -164,6 +167,9 @@ def extend_attention_fwd(
             sinks=sinks,
             window_kv_offsets=window_kv_offsets,
             xai_temperature_len=xai_temperature_len,
+            min_len_extend=min_len_extend,
+            total_prefix_len=total_prefix_len,
+            total_extend_len=total_extend_len,
         )
         return
 
