@@ -1044,7 +1044,6 @@ def _ctypes_call(func, fc_name, md_name):
         so_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
         if not os.path.exists(so_path):
             d_args = get_args_of_build(md_name)
-            d_args["torch_exclude"] = True
             build_module(
                 md_name,
                 d_args["srcs"],
@@ -1057,6 +1056,8 @@ def _ctypes_call(func, fc_name, md_name):
                 d_args["is_python_module"],
                 d_args["is_standalone"],
                 d_args["torch_exclude"],
+                d_args.get("third_party", []),
+                d_args.get("hipify", False),
             )
         lib = ctypes.CDLL(so_path)
         c_func = getattr(lib, fc_name)
