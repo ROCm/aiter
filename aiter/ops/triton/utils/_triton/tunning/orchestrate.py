@@ -165,35 +165,35 @@ def do_tune(kernels, gpus, dry_run=False):
             print(f"  [SKIP] No shapes for {kernel}")
             continue
 
-        # Get LDS-filtered args for each num_stages
+        # Get LDS-filtered args using num_stages=2 (most permissive — allows
+        # larger blocks). screen.py will sweep both num_stages=2 and 3 via
+        # --num-stages-range 2 3, so we only need one run per kernel.
         print(f"\n--- Tuning {kernel} ---")
         if not dry_run:
             lds_result = subprocess.run(
                 [sys.executable, "lds_filter.py", "--kernel", kernel,
-                 "--num-stages", "2", "3", "--print-cli"],
+                 "--num-stages", "2", "--print-cli"],
                 capture_output=True, text=True, cwd=SCRIPT_DIR,
             )
-            # Parse all non-comment lines (one per num_stages)
+            # Get the single output line (for num_stages=2)
             lds_lines = [l.strip() for l in lds_result.stdout.strip().split("\n")
                          if l.strip() and not l.startswith("#")]
+            # Replace --num-stages-range with "2 3" to sweep both in one run
+            lds_args = lds_lines[0] if lds_lines else ""
+            lds_args = lds_args.replace("--num-stages-range 2", "--num-stages-range 2 3")
         else:
-            lds_lines = [
-                "--block-size-m-range 16 32 64 128 --block-size-n-range 32 64 128 --block-size-k-range 128 256 --num-stages-range 2",
-                "--block-size-m-range 16 32 64 --block-size-n-range 32 64 --block-size-k-range 128 --num-stages-range 3",
-            ]
+            lds_args = "--block-size-m-range 16 32 64 128 --block-size-n-range 32 64 128 --block-size-k-range 128 256 --num-stages-range 2 3"
 
         gpu_str = ",".join(str(g) for g in gpus)
-        # Run tuning for each num_stages configuration
-        for lds_args in lds_lines:
-            print(f"  LDS args: {lds_args}")
-            run_cmd([
-                sys.executable, "run_tuning.py",
-                "--kernel", kernel,
-                "--shapes-file", shapes_file,
-                "--gpus", gpu_str,
-                "--output-dir", configs_dir,
-                "--lds-args", lds_args,
-            ] + (["--dry-run"] if dry_run else []), dry_run=False)
+        print(f"  LDS args: {lds_args}")
+        run_cmd([
+            sys.executable, "run_tuning.py",
+            "--kernel", kernel,
+            "--shapes-file", shapes_file,
+            "--gpus", gpu_str,
+            "--output-dir", configs_dir,
+            "--lds-args", lds_args,
+        ] + (["--dry-run"] if dry_run else []), dry_run=False)
 
 
 def do_validate(kernels, gpus, dry_run=False):
