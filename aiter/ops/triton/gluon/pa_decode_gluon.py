@@ -1073,8 +1073,20 @@ def paged_attention_decode_sliding_window_head_1(
     block_split_idx = split_idx % CONTEXT_PARTITION_SIZE_PER_BLOCK
     # ==================== MEMORY LAYOUT DEFINITIONS ====================
     # Query tensor layout - optimized for sequential access (2D)
-    shared_query_layout: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, order=[1, 0])
-    shared_probs_layout: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 8, order=[1, 0])
+    if COMPUTE_TYPE.is_fp8():
+        SHARED_LAYOUT_WIDTH: gl.constexpr = 8
+    else:
+        SHARED_LAYOUT_WIDTH: gl.constexpr = 4
+    shared_query_layout: gl.constexpr = gl.SwizzledSharedLayout(
+        SHARED_LAYOUT_WIDTH, 1, 16, order=[1, 0]
+    )
+    shared_probs_layout: gl.constexpr = gl.SwizzledSharedLayout(
+        SHARED_LAYOUT_WIDTH, 1, 8, order=[1, 0]
+    )
+    shared_value_scale_layout: gl.constexpr = gl.SwizzledSharedLayout(
+        2, 1, 4, order=[0]
+    )
+    shared_key_scale_layout: gl.constexpr = gl.SwizzledSharedLayout(2, 1, 4, order=[0])
     QUERY_GROUP_SIZE_POW2: gl.constexpr = QUERY_SEQ_LEN_POW2 * ONE_QUERY_GROUP_SIZE_POW2
     if ONE_QUERY_GROUP_SIZE_POW2 <= 16:
         Q_WARPS_PER_CTA_DIM1: gl.constexpr = ONE_QUERY_GROUP_SIZE_POW2 // 4
@@ -1472,6 +1484,16 @@ def paged_attention_decode_sliding_window_head_1(
         shared_probs_layout,
     )
 
+    value_scale_shared = gl.allocate_shared_memory(
+        gl.float32,
+        [CONTEXT_PARTITION_SIZE],
+        shared_value_scale_layout,
+    )
+    key_scale_shared = gl.allocate_shared_memory(
+        gl.float32,
+        [CONTEXT_PARTITION_SIZE],
+        shared_key_scale_layout,
+    )
     if QUERY_QUANT_MODE == 0:
         query_scale_value = gl.load(query_scale)
     elif QUERY_QUANT_MODE == 1:
@@ -1527,26 +1549,29 @@ def paged_attention_decode_sliding_window_head_1(
         key_scale_value = gl.load(key_scale)
         value_scale_value = gl.load(value_scale)
 
+    # if QUERY_SEQ_LEN_POW2 == 1:
+    #     if QUERY_QUANT_MODE < 0 and COMPUTE_TYPE.is_fp8():
+    #         query_f32 = query_tensor.to(gl.float32)
+    #         query_abs = gl.abs(query_f32)
+    #         query_max_abs = gl.max(query_abs, axis=1, keep_dims=True)
+    #         query_scale_value = query_max_abs / float(FP8_MAX_VALUE)
+    #         query_tensor = query_f32.to(COMPUTE_TYPE)
+    #     else:
+    #         query_tensor = query_tensor.to(COMPUTE_TYPE)
+    #     query_shared.store(query_tensor)
+    # else:
+    #     if QUERY_QUANT_MODE < 0 and COMPUTE_TYPE.is_fp8():
+    #         query_f32 = mtp_query_tensor.to(gl.float32)
+    #         query_abs = gl.abs(query_f32)
+    #         query_max_abs = gl.max(query_abs, axis=1, keep_dims=True)
+    #         query_scale_value = query_max_abs / float(FP8_MAX_VALUE)
+    #         mtp_query_tensor = query_f32.to(COMPUTE_TYPE)
+    #     else:
     if QUERY_SEQ_LEN_POW2 == 1:
-        if QUERY_QUANT_MODE < 0 and COMPUTE_TYPE.is_fp8():
-            query_f32 = query_tensor.to(gl.float32)
-            query_abs = gl.abs(query_f32)
-            query_max_abs = gl.max(query_abs, axis=1, keep_dims=True)
-            query_scale_value = query_max_abs / float(FP8_MAX_VALUE)
-            query_tensor = query_f32.to(COMPUTE_TYPE)
-        else:
-            query_tensor = query_tensor.to(COMPUTE_TYPE)
-        query_shared.store(query_tensor)
+        mtp_query_tensor = query_tensor.to(COMPUTE_TYPE)
     else:
-        if QUERY_QUANT_MODE < 0 and COMPUTE_TYPE.is_fp8():
-            query_f32 = mtp_query_tensor.to(gl.float32)
-            query_abs = gl.abs(query_f32)
-            query_max_abs = gl.max(query_abs, axis=1, keep_dims=True)
-            query_scale_value = query_max_abs / float(FP8_MAX_VALUE)
-            mtp_query_tensor = query_f32.to(COMPUTE_TYPE)
-        else:
-            mtp_query_tensor = mtp_query_tensor.to(COMPUTE_TYPE)
-        query_shared.store(mtp_query_tensor)
+        mtp_query_tensor = mtp_query_tensor.to(COMPUTE_TYPE)
+    query_shared.store(mtp_query_tensor)
     page_offset = (
         kv_block_start_idx % CONTEXT_PARTITION_SIZE_PER_BLOCK
     ) * CONTEXT_PARTITION_SIZE
@@ -1620,17 +1645,12 @@ def paged_attention_decode_sliding_window_head_1(
             key_scale_value_blocked = gl.reshape(
                 key_scale_value_blocked, [CONTEXT_PARTITION_SIZE]
             )
-            key_scale_value = gl.convert_layout(
-                key_scale_value_blocked, layout=gl.SliceLayout(0, qk_linear_layout)
-            )
-            key_scale_value = key_scale_value[None, :]
+            key_scale_shared.store(key_scale_value_blocked)
+
             value_scale_value_blocked = gl.reshape(
                 value_scale_value_blocked, [CONTEXT_PARTITION_SIZE]
             )
-            value_scale_value = gl.convert_layout(
-                value_scale_value_blocked,
-                layout=gl.SliceLayout(0, qk_linear_layout),
-            )
+            value_scale_shared.store(value_scale_value_blocked)
 
         # Reshape key tensor for matrix multiplication
         key_converted = gl.permute(key_tensor, [1, 3, 0, 2])
@@ -1722,6 +1742,11 @@ def paged_attention_decode_sliding_window_head_1(
 
         # Apply quantization scaling to attention scores
         if KV_QUANT_MODE >= 0:
+            if KV_QUANT_MODE == 1:
+                key_scale_value = key_scale_shared.load(
+                    gl.SliceLayout(0, qk_linear_layout)
+                )
+                key_scale_value = key_scale_value[None, :]
             if QUERY_QUANT_MODE >= 0:
                 qk_scale_value = softmax_scale * query_scale_value * key_scale_value
             else:
@@ -1840,6 +1865,9 @@ def paged_attention_decode_sliding_window_head_1(
             if KV_QUANT_MODE == 1:
                 # Per-token quantization scaling
                 # Create mask for valid tokens
+                value_scale_value = value_scale_shared.load(
+                    gl.SliceLayout(0, qk_linear_layout)
+                )
                 valid_token_mask = qk_column_offsets < context_length
                 # Mask out value_scale of invalid tokens
                 value_scale_value = gl.where(
