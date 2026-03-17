@@ -658,6 +658,7 @@ class FmoeTuner(TunerCommon):
             and q_dtype_w == dtypes.fp4x2
         ):  # a8w4 mxfp4
             from aiter.ops.triton.quant.quant import dynamic_mxfp4_quant
+
             a1_qt, a1_scale = dynamic_mxfp4_quant(input)
         else:
             torch_quant = aiter.get_torch_quant(q_type)
@@ -901,6 +902,7 @@ class FmoeTuner(TunerCommon):
                 and q_dtype_w == dtypes.fp4x2
             ):  # a8w4 mxfp4
                 from aiter.ops.triton.quant.quant import dynamic_mxfp4_quant
+
                 a2_qt, a2_scale = dynamic_mxfp4_quant(
                     ref1.view(ref1.shape[0] * topk, -1)
                 )
@@ -1798,7 +1800,10 @@ class FmoeTuner(TunerCommon):
                 for kernel in ck_stage1_kernels.values():
                     if kernel.MPerBlock != blockM:
                         continue
-                    if hasattr(kernel, 'Block_Per_CU') and kernel.Block_Per_CU not in args.blockPerCu:
+                    if (
+                        hasattr(kernel, "Block_Per_CU")
+                        and kernel.Block_Per_CU not in args.blockPerCu
+                    ):
                         continue
                     tasks_ck.append(
                         (
@@ -1852,7 +1857,10 @@ class FmoeTuner(TunerCommon):
                 for kernel in ck_stage2_kernels.values():
                     if kernel.MPerBlock != blockM:
                         continue
-                    if hasattr(kernel, 'Block_Per_CU') and kernel.Block_Per_CU not in args.blockPerCu:
+                    if (
+                        hasattr(kernel, "Block_Per_CU")
+                        and kernel.Block_Per_CU not in args.blockPerCu
+                    ):
                         continue
                     tasks_ck.append(
                         (
@@ -2217,7 +2225,7 @@ class FmoeTuner(TunerCommon):
         mp_num = args.mp
         blockMs = [16, 32, 64, 128]
         keys = self.keys
-    
+
         print(untunedf[keys])
         tasks = []
         tasks_ck = []
@@ -2269,7 +2277,11 @@ class FmoeTuner(TunerCommon):
                 doweight_stage1,
             )
             # per_1x32 quant requires blockM >= 32 (moe_mxfp4_sort constraint)
-            shape_blockMs = [m for m in blockMs if m >= 32] if q_type == QuantType.per_1x32 else blockMs
+            shape_blockMs = (
+                [m for m in blockMs if m >= 32]
+                if q_type == QuantType.per_1x32
+                else blockMs
+            )
             tasks.extend(self.gen_2stages_asm1_task(info, shape_blockMs))
             tasks_ck.extend(self.gen_2stages_task(info, shape_blockMs))
             tasks_ck.extend(self.gen_flydsl_2stages_task(info, shape_blockMs))

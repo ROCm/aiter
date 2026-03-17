@@ -241,7 +241,9 @@ def get_tune_dict(tune_dict_csv):
         # BLOCK_PER_CU_MAX) without invalidating existing tuned CSVs.
         use_name = "kernelName" in tune_df.columns
         if not use_name:
-            print("[Warning]: tuned CSV has no kernelName column, falling back to kernelId. ")
+            print(
+                "[Warning]: tuned CSV has no kernelName column, falling back to kernelId. "
+            )
         for i in range(len(tune_df)):
             M = tune_df.loc[i, "M"]
             N = tune_df.loc[i, "N"]

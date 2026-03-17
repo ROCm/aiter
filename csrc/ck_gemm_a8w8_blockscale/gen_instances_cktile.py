@@ -53,8 +53,10 @@ class gemm_a8w8_blockscale_codegen:
             # BLOCK_PER_CU_MAX) without invalidating existing tuned CSVs.
             use_name = "kernelName" in tune_df.columns
             if not use_name:
-                print("[Warning]: tuned CSV has no kernelName column, falling back to kernelId. "
-                      "Re-run tuner to generate a CSV with kernelName for robust matching.")
+                print(
+                    "[Warning]: tuned CSV has no kernelName column, falling back to kernelId. "
+                    "Re-run tuner to generate a CSV with kernelName for robust matching."
+                )
             for i in range(len(tune_df)):
                 M = int(tune_df.loc[i, "M"])
                 N = int(tune_df.loc[i, "N"])

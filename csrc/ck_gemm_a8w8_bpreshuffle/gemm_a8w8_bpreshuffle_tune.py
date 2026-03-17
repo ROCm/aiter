@@ -17,7 +17,10 @@ from aiter.utility.mp_tuner import mp_tuner
 from aiter.jit.core import get_asm_dir
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/")
-from gemm_a8w8_bpreshuffle_cktile_common import kernels_list as kernels_list_cktile, BLOCK_PER_CU_MAX
+from gemm_a8w8_bpreshuffle_cktile_common import (
+    kernels_list as kernels_list_cktile,
+    BLOCK_PER_CU_MAX,
+)
 
 
 def checkClose(a, b, rtol=1e-3, atol=0.01):
@@ -260,8 +263,11 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                 f"Warning: q_dtype_w only support {dtypes.fp8}, actual q_dtype_w is {q_dtype_w}!"
             )
             return []
-        filtered_cktile = {k: v for k, v in kernels_list_cktile.items()
-                           if v.BlockPerCu in args.blockPerCu}
+        filtered_cktile = {
+            k: v
+            for k, v in kernels_list_cktile.items()
+            if v.BlockPerCu in args.blockPerCu
+        }
         gemm_a8w8_idx = [0, 1, 2, 3, 4]  # input index in generate_data
         ref_data_idx = [0, 5, 2, 3, 6]
         tasks_ck = []

@@ -696,7 +696,9 @@ if __name__ == "__main__":
 
         # Collect kernel names with their C++ type arguments for name dispatch
         for mnk, k in kernel_dict_merge.items():
-            name_lookup_entries.append((k.name, codegen.a_dtype, "pk_fp4", codegen.acc_dtype, codegen.c_dtype))
+            name_lookup_entries.append(
+                (k.name, codegen.a_dtype, "pk_fp4", codegen.acc_dtype, codegen.c_dtype)
+            )
 
     generate_common_header(args.working_path, gen_dispatch_files, gen_manifest_files)
 
@@ -729,6 +731,8 @@ inline const MoeKernelNameMap& get_cktile_name_lookup() {
     return lookup;
 }
 """
-    name_dispatch_path = os.path.join(args.working_path, "moe_cktile2stages_name_dispatch.h")
+    name_dispatch_path = os.path.join(
+        args.working_path, "moe_cktile2stages_name_dispatch.h"
+    )
     with open(name_dispatch_path, "w") as f:
         f.write(name_dispatch_header)

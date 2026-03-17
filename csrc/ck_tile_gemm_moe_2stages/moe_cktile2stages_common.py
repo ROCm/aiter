@@ -105,7 +105,7 @@ class kernelInstance:
 BLOCK_PER_CU_MAX = 4
 
 
-def expand_blockpercu(base_dict, max_bpc=BLOCK_PER_CU_MAX, field_name='Block_Per_CU'):
+def expand_blockpercu(base_dict, max_bpc=BLOCK_PER_CU_MAX, field_name="Block_Per_CU"):
     """Expand kernel instances with Block_Per_CU 1..max_bpc variants.
 
     For each unique tile configuration (all fields except Block_Per_CU),
