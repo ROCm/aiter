@@ -323,11 +323,8 @@ def get_default_config_moe_e2e(persistent: bool) -> Dict[str, int]:
 def quantize_fp8(
     tensor: torch.Tensor, dim=()
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    dev = arch_info.get_arch()
-    if dev == "gfx950":
-        fp8_type = torch.float8_e4m3fn
-    else:
-        fp8_type = torch.float8_e4m3fnuz
+    from aiter.utility.dtypes import fp8
+    fp8_type = fp8
 
     quantize_dim = [i for i in range(tensor.dim()) if i not in dim]
     max_vals = tensor.abs().amax(dim=quantize_dim, keepdim=True)
