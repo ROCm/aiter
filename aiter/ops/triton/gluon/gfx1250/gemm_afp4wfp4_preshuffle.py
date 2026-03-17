@@ -224,7 +224,7 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
         [NUM_BUFFERS, BLOCK_N // 16, BLOCK_K_BYTES * 16],
         layout=shared_B,
     )
-    # scales: raw shuffled blocks into LDS via TDM, then unshuffle and then load with layout
+    # scales: raw shuffled blocks into LDS via TDM; in compute: unshuffle -> load with layout
     smem_ASraw = gl.allocate_shared_memory(
         a_scale_ptr.type.element_ty,
         [NUM_BUFFERS, BLOCK_M // 32, K_GROUPS * 32],
@@ -299,15 +299,13 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
             gl.amd.gfx1250.tdm.async_load(bs_desc, bs_offs, smem_BSraw.index(slot_p), pred=1)
 
         k_tile_load_idx += 1
-    gl.amd.gfx1250.tdm.async_wait(0)
-    gl.barrier()
 
     # accumulator is in vGPR for the whole C tile
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=wmma_acc_layout)
 
     # ---- Main pipeline ----
     main_iters: gl.constexpr = k_tiles - (NUM_BUFFERS - 1)
-    for _ in gl.static_range(main_iters):
+    for _ in range(main_iters):
         # Load: advance pointers for this k_tile
         # HBM -> vGPR -> LDS
         slot_p = k_tile_load_idx % NUM_BUFFERS
@@ -329,8 +327,7 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
 
         k_tile_load_idx += 1
         # Compute: wait for data we’re about to use
-        gl.amd.gfx1250.tdm.async_wait(0)
-        gl.barrier()
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
 
         slot_c = k_tile_compute_idx % NUM_BUFFERS
 
@@ -345,15 +342,13 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
             ),
             layout=dot_b_layout,
         )
-        # scales: raw shuffled -> unshuffle -> load with wmma scale layouts
-
-        AS_view = smem_ASraw.index(slot_c)
-        AS_raw = unshuffle_scales_32(AS_view, BLOCK_X=BLOCK_M, K_GROUPS=K_GROUPS)
-        AS = AS_raw.load(layout=a_scale_layout)
-
-        BS_view = smem_BSraw.index(slot_c)
-        BS_raw = unshuffle_scales_32(BS_view, BLOCK_X=BLOCK_N, K_GROUPS=K_GROUPS)
-        BS = BS_raw.load(layout=b_scale_layout)
+        # scales: unshuffle -> load with wmma scale layouts
+        AS = unshuffle_scales_32(
+            smem_ASraw.index(slot_c), BLOCK_X=BLOCK_M, K_GROUPS=K_GROUPS
+        ).load(layout=a_scale_layout)
+        BS = unshuffle_scales_32(
+            smem_BSraw.index(slot_c), BLOCK_X=BLOCK_N, K_GROUPS=K_GROUPS
+        ).load(layout=b_scale_layout)
 
         acc = gl.amd.gfx1250.wmma_scaled(A, AS, "e2m1", B, BS, "e2m1", acc)
         k_tile_compute_idx += 1
@@ -363,8 +358,7 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
         if k_tile_compute_idx < k_tiles:
             slot_c = k_tile_compute_idx % NUM_BUFFERS
 
-            gl.amd.gfx1250.tdm.async_wait(0)
-            gl.barrier()
+            gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
 
             slot_c = k_tile_compute_idx % NUM_BUFFERS
 
@@ -378,13 +372,12 @@ def gemm_afp4wfp4_preshuffle_gfx1250(
                 layout=dot_b_layout,
             )
 
-            AS_view = smem_ASraw.index(slot_c)
-            AS_raw = unshuffle_scales_32(AS_view, BLOCK_X=BLOCK_M, K_GROUPS=K_GROUPS)
-            AS = AS_raw.load(layout=a_scale_layout)
-
-            BS_view = smem_BSraw.index(slot_c)
-            BS_raw = unshuffle_scales_32(BS_view, BLOCK_X=BLOCK_N, K_GROUPS=K_GROUPS)
-            BS = BS_raw.load(layout=b_scale_layout)
+            AS = unshuffle_scales_32(
+                smem_ASraw.index(slot_c), BLOCK_X=BLOCK_M, K_GROUPS=K_GROUPS
+            ).load(layout=a_scale_layout)
+            BS = unshuffle_scales_32(
+                smem_BSraw.index(slot_c), BLOCK_X=BLOCK_N, K_GROUPS=K_GROUPS
+            ).load(layout=b_scale_layout)
 
             acc = gl.amd.gfx1250.wmma_scaled(A, AS, "e2m1", B, BS, "e2m1", acc)
 
