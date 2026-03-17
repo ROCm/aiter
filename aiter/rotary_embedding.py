@@ -958,6 +958,17 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
         return new_freqs
 
 
+def apply_interleaved_rope(x: torch.Tensor, mrope_section: list[int]) -> torch.Tensor:
+    """Apply interleaved MRoPE to 3D rotary embeddings.
+    Reorganizes frequency layout from chunked [TTT...HHH...WWW] to
+    interleaved [THTHWHTHW...TT], preserving frequency continuity.
+    """
+    x_t = x[0].clone()
+    x_t[..., 1 : mrope_section[1] * 3 : 3] = x[1, ..., 1 : mrope_section[1] * 3 : 3]
+    x_t[..., 2 : mrope_section[2] * 3 : 3] = x[2, ..., 2 : mrope_section[2] * 3 : 3]
+    return x_t
+
+
 class MRotaryEmbedding(RotaryEmbedding):
     """Rotary Embedding with Multimodal Sections."""
 
@@ -970,12 +981,14 @@ class MRotaryEmbedding(RotaryEmbedding):
         is_neox_style: bool,
         dtype: torch.dtype,
         mrope_section: Optional[List[int]] = None,
+        mrope_interleaved: bool = False,
     ) -> None:
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
         self.mrope_section = mrope_section
+        self.mrope_interleaved = mrope_interleaved
         if self.mrope_section:
             assert sum(self.mrope_section) == rotary_dim // 2
 
@@ -997,32 +1010,38 @@ class MRotaryEmbedding(RotaryEmbedding):
         assert positions.ndim == 1 or positions.ndim == 2
 
         num_tokens = positions.shape[-1]
-        cos_sin = self.cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
+        cos, sin = self.cos_cache[positions], self.sin_cache[positions]
         if positions.ndim == 2:
             assert self.mrope_section
-
-            cos = torch.cat(
-                [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
-                dim=-1,
-            )
-            sin = torch.cat(
-                [m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))],
-                dim=-1,
-            )
+            if self.mrope_interleaved:
+                cos = apply_interleaved_rope(cos, self.mrope_section)
+                sin = apply_interleaved_rope(sin, self.mrope_section)
+            else:
+                cos = torch.cat(
+                    [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
+                    dim=-1,
+                )
+                sin = torch.cat(
+                    [m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))],
+                    dim=-1,
+                )
 
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
         query_pass = query[..., self.rotary_dim :]
-        query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
+        query_rot = _apply_rotary_emb(
+            query_rot, cos.squeeze(), sin.squeeze(), self.is_neox_style
+        )
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
         key_shape = key.shape
         key = key.view(num_tokens, -1, self.head_size)
         key_rot = key[..., : self.rotary_dim]
         key_pass = key[..., self.rotary_dim :]
-        key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
+        key_rot = _apply_rotary_emb(
+            key_rot, cos.squeeze(), sin.squeeze(), self.is_neox_style
+        )
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
 
@@ -1728,7 +1747,6 @@ def get_rope(
     )
     if key in _ROPE_DICT:
         return _ROPE_DICT[key]
-
     if dual_chunk_attention_config is not None:
         extra_kwargs = {
             k: v
@@ -1780,7 +1798,18 @@ def get_rope(
                 original_max_position,
             )
         elif scaling_type == "default":
-            if (
+            if "mrope_section" in rope_scaling:
+                rotary_emb = MRotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    max_position,
+                    base,
+                    is_neox_style,
+                    dtype,
+                    mrope_section=rope_scaling["mrope_section"],
+                    mrope_interleaved=rope_scaling.get("mrope_interleaved", False),
+                )
+            elif (
                 "mrope_section" in rope_scaling
                 and "aiter_rope_fused_qknorm" in rope_scaling
             ):
