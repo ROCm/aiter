@@ -381,13 +381,11 @@ class TunerCommon:
                     f"error: no valid candidate found for {info_key}, please check the result or errRatio in all result file running with --profile_file"
                 )
 
-            if len(filtered_time) < topk:
-                topk = len(filtered_time)
-                print(f"choose {topk} kernels")
-            self.topk = topk
+            shape_topk = min(topk, len(filtered_time))
+            self.topk = shape_topk
             best_config = [
                 ((info_key, *info_ex), us, max_err_ratio)
-                for info_ex, us, max_err_ratio in filtered_time[0:topk]
+                for info_ex, us, max_err_ratio in filtered_time[0:shape_topk]
             ]
             if not best_config:
                 logger.info(f"No kernel can be used for {info_key}")
