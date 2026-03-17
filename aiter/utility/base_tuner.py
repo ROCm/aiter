@@ -59,7 +59,6 @@ class TunerCommon:
         self.tunedf = None
         self.untunedf = None
         self.name = name
-        self.topk = 1
         self.success = pd.DataFrame(columns=self.columns)
         self.failed = pd.DataFrame(columns=self.columns)
 
@@ -381,11 +380,9 @@ class TunerCommon:
                     f"error: no valid candidate found for {info_key}, please check the result or errRatio in all result file running with --profile_file"
                 )
 
-            shape_topk = min(topk, len(filtered_time))
-            self.topk = shape_topk
             best_config = [
                 ((info_key, *info_ex), us, max_err_ratio)
-                for info_ex, us, max_err_ratio in filtered_time[0:shape_topk]
+                for info_ex, us, max_err_ratio in filtered_time[0:topk]
             ]
             if not best_config:
                 logger.info(f"No kernel can be used for {info_key}")
@@ -571,7 +568,7 @@ class GemmCommonTuner(TunerCommon):
             tflops, bw = self.calculate(el)
             key_dict = dict(zip(self.keys, keys))
 
-            if len(results) == self.topk:
+            if len(results) == 1:
                 print(
                     f"Tuning result for {str(key_dict).strip('{}')} is kernelId={kernelId} {kernelName} {splitK=}, {time}us, {err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s"
                 )

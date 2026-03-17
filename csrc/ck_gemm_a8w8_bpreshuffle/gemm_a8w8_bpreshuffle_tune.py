@@ -438,7 +438,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             tflops, bw = self.calculate(el)
             key_dict = dict(zip(self.keys, keys))
 
-            if len(results) == self.topk:
+            if len(results) == 1:
                 print(
                     f"Tuning result for {str(key_dict).strip('{}')} is kernelId={kernelId} {kernelName} {splitK=}, {time}us, {err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s"
                 )
