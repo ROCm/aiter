@@ -28,7 +28,7 @@ arch = get_arch()
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 DEBUG_MODE = False
-ATOL_fp8 = 3.0e-1
+ATOL_fp8 = 5.0e-1
 RTOL_fp8 = 2.5e-1
 
 

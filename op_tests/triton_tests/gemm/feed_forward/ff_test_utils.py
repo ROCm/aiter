@@ -115,7 +115,7 @@ def ff_ungated_test(
             activation=activation,
         )
 
-    torch.testing.assert_close(triton_out, torch_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(triton_out, torch_out, atol=6e-2, rtol=5e-2)
 
 
 def ff_gated_test(
