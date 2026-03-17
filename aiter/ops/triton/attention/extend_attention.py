@@ -15,13 +15,18 @@
 """
 Memory-efficient attention for prefill.
 It supports page size = 1 and prefill with KV cache (i.e. extend).
+
+On gfx950 (MI350X / CDNA4), supported shapes are dispatched to a Gluon
+kernel that is 2-3x faster than the untuned Triton fallback.  Unsupported shapes
+(BLOCK_DPE != 0, Lq != Lv, D=256) fall through to the original Triton
+kernel transparently.
 """
 
 from typing import Optional
 import torch
 import triton
 
-
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.attention.prefill_attention import context_attention_fwd
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.device_info import get_num_xcds
@@ -31,6 +36,37 @@ from aiter.ops.triton._triton_kernels.attention.extend_attention import (
 )
 
 _LOGGER = AiterTritonLogger()
+
+_gluon_extend_fn = None
+_gluon_checked = False
+
+
+def _try_load_gluon_extend():
+    """Lazy-load the Gluon extend kernel.  Returns the function or None."""
+    global _gluon_extend_fn, _gluon_checked
+    if _gluon_checked:
+        return _gluon_extend_fn
+    _gluon_checked = True
+    try:
+        from aiter.ops.triton.gluon.extend_attention_gluon import (
+            gluon_extend_attention_fwd,
+        )
+
+        _gluon_extend_fn = gluon_extend_attention_fwd
+    except (ImportError, AttributeError):
+        _gluon_extend_fn = None
+    return _gluon_extend_fn
+
+
+def _can_use_gluon(Lq: int, Lv: int) -> bool:
+    """Check whether the Gluon kernel supports this shape on this GPU."""
+    if get_gfx() != "gfx950":
+        return False
+    if Lq != Lv:
+        return False
+    if Lq not in (64, 128):
+        return False
+    return _try_load_gluon_extend() is not None
 
 
 def extend_attention_fwd(
@@ -50,11 +86,21 @@ def extend_attention_fwd(
     sm_scale=None,
     logit_cap=0.0,
     skip_prefix_custom_mask=True,
+    k_scale=1.0,
+    v_scale=1.0,
+    sliding_window_size=-1,
+    sinks=None,
+    window_kv_offsets=None,
+    xai_temperature_len=-1,
     config: Optional[dict[str, any]] = None,
 ):
     """
     Attention for prefill with KV cache (extend phase).
     Supports page size = 1 and variable-length sequences with prefix caching.
+
+    On gfx950 with supported head dims (64, 128) and Lq == Lv, dispatches to
+    a Gluon kernel with 2-3x better performance.  All other shapes/GPUs fall
+    through to the original Triton kernel.
 
     Args:
         q_extend (torch.Tensor): Query tensor for extend tokens with shape (total_extend_tokens, num_q_heads, head_dim).
@@ -73,6 +119,12 @@ def extend_attention_fwd(
         sm_scale (Optional[float]): Softmax scale, defaults to 1/sqrt(head_dim).
         logit_cap (float): Cap logits to prevent overflow.
         skip_prefix_custom_mask (bool): Skip custom mask for prefix portion.
+        k_scale (float): Key dequantization scale for FP8 KV cache.
+        v_scale (float): Value dequantization scale for FP8 KV cache.
+        sliding_window_size (int): Sliding window attention size, -1 to disable.
+        sinks (Optional[torch.Tensor]): Attention sink positions.
+        window_kv_offsets (Optional[torch.Tensor]): Per-sequence KV offset for SWA+custom_mask.
+        xai_temperature_len (int): XAI temperature context length, -1 to disable.
         config (Optional[dict]): Kernel tuning parameters (BLOCK_M, BLOCK_N).
 
     Returns:
@@ -87,6 +139,35 @@ def extend_attention_fwd(
         q_extend.shape[-1],
         v_extend.shape[-1],
     )
+
+    if _can_use_gluon(Lq, Lv):
+        _gluon_extend_fn(
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            custom_mask,
+            is_causal,
+            mask_indptr,
+            max_len_extend,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            sm_scale=sm_scale,
+            logit_cap=logit_cap,
+            skip_prefix_custom_mask=skip_prefix_custom_mask,
+            sliding_window_size=sliding_window_size,
+            sinks=sinks,
+            window_kv_offsets=window_kv_offsets,
+            xai_temperature_len=xai_temperature_len,
+        )
+        return
+
+    # --- Triton fallback for non-gfx950 or unsupported shapes ---
 
     if Lq == 576:
         BLOCK_DMODEL = 512
@@ -107,7 +188,6 @@ def extend_attention_fwd(
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
 
     USE_CUSTOM_MASK = custom_mask is not None
-    # Skip custom mask for prefix part
     SKIP_PREFIX_CUSTOM_MASK = skip_prefix_custom_mask
 
     if config is None:
