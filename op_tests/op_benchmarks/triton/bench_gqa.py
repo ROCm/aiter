@@ -1,0 +1,807 @@
+import torch
+import sys
+import warnings
+import argparse
+import itertools
+import triton
+from aiter.ops.triton.attention.mha import (
+    flash_attn_func,
+    flash_attn_varlen_func,
+    mha_set_use_fused_bwd_kernel,
+)
+from aiter.ops.triton.attention.mha_v3 import (
+    flash_attn_fp8_func,
+    flash_attn_varlen_fp8_func,
+)
+from aiter.test_mha_common import (
+    generate_random_padding_mask,
+    generate_qkv,
+)
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_model_configs,
+    print_vgpr,
+    get_caller_name_no_ext,
+)
+
+
+def nonvarlen_benchmark_configs():
+    batch_sizes = [1, 4, 16]
+    N_HEADS_Q = [32, 64, 128]
+    # For GQA, common ratios are 2:1, 4:1, 8:1 (HQ:HK)
+    # Generate configs with HQ and corresponding HK values
+    seq_len_q = [1, 1024, 4096]
+    seq_len_k = [163, 8192]
+    configs = []
+    for batch_size, N_HEAD_Q, seq_len_q_val, seq_len_k_val in itertools.product(
+        batch_sizes, N_HEADS_Q, seq_len_q, seq_len_k
+    ):
+        # Common GQA ratios: 2:1, 4:1, 8:1
+        for ratio in [2, 4, 8]:
+            if N_HEAD_Q % ratio == 0:
+                N_HEAD_K = N_HEAD_Q // ratio
+                configs.append(
+                    (batch_size, N_HEAD_Q, N_HEAD_K, seq_len_q_val, seq_len_k_val)
+                )
+    return configs
+
+
+def varlen_benchmark_configs():
+    batch_sizes = [1, 4, 8]
+    N_HEADS_Q = [32, 64, 128]
+    # For GQA, common ratios are 2:1, 4:1, 8:1 (HQ:HK)
+    seq_len_q = [1, 1024, 4096]
+    seq_len_k = [163, 8192]
+    configs = []
+    for batch_size, N_HEAD_Q, seq_len_q_val, seq_len_k_val in itertools.product(
+        batch_sizes, N_HEADS_Q, seq_len_q, seq_len_k
+    ):
+        # Common GQA ratios: 2:1, 4:1, 8:1
+        for ratio in [2, 4, 8]:
+            if N_HEAD_Q % ratio == 0:
+                N_HEAD_K = N_HEAD_Q // ratio
+                configs.append(
+                    (batch_size, N_HEAD_Q, N_HEAD_K, seq_len_q_val, seq_len_k_val)
+                )
+    return configs
+
+
+def model_benchmark_configs(args):
+    config_file = args.model_configs
+    configs = get_model_configs(config_path=config_file, models=args.model)
+    fa_configs = []
+    batch_size = args.b if args.b else 1
+
+    for model_name, config in configs.items():
+        HQ = config["num_attention_heads"]
+        # For GQA, use num_key_value_heads if available, otherwise default to HQ/4
+        HK = (
+            config["num_key_value_heads"]
+            if config.get("num_key_value_heads") is not None
+            else max(1, HQ // 4)
+        )
+        # Ensure HK < HQ and HQ is divisible by HK for GQA
+        if HK >= HQ:
+            HK = max(1, HQ // 4)
+        if HQ % HK != 0:
+            # Find the largest divisor of HQ that's less than HQ
+            for k in range(HQ - 1, 0, -1):
+                if HQ % k == 0:
+                    HK = k
+                    break
+        N_CTX_Q = args.sq if args.sq else [2**i for i in range(1, 14)]
+        N_CTX_K = args.sk if args.sk else N_CTX_Q
+        HEAD_DIM = config["hidden_size"] // HQ
+        if isinstance(N_CTX_Q, list):
+            for seq_len in N_CTX_Q:
+                fa_configs.append(
+                    (model_name, batch_size, HQ, HK, seq_len, seq_len, HEAD_DIM)
+                )
+        else:
+            fa_configs.append(
+                (model_name, batch_size, HQ, HK, N_CTX_Q, N_CTX_K, HEAD_DIM)
+            )
+
+    return fa_configs
+
+
+def pad_rearrange_dropout_mask(
+    S_dmask,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    seqlen_q,
+    seqlen_k,
+    num_q_heads,
+):
+    batch_size = cu_seqlens_q.numel() - 1
+
+    padded_dropout_mask = torch.ones(
+        (batch_size, num_q_heads, seqlen_q, seqlen_k), device="cuda"
+    )
+    for b in range(batch_size):
+        start_q = cu_seqlens_q[b].item()
+        end_q = cu_seqlens_q[b + 1].item()
+        start_k = cu_seqlens_k[b].item()
+        end_k = cu_seqlens_k[b + 1].item()
+
+        seqlen_q = end_q - start_q
+        seqlen_k = end_k - start_k
+        for h in range(S_dmask.shape[1]):
+            padded_dropout_mask[b, h, :max_seqlen_q, :max_seqlen_k] = S_dmask[
+                b, h, :, :
+            ]
+
+    return padded_dropout_mask
+
+
+def create_benchmark_configs(custom, args):
+    dtype = arg_to_torch_dtype[args.dtype]
+    # For GQA, HK should be > 1 and < HQ, default to HQ/4 if not specified
+    hk = args.hk if args.hk else (args.hq // 4 if args.hq else 8)
+    if args.hk:
+        if args.hk <= 1:
+            warnings.warn(
+                f"GQA benchmark expects HK > 1, but got HK={args.hk}. This may not be true GQA (consider MQA for HK=1).",
+                category=RuntimeWarning,
+            )
+        elif args.hq and args.hk >= args.hq:
+            warnings.warn(
+                f"GQA benchmark expects HK < HQ, but got HK={args.hk} >= HQ={args.hq}. This is not valid GQA.",
+                category=RuntimeWarning,
+            )
+    sk = args.sq if not args.sk else args.sk
+    head_size = 128 if not args.d else args.d
+    head_size_v = head_size if not args.dv else args.dv
+    mode = args.mode
+    x_names = ["BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K"]
+    causal = args.causal
+    varlen = args.layout == "thd"
+
+    configs = []
+    plot_name = get_caller_name_no_ext()
+    extra_args = {
+        "D_HEAD": head_size,
+        "D_HEAD_V": head_size_v,
+        "dtype": dtype,
+        "causal": causal,
+        "mode": mode,
+    }
+
+    if custom:
+        x_vals_list = [(args.b, args.hq, hk, args.sq, sk)]
+    else:
+        if varlen:
+            x_vals_list = varlen_benchmark_configs()
+        else:
+            x_vals_list = nonvarlen_benchmark_configs()
+
+        if args.model:
+            x_vals_list = model_benchmark_configs(args)
+            x_names = ["model", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K", "D_HEAD"]
+            plot_name = f"gqa-attention-{mode}-layout-{args.layout}-fp8-{args.fp8}-causal-{causal}"
+            extra_args = {"dtype": dtype, "causal": causal, "mode": mode}
+
+    if args.metric == "time":
+        unit = "ms"
+    elif args.metric == "throughput":
+        unit = "TFLOPS"
+    elif args.metric == "bandwidth":
+        unit = "GB/s"
+    else:
+        raise ValueError("Unknown metric: " + args.metric)
+
+    if mode == "bwd":
+        if args.fused_bwd:
+            line_vals = [f"fused-bwd({unit})"]
+        else:
+            line_vals = [f"onekernel-bwd({unit})"]
+    else:
+        line_vals = [f"fwd({unit})"]
+
+    if args.bench_torch:
+        line_vals = [f"Triton({unit})", f"Torch({unit})"]
+
+    if args.test_mode:
+        if args.fused_bwd:
+            line_vals = [f"fused-bwd({unit})"]
+        else:
+            line_vals = [f"onekernel-bwd({unit})"]
+
+    configs.append(
+        triton.testing.Benchmark(
+            x_names=x_names,
+            x_vals=x_vals_list,
+            line_arg="provider",
+            line_vals=line_vals,
+            line_names=line_vals,
+            styles=[("red", "-"), ("green", "-"), ("yellow", "-")],
+            ylabel=unit,
+            plot_name=plot_name,
+            args=extra_args,
+        )
+    )
+    return configs
+
+
+def run_benchmark(custom, args):
+    torch.manual_seed(20)
+
+    @triton.testing.perf_report(create_benchmark_configs(custom, args))
+    def bench_gqa(
+        BATCH,
+        HQ,
+        HK,
+        N_CTX_Q,
+        N_CTX_K,
+        D_HEAD,
+        D_HEAD_V,
+        dtype,
+        causal,
+        mode,
+        provider,
+        dropout=0.0,
+        model=None,
+        sm_scale=None,
+        device="cuda",
+    ):
+        """
+        Benchmark or test function for grouped-query attention (GQA).
+        In GQA, HK > 1 and HK < HQ (multiple query heads share fewer key/value heads).
+        In test_mode, verifies output matching with non-varlen inputs.
+        """
+        assert dropout <= 0.0, "Dropout not supported in this benchmark."
+        requires_grad = mode == "bwd" or args.test_mode
+        return_lse = True
+        return_attn_probs = False
+        varlen = args.layout == "thd"
+        has_pe = D_HEAD > D_HEAD_V
+        assert not (
+            args.fp8 and has_pe
+        ), "Positional Encoding (PE) doesn't support FP8 data type."
+        assert not (
+            has_pe and "fused-bwd" in provider
+        ), "'Fused' backward implementation doesn't support Positional Encoding (PE)."
+        assert not (
+            args.fp8 and args.sink
+        ), "Attention sink doesn't support FP8 data type."
+        assert not (
+            args.sink and "fused-bwd" in provider
+        ), "'Fused' backward implementation doesn't support Attention Sink."
+
+        # GQA validation: HK should be > 1 and < HQ
+        if HK <= 1:
+            warnings.warn(
+                f"GQA benchmark expects HK > 1, but got HK={HK}. This may not be true GQA (consider MQA for HK=1).",
+                category=RuntimeWarning,
+            )
+        if HK >= HQ:
+            raise ValueError(
+                f"For GQA, HK ({HK}) must be less than HQ ({HQ}). If HK >= HQ, use MHA benchmark instead."
+            )
+        assert (
+            HQ % HK == 0
+        ), f"For GQA, HQ ({HQ}) must be divisible by HK ({HK})"
+
+        global _USE_FUSED_BWD
+        fused_backward = "fused-bwd" in provider
+        mha_set_use_fused_bwd_kernel(fused_backward)
+
+        # Default softmax scale to match standard attention
+        if sm_scale is None:
+            sm_scale = 1.0 / (D_HEAD**0.5)
+
+        # Test mode: run tests from op_tests with specified shapes
+        if args.test_mode:
+            import op_tests.triton_tests.attention.test_mha as test_mha
+
+            print(
+                f"Testing GQA kernel implementation <{provider}> against Torch with shape:"
+            )
+            print(
+                f"BATCH={BATCH}, HQ={HQ}, HK={HK}, N_CTX_Q={N_CTX_Q}, N_CTX_K={N_CTX_K}, D_HEAD={D_HEAD}, D_HEAD_V={D_HEAD_V}"
+            )
+            if not varlen:
+                if not has_pe:
+                    test_mha.test_mha(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        dropout,
+                        True,
+                        True,
+                        causal,
+                        args.fp8,
+                        dtype,
+                    )
+                else:
+                    test_mha.test_mha_with_pe(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        D_HEAD_V,
+                        dropout,
+                        causal,
+                    )
+                print("Forward test passed!")
+                if not has_pe:
+                    test_mha.test_mha_backward_varlen(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        dropout,
+                        causal,
+                        args.fp8,
+                        dtype,
+                    )
+                else:
+                    test_mha.test_mha_backward_with_pe(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        D_HEAD_V,
+                        dropout,
+                        causal,
+                    )
+                print("Backward test passed!")
+            else:
+                if not has_pe:
+                    test_mha.test_mha_varlen(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        dropout,
+                        True,
+                        True,
+                        causal,
+                        args.fp8,
+                        dtype,
+                    )
+                else:
+                    test_mha.test_mha_varlen_with_pe(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        D_HEAD_V,
+                        dropout,
+                        causal,
+                    )
+                print("Forward test passed!")
+                if not has_pe:
+                    test_mha.test_mha_backward(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        dropout,
+                        causal,
+                        args.fp8,
+                        dtype,
+                    )
+                else:
+                    test_mha.test_mha_backward_varlen_with_pe(
+                        BATCH,
+                        N_CTX_Q,
+                        N_CTX_K,
+                        HQ,
+                        HK,
+                        D_HEAD,
+                        D_HEAD_V,
+                        dropout,
+                        causal,
+                    )
+                print("Backward test passed!")
+
+            return 0
+
+        # Generate base inputs
+        q = torch.randn(
+            (BATCH, N_CTX_Q, HQ, D_HEAD),
+            device=device,
+            dtype=dtype,
+            requires_grad=requires_grad,
+        )
+        k = torch.randn(
+            (BATCH, N_CTX_K, HK, D_HEAD),
+            device=device,
+            dtype=dtype,
+            requires_grad=requires_grad,
+        )
+        v = torch.randn(
+            (BATCH, N_CTX_K, HK, D_HEAD_V),
+            device=device,
+            dtype=dtype,
+            requires_grad=requires_grad,
+        )
+        sink = (
+            torch.randn((HQ,), device=device, dtype=dtype, requires_grad=requires_grad)
+            if args.sink
+            else None
+        )
+
+        # FLOPS calculation variables
+        total_flops = 0.0
+
+        # Input preparation
+        if varlen:
+            query_padding_mask = generate_random_padding_mask(
+                N_CTX_Q, BATCH, device, mode="full" if args.equal_seqlens else "random"
+            )
+            key_padding_mask = generate_random_padding_mask(
+                N_CTX_K, BATCH, device, mode="full" if args.equal_seqlens else "random"
+            )
+            (
+                q_unpad,
+                k_unpad,
+                v_unpad,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                q,
+                k,
+                v,
+                _,
+                _,
+                _,
+            ) = generate_qkv(
+                q, k, v, query_padding_mask, key_padding_mask, kvpacked=False
+            )
+            q_unpad.requires_grad = requires_grad
+            k_unpad.requires_grad = requires_grad
+            v_unpad.requires_grad = requires_grad
+
+            q_input, k_input, v_input = q_unpad, k_unpad, v_unpad
+
+            num_contexts = len(cu_seqlens_q) - 1
+            for i in range(num_contexts):
+                seqlen_q = (cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item()
+                seqlen_k = (cu_seqlens_k[i + 1] - cu_seqlens_k[i]).item()
+                if causal:
+                    valid_out_elements = (
+                        ((seqlen_k**2 + seqlen_k) / 2)
+                        if seqlen_q > seqlen_k
+                        else (seqlen_q * seqlen_k - ((seqlen_q**2 - seqlen_q) / 2))
+                    )
+                    # For GQA, we compute with HQ heads but only HK KV heads
+                    total_flops += valid_out_elements * HQ * (D_HEAD + D_HEAD_V) * 2.0
+                else:
+                    total_flops += seqlen_q * seqlen_k * HQ * (D_HEAD + D_HEAD_V) * 2.0
+        else:
+            q_input, k_input, v_input = q, k, v
+
+            if causal:
+                valid_out_elements = (
+                    ((N_CTX_K**2 + N_CTX_K) / 2)
+                    if N_CTX_Q > N_CTX_K
+                    else (N_CTX_Q * N_CTX_K - ((N_CTX_Q**2 - N_CTX_Q) / 2))
+                )
+                # For GQA, we compute with HQ heads but only HK KV heads
+                total_flops += (
+                    2.0 * BATCH * HQ * valid_out_elements * (D_HEAD + D_HEAD_V)
+                )
+            else:
+                total_flops += (
+                    2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
+                )
+
+        # Benchmark mode
+        if varlen:
+            if args.fp8:
+
+                def fn():
+                    return flash_attn_varlen_fp8_func(
+                        q_input,
+                        k_input,
+                        v_input,
+                        cu_seqlens_q,
+                        cu_seqlens_k,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        softmax_scale=sm_scale,
+                        causal=causal,
+                    )
+
+            else:
+
+                def fn():
+                    return flash_attn_varlen_func(
+                        q_input,
+                        k_input,
+                        v_input,
+                        cu_seqlens_q,
+                        cu_seqlens_k,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        dropout_p=dropout,
+                        softmax_scale=sm_scale,
+                        causal=causal,
+                        return_lse=return_lse,
+                        return_attn_probs=return_attn_probs,
+                        sink=sink,
+                    )
+
+        else:
+            if args.fp8:
+
+                def fn():
+                    return flash_attn_fp8_func(
+                        q_input,
+                        k_input,
+                        v_input,
+                        softmax_scale=sm_scale,
+                        causal=causal,
+                    )
+
+            else:
+
+                def fn():
+                    return flash_attn_func(
+                        q_input,
+                        k_input,
+                        v_input,
+                        dropout_p=dropout,
+                        softmax_scale=sm_scale,
+                        causal=causal,
+                        return_lse=return_lse,
+                        return_attn_probs=return_attn_probs,
+                        sink=sink,
+                    )
+
+        if mode == "bwd":
+            with torch.enable_grad():
+                triton_out = fn()[0]
+                d_out = torch.randn_like(triton_out)
+
+                grad_inputs = (q_input, k_input, v_input)
+                if sink is not None:
+                    grad_inputs += (sink,)
+
+                def fn():
+                    grads = torch.autograd.grad(
+                        triton_out,
+                        grad_inputs,
+                        d_out,
+                        retain_graph=True,
+                    )
+                    return grads
+
+        ms = triton.testing.do_bench(fn)
+
+        if mode == "bwd":
+            total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
+
+        if varlen:
+            total_num_tokens_q = cu_seqlens_q[-1].item()
+            total_num_tokens_k = cu_seqlens_k[-1].item()
+        else:
+            total_num_tokens_q = BATCH * N_CTX_Q
+            total_num_tokens_k = BATCH * N_CTX_K
+        q_size = total_num_tokens_q * HQ * D_HEAD * q.element_size()
+        k_size = total_num_tokens_k * HK * D_HEAD * k.element_size()
+        v_size = total_num_tokens_k * HK * D_HEAD_V * v.element_size()
+        o_size = total_num_tokens_q * HQ * D_HEAD_V * q.element_size()
+        if mode == "fwd":
+            # read q, k, v
+            mem_read = q_size + k_size + v_size
+            # write o
+            mem_write = o_size
+        else:
+            # read q, k, v, do
+            mem_read = q_size + k_size + v_size + o_size
+            # write dq, dk, dv
+            mem_write = q_size + k_size + v_size
+        mem = mem_read + mem_write
+
+        # return ms
+        if "ms" in provider:
+            return ms
+        elif "TFLOPS" in provider:
+            return total_flops / ms * 1e-9
+        else:  # GB/s
+            return mem / ms * 1e-6
+
+    bench_gqa.run(save_path="." if args.o else None, print_data=True)
+
+
+def supported_layouts():
+    layouts = (
+        "bshd: Q, K, V are individual tensors of [batch, seqlen_q/k, num_heads, head_size]. "
+        "thd: Q, K, V are individual tensors of [total_q/k, num_heads, head_size]. "
+    )
+    return layouts
+
+
+# argparse lacks support for boolean argument type (sigh...)
+def str2bool(v):
+    if isinstance(v, bool) or v is None:
+        return v
+    if v.lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    elif v.lower() in ("no", "false", "f", "n", "0"):
+        return False
+    else:
+        raise argparse.ArgumentTypeError("Boolean value expected.")
+
+
+def parse_args(args: list[str] | None = None) -> argparse.Namespace:
+    parser = get_parser(kernel_name="Grouped-Query Attention (GQA)")
+    parser.add_argument(
+        "-mode", type=str, default="fwd", help="fwd:forward kernel, bwd:backward kernel"
+    )
+    parser.add_argument("-b", type=int, default=0)
+    parser.add_argument("-hq", type=int, default=0)
+    parser.add_argument(
+        "-hk",
+        type=int,
+        default=0,
+        help="Number of key/value heads. For GQA, should be > 1 and < HQ (defaults to HQ/4 if HQ is specified).",
+    )
+    parser.add_argument("-sq", type=int, default=0)
+    parser.add_argument("-sk", type=int, default=0)
+    parser.add_argument(
+        "-equal_seqlens",
+        action="store_true",
+        default=False,
+        help="If specified, uses equal sequence lengths with thd layout, i.e t = b * sq",
+    )
+    parser.add_argument(
+        "-d",
+        type=int,
+        default=0,
+        help="Q and K head size, if -dv is absent then -d specifies V head size too",
+    )
+    parser.add_argument("-dv", type=int, default=0, help="optional V head size")
+    parser.add_argument("-causal", type=str2bool, default=None)
+    parser.add_argument("-fp8", action="store_true", default=False)
+    parser.add_argument("-quantize_p", action="store_true", default=False)
+    parser.add_argument("--dtype", default="fp16")
+    parser.add_argument("-bench_torch", action="store_true", default=False)
+    parser.add_argument("-fused_bwd", action="store_true", default=False)
+    parser.add_argument("-print_vgpr", action="store_true", default=False)
+    parser.add_argument(
+        "-test_mode",
+        action="store_true",
+        default=False,
+        help="Tests correctness of the Triton provider comparing the output to the Torch sdpa.",
+    )
+
+    parser.add_argument("--layout", type=str, default=None, help=supported_layouts())
+    parser.add_argument(
+        "-metric",
+        nargs="?",
+        const="throughput",
+        choices=["time", "throughput", "bandwidth"],
+        default=None,
+        help="Metrics for the kernel benchmark.",
+    )
+    parser.add_argument(
+        "-persistent",
+        nargs="?",
+        const="fixed",
+        choices=["fixed", "dynamic"],
+        default=None,
+        help="Enable persistent kernels. Use '-persistent dynamic' for dynamic scheduling of the tiles.",
+    )
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
+    )
+    parser.add_argument(
+        "-sink", action="store_true", default=False, help="use attention sink"
+    )
+    return parser.parse_args(args=args)
+
+
+arg_to_torch_dtype = {
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+    "fp32": torch.float32,
+}
+
+
+def post_process_args(args: argparse.Namespace) -> tuple[argparse.Namespace, bool]:
+    if args.model:
+        if args.causal is None:  # User didn't specify -causal
+            args.causal = True
+        if args.layout is None:  # User didn't specify -layout
+            args.layout = "thd"
+        print(
+            f"Note: using -model config defaults: causal={True}, layout={'thd'}. This is the most common real life scenario, but can be overridden with -causal and -layout flags."
+        )
+    else:
+        # the defaults for causal and varlen when not using the -model
+        if args.causal is None:  # User didn't specify -causal
+            args.causal = False
+        if args.layout is None:  # User didn't specify -layout
+            args.layout = "bshd"
+
+    custom_config = False
+
+    assert (
+        args.layout == "thd" or not args.equal_seqlens or args.model
+    ), "Equal sequence lengths arg must be used with the thd layout or a model config."
+    if args.hq or args.hk or args.d or args.dv:
+        custom_config = True
+        if not args.dv:
+            args.dv = args.d
+        # For GQA, default HK to HQ/4 if HQ is specified and HK is not
+        if args.hq and not args.hk:
+            args.hk = max(1, args.hq // 4)
+            # Ensure HK < HQ and HQ is divisible by HK
+            if args.hk >= args.hq:
+                args.hk = max(1, args.hq // 4)
+            # Find a valid divisor
+            if args.hq % args.hk != 0:
+                for k in range(args.hq - 1, 0, -1):
+                    if args.hq % k == 0:
+                        args.hk = k
+                        break
+        assert (
+            args.b and args.hq and args.sq and args.d and args.dv
+        ), "If custom config is specified, please provide \
+                all of batch, number of Q heads, Q sequence length \
+                and head size."
+
+    if args.model:
+        assert not (
+            args.hq or args.hk or args.d or args.dv
+        ), "Specifying model fixes hq, hk and d already. Do not provide them!"
+
+    assert (
+        args.dtype in arg_to_torch_dtype
+    ), "Only fp16, bf16 and f32 types currently supported."
+
+    assert (
+        args.layout in supported_layouts()
+    ), f"{args.layout} is not in supported layouts: {supported_layouts()}."
+
+    if args.layout == "thd" and args.equal_seqlens:
+        warnings.warn(
+            "Using 'thd' layout with equal_seqlen=True incurs an extra sequence length lookup cost "
+            "compared to 'bshd' layout. Consider using 'bshd' for better performance.",
+            category=RuntimeWarning,
+        )
+
+    return args, custom_config
+
+
+def main(args: list[str] | None = None) -> None:
+    parsed_args = parse_args(args=args)
+    parsed_args, custom_config = post_process_args(parsed_args)
+
+    if parsed_args.print_vgpr:
+        assert not parsed_args.bench_torch, "Do not use -bench_torch with -print_vgpr."
+        print("Retrieving VGPR usage for Triton kernels...")
+
+        def fun():
+            return run_benchmark(custom_config, parsed_args)
+
+        print_vgpr(fun, get_caller_name_no_ext())
+        return
+
+    run_benchmark(custom_config, parsed_args)
+
+
+if __name__ == "__main__":
+    main()
