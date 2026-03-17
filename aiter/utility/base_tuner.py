@@ -481,7 +481,6 @@ class TunerCommon:
                     f"Retrying {len(retry_keys)} failed shapes (attempt {retry + 1}/{max_retries})"
                 )
                 self.failed = pd.DataFrame(columns=self.columns)
-                retry_batches = (len(retry_keys) + batch_size - 1) // batch_size
                 for j in range(0, len(retry_keys), batch_size):
                     retry_batch = retry_keys.iloc[j : j + batch_size].reset_index(drop=True)
                     all_results = self.tune(retry_batch, self.tunedf, args)
