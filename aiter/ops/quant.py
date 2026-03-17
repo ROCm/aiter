@@ -431,7 +431,17 @@ def lqq_1x64_quant(
 
     # uint4
     w_lqq_fp32 = (w_reshaped - w_min.to(torch.float32)) / scale_fp32
-    w_lqq_u4 = w_lqq_fp32.round().to(torch.uint8)
+    w_lqq_u32 = w_lqq_fp32.round()
+    w_lqq_u4 = w_lqq_u32.to(torch.uint8)
+
+    w_lqq_ceil = torch.ceil(w_lqq_fp32)
+    w_lqq_floor = torch.floor(w_lqq_fp32)
+    w_ceil_int = w_lqq_ceil * scale_u8 + zero_i8
+    w_floor_int = w_lqq_floor * scale_u8 + zero_i8
+    dt_w_ceil = torch.abs(w_ceil_int - w_reshaped)
+    dt_w_floor = torch.abs(w_floor_int - w_reshaped)
+    w_lqq_u32 = torch.where(dt_w_ceil < dt_w_floor, w_lqq_ceil, w_lqq_floor)
+    w_lqq_u4 = w_lqq_u32.to(torch.uint8)
 
     w_lqq_uint4 = w_lqq_u4.view(eprt, M, N).to(device)
     w_lqq_scale = scale_u8.squeeze(-1).to(device)

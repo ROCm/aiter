@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
 #include "asm_fmoe_2stages_configs.hpp"
 #include "moe_op.h"
@@ -15,10 +15,6 @@
 
 #if EN_ASM_MOE_PRINT == 1
     #define print(...) printf(__VA_ARGS__)
-#else
-    #define print(...) ((void)0)
-#endif
-#if EN_ASM_MOE_PRINT == 1
     template<typename T>
     static int save_dev_hex(const char* filename, T* array, size_t size) {
         if (filename == NULL || array == NULL || size == 0) {
@@ -105,6 +101,19 @@
         delete[] ptr;
             
         fclose(fp);
+        return 0;
+    }
+#else
+    #define print(...) ((void)0)
+    template<typename T>
+    static int save_dev_hex(const char* filename, T* array, size_t size) {
+        return 0;
+    }
+    template<typename T>
+    static int save_dev_int(const char* filename, T* array, size_t size) {
+        return 0;
+    }
+    static int save_dev_float(const char* filename, float* array, size_t size) {
         return 0;
     }
 #endif
@@ -552,7 +561,7 @@ void moe_stage1_g1u1(
 
     int bdx = 256;
     int gdx = ((hidden_dim + sub_GU - 1) / sub_GU);
-    int gdy = sz_stp; // sub_X_cnt;
+    int gdy = sub_X_cnt;
     int gdz = k_num;
 
     args.log();
@@ -673,6 +682,10 @@ void moe_stage2_g1u1(
 
     int dbl_o    = (splitk > 1) ? 2 : 1;
     int stride_O = dim * out.element_size() * dbl_o;
+    if(out.dim() == 3) // multi buffer
+    {
+        stride_O = stride_O * topk;
+    }
 
     Kernel2Args args;
     size_t arg_size = sizeof(args);

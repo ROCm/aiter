@@ -146,7 +146,6 @@ def test_fmoe_lqq(
     quant_type = QuantType.lqq_1x64
     act_type = ActivationType.Silu
     group_in_k_lqq = 64
-
     # This gpu id in EP, this example use the last id
     ep_id = ep - 1
     # total_expert = unshared_expert + shared_expert + fake_expert(only use this fake expert id to mask)
@@ -161,17 +160,13 @@ def test_fmoe_lqq(
     fake_expertid = expert_mask.numel() - 1
     # Ensure fake expert to be masked
     expert_mask[-1] = 0
-    # Ensure shared expert not to be maskedc
+    # Ensure shared expert not to be masked
     expert_mask[E:-1] = 1
 
     local_expert_hash = build_local_expert_hash(expert_mask)
 
     input = torch.randn((token, model_dim), dtype=dtype, device="cuda")
     score = torch.randn((token, E), device="cuda", dtype=dtype)
-
-    topk_weights, topk_ids = fused_topk(input, score, topk, True)
-    print(f"after fused_topk topk_ids: {topk_ids}")
-
     if shared_E > 0:
         shared_E_score = 0.1
         # init total_topk_ids, inference time you just need to fill ns_topk_ids in total_topk_ids

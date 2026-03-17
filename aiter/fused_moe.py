@@ -176,7 +176,7 @@ def fused_moe(
     topk_weight,
     topk_ids,
     expert_mask: Optional[torch.tensor] = None,  # EP
-    local_expert_hash: Optional[torch.Tensor] = None,
+    local_expert_hash: Optional[torch.Tensor] = None,  # EP
     activation=ActivationType.Silu,
     quant_type=QuantType.No,
     doweight_stage1=False,
@@ -248,6 +248,7 @@ def fused_moe_fake(
     topk_weight: torch.Tensor,
     topk_ids: torch.Tensor,
     expert_mask: Optional[torch.Tensor] = None,  # EP
+    local_expert_hash: Optional[torch.Tensor] = None,  # EP
     activation: int = ActivationType.Silu.value,
     quant_type: int = QuantType.No.value,
     doweight_stage1: bool = False,
@@ -282,7 +283,7 @@ def fused_moe_(
     topk_weight: torch.Tensor,
     topk_ids: torch.Tensor,
     expert_mask: Optional[torch.Tensor] = None,  # EP
-    local_expert_hash: Optional[torch.Tensor] = None,
+    local_expert_hash: Optional[torch.Tensor] = None,  # EP
     activation: int = ActivationType.Silu.value,
     quant_type: int = QuantType.No.value,
     doweight_stage1: bool = False,
@@ -1172,8 +1173,8 @@ def fused_moe_2stages(
     w2_lqq_scale: Optional[torch.Tensor] = None,
     w2_lqq_zero: Optional[torch.Tensor] = None,
     expert_mask: Optional[torch.Tensor] = None,  # EP
-    local_expert_hash: Optional[torch.Tensor] = None,
     topk_ids: Optional[torch.Tensor] = None,  # EP
+    local_expert_hash: Optional[torch.Tensor] = None,  # EP
     fc1_smooth_scale: Optional[
         torch.Tensor
     ] = None,  # [expert(local_expert:EP), 1, model_dim]
@@ -1186,6 +1187,7 @@ def fused_moe_2stages(
     intermediate_pad=0,
     bias1=None,
     bias2=None,
+    accumulate: bool = False,
 ):
     def _normalize_moe_output_shape(x: torch.Tensor) -> torch.Tensor:
         if x.ndim == 3 and x.shape[1] == 1:
@@ -1273,7 +1275,6 @@ def fused_moe_2stages(
                     local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32)
                     local_expert_hash[local_expert_hash > 0] -= 1
                     local_expert_hash[expert_mask == 0] = -1
-
             if fc1_smooth_scale is not None:
                 a8 = torch.empty(
                     (topk, token_num, model_dim), dtype=dtypes.i8, device=device
@@ -1334,6 +1335,7 @@ def fused_moe_2stages(
             dtype=dtype,
             device=device,
         )
+
     extra_stage1_args = {}
     extra_stage2_args = {}
     if (
@@ -1345,6 +1347,7 @@ def fused_moe_2stages(
     ):
         extra_stage1_args["bias1"] = bias1
         extra_stage2_args["bias2"] = bias2
+
     a2 = metadata.stage1(
         a1,
         w1,
@@ -1364,8 +1367,6 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if doweight_stage1 else None,
         **extra_stage1_args,
     )
-    # if quant_type == QuantType.lqq_1x64:
-    #     return a2
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
@@ -1451,7 +1452,8 @@ def fused_moe_2stages(
             num_rows_factor=topk,
         )
         a2 = a2.view(token_num, topk, inter_dim)
-    # Build valid_mask for EP mode, comment it out for hotfix
+
+    # Build valid_mask for EP mode only when reduce mode requests it.
     extra_stage2_args = {}
     use_reduce = is_reduce() and _supports_stage2_reduce(metadata.stage2)
     use_valid_mask = int(os.environ.get("AITER_FLYDSL_GEMM2_VALID_MASK", "0"))
@@ -1459,13 +1461,10 @@ def fused_moe_2stages(
         valid_mask = None
         if topk_ids is not None and expert_mask is not None:
             valid_mask = get_topk_valid_mask(topk_ids, expert_mask)
-        # Add valid_mask to extra_stage2_args if available
         if valid_mask is not None:
             extra_stage2_args["valid_mask"] = valid_mask
-    # print(f"use_reduce: {use_reduce} is_reduce: {is_reduce()} _supports_stage2_reduce: {_supports_stage2_reduce(metadata.stage2)}")
     if use_reduce:
         extra_stage2_args["intermediate"] = moe_out
-        intermediate = moe_out
         moe_out = torch.empty(token_num, model_dim, dtype=moe_out.dtype, device=device)
 
     metadata.stage2(
@@ -1610,8 +1609,6 @@ def asm_stage2(
         splitk,
     )
 
-    return out
-
 
 def torch_moe(
     hidden_states,
@@ -1659,6 +1656,8 @@ def torch_moe(
     if fc1_smooth_scale is not None:
         expert = fc1_smooth_scale.shape[0]
         fc1_smooth_scale = fc1_smooth_scale.view(expert, -1)
+    if fc2_smooth_scale is not None:
+        expert = fc2_smooth_scale.shape[0]
         fc2_smooth_scale = fc2_smooth_scale.view(expert, -1)
 
     for E_id in range(w1.shape[0]):
