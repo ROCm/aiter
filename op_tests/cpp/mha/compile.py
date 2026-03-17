@@ -3,6 +3,7 @@
 import sys
 import os
 import argparse
+from pathlib import Path
 
 # !!!!!!!!!!!!!!!! never import aiter
 # from aiter.jit import core
@@ -13,8 +14,26 @@ from jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_META_DIR  # noqa
 FWD_CODEGEN_CMD = [f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_fwd --output_dir {{}}"]
 BWD_CODEGEN_CMD = [f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}"]
 
+def get_embedded_hsa_build_args():
+    """Optional embedded-HSA config passed from the outer build via env vars."""
+    header_path_var = os.getenv("AITER_EMBEDDED_HSA_HEADER_PATH", "").strip()
+    flags_extra_cc = []
+
+    # If a header path is provided, derive its directory and pass it via -I so
+    # the embedded HSA header can be found during compilation (no separate include_dir).
+    if header_path_var:
+        header_path = Path(header_path_var)
+        # aiter_hip_common.h uses: #include AITER_EMBEDDED_HSA_HEADER
+        # so the macro value must be a quoted header token.
+        flags_extra_cc.append(f'-DAITER_EMBEDDED_HSA_HEADER=\\"{header_path.name}\\"')
+
+        # Keep optCompilerConfig's default include list intact by passing include dir
+        # as a compile flag instead of overriding `extra_include` in custom args.
+        flags_extra_cc.append(f'-I"{header_path.parent}"')
+    return flags_extra_cc
 
 def cmdGenFunc_mha_fwd(ck_exclude: bool):
+    flags_extra_cc = get_embedded_hsa_build_args()
     if ck_exclude:
         srcs = [f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu"]
         blob_gen_cmd = []
@@ -35,7 +54,7 @@ def cmdGenFunc_mha_fwd(ck_exclude: bool):
         "srcs": srcs,
         "md_name": "libmha_fwd",
         "blob_gen_cmd": blob_gen_cmd,
-        "flags_extra_cc": [flag_use_v3],
+        "flags_extra_cc": [flag_use_v3] + flags_extra_cc,
     }
 
 
@@ -56,6 +75,7 @@ def cmdGenFunc_mha_bwd(ck_exclude: bool):
         ]
     blob_gen_cmd.extend(BWD_CODEGEN_CMD)
     flags_extra_cc = ["-DONLY_FAV3"] if ck_exclude else []
+    flags_extra_cc += get_embedded_hsa_build_args()
     return {
         "md_name": "libmha_bwd",
         "blob_gen_cmd": blob_gen_cmd,
