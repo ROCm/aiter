@@ -76,22 +76,54 @@ def do_baseline(kernels, gpus, dry_run=False):
             "--output-dir", shapes_dir,
         ], dry_run=dry_run)
 
-    # Step 2: Collect baseline timings
-    # Distribute kernels across GPUs round-robin
+    # Step 2: Collect baseline timings (parallel across GPUs)
     print("\nStep 2: Collecting baseline timings...")
-    for i, kernel in enumerate(kernels):
-        gpu = gpus[i % len(gpus)]
-        shapes_file = os.path.join(shapes_dir, f"shapes_gemm_{kernel}.json")
-        if not dry_run and not os.path.isfile(shapes_file):
-            print(f"  [SKIP] No shapes file for {kernel}")
-            continue
-        run_cmd([
-            sys.executable, "collect_baseline.py",
-            "--kernel", kernel,
-            "--shapes-file", shapes_file,
-            "--output-dir", baseline_dir,
-            "--gpu", str(gpu),
-        ], dry_run=dry_run)
+    if dry_run:
+        for i, kernel in enumerate(kernels):
+            gpu = gpus[i % len(gpus)]
+            shapes_file = os.path.join(shapes_dir, f"shapes_gemm_{kernel}.json")
+            run_cmd([
+                sys.executable, "collect_baseline.py",
+                "--kernel", kernel,
+                "--shapes-file", shapes_file,
+                "--output-dir", baseline_dir,
+                "--gpu", str(gpu),
+            ], dry_run=True)
+    else:
+        import time
+        active = {}  # gpu_id -> (process, kernel_name)
+        queue = []
+        for kernel in kernels:
+            shapes_file = os.path.join(shapes_dir, f"shapes_gemm_{kernel}.json")
+            if not os.path.isfile(shapes_file):
+                print(f"  [SKIP] No shapes file for {kernel}")
+                continue
+            queue.append((kernel, shapes_file))
+
+        while queue or active:
+            # Check completed
+            for gpu_id in list(active.keys()):
+                proc, kname = active[gpu_id]
+                if proc.poll() is not None:
+                    print(f"  [GPU {gpu_id}] Finished {kname} (rc={proc.returncode})")
+                    del active[gpu_id]
+            # Launch new
+            for gpu_id in gpus:
+                if gpu_id not in active and queue:
+                    kernel, shapes_file = queue.pop(0)
+                    cmd = [
+                        sys.executable, "collect_baseline.py",
+                        "--kernel", kernel,
+                        "--shapes-file", shapes_file,
+                        "--output-dir", baseline_dir,
+                        "--gpu", str(gpu_id),
+                    ]
+                    print(f"  [GPU {gpu_id}] Starting {kernel}")
+                    env = os.environ.copy()
+                    proc = subprocess.Popen(cmd, cwd=SCRIPT_DIR, env=env)
+                    active[gpu_id] = (proc, kernel)
+            if active:
+                time.sleep(2)
 
     # Step 3: Merge per-kernel baselines into one file
     if not dry_run:
@@ -133,30 +165,35 @@ def do_tune(kernels, gpus, dry_run=False):
             print(f"  [SKIP] No shapes for {kernel}")
             continue
 
-        # Get LDS-filtered args
+        # Get LDS-filtered args for each num_stages
         print(f"\n--- Tuning {kernel} ---")
-        lds_result = subprocess.run(
-            [sys.executable, "lds_filter.py", "--kernel", kernel,
-             "--num-stages", "2", "3", "--print-cli"],
-            capture_output=True, text=True, cwd=SCRIPT_DIR,
-        ) if not dry_run else None
-
-        # Use num_stages=2 line (first non-comment line)
-        if dry_run:
-            lds_args = "--block-size-m-range 16 32 64 128 --block-size-n-range 32 64 128 --block-size-k-range 128 256"
+        if not dry_run:
+            lds_result = subprocess.run(
+                [sys.executable, "lds_filter.py", "--kernel", kernel,
+                 "--num-stages", "2", "3", "--print-cli"],
+                capture_output=True, text=True, cwd=SCRIPT_DIR,
+            )
+            # Parse all non-comment lines (one per num_stages)
+            lds_lines = [l.strip() for l in lds_result.stdout.strip().split("\n")
+                         if l.strip() and not l.startswith("#")]
         else:
-            lds_lines = [l for l in lds_result.stdout.strip().split("\n") if not l.startswith("#")]
-            lds_args = lds_lines[0] if lds_lines else ""
+            lds_lines = [
+                "--block-size-m-range 16 32 64 128 --block-size-n-range 32 64 128 --block-size-k-range 128 256 --num-stages-range 2",
+                "--block-size-m-range 16 32 64 --block-size-n-range 32 64 --block-size-k-range 128 --num-stages-range 3",
+            ]
 
         gpu_str = ",".join(str(g) for g in gpus)
-        run_cmd([
-            sys.executable, "run_tuning.py",
-            "--kernel", kernel,
-            "--shapes-file", shapes_file,
-            "--gpus", gpu_str,
-            "--output-dir", configs_dir,
-            "--lds-args", lds_args,
-        ] + (["--dry-run"] if dry_run else []), dry_run=False)  # let run_tuning handle dry_run
+        # Run tuning for each num_stages configuration
+        for lds_args in lds_lines:
+            print(f"  LDS args: {lds_args}")
+            run_cmd([
+                sys.executable, "run_tuning.py",
+                "--kernel", kernel,
+                "--shapes-file", shapes_file,
+                "--gpus", gpu_str,
+                "--output-dir", configs_dir,
+                "--lds-args", lds_args,
+            ] + (["--dry-run"] if dry_run else []), dry_run=False)
 
 
 def do_validate(kernels, gpus, dry_run=False):
@@ -168,21 +205,51 @@ def do_validate(kernels, gpus, dry_run=False):
 
     print("\n=== Phase 3: Validation ===\n")
 
-    # Step 1: Collect new timings
+    # Step 1: Collect new timings (parallel across GPUs)
     print("Step 1: Collecting new timings...")
-    for i, kernel in enumerate(kernels):
-        gpu = gpus[i % len(gpus)]
-        shapes_file = os.path.join(shapes_dir, f"shapes_gemm_{kernel}.json")
-        if not dry_run and not os.path.isfile(shapes_file):
-            print(f"  [SKIP] No shapes file for {kernel}")
-            continue
-        run_cmd([
-            sys.executable, "collect_baseline.py",
-            "--kernel", kernel,
-            "--shapes-file", shapes_file,
-            "--output-dir", validation_dir,
-            "--gpu", str(gpu),
-        ], dry_run=dry_run)
+    if dry_run:
+        for i, kernel in enumerate(kernels):
+            gpu = gpus[i % len(gpus)]
+            shapes_file = os.path.join(shapes_dir, f"shapes_gemm_{kernel}.json")
+            run_cmd([
+                sys.executable, "collect_baseline.py",
+                "--kernel", kernel,
+                "--shapes-file", shapes_file,
+                "--output-dir", validation_dir,
+                "--gpu", str(gpu),
+            ], dry_run=True)
+    else:
+        import time
+        active = {}
+        queue = []
+        for kernel in kernels:
+            shapes_file = os.path.join(shapes_dir, f"shapes_gemm_{kernel}.json")
+            if not os.path.isfile(shapes_file):
+                print(f"  [SKIP] No shapes file for {kernel}")
+                continue
+            queue.append((kernel, shapes_file))
+
+        while queue or active:
+            for gpu_id in list(active.keys()):
+                proc, kname = active[gpu_id]
+                if proc.poll() is not None:
+                    print(f"  [GPU {gpu_id}] Finished {kname} (rc={proc.returncode})")
+                    del active[gpu_id]
+            for gpu_id in gpus:
+                if gpu_id not in active and queue:
+                    kernel, shapes_file = queue.pop(0)
+                    cmd = [
+                        sys.executable, "collect_baseline.py",
+                        "--kernel", kernel,
+                        "--shapes-file", shapes_file,
+                        "--output-dir", validation_dir,
+                        "--gpu", str(gpu_id),
+                    ]
+                    print(f"  [GPU {gpu_id}] Starting {kernel}")
+                    proc = subprocess.Popen(cmd, cwd=SCRIPT_DIR)
+                    active[gpu_id] = (proc, kernel)
+            if active:
+                time.sleep(2)
 
     # Step 2: Merge validation results
     if not dry_run:
