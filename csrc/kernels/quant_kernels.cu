@@ -1514,33 +1514,33 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v2(DTYPE_O* __restrict_
 }
 
 
-#define MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V2_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE) \
-    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_kernel", [&] {                                         \
-        using input_dtype = typename t2ck<scalar_t>::type;                                                             \
-        int warps_per_cu = 8 * BLOCK_SIZE / WARP_SIZE; \
-        int num_tg = persistent_mode? num_cu * warps_per_cu : num_blocks; \
-        dim3 const grid(num_tg);                                                                                    \
-        aiter::quant_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA> \
-            <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                                                   \
-                reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                                            \
-                scales.data_ptr<float>(),                                                                              \
-                reinterpret_cast<input_dtype*>(input.data_ptr()),                                                      \
-                smooth_scale.data_ptr<float>(),                                                                        \
-                sorted_token_ids.data_ptr<int>(),                                                                      \
-                sorted_expert_ids.data_ptr<int>(),                                                                     \
-                num_valid_ids.data_ptr<int>(),                                                                      \
-                num_experts,                                                                                              \
-                num_tokens,                                                                                              \
-                num_blocks,                                                                                              \
-                num_tg,                                                                                                  \
-                cols,                                                                                                  \
-                topk,                                                                                                  \
-                block_m,                                                                                               \
-                block_m_log2split,                                                                                   \
-                input_stride0,                                                                                   \
-                input_stride1,                                                                                   \
-                shuffle_scale,                                                                                         \
-                transpose_out);                                                                                  \
+#define MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V2_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE)  \
+    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_kernel", [&] {                            \
+        using input_dtype = typename t2ck<scalar_t>::type;                                                \
+        int warps_per_cu = 8 * BLOCK_SIZE / WARP_SIZE;                                                    \
+        int num_tg = persistent_mode? num_cu * warps_per_cu : num_blocks;                                 \
+        dim3 const grid(num_tg);                                                                          \
+        aiter::quant_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA>                                \
+            <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                                      \
+                reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                               \
+                scales.data_ptr<float>(),                                                                 \
+                reinterpret_cast<input_dtype*>(input.data_ptr()),                                         \
+                smooth_scale.data_ptr<float>(),                                                           \
+                sorted_token_ids.data_ptr<int>(),                                                         \
+                sorted_expert_ids.data_ptr<int>(),                                                        \
+                num_valid_ids.data_ptr<int>(),                                                            \
+                num_experts,                                                                              \
+                num_tokens,                                                                               \
+                num_blocks,                                                                               \
+                num_tg,                                                                                   \
+                cols,                                                                                     \
+                topk,                                                                                     \
+                block_m,                                                                                  \
+                block_m_log2split,                                                                        \
+                input_stride0,                                                                            \
+                input_stride1,                                                                            \
+                shuffle_scale,                                                                            \
+                transpose_out);                                                                           \
     });
 
 
@@ -1588,10 +1588,11 @@ void moe_smooth_per_token_scaled_quant_v2(
     int input_stride1= input.dim() == 2 ? 0 : input.stride(1);
 
     const int num_cu = get_num_cu_func();
-    int sub_block_m = 2;
-    int num_blocks = sorted_expert_ids.size(0) * (block_m / sub_block_m);
-    int block_split = block_m / sub_block_m;
+    int block_split = 16;
     int block_m_log2split = log2(block_split);
+    TORCH_CHECK(block_m % block_split == 0, __func__, " block_m is not divisible by block_split");
+    int sub_block_m = block_m >> block_m_log2split;
+    int num_blocks = sorted_expert_ids.size(0) * block_split;
     const bool persistent_mode = true;
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
