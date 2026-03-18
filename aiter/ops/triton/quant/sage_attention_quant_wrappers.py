@@ -15,8 +15,7 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     _compute_delta_s_kernel,
     perblock_quantize_q_kernel,
     perblock_quantize_kernel,
-    _rotate_mxfp_quantize_k_kernel,
-    perchannel_quantize_v_kernel
+    _rotate_mxfp_quantize_k_kernel
 )
 
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
@@ -43,7 +42,7 @@ def unified_perblock_quantize_int8(
     assert num_queries_per_kv is not None # and config is not None
     num_heads = hq // num_queries_per_kv
     Q_descale = torch.empty(
-        (total_num_blocks, num_heads), dtype=torch.uint8, device=q.device
+        (total_num_blocks, num_heads), dtype=torch.float32, device=q.device
     )
     BLOCK_Q = BLOCK_SIZE_M // num_queries_per_kv
     perblock_quantize_q_kernel[(
@@ -82,27 +81,25 @@ def perblock_quantize_int8(
     layout="bhsd",
     sm_scale=None,
 ):  
+    # TODO assume contiguous
     d = q.shape[-1]
     if layout=="thd":
         b = len(cu_seqlens)
         h = q.shape[1]
         s = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item() 
-        total_num_blocks = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * b * h
         stride_m = h * d
     elif layout=="bhsd":
         b,h,s,_ = q.shape
-        total_num_blocks = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * b * h
         stride_m = d
     elif layout=="bshd":
         b,s,h,d = q.shape
-        total_num_blocks = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * b * h
         stride_m = h * d
     else: # num_blocks,block_size,h,d = q.shape
         # cached layout can be thought of as
         b,s,h,d = q.shape
-        total_num_blocks = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M * b * h
         stride_m = h * d
 
+    total_num_blocks = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
     Q_q = torch.empty((*q.shape[:-1], d), dtype=torch.int8, device=q.device)
     DTYPE_MAX = torch.iinfo(torch.int8).max
 
@@ -111,10 +108,9 @@ def perblock_quantize_int8(
     # thd: cu_seqlens = cu_seqlens
     # cache: cu_seqlens = block_size, 2 block_size, 3 block_size,...
     Q_descale = torch.empty(
-        (total_num_blocks, h), dtype=torch.uint8, device=q.device
+        (total_num_blocks * b, h), dtype=torch.float32, device=q.device
     )
-    num_pid_m = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
-    grid = (b, num_pid_m, h)
+    grid = (b, total_num_blocks, h)
 
     perblock_quantize_kernel[grid](
         q, Q_q, Q_descale, s, cu_seqlens, stride_m, Q_descale.stride(0), Q_descale.stride(1), BLOCK_SIZE_M, d, sm_scale, DTYPE_MAX)
@@ -188,41 +184,16 @@ def perchannel_quantize_fp8(
     if v_descale is None:
         if layout_k=="bhsd":
             reduce_dims = (0,2)
-            stride_h = v.stride(1)
-            num_heads = v.shape[1]
         elif layout_k=="bshd":
             reduce_dims = (0,1)
-            stride_h = v.stride(2)
-            num_heads = v.shape[2]
         elif layout_k=="thd":
             reduce_dims = (0)
-            stride_h = v.stride(1)
-            num_heads = v.shape[1]
         else: # (num_blocks, block_size, h, d)
             reduce_dims = (0,1)
-            stride_h = v.stride(2)
-            num_heads = v.shape[2]    
-        v_descale = v.abs().amax(dim=reduce_dims).to(torch.float32) / FP8_MAX
-        stride_sh = v_descale.stride(0)
+        v_descale = v.abs().amax(dim=reduce_dims, keepdim=True).to(torch.float32) / FP8_MAX
     
-    num_tokens = v.shape.numel() // (d*num_heads)
-    stride_t = v.stride(-2)
-    
-    num_pid_v = (num_tokens + BLOCK_M - 1) // BLOCK_M
-    grid_v = (num_pid_v, num_heads)
-    perchannel_quantize_v_kernel[grid_v](
-        v,
-        v_q,
-        v_descale,
-        stride_t,
-        stride_h,
-        stride_sh,
-        num_tokens,
-        D=d,
-        BLOCK_M=BLOCK_M,
-        num_stages=3,
-        num_warps=8,
-    )
+    v_q = (v / v_descale).to(FP8_TYPE)
+    v_descale = v_descale.squeeze()
     return v_q, v_descale
 
 def sage_quant_v1(
@@ -270,7 +241,7 @@ def sage_quant_v1(
     k_q, k_descale = perblock_quantize_int8(
         k,
         BLOCK_N,
-        cu_seqlens_k,
+        cu_seqlens_k if not layout_k == "cache" else None,
         layout=layout_k,
         sm_scale=None,
     )

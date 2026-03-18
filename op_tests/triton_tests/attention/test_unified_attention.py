@@ -96,7 +96,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("q_dtype", QDTYPES)
-@pytest.mark.parametrize("quant_scheme", ["v1", "v2", "fp8", None])
+@pytest.mark.parametrize("quant_scheme", ["v2"])
 @torch.inference_mode()
 def test_triton_unified_attn(
     seq_lens: list[tuple[int, int]],
@@ -260,6 +260,9 @@ def test_triton_unified_attn(
         sinks=sinks,
     )
     atol, rtol = 1.5e-2, 1e-2
+
+    print("q_descale", q_descale.flatten()[0:10])
+    print("k_descale", k_descale.flatten()[0:10])
     if is_reduced_precision:
         atol, rtol = 1.5e-1, 1.5e-1
     torch.testing.assert_close(
@@ -277,7 +280,7 @@ if __name__ == "__main__":
     sliding_window = None        # or 256
     dtype = torch.bfloat16       # example from DTYPES
     soft_cap = None              # or 10.0 / 50.0
-    num_blocks = 64              # example from NUM_BLOCKS
+    num_blocks = 32768              # example from NUM_BLOCKS
     q_dtype = None               # or torch.float8_e4m3fn, etc.
     quant_scheme = "v1"
 

@@ -162,10 +162,8 @@ def get_sage_scale_strides(
     # q_descale either t,h_q,d//32 (SAGE_MXFP4) or total_num_blocks,h_k (SAGE)
     if sage_version == SAGE_VERSION.SAGE:
         tiles_per_block = triton.cdiv(BLOCK_SIZE, TILE_SIZE)
-        k_descale_2d = k_descale[:num_blks * tiles_per_block, :]
-        stride_k_cache_scale_1 = k_descale_2d.stride(0)
-        stride_k_cache_scale_0 = tiles_per_block * stride_k_cache_scale_1
-        stride_k_cache_scale_2 = k_descale_2d.stride(1)
+        k_descale_3d = k_descale.view(num_blks, tiles_per_block, -1)
+        stride_k_cache_scale_0, stride_k_cache_scale_1, stride_k_cache_scale_2 = k_descale_3d.stride(0)
         stride_k_cache_scale_3 = 0
 
         query_scale_stride_0, query_scale_stride_1 = q_descale.stride()
@@ -214,7 +212,7 @@ def check_quant_args_get_strides(
         - v_scale,  # [num_kv_heads, head_size] if sage or sage_mxfp4
     """
     if sage_version != None:
-        num_tokens, _, head_size_qk = q.shape
+        num_tokens, num_query_heads, head_size_qk = q.shape
         num_blks, blk_size, num_kv_heads, head_size_v = v.shape
 
         if sage_version == SAGE_VERSION.SAGE:
@@ -224,25 +222,24 @@ def check_quant_args_get_strides(
 
             assert k_descale.ndim == 2, f"expect k_descale to be 2D, got {k_descale.ndim}D with SAGE_VERSION={sage_version}"
             assert k_descale.shape[0] >= num_blks * math.ceil(BLOCK_SIZE / TILE_SIZE), (
-                f"expect k_descale dim 0 >= {num_blks * math.ceil(BLOCK_SIZE / TILE_SIZE)}, "
-                f"got {k_descale.shape[0]} with SAGE_VERSION={sage_version}"
+            f"expect k_descale dim 0 >= {num_blks * math.ceil(BLOCK_SIZE / TILE_SIZE)}, "
+            f"got {k_descale.shape[0]} with SAGE_VERSION={sage_version}"
             )
             assert v_descale.ndim == 2, f"expect v_descale to be 2D, got {v_descale.ndim}D with SAGE_VERSION={sage_version}"
             assert v_descale.shape[0] == num_kv_heads, f"expect v_descale dim 0 == {num_kv_heads}, got {v_descale.shape[0]} with SAGE_VERSION={sage_version}"
         elif sage_version == SAGE_VERSION.SAGE_MXFP4:
             head_size_qk *= 2
-            expected_q_descale_shape = (num_tokens, num_kv_heads, head_size_qk // 32)
-            assert q_descale.shape == expected_q_descale_shape, f"expect q_descale to have shape {expected_q_descale_shape} with SAGE_VERSION={sage_version}"
+            expected_q_descale_shape = (num_tokens, num_query_heads, head_size_qk // 32)
+            assert q_descale.shape == expected_q_descale_shape, f"expect q_descale to have shape {expected_q_descale_shape}, got {q_descale.shape} with SAGE_VERSION={sage_version}"
             expected_k_descale_shape = (
-                num_blks,
-                blk_size,
-                num_kv_heads,
-                head_size_qk // 32,
+            num_blks,
+            blk_size,
+            num_kv_heads,
+            head_size_qk // 32,
             )
-            assert k_descale.shape == expected_k_descale_shape, f"expect k_descale to have shape {expected_k_descale_shape} with SAGE_VERSION={sage_version}"
+            assert k_descale.shape == expected_k_descale_shape, f"expect k_descale to have shape {expected_k_descale_shape}, got {k_descale.shape} with SAGE_VERSION={sage_version}"
             expected_v_descale_shape = (num_kv_heads, head_size_v)
-            assert v_descale.shape == expected_v_descale_shape, f"expect v_descale to have shape {expected_v_descale_shape} with SAGE_VERSION={sage_version}"
-           
+            assert v_descale.shape == expected_v_descale_shape, f"expect v_descale to have shape {expected_v_descale_shape}, got {v_descale.shape} with SAGE_VERSION={sage_version}"
 
         return get_sage_scale_strides(
             q_descale,

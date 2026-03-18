@@ -291,7 +291,6 @@ def run_benchmark(custom, args):
                     cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_q,
                     config=config
                 )
-                
             else:
                 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v2
                 maybe_quantized_query, q_descale, maybe_quantized_key_cache, k_descale, maybe_quantized_value_cache, v_descale = sage_quant_v2(
@@ -369,6 +368,8 @@ def run_benchmark(custom, args):
                 atol, rtol = 1.5e-1, 1.5e-1
             else:
                 atol, rtol = 1.5e-2, 1e-2
+            print("output", output.flatten()[0:50])
+            print("ref_output", ref_output.flatten()[0:50])
             max_err = torch.max(torch.abs(output - ref_output)).item()
             tag = "fp8_full" if args.fp8_full else \
                     "fp8" if args.fp8 else \

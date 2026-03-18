@@ -86,7 +86,9 @@ def k_scale_process(
         K_Descale,
         physical_block_idx,
         seq_offset,
+        tile_idx,
         BLOCK_SIZE,
+        TILE_SIZE,
         kv_head_idx,
         offs_d_scale,
         tile_mask,
@@ -100,7 +102,7 @@ def k_scale_process(
         k_descale_ptr = (
             K_Descale
             + physical_block_idx * stride_k_cache_scale_0
-            + seq_offset % BLOCK_SIZE * stride_k_cache_scale_1
+            + tile_idx % tl.cdiv(BLOCK_SIZE, TILE_SIZE) * stride_k_cache_scale_1
             + kv_head_idx * stride_k_cache_scale_2
         )
         return tl.load(k_descale_ptr)
@@ -435,7 +437,9 @@ def kernel_unified_attention_2d(
                 k_scale,
                 physical_block_idx,
                 seq_offset,
+                j,
                 BLOCK_SIZE,
+                TILE_SIZE,
                 kv_head_idx,
                 offs_d_scale,
                 tile_mask[:, None], # For mxfp4 scale load only
@@ -834,7 +838,9 @@ def kernel_unified_attention_3d(
                 k_scale,
                 physical_block_idx,
                 seq_offset,
+                j,
                 BLOCK_SIZE,
+                TILE_SIZE,
                 kv_head_idx,
                 offs_d_scale,
                 tile_mask[:, None], # For mxfp4 scale load only

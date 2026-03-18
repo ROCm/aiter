@@ -115,8 +115,8 @@ def perblock_quantize_kernel(
     pid_h = tl.program_id(2)
     
     if query_start_len_ptr is not None:
-        cur_batch_in_all_start_index = tl.load(query_start_len_ptr + pid_b)
-        cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + pid_b + 1)
+        cur_batch_in_all_start_index = tl.load(query_start_len_ptr + pid_b).to(tl.int64)
+        cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + pid_b + 1).to(tl.int64)
         seqlen = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
     else:
         seqlen = max_seqlen
@@ -153,7 +153,6 @@ def perblock_quantize_kernel(
     tl.store(
         qtile_ptrs, Q_quant,
         mask=mask)
-
 
 
 @triton.jit
@@ -241,46 +240,41 @@ def _rotate_mxfp_quantize_k_kernel(
 
 
 
-@triton.jit
-def perchannel_quantize_v_kernel(
-    V_Input,
-    V_Output,
-    V_Descale,
-    stride_t,
-    stride_h,
-    stride_sh,
-    num_tokens,
-    D: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-):
-    pid = tl.program_id(0).to(tl.int64)
-    pid_h = tl.program_id(1).to(tl.int64)
+# @triton.jit
+# def perchannel_quantize_v_kernel(
+#     V_Input,
+#     V_Output,
+#     V_Descale,
+#     stride_t,
+#     stride_h,
+#     stride_sh,
+#     num_tokens,
+#     D: tl.constexpr,
+#     BLOCK_M: tl.constexpr,
+# ):
+#     pid = tl.program_id(0).to(tl.int64)
+#     pid_h = tl.program_id(1).to(tl.int64)
 
-    offs_token = pid * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
-    mask = offs_token < num_tokens
-    offs_d = tl.arange(0, D)
+#     offs_token = pid * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+#     mask = offs_token < num_tokens
+#     offs_d = tl.arange(0, D)
 
-    v_offs = (
-        offs_token * stride_t
-        + pid_h * stride_h
-        + offs_d[None, :]
-    )
+#     v_offs = (
+#         offs_token * stride_t
+#         + pid_h * stride_h
+#         + offs_d[None, :]
+#     )
 
-    v_input_ptrs = V_Input + v_offs
-    v_output_ptrs = V_Output + v_offs
+#     v_input_ptrs = V_Input + v_offs
+#     v_output_ptrs = V_Output + v_offs
 
-    # just apply the per channel v_scales that have been computed outside
-    v_descale_ptrs = V_Descale + pid_h * stride_sh + offs_d
-    v = tl.load(v_input_ptrs, mask=mask, other=0.0)
-    v_descales = tl.load(v_descale_ptrs)
-    v_quant = v / v_descales
-    v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
-    tl.store(v_output_ptrs, v_quant, mask=mask)
-
-
-
-
-
+#     # just apply the per channel v_scales that have been computed outside
+#     v_descale_ptrs = V_Descale + pid_h * stride_sh + offs_d
+#     v = tl.load(v_input_ptrs, mask=mask, other=0.0)
+#     v_descales = tl.load(v_descale_ptrs)
+#     v_quant = v / v_descales
+#     v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
+#     tl.store(v_output_ptrs, v_quant, mask=mask)
 
 
 
