@@ -1,89 +1,64 @@
 # MHA 算子支持说明
 
-## 源文件
+基于 [flash-attention](https://github.com/Dao-AILab/flash-attention) 风格实现的 Triton MHA 算子，针对 AMD CDNA GPU 优化。
 
-| 文件 | 说明 |
+## 实现文件
+
+| 文件 | 功能 |
 |------|------|
-| `aiter/ops/triton/attention/mha.py` | 主实现：标准/变长 attention，支持 dropout、ALiBi、sink、PE |
-| `aiter/ops/triton/attention/mha_v3.py` | V3 实现：FP8 高精度 API、KV cache decode、rotary embedding |
-
----
+| [`mha.py`](../aiter/ops/triton/attention/mha.py) | 标准/变长 attention，支持 dropout、ALiBi、sink、PE |
+| [`mha_v3.py`](../aiter/ops/triton/attention/mha_v3.py) | FP8 高精度 API、KV cache decode、rotary embedding |
 
 ## 公开 API
 
-### `mha.py`
+| 函数 | 来源 | 输入格式 | 输出格式 |
+|------|------|---------|---------|
+| `flash_attn_func` | mha / mha_v3 | q/k/v: `[B, S, H, D]` | `[B, S, H, D]` |
+| `flash_attn_varlen_func` | mha / mha_v3 | q: `[total_q, H, D]`，k/v: `[total_k, Hk, D]` | `[total_q, H, D]` |
+| `flash_attn_fp8_func` | mha_v3 | q/k/v: `[B, S, H, D]`（FP16/BF16/FP32，内部自动量化至 FP8） | `[B, S, H, D]`（FP32） |
+| `flash_attn_varlen_fp8_func` | mha_v3 | q: `[total_q, H, D]`，k/v: `[total_k, Hk, D]`（FP16/BF16/FP32） | `[total_q, H, D]`（FP32） |
+| `flash_attn_with_kvcache` | mha_v3 | q + k_cache/v_cache，支持 rotary、paged KV | `[B, S, H, D]` |
 
-| 函数 | 输入 tensor 格式 | 输出格式 |
-|------|-----------------|---------|
-| `flash_attn_func` | q/k/v: `[B, S, H, D]` | `[B, S, H, D]` |
-| `flash_attn_varlen_func` | q: `[total_q, H, D]`，k/v: `[total_k, Hk, D]` | `[total_q, H, D]` |
-
-### `mha_v3.py`
-
-| 函数 | 输入 tensor 格式 | 输出格式 |
-|------|-----------------|---------|
-| `flash_attn_func` | q/k/v: `[B, S, H, D]` | `[B, S, H, D]` |
-| `flash_attn_varlen_func` | q: `[total_q, H, D]`，k/v: `[total_k, Hk, D]` | `[total_q, H, D]` |
-| `flash_attn_fp8_func` | q/k/v: `[B, S, H, D]`（FP16/BF16/FP32 输入，内部自动量化） | `[B, S, H, D]`（FP32） |
-| `flash_attn_varlen_fp8_func` | q: `[total_q, H, D]`，k/v: `[total_k, Hk, D]`（FP16/BF16/FP32） | `[total_q, H, D]`（FP32） |
-| `flash_attn_with_kvcache` | q + k_cache/v_cache，支持 rotary | `[B, S, H, D]` |
-
----
+> tensor 维度含义：B=batch，S=seqlen，H=num_heads，D=head_dim。GQA/MQA 时 k/v 的 H 记为 Hk（需满足 H % Hk == 0），参考 [GQA 论文](https://arxiv.org/abs/2305.13245)。
 
 ## 支持的 dtype
 
-### mha.py（直接传入原始 tensor）
+| dtype | mha.py | mha_v3.py | 备注 |
+|-------|:------:|:---------:|------|
+| `float16` | ✅ | ✅ | mha.py 默认，BLOCK_M=128/BLOCK_N=64 |
+| `bfloat16` | ✅ | ✅ | |
+| `float32` | ✅ | ✅ | mha.py 自动降为 BLOCK_M=32/BLOCK_N=32 |
+| `float8_e4m3fnuz` | ✅ | ✅（内部） | 仅 [gfx942](https://rocm.docs.amd.com/en/latest/reference/gpu-arch-specs.html)（MI300X） |
+| `float8_e4m3fn` | ✅ | ✅（内部） | 仅 gfx950（MI350X） |
+| `float8_e5m2fnuz` / `e5m2` | ✅ | — | 需直接传入 FP8 tensor（mha.py raw 模式） |
 
-| dtype | 支持 | 备注 |
-|-------|------|------|
-| `torch.float16` | ✅ | 默认，BLOCK_M=128/BLOCK_N=64 |
-| `torch.bfloat16` | ✅ | |
-| `torch.float32` | ✅ | 自动降为 BLOCK_M=32/BLOCK_N=32 |
-| `torch.float8_e4m3fnuz` | ✅ | 仅 gfx942，需直接传 FP8 tensor |
-| `torch.float8_e4m3fn` | ✅ | 仅 gfx950 |
-| `torch.float8_e5m2fnuz` | ✅ | 仅 gfx942 |
-| `torch.float8_e5m2` | ✅ | 仅 gfx950 |
+> FP8 格式说明参考 [PyTorch FP8 docs](https://pytorch.org/docs/stable/torch.html#torch.float8_e4m3fn)。mha_v3 的 FP8 API 接受高精度输入并在内部自动完成量化/反量化。
 
-### mha_v3.py FP8 高精度 API（`flash_attn_fp8_func` / `flash_attn_varlen_fp8_func`）
+## GPU 架构与 FP8 支持
 
-| 输入 dtype | 内部计算 dtype | 输出 dtype |
-|-----------|-------------|----------|
-| `float16` / `bfloat16` / `float32` | `float8_e4m3fnuz`（gfx942）或 `float8_e4m3fn`（gfx950） | `float32` |
+| 架构 | gfx | FP8 | FP16/BF16 |
+|------|-----|:---:|:---------:|
+| MI300X (CDNA3) | gfx942 | ✅ | ✅ |
+| MI350X (CDNA4) | gfx950 | ✅ | ✅ |
+| 其他 ROCm 架构 | — | ❌ | ✅ |
 
----
+ROCm GPU 规格详见 [GPU hardware specifications](https://rocm.docs.amd.com/en/latest/reference/gpu-arch-specs.html)。
 
-## GPU 架构支持
+**gfx942 已知限制：**
 
-| 架构 | FP8 可用 | FP8 dtype | 备注 |
-|------|---------|-----------|------|
-| **gfx942**（MI300X） | ✅ | `e4m3fnuz` / `e5m2fnuz` | kernel 已为该架构调优；部分已知问题见下方 |
-| **gfx950**（MI350X） | ✅ | `e4m3fn` / `e5m2` | |
-| 其他 ROCm 架构 | ❌ | — | FP16/BF16 可用，FP8 不可用 |
-
-### gfx942 已知限制
-
-| 场景 | 状态 |
-|------|------|
-| Positional Encoding + Causal | ⛔ skip（暂不支持） |
-| Positional Encoding + Dropout | ⛔ skip（暂不支持） |
-| 反向传播，非 fused，HEAD_SZ=128，DROPOUT=0.2，短序列 | ⛔ skip（ROCm 7.1+ 回归，ROCm 7.0 正常） |
-| Sink + 反向，大 batch（>1）且长序列（≥1024） | ⚠️ 放宽精度容忍度 |
-
----
+- Positional Encoding + Causal 或 Dropout：⛔ 暂不支持
+- 反向传播（非 fused，HEAD_SZ=128，DROPOUT=0.2，短序列）：⛔ ROCm 7.1+ 回归（ROCm 7.0 正常）
+- Sink 反向，batch > 1 且 seqlen ≥ 1024：⚠️ 精度容忍度放宽
 
 ## Shape 约束
 
-| 参数 | 约束 | 测试范围 |
-|------|------|---------|
-| `batch_size` (B) | 任意正整数 | 1, 3, 4, 57, 128 |
-| `seqlen_q` | 任意正整数 | 1~4096 |
-| `seqlen_k` | 任意正整数 | 1~4096 |
-| `num_q_heads` (H) | 必须整除 `num_kv_heads`（GQA/MQA） | 1, 2, 4, 8, 16, 48, 64, 128 |
-| `num_kv_heads` (Hk) | ≤ H，H 可被 Hk 整除 | 1, 4, 8, 16 |
-| `head_dim` (D) | ≥ 8，内部向上对齐到 2 的幂（min 16） | 8, 32, 64, 96, 128, 192 |
-| PE 模式 head_dim | NOPE 和 PE 部分均须为 2 的幂（无需 padding） | (128,64), (192,128), (96,64) |
-
----
+| 参数 | 约束 |
+|------|------|
+| `batch_size` (B) | 任意正整数 |
+| `seqlen_q / seqlen_k` | 任意正整数，测试覆盖 1~4096 |
+| `num_q_heads` (H) | H % Hk == 0（[GQA/MQA](https://arxiv.org/abs/2305.13245)） |
+| `head_dim` (D) | ≥ 8，内部对齐至 2 的幂（min 16） |
+| PE 模式 `head_dim` | NOPE 和 PE 部分均须为 2 的幂，如 (128,64)、(192,128) |
 
 ## 功能矩阵
 
@@ -91,32 +66,25 @@
 |------|:------:|:---------:|
 | Causal masking | ✅ | ✅ |
 | GQA / MQA | ✅ | ✅ |
-| Dropout | ✅ | ❌ |
-| Return LSE | ✅ | ❌ |
-| Return attn probs (softmax mask) | ✅ | ❌ |
-| ALiBi slopes | ✅ | ❌ |
-| Attention sink | ✅ | ❌（反向不支持） |
-| 位置编码分离（NOPE + PE head） | ✅ | ❌ |
-| FP8 自动量化 API | ❌ | ✅ |
-| FP8 原始 tensor 输入 | ✅ | ✅（通过 descale 参数） |
+| FP8（自动量化） | ❌ | ✅ |
+| FP8（raw tensor） | ✅ | ✅（descale 参数） |
 | KV cache decode | ❌ | ✅ |
-| Paged attention（block_table） | ✅ | ✅ |
-| Rotary embedding | ❌ | ✅（仅 kvcache 路径） |
-| 反向传播（标准） | ✅ | ✅ |
-| 反向传播（fused kernel） | ✅ | — |
-| Sliding window | ❌（已预留但未实现） | ❌ |
-| Softcap | ❌ | ❌ |
-| num_splits > 1 | ❌ | ❌ |
-| pack_gqa | ❌ | ❌ |
-| sm_margin != 0 | ❌ | ❌ |
+| Paged attention | ✅ | ✅ |
+| Rotary embedding | ❌ | ✅（kvcache 路径） |
+| Dropout | ✅ | ❌ |
+| ALiBi slopes | ✅ | ❌ |
+| Attention sink | ✅ | ❌ |
+| 位置编码分离（NOPE+PE） | ✅ | ❌ |
+| Return LSE / attn probs | ✅ | ❌ |
+| 反向传播 | ✅（标准 + fused） | ✅（标准） |
+| Sliding window | ❌ | ❌ |
+| Softcap / num_splits / pack_gqa | ❌ | ❌ |
 
----
-
-## 精度容忍度（测试基准）
+## 精度容忍度
 
 | 模式 | atol | rtol |
 |------|------|------|
 | FP16/BF16 前向 | 1e-2 | 1e-2 |
 | FP16 varlen 前向 | 1e-1 | 1e-1 |
-| FP8 前向 | 0.30 | 0.25 |
+| [FP8](https://pytorch.org/docs/stable/torch.html#torch.float8_e4m3fn) 前向 | 0.30 | 0.25 |
 | FP16/BF16 反向 | 1e-2 | 1e-2 |
