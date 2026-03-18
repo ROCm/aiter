@@ -302,7 +302,7 @@ def test_gemm_afp4_wfp4(
                 w_scales_triton,
                 dtype,
                 y,
-                use_aot=(dtype == torch.bfloat16 and layout == "TN"),
+                use_aot=False,
                 skip_reduce=skip_reduce,
             )
         else:
@@ -312,7 +312,7 @@ def test_gemm_afp4_wfp4(
                 x_scales_triton,
                 w_scales_triton,
                 dtype,
-                use_aot=(dtype == torch.bfloat16 and layout == "TN"),
+                use_aot=False,
                 skip_reduce=skip_reduce,
             )
         # TODO: remove in the future

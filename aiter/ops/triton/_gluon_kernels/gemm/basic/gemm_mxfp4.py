@@ -224,12 +224,19 @@ def gemm_mxfp4_preshuffle_gfx1250(
         [NUM_BUFFERS, BLOCK_N // 16, BLOCK_K_BYTES * 16],
         layout=shared_B,
     )
-    # scales: raw shuffled blocks into LDS via TDM; in compute: unshuffle -> load with layout
-    smem_ASraw = gl.allocate_shared_memory(
-        a_scale_ptr.type.element_ty,
-        [NUM_BUFFERS, BLOCK_M // 32, K_GROUPS * 32],
-        layout=shared_S,
-    )
+    # A scales: M>=32 uses preshuffled (M//32, K) layout; M<32 uses (M, K//32) per row
+    if BLOCK_M < 32:
+        smem_ASraw = gl.allocate_shared_memory(
+            a_scale_ptr.type.element_ty,
+            [NUM_BUFFERS, BLOCK_M, K_GROUPS],
+            layout=shared_S,
+        )
+    else:
+        smem_ASraw = gl.allocate_shared_memory(
+            a_scale_ptr.type.element_ty,
+            [NUM_BUFFERS, BLOCK_M // 32, K_GROUPS * 32],
+            layout=shared_S,
+        )
     smem_BSraw = gl.allocate_shared_memory(
         b_scale_ptr.type.element_ty,
         [NUM_BUFFERS, BLOCK_N // 32, K_GROUPS * 32],
@@ -256,14 +263,24 @@ def gemm_mxfp4_preshuffle_gfx1250(
 
     grid_m32 = gl.cdiv(M, 32)
     grid_n32 = gl.cdiv(N, 32)
+    k_scale_cols = K_elems // SCALE_GROUP_ELEMS
 
-    as_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=a_scale_ptr,
-        shape=(grid_m32, K_elems),
-        strides=(stride_as_m, stride_as_k),
-        block_shape=(BLOCK_M // 32, K_GROUPS * 32),
-        layout=shared_S,
-    )
+    if BLOCK_M < 32:
+        as_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=a_scale_ptr,
+            shape=(M, k_scale_cols),
+            strides=(stride_as_m, stride_as_k),
+            block_shape=(BLOCK_M, K_GROUPS),
+            layout=shared_S,
+        )
+    else:
+        as_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=a_scale_ptr,
+            shape=(grid_m32, K_elems),
+            strides=(stride_as_m, stride_as_k),
+            block_shape=(BLOCK_M // 32, K_GROUPS * 32),
+            layout=shared_S,
+        )
     bs_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=b_scale_ptr,
         shape=(grid_n32, K_elems),
@@ -290,7 +307,10 @@ def gemm_mxfp4_preshuffle_gfx1250(
 
             # Scale offsets are in groups-domain -> element-domain (groups*32)
             g0 = split_k0_groups + k_tile_p * K_GROUPS
-            as_offs = [tile_m * (BLOCK_M // 32), g0 * 32]
+            if BLOCK_M < 32:
+                as_offs = [tile_m * BLOCK_M, g0]
+            else:
+                as_offs = [tile_m * (BLOCK_M // 32), g0 * 32]
             bs_offs = [tile_n * (BLOCK_N // 32), g0 * 32]
 
             gl.amd.gfx1250.tdm.async_load(a_desc, a_offs, smem_A.index(slot_p), pred=1)
@@ -317,7 +337,10 @@ def gemm_mxfp4_preshuffle_gfx1250(
             (split_k0_bytes + k_tile_p * BLOCK_K_BYTES) * 16,
         ]
         g0 = split_k0_groups + k_tile_p * K_GROUPS
-        as_offs = [tile_m * (BLOCK_M // 32), g0 * 32]
+        if BLOCK_M < 32:
+            as_offs = [tile_m * BLOCK_M, g0]
+        else:
+            as_offs = [tile_m * (BLOCK_M // 32), g0 * 32]
         bs_offs = [tile_n * (BLOCK_N // 32), g0 * 32]
 
         gl.amd.gfx1250.tdm.async_load(a_desc, a_offs, smem_A.index(slot_p), pred=1)
@@ -342,10 +365,12 @@ def gemm_mxfp4_preshuffle_gfx1250(
             ),
             layout=dot_b_layout,
         )
-        # scales: unshuffle -> load with wmma scale layouts
-        AS = unshuffle_scales_32(
-            smem_ASraw.index(slot_c), BLOCK_X=BLOCK_M, K_GROUPS=K_GROUPS
-        ).load(layout=a_scale_layout)
+        if BLOCK_M < 32:
+            AS = smem_ASraw.index(slot_c).load(layout=a_scale_layout)
+        else:
+            AS = unshuffle_scales_32(
+                smem_ASraw.index(slot_c), BLOCK_X=BLOCK_M, K_GROUPS=K_GROUPS
+            ).load(layout=a_scale_layout)
         BS = unshuffle_scales_32(
             smem_BSraw.index(slot_c), BLOCK_X=BLOCK_N, K_GROUPS=K_GROUPS
         ).load(layout=b_scale_layout)
@@ -372,9 +397,12 @@ def gemm_mxfp4_preshuffle_gfx1250(
                 layout=dot_b_layout,
             )
 
-            AS = unshuffle_scales_32(
-                smem_ASraw.index(slot_c), BLOCK_X=BLOCK_M, K_GROUPS=K_GROUPS
-            ).load(layout=a_scale_layout)
+            if BLOCK_M < 32:
+                AS = smem_ASraw.index(slot_c).load(layout=a_scale_layout)
+            else:
+                AS = unshuffle_scales_32(
+                    smem_ASraw.index(slot_c), BLOCK_X=BLOCK_M, K_GROUPS=K_GROUPS
+                ).load(layout=a_scale_layout)
             BS = unshuffle_scales_32(
                 smem_BSraw.index(slot_c), BLOCK_X=BLOCK_N, K_GROUPS=K_GROUPS
             ).load(layout=b_scale_layout)
