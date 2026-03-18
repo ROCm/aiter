@@ -98,16 +98,15 @@ def test_silu_and_mul(m, n, dtype, output_dtype=None):
     ret["err"] = err
     return ret
 
+
 @benchmark()
 def test_gelu_tanh_and_mul(m, n, dtype):
     ret = {}
     input = torch.randn(m, n, dtype=dtype, device="cuda")
     out = torch.empty((m, n // 2), dtype=dtype, device="cuda")
     ref = torch_gelu_tanh_and_mul(input)
-    _, us_aiter = run_perftest(
-        aiter.gelu_tanh_and_mul,
-        out, input)
-    
+    _, us_aiter = run_perftest(aiter.gelu_tanh_and_mul, out, input)
+
     # Check if the results are close
     err = checkAllclose(ref, out)
     ret["us"] = us_aiter
@@ -115,15 +114,20 @@ def test_gelu_tanh_and_mul(m, n, dtype):
     ret["err"] = err
     return ret
 
+
 from transformers.activations import ACT2FN
+
+
 def torch_gelu_ref(x: torch.Tensor) -> torch.Tensor:
     out = ACT2FN["gelu_pytorch_tanh"](x)
     return out
+
 
 def gelu_fast_wrapper(input: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(input)
     aiter.gelu_fast(out, input)
     return out
+
 
 @benchmark()
 def test_gelu_fast(m, n, dtype, output_dtype=None):
@@ -131,12 +135,8 @@ def test_gelu_fast(m, n, dtype, output_dtype=None):
     input = torch.randn(m, 1, n, dtype=dtype, device="cuda")
     out_dtype = output_dtype if output_dtype is not None else dtype
 
-    out, us_aiter = run_perftest(
-        gelu_fast_wrapper,
-        input)
-    ref, us_torch = run_perftest(
-        torch_gelu_ref,
-        input)
+    out, us_aiter = run_perftest(gelu_fast_wrapper, input)
+    ref, us_torch = run_perftest(torch_gelu_ref, input)
 
     if output_dtype is not None:
         ref = ref.to(output_dtype)
@@ -160,6 +160,7 @@ def test_gelu_fast(m, n, dtype, output_dtype=None):
     ret["WR TB/s"] = (out.nbytes) / us_aiter / 1e6
     ret["err"] = err
     return ret
+
 
 @benchmark()
 def test_scaled_silu_and_mul_mixed_dtype(m, n, input_dtype, output_dtype):
@@ -277,8 +278,20 @@ for dtype in args.dtype:
             df.append(ret)
 df = pd.DataFrame(df)
 df = df[
-    ["M", "N", "input_dtype", "output_dtype", "us", "torch_us", "speedup_vs_torch", "perf_gain_vs_torch_pct", "TB/s", "RD TB/s", "WR TB/s", "err"]
+    [
+        "M",
+        "N",
+        "input_dtype",
+        "output_dtype",
+        "us",
+        "torch_us",
+        "speedup_vs_torch",
+        "perf_gain_vs_torch_pct",
+        "TB/s",
+        "RD TB/s",
+        "WR TB/s",
+        "err",
+    ]
 ]
 df_md = df.to_markdown(index=False)
 aiter.logger.info("gelu_fast summary (markdown):\n%s", df_md)
-
