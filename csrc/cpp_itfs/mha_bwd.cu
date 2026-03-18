@@ -168,6 +168,8 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         /* dv_ptr             */ a.dv_ptr,
         /* dbias_ptr          */ a.dbias_ptr,
         /* dq_acc_ptr         */ a.dq_acc_ptr,
+        /* sink_ptr           */ a.sink_ptr,
+        /* d_sink_ptr         */ a.d_sink_ptr,
 
         /* seqstart_q_ptr     */ a.seqstart_q_ptr,
         /* seqstart_k_ptr     */ a.seqstart_k_ptr,

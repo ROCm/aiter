@@ -36,8 +36,9 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                std::optional<const at::Tensor> rng_state_,
                std::optional<at::Generator> gen_,
                std::optional<const at::Tensor> cu_seqlens_q_padded, // [b+1]
-               std::optional<const at::Tensor> cu_seqlens_k_padded // [b+1]
-               )
+               std::optional<const at::Tensor> cu_seqlens_k_padded, // [b+1]
+               std::optional<const at::Tensor> sink_,               // [b, hq] log-space sink scores (float)
+               std::optional<at::Tensor> d_sink_)                   // [hq] sink gradient output (float)
 {
     if (is_causal) { window_size_right = 0; }
 
@@ -341,6 +342,8 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                                 dv_expanded.data_ptr(),
                                 nullptr, // dbias
                                 dq_accum.data_ptr(), // dq_acc
+                                (sink_.has_value()   && sink_.value().defined())   ? sink_.value().data_ptr()   : nullptr, // sink_ptr [b, hq]
+                                (d_sink_.has_value() && d_sink_.value().defined()) ? d_sink_.value().data_ptr() : nullptr, // d_sink_ptr [hq]
                                 seqstart_q_ptr, // seqstart_q_ptr (physical cumulative)
                                 seqstart_k_ptr, // seqstart_k_ptr (physical cumulative)
                                 nullptr, // seqlen_q_ptr (per-sequence logical)

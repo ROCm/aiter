@@ -24,6 +24,8 @@ std::vector<at::Tensor> mha_bwd(const at::Tensor& dout, // [b, sq, hq, d]
                                 std::optional<const at::Tensor> bias_,        // [sq, sk]
                                 std::optional<const at::Tensor> alibi_slopes, // [hq] or [b, hq]
                                 std::optional<const at::Tensor> rng_state,
-                                std::optional<at::Generator> gen);
+                                std::optional<at::Generator> gen,
+                                std::optional<const at::Tensor> sink,  // [b, hq] log-space sink scores (float)
+                                std::optional<at::Tensor> d_sink);     // [hq] sink gradient output (float)
 } // namespace torch_itfs
 } // namespace aiter

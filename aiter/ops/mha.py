@@ -624,7 +624,8 @@ def cmdGenFunc_mha_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-    sink_ptr: Optional[Tensor] = None,
+    sink: Optional[Tensor] = None,
+    d_sink: Optional[Tensor] = None,
 ):
     md_name = "mha_bwd"
     filter1 = "*"  # get_bwd_dot_do_o_blobs()
@@ -775,7 +776,8 @@ def gen_mha_bwd_fake_tensors(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-    sink_ptr: Optional[Tensor] = None,
+    sink: Optional[Tensor] = None,
+    d_sink: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     return common_mha_bwd_fake_tensors(q, k, v, dq, dk, dv)
 
@@ -807,7 +809,8 @@ def mha_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-    sink_ptr: Optional[Tensor] = None,
+    sink: Optional[Tensor] = None,
+    d_sink: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
@@ -889,7 +892,8 @@ def cmdGenFunc_mha_varlen_bwd(
     gen: Optional[Generator] = None,
     cu_seqlens_q_padded: Optional[Tensor] = None,
     cu_seqlens_k_padded: Optional[Tensor] = None,
-    sink_ptr: Optional[Tensor] = None,
+    sink: Optional[Tensor] = None,
+    d_sink: Optional[Tensor] = None,
 ) -> dict[str, Any]:
     md_name = "mha_varlen_bwd"
     filter1 = "*"  # get_bwd_dot_do_o_blobs()
@@ -1117,7 +1121,8 @@ def gen_mha_varlen_bwd_fake_tensors(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-    sink_ptr: Optional[Tensor] = None,
+    sink: Optional[Tensor] = None,
+    d_sink: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     return gen_mha_varlen_bwd_fake_tensors_common(
         q, k, v, cu_seqlens_q, max_seqlen_q, zero_tensors, dq, dk, dv
@@ -1157,7 +1162,8 @@ def mha_varlen_bwd(
     gen: Optional[Generator] = None,
     cu_seqlens_q_padded: Optional[Tensor] = None,
     cu_seqlens_k_padded: Optional[Tensor] = None,
-    sink_ptr: Optional[Tensor] = None,
+    sink: Optional[Tensor] = None,
+    d_sink: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
