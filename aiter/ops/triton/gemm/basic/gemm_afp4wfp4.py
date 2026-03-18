@@ -442,11 +442,11 @@ def gemm_afp4wfp4_preshuffle(
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
     use_gluon = arch_info.get_arch() == "gfx1250"
 
-    M, K_bytes = x_fp4.shape
-    n16, _ = w_preshuf.shape
-    N = n16 * 16
-    K_elems = K_bytes * 2
-    K = K_bytes // 16
+    M, K = x_fp4.shape
+    N, K = w_preshuf.shape
+    N = N * 16
+    K_elems = K * 2
+    K = K // 16
 
     if config is None:
         config, _ = _get_config(M, N, K, True)
@@ -471,15 +471,15 @@ def gemm_afp4wfp4_preshuffle(
                 (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=x_fp4.device
             )
     else:
-        config["SPLITK_BLOCK_SIZE"] = K_elems
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
 
     if y is None and not return_y_pp:
         y = torch.empty((M, N), dtype=dtype, device=x_fp4.device)
 
-    if config["BLOCK_SIZE_K"] >= K_elems:
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(K_elems)
-        config["SPLITK_BLOCK_SIZE"] = K_elems
+    if config["BLOCK_SIZE_K"] >= 2 * K:
+        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
 
     config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
     if M < 32:
@@ -503,7 +503,7 @@ def gemm_afp4wfp4_preshuffle(
     if M < 32 and M_POW2 > 16:
         M_POW2 = 16
     
-    if use_gluon == False:
+    if use_gluon:
         layouts = get_gemm_afp4wfp4_preshuffle_layouts(config["num_warps"], config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"])
 
         grid = (config["NUM_KSPLIT"] * triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
@@ -540,7 +540,7 @@ def gemm_afp4wfp4_preshuffle(
         )
         return y
 
-    metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/gemm/aot/{_triton_gemm_afp4wfp4_preshuffle_kernel.fn.__name__}_M={M_POW2}-N={N}-K={K_elems}"
+    metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/gemm/aot/{_triton_gemm_afp4wfp4_preshuffle_kernel.fn.__name__}_M={M_POW2}-N={N}-K={2 * K}"
     if use_aot and os.path.exists(metadata_pth):
         with AOTMetadataContext(
             _triton_gemm_afp4wfp4_preshuffle_kernel.fn.__name__,
@@ -577,7 +577,7 @@ def gemm_afp4wfp4_preshuffle(
             w_scales,
             M,
             N,
-            K_elems,
+            K,
             x_fp4.stride(0),
             x_fp4.stride(1),
             w_preshuf.stride(0),
@@ -600,7 +600,7 @@ def gemm_afp4wfp4_preshuffle(
         # NOTE: REDUCE_BLOCK_SIZE_N=16 gives best perf with fp32 partials and
         # REDUCE_BLOCK_SIZE_N=128 gives best perf with bf16 partials
         REDUCE_BLOCK_SIZE_N = 128 if _USE_GEMM_SPLITK_BF16 else 64
-        ACTUAL_KSPLIT = triton.cdiv(K_elems, (config["SPLITK_BLOCK_SIZE"] // 2))
+        ACTUAL_KSPLIT = triton.cdiv(K, (config["SPLITK_BLOCK_SIZE"] // 2))
 
         grid_reduce = (
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
