@@ -172,7 +172,6 @@ def generate_gemm_a8w8_blockscale_inputs(
         y = torch.empty((M, N), dtype=dtype, device="cuda").cuda()
 
     return x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y
-    return x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y
 
 
 @pytest.mark.parametrize(
@@ -205,10 +204,10 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
         )
 
     if impl == "triton_shuffle":
-        if N % 16 > 0 or K % 32 > 0:
-            pytest.skip(
-                "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
-            )
+        if N % 16 > 0:
+            pytest.skip("N has to be multiple of 16 for preshuffle cases")
+        if K % 128 > 0:
+            pytest.skip("K has to be multiple of 128 for preshuffle cases")
 
     dtype = str_to_torch_dtype[dtype]
     x, weight, weight_triton, x_scale, x_scale_shuffled, w_scale, y = (

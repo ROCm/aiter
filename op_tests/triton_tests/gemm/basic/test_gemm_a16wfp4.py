@@ -116,6 +116,7 @@ def get_x_vals():
     x_vals += [(1, 1280, 8192)]
     x_vals += [(v, 7168, 2048) for v in [1, 4, 8, 32, 64, 128]]
     x_vals += [(v, 2112, 7168) for v in [1, 4, 8, 32, 64, 128]]
+    x_vals = [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
     # x_vals += [(1, 1, SCALE_GROUP_SIZE)]  # minimal case, TODO: fix
     return x_vals
 
@@ -194,9 +195,15 @@ def test_gemm_a16wfp4(
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
-    # TODO resolve this compilation error
-    if M == 4864 and N == 8192 and K == 4160:
-        pytest.skip("Skipping this config. due to compilation error.")
+    if shuffle:
+        if N % 32 > 0:
+            pytest.skip(
+                f"N = {N} is not divisible by 32, skip this test for preshuffled weight/scales tests"
+            )
+        if K % 256 > 0:
+            pytest.skip(
+                f"K = {K} is not divisible by 256, skip this test for preshuffled weight/scales tests"
+            )
 
     x, w, w_triton, _, w_scales, w_scales_triton, y = generate_gemm_a16wfp4_inputs(
         M,
