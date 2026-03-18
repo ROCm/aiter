@@ -1309,7 +1309,6 @@ def test_finfo(mod):
     """Test opus::finfo against torch.finfo reference values (bitwise comparison)."""
     import struct
 
-    arch = _get_gpu_arch()
     device = torch.device("cuda")
 
     N_TYPES = 7  # fp32, fp16, bf16, fp8, bf8, fp4, e8m0
@@ -1343,7 +1342,13 @@ def test_finfo(mod):
     # (name, offset, torch_dtype_or_None, manual_ref_or_None)
     # For fp4 and e8m0 there is no torch.finfo, so we provide manual reference.
     fp4_ref = {"eps": 0.5, "max": 6.0, "min": -6.0, "tiny": 1.0, "bits": 4}
-    e8m0_ref = {"eps": 1.0, "max": 2.0**127, "min": 2.0**-127, "tiny": 2.0**-127, "bits": 8}
+    e8m0_ref = {
+        "eps": 1.0,
+        "max": 2.0**127,
+        "min": 2.0**-127,
+        "tiny": 2.0**-127,
+        "bits": 8,
+    }
 
     type_table = [
         ("fp32", 0, torch.float32, 32, None),
