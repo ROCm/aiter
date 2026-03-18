@@ -478,9 +478,9 @@ def _get_config(
 
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_arch()
-        if dev != "gfx950":
+        if dev not in ["gfx950", "gfx1250"]:
             raise ValueError(
-                "Gluon implementation is not supported on this device (requires CDNA4)."
+                "Gluon implementation is not supported on this device."
             )
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-AFP4WFP4.json"
         with open(fpath, "r") as file:

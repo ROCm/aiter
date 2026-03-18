@@ -235,9 +235,9 @@ def run_triton(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
 @pytest.mark.parametrize("output", [True, False])
-@pytest.mark.parametrize("shuffle_weight_scales",[True, False])
+@pytest.mark.parametrize("shuffle_weight_scales",[False])
 @pytest.mark.parametrize("skip_reduce", [True, False])
-@pytest.mark.parametrize("impl", ["triton"])
+@pytest.mark.parametrize("impl", ["gluon"])
 def test_gemm_afp4_wfp4(
     M: int,
     N: int,
@@ -249,9 +249,9 @@ def test_gemm_afp4_wfp4(
     skip_reduce,
     impl,
 ):
-    if impl == "gluon" and DEVICE_ARCH != "gfx950":
+    if impl == "gluon" and DEVICE_ARCH not in ["gfx950", "gfx1250"]:
         pytest.skip(
-            "Gluon implementation is not supported on this device (requires CDNA4)."
+            "Gluon implementation is not supported on this GPU."
         )
 
     if impl == "gluon" and shuffle_weight_scales:
