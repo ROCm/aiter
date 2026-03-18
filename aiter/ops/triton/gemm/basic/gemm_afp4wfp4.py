@@ -505,9 +505,7 @@ def gemm_afp4wfp4_preshuffle(
         M_POW2 = 16
 
     if use_gluon:
-        layouts = get_gemm_afp4wfp4_preshuffle_layouts(config["num_warps"], config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"])
-
-        grid = (config["NUM_KSPLIT"] * triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
+        layouts = get_gemm_afp4wfp4_preshuffle_layouts(config["NUM_WARPS"], config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"])
 
         _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](
         x_fp4,
@@ -529,13 +527,13 @@ def gemm_afp4wfp4_preshuffle(
         x_scales.stride(1),
         w_scales.stride(0),
         w_scales.stride(1),
-        BLOCK_M=config["BLOCK_SIZE_M"],
-        BLOCK_N=config["BLOCK_SIZE_N"],
-        BLOCK_K=config["BLOCK_SIZE_K"],
-        NUM_WARPS=config["num_warps"],
+        NUM_BUFFERS=2,
+        BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
+        BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
+        BLOCK_SIZE_K=config["BLOCK_SIZE_K"],
+        NUM_WARPS=config["NUM_WARPS"],
         NUM_KSPLIT=config["NUM_KSPLIT"],
         SPLITK_BLOCK=config["SPLITK_BLOCK_SIZE"],
-        NUM_BUFFERS=2,
         cache_modifier=config["cache_modifier"],
         **layouts,
         )
