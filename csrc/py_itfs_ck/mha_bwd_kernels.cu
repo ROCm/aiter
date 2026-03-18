@@ -31,7 +31,9 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
         std::optional<const at::Tensor> bias_,         // [sq, sk]
         std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
         std::optional<const at::Tensor> rng_state_,
-        std::optional<at::Generator> gen_)
+        std::optional<at::Generator> gen_,
+        std::optional<const at::Tensor> sink_,         // [b, hq] log-space sink scores (float)
+        std::optional<at::Tensor> d_sink_)             // [hq] sink gradient output (float)
 {
     if (is_causal) { window_size_right = 0; }
 
@@ -198,6 +200,9 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
         hipLaunchKernelGGL(
             aiter::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0,
             philox_args, reinterpret_cast<uint64_t*>(rng_state.data_ptr()));
+    } else {
+        // No dropout: allocate a dummy tensor so data_ptr() is always valid.
+        rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
     }
 
     if (seqlen_q > 0) {
@@ -329,6 +334,8 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
                                 dv_expanded.data_ptr(),
                                 dbias_ptr,
                                 dq_accum.data_ptr(),
+                                (sink_.has_value()   && sink_.value().defined())   ? sink_.value().data_ptr()   : nullptr, // sink_ptr [b, hq]
+                                (d_sink_.has_value() && d_sink_.value().defined()) ? d_sink_.value().data_ptr() : nullptr, // d_sink_ptr [hq]
                                 nullptr, // seqstart_q_ptr
                                 nullptr, // seqstart_k_ptr
                                 nullptr, // seqlen_q_ptr
