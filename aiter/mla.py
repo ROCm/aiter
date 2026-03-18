@@ -135,7 +135,8 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
         )
         if num_kv_splits > 1:
             num_kv_splits = min(
-                num_kv_splits, int(total_kv / bs - max_seqlen_q) // min_block_n + 1
+                num_kv_splits,
+                (abs(total_kv / bs - max_seqlen_q) // min_block_n + 1),
             )
 
     num_kv_splits_indptr = torch.arange(
@@ -198,7 +199,13 @@ def mla_decode_fwd(
             )
 
         mgc = 64 if max_seqlen_q == 1 and nhead == 16 else 16
-        mgc = 32 if nhead == 128 and kv_buffer.dtype == dtypes.fp8 else mgc
+        mgc = (
+            32
+            if (
+                nhead == 128 and q.dtype == dtypes.fp8 and kv_buffer.dtype == dtypes.fp8
+            )
+            else mgc
+        )
 
         MAYBE_FINAL_OUT = True
 
