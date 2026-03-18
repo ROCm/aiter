@@ -15,7 +15,6 @@
 import pytest
 import torch
 
-import aiter
 from aiter import dtypes, mha_bwd, mha_fwd, mha_varlen_bwd
 
 
