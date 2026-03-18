@@ -1951,7 +1951,7 @@ namespace py = pybind11;
           py::arg("conv_state_indices") = torch::Tensor(),                     \
           py::arg("pad_slot_id")        = -1);
 
-#define SPLIT_GDR_DECODE_HIP_PYBIND                                              \
+#define FUSED_SPLIT_GDR_UPDATE_PYBIND                                            \
     m.def("fused_split_gdr_update",                                               \
           &aiter::fused_split_gdr_update,                                         \
           "Fused split GDR decode update (HIP, ksplit4_db backend).",            \

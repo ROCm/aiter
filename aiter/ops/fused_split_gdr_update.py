@@ -7,10 +7,10 @@ from torch import Tensor
 
 from ..jit.core import compile_ops
 
-MD_NAME = "module_split_gdr_decode_hip"
+MD_NAME = "module_fused_split_gdr_update"
 
 
-@compile_ops("module_split_gdr_decode_hip")
+@compile_ops("module_fused_split_gdr_update")
 def fused_split_gdr_update(
     mixed_qkv: Tensor,
     A_log: Tensor,

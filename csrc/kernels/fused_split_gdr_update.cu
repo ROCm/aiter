@@ -12,7 +12,7 @@
 #include <cmath>
 #include <cstdint>
 
-#include "split_gdr_decode_hip.h"
+#include "fused_split_gdr_update.h"
 
 namespace aiter {
 
@@ -71,7 +71,7 @@ __device__ __forceinline__ void load_bf16x2_padded_fast(
 }
 
 template <int BK, int BV, bool USE_INITIAL_STATE, bool USE_QK_L2NORM>
-__global__ __launch_bounds__(BV) void fused_split_gdr_update_kernel_ksplit4_db(
+__global__ __launch_bounds__(BV) void fused_split_gdr_update_kernel(
     const __hip_bfloat16* __restrict__ mixed_qkv,
     const float* __restrict__ A_log,
     const __hip_bfloat16* __restrict__ a,
@@ -323,7 +323,7 @@ __global__ __launch_bounds__(BV) void fused_split_gdr_update_kernel_ksplit4_db(
 }
 
 #define LAUNCH_KS(BK_CT, USE_INIT, USE_L2)                                           \
-    hipLaunchKernelGGL((fused_split_gdr_update_kernel_ksplit4_db<BK_CT, BV_VAL,      \
+    hipLaunchKernelGGL((fused_split_gdr_update_kernel<BK_CT, BV_VAL,                 \
                                                                  USE_INIT, USE_L2>),  \
         dim3(grid),                                                                    \
         dim3(block),                                                                   \
