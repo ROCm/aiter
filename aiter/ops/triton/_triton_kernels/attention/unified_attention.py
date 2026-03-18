@@ -399,7 +399,7 @@ def kernel_unified_attention_2d(
     # for thd layout the block table[seq_idx] gives the starting token index of the kv cache for that sequence
     # we get the base offset as block table[seq_idx] * stride_k_cache_0 
     seq_offset = tile_start * TILE_SIZE + offs_t
-    base_offset = tl.load(block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE).to(tl.int64)
+    base_offset = tl.load(block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE).to(tl.int64)    
     
     for j in range(tile_start, tile_end):
         seq_offset = j * TILE_SIZE + offs_t
