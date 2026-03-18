@@ -1,3 +1,8 @@
+---
+name: tune_ck_gemm_a8w8_blockscale
+description: Step-by-step tutorial for tuning CK GEMM A8W8 Blockscale
+---
+
 # CK GEMM A8W8 Blockscale Tune
 
 1. Install aiter:
