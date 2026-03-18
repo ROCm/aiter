@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #pragma once
-#include <torch/all.h>
+#include "aiter_torch_common.h"
 #include "aiter_hip_common.h"
 
 bool static isGPUArch(const std::vector<std::string> &archs)
