@@ -227,23 +227,58 @@ def test_mha_bwd_sink_null_gives_same_as_no_sink(dtype):
     torch.testing.assert_close(d1,  d2,  msg="softmax_d differs with sink=None vs omitted")
 
 
+def reference_d_sink_varlen(dout, out, lse_group, sink, seqlens_q):
+    """
+    Reference d_sink for varlen mode.
+
+    dout       : [total_q, H, Dv]
+    out        : [total_q, H, Dv]
+    lse_group  : [H, total_q]   – group-mode LSE (flattened across batches)
+    sink       : [B, H]
+    seqlens_q  : list of per-batch sequence lengths
+    returns d_sink : [H]
+    """
+    nhead = sink.shape[1]
+    d_sink = torch.zeros(nhead, device=sink.device, dtype=torch.float32)
+
+    offset = 0
+    for b, sq in enumerate(seqlens_q):
+        dout_b = dout[offset:offset + sq].float()      # [sq, H, Dv]
+        out_b  = out[offset:offset + sq].float()       # [sq, H, Dv]
+        lse_b  = lse_group[:, offset:offset + sq]      # [H, sq]
+
+        # D[q, h] = sum_j(dout[q,h,j] * out[q,h,j])
+        D_qh = (dout_b * out_b).sum(dim=-1)            # [sq, H]
+        D_hq = D_qh.permute(1, 0)                      # [H, sq]
+
+        # P_sink[h, q] = exp(sink[b, h] - lse[h, q])
+        p_sink = torch.exp(sink[b].float().unsqueeze(-1) - lse_b)  # [H, sq]
+
+        d_sink += (-p_sink * D_hq).sum(dim=-1)          # [H]
+        offset += sq
+
+    return d_sink
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_mha_varlen_bwd_sink_dsink(dtype):
     """
-    Smoke test: mha_varlen_bwd with sink/d_sink produces finite, non-zero d_sink
-    and doesn't corrupt dQ/dK/dV shapes.
+    Numerical correctness test: mha_varlen_bwd with sink/d_sink.
+
+    Verifies:
+    1. d_sink values match the per-batch reference computation.
+    2. Handles equal-length sequences correctly.
 
     In group (varlen) mode the CK kernel expects:
-      lse:  [nhead, total_q]   (not the batch-mode [batch, nhead, seqlen])
-      sink: [batch, nhead]     (one log-space score per batch-head pair)
-    We derive these from a batch-mode forward pass.
+      lse  : [nhead, total_q]  (flattened across batches per head)
+      sink : [batch, nhead]    (one log-space score per batch-head pair)
     """
     device = torch.device("cuda")
     batch, seqlen, nhead, hdim = 2, 64, 4, 64
     hdim_v = hdim
     softmax_scale = hdim ** -0.5
+    seqlens_q = [seqlen] * batch
 
-    # build equal-length varlen inputs (no padding)
     cu_seqlens_q = torch.tensor([0, seqlen, seqlen * 2], device=device, dtype=torch.int32)
     cu_seqlens_k = cu_seqlens_q.clone()
     total_q = seqlen * batch
@@ -254,19 +289,16 @@ def test_mha_varlen_bwd_sink_dsink(dtype):
     v    = torch.randn(total_k, nhead, hdim_v, device=device, dtype=dtype)
     dout = torch.randn(total_q, nhead, hdim_v, device=device, dtype=dtype)
 
-    # forward (batch mode) → convert outputs to group-mode shapes
+    # forward (batch mode) → convert to group-mode shapes
     q_b = q.view(batch, seqlen, nhead, hdim)
     k_b = k.view(batch, seqlen, nhead, hdim)
     v_b = v.view(batch, seqlen, nhead, hdim_v)
     out_b, lse_b = run_fwd(q_b, k_b, v_b, softmax_scale, causal=False)
 
     out = out_b.view(total_q, nhead, hdim_v)
-
     # lse for group mode: [nhead, total_q]
-    # lse_b is [batch, nhead, seqlen]; permute to [nhead, batch, seqlen] then flatten
     lse = lse_b.permute(1, 0, 2).reshape(nhead, total_q).contiguous()
 
-    # sink: [batch, nhead], moderate log-space values
     sink   = torch.empty(batch, nhead, device=device, dtype=torch.float32).uniform_(30.0, 60.0)
     d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
 
@@ -292,3 +324,87 @@ def test_mha_varlen_bwd_sink_dsink(dtype):
     assert dq.shape == q.shape
     assert dk.shape == k.shape
     assert dv.shape == v.shape
+
+    # numerical correctness vs reference
+    d_sink_ref = reference_d_sink_varlen(dout, out, lse, sink, seqlens_q)
+    torch.testing.assert_close(d_sink, d_sink_ref, rtol=0.02, atol=0.5,
+                               msg="varlen d_sink mismatch vs reference")
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_mha_varlen_bwd_sink_variable_lengths(dtype):
+    """
+    Varlen sink test with variable-length sequences per batch entry.
+
+    Ensures:
+    - Kernel correctly uses seqstart_q to determine per-batch sink values.
+    - d_sink accumulates correctly across batches with different lengths.
+    """
+    device = torch.device("cuda")
+    nhead, hdim = 4, 64
+    hdim_v = hdim
+    softmax_scale = hdim ** -0.5
+
+    # variable lengths: batch 0 has 48 tokens, batch 1 has 80 tokens
+    seqlens_q = [48, 80]
+    seqlens_k = [48, 80]
+    batch = len(seqlens_q)
+    max_seqlen_q = max(seqlens_q)
+    max_seqlen_k = max(seqlens_k)
+    total_q = sum(seqlens_q)
+    total_k = sum(seqlens_k)
+
+    cu_sq = torch.tensor([0] + list(torch.cumsum(torch.tensor(seqlens_q), 0).tolist()),
+                         device=device, dtype=torch.int32)
+    cu_sk = torch.tensor([0] + list(torch.cumsum(torch.tensor(seqlens_k), 0).tolist()),
+                         device=device, dtype=torch.int32)
+
+    q    = torch.randn(total_q, nhead, hdim,   device=device, dtype=dtype)
+    k    = torch.randn(total_k, nhead, hdim,   device=device, dtype=dtype)
+    v    = torch.randn(total_k, nhead, hdim_v, device=device, dtype=dtype)
+    dout = torch.randn(total_q, nhead, hdim_v, device=device, dtype=dtype)
+
+    # forward per batch segment (different seq lengths → can't use batch mode directly)
+    out_parts, lse_parts = [], []
+    offset_q, offset_k = 0, 0
+    for sq, sk in zip(seqlens_q, seqlens_k):
+        q_b = q[offset_q:offset_q+sq].unsqueeze(0)
+        k_b = k[offset_k:offset_k+sk].unsqueeze(0)
+        v_b = v[offset_k:offset_k+sk].unsqueeze(0)
+        out_b, lse_b = run_fwd(q_b, k_b, v_b, softmax_scale, causal=False)
+        out_parts.append(out_b.squeeze(0))                     # [sq, H, Dv]
+        lse_parts.append(lse_b.squeeze(0).permute(1, 0))      # [sq, H]
+        offset_q += sq
+        offset_k += sk
+
+    out = torch.cat(out_parts, dim=0)                          # [total_q, H, Dv]
+    # group-mode lse: [H, total_q]
+    lse = torch.cat(lse_parts, dim=0).permute(1, 0).contiguous()  # [H, total_q]
+
+    sink   = torch.empty(batch, nhead, device=device, dtype=torch.float32).uniform_(30.0, 60.0)
+    d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
+
+    dq, dk, dv, _ = mha_varlen_bwd(
+        dout, q, k, v, out, lse,
+        cu_seqlens_q=cu_sq,
+        cu_seqlens_k=cu_sk,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        dropout_p=0.0,
+        softmax_scale=softmax_scale,
+        zero_tensors=False,
+        is_causal=False,
+        window_size_left=-1,
+        window_size_right=-1,
+        deterministic=False,
+        sink=sink,
+        d_sink=d_sink,
+    )
+
+    assert torch.isfinite(d_sink).all(), f"d_sink has non-finite values: {d_sink}"
+    assert d_sink.abs().max() > 0, "mha_varlen_bwd did not update d_sink"
+
+    # reference
+    d_sink_ref = reference_d_sink_varlen(dout, out, lse, sink, seqlens_q)
+    torch.testing.assert_close(d_sink, d_sink_ref, rtol=0.02, atol=0.5,
+                               msg="varlen variable-length d_sink mismatch")
