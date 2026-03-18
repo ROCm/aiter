@@ -116,6 +116,7 @@ def compile_flydsl_moe_stage1(
     a_dtype: str,
     b_dtype: str,
     out_dtype: str,
+    act: str = "silu",
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -133,7 +134,7 @@ def compile_flydsl_moe_stage1(
             a_dtype=a_dtype,
             b_dtype=b_dtype,
             out_dtype=out_dtype,
-            use_cshuffle_epilog=(out_dtype == "fp8"),
+            act=act,
         )
     else:
         from .kernels.moe_gemm_2stage import compile_moe_gemm1
@@ -219,6 +220,7 @@ def _get_compiled_stage1(
     a_dtype: str,
     b_dtype: str,
     out_dtype: str,
+    act: str,
 ):
     """Compile and cache stage1 kernel, return a tensor_api closure."""
     exe = compile_flydsl_moe_stage1(
@@ -233,6 +235,7 @@ def _get_compiled_stage1(
         a_dtype=a_dtype,
         b_dtype=b_dtype,
         out_dtype=out_dtype,
+        act=act,
     )
     is_fp4 = b_dtype == "fp4"
     _n_in = inter_dim * 2 if is_fp4 else inter_dim
@@ -253,13 +256,42 @@ def _get_compiled_stage1(
     ) -> None:
         if is_fp4:
             empty_bias = torch.empty(0, device=a.device, dtype=torch.float32)
-            stream = torch.cuda.current_stream().cuda_stream
+            stream = torch.cuda.current_stream()
+            # fp4/e8m0 dtypes are not supported by dlpack; reinterpret as uint8.
+            _a = (
+                a.view(torch.uint8)
+                if a.dtype
+                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
+                else a
+            )
+            _w = (
+                w.view(torch.uint8)
+                if w.dtype
+                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
+                else w
+            )
+            _as = (
+                a_scale.view(torch.uint8)
+                if a_scale is not None
+                and a_scale.numel() > 0
+                and a_scale.dtype
+                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
+                else a_scale
+            )
+            _ws = (
+                w_scale.view(torch.uint8)
+                if w_scale is not None
+                and w_scale.numel() > 0
+                and w_scale.dtype
+                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
+                else w_scale
+            )
             exe(
                 out,
-                a,
-                w,
-                a_scale,
-                w_scale,
+                _a,
+                _w,
+                _as,
+                _ws,
                 sorted_ids,
                 sorted_expert_ids,
                 topk_weights,
@@ -327,15 +359,7 @@ def _get_compiled_stage2(
     _n_in = model_dim
     _k_in = inter_dim
 
-    reduce_exe = None
-    if not accumulate:
-        from .kernels.moe_gemm_2stage import compile_moe_reduction
-
-        reduce_exe = compile_moe_reduction(
-            topk=topk,
-            model_dim=model_dim,
-            dtype_str=out_dtype,
-        )
+    _topk = topk
 
     def tensor_api(
         out: torch.Tensor,
@@ -352,6 +376,7 @@ def _get_compiled_stage2(
     ) -> None:
         if accumulate:
             target = out
+            target.zero_()
         else:
             target = torch.empty(
                 (token_num * topk * model_dim,),
@@ -361,13 +386,42 @@ def _get_compiled_stage2(
 
         if is_fp4:
             empty_bias = torch.empty(0, device=a.device, dtype=torch.float32)
-            stream = torch.cuda.current_stream().cuda_stream
+            stream = torch.cuda.current_stream()
+            # fp4/e8m0 dtypes are not supported by dlpack; cast to uint8
+            _a = (
+                a.view(torch.uint8)
+                if a.dtype
+                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
+                else a
+            )
+            _w = (
+                w.view(torch.uint8)
+                if w.dtype
+                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
+                else w
+            )
+            _as = (
+                a_scale.view(torch.uint8)
+                if a_scale is not None
+                and a_scale.numel() > 0
+                and a_scale.dtype
+                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
+                else a_scale
+            )
+            _ws = (
+                w_scale.view(torch.uint8)
+                if w_scale is not None
+                and w_scale.numel() > 0
+                and w_scale.dtype
+                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
+                else w_scale
+            )
             exe(
                 target,
-                a,
-                w,
-                a_scale,
-                w_scale,
+                _a,
+                _w,
+                _as,
+                _ws,
                 sorted_ids,
                 sorted_expert_ids,
                 topk_weights,
@@ -397,13 +451,7 @@ def _get_compiled_stage2(
             )
 
         if not accumulate:
-            stream = torch.cuda.current_stream().cuda_stream
-            reduce_exe(
-                target.view(token_num, topk, model_dim),
-                out,
-                token_num,
-                stream,
-            )
+            torch.sum(target.view(token_num, _topk, model_dim), dim=1, out=out)
 
     return tensor_api
 
@@ -426,6 +474,7 @@ def flydsl_moe_stage1(
     a_dtype: str = "fp8",
     b_dtype: str = "fp4",
     out_dtype: str = "bf16",
+    act: str = "silu",
     w1_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     sorted_weights: Optional[torch.Tensor] = None,
@@ -433,6 +482,8 @@ def flydsl_moe_stage1(
     """Fused gate+up GEMM (MOE stage1).
 
     a: (token_num, model_dim), w1: (E, 2*inter_dim, model_dim) pre-shuffled.
+    For fp4 stage1, `w1`/`w1_scale` must use the same CK preshuffle layout as `shuffle_weight(..., (16, 16))`
+    and `e8m0_shuffle(...)`.
     Returns (token_num, topk, inter_dim).
     """
     token_num = a.shape[0]
@@ -475,6 +526,7 @@ def flydsl_moe_stage1(
         a_dtype=a_dtype,
         b_dtype=b_dtype,
         out_dtype=out_dtype,
+        act=act,
     )
     tensor_api(
         out.view(-1),
@@ -519,8 +571,6 @@ def flydsl_moe_stage2(
     Returns (token_num, model_dim).
     """
 
-    assert out is not None
-
     token_num = inter_states.shape[0]
     E = w2.shape[0]
     model_dim = w2.shape[1]
@@ -531,7 +581,19 @@ def flydsl_moe_stage2(
     if a_dtype == "fp4":
         inter_dim = inter_dim * 2
 
+    torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
+    if out is None:
+        out = torch.empty(
+            (token_num, model_dim), dtype=torch_out_dtype, device=inter_states.device
+        )
+
     dev = inter_states.device
+    flat_a_scale = (
+        a2_scale.view(-1) if a2_scale is not None else torch.empty(0, device=dev)
+    )
+    flat_w_scale = (
+        w2_scale.view(-1) if w2_scale is not None else torch.empty(0, device=dev)
+    )
     sw = (
         sorted_weights
         if sorted_weights is not None
@@ -560,8 +622,8 @@ def flydsl_moe_stage2(
         out,
         inter_states,
         w2,
-        a2_scale,
-        w2_scale,
+        flat_a_scale,
+        flat_w_scale,
         sorted_token_ids,
         sorted_expert_ids,
         sw,
