@@ -16,6 +16,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
 )
 from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_mxfp4 import (
     gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
+    get_gemm_afp4wfp4_preshuffle_layouts,
 )
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -503,8 +504,11 @@ def gemm_afp4wfp4_preshuffle(
         M_POW2 = 16
     
     if use_gluon:
-        kernel = _gluon_gemm_mxfp4_preshuffle_gfx1250
-        gemm_mxfp4_preshuffle_gfx1250[grid](
+        layouts = get_gemm_afp4wfp4_preshuffle_layouts(config["num_warps"], config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"])
+
+        grid = (config["NUM_KSPLIT"] * triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
+
+        _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](
         x_fp4,
         w_preshuf,
         y,
@@ -524,11 +528,19 @@ def gemm_afp4wfp4_preshuffle(
         x_scales.stride(1),
         w_scales.stride(0),
         w_scales.stride(1),
+        BLOCK_M=config["BLOCK_SIZE_M"],
+        BLOCK_N=config["BLOCK_SIZE_N"],
+        BLOCK_K=config["BLOCK_SIZE_K"],
+        NUM_WARPS=config["num_warps"],
+        NUM_KSPLIT=config["NUM_KSPLIT"],
+        SPLITK_BLOCK=config["SPLITK_BLOCK_SIZE"],
+        NUM_BUFFERS=2,
+        cache_modifier=config["cache_modifier"],
         **layouts,
         )
         return y
 
-    metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/gemm/aot/{kernel.fn.__name__}_M={M_POW2}-N={N}-K={K_elems}"
+    metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/gemm/aot/{_triton_gemm_afp4wfp4_preshuffle_kernel.fn.__name__}_M={M_POW2}-N={N}-K={K_elems}"
     if use_aot and os.path.exists(metadata_pth):
         with AOTMetadataContext(
             kernel.fn.__name__,

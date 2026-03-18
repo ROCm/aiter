@@ -4,12 +4,9 @@ import pytest
 import torch
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as triton_gemm_afp4wfp4,
-    gemm_afp4wfp4_preshuffle as triton_gemm_afp4wfp4_preshuffle,
+    gemm_afp4wfp4_preshuffle,
 )
 from aiter.ops.triton.gluon.gemm_afp4wfp4 import gemm_afp4wfp4 as gluon_gemm_afp4wfp4_CDNA4
-from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_mxfp4 import (
-    gemm_mxfp4_preshuffle_gfx1250 as gluon_gemm_mxfp4_preshuffle_gfx1250,
-)
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from aiter.ops.shuffle import shuffle_weight
@@ -298,7 +295,7 @@ def test_gemm_afp4_wfp4(
 
     if shuffle_weight_scales:
         if output:
-            triton_out = triton_gemm_afp4wfp4_preshuffle(
+            triton_out = gemm_afp4wfp4_preshuffle(
                 x,
                 w_triton,
                 x_scales_triton,
@@ -309,7 +306,7 @@ def test_gemm_afp4_wfp4(
                 skip_reduce=skip_reduce,
             )
         else:
-            triton_out = triton_gemm_afp4wfp4_preshuffle(
+            triton_out = gemm_afp4wfp4_preshuffle(
                 x,
                 w_triton,
                 x_scales_triton,
@@ -412,7 +409,7 @@ def test_gemm_mxfp4_preshuffled_gfx1250(
     torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
 
     if output:
-        triton_out = gluon_gemm_mxfp4_preshuffle_gfx1250(
+        triton_out = gemm_afp4wfp4_preshuffle(
             x,
             w_preshuf,
             x_scales_shuffled,
@@ -421,7 +418,7 @@ def test_gemm_mxfp4_preshuffled_gfx1250(
             y if y is not None else torch.empty_like(torch_out),
         )
     else:
-        triton_out = gluon_gemm_mxfp4_preshuffle_gfx1250(
+        triton_out = gemm_afp4wfp4_preshuffle(
             x,
             w_preshuf,
             x_scales_shuffled,
