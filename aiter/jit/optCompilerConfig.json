@@ -1001,7 +1001,7 @@
         ],
         "flags_extra_cc": [
             "'-DONLY_FAV3=1'",
-            "'-DDISABLE_CK=1'"
+            "'-DENABLE_CK=0'"
         ],
         "flags_extra_hip": [],
         "extra_ldflags": "None",
@@ -1020,7 +1020,7 @@
         ],
         "flags_extra_cc": [
             "'-DONLY_FAV3=1'",
-            "'-DDISABLE_CK=1'"
+            "'-DENABLE_CK=0'"
         ],
         "flags_extra_hip": [],
         "extra_ldflags": "None",
