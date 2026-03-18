@@ -872,11 +872,19 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 
 
-def _sink_make_qkvo(batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, hdim_v, dtype, device):
+def _sink_make_qkvo(
+    batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, hdim_v, dtype, device
+):
     """Return (q, k, v, dout) in BSHD layout, requires_grad=True."""
-    q = torch.randn(batch, seqlen_q, nhead, hdim, device=device, dtype=dtype).requires_grad_(True)
-    k = torch.randn(batch, seqlen_k, nhead_k, hdim, device=device, dtype=dtype).requires_grad_(True)
-    v = torch.randn(batch, seqlen_k, nhead_k, hdim_v, device=device, dtype=dtype).requires_grad_(True)
+    q = torch.randn(
+        batch, seqlen_q, nhead, hdim, device=device, dtype=dtype
+    ).requires_grad_(True)
+    k = torch.randn(
+        batch, seqlen_k, nhead_k, hdim, device=device, dtype=dtype
+    ).requires_grad_(True)
+    v = torch.randn(
+        batch, seqlen_k, nhead_k, hdim_v, device=device, dtype=dtype
+    ).requires_grad_(True)
     dout = torch.randn(batch, seqlen_q, nhead, hdim_v, device=device, dtype=dtype)
     return q, k, v, dout
 
@@ -929,7 +937,9 @@ _SINK_CONFIGS = [
 @pytest.mark.parametrize("causal", _SINK_CAUSALS)
 @pytest.mark.parametrize("dtype", _SINK_DTYPES)
 @pytest.mark.parametrize("batch,seqlen_q,seqlen_k,nhead,nhead_k,hdim", _SINK_CONFIGS)
-def test_mha_bwd_sink_dsink(batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, dtype, causal):
+def test_mha_bwd_sink_dsink(
+    batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, dtype, causal
+):
     """Verify that mha_bwd correctly accumulates d_sink."""
     device = torch.device("cuda")
     hdim_v = hdim
@@ -940,7 +950,9 @@ def test_mha_bwd_sink_dsink(batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, dty
     )
     out, lse = _sink_run_fwd(q.detach(), k.detach(), v.detach(), softmax_scale, causal)
 
-    sink = torch.empty(batch, nhead, device=device, dtype=torch.float32).uniform_(30.0, 60.0)
+    sink = torch.empty(batch, nhead, device=device, dtype=torch.float32).uniform_(
+        30.0, 60.0
+    )
     d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
 
     dq, dk, dv, softmax_d = aiter.mha_bwd(
@@ -975,7 +987,9 @@ def test_mha_bwd_sink_dsink(batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, dty
 @pytest.mark.parametrize("causal", _SINK_CAUSALS)
 @pytest.mark.parametrize("dtype", _SINK_DTYPES)
 @pytest.mark.parametrize("batch,seqlen_q,seqlen_k,nhead,nhead_k,hdim", _SINK_CONFIGS)
-def test_mha_bwd_with_sink_dq_dk_dv(batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, dtype, causal):
+def test_mha_bwd_with_sink_dq_dk_dv(
+    batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, dtype, causal
+):
     """Verify that passing sink/d_sink does not corrupt the dQ, dK, dV outputs."""
     device = torch.device("cuda")
     hdim_v = hdim
@@ -1003,14 +1017,27 @@ def test_mha_bwd_with_sink_dq_dk_dv(batch, seqlen_q, seqlen_k, nhead, nhead_k, h
     d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
 
     dq_sink, dk_sink, dv_sink, _ = aiter.mha_bwd(
-        dout, q.detach(), k.detach(), v.detach(), out, lse, **common_bwd_args,
-        sink=sink_small, d_sink=d_sink,
+        dout,
+        q.detach(),
+        k.detach(),
+        v.detach(),
+        out,
+        lse,
+        **common_bwd_args,
+        sink=sink_small,
+        d_sink=d_sink,
     )
 
     rtol, atol = (0.01, 0.01) if dtype == dtypes.fp16 else (0.02, 0.02)
-    torch.testing.assert_close(dq_sink, dq_base, rtol=rtol, atol=atol, msg="dQ mismatch with small sink")
-    torch.testing.assert_close(dk_sink, dk_base, rtol=rtol, atol=atol, msg="dK mismatch with small sink")
-    torch.testing.assert_close(dv_sink, dv_base, rtol=rtol, atol=atol, msg="dV mismatch with small sink")
+    torch.testing.assert_close(
+        dq_sink, dq_base, rtol=rtol, atol=atol, msg="dQ mismatch with small sink"
+    )
+    torch.testing.assert_close(
+        dk_sink, dk_base, rtol=rtol, atol=atol, msg="dK mismatch with small sink"
+    )
+    torch.testing.assert_close(
+        dv_sink, dv_base, rtol=rtol, atol=atol, msg="dV mismatch with small sink"
+    )
 
 
 @pytest.mark.parametrize("dtype", _SINK_DTYPES)
@@ -1020,7 +1047,9 @@ def test_mha_bwd_sink_null_gives_same_as_no_sink(dtype):
     batch, seqlen, nhead, hdim = 2, 64, 4, 64
     softmax_scale = hdim**-0.5
 
-    q, k, v, dout = _sink_make_qkvo(batch, seqlen, seqlen, nhead, nhead, hdim, hdim, dtype, device)
+    q, k, v, dout = _sink_make_qkvo(
+        batch, seqlen, seqlen, nhead, nhead, hdim, hdim, dtype, device
+    )
     out, lse = _sink_run_fwd(q.detach(), k.detach(), v.detach(), softmax_scale, False)
 
     common = dict(
@@ -1032,12 +1061,24 @@ def test_mha_bwd_sink_null_gives_same_as_no_sink(dtype):
         deterministic=False,
     )
 
-    dq1, dk1, dv1, d1 = aiter.mha_bwd(dout, q.detach(), k.detach(), v.detach(), out, lse, **common)
+    dq1, dk1, dv1, d1 = aiter.mha_bwd(
+        dout, q.detach(), k.detach(), v.detach(), out, lse, **common
+    )
     dq2, dk2, dv2, d2 = aiter.mha_bwd(
-        dout, q.detach(), k.detach(), v.detach(), out, lse, **common, sink=None, d_sink=None
+        dout,
+        q.detach(),
+        k.detach(),
+        v.detach(),
+        out,
+        lse,
+        **common,
+        sink=None,
+        d_sink=None,
     )
 
     torch.testing.assert_close(dq1, dq2, msg="dQ differs with sink=None vs omitted")
     torch.testing.assert_close(dk1, dk2, msg="dK differs with sink=None vs omitted")
     torch.testing.assert_close(dv1, dv2, msg="dV differs with sink=None vs omitted")
-    torch.testing.assert_close(d1, d2, msg="softmax_d differs with sink=None vs omitted")
+    torch.testing.assert_close(
+        d1, d2, msg="softmax_d differs with sink=None vs omitted"
+    )

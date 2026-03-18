@@ -1167,7 +1167,9 @@ def test_mha_varlen_bwd_sink_dsink(dtype):
     softmax_scale = hdim**-0.5
     seqlens_q = [seqlen] * batch
 
-    cu_seqlens_q = torch.tensor([0, seqlen, seqlen * 2], device=device, dtype=torch.int32)
+    cu_seqlens_q = torch.tensor(
+        [0, seqlen, seqlen * 2], device=device, dtype=torch.int32
+    )
     cu_seqlens_k = cu_seqlens_q.clone()
     total_q = seqlen * batch
     total_k = seqlen * batch
@@ -1185,7 +1187,9 @@ def test_mha_varlen_bwd_sink_dsink(dtype):
     out = out_b.view(total_q, nhead, hdim_v)
     lse = lse_b.permute(1, 0, 2).reshape(nhead, total_q).contiguous()
 
-    sink = torch.empty(batch, nhead, device=device, dtype=torch.float32).uniform_(30.0, 60.0)
+    sink = torch.empty(batch, nhead, device=device, dtype=torch.float32).uniform_(
+        30.0, 60.0
+    )
     d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
 
     dq, dk, dv, _ = aiter.mha_varlen_bwd(
@@ -1218,7 +1222,11 @@ def test_mha_varlen_bwd_sink_dsink(dtype):
 
     d_sink_ref = _vsink_reference_d_sink_varlen(dout, out, lse, sink, seqlens_q)
     torch.testing.assert_close(
-        d_sink, d_sink_ref, rtol=0.02, atol=0.5, msg="varlen d_sink mismatch vs reference"
+        d_sink,
+        d_sink_ref,
+        rtol=0.02,
+        atol=0.5,
+        msg="varlen d_sink mismatch vs reference",
     )
 
 
@@ -1240,11 +1248,13 @@ def test_mha_varlen_bwd_sink_variable_lengths(dtype):
 
     cu_sq = torch.tensor(
         [0] + list(torch.cumsum(torch.tensor(seqlens_q), 0).tolist()),
-        device=device, dtype=torch.int32,
+        device=device,
+        dtype=torch.int32,
     )
     cu_sk = torch.tensor(
         [0] + list(torch.cumsum(torch.tensor(seqlens_k), 0).tolist()),
-        device=device, dtype=torch.int32,
+        device=device,
+        dtype=torch.int32,
     )
 
     q = torch.randn(total_q, nhead, hdim, device=device, dtype=dtype)
@@ -1267,7 +1277,9 @@ def test_mha_varlen_bwd_sink_variable_lengths(dtype):
     out = torch.cat(out_parts, dim=0)
     lse = torch.cat(lse_parts, dim=0).permute(1, 0).contiguous()
 
-    sink = torch.empty(batch, nhead, device=device, dtype=torch.float32).uniform_(30.0, 60.0)
+    sink = torch.empty(batch, nhead, device=device, dtype=torch.float32).uniform_(
+        30.0, 60.0
+    )
     d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
 
     dq, dk, dv, _ = aiter.mha_varlen_bwd(
@@ -1297,5 +1309,9 @@ def test_mha_varlen_bwd_sink_variable_lengths(dtype):
 
     d_sink_ref = _vsink_reference_d_sink_varlen(dout, out, lse, sink, seqlens_q)
     torch.testing.assert_close(
-        d_sink, d_sink_ref, rtol=0.02, atol=0.5, msg="varlen variable-length d_sink mismatch"
+        d_sink,
+        d_sink_ref,
+        rtol=0.02,
+        atol=0.5,
+        msg="varlen variable-length d_sink mismatch",
     )
