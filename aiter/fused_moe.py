@@ -624,6 +624,54 @@ class MOEMetadata:
     use_non_temporal_load: bool = True
 
 
+def _flydsl_stage1_wrapper(
+    hidden_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    kernelName="",
+    a1_scale=None,
+    w1_scale=None,
+    sorted_weights=None,
+    **_kwargs,
+):
+    parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
+    if parsed is None:
+        raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
+    out_dtype_str = parsed["out_dtype"]
+    if out_dtype_str == "fp8":
+        token_num = hidden_states.shape[0]
+        _, _, inter_dim = get_inter_dim(w1.shape, w2.shape)
+        out = torch.empty(
+            (token_num, topk, inter_dim),
+            dtype=dtypes.fp8,
+            device=hidden_states.device,
+        )
+    aiter.ops.flydsl.flydsl_moe_stage1(
+        a=hidden_states,
+        w1=w1,
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        out=out,
+        topk=topk,
+        tile_m=parsed["tile_m"],
+        tile_n=parsed["tile_n"],
+        tile_k=parsed["tile_k"],
+        a_dtype=parsed["a_dtype"],
+        b_dtype=parsed["b_dtype"],
+        out_dtype=out_dtype_str,
+        w1_scale=w1_scale,
+        a1_scale=a1_scale,
+        sorted_weights=sorted_weights,
+    )
+    return out
+
+
 def _flydsl_stage2_wrapper(
     inter_states,
     w1,
@@ -949,7 +997,10 @@ def get_2stage_cfgs(
             run_1stage,
         )
 
-    if (kernelName1 and "ck2stages" in kernelName1) or (
+    if (
+        kernelName1
+        and ("ck2stages" in kernelName1 or kernelName1.startswith("flydsl_"))
+    ) or (
         not kernelName1
         and (
             (q_type == QuantType.per_1x128 and doweight_stage1)
@@ -976,8 +1027,13 @@ def get_2stage_cfgs(
                 quant_type=q_type,
                 use_non_temporal_load=use_non_temporal_load,
             )
-        return MOEMetadata(
-            functools.partial(
+        if kernelName1 and kernelName1.startswith("flydsl_") and is_flydsl_available():
+            stage1_func = functools.partial(
+                _flydsl_stage1_wrapper,
+                kernelName=kernelName1,
+            )
+        else:
+            stage1_func = functools.partial(
                 ck_moe_stage1,
                 kernelName=kernelName1,
                 activation=activation,
@@ -985,7 +1041,9 @@ def get_2stage_cfgs(
                 dtype=dtype,
                 splitk=ksplit,
                 use_non_temporal_load=use_non_temporal_load,
-            ),
+            )
+        return MOEMetadata(
+            stage1_func,
             stage2_func,
             block_m,
             int(ksplit),
@@ -1202,7 +1260,8 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and activation == aiter.ActivationType.Swiglu
     ):
-        a2 = a2.to(dtypes.fp8)
+        if a2.dtype != dtypes.fp8:
+            a2 = a2.to(dtypes.fp8)
         a2_scale = a1_scale
     elif quant_type == QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)

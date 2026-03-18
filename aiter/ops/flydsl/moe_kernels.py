@@ -99,6 +99,8 @@ def _register_all_configs():
             for out in ("bf16", "f16"):
                 _KERNEL_PARAMS.update(get_flydsl_stage1_kernels(a, b, out))
                 _KERNEL_PARAMS.update(get_flydsl_stage2_kernels(a, b, out))
+    # a8w4 pipeline: stage1 can output fp8 directly (swiglu fused)
+    _KERNEL_PARAMS.update(get_flydsl_stage1_kernels("fp8", "fp4", "fp8"))
 
 
 _register_all_configs()
