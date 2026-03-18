@@ -143,6 +143,29 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
     return num_kv_splits, num_kv_splits_indptr
 
 
+_mla_dump_counter = 0
+
+
+def dump_mla_decode_fwd_inputs(dump_dir, **kwargs):
+    global _mla_dump_counter
+    call_dir = os.path.join(dump_dir, f"call_{_mla_dump_counter}")
+    os.makedirs(call_dir, exist_ok=True)
+
+    non_tensor_params = {}
+    for name, val in kwargs.items():
+        if isinstance(val, torch.Tensor):
+            torch.save(val, os.path.join(call_dir, f"{name}.pt"))
+        else:
+            non_tensor_params[name] = val
+
+    with open(os.path.join(call_dir, "params.txt"), "w") as f:
+        for name, val in non_tensor_params.items():
+            f.write(f"{name} = {val}\n")
+
+    print(f"[dump_mla] call_{_mla_dump_counter} saved to {call_dir}")
+    _mla_dump_counter += 1
+
+
 def mla_decode_fwd(
     q,
     kv_buffer,
@@ -170,6 +193,37 @@ def mla_decode_fwd(
     return_logits=False,
     return_lse=False,
 ):
+    _dump_dir = os.environ.get("MLA_DUMP_DIR")
+    if _dump_dir:
+        dump_mla_decode_fwd_inputs(
+            _dump_dir,
+            q=q,
+            kv_buffer=kv_buffer,
+            o=o,
+            qo_indptr=qo_indptr,
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            kv_last_page_lens=kv_last_page_lens,
+            max_seqlen_q=max_seqlen_q,
+            page_size=page_size,
+            nhead_kv=nhead_kv,
+            sm_scale=sm_scale,
+            logit_cap=logit_cap,
+            num_kv_splits=num_kv_splits,
+            num_kv_splits_indptr=num_kv_splits_indptr,
+            work_meta_data=work_meta_data,
+            work_indptr=work_indptr,
+            work_info_set=work_info_set,
+            reduce_indptr=reduce_indptr,
+            reduce_final_map=reduce_final_map,
+            reduce_partial_map=reduce_partial_map,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+            intra_batch_mode=intra_batch_mode,
+            return_logits=return_logits,
+            return_lse=return_lse,
+        )
+
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
     if kv_buffer.dtype != torch.uint8:
@@ -329,7 +383,9 @@ def mla_decode_fwd(
             io_transformed = True
         else:
             assert False, f"{nhead=} and {max_seqlen_q=} not supported"
-
+        # print(f"max_seqlen_q: {max_seqlen_q}, bs: {bs}, nhead: {nhead}")
+        # print(f"work_meta_data: {work_meta_data}, work_indptr: {work_indptr}, work_info_set: {work_info_set}")
+        # print(f"reduce_indptr: {reduce_indptr}, reduce_final_map: {reduce_final_map}, reduce_partial_map: {reduce_partial_map}")
         logits = torch.empty(
             (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, v_head_dim),
             dtype=dtypes.fp32,

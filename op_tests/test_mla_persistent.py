@@ -835,8 +835,11 @@ def test_mla(
             kv_last_page_lens.fill_(ctx_lens % page_size)
 
     kv_indptr[1 : batch_size + 1] = torch.cumsum(kv_block_nums, dim=0)
-    num_page = kv_indptr[-1].item()
-    kv_indices = torch.randperm(num_page, dtype=torch.int)
+    # num_page = kv_indptr[-1].item()
+    # kv_indices = torch.randperm(num_page, dtype=torch.int)
+    kv_indices = torch.randint(
+        0, num_page, (kv_indptr[-1].item() + 10000,), dtype=torch.int
+    )
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     max_seqlen_qo = seq_lens_qo.max().item()
     # max_seqlen_kv = seq_lens_kv.max().item()
