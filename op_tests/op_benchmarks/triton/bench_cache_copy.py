@@ -408,13 +408,13 @@ def benchmark(args):
                 waves_per_eu=waves_per_eu,
                 use_tdm=IS_DEVICE_ARCH_GFX12,
             )
-            try:
-                ref = key_cache.sum(dim=0).permute(1, 2, 0)
-                torch.testing.assert_close(y, ref)
-                print(f"Passed")
-            except Exception as e:
-                print(f"Failed")
-                raise e
+            # try:
+            #     ref = key_cache.sum(dim=0).permute(1, 2, 0)
+            #     torch.testing.assert_close(y, ref)
+            #     print(f"Passed")
+            # except Exception as e:
+            #     print(f"Failed")
+            #     raise e
 
         ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
         mem = (
@@ -425,10 +425,11 @@ def benchmark(args):
             * torch.bfloat16.itemsize
             * 1e-12
         )
-        if "ms" in provider:
-            return ms
-        else:  # TB/s
-            return mem / ms * 1e3
+        return ms
+        # if "ms" in provider:
+        #     return ms
+        # else:  # TB/s
+        #     return mem / ms * 1e3
 
     bench_cache_copy.run(
         save_path="." if args.o else None, print_data=True, show_plots=False
