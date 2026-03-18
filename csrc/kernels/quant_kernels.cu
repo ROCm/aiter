@@ -259,7 +259,6 @@ __device__ void scaled_quant_impl(DTYPE_O* __restrict__ out,
         std::is_same_v<DTYPE_O, opus::fp4_t> ? vec_size_i / 2 : vec_size_i;
 
     using vec_i       = opus::vector_t<DTYPE_I, vec_size_i>;
-    using vec_o       = opus::vector_t<DTYPE_O, vec_size_o>;
     using DTYPE_STORE = std::conditional_t<std::is_same_v<DTYPE_O, opus::fp4_t>, uint8_t, DTYPE_O>;
 
     const int64_t row_offset        = blockIdx.x * cols;
@@ -268,7 +267,6 @@ __device__ void scaled_quant_impl(DTYPE_O* __restrict__ out,
     auto* ptr_o                     = std::is_same_v<DTYPE_O, opus::fp4_t>
                                           ? reinterpret_cast<DTYPE_STORE*>(out + row_offset / 2)
                                           : reinterpret_cast<DTYPE_STORE*>(out + row_offset);
-    auto* out_vecs                  = reinterpret_cast<vec_o*>(ptr_o);
     static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
     static constexpr int32_t ooba_o = 4 / sizeof(DTYPE_O);
     const int32_t oob_i             = (cols + ooba_i - 1) / ooba_i * ooba_i;
@@ -295,13 +293,13 @@ __device__ void scaled_quant_impl(DTYPE_O* __restrict__ out,
     for(vec_idx += vec_stride; vec_idx < num_vecs; vec_idx += vec_stride)
     {
         vec_nxt = load_vector_nbytes<DTYPE_I, vec_size_i, 16>(buffer_i, vec_idx * vec_size_i);
-        store_vector<DTYPE_STORE, DTYPE_I, vec_size_o, RT, false, WARP_SIZE, 1, DTYPE_O>(buffer_o, vec_cur, (vec_idx - vec_stride) * vec_size_o, inverted_scale);
+        store_vector<DTYPE_STORE, DTYPE_I, vec_size_i, RT, false, WARP_SIZE, 1, DTYPE_O>(buffer_o, vec_cur, (vec_idx - vec_stride) * vec_size_o, inverted_scale);
         vec_cur = vec_nxt;
     }
 
     if(vec_idx - vec_stride < num_vecs)
     {
-        store_vector<DTYPE_STORE, DTYPE_I, vec_size_o, RT, false, WARP_SIZE, 1, DTYPE_O>(buffer_o, vec_cur, (vec_idx - vec_stride) * vec_size_o, inverted_scale);
+        store_vector<DTYPE_STORE, DTYPE_I, vec_size_i, RT, false, WARP_SIZE, 1, DTYPE_O>(buffer_o, vec_cur, (vec_idx - vec_stride) * vec_size_o, inverted_scale);
     }
     // double load core loop end
 }
