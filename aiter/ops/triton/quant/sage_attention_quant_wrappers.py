@@ -36,15 +36,14 @@ def unified_perblock_quantize_int8(
     hq = q.shape[1]
     Q_q = torch.empty((*q.shape[:-1], d), dtype=torch.int8, device=q.device)
     DTYPE_MAX = torch.iinfo(torch.int8).max
-    num_seqs = len(cu_seqlens)
-    total_num_blocks = q.shape[0] // BLOCK_SIZE_M + num_seqs
-    
+    num_seqs = len(cu_seqlens) - 1
+    BLOCK_Q = BLOCK_SIZE_M // num_queries_per_kv
+    total_num_blocks = q.shape[0] // BLOCK_Q + num_seqs
     assert num_queries_per_kv is not None # and config is not None
     num_heads = hq // num_queries_per_kv
     Q_descale = torch.empty(
         (total_num_blocks, num_heads), dtype=torch.float32, device=q.device
     )
-    BLOCK_Q = BLOCK_SIZE_M // num_queries_per_kv
     perblock_quantize_q_kernel[(
                 num_heads,
                 total_num_blocks,

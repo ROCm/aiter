@@ -12,7 +12,7 @@ import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
 HEAD_SIZES = [128, 256]
-BLOCK_SIZES = [16, 64, 100, 544]
+BLOCK_SIZES = [16, 64, 128, 544]
 
 DTYPES = [torch.float16, torch.bfloat16]
 QDTYPES = [None, e4m3_dtype]
@@ -120,6 +120,8 @@ def test_triton_unified_attn(
         pytest.skip("SAGE quant and fp8 q_dtype are mutually exclusive")
     if quant_scheme == "v2" and not arch_info.is_fp4_avail():
         pytest.skip("FP4 dot product is not supported on this GPU")
+    if quant_scheme == "v1" and (block_size & (block_size - 1)) != 0:
+        pytest.skip("block_size must be a power of 2 for v1 quantization")
 
     torch.cuda.empty_cache()
     torch.manual_seed(0)

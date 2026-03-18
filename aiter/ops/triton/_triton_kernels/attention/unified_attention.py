@@ -140,7 +140,7 @@ def qk_dot(
 def v_scale_process(
         V_Descale,
         kv_head_idx,
-        offs_d_scale,
+        offs_d,
         head_mask,
         stride_v_cache_scale_0: tl.int64,  # int
         stride_v_cache_scale_1: tl.int64,  # int
@@ -150,7 +150,7 @@ def v_scale_process(
         v_descale_ptr = (
             V_Descale
             + kv_head_idx * stride_v_cache_scale_0
-            + offs_d_scale * stride_v_cache_scale_1
+            + offs_d * stride_v_cache_scale_1
         )
         return tl.load(v_descale_ptr, mask=head_mask, other=0.0)
 
@@ -252,9 +252,6 @@ def kernel_unified_attention_2d(
     if SAGE_VERSION == 2: # per token mxfp4
         offs_d_qk = tl.arange(0, HEAD_SIZE_PADDED // 2)
         offs_d_scale = tl.arange(0, HEAD_SIZE_PADDED // 32)
-    elif SAGE_VERSION == 1: # per block int8
-        offs_d_qk = tl.arange(0, HEAD_SIZE_PADDED)
-        offs_d_scale = tl.arange(0, HEAD_SIZE_PADDED)
     else:
         offs_d_qk = tl.arange(0, HEAD_SIZE_PADDED)
         offs_d_scale = None

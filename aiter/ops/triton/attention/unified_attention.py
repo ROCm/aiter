@@ -150,7 +150,7 @@ def get_sage_scale_strides(
         num_blks,
         BLOCK_SIZE,
         TILE_SIZE,
-        sage_version: SAGE_VERSION = None
+        sage_version: SAGE_VERSION
     ):
     # q_descale either t,h_q,d//32 (SAGE_MXFP4) or total_num_blocks,h_k (SAGE)
     if sage_version == SAGE_VERSION.SAGE:
@@ -164,8 +164,6 @@ def get_sage_scale_strides(
     elif sage_version == SAGE_VERSION.SAGE_MXFP4:
         stride_k_cache_scale_0, stride_k_cache_scale_1, stride_k_cache_scale_2, stride_k_cache_scale_3 = k_descale.stride()
         query_scale_stride_0, query_scale_stride_1, query_scale_stride_2 = q_descale.stride()
-    else:
-        raise ValueError(f"Invalid sage version: {sage_version}")
 
     stride_v_cache_scale_0, stride_v_cache_scale_1 = v_descale.stride()
 
@@ -189,8 +187,8 @@ def check_quant_args_get_strides(
         k_descale,
         v,
         v_descale,
-        BLOCK_M,
         BLOCK_SIZE,
+        total_num_q_blocks,
         TILE_SIZE,
         sage_version: SAGE_VERSION = None
     ):
@@ -210,7 +208,7 @@ def check_quant_args_get_strides(
 
         if sage_version == SAGE_VERSION.SAGE:
             assert q_descale.ndim == 2, f"expect q_descale to be 2D, got {q_descale.ndim}D with SAGE_VERSION={sage_version}"
-            assert q_descale.shape[0] >= math.ceil(num_tokens / BLOCK_M), f"expect q_descale dim 0 >= {math.ceil(num_tokens / BLOCK_M)}, got {q_descale.shape[0]} with SAGE_VERSION={sage_version}"
+            assert q_descale.shape[0] == total_num_q_blocks, f"expect q_descale dim 0 == {total_num_q_blocks}, got {q_descale.shape[0]} with SAGE_VERSION={sage_version}"
             assert q_descale.shape[1] == num_kv_heads, f"expect q_descale dim 1 == {num_kv_heads}, got {q_descale.shape[1]} with SAGE_VERSION={sage_version}"
 
             assert k_descale.ndim == 2, f"expect k_descale to be 2D, got {k_descale.ndim}D with SAGE_VERSION={sage_version}"
@@ -220,6 +218,7 @@ def check_quant_args_get_strides(
             )
             assert v_descale.ndim == 2, f"expect v_descale to be 2D, got {v_descale.ndim}D with SAGE_VERSION={sage_version}"
             assert v_descale.shape[0] == num_kv_heads, f"expect v_descale dim 0 == {num_kv_heads}, got {v_descale.shape[0]} with SAGE_VERSION={sage_version}"
+            assert blk_size & (blk_size - 1) == 0, f"block_size must be a power of 2 SAGE_VERSION={sage_version}, got {blk_size}"
         elif sage_version == SAGE_VERSION.SAGE_MXFP4:
             head_size_qk *= 2
             expected_q_descale_shape = (num_tokens, num_query_heads, head_size_qk // 32)
@@ -350,7 +349,7 @@ def unified_attention(
             k_descale,
             v,
             v_descale,
-            BLOCK_M,
+            total_num_q_blocks=total_num_q_blocks,
             BLOCK_SIZE=block_size,
             TILE_SIZE=TILE_SIZE,
             sage_version=sage_version
@@ -472,8 +471,8 @@ def unified_attention(
             k_descale,
             v,
             v_descale,
-            BLOCK_M,
             BLOCK_SIZE=block_size,
+            total_num_q_blocks=total_num_q_blocks,
             TILE_SIZE=TILE_SIZE,
             sage_version=sage_version
         )
