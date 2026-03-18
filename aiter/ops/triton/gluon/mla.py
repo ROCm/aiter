@@ -28,13 +28,13 @@ def select_2d_config(
 ):
     TILE_SIZE = block_size
     num_stages_2d = 1
-    num_warps = 4
+    num_warps = 8
 
     return {
         "TILE_SIZE": TILE_SIZE,
         "num_warps": num_warps,
         "num_stages": num_stages_2d,
-        "waves_per_eu": 2,
+        "waves_per_eu": 1,
         "IS_Q_FP8": (q_dtype == e4m3_dtype),
         "IS_KV_FP8": (kv_buffer_dtype == e4m3_dtype),
     }
@@ -44,7 +44,7 @@ def select_3d_config(
     block_size, max_seqlen_k, target_num_prgms, num_2d_prgms, q_dtype, kv_buffer_dtype
 ):
     reduce_num_warps = 2
-    attn_warps = 4
+    attn_warps = 8
     TILE_SIZE = block_size
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     num_segments = math.ceil(target_num_prgms / num_2d_prgms)
@@ -60,7 +60,7 @@ def select_3d_config(
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": attn_warps,
         "num_stages": 2,
-        "waves_per_eu": 2,
+        "waves_per_eu": 1,
         "IS_Q_FP8": (q_dtype == e4m3_dtype),
         "IS_KV_FP8": (kv_buffer_dtype == e4m3_dtype),
     }
@@ -102,7 +102,8 @@ def mla_prefill_fwd(
         kv_lora_rank + qk_rope_head_dim == qk_head_dim
     ), "qk_head_dim must be equal to kv_lora_rank + qk_rope_head_dim"
 
-    BLOCK_M = 128
+    # BLOCK_M = 128
+    BLOCK_M = 16
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     assert BLOCK_Q >= 1
     # Ideally we would launch with kernel with:
@@ -228,6 +229,7 @@ def mla_decode_fwd(
     attn_config["num_warps"] = num_warps
     attn_config["waves_per_eu"] = waves_per_eu
     attn_config["NUM_SEGMENTS_PER_SEQ"] = num_segments
+    reduce_config["NUM_SEGMENTS_PER_SEQ"] = num_segments
 
     NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
     segm_output = torch.empty(
