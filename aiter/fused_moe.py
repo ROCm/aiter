@@ -1794,14 +1794,19 @@ def fused_topk(
         M, topk, dtype=dtypes.i32, device=hidden_states.device
     )
 
-    if (expert, topk) in [
-        (128, 4),
-        (128, 6),
-        (128, 8),
-        (256, 6),
-        (256, 8),
-        (384, 8),
-    ] and gating_output.dtype in [dtypes.bf16, dtypes.fp32]:
+    if (
+        (expert, topk)
+        in [
+            (128, 4),
+            (128, 6),
+            (128, 8),
+            (256, 6),
+            (256, 8),
+            (384, 8),
+        ]
+        and gating_output.dtype in [dtypes.bf16, dtypes.fp32]
+        and gating_output.is_contiguous()
+    ):
         if topk_weights is None:
             topk_weights = torch.empty(
                 (M + 3) // 4 * 4, topk, dtype=dtypes.fp32, device=hidden_states.device

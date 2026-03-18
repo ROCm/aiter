@@ -1168,14 +1168,6 @@ namespace py = pybind11;
           py::arg("gating_output"),                                            \
           py::arg("need_renorm"),                                              \
           "Apply topk softmax to the gating outputs.");                        \
-    m.def("topk_softmax_asm",                                                  \
-          &topk_softmax_asm,                                                   \
-          py::arg("topk_weights"),                                             \
-          py::arg("topk_indices"),                                             \
-          py::arg("token_expert_indices"),                                     \
-          py::arg("gating_output"),                                            \
-          py::arg("need_renorm"),                                              \
-          "Apply topk softmax to the gating outputs.");                        \
     m.def("grouped_topk",                                                      \
           &grouped_topk,                                                       \
           py::arg("gating_output"),                                            \

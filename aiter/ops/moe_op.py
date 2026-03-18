@@ -22,7 +22,7 @@ def topk_softmax(
 ) -> None: ...
 
 
-@compile_ops("module_moe_asm")
+@compile_ops("module_moe_asm", fc_name="topk_softmax_asm", ffi_type="ctypes")
 def topk_softmax_asm(
     topk_weights: Tensor,
     topk_indices: Tensor,

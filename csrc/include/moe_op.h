@@ -1,6 +1,6 @@
 #pragma once
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_enum.h"
 #include <torch/extension.h>
 
@@ -166,12 +166,6 @@ void moe_stage1_g1u1(
     std::optional<torch::Tensor> a1_scale, // [token_cnt, 1], token scale
     std::optional<torch::Tensor> w1_scale, // [expert, 1, inter_dim], gate(up) scale
     std::optional<torch::Tensor> sorted_weights);
-
-void topk_softmax_asm(torch::Tensor& topk_weights,         // [num_tokens, topk]
-                      torch::Tensor& topk_indices,         // [num_tokens, topk]
-                      torch::Tensor& token_expert_indices, // [num_tokens, topk]
-                      torch::Tensor& gating_output,        // [num_tokens, num_experts]
-                      bool need_renorm);
 
 namespace aiter {
 

@@ -114,6 +114,7 @@ def test_topk_softmax(dtype, token, E, topk, renormalize=True):
             and dtype in [dtypes.bf16, dtypes.fp32]
         ):
             continue
+        gating_output = gating_output.contiguous() if tag == "asm" else gating_output
         (topk_weights, topk_ids), us = func(gating_output, topk, renormalize)
         topk_ids = topk_ids.to(dtypes.i32)
         id, _ref = torch.sort(topk_ids)
