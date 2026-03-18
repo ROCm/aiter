@@ -1950,6 +1950,28 @@ namespace py = pybind11;
           py::arg("cache_seqlens")      = torch::Tensor(),                     \
           py::arg("conv_state_indices") = torch::Tensor(),                     \
           py::arg("pad_slot_id")        = -1);
+
+#define SPLIT_GDR_DECODE_HIP_PYBIND                                              \
+    m.def("fused_split_gdr_update",                                               \
+          &aiter::fused_split_gdr_update,                                         \
+          "Fused split GDR decode update (HIP, ksplit4_db backend).",            \
+          py::arg("mixed_qkv"),                                                   \
+          py::arg("A_log"),                                                       \
+          py::arg("a"),                                                           \
+          py::arg("dt_bias"),                                                     \
+          py::arg("b_gate"),                                                      \
+          py::arg("initial_state_source"),                                        \
+          py::arg("initial_state_indices"),                                       \
+          py::arg("key_dim"),                                                     \
+          py::arg("value_dim"),                                                   \
+          py::arg("num_heads_qk"),                                                \
+          py::arg("num_heads_v"),                                                 \
+          py::arg("head_dim"),                                                    \
+          py::arg("softplus_beta")          = 1.0f,                               \
+          py::arg("softplus_threshold")     = 20.0f,                              \
+          py::arg("scale")                  = -1.0f,                              \
+          py::arg("use_qk_l2norm_in_kernel") = true,                              \
+          py::arg("output") = c10::nullopt);
 #define MLA_HK_PYBIND                   \
     m.def("hk_mla_decode_fwd",          \
           &hk_mla_decode_fwd,           \
