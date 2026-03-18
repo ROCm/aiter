@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from transformers.activations import ACT2FN
 import aiter
 from aiter.test_common import run_perftest, checkAllclose, benchmark
 from aiter import dtypes
@@ -97,25 +98,6 @@ def test_silu_and_mul(m, n, dtype, output_dtype=None):
     ret["WR TB/s"] = (out.nbytes) / us_aiter / 1e6
     ret["err"] = err
     return ret
-
-
-@benchmark()
-def test_gelu_tanh_and_mul(m, n, dtype):
-    ret = {}
-    input = torch.randn(m, n, dtype=dtype, device="cuda")
-    out = torch.empty((m, n // 2), dtype=dtype, device="cuda")
-    ref = torch_gelu_tanh_and_mul(input)
-    _, us_aiter = run_perftest(aiter.gelu_tanh_and_mul, out, input)
-
-    # Check if the results are close
-    err = checkAllclose(ref, out)
-    ret["us"] = us_aiter
-    ret["TB/s"] = (input.nbytes + out.nbytes) / us_aiter / 1e6
-    ret["err"] = err
-    return ret
-
-
-from transformers.activations import ACT2FN
 
 
 def torch_gelu_ref(x: torch.Tensor) -> torch.Tensor:
