@@ -163,12 +163,20 @@ __global__ void add_rmsnorm_quant_kernel(
                 }
                 else
                 {
+#if defined(__gfx1250__)
+                    {
+                        __half2 h2 = *reinterpret_cast<__half2*>(&thread_data_weight2[i]);
+                        thread_data_weight_float2[0] = __half2float(__low2half(h2));
+                        thread_data_weight_float2[1] = __half2float(__high2half(h2));
+                    }
+#else
                     asm volatile(
                         "v_cvt_f32_f16_e32 %0 %2\n"
                         "v_cvt_f32_f16_sdwa %1 %2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1\n"
                         : "=v"(thread_data_weight_float2[0]), "=v"(thread_data_weight_float2[1])
                         : "v"(thread_data_weight2[i])
                     );
+#endif
                 }
                 asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(thread_data_float2[i]) : "v"(thread_data_float2[i]), "v"(thread_data_weight_float2));
             }
