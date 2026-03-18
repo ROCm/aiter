@@ -447,7 +447,7 @@ def kernel_unified_attention_2d(
                 k_descale_ptr = (
                     k_scale
                     + descale_blk_index
-                    + kv_head_idx * stride_k_cache_scale_1
+                    + kv_head_idx * stride_k_cache_scale_2
                 )
                 k_scale_loaded = tl.load(k_descale_ptr)
             elif SAGE_VERSION == 2: # SAGE V2 Each token has its own scale
