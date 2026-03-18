@@ -315,6 +315,21 @@ jobs:
           aiter_test \
           bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
 
+      - name: Sync CK submodule
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        run: |
+          set -ex
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "Nightly build: syncing latest CK from develop branch..."
+            git submodule set-branch --branch develop 3rdparty/composable_kernel
+            git submodule sync
+            git submodule update --init --recursive --remote --jobs 4
+          else
+            echo "Using pinned CK commit..."
+            git submodule sync
+            git submodule update --init --recursive --depth 1 --jobs 4
+          fi
+
       - name: Show Aiter version
         run: |
           set -ex
@@ -322,7 +337,7 @@ jobs:
           -w /workspace \
           aiter_test \
           bash -c "pip show amd-aiter || true"
-      
+
       - name: Tests
         timeout-minutes: 90
         run: |
