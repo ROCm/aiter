@@ -20,7 +20,6 @@
 #include "hip_compat.h"
 #include "hip_reduce.h"
 #include "quant_utils.cuh"
-#include "quant_common.cuh"
 #include "rope/rope_common.h"
 #include "vec_convert.h"
 #include <torch/cuda.h>
