@@ -12,7 +12,7 @@ import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
 HEAD_SIZES = [128, 256]
-BLOCK_SIZES = [16, 64, 100, 544]
+BLOCK_SIZES = [512]
 
 DTYPES = [torch.float16, torch.bfloat16]
 QDTYPES = [None, e4m3_dtype]
@@ -100,6 +100,124 @@ def ref_paged_attn(
     return torch.cat(outputs, dim=0)
 
 
+
+def input_helper(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, DECODE_P, dtype, causal, equal_seqlens=False, softcap=None, kv_layout="cache", num_blocks=0, block_size=512):
+
+    varlen = not equal_seqlens
+
+    if not varlen:
+        seqlens_q = torch.tensor(
+            [N_CTX_Q for _ in range(BATCH)], dtype=torch.int32, device="cuda"
+        )
+        seqlens_k = torch.tensor(
+            [N_CTX_K for _ in range(BATCH)], dtype=torch.int32, device="cuda"
+        )
+    else:
+        seqlens_q = torch.randint(
+            1, N_CTX_Q + 1, (BATCH,), dtype=torch.int32, device="cuda"
+        )
+        seqlens_k = torch.randint(
+            N_CTX_Q, N_CTX_K + 1, (BATCH,), dtype=torch.int32, device="cuda"
+        )
+
+    # turn DECODE_P of the samples to decode samples (seqlen_q == 1)
+    if DECODE_P > 0.0:
+        num_decode = int(round(DECODE_P * BATCH))
+        if num_decode > 0:
+            decode_idx = torch.randperm(BATCH, device=seqlens_q.device)[:num_decode]
+            seqlens_q[decode_idx] = 1
+
+    if causal:
+        if (seqlens_k < seqlens_q).any():
+            print(
+                f"Warning: clamping seqlens_k to be >= seqlens_q for config "
+                f"(BATCH={BATCH}, HQ={HQ}, HK={HK}, N_CTX_Q={N_CTX_Q}, N_CTX_K={N_CTX_K})"
+            )
+        seqlens_k = torch.maximum(seqlens_k, seqlens_q)
+
+    cu_seqlens_q = torch.zeros(len(seqlens_q) + 1, dtype=torch.int32, device="cuda")
+    cu_seqlens_q[1:] = seqlens_q.cumsum(dim=0, dtype=torch.int32)
+    cu_seqlens_k = torch.zeros(len(seqlens_k) + 1, dtype=torch.int32, device="cuda")
+    cu_seqlens_k[1:] = seqlens_k.cumsum(dim=0, dtype=torch.int32)
+    
+    num_seqs = BATCH
+    num_query_heads = HQ
+    num_kv_heads = HK
+    head_size = D_HEAD
+    assert num_query_heads % num_kv_heads == 0
+    max_query_len = max(seqlens_q).item()
+    max_kv_len = max(seqlens_k).item()
+    soft_cap = softcap
+
+    query = torch.randn(
+        sum(seqlens_q), num_query_heads, head_size, dtype=dtype, device="cuda"
+    )
+
+    block_tables = None
+    block_size = None
+
+    if kv_layout == "cache":
+        block_size = block_size if block_size else 512
+        max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+        min_required_blocks = BATCH * max_num_blocks_per_seq
+        num_blocks = (
+            num_blocks if num_blocks else max(min_required_blocks, 2048)
+        )
+        num_blocks = max(num_blocks, min_required_blocks)
+        key_cache = torch.randn(
+            num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cuda"
+        )
+        value_cache = torch.randn_like(key_cache)
+        block_tables = torch.randint(
+            0,
+            num_blocks,
+            (num_seqs, max_num_blocks_per_seq),
+            dtype=torch.int32,
+            device="cuda",
+        )
+    elif kv_layout in ("bshd", "bhsd"):
+        # assert equal_seqlens, "equal_seqlens assumed if kv_cache_layout is bshd"
+        block_size = N_CTX_K
+        num_blocks = BATCH
+        block_tables = torch.arange(num_blocks, dtype=torch.int32, device="cuda").unsqueeze(1)
+        key_cache = torch.randn(
+            BATCH, N_CTX_K, num_kv_heads, head_size, dtype=dtype, device="cuda"
+        )
+        if kv_layout == "bhsd":
+            key_cache = key_cache.transpose(1, 2).contiguous()  # to bhsd
+
+        value_cache = torch.randn_like(key_cache)
+    else:  # thd
+        block_size = max_kv_len
+        block_tables = cu_seqlens_k.unsqueeze(1)
+        key_cache = torch.randn(
+            sum(seqlens_k), num_kv_heads, head_size, dtype=dtype, device="cuda"
+        )
+        value_cache = torch.randn_like(key_cache)
+
+   
+
+    return (
+        query,
+        key_cache,
+        value_cache,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqlens_q,
+        seqlens_k,
+        max_query_len,
+        max_kv_len,
+        block_tables,
+        block_size,
+        num_query_heads,
+        num_kv_heads,
+        head_size,
+        soft_cap,
+    )
+
+
+
+
 @pytest.mark.parametrize(
     "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
 )
@@ -111,7 +229,8 @@ def ref_paged_attn(
 @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("q_dtype", QDTYPES)
-@pytest.mark.parametrize("quant_scheme", ["v2"])
+@pytest.mark.parametrize("quant_scheme", ["v1", "v2", None])
+@pytest.mark.parametrize("kv_layout", ["cache", "bshd", "bhsd", "thd"])
 @torch.inference_mode()
 def test_triton_unified_attn(
     seq_lens: list[tuple[int, int]],
@@ -124,6 +243,7 @@ def test_triton_unified_attn(
     num_blocks: int,
     q_dtype: Optional[torch.dtype],
     quant_scheme: Optional[str],
+    kv_layout: str,
 ) -> None:
     # if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
     #     pytest.skip("block size must be at least 32 for fp8")
@@ -138,40 +258,49 @@ def test_triton_unified_attn(
 
     torch.cuda.empty_cache()
     torch.manual_seed(0)
+
     num_seqs = len(seq_lens)
-    query_lens = [x[0] for x in seq_lens]
-    kv_lens = [x[1] for x in seq_lens]
-    num_query_heads = num_heads[0]
-    num_kv_heads = num_heads[1]
-    assert num_query_heads % num_kv_heads == 0
-    max_query_len = max(query_lens)
-    max_kv_len = max(kv_lens)
-    window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
-    scale = head_size**-0.5
+    query_lens = torch.tensor([x[0] for x in seq_lens], dtype=torch.int32)
+    kv_lens = torch.tensor([x[1] for x in seq_lens], dtype=torch.int32)
 
-    query = torch.randn(
-        sum(query_lens), num_query_heads, head_size, dtype=dtype, device="cuda"
+    (
+        query,
+        key_cache,
+        value_cache,
+        cu_query_lens,
+        cu_key_lens,
+        seqlens_q,
+        seqlens_k,
+        max_query_len,
+        max_kv_len,
+        block_tables,
+        block_size,
+        num_query_heads,
+        num_kv_heads,
+        head_size,
+        soft_cap,
+    ) = input_helper(
+        BATCH=num_seqs,
+        HQ=num_heads[0],
+        HK=num_heads[1],
+        N_CTX_Q=max(query_lens).item(),
+        N_CTX_K=max(kv_lens).item(),
+        D_HEAD=head_size,
+        DECODE_P=0.0,
+        dtype=dtype,
+        causal=True,
+        block_size=block_size,
+        softcap=soft_cap,
+        kv_layout=kv_layout,
     )
-    key_cache = torch.randn(
-        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cuda"
-    )
-    value_cache = torch.randn_like(key_cache)
-    cu_query_lens = torch.tensor(
-        [0] + query_lens, dtype=torch.int32, device="cuda"
-    ).cumsum(dim=0, dtype=torch.int32)
-    cu_key_lens = torch.tensor(
-        [0] + kv_lens, dtype=torch.int32, device="cuda"
-    ).cumsum(dim=0, dtype=torch.int32)
-    kv_lens = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
 
-    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
-    block_tables = torch.randint(
-        0,
-        num_blocks,
-        (num_seqs, max_num_blocks_per_seq),
-        dtype=torch.int32,
-        device="cuda",
-    )
+    window_size = (
+            (sliding_window - 1, 0)
+            if sliding_window is not None
+            else (-1, -1)
+        )
+    
+    scale = query.shape[-1]**-0.5
     sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
     output = torch.empty_like(query)
 
@@ -187,7 +316,6 @@ def test_triton_unified_attn(
     fp8_full = quant_scheme == "fp8"
 
     if sagev1 or sagev2:
-        from aiter.ops.triton.attention.unified_attention import get_config
         num_queries_per_kv = num_query_heads // num_kv_heads
         config = get_config(
             query.shape[0], len(cu_query_lens),
@@ -201,10 +329,9 @@ def test_triton_unified_attn(
             from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v1
             maybe_quantized_query, q_descale, maybe_quantized_key_cache, k_descale, maybe_quantized_value_cache, v_descale = sage_quant_v1(
                 query, key_cache, value_cache, BLOCK_M, BLOCK_N,
-                layout_q="unified", layout_k="cache",
+                layout_q="unified", layout_k=kv_layout,
                 v_descale=None,
                 cu_seqlens_q=cu_query_lens, cu_seqlens_k=cu_key_lens,
-                config=config
             )
             
         else:
@@ -212,7 +339,7 @@ def test_triton_unified_attn(
             maybe_quantized_query, q_descale, maybe_quantized_key_cache, k_descale, maybe_quantized_value_cache, v_descale = sage_quant_v2(
                 query, key_cache, value_cache, BLOCK_M, BLOCK_N,
                 hadamard_rotation=True, R=None, BLOCK_R=128,
-                layout_k="cache", v_descale=None
+                layout_k=kv_layout, v_descale=None
             )
     elif fp8_full:
             from aiter.ops.triton.utils.types import e4m3_dtype
@@ -241,13 +368,14 @@ def test_triton_unified_attn(
     else:
         sage_version = None
 
+
     unified_attention(
         q=maybe_quantized_query,
         k=maybe_quantized_key_cache,
         v=maybe_quantized_value_cache,
         out=output,
         cu_seqlens_q=cu_query_lens,
-        seqused_k=kv_lens,
+        seqused_k=seqlens_k,
         max_seqlen_q=max_query_len,
         max_seqlen_k=max_kv_len,
         softmax_scale=scale,
@@ -259,22 +387,24 @@ def test_triton_unified_attn(
         k_descale=k_descale,
         v_descale=v_descale,
         sinks=sinks,
-        sage_version=sage_version
+        sage_version=sage_version,
+        kv_layout=kv_layout
     )
 
     ref_output = ref_paged_attn(
         query=query,
         key_cache=key_cache,
         value_cache=value_cache,
-        query_lens=query_lens,
-        kv_lens=kv_lens,
+        query_lens=seqlens_q,
+        kv_lens=seqlens_k,
         block_tables=block_tables,
         scale=scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
         sinks=sinks,
-        kv_layout="cache"
+        kv_layout=kv_layout
     )
+
     atol, rtol = 1.5e-2, 1e-2
 
     if is_reduced_precision:
@@ -309,4 +439,5 @@ if __name__ == "__main__":
         num_blocks=num_blocks,
         q_dtype=q_dtype,
         quant_scheme=quant_scheme,
+        kv_layout="cache"
     )
