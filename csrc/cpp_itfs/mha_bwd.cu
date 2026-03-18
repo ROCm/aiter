@@ -3,6 +3,7 @@
 #include "asm_fmha_v3_bwd_configs.hpp"
 #include <memory>
 #include <string>
+#include <mutex>
 
 namespace aiter {
 std::tuple<int, int> get_padded_hdim(int hdim_q, int hdim_v, std::string arch_id)
@@ -360,7 +361,9 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     AiterAsmKernel* impl_ptr_pre    = nullptr;
     AiterAsmKernel* impl_ptr_dqdkdv = nullptr;
     AiterAsmKernel* impl_ptr_post   = nullptr;
+    static std::mutex impl_ptr_mutex;
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+#define LOCK_IMPL_PTR_MAP   std::lock_guard<std::mutex> lock(impl_ptr_mutex)
 
     auto it_pre = pre_cfgs->find(pre_kernel);
     if(it_pre != pre_cfgs->end())
@@ -370,6 +373,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         const char* co_name = cfg.co_name.c_str();
         ts_odo              = cfg.ts;
 
+        LOCK_IMPL_PTR_MAP;
         auto result = impl_ptr_map.emplace(name, nullptr);
         if(result.second)
         {
@@ -391,6 +395,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         const char* co_name = cfg.co_name.c_str();
         ts_kv               = cfg.ts;
 
+        LOCK_IMPL_PTR_MAP;
         auto result = impl_ptr_map.emplace(name, nullptr);
         if(result.second)
         {
@@ -414,6 +419,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
             const char* co_name = cfg.co_name.c_str();
             ts_dq               = cfg.ts;
 
+            LOCK_IMPL_PTR_MAP;
             auto result = impl_ptr_map.emplace(name, nullptr);
             if(result.second)
             {
@@ -427,6 +433,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
             return -1;
         }
     }
+#undef LOCK_IMPL_PTR_MAP
 
     if(a.v3_api_check)
         return 1;
