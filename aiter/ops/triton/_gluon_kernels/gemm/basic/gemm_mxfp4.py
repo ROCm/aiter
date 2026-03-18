@@ -68,10 +68,10 @@ def depreshuffle_b_raw_to_kn(
 ):
     # raw -> logical [BLOCK_K_BYTES, BLOCK_N]
     return (
-        b_raw.reshape(1, BLOCK_N // 16, BLOCK_K // 64, 2, 16, 16)
-        .permute(0, 1, 4, 2, 3, 5)
-        .reshape(BLOCK_N, BLOCK_K_BYTES)
-        .trans(1, 0)
+        b_raw.reshape((1, BLOCK_N // 16, BLOCK_K // 64, 2, 16, 16))
+        .permute((0, 1, 4, 2, 3, 5))
+        .reshape((BLOCK_N, BLOCK_K_BYTES))
+        .permute((1, 0))
     )
 
 
@@ -338,7 +338,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
 
         # B operand (raw unshuffle -> logical)
         B = depreshuffle_b_raw_to_kn(
-                smem_B.index(slot_c), BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BLOCK_K_BYTES=BLOCK_K_BYTES
+                smem_B.index(slot_c), BLOCK_N=BLOCK_SIZE_N, BLOCK_K=BLOCK_SIZE_K, BLOCK_K_BYTES=BLOCK_K_BYTES
             ).load(layout=dot_b_layout)
 
         # scales: unshuffle -> load with wmma scale layouts
@@ -367,7 +367,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
             A = smem_A.index(slot_c).load(layout=dot_a_layout)
 
             B = depreshuffle_b_raw_to_kn(
-                smem_B.index(slot_c), BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BLOCK_K_BYTES=BLOCK_K_BYTES
+                smem_B.index(slot_c), BLOCK_N=BLOCK_SIZE_N, BLOCK_K=BLOCK_SIZE_K, BLOCK_K_BYTES=BLOCK_K_BYTES
             ).load(layout=dot_b_layout)
 
             if BLOCK_SIZE_M < 32:
