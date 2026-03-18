@@ -188,6 +188,24 @@ def mla_decode_fwd(
     persistent_mode = work_meta_data is not None
 
     io_transformed = False
+    forced_head_pad = False
+    o_out = o
+
+    # Pad nhead=8 to nhead=16 for ASM kernel compatibility
+    if nhead == 8 and not persistent_mode:
+        forced_head_pad = True
+        padded_nhead = 16
+        q_padded = torch.empty(
+            (total_s, padded_nhead, qk_head_dim), dtype=q.dtype, device=device
+        )
+        q_padded[:, :nhead, :] = q
+        q_padded[:, nhead:, :].zero_()
+        o_padded = torch.empty(
+            (total_s, padded_nhead, v_head_dim), dtype=o.dtype, device=device
+        )
+        q = q_padded
+        o = o_padded
+        nhead = padded_nhead
 
     if not persistent_mode:
         if num_kv_splits is None or num_kv_splits_indptr is None:
@@ -255,7 +273,12 @@ def mla_decode_fwd(
                 and nhead in [32, 64]
             )
         ):
-            return logits.view(total_s, nhead, v_head_dim), attn_lse
+            if forced_head_pad:
+                o_out.copy_(o[:, :ori_nhead, :])
+                logits = logits[:, :, :ori_nhead, :]
+                attn_lse = attn_lse[:, :, :ori_nhead, :]
+                return logits.reshape(total_s, ori_nhead, v_head_dim), attn_lse
+            return logits.reshape(total_s, nhead, v_head_dim), attn_lse
 
         Lv = v_head_dim
         BLOCK_DV = triton.next_power_of_2(Lv)
@@ -283,6 +306,10 @@ def mla_decode_fwd(
             num_stages=2,
             **extra_kargs,
         )
+
+        if forced_head_pad:
+            o_out.copy_(o[:, :ori_nhead, :])
+
     else:
         if num_kv_splits is None:
             num_kv_splits = get_cu_num()
@@ -442,6 +469,11 @@ def mla_decode_fwd(
                     .reshape(ori_total_s, ori_nhead)
                     .contiguous()
                 )
+
+    if forced_head_pad:
+        logits = logits[..., :ori_nhead, :]
+        if final_lse is not None:
+            final_lse = final_lse[:, :ori_nhead]
 
     return logits, final_lse
 
