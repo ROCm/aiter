@@ -20,9 +20,10 @@ op_tests/opus/
 │   ├── test_dtype_convert.cu    # FP32<->BF16/FP16/FP8/FP4 round-trip kernels
 │   ├── test_load_store_if.cu    # Predicated load/store + free function API tests
 │   ├── test_numeric_limits.cu   # opus::numeric_limits kernel
+│   ├── test_finfo.cu            # opus::finfo kernel
 │   ├── test_mdiv.cu             # opus::magic_div kernel
 │   ├── test_workgroup_barrier.cu# Workgroup barrier kernel
-│   ├── setup.py                 # Parallel hipcc build: 11 .cu -> .o -> .so
+│   ├── setup.py                 # Parallel hipcc build: 12 .cu -> .o -> .so
 │   └── test_opus_device.py      # Python test runner (builds .so, runs all tests)
 ├── run_tests.sh                 # Runs host test + device tests
 └── README.md
@@ -110,18 +111,19 @@ Total wall clock                    ~6.9 s
 ### Per-file device compile times
 
 ```
-test_vector_add.cu         187 ms
-test_async_load.cu         185 ms
-test_numeric_limits.cu     191 ms
-test_workgroup_barrier.cu  216 ms
-test_mdiv.cu               243 ms
-test_mxfp.cu               248 ms
-test_load_store_if.cu      354 ms
-test_dtype_convert.cu      506 ms
-test_mfma_f32.cu         1,445 ms
-test_mfma_f8.cu          1,654 ms
-test_mfma_f16.cu         1,712 ms  <-- critical path
-link                        31 ms
+test_finfo.cu              127 ms
+test_async_load.cu         130 ms
+test_numeric_limits.cu     143 ms
+test_vector_add.cu         147 ms
+test_workgroup_barrier.cu  147 ms
+test_mdiv.cu               167 ms
+test_load_store_if.cu      216 ms
+test_mxfp.cu               224 ms
+test_dtype_convert.cu      292 ms
+test_mfma_f32.cu           769 ms
+test_mfma_f16.cu           863 ms
+test_mfma_f8.cu            884 ms  <-- critical path
+link                        25 ms
 ```
 
 ## How to add a new device test
@@ -232,10 +234,11 @@ In `device/test_opus_device.py`:
 | `test_load_store_if` | free_func_vector_add | Free functions `opus::load`/`opus::store`, `is_gmem_v`/`is_mem_v` type traits | all |
 | `test_load_store_if` | predicated_async_load | `gmem::async_load_if`, free function `opus::async_load_if`, `layout_linear::operator+` | all |
 | `test_numeric_limits` | all types | `opus::numeric_limits<T>` for fp32/fp16/bf16/fp8/bf8/i32/i16/i8/u8 | all |
+| `test_finfo` | all float types | `opus::finfo<T>` (eps/max/min/tiny/bits) for fp32/fp16/bf16/fp8/bf8/fp4/e8m0 | all |
 | `test_mdiv` | 11 divisors | `opus::magic_div` integer division by magic multiply | all |
 | `test_workgroup_barrier` | cumulative + streamk | `opus::workgroup_barrier` cross-workgroup synchronization | all |
 
-Total: **50+ test calls** (14 MFMA + 4 MXFP + 1 vector_add + 1 async_load + 11 dtype_convert + 3 load_store_if + 9 numeric_limits + 11 mdiv + 4 workgroup_barrier).
+Total: **50+ test calls** (14 MFMA + 4 MXFP + 1 vector_add + 1 async_load + 11 dtype_convert + 3 load_store_if + 9 numeric_limits + 7 finfo + 11 mdiv + 4 workgroup_barrier).
 
 ## Notes
 
