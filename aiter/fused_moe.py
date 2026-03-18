@@ -13,7 +13,14 @@ import torch
 from aiter import ActivationType, QuantType, dtypes
 from aiter import get_hip_quant as get_quant
 from aiter import logger
-from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
+from aiter.jit.core import (
+    AITER_CONFIGS,
+    AITER_CSRC_DIR,
+    ENABLE_CK,
+    PY,
+    bd_dir,
+    mp_lock,
+)
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.utils import is_flydsl_available
@@ -753,6 +760,9 @@ def get_2stage_cfgs(
         use_g1u1,
         doweight_stage1,
     )
+    # When CK is disabled, bypass tuned 2-stage configs entirely so the
+    # 1-stage path computes block_m and kernel names from the start.
+    force_1stage = not ENABLE_CK
 
     def MainFunc():
         with open(untune_file, "a") as f:
@@ -789,17 +799,19 @@ def get_2stage_cfgs(
             return False
         return True
 
-    # cfg = cfg_2stages.get(keys, None)
-    cfg = cfg_2stages.get(keys, None) if cfg_2stages and use_cfg() else None
-    if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
+    cfg = (
+        None
+        if force_1stage
+        else (cfg_2stages.get(keys, None) if cfg_2stages and use_cfg() else None)
+    )
+    if not force_1stage and cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{keys}")
         mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
         cfg_2stages = get_cfg_2stages(tune_file)
-        # cfg = cfg_2stages.get(keys, None)
         cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
-    if cfg is not None and not is_flydsl_available():
+    if not force_1stage and cfg is not None and not is_flydsl_available():
         kn1 = str(cfg.get("kernelName1", ""))
         kn2 = str(cfg.get("kernelName2", ""))
         if kn1.startswith("flydsl_") or kn2.startswith("flydsl_"):
@@ -822,8 +834,8 @@ def get_2stage_cfgs(
         ksplit = 0
         kernelName1 = ""
         kernelName2 = ""
-        run_1stage = False
-        if (
+        run_1stage = force_1stage
+        if not force_1stage and (
             activation,
             q_type,
             dtype,
@@ -834,7 +846,7 @@ def get_2stage_cfgs(
         ) in fused_moe_1stage_dict[get_gfx()]:
             if q_type == QuantType.per_1x128:
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
-                run_1stage = token > 32 and (inter_dim % 256 == 0)
+                run_1stage = token > 32 and (inter_dim % 128 == 0)
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:

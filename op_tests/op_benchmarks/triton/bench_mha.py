@@ -532,6 +532,41 @@ def run_benchmark(custom, args):
                     )
                     return grads
 
+        if args.profile is not None:
+            import os
+
+            # Warmup
+            for _ in range(3):
+                fn()
+                torch.cuda.synchronize()
+
+            prof = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=True,
+                with_stack=True,
+            )
+            prof.start()
+            for _ in range(5):
+                fn()
+                torch.cuda.synchronize()
+            prof.stop()
+
+            shape_str = f"B{BATCH}_HQ{HQ}_HK{HK}_SQ{N_CTX_Q}_SK{N_CTX_K}_D{D_HEAD}"
+            print(f"\n--- Profile: {mode} {shape_str} ---")
+            print(
+                prof.key_averages().table(
+                    sort_by="self_cuda_time_total",
+                    row_limit=30,
+                )
+            )
+            trace_dir = os.path.join(args.profile, f"{mode}_{shape_str}")
+            os.makedirs(trace_dir, exist_ok=True)
+            prof.export_chrome_trace(os.path.join(trace_dir, "trace.json"))
+            return 0
+
         ms = triton.testing.do_bench(fn)
 
         if mode == "bwd":
@@ -646,6 +681,13 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
+    )
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help="Enable torch.profiler and write chrome traces to DIR.",
     )
     parser.add_argument(
         "-sink", action="store_true", default=False, help="use attention sink"
