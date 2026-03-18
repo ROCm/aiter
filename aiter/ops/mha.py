@@ -6,7 +6,7 @@ from typing import Any, Optional, Tuple
 import torch
 from torch import Generator, Tensor
 
-from ..jit.core import CK_DIR, AITER_META_DIR, compile_ops
+from ..jit.core import CK_DIR, AITER_META_DIR, ENABLE_CK, compile_ops
 from ..jit.utils.chip_info import get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..jit.utils.mha_recipes import (
@@ -2060,7 +2060,48 @@ def _flash_attn_varlen_forward(
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
 
-    if can_impl_fmha_v3_fwd():
+    can_impl_fmha_v3_fwd_triton = (
+        not ENABLE_CK
+        and can_impl_fmha_v3_fwd()
+        and not return_lse
+        and not return_softmax
+        and block_table is None
+        and bias is None
+        and alibi_slopes is None
+        and cu_seqlens_q_padded is None
+        and cu_seqlens_k_padded is None
+        and sink_ptr is None
+        and not torch.is_grad_enabled()
+    )
+
+    if can_impl_fmha_v3_fwd_triton:
+        from .triton.attention.mha_v3 import (
+            flash_attn_varlen_func as flash_attn_varlen_func_v3_triton,
+        )
+
+        out = flash_attn_varlen_func_v3_triton(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            window_size=(window_size_left, window_size_right),
+            attention_chunk=0,
+            softcap=logits_soft_cap,
+            deterministic=False,
+            sm_margin=0,
+        )
+        softmax_lse = torch.empty((0,), device=q.device, dtype=torch.float32)
+        S_dmask = torch.empty((0,), device=q.device, dtype=torch.uint8)
+        rng_state = torch.empty((0,), device=q.device, dtype=torch.int64)
+    elif can_impl_fmha_v3_fwd():
         out, softmax_lse, S_dmask, rng_state = fmha_v3_varlen_fwd(
             q,
             k,

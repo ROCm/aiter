@@ -304,7 +304,11 @@ FMoeKernel* get_heuristic_kernel(
                     ", smf: ",
                     smf,
                     ", vskip: ",
-                    vskip);
+                    vskip,
+                    ", block_size_M: ",
+                    block_size_M,
+                    ", arch_id: ",
+                    arch_id);
     }
     auto it = cfgs->find(selectedKl);
     if(it != cfgs->end())
