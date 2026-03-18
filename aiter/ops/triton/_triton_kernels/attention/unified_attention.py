@@ -683,9 +683,6 @@ def kernel_unified_attention_3d(
     if SAGE_VERSION == 2:
         offs_d_qk = tl.arange(0, HEAD_SIZE_PADDED // 2)
         offs_d_scale = tl.arange(0, HEAD_SIZE_PADDED // 32)
-    elif SAGE_VERSION == 1:
-        offs_d_qk = tl.arange(0, HEAD_SIZE_PADDED)
-        offs_d_scale = tl.arange(0, HEAD_SIZE_PADDED)
     else:
         offs_d_qk = tl.arange(0, HEAD_SIZE_PADDED)
         offs_d_scale = None

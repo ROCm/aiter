@@ -261,23 +261,11 @@ def test_triton_unified_attn(
     )
     atol, rtol = 1.5e-2, 1e-2
 
-    print("q_descale", q_descale.flatten()[0:10])
-    print("k_descale", k_descale.flatten()[0:10])
     if is_reduced_precision:
         atol, rtol = 1.5e-1, 1.5e-1
-    # torch.testing.assert_close(
-    #     output, ref_output, atol=atol, rtol=rtol
-    # ), f"{torch.max(torch.abs(output - ref_output))}"
-
-    # temp. fix for gpu memory leakage due to correctness mismatch build up
-    max_abs_diff = torch.max(torch.abs(output.float() - ref_output.float())).item()
-    all_close = max_abs_diff <= atol
-    del output, ref_output, query, key_cache, value_cache, block_tables, sinks
-    del maybe_quantized_query, maybe_quantized_key_cache, maybe_quantized_value_cache
-    del q_descale, k_descale, v_descale
-    import gc; gc.collect()
-    torch.cuda.empty_cache()
-    assert all_close, f"max abs diff = {max_abs_diff} (atol={atol})"
+    torch.testing.assert_close(
+        output, ref_output, atol=atol, rtol=rtol
+    ), f"{torch.max(torch.abs(output - ref_output))}"
 
 
 

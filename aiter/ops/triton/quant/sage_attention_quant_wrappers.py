@@ -81,22 +81,37 @@ def perblock_quantize_int8(
     layout="bhsd",
     sm_scale=None,
 ):  
-    # TODO assume contiguous
     d = q.shape[-1]
     if layout=="thd":
         b = len(cu_seqlens) - 1 # skip the last element since it's len(seqlens)
         h = q.shape[1]
         s = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item() 
+        stride_b = 0
         stride_m = h * d
         stride_h = d
         kernel_cu_seqlens = cu_seqlens
     elif layout=="bhsd":
         b,h,s,_ = q.shape
-        stride_m = d
+        stride_b = q.stride(0)
+        stride_m = q.stride(2)
+        stride_h = q.stride(1)
+        kernel_cu_seqlens = None
     elif layout=="bshd":
         b,s,h,d = q.shape
+        stride_b = q.stride(0)
+        stride_m = q.stride(1)
+        stride_h = q.stride(2)
+        kernel_cu_seqlens = None
+    else: # num_blocks,block_size,h,d = q.shape
+        b,s,h,d = q.shape
+        stride_b = q.stride(0)
+        stride_m = q.stride(1)
+        stride_h = q.stride(2)
+        kernel_cu_seqlens = None
 
-    total_num_blocks = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+    num_pid_m = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+    total_num_blocks = num_pid_m * b
+
     Q_q = torch.empty((*q.shape[:-1], d), dtype=torch.int8, device=q.device)
     DTYPE_MAX = torch.iinfo(torch.int8).max
 
@@ -105,16 +120,17 @@ def perblock_quantize_int8(
     # thd: cu_seqlens = cu_seqlens
     # cache: cu_seqlens = block_size, 2 block_size, 3 block_size,...
     Q_descale = torch.empty(
-        (total_num_blocks * b, h), dtype=torch.float32, device=q.device
+        (total_num_blocks, h), dtype=torch.float32, device=q.device
     )
-    grid = (b, total_num_blocks, h)
+    num_pid_m = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+    grid = (b, num_pid_m, h)
 
     perblock_quantize_kernel[grid](
         q, Q_q, Q_descale, s, kernel_cu_seqlens,
         stride_b, stride_m, stride_h,
         Q_descale.stride(0), Q_descale.stride(1),
         BLOCK_SIZE_M, d, sm_scale, DTYPE_MAX)
-    
+
     return Q_q, Q_descale
 
 
@@ -180,27 +196,6 @@ def perchannel_quantize_fp8(
     FP8_TYPE = aiter.dtypes.fp8
     FP8_MAX = torch.finfo(FP8_TYPE).max
     v_q = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
-
-    if layout_k=="bhsd":
-        reduce_dims = (0,2)
-        stride_h = v.stride(1)
-        stride_t = v.stride(2)
-        num_heads = v.shape[1]
-    elif layout_k=="bshd":
-        reduce_dims = (0,1)
-        stride_h = v.stride(2)
-        stride_t = v.stride(1)
-        num_heads = v.shape[2]
-    elif layout_k=="thd":
-        reduce_dims = (0,)
-        stride_h = v.stride(1)
-        stride_t = v.stride(0)
-        num_heads = v.shape[1]
-    else: # (num_blocks, block_size, h, d)
-        reduce_dims = (0,1)
-        stride_h = v.stride(2)
-        stride_t = v.stride(1)
-        num_heads = v.shape[2]
 
     if v_descale is None:
         if layout_k=="bhsd":
