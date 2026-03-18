@@ -42,7 +42,8 @@ torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y
+    torch::Tensor &Y,
+    int KBatch
     )
 {{{{
     // The smallest kernel we have available. Works well for memory bound shapes.
@@ -79,7 +80,7 @@ torch::Tensor
             {k.MWTile}, {k.NWTile}, {k.KWTile},
             ck_tile::GemmPipelineScheduler::{k.sScheduler}>;
         // Run kernel instance.
-        return gemm_a8w8_bpreshuffle_cktile_impl<DDataType, EDataType, FlatmmInstance>(XQ, WQ, x_scale, w_scale, Y);
+        return gemm_a8w8_bpreshuffle_cktile_impl<DDataType, EDataType, FlatmmInstance>(XQ, WQ, x_scale, w_scale, Y, KBatch);
 """
         if self.istune:
             INSTANCE_IMPL_str = INSTANCE_IMPL.format(
@@ -115,7 +116,8 @@ template torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y
+    torch::Tensor &Y,
+    int KBatch
     );
 
 """
@@ -193,7 +195,8 @@ torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y);
+    torch::Tensor &Y,
+    int KBatch);
 """
         MAINFEST_end = """
 

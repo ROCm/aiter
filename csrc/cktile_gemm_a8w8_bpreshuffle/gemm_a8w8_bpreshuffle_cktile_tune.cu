@@ -8,7 +8,7 @@
 #include <string>
 
 using RowwiseKernel = std::function<torch::Tensor(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&)>;
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int)>;
 
 // For certain high priority shapes, we directly use the best kernel rather
 // than use heuristics.
@@ -78,7 +78,7 @@ torch::Tensor gemm_a8w8_bpreshuffle_cktile_tune(torch::Tensor& XQ,
 
     if(Y.dtype() == at::ScalarType::BFloat16)
     {
-        rowwise_dispatch<F32, BF16>(kernelId)(XQ, WQ, x_scale, w_scale, Y);
+        rowwise_dispatch<F32, BF16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, KBatch);
     }
     else
     {

@@ -303,8 +303,8 @@ gemm_a8w8_bpreshuffle_cktile_impl(torch::Tensor& XQ,
                                   torch::Tensor& WQ,
                                   torch::Tensor& x_scale,
                                   torch::Tensor& w_scale,
-                                  torch::Tensor& out // Out:[M, N] fp16
-)
+                                  torch::Tensor& out, // Out:[M, N] fp16
+                                  int KBatch = 1)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
@@ -334,7 +334,7 @@ gemm_a8w8_bpreshuffle_cktile_impl(torch::Tensor& XQ,
         ck_tile::FlatmmScalePointer<1>{reinterpret_cast<AccDataType*>(w_scale.data_ptr()), n};
     args.e_ptr = (void*)out.data_ptr();
 
-    args.k_batch  = 1;
+    args.k_batch  = KBatch;
     args.M        = m;
     args.N        = n;
     args.K        = k;
