@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
+#include "aiter_tensor.h"
 #include "asm_fmoe_configs.hpp"
-#include "moe_op.h"
-#include "py_itfs_common.h"
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
-#include <torch/all.h>
-#include <tuple>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 struct __attribute__((packed)) KernelArgs
 {
@@ -98,32 +97,30 @@ class FMoeKernel
     int get_sub_GU() { return sub_GU; }
     void set_4bit(bool is_4bit_) { is_int4 = is_4bit_; }
 
-    template <typename T, typename T_O, bool switchGxy = false>
-    void launch_kernel(torch::Tensor& out,               // [token_cnt, dim]
-                       torch::Tensor& input,             // [token_cnt, dim] M,K
-                       torch::Tensor& w1,                // [expert, inter_dim, dim] N,K
-                       torch::Tensor& w2,                // [expert, dim, inter_dim]
-                       torch::Tensor& sorted_token_ids,  // [max_num_tokens_padded]
-                       torch::Tensor& sorted_weights,    // [max_num_tokens_padded]
-                       torch::Tensor& sorted_expert_ids, // [max_num_m_blocks]
-                       torch::Tensor& num_valid_ids,     // [1]
+    template <int I_elemSize, int O_elemSize, bool switchGxy = false>
+    void launch_kernel(AiterTensor* out,               // [token_cnt, dim]
+                       AiterTensor* input,             // [token_cnt, dim] M,K
+                       AiterTensor* w1,                // [expert, inter_dim, dim] N,K
+                       AiterTensor* w2,                // [expert, dim, inter_dim]
+                       AiterTensor* sorted_token_ids,  // [max_num_tokens_padded]
+                       AiterTensor* sorted_weights,    // [max_num_tokens_padded]
+                       AiterTensor* sorted_expert_ids, // [max_num_m_blocks]
+                       AiterTensor* num_valid_ids,     // [1]
                        uint32_t topk,                    //
-                       std::optional<torch::Tensor> input_dqn     = std::nullopt,
-                       std::optional<torch::Tensor> w1_dqn        = std::nullopt,
-                       std::optional<torch::Tensor> w2_dqn        = std::nullopt,
-                       std::optional<torch::Tensor> w2_smooth_qnt = std::nullopt //
-    )
+                       AiterTensor* input_dqn,         // NULL = not present
+                       AiterTensor* w1_dqn,            // NULL = not present
+                       AiterTensor* w2_dqn,            // NULL = not present
+                       AiterTensor* w2_smooth_qnt,     // NULL = not present
+                       hipStream_t stream)
     {
-        int token_cnt       = out.size(0);
-        int dim             = w2.size(1);
-        int sub_X_cnt       = sorted_expert_ids.size(0);
-        int eprt            = w1.size(0);
-        int inter_dim       = w2.size(2) * (w2.size(1) / w1.size(2));
+        int token_cnt       = out->size(0);
+        int dim             = w2->size(1);
+        int sub_X_cnt       = sorted_expert_ids->size(0);
+        int eprt            = w1->size(0);
+        int inter_dim       = w2->size(2) * (w2->size(1) / w1->size(2));
         uint32_t sub_GU     = this->sub_GU;
-        uint32_t I_elemSize = sizeof(T);
-        uint32_t O_elemSize = sizeof(T_O);
 
-        int stride_X  = input.stride(0) * input.element_size();
+        int stride_X  = input->stride(0) * input->element_size();
         int stride_GU = dim * I_elemSize;
         int stride_D  = inter_dim * I_elemSize;
         if(is_int4)
@@ -134,30 +131,29 @@ class FMoeKernel
         int stride_expert_GU = stride_GU * inter_dim;
         int stride_expert_D  = stride_D * dim;
         int stride_expert_GUDQN =
-            w1_dqn.has_value() ? w1_dqn.value().stride(0) * w1_dqn.value().element_size() : 0;
+            w1_dqn ? w1_dqn->stride(0) * w1_dqn->element_size() : 0;
         int stride_expert_DDQN =
-            w2_dqn.has_value() ? w2_dqn.value().stride(0) * w2_dqn.value().element_size() : 0;
+            w2_dqn ? w2_dqn->stride(0) * w2_dqn->element_size() : 0;
         int stride_expert_SMTDQN = inter_dim * sizeof(float);
         int stride_O             = dim * O_elemSize;
-        if(inter_dim * 2 == w1.size(1))
+        if(inter_dim * 2 == w1->size(1))
         {
             stride_expert_GU *= 2;
-            // stride_expert_GUDQN *= 2;
         }
 
         KernelArgs args;
         size_t arg_size = sizeof(args);
-        args.ptr_O      = out.data_ptr();
-        args.ptr_X      = input.data_ptr();
-        args.ptr_GU     = w1.data_ptr();
-        args.ptr_XC     = num_valid_ids.data_ptr();
-        args.ptr_D      = w2.data_ptr();
-        if constexpr(std::is_same<T, uint8_t>::value)
+        args.ptr_O      = out->data_ptr();
+        args.ptr_X      = input->data_ptr();
+        args.ptr_GU     = w1->data_ptr();
+        args.ptr_XC     = num_valid_ids->data_ptr();
+        args.ptr_D      = w2->data_ptr();
+        if constexpr(I_elemSize == 1)
         {
-            args.ptr_XQ  = input_dqn.value().data_ptr();
-            args.ptr_GUQ = w1_dqn.value().data_ptr();
-            args.ptr_DQ  = w2_dqn.value().data_ptr();
-            args.ptr_SMQ = w2_smooth_qnt.has_value() ? w2_smooth_qnt.value().data_ptr() : nullptr;
+            args.ptr_XQ  = input_dqn->data_ptr();
+            args.ptr_GUQ = w1_dqn->data_ptr();
+            args.ptr_DQ  = w2_dqn->data_ptr();
+            args.ptr_SMQ = w2_smooth_qnt ? w2_smooth_qnt->data_ptr() : nullptr;
         }
         else
         {
@@ -166,9 +162,9 @@ class FMoeKernel
             args.ptr_DQ  = nullptr;
             args.ptr_SMQ = nullptr;
         }
-        args.ptr_STP   = sorted_token_ids.data_ptr();
-        args.ptr_SW    = sorted_weights.data_ptr();
-        args.ptr_SEP   = sorted_expert_ids.data_ptr();
+        args.ptr_STP   = sorted_token_ids->data_ptr();
+        args.ptr_SW    = sorted_weights->data_ptr();
+        args.ptr_SEP   = sorted_expert_ids->data_ptr();
         args.dim       = dim;
         args.inter_dim = inter_dim;
         args.token_cnt = token_cnt;
@@ -211,28 +207,7 @@ class FMoeKernel
             gdy = sub_X_cnt;
             gdz = 1;
         }
-        // std::cout << "sub_GU: " << sub_GU << std::endl;
-        // std::cout << "args.dim: " << args.dim << std::endl;
-        // std::cout << "args.inter_dim: " << args.inter_dim << std::endl;
-        // std::cout << "args.token_cnt: " << args.token_cnt << std::endl;
-        // std::cout << "args.eprt_cnt: " << args.eprt_cnt << std::endl;
-        // std::cout << "args.stride_X: " << args.Xs << std::endl;
-        // std::cout << "args.stride_GU: " << args.GUs << std::endl;
-        // std::cout << "args.stride_D: " << args.Ds << std::endl;
-        // std::cout << "args.stride_O: " << args.Os << std::endl;
-        // std::cout << "args.stride_expert_GU: " << args.eGUs << std::endl;
-        // std::cout << "args.stride_expert_D: " << args.eDs << std::endl;
-        // std::cout << "args.stride_expert_GUDQN: " << args.eGUQs << std::endl;
-        // std::cout << "args.stride_expert_DDQN: " << args.eDQs << std::endl;
-        // std::cout << "args.stride_expert_SMTDQN: " << args.eSMQs << std::endl;
-        // std::cout << "args.topk: " << args.topk << std::endl;
-        // std::cout << "args.ps_deno: " << args.ps_deno << std::endl;
-        // std::cout << "args.total_tgs: " << args.total_tgs << std::endl;
-        // std::cout << "gdx: " << gdx << std::endl;
-        // std::cout << "gdy: " << gdy << std::endl;
 
-        const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
-        const hipStream_t stream = at::hip::getCurrentHIPStream();
         if constexpr(switchGxy)
         {
             HIP_CALL(hipModuleLaunchKernel(
@@ -295,16 +270,16 @@ FMoeKernel* get_heuristic_kernel(
             }
         }
 
-        TORCH_CHECK(selectedKl != "",
-                    __func__,
-                    ": No suitable kernel found for inter_dim: ",
-                    inter_dim,
-                    ", sub_X_cnt: ",
-                    sub_X_cnt,
-                    ", smf: ",
-                    smf,
-                    ", vskip: ",
-                    vskip);
+        AITER_CHECK(selectedKl != "",
+                    __func__
+                    << ": No suitable kernel found for inter_dim: "
+                    << inter_dim
+                    << ", sub_X_cnt: "
+                    << sub_X_cnt
+                    << ", smf: "
+                    << smf
+                    << ", vskip: "
+                    << vskip);
     }
     auto it = cfgs->find(selectedKl);
     if(it != cfgs->end())
@@ -323,7 +298,7 @@ FMoeKernel* get_heuristic_kernel(
         impl_ptr = result.first->second.get();
     }
     else
-        TORCH_CHECK(false, __func__, " not find kernel " + selectedKl);
+        AITER_CHECK(false, __func__ << " not find kernel " << selectedKl);
     return impl_ptr;
 }
 
@@ -362,58 +337,78 @@ int get_heuristic_tile(int inter_dim, int sub_X_cnt, const std::vector<int>& ava
     return selectedTile;
 };
 
-void fmoe(torch::Tensor& out,               // [token_cnt, dim]
-          torch::Tensor& input,             // [token_cnt, dim] M,K
-          torch::Tensor& gate,              // [expert, inter_dim, dim] N,K
-          torch::Tensor& down,              // [expert, dim, inter_dim]
-          torch::Tensor& sorted_token_ids,  // [max_num_tokens_padded]
-          torch::Tensor& sorted_weights,    // [max_num_tokens_padded]
-          torch::Tensor& sorted_expert_ids, // [max_num_m_blocks]
-          torch::Tensor& num_valid_ids,     // [1]
-          uint32_t topk)
+extern "C" __attribute__((visibility("default")))
+void fmoe(AiterTensor* out,               // [token_cnt, dim]
+          AiterTensor* input,             // [token_cnt, dim] M,K
+          AiterTensor* gate,              // [expert, inter_dim, dim] N,K
+          AiterTensor* down,              // [expert, dim, inter_dim]
+          AiterTensor* sorted_token_ids,  // [max_num_tokens_padded]
+          AiterTensor* sorted_weights,    // [max_num_tokens_padded]
+          AiterTensor* sorted_expert_ids, // [max_num_m_blocks]
+          AiterTensor* num_valid_ids,     // [1]
+          int topk,
+          hipStream_t stream)
 {
+    int prev_device;
+    HIP_CALL(hipGetDevice(&prev_device));
+    HIP_CALL(hipSetDevice(input->device_id));
+
     // g1u0
     FMoeKernel* impl_ptr = nullptr;
-    if(input.dtype() == at::ScalarType::Half)
+    if(input->dtype() == AITER_DTYPE_fp16)
     {
         static FMoeKernel impl_f16("fmoe_kernel_func", "fmoe_f16.co");
         impl_ptr = &impl_f16;
     }
-    else if(input.dtype() == at::ScalarType::BFloat16)
+    else if(input->dtype() == AITER_DTYPE_bf16)
     {
         static FMoeKernel impl_b16("fmoe_kernel_func", "fmoe_b16.co");
         impl_ptr = &impl_b16;
     }
-    TORCH_CHECK(
-        impl_ptr != nullptr, __func__, ": unsupport current input type:", input.scalar_type());
-    impl_ptr->launch_kernel<uint16_t, uint16_t>(out,
-                                                input,
-                                                gate,
-                                                down,
-                                                sorted_token_ids,
-                                                sorted_weights,
-                                                sorted_expert_ids,
-                                                num_valid_ids,
-                                                topk);
+    AITER_CHECK(
+        impl_ptr != nullptr, __func__ << ": unsupport current input type:" << AiterDtype_to_str(input->dtype()));
+    impl_ptr->launch_kernel<2, 2>(out,
+                                  input,
+                                  gate,
+                                  down,
+                                  sorted_token_ids,
+                                  sorted_weights,
+                                  sorted_expert_ids,
+                                  num_valid_ids,
+                                  topk,
+                                  nullptr,
+                                  nullptr,
+                                  nullptr,
+                                  nullptr,
+                                  stream);
+
+    HIP_CALL(hipSetDevice(prev_device));
 }
 
-void fmoe_int8_g1u0(torch::Tensor& out,               // [token_cnt, dim]
-                    torch::Tensor& input,             // [token_cnt, dim] M,K
-                    torch::Tensor& gate,              // [expert, inter_dim, dim] N,K
-                    torch::Tensor& down,              // [expert, dim, inter_dim]
-                    torch::Tensor& sorted_token_ids,  // [max_num_tokens_padded]
-                    torch::Tensor& sorted_weights,    // [max_num_tokens_padded]
-                    torch::Tensor& sorted_expert_ids, // [max_num_m_blocks]
-                    torch::Tensor& num_valid_ids,     // [1]
-                    uint32_t topk,                    //
-                    torch::Tensor& input_scale,       // [token_cnt, 1]
-                    torch::Tensor& fc1_scale,         // [expert, 1, inter_dim]
-                    torch::Tensor& fc2_scale,         // [expert, 1, dim]
-                    torch::Tensor& fc2_smooth_scale,  // [expert, 1, inter_dim],
-                    ActivationType activation)
+extern "C" __attribute__((visibility("default")))
+void fmoe_int8_g1u0(AiterTensor* out,               // [token_cnt, dim]
+                    AiterTensor* input,             // [token_cnt, dim] M,K
+                    AiterTensor* gate,              // [expert, inter_dim, dim] N,K
+                    AiterTensor* down,              // [expert, dim, inter_dim]
+                    AiterTensor* sorted_token_ids,  // [max_num_tokens_padded]
+                    AiterTensor* sorted_weights,    // [max_num_tokens_padded]
+                    AiterTensor* sorted_expert_ids, // [max_num_m_blocks]
+                    AiterTensor* num_valid_ids,     // [1]
+                    int topk,                    //
+                    AiterTensor* input_scale,       // [token_cnt, 1]
+                    AiterTensor* fc1_scale,         // [expert, 1, inter_dim]
+                    AiterTensor* fc2_scale,         // [expert, 1, dim]
+                    AiterTensor* fc2_smooth_scale,  // [expert, 1, inter_dim], NULL = not present
+                    int activation,
+                    hipStream_t stream)
 {
+    int prev_device;
+    HIP_CALL(hipGetDevice(&prev_device));
+    HIP_CALL(hipSetDevice(input->device_id));
+
+    ActivationType act = static_cast<ActivationType>(activation);
     FMoeKernel* impl_ptr = nullptr;
-    int inter_dim        = down.size(2);
+    int inter_dim        = down->size(2);
     static std::unordered_map<std::string, std::unique_ptr<FMoeKernel>> impl_ptr_map;
 
     struct FMoeKernelConfig
@@ -423,7 +418,7 @@ void fmoe_int8_g1u0(torch::Tensor& out,               // [token_cnt, dim]
         int tile_size;
     };
 
-    if(input.dtype() == at::ScalarType::Char || input.dtype() == at::ScalarType::Byte)
+    if(input->dtype() == AITER_DTYPE_i8)
     {
         static std::unordered_map<int, FMoeKernelConfig> gelu_kernel_int8_configs = {
             {512,
@@ -451,18 +446,18 @@ void fmoe_int8_g1u0(torch::Tensor& out,               // [token_cnt, dim]
             {128, {"fmoe_int8_g1u0_subGU_128", "fmoe/silu/fmoe_int8_g1u0_subGU_128.co", 128}}};
 
         std::unordered_map<int, FMoeKernelConfig>* config_map = nullptr;
-        if(activation == ActivationType::Gelu)
+        if(act == ActivationType::Gelu)
         {
             config_map = &gelu_kernel_int8_configs;
         }
-        else if(activation == ActivationType::Silu)
+        else if(act == ActivationType::Silu)
         {
             config_map = &silu_kernel_int8_configs;
         }
 
         if(!config_map)
         {
-            TORCH_CHECK(false, __func__, " Input only supput Int8!");
+            AITER_CHECK(false, __func__ << " Input only supput Int8!");
         }
 
         const int tiles[] = {512, 448, 384, 320, 256, 192, 128};
@@ -477,10 +472,10 @@ void fmoe_int8_g1u0(torch::Tensor& out,               // [token_cnt, dim]
         }
         if(selectedTile == 0)
         {
-            TORCH_CHECK(false,
-                        __func__,
-                        " Unsupported inter_dim " + std::to_string(inter_dim) +
-                            ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
+            AITER_CHECK(false,
+                        __func__
+                        << " Unsupported inter_dim " << std::to_string(inter_dim)
+                        << ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
         }
 
         auto it = config_map->find(selectedTile);
@@ -499,37 +494,50 @@ void fmoe_int8_g1u0(torch::Tensor& out,               // [token_cnt, dim]
             impl_ptr = result.first->second.get();
         }
     }
-    impl_ptr->launch_kernel<uint8_t, uint16_t>(out,
-                                               input,
-                                               gate,
-                                               down,
-                                               sorted_token_ids,
-                                               sorted_weights,
-                                               sorted_expert_ids,
-                                               num_valid_ids,
-                                               topk,
-                                               // quant args
-                                               input_scale,
-                                               fc1_scale,
-                                               fc2_scale,
-                                               fc2_smooth_scale);
+    impl_ptr->launch_kernel<1, 2>(out,
+                                   input,
+                                   gate,
+                                   down,
+                                   sorted_token_ids,
+                                   sorted_weights,
+                                   sorted_expert_ids,
+                                   num_valid_ids,
+                                   topk,
+                                   // quant args
+                                   input_scale,
+                                   fc1_scale,
+                                   fc2_scale,
+                                   fc2_smooth_scale,
+                                   stream);
+
+    HIP_CALL(hipSetDevice(prev_device));
 }
-void fmoe_g1u1(torch::Tensor& out,               // [token_cnt, dim]
-               torch::Tensor& input,             // [token_cnt, dim] M,K
-               torch::Tensor& gate,              // [expert, inter_dim*2, dim] N,K
-               torch::Tensor& down,              // [expert, dim, inter_dim]
-               torch::Tensor& sorted_token_ids,  // [max_num_tokens_padded]
-               torch::Tensor& sorted_weights,    // [max_num_tokens_padded]
-               torch::Tensor& sorted_expert_ids, // [max_num_m_blocks]
-               torch::Tensor& num_valid_ids,     // [1]
-               uint32_t topk,                    //
-               torch::Tensor& input_scale,       // [token_cnt, 1]
-               torch::Tensor& fc1_scale,         // [expert, 1, inter_dim]
-               torch::Tensor& fc2_scale,         // [expert, 1, dim]
-               std::string& kernel_name,
-               std::optional<torch::Tensor> fc2_smooth_scale, // [expert, 1, inter_dim]
-               ActivationType activation)
+
+extern "C" __attribute__((visibility("default")))
+void fmoe_g1u1(AiterTensor* out,               // [token_cnt, dim]
+               AiterTensor* input,             // [token_cnt, dim] M,K
+               AiterTensor* gate,              // [expert, inter_dim*2, dim] N,K
+               AiterTensor* down,              // [expert, dim, inter_dim]
+               AiterTensor* sorted_token_ids,  // [max_num_tokens_padded]
+               AiterTensor* sorted_weights,    // [max_num_tokens_padded]
+               AiterTensor* sorted_expert_ids, // [max_num_m_blocks]
+               AiterTensor* num_valid_ids,     // [1]
+               int topk,                    //
+               AiterTensor* input_scale,       // [token_cnt, 1]
+               AiterTensor* fc1_scale,         // [expert, 1, inter_dim]
+               AiterTensor* fc2_scale,         // [expert, 1, dim]
+               const char* kernel_name,
+               AiterTensor* fc2_smooth_scale, // [expert, 1, inter_dim], NULL = not present
+               int activation,
+               hipStream_t stream)
 {
+    int prev_device;
+    HIP_CALL(hipGetDevice(&prev_device));
+    HIP_CALL(hipSetDevice(input->device_id));
+
+    ActivationType act = static_cast<ActivationType>(activation);
+    std::string knlName = (kernel_name != nullptr && kernel_name[0] != '\0') ? kernel_name : "";
+
     struct FMoeKernelConfig
     {
         std::string name;
@@ -540,12 +548,12 @@ void fmoe_g1u1(torch::Tensor& out,               // [token_cnt, dim]
     FMoeKernel* impl_ptr = nullptr;
     CFG* config_map      = nullptr;
     int smf              = 0;
-    int model_dim        = down.size(1);
-    int inter_dim        = down.size(2);
-    inter_dim *= model_dim / gate.size(2);
-    int sub_X_cnt = sorted_expert_ids.size(0);
+    int model_dim        = down->size(1);
+    int inter_dim        = down->size(2);
+    inter_dim *= model_dim / gate->size(2);
+    int sub_X_cnt = sorted_expert_ids->size(0);
     static std::unordered_map<std::string, std::unique_ptr<FMoeKernel>> impl_ptr_map;
-    if(gate.dtype() == at::ScalarType::UInt32 || gate.dtype() == at::ScalarType::Int) // int4
+    if(gate->dtype() == AITER_DTYPE_u32 || gate->dtype() == AITER_DTYPE_i32) // int4
     {
         int selectedTile = get_heuristic_tile(
             inter_dim, sub_X_cnt, {512, 256, 128}); // todo,add tune interface here
@@ -569,300 +577,345 @@ void fmoe_g1u1(torch::Tensor& out,               // [token_cnt, dim]
         }
         else
         {
-            TORCH_CHECK(false,
-                        __func__,
-                        " Unsupported inter_dim " + std::to_string(inter_dim) +
-                            ", which should be divisible by 128, 256, or 512");
+            AITER_CHECK(false,
+                        __func__
+                        << " Unsupported inter_dim " << std::to_string(inter_dim)
+                        << ", which should be divisible by 128, 256, or 512");
         }
         impl_ptr->set_4bit(true);
     }
 
 #if defined(__Float4_e2m1fn_x2)
-    else if(input.dtype() == gate.dtype() && input.dtype() == torch_fp4x2) // fp4
+    else if(input->dtype() == gate->dtype() && input->dtype() == AITER_DTYPE_fp4x2) // fp4
     {
-        if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Silu)
+        if(out->dtype() == AITER_DTYPE_fp16 && act == ActivationType::Silu)
             config_map = &cfg_fmoe_fp16_pertokenMXfp4_g1u1_silu;
-        else if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Gelu)
+        else if(out->dtype() == AITER_DTYPE_fp16 && act == ActivationType::Gelu)
             config_map = &cfg_fmoe_fp16_pertokenMXfp4_g1u1_gelu;
-        else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Silu)
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Silu)
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_silu;
-        else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Gelu)
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Gelu)
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
         else
-            TORCH_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1. ");
-        impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name);
+            AITER_CHECK(false, __func__ << " Not find proper cfg in pertokenMXfp4_g1u1. ");
+        impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, knlName);
         impl_ptr->set_4bit(true);
     }
 #endif
 
-    else if(input.dtype() == at::ScalarType::Char || input.dtype() == at::ScalarType::Byte) // int8
+    else if(input->dtype() == AITER_DTYPE_i8) // int8
     {
-        if(fc2_smooth_scale.has_value())
+        if(fc2_smooth_scale)
             smf = 2;
-        if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Silu)
+        if(out->dtype() == AITER_DTYPE_fp16 && act == ActivationType::Silu)
             config_map = &cfg_fmoe_fp16_pertokenInt8_g1u1_silu;
-        else if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Gelu)
+        else if(out->dtype() == AITER_DTYPE_fp16 && act == ActivationType::Gelu)
             config_map = &cfg_fmoe_fp16_pertokenInt8_g1u1_gelu;
-        else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Silu)
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Silu)
             config_map = &cfg_fmoe_bf16_pertokenInt8_g1u1_silu;
-        else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Gelu)
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Gelu)
             config_map = &cfg_fmoe_bf16_pertokenInt8_g1u1_gelu;
         else
-            TORCH_CHECK(false, __func__, " Not find proper cfg in pertokenInt8_g1u1. ");
-        impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name);
+            AITER_CHECK(false, __func__ << " Not find proper cfg in pertokenInt8_g1u1. ");
+        impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, knlName);
     }
-    else if(input.dtype() == torch_fp8) // fp8
+    else if(input->dtype() == AITER_DTYPE_fp8) // fp8
     {
-        if(fc2_smooth_scale.has_value())
+        if(fc2_smooth_scale)
             smf = 2;
-        if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Silu)
+        if(out->dtype() == AITER_DTYPE_fp16 && act == ActivationType::Silu)
             config_map = &cfg_fmoe_fp16_pertokenFp8_g1u1_silu;
-        else if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Gelu)
+        else if(out->dtype() == AITER_DTYPE_fp16 && act == ActivationType::Gelu)
             config_map = &cfg_fmoe_fp16_pertokenFp8_g1u1_gelu;
-        else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Silu)
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Silu)
             config_map = &cfg_fmoe_bf16_pertokenFp8_g1u1_silu;
-        else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Gelu)
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Gelu)
             config_map = &cfg_fmoe_bf16_pertokenFp8_g1u1_gelu;
         else
-            TORCH_CHECK(false, __func__, " Not find proper cfg in pertokenFp8_g1u1. ");
-        impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name);
+            AITER_CHECK(false, __func__ << " Not find proper cfg in pertokenFp8_g1u1. ");
+        impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, knlName);
     }
     else
     {
-        TORCH_CHECK(false, __func__, ": unsupport current input type:", input.scalar_type());
+        AITER_CHECK(false, __func__ << ": unsupport current input type:" << AiterDtype_to_str(input->dtype()));
     }
 
-    impl_ptr->launch_kernel<uint8_t, uint16_t>(out,
-                                               input,
-                                               gate,
-                                               down,
-                                               sorted_token_ids,
-                                               sorted_weights,
-                                               sorted_expert_ids,
-                                               num_valid_ids,
-                                               topk,
-                                               // quant args
-                                               input_scale,
-                                               fc1_scale,
-                                               fc2_scale,
-                                               fc2_smooth_scale);
+    impl_ptr->launch_kernel<1, 2>(out,
+                                   input,
+                                   gate,
+                                   down,
+                                   sorted_token_ids,
+                                   sorted_weights,
+                                   sorted_expert_ids,
+                                   num_valid_ids,
+                                   topk,
+                                   // quant args
+                                   input_scale,
+                                   fc1_scale,
+                                   fc2_scale,
+                                   fc2_smooth_scale,
+                                   stream);
+
+    HIP_CALL(hipSetDevice(prev_device));
 }
 
-void fmoe_g1u1_tkw1(torch::Tensor& out,               // [token_cnt, dim]
-                    torch::Tensor& input,             // [token_cnt, dim] M,K
-                    torch::Tensor& gate,              // [expert, inter_dim*2, dim] N,K
-                    torch::Tensor& down,              // [expert, dim, inter_dim]
-                    torch::Tensor& sorted_token_ids,  // [max_num_tokens_padded]
-                    torch::Tensor& sorted_weights,    // [max_num_tokens_padded]
-                    torch::Tensor& sorted_expert_ids, // [max_num_m_blocks]
-                    torch::Tensor& num_valid_ids,     // [1]
-                    uint32_t topk,                    //
-                    torch::Tensor& input_scale,       // [token_cnt, 1]
-                    torch::Tensor& fc1_scale,         // [expert, 1, inter_dim]
-                    torch::Tensor& fc2_scale,         // [expert, 1, dim]
-                    std::string& kernel_name,
-                    std::optional<torch::Tensor> fc2_smooth_scale, // [expert, 1, inter_dim]
-                    ActivationType activation)
+extern "C" __attribute__((visibility("default")))
+void fmoe_g1u1_tkw1(AiterTensor* out,               // [token_cnt, dim]
+                    AiterTensor* input,             // [token_cnt, dim] M,K
+                    AiterTensor* gate,              // [expert, inter_dim*2, dim] N,K
+                    AiterTensor* down,              // [expert, dim, inter_dim]
+                    AiterTensor* sorted_token_ids,  // [max_num_tokens_padded]
+                    AiterTensor* sorted_weights,    // [max_num_tokens_padded]
+                    AiterTensor* sorted_expert_ids, // [max_num_m_blocks]
+                    AiterTensor* num_valid_ids,     // [1]
+                    int topk,                    //
+                    AiterTensor* input_scale,       // [token_cnt, 1]
+                    AiterTensor* fc1_scale,         // [expert, 1, inter_dim]
+                    AiterTensor* fc2_scale,         // [expert, 1, dim]
+                    const char* kernel_name,
+                    AiterTensor* fc2_smooth_scale, // [expert, 1, inter_dim], NULL = not present
+                    int activation,
+                    hipStream_t stream)
 {
+    int prev_device;
+    HIP_CALL(hipGetDevice(&prev_device));
+    HIP_CALL(hipSetDevice(input->device_id));
+
+    ActivationType act = static_cast<ActivationType>(activation);
+    std::string knlName = (kernel_name != nullptr && kernel_name[0] != '\0') ? kernel_name : "";
+
     FMoeKernel* impl_ptr = nullptr;
     CFG* config_map      = nullptr;
 
-    const int token_cnt = input.size(0);
+    const int token_cnt = input->size(0);
     const int block_m   = 32; // fmoe sorting kernel and fmoe kernel only support 32 for now
     const int estimated_sub_X_cnt = (token_cnt * topk + block_m - 1) / block_m;
-    int model_dim                 = down.size(1);
-    int inter_dim                 = down.size(2);
-    inter_dim *= model_dim / gate.size(2);
+    int model_dim                 = down->size(1);
+    int inter_dim                 = down->size(2);
+    inter_dim *= model_dim / gate->size(2);
 
-    if(fc2_smooth_scale.has_value())
+    if(fc2_smooth_scale)
     {
-        TORCH_CHECK(false, __func__, " Only support non-smooth tkw1!");
+        AITER_CHECK(false, __func__ << " Only support non-smooth tkw1!");
     }
 
-    if(input.dtype() == torch_fp8)
+    if(input->dtype() == AITER_DTYPE_fp8)
     {
-        if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Silu)
+        if(out->dtype() == AITER_DTYPE_fp16 && act == ActivationType::Silu)
             config_map = &cfg_fmoe_fp16_pertokenFp8_g1u1_silu_tkw1;
-        else if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Gelu)
+        else if(out->dtype() == AITER_DTYPE_fp16 && act == ActivationType::Gelu)
             config_map = &cfg_fmoe_fp16_pertokenFp8_g1u1_gelu_tkw1;
-        else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Silu)
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Silu)
             config_map = &cfg_fmoe_bf16_pertokenFp8_g1u1_silu_tkw1;
-        else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Gelu)
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Gelu)
             config_map = &cfg_fmoe_bf16_pertokenFp8_g1u1_gelu_tkw1;
         else
-            TORCH_CHECK(false, __func__, ": unsupport current activation type");
+            AITER_CHECK(false, __func__ << ": unsupport current activation type");
     }
-    impl_ptr = get_heuristic_kernel(inter_dim, estimated_sub_X_cnt, config_map, 0, kernel_name);
-    impl_ptr->launch_kernel<uint8_t, uint16_t>(out,
-                                               input,
-                                               gate,
-                                               down,
-                                               sorted_token_ids,
-                                               sorted_weights,
-                                               sorted_expert_ids,
-                                               num_valid_ids,
-                                               topk,
-                                               // quant args
-                                               input_scale,
-                                               fc1_scale,
-                                               fc2_scale,
-                                               fc2_smooth_scale);
+    impl_ptr = get_heuristic_kernel(inter_dim, estimated_sub_X_cnt, config_map, 0, knlName);
+    impl_ptr->launch_kernel<1, 2>(out,
+                                   input,
+                                   gate,
+                                   down,
+                                   sorted_token_ids,
+                                   sorted_weights,
+                                   sorted_expert_ids,
+                                   num_valid_ids,
+                                   topk,
+                                   // quant args
+                                   input_scale,
+                                   fc1_scale,
+                                   fc2_scale,
+                                   fc2_smooth_scale,
+                                   stream);
+
+    HIP_CALL(hipSetDevice(prev_device));
 }
 
-void fmoe_int8_g1u0_a16(torch::Tensor& out,               // [token_cnt, dim]
-                        torch::Tensor& input,             // [token_cnt, dim] M,K
-                        torch::Tensor& gate,              // [expert, inter_dim, dim] N,K
-                        torch::Tensor& down,              // [expert, dim, inter_dim]
-                        torch::Tensor& sorted_token_ids,  // [max_num_tokens_padded]
-                        torch::Tensor& sorted_weights,    // [max_num_tokens_padded]
-                        torch::Tensor& sorted_expert_ids, // [max_num_m_blocks]
-                        torch::Tensor& num_valid_ids,     // [1]
-                        uint32_t topk,                    //
-                        torch::Tensor& fc1_scale,         // [expert, 1, inter_dim]
-                        torch::Tensor& fc2_scale,         // [expert, 1, dim]
-                        torch::Tensor& fc1_smooth_scale,  // [expert, 1, dim]
-                        torch::Tensor& fc2_smooth_scale   // [expert, 1, inter_dim]
-)
+extern "C" __attribute__((visibility("default")))
+void fmoe_int8_g1u0_a16(AiterTensor* out,               // [token_cnt, dim]
+                        AiterTensor* input,             // [token_cnt, dim] M,K
+                        AiterTensor* gate,              // [expert, inter_dim, dim] N,K
+                        AiterTensor* down,              // [expert, dim, inter_dim]
+                        AiterTensor* sorted_token_ids,  // [max_num_tokens_padded]
+                        AiterTensor* sorted_weights,    // [max_num_tokens_padded]
+                        AiterTensor* sorted_expert_ids, // [max_num_m_blocks]
+                        AiterTensor* num_valid_ids,     // [1]
+                        int topk,                    //
+                        AiterTensor* fc1_scale,         // [expert, 1, inter_dim]
+                        AiterTensor* fc2_scale,         // [expert, 1, dim]
+                        AiterTensor* fc1_smooth_scale,  // [expert, 1, dim]
+                        AiterTensor* fc2_smooth_scale,  // [expert, 1, inter_dim]
+                        hipStream_t stream)
 {
+    int prev_device;
+    HIP_CALL(hipGetDevice(&prev_device));
+    HIP_CALL(hipSetDevice(input->device_id));
+
     static FMoeKernel impl("fmoe_kernel_func", "fmoe_int8_g1u0_smf.co");
-    impl.launch_kernel<uint8_t, uint16_t, true>(out,
-                                                input,
-                                                gate,
-                                                down,
-                                                sorted_token_ids,
-                                                sorted_weights,
-                                                sorted_expert_ids,
-                                                num_valid_ids,
-                                                topk,
-                                                // quant args
-                                                fc1_smooth_scale,
-                                                fc1_scale,
-                                                fc2_scale,
-                                                fc2_smooth_scale);
+    impl.launch_kernel<1, 2, true>(out,
+                                    input,
+                                    gate,
+                                    down,
+                                    sorted_token_ids,
+                                    sorted_weights,
+                                    sorted_expert_ids,
+                                    num_valid_ids,
+                                    topk,
+                                    // quant args
+                                    fc1_smooth_scale,
+                                    fc1_scale,
+                                    fc2_scale,
+                                    fc2_smooth_scale,
+                                    stream);
+
+    HIP_CALL(hipSetDevice(prev_device));
 }
 
-void fmoe_g1u1_a16(torch::Tensor& out,               // [token_cnt, dim]
-                   torch::Tensor& input,             // [token_cnt, dim] M,K
-                   torch::Tensor& gate,              // [expert, inter_dim*2, dim] N,K
-                   torch::Tensor& down,              // [expert, dim, inter_dim]
-                   torch::Tensor& sorted_token_ids,  // [max_num_tokens_padded]
-                   torch::Tensor& sorted_weights,    // [max_num_tokens_padded]
-                   torch::Tensor& sorted_expert_ids, // [max_num_m_blocks]
-                   torch::Tensor& num_valid_ids,     // [1]
-                   uint32_t topk,                    //
-                   torch::Tensor& fc1_scale,         // [expert, 1, inter_dim]
-                   torch::Tensor& fc2_scale,         // [expert, 1, dim]
-                   torch::Tensor& fc1_smooth_scale,  // [expert, 1, dim]
-                   torch::Tensor& fc2_smooth_scale,  // [expert, 1, inter_dim]
-                   ActivationType activation)
+extern "C" __attribute__((visibility("default")))
+void fmoe_g1u1_a16(AiterTensor* out,               // [token_cnt, dim]
+                   AiterTensor* input,             // [token_cnt, dim] M,K
+                   AiterTensor* gate,              // [expert, inter_dim*2, dim] N,K
+                   AiterTensor* down,              // [expert, dim, inter_dim]
+                   AiterTensor* sorted_token_ids,  // [max_num_tokens_padded]
+                   AiterTensor* sorted_weights,    // [max_num_tokens_padded]
+                   AiterTensor* sorted_expert_ids, // [max_num_m_blocks]
+                   AiterTensor* num_valid_ids,     // [1]
+                   int topk,                    //
+                   AiterTensor* fc1_scale,         // [expert, 1, inter_dim]
+                   AiterTensor* fc2_scale,         // [expert, 1, dim]
+                   AiterTensor* fc1_smooth_scale,  // [expert, 1, dim]
+                   AiterTensor* fc2_smooth_scale,  // [expert, 1, inter_dim]
+                   int activation,
+                   hipStream_t stream)
 {
+    int prev_device;
+    HIP_CALL(hipGetDevice(&prev_device));
+    HIP_CALL(hipSetDevice(input->device_id));
+
+    ActivationType act = static_cast<ActivationType>(activation);
     FMoeKernel* impl_ptr = nullptr;
-    int inter_dim        = down.size(2);
-    int sub_X_cnt        = sorted_expert_ids.size(0);
+    int inter_dim        = down->size(2);
+    int sub_X_cnt        = sorted_expert_ids->size(0);
 
     CFG* config_map = nullptr;
-    if(gate.dtype() == at::ScalarType::Char || gate.dtype() == at::ScalarType::Byte) // int8
+    if(gate->dtype() == AITER_DTYPE_i8) // int8
     {
-        if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Silu)
+        if(out->dtype() == AITER_DTYPE_fp16 && act == ActivationType::Silu)
             config_map = &cfg_fmoe_fp16_pertokenInt8_g1u1_silu;
-        else if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Gelu)
+        else if(out->dtype() == AITER_DTYPE_fp16 && act == ActivationType::Gelu)
             config_map = &cfg_fmoe_fp16_pertokenInt8_g1u1_gelu;
-        else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Silu)
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Silu)
             config_map = &cfg_fmoe_bf16_pertokenInt8_g1u1_silu;
-        else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Gelu)
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Gelu)
             config_map = &cfg_fmoe_bf16_pertokenInt8_g1u1_gelu;
         else
-            TORCH_CHECK(
-                false, __func__, "Unsupported output dtype or activation type for fmoe_g1u1_a16");
+            AITER_CHECK(
+                false, __func__ << "Unsupported output dtype or activation type for fmoe_g1u1_a16");
     }
-    else if(gate.dtype() == torch_fp8) // fp8
+    else if(gate->dtype() == AITER_DTYPE_fp8) // fp8
     {
-        if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Silu)
+        if(out->dtype() == AITER_DTYPE_fp16 && act == ActivationType::Silu)
             config_map = &cfg_fmoe_fp16_pertokenFp8_g1u1_silu;
-        else if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Gelu)
+        else if(out->dtype() == AITER_DTYPE_fp16 && act == ActivationType::Gelu)
             config_map = &cfg_fmoe_fp16_pertokenFp8_g1u1_gelu;
-        else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Silu)
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Silu)
             config_map = &cfg_fmoe_bf16_pertokenFp8_g1u1_silu;
-        else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Gelu)
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Gelu)
             config_map = &cfg_fmoe_bf16_pertokenFp8_g1u1_gelu;
         else
-            TORCH_CHECK(
-                false, __func__, "Unsupported output dtype or activation type for fmoe_g1u1_a16");
+            AITER_CHECK(
+                false, __func__ << "Unsupported output dtype or activation type for fmoe_g1u1_a16");
     }
     else
-        TORCH_CHECK(false, __func__, "Unsupported gate dtype for fmoe_g1u1_a16");
+        AITER_CHECK(false, __func__ << "Unsupported gate dtype for fmoe_g1u1_a16");
 
-    impl_ptr = get_heuristic_kernel(inter_dim, sorted_expert_ids.size(0), config_map, 1);
-    impl_ptr->launch_kernel<uint8_t, uint16_t, true>(out,
-                                                     input,
-                                                     gate,
-                                                     down,
-                                                     sorted_token_ids,
-                                                     sorted_weights,
-                                                     sorted_expert_ids,
-                                                     num_valid_ids,
-                                                     topk,
-                                                     // quant args
-                                                     fc1_smooth_scale,
-                                                     fc1_scale,
-                                                     fc2_scale,
-                                                     fc2_smooth_scale);
+    impl_ptr = get_heuristic_kernel(inter_dim, sorted_expert_ids->size(0), config_map, 1);
+    impl_ptr->launch_kernel<1, 2, true>(out,
+                                         input,
+                                         gate,
+                                         down,
+                                         sorted_token_ids,
+                                         sorted_weights,
+                                         sorted_expert_ids,
+                                         num_valid_ids,
+                                         topk,
+                                         // quant args
+                                         fc1_smooth_scale,
+                                         fc1_scale,
+                                         fc2_scale,
+                                         fc2_smooth_scale,
+                                         stream);
+
+    HIP_CALL(hipSetDevice(prev_device));
 }
 
-void fmoe_fp8_blockscale_g1u1(torch::Tensor& out,               // [token_cnt, dim]
-                              torch::Tensor& input,             // [token_cnt, dim] M,K
-                              torch::Tensor& gate,              // [expert, inter_dim*2, dim] N,K
-                              torch::Tensor& down,              // [expert, dim, inter_dim]
-                              torch::Tensor& sorted_token_ids,  // [max_num_tokens_padded]
-                              torch::Tensor& sorted_weights,    // [max_num_tokens_padded]
-                              torch::Tensor& sorted_expert_ids, // [max_num_m_blocks]
-                              torch::Tensor& num_valid_ids,     // [1]
-                              uint32_t topk,                    //
-                              torch::Tensor& input_scale,       // [expert, 1, dim]
-                              torch::Tensor& fc1_scale,         // [expert, 1, inter_dim]
-                              torch::Tensor& fc2_scale,         // [expert, 1, dim]
-                              std::string& kernel_name,
+extern "C" __attribute__((visibility("default")))
+void fmoe_fp8_blockscale_g1u1(AiterTensor* out,               // [token_cnt, dim]
+                              AiterTensor* input,             // [token_cnt, dim] M,K
+                              AiterTensor* gate,              // [expert, inter_dim*2, dim] N,K
+                              AiterTensor* down,              // [expert, dim, inter_dim]
+                              AiterTensor* sorted_token_ids,  // [max_num_tokens_padded]
+                              AiterTensor* sorted_weights,    // [max_num_tokens_padded]
+                              AiterTensor* sorted_expert_ids, // [max_num_m_blocks]
+                              AiterTensor* num_valid_ids,     // [1]
+                              int topk,                    //
+                              AiterTensor* input_scale,       // [expert, 1, dim]
+                              AiterTensor* fc1_scale,         // [expert, 1, inter_dim]
+                              AiterTensor* fc2_scale,         // [expert, 1, dim]
+                              const char* kernel_name,
                               int fc_scale_blkn,
                               int fc_scale_blkk,
-                              std::optional<torch::Tensor> fc2_smooth_scale,
-                              ActivationType activation,
-                              int block_size_M)
+                              AiterTensor* fc2_smooth_scale,  // NULL = not present
+                              int activation,
+                              int block_size_M,
+                              hipStream_t stream)
 {
+    int prev_device;
+    HIP_CALL(hipGetDevice(&prev_device));
+    HIP_CALL(hipSetDevice(input->device_id));
+
+    ActivationType act = static_cast<ActivationType>(activation);
+    std::string knlName = (kernel_name != nullptr && kernel_name[0] != '\0') ? kernel_name : "";
+
     FMoeKernel* impl_ptr     = nullptr;
     CFG* config_map          = nullptr;
     uint32_t num_cu          = get_num_cu_func();
-    int inter_dim            = down.size(2);
-    int sub_X_cnt            = sorted_expert_ids.size(0);
+    int inter_dim            = down->size(2);
+    int sub_X_cnt            = sorted_expert_ids->size(0);
     const char* enable_vskip = std::getenv("AITER_ENABLE_VSKIP");
 
-    if(out.dtype() == at::ScalarType::BFloat16 && inter_dim % 128 == 0 && fc_scale_blkn == 128 &&
+    if(out->dtype() == AITER_DTYPE_bf16 && inter_dim % 128 == 0 && fc_scale_blkn == 128 &&
        fc_scale_blkk == 128)
     {
-        if(activation == ActivationType::Silu)
+        if(act == ActivationType::Silu)
             config_map = &cfg_fmoe_bf16_blockscaleFp8_g1u1_silu;
-        else if(activation == ActivationType::Gelu)
+        else if(act == ActivationType::Gelu)
             config_map = &cfg_fmoe_bf16_blockscaleFp8_g1u1_gelu;
         else
-            TORCH_CHECK(
-                false, __func__, "Unsupported activation type for fmoe_fp8_blockscale_g1u1");
+            AITER_CHECK(
+                false, __func__ << "Unsupported activation type for fmoe_fp8_blockscale_g1u1");
 
         impl_ptr =
-            get_heuristic_kernel(inter_dim, sorted_expert_ids.size(0), config_map, 0, kernel_name, block_size_M);
-        impl_ptr->launch_kernel<uint8_t, uint16_t, false>(out,
-                                                          input,
-                                                          gate,
-                                                          down,
-                                                          sorted_token_ids,
-                                                          sorted_weights,
-                                                          sorted_expert_ids,
-                                                          num_valid_ids,
-                                                          topk,
-                                                          // quant args
-                                                          input_scale,
-                                                          fc1_scale,
-                                                          fc2_scale,
-                                                          fc2_smooth_scale);
+            get_heuristic_kernel(inter_dim, sorted_expert_ids->size(0), config_map, 0, knlName, block_size_M);
+        impl_ptr->launch_kernel<1, 2, false>(out,
+                                              input,
+                                              gate,
+                                              down,
+                                              sorted_token_ids,
+                                              sorted_weights,
+                                              sorted_expert_ids,
+                                              num_valid_ids,
+                                              topk,
+                                              // quant args
+                                              input_scale,
+                                              fc1_scale,
+                                              fc2_scale,
+                                              fc2_smooth_scale,
+                                              stream);
     }
     else
-        TORCH_CHECK(false, __func__, "Unsupported the type for fmoe_fp8_blockscale_g1u1");
+        AITER_CHECK(false, __func__ << "Unsupported the type for fmoe_fp8_blockscale_g1u1");
+
+    HIP_CALL(hipSetDevice(prev_device));
 }
