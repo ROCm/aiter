@@ -424,6 +424,7 @@ __global__ void TopPSamplingFromProbKernel(DType* probs,
         double pivot_1 = (pivot_0 + high) / 2;
 
         float aggregate_gt_pivot_0 = 0, aggregate_gt_pivot_1 = 0;
+        float threadlocal_aggregate_gt_pivot_0 = 0, threadlocal_aggregate_gt_pivot_1 = 0;
 #pragma unroll 2
         for(uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i)
         {
@@ -433,34 +434,33 @@ __global__ void TopPSamplingFromProbKernel(DType* probs,
                 probs_vec.cast_load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
             }
 
-            float probs_gt_pivot_0[VEC_SIZE], probs_gt_pivot_1[VEC_SIZE];
 #pragma unroll
             for(uint32_t j = 0; j < VEC_SIZE; ++j)
             {
-                probs_gt_pivot_0[j] = (probs_vec[j] > pivot_0) ? probs_vec[j] : 0;
-                probs_gt_pivot_1[j] = (probs_vec[j] > pivot_1) ? probs_vec[j] : 0;
+                threadlocal_aggregate_gt_pivot_0 += (probs_vec[j] > pivot_0) ? probs_vec[j] : 0;
+                threadlocal_aggregate_gt_pivot_1 += (probs_vec[j] > pivot_1) ? probs_vec[j] : 0;
             }
-
-            aggregate_gt_pivot_0 +=
-                BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce)
-                    .Sum(probs_gt_pivot_0);
-            if(tx == 0)
-            {
-                temp_storage.block_aggregate.value = aggregate_gt_pivot_0;
-            }
-            __syncthreads();
-            aggregate_gt_pivot_0 = temp_storage.block_aggregate.value;
-
-            aggregate_gt_pivot_1 +=
-                BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce)
-                    .Sum(probs_gt_pivot_1);
-            if(tx == 0)
-            {
-                temp_storage.block_aggregate.value = aggregate_gt_pivot_1;
-            }
-            __syncthreads();
-            aggregate_gt_pivot_1 = temp_storage.block_aggregate.value;
         }
+
+        aggregate_gt_pivot_0 +=
+            BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce)
+                .Sum(threadlocal_aggregate_gt_pivot_0);
+        if(tx == 0)
+        {
+            temp_storage.block_aggregate.value = aggregate_gt_pivot_0;
+        }
+        __syncthreads();
+        aggregate_gt_pivot_0 = temp_storage.block_aggregate.value;
+
+        aggregate_gt_pivot_1 +=
+            BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce)
+                .Sum(threadlocal_aggregate_gt_pivot_1);
+        if(tx == 0)
+        {
+            temp_storage.block_aggregate.value = aggregate_gt_pivot_1;
+        }
+        __syncthreads();
+        aggregate_gt_pivot_1 = temp_storage.block_aggregate.value;
         if(aggregate_gt_pivot_0 < top_p)
         {
             // case 1: pivot_0 accepted
@@ -525,14 +525,50 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs,
     float q    = 1;
     double low = 0, high = 1.f;
     int sampled_id;
+
+    constexpr uint32_t PRELOAD_LIMIT = 32; // the number of probabilities to preload into registers
+    const uint32_t num_preload_iters = PRELOAD_LIMIT / VEC_SIZE;
+    //preload as much data as possible into registers
+    vec_t<float, VEC_SIZE> preloaded_probs[num_preload_iters];
+
+#pragma unroll
+    for(uint32_t i = 0; i < num_preload_iters; ++i)
+    {
+        preloaded_probs[i].fill(0);
+        if((i * BLOCK_THREADS + tx) * VEC_SIZE < d) // TODO: buffer load assembly could be used to eliminate this check
+        {
+            preloaded_probs[i].cast_load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+        }
+    }
+
     do
     {
         temp_storage.sampled_id = d;
         __syncthreads();
         float u   = hiprand_uniform(&state) * q;
         aggregate = 0;
+
+        // fixed set of iterations known at compile-time
+#pragma unroll
+        for(uint32_t i = 0; i < num_preload_iters; ++i) {
+            if (i * BLOCK_THREADS * VEC_SIZE >= d) {
+                break;
+            }
+            DeviceSamplingFromProb<VEC_SIZE,
+                                    BLOCK_THREADS,
+                                    SCAN_ALGORITHM,
+                                    REDUCE_ALGORITHM,
+                                    DETERMINISTIC>(
+                i, d, [&](float x) { return x > low; }, u, preloaded_probs[i], aggregate, &temp_storage);
+            if(aggregate > u)
+            {
+                break;
+            }
+        }
+
+        // dynamic tail loop for the remaining probabilities that are not preloaded
 #pragma unroll 2
-        for(uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i)
+        for(uint32_t i = num_preload_iters; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i)
         {
             probs_vec.fill(0);
             if((i * BLOCK_THREADS + tx) * VEC_SIZE < d)
@@ -566,8 +602,34 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs,
         ValueCount<float> aggregate_gt_pivot_0{0, 0}, aggregate_gt_pivot_1{0, 0};
         ValueCount<float> threadlocal_aggregate_gt_pivot_0{0, 0};
         ValueCount<float> threadlocal_aggregate_gt_pivot_1{0, 0};
+
+#pragma unroll
+        for(uint32_t i = 0; i < num_preload_iters; ++i)
+        {
+            if(i * BLOCK_THREADS * VEC_SIZE >= d)
+            {
+                break;
+            }
+
+#pragma unroll
+            for(uint32_t j = 0; j < VEC_SIZE; ++j)
+            {
+                float val = preloaded_probs[i][j];
+                bool valid = (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d;
+                threadlocal_aggregate_gt_pivot_0 += {
+                    (val > pivot_0) ? val : 0.0f,
+                    (val > pivot_0 && valid) ? 1 : 0
+                };
+                threadlocal_aggregate_gt_pivot_1 += {
+                    (val > pivot_1) ? val : 0.0f,
+                    (val > pivot_1 && valid) ? 1 : 0
+                };
+            }
+        }
+
+        // dynamic tail loop for the remaining probabilities that are not preloaded
 #pragma unroll 2
-        for(uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i)
+        for(uint32_t i = num_preload_iters; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i)
         {
             probs_vec.fill(0);
             if((i * BLOCK_THREADS + tx) * VEC_SIZE < d)
@@ -575,18 +637,19 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs,
                 probs_vec.cast_load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
             }
 
-            ValueCount<float> probs_gt_pivot_0[VEC_SIZE], probs_gt_pivot_1[VEC_SIZE];
 #pragma unroll
             for(uint32_t j = 0; j < VEC_SIZE; ++j)
             {
-                probs_gt_pivot_0[j] = {
-                    (probs_vec[j] > pivot_0) ? probs_vec[j] : 0,
-                    (probs_vec[j] > pivot_0 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
-                probs_gt_pivot_1[j] = {
-                    (probs_vec[j] > pivot_1) ? probs_vec[j] : 0,
-                    (probs_vec[j] > pivot_1 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
-                threadlocal_aggregate_gt_pivot_0 += probs_gt_pivot_0[j];
-                threadlocal_aggregate_gt_pivot_1 += probs_gt_pivot_1[j];
+                float val = probs_vec[j];
+                bool valid = (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d;
+                threadlocal_aggregate_gt_pivot_0 += {
+                    (val > pivot_0) ? val : 0.0f,
+                    (val > pivot_0 && valid) ? 1 : 0
+                };
+                threadlocal_aggregate_gt_pivot_1 += {
+                    (val > pivot_1) ? val : 0.0f,
+                    (val > pivot_1 && valid) ? 1 : 0
+                };
             }
         }
 
