@@ -84,7 +84,11 @@ def biased_grouped_topk(
 ):
     token_num = gating_output.shape[0]
     cu_num = get_cu_num()
-    if token_num <= cu_num * 212:
+    # moe_fused_gate requires num_experts to be a power of 2.
+    # For models with non-power-of-2 expert counts (e.g. Kimi-K2.5 with 384
+    # experts), always use biased_grouped_topk_hip which has no such constraint.
+    num_experts_is_power_of_2 = num_experts > 0 and (num_experts & (num_experts - 1)) == 0
+    if token_num <= cu_num * 212 or not num_experts_is_power_of_2:
         return biased_grouped_topk_hip(
             gating_output,
             correction_bias,
