@@ -43,7 +43,7 @@ torch::Tensor
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    int KBatch
+    int KBatch = 1
     )
 {{{{
     // The smallest kernel we have available. Works well for memory bound shapes.
@@ -196,7 +196,7 @@ torch::Tensor
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    int KBatch);
+    int KBatch = 1);
 """
         MAINFEST_end = """
 

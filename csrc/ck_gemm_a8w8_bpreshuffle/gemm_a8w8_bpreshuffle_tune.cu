@@ -72,7 +72,8 @@ torch::Tensor gemm_a8w8_bpreshuffle_tune(torch::Tensor& XQ,
     int M      = XQ.size(0);
     int N      = WQ.size(0);
     int K      = XQ.size(1);
-    int KBatch = std::pow(2, splitK);
+    TORCH_CHECK(splitK >= 0, "splitK must be non-negative!");
+    int KBatch = 1 << splitK;
 
     //if(Y.dtype() == at::ScalarType::Half)
     //{
