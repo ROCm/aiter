@@ -5,6 +5,9 @@ import torch
 import pytest
 
 from aiter.ops.triton.quant import dynamic_mxfp4_quant
+from aiter.utility.fp4_utils import (
+    dynamic_mxfp4_quant as fp4_utils_dynamic_mxfp4_quant,
+)
 
 DEBUG_MODE = False
 
@@ -202,3 +205,55 @@ def test_dynamic_mxfp4_quant(M: int, N: int, dtype):
 
     torch.testing.assert_close(triton_scale, torch_scale)
     torch.testing.assert_close(triton_out, torch_out)
+
+
+@pytest.mark.parametrize(
+    "M, N",
+    [
+        (1, 4),
+        (1, 28),
+        (1, 32),
+        (1, 64),
+        (1, 68),
+        (2, 4),
+        (2, 28),
+        (2, 32),
+        (2, 64),
+        (2, 68),
+        (128, 4),
+        (128, 28),
+        (128, 32),
+        (128, 64),
+        (128, 68),
+        (256, 32),
+        (160, 40),
+        (280, 20),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_fp4_utils_dynamic_mxfp4_quant(M: int, N: int, dtype):
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+    x = torch.randn((M, N), dtype=dtype, device="cuda")
+
+    if DEBUG_MODE:
+        print(f"x.shape={x.shape} x={x}")
+
+    fp4_utils_out, fp4_utils_scale = fp4_utils_dynamic_mxfp4_quant(x)
+    if DEBUG_MODE:
+        print(
+            f"fp4_utils_out.shape={fp4_utils_out.shape} fp4_utils_out={fp4_utils_out}"
+        )
+        print(
+            f"fp4_utils_scale.shape={fp4_utils_scale.shape} fp4_utils_scale={fp4_utils_scale}"
+        )
+
+    torch_out, torch_scale = torch_dynamic_mxfp4_quant(x)
+    if DEBUG_MODE:
+        print(f"torch_out.shape={torch_out.shape} torch_out={torch_out}")
+        print(f"torch_scale.shape={torch_scale.shape} torch_scale={torch_scale}")
+
+    torch.testing.assert_close(
+        fp4_utils_scale.view(torch.uint8).cpu(), torch_scale.cpu()
+    )
+    torch.testing.assert_close(fp4_utils_out.view(torch.uint8).cpu(), torch_out.cpu())
