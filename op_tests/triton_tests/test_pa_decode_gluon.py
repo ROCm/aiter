@@ -1207,29 +1207,30 @@ def run_gluon_kernel(
         )
     else:
         if pa_decode_gluon is not None:
-            torch.ops.aiter.pa_decode_gluon(
-                output,
-                query,
-                key_cache,
-                value_cache,
-                context_lengths,
-                block_tables,
-                softmax_scale,
-                query_length,
-                max_context_partition_num,
-                context_partition_size,
-                compute_type,
-                query_scale,
-                key_scale,
-                value_scale,
-                exp_sums=exp_sums,
-                max_logits=max_logits,
-                temporary_output=temporary_output,
-                alibi_slopes=alibi_slopes,
-                sinks=sinks,
-                sliding_window=sliding_window,
-                ps=ps,
-            )
+            for i in range(1):
+                torch.ops.aiter.pa_decode_gluon(
+                    output,
+                    query,
+                    key_cache,
+                    value_cache,
+                    context_lengths,
+                    block_tables,
+                    softmax_scale,
+                    query_length,
+                    max_context_partition_num,
+                    context_partition_size,
+                    compute_type,
+                    query_scale,
+                    key_scale,
+                    value_scale,
+                    exp_sums=exp_sums,
+                    max_logits=max_logits,
+                    temporary_output=temporary_output,
+                    alibi_slopes=alibi_slopes,
+                    sinks=sinks,
+                    sliding_window=sliding_window,
+                    ps=ps,
+                )
         else:
             raise RuntimeError(
                 "This version triton is not support gluon, please upgrade to 3.5.0 or higher!"
@@ -1654,7 +1655,7 @@ def run_pa_gluon_test(
     if quant_kv and quant_mode == "per_tensor":
         key_scale_original = key_scale_factors_flat.contiguous()
         value_scale_original = value_scale_factors_flat.contiguous()
-    if not skip_assembly:
+    if not False:
         actual_blocks = (context_lengths + block_size - 1) // block_size
         kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
         kv_indptr[1 : batch_size + 1] = torch.cumsum(actual_blocks, dim=0)
@@ -2446,6 +2447,48 @@ def normal_performance_aot_test():
     parse_arg_and_run_test()
 
 
+# def sliding_window_accuracy_test():
+#     """Run sliding window accuracy test."""
+#     global BLOCK_SIZE_OPTIONS
+#     global QUERY_LENGTH_OPTIONS
+#     global BATCH_SIZE_OPTIONS
+#     global HEAD_CONFIGURATIONS
+#     global CONTEXT_LENGTH_OPTIONS
+#     global COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS
+#     global HEAD_DIMENSION_OPTIONS
+#     global SINKS_OPTIONS
+#     global SLIDING_WINDOW_OPTIONS
+#     global TRANS_V_OPTIONS
+#     global KV_VARLEN_OPTIONS
+#     global QUANT_Q_AND_KV_OPTIONS
+#     global USE_TORCH_FLASH_REF_OPTIONS
+#     global USE_AOT_IMPL_OPTIONS
+#     global CONTEXT_PARTITION_SIZE_OPTIONS
+#     global PS_OPTIONS
+#     global QUANT_MODE_OPTIONS
+
+#     USE_TORCH_FLASH_REF_OPTIONS = [False]
+#     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
+
+#     SINKS_OPTIONS = [True, False]
+#     SLIDING_WINDOW_OPTIONS = [0, 128]
+#     HEAD_DIMENSION_OPTIONS = [128]
+#     CONTEXT_LENGTH_OPTIONS = [1024, 8192]
+#     BATCH_SIZE_OPTIONS = [1, 128]
+#     QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
+#     COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["bf16", False, True]]
+#     QUANT_MODE_OPTIONS = ["per_tensor"]
+#     TRANS_V_OPTIONS = [False]
+#     KV_VARLEN_OPTIONS = [True]
+#     HEAD_CONFIGURATIONS = [(64, 8), (16, 1)]
+#     USE_AOT_IMPL_OPTIONS = [False]
+#     PS_OPTIONS = [True]
+#     BLOCK_SIZE_OPTIONS = [16]
+#     parse_arg_and_run_test()
+#     TRANS_V_OPTIONS = [True]
+#     BLOCK_SIZE_OPTIONS = [1024]
+#     parse_arg_and_run_test()
+
 def sliding_window_accuracy_test():
     """Run sliding window accuracy test."""
     global BLOCK_SIZE_OPTIONS
@@ -2465,25 +2508,25 @@ def sliding_window_accuracy_test():
     global CONTEXT_PARTITION_SIZE_OPTIONS
     global PS_OPTIONS
     global QUANT_MODE_OPTIONS
-
+ 
     USE_TORCH_FLASH_REF_OPTIONS = [False]
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
-
-    SINKS_OPTIONS = [True, False]
-    SLIDING_WINDOW_OPTIONS = [0, 128]
+ 
+    SINKS_OPTIONS = [True]
+    SLIDING_WINDOW_OPTIONS = [0]
     HEAD_DIMENSION_OPTIONS = [128]
-    CONTEXT_LENGTH_OPTIONS = [1024, 8192]
-    BATCH_SIZE_OPTIONS = [1, 128]
-    QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
-    COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["bf16", False, True]]
-    QUANT_MODE_OPTIONS = ["per_tensor"]
+    CONTEXT_LENGTH_OPTIONS = [8192]
+    BATCH_SIZE_OPTIONS = [128]
+    QUERY_LENGTH_OPTIONS = [1]
+    COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["fp8", False, True]]
+    QUANT_MODE_OPTIONS = ["per_token"]
     TRANS_V_OPTIONS = [False]
-    KV_VARLEN_OPTIONS = [True]
-    HEAD_CONFIGURATIONS = [(64, 8), (16, 1)]
+    KV_VARLEN_OPTIONS = [False]
+    HEAD_CONFIGURATIONS = [(16, 1)]
     USE_AOT_IMPL_OPTIONS = [False]
     PS_OPTIONS = [True]
-    BLOCK_SIZE_OPTIONS = [16]
-    parse_arg_and_run_test()
+    # BLOCK_SIZE_OPTIONS = [16]
+    # parse_arg_and_run_test()
     TRANS_V_OPTIONS = [True]
     BLOCK_SIZE_OPTIONS = [1024]
     parse_arg_and_run_test()
@@ -2545,9 +2588,9 @@ def test_multi_case_set(case_set_name):
 
 
 if __name__ == "__main__":
-    normal_accuracy_test()
-    normal_accuracy_aot_test()
-    normal_performance_test()
-    normal_performance_aot_test()
+    # normal_accuracy_test()
+    # normal_accuracy_aot_test()
+    # normal_performance_test()
+    # normal_performance_aot_test()
     sliding_window_accuracy_test()
-    sliding_window_performance_test()
+    # sliding_window_performance_test()

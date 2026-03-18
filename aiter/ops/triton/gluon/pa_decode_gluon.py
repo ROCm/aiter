@@ -1875,11 +1875,14 @@ def paged_attention_decode_sliding_window_head_1(
                 )
                 value_scale_max = gl.max(value_scale_value, axis=0)
                 # Scale the maximum value of value_scale to FP8_MAX_VALUE to improve the precision of P * V
+                # Optimization: compute reciprocal once and reuse, use multiply instead of divide for FP8_MAX_VALUE
+                inv_value_scale_max = 1.0 / (value_scale_max + 1e-8)
                 value_scale_value = (
-                    value_scale_value * float(FP8_MAX_VALUE) / (value_scale_max + 1e-8)
+                    value_scale_value * float(FP8_MAX_VALUE) * inv_value_scale_max
                 )
                 attention_probs = value_scale_value[None, :] * attention_probs
-                probability_scale = value_scale_max / float(FP8_MAX_VALUE)
+                # Use multiply by reciprocal instead of divide (precomputed 1/FP8_MAX_VALUE)
+                probability_scale = value_scale_max * (1.0 / float(FP8_MAX_VALUE))
             elif KV_QUANT_MODE == 0:
                 # Per-tensor quantization scaling
                 probability_scale = value_scale_value
@@ -2832,11 +2835,14 @@ def paged_attention_decode_sliding_window(
                 )
                 value_scale_max = gl.max(value_scale_value, axis=0)
                 # Scale the maximum value of value_scale to FP8_MAX_VALUE to improve the precision of P * V
+                # Optimization: compute reciprocal once and reuse, use multiply instead of divide for FP8_MAX_VALUE
+                inv_value_scale_max = 1.0 / (value_scale_max + 1e-8)
                 value_scale_value = (
-                    value_scale_value * float(FP8_MAX_VALUE) / (value_scale_max + 1e-8)
+                    value_scale_value * float(FP8_MAX_VALUE) * inv_value_scale_max
                 )
                 attention_probs = value_scale_value[None, :] * attention_probs
-                probability_scale = value_scale_max / float(FP8_MAX_VALUE)
+                # Use multiply by reciprocal instead of divide (precomputed 1/FP8_MAX_VALUE)
+                probability_scale = value_scale_max * (1.0 / float(FP8_MAX_VALUE))
             elif KV_QUANT_MODE == 0:
                 # Per-tensor quantization scaling
                 probability_scale = value_scale_value
