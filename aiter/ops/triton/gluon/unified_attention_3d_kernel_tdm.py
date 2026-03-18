@@ -1377,6 +1377,7 @@ gluon_kernel_unified_attention_3d_tdm_repr = make_kernel_repr(
         "TILE_SIZE",
         "HEAD_SIZE",
         "NUM_BLOCKS_GATHER_PER_TILE",
+        "NUM_SEGMENTS_PER_SEQ",
         "num_warps",
         "waves_per_eu",
         "num_stages",
