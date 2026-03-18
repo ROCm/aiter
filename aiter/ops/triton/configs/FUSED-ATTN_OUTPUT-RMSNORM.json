@@ -1,0 +1,23 @@
+{
+  "comment": "Default configuration for Fused Attention Output + RMSNorm kernel",
+  "small": {
+    "BLOCK_SIZE_N": 512,
+    "num_warps": 4,
+    "num_stages": 1
+  },
+  "medium": {
+    "BLOCK_SIZE_N": 1024,
+    "num_warps": 4,
+    "num_stages": 1
+  },
+  "large": {
+    "BLOCK_SIZE_N": 2048,
+    "num_warps": 8,
+    "num_stages": 1
+  },
+  "any": {
+    "BLOCK_SIZE_N": 1024,
+    "num_warps": 4,
+    "num_stages": 1
+  }
+}
