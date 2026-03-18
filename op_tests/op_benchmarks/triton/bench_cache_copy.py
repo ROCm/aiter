@@ -135,7 +135,7 @@ def simple_tdm_kernel(
         k_desc = key_cache_ptr
         smem = gl.allocate_shared_memory(
             key_cache_ptr.type.element_ty,
-            shape=[2] + [gl.constexpr(1), BLOCK_SIZE * HEAD_SIZE],
+            shape=[2] + [BLOCK_SIZE // 16, HEAD_SIZE * 16],
             layout=K_SHARED_LAYOUT,
         )
 
@@ -148,6 +148,8 @@ def simple_tdm_kernel(
             [(0 * NUM_KV_HEADS + kv_head_idx).to(gl.int32), 0],
             smem.index(buffer_id),
         )
+        K_LOAD_LAYOUT = None
+        offsets = None
     else:
         # K_LOAD_LAYOUT: gl.constexpr = gl.BlockedLayout(
         #     size_per_thread=[1, 8],
@@ -191,7 +193,7 @@ def simple_tdm_kernel(
             )
             gl.amd.gfx1250.tdm.async_wait(1)
         else:
-            k_desc += key_cache_stride_1
+            k_desc += key_cache_stride_1 * NUM_KV_HEADS
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
                 dest=smem.index(buffer_id),
                 ptr=k_desc,
@@ -222,6 +224,7 @@ def simple_tdm_kernel(
         if use_tdm:
             X = smem_load.load(layout=K_DOT_LAYOUT)
         else:
+            # X = smem_load.load(layout=K_DOT_LAYOUT)
             X = gl.amd.cdna4.async_copy.load_shared_relaxed(
                 smem_load, layout=K_DOT_LAYOUT
             )
@@ -252,10 +255,10 @@ def simple_tdm_kernel(
         .reshape((BLOCK_SIZE, HEAD_SIZE))
         .permute((1, 0))
     )
-
     if use_tdm:
         X = smem_load.load(layout=K_DOT_LAYOUT)
     else:
+        # X = smem_load.load(layout=K_DOT_LAYOUT)
         X = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_load, layout=K_DOT_LAYOUT)
 
     acc = acc + X.to(gl.float32)
@@ -279,7 +282,12 @@ def benchmark(args):
     head_size = args.head_size
     num_warps = args.num_warps
     waves_per_eu = args.waves_per_eu
+    use_tdm = IS_DEVICE_ARCH_GFX12
     # assert IS_DEVICE_ARCH_GFX12, "Gluon Cache Copy only supports gfx1250"
+    if IS_DEVICE_ARCH_GFX12:
+        assert (
+            num_warps == 1 and head_size == 64 and block_size == 64
+        ), "Gluon Cache Copy only supports gfx1250 with 1 warp, 64 head size, and 64 block size"
     configs = []
     x_names = [
         "num_blocks",
@@ -299,8 +307,15 @@ def benchmark(args):
             waves_per_eu,
         )
     ]
-    line_vals = ["time"]
-    line_names = ["Time_(ms)"]
+    if args.metric == "time":
+        unit = "ms"
+    elif args.metric == "bandwidth":
+        unit = "TB/s"
+    else:
+        raise ValueError("Unknown metric: " + args.metric)
+
+    line_vals = [args.metric]
+    line_names = ["TDM " if use_tdm else "ASYNC_COPY " + args.metric]
     configs.append(
         triton.testing.Benchmark(
             x_names=x_names,
@@ -310,7 +325,7 @@ def benchmark(args):
             line_names=line_names,
             plot_name=get_caller_name_no_ext(),
             styles=[("red", "-"), ("green", "-")],
-            ylabel="ms",
+            ylabel=unit,
             args={},
         )
     )
@@ -385,14 +400,6 @@ def benchmark(args):
         )
 
         def fn():
-            # K_LOAD_LAYOUT = make_kv_cache_shuffled_layout(
-            #     block_size // 16,
-            #     head_size * 16,
-            #     num_warps,
-            #     num_warps,
-            # )
-            # print(K_LOAD_LAYOUT)
-
             simple_tdm_kernel[(num_kv_heads,)](
                 key_cache_ptr=key_cache_shuffled,
                 y_ptr=y,
@@ -406,7 +413,7 @@ def benchmark(args):
                 WMMA_LAYOUT=WMMA_LAYOUT,
                 num_warps=num_warps,
                 waves_per_eu=waves_per_eu,
-                use_tdm=IS_DEVICE_ARCH_GFX12,
+                use_tdm=use_tdm,
             )
             # try:
             #     ref = key_cache.sum(dim=0).permute(1, 2, 0)
@@ -425,11 +432,10 @@ def benchmark(args):
             * torch.bfloat16.itemsize
             * 1e-12
         )
-        return ms
-        # if "ms" in provider:
-        #     return ms
-        # else:  # TB/s
-        #     return mem / ms * 1e3
+        if "time" in provider:
+            return ms
+        else:  # TB/s
+            return mem / ms * 1e3
 
     bench_cache_copy.run(
         save_path="." if args.o else None, print_data=True, show_plots=False
@@ -453,7 +459,15 @@ def parse_args():
     parser.add_argument("--head_size", type=int, default=64)
     parser.add_argument("--num_warps", type=int, default=1)
     parser.add_argument("--waves_per_eu", type=int, default=2)
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "-metric",
+        nargs="?",
+        const="bandwidth",
+        choices=["time", "bandwidth"],
+        default="bandwidth",
+        help="Metrics for the kernel benchmark.",
+    )
     parser.add_argument(
         "-o",
         action="store_true",
