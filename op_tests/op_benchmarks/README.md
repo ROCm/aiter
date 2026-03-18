@@ -849,22 +849,42 @@ python bench_moe.py --model mixtral-7B -M 4096 -print_vgpr
 
 **Common MoE Benchmark Arguments:**
 
-- `--model`: Model name (e.g., `mixtral-7B`, `mixtral-22B`, use `all` to benchmark all models)
-- `-M`: M dimension (batch size × sequence length, default: 4096 if not specified)
-- `-dtype`: Data type (`fp16`, `bf16`, `fp32`, default: `fp16`)
-- `-fp8_type`: FP8 data type (`e5m2fnuz`, `e4m3fnuz`, default: `e5m2fnuz`)
-- `-routed_weight`: Enable routed weight mechanism
-- `-int8_w8a16`: Use INT8 weight with FP16 activation
-- `-fp8_w8a8`: Use FP8 weight and activation
-- `-int4_w4a16`: Use INT4 weight with FP16 activation (requires `-group_size`)
-- `-group_size`: Group size for INT4 quantization (required when using `-int4_w4a16`)
-- `-has_zp`: Enable zero point for quantization
-- `-silu_fused`: Enable SiLU activation fusion (automatically sets `-no_bench_stage2`)
-- `-no_bench_stage2`: Skip stage 2 benchmarking (default: enabled)
-- `-print_time`: Print only time metric (default: prints time, TFLOPS, and bandwidth)
-- `-print_vgpr`: Print VGPR usage of the compiled Triton kernel
-- `-o`: Save results to CSV file
-- `-model_configs`: Path to model config JSON file (default: `utils/model_configs.json`)
+- `--model`: Model name (e.g., `mixtral-7B`, `mixtral-22B`, use `all` to benchmark all models). Selects which model configuration to use from the model config file. Model configurations define the MoE layer dimensions (N, K, E, top_k).
+
+- `-M`: M dimension (batch size × sequence length, default: 4096 if not specified). This is the number of tokens being processed. In MoE, M represents the total number of tokens across all batches and sequence positions. You can override the default M value from model configs with this flag.
+
+- `-dtype`: Data type for computation (`fp16`, `bf16`, `fp32`, default: `fp16`). Specifies the precision used for activations and accumulation in the MoE GEMM operations. Higher precision (fp32) provides better accuracy but slower performance.
+
+- `-fp8_type`: FP8 data type format (`e5m2fnuz`, `e4m3fnuz`, default: `e5m2fnuz`). When using `-fp8_w8a8`, this specifies the FP8 format:
+  - `e5m2fnuz`: 5 exponent bits, 2 mantissa bits (better range, lower precision)
+  - `e4m3fnuz`: 4 exponent bits, 3 mantissa bits (better precision, smaller range)
+
+- `-routed_weight`: Enable routed weight mechanism. When enabled, the output from each expert is multiplied by its routing weight (the gate score) before aggregation. This is the standard MoE behavior where expert outputs are weighted by their selection probability. When disabled, expert outputs are summed without weighting.
+
+- `-int8_w8a16`: Use INT8 weight quantization with FP16/BF16 activations (mixed precision). This reduces memory usage and can improve performance by using 8-bit weights while maintaining higher precision for activations. Requires quantization scales and optionally zero points.
+
+- `-fp8_w8a8`: Use FP8 quantization for both weights and activations. This provides the most aggressive quantization, using 8-bit floating point for both inputs and weights. Requires quantization scales. Use `-fp8_type` to specify the FP8 format.
+
+- `-int4_w4a16`: Use INT4 weight quantization with FP16/BF16 activations (requires `-group_size`). This provides the most memory-efficient quantization, using 4-bit weights. Requires grouped quantization with a specified group size. Typically used with GPTQ/AWQ quantization schemes.
+
+- `-group_size`: Group size for INT4 quantization (required when using `-int4_w4a16`). Specifies how many consecutive elements share the same quantization scale. Common values are 128 or 256. This enables grouped quantization where each group has its own scale factor, improving accuracy compared to per-tensor quantization.
+
+- `-has_zp`: Enable zero point for quantization. When using INT4 or INT8 quantization, this enables asymmetric quantization with a zero point. Asymmetric quantization can provide better accuracy by allowing the quantization range to be shifted, but requires storing additional zero point values.
+
+- `-silu_fused`: Enable SiLU (Sigmoid Linear Unit) activation fusion. Fuses the SiLU activation function directly into the MoE kernel, avoiding a separate kernel launch. This improves performance by reducing memory traffic and kernel launch overhead. When enabled, automatically sets `-no_bench_stage2` since SiLU fusion is typically used in the first stage of MoE layers (e.g., in SwiGLU activations).
+
+- `-no_bench_stage2`: Skip stage 2 benchmarking (default: stage 2 is benchmarked). MoE layers typically have two GEMM stages:
+  - **Stage 1**: (M, K) × (E, K, N1) → (M, E, N1) where N1=intermediate_size, K=hidden_size
+  - **Stage 2**: (M, N2) × (E, N2, K2) → (M, E, K) where N2=hidden_size, K2=intermediate_size//2
+  When this flag is set, only stage 1 is benchmarked. Useful when you only care about the first stage performance or when using `-silu_fused` (which applies to stage 1).
+
+- `-print_time`: Print only time metric (default: prints time, TFLOPS, and bandwidth). When enabled, the benchmark output only shows execution time in milliseconds, making the output more concise. By default, all three metrics (time, TFLOPS, bandwidth) are displayed.
+
+- `-print_vgpr`: Print VGPR (Vector General Purpose Register) usage of the compiled Triton kernel. VGPRs are GPU registers used by compute units. This helps understand register pressure and can indicate if a kernel is register-bound. High VGPR usage may limit occupancy (number of concurrent warps/wavefronts).
+
+- `-o`: Save results to CSV file. Writes benchmark results to a CSV file in the current directory. The CSV includes all configuration parameters and performance metrics for easy analysis and comparison.
+
+- `-model_configs`: Path to model config JSON file (default: `utils/model_configs.json`). Specifies the location of the model configuration file that contains model-specific parameters like hidden_size, intermediate_size, num_expert, and top_k. You can use a custom config file to benchmark models not in the default file.
 
 **Note**: MoE benchmarks use model configurations from `utils/model_configs.json`. The M, N, K, E, and top_k parameters are typically derived from the model configuration, but you can override M with the `-M` flag. When using `-int4_w4a16`, you must specify `-group_size` (e.g., `-group_size 128`).
 
