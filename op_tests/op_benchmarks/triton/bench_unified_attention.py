@@ -207,6 +207,12 @@ def input_helper(args, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, DECODE_P, dtype,
             )
         seqlens_k = torch.maximum(seqlens_k, seqlens_q)
 
+    cu_seqlens_q = torch.zeros(len(seqlens_q) + 1, dtype=torch.int32, device="cuda")
+    cu_seqlens_q[1:] = seqlens_q.cumsum(dim=0, dtype=torch.int32)
+    cu_seqlens_k = torch.zeros(len(seqlens_k) + 1, dtype=torch.int32, device="cuda")
+    cu_seqlens_k[1:] = seqlens_k.cumsum(dim=0, dtype=torch.int32)
+    
+    
     num_seqs = BATCH
     num_query_heads = HQ
     num_kv_heads = HK
@@ -228,7 +234,7 @@ def input_helper(args, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, DECODE_P, dtype,
         max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
         min_required_blocks = BATCH * max_num_blocks_per_seq
         num_blocks = (
-            args.num_blocks if args.num_blocks else max(min_required_blocks * 4, 2048)
+            args.num_blocks if args.num_blocks else max(min_required_blocks, 2048)
         )
         num_blocks = max(num_blocks, min_required_blocks)
         key_cache = torch.randn(
@@ -246,20 +252,20 @@ def input_helper(args, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, DECODE_P, dtype,
         assert args.equal_seqlens, "equal_seqlens assumed if kv_cache_layout is bshd"
         block_size = N_CTX_K
         num_blocks = BATCH
+        block_tables = torch.arange(num_blocks, dtype=torch.int32, device="cuda").unsqueeze(1)
         key_cache = torch.randn(
             BATCH, N_CTX_K, num_kv_heads, head_size, dtype=dtype, device="cuda"
         )
         value_cache = torch.randn_like(key_cache)
     else:  # thd
+        block_size = max_kv_len
+        block_tables = cu_seqlens_k.unsqueeze(1)
         key_cache = torch.randn(
             sum(seqlens_k), num_kv_heads, head_size, dtype=dtype, device="cuda"
         )
         value_cache = torch.randn_like(key_cache)
 
-    cu_seqlens_q = torch.zeros(len(seqlens_q) + 1, dtype=torch.int32, device="cuda")
-    cu_seqlens_q[1:] = seqlens_q.cumsum(dim=0, dtype=torch.int32)
-    cu_seqlens_k = torch.zeros(len(seqlens_k) + 1, dtype=torch.int32, device="cuda")
-    cu_seqlens_k[1:] = seqlens_k.cumsum(dim=0, dtype=torch.int32)
+   
 
     return (
         query,
