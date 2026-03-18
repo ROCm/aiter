@@ -1,0 +1,32 @@
+[build-system]
+# We need torch available during the build to provide the CMake files
+requires = ["scikit-build-core>=0.5", "pybind11"]
+build-backend="scikit_build_core.build"
+
+[project]
+name = "rms"
+version = "1.0.0"
+dependencies = [
+    "torch"
+]
+
+
+# This ensures scikit-build-core passes the right paths to
+# find_package(Torch)
+#cmake.args = [
+#    "-DUSE_CUDA=OFF",
+#    "-DUSE_ROCM=ON",
+#    "-DCMAKE_PREFIX_PATH=${PYTHON_SITEPACKAGES}/torch/share/cmake"
+#]
+
+# This replaces old 'set_target_properties' manual output directory
+[tool.scikit-build]
+build-dir="build/{wheel_tag}"
+wheel.packages = ["rms"]
+#install.components = ["python_modules"]
+cmake.verbose = true
+cmake.args = [
+    "-DUSE_CUDA=OFF",
+    "-DUSE_ROCM=ON",
+]
+
