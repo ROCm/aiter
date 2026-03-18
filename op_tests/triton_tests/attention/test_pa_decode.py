@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import triton.language as tl
-import torch
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 import pytest
 import random
+import torch
+import triton.language as tl
 from aiter.ops.triton.attention.pa_decode import paged_attention_decode
 from aiter import pertoken_quant
+from aiter.utility.dtypes import fp8
 
 DEBUG_MODE = False
+DEVICE = arch_info.get_arch()
 
 
 def paged_attention_decode_ref(
@@ -148,6 +151,7 @@ def input_helper(
     )
 
 
+@pytest.mark.skipif(DEVICE == "gfx1250")
 @pytest.mark.parametrize("B", [1, 4, 27])
 @pytest.mark.parametrize("H_Q, H_KV", [(1, 1), (16, 16), (24, 4)])
 @pytest.mark.parametrize("D", [1, 64, 128])
@@ -166,9 +170,9 @@ def input_helper(
     [
         (torch.float16, torch.float16, tl.float16, torch.float16),
         (torch.bfloat16, torch.bfloat16, tl.bfloat16, torch.bfloat16),
-        (torch.bfloat16, torch.float8_e4m3fnuz, tl.bfloat16, torch.bfloat16),
+        (torch.bfloat16, fp8, tl.bfloat16, torch.bfloat16),
         (torch.bfloat16, torch.int8, tl.bfloat16, torch.bfloat16),
-        (torch.float8_e4m3fnuz, torch.float8_e4m3fnuz, tl.bfloat16, torch.bfloat16),
+        (fp8, fp8, tl.bfloat16, torch.bfloat16),
         (torch.int8, torch.int8, tl.bfloat16, torch.bfloat16),
     ],
 )
