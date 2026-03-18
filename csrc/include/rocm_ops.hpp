@@ -1362,68 +1362,66 @@ namespace py = pybind11;
           py::arg("num_local_tokens")  = std::nullopt, \
           py::arg("dispatch_policy")   = 0);
 
-#define NORM_PYBIND                                               \
-    m.def("layernorm2d_fwd",                                      \
-          &layernorm2d,                                           \
-          py::arg("input"),                                       \
-          py::arg("weight"),                                      \
-          py::arg("bias"),                                        \
-          py::arg("epsilon") = 1e-5f,                             \
-          py::arg("x_bias")  = std::nullopt);                      \
-    m.def("layernorm2d_fwd_with_add",                             \
-          &layernorm2d_with_add,                                  \
-          py::arg("out"),                                         \
-          py::arg("input"),                                       \
-          py::arg("residual_in"),                                 \
-          py::arg("residual_out"),                                \
-          py::arg("weight"),                                      \
-          py::arg("bias"),                                        \
-          py::arg("epsilon"),                                     \
-          py::arg("x_bias") = std::nullopt);                      \
-    m.def("layernorm2d_fwd_with_smoothquant",                     \
-          &layernorm2d_with_smoothquant,                          \
-          py::arg("out"),                                         \
-          py::arg("input"),                                       \
-          py::arg("xscale"),                                      \
-          py::arg("yscale"),                                      \
-          py::arg("weight"),                                      \
-          py::arg("bias"),                                        \
-          py::arg("epsilon"),                                     \
-          py::arg("x_bias") = std::nullopt);                      \
-    m.def("layernorm2d_fwd_with_add_smoothquant",                 \
-          &layernorm2d_with_add_smoothquant,                      \
-          py::arg("out"),                                         \
-          py::arg("input"),                                       \
-          py::arg("residual_in"),                                 \
-          py::arg("residual_out"),                                \
-          py::arg("xscale"),                                      \
-          py::arg("yscale"),                                      \
-          py::arg("weight"),                                      \
-          py::arg("bias"),                                        \
-          py::arg("epsilon"),                                     \
-          py::arg("x_bias") = std::nullopt);                      \
-    m.def("layernorm2d_fwd_with_dynamicquant",                    \
-          &layernorm2d_with_dynamicquant,                         \
-          py::arg("out"),                                         \
-          py::arg("input"),                                       \
-          py::arg("yscale"),                                      \
-          py::arg("weight"),                                      \
-          py::arg("bias"),                                        \
-          py::arg("epsilon"),                                     \
-          py::arg("x_bias") = std::nullopt);                      \
-    m.def("layernorm2d_fwd_with_add_dynamicquant",                \
-          &layernorm2d_with_add_dynamicquant,                     \
-          py::arg("out"),                                         \
-          py::arg("input"),                                       \
-          py::arg("residual_in"),                                 \
-          py::arg("residual_out"),                                \
-          py::arg("yscale"),                                      \
-          py::arg("weight"),                                      \
-          py::arg("bias"),                                        \
-          py::arg("epsilon"),                                     \
-          py::arg("x_bias") = std::nullopt);                      \
-    m.def("layernorm2d_with_add_asm", &layernorm2d_with_add_asm); \
-    m.def("layernorm2d_with_add_smoothquant_asm", &layernorm2d_with_add_smoothquant_asm);
+#define NORM_PYBIND                                \
+    m.def("layernorm2d_fwd",                       \
+          &layernorm2d,                            \
+          py::arg("input"),                        \
+          py::arg("weight"),                       \
+          py::arg("bias"),                         \
+          py::arg("epsilon") = 1e-5f,              \
+          py::arg("x_bias")  = std::nullopt);       \
+    m.def("layernorm2d_fwd_with_add",              \
+          &layernorm2d_with_add,                   \
+          py::arg("out"),                          \
+          py::arg("input"),                        \
+          py::arg("residual_in"),                  \
+          py::arg("residual_out"),                 \
+          py::arg("weight"),                       \
+          py::arg("bias"),                         \
+          py::arg("epsilon"),                      \
+          py::arg("x_bias") = std::nullopt);       \
+    m.def("layernorm2d_fwd_with_smoothquant",      \
+          &layernorm2d_with_smoothquant,           \
+          py::arg("out"),                          \
+          py::arg("input"),                        \
+          py::arg("xscale"),                       \
+          py::arg("yscale"),                       \
+          py::arg("weight"),                       \
+          py::arg("bias"),                         \
+          py::arg("epsilon"),                      \
+          py::arg("x_bias") = std::nullopt);       \
+    m.def("layernorm2d_fwd_with_add_smoothquant",  \
+          &layernorm2d_with_add_smoothquant,       \
+          py::arg("out"),                          \
+          py::arg("input"),                        \
+          py::arg("residual_in"),                  \
+          py::arg("residual_out"),                 \
+          py::arg("xscale"),                       \
+          py::arg("yscale"),                       \
+          py::arg("weight"),                       \
+          py::arg("bias"),                         \
+          py::arg("epsilon"),                      \
+          py::arg("x_bias") = std::nullopt);       \
+    m.def("layernorm2d_fwd_with_dynamicquant",     \
+          &layernorm2d_with_dynamicquant,          \
+          py::arg("out"),                          \
+          py::arg("input"),                        \
+          py::arg("yscale"),                       \
+          py::arg("weight"),                       \
+          py::arg("bias"),                         \
+          py::arg("epsilon"),                      \
+          py::arg("x_bias") = std::nullopt);       \
+    m.def("layernorm2d_fwd_with_add_dynamicquant", \
+          &layernorm2d_with_add_dynamicquant,      \
+          py::arg("out"),                          \
+          py::arg("input"),                        \
+          py::arg("residual_in"),                  \
+          py::arg("residual_out"),                 \
+          py::arg("yscale"),                       \
+          py::arg("weight"),                       \
+          py::arg("bias"),                         \
+          py::arg("epsilon"),                      \
+          py::arg("x_bias") = std::nullopt);
 
 #define POS_ENCODING_PYBIND                                               \
     m.def("rotary_embedding_fwd", &rotary_embedding, "rotary_embedding"); \
@@ -1462,28 +1460,6 @@ namespace py = pybind11;
           py::arg("num_rows_factor")       = 1,                          \
           py::arg("smooth_scale_map_hash") = std::nullopt,               \
           py::arg("enable_ps")             = true);                                  \
-    m.def("moe_smooth_per_token_scaled_quant_v1",                        \
-          &aiter::moe_smooth_per_token_scaled_quant_v1,                  \
-          py::arg("out"),                                                \
-          py::arg("input"),                                              \
-          py::arg("scales"),                                             \
-          py::arg("smooth_scale"),                                       \
-          py::arg("smooth_scale_map"),                                   \
-          py::arg("shuffle_scale")         = false,                      \
-          py::arg("smooth_scale_map_hash") = std::nullopt,               \
-          py::arg("transpose_out")         = false);                             \
-    m.def("moe_smooth_per_token_scaled_quant_v2",                        \
-          &aiter::moe_smooth_per_token_scaled_quant_v2,                  \
-          py::arg("out"),                                                \
-          py::arg("input"),                                              \
-          py::arg("scales"),                                             \
-          py::arg("smooth_scale"),                                       \
-          py::arg("sorted_token_ids"),                                   \
-          py::arg("sorted_expert_ids"),                                  \
-          py::arg("num_valid_ids"),                                      \
-          py::arg("block_m"),                                            \
-          py::arg("shuffle_scale") = false,                              \
-          py::arg("transpose_out") = false);                             \
     m.def("partial_transpose",                                           \
           &aiter::partial_transpose,                                     \
           py::arg("out"),                                                \

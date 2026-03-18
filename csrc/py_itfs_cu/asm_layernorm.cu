@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
-#include <torch/all.h>
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "aiter_hip_common.h"
 
 struct __attribute__((packed)) KernelArgs
@@ -33,41 +30,43 @@ struct __attribute__((packed)) KernelArgs
     p2 _p10;
 };
 
-void layernorm2d_with_add_asm(torch::Tensor &out,          // [m ,n]
-                              torch::Tensor &input,        // [m ,n]
-                              torch::Tensor &residual_in,  // [m ,n]
-                              torch::Tensor &residual_out, // [m ,n]
-                              torch::Tensor &weight,       // [1 ,n]
-                              torch::Tensor &bias,         // [1 ,n]
-                              float epsilon)
+extern "C" __attribute__((visibility("default"))) void layernorm2d_with_add_asm(AiterTensor* out,          // [m ,n]
+                              AiterTensor* input,        // [m ,n]
+                              AiterTensor* residual_in,  // [m ,n]
+                              AiterTensor* residual_out, // [m ,n]
+                              AiterTensor* weight,       // [1 ,n]
+                              AiterTensor* bias,         // [1 ,n]
+                              float epsilon,
+                              hipStream_t stream)
 {
-    auto dtype = input.dtype();
-    TORCH_CHECK(dtype == torch::kBFloat16,
+    auto dtype = input->dtype();
+    AITER_CHECK(dtype == AITER_DTYPE_bf16 ,
                 __func__, " for now only support bf16 data type");
-    TORCH_CHECK(input.is_contiguous(),
+    AITER_CHECK(input->is_contiguous(),
                 __func__, " for now only support input.is_contiguous()");
 
     KernelArgs args;
-    int n = input.size(-1);
-    int m = input.numel() / n;
-    TORCH_CHECK(m % 2 == 0,
+    int n = input->size(-1);
+    int m = input->numel() / n;
+    AITER_CHECK(m % 2 == 0,
                 __func__, " for now only support m % 2 == 0");
-    TORCH_CHECK(n == 8192,
+    AITER_CHECK(n == 8192,
                 __func__, " for now only support n == 8192");
 
     size_t arg_size = sizeof(args);
-    args.ptr_O = out.data_ptr();
-    args.ptr_In = input.data_ptr();
-    args.ptr_Weight = weight.data_ptr();
-    args.ptr_Bias = bias.data_ptr();
+    args.ptr_O = out->data_ptr();
+    args.ptr_In = input->data_ptr();
+    args.ptr_Weight = weight->data_ptr();
+    args.ptr_Bias = bias->data_ptr();
     args.epsilon = epsilon;
     args.M = m;
     args.N = n;
-    args.ptr_OutResidual = residual_out.data_ptr();
-    args.ptr_InResidual = residual_in.data_ptr();
+    args.ptr_OutResidual = residual_out->data_ptr();
+    args.ptr_InResidual = residual_in->data_ptr();
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    int prev_device;
+    HIP_CALL(hipGetDevice(&prev_device));
+    HIP_CALL(hipSetDevice(input->device_id));
     int sub_M = 2;
     static AiterAsmKernel impl("layer_norm_kernel_func", "layer_norm.co");
 
@@ -80,47 +79,50 @@ void layernorm2d_with_add_asm(torch::Tensor &out,          // [m ,n]
                         1,                         // bdy
                         1,                         // bdz
                         stream});
+    HIP_CALL(hipSetDevice(prev_device));
 }
 
-void layernorm2d_with_add_smoothquant_asm(torch::Tensor &out,          // [m ,n]
-                                          torch::Tensor &input,        // [m ,n]
-                                          torch::Tensor &residual_in,  // [m ,n]
-                                          torch::Tensor &residual_out, // [m ,n]
-                                          torch::Tensor &xscale,       // [1 ,n]
-                                          torch::Tensor &yscale,       // [m ,1]
-                                          torch::Tensor &weight,       // [1 ,n]
-                                          torch::Tensor &bias,         // [1 ,n]
-                                          float epsilon)
+extern "C" __attribute__((visibility("default"))) void layernorm2d_with_add_smoothquant_asm(AiterTensor* out,          // [m ,n]
+                                          AiterTensor* input,        // [m ,n]
+                                          AiterTensor* residual_in,  // [m ,n]
+                                          AiterTensor* residual_out, // [m ,n]
+                                          AiterTensor* xscale,       // [1 ,n]
+                                          AiterTensor* yscale,       // [m ,1]
+                                          AiterTensor* weight,       // [1 ,n]
+                                          AiterTensor* bias,         // [1 ,n]
+                                          float epsilon,
+                                          hipStream_t stream)
 {
-    auto dtype = input.dtype();
-    TORCH_CHECK(dtype == torch::kBFloat16,
+    auto dtype = input->dtype();
+    AITER_CHECK(dtype == AITER_DTYPE_bf16,
                 __func__, " for now only support bf16 data type");
-    TORCH_CHECK(input.is_contiguous(),
+    AITER_CHECK(input->is_contiguous(),
                 __func__, " for now only support input.is_contiguous()");
 
     KernelArgs args;
-    int n = input.size(-1);
-    int m = input.numel() / n;
-    TORCH_CHECK(m % 2 == 0,
+    int n = input->size(-1);
+    int m = input->numel() / n;
+    AITER_CHECK(m % 2 == 0,
                 __func__, " for now only support m % 2 == 0");
-    TORCH_CHECK(n == 8192,
+    AITER_CHECK(n == 8192,
                 __func__, " for now only support n == 8192");
 
     size_t arg_size = sizeof(args);
-    args.ptr_O = out.data_ptr();
-    args.ptr_In = input.data_ptr();
-    args.ptr_Weight = weight.data_ptr();
-    args.ptr_Bias = bias.data_ptr();
+    args.ptr_O = out->data_ptr();
+    args.ptr_In = input->data_ptr();
+    args.ptr_Weight = weight->data_ptr();
+    args.ptr_Bias = bias->data_ptr();
     args.epsilon = epsilon;
     args.M = m;
     args.N = n;
-    args.ptr_OutResidual = residual_out.data_ptr();
-    args.ptr_InResidual = residual_in.data_ptr();
-    args.ptr_OutYScale = yscale.data_ptr();
-    args.ptr_XScale = xscale.data_ptr();
+    args.ptr_OutResidual = residual_out->data_ptr();
+    args.ptr_InResidual = residual_in->data_ptr();
+    args.ptr_OutYScale = yscale->data_ptr();
+    args.ptr_XScale = xscale->data_ptr();
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    int prev_device;
+    HIP_CALL(hipGetDevice(&prev_device));
+    HIP_CALL(hipSetDevice(input->device_id));
     int sub_M = 2;
     static AiterAsmKernel impl("layer_norm_qnt", "layer_norm_qnt.co");
 
@@ -133,4 +135,5 @@ void layernorm2d_with_add_smoothquant_asm(torch::Tensor &out,          // [m ,n]
                         1,                         // bdy
                         1,                         // bdz
                         stream});
+    HIP_CALL(hipSetDevice(prev_device));
 }
