@@ -17,24 +17,32 @@ import torch
 
 from aiter import dtypes, mha_bwd, mha_fwd, mha_varlen_bwd
 
-
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
 
+
 def make_qkvo(batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, hdim_v, dtype, device):
     """Return (q, k, v, dout) in BSHD layout, requires_grad=True."""
-    q    = torch.randn(batch, seqlen_q, nhead,   hdim,   device=device, dtype=dtype).requires_grad_(True)
-    k    = torch.randn(batch, seqlen_k, nhead_k, hdim,   device=device, dtype=dtype).requires_grad_(True)
-    v    = torch.randn(batch, seqlen_k, nhead_k, hdim_v, device=device, dtype=dtype).requires_grad_(True)
-    dout = torch.randn(batch, seqlen_q, nhead,   hdim_v, device=device, dtype=dtype)
+    q = torch.randn(
+        batch, seqlen_q, nhead, hdim, device=device, dtype=dtype
+    ).requires_grad_(True)
+    k = torch.randn(
+        batch, seqlen_k, nhead_k, hdim, device=device, dtype=dtype
+    ).requires_grad_(True)
+    v = torch.randn(
+        batch, seqlen_k, nhead_k, hdim_v, device=device, dtype=dtype
+    ).requires_grad_(True)
+    dout = torch.randn(batch, seqlen_q, nhead, hdim_v, device=device, dtype=dtype)
     return q, k, v, dout
 
 
 def run_fwd(q, k, v, softmax_scale, causal):
     """Run mha_fwd and return (out, lse)."""
     out, lse, _, _ = mha_fwd(
-        q, k, v,
+        q,
+        k,
+        v,
         dropout_p=0.0,
         softmax_scale=softmax_scale,
         is_causal=causal,
@@ -60,14 +68,14 @@ def reference_d_sink(dout, out, lse, sink, p_undrop=1.0):
     # D[b, q, h] = sum_j(dout * out) * p_undrop  ->  shape [B, Sq, H]
     D_bsh = (dout.float() * out.float()).sum(dim=-1) * p_undrop  # [B, Sq, H]
     # reorder to [B, H, Sq] to align with lse
-    D_bhs = D_bsh.permute(0, 2, 1)                               # [B, H, Sq]
+    D_bhs = D_bsh.permute(0, 2, 1)  # [B, H, Sq]
 
     # P_sink[b, h, q] = exp(sink[b, h] - lse[b, h, q])
-    sink_bhs = sink.unsqueeze(-1)                                 # [B, H, 1]
-    p_sink = torch.exp(sink_bhs.float() - lse.float())           # [B, H, Sq]
+    sink_bhs = sink.unsqueeze(-1)  # [B, H, 1]
+    p_sink = torch.exp(sink_bhs.float() - lse.float())  # [B, H, Sq]
 
     # d_sink[h] = sum_{b, q} (-P_sink * D)
-    d_sink = (-p_sink * D_bhs).sum(dim=(0, 2))                   # [H]
+    d_sink = (-p_sink * D_bhs).sum(dim=(0, 2))  # [H]
     return d_sink.float()
 
 
@@ -75,19 +83,21 @@ def reference_d_sink(dout, out, lse, sink, p_undrop=1.0):
 # parametrize
 # ---------------------------------------------------------------------------
 
-DTYPES   = [dtypes.fp16, dtypes.bf16]
-CAUSALS  = [False, True]
-CONFIGS  = [
+DTYPES = [dtypes.fp16, dtypes.bf16]
+CAUSALS = [False, True]
+CONFIGS = [
     # (batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim)
     (2, 128, 128, 4, 4, 64),
-    (1, 64,  64,  6, 2, 128),
+    (1, 64, 64, 6, 2, 128),
 ]
 
 
-@pytest.mark.parametrize("causal",  CAUSALS)
-@pytest.mark.parametrize("dtype",   DTYPES)
+@pytest.mark.parametrize("causal", CAUSALS)
+@pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("batch,seqlen_q,seqlen_k,nhead,nhead_k,hdim", CONFIGS)
-def test_mha_bwd_sink_dsink(batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, dtype, causal):
+def test_mha_bwd_sink_dsink(
+    batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, dtype, causal
+):
     """
     Verify that mha_bwd correctly accumulates d_sink.
 
@@ -100,7 +110,7 @@ def test_mha_bwd_sink_dsink(batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, dty
     """
     device = torch.device("cuda")
     hdim_v = hdim
-    softmax_scale = hdim ** -0.5
+    softmax_scale = hdim**-0.5
 
     q, k, v, dout = make_qkvo(
         batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, hdim_v, dtype, device
@@ -111,12 +121,19 @@ def test_mha_bwd_sink_dsink(batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, dty
 
     # --- sink tensors ---
     # sink: [batch, nhead], uniform in [30, 60] in log-space
-    sink = torch.empty(batch, nhead, device=device, dtype=torch.float32).uniform_(30.0, 60.0)
+    sink = torch.empty(batch, nhead, device=device, dtype=torch.float32).uniform_(
+        30.0, 60.0
+    )
     d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
 
     # --- backward ---
     dq, dk, dv, softmax_d = mha_bwd(
-        dout, q.detach(), k.detach(), v.detach(), out, lse,
+        dout,
+        q.detach(),
+        k.detach(),
+        v.detach(),
+        out,
+        lse,
         dropout_p=0.0,
         softmax_scale=softmax_scale,
         is_causal=causal,
@@ -136,19 +153,23 @@ def test_mha_bwd_sink_dsink(batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, dty
     # Tolerances: fp16/bf16 are noisy; use relatively loose absolute tolerance
     # because sink values are large (exp() amplifies small differences)
     rtol = 0.02
-    atol = 0.5   # absolute tolerance in float units for d_sink
+    atol = 0.5  # absolute tolerance in float units for d_sink
     torch.testing.assert_close(
-        d_sink, d_sink_ref,
-        rtol=rtol, atol=atol,
+        d_sink,
+        d_sink_ref,
+        rtol=rtol,
+        atol=atol,
         msg=f"d_sink mismatch for dtype={dtype}, causal={causal}, "
-            f"B={batch}, Sq={seqlen_q}, H={nhead}"
+        f"B={batch}, Sq={seqlen_q}, H={nhead}",
     )
 
 
-@pytest.mark.parametrize("causal",  CAUSALS)
-@pytest.mark.parametrize("dtype",   DTYPES)
+@pytest.mark.parametrize("causal", CAUSALS)
+@pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("batch,seqlen_q,seqlen_k,nhead,nhead_k,hdim", CONFIGS)
-def test_mha_bwd_with_sink_dq_dk_dv(batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, dtype, causal):
+def test_mha_bwd_with_sink_dq_dk_dv(
+    batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, dtype, causal
+):
     """
     Verify that passing sink/d_sink does not corrupt the dQ, dK, dV outputs.
 
@@ -158,7 +179,7 @@ def test_mha_bwd_with_sink_dq_dk_dv(batch, seqlen_q, seqlen_k, nhead, nhead_k, h
     """
     device = torch.device("cuda")
     hdim_v = hdim
-    softmax_scale = hdim ** -0.5
+    softmax_scale = hdim**-0.5
 
     q, k, v, dout = make_qkvo(
         batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, hdim_v, dtype, device
@@ -178,16 +199,26 @@ def test_mha_bwd_with_sink_dq_dk_dv(batch, seqlen_q, seqlen_k, nhead, nhead_k, h
 
     # baseline: no sink
     dq_base, dk_base, dv_base, _ = mha_bwd(
-        dout, q.detach(), k.detach(), v.detach(), out, lse,
+        dout,
+        q.detach(),
+        k.detach(),
+        v.detach(),
+        out,
+        lse,
         **common_bwd_args,
     )
 
     # with sink = very negative values → exp(sink - lse) ≈ 0 → no effect
     sink_small = torch.full((batch, nhead), -1000.0, device=device, dtype=torch.float32)
-    d_sink     = torch.zeros(nhead, device=device, dtype=torch.float32)
+    d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
 
     dq_sink, dk_sink, dv_sink, _ = mha_bwd(
-        dout, q.detach(), k.detach(), v.detach(), out, lse,
+        dout,
+        q.detach(),
+        k.detach(),
+        v.detach(),
+        out,
+        lse,
         **common_bwd_args,
         sink=sink_small,
         d_sink=d_sink,
@@ -195,9 +226,15 @@ def test_mha_bwd_with_sink_dq_dk_dv(batch, seqlen_q, seqlen_k, nhead, nhead_k, h
 
     # With negligible sink, gradients should match the no-sink baseline
     rtol, atol = (0.01, 0.01) if dtype == dtypes.fp16 else (0.02, 0.02)
-    torch.testing.assert_close(dq_sink, dq_base, rtol=rtol, atol=atol, msg="dQ mismatch with small sink")
-    torch.testing.assert_close(dk_sink, dk_base, rtol=rtol, atol=atol, msg="dK mismatch with small sink")
-    torch.testing.assert_close(dv_sink, dv_base, rtol=rtol, atol=atol, msg="dV mismatch with small sink")
+    torch.testing.assert_close(
+        dq_sink, dq_base, rtol=rtol, atol=atol, msg="dQ mismatch with small sink"
+    )
+    torch.testing.assert_close(
+        dk_sink, dk_base, rtol=rtol, atol=atol, msg="dK mismatch with small sink"
+    )
+    torch.testing.assert_close(
+        dv_sink, dv_base, rtol=rtol, atol=atol, msg="dV mismatch with small sink"
+    )
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -205,25 +242,43 @@ def test_mha_bwd_sink_null_gives_same_as_no_sink(dtype):
     """Passing sink=None must give identical output to omitting sink entirely."""
     device = torch.device("cuda")
     batch, seqlen, nhead, hdim = 2, 64, 4, 64
-    softmax_scale = hdim ** -0.5
+    softmax_scale = hdim**-0.5
 
-    q, k, v, dout = make_qkvo(batch, seqlen, seqlen, nhead, nhead, hdim, hdim, dtype, device)
+    q, k, v, dout = make_qkvo(
+        batch, seqlen, seqlen, nhead, nhead, hdim, hdim, dtype, device
+    )
     out, lse = run_fwd(q.detach(), k.detach(), v.detach(), softmax_scale, False)
 
     common = dict(
-        dropout_p=0.0, softmax_scale=softmax_scale,
-        is_causal=False, window_size_left=-1, window_size_right=-1,
+        dropout_p=0.0,
+        softmax_scale=softmax_scale,
+        is_causal=False,
+        window_size_left=-1,
+        window_size_right=-1,
         deterministic=False,
     )
 
-    dq1, dk1, dv1, d1 = mha_bwd(dout, q.detach(), k.detach(), v.detach(), out, lse, **common)
-    dq2, dk2, dv2, d2 = mha_bwd(dout, q.detach(), k.detach(), v.detach(), out, lse, **common,
-                                 sink=None, d_sink=None)
+    dq1, dk1, dv1, d1 = mha_bwd(
+        dout, q.detach(), k.detach(), v.detach(), out, lse, **common
+    )
+    dq2, dk2, dv2, d2 = mha_bwd(
+        dout,
+        q.detach(),
+        k.detach(),
+        v.detach(),
+        out,
+        lse,
+        **common,
+        sink=None,
+        d_sink=None,
+    )
 
     torch.testing.assert_close(dq1, dq2, msg="dQ differs with sink=None vs omitted")
     torch.testing.assert_close(dk1, dk2, msg="dK differs with sink=None vs omitted")
     torch.testing.assert_close(dv1, dv2, msg="dV differs with sink=None vs omitted")
-    torch.testing.assert_close(d1,  d2,  msg="softmax_d differs with sink=None vs omitted")
+    torch.testing.assert_close(
+        d1, d2, msg="softmax_d differs with sink=None vs omitted"
+    )
 
 
 def reference_d_sink_varlen(dout, out, lse_group, sink, seqlens_q):
@@ -242,18 +297,18 @@ def reference_d_sink_varlen(dout, out, lse_group, sink, seqlens_q):
 
     offset = 0
     for b, sq in enumerate(seqlens_q):
-        dout_b = dout[offset:offset + sq].float()      # [sq, H, Dv]
-        out_b  = out[offset:offset + sq].float()       # [sq, H, Dv]
-        lse_b  = lse_group[:, offset:offset + sq]      # [H, sq]
+        dout_b = dout[offset : offset + sq].float()  # [sq, H, Dv]
+        out_b = out[offset : offset + sq].float()  # [sq, H, Dv]
+        lse_b = lse_group[:, offset : offset + sq]  # [H, sq]
 
         # D[q, h] = sum_j(dout[q,h,j] * out[q,h,j])
-        D_qh = (dout_b * out_b).sum(dim=-1)            # [sq, H]
-        D_hq = D_qh.permute(1, 0)                      # [H, sq]
+        D_qh = (dout_b * out_b).sum(dim=-1)  # [sq, H]
+        D_hq = D_qh.permute(1, 0)  # [H, sq]
 
         # P_sink[h, q] = exp(sink[b, h] - lse[h, q])
         p_sink = torch.exp(sink[b].float().unsqueeze(-1) - lse_b)  # [H, sq]
 
-        d_sink += (-p_sink * D_hq).sum(dim=-1)          # [H]
+        d_sink += (-p_sink * D_hq).sum(dim=-1)  # [H]
         offset += sq
 
     return d_sink
@@ -275,17 +330,19 @@ def test_mha_varlen_bwd_sink_dsink(dtype):
     device = torch.device("cuda")
     batch, seqlen, nhead, hdim = 2, 64, 4, 64
     hdim_v = hdim
-    softmax_scale = hdim ** -0.5
+    softmax_scale = hdim**-0.5
     seqlens_q = [seqlen] * batch
 
-    cu_seqlens_q = torch.tensor([0, seqlen, seqlen * 2], device=device, dtype=torch.int32)
+    cu_seqlens_q = torch.tensor(
+        [0, seqlen, seqlen * 2], device=device, dtype=torch.int32
+    )
     cu_seqlens_k = cu_seqlens_q.clone()
     total_q = seqlen * batch
     total_k = seqlen * batch
 
-    q    = torch.randn(total_q, nhead, hdim,   device=device, dtype=dtype)
-    k    = torch.randn(total_k, nhead, hdim,   device=device, dtype=dtype)
-    v    = torch.randn(total_k, nhead, hdim_v, device=device, dtype=dtype)
+    q = torch.randn(total_q, nhead, hdim, device=device, dtype=dtype)
+    k = torch.randn(total_k, nhead, hdim, device=device, dtype=dtype)
+    v = torch.randn(total_k, nhead, hdim_v, device=device, dtype=dtype)
     dout = torch.randn(total_q, nhead, hdim_v, device=device, dtype=dtype)
 
     # forward (batch mode) → convert to group-mode shapes
@@ -298,11 +355,18 @@ def test_mha_varlen_bwd_sink_dsink(dtype):
     # lse for group mode: [nhead, total_q]
     lse = lse_b.permute(1, 0, 2).reshape(nhead, total_q).contiguous()
 
-    sink   = torch.empty(batch, nhead, device=device, dtype=torch.float32).uniform_(30.0, 60.0)
+    sink = torch.empty(batch, nhead, device=device, dtype=torch.float32).uniform_(
+        30.0, 60.0
+    )
     d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
 
     dq, dk, dv, _ = mha_varlen_bwd(
-        dout, q, k, v, out, lse,
+        dout,
+        q,
+        k,
+        v,
+        out,
+        lse,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=seqlen,
@@ -326,8 +390,13 @@ def test_mha_varlen_bwd_sink_dsink(dtype):
 
     # numerical correctness vs reference
     d_sink_ref = reference_d_sink_varlen(dout, out, lse, sink, seqlens_q)
-    torch.testing.assert_close(d_sink, d_sink_ref, rtol=0.02, atol=0.5,
-                               msg="varlen d_sink mismatch vs reference")
+    torch.testing.assert_close(
+        d_sink,
+        d_sink_ref,
+        rtol=0.02,
+        atol=0.5,
+        msg="varlen d_sink mismatch vs reference",
+    )
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -342,7 +411,7 @@ def test_mha_varlen_bwd_sink_variable_lengths(dtype):
     device = torch.device("cuda")
     nhead, hdim = 4, 64
     hdim_v = hdim
-    softmax_scale = hdim ** -0.5
+    softmax_scale = hdim**-0.5
 
     # variable lengths: batch 0 has 48 tokens, batch 1 has 80 tokens
     seqlens_q = [48, 80]
@@ -353,38 +422,51 @@ def test_mha_varlen_bwd_sink_variable_lengths(dtype):
     total_q = sum(seqlens_q)
     total_k = sum(seqlens_k)
 
-    cu_sq = torch.tensor([0] + list(torch.cumsum(torch.tensor(seqlens_q), 0).tolist()),
-                         device=device, dtype=torch.int32)
-    cu_sk = torch.tensor([0] + list(torch.cumsum(torch.tensor(seqlens_k), 0).tolist()),
-                         device=device, dtype=torch.int32)
+    cu_sq = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(seqlens_q), 0).tolist()),
+        device=device,
+        dtype=torch.int32,
+    )
+    cu_sk = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(seqlens_k), 0).tolist()),
+        device=device,
+        dtype=torch.int32,
+    )
 
-    q    = torch.randn(total_q, nhead, hdim,   device=device, dtype=dtype)
-    k    = torch.randn(total_k, nhead, hdim,   device=device, dtype=dtype)
-    v    = torch.randn(total_k, nhead, hdim_v, device=device, dtype=dtype)
+    q = torch.randn(total_q, nhead, hdim, device=device, dtype=dtype)
+    k = torch.randn(total_k, nhead, hdim, device=device, dtype=dtype)
+    v = torch.randn(total_k, nhead, hdim_v, device=device, dtype=dtype)
     dout = torch.randn(total_q, nhead, hdim_v, device=device, dtype=dtype)
 
     # forward per batch segment (different seq lengths → can't use batch mode directly)
     out_parts, lse_parts = [], []
     offset_q, offset_k = 0, 0
     for sq, sk in zip(seqlens_q, seqlens_k):
-        q_b = q[offset_q:offset_q+sq].unsqueeze(0)
-        k_b = k[offset_k:offset_k+sk].unsqueeze(0)
-        v_b = v[offset_k:offset_k+sk].unsqueeze(0)
+        q_b = q[offset_q : offset_q + sq].unsqueeze(0)
+        k_b = k[offset_k : offset_k + sk].unsqueeze(0)
+        v_b = v[offset_k : offset_k + sk].unsqueeze(0)
         out_b, lse_b = run_fwd(q_b, k_b, v_b, softmax_scale, causal=False)
-        out_parts.append(out_b.squeeze(0))                     # [sq, H, Dv]
-        lse_parts.append(lse_b.squeeze(0).permute(1, 0))      # [sq, H]
+        out_parts.append(out_b.squeeze(0))  # [sq, H, Dv]
+        lse_parts.append(lse_b.squeeze(0).permute(1, 0))  # [sq, H]
         offset_q += sq
         offset_k += sk
 
-    out = torch.cat(out_parts, dim=0)                          # [total_q, H, Dv]
+    out = torch.cat(out_parts, dim=0)  # [total_q, H, Dv]
     # group-mode lse: [H, total_q]
     lse = torch.cat(lse_parts, dim=0).permute(1, 0).contiguous()  # [H, total_q]
 
-    sink   = torch.empty(batch, nhead, device=device, dtype=torch.float32).uniform_(30.0, 60.0)
+    sink = torch.empty(batch, nhead, device=device, dtype=torch.float32).uniform_(
+        30.0, 60.0
+    )
     d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
 
     dq, dk, dv, _ = mha_varlen_bwd(
-        dout, q, k, v, out, lse,
+        dout,
+        q,
+        k,
+        v,
+        out,
+        lse,
         cu_seqlens_q=cu_sq,
         cu_seqlens_k=cu_sk,
         max_seqlen_q=max_seqlen_q,
@@ -405,5 +487,10 @@ def test_mha_varlen_bwd_sink_variable_lengths(dtype):
 
     # reference
     d_sink_ref = reference_d_sink_varlen(dout, out, lse, sink, seqlens_q)
-    torch.testing.assert_close(d_sink, d_sink_ref, rtol=0.02, atol=0.5,
-                               msg="varlen variable-length d_sink mismatch")
+    torch.testing.assert_close(
+        d_sink,
+        d_sink_ref,
+        rtol=0.02,
+        atol=0.5,
+        msg="varlen variable-length d_sink mismatch",
+    )
