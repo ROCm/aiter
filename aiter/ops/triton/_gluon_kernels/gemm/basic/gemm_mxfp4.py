@@ -12,16 +12,6 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
 ):
     K_GROUPS = BLOCK_K // SCALE_GROUP_ELEMS
 
-    # Raw LDS -> reg layouts (must be DistributedLayout)
-    #   B_raw:   (BLOCK_N//16, BLOCK_K_BYTES*16)
-
-    b_raw_reg_layout = gl.BlockedLayout(
-        size_per_thread=[1, 16],
-        threads_per_warp=[4, 8],
-        warps_per_cta=[1, num_warps],
-        order=[1, 0],
-    )
-
     # e2m1 uses instr_shape [16,16,64] for operands
     wmma_layout = gl.amd.AMDWMMALayout(
         version=3,
@@ -57,7 +47,6 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
     )
 
     return {
-        "b_raw_reg_layout": b_raw_reg_layout,
         "wmma_layout": wmma_layout,
         "wmma_acc_layout": wmma_acc_layout,
         "shared_A": shared_A,
@@ -162,7 +151,6 @@ def gemm_mxfp4_preshuffle_gfx1250(
     NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     cache_modifier: gl.constexpr,
-    b_raw_reg_layout: gl.constexpr,
     wmma_layout: gl.constexpr,
     wmma_acc_layout: gl.constexpr,
     shared_A: gl.constexpr,
@@ -348,14 +336,12 @@ def gemm_mxfp4_preshuffle_gfx1250(
         # LDS -> vGPR
         A = smem_A.index(slot_c).load(layout=dot_a_layout)
 
-        # B operand (raw in LDS -> depreshuffle -> logical)
-        B_raw = smem_B.index(slot_c).load(layout=b_raw_reg_layout)
-        B = gl.convert_layout(
-            depreshuffle_b_raw_to_kn(
-                B_raw, BLOCK_N=BLOCK_SIZE_N, BLOCK_K=BLOCK_SIZE_K, BLOCK_K_BYTES=BLOCK_K_BYTES
-            ),
-            layout=dot_b_layout,
-        )
+        # B operand (raw unshuffle -> logical)
+        B = depreshuffle_b_raw_to_kn(
+                smem_B.index(slot_c), BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BLOCK_K_BYTES=BLOCK_K_BYTES
+            ).load(layout=dot_b_layout)
+
+        # scales: unshuffle -> load with wmma scale layouts
         if BLOCK_SIZE_M < 32:
             AS = smem_ASraw.index(slot_c).load(layout=a_scale_layout)
         else:
@@ -380,13 +366,9 @@ def gemm_mxfp4_preshuffle_gfx1250(
 
             A = smem_A.index(slot_c).load(layout=dot_a_layout)
 
-            B_raw = smem_B.index(slot_c).load(layout=b_raw_reg_layout)
-            B = gl.convert_layout(
-                depreshuffle_b_raw_to_kn(
-                    B_raw, BLOCK_N=BLOCK_SIZE_N, BLOCK_K=BLOCK_SIZE_K, BLOCK_K_BYTES=BLOCK_K_BYTES
-                ),
-                layout=dot_b_layout,
-            )
+            B = depreshuffle_b_raw_to_kn(
+                smem_B.index(slot_c), BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BLOCK_K_BYTES=BLOCK_K_BYTES
+            ).load(layout=dot_b_layout)
 
             if BLOCK_SIZE_M < 32:
                 AS = smem_ASraw.index(slot_c).load(layout=a_scale_layout)
@@ -417,79 +399,3 @@ def gemm_mxfp4_preshuffle_gfx1250(
         BLOCK_N=BLOCK_SIZE_N,
         acc=acc,
     )
-
-
-# def _get_config(M: int, N: int, K: int):
-#     config, is_tuned = get_gemm_config("GEMM-AFP4WFP4_PRESHUFFLED", M, N, K)
-#     return config, is_tuned
-
-
-# def gemm_afp4wfp4_preshuffled_gfx1250(
-#     x_fp4: torch.Tensor,
-#     w_preshuf: torch.Tensor,
-#     x_scales: torch.Tensor,
-#     w_scales: torch.Tensor,
-#     dtype: Optional[torch.dtype] = torch.bfloat16,
-#     y: Optional[torch.Tensor] = None,
-#     config: Optional[dict] = None,
-# ) -> torch.Tensor:
-#     M, K_bytes = x_fp4.shape
-#     n16, _ = w_preshuf.shape
-#     N = n16 * 16
-#     K_elems = K_bytes * 2
-
-#     if config is None:
-#         config, _ = _get_config(M, N, K_elems)
-
-#     BLOCK_M = int(config.get("BLOCK_SIZE_M", 32))
-#     BLOCK_N = int(config.get("BLOCK_SIZE_N", 64))
-#     BLOCK_K = int(config.get("BLOCK_SIZE_K", 256))
-#     NUM_KSPLIT = int(config.get("NUM_KSPLIT", 1))
-
-#     if NUM_KSPLIT == 1:
-#         if y is None:
-#             y = torch.empty((M, N), device=x_fp4.device, dtype=dtype or torch.bfloat16)
-#         stride_c_k = 0
-#         SPLITK_BLOCK = K_elems
-#     else:
-#         SPLITK_BLOCK = triton.cdiv(K_elems, NUM_KSPLIT)
-#         SPLITK_BLOCK = triton.cdiv(SPLITK_BLOCK, BLOCK_K) * BLOCK_K
-#         if y is None:
-#             y = torch.empty((NUM_KSPLIT, M, N), device=x_fp4.device, dtype=torch.float32)
-#         stride_c_k = y.stride(0)
-
-#     num_warps = config.get("num_warps", 4)
-#     layouts = get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K)
-
-#     grid = (NUM_KSPLIT * triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
-#     gemm_mxfp4_preshuffle_gfx1250[grid](
-#         x_fp4,
-#         w_preshuf,
-#         y,
-#         x_scales,
-#         w_scales,
-#         M,
-#         N,
-#         K_elems,
-#         x_fp4.stride(0),
-#         x_fp4.stride(1),
-#         w_preshuf.stride(0),
-#         w_preshuf.stride(1),
-#         stride_c_k,
-#         y.stride(-2),
-#         y.stride(-1),
-#         x_scales.stride(0),
-#         x_scales.stride(1),
-#         w_scales.stride(0),
-#         w_scales.stride(1),
-#         BLOCK_M=BLOCK_M,
-#         BLOCK_N=BLOCK_N,
-#         BLOCK_K=BLOCK_K,
-#         NUM_WARPS=num_warps,
-#         NUM_KSPLIT=NUM_KSPLIT,
-#         SPLITK_BLOCK=SPLITK_BLOCK,
-#         NUM_BUFFERS=2,
-#         cache_modifier=config.get("cache_modifier", ".ca"),
-#         **layouts,
-#     )
-#     return y
