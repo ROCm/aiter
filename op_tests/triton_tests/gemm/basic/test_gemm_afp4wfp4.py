@@ -235,9 +235,9 @@ def run_triton(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
 @pytest.mark.parametrize("output", [True, False])
-@pytest.mark.parametrize("shuffle_weight_scales",[False])
+@pytest.mark.parametrize("shuffle_weight_scales",[True, False])
 @pytest.mark.parametrize("skip_reduce", [True, False])
-@pytest.mark.parametrize("impl", ["gluon"])
+@pytest.mark.parametrize("impl", ["triton", "gluon"])
 def test_gemm_afp4_wfp4(
     M: int,
     N: int,
