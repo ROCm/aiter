@@ -626,7 +626,7 @@
         // For Q, we are done.
         return;
     }
-    float dtype_max = opus::cast<float>(opus::numeric_limits<opus::fp8_t>::max());
+    float dtype_max = opus::cast<float>(opus::finfo<opus::fp8_t>::max());
     auto f_max_f32 = [](float v_0_, float v_1_) { return __builtin_fmaxf(v_0_, v_1_); };
     if(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
     {
