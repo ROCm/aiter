@@ -1036,7 +1036,9 @@ def _ctypes_call(func, fc_name, md_name):
     import torch
     from ..utility.dtypes import torch_to_aiter, AiterTensor
 
+    # closure variables
     _cache = {}
+    _arg_checked = False
 
     def _ensure_loaded():
         if _cache:
@@ -1063,7 +1065,7 @@ def _ctypes_call(func, fc_name, md_name):
         c_func = getattr(lib, fc_name)
         c_func.restype = None
 
-        # declare argument types for ctypes
+        # declare argument types for C/C++ function
         hints = typing.get_type_hints(func)
         argtypes = []
         for pname in inspect.signature(func).parameters:
@@ -1092,21 +1094,73 @@ def _ctypes_call(func, fc_name, md_name):
         _cache["lib"] = lib
         _cache["c_func"] = c_func
 
+    def _check_args_before_convert(bound_args, hints):
+        for pname, value in bound_args.items():
+            hint = hints.get(pname)
+            origin = typing.get_origin(hint)
+            type_args = typing.get_args(hint)
+
+            if hint is torch.Tensor:
+                if not isinstance(value, torch.Tensor):
+                    raise TypeError(
+                        f"{fc_name}: '{pname}' expects torch.Tensor, "
+                        f"got {type(value).__name__}"
+                    )
+            elif origin is typing.Union and torch.Tensor in type_args:
+                if value is not None and not isinstance(value, torch.Tensor):
+                    raise TypeError(
+                        f"{fc_name}: '{pname}' expects Optional[torch.Tensor], "
+                        f"got {type(value).__name__}"
+                    )
+            elif origin is typing.Union and int in type_args:
+                if value is not None and not isinstance(value, int):
+                    raise TypeError(
+                        f"{fc_name}: '{pname}' expects Optional[int], "
+                        f"got {type(value).__name__}"
+                    )
+            elif origin is typing.Union and str in type_args:
+                if value is not None and not isinstance(value, str):
+                    raise TypeError(
+                        f"{fc_name}: '{pname}' expects Optional[str], "
+                        f"got {type(value).__name__}"
+                    )
+            elif hint is bool:
+                if not isinstance(value, (bool, int)):
+                    raise TypeError(
+                        f"{fc_name}: '{pname}' expects bool, "
+                        f"got {type(value).__name__}"
+                    )
+            elif hint is int:
+                if not isinstance(value, int):
+                    raise TypeError(
+                        f"{fc_name}: '{pname}' expects int, "
+                        f"got {type(value).__name__}"
+                    )
+            elif hint is float:
+                if not isinstance(value, (float, int)):
+                    raise TypeError(
+                        f"{fc_name}: '{pname}' expects float, "
+                        f"got {type(value).__name__}"
+                    )
+
     def caller(*args, **kwargs):
+        nonlocal _arg_checked
         _ensure_loaded()
         c_func = _cache["c_func"]
 
-        ### bind arguments
         sig = inspect.signature(func)
         bound = sig.bind(*args, **kwargs)
         bound.apply_defaults()
         hints = typing.get_type_hints(func)
 
+        if not _arg_checked:
+            _check_args_before_convert(bound.arguments, hints)
+            _arg_checked = True
+
         c_args = []
         aiter_refs = []
         tensor_device = None
 
-        ### convert values to ctypes arguments
         for pname, value in bound.arguments.items():
             hint = hints.get(pname)
             origin = typing.get_origin(hint)
@@ -1126,20 +1180,24 @@ def _ctypes_call(func, fc_name, md_name):
                     aiter_refs.append(at)
                     c_args.append(ctypes.byref(at))
                 else:
-                    c_args.append(None)
+                    c_args.append(ctypes.POINTER(AiterTensor)())
             elif origin is typing.Union and int in type_args:
                 c_args.append(value if value is not None else -1)
             elif origin is typing.Union and str in type_args:
                 c_args.append(value.encode() if value is not None else None)
             elif hint is bool:
                 c_args.append(1 if value else 0)
+            elif hint is int:
+                c_args.append(ctypes.c_int(value))
+            elif hint is float:
+                c_args.append(ctypes.c_float(value))
             else:
                 c_args.append(value)
 
         c_args.append(
             ctypes.c_void_p(torch.cuda.current_stream(tensor_device).cuda_stream)
         )
-        c_func(*c_args)  # invoke
+        c_func(*c_args)
 
     return caller
 

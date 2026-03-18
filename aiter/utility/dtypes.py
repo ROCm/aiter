@@ -31,6 +31,8 @@ i32 = torch.int32
 i16 = torch.int16
 i8 = torch.int8
 u8 = torch.uint8
+i64 = torch.int64
+u64 = torch.uint64
 
 d_dtypes = {name: globals()[name] for name in aiter_dtypes}
 

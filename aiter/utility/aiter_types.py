@@ -75,3 +75,13 @@ class AiterTensor(ctypes.Structure):
         ("dtype_", ctypes.c_int),
         ("device_id", ctypes.c_int),
     ]
+
+
+_EXPECTED_SIZEOF_AITER_TENSOR = (
+    160  # must match sizeof(AiterTensor) in csrc/include/aiter_tensor.h
+)
+assert ctypes.sizeof(AiterTensor) == _EXPECTED_SIZEOF_AITER_TENSOR, (
+    f"AiterTensor layout mismatch: Python sizeof={ctypes.sizeof(AiterTensor)}, "
+    f"expected C sizeof={_EXPECTED_SIZEOF_AITER_TENSOR}. "
+    f"Check struct field order and alignment against csrc/include/aiter_tensor.h"
+)

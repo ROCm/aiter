@@ -32,6 +32,8 @@ typedef enum {
     AITER_DTYPE_i16,
     AITER_DTYPE_i8,
     AITER_DTYPE_u8,
+    AITER_DTYPE_i64,
+    AITER_DTYPE_u64,
 } AiterDtype;
 
 static inline size_t AiterDtype_element_size(AiterDtype dtype)
@@ -49,6 +51,8 @@ static inline size_t AiterDtype_element_size(AiterDtype dtype)
     case AITER_DTYPE_fp32:
     case AITER_DTYPE_u32:
     case AITER_DTYPE_i32:      return 4;
+    case AITER_DTYPE_i64:
+    case AITER_DTYPE_u64:      return 8;
     default:                   return 0;
     }
 }
@@ -68,6 +72,8 @@ static inline std::string AiterDtype_to_str(int dtype)
     case AITER_DTYPE_i16:     return "i16";
     case AITER_DTYPE_i8:      return "i8";
     case AITER_DTYPE_u8:      return "u8";
+    case AITER_DTYPE_i64:     return "i64";
+    case AITER_DTYPE_u64:     return "u64";
     default:                   return "unknown";
     }
 }
