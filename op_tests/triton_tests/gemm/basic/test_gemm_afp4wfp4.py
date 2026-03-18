@@ -4,9 +4,10 @@ import pytest
 import torch
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as triton_gemm_afp4wfp4,
-    gemm_afp4wfp4_preshuffle,
+    gemm_afp4wfp4_preshuffle as triton_gemm_afp4wfp4_preshuffle,
 )
-from aiter.ops.triton.gluon.gemm_afp4wfp4 import gemm_afp4wfp4 as gluon_gemm_afp4wfp4
+from aiter.ops.triton.gluon.gemm_afp4wfp4 import gemm_afp4wfp4 as gluon_gemm_afp4wfp4_CDNA4
+from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_mxfp4 import gluon_gemm_mxfp4_preshuffle_gfx1250
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from aiter.ops.shuffle import shuffle_weight
@@ -235,10 +236,7 @@ def run_triton(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
 @pytest.mark.parametrize("output", [True, False])
-@pytest.mark.parametrize(
-    "shuffle_weight_scales",
-    [True, False],
-)
+@pytest.mark.parametrize("shuffle_weight_scales",[True, False])
 @pytest.mark.parametrize("skip_reduce", [True, False])
 @pytest.mark.parametrize("impl", ["triton", "gluon"])
 def test_gemm_afp4_wfp4(
@@ -331,7 +329,7 @@ def test_gemm_afp4_wfp4(
         if impl == "triton":
             impl = triton_gemm_afp4wfp4
         elif impl == "gluon":
-            impl = gluon_gemm_afp4wfp4
+            impl = gluon_gemm_afp4wfp4_CDNA4
         else:
             raise ValueError(f"Unknown implementation: {impl}")
 
@@ -359,5 +357,74 @@ def test_gemm_afp4_wfp4(
 
     if triton_out.dim() == 3:
         triton_out = triton_out.sum(dim=0).to(dtype)
+
+    torch.testing.assert_close(torch_out, triton_out)
+
+
+@pytest.mark.parametrize("M, N, K", get_x_vals())
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("output", [True, False])
+def test_gemm_mxfp4_preshuffled_gfx1250(
+    M: int,
+    N: int,
+    K: int,
+    dtype,
+    output,
+):
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("Preshuffled gfx1250 kernel only supported on gfx1250")
+
+    if not arch_info.is_fp4_avail():
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    if N % 32 > 0:
+        pytest.skip(
+            f"N = {N} is not divisible by 32, skip this test for preshuffled weight/scales tests"
+        )
+    if K % 256 > 0:
+        pytest.skip(
+            f"K = {K} is not divisible by 256, skip this test for preshuffled weight/scales tests"
+        )
+
+    (
+        x,
+        w,
+        w_preshuf,
+        x_scales,
+        w_scales,
+        x_scales_shuffled,
+        w_scales_shuffled,
+        out_dtype,
+        y,
+    ) = generate_gemm_afp4wfp4_inputs(
+        M,
+        N,
+        K,
+        dtype,
+        layout="TN",
+        output=output,
+        shuffle_scales_fg=True,
+        shuffle_weight_fg=True,
+    )
+
+    torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
+
+    if output:
+        triton_out = gluon_gemm_mxfp4_preshuffle_gfx1250(
+            x,
+            w_preshuf,
+            x_scales_shuffled,
+            w_scales_shuffled,
+            dtype,
+            y if y is not None else torch.empty_like(torch_out),
+        )
+    else:
+        triton_out = gluon_gemm_mxfp4_preshuffle_gfx1250(
+            x,
+            w_preshuf,
+            x_scales_shuffled,
+            w_scales_shuffled,
+            dtype,
+        )
 
     torch.testing.assert_close(torch_out, triton_out)
