@@ -284,10 +284,10 @@ def benchmark(args):
     waves_per_eu = args.waves_per_eu
     use_tdm = IS_DEVICE_ARCH_GFX12
     # assert IS_DEVICE_ARCH_GFX12, "Gluon Cache Copy only supports gfx1250"
-    if IS_DEVICE_ARCH_GFX12:
+    if not IS_DEVICE_ARCH_GFX12:
         assert (
             num_warps == 1 and head_size == 64 and block_size == 64
-        ), "Gluon Cache Copy only supports gfx1250 with 1 warp, 64 head size, and 64 block size"
+        ), "Gluon Cache Copy only supports gfx1250 with 1 warp, 64 head size, and 64 block size on non-gfx12"
     configs = []
     x_names = [
         "num_blocks",
