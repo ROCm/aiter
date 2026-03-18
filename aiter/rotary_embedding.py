@@ -1312,21 +1312,20 @@ class RotaryEmbeddingFusedQKNorm(nn.Module):
             else:
                 return q_out, None, None
         else:
-            raise NotImplementedError("fused_rope_rms not supported yet")
-            # fused_rope_rms(
-            #     qkv,
-            #     q_weight,
-            #     k_weight,
-            #     self.cos_sin_cache,
-            #     positions,
-            #     num_tokens,
-            #     num_heads_q,
-            #     num_heads_k,
-            #     num_heads_v,
-            #     self.head_size,
-            #     self.is_neox_style,
-            #     eps,
-            # )
+            fused_rope_rms(
+                qkv,
+                q_weight,
+                k_weight,
+                self.cos_sin_cache,
+                positions,
+                num_tokens,
+                num_heads_q,
+                num_heads_k,
+                num_heads_v,
+                self.head_size,
+                self.is_neox_style,
+                eps,
+            )
             q_size = num_heads_q * self.head_size
             k_size = num_heads_k * self.head_size
             v_size = num_heads_v * self.head_size
@@ -1335,6 +1334,67 @@ class RotaryEmbeddingFusedQKNorm(nn.Module):
             q, k, v = qkv.split([q_size, k_size, v_size], dim=-1)
 
             return q, k, v
+
+
+def fused_rope_rms(
+    qkv,
+    q_weight,
+    k_weight,
+    cos_sin_cache,
+    positions,
+    num_tokens,
+    num_heads_q,
+    num_heads_k,
+    num_heads_v,
+    head_size,
+    is_neox_style,
+    eps,
+):
+    """Fused QK-RMSNorm + RoPE on packed QKV tensor (in-place).
+    Triton fallback for the HIP fused kernel.
+    """
+    from aiter.ops.triton.normalization.rmsnorm import rmsnorm_forward_inference
+    from aiter.ops.triton.rope.rope import (
+        rope_cached_thd_positions_2c_fwd_inplace,
+    )
+
+    q_size = num_heads_q * head_size
+    k_size = num_heads_k * head_size
+    v_size = num_heads_v * head_size
+
+    qkv_2d = qkv.view(num_tokens, q_size + k_size + v_size)
+    q, k, _v = qkv_2d.split([q_size, k_size, v_size], dim=-1)
+
+    # Per-head RMSNorm: [T, H*D] -> [T*H, D] so rmsnorm operates per-head
+    q_normed = rmsnorm_forward_inference(
+        q.reshape(num_tokens * num_heads_q, head_size), q_weight, eps
+    )
+    q.copy_(q_normed.view(num_tokens, q_size))
+
+    k_normed = rmsnorm_forward_inference(
+        k.reshape(num_tokens * num_heads_k, head_size), k_weight, eps
+    )
+    k.copy_(k_normed.view(num_tokens, k_size))
+
+    # RoPE in-place
+    q_rope = q.view(num_tokens, num_heads_q, head_size)
+    k_rope = k.view(num_tokens, num_heads_k, head_size)
+
+    half = cos_sin_cache.shape[-1] // 2
+    cos = cos_sin_cache[:, :half]
+    sin = cos_sin_cache[:, half:]
+    rotate_style = 0 if is_neox_style else 1
+
+    rope_cached_thd_positions_2c_fwd_inplace(
+        q_rope,
+        k_rope,
+        cos,
+        sin,
+        positions,
+        rotate_style,
+        reuse_freqs_front_part=True,
+        nope_first=False,
+    )
 
 
 class MRotaryEmbeddingQKNormFused(RotaryEmbeddingFusedQKNorm):
