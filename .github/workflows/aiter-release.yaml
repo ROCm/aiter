@@ -19,11 +19,11 @@ on:
       docker_image_py310:
         description: 'Docker image for Python 3.10 build'
         required: true
-        default: 'rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.10.1_instinct_beta'
+        default: 'rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1'
       docker_image_py312:
         description: 'Docker image for Python 3.12 build'
         required: true
-        default: 'rocm/vllm-dev:nightly'
+        default: 'rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1'
       gpu_archs:
         description: 'GPU architectures (e.g. gfx942;gfx950)'
         required: false
@@ -31,14 +31,61 @@ on:
       runner:
         description: 'Select build host'
         required: true
-        default: 'aiter-k8s-build'
+        default: 'build-only-aiter'
         type: choice
         options:
+          - build-only-aiter
           - aiter-k8s-build
           - aiter-mi300-1gpu
           - aiter-mi325-1gpu
           - linux-aiter-mi355-1
           - aiter-1gpu-runner
+      release_type:
+        description: 'Release type for S3 publishing (leave empty for artifacts only)'
+        type: choice
+        required: false
+        default: ''
+        options:
+          - ''
+          - nightlies
+          - devreleases
+      add_date_stamp:
+        description: 'Add date stamp to version (+yyyymmdd)'
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      release_type:
+        description: 'Release type for S3 publishing'
+        type: string
+        required: true
+      docker_image_py310:
+        description: 'Docker image for Python 3.10 build'
+        type: string
+        required: true
+      docker_image_py312:
+        description: 'Docker image for Python 3.12 build'
+        type: string
+        required: true
+      gpu_archs:
+        description: 'GPU architectures'
+        type: string
+        required: false
+        default: 'gfx942;gfx950'
+      runner:
+        description: 'Build host'
+        type: string
+        required: false
+        default: 'build-only-aiter'
+      add_date_stamp:
+        description: 'Add date stamp to version'
+        type: boolean
+        required: false
+        default: false
+    outputs:
+      wheel_names:
+        description: 'Space-separated list of built wheel filenames'
+        value: ${{ jobs.collect.outputs.wheel_names }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -46,28 +93,35 @@ concurrency:
 
 jobs:
   build_whl_package:
-    runs-on: ${{ github.event.inputs.runner }}
+    runs-on: ${{ inputs.runner || github.event.inputs.runner }}
+    permissions:
+      id-token: write
+      contents: read
 
     strategy:
       fail-fast: false
       matrix:
         include:
           - python_version: "3.10"
-            docker_image: ${{ github.event.inputs.docker_image_py310 }}
-            build_enabled: ${{ github.event.inputs.build_py310 == 'true' || github.event.inputs.build_py310 == true }}
+            docker_image: ${{ inputs.docker_image_py310 || github.event.inputs.docker_image_py310 }}
+            build_enabled: ${{ inputs.release_type != '' || github.event.inputs.build_py310 == 'true' || github.event.inputs.build_py310 == true }}
           - python_version: "3.12"
-            docker_image: ${{ github.event.inputs.docker_image_py312 }}
-            build_enabled: ${{ github.event.inputs.build_py312 == 'true' || github.event.inputs.build_py312 == true }}
+            docker_image: ${{ inputs.docker_image_py312 || github.event.inputs.docker_image_py312 }}
+            build_enabled: ${{ inputs.release_type != '' || github.event.inputs.build_py312 == 'true' || github.event.inputs.build_py312 == true }}
 
     env:
       BUILD_DOCKER_IMAGE: ${{ matrix.docker_image }}
       PYTHON_VERSION: ${{ matrix.python_version }}
-      GPU_ARCHS: ${{ github.event.inputs.gpu_archs }}
+      GPU_ARCHS: ${{ inputs.gpu_archs || github.event.inputs.gpu_archs }}
+      RELEASE_TYPE: ${{ inputs.release_type || github.event.inputs.release_type }}
+      ADD_DATE_STAMP: ${{ inputs.add_date_stamp || github.event.inputs.add_date_stamp }}
 
     steps:
       - name: Checkout aiter repo
         if: ${{ matrix.build_enabled }}
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history and tags for version generation
 
       - name: Checkout to user-specified commit (if provided)
         if: ${{ matrix.build_enabled }}
@@ -88,6 +142,16 @@ jobs:
           set -ex
           git submodule sync
           git submodule update --init --recursive --depth 1 --jobs 4
+
+      - name: Generate version with date stamp
+        if: ${{ matrix.build_enabled && env.ADD_DATE_STAMP == 'true' }}
+        id: version
+        run: |
+          DATE_STAMP=$(date +%Y%m%d)
+          BASE_VERSION=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' | sed 's/\.post[0-9]*$//' || echo "0.1.0")
+          NIGHTLY_VERSION="${BASE_VERSION}+${DATE_STAMP}"
+          echo "nightly_version=${NIGHTLY_VERSION}" >> $GITHUB_OUTPUT
+          echo "Building version: ${NIGHTLY_VERSION}"
 
       - name: Run the container
         if: ${{ matrix.build_enabled }}
@@ -127,10 +191,24 @@ jobs:
         run: |
           set -e
           echo "Building aiter whl packages for Python ${{ matrix.python_version }}..."
-          docker exec \
-          -w /workspace \
-          aiter_build_${{ matrix.python_version }} \
-          bash -c 'PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCHS }}" python3 setup.py bdist_wheel && ls dist/*.whl'
+
+          if [ "${{ env.ADD_DATE_STAMP }}" = "true" ] && [ -n "${{ steps.version.outputs.nightly_version }}" ]; then
+            echo "Using version: ${{ steps.version.outputs.nightly_version }}"
+            docker exec \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION="${{ steps.version.outputs.nightly_version }}" \
+            -e PREBUILD_KERNELS=1 \
+            -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
+            -w /workspace \
+            aiter_build_${{ matrix.python_version }} \
+            bash -c "python3 setup.py bdist_wheel && ls dist/*.whl"
+          else
+            docker exec \
+            -e PREBUILD_KERNELS=1 \
+            -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
+            -w /workspace \
+            aiter_build_${{ matrix.python_version }} \
+            bash -c "python3 setup.py bdist_wheel && ls dist/*.whl"
+          fi
 
       - name: Upload whl file as artifact
         if: ${{ matrix.build_enabled }}
@@ -139,7 +217,78 @@ jobs:
           name: aiter-whl-packages-py${{ matrix.python_version }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist/*.whl
 
+      - name: Build summary
+        if: ${{ matrix.build_enabled && always() }}
+        env:
+          SUMMARY_DOCKER_IMAGE: ${{ matrix.docker_image }}
+          SUMMARY_PYTHON_VERSION: ${{ matrix.python_version }}
+          SUMMARY_RELEASE_TYPE: ${{ env.RELEASE_TYPE }}
+          SUMMARY_GPU_ARCHS: ${{ env.GPU_ARCHS }}
+          SUMMARY_WHEEL_DIR: dist
+        run: |
+          if [ -f scripts/generate_summary.py ]; then
+            python3 scripts/generate_summary.py build
+          else
+            echo "## Build Summary - Python ${{ matrix.python_version }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Docker Image**: ${{ matrix.docker_image }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Release Type**: ${{ env.RELEASE_TYPE }}" >> $GITHUB_STEP_SUMMARY
+            ls -lh dist/*.whl | awk '{print "- " $9}' >> $GITHUB_STEP_SUMMARY || true
+          fi
+
+      - name: Configure AWS credentials
+        if: ${{ matrix.build_enabled && env.RELEASE_TYPE != '' && github.repository_owner == 'ROCm' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: us-east-1
+          role-to-assume: arn:aws:iam::661452401056:role/framework-aiter-${{ env.RELEASE_TYPE }}
+
+      - name: Install AWS CLI
+        if: ${{ matrix.build_enabled && env.RELEASE_TYPE != '' && github.repository_owner == 'ROCm' }}
+        run: |
+          if ! command -v aws &> /dev/null; then
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip -q awscliv2.zip
+            sudo ./aws/install
+            rm -rf awscliv2.zip aws
+          fi
+
+      - name: Upload wheels to S3 staging
+        if: ${{ matrix.build_enabled && env.RELEASE_TYPE != '' && github.repository_owner == 'ROCm' }}
+        run: |
+          for WHL in dist/*.whl; do
+            WHL_NAME=$(basename ${WHL})
+            echo "Uploading ${WHL_NAME} to S3 staging..."
+            aws s3 cp ${WHL} s3://framework-whls-${{ env.RELEASE_TYPE }}/whl-staging/gfx942-gfx950/${WHL_NAME}
+          done
+          echo "✅ Wheel uploaded to S3 staging"
+
       - name: Cleanup container
         if: always()
         run: |
           docker rm -f aiter_build_${{ matrix.python_version }} || true
+
+  collect:
+    if: ${{ inputs.release_type != '' }}
+    needs: build_whl_package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      wheel_names: ${{ steps.collect-wheels.outputs.wheel_names }}
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: aiter-whl-packages-py*
+          path: all-wheels
+          merge-multiple: true
+
+      - name: Collect wheel names
+        id: collect-wheels
+        run: |
+          cd all-wheels
+          WHEELS=$(ls *.whl | tr '\n' ' ')
+          echo "wheel_names=${WHEELS}" >> $GITHUB_OUTPUT
+          echo "Built wheels: ${WHEELS}"
+          ls -lh *.whl
