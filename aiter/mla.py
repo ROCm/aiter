@@ -137,9 +137,6 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
             num_kv_splits = min(
                 num_kv_splits, int(total_kv / bs - max_seqlen_q) // min_block_n + 1
             )
-        # avg_tail_kv = (total_kv // bs) - min_block_n * (num_kv_splits - 1)
-        # if num_kv_splits > 1 and avg_tail_kv > 0 and avg_tail_kv < max_seqlen_q:
-        #     num_kv_splits = num_kv_splits - 1
 
     num_kv_splits_indptr = torch.arange(
         0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device="cuda"
