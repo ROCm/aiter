@@ -6,7 +6,7 @@ import argparse
 import torch
 
 import aiter
-from aiter import dtypes
+from aiter import dtypes, rmsnorm2d_fwd
 from aiter.test_common import benchmark, checkAllclose, perftest
 
 
@@ -18,7 +18,7 @@ def rms_norm_forward(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch
 
 
 @perftest()
-def run_torch_fused_qk_rmsnorm(
+def run_torch_split_qk_rmsnorm(
     q: torch.Tensor,
     q_weight: torch.Tensor,
     q_eps: float,
@@ -32,6 +32,19 @@ def run_torch_fused_qk_rmsnorm(
 
 
 @perftest()
+def run_aiter_split_qk_rmsnorm(
+    q: torch.Tensor,
+    q_weight: torch.Tensor,
+    q_eps: float,
+    k: torch.Tensor,
+    k_weight: torch.Tensor,
+    k_eps: float,
+):
+    q_ref = rmsnorm2d_fwd(q, q_weight, q_eps)
+    k_ref = rmsnorm2d_fwd(k, k_weight, k_eps)
+    return q_ref, k_ref
+
+@perftest()
 def run_aiter_fused_qk_rmsnorm(
     q: torch.Tensor,
     q_weight: torch.Tensor,
@@ -40,9 +53,7 @@ def run_aiter_fused_qk_rmsnorm(
     k_weight: torch.Tensor,
     k_eps: float,
 ):
-    q_out = q.clone()
-    k_out = k.clone()
-    aiter.fused_qk_rmsnorm(q_out, q_weight, q_eps, k_out, k_weight, k_eps)
+    q_out, k_out = aiter.fused_qk_rmsnorm(q, q_weight, q_eps, k, k_weight, k_eps)
     return q_out, k_out
 
 
@@ -60,18 +71,25 @@ def test_fused_qk_rmsnorm(
     q_weight = torch.randn((n1,), dtype=dtype, device="cuda")
     k_weight = torch.randn((n2,), dtype=dtype, device="cuda")
 
-    (q_ref, k_ref), avg_torch = run_torch_fused_qk_rmsnorm(
+    # (q_ref, k_ref), avg_torch = run_torch_split_qk_rmsnorm(
+    #     q, q_weight, q_eps, k, k_weight, k_eps
+    # )
+    (q_ref, k_ref), avg_ref = run_aiter_split_qk_rmsnorm(
         q, q_weight, q_eps, k, k_weight, k_eps
     )
-    (q_out, k_out), avg_aiter = run_aiter_fused_qk_rmsnorm(
-        q, q_weight, q_eps, k, k_weight, k_eps
+    # Keep perftest path clone-free so measured time is kernel-only.
+    (_, _), avg_opt = run_aiter_fused_qk_rmsnorm(
+        q.clone(), q_weight, q_eps, k.clone(), k_weight, k_eps
     )
+    q_out = q.clone()
+    k_out = k.clone()
+    aiter.fused_qk_rmsnorm(q_out, q_weight, q_eps, k_out, k_weight, k_eps)
 
     info = f"dtype:{dtype}, M:{m}, N1:{n1}, N2:{n2}"
     msg = (
         f"[perf] === {info} === "
-        f"torch avg: {avg_torch:<8.2f} us, aiter avg: {avg_aiter:<8.2f} us, "
-        f"uplift: {avg_torch / avg_aiter - 1:<5.1%}"
+        f"torch avg: {avg_ref:<8.2f} us, aiter avg: {avg_opt:<8.2f} us, "
+        f"uplift: {avg_ref / avg_opt - 1:<5.1%}"
     )
 
     checkAllclose(q_ref, q_out, msg=f"{msg} (q)", rtol=1e-2, atol=1e-2)
@@ -85,9 +103,9 @@ def test_fused_qk_rmsnorm(
         "M": m,
         "N1": n1,
         "N2": n2,
-        "fused_qk_us": avg_aiter,
-        "torch_us": avg_torch,
-        "aiter_bw(TB/s)": total_bytes / (avg_aiter * 1e6),
+        "fused_qk_us": avg_opt,
+        "torch_us": avg_ref,
+        "aiter_bw(TB/s)": total_bytes / (avg_opt * 1e6),
     }
 
 
