@@ -1575,6 +1575,22 @@ namespace py = pybind11;
           py::arg("epsilon"),                                                                      \
           py::arg("use_model_sensitive_rmsnorm") = 0);
 
+#define GEMMA_NORM_PYBIND                                                    \
+    m.def("gemma_rmsnorm",                                                   \
+          &gemma_rmsnorm,                                                    \
+          "Gemma-style RMSNorm: output = (input / RMS(input)) * (1 + weight). fp16/bf16.", \
+          py::arg("output"),                                                 \
+          py::arg("input"),                                                  \
+          py::arg("weight"),                                                 \
+          py::arg("eps") = 1e-6);                                            \
+    m.def("gemma_fused_add_rmsnorm",                                         \
+          &gemma_fused_add_rmsnorm,                                          \
+          "residual += input; input = (residual / RMS(residual)) * (1 + weight). In-place. fp16/bf16.", \
+          py::arg("input"),                                                  \
+          py::arg("residual"),                                                \
+          py::arg("weight"),                                                  \
+          py::arg("eps") = 1e-6);
+
 #define ROPE_GENERAL_FWD_PYBIND                                 \
     m.def("rope_fwd_impl", &rope_fwd_impl);                     \
     m.def("rope_2c_fwd_impl", &rope_2c_fwd_impl);               \
