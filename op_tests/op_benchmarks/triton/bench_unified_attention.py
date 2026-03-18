@@ -168,6 +168,126 @@ def create_benchmark_configs(custom, args):
     return configs
 
 
+
+def input_helper(args, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, DECODE_P, dtype, causal):
+    assert args.layout == "thd"
+    varlen = not args.equal_seqlens
+
+    if not varlen:
+        seqlens_q = torch.tensor(
+            [N_CTX_Q for _ in range(BATCH)], dtype=torch.int32, device="cuda"
+        )
+        seqlens_k = torch.tensor(
+            [N_CTX_K for _ in range(BATCH)], dtype=torch.int32, device="cuda"
+        )
+    else:
+        seqlens_q = torch.randint(
+            1, N_CTX_Q + 1, (BATCH,), dtype=torch.int32, device="cuda"
+        )
+        seqlens_k = torch.randint(
+            N_CTX_Q, N_CTX_K + 1, (BATCH,), dtype=torch.int32, device="cuda"
+        )
+
+    # turn DECODE_P of the samples to decode samples (seqlen_q == 1)
+    if DECODE_P > 0.0:
+        num_decode = int(round(DECODE_P * BATCH))
+        if num_decode > 0:
+            decode_idx = torch.randperm(BATCH, device=seqlens_q.device)[:num_decode]
+            seqlens_q[decode_idx] = 1
+
+    if causal:
+        if (seqlens_k < seqlens_q).any():
+            print(
+                f"Warning: clamping seqlens_k to be >= seqlens_q for config "
+                f"(BATCH={BATCH}, HQ={HQ}, HK={HK}, N_CTX_Q={N_CTX_Q}, N_CTX_K={N_CTX_K})"
+            )
+        seqlens_k = torch.maximum(seqlens_k, seqlens_q)
+
+    cu_seqlens_q = torch.zeros(len(seqlens_q) + 1, dtype=torch.int32, device="cuda")
+    cu_seqlens_q[1:] = seqlens_q.cumsum(dim=0, dtype=torch.int32)
+    cu_seqlens_k = torch.zeros(len(seqlens_k) + 1, dtype=torch.int32, device="cuda")
+    cu_seqlens_k[1:] = seqlens_k.cumsum(dim=0, dtype=torch.int32)
+    
+    
+    num_seqs = BATCH
+    num_query_heads = HQ
+    num_kv_heads = HK
+    head_size = D_HEAD
+    assert num_query_heads % num_kv_heads == 0
+    max_query_len = max(seqlens_q).item()
+    max_kv_len = max(seqlens_k).item()
+    soft_cap = args.softcap
+
+    query = torch.randn(
+        sum(seqlens_q), num_query_heads, head_size, dtype=dtype, device="cuda"
+    )
+
+    block_tables = None
+    block_size = None
+
+    if args.kv_layout == "cache":
+        block_size = args.block_size if args.block_size else 512
+        max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+        min_required_blocks = BATCH * max_num_blocks_per_seq
+        num_blocks = (
+            args.num_blocks if args.num_blocks else max(min_required_blocks, 2048)
+        )
+        num_blocks = max(num_blocks, min_required_blocks)
+        key_cache = torch.randn(
+            num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cuda"
+        )
+        value_cache = torch.randn_like(key_cache)
+        block_tables = torch.randint(
+            0,
+            num_blocks,
+            (num_seqs, max_num_blocks_per_seq),
+            dtype=torch.int32,
+            device="cuda",
+        )
+    elif args.kv_layout in ("bshd", "bhsd"):
+        assert args.equal_seqlens, "equal_seqlens assumed if kv_cache_layout is bshd"
+        block_size = N_CTX_K
+        num_blocks = BATCH
+        block_tables = torch.arange(num_blocks, dtype=torch.int32, device="cuda").unsqueeze(1)
+        key_cache = torch.randn(
+            BATCH, N_CTX_K, num_kv_heads, head_size, dtype=dtype, device="cuda"
+        )
+        if args.kv_layout == "bhsd":
+            key_cache = key_cache.transpose(1, 2).contiguous()  # to bhsd
+
+        value_cache = torch.randn_like(key_cache)
+    else:  # thd
+        block_size = max_kv_len
+        block_tables = cu_seqlens_k.unsqueeze(1)
+        key_cache = torch.randn(
+            sum(seqlens_k), num_kv_heads, head_size, dtype=dtype, device="cuda"
+        )
+        value_cache = torch.randn_like(key_cache)
+
+   
+
+    return (
+        query,
+        key_cache,
+        value_cache,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqlens_q,
+        seqlens_k,
+        max_query_len,
+        max_kv_len,
+        block_tables,
+        block_size,
+        num_query_heads,
+        num_kv_heads,
+        head_size,
+        soft_cap,
+    )
+
+
+
+
+
 def run_benchmark(custom, args):
     torch.manual_seed(20)
 
@@ -186,55 +306,23 @@ def run_benchmark(custom, args):
         provider,
         model=None,
     ):
-        assert args.layout == "thd"
-        varlen = not args.equal_seqlens
-
-        if not varlen:
-            seqlens_q = torch.tensor(
-                [N_CTX_Q for _ in range(BATCH)], dtype=torch.int32, device="cuda"
-            )
-            seqlens_k = torch.tensor(
-                [N_CTX_K for _ in range(BATCH)], dtype=torch.int32, device="cuda"
-            )
-        else:
-            seqlens_q = torch.randint(
-                1, N_CTX_Q + 1, (BATCH,), dtype=torch.int32, device="cuda"
-            )
-            seqlens_k = torch.randint(
-                N_CTX_Q, N_CTX_K + 1, (BATCH,), dtype=torch.int32, device="cuda"
-            )
-
-        # turn DECODE_P of the samples to decode samples (seqlen_q == 1)
-        if DECODE_P > 0.0:
-            num_decode = int(round(DECODE_P * BATCH))
-            if num_decode > 0:
-                # choose which samples become decode samples
-                decode_idx = torch.randperm(BATCH, device=seqlens_q.device)[:num_decode]
-                seqlens_q[decode_idx] = 1
-
-        if causal:
-            if (seqlens_k < seqlens_q).any():
-                print(
-                    f"Warning: clamping seqlens_k to be >= seqlens_q for config "
-                    f"(BATCH={BATCH}, HQ={HQ}, HK={HK}, N_CTX_Q={N_CTX_Q}, N_CTX_K={N_CTX_K})"
-                )
-            seqlens_k = torch.maximum(seqlens_k, seqlens_q)
-
-        num_seqs = BATCH
-        num_query_heads = HQ
-        num_kv_heads = HK
-        head_size = D_HEAD
-        assert num_query_heads % num_kv_heads == 0
-        max_query_len = max(seqlens_q).item()
-        max_kv_len = max(seqlens_k).item()
-        soft_cap = args.softcap
-        block_size = args.block_size if args.block_size else 512
-        max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
-        min_required_blocks = BATCH * max_num_blocks_per_seq
-        num_blocks = (
-            args.num_blocks if args.num_blocks else max(min_required_blocks * 4, 2048)
-        )
-        num_blocks = max(num_blocks, min_required_blocks)
+        (
+            query,
+            key_cache,
+            value_cache,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqlens_q,
+            seqlens_k,
+            max_query_len,
+            max_kv_len,
+            block_tables,
+            block_size,
+            num_query_heads,
+            num_kv_heads,
+            head_size,
+            soft_cap,
+        ) = input_helper(args, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, DECODE_P, dtype, causal)
 
         window_size = (
             (args.sliding_window - 1, 0)
@@ -242,25 +330,7 @@ def run_benchmark(custom, args):
             else (-1, -1)
         )
         scale = D_HEAD**-0.5
-
-        query = torch.randn(
-            sum(seqlens_q), num_query_heads, head_size, dtype=dtype, device="cuda"
-        )
-        key_cache = torch.randn(
-            num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cuda"
-        )
-        value_cache = torch.randn_like(key_cache)
-        cu_seqlens_q = torch.zeros(len(seqlens_q) + 1, dtype=torch.int32, device="cuda")
-        cu_seqlens_q[1:] = seqlens_q.cumsum(dim=0, dtype=torch.int32)
-        cu_seqlens_k = torch.zeros(len(seqlens_k) + 1, dtype=torch.int32, device="cuda")
-        cu_seqlens_k[1:] = seqlens_k.cumsum(dim=0, dtype=torch.int32)
-        block_tables = torch.randint(
-            0,
-            num_blocks,
-            (num_seqs, max_num_blocks_per_seq),
-            dtype=torch.int32,
-            device="cuda",
-        )
+        
         if args.use_sinks:
             sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
         else:
@@ -286,18 +356,19 @@ def run_benchmark(custom, args):
                 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v1
                 maybe_quantized_query, q_descale, maybe_quantized_key_cache, k_descale, maybe_quantized_value_cache, v_descale = sage_quant_v1(
                     query, key_cache, value_cache, BLOCK_M, BLOCK_N,
-                    layout_q="unified", layout_k="cache",
+                    layout_q="unified", layout_k=args.kv_layout,
                     v_descale=None,
                     cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_q,
-                    config=config
                 )
             else:
                 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v2
                 maybe_quantized_query, q_descale, maybe_quantized_key_cache, k_descale, maybe_quantized_value_cache, v_descale = sage_quant_v2(
                     query, key_cache, value_cache, BLOCK_M, BLOCK_N,
                     hadamard_rotation=True, R=None, BLOCK_R=128,
-                    layout_k="cache", v_descale=None
+                    layout_k=args.kv_layout, v_descale=None
                 )
+           
+        
         elif args.fp8_full:
             from aiter.ops.triton.utils.types import e4m3_dtype
 
@@ -332,6 +403,7 @@ def run_benchmark(custom, args):
                 v=maybe_quantized_value_cache,
                 out=output,
                 cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
                 seqused_k=seqlens_k,
                 max_seqlen_q=max_query_len,
                 max_seqlen_k=max_kv_len,
@@ -345,6 +417,7 @@ def run_benchmark(custom, args):
                 v_descale=v_descale,
                 sinks=sinks,
                 sage_version=sage_version,
+                kv_layout=args.kv_layout
             )
 
         ms = triton.testing.do_bench(fn)
@@ -363,6 +436,7 @@ def run_benchmark(custom, args):
                 sliding_window=args.sliding_window,
                 soft_cap=soft_cap,
                 sinks=sinks,
+                kv_layout=args.kv_layout
             )
             if args.fp8 or args.fp8_full or args.sagev1 or args.sagev2:
                 atol, rtol = 1.5e-1, 1.5e-1
@@ -492,7 +566,7 @@ def parse_args():
     parser.add_argument(
         "-block_size",
         type=parse_int_or_list,
-        default=544,
+        default=512,
         help="block size in kv cache",
     )
 
@@ -522,6 +596,7 @@ def parse_args():
         help="Q and K head size, if -dv is absent then -d specifies V head size too",
     )
     parser.add_argument("-unified_attention", type=int, default=1)
+    parser.add_argument("-kv_layout", type=str, default="cache", choices=["cache", "bshd", "bhsd", "thd"])
     parser.add_argument(
         "-sliding_window",
         type=int,

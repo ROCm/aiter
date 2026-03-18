@@ -28,7 +28,6 @@ def unified_perblock_quantize_int8(
     BLOCK_SIZE_M,
     cu_seqlens,
     sm_scale,
-    config,
     num_queries_per_kv,
 ):  
     # q is expected to have layout thd
@@ -36,15 +35,16 @@ def unified_perblock_quantize_int8(
     hq = q.shape[1]
     Q_q = torch.empty((*q.shape[:-1], d), dtype=torch.int8, device=q.device)
     DTYPE_MAX = torch.iinfo(torch.int8).max
-    num_seqs = len(cu_seqlens)
-    total_num_blocks = q.shape[0] // BLOCK_SIZE_M + num_seqs
+    num_seqs = len(cu_seqlens) - 1
+    BLOCK_Q = BLOCK_SIZE_M // num_queries_per_kv
+    total_num_blocks = q.shape[0] // BLOCK_Q + num_seqs
     
     assert num_queries_per_kv is not None # and config is not None
     num_heads = hq // num_queries_per_kv
     Q_descale = torch.empty(
         (total_num_blocks, num_heads), dtype=torch.float32, device=q.device
     )
-    BLOCK_Q = BLOCK_SIZE_M // num_queries_per_kv
+   
     perblock_quantize_q_kernel[(
                 num_heads,
                 total_num_blocks,
@@ -110,9 +110,8 @@ def perblock_quantize_int8(
         kernel_cu_seqlens = None
 
     num_pid_m = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
-    total_num_blocks = num_pid_m * b
 
-    Q_q = torch.empty((*q.shape[:-1], d), dtype=torch.int8, device=q.device)
+    Q_q = torch.empty(q.shape, dtype=torch.int8, device=q.device)
     DTYPE_MAX = torch.iinfo(torch.int8).max
 
     # bshd, thd and cache layout can be dealt with one kernel that has stride_t = h*d and:
@@ -120,7 +119,7 @@ def perblock_quantize_int8(
     # thd: cu_seqlens = cu_seqlens
     # cache: cu_seqlens = block_size, 2 block_size, 3 block_size,...
     Q_descale = torch.empty(
-        (total_num_blocks, h), dtype=torch.float32, device=q.device
+        (b, num_pid_m, h), dtype=torch.float32, device=q.device
     )
     num_pid_m = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
     grid = (b, num_pid_m, h)
@@ -128,7 +127,7 @@ def perblock_quantize_int8(
     perblock_quantize_kernel[grid](
         q, Q_q, Q_descale, s, kernel_cu_seqlens,
         stride_b, stride_m, stride_h,
-        Q_descale.stride(0), Q_descale.stride(1),
+        Q_descale.stride(0), Q_descale.stride(1), Q_descale.stride(2),
         BLOCK_SIZE_M, d, sm_scale, DTYPE_MAX)
 
     return Q_q, Q_descale
@@ -192,7 +191,6 @@ def perchannel_quantize_fp8(
     layout_k="bhsd",
     v_descale=None,
 ):  
-    d = v.shape[-1]
     FP8_TYPE = aiter.dtypes.fp8
     FP8_MAX = torch.finfo(FP8_TYPE).max
     v_q = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
@@ -207,7 +205,6 @@ def perchannel_quantize_fp8(
         else: # (num_blocks, block_size, h, d)
             reduce_dims = (0,1)
         v_descale = v.abs().amax(dim=reduce_dims, keepdim=True).to(torch.float32) / FP8_MAX
-    
     v_q = (v / v_descale).to(FP8_TYPE)
     v_descale = v_descale.squeeze()
     return v_q, v_descale
@@ -223,12 +220,10 @@ def sage_quant_v1(
     v_descale = None,
     cu_seqlens_q= None,
     cu_seqlens_k= None,
-    config=None,
 ):
     d = q.shape[-1]
     sm_scale = d**-0.5 * 1.4426950408889634
-    
-    # this is pain in the ass as it groups tokens, so we have to consider the layouting
+    # groups tokens, so we have to consider the layouting
     if layout_q == "unified":
         if layout_k in ("cache", "bshd", "thd"):
             num_kv_heads = k.shape[-2] 
@@ -243,7 +238,6 @@ def sage_quant_v1(
             cu_seqlens_q,
             sm_scale=sm_scale,
             num_queries_per_kv=num_queries_per_kv,
-            config=config,
         )
     else:
         q_q, q_descale = perblock_quantize_int8(
@@ -253,7 +247,6 @@ def sage_quant_v1(
             layout=layout_q,
             sm_scale=sm_scale,
         )
-
     k_q, k_descale = perblock_quantize_int8(
         k,
         BLOCK_N,
@@ -261,9 +254,7 @@ def sage_quant_v1(
         layout=layout_k,
         sm_scale=None,
     )
-
     v_q, v_descale = perchannel_quantize_fp8(v, 256, layout_k=layout_k, v_descale=v_descale)
-
     return q_q, q_descale, k_q, k_descale, v_q, v_descale
 
 def sage_quant_v2(
@@ -311,7 +302,6 @@ def sage_quant_v2(
         sm_scale=None, # do not apply sm scale to k tensor!
     )
     v_q, v_descale = perchannel_quantize_fp8(v, 256, layout_k=layout_k, v_descale=v_descale)
-    
     return q_q, q_descale, k_q, k_descale, v_q, v_descale
 
 ######################## 

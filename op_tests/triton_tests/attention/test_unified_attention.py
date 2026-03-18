@@ -32,10 +32,19 @@ def ref_paged_attn(
     sliding_window: Optional[int] = None,
     soft_cap: Optional[float] = None,
     sinks: Optional[torch.Tensor] = None,
+    kv_layout: str = "cache", # "cache" i.e (num_blocks, block_size, num_kv_heads, head_size) as default. "bshd", "bhsd", "thd"
 ) -> torch.Tensor:
     num_seqs = len(query_lens)
     block_tables = block_tables.cpu().numpy()
-    _, block_size, num_kv_heads, head_size = key_cache.shape
+    if kv_layout == "thd":
+        _, num_kv_heads, head_size = key_cache.shape
+        block_size = kv_lens.max().item()
+    else:
+        # we are only checking correctness, so we can permute the cache to the most convenient layout
+        if kv_layout == "bhsd":
+            key_cache = key_cache.permute(0, 2, 1, 3)
+            value_cache = value_cache.permute(0, 2, 1, 3)
+        _, block_size, num_kv_heads, head_size = key_cache.shape
 
     outputs: list[torch.Tensor] = []
     start_idx = 0
@@ -48,10 +57,16 @@ def ref_paged_attn(
         num_kv_blocks = (kv_len + block_size - 1) // block_size
         block_indices = block_tables[i, :num_kv_blocks]
 
-        k = key_cache[block_indices].view(-1, num_kv_heads, head_size)
-        k = k[:kv_len]
-        v = value_cache[block_indices].view(-1, num_kv_heads, head_size)
-        v = v[:kv_len]
+        if kv_layout == "thd":
+            start_token_idx = block_indices[0]
+            end_token_idx = start_token_idx + kv_len
+            k = key_cache[start_token_idx:end_token_idx].view(-1, num_kv_heads, head_size)
+            v = value_cache[start_token_idx:end_token_idx].view(-1, num_kv_heads, head_size)
+        else:
+            k = key_cache[block_indices].view(-1, num_kv_heads, head_size)
+            k = k[:kv_len]
+            v = value_cache[block_indices].view(-1, num_kv_heads, head_size)
+            v = v[:kv_len]
 
         if q.shape[1] != k.shape[1]:
             k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
@@ -258,6 +273,7 @@ def test_triton_unified_attn(
         sliding_window=sliding_window,
         soft_cap=soft_cap,
         sinks=sinks,
+        kv_layout="cache"
     )
     atol, rtol = 1.5e-2, 1e-2
 

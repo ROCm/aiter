@@ -104,8 +104,9 @@ def perblock_quantize_kernel(
     stride_b: tl.int64,
     stride_m: tl.int64,
     stride_h: tl.int64,
-    scale_stride_0,
-    scale_stride_1,
+    stride_bs: tl.int64,
+    stride_ms: tl.int64,
+    stride_hs: tl.int64,
     BLOCK_M: tl.constexpr,
     D: tl.constexpr,
     sm_scale: tl.constexpr,
@@ -151,7 +152,7 @@ def perblock_quantize_kernel(
     Q_quant = Q_quant.to(Q_q.dtype.element_ty)
 
     # scale (total num blocks)
-    scale_ptrs = Q_descale + global_blk_idx * scale_stride_0 + pid_h * scale_stride_1
+    scale_ptrs = Q_descale + pid_b * stride_bs + pid_h * stride_hs + pid_m * stride_ms
     tl.store(scale_ptrs, scale)
     
     qtile_ptrs = Q_q + tile_offsets
