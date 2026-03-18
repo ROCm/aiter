@@ -73,12 +73,12 @@ void fused_qk_norm_rope_2way(at::Tensor& q0,
                              at::Tensor& out_q01,
                              at::Tensor& out_k01);
 
-void fused_qk_rmsnorm(at::Tensor& q,
-                      at::Tensor& q_weight,
-                      double q_eps,
-                      at::Tensor& k,
-                      at::Tensor& k_weight,
-                      double k_eps);
+std::tuple<at::Tensor, at::Tensor> fused_qk_rmsnorm(at::Tensor& q,
+                                                     at::Tensor& q_weight,
+                                                     double q_eps,
+                                                     at::Tensor& k,
+                                                     at::Tensor& k_weight,
+                                                     double k_eps);
 
 void fused_qk_norm_rope_cache_block_quant_shuffle(
     at::Tensor& qkv,                   // Combined QKV tensor [num_tokens,

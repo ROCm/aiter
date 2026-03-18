@@ -36,7 +36,7 @@ def fused_qk_rmsnorm(
     k: Tensor,
     k_weight: Tensor,
     k_eps: float,
-) -> None: ...
+) -> tuple[Tensor, Tensor]: ...
 
 
 @compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle")
