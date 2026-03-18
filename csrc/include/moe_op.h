@@ -146,7 +146,8 @@ void fmoe_fp8_blockscale_g1u1(
     int fc_scale_blkn                             = 128,          // = 128,
     int fc_scale_blkk                             = 128,          // = 128
     std::optional<torch::Tensor> fc2_smooth_scale = std::nullopt, // [expert, 1, inter_dim]
-    ActivationType activation                     = ActivationType::Silu);
+    ActivationType activation                     = ActivationType::Silu,
+    int block_size_M                              = 32);
 
 void moe_stage1_g1u1(
     torch::Tensor& input,             // [token_cnt, model_dim] M,K

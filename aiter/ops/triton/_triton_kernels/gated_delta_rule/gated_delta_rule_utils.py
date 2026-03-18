@@ -1,4 +1,4 @@
-# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Copyright (C) 2023-2026, Songlin Yang, Yu Zhang
 
 import contextlib
 import functools

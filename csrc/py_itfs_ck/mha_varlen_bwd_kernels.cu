@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
 #include <ATen/hip/HIPContext.h>
@@ -109,23 +109,6 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
         mask = mask_info::decode(mask_identify, max_seqlen_q, max_seqlen_k); // local
     }
 
-    auto get_mask_type = [&]() {
-        if (mask.type == mask_enum::no_mask) {
-            return 0;
-        } else {
-            if (mask.type == mask_enum::window_generic) {
-                assert(false);
-                return 0;
-            } else {
-                if ((mask.left == -1) && (mask.right == 0)) {
-                    return (mask.type == mask_enum::mask_top_left) ? 1 : 2;
-                } else {
-                    return 3;
-                }
-            }
-        }
-    };
-
     // q, k, v, out had been padded in mha_fwd
     // dq_, dk_, dv_ are also padded tensor
     CHECK_SHAPE(q, total_q, num_heads, head_size_q);
@@ -165,19 +148,38 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
         dv = torch::empty_like(v);
     }
 
+    bias_enum bias_type = alibi_slopes_.has_value() ? bias_enum::alibi : bias_enum::no_bias;
+    auto opts = q.options();
+    const fmha_bwd_traits traits{
+        total_q,
+        total_k,
+        batch_size,
+        max_seqlen_q,
+        max_seqlen_k,
+        head_size_q,
+        head_size_v,
+        num_heads,
+        num_heads_k,
+        q_dtype_str,
+        true, // is_group_mode
+        mask.type,
+        bias_type,
+        false, // has_dbias
+        p_dropout > 0,
+        false, // is_store_randval
+        deterministic,
+    };
+    const fmha_bwd_launcher launcher(traits);
+    const ck_tile::index_t nsplits = launcher.dq_acc_splits;
+
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
 
-    auto opts = q.options();
     auto softmax_d = torch::empty({batch_size, num_heads, total_q}, opts.dtype(at::kFloat));
     at::Tensor dq_accum;
-
-    if (!deterministic) {
-        dq_accum = torch::zeros({num_heads, 1, total_q, head_size_q}, opts.dtype(at::kFloat));
-    } else {
-        const ck_tile::index_t kN0 = head_size_q <= 128 ? 128 : 64;
-        const ck_tile::index_t nsplits = ck_tile::integer_divide_ceil(max_seqlen_k, kN0);
+    if (launcher.needs_zero_dq_acc)
         dq_accum = torch::zeros({num_heads, nsplits, total_q, head_size_q}, opts.dtype(at::kFloat));
-    }
+    else
+        dq_accum = torch::empty({num_heads, nsplits, total_q, head_size_q}, opts.dtype(at::kFloat));
 
     at::Tensor dk_expanded, dv_expanded;
     if (num_heads_k != num_heads) {  // MQA / GQA
@@ -194,8 +196,6 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
         dv_expanded.zero_();
         softmax_d.zero_();
     }
-
-    bias_enum bias_type = alibi_slopes_.has_value() ? bias_enum::alibi : bias_enum::no_bias;
 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
@@ -311,8 +311,7 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                 seqstart_q_ptr = cu_seqlens_q.data_ptr();
             }
 
-            return mha_bwd_args{get_mask_type(),
-                                false, // use_v3
+            return mha_bwd_args{false, // use_v3
                                 false, // is_v3_atomic_fp32
                                 false, // how_v3_bf16_cvt
                                 false, // v3_api_check

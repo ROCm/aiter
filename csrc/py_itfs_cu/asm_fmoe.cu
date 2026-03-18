@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
 #include "asm_fmoe_configs.hpp"
 #include "moe_op.h"
@@ -247,7 +247,7 @@ class FMoeKernel
 };
 
 FMoeKernel* get_heuristic_kernel(
-    int inter_dim, int sub_X_cnt, CFG* cfgs, int smf = 0, std::string kernel_name = "")
+    int inter_dim, int sub_X_cnt, CFG* cfgs, int smf = 0, std::string kernel_name = "", int block_size_M = 32)
 {
     FMoeKernel* impl_ptr        = nullptr;
     uint32_t num_cu             = get_num_cu_func();
@@ -270,7 +270,7 @@ FMoeKernel* get_heuristic_kernel(
             if(el.first.find(arch_id) != 0)
                 continue;
             const auto& cfg = el.second;
-            if(cfg.vskip == vskip && cfg.smf == smf)
+            if(cfg.vskip == vskip && cfg.smf == smf && block_size_M == cfg.subGU_m)
             {
                 if((inter_dim % cfg.subGU_n) == 0)
                 {
@@ -825,7 +825,8 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor& out,               // [token_cnt, d
                               int fc_scale_blkn,
                               int fc_scale_blkk,
                               std::optional<torch::Tensor> fc2_smooth_scale,
-                              ActivationType activation)
+                              ActivationType activation,
+                              int block_size_M)
 {
     FMoeKernel* impl_ptr     = nullptr;
     CFG* config_map          = nullptr;
@@ -846,7 +847,7 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor& out,               // [token_cnt, d
                 false, __func__, "Unsupported activation type for fmoe_fp8_blockscale_g1u1");
 
         impl_ptr =
-            get_heuristic_kernel(inter_dim, sorted_expert_ids.size(0), config_map, 0, kernel_name);
+            get_heuristic_kernel(inter_dim, sorted_expert_ids.size(0), config_map, 0, kernel_name, block_size_M);
         impl_ptr->launch_kernel<uint8_t, uint16_t, false>(out,
                                                           input,
                                                           gate,

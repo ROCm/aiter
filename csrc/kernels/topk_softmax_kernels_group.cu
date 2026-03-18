@@ -201,6 +201,44 @@ __device__ constexpr void wave_reduce_argmax2(
     }
 }
 
+#if defined(__gfx1250__)
+// gfx1250 substitute for __builtin_amdgcn_mov_dpp: uses ds_bpermute for row_bcast ops
+template <int dpp_i>
+__device__ int gfx1250_dpp_substitute(int val, int /*row_mask*/, int /*bank_mask*/, bool /*bound_ctrl*/)
+{
+    if constexpr(dpp_i == 0xb1 || dpp_i == 0x4e || dpp_i == 0x114 || dpp_i == 0x118)
+    {
+        // quad_perm and row_shr are supported on gfx1250; use DPP
+        return __builtin_amdgcn_mov_dpp(val, dpp_i, 0xf, 0xf, true);
+    }
+    else if constexpr(dpp_i == 0x141)
+    {
+        // row_half_mirror -> XOR lane with 1
+        return __builtin_amdgcn_ds_bpermute((__lane_id() ^ 1) << 2, val);
+    }
+    else if constexpr(dpp_i == 0x140)
+    {
+        // row_shr:1 within 8-lane groups -> XOR not exact, use bpermute
+        int src = (__lane_id() & ~7) | ((__lane_id() + 1) & 7);
+        return __builtin_amdgcn_ds_bpermute(src << 2, val);
+    }
+    else if constexpr(dpp_i == 0x142)
+    {
+        // row_bcast:15 -> shuffle from lane 15
+        return __builtin_amdgcn_ds_bpermute((15 + (__lane_id() & ~31)) << 2, val);
+    }
+    else if constexpr(dpp_i == 0x143)
+    {
+        // row_bcast:31 -> shuffle from lane 31
+        return __builtin_amdgcn_ds_bpermute(31 << 2, val);
+    }
+    else
+    {
+        return val;
+    }
+}
+#endif
+
 __inline__ __device__ void warpReduceMax(float& val_o, int& idx)
 {
     static_assert(64 == WARP_SIZE, "WARP_SIZE == 64");
@@ -229,6 +267,15 @@ __inline__ __device__ void warpReduceMax(float& val_o, int& idx)
     ck_tile::static_for<0, lane_steps, 1>{}([&](auto i_step) {
         constexpr int dpp_i = get_dpp_i(i_step);
 
+#if defined(__gfx1250__)
+        float remote_val = __builtin_bit_cast(
+            float,
+            gfx1250_dpp_substitute<dpp_i>(
+                __builtin_bit_cast(int, val), row_mask, bank_mask, bound_ctrl));
+        int remote_idx =
+            gfx1250_dpp_substitute<dpp_i>(
+                __builtin_bit_cast(int, idx), row_mask, bank_mask, bound_ctrl);
+#else
         float remote_val = __builtin_bit_cast(
             float,
             __builtin_amdgcn_mov_dpp(
@@ -237,6 +284,7 @@ __inline__ __device__ void warpReduceMax(float& val_o, int& idx)
             int,
             __builtin_amdgcn_mov_dpp(
                 __builtin_bit_cast(int, idx), dpp_i, row_mask, bank_mask, bound_ctrl));
+#endif
 
         idx = val > remote_val ? idx : remote_idx;
         val = val > remote_val ? val : remote_val;
@@ -478,6 +526,16 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
                 };
                 ck_tile::static_for<0, lane_steps, 1>{}([&](auto i_step) {
                     constexpr int dpp_i = get_dpp_i(i_step);
+#if defined(__gfx1250__)
+                    float remote_max_1  = __builtin_bit_cast(
+                        float,
+                        gfx1250_dpp_substitute<dpp_i>(
+                            __builtin_bit_cast(int, max1), row_mask, bank_mask, bound_ctrl));
+                    float remote_max_2 = __builtin_bit_cast(
+                        float,
+                        gfx1250_dpp_substitute<dpp_i>(
+                            __builtin_bit_cast(int, max2), row_mask, bank_mask, bound_ctrl));
+#else
                     float remote_max_1  = __builtin_bit_cast(
                         float,
                         __builtin_amdgcn_mov_dpp(
@@ -486,6 +544,7 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
                         float,
                         __builtin_amdgcn_mov_dpp(
                             __builtin_bit_cast(int, max2), dpp_i, row_mask, bank_mask, bound_ctrl));
+#endif
 
                     max2 = dev_max_(remote_max_1, max2);
                     max2 = remote_max_1 > max1 ? max1 : max2;
@@ -802,6 +861,16 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
                 };
                 ck_tile::static_for<0, lane_steps, 1>{}([&](auto i_step) {
                     constexpr int dpp_i = get_dpp_i(i_step);
+#if defined(__gfx1250__)
+                    float remote_max_1  = __builtin_bit_cast(
+                        float,
+                        gfx1250_dpp_substitute<dpp_i>(
+                            __builtin_bit_cast(int, max1), row_mask, bank_mask, bound_ctrl));
+                    float remote_max_2 = __builtin_bit_cast(
+                        float,
+                        gfx1250_dpp_substitute<dpp_i>(
+                            __builtin_bit_cast(int, max2), row_mask, bank_mask, bound_ctrl));
+#else
                     float remote_max_1  = __builtin_bit_cast(
                         float,
                         __builtin_amdgcn_mov_dpp(
@@ -810,6 +879,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
                         float,
                         __builtin_amdgcn_mov_dpp(
                             __builtin_bit_cast(int, max2), dpp_i, row_mask, bank_mask, bound_ctrl));
+#endif
 
                     max2 = dev_max_(remote_max_2, max2);
                     max2 = dev_med3_(remote_max_1, max1, max2);
