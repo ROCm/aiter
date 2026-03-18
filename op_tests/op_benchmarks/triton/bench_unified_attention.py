@@ -18,6 +18,9 @@ from op_tests.triton_tests.attention.test_unified_attention import shuffle_kv_ca
 from aiter.ops.triton.utils.types import e4m3_dtype
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 import argparse
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_caller_name_no_ext,
+)
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
@@ -46,6 +49,7 @@ def benchmark(args):
     configs = []
 
     x_names = [
+        "num_seqs",
         "seq_lens",
         "num_heads",
         "head_size",
@@ -62,7 +66,8 @@ def benchmark(args):
 
     x_vals_list = [
         (
-            [(1, int(seq_lens))] * int(num_seqs),
+            num_seqs,
+            seq_lens,
             (num_query_heads, num_kv_heads),
             HEAD_SIZE,
             None,
@@ -77,23 +82,28 @@ def benchmark(args):
         )
     ]
 
+    line_vals = ["time"]
+    line_names = ["Time_(ms)"]
+
     configs.append(
         triton.testing.Benchmark(
             x_names=x_names,
             x_vals=x_vals_list,
-            # line_arg="provider",
-            # line_vals=line_vals,
-            # line_names=line_vals,
+            line_arg="provider",
+            line_vals=line_vals,
+            line_names=line_names,
+            plot_name=get_caller_name_no_ext(),
             styles=[("red", "-"), ("green", "-")],
             ylabel="ms",
-            plot_name="unified_attention",
+            args={},
             # args={"sm_scale": 1.0, "logit_cap": 0.0, "device": args.device},
         )
     )
 
     @triton.testing.perf_report(configs)
     def bench_unified_attention(
-        seq_lens: list[tuple[int, int]],
+        num_seqs: int,
+        seq_lens: int,
         num_heads: tuple[int, int],
         head_size: int,
         sliding_window: Optional[int],
@@ -105,13 +115,16 @@ def benchmark(args):
         o_dtype: torch.dtype,
         shuffled_kv_cache: bool,
         backend: str,
+        provider,
     ):
         warmup = 25
         rep = 100
 
-        num_seqs = len(seq_lens)
-        query_lens = [x[0] for x in seq_lens]
-        kv_lens = [x[1] for x in seq_lens]
+        seq_lens_list = [(1, seq_lens)] * num_seqs
+
+        num_seqs = len(seq_lens_list)
+        query_lens = [x[0] for x in seq_lens_list]
+        kv_lens = [x[1] for x in seq_lens_list]
         num_query_heads = num_heads[0]
         num_kv_heads = num_heads[1]
         assert num_query_heads % num_kv_heads == 0
@@ -170,7 +183,7 @@ def benchmark(args):
         q_descale = None
         k_descale = None
         v_descale = None
-        if q_dtype != torch.bfloat16:
+        if q_dtype != torch.bfloat16 and backend == "gluon":
             q_descale = torch.rand((1,), dtype=torch.float32, device="cuda")
 
         if kv_dtype != torch.bfloat16:
@@ -221,12 +234,19 @@ def benchmark(args):
             )
 
         ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+        # TODO: add TFLOPS and BW
+        # if "ms" in provider:
+        #     return ms
+        # elif "TFLOPS" in provider:
+        #     return total_flops / ms * 1e-9
+        # else:  # BW
+        #     return mem / ms * 1e-6
         return ms
 
     bench_unified_attention.run(
         save_path="." if args.o else None, print_data=True, show_plots=False
     )
-    return x_vals_list, x_names, line_vals
+    # return x_vals_list, x_names, line_vals
 
 
 def parse_args():
@@ -241,8 +261,8 @@ def parse_args():
     parser.add_argument("--shuffled_kv_cache", type=bool, default=True)
     parser.add_argument("--num_query_heads", type=int, default=64)
     parser.add_argument("--num_kv_heads", type=int, default=8)
-    parser.add_argument("--q_dtype", type=str, default="fp8")
-    parser.add_argument("--kv_dtype", type=str, default="fp8")
+    parser.add_argument("--q_dtype", type=str, default="bf16")
+    parser.add_argument("--kv_dtype", type=str, default="bf16")
     parser.add_argument("--backend", type=str, default="gluon")
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
