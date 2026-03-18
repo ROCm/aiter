@@ -503,7 +503,7 @@ def gemm_afp4wfp4_preshuffle(
     if M < 32 and M_POW2 > 16:
         M_POW2 = 16
     
-    if use_gluon:
+    if use_gluon == False:
         layouts = get_gemm_afp4wfp4_preshuffle_layouts(config["num_warps"], config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"])
 
         grid = (config["NUM_KSPLIT"] * triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
@@ -543,7 +543,7 @@ def gemm_afp4wfp4_preshuffle(
     metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/gemm/aot/{_triton_gemm_afp4wfp4_preshuffle_kernel.fn.__name__}_M={M_POW2}-N={N}-K={K_elems}"
     if use_aot and os.path.exists(metadata_pth):
         with AOTMetadataContext(
-            kernel.fn.__name__,
+            _triton_gemm_afp4wfp4_preshuffle_kernel.fn.__name__,
             f"{metadata_pth}",
         ):
             _triton_gemm_afp4wfp4_preshuffle_kernel[grid](
@@ -577,7 +577,7 @@ def gemm_afp4wfp4_preshuffle(
             w_scales,
             M,
             N,
-            K,
+            K_elems,
             x_fp4.stride(0),
             x_fp4.stride(1),
             w_preshuf.stride(0),
@@ -600,7 +600,7 @@ def gemm_afp4wfp4_preshuffle(
         # NOTE: REDUCE_BLOCK_SIZE_N=16 gives best perf with fp32 partials and
         # REDUCE_BLOCK_SIZE_N=128 gives best perf with bf16 partials
         REDUCE_BLOCK_SIZE_N = 128 if _USE_GEMM_SPLITK_BF16 else 64
-        ACTUAL_KSPLIT = triton.cdiv(K, (config["SPLITK_BLOCK_SIZE"] // 2))
+        ACTUAL_KSPLIT = triton.cdiv(K_elems, (config["SPLITK_BLOCK_SIZE"] // 2))
 
         grid_reduce = (
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
