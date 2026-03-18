@@ -254,6 +254,10 @@ def fused_moe_(
         dtypes.bf16,
     ], f"Fused_moe unsupported out dtype: {dtype}"
     quant_type = quant_remap.get(quant_type, quant_type)
+    # W4A6: remap QuantType.No -> per_1x32 for fp4x2 weights so activations
+    # get quantized to fp4x2 at runtime (CK MoE only supports A4W4).
+    if quant_type == QuantType.No and w1.dtype == dtypes.fp4x2:
+        quant_type = QuantType.per_1x32
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
     # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
