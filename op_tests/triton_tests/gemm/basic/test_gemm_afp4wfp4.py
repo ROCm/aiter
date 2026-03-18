@@ -175,6 +175,7 @@ def get_x_vals():
     x_vals += [(v, 57344, 8192) for v in [1, 2, 4, 8, 31, 16, 32, 64]]
     x_vals += [(v, 8192, 28672) for v in [1, 2, 4, 8, 31, 16, 32, 64]]
     x_vals += [(1, 1, 32)]  # minimal case
+    x_vals += [(2048, 7168, 4096),(32, 7168, 4096)]
     return x_vals
 
 
@@ -249,7 +250,7 @@ def test_gemm_afp4_wfp4(
     skip_reduce,
     impl,
 ):
-    if impl == "gluon" and DEVICE_ARCH not in ["gfx950", "gfx1250"]:
+    if impl == "gluon" and not arch_info.is_gluon_avail():
         pytest.skip(
             "Gluon implementation is not supported on this GPU."
         )
@@ -362,12 +363,14 @@ def test_gemm_afp4_wfp4(
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["TN", "TT"]) # "NN", "NT"
 @pytest.mark.parametrize("output", [True, False])
 def test_gemm_mxfp4_preshuffled_gfx1250(
     M: int,
     N: int,
     K: int,
     dtype,
+    layout,
     output,
 ):
     if DEVICE_ARCH != "gfx1250":
@@ -400,7 +403,7 @@ def test_gemm_mxfp4_preshuffled_gfx1250(
         N,
         K,
         dtype,
-        layout="TN",
+        layout=layout,
         output=output,
         shuffle_scales_fg=True,
         shuffle_weight_fg=True,
