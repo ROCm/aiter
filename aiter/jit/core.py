@@ -1029,6 +1029,11 @@ def get_args_of_build(ops_name: str, exclude=[]):
             )
 
 
+def _is_union(origin):
+    """Check for both typing.Union (Optional[X]) and types.UnionType (X | None)."""
+    return origin is typing.Union or origin is types.UnionType
+
+
 def _ctypes_call(func, fc_name, md_name):
     """Build a ctypes-based caller for a torch-free .so module."""
     import ctypes
@@ -1036,7 +1041,6 @@ def _ctypes_call(func, fc_name, md_name):
     import torch
     from ..utility.dtypes import torch_to_aiter, AiterTensor
 
-    # closure variables
     _cache = {}
     _arg_checked = False
 
@@ -1065,20 +1069,19 @@ def _ctypes_call(func, fc_name, md_name):
         c_func = getattr(lib, fc_name)
         c_func.restype = None
 
-        # declare argument types for C/C++ function
         hints = typing.get_type_hints(func)
         argtypes = []
         for pname in inspect.signature(func).parameters:
-            hint = hints.get(pname)  ### type hint
-            origin = typing.get_origin(hint)  ### check if union type
+            hint = hints.get(pname)
+            origin = typing.get_origin(hint)
             type_args = typing.get_args(hint)
             if hint is torch.Tensor:
                 argtypes.append(ctypes.POINTER(AiterTensor))
-            elif origin is typing.Union and torch.Tensor in type_args:
+            elif _is_union(origin) and torch.Tensor in type_args:
                 argtypes.append(ctypes.POINTER(AiterTensor))
-            elif origin is typing.Union and int in type_args:
+            elif _is_union(origin) and int in type_args:
                 argtypes.append(ctypes.c_int)
-            elif origin is typing.Union and str in type_args:
+            elif _is_union(origin) and str in type_args:
                 argtypes.append(ctypes.c_char_p)
             elif hint is bool:
                 argtypes.append(ctypes.c_int)
@@ -1106,19 +1109,19 @@ def _ctypes_call(func, fc_name, md_name):
                         f"{fc_name}: '{pname}' expects torch.Tensor, "
                         f"got {type(value).__name__}"
                     )
-            elif origin is typing.Union and torch.Tensor in type_args:
+            elif _is_union(origin) and torch.Tensor in type_args:
                 if value is not None and not isinstance(value, torch.Tensor):
                     raise TypeError(
                         f"{fc_name}: '{pname}' expects Optional[torch.Tensor], "
                         f"got {type(value).__name__}"
                     )
-            elif origin is typing.Union and int in type_args:
+            elif _is_union(origin) and int in type_args:
                 if value is not None and not isinstance(value, int):
                     raise TypeError(
                         f"{fc_name}: '{pname}' expects Optional[int], "
                         f"got {type(value).__name__}"
                     )
-            elif origin is typing.Union and str in type_args:
+            elif _is_union(origin) and str in type_args:
                 if value is not None and not isinstance(value, str):
                     raise TypeError(
                         f"{fc_name}: '{pname}' expects Optional[str], "
@@ -1172,7 +1175,7 @@ def _ctypes_call(func, fc_name, md_name):
                 at = torch_to_aiter(value)
                 aiter_refs.append(at)
                 c_args.append(ctypes.byref(at))
-            elif origin is typing.Union and torch.Tensor in type_args:
+            elif _is_union(origin) and torch.Tensor in type_args:
                 if value is not None:
                     if tensor_device is None:
                         tensor_device = value.device
@@ -1181,9 +1184,9 @@ def _ctypes_call(func, fc_name, md_name):
                     c_args.append(ctypes.byref(at))
                 else:
                     c_args.append(ctypes.POINTER(AiterTensor)())
-            elif origin is typing.Union and int in type_args:
+            elif _is_union(origin) and int in type_args:
                 c_args.append(value if value is not None else -1)
-            elif origin is typing.Union and str in type_args:
+            elif _is_union(origin) and str in type_args:
                 c_args.append(value.encode() if value is not None else None)
             elif hint is bool:
                 c_args.append(1 if value else 0)
