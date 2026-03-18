@@ -8,14 +8,14 @@ import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_str
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
-    _triton_gemm_afp4wfp4_kernel,
-    _triton_gemm_afp4wfp4_preshuffle_kernel,
-    _triton_gemm_afp4wfp4_kernel_preshuffle_scales,
-    _triton_gemm_afp4wfp4_reduce_kernel,
+    _gemm_afp4wfp4_kernel as _triton_gemm_afp4wfp4_kernel,
+    _gemm_afp4wfp4_preshuffle_kernel as _triton_gemm_afp4wfp4_preshuffle_kernel,
+    _gemm_afp4wfp4_kernel_preshuffle_scales as _triton_gemm_afp4wfp4_kernel_preshuffle_scales,
+    _gemm_afp4wfp4_reduce_kernel as _triton_gemm_afp4wfp4_reduce_kernel,
     _get_config,
 )
 from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_mxfp4 import (
-    _gluon_gemm_mxfp4_preshuffle_gfx1250,
+    gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
 )
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -445,7 +445,7 @@ def gemm_afp4wfp4_preshuffle(
     n16, _ = w_preshuf.shape
     N = n16 * 16
     K_elems = K_bytes * 2
-    K = K // 16
+    K = K_bytes // 16
 
     if config is None:
         config, _ = _get_config(M, N, K, True)

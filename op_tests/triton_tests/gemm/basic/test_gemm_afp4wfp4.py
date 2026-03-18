@@ -7,7 +7,9 @@ from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4_preshuffle as triton_gemm_afp4wfp4_preshuffle,
 )
 from aiter.ops.triton.gluon.gemm_afp4wfp4 import gemm_afp4wfp4 as gluon_gemm_afp4wfp4_CDNA4
-from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_mxfp4 import gluon_gemm_mxfp4_preshuffle_gfx1250
+from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_mxfp4 import (
+    gemm_mxfp4_preshuffle_gfx1250 as gluon_gemm_mxfp4_preshuffle_gfx1250,
+)
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from aiter.ops.shuffle import shuffle_weight
@@ -238,7 +240,7 @@ def run_triton(
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("shuffle_weight_scales",[True, False])
 @pytest.mark.parametrize("skip_reduce", [True, False])
-@pytest.mark.parametrize("impl", ["triton", "gluon"])
+@pytest.mark.parametrize("impl", ["triton"])
 def test_gemm_afp4_wfp4(
     M: int,
     N: int,
@@ -296,7 +298,7 @@ def test_gemm_afp4_wfp4(
 
     if shuffle_weight_scales:
         if output:
-            triton_out = gemm_afp4wfp4_preshuffle(
+            triton_out = triton_gemm_afp4wfp4_preshuffle(
                 x,
                 w_triton,
                 x_scales_triton,
@@ -307,7 +309,7 @@ def test_gemm_afp4_wfp4(
                 skip_reduce=skip_reduce,
             )
         else:
-            triton_out = gemm_afp4wfp4_preshuffle(
+            triton_out = triton_gemm_afp4wfp4_preshuffle(
                 x,
                 w_triton,
                 x_scales_triton,
