@@ -28,35 +28,28 @@ def get_config(num_tokens, num_seqs, num_queries_per_kv, num_kv_heads, head_size
     total_num_q_blocks = num_tokens // BLOCK_Q + num_seqs
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
-    # if use_2d_kernel(
-    #     head_size,
-    #     SLIDING_WINDOW,
-    #     ALL_DECODE,
-    #     max_seqlen_q,
-    #     max_seqlen_k,
-    #     target_num_prgms,
-    #     num_2d_prgms,
-    # ):
-    return select_2d_config(
-        block_size,
+    if use_2d_kernel(
         head_size,
         SLIDING_WINDOW,
         ALL_DECODE,
         max_seqlen_q,
         max_seqlen_k,
-        num_queries_per_kv,
+        target_num_prgms,
         num_2d_prgms,
-    )
-    # else:
-    #     attn_config, reduce_config = select_3d_config(
-    #         head_size,
-    #         block_size,
-    #         q_element_size,
-    #         max_seqlen_k,
-    #         target_num_prgms,
-    #         num_2d_prgms,
-    #     )
-    #     return attn_config
+    ):
+        return select_2d_config(block_size, head_size, SLIDING_WINDOW, ALL_DECODE, max_seqlen_q, max_seqlen_k, num_queries_per_kv, num_2d_prgms)
+    else:
+        attn_config, reduce_config = select_3d_config(
+            head_size,
+            block_size,
+            q_element_size,
+            max_seqlen_k,
+            target_num_prgms,
+            num_2d_prgms,
+        )
+        attn_config["BLOCK_M"] = BLOCK_M
+        attn_config["BLOCK_Q"] = BLOCK_Q
+        return attn_config
 
 def select_2d_config(
     block_size,
@@ -163,7 +156,7 @@ def get_sage_scale_strides(
     if sage_version == SAGE_VERSION.SAGE:
         tiles_per_block = triton.cdiv(BLOCK_SIZE, TILE_SIZE)
         k_descale_3d = k_descale.view(num_blks, tiles_per_block, -1)
-        stride_k_cache_scale_0, stride_k_cache_scale_1, stride_k_cache_scale_2 = k_descale_3d.stride(0)
+        stride_k_cache_scale_0, stride_k_cache_scale_1, stride_k_cache_scale_2 = k_descale_3d.stride()
         stride_k_cache_scale_3 = 0
 
         query_scale_stride_0, query_scale_stride_1 = q_descale.stride()
@@ -318,7 +311,6 @@ def unified_attention(
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
-    # 3D kernel does not support sage attention yet; force 2D path when sage is active.
     if use_2d_kernel(
         head_size,
         SLIDING_WINDOW,

@@ -116,7 +116,7 @@ def test_triton_unified_attn(
     # TODO: better block size checking
     if is_reduced_precision and block_size < 32:
         pytest.skip("block size must be at least 32 for fp8")
-    if quant_scheme is not None and q_dtype is not None:
+    if quant_scheme not in ("v1", "v2") and q_dtype is not None:
         pytest.skip("SAGE quant and fp8 q_dtype are mutually exclusive")
     if quant_scheme == "v2" and not arch_info.is_fp4_avail():
         pytest.skip("FP4 dot product is not supported on this GPU")
@@ -265,9 +265,19 @@ def test_triton_unified_attn(
     print("k_descale", k_descale.flatten()[0:10])
     if is_reduced_precision:
         atol, rtol = 1.5e-1, 1.5e-1
-    torch.testing.assert_close(
-        output, ref_output, atol=atol, rtol=rtol
-    ), f"{torch.max(torch.abs(output - ref_output))}"
+    # torch.testing.assert_close(
+    #     output, ref_output, atol=atol, rtol=rtol
+    # ), f"{torch.max(torch.abs(output - ref_output))}"
+
+    # temp. fix for gpu memory leakage due to correctness mismatch build up
+    max_abs_diff = torch.max(torch.abs(output.float() - ref_output.float())).item()
+    all_close = max_abs_diff <= atol
+    del output, ref_output, query, key_cache, value_cache, block_tables, sinks
+    del maybe_quantized_query, maybe_quantized_key_cache, maybe_quantized_value_cache
+    del q_descale, k_descale, v_descale
+    import gc; gc.collect()
+    torch.cuda.empty_cache()
+    assert all_close, f"max abs diff = {max_abs_diff} (atol={atol})"
 
 
 
