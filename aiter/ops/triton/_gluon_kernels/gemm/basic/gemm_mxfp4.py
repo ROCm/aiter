@@ -1,14 +1,5 @@
-from typing import Optional
-
-import torch
-
-# from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-import triton
 from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
-
-_LOGGER = AiterTritonLogger()
 
 SCALE_GROUP_ELEMS = 32
 

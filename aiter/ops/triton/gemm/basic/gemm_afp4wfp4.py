@@ -440,7 +440,7 @@ def gemm_afp4wfp4_preshuffle(
     """
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
-    use_gluon = arch_info.get_arch() != "gfx1250"
+    use_gluon = arch_info.get_arch() == "gfx1250"
 
     M, K_bytes = x_fp4.shape
     n16, _ = w_preshuf.shape
