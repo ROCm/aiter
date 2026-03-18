@@ -14,6 +14,7 @@ from ..jit.core import (
     AITER_CONFIGS,
     AITER_LOG_TUNED_CONFIG,
     AITER_ROOT_DIR,
+    ENABLE_CK,
     compile_ops,
 )
 from ..jit.utils.chip_info import get_cu_num
@@ -574,6 +575,32 @@ def gemm_a8w8_blockscale(
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     from aiter.jit.utils.chip_info import get_gfx
 
+    if not ENABLE_CK:
+        from .triton.gemm.basic.gemm_a8w8_blockscale import (
+            gemm_a8w8_blockscale as gemm_a8w8_blockscale_triton,
+            gemm_a8w8_blockscale_preshuffle as gemm_a8w8_blockscale_preshuffle_triton,
+        )
+
+        if isBpreshuffled:
+            if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:
+                return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
+
+            weight_shuffle_layout = (16, 16)
+            assert (
+                WQ.shape[0] % weight_shuffle_layout[0] == 0
+            ), f"{WQ.shape[0]} must be divisible by {weight_shuffle_layout[0]}"
+            WQ_preshuffled = WQ.reshape(
+                WQ.shape[0] // weight_shuffle_layout[0],
+                WQ.shape[1] * weight_shuffle_layout[0],
+            )
+            return gemm_a8w8_blockscale_preshuffle_triton(
+                XQ, WQ_preshuffled, x_scale, w_scale, dtype=dtype, y=Y
+            )
+
+        return gemm_a8w8_blockscale_triton(
+            XQ, WQ, x_scale, w_scale, dtype=dtype, y=Y
+        )
+
     if isBpreshuffled:
         if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:
             return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
@@ -635,11 +662,29 @@ def gemm_a8w8_blockscale_bpreshuffle(
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
     m = XQ.shape[0]
     n = WQ.shape[0]
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+
+    if not ENABLE_CK:
+        from .triton.gemm.basic.gemm_a8w8_blockscale import (
+            gemm_a8w8_blockscale_preshuffle as gemm_a8w8_blockscale_preshuffle_triton,
+        )
+
+        weight_shuffle_layout = (16, 16)
+        assert (
+            WQ.shape[0] % weight_shuffle_layout[0] == 0
+        ), f"{WQ.shape[0]} must be divisible by {weight_shuffle_layout[0]}"
+        WQ_preshuffled = WQ.reshape(
+            WQ.shape[0] // weight_shuffle_layout[0],
+            WQ.shape[1] * weight_shuffle_layout[0],
+        )
+        return gemm_a8w8_blockscale_preshuffle_triton(
+            XQ, WQ_preshuffled, x_scale, w_scale, dtype=dtype, y=Y
+        )
+
     k = XQ.shape[1]
     config = get_CKGEMM_config(
         m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
     )
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     if config is not None:
         libtype = config["libtype"]
         if libtype == "cktile":
