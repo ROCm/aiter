@@ -201,7 +201,7 @@ torch::Tensor
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    int KBatch = 1);
+    int KBatch);
 """
         MAINFEST_end = """
 

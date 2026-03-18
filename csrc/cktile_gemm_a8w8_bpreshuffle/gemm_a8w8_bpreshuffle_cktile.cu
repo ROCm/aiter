@@ -8,7 +8,7 @@
 #include <cmath>
 
 using RowwiseKernel = std::function<torch::Tensor(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&)>;
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int)>;
 
 // Define a custom hash function for std::tuple<int, int, int>
 struct IntTupleHash
@@ -111,11 +111,11 @@ torch::Tensor gemm_a8w8_bpreshuffle_cktile(torch::Tensor& XQ,
 
     if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
     {
-        rowwise_dispatch<F32, F16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
+        rowwise_dispatch<F32, F16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, 1);
     }
     else if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
     {
-        rowwise_dispatch<F32, B16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
+        rowwise_dispatch<F32, B16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, 1);
     }
     else
     {
