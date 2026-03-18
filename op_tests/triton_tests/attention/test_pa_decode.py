@@ -194,11 +194,6 @@ def test_paged_attn(
     if SEQ_LEN >= 8192 and B >= 16:
         pytest.skip("B>={4} and SEQ_LEN>={8192} tests are too slow")
     # Remap fnuz to arch-appropriate fp8 dtype
-    from aiter.utility.dtypes import fp8
-    if dtype == torch.float8_e4m3fnuz:
-        dtype = fp8
-    if kv_cache_dtype == torch.float8_e4m3fnuz:
-        kv_cache_dtype = fp8
     torch.set_printoptions(threshold=100000)
     num_blocks = NUM_BLK
 
