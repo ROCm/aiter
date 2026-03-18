@@ -886,6 +886,32 @@ python bench_moe.py --model mixtral-7B -M 4096 -print_vgpr
 
 - `-model_configs`: Path to model config JSON file (default: `utils/model_configs.json`). Specifies the location of the model configuration file that contains model-specific parameters like hidden_size, intermediate_size, num_expert, and top_k. You can use a custom config file to benchmark models not in the default file.
 
+**MoE Dimension Parameters:**
+
+The MoE benchmark uses several key dimensions that define the computation:
+
+- **M**: Number of tokens (batch size × sequence length). This is the number of input tokens being processed through the MoE layer. You can override the default M value from model configs with the `-M` flag.
+
+- **N**: Intermediate dimension size. In MoE layers, this represents the size of the intermediate activation space. For Stage 1 (up projection), N = `intermediate_size` from the model config. For Stage 2 (down projection), N = `hidden_size` from the model config. This dimension determines the width of the expert MLP layers.
+
+- **K**: Hidden dimension size. This is the input/output feature dimension. For Stage 1, K = `hidden_size` (input dimension). For Stage 2, K = `intermediate_size // 2` (output dimension). The K dimension represents the model's hidden state size.
+
+- **E**: Number of experts. This is the total number of expert networks in the MoE layer (e.g., `num_expert` = 8 for Mixtral models). Each expert is a separate MLP that processes a subset of tokens. More experts provide more model capacity but require more computation and memory.
+
+- **top_k**: Number of active experts per token. This determines how many experts are selected to process each token (e.g., `top_k` = 2 means each token is routed to 2 experts). The routing mechanism selects the top-k experts based on gate scores. Higher top_k values use more experts per token, increasing computation but potentially improving model quality.
+
+**MoE Computation Structure:**
+
+The MoE layer performs two GEMM stages:
+
+- **Stage 1 (Up Projection)**: `(M, K) × (E, K, N1) → (M, E, N1)` where N1 = `intermediate_size`, K = `hidden_size`
+  - Expands from hidden_size to intermediate_size
+  - Applies activation (e.g., SiLU) if `-silu_fused` is enabled
+
+- **Stage 2 (Down Projection)**: `(M, N2) × (E, N2, K2) → (M, E, K)` where N2 = `hidden_size`, K2 = `intermediate_size // 2`
+  - Projects back from intermediate_size to hidden_size
+  - Aggregates outputs from selected experts
+
 **Note**: MoE benchmarks use model configurations from `utils/model_configs.json`. The M, N, K, E, and top_k parameters are typically derived from the model configuration, but you can override M with the `-M` flag. When using `-int4_w4a16`, you must specify `-group_size` (e.g., `-group_size 128`).
 
 **Comprehensive Benchmark Script:**
@@ -934,7 +960,9 @@ for M in "${M_VALUES[@]}"; do
                                 continue
                             fi
                             
-                            # SiLU fused automatically sets no_bench_stage2
+                            # SiLU fused automatically sets no_bench_stage2 (skips stage 2)
+                            # Skip redundant combination where both flags are set, as silu_fused
+                            # automatically disables stage 2 benchmarking in the code
                             if [ -n "$SILU" ] && [ -n "$NO_STAGE2" ]; then
                                 continue
                             fi
