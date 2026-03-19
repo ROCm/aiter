@@ -1118,8 +1118,24 @@ def decode_update_mla_metadata_v1(
     assert kv_granularity >= 16
     assert page_size == 1
     # assert not (dtype_q == dtypes.bf16 and dtype_kv == dtypes.bf16 and num_heads_per_head_k == 128), "In this case, use get_mla_metadata_v1 instead"
-    natively_supported = (num_heads_per_head_k == 16) or (
-        num_heads_per_head_k == 128 and dtype_q == dtypes.fp8 and dtype_kv == dtypes.fp8
+    q_is_fp8 = dtype_q == dtypes.fp8
+    kv_is_fp8 = dtype_kv == dtypes.fp8
+    arch_id = get_gfx()
+    natively_supported = (
+        (num_heads_per_head_k == 16)
+        or (
+            arch_id == "gfx950"
+            and num_heads_per_head_k == 32
+            and q_is_fp8
+            and kv_is_fp8
+            and max_seqlen_qo == 4
+        )
+        or (
+            arch_id == "gfx942"
+            and num_heads_per_head_k == 128
+            and q_is_fp8
+            and kv_is_fp8
+        )
     )
     cu_num = work_indptr.shape[0] - 1
     tile_reduce_cnt = reduce_indptr.shape[0] - 1
