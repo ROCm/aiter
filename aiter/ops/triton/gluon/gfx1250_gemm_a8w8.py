@@ -96,19 +96,39 @@ def _gemm_a8w8_kernel_async(
     a_buffer = gl.allocate_shared_memory(a_desc.dtype, shape=[NUM_BUFFERS] + a_desc.block_shape, layout=a_desc.layout)
     b_buffer = gl.allocate_shared_memory(b_desc.dtype, shape=[NUM_BUFFERS] + b_desc.block_shape, layout=b_desc.layout)
     
-    wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
-        version=3,
-        transposed=True,
-        warp_bases=[[0, 1], [0, 2], [1, 0]],  # [2, 4] layout
-        reg_bases=[],
-        instr_shape=[16, 16, 128],
-    )
+    if NUM_WARPS == 8:
+        wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
+            version=3,
+            transposed=True,
+            warp_bases=[[0, 1], [0, 2], [1, 0]],  # [2, 4] layout
+            reg_bases=[],
+            instr_shape=[16, 16, 128],
+        )
+    elif NUM_WARPS == 4:
+        wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
+            version=3,
+            transposed=True,
+            warp_bases=[[0, 1], [1, 0]],  # [2, 2] layout
+            reg_bases=[],
+            instr_shape=[16, 16, 128],
+        )
+    elif NUM_WARPS == 2:
+        wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
+            version=3,
+            transposed=True,
+            warp_bases=[[0, 1]],  # [1, 2] layout
+            reg_bases=[],
+            instr_shape=[16, 16, 128],
+        )
+    else:
+        raise ValueError(f"Unsupported number of warps: {NUM_WARPS}")
+    
 
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=wmma_layout, k_width=16
+        operand_index=0, parent=wmma_layout, k_width=8
     )
     dot_b_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=wmma_layout, k_width=16
+        operand_index=1, parent=wmma_layout, k_width=8
     )
 
     offs_am = pid_m * BLOCK_SIZE_M
