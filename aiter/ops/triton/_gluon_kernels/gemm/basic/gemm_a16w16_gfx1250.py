@@ -8,7 +8,7 @@ from typing import Optional, Dict
 from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
 from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
-from aiter.ops.triton._gluon_kernels.utils.gemm_config_utils import get_gemm_config
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.ops.triton._gluon_kernels.utils.prefetch import gemm_l2_prefetch, gemm_l2_prefetch_prologue
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr

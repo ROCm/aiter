@@ -23,7 +23,6 @@ import triton
 import math
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import (
     gemm_a16w16,
-    _is_gluon_available,
     _resolve_backend,
 )
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
@@ -85,7 +84,13 @@ def bench_gemm_fn(
     else:
         ms = triton.testing.do_bench(
             lambda: gemm_a16w16(
-                x, w, bias, c_dtype, y, activation=activation, backend=backend,
+                x,
+                w,
+                bias,
+                c_dtype,
+                y,
+                activation=activation,
+                backend=backend,
             ),
             warmup=warmup,
             rep=rep,
@@ -135,9 +140,16 @@ def run_model_benchmark(args, backend):
             K = math.ceil(K / args.tp)
 
         return bench_gemm_fn(
-            M, N, K, metric, args.layout, backend,
-            atomic=args.atomic, activation=args.activation,
-            warmup=args.warmup, rep=args.rep,
+            M,
+            N,
+            K,
+            metric,
+            args.layout,
+            backend,
+            atomic=args.atomic,
+            activation=args.activation,
+            warmup=args.warmup,
+            rep=args.rep,
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -154,8 +166,15 @@ def run_shape_benchmark(args, backend):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
         return bench_gemm_fn(
-            M, N, K, metric, args.layout, backend, atomic=args.atomic,
-            warmup=args.warmup, rep=args.rep,
+            M,
+            N,
+            K,
+            metric,
+            args.layout,
+            backend,
+            atomic=args.atomic,
+            warmup=args.warmup,
+            rep=args.rep,
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
