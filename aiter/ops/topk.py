@@ -83,6 +83,7 @@ def biased_grouped_topk(
     routed_scaling_factor: float = 1.0,  # mul to topk_weights
 ):
     token_num = gating_output.shape[0]
+    num_experts = gating_output.shape[1]
     cu_num = get_cu_num()
     # moe_fused_gate requires num_experts to be a power of 2.
     # For models with non-power-of-2 expert counts (e.g. Kimi-K2.5 with 384
