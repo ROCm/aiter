@@ -472,17 +472,14 @@ def get_mha_bench_result(
         logging.error("Benchmark name doesn't match: %s", l0)
         return None
     # Check stdout line #2 (table header):
-    kernel_header: str = {"fwd": "fwd", "bwdo": "onekernel-bwd", "bwdf": "fused-bwd"}[
-        args.kernel
-    ]
+    kernel_header: str = {"fwd": "fwd", "bwdo": "bwd", "bwdf": "fused-bwd"}[args.kernel]
     if l1 != [
         "BATCH",
         "HQ",
         "HK",
         "N_CTX_Q",
         "N_CTX_K",
-        f"{kernel_header}({metric.user_unit})",
-        f"({metric.user_unit})",
+        f"BF16-{kernel_header}({metric.user_unit})",
     ]:
         logging.error("Table header doesn't match: %s", l1)
         return None
