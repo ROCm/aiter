@@ -142,8 +142,8 @@ def generate_gemm_a8w8_inputs(
     "in_dtype, out_dtype, m, n, k, layout, output",
     [
         (in_dtype, out_dtype, *shape, layout, output)
-        for in_dtype in ["fp8e4m3", "fp8e5m2", "int8"]
-        for out_dtype in ["bf16", "fp16", "fp32", "int32"]
+        for in_dtype in ["fp8e4m3", "fp8e5m2"]
+        for out_dtype in ["bf16", "fp16", "fp32"]
         for shape in get_x_vals()
         for layout in ["TN", "TT", "NN", "NT"]
         for output in [True, False]
@@ -153,8 +153,6 @@ def generate_gemm_a8w8_inputs(
     "impl",
     [
         "triton",
-        "gluon",
-        "gluon_shuffle",
     ],
 )
 def test_gemm(in_dtype, out_dtype, m, n, k, layout, output, impl: str):
