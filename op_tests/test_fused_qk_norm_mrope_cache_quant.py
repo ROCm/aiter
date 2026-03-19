@@ -724,7 +724,6 @@ if __name__ == "__main__":
     use_shuffle_layouts = [True]  # Test both normal and shuffle layouts
     page_sizes = [16]  # Test two page sizes for shuffle layout
     partial_rotary_configs = [(256, 64), (128, 32)]
-    partial_rotary_tokens = [3, 127, 512]
     partial_rotary_heads = [(32, 4), (8, 2)]
 
     for kv_cache_dtype in kv_cache_dtypes:
@@ -793,7 +792,7 @@ if __name__ == "__main__":
             page_size_list = page_sizes if use_shuffle_layout else [0]
             for page_size in page_size_list:
                 for is_neox_style in args.neox_style:
-                    for num_token in partial_rotary_tokens:
+                    for num_token in args.token:
                         for num_head_q, num_head_kv in partial_rotary_heads:
                             for head_size, rotary_dim in partial_rotary_configs:
                                 test_mrope_3d_rms_set_kv_shuffle(
@@ -823,7 +822,7 @@ if __name__ == "__main__":
             page_size_list = page_sizes if use_shuffle_layout else [0]
             for page_size in page_size_list:
                 for is_neox_style in args.neox_style:
-                    for num_token in partial_rotary_tokens:
+                    for num_token in args.token:
                         for num_head_q, num_head_kv in partial_rotary_heads:
                             for (
                                 head_size,
