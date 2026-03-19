@@ -11,7 +11,7 @@ Covers:
   - MFMA variants (fp32, fp16, bf16, fp8, bf8)
   - MXFP variants (fp8, fp4) -- gfx950 only
   - vector_add, async_load, dtype_convert, predicated_copy, free_func_add,
-    predicated_async_load, numeric_limits, mdiv, workgroup_barrier
+    predicated_async_load, numeric_limits, finfo, mdiv, workgroup_barrier
 """
 
 import ctypes
@@ -137,6 +137,13 @@ class OpusDeviceLib:
     # -- numeric_limits --
     def run_numeric_limits(self, Out):
         fn = self._lib.run_numeric_limits
+        fn.restype = None
+        fn.argtypes = [_VP]
+        fn(self._ptr(Out))
+
+    # -- finfo --
+    def run_finfo(self, Out):
+        fn = self._lib.run_finfo
         fn.restype = None
         fn.argtypes = [_VP]
         fn(self._ptr(Out))
@@ -1298,6 +1305,103 @@ def test_numeric_limits(mod):
     return 0
 
 
+def test_finfo(mod):
+    """Test opus::finfo against torch.finfo reference values (bitwise comparison)."""
+    import struct
+
+    device = torch.device("cuda")
+
+    N_TYPES = 7  # fp32, fp16, bf16, fp8, bf8, fp4, e8m0
+    FIELDS_PER_TYPE = 5  # eps, max, min, tiny, bits
+    N = N_TYPES * FIELDS_PER_TYPE
+    out = torch.zeros(N, device=device, dtype=torch.float32)
+    mod.run_finfo(out)
+    raw = out.cpu()
+
+    fails = 0
+    fields = ["eps", "max", "min", "tiny", "bits"]
+
+    def float_to_u32(f):
+        return struct.unpack("I", struct.pack("f", float(f)))[0]
+
+    def u32_to_float(u):
+        return struct.unpack("f", struct.pack("I", u))[0]
+
+    def ref_from_torch_finfo(dtype):
+        fi = torch.finfo(dtype)
+        return {
+            "eps": fi.eps,
+            "max": fi.max,
+            "min": fi.min,
+            "tiny": fi.tiny,
+        }
+
+    fp8_dtype = _get_fp8_dtype()
+    bf8_dtype = _get_bf8_dtype()
+
+    # (name, offset, torch_dtype_or_None, manual_ref_or_None)
+    # For fp4 and e8m0 there is no torch.finfo, so we provide manual reference.
+    fp4_ref = {"eps": 0.5, "max": 6.0, "min": -6.0, "tiny": 1.0, "bits": 4}
+    e8m0_ref = {
+        "eps": 1.0,
+        "max": 2.0**127,
+        "min": 2.0**-127,
+        "tiny": 2.0**-127,
+        "bits": 8,
+    }
+
+    type_table = [
+        ("fp32", 0, torch.float32, 32, None),
+        ("fp16", 5, torch.float16, 16, None),
+        ("bf16", 10, torch.bfloat16, 16, None),
+        ("fp8", 15, fp8_dtype, 8, None),
+        ("bf8", 20, bf8_dtype, 8, None),
+        ("fp4", 25, None, 4, fp4_ref),
+        ("e8m0", 30, None, 8, e8m0_ref),
+    ]
+
+    for name, offset, dtype, expected_bits, manual_ref in type_table:
+        if dtype is not None:
+            ref = ref_from_torch_finfo(dtype)
+            ref["bits"] = expected_bits
+        else:
+            ref = manual_ref
+
+        type_fails = 0
+        for j, field in enumerate(fields):
+            actual_f32 = raw[offset + j].item()
+            if field == "bits":
+                # bits is stored as __int_as_float(bits), extract the int
+                actual_val = struct.unpack("I", struct.pack("f", actual_f32))[0]
+                expected_val = ref["bits"]
+                if actual_val != expected_val:
+                    print(
+                        f"    {name}.{field}: {actual_val} != expected {expected_val}"
+                    )
+                    type_fails += 1
+            else:
+                expected_f32 = float(ref[field])
+                actual_bits = float_to_u32(actual_f32)
+                expected_bits_val = float_to_u32(expected_f32)
+                if actual_bits != expected_bits_val:
+                    print(
+                        f"    {name}.{field}: 0x{actual_bits:08X} ({actual_f32}) "
+                        f"!= expected 0x{expected_bits_val:08X} ({expected_f32})"
+                    )
+                    type_fails += 1
+        if type_fails == 0:
+            print(f"  PASS: finfo<{name}> (all {len(fields)} fields)")
+        else:
+            print(f"  FAIL: finfo<{name}> ({type_fails} field(s) wrong)")
+            fails += type_fails
+
+    if fails:
+        print(f"  finfo: {fails} field(s) FAILED")
+        return 1
+    print("  PASS: finfo all types correct")
+    return 0
+
+
 def test_wb_cumulative(mod):
     """Test workgroup_barrier wait_lt + inc: N workgroups contribute i+1 sequentially."""
     device = torch.device("cuda")
@@ -1395,6 +1499,7 @@ def main():
     failures += test_free_func_vector_add(mod)
     failures += test_predicated_async_load(mod)
     failures += test_numeric_limits(mod)
+    failures += test_finfo(mod)
     failures += test_mdiv(mod)
     failures += test_wb_cumulative(mod)
     failures += test_wb_streamk_reduce(mod)

@@ -828,7 +828,8 @@ REGISTER_DTYPE(i8  , signed char)
 REGISTER_DTYPE(u8  , unsigned char)
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////
-// numeric_limits -- min/max/lowest/quiet_nan/infinity for all registered dtypes
+// numeric_limits -- returns min/max/lowest/quiet_nan/infinity in the *original* dtype
+// (see finfo below for float-valued properties like eps/max/min/tiny)
 template<typename T> struct numeric_limits;
 
 template<> struct numeric_limits<fp32_t> {
@@ -858,10 +859,10 @@ template<> struct numeric_limits<bf16_t> {
 // fp8 E4M3: gfx950=OCP(ieee-like, NaN=0x7F), gfx942=fnuz(NaN=0x80). No infinity in either format.
 // NOTE: __builtin_bit_cast with _BitInt(8) is not yet constexpr in clang, so use static_cast via signed char.
 template<> struct numeric_limits<fp8_t> {
-#if defined(__gfx950__)
-    static constexpr unsigned char bin_min = 0x08, bin_max = 0x7E, bin_lowest = 0xFE, bin_qnan = 0x7F, bin_inf = 0x00;
-#else
+#if defined(__gfx942__)
     static constexpr unsigned char bin_min = 0x08, bin_max = 0x7F, bin_lowest = 0xFF, bin_qnan = 0x80, bin_inf = 0x00;
+#else
+    static constexpr unsigned char bin_min = 0x08, bin_max = 0x7E, bin_lowest = 0xFE, bin_qnan = 0x7F, bin_inf = 0x00;
 #endif
     OPUS_H_D static constexpr fp8_t min()       { return static_cast<fp8_t>(static_cast<signed char>(bin_min)); }
     OPUS_H_D static constexpr fp8_t max()       { return static_cast<fp8_t>(static_cast<signed char>(bin_max)); }
@@ -871,10 +872,10 @@ template<> struct numeric_limits<fp8_t> {
 };
 // bf8 E5M2: gfx950=OCP(ieee, has inf=0x7C, NaN=0x7E), gfx942=fnuz(no inf, NaN=0x80)
 template<> struct numeric_limits<bf8_t> {
-#if defined(__gfx950__)
-    static constexpr unsigned char bin_min = 0x04, bin_max = 0x7B, bin_lowest = 0xFB, bin_qnan = 0x7F, bin_inf = 0x7C;
-#else
+#if defined(__gfx942__)
     static constexpr unsigned char bin_min = 0x04, bin_max = 0x7F, bin_lowest = 0xFF, bin_qnan = 0x80, bin_inf = 0x00;
+#else
+    static constexpr unsigned char bin_min = 0x04, bin_max = 0x7B, bin_lowest = 0xFB, bin_qnan = 0x7F, bin_inf = 0x7C;
 #endif
     OPUS_H_D static constexpr bf8_t min()       { return static_cast<bf8_t>(bin_min); }
     OPUS_H_D static constexpr bf8_t max()       { return static_cast<bf8_t>(bin_max); }
@@ -925,6 +926,61 @@ template<> struct numeric_limits<u8_t> {
     OPUS_H_D static constexpr u8_t lowest()    { return 0; }
     OPUS_H_D static constexpr u8_t quiet_nan() { return 0; }
     OPUS_H_D static constexpr u8_t infinity()  { return 0; }
+};
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
+// finfo -- like torch.finfo: eps/max/min/tiny as float, bits as int
+template<typename T> struct finfo;
+
+template<> struct finfo<fp32_t> {
+    static constexpr int bits = 32;
+    OPUS_H_D static constexpr float eps()  { return __builtin_bit_cast(float, 0x34000000u); }  // 2^-23
+    OPUS_H_D static constexpr float max()  { return __builtin_bit_cast(float, 0x7F7FFFFFu); }  // 3.4028235e+38
+    OPUS_H_D static constexpr float min()  { return __builtin_bit_cast(float, 0xFF7FFFFFu); }  // -3.4028235e+38
+    OPUS_H_D static constexpr float tiny() { return __builtin_bit_cast(float, 0x00800000u); }  // 2^-126
+};
+template<> struct finfo<fp16_t> {
+    static constexpr int bits = 16;
+    OPUS_H_D static constexpr float eps()  { return __builtin_bit_cast(float, 0x3A800000u); }  // 2^-10 = 9.765625e-4
+    OPUS_H_D static constexpr float max()  { return __builtin_bit_cast(float, 0x477FE000u); }  // 65504.0
+    OPUS_H_D static constexpr float min()  { return __builtin_bit_cast(float, 0xC77FE000u); }  // -65504.0
+    OPUS_H_D static constexpr float tiny() { return __builtin_bit_cast(float, 0x38800000u); }  // 2^-14
+};
+template<> struct finfo<bf16_t> {
+    static constexpr int bits = 16;
+    OPUS_H_D static constexpr float eps()  { return __builtin_bit_cast(float, 0x3C000000u); }  // 2^-7 = 0.0078125
+    OPUS_H_D static constexpr float max()  { return __builtin_bit_cast(float, 0x7F7F0000u); }  // 3.389531e+38
+    OPUS_H_D static constexpr float min()  { return __builtin_bit_cast(float, 0xFF7F0000u); }  // -3.389531e+38
+    OPUS_H_D static constexpr float tiny() { return __builtin_bit_cast(float, 0x00800000u); }  // 2^-126
+};
+// fp8 E4M3: gfx950=OCP(float8_e4m3fn, bias=7), gfx942=fnuz(float8_e4m3fnuz, bias=8)
+template<> struct finfo<fp8_t> {
+    static constexpr int bits = 8;
+    OPUS_H_D static constexpr float eps()  { return __builtin_bit_cast(float, 0x3E000000u); }  // 2^-3 = 0.125
+#if defined(__gfx942__)
+    OPUS_H_D static constexpr float max()  { return __builtin_bit_cast(float, 0x43700000u); }  // 240.0
+    OPUS_H_D static constexpr float min()  { return __builtin_bit_cast(float, 0xC3700000u); }  // -240.0
+    OPUS_H_D static constexpr float tiny() { return __builtin_bit_cast(float, 0x3C000000u); }  // 2^-7 = 0.0078125
+#else
+    OPUS_H_D static constexpr float max()  { return __builtin_bit_cast(float, 0x43E00000u); }  // 448.0
+    OPUS_H_D static constexpr float min()  { return __builtin_bit_cast(float, 0xC3E00000u); }  // -448.0
+    OPUS_H_D static constexpr float tiny() { return __builtin_bit_cast(float, 0x3C800000u); }  // 2^-6 = 0.015625
+#endif
+};
+// bf8 E5M2: gfx950=OCP(float8_e5m2, bias=15), gfx942=fnuz(float8_e5m2fnuz, bias=16)
+template<> struct finfo<bf8_t> {
+    static constexpr int bits = 8;
+#if defined(__gfx942__)
+    OPUS_H_D static constexpr float eps()  { return __builtin_bit_cast(float, 0x3E000000u); }  // 2^-3 = 0.125
+    OPUS_H_D static constexpr float max()  { return __builtin_bit_cast(float, 0x47600000u); }  // 57344.0
+    OPUS_H_D static constexpr float min()  { return __builtin_bit_cast(float, 0xC7600000u); }  // -57344.0
+    OPUS_H_D static constexpr float tiny() { return __builtin_bit_cast(float, 0x38000000u); }  // 2^-15
+#else
+    OPUS_H_D static constexpr float eps()  { return __builtin_bit_cast(float, 0x3E800000u); }  // 2^-2 = 0.25
+    OPUS_H_D static constexpr float max()  { return __builtin_bit_cast(float, 0x47600000u); }  // 57344.0
+    OPUS_H_D static constexpr float min()  { return __builtin_bit_cast(float, 0xC7600000u); }  // -57344.0
+    OPUS_H_D static constexpr float tiny() { return __builtin_bit_cast(float, 0x38800000u); }  // 2^-14
+#endif
 };
 
 template<typename C, typename... S, std::enable_if_t<is_dtype_v<C> && (is_constant_v<S> && ...), bool> = true>
@@ -1038,6 +1094,24 @@ OPUS_DEFINE_DPACKS(int4_t , unsigned char, 4, true)           // int4x2
 OPUS_DEFINE_DPACKS(uint4_t, unsigned char, 4, false)          // uint4x2
 OPUS_DEFINE_FPACKS(fp4_t,   unsigned char, 4, 2, 1, true)     // fp4x2
 OPUS_DEFINE_FPACKS(e8m0_t,  unsigned char, 8, 8, 0, false)    // fp4x2
+
+// finfo specializations for subbyte/packed types (defined after OPUS_DEFINE_FPACKS)
+// fp4 E2M1: 1 sign, 2 exp, 1 mantissa, bias=1
+template<> struct finfo<fp4_t> {
+    static constexpr int bits = 4;
+    OPUS_H_D static constexpr float eps()  { return __builtin_bit_cast(float, 0x3F000000u); }  // 2^-1 = 0.5
+    OPUS_H_D static constexpr float max()  { return __builtin_bit_cast(float, 0x40C00000u); }  // 6.0
+    OPUS_H_D static constexpr float min()  { return __builtin_bit_cast(float, 0xC0C00000u); }  // -6.0
+    OPUS_H_D static constexpr float tiny() { return __builtin_bit_cast(float, 0x3F800000u); }  // 1.0
+};
+// e8m0: 8-bit exponent only, unsigned, bias=127
+template<> struct finfo<e8m0_t> {
+    static constexpr int bits = 8;
+    OPUS_H_D static constexpr float eps()  { return __builtin_bit_cast(float, 0x3F800000u); }  // 1.0
+    OPUS_H_D static constexpr float max()  { return __builtin_bit_cast(float, 0x7F000000u); }  // 2^127
+    OPUS_H_D static constexpr float min()  { return __builtin_bit_cast(float, 0x00400000u); }  // 2^-127 (unsigned, no negative)
+    OPUS_H_D static constexpr float tiny() { return __builtin_bit_cast(float, 0x00400000u); }  // 2^-127
+};
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wuninitialized"
