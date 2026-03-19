@@ -23,7 +23,6 @@ import triton
 import math
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import (
     gemm_a16w16,
-    _is_gluon_available,
     _resolve_backend,
 )
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
