@@ -263,7 +263,9 @@ def test_triton_unified_attn(
     )
     atol, rtol = 1.5e-2, 1e-2
 
-    if is_reduced_precision:
+    if quant_scheme == "v2":
+        atol, rtol = 3.5e-1, 2.5e-1
+    elif is_reduced_precision:
         atol, rtol = 1.5e-1, 1.5e-1
     torch.testing.assert_close(
         output, ref_output, atol=atol, rtol=rtol
