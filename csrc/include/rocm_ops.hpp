@@ -324,6 +324,7 @@ namespace py = pybind11;
           "                     Tensor q_nope, Tensor q_pe,"                        \
           "                     Tensor kv_c, Tensor! k_pe,"                          \
           "                     Tensor k_weight,"                                   \
+          "                     Tensor? q_weight,"                                  \
           "                     Tensor! kv_cache,"                                  \
           "                     Tensor! q_out,"                                     \
           "                     Tensor slot_mapping,"                               \
@@ -340,6 +341,7 @@ namespace py = pybind11;
           py::arg("kv_c"),                                                          \
           py::arg("k_pe"),                                                          \
           py::arg("k_weight"),                                                      \
+          py::arg("q_weight"),                                                      \
           py::arg("kv_cache"),                                                      \
           py::arg("q_out"),                                                         \
           py::arg("slot_mapping"),                                                  \

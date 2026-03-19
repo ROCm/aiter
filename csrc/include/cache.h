@@ -109,6 +109,7 @@ void fused_qk_norm_rope_group_quant_concat_and_cache_mla(
     torch::Tensor& kv_c,          // [num_tokens, k_num_heads, kv_lora_rank]
     torch::Tensor& k_pe,          // [num_tokens, k_num_heads, pe_dim]
     torch::Tensor& k_weight,      // [kv_lora_rank] RMSNorm weights for K
+    std::optional<torch::Tensor> q_weight_opt,  // [kv_lora_rank] RMSNorm weights for Q (optional)
     torch::Tensor& kv_cache,      // [num_blocks, block_size, k_num_heads, kv_lora_rank + pe_dim)]
     torch::Tensor& q_out,         // [num_tokens, num_heads, qk_lora_rank+pe_dim]
     torch::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
