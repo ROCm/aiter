@@ -110,7 +110,7 @@ def fp8_assert_close(
     [(1, 1), (4, 4), (128, 128), (1, 2), (32, 16), (64, 128)],
 )
 @pytest.mark.parametrize(
-    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (128, 8)]
+    "NUM_Q_HEADS, NUM_K_HEADS", [(16, 1), (16, 16), (128, 8)]
 )
 @pytest.mark.parametrize("HEAD_SZ", [64, 128])
 # TODO: Uncomment when merging. It is not important for launch.
