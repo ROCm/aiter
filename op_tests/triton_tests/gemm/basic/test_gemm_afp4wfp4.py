@@ -233,8 +233,13 @@ def run_triton(
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
+# TODO: We need to reduce number of tests producing float16. They are not high priority.
+# And not critical for launch models. Fix this by making separate float16 UTs with reduced scope.
+#@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
+# We need to reduce scope to launch models. Those don't have any other layout but TN.
+#@pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
+@pytest.mark.parametrize("layout", ["TN"])
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize(
     "shuffle_weight_scales",
