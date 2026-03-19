@@ -500,12 +500,21 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         #pragma unroll
         for(int i = 0; i < async_load_num; i++)
         {
-            // buffer_hash.async_load(smooth_scale_map_hash_shared + threadIdx.x + i * block_size, threadIdx.x + i * block_size);
-            const int lds_ptr_sgpr = __builtin_amdgcn_readfirstlane((reinterpret_cast<uintptr_t>((smooth_scale_map_hash_shared + threadIdx.x / WARP_SIZE * WARP_SIZE + i * block_size))));
-            uint32_t offset = threadIdx.x * sizeof(int) + i * block_size * sizeof(int);
-            asm volatile( "s_mov_b32 m0 %0\n\t"
+            #if defined(__gfx12__)
+                int idx = threadIdx.x + i * block_size;
+                if(idx < smooth_scale_map_hash_size)
+                {
+                    // RDNA4 doesn't support buffer_load_* with LDS modifier
+                    // Use standard global load to VGPR then write to LDS
+                    smooth_scale_map_hash_shared[idx] = smooth_scale_map_hash[idx];
+                }
+            #else
+                const int lds_ptr_sgpr = __builtin_amdgcn_readfirstlane((reinterpret_cast<uintptr_t>((smooth_scale_map_hash_shared + threadIdx.x / WARP_SIZE * WARP_SIZE + i * block_size))));
+                uint32_t offset = threadIdx.x * sizeof(int) + i * block_size * sizeof(int);
+                asm volatile( "s_mov_b32 m0 %0\n\t"
                 "buffer_load_dword %1, %2, 0 offen offset:0 lds\n\t"
                 ::"s"(lds_ptr_sgpr), "v"(offset), "s"(buffer_hash.cached_rsrc): "memory", "m0");
+            #endif
         }
     }
 
@@ -1210,12 +1219,21 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v1(DTYPE_O* __restrict_
         #pragma unroll
         for(int i = 0; i < async_load_num; i++)
         {
-            // buffer_hash.async_load(smooth_scale_map_hash_shared + threadIdx.x + i * block_size, threadIdx.x + i * block_size);
-            const int lds_ptr_sgpr = __builtin_amdgcn_readfirstlane((reinterpret_cast<uintptr_t>((smooth_scale_map_hash_shared + threadIdx.x / WARP_SIZE * WARP_SIZE + i * block_size))));
-            uint32_t offset = threadIdx.x * sizeof(int) + i * block_size * sizeof(int);
-            asm volatile( "s_mov_b32 m0 %0\n\t"
+            #if defined(__gfx12__)
+                int idx = threadIdx.x + i * block_size;
+                if(idx < smooth_scale_map_hash_size)
+                {
+                    // RDNA4 doesn't support buffer_load_* with LDS modifier
+                    // Use standard global load to VGPR then write to LDS
+                    smooth_scale_map_hash_shared[idx] = smooth_scale_map_hash[idx];
+                }
+            #else
+                const int lds_ptr_sgpr = __builtin_amdgcn_readfirstlane((reinterpret_cast<uintptr_t>((smooth_scale_map_hash_shared + threadIdx.x / WARP_SIZE * WARP_SIZE + i * block_size))));
+                uint32_t offset = threadIdx.x * sizeof(int) + i * block_size * sizeof(int);
+                asm volatile( "s_mov_b32 m0 %0\n\t"
                 "buffer_load_dword %1, %2, 0 offen offset:0 lds\n\t"
                 ::"s"(lds_ptr_sgpr), "v"(offset), "s"(buffer_hash.cached_rsrc): "memory", "m0");
+            #endif
         }
     }
     int smscale_map_idx_list = 0;
