@@ -6,11 +6,11 @@ import triton.experimental.gluon.language as gl
 
 
 @gluon.jit
-def issue_l2_prefetch(desc, offsets, pred=True):
+def issue_l2_prefetch(desc, offsets, pred=True, SPECULATIVE: gl.constexpr = True):
     """
     Prefetch a single 2D descriptor tile at the given [row, col] offsets.
     """
-    gl.amd.gfx1250.tdm.prefetch(desc, offsets, pred=pred)
+    gl.amd.gfx1250.tdm.prefetch(desc, offsets, pred=pred, speculative=SPECULATIVE)
 
 
 @gluon.jit
@@ -44,6 +44,6 @@ def gemm_l2_prefetch_prologue(distance, load_idx, a_desc, b_desc, off_am, off_bn
     if distance <= NUM_BUFFERS:
         return
 
-    for i in gl.static_range(NUM_BUFFERS - distance):
+    for i in gl.static_range(distance - NUM_BUFFERS):
         gemm_l2_prefetch(NUM_BUFFERS + i, load_idx, a_desc, b_desc, off_am, off_bn, BLOCK_K,
                          TRANSPOSE_A, TRANSPOSE_B, pred)

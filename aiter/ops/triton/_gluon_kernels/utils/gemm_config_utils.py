@@ -5,15 +5,12 @@ import functools
 import json
 import os
 
-from aiter.ops.gluon.utils.core import AITER_GLUON_CONFIGS_PATH
+from aiter.ops.triton._gluon_kernels.utils.core import AITER_GLUON_CONFIGS_PATH
 
-# Standard bounds for M_LEQ_x keys (tuple for hashability with LRU cache)
 STANDARD_M_BOUNDS = (4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
 
-# Gluon kernels only target gfx1250
 _ARCH = "gfx1250"
 
-# This flag should be set to True, unless it is being used for debugging
 USE_LRU_CACHE = True
 
 
@@ -72,7 +69,6 @@ def get_gemm_config(
         Dictionary with the config params,
         bool indicating if the config is tuned (True if tuned, False otherwise)
     """
-    # Input validation
     assert M >= 0, "M must be positive."
     assert N is None or N > 0, "N must be positive when provided."
     assert K is None or K > 0, "K must be positive when provided."
@@ -90,7 +86,6 @@ def get_gemm_config(
     if cache_key not in get_gemm_config._config_cache:
         get_gemm_config._config_cache[cache_key] = {}
 
-        # Load default config (must exist)
         fpath = f"{AITER_GLUON_CONFIGS_PATH}/gemm/{_ARCH}-{config_name}.json"
         _load_config_file(
             get_gemm_config._config_cache,
@@ -102,7 +97,6 @@ def get_gemm_config(
 
     config_dict_key = "default"
 
-    # Handle custom specialized filename (for fused kernels with multiple N dims)
     if specialized_filename is not None:
         spec_key = specialized_filename
         if spec_key not in get_gemm_config._config_cache[cache_key]:
@@ -117,7 +111,6 @@ def get_gemm_config(
     elif N is not None and K is not None:
         nk_key = f"{N}_{K}"
         if nk_key not in get_gemm_config._config_cache[cache_key]:
-            # load specialized config
             fpath = (
                 f"{AITER_GLUON_CONFIGS_PATH}/gemm/{_ARCH}-{config_name}-N={N}-K={K}.json"
             )
@@ -130,16 +123,13 @@ def get_gemm_config(
 
     config_dict = get_gemm_config._config_cache[cache_key][config_dict_key]
 
-    # use standard bounds unless custom bounds are passed
     search_bounds = bounds if bounds is not None else STANDARD_M_BOUNDS
 
-    # Search for M_LEQ_x keys
     for bound in search_bounds:
         key = f"M_LEQ_{bound}"
         if M <= bound and key in config_dict:
             return dict(config_dict[key]), config_dict_key != "default"
 
-    # Search for M_GEQ_x keys
     for bound in reversed(search_bounds):
         key = f"M_GEQ_{bound}"
         if M >= bound and key in config_dict:
