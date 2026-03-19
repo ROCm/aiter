@@ -19,6 +19,8 @@ def topk_softmax(
     token_expert_indices: Tensor,
     gating_output: Tensor,
     need_renorm: bool,
+    num_shared_experts: int = 0,
+    shared_expert_scoring_func: str = "",
 ) -> None: ...
 
 

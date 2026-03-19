@@ -179,7 +179,9 @@ void topk_softmax(torch::Tensor& topk_weights,
                   torch::Tensor& topk_indices,
                   torch::Tensor& token_expert_indices,
                   torch::Tensor& gating_output,
-                  bool need_renorm);
+                  bool need_renorm,
+                  int num_shared_experts                        = 0,
+                  const std::string& shared_expert_scoring_func = "");
 
 void moe_align_block_size(torch::Tensor topk_ids,
                           int64_t num_experts,
