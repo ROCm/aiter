@@ -33,6 +33,7 @@ _CU_SOURCES = [
     "test_mdiv.cu",
     "test_numeric_limits.cu",
     "test_workgroup_barrier.cu",
+    "test_finfo.cu",
 ]
 
 
