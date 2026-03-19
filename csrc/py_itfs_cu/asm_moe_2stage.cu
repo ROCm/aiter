@@ -2,13 +2,8 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
-#include <torch/all.h>
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "aiter_hip_common.h"
-#include "moe_op.h"
 #include "asm_fmoe_2stages_configs.hpp"
-#include "py_itfs_common.h"
 
 struct __attribute__((packed)) KernelArgs
 {
@@ -60,51 +55,51 @@ struct __attribute__((packed)) KernelArgs
     p2 _p22;
 };
 
-static CFG *get_cfg(torch::Tensor &inp, torch::Tensor &out, torch::Tensor &w1, QuantType &quant_type, bool do_weight)
+static CFG *get_cfg(AiterTensor *inp, AiterTensor *out, AiterTensor *w1, QuantType quant_type, bool do_weight)
 {
-    int E = w1.size(0);
-    int dim1 = w1.size(1);
-
-    if ((inp.scalar_type() == torch_fp8) &&
-        (w1.scalar_type() == torch_fp8) &&
-        out.scalar_type() == at::ScalarType::BFloat16 &&
+    if (inp->dtype() == AITER_DTYPE_fp8 &&
+        w1->dtype() == AITER_DTYPE_fp8 &&
+        out->dtype() == AITER_DTYPE_bf16 &&
         quant_type == QuantType::per_Token &&
         do_weight)
     {
         return &cfg_fmoe_stage1_bf16_pertokenFp8_doweight_g1u1;
     }
-    else if ((inp.scalar_type() == torch_fp8) &&
-             (w1.scalar_type() == torch_fp8) &&
-             out.scalar_type() == at::ScalarType::BFloat16 &&
-             quant_type == QuantType::per_Token && 
+    else if (inp->dtype() == AITER_DTYPE_fp8 &&
+             w1->dtype() == AITER_DTYPE_fp8 &&
+             out->dtype() == AITER_DTYPE_bf16 &&
+             quant_type == QuantType::per_Token &&
              !do_weight)
     {
         return &cfg_fmoe_stage1_bf16_pertokenFp8_g1u1;
     }
-    else if (inp.scalar_type() == at::ScalarType::Char &&
-             w1.scalar_type() == at::ScalarType::Char &&
-             out.scalar_type() == at::ScalarType::BFloat16 &&
-             quant_type == QuantType::per_Token && 
+    else if (inp->dtype() == AITER_DTYPE_i8 &&
+             w1->dtype() == AITER_DTYPE_i8 &&
+             out->dtype() == AITER_DTYPE_bf16 &&
+             quant_type == QuantType::per_Token &&
              !do_weight)
     {
         return &cfg_fmoe_stage1_bf16_pertokenInt8_g1u1;
     }
-    else if ((inp.scalar_type() == torch_fp8) &&
-             (w1.scalar_type() == torch_fp8) &&
-             (out.scalar_type() == torch_fp8) &&
-             quant_type == QuantType::per_1x128 && 
+    else if (inp->dtype() == AITER_DTYPE_fp8 &&
+             w1->dtype() == AITER_DTYPE_fp8 &&
+             out->dtype() == AITER_DTYPE_fp8 &&
+             quant_type == QuantType::per_1x128 &&
              !do_weight)
     {
         return &cfg_fmoe_stage1_bf16_pertokenFp8_blockscale_g1u1;
     }
     else
     {
-        TORCH_CHECK(false, __func__, " Unsupported input_type:", inp.scalar_type(), ", weight_type:", w1.scalar_type(),
-                    ", out_type:", out.scalar_type(), ", quant_type:", static_cast<int>(quant_type), ", do_weight:", do_weight);
+        AITER_CHECK(false, __func__, " Unsupported input_type:", AiterDtype_to_str(inp->dtype()),
+                    ", weight_type:", AiterDtype_to_str(w1->dtype()),
+                    ", out_type:", AiterDtype_to_str(out->dtype()),
+                    ", quant_type:", static_cast<int>(quant_type), ", do_weight:", do_weight);
+        return nullptr;
     }
 };
 
-std::string get_heuristic_kernel(int m_num, int N, int blockk_size, CFG *cfgs, std::string arch_id)
+static std::string get_heuristic_kernel(int m_num, int N, int blockk_size, CFG *cfgs, std::string arch_id)
 {
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
@@ -146,49 +141,51 @@ std::string get_heuristic_kernel(int m_num, int N, int blockk_size, CFG *cfgs, s
     }
     return selected;
 }
-void moe_stage1_g1u1(
-    torch::Tensor &input,             // [token_cnt, model_dim] M,K
-    torch::Tensor &w1,                // [expert, inter_dim*2, model_dim] N,K
-    torch::Tensor &w2,                // [expert, model_dim, inter_dim]
-    torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
-    torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
-    torch::Tensor &num_valid_ids,     // [1]
-    torch::Tensor &out,               // [token_cnt, topk, inter_dim*2]
-    int inter_dim,
-    std::string &kernelName,
-    int block_m,
-    int ksplit = 0,
-    ActivationType activation = ActivationType::Silu,
-    QuantType quant_type = QuantType::No,
-    std::optional<torch::Tensor> a1_scale = std::nullopt,      // [token_cnt, 1], token scale
-    std::optional<torch::Tensor> w1_scale = std::nullopt,      // [expert, 1, inter_dim], gate(up) scale
-    std::optional<torch::Tensor> sorted_weights = std::nullopt // [max_num_tokens_padded], do_weight==true need
-)
-{
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    CFG *config_map = get_cfg(input, out, w1, quant_type, sorted_weights.has_value());
+extern "C" __attribute__((visibility("default"))) void moe_stage1_g1u1(
+    AiterTensor *input,             // [token_cnt, model_dim] M,K
+    AiterTensor *w1,                // [expert, inter_dim*2, model_dim] N,K
+    AiterTensor *w2,                // [expert, model_dim, inter_dim]
+    AiterTensor *sorted_token_ids,  // [max_num_tokens_padded]
+    AiterTensor *sorted_expert_ids, // [max_num_m_blocks]
+    AiterTensor *num_valid_ids,     // [1]
+    AiterTensor *out,               // [token_cnt, topk, inter_dim*2]
+    int inter_dim,
+    const char *kernelName,
+    int block_m,
+    int ksplit,
+    int activation,
+    int quant_type,
+    AiterTensor *a1_scale,       // [token_cnt, 1], token scale
+    AiterTensor *w1_scale,       // [expert, 1, inter_dim], gate(up) scale
+    AiterTensor *sorted_weights, // [max_num_tokens_padded], do_weight==true need
+    hipStream_t stream)
+{
+    ActivationType act = static_cast<ActivationType>(activation);
+    QuantType qt = static_cast<QuantType>(quant_type);
+
+    CFG *config_map = get_cfg(input, out, w1, qt, sorted_weights != nullptr);
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
-    int model_dim = input.size(1);
+    int model_dim = input->size(1);
     int hidden_dim = inter_dim;
-    int sub_X_cnt = sorted_expert_ids.size(0);
+    int sub_X_cnt = sorted_expert_ids->size(0);
     std::string arch_id = get_gpu_arch();
-    kernelName = !kernelName.empty() ? arch_id + kernelName : "";
-    if (kernelName.empty())
+    std::string kernelNameStr = (kernelName && kernelName[0] != '\0') ? arch_id + kernelName : "";
+    if (kernelNameStr.empty())
     {
-        kernelName = get_heuristic_kernel(sub_X_cnt, inter_dim, block_m, config_map, arch_id);
+        kernelNameStr = get_heuristic_kernel(sub_X_cnt, inter_dim, block_m, config_map, arch_id);
     }
 
     AiterAsmKernel *impl_ptr = nullptr;
-    auto it = config_map->find(kernelName);
+    auto it = config_map->find(kernelNameStr);
     if (it != config_map->end())
     {
         const auto &cfg = it->second;
         const char *name = cfg.knl_name.c_str();
         const char *co_name = cfg.co_name.c_str();
 
-        TORCH_CHECK(inter_dim % cfg.tile_n == 0, "ASM kernel " + std::string(name) + " is not supported for inter_dim = " + std::to_string(inter_dim));
+        AITER_CHECK(inter_dim % cfg.tile_n == 0,
+                    "ASM kernel " + std::string(name) + " is not supported for inter_dim = " + std::to_string(inter_dim));
 
         auto result = impl_ptr_map.emplace(name, nullptr);
         if (result.second)
@@ -198,44 +195,41 @@ void moe_stage1_g1u1(
         impl_ptr = result.first->second.get();
     }
     else
-        TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
+        AITER_CHECK(false, __func__, " not find kernel " + kernelNameStr);
 
-    int token_cnt = input.size(0);
-    int topk = out.size(1);
+    int token_cnt = input->size(0);
+    int topk = out->size(1);
 
-    // const char *enable_vskip = std::getenv("AITER_ENABLE_VSKIP");
-
-    int dim = w2.size(1);
-    int eprt = w1.size(0);
+    int dim = w2->size(1);
+    int eprt = w1->size(0);
     const auto &cfg = it->second;
     uint32_t sub_GU = cfg.tile_n;
-    TORCH_CHECK(block_m == cfg.tile_m, __func__, " kernel: ", cfg.knl_name, " need block_m == ", cfg.tile_m);
+    AITER_CHECK(block_m == cfg.tile_m, __func__, " kernel: ", cfg.knl_name, " need block_m == ", cfg.tile_m);
 
-    int stride_X = input.stride(0) * input.element_size();
-    int stride_GU = dim * w1.element_size();
+    int stride_X = input->stride(0) * input->element_size();
+    int stride_GU = dim * w1->element_size();
 
     int stride_expert_GU = stride_GU * inter_dim;
-    int stride_expert_GUDQN = w1_scale.has_value() ? w1_scale.value().stride(0) * sizeof(float) : 0;
+    int stride_expert_GUDQN = w1_scale ? w1_scale->stride(0) * sizeof(float) : 0;
     int stride_expert_SMTDQN = inter_dim * sizeof(float);
-    int stride_O = out.stride(0) * out.element_size();
-    if (inter_dim * 2 == w1.size(1))
+    int stride_O = out->stride(0) * out->element_size();
+    if (inter_dim * 2 == w1->size(1))
     {
         stride_expert_GU *= 2;
     }
 
     KernelArgs args;
     size_t arg_size = sizeof(args);
-    args.ptr_O = out.data_ptr();
-    args.ptr_X = input.data_ptr();
-    args.ptr_GU = w1.data_ptr();
-    args.ptr_XC = num_valid_ids.data_ptr();
+    args.ptr_O = out->ptr;
+    args.ptr_X = input->ptr;
+    args.ptr_GU = w1->ptr;
+    args.ptr_XC = num_valid_ids->ptr;
 
-    args.ptr_XQ = a1_scale.has_value() ? a1_scale.value().data_ptr() : nullptr;
-    args.ptr_GUQ = w1_scale.has_value() ? w1_scale.value().data_ptr() : nullptr;
-    // args.ptr_SMQ = w2_smooth_qnt.has_value() ? w2_smooth_qnt.value().data_ptr() : nullptr;
+    args.ptr_XQ = a1_scale ? a1_scale->ptr : nullptr;
+    args.ptr_GUQ = w1_scale ? w1_scale->ptr : nullptr;
 
-    args.ptr_STP = sorted_token_ids.data_ptr();
-    args.ptr_SEP = sorted_expert_ids.data_ptr();
+    args.ptr_STP = sorted_token_ids->ptr;
+    args.ptr_SEP = sorted_expert_ids->ptr;
     args.dim = dim;
     args.hidden_dim = inter_dim;
     args.token_cnt = token_cnt;
@@ -248,11 +242,11 @@ void moe_stage1_g1u1(
     args.eSMQs = stride_expert_SMTDQN;
     args.topk = topk;
     args.splitk = ksplit;
-    args.activation = static_cast<int>(activation);
-    args.ptr_SW = sorted_weights.has_value() ? sorted_weights.value().data_ptr() : nullptr;
+    args.activation = static_cast<int>(act);
+    args.ptr_SW = sorted_weights ? sorted_weights->ptr : nullptr;
 
     uint32_t k_num = 1 << ksplit;
-    TORCH_CHECK(model_dim % k_num == 0, __func__, " Unsupported ksplit for model_dim:", model_dim, " k_num:", k_num);
+    AITER_CHECK(model_dim % k_num == 0, __func__, " Unsupported ksplit for model_dim:", model_dim, " k_num:", k_num);
 
     void *config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE,
                       &arg_size, HIP_LAUNCH_PARAM_END};
@@ -261,20 +255,6 @@ void moe_stage1_g1u1(
     int gdx = ((hidden_dim + sub_GU - 1) / sub_GU);
     int gdy = sub_X_cnt;
     int gdz = k_num;
-
-    // std::cout << "dim:" << args.dim << std::endl;
-    // std::cout << "hidden:" << args.hidden_dim << std::endl;
-    // std::cout << "token:" << args.token_cnt << std::endl;
-    // std::cout << "eprt:" << args.eprt_cnt << std::endl;
-    // std::cout << "Xs:" << args.Xs << std::endl;
-    // std::cout << "GUs:" << args.GUs << std::endl;
-    // std::cout << "Os:" << args.Os << std::endl;
-    // std::cout << "GUs:" << args.eGUs << std::endl;
-    // std::cout << "GUQs:" << args.eGUQs << std::endl;
-    // std::cout << "SMQs:" << args.eSMQs << std::endl;
-    // std::cout << "topk:" << args.topk << std::endl;
-    // std::cout << "splitk:" << args.splitk << std::endl;
-    // printf("gdx:%d, gdy:%d, gdz:%d, tgs:%d\n", gdx, gdy, gdz, sub_X_cnt * gdx * gdz);
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,
