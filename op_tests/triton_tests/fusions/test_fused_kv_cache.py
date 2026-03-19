@@ -61,10 +61,8 @@ def test_fused_qk_rope_cat_and_cache_mla(
     )
 
     if cache_dtype == torch.uint8:
-        if arch_info.get_arch() in ["gfx950"]:
-            cache_dtype_actual = torch.float8_e4m3fn
-        else:
-            cache_dtype_actual = torch.float8_e4m3fnuz
+        from aiter.utility.dtypes import fp8
+        cache_dtype_actual = fp8
 
     kv_cache = torch.zeros(
         (num_kv_cahce_tokens, KH, D_lora + D), dtype=cache_dtype, device="cuda"
@@ -226,11 +224,8 @@ def test_fused_qk_rope_reshape_and_cache(
     v = torch.randn_like(k)
 
     if cache_dtype == torch.uint8:
-        if arch_info.get_arch() in ["gfx950"]:
-            cache_dtype_actual = torch.float8_e4m3fn
-        else:
-            cache_dtype_actual = torch.float8_e4m3fnuz
-            pytest.skip("Skipping FP8 dtype cases non-gfx950")
+        from aiter.utility.dtypes import fp8
+        cache_dtype_actual = fp8
 
     if cache_flash:
         key_cache = torch.zeros(
@@ -750,10 +745,8 @@ def test_fused_qk_rope_cosine_cache_llama(
     v = torch.randn_like(k)
 
     if cache_dtype == torch.uint8:
-        if arch_info.get_arch() in ["gfx950"]:
-            cache_dtype_actual = torch.float8_e4m3fn
-        else:
-            cache_dtype_actual = torch.float8_e4m3fnuz
+        from aiter.utility.dtypes import fp8
+        cache_dtype_actual = fp8
 
     if cache_flash:
         key_cache = torch.zeros(

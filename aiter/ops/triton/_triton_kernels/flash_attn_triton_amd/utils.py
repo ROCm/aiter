@@ -49,7 +49,7 @@ __all__ = [
 # -------------------------------
 ArchFamily = Literal["cdna", "rdna"]
 
-CDNA_ARCHS = frozenset({"gfx908", "gfx90a", "gfx940", "gfx941", "gfx942", "gfx950"})
+CDNA_ARCHS = frozenset({"gfx908", "gfx90a", "gfx940", "gfx941", "gfx942", "gfx950", "gfx1250"})
 RDNA_ARCHS = frozenset(
     {
         "gfx1030",
@@ -62,7 +62,7 @@ RDNA_ARCHS = frozenset(
         "gfx1201",
     }
 )
-FP8_ARCHS = frozenset({"gfx942", "gfx950"})
+FP8_ARCHS = frozenset({"gfx942", "gfx950", "gfx1250"})
 
 _RECOMMENDED_FP8_REPLACEMENTS: dict[str, dict[torch.dtype, torch.dtype]] = {
     "gfx942": {
