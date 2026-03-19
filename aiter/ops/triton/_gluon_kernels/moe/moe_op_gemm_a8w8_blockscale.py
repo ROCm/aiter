@@ -281,33 +281,73 @@ def issue_async_tile_loads(
 
 
 @gluon.jit
-def consume_scaled_tile(
-    a_buffer,
-    b_buffer,
-    m,
-    XBlockScale,
+def precompute_scale_offsets(
     stride_x_bs_m,
-    stride_x_bs_k,
     WBlockScale,
     stride_w_bs_e,
-    stride_w_bs_k,
     stride_w_bs_n,
     gathered_m,
     expt_id,
     pid_n,
     N,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCKSCALE_M: gl.constexpr,
+    BLOCKSCALE_N: gl.constexpr,
+    WMMA_LAYOUT: gl.constexpr,
+    PER_ROW_X_SCALE: gl.constexpr,
+    is_x_blockscale: gl.constexpr,
+    is_w_blockscale: gl.constexpr,
+):
+    if is_x_blockscale:
+        if PER_ROW_X_SCALE:
+            a_scale_m_offs = gathered_m * stride_x_bs_m
+        else:
+            a_scale_m_offs = (gathered_m // BLOCKSCALE_M) * stride_x_bs_m
+    else:
+        a_scale_m_offs = gl.zeros(
+            (BLOCK_M,), dtype=gl.int32, layout=gl.SliceLayout(1, WMMA_LAYOUT)
+        )
+
+    if is_w_blockscale:
+        b_scale_base = WBlockScale + expt_id * stride_w_bs_e
+        offs_w_n = pid_n * BLOCK_N + gl.arange(
+            0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
+        )
+        offs_w_n = gl.max_contiguous(
+            gl.multiple_of(offs_w_n % N, BLOCK_N),
+            BLOCK_N,
+        )
+        b_scale_n_offs = (offs_w_n // BLOCKSCALE_N) * stride_w_bs_n
+    else:
+        b_scale_base = WBlockScale
+        b_scale_n_offs = gl.zeros(
+            (BLOCK_N,), dtype=gl.int32, layout=gl.SliceLayout(0, WMMA_LAYOUT)
+        )
+
+    return a_scale_m_offs, b_scale_base, b_scale_n_offs
+
+
+@gluon.jit
+def consume_scaled_tile(
+    a_buffer,
+    b_buffer,
+    m,
+    XBlockScale,
+    stride_x_bs_k,
+    stride_w_bs_k,
+    a_scale_m_offs,
+    b_scale_base,
+    b_scale_n_offs,
     k_offset_start,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
-    BLOCKSCALE_M: gl.constexpr,
-    BLOCKSCALE_N: gl.constexpr,
     BLOCKSCALE_K: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     WMMA_LAYOUT: gl.constexpr,
     DOT_A_LAYOUT: gl.constexpr,
     DOT_B_LAYOUT: gl.constexpr,
-    PER_ROW_X_SCALE: gl.constexpr,
     is_x_blockscale: gl.constexpr,
     is_w_blockscale: gl.constexpr,
 ):
@@ -317,22 +357,11 @@ def consume_scaled_tile(
     cur_b = b_slice.load(layout=DOT_B_LAYOUT)
 
     offs_k_scale = (k_offset_start // BLOCKSCALE_K) + m * gl.cdiv(BLOCK_K, BLOCKSCALE_K)
+
     if is_x_blockscale:
-        if PER_ROW_X_SCALE:
-            # XScale: [M, K_blocks]
-            a_scale_offs = (
-                gathered_m * stride_x_bs_m + offs_k_scale * stride_x_bs_k
-            )
-        else:
-            # XScale: [M_blocks, K_blocks]
-            offs_x_scale_m = gathered_m // BLOCKSCALE_M
-            a_scale_offs = (
-                offs_x_scale_m * stride_x_bs_m
-                + offs_k_scale * stride_x_bs_k
-            )
         cur_a_scale = gl.amd.cdna4.buffer_load(
             ptr=XBlockScale,
-            offsets=a_scale_offs,
+            offsets=a_scale_m_offs + offs_k_scale * stride_x_bs_k,
             cache="",
         )
     else:
@@ -341,23 +370,9 @@ def consume_scaled_tile(
         )
 
     if is_w_blockscale:
-        # WScale: [K_blocks, N_blocks]
-        b_scale_base = WBlockScale + expt_id * stride_w_bs_e
-        offs_w_n = pid_n * BLOCK_N + gl.arange(
-            0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
-        )
-        offs_w_n = gl.max_contiguous(
-            gl.multiple_of(offs_w_n % N, BLOCK_N),
-            BLOCK_N,
-        )
-
-        offs_w_scale_n = offs_w_n // BLOCKSCALE_N
-        b_scale_offs = (
-            offs_k_scale * stride_w_bs_k + offs_w_scale_n * stride_w_bs_n
-        )
         cur_b_scale = gl.amd.cdna4.buffer_load(
             ptr=b_scale_base,
-            offsets=b_scale_offs,
+            offsets=offs_k_scale * stride_w_bs_k + b_scale_n_offs,
             cache="",
         )
     else:
@@ -691,6 +706,26 @@ def _moe_gemm_a8w8_blockscale(
     num_k_tiles = gl.cdiv(splitk_block_size, BLOCK_K)
     k_offset_start = pid_k * splitk_block_size
 
+    # Precompute scale offsets that are constant across K iterations
+    a_scale_m_offs, b_scale_base, b_scale_n_offs = precompute_scale_offsets(
+        stride_x_bs_m,
+        WBlockScale,
+        stride_w_bs_e,
+        stride_w_bs_n,
+        gathered_m_scale,
+        expt_id,
+        pid_n,
+        N,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCKSCALE_M,
+        BLOCKSCALE_N,
+        WMMA_LAYOUT,
+        PER_ROW_X_SCALE,
+        is_x_blockscale,
+        is_w_blockscale,
+    )
+
     # prologue
     for _ in gl.static_range(NUM_BUFFERS - 1):
         issue_async_tile_loads(
@@ -737,28 +772,20 @@ def _moe_gemm_a8w8_blockscale(
             b_buffer,
             m,
             XBlockScale,
-            stride_x_bs_m,
             stride_x_bs_k,
-            WBlockScale,
-            stride_w_bs_e,
             stride_w_bs_k,
-            stride_w_bs_n,
-            gathered_m_scale,
-            expt_id,
-            pid_n,
-            N,
+            a_scale_m_offs,
+            b_scale_base,
+            b_scale_n_offs,
             k_offset_start,
             BLOCK_M,
             BLOCK_N,
             BLOCK_K,
-            BLOCKSCALE_M,
-            BLOCKSCALE_N,
             BLOCKSCALE_K,
             NUM_BUFFERS,
             WMMA_LAYOUT,
             DOT_A_LAYOUT,
             DOT_B_LAYOUT,
-            PER_ROW_X_SCALE,
             is_x_blockscale,
             is_w_blockscale,
         )
@@ -772,28 +799,20 @@ def _moe_gemm_a8w8_blockscale(
             b_buffer,
             m,
             XBlockScale,
-            stride_x_bs_m,
             stride_x_bs_k,
-            WBlockScale,
-            stride_w_bs_e,
             stride_w_bs_k,
-            stride_w_bs_n,
-            gathered_m_scale,
-            expt_id,
-            pid_n,
-            N,
+            a_scale_m_offs,
+            b_scale_base,
+            b_scale_n_offs,
             k_offset_start,
             BLOCK_M,
             BLOCK_N,
             BLOCK_K,
-            BLOCKSCALE_M,
-            BLOCKSCALE_N,
             BLOCKSCALE_K,
             NUM_BUFFERS,
             WMMA_LAYOUT,
             DOT_A_LAYOUT,
             DOT_B_LAYOUT,
-            PER_ROW_X_SCALE,
             is_x_blockscale,
             is_w_blockscale,
         )
