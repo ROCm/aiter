@@ -100,45 +100,46 @@ namespace py = pybind11;
           py::arg("k_scale") = std::nullopt,   \
           py::arg("v_scale") = std::nullopt);
 
-#define ATTENTION_ASM_PYBIND                         \
-    m.def("pa_fwd_asm",                              \
-          &pa_fwd,                                   \
-          "pa_fwd",                                  \
-          py::arg("Q"),                              \
-          py::arg("K"),                              \
-          py::arg("V"),                              \
-          py::arg("block_tables"),                   \
-          py::arg("context_lens"),                   \
-          py::arg("block_tables_stride0"),           \
-          py::arg("max_qlen")       = 1,             \
-          py::arg("K_QScale")       = std::nullopt,  \
-          py::arg("V_QScale")       = std::nullopt,  \
-          py::arg("out_")           = std::nullopt,  \
-          py::arg("qo_indptr")      = std::nullopt,  \
-          py::arg("high_precision") = 1,             \
-          py::arg("kernelName")     = std::nullopt); \
-    m.def("pa_ps_fwd_asm",                           \
-          &pa_ps_fwd,                                \
-          "pa_ps_fwd",                               \
-          py::arg("Q"),                              \
-          py::arg("K"),                              \
-          py::arg("V"),                              \
-          py::arg("kv_indptr"),                      \
-          py::arg("kv_indices"),                     \
-          py::arg("context_lens"),                   \
-          py::arg("softmax_scale"),                  \
-          py::arg("max_qlen")       = 1,             \
-          py::arg("K_QScale")       = std::nullopt,  \
-          py::arg("V_QScale")       = std::nullopt,  \
-          py::arg("out_")           = std::nullopt,  \
-          py::arg("qo_indptr")      = std::nullopt,  \
-          py::arg("work_indptr")    = std::nullopt,  \
-          py::arg("work_info")      = std::nullopt,  \
-          py::arg("splitData")      = std::nullopt,  \
-          py::arg("splitLse")       = std::nullopt,  \
-          py::arg("mask")           = 0,             \
-          py::arg("high_precision") = 1,             \
-          py::arg("kernelName")     = std::nullopt);
+#define ATTENTION_ASM_PYBIND                        \
+    m.def("pa_fwd_asm",                             \
+          &pa_fwd,                                  \
+          "pa_fwd",                                 \
+          py::arg("Q"),                             \
+          py::arg("K"),                             \
+          py::arg("V"),                             \
+          py::arg("block_tables"),                  \
+          py::arg("context_lens"),                  \
+          py::arg("block_tables_stride0"),          \
+          py::arg("max_qlen")       = 1,            \
+          py::arg("K_QScale")       = std::nullopt, \
+          py::arg("V_QScale")       = std::nullopt, \
+          py::arg("out_")           = std::nullopt, \
+          py::arg("qo_indptr")      = std::nullopt, \
+          py::arg("high_precision") = 1,            \
+          py::arg("kernelName")     = std::nullopt);    \
+    m.def("pa_ps_fwd_asm",                          \
+          &pa_ps_fwd,                               \
+          "pa_ps_fwd",                              \
+          py::arg("Q"),                             \
+          py::arg("K"),                             \
+          py::arg("V"),                             \
+          py::arg("kv_indptr"),                     \
+          py::arg("kv_indices"),                    \
+          py::arg("context_lens"),                  \
+          py::arg("softmax_scale"),                 \
+          py::arg("max_qlen")       = 1,            \
+          py::arg("K_QScale")       = std::nullopt, \
+          py::arg("V_QScale")       = std::nullopt, \
+          py::arg("out_")           = std::nullopt, \
+          py::arg("qo_indptr")      = std::nullopt, \
+          py::arg("work_indptr")    = std::nullopt, \
+          py::arg("work_info")      = std::nullopt, \
+          py::arg("splitData")      = std::nullopt, \
+          py::arg("splitLse")       = std::nullopt, \
+          py::arg("mask")           = 0,            \
+          py::arg("high_precision") = 1,            \
+          py::arg("kernelName")     = std::nullopt, \
+          py::arg("quant_type")     = QuantType::per_Token);
 
 #define ATTENTION_CK_PYBIND            \
     m.def("pa_fwd_naive",              \
@@ -1740,6 +1741,8 @@ namespace py = pybind11;
         .value("per_1x32", QuantType::per_1x32)          \
         .value("per_1x128", QuantType::per_1x128)        \
         .value("per_128x128", QuantType::per_128x128)    \
+        .value("per_256x128", QuantType::per_256x128)    \
+        .value("per_1024x128", QuantType::per_1024x128)  \
         .export_values();                                \
     pybind11::enum_<ActivationType>(m, "ActivationType") \
         .value("No", ActivationType::No)                 \
