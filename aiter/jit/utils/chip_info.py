@@ -31,8 +31,30 @@ GFX_MAP = {
 }
 
 
+def _detect_ffm_arch() -> str | None:
+    """Detect GPU arch from FFM simulation topology if active.
+
+    When HSA_MODEL_TOPOLOGY is set, we are running under FFM simulation.
+    The topology path encodes the target device (e.g. .../topology/mi450).
+    """
+    topo = os.getenv("HSA_MODEL_TOPOLOGY", "")
+    if not topo:
+        return None
+    ffm_arch_map = {"mi450": "gfx1250", "mi400": "gfx1250", "mi350": "gfx950"}
+    target = os.path.basename(topo.rstrip("/")).lower()
+    arch = ffm_arch_map.get(target)
+    if arch:
+        print(f"[aiter] FFM simulation detected (topology={target}), using arch={arch}")
+    return arch
+
+
 @functools.lru_cache(maxsize=1)
 def _detect_native() -> list[str]:
+    # Check FFM simulation first — native tools report physical hardware,
+    # but we need the simulated arch for correct kernel compilation
+    ffm_arch = _detect_ffm_arch()
+    if ffm_arch:
+        return [ffm_arch]
     try:
         rocminfo = executable_path("rocminfo")
         result = subprocess.run(
@@ -59,8 +81,11 @@ def get_gfx_custom_op() -> int:
 def get_gfx_custom_op_core() -> int:
     gfx = os.getenv("GPU_ARCHS", "native")
     gfx_mapping = {v: k for k, v in GFX_MAP.items()}
-    # gfx = os.getenv("GPU_ARCHS", "native")
     if gfx == "native":
+        # Check FFM simulation first
+        ffm_arch = _detect_ffm_arch()
+        if ffm_arch and ffm_arch in gfx_mapping:
+            return gfx_mapping[ffm_arch]
         try:
             rocminfo = executable_path("rocminfo")
             result = subprocess.run(

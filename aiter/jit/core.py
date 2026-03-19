@@ -369,6 +369,16 @@ if multiprocessing.current_process().name == "MainProcess":
 def validate_and_update_archs():
     archs = os.getenv("GPU_ARCHS", "native").split(";")
     archs = [arch.strip() for arch in archs]
+
+    # Under FFM simulation, replace "native" with the simulated arch
+    # because hipcc's --offload-arch=native queries physical hardware,
+    # not the FFM-simulated device
+    if "native" in archs:
+        from chip_info import _detect_ffm_arch
+        ffm_arch = _detect_ffm_arch()
+        if ffm_arch:
+            archs = [ffm_arch if a == "native" else a for a in archs]
+
     # List of allowed architectures
     allowed_archs = [
         "native",
@@ -386,6 +396,7 @@ def validate_and_update_archs():
         "gfx1153",
         "gfx1200",
         "gfx1201",
+        "gfx1250",
         "gfx950",
     ]
 
