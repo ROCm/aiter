@@ -22,6 +22,7 @@ def perblock_quantize_q_kernel(
     num_queries_per_kv,
     query_stride_0,
     query_stride_1,
+    query_stride_2,
     scale_stride_0,
     scale_stride_1,
     BLOCK_Q: tl.constexpr,
@@ -30,6 +31,9 @@ def perblock_quantize_q_kernel(
     HEAD_SIZE: tl.constexpr,
     sm_scale: tl.constexpr,
     DTYPE_MAX: tl.constexpr,
+    stride_bt=0,
+    block_table=None,
+    block_size: tl.constexpr=None,
 ):
 
     kv_head_idx = tl.program_id(0)
@@ -55,11 +59,20 @@ def perblock_quantize_q_kernel(
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
     query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
 
-    query_offset_0 = cur_batch_in_all_start_index + query_pos
+    # query_offset_0 = cur_batch_in_all_start_index + query_pos
+    batch_offset = cur_batch_in_all_start_index
+    seq_offset = query_pos
+
+    if block_table is not None:
+        batch_offset = tl.load(block_table + seq_idx * stride_bt + query_pos // block_size)
+        seq_offset = query_pos % block_size
+    
     query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
+    
     query_offset = (
-        query_offset_0[:, None] * query_stride_0
-        + query_offset_1[:, None] * query_stride_1
+        batch_offset[:, None] * query_stride_0
+        + seq_offset[:, None] * query_stride_1
+        + query_offset_1[:, None] * query_stride_2
         + offs_d[None, :]
     )
 
@@ -96,48 +109,57 @@ def perblock_quantize_q_kernel(
 
 @triton.jit
 def perblock_quantize_kernel(
-    query_ptr,
-    Q_q,
-    Q_descale,
+    tensor_ptr,
+    tensor_q,
+    tensor_descale,
     max_seqlen,
-    query_start_len_ptr,
+    tensor_start_len_ptr,
     stride_b: tl.int64,
     stride_m: tl.int64,
     stride_h: tl.int64,
     stride_bs: tl.int64,
     stride_ms: tl.int64,
     stride_hs: tl.int64,
+    stride_bt: tl.int64,
+    stride_mt: tl.int64,
     BLOCK_M: tl.constexpr,
     D: tl.constexpr,
     sm_scale: tl.constexpr,
     DTYPE_MAX: tl.constexpr,
+    block_table_ptr=None,
+    block_size: tl.constexpr=None,
 ):
     
-    pid_b = tl.program_id(0)
-    pid_m = tl.program_id(1)
-    pid_h = tl.program_id(2)
-    
-    if query_start_len_ptr is not None:
-        cur_batch_in_all_start_index = tl.load(query_start_len_ptr + pid_b).to(tl.int64)
-        cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + pid_b + 1).to(tl.int64)
-        seqlen = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
-        batch_offset = cur_batch_in_all_start_index.to(tl.int64) * stride_m
-    else:
-        seqlen = max_seqlen
-        batch_offset = pid_b.to(tl.int64) * stride_b
+    head_idx = tl.program_id(0)
+    block_global_idx = tl.program_id(1)
 
-    if pid_m * BLOCK_M >= seqlen:
+    seq_idx = find_seq_idx(
+        tensor_start_len_ptr, block_global_idx, num_seqs, BLOCK_M, True
+    )
+
+    block_start_idx = tl.load(tensor_start_len_ptr + seq_idx) // BLOCK_M + seq_idx
+
+    block_local_idx = block_global_idx - block_start_idx
+
+    cur_batch_in_all_start_index = tl.load(tensor_start_len_ptr + seq_idx)
+    cur_batch_in_all_stop_index = tl.load(tensor_start_len_ptr + seq_idx + 1)
+
+    cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
+
+    if block_local_idx * BLOCK_M >= cur_batch_query_len:
         return
 
-    num_pid_m = tl.cdiv(max_seqlen, BLOCK_M)
-    global_blk_idx = pid_b * num_pid_m + pid_m
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, D)
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    tensor_pos = block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+    
+    
     offs_d = tl.arange(0, D)[None,:]
     mask = offs_m < seqlen
     head_offset = pid_h.to(tl.int64) * stride_h
     tile_offsets = batch_offset + offs_m * stride_m + head_offset + offs_d
-    tile_ptrs = query_ptr + tile_offsets
+    tile_ptrs = tensor_ptr + tile_offsets
     Q = tl.load(
         tile_ptrs,
         mask=mask,
@@ -149,13 +171,13 @@ def perblock_quantize_kernel(
         Q *= sm_scale
     scale = tl.max(tl.abs(Q)) / DTYPE_MAX
     Q_quant = Q / scale
-    Q_quant = Q_quant.to(Q_q.dtype.element_ty)
+    Q_quant = Q_quant.to(tensor_q.dtype.element_ty)
 
     # scale (total num blocks)
-    scale_ptrs = Q_descale + pid_b * stride_bs + pid_h * stride_hs + pid_m * stride_ms
+    scale_ptrs = tensor_descale + pid_b * stride_bs + pid_h * stride_hs + pid_m * stride_ms
     tl.store(scale_ptrs, scale)
     
-    qtile_ptrs = Q_q + tile_offsets
+    qtile_ptrs = tensor_q + tile_offsets
     tl.store(
         qtile_ptrs, Q_quant,
         mask=mask)

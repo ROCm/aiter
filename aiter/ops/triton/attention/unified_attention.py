@@ -232,101 +232,94 @@ def check_quant_args_get_strides(
         k_descale,
         v,
         v_descale,
-        BLOCK_M,
-        BLOCK_SIZE,
+        BLOCK_Q,
         TILE_SIZE,
-        kv_layout,
-        num_seqs=None,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
         sage_version: SAGE_VERSION = None
     ):
     """
     qkv has shapes:
         - q,  # [num_tokens, num_query_heads, head_size]
-        - k,  # [num_blks, blk_size, num_kv_heads, head_size]
-        - v,  # [num_blks, blk_size, num_kv_heads, head_size]
+        - k,  # [num_blks, blk_size, num_kv_heads, head_size] or [num_tokens_k, num_kv_heads, head_size]
+        - v,  # [num_blks, blk_size, num_kv_heads, head_size]  or [num_tokens_k, num_kv_heads, head_size]
     we expect the scales to have shapes:
-        - q_scale,  # [num_tokens // BLOCK_M, num_kv_heads] if sage, [num_tokens, num_kv_heads, head_size // 32] if sage_mxfp4
-        - k_scale,  # [num_blks * tl.cdiv(block_size, TILE_SIZE), num_kv_heads] if sage, [num_blks, blk_size, num_kv_heads, head_size // 32] if sage_mxfp4
+        - q_scale,  # [num_tokens // BLOCK_M + num_seqs, num_kv_heads] if sage, [num_tokens, num_kv_heads, head_size // 32] if sage_mxfp4
+        - k_scale,  # [num_tokens_k // TILE_SIZE + num_seqs, num_kv_heads] if sage, [num_tokens_k, num_kv_heads, head_size // 32] if sage_mxfp4
         - v_scale,  # [num_kv_heads, head_size] if sage or sage_mxfp4
     """
     if sage_version != None:
-        num_tokens, _, head_size_qk = q.shape
-        if kv_layout == "thd":
-            assert num_seqs is not None, "num_seqs must be provided when kv_layout is thd"
-            num_blks = num_seqs
-            _, num_kv_heads, head_size_v = v.shape
-        elif kv_layout == "bshd":
-            num_blks, _, num_kv_heads, head_size_v = v.shape
-        elif kv_layout == "bhsd":
-            num_blks, num_kv_heads, _, head_size_v = v.shape
-        else: # cache
-            num_blks, _, num_kv_heads, head_size_v = v.shape
-
         if sage_version == SAGE_VERSION.SAGE:
-            assert q_descale.ndim == 2, f"expect q_descale to be 2D, got {q_descale.ndim}D with SAGE_VERSION={sage_version}"
-            assert q_descale.shape[0] >= math.ceil(num_tokens / BLOCK_M), f"expect q_descale dim 0 >= {math.ceil(num_tokens / BLOCK_M)}, got {q_descale.shape[0]} with SAGE_VERSION={sage_version}"
-            assert q_descale.shape[1] == num_kv_heads, f"expect q_descale dim 1 == {num_kv_heads}, got {q_descale.shape[1]} with SAGE_VERSION={sage_version}"
+            num_seqs = len(cu_seqlens_q) - 1
+            num_q_descale_blks = cu_seqlens_q[-1] // BLOCK_Q + num_seqs
+            num_k_descale_blks = cu_seqlens_k[-1] // TILE_SIZE + num_seqs
+            print(f"num_q_descale_blks: {num_q_descale_blks}, num_k_descale_blks: {num_k_descale_blks}")
+            assert q_descale.shape == (num_q_descale_blks, k.shape[-2]), f"Expected q_descale shape {(num_q_descale_blks, k.shape[-2])}, got {q_descale.shape}"
+            # assert k_descale.shape == (num_k_descale_blks, k.shape[-2]), f"Expected k_descale shape {(num_k_descale_blks, k.shape[-2])}, got {k_descale.shape}"
+        else: # SAGE_MXFP4
+            assert q_descale.shape == (*q.shape, q.shape[-1] // 32), f"Expected q_descale shape {*q.shape, q.shape[-1] // 32}, got {q_descale.shape}"
+            assert k_descale.shape == (cu_seqlens_k[-1], k.shape[-2], k.shape[-1] // 32), f"Expected k_descale shape {cu_seqlens_k[-1], k.shape[-2], k.shape[-1] // 32}, got {k_descale.shape}"
+        assert v_descale.shape == (v.shape[-2], v.shape[-1]), f"Expected v_descale shape {(v.shape[-2], v.shape[-1])}, got {v_descale.shape}"
 
-            assert k_descale.ndim == 3, f"expect k_descale to be 3D, got {k_descale.ndim}D with SAGE_VERSION={sage_version}"
-            assert k_descale.shape[0]*k_descale.shape[1] == num_blks * math.ceil(BLOCK_SIZE / TILE_SIZE), (
-                f"expect k_descale dim 0 >= {num_blks * math.ceil(BLOCK_SIZE / TILE_SIZE)}, "
-                f"got {k_descale.shape[0]} with SAGE_VERSION={sage_version}"
-            )
-            assert v_descale.ndim == 2, f"expect v_descale to be 2D, got {v_descale.ndim}D with SAGE_VERSION={sage_version}"
-            assert v_descale.shape[0] == num_kv_heads, f"expect v_descale dim 0 == {num_kv_heads}, got {v_descale.shape[0]} with SAGE_VERSION={sage_version}"
-        elif sage_version == SAGE_VERSION.SAGE_MXFP4:
-            head_size_qk *= 2
-            expected_q_descale_shape = (num_tokens, num_kv_heads, head_size_qk // 32)
-            assert q_descale.shape == expected_q_descale_shape, f"expect q_descale to have shape {expected_q_descale_shape} with SAGE_VERSION={sage_version}"
-            expected_k_descale_shape = (
-                *k.shape[:-1],
-                head_size_qk // 32,
-            )
-            assert k_descale.shape == expected_k_descale_shape, f"expect k_descale to have shape {expected_k_descale_shape} with SAGE_VERSION={sage_version}"
-            expected_v_descale_shape = (num_kv_heads, head_size_v)
-            assert v_descale.shape == expected_v_descale_shape, f"expect v_descale to have shape {expected_v_descale_shape} with SAGE_VERSION={sage_version}"
-           
-
-        return get_sage_scale_strides(
-            q_descale,
-            k_descale,
-            v_descale,
-            num_blks,
-            BLOCK_SIZE,
-            TILE_SIZE,
-            sage_version=sage_version,
-            kv_layout=kv_layout,
-        )
+        query_scale_stride_0 = q_descale.stride(0)
+        query_scale_stride_1 = q_descale.stride(1)
+        query_scale_stride_2 = q_descale.stride(2) if sage_version == SAGE_VERSION.SAGE_MXFP4 else 0
+        stride_k_cache_scale_0 = k_descale.stride(0)
+        stride_k_cache_scale_1 = k_descale.stride(1)
+        stride_k_cache_scale_2 = k_descale.stride(2) if sage_version == SAGE_VERSION.SAGE_MXFP4 else 0
+        stride_v_cache_scale_0 = v_descale.stride(0)
+        stride_v_cache_scale_1 = v_descale.stride(1)
+        return (
+        query_scale_stride_0,
+        query_scale_stride_1,
+        query_scale_stride_2,
+        stride_k_cache_scale_0,
+        stride_k_cache_scale_1,
+        stride_k_cache_scale_2,
+        stride_v_cache_scale_0,
+        stride_v_cache_scale_1)
     # if sage_version is None, return dummy strides
-    return (0, 0, 0, 0, 0, 0, 0, 0, 0)
+    return (0, 0, 0, 0, 0, 0, 0, 0)
 
 
 
 def unified_attention(
     q, # thd layout assumed
-    k,
-    v,
-    out,
-    cu_seqlens_q,
+    k, # default: cache (i.e. num_blocks, blk_size, h, d). Also bshd, bhsd or thd layout supported by providing kv_layout argument.
+    v, # default: cache (i.e. num_blocks, blk_size, h, d). Also bshd, bhsd or thd layout supported by providing kv_layout argument.
+    out, # thd layout assumed
+    cu_seqlens_q, # (num_seqs + 1, ) cumulative sequence lengths for queries
+    cu_seqlens_k, # (num_seqs + 1, ) cumulative sequence lengths for keys/values
     max_seqlen_q,
-    seqused_k,
+    seqused_k, # (num_seqs, )
     max_seqlen_k,
     softmax_scale,
     causal,
     window_size,
     softcap,
-    q_descale,
+    q_descale, 
+    # None,
+    # float32 scalar for per tensor, 
+    # (total_num_q_blocks = q.shape[0] // config["BLOCK_Q"] + num_seqs, num_kv_heads) for SAGE,
+    # (t, hq, head_size//32) for SAGE_MXFP4
     k_descale,
+    # None,
+    # float32 scalar for per tensor, 
+    # (b, cdiv(s, config["TILE_SIZE"]), num_kv_heads) for SAGE,
+    # (t, hq, head_size//32) for SAGE_MXFP4
     v_descale,
+    # None,
+    # float32 scalar for per tensor, 
+    # (num_kv_heads, head_size) for both SAGE and SAGE_MXFP4
     block_table=None,
     alibi_slopes=None,
-    output_scale=None,
+    output_scale=None, # None or float32 scalar for per tensor output quantization. If provided, output will be quantized to out.dtype with this scale.
     qq_bias=None,
     # Optional tensor for sinks
     sinks=None,
     sage_version: SAGE_VERSION = None,
-    cu_seqlens_k=None, # is only needed if kv_layout is not cache and block_table is not provided as block_table=cu_seqlens_k
-    kv_layout: str = "cache", # cache i.e. (num_blocks, blk_size, h, d) as default. Other options "bhsd", "bshd", "thd"
+    
+    kv_layout: str = "cache", # "cache" i.e. (num_blocks, blk_size, h, d) as default. Other options "bhsd", "bshd", "thd"
 ):
     assert causal, "Only causal attention is supported"
     if sinks is not None:
@@ -346,7 +339,7 @@ def unified_attention(
         block_size = k.shape[1]
 
 
-    # Determine num_kv_heads based on layout
+    # which index is the num_kv_heads dimension in k and v for different layouts
     kv_layout_head_dims = {
         "cache": 2,
         "thd": 1,
@@ -376,6 +369,8 @@ def unified_attention(
     elif kv_layout == "thd":
         stride_k_cache = (stride_k_cache[0], stride_k_cache[0], stride_k_cache[1], stride_k_cache[2])
         stride_v_cache = (stride_v_cache[0], stride_v_cache[0], stride_v_cache[1], stride_v_cache[2])
+    # cache and bshd layout can use the strides as is
+
 
     stride_k_cache_0, stride_k_cache_1, stride_k_cache_2, stride_k_cache_3 = stride_k_cache
     stride_v_cache_0, stride_v_cache_1, stride_v_cache_2, stride_v_cache_3 = stride_v_cache
@@ -431,9 +426,7 @@ def unified_attention(
             num_queries_per_kv,
             num_2d_prgms,
         )
-
-        TILE_SIZE=config["TILE_SIZE"]
-        BLOCK_M=config["BLOCK_M"]
+        assert config["BLOCK_Q"] >= 1
         (
             query_scale_stride_0,
             query_scale_stride_1,
@@ -441,7 +434,6 @@ def unified_attention(
             stride_k_cache_scale_0,
             stride_k_cache_scale_1,
             stride_k_cache_scale_2,
-            stride_k_cache_scale_3,
             stride_v_cache_scale_0,
             stride_v_cache_scale_1 
         ) = check_quant_args_get_strides(
@@ -451,15 +443,14 @@ def unified_attention(
             k_descale,
             v,
             v_descale,
-            BLOCK_M,
-            BLOCK_SIZE=block_size,
-            TILE_SIZE=TILE_SIZE,
+            BLOCK_Q=config["BLOCK_Q"],
+            TILE_SIZE=config["TILE_SIZE"],
             sage_version=sage_version,
-            num_seqs=num_seqs,
-            kv_layout=kv_layout
+            cu_seqlens_k=cu_seqlens_k,
+            cu_seqlens_q=cu_seqlens_q
         )
 
-        assert config["BLOCK_Q"] >= 1
+        
         total_num_q_blocks = q.shape[0] // config["BLOCK_Q"] + num_seqs
         kernel_unified_attention_2d[
             (
@@ -512,7 +503,6 @@ def unified_attention(
             stride_k_cache_scale_0=stride_k_cache_scale_0,
             stride_k_cache_scale_1=stride_k_cache_scale_1,
             stride_k_cache_scale_2=stride_k_cache_scale_2,
-            stride_k_cache_scale_3=stride_k_cache_scale_3,
             stride_v_cache_scale_0=stride_v_cache_scale_0,
             stride_v_cache_scale_1=stride_v_cache_scale_1,
             query_start_len_ptr=cu_seqlens_q,

@@ -329,9 +329,10 @@ def test_triton_unified_attn(
             from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v1
             maybe_quantized_query, q_descale, maybe_quantized_key_cache, k_descale, maybe_quantized_value_cache, v_descale = sage_quant_v1(
                 query, key_cache, value_cache, BLOCK_M, BLOCK_N,
-                layout_q="unified", layout_k=kv_layout,
+                layout_k=kv_layout,
                 v_descale=None,
                 cu_seqlens_q=cu_query_lens, cu_seqlens_k=cu_key_lens,
+                block_table=block_tables, block_size=block_size
             )
             
         else:
@@ -375,6 +376,7 @@ def test_triton_unified_attn(
         v=maybe_quantized_value_cache,
         out=output,
         cu_seqlens_q=cu_query_lens,
+        cu_seqlens_k=cu_key_lens,
         seqused_k=seqlens_k,
         max_seqlen_q=max_query_len,
         max_seqlen_k=max_kv_len,

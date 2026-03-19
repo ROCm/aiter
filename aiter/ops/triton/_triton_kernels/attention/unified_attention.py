@@ -203,7 +203,6 @@ def kernel_unified_attention_2d(
     stride_k_cache_scale_0: tl.int64,  # int
     stride_k_cache_scale_1: tl.int64,  # int
     stride_k_cache_scale_2: tl.int64,  # int
-    stride_k_cache_scale_3: tl.int64,  # int
     stride_v_cache_scale_0: tl.int64,  # int
     stride_v_cache_scale_1: tl.int64,  # int
     query_start_len_ptr,  # [num_seqs+1]
@@ -215,7 +214,6 @@ def kernel_unified_attention_2d(
     FP8_MAX: tl.constexpr = float8_info.max,
     ALL_DECODE: tl.constexpr = False,  # bool
     SAGE_VERSION: tl.constexpr = None, # bool
-    IS_PAGING: tl.constexpr = True, # bool
     PRELOAD_V: tl.constexpr = False, # bool
     KV_LAYOUT: tl.constexpr = 1
 ):
@@ -389,9 +387,7 @@ def kernel_unified_attention_2d(
 
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
     # iterate through tiles (now limited to the sliding window range)
-    
-    # to unify the indexing we use block_tables for every layout
-    num_tiles_in_block = tl.cdiv(BLOCK_SIZE, TILE_SIZE)
+
     
     # bring the k_cache ptrs to correct start location for this sequence
     # for paged layout (aka num_blocks, blk_size, num_kv_heads, head_size) the block table[seq_idx] gives the physical block index directly
@@ -399,8 +395,8 @@ def kernel_unified_attention_2d(
     # for thd layout the block table[seq_idx] gives the starting token index of the kv cache for that sequence
     # we get the base offset as block table[seq_idx] * stride_k_cache_0 
     seq_offset = tile_start * TILE_SIZE + offs_t
-    base_offset = tl.load(block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE).to(tl.int64)    
-    
+    base_offset = tl.load(block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE).to(tl.int64)     
+    base_scale_offset = tl.load(block_tables_ptr + block_table_offset).to(tl.int64) # scale is not stored in paged manner
     for j in range(tile_start, tile_end):
         seq_offset = j * TILE_SIZE + offs_t
         # to reduce the masking effect when not needed
@@ -436,29 +432,21 @@ def kernel_unified_attention_2d(
         k_scale_loaded = None
         if SAGE_VERSION != None:
             K = K_load
-            if SAGE_VERSION == 1: # SAGE V1 Each tile has its own scale
-                # bshd/bhsd layout descale has shape (b, cdiv(s,TILE_SIZE),h)
-                # paged layout descale has shape (num_blocks, cdiv(BLOCK_SIZE, TILE_SIZE), num_kv_heads)
-                # so the following works for both
-                descale_blk_index = base_offset * stride_k_cache_scale_0 + j % num_tiles_in_block * stride_k_cache_scale_1
-                # thd layout forms a exception
-                if KV_LAYOUT==3:
-                    descale_blk_index = seq_idx * stride_k_cache_scale_0 + j % num_tiles_in_block * stride_k_cache_scale_1
+            if SAGE_VERSION == 1: # SAGE v1
                 k_descale_ptr = (
                     k_scale
-                    + descale_blk_index
-                    + kv_head_idx * stride_k_cache_scale_2
+                    + (base_scale_offset + j * TILE_SIZE) // TILE_SIZE * stride_k_cache_scale_0
+                    + kv_head_idx * stride_k_cache_scale_1
                 )
-                k_scale_loaded = tl.load(k_descale_ptr)
-            elif SAGE_VERSION == 2: # SAGE V2 Each token has its own scale
-                descale_token_index = base_offset * stride_k_cache_scale_0 + (seq_offset % BLOCK_SIZE) * stride_k_cache_scale_1
+                k_scale_loaded =  tl.load(k_descale_ptr)
+            elif SAGE_VERSION == 2: # SAGE mxfp4
                 k_descale_ptr = (
                     k_scale
-                    + descale_token_index[:, None]
-                    + kv_head_idx * stride_k_cache_scale_2
-                    + offs_d_scale[None, :] * stride_k_cache_scale_3
+                    + (base_scale_offset + seq_offset) * stride_k_cache_scale_0
+                    + kv_head_idx * stride_k_cache_scale_1
+                    + offs_d_qk[:, None] * stride_k_cache_scale_2
                 )
-                k_scale_loaded = tl.load(k_descale_ptr, mask=tile_mask[:, None], other=0.0)
+                k_scale_loaded =  tl.load(k_descale_ptr, mask=tile_mask[:, None], other=0.0)
         else:  # TODO: check convert effect on perf
             K = K_load.to(Q.dtype)
 

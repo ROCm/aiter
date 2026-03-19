@@ -28,7 +28,9 @@ def unified_perblock_quantize_int8(
     BLOCK_SIZE_M,
     cu_seqlens,
     sm_scale,
-    num_queries_per_kv,
+    block_table=None,
+    block_size=None,
+    num_queries_per_kv=1,
 ):  
     # q is expected to have layout thd
     d = q.shape[-1]
@@ -38,13 +40,21 @@ def unified_perblock_quantize_int8(
     num_seqs = len(cu_seqlens) - 1
     BLOCK_Q = BLOCK_SIZE_M // num_queries_per_kv
     total_num_blocks = q.shape[0] // BLOCK_Q + num_seqs
-    
+    print("tootal_num_blocks", total_num_blocks)
     assert num_queries_per_kv is not None # and config is not None
     num_heads = hq // num_queries_per_kv
     Q_descale = torch.empty(
         (total_num_blocks, num_heads), dtype=torch.float32, device=q.device
     )
    
+    stride_bt = 0
+    if block_table is not None: # layout is cache, expected q shape is (num_blocks, block_size, h, d)
+        assert block_size is not None, "if block_table is provided, block_size must also be provided"
+        stride_bt = block_table.stride(0)
+        query_stride_0, query_stride_1, query_stride_2 = q.stride(0), q.stride(1), q.stride(2)
+    else: # layout is thd
+        query_stride_0, query_stride_1, query_stride_2 = q.stride(0), q.stride(0), q.stride(1), 
+
     perblock_quantize_q_kernel[(
                 num_heads,
                 total_num_blocks,
@@ -56,8 +66,7 @@ def unified_perblock_quantize_int8(
                 num_seqs,
                 hq,
                 num_queries_per_kv,
-                q.stride(0),
-                q.stride(1),
+                query_stride_0, query_stride_1, query_stride_2, 
                 Q_descale.stride(0),
                 Q_descale.stride(1),
                 sm_scale=sm_scale,
@@ -66,69 +75,48 @@ def unified_perblock_quantize_int8(
                 BLOCK_M=BLOCK_SIZE_M,
                 BLOCK_Q=BLOCK_Q,
                 DTYPE_MAX=DTYPE_MAX,
+                stride_bt=stride_bt,
+                block_table=block_table,
+                block_size=block_size,
             )
     return Q_q, Q_descale
 
 """
 expected shapes
-tensors (and quantized tensors) (bshd), (thd) or (num_blocks,block_size,h,d)
-descales (b,cdiv(s, BLOCK_M),h,1), (b,cdiv(max_seqlen, BLOCK_M),h,1) or (num_blocks,cdiv(block_size, BLOCK_M), h,1)
+tensors (and quantized tensors) contiguous (thd) or paged (num_blocks,block_size,h,d)
+descales (total_num_blocks,h), where total_num_blocks = cu_seqlens[-1] // BLOCK_M + num_seqs
 """
 def perblock_quantize_int8(
     q,
     BLOCK_SIZE_M,
     cu_seqlens,
     layout="bhsd",
+    block_table=None,
+    block_size=None,
     sm_scale=None,
 ):  
     d = q.shape[-1]
-    if layout=="thd":
-        b = len(cu_seqlens) - 1 # skip the last element since it's len(seqlens)
-        h = q.shape[1]
-        s = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item() 
-        stride_b = 0
-        stride_m = h * d
-        stride_h = d
-        kernel_cu_seqlens = cu_seqlens
-    elif layout=="bhsd":
-        b,h,s,_ = q.shape
-        stride_b = q.stride(0)
-        stride_m = q.stride(2)
-        stride_h = q.stride(1)
-        kernel_cu_seqlens = None
-    elif layout=="bshd":
-        b,s,h,d = q.shape
-        stride_b = q.stride(0)
-        stride_m = q.stride(1)
-        stride_h = q.stride(2)
-        kernel_cu_seqlens = None
-    else: # num_blocks,block_size,h,d = q.shape
-        b,s,h,d = q.shape
-        stride_b = q.stride(0)
-        stride_m = q.stride(1)
-        stride_h = q.stride(2)
-        kernel_cu_seqlens = None
-
-    num_pid_m = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+    if layout=="cache":
+        assert block_table is not None, "block_table must be provided for cache layout"
+    assert cu_seqlens is not None, "cu_seqlens must be provided for thd layout"
+    num_seqs = len(cu_seqlens) - 1 # skip the last element since it's len(seqlens)
+    h = q.shape[-2]
+    total_num_blocks = cu_seqlens[-1] // BLOCK_SIZE_M + num_seqs
 
     Q_q = torch.empty(q.shape, dtype=torch.int8, device=q.device)
     DTYPE_MAX = torch.iinfo(torch.int8).max
-
-    # bshd, thd and cache layout can be dealt with one kernel that has stride_t = h*d and:
-    # bhsd: cu_seqlens = s,2s,3s,...
-    # thd: cu_seqlens = cu_seqlens
-    # cache: cu_seqlens = block_size, 2 block_size, 3 block_size,...
     Q_descale = torch.empty(
-        (b, num_pid_m, h), dtype=torch.float32, device=q.device
+        (num_seqs, h), dtype=torch.float32, device=q.device
     )
-    num_pid_m = (s + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
-    grid = (b, num_pid_m, h)
+    grid = (total_num_blocks, h)
 
     perblock_quantize_kernel[grid](
         q, Q_q, Q_descale, s, kernel_cu_seqlens,
         stride_b, stride_m, stride_h,
         Q_descale.stride(0), Q_descale.stride(1), Q_descale.stride(2),
-        BLOCK_SIZE_M, d, sm_scale, DTYPE_MAX)
+        block_table.stride(0) if block_table is not None else 0,
+        block_table.stride(1) if block_table is not None else 0,
+        BLOCK_SIZE_M, d, sm_scale, DTYPE_MAX, block_table, block_size)
 
     return Q_q, Q_descale
 
@@ -187,8 +175,7 @@ v_descale: (h,d)
 
 def perchannel_quantize_fp8(
     v,
-    BLOCK_M,
-    layout_k="bhsd",
+    layout_k="thd",
     v_descale=None,
 ):  
     FP8_TYPE = aiter.dtypes.fp8
@@ -196,11 +183,7 @@ def perchannel_quantize_fp8(
     v_q = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
 
     if v_descale is None:
-        if layout_k=="bhsd":
-            reduce_dims = (0,2)
-        elif layout_k=="bshd":
-            reduce_dims = (0,1)
-        elif layout_k=="thd":
+        if layout_k=="thd":
             reduce_dims = (0)
         else: # (num_blocks, block_size, h, d)
             reduce_dims = (0,1)
@@ -215,46 +198,45 @@ def sage_quant_v1(
     v,
     BLOCK_M,
     BLOCK_N,
-    layout_q, # options: "unified", "bshd", "bhsd", "thd", "cache"
-    layout_k, # options: "bshd", "bhsd", "thd", "cache". same for v
+    layout_k, # options: "thd","cache" (i.e num_blocks, block_size, h, d)
     v_descale = None,
     cu_seqlens_q= None,
     cu_seqlens_k= None,
+    block_table=None,
+    block_size=None,
 ):
     d = q.shape[-1]
     sm_scale = d**-0.5 * 1.4426950408889634
-    # groups tokens, so we have to consider the layouting
-    if layout_q == "unified":
-        if layout_k in ("cache", "bshd", "thd"):
-            num_kv_heads = k.shape[-2] 
-        elif layout_k == "bhsd":
-            num_kv_heads = k.shape[1] 
-        num_queries_per_kv = q.shape[1] // num_kv_heads
+
+    num_queries_per_kv = q.shape[-2] // k.shape[-2]
         
         
-        q_q, q_descale = unified_perblock_quantize_int8(
-            q,
-            BLOCK_M,
-            cu_seqlens_q,
-            sm_scale=sm_scale,
-            num_queries_per_kv=num_queries_per_kv,
-        )
-    else:
-        q_q, q_descale = perblock_quantize_int8(
-            q,
-            BLOCK_M,
-            cu_seqlens_q,
-            layout=layout_q,
-            sm_scale=sm_scale,
-        )
-    k_q, k_descale = perblock_quantize_int8(
+    q_q, q_descale = unified_perblock_quantize_int8(
+        q,
+        BLOCK_M,
+        cu_seqlens_q,
+        sm_scale=sm_scale,
+        num_queries_per_kv=num_queries_per_kv,
+    )
+
+    if layout_k == "cache":
+        assert block_table is not None and block_size is not None, "block_table and block_size must be provided for cache layout"
+    
+    
+    
+    
+    k_q, k_descale = unified_perblock_quantize_int8(
         k,
         BLOCK_N,
-        cu_seqlens_k if not layout_k == "cache" else None,
-        layout=layout_k,
+        cu_seqlens_k,
         sm_scale=None,
+        block_table=block_table,
+        block_size=block_size,
     )
-    v_q, v_descale = perchannel_quantize_fp8(v, 256, layout_k=layout_k, v_descale=v_descale)
+
+    print("k_descale.shape", k_descale.shape)
+   
+    v_q, v_descale = perchannel_quantize_fp8(v, layout_k=layout_k, v_descale=v_descale)
     return q_q, q_descale, k_q, k_descale, v_q, v_descale
 
 def sage_quant_v2(
