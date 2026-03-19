@@ -31,7 +31,7 @@ def get_gpu_arch():
     if not torch.cuda.is_available():
         return None
     props = torch.cuda.get_device_properties(0)
-    return getattr(props, 'gcnArchName', None)
+    return getattr(props, "gcnArchName", None)
 
 
 def is_gluon_supported():
@@ -75,21 +75,17 @@ def get_x_vals():
         (1, 16, 16),
         (16, 1, 16),
         (16, 16, 1),
-
         # Irregular shapes (masking & OOB)
         (3, 5, 7),
         (17, 33, 65),
         (63, 127, 255),
         (65, 129, 257),
-
         #
         (64, 64, 64),
         (128, 128, 128),
-
         # Multiple blocks
         (128, 256, 512),
         (256, 512, 256),
-
         # Asymmetric shapes
         (32, 256, 128),
         (256, 32, 128),
@@ -108,7 +104,8 @@ def run_gemm(x, w, bias, out_dtype, y, backend, activation=None):
         dtype_arg = out_dtype
 
     return gemm_a16w16(
-        x, w,
+        x,
+        w,
         bias=bias,
         dtype=dtype_arg,
         y=y,
@@ -122,7 +119,9 @@ def run_gemm(x, w, bias, out_dtype, y, backend, activation=None):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
-def test_gemm_a16_w16_activation(M: int, N: int, K: int, dtype, output, activation, backend):
+def test_gemm_a16_w16_activation(
+    M: int, N: int, K: int, dtype, output, activation, backend
+):
     if backend == "gluon" and not is_gluon_supported():
         pytest.skip("Gluon not supported on this architecture")
 

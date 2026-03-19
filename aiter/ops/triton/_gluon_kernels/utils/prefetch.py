@@ -14,8 +14,18 @@ def issue_l2_prefetch(desc, offsets, pred=True, SPECULATIVE: gl.constexpr = True
 
 
 @gluon.jit
-def gemm_l2_prefetch(distance, load_idx, a_desc, b_desc, off_am, off_bn, BLOCK_K: gl.constexpr,
-                     TRANSPOSE_A: gl.constexpr, TRANSPOSE_B: gl.constexpr, pred=True):
+def gemm_l2_prefetch(
+    distance,
+    load_idx,
+    a_desc,
+    b_desc,
+    off_am,
+    off_bn,
+    BLOCK_K: gl.constexpr,
+    TRANSPOSE_A: gl.constexpr,
+    TRANSPOSE_B: gl.constexpr,
+    pred=True,
+):
     """
     Creates L2 prefetch for iteration `load_idx + distance` for a GEMM's A and B descriptors.
     """
@@ -34,9 +44,19 @@ def gemm_l2_prefetch(distance, load_idx, a_desc, b_desc, off_am, off_bn, BLOCK_K
 
 
 @gluon.jit
-def gemm_l2_prefetch_prologue(distance, load_idx, a_desc, b_desc, off_am, off_bn, BLOCK_K: gl.constexpr,
-                              NUM_BUFFERS: gl.constexpr, TRANSPOSE_A: gl.constexpr,
-                              TRANSPOSE_B: gl.constexpr, pred=True):
+def gemm_l2_prefetch_prologue(
+    distance,
+    load_idx,
+    a_desc,
+    b_desc,
+    off_am,
+    off_bn,
+    BLOCK_K: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    TRANSPOSE_A: gl.constexpr,
+    TRANSPOSE_B: gl.constexpr,
+    pred=True,
+):
     """
     Creates prefetches for iterations [NUM_BUFFERS, distance - NUM_BUFFERS) or no prefetches if distance <= NUM_BUFFERS.
     Skips iterations preloaded in the prologue since prefetching them is redundant.
@@ -45,5 +65,15 @@ def gemm_l2_prefetch_prologue(distance, load_idx, a_desc, b_desc, off_am, off_bn
         return
 
     for i in gl.static_range(distance - NUM_BUFFERS):
-        gemm_l2_prefetch(NUM_BUFFERS + i, load_idx, a_desc, b_desc, off_am, off_bn, BLOCK_K,
-                         TRANSPOSE_A, TRANSPOSE_B, pred)
+        gemm_l2_prefetch(
+            NUM_BUFFERS + i,
+            load_idx,
+            a_desc,
+            b_desc,
+            off_am,
+            off_bn,
+            BLOCK_K,
+            TRANSPOSE_A,
+            TRANSPOSE_B,
+            pred,
+        )
