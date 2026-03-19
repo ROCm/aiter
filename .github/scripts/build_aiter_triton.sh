@@ -22,12 +22,13 @@ if [[ "$BUILD_TRITON" == "1" ]]; then
     echo
     echo "==== Install triton ===="
     pip uninstall -y triton || true
-    # Pin triton to a known-good commit to avoid CI breakage from
-    # upstream changes (e.g. AMD codegen regressions in triton-lang/triton).
-    TRITON_COMMIT=${TRITON_COMMIT:-756afc06}
+    # Use latest triton main by default; override with TRITON_COMMIT env var.
+    TRITON_COMMIT=${TRITON_COMMIT:-}
     git clone https://github.com/triton-lang/triton || true
     cd triton
-    git checkout "$TRITON_COMMIT"
+    if [[ -n "$TRITON_COMMIT" ]]; then
+        git checkout "$TRITON_COMMIT"
+    fi
     pip install -r python/requirements.txt
     pip install filecheck
     # NetworkX is a dependency of Triton test selection script
