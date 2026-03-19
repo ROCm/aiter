@@ -19,7 +19,10 @@ if is_flydsl_available():
         flydsl_moe_stage2,
     )
 
+    from .attn_reduce import flydsl_attn_reduce_v1
+
     __all__ += [
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
+        "flydsl_attn_reduce_v1",
     ]

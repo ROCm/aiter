@@ -13,6 +13,7 @@ import triton.language as tl
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.ops.flydsl import flydsl_attn_reduce_v1
 
 import os
 
@@ -394,7 +395,7 @@ def mla_decode_fwd(
                 kv_scale,
             )
 
-        aiter.mla_reduce_v1(
+        flydsl_attn_reduce_v1(
             logits,
             attn_lse,
             reduce_indptr,

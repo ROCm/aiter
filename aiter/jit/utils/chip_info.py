@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import functools
 import os
 import re
@@ -143,6 +143,52 @@ def get_cu_num_custom_op() -> int:
 def get_cu_num():
     cu_num = get_cu_num_custom_op()
     return cu_num
+
+
+@torch_compile_guard()
+def get_lds_size_per_cu_custom_op() -> int:
+    """Return the LDS (shared memory) size per CU in bytes.
+
+    Parses the GROUP segment pool size from ``rocminfo`` output.
+    The value corresponds to ``hipDeviceProp_t.sharedMemPerMultiprocessor``.
+    """
+    try:
+        rocminfo = executable_path("rocminfo")
+        result = subprocess.run(
+            [rocminfo], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        output = result.stdout
+        devices = re.split(r"Agent\s*\d+", output)
+        lds_sizes = []
+        for device in devices:
+            is_gpu = False
+            for line in device.split("\n"):
+                if "Device Type" in line and line.find("GPU") != -1:
+                    is_gpu = True
+                    break
+            if not is_gpu:
+                continue
+            # Find GROUP segment pool size within this GPU agent section.
+            lines = device.split("\n")
+            for i, line in enumerate(lines):
+                if re.search(r"Segment\s*:\s*GROUP", line):
+                    # The Size line immediately follows the Segment line.
+                    if i + 1 < len(lines):
+                        m = re.search(r"Size\s*:\s*(\d+)", lines[i + 1])
+                        if m:
+                            lds_sizes.append(int(m.group(1)) * 1024)  # KB to bytes
+                    break
+    except Exception as e:
+        raise RuntimeError(f"Get LDS size per CU from rocminfo failed {str(e)}")
+    if not lds_sizes:
+        raise RuntimeError("No GPU GROUP segment found in rocminfo output")
+    assert len(set(lds_sizes)) == 1, f"Inconsistent LDS sizes across GPUs: {lds_sizes}"
+    return lds_sizes[0]
+
+
+@functools.lru_cache(maxsize=1)
+def get_lds_size_per_cu() -> int:
+    return get_lds_size_per_cu_custom_op()
 
 
 def _get_pci_chip_id(device_id=0):
