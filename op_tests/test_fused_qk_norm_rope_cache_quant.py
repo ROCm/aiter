@@ -1879,6 +1879,16 @@ def test_partial_rotary_pts_quant(
         atol=0.05,
     )
     print(f"[PASS] {tag}", flush=True)
+    return {
+        "dtype": str(dtype),
+        "num_tokens": num_tokens,
+        "num_heads_q": num_heads_q,
+        "num_heads_k": num_heads_k,
+        "head_size": head_size,
+        "rotary_dim": rotary_dim,
+        "is_neox_style": "1" if is_neox_style else "0",
+        "status": "PASS",
+    }
 
 
 parser = argparse.ArgumentParser(
@@ -2107,18 +2117,29 @@ if __name__ == "__main__":
     aiter.logger.info("qk_norm_rope_2way summary (markdown):\n%s", df_md)
 
     # partial rotary tests (Qwen3.5-style: head_size=256, rotary_dim=64)
-    print("\n=== Partial Rotary RoPE Tests ===", flush=True)
-    for nt in [3, 127, 512]:
-        for hq, hk in [(32, 4), (8, 1)]:
-            for hs, rd in [(256, 64), (128, 32)]:
-                for neox in [True, False]:
-                    test_partial_rotary_pts_quant(
-                        torch.bfloat16,
-                        nt,
-                        hq,
-                        hk,
-                        hk,
-                        hs,
-                        rd,
-                        neox,
+    df = []
+    partial_rotary_configs = {256: 64, 128: 32, 64: 16}
+
+    for num_token in args.token:
+        for num_head, num_kv_head in args.head:
+            for head_size in args.head_sizes:
+                rotary_dim = partial_rotary_configs[head_size]
+                assert rotary_dim < head_size
+                for is_neox_style in args.is_neox_styles:
+                    ret = test_partial_rotary_pts_quant(
+                        args.dtype,
+                        num_token,
+                        num_head,
+                        num_kv_head,
+                        num_kv_head,
+                        head_size,
+                        rotary_dim,
+                        is_neox_style,
+                        eps=1e-6,
                     )
+                    df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info(
+        "partial_rotary_pts_quant summary (markdown):\n%s", df_md
+    )
