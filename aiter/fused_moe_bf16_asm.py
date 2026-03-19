@@ -130,6 +130,7 @@ def asm_moe(
                 fc2_scale,
                 fc1_smooth_scale,
                 fc2_smooth_scale,
+                activation,
             )
         else:
             raise ValueError(f"Invalid args: {w1.dtype} {w1.shape=} {w2.shape=}")
@@ -196,35 +197,6 @@ def asm_moe(
 
             # aiter.moe_smoothquant_fwd(
             #     a8, hidden_states, fc1_smooth_scale, topk_ids, a8_scale
-            # )
-            # aiter.smooth_per_token_scaled_quant(
-            #     a8.view(topk, M, model_dim).transpose(0, 1),
-            #     hidden_states.view(M, 1, model_dim).expand(-1, topk, -1),
-            #     a8_scale,
-            #     fc1_smooth_scale,
-            #     topk_ids,
-            #     smooth_scale_map_hash=local_expert_hash,
-            #     enable_ps=True,
-            # )
-            # aiter.moe_smooth_per_token_scaled_quant_v1(
-            #     a8,
-            #     hidden_states,
-            #     a8_scale,
-            #     fc1_smooth_scale,
-            #     topk_ids,
-            #     smooth_scale_map_hash=local_expert_hash,
-            #     transpose_out=True,
-            # )
-            # aiter.moe_smooth_per_token_scaled_quant_v2(
-            #     a8,
-            #     hidden_states,
-            #     a8_scale,
-            #     fc1_smooth_scale,
-            #     sorted_ids,
-            #     sorted_expert_ids,
-            #     num_valid_ids,
-            #     BLOCK_SIZE_M,
-            #     transpose_out=True,
             # )
             aiter.moe_smooth_per_token_scaled_quant(
                 a8,

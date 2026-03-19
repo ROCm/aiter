@@ -142,6 +142,7 @@ def fmoe_int8_g1u0_a16(
     fc2_scale: Tensor,
     fc1_smooth_scale: Tensor,
     fc2_smooth_scale: Tensor,
+    activation: Optional[Enum] = ActivationType.Silu.value,
 ) -> None: ...
 
 

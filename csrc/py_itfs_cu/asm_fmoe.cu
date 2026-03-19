@@ -721,24 +721,45 @@ void fmoe_int8_g1u0_a16(torch::Tensor& out,               // [token_cnt, dim]
                         torch::Tensor& fc1_scale,         // [expert, 1, inter_dim]
                         torch::Tensor& fc2_scale,         // [expert, 1, dim]
                         torch::Tensor& fc1_smooth_scale,  // [expert, 1, dim]
-                        torch::Tensor& fc2_smooth_scale   // [expert, 1, inter_dim]
-)
+                        torch::Tensor& fc2_smooth_scale,  // [expert, 1, inter_dim]
+                        ActivationType activation)
 {
-    static FMoeKernel impl("fmoe_kernel_func", "fmoe_int8_g1u0_smf.co");
-    impl.launch_kernel<uint8_t, uint16_t, true>(out,
-                                                input,
-                                                gate,
-                                                down,
-                                                sorted_token_ids,
-                                                sorted_weights,
-                                                sorted_expert_ids,
-                                                num_valid_ids,
-                                                topk,
-                                                // quant args
-                                                fc1_smooth_scale,
-                                                fc1_scale,
-                                                fc2_scale,
-                                                fc2_smooth_scale);
+    FMoeKernel* impl_ptr = nullptr;
+    CFG* config_map      = nullptr;
+    int inter_dim        = down.size(2);
+    int sub_X_cnt        = sorted_expert_ids.size(0);
+
+    if(gate.dtype() == at::ScalarType::Char || gate.dtype() == at::ScalarType::Byte)
+    {
+        if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Silu)
+            config_map = &cfg_fmoe_fp16_pertokenInt8_g1u0_silu;
+        else if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Gelu)
+            config_map = &cfg_fmoe_fp16_pertokenInt8_g1u0_gelu;
+        else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Silu)
+            config_map = &cfg_fmoe_bf16_pertokenInt8_g1u0_silu;
+        else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Gelu)
+            config_map = &cfg_fmoe_bf16_pertokenInt8_g1u0_gelu;
+        else
+            TORCH_CHECK(false, __func__, " Not find proper cfg in pertokenInt8_g1u0. ");
+    }
+    else
+        TORCH_CHECK(false, __func__, "Unsupported gate dtype for fmoe_int8_g1u0_a16");
+
+    impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, 1);
+    impl_ptr->launch_kernel<uint8_t, uint16_t, true>(out,
+                                                     input,
+                                                     gate,
+                                                     down,
+                                                     sorted_token_ids,
+                                                     sorted_weights,
+                                                     sorted_expert_ids,
+                                                     num_valid_ids,
+                                                     topk,
+                                                     // quant args
+                                                     fc1_smooth_scale,
+                                                     fc1_scale,
+                                                     fc2_scale,
+                                                     fc2_smooth_scale);
 }
 
 void fmoe_g1u1_a16(torch::Tensor& out,               // [token_cnt, dim]
