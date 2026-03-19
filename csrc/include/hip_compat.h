@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 #ifdef USE_ROCM
-#ifndef AITER_CK_FREE
+#if !DISABLE_CK
 #include "ck_tile/core.hpp"
 #endif
 #include <hip/hip_runtime.h>
@@ -24,7 +24,7 @@
 
 #ifndef USE_ROCM
 constexpr int WARP_SIZE = 32;
-#elif defined(AITER_CK_FREE)
+#elif DISABLE_CK
 #if defined(__AMDGCN_WAVEFRONT_SIZE__)
 constexpr int WARP_SIZE = __AMDGCN_WAVEFRONT_SIZE__;
 #else

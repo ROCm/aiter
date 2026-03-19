@@ -2,7 +2,11 @@
 // Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #pragma once
+#if DISABLE_CK
+#include "ck_tile_shim.h"
+#else
 #include "ck_tile/core.hpp"
+#endif
 
 #ifndef AITER_WARP_SORT_USE_INLINE_ASM
 #define AITER_WARP_SORT_USE_INLINE_ASM 0

@@ -35,6 +35,15 @@ constexpr T log2e_v = static_cast<T>(1.4426950408889634);
 
 inline int get_warp_size() { return 64; }
 
+template <auto N>
+struct number {
+    static constexpr auto value = N;
+    constexpr operator decltype(N)() const { return N; }
+};
+
+template <bool B>
+using bool_constant = number<B>;
+
 template <typename... Callables>
 float launch_kernel(const stream_config& s, Callables&&... callables)
 {
