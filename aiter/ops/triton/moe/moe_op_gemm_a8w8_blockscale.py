@@ -74,27 +74,18 @@ def get_kernel_config(m, n, k, routing_data, use_gluon=False):
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_stages = 2
-    num_buffers = 2
-
-    def _halve(block: int, dim: int, min_block: int) -> int:
-        while block > dim and block > min_block:
-            block //= 2
-        return block
+    num_buffers = 6
 
     split_k = 1
     if block_m == 16:
         block_n = 256
-        block_k = 128
+        block_k = 256
         num_warps = 4
     else:
         # for scale preshuffling
         block_n = 256
-        block_k = 128
-        num_warps = 8
-
-    block_m = _halve(block_m, m, 16)
-    block_n = _halve(block_n, n, 16)
-    block_k = _halve(block_k, k, 32 if use_gluon else 16)
+        block_k = 256
+        num_warps = 2
 
     grid_m = routing_data.n_blocks(m, block_m)
     grid_n = triton.cdiv(n, block_n)
@@ -490,7 +481,6 @@ def moe_gemm_a8w8_blockscale(
         if scatter_indx is None
         else scatter_indx.view(-1, routing_data.n_expts_act)
     )
-    print(y.shape)
     y_final = reduce_grouped(
         y,
         group_indx,
@@ -502,7 +492,6 @@ def moe_gemm_a8w8_blockscale(
         out_dtype=out_dtype,
         use_gluon=use_gluon,
     )
-    print(y_final.shape)
     return y_final
 
 
@@ -598,7 +587,7 @@ def main():
     parser.add_argument("--E", type=int, default=1, help="Total experts")
     parser.add_argument("--n_expts_act", type=int, default=1, help="Active experts per token")
     parser.add_argument(
-        "--do_gather", action=argparse.BooleanOptionalAction, default=False
+        "--do_gather", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument(
         "--do_scatter", action=argparse.BooleanOptionalAction, default=False
@@ -652,7 +641,10 @@ def main():
     logits = torch.randn((args.M, args.E), dtype=torch.float16, device=device)
     routing_data, gather_idx, scatter_idx = routing(logits, args.n_expts_act)
     routing_data.gate_scal = None
-    print(f"  block_m (from routing): {routing_data.block_m}")
+    config = get_kernel_config(args.M, args.N, args.K, routing_data, use_gluon=(arch == "gfx1250"))
+    print(f"  block_m: {config['block_m']}, block_n: {config['block_n']}, block_k: {config['block_k']}")
+    print(f"  num_warps: {config['num_warps']}")
+
     gather_idx = gather_idx if args.do_gather else None
     scatter_idx = scatter_idx if args.do_scatter else None
 
@@ -661,13 +653,15 @@ def main():
     w = (
         torch.randn((args.E, args.K, args.N), dtype=torch.bfloat16, device=device) / 10
     ).to(fp8e4_dtype)
+    w = w.transpose(1, 2).contiguous().transpose(1, 2)
     bias = torch.randn((args.E, args.N), dtype=torch.float32, device=device)
     gammas = (
         2 ** torch.randint(-5, 0, (args.M * args.n_expts_act,), device=device, dtype=torch.float32)
         if args.has_y_gammas
         else None
     )
-
+    print(f"  x strides: {x.stride()}")
+    print(f"  w strides: {w.stride()}")
     scale_m = (in_m + group_shape_m - 1) // group_shape_m
     scale_n = (args.N + group_shape_n - 1) // group_shape_n
     scale_k = (args.K + group_shape_k - 1) // group_shape_k

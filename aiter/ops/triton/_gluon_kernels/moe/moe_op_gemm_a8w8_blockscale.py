@@ -351,38 +351,49 @@ def consume_scaled_tile(
     is_x_blockscale: gl.constexpr,
     is_w_blockscale: gl.constexpr,
 ):
-    cur_a = a_buffer.index(m % NUM_BUFFERS).load(layout=DOT_A_LAYOUT)
-    b_shuffled = b_buffer.index(m % NUM_BUFFERS)
-    b_slice = unshuffle_b_to_kn(b_shuffled, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K)
-    cur_b = b_slice.load(layout=DOT_B_LAYOUT)
+    N_SUBTILES: gl.constexpr = gl.cdiv(BLOCK_K, BLOCKSCALE_K)
+    acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
 
-    offs_k_scale = (k_offset_start // BLOCKSCALE_K) + m * gl.cdiv(BLOCK_K, BLOCKSCALE_K)
+    a_tile = a_buffer.index(m % NUM_BUFFERS)
+    b_shuffled_tile = b_buffer.index(m % NUM_BUFFERS)
 
-    if is_x_blockscale:
-        cur_a_scale = gl.amd.cdna4.buffer_load(
-            ptr=XBlockScale,
-            offsets=a_scale_m_offs + offs_k_scale * stride_x_bs_k,
-            cache="",
-        )
-    else:
-        cur_a_scale = gl.full(
-            (BLOCK_M,), 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, WMMA_LAYOUT)
-        )
+    for sub in gl.static_range(N_SUBTILES):
+        offs_k_scale = (k_offset_start // BLOCKSCALE_K) + m * N_SUBTILES + sub
 
-    if is_w_blockscale:
-        cur_b_scale = gl.amd.cdna4.buffer_load(
-            ptr=b_scale_base,
-            offsets=offs_k_scale * stride_w_bs_k + b_scale_n_offs,
-            cache="",
-        )
-    else:
-        cur_b_scale = gl.full(
-            (BLOCK_N,), 1.0, dtype=gl.float32, layout=gl.SliceLayout(0, WMMA_LAYOUT)
-        )
+        if is_x_blockscale:
+            cur_a_scale = gl.amd.cdna4.buffer_load(
+                ptr=XBlockScale,
+                offsets=a_scale_m_offs + offs_k_scale * stride_x_bs_k,
+                cache="",
+            )
+        else:
+            cur_a_scale = gl.full(
+                (BLOCK_M,), 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, WMMA_LAYOUT)
+            )
 
-    zeros = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
-    partial = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
-    return partial * cur_a_scale[:, None] * cur_b_scale[None, :]
+        if is_w_blockscale:
+            cur_b_scale = gl.amd.cdna4.buffer_load(
+                ptr=b_scale_base,
+                offsets=offs_k_scale * stride_w_bs_k + b_scale_n_offs,
+                cache="",
+            )
+        else:
+            cur_b_scale = gl.full(
+                (BLOCK_N,), 1.0, dtype=gl.float32, layout=gl.SliceLayout(0, WMMA_LAYOUT)
+            )
+
+        sub_a_smem = a_tile.slice(sub * BLOCKSCALE_K, BLOCKSCALE_K, dim=1)
+        sub_a = sub_a_smem.load(layout=DOT_A_LAYOUT)
+
+        b_tile = unshuffle_b_to_kn(b_shuffled_tile, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K)
+        sub_b_smem = b_tile.slice(sub * BLOCKSCALE_K, BLOCKSCALE_K, dim=0)
+        sub_b = sub_b_smem.load(layout=DOT_B_LAYOUT)
+
+        zeros = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
+        partial = gl.amd.gfx1250.wmma(sub_a, sub_b, zeros)
+        acc += partial * cur_a_scale[:, None] * cur_b_scale[None, :]
+
+    return acc
 
 
 @gluon.jit
@@ -572,8 +583,6 @@ def _moe_gemm_a8w8_blockscale(
     - w_scale: Scale tensor for B with shape (K // blockscale_k, N // blockscale_n)
     - PER_ROW_X_SCALE: Determines whether we use per-row or 2D blockscale on X
     - NUM_BUFFERS: Determines the number of buffers to use for async_load
-
-    For this kernel implementation, BLOCKSCALE_K must equal BLOCK_K. #TODO: make this configurable
     """
     is_x_blockscale: gl.constexpr = XBlockScale is not None
     is_w_blockscale: gl.constexpr = WBlockScale is not None
@@ -636,7 +645,9 @@ def _moe_gemm_a8w8_blockscale(
         warps_per_cta=[1, num_warps],
         order=[0, 1],
     )
-    if num_warps == 4:
+    if num_warps == 2:
+        warp_bases: gl.constexpr = [[0, 1]]
+    elif num_warps == 4:
         warp_bases: gl.constexpr = [[0, 1], [1, 0]]
     else:
         warp_bases: gl.constexpr = [[0, 1], [0, 2], [1, 0]]
@@ -644,10 +655,10 @@ def _moe_gemm_a8w8_blockscale(
         version=3, transposed=True, warp_bases=warp_bases, instr_shape=[16, 16, 128]
     )
     SHARED_A: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_K, 16]], [BLOCK_M, BLOCK_K], [1, 0]
+        [[BLOCK_K, 4]], [BLOCK_M, BLOCK_K], [1, 0]
     )
     SHARED_B: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_K, 16]], [BLOCK_N // 16, BLOCK_K * 16], [1, 0]
+        [[BLOCK_K, 4]], [BLOCK_N // 16, BLOCK_K * 16], [1, 0]
     )
     DOT_A_LAYOUT: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=WMMA_LAYOUT, k_width=16
