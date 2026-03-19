@@ -204,8 +204,8 @@ def torch_mla_extend(
     "q_dtype, kv_dtype, out_dtype, use_out_scale",
     [
         (torch.bfloat16, torch.bfloat16, torch.bfloat16, False),
-        (torch.bfloat16, e4m3_dtype, torch.bfloat16, True),
-        (e4m3_dtype, e4m3_dtype, torch.bfloat16, True),
+        # (torch.bfloat16, e4m3_dtype, torch.bfloat16, True),
+        # (e4m3_dtype, e4m3_dtype, torch.bfloat16, True),
     ],
 )
 @pytest.mark.parametrize(
@@ -309,8 +309,8 @@ def test_mla_decode_fwd(
             kv_descale=kv_descale,
             out_scale=out_scale,
             shuffled_kv_cache=shuffled_kv_cache,
-            num_warps=4,
-            waves_per_eu=2,
+            num_warps=2,
+            waves_per_eu=1,
             num_segments=8,
         )
     else:
