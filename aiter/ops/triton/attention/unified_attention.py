@@ -4,6 +4,7 @@ import triton
 import torch
 from aiter.ops.triton.utils.device_info import get_num_sms
 import math
+from typing import Callable
 from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     kernel_unified_attention_2d,
     kernel_unified_attention_3d,
@@ -100,6 +101,49 @@ def use_2d_kernel(
     )
 
 
+def _max_kv_offset_elems(
+    x: torch.Tensor, block_size: int, num_kv_heads: int, head_size: int
+) -> int:
+    # Triton HIP may lower global addressing through signed int32 offsets.
+    # Bound the largest element offset touched by the paged KV addressing math.
+    max_block_idx = int(x.shape[0]) - 1
+    if max_block_idx < 0:
+        return 0
+    s0, s1, s2, s3 = [abs(int(s)) for s in x.stride()]
+    inner = (
+        (block_size - 1) * s1
+        + (num_kv_heads - 1) * s2
+        + (head_size - 1) * s3
+    )
+    return max_block_idx * s0 + inner
+
+
+def _needs_disable_amd_buffer_ops(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_size: int,
+    num_kv_heads: int,
+    head_size: int,
+) -> bool:
+    int32_max = (1 << 31) - 1
+    max_offset = max(
+        _max_kv_offset_elems(k, block_size, num_kv_heads, head_size),
+        _max_kv_offset_elems(v, block_size, num_kv_heads, head_size),
+    )
+    return max_offset > int32_max
+
+
+def _launch_with_optional_amd_buffer_ops_guard(
+    needs_disable_buffer_ops: bool, launch: Callable[[], None]
+) -> None:
+    if needs_disable_buffer_ops:
+        with triton.knobs.amd.scope():
+            triton.knobs.amd.use_buffer_ops = False
+            launch()
+    else:
+        launch()
+
+
 def unified_attention(
     q,
     k,
@@ -159,6 +203,9 @@ def unified_attention(
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
+    needs_disable_buffer_ops = torch.version.hip is not None and (
+        _needs_disable_amd_buffer_ops(k, v, block_size, num_kv_heads, head_size)
+    )
     # if batch contains a prefill
     if use_2d_kernel(
         head_size,
@@ -182,55 +229,60 @@ def unified_attention(
         assert config["BLOCK_Q"] >= 1
         total_num_q_blocks = q.shape[0] // config["BLOCK_Q"] + num_seqs
 
-        kernel_unified_attention_2d[
-            (
-                num_kv_heads,
-                total_num_q_blocks,
+        def _launch_2d() -> None:
+            kernel_unified_attention_2d[
+                (
+                    num_kv_heads,
+                    total_num_q_blocks,
+                )
+            ](
+                output_ptr=out,
+                query_ptr=q,
+                key_cache_ptr=k,
+                value_cache_ptr=v,
+                sink_ptr=sinks,
+                block_tables_ptr=block_table,
+                seq_lens_ptr=seqused_k,
+                alibi_slopes_ptr=alibi_slopes,
+                qq_bias_ptr=qq_bias,
+                scale=softmax_scale,
+                k_scale=k_descale,
+                v_scale=v_descale,
+                out_scale=1 / output_scale if output_scale is not None else 1.0,
+                softcap=softcap,
+                num_query_heads=num_query_heads,
+                num_queries_per_kv=num_queries_per_kv,
+                block_table_stride=block_table.stride(0),
+                query_stride_0=q.stride(0),
+                query_stride_1=q.stride(1),
+                output_stride_0=out.stride(0),
+                output_stride_1=out.stride(1),
+                qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
+                BLOCK_SIZE=block_size,
+                HEAD_SIZE=head_size,
+                HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+                USE_ALIBI_SLOPES=use_alibi_slopes,
+                USE_QQ_BIAS=use_qq_bias,
+                USE_SOFTCAP=(softcap > 0),
+                USE_SINKS=(sinks is not None),
+                SLIDING_WINDOW=SLIDING_WINDOW,
+                stride_k_cache_0=k.stride(0),
+                stride_k_cache_1=k.stride(1),
+                stride_k_cache_2=k.stride(2),
+                stride_k_cache_3=k.stride(3),
+                stride_v_cache_0=v.stride(0),
+                stride_v_cache_1=v.stride(1),
+                stride_v_cache_2=v.stride(2),
+                stride_v_cache_3=v.stride(3),
+                query_start_len_ptr=cu_seqlens_q,
+                num_seqs=num_seqs,
+                USE_FP8=output_scale is not None,
+                ALL_DECODE=ALL_DECODE,
+                **config,
             )
-        ](
-            output_ptr=out,
-            query_ptr=q,
-            key_cache_ptr=k,
-            value_cache_ptr=v,
-            sink_ptr=sinks,
-            block_tables_ptr=block_table,
-            seq_lens_ptr=seqused_k,
-            alibi_slopes_ptr=alibi_slopes,
-            qq_bias_ptr=qq_bias,
-            scale=softmax_scale,
-            k_scale=k_descale,
-            v_scale=v_descale,
-            out_scale=1 / output_scale if output_scale is not None else 1.0,
-            softcap=softcap,
-            num_query_heads=num_query_heads,
-            num_queries_per_kv=num_queries_per_kv,
-            block_table_stride=block_table.stride(0),
-            query_stride_0=q.stride(0),
-            query_stride_1=q.stride(1),
-            output_stride_0=out.stride(0),
-            output_stride_1=out.stride(1),
-            qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
-            BLOCK_SIZE=block_size,
-            HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
-            USE_ALIBI_SLOPES=use_alibi_slopes,
-            USE_QQ_BIAS=use_qq_bias,
-            USE_SOFTCAP=(softcap > 0),
-            USE_SINKS=(sinks is not None),
-            SLIDING_WINDOW=SLIDING_WINDOW,
-            stride_k_cache_0=k.stride(0),
-            stride_k_cache_1=k.stride(1),
-            stride_k_cache_2=k.stride(2),
-            stride_k_cache_3=k.stride(3),
-            stride_v_cache_0=v.stride(0),
-            stride_v_cache_1=v.stride(1),
-            stride_v_cache_2=v.stride(2),
-            stride_v_cache_3=v.stride(3),
-            query_start_len_ptr=cu_seqlens_q,
-            num_seqs=num_seqs,
-            USE_FP8=output_scale is not None,
-            ALL_DECODE=ALL_DECODE,
-            **config,
+
+        _launch_with_optional_amd_buffer_ops_guard(
+            needs_disable_buffer_ops, _launch_2d
         )
 
     else:
@@ -266,50 +318,57 @@ def unified_attention(
             device=q.device,
         )
 
-        kernel_unified_attention_3d[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
-            segm_output_ptr=segm_output,
-            segm_max_ptr=segm_max,
-            segm_expsum_ptr=segm_expsum,
-            query_ptr=q,
-            key_cache_ptr=k,
-            value_cache_ptr=v,
-            sink_ptr=sinks,
-            block_tables_ptr=block_table,
-            seq_lens_ptr=seqused_k,
-            alibi_slopes_ptr=alibi_slopes,
-            qq_bias_ptr=qq_bias,
-            scale=softmax_scale,
-            k_scale=k_descale,
-            v_scale=v_descale,
-            softcap=softcap,
-            num_query_heads=num_query_heads,
-            num_queries_per_kv=num_queries_per_kv,
-            block_table_stride=block_table.stride(0),
-            query_stride_0=q.stride(0),
-            query_stride_1=q.stride(1),
-            qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
-            BLOCK_SIZE=block_size,
-            HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
-            USE_ALIBI_SLOPES=use_alibi_slopes,
-            USE_QQ_BIAS=use_qq_bias,
-            USE_SOFTCAP=(softcap > 0),
-            USE_SINKS=(sinks is not None),
-            SLIDING_WINDOW=SLIDING_WINDOW,
-            stride_k_cache_0=k.stride(0),
-            stride_k_cache_1=k.stride(1),
-            stride_k_cache_2=k.stride(2),
-            stride_k_cache_3=k.stride(3),
-            stride_v_cache_0=v.stride(0),
-            stride_v_cache_1=v.stride(1),
-            stride_v_cache_2=v.stride(2),
-            stride_v_cache_3=v.stride(3),
-            query_start_len_ptr=cu_seqlens_q,
-            BLOCK_Q=BLOCK_Q,
-            num_seqs=num_seqs,
-            BLOCK_M=BLOCK_M,
-            ALL_DECODE=ALL_DECODE,
-            **attn_config,
+        def _launch_3d() -> None:
+            kernel_unified_attention_3d[
+                (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
+            ](
+                segm_output_ptr=segm_output,
+                segm_max_ptr=segm_max,
+                segm_expsum_ptr=segm_expsum,
+                query_ptr=q,
+                key_cache_ptr=k,
+                value_cache_ptr=v,
+                sink_ptr=sinks,
+                block_tables_ptr=block_table,
+                seq_lens_ptr=seqused_k,
+                alibi_slopes_ptr=alibi_slopes,
+                qq_bias_ptr=qq_bias,
+                scale=softmax_scale,
+                k_scale=k_descale,
+                v_scale=v_descale,
+                softcap=softcap,
+                num_query_heads=num_query_heads,
+                num_queries_per_kv=num_queries_per_kv,
+                block_table_stride=block_table.stride(0),
+                query_stride_0=q.stride(0),
+                query_stride_1=q.stride(1),
+                qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
+                BLOCK_SIZE=block_size,
+                HEAD_SIZE=head_size,
+                HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+                USE_ALIBI_SLOPES=use_alibi_slopes,
+                USE_QQ_BIAS=use_qq_bias,
+                USE_SOFTCAP=(softcap > 0),
+                USE_SINKS=(sinks is not None),
+                SLIDING_WINDOW=SLIDING_WINDOW,
+                stride_k_cache_0=k.stride(0),
+                stride_k_cache_1=k.stride(1),
+                stride_k_cache_2=k.stride(2),
+                stride_k_cache_3=k.stride(3),
+                stride_v_cache_0=v.stride(0),
+                stride_v_cache_1=v.stride(1),
+                stride_v_cache_2=v.stride(2),
+                stride_v_cache_3=v.stride(3),
+                query_start_len_ptr=cu_seqlens_q,
+                BLOCK_Q=BLOCK_Q,
+                num_seqs=num_seqs,
+                BLOCK_M=BLOCK_M,
+                ALL_DECODE=ALL_DECODE,
+                **attn_config,
+            )
+
+        _launch_with_optional_amd_buffer_ops_guard(
+            needs_disable_buffer_ops, _launch_3d
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
