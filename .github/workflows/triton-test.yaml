@@ -57,36 +57,36 @@ jobs:
   # Step 2: matrix jobs consume shard file lists
   triton:
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
-    name: Triton Tests (1 GPU) / Shard ${{ matrix.shard }}
+    name: Triton Tests (1 GPU, ${{ matrix.label }}) / Shard ${{ matrix.shard }}
     runs-on: ${{ matrix.runner }}
     needs: [split_triton_tests, check-signal]
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi355-1
+            label: MI355
             shard: 0
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi355-1
+            label: MI355
             shard: 1
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi355-1
+            label: MI355
             shard: 2
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi355-1
+            label: MI355
             shard: 3
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi355-1
+            label: MI355
             shard: 4
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi355-1
+            label: MI355
             shard: 5
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi355-1
+            label: MI355
             shard: 6
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi355-1
+            label: MI355
             shard: 7
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
@@ -189,7 +189,7 @@ jobs:
           set -ex
           echo "Running Triton Tests..."
           docker exec -w /workspace triton_test mkdir -p test-reports
-          docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} --junitxml=test-reports/triton.xml
+          docker exec -e TRITON_HIP_USE_ASYNC_COPY=0 -w /workspace triton_test pytest -v ${TRITON_TEST} --junitxml=test-reports/triton.xml
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
