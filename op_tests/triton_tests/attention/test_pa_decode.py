@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import triton.language as tl
-import torch
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 import pytest
 import random
+import torch
+import triton.language as tl
 from aiter.ops.triton.attention.pa_decode import paged_attention_decode
 from aiter import pertoken_quant
+from aiter.utility.dtypes import fp8
 
 DEBUG_MODE = False
+DEVICE = arch_info.get_arch()
 
 
 def paged_attention_decode_ref(
@@ -148,6 +151,7 @@ def input_helper(
     )
 
 
+@pytest.mark.skipif(DEVICE == "gfx1250", reason="PA decode not supported on gfx1250; use unified attention instead")
 @pytest.mark.parametrize("B", [1, 4, 27])
 @pytest.mark.parametrize("H_Q, H_KV", [(1, 1), (16, 16), (24, 4)])
 @pytest.mark.parametrize("D", [1, 64, 128])
@@ -166,9 +170,9 @@ def input_helper(
     [
         (torch.float16, torch.float16, tl.float16, torch.float16),
         (torch.bfloat16, torch.bfloat16, tl.bfloat16, torch.bfloat16),
-        (torch.bfloat16, torch.float8_e4m3fnuz, tl.bfloat16, torch.bfloat16),
+        (torch.bfloat16, fp8, tl.bfloat16, torch.bfloat16),
         (torch.bfloat16, torch.int8, tl.bfloat16, torch.bfloat16),
-        (torch.float8_e4m3fnuz, torch.float8_e4m3fnuz, tl.bfloat16, torch.bfloat16),
+        (fp8, fp8, tl.bfloat16, torch.bfloat16),
         (torch.int8, torch.int8, tl.bfloat16, torch.bfloat16),
     ],
 )
@@ -189,6 +193,7 @@ def test_paged_attn(
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     if SEQ_LEN >= 8192 and B >= 16:
         pytest.skip("B>={4} and SEQ_LEN>={8192} tests are too slow")
+    # Remap fnuz to arch-appropriate fp8 dtype
     torch.set_printoptions(threshold=100000)
     num_blocks = NUM_BLK
 
@@ -248,6 +253,7 @@ def test_paged_attn(
     torch.testing.assert_close(triton_output, torch_output, rtol=1e-02, atol=1e-02)
 
 
+@pytest.mark.skipif(DEVICE == "gfx1250", reason="PA decode not supported on gfx1250; use unified attention instead")
 @pytest.mark.parametrize("B", [1, 4, 57, 64])
 # @pytest.mark.parametrize("H_Q, H_KV", [(1,1), (16, 16), (2,1), (24,4)]) #TODO: GQA failing
 @pytest.mark.parametrize("H_Q, H_KV", [(1, 1), (16, 16)])
@@ -314,13 +320,13 @@ def test_paged_attn_per_token_quant(
         key_cache_tri_quant,
         k_scale,
     ) = pertoken_quant(
-        key_cache_tri, scale_dtype=torch.float32, quant_dtype=torch.float8_e4m3fnuz
+        key_cache_tri, scale_dtype=torch.float32, quant_dtype=fp8
     )
     (
         value_cache_tri_quant,
         v_scale,
     ) = pertoken_quant(
-        value_cache_tri, scale_dtype=torch.float32, quant_dtype=torch.float8_e4m3fnuz
+        value_cache_tri, scale_dtype=torch.float32, quant_dtype=fp8
     )
 
     paged_attention_decode(
