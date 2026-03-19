@@ -32,11 +32,14 @@ def _resolve_backend(backend: Optional[str]) -> str:
     if backend is None:
         return "gluon" if _is_gluon_available() else "triton"
     backend = backend.lower()
-    assert backend in ("triton", "gluon"), \
-        f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
+    assert backend in (
+        "triton",
+        "gluon",
+    ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
     if backend == "gluon":
-        assert _is_gluon_available(), \
-            f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
+        assert (
+            _is_gluon_available()
+        ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
     return backend
 
 
@@ -152,9 +155,16 @@ def _gemm_a16w16_gluon(
     from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_a16w16_gfx1250 import (
         gemm_a16w16_gfx1250,
     )
+
     return gemm_a16w16_gfx1250(
-        x, w, bias=bias, dtype=dtype, y=y, config=config,
-        activation=activation, kernel_type=kernel_type,
+        x,
+        w,
+        bias=bias,
+        dtype=dtype,
+        y=y,
+        config=config,
+        activation=activation,
+        kernel_type=kernel_type,
     )
 
 
@@ -199,11 +209,23 @@ def gemm_a16w16(
 
     if resolved == "gluon":
         return _gemm_a16w16_gluon(
-            x, w, bias=bias, dtype=dtype, y=y, config=config,
-            activation=activation, kernel_type=kernel_type,
+            x,
+            w,
+            bias=bias,
+            dtype=dtype,
+            y=y,
+            config=config,
+            activation=activation,
+            kernel_type=kernel_type,
         )
     else:
         return _gemm_a16w16_triton(
-            x, w, bias=bias, dtype=dtype, y=y, config=config,
-            activation=activation, skip_reduce=skip_reduce,
+            x,
+            w,
+            bias=bias,
+            dtype=dtype,
+            y=y,
+            config=config,
+            activation=activation,
+            skip_reduce=skip_reduce,
         )
