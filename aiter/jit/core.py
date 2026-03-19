@@ -423,7 +423,7 @@ def check_LLVM_MAIN_REVISION():
     import subprocess
 
     cmd = """echo "#include <tuple>
-__host__ __device__ void func(){std::tuple<int, int> t = std::tuple(1, 1);}" | hipcc -x hip -P -c -Wno-unused-command-line-argument -"""
+__host__ __device__ void func(){std::tuple<int, int> t = std::tuple(1, 1);}" | hipcc -x hip -P -c -Wno-unused-command-line-argument -o /dev/null -"""
     try:
         subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.STDOUT)
     except subprocess.CalledProcessError:
