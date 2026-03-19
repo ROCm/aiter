@@ -229,6 +229,11 @@ def run_benchmark(custom, args):
         max_kv_len = max(seqlens_k).item()
         soft_cap = args.softcap
         block_size = args.block_size if args.block_size else 512
+
+        # round down block_size to the nearest power of 2 for v1/v2 quantization
+        if (args.sagev1 or args.sagev2) and (block_size & (block_size - 1) != 0):
+            block_size = 1 << (block_size.bit_length() - 1)
+            
         max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
         min_required_blocks = BATCH * max_num_blocks_per_seq
         num_blocks = (
@@ -275,7 +280,7 @@ def run_benchmark(custom, args):
             from aiter.ops.triton.attention.unified_attention import get_config
             num_queries_per_kv = num_query_heads // num_kv_heads
             config = get_config(
-                query.shape[0], len(cu_seqlens_q),
+                query.shape[0], num_seqs,
                 num_queries_per_kv, num_kv_heads, head_size,
                 window_size, max_query_len, max_kv_len,
                 block_size, query.element_size()
@@ -368,8 +373,8 @@ def run_benchmark(custom, args):
                 atol, rtol = 1.5e-1, 1.5e-1
             else:
                 atol, rtol = 1.5e-2, 1e-2
-            print("output", output.flatten()[0:50])
-            print("ref_output", ref_output.flatten()[0:50])
+            # print("output", output.flatten()[0:50])
+            # print("ref_output", ref_output.flatten()[0:50])
             max_err = torch.max(torch.abs(output - ref_output)).item()
             tag = "fp8_full" if args.fp8_full else \
                     "fp8" if args.fp8 else \

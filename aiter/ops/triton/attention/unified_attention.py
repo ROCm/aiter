@@ -332,6 +332,8 @@ def unified_attention(
 
         TILE_SIZE=config["TILE_SIZE"]
         BLOCK_M=config["BLOCK_M"]
+        assert config["BLOCK_Q"] >= 1
+        total_num_q_blocks = q.shape[0] // config["BLOCK_Q"] + num_seqs
         (
             query_scale_stride_0,
             query_scale_stride_1,
@@ -354,9 +356,6 @@ def unified_attention(
             TILE_SIZE=TILE_SIZE,
             sage_version=sage_version
         )
-
-        assert config["BLOCK_Q"] >= 1
-        total_num_q_blocks = q.shape[0] // config["BLOCK_Q"] + num_seqs
 
         kernel_unified_attention_2d[
             (
