@@ -5,8 +5,9 @@ import torch
 from aiter.ops.triton.utils.device_info import get_num_sms
 import math
 from aiter.ops.triton.gluon.mla_kernel import (
-    _mla_prefill_fwd_kernel,
     _mla_decode_fwd_kernel,
+    _mla_prefill_fwd_kernel_non_pipelined,
+    _mla_decode_fwd_kernel_non_pipelined,
     _mla_decode_fwd_reduce_kernel,
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
@@ -129,7 +130,7 @@ def mla_prefill_fwd(
         kv_buffer.dtype,
     )
 
-    _mla_prefill_fwd_kernel[(num_kv_heads, total_num_q_blocks)](
+    _mla_prefill_fwd_kernel_non_pipelined[(num_kv_heads, total_num_q_blocks)](
         output_ptr=out,
         query_ptr=q,
         kv_buffer_ptr=kv_buffer,
@@ -184,7 +185,11 @@ def mla_decode_fwd(
     assert causal, "Only causal attention is supported"
 
     total_num_tokens, num_query_heads, qk_head_dim = q.shape
-    num_blocks, block_size, num_kv_heads, _ = kv_buffer.shape
+    if shuffled_kv_cache:
+        num_blocks, num_kv_heads, block_size, _ = kv_buffer.shape
+        block_size = block_size * 16
+    else:
+        num_blocks, block_size, num_kv_heads, _ = kv_buffer.shape
     num_seqs = len(seqused_k)
     num_tokens_per_seq = total_num_tokens // num_seqs
     num_queries_per_kv = num_query_heads // num_kv_heads
@@ -255,7 +260,12 @@ def mla_decode_fwd(
         device=q.device,
     )
 
-    _mla_decode_fwd_kernel[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
+    if shuffled_kv_cache:
+        impl = _mla_decode_fwd_kernel
+    else:
+        impl = _mla_decode_fwd_kernel_non_pipelined
+
+    impl[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,
         segm_expsum_ptr=segm_expsum,
@@ -279,6 +289,7 @@ def mla_decode_fwd(
         stride_kv_buffer_3=kv_buffer.stride(3),
         query_start_len_ptr=cu_seqlens_q,
         num_tokens_per_seq=num_tokens_per_seq,
+        num_blocks=num_blocks,
         WARP_SIZE=WARP_SIZE,
         BLOCK_Q=BLOCK_Q,
         BLOCK_M=BLOCK_M,

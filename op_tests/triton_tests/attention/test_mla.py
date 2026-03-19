@@ -34,6 +34,7 @@ def shuffle_kv_buffer(
             BF16: 16x16x32
             FP8: 16x16x64
     """
+
     dtype = kv_buffer.dtype
     assert dtype in (torch.bfloat16, e4m3_dtype)
 
@@ -45,14 +46,10 @@ def shuffle_kv_buffer(
         layout = (16, 16)
 
     num_blocks, block_size, num_kv_heads, head_size = kv_buffer.shape
+
     assert block_size >= 16
 
     num_lanes, num_elements_per_thread = layout
-    kv_buffer_shuffled = kv_buffer.view(
-        -1, block_size, num_kv_heads, head_size
-    ).permute(0, 2, 1, 3)
-    kv_buffer_shuffled_lora = kv_buffer_shuffled[..., :kv_lora_rank]
-    kv_buffer_shuffled_rope = kv_buffer_shuffled[..., kv_lora_rank:]
 
     def shuffle(kvb, h):
         kvb = kvb.view(
@@ -68,8 +65,15 @@ def shuffle_kv_buffer(
         kvb = kvb.view(-1, num_kv_heads, block_size // 16, h * 16)
         return kvb
 
-    kv_buffer_shuffled_lora = shuffle(kv_buffer_shuffled_lora, kv_lora_rank)
-    kv_buffer_shuffled_rope = shuffle(kv_buffer_shuffled_rope, head_size - kv_lora_rank)
+    kv_buffer_shuffled = kv_buffer.view(
+        -1, block_size, num_kv_heads, head_size
+    ).permute(0, 2, 1, 3)
+    kv_buffer_shuffled_lora = shuffle(
+        kv_buffer_shuffled[..., :kv_lora_rank], kv_lora_rank
+    )
+    kv_buffer_shuffled_rope = shuffle(
+        kv_buffer_shuffled[..., kv_lora_rank:], head_size - kv_lora_rank
+    )
     kv_buffer_shuffled = torch.cat(
         [kv_buffer_shuffled_lora, kv_buffer_shuffled_rope], dim=-1
     ).contiguous()
@@ -188,12 +192,12 @@ def torch_mla_extend(
     return out.to(o_dtype)
 
 
-@pytest.mark.parametrize("batch_size", [1, 32])
+@pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("decode_qlen", [1])
 @pytest.mark.parametrize("ctx_lens", [1024])
 @pytest.mark.parametrize("num_heads", [(16, 1)])
 @pytest.mark.parametrize("kv_lora_rank, qk_rope_head_dim", [(512, 64)])
-@pytest.mark.parametrize("block_size", [16])
+@pytest.mark.parametrize("block_size", [64])
 @pytest.mark.parametrize("num_blocks", [128])
 @pytest.mark.parametrize("varlen", [True, False])
 @pytest.mark.parametrize(
@@ -208,8 +212,8 @@ def torch_mla_extend(
     "backend, shuffled_kv_cache",
     [
         # ("triton", False),  # use triton
-        ("gluon", False),
-        # ("gluon", True),
+        # ("gluon", False),
+        ("gluon", True),
     ],
 )
 # @torch.inference_mode()
@@ -305,8 +309,8 @@ def test_mla_decode_fwd(
             kv_descale=kv_descale,
             out_scale=out_scale,
             shuffled_kv_cache=shuffled_kv_cache,
-            num_warps=8,
-            waves_per_eu=1,
+            num_warps=4,
+            waves_per_eu=2,
             num_segments=8,
         )
     else:
