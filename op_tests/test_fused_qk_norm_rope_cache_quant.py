@@ -2140,6 +2140,4 @@ if __name__ == "__main__":
                     df.append(ret)
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
-    aiter.logger.info(
-        "partial_rotary_pts_quant summary (markdown):\n%s", df_md
-    )
+    aiter.logger.info("partial_rotary_pts_quant summary (markdown):\n%s", df_md)
