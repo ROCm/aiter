@@ -1,13 +1,14 @@
 #pragma once
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include <string>
+
 
 enum class ActivationType : int
 {
-    No = -1,
-    Silu = 0,
-    Gelu = 1,
+    No     = -1,
+    Silu   = 0,
+    Gelu   = 1,
     Swiglu = 2,
 };
 enum class QuantType : int
@@ -18,6 +19,8 @@ enum class QuantType : int
     per_1x32,
     per_1x128,
     per_128x128,
+    per_256x128,
+    per_1024x128,
 };
 typedef enum {
     AITER_DTYPE_fp8,

@@ -562,7 +562,16 @@ def acc_test_cudagraph_on(
 #         checkAllclose(cpu_rslt[i], ar_rslt[i].to(ref))
 
 l_dtype = ["fp16", "bf16"]
-l_shape = [(13, 512), (13, 1024), (13, 2048), (17, 4096), (17, 7168), (19, 8192)]
+# (13, 2880): GPT-OSS-120B / GPT-OSS-20B hidden_size (n_bytes=5760, 4096 < 5760 < 8192)
+l_shape = [
+    (13, 512),
+    (13, 1024),
+    (13, 2048),
+    (13, 2880),
+    (17, 4096),
+    (17, 7168),
+    (19, 8192),
+]
 l_tp = [8]
 l_pp = [1]
 l_graph = [False, True]

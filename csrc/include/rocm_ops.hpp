@@ -80,7 +80,8 @@ namespace py = pybind11;
           py::arg("splitLse")       = std::nullopt, \
           py::arg("mask")           = 0,            \
           py::arg("high_precision") = 1,            \
-          py::arg("kernelName")     = std::nullopt);
+          py::arg("kernelName")     = std::nullopt, \
+          py::arg("quant_type")     = QuantType::per_Token);
 
 #define ATTENTION_CK_PYBIND            \
     m.def("pa_fwd_naive",              \
@@ -1207,7 +1208,22 @@ namespace py = pybind11;
           py::arg("kernel_name"),                                              \
           py::arg("fc2_smooth_scale") = std::nullopt,                          \
           py::arg("activation")       = ActivationType::Silu);                       \
-    m.def("fmoe_int8_g1u0_a16", &fmoe_int8_g1u0_a16);                          \
+    m.def("fmoe_int8_g1u0_a16",                                                \
+          &fmoe_int8_g1u0_a16,                                                \
+          py::arg("out"),                                                      \
+          py::arg("input"),                                                    \
+          py::arg("gate"),                                                     \
+          py::arg("down"),                                                     \
+          py::arg("sorted_token_ids"),                                         \
+          py::arg("sorted_weights"),                                           \
+          py::arg("sorted_expert_ids"),                                        \
+          py::arg("num_valid_ids"),                                            \
+          py::arg("topk"),                                                     \
+          py::arg("fc1_scale"),                                                \
+          py::arg("fc2_scale"),                                                \
+          py::arg("fc1_smooth_scale"),                                         \
+          py::arg("fc2_smooth_scale"),                                         \
+          py::arg("activation") = ActivationType::Silu);                      \
     m.def("fmoe_g1u1_a16",                                                     \
           &fmoe_g1u1_a16,                                                      \
           py::arg("out"),                                                      \
@@ -1665,6 +1681,8 @@ namespace py = pybind11;
         .value("per_1x32", QuantType::per_1x32)          \
         .value("per_1x128", QuantType::per_1x128)        \
         .value("per_128x128", QuantType::per_128x128)    \
+        .value("per_256x128", QuantType::per_256x128)    \
+        .value("per_1024x128", QuantType::per_1024x128)  \
         .export_values();                                \
     pybind11::enum_<ActivationType>(m, "ActivationType") \
         .value("No", ActivationType::No)                 \
