@@ -458,6 +458,8 @@ dtype2str_dict = {
     dtypes.fp16: "f16",
     dtypes.bf16: "b16",
     dtypes.fp8: "f8",
+    torch.float8_e4m3fn: "f8",
+    torch.float8_e4m3fnuz: "f8",
     dtypes.i8: "i8",
     dtypes.fp4x2: "fp4x2",
     torch.uint32: "i4",
