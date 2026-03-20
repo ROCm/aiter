@@ -368,7 +368,6 @@
     },
     "module_gemm_a8w8_asm": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_asm_pybind.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_gemm_a8w8.cu'"
         ],
         "flags_extra_cc": [],

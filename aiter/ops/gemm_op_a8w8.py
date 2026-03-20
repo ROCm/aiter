@@ -98,36 +98,43 @@ def gemm_a8w8_bpreshuffle_cktile(
 ) -> Tensor: ...
 
 
-def gen_gemm_a8w8_asm_fake_tensors(
-    XQ: Tensor,  # A:[M, K] i8
-    WQ: Tensor,  # B:[N, K] i8 -> shuffle layout(32,16)
-    x_scale: Tensor,  # A_scale:[M, 1] f32
-    w_scale: Tensor,  # B_scale:[1, N] f32
-    Out: Tensor,  # Out:[M, N] bf16
-    kernelName: str,
-    bias: Optional[Tensor],  # bias:[1, N] f32
-    bpreshuffle: Optional[bool] = True,
-    splitK: Optional[int] = None,
-) -> torch.Tensor:
-    return Out
-
-
 @compile_ops(
     "module_gemm_a8w8_asm",
     fc_name="gemm_a8w8_asm",
-    gen_fake=gen_gemm_a8w8_asm_fake_tensors,
+    ffi_type="ctypes",
 )
-def gemm_a8w8_asm(
+def _gemm_a8w8_asm(
     XQ: Tensor,  # A:[M, K] i8
     WQ: Tensor,  # B:[N, K] i8 -> shuffle layout(32,16)
     x_scale: Tensor,  # A_scale:[M, 1] f32
     w_scale: Tensor,  # B_scale:[1, N] f32
     Out: Tensor,  # Out:[M, N] bf16
-    kernelName: str,
-    bias: Optional[Tensor],  # bias:[1, N] f32
+    kernelName: Optional[str] = None,
+    bias: Optional[Tensor] = None,  # bias:[1, N] f32
+    bpreshuffle: bool = True,
+    splitK: int = -1,
+) -> None: ...
+
+
+def gemm_a8w8_asm(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    kernelName: str = "",
+    bias: Optional[Tensor] = None,
     bpreshuffle: Optional[bool] = True,
     splitK: Optional[int] = None,
-) -> torch.Tensor: ...
+) -> Tensor:
+    _gemm_a8w8_asm(
+        XQ, WQ, x_scale, w_scale, Out,
+        kernelName if kernelName else None,
+        bias,
+        bool(bpreshuffle) if bpreshuffle is not None else True,
+        splitK if splitK is not None else -1,
+    )
+    return Out
 
 
 def gen_gemm_a8w8_blockscale_ck_fake_tensors(
