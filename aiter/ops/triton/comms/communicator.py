@@ -44,7 +44,6 @@ class AiterCommunicator:
     ) -> None:
         self.disabled = True
         self._shmem = None
-        self._config = None
         self._workspace = None
         self._input_buf = None
         self._output_buf = None
@@ -69,14 +68,12 @@ class AiterCommunicator:
 
         try:
             import iris
-            from iris.ccl import Config
-            self._shmem = iris.iris(heap_size=self._HEAP_SIZE)
-            self._config = Config(use_device_barrier=True)
+            self._shmem = iris.iris(heap_size=self._HEAP_SIZE, coord_backend="gloo")
             self.disabled = False
             rank = dist.get_rank(group)
             logger.info(
-                "Allreduce initialized: rank %d/%d config=%s",
-                rank, world_size, self._config,
+                "Allreduce initialized: rank %d/%d coord_backend=gloo",
+                rank, world_size,
             )
         except Exception as e:
             logger.warning("Failed to initialize Allreduce: %s", e)
@@ -113,7 +110,7 @@ class AiterCommunicator:
         input_buf.copy_(inp)
 
         self._workspace = self._shmem.ccl.all_reduce(
-            output_buf, input_buf, config=self._config, workspace=self._workspace
+            output_buf, input_buf, workspace=self._workspace
         )
 
         out = torch.empty_like(inp)
