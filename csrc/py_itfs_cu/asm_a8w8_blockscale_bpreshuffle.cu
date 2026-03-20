@@ -209,6 +209,7 @@ static void print_debug_info(const KernelArgs& args, const std::string& selected
                            const std::optional<torch::Tensor>& bias) {
     if (!DebugPrint) return;
     
+    printf("\n=== A8W8 GEMM Kernel Parameters ===\n");
     printf("Selected Kernel: %s\n", selectedKernelName.c_str());
     printf("Matrix dimensions: M=%u, N=%u, K=%u\n", args.m, args.n, args.k);
     printf("Grid dimensions: gdx=%d, gdy=%d, gdz=%d\n", gdx, gdy, gdz);
