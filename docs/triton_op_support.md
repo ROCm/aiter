@@ -1,19 +1,20 @@
-# Triton Attention Operator Support Matrix
-
-> References: [flash-attention](https://github.com/Dao-AILab/flash-attention) · [ROCm GPU specs](https://rocm.docs.amd.com/en/latest/reference/gpu-arch-specs.html) · [PyTorch FP8](https://pytorch.org/docs/stable/torch.html#torch.float8_e4m3fn) · [GQA paper](https://arxiv.org/abs/2305.13245) · [HSTU paper](https://arxiv.org/abs/2402.17152)
+# Triton Operator Support Matrix
 
 ## Overview
 
-| Operator | File | dtype | GPU Arch | Causal | GQA | FP8 | KV Cache | Dropout | Backward |
-|----------|------|-------|----------|:------:|:---:|:---:|:--------:|:-------:|:--------:|
-| **MHA** | [`mha.py`](../aiter/ops/triton/attention/mha.py) | fp16 · bf16 · fp32 · fp8 | gfx942 / gfx950 / other ROCm | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ |
-| **MHA v3** | [`mha_v3.py`](../aiter/ops/triton/attention/mha_v3.py) | fp16 · bf16 · fp32 · fp8 | gfx942 / gfx950 / other ROCm | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
-| **HSTU** | [`hstu_attention.py`](../aiter/ops/triton/attention/hstu_attention.py) | bf16 · fp16 | all ROCm⁷ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ |
-| **PA Decode** | [`pa_decode.py`](../aiter/ops/triton/attention/pa_decode.py) | fp16 · bf16 · fp8 · int8 | gfx942 / gfx950 | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
-| **PA Prefill** | [`pa_prefill.py`](../aiter/ops/triton/attention/pa_prefill.py) | fp16 · fp8 | gfx942 / gfx950 | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
-| **PA Decode Gluon** | [`pa_decode_gluon.py`](../aiter/ops/triton/gluon/pa_decode_gluon.py) | fp8 · bf16 | gfx942 / gfx950 | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
-| **FP8 MQA Logits** | [`fp8_mqa_logits.py`](../aiter/ops/triton/attention/fp8_mqa_logits.py) | fp8 | gfx942 / gfx950 | ✅ | ✅ (MQA) | ✅ | ❌ | ❌ | ❌ |
-| **PA MQA Logits** | [`pa_mqa_logits.py`](../aiter/ops/triton/attention/pa_mqa_logits.py) | fp8 | gfx942 / gfx950 | ✅ | ✅ (MQA) | ✅ | ✅ | ❌ | ❌ |
+| Kernel | DSL | dtype | GPU Arch |
+|--------|:---:|-------|----------|
+| [`mha.py`](../aiter/ops/triton/attention/mha.py) `:: flash_attn_func / flash_attn_varlen_func` | Triton | fp16 · bf16 · fp32 · fp8 | gfx942 / gfx950 / other ROCm |
+| [`mha.py`](../aiter/ops/triton/attention/mha.py) `:: flash_attn_with_kvcache` | Triton | fp16 · bf16 | gfx942 / gfx950 / other ROCm |
+| [`mha_v3.py`](../aiter/ops/triton/attention/mha_v3.py) `:: flash_attn_func / flash_attn_varlen_func` | Triton | fp16 · bf16 · fp32 · fp8 | gfx942 / gfx950 / other ROCm |
+| [`mha_v3.py`](../aiter/ops/triton/attention/mha_v3.py) `:: flash_attn_fp8_func / flash_attn_varlen_fp8_func` | Triton | bf16 · fp32 → fp8 (auto-quant) | gfx942 / gfx950 |
+| [`mha_v3.py`](../aiter/ops/triton/attention/mha_v3.py) `:: flash_attn_with_kvcache` | Triton | fp16 · bf16 · fp8 | gfx942 / gfx950 |
+| [`hstu_attention.py`](../aiter/ops/triton/attention/hstu_attention.py) `:: triton_hstu_attention_fwd / triton_hstu_attention_bwd` | Triton | bf16 · fp16 | all ROCm⁷ |
+| [`pa_decode.py`](../aiter/ops/triton/attention/pa_decode.py) `:: paged_attention_decode` | Triton | fp16 · bf16 · fp8 · int8 | gfx942 / gfx950 |
+| [`pa_prefill.py`](../aiter/ops/triton/attention/pa_prefill.py) `:: context_attention_fwd` | Triton | fp16 · fp8 | gfx942 / gfx950 |
+| [`pa_decode_gluon.py`](../aiter/ops/triton/gluon/pa_decode_gluon.py) `:: pa_decode_gluon` | Gluon | fp8 · bf16 | gfx942 / gfx950 |
+| [`fp8_mqa_logits.py`](../aiter/ops/triton/attention/fp8_mqa_logits.py) `:: fp8_mqa_logits` | Triton | fp8 | gfx942 / gfx950 |
+| [`pa_mqa_logits.py`](../aiter/ops/triton/attention/pa_mqa_logits.py) `:: deepgemm_fp8_paged_mqa_logits` | Gluon | fp8 | gfx942 / gfx950 |
 
 ---
 
