@@ -64,37 +64,41 @@ No $XW^Q, XW^K, XW^V$ FLOPs—only attention + (optional) bwd through it.
 
 ## How bench_mha.py Works
 
-`post_process_args` → defaults (`causal`, `layout`, custom vs grid vs `--model`) → `run_benchmark` → Triton `Benchmark` + `perf_report` + `do_bench`. **`-test_mode`**: correctness vs PyTorch SDPA, no timing.
+`post_process_args` → defaults → `run_benchmark` → Triton `Benchmark` + `perf_report` + `do_bench`. **`-test_mode`**: check $\text{Attention}(\cdot)$ vs PyTorch SDPA, no timing.
 
-### Args: shape / model
+**Symbols ↔ args** (per head $h$, batch $b$; dense `bshd` case): $L_q$ **`-sq`** (`N_CTX_Q`), $L_k$ **`-sk`** (`N_CTX_K`), $d$ **`-d`** (`D_HEAD`), $d_v$ **`-dv`** (`D_HEAD_V`), $H_q$ **`-hq`**, $H_k$ **`-hk`**, batch $B$ **`-b`**. Mask $M$ in the softmax: **`-causal`**. Same equation; **`--layout`** only changes how $Q_{b,h},K_{b,h},V_{b,h}$ are stored (`bshd` = padded $L_q,L_k$ axes; `thd` = varlen segments, same math after unpack).
 
-| Arg | Meaning |
-|-----|---------|
-| `--model` | Heads/dims from JSON. List, family, or `all`. Conflicts with `-hq/-hk/-d/-dv`. Default with model: `causal`, `layout=thd`. |
-| `--model-configs` | JSON path under `triton/` (default `utils/model_configs.json`). |
-| `-b` | Batch. Custom shape needs `>0`. Model: unset → `1`. |
-| `-hq` `-hk` | Query / KV heads. `0` + no other custom dims → built-in sweep. `-hk` `0` → use `-hq`. |
-| `-sq` `-sk` | Q / K length. `-sk` `0` → `-sq`. Model, both unset → sweep $2^1 \ldots 2^{13}$. |
-| `-d` `-dv` | QK head dim; V dim (`-dv` defaults to `-d`). `-dv≠-d` → “PE” path. |
-| `--layout` | `bshd` or `thd` ([Layouts](#layouts--layout)). Default: `bshd` / `thd` without / with `--model`. |
-| `-equal_seqlens` | `thd` (or model): equal lens in varlen path. Not `bshd`-only without model. |
+### Args: shape / model (maps to $Q,K,V,M$)
 
-### Args: run / metric
+| Arg | Theory / tensors |
+|-----|------------------|
+| `-b` | Batch size $B$ in `[B, L_q, H_q, d]`, `[B, L_k, H_k, d]`, `[B, L_k, H_k, d_v]`. |
+| `-sq` | Query axis length $L_q$ (benchmark `N_CTX_Q`). |
+| `-sk` | Key/value axis length $L_k$ (`N_CTX_K`); `0` → same as `-sq`. |
+| `-d` | Head dim $d$ for $Q,K$; softmax scale uses $1/\sqrt{d}$ unless overridden in code. |
+| `-dv` | Head dim $d_v$ for $V$ and output columns; default `-dv` = `-d` ⇒ $d_v=d$. |
+| `-hq` | $H_q$: number of $Q_{b,h}$ stacks (parallel applications of the single-head equation). |
+| `-hk` | $H_k$: number of $K,V$ head stacks; `0` → $H_k=H_q$. If $H_k<H_q$, kernel maps $h$ to KV slices (same $O_{b,h}$ formula, shared $K,V$ per group). |
+| `-causal` | Chooses mask $M$ (causal vs full); default off without `--model`, on with `--model`. |
+| `--layout` | `bshd`: fixed $L_q,L_k$ per batch row. `thd`: varlen $L_q,L_k$ per segment via `cu_seqlens`; $M$ still masks invalid positions. |
+| `-equal_seqlens` | `thd`: all segments share one $L_q$ / $L_k$ (still varlen storage). |
+| `--model` | Sets $H_q,H_k,d$ (and often $d_v$) from config; forbids `-hq/-hk/-d/-dv`. Seq sweep if `-sq/-sk` omitted. |
+| `--model-configs` | JSON for `--model` (default `utils/model_configs.json`). |
 
-| Arg | Meaning |
-|-----|---------|
-| `-mode` | `fwd` or `bwd` (`torch.autograd.grad`). |
-| `--metric` / `-metric` | `time` \| `throughput` \| `bandwidth` (parser default `throughput`). |
-| `--dtype` | `fp16` \| `bf16` \| `fp32` (non-FP8). |
-| `-fp8` | FP8 APIs. No `-sink`, no `-dv≠-d`. |
-| `-causal` | str2bool; unset → `False` / `True` without / with `--model`. |
-| `-sink` | Attention sink. No `-fp8`, no `-fused_bwd`. |
-| `-fused_bwd` | Fused bwd kernel. No `-sink`, no PE (`d>dv`). |
-| `-test_mode` | Correctness only. |
-| `-bench_torch` | Extra plot line “Torch”; still times Triton only. |
-| `-o` | CSV / `perf_report` to cwd. |
-| `-print_vgpr` | VGPR report. No `-bench_torch`. |
-| `-persistent` `-quantize_p` | Parsed; **unused** in this script. |
+### Args: run / metric (what is measured, not the formula)
+
+| Arg | Role |
+|-----|------|
+| `-mode` | `fwd`: time $\text{Attention}(Q,K,V)\to O$. `bwd`: time $\partial L/\partial Q,\partial K,\partial V$ (+ sink if used). |
+| `--dtype` / `-fp8` | Dtype of $Q,K,V$ (and compute) in the non-FP8 / FP8 paths. |
+| `-sink` | Extra per-head vector in the API (not in the boxed equation above); grads if `bwd`. |
+| `-fused_bwd` | Which backward implementation differentiates the same $\text{Attention}$. Incompatible with `-sink` and with $d>d_v$. |
+| `--metric` / `-metric` | Report latency, FLOPs/s for the op’s FLOP model, or bytes/s for Q,K,V,O traffic. |
+| `-test_mode` | Numerically match PyTorch SDPA for the same $Q,K,V,M$ setup. |
+| `-bench_torch` | Second plot series only; timed code path still Triton. |
+| `-o` | Save `perf_report` (e.g. CSV). |
+| `-print_vgpr` | Kernel register use (Triton). No `-bench_torch`. |
+| `-persistent` `-quantize_p` | Parsed; **unused** here. |
 
 ---
 
