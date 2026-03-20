@@ -70,11 +70,11 @@ def model_benchmark_configs(args):
         if isinstance(N_CTX_Q, list):
             for seq_len in N_CTX_Q:
                 fa_configs.append(
-                    (model_name, batch_size, HQ, HK, seq_len, seq_len, HEAD_DIM)
+                    (model_name, batch_size, HQ, HK, seq_len, seq_len, HEAD_DIM, HEAD_DIM)
                 )
         else:
             fa_configs.append(
-                (model_name, batch_size, HQ, HK, N_CTX_Q, N_CTX_K, HEAD_DIM)
+                (model_name, batch_size, HQ, HK, N_CTX_Q, N_CTX_K, HEAD_DIM, HEAD_DIM)
             )
 
     return fa_configs
@@ -142,7 +142,7 @@ def create_benchmark_configs(custom, args):
 
         if args.model:
             x_vals_list = model_benchmark_configs(args)
-            x_names = ["model", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K", "D_HEAD"]
+            x_names = ["model", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K", "D_HEAD", "D_HEAD_V"]
             plot_name = f"fused-attention-{mode}-layout-{args.layout}-fp8-{args.fp8}-causal-{causal}"
             extra_args = {"dtype": dtype, "causal": causal, "mode": mode}
 
