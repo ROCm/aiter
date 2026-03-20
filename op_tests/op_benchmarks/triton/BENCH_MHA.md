@@ -49,17 +49,15 @@ flowchart TB
 
 The output has shape $L_q \times d_v$.
 
-### Multiple heads and grouped-query attention (GQA)
+### Multiple heads
 
-With $H_q$ **query heads** and $H_k$ **key/value heads** ($H_k \le H_q$, and $H_q / H_k$ is an integer), each query head uses one of the $H_k$ key/value head stacks (repeated or grouped as in standard GQA). The benchmark flags **`-hq`** and **`-hk`** correspond to $H_q$ and $H_k$; when **`-hk`** is omitted, $H_k = H_q$ (full multi-head attention).
-
-Conceptually, for batch element $b$ and head index $h$:
+Attention runs **in parallel over heads**: for batch index $b$ and head index $h$, you apply the same single-head computation to slices $Q_{b,h}$, $K_{b,h}$, and $V_{b,h}$. The benchmark uses **`-hq`** for the number of query heads; **`-hk`** sets the number of key/value heads when it differs (if omitted, it matches **`-hq`**).
 
 $$
-O_{b,h} = \text{Attention}\left( Q_{b,h},\, K_{b,\phi(h)},\, V_{b,\phi(h)} \right)
+O_{b,h} = \text{Attention}\left( Q_{b,h},\, K_{b,h},\, V_{b,h} \right)
 $$
 
-where $\phi$ maps query heads to KV heads in the GQA pattern. Outputs per head are $L_q \times d_v$ and are typically concatenated or merged downstream in the model; this script only measures the **attention** primitive that produces those per-head outputs.
+Each $O_{b,h}$ has shape $L_q \times d_v$. The model usually concatenates or merges heads later; this benchmark only times the **attention** primitive per head.
 
 ### What the benchmark does *not* include
 
