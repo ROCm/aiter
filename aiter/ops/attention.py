@@ -564,7 +564,7 @@ direct_register_custom_op(
 MD_NAME = "module_mla_asm"
 
 
-@compile_ops(MD_NAME)
+@compile_ops(MD_NAME, ffi_type="ctypes")
 def mla_decode_stage1_asm_fwd(
     # [num_seqs, num_heads, head_size]
     Q: torch.Tensor,
@@ -600,7 +600,7 @@ def mla_decode_stage1_asm_fwd(
 ) -> None: ...
 
 
-@compile_ops(MD_NAME)
+@compile_ops(MD_NAME, ffi_type="ctypes")
 def mla_prefill_asm_fwd(
     # [num_seqs, num_heads, head_size]
     Q: torch.Tensor,
@@ -785,7 +785,7 @@ def get_ps_metadata_v1(
 ) -> None: ...
 
 
-@compile_ops(MD_NAME)
+@compile_ops(MD_NAME, ffi_type="ctypes")
 def mla_prefill_ps_asm_fwd(
     Q: torch.Tensor,
     K: torch.Tensor,
