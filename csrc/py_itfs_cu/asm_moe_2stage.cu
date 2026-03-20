@@ -2,6 +2,7 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <memory>
 #include "aiter_hip_common.h"
 #include "asm_fmoe_2stages_configs.hpp"
 
