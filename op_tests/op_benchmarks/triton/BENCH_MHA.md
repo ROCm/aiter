@@ -57,6 +57,37 @@ $$
 O_{b,h} = \text{Attention}\left( Q_{b,h},\, K_{b,h},\, V_{b,h} \right)
 $$
 
+**Visualization** (one batch element $b$; **`-hq`** is the number of query heads, each runs the same pipeline as above):
+
+```mermaid
+flowchart TB
+  Q["Q per batch: Hq head slices"]
+  K["K per batch: Hk head slices"]
+  V["V per batch: Hk head slices"]
+  Q --> Par["Single-head Attention, once per h = 0 ... Hq-1"]
+  K --> Par
+  V --> Par
+  Par --> Out["O_b,h for each h (each Lq × dv)"]
+```
+
+```text
+  One batch index b
+  ═══════════════════════════════════════════════════════════════════
+
+       head h = 0          head h = 1                 head h = Hq−1
+       ┌──────────┐        ┌──────────┐               ┌──────────┐
+  Q_b,·──►│ Attention │        │ Attention │    ···    │ Attention │
+  K_b,·──►│ (single   │   Q,K,V slices   │ (same op)  │ (same op) │
+  V_b,·──►│  head eq) │        │ per h    │            │           │
+       └───┬───────┘        └───┬───────┘               └───┬───────┘
+           │                    │                           │
+           ▼                    ▼                           ▼
+        O_b,0                 O_b,1                     O_b,Hq−1
+        Lq×dv                 Lq×dv                     Lq×dv
+
+  (If −hk < −hq, K/V slices are shared across query heads per the kernel layout.)
+```
+
 Each $O_{b,h}$ has shape $L_q \times d_v$. The model usually concatenates or merges heads later; this benchmark only times the **attention** primitive per head.
 
 ### What the benchmark does *not* include
