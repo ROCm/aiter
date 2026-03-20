@@ -99,9 +99,9 @@ std::tuple<std::string, int> get_heuristic_fp8_kernel(int M, int N, int K, std::
         if (el.first.find(arch_id) != 0) continue;
         
         const auto& cfg = el.second;
-        if (cfg.bpreshuffle == bpreshuffle_en && ((cfg.splitK == splitK_en) || !splitK.has_value())) {
+        if (cfg.bpreshuffle == bpreshuffle_en && ((cfg.splitK >= splitK_en) || !splitK.has_value())) {
             if ((N % cfg.tile_n) == 0) {
-                std::vector<int> splitK_list = (splitK.has_value() && cfg.splitK) 
+                std::vector<int> splitK_list = (splitK.has_value()) 
                     ? std::vector<int>{splitK.value()}
                     : (cfg.splitK ? std::vector<int>{2, 4, 8} : std::vector<int>{1});
 
@@ -209,7 +209,6 @@ static void print_debug_info(const KernelArgs& args, const std::string& selected
                            const std::optional<torch::Tensor>& bias) {
     if (!DebugPrint) return;
     
-    printf("=== MI308 A8W8 GEMM Kernel Parameters ===\n");
     printf("Selected Kernel: %s\n", selectedKernelName.c_str());
     printf("Matrix dimensions: M=%u, N=%u, K=%u\n", args.m, args.n, args.k);
     printf("Grid dimensions: gdx=%d, gdy=%d, gdz=%d\n", gdx, gdy, gdz);
