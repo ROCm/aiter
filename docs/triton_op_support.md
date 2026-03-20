@@ -8,7 +8,7 @@
 |------|------|-------|---------|:------:|:---:|:---:|:--------:|:-------:|:-------:|
 | **MHA** | [`mha.py`](../aiter/ops/triton/attention/mha.py) | fp16 · bf16 · fp32 · fp8 | gfx942 / gfx950 / 其他 ROCm | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ |
 | **MHA v3** | [`mha_v3.py`](../aiter/ops/triton/attention/mha_v3.py) | fp16 · bf16 · fp32 · fp8 | gfx942 / gfx950 / 其他 ROCm | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
-| **HSTU** | [`hstu_attention.py`](../aiter/ops/triton/attention/hstu_attention.py) | bf16 · fp16 | gfx942 / gfx950 | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ |
+| **HSTU** | [`hstu_attention.py`](../aiter/ops/triton/attention/hstu_attention.py) | bf16 · fp16 | gfx942 / gfx950⁷ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ |
 
 ---
 
@@ -81,7 +81,7 @@
 | **输入格式** | 仅 jagged：Q/K `[T, H, D_attn]`，V `[T, H, D_v]`，`seq_offsets [B+1]`⁵ |
 | **激活函数** | SiLU：`Y = silu(alpha · Q @ Kᵀ) @ V`⁶ |
 | **dtype** | bf16（推荐）· fp16 |
-| **GPU 架构** | gfx942 / gfx950（含预调参 config） |
+| **GPU 架构** | 所有 ROCm（Triton 内核无 arch 限制）；gfx942 / gfx950 已有预调参 config⁷ |
 | **Shape** | T = Σ seq_len；D_attn / D_v 任意正整数 |
 | **Causal masking** | ✅ |
 | **Non-causal（双向）** | ✅ |
@@ -105,3 +105,4 @@
 > ⁴ ROCm 7.1+ 回归，ROCm 7.0 正常
 > ⁵ HSTU 仅支持 jagged（packed）格式；T = Σ(seq_len_i)，seq_offsets 为累积偏移量
 > ⁶ alpha 通常设为 `1/D_attn × 10000`
+> ⁷ HSTU 内核为标准 Triton，理论上支持所有 ROCm 架构。当前仅 gfx942/gfx950 有预调参 JSON config（包含 ROCm 专有参数 `matrix_instr_nonkdim`、`kpack`）；其他 ROCm 架构需补充对应 config 文件后即可使用
