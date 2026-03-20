@@ -128,10 +128,10 @@ def gemm_a8w8_asm(
     splitK: Optional[int] = None,
 ) -> Tensor:
     _gemm_a8w8_asm(
-        XQ, 
-        WQ, 
-        x_scale, 
-        w_scale, 
+        XQ,
+        WQ,
+        x_scale,
+        w_scale,
         Out,
         kernelName if kernelName else None,
         bias,
