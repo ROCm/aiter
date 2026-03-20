@@ -187,11 +187,9 @@ v_descale: (h,d)
 
 def perchannel_quantize_fp8(
     v,
-    BLOCK_M,
     layout_k="bhsd",
     v_descale=None,
 ):  
-    d = v.shape[-1]
     FP8_TYPE = aiter.dtypes.fp8
     FP8_MAX = torch.finfo(FP8_TYPE).max
     v_q = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
@@ -261,7 +259,7 @@ def sage_quant_v1(
         sm_scale=None,
     )
 
-    v_q, v_descale = perchannel_quantize_fp8(v, 256, layout_k=layout_k, v_descale=v_descale)
+    v_q, v_descale = perchannel_quantize_fp8(v, layout_k=layout_k, v_descale=v_descale)
 
     return q_q, q_descale, k_q, k_descale, v_q, v_descale
 
@@ -269,8 +267,6 @@ def sage_quant_v2(
     q,
     k,
     v,
-    BLOCK_M,
-    BLOCK_N,
     hadamard_rotation=False,
     R=None,
     BLOCK_R=None,
@@ -297,7 +293,7 @@ def sage_quant_v2(
         q,
         R=R,
         BLOCK_R=BLOCK_R,
-        BLOCK_SIZE_M=BLOCK_M,
+        BLOCK_SIZE_M=256,
         hadamard_rotation=hadamard_rotation,
         sm_scale=sm_scale,
     )
@@ -305,11 +301,11 @@ def sage_quant_v2(
         k,
         R=R,
         BLOCK_R=BLOCK_R,
-        BLOCK_SIZE_M=BLOCK_N,
+        BLOCK_SIZE_M=256,
         hadamard_rotation=hadamard_rotation,
         sm_scale=None, # do not apply sm scale to k tensor!
     )
-    v_q, v_descale = perchannel_quantize_fp8(v, 256, layout_k=layout_k, v_descale=v_descale)
+    v_q, v_descale = perchannel_quantize_fp8(v, layout_k=layout_k, v_descale=v_descale)
     
     return q_q, q_descale, k_q, k_descale, v_q, v_descale
 
