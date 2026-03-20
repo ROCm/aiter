@@ -14,6 +14,8 @@ from aiter.ops.triton._triton_kernels.attention.mha_onekernel_bwd import (
     bwd_kernel_noncausal,
     _get_config,
 )
+from aiter.ops.triton.utils.kernel_info import collect_kernel_info
+
 
 _LOGGER = AiterTritonLogger()
 
@@ -231,6 +233,14 @@ def flash_attn_onekernel_backward(
         IS_VARLEN=IS_VARLEN,
         IS_FP8=IS_FP8,
     )
+    collect_kernel_info(
+        _bwd_preprocess,
+        {
+            "IS_VARLEN": IS_VARLEN,
+            "IS_FP8": IS_FP8,
+            "PRE_BLOCK": config["preprocess_kernel"]["PRE_BLOCK"],
+        },
+    )
 
     # dropout_mask
     use_dropout = dropout_p > 0.0
@@ -316,6 +326,10 @@ def flash_attn_onekernel_backward(
             ENABLE_SINK=sink is not None,
             **config_onekernel,
         )
+        collect_kernel_info(
+            bwd_kernel_causal,
+            {"IS_VARLEN": IS_VARLEN, "causal": True},
+        )
     else:
         bwd_kernel_noncausal[grid](
             q,
@@ -371,6 +385,10 @@ def flash_attn_onekernel_backward(
             USE_INT64_STRIDES=USE_INT64_STRIDES,
             ENABLE_SINK=sink is not None,
             **config_onekernel,
+        )
+        collect_kernel_info(
+            bwd_kernel_noncausal,
+            {"IS_VARLEN": IS_VARLEN, "causal": False},
         )
 
     return delta

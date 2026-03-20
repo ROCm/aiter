@@ -571,6 +571,22 @@ def run_benchmark(custom, args):
     bench_mha.run(save_path="." if args.o else None, print_data=True)
 
 
+
+    import os
+
+    from aiter.ops.triton.utils.kernel_info import print_kernel_info, write_kernel_names_to_csv
+
+    if args.o and os.environ.get("AITER_PRINT_KERNEL_NAME", "0") == "1":
+
+        _csv = os.path.join(
+
+            os.path.abspath("."), os.path.splitext(os.path.basename(__file__))[0] + ".csv"
+
+        )
+
+        write_kernel_names_to_csv(_csv)
+
+    print_kernel_info()
 def supported_layouts():
     layouts = (
         "bshd: Q, K, V are individual tensors of [batch, seqlen_q/k, num_heads, head_size]. "

@@ -3,6 +3,7 @@ import torch
 import triton
 import triton.language as tl
 from typing import Literal, Optional
+from aiter.ops.triton.utils.kernel_info import collect_kernel_info
 from .common import compute_alibi_block, compute_fp8_scaling_factors, apply_rotary
 from .utils import (
     AUTOTUNE,
@@ -1695,6 +1696,19 @@ def attention_forward_prefill_triton_impl(
     # launch kernel
     def grid(META):
         return (batch, nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]))
+
+    collect_kernel_info(
+        attn_fwd,
+        {
+            "IS_CAUSAL": causal,
+            "IS_VARLEN": IS_VARLEN,
+            "HQ": nheads_q,
+            "HK": nheads_k,
+            "MAX_SEQLENS_Q": max_seqlens_q,
+            "MAX_SEQLENS_K": max_seqlens_k,
+            "IS_FP8": IS_FP8,
+        },
+    )
 
     attn_fwd[grid](
         q,

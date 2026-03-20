@@ -11,6 +11,7 @@ from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_ba
 from aiter.ops.triton.attention.mha_fused_bwd import flash_attn_fused_backward
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.kernel_info import collect_kernel_info
 from aiter.ops.triton._triton_kernels.attention.mha import _attn_fwd, _get_config
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 
@@ -247,6 +248,17 @@ def _flash_attn_forward(
         USE_INT64_STRIDES=_USE_INT64_STRIDES,
         ENABLE_SINK=sink is not None,
         **config,
+    )
+    collect_kernel_info(
+        _attn_fwd,
+        {
+            **config,
+            "VARLEN": is_varlen,
+            "IS_CAUSAL": causal,
+            "IS_FP8": IS_FP8,
+            "RETURN_SCORES": return_softmax,
+            "ENABLE_DROPOUT": enable_dropout,
+        },
     )
 
     return o, softmax_lse, s_dmask, philox_seed, philox_offset

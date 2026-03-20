@@ -14,6 +14,7 @@ from aiter.ops.triton._triton_kernels.attention.mha_fused_bwd import (
     _get_config,
 )
 from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.kernel_info import collect_kernel_info
 
 _LOGGER = AiterTritonLogger()
 
@@ -192,6 +193,14 @@ def flash_attn_fused_backward(
         IS_VARLEN=IS_VARLEN,
         IS_FP8=IS_FP8,
     )
+    collect_kernel_info(
+        _bwd_preprocess,
+        {
+            "IS_VARLEN": IS_VARLEN,
+            "IS_FP8": IS_FP8,
+            "PRE_BLOCK": config["preprocess_kernel"]["PRE_BLOCK"],
+        },
+    )
     # dropout_mask
     use_dropout = dropout_p > 0.0
     if use_dropout:
@@ -264,6 +273,10 @@ def flash_attn_fused_backward(
             NUM_XCD=get_num_xcds(),
             **config_dkdvdq,
         )
+        collect_kernel_info(
+            _bwd_kernel_dkdvdq_causal,
+            {"IS_VARLEN": IS_VARLEN, "causal": True},
+        )
     else:
         # in non causal inner loop over grouped q heads
         grid_dkdvdq = (batch * num_k_heads * num_k_pids,)
@@ -311,6 +324,10 @@ def flash_attn_fused_backward(
             FP8_MAX=FP8_MAX,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
             **config_dkdvdq,
+        )
+        collect_kernel_info(
+            _bwd_kernel_dkdvdq_noncausal,
+            {"IS_VARLEN": IS_VARLEN, "causal": False},
         )
 
     return delta

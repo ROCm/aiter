@@ -3,6 +3,7 @@ import torch
 import triton
 import triton.language as tl
 from typing import Literal, Optional
+from aiter.ops.triton.utils.kernel_info import collect_kernel_info
 from .common import apply_rotary
 from .utils import (
     DEBUG,
@@ -1223,6 +1224,18 @@ def attention_forward_decode_triton_impl(
             (stride_mzhg, stride_m2, stride_ms, stride_mm),
         )
         print("stride_lse_zhg, stride_lse_m", (stride_lse_zhg, stride_lse_m))
+
+    collect_kernel_info(
+        _fwd_kernel_splitK,
+        {
+            "batch": batch_size,
+            "SEQLEN_Q": seqlen_q,
+            "SEQLEN_KC": seqlen_kc,
+            "H_q": nheads_q,
+            "IS_CAUSAL": causal,
+            "IS_FP8": IS_FP8,
+        },
+    )
 
     _fwd_kernel_splitK[grid](
         Q=q,
