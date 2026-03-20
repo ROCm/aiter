@@ -1,6 +1,7 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
 import triton
+import aiter
 import torch
 from aiter.ops.triton.utils.device_info import get_num_sms
 import math
@@ -9,7 +10,46 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     kernel_unified_attention_3d,
     reduce_segments,
 )
+from aiter.ops.triton.quant.sage_attention_quant_wrappers import (sage_quant, sage_quant_mxfp4)
+from enum import IntEnum
 
+
+def get_config(num_tokens, num_seqs, num_queries_per_kv, num_kv_heads, head_size, window_size, max_seqlen_q, max_seqlen_k, block_size, q_element_size):
+    SLIDING_WINDOW = 1 + window_size[0]
+    ALL_DECODE = max_seqlen_q == 1
+    cu_count = get_num_sms()
+    
+    BLOCK_M = (
+        16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
+    )
+
+    BLOCK_Q = BLOCK_M // num_queries_per_kv
+    
+    total_num_q_blocks = num_tokens // BLOCK_Q + num_seqs
+    target_num_prgms = cu_count * 4
+    num_2d_prgms = total_num_q_blocks * num_kv_heads
+    if use_2d_kernel(
+        head_size,
+        SLIDING_WINDOW,
+        ALL_DECODE,
+        max_seqlen_q,
+        max_seqlen_k,
+        target_num_prgms,
+        num_2d_prgms,
+    ):
+        return select_2d_config(block_size, head_size, SLIDING_WINDOW, ALL_DECODE, max_seqlen_q, max_seqlen_k, num_queries_per_kv, num_2d_prgms)
+    else:
+        attn_config, reduce_config = select_3d_config(
+            head_size,
+            block_size,
+            q_element_size,
+            max_seqlen_k,
+            target_num_prgms,
+            num_2d_prgms,
+        )
+        attn_config["BLOCK_M"] = BLOCK_M
+        attn_config["BLOCK_Q"] = BLOCK_Q
+        return attn_config
 
 def select_2d_config(
     block_size,
@@ -35,7 +75,7 @@ def select_2d_config(
     else:
         num_stages_2d = 3
         num_warps = 2
-        TILE_SIZE = block_size
+        TILE_SIZE = min(triton.next_power_of_2(block_size), 64)
 
     if max_seqlen_q >= 256:
         BLOCK_M = 128
@@ -58,8 +98,8 @@ def select_3d_config(
 ):
     reduce_num_warps = 2
     attn_warps = 2
-    TILE_SIZE = block_size
-    MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
+    TILE_SIZE = min(triton.next_power_of_2(block_size), 64)
+    # MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     num_segments = math.ceil(target_num_prgms / num_2d_prgms)
     num_segments = triton.next_power_of_2(num_segments)
     num_segments = min(num_segments, 128)
@@ -100,6 +140,57 @@ def use_2d_kernel(
     )
 
 
+def check_mxfp4_quant_args_get_strides(
+        q,
+        q_descale,
+        k,
+        k_descale,
+        v,
+        v_descale,
+    ):
+    """
+    qkv has shapes:
+        - q,  # [num_tokens, num_query_heads, head_size]
+        - k,  # [num_blks, blk_size, num_kv_heads, head_size]
+        - v,  # [num_blks, blk_size, num_kv_heads, head_size]
+    we expect the scales to have shapes:
+        - q_scale,  # [num_tokens, num_kv_heads, head_size // 32] if sage_mxfp4
+        - k_scale,  # [num_blks, blk_size, num_kv_heads, head_size // 32] if sage_mxfp4
+        - v_scale,  # [num_kv_heads, head_size]
+    """
+    num_tokens, num_query_heads, head_size_qk = q.shape
+    num_blks, blk_size, num_kv_heads, head_size_v = v.shape
+    head_size_qk *= 2
+    expected_q_descale_shape = (num_tokens, num_query_heads, head_size_qk // 32)
+    assert q_descale.shape == expected_q_descale_shape, f"expect q_descale to have shape {expected_q_descale_shape}, got {q_descale.shape}"
+    expected_k_descale_shape = (
+    num_blks,
+    blk_size,
+    num_kv_heads,
+    head_size_qk // 32,
+    )
+    assert k_descale.shape == expected_k_descale_shape, f"expect k_descale to have shape {expected_k_descale_shape}, got {k_descale.shape}"
+    expected_v_descale_shape = (num_kv_heads, head_size_v)
+    assert v_descale.shape == expected_v_descale_shape, f"expect v_descale to have shape {expected_v_descale_shape}, got {v_descale.shape}"
+
+    stride_k_cache_scale_0, stride_k_cache_scale_1, stride_k_cache_scale_2, stride_k_cache_scale_3 = k_descale.stride()
+    query_scale_stride_0, query_scale_stride_1, query_scale_stride_2 = q_descale.stride()
+    stride_v_cache_scale_0, stride_v_cache_scale_1 = v_descale.stride()
+
+    return (
+        query_scale_stride_0,
+        query_scale_stride_1,
+        query_scale_stride_2,
+        stride_k_cache_scale_0,
+        stride_k_cache_scale_1,
+        stride_k_cache_scale_2,
+        stride_k_cache_scale_3,
+        stride_v_cache_scale_0,
+        stride_v_cache_scale_1
+    )
+
+
+
 def unified_attention(
     q,
     k,
@@ -122,9 +213,9 @@ def unified_attention(
     qq_bias=None,
     # Optional tensor for sinks
     sinks=None,
+    sage_mxfp4=False,
 ):
     assert causal, "Only causal attention is supported"
-    assert q_descale is None, "Q scales not supported"
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -136,13 +227,42 @@ def unified_attention(
     block_size = v.shape[1]
     num_seqs = len(seqused_k)
     num_query_heads = q.shape[1]
+
     num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
+    if sage_mxfp4:
+        head_size *= 2
+        (
+            query_scale_stride_0,
+            query_scale_stride_1,
+            query_scale_stride_2,
+            stride_k_cache_scale_0,
+            stride_k_cache_scale_1,
+            stride_k_cache_scale_2,
+            stride_k_cache_scale_3,
+            stride_v_cache_scale_0,
+            stride_v_cache_scale_1 
+        ) = check_mxfp4_quant_args_get_strides(
+            q,
+            q_descale,
+            k,
+            k_descale,
+            v,
+            v_descale,
+        )
+    else:
+        query_scale_stride_0 = query_scale_stride_1 = query_scale_stride_2 = 0
+        stride_k_cache_scale_0 = stride_k_cache_scale_1 = stride_k_cache_scale_2 = stride_k_cache_scale_3 = 0
+        stride_v_cache_scale_0 = stride_v_cache_scale_1 = 0
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
+
+    print("v.dtype", v.dtype)
+
+
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     assert BLOCK_Q >= 1
     # Ideally we would launch with kernel with:
@@ -159,8 +279,7 @@ def unified_attention(
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
-    # if batch contains a prefill
-    if use_2d_kernel(
+    if True or use_2d_kernel(
         head_size,
         SLIDING_WINDOW,
         ALL_DECODE,
@@ -179,6 +298,8 @@ def unified_attention(
             num_queries_per_kv,
             num_2d_prgms,
         )
+
+        BLOCK_M=config["BLOCK_M"]
         assert config["BLOCK_Q"] >= 1
         total_num_q_blocks = q.shape[0] // config["BLOCK_Q"] + num_seqs
 
@@ -198,6 +319,7 @@ def unified_attention(
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
             scale=softmax_scale,
+            q_scale=q_descale,
             k_scale=k_descale,
             v_scale=v_descale,
             out_scale=1 / output_scale if output_scale is not None else 1.0,
@@ -207,6 +329,9 @@ def unified_attention(
             block_table_stride=block_table.stride(0),
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
+            query_scale_stride_0=query_scale_stride_0,
+            query_scale_stride_1=query_scale_stride_1,
+            query_scale_stride_2=query_scale_stride_2,
             output_stride_0=out.stride(0),
             output_stride_1=out.stride(1),
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
@@ -226,10 +351,17 @@ def unified_attention(
             stride_v_cache_1=v.stride(1),
             stride_v_cache_2=v.stride(2),
             stride_v_cache_3=v.stride(3),
+            stride_k_cache_scale_0=stride_k_cache_scale_0,
+            stride_k_cache_scale_1=stride_k_cache_scale_1,
+            stride_k_cache_scale_2=stride_k_cache_scale_2,
+            stride_k_cache_scale_3=stride_k_cache_scale_3,
+            stride_v_cache_scale_0=stride_v_cache_scale_0,
+            stride_v_cache_scale_1=stride_v_cache_scale_1,
             query_start_len_ptr=cu_seqlens_q,
             num_seqs=num_seqs,
-            USE_FP8=output_scale is not None,
+            OUTPUT_FP8=output_scale is not None,
             ALL_DECODE=ALL_DECODE,
+            SAGE_MXFP4=sage_mxfp4,
             **config,
         )
 
@@ -265,7 +397,7 @@ def unified_attention(
             dtype=torch.float32,
             device=q.device,
         )
-
+ 
         kernel_unified_attention_3d[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,
@@ -279,14 +411,17 @@ def unified_attention(
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
             scale=softmax_scale,
+            q_scale=q_descale,
             k_scale=k_descale,
-            v_scale=v_descale,
             softcap=softcap,
             num_query_heads=num_query_heads,
             num_queries_per_kv=num_queries_per_kv,
             block_table_stride=block_table.stride(0),
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
+            query_scale_stride_0=query_scale_stride_0,
+            query_scale_stride_1=query_scale_stride_1,
+            query_scale_stride_2=query_scale_stride_2,
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
             BLOCK_SIZE=block_size,
             HEAD_SIZE=head_size,
@@ -304,29 +439,39 @@ def unified_attention(
             stride_v_cache_1=v.stride(1),
             stride_v_cache_2=v.stride(2),
             stride_v_cache_3=v.stride(3),
+            stride_k_cache_scale_0=stride_k_cache_scale_0,
+            stride_k_cache_scale_1=stride_k_cache_scale_1,
+            stride_k_cache_scale_2=stride_k_cache_scale_2,
+            stride_k_cache_scale_3=stride_k_cache_scale_3,
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             ALL_DECODE=ALL_DECODE,
+            SAGE_MXFP4=sage_mxfp4,
             **attn_config,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
+            v_scale=v_descale,
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,
             segm_expsum_ptr=segm_expsum,
             seq_lens_ptr=seqused_k,
             num_seqs=num_seqs,
             num_query_heads=num_query_heads,
+            num_queries_per_kv=num_queries_per_kv,
             out_scale_inv=1 / output_scale if output_scale is not None else 1.0,
             output_stride_0=out.stride(0),
             output_stride_1=out.stride(1),
+            stride_v_cache_scale_0=stride_v_cache_scale_0,
+            stride_v_cache_scale_1=stride_v_cache_scale_1,
             block_table_stride=block_table.stride(0),
             HEAD_SIZE=head_size,
             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
-            USE_FP8=output_scale is not None,
+            OUTPUT_FP8=output_scale is not None,
+            SAGE_MXFP4=sage_mxfp4,
             **reduce_config,
         )

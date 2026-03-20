@@ -6,12 +6,16 @@ from typing import Optional
 import pytest
 import torch
 
-from aiter.ops.triton.attention.unified_attention import unified_attention
 from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.ops.triton.attention.unified_attention import unified_attention, get_config
+from aiter.ops.triton.utils.types import e4m3_dtype
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+
+from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v2
 
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
 HEAD_SIZES = [128, 256]
-BLOCK_SIZES = [16, 64]
+BLOCK_SIZES = [16, 64, 128, 544]
 
 DTYPES = [torch.float16, torch.bfloat16]
 QDTYPES = [None, e4m3_dtype]
@@ -92,9 +96,11 @@ def ref_paged_attn(
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
 @pytest.mark.parametrize("sliding_window", [None, 256])
 @pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("q_dtype", QDTYPES)
 @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
-@pytest.mark.parametrize("q_dtype", QDTYPES)
+@pytest.mark.parametrize("fp8", [True, False])
+@pytest.mark.parametrize("sage_mxfp4", [True, False])
 @torch.inference_mode()
 def test_triton_unified_attn(
     seq_lens: list[tuple[int, int]],
@@ -102,14 +108,22 @@ def test_triton_unified_attn(
     head_size: int,
     sliding_window: Optional[int],
     dtype: torch.dtype,
+    q_dtype: Optional[torch.dtype],
     block_size: int,
     soft_cap: Optional[float],
     num_blocks: int,
-    q_dtype: Optional[torch.dtype],
+    fp8: Optional[bool],
+    sage_mxfp4: Optional[bool],
 ) -> None:
-    if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
-        pytest.skip("block size must be at least 32 for fp8")
+    # if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
+    #     pytest.skip("block size must be at least 32 for fp8")
+    if sage_mxfp4 and fp8:
+        pytest.skip("SAGE quant and fp8 q_dtype are mutually exclusive")
+    if sage_mxfp4 and not arch_info.is_fp4_avail():
+        pytest.skip("FP4 dot product is not supported on this GPU")
 
+
+    torch.cuda.empty_cache()
     torch.manual_seed(0)
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]
@@ -132,6 +146,9 @@ def test_triton_unified_attn(
     cu_query_lens = torch.tensor(
         [0] + query_lens, dtype=torch.int32, device="cuda"
     ).cumsum(dim=0, dtype=torch.int32)
+    cu_key_lens = torch.tensor(
+        [0] + kv_lens, dtype=torch.int32, device="cuda"
+    ).cumsum(dim=0, dtype=torch.int32)
     kv_lens = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
 
     max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
@@ -151,16 +168,29 @@ def test_triton_unified_attn(
     q_descale = None
     k_descale = None
     v_descale = None
-    if q_dtype is not None:
-        # QKV are drawn from N(0, 1): no need for a fp8 scaling factor
-        maybe_quantized_query = query.to(q_dtype)
-        maybe_quantized_key_cache = key_cache.to(q_dtype)
-        maybe_quantized_value_cache = value_cache.to(q_dtype)
 
-        scale_shape = (num_seqs, num_kv_heads)
-        q_descale = None  # Not yet supported
-        k_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
-        v_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
+    if sage_mxfp4:        
+        maybe_quantized_query, q_descale, maybe_quantized_key_cache, k_descale, maybe_quantized_value_cache, v_descale = sage_quant_v2(
+            query, key_cache, value_cache,
+            hadamard_rotation=True, R=None, BLOCK_R=128,
+            layout_k="cache", v_descale=None
+        )
+    elif fp8:
+        FP8_TYPE = e4m3_dtype
+        fp8_max = torch.finfo(FP8_TYPE).max
+
+        q_abs_max = query.abs().amax().clamp(min=1e-9)
+        q_descale = (q_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
+        maybe_quantized_query = (query * (fp8_max / q_abs_max)).to(FP8_TYPE)
+
+        k_abs_max = key_cache.abs().amax().clamp(min=1e-9)
+        k_descale = (k_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
+        maybe_quantized_key_cache = (key_cache * (fp8_max / k_abs_max)).to(FP8_TYPE)
+
+        v_abs_max = value_cache.abs().amax().clamp(min=1e-9)
+        v_descale = (v_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
+        maybe_quantized_value_cache = (value_cache * (fp8_max / v_abs_max)).to(FP8_TYPE)
+  
 
     unified_attention(
         q=maybe_quantized_query,
@@ -180,6 +210,7 @@ def test_triton_unified_attn(
         k_descale=k_descale,
         v_descale=v_descale,
         sinks=sinks,
+        sage_mxfp4=sage_mxfp4,
     )
 
     ref_output = ref_paged_attn(
@@ -195,8 +226,28 @@ def test_triton_unified_attn(
         sinks=sinks,
     )
     atol, rtol = 1.5e-2, 1e-2
-    if q_dtype is not None:
+
+    if sage_mxfp4:
+        atol, rtol = 3.5e-1, 2.5e-1
+    elif fp8:
         atol, rtol = 1.5e-1, 1.5e-1
     torch.testing.assert_close(
         output, ref_output, atol=atol, rtol=rtol
     ), f"{torch.max(torch.abs(output - ref_output))}"
+
+
+
+if __name__ == "__main__":
+    test_triton_unified_attn(
+        seq_lens=[(1, 1328), (5, 18), (129, 463)],
+        num_heads=(4, 4),
+        head_size=128,
+        sliding_window=None,
+        dtype=torch.float16,
+        q_dtype=None,
+        block_size=16,
+        soft_cap=None,
+        num_blocks=32768,
+        fp8=False,
+        sage_mxfp4=True,
+    )

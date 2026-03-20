@@ -4,6 +4,285 @@ import triton.language as tl
 
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 
+
+
+
+###################### Unified quantization kernels ###############
+
+from aiter.ops.triton._triton_kernels.attention.unified_attention import find_seq_idx
+
+@triton.jit
+def perblock_quantize_q_kernel(
+    query_ptr,
+    Q_q,
+    Q_descale,
+    query_start_len_ptr,
+    num_seqs,
+    num_query_heads,
+    num_queries_per_kv,
+    query_stride_0,
+    query_stride_1,
+    scale_stride_0,
+    scale_stride_1,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    sm_scale: tl.constexpr,
+    DTYPE_MAX: tl.constexpr,
+):
+
+    kv_head_idx = tl.program_id(0)
+    q_block_global_idx = tl.program_id(1)
+
+    seq_idx = find_seq_idx(
+        query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
+    )
+
+    q_block_start_idx = tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
+
+    q_block_local_idx = q_block_global_idx - q_block_start_idx
+
+    cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
+    cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
+
+    cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
+
+    if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
+        return
+
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+    query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+
+    query_offset_0 = cur_batch_in_all_start_index + query_pos
+    query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
+    query_offset = (
+        query_offset_0[:, None] * query_stride_0
+        + query_offset_1[:, None] * query_stride_1
+        + offs_d[None, :]
+    )
+
+    if HEAD_SIZE_PADDED != HEAD_SIZE:
+        dim_mask = offs_d < HEAD_SIZE
+    else:
+        dim_mask = tl.full((1,), 1, dtype=tl.int1)
+    query_mask_0 = query_pos < cur_batch_query_len
+    query_mask_1 = query_offset_1 < num_query_heads
+
+    Q_cache_modifier: tl.constexpr = ""
+    # Q : (BLOCK_M, HEAD_SIZE_PADDED)
+    Q = tl.load(
+        query_ptr + query_offset,
+        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+        other=0.0,
+        cache_modifier=Q_cache_modifier,
+    )
+
+    Q = Q.to(tl.float32)
+    if sm_scale is not None:
+        Q *= sm_scale
+    scale = tl.max(tl.abs(Q)) / DTYPE_MAX
+    Q_quant = Q / scale
+    Q_quant = Q_quant.to(Q_q.dtype.element_ty)
+
+    # scale (total num blocks, hk)
+    scale_ptrs = Q_descale + q_block_global_idx * scale_stride_0 + kv_head_idx * scale_stride_1
+    tl.store(scale_ptrs, scale)
+    tl.store(
+        Q_q + query_offset, Q_quant,
+        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None])
+
+
+@triton.jit
+def perblock_quantize_kernel(
+    query_ptr,
+    Q_q,
+    Q_descale,
+    max_seqlen,
+    query_start_len_ptr,
+    stride_b: tl.int64,
+    stride_m: tl.int64,
+    stride_h: tl.int64,
+    scale_stride_0,
+    scale_stride_1,
+    BLOCK_M: tl.constexpr,
+    D: tl.constexpr,
+    sm_scale: tl.constexpr,
+    DTYPE_MAX: tl.constexpr,
+):
+    
+    pid_b = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_h = tl.program_id(2)
+    
+    if query_start_len_ptr is not None:
+        cur_batch_in_all_start_index = tl.load(query_start_len_ptr + pid_b).to(tl.int64)
+        cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + pid_b + 1).to(tl.int64)
+        seqlen = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
+        batch_offset = cur_batch_in_all_start_index.to(tl.int64) * stride_m
+    else:
+        seqlen = max_seqlen
+        batch_offset = pid_b.to(tl.int64) * stride_b
+
+    if pid_m * BLOCK_M >= seqlen:
+        return
+
+    num_pid_m = tl.cdiv(max_seqlen, BLOCK_M)
+    global_blk_idx = pid_b * num_pid_m + pid_m
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    offs_d = tl.arange(0, D)[None,:]
+    mask = offs_m < seqlen
+    head_offset = pid_h.to(tl.int64) * stride_h
+    tile_offsets = batch_offset + offs_m * stride_m + head_offset + offs_d
+    tile_ptrs = query_ptr + tile_offsets
+    Q = tl.load(
+        tile_ptrs,
+        mask=mask,
+        other=0.0,
+    )
+
+    Q = Q.to(tl.float32)
+    if sm_scale is not None:
+        Q *= sm_scale
+    scale = tl.max(tl.abs(Q)) / DTYPE_MAX
+    Q_quant = Q / scale
+    Q_quant = Q_quant.to(Q_q.dtype.element_ty)
+
+    # scale (total num blocks)
+    scale_ptrs = Q_descale + global_blk_idx * scale_stride_0 + pid_h * scale_stride_1
+    tl.store(scale_ptrs, scale)
+    
+    qtile_ptrs = Q_q + tile_offsets
+    tl.store(
+        qtile_ptrs, Q_quant,
+        mask=mask)
+
+
+@triton.jit
+def _rotate_mxfp_quantize_k_kernel(
+    K,
+    K_q,
+    K_descale,
+    R,  # Hadamard matrix
+    stride_t,
+    stride_tq,
+    stride_ts,
+    num_tokens,
+    hadamard_rotation: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_R: tl.constexpr,  # rotation block size
+    D: tl.constexpr,  # D is 128
+    sm_scale: tl.constexpr,
+    SCALE_GROUP_SIZE: tl.constexpr = 32,
+):
+
+    pid = tl.program_id(0).to(tl.int64)
+
+    # Offsets
+    offs_t = pid * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    mask = (offs_t < num_tokens)
+
+    offs_d = tl.arange(0, D)
+    offs_dq = tl.arange(0, D // 2)
+    offs_ds = tl.arange(0, D // SCALE_GROUP_SIZE)
+
+    # set pointers to either Q or K tensor, descale, quantized output
+    # Q block shape: [BLOCK_M, D]
+    tensor_offset = K + (
+        offs_t * stride_t
+        + offs_d[None, :]
+    )
+    descale_offset = K_descale + (
+        offs_t * stride_ts
+        + offs_ds[None, :]
+    )  # we group 32 values together for quantization
+
+    quant_tensor_offset = K_q + (
+        offs_t * stride_tq
+        + offs_dq[None, :]
+    )
+
+    qk_ptr = tensor_offset
+    qk_descale_ptr = descale_offset
+    qk_quant_ptr = quant_tensor_offset
+
+    qk_tile = tl.load(
+        qk_ptr, mask=mask & (offs_d[None, :] < D), other=0.0
+    )  # (BLOCK_M, D)
+
+    if hadamard_rotation:
+        r_ptr = (
+            R
+            + tl.arange(0, BLOCK_R)[:, None] * BLOCK_R
+            + tl.arange(0, BLOCK_R)[None, :]
+        )
+        r_mat = tl.load(r_ptr)  # BLOCK_R x BLOCK_R
+
+        shape0: tl.constexpr = BLOCK_M * D // BLOCK_R
+
+        # Rotate: Q_rot = Q @ R
+        qk_rot_tile = tl.dot(qk_tile.reshape((shape0, BLOCK_R)).to(r_mat.dtype), r_mat)
+        qk_rot_tile = qk_rot_tile.reshape((BLOCK_M, D))
+    else:
+        qk_rot_tile = qk_tile.to(tl.float32)
+
+    if sm_scale is not None:
+        qk_rot_tile *= sm_scale
+    
+    qk_quant_tile, qk_descale = _compute_mx_quant_and_scale_rne(
+        qk_rot_tile, mask, tl.uint8
+    )
+
+    tl.store(qk_descale_ptr, qk_descale, mask=mask)
+
+    tl.store(
+        qk_quant_ptr,
+        qk_quant_tile,
+        mask=mask,
+    )
+
+
+
+# @triton.jit
+# def perchannel_quantize_v_kernel(
+#     V_Input,
+#     V_Output,
+#     V_Descale,
+#     stride_t,
+#     stride_h,
+#     stride_sh,
+#     num_tokens,
+#     D: tl.constexpr,
+#     BLOCK_M: tl.constexpr,
+# ):
+#     pid = tl.program_id(0).to(tl.int64)
+#     pid_h = tl.program_id(1).to(tl.int64)
+
+#     offs_token = pid * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+#     mask = offs_token < num_tokens
+#     offs_d = tl.arange(0, D)
+
+#     v_offs = (
+#         offs_token * stride_t
+#         + pid_h * stride_h
+#         + offs_d[None, :]
+#     )
+
+#     v_input_ptrs = V_Input + v_offs
+#     v_output_ptrs = V_Output + v_offs
+
+#     # just apply the per channel v_scales that have been computed outside
+#     v_descale_ptrs = V_Descale + pid_h * stride_sh + offs_d
+#     v = tl.load(v_input_ptrs, mask=mask, other=0.0)
+#     v_descales = tl.load(v_descale_ptrs)
+#     v_quant = v / v_descales
+#     v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
+#     tl.store(v_output_ptrs, v_quant, mask=mask)
+
+
+
 ################# Sage V2 quantization kernels ####################
 
 
