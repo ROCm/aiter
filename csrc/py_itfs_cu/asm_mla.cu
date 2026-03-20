@@ -88,7 +88,8 @@ std::string get_heuristic_kernel_mla(std::string q_type,
                 " ps:", ps,
                 " prefill:", prefill,
                 " causal:", causal,
-                " qseqlen:", qseqlen);
+                " qseqlen:", qseqlen,
+                " lse:", lse);
     return "";
 }
 
