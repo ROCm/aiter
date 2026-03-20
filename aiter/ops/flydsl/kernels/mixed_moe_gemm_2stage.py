@@ -2963,9 +2963,11 @@ def compile_mixed_moe_gemm2(
                     if bool(accumulate):
                         row_byte_base = out_base_idx + t_idx * n_byte_stride
                     else:
-                        row_byte_base = out_base_idx + (
-                            t_idx * arith.constant(topk, index=True) + s_idx
-                        ) * n_byte_stride
+                        row_byte_base = (
+                            out_base_idx
+                            + (t_idx * arith.constant(topk, index=True) + s_idx)
+                            * n_byte_stride
+                        )
                     if not bool(accumulate):
                         # ---- 64-bit global store path (avoids i32 offset overflow) ----
                         col_idx = col_g0
