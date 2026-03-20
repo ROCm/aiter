@@ -82,20 +82,23 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
     int tokens = hidden_states.size(0);
     int sorted_size = std::min(int64_t(tokens * topk * block_m.value()), sorted_token_ids.size(0));
     int E = w1.size(0);
-    int N = w1.size(1) / 2;
-    if (w1.size(1) == w2.size(2))
-        N = w1.size(1);
+    bool use_g1u1 = (w1.size(1) != w2.size(2));
+    int N = use_g1u1 ? (w1.size(1) / 2) : w1.size(1);
     int K = hidden_states.size(-1);
     int MPerBlock = block_m.value();
+    static bool first_call = true;
+    if(first_call) {
+        std::cerr << "[ck_moe_stage1] hidden_states: " << hidden_states.sizes()
+                << " w1: " << w1.sizes()
+                << " w2: " << w2.sizes()
+                << " out: " << out.sizes()
+                << " E=" << E << " N=" << N << " K=" << K
+                << " tokens=" << tokens << " sorted_size=" << sorted_size
+                << " g1u1=" << (use_g1u1 ? "yes" : "no")
+                << std::endl;
+        first_call = false;
+    }
 
-    std::cerr << "[ck_moe_stage1] hidden_states: " << hidden_states.sizes()
-              << " w1: " << w1.sizes()
-              << " w2: " << w2.sizes()
-              << " out: " << out.sizes()
-              << " E=" << E << " N=" << N << " K=" << K
-              << " tokens=" << tokens << " sorted_size=" << sorted_size
-              << " g1u1=" << (w1.size(1) != w2.size(2) ? "yes" : "no")
-              << std::endl;
 
     void *hidden_states_ptr = hidden_states.data_ptr();
     void *w1_ptr = w1.transpose(1, 2).data_ptr();
@@ -125,7 +128,7 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
 
     kernel(at::hip::getCurrentHIPStream(),
            tokens, sorted_size, N, K, topk,
-           hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr, splitk_local, nt);
+           hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr, splitk_local, nt, use_g1u1);
 }
 
 void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
@@ -188,5 +191,5 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
 
     kernel(at::hip::getCurrentHIPStream(),
            tokens, sorted_size, N, K, topk,
-           inter_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w2_scale_ptr, a2_scale_ptr, splitk_local, nt);
+           inter_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w2_scale_ptr, a2_scale_ptr, splitk_local, nt, false);
 }

@@ -39,7 +39,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                         std::optional<void*> w1_scale, // [e, 1, n], gate(up) scale
                         std::optional<void*> a1_scale, // [m, 1], token scale
                         std::optional<int> splitk,     // splitk
-                        std::optional<bool> nt)
+                        std::optional<bool> nt,
+                        bool use_g1u1)                 // gate-up fusion flag
 {
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
     ck::index_t StrideA = K;
@@ -147,7 +148,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
         KBatch,
         a_element_op,
         b_element_op,
-        cde_element_op);
+        cde_element_op,
+        use_g1u1);
 
     if(!device_op.IsSupportedArgument(argument))
     {
@@ -193,7 +195,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                                             std::optional<void*> w1_scale,    \
                                             std::optional<void*> a1_scale,    \
                                             std::optional<int> splitk,        \
-                                            std::optional<bool> nt);
+                                            std::optional<bool> nt,           \
+                                            bool use_g1u1);
 
 template <typename A0DataType,
           typename B0DataType,
@@ -228,7 +231,8 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
                         std::optional<void*> w2_scale, // [e, 1, n], gate(up) scale
                         std::optional<void*> a2_scale, // [max_num_tokens_padded, 1], token scale
                         std::optional<int> splitk,     // splitk
-                        std::optional<bool> nt)
+                        std::optional<bool> nt,
+                        bool use_g1u1)
 {
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
     ck::index_t StrideA = K;
@@ -334,7 +338,8 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
                                KBatch,
                                a_element_op,
                                b_element_op,
-                               cde_element_op);
+                               cde_element_op,
+			       use_g1u1);
 
     if (!device_op.IsSupportedArgument(argument))
     {
@@ -342,7 +347,7 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
             "wrong! device_gemm with the specified compilation parameters does "
             "not support this GEMM problem");
     }
-    printf("%s:%d - %s", __FILE__, __LINE__, __PRETTY_FUNCTION__);
+
     fflush(stdout);
     invoker.Run(argument, StreamConfig{stream});
 }
@@ -363,4 +368,4 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
         std::optional<void *> w2_scale,                                                                                                                              \
         std::optional<void *> a2_scale,                                                                                                                              \
         std::optional<int>   splitk,                                                                                                                                 \
-        std::optional<bool>  nt);
+        std::optional<bool>  nt, bool use_g1u1);
