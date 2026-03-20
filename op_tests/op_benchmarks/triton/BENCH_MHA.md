@@ -18,6 +18,31 @@ $$
 \text{Attention}(Q, K, V) = \mathrm{softmax}\left( \frac{Q K^{\top}}{\sqrt{d}} + M \right) V
 $$
 
+**Computation flow** (matrix shapes for one head: scores are $L_q \times L_k$, output is $L_q \times d_v$):
+
+```mermaid
+flowchart TB
+  Q["Q (Lq × d)"] --> Mat["Scores S = Q K^T (Lq × Lk)"]
+  K["K (Lk × d)"] --> Mat
+  Mat --> Div["S / sqrt(d)"]
+  Div --> AddM["S + M (mask)"]
+  AddM --> SM["row-wise softmax gives A"]
+  SM --> AV["A V"]
+  V["V (Lk × dv)"] --> AV
+  AV --> Out["Output (Lq × dv)"]
+```
+
+```text
+                    ┌─────────────┐     ┌──────────┐     ┌─────────┐
+  Q (Lq×d) ─────────┤             │     │  + mask │     │ row-wise│     ┌───────────┐
+                    │  Q · K^T    ├────►│    M    ├────►│ softmax ├───► │ A · V     ├──► O (Lq×dv)
+  K (Lk×d) ─────────┤  → Lq×Lk   │     │         │     │  → A    │     └───────────┘
+                    └─────────────┘     └──────────┘     └─────────┘           ▲
+                                                                               │
+  V (Lk×dv) ─────────────────────────────────────────────────────────────────────┘
+         attention weights A weight the value rows; result has Lq rows, dv cols
+```
+
 - **Scale** $1/\sqrt{d}$ matches the default `softmax_scale` in code (`sm_scale`), unless you change it inside the benchmark.
 - **Mask** $M$ is **causal** when `-causal` is enabled: entries above the diagonal are set so those positions get zero probability after softmax (exact layout follows the kernel; conceptually “token $i$ may not attend to token $j > i$” when $L_q = L_k$).
 - With **no causal mask**, all $L_q \times L_k$ pairs contribute (subject to varlen padding, which zeroes out invalid positions in the `thd` path).
@@ -39,19 +64,6 @@ where $\phi$ maps query heads to KV heads in the GQA pattern. Outputs per head a
 ### What the benchmark does *not* include
 
 The timed kernels implement the **attention map × values** computation (and backward through it). They do **not** include the learned projections $X W^Q, X W^K, X W^V$ from the transformer block—that FLOPs and memory traffic is separate from `bench_mha.py`.
-
----
-
-## Prerequisites
-
-- **GPU**: CUDA device; tensors are allocated on `cuda`.
-- **Python environment**: PyTorch, Triton, and the **aiter** package importable (typically run from the **aiter** repo root with that environment activated so `aiter.ops.triton.attention` resolves).
-- **Working directory**: Examples assume you run from `op_tests/op_benchmarks/triton` (or pass equivalent `PYTHONPATH` so package imports work).
-
-```bash
-cd op_tests/op_benchmarks/triton
-python bench_mha.py --help
-```
 
 ---
 
