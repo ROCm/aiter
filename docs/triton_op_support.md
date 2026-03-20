@@ -4,9 +4,9 @@
 
 | Kernel | DSL | dtype | GPU Arch |
 |--------|:---:|-------|----------|
-| [`mha.py`](../aiter/ops/triton/attention/mha.py) `:: flash_attn_func / flash_attn_varlen_func` | Triton | fp16 · bf16 · fp32 · fp8 | gfx942 / gfx950 / other ROCm |
-| [`mha.py`](../aiter/ops/triton/attention/mha.py) `:: flash_attn_with_kvcache` | Triton | fp16 · bf16 | gfx942 / gfx950 / other ROCm |
-| [`mha_v3.py`](../aiter/ops/triton/attention/mha_v3.py) `:: flash_attn_func / flash_attn_varlen_func` | Triton | fp16 · bf16 · fp32 · fp8 | gfx942 / gfx950 / other ROCm |
+| [`mha.py`](../aiter/ops/triton/attention/mha.py) `:: flash_attn_func / flash_attn_varlen_func` | Triton | fp16 · bf16 · fp32 · fp8 | all ROCm |
+| [`mha.py`](../aiter/ops/triton/attention/mha.py) `:: flash_attn_with_kvcache` | Triton | fp16 · bf16 | all ROCm |
+| [`mha_v3.py`](../aiter/ops/triton/attention/mha_v3.py) `:: flash_attn_func / flash_attn_varlen_func` | Triton | fp16 · bf16 · fp32 · fp8 | all ROCm |
 | [`mha_v3.py`](../aiter/ops/triton/attention/mha_v3.py) `:: flash_attn_fp8_func / flash_attn_varlen_fp8_func` | Triton | bf16 · fp32 → fp8 (auto-quant) | gfx942 / gfx950 |
 | [`mha_v3.py`](../aiter/ops/triton/attention/mha_v3.py) `:: flash_attn_with_kvcache` | Triton | fp16 · bf16 · fp8 | gfx942 / gfx950 |
 | [`hstu_attention.py`](../aiter/ops/triton/attention/hstu_attention.py) `:: triton_hstu_attention_fwd / triton_hstu_attention_bwd` | Triton | bf16 · fp16 | all ROCm⁷ |
