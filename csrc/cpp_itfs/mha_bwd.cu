@@ -365,6 +365,11 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
 #define LOCK_IMPL_PTR_MAP   std::lock_guard<std::mutex> lock(impl_ptr_mutex)
 
+    // Include device ID in cache key so each GPU gets its own loaded module
+    int current_device;
+    HIP_CALL(hipGetDevice(&current_device));
+    std::string dev_prefix = std::to_string(current_device) + ":";
+
     auto it_pre = pre_cfgs->find(pre_kernel);
     if(it_pre != pre_cfgs->end())
     {
@@ -372,9 +377,10 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
         ts_odo              = cfg.ts;
+        std::string key     = dev_prefix + name;
 
         LOCK_IMPL_PTR_MAP;
-        auto result = impl_ptr_map.emplace(name, nullptr);
+        auto result = impl_ptr_map.emplace(key, nullptr);
         if(result.second)
         {
             result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
@@ -394,9 +400,10 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
         ts_kv               = cfg.ts;
+        std::string key     = dev_prefix + name;
 
         LOCK_IMPL_PTR_MAP;
-        auto result = impl_ptr_map.emplace(name, nullptr);
+        auto result = impl_ptr_map.emplace(key, nullptr);
         if(result.second)
         {
             result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
@@ -418,9 +425,10 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
             const char* name    = cfg.knl_name.c_str();
             const char* co_name = cfg.co_name.c_str();
             ts_dq               = cfg.ts;
+            std::string key     = dev_prefix + name;
 
             LOCK_IMPL_PTR_MAP;
-            auto result = impl_ptr_map.emplace(name, nullptr);
+            auto result = impl_ptr_map.emplace(key, nullptr);
             if(result.second)
             {
                 result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
