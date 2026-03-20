@@ -123,6 +123,8 @@ void mla_decode_stage1_asm_fwd(
 
     bool persistent = (num_kv_splits_indptr == nullptr);
 
+    const HipDeviceGuard device_guard(Q->device_id);
+
     int stride_Q       = Q->stride(0) * Q->element_size() * max_seqlen_q;
     int stride_Page    = KV->stride(0) * KV->element_size();
     uint32_t log2_page = (uint32_t)log2f(page_size);
@@ -200,10 +202,6 @@ void mla_decode_stage1_asm_fwd(
     // std::cout << "ptr_STP: " << args.ptr_STP << std::endl;
     // std::cout << "out_16_nosplit: " << args.out_16_nosplit << std::endl;
     // std::cout << "ptr_LSEP: " << args.ptr_LSEP << std::endl;
-
-    int prev_device;
-    HIP_CALL(hipGetDevice(&prev_device));
-    HIP_CALL(hipSetDevice(Q->device_id));
 
     AITER_CHECK(Q->is_contiguous(), __func__, ":only support Q.is_contiguous() for now");
     AITER_CHECK(num_kv_heads == 1, __func__, ":only support num_kv_heads==1 for now");
@@ -373,7 +371,6 @@ void mla_decode_stage1_asm_fwd(
                              1,         // bdy
                              1,         // bdz
                              stream});
-    HIP_CALL(hipSetDevice(prev_device));
 }
 
 struct __attribute__((packed)) PsKernelArgs
@@ -448,6 +445,8 @@ void mla_prefill_ps_asm_fwd(
     int available_tgs = 1;
     const int gqa_ratio = num_head_q / num_kv_heads;
 
+    const HipDeviceGuard device_guard(Q->device_id);
+
     PsKernelArgs args;
     size_t arg_size = sizeof(args);
     
@@ -473,10 +472,6 @@ void mla_prefill_ps_asm_fwd(
     args.num_page          = num_page;
     args.num_used_page     = num_used_page;
     
-    int prev_device;
-    HIP_CALL(hipGetDevice(&prev_device));
-    HIP_CALL(hipSetDevice(Q->device_id));
-
     auto q_dtype = Q->dtype();
     auto k_dtype = K->dtype();
 
@@ -538,7 +533,6 @@ void mla_prefill_ps_asm_fwd(
                              1,            // bdy
                              1,            // bdz
                              stream});
-    HIP_CALL(hipSetDevice(prev_device));
 }
 
 
@@ -565,6 +559,8 @@ void mla_prefill_asm_fwd(
     int kv_split        = splitData->size(1);
     const int gqa_ratio = num_heads / num_kv_heads;
 
+    const HipDeviceGuard device_guard(Q->device_id);
+
     int stride_Q       = Q->stride(0) * Q->element_size();
     int stride_Page    = KV->stride(0) * KV->element_size();
     uint32_t log2_page = (uint32_t)log2f(page_size);
@@ -585,10 +581,6 @@ void mla_prefill_asm_fwd(
     args.s_Q_Bs      = stride_Q;
     args.s_Bs        = stride_Page;
     args.s_log2_plen = log2_page;
-
-    int prev_device;
-    HIP_CALL(hipGetDevice(&prev_device));
-    HIP_CALL(hipSetDevice(Q->device_id));
 
     AITER_CHECK(Q->is_contiguous(), __func__, ":only support Q.is_contiguous() for now");
     AITER_CHECK(gqa_ratio == 16 || gqa_ratio == 128,
@@ -651,5 +643,4 @@ void mla_prefill_asm_fwd(
                              1,                                              // bdy
                              1,                                              // bdz
                              stream});
-    HIP_CALL(hipSetDevice(prev_device));
 }

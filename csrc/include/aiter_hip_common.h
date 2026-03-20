@@ -259,3 +259,16 @@ static bool is_mi308_device()
     return chip_id == 0x74a2 || chip_id == 0x74a8 ||
            chip_id == 0x74b6 || chip_id == 0x74bc;
 }
+
+class HipDeviceGuard {
+public:
+    explicit HipDeviceGuard(int device_id) {
+        hipGetDevice(&prev_device_);
+        hipSetDevice(device_id);
+    }
+    ~HipDeviceGuard() { hipSetDevice(prev_device_); }
+    HipDeviceGuard(const HipDeviceGuard&) = delete;
+    HipDeviceGuard& operator=(const HipDeviceGuard&) = delete;
+private:
+    int prev_device_{};
+};
