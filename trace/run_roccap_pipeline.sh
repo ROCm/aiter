@@ -3,15 +3,29 @@
 # Runs the roccap capture/play/extract pipeline, then sp3disasm and amtool
 # using the SHA extracted from the roccap extract output.
 #
-# Usage: ./run_roccap_pipeline.sh <kernel_name> <path_to_kernel_file>
-# Example: ./run_roccap_pipeline.sh gemm_mxfp4_preshuffle_gfx1250 ../aiter/ops/triton/_gluon_kernels/gemm/basic/gemm_mxfp4.py
+# The runnable entry point is gemm_afp4wfp4.py (runs __main__, uses config from
+# _get_config, launches Gluon gemm_mxfp4_preshuffle_gfx1250 on gfx1250).
+# Requires PYTHONPATH to include the AITER repo root so "aiter" and "op_tests"
+# resolve (the CLI imports generate_gemm_afp4wfp4_inputs from op_tests).
+#
+# Usage (from this trace/ directory):
+#   export PYTHONPATH=/path/to/aiter/repo/root
+#   ./run_roccap_pipeline.sh <kernel_disp_name> <path_to_python_script>
+#
+# Example:
+#   ./run_roccap_pipeline.sh gemm_mxfp4_preshuffle_gfx1250 \
+#     ../aiter/ops/triton/gemm/basic/gemm_afp4wfp4.py
+#
+# If capture finds no kernel, list available names from a trial run or adjust
+# --disp to match how roccap labels the Gluon kernel on your stack.
 
 # Do not abort on failures; continue through the pipeline.
 set +e
 
 if [[ $# -lt 2 ]]; then
-  echo "Usage: $0 <kernel_name> <path_to_kernel_file>" >&2
-  echo "Example: $0 gemm_mxfp4_preshuffle_gfx1250 ../aiter/ops/triton/_gluon_kernels/gemm/basic/gemm_mxfp4.py" >&2
+  echo "Usage: $0 <kernel_disp_name> <path_to_python_script>" >&2
+  echo "Set PYTHONPATH to AITER repo root (for aiter + op_tests)." >&2
+  echo "Example: $0 gemm_mxfp4_preshuffle_gfx1250 ../aiter/ops/triton/gemm/basic/gemm_afp4wfp4.py" >&2
   exit 1
 fi
 
