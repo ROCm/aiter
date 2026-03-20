@@ -173,8 +173,13 @@ function run_aiter_op {
 
     # python op_tests/test_mha.py -b 1 -n 64 -q 8192 -k 8192 -d_qk_v 128,128 -d fp16 -c --no-local -bt no -m mha -det
     # python op_tests/test_mha.py -b 1 -n 64 -q 8192 -k 8192 -d_qk_v 128,128 -d fp16 -c --no-local -bt no -m mha -det --bf16-fwd-backend asm
-    python op_tests/test_mha.py -b 1 -n 64 -q 8192 -k 8192 -d_qk_v 128,128 -d bf16 -c --no-local -bt no -m mha -det --bf16-fwd-backend asm
-    python op_tests/test_mha.py -b 1 -n 64 -q 8192 -k 8192 -d_qk_v 128,128 -d bf16 -c --no-local -bt no -m mha -det --bf16-fwd-backend ck
+    # python op_tests/test_mha.py -b 1 -n 64 -q 8192 -k 8192 -d_qk_v 128,128 -d bf16 -c --no-local -bt no -m mha -det --bf16-fwd-backend asm
+    # python op_tests/test_mha.py -b 1 -n 64 -q 8192 -k 8192 -d_qk_v 128,128 -d bf16 -c --no-local -bt no -m mha -det --bf16-fwd-backend ck
+
+    python op_tests/test_mha_ck_vs_torch.py -b 1 -n 64 -q 8192 -k 8192 -d_qk_v 128,128 -d bf16 -c --no-local -bt no -m mha -det --bf16-fwd-backend asm
+    python op_tests/test_mha_ck_vs_torch.py -b 1 -n 64 -q 8192 -k 8192 -d_qk_v 128,128 -d fp16 -c --no-local -bt no -m mha -det --bf16-fwd-backend asm
+    python op_tests/test_mha_ck_vs_torch.py -b 1 -n 64 -q 8192 -k 8192 -d_qk_v 128,128 -d bf16 -c --no-local -bt no -m mha -det --bf16-fwd-backend ck
+    python op_tests/test_mha_ck_vs_torch.py -b 1 -n 64 -q 8192 -k 8192 -d_qk_v 128,128 -d fp16 -c --no-local -bt no -m mha -det --bf16-fwd-backend ck
 
 
     # cp /mnt/raid0/heyanguang/code/fa_triton/latest_triton_py3.12/third_party/amd/backend/compiler.py /usr/local/lib/python3.10/dist-packages/triton/backends/amd/compiler.py
