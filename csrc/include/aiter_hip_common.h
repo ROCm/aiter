@@ -263,10 +263,10 @@ static bool is_mi308_device()
 class HipDeviceGuard {
 public:
     explicit HipDeviceGuard(int device_id) {
-        hipGetDevice(&prev_device_);
-        hipSetDevice(device_id);
+        HIP_CALL(hipGetDevice(&prev_device_));
+        HIP_CALL(hipSetDevice(device_id));
     }
-    ~HipDeviceGuard() { hipSetDevice(prev_device_); }
+    ~HipDeviceGuard() noexcept { HIP_CALL(hipSetDevice(prev_device_)); }
     HipDeviceGuard(const HipDeviceGuard&) = delete;
     HipDeviceGuard& operator=(const HipDeviceGuard&) = delete;
 private:
