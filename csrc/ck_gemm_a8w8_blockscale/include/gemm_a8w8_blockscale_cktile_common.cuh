@@ -135,21 +135,23 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
 
     using TilePartitioner = ck_tile::GemmTile1DPartitioner<GemmShape>;
 
-    using GemmTraits = ck_tile::TileGemmQuantTraits<
-        true, // PadM
-        PadN,
-        PadK,
-        false,       // PreshuffleQuant for A, not supported yet
-        PreshuffleQuantB,       // PreshuffleQuant for B, not supported yet (distinct from PreshuffleB below)
-        PreshuffleB, // PreshuffleB (weight/B matrix preshuffle), supported
-        ALayout,
-        BLayout,
-        CLayout,
-        QuantMode,
-        std::conditional_t<eight_warps, AQLayout_8Warps, AQLayout>,
-        BQLayout,
-        transpose_c,
-        UseDoubleSmemBuffer>;
+    using GemmTraits =
+        ck_tile::TileGemmQuantTraits<true, // PadM
+                                     PadN,
+                                     PadK,
+                                     false,            // PreshuffleQuant for A, not supported yet
+                                     PreshuffleQuantB, // PreshuffleQuant for B, not supported yet
+                                                       // (distinct from PreshuffleB below)
+                                     PreshuffleB,      // PreshuffleB (weight/B matrix preshuffle),
+                                                       // supported
+                                     ALayout,
+                                     BLayout,
+                                     CLayout,
+                                     QuantMode,
+                                     std::conditional_t<eight_warps, AQLayout_8Warps, AQLayout>,
+                                     BQLayout,
+                                     transpose_c,
+                                     UseDoubleSmemBuffer>;
 
     using GemmPipelineProblem = ck_tile::GemmPipelineProblemBase<ADataType,
                                                                  BDataType,
@@ -246,7 +248,11 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
     BaseGemmPipeline::TailHandler(Run, has_hot_loop, tail_num);
 }
 
-template <typename QDataType, typename OutDataType, typename GemmConfig, bool PreshuffleB, bool PreshuffleQuantB>
+template <typename QDataType,
+          typename OutDataType,
+          typename GemmConfig,
+          bool PreshuffleB,
+          bool PreshuffleQuantB>
 void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
 {
     const bool pad_n = (args.N % BQuantGroupSize::kN != 0);
@@ -254,19 +260,43 @@ void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
 
     if(pad_n && pad_k)
     {
-        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, true, true, PreshuffleB, PreshuffleQuantB>(args);
+        TileGemmComputeImpl<QDataType,
+                            OutDataType,
+                            GemmConfig,
+                            true,
+                            true,
+                            PreshuffleB,
+                            PreshuffleQuantB>(args);
     }
     else if(pad_n && !pad_k)
     {
-        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, true, false, PreshuffleB, PreshuffleQuantB>(args);
+        TileGemmComputeImpl<QDataType,
+                            OutDataType,
+                            GemmConfig,
+                            true,
+                            false,
+                            PreshuffleB,
+                            PreshuffleQuantB>(args);
     }
     else if(!pad_n && pad_k)
     {
-        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, false, true, PreshuffleB, PreshuffleQuantB>(args);
+        TileGemmComputeImpl<QDataType,
+                            OutDataType,
+                            GemmConfig,
+                            false,
+                            true,
+                            PreshuffleB,
+                            PreshuffleQuantB>(args);
     }
     else
     {
-        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, false, false, PreshuffleB, PreshuffleQuantB>(args);
+        TileGemmComputeImpl<QDataType,
+                            OutDataType,
+                            GemmConfig,
+                            false,
+                            false,
+                            PreshuffleB,
+                            PreshuffleQuantB>(args);
     }
 }
 
@@ -308,8 +338,7 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     }
     else if(!eight_warps && PreshuffleB)
     {
-        x_scale_t =
-            x_scale.view({x_scale.size(1), x_scale.size(0)}).transpose(0, 1).contiguous();
+        x_scale_t   = x_scale.view({x_scale.size(1), x_scale.size(0)}).transpose(0, 1).contiguous();
         args.aq_ptr = x_scale_t.data_ptr();
     }
     else
