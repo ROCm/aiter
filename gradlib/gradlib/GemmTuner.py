@@ -673,6 +673,7 @@ class GemmTuner(GemmCommonTuner):
         "tune_file": f"{AITER_CONFIG_GEMM_BF16}",
         "untune_file": "aiter/configs/bf16_untuned_gemm.csv",
         "batch": 1,
+        "config_env_name": "AITER_CONFIG_GEMM_BF16",
     }
 
     def _setup_specific_arguments(self):
@@ -759,6 +760,72 @@ class GemmTuner(GemmCommonTuner):
         self.cu_num = self.get_cu_num()
         self.gemmobj = None
         self.num_warmup = 10
+
+    def _clear_op_caches(self):
+        from aiter.tuned_gemm import get_GEMM_A16W16_config_, get_GEMM_A16W16_config
+
+        get_GEMM_A16W16_config_.cache_clear()
+        get_GEMM_A16W16_config.cache_clear()
+
+    def run_config(self, args):
+        from aiter.tuned_gemm import gemm_a16w16
+        from aiter.test_common import run_perftest, checkAllclose
+
+        untunedf = self.untunedf
+        results = []
+        for i in range(len(untunedf)):
+            M = int(untunedf.loc[i, "M"])
+            N = int(untunedf.loc[i, "N"])
+            K = int(untunedf.loc[i, "K"])
+            bias = untunedf.loc[i, "bias"]
+            indtype = str(untunedf.loc[i, "dtype"])
+            outdtype = str(untunedf.loc[i, "outdtype"])
+            scaleAB = untunedf.loc[i, "scaleAB"]
+            bpreshuffle = untunedf.loc[i, "bpreshuffle"]
+            shape_str = f"({M}, {N}, {K}, {indtype}, bias={bias})"
+            try:
+                inp, weights, _, bias_tensor, x_scale, _, shuffleweights, w_scale = (
+                    generate_data(
+                        M,
+                        N,
+                        K,
+                        eval(indtype),
+                        eval(outdtype),
+                        scaleAB,
+                        bpreshuffle,
+                        0,
+                        bias,
+                    )
+                )
+                w = shuffleweights if bpreshuffle else weights
+                scale_a = x_scale if scaleAB else None
+                scale_b = w_scale if scaleAB else None
+                out, us = run_perftest(
+                    gemm_a16w16,
+                    inp,
+                    w,
+                    bias=bias_tensor,
+                    otype=eval(outdtype),
+                    scale_a=scale_a,
+                    scale_b=scale_b,
+                    num_warmup=args.warmup,
+                    num_iters=args.iters,
+                )
+                ref = get_gemm_ref(
+                    inp,
+                    weights,
+                    bias_tensor,
+                    x_scale,
+                    w_scale,
+                    eval(indtype),
+                    eval(outdtype),
+                )
+                err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
+                status = "ok" if err_ratio <= args.errRatio else "mismatch"
+                results.append({"shape": shape_str, "us": us, "status": status})
+            except Exception as e:
+                results.append({"shape": shape_str, "us": -1, "status": f"error:{e}"})
+        return results
 
     def calculate_perf(
         self,
