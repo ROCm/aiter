@@ -532,7 +532,6 @@ def get_mla_bench_result(args: BenchArgs, out: str, err: str) -> Optional[float]
         "rotary_dim",
         "num_kv_splits",
         "mla_decode_fwd",
-        "(ms)",
     ]:
         logging.error("Table header doesn't match: %s", l1)
         return None
