@@ -1876,6 +1876,29 @@ class CustomAllreduce
         }
     }
 
+    // Peer-pointer based constructor: accepts pre-resolved peer pointers directly,
+    // without any IPC handle exchange. The caller (e.g. MoRI SHMEM) is responsible
+    // for obtaining peer-accessible addresses.
+    CustomAllreduce(Signal* meta,
+                    void* rank_data,
+                    size_t rank_data_sz,
+                    const std::vector<int64_t>& meta_peer_ptrs,
+                    int rank,
+                    int world_size,
+                    bool fully_connected = true)
+        : rank_(rank),
+          world_size_(world_size),
+          full_nvlink_(fully_connected),
+          self_sg_(meta),
+          d_rank_data_base_(reinterpret_cast<RankData*>(rank_data)),
+          d_rank_data_end_(d_rank_data_base_ + rank_data_sz / sizeof(RankData))
+    {
+        for(int i = 0; i < world_size_; i++)
+        {
+            sg_.signals[i] = reinterpret_cast<Signal*>(meta_peer_ptrs[i]);
+        }
+    }
+
     char* open_ipc_handle(const void* ipc_handle)
     {
         auto [it, new_handle] = ipc_handles_.insert({*((IPC_KEY*)ipc_handle), nullptr});
@@ -1989,6 +2012,36 @@ class CustomAllreduce
             {
                 data.ptrs[i] = self;
             }
+        }
+        auto d_data = d_rank_data_base_++;
+        HIP_CALL(hipMemcpy(d_data, &data, sizeof(RankData), hipMemcpyHostToDevice));
+        output_buffers_[self] = d_data;
+    }
+
+    // Register input buffer with pre-resolved peer pointers (no IPC handles).
+    void register_input_buffer_with_peer_ptrs(const std::vector<int64_t>& peer_ptrs,
+                                              void* self)
+    {
+        check_rank_data_capacity();
+        RankData data;
+        for(int i = 0; i < world_size_; i++)
+        {
+            data.ptrs[i] = reinterpret_cast<const void*>(peer_ptrs[i]);
+        }
+        auto d_data = d_rank_data_base_++;
+        HIP_CALL(hipMemcpy(d_data, &data, sizeof(RankData), hipMemcpyHostToDevice));
+        input_buffer[self] = d_data;
+    }
+
+    // Register output buffer with pre-resolved peer pointers (no IPC handles).
+    void register_output_buffer_with_peer_ptrs(const std::vector<int64_t>& peer_ptrs,
+                                               void* self)
+    {
+        check_rank_data_capacity();
+        RankData data;
+        for(int i = 0; i < world_size_; i++)
+        {
+            data.ptrs[i] = reinterpret_cast<const void*>(peer_ptrs[i]);
         }
         auto d_data = d_rank_data_base_++;
         HIP_CALL(hipMemcpy(d_data, &data, sizeof(RankData), hipMemcpyHostToDevice));

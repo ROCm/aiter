@@ -622,6 +622,51 @@ void register_graph_buffers(fptr_t _fa,
     fa->register_graph_buffers(handles, offsets);
 }
 
+// Peer-pointer based APIs: accept pre-resolved peer pointers directly,
+// agnostic to how the pointers were obtained (IPC, MoRI SHMEM, etc.).
+
+fptr_t init_custom_ar_with_peer_ptrs(int64_t meta_ptr,
+                                     torch::Tensor& rank_data,
+                                     const std::vector<int64_t>& meta_peer_ptrs,
+                                     int64_t rank,
+                                     int64_t world_size,
+                                     bool fully_connected)
+{
+    if(world_size > 8)
+        throw std::invalid_argument("world size > 8 is not supported");
+    if(world_size % 2 != 0)
+        throw std::invalid_argument("Odd num gpus is not supported for now");
+    if(rank < 0 || rank >= world_size)
+        throw std::invalid_argument("invalid rank passed in");
+    if(static_cast<int>(meta_peer_ptrs.size()) != world_size)
+        throw std::invalid_argument("meta_peer_ptrs size must equal world_size");
+
+    return (fptr_t) new aiter::CustomAllreduce(
+        reinterpret_cast<aiter::Signal*>(meta_ptr),
+        rank_data.data_ptr(),
+        rank_data.numel(),
+        meta_peer_ptrs,
+        rank,
+        world_size,
+        fully_connected);
+}
+
+void register_input_buffer_with_peer_ptrs(fptr_t _fa,
+                                          int64_t self_ptr,
+                                          const std::vector<int64_t>& peer_ptrs)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    fa->register_input_buffer_with_peer_ptrs(peer_ptrs, reinterpret_cast<void*>(self_ptr));
+}
+
+void register_output_buffer_with_peer_ptrs(fptr_t _fa,
+                                           int64_t self_ptr,
+                                           const std::vector<int64_t>& peer_ptrs)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    fa->register_output_buffer_with_peer_ptrs(peer_ptrs, reinterpret_cast<void*>(self_ptr));
+}
+
 #ifdef USE_ROCM
 
 void free_meta_buffer(void* buffer) { HIP_CALL(hipFree(buffer)); }

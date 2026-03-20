@@ -45,20 +45,35 @@ def is_weak_contiguous(inp: torch.Tensor):
     )
 
 
+class _GpuPtrBuffer:
+    """Wraps a raw GPU pointer as a buffer with __cuda_array_interface__
+    so that torch.as_tensor can create a tensor view without copying."""
+
+    def __init__(self, ptr: int, nbytes: int):
+        self.ptr = ptr
+        self.nbytes = nbytes
+        self.__cuda_array_interface__ = {
+            "data": (ptr, False),
+            "shape": (nbytes,),
+            "typestr": "<u1",
+            "strides": None,
+            "version": 3,
+        }
+
+
 class CustomAllreduce:
 
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
 
-    # max_size: max supported allreduce size
+    SHMEM_INPUT_BUFFER_SIZE = int(1.2 * 1024**3)  # 1.2 GB
+    SHMEM_OUTPUT_BUFFER_SIZE = int(1.2 * 1024**3)  # 1.2 GB
+    SHMEM_TMP_BUFFER_SIZE = int(2.4 * 1024**3)  # 2.4 GB
+    _IPC_FALLBACK_MAX_SIZE = 8192 * 1024 * 8 * 2  # ~128 MB, IPC fallback only
+
     def __init__(
         self,
         group: ProcessGroup,
         device: Union[int, str, torch.device],
-        max_size=8192
-        * 1024
-        * 8
-        * 2,  # In allreduce 2stage writemode, use 2x tmp buffer
-        enable_register_for_capturing: bool = True,
     ) -> None:
         """
         Args:
@@ -69,9 +84,22 @@ class CustomAllreduce:
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device, and all communicators in this group
         are in the same node.
+
+        Buffer allocation is automatic:
+        - Primary path uses MoRI SHMEM symmetric memory (1.2 GB input/output,
+          2.4 GB tmp) with no IPC handles needed for static buffers.
+        - Falls back to IPC-based buffers if MoRI SHMEM is unavailable.
+        - Eager mode: input address varies each call, so a d2d copy to the
+          pre-registered static buffer is required before the allreduce kernel.
+        - Graph mode: the input address is captured once and replayed at a
+          fixed address, so the kernel operates directly on the captured input
+          with zero d2d copy.  Graph-captured addresses are registered via IPC
+          at the end of capture (they are not SHMEM allocations).
         """
         self._IS_CAPTURING = False
         self.disabled = True
+        self._use_shmem = False
+        self._shmem_ptrs = []
 
         if not custom_ar:
             # disable because of missing custom allreduce library
@@ -116,21 +144,6 @@ class CustomAllreduce:
         assert isinstance(device, torch.device)
         self.device = device
 
-        # device_ids = get_cuda_visible_devices()
-
-        # physical_device_id = device_ids[device.index]
-        # tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
-        # gather_list = [
-        #     torch.tensor([0], dtype=torch.int, device="cpu") for _ in range(world_size)
-        # ]
-        # dist.all_gather(gather_list, tensor, group=self.group)
-        # physical_device_ids = [t.item() for t in gather_list]
-
-        # test nvlink first, this will filter out most of the cases
-        # where custom allreduce is not supported
-        # this checks hardware and driver support for NVLink
-        # assert current_platform.is_cuda() or current_platform.is_rocm()
-        # fully_connected = current_platform.is_full_nvlink(physical_device_ids)
         fully_connected = True
         if world_size > 2 and not fully_connected:
             logger.warning(
@@ -139,30 +152,133 @@ class CustomAllreduce:
                 "specify disable_custom_all_reduce=True explicitly."
             )
             return
-        # test P2P capability, this checks software/cudaruntime support
-        # this is expensive to compute at the first time
-        # then we cache the result
-        # On AMD GPU, p2p is always enabled between XGMI connected GPUs
-        # if not current_platform.is_rocm() and not _can_p2p(rank, world_size):
-        #     logger.warning(
-        #         "Custom allreduce is disabled because your platform lacks "
-        #         "GPU P2P capability or P2P test failed. To silence this "
-        #         "warning, specify disable_custom_all_reduce=True explicitly.")
-        #     return
 
         self.disabled = False
-        self.enable_register_for_capturing = enable_register_for_capturing
-        # buffers memory are owned by this Python class and passed to C++
-        # meta data composes of two parts: meta data for synchronization
-        # (256 bytes) and a temporary buffer for storing intermediate
-        # allreduce results.
-        # if current_platform.is_rocm():
+        self.rank = rank
+        self.world_size = world_size
+        self.fully_connected = fully_connected
+
+        try:
+            self._init_with_shmem(rank, world_size, fully_connected)
+        except Exception as e:
+            print(f"MoRI SHMEM unavailable ({e}), falling back to IPC path.")
+            self._init_with_ipc(rank, world_size, fully_connected)
+
+    def _init_with_shmem(self, rank, world_size, fully_connected):
+        """Initialize using MoRI SHMEM symmetric memory (no IPC handles)."""
+        import mori.shmem as shmem
+
+        self._use_shmem = True
+        self.enable_register_for_capturing = True
+
+        # Ensure the SHMEM static heap is large enough for our buffers.
+        # Total: meta(signal + tmp) + input + output ≈ 4.8 GB
+        import os
+
+        required = (
+            ops.meta_size()
+            + self.SHMEM_TMP_BUFFER_SIZE
+            + self.SHMEM_INPUT_BUFFER_SIZE
+            + self.SHMEM_OUTPUT_BUFFER_SIZE
+        )
+        # 10 % headroom for alignment
+        required = int(required * 1.1)
+        if "MORI_SHMEM_HEAP_SIZE" not in os.environ:
+            os.environ["MORI_SHMEM_HEAP_SIZE"] = str(required)
+
+        # Initialize MoRI SHMEM: bootstrap via UniqueId broadcast
+        if rank == 0:
+            uid_list = [shmem.shmem_get_unique_id()]
+        else:
+            uid_list = [None]
+        dist.broadcast_object_list(uid_list, src=0, group=self.group)
+        shmem.shmem_init_attr(
+            shmem.MORI_SHMEM_INIT_WITH_UNIQUEID,
+            rank,
+            world_size,
+            uid_list[0],
+        )
+
+        meta_signal_size = ops.meta_size()
+        meta_total = meta_signal_size + self.SHMEM_TMP_BUFFER_SIZE
+
+        # Allocate symmetric memory via MoRI SHMEM
+        meta_ptr = shmem.shmem_malloc(meta_total)
+        input_ptr = shmem.shmem_malloc(self.SHMEM_INPUT_BUFFER_SIZE)
+        output_ptr = shmem.shmem_malloc(self.SHMEM_OUTPUT_BUFFER_SIZE)
+        assert meta_ptr != 0, "shmem_malloc failed for meta buffer"
+        assert input_ptr != 0, "shmem_malloc failed for input buffer"
+        assert output_ptr != 0, "shmem_malloc failed for output buffer"
+        self._shmem_ptrs = [meta_ptr, input_ptr, output_ptr]
+
+        # Zero-initialize the Signal region (synchronization flags must start at 0)
+        meta_view = torch.as_tensor(_GpuPtrBuffer(meta_ptr, meta_total), device="cuda")
+        meta_view[:meta_signal_size].zero_()
+        torch.cuda.synchronize(self.device)
+
+        # Wrap SHMEM pointers as torch tensors for the existing C++ eager-mode
+        # copy path (hipMemcpyAsync to/from registered buffers)
+        self.meta = meta_view
+        self.input_buffer = torch.as_tensor(
+            _GpuPtrBuffer(input_ptr, self.SHMEM_INPUT_BUFFER_SIZE), device="cuda"
+        )
+        self.output_buffer = torch.as_tensor(
+            _GpuPtrBuffer(output_ptr, self.SHMEM_OUTPUT_BUFFER_SIZE), device="cuda"
+        )
+
+        # Rank-data: GPU buffer for per-rank pointer tuples used by kernels
+        self.rank_data = torch.empty(
+            8 * 1024 * 1024, dtype=torch.uint8, device=self.device
+        )
+
+        # Resolve P2P peer addresses for every buffer
+        my_pe = shmem.shmem_mype()
+        meta_peers = [
+            shmem.shmem_ptr_p2p(meta_ptr, my_pe, pe) for pe in range(world_size)
+        ]
+        input_peers = [
+            shmem.shmem_ptr_p2p(input_ptr, my_pe, pe) for pe in range(world_size)
+        ]
+        output_peers = [
+            shmem.shmem_ptr_p2p(output_ptr, my_pe, pe) for pe in range(world_size)
+        ]
+
+        # Initialize C++ CustomAllreduce with pre-resolved peer pointers
+        self._ptr = ops.init_custom_ar_with_peer_ptrs(
+            meta_ptr,
+            self.rank_data,
+            meta_peers,
+            rank,
+            world_size,
+            fully_connected,
+        )
+
+        # Register input/output buffers with pre-resolved peer pointers
+        ops.register_input_buffer_with_peer_ptrs(
+            self._ptr,
+            input_ptr,
+            input_peers,
+        )
+        ops.register_output_buffer_with_peer_ptrs(
+            self._ptr,
+            output_ptr,
+            output_peers,
+        )
+
+        logger.info(
+            "CustomAllreduce initialized with MoRI SHMEM: "
+            "input=%.1fGB, output=%.1fGB, tmp=%.1fGB",
+            self.SHMEM_INPUT_BUFFER_SIZE / 1024**3,
+            self.SHMEM_OUTPUT_BUFFER_SIZE / 1024**3,
+            self.SHMEM_TMP_BUFFER_SIZE / 1024**3,
+        )
+
+    def _init_with_ipc(self, rank, world_size, fully_connected):
+        """Fallback: initialize using the original IPC handle exchange path."""
+        self.enable_register_for_capturing = True
+        max_size = self._IPC_FALLBACK_MAX_SIZE
         self.meta = ops.allocate_meta_buffer(ops.meta_size() + max_size)
-        # This is a pre-registered IPC buffer. In eager mode, input tensors
-        # are first copied into this buffer before allreduce is performed
         self.input_buffer = torch.empty(max_size, dtype=torch.uint8, device=self.device)
-        # This is a pre-registered IPC buffer for output. In eager mode, kernel
-        # writes results to this buffer, then it's copied to the actual output
         self.output_buffer = torch.empty(
             max_size, dtype=torch.uint8, device=self.device
         )
@@ -174,9 +290,10 @@ class CustomAllreduce:
         self.rank_data = torch.empty(
             8 * 1024 * 1024, dtype=torch.uint8, device=self.device
         )
-        self.max_size = max_size
-        self.rank = rank
-        self.world_size = world_size
+        # max_size = max input bytes the allreduce can handle.
+        # In 2-stage write mode, tmp needs 2x, and input/tmp share the same
+        # raw size in the IPC path, so effective max is raw_size // 2.
+        self.max_size = max_size // 2
         handle = ops.get_meta_buffer_ipc_handle(self.meta)
         shard_data = (
             handle,  # ipc handle to base ptr
@@ -188,16 +305,17 @@ class CustomAllreduce:
         self._ptr = ops.init_custom_ar(
             self.meta, self.rank_data, handles, offsets, rank, self.fully_connected
         )
-        # Register both input and output buffers
-        self.register_input_buffer(self.input_buffer)
-        self.register_output_buffer(self.output_buffer)
+        self._register_input_buffer_ipc(self.input_buffer)
+        self._register_output_buffer_ipc(self.output_buffer)
 
     @contextmanager
     def capture(self):
-        """
-        The main responsibility of this context manager is the
-        `register_graph_buffers` call at the end of the context.
-        It records all the buffer addresses used in the CUDA graph.
+        """Context manager for CUDA graph capture.
+
+        During capture the kernel operates directly on the captured input
+        address (no d2d copy).  After capture completes, all captured
+        addresses are registered via IPC so that peer GPUs can access them
+        during graph replay.
         """
         try:
             self._IS_CAPTURING = True
@@ -205,29 +323,19 @@ class CustomAllreduce:
         finally:
             self._IS_CAPTURING = False
             if not self.disabled:
-                self.register_graph_buffers()
+                self._register_graph_buffers()
+
+    # ---- IPC helpers ----
+    # Used by _init_with_ipc for static buffers AND by _register_graph_buffers
+    # for graph-captured addresses (which are regular PyTorch allocations, not
+    # SHMEM, so IPC is still needed for P2P address resolution).
 
     def _get_ipc_meta(self, inp: torch.Tensor):
-        # if current_platform.is_rocm():
-        if 1:
-            # _share_cuda_() doesn't accept meta buffer not allocated from
-            # PyTorch cache allocator, use direct HIP call to get IPC handle
-            handle = ops.get_meta_buffer_ipc_handle(inp)
-            shard_data = (
-                handle,  # ipc handle to base ptr
-                0,  # offset of base ptr
-            )
-        else:
-            data = inp.untyped_storage()._share_cuda_()
-            shard_data = (
-                data[1],  # ipc handle to base ptr
-                data[3],  # offset of base ptr
-            )
+        handle = ops.get_meta_buffer_ipc_handle(inp)
+        shard_data = (handle, 0)
         return self._gather_ipc_meta(shard_data)
 
     def _gather_ipc_meta(self, shard_data):
-        # Note: don't use `[[None]] * self.world_size` here
-        # because it will create a list of the same reference
         all_data: List[Optional[Any]] = [[None] for i in range(self.world_size)]
         all_data[self.rank][0] = shard_data
 
@@ -238,10 +346,6 @@ class CustomAllreduce:
                 all_data[i], src=rank, group=self.group, device="cpu"
             )
 
-        # we cannot directly use `dist.all_gather_object` here
-        # because it is incompatible with `gloo` backend under inference mode.
-        # see https://github.com/pytorch/pytorch/issues/126032 for details.
-
         handles = []
         offsets = []
         for i in range(len(all_data)):
@@ -249,34 +353,41 @@ class CustomAllreduce:
             offsets.append(all_data[i][0][1])  # type: ignore
         return handles, offsets
 
-    def register_input_buffer(self, inp: torch.Tensor):
+    def _register_input_buffer_ipc(self, inp: torch.Tensor):
         handles, offsets = self._get_ipc_meta(inp)
         ops.register_input_buffer(self._ptr, inp, handles, offsets)
 
-    def register_output_buffer(self, out: torch.Tensor):
+    def _register_output_buffer_ipc(self, out: torch.Tensor):
         handles, offsets = self._get_ipc_meta(out)
         ops.register_output_buffer(self._ptr, out, handles, offsets)
 
-    def register_graph_buffers(self):
+    def _register_graph_buffers(self):
+        """Register graph-captured addresses via IPC after capture ends.
+
+        Graph-captured tensor addresses come from PyTorch's caching allocator
+        (not SHMEM), so IPC handles are still needed for cross-GPU access.
+        """
         handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
         handles, offsets = self._gather_ipc_meta((handle, offset))
         logger.info("Registering %d cuda graph addresses", len(offset))
         ops.register_graph_buffers(self._ptr, handles, offsets)
 
+    def _max_input_bytes(self) -> int:
+        """Max input bytes the custom allreduce can handle."""
+        if self._use_shmem:
+            return self.SHMEM_INPUT_BUFFER_SIZE
+        return self.max_size
+
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
             return False
         inp_size = inp.numel() * inp.element_size()
-        # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
             return False
         if not is_weak_contiguous(inp):
             return False
-        # for 4 or more non NVLink-capable GPUs, custom allreduce provides
-        # little performance improvement over NCCL.
-        # In allreduce 2stage writemode, use 2x tmp buffer
         if self.world_size == 2 or self.fully_connected:
-            return inp_size <= (self.max_size / 2)
+            return inp_size <= self._max_input_bytes()
         return False
 
     def should_custom_ag(self, inp: torch.Tensor):
@@ -287,10 +398,9 @@ class CustomAllreduce:
             return False
         if not is_weak_contiguous(inp):
             return False
-        # all_gather output = input * world_size, so the per-rank input
-        # must fit within max_size / world_size
+        # all_gather output = input * world_size
         if self.world_size == 2 or self.fully_connected:
-            return inp_size <= (self.max_size / (self.world_size * 2))
+            return inp_size <= (self._max_input_bytes() / self.world_size)
         return False
 
     def all_reduce(
@@ -300,14 +410,16 @@ class CustomAllreduce:
         out: Optional[torch.Tensor] = None,
         use_new: bool = True,
         open_fp8_quant: bool = False,
-        registered_input: bool = False,
-        registered_output: bool = False,
+        registered: bool = False,
     ):
         """Performs an out-of-place all reduce.
 
-        If registered is True, this assumes inp's pointer is already
-        IPC-registered. Otherwise, inp is first copied into a pre-registered
-        buffer.
+        If registered is False (eager mode), inp is first d2d-copied into the
+        pre-registered static buffer before allreduce, and the result is copied
+        back to *out*.
+        If registered is True (graph mode), the kernel operates directly on
+        *inp* whose address was captured and later IPC-registered, so no d2d
+        copy takes place.
         """
         if out is None:
             out = torch.empty_like(inp)
@@ -317,42 +429,30 @@ class CustomAllreduce:
             out,
             use_new,
             open_fp8_quant,
-            None if registered_input else self.input_buffer,
-            None if registered_output else self.output_buffer,
+            None if registered else self.input_buffer,
+            None if registered else self.output_buffer,
         )
         return out
 
     def custom_all_reduce(
         self, input: torch.Tensor, use_new: bool = True, open_fp8_quant: bool = False
     ) -> Optional[torch.Tensor]:
-        # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
+                # Graph capture: kernel uses the captured input address directly
                 return self.all_reduce(
                     input,
                     use_new=use_new,
                     open_fp8_quant=open_fp8_quant,
-                    registered_input=self.enable_register_for_capturing,
-                    registered_output=self.enable_register_for_capturing,
+                    registered=True,
                 )
             else:
-                # if warm up, mimic the allocation pattern
-                # since custom allreduce is out-of-place
+                # Warmup: mimic the allocation pattern (out-of-place)
                 return torch.zeros_like(input)
-        else:
-            # note: outside of cuda graph context,
-            # custom allreduce incurs a cost of cudaMemcpy, which should
-            # be small(<=1% of overall latency) compared to the performance
-            # gains of using custom kernels
-            return self.all_reduce(
-                input,
-                use_new=use_new,
-                open_fp8_quant=open_fp8_quant,
-                registered_input=False,
-                registered_output=False,
-            )
+        # Eager: d2d copy to static buffer → allreduce → copy back
+        return self.all_reduce(input, use_new=use_new, open_fp8_quant=open_fp8_quant)
 
     def reduce_scatter(
         self,
@@ -371,14 +471,13 @@ class CustomAllreduce:
     def custom_reduce_scatter(
         self, input: torch.Tensor, output: torch.Tensor
     ) -> Optional[torch.Tensor]:
-        # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
                 return self.reduce_scatter(input, output, registered=True)
-        else:
-            return self.reduce_scatter(input, output, registered=False)
+            return None
+        return self.reduce_scatter(input, output)
 
     def _allgather_out_shape(self, inp: torch.Tensor, dim: int):
         ndim = inp.dim()
@@ -419,11 +518,8 @@ class CustomAllreduce:
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
                 return self.all_gather_reg(inp, dim=dim)
-            else:
-                print("allgather capture hipgraph error")
-                return torch.zeros_like(inp)
-        else:
-            return self.all_gather_unreg(inp, dim=dim)
+            return torch.zeros_like(inp)
+        return self.all_gather_unreg(inp, dim=dim)
 
     def fused_ar_rms(
         self,
@@ -485,7 +581,6 @@ class CustomAllreduce:
         eps: float,
         use_1stage: bool,
     ) -> Optional[torch.Tensor]:
-        # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
             return None
         if self._IS_CAPTURING:
@@ -498,17 +593,14 @@ class CustomAllreduce:
                     registered=True,
                     use_1stage=use_1stage,
                 )
-            else:
-                return torch.zeros_like(input), torch.zeros_like(input)
-        else:
-            return self.fused_ar_rms(
-                input,
-                residual_inp,
-                w=weight,
-                eps=eps,
-                registered=False,
-                use_1stage=use_1stage,
-            )
+            return torch.zeros_like(input), torch.zeros_like(input)
+        return self.fused_ar_rms(
+            input,
+            residual_inp,
+            w=weight,
+            eps=eps,
+            use_1stage=use_1stage,
+        )
 
     def custom_fused_ar_rms_quant(
         self,
@@ -518,7 +610,6 @@ class CustomAllreduce:
         eps: float,
         use_1stage: bool,
     ):
-        # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
             return None
         if self._IS_CAPTURING:
@@ -532,27 +623,35 @@ class CustomAllreduce:
                     use_1stage=use_1stage,
                     post_per_token_quant=True,
                 )
-            else:
-                dummy_out = torch.zeros(input.shape, dtype=fp8, device=input.device)
-                dummy_scale_out = torch.zeros(
-                    input.shape[:-1] + (1,), dtype=torch.float32, device=input.device
-                )
-                return dummy_out, torch.zeros_like(input), dummy_scale_out
-        else:
-            return self.fused_ar_rms(
-                input,
-                residual_inp,
-                w=weight,
-                eps=eps,
-                registered=False,
-                use_1stage=use_1stage,
-                post_per_token_quant=True,
+            dummy_out = torch.zeros(input.shape, dtype=fp8, device=input.device)
+            dummy_scale_out = torch.zeros(
+                input.shape[:-1] + (1,), dtype=torch.float32, device=input.device
             )
+            return dummy_out, torch.zeros_like(input), dummy_scale_out
+        return self.fused_ar_rms(
+            input,
+            residual_inp,
+            w=weight,
+            eps=eps,
+            use_1stage=use_1stage,
+            post_per_token_quant=True,
+        )
 
     def close(self):
         if not self.disabled and self._ptr:
             ops.dispose(self._ptr)
             self._ptr = 0
+        if self._shmem_ptrs:
+            try:
+                import mori.shmem as shmem
+
+                for ptr in self._shmem_ptrs:
+                    if ptr:
+                        shmem.shmem_free(ptr)
+                shmem.shmem_finalize()
+            except Exception:
+                pass
+            self._shmem_ptrs.clear()
 
     def __del__(self):
         self.close()

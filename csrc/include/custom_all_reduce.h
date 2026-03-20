@@ -68,6 +68,20 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
 
 void dispose(fptr_t _fa);
 int64_t meta_size();
+
+// Peer-pointer based APIs (transport-agnostic, no IPC handles)
+fptr_t init_custom_ar_with_peer_ptrs(int64_t meta_ptr,
+                                     torch::Tensor& rank_data,
+                                     const std::vector<int64_t>& meta_peer_ptrs,
+                                     int64_t rank,
+                                     int64_t world_size,
+                                     bool fully_connected);
+void register_input_buffer_with_peer_ptrs(fptr_t _fa,
+                                          int64_t self_ptr,
+                                          const std::vector<int64_t>& peer_ptrs);
+void register_output_buffer_with_peer_ptrs(fptr_t _fa,
+                                           int64_t self_ptr,
+                                           const std::vector<int64_t>& peer_ptrs);
 void register_input_buffer(fptr_t _fa,
                            torch::Tensor& t,
                            const std::vector<torch::Tensor>& handles,

@@ -470,7 +470,25 @@ namespace py = pybind11;
           py::arg("handles"),                                                                  \
           py::arg("offsets"));                                                                 \
     m.def("allocate_meta_buffer", &aiter::allocate_meta_buffer, py::arg("size"));              \
-    m.def("get_meta_buffer_ipc_handle", &aiter::get_meta_buffer_ipc_handle, py::arg("inp"));
+    m.def("get_meta_buffer_ipc_handle", &aiter::get_meta_buffer_ipc_handle, py::arg("inp")); \
+    m.def("init_custom_ar_with_peer_ptrs",                                                    \
+          &aiter::init_custom_ar_with_peer_ptrs,                                              \
+          py::arg("meta_ptr"),                                                                \
+          py::arg("rank_data"),                                                               \
+          py::arg("meta_peer_ptrs"),                                                          \
+          py::arg("rank"),                                                                    \
+          py::arg("world_size"),                                                              \
+          py::arg("fully_connected"));                                                        \
+    m.def("register_input_buffer_with_peer_ptrs",                                             \
+          &aiter::register_input_buffer_with_peer_ptrs,                                       \
+          py::arg("_fa"),                                                                     \
+          py::arg("self_ptr"),                                                                \
+          py::arg("peer_ptrs"));                                                              \
+    m.def("register_output_buffer_with_peer_ptrs",                                            \
+          &aiter::register_output_buffer_with_peer_ptrs,                                      \
+          py::arg("_fa"),                                                                     \
+          py::arg("self_ptr"),                                                                \
+          py::arg("peer_ptrs"));
 
 #define CUSTOM_PYBIND                                                                           \
     m.def("wvSpltK",                                                                            \

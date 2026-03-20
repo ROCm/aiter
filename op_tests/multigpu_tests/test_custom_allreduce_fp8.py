@@ -125,19 +125,19 @@ def test_allreduce_custom(
     rets = [el.get() for el in rets]
 
     a = ref.clone().cuda()
-    a.to(float)
     qtype = QuantType.per_1x128
     quant_function = get_hip_quant(qtype)
-    a = a.reshape(8192, 128)
-    fp8_output, scale = quant_function(a, quant_dtype=dtypes.fp8)
+    fp8_output, scale = quant_function(a.reshape(-1, 128), quant_dtype=dtypes.fp8)
     fp32_output = fp8_output.to(torch.float) * scale
-    fp16_quanted_ref = fp32_output.to(torch.float16).reshape(128, 8192)
+    fp16_quanted_ref = fp32_output.to(torch.float16).reshape(shape)
+    rows_per_gpu = shape[0] // tp_size
     for out, us in rets:
         gpu_id = out.device.index
         ori_ref = ref.clone()
-        ori_tensor = ori_ref[gpu_id * 16 : (gpu_id + 1) * 16][:]
+        s = gpu_id * rows_per_gpu
+        e = s + rows_per_gpu
         c = fp16_quanted_ref.clone()
-        c[gpu_id * 16 : (gpu_id + 1) * 16][:] = ori_tensor
+        c[s:e] = ori_ref[s:e]
         msg = f"test_allreduce_custom: {shape=} {dtype=} {withGraph=} {us:>8.2f}"
         checkAllclose(c.cpu(), out.cpu(), msg=msg)
 

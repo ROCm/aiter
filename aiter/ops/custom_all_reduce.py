@@ -198,6 +198,36 @@ def all_reduce_rmsnorm_quant_(
 def dispose(_fa: int) -> None: ...
 
 
+# Peer-pointer based APIs (transport-agnostic, no IPC handles)
+
+
+@compile_ops("module_custom_all_reduce")
+def init_custom_ar_with_peer_ptrs(
+    meta_ptr: int,
+    rank_data: torch.Tensor,
+    meta_peer_ptrs: List[int],
+    rank: int,
+    world_size: int,
+    fully_connected: bool,
+) -> int: ...
+
+
+@compile_ops("module_custom_all_reduce")
+def register_input_buffer_with_peer_ptrs(
+    _fa: int,
+    self_ptr: int,
+    peer_ptrs: List[int],
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce")
+def register_output_buffer_with_peer_ptrs(
+    _fa: int,
+    self_ptr: int,
+    peer_ptrs: List[int],
+) -> None: ...
+
+
 @compile_ops("module_custom_all_reduce")
 def meta_size() -> int: ...
 
