@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import torch.nn.functional as F
@@ -21,7 +21,14 @@ class Gemma8W8BlockScaleBPreShuffleTuner(GemmCommonTuner):
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE}",
         "untune_file": "aiter/configs/a8w8_blockscale_bpreshuffle_untuned_gemm.csv",
+        "config_env_name": "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
     }
+
+    def _clear_op_caches(self):
+        from aiter.ops.gemm_op_a8w8 import get_GEMM_config_with_quant_type
+
+        if hasattr(get_GEMM_config_with_quant_type, "file_cache"):
+            get_GEMM_config_with_quant_type.file_cache.clear()
 
     def _setup_specific_arguments(self):
         pass
@@ -90,6 +97,39 @@ class Gemma8W8BlockScaleBPreShuffleTuner(GemmCommonTuner):
         out = torch.empty(m, n, dtype=dtypes.bf16, device=device)
         x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
         return x, weight_shuffle, x_scale_t, w_scale, out, weight, x_scale
+
+    def run_config(self, args):
+        from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_bpreshuffle
+        from aiter.test_common import run_perftest, checkAllclose
+        import pandas as pd
+
+        untunedf = self.untunedf
+        results = []
+        for i in range(len(untunedf)):
+            M = int(untunedf.loc[i, "M"])
+            N = int(untunedf.loc[i, "N"])
+            K = int(untunedf.loc[i, "K"])
+            shape_str = f"({M}, {N}, {K})"
+            try:
+                (x, weight_shuffle, x_scale_t, w_scale, out, weight, x_scale) = (
+                    self.generate_data(M, N, K, 0)
+                )
+                out, us = run_perftest(
+                    gemm_a8w8_blockscale_bpreshuffle,
+                    x,
+                    weight_shuffle,
+                    x_scale_t,
+                    w_scale,
+                    num_warmup=args.warmup,
+                    num_iters=args.iters,
+                )
+                ref = self.run_torch(x, weight, x_scale, w_scale)
+                err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
+                status = "ok" if err_ratio <= args.errRatio else "mismatch"
+                results.append({"shape": shape_str, "us": us, "status": status})
+            except Exception as e:
+                results.append({"shape": shape_str, "us": -1, "status": f"error:{e}"})
+        return results
 
     def get_ck_tasks(self, info_keys, useSplitK, seed):
         cu_num, M, N, K = info_keys

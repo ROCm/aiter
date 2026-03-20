@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import os
 
 import pandas as pd
@@ -132,10 +132,59 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_A4W4}",
         "untune_file": "aiter/configs/a4w4_blockscale_untuned_gemm.csv",
+        "config_env_name": "AITER_CONFIG_GEMM_A4W4",
     }
+
+    def _clear_op_caches(self):
+        from aiter.ops.gemm_op_a4w4 import get_GEMM_config
+
+        if hasattr(get_GEMM_config, "file_cache"):
+            get_GEMM_config.file_cache.clear()
 
     def _setup_specific_arguments(self):
         pass
+
+    def run_config(self, args):
+        from aiter.ops.gemm_op_a4w4 import gemm_a4w4
+        from aiter.test_common import run_perftest, checkAllclose
+
+        untunedf = self.untunedf
+        results = []
+        for i in range(len(untunedf)):
+            M = int(untunedf.loc[i, "M"])
+            N = int(untunedf.loc[i, "N"])
+            K = int(untunedf.loc[i, "K"])
+            shape_str = f"({M}, {N}, {K})"
+            try:
+                (
+                    x,
+                    w,
+                    x_scales,
+                    w_scales,
+                    w_shuffle,
+                    x_scales_shuffle,
+                    w_scales_shuffle,
+                    out_ck,
+                    bias_f32,
+                ) = generate_data(M, N, K, 0)
+                out, us = run_perftest(
+                    gemm_a4w4,
+                    x,
+                    w_shuffle,
+                    x_scales_shuffle,
+                    w_scales_shuffle,
+                    num_warmup=args.warmup,
+                    num_iters=args.iters,
+                )
+                ref = run_torch(x, w, x_scales, w_scales, dtypes.bf16)
+                err_ratio = checkAllclose(
+                    out[:M].to(dtypes.bf16), ref, msg=f"run_config {shape_str}"
+                )
+                status = "ok" if err_ratio <= args.errRatio else "mismatch"
+                results.append({"shape": shape_str, "us": us, "status": status})
+            except Exception as e:
+                results.append({"shape": shape_str, "us": -1, "status": f"error:{e}"})
+        return results
 
     def calculate(self, results, bpes=(1 / 2, 1 / 2, 2)):
         return super().calculate(results, bpes=bpes)

@@ -61,10 +61,50 @@ class BatchedGemma8W8Tuner(GemmCommonTuner):
         "errRatio": 0.05,
         "batch": 100,
         "profile_file": "",
+        "config_env_name": "AITER_CONFIG_A8W8_BATCHED_GEMM",
     }
+
+    def _clear_op_caches(self):
+        from aiter.ops.batched_gemm_op_a8w8 import get_CKBatchedGEMM_config
+
+        get_CKBatchedGEMM_config.cache_clear()
+        if hasattr(get_CKBatchedGEMM_config, "ck_batched_gemm_dict"):
+            del get_CKBatchedGEMM_config.ck_batched_gemm_dict
 
     def _setup_specific_arguments(self):
         pass
+
+    def run_config(self, args):
+        from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8
+        from aiter.test_common import run_perftest, checkAllclose
+
+        untunedf = self.untunedf
+        results = []
+        for i in range(len(untunedf)):
+            B = int(untunedf.loc[i, "B"])
+            M = int(untunedf.loc[i, "M"])
+            N = int(untunedf.loc[i, "N"])
+            K = int(untunedf.loc[i, "K"])
+            shape_str = f"({B}, {M}, {N}, {K})"
+            try:
+                x, weight, x_scale, w_scale, out = generate_data(B, M, N, K)
+                out, us = run_perftest(
+                    batched_gemm_a8w8,
+                    x,
+                    weight,
+                    x_scale,
+                    w_scale,
+                    out,
+                    num_warmup=args.warmup,
+                    num_iters=args.iters,
+                )
+                ref = run_torch(x, weight, x_scale, w_scale)
+                err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
+                status = "ok" if err_ratio <= args.errRatio else "mismatch"
+                results.append({"shape": shape_str, "us": us, "status": status})
+            except Exception as e:
+                results.append({"shape": shape_str, "us": -1, "status": f"error:{e}"})
+        return results
 
     def calculate(self, results, bpes=(1, 1, 2)):
         info, time, err_ratio = results

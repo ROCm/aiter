@@ -16,6 +16,20 @@ from aiter import dtypes
 INVALID_TIME = -1
 
 
+def _read_csv(filepath, **kwargs):
+    """Read CSV with automatic cleanup of common formatting issues:
+    trailing tabs/spaces, extra unnamed columns, whitespace in headers/values.
+    """
+    df = pd.read_csv(filepath, **kwargs)
+    df.columns = df.columns.str.strip()
+    df = df.loc[:, ~df.columns.str.startswith("Unnamed:")]
+    str_cols = df.select_dtypes(include=["object"]).columns
+    for col in str_cols:
+        df[col] = df[col].str.strip()
+    df.dropna(how="all", inplace=True)
+    return df
+
+
 class TunerCommon:
     ARG_DEFAULTS = {
         "verbose": False,
@@ -165,6 +179,18 @@ class TunerCommon:
             default=defaults["timeout"],
             help="timeout for task group",
         )
+        self.parser.add_argument(
+            "--run_config",
+            action="store_true",
+            required=False,
+            help="Run production operator benchmark for all shapes and exit (no tuning)",
+        )
+        self.parser.add_argument(
+            "--compare",
+            action="store_true",
+            required=False,
+            help="Run benchmark before and after tuning to compare performance improvement",
+        )
 
     def parse_args(self):
         return self.parser.parse_args()
@@ -207,10 +233,10 @@ class TunerCommon:
         ## merge config files
         ##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
 
-        df_list.append(pd.read_csv(path_list[0]))
+        df_list.append(_read_csv(path_list[0]))
         for i, path in enumerate(path_list[1:]):
             if os.path.exists(path):
-                df = pd.read_csv(path)
+                df = _read_csv(path)
                 base_cols = [c for c in df_list[0].columns if c != "_tag"]
                 new_cols = [c for c in df.columns if c != "_tag"]
                 assert (
@@ -238,7 +264,7 @@ class TunerCommon:
         assert os.path.exists(
             untuned_gemm_file
         ), f"Not exist untuned file: {untuned_gemm_file}"
-        untunedf = pd.read_csv(untuned_gemm_file)
+        untunedf = _read_csv(untuned_gemm_file)
         filtered_df = untunedf.drop_duplicates().reset_index(drop=True)
         return filtered_df
 
@@ -251,8 +277,8 @@ class TunerCommon:
     def get_tuned_gemm_list(self, tuned_gemm_file, columns=[]):
         all_tuned_file = self.update_config_files(tuned_gemm_file, self.name)
         if os.path.exists(all_tuned_file):
-            column_order = pd.read_csv(all_tuned_file, nrows=0).columns.tolist()
-            tunedf = pd.read_csv(all_tuned_file)
+            column_order = _read_csv(all_tuned_file, nrows=0).columns.tolist()
+            tunedf = _read_csv(all_tuned_file)
             tunedf = tunedf[column_order]
         else:
             print(f"Not exist tuned file: {all_tuned_file}")
@@ -321,7 +347,7 @@ class TunerCommon:
         return df_old
 
     def sortResults(self, tune_file, issorted, values):
-        tunedf = pd.read_csv(tune_file)
+        tunedf = _read_csv(tune_file)
         if issorted:
             tunedf = tunedf.sort_values(by=values)
         dedup_keys = self.keys
@@ -348,7 +374,7 @@ class TunerCommon:
                 logger.info(f"saving profile to {args.profile_file}")
             profiledf = self.result_to_df(sorted(rets, key=itemgetter(0)))
             if os.path.exists(args.profile_file):
-                old_df = pd.read_csv(args.profile_file)
+                old_df = _read_csv(args.profile_file)
             else:
                 old_df = pd.DataFrame(columns=self.columns)
             profiledf = pd.concat([old_df, profiledf], ignore_index=True)
@@ -434,6 +460,116 @@ class TunerCommon:
         """update tflops and bw from old tune_file"""
         pass
 
+    def run_config(self, args):
+        """Run the production operator for each shape in the untuned CSV.
+        Subclasses should override this to call the actual production operator.
+        Returns a list of dicts: [{"shape": str, "us": float, "status": "ok"/"error"}]
+        """
+        logger.info(f"run_config not implemented for {self.name}, skipping benchmark")
+        return []
+
+    def _clear_op_caches(self):
+        """Clear operator-specific config caches. Subclasses should override this
+        to clear only their own caches."""
+        pass
+
+    def _set_config_env_for_run_config(self, args):
+        """Set the config env var to point to the -o output file, clear caches,
+        and enable AITER_REBUILD so that post-tune run_config rebuilds with new configs.
+        """
+        defaults = self.get_arg_defaults()
+        env_name = defaults.get("config_env_name")
+        if not env_name:
+            return None
+        output_file = self.get_out_file(args.tune_file)
+        old_val = os.environ.get(env_name)
+        os.environ[env_name] = output_file
+        logger.info(f"Setting {env_name}={output_file} for post-tune benchmark")
+        # Clear operator-specific config caches
+        self._clear_op_caches()
+        # Enable AITER_REBUILD (level 2: rm .so only, keep build cache for faster rebuild)
+        # and clear module caches so operators rebuild with new config
+        from aiter.jit import core as jit_core
+
+        jit_core.AITER_REBUILD = 2
+        jit_core.get_module.cache_clear()
+        # Reset rebuilded_list so all modules get rebuilt on next call
+        jit_core.rebuilded_list = ["module_aiter_enum"]
+        # Clear loaded modules dict (use getattr to avoid Python name mangling of __ prefix in class methods)
+        mds = getattr(jit_core, "__mds", None)
+        if mds is not None:
+            mds.clear()
+        # Clear get_config_file lru_cache so it re-reads the env var
+        jit_core.AITER_CONFIGS.get_config_file.cache_clear()
+        return old_val
+
+    def _restore_config_env(self, env_name, old_val):
+        """Restore the config env var and AITER_REBUILD to original values."""
+        if env_name is None:
+            return
+        if old_val is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = old_val
+        # Restore AITER_REBUILD to 0
+        try:
+            from aiter.jit import core as jit_core
+
+            jit_core.AITER_REBUILD = 0
+        except ImportError:
+            pass
+
+    def _print_benchmark_results(self, label, results):
+        """Print benchmark results in a table format."""
+        if not results:
+            logger.info(f"{label}: no results")
+            return
+        logger.info(f"============= {label} Benchmark Results =============")
+        header = f"{'Shape':<40} | {'Time(us)':>10} | {'Status':>8}"
+        logger.info(header)
+        logger.info("-" * len(header))
+        for r in results:
+            shape_str = r.get("shape", "unknown")
+            us = r.get("us", -1)
+            status = r.get("status", "unknown")
+            us_str = f"{us:.2f}" if us > 0 else "N/A"
+            logger.info(f"{shape_str:<40} | {us_str:>10} | {status:>8}")
+
+    def _print_comparison(self, pre_results, post_results):
+        """Print a comparison table between pre-tune and post-tune results."""
+        if not pre_results or not post_results:
+            logger.info("Cannot print comparison: missing pre or post results")
+            return
+        # Build lookup by shape
+        post_map = {r["shape"]: r for r in post_results}
+        logger.info("============= Tune Performance Comparison =============")
+        header = f"{'Shape':<40} | {'Pre-tune(us)':>13} | {'Post-tune(us)':>14} | {'Speedup':>8} | {'Status':>8}"
+        logger.info(header)
+        logger.info("-" * len(header))
+        for pre in pre_results:
+            shape = pre["shape"]
+            post = post_map.get(shape)
+            pre_us = pre.get("us", -1)
+            pre_status = pre.get("status", "error")
+            if post is None:
+                logger.info(
+                    f"{shape:<40} | {pre_us:>13.2f} | {'N/A':>14} | {'N/A':>8} | {'MISS':>8}"
+                )
+                continue
+            post_us = post.get("us", -1)
+            post_status = post.get("status", "error")
+            if pre_us > 0 and post_us > 0:
+                speedup = pre_us / post_us
+                speedup_str = f"{speedup:.2f}x"
+            else:
+                speedup_str = "N/A"
+            status = "OK" if post_status == "ok" else "ERROR"
+            pre_str = f"{pre_us:.2f}" if pre_us > 0 else "N/A"
+            post_str = f"{post_us:.2f}" if post_us > 0 else "N/A"
+            logger.info(
+                f"{shape:<40} | {pre_str:>13} | {post_str:>14} | {speedup_str:>8} | {status:>8}"
+            )
+
     #
     def run(self, args, fast_mode=False):
         """tuner run function"""
@@ -442,12 +578,39 @@ class TunerCommon:
         output_file = self.get_out_file(args.tune_file)
         if args.verbose:
             logger.info(f"args: {args}")
+
+        # --run_config: only run benchmark and exit (no tuning)
+        if args.run_config:
+            logger.info("=== Running production operator benchmark ===")
+            results = self.run_config(args)
+            self._print_benchmark_results("Benchmark", results)
+            return self.tunedf if self.tunedf is not None else pd.DataFrame()
+
+        # --compare: pre-tune benchmark
+        pre_tune_results = None
+        if args.compare:
+            logger.info("=== Running pre-tune benchmark ===")
+            pre_tune_results = self.run_config(args)
+            self._print_benchmark_results("Pre-tune", pre_tune_results)
+
         if len(self.untunedf) == 0:
             # self.update_tflops_bw(args.tune_file)
             self.sortResults(output_file, args.sort, self.sort_keys)
             logger.info(
                 f"no shapes to be tuned, skip tuning, tuned file is {args.tune_file}"
             )
+            if args.compare:
+                defaults = self.get_arg_defaults()
+                env_name = defaults.get("config_env_name")
+                old_val = self._set_config_env_for_run_config(args)
+                try:
+                    logger.info("=== Running post-tune benchmark (verification) ===")
+                    post_tune_results = self.run_config(args)
+                    self._print_benchmark_results("Post-tune", post_tune_results)
+                    if pre_tune_results:
+                        self._print_comparison(pre_tune_results, post_tune_results)
+                finally:
+                    self._restore_config_env(env_name, old_val)
             return self.tunedf if self.tunedf is not None else pd.DataFrame()
         batch_size = min(args.batch, len(self.untunedf))
         total_batches = (len(self.untunedf) + batch_size - 1) // batch_size
@@ -489,7 +652,26 @@ class TunerCommon:
                 exc_info=True,
             )
         finally:
-            self.tune_summary(tuning_status)
+            tune_exit = None
+            try:
+                self.tune_summary(tuning_status)
+            except SystemExit as e:
+                tune_exit = e
+            # --compare: post-tune benchmark + comparison
+            if args.compare:
+                defaults = self.get_arg_defaults()
+                env_name = defaults.get("config_env_name")
+                old_val = self._set_config_env_for_run_config(args)
+                try:
+                    logger.info("=== Running post-tune benchmark (verification) ===")
+                    post_tune_results = self.run_config(args)
+                    self._print_benchmark_results("Post-tune", post_tune_results)
+                    if pre_tune_results:
+                        self._print_comparison(pre_tune_results, post_tune_results)
+                finally:
+                    self._restore_config_env(env_name, old_val)
+            if tune_exit is not None:
+                raise tune_exit
 
 
 class GemmCommonTuner(TunerCommon):

@@ -110,21 +110,6 @@ def generate_data(
     return x, weight_shuffle, x_scale, w_scale, out, weight, bias_f32
 
 
-def generate_data_asm(
-    m, n, k, seed, dtype=dtypes.bf16, q_dtype_w=dtypes.i8, device="cuda"
-):
-    torch.manual_seed(seed)
-    x = torch.randn((m, k), dtype=dtype, device=device)
-    weight = torch.randn((n, k), dtype=dtype, device=device)
-    x, x_scale = aiter.pertoken_quant(x, quant_dtype=q_dtype_w)
-    weight, w_scale = aiter.pertoken_quant(weight, quant_dtype=q_dtype_w)
-    weight_shuffle = shuffle_weight(weight, layout=(32, 16))
-    bias = torch.rand([1, n], dtype=dtype, device=device)
-    bias_f32 = bias.to(dtypes.fp32)
-    out = torch.empty(m, n, dtype=dtype, device=device)
-    return x, weight, weight_shuffle, x_scale, w_scale, out, bias_f32
-
-
 def libtype_list(string):
     values = string.split(",")
     for value in values:
@@ -138,7 +123,14 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE}",
         "untune_file": "aiter/configs/a8w8_bpreshuffle_untuned_gemm.csv",
+        "config_env_name": "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE",
     }
+
+    def _clear_op_caches(self):
+        from aiter.ops.gemm_op_a8w8 import get_GEMM_config_with_quant_type
+
+        if hasattr(get_GEMM_config_with_quant_type, "file_cache"):
+            get_GEMM_config_with_quant_type.file_cache.clear()
 
     def _setup_specific_arguments(self):
         self.parser.add_argument(
@@ -460,6 +452,54 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             else:
                 resultdf = pd.concat([resultdf, temp], ignore_index=True)
         return resultdf
+
+    def run_config(self, args):
+        from aiter.ops.gemm_op_a8w8 import gemm_a8w8_bpreshuffle, gemm_a8w8_ASM
+        from aiter.test_common import run_perftest, checkAllclose
+
+        untunedf = self.untunedf
+        results = []
+        for i in range(len(untunedf)):
+            M = int(untunedf.loc[i, "M"])
+            N = int(untunedf.loc[i, "N"])
+            K = int(untunedf.loc[i, "K"])
+            q_dtype_w = untunedf.loc[i, "q_dtype_w"]
+            shape_str = f"({M}, {N}, {K}, {q_dtype_w})"
+            try:
+                is_asm = eval(q_dtype_w) == dtypes.i8
+                (x, weight_shuffle, x_scale, w_scale, out, weight, bias_f32) = (
+                    generate_data(M, N, K, 0, dtypes.bf16, eval(q_dtype_w), is_asm)
+                )
+                if is_asm:
+                    out, us = run_perftest(
+                        gemm_a8w8_ASM,
+                        x,
+                        weight_shuffle,
+                        x_scale,
+                        w_scale,
+                        bias_f32,
+                        num_warmup=args.warmup,
+                        num_iters=args.iters,
+                    )
+                else:
+                    out, us = run_perftest(
+                        gemm_a8w8_bpreshuffle,
+                        x,
+                        weight_shuffle,
+                        x_scale,
+                        w_scale,
+                        num_warmup=args.warmup,
+                        num_iters=args.iters,
+                    )
+                ref = run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16)
+                err_ratio = checkAllclose(
+                    out.to(dtypes.bf16), ref, msg=f"run_config {shape_str}"
+                )
+                status = "ok" if err_ratio <= args.errRatio else "mismatch"
+                results.append({"shape": shape_str, "us": us, "status": status})
+            except Exception as e:
+                results.append({"shape": shape_str, "us": -1, "status": f"error:{e}"})
+        return results
 
 
 if __name__ == "__main__":

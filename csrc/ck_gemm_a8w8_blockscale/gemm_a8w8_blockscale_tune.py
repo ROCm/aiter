@@ -127,6 +127,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         "errRatio": 0.05,
         "batch": 100,
         "profile_file": "",  # for both results
+        "config_env_name": "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
     }
 
     def __init__(self, name, keys, resultList, description=""):
@@ -135,6 +136,12 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         """
 
         super().__init__(name, keys, resultList, description)
+
+    def _clear_op_caches(self):
+        from aiter.ops.gemm_op_a8w8 import get_GEMM_config_with_quant_type
+
+        if hasattr(get_GEMM_config_with_quant_type, "file_cache"):
+            get_GEMM_config_with_quant_type.file_cache.clear()
 
     def _setup_specific_arguments(self):
         """
@@ -306,6 +313,38 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                     )
                 )
         return tasks_ck
+
+    def run_config(self, args):
+        from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale
+        from aiter.test_common import run_perftest, checkAllclose
+
+        untunedf = self.untunedf
+        results = []
+        for i in range(len(untunedf)):
+            M = int(untunedf.loc[i, "M"])
+            N = int(untunedf.loc[i, "N"])
+            K = int(untunedf.loc[i, "K"])
+            shape_str = f"({M}, {N}, {K})"
+            try:
+                x, weight, x_scale, w_scale, out, weight_shuffle, x_scale_t = (
+                    generate_data(M, N, K, 0)
+                )
+                out, us = run_perftest(
+                    gemm_a8w8_blockscale,
+                    x,
+                    weight,
+                    x_scale,
+                    w_scale,
+                    num_warmup=args.warmup,
+                    num_iters=args.iters,
+                )
+                ref = run_torch(x, weight, x_scale, w_scale)
+                err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
+                status = "ok" if err_ratio <= args.errRatio else "mismatch"
+                results.append({"shape": shape_str, "us": us, "status": status})
+            except Exception as e:
+                results.append({"shape": shape_str, "us": -1, "status": f"error:{e}"})
+        return results
 
     def tune(
         self,
