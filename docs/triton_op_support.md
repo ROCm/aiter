@@ -4,14 +4,14 @@
 
 | Kernel | DSL | dtype | GPU Arch |
 |--------|:---:|-------|----------|
-| [`mha.py`](../aiter/ops/triton/attention/mha.py) `:: flash_attn_func / flash_attn_varlen_func` | Triton | fp16 · bf16 · fp32 · fp8 | all ROCm |
+| [`mha.py`](../aiter/ops/triton/attention/mha.py) `:: flash_attn_func / flash_attn_varlen_func` | Triton | fp16 · bf16 · fp32 · fp8 | all ROCm⁸ |
 | [`mha.py`](../aiter/ops/triton/attention/mha.py) `:: flash_attn_with_kvcache` | Triton | fp16 · bf16 | all ROCm |
-| [`mha_v3.py`](../aiter/ops/triton/attention/mha_v3.py) `:: flash_attn_func / flash_attn_varlen_func` | Triton | fp16 · bf16 · fp32 · fp8 | all ROCm |
+| [`mha_v3.py`](../aiter/ops/triton/attention/mha_v3.py) `:: flash_attn_func / flash_attn_varlen_func` | Triton | fp16 · bf16 · fp32 · fp8 | all ROCm⁸ |
 | [`mha_v3.py`](../aiter/ops/triton/attention/mha_v3.py) `:: flash_attn_fp8_func / flash_attn_varlen_fp8_func` | Triton | bf16 · fp32 → fp8 (auto-quant) | gfx942 / gfx950 |
-| [`mha_v3.py`](../aiter/ops/triton/attention/mha_v3.py) `:: flash_attn_with_kvcache` | Triton | fp16 · bf16 · fp8 | gfx942 / gfx950 |
+| [`mha_v3.py`](../aiter/ops/triton/attention/mha_v3.py) `:: flash_attn_with_kvcache` | Triton | fp16 · bf16 · fp8 | all ROCm⁸ |
 | [`hstu_attention.py`](../aiter/ops/triton/attention/hstu_attention.py) `:: triton_hstu_attention_fwd / triton_hstu_attention_bwd` | Triton | bf16 · fp16 | all ROCm⁷ |
-| [`pa_decode.py`](../aiter/ops/triton/attention/pa_decode.py) `:: paged_attention_decode` | Triton | fp16 · bf16 · fp8 · int8 | gfx942 / gfx950 |
-| [`pa_prefill.py`](../aiter/ops/triton/attention/pa_prefill.py) `:: context_attention_fwd` | Triton | fp16 · fp8 | gfx942 / gfx950 |
+| [`pa_decode.py`](../aiter/ops/triton/attention/pa_decode.py) `:: paged_attention_decode` | Triton | fp16 · bf16 · fp8 · int8 | all ROCm⁸ |
+| [`pa_prefill.py`](../aiter/ops/triton/attention/pa_prefill.py) `:: context_attention_fwd` | Triton | fp16 · fp8 | all ROCm⁸ |
 | [`pa_decode_gluon.py`](../aiter/ops/triton/gluon/pa_decode_gluon.py) `:: pa_decode_gluon` | Gluon | fp8 · bf16 | gfx942 / gfx950 |
 | [`fp8_mqa_logits.py`](../aiter/ops/triton/attention/fp8_mqa_logits.py) `:: fp8_mqa_logits` | Triton | fp8 | gfx942 / gfx950 |
 | [`pa_mqa_logits.py`](../aiter/ops/triton/attention/pa_mqa_logits.py) `:: deepgemm_fp8_paged_mqa_logits` | Gluon | fp8 | gfx942 / gfx950 |
@@ -27,7 +27,7 @@
 | **API** | `flash_attn_func` · `flash_attn_varlen_func` |
 | **Input format** | Standard: `[B, S, H, D]`; varlen: `[T, H, D]`¹ |
 | **dtype** | fp16 · bf16 · fp32; fp8² (raw tensor pass-through) |
-| **GPU arch** | gfx942 / gfx950 (incl. FP8); other ROCm (fp16/bf16) |
+| **GPU arch** | all ROCm; FP8 limited to gfx942 / gfx950⁸ |
 | **Shape** | B/S: any positive integer; H % Hk == 0 (GQA/MQA); D ≥ 8 and power-of-2 aligned |
 | **Causal masking** | ✅ |
 | **GQA / MQA** | ✅ |
@@ -57,7 +57,7 @@
 | **API** | `flash_attn_func` · `flash_attn_varlen_func` · `flash_attn_fp8_func` · `flash_attn_varlen_fp8_func` · `flash_attn_with_kvcache` |
 | **Input format** | Standard: `[B, S, H, D]`; varlen: `[T, H, D]`¹; fp8_func output is FP32 |
 | **dtype** | fp16 · bf16 · fp32; fp8² (internally auto-quantized) |
-| **GPU arch** | gfx942 / gfx950 (incl. FP8); other ROCm (fp16/bf16) |
+| **GPU arch** | all ROCm; FP8 limited to gfx942 / gfx950⁸ |
 | **Shape** | B/S: any positive integer; H % Hk == 0 (GQA/MQA); D ≥ 8 and power-of-2 aligned |
 | **Causal masking** | ✅ |
 | **GQA / MQA** | ✅ |
@@ -114,7 +114,7 @@
 | **API** | `paged_attention_decode` |
 | **Input format** | Q: `[B, H_Q, D]`, k_cache/v_cache: `[N, H_KV, BLK_SZ, D]` (paged layout) |
 | **dtype** | fp16 · bf16 · fp8(e4m3fnuz) · int8 · bf16×fp8 · bf16×int8 |
-| **GPU arch** | gfx942 / gfx950 |
+| **GPU arch** | all ROCm; FP8/INT8 dtypes limited to gfx942 / gfx950⁸ |
 | **Shape** | B: any; H_Q % H_KV == 0 (GQA/MQA); D: any; kv_block_size: any; D=128 + BLK=512 ⛔ (shared memory overflow) |
 | **GQA / MQA** | ✅ |
 | **FP8 KV Cache** | ✅ |
@@ -140,7 +140,7 @@
 | **API** | `context_attention_fwd` |
 | **Input format** | Q: `[T, H, D]`, K/V: `[T, H_KV, D]`, k_cache/v_cache: paged layout |
 | **dtype** | fp16 query; KV cache: auto · fp8e4m3 · fp8e5m2 |
-| **GPU arch** | gfx942 / gfx950 |
+| **GPU arch** | all ROCm; FP8 KV cache limited to gfx942 / gfx950⁸ |
 | **Shape** | H: any; H % H_KV == 0 (GQA/MQA); head_size: any; sliding_window ≥ 0 |
 | **GQA / MQA** | ✅ |
 | **FP8 KV Cache** | ✅ |
@@ -233,3 +233,4 @@
 > ⁵ HSTU supports jagged (packed) format only; T = Σ(seq_len_i), seq_offsets holds cumulative offsets
 > ⁶ alpha is typically set to `1/D_attn × 10000`
 > ⁷ The Triton kernel itself has no arch restriction. The current limitation is missing pre-tuned JSON config files — only gfx942/gfx950 configs exist under `aiter/ops/triton/configs/hstu_attn/`. These configs contain ROCm-specific Triton parameters (`matrix_instr_nonkdim`, `kpack`). Other ROCm architectures can be supported by adding the corresponding config file.
+> ⁸ Triton kernels compile for all ROCm GPUs; however FP8 (`float8_e4m3fnuz` / `float8_e5m2fnuz` on gfx942, `float8_e4m3fn` / `float8_e5m2` on gfx950) and INT8 dtypes require gfx942 or gfx950. fp16 / bf16 paths work on any ROCm GPU.
