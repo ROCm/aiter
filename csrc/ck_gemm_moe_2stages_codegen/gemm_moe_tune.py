@@ -2179,6 +2179,7 @@ class FmoeTuner(TunerCommon):
             except Exception as e:
                 results.append({"shape": shape_str, "us": -1, "status": f"error:{e}"})
         return results
+
     def gen_cktile_2stages_task(self, info, blockMs):
         tasks_cktile = []
         (

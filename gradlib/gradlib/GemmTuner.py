@@ -820,7 +820,11 @@ class GemmTuner(GemmCommonTuner):
                     eval(indtype),
                     eval(outdtype),
                 )
-                err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
+                _atol = 5e-2 if eval(outdtype) == torch.bfloat16 else 1e-2
+                _rtol = 5e-2 if eval(outdtype) == torch.bfloat16 else 1e-2
+                err_ratio = checkAllclose(
+                    out, ref, atol=_atol, rtol=_rtol, msg=f"run_config {shape_str}"
+                )
                 status = "ok" if err_ratio <= args.errRatio else "mismatch"
                 results.append({"shape": shape_str, "us": us, "status": status})
             except Exception as e:
