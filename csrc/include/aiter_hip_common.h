@@ -4,7 +4,7 @@
 #include "aiter_logger.h"
 #include "aiter_enum.h"
 #include "aiter_tensor.h"
-#if DISABLE_CK
+#if !ENABLE_CK
 #include "ck_tile_shim.h"
 #else
 #include "ck_tile/core.hpp"

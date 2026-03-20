@@ -896,16 +896,12 @@
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu'"
         ],
         "flags_extra_cc": [
-            "'-DFAV3_ON=1'"
+            "'-DFAV3_ON=1'",
+            "'-DENABLE_CK=0'"
         ],
-        "flags_extra_hip": [
-            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
-        ],
+        "flags_extra_hip": [],
         "extra_ldflags": "None",
-        "extra_include": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha'"
-        ],
+        "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": [
             "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_fwd --output_dir {{}}'"
@@ -997,7 +993,7 @@
         ],
         "flags_extra_cc": [
             "'-DONLY_FAV3=1'",
-            "'-DDISABLE_CK=1'"
+            "'-DENABLE_CK=0'"
         ],
         "flags_extra_hip": [],
         "extra_ldflags": "None",
@@ -1016,7 +1012,7 @@
         ],
         "flags_extra_cc": [
             "'-DONLY_FAV3=1'",
-            "'-DDISABLE_CK=1'"
+            "'-DENABLE_CK=0'"
         ],
         "flags_extra_hip": [],
         "extra_ldflags": "None",
@@ -1034,15 +1030,12 @@
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu'"
         ],
         "flags_extra_cc": [
-            "'-DFAV3_ON=1'"
+            "'-DFAV3_ON=1'",
+            "'-DENABLE_CK=0'"
         ],
-        "flags_extra_hip": [
-            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'"
-        ],
+        "flags_extra_hip": [],
         "extra_ldflags": "None",
-        "extra_include": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha'"
-        ],
+        "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": [
             "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_fwd --output_dir {{}}'"
