@@ -4,6 +4,7 @@ set -euo pipefail
 MULTIGPU=${MULTIGPU:-FALSE}
 SHARD_TOTAL=${SHARD_TOTAL:-5}
 SHARD_IDX=${SHARD_IDX:-0}
+export AITER_SKIP_PERF=${AITER_SKIP_PERF:-1}
 
 files=()
 failedFiles=()
