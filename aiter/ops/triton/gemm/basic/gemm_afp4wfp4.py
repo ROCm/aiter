@@ -641,3 +641,39 @@ def gemm_afp4wfp4_preshuffled_weight_scales(
         "gemm_afp4wfp4_preshuffled_weight_scales will be deprecated in future AITER release, please switch to gemm_afp4wfp4_preshuffle"
     )
     return gemm_afp4wfp4_preshuffle(x, w, x_scales, w_scales, dtype, y, config, use_aot)
+
+
+if __name__ == "__main__":
+    from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
+        generate_gemm_afp4wfp4_inputs,
+    )
+
+    M, N, K = 2048, 7168, 4096
+    dtype = torch.float16
+    (
+        x,
+        _w,
+        w_preshuf,
+        _x_scales_plain,
+        _w_scales_plain,
+        x_scales,
+        w_scales,
+        _out_dtype,
+        y,
+    ) = generate_gemm_afp4wfp4_inputs(
+        M,
+        N,
+        K,
+        dtype,
+        layout="TN",
+        output=True,
+        shuffle_weight_fg=True,
+        shuffle_scales_fg=True,
+    )
+    gemm_afp4wfp4_preshuffle(
+        x, w_preshuf, x_scales, w_scales, dtype=dtype, y=y, config=None, use_aot=True
+    )
+    torch.cuda.synchronize()
+    print(
+        f"gemm_afp4wfp4_preshuffle done (config from _get_config): output shape {y.shape}"
+    )
