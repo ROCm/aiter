@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from ast import Pass
 import functools
 from typing import Optional, Tuple
 
@@ -13,7 +14,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from ..jit.core import compile_ops
 from ..utility import dtypes, fp4_utils
 from . import triton
-from .enum import ActivationType, QuantType
+from .enum import ActivationType, QuantType, FP8KVCacheLayout
 
 
 @compile_ops("module_smoothquant")
@@ -458,6 +459,7 @@ def partial_transpose(
 ) -> None: ...
 
 
+<<<<<<< Updated upstream
 MODEL1_FP8Sparse = (512, 448, 64, 64, 7)
 
 
@@ -567,3 +569,27 @@ def dequantize_k_cache_ds_model1(
 
     result = result.view(num_blocks, block_size, 1, d)
     return result
+=======
+### 这个需要 torch compile guard 吗？
+def quantize_k_cache(
+    input_k_cache: torch.Tensor,    # (num_blocks, block_size, h_k, d)
+    kvcache_layout: FP8KVCacheLayout,
+) -> torch.Tensor:
+    d, d_nope, d_rope, tile_size, num_tiles = kvcache_layout.get_meta()
+    assert input_k_cache.shape[-1] == d
+    num_blocks, block_size, h_k, _ = input_k_cache.shape
+    assert h_k == 1
+    input_k_cache = input_k_cache.squeeze(2) # (num_blocks, block_size, d)
+    input_elem_size = input_k_cache.element_size()
+
+    if kvcache_layout == FP8KVCacheLayout.V32_FP8Sparse:
+        bytes_per_token = d_nope + num
+
+
+    elif kvcache_layout == FP8KVCacheLayout.MODEL1_FP8Sparse:
+
+        pass
+
+    else:
+        raise NotImplementedError(f"Unsupported kvcache_layout: {kvcache_layout}")
+>>>>>>> Stashed changes

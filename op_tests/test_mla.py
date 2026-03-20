@@ -165,13 +165,84 @@ def test_mla(
         (num_page * page_size, 1, kv_lora_rank + qk_rope_head_dim),
         dtype=torch.bfloat16,
     )
+    ### kv_buffer quant & dequant
+    ### Without quant and dequant, it's difficult to distinguish errors caused by an incorrect fp8 kernel.
+    def quant_and_dequant_kv_buffer(kv_buffer:torch.Tensor, d_qk:int)->torch.Tensor:
+        fp8_kvcache_layout = None   # (d, d_nope, d_rope, tile_size, num_tiles)
+        if d_qk == 576:
+            fp8_kvcache_layout = (576, 512, 64, 128, 4)
+        elif d_qk == 512:
+            fp8_kvcache_layout = (512, 448, 64, 64, 7)
+        else:
+            assert False
+        def quantize_k_cache(
+            input_k_cache: torch.Tensor,    # (num_blocks, block_size, h_k, d)
+            kvcache_layout,
+        ) -> torch.Tensor:
+            """
+            Quantize the k-cache
+            For more detail about the layout of K/V, please refer to comments in flash_mla_interface.py
+            """
+            d, d_nope, d_rope, tile_size, num_tiles = kvcache_layout.get_meta()
+            assert input_k_cache.shape[-1] == d
+            num_blocks, block_size, h_k, _ = input_k_cache.shape
+            assert h_k == 1
+            input_k_cache = input_k_cache.squeeze(2)    # [num_blocks, block_size, d]
+            input_elem_size = input_k_cache.element_size()
+
+            if kvcache_layout == FP8KVCacheLayout.V32_FP8Sparse:
+                bytes_per_token = d_nope + num_tiles*4 + input_elem_size*d_rope
+                result = torch.empty((num_blocks, block_size+1, bytes_per_token), dtype=torch.float8_e4m3fn, device=input_k_cache.device)[:, :block_size, :]
+                result_k_nope_part = result[..., :d_nope]
+                result_k_scale_factor = result[..., d_nope: d_nope + num_tiles*4].view(torch.float32)
+                result_k_rope_part = result[..., d_nope + num_tiles*4:].view(input_k_cache.dtype)
+                result_k_rope_part[:] = input_k_cache[..., d_nope:]
+
+                for tile_idx in range(0, num_tiles):
+                    cur_scale_factors_inv = torch.abs(input_k_cache[..., tile_idx*tile_size:(tile_idx+1)*tile_size]).max(dim=-1).values.float() / 448.0 # [num_blocks, block_size]
+                    cur_scale_factors_inv = _cast_scale_inv_to_ue8m0(cur_scale_factors_inv)
+                    result_k_scale_factor[:, :, tile_idx] = cur_scale_factors_inv
+
+                    cur_scale_factors_inv.unsqueeze_(-1)    # [num_blocks, block_size, 1]
+                    cur_quantized_nope = (input_k_cache[..., tile_idx*tile_size:(tile_idx+1)*tile_size].float() / cur_scale_factors_inv.float()).to(torch.float8_e4m3fn)
+                    result_k_nope_part[..., tile_idx*tile_size:(tile_idx+1)*tile_size] = cur_quantized_nope
+                
+                result = result.view(num_blocks, block_size, 1, -1)
+                return result
+            
+            elif kvcache_layout == FP8KVCacheLayout.MODEL1_FP8Sparse:
+                bytes_per_token = d_nope + 2*d_rope + num_tiles + 1
+                size_per_block_padded = (block_size*bytes_per_token + 576-1) // 576 * 576
+                result = torch.empty((num_blocks, size_per_block_padded), dtype=torch.float8_e4m3fn, device=input_k_cache.device)[:, :block_size*bytes_per_token]
+                result_k_nope_rope_part = result[:, :block_size*(d_nope+2*d_rope)].view(num_blocks, block_size, d_nope + 2*d_rope)
+                result_k_nope = result_k_nope_rope_part[:, :, :d_nope]  # [num_blocks, block_size, d_nope]
+                result_k_rope = result_k_nope_rope_part[:, :, d_nope:].view(input_k_cache.dtype)  # [num_blocks, block_size, d_rope]
+                result_k_scale_factor = result[:, block_size*(d_nope+2*d_rope):].view(num_blocks, block_size, 8)[:, :, :7].view(torch.float8_e8m0fnu)   # [num_blocks, block_size, num_tiles]
+
+                result_k_rope[:] = input_k_cache[..., d_nope:]
+                for tile_idx in range(0, num_tiles):
+                    cur_scale_factors_inv = torch.abs(input_k_cache[..., tile_idx*tile_size:(tile_idx+1)*tile_size]).max(dim=-1).values.float() / 448.0 # [num_blocks, block_size]
+                    cur_scale_factors_inv = _cast_scale_inv_to_ue8m0(cur_scale_factors_inv)
+                    result_k_scale_factor[:, :, tile_idx] = cur_scale_factors_inv.to(torch.float8_e8m0fnu)
+
+                    cur_scale_factors_inv = cur_scale_factors_inv.view(num_blocks, block_size, 1)
+                    cur_quantized_nope = (input_k_cache[..., tile_idx*tile_size:(tile_idx+1)*tile_size].float() / cur_scale_factors_inv.float()).to(torch.float8_e4m3fn)
+                    result_k_nope[:, :, tile_idx*tile_size:(tile_idx+1)*tile_size] = cur_quantized_nope
+                
+                result = result.view(num_blocks, block_size, 1, -1)
+                return result
+
+            else:
+                raise NotImplementedError(f"Unsupported kvcache_layout: {kvcache_layout}")
+            
+        blocked_k_quantized =  
 
     # for none absorb (mha)
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
     sm_scale = 1.0 / (qk_head_dim**0.5)
 
     # ############################## normal: prefill
-    def test_normal_prefill():
+    def test_normal_prefill():   ### 这个是纯 MHA，不是MLA。里面的torch_mha_extend 是MHA的reference实现
         q = torch.randn((total_qo, nhead, qk_head_dim), dtype=torch.bfloat16)
         k = torch.randn((total_kv, nhead, qk_head_dim), dtype=torch.bfloat16)
         v = torch.randn((total_kv, nhead, v_head_dim), dtype=torch.bfloat16)
@@ -231,7 +302,7 @@ def test_mla(
 
     # test prefill
     # ############################## absorb: prefill
-    def test_absorb_prefill():
+    def test_absorb_prefill():     ### 这个带absorb的，是真 MLA ，里面的torch_mla_extend是MLA的reference实现
         q = torch.randn((total_qo, nhead, qk_head_dim), dtype=torch.bfloat16)
 
         out_ref = torch_mla_extend(
@@ -324,7 +395,7 @@ def test_mla(
     q = torch.randn((total_q, nhead, qk_head_dim), dtype=torch.bfloat16)
 
     # troch implementation
-    out_ref = torch_mla_extend(
+    out_ref = torch_mla_extend(      #### 这个看样子既可以prefill，也可以decode
         q,
         kv_buffer,
         qo_indptr,
@@ -487,7 +558,7 @@ parser.add_argument(
     "-k",
     "--kv_lora_rank",
     type=int,
-    default=512,
+    default=[512, 448],
     help="""kv lora rank.
     e.g.: -k 512""",
 )
@@ -581,7 +652,7 @@ parser.add_argument(
     nargs="*",
     default=[None],
     help="""kv seqlens split num for per batch.
-    e.g.: -ms 32""",
+    e.g.: -splits 32""",
 )
 parser.add_argument(
     "--varlen",
@@ -589,7 +660,13 @@ parser.add_argument(
     help="""variable kv seqlens per batch. Default: False.
     --varlen # True""",
 )
-
+parser.add_argument(
+    "-det",
+    "--decode_extra_topk",
+    action="store_true",
+    help="""decode extra topk. Default: False.
+    e.g.: -det # True""",
+)
 
 args = parser.parse_args()
 
