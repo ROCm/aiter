@@ -76,8 +76,7 @@
     },
     "module_attention_asm": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_pa.cu'",
-            "f'{AITER_CSRC_DIR}/pybind/attention_asm_pybind.cu'"
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_pa.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
