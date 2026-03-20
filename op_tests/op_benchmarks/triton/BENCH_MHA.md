@@ -6,6 +6,42 @@ For a shorter “how to run” cheat sheet, see [How to Run MHA](../README.md#ho
 
 ---
 
+## Multi-head attention: equations
+
+This benchmark times **scaled dot-product attention** on tensors that are already the **query, key, and value** representations for each head (the linear projections from the hidden state are *outside* the timed kernel).
+
+### Single head
+
+For one head, let \(Q \in \mathbb{R}^{L_q \times d}\), \(K \in \mathbb{R}^{L_k \times d}\), and \(V \in \mathbb{R}^{L_k \times d_v}\) (query length \(L_q\), key/value length \(L_k\), head dims \(d\) and \(d_v\)). **Scaled attention** is:
+
+\[
+\text{Attention}(Q, K, V) = \operatorname{softmax}\!\left(\frac{Q K^\top}{\sqrt{d}} + M\right) V
+\]
+
+- **Scale** \(1/\sqrt{d}\) matches the default `softmax_scale` in code (`sm_scale`), unless you change it inside the benchmark.
+- **Mask** \(M\) is **causal** when `-causal` is enabled: entries above the diagonal are set so those positions get zero probability after softmax (exact layout follows the kernel; conceptually “token \(i\) may not attend to token \(j > i\)” when \(L_q = L_k\)).
+- With **no causal mask**, all \(L_q \times L_k\) pairs contribute (subject to varlen padding, which zeroes out invalid positions in the `thd` path).
+
+The output has shape \(L_q \times d_v\).
+
+### Multiple heads and grouped-query attention (GQA)
+
+With \(H_q\) **query heads** and \(H_k\) **key/value heads** (\(H_k \le H_q\), and \(H_q / H_k\) is an integer), each query head uses one of the \(H_k\) key/value head stacks (repeated or grouped as in standard GQA). The benchmark flags **`-hq`** and **`-hk`** correspond to \(H_q\) and \(H_k\); when **`-hk`** is omitted, \(H_k = H_q\) (full multi-head attention).
+
+Conceptually, for batch element \(b\) and head index \(h\):
+
+\[
+O_{b,h} = \operatorname{Attention}\!\left(Q_{b,h},\, K_{b,\,\phi(h)},\, V_{b,\,\phi(h)}\right)
+\]
+
+where \(\phi\) maps query heads to KV heads in the GQA pattern. Outputs per head are \(L_q \times d_v\) and are typically concatenated or merged downstream in the model; this script only measures the **attention** primitive that produces those per-head outputs.
+
+### What the benchmark does *not* include
+
+The timed kernels implement the **attention map × values** computation (and backward through it). They do **not** include the learned projections \(X W^Q, X W^K, X W^V\) from the transformer block—that FLOPs and memory traffic is separate from `bench_mha.py`.
+
+---
+
 ## Prerequisites
 
 - **GPU**: CUDA device; tensors are allocated on `cuda`.
