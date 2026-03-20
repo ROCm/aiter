@@ -436,9 +436,12 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     odo_args.ptr_o           = a.o_ptr;
     odo_args.ptr_do          = a.do_ptr;
     odo_args.ptr_d           = a.d_ptr;
-    odo_args.Hs_odo          = a.nhead_stride_o * 2;
-    odo_args.BAs_odo         = a.batch_stride_o * 2;
-    odo_args.Seqs_odo        = a.stride_o * 2;
+    odo_args.Hs_o            = a.nhead_stride_o * 2;
+    odo_args.BAs_o           = a.batch_stride_o * 2;
+    odo_args.Seqs_o          = a.stride_o * 2;
+    odo_args.Hs_do           = a.nhead_stride_do * 2;
+    odo_args.BAs_do          = a.batch_stride_do * 2;
+    odo_args.Seqs_do         = a.stride_do * 2;
     odo_args.Hs_d            = a.nhead_stride_lsed * 4;
     odo_args.BAs_d           = a.batch_stride_lsed * 4;
     odo_args.Seqs_d          = 1 * 4;
