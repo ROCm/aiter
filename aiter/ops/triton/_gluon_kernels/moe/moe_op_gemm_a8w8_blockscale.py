@@ -329,6 +329,44 @@ def precompute_scale_offsets(
 
 
 @gluon.jit
+def buffer_load_scales(
+    offs_k_scale,
+    XBlockScale,
+    stride_x_bs_k,
+    b_scale_base,
+    stride_w_bs_k,
+    a_scale_m_offs,
+    b_scale_n_offs,
+    is_x_blockscale: gl.constexpr,
+    is_w_blockscale: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    WMMA_LAYOUT: gl.constexpr,
+):
+    if is_x_blockscale:
+        a_scale = gl.amd.cdna4.buffer_load(
+            ptr=XBlockScale,
+            offsets=a_scale_m_offs + offs_k_scale * stride_x_bs_k,
+            cache="",
+        )
+    else:
+        a_scale = gl.full(
+            (BLOCK_M,), 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, WMMA_LAYOUT)
+        )
+    if is_w_blockscale:
+        b_scale = gl.amd.cdna4.buffer_load(
+            ptr=b_scale_base,
+            offsets=offs_k_scale * stride_w_bs_k + b_scale_n_offs,
+            cache="",
+        )
+    else:
+        b_scale = gl.full(
+            (BLOCK_N,), 1.0, dtype=gl.float32, layout=gl.SliceLayout(0, WMMA_LAYOUT)
+        )
+    return a_scale, b_scale
+
+
+@gluon.jit
 def consume_scaled_tile(
     a_buffer,
     b_buffer,
@@ -357,29 +395,24 @@ def consume_scaled_tile(
     a_tile = a_buffer.index(m % NUM_BUFFERS)
     b_shuffled_tile = b_buffer.index(m % NUM_BUFFERS)
 
+    offs_k_scale = (k_offset_start // BLOCKSCALE_K) + m * N_SUBTILES
+    cur_a_scale, cur_b_scale = buffer_load_scales(
+        offs_k_scale,
+        XBlockScale, stride_x_bs_k, b_scale_base, stride_w_bs_k,
+        a_scale_m_offs, b_scale_n_offs,
+        is_x_blockscale, is_w_blockscale,
+        BLOCK_M, BLOCK_N, WMMA_LAYOUT,
+    )
+
     for sub in gl.static_range(N_SUBTILES):
-        offs_k_scale = (k_offset_start // BLOCKSCALE_K) + m * N_SUBTILES + sub
-
-        if is_x_blockscale:
-            cur_a_scale = gl.amd.cdna4.buffer_load(
-                ptr=XBlockScale,
-                offsets=a_scale_m_offs + offs_k_scale * stride_x_bs_k,
-                cache="",
-            )
-        else:
-            cur_a_scale = gl.full(
-                (BLOCK_M,), 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, WMMA_LAYOUT)
-            )
-
-        if is_w_blockscale:
-            cur_b_scale = gl.amd.cdna4.buffer_load(
-                ptr=b_scale_base,
-                offsets=offs_k_scale * stride_w_bs_k + b_scale_n_offs,
-                cache="",
-            )
-        else:
-            cur_b_scale = gl.full(
-                (BLOCK_N,), 1.0, dtype=gl.float32, layout=gl.SliceLayout(0, WMMA_LAYOUT)
+        if sub < N_SUBTILES - 1:
+            offs_k_scale += sub + 1
+            next_a_scale, next_b_scale = buffer_load_scales(
+                offs_k_scale,
+                XBlockScale, stride_x_bs_k, b_scale_base, stride_w_bs_k,
+                a_scale_m_offs, b_scale_n_offs,
+                is_x_blockscale, is_w_blockscale,
+                BLOCK_M, BLOCK_N, WMMA_LAYOUT,
             )
 
         sub_a_smem = a_tile.slice(sub * BLOCKSCALE_K, BLOCKSCALE_K, dim=1)
@@ -392,6 +425,10 @@ def consume_scaled_tile(
         zeros = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
         partial = gl.amd.gfx1250.wmma(sub_a, sub_b, zeros)
         acc += partial * cur_a_scale[:, None] * cur_b_scale[None, :]
+
+        if sub < N_SUBTILES - 1:
+            cur_a_scale = next_a_scale
+            cur_b_scale = next_b_scale
 
     return acc
 
@@ -737,6 +774,8 @@ def _moe_gemm_a8w8_blockscale(
         is_w_blockscale,
     )
 
+    N_SUBTILES: gl.constexpr = gl.cdiv(BLOCK_K, BLOCKSCALE_K)
+
     # prologue
     for _ in gl.static_range(NUM_BUFFERS - 1):
         issue_async_tile_loads(
@@ -756,6 +795,14 @@ def _moe_gemm_a8w8_blockscale(
             NUM_BUFFERS,
         )
         k += 1
+
+    # cur_a_scale, cur_b_scale = prefetch_scales(
+    #     (k_offset_start // BLOCKSCALE_K) + m * N_SUBTILES,
+    #     XBlockScale, stride_x_bs_k, b_scale_base, stride_w_bs_k,
+    #     a_scale_m_offs, b_scale_n_offs,
+    #     is_x_blockscale, is_w_blockscale,
+    #     BLOCK_M, BLOCK_N, WMMA_LAYOUT,
+    # )
 
     # Main loop
     for _ in range(num_k_tiles - (NUM_BUFFERS - 1)):
@@ -801,6 +848,14 @@ def _moe_gemm_a8w8_blockscale(
             is_w_blockscale,
         )
         m += 1
+
+        # cur_a_scale, cur_b_scale = prefetch_scales(
+        #     (k_offset_start // BLOCKSCALE_K) + m * N_SUBTILES,
+        #     XBlockScale, stride_x_bs_k, b_scale_base, stride_w_bs_k,
+        #     a_scale_m_offs, b_scale_n_offs,
+        #     is_x_blockscale, is_w_blockscale,
+        #     BLOCK_M, BLOCK_N, WMMA_LAYOUT,
+        # )
 
     # Epilogue
     for i in gl.static_range(NUM_BUFFERS - 1):
