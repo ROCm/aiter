@@ -192,7 +192,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
 
         using GemmPipeline = std::conditional_t<
             eight_warps,
-            ck_tile::ABQuantGemmPipelineAgBgCrEightWarps<PipelineProblem>,
+            ck_tile::ABQuantGemmPipelineAgBgCrEightWaves<PipelineProblem>,
             std::conditional_t<UseDoubleSmemBuffer && PreshuffleB,
                                ck_tile::WPABQuantBPipelineAgBgCrV2<PipelineProblem>,
                                ck_tile::ABQuantGemmPipelineAgBgCrCompV3<PipelineProblem>>>;
