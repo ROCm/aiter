@@ -97,6 +97,18 @@ def biased_grouped_topk(
         )
     else:
         topk = topk_ids.shape[1]
+        experts_per_group = gating_output.shape[1] // num_expert_group
+        if experts_per_group > 32:
+            return biased_grouped_topk_hip(
+                gating_output,
+                correction_bias,
+                topk_weights,
+                topk_ids,
+                num_expert_group,
+                topk_group,
+                need_renorm,
+                routed_scaling_factor,
+            )
         assert need_renorm, "Renormalization is required for moe_fused_gate."
         return moe_fused_gate(
             gating_output,
