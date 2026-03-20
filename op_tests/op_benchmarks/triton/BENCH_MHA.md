@@ -1,24 +1,22 @@
 # Multi-Head Attention (MHA) benchmark — user guide
 
-This document describes [`bench_mha.py`](bench_mha.py), which benchmarks AITER’s Triton **FlashAttention-style** MHA (`flash_attn_func`, `flash_attn_varlen_func`, and FP8 variants). It uses Triton’s `perf_report` / `do_bench` machinery to report latency, throughput, or effective memory bandwidth.
-
-For a shorter “how to run” cheat sheet, see [How to Run MHA](../README.md#how-to-run-mha) in the parent `op_tests/op_benchmarks` README.
+[`bench_mha.py`](bench_mha.py): Triton FlashAttention-style MHA (`flash_attn_*` / varlen / FP8). Triton `perf_report` + `do_bench` → ms, TFLOPS, or GB/s. More examples: [README § MHA](../README.md#how-to-run-mha).
 
 ---
 
 ## Multi-head Attention
 
-This benchmark times **scaled dot-product attention** on tensors that are already the **query, key, and value** representations for each head (the linear projections from the hidden state are *outside* the timed kernel).
+Times **scaled dot-product attention** on per-head **Q, K, V** (no $W^Q,W^K,W^V$ in the timed region).
 
 ### Single head
 
-For one head, let $Q \in \mathbb{R}^{L_q \times d}$, $K \in \mathbb{R}^{L_k \times d}$, and $V \in \mathbb{R}^{L_k \times d_v}$ (query length $L_q$, key/value length $L_k$, head dims $d$ and $d_v$). **Scaled attention** is:
+$Q \in \mathbb{R}^{L_q \times d}$, $K \in \mathbb{R}^{L_k \times d}$, $V \in \mathbb{R}^{L_k \times d_v}$:
 
 $$
 \text{Attention}(Q, K, V) = \mathrm{softmax}\left( \frac{Q K^{\top}}{\sqrt{d}} + M \right) V
 $$
 
-**Computation flow** (matrix shapes for one head: scores are $L_q \times L_k$, output is $L_q \times d_v$):
+Scores $L_q \times L_k$; output $L_q \times d_v$.
 
 ```mermaid
 flowchart TB
@@ -33,242 +31,117 @@ flowchart TB
 ```
 
 ```text
-                    ┌─────────────┐     ┌──────────┐     ┌─────────┐
-  Q (Lq×d) ─────────┤             │     │  + mask │     │ row-wise│     ┌───────────┐
-                    │  Q · K^T    ├────►│    M    ├────►│ softmax ├───► │ A · V     ├──► O (Lq×dv)
-  K (Lk×d) ─────────┤  → Lq×Lk   │     │         │     │  → A    │     └───────────┘
-                    └─────────────┘     └──────────┘     └─────────┘           ▲
-                                                                               │
-  V (Lk×dv) ─────────────────────────────────────────────────────────────────────┘
-         attention weights A weight the value rows; result has Lq rows, dv cols
+  Q (Lq×d) ──┐     ┌─────────┐     ┌─────────┐     ┌───────────┐
+  K (Lk×d) ──┼──► Q·K^T ─► +M ─► softmax ─► A·V ─► O (Lq×dv)
+  V (Lk×dv) ─┘
 ```
 
-- **Scale** $1/\sqrt{d}$ matches the default `softmax_scale` in code (`sm_scale`), unless you change it inside the benchmark.
-- **Mask** $M$ is **causal** when `-causal` is enabled: entries above the diagonal are set so those positions get zero probability after softmax (exact layout follows the kernel; conceptually “token $i$ may not attend to token $j > i$” when $L_q = L_k$).
-- With **no causal mask**, all $L_q \times L_k$ pairs contribute (subject to varlen padding, which zeroes out invalid positions in the `thd` path).
-
-The output has shape $L_q \times d_v$.
+- Scale: default `sm_scale` = $1/\sqrt{d}$.
+- **Causal** `-causal`: upper triangle masked (when $L_q=L_k$, no attend to future).
+- **Full** mask: all pairs; `thd` still zeros padded positions.
 
 ### Multiple heads
 
-Attention runs **in parallel over heads**: for batch index $b$ and head index $h$, you apply the same single-head computation to slices $Q_{b,h}$, $K_{b,h}$, and $V_{b,h}$. The benchmark uses **`-hq`** for the number of query heads; **`-hk`** sets the number of key/value heads when it differs (if omitted, it matches **`-hq`**).
+Per batch $b$, head $h$: same formula on $Q_{b,h}, K_{b,h}, V_{b,h}$. **`-hq`** = query heads; **`-hk`** = KV heads (`0` → same as `-hq`). If `-hk` < `-hq`, layout follows the kernel.
 
 $$
 O_{b,h} = \text{Attention}\left( Q_{b,h},\, K_{b,h},\, V_{b,h} \right)
 $$
 
-**Visualization** (one batch element $b$; **`-hq`** is the number of query heads, each runs the same pipeline as above):
-
 ```mermaid
 flowchart TB
-  Q["Q per batch: Hq head slices"]
-  K["K per batch: Hk head slices"]
-  V["V per batch: Hk head slices"]
-  Q --> Par["Single-head Attention, once per h = 0 ... Hq-1"]
-  K --> Par
-  V --> Par
-  Par --> Out["O_b,h for each h (each Lq × dv)"]
+  Q["Q: Hq slices"] --> Par["Single-head Attn per h"]
+  K["K: Hk slices"] --> Par
+  V["V: Hk slices"] --> Par
+  Par --> Out["O_b,h (Lq×dv each)"]
 ```
 
-```text
-  One batch index b
-  ═══════════════════════════════════════════════════════════════════
+### Out of scope
 
-       head h = 0          head h = 1                 head h = Hq−1
-       ┌──────────┐        ┌──────────┐               ┌──────────┐
-  Q_b,·──►│ Attention │        │ Attention │    ···    │ Attention │
-  K_b,·──►│ (single   │   Q,K,V slices   │ (same op)  │ (same op) │
-  V_b,·──►│  head eq) │        │ per h    │            │           │
-       └───┬───────┘        └───┬───────┘               └───┬───────┘
-           │                    │                           │
-           ▼                    ▼                           ▼
-        O_b,0                 O_b,1                     O_b,Hq−1
-        Lq×dv                 Lq×dv                     Lq×dv
+No $XW^Q, XW^K, XW^V$ FLOPs—only attention + (optional) bwd through it.
 
-  (If −hk < −hq, K/V slices are shared across query heads per the kernel layout.)
-```
+---
 
-Each $O_{b,h}$ has shape $L_q \times d_v$. The model usually concatenates or merges heads later; this benchmark only times the **attention** primitive per head.
+## How bench_mha.py Works
 
-### What the benchmark does *not* include
+`post_process_args` → defaults (`causal`, `layout`, custom vs grid vs `--model`) → `run_benchmark` → Triton `Benchmark` + `perf_report` + `do_bench`. **`-test_mode`**: correctness vs PyTorch SDPA, no timing.
 
-The timed kernels implement the **attention map × values** computation (and backward through it). They do **not** include the learned projections $X W^Q, X W^K, X W^V$ from the transformer block—that FLOPs and memory traffic is separate from `bench_mha.py`.
+### Args: shape / model
+
+| Arg | Meaning |
+|-----|---------|
+| `--model` | Heads/dims from JSON. List, family, or `all`. Conflicts with `-hq/-hk/-d/-dv`. Default with model: `causal`, `layout=thd`. |
+| `--model-configs` | JSON path under `triton/` (default `utils/model_configs.json`). |
+| `-b` | Batch. Custom shape needs `>0`. Model: unset → `1`. |
+| `-hq` `-hk` | Query / KV heads. `0` + no other custom dims → built-in sweep. `-hk` `0` → use `-hq`. |
+| `-sq` `-sk` | Q / K length. `-sk` `0` → `-sq`. Model, both unset → sweep $2^1 \ldots 2^{13}$. |
+| `-d` `-dv` | QK head dim; V dim (`-dv` defaults to `-d`). `-dv≠-d` → “PE” path. |
+| `--layout` | `bshd` or `thd` ([Layouts](#layouts--layout)). Default: `bshd` / `thd` without / with `--model`. |
+| `-equal_seqlens` | `thd` (or model): equal lens in varlen path. Not `bshd`-only without model. |
+
+### Args: run / metric
+
+| Arg | Meaning |
+|-----|---------|
+| `-mode` | `fwd` or `bwd` (`torch.autograd.grad`). |
+| `--metric` / `-metric` | `time` \| `throughput` \| `bandwidth` (parser default `throughput`). |
+| `--dtype` | `fp16` \| `bf16` \| `fp32` (non-FP8). |
+| `-fp8` | FP8 APIs. No `-sink`, no `-dv≠-d`. |
+| `-causal` | str2bool; unset → `False` / `True` without / with `--model`. |
+| `-sink` | Attention sink. No `-fp8`, no `-fused_bwd`. |
+| `-fused_bwd` | Fused bwd kernel. No `-sink`, no PE (`d>dv`). |
+| `-test_mode` | Correctness only. |
+| `-bench_torch` | Extra plot line “Torch”; still times Triton only. |
+| `-o` | CSV / `perf_report` to cwd. |
+| `-print_vgpr` | VGPR report. No `-bench_torch`. |
+| `-persistent` `-quantize_p` | Parsed; **unused** in this script. |
 
 ---
 
 ## What is being timed
 
-| `-mode` | Measured work |
-|--------|----------------|
-| `fwd` | Forward: Q, K, V → attention output (and internal LSE when applicable). |
-| `bwd` | Backward: `torch.autograd.grad` on the forward output w.r.t. Q, K, V (and **attention sink** tensor if `-sink` is used). |
+| `-mode` | Work |
+|---------|------|
+| `fwd` | Forward attention (+ LSE internally). |
+| `bwd` | Grad w.r.t. Q,K,V (+ sink if `-sink`). |
 
-**Backward FLOPs model**: The script scales forward FLOPs by **2.5×** for backward (comment in code: 2.0 backward + 0.5 recomputation).
+Bwd FLOPs model: **×2.5** vs fwd (recompute). **Dropout**: not supported.
 
-**Dropout**: Not supported in this benchmark (`dropout` must be ≤ 0).
-
-**Kernels used** (from `aiter.ops.triton.attention`):
-
-- Non-varlen: `flash_attn_func` or `flash_attn_fp8_func`
-- Varlen (`-layout thd`): `flash_attn_varlen_func` or `flash_attn_varlen_fp8_func`
+**Kernels:** `flash_attn_func` / `flash_attn_fp8_func`; varlen: `flash_attn_varlen_*`.
 
 ---
 
 ## Layouts (`-layout`)
 
-| Layout | Tensor shape | Default when |
-|--------|--------------|--------------|
-| `bshd` | Q: `[B, N_CTX_Q, HQ, D_HEAD]`<br>K/V: `[B, N_CTX_K, HK, D_HEAD]` (V may use `D_HEAD_V`) | No `--model` |
-| `thd` | Unpadded total tokens × heads (varlen). Built with `generate_qkv` and cumulative sequence lengths. | With `--model` (unless overridden) |
+| Layout | Shape | Default |
+|--------|--------|---------|
+| `bshd` | Q `[B,N_CTX_Q,HQ,D]`; K/V `[B,N_CTX_K,HK,D]` (V may use `D_HEAD_V`) | no `--model` |
+| `thd` | Unpadded tokens + `cu_seqlens` (`generate_qkv`) | `--model` |
 
-**`-equal_seqlens`** (only with `thd` or `--model`): padding masks are “full” so all sequences in the batch share the same length; still uses the varlen API. The script warns that `thd` + equal lengths can add extra lookup cost versus `bshd`.
+`-equal_seqlens` + `thd`: full masks, equal lengths; slower than `bshd` for that case (warning in code).
 
 ---
 
 ## Configuration modes
 
-The benchmark sweeps **different x-axis points** depending on whether you pass a **custom shape**, use **`--model`**, or use the **built-in grid**.
+**Custom:** any of `-hq/-hk/-d/-dv` nonzero → need `-b -hq -sq -d` (and `-dv` implied).
 
-### 1. Custom shape (explicit `-b`, `-hq`, `-sq`, `-d`, …)
+**Built-in grid** (no custom, no model): `bshd` batches `1,4,16`, heads `16,48`, `N_CTX_Q` `1,1024,4096`, `N_CTX_K` `163,8192`. `thd`: batches `1,4,8`, same heads/lengths.
 
-Triggered when any of `-hq`, `-hk`, `-d`, or `-dv` is non-zero. You must supply **batch**, **Q heads**, **Q sequence length**, and **head sizes** (`-d`, and implicitly `-dv` if omitted copies `-d`).
-
-Optional:
-
-- **`-hk`**: key/value head count (GQA). Default: same as `-hq` if omitted.
-- **`-sk`**: key sequence length. Default: same as `-sq` if omitted.
-- **`-dv`**: V head dim; if omitted, equals `-d`.
-
-### 2. Built-in sweeps (no custom flags, no `--model`)
-
-**Non-varlen (`bshd`):** Cartesian product of
-
-- Batch: `1, 4, 16`
-- Heads: `16, 48` (HQ = HK in the grid)
-- `N_CTX_Q`: `1, 1024, 4096`
-- `N_CTX_K`: `163, 8192`
-
-**Varlen (`thd`):** same idea with batch sizes `1, 4, 8` and the same head / length grid.
-
-### 3. Model-driven (`--model`)
-
-- Reads **`utils/model_configs.json`** (override path with **`--model-configs`**, relative to `op_tests/op_benchmarks/triton`).
-- **`--model`** accepts a comma-separated list, a family name (all sizes in that family), or `all`. Exact strings are listed in `python bench_mha.py --help`.
-- **Defaults when `--model` is set** (unless you override): **`causal=True`**, **`layout=thd`** — intended to match common prefill-style setups.
-- **Batch**: `-b` if set, else `1`.
-- **Sequence lengths**: If **`-sq` / `-sk` are omitted**, the sweep uses $2^i$ for $i = 1, \ldots, 13$ (lengths 2, 4, 8, …, 8192) for Q; K follows Q unless `-sk` is set.
-- **Head dims** come from the model config: `hidden_size // num_attention_heads`, with GQA from `num_key_value_heads` when present.
-
-Do **not** pass `-hq`, `-hk`, `-d`, or `-dv` together with `--model`; those come from the JSON.
-
----
-
-## Metrics (`--metric` / `-metric`)
-
-| Metric | Y-axis | Notes |
-|--------|--------|--------|
-| `time` | ms | Raw `triton.testing.do_bench` result. |
-| `throughput` | TFLOPS | `total_flops / time` (see FLOPs accounting above for bwd). |
-| `bandwidth` | GB/s | Simple R/W byte model over Q, K, V, O (and dout / grads in bwd). |
-
-The shared parser also defines **`--metric`**; either form can appear in docs—use the one your installed argparse accepts (see `--help`).
-
----
-
-## Data types
-
-- **`-dtype` / `--dtype`**: `fp16` (default), `bf16`, or `fp32` for activations in the non-FP8 path.
-- **`-fp8`**: Uses the FP8 entry points (`flash_attn_*_fp8_func`). **Incompatible** with positional-encoding-style head splits (see below) and with **`-sink`**.
-
----
-
-## Causal mask (`-causal`)
-
-Accepts boolean-like strings (`true`/`false`, `1`/`0`, etc.) via `str2bool`.
-
-- Default **`False`** without `--model`.
-- Default **`True`** with `--model` (unless you set `-causal` explicitly).
-
----
-
-## Backward implementation toggles
-
-- **`-fused_bwd`**: Enables the **fused** backward path via `mha_set_use_fused_bwd_kernel(True)` when the provider label contains `fused-bwd`.
-
-**Not supported together** (assertions in the benchmark):
-
-- Fused backward + **PE** (`D_HEAD > D_HEAD_V`)
-- Fused backward + **attention sink**
-- FP8 + PE or FP8 + sink
-
----
-
-## Positional encoding / different QK vs V dim (“PE”)
-
-Set **`-dv`** different from **`-d`** so that `D_HEAD > D_HEAD_V`. That path uses separate test and API coverage (`test_mha_with_pe`, etc.). **FP8** and **fused backward** are disallowed in that configuration.
-
----
-
-## Attention sink (`-sink`)
-
-Adds a learnable **per-head sink** vector (length `HQ`) passed into the non-FP8 flash APIs. In backward mode, gradients include the sink. **Not compatible** with **`-fp8`** or **fused backward**.
-
----
-
-## Correctness mode (`-test_mode`)
-
-Does **not** benchmark. Instead it runs tests from `op_tests.triton_tests.attention.test_mha` (forward + backward) comparing the Triton implementation to PyTorch SDPA for the current shape, layout, causal flag, and FP8 flag.
-
-Use this to validate kernels after changes or on new hardware.
-
----
-
-## Optional comparisons and tooling
-
-| Flag | Purpose |
-|------|---------|
-| **`-bench_torch`** | Adds a second plot series labeled Torch. |
-| **`-o`** | Save results under the current directory (CSV via Triton `perf_report`). |
-| **`-print_vgpr`** | Print VGPR usage for Triton kernels (do not combine with `-bench_torch`). |
-
-**`-bench_torch` note:** The timed `fn` is still the Triton path for every series; this flag does not benchmark `torch.nn.functional.scaled_dot_product_attention`.
-
----
-
-## Flags present but unused in this script
-
-The following are defined on the parser but **not referenced** in `bench_mha.py` today:
-
-- **`-persistent`**
-- **`-quantize_p`**
-
-They may be reserved for future kernel options or copied from other benchmarks; check the implementation before relying on them.
+**`--model`:** JSON drives HQ/HK/D; `-b` default 1; if `-sq/-sk` omitted, seq sweep $2^1 \ldots 2^{13}$.
 
 ---
 
 ## Example commands
 
 ```bash
-# Built-in grid, forward, throughput (defaults: bshd, non-causal)
 python bench_mha.py --metric throughput -mode fwd
-
-# Single custom shape
 python bench_mha.py -b 4 -hq 32 -hk 8 -sq 2048 -sk 2048 -d 128 --dtype bf16 -metric time -mode fwd
-
-# Model-driven varlen sweep (causal + thd by default)
 python bench_mha.py --model llama3-70B -b 1 --metric throughput
-
-# FP8 forward (custom shape)
-python bench_mha.py -fp8 -b 4 -hq 32 -hk 32 -sq 2048 -sk 2048 -d 128
-
-# Backward, unfused vs fused (compare runs)
+python bench_mha.py -fp8 -b 4 -hq 32 -sq 2048 -sk 2048 -d 128
 python bench_mha.py -mode bwd -b 4 -hq 32 -sq 1024 -sk 1024 -d 128
 python bench_mha.py -mode bwd -fused_bwd -b 4 -hq 32 -sq 1024 -sk 1024 -d 128
-
-# Correctness
 python bench_mha.py -test_mode -b 2 -hq 16 -sq 512 -sk 512 -d 64 -causal true
-
-# Varlen grid explicitly
 python bench_mha.py -layout thd --metric bandwidth
 ```
 
@@ -276,17 +149,17 @@ python bench_mha.py -layout thd --metric bandwidth
 
 ## Troubleshooting
 
-- **Import errors**: Run from the **aiter** repo with the same environment you use to build/run AITER; ensure `op_tests` is on `PYTHONPATH` if you launch from elsewhere.
-- **Assertion on layout / equal seqlens**: `-equal_seqlens` requires `thd` or `--model`.
-- **FP8 / PE / fused bwd / sink**: See the “Not supported together” notes above—those are enforced explicitly in the benchmark.
+- Imports: aiter env + `PYTHONPATH` if not run from repo layout.
+- `-equal_seqlens`: needs `thd` or `--model`.
+- Conflicting `-fp8` / PE / `-sink` / `-fused_bwd`: asserts in script.
 
 ---
 
 ## Related code
 
-| Area | Location |
-|------|----------|
-| Benchmark entrypoint | [`bench_mha.py`](bench_mha.py) |
-| Shared CLI base | [`utils/argparse.py`](utils/argparse.py) |
-| Model JSON | [`utils/model_configs.json`](utils/model_configs.json) |
-| Triton MHA ops | `aiter.ops.triton.attention.mha`, `mha_v3` |
+| Item | Path |
+|------|------|
+| Script | [`bench_mha.py`](bench_mha.py) |
+| CLI | [`utils/argparse.py`](utils/argparse.py) |
+| Models | [`utils/model_configs.json`](utils/model_configs.json) |
+| Ops | `aiter.ops.triton.attention.mha`, `mha_v3` |
