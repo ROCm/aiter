@@ -108,11 +108,11 @@ jobs:
           name: triton-wheel
           path: triton-wheels/*.whl
 
-  # Step 2: matrix jobs consume shard file lists
+  # Step 2: MI325 matrix jobs (always runs)
   triton:
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
-    name: Triton Tests (1 GPU) / Shard ${{ matrix.shard }}
-    runs-on: ${{ matrix.runner }}
+    name: Triton Tests (MI325) / Shard ${{ matrix.shard }}
+    runs-on: aiter-1gpu-runner
     needs: [split_triton_tests, build-triton, check-signal]
     strategy:
       fail-fast: false
