@@ -48,6 +48,18 @@ def perftest(
 ):
     def decorator(func):
         def wrapper(*args, **kwargs):
+            if int(os.environ.get("AITER_SKIP_PERF", 0)):
+                func(*args, **kwargs)
+                torch.cuda.synchronize()
+                start_evt = torch.cuda.Event(enable_timing=True)
+                end_evt = torch.cuda.Event(enable_timing=True)
+                start_evt.record()
+                data = func(*args, **kwargs)
+                end_evt.record()
+                end_evt.synchronize()
+                avg = start_evt.elapsed_time(end_evt) * 1000
+                return data, avg
+
             num = num_rotate_args
             if num < 1:
                 gpu_id = torch.cuda.current_device()
