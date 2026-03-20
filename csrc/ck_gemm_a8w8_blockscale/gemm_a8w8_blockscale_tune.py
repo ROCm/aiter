@@ -249,9 +249,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             else candidate_kernels_cktile_dict
         )
         kernel_list = {
-            k: v
-            for k, v in full_dict.items()
-            if v.BlockPerCu in block_per_cu
+            k: v for k, v in full_dict.items() if v.BlockPerCu in block_per_cu
         }
         gemm_a8w8_idx = (
             [0, 1, 2, 7, 4]
