@@ -1875,9 +1875,9 @@ def compile_mixed_moe_gemm2(
                 elem_bytes=b_elem_bytes,
             )
             layout_b = b_layout.layout_b
-            _c_k0 = (k_in * arith.constant(int(a_elem_bytes), index=True)) / arith.index(
-                64
-            )
+            _c_k0 = (
+                k_in * arith.constant(int(a_elem_bytes), index=True)
+            ) / arith.index(64)
 
             def check_c_n_valid_gate(base_n):
                 return arith.cmpi(CmpIPredicate.ult, base_n, model_dim - model_dim_pad)

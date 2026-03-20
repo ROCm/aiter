@@ -139,11 +139,13 @@ def compile_moe_gemm1(
     elem_bytes = 2 if is_f16_or_bf16 else 1
     if out_dtype not in ("f16", "bf16"):
         raise ValueError(f"out_dtype must be 'f16' or 'bf16', got {out_dtype!r}")
+
     # NOTE: don't materialize MLIR types outside an active MLIR Context.
     def out_mlir():
         return (lambda ty: ty() if callable(ty) else ty)(
             T.f16 if out_dtype == "f16" else T.bf16
         )
+
     tile_k_bytes = int(tile_k) * int(elem_bytes)
     # K64-byte micro-step: always 64 bytes per `ku`. For fp16 this is 32 elements.
     if (tile_k_bytes % 64) != 0:
@@ -2838,6 +2840,7 @@ def compile_moe_reduction(
         elem_type_tag = "bf16"
     else:
         raise ValueError(f"Unsupported dtype: {dtype_str}")
+
     def compute_type():
         return T.f32() if callable(T.f32) else T.f32
 
