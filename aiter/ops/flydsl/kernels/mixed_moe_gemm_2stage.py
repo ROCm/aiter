@@ -1953,7 +1953,7 @@ def compile_mixed_moe_gemm2(
             # - blockIdx.x -> N dimension (tile along model_dim)
             # - blockIdx.y -> expert-block id / M dimension (tile along sorted M)
             by = gpu.block_id("x")  # tile along model_dim
-            bx = gpu.block_id("y")  # tile along sorted M
+            bx_persist = gpu.block_id("y")  # tile along sorted M
 
             # XOR16 swizzle parameter (in bytes; constant, power-of-two in our configs).
             k_blocks16 = arith.constant(tile_k_bytes // 16, index=True)
@@ -2957,6 +2957,15 @@ def compile_mixed_moe_gemm2(
                     s = fused >> 24
                     t_idx = arith.index_cast(ir.IndexType.get(), t)
                     s_idx = arith.index_cast(ir.IndexType.get(), s)
+                    n_byte_stride = arith.constant(
+                        model_dim * out_elem_bytes, index=True
+                    )
+                    if bool(accumulate):
+                        row_byte_base = out_base_idx + t_idx * n_byte_stride
+                    else:
+                        row_byte_base = out_base_idx + (
+                            t_idx * arith.constant(topk, index=True) + s_idx
+                        ) * n_byte_stride
                     if not bool(accumulate):
                         # ---- 64-bit global store path (avoids i32 offset overflow) ----
                         col_idx = col_g0
