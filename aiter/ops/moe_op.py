@@ -103,7 +103,7 @@ def fmoe_g1u1(
     input_scale: Tensor,
     fc1_scale: Tensor,
     fc2_scale: Tensor,
-    kernelName: str,
+    kernelName: Optional[str] = "",
     fc2_smooth_scale: Optional[Tensor] = None,
     activation: Optional[int] = ActivationType.Silu.value,
 ) -> None: ...
@@ -123,7 +123,7 @@ def fmoe_g1u1_tkw1(
     input_scale: Tensor,
     fc1_scale: Tensor,
     fc2_scale: Tensor,
-    kernelName: str,
+    kernelName: Optional[str] = "",
     fc2_smooth_scale: Optional[Tensor] = None,
     activation: Optional[int] = ActivationType.Silu.value,
 ) -> None: ...
@@ -144,7 +144,6 @@ def fmoe_int8_g1u0_a16(
     fc2_scale: Tensor,
     fc1_smooth_scale: Tensor,
     fc2_smooth_scale: Tensor,
-    activation: Optional[Enum] = ActivationType.Silu.value,
 ) -> None: ...
 
 
@@ -181,7 +180,7 @@ def fmoe_fp8_blockscale_g1u1(
     input_scale: Tensor,
     fc1_scale: Tensor,
     fc2_scale: Tensor,
-    kernelName: str,
+    kernelName: Optional[str] = "",
     fc_scale_blkn: int = 128,
     fc_scale_blkk: int = 128,
     fc2_smooth_scale: Optional[Tensor] = None,
@@ -200,7 +199,7 @@ def moe_stage1_g1u1(
     num_valid_ids: Tensor,
     out: Tensor,
     inter_dim: int,
-    kernelName: str,
+    kernelName: Optional[str],
     block_m: int,
     ksplit: int = 0,
     activation: Optional[int] = ActivationType.Silu.value,

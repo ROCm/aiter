@@ -443,7 +443,7 @@ extern "C" __attribute__((visibility("default"))) void fmoe_int8_g1u0(
 
         if(!config_map)
         {
-            AITER_CHECK(false, __func__, " Input only supput Int8!");
+            AITER_CHECK(false, __func__, " Input only support Int8!");
         }
 
         const int tiles[] = {512, 448, 384, 320, 256, 192, 128};
