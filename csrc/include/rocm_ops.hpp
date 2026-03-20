@@ -42,64 +42,6 @@ namespace py = pybind11;
     m.def("sigmoid", &aiter_sigmoid, "apply for sigmoid."); \
     m.def("tanh", &aiter_tanh, "apply for tanh.");
 
-#define ATTENTION_ASM_MLA_PYBIND               \
-    m.def("mla_decode_stage1_asm_fwd",         \
-          &mla_decode_stage1_asm_fwd,          \
-          "mla_decode_stage1_asm_fwd",         \
-          py::arg("Q"),                        \
-          py::arg("KV"),                       \
-          py::arg("qo_indptr"),                \
-          py::arg("kv_indptr"),                \
-          py::arg("kv_page_indices"),          \
-          py::arg("kv_last_page_lens"),        \
-          py::arg("num_kv_splits_indptr"),     \
-          py::arg("work_meta_data"),           \
-          py::arg("work_indptr"),              \
-          py::arg("work_info_set"),            \
-          py::arg("max_seqlen_q"),             \
-          py::arg("page_size"),                \
-          py::arg("nhead_kv"),                 \
-          py::arg("softmax_scale"),            \
-          py::arg("splitData"),                \
-          py::arg("splitLse"),                 \
-          py::arg("output"),                   \
-          py::arg("lse")      = std::nullopt,  \
-          py::arg("q_scale")  = std::nullopt,  \
-          py::arg("kv_scale") = std::nullopt); \
-    m.def("mla_prefill_asm_fwd",               \
-          &mla_prefill_asm_fwd,                \
-          "mla_prefill_asm_fwd",               \
-          py::arg("Q"),                        \
-          py::arg("KV"),                       \
-          py::arg("qo_indptr"),                \
-          py::arg("kv_indptr"),                \
-          py::arg("kv_page_indices"),          \
-          py::arg("kv_last_page_lens"),        \
-          py::arg("max_seqlen_q"),             \
-          py::arg("softmax_scale"),            \
-          py::arg("splitData"),                \
-          py::arg("splitLse"));                \
-    m.def("mla_prefill_ps_asm_fwd",            \
-          &mla_prefill_ps_asm_fwd,             \
-          "mla_prefill_ps_asm_fwd",            \
-          py::arg("Q"),                        \
-          py::arg("K"),                        \
-          py::arg("V"),                        \
-          py::arg("qo_indptr"),                \
-          py::arg("kv_indptr"),                \
-          py::arg("kv_page_indices"),          \
-          py::arg("work_indptr"),              \
-          py::arg("work_info_set"),            \
-          py::arg("max_seqlen_q"),             \
-          py::arg("softmax_scale"),            \
-          py::arg("is_causal"),                \
-          py::arg("splitData"),                \
-          py::arg("splitLse"),                 \
-          py::arg("output"),                   \
-          py::arg("q_scale") = std::nullopt,   \
-          py::arg("k_scale") = std::nullopt,   \
-          py::arg("v_scale") = std::nullopt);
-
 #define ATTENTION_ASM_PYBIND                        \
     m.def("pa_fwd_asm",                             \
           &pa_fwd,                                  \
@@ -138,7 +80,8 @@ namespace py = pybind11;
           py::arg("splitLse")       = std::nullopt, \
           py::arg("mask")           = 0,            \
           py::arg("high_precision") = 1,            \
-          py::arg("kernelName")     = std::nullopt);
+          py::arg("kernelName")     = std::nullopt, \
+          py::arg("quant_type")     = QuantType::per_Token);
 
 #define ATTENTION_CK_PYBIND            \
     m.def("pa_fwd_naive",              \
@@ -1257,7 +1200,22 @@ namespace py = pybind11;
           py::arg("kernel_name"),                                              \
           py::arg("fc2_smooth_scale") = std::nullopt,                          \
           py::arg("activation")       = ActivationType::Silu);                       \
-    m.def("fmoe_int8_g1u0_a16", &fmoe_int8_g1u0_a16);                          \
+    m.def("fmoe_int8_g1u0_a16",                                                \
+          &fmoe_int8_g1u0_a16,                                                \
+          py::arg("out"),                                                      \
+          py::arg("input"),                                                    \
+          py::arg("gate"),                                                     \
+          py::arg("down"),                                                     \
+          py::arg("sorted_token_ids"),                                         \
+          py::arg("sorted_weights"),                                           \
+          py::arg("sorted_expert_ids"),                                        \
+          py::arg("num_valid_ids"),                                            \
+          py::arg("topk"),                                                     \
+          py::arg("fc1_scale"),                                                \
+          py::arg("fc2_scale"),                                                \
+          py::arg("fc1_smooth_scale"),                                         \
+          py::arg("fc2_smooth_scale"),                                         \
+          py::arg("activation") = ActivationType::Silu);                      \
     m.def("fmoe_g1u1_a16",                                                     \
           &fmoe_g1u1_a16,                                                      \
           py::arg("out"),                                                      \
@@ -1693,6 +1651,8 @@ namespace py = pybind11;
         .value("per_1x32", QuantType::per_1x32)          \
         .value("per_1x128", QuantType::per_1x128)        \
         .value("per_128x128", QuantType::per_128x128)    \
+        .value("per_256x128", QuantType::per_256x128)    \
+        .value("per_1024x128", QuantType::per_1024x128)  \
         .export_values();                                \
     pybind11::enum_<ActivationType>(m, "ActivationType") \
         .value("No", ActivationType::No)                 \

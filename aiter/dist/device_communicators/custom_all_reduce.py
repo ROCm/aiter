@@ -279,6 +279,20 @@ class CustomAllreduce:
             return inp_size <= (self.max_size / 2)
         return False
 
+    def should_custom_ag(self, inp: torch.Tensor):
+        if self.disabled:
+            return False
+        inp_size = inp.numel() * inp.element_size()
+        if inp_size % 16 != 0:
+            return False
+        if not is_weak_contiguous(inp):
+            return False
+        # all_gather output = input * world_size, so the per-rank input
+        # must fit within max_size / world_size
+        if self.world_size == 2 or self.fully_connected:
+            return inp_size <= (self.max_size / (self.world_size * 2))
+        return False
+
     def all_reduce(
         self,
         inp: torch.Tensor,
