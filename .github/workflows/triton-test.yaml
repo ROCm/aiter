@@ -54,12 +54,66 @@ jobs:
           name: triton_shards
           path: triton_shard_*.list
 
-  # Step 2: MI325 matrix jobs (always runs)
+  # Build Triton wheel once, shared by all shard jobs via artifact
+  build-triton:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    name: Build Triton Wheel
+    runs-on: aiter-1gpu-runner
+    needs: [check-signal]
+    env:
+      DOCKER_IMAGE: "rocm/pytorch:latest"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+
+      - name: Build Triton wheel in Docker
+        run: |
+          set -ex
+          mkdir -p triton-wheels
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          docker run --rm \
+            --device=/dev/kfd $DEVICE_FLAG \
+            --shm-size=16G \
+            --group-add $(getent group render | cut -d: -f3) \
+            --group-add $(getent group video | cut -d: -f3) \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            ${{ env.DOCKER_IMAGE }} \
+            bash -c '
+              set -ex
+              pip config set global.default-timeout 60
+              pip config set global.retries 10
+              TRITON_COMMIT=${TRITON_COMMIT:-756afc06}
+              git clone https://github.com/triton-lang/triton
+              cd triton
+              git checkout "$TRITON_COMMIT"
+              pip install -r python/requirements.txt
+              MAX_JOBS=64 pip wheel --no-deps -w /workspace/triton-wheels .
+            '
+
+      - name: Upload Triton wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: triton-wheel
+          path: triton-wheels/*.whl
+
+  # Step 2: matrix jobs consume shard file lists
   triton:
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
-    name: Triton Tests (MI325) / Shard ${{ matrix.shard }}
-    runs-on: aiter-1gpu-runner
-    needs: [split_triton_tests, check-signal]
+    name: Triton Tests (1 GPU) / Shard ${{ matrix.shard }}
+    runs-on: ${{ matrix.runner }}
+    needs: [split_triton_tests, build-triton, check-signal]
     strategy:
       fail-fast: false
       matrix:
@@ -79,6 +133,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: triton_shards
+
+      - name: Download Triton wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: triton-wheel
+          path: triton-wheels
 
       - name: List test shard files
         run: |
@@ -125,6 +185,7 @@ jobs:
           set -ex
           echo "Setting up Aiter and Triton..."
           docker exec \
+          -e TRITON_WHEEL_DIR=/workspace/triton-wheels \
           -w /workspace \
           triton_test \
           ./.github/scripts/build_aiter_triton.sh
