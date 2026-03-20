@@ -98,7 +98,6 @@ def make_preshuffle_scale_layout(
             f"elem_bytes of scale must be {mn_pack} * {k_pack}, got {elem_bytes!r}"
         )
 
-    stride_nlane = arith.constant(1, index=True)
     stride_klane = c16
     stride_k0 = c4 * stride_klane
     stride_n0 = c_k1 * stride_k0

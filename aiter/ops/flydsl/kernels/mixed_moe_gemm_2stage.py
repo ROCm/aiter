@@ -184,18 +184,6 @@ def compile_mixed_moe_gemm1(
     # # W is packed int4 for W4A8: 2 values per byte.
     # size_w = (experts * (2 * inter_dim) * model_dim) // 2 if is_int4 else (experts * (2 * inter_dim) * model_dim)
 
-    DYN = ir.ShapedType.get_dynamic_size()
-    size_out = DYN
-    size_x = DYN
-    # W is packed int4 for W4A8: 2 values per byte.
-    size_w = (
-        (experts * (2 * inter_dim) * model_dim) // 2
-        if is_int4
-        else (experts * (2 * inter_dim) * model_dim)
-    )
-    size_sorted = DYN
-    size_expert_ids = DYN
-
     total_threads = 256
     bytes_x_per_tile = int(tile_m) * int(tile_k) * int(a_elem_bytes)
     if bytes_x_per_tile % total_threads != 0:
@@ -281,7 +269,7 @@ def compile_mixed_moe_gemm1(
             arg_bias = arg_bias.value
 
             tokens_in = arith.index_cast(ir.IndexType.get(), i32_tokens_in.ir_value())
-            inter_in = arith.index_cast(ir.IndexType.get(), i32_inter_in.ir_value())
+            _inter_in = arith.index_cast(ir.IndexType.get(), i32_inter_in.ir_value())
             k_in = arith.index_cast(ir.IndexType.get(), i32_k_in.ir_value())
             size_expert_ids_in = arith.index_cast(
                 ir.IndexType.get(), i32_size_expert_ids_in.ir_value()
@@ -290,24 +278,14 @@ def compile_mixed_moe_gemm1(
             k_i32_v = i32_k_in.ir_value()
 
             x_elem = T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
-            # For int4, weights are stored as packed bytes (i8) and unpacked to i8 packs.
-            w_elem = T.f16 if is_f16_b else (T.i8 if is_int8 else T.f8)
-            f16 = T.f16
             f32 = T.f32
             i32 = T.i32
             i64 = T.i64
             vec4_f32 = T.vec(4, f32)
             vec4_i32 = T.vec(4, i32)
-            vec4_f16 = T.vec(4, f16)
-            vec4_f8 = T.vec(4, T.f8)
-            vec1_f16 = T.vec(1, f16)
             vec1_f32 = T.vec(1, f32)
             vec16_elems = 16 if a_elem_bytes == 1 else 8
-            vec8_elems = 8 if a_elem_bytes == 1 else 4
-            vec4_elems = 4 if a_elem_bytes == 1 else 2
-            vec8_x = T.vec(vec8_elems, x_elem)
             vec16_x = T.vec(vec16_elems, x_elem)
-            vec1_i64 = T.vec(1, i64)
             vec2_i64 = T.vec(2, i64)
 
             def silu(x):
@@ -354,7 +332,7 @@ def compile_mixed_moe_gemm1(
             )
 
             # Lccouts
-            layout_x = fx.make_layout((tokens_i32_v, k_i32_v), stride=(k_i32_v, 1))
+            _layout_x = fx.make_layout((tokens_i32_v, k_i32_v), stride=(k_i32_v, 1))
 
             # B preshuffle layout: match GEMM test helper exactly.
             c_n_total = arith.constant(experts * (2 * inter_dim), index=True)
@@ -411,7 +389,7 @@ def compile_mixed_moe_gemm1(
             )
 
             bx_m_i32 = arith.index_cast(T.i32, bx_m)
-            by_n_i32 = arith.index_cast(T.i32, by_n)
+            _by_n_i32 = arith.index_cast(T.i32, by_n)
             blk_valid = arith.cmpi(CmpIPredicate.ult, bx_m_i32, max_token_id_i32)
             # Common constants/atoms (hoisted): keep IR small like GEMM.
             # CK-style XOR16 swizzle parameter (constant, power-of-two in our configs).
@@ -565,7 +543,7 @@ def compile_mixed_moe_gemm1(
                         (k_in / c_a_pack) * arith.constant(int(elem_bytes), index=True)
                     ) / arith.index(4)
                     c_k_div4_i32 = arith.index_cast(T.i32, c_k_div4)
-                    layout_x_div4 = fx.make_layout(
+                    _layout_x_div4 = fx.make_layout(
                         (tokens_i32_v, c_k_div4_i32), stride=(c_k_div4_i32, 1)
                     )
                     tile_k_dwords = (int(tile_k) * int(elem_bytes)) // 4
@@ -621,10 +599,7 @@ def compile_mixed_moe_gemm1(
                         t_idx = arith.index_cast(ir.IndexType.get(), t_safe)
                         x_row_base_div4.append(t_idx * c_k_div4)
 
-                    vec1_i32 = T.vec(1, i32)
-                    vec2_i32 = T.vec(2, i32)
                     vec4_i32 = T.vec(4, i32)
-                    vec4_x = T.vec(4, x_elem)
 
                     def load_x(idx_i32):
                         """Load `x_load_bytes` bytes from X (gmem) into regs.
@@ -1295,8 +1270,6 @@ def compile_mixed_moe_gemm1(
                         )
 
                     # Store epilogue to out[t, slot, inter]
-                    expert_off = expert_off_idx
-                    bx_m0 = bx_m
                     topk_i32_v = topk_i32
                     inter_i32_v = arith.constant(inter_dim)
                     mask24_i32 = arith.constant(0xFFFFFF)
@@ -1306,7 +1279,7 @@ def compile_mixed_moe_gemm1(
                     for ni in range_constexpr(num_acc_n):
                         col_i32_list.append(arith.index_cast(T.i32, col_g_list[ni]))
 
-                    lane_div_16_mul4 = lane_div_16 * arith.index(4)
+                    _lane_div_16_mul4 = lane_div_16 * arith.index(4)
                     inter_i32_local = inter_i32_v
 
                     # Optional: CK-style CShuffle epilogue for better global store coalescing.
@@ -1315,7 +1288,7 @@ def compile_mixed_moe_gemm1(
                         use_cshuffle_epilog
                     )
 
-                    mask_even_i32 = arith.constant(0xFFFFFFFE)
+                    _mask_even_i32 = arith.constant(0xFFFFFFFE)
 
                     if _use_cshuffle_epilog:
                         if lds_out is None:
@@ -1345,7 +1318,7 @@ def compile_mixed_moe_gemm1(
                             fused2 = buffer_ops.buffer_load(
                                 sorted_rsrc, row_safe, vec_width=1, dtype=T.i32
                             )
-                            t2 = fused2 & mask24_i32
+                            _t2 = fused2 & mask24_i32
 
                             # Sorted weight aligned with `row` (matches aiter moe_sorting output).
                             if doweight_stage1:
@@ -1685,7 +1658,6 @@ def compile_mixed_moe_gemm2(
 
     is_f16_a = a_dtype == "fp16"
     is_f16_b = b_dtype == "fp16"
-    is_f16 = is_f16_a or is_f16_b
 
     is_f8_a = a_dtype == "fp8"
     is_f4_a = a_dtype == "fp4"
@@ -1750,19 +1722,6 @@ def compile_mixed_moe_gemm2(
 
     def _scale_elem_type():
         return T.i32
-
-    DYN = ir.ShapedType.get_dynamic_size()
-    size_out = DYN
-    size_x = DYN
-    size_sorted = DYN
-    size_expert_ids_shape = DYN
-    size_scale_x = DYN
-    # W is packed int4 for W4A8: 2 values per byte.
-    size_w = (
-        (experts * model_dim * inter_dim) // 2
-        if is_int4
-        else (experts * model_dim * inter_dim)
-    )
 
     total_threads = 256
     bytes_x_per_tile = int(tile_m) * int(tile_k) * int(a_elem_bytes)
@@ -1880,23 +1839,15 @@ def compile_mixed_moe_gemm2(
                 ir.IndexType.get(), i32_size_expert_ids_in.ir_value()
             )
             x_elem = T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
-            # For int4, weights are stored as packed bytes (i8) and unpacked to i8 packs.
-            w_elem = T.f16 if is_f16_b else (T.i8 if is_int8 else T.f8)
-            f16 = T.f16
             f32 = T.f32
             i32 = T.i32
             i64 = T.i64
             vec4_f32 = T.vec(4, f32)
             vec4_i32 = T.vec(4, i32)
-            vec1_f16 = T.vec(1, f16)
-            vec2_f16 = T.vec(2, f16)
-            vec4_f16 = T.vec(4, f16)
             vec16_elems = 16 if a_elem_bytes == 1 else 8
             vec8_elems = 8 if a_elem_bytes == 1 else 4
             vec4_elems = 4 if a_elem_bytes == 1 else 2
-            vec8_x = T.vec(vec8_elems, x_elem)
             vec16_x = T.vec(vec16_elems, x_elem)
-            vec1_i64 = T.vec(1, i64)
             vec2_i64 = T.vec(2, i64)
 
             acc_init = (
@@ -1911,7 +1862,7 @@ def compile_mixed_moe_gemm2(
             # fly.make_shape requires i32/i64, not index
             m_i32_v = arith.index_cast(T.i32, m_in)
             k_i32_v = i32_k_in.ir_value()
-            layout_x = fx.make_layout((m_i32_v, k_i32_v), stride=(k_i32_v, 1))
+            _layout_x = fx.make_layout((m_i32_v, k_i32_v), stride=(k_i32_v, 1))
 
             # B preshuffle layout: [experts*model_dim, inter_dim]
             c_n_total = arith.constant(experts * model_dim, index=True)
@@ -1924,7 +1875,7 @@ def compile_mixed_moe_gemm2(
                 elem_bytes=b_elem_bytes,
             )
             layout_b = b_layout.layout_b
-            c_k0 = (k_in * arith.constant(int(a_elem_bytes), index=True)) / arith.index(
+            _c_k0 = (k_in * arith.constant(int(a_elem_bytes), index=True)) / arith.index(
                 64
             )
 
@@ -2150,12 +2101,14 @@ def compile_mixed_moe_gemm2(
                 num_x_loads = bytes_per_thread_x // x_load_bytes
                 chunk_i32 = x_load_bytes // 4  # dwords per chunk (1/2/4)
                 vec4_i32 = T.vec(4, i32)
+                vec2_i32 = T.vec(2, i32)
+                vec1_i32 = T.vec(1, i32)
 
                 c_k_div4 = (
                     (k_in / c_a_pack) * arith.constant(int(a_elem_bytes), index=True)
                 ) / arith.index(4)
                 c_k_div4_i32 = arith.index_cast(T.i32, c_k_div4)
-                layout_x_div4 = fx.make_layout(
+                _layout_x_div4 = fx.make_layout(
                     (m_i32_v, c_k_div4_i32), stride=(c_k_div4_i32, 1)
                 )
                 tile_k_dwords = (int(tile_k) * int(a_elem_bytes)) // (
@@ -2182,9 +2135,6 @@ def compile_mixed_moe_gemm2(
                         chunk_i32=chunk_i32,
                     )
 
-                vec1_i32 = T.vec(1, i32)
-                vec2_i32 = T.vec(2, i32)
-                vec4_x = T.vec(4, x_elem)
                 x_load_vec_elems = (
                     x_load_bytes if a_elem_bytes == 1 else x_load_bytes // a_elem_bytes
                 )
@@ -2290,7 +2240,7 @@ def compile_mixed_moe_gemm2(
                 n_intra_list = []
                 n_blk_list = []
                 col_g_list = []
-                c_n0 = c_n_total / arith.index(16)
+                _c_n0 = c_n_total / arith.index(16)
                 c_n0_static = experts * model_dim // 16
                 layout_n_blk_intra = fx.make_layout((c_n0_static, 16), stride=(16, 1))
 
