@@ -188,6 +188,7 @@ def _get_gpu_arch():
 # Arch sets for runtime gating
 _MFMA_ARCHS_GFX942 = {"gfx942"}  # 32x32x8, 16x16x16
 _MFMA_ARCHS_GFX942_GFX950 = {"gfx942", "gfx950"}  # 32x32x16, 16x16x32
+_MFMA_ALL = _MFMA_ARCHS_GFX942 | _MFMA_ARCHS_GFX942_GFX950  # all archs with MFMA
 
 
 # FP8/BF8 torch dtypes differ by architecture:
@@ -204,7 +205,7 @@ _FP8_LIKE_DTYPES = {
 def _get_fp8_dtype():
     """Return the correct FP8 (e4m3) torch dtype for the current GPU arch."""
     arch = _get_gpu_arch()
-    if arch == "gfx950":
+    if arch in ("gfx950", "gfx1250"):
         return torch.float8_e4m3fn
     return torch.float8_e4m3fnuz  # gfx942 default
 
@@ -212,7 +213,7 @@ def _get_fp8_dtype():
 def _get_bf8_dtype():
     """Return the correct BF8 (e5m2) torch dtype for the current GPU arch."""
     arch = _get_gpu_arch()
-    if arch == "gfx950":
+    if arch in ("gfx950", "gfx1250"):
         return torch.float8_e5m2
     return torch.float8_e5m2fnuz  # gfx942 default
 
@@ -723,8 +724,8 @@ def test_dtype_convert_fp32_fp16_vec4(mod):
     return 0
 
 
-_FP8_SUPPORTED_ARCHS = {"gfx942", "gfx950"}
-_FP4_SUPPORTED_ARCHS = {"gfx950"}
+_FP8_SUPPORTED_ARCHS = {"gfx942", "gfx950", "gfx1250"}
+_FP4_SUPPORTED_ARCHS = {"gfx950", "gfx1250"}
 
 
 def test_dtype_convert_fp32_fp8_scalar(mod):
@@ -1268,7 +1269,7 @@ def test_numeric_limits(mod):
         ("fp16", 5, 2, True, torch.float16, True),
         ("bf16", 10, 2, True, torch.bfloat16, True),
         ("fp8", 15, 1, True, fp8_dtype, False),
-        ("bf8", 20, 1, True, bf8_dtype, arch == "gfx950"),
+        ("bf8", 20, 1, True, bf8_dtype, arch in ("gfx950", "gfx1250")),
         ("i32", 25, 4, False, torch.int32, False),
         ("i16", 35, 2, False, torch.int16, False),
         ("i8", 45, 1, False, torch.int8, False),
