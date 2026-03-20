@@ -17,6 +17,7 @@ from aiter.ops.triton.utils._triton.arch_info import get_arch
 import tempfile
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 import inspect
+import csv
 
 
 def parse_profile(profile_path, useful_op_regex, reps):
@@ -75,16 +76,57 @@ def compute_roofline(
     print("=========================================")
     print(f"{out_path}...")
     print("=========================================")
+
     for val in intensity_proxy_values:
         perf = inject_proxy_and_call(val, args, kwargs)
-        perfs.append(perf)
-        tflops = perfs[-1]["flops"] / perfs[-1]["kernel_time_ns"] * 1e-3
-        tbps = perfs[-1]["bytes"] / perfs[-1]["kernel_time_ns"] * 1e-3
-        total_latency = perfs[-1]["total_time_ns"] / 1e3 / perfs[-1]["reps"]
-        kernel_latency = perfs[-1]["kernel_time_ns"] / 1e3 / perfs[-1]["reps"]
+        perfs.append((val, perf))
+
+        tflops = perf["flops"] / perf["kernel_time_ns"] * 1e-3
+        tbps = perf["bytes"] / perf["kernel_time_ns"] * 1e-3
+        total_latency = perf["total_time_ns"] / 1e3 / perf["reps"]
+        kernel_latency = perf["kernel_time_ns"] / 1e3 / perf["reps"]
         print(
-            f"{intensity_proxy_name}: {val:5d} | Total latency (us): {total_latency:.2f} | Kernel latency (us): {kernel_latency:.2f} | TFLOPS: {tflops:#.4g} | TBPS: {tbps:.2f}"
+            f"{intensity_proxy_name}: {val:5d} | "
+            f"Total latency (us): {total_latency:.2f} | "
+            f"Kernel latency (us): {kernel_latency:.2f} | "
+            f"TFLOPS: {tflops:#.4g} | "
+            f"TBPS: {tbps:.2f}"
         )
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = [
+        intensity_proxy_name, # e.g. "batch"
+        "total_latency_us",
+        "kernel_latency_us",
+        "tflops",
+        "tbps",
+        # raw counters from proton:
+        "total_time_ns",
+        "kernel_time_ns",
+        "flops",
+        "bytes",
+        "reps",
+    ]
+
+    with out_path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for val, perf in perfs:
+            row = {
+                intensity_proxy_name: val,
+                "total_latency_us": perf["total_time_ns"] / 1e3 / perf["reps"],
+                "kernel_latency_us": perf["kernel_time_ns"] / 1e3 / perf["reps"],
+                "tflops": perf["flops"] / perf["kernel_time_ns"] * 1e-3,
+                "tbps": perf["bytes"] / perf["kernel_time_ns"] * 1e-3,
+                "total_time_ns": perf["total_time_ns"],
+                "kernel_time_ns": perf["kernel_time_ns"],
+                "flops": perf["flops"],
+                "bytes": perf["bytes"],
+                "reps": perf["reps"],
+            }
+            w.writerow(row)
 
 
 def check_and_swizzle_scales(scale, N, K):
@@ -238,8 +280,12 @@ def roofline_mlp(
     num_weight_inits=1,
     name="",
 ):
-    out_path = Path(f"logs/{name}/{x_dtype}x-{w_dtype}w-TP{TP}/")
-    out_path.mkdir(parents=True, exist_ok=True)
+    # Put all outputs under logs/<name>/ and write a CSV file (not a directory-as-stem).
+    out_dir = Path("logs") / name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    out_csv = out_dir / f"{x_dtype}x-{w_dtype}w-TP{TP}.csv"
+
     compute_roofline(
         dim1,
         dim2,
@@ -253,8 +299,8 @@ def roofline_mlp(
         bench_fn=bench_mlp,  # function to benchmark
         intensity_proxy_name="batch",  # intensity proxy name
         intensity_proxy_values=batch_sizes,  # intensity proxy values to sweep
-        out_path=out_path.with_suffix(".csv"),
-    )  # output path
+        out_path=out_csv,  # output path
+    )
 
 
 def parse_args(args: list[str] | None = None):

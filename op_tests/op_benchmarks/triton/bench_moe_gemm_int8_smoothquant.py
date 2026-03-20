@@ -6,6 +6,7 @@ from pathlib import Path
 import triton.profiler as proton
 import torch
 import argparse
+import csv
 from aiter.ops.triton.moe.moe_op_gemm_int8_smoothquant import (
     moe_gemm_int8_smoothquant,
     preshuffle_weights,
@@ -27,15 +28,13 @@ def parse_profile(profile_path, useful_op_regex, reps):
     from triton.profiler import viewer
 
     gf, _, _, _ = viewer.read(profile_path)
-    # aggregate "useful" flops + bytes
     useful = gf.filter(
         f"MATCH ('*', c) WHERE c.'name' =~ '{useful_op_regex}' AND c IS LEAF"
     ).dataframe
-    bytes = int(useful["bytes"].sum())
+    bytes_ = int(useful["bytes"].sum())
     flops = int(
         sum(useful[[c for c in ["flops8", "flops16"] if c in useful.columns]].sum())
     )
-    # take all ops (incl. "not useful" ones) when computing total time
     allops = gf.filter("MATCH ('*', c) WHERE c IS LEAF").dataframe
     total_time_ns = allops["time (ns)"].sum()
     kernel_time_ns = useful["time (ns)"].sum()
@@ -43,7 +42,7 @@ def parse_profile(profile_path, useful_op_regex, reps):
         "total_time_ns": total_time_ns,
         "kernel_time_ns": kernel_time_ns,
         "flops": flops,
-        "bytes": bytes,
+        "bytes": bytes_,
         "reps": reps,
     }
 
@@ -51,12 +50,14 @@ def parse_profile(profile_path, useful_op_regex, reps):
 def compute_roofline(
     *args, bench_fn, intensity_proxy_name, intensity_proxy_values, out_path, **kwargs
 ):
-    # validate input args
+    """
+    Sweeps intensity_proxy_values by injecting them into bench_fn, prints summary, and writes a CSV to out_path.
+    """
     if not isinstance(intensity_proxy_name, str):
         raise TypeError(
             "intensity_proxy must be a string naming a parameter in target_fn"
         )
-    # determine position of intensity_proxy in target_fn signature
+
     sig = inspect.signature(bench_fn)
     params = list(sig.parameters.values())
     if intensity_proxy_name not in sig.parameters:
@@ -65,27 +66,64 @@ def compute_roofline(
         )
     pos_index = [p.name for p in params].index(intensity_proxy_name)
 
-    # wrapper to inject intensity proxy into target_fn and call it
-    def inject_proxy_and_call(val, args, kwargs):
-        args_list = list(args)
+    def inject_proxy_and_call(val, args_, kwargs_):
+        args_list = list(args_)
         args_list.insert(pos_index, val)
-        return bench_fn(*args_list, **kwargs)
+        return bench_fn(*args_list, **kwargs_)
 
-    # collect performance data
-    perfs = []
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    results = []  # list[(proxy_val, perf_dict)]
     print("=========================================")
-    print(f"{out_path   }...")
+    print(f"{out_path}...")
     print("=========================================")
     for val in intensity_proxy_values:
         perf = inject_proxy_and_call(val, args, kwargs)
-        perfs.append(perf)
-        tflops = perfs[-1]["flops"] / perfs[-1]["kernel_time_ns"] * 1e-3
-        tbps = perfs[-1]["bytes"] / perfs[-1]["kernel_time_ns"] * 1e-3
-        total_latency = perfs[-1]["total_time_ns"] / 1e3 / perfs[-1]["reps"]
-        kernel_latency = perfs[-1]["kernel_time_ns"] / 1e3 / perfs[-1]["reps"]
+        results.append((val, perf))
+
+        tflops = perf["flops"] / perf["kernel_time_ns"] * 1e-3
+        tbps = perf["bytes"] / perf["kernel_time_ns"] * 1e-3
+        total_latency_us = perf["total_time_ns"] / 1e3 / perf["reps"]
+        kernel_latency_us = perf["kernel_time_ns"] / 1e3 / perf["reps"]
         print(
-            f"{intensity_proxy_name}: {val:5d} | Total latency (us): {total_latency:.2f} | Kernel latency (us): {kernel_latency:.2f} | TFLOPS: {tflops:#.4g} | TBPS: {tbps:.2f}"
+            f"{intensity_proxy_name}: {val:5d} | "
+            f"Total latency (us): {total_latency_us:.2f} | "
+            f"Kernel latency (us): {kernel_latency_us:.2f} | "
+            f"TFLOPS: {tflops:#.4g} | "
+            f"TBPS: {tbps:.2f}"
         )
+
+    fieldnames = [
+        intensity_proxy_name,  # e.g. "batch"
+        "total_latency_us",
+        "kernel_latency_us",
+        "tflops",
+        "tbps",
+        "total_time_ns",
+        "kernel_time_ns",
+        "flops",
+        "bytes",
+        "reps",
+    ]
+    with out_path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for val, perf in results:
+            w.writerow(
+                {
+                    intensity_proxy_name: val,
+                    "total_latency_us": perf["total_time_ns"] / 1e3 / perf["reps"],
+                    "kernel_latency_us": perf["kernel_time_ns"] / 1e3 / perf["reps"],
+                    "tflops": perf["flops"] / perf["kernel_time_ns"] * 1e-3,
+                    "tbps": perf["bytes"] / perf["kernel_time_ns"] * 1e-3,
+                    "total_time_ns": perf["total_time_ns"],
+                    "kernel_time_ns": perf["kernel_time_ns"],
+                    "flops": perf["flops"],
+                    "bytes": perf["bytes"],
+                    "reps": perf["reps"],
+                }
+            )
 
 
 def bench_mlp_single_weight_init(
@@ -105,23 +143,18 @@ def bench_mlp_single_weight_init(
 
     assert dim2 % TP == 0, f"{dim2=}, {TP=}, dim2 must be divisible by TP"
 
-    # -- init data --
-    # weights
     wg = torch.randn((dim1, n_expts_tot), device=dev, dtype=torch.bfloat16)
     w1 = torch.randn((n_expts_tot, dim1, dim2 // TP), device=dev, dtype=torch.bfloat16)
     w2 = torch.randn(
         (n_expts_tot, dim2 // TP // 2, dim1), device=dev, dtype=torch.bfloat16
     )
-    # biases
     bg = torch.randn((n_expts_tot,), device=dev, dtype=torch.bfloat16)
 
-    # smoothQuant scales
     fc1_smooth_scale = torch.randn((dim1,), device=dev, dtype=torch.float32).abs() + 0.1
     fc2_smooth_scale = (
         torch.randn((dim2 // TP // 2,), device=dev, dtype=torch.float32).abs() + 0.1
     )
 
-    # -- numerics --
     w1_int8, w1_scale = quantize_weights_int8(w1)
     w2_int8, w2_scale = quantize_weights_int8(w2)
     w1_int8 = w1_int8.transpose(1, 2).contiguous().transpose(1, 2)
@@ -129,7 +162,7 @@ def bench_mlp_single_weight_init(
     if preshuffled:
         w1_int8 = preshuffle_weights(w1_int8)
         w2_int8 = preshuffle_weights(w2_int8)
-    # -- benchmark --
+
     reps = 100
     x = torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev)
     xg = x
@@ -137,7 +170,7 @@ def bench_mlp_single_weight_init(
     fpath = Path(tempfile.mktemp())
     proton.start(str(fpath), hook="triton")
 
-    for i in range(reps):
+    for _ in range(reps):
         logits = gemm_a16w16(xg, wg.T, bg)
         rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
 
@@ -172,6 +205,7 @@ def bench_mlp_single_weight_init(
             apply_activation=False,
             add_residual=False,
         )
+
     proton.finalize()
     return parse_profile(
         fpath.with_suffix(".hatchet"), useful_op_regex=op_regex, reps=reps
@@ -192,7 +226,7 @@ def bench_mlp(
     num_weight_inits=1,
 ):
     all_results = []
-    for i in range(num_weight_inits):
+    for _ in range(num_weight_inits):
         result = bench_mlp_single_weight_init(
             batch,
             dim1,
@@ -233,8 +267,12 @@ def roofline_mlp(
     num_weight_inits=1,
     name="",
 ):
-    out_path = Path(f"logs/{name}/{x_dtype}x-{w_dtype}w-TP{TP}/")
-    out_path.mkdir(parents=True, exist_ok=True)
+    # Avoid creating an empty directory named like the output CSV stem.
+    out_dir = Path("logs") / name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    out_csv = out_dir / f"{x_dtype}x-{w_dtype}w-TP{TP}.csv"
+
     compute_roofline(
         dim1,
         dim2,
@@ -244,13 +282,13 @@ def roofline_mlp(
         x_dtype,
         w_dtype,
         TP,
-        op_regex,  # fixed args
+        op_regex,
         num_weight_inits,
-        bench_fn=bench_mlp,  # function to benchmark
-        intensity_proxy_name="batch",  # intensity proxy name
-        intensity_proxy_values=batch_sizes,  # intensity proxy values to sweep
-        out_path=out_path.with_suffix(".csv"),
-    )  # output path
+        bench_fn=bench_mlp,
+        intensity_proxy_name="batch",
+        intensity_proxy_values=batch_sizes,
+        out_path=out_csv,
+    )
 
 
 def parse_args():
@@ -287,8 +325,7 @@ def parse_args():
         help="Number of different weight initializations to run for more stable results (default: 1). "
         "Each initialization runs 100 iterations. Use higher values (e.g., 10) for more stable benchmarks.",
     )
-    args = parser.parse_args()
-    return args
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
