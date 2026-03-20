@@ -21,6 +21,8 @@
 ### 3. M-Dependent Block Size Ranges (Critical for Performance)
 The tuning search space MUST be tailored to M. Using the full default range wastes time and misses optimal configs for large M.
 
+**For fp8 kernels (1 byte/element):**
+
 | M Range | BLOCK_SIZE_M | BLOCK_SIZE_N | BLOCK_SIZE_K |
 |---------|-------------|-------------|-------------|
 | M <= 16 | 4, 8, 16 | 16, 32 | 256, 512, 1024 |
@@ -28,9 +30,22 @@ The tuning search space MUST be tailored to M. Using the full default range wast
 | M 128-512 | 64, 128, 256 | 64, 128 | 128, 256 |
 | M >= 1024 | 128, 256, 512 | 128, 256 | 128, 256 |
 
+**For bf16 kernels (2 bytes/element) — MUST include BK=64:**
+
+| M Range | BLOCK_SIZE_M | BLOCK_SIZE_N | BLOCK_SIZE_K |
+|---------|-------------|-------------|-------------|
+| M <= 16 | 4, 8, 16 | 16, 32 | 128, 256 |
+| M 32-64 | 16, 32, 64 | 32, 64 | 64, 128, 256 |
+| M 128-512 | 64, 128, 256 | 64, 128 | 64, 128 |
+| M >= 1024 | 128, 256, 512 | 128, 256 | **64**, 128 |
+
+**Critical learning from a16w16:** For large M with bf16, reducing BK from 128 to **64** halves LDS per tile, enabling BM=256 and BN=128/256 with num_stages=3. This is dramatically faster than BK=128 with BM=128 and num_stages=2. Example: `(256*64 + 128*64) * 2 * 3 = 147456 bytes` fits in 160KB LDS.
+
+The tuning script MUST include BK=64 in `--block-size-k-range` for bf16 kernels, especially for large M. Without it, the tuner is blind to the best configs.
+
 ### 4. num_stages
-- `num_stages=3` is optimal for most shapes on Triton 3.6
-- `num_stages=2` is close second, sometimes wins for large M
+- `num_stages=3` is optimal for most shapes on Triton 3.6, even with smaller BK
+- `num_stages=2` is close second, sometimes wins for large M with large BK
 - Always sweep `--num-stages-range 2 3`
 
 ### 5. GPU Assignment
@@ -94,21 +109,23 @@ for i in 0 1 2 3; do
 done
 
 # Medium M (128-512): use medium blocks
+# For bf16: include BK=64 to enable larger BM/BN with num_stages=3
 for i in 4 5 6; do
     M_VALS=(128 256 512)
     M=${M_VALS[$((i-4))]}
     python screen.py $M 8192 8192 $i ut_<variant>_gemm.py \
         --block-size-m-range 64 128 256 \
         --block-size-n-range 64 128 \
-        --block-size-k-range 128 256 \
+        --block-size-k-range 64 128 256 \
         --num-stages-range 2 3 > /dev/null 2>&1 &
 done
 
 # Large M (8192): use large blocks
+# For bf16: BK=64 is CRITICAL — enables BM=256, BN=128/256 with num_stages=3
 python screen.py 8192 8192 8192 7 ut_<variant>_gemm.py \
     --block-size-m-range 128 256 512 \
     --block-size-n-range 128 256 \
-    --block-size-k-range 128 256 \
+    --block-size-k-range 64 128 256 \
     --num-stages-range 2 3 > /dev/null 2>&1 &
 
 wait  # Wait for all GPUs to finish
