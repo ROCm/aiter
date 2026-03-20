@@ -223,17 +223,14 @@ class AITER_CONFIG(object):
             if "cu_num" not in keys:
                 keys.append("cu_num")
             dedup_keys = keys + ["_tag"] if has_tag else keys
-            sorted_df = merge_df.sort_values("us")
-            duplicated_mask = sorted_df.duplicated(subset=dedup_keys, keep="first")
+            duplicated_mask = merge_df.duplicated(subset=dedup_keys, keep=False)
             if duplicated_mask.any():
-                dup_rows = sorted_df[duplicated_mask]
-                logger.warning(
-                    f"Dropping {len(dup_rows)} duplicate rows during merge of '{merge_name}':\n"
-                    f"{dup_rows.to_string(index=False)}"
+                dup_rows = merge_df[duplicated_mask].sort_values(dedup_keys)
+                assert False, (
+                    f"Found {duplicated_mask.sum()} duplicate shape entries during merge of '{merge_name}'. "
+                    f"Please remove duplicates from configs/ or model_configs/ and keep only the best performing one.\n"
+                    f"Duplicate rows:\n{dup_rows.to_string(index=False)}"
                 )
-            merge_df = sorted_df.drop_duplicates(
-                subset=dedup_keys, keep="first"
-            ).reset_index(drop=True)
         else:
             logger.warning(
                 f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
