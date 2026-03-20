@@ -65,15 +65,14 @@ std::string get_kernel_co_name(const std::string& cfg_co_name, const std::string
     std::string co_name = cfg_co_name;
     if(arch_id == "gfx942")
     {
-        auto pos        = cfg_co_name.rfind('/');
-        uint32_t cu_num = get_num_cu_func();
-        if(cu_num == 304)
-        {
-            co_name = cfg_co_name.substr(0, pos + 1) + "MI300/" + cfg_co_name.substr(pos + 1);
-        }
-        else if(cu_num == 80 || cu_num == 64)
+        auto pos = cfg_co_name.rfind('/');
+        if(is_mi308_device())
         {
             co_name = cfg_co_name.substr(0, pos + 1) + "MI308/" + cfg_co_name.substr(pos + 1);
+        }
+        else
+        {
+            co_name = cfg_co_name.substr(0, pos + 1) + "MI300/" + cfg_co_name.substr(pos + 1);
         }
     }
     return co_name;

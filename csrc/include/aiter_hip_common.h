@@ -2,6 +2,8 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #include "aiter_logger.h"
+#include "aiter_enum.h"
+#include "aiter_tensor.h"
 #if DISABLE_CK
 #include "ck_tile_shim.h"
 #else
@@ -28,6 +30,26 @@ enum class GPUArch
             std::cerr << "check failed, file=" << __FILE__ << ", line=" << __LINE__ << std::endl; \
             std::terminate();                                                                     \
         }                                                                                         \
+    } while(0)
+
+namespace aiter_detail {
+template <typename... Args>
+inline void check_print(std::ostream& os, Args&&... args)
+{
+    (os << ... << std::forward<Args>(args));
+}
+} // namespace aiter_detail
+
+#define AITER_CHECK(x, ...)                                                                        \
+    do                                                                                             \
+    {                                                                                              \
+        if(!(x))                                                                                   \
+        {                                                                                          \
+            std::cerr << "[AITER] " << __FILE__ << ":" << __LINE__ << " ";                         \
+            aiter_detail::check_print(std::cerr, __VA_ARGS__);                                     \
+            std::cerr << std::endl;                                                                \
+            std::terminate();                                                                      \
+        }                                                                                          \
     } while(0)
 
 #define HIP_CALL(call)                                                       \
@@ -215,4 +237,25 @@ static uint32_t get_num_cu_func()
     };
     static const uint32_t num_cu = get_num_cu_local();
     return num_cu;
+}
+
+static int get_pci_chip_id()
+{
+    static const int chip_id = []() {
+        hipDevice_t dev;
+        int id = 0;
+        HIP_CALL(hipGetDevice(&dev));
+        HIP_CALL(hipDeviceGetAttribute(&id, hipDeviceAttributePciChipId, dev));
+        AITER_LOG_INFO("pciChipId: 0x" << std::hex << id << std::dec
+                       << ", CU count: " << get_num_cu_func());
+        return id;
+    }();
+    return chip_id;
+}
+
+static bool is_mi308_device()
+{
+    int chip_id = get_pci_chip_id();
+    return chip_id == 0x74a2 || chip_id == 0x74a8 ||
+           chip_id == 0x74b6 || chip_id == 0x74bc;
 }

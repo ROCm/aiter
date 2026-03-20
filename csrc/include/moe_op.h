@@ -1,6 +1,6 @@
 #pragma once
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_enum.h"
 #include <torch/extension.h>
 
@@ -112,8 +112,8 @@ void fmoe_int8_g1u0_a16(torch::Tensor& out,               // [token_cnt, dim]
                         torch::Tensor& fc1_scale,         // [expert, 1, hidden_dim]
                         torch::Tensor& fc2_scale,         // [expert, 1, dim]
                         torch::Tensor& fc1_smooth_scale,  // [expert, 1, hidden_dim]
-                        torch::Tensor& fc2_smooth_scale   // [expert, 1, hidden_dim]
-);
+                        torch::Tensor& fc2_smooth_scale,  // [expert, 1, hidden_dim]
+                        ActivationType activation = ActivationType::Silu);
 void fmoe_g1u1_a16(torch::Tensor& out,               // [token_cnt, dim]
                    torch::Tensor& input,             // [token_cnt, dim] M,K
                    torch::Tensor& gate,              // [expert, inter_dim, dim] N,K
