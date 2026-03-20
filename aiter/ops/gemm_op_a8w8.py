@@ -128,7 +128,11 @@ def gemm_a8w8_asm(
     splitK: Optional[int] = None,
 ) -> Tensor:
     _gemm_a8w8_asm(
-        XQ, WQ, x_scale, w_scale, Out,
+        XQ, 
+        WQ, 
+        x_scale, 
+        w_scale, 
+        Out,
         kernelName if kernelName else None,
         bias,
         bool(bpreshuffle) if bpreshuffle is not None else True,
