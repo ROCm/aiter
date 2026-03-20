@@ -267,14 +267,55 @@ torch::Tensor gemm_a8w8_asm(torch::Tensor& A,       // A:[M, K] i8
     else
         TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
 
-    impl_ptr->launch_kernel({&args,
-                             &arg_size,
-                             gdx / blockSizeX, // gdx
-                             gdy,              // gdy
-                             gdz,              // gdz
-                             256,              // bdx: 4 wv64
-                             1,                // bdy
-                             1,                // bdz
-                             stream});
+    // The asm kernel uses 32-bit arithmetic for address offsets internally
+    // (s_mul_i32 for NUM_RECORDS and voffset). When any buffer exceeds 4GB,
+    // the 32-bit offset wraps around causing silent data corruption.
+    // Fix: split the M dimension into chunks that keep all offsets within 32-bit.
+    const uint64_t max_m_c  = stride_c > 0 ? (uint64_t)UINT32_MAX / stride_c : UINT32_MAX;
+    const uint64_t max_m_a  = stride_a > 0 ? (uint64_t)UINT32_MAX / stride_a : UINT32_MAX;
+    const uint64_t max_m_sa = (uint64_t)UINT32_MAX / sizeof(float);
+    int max_safe_m          = (int)std::min({max_m_c, max_m_a, max_m_sa});
+    if(SUBM > 0)
+        max_safe_m = (max_safe_m / SUBM) * SUBM;
+
+    if(max_safe_m > 0 && Mdim > max_safe_m)
+    {
+        for(int m_off = 0; m_off < Mdim; m_off += max_safe_m)
+        {
+            int m_chunk = std::min(max_safe_m, Mdim - m_off);
+
+            KernelArgs chunk_args = args;
+            chunk_args.ptr_c  = (void*)((char*)args.ptr_c + (int64_t)m_off * stride_c);
+            chunk_args.ptr_a  = (void*)((char*)args.ptr_a + (int64_t)m_off * stride_a);
+            chunk_args.ptr_sa = (void*)((float*)args.ptr_sa + m_off);
+            chunk_args.m      = m_chunk;
+
+            size_t chunk_arg_size = sizeof(chunk_args);
+            int chunk_gdy         = (m_chunk + SUBM - 1) / SUBM;
+
+            impl_ptr->launch_kernel({&chunk_args,
+                                     &chunk_arg_size,
+                                     gdx / blockSizeX,
+                                     chunk_gdy,
+                                     gdz,
+                                     256,
+                                     1,
+                                     1,
+                                     stream});
+        }
+    }
+    else
+    {
+        impl_ptr->launch_kernel({&args,
+                                 &arg_size,
+                                 gdx / blockSizeX,
+                                 gdy,
+                                 gdz,
+                                 256,
+                                 1,
+                                 1,
+                                 stream});
+    }
+
     return out;
 }
