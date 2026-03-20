@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Optional
 
@@ -115,7 +115,7 @@ def layernorm2d_fwd_with_add_smoothquant(
 #     bias: Tensor,
 #     epsilon: float,
 #     x_bias: Optional[Tensor] = None,):...
-@compile_ops("module_norm")
+@compile_ops("module_asm_layernorm", ffi_type="ctypes")
 def layernorm2d_with_add_asm(
     out: Tensor,
     input: Tensor,
@@ -128,7 +128,10 @@ def layernorm2d_with_add_asm(
 ) -> None: ...
 
 
-@compile_ops("module_norm")
+@compile_ops(
+    "module_asm_layernorm",
+    ffi_type="ctypes",
+)
 def layernorm2d_with_add_smoothquant_asm(
     out: Tensor,
     input: Tensor,
