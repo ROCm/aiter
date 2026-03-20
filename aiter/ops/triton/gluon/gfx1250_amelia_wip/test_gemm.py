@@ -3,7 +3,7 @@
 
 import torch
 import pytest
-from aiter.ops.triton.gluon.gfx1250_amelia_wip.gemma8w8_1250_v2 import (
+from aiter.ops.triton.gluon.gfx1250_amelia_wip.gemma8w8_1250_v3 import (
     gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
 )
 from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
@@ -234,4 +234,5 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
     print(a)
     print(b)
     torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
-test_gemm("bf16", 32, 5120, 2944, "TN", True, "gluon")
+#test_gemm("bf16", 32, 5120, 2880, "TN", True, "gluon")
+test_gemm("bf16", 2048, 5120, 2880, "TN", True, "gluon")

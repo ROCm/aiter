@@ -225,7 +225,6 @@ def _gemm_a8w8_blockscale_kernel(
         order=[0, 1],
     )
 
-    # TODO: i think the issue is that this is 64 so it's now twice as long, and the scales don't see that
     wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(3, True, warp_bases, [], [16, 16, 64])
 
 
