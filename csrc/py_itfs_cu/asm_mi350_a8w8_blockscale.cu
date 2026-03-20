@@ -2,11 +2,7 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
-#include <torch/all.h>
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "aiter_hip_common.h"
-#include "hip_float8.h"
 
 struct __attribute__((packed)) KernelArgs
 {
@@ -58,64 +54,59 @@ struct __attribute__((packed)) KernelArgs
     p2 _p22;
 };
 
-using namespace hip_fp8_impl;
-torch::Tensor mi350_a8w8_blockscale_asm(
-    torch::Tensor &XQ,      // [M, K]
-    torch::Tensor &WQ,      // [N, K] -> [N/128, K*128]
-    torch::Tensor &x_scale, // [K/128, M]
-    torch::Tensor &w_scale, // [K/128, N/128]
-    torch::Tensor &out      // Out:[M, N] fp16
-)
+extern "C" __attribute__((visibility("default"))) void mi350_a8w8_blockscale_asm(
+    AiterTensor *XQ,      // [M, K]
+    AiterTensor *WQ,      // [N, K] -> [N/128, K*128]
+    AiterTensor *x_scale, // [K/128, M]
+    AiterTensor *w_scale, // [K/128, N/128]
+    AiterTensor *out,     // Out:[M, N] bf16
+    hipStream_t  stream)
 {
     int TileM = 128;
     constexpr int TileN = 128;
     constexpr int TileK = 128;
 
-    int m = XQ.size(0);
-    int n = out.size(1);
-    int k = XQ.size(1);
-   if (m <= 32)
-       TileM = 32;
-    TORCH_CHECK(out.dtype() == torch::ScalarType::BFloat16,
+    int m = XQ->size(0);
+    int n = out->size(1);
+    int k = XQ->size(1);
+    if (m <= 32)
+        TileM = 32;
+    AITER_CHECK(out->dtype() == AITER_DTYPE_bf16,
                 "mi350 a8w8 blockscale asm only support Half output now!");
-    TORCH_CHECK(n % TileN == 0 && k % TileK == 0, 
+    AITER_CHECK(n % TileN == 0 && k % TileK == 0,
                 "mi350 a8w8 blockscale asm only suuport 128x256x128 tile now!");
-    TORCH_CHECK(m >= 16,
+    AITER_CHECK(m >= 16,
                 "mi350 a8w8 blockscale asm only suuport m>=16 now!");
-    TORCH_CHECK(k >=512,
+    AITER_CHECK(k >= 512,
                 "mi350 a8w8 blockscale asm only suuport k>=512 now!");
     KernelArgs args;
     size_t arg_size = sizeof(args);
 
-    args.ptr_X = (void *)XQ.data_ptr();
-    args.ptr_W = (void *)WQ.data_ptr();
-    args.ptr_XQ = (void *)x_scale.data_ptr();
-    args.ptr_WQ = (void *)w_scale.data_ptr();
-    args.ptr_C = (void *)out.data_ptr();
+    args.ptr_X = XQ->ptr;
+    args.ptr_W = WQ->ptr;
+    args.ptr_XQ = x_scale->ptr;
+    args.ptr_WQ = w_scale->ptr;
+    args.ptr_C = out->ptr;
     args.K = k;
     args.N = n;
     args.M = m;
     args.eprt_cnt = 1;
-    args.Xs = k * XQ.element_size();
-    args.Ws = k * XQ.element_size();
+    args.Xs = k * XQ->element_size();
+    args.Ws = k * XQ->element_size();
     args.Cs = n * 2;
     args.splitk = 0;
     args.activation = 0;
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(XQ));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-    // printf("ptr_X: %p\n", args.ptr_X);
-    // printf("ptr_GU: %p\n", args.ptr_GU);
-    // printf("ptr_XQ: %p\n", args.ptr_XQ);
-    // printf("ptr_GUQ: %p\n", args.ptr_GUQ);
-    // printf("args.Xs: %d\n", args.Xs);
-    // printf("args.token_cnt: %d\n", args.token_cnt);
+
+    int prev_device;
+    HIP_CALL(hipGetDevice(&prev_device));
+    HIP_CALL(hipSetDevice(XQ->device_id));
+
     AiterAsmKernel *impl_ptr = nullptr;
     static AiterAsmKernel impl_kenrel_x128("f8_block_scale_mi350_x128", "f8_block_scale_mi350_x128.co");
     static AiterAsmKernel impl_kenrel_x32("f8_block_scale_mi350_x32", "f8_block_scale_mi350_x32.co");
-    impl_ptr = (m <= 32)?&impl_kenrel_x32:&impl_kenrel_x128;
+    impl_ptr = (m <= 32) ? &impl_kenrel_x32 : &impl_kenrel_x128;
     int gdx = (n + TileN*2 - 1) / (TileN*2);
     int gdy = (m + TileM - 1) / TileM;
-   // printf("gdx: %d, gdy:%d, \n", gdx, gdy);
     impl_ptr->launch_kernel({&args,
                              &arg_size,
                              gdx,   // gdx
@@ -124,7 +115,7 @@ torch::Tensor mi350_a8w8_blockscale_asm(
                              256,   // bdx: 4 wv64
                              1,     // bdy
                              1,     // bdz
-                             stream});                                 
+                             stream});
 
-    return out;
+    HIP_CALL(hipSetDevice(prev_device));
 }
