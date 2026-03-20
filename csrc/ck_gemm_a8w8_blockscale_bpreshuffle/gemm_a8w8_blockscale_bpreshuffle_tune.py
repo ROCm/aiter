@@ -101,7 +101,6 @@ class Gemma8W8BlockScaleBPreShuffleTuner(GemmCommonTuner):
     def run_config(self, args):
         from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_bpreshuffle
         from aiter.test_common import run_perftest, checkAllclose
-        import pandas as pd
 
         untunedf = self.untunedf
         results = []

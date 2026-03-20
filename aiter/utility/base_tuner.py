@@ -25,7 +25,7 @@ def _read_csv(filepath, **kwargs):
     df = df.loc[:, ~df.columns.str.startswith("Unnamed:")]
     str_cols = df.select_dtypes(include=["object"]).columns
     for col in str_cols:
-        df[col] = df[col].str.strip()
+        df[col] = df[col].apply(lambda v: v.strip() if isinstance(v, str) else v)
     df.dropna(how="all", inplace=True)
     return df
 
@@ -491,6 +491,7 @@ class TunerCommon:
         # and clear module caches so operators rebuild with new config
         from aiter.jit import core as jit_core
 
+        old_rebuild = jit_core.AITER_REBUILD
         jit_core.AITER_REBUILD = 2
         jit_core.get_module.cache_clear()
         # Reset rebuilded_list so all modules get rebuilt on next call
@@ -501,9 +502,9 @@ class TunerCommon:
             mds.clear()
         # Clear get_config_file lru_cache so it re-reads the env var
         jit_core.AITER_CONFIGS.get_config_file.cache_clear()
-        return old_val
+        return old_val, old_rebuild
 
-    def _restore_config_env(self, env_name, old_val):
+    def _restore_config_env(self, env_name, old_val, old_rebuild=0):
         """Restore the config env var and AITER_REBUILD to original values."""
         if env_name is None:
             return
@@ -511,11 +512,10 @@ class TunerCommon:
             os.environ.pop(env_name, None)
         else:
             os.environ[env_name] = old_val
-        # Restore AITER_REBUILD to 0
         try:
             from aiter.jit import core as jit_core
 
-            jit_core.AITER_REBUILD = 0
+            jit_core.AITER_REBUILD = old_rebuild
         except ImportError:
             pass
 
@@ -550,7 +550,6 @@ class TunerCommon:
             shape = pre["shape"]
             post = post_map.get(shape)
             pre_us = pre.get("us", -1)
-            pre_status = pre.get("status", "error")
             if post is None:
                 logger.info(
                     f"{shape:<40} | {pre_us:>13.2f} | {'N/A':>14} | {'N/A':>8} | {'MISS':>8}"
@@ -602,7 +601,7 @@ class TunerCommon:
             if args.compare:
                 defaults = self.get_arg_defaults()
                 env_name = defaults.get("config_env_name")
-                old_val = self._set_config_env_for_run_config(args)
+                old_val, old_rebuild = self._set_config_env_for_run_config(args)
                 try:
                     logger.info("=== Running post-tune benchmark (verification) ===")
                     post_tune_results = self.run_config(args)
@@ -610,7 +609,7 @@ class TunerCommon:
                     if pre_tune_results:
                         self._print_comparison(pre_tune_results, post_tune_results)
                 finally:
-                    self._restore_config_env(env_name, old_val)
+                    self._restore_config_env(env_name, old_val, old_rebuild)
             return self.tunedf if self.tunedf is not None else pd.DataFrame()
         batch_size = min(args.batch, len(self.untunedf))
         total_batches = (len(self.untunedf) + batch_size - 1) // batch_size
@@ -661,7 +660,7 @@ class TunerCommon:
             if args.compare:
                 defaults = self.get_arg_defaults()
                 env_name = defaults.get("config_env_name")
-                old_val = self._set_config_env_for_run_config(args)
+                old_val, old_rebuild = self._set_config_env_for_run_config(args)
                 try:
                     logger.info("=== Running post-tune benchmark (verification) ===")
                     post_tune_results = self.run_config(args)
@@ -669,7 +668,7 @@ class TunerCommon:
                     if pre_tune_results:
                         self._print_comparison(pre_tune_results, post_tune_results)
                 finally:
-                    self._restore_config_env(env_name, old_val)
+                    self._restore_config_env(env_name, old_val, old_rebuild)
             if tune_exit is not None:
                 raise tune_exit
 
