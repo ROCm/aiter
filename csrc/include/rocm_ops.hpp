@@ -42,6 +42,14 @@ namespace py = pybind11;
     m.def("sigmoid", &aiter_sigmoid, "apply for sigmoid."); \
     m.def("tanh", &aiter_tanh, "apply for tanh.");
 
+#define VADD_ASM_PYBIND                        \
+    m.def("vadd_asm",                            \
+          &vadd_asm,                             \
+          "Vector add (fp32) via HSACO vadd_kernel.", \
+          py::arg("a"),                          \
+          py::arg("b"),                          \
+          py::arg("c"));
+
 #define ATTENTION_ASM_PYBIND                        \
     m.def("pa_fwd_asm",                             \
           &pa_fwd,                                  \

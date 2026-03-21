@@ -1,0 +1,2 @@
+knl_name,co_name,tile_m,tile_n
+vadd_kernel,k_vadd.co,16,16
