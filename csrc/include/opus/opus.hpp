@@ -956,8 +956,8 @@ OPUS_D constexpr unsigned short fp32_to_bf16_rtn_raw(float f)
     else if(bits & 0xffff) { bits |= 0x10000; /* Preserve signaling NaN */ }
     return static_cast<unsigned short>(bits >> 16);
 }
-#if defined(__gfx950__) && __clang_major__ >= 20
-template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // gfx950 has instruction conversion, leave 'rm' here for compatiblity
+#if (defined(__gfx950__) || defined(__GFX12__)) && __clang_major__ >= 20
+template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // gfx950/gfx12 has instruction conversion, leave 'rm' here for compatiblity
 OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) { return static_cast<bf16_t>(x); }
 #else
 template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // 0:standard, 1:truncate_with_nan, 2:truncate, 3:standard asm 4:rta_asm(round to nearest away)
@@ -1159,6 +1159,55 @@ OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& s, float scale = 
 }
 template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp4_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_bf16_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) { return __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(s, scale, sel); }
+#elif defined(__GFX12__)
+// gfx1250: pk8 builtins convert 8 fp4 <-> 8 f32 at once
+// f32->fp4: __builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(v8f32 src, float scale) -> i32
+// fp4->f32: __builtin_amdgcn_cvt_scale_pk8_f32_fp4(i32 src, i32 scale_sel, i32 imm) -> v8f32
+//   scale_sel = e8m0 scale byte (imm selects which byte), e8m0: val = 2^(byte-127), so 1.0 = 0x7F
+//   extract e8m0 from float: biased exponent = (float_bits >> 23) & 0xFF
+template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) {
+    fp32x8_t v{s[0], s[1], 0, 0, 0, 0, 0, 0};
+    u32_t w = __builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(v, scale);
+    return __builtin_bit_cast(array<fp4_t, 1>, static_cast<u8_t>(w));
+}
+template<typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x4(const S& s, float scale = 1.0f) {
+    fp32x8_t v{s[0], s[1], s[2], s[3], 0, 0, 0, 0};
+    u32_t w = __builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(v, scale);
+    return __builtin_bit_cast(array<fp4_t, 2>, static_cast<u16_t>(w));
+}
+template<typename S, std::enable_if_t<std::is_same_v<S, fp32x8_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x8(const S& s, float scale = 1.0f) {
+    u32_t w = __builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(s, scale);
+    return __builtin_bit_cast(array<fp4_t, 4>, w);
+}
+template<typename S, index_t sel = 0, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 1>>, bool> = true>
+OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) {
+    i32_t e = (__builtin_bit_cast(i32_t, scale) >> 23) & 0xFF;
+    i32_t scale_e8m0 = e * static_cast<i32_t>(0x01010101);
+    fp32x8_t r = __builtin_amdgcn_cvt_scale_pk8_f32_fp4(static_cast<i32_t>(__builtin_bit_cast(u8_t, s)), scale_e8m0, 0);
+    return fp32x2_t{r[0], r[1]};
+}
+template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 2>>, bool> = true>
+OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x4(const S& s, float scale = 1.0f) {
+    i32_t e = (__builtin_bit_cast(i32_t, scale) >> 23) & 0xFF;
+    i32_t scale_e8m0 = e * static_cast<i32_t>(0x01010101);
+    fp32x8_t r = __builtin_amdgcn_cvt_scale_pk8_f32_fp4(static_cast<i32_t>(__builtin_bit_cast(u16_t, s)), scale_e8m0, 0);
+    return fp32x4_t{r[0], r[1], r[2], r[3]};
+}
+template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>>, bool> = true>
+OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x8(const S& s, float scale = 1.0f) {
+    i32_t e = (__builtin_bit_cast(i32_t, scale) >> 23) & 0xFF;
+    i32_t scale_e8m0 = e * static_cast<i32_t>(0x01010101);
+    fp32x8_t r = __builtin_amdgcn_cvt_scale_pk8_f32_fp4(static_cast<i32_t>(__builtin_bit_cast(u32_t, s)), scale_e8m0, 0);
+    return fp32x8_t{r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]};
+}
+// bf16<->fp4 stubs for gfx1250 (no pk bf16<->fp4 builtins available)
+template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, bf16x2_t>, bool> = true>
+OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f, number<sel> = {}) { return fp4_t{}; }
+template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp4_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp4_to_bf16_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f, number<sel> = {}) { return bf16x2_t{}; }
 #else
 template<typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 1>{}; }
 template<typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x4(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 2>{}; }
@@ -1415,10 +1464,10 @@ struct gmem {
     template<index_t vec = 1, index_t aux = 0>   // os in unit of byte
     OPUS_D void _async_load(OPUS_LDS_ADDR void* dst, int v_os, int s_os = 0, number<aux> = {}) {
         using type = vector_type<vec>;
-#if OPUS_GFX1250_DISABLED
-        // Fallback: synchronous load from global to LDS via registers
-        auto val = *reinterpret_cast<const type*>(res_ptr + v_os + s_os);
-        *reinterpret_cast<OPUS_LDS_ADDR type*>(dst) = val;
+#if defined(__GFX12__)
+        // gfx12 does not have vmem-to-lds-load-insts; fallback to synchronous load + LDS store
+        auto val = _load<vec>(v_os, s_os, number<aux>{});
+        *reinterpret_cast<OPUS_LDS_ADDR vector_type<vec>*>(dst) = val;
 #elif __clang_major__ >= 20   // start from rocm 7.0,introduced by https://github.com/llvm/llvm-project/pull/132048, 133055, 132957
         if      constexpr (sizeof(type) == 1)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  1, v_os, s_os, 0, aux); }
         else if constexpr (sizeof(type) == 2)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  2, v_os, s_os, 0, aux); }
@@ -1750,13 +1799,32 @@ OPUS_D void async_load_if(Mem& mem, Args&&... args) { mem.template async_load_if
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // waitcnt
-// vmcnt=0~63([15:14],[3:0]), lgkmcnt=0~15([11:8]), expcnt=0~7([6:4])
+#if defined(__GFX12__)
+// gfx12 uses separate wait instructions: s_wait_loadcnt, s_wait_storecnt, s_wait_dscnt, etc.
+// __builtin_amdgcn_s_waitcnt is not supported; use inline asm for gfx12.
+template <index_t vmcnt, index_t lgkmcnt, index_t expcnt = 0>
+OPUS_D void s_waitcnt(number<vmcnt>, number<lgkmcnt>, number<expcnt> = {}) {
+    // On gfx12, vmcnt maps to s_wait_loadcnt, lgkmcnt maps to s_wait_dscnt
+    if constexpr (vmcnt == 0)   { asm volatile("s_wait_loadcnt 0" ::: "memory"); }
+    if constexpr (lgkmcnt == 0) { asm volatile("s_wait_dscnt 0" ::: "memory"); }
+    if constexpr (expcnt == 0)  { asm volatile("s_wait_expcnt 0" ::: "memory"); }
+}
+
+template <index_t vmcnt>   OPUS_D void s_waitcnt_vmcnt(number<vmcnt>) {
+    if constexpr (vmcnt == 0) { asm volatile("s_wait_loadcnt 0" ::: "memory"); }
+}
+template <index_t lgkmcnt> OPUS_D void s_waitcnt_lgkmcnt(number<lgkmcnt>) {
+    if constexpr (lgkmcnt == 0) { asm volatile("s_wait_dscnt 0" ::: "memory"); }
+}
+#else
+// gfx9: vmcnt=0~63([15:14],[3:0]), lgkmcnt=0~15([11:8]), expcnt=0~7([6:4])
 template <index_t vmcnt, index_t lgkmcnt, index_t expcnt = 7>
 OPUS_D void s_waitcnt(number<vmcnt>, number<lgkmcnt>, number<expcnt> = {})
 {   __builtin_amdgcn_s_waitcnt((((0b110000 & vmcnt) << (14 - 4)) | (0b1111 & vmcnt)) | ((0b111 & expcnt) << 4) | ((0b1111 & lgkmcnt) << 8)); }
 
 template <index_t vmcnt>   OPUS_D void s_waitcnt_vmcnt(number<vmcnt>) { s_waitcnt(number<vmcnt>{}, number<15>{}); }
 template <index_t lgkmcnt> OPUS_D void s_waitcnt_lgkmcnt(number<lgkmcnt>) { s_waitcnt(number<63>{}, number<lgkmcnt>{}); }
+#endif
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // mfma
