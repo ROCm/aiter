@@ -276,15 +276,17 @@ FMoeKernel* get_heuristic_kernel(
                 {
                     tg_num = inter_dim / cfg.subGU_n *
                              sub_X_cnt; // hom many thread_groups are needed to handel inter_dim
-                    uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
+		    const uint32_t tg_num_norm = tg_num/cfg.tg_num_perCU; // how many CUs will be occupied
+                    uint32_t local_round = (tg_num_norm + num_cu - 1) / num_cu;
+
                     if(local_round < round || // fewer round is better
                        (local_round == round &&
-                        (empty_cu > (local_round * num_cu - tg_num) || // fewer empty_cu is better
-                         (empty_cu == (local_round * num_cu - tg_num) &&
+                        (empty_cu > (local_round * num_cu - tg_num_norm) || // fewer empty_cu is better
+                         (empty_cu == (local_round * num_cu - tg_num_norm) &&
                           cfg.ps == 1)))) // prefer PS kernel
                     {
                         round      = local_round;
-                        empty_cu   = local_round * num_cu - tg_num;
+                        empty_cu   = local_round * num_cu - tg_num_norm;
                         selectedKl = el.first;
                         if(cfg.ps == 1)
                             num_persistent_tgs = cfg.tg_num_perCU * num_cu;

@@ -775,6 +775,10 @@ def get_2stage_cfgs(
         )
         logger.info("\033[0m")
 
+    def use_asm_embedded_quantization():
+        # For big model_dim ck's split-k is a better alternative
+        return model_dim <= 2048 and token > 1 and token < 16 and topk > 8 and (inter_dim % 128) == 0
+
     def use_cfg():
         problem_type = (activation, dtype, q_dtype_a, q_dtype_w, q_type)
         bypass_type = (
@@ -836,6 +840,7 @@ def get_2stage_cfgs(
             if q_type == QuantType.per_1x128:
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
                 run_1stage = token > 32 and (inter_dim % 128 == 0)
+                run_1stage_xbf16 = use_asm_embedded_quantization()
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
@@ -846,7 +851,10 @@ def get_2stage_cfgs(
         run_1stage = run_1stage or run_1stage_xbf16
 
         block_m = (
-            BLOCK_SIZE_M
+            (
+              (64 if (token * topk)/expert > 32 else BLOCK_SIZE_M)
+              if q_type == QuantType.per_1x128 else BLOCK_SIZE_M
+            )
             if run_1stage
             else (
                 (64 if token > 32 else 16)
