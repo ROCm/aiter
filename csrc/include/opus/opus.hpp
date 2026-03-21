@@ -956,8 +956,8 @@ OPUS_D constexpr unsigned short fp32_to_bf16_rtn_raw(float f)
     else if(bits & 0xffff) { bits |= 0x10000; /* Preserve signaling NaN */ }
     return static_cast<unsigned short>(bits >> 16);
 }
-#if (defined(__gfx950__) || defined(__GFX12__)) && __clang_major__ >= 20
-template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // gfx950/gfx12 has instruction conversion, leave 'rm' here for compatiblity
+#if (defined(__gfx950__) || defined(__gfx1250__)) && __clang_major__ >= 20
+template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // gfx950/gfx1250 has instruction conversion, leave 'rm' here for compatiblity
 OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) { return static_cast<bf16_t>(x); }
 #else
 template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // 0:standard, 1:truncate_with_nan, 2:truncate, 3:standard asm 4:rta_asm(round to nearest away)
@@ -1159,7 +1159,7 @@ OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& s, float scale = 
 }
 template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp4_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_bf16_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) { return __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(s, scale, sel); }
-#elif defined(__GFX12__)
+#elif defined(__gfx1250__)
 // gfx1250: pk8 builtins convert 8 fp4 <-> 8 f32 at once
 // f32->fp4: __builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(v8f32 src, float scale) -> i32
 // fp4->f32: __builtin_amdgcn_cvt_scale_pk8_f32_fp4(i32 src, i32 scale_sel, i32 imm) -> v8f32
@@ -1316,7 +1316,7 @@ OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
 // ---- get_warp_size() / get_smem_size() ----
 //   OPUS_H_D constexpr -- safe to use everywhere: template defaults, static_assert, constexpr variables, __shared__ array sizes, host launch-parameter calculations, etc.
 //   During the host pass (arch macros absent), they return safe defaults:
-//     get_warp_size() -> 64 (GFX9 default)
+//     get_warp_size() -> 64 (GFX9 default), 32 for gfx1250 (wave32)
 //     get_smem_size() -> 65536 (64 KB, non-gfx950 default)
 //   Note: __builtin_amdgcn_wavefrontsize() is NOT constexpr in clang, so it cannot be used in template arguments, static_assert, or if constexpr. Prefer get_warp_size() which uses
 //   preprocessor arch detection to provide a constexpr result.
@@ -1328,7 +1328,9 @@ OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
 //
 OPUS_H_D constexpr index_t get_warp_size()
 {
-#if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
+#if defined(__gfx1250__)
+    return 32;
+#elif defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
     return 64;
 #else
     return 32;
@@ -1440,12 +1442,11 @@ struct gmem {
     template<index_t vec = 1> using vector_type = vector_t<scalar_type, vec * vector_size>;
 
     OPUS_D gmem(const void* ptr, unsigned int size = 0xffffffff, unsigned int config = buffer_default_config())
-#if !OPUS_GFX1250_DISABLED
-        : cached_rsrc(make_buffer_rsrc(ptr, size, config)) {}
-#else
-        : cached_rsrc(make_buffer_rsrc(ptr, size, config)), res_ptr(reinterpret_cast<const char*>(ptr)) {}
-    const char* res_ptr;  // raw pointer for gfx1250 fallback global memory ops
+        : cached_rsrc(make_buffer_rsrc(ptr, size, config))
+#if defined(__gfx1250__)
+        , raw_ptr(static_cast<const char*>(ptr))
 #endif
+    {}
 
     template<index_t vec = 1, index_t aux = 0>   // os in unit of byte
     OPUS_D auto _load(int v_os, int s_os = 0, number<aux> = {}) {
@@ -1464,10 +1465,21 @@ struct gmem {
     template<index_t vec = 1, index_t aux = 0>   // os in unit of byte
     OPUS_D void _async_load(OPUS_LDS_ADDR void* dst, int v_os, int s_os = 0, number<aux> = {}) {
         using type = vector_type<vec>;
-#if defined(__GFX12__)
-        // gfx12 does not have vmem-to-lds-load-insts; fallback to synchronous load + LDS store
-        auto val = _load<vec>(v_os, s_os, number<aux>{});
-        *reinterpret_cast<OPUS_LDS_ADDR vector_type<vec>*>(dst) = val;
+#if defined(__gfx1250__)
+        // gfx1250: global_load_async_to_lds (global addressing, not buffer rsrc)
+        #define GPTR_(T, p) ((__attribute__((address_space(1))) T*)(p))
+        #define LPTR_(T, p) ((OPUS_LDS_ADDR T*)(p))
+        {
+            auto* src = raw_ptr + v_os + s_os;
+            if      constexpr (sizeof(type) == 1)  { __builtin_amdgcn_global_load_async_to_lds_b8  (GPTR_(char, src), LPTR_(char, dst), 0, 0); }
+            else if constexpr (sizeof(type) == 2)  { __builtin_amdgcn_global_load_async_to_lds_b8  (GPTR_(char, src), LPTR_(char, dst), 0, 0);
+                                                     __builtin_amdgcn_global_load_async_to_lds_b8  (GPTR_(char, src + 1), LPTR_(char, (char*)dst + 1), 0, 0); }
+            else if constexpr (sizeof(type) == 4)  { __builtin_amdgcn_global_load_async_to_lds_b32 (GPTR_(int, src), LPTR_(int, dst), 0, 0); }
+            else if constexpr (sizeof(type) == 8)  { __builtin_amdgcn_global_load_async_to_lds_b64 (GPTR_(i32x2_t, src), LPTR_(i32x2_t, dst), 0, 0); }
+            else if constexpr (sizeof(type) == 16) { __builtin_amdgcn_global_load_async_to_lds_b128(GPTR_(i32x4_t, src), LPTR_(i32x4_t, dst), 0, 0); }
+        }
+        #undef GPTR_
+        #undef LPTR_
 #elif __clang_major__ >= 20   // start from rocm 7.0,introduced by https://github.com/llvm/llvm-project/pull/132048, 133055, 132957
         if      constexpr (sizeof(type) == 1)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  1, v_os, s_os, 0, aux); }
         else if constexpr (sizeof(type) == 2)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  2, v_os, s_os, 0, aux); }
@@ -1639,6 +1651,9 @@ struct gmem {
     }
 
     __amdgpu_buffer_rsrc_t cached_rsrc;
+#if defined(__gfx1250__)
+    const char* raw_ptr;  // flat pointer for global_load_async_to_lds (gfx1250 uses global addressing, not buffer rsrc)
+#endif
 };
 
 template<typename T_> OPUS_D decltype(auto) make_gmem(const T_* ptr, unsigned int size = 0xffffffff, unsigned int config = buffer_default_config()) { return gmem<T_>{ptr, size, config}; }
@@ -1799,25 +1814,27 @@ OPUS_D void async_load_if(Mem& mem, Args&&... args) { mem.template async_load_if
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // waitcnt
-#if defined(__GFX12__)
-// gfx12 uses separate wait instructions: s_wait_loadcnt, s_wait_storecnt, s_wait_dscnt, etc.
-// __builtin_amdgcn_s_waitcnt is not supported; use inline asm for gfx12.
-template <index_t vmcnt, index_t lgkmcnt, index_t expcnt = 0>
-OPUS_D void s_waitcnt(number<vmcnt>, number<lgkmcnt>, number<expcnt> = {}) {
-    // On gfx12, vmcnt maps to s_wait_loadcnt, lgkmcnt maps to s_wait_dscnt
-    if constexpr (vmcnt == 0)   { asm volatile("s_wait_loadcnt 0" ::: "memory"); }
-    if constexpr (lgkmcnt == 0) { asm volatile("s_wait_dscnt 0" ::: "memory"); }
-    if constexpr (expcnt == 0)  { asm volatile("s_wait_expcnt 0" ::: "memory"); }
-}
+#if defined(__gfx1250__)
+// gfx1250: split wait counters, exposed as native instruction wrappers via LLVM IR intrinsics.
+// s_wait_expcnt/s_wait_samplecnt/s_wait_bvhcnt do NOT exist on gfx1250.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wundefined-inline"
+OPUS_D void llvm_s_wait_loadcnt(short cnt)    __asm("llvm.amdgcn.s.wait.loadcnt");
+OPUS_D void llvm_s_wait_dscnt(short cnt)      __asm("llvm.amdgcn.s.wait.dscnt");
+OPUS_D void llvm_s_wait_storecnt(short cnt)   __asm("llvm.amdgcn.s.wait.storecnt");
+OPUS_D void llvm_s_wait_kmcnt(short cnt)      __asm("llvm.amdgcn.s.wait.kmcnt");
+OPUS_D void llvm_s_wait_asynccnt(short cnt)   __asm("llvm.amdgcn.s.wait.asynccnt");
+OPUS_D void llvm_s_wait_tensorcnt(short cnt)  __asm("llvm.amdgcn.s.wait.tensorcnt");
+#pragma clang diagnostic pop
 
-template <index_t vmcnt>   OPUS_D void s_waitcnt_vmcnt(number<vmcnt>) {
-    if constexpr (vmcnt == 0) { asm volatile("s_wait_loadcnt 0" ::: "memory"); }
-}
-template <index_t lgkmcnt> OPUS_D void s_waitcnt_lgkmcnt(number<lgkmcnt>) {
-    if constexpr (lgkmcnt == 0) { asm volatile("s_wait_dscnt 0" ::: "memory"); }
-}
+template <index_t cnt> OPUS_D void s_wait_loadcnt(number<cnt> = {})   { llvm_s_wait_loadcnt(cnt); }
+template <index_t cnt> OPUS_D void s_wait_dscnt(number<cnt> = {})     { llvm_s_wait_dscnt(cnt); }
+template <index_t cnt> OPUS_D void s_wait_storecnt(number<cnt> = {})  { llvm_s_wait_storecnt(cnt); }
+template <index_t cnt> OPUS_D void s_wait_kmcnt(number<cnt> = {})     { llvm_s_wait_kmcnt(cnt); }
+template <index_t cnt> OPUS_D void s_wait_asynccnt(number<cnt> = {})  { llvm_s_wait_asynccnt(cnt); }
+template <index_t cnt> OPUS_D void s_wait_tensorcnt(number<cnt> = {}) { llvm_s_wait_tensorcnt(cnt); }
 #else
-// gfx9: vmcnt=0~63([15:14],[3:0]), lgkmcnt=0~15([11:8]), expcnt=0~7([6:4])
+// gfx9: combined s_waitcnt instruction
 template <index_t vmcnt, index_t lgkmcnt, index_t expcnt = 7>
 OPUS_D void s_waitcnt(number<vmcnt>, number<lgkmcnt>, number<expcnt> = {})
 {   __builtin_amdgcn_s_waitcnt((((0b110000 & vmcnt) << (14 - 4)) | (0b1111 & vmcnt)) | ((0b111 & expcnt) << 4) | ((0b1111 & lgkmcnt) << 8)); }
@@ -1826,8 +1843,14 @@ template <index_t vmcnt>   OPUS_D void s_waitcnt_vmcnt(number<vmcnt>) { s_waitcn
 template <index_t lgkmcnt> OPUS_D void s_waitcnt_lgkmcnt(number<lgkmcnt>) { s_waitcnt(number<63>{}, number<lgkmcnt>{}); }
 #endif
 
+// Helper: resolve vtype for MFMA/WMMA registers. Packed types (fp4_t etc.) use underlying storage since ext_vector_type requires scalar types.
+namespace impl { template<typename T, index_t N, typename = void> struct mfma_vtype { using type = vector_t<T, N>; };
+template<typename T, index_t N> struct mfma_vtype<T, N, std::enable_if_t<is_packs_v<T>>> { using type = vector_t<typename T::storage, N>; }; }
+template<typename T, index_t N> using mfma_vtype_t = typename impl::mfma_vtype<T, N>::type;
+
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// mfma
+// mfma (GFX9: gfx942, gfx950)
+#if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
 #define DISPATCH_MFMA_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_) {  return inst_(a, b, c, cbsz, abid, blgp); }
 
@@ -1865,11 +1888,6 @@ template <index_t lgkmcnt> OPUS_D void s_waitcnt_lgkmcnt(number<lgkmcnt>) { s_wa
 #define DISPATCH_MFMA_SCALE_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
     return inst_(__builtin_bit_cast(i32x8_t, a), __builtin_bit_cast(i32x8_t, b), c, fmt_a, fmt_b, 0, scale_a, 0, scale_b); }
-
-// Helper: resolve vtype for MFMA registers. Packed types (fp4_t etc.) use underlying storage since ext_vector_type requires scalar types.
-namespace impl { template<typename T, index_t N, typename = void> struct mfma_vtype { using type = vector_t<T, N>; };
-template<typename T, index_t N> struct mfma_vtype<T, N, std::enable_if_t<is_packs_v<T>>> { using type = vector_t<typename T::storage, N>; }; }
-template<typename T, index_t N> using mfma_vtype_t = typename impl::mfma_vtype<T, N>::type;
 
 // prefer use make_mfma() to create instance, which will return impl::mfma_adaptor_xxx. In this way we can access layout info from the "mma"
 //
@@ -1988,6 +2006,121 @@ using mfma_scale_f32_32x32x64_fp8_fp8   = mfma_f32_32x32x64_fp8_fp8;
 using mfma_scale_f32_16x16x128_fp8_fp8  = mfma_f32_16x16x128_fp8_fp8;
 using mfma_scale_f32_32x32x64_fp4_fp4   = mfma_f32_32x32x64_fp4_fp4;
 using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
+#endif // __GFX9__ (mfma)
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+// wmma (gfx1250 / RDNA4, wave32)
+#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
+// f16/bf16/f32 builtins: (neg_a, A, neg_b, B, matrix_fmts, C, clamp, neg_c)
+#define DISPATCH_WMMA_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
+ (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
+  wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
+    return inst_(false, a, false, b, static_cast<short>(0), c, false, false); }
+// bf16f32 special: accumulator is f32 but output is bf16 => (neg_a, A, neg_b, B, fmts, C_f32, clamp, neg_c)
+// The builtin takes f32 accumulator and returns bf16 output; we store the f32 accum but return bf16.
+#define DISPATCH_WMMA_BF16F32_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
+ (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
+  wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
+    return inst_(false, a, false, b, static_cast<short>(0), c, false, false); }
+// fp8/bf8 builtins: (A, B, matrix_fmts, C, clamp, neg_c)  -- no neg_a/neg_b
+// A/B are packed as _ExtVector<N, int>; bitcast from the fp8/bf8 vector
+#define DISPATCH_WMMA_8BIT_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
+ (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
+  wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
+    constexpr index_t i32_a = elem_a * static_cast<index_t>(sizeof(dtype_a)) / static_cast<index_t>(sizeof(i32_t)); \
+    constexpr index_t i32_b = elem_b * static_cast<index_t>(sizeof(dtype_b)) / static_cast<index_t>(sizeof(i32_t)); \
+    return inst_(__builtin_bit_cast(vector_t<i32_t, i32_a>, a), \
+                 __builtin_bit_cast(vector_t<i32_t, i32_b>, b), \
+                 static_cast<short>(0), c, false, false); }
+
+template<typename dtype_a_, typename dtype_b_, typename dtype_c_, index_t wave_m_, index_t wave_n_, index_t wave_k_, index_t warp_size_ = get_warp_size()>
+struct wmma {
+    using dtype_a = remove_cvref_t<dtype_a_>;
+    using dtype_b = remove_cvref_t<dtype_b_>;
+    using dtype_c = remove_cvref_t<dtype_c_>;
+    static constexpr index_t wave_m = wave_m_;
+    static constexpr index_t wave_n = wave_n_;
+    static constexpr index_t wave_k = wave_k_;
+    static constexpr index_t warp_size = warp_size_;  // 32 for gfx1250
+    static constexpr index_t elem_a = wave_m * wave_k / warp_size;
+    static constexpr index_t elem_b = wave_n * wave_k / warp_size;
+    static constexpr index_t elem_c = wave_m * wave_n / warp_size;
+
+    using vtype_a = mfma_vtype_t<dtype_a, elem_a>;
+    using vtype_b = mfma_vtype_t<dtype_b, elem_b>;
+    using vtype_c = vector_t<dtype_c, elem_c>;
+
+    template<typename VA, typename VB, typename VC>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c) -> vtype_c {
+        (void)a; (void)b; (void)c;
+        if      constexpr (false) {}
+#if defined(__gfx1250__)
+        // f16/bf16 16x16x32
+        else if constexpr DISPATCH_WMMA_(fp16_t, fp16_t, fp32_t, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x32_f16)
+        else if constexpr DISPATCH_WMMA_(fp16_t, fp16_t, fp16_t, 16, 16, 32, __builtin_amdgcn_wmma_f16_16x16x32_f16)
+        else if constexpr DISPATCH_WMMA_(bf16_t, bf16_t, fp32_t, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x32_bf16)
+        else if constexpr DISPATCH_WMMA_(bf16_t, bf16_t, bf16_t, 16, 16, 32, __builtin_amdgcn_wmma_bf16_16x16x32_bf16)
+        // f32 16x16x4
+        else if constexpr DISPATCH_WMMA_(fp32_t, fp32_t, fp32_t, 16, 16,  4, __builtin_amdgcn_wmma_f32_16x16x4_f32)
+        // fp8/bf8 16x16x64 -> f32
+        else if constexpr DISPATCH_WMMA_8BIT_(fp8_t, fp8_t, fp32_t, 16, 16, 64, __builtin_amdgcn_wmma_f32_16x16x64_fp8_fp8)
+        else if constexpr DISPATCH_WMMA_8BIT_(fp8_t, bf8_t, fp32_t, 16, 16, 64, __builtin_amdgcn_wmma_f32_16x16x64_fp8_bf8)
+        else if constexpr DISPATCH_WMMA_8BIT_(bf8_t, fp8_t, fp32_t, 16, 16, 64, __builtin_amdgcn_wmma_f32_16x16x64_bf8_fp8)
+        else if constexpr DISPATCH_WMMA_8BIT_(bf8_t, bf8_t, fp32_t, 16, 16, 64, __builtin_amdgcn_wmma_f32_16x16x64_bf8_bf8)
+        // fp8/bf8 16x16x64 -> f16
+        else if constexpr DISPATCH_WMMA_8BIT_(fp8_t, fp8_t, fp16_t, 16, 16, 64, __builtin_amdgcn_wmma_f16_16x16x64_fp8_fp8)
+        else if constexpr DISPATCH_WMMA_8BIT_(fp8_t, bf8_t, fp16_t, 16, 16, 64, __builtin_amdgcn_wmma_f16_16x16x64_fp8_bf8)
+        else if constexpr DISPATCH_WMMA_8BIT_(bf8_t, fp8_t, fp16_t, 16, 16, 64, __builtin_amdgcn_wmma_f16_16x16x64_bf8_fp8)
+        else if constexpr DISPATCH_WMMA_8BIT_(bf8_t, bf8_t, fp16_t, 16, 16, 64, __builtin_amdgcn_wmma_f16_16x16x64_bf8_bf8)
+        // fp8/bf8 16x16x128 -> f32
+        else if constexpr DISPATCH_WMMA_8BIT_(fp8_t, fp8_t, fp32_t, 16, 16, 128, __builtin_amdgcn_wmma_f32_16x16x128_fp8_fp8)
+        else if constexpr DISPATCH_WMMA_8BIT_(fp8_t, bf8_t, fp32_t, 16, 16, 128, __builtin_amdgcn_wmma_f32_16x16x128_fp8_bf8)
+        else if constexpr DISPATCH_WMMA_8BIT_(bf8_t, fp8_t, fp32_t, 16, 16, 128, __builtin_amdgcn_wmma_f32_16x16x128_bf8_fp8)
+        else if constexpr DISPATCH_WMMA_8BIT_(bf8_t, bf8_t, fp32_t, 16, 16, 128, __builtin_amdgcn_wmma_f32_16x16x128_bf8_bf8)
+        // fp8/bf8 16x16x128 -> f16
+        else if constexpr DISPATCH_WMMA_8BIT_(fp8_t, fp8_t, fp16_t, 16, 16, 128, __builtin_amdgcn_wmma_f16_16x16x128_fp8_fp8)
+        else if constexpr DISPATCH_WMMA_8BIT_(fp8_t, bf8_t, fp16_t, 16, 16, 128, __builtin_amdgcn_wmma_f16_16x16x128_fp8_bf8)
+        else if constexpr DISPATCH_WMMA_8BIT_(bf8_t, fp8_t, fp16_t, 16, 16, 128, __builtin_amdgcn_wmma_f16_16x16x128_bf8_fp8)
+        else if constexpr DISPATCH_WMMA_8BIT_(bf8_t, bf8_t, fp16_t, 16, 16, 128, __builtin_amdgcn_wmma_f16_16x16x128_bf8_bf8)
+#endif
+        __builtin_unreachable();
+    }
+
+    template<typename VA, typename VB>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b) {
+        vtype_c c{0}; return operator()(a, b, c);
+    }
+};
+#undef DISPATCH_WMMA_
+#undef DISPATCH_WMMA_BF16F32_
+#undef DISPATCH_WMMA_8BIT_
+
+// f16/bf16 16x16x32
+using wmma_f32_16x16x32_f16   = wmma<fp16_t, fp16_t, fp32_t, 16, 16, 32>;
+using wmma_f16_16x16x32_f16   = wmma<fp16_t, fp16_t, fp16_t, 16, 16, 32>;
+using wmma_f32_16x16x32_bf16  = wmma<bf16_t, bf16_t, fp32_t, 16, 16, 32>;
+using wmma_bf16_16x16x32_bf16 = wmma<bf16_t, bf16_t, bf16_t, 16, 16, 32>;
+// f32 16x16x4
+using wmma_f32_16x16x4_f32    = wmma<fp32_t, fp32_t, fp32_t, 16, 16,  4>;
+// fp8/bf8 16x16x64
+using wmma_f32_16x16x64_fp8_fp8  = wmma<fp8_t, fp8_t, fp32_t, 16, 16, 64>;
+using wmma_f32_16x16x64_fp8_bf8  = wmma<fp8_t, bf8_t, fp32_t, 16, 16, 64>;
+using wmma_f32_16x16x64_bf8_fp8  = wmma<bf8_t, fp8_t, fp32_t, 16, 16, 64>;
+using wmma_f32_16x16x64_bf8_bf8  = wmma<bf8_t, bf8_t, fp32_t, 16, 16, 64>;
+using wmma_f16_16x16x64_fp8_fp8  = wmma<fp8_t, fp8_t, fp16_t, 16, 16, 64>;
+using wmma_f16_16x16x64_fp8_bf8  = wmma<fp8_t, bf8_t, fp16_t, 16, 16, 64>;
+using wmma_f16_16x16x64_bf8_fp8  = wmma<bf8_t, fp8_t, fp16_t, 16, 16, 64>;
+using wmma_f16_16x16x64_bf8_bf8  = wmma<bf8_t, bf8_t, fp16_t, 16, 16, 64>;
+// fp8/bf8 16x16x128
+using wmma_f32_16x16x128_fp8_fp8 = wmma<fp8_t, fp8_t, fp32_t, 16, 16, 128>;
+using wmma_f32_16x16x128_fp8_bf8 = wmma<fp8_t, bf8_t, fp32_t, 16, 16, 128>;
+using wmma_f32_16x16x128_bf8_fp8 = wmma<bf8_t, fp8_t, fp32_t, 16, 16, 128>;
+using wmma_f32_16x16x128_bf8_bf8 = wmma<bf8_t, bf8_t, fp32_t, 16, 16, 128>;
+using wmma_f16_16x16x128_fp8_fp8 = wmma<fp8_t, fp8_t, fp16_t, 16, 16, 128>;
+using wmma_f16_16x16x128_fp8_bf8 = wmma<fp8_t, bf8_t, fp16_t, 16, 16, 128>;
+using wmma_f16_16x16x128_bf8_fp8 = wmma<bf8_t, fp8_t, fp16_t, 16, 16, 128>;
+using wmma_f16_16x16x128_bf8_bf8 = wmma<bf8_t, bf8_t, fp16_t, 16, 16, 128>;
+#endif // __gfx1250__ (wmma)
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // adaptor
@@ -2112,6 +2245,7 @@ OPUS_D constexpr auto unfold_x_stride(const Dim&, const Shape&, const Stride& st
 // A:[(grpm_a<p>), (rept_a<y>, grpk_a<p>, pack_a<y>)], MxK
 // B:[(grpn_b<p>), (rept_b<y>, grpk_b<p>, pack_b<y>)], NxK
 // C:[(rept_c<y>, grpm_c<p>, pack_c<y>), (grpn_c<p>)], MxN
+#if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
 namespace impl {
 template<typename MFMA>
 struct mfma_adaptor : public remove_cvref_t<MFMA> {
@@ -2183,6 +2317,79 @@ OPUS_D decltype(auto) make_mfma(number<w_m>, number<w_n>, number<w_k>, A&& = {},
 
 template<typename d_a, typename d_b, typename d_c, typename WaveMNK /*seq<m, n, k>*/, typename A = mfma_adaptor, index_t warp_size_ = get_warp_size()>
 OPUS_D decltype(auto) make_mfma(WaveMNK&&, A&& = {}, number<warp_size_> = {}) { return A{}(mfma<d_a, d_b, d_c, get<0>(WaveMNK{}), get<1>(WaveMNK{}), get<2>(WaveMNK{}), warp_size_>{}); }
+#endif // __GFX9__
+
+// wmma_adaptor: same layout encoding as mfma_adaptor but for wave32 WMMA (gfx1250)
+// A:[(grpm_a<p>), (rept_a<y>, grpk_a<p>, pack_a<y>)], MxK
+// B:[(grpn_b<p>), (rept_b<y>, grpk_b<p>, pack_b<y>)], NxK
+// C:[(grpm_c<p>, rept_c<y>, pack_c<y>), (grpn_c<p>)], MxN
+#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
+namespace impl {
+template<typename WMMA>
+struct wmma_adaptor : public remove_cvref_t<WMMA> {
+    using wmma_type = remove_cvref_t<WMMA>;
+
+    static constexpr index_t grpm_a = wmma_type::wave_m;
+    static constexpr index_t grpn_b = wmma_type::wave_n;
+    static_assert(wmma_type::warp_size % grpm_a == 0 && wmma_type::warp_size % grpn_b == 0 && grpm_a == grpn_b);
+    static constexpr index_t grpk_a = wmma_type::warp_size / grpm_a;
+    static constexpr index_t grpk_b = grpk_a;
+    static constexpr index_t grpn_c = wmma_type::wave_n;
+    static constexpr index_t grpm_c = wmma_type::warp_size / grpn_c;
+
+    static constexpr index_t max_pack_a = 16 / sizeof(typename wmma_type::dtype_a);
+    static constexpr index_t max_pack_b = 16 / sizeof(typename wmma_type::dtype_b);
+    static constexpr index_t max_pack_c = 16 / sizeof(typename wmma_type::dtype_c);
+
+    static constexpr index_t pack_a = (max_pack_a < wmma_type::elem_a ? max_pack_a : wmma_type::elem_a);
+    static constexpr index_t pack_b = (max_pack_b < wmma_type::elem_b ? max_pack_b : wmma_type::elem_b);
+    static constexpr index_t pack_c = (max_pack_c < wmma_type::elem_c ? max_pack_c : wmma_type::elem_c);
+
+    static constexpr index_t rept_a = wmma_type::elem_a / pack_a;
+    static constexpr index_t rept_b = wmma_type::elem_b / pack_b;
+    static constexpr index_t rept_c = wmma_type::elem_c / pack_c;
+
+    OPUS_D static constexpr auto shape_a() { return tuple<number<grpm_a>, number<rept_a>, number<grpk_a>, number<pack_a>>{}; }
+    OPUS_D static constexpr auto shape_b() { return tuple<number<grpn_b>, number<rept_b>, number<grpk_a>, number<pack_b>>{}; }
+    OPUS_D static constexpr auto shape_c() { return tuple<number<grpm_c>, number<rept_c>, number<pack_c>, number<grpn_c>>{}; }
+
+    OPUS_D static constexpr auto dim_a()   { return tuple< tuple<p_dim>,  tuple<y_dim, p_dim, y_dim> >{}; }
+    OPUS_D static constexpr auto dim_b()   { return tuple< tuple<p_dim>,  tuple<y_dim, p_dim, y_dim> >{}; }
+    OPUS_D static constexpr auto dim_c()   { return tuple< tuple<p_dim, y_dim, y_dim>,  tuple<p_dim> >{}; }
+
+    OPUS_ADAPTOR_LAYOUT_API_DEFINE
+};
+
+template<typename WMMA>
+struct wmma_adaptor_swap_ab : wmma_adaptor<WMMA> {
+    using base = wmma_adaptor<WMMA>;
+    using base::shape_a; using base::shape_b; using base::dim_a; using base::dim_b;
+    OPUS_D static constexpr auto shape_c() { return tuple<number<base::grpn_c>, number<base::grpm_c>, number<base::rept_c>, number<base::pack_c>>{}; }
+    OPUS_D static constexpr auto dim_c()   { return tuple<tuple<p_dim>,  tuple<p_dim, y_dim, y_dim> >{}; }
+
+    template<typename VA, typename VB, typename VC>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c) {
+        return base::operator()(b, a, c);
+    }
+
+    template<typename VA, typename VB>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b) {
+        typename WMMA::vtype_c c{0}; return operator()(b, a, c);
+    }
+
+    OPUS_ADAPTOR_LAYOUT_API_DEFINE
+};
+} // namespace impl (wmma_adaptor)
+
+struct wmma_adaptor         { template<typename M> OPUS_D decltype(auto) operator()(M&&) { return impl::wmma_adaptor<remove_cvref_t<M>>{};} };
+struct wmma_adaptor_swap_ab { template<typename M> OPUS_D decltype(auto) operator()(M&&) { return impl::wmma_adaptor_swap_ab<remove_cvref_t<M>>{};} };
+
+template<typename d_a, typename d_b, typename d_c, index_t w_m, index_t w_n, index_t w_k, typename A = wmma_adaptor, index_t warp_size_ = get_warp_size()>
+OPUS_D decltype(auto) make_wmma(number<w_m>, number<w_n>, number<w_k>, A&& = {}, number<warp_size_> = {}) { return A{}(wmma<d_a, d_b, d_c, w_m, w_n, w_k, warp_size_>{}); }
+
+template<typename d_a, typename d_b, typename d_c, typename WaveMNK, typename A = wmma_adaptor, index_t warp_size_ = get_warp_size()>
+OPUS_D decltype(auto) make_wmma(WaveMNK&&, A&& = {}, number<warp_size_> = {}) { return A{}(wmma<d_a, d_b, d_c, get<0>(WaveMNK{}), get<1>(WaveMNK{}), get<2>(WaveMNK{}), warp_size_>{}); }
+#endif // __gfx1250__
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 namespace impl {
@@ -2286,10 +2493,18 @@ OPUS_D decltype(auto) make_tiled_mma(MMA&& mma, ES, TS, A&& = {}) {
 }
 
 template<typename d_a, typename d_b, typename d_c, typename ES /* expand-m/n/k */, typename TS /* tile-m/n/k */, typename WS /* wave-m/n/k*/,
+#if defined(__gfx1250__)
+         typename WA = wmma_adaptor,
+#else
          typename WA = mfma_adaptor,
+#endif
          typename TA = tiled_mma_adaptor, index_t warp_size = get_warp_size()>
 OPUS_D decltype(auto) make_tiled_mma(ES, TS, WS, WA&& = {}, TA&& = {}) {
+#if defined(__gfx1250__)
+    return TA{}(make_wmma<d_a, d_b, d_c>(WS{}, WA{}, number<warp_size>{}),
+#else
     return TA{}(make_mfma<d_a, d_b, d_c>(WS{}, WA{}, number<warp_size>{}),
+#endif
             number<get<0>(ES{})>{}, number<get<1>(ES{})>{}, number<get<2>(ES{})>{}, number<get<0>(TS{})>{}, number<get<1>(TS{})>{}, number<get<2>(TS{})>{});
 }
 
