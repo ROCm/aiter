@@ -470,8 +470,10 @@ def _test_wmma_variant_generic(
 
     # For fp8 types, use small integer range to avoid overflow
     is_fp8 = in_dtype in (
-        torch.float8_e4m3fn, torch.float8_e4m3fnuz,
-        torch.float8_e5m2, torch.float8_e5m2fnuz,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2,
+        torch.float8_e5m2fnuz,
     )
     if is_fp8:
         A = torch.randint(-3, 4, (M, K), device=device).to(torch.float32).to(in_dtype)
@@ -520,65 +522,113 @@ def test_wmma_16x16x32_bf16(mod):
 
 def test_wmma_16x16x32_f16_f16(mod):
     return _test_wmma_variant_generic(
-        mod, "16x16x32_f16_f16", 16, 16, 32,
-        torch.float16, torch.float16, _WMMA_ARCHS_GFX1250
+        mod,
+        "16x16x32_f16_f16",
+        16,
+        16,
+        32,
+        torch.float16,
+        torch.float16,
+        _WMMA_ARCHS_GFX1250,
     )
 
 
 def test_wmma_16x16x32_bf16_bf16(mod):
     return _test_wmma_variant_generic(
-        mod, "16x16x32_bf16_bf16", 16, 16, 32,
-        torch.bfloat16, torch.bfloat16, _WMMA_ARCHS_GFX1250,
-        atol=4.0, rtol=1e-2,  # bf16 output has ~3 decimal digits precision
+        mod,
+        "16x16x32_bf16_bf16",
+        16,
+        16,
+        32,
+        torch.bfloat16,
+        torch.bfloat16,
+        _WMMA_ARCHS_GFX1250,
+        atol=4.0,
+        rtol=1e-2,  # bf16 output has ~3 decimal digits precision
     )
 
 
 def test_wmma_16x16x4_f32(mod):
     return _test_wmma_variant_generic(
-        mod, "16x16x4_f32", 16, 16, 4,
-        torch.float32, torch.float32, _WMMA_ARCHS_GFX1250
+        mod, "16x16x4_f32", 16, 16, 4, torch.float32, torch.float32, _WMMA_ARCHS_GFX1250
     )
 
 
 def test_wmma_16x16x64_fp8_f32(mod):
     return _test_wmma_variant_generic(
-        mod, "16x16x64_fp8_f32", 16, 16, 64,
-        _get_fp8_dtype(), torch.float32, _WMMA_ARCHS_GFX1250
+        mod,
+        "16x16x64_fp8_f32",
+        16,
+        16,
+        64,
+        _get_fp8_dtype(),
+        torch.float32,
+        _WMMA_ARCHS_GFX1250,
     )
 
 
 def test_wmma_16x16x64_bf8_f32(mod):
     return _test_wmma_variant_generic(
-        mod, "16x16x64_bf8_f32", 16, 16, 64,
-        _get_bf8_dtype(), torch.float32, _WMMA_ARCHS_GFX1250
+        mod,
+        "16x16x64_bf8_f32",
+        16,
+        16,
+        64,
+        _get_bf8_dtype(),
+        torch.float32,
+        _WMMA_ARCHS_GFX1250,
     )
 
 
 def test_wmma_16x16x64_fp8_f16(mod):
     return _test_wmma_variant_generic(
-        mod, "16x16x64_fp8_f16", 16, 16, 64,
-        _get_fp8_dtype(), torch.float16, _WMMA_ARCHS_GFX1250
+        mod,
+        "16x16x64_fp8_f16",
+        16,
+        16,
+        64,
+        _get_fp8_dtype(),
+        torch.float16,
+        _WMMA_ARCHS_GFX1250,
     )
 
 
 def test_wmma_16x16x128_fp8_f32(mod):
     return _test_wmma_variant_generic(
-        mod, "16x16x128_fp8_f32", 16, 16, 128,
-        _get_fp8_dtype(), torch.float32, _WMMA_ARCHS_GFX1250
+        mod,
+        "16x16x128_fp8_f32",
+        16,
+        16,
+        128,
+        _get_fp8_dtype(),
+        torch.float32,
+        _WMMA_ARCHS_GFX1250,
     )
 
 
 def test_wmma_16x16x128_bf8_f32(mod):
     return _test_wmma_variant_generic(
-        mod, "16x16x128_bf8_f32", 16, 16, 128,
-        _get_bf8_dtype(), torch.float32, _WMMA_ARCHS_GFX1250
+        mod,
+        "16x16x128_bf8_f32",
+        16,
+        16,
+        128,
+        _get_bf8_dtype(),
+        torch.float32,
+        _WMMA_ARCHS_GFX1250,
     )
 
 
 def test_wmma_16x16x128_fp8_f16(mod):
     return _test_wmma_variant_generic(
-        mod, "16x16x128_fp8_f16", 16, 16, 128,
-        _get_fp8_dtype(), torch.float16, _WMMA_ARCHS_GFX1250
+        mod,
+        "16x16x128_fp8_f16",
+        16,
+        16,
+        128,
+        _get_fp8_dtype(),
+        torch.float16,
+        _WMMA_ARCHS_GFX1250,
     )
 
 
