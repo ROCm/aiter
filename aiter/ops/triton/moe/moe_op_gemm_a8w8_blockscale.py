@@ -74,17 +74,17 @@ def get_kernel_config(m, n, k, routing_data, use_gluon=False):
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_stages = 2
-    num_buffers = 6
+    num_buffers = 8
 
     split_k = 1
     if block_m == 16:
         block_n = 256
-        block_k = 256
+        block_k = 512
         num_warps = 4
     else:
         # for scale preshuffling
         block_n = 256
-        block_k = 256
+        block_k = 512
         num_warps = 2
 
     grid_m = routing_data.n_blocks(m, block_m)
