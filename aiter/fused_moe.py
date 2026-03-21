@@ -826,6 +826,8 @@ def get_2stage_cfgs(
                     asm_stage2,
                     activation=activation,
                     quant_type=q_type,
+                    tg=3,
+                    do_atomic=1,
                 ),
                 block_m=0,
                 ksplit=0,
@@ -1599,6 +1601,8 @@ def asm_stage2(
     sorted_weights=None,
     intermediate=None,
     valid_mask=None,
+    tg=-1,
+    do_atomic=-1,
     **_kwargs,
 ):
     return aiter.moe_stage2_g1u1(
@@ -1620,6 +1624,8 @@ def asm_stage2(
         quant_type,
         activation,
         splitk,
+        tg=3,
+        do_atomic=do_atomic,
     )
 
 

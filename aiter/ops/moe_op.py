@@ -334,6 +334,8 @@ def moe_stage2_g1u1(
     quant_type: Optional[Enum] = QuantType.No.value,
     activation: Optional[Enum] = ActivationType.Silu.value,
     splitk: Optional[int] = 0,
+    tg: int = -1,
+    do_atomic: int = -1,
 ) -> None: ...
 
 

@@ -357,7 +357,7 @@ static CFG* get_cfg_stage2(torch::Tensor& inter_states,
     }
 }
 
-std::string get_heuristic_kernel(int m_num, int N, int blockk_size, CFG* cfgs, std::string arch_id)
+std::string get_heuristic_kernel(int m_num, int N, int blockk_size, CFG* cfgs, std::string arch_id, int pf, bool coexec, int tg, int atomic)
 {
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
@@ -377,6 +377,16 @@ std::string get_heuristic_kernel(int m_num, int N, int blockk_size, CFG* cfgs, s
         if(cfg.tile_m != blockk_size || N % cfg.tile_n != 0)
         {
             continue;
+        }
+        if(pf == cfg.pf && coexec == cfg.coexec) // ignore tg for stage1 kernel
+        {
+            selected = el.first;
+            break;
+        }
+        if(tg == cfg.tg && atomic == cfg.atomic) // ignore pf for stage2 kernel
+        {
+            selected = el.first;
+            break;
         }
 
         tg_num               = (N + cfg.tile_n - 1) / cfg.tile_n * m_num;
@@ -421,7 +431,9 @@ void moe_stage1_g1u1(
     std::optional<torch::Tensor> fc2_smooth_scale = std::nullopt,
     std::optional<torch::Tensor> fc2_scale        = std::nullopt,
     std::optional<torch::Tensor> sorted_weights =
-        std::nullopt // [max_num_tokens_padded], do_weight==true need
+        std::nullopt, // [max_num_tokens_padded], do_weight==true need
+    int  pf     = 2,
+    bool coexec = false
 )
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
@@ -453,7 +465,9 @@ void moe_stage1_g1u1(
     kernelName          = !kernelName.empty() ? arch_id + kernelName : "";
     if(kernelName.empty())
     {
-        kernelName = get_heuristic_kernel(sub_X_cnt, inter_dim, block_m, config_map, arch_id);
+        kernelName = get_heuristic_kernel(sub_X_cnt, inter_dim, block_m, config_map, arch_id, pf, coexec, -1, -1);
+        
+        printf("[KERNEL] block_m = %d, pf = %d, coexec = %d\n", block_m, pf, coexec);
         print("[KERNEL] heuristic_kernel = %s\n", kernelName.c_str());
     }
 
@@ -465,8 +479,8 @@ void moe_stage1_g1u1(
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
 
-        print("[KERNEL] name = %s\n", name);
-        print("[KERNEL] co_name = %s\n", co_name);
+        printf("[KERNEL] name = %s\n", name);
+        printf("[KERNEL] co_name = %s\n", co_name);
 
         TORCH_CHECK(inter_dim % cfg.tile_n == 0,
                     "ASM kernel " + std::string(name) +
@@ -610,7 +624,10 @@ void moe_stage2_g1u1(
         std::nullopt, // [max_num_tokens_padded], do_weight==true need
     QuantType quant_type      = QuantType::No,
     ActivationType activation = ActivationType::No,
-    int splitk                = 0)
+    int splitk               = 0,
+    int tg     = -1,
+    int do_atomic = -1
+)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inter_states));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
@@ -630,7 +647,9 @@ void moe_stage2_g1u1(
     kernelName          = !kernelName.empty() ? arch_id + kernelName : "";
     if(kernelName.empty())
     {
-        kernelName = get_heuristic_kernel(sub_X_cnt, out.size(-1), block_m, config_map, arch_id);
+        kernelName = get_heuristic_kernel(sub_X_cnt, out.size(-1), block_m, config_map, arch_id, -1, false, tg, do_atomic);
+
+        printf("[KERNEL] block_m = %d, tg = %d, do_atomic = %d\n", block_m, tg, do_atomic);
         print("[KERNEL] heuristic_kernel = %s\n", kernelName.c_str());
     }
 
@@ -642,8 +661,8 @@ void moe_stage2_g1u1(
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
 
-        print("[KERNEL] name = %s\n", name);
-        print("[KERNEL] co_name = %s\n", co_name);
+        printf("[KERNEL] name = %s\n", name);
+        printf("[KERNEL] co_name = %s\n", co_name);
 
         auto result = impl_ptr_map.emplace(name, nullptr);
         if(result.second)

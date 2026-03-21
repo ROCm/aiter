@@ -1318,7 +1318,9 @@ namespace py = pybind11;
           py::arg("w1_lqq_zero")      = std::nullopt,                          \
           py::arg("fc2_smooth_scale") = std::nullopt,                          \
           py::arg("fc2_scale")        = std::nullopt,                          \
-          py::arg("sorted_weights")   = std::nullopt);                           \
+          py::arg("sorted_weights")   = std::nullopt,                          \
+          py::arg("pf")               = -1,                                    \
+          py::arg("coexec")           = false);                                \
     m.def("moe_stage2_g1u1",                                                   \
           &moe_stage2_g1u1,                                                    \
           py::arg("inter_states"),                                             \
@@ -1338,7 +1340,9 @@ namespace py = pybind11;
           py::arg("sorted_weights") = std::nullopt,                            \
           py::arg("quant_type")     = QuantType::No,                           \
           py::arg("activation")     = ActivationType::Silu,                    \
-          py::arg("splitk")         = 0);                                              \
+          py::arg("splitk")         = 0,                                       \
+          py::arg("tg")             = -1,                                      \
+          py::arg("do_atomic")      = -1);                                     \
     m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
 #define MOE_TOPK_PYBIND             \
