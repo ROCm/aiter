@@ -168,7 +168,9 @@ void moe_stage1_g1u1(
     std::optional<torch::Tensor> w1_lqq_zero,// [expert, inter_dim*2, model_dim/group_in_k_lqq] N,Klqq
     std::optional<torch::Tensor> fc2_smooth_scale,
     std::optional<torch::Tensor> fc2_scale,
-    std::optional<torch::Tensor> sorted_weights);
+    std::optional<torch::Tensor> sorted_weights,
+    int pf,
+    int co_exec);
 void moe_stage2_g1u1(
     torch::Tensor& inter_states,      // [token_cnt, topk, inter_dim]
     torch::Tensor& w1,                // [expert, inter_dim*2, model_dim] N,K
@@ -187,7 +189,9 @@ void moe_stage2_g1u1(
     std::optional<torch::Tensor> sorted_weights,
     QuantType quant_type,
     ActivationType activation,
-    int splitk);
+    int splitk,
+    int tg,
+    int do_atomic);
 
 void topk_softmax_asm(torch::Tensor& topk_weights,         // [num_tokens, topk]
                       torch::Tensor& topk_indices,         // [num_tokens, topk]

@@ -27,8 +27,22 @@ from aiter.ops.moe_flydsl import flydsl_moe_stage1, flydsl_moe_stage2
 from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
 from aiter.utility import fp4_utils
 
+import os
+import sys
 
 from aiter.ops.flydsl.utils import is_flydsl_available
+
+FLIR_PATH = os.getenv("FLIR_PATH")
+if is_flydsl_available() and FLIR_PATH:
+    if FLIR_PATH not in sys.path:
+        sys.path.insert(0, FLIR_PATH)
+    try:
+        from kernels.moe_gemm_2stage import (
+            compile_moe_reduction,
+        )
+    except ImportError as e:
+        logger.error(f"Failed to import FLIR kernels from FLIR_PATH={FLIR_PATH}: {e}")
+        raise e
 
 BLOCK_SIZE_M = 32
 
@@ -821,11 +835,14 @@ def get_2stage_cfgs(
                     asm_stage1,
                     activation=activation,
                     quant_type=q_type,
+                    pf=3,
+                    co_exec=0,
                 ),
                 functools.partial(
                     asm_stage2,
                     activation=activation,
                     quant_type=q_type,
+                    tg=2,
                 ),
                 block_m=0,
                 ksplit=0,
@@ -1479,7 +1496,26 @@ def fused_moe_2stages(
     if use_reduce:
         extra_stage2_args["intermediate"] = moe_out
         moe_out = torch.empty(token_num, model_dim, dtype=moe_out.dtype, device=device)
+    if metadata.stage2.func == asm_stage2:
+        extra_stage2_args["asm_do_atomic"] = accumulate
 
+    if accumulate and metadata.stage2.func == asm_stage2:
+        if is_flydsl_available() and FLIR_PATH:
+            moe_intermediate = torch.empty(
+                token_num, topk, model_dim, device=device, dtype=moe_out.dtype
+            )
+        else:
+            moe_intermediate = torch.zeros(
+                (
+                    token_num,
+                    topk,
+                    model_dim,
+                ),
+                device=device,
+                dtype=moe_out.dtype,
+            )
+    else:
+        moe_intermediate = moe_out
     metadata.stage2(
         a2,
         w1,
@@ -1487,7 +1523,7 @@ def fused_moe_2stages(
         sorted_ids,
         sorted_expert_ids,
         num_valid_ids,
-        moe_out,
+        moe_intermediate,
         topk,
         w2_scale=(
             w2_scale.view(dtypes.fp8_e8m0) if w2.dtype == dtypes.fp4x2 else w2_scale
@@ -1499,6 +1535,29 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if not doweight_stage1 else None,
         **extra_stage2_args,
     )
+    if accumulate and metadata.stage2.func == asm_stage2:
+        if is_flydsl_available() and FLIR_PATH:
+            topk_ids = topk_ids.contiguous()
+            expert_mask = expert_mask.contiguous()
+
+            reduce_exe = compile_moe_reduction(
+                topk=topk,
+                model_dim=model_dim,
+                dtype_str="bf16",
+                use_mask=True,
+            )
+            reduce_exe(
+                moe_intermediate,
+                moe_out,
+                topk_ids,
+                expert_mask,
+                token_num,
+                torch.cuda.current_stream().cuda_stream,
+            )
+        else:
+            moe_out = moe_intermediate.sum(dim=1)
+    else:
+        moe_out = moe_intermediate
     return _normalize_moe_output_shape(moe_out)
 
 
@@ -1529,6 +1588,8 @@ def asm_stage1(
     w1_lqq_scale: Optional[torch.Tensor] = None,
     w1_lqq_zero: Optional[torch.Tensor] = None,
     sorted_weights=None,
+    pf=-1,
+    co_exec=-1,
 ):
     dtype = dtypes.bf16  # out.dtype, asm only support bf16
     if quant_type != QuantType.per_1x128:
@@ -1569,6 +1630,8 @@ def asm_stage1(
         w1_lqq_scale=w1_lqq_scale,
         w1_lqq_zero=w1_lqq_zero,
         sorted_weights=sorted_weights,
+        pf=pf,
+        co_exec=co_exec,
     )
     if ksplit > 0:
         if activation == ActivationType.Silu:
@@ -1599,8 +1662,10 @@ def asm_stage2(
     sorted_weights=None,
     intermediate=None,
     valid_mask=None,
+    tg=-1,
     **_kwargs,
 ):
+    do_atomic = int(_kwargs["asm_do_atomic"])
     return aiter.moe_stage2_g1u1(
         inter_states,
         w1,
@@ -1612,14 +1677,16 @@ def asm_stage2(
         topk,
         kernelName,
         block_m,
-        w2_scale,
-        a2_scale,
-        w2_lqq_scale,
-        w2_lqq_zero,
-        sorted_weights,
-        quant_type,
-        activation,
-        splitk,
+        w2_scale=w2_scale,
+        a2_scale=a2_scale,
+        w2_lqq_scale=w2_lqq_scale,
+        w2_lqq_zero=w2_lqq_zero,
+        sorted_weights=sorted_weights,
+        quant_type=quant_type,
+        activation=activation,
+        splitk=splitk,
+        tg=tg,
+        do_atomic=do_atomic,
     )
 
 

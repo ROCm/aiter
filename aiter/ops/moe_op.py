@@ -208,6 +208,9 @@ def moe_stage1_g1u1(
     fc2_smooth_scale: Optional[Tensor] = None,
     fc2_scale: Optional[Tensor] = None,
     sorted_weights: Optional[Tensor] = None,
+    *,
+    pf: int = -1,
+    co_exec: int = -1,
 ) -> None: ...
 
 
@@ -334,6 +337,9 @@ def moe_stage2_g1u1(
     quant_type: Optional[Enum] = QuantType.No.value,
     activation: Optional[Enum] = ActivationType.Silu.value,
     splitk: Optional[int] = 0,
+    *,
+    tg: int = -1,
+    do_atomic: int = -1,
 ) -> None: ...
 
 
