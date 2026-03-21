@@ -777,7 +777,13 @@ def get_2stage_cfgs(
 
     def use_asm_embedded_quantization():
         # For big model_dim ck's split-k is a better alternative
-        return model_dim <= 2048 and token > 1 and token < 16 and topk > 8 and (inter_dim % 128) == 0
+        return (
+            model_dim <= 2048
+            and token > 1
+            and token < 16
+            and topk > 8
+            and (inter_dim % 128) == 0
+        )
 
     def use_cfg():
         problem_type = (activation, dtype, q_dtype_a, q_dtype_w, q_type)
@@ -852,8 +858,9 @@ def get_2stage_cfgs(
 
         block_m = (
             (
-              (64 if (token * topk)/expert > 32 else BLOCK_SIZE_M)
-              if q_type == QuantType.per_1x128 else BLOCK_SIZE_M
+                (64 if (token * topk) / expert > 32 else BLOCK_SIZE_M)
+                if q_type == QuantType.per_1x128
+                else BLOCK_SIZE_M
             )
             if run_1stage
             else (
