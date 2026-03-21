@@ -1,0 +1,307 @@
+++ shopt -s expand_aliases
+++ alias 'l.=ls -d .* --color=auto'
+++ alias 'll=ls -l --color=auto'
+++ alias 'ls=ls --color=auto'
+++ alias python=python3
+++ export HIP_VISIBLE_DEVICES=6
+++ HIP_VISIBLE_DEVICES=6
+++ rocm-smi
+++ egrep '6    |Device'
+WARNING: AMD GPU device(s) is/are in a low-power state. Check power control/runtime_status
+
+Device  Node  IDs              Temp        Power     Partitions          SCLK    MCLK    Fan  Perf    PwrCap   VRAM%  GPU%  
+6       8     0x74a5,   20463  31.0°C      120.0W    NPS1, SPX, 0        115Mhz  900Mhz  0%   manual  1000.0W  0%     0%    
+7       6     0x74a5,   33762  25.0°C      112.0W    NPS1, SPX, 0        113Mhz  900Mhz  0%   manual  1000.0W  0%     0%    
+++ pip show triton
+Name: triton
+Version: 3.4.0+rocm7.1.0.gitf9e5bf54
+Summary: A language and compiler for custom Deep Learning operations
+Home-page: https://github.com/triton-lang/triton/
+Author: Philippe Tillet
+Author-email: phil@openai.com
+License: 
+Location: /opt/venv/lib/python3.12/site-packages
+Requires: setuptools
+Required-by: torch
+++ rocprofv3 --version
+             version: 1.0.0
+        git_revision: 
+        library_arch: x86_64-linux-gnu
+         system_name: Linux
+    system_processor: x86_64
+      system_version: 6.8.0-71-generic
+         compiler_id: GNU
+    compiler_version: 11.4.0
+        rocm_version: 7.1.0
+++ triton_cache_dir=/mnt/raid0/heyanguang/code/fa_triton/aiter/triton_cache2
+++ export TRITON_CACHE_DIR=/mnt/raid0/heyanguang/code/fa_triton/aiter/triton_cache2
+++ TRITON_CACHE_DIR=/mnt/raid0/heyanguang/code/fa_triton/aiter/triton_cache2
+++ run_aiter_op
+++ rm -rf /mnt/raid0/heyanguang/code/fa_triton/aiter/triton_cache2
+++ export AITER_LOG_MORE=1
+++ AITER_LOG_MORE=1
+++ export MLIR_ASM_VERBOSE=1
+++ MLIR_ASM_VERBOSE=1
+++ export FLIR_LOG_MORE=1
+++ FLIR_LOG_MORE=1
+++ export FLIR_DUMP_IR=1
+++ FLIR_DUMP_IR=1
+++ export FLIR_REBUILD=1
+++ FLIR_REBUILD=1
+++ export FLIR_DUMP_DIR=./flydsl_dump
+++ FLIR_DUMP_DIR=./flydsl_dump
+++ python3 op_tests/test_mha_ck_vs_torch.py -b 1 -n 64 -q 8192 -k 8192 -d_qk_v 128,128 -d bf16 -c --no-local -bt no -m mha -det --bf16-fwd-backend asm
+[aiter INFO] 2026-03-21 00:46:35.783 - MainProcess:48298 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/jit/core.py:497 - get_module_custom_op
+import [module_aiter_enum] under /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/jit/module_aiter_enum.so
+[aiter INFO] 2026-03-21 00:46:36.420 - MainProcess:48298 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/jit/core.py:497 - get_module_custom_op
+import [module_fmha_v3_fwd] under /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/jit/module_fmha_v3_fwd.so
+[aiter WARNING] 2026-03-21 00:46:36.421 - MainProcess:48298 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/jit/core.py:949 - check_args
+type hints mismatch, override to --> fmha_v3_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, dropout_p: float | typing.SupportsIndex, softmax_scale: float | typing.SupportsIndex, is_causal: bool, window_size_left: int | typing.SupportsIndex, window_size_right: int | typing.SupportsIndex, return_softmax_lse: bool, return_dropout_randval: bool, how_v3_bf16_cvt: int | typing.SupportsIndex, out: Optional[torch.Tensor] = None, bias: Optional[torch.Tensor] = None, alibi_slopes: Optional[torch.Tensor] = None, gen: Optional[torch.Generator] = None) -> List[torch.Tensor]
+[aiter] hipModuleLoad: /mnt/yanguahe/code/my_asm_code_wk2/aiter/hsa/gfx942/fmha_v3_fwd/MI300/fwd_hd128_bf16_causal_rtz.co GetFunction: _ZN5aiter30fmha_fwd_hd128_bf16_causal_rtzE Success
+[aiter INFO] 2026-03-21 00:46:36.603 - MainProcess:48298 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:84 - wrapper
+avg: 1751.2019919877005 us/iter from cuda.Event
+[W321 00:46:36.242955794 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 2 (function operator())
+[aiter INFO] 2026-03-21 00:46:36.804 - MainProcess:48298 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:309 - post_process_data
+abnormal data indices: {9, 914, 918}
+[aiter INFO] 2026-03-21 00:46:36.804 - MainProcess:48298 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:311 - post_process_data
+abnormal data: 1688.702
+[aiter INFO] 2026-03-21 00:46:36.804 - MainProcess:48298 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:311 - post_process_data
+abnormal data: 1880.821
+[aiter INFO] 2026-03-21 00:46:36.804 - MainProcess:48298 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:311 - post_process_data
+abnormal data: 1885.3009999999995
+[aiter INFO] 2026-03-21 00:46:36.814 - MainProcess:48298 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:390 - get_trace_perf
+                                                name   cnt  host_time_sum  device_time_sum device_type device_index
+0              aiter::fmha_fwd_hd128_bf16_causal_rtz  98.0            0.0        168,176.4        CUDA            8
+1                                 aiter::fmha_v3_fwd 100.0      171,942.5              0.0         CPU        48298
+[avg us/iter]                                    NaN   NaN        1,719.4          1,716.1         NaN          NaN
+==================================================================================================================================
+CK flash_attn_func correctness test  (run_ck vs run_torch)
+  GPU: AMD Instinct MI325X
+  backend: asm
+==================================================================================================================================
+
+                                                                  Config | Status |    MaxErr    PtDiff       Tol |  LSE_diff |         us   TFLOPS
+---------------------------------------------------------------------------------------------------------------------------------------------------
+
+  [B=1 Sq=8192 Sk=8192 H=64 D=128 Dv=128 mha causal  bias=no torch.bfloat16] --- detailed comparison ---
+  result_md5 = ccf20c4e83d5c527e7a91f96d1b33862
+  ref_md5    = 1405d80408ed5fced54248732935bd41
+  MD5 match: DIFFER
+  diff.abs.max  = 0.031250
+  diff.abs.mean = 0.000158
+  max_diff_thr (rel) = 1.030928e-02
+  Top-5 differences:
+    [(np.int64(0), np.int64(2), np.int64(57), np.int64(87))] ck=-3.421875, ref=-3.453125, diff=0.031250
+    [(np.int64(0), np.int64(1), np.int64(7), np.int64(61))] ck=3.328125, ref=3.359375, diff=0.031250
+    [(np.int64(0), np.int64(8), np.int64(51), np.int64(121))] ck=-2.000000, ref=-2.031250, diff=0.031250
+    [(np.int64(0), np.int64(3), np.int64(49), np.int64(41))] ck=2.234375, ref=2.265625, diff=0.031250
+    [(np.int64(0), np.int64(8), np.int64(2), np.int64(7))] ck=1.242188, ref=1.257812, diff=0.015625
+  Threshold distribution (67108864 elements):
+    [0e+00, 1e-06): 11025983 ( 16.43%)
+    [1e-06, 1e-05):   559161 (  0.83%)
+    [1e-05, 1e-04): 18258224 ( 27.21%)
+    [1e-04, 1e-03): 36952767 ( 55.06%)
+    [1e-03, 1e-02):   312451 (  0.47%)
+    [1e-02, 1e-01):      278 (  0.00%)
+    [1e-01, 1e+00):        0 (  0.00%)
+    [1e+00, 1e+01):        0 (  0.00%)
+    >=1e+01       :        0 (  0.00%)
+B=1 Sq=8192 Sk=8192 H=64 D=128 Dv=128 mha causal  bias=no torch.bfloat16 |   PASS |  3.12e-02  1.56e-02  3.12e-02 |  3.13e-02 |     1716.1  640.709
+==================================================================================================================================
+Total: 1  PASS: 1  FAIL: 0  ERROR: 0
+All tests PASSED
+++ python3 op_tests/test_mha_ck_vs_torch.py -b 1 -n 64 -q 8192 -k 8192 -d_qk_v 128,128 -d fp16 -c --no-local -bt no -m mha -det --bf16-fwd-backend asm
+[aiter INFO] 2026-03-21 00:46:43.856 - MainProcess:48388 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/jit/core.py:497 - get_module_custom_op
+import [module_aiter_enum] under /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/jit/module_aiter_enum.so
+[aiter INFO] 2026-03-21 00:46:44.524 - MainProcess:48388 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/jit/core.py:497 - get_module_custom_op
+import [mha_fwd_fp16_nbias_mask_lse_ndropout_nqscale] under /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/jit/mha_fwd_fp16_nbias_mask_lse_ndropout_nqscale.so
+[aiter WARNING] 2026-03-21 00:46:44.525 - MainProcess:48388 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/jit/core.py:949 - check_args
+type hints mismatch, override to --> mha_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, dropout_p: float | typing.SupportsIndex, softmax_scale: float | typing.SupportsIndex, is_causal: bool, window_size_left: int | typing.SupportsIndex, window_size_right: int | typing.SupportsIndex, sink_size: int | typing.SupportsIndex, return_softmax_lse: bool, return_dropout_randval: bool, cu_seqlens_q: Optional[torch.Tensor] = None, cu_seqlens_kv: Optional[torch.Tensor] = None, out: Optional[torch.Tensor] = None, bias: Optional[torch.Tensor] = None, alibi_slopes: Optional[torch.Tensor] = None, q_descale: Optional[torch.Tensor] = None, k_descale: Optional[torch.Tensor] = None, v_descale: Optional[torch.Tensor] = None, gen: Optional[torch.Generator] = None) -> List[torch.Tensor]
+[aiter INFO] 2026-03-21 00:46:44.813 - MainProcess:48388 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:84 - wrapper
+avg: 2766.9528309661564 us/iter from cuda.Event
+[W321 00:46:45.557401318 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 5 (function operator())
+[aiter INFO] 2026-03-21 00:46:45.130 - MainProcess:48388 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:309 - post_process_data
+abnormal data indices: {601, 1421, 14}
+[aiter INFO] 2026-03-21 00:46:45.130 - MainProcess:48388 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:311 - post_process_data
+abnormal data: 2885.171
+[aiter INFO] 2026-03-21 00:46:45.130 - MainProcess:48388 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:311 - post_process_data
+abnormal data: 2748.1319999999996
+[aiter INFO] 2026-03-21 00:46:45.130 - MainProcess:48388 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:311 - post_process_data
+abnormal data: 2619.254
+[aiter INFO] 2026-03-21 00:46:45.142 - MainProcess:48388 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:390 - get_trace_perf
+                                                                                                    name   cnt  host_time_sum  device_time_sum device_type device_index
+0              void ck_tile::kentry<ck_tile::gfx9_t, 2, ck_tile::FmhaFwdKernel<ck_tile::BlockFmhaPipe...  98.0            0.0        266,508.7        CUDA            8
+1                                                                                         aiter::mha_fwd 100.0      272,142.0              0.0         CPU        48388
+[avg us/iter]                                                                                        NaN   NaN        2,721.4          2,719.5         NaN          NaN
+==================================================================================================================================
+CK flash_attn_func correctness test  (run_ck vs run_torch)
+  GPU: AMD Instinct MI325X
+  backend: asm
+==================================================================================================================================
+
+                                                                  Config | Status |    MaxErr    PtDiff       Tol |  LSE_diff |         us   TFLOPS
+---------------------------------------------------------------------------------------------------------------------------------------------------
+
+  [B=1 Sq=8192 Sk=8192 H=64 D=128 Dv=128 mha causal  bias=no torch.float16] --- detailed comparison ---
+  result_md5 = 9356f5dbf7795380795e5767f4cd052d
+  ref_md5    = 3872a0725859833e4abeef07bcd0a5a2
+  MD5 match: DIFFER
+  diff.abs.max  = 0.001953
+  diff.abs.mean = 0.000011
+  max_diff_thr (rel) = 6.506181e-04
+  Top-5 differences:
+    [(np.int64(0), np.int64(6), np.int64(52), np.int64(53))] ck=-2.183594, ref=-2.185547, diff=0.001953
+    [(np.int64(0), np.int64(0), np.int64(27), np.int64(15))] ck=-2.978516, ref=-2.980469, diff=0.001953
+    [(np.int64(0), np.int64(1), np.int64(25), np.int64(123))] ck=-2.259766, ref=-2.261719, diff=0.001953
+    [(np.int64(0), np.int64(1), np.int64(25), np.int64(74))] ck=-2.228516, ref=-2.230469, diff=0.001953
+    [(np.int64(0), np.int64(0), np.int64(44), np.int64(125))] ck=-3.214844, ref=-3.216797, diff=0.001953
+  Threshold distribution (67108864 elements):
+    [0e+00, 1e-06): 27605850 ( 41.14%)
+    [1e-06, 1e-05): 16806856 ( 25.04%)
+    [1e-05, 1e-04): 22096396 ( 32.93%)
+    [1e-04, 1e-03):   599717 (  0.89%)
+    [1e-03, 1e-02):       45 (  0.00%)
+    [1e-02, 1e-01):        0 (  0.00%)
+    [1e-01, 1e+00):        0 (  0.00%)
+    [1e+00, 1e+01):        0 (  0.00%)
+    >=1e+01       :        0 (  0.00%)
+ B=1 Sq=8192 Sk=8192 H=64 D=128 Dv=128 mha causal  bias=no torch.float16 |   PASS |  1.95e-03  1.95e-03  1.00e-02 |  3.91e-03 |     2719.5  404.310
+==================================================================================================================================
+Total: 1  PASS: 1  FAIL: 0  ERROR: 0
+All tests PASSED
+++ python3 op_tests/test_mha_ck_vs_torch.py -b 1 -n 64 -q 8192 -k 8192 -d_qk_v 128,128 -d bf16 -c --no-local -bt no -m mha -det --bf16-fwd-backend ck
+[aiter INFO] 2026-03-21 00:46:51.502 - MainProcess:48473 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/jit/core.py:497 - get_module_custom_op
+import [module_aiter_enum] under /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/jit/module_aiter_enum.so
+[aiter INFO] 2026-03-21 00:46:52.202 - MainProcess:48473 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/jit/core.py:497 - get_module_custom_op
+import [mha_fwd_bf16_nbias_mask_lse_ndropout_nqscale] under /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/jit/mha_fwd_bf16_nbias_mask_lse_ndropout_nqscale.so
+[aiter WARNING] 2026-03-21 00:46:52.203 - MainProcess:48473 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/jit/core.py:949 - check_args
+type hints mismatch, override to --> mha_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, dropout_p: float | typing.SupportsIndex, softmax_scale: float | typing.SupportsIndex, is_causal: bool, window_size_left: int | typing.SupportsIndex, window_size_right: int | typing.SupportsIndex, sink_size: int | typing.SupportsIndex, return_softmax_lse: bool, return_dropout_randval: bool, cu_seqlens_q: Optional[torch.Tensor] = None, cu_seqlens_kv: Optional[torch.Tensor] = None, out: Optional[torch.Tensor] = None, bias: Optional[torch.Tensor] = None, alibi_slopes: Optional[torch.Tensor] = None, q_descale: Optional[torch.Tensor] = None, k_descale: Optional[torch.Tensor] = None, v_descale: Optional[torch.Tensor] = None, gen: Optional[torch.Generator] = None) -> List[torch.Tensor]
+[aiter INFO] 2026-03-21 00:46:52.482 - MainProcess:48473 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:84 - wrapper
+avg: 2677.8926164797035 us/iter from cuda.Event
+[W321 00:46:52.217195952 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 5 (function operator())
+[aiter INFO] 2026-03-21 00:46:52.789 - MainProcess:48473 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:309 - post_process_data
+abnormal data indices: {651, 1340, 1421, 14}
+[aiter INFO] 2026-03-21 00:46:52.789 - MainProcess:48473 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:311 - post_process_data
+abnormal data: 2757.412
+[aiter INFO] 2026-03-21 00:46:52.789 - MainProcess:48473 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:311 - post_process_data
+abnormal data: 2659.174000000001
+[aiter INFO] 2026-03-21 00:46:52.789 - MainProcess:48473 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:311 - post_process_data
+abnormal data: 2656.054
+[aiter INFO] 2026-03-21 00:46:52.789 - MainProcess:48473 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:311 - post_process_data
+abnormal data: 2781.253
+[aiter INFO] 2026-03-21 00:46:52.800 - MainProcess:48473 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:390 - get_trace_perf
+                                                                                                    name   cnt  host_time_sum  device_time_sum device_type device_index
+0              void ck_tile::kentry<ck_tile::gfx9_t, 2, ck_tile::FmhaFwdKernel<ck_tile::BlockFmhaPipe...  97.0            0.0        255,107.8        CUDA            8
+1                                                                                         aiter::mha_fwd 100.0      263,180.4              0.0         CPU        48473
+[avg us/iter]                                                                                        NaN   NaN        2,631.8          2,630.0         NaN          NaN
+==================================================================================================================================
+CK flash_attn_func correctness test  (run_ck vs run_torch)
+  GPU: AMD Instinct MI325X
+  backend: ck
+==================================================================================================================================
+
+                                                                  Config | Status |    MaxErr    PtDiff       Tol |  LSE_diff |         us   TFLOPS
+---------------------------------------------------------------------------------------------------------------------------------------------------
+
+  [B=1 Sq=8192 Sk=8192 H=64 D=128 Dv=128 mha causal  bias=no torch.bfloat16] --- detailed comparison ---
+  result_md5 = e87a3ce66d9f18693137c5a0bd23e104
+  ref_md5    = 1405d80408ed5fced54248732935bd41
+  MD5 match: DIFFER
+  diff.abs.max  = 0.031250
+  diff.abs.mean = 0.000159
+  max_diff_thr (rel) = 1.030928e-02
+  Top-5 differences:
+    [(np.int64(0), np.int64(1), np.int64(7), np.int64(61))] ck=3.328125, ref=3.359375, diff=0.031250
+    [(np.int64(0), np.int64(2), np.int64(57), np.int64(87))] ck=-3.421875, ref=-3.453125, diff=0.031250
+    [(np.int64(0), np.int64(8), np.int64(51), np.int64(121))] ck=-2.000000, ref=-2.031250, diff=0.031250
+    [(np.int64(0), np.int64(3), np.int64(49), np.int64(41))] ck=2.234375, ref=2.265625, diff=0.031250
+    [(np.int64(0), np.int64(2), np.int64(0), np.int64(18))] ck=2.015625, ref=2.031250, diff=0.015625
+  Threshold distribution (67108864 elements):
+    [0e+00, 1e-06): 10941327 ( 16.30%)
+    [1e-06, 1e-05):   560824 (  0.84%)
+    [1e-05, 1e-04): 18268862 ( 27.22%)
+    [1e-04, 1e-03): 37018330 ( 55.16%)
+    [1e-03, 1e-02):   319243 (  0.48%)
+    [1e-02, 1e-01):      278 (  0.00%)
+    [1e-01, 1e+00):        0 (  0.00%)
+    [1e+00, 1e+01):        0 (  0.00%)
+    >=1e+01       :        0 (  0.00%)
+B=1 Sq=8192 Sk=8192 H=64 D=128 Dv=128 mha causal  bias=no torch.bfloat16 |   PASS |  3.12e-02  1.56e-02  3.12e-02 |  3.13e-02 |     2630.0  418.069
+==================================================================================================================================
+Total: 1  PASS: 1  FAIL: 0  ERROR: 0
+All tests PASSED
+++ python3 op_tests/test_mha_ck_vs_torch.py -b 1 -n 64 -q 8192 -k 8192 -d_qk_v 128,128 -d fp16 -c --no-local -bt no -m mha -det --bf16-fwd-backend ck
+[aiter INFO] 2026-03-21 00:46:59.135 - MainProcess:48558 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/jit/core.py:497 - get_module_custom_op
+import [module_aiter_enum] under /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/jit/module_aiter_enum.so
+[aiter INFO] 2026-03-21 00:46:59.714 - MainProcess:48558 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/jit/core.py:497 - get_module_custom_op
+import [mha_fwd_fp16_nbias_mask_lse_ndropout_nqscale] under /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/jit/mha_fwd_fp16_nbias_mask_lse_ndropout_nqscale.so
+[aiter WARNING] 2026-03-21 00:46:59.715 - MainProcess:48558 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/jit/core.py:949 - check_args
+type hints mismatch, override to --> mha_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, dropout_p: float | typing.SupportsIndex, softmax_scale: float | typing.SupportsIndex, is_causal: bool, window_size_left: int | typing.SupportsIndex, window_size_right: int | typing.SupportsIndex, sink_size: int | typing.SupportsIndex, return_softmax_lse: bool, return_dropout_randval: bool, cu_seqlens_q: Optional[torch.Tensor] = None, cu_seqlens_kv: Optional[torch.Tensor] = None, out: Optional[torch.Tensor] = None, bias: Optional[torch.Tensor] = None, alibi_slopes: Optional[torch.Tensor] = None, q_descale: Optional[torch.Tensor] = None, k_descale: Optional[torch.Tensor] = None, v_descale: Optional[torch.Tensor] = None, gen: Optional[torch.Generator] = None) -> List[torch.Tensor]
+[aiter INFO] 2026-03-21 00:47:00.003 - MainProcess:48558 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:84 - wrapper
+avg: 2766.0355190239334 us/iter from cuda.Event
+[W321 00:47:00.746678695 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 5 (function operator())
+[aiter INFO] 2026-03-21 00:47:00.318 - MainProcess:48558 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:309 - post_process_data
+abnormal data indices: {14, 591}
+[aiter INFO] 2026-03-21 00:47:00.318 - MainProcess:48558 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:311 - post_process_data
+abnormal data: 2583.534
+[aiter INFO] 2026-03-21 00:47:00.318 - MainProcess:48558 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:311 - post_process_data
+abnormal data: 2828.4509999999996
+[aiter INFO] 2026-03-21 00:47:00.330 - MainProcess:48558 - /mnt/yanguahe/code/my_asm_code_wk2/aiter/aiter/test_common.py:390 - get_trace_perf
+                                                                                                    name   cnt  host_time_sum  device_time_sum device_type device_index
+0              void ck_tile::kentry<ck_tile::gfx9_t, 2, ck_tile::FmhaFwdKernel<ck_tile::BlockFmhaPipe...  99.0            0.0        268,946.0        CUDA            8
+1                                                                                         aiter::mha_fwd 100.0      271,774.5              0.0         CPU        48558
+[avg us/iter]                                                                                        NaN   NaN        2,717.7          2,716.6         NaN          NaN
+==================================================================================================================================
+CK flash_attn_func correctness test  (run_ck vs run_torch)
+  GPU: AMD Instinct MI325X
+  backend: ck
+==================================================================================================================================
+
+                                                                  Config | Status |    MaxErr    PtDiff       Tol |  LSE_diff |         us   TFLOPS
+---------------------------------------------------------------------------------------------------------------------------------------------------
+
+  [B=1 Sq=8192 Sk=8192 H=64 D=128 Dv=128 mha causal  bias=no torch.float16] --- detailed comparison ---
+  result_md5 = 9356f5dbf7795380795e5767f4cd052d
+  ref_md5    = 3872a0725859833e4abeef07bcd0a5a2
+  MD5 match: DIFFER
+  diff.abs.max  = 0.001953
+  diff.abs.mean = 0.000011
+  max_diff_thr (rel) = 6.506181e-04
+  Top-5 differences:
+    [(np.int64(0), np.int64(6), np.int64(52), np.int64(53))] ck=-2.183594, ref=-2.185547, diff=0.001953
+    [(np.int64(0), np.int64(0), np.int64(27), np.int64(15))] ck=-2.978516, ref=-2.980469, diff=0.001953
+    [(np.int64(0), np.int64(1), np.int64(25), np.int64(123))] ck=-2.259766, ref=-2.261719, diff=0.001953
+    [(np.int64(0), np.int64(1), np.int64(25), np.int64(74))] ck=-2.228516, ref=-2.230469, diff=0.001953
+    [(np.int64(0), np.int64(0), np.int64(44), np.int64(125))] ck=-3.214844, ref=-3.216797, diff=0.001953
+  Threshold distribution (67108864 elements):
+    [0e+00, 1e-06): 27605850 ( 41.14%)
+    [1e-06, 1e-05): 16806856 ( 25.04%)
+    [1e-05, 1e-04): 22096396 ( 32.93%)
+    [1e-04, 1e-03):   599717 (  0.89%)
+    [1e-03, 1e-02):       45 (  0.00%)
+    [1e-02, 1e-01):        0 (  0.00%)
+    [1e-01, 1e+00):        0 (  0.00%)
+    [1e+00, 1e+01):        0 (  0.00%)
+    >=1e+01       :        0 (  0.00%)
+ B=1 Sq=8192 Sk=8192 H=64 D=128 Dv=128 mha causal  bias=no torch.float16 |   PASS |  1.95e-03  1.95e-03  1.00e-02 |  3.91e-03 |     2716.6  404.734
+==================================================================================================================================
+Total: 1  PASS: 1  FAIL: 0  ERROR: 0
+All tests PASSED
+++ for ctx_ps in 256
+++ for b_val in 110
+++ echo 'Running with -b 110 --context_partition_size 256'
+Running with -b 110 --context_partition_size 256
+++ copy_recent_amdgcn_files
+++ dir_name=pa_decode_v2_gluon_fp8
+++ local k=200
+++ local dest_dir=/mnt/yanguahe/code/my_asm_code_wk2/aiter/thread_trace/triton_gen_asm/pa_decode_v2_gluon_fp8
+++ kernel_name=paged_attention_decode_v2_gluon_
+++ file_filter='*paged_attention_decode_v2_gluon_*'
+++ amdgcn_filter='/mnt/raid0/heyanguang/code/fa_triton/aiter/triton_cache2/*/*paged_attention_decode_v2_gluon_*.amdgcn'
+++ json_filter='/mnt/raid0/heyanguang/code/fa_triton/aiter/triton_cache2/*/paged_attention_decode_v2_gluon_*.json'
+++ cat '/mnt/raid0/heyanguang/code/fa_triton/aiter/triton_cache2/*/paged_attention_decode_v2_gluon_*.json'
+cat: '/mnt/raid0/heyanguang/code/fa_triton/aiter/triton_cache2/*/paged_attention_decode_v2_gluon_*.json': No such file or directory
+++ cat '/mnt/raid0/heyanguang/code/fa_triton/aiter/triton_cache2/*/*paged_attention_decode_v2_gluon_*.amdgcn'
+++ egrep '.sgpr_count|.sgpr_spill_count|.vgpr_count|.vgpr_spill_count|SGPRBlocks|VGPRBlocks|Occupancy'
+cat: '/mnt/raid0/heyanguang/code/fa_triton/aiter/triton_cache2/*/*paged_attention_decode_v2_gluon_*.amdgcn': No such file or directory
+++ set +x
