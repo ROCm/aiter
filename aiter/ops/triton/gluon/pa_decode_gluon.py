@@ -22,6 +22,25 @@ except ImportError:
     gl = tl
     GLUON_JIT_KERNEL_ENABLED = False
 
+try:
+    from triton.experimental.gluon.language.amd.cdna3 import (
+        sched_barrier as _amd_iglp_sched_barrier,
+        sched_group_barrier as _amd_iglp_sched_group_barrier,
+        set_prio as _amd_set_prio,
+    )
+except ImportError:
+    # ignore iglp hint
+    @gluon.jit
+    def _amd_iglp_sched_barrier(inst_mask):
+        pass
+
+    @gluon.jit
+    def _amd_iglp_sched_group_barrier(inst_mask, cnt, _):
+        pass
+
+    @gluon.jit
+    def _amd_set_prio(value, prio):
+        pass
 
 @lru_cache(maxsize=1)
 def get_cdna_version():
@@ -1035,6 +1054,13 @@ def paged_attention_decode_sliding_window_head_1(
     if KV_QUANT_MODE >= 0:
         gl.static_assert(key_scale.dtype.element_ty == gl.float32)
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
+
+    # DS_WRITE: gl.constexpr = 0x200
+    DS_READ: gl.constexpr = 0x100
+    BUFFER_LOAD: gl.constexpr = 0x020
+    MFMA: gl.constexpr = 0x008
+    # VALU: gl.constexpr = 0x002
+
     sequence_idx = gl.program_id(0)
     mtp_idx = gl.program_id(1)
     split_idx = gl.program_id(2)
