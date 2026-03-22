@@ -432,19 +432,6 @@ namespace py = pybind11;
           "wvSplitKQ(Tensor in_a, Tensor in_b, Tensor! out_c, Tensor scale_a, Tensor scale_b, " \
           "int CuCount) -> ()");
 
-#define GEMM_A8W8_ASM_PYBIND                                            \
-    m.def("gemm_a8w8_asm",                                              \
-          &gemm_a8w8_asm,                                               \
-          "Asm gemm a8w8 ,  weight should be shuffle to layout(32,16)", \
-          py::arg("XQ"),                                                \
-          py::arg("WQ"),                                                \
-          py::arg("x_scale"),                                           \
-          py::arg("w_scale"),                                           \
-          py::arg("Out"),                                               \
-          py::arg("kernelName"),                                        \
-          py::arg("bias"),                                              \
-          py::arg("bpreshuffle") = true,                                \
-          py::arg("splitK")      = std::nullopt);
 
 #define GEMM_A16W16_ASM_PYBIND                   \
     m.def("gemm_a16w16_asm",                     \
@@ -459,21 +446,6 @@ namespace py = pybind11;
           py::arg("kernelName")  = std::nullopt, \
           py::arg("bpreshuffle") = false);
 
-#define GEMM_A4W4_ASM_PYBIND                      \
-    m.def("gemm_a4w4_asm",                        \
-          &gemm_a4w4_asm,                         \
-          "Asm gemm a4w4",                        \
-          py::arg("A"),                           \
-          py::arg("B"),                           \
-          py::arg("A_scale"),                     \
-          py::arg("B_scale"),                     \
-          py::arg("out"),                         \
-          py::arg("kernelName"),                  \
-          py::arg("bias")         = std::nullopt, \
-          py::arg("alpha")        = 1.0,          \
-          py::arg("beta")         = 0.0,          \
-          py::arg("bpreshuffle")  = true,         \
-          py::arg("log2_k_split") = std::nullopt);
 
 #define FLATMM_A8W8_BLOCKSCALE_ASM_PYBIND \
     m.def("flatmm_a8w8_blockscale_asm",   \
@@ -485,19 +457,6 @@ namespace py = pybind11;
           py::arg("w_scale"),             \
           py::arg("Out"));
 
-#define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_ASM_PYBIND                  \
-    m.def("gemm_a8w8_blockscale_bpreshuffle_asm",                    \
-          &gemm_a8w8_blockscale_bpreshuffle_asm,                     \
-          "FP8 blockscale BpreShuffle GEMM assembly implementation", \
-          py::arg("A"),                                              \
-          py::arg("B"),                                              \
-          py::arg("out"),                                            \
-          py::arg("A_scale"),                                        \
-          py::arg("B_scale"),                                        \
-          py::arg("bias")        = py::none(),                       \
-          py::arg("splitK")      = py::none(),                       \
-          py::arg("kernelName")  = py::none(),                       \
-          py::arg("bpreshuffle") = true);
 
 #define GEMM_A4W4_BLOCKSCALE_PYBIND \
     m.def("gemm_a4w4_blockscale",   \
