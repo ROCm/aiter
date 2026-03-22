@@ -16,6 +16,14 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 
 import os
 
+# CK-free: Triton MLA decode fallback
+import os as _mla_os
+AITER_USE_ASM_MLA = _mla_os.getenv('AITER_USE_ASM_MLA', '1') == '1'
+if not AITER_USE_ASM_MLA:
+    from aiter.ops.triton.attention.mla_decode_rope import decode_attention_fwd_grouped_rope
+    print('[MLA] Triton MLA decode enabled (ASM disabled)')
+
+
 
 @triton.jit
 def _fwd_kernel_stage2_asm(
@@ -223,7 +231,8 @@ def mla_decode_fwd(
         )
         final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
 
-        aiter.mla_decode_stage1_asm_fwd(
+        if AITER_USE_ASM_MLA:
+            aiter.mla_decode_stage1_asm_fwd(
             q,
             kv_buffer,
             qo_indptr,
@@ -245,6 +254,28 @@ def mla_decode_fwd(
             q_scale,
             kv_scale,
         )
+        else:
+            # Triton MLA decode
+            _, _, _nkv, _hdim = kv_buffer.shape
+            _kv_flat = kv_buffer.view(-1, _nkv, _hdim)
+            _kv_lora_rank = v_head_dim
+            _qk_rope_dim = _hdim - _kv_lora_rank
+            _v_flat = _kv_flat[:, :, :_kv_lora_rank].contiguous()
+            import torch as _torch
+            _triton_logits = _torch.empty(
+                (bs, nhead, num_kv_splits, _kv_lora_rank + 1),
+                dtype=_torch.float32, device=device)
+            decode_attention_fwd_grouped_rope(
+                q, _kv_flat, _v_flat, o,
+                kv_indptr, kv_indices,
+                None, _kv_lora_rank, _qk_rope_dim,
+                None, None, _triton_logits,
+                num_kv_splits, sm_scale,
+                logit_cap=0.0, use_rope=False, is_neox_style=False)
+            if return_lse:
+                return o, attn_lse
+            return o, None
+
 
         if num_kv_splits == 1 and (
             q.dtype == dtypes.fp8
