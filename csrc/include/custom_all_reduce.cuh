@@ -2320,6 +2320,7 @@ class CustomAllreduce
         }                                                \
         break;                                           \
     }
+#undef dispatch
 
         switch(world_size_)
         {
