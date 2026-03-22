@@ -298,21 +298,9 @@ def fused_qk_rope_reshape_and_cache(
     if flash_layout:
         t_cache, block_size, kh_cache, dk_cache = key_cache.shape
         t_cache_v, block_size_v, vh_cache, dv_cache = value_cache.shape
-        value_shuffle_layout = False
     else:
         t_cache, kh_cache, dkx_cache, block_size, x_cache = key_cache.shape
-        if value_cache.ndim == 5:
-            # value_cache shuffle: (num_blocks, num_kv_heads, block_size // x, head_size, x)
-            t_cache_v, vh_cache, slot_chunk_v, dv_cache, x_v = value_cache.shape
-            value_shuffle_layout = True
-            block_size_v = slot_chunk_v * x_v
-            assert block_size_v == block_size and x_v == x_cache, (
-                f"value_cache shuffle (T,KH,block_size//x,D,x) must match key: "
-                f"{block_size_v=} {block_size=} {x_v=} {x_cache=}"
-            )
-        else:
-            t_cache_v, vh_cache, dv_cache, block_size_v = value_cache.shape
-            value_shuffle_layout = False
+        t_cache_v, vh_cache, dv_cache, block_size_v = value_cache.shape
     (t_slot,) = slot_mapping.shape
 
     assert (
@@ -397,18 +385,8 @@ def fused_qk_rope_reshape_and_cache(
         key_cache.stride(4) if not flash_layout else 0,
         value_cache.stride(0) if not flash_layout else value_cache.stride(0),
         value_cache.stride(1) if not flash_layout else value_cache.stride(2),
-        (
-            value_cache.stride(3)
-            if (not flash_layout and value_shuffle_layout)
-            else (value_cache.stride(2) if not flash_layout else value_cache.stride(3))
-        ),
-        (
-            0
-            if (not flash_layout and value_shuffle_layout)
-            else (value_cache.stride(3) if not flash_layout else value_cache.stride(1))
-        ),
-        value_cache.stride(2) if (not flash_layout and value_shuffle_layout) else 0,
-        value_cache.stride(4) if (not flash_layout and value_shuffle_layout) else 0,
+        value_cache.stride(2) if not flash_layout else value_cache.stride(3),
+        value_cache.stride(3) if not flash_layout else value_cache.stride(1),
         zeros_out.stride(0) if zeros_out is not None else 0,
         zeros_out.stride(1) if zeros_out is not None else 0,
         zeros_out.stride(2) if zeros_out is not None else 0,
@@ -424,7 +402,6 @@ def fused_qk_rope_reshape_and_cache(
         BLOCK_SIZE=block_size,
         X_SIZE=x_cache if not flash_layout else 0,
         FLASH_LAYOUT=flash_layout,
-        VALUE_SHUFFLE_LAYOUT=value_shuffle_layout,
         HAVE_POS=(offs is not None),
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
         HAVE_V_SCALE=(v_scale is not None and apply_scale),
