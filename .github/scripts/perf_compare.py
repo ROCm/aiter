@@ -26,8 +26,9 @@ def load_csv(path):
 
 def get_baseline_from_artifact(repo="ROCm/aiter"):
     """Try to fetch the latest perf results from main branch artifacts."""
-    # This would use the GitHub API to download the latest artifact
-    # For now, return empty — baseline builds up over time
+    # TODO (Phase 2): Download latest perf-results artifact from main branch
+    # workflow run via GitHub API. For now, returns empty — baseline builds up
+    # after the first push-to-main run produces an artifact.
     return []
 
 

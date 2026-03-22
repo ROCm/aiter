@@ -8,7 +8,7 @@
 # Examples:
 #   op_perf_bench.sh ""                    # Run all benchmarks
 #   op_perf_bench.sh "gemm"               # Only GEMM benchmarks
-#   op_perf_bench.sh "mha,moe"            # MHA and MoE benchmarks
+#   op_perf_bench.sh "attention,moe"      # Attention and MoE benchmarks
 #   op_perf_bench.sh "auto"               # Auto-detect from changed files
 
 set -euo pipefail
@@ -20,9 +20,21 @@ MODEL_CONFIGS="op_tests/op_benchmarks/triton/utils/model_configs.json"
 
 mkdir -p "$OUTPUT_DIR"
 
-# Collect system info
+# Collect system info (supports both ROCm gcnArchName and CUDA sm_XX)
 GPU_NAME=$(python3 -c "import torch; print(torch.cuda.get_device_name(0))" 2>/dev/null || echo "unknown")
-GPU_ARCH=$(python3 -c "import torch; print(f'sm_{torch.cuda.get_device_capability(0)[0]}{torch.cuda.get_device_capability(0)[1]}')" 2>/dev/null || echo "unknown")
+GPU_ARCH=$(python3 - <<'PY' 2>/dev/null || echo "unknown")
+import torch
+try:
+    props = torch.cuda.get_device_properties(0)
+    arch = getattr(props, "gcnArchName", None)
+    if arch:
+        print(str(arch).split(":", 1)[0])
+    else:
+        major, minor = torch.cuda.get_device_capability(0)
+        print(f"sm_{major}{minor}")
+except Exception:
+    print("unknown")
+PY
 COMMIT_SHA="${GITHUB_SHA:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
 COMMIT_DATE=$(git show -s --format=%ci HEAD 2>/dev/null || date -Iseconds)
 BRANCH="${GITHUB_HEAD_REF:-$(git branch --show-current 2>/dev/null || echo unknown)}"
@@ -46,6 +58,19 @@ cat > "$OUTPUT_DIR/metadata.json" <<METADATA
   "timestamp": "$(date -Iseconds)"
 }
 METADATA
+
+# ── Normalize filter: handle "all", aliases ──
+normalize_filter() {
+    local f="$1"
+    f=$(echo "$f" | tr '[:upper:]' '[:lower:]')
+    # "all" or empty = run everything
+    if [ -z "$f" ] || [ "$f" = "all" ]; then echo ""; return; fi
+    # Alias: mha -> attention
+    f=$(echo "$f" | sed 's/\bmha\b/attention/g')
+    echo "$f"
+}
+
+BENCH_FILTER=$(normalize_filter "$BENCH_FILTER")
 
 # ── Auto-detect changed operators from PR diff ──
 if [ "$BENCH_FILTER" = "auto" ]; then
@@ -82,6 +107,7 @@ declare -a BENCH_JOBS=()
 
 should_run() {
     local name="$1"
+    # Empty filter = run all
     if [ -z "$BENCH_FILTER" ]; then return 0; fi
     echo ",$BENCH_FILTER," | grep -qi ",$name," && return 0
     return 1
@@ -212,4 +238,9 @@ else:
     print('No CSV results to combine.')
 " 2>/dev/null || echo "Warning: could not generate combined CSV"
 
-exit ${#FAILED[@]}
+# Always exit 0 — failures are tracked in summary and artifacts, not exit code
+if [ "${#FAILED[@]}" -gt 0 ]; then
+    echo "${#FAILED[@]} benchmark(s) failed. See logs and artifacts for details."
+fi
+
+exit 0

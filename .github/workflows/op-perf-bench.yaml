@@ -1,6 +1,6 @@
 name: Op Performance Bench
 
-# Trigger: PR with ci:perf label, push to main, or manual
+# Trigger: PR with ci:perf label (non-draft only), push to main, or manual
 on:
   push:
     branches: [main]
@@ -16,10 +16,6 @@ on:
         description: 'Comma-separated benchmarks to run (gemm,attention,moe,rmsnorm,rope) or "all"'
         required: false
         default: 'auto'
-      batch_sizes:
-        description: 'Batch sizes to benchmark (comma-separated)'
-        required: false
-        default: '1,16,256,4096'
 
 concurrency:
   group: perf-${{ github.workflow }}-${{ github.ref }}
@@ -33,11 +29,16 @@ env:
 
 jobs:
   check-trigger:
-    # Only run on PRs with ci:perf or ci:all label, or on push/dispatch
+    # Skip draft PRs; only run on non-draft PRs with ci:perf or ci:all label
     if: >-
       github.event_name != 'pull_request' ||
-      contains(github.event.pull_request.labels.*.name, 'ci:perf') ||
-      contains(github.event.pull_request.labels.*.name, 'ci:all')
+      (
+        !github.event.pull_request.draft &&
+        (
+          contains(github.event.pull_request.labels.*.name, 'ci:perf') ||
+          contains(github.event.pull_request.labels.*.name, 'ci:all')
+        )
+      )
     runs-on: ubuntu-latest
     outputs:
       should_run: ${{ steps.check.outputs.should_run }}
@@ -50,6 +51,10 @@ jobs:
     if: needs.check-trigger.outputs.should_run == 'true'
     runs-on: aiter-1gpu-runner
     timeout-minutes: 60
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
 
     steps:
       - name: Checkout aiter
