@@ -163,9 +163,7 @@ extern "C" __attribute__((visibility("default"))) void gemm_a8w8_asm(
     args.ldc = stride_c;
     args.ks  = ks;
 
-    int prev_device;
-    HIP_CALL(hipGetDevice(&prev_device));
-    HIP_CALL(hipSetDevice(A->device_id));
+    const HipDeviceGuard device_guard(A->device_id);
 
     CFG* config_map = get_cfg(A->dtype(), out->dtype());
     using DictKey   = std::tuple<int, int, int, std::optional<int>, std::optional<bool>>;
@@ -275,6 +273,4 @@ extern "C" __attribute__((visibility("default"))) void gemm_a8w8_asm(
                              1,
                              1,
                              stream});
-
-    HIP_CALL(hipSetDevice(prev_device));
 }

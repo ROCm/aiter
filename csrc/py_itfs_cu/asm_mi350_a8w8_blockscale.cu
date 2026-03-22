@@ -97,9 +97,7 @@ extern "C" __attribute__((visibility("default"))) void mi350_a8w8_blockscale_asm
     args.splitk = 0;
     args.activation = 0;
 
-    int prev_device;
-    HIP_CALL(hipGetDevice(&prev_device));
-    HIP_CALL(hipSetDevice(XQ->device_id));
+    const HipDeviceGuard device_guard(XQ->device_id);
 
     AiterAsmKernel *impl_ptr = nullptr;
     static AiterAsmKernel impl_kenrel_x128("f8_block_scale_mi350_x128", "f8_block_scale_mi350_x128.co");
@@ -116,6 +114,4 @@ extern "C" __attribute__((visibility("default"))) void mi350_a8w8_blockscale_asm
                              1,     // bdy
                              1,     // bdz
                              stream});
-
-    HIP_CALL(hipSetDevice(prev_device));
 }

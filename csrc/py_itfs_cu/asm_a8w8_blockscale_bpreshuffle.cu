@@ -246,9 +246,7 @@ extern "C" __attribute__((visibility("default"))) void gemm_a8w8_blockscale_bpre
     // Use provided bias or the zero_bias_buf passed by caller
     void* bias_ptr = bias ? bias->ptr : (zero_bias_buf ? zero_bias_buf->ptr : nullptr);
 
-    int prev_device;
-    HIP_CALL(hipGetDevice(&prev_device));
-    HIP_CALL(hipSetDevice(A->device_id));
+    const HipDeviceGuard device_guard(A->device_id);
 
     auto it = config_map->find(selectedKernelName);
     AITER_CHECK(it != config_map->end(), __func__, " not find kernel " + selectedKernelName);
@@ -281,6 +279,4 @@ extern "C" __attribute__((visibility("default"))) void gemm_a8w8_blockscale_bpre
         print_debug_info(args, selectedKernelName, selectedsplitK, gdx, gdy, gdz, stream, bias);
     }
     impl_ptr->launch_kernel({&args, &arg_size, gdx, gdy, gdz, 256, 1, 1, stream});
-
-    HIP_CALL(hipSetDevice(prev_device));
 }

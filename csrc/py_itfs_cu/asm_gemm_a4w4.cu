@@ -192,9 +192,7 @@ extern "C" __attribute__((visibility("default"))) void gemm_a4w4_asm(
     args.stride_ScaleB0 = B_scale->stride(0);
     args.log2_k_split   = 0;
 
-    int prev_device;
-    HIP_CALL(hipGetDevice(&prev_device));
-    HIP_CALL(hipSetDevice(A->device_id));
+    const HipDeviceGuard device_guard(A->device_id);
 
     CFG* config_map = get_cfg(A->dtype(), out->dtype());
     using DictKey   = std::tuple<int, int, int, int, int>;
@@ -287,6 +285,4 @@ extern "C" __attribute__((visibility("default"))) void gemm_a4w4_asm(
                              1,   // bdy
                              1,   // bdz
                              stream});
-
-    HIP_CALL(hipSetDevice(prev_device));
 }
