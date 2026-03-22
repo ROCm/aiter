@@ -93,10 +93,10 @@ std::tuple<std::string, int> get_heuristic_fp8_kernel(int M, int N, int K, std::
         if (el.first.find(arch_id) != 0) continue;
 
         const auto& cfg = el.second;
-        if (cfg.bpreshuffle == bpreshuffle_en && ((cfg.splitK >= splitK_en) || !splitK.has_value())) {
+        if (cfg.bpreshuffle == bpreshuffle_en && ((cfg.splitK >= splitK_en) || (splitK < 0))) {
             if ((N % cfg.tile_n) == 0) {
-                std::vector<int> splitK_list = (splitK.has_value()) 
-                    ? std::vector<int>{splitK.value()}
+                std::vector<int> splitK_list = (splitK >= 0) 
+                    ? std::vector<int>{splitK}
                     : (cfg.splitK ? std::vector<int>{2, 4, 8} : std::vector<int>{1});
 
                 for (auto& split_k : splitK_list) {
