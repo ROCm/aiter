@@ -787,7 +787,7 @@ def build_module(
         else:
             # When CK is not available, define AITER_CK_FREE for all modules
             # so headers use lightweight shims instead of ck_tile/core.hpp
-            flags_cc.append("-DAITER_CK_FREE=1")
+            flags_cc.append("-DDISABLE_CK=1 -DAITER_CK_FREE=1")
 
         if os.path.isdir(HIP_KITTENS_DIR):
             extra_include_paths += [
