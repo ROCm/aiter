@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cmath>
 #include <type_traits>
+#include <initializer_list>
 
 // ============================================================================
 // CK compatibility macros (used by ck_tile/vec_convert.h)

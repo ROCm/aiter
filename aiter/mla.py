@@ -16,12 +16,13 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 
 import os
 
-# CK-free: Triton MLA decode fallback
-import os as _mla_os
-AITER_USE_ASM_MLA = _mla_os.getenv('AITER_USE_ASM_MLA', '1') == '1'
+# CK-free: Triton MLA decode fallback (AITER_USE_ASM_MLA=0)
+import logging as _mla_logging
+_mla_logger = _mla_logging.getLogger(__name__)
+AITER_USE_ASM_MLA = os.getenv('AITER_USE_ASM_MLA', '1') == '1'
 if not AITER_USE_ASM_MLA:
     from aiter.ops.triton.attention.mla_decode_rope import decode_attention_fwd_grouped_rope
-    print('[MLA] Triton MLA decode enabled (ASM disabled)')
+    _mla_logger.info("Triton MLA decode enabled (ASM disabled)")
 
 
 
@@ -273,7 +274,10 @@ def mla_decode_fwd(
                 num_kv_splits, sm_scale,
                 logit_cap=0.0, use_rope=False, is_neox_style=False)
             if return_lse:
-                return o, attn_lse
+                raise RuntimeError(
+                    "return_lse=True is not supported for Triton MLA decode "
+                    "(AITER_USE_ASM_MLA=0): attn_lse is not computed in this path."
+                )
             return o, None
 
 
