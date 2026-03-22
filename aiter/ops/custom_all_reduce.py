@@ -88,32 +88,32 @@ def fused_allreduce_rmsnorm_quant(
 ) -> None: ...
 
 
-def all_reduce_asm_fake_tensor(
+@compile_ops("module_custom_all_reduce", ffi_type="ctypes")
+def all_reduce_asm(
     inp: torch.Tensor,
     ca: int,
     reg_sig: torch.Tensor,
     reg_buffer: torch.Tensor,
     isGraph: bool,
-) -> torch.Tensor:
-
-    return torch.empty_like(
-        inp,
-        dtype=inp.dtype,
-        device=inp.device,
-    )
+) -> None: ...
 
 
-@compile_ops("module_custom_all_reduce", gen_fake=all_reduce_asm_fake_tensor)
 def all_reduce_asm_(
     inp: torch.Tensor,
     ca: int,
     reg_sig: torch.Tensor,
     reg_buffer: torch.Tensor,
     isGraph: bool,
-) -> torch.Tensor: ...
+) -> torch.Tensor:
+    all_reduce_asm(inp, ca, reg_sig, reg_buffer, isGraph)
+    if isGraph:
+        return inp
+    else:
+        return reg_buffer
 
 
-def all_reduce_rmsnorm_fake_tensors(
+@compile_ops("module_custom_all_reduce", ffi_type="ctypes")
+def all_reduce_rmsnorm(
     input: torch.Tensor,
     residual_in: torch.Tensor,
     weight: torch.Tensor,
@@ -123,20 +123,9 @@ def all_reduce_rmsnorm_fake_tensors(
     reg_sig: torch.Tensor,
     reg_buffer: torch.Tensor,
     isGraph: bool,
-) -> List[torch.Tensor]:
-
-    output = torch.empty_like(
-        input, dtype=input.dtype, device=input.device, requires_grad=input.requires_grad
-    )
-
-    residual_out = torch.empty_like(
-        input, dtype=input.dtype, device=input.device, requires_grad=input.requires_grad
-    )
-
-    return [output, residual_out]
+) -> None: ...
 
 
-@compile_ops("module_custom_all_reduce", gen_fake=all_reduce_rmsnorm_fake_tensors)
 def all_reduce_rmsnorm_(
     input: torch.Tensor,
     residual_in: torch.Tensor,
@@ -147,51 +136,81 @@ def all_reduce_rmsnorm_(
     reg_sig: torch.Tensor,
     reg_buffer: torch.Tensor,
     isGraph: bool,
-) -> List[torch.Tensor]: ...
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    all_reduce_rmsnorm(
+        input, residual_in, weight, bias, epsilon, ca, reg_sig, reg_buffer, isGraph
+    )
+
+    nbytes = input.numel() * input.element_size()
+    size_pad = (nbytes + 4095) & ~4095
+
+    storage = reg_buffer.untyped_storage()
+    out = torch.empty([], dtype=input.dtype, device=input.device).set_(
+        storage, size_pad, input.shape, input.stride()
+    )
+    residual_out = torch.empty([], dtype=input.dtype, device=input.device).set_(
+        storage, size_pad * 2, input.shape, input.stride()
+    )
+    return out, residual_out
 
 
-def all_reduce_rmsnorm_quant_fake_tensors(
+@compile_ops("module_custom_all_reduce", ffi_type="ctypes")
+def all_reduce_rmsnorm_quant(
     input: torch.Tensor,
     residual_in: torch.Tensor,
-    weight: torch.Tensor,
     xscale: torch.Tensor,
+    weight: torch.Tensor,
     bias: torch.Tensor,
     epsilon: float,
     ca: int,
     reg_sig: torch.Tensor,
     reg_buffer: torch.Tensor,
     isGraph: bool,
-) -> List[torch.Tensor]:
-
-    N = input.size(-1)
-    M = input.numel() // N
-
-    output = torch.empty_like(
-        input, dtype=input.dtype, device=input.device, requires_grad=input.requires_grad
-    )
-
-    residual_out = torch.empty_like(
-        input, dtype=input.dtype, device=input.device, requires_grad=input.requires_grad
-    )
-
-    y_scale = torch.empty((M, 1), dtype=torch.float32, device=input.device)
-
-    return [output, residual_out, y_scale]
+) -> None: ...
 
 
-@compile_ops("module_custom_all_reduce", gen_fake=all_reduce_rmsnorm_quant_fake_tensors)
 def all_reduce_rmsnorm_quant_(
     input: torch.Tensor,
     residual_in: torch.Tensor,
-    weight: torch.Tensor,
     xscale: torch.Tensor,
+    weight: torch.Tensor,
     bias: torch.Tensor,
     epsilon: float,
     ca: int,
     reg_sig: torch.Tensor,
     reg_buffer: torch.Tensor,
     isGraph: bool,
-) -> List[torch.Tensor]: ...
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    all_reduce_rmsnorm_quant(
+        input,
+        residual_in,
+        xscale,
+        weight,
+        bias,
+        epsilon,
+        ca,
+        reg_sig,
+        reg_buffer,
+        isGraph,
+    )
+
+    nbytes = input.numel() * input.element_size()
+    size_pad = (nbytes + 4095) & ~4095
+
+    storage = reg_buffer.untyped_storage()
+    out = torch.empty([], dtype=input.dtype, device=input.device).set_(
+        storage, size_pad, input.shape, input.stride()
+    )
+    residual_out = torch.empty([], dtype=input.dtype, device=input.device).set_(
+        storage, size_pad * 2, input.shape, input.stride()
+    )
+
+    N = input.size(-1)
+    M = input.numel() // N
+    yscale = torch.empty([], dtype=torch.float32, device=input.device).set_(
+        storage, size_pad * 3, (M, 1), (1, 1)
+    )
+    return out, residual_out, yscale
 
 
 @compile_ops("module_custom_all_reduce")
