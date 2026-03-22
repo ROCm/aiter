@@ -17,6 +17,7 @@
  */
 #include "aiter_hip_common.h"
 //#include "communication_asm.h"
+#include <torch/extension.h>
 #include "hip_float8.h"
 #include "opus/opus.hpp"
 #include <hip/hip_bf16.h>
