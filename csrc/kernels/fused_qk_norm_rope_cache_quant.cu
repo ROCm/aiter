@@ -15,14 +15,12 @@
  */
 
 #include <cmath>
-#include <cstdint>
 #include <type_traits>
 
 #include "hip_compat.h"
 #include "hip_reduce.h"
 #include "quant_utils.cuh"
 #include "quant_common.cuh"
-#include "rmsnorm_quant.h"
 #include "rope/rope_common.h"
 #include "vec_convert.h"
 #include <torch/cuda.h>
@@ -1378,108 +1376,6 @@ __global__ void fused_rope_rms_2way_kernel(const T* q0_,
     }
 }
 
-template <typename T, int BLOCK_SIZE>
-__global__ void fusedQKNormKernel(T* __restrict__ q_ptr,
-                                  T const* __restrict__ q_weight_ptr,
-                                  T* __restrict__ k_ptr,
-                                  T const* __restrict__ k_weight_ptr,
-                                  int64_t m,
-                                  int64_t q_n,
-                                  int64_t k_n,
-                                  int64_t q_row_stride,
-                                  int64_t q_col_stride,
-                                  int64_t k_row_stride,
-                                  int64_t k_col_stride,
-                                  float q_eps,
-                                  float k_eps)
-{
-    int const row = blockIdx.x;
-    if(row >= m)
-    {
-        return;
-    }
-
-    bool const is_q_block = blockIdx.y == 0;
-    int const tid         = threadIdx.x;
-    T* row_ptr            = is_q_block ? (q_ptr + row * q_row_stride) : (k_ptr + row * k_row_stride);
-    T const* weight_ptr   = is_q_block ? q_weight_ptr : k_weight_ptr;
-    int64_t const n       = is_q_block ? q_n : k_n;
-    int64_t const c_stride = is_q_block ? q_col_stride : k_col_stride;
-    float const eps       = is_q_block ? q_eps : k_eps;
-    auto sum_op              = [](float a, float b) { return a + b; };
-    constexpr int WAVE_SIZE  = 64;
-    constexpr int VEC_SIZE   = sizeof(float4) / sizeof(T);
-    using vec_type           = vec_t<T, VEC_SIZE>;
-
-    bool const can_vec = c_stride == 1 && n % VEC_SIZE == 0 &&
-                         (reinterpret_cast<uintptr_t>(row_ptr) % alignof(vec_type) == 0) &&
-                         (reinterpret_cast<uintptr_t>(weight_ptr) % alignof(vec_type) == 0);
-
-    float sum_sq = 0.0f;
-    if(can_vec)
-    {
-        int64_t const vec_n = n / VEC_SIZE;
-        for(int64_t vec_idx = tid; vec_idx < vec_n; vec_idx += BLOCK_SIZE)
-        {
-            vec_type in_vec;
-            in_vec.load(row_ptr + vec_idx * VEC_SIZE);
-#pragma unroll
-            for(int i = 0; i < VEC_SIZE; ++i)
-            {
-                float const v = static_cast<float>(in_vec[i]);
-                sum_sq += v * v;
-            }
-        }
-    }
-    else
-    {
-        for(int64_t col = tid; col < n; col += BLOCK_SIZE)
-        {
-            float const v = static_cast<float>(row_ptr[col * c_stride]);
-            sum_sq += v * v;
-        }
-    }
-    if constexpr(BLOCK_SIZE == WAVE_SIZE)
-    {
-        sum_sq = wave_reduce<float, decltype(sum_op), WAVE_SIZE, true>(sum_sq, sum_op);
-    }
-    else
-    {
-        sum_sq = block_reduce<float, decltype(sum_op), BLOCK_SIZE, true>(sum_sq, sum_op);
-    }
-    float const rms_rcp = rsqrtf(sum_sq / static_cast<float>(n) + eps);
-
-    if(can_vec)
-    {
-        int64_t const vec_n = n / VEC_SIZE;
-        for(int64_t vec_idx = tid; vec_idx < vec_n; vec_idx += BLOCK_SIZE)
-        {
-            vec_type in_vec;
-            vec_type w_vec;
-            vec_type out_vec;
-            in_vec.load(row_ptr + vec_idx * VEC_SIZE);
-            w_vec.load(weight_ptr + vec_idx * VEC_SIZE);
-#pragma unroll
-            for(int i = 0; i < VEC_SIZE; ++i)
-            {
-                float const v = static_cast<float>(in_vec[i]);
-                float const w = static_cast<float>(w_vec[i]);
-                out_vec[i]    = static_cast<T>(v * rms_rcp * w);
-            }
-            out_vec.store(row_ptr + vec_idx * VEC_SIZE);
-        }
-    }
-    else
-    {
-        for(int64_t col = tid; col < n; col += BLOCK_SIZE)
-        {
-            float const v = static_cast<float>(row_ptr[col * c_stride]);
-            float const w = static_cast<float>(weight_ptr[col]);
-            row_ptr[col * c_stride] = static_cast<T>(v * rms_rcp * w);
-        }
-    }
-}
-
 template <typename T>
 void fused_rope_rms_2way(const T* q0,
                          const T* k0,
@@ -1671,7 +1567,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(at::Tensor& qkv,
                                                 bool return_kv,
                                                 bool use_shuffle_layout,
                                                 int64_t block_size,
-                                                int64_t x)
+                                                int64_t x,
+                                                int64_t rotary_dim)
 {
     TORCH_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() &&
                 cos_sin.is_contiguous());
@@ -1720,7 +1617,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(at::Tensor& qkv,
                                                          v_out_ptr,
                                                          use_shuffle_layout,
                                                          block_size,
-                                                         x);
+                                                         x,
+                                                         rotary_dim);
             }
             else
             {
@@ -1761,7 +1659,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(at::Tensor& qkv,
                         v_out_fp8_ptr,
                         use_shuffle_layout,
                         block_size,
-                        x);
+                        x,
+                        rotary_dim);
                 }
                 else if(kv_cache_dtype == at::ScalarType::Float8_e4m3fn)
                 {
@@ -1799,7 +1698,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(at::Tensor& qkv,
                         v_out_fp8_ptr,
                         use_shuffle_layout,
                         block_size,
-                        x);
+                        x,
+                        rotary_dim);
                 }
                 else
                 {
@@ -1863,7 +1763,6 @@ void fused_qk_norm_rope_2way(at::Tensor& q0,
                                    stream);
         });
 }
-
 void fused_qk_norm_rope_cache_block_quant_shuffle(
     at::Tensor& qkv,                   // Combined QKV tensor [num_tokens,
                                        // (num_heads_q+num_heads_k+num_heads_v)*head_dim]
