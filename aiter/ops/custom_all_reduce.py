@@ -88,7 +88,7 @@ def fused_allreduce_rmsnorm_quant(
 ) -> None: ...
 
 
-@compile_ops("module_custom_all_reduce", ffi_type="ctypes")
+@compile_ops("module_asm_communication", ffi_type="ctypes")
 def all_reduce_asm(
     inp: torch.Tensor,
     ca: int,
@@ -112,7 +112,7 @@ def all_reduce_asm_(
         return reg_buffer
 
 
-@compile_ops("module_custom_all_reduce", ffi_type="ctypes")
+@compile_ops("module_asm_communication", ffi_type="ctypes")
 def all_reduce_rmsnorm(
     input: torch.Tensor,
     residual_in: torch.Tensor,
@@ -154,7 +154,7 @@ def all_reduce_rmsnorm_(
     return out, residual_out
 
 
-@compile_ops("module_custom_all_reduce", ffi_type="ctypes")
+@compile_ops("module_asm_communication", ffi_type="ctypes")
 def all_reduce_rmsnorm_quant(
     input: torch.Tensor,
     residual_in: torch.Tensor,
