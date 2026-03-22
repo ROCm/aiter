@@ -1891,6 +1891,10 @@ template <index_t cnt> OPUS_D void s_wait_storecnt(number<cnt> = {})  { llvm_s_w
 template <index_t cnt> OPUS_D void s_wait_kmcnt(number<cnt> = {})     { llvm_s_wait_kmcnt(cnt); }
 template <index_t cnt> OPUS_D void s_wait_asynccnt(number<cnt> = {})  { llvm_s_wait_asynccnt(cnt); }
 template <index_t cnt> OPUS_D void s_wait_tensorcnt(number<cnt> = {}) { llvm_s_wait_tensorcnt(cnt); }
+// gfx1250 compatibility: map gfx9-style waitcnt wrappers to split counters
+// so kernel code using opus::s_waitcnt_vmcnt/lgkmcnt compiles on gfx1250
+template <index_t vmcnt>   OPUS_D void s_waitcnt_vmcnt(number<vmcnt>)   { s_wait_loadcnt(number<vmcnt>{}); }
+template <index_t lgkmcnt> OPUS_D void s_waitcnt_lgkmcnt(number<lgkmcnt>) { s_wait_dscnt(number<lgkmcnt>{}); }
 #else
 // gfx9: combined s_waitcnt instruction
 template <index_t vmcnt, index_t lgkmcnt, index_t expcnt = 7>

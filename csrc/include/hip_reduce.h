@@ -5,29 +5,34 @@
 
 // gfx1250 does not support row_bcast:15, row_bcast:31, or multi-row DPP ops (0x140, 0x141).
 // Use ds_bpermute-based shuffles as fallback.
+// NOTE: ds_bpermute operates on int32. For types > 4 bytes, shuffle each 4-byte word.
 #if defined(__gfx1250__)
 
 template <typename T>
+__device__ T gfx1250_ds_bpermute(int src_lane, T val) {
+    constexpr int words = (sizeof(T) + 3) / 4;
+    union { T v; int32_t w[words]; } in, out;
+    in.v = val;
+    #pragma unroll
+    for (int i = 0; i < words; i++)
+        out.w[i] = __builtin_amdgcn_ds_bpermute(src_lane << 2, in.w[i]);
+    return out.v;
+}
+
+template <typename T>
 __device__ T gfx1250_bcast15(T val) {
-    // row_bcast:15 broadcasts lane 15 of each row to lanes 16-31
-    int src_lane = 15 + (__lane_id() & ~31);  // lane 15 within each group of 32
-    int32_t tmp = __builtin_amdgcn_ds_bpermute(src_lane << 2, __builtin_bit_cast(int32_t, val));
-    return __builtin_bit_cast(T, tmp);
+    int src_lane = 15 + (__lane_id() & ~31);
+    return gfx1250_ds_bpermute(src_lane, val);
 }
 
 template <typename T>
 __device__ T gfx1250_bcast31(T val) {
-    // row_bcast:31 broadcasts lane 31 to all lanes in a wave
-    int32_t tmp = __builtin_amdgcn_ds_bpermute(31 << 2, __builtin_bit_cast(int32_t, val));
-    return __builtin_bit_cast(T, tmp);
+    return gfx1250_ds_bpermute(31, val);
 }
 
-// Replacement for DPP 0x141 (row_shr:1 within half-rows)
 template <typename T>
 __device__ T gfx1250_half_mirror(T val) {
-    int src_lane = __lane_id() ^ 1;
-    int32_t tmp = __builtin_amdgcn_ds_bpermute(src_lane << 2, __builtin_bit_cast(int32_t, val));
-    return __builtin_bit_cast(T, tmp);
+    return gfx1250_ds_bpermute(__lane_id() ^ 1, val);
 }
 
 #endif // __gfx1250__
@@ -41,9 +46,13 @@ __device__ constexpr T wave_reduce_ds(T local, F reduce_op)
     for(int i_stage = 0; i_stage < reduce_stage; i_stage++)
     {
         int src_lane = __lane_id() ^ (1 << i_stage);
+#if defined(__gfx1250__)
+        T v_remote = gfx1250_ds_bpermute(src_lane, v_local);
+#else
         int32_t v_remote_tmp =
             __builtin_amdgcn_ds_bpermute(src_lane << 2, __builtin_bit_cast(int32_t, v_local));
         T v_remote = __builtin_bit_cast(T, v_remote_tmp);
+#endif
         v_local    = reduce_op(v_local, v_remote);
     }
     return v_local;
@@ -176,8 +185,7 @@ __device__ constexpr T multithread_reduce(T data, F reduce_op, int thread_num)
     for(int offset = 1; offset < thread_num; offset <<= 1)
     {
         int src_lane = __lane_id() ^ offset;
-        int32_t tmp = __builtin_amdgcn_ds_bpermute(src_lane << 2, __builtin_bit_cast(int32_t, data));
-        T remote = __builtin_bit_cast(T, tmp);
+        T remote = gfx1250_ds_bpermute(src_lane, data);
         data = reduce_op(remote, data);
     }
     if constexpr(threadBroadcast)
