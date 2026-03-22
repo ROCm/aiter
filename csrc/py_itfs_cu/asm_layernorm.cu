@@ -53,6 +53,8 @@ extern "C" __attribute__((visibility("default"))) void layernorm2d_with_add_asm(
     AITER_CHECK(n == 8192,
                 __func__, " for now only support n == 8192");
 
+    const HipDeviceGuard device_guard(input->device_id);
+
     size_t arg_size = sizeof(args);
     args.ptr_O = out->data_ptr();
     args.ptr_In = input->data_ptr();
@@ -64,9 +66,6 @@ extern "C" __attribute__((visibility("default"))) void layernorm2d_with_add_asm(
     args.ptr_OutResidual = residual_out->data_ptr();
     args.ptr_InResidual = residual_in->data_ptr();
 
-    int prev_device;
-    HIP_CALL(hipGetDevice(&prev_device));
-    HIP_CALL(hipSetDevice(input->device_id));
     int sub_M = 2;
     static AiterAsmKernel impl("layer_norm_kernel_func", "layer_norm.co");
 
@@ -79,7 +78,6 @@ extern "C" __attribute__((visibility("default"))) void layernorm2d_with_add_asm(
                         1,                         // bdy
                         1,                         // bdz
                         stream});
-    HIP_CALL(hipSetDevice(prev_device));
 }
 
 extern "C" __attribute__((visibility("default"))) void layernorm2d_with_add_smoothquant_asm(AiterTensor* out,          // [m ,n]
@@ -107,6 +105,8 @@ extern "C" __attribute__((visibility("default"))) void layernorm2d_with_add_smoo
     AITER_CHECK(n == 8192,
                 __func__, " for now only support n == 8192");
 
+    const HipDeviceGuard device_guard(input->device_id);
+
     size_t arg_size = sizeof(args);
     args.ptr_O = out->data_ptr();
     args.ptr_In = input->data_ptr();
@@ -120,9 +120,6 @@ extern "C" __attribute__((visibility("default"))) void layernorm2d_with_add_smoo
     args.ptr_OutYScale = yscale->data_ptr();
     args.ptr_XScale = xscale->data_ptr();
 
-    int prev_device;
-    HIP_CALL(hipGetDevice(&prev_device));
-    HIP_CALL(hipSetDevice(input->device_id));
     int sub_M = 2;
     static AiterAsmKernel impl("layer_norm_qnt", "layer_norm_qnt.co");
 
@@ -135,5 +132,4 @@ extern "C" __attribute__((visibility("default"))) void layernorm2d_with_add_smoo
                         1,                         // bdy
                         1,                         // bdz
                         stream});
-    HIP_CALL(hipSetDevice(prev_device));
 }
