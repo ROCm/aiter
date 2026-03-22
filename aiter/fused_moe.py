@@ -779,6 +779,7 @@ def get_2stage_cfgs(
         # For big model_dim ck's split-k is a better alternative
         return (
             model_dim <= 2048
+            and get_gfx() == "gfx950"
             and token > 1
             and token < 16
             and topk > 8
@@ -857,11 +858,7 @@ def get_2stage_cfgs(
         run_1stage = run_1stage or run_1stage_xbf16
 
         block_m = (
-            (
-                (64 if (token * topk) / expert > 32 else BLOCK_SIZE_M)
-                if q_type == QuantType.per_1x128
-                else BLOCK_SIZE_M
-            )
+            BLOCK_SIZE_M
             if run_1stage
             else (
                 (64 if token > 32 else 16)
