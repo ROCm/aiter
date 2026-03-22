@@ -106,7 +106,9 @@ def pa_fwd_naive(
 ) -> torch.Tensor: ...
 
 
-@compile_ops("module_attention_asm", fc_name="pa_fwd", ffi_type="ctypes", gen_fake=gen_pa_fwd_asm)
+@compile_ops(
+    "module_attention_asm", fc_name="pa_fwd", ffi_type="ctypes", gen_fake=gen_pa_fwd_asm
+)
 def _pa_fwd_asm(
     Q: torch.Tensor,
     K: torch.Tensor,
@@ -143,9 +145,19 @@ def pa_fwd_asm(
 ) -> torch.Tensor:
     output = out_ if out_ is not None else torch.empty_like(Q)
     _pa_fwd_asm(
-        Q, K, V, block_tables, context_lens, block_tables_stride0,
-        max_qlen, K_QScale, V_QScale, output, qo_indptr,
-        high_precision, kernelName,
+        Q,
+        K,
+        V,
+        block_tables,
+        context_lens,
+        block_tables_stride0,
+        max_qlen,
+        K_QScale,
+        V_QScale,
+        output,
+        qo_indptr,
+        high_precision,
+        kernelName,
     )
     return output
 
@@ -299,7 +311,12 @@ def gen_pa_ps_fwd_asm(
         return torch.empty_like(Q)
 
 
-@compile_ops("module_attention_asm", fc_name="pa_ps_fwd", ffi_type="ctypes", gen_fake=gen_pa_ps_fwd_asm)
+@compile_ops(
+    "module_attention_asm",
+    fc_name="pa_ps_fwd",
+    ffi_type="ctypes",
+    gen_fake=gen_pa_ps_fwd_asm,
+)
 def _pa_ps_fwd_asm(
     Q: torch.Tensor,
     K: torch.Tensor,
@@ -350,10 +367,26 @@ def pa_ps_fwd_asm(
 ) -> torch.Tensor:
     output = out_ if out_ is not None else torch.empty_like(Q)
     _pa_ps_fwd_asm(
-        Q, K, V, kv_indptr, kv_page_indices, context_lens,
-        softmax_scale, max_qlen, K_QScale, V_QScale, output,
-        qo_indptr, work_indptr, work_info, splitData, splitLse,
-        mask, high_precision, kernelName, quant_type,
+        Q,
+        K,
+        V,
+        kv_indptr,
+        kv_page_indices,
+        context_lens,
+        softmax_scale,
+        max_qlen,
+        K_QScale,
+        V_QScale,
+        output,
+        qo_indptr,
+        work_indptr,
+        work_info,
+        splitData,
+        splitLse,
+        mask,
+        high_precision,
+        kernelName,
+        quant_type,
     )
     return output
 
