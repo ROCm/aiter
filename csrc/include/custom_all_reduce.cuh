@@ -16,6 +16,7 @@
  * limitations under the License.
  */
 #include "aiter_hip_common.h"
+//#include "communication_asm.h"
 #include "hip_float8.h"
 #include "opus/opus.hpp"
 #include <hip/hip_bf16.h>
@@ -1943,7 +1944,6 @@ class CustomAllreduce
                                      std::to_string(d_rank_data_base_ + num - d_rank_data_end_));
     }
 
-#ifdef AITER_HAS_TORCH
     void register_input_buffer(const std::vector<torch::Tensor>& handles,
                                const std::vector<int64_t>& offsets,
                                void* self)
@@ -2121,7 +2121,6 @@ class CustomAllreduce
         graph_unreg_input_buffers_.clear();
         graph_unreg_output_buffers_.clear();
     }
-#endif // AITER_HAS_TORCH
 
     /*
      * call all reduce fp8 kernel
@@ -2320,7 +2319,6 @@ class CustomAllreduce
         }                                                \
         break;                                           \
     }
-#undef dispatch
 
         switch(world_size_)
         {
