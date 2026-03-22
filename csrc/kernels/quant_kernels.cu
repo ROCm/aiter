@@ -547,7 +547,7 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         int real_token_idx = idx_input_dim1 * input_stride1_cols +
                             idx_input_dim0 * input_stride0_cols;
         int32_t smscale_map_idx = __builtin_amdgcn_readlane(smscale_map_idx_list, i_rem);
-       
+
         if (smscale_map_idx < 0)
         {
             continue;

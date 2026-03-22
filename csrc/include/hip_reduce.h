@@ -3,6 +3,35 @@
 #include "hip_compat.h"
 #include <rocprim/rocprim.hpp>
 
+// gfx1250 does not support row_bcast:15, row_bcast:31, or multi-row DPP ops (0x140, 0x141).
+// Use ds_bpermute-based shuffles as fallback.
+#if defined(__gfx1250__)
+
+template <typename T>
+__device__ T gfx1250_bcast15(T val) {
+    // row_bcast:15 broadcasts lane 15 of each row to lanes 16-31
+    int src_lane = 15 + (__lane_id() & ~31);  // lane 15 within each group of 32
+    int32_t tmp = __builtin_amdgcn_ds_bpermute(src_lane << 2, __builtin_bit_cast(int32_t, val));
+    return __builtin_bit_cast(T, tmp);
+}
+
+template <typename T>
+__device__ T gfx1250_bcast31(T val) {
+    // row_bcast:31 broadcasts lane 31 to all lanes in a wave
+    int32_t tmp = __builtin_amdgcn_ds_bpermute(31 << 2, __builtin_bit_cast(int32_t, val));
+    return __builtin_bit_cast(T, tmp);
+}
+
+// Replacement for DPP 0x141 (row_shr:1 within half-rows)
+template <typename T>
+__device__ T gfx1250_half_mirror(T val) {
+    int src_lane = __lane_id() ^ 1;
+    int32_t tmp = __builtin_amdgcn_ds_bpermute(src_lane << 2, __builtin_bit_cast(int32_t, val));
+    return __builtin_bit_cast(T, tmp);
+}
+
+#endif // __gfx1250__
+
 template <typename T, typename F>
 __device__ constexpr T wave_reduce_ds(T local, F reduce_op)
 {
@@ -113,13 +142,21 @@ __device__ constexpr T wave_reduce(T local, F reduce_op)
     if constexpr(WarpSize > 16)
     {
         // row_bcast:15
+#if defined(__gfx1250__)
+        local = reduce_op(gfx1250_bcast15(local), local);
+#else
         local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x142>(local), local);
+#endif
     }
 
     if constexpr(WarpSize > 32)
     {
         // row_bcast:31
+#if defined(__gfx1250__)
+        local = reduce_op(gfx1250_bcast31(local), local);
+#else
         local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x143>(local), local);
+#endif
     }
 
     if constexpr(threadBroadcast && WarpSize > 4)
@@ -134,6 +171,23 @@ __device__ constexpr T wave_reduce(T local, F reduce_op)
 template <typename T, typename F, int WarpSize = 64, bool threadBroadcast = true>
 __device__ constexpr T multithread_reduce(T data, F reduce_op, int thread_num)
 {
+#if defined(__gfx1250__)
+    // gfx1250: use ds_bpermute-based reduction (no row_bcast or multi-row DPP support)
+    for(int offset = 1; offset < thread_num; offset <<= 1)
+    {
+        int src_lane = __lane_id() ^ offset;
+        int32_t tmp = __builtin_amdgcn_ds_bpermute(src_lane << 2, __builtin_bit_cast(int32_t, data));
+        T remote = __builtin_bit_cast(T, tmp);
+        data = reduce_op(remote, data);
+    }
+    if constexpr(threadBroadcast)
+    {
+        if(thread_num > 4)
+        {
+            data = rocprim::warp_shuffle(data, thread_num - 1, thread_num);
+        }
+    }
+#else
     if(thread_num == 1)
     {
         return data;
@@ -187,6 +241,7 @@ __device__ constexpr T multithread_reduce(T data, F reduce_op, int thread_num)
             // data = thread_broadcast<T, 64, WarpSize>(data, thread_num - 1);
         }
     }
+#endif
 
     return data;
 }
