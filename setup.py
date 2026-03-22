@@ -76,13 +76,18 @@ else:
         f.write("install")
 
 if IS_ROCM:
-    assert os.path.exists(
-        ck_dir
-    ), 'CK is needed by aiter, please make sure clone by "git clone --recursive https://github.com/ROCm/aiter.git" or "git submodule sync ; git submodule update --init --recursive"'
+    enable_ck = int(os.environ.get("ENABLE_CK", "1")) != 0
+    if enable_ck:
+        assert os.path.exists(
+            ck_dir
+        ), 'CK is needed by aiter, please make sure clone by "git clone --recursive https://github.com/ROCm/aiter.git" or "git submodule sync ; git submodule update --init --recursive"'
 
     if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
         shutil.rmtree("aiter_meta")
-    shutil.copytree("3rdparty", "aiter_meta/3rdparty")
+    if os.path.exists("3rdparty"):
+        shutil.copytree("3rdparty", "aiter_meta/3rdparty")
+    else:
+        os.makedirs("aiter_meta/3rdparty", exist_ok=True)
     shutil.copytree("hsa", "aiter_meta/hsa")
     shutil.copytree("gradlib", "aiter_meta/gradlib")
     shutil.copytree("csrc", "aiter_meta/csrc")
