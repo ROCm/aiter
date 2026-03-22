@@ -221,9 +221,7 @@ void pa_fwd(AiterTensor* Q,              //   [num_seqs, num_heads, head_size]
     args.GQA       = gqa_ratio;
     args.ptr_QTP   = (qo_indptr != nullptr) ? qo_indptr->data_ptr() : nullptr;
 
-    int prev_device;
-    HIP_CALL(hipGetDevice(&prev_device));
-    HIP_CALL(hipSetDevice(Q->device_id));
+    const HipDeviceGuard device_guard(Q->device_id);
 
     std::string q_type;
     std::string kv_type;
@@ -309,7 +307,6 @@ void pa_fwd(AiterTensor* Q,              //   [num_seqs, num_heads, head_size]
                              1,            // bdy
                              1,            // bdz
                              stream});
-    HIP_CALL(hipSetDevice(prev_device));
 }
 
 extern "C" __attribute__((visibility("default")))
@@ -383,9 +380,7 @@ void pa_ps_fwd(AiterTensor* Q,            //   [num_seqs, num_heads, head_size]
     args.ptr_SplitLSE = (work_info != nullptr) ? splitLse->data_ptr() : nullptr;
     args.mtp          = max_qlen - 1;
 
-    int prev_device;
-    HIP_CALL(hipGetDevice(&prev_device));
-    HIP_CALL(hipSetDevice(Q->device_id));
+    const HipDeviceGuard device_guard(Q->device_id);
 
     std::string q_type;
     std::string kv_type;
@@ -497,5 +492,4 @@ void pa_ps_fwd(AiterTensor* Q,            //   [num_seqs, num_heads, head_size]
                              1,   // bdy
                              1,   // bdz
                              stream});
-    HIP_CALL(hipSetDevice(prev_device));
 }
