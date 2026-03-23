@@ -1,41 +1,44 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <torch/all.h>
 
 #include "aiter_hip_common.h"
+#include "communication_asm.h"
 #include "custom_all_reduce.cuh"
 
-extern "C" __attribute__((visibility("default"))) void all_reduce_asm(
-    AiterTensor* input,
-    int64_t _ca,
-    AiterTensor* reg_sig,
-    AiterTensor* reg_buffer,
-    bool isGraph,
-    hipStream_t stream)
+torch::Tensor all_reduce_asm(torch::Tensor& input,
+                             int64_t _ca,
+                             torch::Tensor& reg_sig,
+                             torch::Tensor& reg_buffer,
+                             bool isGraph)
 {
-    const HipDeviceGuard device_guard(input->device_id);
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
 
-    auto input_size = input->numel() * input->element_size();
+    auto input_size = input.numel() * input.element_size();
 
-    void* inp_ptr = input->data_ptr();
+    void* inp_ptr = input.data_ptr();
     if(!isGraph)
     {
-        AITER_CHECK(input_size <= reg_buffer->numel() * reg_buffer->element_size(),
+        TORCH_CHECK(input_size <= reg_buffer.numel() * reg_buffer.element_size(),
                     "registered buffer is too small to contain the input",
                     input_size,
                     ">",
-                    reg_buffer->numel() * reg_buffer->element_size());
+                    reg_buffer.numel() * reg_buffer.element_size());
         HIP_CALL(hipMemcpyAsync(
-            reg_buffer->data_ptr(), inp_ptr, input_size, hipMemcpyDeviceToDevice, stream));
-        inp_ptr = reg_buffer->data_ptr();
+            reg_buffer.data_ptr(), inp_ptr, input_size, hipMemcpyDeviceToDevice, stream));
+        inp_ptr = reg_buffer.data_ptr();
     }
 
     auto ca  = reinterpret_cast<aiter::CustomAllreduce*>(_ca);
     using RD = aiter::RankData;
 
     RD* input_rd = ca->get_buffer_RD(stream, inp_ptr);
-    RD* sig_rd   = ca->get_buffer_RD(stream, reg_sig->data_ptr());
+    RD* sig_rd   = ca->get_buffer_RD(stream, reg_sig.data_ptr());
 
     struct __attribute__((packed)) KernelArgs
     {
@@ -108,58 +111,64 @@ extern "C" __attribute__((visibility("default"))) void all_reduce_asm(
                         1,   // bdy
                         1,   // bdz
                         stream});
-    // result is written in-place to inp_ptr (input or reg_buffer depending on isGraph)
+    auto options = torch::TensorOptions().dtype(input.dtype()).device(input.device());
+    return torch::from_blob(inp_ptr, {input.sizes()}, options);
 }
 
-extern "C" __attribute__((visibility("default"))) void all_reduce_rmsnorm(
-    AiterTensor* input,        // [m ,n]
-    AiterTensor* residual_in,  // [m ,n]
-    AiterTensor* weight,       // [1 ,n]
-    AiterTensor* bias,         // [1 ,n]
-    float epsilon,
-    // following are fused_allreduce args
-    int64_t _ca,
-    AiterTensor* reg_sig,
-    AiterTensor* reg_buffer,
-    bool isGraph,
-    hipStream_t stream)
+std::tuple<torch::Tensor, torch::Tensor> all_reduce_rmsnorm(torch::Tensor& input,       // [m ,n]
+                                                            torch::Tensor& residual_in, // [m ,n]
+                                                            torch::Tensor& weight,      // [1 ,n]
+                                                            torch::Tensor& bias,        // [1 ,n]
+                                                            float epsilon,
+                                                            // following are fused_allreduce args
+                                                            int64_t _ca,
+                                                            torch::Tensor& reg_sig,
+                                                            torch::Tensor& reg_buffer,
+                                                            bool isGraph)
 {
-    const HipDeviceGuard device_guard(input->device_id);
-
-    auto size_input = input->numel() * input->element_size();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    auto stream     = at::hip::getCurrentHIPStream();
+    auto size_input = input.numel() * input.element_size();
     auto size_pad   = (size_input + 4095) & 0xfffff000;
 
-    void* inp_ptr = input->data_ptr();
+    void* inp_ptr = input.data_ptr();
     // reg_buffer contains input|out|res_out
     auto size_needed = size_pad * 3;
-    AITER_CHECK(size_needed <= reg_buffer->numel() * reg_buffer->element_size(),
+    TORCH_CHECK(size_needed <= reg_buffer.numel() * reg_buffer.element_size(),
                 "registered buffer is too small to contain the input ",
                 size_needed,
                 ">",
-                reg_buffer->numel() * reg_buffer->element_size());
+                reg_buffer.numel() * reg_buffer.element_size());
 
     uint64_t out_offset = (uint64_t)size_pad;
     uint64_t res_offset = (uint64_t)size_pad * 2;
     if(!isGraph)
     {
         HIP_CALL(hipMemcpyAsync(
-            reg_buffer->data_ptr(), inp_ptr, size_input, hipMemcpyDeviceToDevice, stream));
-        inp_ptr = reg_buffer->data_ptr();
+            reg_buffer.data_ptr(), inp_ptr, size_input, hipMemcpyDeviceToDevice, stream));
+        inp_ptr = reg_buffer.data_ptr();
     }
 
     auto ca  = reinterpret_cast<aiter::CustomAllreduce*>(_ca);
     using RD = aiter::RankData;
 
-    RD* sig_rd   = ca->get_buffer_RD(stream, reg_sig->data_ptr());
-    RD* reg_rd   = ca->get_buffer_RD(stream, reg_buffer->data_ptr());
+    RD* sig_rd   = ca->get_buffer_RD(stream, reg_sig.data_ptr());
+    RD* reg_rd   = ca->get_buffer_RD(stream, reg_buffer.data_ptr());
     RD* input_rd = ca->get_buffer_RD(stream, inp_ptr);
 
+    void* out_ptr;
+    void* res_ptr;
     uint64_t gpu_bufs[8 * 4];
     for(size_t i = 0; i < ca->world_size_; i++)
     {
         gpu_bufs[i]      = reinterpret_cast<uint64_t>(input_rd->ptrs[i]);
         gpu_bufs[i + 8]  = reinterpret_cast<uint64_t>(reg_rd->ptrs[i]) + out_offset;
         gpu_bufs[i + 16] = reinterpret_cast<uint64_t>(reg_rd->ptrs[i]) + res_offset;
+        if(i == ca->rank_)
+        {
+            out_ptr = reinterpret_cast<void*>(gpu_bufs[i + 8]);
+            res_ptr = reinterpret_cast<void*>(gpu_bufs[i + 16]);
+        }
     }
 
     uint64_t* gpu_addr_buf_in;
@@ -209,8 +218,8 @@ extern "C" __attribute__((visibility("default"))) void all_reduce_rmsnorm(
         p3 _p21;
     };
 
-    int N = input->size(-1);
-    int M = input->numel() / N;
+    int N = input.size(-1);
+    int M = input.numel() / N;
 
     int TGs = M / ca->world_size_;
     KernelArgs args;
@@ -224,9 +233,9 @@ extern "C" __attribute__((visibility("default"))) void all_reduce_rmsnorm(
     args.ptr_gpu5_sig  = const_cast<void*>(sig_rd->ptrs[5]);
     args.ptr_gpu6_sig  = const_cast<void*>(sig_rd->ptrs[6]);
     args.ptr_gpu7_sig  = const_cast<void*>(sig_rd->ptrs[7]);
-    args.ptr_resi_in   = residual_in->data_ptr();
-    args.ptr_weight_in = weight->data_ptr();
-    args.ptr_bias_in   = bias->data_ptr();
+    args.ptr_resi_in   = const_cast<void*>(residual_in.data_ptr());
+    args.ptr_weight_in = const_cast<void*>(weight.data_ptr());
+    args.ptr_bias_in   = const_cast<void*>(bias.data_ptr());
     args.gpuId         = ca->rank_;
     args.stride_gpu    = size_input / ca->world_size_;
     args.N             = N;
@@ -245,51 +254,56 @@ extern "C" __attribute__((visibility("default"))) void all_reduce_rmsnorm(
                         1,   // bdy
                         1,   // bdz
                         stream});
-    // results are written in-place: out at reg_buffer+size_pad, residual at reg_buffer+size_pad*2
-}
 
-extern "C" __attribute__((visibility("default"))) void all_reduce_rmsnorm_quant(
-    AiterTensor* input,        // [m ,n]
-    AiterTensor* residual_in,  // [m ,n]
-    AiterTensor* xscale,       // [1 ,n]
-    AiterTensor* weight,       // [1 ,n]
-    AiterTensor* bias,         // [1 ,n]
-    float epsilon,
-    // following are fused_allreduce args
-    int64_t _ca,
-    AiterTensor* reg_sig,
-    AiterTensor* reg_buffer,
-    bool isGraph,
-    hipStream_t stream)
+    auto options = torch::TensorOptions().dtype(input.dtype()).device(input.device());
+    return {torch::from_blob(out_ptr, {input.sizes()}, options),
+            torch::from_blob(res_ptr, {input.sizes()}, options)};
+};
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+all_reduce_rmsnorm_quant(torch::Tensor& input,       // [m ,n]
+                         torch::Tensor& residual_in, // [m ,n]
+                         torch::Tensor& xscale,      // [1 ,n]
+                         torch::Tensor& weight,      // [1 ,n]
+                         torch::Tensor& bias,        // [1 ,n]
+                         float epsilon,
+                         // following are fused_allreduce args
+                         int64_t _ca,
+                         torch::Tensor& reg_sig,
+                         torch::Tensor& reg_buffer,
+                         bool isGraph)
 {
-    const HipDeviceGuard device_guard(input->device_id);
-
-    auto size_input = input->numel() * input->element_size();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    auto stream     = at::hip::getCurrentHIPStream();
+    auto size_input = input.numel() * input.element_size();
     auto size_pad   = (size_input + 4095) & 0xfffff000;
 
-    void* inp_ptr = input->data_ptr();
+    void* inp_ptr = input.data_ptr();
     // reg_buffer contains input|out|res_out
     auto size_needed = size_pad * 4;
-    AITER_CHECK(size_needed <= reg_buffer->numel() * reg_buffer->element_size(),
+    TORCH_CHECK(size_needed <= reg_buffer.numel() * reg_buffer.element_size(),
                 "registered buffer is too small to contain the input ",
                 size_needed,
                 ">",
-                reg_buffer->numel() * reg_buffer->element_size());
+                reg_buffer.numel() * reg_buffer.element_size());
 
     if(!isGraph)
     {
         HIP_CALL(hipMemcpyAsync(
-            reg_buffer->data_ptr(), inp_ptr, size_input, hipMemcpyDeviceToDevice, stream));
-        inp_ptr = reg_buffer->data_ptr();
+            reg_buffer.data_ptr(), inp_ptr, size_input, hipMemcpyDeviceToDevice, stream));
+        inp_ptr = reg_buffer.data_ptr();
     }
 
     auto ca  = reinterpret_cast<aiter::CustomAllreduce*>(_ca);
     using RD = aiter::RankData;
 
-    RD* sig_rd   = ca->get_buffer_RD(stream, reg_sig->data_ptr());
-    RD* reg_rd   = ca->get_buffer_RD(stream, reg_buffer->data_ptr());
+    RD* sig_rd   = ca->get_buffer_RD(stream, reg_sig.data_ptr());
+    RD* reg_rd   = ca->get_buffer_RD(stream, reg_buffer.data_ptr());
     RD* input_rd = ca->get_buffer_RD(stream, inp_ptr);
 
+    void* out_ptr;
+    void* res_ptr;
+    void* ys_ptr;
     uint64_t gpu_bufs[8 * 4];
     for(size_t i = 0; i < ca->world_size_; i++)
     {
@@ -297,6 +311,12 @@ extern "C" __attribute__((visibility("default"))) void all_reduce_rmsnorm_quant(
         gpu_bufs[i + 8]  = reinterpret_cast<uint64_t>(reg_rd->ptrs[i]) + size_pad;
         gpu_bufs[i + 16] = reinterpret_cast<uint64_t>(reg_rd->ptrs[i]) + size_pad * 2;
         gpu_bufs[i + 24] = reinterpret_cast<uint64_t>(reg_rd->ptrs[i]) + size_pad * 3;
+        if(i == ca->rank_)
+        {
+            out_ptr = reinterpret_cast<void*>(gpu_bufs[i + 8]);
+            res_ptr = reinterpret_cast<void*>(gpu_bufs[i + 16]);
+            ys_ptr  = reinterpret_cast<void*>(gpu_bufs[i + 24]);
+        }
     }
 
     uint64_t* gpu_addr_buf_in;
@@ -346,8 +366,8 @@ extern "C" __attribute__((visibility("default"))) void all_reduce_rmsnorm_quant(
         p3 _p21;
     };
 
-    int N = input->size(-1);
-    int M = input->numel() / N;
+    int N = input.size(-1);
+    int M = input.numel() / N;
 
     int TGs = M / ca->world_size_;
     KernelArgs args;
@@ -361,10 +381,10 @@ extern "C" __attribute__((visibility("default"))) void all_reduce_rmsnorm_quant(
     args.ptr_gpu5_sig  = const_cast<void*>(sig_rd->ptrs[5]);
     args.ptr_gpu6_sig  = const_cast<void*>(sig_rd->ptrs[6]);
     args.ptr_gpu7_sig  = const_cast<void*>(sig_rd->ptrs[7]);
-    args.ptr_resi_in   = residual_in->data_ptr();
-    args.ptr_weight_in = weight->data_ptr();
-    args.ptr_bias_in   = bias->data_ptr();
-    args.ptr_xscale    = xscale->data_ptr();
+    args.ptr_resi_in   = const_cast<void*>(residual_in.data_ptr());
+    args.ptr_weight_in = const_cast<void*>(weight.data_ptr());
+    args.ptr_bias_in   = const_cast<void*>(bias.data_ptr());
+    args.ptr_xscale    = xscale.data_ptr();
     args.gpuId         = ca->rank_;
     args.stride_gpu    = size_input / ca->world_size_;
     args.N             = N;
@@ -384,5 +404,13 @@ extern "C" __attribute__((visibility("default"))) void all_reduce_rmsnorm_quant(
                         1,   // bdy
                         1,   // bdz
                         stream});
-    // results are written in-place: out at reg_buffer+size_pad, residual at reg_buffer+size_pad*2, yscale at reg_buffer+size_pad*3
-}
+
+    auto opt_out = torch::TensorOptions().dtype(torch::kInt8).device(input.device());
+    auto opt_res = torch::TensorOptions().dtype(input.dtype()).device(input.device());
+    auto opt_ys  = torch::TensorOptions().dtype(torch::kFloat32).device(input.device());
+    return {
+        torch::from_blob(out_ptr, {input.sizes()}, opt_out),
+        torch::from_blob(res_ptr, {input.sizes()}, opt_res),
+        torch::from_blob(ys_ptr, {M, 1}, opt_ys),
+    };
+};

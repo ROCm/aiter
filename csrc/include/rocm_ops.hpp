@@ -386,6 +386,9 @@ namespace py = pybind11;
           py::arg("eps"),                                                                      \
           py::arg("reg_buffer") = std::nullopt,                                                \
           py::arg("use_1stage") = false);                                                      \
+    m.def("all_reduce_asm_", &all_reduce_asm, "");                                             \
+    m.def("all_reduce_rmsnorm_", &all_reduce_rmsnorm, "all_reduce_rmsnorm");                   \
+    m.def("all_reduce_rmsnorm_quant_", &all_reduce_rmsnorm_quant, "all_reduce_rmsnorm_quant"); \
     m.def("dispose", &aiter::dispose, py::arg("_fa"));                                         \
     m.def("meta_size", &aiter::meta_size);                                                     \
     m.def("register_input_buffer",                                                             \
@@ -429,19 +432,6 @@ namespace py = pybind11;
           "wvSplitKQ(Tensor in_a, Tensor in_b, Tensor! out_c, Tensor scale_a, Tensor scale_b, " \
           "int CuCount) -> ()");
 
-#define GEMM_A8W8_ASM_PYBIND                                            \
-    m.def("gemm_a8w8_asm",                                              \
-          &gemm_a8w8_asm,                                               \
-          "Asm gemm a8w8 ,  weight should be shuffle to layout(32,16)", \
-          py::arg("XQ"),                                                \
-          py::arg("WQ"),                                                \
-          py::arg("x_scale"),                                           \
-          py::arg("w_scale"),                                           \
-          py::arg("Out"),                                               \
-          py::arg("kernelName"),                                        \
-          py::arg("bias"),                                              \
-          py::arg("bpreshuffle") = true,                                \
-          py::arg("splitK")      = std::nullopt);
 
 #define GEMM_A16W16_ASM_PYBIND                   \
     m.def("gemm_a16w16_asm",                     \
@@ -456,21 +446,6 @@ namespace py = pybind11;
           py::arg("kernelName")  = std::nullopt, \
           py::arg("bpreshuffle") = false);
 
-#define GEMM_A4W4_ASM_PYBIND                      \
-    m.def("gemm_a4w4_asm",                        \
-          &gemm_a4w4_asm,                         \
-          "Asm gemm a4w4",                        \
-          py::arg("A"),                           \
-          py::arg("B"),                           \
-          py::arg("A_scale"),                     \
-          py::arg("B_scale"),                     \
-          py::arg("out"),                         \
-          py::arg("kernelName"),                  \
-          py::arg("bias")         = std::nullopt, \
-          py::arg("alpha")        = 1.0,          \
-          py::arg("beta")         = 0.0,          \
-          py::arg("bpreshuffle")  = true,         \
-          py::arg("log2_k_split") = std::nullopt);
 
 #define FLATMM_A8W8_BLOCKSCALE_ASM_PYBIND \
     m.def("flatmm_a8w8_blockscale_asm",   \
@@ -482,19 +457,6 @@ namespace py = pybind11;
           py::arg("w_scale"),             \
           py::arg("Out"));
 
-#define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_ASM_PYBIND                  \
-    m.def("gemm_a8w8_blockscale_bpreshuffle_asm",                    \
-          &gemm_a8w8_blockscale_bpreshuffle_asm,                     \
-          "FP8 blockscale BpreShuffle GEMM assembly implementation", \
-          py::arg("A"),                                              \
-          py::arg("B"),                                              \
-          py::arg("out"),                                            \
-          py::arg("A_scale"),                                        \
-          py::arg("B_scale"),                                        \
-          py::arg("bias")        = py::none(),                       \
-          py::arg("splitK")      = py::none(),                       \
-          py::arg("kernelName")  = py::none(),                       \
-          py::arg("bpreshuffle") = true);
 
 #define GEMM_A4W4_BLOCKSCALE_PYBIND \
     m.def("gemm_a4w4_blockscale",   \
@@ -1109,14 +1071,8 @@ namespace py = pybind11;
           py::arg("token_expert_indices"),                                     \
           py::arg("gating_output"),                                            \
           py::arg("need_renorm"),                                              \
-          "Apply topk softmax to the gating outputs.");                        \
-    m.def("topk_softmax_asm",                                                  \
-          &topk_softmax_asm,                                                   \
-          py::arg("topk_weights"),                                             \
-          py::arg("topk_indices"),                                             \
-          py::arg("token_expert_indices"),                                     \
-          py::arg("gating_output"),                                            \
-          py::arg("need_renorm"),                                              \
+          py::arg("num_shared_experts")         = 0,                           \
+          py::arg("shared_expert_scoring_func") = "",                          \
           "Apply topk softmax to the gating outputs.");                        \
     m.def("grouped_topk",                                                      \
           &grouped_topk,                                                       \
@@ -1208,7 +1164,7 @@ namespace py = pybind11;
           py::arg("fc2_smooth_scale") = std::nullopt,                          \
           py::arg("activation")       = ActivationType::Silu);                       \
     m.def("fmoe_int8_g1u0_a16",                                                \
-          &fmoe_int8_g1u0_a16,                                                \
+          &fmoe_int8_g1u0_a16,                                                 \
           py::arg("out"),                                                      \
           py::arg("input"),                                                    \
           py::arg("gate"),                                                     \
@@ -1222,7 +1178,7 @@ namespace py = pybind11;
           py::arg("fc2_scale"),                                                \
           py::arg("fc1_smooth_scale"),                                         \
           py::arg("fc2_smooth_scale"),                                         \
-          py::arg("activation") = ActivationType::Silu);                      \
+          py::arg("activation") = ActivationType::Silu);                       \
     m.def("fmoe_g1u1_a16",                                                     \
           &fmoe_g1u1_a16,                                                      \
           py::arg("out"),                                                      \
@@ -1757,8 +1713,27 @@ namespace py = pybind11;
           py::arg("numRows"),           \
           py::arg("stride0"),           \
           py::arg("stride1"));          \
+    m.def("top_k_per_row_prefill_fast", \
+          &top_k_per_row_prefill_fast,  \
+          py::arg("logits"),            \
+          py::arg("rowStarts"),         \
+          py::arg("rowEnds"),           \
+          py::arg("indices"),           \
+          py::arg("values"),            \
+          py::arg("numRows"),           \
+          py::arg("stride0"),           \
+          py::arg("stride1"));          \
     m.def("top_k_per_row_decode",       \
           &top_k_per_row_decode,        \
+          py::arg("logits"),            \
+          py::arg("next_n"),            \
+          py::arg("seqLens"),           \
+          py::arg("indices"),           \
+          py::arg("numRows"),           \
+          py::arg("stride0"),           \
+          py::arg("stride1"));          \
+    m.def("top_k_per_row_decode_fast",  \
+          &top_k_per_row_decode_fast,   \
           py::arg("logits"),            \
           py::arg("next_n"),            \
           py::arg("seqLens"),           \
