@@ -293,7 +293,7 @@ def test_mla_prefill(
 
    
 
-    use_triton = False
+    use_triton = True
     if use_triton:
         triton_out = torch.empty((num_tokens, num_head_q, v_head_dim), dtype=torch.bfloat16)
         use_fp8 = True
