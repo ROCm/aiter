@@ -145,9 +145,9 @@ def test_triton_unified_attn(
     cu_query_lens = torch.tensor(
         [0] + query_lens, dtype=torch.int32, device="cuda"
     ).cumsum(dim=0, dtype=torch.int32)
-    cu_key_lens = torch.tensor(
-        [0] + kv_lens, dtype=torch.int32, device="cuda"
-    ).cumsum(dim=0, dtype=torch.int32)
+    # cu_key_lens = torch.tensor(
+    #     [0] + kv_lens, dtype=torch.int32, device="cuda"
+    # ).cumsum(dim=0, dtype=torch.int32)
     kv_lens = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
 
     max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
