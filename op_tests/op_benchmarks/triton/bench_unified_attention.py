@@ -1,6 +1,5 @@
 from sys import exit
 
-import random
 import argparse
 import itertools
 
