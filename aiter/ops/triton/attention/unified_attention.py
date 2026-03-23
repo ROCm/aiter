@@ -9,8 +9,6 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     kernel_unified_attention_3d,
     reduce_segments,
 )
-from enum import IntEnum
-
 
 def get_config(num_tokens, num_seqs, num_queries_per_kv, num_kv_heads, head_size, window_size, max_seqlen_q, max_seqlen_k, block_size, q_element_size):
     SLIDING_WINDOW = 1 + window_size[0]
