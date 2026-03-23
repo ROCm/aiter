@@ -56,6 +56,7 @@ def gen_gemm_a8w8_bpreshuffle_ck_fake_tensors(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    splitK: int = 0,
 ) -> torch.Tensor:
     return Out
 
@@ -71,6 +72,7 @@ def gemm_a8w8_bpreshuffle_ck(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    splitK: int = 0,
 ) -> torch.Tensor: ...
 
 
@@ -80,6 +82,7 @@ def gen_gemm_a8w8_bpreshuffle_cktile_fake_tensors(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    splitK: int = 0,
 ) -> torch.Tensor:
     return Out
 
@@ -95,6 +98,7 @@ def gemm_a8w8_bpreshuffle_cktile(
     x_scale: Tensor,
     w_scale: Tensor,
     out: Tensor,
+    splitK: int = 0,
 ) -> Tensor: ...
 
 
@@ -533,12 +537,13 @@ def gemm_a8w8_bpreshuffle(
     )
     if config is not None:
         libtype = config["libtype"]
+        splitK = int(config["splitK"])
         if libtype == "ck":
-            return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+            return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, splitK)
         elif libtype == "cktile":
-            return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
+            return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
     else:
-        return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+        return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, 0)
 
 
 def gemm_a8w8_blockscale_fake(

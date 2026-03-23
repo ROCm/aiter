@@ -702,7 +702,8 @@ namespace py = pybind11;
           py::arg("WQ"),             \
           py::arg("x_scale"),        \
           py::arg("w_scale"),        \
-          py::arg("Out"));
+          py::arg("Out"),            \
+          py::arg("splitK") = 0);
 
 #define GEMM_A8W8_BPRESHUFFLE_TUNE_PYBIND \
     m.def("gemm_a8w8_bpreshuffle_tune",   \
@@ -724,7 +725,8 @@ namespace py = pybind11;
           py::arg("WQ"),                    \
           py::arg("x_scale"),               \
           py::arg("w_scale"),               \
-          py::arg("Out"));
+          py::arg("Out"),                   \
+          py::arg("splitK") = 0);
 
 #define GEMM_A8W8_BPRESHUFFLE_CKTILE_TUNE_PYBIND \
     m.def("gemm_a8w8_bpreshuffle_cktile_tune",   \
