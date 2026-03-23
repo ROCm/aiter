@@ -165,9 +165,9 @@ def kernel_unified_attention_2d(
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
     scale: tl.constexpr,  # float32
-    q_scale,  # [num_tokens // BLOCK_M, num_kv_heads] if sage, [num_tokens, num_query_heads, head_size // 32] if sage_mxfp4 else non or scalar
-    k_scale,  # [num_blks, tl.cdiv(block_size, TILE_SIZE), num_kv_heads] if sage, [num_blks, blk_size, num_kv_heads, head_size // 32] if sage_mxfp4 else non or scalar
-    v_scale,  # [num_kv_heads, head_size] if sage or sage_mxfp4 else non or scalar
+    q_scale,  # [num_tokens, num_query_heads, head_size // 32] (sage_mxfp4), None (no quantization) or scalar (per tensor fp8)
+    k_scale,  # [num_blks, blk_size, num_kv_heads, head_size // 32] (sage_mxfp4), None (no quantization) or scalar (per tensor fp8)
+    v_scale,  # [num_kv_heads, head_size] (sage_mxfp4), None (no quantization) or scalar (per tensor fp8)
     out_scale,  # float32
     softcap,  # float32
     num_query_heads: tl.constexpr,  # int
@@ -225,7 +225,8 @@ def kernel_unified_attention_2d(
     if not SAGE_MXFP4:
         _q_ds = tl.load(q_scale) if q_scale is not None else 1.0
         _k_ds = tl.load(k_scale) if k_scale is not None else 1.0
-        qk_scale = scale * RCP_LN2 * _q_ds * _k_ds
+        sm_scale = scale if scale is not None else 1.0
+        qk_scale = sm_scale * RCP_LN2 * _q_ds * _k_ds
     else:
         qk_scale = None
 
@@ -576,8 +577,8 @@ def kernel_unified_attention_3d(
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
     scale,  # float32
-    q_scale,  # [num_tokens // BLOCK_M, num_kv_heads] if sage, [num_tokens, num_query_heads, head_size // 32] if sage_mxfp4 else non or scalar
-    k_scale,  # [num_blks, tl.cdiv(block_size, TILE_SIZE), num_kv_heads] if sage, [num_blks, blk_size, num_kv_heads, head_size // 32] if sage_mxfp4 else non or scalar
+    q_scale,  # [num_tokens, num_query_heads, head_size // 32] (sage_mxfp4), None (no quantization) or scalar (per tensor fp8)
+    k_scale,  # [num_blks, blk_size, num_kv_heads, head_size // 32] (sage_mxfp4), None (no quantization) or scalar (per tensor fp8)
     softcap,  # float32
     num_query_heads: tl.constexpr,  # int
     num_queries_per_kv: tl.constexpr,  # int
@@ -628,7 +629,8 @@ def kernel_unified_attention_3d(
     if not SAGE_MXFP4:
         _q_ds = tl.load(q_scale) if q_scale is not None else 1.0
         _k_ds = tl.load(k_scale) if k_scale is not None else 1.0
-        qk_scale = scale * RCP_LN2 * _q_ds * _k_ds
+        sm_scale = scale if scale is not None else 1.0
+        qk_scale = sm_scale * RCP_LN2 * _q_ds * _k_ds
     else:
         qk_scale = None
 
@@ -910,6 +912,8 @@ def kernel_unified_attention_3d(
         L = L * alpha + l_j
         M = m_j
 
+        tl.static_print("P", P)
+        tl.static_print("V", V)
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         acc += tl.dot(P.to(V.dtype), V)
 
