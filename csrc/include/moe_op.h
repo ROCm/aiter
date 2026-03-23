@@ -40,12 +40,6 @@ void moe_align_block_size(torch::Tensor topk_ids,
                           torch::Tensor token_nums,
                           torch::Tensor num_tokens_post_pad);
 
-void topk_softmax_asm(torch::Tensor& topk_weights,         // [num_tokens, topk]
-                      torch::Tensor& topk_indices,         // [num_tokens, topk]
-                      torch::Tensor& token_expert_indices, // [num_tokens, topk]
-                      torch::Tensor& gating_output,        // [num_tokens, num_experts]
-                      bool need_renorm);
-
 namespace aiter {
 
 void topk_softmax(torch::Tensor& topk_weights,
