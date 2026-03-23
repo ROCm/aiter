@@ -388,7 +388,7 @@ class FmoeTuner(TunerCommon):
         q_type,
         act_type,
     ):
-        w2_shuffled = shuffle_weight(w2_qt, layout=(16, 16))
+        shuffle_weight(w2_qt, layout=(16, 16))
         if kparams["b_dtype"] == "fp4" and w2_scale is not None:
             w2_scale = fp4_utils.e8m0_shuffle(w2_scale)
         return flydsl_moe_stage2(
