@@ -33,7 +33,14 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed
-from torch.distributed import Backend, ProcessGroup
+try:
+    from torch.distributed import Backend, ProcessGroup
+except ImportError:
+    # torch.distributed is not available on all Windows ROCm builds.
+    # Set to None so the module can be imported; code paths that actually
+    # use these names are guarded by distributed-availability checks.
+    Backend = None      # type: ignore[assignment]
+    ProcessGroup = None  # type: ignore[assignment]
 
 import os
 from aiter import logger
