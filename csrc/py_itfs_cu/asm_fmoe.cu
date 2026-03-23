@@ -717,25 +717,48 @@ extern "C" __attribute__((visibility("default"))) void fmoe_int8_g1u0_a16(
     AiterTensor* fc2_scale,         // [expert, 1, dim]
     AiterTensor* fc1_smooth_scale,  // [expert, 1, dim]
     AiterTensor* fc2_smooth_scale,  // [expert, 1, inter_dim]
+    int activation,
     hipStream_t stream)
 {
     const HipDeviceGuard device_guard(input->device_id);
-    static FMoeKernel impl("fmoe_kernel_func", "fmoe_int8_g1u0_smf.co");
-    impl.launch_kernel<1, 2, true>(out,
-                                   input,
-                                   gate,
-                                   down,
-                                   sorted_token_ids,
-                                   sorted_weights,
-                                   sorted_expert_ids,
-                                   num_valid_ids,
-                                   topk,
-                                   // quant args
-                                   fc1_smooth_scale,
-                                   fc1_scale,
-                                   fc2_scale,
-                                   fc2_smooth_scale,
-                                   stream);
+    ActivationType act = static_cast<ActivationType>(activation);
+    FMoeKernel* impl_ptr = nullptr;
+    CFG* config_map      = nullptr;
+    int inter_dim        = down->size(2);
+    int sub_X_cnt        = sorted_expert_ids->size(0);
+
+    if(gate->dtype() == AITER_DTYPE_i8 || gate->dtype() == AITER_DTYPE_u8)
+    {
+        if(out->dtype() == AITER_DTYPE_fp16 && act == ActivationType::Silu)
+            config_map = &cfg_fmoe_fp16_pertokenInt8_g1u0_silu;
+        else if(out->dtype() == AITER_DTYPE_fp16 && act == ActivationType::Gelu)
+            config_map = &cfg_fmoe_fp16_pertokenInt8_g1u0_gelu;
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Silu)
+            config_map = &cfg_fmoe_bf16_pertokenInt8_g1u0_silu;
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Gelu)
+            config_map = &cfg_fmoe_bf16_pertokenInt8_g1u0_gelu;
+        else
+            AITER_CHECK(false, __func__, " Not find proper cfg in pertokenInt8_g1u0. ");
+    }
+    else
+        AITER_CHECK(false, __func__, "Unsupported gate dtype for fmoe_int8_g1u0_a16");
+
+    impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, 1);
+    impl_ptr->launch_kernel<1, 2, true>(out,
+                                        input,
+                                        gate,
+                                        down,
+                                        sorted_token_ids,
+                                        sorted_weights,
+                                        sorted_expert_ids,
+                                        num_valid_ids,
+                                        topk,
+                                        // quant args
+                                        fc1_smooth_scale,
+                                        fc1_scale,
+                                        fc2_scale,
+                                        fc2_smooth_scale,
+                                        stream);
 }
 
 extern "C" __attribute__((visibility("default"))) void fmoe_g1u1_a16(
