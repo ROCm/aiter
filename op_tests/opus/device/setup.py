@@ -26,6 +26,9 @@ _CU_SOURCES = [
     "test_mfma_f32.cu",
     "test_mfma_f8.cu",
     "test_mxfp.cu",
+    "test_wmma_f16.cu",
+    "test_wmma_f32.cu",
+    "test_wmma_f8.cu",
     "test_load_store_if.cu",
     "test_vector_add.cu",
     "test_async_load.cu",
@@ -33,6 +36,7 @@ _CU_SOURCES = [
     "test_mdiv.cu",
     "test_numeric_limits.cu",
     "test_workgroup_barrier.cu",
+    "test_finfo.cu",
 ]
 
 
