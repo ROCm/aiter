@@ -84,7 +84,8 @@ cktile_moe_gemm1(torch::Tensor& XQ,
                  std::optional<torch::Tensor> exp_bias,
                  std::optional<int> activation,
                  std::optional<int> block_m,
-                 std::optional<int> split_k);
+                 std::optional<int> split_k,
+                 std::string kernel_name = "");
 
 __attribute__((visibility("default"))) torch::Tensor
 cktile_moe_gemm2(torch::Tensor& XQ,
@@ -102,4 +103,5 @@ cktile_moe_gemm2(torch::Tensor& XQ,
                  std::optional<torch::Tensor> exp_bias,
                  std::optional<int> activation,
                  std::optional<int> block_m,
-                 std::optional<int> split_k);
+                 std::optional<int> split_k,
+                 std::string kernel_name = "");
