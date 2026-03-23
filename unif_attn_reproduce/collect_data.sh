@@ -1,8 +1,8 @@
 export PRINT_IRS=1
 export TRITON_ALWAYS_COMPILE=1
 # if both 0, use bf16, if both 1, fp8 with tensor scale
-q_fp8=1
-kv_fp8=1
+q_fp8=0
+kv_fp8=0
 for wpeu in 1; do
 for lenn in 2048; do
     seq_q_l=$lenn
