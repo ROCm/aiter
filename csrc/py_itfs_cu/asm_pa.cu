@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
 #include "asm_pa_configs.hpp"
-#include "py_itfs_common.h"
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
-#include <torch/all.h>
+#include <memory>
+#include <unordered_map>
 
 struct __attribute__((packed)) KernelArgs
 {
@@ -103,6 +101,7 @@ std::string get_heuristic_kernel(std::string q_type,
                                  std::string arch_id,
                                  int ps,
                                  int qTile,
+                                 int quant_type,
                                  CFG* cfgs)
 {
     // # mtp * gqa <= 16
@@ -125,14 +124,14 @@ std::string get_heuristic_kernel(std::string q_type,
                 // hp is just distinct from uhp
                 if(cfg.qType == q_type && cfg.kvType == kv_type && cfg.Gqa == gqa_ &&
                    cfg.Mtp == mtp_ && cfg.Msk == msk && (cfg.Hp == hp || hp == 1) &&
-                   cfg.blkSz == block_size && cfg.ps == ps && cfg.qTile == qTile)
+                   cfg.blkSz == block_size && cfg.ps == ps && cfg.qTile == qTile && cfg.quant_type == quant_type)
 
                     return el.first;
             }
         }
     }
 
-    TORCH_CHECK(false,
+    AITER_CHECK(false,
                 __func__,
                 ": cannot get heuristic kernel!"
                 " q_type:",
@@ -152,59 +151,61 @@ std::string get_heuristic_kernel(std::string q_type,
                 " ps:",
                 ps,
                 " qTile:",
-                qTile);
+                qTile,
+                " quant_type:",
+                quant_type);
     return "";
 }
 const float f_log2E = log2f(expf(1));
 
-torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
-                     torch::Tensor& K, //   [num_blocks, num_kv_heads, head_size/x, block_size, x]
-                     torch::Tensor& V, //   [num_blocks, num_kv_heads, block_size/X, head_size, X]
-                     torch::Tensor& block_tables, //   [num_seqs, max_num_blocks_per_seq]
-                     torch::Tensor& context_lens, //   [num_seqs]
-                     int block_tables_stride0,
-                     int max_qlen                           = 1,
-                     std::optional<torch::Tensor> K_QScale  = std::nullopt,
-                     std::optional<torch::Tensor> V_QScale  = std::nullopt,
-                     std::optional<torch::Tensor> out_      = std::nullopt,
-                     std::optional<torch::Tensor> qo_indptr = std::nullopt,
-                     std::optional<int> high_precision      = 1,
-                     std::optional<std::string> kernelName_ = std::nullopt)
+extern "C" __attribute__((visibility("default")))
+void pa_fwd(AiterTensor* Q,              //   [num_seqs, num_heads, head_size]
+            AiterTensor* K,              //   [num_blocks, num_kv_heads, head_size/x, block_size, x]
+            AiterTensor* V,              //   [num_blocks, num_kv_heads, block_size/X, head_size, X]
+            AiterTensor* block_tables,   //   [num_seqs, max_num_blocks_per_seq]
+            AiterTensor* context_lens,   //   [num_seqs]
+            int block_tables_stride0,
+            int max_qlen,
+            AiterTensor* K_QScale,       //   nullable
+            AiterTensor* V_QScale,       //   nullable
+            AiterTensor* out_,           //   output tensor (pre-allocated by caller)
+            AiterTensor* qo_indptr,      //   nullable
+            int high_precision,
+            const char* kernelName_,     //   nullable
+            hipStream_t stream)
 {
-    torch::Tensor output = out_.value_or(torch::empty_like(Q));
-    int batch            = context_lens.size(0);
+    int batch            = context_lens->size(0);
     std::string arch_id = get_gpu_arch();
-    // int block_tables_stride0 = block_tables.size(1);
-    int num_heads       = Q.size(1);
-    int head_size       = Q.size(2);
-    TORCH_CHECK(head_size == 128,
+    int num_heads       = Q->size(1);
+    int head_size       = Q->size(2);
+    AITER_CHECK(head_size == 128,
         __func__,
         ": ASM PA only supports head_size=128, got ",
         head_size);
-    int num_kv_heads    = K.size(1);
-    int block_size      = K.size(3);
+    int num_kv_heads    = K->size(1);
+    int block_size      = K->size(3);
     const int gqa_ratio = num_heads / num_kv_heads;
 
     int dim            = head_size;
-    int stride_Q       = Q.stride(0) * Q.itemsize();
-    int stride_KV_head = K.stride(1) * K.itemsize();
-    int stride_KV_blk  = K.stride(0) * K.itemsize();
+    int stride_Q       = Q->stride(0) * Q->element_size();
+    int stride_KV_head = K->stride(1) * K->element_size();
+    int stride_KV_blk  = K->stride(0) * K->element_size();
     float k_log2e      = f_log2E;
     float k_scalar     = sqrt(dim);
     k_scalar           = (float)((double)k_log2e / (double)k_scalar);
 
     KernelArgs args;
     size_t arg_size = sizeof(args);
-    args.ptr_O      = output.data_ptr();
-    args.ptr_Q      = Q.data_ptr();
-    args.ptr_K      = K.data_ptr();
-    args.ptr_V      = V.data_ptr();
-    args.ptr_BT     = block_tables.data_ptr();
-    args.ptr_CL     = context_lens.data_ptr();
-    if(K_QScale)
+    args.ptr_O      = out_->data_ptr();
+    args.ptr_Q      = Q->data_ptr();
+    args.ptr_K      = K->data_ptr();
+    args.ptr_V      = V->data_ptr();
+    args.ptr_BT     = block_tables->data_ptr();
+    args.ptr_CL     = context_lens->data_ptr();
+    if(K_QScale != nullptr)
     {
-        args.ptr_KQ = K_QScale.value().data_ptr();
-        args.ptr_VQ = V_QScale.value().data_ptr();
+        args.ptr_KQ = K_QScale->data_ptr();
+        args.ptr_VQ = V_QScale->data_ptr();
     }
     else
     {
@@ -218,13 +219,9 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     args.Bs        = stride_KV_blk;
     args.KVs       = stride_KV_head;
     args.GQA       = gqa_ratio;
-    args.ptr_QTP   = qo_indptr ? qo_indptr.value().data_ptr() : nullptr;
-    // std::cout << "sclg2e: " << args.sclg2e << " mblk:" << args.mblk
-    //           << " kv_nheads:" << args.kv_nheads << " Qs:" << args.Qs << " Bs:" << args.Bs
-    //           << " KVs:" << args.KVs << std::endl;
+    args.ptr_QTP   = (qo_indptr != nullptr) ? qo_indptr->data_ptr() : nullptr;
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Q));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const HipDeviceGuard device_guard(Q->device_id);
 
     std::string q_type;
     std::string kv_type;
@@ -233,30 +230,28 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     int msk;
     int hp;
     // 1. "q_type"
-    if(Q.dtype() == at::ScalarType::Half)
+    auto q_dtype = Q->dtype();
+    auto kv_dtype = K->dtype();
+    if(q_dtype == AITER_DTYPE_fp16)
         q_type = "fp16";
-    else if(Q.dtype() == at::ScalarType::BFloat16)
+    else if(q_dtype == AITER_DTYPE_bf16)
         q_type = "bf16";
     else
-        TORCH_CHECK(false, __func__, ": unsupport Q dtype:", Q.scalar_type());
+        AITER_CHECK(false, __func__, ": unsupport Q dtype:", AiterDtype_to_str(q_dtype));
 
     // 2. "kv_type"
-    if(K.dtype() == at::ScalarType::Half)
+    if(kv_dtype == AITER_DTYPE_fp16)
         kv_type = "fp16";
-    else if(K.dtype() == at::ScalarType::BFloat16)
+    else if(kv_dtype == AITER_DTYPE_bf16)
         kv_type = "bf16";
-    else if(K.dtype() == at::ScalarType::Byte || K.dtype() == at::ScalarType::Char) //?
+    else if(kv_dtype == AITER_DTYPE_i8 || kv_dtype == AITER_DTYPE_u8)
         kv_type = "int8";
-    else if(K.dtype() == torch_fp8)
+    else if(kv_dtype == AITER_DTYPE_fp8)
         kv_type = "fp8";
     else
-        TORCH_CHECK(false, __func__, ": unsupport K dtype:", K.scalar_type());
+        AITER_CHECK(false, __func__, ": unsupport K dtype:", AiterDtype_to_str(kv_dtype));
 
-    // 3. "gqa_ratio"
-    // gqa = (gqa_ratio <= 8) ? 8 : 16;
-
-    // 4. "mtp" , 5. "mask"
-    if(qo_indptr && max_qlen > 1)
+    if(qo_indptr != nullptr && max_qlen > 1)
     {
         mtp = max_qlen + 10; // for kernels only support qlen=3, we encode it as 3+10=13
         msk = 1;
@@ -267,7 +262,7 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
         msk = 0;
     }
     // 6. "high_precision" , 7. "ultra_precision"
-    switch(high_precision.value())
+    switch(high_precision)
     {
     case 1: hp = 1; break;
     case 2: hp = 2; break;
@@ -276,13 +271,13 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     int qTile = 0;
     CFG* config_map = &cfg_pa_asm; // only one config csv in hsa/<arch>/pa, now
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
-    std::string kernelName = kernelName_.has_value() ? arch_id + kernelName_.value() : "";
+    std::string kernelName = (kernelName_ != nullptr) ? arch_id + std::string(kernelName_) : "";
     int ps = 0;
     if (kernelName.empty())
-        kernelName = get_heuristic_kernel(q_type, kv_type, gqa_ratio, mtp, msk, hp, block_size, arch_id, ps, qTile, config_map);
+        kernelName = get_heuristic_kernel(q_type, kv_type, gqa_ratio, mtp, msk, hp, block_size, arch_id, ps, qTile, 0, config_map);
     if(kernelName.empty())
     {
-        TORCH_CHECK(false, __func__, "not supported this kernel now! ");
+        AITER_CHECK(false, __func__, "not supported this kernel now! ");
     }
 
     AiterAsmKernel* impl_ptr = nullptr;
@@ -301,7 +296,7 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
         impl_ptr = result.first->second.get();
     }
     else
-        TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
+        AITER_CHECK(false, __func__, " not find kernel ", kernelName);
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,
@@ -312,60 +307,59 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
                              1,            // bdy
                              1,            // bdz
                              stream});
-    return output;
 }
 
-torch::Tensor pa_ps_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
-    torch::Tensor& K, //   [num_blocks, num_kv_heads, head_size/x, block_size, x]
-    torch::Tensor& V, //   [num_blocks, num_kv_heads, block_size/X, head_size, X]
-    torch::Tensor& kv_indptr, //   [batch_size+1], kvlen prefix sum
-    torch::Tensor& kv_indices, //   [sum_kvlen], packed kv ids
-    torch::Tensor& context_lens, //   [batch_size]
-    float softmax_scale,
-    int max_qlen                           = 1,
-    std::optional<torch::Tensor> K_QScale  = std::nullopt,
-    std::optional<torch::Tensor> V_QScale  = std::nullopt,
-    std::optional<torch::Tensor> out_      = std::nullopt,
-    std::optional<torch::Tensor> qo_indptr = std::nullopt,
-    std::optional<torch::Tensor> work_indptr = std::nullopt,
-    std::optional<torch::Tensor> work_info = std::nullopt,
-    // std::optional<torch::Tensor> work_meta_data = std::nullopt,
-    std::optional<torch::Tensor> splitData = std::nullopt,
-    std::optional<torch::Tensor> splitLse = std::nullopt,
-    int mask                               = 0,
-    std::optional<int> high_precision      = 1,
-    std::optional<std::string> kernelName_ = std::nullopt)
+extern "C" __attribute__((visibility("default")))
+void pa_ps_fwd(AiterTensor* Q,            //   [num_seqs, num_heads, head_size]
+               AiterTensor* K,            //   [num_blocks, num_kv_heads, head_size/x, block_size, x]
+               AiterTensor* V,            //   [num_blocks, num_kv_heads, block_size/X, head_size, X]
+               AiterTensor* kv_indptr,    //   [batch_size+1], kvlen prefix sum
+               AiterTensor* kv_indices,   //   [sum_kvlen], packed kv ids
+               AiterTensor* context_lens, //   [batch_size]
+               float softmax_scale,
+               int max_qlen,
+               AiterTensor* K_QScale,     //   nullable
+               AiterTensor* V_QScale,     //   nullable
+               AiterTensor* out_,         //   output (pre-allocated by caller)
+               AiterTensor* qo_indptr,    //   nullable
+               AiterTensor* work_indptr,  //   nullable
+               AiterTensor* work_info,    //   nullable
+               AiterTensor* splitData,    //   nullable
+               AiterTensor* splitLse,     //   nullable
+               int mask,
+               int high_precision,
+               const char* kernelName_,   //   nullable
+               int quant_type,            //   QuantType enum value
+               hipStream_t stream)
 {
-    torch::Tensor output = out_.value_or(torch::empty_like(Q));
     int batch           = qo_indptr->size(0) - 1;
-    // int block_tables_stride0 = block_tables.size(1);
-    int num_heads       = Q.size(1);
-    int head_size       = Q.size(2);
-    int num_kv_heads    = K.size(1);
-    int block_size      = K.size(3);
-    const int gqa_ratio = num_heads / num_kv_heads;    
+    int num_heads       = Q->size(1);
+    int head_size       = Q->size(2);
+    int num_kv_heads    = K->size(1);
+    int block_size      = K->size(3);
+    const int gqa_ratio = num_heads / num_kv_heads;
 
     int dim            = head_size;
-    int stride_Q       = Q.stride(0) * Q.itemsize();
-    int stride_KV_head = K.stride(1) * K.itemsize();
-    int stride_KV_blk  = K.stride(0) * K.itemsize();
+    int stride_Q       = Q->stride(0) * Q->element_size();
+    int stride_KV_head = K->stride(1) * K->element_size();
+    int stride_KV_blk  = K->stride(0) * K->element_size();
     float k_log2e      = f_log2E;
     float k_scalar     = sqrt(dim);
     k_scalar           = (float)((double)k_log2e / (double)k_scalar);
 
     PsKernelArgs args;
     size_t arg_size = sizeof(args);
-    args.ptr_O      = output.data_ptr();
-    args.ptr_Q      = Q.data_ptr();
-    args.ptr_K      = K.data_ptr();
-    args.ptr_V      = V.data_ptr();
+    args.ptr_O      = out_->data_ptr();
+    args.ptr_Q      = Q->data_ptr();
+    args.ptr_K      = K->data_ptr();
+    args.ptr_V      = V->data_ptr();
 
-    args.ptr_KVIndices     = kv_indices.data_ptr();
-    args.ptr_CL     = context_lens.data_ptr();
-    if(K_QScale)
+    args.ptr_KVIndices     = kv_indices->data_ptr();
+    args.ptr_CL     = context_lens->data_ptr();
+    if(K_QScale != nullptr)
     {
-        args.ptr_KQ = K_QScale.value().data_ptr();
-        args.ptr_VQ = V_QScale.value().data_ptr();
+        args.ptr_KQ = K_QScale->data_ptr();
+        args.ptr_VQ = V_QScale->data_ptr();
     }
     else
     {
@@ -373,27 +367,20 @@ torch::Tensor pa_ps_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
         args.ptr_VQ = nullptr;
     }
     args.sclg2e       = k_scalar;
-    // args.mblk         = 1; // fix
     args.kv_nheads    = num_kv_heads;
     args.Qs           = stride_Q;
     args.Bs           = stride_KV_blk;
     args.KVs          = stride_KV_head;
     args.GQA          = gqa_ratio;
-    args.ptr_QOPtr      = qo_indptr ? qo_indptr.value().data_ptr() : nullptr;
-    args.ptr_KVPtr     = kv_indptr.data_ptr();
-    // args.ptr_Metadata = work_meta_data ? work_meta_data.value().data_ptr() : nullptr;
-    args.ptr_WorkPtr  = work_indptr ? work_indptr.value().data_ptr() : nullptr;
-    args.ptr_WorkInfo = work_info ? work_info.value().data_ptr() : nullptr;
-    args.ptr_SplitO   = work_info ? splitData.value().data_ptr() : nullptr;
-    args.ptr_SplitLSE = work_info ? splitLse.value().data_ptr() : nullptr;
+    args.ptr_QOPtr      = (qo_indptr != nullptr) ? qo_indptr->data_ptr() : nullptr;
+    args.ptr_KVPtr     = kv_indptr->data_ptr();
+    args.ptr_WorkPtr  = (work_indptr != nullptr) ? work_indptr->data_ptr() : nullptr;
+    args.ptr_WorkInfo = (work_info != nullptr) ? work_info->data_ptr() : nullptr;
+    args.ptr_SplitO   = (work_info != nullptr) ? splitData->data_ptr() : nullptr;
+    args.ptr_SplitLSE = (work_info != nullptr) ? splitLse->data_ptr() : nullptr;
     args.mtp          = max_qlen - 1;
 
-    // std::cout << "sclg2e: " << args.sclg2e << " mblk:" << args.mblk
-    //           << " kv_nheads:" << args.kv_nheads << " Qs:" << args.Qs << " Bs:" << args.Bs
-    //           << " KVs:" << args.KVs << std::endl;
-
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Q));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const HipDeviceGuard device_guard(Q->device_id);
 
     std::string q_type;
     std::string kv_type;
@@ -401,26 +388,28 @@ torch::Tensor pa_ps_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     int mtp;
     int msk;
     int hp;
-    int ps = work_indptr.has_value() ? 1 : 0;
+    int ps = (work_indptr != nullptr) ? 1 : 0;
     // 1. "q_type"
-    if(Q.dtype() == at::ScalarType::Half)
+    auto q_dtype = Q->dtype();
+    auto kv_dtype = K->dtype();
+    if(q_dtype == AITER_DTYPE_fp16)
         q_type = "fp16";
-    else if(Q.dtype() == at::ScalarType::BFloat16)
+    else if(q_dtype == AITER_DTYPE_bf16)
         q_type = "bf16";
     else
-        TORCH_CHECK(false, __func__, ": unsupport Q dtype:", Q.scalar_type());
+        AITER_CHECK(false, __func__, ": unsupport Q dtype:", AiterDtype_to_str(q_dtype));
 
     // 2. "kv_type"
-    if(K.dtype() == at::ScalarType::Half)
+    if(kv_dtype == AITER_DTYPE_fp16)
         kv_type = "fp16";
-    else if(K.dtype() == at::ScalarType::BFloat16)
+    else if(kv_dtype == AITER_DTYPE_bf16)
         kv_type = "bf16";
-    else if(K.dtype() == at::ScalarType::Byte || K.dtype() == at::ScalarType::Char) //?
+    else if(kv_dtype == AITER_DTYPE_i8 || kv_dtype == AITER_DTYPE_u8)
         kv_type = "int8";
-    else if(K.dtype() == torch_fp8)
+    else if(kv_dtype == AITER_DTYPE_fp8)
         kv_type = "fp8";
     else
-        TORCH_CHECK(false, __func__, ": unsupport K dtype:", K.scalar_type());
+        AITER_CHECK(false, __func__, ": unsupport K dtype:", AiterDtype_to_str(kv_dtype));
 
     // 3. "gqa_ratio"
     // 4. "mtp" , 5. "mask"
@@ -430,39 +419,39 @@ torch::Tensor pa_ps_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     mtp = 0;
 
     // 6. "high_precision" , 7. "ultra_precision"
-    switch(high_precision.value())
+    switch(high_precision)
     {
     case 1: hp = 1; break;
     case 2: hp = 2; break;
     default: hp = 0; break;
     };
-    
+
     // gqa_ratio * max_qlen <= qTile
     int required_qTile = gqa_ratio * max_qlen;
     std::vector<int> available_qTiles = {16, 32, 40, 48, 64};
     int qTile = -1;
-    
+
     for (int tile : available_qTiles) {
         if (required_qTile <= tile) {
             qTile = tile;
             break;
         }
     }
-    
-    TORCH_CHECK(qTile != -1, 
-                __func__, 
-                ": required qTile (gqa_ratio * max_qlen = ", gqa_ratio, " * ", max_qlen, 
-                " = ", required_qTile, 
+
+    AITER_CHECK(qTile != -1,
+                __func__,
+                ": required qTile (gqa_ratio * max_qlen = ", gqa_ratio, " * ", max_qlen,
+                " = ", required_qTile,
                 ") exceeds maximum available qTile. Please reduce gqa_ratio or max_qlen.");
 
     CFG* config_map = &cfg_pa_asm; // only one config csv in hsa/<arch>/pa, now
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
     std::string arch_id = get_gpu_arch();
-    std::string kernelName = kernelName_.value_or(
-        get_heuristic_kernel(q_type, kv_type, gqa, mtp, msk, hp, block_size, arch_id, ps, qTile, config_map));
+    std::string kernelName = (kernelName_ != nullptr) ? std::string(kernelName_) :
+        get_heuristic_kernel(q_type, kv_type, gqa, mtp, msk, hp, block_size, arch_id, ps, qTile, quant_type, config_map);
     if(kernelName.empty())
     {
-        TORCH_CHECK(false, __func__, "not supported this kernel now! ");
+        AITER_CHECK(false, __func__, "not supported this kernel now! ");
     }
 
     AiterAsmKernel* impl_ptr = nullptr;
@@ -492,7 +481,7 @@ torch::Tensor pa_ps_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
         }
     }
     else
-        TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
+        AITER_CHECK(false, __func__, " not find kernel ", kernelName);
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,
@@ -503,5 +492,4 @@ torch::Tensor pa_ps_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
                              1,   // bdy
                              1,   // bdz
                              stream});
-    return output;
 }

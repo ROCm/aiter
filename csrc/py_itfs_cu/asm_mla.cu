@@ -2,12 +2,10 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
 #include "asm_mla_configs.hpp"
-#include "py_itfs_common.h"
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
-#include <torch/all.h>
+#include <memory>
+#include <unordered_map>
 
 struct __attribute__((packed)) KernelArgs
 {
@@ -61,7 +59,8 @@ std::string get_heuristic_kernel_mla(std::string q_type,
                                      int causal,
                                      int qseqlen,
                                      std::string arch_id,
-                                     CFG* cfgs)
+                                     CFG* cfgs,
+                                     int lse = 0)
 {
     for(const auto& el : *cfgs)
     {
@@ -75,10 +74,12 @@ std::string get_heuristic_kernel_mla(std::string q_type,
             continue;
         if (cfg.causal != causal || cfg.qSeqLen != qseqlen)
             continue;
+        if (cfg.lse != lse)
+            continue;
         return el.first;
     }
     
-    TORCH_CHECK(false,
+    AITER_CHECK(false,
                 __func__,
                 ": cannot get heuristic kernel!"
                 " q_type:", q_type,
@@ -87,57 +88,61 @@ std::string get_heuristic_kernel_mla(std::string q_type,
                 " ps:", ps,
                 " prefill:", prefill,
                 " causal:", causal,
-                " qseqlen:", qseqlen);
+                " qseqlen:", qseqlen,
+                " lse:", lse);
     return "";
 }
 
+extern "C" __attribute__((visibility("default")))
 void mla_decode_stage1_asm_fwd(
-    torch::Tensor& Q,                    //   [num_seqs, num_heads, head_size]
-    torch::Tensor& KV,                   //   [num_page, page_size, num_kv_heads, head_size] or [num_page, page_size*(nhead_kv*(kv_lora_rank+scale_dim+qk_rope_head_dim))]
-    torch::Tensor& qo_indptr,            //   [batch_size+1]
-    torch::Tensor& kv_indptr,            //   [batch_size+1]
-    torch::Tensor& kv_page_indices,      //   [num_page_used]
-    torch::Tensor& kv_last_page_lens,    //   [batch_size]
-    std::optional<torch::Tensor>& num_kv_splits_indptr,   //   metadata
-    std::optional<torch::Tensor>& work_meta_data,         //   metadata addr
-    std::optional<torch::Tensor>& work_indptr,            //   metadata
-    std::optional<torch::Tensor>& work_info_set,          //   [batch_size+1]
+    AiterTensor* Q,                    //   [num_seqs, num_heads, head_size]
+    AiterTensor* KV,                   //   [num_page, page_size, num_kv_heads, head_size] or [num_page, page_size*(nhead_kv*(kv_lora_rank+scale_dim+qk_rope_head_dim))]
+    AiterTensor* qo_indptr,            //   [batch_size+1]
+    AiterTensor* kv_indptr,            //   [batch_size+1]
+    AiterTensor* kv_page_indices,      //   [num_page_used]
+    AiterTensor* kv_last_page_lens,    //   [batch_size]
+    AiterTensor* num_kv_splits_indptr, //   metadata (nullable)
+    AiterTensor* work_meta_data,       //   metadata addr (nullable)
+    AiterTensor* work_indptr,          //   metadata (nullable)
+    AiterTensor* work_info_set,        //   [batch_size+1] (nullable)
     int max_seqlen_q,
     int page_size,
     int nhead_kv,
     float softmax_scale,
     // following are output
-    torch::Tensor& splitData, //[batch_size, num_kv_splits, num_heads, v_head_dim]
-    torch::Tensor& splitLse,  //[batch_size, num_kv_splits, num_heads,  1]
-    torch::Tensor& output,    //[batch_size, num_heads, v_head_dim]
-    std::optional<torch::Tensor>& lse,    //[batch_size, num_heads]
-    std::optional<torch::Tensor> q_scale  = std::nullopt, //   [1]
-    std::optional<torch::Tensor> kv_scale = std::nullopt  //   [1]
-)
+    AiterTensor* splitData,            //   [batch_size, num_kv_splits, num_heads, v_head_dim]
+    AiterTensor* splitLse,             //   [batch_size, num_kv_splits, num_heads,  1]
+    AiterTensor* output,               //   [batch_size, num_heads, v_head_dim]
+    AiterTensor* lse,                  //   [batch_size, num_heads] (nullable)
+    AiterTensor* q_scale,              //   [1] (nullable)
+    AiterTensor* kv_scale,             //   [1] (nullable)
+    hipStream_t stream)
 {    
-    int batch           = qo_indptr.size(0) - 1;
-    int num_heads       = Q.size(1);
-    int head_size       = Q.size(2);
+    int batch           = qo_indptr->size(0) - 1;
+    int num_heads       = Q->size(1);
+    int head_size       = Q->size(2);
     int num_kv_heads    = nhead_kv;
-    int kv_split        = splitData.size(1);
+    int kv_split        = splitData->size(1);
     const int gqa_ratio = num_heads / num_kv_heads;
 
-    bool persistent = !num_kv_splits_indptr.has_value();
+    bool persistent = (num_kv_splits_indptr == nullptr);
 
-    int stride_Q       = Q.stride(0) * Q.itemsize() * max_seqlen_q;
-    int stride_Page    = KV.stride(0) * KV.itemsize();
+    const HipDeviceGuard device_guard(Q->device_id);
+
+    int stride_Q       = Q->stride(0) * Q->element_size() * max_seqlen_q;
+    int stride_Page    = KV->stride(0) * KV->element_size();
     uint32_t log2_page = (uint32_t)log2f(page_size);
 
     KernelArgs args;
     size_t arg_size  = sizeof(args);
-    args.ptr_R       = splitData.data_ptr();
-    args.ptr_LSE     = splitLse.data_ptr();
-    args.ptr_Q       = Q.data_ptr();
-    args.ptr_KV      = KV.data_ptr();
-    args.ptr_LTP     = kv_indptr.data_ptr();
-    args.ptr_LTD     = kv_page_indices.data_ptr();
-    args.ptr_LTL     = kv_last_page_lens.data_ptr();
-    args.ptr_QTP     = qo_indptr.data_ptr();
+    args.ptr_R       = splitData->data_ptr();
+    args.ptr_LSE     = splitLse->data_ptr();
+    args.ptr_Q       = Q->data_ptr();
+    args.ptr_KV      = KV->data_ptr();
+    args.ptr_LTP     = kv_indptr->data_ptr();
+    args.ptr_LTD     = kv_page_indices->data_ptr();
+    args.ptr_LTL     = kv_last_page_lens->data_ptr();
+    args.ptr_QTP     = qo_indptr->data_ptr();
     args.scalar      = softmax_scale;
     args.s_MQA       = gqa_ratio * max_seqlen_q;
     args.s_kv_split  = kv_split;
@@ -148,18 +153,20 @@ void mla_decode_stage1_asm_fwd(
 
     if (persistent)
     {
-        if (work_meta_data.has_value())
+        if (work_meta_data != nullptr)
         {
-            args.ptr_STP = work_meta_data.value().data_ptr();
+            args.ptr_STP = work_meta_data->data_ptr();
         }
         else
         {
-            assert(work_indptr.has_value() && work_info_set.has_value());
-            assert(work_indptr.value().data_ptr() != nullptr && work_info_set.value().data_ptr() != nullptr);
+            AITER_CHECK(work_indptr != nullptr && work_info_set != nullptr,
+                        __func__, ": work_indptr and work_info_set must be provided");
+            AITER_CHECK(work_indptr->data_ptr() != nullptr && work_info_set->data_ptr() != nullptr,
+                        __func__, ": work_indptr and work_info_set data_ptr must not be null");
 
             uint64_t* persistent_meta_data = new uint64_t[10];
-            persistent_meta_data[0] = (uint64_t)work_indptr.value().data_ptr();
-            persistent_meta_data[1] = (uint64_t)work_info_set.value().data_ptr();
+            persistent_meta_data[0] = (uint64_t)work_indptr->data_ptr();
+            persistent_meta_data[1] = (uint64_t)work_info_set->data_ptr();
             uint32_t* dev_PS_META_DATA;
 
             unsigned long buf_size_META = 10 * sizeof(uint64_t);
@@ -171,13 +178,13 @@ void mla_decode_stage1_asm_fwd(
     }
     else
     {
-        args.ptr_STP = num_kv_splits_indptr.value().data_ptr();
+        args.ptr_STP = num_kv_splits_indptr->data_ptr();
     }
-    args.ptr_RP = output.data_ptr(); //final output
+    args.ptr_RP = output->data_ptr(); //final output
     args.ptr_LSEP = nullptr;
-    if (lse.has_value())
+    if (lse != nullptr)
     {
-        args.ptr_LSEP = lse.value().data_ptr(); //final lse
+        args.ptr_LSEP = lse->data_ptr(); //final lse
     }
 
     // std::cout << "mla args" << std::endl;
@@ -200,45 +207,49 @@ void mla_decode_stage1_asm_fwd(
     // std::cout << "out_16_nosplit: " << args.out_16_nosplit << std::endl;
     // std::cout << "ptr_LSEP: " << args.ptr_LSEP << std::endl;
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Q));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    AITER_CHECK(Q->is_contiguous(), __func__, ":only support Q.is_contiguous() for now");
+    AITER_CHECK(num_kv_heads == 1, __func__, ":only support num_kv_heads==1 for now");
 
-    TORCH_CHECK(Q.is_contiguous(), __func__, ":only support Q.is_contiguous() for now");
-    TORCH_CHECK(num_kv_heads == 1, __func__, ":only support num_kv_heads==1 for now");
-    if (KV.dtype() != at::ScalarType::Byte && KV.dtype() != at::ScalarType::Char) {
-        TORCH_CHECK(head_size == KV.size(3), __func__, ":only support head_size == KV.size(3) for now");
+    auto q_dtype = Q->dtype();
+    auto kv_dtype = KV->dtype();
+
+    if (kv_dtype != AITER_DTYPE_i8 && kv_dtype != AITER_DTYPE_u8) {
+        AITER_CHECK(head_size == KV->size(3), __func__, ":only support head_size == KV.size(3) for now");
     }
     
-    if(Q.dtype() == at::ScalarType::Float8_e4m3fnuz || Q.dtype() == at::ScalarType::Float8_e4m3fn)
+    if(q_dtype == AITER_DTYPE_fp8)
     {
-        assert(q_scale.has_value() && kv_scale.has_value());
-        assert(q_scale.value().data_ptr() != nullptr && kv_scale.value().data_ptr() != nullptr);
-        args.ptr_QSCALE  = q_scale.value().data_ptr();
-        args.ptr_KVSCALE = kv_scale.value().data_ptr();
+        AITER_CHECK(q_scale != nullptr && kv_scale != nullptr,
+                    __func__, ": fp8 Q requires q_scale and kv_scale");
+        AITER_CHECK(q_scale->data_ptr() != nullptr && kv_scale->data_ptr() != nullptr,
+                    __func__, ": q_scale and kv_scale data_ptr must not be null");
+        args.ptr_QSCALE  = q_scale->data_ptr();
+        args.ptr_KVSCALE = kv_scale->data_ptr();
     }
-    else if((KV.dtype() == at::ScalarType::Float8_e4m3fnuz || KV.dtype() == at::ScalarType::Float8_e4m3fn) && kv_scale.has_value())
+    else if(kv_dtype == AITER_DTYPE_fp8 && kv_scale != nullptr)
     {
-        assert(kv_scale.value().data_ptr() != nullptr);
-        args.ptr_KVSCALE = kv_scale.value().data_ptr();
+        AITER_CHECK(kv_scale->data_ptr() != nullptr,
+                    __func__, ": kv_scale data_ptr must not be null");
+        args.ptr_KVSCALE = kv_scale->data_ptr();
     }
 
     // Determine data types
     std::string q_type, kv_type;
-    if(Q.dtype() == at::ScalarType::BFloat16)
+    if(q_dtype == AITER_DTYPE_bf16)
         q_type = "bf16";
-    else if(Q.dtype() == at::ScalarType::Float8_e4m3fnuz || Q.dtype() == at::ScalarType::Float8_e4m3fn)
+    else if(q_dtype == AITER_DTYPE_fp8)
         q_type = "fp8";
     else
-        TORCH_CHECK(false, __func__, ": unsupport Q dtype:", Q.scalar_type());
+        AITER_CHECK(false, __func__, ": unsupport Q dtype:", AiterDtype_to_str(q_dtype));
 
-    if(KV.dtype() == at::ScalarType::BFloat16)
+    if(kv_dtype == AITER_DTYPE_bf16)
         kv_type = "bf16";
-    else if(KV.dtype() == at::ScalarType::Float8_e4m3fnuz || KV.dtype() == at::ScalarType::Float8_e4m3fn)
+    else if(kv_dtype == AITER_DTYPE_fp8)
         kv_type = "fp8";
-    else if(KV.dtype() == at::ScalarType::Byte || KV.dtype() == at::ScalarType::Char)
+    else if(kv_dtype == AITER_DTYPE_i8 || kv_dtype == AITER_DTYPE_u8)
         kv_type = "byte";
     else
-        TORCH_CHECK(false, __func__, ": unsupport KV dtype:", KV.scalar_type());
+        AITER_CHECK(false, __func__, ": unsupport KV dtype:", AiterDtype_to_str(kv_dtype));
 
     // Get kernel using config dispatch
     std::string arch_id = get_gpu_arch();
@@ -290,7 +301,7 @@ void mla_decode_stage1_asm_fwd(
                 sub_Q = 64;
                 config_max_seqlen_q = 4;
             }else if (max_seqlen_q > 4){
-                TORCH_CHECK(false, __func__, ":only support fp8 mla decoding for qo_len <= 4");
+                AITER_CHECK(false, __func__, ":only support fp8 mla decoding for qo_len <= 4");
             }
         }
     } else if (gqa_ratio == 32){
@@ -304,7 +315,7 @@ void mla_decode_stage1_asm_fwd(
                 config_max_seqlen_q = 4;
                 sub_Q = 128;
             } else {
-                TORCH_CHECK(false, __func__, 
+                AITER_CHECK(false, __func__, 
                     ": fp8/fp8 with gqa_ratio=32 only supports decode_qlen=4 in persistent mode");
             }
         }
@@ -317,9 +328,10 @@ void mla_decode_stage1_asm_fwd(
         }
     }
 
-    std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map);
+    int lse_flag = (lse != nullptr) ? 1 : 0;
+    std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map, lse_flag);
     
-    TORCH_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
+    AITER_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
     
     AiterAsmKernel* impl_ptr = nullptr;
     
@@ -338,9 +350,9 @@ void mla_decode_stage1_asm_fwd(
         
     }
     else
-        TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
+        AITER_CHECK(false, __func__, " not find kernel ", kernelName);
 
-    TORCH_CHECK(impl_ptr != nullptr, __func__,
+    AITER_CHECK(impl_ptr != nullptr, __func__,
         ": unsupport current data type or shape. please refer to asm_mla.cu");
 
     int bdx = 256;
@@ -350,11 +362,10 @@ void mla_decode_stage1_asm_fwd(
 
     if(persistent)
     {
-        gdx = work_indptr.value().size(0) - 1;
+        gdx = work_indptr->size(0) - 1;
         gdy = 1;
         gdz = 1;
     }
-    // printf("gdz: %d \n", gdz);
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,
@@ -410,91 +421,79 @@ struct __attribute__((packed)) PsKernelArgs
 };
 
 
+extern "C" __attribute__((visibility("default")))
 void mla_prefill_ps_asm_fwd(
-    torch::Tensor& Q,                    //  [num_seqs, num_q_heads, qk_hetad_size], fp8
-    torch::Tensor& K,                   //   [num_page, num_kv_heads, qk_head_size], fp8
-    torch::Tensor& V,                   //   [num_page, num_kv_heads, v_head_size], fp8
-    torch::Tensor& qo_indptr,            //   [batch_size+1], int
-    torch::Tensor& kv_indptr,            //   [batch_size+1], int
-    torch::Tensor& kv_page_indices,      //   [num_page_used], int
-    std::optional<torch::Tensor>& work_indptr,            //   [available_tgs+1], int
-    std::optional<torch::Tensor>& work_info_set,          //   [max_works], int
+    AiterTensor* Q,                    //  [num_seqs, num_q_heads, qk_hetad_size], fp8
+    AiterTensor* K,                    //   [num_page, num_kv_heads, qk_head_size], fp8
+    AiterTensor* V,                    //   [num_page, num_kv_heads, v_head_size], fp8
+    AiterTensor* qo_indptr,            //   [batch_size+1], int
+    AiterTensor* kv_indptr,            //   [batch_size+1], int
+    AiterTensor* kv_page_indices,      //   [num_page_used], int
+    AiterTensor* work_indptr,          //   [available_tgs+1], int (nullable)
+    AiterTensor* work_info_set,        //   [max_works], int (nullable)
     int max_seqlen_q,
-    float softmax_scale, // following are output
-    bool is_causal,
-    torch::Tensor& splitData, //[num_q_heads, num_seqs, max_kv_split, v_head_dim], fp32
-    torch::Tensor& splitLse,  //[num_q_heads, num_seqs, max_kv_split,  1], fp32
-    torch::Tensor& output,    //[num_seqs, num_q_heads, v_head_dim], bf16
-    std::optional<torch::Tensor> q_scale  = std::nullopt,// fp32, scalar
-    std::optional<torch::Tensor> k_scale = std::nullopt, // fp32, scalar
-    std::optional<torch::Tensor> v_scale = std::nullopt  // fp32, scalar
-){
-    // TORCH_CHECK(Q.dtype() == at::ScalarType::Float8_e4m3fnuz || Q.dtype() == at::ScalarType::Float8_e4m3fn,
-    //             __func__, ": only support fp8 Q for now");
-    // TORCH_CHECK(K.dtype() == at::ScalarType::Float8_e4m3fnuz || K.dtype() == at::ScalarType::Float8_e4m3fn,
-    //             __func__, ": only support fp8 K for now");
-    // TORCH_CHECK(V.dtype() == at::ScalarType::Float8_e4m3fnuz || V.dtype() == at::ScalarType::Float8_e4m3fn,
-    //             __func__, ": only support fp8 V for now");
-    // TORCH_CHECK(q_scale.has_value() && k_scale.has_value() && v_scale.has_value(),
-    //             __func__, ": fp8 requires scale tensors");
-    // TORCH_CHECK(work_indptr.has_value() && work_info_set.has_value(),
-    //             __func__, ": persistent scheduling requires work_indptr and work_info_set");
-    
-    int num_q_tokens  = Q.size(0);
-    int num_head_q    = Q.size(1);
-    int num_page      = K.size(0);
-    int num_kv_heads = K.size(1);
-    int num_used_page = kv_page_indices.size(0);
+    float softmax_scale,
+    int is_causal,
+    AiterTensor* splitData,            //   [num_q_heads, num_seqs, max_kv_split, v_head_dim], fp32
+    AiterTensor* splitLse,             //   [num_q_heads, num_seqs, max_kv_split,  1], fp32
+    AiterTensor* output,               //   [num_seqs, num_q_heads, v_head_dim], bf16
+    AiterTensor* q_scale,              //   fp32, scalar (nullable)
+    AiterTensor* k_scale,              //   fp32, scalar (nullable)
+    AiterTensor* v_scale,              //   fp32, scalar (nullable)
+    hipStream_t stream)
+{
+    int num_q_tokens  = Q->size(0);
+    int num_head_q    = Q->size(1);
+    int num_page      = K->size(0);
+    int num_kv_heads  = K->size(1);
+    int num_used_page = kv_page_indices->size(0);
     int available_tgs = 1;
     const int gqa_ratio = num_head_q / num_kv_heads;
 
-    // Setup kernel arguments
+    const HipDeviceGuard device_guard(Q->device_id);
+
     PsKernelArgs args;
     size_t arg_size = sizeof(args);
     
     float k_scalar = softmax_scale;
     
-    // Setup all pointers
-    args.ptr_Q             = Q.data_ptr();
-    args.ptr_K             = K.data_ptr();
-    args.ptr_V             = V.data_ptr();
-    args.ptr_O             = output.data_ptr();
-    args.ptr_PartialO      = splitData.data_ptr();
-    args.ptr_PartialLSE    = splitLse.data_ptr();
-    args.ptr_WorkIndptr    = work_indptr.has_value() ? work_indptr.value().data_ptr() : nullptr;
-    args.ptr_WorkInfo      = work_info_set.has_value() ? work_info_set.value().data_ptr() : nullptr;
-    args.ptr_QOIndptr      = qo_indptr.data_ptr();
-    args.ptr_KVIndptr      = kv_indptr.data_ptr();
-    args.ptr_KVPageIndices = kv_page_indices.data_ptr();
-    args.ptr_QScale        = q_scale.has_value() ? q_scale.value().data_ptr() : nullptr;
-    args.ptr_KScale        = k_scale.has_value() ? k_scale.value().data_ptr() : nullptr;
-    args.ptr_VScale        = v_scale.has_value() ? v_scale.value().data_ptr() : nullptr;
+    args.ptr_Q             = Q->data_ptr();
+    args.ptr_K             = K->data_ptr();
+    args.ptr_V             = V->data_ptr();
+    args.ptr_O             = output->data_ptr();
+    args.ptr_PartialO      = splitData->data_ptr();
+    args.ptr_PartialLSE    = splitLse->data_ptr();
+    args.ptr_WorkIndptr    = work_indptr != nullptr ? work_indptr->data_ptr() : nullptr;
+    args.ptr_WorkInfo      = work_info_set != nullptr ? work_info_set->data_ptr() : nullptr;
+    args.ptr_QOIndptr      = qo_indptr->data_ptr();
+    args.ptr_KVIndptr      = kv_indptr->data_ptr();
+    args.ptr_KVPageIndices = kv_page_indices->data_ptr();
+    args.ptr_QScale        = q_scale != nullptr ? q_scale->data_ptr() : nullptr;
+    args.ptr_KScale        = k_scale != nullptr ? k_scale->data_ptr() : nullptr;
+    args.ptr_VScale        = v_scale != nullptr ? v_scale->data_ptr() : nullptr;
     args.scalar            = k_scalar;
     args.num_q_tokens      = num_q_tokens;
     args.num_head_q        = num_head_q;
     args.num_page          = num_page;
     args.num_used_page     = num_used_page;
     
-    // Get CUDA/HIP stream and device guard
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Q));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-    
-    // Determine data types
+    auto q_dtype = Q->dtype();
+    auto k_dtype = K->dtype();
+
     std::string q_type, k_type;
-    if(Q.dtype() == at::ScalarType::Float8_e4m3fnuz || Q.dtype() == at::ScalarType::Float8_e4m3fn)
+    if(q_dtype == AITER_DTYPE_fp8)
         q_type = "fp8";
     else
-        TORCH_CHECK(false, __func__, ": unsupport Q dtype:", Q.scalar_type());
+        AITER_CHECK(false, __func__, ": unsupport Q dtype:", AiterDtype_to_str(q_dtype));
 
-    if(K.dtype() == at::ScalarType::Float8_e4m3fnuz || K.dtype() == at::ScalarType::Float8_e4m3fn)
+    if(k_dtype == AITER_DTYPE_fp8)
         k_type = "fp8";
     else
-        TORCH_CHECK(false, __func__, ": unsupport K dtype:", K.scalar_type());
+        AITER_CHECK(false, __func__, ": unsupport K dtype:", AiterDtype_to_str(k_dtype));
 
-    // Get kernel using config dispatch
     std::string arch_id = get_gpu_arch();
     if(arch_id == "gfx942"){
-        TORCH_CHECK(false, __func__, ": fp8 mla persistent prefill is not supported on gfx942");
+        AITER_CHECK(false, __func__, ": fp8 mla persistent prefill is not supported on gfx942");
     }
     CFG* config_map = &cfg_mla_asm;
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
@@ -506,7 +505,7 @@ void mla_prefill_ps_asm_fwd(
     
     std::string kernelName = get_heuristic_kernel_mla(q_type, k_type, gqa_ratio, ps, prefill, causal_flag, qseqlen, arch_id, config_map);
     
-    TORCH_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
+    AITER_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
     
     AiterAsmKernel* impl_ptr = nullptr;
     int wave_per_tg = 8;
@@ -525,14 +524,10 @@ void mla_prefill_ps_asm_fwd(
         impl_ptr = result.first->second.get();
     }
     else
-        TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
+        AITER_CHECK(false, __func__, " not find kernel ", kernelName);
     
-    // Launch kernel
-    int block_size_x = wave_per_tg * 64;  // 8 * 64 = 512
-    // int grid_size_x  = get_num_cu_func();
-    // std::cout << "grid_size_x" << grid_size_x << std::endl;
-    int grid_size_x = work_indptr.value().size(0) - 1;
-    // std::cout << "grid_size_x" << grid_size_x << std::endl;
+    int block_size_x = wave_per_tg * 64;
+    int grid_size_x = work_indptr->size(0) - 1;
     
     impl_ptr->launch_kernel({&args,
                              &arg_size,
@@ -546,44 +541,45 @@ void mla_prefill_ps_asm_fwd(
 }
 
 
+extern "C" __attribute__((visibility("default")))
 void mla_prefill_asm_fwd(
-    torch::Tensor& Q,                 //   [num_seqs, num_heads, head_size]
-    torch::Tensor& KV,                //   [num_page, page_size, num_kv_heads, head_size]
-    torch::Tensor& qo_indptr,         //   [batch_size+1]
-    torch::Tensor& kv_indptr,         //   [batch_size+1]
-    torch::Tensor& kv_page_indices,   //   [num_page_used]
-    torch::Tensor& kv_last_page_lens, //   [batch_size]
+    AiterTensor* Q,                    //   [num_seqs, num_heads, head_size]
+    AiterTensor* KV,                   //   [num_page, page_size, num_kv_heads, head_size]
+    AiterTensor* qo_indptr,            //   [batch_size+1]
+    AiterTensor* kv_indptr,            //   [batch_size+1]
+    AiterTensor* kv_page_indices,      //   [num_page_used]
+    AiterTensor* kv_last_page_lens,    //   [batch_size]
     int max_seqlen_q,
     float softmax_scale,
-    // following are output
-    torch::Tensor& splitData, //[batch_size, num_kv_splits, num_heads, v_head_dim]
-    torch::Tensor& splitLse   //[batch_size, num_kv_splits, num_heads,  1]
-
-)
+    AiterTensor* splitData,            //   [batch_size, num_kv_splits, num_heads, v_head_dim]
+    AiterTensor* splitLse,             //   [batch_size, num_kv_splits, num_heads,  1]
+    hipStream_t stream)
 {
     int sub_Q           = 128;
-    int batch           = kv_indptr.size(0) - 1;
-    int num_heads       = Q.size(1);
-    int head_size       = Q.size(2);
-    int page_size       = KV.size(1);
-    int num_kv_heads    = KV.size(2);
-    int kv_split        = splitData.size(1);
+    int batch           = kv_indptr->size(0) - 1;
+    int num_heads       = Q->size(1);
+    int head_size       = Q->size(2);
+    int page_size       = KV->size(1);
+    int num_kv_heads    = KV->size(2);
+    int kv_split        = splitData->size(1);
     const int gqa_ratio = num_heads / num_kv_heads;
 
-    int stride_Q       = Q.stride(0) * Q.itemsize();
-    int stride_Page    = KV.stride(0) * KV.itemsize();
+    const HipDeviceGuard device_guard(Q->device_id);
+
+    int stride_Q       = Q->stride(0) * Q->element_size();
+    int stride_Page    = KV->stride(0) * KV->element_size();
     uint32_t log2_page = (uint32_t)log2f(page_size);
 
     KernelArgs args;
     size_t arg_size  = sizeof(args);
-    args.ptr_R       = splitData.data_ptr();
-    args.ptr_LSE     = splitLse.data_ptr();
-    args.ptr_Q       = Q.data_ptr();
-    args.ptr_KV      = KV.data_ptr();
-    args.ptr_LTP     = kv_indptr.data_ptr();
-    args.ptr_LTD     = kv_page_indices.data_ptr();
-    args.ptr_LTL     = kv_last_page_lens.data_ptr();
-    args.ptr_QTP     = qo_indptr.data_ptr();
+    args.ptr_R       = splitData->data_ptr();
+    args.ptr_LSE     = splitLse->data_ptr();
+    args.ptr_Q       = Q->data_ptr();
+    args.ptr_KV      = KV->data_ptr();
+    args.ptr_LTP     = kv_indptr->data_ptr();
+    args.ptr_LTD     = kv_page_indices->data_ptr();
+    args.ptr_LTL     = kv_last_page_lens->data_ptr();
+    args.ptr_QTP     = qo_indptr->data_ptr();
     args.scalar      = softmax_scale;
     args.s_MQA       = gqa_ratio;
     args.s_kv_split  = kv_split;
@@ -591,29 +587,27 @@ void mla_prefill_asm_fwd(
     args.s_Bs        = stride_Page;
     args.s_log2_plen = log2_page;
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Q));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-
-    TORCH_CHECK(Q.is_contiguous(), __func__, ":only support Q.is_contiguous() for now");
-    TORCH_CHECK(gqa_ratio == 16 || gqa_ratio == 128,
+    AITER_CHECK(Q->is_contiguous(), __func__, ":only support Q.is_contiguous() for now");
+    AITER_CHECK(gqa_ratio == 16 || gqa_ratio == 128,
                 __func__,
                 ":only support num_q_heads/num_kv_heads==16 or 128 for now");
-    TORCH_CHECK(num_kv_heads == 1, __func__, ":only support num_kv_heads==1 for now");
-    TORCH_CHECK(head_size == KV.size(3), __func__, ":only support head_size == KV.size(3) for now");
+    AITER_CHECK(num_kv_heads == 1, __func__, ":only support num_kv_heads==1 for now");
+    AITER_CHECK(head_size == KV->size(3), __func__, ":only support head_size == KV.size(3) for now");
     
-    // Determine data types
+    auto q_dtype = Q->dtype();
+    auto kv_dtype = KV->dtype();
+
     std::string q_type, kv_type;
-    if(Q.dtype() == at::ScalarType::BFloat16)
+    if(q_dtype == AITER_DTYPE_bf16)
         q_type = "bf16";
     else 
-        TORCH_CHECK(false, __func__, ": unsupport Q dtype:", Q.scalar_type());
+        AITER_CHECK(false, __func__, ": unsupport Q dtype:", AiterDtype_to_str(q_dtype));
 
-    if(KV.dtype() == at::ScalarType::BFloat16)
+    if(kv_dtype == AITER_DTYPE_bf16)
         kv_type = "bf16";
     else
-        TORCH_CHECK(false, __func__, ": unsupport KV dtype:", KV.scalar_type());
+        AITER_CHECK(false, __func__, ": unsupport KV dtype:", AiterDtype_to_str(kv_dtype));
 
-    // Get kernel using config dispatch
     std::string arch_id = get_gpu_arch();
     CFG* config_map = &cfg_mla_asm;
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
@@ -624,7 +618,7 @@ void mla_prefill_asm_fwd(
     int qseqlen = 0;
     std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, gqa_ratio, ps, prefill, causal_flag, qseqlen, arch_id, config_map);
     
-    TORCH_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
+    AITER_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
     
     AiterAsmKernel* impl_ptr = nullptr;
     
@@ -642,9 +636,9 @@ void mla_prefill_asm_fwd(
         impl_ptr = result.first->second.get();
     }
     else
-        TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
+        AITER_CHECK(false, __func__, " not find kernel ", kernelName);
 
-    TORCH_CHECK(impl_ptr != nullptr, __func__, ": unsupport current Q_type:", Q.scalar_type());
+    AITER_CHECK(impl_ptr != nullptr, __func__, ": unsupport current Q_type:", AiterDtype_to_str(q_dtype));
     impl_ptr->launch_kernel({&args,
                              &arg_size,
                              (max_seqlen_q * gqa_ratio + sub_Q - 1) / sub_Q, // gdx

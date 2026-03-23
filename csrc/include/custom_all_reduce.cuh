@@ -42,9 +42,15 @@ struct Signal
 };
 
 #ifdef USE_ROCM
-struct __align__(16) RankData { const void* ptrs[8]; };
+struct __align__(16) RankData
+{
+    const void* ptrs[8];
+};
 #else
-struct __align__(16) RankData { const void* __restrict__ ptrs[8]; };
+struct __align__(16) RankData
+{
+    const void* __restrict__ ptrs[8];
+};
 #endif
 
 struct __align__(16) RankSignals
@@ -60,27 +66,19 @@ struct __align__(16) RankSignals
 // scalar cast functions
 template <typename inp_dtype>
 DINLINE opus::fp32_t upcast_s(inp_dtype val)
-{
-    return opus::cast<opus::fp32_t>(val);
-}
+{ return opus::cast<opus::fp32_t>(val); }
 
 template <>
 DINLINE opus::fp32_t upcast_s<opus::fp32_t>(opus::fp32_t val)
-{
-    return val;
-}
+{ return val; }
 
 template <typename out_dtype>
 DINLINE out_dtype downcast_s(opus::fp32_t val)
-{
-    return opus::cast<out_dtype>(val);
-}
+{ return opus::cast<out_dtype>(val); }
 
 template <>
 DINLINE opus::fp32_t downcast_s<opus::fp32_t>(opus::fp32_t val)
-{
-    return val;
-}
+{ return val; }
 
 // scalar add functions
 // for some reason when compiling with Pytorch, the + operator for half and
@@ -367,27 +365,25 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_naive(RankD
 #define THREAD_NUM 512
 
 template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
-__global__ void __launch_bounds__(512, 1)
-cross_device_reduce_1stage(
-    RankData* _input_dp,
-    RankData* _output_dp,
-    RankSignals sg,
+__global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _input_dp,
+                                                                     RankData* _output_dp,
+                                                                     RankSignals sg,
 #ifndef USE_ROCM
-    volatile
+                                                                     volatile
 #endif
-    Signal* self_sg,
-    T* __restrict__ result,
-    int rank,
-    int size)
+                                                                     Signal* self_sg,
+                                                                     T* __restrict__ result,
+                                                                     int rank,
+                                                                     int size)
 {
     constexpr int pack_size = 16 / sizeof(T);
-    using P = typename opus::vector_t<T, pack_size>;
-    using A = typename opus::vector_t<opus::fp32_t, pack_size>;
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
 
     constexpr int tnum_gpu = THREAD_NUM / ngpus;
     // note: we don't reorder the address so the accumulation order is the same
     // for all ranks, ensuring bitwise identical results
-    auto dp = *_input_dp;
+    auto dp     = *_input_dp;
     int warp_id = threadIdx.x / tnum_gpu;
     int lane_id = threadIdx.x % tnum_gpu;
 
@@ -401,25 +397,26 @@ cross_device_reduce_1stage(
 
     // --- compute uniform iteration count (to keep barriers well-formed) ---
     const int first = blockIdx.x * tnum_gpu;
-    int iters = 0;
+    int iters       = 0;
     {
         int rem = size - first;
-        iters = rem > 0 ? (rem + step - 1) / step : 0;
+        iters   = rem > 0 ? (rem + step - 1) / step : 0;
     }
 
     // -------------------------------
     // fill buffer 0
     // -------------------------------
-    int buf   = 0;
-    int idx0  = start;
+    int buf  = 0;
+    int idx0 = start;
 
-    if (idx0 < size) {
-        P val = ((const P**)&dp.ptrs[0])[warp_id][idx0];
+    if(idx0 < size)
+    {
+        P val                                       = ((const P**)&dp.ptrs[0])[warp_id][idx0];
         tmp_smem[buf][warp_id * tnum_gpu + lane_id] = val;
     }
     __syncthreads();
 
-    for (int it = 0; it < iters; ++it)
+    for(int it = 0; it < iters; ++it)
     {
         const int cur_idx  = idx0 + it * step;
         const int next_idx = cur_idx + step;
@@ -428,30 +425,30 @@ cross_device_reduce_1stage(
         // =======================================================
         // 1. Warp 0 REDUCES current buffer
         // =======================================================
-        if (warp_id == 0 && cur_idx < size)
+        if(warp_id == 0 && cur_idx < size)
         {
             // GPU 0 contribution
             P v0 = tmp_smem[buf][0 * tnum_gpu + lane_id];
 
             A acc;
 #pragma unroll
-            for (int j = 0; j < pack_size; ++j)
+            for(int j = 0; j < pack_size; ++j)
                 acc[j] = ck_tile::type_convert<float>(v0[j]);
 
             // GPUs 1..(ngpus-1)
 #pragma unroll
-            for (int g = 1; g < ngpus; ++g)
+            for(int g = 1; g < ngpus; ++g)
             {
                 P vg = tmp_smem[buf][g * tnum_gpu + lane_id];
 #pragma unroll
-                for (int j = 0; j < pack_size; ++j)
+                for(int j = 0; j < pack_size; ++j)
                     acc[j] += ck_tile::type_convert<float>(vg[j]);
             }
 
             // store result
             P out;
 #pragma unroll
-            for (int j = 0; j < pack_size; ++j)
+            for(int j = 0; j < pack_size; ++j)
                 out[j] = ck_tile::type_convert<T>(acc[j]);
 
             ((P*)result)[cur_idx] = out;
@@ -461,7 +458,7 @@ cross_device_reduce_1stage(
         // 2. ALL warps prefetch NEXT buffer
         //    (including warp 0; safe to issue after reduction)
         // =======================================================
-        if (next_idx < size)
+        if(next_idx < size)
         {
             P nxt = ((const P**)&dp.ptrs[0])[warp_id][next_idx];
             tmp_smem[next_buf][warp_id * tnum_gpu + lane_id] = nxt;
@@ -907,15 +904,41 @@ struct AbsMaxFunctor
     }
 };
 
+// cross-lane butterfly shuffle (XOR) via ds_bpermute
+template<typename T>
+DINLINE T shfl_xor(T var, int mask, int width = opus::get_warp_size())
+{
+    static_assert(sizeof(T) == 4); 
+    int self = opus::lane_id();
+    int index = (self & ~(width - 1)) + ((self ^ mask) & (width - 1));
+    return __builtin_bit_cast(T, __builtin_amdgcn_ds_bpermute(index << 2, __builtin_bit_cast(int, var)));
+}
+
+// shfl_xor support 4bytes dtype only
 template <template <typename> class functor, typename T, int reduce_range, int stop_stride = 0>
 DINLINE T warpReduce(T val)
 {
-    auto op = functor<T>();
-#pragma unroll
-    for(int stride = reduce_range / 2; stride > stop_stride; stride >>= 1)
+    if constexpr (sizeof(T) == 4)
     {
-        T tmp = __shfl_xor(val, stride, reduce_range);
-        val   = op(val, tmp);
+        auto op = functor<T>();
+#pragma unroll
+        for(int stride = reduce_range / 2; stride > stop_stride; stride >>= 1)
+        {
+            T tmp = shfl_xor(val, stride, reduce_range);
+            val   = op(val, tmp);
+        }
+    }
+    else
+    {
+        auto op = functor<float>();
+        float val_fp32 = upcast_s(val);
+#pragma unroll
+        for(int stride = reduce_range / 2; stride > stop_stride; stride >>= 1)
+        {
+            float tmp = shfl_xor(val_fp32, stride, reduce_range);
+            val_fp32  = op(val_fp32, tmp);
+        }
+        val = downcast_s<T>(val_fp32);
     }
     return val;
 }
@@ -1040,7 +1063,9 @@ __global__ __forceinline__ void __launch_bounds__(512, 1) allReduceQuantFp8(
                 {
                     scale_factor = *(reinterpret_cast<T*>(&tmps[i][part]) + idx / factor_stride);
                 }
-                scale_factor = __shfl(scale_factor, (threadIdx.x / factor_stride) * factor_stride);
+                float scale_factor_fp32 = upcast_s(scale_factor);
+                scale_factor_fp32 = opus::shfl(scale_factor_fp32, (threadIdx.x / factor_stride) * factor_stride);
+                scale_factor = downcast_s<T>(scale_factor_fp32);
                 inp_pack half8_reg = packDequant<T, pack_size>(tmps[i][idx], scale_factor);
                 int dst_idx        = gather_from_rank * part + idx;
                 ((inp_pack*)result)[dst_idx] = half8_reg;
@@ -1897,7 +1922,7 @@ class CustomAllreduce
 #ifdef USE_ROCM
                                       HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
 #else
-                                       CU_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+                                      CU_POINTER_ATTRIBUTE_RANGE_START_ADDR,
 #endif
                                       (hipDeviceptr_t)ptr) != CUDA_SUCCESS)
                 throw std::runtime_error("failed to get pointer attr for output");
@@ -2554,9 +2579,7 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
             sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n); \
     } while(0)
 
-    // Support GPT-OSS (e.g. 120B) hidden_size=2880: n_bytes=5760 not multiple of 1024.
-    // Require 16-byte alignment (pack_size alignment for vectorized load).
-    if(n_bytes % 16 == 0)
+    if(n_bytes % 1024 == 0)
     {
         if(8192 <= n_bytes && n_bytes <= 32768)
         {
@@ -2608,9 +2631,7 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
             }
             else
             {
-                // n_loop = 2: covers 4096 < n_bytes < 8192, e.g. GPT-OSS hidden_size=2880
-                // (n_bytes=5760). Kernel uses bound (n_iter*tnum+threadIdx.x) < (n/pack_size)
-                // so partial second iteration is correct; no precision change.
+                // n_loop = 2
                 launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 256, 2>));
             }
         }
@@ -2707,7 +2728,6 @@ void dispatchFusedAllReduceRMSNormQuant(hipStream_t stream,
         {                                                                                    \
             DISPATCH_AR_FUSION_KERNEL_(NGPUS, 4096, allreduce_fusion_kernel_split_launcher)  \
             DISPATCH_AR_FUSION_KERNEL_(NGPUS, 2048, allreduce_fusion_kernel_split_launcher)  \
-            DISPATCH_AR_FUSION_KERNEL_(NGPUS, 2880, allreduce_fusion_kernel_split_launcher)  \
             DISPATCH_AR_FUSION_KERNEL_(NGPUS, 1024, allreduce_fusion_kernel_split_launcher)  \
             DISPATCH_AR_FUSION_KERNEL_(NGPUS, 512, allreduce_fusion_kernel_split_launcher)   \
         default: printf("fused allreduce rmsnorm quant N-dim error\n");                      \
