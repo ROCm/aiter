@@ -15,6 +15,7 @@ from aiter import dtypes
 from aiter import per_tensor_quant
 from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.triton.attention.unified_attention import unified_attention
 
 from typing import Tuple, Optional
 
@@ -125,7 +126,7 @@ def torch_mla_extend(
         kvc_cache = kvc_cache.to(torch.float)
 
     qs = torch.tensor_split(q, qo_indptr.tolist()[1:])
-    kvc = torch.index_select(kvc_cache, 0, kv_indices)
+    kvc = torch.index_select(kvc_cache, 0, kv_indices) # 
     kvs = torch.tensor_split(kvc, kv_indptr.tolist()[1:])
     bs = qo_indptr.shape[0] - 1
 
@@ -264,20 +265,108 @@ def test_mla_prefill(
 
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     actual_blocks = (seq_lens_kv + block_size - 1) // block_size
-    kv_indptr[1 : batch_size + 1] = torch.cumsum(actual_blocks, dim=0)
+    kv_indptr[1 : batch_size + 1] = torch.cumsum(actual_blocks, dim=0) # aka cumulative seqlen in blocks
     num_blocks = kv_indptr[-1].item()
-    kv_indices = torch.randint(0, num_blocks, (num_blocks,), dtype=torch.int)
+    kv_indices = torch.randint(0, num_blocks, (num_blocks,), dtype=torch.int) # i.e. kv_table
 
     num_tokens = qo_indptr[-1].item()
     Q_bf16 = torch.randn((num_tokens, num_head_q, qk_head_dim), dtype=torch.bfloat16)
     # block_size = 1
-    K_bf16 = torch.randn((num_blocks, num_head_kv, qk_head_dim), dtype=torch.bfloat16)
-    V_bf16 = K_bf16[:, :, :v_head_dim].contiguous()
+    K_bf16 = torch.randn((num_blocks, block_size, num_head_kv, qk_head_dim), dtype=torch.bfloat16)
+    V_bf16 = K_bf16[:, :, :, :v_head_dim].contiguous()
+
+    if not skip_reference:
+        # TODO: optimize reference implementation(too slow for large context length)
+        kv_buffer = K_bf16.view(-1, num_head_kv, qk_head_dim) 
+        out_ref, lse_ref = torch_mla_extend(
+            Q_bf16,
+            kv_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            softmax_scale,
+            kv_lora_rank=v_head_dim,
+            qk_rope_head_dim=qk_head_dim - v_head_dim,
+            dtype=out_dtype,
+            is_causal=is_causal,
+        )
+
+   
+
+    use_triton = False
+    if use_triton:
+        triton_out = torch.empty((num_tokens, num_head_q, v_head_dim), dtype=torch.bfloat16)
+        use_fp8 = True
+        if use_fp8:
+            q_quant, q_scale = per_tensor_quant(Q_bf16, quant_dtype=dtype)
+            k_quant, k_scale = per_tensor_quant(K_bf16.view(-1, num_head_kv, qk_head_dim), quant_dtype=kv_dtype)
+            v_quant, v_scale = per_tensor_quant(V_bf16.view(-1, num_head_kv, v_head_dim), quant_dtype=kv_dtype)
+            k_quant = k_quant.view((num_blocks, block_size, num_head_kv, qk_head_dim))
+            v_quant = v_quant.view((num_blocks, block_size, num_head_kv, v_head_dim))    
+
+            unified_attention(
+                q=q_quant,
+                k=k_quant,
+                v=v_quant,
+                out=triton_out,
+                cu_seqlens_q=qo_indptr,
+                max_seqlen_q=max_qlen,
+                seqused_k=seq_lens_kv,
+                max_seqlen_k=seq_lens_kv.max().item(),
+                softmax_scale=softmax_scale,
+                causal=is_causal,
+                window_size=(-1, -1),
+                block_table=kv_indices,
+                softcap=0.0,
+                q_descale=q_scale,
+                k_descale=k_scale,
+                v_descale=v_scale,
+            )
+        else: # bf16     
+            unified_attention(
+                q=Q_bf16,
+                k=K_bf16,
+                v=V_bf16,
+                out=triton_out,
+                cu_seqlens_q=qo_indptr,
+                max_seqlen_q=max_qlen,
+                seqused_k=seq_lens_kv,
+                max_seqlen_k=seq_lens_kv.max().item(),
+                softmax_scale=softmax_scale,
+                causal=is_causal,
+                window_size=(-1, -1),
+                block_table=kv_indices,
+                softcap=0.0,
+                q_descale=None,
+                k_descale=None,
+                v_descale=None,
+            )
+        err = checkAllclose(
+            out_ref,
+            triton_out,
+            rtol=5e-2,
+            atol=5e-2,
+            msg="mla_prefill_ps    [torch vs aiter_asm]: us......",
+        )
+        if err == 0:
+            status = "passed"
+        elif 0 < err <= 0.05:
+            status = "warning"
+        else:
+            status = "failed"
+        ret["err bf16"] = err
+        ret["acc result"] = status
+        return ret    
+
+
+    # Continue with rest
+    K_bf16 = K_bf16.view(-1, num_head_kv, qk_head_dim)
+    V_bf16 = V_bf16.view(-1, num_head_kv, v_head_dim)
 
     q_quant, q_scale = per_tensor_quant(Q_bf16, quant_dtype=dtype)
     k_quant, k_scale = per_tensor_quant(K_bf16, quant_dtype=kv_dtype)
     v_quant, v_scale = per_tensor_quant(V_bf16, quant_dtype=kv_dtype)
-
+    
     tile_q = 256
     tile_kv = 128
     qhead_granularity = gqa_ratio
@@ -530,22 +619,8 @@ def test_mla_prefill(
 
         ret["us_mla_prefill_ps"] = us_aiter_asm
 
+    
     if not skip_reference:
-        # TODO: optimize reference implementation(too slow for large context length)
-        kv_buffer = K_bf16.view(-1, num_head_kv, qk_head_dim)
-        out_ref, lse_ref = torch_mla_extend(
-            Q_bf16,
-            kv_buffer,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            softmax_scale,
-            kv_lora_rank=v_head_dim,
-            qk_rope_head_dim=qk_head_dim - v_head_dim,
-            dtype=out_dtype,
-            is_causal=is_causal,
-        )
-
         err = checkAllclose(
             out_ref,
             output,
