@@ -746,7 +746,7 @@ class AttentionConfig:
         self.ARCH_NAME = gl.constexpr(ARCH_NAME)
         self.WARP_SIZE = gl.constexpr(32 if ARCH_NAME == "gfx1250" else 64)
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
-        FP8_DOT: gl.constexpr = Q_FP8 and KV_FP8
+        FP8_DOT = gl.constexpr(Q_FP8 and KV_FP8)
         self.K_WIDTH = gl.constexpr(8)
         # Operator layouts (gfx1250 WMMA)
         if ARCH_NAME == "gfx1250":
@@ -810,7 +810,7 @@ class AttentionConfig:
         HEAD_SIZE_DIV = HEAD_SIZE // 8
         self.blocked_q = gl.constexpr(
             gl.BlockedLayout(
-                size_per_thread=[1, MAX_LOAD],
+                size_per_thread=[1, SIZE_PER_THREAD],
                 threads_per_warp=[self.WARP_SIZE // 8, 8],
                 warps_per_cta=[NUM_WARPS, 1],
                 order=[1, 0],
