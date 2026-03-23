@@ -34,15 +34,19 @@ def select_2d_config(
 
     max_num_stages_2d = 2 if head_size > 128 else 4
 
+    # base prefill, for short cases
     if not all_decode:
         num_stages_2d, num_warps = 1, 2
-    elif arch.is_rdna:
-        num_stages_2d, num_warps = 1, 4
-        TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+    # pure decode config
     else:
-        num_stages_2d, num_warps = 3, 2
+        # to not have masking when loading KV
         TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+        if arch.is_rdna:
+            num_stages_2d, num_warps = 1, 4
+        else:
+            num_stages_2d, num_warps = 3, 2
 
+    # large prefill config
     if max_seqlen_q >= 256:
         BLOCK_M = 64 if arch.is_rdna else 128
         num_stages_2d, num_warps = 1, 4
