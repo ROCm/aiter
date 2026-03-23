@@ -39,7 +39,7 @@ OCCUPANCY: int = 1
 SIZE_MLA_WORK_INFO_IN_DW: int = 8
 
 
-@flyc.kernel
+@flyc.kernel(known_block_size=[NUM_THREADS, 1, 1])
 def kn_mla_fwd_decode_h128_fp8_fp8(
     # --- inputs ---
     query: fx.Tensor,  # [num_seqs * num_heads, qk_head_dim]  (fp8)
@@ -60,6 +60,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
     This is a persistent-thread kernel: each workgroup picks up work items
     from ``work_indptr`` / ``work_info_set`` and processes them sequentially.
     """
+    pass
 
     kv_page_indices_rsrc = buffer_ops.create_buffer_resource(kv_page_indices)
     work_indptr_rsrc = buffer_ops.create_buffer_resource(work_indptr)
@@ -71,8 +72,28 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
     )
     work_start_idx = vector.extract(work_range, [0])
     work_end_idx = vector.extract(work_range, [1])
-    if work_start_idx >= work_end_idx:
-        return
+
+    for work_idx in range(work_start_idx, work_end_idx):
+        # Load MlaWorkInfo dw1..5 (partial_qo_loc, qo_start, qo_end, kv_start, kv_end)
+        wi_base = work_idx * SIZE_MLA_WORK_INFO_IN_DW
+        wi_dw1_4 = buffer_ops.buffer_load(
+            work_info_set_rsrc, wi_base + 1, vec_width=4, dtype=T.i32
+        )
+        wi_dw5 = buffer_ops.buffer_load(
+            work_info_set_rsrc, wi_base + 5, vec_width=1, dtype=T.i32
+        )
+        partial_qo_loc = vector.extract(wi_dw1_4, [0])
+        qo_start = vector.extract(wi_dw1_4, [1])
+        qo_end = vector.extract(wi_dw1_4, [2])
+        kv_start = vector.extract(wi_dw1_4, [3])
+        kv_end = wi_dw5
+
+        # tid = gpu.thread_idx.x
+        # if arith.cmpi(CmpIPredicate.eq, tid, arith.constant(5, type=T.i32)):
+        #     fx.printf(
+        #         "work_idx={} partial_qo_loc={} qo_start={} qo_end={} kv_start={} kv_end={}",
+        #         work_idx, partial_qo_loc, qo_start, qo_end, kv_start, kv_end,
+        #     )
 
 
 @flyc.jit
@@ -104,6 +125,6 @@ def launch_mla_fwd_decode_h128_fp8_fp8(
     ).launch(
         grid=(num_cus, 1, 1),
         block=(NUM_THREADS, 1, 1),
-        smem=lds_size,
+        # smem=lds_size,
         stream=stream,
     )

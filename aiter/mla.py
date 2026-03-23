@@ -411,9 +411,10 @@ def mla_decode_fwd(
             and q.dtype == dtypes.fp8
             and kv_buffer.dtype == dtypes.fp8
             and page_size == 1
+            # and os.getenv("AITER_FLYDSL_MLA_DECODE", False)
         )
 
-        if True:
+        if use_flydsl:
             from aiter.ops.flydsl import flydsl_mla_fwd_decode
 
             flydsl_mla_fwd_decode(
