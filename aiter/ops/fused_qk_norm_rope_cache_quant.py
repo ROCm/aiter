@@ -29,6 +29,17 @@ def fused_qk_norm_rope_cache_quant_shuffle(
 
 
 @compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle")
+def fused_qk_rmsnorm(
+    q: Tensor,
+    q_weight: Tensor,
+    q_eps: float,
+    k: Tensor,
+    k_weight: Tensor,
+    k_eps: float,
+) -> tuple[Tensor, Tensor]: ...
+
+
+@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle")
 def fused_qk_norm_rope_cache_block_quant_shuffle(
     qkv: Tensor,
     num_heads_q: int,

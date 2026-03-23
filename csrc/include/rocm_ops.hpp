@@ -1421,6 +1421,14 @@ namespace py = pybind11;
 #define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                     \
     m.def("fused_qk_norm_rope_cache_quant_shuffle",              \
           &aiter::fused_qk_norm_rope_cache_quant_shuffle);       \
+    m.def("fused_qk_rmsnorm",                                    \
+            &aiter::fused_qk_rmsnorm,                            \
+            py::arg("q"),                                        \
+            py::arg("q_weight"),                                 \
+            py::arg("q_eps"),                                    \
+            py::arg("k"),                                        \
+            py::arg("k_weight"),                                 \
+            py::arg("k_eps"));                                   \
     m.def("fused_qk_norm_rope_cache_pts_quant_shuffle",          \
           &aiter::fused_qk_norm_rope_cache_pts_quant_shuffle,    \
           py::arg("qkv"),                                        \
