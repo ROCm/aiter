@@ -167,19 +167,15 @@ void moe_stage1_g1u1(
     std::optional<torch::Tensor> w1_scale, // [expert, 1, inter_dim], gate(up) scale
     std::optional<torch::Tensor> sorted_weights);
 
-void topk_softmax_asm(torch::Tensor& topk_weights,         // [num_tokens, topk]
-                      torch::Tensor& topk_indices,         // [num_tokens, topk]
-                      torch::Tensor& token_expert_indices, // [num_tokens, topk]
-                      torch::Tensor& gating_output,        // [num_tokens, num_experts]
-                      bool need_renorm);
-
 namespace aiter {
 
 void topk_softmax(torch::Tensor& topk_weights,
                   torch::Tensor& topk_indices,
                   torch::Tensor& token_expert_indices,
                   torch::Tensor& gating_output,
-                  bool need_renorm);
+                  bool need_renorm,
+                  int num_shared_experts                        = 0,
+                  const std::string& shared_expert_scoring_func = "");
 
 void moe_align_block_size(torch::Tensor topk_ids,
                           int64_t num_experts,

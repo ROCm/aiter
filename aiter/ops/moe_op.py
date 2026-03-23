@@ -19,10 +19,12 @@ def topk_softmax(
     token_expert_indices: Tensor,
     gating_output: Tensor,
     need_renorm: bool,
+    num_shared_experts: int = 0,
+    shared_expert_scoring_func: str = "",
 ) -> None: ...
 
 
-@compile_ops("module_moe_asm")
+@compile_ops("module_moe_asm", fc_name="topk_softmax_asm", ffi_type="ctypes")
 def topk_softmax_asm(
     topk_weights: Tensor,
     topk_indices: Tensor,
@@ -354,6 +356,7 @@ def moe_cktile2stages_gemm1_ck(
     activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
     split_k: Optional[int] = 1,
+    kernel_name: str = "",
 ) -> Tensor: ...
 
 
@@ -374,6 +377,7 @@ def moe_cktile2stages_gemm1(
     activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
     split_k: Optional[int] = 1,
+    kernel_name: str = "",
 ):
     return moe_cktile2stages_gemm1_ck(
         XQ,
@@ -392,6 +396,7 @@ def moe_cktile2stages_gemm1(
         activation,
         block_m,
         split_k,
+        kernel_name,
     )
 
 
@@ -413,6 +418,7 @@ def moe_cktile2stages_gemm2_ck(
     activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
     split_k: Optional[int] = 1,
+    kernel_name: str = "",
 ) -> Tensor: ...
 
 
@@ -433,6 +439,7 @@ def moe_cktile2stages_gemm2(
     activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
     split_k: Optional[int] = 1,
+    kernel_name: str = "",
 ):
     return moe_cktile2stages_gemm2_ck(
         XQ,
@@ -451,6 +458,7 @@ def moe_cktile2stages_gemm2(
         activation,
         block_m,
         split_k,
+        kernel_name,
     )
 
 

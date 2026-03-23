@@ -747,6 +747,10 @@ def build_module(
             if hasattr(torch, "float4_e2m1fn_x2"):
                 flags_hip += ["-DTORCH_Float4_e2m1fn_x2"]
 
+        enable_ck = int(os.environ.get("ENABLE_CK", "1"))
+        if not any("ENABLE_CK" in f for f in flags_extra_cc):
+            flags_cc.append(f"-DENABLE_CK={enable_ck}")
+
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
