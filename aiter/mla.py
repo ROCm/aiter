@@ -959,3 +959,26 @@ def mla_prefill_reduce(
             )  # [tile_q, v_head_dim]
 
             output[qo_start:qo_end, head_idx, :] = final_output[:q_len, :]
+
+
+def mla_decode_gluon_fwd(
+    q_nope,
+    q_pe,
+    kv_c,
+    k_pe,
+    o,
+    page_table,
+    seq_info,
+    sm_scale,
+    kv_pe_offset=0,
+    use_2d_view=True,
+):
+    """Gluon MLA decode forward kernel."""
+    from aiter.ops.triton.gluon.mla_decode_gluon import mla_decode_gluon
+
+    return mla_decode_gluon(
+        q_nope, q_pe, kv_c, k_pe, o,
+        page_table, seq_info, sm_scale,
+        kv_pe_offset=kv_pe_offset,
+        use_2d_view=use_2d_view,
+    )
