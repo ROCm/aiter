@@ -250,6 +250,56 @@ class CudaCommunicator(DeviceCommunicatorBase):
         assert scale_out is not None
         return out, res_out, scale_out
 
+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        if dim < 0:
+            dim += input_.dim()
+        input_size = input_.size()
+        world_size = self.world_size
+
+        is_last_dim = dim == input_.dim() - 1
+        ca_comm = self.ca_comm
+        if (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and ca_comm.should_custom_ag(input_)
+            and (
+                dim == 0
+                or (is_last_dim and input_size[-1] * input_.element_size() % 16 == 0)
+            )
+        ):
+            out = ca_comm.custom_all_gather(input_, dim)
+            assert out is not None
+            return out
+
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            output_size = (input_size[0] * world_size,) + input_size[1:]
+            output_tensor = torch.empty(
+                output_size, dtype=input_.dtype, device=input_.device
+            )
+            pynccl_comm.all_gather(output_tensor, input_)
+            output_tensor = output_tensor.reshape((world_size,) + input_size)
+            output_tensor = output_tensor.movedim(0, dim)
+            output_tensor = output_tensor.reshape(
+                input_size[:dim]
+                + (world_size * input_size[dim],)
+                + input_size[dim + 1 :]
+            )
+            return output_tensor
+
+        # fall back to the default all-gather using PyTorch
+        output_tensor = torch.empty(
+            (world_size,) + input_size, dtype=input_.dtype, device=input_.device
+        )
+        torch.distributed.all_gather_into_tensor(
+            output_tensor, input_, group=self.device_group
+        )
+        output_tensor = output_tensor.movedim(0, dim)
+        output_tensor = output_tensor.reshape(
+            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
+        )
+        return output_tensor
+
     def reduce_scatter(
         self, input_: torch.Tensor, output_: torch.Tensor, dim: int = -1
     ):

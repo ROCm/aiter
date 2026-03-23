@@ -26,9 +26,23 @@ modules (`arith`, `vector`, `gpu`) and the `range_constexpr` iterator.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Callable
 
-from _mlir import ir
+from flydsl._mlir import ir
+from flydsl.expr.typing import T
+
+
+@contextmanager
+def _if_then(if_op, scf):
+    """Compat helper for SCF IfOp then-region across old/new Python APIs."""
+    with ir.InsertionPoint(if_op.then_block):
+        try:
+            yield if_op.then_block
+        finally:
+            blk = if_op.then_block
+            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
+                scf.YieldOp([])
 
 
 def default_epilog(
@@ -169,11 +183,15 @@ def c_shuffle_epilog(
     c_evec = arith.constant(EVec, index=True)
 
     if frag_elem_type is None:
-        frag_elem_type = ir.F16Type.get()
-    vec_frag = ir.VectorType.get([EVec], frag_elem_type)
+        frag_elem_type = T.f16
+    vec_frag = T.vec(EVec, frag_elem_type)
     bx_m_v = bx_m
     by_n_v = by_n
 
+    # Batch-precompute all row contexts (sorted_idx loads) before the store loop.
+    # This issues all buffer_load instructions upfront so the compiler can pipeline
+    # them instead of serializing each load with s_waitcnt vmcnt(0).
+    _precomputed_rows = []
     for mr in range_constexpr(m_reps_shuffle):
         row_base_m = arith.constant(mr * CShuffleMLane, index=True)
         row_local = row_base_m + m_lane
@@ -197,6 +215,12 @@ def c_shuffle_epilog(
         ):
             row_ctx, row_pred = row_ctx_raw
 
+        _precomputed_rows.append((row_local, row, row_ctx, row_pred))
+
+    # Now perform LDS reads and stores using the pre-fetched row contexts.
+    for mr in range_constexpr(m_reps_shuffle):
+        row_local, row, row_ctx, row_pred = _precomputed_rows[mr]
+
         def _do_store_row():
             row_base_lds = row_local * tile_n_idx
             for nr in range_constexpr(n_reps_shuffle):
@@ -217,7 +241,7 @@ def c_shuffle_epilog(
 
         if row_pred is not None:
             _if_row = scf.IfOp(row_pred)
-            with _if_row.then():
+            with _if_then(_if_row, scf):
                 _do_store_row()
         else:
             _do_store_row()

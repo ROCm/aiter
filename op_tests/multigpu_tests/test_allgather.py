@@ -231,9 +231,15 @@ def allgather_perftest(
 l_dtype = ["bf16"]
 l_shape = [
     # (4096, 2048)
-    # (1345,),
-    # (16, 512),
-    (128, 7168)
+    (1345,),
+    # # (16, 512),
+    (128, 7168),
+    # (32, 7168),
+    # exceeds max_size/world_size but satisfies all other custom ag
+    # conditions (contiguous, 16-byte aligned) — should fallback to RCCL
+    # threshold: 64 MB (2 GPU) / 32 MB (4 GPU) / 16 MB (8 GPU)
+    # this shape = 4097*8192*2 bytes ≈ 64.015 MB, exceeds even the 2-GPU threshold
+    (4097, 8192),
 ]
 
 parser = argparse.ArgumentParser(description="config input of test")
@@ -267,31 +273,22 @@ if __name__ == "__main__":
         l_dtype = [dtypes.d_dtypes[args.dtype]]
     if args.shape is not None:
         l_shape = [args.shape]
+    l_dim = [0, -1]
     for dtype in l_dtype:
         for shape in l_shape:
-            # allgather_acctest(8, 1, shape, dtype, use_custom=False)
-            # allgather_acctest(8, 1, shape, dtype, use_custom=True)
-            allgather_perftest(
-                8,
-                1,
-                shape,
-                dtype,
-                withGraph=False,
-                use_custom=False,
-                dim=-1,
-                distributed_init_method=get_distributed_init_method(
-                    get_ip(), get_open_port()
-                ),
-            )
-            allgather_perftest(
-                8,
-                1,
-                shape,
-                dtype,
-                withGraph=False,
-                use_custom=True,
-                dim=-1,
-                distributed_init_method=get_distributed_init_method(
-                    get_ip(), get_open_port()
-                ),
-            )
+            for dim in l_dim:
+                # allgather_acctest(8, 1, shape, dtype, use_custom=False)
+                # allgather_acctest(8, 1, shape, dtype, use_custom=True)
+                for use_custom in [False, True]:
+                    allgather_perftest(
+                        8,
+                        1,
+                        shape,
+                        dtype,
+                        withGraph=False,
+                        use_custom=use_custom,
+                        dim=dim,
+                        distributed_init_method=get_distributed_init_method(
+                            get_ip(), get_open_port()
+                        ),
+                    )
