@@ -432,19 +432,6 @@ namespace py = pybind11;
           "wvSplitKQ(Tensor in_a, Tensor in_b, Tensor! out_c, Tensor scale_a, Tensor scale_b, " \
           "int CuCount) -> ()");
 
-#define GEMM_A8W8_ASM_PYBIND                                            \
-    m.def("gemm_a8w8_asm",                                              \
-          &gemm_a8w8_asm,                                               \
-          "Asm gemm a8w8 ,  weight should be shuffle to layout(32,16)", \
-          py::arg("XQ"),                                                \
-          py::arg("WQ"),                                                \
-          py::arg("x_scale"),                                           \
-          py::arg("w_scale"),                                           \
-          py::arg("Out"),                                               \
-          py::arg("kernelName"),                                        \
-          py::arg("bias"),                                              \
-          py::arg("bpreshuffle") = true,                                \
-          py::arg("splitK")      = std::nullopt);
 
 #define GEMM_A16W16_ASM_PYBIND                   \
     m.def("gemm_a16w16_asm",                     \
@@ -459,21 +446,6 @@ namespace py = pybind11;
           py::arg("kernelName")  = std::nullopt, \
           py::arg("bpreshuffle") = false);
 
-#define GEMM_A4W4_ASM_PYBIND                      \
-    m.def("gemm_a4w4_asm",                        \
-          &gemm_a4w4_asm,                         \
-          "Asm gemm a4w4",                        \
-          py::arg("A"),                           \
-          py::arg("B"),                           \
-          py::arg("A_scale"),                     \
-          py::arg("B_scale"),                     \
-          py::arg("out"),                         \
-          py::arg("kernelName"),                  \
-          py::arg("bias")         = std::nullopt, \
-          py::arg("alpha")        = 1.0,          \
-          py::arg("beta")         = 0.0,          \
-          py::arg("bpreshuffle")  = true,         \
-          py::arg("log2_k_split") = std::nullopt);
 
 #define FLATMM_A8W8_BLOCKSCALE_ASM_PYBIND \
     m.def("flatmm_a8w8_blockscale_asm",   \
@@ -485,19 +457,6 @@ namespace py = pybind11;
           py::arg("w_scale"),             \
           py::arg("Out"));
 
-#define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_ASM_PYBIND                  \
-    m.def("gemm_a8w8_blockscale_bpreshuffle_asm",                    \
-          &gemm_a8w8_blockscale_bpreshuffle_asm,                     \
-          "FP8 blockscale BpreShuffle GEMM assembly implementation", \
-          py::arg("A"),                                              \
-          py::arg("B"),                                              \
-          py::arg("out"),                                            \
-          py::arg("A_scale"),                                        \
-          py::arg("B_scale"),                                        \
-          py::arg("bias")        = py::none(),                       \
-          py::arg("splitK")      = py::none(),                       \
-          py::arg("kernelName")  = py::none(),                       \
-          py::arg("bpreshuffle") = true);
 
 #define GEMM_A4W4_BLOCKSCALE_PYBIND \
     m.def("gemm_a4w4_blockscale",   \
@@ -995,46 +954,48 @@ namespace py = pybind11;
           py::arg("dst_type")          = std::nullopt, \
           py::arg("is_shuffled")       = true);
 
-#define MOE_CKTILE_2STAGES_PYBIND                   \
-    m.def("cktile_moe_gemm1",                       \
-          &cktile_moe_gemm1,                        \
-          "cktile_moe_gemm1",                       \
-          py::arg("XQ"),                            \
-          py::arg("WQ"),                            \
-          py::arg("Y"),                             \
-          py::arg("sorted_ids"),                    \
-          py::arg("sorted_expert_ids"),             \
-          py::arg("max_token_ids"),                 \
-          py::arg("topk"),                          \
-          py::arg("n_padded_zeros") = 0,            \
-          py::arg("k_padded_zeros") = 0,            \
-          py::arg("topk_weight")    = std::nullopt, \
-          py::arg("x_scale")        = std::nullopt, \
-          py::arg("w_scale")        = std::nullopt, \
-          py::arg("exp_bias")       = std::nullopt, \
-          py::arg("activation")     = 0,            \
-          py::arg("block_m")        = 32,           \
-          py::arg("split_k")        = 1);                  \
-                                                    \
-    m.def("cktile_moe_gemm2",                       \
-          &cktile_moe_gemm2,                        \
-          "cktile_moe_gemm2",                       \
-          py::arg("XQ"),                            \
-          py::arg("WQ"),                            \
-          py::arg("Y"),                             \
-          py::arg("sorted_ids"),                    \
-          py::arg("sorted_expert_ids"),             \
-          py::arg("max_token_ids"),                 \
-          py::arg("topk"),                          \
-          py::arg("n_padded_zeros") = 0,            \
-          py::arg("k_padded_zeros") = 0,            \
-          py::arg("topk_weight")    = std::nullopt, \
-          py::arg("x_scale")        = std::nullopt, \
-          py::arg("w_scale")        = std::nullopt, \
-          py::arg("exp_bias")       = std::nullopt, \
-          py::arg("activation")     = 0,            \
-          py::arg("block_m")        = 32,           \
-          py::arg("split_k")        = 1);
+#define MOE_CKTILE_2STAGES_PYBIND                    \
+    m.def("cktile_moe_gemm1",                        \
+          &cktile_moe_gemm1,                         \
+          "cktile_moe_gemm1",                        \
+          py::arg("XQ"),                             \
+          py::arg("WQ"),                             \
+          py::arg("Y"),                              \
+          py::arg("sorted_ids"),                     \
+          py::arg("sorted_expert_ids"),              \
+          py::arg("max_token_ids"),                  \
+          py::arg("topk"),                           \
+          py::arg("n_padded_zeros") = 0,             \
+          py::arg("k_padded_zeros") = 0,             \
+          py::arg("topk_weight")    = std::nullopt,  \
+          py::arg("x_scale")        = std::nullopt,  \
+          py::arg("w_scale")        = std::nullopt,  \
+          py::arg("exp_bias")       = std::nullopt,  \
+          py::arg("activation")     = 0,             \
+          py::arg("block_m")        = 32,            \
+          py::arg("split_k")        = 1,             \
+          py::arg("kernel_name")    = std::string("")); \
+                                                     \
+    m.def("cktile_moe_gemm2",                        \
+          &cktile_moe_gemm2,                         \
+          "cktile_moe_gemm2",                        \
+          py::arg("XQ"),                             \
+          py::arg("WQ"),                             \
+          py::arg("Y"),                              \
+          py::arg("sorted_ids"),                     \
+          py::arg("sorted_expert_ids"),              \
+          py::arg("max_token_ids"),                  \
+          py::arg("topk"),                           \
+          py::arg("n_padded_zeros") = 0,             \
+          py::arg("k_padded_zeros") = 0,             \
+          py::arg("topk_weight")    = std::nullopt,  \
+          py::arg("x_scale")        = std::nullopt,  \
+          py::arg("w_scale")        = std::nullopt,  \
+          py::arg("exp_bias")       = std::nullopt,  \
+          py::arg("activation")     = 0,             \
+          py::arg("block_m")        = 32,            \
+          py::arg("split_k")        = 1,             \
+          py::arg("kernel_name")    = std::string(""));
 
 #define MHA_VARLEN_FWD_PYBIND                            \
     m.def("mha_varlen_fwd",                              \
@@ -1110,14 +1071,8 @@ namespace py = pybind11;
           py::arg("token_expert_indices"),                                     \
           py::arg("gating_output"),                                            \
           py::arg("need_renorm"),                                              \
-          "Apply topk softmax to the gating outputs.");                        \
-    m.def("topk_softmax_asm",                                                  \
-          &topk_softmax_asm,                                                   \
-          py::arg("topk_weights"),                                             \
-          py::arg("topk_indices"),                                             \
-          py::arg("token_expert_indices"),                                     \
-          py::arg("gating_output"),                                            \
-          py::arg("need_renorm"),                                              \
+          py::arg("num_shared_experts")         = 0,                           \
+          py::arg("shared_expert_scoring_func") = "",                          \
           "Apply topk softmax to the gating outputs.");                        \
     m.def("grouped_topk",                                                      \
           &grouped_topk,                                                       \
@@ -1209,7 +1164,7 @@ namespace py = pybind11;
           py::arg("fc2_smooth_scale") = std::nullopt,                          \
           py::arg("activation")       = ActivationType::Silu);                       \
     m.def("fmoe_int8_g1u0_a16",                                                \
-          &fmoe_int8_g1u0_a16,                                                \
+          &fmoe_int8_g1u0_a16,                                                 \
           py::arg("out"),                                                      \
           py::arg("input"),                                                    \
           py::arg("gate"),                                                     \
@@ -1223,7 +1178,7 @@ namespace py = pybind11;
           py::arg("fc2_scale"),                                                \
           py::arg("fc1_smooth_scale"),                                         \
           py::arg("fc2_smooth_scale"),                                         \
-          py::arg("activation") = ActivationType::Silu);                      \
+          py::arg("activation") = ActivationType::Silu);                       \
     m.def("fmoe_g1u1_a16",                                                     \
           &fmoe_g1u1_a16,                                                      \
           py::arg("out"),                                                      \
@@ -1564,15 +1519,67 @@ namespace py = pybind11;
     m.def("rope_cached_positions_offsets_fwd_impl", &rope_cached_positions_offsets_fwd_impl); \
     m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl);
 
-#define FUSED_QKNORM_MROPE_CACHE_QUANT_PYBIND               \
-    m.def("fused_qk_norm_mrope_3d_cache_pts_quant_shuffle", \
-          &fused_qk_norm_mrope_3d_cache_pts_quant_shuffle);
+#define FUSED_QKNORM_MROPE_CACHE_QUANT_PYBIND                                      \
+    m.def("fused_qk_norm_mrope_3d_cache_pts_quant_shuffle",                        \
+          &fused_qk_norm_mrope_3d_cache_pts_quant_shuffle,                         \
+          py::arg("qkv"),                                                          \
+          py::arg("qw"),                                                           \
+          py::arg("kw"),                                                           \
+          py::arg("cos_sin"),                                                      \
+          py::arg("positions"),                                                    \
+          py::arg("num_tokens"),                                                   \
+          py::arg("num_heads_q"),                                                  \
+          py::arg("num_heads_k"),                                                  \
+          py::arg("num_heads_v"),                                                  \
+          py::arg("head_size"),                                                    \
+          py::arg("is_neox_style"),                                                \
+          py::arg("mrope_section_"),                                               \
+          py::arg("is_interleaved"),                                               \
+          py::arg("eps"),                                                          \
+          py::arg("q_out"),                                                        \
+          py::arg("k_cache"),                                                      \
+          py::arg("v_cache"),                                                      \
+          py::arg("slot_mapping"),                                                 \
+          py::arg("per_tensor_k_scale"),                                           \
+          py::arg("per_tensor_v_scale"),                                           \
+          py::arg("k_out"),                                                        \
+          py::arg("v_out"),                                                        \
+          py::arg("return_kv"),                                                    \
+          py::arg("use_shuffle_layout"),                                           \
+          py::arg("block_size"),                                                   \
+          py::arg("x"),                                                            \
+          py::arg("rotary_dim") = 0);
 
-#define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                    \
-    m.def("fused_qk_norm_rope_cache_quant_shuffle",             \
-          &aiter::fused_qk_norm_rope_cache_quant_shuffle);      \
-    m.def("fused_qk_norm_rope_cache_pts_quant_shuffle",         \
-          &aiter::fused_qk_norm_rope_cache_pts_quant_shuffle);  \
+#define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                     \
+    m.def("fused_qk_norm_rope_cache_quant_shuffle",              \
+          &aiter::fused_qk_norm_rope_cache_quant_shuffle);       \
+    m.def("fused_qk_norm_rope_cache_pts_quant_shuffle",          \
+          &aiter::fused_qk_norm_rope_cache_pts_quant_shuffle,    \
+          py::arg("qkv"),                                        \
+          py::arg("qw"),                                         \
+          py::arg("kw"),                                         \
+          py::arg("cos_sin"),                                    \
+          py::arg("positions"),                                  \
+          py::arg("num_tokens"),                                 \
+          py::arg("num_heads_q"),                                \
+          py::arg("num_heads_k"),                                \
+          py::arg("num_heads_v"),                                \
+          py::arg("head_size"),                                  \
+          py::arg("is_neox_style"),                              \
+          py::arg("eps"),                                        \
+          py::arg("q_out"),                                      \
+          py::arg("k_cache"),                                    \
+          py::arg("v_cache"),                                    \
+          py::arg("slot_mapping"),                               \
+          py::arg("per_tensor_k_scale"),                         \
+          py::arg("per_tensor_v_scale"),                         \
+          py::arg("k_out"),                                      \
+          py::arg("v_out"),                                      \
+          py::arg("return_kv"),                                  \
+          py::arg("use_shuffle_layout"),                         \
+          py::arg("block_size"),                                 \
+          py::arg("x"),                                          \
+          py::arg("rotary_dim") = 0);                            \
     m.def("fused_qk_norm_rope_cache_block_quant_shuffle",       \
           &aiter::fused_qk_norm_rope_cache_block_quant_shuffle, \
           py::arg("qkv"),                                       \

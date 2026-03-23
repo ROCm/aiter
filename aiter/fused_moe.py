@@ -1761,6 +1761,7 @@ def cktile_moe_stage1(
     activation=ActivationType.Silu,
     split_k=1,
     dtype=torch.bfloat16,
+    kernel_name="",
 ):
     token_num = hidden_states.shape[0]
     _, n1, k1 = w1.shape
@@ -1798,6 +1799,7 @@ def cktile_moe_stage1(
         activation,
         block_m,
         split_k,
+        kernel_name,
     )
 
     if split_k > 1:
@@ -1826,9 +1828,8 @@ def cktile_moe_stage2(
     n_pad_zeros=0,
     k_pad_zeros=0,
     bias2=None,
+    kernel_name="",
 ):
-    token_num = a2.shape[0]
-    D = w2.shape[1]
     # max_num_tokens_padded = sorted_expert_ids.shape[0]*block_size
 
     # out = torch.empty(
@@ -1855,6 +1856,7 @@ def cktile_moe_stage2(
         bias2,
         activation,
         block_m,
+        kernel_name=kernel_name,
     )
     return out
 
@@ -1876,14 +1878,19 @@ def fused_topk(
         M, topk, dtype=dtypes.i32, device=hidden_states.device
     )
 
-    if (expert, topk) in [
-        (128, 4),
-        (128, 6),
-        (128, 8),
-        (256, 6),
-        (256, 8),
-        (384, 8),
-    ] and gating_output.dtype in [dtypes.bf16, dtypes.fp32]:
+    if (
+        (expert, topk)
+        in [
+            (128, 4),
+            (128, 6),
+            (128, 8),
+            (256, 6),
+            (256, 8),
+            (384, 8),
+        ]
+        and gating_output.dtype in [dtypes.bf16, dtypes.fp32]
+        and gating_output.is_contiguous()
+    ):
         if topk_weights is None:
             topk_weights = torch.empty(
                 (M + 3) // 4 * 4, topk, dtype=dtypes.fp32, device=hidden_states.device

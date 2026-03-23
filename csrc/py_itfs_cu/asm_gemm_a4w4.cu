@@ -2,12 +2,9 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
 #include "asm_f4gemm_configs.hpp"
-#include "py_itfs_common.h"
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <cmath>
+#include <memory>
 #include <hip/hip_runtime.h>
-#include <torch/all.h>
 
 struct __attribute__((packed)) KernelArgs
 {
@@ -61,34 +58,31 @@ struct __attribute__((packed)) KernelArgs
     // p3 _p23;
 };
 
-static CFG* get_cfg(torch::Tensor& inp, torch::Tensor& out)
+static CFG* get_cfg(AiterDtype inp_dtype, AiterDtype out_dtype)
 {
-
-#if defined(__Float4_e2m1fn_x2)
-    if(inp.dtype() == torch_fp4x2 && out.scalar_type() == at::ScalarType::BFloat16)
-#else
-    if((inp.dtype() == torch::kUInt8) && out.scalar_type() == at::ScalarType::BFloat16)
-#endif
+    if((inp_dtype == AITER_DTYPE_fp4x2 || inp_dtype == AITER_DTYPE_u8) &&
+       out_dtype == AITER_DTYPE_bf16)
     {
         return &cfg_f4gemm_bf16_per1x32Fp4;
     }
     else
     {
-        TORCH_CHECK(false,
+        AITER_CHECK(false,
                     __func__,
                     " Unsupported input_type:",
-                    inp.scalar_type(),
+                    AiterDtype_to_str(inp_dtype),
                     ", out_type:",
-                    out.scalar_type());
+                    AiterDtype_to_str(out_dtype));
+        return nullptr;
     }
-};
+}
 
 std::tuple<std::string, int> get_heuristic_kernel(int M,
                                                   int N,
                                                   int K,
                                                   std::string arch_id,
-                                                  std::optional<int> log2_k_split,
-                                                  std::optional<bool> bpreshuffle,
+                                                  int log2_k_split,
+                                                  int bpreshuffle,
                                                   CFG* cfgs)
 {
     hipDevice_t dev;
@@ -100,8 +94,8 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
     uint32_t tg_num        = 0;
     uint32_t round         = 0xffffffff;
     float compute2mem_effi = 1.0;
-    int log2_k_split_en    = (log2_k_split.has_value() && log2_k_split.value() != 0) ? 1 : 0;
-    int bpreshuffle_en     = (bpreshuffle.has_value() && !bpreshuffle) ? 0 : 1;
+    int log2_k_split_en    = (log2_k_split >= 0 && log2_k_split != 0) ? 1 : 0;
+    int bpreshuffle_en     = (bpreshuffle == 0) ? 0 : 1;
     std::string selectedKernelName = "";
     int selectedsplitK             = 1;
 
@@ -117,8 +111,8 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
             if(cfg.tile_M != 128 || cfg.tile_N != 512 || (N % cfg.tile_N) == 0)
             {
                 std::vector<int> splitK_list =
-                    (log2_k_split.has_value() && cfg.splitK)
-                        ? std::vector<int>{1 << log2_k_split.value()}
+                    (log2_k_split >= 0 && cfg.splitK)
+                        ? std::vector<int>{1 << log2_k_split}
                         : (cfg.splitK ? std::vector<int>{2, 4, 8, 16} : std::vector<int>{1});
 
                 for(auto& splitK : splitK_list)
@@ -149,7 +143,7 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
         }
     }
 
-    TORCH_CHECK(selectedKernelName != "", __func__, ": cannot get heuristic kernel!");
+    AITER_CHECK(selectedKernelName != "", __func__, ": cannot get heuristic kernel!");
     int log2_result = 0;
     while(selectedsplitK >>= 1)
         ++log2_result;
@@ -158,82 +152,77 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
 
 // A4W4 asm gemm kernel
 // D=A*B*alpha+beta*C
-torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
-                            torch::Tensor& B,       // B:[N, K/2] f4x2
-                            torch::Tensor& A_scale, // A_scale:[M, K/32] e8m0 paded
-                            torch::Tensor& B_scale, // B_scale:[N, K/32] e8m0 paded
-                            torch::Tensor& out,     // Out:[M, N] bf16
-                            std::string& kernelName,
-                            std::optional<torch::Tensor>& bias, // bias:[M, N] f32
-                            std::optional<float> alpha      = 1.0,
-                            std::optional<float> beta       = 0.0,
-                            std::optional<bool> bpreshuffle = true,
-                            std::optional<int> log2_k_split = std::nullopt)
-
+extern "C" __attribute__((visibility("default"))) void gemm_a4w4_asm(
+    AiterTensor* A,       // A:[M, K/2] f4x2
+    AiterTensor* B,       // B:[N, K/2] f4x2
+    AiterTensor* A_scale, // A_scale:[M, K/32] e8m0 paded
+    AiterTensor* B_scale, // B_scale:[N, K/32] e8m0 paded
+    AiterTensor* out,     // Out:[M, N] bf16
+    const char*  kernelName,
+    AiterTensor* bias,    // bias:[M, N] f32, can be nullptr
+    float        alpha,
+    float        beta,
+    int          bpreshuffle,
+    int          log2_k_split,
+    hipStream_t  stream)
 {
-
-    TORCH_CHECK(
-        out.dtype() == torch::ScalarType::BFloat16, __func__, " only support BFloat16 output now!");
-    int Mdim = A.size(0);
-    int Ndim = B.size(0);
-    int Kdim = A.size(1) * 2; // always fp4_x2F
+    AITER_CHECK(
+        out->dtype() == AITER_DTYPE_bf16, __func__, " only support BFloat16 output now!");
+    int Mdim = A->size(0);
+    int Ndim = B->size(0);
+    int Kdim = A->size(1) * 2; // always fp4_x2
     KernelArgs args;
     size_t arg_size = sizeof(args);
-    args.ptr_D      = (void*)out.data_ptr();
-    args.ptr_C      = bias.has_value() ? (void*)bias.value().data_ptr() : nullptr;
-    args.ptr_A      = (void*)A.data_ptr();
-    args.ptr_B      = (void*)B.data_ptr();
+    args.ptr_D      = out->ptr;
+    args.ptr_C      = bias ? bias->ptr : nullptr;
+    args.ptr_A      = A->ptr;
+    args.ptr_B      = B->ptr;
 
-    args.alpha          = alpha.value();
-    args.beta           = beta.value();
-    args.stride_C0      = out.stride(0);
-    args.stride_A0      = A.stride(0) * 2; // always fp4_x2
-    args.stride_B0      = B.stride(0) * 2; // always fp4_x2
+    args.alpha          = alpha;
+    args.beta           = beta;
+    args.stride_C0      = out->stride(0);
+    args.stride_A0      = A->stride(0) * 2; // always fp4_x2
+    args.stride_B0      = B->stride(0) * 2; // always fp4_x2
     args.M              = Mdim;
     args.N              = Ndim;
     args.K              = Kdim;
-    args.ptr_ScaleA     = (void*)A_scale.data_ptr();
-    args.ptr_ScaleB     = (void*)B_scale.data_ptr();
-    args.stride_ScaleA0 = A_scale.stride(0);
-    args.stride_ScaleB0 = B_scale.stride(0);
+    args.ptr_ScaleA     = A_scale->ptr;
+    args.ptr_ScaleB     = B_scale->ptr;
+    args.stride_ScaleA0 = A_scale->stride(0);
+    args.stride_ScaleB0 = B_scale->stride(0);
     args.log2_k_split   = 0;
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(A));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-    CFG* config_map          = get_cfg(A, out);
-    using DictKey            = std::tuple<int, int, int, std::optional<int>, std::optional<bool>>;
+    const HipDeviceGuard device_guard(A->device_id);
+
+    CFG* config_map = get_cfg(A->dtype(), out->dtype());
+    using DictKey   = std::tuple<int, int, int, int, int>;
     struct SimpleHash
     {
         size_t operator()(const DictKey& key) const
         {
             const auto& [m, n, k, log2, shuffle] = key;
-            int log2_key                         = log2.has_value() ? log2.value() : -1;
-            bool shuffle_key                     = shuffle.has_value() ? shuffle.value() : false;
             return std::hash<int>()(m) ^ std::hash<int>()(n) ^ std::hash<int>()(k) ^
-                   std::hash<int>()(log2_key) ^ std::hash<bool>()(shuffle_key);
+                   std::hash<int>()(log2) ^ std::hash<int>()(shuffle);
         }
     };
     static std::unordered_map<DictKey, std::tuple<std::string, int>, SimpleHash>
         heuristic_kernel_dict;
 
-    if(config_map->empty())
-    {
-        TORCH_CHECK(false, __func__, " no kernel support a4w4 for this gpu arch");
-    }
+    AITER_CHECK(!config_map->empty(), __func__, " no kernel support a4w4 for this gpu arch");
 
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
 
     std::string arch_id = get_gpu_arch();
-    kernelName          = kernelName.empty() ? "" : arch_id + kernelName;
+    std::string kname   = (kernelName && kernelName[0] != 0) ? (arch_id + kernelName) : "";
 
-    int selectedksplit = log2_k_split.has_value() ? log2_k_split.value() : 0;
-    if(kernelName.empty())
+    int selectedksplit = (log2_k_split >= 0) ? log2_k_split : 0;
+    if(kname.empty())
     {
         auto it = heuristic_kernel_dict.find(DictKey(Mdim, Ndim, Kdim, log2_k_split, bpreshuffle));
         if(it != heuristic_kernel_dict.end())
         {
             auto res       = it->second;
-            kernelName     = std::get<0>(res);
+            kname          = std::get<0>(res);
             selectedksplit = std::get<1>(res);
         }
         else
@@ -241,10 +230,10 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
             auto it = get_heuristic_kernel(
                 Mdim, Ndim, Kdim, arch_id, log2_k_split, bpreshuffle, config_map);
 
-            kernelName     = std::get<0>(it);
+            kname          = std::get<0>(it);
             selectedksplit = std::get<1>(it);
             heuristic_kernel_dict[{Mdim, Ndim, Kdim, log2_k_split, bpreshuffle}] =
-                std::make_tuple(kernelName, selectedksplit);
+                std::make_tuple(kname, selectedksplit);
         }
     }
 
@@ -253,7 +242,7 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
     int SUBN                 = 0;
     int gdz                  = 1;
 
-    auto it = config_map->find(kernelName);
+    auto it = config_map->find(kname);
     if(it != config_map->end())
     {
         const auto& cfg     = it->second;
@@ -266,9 +255,9 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
         {
             args.log2_k_split = selectedksplit;
             int k_num         = 1 << args.log2_k_split;
-            TORCH_CHECK(Kdim % k_num == 0, __func__, " Kdim % (1 << args.log2_k_split) != 0 !");
+            AITER_CHECK(Kdim % k_num == 0, __func__, " Kdim % (1 << args.log2_k_split) != 0 !");
             if(k_num > 1)
-                out.zero_();
+                hipMemsetAsync(out->ptr, 0, out->numel() * out->element_size(), stream);
             int k_per_tg = Kdim / k_num;
             k_per_tg     = ((k_per_tg + 256 - 1) / 256) * 256;
             gdz          = (Kdim + k_per_tg - 1) / k_per_tg;
@@ -282,7 +271,7 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
         impl_ptr = result.first->second.get();
     }
     else
-        TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
+        AITER_CHECK(false, __func__, " not find kernel " + kname);
 
     int gdx = (Ndim + SUBN - 1) / SUBN;
     int gdy = (Mdim + SUBM - 1) / SUBM;
@@ -296,5 +285,4 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
                              1,   // bdy
                              1,   // bdz
                              stream});
-    return out;
 }
