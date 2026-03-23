@@ -224,13 +224,13 @@ __device__ int gfx1250_dpp_substitute(int val, int /*row_mask*/, int /*bank_mask
     }
     else if constexpr(dpp_i == 0x142)
     {
-        // row_bcast:15 -> shuffle from lane 15
-        return __builtin_amdgcn_ds_bpermute((15 + (__lane_id() & ~31)) << 2, val);
+        // row_bcast:15 -> shuffle from lane 15 within 16-lane row
+        return __builtin_amdgcn_ds_bpermute((15 + (__lane_id() & ~15)) << 2, val);
     }
     else if constexpr(dpp_i == 0x143)
     {
-        // row_bcast:31 -> shuffle from lane 31
-        return __builtin_amdgcn_ds_bpermute(31 << 2, val);
+        // row_bcast:31 -> shuffle from lane 31 within 32-lane half
+        return __builtin_amdgcn_ds_bpermute((31 + (__lane_id() & ~31)) << 2, val);
     }
     else
     {

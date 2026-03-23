@@ -644,8 +644,13 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
                     : "=v"(sum[n][y])
                     : "0"(sum[n][y]), "v"(sum[n][y]), "v"(sum[n][y]));
 #if defined(__gfx1250__)
-                sum[n][y] += __shfl(sum[n][y], 15);
-                sum[n][y] += __shfl(sum[n][y], 31);
+                {
+                    unsigned lane_id = __lane_id();
+                    unsigned src15 = (lane_id & ~0xFu) | 15u;
+                    unsigned src31 = (lane_id & ~0x1Fu) | 31u;
+                    sum[n][y] += __shfl(sum[n][y], src15);
+                    sum[n][y] += __shfl(sum[n][y], src31);
+                }
 #else
                 asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:15 bound_ctrl:0"
                     : "=v"(sum[n][y])
@@ -914,8 +919,13 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_sml_(const int K,
                     : "=v"(sum[n][y])
                     : "0"(sum[n][y]), "v"(sum[n][y]), "v"(sum[n][y]));
 #if defined(__gfx1250__)
-                sum[n][y] += __shfl(sum[n][y], 15);
-                sum[n][y] += __shfl(sum[n][y], 31);
+                {
+                    unsigned lane_id = __lane_id();
+                    unsigned src15 = (lane_id & ~0xFu) | 15u;
+                    unsigned src31 = (lane_id & ~0x1Fu) | 31u;
+                    sum[n][y] += __shfl(sum[n][y], src15);
+                    sum[n][y] += __shfl(sum[n][y], src31);
+                }
 #else
                 asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:15 bound_ctrl:0"
                     : "=v"(sum[n][y])
@@ -1212,8 +1222,13 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_(const int K,
                     : "=v"(sum[n][y])
                     : "0"(sum[n][y]), "v"(sum[n][y]), "v"(sum[n][y]));
 #if defined(__gfx1250__)
-                sum[n][y] += __shfl(sum[n][y], 15);
-                sum[n][y] += __shfl(sum[n][y], 31);
+                {
+                    unsigned lane_id = __lane_id();
+                    unsigned src15 = (lane_id & ~0xFu) | 15u;
+                    unsigned src31 = (lane_id & ~0x1Fu) | 31u;
+                    sum[n][y] += __shfl(sum[n][y], src15);
+                    sum[n][y] += __shfl(sum[n][y], src31);
+                }
 #else
                 asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:15 bound_ctrl:0"
                     : "=v"(sum[n][y])
@@ -1583,8 +1598,13 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_big_(const int K,
                     : "=v"(sum[n][y])
                     : "0"(sum[n][y]), "v"(sum[n][y]), "v"(sum[n][y]));
 #if defined(__gfx1250__)
-                sum[n][y] += __shfl(sum[n][y], 15);
-                sum[n][y] += __shfl(sum[n][y], 31);
+                {
+                    unsigned lane_id = __lane_id();
+                    unsigned src15 = (lane_id & ~0xFu) | 15u;
+                    unsigned src31 = (lane_id & ~0x1Fu) | 31u;
+                    sum[n][y] += __shfl(sum[n][y], src15);
+                    sum[n][y] += __shfl(sum[n][y], src31);
+                }
 #else
                 asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:15 bound_ctrl:0"
                     : "=v"(sum[n][y])

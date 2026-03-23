@@ -21,13 +21,13 @@ __device__ T gfx1250_ds_bpermute(int src_lane, T val) {
 
 template <typename T>
 __device__ T gfx1250_bcast15(T val) {
-    int src_lane = 15 + (__lane_id() & ~31);
+    int src_lane = 15 + (__lane_id() & ~15);
     return gfx1250_ds_bpermute(src_lane, val);
 }
 
 template <typename T>
 __device__ T gfx1250_bcast31(T val) {
-    return gfx1250_ds_bpermute(31, val);
+    return gfx1250_ds_bpermute((__lane_id() & ~31) + 31, val);
 }
 
 template <typename T>

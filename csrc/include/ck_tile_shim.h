@@ -188,8 +188,8 @@ template <typename T> struct numeric_traits;
 
 template <>
 struct numeric_traits<fp8_t> {
-#if defined(__gfx950__)
-    // gfx950 (MI355) uses OCP E4M3 format (same as CK)
+#if defined(__gfx950__) || defined(__gfx1250__)
+    // gfx950 (MI355) and gfx1250 (MI450) use OCP E4M3 format (same as CK)
     static constexpr fp8_interpretation f8_interpret = fp8_interpretation::E4M3_OCP;
 #else
     static constexpr fp8_interpretation f8_interpret = fp8_interpretation::E4M3_FNUZ;
@@ -197,7 +197,7 @@ struct numeric_traits<fp8_t> {
 };
 template <>
 struct numeric_traits<bf8_t> {
-#if defined(__gfx950__)
+#if defined(__gfx950__) || defined(__gfx1250__)
     static constexpr fp8_interpretation f8_interpret = fp8_interpretation::E5M2_OCP;
 #else
     static constexpr fp8_interpretation f8_interpret = fp8_interpretation::E5M2_FNUZ;
