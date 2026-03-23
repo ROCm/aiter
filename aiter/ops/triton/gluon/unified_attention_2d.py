@@ -1577,7 +1577,7 @@ def unified_attention(
     print("*"*100)
     if PRINT_IRS and getattr(unified_attention, "print", False) == False:
         setattr(unified_attention, "print", True)
-        print_irs_to_files(attn_kernel, f"unified_attention_2d_gluon_num_warps_{NUM_WARPS}_block_m_{BLOCK_M}_tile_size_{TILE_SIZE}_block_size_{BLOCK_SIZE}_head_size_{HEAD_SIZE}_sfl_{shuffled_kv_cache}")
+        print_irs_to_files(attn_kernel, f"unified_attention_2d_gluon_wpeu_{waves_per_eu}_num_warps_{NUM_WARPS}_block_m_{BLOCK_M}_tile_size_{TILE_SIZE}_block_size_{BLOCK_SIZE}_head_size_{HEAD_SIZE}_sfl_{shuffled_kv_cache}")
     return attn_kernel
 
 
