@@ -328,7 +328,7 @@ setup(
         "einops",
         "psutil",
         "packaging",
-        "flydsl==0.0.1.dev95158637",
+        "flydsl>=0.1.1",
     ],
     extras_require={
         # Triton-based communication using Iris
