@@ -290,7 +290,11 @@ def is_hip() -> bool:
 @functools.cache
 def get_arch() -> GpuArch:
     """Get the current GPU architecture."""
-    name: str = triton.runtime.driver.active.get_current_target().arch
+    try:
+        name: str = triton.runtime.driver.active.get_current_target().arch
+    except RuntimeError:
+        # No GPU available (e.g. import-only on Windows/CPU)
+        return GpuArch(name="unknown")
     if name in CDNA_ARCHS:
         return GpuArch(name=name, family="cdna")
     elif name in RDNA_ARCHS:
