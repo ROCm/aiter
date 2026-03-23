@@ -2043,7 +2043,7 @@ class FmoeTuner(TunerCommon):
                         ),
                         FmoeTuner.run_flydsl_stage2_out,
                         (
-                            [0, 17, 5, 6, 7, 8, 19, 14, 9],
+                            [0, 17, 5, 6, 7, 8, 19, 14],
                             dtype,
                             topk,
                             kparams,
