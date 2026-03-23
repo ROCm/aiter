@@ -15,6 +15,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 )
 from op_tests.triton_tests.attention.test_unified_attention import ref_paged_attn
 
+
 def nonvarlen_benchmark_configs():
     batch_sizes = [1, 4, 16]
     N_HEADS = [16, 48]
@@ -132,9 +133,7 @@ def create_benchmark_configs(custom, args):
                 "D_HEAD_V",
                 "DECODE_P",
             ]
-            plot_name = (
-                f"fused-attention-layout-{args.layout}-sagev1-{args.sagev1}-sagev2-{args.sagev2}-causal-{causal}"
-            )
+            plot_name = f"fused-attention-layout-{args.layout}-sagev1-{args.sagev1}-sagev2-{args.sagev2}-causal-{causal}"
             extra_args = {"dtype": dtype, "causal": causal}
 
     for i in range(len(x_vals_list)):
@@ -232,7 +231,7 @@ def run_benchmark(custom, args):
         # round down block_size to the nearest power of 2 for v1/v2 quantization
         if (args.sagev1 or args.sagev2) and (block_size & (block_size - 1) != 0):
             block_size = 1 << (block_size.bit_length() - 1)
-            
+
         max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
         min_required_blocks = BATCH * max_num_blocks_per_seq
         num_blocks = (
@@ -277,30 +276,70 @@ def run_benchmark(custom, args):
 
         if args.sagev1 or args.sagev2:
             from aiter.ops.triton.attention.unified_attention import get_config
+
             num_queries_per_kv = num_query_heads // num_kv_heads
             config = get_config(
-                query.shape[0], num_seqs,
-                num_queries_per_kv, num_kv_heads, head_size,
-                window_size, max_query_len, max_kv_len,
-                block_size, query.element_size()
+                query.shape[0],
+                num_seqs,
+                num_queries_per_kv,
+                num_kv_heads,
+                head_size,
+                window_size,
+                max_query_len,
+                max_kv_len,
+                block_size,
+                query.element_size(),
             )
             BLOCK_M = config["BLOCK_M"]
             BLOCK_N = config["TILE_SIZE"]
             if args.sagev1:
-                from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v1
-                maybe_quantized_query, q_descale, maybe_quantized_key_cache, k_descale, maybe_quantized_value_cache, v_descale = sage_quant_v1(
-                    query, key_cache, value_cache, BLOCK_M, BLOCK_N,
-                    layout_q="unified", layout_k="cache",
+                from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
+                    sage_quant_v1,
+                )
+
+                (
+                    maybe_quantized_query,
+                    q_descale,
+                    maybe_quantized_key_cache,
+                    k_descale,
+                    maybe_quantized_value_cache,
+                    v_descale,
+                ) = sage_quant_v1(
+                    query,
+                    key_cache,
+                    value_cache,
+                    BLOCK_M,
+                    BLOCK_N,
+                    layout_q="unified",
+                    layout_k="cache",
                     v_descale=None,
-                    cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_q,
-                    config=config
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_q,
+                    config=config,
                 )
             else:
-                from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v2
-                maybe_quantized_query, q_descale, maybe_quantized_key_cache, k_descale, maybe_quantized_value_cache, v_descale = sage_quant_v2(
-                    query, key_cache, value_cache, BLOCK_M, BLOCK_N,
-                    hadamard_rotation=True, R=None, BLOCK_R=128,
-                    layout_k="cache", v_descale=None
+                from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
+                    sage_quant_v2,
+                )
+
+                (
+                    maybe_quantized_query,
+                    q_descale,
+                    maybe_quantized_key_cache,
+                    k_descale,
+                    maybe_quantized_value_cache,
+                    v_descale,
+                ) = sage_quant_v2(
+                    query,
+                    key_cache,
+                    value_cache,
+                    BLOCK_M,
+                    BLOCK_N,
+                    hadamard_rotation=True,
+                    R=None,
+                    BLOCK_R=128,
+                    layout_k="cache",
+                    v_descale=None,
                 )
         elif args.fp8_full:
             from aiter.ops.triton.utils.types import e4m3_dtype
@@ -318,7 +357,9 @@ def run_benchmark(custom, args):
 
             v_abs_max = value_cache.abs().amax().clamp(min=1e-9)
             v_descale = (v_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
-            maybe_quantized_value_cache = (value_cache * (fp8_max / v_abs_max)).to(FP8_TYPE)
+            maybe_quantized_value_cache = (value_cache * (fp8_max / v_abs_max)).to(
+                FP8_TYPE
+            )
         else:
             q_descale, k_descale, v_descale = None, None, None
 
@@ -328,7 +369,7 @@ def run_benchmark(custom, args):
             sage_version = SAGE_VERSION.SAGE_MXFP4
         else:
             sage_version = None
-        
+
         def fn():
             return unified_attention(
                 q=maybe_quantized_query,
@@ -375,19 +416,25 @@ def run_benchmark(custom, args):
             # print("output", output.flatten()[0:50])
             # print("ref_output", ref_output.flatten()[0:50])
             max_err = torch.max(torch.abs(output - ref_output)).item()
-            tag = "fp8_full" if args.fp8_full else \
-                    "fp8" if args.fp8 else \
-                    "sagev1" if args.sagev1 else \
-                    "sagev2" if args.sagev2 else \
-                    "default"
+            tag = (
+                "fp8_full"
+                if args.fp8_full
+                else (
+                    "fp8"
+                    if args.fp8
+                    else (
+                        "sagev1"
+                        if args.sagev1
+                        else "sagev2" if args.sagev2 else "default"
+                    )
+                )
+            )
             config_str = (
                 f"BATCH={BATCH}, HQ={HQ}, HK={HK}, "
                 f"N_CTX_Q={N_CTX_Q}, N_CTX_K={N_CTX_K}"
             )
             try:
-                torch.testing.assert_close(
-                    output, ref_output, atol=atol, rtol=rtol
-                )
+                torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
                 print(
                     f"  [{tag}] PASS  max_err={max_err:.6f}  "
                     f"atol={atol}  ({config_str})"

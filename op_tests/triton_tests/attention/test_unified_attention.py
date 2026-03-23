@@ -121,7 +121,6 @@ def test_triton_unified_attn(
     if sage_mxfp4 and not arch_info.is_fp4_avail():
         pytest.skip("FP4 dot product is not supported on this GPU")
 
-
     torch.cuda.empty_cache()
     torch.manual_seed(0)
     num_seqs = len(seq_lens)
@@ -168,11 +167,23 @@ def test_triton_unified_attn(
     k_descale = None
     v_descale = None
 
-    if sage_mxfp4:        
-        maybe_quantized_query, q_descale, maybe_quantized_key_cache, k_descale, maybe_quantized_value_cache, v_descale = sage_quant_v2(
-            query, key_cache, value_cache,
-            hadamard_rotation=True, R=None, BLOCK_R=128,
-            layout_k="cache", v_descale=None
+    if sage_mxfp4:
+        (
+            maybe_quantized_query,
+            q_descale,
+            maybe_quantized_key_cache,
+            k_descale,
+            maybe_quantized_value_cache,
+            v_descale,
+        ) = sage_quant_v2(
+            query,
+            key_cache,
+            value_cache,
+            hadamard_rotation=True,
+            R=None,
+            BLOCK_R=128,
+            layout_k="cache",
+            v_descale=None,
         )
     elif fp8:
         FP8_TYPE = e4m3_dtype
@@ -189,7 +200,6 @@ def test_triton_unified_attn(
         v_abs_max = value_cache.abs().amax().clamp(min=1e-9)
         v_descale = (v_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
         maybe_quantized_value_cache = (value_cache * (fp8_max / v_abs_max)).to(FP8_TYPE)
-  
 
     unified_attention(
         q=maybe_quantized_query,
@@ -233,7 +243,6 @@ def test_triton_unified_attn(
     torch.testing.assert_close(
         output, ref_output, atol=atol, rtol=rtol
     ), f"{torch.max(torch.abs(output - ref_output))}"
-
 
 
 if __name__ == "__main__":

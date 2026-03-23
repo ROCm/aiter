@@ -52,53 +52,54 @@ def find_seq_idx(
 
 @triton.jit
 def q_scale_process(
-        Q_Descale,
-        q_block_global_idx,
-        offs_d_scale,
-        query_offset_seq,
-        kv_head_idx,
-        query_offset_head,
-        seq_mask,
-        query_scale_stride_0: tl.int64,  
-        query_scale_stride_1: tl.int64,  
-        query_scale_stride_2: tl.int64,
-        SAGE_VERSION: tl.constexpr = None
-    ):
-    if SAGE_VERSION == 1: # SAGE v1
+    Q_Descale,
+    q_block_global_idx,
+    offs_d_scale,
+    query_offset_seq,
+    kv_head_idx,
+    query_offset_head,
+    seq_mask,
+    query_scale_stride_0: tl.int64,
+    query_scale_stride_1: tl.int64,
+    query_scale_stride_2: tl.int64,
+    SAGE_VERSION: tl.constexpr = None,
+):
+    if SAGE_VERSION == 1:  # SAGE v1
         q_descale_ptr = (
             Q_Descale
             + q_block_global_idx * query_scale_stride_0
             + kv_head_idx * query_scale_stride_1
         )
         return tl.load(q_descale_ptr)
-    elif SAGE_VERSION == 2: # SAGE mxfp4
+    elif SAGE_VERSION == 2:  # SAGE mxfp4
         q_descale_ptr = (
             Q_Descale
             + query_offset_seq[:, None] * query_scale_stride_0
             + query_offset_head[:, None] * query_scale_stride_1
             + offs_d_scale[None, :] * query_scale_stride_2
         )
-        
+
         return tl.load(q_descale_ptr, mask=seq_mask, other=0.0)
+
 
 @triton.jit
 def k_scale_process(
-        K_Descale,
-        physical_block_idx,
-        seq_offset,
-        tile_idx,
-        BLOCK_SIZE,
-        TILE_SIZE,
-        kv_head_idx,
-        offs_d_scale,
-        tile_mask,
-        stride_k_cache_scale_0: tl.int64,  # int
-        stride_k_cache_scale_1: tl.int64,  # int
-        stride_k_cache_scale_2: tl.int64,  # int
-        stride_k_cache_scale_3: tl.int64,  # int
-        SAGE_VERSION: tl.constexpr = None
-    ):
-    if SAGE_VERSION == 1: # SAGE v1 Each block_size has its own scale
+    K_Descale,
+    physical_block_idx,
+    seq_offset,
+    tile_idx,
+    BLOCK_SIZE,
+    TILE_SIZE,
+    kv_head_idx,
+    offs_d_scale,
+    tile_mask,
+    stride_k_cache_scale_0: tl.int64,  # int
+    stride_k_cache_scale_1: tl.int64,  # int
+    stride_k_cache_scale_2: tl.int64,  # int
+    stride_k_cache_scale_3: tl.int64,  # int
+    SAGE_VERSION: tl.constexpr = None,
+):
+    if SAGE_VERSION == 1:  # SAGE v1 Each block_size has its own scale
         k_descale_ptr = (
             K_Descale
             + physical_block_idx * stride_k_cache_scale_0
@@ -106,7 +107,7 @@ def k_scale_process(
             + kv_head_idx * stride_k_cache_scale_2
         )
         return tl.load(k_descale_ptr)
-    elif SAGE_VERSION == 2: # SAGE mxfp4
+    elif SAGE_VERSION == 2:  # SAGE mxfp4
         k_descale_ptr = (
             K_Descale
             + physical_block_idx[:, None] * stride_k_cache_scale_0
@@ -119,31 +120,29 @@ def k_scale_process(
 
 @triton.jit
 def qk_dot(
-        Q,
-        K,
-        qk_scale,
-        q_descale,
-        k_descale,
-        SAGE_MXFP4: tl.constexpr = False,
-    ):
+    Q,
+    K,
+    qk_scale,
+    q_descale,
+    k_descale,
+    SAGE_MXFP4: tl.constexpr = False,
+):
     if SAGE_MXFP4:
-        return tl.dot_scaled(
-            Q, q_descale, "e2m1", K, k_descale, "e2m1", fast_math=True
-        )
+        return tl.dot_scaled(Q, q_descale, "e2m1", K, k_descale, "e2m1", fast_math=True)
     else:
         return qk_scale * tl.dot(Q, K)
 
 
 @triton.jit
 def v_scale_process(
-        V_Descale,
-        kv_head_idx,
-        offs_d,
-        head_mask,
-        stride_v_cache_scale_0: tl.int64,  # int
-        stride_v_cache_scale_1: tl.int64,  # int
-        SAGE_VERSION: tl.constexpr = None
-    ):
+    V_Descale,
+    kv_head_idx,
+    offs_d,
+    head_mask,
+    stride_v_cache_scale_0: tl.int64,  # int
+    stride_v_cache_scale_1: tl.int64,  # int
+    SAGE_VERSION: tl.constexpr = None,
+):
     if SAGE_VERSION == 1 or SAGE_VERSION == 2:
         v_descale_ptr = (
             V_Descale
@@ -175,9 +174,9 @@ def kernel_unified_attention_2d(
     block_table_stride: tl.int64,  # int
     query_stride_0: tl.int64,  # int
     query_stride_1: tl.int64,  # int, should be equal to head_size
-    query_scale_stride_0: tl.int64,  
-    query_scale_stride_1: tl.int64,  
-    query_scale_stride_2: tl.int64,  
+    query_scale_stride_0: tl.int64,
+    query_scale_stride_1: tl.int64,
+    query_scale_stride_2: tl.int64,
     output_stride_0: tl.int64,  # int
     output_stride_1: tl.int64,  # int, should be equal to head_size
     qq_bias_stride_0: tl.int64,  # int
@@ -212,16 +211,16 @@ def kernel_unified_attention_2d(
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
     ALL_DECODE: tl.constexpr = False,  # bool
-    SAGE_MXFP4: tl.constexpr = False, # bool
-    IS_PAGING: tl.constexpr = True, # bool
-    PRELOAD_V: tl.constexpr = False, # bool
+    SAGE_MXFP4: tl.constexpr = False,  # bool
+    IS_PAGING: tl.constexpr = True,  # bool
+    PRELOAD_V: tl.constexpr = False,  # bool
 ):
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
 
     # needed to use exp2 (exp2 -> exp conversion)
     RCP_LN2 = 1.4426950408889634
-        
+
     if not SAGE_MXFP4:
         _q_ds = tl.load(q_scale) if q_scale is not None else 1.0
         _k_ds = tl.load(k_scale) if k_scale is not None else 1.0
@@ -248,7 +247,7 @@ def kernel_unified_attention_2d(
 
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
-    if SAGE_MXFP4: # per token mxfp4
+    if SAGE_MXFP4:  # per token mxfp4
         offs_d_qk = tl.arange(0, HEAD_SIZE_PADDED // 2)
         offs_d_scale = tl.arange(0, HEAD_SIZE_PADDED // 32)
     else:
@@ -298,8 +297,10 @@ def kernel_unified_attention_2d(
             + query_offset_1[:, None] * query_scale_stride_1
             + offs_d_scale[None, :] * query_scale_stride_2
         )
-        
-        q_scale_loaded = tl.load(q_descale_ptr, mask=query_mask_0[:, None] & query_mask_1[:, None], other=0.0)
+
+        q_scale_loaded = tl.load(
+            q_descale_ptr, mask=query_mask_0[:, None] & query_mask_1[:, None], other=0.0
+        )
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -385,7 +386,7 @@ def kernel_unified_attention_2d(
         physical_block_idx = tl.load(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
         ).to(tl.int64)
-    
+
     for j in range(tile_start, tile_end):
         seq_offset = j * TILE_SIZE + offs_t
         # to reduce the masking effect when not needed
@@ -433,7 +434,7 @@ def kernel_unified_attention_2d(
             )
 
             k_scale_loaded = tl.load(k_descale_ptr, mask=tile_mask[:, None], other=0.0)
-        
+
         # TODO: check convert effect on perf
         K = K_load.to(Q.dtype)
 
@@ -445,7 +446,6 @@ def kernel_unified_attention_2d(
                 other=0.0,
                 cache_modifier=KV_cache_modifier,
             )
-
 
         # S : (BLOCK_M, TILE_SIZE)
         S = qk_dot(
@@ -526,12 +526,11 @@ def kernel_unified_attention_2d(
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         acc += tl.dot(P.to(V.dtype), V)
 
-
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
     one_over_L = 1.0 / L[:, None]
     acc = acc * one_over_L
-        
+
     if SAGE_MXFP4:
         v_descale_ptr = (
             v_scale
@@ -544,18 +543,16 @@ def kernel_unified_attention_2d(
         v_scale_loaded = tl.load(v_scale)
         acc *= v_scale_loaded
 
-    
     if OUTPUT_FP8:
         acc = acc * tl.load(out_scale)
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
-    
-    
+
     output_offset = (
         query_offset_0[:, None] * output_stride_0
         + query_offset_1[:, None] * output_stride_1
         + offs_d[None, :]
     )
-    
+
     tl.store(
         output_ptr + output_offset,
         acc,
@@ -565,7 +562,7 @@ def kernel_unified_attention_2d(
 
 @triton.jit
 def kernel_unified_attention_3d(
-    segm_output_ptr, # [num_tokens, num_query_heads, num_segments, head_size]
+    segm_output_ptr,  # [num_tokens, num_query_heads, num_segments, head_size]
     segm_max_ptr,  # [num_tokens, num_query_heads, num_segments]
     segm_expsum_ptr,  # [num_tokens, num_query_heads, num_segments]
     query_ptr,  # [num_tokens, num_query_heads, head_size]
@@ -585,9 +582,9 @@ def kernel_unified_attention_3d(
     block_table_stride: tl.int64,  # int
     query_stride_0: tl.int64,  # int
     query_stride_1: tl.int64,  # int, should be equal to head_size
-    query_scale_stride_0: tl.int64,  
-    query_scale_stride_1: tl.int64,  
-    query_scale_stride_2: tl.int64,  
+    query_scale_stride_0: tl.int64,
+    query_scale_stride_1: tl.int64,
+    query_scale_stride_2: tl.int64,
     qq_bias_stride_0: tl.int64,  # int
     BLOCK_SIZE: tl.constexpr,  # int
     TILE_SIZE: tl.constexpr,  # int, must be power of 2
@@ -616,9 +613,9 @@ def kernel_unified_attention_3d(
     BLOCK_M: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     ALL_DECODE: tl.constexpr = False,  # bool
-    SAGE_MXFP4: tl.constexpr = False, # bool
-    IS_PAGING: tl.constexpr = True, # bool
-    PRELOAD_V: tl.constexpr = True, # bool
+    SAGE_MXFP4: tl.constexpr = False,  # bool
+    IS_PAGING: tl.constexpr = True,  # bool
+    PRELOAD_V: tl.constexpr = True,  # bool
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -707,7 +704,9 @@ def kernel_unified_attention_3d(
             + query_offset_1[:, None] * query_scale_stride_1
             + offs_d_scale[None, :] * query_scale_stride_2
         )
-        q_scale_loaded = tl.load(q_descale_ptr, mask= query_mask_0[:, None] & query_mask_1[:, None], other=0.0)
+        q_scale_loaded = tl.load(
+            q_descale_ptr, mask=query_mask_0[:, None] & query_mask_1[:, None], other=0.0
+        )
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -769,7 +768,7 @@ def kernel_unified_attention_3d(
         physical_block_idx = tl.load(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
         ).to(tl.int64)
-    
+
     # iterate through tiles within current segment
     for j in range(
         segm_idx * tiles_per_segment,
@@ -808,7 +807,6 @@ def kernel_unified_attention_3d(
             cache_modifier=KV_cache_modifier,
         )
 
-
         k_scale_loaded = None
         if SAGE_MXFP4:
             K = K_load
@@ -821,7 +819,7 @@ def kernel_unified_attention_3d(
             )
 
             k_scale_loaded = tl.load(k_descale_ptr, mask=tile_mask[:, None], other=0.0)
-        
+
         # TODO: check convert effect on perf
         K = K_load.to(Q.dtype)
 
@@ -834,7 +832,6 @@ def kernel_unified_attention_3d(
                 cache_modifier=KV_cache_modifier,
             )
 
-
         # S : (BLOCK_M, TILE_SIZE)
         S = qk_dot(
             Q,
@@ -845,13 +842,12 @@ def kernel_unified_attention_3d(
             SAGE_MXFP4,
         )
 
-
         if USE_SOFTCAP:
             # softcap here uses exp2 and consumes RCP_LN2 conversion.
             # multiply by RCP_LN2 again to be used in later exp2
             S = apply_softcap(S, softcap) * RCP_LN2
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
-        
+
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
         )
@@ -917,7 +913,6 @@ def kernel_unified_attention_3d(
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         acc += tl.dot(P.to(V.dtype), V)
 
-
     segm_output_offset = (
         query_offset_0[:, None].to(tl.int64)
         * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
@@ -942,7 +937,7 @@ def kernel_unified_attention_3d(
 @triton.jit
 def reduce_segments(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
-    v_scale, # [num_kv_heads, head_size] if sage or sage_mxfp4 else non or scalar
+    v_scale,  # [num_kv_heads, head_size] if sage or sage_mxfp4 else non or scalar
     segm_output_ptr,
     # [num_tokens, num_query_heads, max_num_segments, head_size]
     segm_max_ptr,  # [num_tokens, num_query_heads, max_num_segments]
@@ -964,7 +959,7 @@ def reduce_segments(
     BLOCK_Q: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     OUTPUT_FP8: tl.constexpr,  # bool
-    SAGE_MXFP4: tl.constexpr = False, # bool
+    SAGE_MXFP4: tl.constexpr = False,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):

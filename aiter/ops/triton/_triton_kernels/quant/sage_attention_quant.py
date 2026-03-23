@@ -4,12 +4,10 @@ import triton.language as tl
 
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 
-
-
-
 ###################### Unified quantization kernels ###############
 
 from aiter.ops.triton._triton_kernels.attention.unified_attention import find_seq_idx
+
 
 @triton.jit
 def perblock_quantize_q_kernel(
@@ -87,11 +85,15 @@ def perblock_quantize_q_kernel(
     Q_quant = Q_quant.to(Q_q.dtype.element_ty)
 
     # scale (total num blocks, hk)
-    scale_ptrs = Q_descale + q_block_global_idx * scale_stride_0 + kv_head_idx * scale_stride_1
+    scale_ptrs = (
+        Q_descale + q_block_global_idx * scale_stride_0 + kv_head_idx * scale_stride_1
+    )
     tl.store(scale_ptrs, scale)
     tl.store(
-        Q_q + query_offset, Q_quant,
-        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None])
+        Q_q + query_offset,
+        Q_quant,
+        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+    )
 
 
 @triton.jit
@@ -111,14 +113,16 @@ def perblock_quantize_kernel(
     sm_scale: tl.constexpr,
     DTYPE_MAX: tl.constexpr,
 ):
-    
+
     pid_b = tl.program_id(0)
     pid_m = tl.program_id(1)
     pid_h = tl.program_id(2)
-    
+
     if query_start_len_ptr is not None:
         cur_batch_in_all_start_index = tl.load(query_start_len_ptr + pid_b).to(tl.int64)
-        cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + pid_b + 1).to(tl.int64)
+        cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + pid_b + 1).to(
+            tl.int64
+        )
         seqlen = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
         batch_offset = cur_batch_in_all_start_index.to(tl.int64) * stride_m
     else:
@@ -132,7 +136,7 @@ def perblock_quantize_kernel(
     global_blk_idx = pid_b * num_pid_m + pid_m
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
-    offs_d = tl.arange(0, D)[None,:]
+    offs_d = tl.arange(0, D)[None, :]
     mask = offs_m < seqlen
     head_offset = pid_h.to(tl.int64) * stride_h
     tile_offsets = batch_offset + offs_m * stride_m + head_offset + offs_d
@@ -153,11 +157,9 @@ def perblock_quantize_kernel(
     # scale (total num blocks)
     scale_ptrs = Q_descale + global_blk_idx * scale_stride_0 + pid_h * scale_stride_1
     tl.store(scale_ptrs, scale)
-    
+
     qtile_ptrs = Q_q + tile_offsets
-    tl.store(
-        qtile_ptrs, Q_quant,
-        mask=mask)
+    tl.store(qtile_ptrs, Q_quant, mask=mask)
 
 
 @triton.jit
@@ -182,7 +184,7 @@ def _rotate_mxfp_quantize_k_kernel(
 
     # Offsets
     offs_t = pid * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
-    mask = (offs_t < num_tokens)
+    mask = offs_t < num_tokens
 
     offs_d = tl.arange(0, D)
     offs_dq = tl.arange(0, D // 2)
@@ -190,19 +192,12 @@ def _rotate_mxfp_quantize_k_kernel(
 
     # set pointers to either Q or K tensor, descale, quantized output
     # Q block shape: [BLOCK_M, D]
-    tensor_offset = K + (
-        offs_t * stride_t
-        + offs_d[None, :]
-    )
+    tensor_offset = K + (offs_t * stride_t + offs_d[None, :])
     descale_offset = K_descale + (
-        offs_t * stride_ts
-        + offs_ds[None, :]
+        offs_t * stride_ts + offs_ds[None, :]
     )  # we group 32 values together for quantization
 
-    quant_tensor_offset = K_q + (
-        offs_t * stride_tq
-        + offs_dq[None, :]
-    )
+    quant_tensor_offset = K_q + (offs_t * stride_tq + offs_dq[None, :])
 
     qk_ptr = tensor_offset
     qk_descale_ptr = descale_offset
@@ -230,7 +225,7 @@ def _rotate_mxfp_quantize_k_kernel(
 
     if sm_scale is not None:
         qk_rot_tile *= sm_scale
-    
+
     qk_quant_tile, qk_descale = _compute_mx_quant_and_scale_rne(
         qk_rot_tile, mask, tl.uint8
     )
@@ -242,7 +237,6 @@ def _rotate_mxfp_quantize_k_kernel(
         qk_quant_tile,
         mask=mask,
     )
-
 
 
 # @triton.jit
@@ -280,7 +274,6 @@ def _rotate_mxfp_quantize_k_kernel(
 #     v_quant = v / v_descales
 #     v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
 #     tl.store(v_output_ptrs, v_quant, mask=mask)
-
 
 
 ################# Sage V2 quantization kernels ####################

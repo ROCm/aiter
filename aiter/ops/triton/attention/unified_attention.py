@@ -10,17 +10,29 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     reduce_segments,
 )
 
-def get_config(num_tokens, num_seqs, num_queries_per_kv, num_kv_heads, head_size, window_size, max_seqlen_q, max_seqlen_k, block_size, q_element_size):
+
+def get_config(
+    num_tokens,
+    num_seqs,
+    num_queries_per_kv,
+    num_kv_heads,
+    head_size,
+    window_size,
+    max_seqlen_q,
+    max_seqlen_k,
+    block_size,
+    q_element_size,
+):
     SLIDING_WINDOW = 1 + window_size[0]
     ALL_DECODE = max_seqlen_q == 1
     cu_count = get_num_sms()
-    
+
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
 
     BLOCK_Q = BLOCK_M // num_queries_per_kv
-    
+
     total_num_q_blocks = num_tokens // BLOCK_Q + num_seqs
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
@@ -33,7 +45,16 @@ def get_config(num_tokens, num_seqs, num_queries_per_kv, num_kv_heads, head_size
         target_num_prgms,
         num_2d_prgms,
     ):
-        return select_2d_config(block_size, head_size, SLIDING_WINDOW, ALL_DECODE, max_seqlen_q, max_seqlen_k, num_queries_per_kv, num_2d_prgms)
+        return select_2d_config(
+            block_size,
+            head_size,
+            SLIDING_WINDOW,
+            ALL_DECODE,
+            max_seqlen_q,
+            max_seqlen_k,
+            num_queries_per_kv,
+            num_2d_prgms,
+        )
     else:
         attn_config, reduce_config = select_3d_config(
             head_size,
@@ -46,6 +67,7 @@ def get_config(num_tokens, num_seqs, num_queries_per_kv, num_kv_heads, head_size
         attn_config["BLOCK_M"] = BLOCK_M
         attn_config["BLOCK_Q"] = BLOCK_Q
         return attn_config
+
 
 def select_2d_config(
     block_size,
@@ -137,13 +159,13 @@ def use_2d_kernel(
 
 
 def check_mxfp4_quant_args_get_strides(
-        q,
-        q_descale,
-        k,
-        k_descale,
-        v,
-        v_descale,
-    ):
+    q,
+    q_descale,
+    k,
+    k_descale,
+    v,
+    v_descale,
+):
     """
     qkv has shapes:
         - q,  # [num_tokens, num_query_heads, head_size]
@@ -158,19 +180,32 @@ def check_mxfp4_quant_args_get_strides(
     num_blks, blk_size, num_kv_heads, head_size_v = v.shape
     head_size_qk *= 2
     expected_q_descale_shape = (num_tokens, num_query_heads, head_size_qk // 32)
-    assert q_descale.shape == expected_q_descale_shape, f"expect q_descale to have shape {expected_q_descale_shape}, got {q_descale.shape}"
+    assert (
+        q_descale.shape == expected_q_descale_shape
+    ), f"expect q_descale to have shape {expected_q_descale_shape}, got {q_descale.shape}"
     expected_k_descale_shape = (
-    num_blks,
-    blk_size,
-    num_kv_heads,
-    head_size_qk // 32,
+        num_blks,
+        blk_size,
+        num_kv_heads,
+        head_size_qk // 32,
     )
-    assert k_descale.shape == expected_k_descale_shape, f"expect k_descale to have shape {expected_k_descale_shape}, got {k_descale.shape}"
+    assert (
+        k_descale.shape == expected_k_descale_shape
+    ), f"expect k_descale to have shape {expected_k_descale_shape}, got {k_descale.shape}"
     expected_v_descale_shape = (num_kv_heads, head_size_v)
-    assert v_descale.shape == expected_v_descale_shape, f"expect v_descale to have shape {expected_v_descale_shape}, got {v_descale.shape}"
+    assert (
+        v_descale.shape == expected_v_descale_shape
+    ), f"expect v_descale to have shape {expected_v_descale_shape}, got {v_descale.shape}"
 
-    stride_k_cache_scale_0, stride_k_cache_scale_1, stride_k_cache_scale_2, stride_k_cache_scale_3 = k_descale.stride()
-    query_scale_stride_0, query_scale_stride_1, query_scale_stride_2 = q_descale.stride()
+    (
+        stride_k_cache_scale_0,
+        stride_k_cache_scale_1,
+        stride_k_cache_scale_2,
+        stride_k_cache_scale_3,
+    ) = k_descale.stride()
+    query_scale_stride_0, query_scale_stride_1, query_scale_stride_2 = (
+        q_descale.stride()
+    )
     stride_v_cache_scale_0, stride_v_cache_scale_1 = v_descale.stride()
 
     return (
@@ -182,9 +217,8 @@ def check_mxfp4_quant_args_get_strides(
         stride_k_cache_scale_2,
         stride_k_cache_scale_3,
         stride_v_cache_scale_0,
-        stride_v_cache_scale_1
+        stride_v_cache_scale_1,
     )
-
 
 
 def unified_attention(
@@ -238,7 +272,7 @@ def unified_attention(
             stride_k_cache_scale_2,
             stride_k_cache_scale_3,
             stride_v_cache_scale_0,
-            stride_v_cache_scale_1 
+            stride_v_cache_scale_1,
         ) = check_mxfp4_quant_args_get_strides(
             q,
             q_descale,
@@ -249,7 +283,9 @@ def unified_attention(
         )
     else:
         query_scale_stride_0 = query_scale_stride_1 = query_scale_stride_2 = 0
-        stride_k_cache_scale_0 = stride_k_cache_scale_1 = stride_k_cache_scale_2 = stride_k_cache_scale_3 = 0
+        stride_k_cache_scale_0 = stride_k_cache_scale_1 = stride_k_cache_scale_2 = (
+            stride_k_cache_scale_3
+        ) = 0
         stride_v_cache_scale_0 = stride_v_cache_scale_1 = 0
 
     BLOCK_M = (
@@ -257,7 +293,6 @@ def unified_attention(
     )
 
     print("v.dtype", v.dtype)
-
 
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     assert BLOCK_Q >= 1
@@ -295,7 +330,7 @@ def unified_attention(
             num_2d_prgms,
         )
 
-        BLOCK_M=config["BLOCK_M"]
+        BLOCK_M = config["BLOCK_M"]
         assert config["BLOCK_Q"] >= 1
         total_num_q_blocks = q.shape[0] // config["BLOCK_Q"] + num_seqs
 
@@ -393,7 +428,7 @@ def unified_attention(
             dtype=torch.float32,
             device=q.device,
         )
- 
+
         kernel_unified_attention_3d[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,
