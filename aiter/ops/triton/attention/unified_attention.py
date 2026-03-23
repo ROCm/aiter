@@ -1,7 +1,6 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
 import triton
-import aiter
 import torch
 from aiter.ops.triton.utils.device_info import get_num_sms
 import math
@@ -10,7 +9,6 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     kernel_unified_attention_3d,
     reduce_segments,
 )
-from aiter.ops.triton.quant.sage_attention_quant_wrappers import (sage_quant, sage_quant_mxfp4)
 from enum import IntEnum
 
 

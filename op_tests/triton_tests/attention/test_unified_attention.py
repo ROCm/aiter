@@ -7,8 +7,7 @@ import pytest
 import torch
 
 from aiter.ops.triton.utils.types import e4m3_dtype
-from aiter.ops.triton.attention.unified_attention import unified_attention, get_config
-from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.ops.triton.attention.unified_attention import unified_attention
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v2
