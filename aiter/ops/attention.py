@@ -106,7 +106,26 @@ def pa_fwd_naive(
 ) -> torch.Tensor: ...
 
 
-@compile_ops("module_attention_asm", gen_fake=gen_pa_fwd_asm)
+@compile_ops(
+    "module_attention_asm", fc_name="pa_fwd", ffi_type="ctypes", gen_fake=gen_pa_fwd_asm
+)
+def _pa_fwd_asm(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables_stride0: int,
+    max_qlen: int = 1,
+    K_QScale: Optional[torch.Tensor] = None,
+    V_QScale: Optional[torch.Tensor] = None,
+    out_: Optional[torch.Tensor] = None,
+    qo_indptr: Optional[torch.Tensor] = None,
+    high_precision: Optional[int] = 1,
+    kernelName: Optional[str] = None,
+) -> None: ...
+
+
 def pa_fwd_asm(
     Q: torch.Tensor,
     K: torch.Tensor,
@@ -123,7 +142,24 @@ def pa_fwd_asm(
         int
     ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
     kernelName: Optional[str] = None,
-) -> torch.Tensor: ...
+) -> torch.Tensor:
+    output = out_ if out_ is not None else torch.empty_like(Q)
+    _pa_fwd_asm(
+        Q,
+        K,
+        V,
+        block_tables,
+        context_lens,
+        block_tables_stride0,
+        max_qlen,
+        K_QScale,
+        V_QScale,
+        output,
+        qo_indptr,
+        high_precision,
+        kernelName,
+    )
+    return output
 
 
 def _should_use_asm_kernel(
@@ -275,7 +311,36 @@ def gen_pa_ps_fwd_asm(
         return torch.empty_like(Q)
 
 
-@compile_ops("module_attention_asm", gen_fake=gen_pa_ps_fwd_asm)
+@compile_ops(
+    "module_attention_asm",
+    fc_name="pa_ps_fwd",
+    ffi_type="ctypes",
+    gen_fake=gen_pa_ps_fwd_asm,
+)
+def _pa_ps_fwd_asm(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    context_lens: torch.Tensor,
+    softmax_scale: float,
+    max_qlen: int = 1,
+    K_QScale: Optional[torch.Tensor] = None,
+    V_QScale: Optional[torch.Tensor] = None,
+    out_: Optional[torch.Tensor] = None,
+    qo_indptr: Optional[torch.Tensor] = None,
+    work_indptr: Optional[torch.Tensor] = None,
+    work_info: Optional[torch.Tensor] = None,
+    splitData: Optional[torch.Tensor] = None,
+    splitLse: Optional[torch.Tensor] = None,
+    mask: int = 0,
+    high_precision: Optional[int] = 1,
+    kernelName: Optional[str] = None,
+    quant_type: Optional[Enum] = QuantType.per_Token.value,
+) -> None: ...
+
+
 def pa_ps_fwd_asm(
     Q: torch.Tensor,
     K: torch.Tensor,
@@ -283,13 +348,12 @@ def pa_ps_fwd_asm(
     kv_indptr: torch.Tensor,
     kv_page_indices: torch.Tensor,
     context_lens: torch.Tensor,
-    softmax_scale: float,  # better have ?
+    softmax_scale: float,
     max_qlen: int = 1,
     K_QScale: Optional[torch.Tensor] = None,
     V_QScale: Optional[torch.Tensor] = None,
     out_: Optional[torch.Tensor] = None,
     qo_indptr: Optional[torch.Tensor] = None,
-    # work_meta_data: Optional[torch.Tensor] = None,
     work_indptr: Optional[torch.Tensor] = None,
     work_info: Optional[torch.Tensor] = None,
     splitData: Optional[torch.Tensor] = None,
@@ -300,7 +364,31 @@ def pa_ps_fwd_asm(
     ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
     kernelName: Optional[str] = None,
     quant_type: Optional[Enum] = QuantType.per_Token.value,
-) -> torch.Tensor: ...
+) -> torch.Tensor:
+    output = out_ if out_ is not None else torch.empty_like(Q)
+    _pa_ps_fwd_asm(
+        Q,
+        K,
+        V,
+        kv_indptr,
+        kv_page_indices,
+        context_lens,
+        softmax_scale,
+        max_qlen,
+        K_QScale,
+        V_QScale,
+        output,
+        qo_indptr,
+        work_indptr,
+        work_info,
+        splitData,
+        splitLse,
+        mask,
+        high_precision,
+        kernelName,
+        quant_type,
+    )
+    return output
 
 
 def pa_reduce_v1(
@@ -380,7 +468,7 @@ def pa_persistent_fwd(
         work_info,
         logits,
         splitLse,
-        mask=mask,
+        mask,
         quant_type=quant_type,
     )
     pa_reduce_v1(
@@ -1123,8 +1211,24 @@ def decode_update_mla_metadata_v1(
     assert kv_granularity >= 16
     assert page_size == 1
     # assert not (dtype_q == dtypes.bf16 and dtype_kv == dtypes.bf16 and num_heads_per_head_k == 128), "In this case, use get_mla_metadata_v1 instead"
-    natively_supported = (num_heads_per_head_k == 16) or (
-        num_heads_per_head_k == 128 and dtype_q == dtypes.fp8 and dtype_kv == dtypes.fp8
+    q_is_fp8 = dtype_q == dtypes.fp8
+    kv_is_fp8 = dtype_kv == dtypes.fp8
+    arch_id = get_gfx()
+    natively_supported = (
+        (num_heads_per_head_k == 16)
+        or (
+            arch_id == "gfx950"
+            and num_heads_per_head_k == 32
+            and q_is_fp8
+            and kv_is_fp8
+            and max_seqlen_qo == 4
+        )
+        or (
+            arch_id == "gfx942"
+            and num_heads_per_head_k == 128
+            and q_is_fp8
+            and kv_is_fp8
+        )
     )
     cu_num = work_indptr.shape[0] - 1
     tile_reduce_cnt = reduce_indptr.shape[0] - 1
