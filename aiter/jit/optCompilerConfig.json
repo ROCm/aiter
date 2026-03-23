@@ -1,4 +1,16 @@
 {
+    "module_aiter_enum": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/aiter_enum_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_activation": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/activation_pybind.cu'",

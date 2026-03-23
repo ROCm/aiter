@@ -149,7 +149,7 @@ def get_exclude_ops():
 
     for module in all_modules:
         if PREBUILD_KERNELS == 1:
-            if "_tune" in module or module == "module_gemm_mi350_a8w8_blockscale_asm":
+            if "_tune" in module:
                 exclude_ops.append(module)
             if "mha" in module and module not in [
                 "module_fmha_v3_fwd",
@@ -157,23 +157,16 @@ def get_exclude_ops():
             ]:
                 exclude_ops.append(module)
         elif PREBUILD_KERNELS == 2:
-            # Exclude _bwd, _tune, and specific module
-            if (
-                "_bwd" in module
-                or "_tune" in module
-                or module == "module_gemm_mi350_a8w8_blockscale_asm"
-            ):
+            # Exclude _bwd and _tune
+            if "_bwd" in module or "_tune" in module:
                 exclude_ops.append(module)
         elif PREBUILD_KERNELS == 3:
             # Keep only module_fmha_v3*
-            if not (
-                module.startswith("module_fmha_v3")
-                or module == "module_gemm_mi350_a8w8_blockscale_asm"
-            ):
+            if not module.startswith("module_fmha_v3"):
                 exclude_ops.append(module)
         else:
-            # Default behavior: exclude tunes and specific mi350 module
-            if "_tune" in module or module == "module_gemm_mi350_a8w8_blockscale_asm":
+            # Default behavior: exclude tunes
+            if "_tune" in module:
                 exclude_ops.append(module)
 
     return exclude_ops
