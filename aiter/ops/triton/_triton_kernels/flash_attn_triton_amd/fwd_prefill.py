@@ -80,7 +80,12 @@ def get_fwd_prefill_configs(autotune: bool):
             BLOCK_N = 64 if arch.name == "gfx1100" else 32
             return [
                 triton.Config(
-                    {"BLOCK_M": 128, "BLOCK_N": BLOCK_N, "PRE_LOAD_V": False, "waves_per_eu" : 6},
+                    {
+                        "BLOCK_M": 128,
+                        "BLOCK_N": BLOCK_N,
+                        "PRE_LOAD_V": False,
+                        "waves_per_eu": 6,
+                    },
                     num_stages=1,
                     num_warps=8,
                 ),
