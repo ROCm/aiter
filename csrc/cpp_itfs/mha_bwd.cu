@@ -531,7 +531,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
     if(mt == 3)
     {
-#if DISABLE_CK
+#if !ENABLE_CK
         bool is_top_left = (a.mask_type == static_cast<int>(mask_enum::mask_top_left) ||
                             a.mask_type == static_cast<int>(mask_enum::window_generic));
         auto [mask_y, mask_x] = compute_mask_coordinates(

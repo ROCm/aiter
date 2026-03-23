@@ -209,6 +209,8 @@ extern "C" __attribute__((visibility("default"))) void gemm_a16w16_asm(AiterTens
     AITER_CHECK(out->dtype() == AITER_DTYPE_fp32 || out->dtype() == AITER_DTYPE_bf16,
                 "GEMM A16W16 asm: out must be Float32 or Bf16, got ", AiterDtype_to_str(out->dtype()));
 
+    const HipDeviceGuard device_guard(A->device_id);
+
     std::string arch_id = get_gpu_arch();
     int Mdim            = A->size(0);
     int Ndim            = B->size(0);
@@ -240,9 +242,6 @@ extern "C" __attribute__((visibility("default"))) void gemm_a16w16_asm(AiterTens
         Mdim, Ndim, Kdim, config_map, arch_id, bpreshuffle, args.add_bias, splitK, kernelName);
     args.splitk              = split;
     AiterAsmKernel* impl_ptr = get_or_load_kernel(name, config_map, SUBM, SUBN);
-    int prev_device;
-    HIP_CALL(hipGetDevice(&prev_device));
-    HIP_CALL(hipSetDevice(A->device_id));
 
     int gdx = (Ndim + SUBN - 1) / SUBN;
     int gdy = (Mdim + SUBM - 1) / SUBM;
@@ -264,5 +263,4 @@ extern "C" __attribute__((visibility("default"))) void gemm_a16w16_asm(AiterTens
     size_t arg_size = sizeof(args);
     impl_ptr->launch_kernel({&args, &arg_size, gdx, gdy, gdz, 256, 1, 1, stream});
 
-    HIP_CALL(hipSetDevice(prev_device));
 }
