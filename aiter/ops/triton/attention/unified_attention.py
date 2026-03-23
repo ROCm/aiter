@@ -93,7 +93,7 @@ def select_2d_config(
     else:
         num_stages_2d = 3
         num_warps = 2
-        TILE_SIZE = min(triton.next_power_of_2(block_size), 64)
+        TILE_SIZE = min(64, triton.next_power_of_2(block_size))
 
     if max_seqlen_q >= 256:
         BLOCK_M = 128
@@ -116,7 +116,7 @@ def select_3d_config(
 ):
     reduce_num_warps = 2
     attn_warps = 2
-    TILE_SIZE = min(triton.next_power_of_2(block_size), 64)
+    TILE_SIZE = min(64, triton.next_power_of_2(block_size))
     # MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     num_segments = math.ceil(target_num_prgms / num_2d_prgms)
     num_segments = triton.next_power_of_2(num_segments)

@@ -114,6 +114,7 @@ def test_topk_softmax(dtype, token, E, topk, renormalize=True):
             and dtype in [dtypes.bf16, dtypes.fp32]
         ):
             continue
+        gating_output = gating_output.contiguous() if tag == "asm" else gating_output
         (topk_weights, topk_ids), us = func(gating_output, topk, renormalize)
         topk_ids = topk_ids.to(dtypes.i32)
         id, _ref = torch.sort(topk_ids)
@@ -178,7 +179,7 @@ def check_topk_softmax_allclose(
     is_close_i = torch.isclose(r_idx, t_idx)  # use high resolution for index
 
     scores_for_choice = scores.view(original_shape)
-    if bias != None:
+    if bias is not None:
         scores_for_choice = scores_for_choice + bias.unsqueeze(0)
 
     if is_close_v.all():
@@ -196,7 +197,6 @@ def check_topk_softmax_allclose(
         else:
             # this case there must be some duplicate value, and due to compare order, index maybe different
             mask = ~(is_close_i)
-            val_mask = torch.zeros(original_shape, dtype=torch.bool)
             mismatch_r = scores_for_choice.gather(-1, r_idx.to(dtype=torch.int64))[mask]
             mismatch_t = scores_for_choice.gather(-1, t_idx.to(dtype=torch.int64))[mask]
 
@@ -217,7 +217,7 @@ def check_topk_softmax_allclose(
                         if r_idx[i_row, i_col] != t_idx[i_row, i_col]:
                             sr = scores_for_choice[i_row, r_idx[i_row, i_col]]
                             st = scores_for_choice[i_row, t_idx[i_row, i_col]]
-                            is_close_ = torch.isclose(sr, st, rtol=rtol, atol=atol)
+                            torch.isclose(sr, st, rtol=rtol, atol=atol)
                             logger.info(
                                 f"{msg} [{i_row}x{i_col}], r:{r_idx[i_row, i_col]}->{sr}, t:{t_idx[i_row, i_col]}->{st}"
                             )
@@ -409,6 +409,130 @@ def test_grouped_topk(
     return {"err": err, "us": us_aiter}
 
 
+@perftest(num_iters=2, num_warmup=1)
+def test_nofuse_shared(
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_shared_experts: int,
+):
+    """Reference implementation with shared experts using PyTorch."""
+    num_routing_experts = gating_output.size(-1) - num_shared_experts
+
+    # Split routing and shared expert logits
+    routing_logits = gating_output[:, :num_routing_experts]
+    shared_logits = gating_output[:, num_routing_experts:]
+
+    # Process routing experts with softmax + topk
+    routing_probs = torch.nn.functional.softmax(routing_logits.float(), dim=-1)
+    topk_weights_routing, topk_indices = routing_probs.topk(
+        k=topk, dim=-1, largest=True, sorted=True
+    )
+
+    if renormalize:
+        topk_weights_routing = topk_weights_routing / topk_weights_routing.sum(
+            dim=-1, keepdim=True
+        )
+
+    # Process shared experts with sigmoid
+    shared_weights = torch.sigmoid(shared_logits.float())
+
+    # Concatenate routing and shared weights
+    topk_weights = torch.cat([topk_weights_routing, shared_weights], dim=-1)
+
+    return topk_weights, topk_indices.to(dtypes.i32)
+
+
+@perftest()
+def test_fuse_shared(
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_shared_experts: int,
+):
+    """AITER kernel with shared experts."""
+    M = gating_output.shape[0]
+    total_output_size = topk + num_shared_experts
+
+    topk_weights = torch.empty_strided(
+        (M, total_output_size),
+        (total_output_size + 10, 1),
+        dtype=dtypes.fp32,
+        device=gating_output.device,
+    )
+    topk_ids = torch.empty_strided(
+        (M, topk), (topk + 10, 1), dtype=dtypes.i32, device=gating_output.device
+    )
+    token_expert_indicies = torch.empty_strided(
+        (M, topk), (topk + 10, 1), dtype=dtypes.i32, device=gating_output.device
+    )
+
+    aiter.topk_softmax(
+        topk_weights,
+        topk_ids,
+        token_expert_indicies,
+        gating_output,
+        renormalize,
+        num_shared_experts,
+        "sigmoid",
+    )
+
+    return topk_weights, topk_ids
+
+
+@benchmark()
+def test_topk_softmax_shared_experts(
+    dtype, token, num_routing_experts, num_shared_experts, topk, renormalize=True
+):
+    """Test topk_softmax with shared expert sigmoid scoring."""
+    num_experts = num_routing_experts + num_shared_experts
+    gating_output = torch.randn((token, num_experts + 10), dtype=dtype, device="cuda")
+    gating_output = gating_output[:, :num_experts]
+
+    # Reference (PyTorch)
+    (topk_weights_ref, topk_ids_ref), us_ref = test_nofuse_shared(
+        gating_output, topk, renormalize, num_shared_experts
+    )
+
+    # AITER kernel
+    (topk_weights_aiter, topk_ids_aiter), us_aiter = test_fuse_shared(
+        gating_output, topk, renormalize, num_shared_experts
+    )
+
+    ret = {}
+
+    # Split routing and shared weights for comparison
+    routing_weights_ref = topk_weights_ref[:, :topk]
+    routing_weights_aiter = topk_weights_aiter[:, :topk]
+
+    # Check routing weights (sort by indices first for fair comparison)
+    id_ref_sorted, _ref = torch.sort(topk_ids_ref)
+    id_aiter_sorted, _aiter = torch.sort(topk_ids_aiter)
+    w_ref_sorted = routing_weights_ref.gather(1, _ref)
+    w_aiter_sorted = routing_weights_aiter.gather(1, _aiter)
+
+    ret["routing_err"] = checkAllclose(
+        w_ref_sorted, w_aiter_sorted, msg="routing_weights [ref vs aiter]"
+    )
+    checkAllclose(id_ref_sorted, id_aiter_sorted, msg="routing_ids [ref vs aiter]")
+
+    # Check shared weights
+    if num_shared_experts > 0:
+        shared_weights_ref = topk_weights_ref[:, topk:]
+        shared_weights_aiter = topk_weights_aiter[:, topk:]
+        ret["shared_err"] = checkAllclose(
+            shared_weights_ref,
+            shared_weights_aiter,
+            msg=f"shared_weights [ref vs aiter]: {us_ref:>8.2f} us vs {us_aiter:>8.2f} us",
+        )
+
+    ret["us_ref"] = us_ref
+    ret["us_aiter"] = us_aiter
+    ret["speedup"] = us_ref / us_aiter if us_aiter > 0 else 0
+
+    return ret
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -523,3 +647,36 @@ for token in args.token:
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("moeTopkSoftmax_grouped_topk summary (markdown):\n%s", df_md)
+
+# Test shared expert sigmoid scoring
+aiter.logger.info("\n" + "=" * 70)
+aiter.logger.info("Testing topk_softmax with shared expert sigmoid scoring")
+aiter.logger.info("=" * 70)
+
+df = []
+# Test configurations: (num_routing_experts, num_shared_experts, topk, dtype, renormalize)
+shared_expert_configs = [
+    (8, 2, 2, dtypes.bf16, False),
+    (16, 2, 4, dtypes.bf16, True),
+    (32, 4, 8, dtypes.fp32, False),
+    (64, 4, 16, dtypes.fp32, True),
+    (8, 0, 2, dtypes.bf16, False),  # No shared experts (backward compatibility)
+    (16, 0, 4, dtypes.bf16, True),  # No shared experts (backward compatibility)
+]
+
+for token in [128, 256, 512, 1024]:
+    for num_routing, num_shared, topk, dtype, renorm in shared_expert_configs:
+        ret = test_topk_softmax_shared_experts(
+            dtype, token, num_routing, num_shared, topk, renorm
+        )
+        ret["token"] = token
+        ret["routing_experts"] = num_routing
+        ret["shared_experts"] = num_shared
+        ret["topk"] = topk
+        ret["dtype"] = str(dtype)
+        ret["renorm"] = renorm
+        df.append(ret)
+
+df = pd.DataFrame(df)
+df_md = df.to_markdown(index=False)
+aiter.logger.info("moeTopkSoftmax_shared_experts summary (markdown):\n%s", df_md)
