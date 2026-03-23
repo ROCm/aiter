@@ -3,8 +3,11 @@
 import functools
 import os
 import re
+import shutil
 import subprocess
+import sys
 
+from typing import Optional
 from cpp_extension import executable_path
 from torch_guard import torch_compile_guard
 
@@ -30,23 +33,82 @@ GFX_MAP = {
 }
 
 
-@functools.lru_cache(maxsize=1)
-def _detect_native() -> list[str]:
-    try:
-        rocminfo = executable_path("rocminfo")
+def _run_gpu_info_tool() -> str:
+    """
+    Run rocminfo (Linux) or hipinfo (Windows) and return stdout.
+    rocminfo is not shipped with the Windows ROCm SDK; hipinfo is the
+    equivalent tool available there.
+    """
+    # Try rocminfo first (Linux / full ROCm installs)
+    rocminfo_path = shutil.which("rocminfo")
+    if rocminfo_path is None and sys.platform != "win32":
+        # On Linux also try via executable_path which searches ROCM_HOME/bin
+        try:
+            rocminfo_path = executable_path("rocminfo")
+        except Exception:
+            pass
+
+    if rocminfo_path is not None:
         result = subprocess.run(
-            [rocminfo],
+            [rocminfo_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            check=True,
         )
-        for line in result.stdout.splitlines():
-            if "gfx" in line.lower():
-                return [line.split(":", 1)[-1].strip()]
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout
+
+    # Fall back to hipinfo (Windows ROCm SDK)
+    hipinfo_path = shutil.which("hipinfo")
+    if hipinfo_path is not None:
+        result = subprocess.run(
+            [hipinfo_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout
+
+    raise RuntimeError(
+        "Could not find rocminfo or hipinfo in PATH. "
+        "Please ensure the ROCm/HIP SDK bin directory is on your PATH "
+        "(e.g. C:\\Program Files\\AMD\\ROCm\\<ver>\\bin on Windows)."
+    )
+
+
+def _extract_gfx_from_output(output: str) -> Optional[str]:
+    """
+    Parse a gfx architecture string out of rocminfo or hipinfo output.
+    """
+    for line in output.splitlines():
+        match = re.search(r"\b(gfx\w+)\b", line, re.IGNORECASE)
+        if match:
+            return match.group(1).lower()
+    return None
+
+
+def _extract_cu_from_output(output: str) -> Optional[int]:
+    """
+    Parse the Compute Unit count out of rocminfo or hipinfo output.
+    """
+    for line in output.splitlines():
+        match = re.search(r"Compute Units?\s*:+\s*(\d+)", line, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+@functools.lru_cache(maxsize=1)
+def _detect_native() -> list[str]:
+    try:
+        output = _run_gpu_info_tool()
+        gfx = _extract_gfx_from_output(output)
+        if gfx is not None:
+            return [gfx]
     except Exception as e:
-        raise RuntimeError(f"Get GPU arch from rocminfo failed: {e}") from e
-    raise RuntimeError("No gfx arch found in rocminfo output.")
+        raise RuntimeError(f"Get GPU arch from rocminfo/hipinfo failed: {e}") from e
+    raise RuntimeError("No gfx arch found in rocminfo/hipinfo output.")
 
 
 @torch_compile_guard()
@@ -58,30 +120,25 @@ def get_gfx_custom_op() -> int:
 def get_gfx_custom_op_core() -> int:
     gfx = os.getenv("GPU_ARCHS", "native")
     gfx_mapping = {v: k for k, v in GFX_MAP.items()}
-    # gfx = os.getenv("GPU_ARCHS", "native")
+
     if gfx == "native":
         try:
-            rocminfo = executable_path("rocminfo")
-            result = subprocess.run(
-                [rocminfo], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
-            output = result.stdout
-            for line in output.split("\n"):
-                match = re.search(r"\b(gfx\w+)\b", line, re.IGNORECASE)
-                if match:
-                    gfx_arch = match.group(1).lower()
-                    try:
-                        return gfx_mapping[gfx_arch]
-                    except KeyError:
-                        raise KeyError(
-                            f"Unknown GPU architecture: {gfx_arch}. "
-                            f"Supported architectures: {list(gfx_mapping.keys())}"
-                        )
-
+            output = _run_gpu_info_tool()
+            gfx_arch = _extract_gfx_from_output(output)
+            if gfx_arch is None:
+                raise RuntimeError("No gfx arch found in rocminfo/hipinfo output.")
+            try:
+                return gfx_mapping[gfx_arch]
+            except KeyError:
+                raise KeyError(
+                    f"Unknown GPU architecture: {gfx_arch}. "
+                    f"Supported architectures: {list(gfx_mapping.keys())}"
+                )
         except Exception as e:
-            raise RuntimeError(f"Get GPU arch from rocminfo failed {str(e)}")
+            raise RuntimeError(f"Get GPU arch from rocminfo/hipinfo failed: {e}")
     elif ";" in gfx:
         gfx = gfx.split(";")[-1]
+
     try:
         return gfx_mapping[gfx]
     except KeyError:
@@ -99,7 +156,6 @@ def get_gfx():
 
 @functools.lru_cache(maxsize=1)
 def get_gfx_list() -> list[str]:
-
     gfx_env = os.getenv("GPU_ARCHS", "native")
     if gfx_env == "native":
         try:
@@ -109,7 +165,6 @@ def get_gfx_list() -> list[str]:
     else:
         gfxs = [g.strip() for g in gfx_env.split(";") if g.strip()]
     os.environ["AITER_GPU_ARCHS"] = ";".join(gfxs)
-
     return gfxs
 
 
@@ -118,23 +173,28 @@ def get_cu_num_custom_op() -> int:
     cu_num = int(os.getenv("CU_NUM", 0))
     if cu_num == 0:
         try:
-            rocminfo = executable_path("rocminfo")
-            result = subprocess.run(
-                [rocminfo], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
-            output = result.stdout
+            output = _run_gpu_info_tool()
+            # rocminfo groups by Agent; collect CU counts for GPU agents only
             devices = re.split(r"Agent\s*\d+", output)
             gpu_compute_units = []
             for device in devices:
-                for line in device.split("\n"):
-                    if "Device Type" in line and line.find("GPU") != -1:
-                        match = re.search(r"Compute Unit\s*:\s*(\d+)", device)
-                        if match:
-                            gpu_compute_units.append(int(match.group(1)))
-                        break
+                if "Device Type" in device and "GPU" in device:
+                    cu = _extract_cu_from_output(device)
+                    if cu is not None:
+                        gpu_compute_units.append(cu)
+            # hipinfo doesn't have the Agent split — fall back to global scan
+            if not gpu_compute_units:
+                cu = _extract_cu_from_output(output)
+                if cu is not None:
+                    gpu_compute_units.append(cu)
         except Exception as e:
-            raise RuntimeError(f"Get GPU Compute Unit from rocminfo failed {str(e)}")
-        assert len(set(gpu_compute_units)) == 1
+            raise RuntimeError(f"Get GPU Compute Unit from rocminfo/hipinfo failed: {e}")
+
+        if not gpu_compute_units:
+            raise RuntimeError("Could not determine Compute Unit count from GPU info output.")
+        assert len(set(gpu_compute_units)) == 1, (
+            f"Multiple different CU counts found: {gpu_compute_units}"
+        )
         cu_num = gpu_compute_units[0]
     return cu_num
 
@@ -168,10 +228,27 @@ def get_device_name():
     gfx = get_gfx()
 
     if gfx == "gfx942":
-        chip_id = _get_pci_chip_id()
-        if chip_id in MI308_CHIP_IDS:
-            return "MI308"
-        return "MI300"
+        if sys.platform == "win32":
+            # libamdhip64.so ctypes probe is Linux-only; identify the SKU by
+            # Compute Unit count instead.  Known gfx942 SKU map:
+            #   304 CU -> MI300X
+            #   228 CU -> MI300A
+            #    80 CU -> MI308X
+            #    64 CU -> MI308  (smaller variant)
+            cu = get_cu_num()
+            if cu == 304:
+                return "MI300X"
+            elif cu == 228:
+                return "MI300A"
+            elif cu in (80, 64):
+                return "MI308"
+            else:
+                return f"MI300-family (gfx942, {cu} CUs)"
+        else:
+            chip_id = _get_pci_chip_id()
+            if chip_id in MI308_CHIP_IDS:
+                return "MI308"
+            return "MI300"
     elif gfx == "gfx950":
         return "MI350"
     else:
