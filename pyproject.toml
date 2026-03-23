@@ -8,7 +8,7 @@ requires = [
     "psutil",
     "ninja",
     "pandas",
-    "flydsl @ https://rocm.frameworks-nightlies.amd.com/whl/gfx942-gfx950/flydsl-0.1.0%2B20260318.2ca3913-cp312-cp312-manylinux_2_35_x86_64.whl"
+    "flydsl==0.1.1"
 ]
 
 [tool.setuptools_scm]
