@@ -19,10 +19,12 @@ def topk_softmax(
     token_expert_indices: Tensor,
     gating_output: Tensor,
     need_renorm: bool,
+    num_shared_experts: int = 0,
+    shared_expert_scoring_func: str = "",
 ) -> None: ...
 
 
-@compile_ops("module_moe_asm")
+@compile_ops("module_moe_asm", fc_name="topk_softmax_asm", ffi_type="ctypes")
 def topk_softmax_asm(
     topk_weights: Tensor,
     topk_indices: Tensor,

@@ -982,6 +982,11 @@ template<> struct finfo<bf8_t> {
     OPUS_H_D static constexpr float tiny() { return __builtin_bit_cast(float, 0x38800000u); }  // 2^-14
 #endif
 };
+template<> struct finfo<i8_t> {
+    static constexpr int bits = 8;
+    OPUS_H_D static constexpr float max()  { return 127.0f; }
+    OPUS_H_D static constexpr float min()  { return -128.0f; }
+};
 
 template<typename C, typename... S, std::enable_if_t<is_dtype_v<C> && (is_constant_v<S> && ...), bool> = true>
 OPUS_H_D constexpr auto slice(C&& container, S&&.../*ss*/) { return container; }    // TODO: fallback slice a normal value does nonthing
@@ -1032,6 +1037,9 @@ OPUS_D auto fp8_to_fp32(const fp8_t& x) {
     int w = static_cast<int>(__builtin_bit_cast(unsigned char, x));
     return __builtin_amdgcn_cvt_f32_fp8(w, /*byte=*/0);
 }
+OPUS_D constexpr auto fp32_to_fp32(const fp32_t& x) { return x; }
+OPUS_D constexpr auto fp32_to_i8(const fp32_t& x) { return static_cast<i8_t>(x); }
+OPUS_D constexpr auto i8_to_fp32(const i8_t& x) { return static_cast<fp32_t>(x); }
 #pragma clang diagnostic pop
 
 #define OPUS_CAST_DEFINE(d_, s_) template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, s_ ## _t> && std::is_same_v<D, d_ ## _t>, bool> = true> \
@@ -1042,6 +1050,9 @@ OPUS_CAST_DEFINE(bf16, fp32)
 OPUS_CAST_DEFINE(fp32, bf16)
 OPUS_CAST_DEFINE(fp8, fp32)
 OPUS_CAST_DEFINE(fp32, fp8)
+OPUS_CAST_DEFINE(fp32, fp32)
+OPUS_CAST_DEFINE(i8, fp32)
+OPUS_CAST_DEFINE(fp32, i8)
 
 namespace impl {
 // implement a "pack" of data, storage should pad to multiple of byte(8bit)
@@ -1219,7 +1230,7 @@ OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x8(const S& s, float scale = 
 
 template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, bf16x2_t>, bool> = true>
 OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) {
-    union { unsigned int bitwise; fp4_t f4_pack[4]; } value;
+    union { unsigned int bitwise; fp4_t fp4_pack[4]; } value;
     value.bitwise = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(value.bitwise, s, scale, sel);
     return value.fp4_pack[0];
 }
