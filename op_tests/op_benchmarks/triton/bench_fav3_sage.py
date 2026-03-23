@@ -234,7 +234,7 @@ def sparse_flops_from_lut(
 ) -> Tuple[float, float]:
     """Return (sparse_flops, total_flops_dense). Uses config BLOCK_M, BLOCK_N."""
     kv_block_indices, lut_start, lut_count = block_lut
-    num_sparse_pairs = kv_block_indices.numel()
+    num_sparse_pairs = lut_count.sum()
     config = get_sage_fwd_configs()
     BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
     num_q_blocks = (N_CTX_Q + BLOCK_M - 1) // BLOCK_M
@@ -463,7 +463,7 @@ def fav3_sage_forward_func(
         v,
         softmax_scale,
         causal=False,
-        inference_mode=True,
+        return_lse=False,
         layout=layout,
         block_lut=block_lut,
     )
