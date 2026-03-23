@@ -12,7 +12,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 from .utils import is_flydsl_available
 
-_REQUIRED_FLYDSL_VERSION = "0.1.1.dev387"
+_REQUIRED_FLYDSL_VERSION = "0.1.1"
 
 __all__ = [
     "is_flydsl_available",
