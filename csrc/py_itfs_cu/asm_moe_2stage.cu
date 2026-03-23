@@ -162,6 +162,7 @@ extern "C" __attribute__((visibility("default"))) void moe_stage1_g1u1(
     AiterTensor *sorted_weights, // [max_num_tokens_padded], do_weight==true need
     hipStream_t stream)
 {
+    const HipDeviceGuard device_guard(input->device_id);
     ActivationType act = static_cast<ActivationType>(activation);
     QuantType qt = static_cast<QuantType>(quant_type);
 

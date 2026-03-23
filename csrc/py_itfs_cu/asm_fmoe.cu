@@ -345,6 +345,7 @@ extern "C" __attribute__((visibility("default"))) void fmoe(
     int topk,
     hipStream_t stream)
 {
+    const HipDeviceGuard device_guard(input->device_id);
     // g1u0
     FMoeKernel* impl_ptr = nullptr;
     if(input->dtype() == AITER_DTYPE_fp16)
@@ -392,6 +393,7 @@ extern "C" __attribute__((visibility("default"))) void fmoe_int8_g1u0(
     int activation,
     hipStream_t stream)
 {
+    const HipDeviceGuard device_guard(input->device_id);
     ActivationType act = static_cast<ActivationType>(activation);
     FMoeKernel* impl_ptr = nullptr;
     int inter_dim        = down->size(2);
@@ -515,6 +517,7 @@ extern "C" __attribute__((visibility("default"))) void fmoe_g1u1(
     int activation,
     hipStream_t stream)
 {
+    const HipDeviceGuard device_guard(input->device_id);
     ActivationType act = static_cast<ActivationType>(activation);
     struct FMoeKernelConfig
     {
@@ -651,6 +654,7 @@ extern "C" __attribute__((visibility("default"))) void fmoe_g1u1_tkw1(
     int activation,
     hipStream_t stream)
 {
+    const HipDeviceGuard device_guard(input->device_id);
     ActivationType act = static_cast<ActivationType>(activation);
     FMoeKernel* impl_ptr = nullptr;
     CFG* config_map      = nullptr;
@@ -715,6 +719,7 @@ extern "C" __attribute__((visibility("default"))) void fmoe_int8_g1u0_a16(
     AiterTensor* fc2_smooth_scale,  // [expert, 1, inter_dim]
     hipStream_t stream)
 {
+    const HipDeviceGuard device_guard(input->device_id);
     static FMoeKernel impl("fmoe_kernel_func", "fmoe_int8_g1u0_smf.co");
     impl.launch_kernel<1, 2, true>(out,
                                    input,
@@ -750,6 +755,7 @@ extern "C" __attribute__((visibility("default"))) void fmoe_g1u1_a16(
     int activation,
     hipStream_t stream)
 {
+    const HipDeviceGuard device_guard(input->device_id);
     ActivationType act = static_cast<ActivationType>(activation);
     FMoeKernel* impl_ptr = nullptr;
     int inter_dim        = down->size(2);
@@ -826,6 +832,7 @@ extern "C" __attribute__((visibility("default"))) void fmoe_fp8_blockscale_g1u1(
     int block_size_M,
     hipStream_t stream)
 {
+    const HipDeviceGuard device_guard(input->device_id);
     ActivationType act = static_cast<ActivationType>(activation);
     FMoeKernel* impl_ptr     = nullptr;
     CFG* config_map          = nullptr;
