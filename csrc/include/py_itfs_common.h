@@ -44,7 +44,7 @@ const constexpr auto torch_fp4x2  = torch::kUInt8;
 #endif
 
 // clang-format off
-#if !DISABLE_CK
+#if ENABLE_CK
 template <typename T> struct t2ck;
 template <> struct t2ck<float> { using type = ck_tile::fp32_t; };
 template <> struct t2ck<c10::Half> { using type = ck_tile::fp16_t; };

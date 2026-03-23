@@ -836,7 +836,6 @@ def _fused_dynamic_mxfp4_quant_moe_sort_kernel(
     stride_o0,  #: tl.constexpr,
     stride_o4,  #: tl.constexpr,
     token_num,  #: tl.constexpr,
-    M_i,  #: tl.constexpr,
     N_i,  #: tl.constexpr,
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
     BLOCK_SIZE_Mx: tl.constexpr,
