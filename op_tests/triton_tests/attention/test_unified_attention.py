@@ -243,7 +243,6 @@ def ref_paged_attn(
 @pytest.mark.parametrize("shuffled_kv_cache", [True, False])
 @pytest.mark.parametrize(
     "backend, use_tdm, num_tdm_gather, use_async",
-    "backend, use_tdm, num_tdm_gather, use_async",
     [
         # ("triton", False, 1, False),  # use triton
         # ("gluon", False, 1, False),  # use gluon baseline
