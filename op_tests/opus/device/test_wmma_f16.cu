@@ -2,46 +2,59 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 /**
- * @file test_mfma_f32.cu
- * @brief OPUS MFMA f32 variants: 32x32x2, 16x16x4 (gfx942 + gfx950).
+ * @file test_wmma_f16.cu
+ * @brief OPUS WMMA fp16/bf16 16x16x32 variants (gfx1250 only, wave32).
  */
 
 #ifdef __HIP_DEVICE_COMPILE__
 // ── Device pass ─────────────────────────────────────────────────────────────
 #include "opus/opus.hpp"
-#if defined(__gfx942__) || defined(__gfx9_4_generic__) || defined(__gfx950__)
+#if defined(__gfx1250__)
 
 template<typename DIN, typename DOUT, int WM, int WN, int WK>
-__global__ void mfma_kernel_generic(
+__global__ void wmma_kernel_generic(
     const DIN* __restrict__ ptr_a,
     const DIN* __restrict__ ptr_b,
     DOUT* __restrict__ ptr_c,
-    int k, int stride_a, int stride_b, int stride_c)
+    int k,
+    int stride_a,
+    int stride_b,
+    int stride_c)
 {
     using opus::operator""_I;
-    constexpr int BLOCK_M = WM, BLOCK_N = WN, BLOCK_K = WK;
+    constexpr int BLOCK_M = WM;
+    constexpr int BLOCK_N = WN;
+    constexpr int BLOCK_K = WK;
     constexpr int T_M = 1, T_N = 1, T_K = 1;
     constexpr int E_M = BLOCK_M / (WM * T_M);
     constexpr int E_N = BLOCK_N / (WN * T_N);
     constexpr int E_K = BLOCK_K / (WK * T_K);
-    constexpr int ELEM_A = WM * WK / 64;
-    constexpr int ELEM_B = WN * WK / 64;
 
-    using d_a = DIN; using d_b = DIN; using d_c = opus::fp32_t;
+    // wave32: pack_a = min(16/sizeof(DIN), WM*WK/32)
+    // For f16 16x16x32: elem=16, pack=8 (4 dwords = 128-bit vector load)
+    constexpr int ELEM_A = WM * WK / 32;
+    constexpr int ELEM_B = WN * WK / 32;
+    constexpr int PACK_A = (16 / static_cast<int>(sizeof(DIN)) < ELEM_A) ? 16 / static_cast<int>(sizeof(DIN)) : ELEM_A;
+    constexpr int PACK_B = PACK_A;
+
+    using d_a = DIN;
+    using d_b = DIN;
+    using d_c = opus::fp32_t;
 
     int lane_id = static_cast<int>(__builtin_amdgcn_workitem_id_x() % opus::get_warp_size());
     int wave_id = static_cast<int>(__builtin_amdgcn_workitem_id_x() / opus::get_warp_size());
     int g_im = __builtin_amdgcn_workgroup_id_x() * BLOCK_M;
     int g_in = __builtin_amdgcn_workgroup_id_y() * BLOCK_N;
 
-    auto mma = opus::make_tiled_mma<d_a, d_b, d_c>(
-        opus::seq<E_M, E_N, E_K>{}, opus::seq<T_M, T_N, T_K>{},
-        opus::seq<WM, WN, WK>{}, opus::mfma_adaptor_swap_ab{});
+    auto mma = opus::make_tiled_mma(
+        opus::make_wmma<d_a, d_b, d_c>(opus::seq<WM, WN, WK>{}, opus::wmma_adaptor_swap_ab{}),
+        opus::seq<E_M, E_N, E_K>{},
+        opus::seq<T_M, T_N, T_K>{});
 
-    auto u_a = opus::partition_layout_a<ELEM_A>(
+    auto u_a = opus::partition_layout_a<PACK_A>(
         mma, opus::make_tuple(stride_a, 1_I),
         opus::make_tuple(wave_id / 2, lane_id % mma.grpm_a, 0_I, lane_id / mma.grpm_a));
-    auto u_b = opus::partition_layout_b<ELEM_B>(
+    auto u_b = opus::partition_layout_b<PACK_B>(
         mma, opus::make_tuple(stride_b, 1_I),
         opus::make_tuple(wave_id % 2, lane_id % mma.grpn_b, 0_I, lane_id / mma.grpn_b));
     auto u_c = opus::partition_layout_c(
@@ -57,32 +70,27 @@ __global__ void mfma_kernel_generic(
     opus::clear(v_c);
 
     for (int i = 0; i < loops; i++) {
-        auto v_a = g_a.template load<ELEM_A>(u_a); u_a += BLOCK_K;
-        auto v_b = g_b.template load<ELEM_B>(u_b); u_b += BLOCK_K;
+        auto v_a = g_a.template load<PACK_A>(u_a);
+        u_a += BLOCK_K;
+        auto v_b = g_b.template load<PACK_B>(u_b);
+        u_b += BLOCK_K;
         v_c = mma(v_a, v_b, v_c);
     }
 
-    if constexpr (std::is_same_v<DOUT, d_c>) {
-        g_c.template store<4>(v_c, u_c);
-    } else if constexpr (std::is_same_v<DIN, opus::bf16_t>) {
-        auto v_c_out = opus::cast<DOUT>(v_c, 0_I);
-        g_c.template store<4>(v_c_out, u_c);
-    } else {
-        auto v_c_out = opus::cast<DOUT>(v_c);
-        g_c.template store<4>(v_c_out, u_c);
-    }
+    g_c.template store<4>(v_c, u_c);
 }
 
-template __global__ void mfma_kernel_generic<opus::fp32_t, opus::fp32_t, 32, 32, 2>(
-    const opus::fp32_t*, const opus::fp32_t*, opus::fp32_t*, int, int, int, int);
-template __global__ void mfma_kernel_generic<opus::fp32_t, opus::fp32_t, 16, 16, 4>(
-    const opus::fp32_t*, const opus::fp32_t*, opus::fp32_t*, int, int, int, int);
-#endif // gfx942 / gfx950 guard
+// fp16 16x16x32
+template __global__ void wmma_kernel_generic<opus::fp16_t, opus::fp32_t, 16, 16, 32>(
+    const opus::fp16_t*, const opus::fp16_t*, opus::fp32_t*, int, int, int, int);
+// bf16 16x16x32
+template __global__ void wmma_kernel_generic<opus::bf16_t, opus::fp32_t, 16, 16, 32>(
+    const opus::bf16_t*, const opus::bf16_t*, opus::fp32_t*, int, int, int, int);
+#endif // gfx1250 guard
 
 #else
 // ── Host pass ───────────────────────────────────────────────────────────────
 #include "opus/opus.hpp"
-// #include <hip/hip_runtime.h>   // replaced by hip_host_minimal.h for faster builds
 #include "hip_host_minimal.h"
 #include <cstdio>
 
@@ -95,33 +103,34 @@ template __global__ void mfma_kernel_generic<opus::fp32_t, opus::fp32_t, 16, 16,
 } while(0)
 
 template<typename DIN, typename DOUT, int WM, int WN, int WK>
-__global__ void mfma_kernel_generic(
+__global__ void wmma_kernel_generic(
     const DIN* __restrict__ ptr_a, const DIN* __restrict__ ptr_b,
     DOUT* __restrict__ ptr_c,
     int k, int stride_a, int stride_b, int stride_c) {}
 
-extern "C" void run_mfma_32x32x2_f32(
+extern "C" void run_wmma_16x16x32_f16(
     const void* d_a, const void* d_b, void* d_c,
     int stride_a, int stride_b, int stride_c)
 {
-    const auto* a = static_cast<const opus::fp32_t*>(d_a);
-    const auto* b = static_cast<const opus::fp32_t*>(d_b);
+    const auto* a = static_cast<const opus::fp16_t*>(d_a);
+    const auto* b = static_cast<const opus::fp16_t*>(d_b);
     auto* c = static_cast<opus::fp32_t*>(d_c);
-    hipLaunchKernelGGL((mfma_kernel_generic<opus::fp32_t, opus::fp32_t, 32, 32, 2>),
-                       dim3(1, 1), 64, 0, 0, a, b, c, 2, stride_a, stride_b, stride_c);
+    // wave32: launch with 32 threads per wave
+    hipLaunchKernelGGL((wmma_kernel_generic<opus::fp16_t, opus::fp32_t, 16, 16, 32>),
+                       dim3(1, 1), 32, 0, 0, a, b, c, 32, stride_a, stride_b, stride_c);
     HIP_CALL(hipGetLastError());
     HIP_CALL(hipDeviceSynchronize());
 }
 
-extern "C" void run_mfma_16x16x4_f32(
+extern "C" void run_wmma_16x16x32_bf16(
     const void* d_a, const void* d_b, void* d_c,
     int stride_a, int stride_b, int stride_c)
 {
-    const auto* a = static_cast<const opus::fp32_t*>(d_a);
-    const auto* b = static_cast<const opus::fp32_t*>(d_b);
+    const auto* a = static_cast<const opus::bf16_t*>(d_a);
+    const auto* b = static_cast<const opus::bf16_t*>(d_b);
     auto* c = static_cast<opus::fp32_t*>(d_c);
-    hipLaunchKernelGGL((mfma_kernel_generic<opus::fp32_t, opus::fp32_t, 16, 16, 4>),
-                       dim3(1, 1), 64, 0, 0, a, b, c, 4, stride_a, stride_b, stride_c);
+    hipLaunchKernelGGL((wmma_kernel_generic<opus::bf16_t, opus::fp32_t, 16, 16, 32>),
+                       dim3(1, 1), 32, 0, 0, a, b, c, 32, stride_a, stride_b, stride_c);
     HIP_CALL(hipGetLastError());
     HIP_CALL(hipDeviceSynchronize());
 }
