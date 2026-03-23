@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import functools
 import os
 import re
@@ -145,15 +145,33 @@ def get_cu_num():
     return cu_num
 
 
+def _get_pci_chip_id(device_id=0):
+    import ctypes
+
+    libhip = ctypes.CDLL("libamdhip64.so")
+    chip_id = ctypes.c_int(0)
+    hipDeviceAttributePciChipId = 10019
+    err = libhip.hipDeviceGetAttribute(
+        ctypes.byref(chip_id),
+        hipDeviceAttributePciChipId,
+        device_id,
+    )
+    if err != 0:
+        raise RuntimeError(f"hipDeviceGetAttribute(PciChipId) failed with error {err}")
+    return chip_id.value
+
+
+MI308_CHIP_IDS = {0x74A2, 0x74A8, 0x74B6, 0x74BC}
+
+
 def get_device_name():
     gfx = get_gfx()
 
     if gfx == "gfx942":
-        cu = get_cu_num()
-        if cu == 304:
-            return "MI300"
-        elif cu == 80 or cu == 64:
+        chip_id = _get_pci_chip_id()
+        if chip_id in MI308_CHIP_IDS:
             return "MI308"
+        return "MI300"
     elif gfx == "gfx950":
         return "MI350"
     else:
