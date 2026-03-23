@@ -446,7 +446,6 @@ namespace py = pybind11;
           py::arg("kernelName")  = std::nullopt, \
           py::arg("bpreshuffle") = false);
 
-
 #define FLATMM_A8W8_BLOCKSCALE_ASM_PYBIND \
     m.def("flatmm_a8w8_blockscale_asm",   \
           &flatmm_a8w8_blockscale_asm,    \
@@ -456,7 +455,6 @@ namespace py = pybind11;
           py::arg("x_scale"),             \
           py::arg("w_scale"),             \
           py::arg("Out"));
-
 
 #define GEMM_A4W4_BLOCKSCALE_PYBIND \
     m.def("gemm_a4w4_blockscale",   \
@@ -1713,27 +1711,8 @@ namespace py = pybind11;
           py::arg("numRows"),           \
           py::arg("stride0"),           \
           py::arg("stride1"));          \
-    m.def("top_k_per_row_prefill_fast", \
-          &top_k_per_row_prefill_fast,  \
-          py::arg("logits"),            \
-          py::arg("rowStarts"),         \
-          py::arg("rowEnds"),           \
-          py::arg("indices"),           \
-          py::arg("values"),            \
-          py::arg("numRows"),           \
-          py::arg("stride0"),           \
-          py::arg("stride1"));          \
     m.def("top_k_per_row_decode",       \
           &top_k_per_row_decode,        \
-          py::arg("logits"),            \
-          py::arg("next_n"),            \
-          py::arg("seqLens"),           \
-          py::arg("indices"),           \
-          py::arg("numRows"),           \
-          py::arg("stride0"),           \
-          py::arg("stride1"));          \
-    m.def("top_k_per_row_decode_fast",  \
-          &top_k_per_row_decode_fast,   \
           py::arg("logits"),            \
           py::arg("next_n"),            \
           py::arg("seqLens"),           \
