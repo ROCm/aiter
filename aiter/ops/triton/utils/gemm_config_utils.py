@@ -50,6 +50,7 @@ def get_gemm_config(
     K: int | None = None,
     bounds: tuple[int, ...] | None = None,
     specialized_filename: str | None = None,
+    use_gluon_config: bool = False,
 ) -> tuple[dict, bool]:
     """
     Load a GEMM configuration using the standardized M_LEQ_x/M_GEQ_y/any format.
@@ -70,6 +71,8 @@ def get_gemm_config(
         K: K dimension of the GEMM (optional)
         bounds: Custom bounds to use instead of STANDARD_M_BOUNDS (optional)
         specialized_filename: Custom specialized filename suffix (optional)
+        use_gluon_config: If True, load configs from the gluon subdirectory
+            (gemm/gluon/) instead of the default (gemm/). Defaults to False.
 
     Returns:
         Dictionary with the config params,
@@ -89,13 +92,14 @@ def get_gemm_config(
         get_gemm_config._config_cache = {}
 
     dev = arch_info.get_arch()
-    cache_key = f"{dev}_{config_name}"
+    config_subdir = "gemm/gluon" if use_gluon_config else "gemm"
+    cache_key = f"{dev}_{config_name}{'_gluon' if use_gluon_config else ''}"
 
     if cache_key not in get_gemm_config._config_cache:
         get_gemm_config._config_cache[cache_key] = {}
 
         # Load default config (must exist)
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}.json"
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{config_subdir}/{dev}-{config_name}.json"
         _load_config_file(
             get_gemm_config._config_cache,
             cache_key,
@@ -110,7 +114,7 @@ def get_gemm_config(
     if specialized_filename is not None:
         spec_key = specialized_filename
         if spec_key not in get_gemm_config._config_cache[cache_key]:
-            fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}-{specialized_filename}.json"
+            fpath = f"{AITER_TRITON_CONFIGS_PATH}/{config_subdir}/{dev}-{config_name}-{specialized_filename}.json"
             if _load_config_file(
                 get_gemm_config._config_cache, cache_key, fpath, spec_key
             ):
@@ -123,7 +127,7 @@ def get_gemm_config(
         if nk_key not in get_gemm_config._config_cache[cache_key]:
             # load specialized config
             fpath = (
-                f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}-N={N}-K={K}.json"
+                f"{AITER_TRITON_CONFIGS_PATH}/{config_subdir}/{dev}-{config_name}-N={N}-K={K}.json"
             )
             if _load_config_file(
                 get_gemm_config._config_cache, cache_key, fpath, nk_key
