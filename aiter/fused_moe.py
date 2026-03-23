@@ -884,7 +884,11 @@ def get_2stage_cfgs(
                 run_1stage = token < 256
 
         block_m = (
-            BLOCK_SIZE_M
+            ( 
+                (64 if token*topk/expert > 32 else BLOCK_SIZE_M)
+                if q_type == QuantType.per_1x128 and use_g1u1 and q_dtype_w == torch.float8_e4m3fn
+                else BLOCK_SIZE_M
+            )
             if run_1stage
             else (
                 (64 if token > 32 else 16)
