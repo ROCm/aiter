@@ -256,9 +256,10 @@ class TDMKVLoaderConfig:
                 gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
             )
         else:
+            padding = 8 if cfg.Q_FP8 else 8
             self.shared_k_layout = gl.constexpr(
                 gl.PaddedSharedLayout.with_identity_for(
-                    [[cfg.HEAD_SIZE, 16]], [cfg.BLOCK_SIZE, cfg.HEAD_SIZE], [1, 0]
+                    [[cfg.HEAD_SIZE, padding]], [cfg.BLOCK_SIZE, cfg.HEAD_SIZE], [1, 0]
                 )
             )
             self.shared_v_layout = gl.constexpr(
@@ -746,7 +747,7 @@ class AttentionConfig:
         self.WARP_SIZE = gl.constexpr(32 if ARCH_NAME == "gfx1250" else 64)
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
         FP8_DOT: gl.constexpr = Q_FP8 and KV_FP8
-        self.K_WIDTH = gl.constexpr(8 if FP8_DOT else 8)
+        self.K_WIDTH = gl.constexpr(8)
         # Operator layouts (gfx1250 WMMA)
         if ARCH_NAME == "gfx1250":
             assert NUM_WARPS == 2 or NUM_WARPS == 4 or NUM_WARPS == 8
@@ -757,11 +758,23 @@ class AttentionConfig:
                 warp_bases = [[1, 0], [2, 0]]
             else:
                 warp_bases = [[1, 0], [2, 0], [4, 0]]
+            FP8_K_DIM_QK = 128 if HEAD_SIZE > 64 else 64
+            #FP8_K_DIM_QK = 64
             self.qk_layout = gl.constexpr(
                 gl.amd.AMDWMMALayout(
                     version=3,
                     transposed=True,
-                    instr_shape=[16, 16, 32] if not FP8_DOT else [16, 16, 64],
+                    instr_shape=[16, 16, 32] if not FP8_DOT else [16, 16, FP8_K_DIM_QK],
+                    warp_bases=warp_bases,
+                )
+            )
+            FP8_K_DIM_PV = 128 if TILE_SIZE > 64 else 64
+            #FP8_K_DIM_PV = 64
+            self.pv_layout = gl.constexpr(
+                gl.amd.AMDWMMALayout(
+                    version=3,
+                    transposed=True,
+                    instr_shape=[16, 16, 32] if not FP8_DOT else [16, 16, FP8_K_DIM_PV],
                     warp_bases=warp_bases,
                 )
             )
@@ -775,8 +788,15 @@ class AttentionConfig:
                     warps_per_cta=[NUM_WARPS, 1],
                 )
             )
-        self.pv_layout = self.qk_layout
 
+            self.pv_layout = gl.constexpr(
+                gl.amd.AMDMFMALayout(
+                    version=4,
+                    transposed=True,
+                    instr_shape=[32, 32, 16] if not FP8_DOT else [32, 32, 64],
+                    warps_per_cta=[NUM_WARPS, 1],
+                )
+            )
         # Dot operand layouts
         self.q_layout = gl.constexpr(gl.DotOperandLayout(0, self.qk_layout, self.K_WIDTH))
         self.k_layout = gl.constexpr(gl.DotOperandLayout(1, self.qk_layout, self.K_WIDTH))
@@ -784,10 +804,13 @@ class AttentionConfig:
         self.p_layout = gl.constexpr(gl.DotOperandLayout(0, self.pv_layout, self.K_WIDTH))
 
         # Blocked layouts for global-to-shared memory loads
+        ELEMENT_SIZE = 8 if Q_FP8 else 16
+        MAX_LOAD = 128
+        SIZE_PER_THREAD = MAX_LOAD // ELEMENT_SIZE
         HEAD_SIZE_DIV = HEAD_SIZE // 8
         self.blocked_q = gl.constexpr(
             gl.BlockedLayout(
-                size_per_thread=[1, 8],
+                size_per_thread=[1, MAX_LOAD],
                 threads_per_warp=[self.WARP_SIZE // 8, 8],
                 warps_per_cta=[NUM_WARPS, 1],
                 order=[1, 0],
@@ -1020,7 +1043,7 @@ class AttentionProgram:
     @gluon.jit
     def softmax_part0(self, S, M):
         m_ij = gl.maximum(M, gl.max(S, axis=1))
-        m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
+        #m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
         m_ij_scaled = m_ij * self.QK_scale
         q_shifted = S * self.QK_scale - m_ij_scaled[:, None]
         p = gl.exp2(q_shifted)
@@ -1041,7 +1064,7 @@ class AttentionProgram:
 
     @gluon.jit
     def compute_pv(self, p, v, acc):
-        p = gl.convert_layout(p, self.cfg.p_layout)
+        p = gl.convert_layout(p, self.cfg.p_layout, assert_trivial=True)
         if self.cfg.ARCH_NAME == "gfx1250":
             return gl.amd.gfx1250.wmma(p, v, acc)
         else:
@@ -1341,20 +1364,21 @@ def kernel_unified_attention_2d(
     kv_loader.load_v_to_shared(physical_block_idx, buffer_id=buffer_id)
     # Main attention loop over KV tiles (staged, num_stages=2)
     for j in range(pgm.tile_start, pgm.safe_tile_end):
-        #with gl.amd.warp_pipeline_stage("stage0", priority=2):
+
         next_physical_block_idx = kv_loader.load_block_ids(j + 1)
         k = kv_loader.load_k_from_shared(wait_count=1, target_dtype=q.dtype, buffer_id=buffer_id)
         # Prefetch next tile (shared is free since k, v are in registers)
         kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
         kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
+
         # Compute attention for current tile
         S = pgm.compute_qk(k)
         if SLIDING_WINDOW > 0:
             S = pgm.apply_mask_qk(S, j)
-
+        S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
         p, alpha, M = pgm.softmax_part0(S, M)
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
-        #with gl.amd.warp_pipeline_stage("stage2", priority=0):
+
         v = kv_loader.load_v_from_shared(wait_count=2, target_dtype=q.dtype, buffer_id=buffer_id)
         acc = pgm.compute_pv(p, v, acc)
         buffer_id = 1 - buffer_id
@@ -1369,6 +1393,7 @@ def kernel_unified_attention_2d(
         # Compute attention for current tile
         S = pgm.compute_qk(k)
         S = pgm.apply_mask_qk(S, j)
+        S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
         p, alpha, M = pgm.softmax_part0(S, M)
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
         #with gl.amd.warp_pipeline_stage("stage2", priority=0):
@@ -1381,6 +1406,7 @@ def kernel_unified_attention_2d(
     # Compute attention for current tile
     S = pgm.compute_qk(k)
     S = pgm.apply_mask_qk(S, pgm.tile_end - 1)
+    S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
     p, alpha, M = pgm.softmax_part0(S, M)
     p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
     v = kv_loader.load_v_from_shared(wait_count=0, target_dtype=q.dtype, buffer_id=buffer_id)
@@ -1429,6 +1455,7 @@ def unified_attention(
     waves_per_eu=1,
     shuffled_kv_cache=False,
     num_warps=4,
+    block_m=128,
 ):
     """
     Run the unified attention kernel with paged KV cache.
@@ -1480,7 +1507,7 @@ def unified_attention(
     
     # if use_tdm:
     #     assert ARCH_NAME == "gfx1250", "With TDM, ARCH must be gfx1250"
-    BLOCK_M = 128
+    BLOCK_M = block_m
     SLIDING_WINDOW = 1 + window_size[0]
     ALL_DECODE = max_seqlen_q == 1
     NUM_QUERIES_PER_KV = NUM_Q_HEADS // NUM_KV_HEADS
