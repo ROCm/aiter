@@ -12,6 +12,10 @@ NOTE: Do NOT use ``from __future__ import annotations`` here -- it breaks
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
+from flydsl.expr import gpu, buffer_ops, vector
+from flydsl.expr.typing import T
+
+
 # ---------------------------------------------------------------------------
 # Compile-time constants (mirroring HkMlaDecodeFwdTraits)
 # ---------------------------------------------------------------------------
@@ -55,10 +59,20 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
 
     This is a persistent-thread kernel: each workgroup picks up work items
     from ``work_indptr`` / ``work_info_set`` and processes them sequentially.
-
-    TODO: Implement kernel body (currently empty stub).
     """
-    pass
+
+    kv_page_indices_rsrc = buffer_ops.create_buffer_resource(kv_page_indices)
+    work_indptr_rsrc = buffer_ops.create_buffer_resource(work_indptr)
+    work_info_set_rsrc = buffer_ops.create_buffer_resource(work_info_set)
+
+    worker_idx = gpu.block_idx.x
+    work_range = buffer_ops.buffer_load(
+        work_indptr_rsrc, worker_idx, vec_width=2, dtype=T.i32
+    )
+    work_start_idx = vector.extract(work_range, [0])
+    work_end_idx = vector.extract(work_range, [1])
+    if work_start_idx >= work_end_idx:
+        return
 
 
 @flyc.jit

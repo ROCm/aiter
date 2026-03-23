@@ -406,7 +406,32 @@ def mla_decode_fwd(
             and os.getenv("AITER_ENABLE_EXPERIMENTAL", False)
         )
 
-        if use_hk:
+        use_flydsl = (
+            nhead == 128
+            and q.dtype == dtypes.fp8
+            and kv_buffer.dtype == dtypes.fp8
+            and page_size == 1
+        )
+
+        if True:
+            from aiter.ops.flydsl import flydsl_mla_fwd_decode
+
+            flydsl_mla_fwd_decode(
+                q,
+                kv_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                kv_last_page_lens,
+                work_indptr,
+                work_info_set,
+                max_seqlen_q,
+                sm_scale,
+                logits,
+                attn_lse,
+                o,
+            )
+        elif use_hk:
             aiter.hk_mla_decode_fwd(
                 q,
                 kv_buffer,

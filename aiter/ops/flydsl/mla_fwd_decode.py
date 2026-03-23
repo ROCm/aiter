@@ -66,6 +66,7 @@ def flydsl_mla_fwd_decode(
         num_cus = get_cu_num()
         lds_size = get_lds_size_per_cu() // OCCUPANCY
 
+        print(f"launch_mla_fwd_decode_h128_fp8_fp8: {lds_size=}")
         launch_mla_fwd_decode_h128_fp8_fp8(
             query_flat,
             kv_flat,
