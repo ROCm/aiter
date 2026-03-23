@@ -56,9 +56,9 @@ def block_attn_mask_to_ragged_lut(
     lut_count = counts.reshape(-1)
     lut_start = (torch.cumsum(lut_count, dim=0) - lut_count)
 
-    total_count = lut_count.sum()
+    max_count = batch * num_heads * num_q_blocks * num_kv_blocks
     kv_block_indices = torch.empty(
-        total_count, dtype=torch.int32, device=device
+        max_count, dtype=torch.int32, device=device
     )
     block_attn_mask_to_lut_kernel(
         block_attn_mask,
