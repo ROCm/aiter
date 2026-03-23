@@ -291,9 +291,6 @@ def unified_attention(
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
-
-    print("v.dtype", v.dtype)
-
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     assert BLOCK_Q >= 1
     # Ideally we would launch with kernel with:
