@@ -9,8 +9,11 @@ from aiter import logger
 from aiter import pertoken_quant, get_hip_quant
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_moe
+from aiter.jit.core import ENABLE_CK
 
 BLOCK_SIZE_M = 32
+
+_USE_OPUS_MOE_SORTING = not ENABLE_CK
 
 
 def moe_sorting_ck(
@@ -37,7 +40,8 @@ def moe_sorting_ck(
     num_valid_ids = torch.empty((2), dtype=dtypes.i32, device=device)
     moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
-    aiter.moe_sorting_fwd(
+    fwd_fn = aiter.moe_sorting_opus_fwd if _USE_OPUS_MOE_SORTING else aiter.moe_sorting_fwd
+    fwd_fn(
         topk_ids,
         topk_weights,
         sorted_ids,

@@ -3,8 +3,9 @@
 
 import torch
 from torch import Tensor
-from ..jit.core import compile_ops
 from typing import Optional
+
+from ..jit.core import ENABLE_CK, compile_ops
 
 MD_NAME = "module_rmsnorm"
 
@@ -66,7 +67,14 @@ def rmsnorm2d_fwd(
     use_model_sensitive_rmsnorm: int = 0,
 ) -> Tensor:
     if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
-        out = rmsnorm2d_fwd_ck(input, weight, epsilon, use_model_sensitive_rmsnorm)
+        if ENABLE_CK:
+            out = rmsnorm2d_fwd_ck(
+                input, weight, epsilon, use_model_sensitive_rmsnorm
+            )
+        else:
+            from .triton.normalization.rmsnorm import rms_norm as rms_norm_triton
+
+            out = rms_norm_triton(input, weight, epsilon)
     else:
         out = torch.empty_like(input, dtype=input.dtype, device=input.device)
         rmsnorm(out, input, weight, epsilon)
@@ -83,15 +91,29 @@ def rmsnorm2d_fwd_with_add(
     use_model_sensitive_rmsnorm: int = 0,
 ) -> None:
     if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
-        rmsnorm2d_fwd_with_add_ck(
-            out,
-            input,
-            residual_in,
-            residual_out,
-            weight,
-            epsilon,
-            use_model_sensitive_rmsnorm,
-        )
+        if ENABLE_CK:
+            rmsnorm2d_fwd_with_add_ck(
+                out,
+                input,
+                residual_in,
+                residual_out,
+                weight,
+                epsilon,
+                use_model_sensitive_rmsnorm,
+            )
+        else:
+            from .triton.normalization.rmsnorm import (
+                rmsnorm2d_fwd_with_add as rmsnorm2d_fwd_with_add_triton,
+            )
+
+            rmsnorm2d_fwd_with_add_triton(
+                out,
+                input,
+                residual_in,
+                residual_out,
+                weight,
+                epsilon,
+            )
     else:
         add_rmsnorm(out, input, residual_in, residual_out, weight, epsilon)
 
@@ -136,9 +158,18 @@ def rmsnorm2d_fwd_with_dynamicquant(
     if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
         assert group_size == 0, "group_size is not supported for ck rmsnorm"
         assert not shuffle_scale, "shuffle_scale is not supported for ck rmsnorm"
-        rmsnorm2d_fwd_with_dynamicquant_ck(
-            out, input, yscale, weight, epsilon, use_model_sensitive_rmsnorm
-        )
+        if ENABLE_CK:
+            rmsnorm2d_fwd_with_dynamicquant_ck(
+                out, input, yscale, weight, epsilon, use_model_sensitive_rmsnorm
+            )
+        else:
+            from .triton.normalization.rmsnorm import (
+                rmsnorm2d_fwd_with_dynamicquant as rmsnorm2d_fwd_with_dynamicquant_triton,
+            )
+
+            rmsnorm2d_fwd_with_dynamicquant_triton(
+                out, input, yscale, weight, epsilon
+            )
     else:
         rmsnorm_quant(out, input, yscale, weight, epsilon, group_size, shuffle_scale)
 
@@ -158,16 +189,31 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
         assert group_size == 0, "group_size is not supported for ck rmsnorm"
         assert not shuffle_scale, "shuffle_scale is not supported for ck rmsnorm"
-        rmsnorm2d_fwd_with_add_dynamicquant_ck(
-            out,
-            input,
-            residual_in,
-            residual_out,
-            yscale,
-            weight,
-            epsilon,
-            use_model_sensitive_rmsnorm,
-        )
+        if ENABLE_CK:
+            rmsnorm2d_fwd_with_add_dynamicquant_ck(
+                out,
+                input,
+                residual_in,
+                residual_out,
+                yscale,
+                weight,
+                epsilon,
+                use_model_sensitive_rmsnorm,
+            )
+        else:
+            from .triton.normalization.rmsnorm import (
+                rmsnorm2d_fwd_with_add_dynamicquant as rmsnorm2d_fwd_with_add_dynamicquant_triton,
+            )
+
+            rmsnorm2d_fwd_with_add_dynamicquant_triton(
+                out,
+                input,
+                residual_in,
+                residual_out,
+                yscale,
+                weight,
+                epsilon,
+            )
     else:
         add_rmsnorm_quant(
             out,

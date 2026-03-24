@@ -11,7 +11,7 @@ from torch import Tensor
 from aiter import logger
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
-from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
+from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, ENABLE_CK, compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
@@ -110,7 +110,8 @@ def gemm_a4w4(
         splitK = ck_config.get("splitK", None)
         kernelName = ck_config["kernelName"]
     if (
-        ck_config is not None
+        ENABLE_CK
+        and ck_config is not None
         and kernelName.find("_ZN") == -1
         # or bias is None
     ):
@@ -118,6 +119,9 @@ def gemm_a4w4(
         return gemm_a4w4_blockscale(
             A.view(m, k // 2), B, A_scale, B_scale, out, splitK=splitK
         )[:m]
+    if not ENABLE_CK and kernelName.find("_ZN") == -1:
+        splitK = 0
+        kernelName = ""
     assert (
         out.shape[0] % 32 == 0
     ), "Dim0 of gemm_a4w4_asm output needs to be padded to multiples of 32!"
