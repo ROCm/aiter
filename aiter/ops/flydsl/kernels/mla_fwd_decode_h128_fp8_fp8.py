@@ -5,6 +5,10 @@
 
 Transplanted from csrc/kernels/mla/hk/mi3xx_v32_fwd_decode_h128_fp8_fp8.cuh.
 
+Architecture: 8 warps / 512 threads, persistent-thread dispatch.
+Per work item: load Q -> iterate KV tiles (BLOCK_N=32) -> QK GEMM (nope+rope)
+-> online softmax -> PV GEMM -> output (final bf16 or split f32 + LSE).
+
 NOTE: Do NOT use ``from __future__ import annotations`` here -- it breaks
 ``fx.Constexpr`` detection in the FlyDSL AST rewriter.
 """
@@ -12,8 +16,22 @@ NOTE: Do NOT use ``from __future__ import annotations`` here -- it breaks
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
-from flydsl.expr import gpu, buffer_ops, vector
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm, scf
+from flydsl._mlir.dialects import arith as _std_arith
+from flydsl._mlir.dialects import math as _math
+from flydsl._mlir.dialects import memref as _memref
+from flydsl._mlir.dialects import gpu as _mlir_gpu
+from flydsl._mlir.dialects._arith_enum_gen import CmpIPredicate
+
+from flydsl.expr import arith, vector, gpu, buffer_ops, rocdl
+from flydsl.expr import range_constexpr
+from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
+
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.utils.smem_allocator import SmemAllocator
+from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
 
 # ---------------------------------------------------------------------------
@@ -37,8 +55,267 @@ TILE_M: int = BLOCK_M // NUM_WARPS  # 16
 OCCUPANCY: int = 1
 
 SIZE_MLA_WORK_INFO_IN_DW: int = 8
+LOG2E: float = 1.4426950408889634
+
+# ---------------------------------------------------------------------------
+# KvManagerV2 LDS layout constants
+# ---------------------------------------------------------------------------
+# KV tile: 32 rows x 576 cols (fp8), split into 9 blocks of 64 cols each.
+# Each block: 8 sub-blocks (one per warp) of 4 rows x 64 cols + 2 DW padding.
+KV_NUM_COLS: int = 64
+KV_NUM_BLOCKS: int = QK_HEAD_DIM // KV_NUM_COLS  # 576 / 64 = 9
+KV_ROWS_PER_SUB: int = BLOCK_N // NUM_WARPS  # 32 / 8 = 4
+KV_BYTES_PER_ROW: int = KV_NUM_COLS  # 64 * 1 (fp8)
+KV_PAD_DW: int = 2
+KV_SUB_BYTES: int = KV_ROWS_PER_SUB * KV_BYTES_PER_ROW + KV_PAD_DW * 4  # 264
+KV_NUM_SUBS: int = BLOCK_N // KV_ROWS_PER_SUB  # 8
+KV_BLOCK_BYTES: int = KV_SUB_BYTES * KV_NUM_SUBS  # 2112
+SZ_LDS_KV: int = KV_BLOCK_BYTES * KV_NUM_BLOCKS  # 2112 * 9 = 19008
+
+# ---------------------------------------------------------------------------
+# VtManagerV1 LDS layout constants
+# ---------------------------------------------------------------------------
+VT_ROWS_PER_THR: int = 4
+VT_COLS_PER_THR: int = 8
+VT_ELEMS_PER_BLK: int = VT_ROWS_PER_THR * VT_COLS_PER_THR  # 32
+VT_BLKS_PER_ROW: int = V_HEAD_DIM // VT_COLS_PER_THR  # 64
+VT_BLKS_PER_ROW_PAD: int = VT_BLKS_PER_ROW + 2  # 66
+VT_NUM_SUB_BLKS: int = 8
+SZ_LDS_VT: int = VT_NUM_SUB_BLKS * (
+    (BLOCK_N // VT_NUM_SUB_BLKS) * V_HEAD_DIM + 16 * 4
+)  # 8 * (4*512 + 64) = 16896
+
+# ---------------------------------------------------------------------------
+# QManagerV3 LDS layout constants (per-warp staging for VRAM->LDS->GPR)
+# ---------------------------------------------------------------------------
+Q_ELEM_PER_ROW: int = 64
+Q_ELEM_PER_COL: int = 16
+Q_PAD_BYTES_PER_2ROWS: int = 8  # 2 DW
+Q_BYTES_PER_2ROWS: int = Q_ELEM_PER_ROW * 2 + Q_PAD_BYTES_PER_2ROWS  # 136
+SZ_LDS_Q_PER_WARP: int = Q_ELEM_PER_COL // 2 * Q_BYTES_PER_2ROWS  # 1088
+SZ_LDS_Q: int = NUM_WARPS * SZ_LDS_Q_PER_WARP  # 8704
+
+# ---------------------------------------------------------------------------
+# OManager16bitsV2 (bf16 output via LDS reshape)
+# ---------------------------------------------------------------------------
+O16_NUM_ROWS: int = 16
+O16_NUM_COLS: int = 32
+O16_PAD_ELEM_PER_2ROWS: int = 4  # padded 2-row stride in bf16 elements
+O16_ELEM_PER_PAD_2ROWS: int = 2 * O16_NUM_COLS + O16_PAD_ELEM_PER_2ROWS  # 68
+O16_LDS_PER_WARP: int = (O16_NUM_ROWS // 2) * O16_ELEM_PER_PAD_2ROWS * 2  # 1088
+SZ_LDS_O16: int = NUM_WARPS * O16_LDS_PER_WARP  # 8704  (reuses p_lds_kv region)
+
+# ---------------------------------------------------------------------------
+# OManager32bitsV2 (f32 split output via LDS reshape)
+# ---------------------------------------------------------------------------
+O32_NUM_ROWS: int = 16
+O32_NUM_COLS: int = 32
+O32_PAD_ELEM_PER_ROW: int = 4
+O32_ELEM_PER_PAD_ROW: int = O32_NUM_COLS + O32_PAD_ELEM_PER_ROW  # 36
+O32_LDS_PER_WARP: int = O32_NUM_ROWS * O32_ELEM_PER_PAD_ROW * 4  # 2304
+SZ_LDS_O32: int = NUM_WARPS * O32_LDS_PER_WARP  # 18432
+
+# Overall LDS layout (byte offsets):
+#   [0, SZ_LDS_VT) = Vt staging buffer
+#   [SZ_LDS_VT, SZ_LDS_VT + SZ_LDS_Q) = Q staging buffer
+#   [SZ_LDS_VT + SZ_LDS_Q, +SZ_LDS_KV) = KV double-buffer 0
+#   [SZ_LDS_VT + SZ_LDS_Q + SZ_LDS_KV, +SZ_LDS_KV) = KV double-buffer 1
+# Output reuses the KV double-buffer 0 region.
+P_LDS_VT: int = 0
+P_LDS_Q: int = SZ_LDS_VT  # 16896
+P_LDS_KV_0: int = P_LDS_Q + SZ_LDS_Q  # 25600
+P_LDS_KV_1: int = P_LDS_KV_0 + SZ_LDS_KV  # 44608
+TOTAL_LDS_BYTES: int = P_LDS_KV_1 + SZ_LDS_KV  # 63616
+
+assert (
+    max(SZ_LDS_O16, SZ_LDS_O32) <= SZ_LDS_KV
+), "Output LDS must fit in one KV buffer region"
+
+# ---------------------------------------------------------------------------
+# MFMA tile constants
+# ---------------------------------------------------------------------------
+MFMA_M: int = 16
+MFMA_N: int = 16
+MFMA_K: int = 32  # mfma_f32_16x16x32_fp8_fp8
+MFMA_ELEM_PER_THR: int = MFMA_M * MFMA_K // WARP_SIZE  # 8
+
+# Number of QK sub-tile iterations
+NUM_NOPE_ITERS: int = QK_NOPE_HEAD_DIM // (MFMA_K * 2)  # 512/64 = 8
+NUM_ROPE_ITERS: int = QK_ROPE_HEAD_DIM // (MFMA_K * 2)  # 64/64 = 1
+NUM_PV_ITERS: int = V_HEAD_DIM // (MFMA_N * 2)  # 512/32 = 16
 
 
+# ---------------------------------------------------------------------------
+# Utility helpers (ported from FlyDSL/kernels/mla_decode_fp8.py)
+# ---------------------------------------------------------------------------
+
+
+def _encode_waitcnt(vmcnt=63, expcnt=7, lgkmcnt=63):
+    """Encode s_waitcnt bitfield for CDNA3 (gfx94x)."""
+    vm_lo = vmcnt & 0xF
+    vm_hi = (vmcnt >> 4) & 0x3
+    return vm_lo | (expcnt << 4) | (lgkmcnt << 8) | (vm_hi << 14)
+
+
+def _barrier(vmcnt=63, lgkmcnt=63):
+    """Emit s_waitcnt + s_barrier via inline asm."""
+    parts = []
+    needs_waitcnt = vmcnt < 63 or lgkmcnt < 63
+    if needs_waitcnt:
+        wc = []
+        if vmcnt < 63:
+            wc.append(f"vmcnt({vmcnt})")
+        if lgkmcnt < 63:
+            wc.append(f"lgkmcnt({lgkmcnt})")
+        parts.append("s_waitcnt " + " ".join(wc))
+    parts.append("s_barrier")
+    llvm.InlineAsmOp(
+        res=None,
+        operands_=[],
+        asm_string="\n".join(parts),
+        constraints="",
+        has_side_effects=True,
+        is_align_stack=False,
+    )
+
+
+_LDS_PTR_TYPE = None
+
+
+def _inttoptr_lds(i64_val):
+    """Convert i64 scalar to !llvm.ptr<3> (LDS pointer)."""
+    global _LDS_PTR_TYPE
+    if _LDS_PTR_TYPE is None:
+        _LDS_PTR_TYPE = ir.Type.parse("!llvm.ptr<3>")
+    return llvm.inttoptr(_LDS_PTR_TYPE, i64_val)
+
+
+def _get_element_ptr(base_ptr, byte_offset=None, static_byte_offset=0, elem_type=None):
+    """GEP-based pointer arithmetic."""
+    _GEP_DYN = -(2**31)
+    raw_ptr = _raw(base_ptr) if not isinstance(base_ptr, ir.Value) else base_ptr
+    if elem_type is None:
+        elem_type = ir.IntegerType.get_signless(8)
+
+    if byte_offset is None:
+        return llvm.GEPOp(
+            raw_ptr.type,
+            raw_ptr,
+            [],
+            [int(static_byte_offset)],
+            elem_type,
+            None,
+        ).result
+    elif isinstance(byte_offset, int):
+        return llvm.GEPOp(
+            raw_ptr.type,
+            raw_ptr,
+            [],
+            [int(byte_offset) + int(static_byte_offset)],
+            elem_type,
+            None,
+        ).result
+    else:
+        offset_val = (
+            _raw(byte_offset) if not isinstance(byte_offset, ir.Value) else byte_offset
+        )
+        if isinstance(offset_val.type, ir.IndexType):
+            i64_type = ir.IntegerType.get_signless(64)
+            offset_val = _std_arith.IndexCastOp(i64_type, offset_val).result
+        if static_byte_offset != 0:
+            static_attr = ir.IntegerAttr.get(offset_val.type, int(static_byte_offset))
+            static_const = _std_arith.ConstantOp(offset_val.type, static_attr).result
+            offset_val = _std_arith.AddIOp(offset_val, static_const).result
+        return llvm.GEPOp(
+            raw_ptr.type,
+            raw_ptr,
+            [offset_val],
+            [_GEP_DYN],
+            elem_type,
+            None,
+        ).result
+
+
+def _lds_load_prefer_agpr(byte_addr_index, vec_type, static_byte_offset=0):
+    """LDS load with AGPR allocation hint via nontemporal flag."""
+    raw_addr = (
+        _raw(byte_addr_index)
+        if not isinstance(byte_addr_index, ir.Value)
+        else byte_addr_index
+    )
+    i64_type = ir.IntegerType.get_signless(64)
+    addr_i64 = _std_arith.IndexCastOp(i64_type, raw_addr).result
+    lds_ptr = _inttoptr_lds(addr_i64)
+    if static_byte_offset != 0:
+        lds_ptr = _get_element_ptr(lds_ptr, static_byte_offset=static_byte_offset)
+    return llvm.LoadOp(vec_type, lds_ptr, alignment=16, nontemporal=True).result
+
+
+def _index_cast_to_i32(value):
+    """Cast index/ArithValue to i32.  No-op if already i32."""
+    raw = _raw(value) if not isinstance(value, ir.Value) else value
+    i32_type = ir.IntegerType.get_signless(32)
+    if raw.type == i32_type:
+        return raw
+    return _std_arith.IndexCastOp(i32_type, raw).result
+
+
+def _fast_exp2(val):
+    """Bare v_exp_f32 via rocdl.exp2 -- no range reduction."""
+    return rocdl.exp2(ir.F32Type.get(), _raw(val))
+
+
+def _to_mlir(val, index=False):
+    """Convert Python int/float, ArithValue, or ir.Value to raw MLIR Value."""
+    if isinstance(val, int):
+        return _raw(arith.constant(val, index=index))
+    if isinstance(val, float):
+        return _raw(arith.constant(val))
+    if isinstance(val, ir.Value):
+        return val
+    return _raw(val)
+
+
+def _set_mfma_vgpr_form():
+    """Force MFMA to use ACC_CD=0 (D/C in ArchVGPR) via LLVM cl::opt."""
+    import ctypes
+    import os
+
+    lib_dir = os.path.dirname(
+        __import__("flydsl._mlir._mlir_libs", fromlist=["_mlir_libs"]).__file__
+    )
+    lib_name = "libFlyPythonCAPI.so"
+    lib_path = os.path.join(lib_dir, lib_name)
+    if not os.path.exists(lib_path):
+        lib_name = "libFlirPythonCAPI.so"
+        lib_path = os.path.join(lib_dir, lib_name)
+    lib = ctypes.CDLL(lib_path)
+    try:
+        parse_fn = lib.LLVMParseCommandLineOptions
+    except AttributeError:
+        return  # Symbol not available in this build
+    parse_fn.restype = None
+    parse_fn.argtypes = [
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_char_p),
+        ctypes.c_char_p,
+    ]
+    argv = [
+        b"mlir",
+        b"-amdgpu-mfma-vgpr-form",
+        b"--amdgpu-schedule-metric-bias=0",
+        b"--enable-deferred-spilling",
+    ]
+    argv_arr = (ctypes.c_char_p * len(argv))(*argv)
+    parse_fn(len(argv), argv_arr, None)
+
+
+_set_mfma_vgpr_form()
+
+
+# ---------------------------------------------------------------------------
+# Kernel
+# ---------------------------------------------------------------------------
 @flyc.kernel(known_block_size=[NUM_THREADS, 1, 1])
 def kn_mla_fwd_decode_h128_fp8_fp8(
     # --- inputs ---
@@ -57,45 +334,1231 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
 ):
     """MLA decode forward kernel (nhead=128, fp8/fp8 -> bf16).
 
-    This is a persistent-thread kernel: each workgroup picks up work items
+    Persistent-thread kernel: each workgroup picks up work items
     from ``work_indptr`` / ``work_info_set`` and processes them sequentially.
     """
-    pass
+    _STUB_EARLY_RETURN = False  # Set True to skip all kernel body for testing launch
+    if _STUB_EARLY_RETURN:
+        return
 
+    # ---- Types ----
+    compute_type = T.f32
+    lds_elem_type = ir.IntegerType.get_signless(8)
+    i32_type = ir.IntegerType.get_signless(32)
+    i64_type = ir.IntegerType.get_signless(64)
+    v4f32_type = ir.VectorType.get([4], compute_type)
+    v2i64_type = ir.VectorType.get([2], i64_type)
+    v4i8_type = ir.VectorType.get([4], lds_elem_type)
+    v16i8_type = ir.VectorType.get([16], lds_elem_type)
+    v4i32_type = ir.VectorType.get([4], i32_type)
+    v1i32_type = ir.VectorType.get([1], i32_type)
+    fm_fast = _std_arith.FastMathFlags.fast
+
+    def _mfma_fp8(result_type, operands, **kw):
+        return rocdl.mfma_f32_16x16x32_fp8_fp8(result_type, operands, **kw)
+
+    # ---- LDS setup ----
+    arch = get_hip_arch()
+    lds_allocator = SmemAllocator(None, arch=arch)
+    lds_allocator.ptr = TOTAL_LDS_BYTES  # reserve LDS bytes
+
+    ctx = CompilationContext.get_current()
+    with ir.InsertionPoint(ctx.gpu_module_body):
+        lds_allocator.finalize()
+
+    lds_buffer = lds_allocator.get_base()
+    lds_base_idx = _memref.ExtractAlignedPointerAsIndexOp(lds_buffer).result
+
+    # ---- V^T transpose perm constants ----
+    c_perm0 = arith.constant(0x05010400, type=i32_type)
+    c_perm1 = arith.constant(0x07030602, type=i32_type)
+    c_perm2 = arith.constant(0x05040100, type=i32_type)
+    c_perm3 = arith.constant(0x07060302, type=i32_type)
+
+    def _vt_perm(src_hi, src_lo, sel):
+        return llvm.call_intrinsic(
+            i32_type,
+            "llvm.amdgcn.perm",
+            [src_hi, src_lo, sel],
+            [],
+            [],
+        )
+
+    # ---- Constants ----
+    c_neg_inf_f32 = arith.constant(float("-inf"), type=compute_type)
+    c_zero_f32 = arith.constant(0.0, type=compute_type)
+    c_one_f32 = arith.constant(1.0, type=compute_type)
+    c_zero_i32 = arith.constant(0, type=i32_type)
+    c_zero_v4f32 = arith.constant_vector(0.0, v4f32_type)
+    c_sm_scale = arith.constant(softmax_scale, type=compute_type)
+    c_log2e = arith.constant(LOG2E, type=compute_type)
+    c_inv_log2e = arith.constant(1.0 / LOG2E, type=compute_type)
+    c_dword_sz = arith.constant(4, type=i32_type)
+    c_aux_zero = arith.constant(0, type=i32_type)
+
+    # ---- Buffer resources ----
+    query_rsrc = buffer_ops.create_buffer_resource(query)
+    kv_rsrc = buffer_ops.create_buffer_resource(kv_buffer)
     kv_page_indices_rsrc = buffer_ops.create_buffer_resource(kv_page_indices)
     work_indptr_rsrc = buffer_ops.create_buffer_resource(work_indptr)
     work_info_set_rsrc = buffer_ops.create_buffer_resource(work_info_set)
+    final_output_rsrc = buffer_ops.create_buffer_resource(final_output)
+    split_output_rsrc = buffer_ops.create_buffer_resource(split_output)
+    split_lse_rsrc = buffer_ops.create_buffer_resource(split_lse)
 
+    # ---- Thread indices ----
     worker_idx = gpu.block_idx.x
-    work_range = buffer_ops.buffer_load(
-        work_indptr_rsrc, worker_idx, vec_width=2, dtype=T.i32
-    )
-    work_start_idx = vector.extract(work_range, [0])
-    work_end_idx = vector.extract(work_range, [1])
+    tid = gpu.thread_id("x")
+    warp_idx = tid / arith.index(WARP_SIZE)
+    lane_idx = tid % arith.index(WARP_SIZE)
+    warp_idx_i32 = _index_cast_to_i32(warp_idx)
+    lane_idx_i32 = _index_cast_to_i32(lane_idx)
 
+    # ---- Work range ----
+    worker_idx_i32 = _index_cast_to_i32(worker_idx)
+    work_range = buffer_ops.buffer_load(
+        work_indptr_rsrc, worker_idx_i32, vec_width=2, dtype=T.i32
+    )
+    work_start_i32 = vector.extract(work_range, [0])
+    work_end_i32 = vector.extract(work_range, [1])
+    work_start_idx = arith.index_cast(T.index, work_start_i32)
+    work_end_idx = arith.index_cast(T.index, work_end_i32)
+
+    # ---- KvManagerV2 thread-to-data mapping ----
+    # Each warp takes 4 rows: warp w -> rows {w*2, w*2+1, w*2+16, w*2+17}
+    # lane mapping: (lane/32)*16 + (lane/16)%2 + warp*2
+    kv_ld_row_base = (
+        lane_idx / arith.index(32) * arith.index(16)
+        + (lane_idx / arith.index(16)) % arith.index(2)
+        + warp_idx * arith.index(2)
+    )
+    kv_ld_row_base_i32 = _index_cast_to_i32(kv_ld_row_base)
+    kv_ld_col_base_i32 = _index_cast_to_i32(
+        (lane_idx % arith.index(16)) * arith.index(4)
+    )
+
+    # ---- Helper: resolve KV page index -> physical row ----
+    def _get_kv_ld_row(kv_tile_start_i32, kv_tile_end_i32, check_boundary):
+        """Resolve physical KV row for this thread's assigned row.
+
+        For OOB rows (row >= kv_end), returns -1 WITHOUT issuing a
+        buffer_load -- avoids reading garbage from kv_page_indices.
+        """
+        row_idx_i32 = _std_arith.AddIOp(
+            _raw(kv_ld_row_base_i32), _raw(kv_tile_start_i32)
+        ).result
+        if check_boundary:
+            neg_one = _raw(arith.constant(-1, type=i32_type))
+            if_op = scf.IfOp(
+                _std_arith.CmpIOp(
+                    CmpIPredicate.slt, row_idx_i32, _raw(kv_tile_end_i32)
+                ).result,
+                [i32_type],
+                has_else=True,
+            )
+            with ir.InsertionPoint(if_op.regions[0].blocks[0]):
+                # In-bounds: do the buffer_load
+                phys_row_ib = buffer_ops.buffer_load(
+                    kv_page_indices_rsrc, row_idx_i32, vec_width=1, dtype=i32_type
+                )
+                scf.YieldOp([_raw(phys_row_ib)])
+            with ir.InsertionPoint(if_op.regions[1].blocks[0]):
+                # OOB: return -1
+                scf.YieldOp([neg_one])
+            return if_op.results[0]
+        else:
+            phys_row = buffer_ops.buffer_load(
+                kv_page_indices_rsrc, row_idx_i32, vec_width=1, dtype=i32_type
+            )
+            return _raw(phys_row)
+
+    # ---- Helper: async_load_k_tile (VRAM->LDS via buffer_load_dword_lds) ----
+    def _async_load_k_tile(
+        p_lds_kv_warp_i32, row_i32, col_base_i32, block_idx_const, check_boundary=False
+    ):
+        """Load one 32x64 block of KV data from VRAM to LDS.
+
+        block_idx_const: Python int [0..8], which 64-col block.
+        """
+        lds_warp_offset = block_idx_const * KV_BLOCK_BYTES
+        # p_lds_kv_warp points to warp's sub-block start.
+        # Actual LDS target: p_lds_kv_warp + block*KV_BLOCK_BYTES - block*64
+        lds_base_i32 = _std_arith.AddIOp(
+            p_lds_kv_warp_i32,
+            _raw(
+                arith.constant(
+                    lds_warp_offset - block_idx_const * KV_NUM_COLS, type=i32_type
+                )
+            ),
+        ).result
+
+        if check_boundary:
+            neg_one = _raw(arith.constant(-1, type=i32_type))
+            is_oob = _std_arith.CmpIOp(CmpIPredicate.eq, _raw(row_i32), neg_one).result
+            # For OOB: write zero to LDS
+            if_op = scf.IfOp(is_oob, [], has_else=True)
+            with ir.InsertionPoint(if_op.regions[0].blocks[0]):
+                # Write zero via ds_write_b32 at lane's position
+                zero_u32 = _raw(arith.constant(0, type=i32_type))
+                lane_offset = _std_arith.MulIOp(
+                    _raw(lane_idx_i32),
+                    _raw(arith.constant(4, type=i32_type)),
+                ).result
+                lds_addr_zero = _std_arith.AddIOp(
+                    lds_base_i32,
+                    _std_arith.AddIOp(
+                        _raw(
+                            arith.constant(block_idx_const * KV_NUM_COLS, type=i32_type)
+                        ),
+                        lane_offset,
+                    ).result,
+                ).result
+                lds_addr_i64 = _std_arith.ExtUIOp(i64_type, lds_addr_zero).result
+                lds_ptr = _inttoptr_lds(lds_addr_i64)
+                llvm.StoreOp(zero_u32, lds_ptr, alignment=4)
+                scf.YieldOp([])
+            with ir.InsertionPoint(if_op.regions[1].blocks[0]):
+                # Normal load
+                voff = _std_arith.AddIOp(
+                    _std_arith.MulIOp(
+                        _raw(row_i32),
+                        _raw(arith.constant(QK_HEAD_DIM, type=i32_type)),
+                    ).result,
+                    _raw(col_base_i32),
+                ).result
+                col_off = arith.constant(block_idx_const * KV_NUM_COLS, type=i32_type)
+                lds_ptr_i64 = _std_arith.ExtUIOp(i64_type, lds_base_i32).result
+                lds_ptr = _inttoptr_lds(lds_ptr_i64)
+                rocdl.raw_ptr_buffer_load_lds(
+                    kv_rsrc,
+                    lds_ptr,
+                    _raw(c_dword_sz),
+                    voff,
+                    _raw(c_aux_zero),
+                    _raw(col_off),
+                    _raw(c_aux_zero),
+                )
+                scf.YieldOp([])
+        else:
+            voff = _std_arith.AddIOp(
+                _std_arith.MulIOp(
+                    _raw(row_i32),
+                    _raw(arith.constant(QK_HEAD_DIM, type=i32_type)),
+                ).result,
+                _raw(col_base_i32),
+            ).result
+            col_off = arith.constant(block_idx_const * KV_NUM_COLS, type=i32_type)
+            lds_ptr_i64 = _std_arith.ExtUIOp(i64_type, lds_base_i32).result
+            lds_ptr = _inttoptr_lds(lds_ptr_i64)
+            rocdl.raw_ptr_buffer_load_lds(
+                kv_rsrc,
+                lds_ptr,
+                _raw(c_dword_sz),
+                voff,
+                _raw(c_aux_zero),
+                _raw(col_off),
+                _raw(c_aux_zero),
+            )
+
+    def _async_load_kv_all(
+        p_lds_kv_warp_i32, row_i32, col_base_i32, check_boundary=False
+    ):
+        """Load all 9 blocks of a KV tile."""
+        for blk in range_constexpr(KV_NUM_BLOCKS):
+            _async_load_k_tile(
+                p_lds_kv_warp_i32,
+                row_i32,
+                col_base_i32,
+                blk,
+                check_boundary=check_boundary,
+            )
+
+    # ---- Helper: load K sub-tile from LDS (16x32 for MFMA) ----
+    def _load_k_from_lds(p_lds_kv_base_idx, row_offset, col_offset):
+        """Read 16x32 K sub-tile from LDS -> i64 for MFMA.
+
+        row_offset: 0 or 16 (which half of BLOCK_N=32)
+        col_offset: column offset in elements (multiple of 32)
+
+        KvManagerV2 LDS address formula:
+          row_phy = (row/2)*4 + (row%2)  where row = lane_idx % 16
+          p = p_lds_kv + (row_phy/4)*KV_SUB_BYTES + (row_phy%4)*KV_BYTES_PER_ROW
+              + (col%64)*sizeof(kv_t) + (col/64)*KV_BLOCK_BYTES
+          fixed_offset = (row_offset/16)*2*KV_BYTES_PER_ROW
+                       + (col_offset%64)*sizeof(kv_t)
+                       + (col_offset/64)*KV_BLOCK_BYTES
+        """
+        row_in_mfma = lane_idx % arith.index(MFMA_M)
+        # row_phy = (row/2)*4 + (row%2)
+        row_phy = (row_in_mfma / arith.index(2)) * arith.index(
+            4
+        ) + row_in_mfma % arith.index(2)
+        col_in_lane = (lane_idx / arith.index(MFMA_M)) * arith.index(MFMA_ELEM_PER_THR)
+
+        # Dynamic part: based on lane position
+        lds_lane_offset = (
+            (row_phy / arith.index(4)) * arith.index(KV_SUB_BYTES)
+            + (row_phy % arith.index(4)) * arith.index(KV_BYTES_PER_ROW)
+            + (col_in_lane % arith.index(KV_NUM_COLS))
+        )
+
+        # Fixed part: based on compile-time row/col offsets
+        fixed_offset = (
+            (row_offset // 16) * 2 * KV_BYTES_PER_ROW
+            + (col_offset % KV_NUM_COLS)
+            + (col_offset // KV_NUM_COLS) * KV_BLOCK_BYTES
+        )
+
+        lds_addr = p_lds_kv_base_idx + lds_lane_offset + arith.index(fixed_offset)
+
+        # ds_read_b64 -> 8 bytes = 1 i64 for MFMA input
+        data = _lds_load_prefer_agpr(lds_addr, i64_type)
+        return data
+
+    # ---- Helper: load V from KV LDS (un-transposed) ----
+    def _load_v_from_lds(p_lds_kv_base_idx, warp_idx_val, lane_idx_val):
+        """Load un-transposed V: each warp reads 16x128 region.
+
+        KvManagerV2::load_v_to_gpr pattern:
+          row = (warp%2)*16 + lane/16*4
+          row_phy = ((row%16)/2)*4 + 2*(row/16) + (row%2)
+          col = (lane%16)*8 + (warp/2)*128
+        Returns 8 i32 values.
+        """
+        row = (warp_idx_val % arith.index(2)) * arith.index(16) + (
+            lane_idx_val / arith.index(16)
+        ) * arith.index(4)
+        row_mod16 = row % arith.index(16)
+        row_phy = (
+            (row_mod16 / arith.index(2)) * arith.index(4)
+            + arith.index(2) * (row / arith.index(16))
+            + row % arith.index(2)
+        )
+        col = (lane_idx_val % arith.index(16)) * arith.index(8) + (
+            warp_idx_val / arith.index(2)
+        ) * arith.index(128)
+
+        lds_v_offset = (
+            (row_phy / arith.index(4)) * arith.index(KV_SUB_BYTES)
+            + (row_phy % arith.index(4)) * arith.index(KV_BYTES_PER_ROW)
+            + (col / arith.index(KV_NUM_COLS)) * arith.index(KV_BLOCK_BYTES)
+            + (col % arith.index(KV_NUM_COLS))
+        )
+
+        lds_addr = p_lds_kv_base_idx + lds_v_offset
+
+        # 4 x ds_read_b64: load 8 dwords at strides matching KvManagerV2
+        v_vals = []
+        for pass_idx in range_constexpr(4):
+            if pass_idx == 0:
+                off = 0
+            elif pass_idx == 1:
+                off = KV_BYTES_PER_ROW
+            elif pass_idx == 2:
+                off = KV_SUB_BYTES
+            else:
+                off = KV_SUB_BYTES + KV_BYTES_PER_ROW
+            data = _lds_load_prefer_agpr(
+                lds_addr,
+                ir.VectorType.get([2], i32_type),
+                static_byte_offset=off,
+            )
+            v_vals.append(
+                vector.extract(data, static_position=[0], dynamic_position=[])
+            )
+            v_vals.append(
+                vector.extract(data, static_position=[1], dynamic_position=[])
+            )
+        return v_vals  # 8 i32 values
+
+    # ---- Helper: transpose V in-register ----
+    def _transpose_v(v8):
+        """12x v_perm_b32 to transpose 4x8 fp8 block.
+
+        Ported from VtManagerV1::transpose_v.
+        Input:  v8[0..7] in row-major 4x8 layout
+        Output: v8[0..7] in transposed layout for Vt storage
+        """
+        # Phase 1: perm_0 (c_perm0=0x05010400) and perm_3 (c_perm1=0x07030602)
+        t0_0 = _vt_perm(v8[2], v8[0], c_perm0)
+        t2_0 = _vt_perm(v8[2], v8[0], c_perm1)
+        t0_1 = _vt_perm(v8[3], v8[1], c_perm0)
+        t2_1 = _vt_perm(v8[3], v8[1], c_perm1)
+
+        t1_0 = _vt_perm(v8[6], v8[4], c_perm0)
+        t3_0 = _vt_perm(v8[6], v8[4], c_perm1)
+        t1_1 = _vt_perm(v8[7], v8[5], c_perm0)
+        t3_1 = _vt_perm(v8[7], v8[5], c_perm1)
+
+        # Phase 2: perm_1 (c_perm2=0x05040100) and perm_2 (c_perm3=0x07060302)
+        # Output order: r0_0, r0_1, r1_0, r1_1, r2_0, r2_1, r3_0, r3_1
+        r = [None] * 8
+        r[0] = _vt_perm(t1_0, t0_0, c_perm2)  # r0_0
+        r[1] = _vt_perm(t1_1, t0_1, c_perm2)  # r0_1
+        r[2] = _vt_perm(t1_0, t0_0, c_perm3)  # r1_0
+        r[3] = _vt_perm(t1_1, t0_1, c_perm3)  # r1_1
+        r[4] = _vt_perm(t3_0, t2_0, c_perm2)  # r2_0
+        r[5] = _vt_perm(t3_1, t2_1, c_perm2)  # r2_1
+        r[6] = _vt_perm(t3_0, t2_0, c_perm3)  # r3_0
+        r[7] = _vt_perm(t3_1, t2_1, c_perm3)  # r3_1
+        return r
+
+    # ---- Helper: store transposed V to Vt LDS ----
+    def _store_vt_to_lds(vt_lds_base_idx, warp_idx_val, lane_idx_val, vt8):
+        """VtManagerV1::store_transposed_v_to_lds.
+
+        4x8 block-wise row-major layout, no padding between rows/cols.
+        row_blk = (warp%2)*4 + lane/16
+        col_blk = (lane%16) + (warp/2)*16
+        block_offset = (row_blk * VT_BLKS_PER_ROW_PAD + col_blk) * VT_ELEMS_PER_BLK
+        """
+        row_blk = (warp_idx_val % arith.index(2)) * arith.index(
+            4
+        ) + lane_idx_val / arith.index(16)
+        col_blk = (lane_idx_val % arith.index(16)) + (
+            warp_idx_val / arith.index(2)
+        ) * arith.index(16)
+        block_offset = (
+            row_blk * arith.index(VT_BLKS_PER_ROW_PAD) + col_blk
+        ) * arith.index(VT_ELEMS_PER_BLK)
+        lds_vt_addr = vt_lds_base_idx + block_offset
+
+        # ds_write_b128 x 2 (4 dwords each = 32 fp8)
+        lo_packed = vector.from_elements(v4i32_type, vt8[0:4])
+        lo_i8 = vector.bitcast(v16i8_type, lo_packed)
+        vector.store(lo_i8, lds_buffer, [_raw(lds_vt_addr)])
+
+        hi_packed = vector.from_elements(v4i32_type, vt8[4:8])
+        hi_i8 = vector.bitcast(v16i8_type, hi_packed)
+        vector.store(hi_i8, lds_buffer, [_raw(lds_vt_addr + arith.index(16))])
+
+    # ---- Helper: load transposed V from Vt LDS ----
+    def _load_vt_from_lds(vt_lds_base_idx, lane_idx_val, col_offset):
+        """VtManagerV1::load_transposed_v_to_gpr.
+
+        Each warp reads 32x16 block from Vt LDS. Returns 2 i32 via ds_read_b32x2.
+        col_offset: Python int, multiple of 16, in [0, 512).
+
+        LDS address formula:
+          row_blk = lane/16
+          col_blk = (lane%16) / VT_COLS_PER_THR
+          row_inblk = lane % VT_ROWS_PER_THR
+          col_inblk = ((lane%8) / VT_ROWS_PER_THR) * VT_ROWS_PER_THR
+          fixed_col_blk = col_offset / VT_COLS_PER_THR
+          offset_tl_bl = 4 * VT_BLKS_PER_ROW_PAD * VT_ELEMS_PER_BLK = 8448
+        """
+        fixed_col_blk = col_offset // VT_COLS_PER_THR
+        fixed_block_offset = fixed_col_blk * VT_ELEMS_PER_BLK
+        offset_tl_bl = 4 * VT_BLKS_PER_ROW_PAD * VT_ELEMS_PER_BLK  # 8448
+
+        row_blk = lane_idx_val / arith.index(16)
+        col_blk = (lane_idx_val % arith.index(16)) / arith.index(VT_COLS_PER_THR)
+        row_inblk = lane_idx_val % arith.index(VT_ROWS_PER_THR)
+        col_inblk = (
+            (lane_idx_val % arith.index(8)) / arith.index(VT_ROWS_PER_THR)
+        ) * arith.index(VT_ROWS_PER_THR)
+        block_offset = (
+            row_blk * arith.index(VT_BLKS_PER_ROW_PAD) + col_blk
+        ) * arith.index(VT_ELEMS_PER_BLK)
+        inblock_offset = row_inblk * arith.index(VT_COLS_PER_THR) + col_inblk
+
+        lds_addr = vt_lds_base_idx + block_offset + inblock_offset
+
+        # ds_read_b32 x 2
+        v0 = _lds_load_prefer_agpr(
+            lds_addr, i32_type, static_byte_offset=fixed_block_offset
+        )
+        v1 = _lds_load_prefer_agpr(
+            lds_addr, i32_type, static_byte_offset=fixed_block_offset + offset_tl_bl
+        )
+        return v0, v1
+
+    # ---- Helper: warp reduce (butterfly XOR) ----
+    def _shfl_xor_f32(val_f32, offset_i32, width_i32):
+        """XOR shuffle for f32 via bitcast to i32 and back."""
+        # Bitcast f32 -> i32
+        val_i32 = _std_arith.BitcastOp(i32_type, val_f32).result
+        # Shuffle as i32
+        peer_i32 = _mlir_gpu.ShuffleOp(
+            val_i32, offset_i32, width_i32, _mlir_gpu.ShuffleMode.XOR
+        ).shuffleResult
+        # Bitcast i32 -> f32
+        return _std_arith.BitcastOp(compute_type, peer_i32).result
+
+    def _warp_reduce_max_16(val):
+        """Butterfly max reduce across MFMA column groups.
+
+        HK: reduce_range=64, stop_stride=15 -> strides [32, 16].
+        This reduces across the 4 column groups (each owning 4 K positions)
+        while keeping each row (Q head) independent.
+        """
+        w = _to_mlir(val)
+        width = _std_arith.ConstantOp(
+            i32_type, ir.IntegerAttr.get(i32_type, WARP_SIZE)
+        ).result
+        for sh in [32, 16]:
+            offset = _std_arith.ConstantOp(
+                i32_type, ir.IntegerAttr.get(i32_type, sh)
+            ).result
+            peer = _shfl_xor_f32(w, offset, width)
+            w = _std_arith.MaximumFOp(w, peer, fastmath=fm_fast).result
+        return w
+
+    def _warp_reduce_add_16(val):
+        """Butterfly sum reduce across MFMA column groups."""
+        w = _to_mlir(val)
+        width = _std_arith.ConstantOp(
+            i32_type, ir.IntegerAttr.get(i32_type, WARP_SIZE)
+        ).result
+        for sh in [32, 16]:
+            offset = _std_arith.ConstantOp(
+                i32_type, ir.IntegerAttr.get(i32_type, sh)
+            ).result
+            peer = _shfl_xor_f32(w, offset, width)
+            w = _std_arith.AddFOp(w, peer, fastmath=fm_fast).result
+        return w
+
+    # ---- Helper: Q loading (QManagerV3) ----
+    def _load_q_to_regs(qo_start_i32):
+        """Load Q from VRAM to registers via LDS staging.
+
+        QManagerV3: each warp loads 16x64 per pass, 9 passes total.
+        VRAM -> LDS (ds_write_b128), then LDS -> register (ds_read_b64).
+        Returns (q_nope_regs, q_rope_regs):
+          q_nope_regs: list of 16 v2i64 (16 sub-tiles x 32 cols each)
+          q_rope_regs: list of 2 v2i64 (2 sub-tiles x 32 cols each)
+        """
+        p_lds_q_warp = (
+            lds_base_idx
+            + arith.index(P_LDS_Q)
+            + warp_idx * arith.index(SZ_LDS_Q_PER_WARP)
+        )
+
+        # VRAM addressing: row = lane/4, col = (lane%4)*16
+        # s_offset = warp * 16 * QK_HEAD_DIM * sizeof(fp8)
+        # v_offset = (row * QK_HEAD_DIM + col) * sizeof(fp8)
+        s_offset_i32 = _std_arith.MulIOp(
+            _raw(warp_idx_i32),
+            _raw(arith.constant(16 * QK_HEAD_DIM, type=i32_type)),
+        ).result
+        # Add qo_start offset: qo_start * NUM_QO_HEADS * QK_HEAD_DIM
+        q_base_offset = _std_arith.MulIOp(
+            _raw(qo_start_i32),
+            _raw(arith.constant(NUM_QO_HEADS * QK_HEAD_DIM, type=i32_type)),
+        ).result
+        s_offset_i32 = _std_arith.AddIOp(s_offset_i32, q_base_offset).result
+
+        row = lane_idx / arith.index(4)
+        col = (lane_idx % arith.index(4)) * arith.index(16)
+        v_offset_i32 = _index_cast_to_i32(row * arith.index(QK_HEAD_DIM) + col)
+
+        # LDS store layout (QManagerV3):
+        # row_st = lane/4, col_st = (lane%4)*16
+        # v_offset_st = (row_st/2)*Q_BYTES_PER_2ROWS + ((row_st%2)*64 + col_st)
+        row_st = lane_idx / arith.index(4)
+        col_st = (lane_idx % arith.index(4)) * arith.index(16)
+        lds_st_offset = (
+            (row_st / arith.index(2)) * arith.index(Q_BYTES_PER_2ROWS)
+            + (row_st % arith.index(2)) * arith.index(Q_ELEM_PER_ROW)
+            + col_st
+        )
+
+        # LDS read layout (MFMA-compatible):
+        # row_ld = lane%16, col_ld = (lane/16)*8
+        # v_offset_ld = (row_ld/2)*Q_BYTES_PER_2ROWS + ((row_ld%2)*64 + col_ld)
+        row_ld = lane_idx % arith.index(16)
+        col_ld = (lane_idx / arith.index(16)) * arith.index(8)
+        lds_ld_offset = (
+            (row_ld / arith.index(2)) * arith.index(Q_BYTES_PER_2ROWS)
+            + (row_ld % arith.index(2)) * arith.index(Q_ELEM_PER_ROW)
+            + col_ld
+        )
+
+        q_regs = []  # Will hold 18 v2i64 = 16 nope + 2 rope
+
+        for pass_idx in range_constexpr(9):
+            col_chunk = pass_idx * Q_ELEM_PER_ROW  # 0, 64, 128, ..., 512
+            col_off_i32 = arith.constant(col_chunk, type=i32_type)
+
+            # VRAM -> VGPR: buffer_load_dwordx4 (16 fp8 values per lane)
+            # voff is in fp8 elements (= bytes); buffer_load auto-scales by
+            # element_bytes, so divide by 4 when loading as i32.
+            voff_bytes = _std_arith.AddIOp(_raw(v_offset_i32), _raw(col_off_i32)).result
+            voff_dw = _std_arith.DivSIOp(
+                voff_bytes,
+                _raw(arith.constant(4, type=i32_type)),
+            ).result
+            q_vram_data = buffer_ops.buffer_load(
+                query_rsrc,
+                voff_dw,
+                vec_width=4,
+                dtype=i32_type,
+                soffset_bytes=s_offset_i32,
+            )
+
+            rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
+
+            # VGPR -> LDS: ds_write_b128 at per-lane LDS address
+            lds_st_addr = p_lds_q_warp + lds_st_offset
+            lds_st_i64 = arith.index_cast(T.i64, lds_st_addr)
+            lds_st_ptr = _inttoptr_lds(_raw(lds_st_i64))
+            llvm.StoreOp(_raw(q_vram_data), lds_st_ptr, alignment=16)
+
+            rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+
+            # LDS -> register: 2x ds_read_b64 (MFMA layout)
+            # Sub-tile 0 at offset 0, sub-tile 1 at offset MFMA_K (32 bytes)
+            lds_rd_addr = p_lds_q_warp + lds_ld_offset
+            q0 = _lds_load_prefer_agpr(lds_rd_addr, i64_type, static_byte_offset=0)
+            q1 = _lds_load_prefer_agpr(lds_rd_addr, i64_type, static_byte_offset=MFMA_K)
+            q_regs.append((q0, q1))
+
+            rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+
+        # Split into nope (passes 0-7 -> 16 sub-tiles) and rope (pass 8 -> 2 sub-tiles)
+        q_nope_packs = []
+        for i in range_constexpr(8):
+            q_nope_packs.append(q_regs[i][0])  # sub-tile 0
+            q_nope_packs.append(q_regs[i][1])  # sub-tile 1
+        q_rope_packs = [q_regs[8][0], q_regs[8][1]]
+        return q_nope_packs, q_rope_packs
+
+    # ---- Helper: softmax scale + boundary masking ----
+    def _softmax_scale_p(p_vals, col_0_start_i32, kv_end_i32, check_boundary):
+        """Scale p_vals by softmax_scale, mask OOB to -inf."""
+        result = [None] * 8
+        for i in range_constexpr(8):
+            result[i] = _std_arith.MulFOp(
+                _raw(p_vals[i]), _raw(c_sm_scale), fastmath=fm_fast
+            ).result
+
+        if check_boundary:
+            for i in range_constexpr(8):
+                # Position of this element: col_0_start + (i//4)*16 + (i%4)
+                sub_offset = (i // 4) * 16 + (i % 4)
+                pos_i32 = _std_arith.AddIOp(
+                    _raw(col_0_start_i32),
+                    _raw(arith.constant(sub_offset, type=i32_type)),
+                ).result
+                is_oob = _std_arith.CmpIOp(
+                    CmpIPredicate.sge, pos_i32, _raw(kv_end_i32)
+                ).result
+                result[i] = _std_arith.SelectOp(
+                    is_oob, _raw(c_neg_inf_f32), result[i]
+                ).result
+        return result
+
+    # ---- Helper: online softmax ----
+    def _softmax(
+        p_vals,
+        row_max_old,
+        row_sum_e_old,
+        is_first_iter,
+        kv_tile_start_i32,
+        kv_end_i32,
+        check_boundary,
+    ):
+        """Online softmax: scale -> max -> exp2 -> sum -> rescale.
+
+        p_vals: 8 f32 attention scores for this thread
+        Returns: (p_exp_vals, row_max_new, row_sum_e_new, rescale)
+        """
+        # Column index for this thread's first element
+        col_0_idx = lane_idx / arith.index(16)
+        col_0_start_i32 = _std_arith.AddIOp(
+            _raw(_index_cast_to_i32(col_0_idx * arith.index(4))),
+            _raw(kv_tile_start_i32),
+        ).result
+
+        # Scale and mask
+        scaled = _softmax_scale_p(p_vals, col_0_start_i32, kv_end_i32, check_boundary)
+
+        # Local max of 8 values
+        local_max = scaled[0]
+        for i in range_constexpr(1, 8):
+            local_max = _std_arith.MaximumFOp(
+                local_max, _raw(scaled[i]), fastmath=fm_fast
+            ).result
+
+        # Warp reduce max (within 16-lane groups)
+        local_max = _warp_reduce_max_16(local_max)
+
+        # New row max
+        if is_first_iter:
+            new_row_max = local_max
+            rescale = _raw(c_one_f32)
+        else:
+            new_row_max = _std_arith.MaximumFOp(
+                local_max, _raw(row_max_old), fastmath=fm_fast
+            ).result
+            # rescale = exp2((old_max - new_max) * log2e)
+            diff = _std_arith.SubFOp(
+                _raw(row_max_old), new_row_max, fastmath=fm_fast
+            ).result
+            rescale_arg = _std_arith.MulFOp(
+                diff, _raw(c_log2e), fastmath=fm_fast
+            ).result
+            rescale = _fast_exp2(rescale_arg)
+
+        # exp(p - max) for each value, and sum
+        p_exp_vals = [None] * 8
+        local_sum = _raw(c_zero_f32)
+        for i in range_constexpr(8):
+            # exp2((p[i] - new_max) * log2e)
+            diff = _std_arith.SubFOp(
+                _raw(scaled[i]), new_row_max, fastmath=fm_fast
+            ).result
+            exp_arg = _std_arith.MulFOp(diff, _raw(c_log2e), fastmath=fm_fast).result
+            p_exp_vals[i] = _fast_exp2(exp_arg)
+            local_sum = _std_arith.AddFOp(
+                local_sum, p_exp_vals[i], fastmath=fm_fast
+            ).result
+
+        # Warp reduce sum
+        local_sum = _warp_reduce_add_16(local_sum)
+
+        # Update row_sum_e
+        if is_first_iter:
+            row_sum_e_new = local_sum
+        else:
+            row_sum_e_new = _std_arith.AddFOp(
+                _std_arith.MulFOp(
+                    rescale, _raw(row_sum_e_old), fastmath=fm_fast
+                ).result,
+                local_sum,
+                fastmath=fm_fast,
+            ).result
+
+        return p_exp_vals, new_row_max, row_sum_e_new, rescale
+
+    # ---- Helper: pack P from f32 to fp8 ----
+    def _pack_p_to_fp8(p_exp_vals):
+        """Pack 8 f32 -> 2 i32 (4x cvt_pk_fp8_f32) -> 1 i64 for MFMA."""
+        w0 = rocdl.cvt_pk_fp8_f32(
+            i32_type, _raw(p_exp_vals[0]), _raw(p_exp_vals[1]), c_zero_i32, 0
+        )
+        w0 = rocdl.cvt_pk_fp8_f32(
+            i32_type, _raw(p_exp_vals[2]), _raw(p_exp_vals[3]), w0, 1
+        )
+        w1 = rocdl.cvt_pk_fp8_f32(
+            i32_type, _raw(p_exp_vals[4]), _raw(p_exp_vals[5]), c_zero_i32, 0
+        )
+        w1 = rocdl.cvt_pk_fp8_f32(
+            i32_type, _raw(p_exp_vals[6]), _raw(p_exp_vals[7]), w1, 1
+        )
+        w0_i64 = _std_arith.ExtUIOp(i64_type, w0).result
+        w1_i64 = _std_arith.ExtUIOp(i64_type, w1).result
+        c32_i64 = _std_arith.ConstantOp(
+            i64_type, ir.IntegerAttr.get(i64_type, 32)
+        ).result
+        w1_shifted = _std_arith.ShLIOp(w1_i64, c32_i64).result
+        p_pack = _std_arith.OrIOp(w0_i64, w1_shifted).result
+        return p_pack
+
+    # ---- Helper: rescale oaccu ----
+    def _rescale_oaccu(oaccu, rescale):
+        """Multiply all oaccu accumulators by rescale factor."""
+        rescale_vec = vector.broadcast(v4f32_type, rescale)
+        result = [None] * len(oaccu)
+        for i in range_constexpr(len(oaccu)):
+            result[i] = _std_arith.MulFOp(
+                _raw(oaccu[i]), _raw(rescale_vec), fastmath=fm_fast
+            ).result
+        return result
+
+    # ---- Helper: output bf16 (simplified direct write, no LDS reshape) ----
+    def _write_output_bf16(oaccu, qo_start_i32, p_lds_o_base_idx):
+        """Write normalized oaccu to final_output as bf16.
+
+        Simplified version: each lane directly converts f32->bf16 and writes
+        via buffer_store. MFMA layout: lane%16 = row (Q head),
+        (lane/16)*4 + elem = col within sub-tile.
+        """
+        bf16_type = ir.BF16Type.get()
+        v4bf16_type = ir.VectorType.get([4], bf16_type)
+
+        # MFMA layout: row = lane%16, col_base = (lane/16)*4
+        mfma_row = lane_idx % arith.index(16)
+        mfma_col_base = (lane_idx / arith.index(16)) * arith.index(4)
+        qo_start_idx = arith.index_cast(T.index, qo_start_i32)
+        # VRAM row = mfma_row + qo_start*128 + warp*16
+        row_vram = (
+            mfma_row
+            + qo_start_idx * arith.index(NUM_QO_HEADS)
+            + warp_idx * arith.index(16)
+        )
+
+        for tile_idx in range_constexpr(NUM_PV_ITERS * 2):
+            col_offset = tile_idx * MFMA_N  # 0, 16, 32, ... 496
+
+            # Convert v4f32 -> v4bf16
+            bf16_vals = _std_arith.TruncFOp(v4bf16_type, _raw(oaccu[tile_idx])).result
+
+            # Bitcast v4bf16 (8 bytes) -> v2i32 for buffer_store_dwordx2
+            # Actually v4bf16 -> i64 -> use i64 store directly
+            # Or: cast v4bf16 to v4i16, then to v2i32
+            # Simplest: store v4bf16 as-is using f16 buffer format
+
+            # Cast v4bf16 -> v4i16 -> v2i32 for buffer_store
+            v4i16_type = ir.VectorType.get([4], ir.IntegerType.get_signless(16))
+            i16_vals = _std_arith.BitcastOp(v4i16_type, bf16_vals).result
+
+            # Shuffle i16 pairs into i32: [i16_0, i16_1] -> i32_0, [i16_2, i16_3] -> i32_1
+            i16_0 = vector.extract(i16_vals, static_position=[0], dynamic_position=[])
+            i16_1 = vector.extract(i16_vals, static_position=[1], dynamic_position=[])
+            i16_2 = vector.extract(i16_vals, static_position=[2], dynamic_position=[])
+            i16_3 = vector.extract(i16_vals, static_position=[3], dynamic_position=[])
+
+            # Pack i16 pairs to i32
+            lo_0 = _std_arith.ExtUIOp(i32_type, i16_0).result
+            hi_0 = _std_arith.ExtUIOp(i32_type, i16_1).result
+            c16 = _raw(arith.constant(16, type=i32_type))
+            dw0 = _std_arith.OrIOp(lo_0, _std_arith.ShLIOp(hi_0, c16).result).result
+
+            lo_1 = _std_arith.ExtUIOp(i32_type, i16_2).result
+            hi_1 = _std_arith.ExtUIOp(i32_type, i16_3).result
+            dw1 = _std_arith.OrIOp(lo_1, _std_arith.ShLIOp(hi_1, c16).result).result
+
+            # buffer_store_dwordx2 to final_output
+            # Byte offset: (row * V_HEAD_DIM + col_offset + mfma_col_base) * sizeof(bf16)
+            offset_i32 = _index_cast_to_i32(
+                (
+                    row_vram * arith.index(V_HEAD_DIM)
+                    + mfma_col_base
+                    + arith.index(col_offset)
+                )
+                * arith.index(2)
+            )
+            v2i32_vals = vector.from_elements(
+                ir.VectorType.get([2], i32_type), [dw0, dw1]
+            )
+            buffer_ops.buffer_store(
+                v2i32_vals,
+                final_output_rsrc,
+                offset_i32,
+                offset_is_bytes=True,
+            )
+
+    # ---- Helper: output f32 split (direct write, no LDS reshape) ----
+    def _write_output_split(
+        oaccu, partial_qo_loc_i32, row_max, row_sum_e, p_lds_o_base_idx
+    ):
+        """Write normalized oaccu to split_output as f32 + write LSE.
+
+        Direct write: each lane writes its 4 f32 values per sub-tile
+        using MFMA layout: row = lane%16, col_base = (lane/16)*4.
+        """
+        pqo_idx = arith.index_cast(T.index, partial_qo_loc_i32)
+        mfma_row = lane_idx % arith.index(16)
+        mfma_col_base = (lane_idx / arith.index(16)) * arith.index(4)
+        row_vram = (
+            mfma_row + pqo_idx * arith.index(NUM_QO_HEADS) + warp_idx * arith.index(16)
+        )
+
+        for tile_idx in range_constexpr(NUM_PV_ITERS * 2):
+            col_offset = tile_idx * MFMA_N  # 0, 16, 32, ..., 496
+
+            # buffer_store_dwordx4 to split_output
+            # Byte offset: (row * V_HEAD_DIM + col_offset + mfma_col_base) * sizeof(f32)
+            offset_i32 = _index_cast_to_i32(
+                (
+                    row_vram * arith.index(V_HEAD_DIM)
+                    + mfma_col_base
+                    + arith.index(col_offset)
+                )
+                * arith.index(4)  # sizeof(f32)
+            )
+            buffer_ops.buffer_store(
+                oaccu[tile_idx],
+                split_output_rsrc,
+                offset_i32,
+                offset_is_bytes=True,
+            )
+
+        # Write LSE: lse = row_max + ln(row_sum_e) / log2e
+        # Only first 16 lanes per warp write (one per MFMA result row)
+        if arith.cmpi(
+            CmpIPredicate.ult, lane_idx_i32, arith.constant(16, type=i32_type)
+        ):
+            # HK uses __builtin_amdgcn_logf (= v_log_f32 = log2) * inv_log2e
+            # which equals ln(sum_e). Use math.log (= ln) directly.
+            log_sum = _math.LogOp(_raw(row_sum_e)).result
+            lse = _std_arith.AddFOp(
+                _raw(row_max),
+                log_sum,
+                fastmath=fm_fast,
+            ).result
+            row_idx_i32 = _std_arith.AddIOp(
+                _std_arith.AddIOp(
+                    _raw(lane_idx_i32),
+                    _std_arith.MulIOp(
+                        _raw(warp_idx_i32),
+                        _raw(arith.constant(16, type=i32_type)),
+                    ).result,
+                ).result,
+                _std_arith.MulIOp(
+                    _raw(partial_qo_loc_i32),
+                    _raw(arith.constant(NUM_QO_HEADS, type=i32_type)),
+                ).result,
+            ).result
+            buffer_ops.buffer_store(
+                lse,
+                split_lse_rsrc,
+                row_idx_i32,
+            )
+
+    # ---- Helper: process one KV tile (GEMM1 + softmax + V + GEMM2) ----
+    def _process_tile(
+        p_lds_kv_base,
+        kv_tile_start_i32,
+        kv_end_i32,
+        q_nope,
+        q_rope,
+        row_max_in,
+        row_sum_e_in,
+        oaccu_in,
+        is_first_iter,
+        check_boundary,
+    ):
+        """Process one KV tile: QK GEMM -> softmax -> V transpose -> PV GEMM.
+
+        Returns (row_max, row_sum_e, oaccu) as updated values.
+        """
+        # ---- GEMM1: QK attention scores ----
+        p_comp = [_raw(c_zero_v4f32), _raw(c_zero_v4f32)]
+
+        for nope_pair in range_constexpr(NUM_NOPE_ITERS):
+            tile_0 = nope_pair * 2
+            tile_1 = nope_pair * 2 + 1
+
+            k0_lo = _load_k_from_lds(p_lds_kv_base, 0, tile_0 * BLOCK_K)
+            k0_hi = _load_k_from_lds(p_lds_kv_base, 16, tile_0 * BLOCK_K)
+            k1_lo = _load_k_from_lds(p_lds_kv_base, 0, tile_1 * BLOCK_K)
+            k1_hi = _load_k_from_lds(p_lds_kv_base, 16, tile_1 * BLOCK_K)
+
+            rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=2))
+
+            q_0 = q_nope[tile_0]
+            q_1 = q_nope[tile_1]
+
+            if nope_pair == 0:
+                p_comp[0] = _mfma_fp8(
+                    v4f32_type, [k0_lo, q_0, _raw(c_zero_v4f32), 0, 0, 0]
+                )
+                p_comp[1] = _mfma_fp8(
+                    v4f32_type, [k0_hi, q_0, _raw(c_zero_v4f32), 0, 0, 0]
+                )
+            else:
+                p_comp[0] = _mfma_fp8(v4f32_type, [k0_lo, q_0, p_comp[0], 0, 0, 0])
+                p_comp[1] = _mfma_fp8(v4f32_type, [k0_hi, q_0, p_comp[1], 0, 0, 0])
+
+            rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+
+            p_comp[0] = _mfma_fp8(v4f32_type, [k1_lo, q_1, p_comp[0], 0, 0, 0])
+            p_comp[1] = _mfma_fp8(v4f32_type, [k1_hi, q_1, p_comp[1], 0, 0, 0])
+
+        for rope_pair in range_constexpr(NUM_ROPE_ITERS):
+            tile_0 = rope_pair * 2
+            tile_1 = rope_pair * 2 + 1
+
+            k0_lo = _load_k_from_lds(p_lds_kv_base, 0, (tile_0 + 16) * BLOCK_K)
+            k0_hi = _load_k_from_lds(p_lds_kv_base, 16, (tile_0 + 16) * BLOCK_K)
+            k1_lo = _load_k_from_lds(p_lds_kv_base, 0, (tile_1 + 16) * BLOCK_K)
+            k1_hi = _load_k_from_lds(p_lds_kv_base, 16, (tile_1 + 16) * BLOCK_K)
+
+            rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=2))
+
+            p_comp[0] = _mfma_fp8(
+                v4f32_type, [k0_lo, q_rope[tile_0], p_comp[0], 0, 0, 0]
+            )
+            p_comp[1] = _mfma_fp8(
+                v4f32_type, [k0_hi, q_rope[tile_0], p_comp[1], 0, 0, 0]
+            )
+
+            rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+
+            p_comp[0] = _mfma_fp8(
+                v4f32_type, [k1_lo, q_rope[tile_1], p_comp[0], 0, 0, 0]
+            )
+            p_comp[1] = _mfma_fp8(
+                v4f32_type, [k1_hi, q_rope[tile_1], p_comp[1], 0, 0, 0]
+            )
+
+        # ---- Extract p_comp values for softmax ----
+        p_vals = []
+        for sub in range_constexpr(2):
+            for ii in range_constexpr(4):
+                p_vals.append(
+                    vector.extract(
+                        p_comp[sub], static_position=[ii], dynamic_position=[]
+                    )
+                )
+
+        # ---- Load V from KV LDS ----
+        v8_raw = _load_v_from_lds(p_lds_kv_base, warp_idx, lane_idx)
+        rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+        rocdl.sched_barrier(0)
+
+        # ---- Softmax ----
+        p_exp_vals, row_max_new, row_sum_e_new, rescale = _softmax(
+            p_vals,
+            row_max_in,
+            row_sum_e_in,
+            is_first_iter,
+            kv_tile_start_i32,
+            kv_end_i32,
+            check_boundary,
+        )
+
+        # ---- Transpose V and store to Vt LDS ----
+        vt8 = _transpose_v(v8_raw)
+        vt_lds_base = lds_base_idx + arith.index(P_LDS_VT)
+        _store_vt_to_lds(vt_lds_base, warp_idx, lane_idx, vt8)
+
+        # ---- Rescale oaccu (not first iter) ----
+        if not is_first_iter:
+            oaccu_in = _rescale_oaccu(oaccu_in, rescale)
+
+        # ---- Pack P to fp8 ----
+        p_pack = _pack_p_to_fp8(p_exp_vals)
+
+        # ---- Barrier: wait for Vt store ----
+        _barrier(lgkmcnt=0)
+        rocdl.sched_barrier(0)
+
+        # ---- GEMM2: PV accumulation ----
+        c32_i64_pv = _std_arith.ConstantOp(
+            i64_type, ir.IntegerAttr.get(i64_type, 32)
+        ).result
+        oaccu_out = list(oaccu_in)
+        for pv_iter in range_constexpr(NUM_PV_ITERS):
+            col_offset_0 = pv_iter * MFMA_N * 2
+            col_offset_1 = col_offset_0 + MFMA_N
+
+            vt0_lo, vt0_hi = _load_vt_from_lds(vt_lds_base, lane_idx, col_offset_0)
+            vt1_lo, vt1_hi = _load_vt_from_lds(vt_lds_base, lane_idx, col_offset_1)
+
+            rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=2))
+
+            vt0_lo_i64 = _std_arith.ExtUIOp(i64_type, vt0_lo).result
+            vt0_hi_i64 = _std_arith.ExtUIOp(i64_type, vt0_hi).result
+            vt0_hi_shifted = _std_arith.ShLIOp(vt0_hi_i64, c32_i64_pv).result
+            kv_mfma_0 = _std_arith.OrIOp(vt0_lo_i64, vt0_hi_shifted).result
+
+            oaccu_out[pv_iter * 2] = _mfma_fp8(
+                v4f32_type, [kv_mfma_0, p_pack, oaccu_out[pv_iter * 2], 0, 0, 0]
+            )
+
+            rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+
+            vt1_lo_i64 = _std_arith.ExtUIOp(i64_type, vt1_lo).result
+            vt1_hi_i64 = _std_arith.ExtUIOp(i64_type, vt1_hi).result
+            vt1_hi_shifted = _std_arith.ShLIOp(vt1_hi_i64, c32_i64_pv).result
+            kv_mfma_1 = _std_arith.OrIOp(vt1_lo_i64, vt1_hi_shifted).result
+
+            oaccu_out[pv_iter * 2 + 1] = _mfma_fp8(
+                v4f32_type, [kv_mfma_1, p_pack, oaccu_out[pv_iter * 2 + 1], 0, 0, 0]
+            )
+
+        return row_max_new, row_sum_e_new, oaccu_out
+
+    # ==================================================================
+    # Main kernel body: persistent-thread work loop
+    # ==================================================================
     for work_idx in range(work_start_idx, work_end_idx):
-        # Load MlaWorkInfo dw1..5 (partial_qo_loc, qo_start, qo_end, kv_start, kv_end)
-        wi_base = work_idx * SIZE_MLA_WORK_INFO_IN_DW
+        # Load MlaWorkInfo
+        wi_base_i32 = _index_cast_to_i32(work_idx * SIZE_MLA_WORK_INFO_IN_DW)
         wi_dw1_4 = buffer_ops.buffer_load(
-            work_info_set_rsrc, wi_base + 1, vec_width=4, dtype=T.i32
+            work_info_set_rsrc,
+            arith.addi(wi_base_i32, arith.constant(1, type=i32_type)),
+            vec_width=4,
+            dtype=T.i32,
         )
         wi_dw5 = buffer_ops.buffer_load(
-            work_info_set_rsrc, wi_base + 5, vec_width=1, dtype=T.i32
+            work_info_set_rsrc,
+            arith.addi(wi_base_i32, arith.constant(5, type=i32_type)),
+            vec_width=1,
+            dtype=T.i32,
         )
         partial_qo_loc = vector.extract(wi_dw1_4, [0])
         qo_start = vector.extract(wi_dw1_4, [1])
         qo_end = vector.extract(wi_dw1_4, [2])
         kv_start = vector.extract(wi_dw1_4, [3])
         kv_end = wi_dw5
+        kv_len = arith.subi(kv_end, kv_start)
 
-        # tid = gpu.thread_idx.x
-        # if arith.cmpi(CmpIPredicate.eq, tid, arith.constant(5, type=T.i32)):
-        #     fx.printf(
-        #         "work_idx={} partial_qo_loc={} qo_start={} qo_end={} kv_start={} kv_end={}",
-        #         work_idx, partial_qo_loc, qo_start, qo_end, kv_start, kv_end,
-        #     )
+        # ---- Load Q from VRAM to registers ----
+        q_nope_packs, q_rope_packs = _load_q_to_regs(qo_start)
+        rocdl.sched_barrier(0)
+
+        # ---- KV tile iteration ----
+        p_lds_kv_0_base = lds_base_idx + arith.index(P_LDS_KV_0)
+        p_lds_kv_1_base = lds_base_idx + arith.index(P_LDS_KV_1)
+
+        kv_warp_offset_i32 = _std_arith.MulIOp(
+            _raw(warp_idx_i32),
+            _raw(arith.constant(KV_SUB_BYTES, type=i32_type)),
+        ).result
+
+        p_lds_kv_0_warp_i32 = _std_arith.AddIOp(
+            _raw(_index_cast_to_i32(p_lds_kv_0_base)),
+            kv_warp_offset_i32,
+        ).result
+        p_lds_kv_1_warp_i32 = _std_arith.AddIOp(
+            _raw(_index_cast_to_i32(p_lds_kv_1_base)),
+            kv_warp_offset_i32,
+        ).result
+
+        # Initialize softmax state
+        row_max = _raw(c_neg_inf_f32)
+        row_sum_e = _raw(c_zero_f32)
+        oaccu = [_raw(c_zero_v4f32)] * (NUM_PV_ITERS * 2)
+
+        # Compute number of tiles
+        c_block_n = arith.constant(BLOCK_N, type=i32_type)
+        c_block_n_m1 = arith.constant(BLOCK_N - 1, type=i32_type)
+        num_tiles = arith.divui(arith.addi(kv_len, c_block_n_m1), c_block_n)
+        num_tiles_idx = arith.index_cast(T.index, num_tiles)
+
+        # ---- Tile loop ----
+        # We use Python range with compile-time max and break early via
+        # scf.IfOp to avoid complex SSA state passing through scf.ForOp.
+        # The tile loop processes tiles [0, num_tiles).
+        # For each tile:
+        #   1. Resolve KV page indices
+        #   2. Load KV tile to LDS (p_lds_kv_0 region, no double-buffering for now)
+        #   3. Barrier
+        #   4. Process tile (GEMM1 + softmax + V + GEMM2)
+        #
+        # First tile: is_first_iter=True, always check boundary
+        # Last tile: always check boundary
+        # Middle tiles: no boundary check
+
+        # --- First tile ---
+        row_kv_ld_first = _get_kv_ld_row(kv_start, kv_end, True)
+        _async_load_kv_all(
+            p_lds_kv_0_warp_i32,
+            row_kv_ld_first,
+            kv_ld_col_base_i32,
+            check_boundary=True,
+        )
+
+        _barrier(vmcnt=0, lgkmcnt=0)
+        rocdl.sched_barrier(0)
+
+        row_max, row_sum_e, oaccu = _process_tile(
+            p_lds_kv_0_base,
+            kv_start,
+            kv_end,
+            q_nope_packs,
+            q_rope_packs,
+            row_max,
+            row_sum_e,
+            oaccu,
+            is_first_iter=True,
+            check_boundary=True,
+        )
+
+        # --- Middle + last tiles (if any) ---
+        # Use scf.ForOp with tile index [1, num_tiles)
+        # Carried values: row_max, row_sum_e, oaccu[0..31]
+        c_one_idx = arith.index(1)
+        init_args = [row_max, row_sum_e] + oaccu
+        result_types = [compute_type, compute_type] + [v4f32_type] * (NUM_PV_ITERS * 2)
+
+        for_op = scf.ForOp(
+            _raw(c_one_idx),
+            _raw(num_tiles_idx),
+            _raw(c_one_idx),
+            [_raw(v) if not isinstance(v, ir.Value) else v for v in init_args],
+        )
+        with ir.InsertionPoint(for_op.body):
+            tile_iv = for_op.induction_variable  # index type
+            tile_iv_i32 = _index_cast_to_i32(tile_iv)
+            kv_tile_start_i32 = _std_arith.AddIOp(
+                _raw(kv_start),
+                _std_arith.MulIOp(tile_iv_i32, _raw(c_block_n)).result,
+            ).result
+
+            # Unpack carried state
+            rm_carried = for_op.inner_iter_args[0]
+            rse_carried = for_op.inner_iter_args[1]
+            oaccu_carried = [
+                for_op.inner_iter_args[2 + i] for i in range(NUM_PV_ITERS * 2)
+            ]
+
+            # Determine if this is the last tile (needs boundary check)
+            is_last_tile_i32 = _std_arith.AddIOp(
+                tile_iv_i32,
+                _raw(arith.constant(1, type=i32_type)),
+            ).result
+            last_cond = _std_arith.CmpIOp(
+                CmpIPredicate.sge,
+                is_last_tile_i32,
+                _raw(num_tiles),
+            ).result
+
+            # Load KV tile (with boundary check on last tile)
+            # For simplicity, always check boundary -- slightly slower but correct
+            row_kv_ld_tile = _get_kv_ld_row(kv_tile_start_i32, _raw(kv_end), True)
+            _async_load_kv_all(
+                p_lds_kv_0_warp_i32,
+                row_kv_ld_tile,
+                kv_ld_col_base_i32,
+                check_boundary=True,
+            )
+
+            _barrier(vmcnt=0, lgkmcnt=0)
+            rocdl.sched_barrier(0)
+
+            rm_new, rse_new, oaccu_new = _process_tile(
+                p_lds_kv_0_base,
+                kv_tile_start_i32,
+                _raw(kv_end),
+                q_nope_packs,
+                q_rope_packs,
+                rm_carried,
+                rse_carried,
+                oaccu_carried,
+                is_first_iter=False,
+                check_boundary=True,
+            )
+
+            yield_vals = [rm_new, rse_new] + oaccu_new
+            yield_vals = [
+                _raw(v) if not isinstance(v, ir.Value) else v for v in yield_vals
+            ]
+            scf.YieldOp(yield_vals)
+
+        # Unpack results from for loop
+        row_max = for_op.results[0]
+        row_sum_e = for_op.results[1]
+        oaccu = [for_op.results[2 + i] for i in range(NUM_PV_ITERS * 2)]
+
+        # ---- Normalize output: oaccu *= 1/row_sum_e ----
+        reci_sum = _std_arith.DivFOp(
+            _raw(c_one_f32), row_sum_e, fastmath=fm_fast
+        ).result
+        reci_vec = vector.broadcast(v4f32_type, reci_sum)
+        for i in range_constexpr(len(oaccu)):
+            oaccu[i] = _std_arith.MulFOp(
+                oaccu[i], _raw(reci_vec), fastmath=fm_fast
+            ).result
+
+        # ---- Output dispatch ----
+        p_lds_o = p_lds_kv_0_base
+
+        if arith.cmpi(
+            CmpIPredicate.slt, partial_qo_loc, arith.constant(0, type=i32_type)
+        ):
+            _write_output_bf16(oaccu, qo_start, p_lds_o)
+        else:
+            _write_output_split(oaccu, partial_qo_loc, row_max, row_sum_e, p_lds_o)
 
 
+# ---------------------------------------------------------------------------
+# JIT launcher
+# ---------------------------------------------------------------------------
 @flyc.jit
 def launch_mla_fwd_decode_h128_fp8_fp8(
     query: fx.Tensor,
@@ -125,6 +1588,6 @@ def launch_mla_fwd_decode_h128_fp8_fp8(
     ).launch(
         grid=(num_cus, 1, 1),
         block=(NUM_THREADS, 1, 1),
-        # smem=lds_size,
+        smem=0,  # LDS is statically allocated via SmemAllocator
         stream=stream,
     )
