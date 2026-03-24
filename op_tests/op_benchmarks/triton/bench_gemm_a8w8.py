@@ -1,7 +1,7 @@
 import sys
 import triton
 import math
-from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8 as triton_gemm_a8w8
+from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8
 from aiter.ops.triton.gluon.gemm_a8w8 import (
     gemm_a8w8 as gluon_gemm_a8w8,
     gemm_a8w8_preshuffle as gluon_gemm_a8w8_preshuffle,
@@ -25,7 +25,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 
 
 def bench_gemm_fn(
-    M: int, N: int, K: int, metric: str, layout: str, shuffle: bool, impl: callable
+    M: int, N: int, K: int, metric: str, layout: str, shuffle: bool, impl: callable, use_gluon: bool = False
 ):
     # NOTE: Assume bias and output has the same dtype
     c_dtype = str_to_torch_dtype["bf16"]
@@ -46,11 +46,18 @@ def bench_gemm_fn(
     mem_read = (M * K) * x.element_size() + (N * K) * weight.element_size()
     mem_write = (M * N) * bias.element_size()
     mem = mem_read + mem_write
-    ms = triton.testing.do_bench(
-        lambda: impl(x, weight, x_scale, w_scale, bias, c_dtype, y),  # noqa: E731
-        warmup=25,
-        rep=100,
-    )
+    if use_gluon:
+        ms = triton.testing.do_bench(
+            lambda: impl(x, weight, x_scale, w_scale, bias, c_dtype, y, use_gluon=use_gluon),  # noqa: E731
+            warmup=25,
+            rep=100,
+        )
+    else:
+        ms = triton.testing.do_bench(
+            lambda: impl(x, weight, x_scale, w_scale, bias, c_dtype, y),  # noqa: E731
+            warmup=25,
+            rep=100,
+        )
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -65,7 +72,7 @@ def bench_gemm_fn(
         raise ValueError("Unknown metric: " + metric)
 
 
-def run_model_benchmark(args, impl):
+def run_model_benchmark(args, impl, use_gluon=False):
     """
     Runs benchmark given a --model argument.
     """
@@ -99,12 +106,12 @@ def run_model_benchmark(args, impl):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(M, N, K, metric, args.layout, args.shuffle, impl)
+        return bench_gemm_fn(M, N, K, metric, args.layout, args.shuffle, impl, use_gluon)
 
     bench_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
 
-def run_shape_benchmark(args, impl):
+def run_shape_benchmark(args, impl, use_gluon=False):
     """
     Runs a benchmark with given tensor shapes.
     """
@@ -114,7 +121,7 @@ def run_shape_benchmark(args, impl):
     def bench_gemm_a8w8(M, N, K, metric, model_name=None, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric, args.layout, args.shuffle, impl)
+        return bench_gemm_fn(M, N, K, metric, args.layout, args.shuffle, impl, use_gluon)
 
     bench_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
@@ -123,7 +130,11 @@ def run_benchmark(args, defaults):
     assert not (args.shape and args.model) or not (
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
-    if args.gluon:
+    use_gluon = False
+    if args.gfx1250_gluon:
+        use_gluon = True
+        impl = gemm_a8w8
+    elif args.gluon:
         if args.shuffle:
             impl = gluon_gemm_a8w8_preshuffle
         else:
@@ -131,7 +142,7 @@ def run_benchmark(args, defaults):
     else:
         if args.shuffle:
             raise Exception("Argument --shuffle is only supported with --gluon flag.")
-        impl = triton_gemm_a8w8
+        impl = gemm_a8w8
     if args.model:
         unsupported_args = []
         for arg in unsupported_args:
@@ -139,7 +150,7 @@ def run_benchmark(args, defaults):
                 raise Exception(
                     f"Argument '{arg}' is not supported for benchmarking with the --model flag."
                 )
-        run_model_benchmark(args, impl)
+        run_model_benchmark(args, impl, use_gluon)
     else:
         unsupported_args = [
             "fc1",
@@ -151,7 +162,7 @@ def run_benchmark(args, defaults):
                 raise Exception(
                     f"Argument '{arg}' is not supported for benchmarking without the --model flag."
                 )
-        run_shape_benchmark(args, impl)
+        run_shape_benchmark(args, impl, use_gluon)
 
 
 def parse_args():
@@ -166,6 +177,11 @@ def parse_args():
         "--shuffle",
         action="store_true",
         help="Preshuffle weight",
+    )
+    parser.add_argument(
+        "--gfx1250-gluon",
+        action="store_true",
+        help="Use gfx1250 Gluon implementation",
     )
     return get_ff_args(parser)
 
