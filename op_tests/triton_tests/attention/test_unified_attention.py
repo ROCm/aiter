@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from typing import Optional
-
 import pytest
 import torch
 
@@ -87,8 +86,6 @@ def ref_paged_attn(
         start_idx += query_len
 
     return torch.cat(outputs, dim=0)
-
-from typing import Optional
 
 # All the parametrization stays here on the "base" test
 BASE_SEQ_LENS = [
