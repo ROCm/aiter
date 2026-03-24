@@ -46,9 +46,15 @@ def _moe_sorting_impl(
     sorted_weights = torch.empty(
         max_num_tokens_padded, dtype=dtypes.fp32, device=device
     )
-    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
+    if expert_mask is not None:
+        sorted_expert_ids = torch.zeros(max_num_m_blocks, dtype=dtypes.i32, device=device)
+    else:
+        sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+    if expert_mask is not None:
+        moe_buf = torch.zeros((M, model_dim), dtype=moebuf_dtype, device=device)
+    else:
+        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
     fwd_fn = aiter.moe_sorting_opus_fwd if use_opus else aiter.moe_sorting_fwd
     fwd_fn(
@@ -1227,13 +1233,13 @@ def fused_moe_2stages(
         a1 = hidden_states
     if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         ratio = a1_scale.element_size() // a1.element_size()
-        a2 = torch.empty(
+        a2 = torch.zeros(
             (token_num + (token_num * ratio + 127) // 128, topk, inter_dim),
             dtype=q_dtype_a,
             device=device,
         )
     else:
-        a2 = torch.empty(
+        a2 = torch.zeros(
             (token_num, topk, inter_dim),
             dtype=dtype,
             device=device,
