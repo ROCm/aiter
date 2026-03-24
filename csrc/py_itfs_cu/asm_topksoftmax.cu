@@ -114,9 +114,7 @@ void topk_softmax_asm(aiter_tensor_t* topk_weights,         // [num_tokens, topk
         AITER_CHECK(false, __func__, " not find kernel " + kernelName);
 
 
-    int prev_device;
-    HIP_CALL(hipGetDevice(&prev_device));
-    HIP_CALL(hipSetDevice(gating_output->device_id));
+    const HipDeviceGuard device_guard(gating_output->device_id);
 
     uint gdx = (num_tokens + subm - 1) / subm;
     AITER_CHECK(gdx >> 31 == 0, "num_tokens too large: ", num_tokens);
@@ -129,5 +127,4 @@ void topk_softmax_asm(aiter_tensor_t* topk_weights,         // [num_tokens, topk
                              1,                     // bdy
                              1,                     // bdz
                              stream});
-    HIP_CALL(hipSetDevice(prev_device));
 }
