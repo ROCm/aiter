@@ -579,27 +579,52 @@ def gemm_a8w8_bpreshuffle(
     n = WQ.shape[0]
     k = XQ.shape[-1]
 
-    # if (
-    #     ck_config is None
-    #     and dtype == dtypes.bf16
-    #     and bias is not None
-    #     and WQ.dtype != dtypes.i8
-    # ):
-    #     res = gemm_a8w8_ASM(XQ, WQ, x_scale, w_scale, bias, dtype=dtype, check=check)
-    #     if res is not None:
-    #         return res
-    assert WQ.dtype == dtypes.fp8, "gemm_a8w8_bpreshuffle only support fp8 now"
-    assert bias is None, "gemm_a8w8_bpreshuffle does not support bias now"
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
     if not ENABLE_CK:
+        can_use_asm = (
+            dtype == dtypes.bf16
+            and XQ.dtype == dtypes.i8
+            and WQ.dtype == dtypes.i8
+            and x_scale.dtype == dtypes.fp32
+            and w_scale.dtype == dtypes.fp32
+        )
+        if can_use_asm and (
+            get_GEMM_config_with_quant_type(
+                m,
+                n,
+                k,
+                dtypes.i8,
+                AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
+            )
+            is not None
+        ):
+            asm_bias = bias
+            if asm_bias is None:
+                asm_bias = torch.zeros(
+                    (1, n), dtype=dtypes.fp32, device=XQ.device
+                )
+            else:
+                asm_bias = asm_bias.to(dtype=dtypes.fp32, device=XQ.device)
+                if asm_bias.dim() == 1:
+                    asm_bias = asm_bias.view(1, -1)
+            return gemm_a8w8_ASM(
+                XQ,
+                WQ,
+                x_scale,
+                w_scale,
+                asm_bias,
+                dtype=dtype,
+            )
+
         raise RuntimeError(
-            "gemm_a8w8_bpreshuffle requires CK-format preshuffled weights, "
-            "which is incompatible with ENABLE_CK=0. Use gemm_a8w8() with "
-            "non-preshuffled weights instead."
+            "gemm_a8w8_bpreshuffle with ENABLE_CK=0: no ASM config found "
+            "for this shape. Ensure tuned config exists for i8 weights."
         )
 
-    # CKTile only supports bf16 dtype
+    # CK path — only supports fp8
+    assert WQ.dtype == dtypes.fp8, "CK gemm_a8w8_bpreshuffle only supports fp8"
+    assert bias is None, "CK gemm_a8w8_bpreshuffle does not support bias"
     config = get_GEMM_config_with_quant_type(
         m,
         n,
@@ -613,8 +638,7 @@ def gemm_a8w8_bpreshuffle(
             return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
         elif libtype == "cktile":
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
-    else:
-        return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+    return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
 
 def gemm_a8w8_blockscale_fake(
