@@ -5,7 +5,7 @@ import os
 import shutil
 import sys
 
-from setuptools import Distribution, setup
+from setuptools import Distribution, find_packages, setup
 from setuptools.command.build_ext import build_ext
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -71,11 +71,11 @@ def prepare_packaging():
 
 
 if is_develop_mode():
-    packages = ["aiter"]
+    packages = find_packages(include=["aiter", "aiter.*"])
     write_install_mode()
 else:
     prepare_packaging()
-    packages = ["aiter_meta", "aiter"]
+    packages = find_packages(include=["aiter", "aiter.*", "aiter_meta"])
 
 
 def _is_metadata_only():

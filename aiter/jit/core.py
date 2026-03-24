@@ -764,9 +764,12 @@ def build_module(
             if blob_gen_cmd:
                 blob_dir = f"{op_dir}/blob/"
                 os.makedirs(blob_dir, exist_ok=True)
+                cmd = blob_gen_cmd.format(blob_dir)
+                # Explicitly set PYTHONPATH to script's directory for sibling imports
+                script_dir = os.path.dirname(os.path.abspath(cmd.split()[0]))
                 if AITER_LOG_MORE:
-                    logger.info(f"exec_blob ---> {PY} {blob_gen_cmd.format(blob_dir)}")
-                os.system(f"{PY} {blob_gen_cmd.format(blob_dir)}")
+                    logger.info(f"exec_blob ---> {PY} {cmd}")
+                os.system(f"PYTHONPATH={script_dir}:$PYTHONPATH {PY} {cmd}")
                 sources += rename_cpp_to_cu([blob_dir], src_dir, hipify, recursive=True)
             return sources
 
