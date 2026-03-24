@@ -62,7 +62,6 @@ def model_benchmark_configs(args):
 
 def benchmark(args):
     dtype = str_to_torch_dtype[args.dtype]
-    torch.set_default_dtype(dtype)
 
     configs = []
 
