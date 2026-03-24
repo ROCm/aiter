@@ -204,15 +204,14 @@ def torch_mla_extend(
     "q_dtype, kv_dtype, out_dtype, use_out_scale",
     [
         (torch.bfloat16, torch.bfloat16, torch.bfloat16, False),
-        # (torch.bfloat16, e4m3_dtype, torch.bfloat16, True),
-        # (e4m3_dtype, e4m3_dtype, torch.bfloat16, True),
+        (torch.bfloat16, e4m3_dtype, torch.bfloat16, True),
+        (e4m3_dtype, e4m3_dtype, torch.bfloat16, True),
     ],
 )
 @pytest.mark.parametrize(
     "backend, shuffled_kv_cache",
     [
         # ("triton", False),  # use triton
-        # ("gluon", False),
         ("gluon", True),
     ],
 )
@@ -311,6 +310,7 @@ def test_mla_decode_fwd(
             shuffled_kv_cache=shuffled_kv_cache,
             num_warps=2,
             waves_per_eu=1,
+            num_stages=2,
             num_segments=8,
         )
     else:

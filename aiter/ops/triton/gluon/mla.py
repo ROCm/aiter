@@ -180,6 +180,7 @@ def mla_decode_fwd(
     shuffled_kv_cache: bool,
     num_warps: int,
     waves_per_eu: int,
+    num_stages: int,
     num_segments: int,
 ):
     assert causal, "Only causal attention is supported"
@@ -234,6 +235,7 @@ def mla_decode_fwd(
     attn_config["num_warps"] = num_warps
     attn_config["waves_per_eu"] = waves_per_eu
     attn_config["NUM_SEGMENTS_PER_SEQ"] = num_segments
+    attn_config["num_stages"] = num_stages
     reduce_config["NUM_SEGMENTS_PER_SEQ"] = num_segments
 
     NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
