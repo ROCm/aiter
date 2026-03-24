@@ -28,8 +28,8 @@ def fused_qk_norm_rope_cache_quant_shuffle(
 ) -> None: ...
 
 
-@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle")
-def fused_qk_rmsnorm(
+@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle", fc_name="fused_qk_rmsnorm")
+def _fused_qk_rmsnorm_kernel(
     q: Tensor,
     q_weight: Tensor,
     q_eps: float,
@@ -37,6 +37,28 @@ def fused_qk_rmsnorm(
     k_weight: Tensor,
     k_eps: float,
 ) -> tuple[Tensor, Tensor]: ...
+
+
+_FUSED_QK_FALLBACK_M = 16384
+
+
+def fused_qk_rmsnorm(
+    q: Tensor,
+    q_weight: Tensor,
+    q_eps: float,
+    k: Tensor,
+    k_weight: Tensor,
+    k_eps: float,
+) -> tuple[Tensor, Tensor]:
+    m = q.size(0)
+    q_n = q.size(1)
+    k_n = k.size(1)
+    if q_n != k_n and m >= _FUSED_QK_FALLBACK_M:
+        from .rmsnorm import rmsnorm2d_fwd
+        q_out = rmsnorm2d_fwd(q, q_weight, q_eps)
+        k_out = rmsnorm2d_fwd(k, k_weight, k_eps)
+        return q_out, k_out
+    return _fused_qk_rmsnorm_kernel(q, q_weight, q_eps, k, k_weight, k_eps)
 
 
 @compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle")

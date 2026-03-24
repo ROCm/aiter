@@ -83,7 +83,7 @@ def test_fused_qk_rmsnorm(
         q, q_weight, q_eps, k, k_weight, k_eps
     )
 
-    aiter.fused_qk_rmsnorm(q_out, q_weight, q_eps, k_out, k_weight, k_eps)
+    q_out, k_out = aiter.fused_qk_rmsnorm(q_out, q_weight, q_eps, k_out, k_weight, k_eps)
 
     info = f"dtype:{dtype}, M:{m}, N1:{n1}, N2:{n2}"
     msg = (
