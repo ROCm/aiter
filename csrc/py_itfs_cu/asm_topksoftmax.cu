@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
-#include "py_itfs_common.h"
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <torch/all.h>
 #include "asm_topksoftmax_configs.hpp"
+#include <memory>
 
 struct __attribute__((packed)) KernelArgs
 {
@@ -51,7 +48,7 @@ std::pair<std::string, int> get_heuristic_kernel_topksoftmax(std::string arch_id
         }
     }
 
-    TORCH_CHECK(!kernelName.empty(),
+    AITER_CHECK(!kernelName.empty(),
     __func__,
     ": cannot get heuristic kernel!"
     " arch_id:", arch_id,
@@ -62,31 +59,32 @@ std::pair<std::string, int> get_heuristic_kernel_topksoftmax(std::string arch_id
     return {kernelName, subm};
 }
 
-void topk_softmax_asm(torch::Tensor& topk_weights,         // [num_tokens, topk]
-                      torch::Tensor& topk_indices,         // [num_tokens, topk]
-                      torch::Tensor& token_expert_indices, // [num_tokens, topk]
-                      torch::Tensor& gating_output,        // [num_tokens, num_experts]
-                      bool need_renorm)
+extern "C" __attribute__((visibility("default")))
+void topk_softmax_asm(AiterTensor* topk_weights,         // [num_tokens, topk]
+                      AiterTensor* topk_indices,         // [num_tokens, topk]
+                      AiterTensor* token_expert_indices, // [num_tokens, topk]
+                      AiterTensor* gating_output,        // [num_tokens, num_experts]
+                      int need_renorm, hipStream_t stream)
 {
     std::string arch_id = get_gpu_arch();
-    const uint num_experts = gating_output.size(-1);
-    const uint num_tokens  = gating_output.numel() / num_experts;
-    const uint topk        = topk_weights.size(-1);
-    const uint out_stride  = topk_weights.stride(0);
+    const uint num_experts = gating_output->size(-1);
+    const uint num_tokens  = gating_output->numel() / num_experts;
+    const uint topk        = topk_weights->size(-1);
+    const uint out_stride  = topk_weights->stride(0);
     const uint MAX_SUBM    = num_tokens < 10000 ? 4 : 12;
     std::string dtype;
-    if(gating_output.dtype() == at::ScalarType::Float)
+    if(gating_output->dtype() == AITER_DTYPE_fp32)
         dtype = "fp32";
-    else if(gating_output.dtype() == at::ScalarType::BFloat16)
+    else if(gating_output->dtype() == AITER_DTYPE_bf16)
         dtype = "bf16";
     else
-        TORCH_CHECK(false, __func__, ": unsupport gating_output dtype:", gating_output.scalar_type());
+        AITER_CHECK(false, __func__, ": unsupport gating_output dtype:", AiterDtype_to_str(gating_output->dtype()));
 
     KernelArgs args;
     size_t arg_size = sizeof(args);
-    args.ptr_T      = (void*)topk_indices.data_ptr();
-    args.ptr_W      = (void*)topk_weights.data_ptr();
-    args.ptr_A      = (void*)gating_output.data_ptr();
+    args.ptr_T      = topk_indices->ptr;
+    args.ptr_W      = topk_weights->ptr;
+    args.ptr_A      = gating_output->ptr;
 
     args.batch       = num_tokens;
     args.expert      = num_experts;
@@ -113,13 +111,15 @@ void topk_softmax_asm(torch::Tensor& topk_weights,         // [num_tokens, topk]
         impl_ptr = result.first->second.get();
     }
     else
-        TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
+        AITER_CHECK(false, __func__, " not find kernel " + kernelName);
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(gating_output));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+    int prev_device;
+    HIP_CALL(hipGetDevice(&prev_device));
+    HIP_CALL(hipSetDevice(gating_output->device_id));
 
     uint gdx = (num_tokens + subm - 1) / subm;
-    TORCH_CHECK(gdx >> 31 == 0, "num_tokens too large: ", num_tokens);
+    AITER_CHECK(gdx >> 31 == 0, "num_tokens too large: ", num_tokens);
     impl_ptr->launch_kernel({&args,
                              &arg_size,
                              static_cast<int>(gdx), // gdx
@@ -129,4 +129,5 @@ void topk_softmax_asm(torch::Tensor& topk_weights,         // [num_tokens, topk]
                              1,                     // bdy
                              1,                     // bdz
                              stream});
+    HIP_CALL(hipSetDevice(prev_device));
 }

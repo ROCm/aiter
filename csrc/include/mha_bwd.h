@@ -5,7 +5,7 @@
 // Include these 2 headers instead of torch/extension.h since we don't need all of the torch
 // headers.
 #include "aiter_hip_common.h"
-#if !DISABLE_CK
+#if ENABLE_CK
 #include "fmha_bwd.hpp"
 #endif
 #include <variant>
@@ -253,26 +253,32 @@ struct __attribute__((packed)) fmha_bwd_odo_args
     p2 _p1;
     void* ptr_d;
     p2 _p2;
-    unsigned int Hs_odo;
+    unsigned int Hs_o;
     p3 _p3;
-    unsigned int BAs_odo;
+    unsigned int BAs_o;
     p3 _p4;
-    unsigned int Seqs_odo;
+    unsigned int Seqs_o;
     p3 _p5;
-    unsigned int Hs_d;
+    unsigned int Hs_do;
     p3 _p6;
-    unsigned int BAs_d;
+    unsigned int BAs_do;
     p3 _p7;
-    unsigned int Seqs_d;
+    unsigned int Seqs_do;
     p3 _p8;
-    unsigned int seqlen_q;
+    unsigned int Hs_d;
     p3 _p9;
-    unsigned int head_dim;
+    unsigned int BAs_d;
     p3 _p10;
+    unsigned int Seqs_d;
+    p3 _p11;
+    unsigned int seqlen_q;
+    p3 _p12;
+    unsigned int head_dim;
+    p3 _p13;
     const void* ptr_qseq;
-    p2 _p11;
+    p2 _p14;
     const void* ptr_qseq_padded;
-    p2 _p12;
+    p2 _p15;
 };
 
 // dq_shuffle & dq_convert post process kernel args
