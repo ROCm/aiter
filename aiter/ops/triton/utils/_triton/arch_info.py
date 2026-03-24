@@ -19,8 +19,10 @@ def get_arch():
 def is_gluon_avail():
     return get_arch() in ("gfx950", "gfx1250")
 
+
 def is_fp4_avail():
     return get_arch() in ("gfx950", "gfx1250")
+
 
 def is_fp8_avail():
     return get_arch() in ("gfx942", "gfx950", "gfx1250")

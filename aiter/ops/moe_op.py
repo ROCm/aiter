@@ -19,10 +19,12 @@ def topk_softmax(
     token_expert_indices: Tensor,
     gating_output: Tensor,
     need_renorm: bool,
+    num_shared_experts: int = 0,
+    shared_expert_scoring_func: str = "",
 ) -> None: ...
 
 
-@compile_ops("module_moe_asm")
+@compile_ops("module_moe_asm", fc_name="topk_softmax_asm", ffi_type="ctypes")
 def topk_softmax_asm(
     topk_weights: Tensor,
     topk_indices: Tensor,
@@ -54,7 +56,7 @@ def moe_align_block_size(
 ) -> None: ...
 
 
-@compile_ops("module_moe_asm")
+@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
 def fmoe(
     out: Tensor,
     input: Tensor,
@@ -68,7 +70,7 @@ def fmoe(
 ) -> None: ...
 
 
-@compile_ops("module_moe_asm")
+@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
 def fmoe_int8_g1u0(
     out: Tensor,
     input: Tensor,
@@ -83,11 +85,11 @@ def fmoe_int8_g1u0(
     fc1_scale: Tensor,
     fc2_scale: Tensor,
     fc2_smooth_scale: Tensor,
-    activation: Optional[Enum] = ActivationType.Silu.value,
+    activation: Optional[int] = ActivationType.Silu.value,
 ) -> None: ...
 
 
-@compile_ops("module_moe_asm")
+@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
 def fmoe_g1u1(
     out: Tensor,
     input: Tensor,
@@ -101,13 +103,13 @@ def fmoe_g1u1(
     input_scale: Tensor,
     fc1_scale: Tensor,
     fc2_scale: Tensor,
-    kernelName: str,
+    kernelName: Optional[str] = "",
     fc2_smooth_scale: Optional[Tensor] = None,
-    activation: Optional[Enum] = ActivationType.Silu.value,
+    activation: Optional[int] = ActivationType.Silu.value,
 ) -> None: ...
 
 
-@compile_ops("module_moe_asm")
+@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
 def fmoe_g1u1_tkw1(
     out: Tensor,
     input: Tensor,
@@ -121,13 +123,13 @@ def fmoe_g1u1_tkw1(
     input_scale: Tensor,
     fc1_scale: Tensor,
     fc2_scale: Tensor,
-    kernelName: str,
+    kernelName: Optional[str] = "",
     fc2_smooth_scale: Optional[Tensor] = None,
-    activation: Optional[Enum] = ActivationType.Silu.value,
+    activation: Optional[int] = ActivationType.Silu.value,
 ) -> None: ...
 
 
-@compile_ops("module_moe_asm")
+@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
 def fmoe_int8_g1u0_a16(
     out: Tensor,
     input: Tensor,  # bf16
@@ -142,11 +144,11 @@ def fmoe_int8_g1u0_a16(
     fc2_scale: Tensor,
     fc1_smooth_scale: Tensor,
     fc2_smooth_scale: Tensor,
-    activation: Optional[Enum] = ActivationType.Silu.value,
+    activation: Optional[int] = ActivationType.Silu.value,
 ) -> None: ...
 
 
-@compile_ops("module_moe_asm")
+@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
 def fmoe_g1u1_a16(
     out: Tensor,
     input: Tensor,  # bf16
@@ -161,11 +163,11 @@ def fmoe_g1u1_a16(
     fc2_scale: Tensor,
     fc1_smooth_scale: Tensor,
     fc2_smooth_scale: Tensor,
-    activation: Optional[Enum] = ActivationType.Silu.value,
+    activation: Optional[int] = ActivationType.Silu.value,
 ) -> None: ...
 
 
-@compile_ops("module_moe_asm")
+@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
 def fmoe_fp8_blockscale_g1u1(
     out: Tensor,
     input: Tensor,
@@ -179,16 +181,16 @@ def fmoe_fp8_blockscale_g1u1(
     input_scale: Tensor,
     fc1_scale: Tensor,
     fc2_scale: Tensor,
-    kernelName: str,
+    kernelName: Optional[str] = "",
     fc_scale_blkn: int = 128,
     fc_scale_blkk: int = 128,
     fc2_smooth_scale: Optional[Tensor] = None,
-    activation: Optional[Enum] = ActivationType.Silu.value,
+    activation: Optional[int] = ActivationType.Silu.value,
     block_size_M: int = 32,
 ) -> None: ...
 
 
-@compile_ops("module_moe_asm")
+@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
 def moe_stage1_g1u1(
     input: Tensor,
     w1: Tensor,
@@ -198,11 +200,11 @@ def moe_stage1_g1u1(
     num_valid_ids: Tensor,
     out: Tensor,
     inter_dim: int,
-    kernelName: str,
+    kernelName: Optional[str],
     block_m: int,
     ksplit: int = 0,
-    activation: Optional[Enum] = ActivationType.Silu.value,
-    quant_type: Optional[Enum] = QuantType.No.value,
+    activation: Optional[int] = ActivationType.Silu.value,
+    quant_type: Optional[int] = QuantType.No.value,
     a1_scale: Optional[Tensor] = None,
     w1_scale: Optional[Tensor] = None,
     sorted_weights: Optional[Tensor] = None,
@@ -354,6 +356,7 @@ def moe_cktile2stages_gemm1_ck(
     activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
     split_k: Optional[int] = 1,
+    kernel_name: str = "",
 ) -> Tensor: ...
 
 
@@ -374,6 +377,7 @@ def moe_cktile2stages_gemm1(
     activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
     split_k: Optional[int] = 1,
+    kernel_name: str = "",
 ):
     return moe_cktile2stages_gemm1_ck(
         XQ,
@@ -392,6 +396,7 @@ def moe_cktile2stages_gemm1(
         activation,
         block_m,
         split_k,
+        kernel_name,
     )
 
 
@@ -413,6 +418,7 @@ def moe_cktile2stages_gemm2_ck(
     activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
     split_k: Optional[int] = 1,
+    kernel_name: str = "",
 ) -> Tensor: ...
 
 
@@ -433,6 +439,7 @@ def moe_cktile2stages_gemm2(
     activation: Optional[int] = 0,
     block_m: Optional[int] = 32,
     split_k: Optional[int] = 1,
+    kernel_name: str = "",
 ):
     return moe_cktile2stages_gemm2_ck(
         XQ,
@@ -451,6 +458,7 @@ def moe_cktile2stages_gemm2(
         activation,
         block_m,
         split_k,
+        kernel_name,
     )
 
 
