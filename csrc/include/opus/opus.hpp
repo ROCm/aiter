@@ -982,6 +982,11 @@ template<> struct finfo<bf8_t> {
     OPUS_H_D static constexpr float tiny() { return __builtin_bit_cast(float, 0x38800000u); }  // 2^-14
 #endif
 };
+template<> struct finfo<i8_t> {
+    static constexpr int bits = 8;
+    OPUS_H_D static constexpr float max()  { return 127.0f; }
+    OPUS_H_D static constexpr float min()  { return -128.0f; }
+};
 
 template<typename C, typename... S, std::enable_if_t<is_dtype_v<C> && (is_constant_v<S> && ...), bool> = true>
 OPUS_H_D constexpr auto slice(C&& container, S&&.../*ss*/) { return container; }    // TODO: fallback slice a normal value does nonthing
@@ -1032,6 +1037,9 @@ OPUS_D auto fp8_to_fp32(const fp8_t& x) {
     int w = static_cast<int>(__builtin_bit_cast(unsigned char, x));
     return __builtin_amdgcn_cvt_f32_fp8(w, /*byte=*/0);
 }
+OPUS_D constexpr auto fp32_to_fp32(const fp32_t& x) { return x; }
+OPUS_D constexpr auto fp32_to_i8(const fp32_t& x) { return static_cast<i8_t>(x); }
+OPUS_D constexpr auto i8_to_fp32(const i8_t& x) { return static_cast<fp32_t>(x); }
 #pragma clang diagnostic pop
 
 #define OPUS_CAST_DEFINE(d_, s_) template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, s_ ## _t> && std::is_same_v<D, d_ ## _t>, bool> = true> \
@@ -1042,6 +1050,9 @@ OPUS_CAST_DEFINE(bf16, fp32)
 OPUS_CAST_DEFINE(fp32, bf16)
 OPUS_CAST_DEFINE(fp8, fp32)
 OPUS_CAST_DEFINE(fp32, fp8)
+OPUS_CAST_DEFINE(fp32, fp32)
+OPUS_CAST_DEFINE(i8, fp32)
+OPUS_CAST_DEFINE(fp32, i8)
 
 namespace impl {
 // implement a "pack" of data, storage should pad to multiple of byte(8bit)
@@ -1219,7 +1230,7 @@ OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x8(const S& s, float scale = 
 
 template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, bf16x2_t>, bool> = true>
 OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) {
-    union { unsigned int bitwise; fp4_t f4_pack[4]; } value;
+    union { unsigned int bitwise; fp4_t fp4_pack[4]; } value;
     value.bitwise = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(value.bitwise, s, scale, sel);
     return value.fp4_pack[0];
 }
@@ -2332,7 +2343,7 @@ struct mfma_adaptor : public remove_cvref_t<MFMA> {
 
     // by default, this is X shape, P + Y
     OPUS_D static constexpr auto shape_a() { return tuple<number<grpm_a>, number<rept_a>, number<grpk_a>, number<pack_a>>{}; }
-    OPUS_D static constexpr auto shape_b() { return tuple<number<grpn_b>, number<rept_b>, number<grpk_a>, number<pack_b>>{}; }
+    OPUS_D static constexpr auto shape_b() { return tuple<number<grpn_b>, number<rept_b>, number<grpk_b>, number<pack_b>>{}; }
     OPUS_D static constexpr auto shape_c() { return tuple<number<rept_c>, number<grpm_c>, number<pack_c>, number<grpn_c>>{}; }
 
     // here we describe above shape by group them into a 2d shape style, and with p/y dim. we could put into same structure, but let's make things easier
@@ -2360,7 +2371,17 @@ struct mfma_adaptor_swap_ab : mfma_adaptor<MFMA> {
 
     template<typename VA, typename VB, index_t cbsz = 0, index_t abid = 0, index_t blgp = 0>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) {
-        typename MFMA::vtype_c c{0}; return operator()(b, a, c, number<cbsz>{}, number<abid>{}, number<blgp>{});
+        typename MFMA::vtype_c c{0}; return operator()(a, b, c, number<cbsz>{}, number<abid>{}, number<blgp>{});
+    }
+
+    template<typename VA, typename VB, typename VC>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
+        return base::operator()(b, a, c, scale_b, scale_a);
+    }
+
+    template<typename VA, typename VB>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b) {
+        typename MFMA::vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b);
     }
 
     OPUS_ADAPTOR_LAYOUT_API_DEFINE
@@ -2533,6 +2554,53 @@ struct tiled_mma_adaptor : public MMA_ {
         vtype_c c{0};
         return operator()(a, b, c, number<cbsz>{}, number<abid>{}, number<blgp>{});
     }
+
+    // Scaled MFMA (f8f6f4): forward scale_a, scale_b to underlying MMA
+    template<typename VA, typename VB, typename VC,
+             std::enable_if_t< (is_array_v< remove_cvref_t<VA> > && is_array_v< remove_cvref_t<VB> > && is_array_v< remove_cvref_t<VC> >), bool > = true>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
+        VC c_ {c};
+        static_ford<EXPAND_K, EXPAND_M, EXPAND_N>([&](auto i_k, auto i_m, auto i_n){
+            auto s_a = a[i_m * EXPAND_K + i_k];
+            auto s_b = b[i_n * EXPAND_K + i_k];
+            auto s_c = c_[i_m * EXPAND_N + i_n];
+            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b);
+            c_[i_m * EXPAND_N + i_n] = s_c;
+        });
+        return c_;
+    }
+
+    template<typename VA, typename VB, typename VC,
+             std::enable_if_t< (is_vector_v< remove_cvref_t<VA> > && is_vector_v< remove_cvref_t<VB> > && is_vector_v< remove_cvref_t<VC> >), bool > = true>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
+        static_assert(size<VA>() == get<0>(reduce_tuple_mul(y_shape_a())));
+        static_assert(size<VB>() == get<0>(reduce_tuple_mul(y_shape_b())));
+        static_assert(size<VC>() == get<0>(reduce_tuple_mul(y_shape_c())));
+
+        constexpr auto a_len = get<0>(reduce_tuple_mul(MMA::y_shape_a()));
+        constexpr auto b_len = get<0>(reduce_tuple_mul(MMA::y_shape_b()));
+        constexpr auto c_len = get<0>(reduce_tuple_mul(MMA::y_shape_c()));
+
+        VC c_ {c};
+        static_ford<EXPAND_K, EXPAND_M, EXPAND_N>([&](auto i_k, auto i_m, auto i_n){
+            constexpr index_t i_tile_a = i_m * EXPAND_K + i_k;
+            constexpr index_t i_tile_b = i_n * EXPAND_K + i_k;
+            constexpr index_t i_tile_c = i_m * EXPAND_N + i_n;
+            auto s_a = slice(a, number<i_tile_a * a_len>{}, number<i_tile_a * a_len + a_len>{});
+            auto s_b = slice(b, number<i_tile_b * b_len>{}, number<i_tile_b * b_len + b_len>{});
+            auto s_c = slice(c_, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
+            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b);
+            set_slice(c_, s_c, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
+        });
+        return c_;
+    }
+
+    template<typename VA, typename VB>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b) {
+        vtype_c c{0};
+        return operator()(a, b, c, scale_a, scale_b);
+    }
+
     OPUS_ADAPTOR_LAYOUT_API_DEFINE
 };
 }

@@ -432,19 +432,6 @@ namespace py = pybind11;
           "wvSplitKQ(Tensor in_a, Tensor in_b, Tensor! out_c, Tensor scale_a, Tensor scale_b, " \
           "int CuCount) -> ()");
 
-#define GEMM_A8W8_ASM_PYBIND                                            \
-    m.def("gemm_a8w8_asm",                                              \
-          &gemm_a8w8_asm,                                               \
-          "Asm gemm a8w8 ,  weight should be shuffle to layout(32,16)", \
-          py::arg("XQ"),                                                \
-          py::arg("WQ"),                                                \
-          py::arg("x_scale"),                                           \
-          py::arg("w_scale"),                                           \
-          py::arg("Out"),                                               \
-          py::arg("kernelName"),                                        \
-          py::arg("bias"),                                              \
-          py::arg("bpreshuffle") = true,                                \
-          py::arg("splitK")      = std::nullopt);
 
 #define GEMM_A16W16_ASM_PYBIND                   \
     m.def("gemm_a16w16_asm",                     \
@@ -459,22 +446,6 @@ namespace py = pybind11;
           py::arg("kernelName")  = std::nullopt, \
           py::arg("bpreshuffle") = false);
 
-#define GEMM_A4W4_ASM_PYBIND                      \
-    m.def("gemm_a4w4_asm",                        \
-          &gemm_a4w4_asm,                         \
-          "Asm gemm a4w4",                        \
-          py::arg("A"),                           \
-          py::arg("B"),                           \
-          py::arg("A_scale"),                     \
-          py::arg("B_scale"),                     \
-          py::arg("out"),                         \
-          py::arg("kernelName"),                  \
-          py::arg("bias")         = std::nullopt, \
-          py::arg("alpha")        = 1.0,          \
-          py::arg("beta")         = 0.0,          \
-          py::arg("bpreshuffle")  = true,         \
-          py::arg("log2_k_split") = std::nullopt);
-
 #define FLATMM_A8W8_BLOCKSCALE_ASM_PYBIND \
     m.def("flatmm_a8w8_blockscale_asm",   \
           &flatmm_a8w8_blockscale_asm,    \
@@ -484,20 +455,6 @@ namespace py = pybind11;
           py::arg("x_scale"),             \
           py::arg("w_scale"),             \
           py::arg("Out"));
-
-#define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_ASM_PYBIND                  \
-    m.def("gemm_a8w8_blockscale_bpreshuffle_asm",                    \
-          &gemm_a8w8_blockscale_bpreshuffle_asm,                     \
-          "FP8 blockscale BpreShuffle GEMM assembly implementation", \
-          py::arg("A"),                                              \
-          py::arg("B"),                                              \
-          py::arg("out"),                                            \
-          py::arg("A_scale"),                                        \
-          py::arg("B_scale"),                                        \
-          py::arg("bias")        = py::none(),                       \
-          py::arg("splitK")      = py::none(),                       \
-          py::arg("kernelName")  = py::none(),                       \
-          py::arg("bpreshuffle") = true);
 
 #define GEMM_A4W4_BLOCKSCALE_PYBIND \
     m.def("gemm_a4w4_blockscale",   \
@@ -971,7 +928,7 @@ namespace py = pybind11;
           py::arg("splitk")            = 1,            \
           py::arg("non_temporal_load") = false,        \
           py::arg("dst_type")          = std::nullopt, \
-          py::arg("is_shuffled")       = true);              \
+          py::arg("is_shuffled")       = true);        \
                                                        \
     m.def("ck_moe_stage2",                             \
           &ck_moe_stage2,                              \
@@ -1112,14 +1069,8 @@ namespace py = pybind11;
           py::arg("token_expert_indices"),                                     \
           py::arg("gating_output"),                                            \
           py::arg("need_renorm"),                                              \
-          "Apply topk softmax to the gating outputs.");                        \
-    m.def("topk_softmax_asm",                                                  \
-          &topk_softmax_asm,                                                   \
-          py::arg("topk_weights"),                                             \
-          py::arg("topk_indices"),                                             \
-          py::arg("token_expert_indices"),                                     \
-          py::arg("gating_output"),                                            \
-          py::arg("need_renorm"),                                              \
+          py::arg("num_shared_experts")         = 0,                           \
+          py::arg("shared_expert_scoring_func") = "",                          \
           "Apply topk softmax to the gating outputs.");                        \
     m.def("grouped_topk",                                                      \
           &grouped_topk,                                                       \
@@ -1159,127 +1110,6 @@ namespace py = pybind11;
           &aiter::moe_align_block_size,                                        \
           "Aligning the number of tokens to be processed by each expert such " \
           "that it is divisible by the block size.");                          \
-    m.def("fmoe", &fmoe);                                                      \
-    m.def("fmoe_int8_g1u0",                                                    \
-          &fmoe_int8_g1u0,                                                     \
-          py::arg("out"),                                                      \
-          py::arg("input"),                                                    \
-          py::arg("gate"),                                                     \
-          py::arg("down"),                                                     \
-          py::arg("sorted_token_ids"),                                         \
-          py::arg("sorted_weights"),                                           \
-          py::arg("sorted_expert_ids"),                                        \
-          py::arg("num_valid_ids"),                                            \
-          py::arg("topk"),                                                     \
-          py::arg("input_scale"),                                              \
-          py::arg("fc1_scale"),                                                \
-          py::arg("fc2_scale"),                                                \
-          py::arg("fc2_smooth_scale") = std::nullopt,                          \
-          py::arg("activation")       = ActivationType::Silu);                       \
-    m.def("fmoe_g1u1",                                                         \
-          &fmoe_g1u1,                                                          \
-          py::arg("out"),                                                      \
-          py::arg("input"),                                                    \
-          py::arg("gate"),                                                     \
-          py::arg("down"),                                                     \
-          py::arg("sorted_token_ids"),                                         \
-          py::arg("sorted_weights"),                                           \
-          py::arg("sorted_expert_ids"),                                        \
-          py::arg("num_valid_ids"),                                            \
-          py::arg("topk"),                                                     \
-          py::arg("input_scale"),                                              \
-          py::arg("fc1_scale"),                                                \
-          py::arg("fc2_scale"),                                                \
-          py::arg("kernel_name"),                                              \
-          py::arg("fc2_smooth_scale") = std::nullopt,                          \
-          py::arg("activation")       = ActivationType::Silu);                       \
-    m.def("fmoe_g1u1_tkw1",                                                    \
-          &fmoe_g1u1_tkw1,                                                     \
-          py::arg("out"),                                                      \
-          py::arg("input"),                                                    \
-          py::arg("gate"),                                                     \
-          py::arg("down"),                                                     \
-          py::arg("sorted_token_ids"),                                         \
-          py::arg("sorted_weights"),                                           \
-          py::arg("sorted_expert_ids"),                                        \
-          py::arg("num_valid_ids"),                                            \
-          py::arg("topk"),                                                     \
-          py::arg("input_scale"),                                              \
-          py::arg("fc1_scale"),                                                \
-          py::arg("fc2_scale"),                                                \
-          py::arg("kernel_name"),                                              \
-          py::arg("fc2_smooth_scale") = std::nullopt,                          \
-          py::arg("activation")       = ActivationType::Silu);                       \
-    m.def("fmoe_int8_g1u0_a16",                                                \
-          &fmoe_int8_g1u0_a16,                                                \
-          py::arg("out"),                                                      \
-          py::arg("input"),                                                    \
-          py::arg("gate"),                                                     \
-          py::arg("down"),                                                     \
-          py::arg("sorted_token_ids"),                                         \
-          py::arg("sorted_weights"),                                           \
-          py::arg("sorted_expert_ids"),                                        \
-          py::arg("num_valid_ids"),                                            \
-          py::arg("topk"),                                                     \
-          py::arg("fc1_scale"),                                                \
-          py::arg("fc2_scale"),                                                \
-          py::arg("fc1_smooth_scale"),                                         \
-          py::arg("fc2_smooth_scale"),                                         \
-          py::arg("activation") = ActivationType::Silu);                      \
-    m.def("fmoe_g1u1_a16",                                                     \
-          &fmoe_g1u1_a16,                                                      \
-          py::arg("out"),                                                      \
-          py::arg("input"),                                                    \
-          py::arg("gate"),                                                     \
-          py::arg("down"),                                                     \
-          py::arg("sorted_token_ids"),                                         \
-          py::arg("sorted_weights"),                                           \
-          py::arg("sorted_expert_ids"),                                        \
-          py::arg("num_valid_ids"),                                            \
-          py::arg("topk"),                                                     \
-          py::arg("fc1_scale"),                                                \
-          py::arg("fc2_scale"),                                                \
-          py::arg("fc1_smooth_scale"),                                         \
-          py::arg("fc2_smooth_scale"),                                         \
-          py::arg("activation") = ActivationType::Silu);                       \
-    m.def("fmoe_fp8_blockscale_g1u1",                                          \
-          &fmoe_fp8_blockscale_g1u1,                                           \
-          py::arg("out"),                                                      \
-          py::arg("input"),                                                    \
-          py::arg("gate"),                                                     \
-          py::arg("down"),                                                     \
-          py::arg("sorted_token_ids"),                                         \
-          py::arg("sorted_weights"),                                           \
-          py::arg("sorted_expert_ids"),                                        \
-          py::arg("num_valid_ids"),                                            \
-          py::arg("topk"),                                                     \
-          py::arg("input_scale"),                                              \
-          py::arg("fc1_scale"),                                                \
-          py::arg("fc2_scale"),                                                \
-          py::arg("kernel_name"),                                              \
-          py::arg("fc_scale_blkn")    = 128,                                   \
-          py::arg("fc_scale_blkk")    = 128,                                   \
-          py::arg("fc2_smooth_scale") = std::nullopt,                          \
-          py::arg("activation")       = ActivationType::Silu,                  \
-          py::arg("block_size_M")     = 32);                                       \
-    m.def("moe_stage1_g1u1",                                                   \
-          &moe_stage1_g1u1,                                                    \
-          py::arg("input"),                                                    \
-          py::arg("w1"),                                                       \
-          py::arg("w2"),                                                       \
-          py::arg("sorted_token_ids"),                                         \
-          py::arg("sorted_expert_ids"),                                        \
-          py::arg("num_valid_ids"),                                            \
-          py::arg("out"),                                                      \
-          py::arg("inter_dim"),                                                \
-          py::arg("kernelName"),                                               \
-          py::arg("block_m"),                                                  \
-          py::arg("ksplit")         = 0,                                       \
-          py::arg("activation")     = ActivationType::Silu,                    \
-          py::arg("quant_type")     = QuantType::No,                           \
-          py::arg("a1_scale")       = std::nullopt,                            \
-          py::arg("w1_scale")       = std::nullopt,                            \
-          py::arg("sorted_weights") = std::nullopt);                           \
     m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
 #define MOE_TOPK_PYBIND             \
@@ -1419,7 +1249,7 @@ namespace py = pybind11;
           py::arg("num_rows")              = std::nullopt,               \
           py::arg("num_rows_factor")       = 1,                          \
           py::arg("smooth_scale_map_hash") = std::nullopt,               \
-          py::arg("enable_ps")             = true);                                  \
+          py::arg("enable_ps")             = true);                      \
     m.def("moe_smooth_per_token_scaled_quant_v1",                        \
           &aiter::moe_smooth_per_token_scaled_quant_v1,                  \
           py::arg("out"),                                                \
@@ -1429,7 +1259,7 @@ namespace py = pybind11;
           py::arg("smooth_scale_map"),                                   \
           py::arg("shuffle_scale")         = false,                      \
           py::arg("smooth_scale_map_hash") = std::nullopt,               \
-          py::arg("transpose_out")         = false);                             \
+          py::arg("transpose_out")         = false);                     \
     m.def("moe_smooth_per_token_scaled_quant_v2",                        \
           &aiter::moe_smooth_per_token_scaled_quant_v2,                  \
           py::arg("out"),                                                \
@@ -1670,7 +1500,7 @@ namespace py = pybind11;
           py::arg("temperature"),                                                    \
           py::arg("lambd")     = 1.0,                                                \
           py::arg("generator") = std::nullopt,                                       \
-          py::arg("eps")       = 1e-10);                                                   \
+          py::arg("eps")       = 1e-10);                                             \
     m.def("mixed_sample_outer_exponential",                                          \
           &aiter::mixed_sample_outer_exponential,                                    \
           py::arg("out"),                                                            \
@@ -1685,7 +1515,7 @@ namespace py = pybind11;
           py::arg("temperature"),                                                    \
           py::arg("lambd")     = 1.0,                                                \
           py::arg("generator") = std::nullopt,                                       \
-          py::arg("eps")       = 1e-10);                                                   \
+          py::arg("eps")       = 1e-10);                                             \
     m.def("exponential",                                                             \
           &aiter::exponential,                                                       \
           py::arg("out"),                                                            \
@@ -1760,16 +1590,6 @@ namespace py = pybind11;
           py::arg("numRows"),           \
           py::arg("stride0"),           \
           py::arg("stride1"));          \
-    m.def("top_k_per_row_prefill_fast", \
-          &top_k_per_row_prefill_fast,  \
-          py::arg("logits"),            \
-          py::arg("rowStarts"),         \
-          py::arg("rowEnds"),           \
-          py::arg("indices"),           \
-          py::arg("values"),            \
-          py::arg("numRows"),           \
-          py::arg("stride0"),           \
-          py::arg("stride1"));          \
     m.def("top_k_per_row_decode",       \
           &top_k_per_row_decode,        \
           py::arg("logits"),            \
@@ -1778,43 +1598,34 @@ namespace py = pybind11;
           py::arg("indices"),           \
           py::arg("numRows"),           \
           py::arg("stride0"),           \
-          py::arg("stride1"));          \
-    m.def("top_k_per_row_decode_fast",  \
-          &top_k_per_row_decode_fast,   \
-          py::arg("logits"),            \
-          py::arg("next_n"),            \
-          py::arg("seqLens"),           \
-          py::arg("indices"),           \
-          py::arg("numRows"),           \
-          py::arg("stride0"),           \
           py::arg("stride1"));
 
-#define MLA_METADATA_PYBIND                              \
-    m.def("get_mla_metadata_v1",                         \
-          &get_mla_metadata_v1,                          \
-          "get_mla_metadata_v1",                         \
-          py::arg("seqlens_qo_indptr"),                  \
-          py::arg("seqlens_kv_indptr"),                  \
-          py::arg("kv_last_page_lens"),                  \
-          py::arg("num_heads_per_head_k"),               \
-          py::arg("num_heads_k"),                        \
-          py::arg("is_causal"),                          \
-          py::arg("work_metadata_ptrs"),                 \
-          py::arg("work_info_set"),                      \
-          py::arg("work_indptr"),                        \
-          py::arg("reduce_indptr"),                      \
-          py::arg("reduce_final_map"),                   \
-          py::arg("reduce_partial_map"),                 \
-          py::arg("page_size")           = 1,            \
-          py::arg("kv_granularity")      = 16,           \
-          py::arg("max_seqlen_qo")       = -1,           \
-          py::arg("uni_seqlen_qo")       = -1,           \
-          py::arg("fast_mode")           = true,         \
-          py::arg("topk")                = -1,           \
-          py::arg("max_split_per_batch") = -1,           \
-          py::arg("intra_batch_mode")    = false,        \
-          py::arg("dtype_q")             = std::nullopt, \
-          py::arg("dtype_kv")            = std::nullopt);           \
+#define MLA_METADATA_PYBIND                               \
+    m.def("get_mla_metadata_v1",                          \
+          &get_mla_metadata_v1,                           \
+          "get_mla_metadata_v1",                          \
+          py::arg("seqlens_qo_indptr"),                   \
+          py::arg("seqlens_kv_indptr"),                   \
+          py::arg("kv_last_page_lens"),                   \
+          py::arg("num_heads_per_head_k"),                \
+          py::arg("num_heads_k"),                         \
+          py::arg("is_causal"),                           \
+          py::arg("work_metadata_ptrs"),                  \
+          py::arg("work_info_set"),                       \
+          py::arg("work_indptr"),                         \
+          py::arg("reduce_indptr"),                       \
+          py::arg("reduce_final_map"),                    \
+          py::arg("reduce_partial_map"),                  \
+          py::arg("page_size")           = 1,             \
+          py::arg("kv_granularity")      = 16,            \
+          py::arg("max_seqlen_qo")       = -1,            \
+          py::arg("uni_seqlen_qo")       = -1,            \
+          py::arg("fast_mode")           = true,          \
+          py::arg("topk")                = -1,            \
+          py::arg("max_split_per_batch") = -1,            \
+          py::arg("intra_batch_mode")    = false,         \
+          py::arg("dtype_q")             = std::nullopt,  \
+          py::arg("dtype_kv")            = std::nullopt); \
     m.def("get_mla_metadata_v1_no_redundant", &get_mla_metadata_v1_no_redundant);
 
 #define PA_METADATA_PYBIND                       \
@@ -1962,6 +1773,28 @@ namespace py = pybind11;
           py::arg("cache_seqlens")      = torch::Tensor(),                     \
           py::arg("conv_state_indices") = torch::Tensor(),                     \
           py::arg("pad_slot_id")        = -1);
+
+#define FUSED_SPLIT_GDR_UPDATE_PYBIND                                            \
+    m.def("fused_split_gdr_update",                                               \
+          &aiter::fused_split_gdr_update,                                         \
+          "Fused split GDR decode update (HIP, ksplit4_db backend).",            \
+          py::arg("mixed_qkv"),                                                   \
+          py::arg("A_log"),                                                       \
+          py::arg("a"),                                                           \
+          py::arg("dt_bias"),                                                     \
+          py::arg("b_gate"),                                                      \
+          py::arg("initial_state_source"),                                        \
+          py::arg("initial_state_indices"),                                       \
+          py::arg("key_dim"),                                                     \
+          py::arg("value_dim"),                                                   \
+          py::arg("num_heads_qk"),                                                \
+          py::arg("num_heads_v"),                                                 \
+          py::arg("head_dim"),                                                    \
+          py::arg("softplus_beta")          = 1.0f,                               \
+          py::arg("softplus_threshold")     = 20.0f,                              \
+          py::arg("scale")                  = -1.0f,                              \
+          py::arg("use_qk_l2norm_in_kernel") = true,                              \
+          py::arg("output") = c10::nullopt);
 #define MLA_HK_PYBIND                   \
     m.def("hk_mla_decode_fwd",          \
           &hk_mla_decode_fwd,           \
