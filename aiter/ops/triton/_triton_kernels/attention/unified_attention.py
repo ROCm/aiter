@@ -517,12 +517,12 @@ def kernel_unified_attention_2d(
                     k_scale
                     + physical_block_idx[:, None] * stride_k_cache_scale_0
                     + kv_head_idx * stride_k_cache_scale_2
-                    + offs_rope_scale[:, None] * stride_k_cache_scale_3
+                    + offs_rope_scale[None, :] * stride_k_cache_scale_3
                     + (seq_offset % BLOCK_SIZE)[:, None] * stride_k_cache_scale_1
                 )
                 k_rope_scale_loaded = tl.load(
                     k_rope_scale_ptr,
-                    mask=rope_scale_dim_mask[:, None] & tile_mask[:, None],
+                    mask=rope_scale_dim_mask[None, :] & tile_mask[:, None],
                     other=0.0,
                 )
                 S += tl.dot_scaled(
@@ -1009,10 +1009,10 @@ def kernel_unified_attention_3d(
                     k_scale
                     + physical_block_idx[:, None] * stride_k_cache_scale_0
                     + kv_head_idx * stride_k_cache_scale_2
-                    + offs_rope_scale[:, None] * stride_k_cache_scale_3
+                    + offs_rope_scale[None, :] * stride_k_cache_scale_3
                     + (seq_offset % BLOCK_SIZE)[:, None] * stride_k_cache_scale_1
                 )
-                k_rope_scale_loaded = tl.load(k_rope_scale_ptr, mask=rope_scale_dim_mask[:, None] & tile_mask[:, None], other=0.0)
+                k_rope_scale_loaded = tl.load(k_rope_scale_ptr, mask=rope_scale_dim_mask[None, :] & tile_mask[:, None], other=0.0)
                 S += tl.dot_scaled(Q_rope, q_rope_scale_loaded, "e2m1", K_rope, k_rope_scale_loaded, "e2m1", fast_math=True)
             else:
                 S += qk_scale * tl.dot(Q_rope, K_rope)

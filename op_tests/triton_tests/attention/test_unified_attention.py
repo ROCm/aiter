@@ -406,7 +406,7 @@ def test_triton_unified_attn_fp8(unified_attn_inputs):
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
-@pytest.mark.parametrize("rope_size", [0])  # ROPE not supported
+@pytest.mark.parametrize("rope_size", [0, 64])
 @torch.inference_mode()
 def test_triton_unified_attn_mxfp4(unified_attn_inputs):
     if not arch_info.is_fp4_avail():

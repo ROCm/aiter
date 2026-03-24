@@ -285,13 +285,11 @@ def unified_attention(
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
 
     head_size = v.shape[-1]
-    # rope and mla support for mxfp4 to be supported    
     if sage_mxfp4:
-        ROPE_SIZE = 0
-        HAS_ROPE = False
+        ROPE_SIZE = k.shape[-1] * 2 - v.shape[-1]
     else:
         ROPE_SIZE = k.shape[-1] - v.shape[-1]
-        HAS_ROPE = ROPE_SIZE > 0
+    HAS_ROPE = ROPE_SIZE > 0
     
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
