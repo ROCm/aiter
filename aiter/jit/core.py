@@ -1039,7 +1039,24 @@ def _is_union(origin):
 
 
 def _ctypes_call(func, fc_name, md_name):
-    """Build a ctypes-based caller for a torch-free .so module."""
+    """Build a ctypes-based caller for a torch-free .so module.
+
+    Type-hint to C ABI mapping
+    -------------------------------------------------------
+    Python annotation     | ctypes type          | C type
+    ----------------------|----------------------|---------
+    Tensor                | POINTER(AiterTensor) | AiterTensor*
+    Optional[Tensor]      | POINTER(AiterTensor) | AiterTensor* (NULL if None)
+    int                   | c_int                | int
+    Optional[int]         | c_int                | int   (-1 if None)
+    str                   | c_char_p             | char* (.encode())
+    Optional[str]         | c_char_p             | char* (NULL if None)
+    bool                  | c_int                | int   (0 / 1)
+    float                 | c_float              | float
+    (other)               | c_void_p             | void*
+    (auto-appended)       | c_void_p             | hipStream_t
+    -------------------------------------------------------
+    """
     import ctypes
     import inspect
     import torch
@@ -1087,6 +1104,8 @@ def _ctypes_call(func, fc_name, md_name):
                 argtypes.append(ctypes.c_int)
             elif _is_union(origin) and str in type_args:
                 argtypes.append(ctypes.c_char_p)
+            elif hint is str:
+                argtypes.append(ctypes.c_char_p)
             elif hint is bool:
                 argtypes.append(ctypes.c_int)
             elif hint is int:
@@ -1129,6 +1148,12 @@ def _ctypes_call(func, fc_name, md_name):
                 if value is not None and not isinstance(value, str):
                     raise TypeError(
                         f"{fc_name}: '{pname}' expects Optional[str], "
+                        f"got {type(value).__name__}"
+                    )
+            elif hint is str:
+                if not isinstance(value, str):
+                    raise TypeError(
+                        f"{fc_name}: '{pname}' expects str, "
                         f"got {type(value).__name__}"
                     )
             elif hint is bool:
@@ -1192,6 +1217,8 @@ def _ctypes_call(func, fc_name, md_name):
                 c_args.append(value if value is not None else -1)
             elif _is_union(origin) and str in type_args:
                 c_args.append(value.encode() if value is not None else None)
+            elif hint is str:
+                c_args.append(value.encode())
             elif hint is bool:
                 c_args.append(1 if value else 0)
             elif hint is int:

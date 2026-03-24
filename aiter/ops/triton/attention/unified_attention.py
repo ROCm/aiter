@@ -12,6 +12,8 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     reduce_segments,
 )
 
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
+
 
 class SAGE_VERSION(Enum):
     SAGE = 1
@@ -86,6 +88,8 @@ def select_2d_config(
     num_queries_per_kv,
     num_2d_prgms,
 ):
+    arch = get_arch()
+
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
@@ -102,19 +106,38 @@ def select_2d_config(
         num_warps = 2
         TILE_SIZE = max(32, min(64, triton.next_power_of_2(block_size)))
 
+    TILE_SIZE = 32 if arch.name == "gfx1201" else 16 if arch.is_rdna else 64
+    waves_per_eu = 8 if arch.name == "gfx1151" else 6 if arch.is_rdna else 2
+
+    max_num_stages_2d = 2 if head_size > 128 else 4
+
+    # base prefill, for short cases
+    if not all_decode:
+        num_stages_2d, num_warps = 1, 2
+    # pure decode config
+    else:
+        # to not have masking when loading KV
+        TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+        if arch.is_rdna:
+            num_stages_2d, num_warps = 1, 4
+        else:
+            num_stages_2d, num_warps = 3, 2
+
+    # large prefill config
     if max_seqlen_q >= 256:
-        BLOCK_M = 128
-        num_stages_2d = 1
-        num_warps = 4
+        BLOCK_M = 64 if arch.is_rdna else 128
+        num_stages_2d, num_warps = 1, 4
+
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     num_stages_2d = min(max_num_stages_2d, num_stages_2d)
+
     return {
         "BLOCK_M": BLOCK_M,
         "BLOCK_Q": BLOCK_Q,
         "TILE_SIZE": TILE_SIZE,
         "num_warps": num_warps,
         "num_stages": num_stages_2d,
-        "waves_per_eu": 2,
+        "waves_per_eu": waves_per_eu,
     }
 
 
@@ -229,10 +252,10 @@ def check_mxfp4_quant_args_get_strides(
 
 
 def unified_attention(
-    q, # t,h,d+r
-    k, # num_blks, blk_size, hk, d+r
-    v, # num_blks, blk_size, hk, d
-    out, # t,h,d
+    q,  # t,h,d+r
+    k,  # num_blks, blk_size, hk, d+r
+    v,  # num_blks, blk_size, hk, d
+    out,  # t,h,d
     cu_seqlens_q,
     max_seqlen_q,
     seqused_k,
@@ -280,7 +303,7 @@ def unified_attention(
 
     num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
-    
+
     if sage_mxfp4:
         (
             query_scale_stride_0,

@@ -39,10 +39,14 @@ def pertoken_rotate_quantize_mxfp4(
     sm_scale=None,
 ):
     d = k.shape[-1]
-    assert d % 32 == 0, "for mxfp4 quantization, head dimension must be divisible by 32."
-    assert d % BLOCK_R == 0, "head dimension must be divisible by BLOCK_R (hadamard matrix size) for rotation quantization."
+    assert (
+        d % 32 == 0
+    ), "for mxfp4 quantization, head dimension must be divisible by 32."
+    assert (
+        d % BLOCK_R == 0
+    ), "head dimension must be divisible by BLOCK_R (hadamard matrix size) for rotation quantization."
     assert d % 2 == 0, "head dimension must be divisible by 2 for mxfp4 quantization."
-    
+
     K_q = torch.empty((*k.shape[:-1], d // 2), dtype=torch.uint8, device=k.device)
     K_descale = torch.empty(
         (*k.shape[:-1], d // 32), dtype=torch.uint8, device=k.device
@@ -78,6 +82,7 @@ v or v_q.shape: (b,h,s,d) or (t,h,d) or (num_blocks, block_size, h, d)
 v_descale: (h,d)
 """
 
+
 def perchannel_quantize_fp8(
     v,
     layout_k="bhsd",
@@ -103,6 +108,7 @@ def perchannel_quantize_fp8(
     v_q = (v / v_descale).to(FP8_TYPE)
     v_descale = v_descale.squeeze()
     return v_q, v_descale
+
 
 def sage_quant_v2(
     q,

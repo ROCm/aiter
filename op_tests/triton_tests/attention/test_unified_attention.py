@@ -79,13 +79,14 @@ def ref_paged_attn(
         attn = torch.softmax(attn, dim=-1).to(v.dtype)
         if sinks is not None:
             attn = attn[..., :-1]
-        
+
         out = torch.einsum("hqk,khc->qhc", attn, v)
 
         outputs.append(out)
         start_idx += query_len
 
     return torch.cat(outputs, dim=0)
+
 
 # All the parametrization stays here on the "base" test
 BASE_SEQ_LENS = [
@@ -112,6 +113,7 @@ def unified_attn_unpack(d):
         d["rope_size"],
         d["ref_kwargs"],
     )
+
 
 @pytest.fixture
 def unified_attn_inputs(
@@ -216,7 +218,6 @@ def unified_attn_inputs(
     )
 
 
-
 @pytest.mark.parametrize("seq_lens", BASE_SEQ_LENS)
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size_qk", HEAD_SIZES)
@@ -271,6 +272,7 @@ def test_triton_unified_attn(
     ref_output = ref_paged_attn(**ref_kwargs)
     atol, rtol = 1.5e-2, 1e-2
     torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
+
 
 @pytest.mark.parametrize("seq_lens", BASE_SEQ_LENS)
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
