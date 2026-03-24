@@ -91,6 +91,8 @@ def create_benchmark_configs(custom, args):
     sk = args.sq if not args.sk else args.sk
     head_size = 128 if not args.d else args.d
     head_size_v = head_size if not args.dv else args.dv
+    if args.rope_size > 0:
+        head_size_v = head_size - args.rope_size
     decode_p = args.decode
     x_names = [
         "BATCH",
@@ -252,7 +254,10 @@ def run_benchmark(custom, args):
         key_cache = torch.randn(
             num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cuda"
         )
-        value_cache = torch.randn_like(key_cache)
+        if args.rope_size > 0:
+            value_cache = key_cache[:, :, :, :D_HEAD_V]
+        else:
+            value_cache = torch.randn_like(key_cache)
         cu_seqlens_q = torch.zeros(len(seqlens_q) + 1, dtype=torch.int32, device="cuda")
         cu_seqlens_q[1:] = seqlens_q.cumsum(dim=0, dtype=torch.int32)
         cu_seqlens_k = torch.zeros(len(seqlens_k) + 1, dtype=torch.int32, device="cuda")
@@ -269,7 +274,7 @@ def run_benchmark(custom, args):
         else:
             sinks = None
 
-        output = torch.empty_like(query)
+        output = torch.empty(sum(seqlens_q), num_query_heads, D_HEAD_V, dtype=dtype, device="cuda")
         maybe_quantized_query = query
         maybe_quantized_key_cache = key_cache
         maybe_quantized_value_cache = value_cache
@@ -532,6 +537,7 @@ def parse_args():
     )
     parser.add_argument("-softcap", type=float, default=0.0)
     parser.add_argument("-dv", type=int, default=0, help="optional V head size")
+    parser.add_argument("-rope_size", type=int, default=0, help="RoPE size for MLA workloads (0=disabled). When >0, V head dim = d - rope_size")
     parser.add_argument(
         "-decode",
         nargs="?",  # 0 or 1 values

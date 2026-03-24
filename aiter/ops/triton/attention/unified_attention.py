@@ -326,7 +326,7 @@ def unified_attention(
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
-    if use_2d_kernel(
+    if HAS_ROPE or use_2d_kernel(
         head_size,
         SLIDING_WINDOW,
         ALL_DECODE,
