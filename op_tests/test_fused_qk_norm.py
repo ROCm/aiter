@@ -56,8 +56,6 @@ def run_aiter_fused_qk_rmsnorm(
 ):
     q_out, k_out = aiter.fused_qk_rmsnorm(q, q_weight, q_eps, k, k_weight, k_eps)
     return q_out, k_out
-    # fused_qk_rmsnorm(q, q_weight, q_eps, k, k_weight, k_eps)
-    # return q, k
 
 
 @benchmark()
