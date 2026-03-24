@@ -38,6 +38,7 @@ def ref_paged_attn(
     num_seqs = len(query_lens)
     block_tables = block_tables.cpu().numpy()
     _, block_size, num_kv_heads, head_size = key_cache.shape
+    head_size_v = value_cache.shape[-1]
 
     outputs: list[torch.Tensor] = []
     start_idx = 0
@@ -52,7 +53,7 @@ def ref_paged_attn(
 
         k = key_cache[block_indices].view(-1, num_kv_heads, head_size)
         k = k[:kv_len]
-        v = value_cache[block_indices].view(-1, num_kv_heads, head_size)
+        v = value_cache[block_indices].view(-1, num_kv_heads, head_size_v)
         v = v[:kv_len]
 
         if q.shape[1] != k.shape[1]:
@@ -79,7 +80,8 @@ def ref_paged_attn(
         attn = torch.softmax(attn, dim=-1).to(v.dtype)
         if sinks is not None:
             attn = attn[..., :-1]
-        out = torch.einsum("hqk,khd->qhd", attn, v)
+        
+        out = torch.einsum("hqk,khc->qhc", attn, v)
 
         outputs.append(out)
         start_idx += query_len
@@ -91,33 +93,37 @@ def ref_paged_attn(
     "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
 )
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("head_size_qk", HEAD_SIZES)
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
 @pytest.mark.parametrize("sliding_window", [None, 256])
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("q_dtype", QDTYPES)
 @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
-@pytest.mark.parametrize("fp8", [True, False])
-@pytest.mark.parametrize("sage_mxfp4", [True, False])
+@pytest.mark.parametrize("quant_scheme", [None, "fp8", "sage_mxfp4"])
+@pytest.mark.parametrize("rope_size", [0, 64])
 @torch.inference_mode()
 def test_triton_unified_attn(
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
-    head_size: int,
+    head_size_qk: int,
     sliding_window: Optional[int],
     dtype: torch.dtype,
     q_dtype: Optional[torch.dtype],
     block_size: int,
     soft_cap: Optional[float],
     num_blocks: int,
-    fp8: Optional[bool],
-    sage_mxfp4: Optional[bool],
+    quant_scheme: Optional[str],
+    rope_size: int,
 ) -> None:
     # if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
     #     pytest.skip("block size must be at least 32 for fp8")
-    if sage_mxfp4 and fp8:
-        pytest.skip("SAGE quant and fp8 q_dtype are mutually exclusive")
+    fp8 = quant_scheme == "fp8"
+    sage_mxfp4 = quant_scheme == "sage_mxfp4"
+    
+    if sage_mxfp4 and rope_size > 0:
+        pytest.skip("ROPE is not supported with Sage MXFP4 quantization")
+    
     if sage_mxfp4 and not arch_info.is_fp4_avail():
         pytest.skip("FP4 dot product is not supported on this GPU")
 
@@ -132,15 +138,20 @@ def test_triton_unified_attn(
     max_query_len = max(query_lens)
     max_kv_len = max(kv_lens)
     window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
-    scale = head_size**-0.5
+    scale = head_size_qk**-0.5
 
     query = torch.randn(
-        sum(query_lens), num_query_heads, head_size, dtype=dtype, device="cuda"
+        sum(query_lens), num_query_heads, head_size_qk, dtype=dtype, device="cuda"
     )
     key_cache = torch.randn(
-        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cuda"
+        num_blocks, block_size, num_kv_heads, head_size_qk, dtype=dtype, device="cuda"
     )
-    value_cache = torch.randn_like(key_cache)
+    if rope_size > 0:
+        lora_rank = head_size_qk - rope_size
+        value_cache = key_cache[:,:,:,:lora_rank]
+    else:
+        value_cache = torch.randn_like(key_cache)
+    
     cu_query_lens = torch.tensor(
         [0] + query_lens, dtype=torch.int32, device="cuda"
     ).cumsum(dim=0, dtype=torch.int32)
@@ -158,7 +169,10 @@ def test_triton_unified_attn(
         device="cuda",
     )
     sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
-    output = torch.empty_like(query)
+    
+    output = torch.empty(
+        sum(query_lens), num_query_heads, head_size_qk - rope_size, dtype=dtype, device="cuda"
+    )
 
     maybe_quantized_query = query
     maybe_quantized_key_cache = key_cache
@@ -249,13 +263,13 @@ if __name__ == "__main__":
     test_triton_unified_attn(
         seq_lens=[(1, 1328), (5, 18), (129, 463)],
         num_heads=(4, 4),
-        head_size=128,
+        head_size_qk=512,
+        rope_size=64,
         sliding_window=None,
         dtype=torch.float16,
         q_dtype=None,
         block_size=16,
         soft_cap=None,
         num_blocks=32768,
-        fp8=False,
-        sage_mxfp4=True,
+        quant_scheme=None,
     )

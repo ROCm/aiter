@@ -222,10 +222,10 @@ def check_mxfp4_quant_args_get_strides(
 
 
 def unified_attention(
-    q,
-    k,
-    v,
-    out,
+    q, # t,h,d+r
+    k, # num_blks, blk_size, hk, d+r
+    v, # num_blks, blk_size, hk, d
+    out, # t,h,d
     cu_seqlens_q,
     max_seqlen_q,
     seqused_k,
@@ -250,6 +250,10 @@ def unified_attention(
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
 
+    head_size = v.shape[-1]
+    ROPE_SIZE = k.shape[-1] - v.shape[-1]
+    HAS_ROPE = ROPE_SIZE > 0
+    
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
@@ -260,7 +264,7 @@ def unified_attention(
 
     num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
-    head_size = q.shape[2]
+    
     if sage_mxfp4:
         head_size *= 2
         (
@@ -307,7 +311,7 @@ def unified_attention(
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
-    if use_2d_kernel(
+    if HAS_ROPE or use_2d_kernel(
         head_size,
         SLIDING_WINDOW,
         ALL_DECODE,
@@ -390,6 +394,9 @@ def unified_attention(
             OUTPUT_FP8=output_scale is not None,
             ALL_DECODE=ALL_DECODE,
             SAGE_MXFP4=sage_mxfp4,
+            HAS_ROPE=HAS_ROPE,
+            ROPE_SIZE=ROPE_SIZE,
+            ROPE_SIZE_PADDED=triton.next_power_of_2(ROPE_SIZE),
             **config,
         )
 

@@ -184,6 +184,8 @@ def kernel_unified_attention_2d(
     TILE_SIZE: tl.constexpr,  # int must be power of 2
     HEAD_SIZE: tl.constexpr,  # int
     HEAD_SIZE_PADDED: tl.constexpr,  # int, must be power of 2
+    ROPE_SIZE: tl.constexpr,  # int
+    ROPE_SIZE_PADDED: tl.constexpr,  # int, must be power of 2
     USE_ALIBI_SLOPES: tl.constexpr,  # bool
     USE_QQ_BIAS: tl.constexpr,  # bool
     USE_SOFTCAP: tl.constexpr,  # bool
@@ -214,6 +216,7 @@ def kernel_unified_attention_2d(
     SAGE_MXFP4: tl.constexpr = False,  # bool
     IS_PAGING: tl.constexpr = True,  # bool
     PRELOAD_V: tl.constexpr = False,  # bool
+    HAS_ROPE: tl.constexpr = False,  # bool, not implemented yet
 ):
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
@@ -254,6 +257,15 @@ def kernel_unified_attention_2d(
         offs_d_qk = tl.arange(0, HEAD_SIZE_PADDED)
         offs_d_scale = None
 
+    if HAS_ROPE:
+        if SAGE_MXFP4:  # per token mxfp4
+            offs_rope = tl.arange(HEAD_SIZE//2, (HEAD_SIZE + ROPE_SIZE_PADDED)//2)
+            offs_rope_scale = tl.arange(HEAD_SIZE//32, (HEAD_SIZE + ROPE_SIZE)//32)
+        else:
+            offs_rope = tl.arange(HEAD_SIZE, HEAD_SIZE + ROPE_SIZE)
+            offs_rope_scale = None
+
+
     offs_t = tl.arange(0, TILE_SIZE)
     query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
 
@@ -266,14 +278,26 @@ def kernel_unified_attention_2d(
     )
 
     if HEAD_SIZE_PADDED != HEAD_SIZE:
-        dim_mask = offs_d < HEAD_SIZE
         if SAGE_MXFP4:
             dim_mask_qk = offs_d_qk < (HEAD_SIZE // 2)
+            scale_dim_mask = offs_d_scale < (HEAD_SIZE // 32)
         else:
+            dim_mask = offs_d < HEAD_SIZE
             dim_mask_qk = dim_mask
     else:
-        dim_mask = tl.full((1,), 1, dtype=tl.int1)
-        dim_mask_qk = dim_mask
+        dim_mask_qk = tl.full((1,), 1, dtype=tl.int1)
+        scale_dim_mask = tl.full((1,), 1, dtype=tl.int1)
+    
+    if ROPE_SIZE_PADDED != ROPE_SIZE:
+        if SAGE_MXFP4:
+            rope_dim_mask = offs_rope < ((HEAD_SIZE + ROPE_SIZE) // 2)
+            rope_scale_dim_mask = offs_rope_scale < ((HEAD_SIZE + ROPE_SIZE) // 32)
+        else:
+            rope_dim_mask = offs_rope < (HEAD_SIZE + ROPE_SIZE)
+    else:
+        rope_dim_mask = tl.full((1,), 1, dtype=tl.int1)
+        rope_scale_dim_mask = tl.full((1,), 1, dtype=tl.int1)
+    
     query_mask_0 = query_pos < cur_batch_query_len
     query_mask_1 = query_offset_1 < num_query_heads
 
@@ -281,6 +305,20 @@ def kernel_unified_attention_2d(
         Q_cache_modifier: tl.constexpr = ".cg"
     else:
         Q_cache_modifier: tl.constexpr = ""
+    
+    if HAS_ROPE:
+        q_rope_offset = (
+            query_offset_0[:, None] * query_stride_0
+            + query_offset_1[:, None] * query_stride_1
+            + offs_rope[None, :]
+        )
+        Q_rope = tl.load(
+            query_ptr + q_rope_offset,
+            mask=rope_dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+            other=0.0,
+            cache_modifier=Q_cache_modifier,
+        )
+    
     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
     Q = tl.load(
         query_ptr + query_offset,
@@ -297,10 +335,19 @@ def kernel_unified_attention_2d(
             + query_offset_1[:, None] * query_scale_stride_1
             + offs_d_scale[None, :] * query_scale_stride_2
         )
-
         q_scale_loaded = tl.load(
-            q_descale_ptr, mask=query_mask_0[:, None] & query_mask_1[:, None], other=0.0
+            q_descale_ptr, mask=scale_dim_mask[None,:] & query_mask_0[:, None] & query_mask_1[:, None], other=0.0
         )
+        if HAS_ROPE:
+            q_rope_scale_ptr = (
+                q_scale
+                + query_offset_0[:, None] * query_scale_stride_0
+                + query_offset_1[:, None] * query_scale_stride_1
+                + offs_rope_scale[None, :] * query_scale_stride_2
+            )
+            q_rope_scale_loaded = tl.load(
+                q_rope_scale_ptr, mask=rope_scale_dim_mask[None,:] & query_mask_0[:, None] & query_mask_1[:, None], other=0.0
+            )
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -414,6 +461,8 @@ def kernel_unified_attention_2d(
             + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
         )
 
+        S = tl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32)
+        
         # K : (HEAD_SIZE, TILE_SIZE)
         K_load = tl.load(
             key_cache_ptr + k_offset,
@@ -438,6 +487,33 @@ def kernel_unified_attention_2d(
         # TODO: check convert effect on perf
         K = K_load.to(Q.dtype)
 
+        if HAS_ROPE:
+            k_rope_ptrs = (
+                key_cache_ptr
+                + physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_rope[:, None] * stride_k_cache_3
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
+            K_rope = tl.load(
+                k_rope_ptrs,
+                mask=rope_dim_mask[:, None] & tile_mask[None, :],
+                other=0.0,
+                cache_modifier=KV_cache_modifier,
+            )
+            if SAGE_MXFP4:
+                k_rope_scale_ptr = (
+                    k_scale
+                    + physical_block_idx[:, None] * stride_k_cache_scale_0
+                    + kv_head_idx * stride_k_cache_scale_2
+                    + offs_rope_scale[:, None] * stride_k_cache_scale_3
+                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_k_cache_scale_1
+                )
+                k_rope_scale_loaded = tl.load(k_rope_scale_ptr, mask=rope_scale_dim_mask[:, None] & tile_mask[:, None], other=0.0)
+                S += tl.dot_scaled(Q_rope, q_rope_scale_loaded, "e2m1", K_rope, k_rope_scale_loaded, "e2m1", fast_math=True)
+            else:
+                S += qk_scale * tl.dot(Q_rope, K_rope)
+    
         if PRELOAD_V:
             # V : (TILE_SIZE, HEAD_SIZE)
             V = tl.load(
@@ -448,7 +524,7 @@ def kernel_unified_attention_2d(
             )
 
         # S : (BLOCK_M, TILE_SIZE)
-        S = qk_dot(
+        S += qk_dot(
             Q,
             K,
             qk_scale,
