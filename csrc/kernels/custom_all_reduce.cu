@@ -14,27 +14,39 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
-#include <torch/all.h>
-#include <torch/csrc/distributed/c10d/ParamCommsUtils.hpp>
-
 #include "custom_all_reduce.cuh"
+#include <cstring>
 
 using fp8_type = ck_tile::fp8_t;
 
-// fake pointer type, must match fptr_t type in ops.h
+// fake pointer type, must match fptr_t type in custom_all_reduce.h
 using fptr_t = int64_t;
 static_assert(sizeof(void*) == sizeof(fptr_t));
 
-// Sequence counter for profiling collective operations
-static std::atomic<int64_t> aiter_collective_seq_{0};
-
 namespace aiter {
 
-fptr_t init_custom_ar(torch::Tensor& meta,
-                      torch::Tensor& rank_data,
-                      const std::vector<torch::Tensor>& handles,
+// Dtype codes – keep in sync with Python-side _DTYPE_MAP
+static constexpr int64_t DTYPE_FLOAT32  = 0;
+static constexpr int64_t DTYPE_FLOAT16  = 1;
+static constexpr int64_t DTYPE_BFLOAT16 = 2;
+
+inline int64_t dtype_element_size(int64_t dtype)
+{
+    switch(dtype)
+    {
+    case DTYPE_FLOAT32:  return 4;
+    case DTYPE_FLOAT16:  return 2;
+    case DTYPE_BFLOAT16: return 2;
+    default: throw std::runtime_error("unsupported dtype: " + std::to_string(dtype));
+    }
+}
+
+// ---- init / dispose / meta_size ----
+
+fptr_t init_custom_ar(int64_t meta_ptr,
+                      int64_t rank_data_ptr,
+                      int64_t rank_data_sz,
+                      const std::vector<int64_t>& ipc_handle_ptrs,
                       const std::vector<int64_t>& offsets,
                       int64_t rank,
                       bool fully_connected)
@@ -44,7 +56,7 @@ fptr_t init_custom_ar(torch::Tensor& meta,
         throw std::invalid_argument("world size > 8 is not supported");
     if(world_size % 2 != 0)
         throw std::invalid_argument("Odd num gpus is not supported for now");
-    if(world_size != handles.size())
+    if(world_size != (int)ipc_handle_ptrs.size())
         throw std::invalid_argument("handles length should equal to offsets length");
     if(rank < 0 || rank >= world_size)
         throw std::invalid_argument("invalid rank passed in");
@@ -52,135 +64,64 @@ fptr_t init_custom_ar(torch::Tensor& meta,
     hipIpcMemHandle_t ipc_handles[8];
     for(int i = 0; i < world_size; i++)
     {
-        hipIpcMemHandle_t* ipc_handle_ptr = (hipIpcMemHandle_t*)handles[i].data_ptr();
-        std::memcpy(&ipc_handles[i], ipc_handle_ptr, sizeof(hipIpcMemHandle_t));
+        std::memcpy(&ipc_handles[i], (void*)ipc_handle_ptrs[i], sizeof(hipIpcMemHandle_t));
     }
-    return (fptr_t) new aiter::CustomAllreduce(reinterpret_cast<aiter::Signal*>(meta.data_ptr()),
-                                               rank_data.data_ptr(),
-                                               rank_data.numel(),
+    return (fptr_t) new aiter::CustomAllreduce(reinterpret_cast<aiter::Signal*>(meta_ptr),
+                                               (void*)rank_data_ptr,
+                                               rank_data_sz,
                                                ipc_handles,
                                                offsets,
                                                rank,
                                                fully_connected);
 }
 
-/**
- * Make sure tensor t's data lies completely within ((char)t.data_ptr()) +
- * t.numel() * t.element_size(). This is slightly weaker than t.is_contiguous()
- * because it allows transpose of contiguous slice (i.e. slicing the first
- * dimension). Currently, we require this because stride information is not
- * passed into the kernels and we treat input tensors as flat.
- *
- * Examples
- * A = torch.zeros(3, 3, 3)
- * 1. A: OK
- * 2. A[1:]: OK
- * 3. A.permute(2, 0, 1): OK
- * 4. A[1:].permute(2, 0, 1): OK
- * 5. A[None].expand(2, -1, -1, -1): Not OK
- * 6. A[:, 1:, 1:]: Not OK
- */
-bool _is_weak_contiguous(torch::Tensor& t)
-{
-    return t.is_contiguous() || (t.storage().nbytes() - t.storage_offset() * t.element_size() ==
-                                 t.numel() * t.element_size());
-}
-
-inline std::string _tensor_meta_str(const char* label, const torch::Tensor& t) \
-{                                                                              \
-  std::ostringstream os;                                                       \
-  os << label << ":[";                                                         \
-  for (int i = 0; i < t.dim(); ++i) { if (i) os << ","; os << t.size(i); }    \
-  os << "] stride:[";                                                          \
-  for (int i = 0; i < t.dim(); ++i) { if (i) os << ","; os << t.stride(i); }  \
-  os << "]";                                                                   \
-  return os.str();                                                             \
-}
-
-#define INSTRUMENTATION(kernel_name, inp, out, rank_id, world_size)         \
-  std::string _inst_name = std::string(kernel_name)                          \
-    + " " + _tensor_meta_str("inp", inp)                                     \
-    + " " + _tensor_meta_str("out", out);                                    \
-  std::vector<torch::Tensor> input_tensors = {inp};                         \
-  std::vector<torch::Tensor> output_tensors = {out};                        \
-  std::vector<int64_t> inp_split_sizes;                                     \
-  std::vector<int64_t> out_split_sizes;                                     \
-  if (inp.numel() != out.numel())                                           \
-  {                                                                         \
-    if (inp.numel() > out.numel())                                          \
-    {                                                                       \
-      for (int i = 0; i < rank_id; ++i)                                     \
-      {                                                                     \
-        out_split_sizes.push_back(out.numel());                             \
-      }                                                                     \
-    }                                                                       \
-    else                                                                    \
-    {                                                                       \
-      for (int i = 0; i < rank_id; ++i)                                     \
-      {                                                                     \
-        inp_split_sizes.push_back(inp.numel());                             \
-      }                                                                     \
-    }                                                                       \
-  }                                                                         \
-  RECORD_PARAM_COMMS_DATA(                                                  \
-    std::make_tuple(static_cast<int64_t>(aiter_collective_seq_++), false),  \
-    std::make_tuple("aiter_custom", "communication_kernel"),                \
-    input_tensors,                                                          \
-    output_tensors,                                                         \
-    rank_id,                                                                \
-    _inst_name.c_str(),                                                     \
-    inp.numel(),                                                            \
-    out.numel(),                                                            \
-    inp.scalar_type(),                                                      \
-    inp_split_sizes,                                                        \
-    out_split_sizes,                                                        \
-    0,                                                                      \
-    1,                                                                      \
-    world_size                                                              \
-  )
-
-void _all_reduce(
-    fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, hipStream_t stream, bool use_new,
-    bool open_fp8_quant, bool is_broadcast_reg_outptr)
+void dispose(fptr_t _fa)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
-    TORCH_CHECK(_is_weak_contiguous(out));
-    switch(out.scalar_type())
+    delete fa;
+}
+
+int64_t meta_size() { return sizeof(aiter::Signal); }
+
+// ---- Internal dispatch helpers ----
+
+static void _all_reduce(fptr_t _fa, void* inp, void* out,
+                        int64_t numel, int64_t dtype, hipStream_t stream,
+                        bool use_new, bool open_fp8_quant, bool is_broadcast_reg_outptr)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    switch(dtype)
     {
-    case at::ScalarType::Float: {
+    case DTYPE_FLOAT32: {
         fa->allreduce<opus::fp32_t>(stream,
-                             reinterpret_cast<opus::fp32_t*>(inp.data_ptr()),
-                             reinterpret_cast<opus::fp32_t*>(out.data_ptr()),
-                             out.numel(), use_new, is_broadcast_reg_outptr);
+                             reinterpret_cast<opus::fp32_t*>(inp),
+                             reinterpret_cast<opus::fp32_t*>(out),
+                             numel, use_new, is_broadcast_reg_outptr);
         break;
     }
-    case at::ScalarType::Half: {
-        /*
-         * By default, hidden_dim is a multiple of 128
-         * Obvious effects can only be achieved when the data scale reaches a certain level
-         * */
-        if(open_fp8_quant && out.numel() >= 128 * 2048)
+    case DTYPE_FLOAT16: {
+        if(open_fp8_quant && numel >= 128 * 2048)
         {
             fa->runFp8QuantKernel<opus::fp16_t>(stream,
-                                        reinterpret_cast<opus::fp16_t*>(inp.data_ptr()),
-                                        reinterpret_cast<opus::fp16_t*>(out.data_ptr()),
-                                        out.numel());
+                                        reinterpret_cast<opus::fp16_t*>(inp),
+                                        reinterpret_cast<opus::fp16_t*>(out),
+                                        numel);
         }
         else
         {
             fa->allreduce<opus::fp16_t>(stream,
-                                reinterpret_cast<opus::fp16_t*>(inp.data_ptr()),
-                                reinterpret_cast<opus::fp16_t*>(out.data_ptr()),
-                                out.numel(), use_new, is_broadcast_reg_outptr);
+                                reinterpret_cast<opus::fp16_t*>(inp),
+                                reinterpret_cast<opus::fp16_t*>(out),
+                                numel, use_new, is_broadcast_reg_outptr);
         }
         break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
-    case at::ScalarType::BFloat16: {
+    case DTYPE_BFLOAT16: {
         fa->allreduce<opus::bf16_t>(stream,
-                                      reinterpret_cast<opus::bf16_t*>(inp.data_ptr()),
-                                      reinterpret_cast<opus::bf16_t*>(out.data_ptr()),
-                                      out.numel(), use_new);
+                                      reinterpret_cast<opus::bf16_t*>(inp),
+                                      reinterpret_cast<opus::bf16_t*>(out),
+                                      numel, use_new);
         break;
     }
 #endif
@@ -189,122 +130,31 @@ void _all_reduce(
     }
 }
 
-void all_reduce(fptr_t _fa,
-                torch::Tensor& inp,
-                torch::Tensor& out,
-                bool use_new,
-                bool open_fp8_quant,
-                std::optional<torch::Tensor> reg_input_buffer,
-                std::optional<torch::Tensor> reg_output_buffer)
-{
-    // for profiling log
-    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
-    INSTRUMENTATION("all_reduce", inp, out, fa->rank_, fa->world_size_);
-
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
-    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
-    TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
-    TORCH_CHECK_EQ(inp.numel(), out.numel());
-
-    torch::Tensor* typed_input_buffer = &inp;
-    torch::Tensor* typed_output_buffer = &out;
-
-    torch::Tensor typed_input_buffer_reg;
-    torch::Tensor typed_output_buffer_reg;
-
-    // In eager mode, broadcasting tmp_output_ptr will lead to unnecessary memcpy.
-    // So we check if the output buffer is registered and if so, we set is_broadcast_reg_outptr to false.
-    bool is_broadcast_reg_outptr = true;
-    if (reg_output_buffer.has_value())
-    {
-        is_broadcast_reg_outptr = false;
-    }
-
-    if (!reg_input_buffer.has_value() && !reg_output_buffer.has_value())
-    {
-        // Graph mode: input and output are already registered, use directly
-        _all_reduce(_fa, inp, out, stream, use_new, open_fp8_quant, is_broadcast_reg_outptr);
-        return;
-    }
-
-    if(reg_input_buffer.has_value())
-    {
-        // Eager mode: use pre-registered buffers for both input and output
-        auto input_size = inp.numel() * inp.element_size();
-        TORCH_CHECK(input_size <= reg_input_buffer.value().numel() * reg_input_buffer.value().element_size(),
-                    "registered buffer is too small to contain the input");
-        
-        // Copy input to registered input buffer
-        HIP_CALL(hipMemcpyAsync(reg_input_buffer.value().data_ptr(),
-                                inp.data_ptr(),
-                                input_size,
-                                hipMemcpyDeviceToDevice,
-                                stream));
-        // Create typed views of the buffers with correct dtype and shape
-        typed_input_buffer_reg = torch::from_blob(
-            reg_input_buffer.value().data_ptr(),
-            {inp.numel()},
-            torch::TensorOptions().dtype(inp.dtype()).device(inp.device())
-        );
-        typed_input_buffer = &typed_input_buffer_reg;
-    }
-        
-    if(reg_output_buffer.has_value() && is_broadcast_reg_outptr)
-    {
-        // Use registered output buffer, kernel writes directly to it
-        auto output_size = out.numel() * out.element_size();
-        TORCH_CHECK(output_size <= reg_output_buffer.value().numel() * reg_output_buffer.value().element_size(),
-                    "registered output buffer is too small to contain the output");
-        
-        typed_output_buffer_reg = torch::from_blob(
-            reg_output_buffer.value().data_ptr(),
-            {out.numel()},
-            torch::TensorOptions().dtype(out.dtype()).device(out.device())
-        );
-        typed_output_buffer = &typed_output_buffer_reg;
-    }
-            
-    _all_reduce(_fa, *typed_input_buffer, *typed_output_buffer, stream, use_new,
-        open_fp8_quant, is_broadcast_reg_outptr);
-    
-    if(reg_output_buffer.has_value() && is_broadcast_reg_outptr)
-    {
-        // Copy result from registered output buffer to actual output
-        auto output_size = out.numel() * out.element_size();
-        HIP_CALL(hipMemcpyAsync(out.data_ptr(),
-                                reg_output_buffer.value().data_ptr(),
-                                output_size,
-                                hipMemcpyDeviceToDevice,
-                                stream));
-    }
-        
-}
-
-void _reduce_scatter(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int size, hipStream_t stream)
+static void _reduce_scatter(fptr_t _fa, void* inp, void* out,
+                            int64_t size, int64_t dtype, hipStream_t stream)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
-    TORCH_CHECK(_is_weak_contiguous(out));
-    switch(out.scalar_type())
+    switch(dtype)
     {
-    case at::ScalarType::Float: {
+    case DTYPE_FLOAT32: {
         fa->dispatchReduceScatter<opus::fp32_t>(stream,
-                                     reinterpret_cast<opus::fp32_t*>(inp.data_ptr()),
-                                     reinterpret_cast<opus::fp32_t*>(out.data_ptr()),
+                                     reinterpret_cast<opus::fp32_t*>(inp),
+                                     reinterpret_cast<opus::fp32_t*>(out),
                                      size);
         break;
     }
-    case at::ScalarType::Half: {
+    case DTYPE_FLOAT16: {
         fa->dispatchReduceScatter<opus::fp16_t>(stream,
-                                    reinterpret_cast<opus::fp16_t*>(inp.data_ptr()),
-                                    reinterpret_cast<opus::fp16_t*>(out.data_ptr()),
+                                    reinterpret_cast<opus::fp16_t*>(inp),
+                                    reinterpret_cast<opus::fp16_t*>(out),
                                     size);
         break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
-    case at::ScalarType::BFloat16: {
+    case DTYPE_BFLOAT16: {
         fa->dispatchReduceScatter<opus::bf16_t>(stream,
-                                              reinterpret_cast<opus::bf16_t*>(inp.data_ptr()),
-                                              reinterpret_cast<opus::bf16_t*>(out.data_ptr()),
+                                              reinterpret_cast<opus::bf16_t*>(inp),
+                                              reinterpret_cast<opus::bf16_t*>(out),
                                               size);
         break;
     }
@@ -314,60 +164,33 @@ void _reduce_scatter(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int siz
     }
 }
 
-void reduce_scatter(fptr_t _fa,
-                torch::Tensor& inp,
-                torch::Tensor& out,
-                std::optional<torch::Tensor> reg_buffer)
+static void _all_gather(fptr_t _fa, void* inp, void* out,
+                        int64_t size, int64_t dtype,
+                        int64_t last_dim_size, int64_t gather_dim,
+                        hipStream_t stream)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
-    INSTRUMENTATION("reduce_scatter", inp, out, fa->rank_, fa->world_size_);
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
-    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
-    TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
-
-    if(reg_buffer.has_value())
+    switch(dtype)
     {
-        auto input_size = inp.numel() * inp.element_size();
-        TORCH_CHECK(input_size <= reg_buffer.value().numel() * reg_buffer.value().element_size(),
-                    "registered buffer is too small to contain the input");
-        HIP_CALL(hipMemcpyAsync(reg_buffer.value().data_ptr(),
-                                inp.data_ptr(),
-                                input_size,
-                                hipMemcpyDeviceToDevice,
-                                stream));
-        _reduce_scatter(_fa, reg_buffer.value(), out, inp.numel(), stream);
-    }
-    else
-    {
-        _reduce_scatter(_fa, inp, out, inp.numel(), stream);
-    }
-}
-
-void _all_gather(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int size, int last_dim_size, int gather_dim, hipStream_t stream)
-{
-    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
-    TORCH_CHECK(_is_weak_contiguous(out));
-    switch(out.scalar_type())
-    {
-    case at::ScalarType::Float: {
+    case DTYPE_FLOAT32: {
         fa->dispatchAllGather<opus::fp32_t>(stream,
-                                     reinterpret_cast<opus::fp32_t*>(inp.data_ptr()),
-                                     reinterpret_cast<opus::fp32_t*>(out.data_ptr()),
+                                     reinterpret_cast<opus::fp32_t*>(inp),
+                                     reinterpret_cast<opus::fp32_t*>(out),
                                      size, last_dim_size, gather_dim);
         break;
     }
-    case at::ScalarType::Half: {
+    case DTYPE_FLOAT16: {
         fa->dispatchAllGather<opus::fp16_t>(stream,
-                                    reinterpret_cast<opus::fp16_t*>(inp.data_ptr()),
-                                    reinterpret_cast<opus::fp16_t*>(out.data_ptr()),
+                                    reinterpret_cast<opus::fp16_t*>(inp),
+                                    reinterpret_cast<opus::fp16_t*>(out),
                                     size, last_dim_size, gather_dim);
         break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
-    case at::ScalarType::BFloat16: {
+    case DTYPE_BFLOAT16: {
         fa->dispatchAllGather<opus::bf16_t>(stream,
-                                    reinterpret_cast<opus::bf16_t*>(inp.data_ptr()),
-                                    reinterpret_cast<opus::bf16_t*>(out.data_ptr()),
+                                    reinterpret_cast<opus::bf16_t*>(inp),
+                                    reinterpret_cast<opus::bf16_t*>(out),
                                     size, last_dim_size, gather_dim);
         break;
     }
@@ -377,59 +200,28 @@ void _all_gather(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int size, i
     }
 }
 
-void all_gather_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int last_dim_size, int dim)
+static void _fused_allreduce_rmsnorm(fptr_t _fa,
+                                     void* inp, void* residual_inp,
+                                     void* residual_out, void* out,
+                                     void* scale_out, void* w,
+                                     int64_t dtype, float eps,
+                                     int m, int n,
+                                     bool use_1stage,
+                                     hipStream_t stream)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
-    INSTRUMENTATION("all_gather", inp, out, fa->rank_, fa->world_size_);
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
-    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
-    TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
-    _all_gather(_fa, inp, out, inp.numel(), last_dim_size, dim, stream);
-}
-
-void all_gather_unreg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& reg_buffer, torch::Tensor& out, int last_dim_size, int dim)
-{
-    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
-    INSTRUMENTATION("all_gather", inp, out, fa->rank_, fa->world_size_);
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
-    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
-
-    auto input_size = inp.numel() * inp.element_size();
-    TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
-    TORCH_CHECK(input_size <= reg_buffer.numel() * reg_buffer.element_size(),
-                "registered buffer is too small to contain the input");
-    HIP_CALL(hipMemcpyAsync(
-        reg_buffer.data_ptr(), inp.data_ptr(), input_size, hipMemcpyDeviceToDevice, stream));
-    _all_gather(_fa, reg_buffer, out, inp.numel(), last_dim_size, dim, stream);
-}
-
-void _fused_allreduce_rmsnorm(fptr_t _fa,
-                              torch::Tensor& inp,
-                              torch::Tensor& residual_inp,
-                              torch::Tensor& residual_out,
-                              torch::Tensor& out,
-                              torch::Tensor& scale_out,
-                              torch::Tensor& w,
-                              int eps,
-                              int m,
-                              int n,
-                              bool use_1stage,
-                              hipStream_t stream)
-{
-    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
-    TORCH_CHECK(_is_weak_contiguous(out));
-    bool use_fp8_per_token_quant = scale_out.defined();
+    bool use_fp8_per_token_quant = (scale_out != nullptr);
 
 #define DISPATCH_AR_FUSION(DTYPE)                                \
     if(!use_fp8_per_token_quant)                                 \
     {                                                            \
         fa->dispatchFusedAllReduceRMSNorm<DTYPE>(                \
             stream,                                              \
-            reinterpret_cast<DTYPE*>(inp.data_ptr()),            \
-            reinterpret_cast<DTYPE*>(residual_inp.data_ptr()),   \
-            reinterpret_cast<DTYPE*>(residual_out.data_ptr()),   \
-            reinterpret_cast<DTYPE*>(out.data_ptr()),            \
-            reinterpret_cast<DTYPE*>(w.data_ptr()),              \
+            reinterpret_cast<DTYPE*>(inp),                       \
+            reinterpret_cast<DTYPE*>(residual_inp),              \
+            reinterpret_cast<DTYPE*>(residual_out),              \
+            reinterpret_cast<DTYPE*>(out),                       \
+            reinterpret_cast<DTYPE*>(w),                         \
             eps,                                                 \
             m,                                                   \
             n,                                                   \
@@ -439,30 +231,30 @@ void _fused_allreduce_rmsnorm(fptr_t _fa,
     {                                                            \
         fa->dispatchFusedAllReduceRMSNormQuant<DTYPE, fp8_type>( \
             stream,                                              \
-            reinterpret_cast<DTYPE*>(inp.data_ptr()),            \
-            reinterpret_cast<DTYPE*>(residual_inp.data_ptr()),   \
-            reinterpret_cast<DTYPE*>(residual_out.data_ptr()),   \
-            reinterpret_cast<fp8_type*>(out.data_ptr()),         \
-            reinterpret_cast<float*>(scale_out.data_ptr()),      \
-            reinterpret_cast<DTYPE*>(w.data_ptr()),              \
+            reinterpret_cast<DTYPE*>(inp),                       \
+            reinterpret_cast<DTYPE*>(residual_inp),              \
+            reinterpret_cast<DTYPE*>(residual_out),              \
+            reinterpret_cast<fp8_type*>(out),                    \
+            reinterpret_cast<float*>(scale_out),                 \
+            reinterpret_cast<DTYPE*>(w),                         \
             eps,                                                 \
             m,                                                   \
             n,                                                   \
             use_1stage);                                         \
     }
 
-    switch(residual_inp.scalar_type())
+    switch(dtype)
     {
-    case at::ScalarType::Float: {
+    case DTYPE_FLOAT32: {
         DISPATCH_AR_FUSION(opus::fp32_t)
         break;
     }
-    case at::ScalarType::Half: {
+    case DTYPE_FLOAT16: {
         DISPATCH_AR_FUSION(opus::fp16_t)
         break;
     }
 #if(__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
-    case at::ScalarType::BFloat16: {
+    case DTYPE_BFLOAT16: {
         DISPATCH_AR_FUSION(opus::bf16_t)
         break;
     }
@@ -474,180 +266,268 @@ void _fused_allreduce_rmsnorm(fptr_t _fa,
 #undef DISPATCH_AR_FUSION
 }
 
-void fused_allreduce_rmsnorm(fptr_t _fa,
-                             torch::Tensor& inp,
-                             torch::Tensor& res_inp,
-                             torch::Tensor& res_out,
-                             torch::Tensor& out,
-                             torch::Tensor& w,
-                             float eps,
-                             std::optional<torch::Tensor> reg_buffer,
-                             bool use_1stage)
-{
-    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
-    INSTRUMENTATION("fused_allreduce_rmsnorm", inp, out, fa->rank_, fa->world_size_);
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
-    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
-    TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
-    TORCH_CHECK_EQ(inp.scalar_type(), res_inp.scalar_type());
-    TORCH_CHECK_EQ(inp.numel(), out.numel());
-    TORCH_CHECK_EQ(inp.numel(), res_inp.numel());
-    int n          = w.numel();
-    int m          = inp.numel() / n;
-    auto scale_out = torch::Tensor();
+// ---- Public collective APIs ----
 
-    if(reg_buffer.has_value())
+void all_reduce(fptr_t _fa, int64_t inp, int64_t out,
+                int64_t numel, int64_t dtype,
+                bool use_new, bool open_fp8_quant,
+                int64_t reg_inp_ptr, int64_t reg_inp_bytes,
+                int64_t reg_out_ptr, int64_t reg_out_bytes,
+                int64_t stream_ptr)
+{
+    auto stream    = (hipStream_t)stream_ptr;
+    int64_t elem_sz    = dtype_element_size(dtype);
+    int64_t data_bytes = numel * elem_sz;
+
+    void* actual_inp = (void*)inp;
+    void* actual_out = (void*)out;
+
+    bool is_broadcast_reg_outptr = (reg_out_ptr == 0);
+
+    if(reg_inp_ptr == 0 && reg_out_ptr == 0)
     {
-        auto input_size = inp.numel() * inp.element_size();
-        TORCH_CHECK(input_size <= reg_buffer.value().numel() * reg_buffer.value().element_size(),
-                    "registered buffer is too small to contain the input");
-        HIP_CALL(hipMemcpyAsync(reg_buffer.value().data_ptr(),
-                                inp.data_ptr(),
-                                input_size,
-                                hipMemcpyDeviceToDevice,
-                                stream));
-        _fused_allreduce_rmsnorm(_fa,
-                                 reg_buffer.value(),
-                                 res_inp,
-                                 res_out,
-                                 out,
-                                 scale_out,
-                                 w,
-                                 eps,
-                                 m,
-                                 n,
-                                 use_1stage,
-                                 stream);
+        _all_reduce(_fa, actual_inp, actual_out, numel, dtype, stream,
+                    use_new, open_fp8_quant, is_broadcast_reg_outptr);
+        return;
+    }
+
+    if(reg_inp_ptr != 0)
+    {
+        if(data_bytes > reg_inp_bytes)
+            throw std::runtime_error("registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync((void*)reg_inp_ptr, (void*)inp, data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
+        actual_inp = (void*)reg_inp_ptr;
+    }
+
+    if(reg_out_ptr != 0 && is_broadcast_reg_outptr)
+    {
+        if(data_bytes > reg_out_bytes)
+            throw std::runtime_error("registered output buffer is too small to contain the output");
+        actual_out = (void*)reg_out_ptr;
+    }
+
+    _all_reduce(_fa, actual_inp, actual_out, numel, dtype, stream,
+                use_new, open_fp8_quant, is_broadcast_reg_outptr);
+
+    if(reg_out_ptr != 0 && is_broadcast_reg_outptr)
+    {
+        HIP_CALL(hipMemcpyAsync((void*)out, (void*)reg_out_ptr, data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
+    }
+}
+
+void reduce_scatter(fptr_t _fa, int64_t inp, int64_t out,
+                    int64_t inp_numel, int64_t dtype,
+                    int64_t reg_ptr, int64_t reg_bytes,
+                    int64_t stream_ptr)
+{
+    auto stream    = (hipStream_t)stream_ptr;
+    int64_t elem_sz    = dtype_element_size(dtype);
+    int64_t data_bytes = inp_numel * elem_sz;
+
+    if(reg_ptr != 0)
+    {
+        if(data_bytes > reg_bytes)
+            throw std::runtime_error("registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync((void*)reg_ptr, (void*)inp, data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
+        _reduce_scatter(_fa, (void*)reg_ptr, (void*)out, inp_numel, dtype, stream);
     }
     else
     {
-        _fused_allreduce_rmsnorm(
-            _fa, inp, res_inp, res_out, out, scale_out, w, eps, m, n, use_1stage, stream);
+        _reduce_scatter(_fa, (void*)inp, (void*)out, inp_numel, dtype, stream);
+    }
+}
+
+void all_gather_reg(fptr_t _fa, int64_t inp, int64_t out,
+                    int64_t inp_numel, int64_t dtype,
+                    int64_t last_dim_size, int64_t dim,
+                    int64_t stream_ptr)
+{
+    auto stream = (hipStream_t)stream_ptr;
+    _all_gather(_fa, (void*)inp, (void*)out, inp_numel, dtype,
+                last_dim_size, dim, stream);
+}
+
+void all_gather_unreg(fptr_t _fa, int64_t inp, int64_t reg_buffer,
+                      int64_t out, int64_t inp_numel, int64_t dtype,
+                      int64_t reg_bytes,
+                      int64_t last_dim_size, int64_t dim,
+                      int64_t stream_ptr)
+{
+    auto stream    = (hipStream_t)stream_ptr;
+    int64_t elem_sz    = dtype_element_size(dtype);
+    int64_t data_bytes = inp_numel * elem_sz;
+
+    if(data_bytes > reg_bytes)
+        throw std::runtime_error("registered buffer is too small to contain the input");
+    HIP_CALL(hipMemcpyAsync((void*)reg_buffer, (void*)inp, data_bytes,
+                            hipMemcpyDeviceToDevice, stream));
+    _all_gather(_fa, (void*)reg_buffer, (void*)out, inp_numel, dtype,
+                last_dim_size, dim, stream);
+}
+
+void fused_allreduce_rmsnorm(fptr_t _fa,
+                             int64_t inp, int64_t res_inp, int64_t res_out,
+                             int64_t out, int64_t w,
+                             int64_t numel, int64_t w_numel, int64_t dtype,
+                             double eps,
+                             int64_t reg_ptr, int64_t reg_bytes,
+                             bool use_1stage,
+                             int64_t stream_ptr)
+{
+    auto stream    = (hipStream_t)stream_ptr;
+    int64_t elem_sz    = dtype_element_size(dtype);
+    int64_t data_bytes = numel * elem_sz;
+    int n = (int)w_numel;
+    int m = (int)(numel / w_numel);
+
+    if(reg_ptr != 0)
+    {
+        if(data_bytes > reg_bytes)
+            throw std::runtime_error("registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync((void*)reg_ptr, (void*)inp, data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
+        _fused_allreduce_rmsnorm(_fa,
+                                 (void*)reg_ptr, (void*)res_inp, (void*)res_out,
+                                 (void*)out, nullptr, (void*)w,
+                                 dtype, (float)eps, m, n, use_1stage, stream);
+    }
+    else
+    {
+        _fused_allreduce_rmsnorm(_fa,
+                                 (void*)inp, (void*)res_inp, (void*)res_out,
+                                 (void*)out, nullptr, (void*)w,
+                                 dtype, (float)eps, m, n, use_1stage, stream);
     }
 }
 
 void fused_allreduce_rmsnorm_quant(fptr_t _fa,
-                                   torch::Tensor& inp,
-                                   torch::Tensor& res_inp,
-                                   torch::Tensor& res_out,
-                                   torch::Tensor& out,
-                                   torch::Tensor& scale_out,
-                                   torch::Tensor& w,
-                                   float eps,
-                                   std::optional<torch::Tensor> reg_buffer,
-                                   bool use_1stage)
+                                   int64_t inp, int64_t res_inp, int64_t res_out,
+                                   int64_t out, int64_t scale_out, int64_t w,
+                                   int64_t numel, int64_t w_numel, int64_t dtype,
+                                   double eps,
+                                   int64_t reg_ptr, int64_t reg_bytes,
+                                   bool use_1stage,
+                                   int64_t stream_ptr)
 {
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
-    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
-    TORCH_CHECK_EQ(inp.scalar_type(), res_inp.scalar_type());
-    TORCH_CHECK_EQ(inp.numel(), res_inp.numel());
-    int n = w.numel();
-    int m = inp.numel() / n;
+    auto stream    = (hipStream_t)stream_ptr;
+    int64_t elem_sz    = dtype_element_size(dtype);
+    int64_t data_bytes = numel * elem_sz;
+    int n = (int)w_numel;
+    int m = (int)(numel / w_numel);
 
-    if(reg_buffer.has_value())
+    if(reg_ptr != 0)
     {
-        auto input_size = inp.numel() * inp.element_size();
-        TORCH_CHECK(input_size <= reg_buffer.value().numel() * reg_buffer.value().element_size(),
-                    "registered buffer is too small to contain the input");
-        HIP_CALL(hipMemcpyAsync(reg_buffer.value().data_ptr(),
-                                inp.data_ptr(),
-                                input_size,
-                                hipMemcpyDeviceToDevice,
-                                stream));
+        if(data_bytes > reg_bytes)
+            throw std::runtime_error("registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync((void*)reg_ptr, (void*)inp, data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
         _fused_allreduce_rmsnorm(_fa,
-                                 reg_buffer.value(),
-                                 res_inp,
-                                 res_out,
-                                 out,
-                                 scale_out,
-                                 w,
-                                 eps,
-                                 m,
-                                 n,
-                                 use_1stage,
-                                 stream);
+                                 (void*)reg_ptr, (void*)res_inp, (void*)res_out,
+                                 (void*)out, (void*)scale_out, (void*)w,
+                                 dtype, (float)eps, m, n, use_1stage, stream);
     }
     else
     {
-        _fused_allreduce_rmsnorm(
-            _fa, inp, res_inp, res_out, out, scale_out, w, eps, m, n, use_1stage, stream);
+        _fused_allreduce_rmsnorm(_fa,
+                                 (void*)inp, (void*)res_inp, (void*)res_out,
+                                 (void*)out, (void*)scale_out, (void*)w,
+                                 dtype, (float)eps, m, n, use_1stage, stream);
     }
 }
 
-void dispose(fptr_t _fa)
-{
-    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
-    delete fa;
-}
-
-int64_t meta_size() { return sizeof(aiter::Signal); }
+// ---- Buffer registration ----
 
 void register_input_buffer(fptr_t _fa,
-                     torch::Tensor& t,
-                     const std::vector<torch::Tensor>& handles,
-                     const std::vector<int64_t>& offsets)
+                           int64_t self_ptr,
+                           const std::vector<int64_t>& ipc_handle_ptrs,
+                           const std::vector<int64_t>& offsets)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
-    fa->register_input_buffer(handles, offsets, t.data_ptr());
+    int world_size = ipc_handle_ptrs.size();
+    std::vector<hipIpcMemHandle_t> ipc_handles(world_size);
+    for(int i = 0; i < world_size; i++)
+    {
+        std::memcpy(&ipc_handles[i], (void*)ipc_handle_ptrs[i], sizeof(hipIpcMemHandle_t));
+    }
+    fa->register_input_buffer(ipc_handles.data(), offsets.data(), (void*)self_ptr);
 }
 
 void register_output_buffer(fptr_t _fa,
-                            torch::Tensor& t,
-                            const std::vector<torch::Tensor>& handles,
+                            int64_t self_ptr,
+                            const std::vector<int64_t>& ipc_handle_ptrs,
                             const std::vector<int64_t>& offsets)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
-    fa->register_output_buffer(handles, offsets, t.data_ptr());
+    int world_size = ipc_handle_ptrs.size();
+    std::vector<hipIpcMemHandle_t> ipc_handles(world_size);
+    for(int i = 0; i < world_size; i++)
+    {
+        std::memcpy(&ipc_handles[i], (void*)ipc_handle_ptrs[i], sizeof(hipIpcMemHandle_t));
+    }
+    fa->register_output_buffer(ipc_handles.data(), offsets.data(), (void*)self_ptr);
 }
 
-std::tuple<torch::Tensor, torch::Tensor> get_graph_buffer_ipc_meta(fptr_t _fa)
+int64_t get_graph_buffer_count(fptr_t _fa)
 {
-    auto fa                      = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
-    auto [handle_bytes, offsets] = fa->get_graph_buffer_ipc_meta();
-    auto options                 = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU);
-    auto handles = torch::empty({static_cast<int64_t>(handle_bytes.size())}, options);
-    std::memcpy(handles.data_ptr(), handle_bytes.data(), handle_bytes.size());
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    return (int64_t)(fa->graph_unreg_input_buffers_.size() +
+                     fa->graph_unreg_output_buffers_.size());
+}
 
-    torch::Tensor offset_tensor =
-        torch::from_blob(offsets.data(), {static_cast<int64_t>(offsets.size())}, torch::kInt64)
-            .clone();
-    return {handles, offset_tensor};
+void get_graph_buffer_ipc_meta(fptr_t _fa,
+                               int64_t handle_out,
+                               int64_t offset_out)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    auto [handle_bytes, offsets] = fa->get_graph_buffer_ipc_meta();
+    std::memcpy((void*)handle_out, handle_bytes.data(), handle_bytes.size());
+    std::memcpy((void*)offset_out, offsets.data(), offsets.size() * sizeof(int64_t));
 }
 
 void register_graph_buffers(fptr_t _fa,
-                            const std::vector<torch::Tensor>& handles,
-                            const std::vector<torch::Tensor>& offsets)
+                            const std::vector<int64_t>& handle_ptrs,
+                            const std::vector<int64_t>& offset_ptrs)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
-    fa->register_graph_buffers(handles, offsets);
+    int world_size = handle_ptrs.size();
+    std::vector<const void*> handles(world_size);
+    std::vector<const int64_t*> offsets(world_size);
+    for(int i = 0; i < world_size; i++)
+    {
+        handles[i] = (const void*)handle_ptrs[i];
+        offsets[i] = (const int64_t*)offset_ptrs[i];
+    }
+    fa->register_graph_buffers(handles.data(), offsets.data());
 }
+
+// ---- ROCm-specific utilities ----
 
 #ifdef USE_ROCM
 
-void free_meta_buffer(void* buffer) { HIP_CALL(hipFree(buffer)); }
-
-torch::Tensor get_meta_buffer_ipc_handle(torch::Tensor& inp)
+int64_t allocate_meta_buffer(int64_t size, int64_t stream_ptr)
 {
-    auto options     = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU);
-    auto data_handle = torch::empty({static_cast<int64_t>(sizeof(hipIpcMemHandle_t))}, options);
-    HIP_CALL(hipIpcGetMemHandle((hipIpcMemHandle_t*)data_handle.data_ptr(), inp.data_ptr()));
-    return data_handle;
-}
-
-torch::Tensor allocate_meta_buffer(int64_t size)
-{
-    auto device_index = c10::hip::current_device();
-    at::DeviceGuard device_guard(at::Device(at::DeviceType::CUDA, device_index));
+    auto stream = (hipStream_t)stream_ptr;
     void* buffer;
     hipStreamCaptureMode mode = hipStreamCaptureModeRelaxed;
-    auto stream               = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     HIP_CALL(hipThreadExchangeStreamCaptureMode(&mode));
     HIP_CALL(hipExtMallocWithFlags((void**)&buffer, size, hipDeviceMallocUncached));
     HIP_CALL(hipMemsetAsync(buffer, 0, size, stream));
     HIP_CALL(hipStreamSynchronize(stream));
     HIP_CALL(hipThreadExchangeStreamCaptureMode(&mode));
-    auto options = torch::TensorOptions().dtype(torch::kI8).device(torch::kCUDA, device_index);
-    return torch::from_blob(buffer, {size}, free_meta_buffer, options);
+    return (int64_t)buffer;
+}
+
+void free_meta_buffer(int64_t ptr)
+{
+    HIP_CALL(hipFree((void*)ptr));
+}
+
+void get_meta_buffer_ipc_handle(int64_t inp_ptr, int64_t out_handle_ptr)
+{
+    HIP_CALL(hipIpcGetMemHandle((hipIpcMemHandle_t*)out_handle_ptr, (void*)inp_ptr));
 }
 
 #endif

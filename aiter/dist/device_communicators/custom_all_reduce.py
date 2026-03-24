@@ -15,8 +15,9 @@
 * limitations under the License.
 """
 
+import pickle
 from contextlib import contextmanager
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -43,6 +44,211 @@ def is_weak_contiguous(inp: torch.Tensor):
         inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
         == inp.numel() * inp.element_size()
     )
+
+
+_DTYPE_MAP = {
+    torch.float32: 0,
+    torch.float16: 1,
+    torch.bfloat16: 2,
+}
+
+
+def _current_stream_ptr() -> int:
+    return torch.cuda.current_stream().cuda_stream
+
+
+class IPCBuffer:
+    """A single IPC-accessible device buffer.
+
+    Pure data container — owns a pre-allocated GPU allocation with a fixed
+    device address.  All IPC handle / broadcast / registration logic lives
+    in IPCBufferPool.
+
+    When *uncached* is False (default), memory is allocated through PyTorch's
+    caching allocator (torch.empty).  When True, memory is allocated via
+    hipExtMallocWithFlags with hipDeviceMallocUncached, bypassing the cache.
+    Uncached buffers are suitable for cross-GPU synchronization metadata and
+    signal buffers where cache coherence overhead is undesirable.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        device: torch.device,
+        uncached: bool = False,
+    ):
+        self._size = size
+        self._uncached = uncached
+        if uncached:
+            self._buffer = None
+            self._raw_ptr = ops.allocate_meta_buffer(size, _current_stream_ptr())
+        else:
+            self._buffer = torch.empty(size, dtype=torch.uint8, device=device)
+            self._raw_ptr = self._buffer.data_ptr()
+
+    @property
+    def data_ptr(self) -> int:
+        return self._raw_ptr
+
+    @property
+    def tensor(self) -> torch.Tensor:
+        if self._buffer is None:
+            raise RuntimeError(
+                "Uncached IPCBuffer has no backing tensor; use .data_ptr"
+            )
+        return self._buffer
+
+    @property
+    def max_size(self) -> int:
+        return self._size
+
+    @property
+    def uncached(self) -> bool:
+        return self._uncached
+
+    def __del__(self):
+        if self._uncached and self._raw_ptr:
+            ops.free_meta_buffer(self._raw_ptr)
+            self._raw_ptr = 0
+
+
+class IPCBufferPool:
+    """Manages a collection of named IPCBuffers and provides IPC broadcast
+    infrastructure for cross-GPU communication.
+
+    Buffers are stored in an internal dict and accessed by string key.
+
+    Two sets of operations:
+
+    Eager mode (named internal buffers):
+        create(key, size) allocates a buffer and stores it under *key*.
+        get_ipc_meta(key) broadcasts IPC handles for that buffer.
+
+    Graph mode (arbitrary external tensors):
+        get_external_ipc_meta(tensor) broadcasts IPC handles for any tensor.
+        flush_graph_buffers(ar_ptr) batch-registers addresses that the C++
+        backend collected during CUDA graph capture.
+    """
+
+    _pool_seq: int = 0
+
+    def __init__(self, device: torch.device, group: ProcessGroup):
+        self._device = device
+        self._group = group
+        self._rank = dist.get_rank(group=group)
+        self._world_size = dist.get_world_size(group=group)
+        self._buffers: Dict[str, IPCBuffer] = {}
+
+        self._store = dist.distributed_c10d._get_default_store()
+        self._assert_pure_tcp_store(self._store)
+
+        ranks_tag = "_".join(map(str, sorted(dist.get_process_group_ranks(group))))
+        self._store_key_prefix = f"aiter_ipc/p{IPCBufferPool._pool_seq}/g{ranks_tag}"
+        IPCBufferPool._pool_seq += 1
+        self._ipc_seq = 0
+
+    @staticmethod
+    def _assert_pure_tcp_store(store) -> None:
+        """Verify the store is a pure-TCP KV store, free from any collective
+        communication backend (RCCL / gloo / MPI)."""
+        s = store
+        while isinstance(s, dist.PrefixStore):
+            s = s.underlying_store
+        assert isinstance(s, dist.TCPStore), (
+            f"IPC metadata exchange requires a pure-TCP KV store "
+            f"(torch.distributed.TCPStore), got {type(s).__name__}. "
+            f"This ensures the exchange is backend-free — no RCCL, "
+            f"gloo, or MPI collective is involved."
+        )
+
+    # ---- Buffer lifecycle ----
+
+    def create(self, key: str, size: int, uncached: bool = False) -> IPCBuffer:
+        """Allocate a new IPCBuffer and store it under *key*.
+
+        Args:
+            key: unique name for this buffer in the pool.
+            size: buffer size in bytes.
+            uncached: if True, allocate via hipMalloc (uncached);
+                      if False (default), allocate via torch.empty (cached).
+        """
+        if key in self._buffers:
+            raise KeyError(f"IPCBuffer '{key}' already exists in the pool")
+        buf = IPCBuffer(size, self._device, uncached=uncached)
+        self._buffers[key] = buf
+        return buf
+
+    def __getitem__(self, key: str) -> IPCBuffer:
+        return self._buffers[key]
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._buffers
+
+    # ---- Eager mode: named buffer IPC meta ----
+
+    def get_ipc_meta(self, key: str) -> Tuple[List, List]:
+        """Broadcast IPC handles for the named buffer across all ranks."""
+        buf = self._buffers[key]
+        return self._broadcast_ipc(buf.data_ptr)
+
+    # ---- Graph mode: external buffer IPC meta ----
+
+    def get_external_ipc_meta(self, tensor: torch.Tensor) -> Tuple[List, List]:
+        """Broadcast IPC handles for an arbitrary external tensor."""
+        return self._broadcast_ipc(tensor.data_ptr())
+
+    def flush_graph_buffers(self, ar_ptr):
+        """Batch-register buffer addresses collected during CUDA graph capture.
+
+        During graph capture the C++ backend records addresses of buffers that
+        are not yet IPC-registered.  After capture ends this method exchanges
+        their IPC handles across all ranks and completes registration.
+        """
+        count = ops.get_graph_buffer_count(ar_ptr)
+        if count == 0:
+            return
+        handle_sz = 64  # sizeof(hipIpcMemHandle_t)
+        handle = torch.empty(count * handle_sz, dtype=torch.uint8)
+        offset = torch.empty(count, dtype=torch.int64)
+        ops.get_graph_buffer_ipc_meta(ar_ptr, handle.data_ptr(), offset.data_ptr())
+        handles, offsets = self._gather_ipc_meta((handle, offset))
+        logger.info("Registering %d cuda graph addresses", count)
+        ops.register_graph_buffers(
+            ar_ptr,
+            [h.data_ptr() for h in handles],
+            [o.data_ptr() for o in offsets],
+        )
+
+    # ---- Private IPC primitives ----
+
+    def _broadcast_ipc(self, data_ptr: int) -> Tuple[List, List]:
+        """Get IPC handle for *data_ptr* and broadcast across all ranks."""
+        handle = torch.empty(64, dtype=torch.uint8)  # sizeof(hipIpcMemHandle_t)
+        ops.get_meta_buffer_ipc_handle(data_ptr, handle.data_ptr())
+        return self._gather_ipc_meta((handle, 0))
+
+    def _gather_ipc_meta(self, shard_data) -> Tuple[List, List]:
+        """Exchange IPC metadata (handle + offset) across all ranks via TCP store.
+
+        Each rank writes its serialised *shard_data* under a unique key, then
+        reads every other rank's data.  ``store.get()`` blocks until the key
+        is available, providing natural barrier semantics without involving any
+        collective communication backend.
+        """
+        seq = self._ipc_seq
+        self._ipc_seq += 1
+        prefix = f"{self._store_key_prefix}/{seq}"
+
+        self._store.set(f"{prefix}/r{self._rank}", pickle.dumps(shard_data))
+
+        handles = []
+        offsets = []
+        for r in range(self._world_size):
+            raw = self._store.get(f"{prefix}/r{r}")
+            h, o = pickle.loads(raw)
+            handles.append(h)
+            offsets.append(o)
+        return handles, offsets
 
 
 class CustomAllreduce:
@@ -152,20 +358,6 @@ class CustomAllreduce:
 
         self.disabled = False
         self.enable_register_for_capturing = enable_register_for_capturing
-        # buffers memory are owned by this Python class and passed to C++
-        # meta data composes of two parts: meta data for synchronization
-        # (256 bytes) and a temporary buffer for storing intermediate
-        # allreduce results.
-        # if current_platform.is_rocm():
-        self.meta = ops.allocate_meta_buffer(ops.meta_size() + max_size)
-        # This is a pre-registered IPC buffer. In eager mode, input tensors
-        # are first copied into this buffer before allreduce is performed
-        self.input_buffer = torch.empty(max_size, dtype=torch.uint8, device=self.device)
-        # This is a pre-registered IPC buffer for output. In eager mode, kernel
-        # writes results to this buffer, then it's copied to the actual output
-        self.output_buffer = torch.empty(
-            max_size, dtype=torch.uint8, device=self.device
-        )
         # This is a buffer for storing the tuples of pointers pointing to
         # IPC buffers from all ranks. Each registered tuple has size of
         # 8*world_size bytes where world_size is at most 8. Allocating 8MB
@@ -177,26 +369,53 @@ class CustomAllreduce:
         self.max_size = max_size
         self.rank = rank
         self.world_size = world_size
-        handle = ops.get_meta_buffer_ipc_handle(self.meta)
-        shard_data = (
-            handle,  # ipc handle to base ptr
-            0,  # offset of base ptr
-        )
-        handles, offsets = self._gather_ipc_meta(shard_data)
+
+        # Create IPC buffer pool and allocate all named buffers.
+        # "meta" uses hipAlloc (uncached) for synchronization metadata +
+        # intermediate allreduce temp storage.
+        # "input" / "output" use torchAlloc (cached) for D2D relay in
+        # eager mode.
+        self._pool = IPCBufferPool(self.device, self.group)
+        self._pool.create("meta", ops.meta_size() + max_size, uncached=True)
+        self._pool.create("input", max_size)
+        self._pool.create("output", max_size)
+
+        # Exchange meta buffer IPC handles to initialize C++ backend
+        handles, offsets = self._pool.get_ipc_meta("meta")
 
         self.fully_connected = fully_connected
         self._ptr = ops.init_custom_ar(
-            self.meta, self.rank_data, handles, offsets, rank, self.fully_connected
+            self._pool["meta"].data_ptr,
+            self.rank_data.data_ptr(),
+            self.rank_data.numel(),
+            [h.data_ptr() for h in handles],
+            offsets,
+            rank,
+            self.fully_connected,
         )
-        # Register both input and output buffers
-        self.register_input_buffer(self.input_buffer)
-        self.register_output_buffer(self.output_buffer)
+
+        # Register input/output IPC buffers with the C++ backend
+        handles, offsets = self._pool.get_ipc_meta("input")
+        ops.register_input_buffer(
+            self._ptr,
+            self._pool["input"].data_ptr,
+            [h.data_ptr() for h in handles],
+            offsets,
+        )
+
+        handles, offsets = self._pool.get_ipc_meta("output")
+        ops.register_output_buffer(
+            self._ptr,
+            self._pool["output"].data_ptr,
+            [h.data_ptr() for h in handles],
+            offsets,
+        )
 
     @contextmanager
     def capture(self):
         """
         The main responsibility of this context manager is the
-        `register_graph_buffers` call at the end of the context.
+        flush_graph_buffers call at the end of the context.
         It records all the buffer addresses used in the CUDA graph.
         """
         try:
@@ -205,63 +424,25 @@ class CustomAllreduce:
         finally:
             self._IS_CAPTURING = False
             if not self.disabled:
-                self.register_graph_buffers()
-
-    def _get_ipc_meta(self, inp: torch.Tensor):
-        # if current_platform.is_rocm():
-        if 1:
-            # _share_cuda_() doesn't accept meta buffer not allocated from
-            # PyTorch cache allocator, use direct HIP call to get IPC handle
-            handle = ops.get_meta_buffer_ipc_handle(inp)
-            shard_data = (
-                handle,  # ipc handle to base ptr
-                0,  # offset of base ptr
-            )
-        else:
-            data = inp.untyped_storage()._share_cuda_()
-            shard_data = (
-                data[1],  # ipc handle to base ptr
-                data[3],  # offset of base ptr
-            )
-        return self._gather_ipc_meta(shard_data)
-
-    def _gather_ipc_meta(self, shard_data):
-        # Note: don't use `[[None]] * self.world_size` here
-        # because it will create a list of the same reference
-        all_data: List[Optional[Any]] = [[None] for i in range(self.world_size)]
-        all_data[self.rank][0] = shard_data
-
-        ranks = dist.get_process_group_ranks(group=self.group)
-        ranks.sort()
-        for i, rank in enumerate(ranks):
-            dist.broadcast_object_list(
-                all_data[i], src=rank, group=self.group, device="cpu"
-            )
-
-        # we cannot directly use `dist.all_gather_object` here
-        # because it is incompatible with `gloo` backend under inference mode.
-        # see https://github.com/pytorch/pytorch/issues/126032 for details.
-
-        handles = []
-        offsets = []
-        for i in range(len(all_data)):
-            handles.append(all_data[i][0][0])  # type: ignore
-            offsets.append(all_data[i][0][1])  # type: ignore
-        return handles, offsets
+                self._pool.flush_graph_buffers(self._ptr)
 
     def register_input_buffer(self, inp: torch.Tensor):
-        handles, offsets = self._get_ipc_meta(inp)
-        ops.register_input_buffer(self._ptr, inp, handles, offsets)
+        """Register an external tensor as an IPC input buffer."""
+        handles, offsets = self._pool.get_external_ipc_meta(inp)
+        ops.register_input_buffer(
+            self._ptr, inp.data_ptr(), [h.data_ptr() for h in handles], offsets
+        )
 
     def register_output_buffer(self, out: torch.Tensor):
-        handles, offsets = self._get_ipc_meta(out)
-        ops.register_output_buffer(self._ptr, out, handles, offsets)
+        """Register an external tensor as an IPC output buffer."""
+        handles, offsets = self._pool.get_external_ipc_meta(out)
+        ops.register_output_buffer(
+            self._ptr, out.data_ptr(), [h.data_ptr() for h in handles], offsets
+        )
 
     def register_graph_buffers(self):
-        handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
-        handles, offsets = self._gather_ipc_meta((handle, offset))
-        logger.info("Registering %d cuda graph addresses", len(offset))
-        ops.register_graph_buffers(self._ptr, handles, offsets)
+        """Batch-register graph-captured buffer addresses."""
+        self._pool.flush_graph_buffers(self._ptr)
 
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
@@ -311,14 +492,27 @@ class CustomAllreduce:
         """
         if out is None:
             out = torch.empty_like(inp)
+        assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
+        stream = _current_stream_ptr()
+        inp_numel = inp.numel()
+        dtype_code = _DTYPE_MAP[inp.dtype]
+        reg_inp = 0 if registered_input else self._pool["input"].data_ptr
+        reg_inp_bytes = 0 if registered_input else self._pool["input"].max_size
+        reg_out = 0 if registered_output else self._pool["output"].data_ptr
+        reg_out_bytes = 0 if registered_output else self._pool["output"].max_size
         ops.all_reduce(
             self._ptr,
-            inp,
-            out,
+            inp.data_ptr(),
+            out.data_ptr(),
+            inp_numel,
+            dtype_code,
             use_new,
             open_fp8_quant,
-            None if registered_input else self.input_buffer,
-            None if registered_output else self.output_buffer,
+            reg_inp,
+            reg_inp_bytes,
+            reg_out,
+            reg_out_bytes,
+            stream,
         )
         return out
 
@@ -361,11 +555,20 @@ class CustomAllreduce:
         *,
         registered: bool = False,
     ):
+        assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
+        stream = _current_stream_ptr()
+        dtype_code = _DTYPE_MAP[inp.dtype]
+        reg = 0 if registered else self._pool["input"].data_ptr
+        reg_bytes = 0 if registered else self._pool["input"].max_size
         ops.reduce_scatter(
             self._ptr,
-            inp,
-            out,
-            None if registered else self.input_buffer,
+            inp.data_ptr(),
+            out.data_ptr(),
+            inp.numel(),
+            dtype_code,
+            reg,
+            reg_bytes,
+            stream,
         )
 
     def custom_reduce_scatter(
@@ -398,7 +601,19 @@ class CustomAllreduce:
                 dtype=inp.dtype,
                 device=inp.device,
             )
-        ops.all_gather_reg(self._ptr, inp, out, inp.shape[-1], dim)
+        assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
+        stream = _current_stream_ptr()
+        dtype_code = _DTYPE_MAP[inp.dtype]
+        ops.all_gather_reg(
+            self._ptr,
+            inp.data_ptr(),
+            out.data_ptr(),
+            inp.numel(),
+            dtype_code,
+            inp.shape[-1],
+            dim,
+            stream,
+        )
         return out
 
     def all_gather_unreg(
@@ -410,7 +625,21 @@ class CustomAllreduce:
                 dtype=inp.dtype,
                 device=inp.device,
             )
-        ops.all_gather_unreg(self._ptr, inp, self.input_buffer, out, inp.shape[-1], dim)
+        assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
+        stream = _current_stream_ptr()
+        dtype_code = _DTYPE_MAP[inp.dtype]
+        ops.all_gather_unreg(
+            self._ptr,
+            inp.data_ptr(),
+            self._pool["input"].data_ptr,
+            out.data_ptr(),
+            inp.numel(),
+            dtype_code,
+            self._pool["input"].max_size,
+            inp.shape[-1],
+            dim,
+            stream,
+        )
         return out
 
     def custom_all_gather(
@@ -441,39 +670,55 @@ class CustomAllreduce:
     ):
         if res_out is None:
             res_out = torch.empty_like(inp)
+        stream = _current_stream_ptr()
+        dtype_code = _DTYPE_MAP[inp.dtype]
+        reg = 0 if registered else self._pool["input"].data_ptr
+        reg_bytes = 0 if registered else self._pool["input"].max_size
         if not post_per_token_quant:
             if out is None:
                 out = torch.empty_like(inp)
+            assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
             ops.fused_allreduce_rmsnorm(
                 self._ptr,
-                inp,
-                res_inp,
-                res_out,
-                out,
-                w,
+                inp.data_ptr(),
+                res_inp.data_ptr(),
+                res_out.data_ptr(),
+                out.data_ptr(),
+                w.data_ptr(),
+                inp.numel(),
+                w.numel(),
+                dtype_code,
                 eps,
-                None if registered else self.input_buffer,
+                reg,
+                reg_bytes,
                 use_1stage,
+                stream,
             )
             return out, res_out
         else:
             if out is None:
                 out = torch.empty(inp.shape, dtype=fp8, device=inp.device)
+            assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
             if scale_out is None:
                 scale_out = torch.empty(
                     inp.shape[:-1] + (1,), dtype=torch.float32, device=inp.device
                 )
             ops.fused_allreduce_rmsnorm_quant(
                 self._ptr,
-                inp,
-                res_inp,
-                res_out,
-                out,
-                scale_out,
-                w,
+                inp.data_ptr(),
+                res_inp.data_ptr(),
+                res_out.data_ptr(),
+                out.data_ptr(),
+                scale_out.data_ptr(),
+                w.data_ptr(),
+                inp.numel(),
+                w.numel(),
+                dtype_code,
                 eps,
-                None if registered else self.input_buffer,
+                reg,
+                reg_bytes,
                 use_1stage,
+                stream,
             )
             return out, res_out, scale_out
 

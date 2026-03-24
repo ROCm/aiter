@@ -16,7 +16,6 @@
  * limitations under the License.
  */
 #include "aiter_hip_common.h"
-#include "communication_asm.h"
 #include "hip_float8.h"
 #include "opus/opus.hpp"
 #include <hip/hip_bf16.h>
@@ -1941,8 +1940,8 @@ class CustomAllreduce
                                      std::to_string(d_rank_data_base_ + num - d_rank_data_end_));
     }
 
-    void register_input_buffer(const std::vector<torch::Tensor>& handles,
-                               const std::vector<int64_t>& offsets,
+    void register_input_buffer(const hipIpcMemHandle_t* ipc_handles,
+                               const int64_t* offsets,
                                void* self)
     {
         check_rank_data_capacity();
@@ -1951,8 +1950,7 @@ class CustomAllreduce
         {
             if(i != rank_)
             {
-                hipIpcMemHandle_t* ipc_handle_ptr = (hipIpcMemHandle_t*)handles[i].data_ptr();
-                char* handle                      = open_ipc_handle((void*)ipc_handle_ptr);
+                char* handle = open_ipc_handle((void*)&ipc_handles[i]);
                 handle += offsets[i];
                 data.ptrs[i] = handle;
             }
@@ -1966,19 +1964,17 @@ class CustomAllreduce
         input_buffer[self] = d_data;
     }
 
-    void register_output_buffer(const std::vector<torch::Tensor>& handles,
-                                const std::vector<int64_t>& offsets,
+    void register_output_buffer(const hipIpcMemHandle_t* ipc_handles,
+                                const int64_t* offsets,
                                 void* self)
     {
         check_rank_data_capacity();
         RankData data;
-        // Setup output_ptrs
         for(int i = 0; i < world_size_; i++)
         {
             if(i != rank_)
             {
-                hipIpcMemHandle_t* ipc_handle_ptr = (hipIpcMemHandle_t*)handles[i].data_ptr();
-                char* handle                      = open_ipc_handle((void*)ipc_handle_ptr);
+                char* handle = open_ipc_handle((void*)&ipc_handles[i]);
                 handle += offsets[i];
                 data.ptrs[i] = handle;
             }
@@ -2057,8 +2053,8 @@ class CustomAllreduce
     // rank 1 may get the same input address for the second allreduce, but rank 2
     // got a different address. IPC handles have internal reference counting
     // mechanism so overhead should be small.
-    void register_graph_buffers(const std::vector<torch::Tensor>& handles,
-                                const std::vector<torch::Tensor>& offsets)
+    void register_graph_buffers(const void* const* handles_per_rank,
+                                const int64_t* const* offsets_per_rank)
     {
         auto num_input_buffers  = graph_unreg_input_buffers_.size();
         auto num_output_buffers = graph_unreg_output_buffers_.size();
@@ -2075,10 +2071,10 @@ class CustomAllreduce
             {
                 if(j != rank_)
                 {
-                    hipIpcMemHandle_t* ipc_handle_ptr =
-                        (hipIpcMemHandle_t*)handles[j].data_ptr() + i;
+                    auto* ipc_handle_ptr =
+                        (const hipIpcMemHandle_t*)handles_per_rank[j] + i;
                     char* handle = open_ipc_handle(ipc_handle_ptr);
-                    handle += *((int64_t*)offsets[j].data_ptr() + i);
+                    handle += offsets_per_rank[j][i];
                     rd.ptrs[j] = handle;
                 }
                 else
@@ -2096,10 +2092,10 @@ class CustomAllreduce
             {
                 if(j != rank_)
                 {
-                    hipIpcMemHandle_t* ipc_handle_ptr =
-                        (hipIpcMemHandle_t*)handles[j].data_ptr() + num_input_buffers + i;
+                    auto* ipc_handle_ptr =
+                        (const hipIpcMemHandle_t*)handles_per_rank[j] + num_input_buffers + i;
                     char* handle = open_ipc_handle(ipc_handle_ptr);
-                    handle += *((int64_t*)offsets[j].data_ptr() + num_input_buffers + i);
+                    handle += offsets_per_rank[j][num_input_buffers + i];
                     rd.ptrs[j] = handle;
                 }
                 else

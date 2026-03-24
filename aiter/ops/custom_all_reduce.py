@@ -12,9 +12,10 @@ MD_NAME = "module_custom_all_reduce"
 
 @compile_ops("module_custom_all_reduce")
 def init_custom_ar(
-    meta: torch.Tensor,
-    rank_data: torch.Tensor,
-    handles: List[torch.Tensor],
+    meta_ptr: int,
+    rank_data_ptr: int,
+    rank_data_sz: int,
+    ipc_handle_ptrs: List[int],
     offsets: List[int],
     rank: int,
     fully_connected: bool,
@@ -24,67 +25,97 @@ def init_custom_ar(
 @compile_ops("module_custom_all_reduce")
 def all_reduce(
     _fa: int,
-    inp: torch.Tensor,
-    out: torch.Tensor,
+    inp: int,
+    out: int,
+    numel: int,
+    dtype: int,
     use_new: bool,
     open_fp8_quant: bool,
-    reg_input_buffer: Optional[torch.Tensor] = None,
-    reg_output_buffer: Optional[torch.Tensor] = None,
+    reg_inp_ptr: int,
+    reg_inp_bytes: int,
+    reg_out_ptr: int,
+    reg_out_bytes: int,
+    stream: int,
 ) -> None: ...
 
 
 @compile_ops("module_custom_all_reduce")
 def reduce_scatter(
     _fa: int,
-    inp: torch.Tensor,
-    out: torch.Tensor,
-    reg_buffer: Optional[torch.Tensor] = None,
+    inp: int,
+    out: int,
+    inp_numel: int,
+    dtype: int,
+    reg_ptr: int,
+    reg_bytes: int,
+    stream: int,
 ) -> None: ...
 
 
 @compile_ops("module_custom_all_reduce")
 def all_gather_reg(
-    _fa: int, inp: torch.Tensor, out: torch.Tensor, last_dim_size: int, dim: int
+    _fa: int,
+    inp: int,
+    out: int,
+    inp_numel: int,
+    dtype: int,
+    last_dim_size: int,
+    dim: int,
+    stream: int,
 ) -> None: ...
 
 
 @compile_ops("module_custom_all_reduce")
 def all_gather_unreg(
     _fa: int,
-    inp: torch.Tensor,
-    reg_buffer: torch.Tensor,
-    out: torch.Tensor,
+    inp: int,
+    reg_buffer: int,
+    out: int,
+    inp_numel: int,
+    dtype: int,
+    reg_bytes: int,
     last_dim_size: int,
     dim: int,
+    stream: int,
 ) -> None: ...
 
 
 @compile_ops("module_custom_all_reduce")
 def fused_allreduce_rmsnorm(
     _fa: int,
-    inp: torch.Tensor,
-    res_inp: torch.Tensor,
-    res_out: torch.Tensor,
-    out: torch.Tensor,
-    w: torch.Tensor,
+    inp: int,
+    res_inp: int,
+    res_out: int,
+    out: int,
+    w: int,
+    numel: int,
+    w_numel: int,
+    dtype: int,
     eps: float,
-    reg_buffer: Optional[torch.Tensor] = None,
-    use_1stage: bool = False,
+    reg_ptr: int,
+    reg_bytes: int,
+    use_1stage: bool,
+    stream: int,
 ) -> None: ...
 
 
 @compile_ops("module_custom_all_reduce")
 def fused_allreduce_rmsnorm_quant(
     _fa: int,
-    inp: torch.Tensor,
-    res_inp: torch.Tensor,
-    res_out: torch.Tensor,
-    out: torch.Tensor,
-    scale_out: torch.Tensor,
-    w: torch.Tensor,
+    inp: int,
+    res_inp: int,
+    res_out: int,
+    out: int,
+    scale_out: int,
+    w: int,
+    numel: int,
+    w_numel: int,
+    dtype: int,
     eps: float,
-    reg_buffer: Optional[torch.Tensor] = None,
-    use_1stage: bool = False,
+    reg_ptr: int,
+    reg_bytes: int,
+    use_1stage: bool,
+    stream: int,
 ) -> None: ...
 
 
@@ -204,48 +235,37 @@ def meta_size() -> int: ...
 
 @compile_ops("module_custom_all_reduce")
 def register_input_buffer(
-    _fa: int, t: torch.Tensor, handles: List[torch.Tensor], offsets: List[int]
+    _fa: int, self_ptr: int, ipc_handle_ptrs: List[int], offsets: List[int]
 ) -> None: ...
 
 
 @compile_ops("module_custom_all_reduce")
 def register_output_buffer(
-    _fa: int, t: torch.Tensor, handles: List[torch.Tensor], offsets: List[int]
+    _fa: int, self_ptr: int, ipc_handle_ptrs: List[int], offsets: List[int]
 ) -> None: ...
 
 
-# def gen_get_graph_buffer_ipc_meta_fake_tensors(_fa: int) -> List[torch.Tensor]:
-
-#     handle_sz = 64  # sizeof(hipIpcMemHandle_t) is 64 byte
-#     num_buffers = 4  # ???
-#     handles = torch.empty((handle_sz * num_buffers,), dtype=torch.uint8, device="cuda")
-
-#     offset_tensor = torch.empty((num_buffers,), dtype=torch.int64, device="cuda")
-
-#     return [handles, offset_tensor]
+@compile_ops("module_custom_all_reduce")
+def get_graph_buffer_count(_fa: int) -> int: ...
 
 
 @compile_ops("module_custom_all_reduce")
-def get_graph_buffer_ipc_meta(_fa: int) -> Tuple[torch.Tensor, torch.Tensor]: ...
+def get_graph_buffer_ipc_meta(_fa: int, handle_out: int, offset_out: int) -> None: ...
 
 
 @compile_ops("module_custom_all_reduce")
 def register_graph_buffers(
-    _fa: int, handles: List[torch.Tensor], offsets: List[torch.Tensor]
+    _fa: int, handle_ptrs: List[int], offset_ptrs: List[int]
 ) -> None: ...
 
 
 @compile_ops("module_custom_all_reduce")
-def allocate_meta_buffer(size: int) -> torch.Tensor: ...
-
-
-# def get_meta_buffer_ipc_handle_fake(inp: torch.Tensor) -> torch.Tensor:
-#     handle_size = 64
-#     if not inp.is_cuda:
-#         raise RuntimeError("Input tensor must be on CUDA device")
-
-#     return torch.empty(handle_size, dtype=torch.uint8, device=inp.device)
+def allocate_meta_buffer(size: int, stream: int) -> int: ...
 
 
 @compile_ops("module_custom_all_reduce")
-def get_meta_buffer_ipc_handle(inp: torch.Tensor) -> torch.Tensor: ...
+def free_meta_buffer(ptr: int) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce")
+def get_meta_buffer_ipc_handle(inp_ptr: int, out_handle_ptr: int) -> None: ...

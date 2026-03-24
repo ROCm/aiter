@@ -15,74 +15,110 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <torch/extension.h>
+#include <cstdint>
+#include <vector>
 
 // all reduce
 using fptr_t = int64_t;
 
 namespace aiter {
 
-fptr_t init_custom_ar(torch::Tensor& meta,
-                      torch::Tensor& rank_data,
-                      const std::vector<torch::Tensor>& handles,
+fptr_t init_custom_ar(int64_t meta_ptr,
+                      int64_t rank_data_ptr,
+                      int64_t rank_data_sz,
+                      const std::vector<int64_t>& ipc_handle_ptrs,
                       const std::vector<int64_t>& offsets,
                       int64_t rank,
                       bool fully_connected);
 void all_reduce(fptr_t _fa,
-                torch::Tensor& inp,
-                torch::Tensor& out,
+                int64_t inp,
+                int64_t out,
+                int64_t numel,
+                int64_t dtype,
                 bool use_new,
                 bool open_fp8_quant,
-                std::optional<torch::Tensor> reg_input_buffer,
-                std::optional<torch::Tensor> reg_output_buffer);
+                int64_t reg_inp_ptr,
+                int64_t reg_inp_bytes,
+                int64_t reg_out_ptr,
+                int64_t reg_out_bytes,
+                int64_t stream);
 void reduce_scatter(fptr_t _fa,
-                    torch::Tensor& inp,
-                    torch::Tensor& out,
-                    std::optional<torch::Tensor> reg_buffer);
-void all_gather_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, int last_dim_size, int dim);
+                    int64_t inp,
+                    int64_t out,
+                    int64_t inp_numel,
+                    int64_t dtype,
+                    int64_t reg_ptr,
+                    int64_t reg_bytes,
+                    int64_t stream);
+void all_gather_reg(fptr_t _fa,
+                    int64_t inp,
+                    int64_t out,
+                    int64_t inp_numel,
+                    int64_t dtype,
+                    int64_t last_dim_size,
+                    int64_t dim,
+                    int64_t stream);
 void all_gather_unreg(fptr_t _fa,
-                      torch::Tensor& inp,
-                      torch::Tensor& reg_buffer,
-                      torch::Tensor& out,
-                      int last_dim_size,
-                      int dim);
+                      int64_t inp,
+                      int64_t reg_buffer,
+                      int64_t out,
+                      int64_t inp_numel,
+                      int64_t dtype,
+                      int64_t reg_bytes,
+                      int64_t last_dim_size,
+                      int64_t dim,
+                      int64_t stream);
 void fused_allreduce_rmsnorm(fptr_t _fa,
-                             torch::Tensor& inp,
-                             torch::Tensor& res_inp,
-                             torch::Tensor& res_out,
-                             torch::Tensor& out,
-                             torch::Tensor& w,
-                             float eps,
-                             std::optional<torch::Tensor> reg_buffer,
-                             bool use_1stage);
+                             int64_t inp,
+                             int64_t res_inp,
+                             int64_t res_out,
+                             int64_t out,
+                             int64_t w,
+                             int64_t numel,
+                             int64_t w_numel,
+                             int64_t dtype,
+                             double eps,
+                             int64_t reg_ptr,
+                             int64_t reg_bytes,
+                             bool use_1stage,
+                             int64_t stream);
 void fused_allreduce_rmsnorm_quant(fptr_t _fa,
-                                   torch::Tensor& inp,
-                                   torch::Tensor& res_inp,
-                                   torch::Tensor& res_out,
-                                   torch::Tensor& out,
-                                   torch::Tensor& scale_out,
-                                   torch::Tensor& w,
-                                   float eps,
-                                   std::optional<torch::Tensor> reg_buffer,
-                                   bool use_1stage);
+                                   int64_t inp,
+                                   int64_t res_inp,
+                                   int64_t res_out,
+                                   int64_t out,
+                                   int64_t scale_out,
+                                   int64_t w,
+                                   int64_t numel,
+                                   int64_t w_numel,
+                                   int64_t dtype,
+                                   double eps,
+                                   int64_t reg_ptr,
+                                   int64_t reg_bytes,
+                                   bool use_1stage,
+                                   int64_t stream);
 
 void dispose(fptr_t _fa);
 int64_t meta_size();
 void register_input_buffer(fptr_t _fa,
-                           torch::Tensor& t,
-                           const std::vector<torch::Tensor>& handles,
+                           int64_t self_ptr,
+                           const std::vector<int64_t>& ipc_handle_ptrs,
                            const std::vector<int64_t>& offsets);
 void register_output_buffer(fptr_t _fa,
-                            torch::Tensor& t,
-                            const std::vector<torch::Tensor>& handles,
+                            int64_t self_ptr,
+                            const std::vector<int64_t>& ipc_handle_ptrs,
                             const std::vector<int64_t>& offsets);
-std::tuple<torch::Tensor, torch::Tensor> get_graph_buffer_ipc_meta(fptr_t _fa);
+int64_t get_graph_buffer_count(fptr_t _fa);
+void get_graph_buffer_ipc_meta(fptr_t _fa,
+                               int64_t handle_out,
+                               int64_t offset_out);
 void register_graph_buffers(fptr_t _fa,
-                            const std::vector<torch::Tensor>& handles,
-                            const std::vector<torch::Tensor>& offsets);
+                            const std::vector<int64_t>& handle_ptrs,
+                            const std::vector<int64_t>& offset_ptrs);
 #ifdef USE_ROCM
-torch::Tensor allocate_meta_buffer(int64_t size);
-torch::Tensor get_meta_buffer_ipc_handle(torch::Tensor& inp);
+int64_t allocate_meta_buffer(int64_t size, int64_t stream);
+void free_meta_buffer(int64_t ptr);
+void get_meta_buffer_ipc_handle(int64_t inp_ptr, int64_t out_handle_ptr);
 #endif
 
 } // namespace aiter
