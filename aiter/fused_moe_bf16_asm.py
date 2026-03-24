@@ -40,7 +40,9 @@ def moe_sorting_ck(
     num_valid_ids = torch.empty((2), dtype=dtypes.i32, device=device)
     moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
-    fwd_fn = aiter.moe_sorting_opus_fwd if _USE_OPUS_MOE_SORTING else aiter.moe_sorting_fwd
+    fwd_fn = (
+        aiter.moe_sorting_opus_fwd if _USE_OPUS_MOE_SORTING else aiter.moe_sorting_fwd
+    )
     fwd_fn(
         topk_ids,
         topk_weights,

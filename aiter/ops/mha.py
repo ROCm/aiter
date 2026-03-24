@@ -3048,7 +3048,9 @@ def flash_attn_fp8_pertensor_func(
     sink_ptr=None,
 ):
     if not ENABLE_CK and sink_ptr is None:
-        from .triton.attention.mha_v3 import flash_attn_func as flash_attn_func_v3_triton
+        from .triton.attention.mha_v3 import (
+            flash_attn_func as flash_attn_func_v3_triton,
+        )
 
         return flash_attn_func_v3_triton(
             q=q,

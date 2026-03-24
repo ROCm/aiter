@@ -68,9 +68,7 @@ def rmsnorm2d_fwd(
 ) -> Tensor:
     if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
         if ENABLE_CK:
-            out = rmsnorm2d_fwd_ck(
-                input, weight, epsilon, use_model_sensitive_rmsnorm
-            )
+            out = rmsnorm2d_fwd_ck(input, weight, epsilon, use_model_sensitive_rmsnorm)
         else:
             from .triton.normalization.rmsnorm import rms_norm as rms_norm_triton
 
@@ -167,9 +165,7 @@ def rmsnorm2d_fwd_with_dynamicquant(
                 rmsnorm2d_fwd_with_dynamicquant as rmsnorm2d_fwd_with_dynamicquant_triton,
             )
 
-            rmsnorm2d_fwd_with_dynamicquant_triton(
-                out, input, yscale, weight, epsilon
-            )
+            rmsnorm2d_fwd_with_dynamicquant_triton(out, input, yscale, weight, epsilon)
     else:
         rmsnorm_quant(out, input, yscale, weight, epsilon, group_size, shuffle_scale)
 

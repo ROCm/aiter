@@ -657,7 +657,12 @@ def gemm_a8w8_blockscale(
         )
 
         if isBpreshuffled:
-            if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:
+            if (
+                get_gfx() in ["gfx950"]
+                and m >= 16
+                and k >= 512
+                and dtype == dtypes.bf16
+            ):
                 return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
 
             weight_shuffle_layout = (16, 16)
@@ -672,9 +677,7 @@ def gemm_a8w8_blockscale(
                 XQ, WQ_preshuffled, x_scale, w_scale, dtype=dtype, y=Y
             )
 
-        return gemm_a8w8_blockscale_triton(
-            XQ, WQ, x_scale, w_scale, dtype=dtype, y=Y
-        )
+        return gemm_a8w8_blockscale_triton(XQ, WQ, x_scale, w_scale, dtype=dtype, y=Y)
 
     if isBpreshuffled:
         if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:

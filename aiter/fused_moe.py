@@ -847,7 +847,11 @@ def get_2stage_cfgs(
         if force_1stage
         else (cfg_2stages.get(keys, None) if cfg_2stages and use_cfg() else None)
     )
-    if not force_1stage and cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
+    if (
+        not force_1stage
+        and cfg is None
+        and os.environ.get("AITER_ONLINE_TUNE", "0") == "1"
+    ):
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{keys}")
         mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
         cfg_2stages = get_cfg_2stages(tune_file)
@@ -878,15 +882,19 @@ def get_2stage_cfgs(
         kernelName1 = ""
         kernelName2 = ""
         run_1stage = force_1stage
-        if not force_1stage and (
-            activation,
-            q_type,
-            dtype,
-            q_dtype_a,
-            q_dtype_w,
-            use_g1u1,
-            doweight_stage1,
-        ) in fused_moe_1stage_dict[get_gfx()]:
+        if (
+            not force_1stage
+            and (
+                activation,
+                q_type,
+                dtype,
+                q_dtype_a,
+                q_dtype_w,
+                use_g1u1,
+                doweight_stage1,
+            )
+            in fused_moe_1stage_dict[get_gfx()]
+        ):
             if q_type == QuantType.per_1x128:
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
                 run_1stage = token > 32 and (inter_dim % 128 == 0)
