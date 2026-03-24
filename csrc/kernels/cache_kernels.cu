@@ -2245,7 +2245,6 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
       // group quant reduce size (compile-time since GROUP_SIZE and vec_size_i are constexpr)
       constexpr int32_t reduce_thread_size = GROUP_SIZE / vec_size_i;
 
-      using vec_i = ck_tile::vec_t<scalar_t, vec_size_i>;
       using opus_vec_i = opus::vector_t<scalar_t, vec_size_i>;
       using opus_vec_o = opus::vector_t<cache_t, vec_size_o>;
       using opus_vec_q = opus::vector_t<query_t, vec_size_o>;
@@ -2356,15 +2355,11 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
           auto max_func = [](float a, float b) { return fmaxf(a, b); };
           thread_max = multithread_reduce(thread_max, max_func, reduce_thread_size);
 
-          const float inverted_DTYPE_MAX =
-                std::is_same_v<cache_t, ck_tile::fp4x2_t>
-                    ? 0.25f
-                    : (1.f / ck_tile::type_convert<float>(ck_tile::numeric<cache_t>::max()));
+          const float inverted_DTYPE_MAX = 1.f / opus::finfo<cache_t>::max();
           const float group_scale = thread_max * inverted_DTYPE_MAX;
 
-          // Compute inv_scale in registers (all 8 threads have same group_scale)
           float inv_scale;
-          if constexpr (std::is_same_v<cache_t, ck_tile::fp8_t>) {
+          if constexpr (std::is_same_v<cache_t, opus::fp8_t>) {
             uint32_t u32 = __builtin_bit_cast(uint32_t, group_scale);
             uint32_t exponent = (u32 >> 23) & 0xFF;
             if (u32 & 0x7FFFFF) exponent += 1;
@@ -2390,7 +2385,7 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
             #pragma unroll
             for (int i = 0; i < vec_size_i; i++) {
               float val = static_cast<float>(vec_k[i]);
-              vec_out[i] = ck_tile::type_convert<cache_t>(val * inv_scale);
+              vec_out[i] = opus::cast<cache_t>(val * inv_scale);
             }
             buffer_o.template store<vec_size_o>(vec_out, kv_c_offset);
           }
@@ -2458,17 +2453,14 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
         if constexpr (q_dt != vllm::Fp8KVCacheDataType::kAuto) {
           auto max_func = [](float a, float b) { return fmaxf(a, b); };
           thread_max = multithread_reduce(thread_max, max_func, reduce_thread_size);
-          const float inverted_DTYPE_MAX =
-                std::is_same_v<query_t, ck_tile::fp4x2_t>
-                    ? 0.25f
-                    : (1.f / ck_tile::type_convert<float>(ck_tile::numeric<cache_t>::max()));
+          const float inverted_DTYPE_MAX = 1.f / opus::finfo<cache_t>::max();
           const float q_group_scale = thread_max * inverted_DTYPE_MAX;
 
           query_t* q_nope_out_base = reinterpret_cast<query_t*>(
               q_out + token_qout_base + q_head_idx * params.q_out_stride_1 + (is_nope_first ? 0 : pe_dim));
 
           float q_inv_scale;
-          if constexpr (std::is_same_v<query_t, ck_tile::fp8_t>) {
+          if constexpr (std::is_same_v<query_t, opus::fp8_t>) {
             uint32_t u32 = __builtin_bit_cast(uint32_t, q_group_scale);
             uint32_t exponent = (u32 >> 23) & 0xFF;
             if (u32 & 0x7FFFFF) exponent += 1;
@@ -2493,7 +2485,7 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
             opus_vec_q vec_out;
             #pragma unroll
             for (int i = 0; i < vec_size_i; i++) {
-              vec_out[i] = ck_tile::type_convert<cache_t>(q_fp32[i] * q_inv_scale);
+              vec_out[i] = opus::cast<cache_t>(q_fp32[i] * q_inv_scale);
             }
             q_buffer_o.template store<vec_size_o>(vec_out, q_offset);
           }
@@ -2517,16 +2509,16 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
           if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
             q_buffer_o.template store<vec_size_o>(vec_in, offset);
           } else {
-            auto vec_converted_ck = ck_tile::vec_convert<query_t, scalar_t, vec_size_i>(
-                ck_tile::bit_cast<vec_i>(vec_in), inverted_qscale);
-            opus_vec_q vec_out = ck_tile::bit_cast<opus_vec_q>(vec_converted_ck);
+            opus_vec_q vec_out = aiter::scaled_cast<query_t>(vec_in, inverted_qscale);
             q_buffer_o.template store<vec_size_o>(vec_out, offset);
           }
         }
       } // end Q_nope
 
       // ============ Q RoPE Phase ============
-      // Compute Q pe pointer once (not inside loop)
+      // Only one kv_head block per q_head does q_pe RoPE to avoid race condition
+      // (all kv_head blocks share the same q_pe location for a given q_head)
+      if (kv_head_idx == 0) {
       scalar_t* q_pe_ptr = q_pe + token_qpe_base + q_head_idx * params.q_pe_stride_1;
       if (tid < embed_dim) {
         uint32_t x_idx, y_idx;
@@ -2553,15 +2545,16 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
         } else {
           query_t* q_rope_out = q_out + token_qout_base + q_head_idx * params.q_out_stride_1;
           if constexpr (is_nope_first) { q_rope_out += kv_lora_dim; }
-          if constexpr (std::is_same_v<query_t, ck_tile::fp8_t>) {
-            q_rope_out[x_idx] = ck_tile::type_convert<ck_tile::fp8_t>(q_rot_x * inverted_qscale);
-            q_rope_out[y_idx] = ck_tile::type_convert<ck_tile::fp8_t>(q_rot_y * inverted_qscale);
+          if constexpr (std::is_same_v<query_t, opus::fp8_t>) {
+            q_rope_out[x_idx] = opus::cast<opus::fp8_t>(q_rot_x * inverted_qscale);
+            q_rope_out[y_idx] = opus::cast<opus::fp8_t>(q_rot_y * inverted_qscale);
           } else {
             q_rope_out[x_idx] = static_cast<query_t>(q_rot_x);
             q_rope_out[y_idx] = static_cast<query_t>(q_rot_y);
           }
         }
       }
+      } // kv_head_idx == 0
     }
 
     // General version with kv_lora_dim and embed_dim as parameters
@@ -4162,11 +4155,11 @@ void fused_qk_norm_rope_group_quant_concat_and_cache_mla(
     dim3 block(tokens_per_block_val * 64);
     if (kv_lora_rank == 448) {
       constexpr int kv_lora_rank_val = 448;
-      DISPATCH_BY_KV_CACHE_QUERY_DTYPE(kv_c.dtype(), kv_cache_dtype, q_out_type,
+      DISPATCH_BY_KV_CACHE_QUERY_DTYPE_OPUS(kv_c.dtype(), kv_cache_dtype, q_out_type,
                                         CALL_PREFILL_FUSED_QK_NORM_ROPE_CONCAT_AND_CACHE_MLA);
     } else if (kv_lora_rank == 512) {
       constexpr int kv_lora_rank_val = 512;
-      DISPATCH_BY_KV_CACHE_QUERY_DTYPE(kv_c.dtype(), kv_cache_dtype, q_out_type,
+      DISPATCH_BY_KV_CACHE_QUERY_DTYPE_OPUS(kv_c.dtype(), kv_cache_dtype, q_out_type,
                                         CALL_PREFILL_FUSED_QK_NORM_ROPE_CONCAT_AND_CACHE_MLA);
     } else {
       TORCH_CHECK(false, "Unsupported kv_lora_rank=", kv_lora_rank,
