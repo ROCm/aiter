@@ -35,5 +35,6 @@ jobs:
             | \`ci:vllm\` | vLLM benchmark |
             | \`ci:all\` | All of the above |
 
-            > Add labels via the sidebar or \`gh pr edit ${context.issue.number} --add-label <label>\``
+            > Add labels via the sidebar or \`gh pr edit ${context.issue.number} --add-label <label>\`
+            `
             });
