@@ -117,7 +117,7 @@ def select_2d_config(
     # pure decode config
     else:
         # to not have masking when loading KV
-        TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+        TILE_SIZE = max(32, min(64, triton.next_power_of_2(block_size)))
         if arch.is_rdna:
             num_stages_2d, num_warps = 1, 4
         else:
@@ -522,6 +522,9 @@ def unified_attention(
             BLOCK_M=BLOCK_M,
             ALL_DECODE=ALL_DECODE,
             SAGE_MXFP4=sage_mxfp4,
+            HAS_ROPE=HAS_ROPE,
+            ROPE_SIZE=ROPE_SIZE,
+            ROPE_SIZE_PADDED=triton.next_power_of_2(ROPE_SIZE) if HAS_ROPE else 0,
             **attn_config,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
