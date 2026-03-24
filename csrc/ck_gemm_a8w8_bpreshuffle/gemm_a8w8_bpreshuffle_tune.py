@@ -482,7 +482,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             shape_str = f"({M}, {N}, {K}, {q_dtype_w})"
             try:
                 is_asm = eval(q_dtype_w) == dtypes.i8
-                (x, weight_shuffle, x_scale, w_scale, out, weight, bias_f32) = (
+                x, weight_shuffle, x_scale, w_scale, out, weight, bias_f32 = (
                     generate_data(M, N, K, 0, dtypes.bf16, eval(q_dtype_w), is_asm)
                 )
                 if is_asm:
