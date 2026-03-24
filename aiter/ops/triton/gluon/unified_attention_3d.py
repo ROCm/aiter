@@ -346,7 +346,9 @@ def select_3d_config(
     attn_warps = 2
     if kv_cache_dtype == torch.bfloat16 and block_size == 64:
         attn_warps = 1
-    
+    if q_dtype == torch.bfloat16 and kv_cache_dtype == e4m3_dtype and block_size == 128:
+        attn_warps = 1
+
     if shuffled_kv_cache:
         assert (
             block_size >= 64

@@ -181,7 +181,8 @@ class AttentionConfig:
                 transposed=True,
                 warp_bases=warp_bases_pv,
                 reg_bases=[],
-                instr_shape=[16, 16, 32 if not self.IS_KV_FP8 else 64],
+                # instr_shape=[16, 16, 32 if not (self.IS_Q_FP8 and self.IS_KV_FP8) else 64],
+                instr_shape=[16, 16, 32],
             )
         )
         k_width = 16 if self.IS_KV_FP8 and self.SHUFFLED_KV_CACHE else 8
@@ -455,9 +456,6 @@ class AttentionProgram:
 
     qq_bias_stride_0: gl.tensor
     softcap: gl.tensor
-    q_scale: gl.tensor
-    k_scale: gl.tensor
-    v_scale: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
@@ -499,9 +497,6 @@ class AttentionProgram:
         stride_v_cache_3,
         qq_bias_stride_0,
         softcap,
-        q_scale,
-        k_scale,
-        v_scale,
     ):
         self.cfg = cfg
         self.q = q
@@ -539,9 +534,6 @@ class AttentionProgram:
         self.stride_v_cache_2 = stride_v_cache_2
         self.stride_v_cache_3 = stride_v_cache_3
         self.qq_bias_stride_0 = qq_bias_stride_0
-        self.q_scale = q_scale
-        self.k_scale = k_scale
-        self.v_scale = v_scale
         self.softcap = softcap
 
     @gluon.jit
@@ -580,9 +572,6 @@ class AttentionProgram:
         stride_v_cache_2,
         stride_v_cache_3,
         qq_bias_stride_0,
-        q_scale,
-        k_scale,
-        v_scale,
         softcap,
     ):
         # the last dimension of the stride should always be 1
@@ -766,9 +755,6 @@ class AttentionProgram:
             stride_v_cache_3,
             qq_bias_stride_0,
             softcap,
-            q_scale,
-            k_scale,
-            v_scale,
         )
 
     @gluon.jit
@@ -1092,13 +1078,11 @@ class AttentionProgram:
             dtype=gl.float32,
             layout=self.cfg.QK_WMMA_LAYOUT,
         )
-        pre_factor: gl.float32 = self.cfg.QK_SCALE
         if self.cfg.IS_Q_FP8 and self.cfg.IS_KV_FP8:
-            pre_factor = pre_factor * self.q_scale * self.k_scale
+            k = k.to(self.q.dtype)
         elif self.cfg.IS_KV_FP8:
             k = k.to(self.q.dtype)
-            pre_factor = pre_factor * self.k_scale
-        return gl.amd.gfx1250.wmma(self.q, k, S) * pre_factor
+        return gl.amd.gfx1250.wmma(self.q, k, S)
 
     @gluon.jit
     def apply_softcap(self, S):
@@ -1179,14 +1163,18 @@ class AttentionProgram:
 
     @gluon.jit
     def compute_pv(self, p, v, acc):
-        if self.cfg.IS_KV_FP8:
-            p = p.to(v.dtype)
+        if self.cfg.IS_Q_FP8 and self.cfg.IS_KV_FP8:
+            # p = p.to(v.dtype)
+            p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
+            v = v.to(gl.bfloat16)
+        elif self.cfg.IS_KV_FP8:
+            p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
+            v = v.to(gl.bfloat16)
+            # p = p.to(v.dtype)
         else:
             p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
         p = gl.convert_layout(p, self.cfg.P_DOT_LAYOUT)
         acc = gl.amd.gfx1250.wmma(p, v, acc)
-        if self.cfg.IS_KV_FP8:
-            acc = acc * self.v_scale
         return acc
 
     @gluon.jit
@@ -1510,14 +1498,23 @@ def gluon_kernel_unified_attention_3d_tdm(
     if segm_idx * tiles_per_segment * cfg.TILE_SIZE >= seq_len:
         return
 
-    q_scale: gl.float32 = 1.0
-    k_scale: gl.float32 = 1.0
-    v_scale: gl.float32 = 1.0
-    if cfg.IS_Q_FP8:
+    qk_factor: gl.float32 = cfg.QK_SCALE
+    if q_scale_ptr is not None:
         q_scale = gl.load(q_scale_ptr)
-    if cfg.IS_KV_FP8:
+        qk_factor = qk_factor * q_scale
+    else:
+        q_scale = None
+
+    if k_scale_ptr is not None:
         k_scale = gl.load(k_scale_ptr)
+        qk_factor = qk_factor * k_scale
+    else:
+        k_scale = None
+
+    if v_scale_ptr is not None:
         v_scale = gl.load(v_scale_ptr)
+    else:
+        v_scale = None
 
     context_len = seq_len - cur_batch_query_len
     block_tables_ptr_shifted = block_tables_ptr + seq_idx * block_table_stride
@@ -1631,9 +1628,6 @@ def gluon_kernel_unified_attention_3d_tdm(
         stride_v_cache_2,
         stride_v_cache_3,
         qq_bias_stride_0,
-        q_scale,
-        k_scale,
-        v_scale,
         softcap,
     )
 
@@ -1686,6 +1680,8 @@ def gluon_kernel_unified_attention_3d_tdm(
         # with gl.amd.warp_pipeline_stage("qk", priority=0):
         # Compute attention for current tile
         S = pgm.compute_qk(k)
+        S = S * qk_factor
+
         S = pgm.apply_softcap(S)
         S = pgm.apply_mask_qk_3D(S, seq_offset, alibi_slope, qq_bias_row_ptrs)
         # if j >= pgm.safe_tile_end or SLIDING_WINDOW > 0:
@@ -1711,6 +1707,7 @@ def gluon_kernel_unified_attention_3d_tdm(
         )
         # Compute attention for current tile
         S = pgm.compute_qk(k)
+        S = S * qk_factor
 
         S = pgm.apply_softcap(S)
         S = pgm.apply_mask_qk_3D(S, seq_offset, alibi_slope, qq_bias_row_ptrs)
@@ -1724,6 +1721,9 @@ def gluon_kernel_unified_attention_3d_tdm(
         acc = pgm.compute_pv(p, v, acc)
 
         seq_offset += cfg.TILE_SIZE
+
+    if v_scale_ptr is not None:
+        acc = acc * v_scale
 
     # Normalize and store output, this is done in reduce kernel for 3D
     # l_recip = 1 / L[:, None]
