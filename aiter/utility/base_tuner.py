@@ -598,7 +598,9 @@ class TunerCommon:
                 cu = self.get_cu_num()
                 if "cu_num" in tunedf.columns:
                     tunedf = tunedf[tunedf["cu_num"] == cu]
-                self.untunedf = tunedf[self.keys].drop_duplicates().reset_index(drop=True)
+                self.untunedf = (
+                    tunedf[self.keys].drop_duplicates().reset_index(drop=True)
+                )
 
         print(self.untunedf)
         output_file = self.get_out_file(args.tune_file)
@@ -617,13 +619,19 @@ class TunerCommon:
                     args, config_file=run_config_file
                 )
                 try:
-                    print("=== Running production operator benchmark (tuned) ===", flush=True)
+                    print(
+                        "=== Running production operator benchmark (tuned) ===",
+                        flush=True,
+                    )
                     results = self.run_config(args)
                     self._print_benchmark_results("Benchmark (tuned)", results)
                 finally:
                     self._restore_config_env(env_name, old_val, old_rebuild)
             else:
-                print("=== Running production operator benchmark (default) ===", flush=True)
+                print(
+                    "=== Running production operator benchmark (default) ===",
+                    flush=True,
+                )
                 results = self.run_config(args)
                 self._print_benchmark_results("Benchmark (default)", results)
             return self.tunedf if self.tunedf is not None else pd.DataFrame()
@@ -809,9 +817,7 @@ class GemmCommonTuner(TunerCommon):
             # Treat missing/NA like "" so we always look up CK kernel names; otherwise NaN
             # would serialize as "Null" via na_rep in to_csv.
             need_lookup = kernelName == "" or pd.isna(kernelName)
-            resolved = (
-                self.getKernelName(kernelId) if need_lookup else kernelName
-            )
+            resolved = self.getKernelName(kernelId) if need_lookup else kernelName
             if resolved is None or pd.isna(resolved):
                 kernelName = "None"
             else:
