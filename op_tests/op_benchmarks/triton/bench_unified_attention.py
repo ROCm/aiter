@@ -133,7 +133,7 @@ def create_benchmark_configs(custom, args):
                 "D_HEAD_V",
                 "DECODE_P",
             ]
-            plot_name = f"fused-attention-layout-{args.layout}-sagev1-{args.sagev1}-sagev2-{args.sagev2}-causal-{causal}"
+            plot_name = f"fused-attention-layout-{args.layout}-sagev2-{args.sagev2}-causal-{causal}"
             extra_args = {"dtype": dtype, "causal": causal}
 
     for i in range(len(x_vals_list)):
@@ -229,7 +229,7 @@ def run_benchmark(custom, args):
         block_size = args.block_size if args.block_size else 512
 
         # round down block_size to the nearest power of 2 for v1/v2 quantization
-        if (args.sagev1 or args.sagev2) and (block_size & (block_size - 1) != 0):
+        if args.sagev2 and (block_size & (block_size - 1) != 0):
             block_size = 1 << (block_size.bit_length() - 1)
 
         max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
@@ -274,73 +274,28 @@ def run_benchmark(custom, args):
         maybe_quantized_key_cache = key_cache
         maybe_quantized_value_cache = value_cache
 
-        if args.sagev1 or args.sagev2:
-            from aiter.ops.triton.attention.unified_attention import get_config
-
-            num_queries_per_kv = num_query_heads // num_kv_heads
-            config = get_config(
-                query.shape[0],
-                num_seqs,
-                num_queries_per_kv,
-                num_kv_heads,
-                head_size,
-                window_size,
-                max_query_len,
-                max_kv_len,
-                block_size,
-                query.element_size(),
+        if args.sagev2:
+            from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
+                sage_quant_v2,
             )
-            BLOCK_M = config["BLOCK_M"]
-            BLOCK_N = config["TILE_SIZE"]
-            if args.sagev1:
-                from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
-                    sage_quant_v1,
-                )
 
-                (
-                    maybe_quantized_query,
-                    q_descale,
-                    maybe_quantized_key_cache,
-                    k_descale,
-                    maybe_quantized_value_cache,
-                    v_descale,
-                ) = sage_quant_v1(
-                    query,
-                    key_cache,
-                    value_cache,
-                    BLOCK_M,
-                    BLOCK_N,
-                    layout_q="unified",
-                    layout_k="cache",
-                    v_descale=None,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k=cu_seqlens_q,
-                    config=config,
-                )
-            else:
-                from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
-                    sage_quant_v2,
-                )
-
-                (
-                    maybe_quantized_query,
-                    q_descale,
-                    maybe_quantized_key_cache,
-                    k_descale,
-                    maybe_quantized_value_cache,
-                    v_descale,
-                ) = sage_quant_v2(
-                    query,
-                    key_cache,
-                    value_cache,
-                    BLOCK_M,
-                    BLOCK_N,
-                    hadamard_rotation=True,
-                    R=None,
-                    BLOCK_R=128,
-                    layout_k="cache",
-                    v_descale=None,
-                )
+            (
+                maybe_quantized_query,
+                q_descale,
+                maybe_quantized_key_cache,
+                k_descale,
+                maybe_quantized_value_cache,
+                v_descale,
+            ) = sage_quant_v2(
+                query,
+                key_cache,
+                value_cache,
+                hadamard_rotation=True,
+                R=None,
+                BLOCK_R=128,
+                layout_k="cache",
+                v_descale=None,
+            )
         elif args.fp8_full:
             from aiter.ops.triton.utils.types import e4m3_dtype
 
@@ -363,9 +318,7 @@ def run_benchmark(custom, args):
         else:
             q_descale, k_descale, v_descale = None, None, None
 
-        if args.sagev1:
-            sage_version = SAGE_VERSION.SAGE
-        elif args.sagev2:
+        if args.sagev2:
             sage_version = SAGE_VERSION.SAGE_MXFP4
         else:
             sage_version = None
@@ -409,7 +362,9 @@ def run_benchmark(custom, args):
                 soft_cap=soft_cap,
                 sinks=sinks,
             )
-            if args.fp8 or args.fp8_full or args.sagev1 or args.sagev2:
+            if args.sagev2:
+                atol, rtol = 3.5e-1, 2.5e-1
+            elif args.fp8 or args.fp8_full:
                 atol, rtol = 1.5e-1, 1.5e-1
             else:
                 atol, rtol = 1.5e-2, 1e-2
@@ -422,11 +377,7 @@ def run_benchmark(custom, args):
                 else (
                     "fp8"
                     if args.fp8
-                    else (
-                        "sagev1"
-                        if args.sagev1
-                        else "sagev2" if args.sagev2 else "default"
-                    )
+                    else "sagev2" if args.sagev2 else "default"
                 )
             )
             config_str = (
@@ -597,7 +548,6 @@ def parse_args():
         default=False,
         help="Full FP8 path: quantize Q, K, V to FP8 with q_descale, k_descale, v_descale",
     )
-    parser.add_argument("-sagev1", action="store_true", default=False)
     parser.add_argument("-sagev2", action="store_true", default=False)
     parser.add_argument("-dtype", default="fp16")
     parser.add_argument("-print_vgpr", action="store_true", default=False)

@@ -326,7 +326,7 @@ def unified_attention(
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
-    if HAS_ROPE or use_2d_kernel(
+    if use_2d_kernel(
         head_size,
         SLIDING_WINDOW,
         ALL_DECODE,
@@ -411,7 +411,7 @@ def unified_attention(
             SAGE_MXFP4=sage_mxfp4,
             HAS_ROPE=HAS_ROPE,
             ROPE_SIZE=ROPE_SIZE,
-            ROPE_SIZE_PADDED=triton.next_power_of_2(ROPE_SIZE),
+            ROPE_SIZE_PADDED=triton.next_power_of_2(ROPE_SIZE) if HAS_ROPE else 0,
             **config,
         )
 
