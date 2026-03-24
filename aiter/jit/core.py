@@ -1045,8 +1045,8 @@ def _ctypes_call(func, fc_name, md_name):
     -------------------------------------------------------
     Python annotation     | ctypes type          | C type
     ----------------------|----------------------|---------
-    Tensor                | POINTER(AiterTensor) | AiterTensor*
-    Optional[Tensor]      | POINTER(AiterTensor) | AiterTensor* (NULL if None)
+    Tensor                | POINTER(aiter_tensor_t) | aiter_tensor_t*
+    Optional[Tensor]      | POINTER(aiter_tensor_t) | aiter_tensor_t* (NULL if None)
     int                   | c_int                | int
     Optional[int]         | c_int                | int   (-1 if None)
     str                   | c_char_p             | char* (.encode())
@@ -1060,7 +1060,7 @@ def _ctypes_call(func, fc_name, md_name):
     import ctypes
     import inspect
     import torch
-    from ..utility.dtypes import torch_to_aiter, AiterTensor
+    from ..utility.dtypes import torch_to_aiter, aiter_tensor_t
 
     _cache = {}
     _arg_checked = False
@@ -1097,9 +1097,9 @@ def _ctypes_call(func, fc_name, md_name):
             origin = typing.get_origin(hint)
             type_args = typing.get_args(hint)
             if hint is torch.Tensor:
-                argtypes.append(ctypes.POINTER(AiterTensor))
+                argtypes.append(ctypes.POINTER(aiter_tensor_t))
             elif _is_union(origin) and torch.Tensor in type_args:
-                argtypes.append(ctypes.POINTER(AiterTensor))
+                argtypes.append(ctypes.POINTER(aiter_tensor_t))
             elif _is_union(origin) and int in type_args:
                 argtypes.append(ctypes.c_int)
             elif _is_union(origin) and str in type_args:
@@ -1212,7 +1212,7 @@ def _ctypes_call(func, fc_name, md_name):
                     aiter_refs.append(at)
                     c_args.append(ctypes.byref(at))
                 else:
-                    c_args.append(ctypes.POINTER(AiterTensor)())
+                    c_args.append(ctypes.POINTER(aiter_tensor_t)())
             elif _is_union(origin) and int in type_args:
                 c_args.append(value if value is not None else -1)
             elif _is_union(origin) and str in type_args:

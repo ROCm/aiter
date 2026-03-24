@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
+
+#define AITER_C_ITFS extern "C" __attribute__((visibility("default")))
+
 #include "aiter_logger.h"
 #include "aiter_enum.h"
 #include "aiter_tensor.h"
