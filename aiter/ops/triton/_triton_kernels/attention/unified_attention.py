@@ -260,9 +260,9 @@ def kernel_unified_attention_2d(
     if HAS_ROPE:
         if SAGE_MXFP4:  # per token mxfp4
             offs_rope = tl.arange(HEAD_SIZE//2, (HEAD_SIZE + ROPE_SIZE_PADDED)//2)
-            offs_rope_scale = tl.arange(HEAD_SIZE//32, (HEAD_SIZE + ROPE_SIZE)//32)
+            offs_rope_scale = tl.arange(HEAD_SIZE//32, (HEAD_SIZE + ROPE_SIZE_PADDED)//32)
         else:
-            offs_rope = tl.arange(HEAD_SIZE, HEAD_SIZE + ROPE_SIZE)
+            offs_rope = tl.arange(HEAD_SIZE, HEAD_SIZE + ROPE_SIZE_PADDED)
             offs_rope_scale = None
 
 
