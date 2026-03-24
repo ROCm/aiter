@@ -19,20 +19,6 @@ def rms_norm_forward(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch
 
 
 @perftest()
-def run_torch_split_qk_rmsnorm(
-    q: torch.Tensor,
-    q_weight: torch.Tensor,
-    q_eps: float,
-    k: torch.Tensor,
-    k_weight: torch.Tensor,
-    k_eps: float,
-):
-    q_ref = rms_norm_forward(q, q_weight, q_eps)
-    k_ref = rms_norm_forward(k, k_weight, k_eps)
-    return q_ref, k_ref
-
-
-@perftest()
 def run_aiter_split_qk_rmsnorm(
     q: torch.Tensor,
     q_weight: torch.Tensor,
@@ -44,6 +30,7 @@ def run_aiter_split_qk_rmsnorm(
     q_ref = rmsnorm2d_fwd(q, q_weight, q_eps)
     k_ref = rmsnorm2d_fwd(k, k_weight, k_eps)
     return q_ref, k_ref
+
 
 @perftest()
 def run_aiter_fused_qk_rmsnorm(
@@ -79,11 +66,11 @@ def test_fused_qk_rmsnorm(
     (q_ref, k_ref), avg_ref = run_aiter_split_qk_rmsnorm(
         q, q_weight, q_eps, k, k_weight, k_eps
     )
-    (_, _), avg_opt = run_aiter_fused_qk_rmsnorm(
-        q, q_weight, q_eps, k, k_weight, k_eps
-    )
+    (_, _), avg_opt = run_aiter_fused_qk_rmsnorm(q, q_weight, q_eps, k, k_weight, k_eps)
 
-    q_out, k_out = aiter.fused_qk_rmsnorm(q_out, q_weight, q_eps, k_out, k_weight, k_eps)
+    q_out, k_out = aiter.fused_qk_rmsnorm(
+        q_out, q_weight, q_eps, k_out, k_weight, k_eps
+    )
 
     info = f"dtype:{dtype}, M:{m}, N1:{n1}, N2:{n2}"
     msg = (
