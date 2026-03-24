@@ -601,9 +601,7 @@ def gemm_a8w8_bpreshuffle(
         ):
             asm_bias = bias
             if asm_bias is None:
-                asm_bias = torch.zeros(
-                    (1, n), dtype=dtypes.fp32, device=XQ.device
-                )
+                asm_bias = torch.zeros((1, n), dtype=dtypes.fp32, device=XQ.device)
             else:
                 asm_bias = asm_bias.to(dtype=dtypes.fp32, device=XQ.device)
                 if asm_bias.dim() == 1:
