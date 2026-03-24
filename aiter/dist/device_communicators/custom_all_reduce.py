@@ -260,10 +260,7 @@ class CustomAllreduce:
         self,
         group: ProcessGroup,
         device: Union[int, str, torch.device],
-        max_size=8192
-        * 1024
-        * 8
-        * 2,  # In allreduce 2stage writemode, use 2x tmp buffer
+        max_size=1024 * 1024 * 1024,  # 2GB bf16/half
         enable_register_for_capturing: bool = True,
     ) -> None:
         """
@@ -376,7 +373,7 @@ class CustomAllreduce:
         # "input" / "output" use torchAlloc (cached) for D2D relay in
         # eager mode.
         self._pool = IPCBufferPool(self.device, self.group)
-        self._pool.create("meta", ops.meta_size() + max_size, uncached=True)
+        self._pool.create("meta", ops.meta_size() + max_size * 2, uncached=True)
         self._pool.create("input", max_size)
         self._pool.create("output", max_size)
 
