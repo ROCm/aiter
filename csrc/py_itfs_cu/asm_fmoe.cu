@@ -863,20 +863,24 @@ extern "C" __attribute__((visibility("default"))) void fmoe_fp8_blockscale_g1u1(
     int inter_dim            = down->size(2);
     int sub_X_cnt            = sorted_expert_ids->size(0);
     std::string kernel_name_str = kernel_name ? kernel_name : "";
+    const int token_cnt = input->size(0);
+    const int max_experts = token_cnt * topk > sub_X_cnt ? sub_X_cnt : token_cnt * topk; // we can't have more experts than this
 
     if(out->dtype() == AITER_DTYPE_bf16 && inter_dim % 128 == 0 && fc_scale_blkn == 128 &&
        fc_scale_blkk == 128)
-    {
-        if(act == ActivationType::Silu)
-            config_map = &cfg_fmoe_bf16_blockscaleFp8_g1u1_silu;
+	    {
+	bool xquant = (input->dtype() == AITER_DTYPE_bf16);
+        ActivationType act = static_cast<ActivationType>(activation);
+	if(act == ActivationType::Silu)
+		config_map = xquant ? &cfg_fmoe_bf16_blockscaleBf16_g1u1_silu : &cfg_fmoe_bf16_blockscaleFp8_g1u1_silu;
         else if(act == ActivationType::Gelu)
-            config_map = &cfg_fmoe_bf16_blockscaleFp8_g1u1_gelu;
+		config_map = xquant ? &cfg_fmoe_bf16_blockscaleBf16_g1u1_gelu : &cfg_fmoe_bf16_blockscaleFp8_g1u1_gelu;
         else
             AITER_CHECK(
                 false, __func__, "Unsupported activation type for fmoe_fp8_blockscale_g1u1");
 
         impl_ptr =
-            get_heuristic_kernel(inter_dim, sorted_expert_ids->size(0), config_map, 0, kernel_name_str, block_size_M);
+            get_heuristic_kernel(inter_dim, max_experts, config_map, 0, kernel_name_str, block_size_M);
         impl_ptr->launch_kernel<1, 2, false>(out,
                                              input,
                                              gate,
