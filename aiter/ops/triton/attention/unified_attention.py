@@ -1,5 +1,7 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+from enum import Enum
+
 import triton
 import torch
 from aiter.ops.triton.utils.device_info import get_num_sms
@@ -9,6 +11,11 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     kernel_unified_attention_3d,
     reduce_segments,
 )
+
+
+class SAGE_VERSION(Enum):
+    SAGE = 1
+    SAGE_MXFP4 = 2
 
 
 def get_config(
@@ -93,7 +100,7 @@ def select_2d_config(
     else:
         num_stages_2d = 3
         num_warps = 2
-        TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+        TILE_SIZE = max(32, min(64, triton.next_power_of_2(block_size)))
 
     if max_seqlen_q >= 256:
         BLOCK_M = 128
@@ -116,7 +123,7 @@ def select_3d_config(
 ):
     reduce_num_warps = 2
     attn_warps = 2
-    TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+    TILE_SIZE = max(32, min(64, triton.next_power_of_2(block_size)))
     # MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     num_segments = math.ceil(target_num_prgms / num_2d_prgms)
     num_segments = triton.next_power_of_2(num_segments)
@@ -243,16 +250,25 @@ def unified_attention(
     qq_bias=None,
     # Optional tensor for sinks
     sinks=None,
+    sage_version=None,
     sage_mxfp4=False,
 ):
+    if sage_version is not None:
+        sage_mxfp4 = sage_version == SAGE_VERSION.SAGE_MXFP4
+
     assert causal, "Only causal attention is supported"
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
 
     head_size = v.shape[-1]
-    ROPE_SIZE = k.shape[-1] - v.shape[-1]
-    HAS_ROPE = ROPE_SIZE > 0
+    # rope and mla support for mxfp4 to be supported    
+    if sage_mxfp4:
+        ROPE_SIZE = 0
+        HAS_ROPE = False
+    else:
+        ROPE_SIZE = k.shape[-1] - v.shape[-1]
+        HAS_ROPE = ROPE_SIZE > 0
     
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
@@ -266,7 +282,6 @@ def unified_attention(
     num_queries_per_kv = num_query_heads // num_kv_heads
     
     if sage_mxfp4:
-        head_size *= 2
         (
             query_scale_stride_0,
             query_scale_stride_1,

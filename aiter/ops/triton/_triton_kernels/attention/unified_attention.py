@@ -283,8 +283,8 @@ def kernel_unified_attention_2d(
             dim_mask_qk = offs_d_qk < (HEAD_SIZE // 2)
             scale_dim_mask = offs_d_scale < (HEAD_SIZE // 32)
         else:
-            
             dim_mask_qk = dim_mask
+            scale_dim_mask = dim_mask
     else:
         dim_mask = tl.full((1,), 1, dtype=tl.int1)
         dim_mask_qk = dim_mask
@@ -486,8 +486,8 @@ def kernel_unified_attention_2d(
 
             k_scale_loaded = tl.load(k_descale_ptr, mask=tile_mask[:, None], other=0.0)
 
-        # TODO: check convert effect on perf
-        K = K_load.to(Q.dtype)
+        if not SAGE_MXFP4:
+            K = K_load.to(Q.dtype)
 
         if HAS_ROPE:
             k_rope_ptrs = (
@@ -898,8 +898,8 @@ def kernel_unified_attention_3d(
 
             k_scale_loaded = tl.load(k_descale_ptr, mask=tile_mask[:, None], other=0.0)
 
-        # TODO: check convert effect on perf
-        K = K_load.to(Q.dtype)
+        if not SAGE_MXFP4:
+            K = K_load.to(Q.dtype)
 
         if PRELOAD_V:
             # V : (TILE_SIZE, HEAD_SIZE)
@@ -986,8 +986,6 @@ def kernel_unified_attention_3d(
         L = L * alpha + l_j
         M = m_j
 
-        tl.static_print("P", P)
-        tl.static_print("V", V)
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         acc += tl.dot(P.to(V.dtype), V)
 
