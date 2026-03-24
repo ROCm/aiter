@@ -1092,13 +1092,13 @@ def _mla_decode_fwd_kernel(
         other=0.0,
     )
     q_lora_0_shared.store(Q_lora_load_0)
-    Q_lora_0 = q_lora_0_shared.load(layout=cfg.Q_DOT_LAYOUT)
     Q_lora_load_1 = gl.load(
         query_ptr + query_offset_lora + ((KV_LORA_RANK // 2) + offs_q_d_lora)[None, :],
         mask=query_mask_0_lora[:, None] & query_mask_1_lora[:, None],
         other=0.0,
     )
     q_lora_1_shared.store(Q_lora_load_1)
+    Q_lora_0 = q_lora_0_shared.load(layout=cfg.Q_DOT_LAYOUT)
     Q_lora_1 = q_lora_1_shared.load(layout=cfg.Q_DOT_LAYOUT)
 
     query_pos_rope = (
@@ -1211,9 +1211,9 @@ def _mla_decode_fwd_kernel(
         j_hbm, block_tables_ptr_shifted
     )
     row_offsets = pgm.get_kv_buffer_row_offsets(physical_block_idx)
-    pgm.tdm_load_global_to_shared_kv_lora_0(row_offsets, buffer_id)
-    pgm.tdm_load_global_to_shared_kv_lora_1(row_offsets, buffer_id)
-    pgm.tdm_load_global_to_shared_k_rope(row_offsets, buffer_id)
+    pgm.tdm_load_global_to_shared_kv_lora_0(row_offsets, 0)
+    pgm.tdm_load_global_to_shared_kv_lora_1(row_offsets, 0)
+    pgm.tdm_load_global_to_shared_k_rope(row_offsets, 0)
 
     for _ in range(pgm.tile_start, pgm.tile_end - 1):
         j_hbm, physical_block_idx = pgm.load_physical_block_idx(
