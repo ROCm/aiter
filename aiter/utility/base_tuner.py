@@ -181,9 +181,13 @@ class TunerCommon:
         )
         self.parser.add_argument(
             "--run_config",
-            action="store_true",
-            required=False,
-            help="Run production operator benchmark for all shapes and exit (no tuning)",
+            nargs="?",
+            const=True,
+            default=False,
+            metavar="TUNED_CSV",
+            help="Run production operator benchmark and exit (no tuning). "
+            "If a tuned CSV path is given, read shapes and kernels from it; "
+            "otherwise read shapes from -i and run with default kernels.",
         )
         self.parser.add_argument(
             "--compare",
@@ -473,19 +477,20 @@ class TunerCommon:
         to clear only their own caches."""
         pass
 
-    def _set_config_env_for_run_config(self, args):
-        """Set the config env var to point to the -o output file, clear caches,
-        and enable AITER_REBUILD so that post-tune run_config rebuilds with new configs.
+    def _set_config_env_for_run_config(self, args, config_file=None):
+        """Set the config env var to point to a tuned config file, clear caches,
+        and enable AITER_REBUILD so that run_config rebuilds with new configs.
+        *config_file* overrides the default (``-o`` / ``args.tune_file``).
         """
         defaults = self.get_arg_defaults()
         env_name = defaults.get("config_env_name")
         if not env_name:
             # Must return a 2-tuple: callers always unpack into old_val, old_rebuild.
             return None, None
-        output_file = self.get_out_file(args.tune_file)
+        output_file = config_file if config_file else self.get_out_file(args.tune_file)
         old_val = os.environ.get(env_name)
         os.environ[env_name] = output_file
-        logger.info(f"Setting {env_name}={output_file} for post-tune benchmark")
+        logger.info(f"Setting {env_name}={output_file} for benchmark")
         # Clear operator-specific config caches
         self._clear_op_caches()
         # Enable AITER_REBUILD (level 2: rm .so only, keep build cache for faster rebuild)
@@ -577,14 +582,24 @@ class TunerCommon:
     def run(self, args, fast_mode=False):
         """tuner run function"""
         self.pre_process(args)
-        # --run_config: use tuned CSV shapes only. --compare: use untuned (from pre_process).
-        if args.run_config:
-            tunedf = self.get_tuned_gemm_list(args.tune_file)
+
+        # Resolve --run_config: can be False, True (no file), or a file path string.
+        # Strict semantics:
+        #   --run_config <tuned_csv>  -> tuned kernels using that config file
+        #   --run_config              -> default kernels (no config env override)
+        run_config_file = args.run_config if isinstance(args.run_config, str) else None
+
+        # --run_config with tuned file: load shapes from the tuned CSV.
+        # --run_config without file: keep shapes from -i (pre_process), run default kernels.
+        # --compare: always use untuned shapes from -i (pre_process).
+        if args.run_config and run_config_file:
+            tunedf = self.get_tuned_gemm_list(run_config_file)
             if not tunedf.empty and self.keys[0] in tunedf.columns:
                 cu = self.get_cu_num()
                 if "cu_num" in tunedf.columns:
                     tunedf = tunedf[tunedf["cu_num"] == cu]
                 self.untunedf = tunedf[self.keys].drop_duplicates().reset_index(drop=True)
+
         print(self.untunedf)
         output_file = self.get_out_file(args.tune_file)
         if args.verbose:
@@ -593,17 +608,24 @@ class TunerCommon:
         # --run_config: only run benchmark and exit (no tuning)
         if args.run_config:
             if self.untunedf.empty:
-                logger.info("Tuned file is empty or has no matching shapes, nothing to benchmark")
+                logger.info("No shapes to benchmark, nothing to run")
                 return pd.DataFrame()
-            defaults = self.get_arg_defaults()
-            env_name = defaults.get("config_env_name")
-            old_val, old_rebuild = self._set_config_env_for_run_config(args)
-            try:
-                print("=== Running production operator benchmark ===", flush=True)
+            if run_config_file:
+                defaults = self.get_arg_defaults()
+                env_name = defaults.get("config_env_name")
+                old_val, old_rebuild = self._set_config_env_for_run_config(
+                    args, config_file=run_config_file
+                )
+                try:
+                    print("=== Running production operator benchmark (tuned) ===", flush=True)
+                    results = self.run_config(args)
+                    self._print_benchmark_results("Benchmark (tuned)", results)
+                finally:
+                    self._restore_config_env(env_name, old_val, old_rebuild)
+            else:
+                print("=== Running production operator benchmark (default) ===", flush=True)
                 results = self.run_config(args)
-                self._print_benchmark_results("Benchmark", results)
-            finally:
-                self._restore_config_env(env_name, old_val, old_rebuild)
+                self._print_benchmark_results("Benchmark (default)", results)
             return self.tunedf if self.tunedf is not None else pd.DataFrame()
 
         # --compare: pre-tune benchmark
