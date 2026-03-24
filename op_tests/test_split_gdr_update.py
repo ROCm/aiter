@@ -168,7 +168,7 @@ def split_gdr_reference(
     return output.to(mixed_qkv.dtype).to(mixed_qkv.device)
 
 
-@perftest(num_warmup=10, num_iters=1000, num_rotate_args=8)
+@perftest()
 def run_fused_split_gdr_update_decode(
     mixed_qkv: torch.Tensor,
     A_log: torch.Tensor,
@@ -188,13 +188,15 @@ def run_fused_split_gdr_update_decode(
     use_qk_l2norm_in_kernel: bool,
 ) -> torch.Tensor:
     """Run fused_split_gdr_update decode kernel for perf measurement."""
+    # Fresh state per invocation to align with per-iter clone benchmarking.
+    state_fresh = initial_state_source.clone()
     return aiter.fused_split_gdr_update(
         mixed_qkv=mixed_qkv,
         A_log=A_log,
         a=a,
         dt_bias=dt_bias,
         b_gate=b_gate,
-        initial_state_source=initial_state_source,
+        initial_state_source=state_fresh,
         initial_state_indices=initial_state_indices,
         key_dim=key_dim,
         value_dim=value_dim,
@@ -301,10 +303,8 @@ def test_split_gdr_update_decode(
     )
     all_close = all_close_out and all_close_state
 
-    # Perf uses aiter common @perftest workflow.
-    # It rotates multiple pre-copied state tensors (num_rotate_args)
-    # so the measured region stays closer to kernel-only execution.
-    ssm_state_swizzled_template = to_swizzled_layout(inputs["ssm_state"].clone())
+    # Perf path uses fresh state per call via clone in run_fused_split_gdr_update_decode.
+    ssm_state_swizzled_template = to_swizzled_layout(inputs["ssm_state"])
     _, hip_us = run_fused_split_gdr_update_decode(
         mixed_qkv=inputs["mixed_qkv"],
         A_log=inputs["A_log"],

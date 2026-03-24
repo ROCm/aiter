@@ -1297,7 +1297,6 @@
         "flags_extra_cc": [
         ],
         "flags_extra_hip": [
-            "'-O3'",
             "'-ffast-math'"
         ],
         "extra_ldflags": "None",
