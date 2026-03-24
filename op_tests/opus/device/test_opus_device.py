@@ -107,13 +107,17 @@ class OpusDeviceLib:
         fn(self._ptr(A), self._ptr(B), self._ptr(C), int(scale_a), int(scale_b))
 
     # -- WMMA Scale (BX32: int scale, BX16: long scale) --
-    def run_wmma_scale_bx32(self, A, B, C, variant, scale_a=0x7F7F7F7F, scale_b=0x7F7F7F7F):
+    def run_wmma_scale_bx32(
+        self, A, B, C, variant, scale_a=0x7F7F7F7F, scale_b=0x7F7F7F7F
+    ):
         fn = getattr(self._lib, f"run_{variant}")
         fn.restype = None
         fn.argtypes = [_VP, _VP, _VP, _I, _I]
         fn(self._ptr(A), self._ptr(B), self._ptr(C), int(scale_a), int(scale_b))
 
-    def run_wmma_scale_bx16(self, A, B, C, variant, scale_a=0x7F7F7F7F7F7F7F7F, scale_b=0x7F7F7F7F7F7F7F7F):
+    def run_wmma_scale_bx16(
+        self, A, B, C, variant, scale_a=0x7F7F7F7F7F7F7F7F, scale_b=0x7F7F7F7F7F7F7F7F
+    ):
         _L = ctypes.c_long
         fn = getattr(self._lib, f"run_{variant}")
         fn.restype = None
@@ -133,7 +137,9 @@ class OpusDeviceLib:
             self._ptr(scale_b_buf),
         )
 
-    def run_tiled_wmma_scale(self, A, B, C, variant, scale_a=0x7F7F7F7F, scale_b=0x7F7F7F7F):
+    def run_tiled_wmma_scale(
+        self, A, B, C, variant, scale_a=0x7F7F7F7F, scale_b=0x7F7F7F7F
+    ):
         fn = getattr(self._lib, f"run_{variant}")
         fn.restype = None
         fn.argtypes = [_VP, _VP, _VP, _I, _I, _I, _I, _I]
@@ -969,7 +975,9 @@ def _test_tiled_wmma_scale_fp8_multi(mod, variant, M, N, K):
     max_diff = (C - C_ref).abs().max().item()
     if not ok:
         diff_count = (C != C_ref).sum().item()
-        print(f"  FAIL: {variant} max_diff={max_diff:.4f}, {diff_count}/{M*N} mismatches")
+        print(
+            f"  FAIL: {variant} max_diff={max_diff:.4f}, {diff_count}/{M*N} mismatches"
+        )
         return 1
     print(f"  PASS: {variant} ({M}x{N}x{K}), max_diff={max_diff:.4f}")
     return 0
@@ -1028,12 +1036,8 @@ def _test_wmma_scale_fp8_with_scaling(mod, variant, bx16=False):
 
     # Build per-lane scale arrays (32 lanes: lanes 0-15 = data, 16-31 = k-group1)
     # Scale comes from lanes 0-15 (scale_sel=0), so lanes 16-31 don't matter.
-    sa_per_lane = _pack_bx32_scales(
-        [sa_exps[l % 16] for l in range(32)]
-    )
-    sb_per_lane = _pack_bx32_scales(
-        [sb_exps[l % 16] for l in range(32)]
-    )
+    sa_per_lane = _pack_bx32_scales([sa_exps[lane % 16] for lane in range(32)])
+    sb_per_lane = _pack_bx32_scales([sb_exps[lane % 16] for lane in range(32)])
 
     sa_buf = torch.tensor(sa_per_lane, dtype=torch.int32, device=device)
     sb_buf = torch.tensor(sb_per_lane, dtype=torch.int32, device=device)
