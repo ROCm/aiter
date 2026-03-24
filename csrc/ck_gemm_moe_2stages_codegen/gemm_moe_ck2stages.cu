@@ -86,19 +86,6 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
     int K = hidden_states.size(-1);
     int MPerBlock = block_m.value();
 
-    // Clamp sorted_size to num_valid_ids to prevent kernel from processing
-    // padding blocks with garbage expert IDs (critical for Expert Parallelism).
-    {
-        int32_t h_num_valid = 0;
-        hipMemcpyAsync(&h_num_valid, num_valid_ids.data_ptr(), sizeof(int32_t),
-                        hipMemcpyDeviceToHost, at::hip::getCurrentHIPStream());
-        hipStreamSynchronize(at::hip::getCurrentHIPStream());
-        if (h_num_valid > 0 && h_num_valid < sorted_size)
-        {
-            sorted_size = h_num_valid;
-        }
-    }
-
     void *hidden_states_ptr = hidden_states.data_ptr();
     void *w1_ptr = w1.transpose(1, 2).data_ptr();
     void *w2_ptr = w2.data_ptr();
@@ -162,19 +149,6 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
     int N = w2.size(1);
     int K = inter_states.size(-1);
     int MPerBlock = block_m.value();
-
-    // Clamp sorted_size to num_valid_ids to prevent kernel from processing
-    // padding blocks with garbage expert IDs (critical for Expert Parallelism).
-    {
-        int32_t h_num_valid = 0;
-        hipMemcpyAsync(&h_num_valid, num_valid_ids.data_ptr(), sizeof(int32_t),
-                        hipMemcpyDeviceToHost, at::hip::getCurrentHIPStream());
-        hipStreamSynchronize(at::hip::getCurrentHIPStream());
-        if (h_num_valid > 0 && h_num_valid < sorted_size)
-        {
-            sorted_size = h_num_valid;
-        }
-    }
 
     void *inter_states_ptr = inter_states.data_ptr();
     void *w1_ptr = w1.data_ptr();

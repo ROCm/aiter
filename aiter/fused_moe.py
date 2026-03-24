@@ -1233,13 +1233,13 @@ def fused_moe_2stages(
         a1 = hidden_states
     if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         ratio = a1_scale.element_size() // a1.element_size()
-        a2 = torch.zeros(
+        a2 = torch.empty(
             (token_num + (token_num * ratio + 127) // 128, topk, inter_dim),
             dtype=q_dtype_a,
             device=device,
         )
     else:
-        a2 = torch.zeros(
+        a2 = torch.empty(
             (token_num, topk, inter_dim),
             dtype=dtype,
             device=device,
