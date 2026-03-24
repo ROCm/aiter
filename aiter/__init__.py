@@ -40,6 +40,8 @@ def getLogger():
         console_handler.setLevel(log_level)
 
         logger.addHandler(console_handler)
+        logger.propagate = False
+
         if hasattr(torch._dynamo.config, "ignore_logger_methods"):
             torch._dynamo.config.ignore_logger_methods = (
                 logging.Logger.info,
