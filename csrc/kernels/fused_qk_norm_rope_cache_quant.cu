@@ -20,7 +20,6 @@
 #include "hip_compat.h"
 #include "hip_reduce.h"
 #include "quant_utils.cuh"
-#include "quant_common.cuh"
 #include "rope/rope_common.h"
 #include "vec_convert.h"
 #include <torch/cuda.h>
@@ -626,7 +625,7 @@
         // For Q, we are done.
         return;
     }
-    float dtype_max = opus::cast<float>(opus::numeric_limits<opus::fp8_t>::max());
+    float dtype_max = opus::cast<float>(opus::finfo<opus::fp8_t>::max());
     auto f_max_f32 = [](float v_0_, float v_1_) { return __builtin_fmaxf(v_0_, v_1_); };
     if(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
     {
@@ -1567,7 +1566,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(at::Tensor& qkv,
                                                 bool return_kv,
                                                 bool use_shuffle_layout,
                                                 int64_t block_size,
-                                                int64_t x)
+                                                int64_t x,
+                                                int64_t rotary_dim)
 {
     TORCH_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() &&
                 cos_sin.is_contiguous());
@@ -1616,7 +1616,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(at::Tensor& qkv,
                                                          v_out_ptr,
                                                          use_shuffle_layout,
                                                          block_size,
-                                                         x);
+                                                         x,
+                                                         rotary_dim);
             }
             else
             {
@@ -1657,7 +1658,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(at::Tensor& qkv,
                         v_out_fp8_ptr,
                         use_shuffle_layout,
                         block_size,
-                        x);
+                        x,
+                        rotary_dim);
                 }
                 else if(kv_cache_dtype == at::ScalarType::Float8_e4m3fn)
                 {
@@ -1695,7 +1697,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(at::Tensor& qkv,
                         v_out_fp8_ptr,
                         use_shuffle_layout,
                         block_size,
-                        x);
+                        x,
+                        rotary_dim);
                 }
                 else
                 {

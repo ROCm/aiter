@@ -4,7 +4,7 @@
 #include "aiter_logger.h"
 #include "aiter_enum.h"
 #include "aiter_tensor.h"
-#if DISABLE_CK
+#if !ENABLE_CK
 #include "ck_tile_shim.h"
 #else
 #include "ck_tile/core.hpp"
@@ -134,9 +134,7 @@ class AiterAsmKernel
 
     public:
     AiterAsmKernel(const char* name, const char* hsaco)
-    {
-        load_asm_kernel(name, hsaco, module, kernel_func);
-    };
+    { load_asm_kernel(name, hsaco, module, kernel_func); };
 
     ~AiterAsmKernel() { HIP_CALL(hipModuleUnload(module)); }
 
@@ -247,7 +245,7 @@ static int get_pci_chip_id()
         HIP_CALL(hipGetDevice(&dev));
         HIP_CALL(hipDeviceGetAttribute(&id, hipDeviceAttributePciChipId, dev));
         AITER_LOG_INFO("pciChipId: 0x" << std::hex << id << std::dec
-                       << ", CU count: " << get_num_cu_func());
+                                       << ", CU count: " << get_num_cu_func());
         return id;
     }();
     return chip_id;
@@ -256,6 +254,18 @@ static int get_pci_chip_id()
 static bool is_mi308_device()
 {
     int chip_id = get_pci_chip_id();
-    return chip_id == 0x74a2 || chip_id == 0x74a8 ||
-           chip_id == 0x74b6 || chip_id == 0x74bc;
+    return chip_id == 0x74a2 || chip_id == 0x74a8 || chip_id == 0x74b6 || chip_id == 0x74bc;
 }
+
+class HipDeviceGuard {
+public:
+    explicit HipDeviceGuard(int device_id) {
+        HIP_CALL(hipGetDevice(&prev_device_));
+        HIP_CALL(hipSetDevice(device_id));
+    }
+    ~HipDeviceGuard() noexcept { HIP_CALL(hipSetDevice(prev_device_)); }
+    HipDeviceGuard(const HipDeviceGuard&) = delete;
+    HipDeviceGuard& operator=(const HipDeviceGuard&) = delete;
+private:
+    int prev_device_{};
+};
