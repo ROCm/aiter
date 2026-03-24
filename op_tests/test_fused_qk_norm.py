@@ -54,22 +54,17 @@ def test_fused_qk_rmsnorm(
     q_eps: float = 1e-5,
     k_eps: float = 1e-5,
 ):
-    q = torch.randn((m, n1), dtype=dtype, device="cuda")
-    k = torch.randn((m, n2), dtype=dtype, device="cuda")
-    q_out = q.clone()
-    k_out = k.clone()
+    total_n = n1 + n2
+    qkv = torch.randn((m, total_n), dtype=dtype, device="cuda")
+    q, k = torch.split(qkv, [n1, n2], dim=-1)
     q_weight = torch.randn((n1,), dtype=dtype, device="cuda")
     k_weight = torch.randn((n2,), dtype=dtype, device="cuda")
 
-    # Keep perf benchmark separate from accuracy check because fused_qk_rmsnorm
-    # updates input tensors in-place.
     (q_ref, k_ref), avg_ref = run_aiter_split_qk_rmsnorm(
         q, q_weight, q_eps, k, k_weight, k_eps
     )
-    (_, _), avg_opt = run_aiter_fused_qk_rmsnorm(q, q_weight, q_eps, k, k_weight, k_eps)
-
-    q_out, k_out = aiter.fused_qk_rmsnorm(
-        q_out, q_weight, q_eps, k_out, k_weight, k_eps
+    (q_out, k_out), avg_opt = run_aiter_fused_qk_rmsnorm(
+        q, q_weight, q_eps, k, k_weight, k_eps
     )
 
     info = f"dtype:{dtype}, M:{m}, N1:{n1}, N2:{n2}"
@@ -94,7 +89,7 @@ def test_fused_qk_rmsnorm(
 
 
 l_dtype = ["fp16", "bf16"]
-l_m = [1, 4, 5, 64, 1024, 8192]
+l_m = [1, 4, 5, 64, 1024, 8192, 16384, 32768, 65536]
 l_n1 = [1024, 1536]
 l_n2 = [512, 1024]
 
