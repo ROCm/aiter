@@ -278,15 +278,17 @@ def kernel_unified_attention_2d(
     )
 
     if HEAD_SIZE_PADDED != HEAD_SIZE:
+        dim_mask = offs_d < HEAD_SIZE
         if SAGE_MXFP4:
             dim_mask_qk = offs_d_qk < (HEAD_SIZE // 2)
             scale_dim_mask = offs_d_scale < (HEAD_SIZE // 32)
         else:
-            dim_mask = offs_d < HEAD_SIZE
+            
             dim_mask_qk = dim_mask
     else:
-        dim_mask_qk = tl.full((1,), 1, dtype=tl.int1)
-        scale_dim_mask = tl.full((1,), 1, dtype=tl.int1)
+        dim_mask = tl.full((1,), 1, dtype=tl.int1)
+        dim_mask_qk = dim_mask
+        scale_dim_mask = dim_mask
     
     if ROPE_SIZE_PADDED != ROPE_SIZE:
         if SAGE_MXFP4:
