@@ -88,22 +88,36 @@ def ref_paged_attn(
 
     return torch.cat(outputs, dim=0)
 
+from typing import Optional
 
-@pytest.mark.parametrize(
-    "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
-)
-@pytest.mark.parametrize("num_heads", NUM_HEADS)
-@pytest.mark.parametrize("head_size_qk", HEAD_SIZES)
-@pytest.mark.parametrize("block_size", BLOCK_SIZES)
-@pytest.mark.parametrize("sliding_window", [None, 256])
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("q_dtype", QDTYPES)
-@pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
-@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
-@pytest.mark.parametrize("quant_scheme", [None, "fp8", "sage_mxfp4"])
-@pytest.mark.parametrize("rope_size", [0, 64])
-@torch.inference_mode()
-def test_triton_unified_attn(
+# All the parametrization stays here on the "base" test
+BASE_SEQ_LENS = [
+    [(1, 1328), (5, 18), (129, 463)],
+    [(1, 523), (1, 37), (1, 2011)],
+]
+QUANT_SCHEMES = [None, "fp8", "sage_mxfp4"]  # only used in base test
+
+
+def unified_attn_unpack(d):
+    return (
+        d["query"],
+        d["key_cache"],
+        d["value_cache"],
+        d["cu_query_lens"],
+        d["kv_lens"],
+        d["block_tables"],
+        d["sinks"],
+        d["output"],
+        d["max_query_len"],
+        d["max_kv_len"],
+        d["window_size"],
+        d["scale"],
+        d["rope_size"],
+        d["ref_kwargs"],
+    )
+
+@pytest.fixture
+def unified_attn_inputs(
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
     head_size_qk: int,
@@ -113,30 +127,20 @@ def test_triton_unified_attn(
     block_size: int,
     soft_cap: Optional[float],
     num_blocks: int,
-    quant_scheme: Optional[str],
     rope_size: int,
-) -> None:
-    # if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
-    #     pytest.skip("block size must be at least 32 for fp8")
-    fp8 = quant_scheme == "fp8"
-    sage_mxfp4 = quant_scheme == "sage_mxfp4"
-    
-    if sage_mxfp4 and rope_size > 0:
-        pytest.skip("ROPE is not supported with Sage MXFP4 quantization")
-    
-    if sage_mxfp4 and not arch_info.is_fp4_avail():
-        pytest.skip("FP4 dot product is not supported on this GPU")
-
+):
     torch.cuda.empty_cache()
     torch.manual_seed(0)
+
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]
-    kv_lens = [x[1] for x in seq_lens]
+    kv_lens_list = [x[1] for x in seq_lens]
     num_query_heads = num_heads[0]
     num_kv_heads = num_heads[1]
     assert num_query_heads % num_kv_heads == 0
+
     max_query_len = max(query_lens)
-    max_kv_len = max(kv_lens)
+    max_kv_len = max(kv_lens_list)
     window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
     scale = head_size_qk**-0.5
 
@@ -144,21 +148,24 @@ def test_triton_unified_attn(
         sum(query_lens), num_query_heads, head_size_qk, dtype=dtype, device="cuda"
     )
     key_cache = torch.randn(
-        num_blocks, block_size, num_kv_heads, head_size_qk, dtype=dtype, device="cuda"
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        head_size_qk,
+        dtype=dtype,
+        device="cuda",
     )
+
     if rope_size > 0:
         lora_rank = head_size_qk - rope_size
-        value_cache = key_cache[:,:,:,:lora_rank]
+        value_cache = key_cache[:, :, :, :lora_rank]
     else:
         value_cache = torch.randn_like(key_cache)
-    
+
     cu_query_lens = torch.tensor(
         [0] + query_lens, dtype=torch.int32, device="cuda"
     ).cumsum(dim=0, dtype=torch.int32)
-    # cu_key_lens = torch.tensor(
-    #     [0] + kv_lens, dtype=torch.int32, device="cuda"
-    # ).cumsum(dim=0, dtype=torch.int32)
-    kv_lens = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
+    kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32, device="cuda")
 
     max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
     block_tables = torch.randint(
@@ -168,75 +175,18 @@ def test_triton_unified_attn(
         dtype=torch.int32,
         device="cuda",
     )
+
     sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
-    
+
     output = torch.empty(
-        sum(query_lens), num_query_heads, head_size_qk - rope_size, dtype=dtype, device="cuda"
+        sum(query_lens),
+        num_query_heads,
+        head_size_qk - rope_size,
+        dtype=dtype,
+        device="cuda",
     )
 
-    maybe_quantized_query = query
-    maybe_quantized_key_cache = key_cache
-    maybe_quantized_value_cache = value_cache
-    q_descale = None
-    k_descale = None
-    v_descale = None
-
-    if sage_mxfp4:
-        (
-            maybe_quantized_query,
-            q_descale,
-            maybe_quantized_key_cache,
-            k_descale,
-            maybe_quantized_value_cache,
-            v_descale,
-        ) = sage_quant_v2(
-            query,
-            key_cache,
-            value_cache,
-            hadamard_rotation=True,
-            R=None,
-            BLOCK_R=128,
-            layout_k="cache",
-            v_descale=None,
-        )
-    elif fp8:
-        FP8_TYPE = e4m3_dtype
-        fp8_max = torch.finfo(FP8_TYPE).max
-
-        q_abs_max = query.abs().amax().clamp(min=1e-9)
-        q_descale = (q_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
-        maybe_quantized_query = (query * (fp8_max / q_abs_max)).to(FP8_TYPE)
-
-        k_abs_max = key_cache.abs().amax().clamp(min=1e-9)
-        k_descale = (k_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
-        maybe_quantized_key_cache = (key_cache * (fp8_max / k_abs_max)).to(FP8_TYPE)
-
-        v_abs_max = value_cache.abs().amax().clamp(min=1e-9)
-        v_descale = (v_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
-        maybe_quantized_value_cache = (value_cache * (fp8_max / v_abs_max)).to(FP8_TYPE)
-
-    unified_attention(
-        q=maybe_quantized_query,
-        k=maybe_quantized_key_cache,
-        v=maybe_quantized_value_cache,
-        out=output,
-        cu_seqlens_q=cu_query_lens,
-        seqused_k=kv_lens,
-        max_seqlen_q=max_query_len,
-        max_seqlen_k=max_kv_len,
-        softmax_scale=scale,
-        causal=True,
-        window_size=window_size,
-        block_table=block_tables,
-        softcap=soft_cap if soft_cap is not None else 0,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        sinks=sinks,
-        sage_mxfp4=sage_mxfp4,
-    )
-
-    ref_output = ref_paged_attn(
+    common_kwargs = dict(
         query=query,
         key_cache=key_cache,
         value_cache=value_cache,
@@ -248,28 +198,282 @@ def test_triton_unified_attn(
         soft_cap=soft_cap,
         sinks=sinks,
     )
-    atol, rtol = 1.5e-2, 1e-2
 
-    if sage_mxfp4:
-        atol, rtol = 3.5e-1, 2.5e-1
-    elif fp8:
-        atol, rtol = 1.5e-1, 1.5e-1
-    torch.testing.assert_close(
-        output, ref_output, atol=atol, rtol=rtol
-    ), f"{torch.max(torch.abs(output - ref_output))}"
-
-
-if __name__ == "__main__":
-    test_triton_unified_attn(
-        seq_lens=[(1, 1328), (5, 18), (129, 463)],
-        num_heads=(4, 4),
-        head_size_qk=512,
-        rope_size=64,
-        sliding_window=None,
-        dtype=torch.float16,
-        q_dtype=None,
-        block_size=16,
-        soft_cap=None,
-        num_blocks=32768,
-        quant_scheme=None,
+    return dict(
+        # raw tensors
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        cu_query_lens=cu_query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        sinks=sinks,
+        output=output,
+        # meta
+        max_query_len=max_query_len,
+        max_kv_len=max_kv_len,
+        window_size=window_size,
+        scale=scale,
+        rope_size=rope_size,
+        # for ref
+        ref_kwargs=common_kwargs,
     )
+
+
+
+@pytest.mark.parametrize("seq_lens", BASE_SEQ_LENS)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size_qk", HEAD_SIZES)
+@pytest.mark.parametrize("block_size", BLOCK_SIZES)
+@pytest.mark.parametrize("sliding_window", [None, 256])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("q_dtype", QDTYPES)
+@pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
+@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
+@pytest.mark.parametrize("rope_size", [0, 64])
+@torch.inference_mode()
+def test_triton_unified_attn(
+    unified_attn_inputs,
+):
+    (
+        query,
+        key_cache,
+        value_cache,
+        cu_query_lens,
+        kv_lens,
+        block_tables,
+        sinks,
+        output,
+        max_query_len,
+        max_kv_len,
+        window_size,
+        scale,
+        rope_size,
+        ref_kwargs,
+    ) = unified_attn_unpack(unified_attn_inputs)
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=ref_kwargs["soft_cap"] if ref_kwargs["soft_cap"] is not None else 0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        sinks=sinks,
+        sage_mxfp4=False,
+    )
+
+    ref_output = ref_paged_attn(**ref_kwargs)
+    atol, rtol = 1.5e-2, 1e-2
+    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
+
+@pytest.mark.parametrize("seq_lens", BASE_SEQ_LENS)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size_qk", HEAD_SIZES)
+@pytest.mark.parametrize("block_size", BLOCK_SIZES)
+@pytest.mark.parametrize("sliding_window", [None, 256])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("q_dtype", QDTYPES)
+@pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
+@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
+@pytest.mark.parametrize("rope_size", [64])  # MLA only
+@torch.inference_mode()
+def test_triton_unified_attn_mla(unified_attn_inputs):
+    (
+        query,
+        key_cache,
+        value_cache,
+        cu_query_lens,
+        kv_lens,
+        block_tables,
+        sinks,
+        output,
+        max_query_len,
+        max_kv_len,
+        window_size,
+        scale,
+        rope_size,
+        ref_kwargs,
+    ) = unified_attn_unpack(unified_attn_inputs)
+
+    # same as normal, but implicitly exercising rope_size > 0 layout
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=ref_kwargs["soft_cap"] if ref_kwargs["soft_cap"] is not None else 0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        sinks=sinks,
+        sage_mxfp4=False,
+    )
+
+    ref_output = ref_paged_attn(**ref_kwargs)
+    atol, rtol = 1.5e-2, 1e-2
+    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("seq_lens", BASE_SEQ_LENS)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size_qk", HEAD_SIZES)
+@pytest.mark.parametrize("block_size", BLOCK_SIZES)
+@pytest.mark.parametrize("sliding_window", [None, 256])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("q_dtype", QDTYPES)
+@pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
+@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
+@pytest.mark.parametrize("rope_size", [0, 64])
+@torch.inference_mode()
+def test_triton_unified_attn_fp8(unified_attn_inputs):
+    (
+        query,
+        key_cache,
+        value_cache,
+        cu_query_lens,
+        kv_lens,
+        block_tables,
+        sinks,
+        output,
+        max_query_len,
+        max_kv_len,
+        window_size,
+        scale,
+        rope_size,
+        ref_kwargs,
+    ) = unified_attn_unpack(unified_attn_inputs)
+
+    FP8_TYPE = e4m3_dtype
+    fp8_max = torch.finfo(FP8_TYPE).max
+
+    q_abs_max = query.abs().amax().clamp(min=1e-9)
+    q_descale = (q_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
+    q_fp8 = (query * (fp8_max / q_abs_max)).to(FP8_TYPE)
+
+    k_abs_max = key_cache.abs().amax().clamp(min=1e-9)
+    k_descale = (k_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
+    k_fp8 = (key_cache * (fp8_max / k_abs_max)).to(FP8_TYPE)
+
+    v_abs_max = value_cache.abs().amax().clamp(min=1e-9)
+    v_descale = (v_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
+    v_fp8 = (value_cache * (fp8_max / v_abs_max)).to(FP8_TYPE)
+
+    unified_attention(
+        q=q_fp8,
+        k=k_fp8,
+        v=v_fp8,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=ref_kwargs["soft_cap"] if ref_kwargs["soft_cap"] is not None else 0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+        sage_mxfp4=False,
+    )
+
+    ref_output = ref_paged_attn(**ref_kwargs)
+    atol, rtol = 1.5e-1, 1.5e-1
+    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("seq_lens", BASE_SEQ_LENS)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size_qk", HEAD_SIZES)
+@pytest.mark.parametrize("block_size", BLOCK_SIZES)
+@pytest.mark.parametrize("sliding_window", [None, 256])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("q_dtype", QDTYPES)
+@pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
+@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
+@pytest.mark.parametrize("rope_size", [0])  # ROPE not supported
+@torch.inference_mode()
+def test_triton_unified_attn_mxfp4(unified_attn_inputs):
+    if not arch_info.is_fp4_avail():
+        pytest.skip("FP4 dot product is not supported on this GPU")
+
+    (
+        query,
+        key_cache,
+        value_cache,
+        cu_query_lens,
+        kv_lens,
+        block_tables,
+        sinks,
+        output,
+        max_query_len,
+        max_kv_len,
+        window_size,
+        scale,
+        rope_size,
+        ref_kwargs,
+    ) = unified_attn_unpack(unified_attn_inputs)
+
+    (
+        q_fp4,
+        q_descale,
+        k_fp4,
+        k_descale,
+        v_fp4,
+        v_descale,
+    ) = sage_quant_v2(
+        query,
+        key_cache,
+        value_cache,
+        hadamard_rotation=True,
+        R=None,
+        BLOCK_R=128,
+        layout_k="cache",
+        v_descale=None,
+    )
+
+    unified_attention(
+        q=q_fp4,
+        k=k_fp4,
+        v=v_fp4,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=ref_kwargs["soft_cap"] if ref_kwargs["soft_cap"] is not None else 0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+        sage_mxfp4=True,
+    )
+
+    ref_output = ref_paged_attn(**ref_kwargs)
+    atol, rtol = 3.5e-1, 2.5e-1
+    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
