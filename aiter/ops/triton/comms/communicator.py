@@ -37,7 +37,7 @@ class AiterCommunicator:
 
     _SUPPORTED_WORLD_SIZES = [2, 4, 8]
     _SUPPORTED_DTYPES = [torch.float16, torch.bfloat16]
-    _HEAP_SIZE = 2**33  # 8 GB
+    _HEAP_SIZE = 2**31  # 2 GB
 
     def __init__(
         self, group: ProcessGroup, device: Union[int, str, torch.device]
