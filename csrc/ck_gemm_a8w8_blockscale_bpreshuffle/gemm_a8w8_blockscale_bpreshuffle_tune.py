@@ -111,7 +111,7 @@ class Gemma8W8BlockScaleBPreShuffleTuner(GemmCommonTuner):
             K = int(untunedf.loc[i, "K"])
             shape_str = f"({M}, {N}, {K})"
             try:
-                (x, weight_shuffle, x_scale_t, w_scale, out, weight, x_scale) = (
+                x, weight_shuffle, x_scale_t, w_scale, out, weight, x_scale = (
                     self.generate_data(M, N, K, 0)
                 )
                 out, us = run_perftest(
