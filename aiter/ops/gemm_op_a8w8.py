@@ -224,13 +224,22 @@ def gen_flatmm_a8w8_blockscale_asm_fake_tensors(
     fc_name="flatmm_a8w8_blockscale_asm",
     ffi_type="ctypes",
 )
-def flatmm_a8w8_blockscale_asm(
+def _flatmm_a8w8_blockscale_asm(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
     out: Tensor,
 ) -> None: ...
+def flatmm_a8w8_blockscale_asm(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+) -> Tensor:
+    _flatmm_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, out)
+    return out
 
 
 @compile_ops(
