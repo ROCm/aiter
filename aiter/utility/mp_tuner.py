@@ -512,7 +512,9 @@ def mp_tuner(
         if pool_restart_needed and remaining_tasks:
             if verbose:
                 print(f"\n{'='*60}")
-                print("? Pool restart needed due to crash. Restarting pool...", flush=True)
+                print(
+                    "? Pool restart needed due to crash. Restarting pool...", flush=True
+                )
                 print(f"Remaining tasks: {len(remaining_tasks)}", flush=True)
                 print(f"{'='*60}\n", flush=True)
 
@@ -543,7 +545,8 @@ def mp_tuner(
             # Reset pool restart flag
             pool_restart_needed = False
             print(
-                f"Pool restarted. Continuing with {len(remaining_tasks)} remaining tasks...\n", flush=True
+                f"Pool restarted. Continuing with {len(remaining_tasks)} remaining tasks...\n",
+                flush=True,
             )
 
         # Small sleep to avoid busy waiting
