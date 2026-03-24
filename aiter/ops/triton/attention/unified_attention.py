@@ -233,10 +233,10 @@ def check_mxfp4_quant_args_get_strides(
 
 
 def unified_attention(
-    q, # t,h,d+r
-    k, # num_blks, blk_size, hk, d+r
-    v, # num_blks, blk_size, hk, d
-    out, # t,h,d
+    q,  # t,h,d+r
+    k,  # num_blks, blk_size, hk, d+r
+    v,  # num_blks, blk_size, hk, d
+    out,  # t,h,d
     cu_seqlens_q,
     max_seqlen_q,
     seqused_k,
@@ -264,7 +264,7 @@ def unified_attention(
     head_size = v.shape[-1]
     ROPE_SIZE = k.shape[-1] - v.shape[-1]
     HAS_ROPE = ROPE_SIZE > 0
-    
+
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
@@ -275,7 +275,7 @@ def unified_attention(
 
     num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
-    
+
     if sage_mxfp4:
         head_size *= 2
         (
