@@ -17,7 +17,6 @@ _gemm_a8w8_repr = make_kernel_repr(
         "BLOCK_SIZE_N",
         "BLOCK_SIZE_K",
         "GROUP_SIZE_M",
-        "EVEN_K",
         "GRID_MN",
         "NUM_BUFFERS",
     ],
@@ -281,6 +280,11 @@ def gfx1250_gemm_a8w8(
             stacklevel=2,
         )
         w = w.contiguous()
+
+    # NUM_BUFFERS must not exceed K iterations, otherwise the prologue
+    # would try to prefetch more tiles than exist.
+    if config["NUM_BUFFERS"] > triton.cdiv(K, config["BLOCK_SIZE_K"]):
+        config["NUM_BUFFERS"] = 2
 
     grid = (
         triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),

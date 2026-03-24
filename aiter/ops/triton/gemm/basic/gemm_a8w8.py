@@ -51,7 +51,7 @@ def gemm_a8w8(
     """
 
     _LOGGER.info(
-        f"GEMM_A8W8: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+        f"GEMM_A8W8: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)} use_gluon={use_gluon}"
     )
     
     if use_gluon:
