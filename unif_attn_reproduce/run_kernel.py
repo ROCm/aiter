@@ -188,7 +188,6 @@ parser.add_argument('--block_size', type=int, default=16, help='')
 parser.add_argument('--repeat', type=int, default=1000, help='')
 parser.add_argument('--cache_size', type=str, default="512*1024*1024", help='')
 parser.add_argument('--test', type=int, default=0, help='')
-parser.add_argument('--path', type=str, default="res", help='')
 parser.add_argument('--use_tdm', type=int, default=1, help='')
 parser.add_argument('--num_kv_blocks', type=int, default=1, help='')
 parser.add_argument('--waves_per_eu', type=int, default=1, help='')
@@ -204,9 +203,6 @@ print(args)
 cache_size = eval(args.cache_size)
 cache = torch.empty(int(cache_size // 4), dtype=torch.int, device='cuda')
 clear_cache = lambda: cache.zero_()
-
-if not os.path.exists(args.path):
-    os.makedirs(args.path)
 
 repeat = args.repeat
 block_size = args.block_size
