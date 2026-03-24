@@ -245,7 +245,7 @@ jobs:
     if: ${{ contains(github.event.pull_request.labels.*.name, 'ci:triton-355') }}
     name: Triton Tests (MI355) / Shard ${{ matrix.shard }}
     runs-on: linux-aiter-mi355-1
-    needs: [split_triton_tests, check-signal]
+    needs: [split_triton_tests, build-triton, check-signal]
     strategy:
       fail-fast: false
       matrix:
@@ -265,6 +265,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: triton_shards
+
+      - name: Download Triton wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: triton-wheel
+          path: triton-wheels
 
       - name: List test shard files
         run: |
@@ -311,6 +317,7 @@ jobs:
           set -ex
           echo "Setting up Aiter and Triton..."
           docker exec \
+          -e TRITON_WHEEL_DIR=/workspace/triton-wheels \
           -w /workspace \
           triton_test \
           ./.github/scripts/build_aiter_triton.sh
