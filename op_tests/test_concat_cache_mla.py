@@ -1343,7 +1343,7 @@ def test_fused_qk_norm_rope_qk_group_quant_concat_and_cache_mla(
             msg="bf16 q_nope (q_norm applied) compared with ref",
         )
         # Q pe inplace
-        err_q_pe = checkAllclose(
+        checkAllclose(
             q_pe_kernel.to(torch.float32),
             ref_q_pe.to(torch.float32),
             atol=0.01,
@@ -1359,7 +1359,7 @@ def test_fused_qk_norm_rope_qk_group_quant_concat_and_cache_mla(
             ref_q_out[..., :kv_lora_rank],
             msg="bf16 q_nope result compared with ref",
         )
-        err_q_pe = checkAllclose(
+        checkAllclose(
             q_pe_kernel.to(torch.float32),
             ref_q_pe.to(torch.float32),
             atol=0.01,

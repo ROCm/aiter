@@ -143,7 +143,9 @@ def fused_qk_norm_rope_group_quant_concat_and_cache_mla(
     kv_c: Tensor,  # [num_tokens, k_num_heads, kv_lora_rank]
     k_pe: Tensor,  # [num_tokens, k_num_heads, pe_dim]
     k_weight: Tensor,  # [kv_lora_rank] RMSNorm weights for K
-    q_weight: Optional[Tensor],  # [kv_lora_rank] RMSNorm weights for Q (None = no Q norm)
+    q_weight: Optional[
+        Tensor
+    ],  # [kv_lora_rank] RMSNorm weights for Q (None = no Q norm)
     kv_cache: Tensor,  # [num_blocks, block_size, k_num_heads, kv_lora_rank + pe_dim)]
     q_out: Tensor,  # [num_tokens, num_heads, qk_lora_rank+pe_dim]
     slot_mapping: Tensor,  # [num_tokens]
