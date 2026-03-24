@@ -44,19 +44,26 @@ def mean_pooling_kernel(
     # 2. SELF-SIMILARITY CHECK (Single Pass Variance)
     # Variance = E[X^2] - (E[X])^2
     sum = tl.sum(input_tile, axis=0) # [D]
-    sq_sum = tl.sum(input_tile * input_tile, axis=0) # [D]
     
-    actual_block_size = tl.mean(BLOCK_SIZE, remained_seq)
+    actual_block_size = tl.minimum(BLOCK_SIZE, remained_seq)
     mean = sum / actual_block_size 
-    var = (sq_sum / actual_block_size) - (mean * mean)
+
+    input_tile = input_tile.to(tl.float32)
+
+    x_norm = tl.sqrt(tl.sum(input_tile * input_tile, axis=1, keep_dims=True))
+    x = (input_tile / x_norm).to(tl.float16)  # norm at D dim
     
-    mean_offset = off_z * stride_mz + off_h * stride_mh + start_s * stride_ms + tl.arange(0, BLOCK_SIZE) * stride_md
+    grams = tl.dot(x, tl.trans(x))
+    sum_value = tl.sum(grams).to(tl.float32)
+    cur_sim = (sum_value / (actual_block_size * actual_block_size))
+
+    mean_offset = off_z * stride_mz + off_h * stride_mh + start_s * stride_ms + offs_d * stride_md
     mean_ptr = Mean_ptr + mean_offset
     tl.store(mean_ptr, mean)
 
     simiarlity_offset = off_z * stride_sz + off_h * stride_sh + start_s * stride_ss
     simiarlity_ptr = Simiarlity_ptr + simiarlity_offset
-    tl.store(simiarlity_ptr, var)
+    tl.store(simiarlity_ptr, cur_sim)
 
 
 # Theta is the threshold for simiarlity
@@ -123,6 +130,7 @@ def sparge_preprocess(q, k, BLOCK_M, BLOCK_N, theta, tau, layout):
         D=head_dim,
         BLOCK_SIZE=BLOCK_M,
     )
+    print(q_similarity)
     
     # Launch kernel for K
     grid_k = (num_blocks_k, num_k_heads, batch)
@@ -145,6 +153,7 @@ def sparge_preprocess(q, k, BLOCK_M, BLOCK_N, theta, tau, layout):
     # Apply softmax
     similarity = torch.softmax(similarity, dim=-1)
 
+    print(similarity)
     # TODO check impl
     # M[i, :] = TopCdf(Pˆ[i], τ )
     # Sort similarity scores in descending order to compute CDF
@@ -179,4 +188,4 @@ def sparge_preprocess(q, k, BLOCK_M, BLOCK_N, theta, tau, layout):
     # Note: Assuming num_q_heads == num_k_heads or broadcastable for GQA/MQA handled by torch
     M = M | k_mask.unsqueeze(-2)
 
-    return q_mean, q_similarity, k_mean, k_similarity
+    return M

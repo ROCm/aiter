@@ -11,6 +11,9 @@ from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
     sage_fwd,
     map_dims,
 )
+from aiter.ops.triton._triton_kernels.attention.sparge_lookup import (
+    sparge_preprocess
+)
 from aiter.ops.triton.utils._triton import arch_info
 
 
@@ -115,7 +118,12 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             BLKK=BLKK,
             layout=layout,
         )
-
+        # simthreshd1=0.3, cdfthreshd=0.96 from : https://github.com/thu-ml/SpargeAttn/blob/main/Triton_SpargeAttn/triton_kernel_example.py#L26
+        M = sparge_preprocess(q, k, BLOCK_M=BLKQ, BLOCK_N=BLKK, theta=0.3, tau=0.96, layout=layout)
+        
+        # print("M.numel()", M.numel())
+        # print("M.flatten()[0:50]", M.flatten()[0:50])
+        # print("M.sum()", M.sum())
         # 4. Verify Descale Shapes (Grouped scaling for GQA/MQA)
         num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
         num_k_blocks = (seqlen_k + BLKK - 1) // BLKK
