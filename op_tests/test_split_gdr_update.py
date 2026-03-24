@@ -1,6 +1,3 @@
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-# AIter split_gdr_update benchmark tests with @perftest and @benchmark
-
 import argparse
 import itertools
 import random
@@ -10,7 +7,7 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter.test_common import benchmark
+from aiter.test_common import benchmark, perftest
 
 
 def seed_everything(seed: int = 42) -> None:
@@ -171,6 +168,48 @@ def split_gdr_reference(
     return output.to(mixed_qkv.dtype).to(mixed_qkv.device)
 
 
+@perftest()
+def run_fused_split_gdr_update_decode(
+    mixed_qkv: torch.Tensor,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b_gate: torch.Tensor,
+    initial_state_source_template: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    key_dim: int,
+    value_dim: int,
+    num_heads_qk: int,
+    num_heads_v: int,
+    head_dim: int,
+    softplus_beta: float,
+    softplus_threshold: float,
+    scale: float,
+    use_qk_l2norm_in_kernel: bool,
+) -> torch.Tensor:
+    """Run fused_split_gdr_update decode kernel for perf measurement."""
+    # Clone per iteration to keep the same state-update semantics as the old event loop.
+    st = initial_state_source_template.clone()
+    return aiter.fused_split_gdr_update(
+        mixed_qkv=mixed_qkv,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b_gate=b_gate,
+        initial_state_source=st,
+        initial_state_indices=initial_state_indices,
+        key_dim=key_dim,
+        value_dim=value_dim,
+        num_heads_qk=num_heads_qk,
+        num_heads_v=num_heads_v,
+        head_dim=head_dim,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        scale=scale,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
+
+
 @benchmark()
 def test_split_gdr_update_decode(
     batch_size: int,
@@ -183,8 +222,6 @@ def test_split_gdr_update_decode(
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
     use_qk_l2norm_in_kernel: bool = True,
-    num_warmup: int = 10,
-    num_iters: int = 1000,
 ) -> dict:
     """Check correctness and benchmark HIP split_gdr update decode kernel."""
     if not torch.cuda.is_available():
@@ -266,43 +303,26 @@ def test_split_gdr_update_decode(
     )
     all_close = all_close_out and all_close_state
 
-    # Align perf methodology with sglang ksplit4_db benchmark:
-    # fixed warmup/iters + cuda event timing + cloned state per iteration.
+    # Perf uses the common @perftest workflow, consistent with other op_tests.
     ssm_state_swizzled_template = to_swizzled_layout(inputs["ssm_state"].clone())
-
-    def _run_with_state(st: torch.Tensor) -> torch.Tensor:
-        return aiter.fused_split_gdr_update(
-            mixed_qkv=inputs["mixed_qkv"],
-            A_log=inputs["A_log"],
-            a=inputs["a"],
-            dt_bias=inputs["dt_bias"],
-            b_gate=inputs["b"],
-            initial_state_source=st,
-            initial_state_indices=inputs["ssm_state_indices"],
-            key_dim=key_dim,
-            value_dim=value_dim,
-            num_heads_qk=num_heads_qk,
-            num_heads_v=num_heads_v,
-            head_dim=head_dim,
-            softplus_beta=softplus_beta,
-            softplus_threshold=softplus_threshold,
-            scale=scale,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        )
-
-    for _ in range(num_warmup):
-        _run_with_state(ssm_state_swizzled_template.clone())
-    torch.cuda.synchronize()
-
-    start_evt = torch.cuda.Event(enable_timing=True)
-    end_evt = torch.cuda.Event(enable_timing=True)
-    torch.cuda.synchronize()
-    start_evt.record()
-    for _ in range(num_iters):
-        _run_with_state(ssm_state_swizzled_template.clone())
-    end_evt.record()
-    torch.cuda.synchronize()
-    hip_us = start_evt.elapsed_time(end_evt) / num_iters * 1000.0
+    _, hip_us = run_fused_split_gdr_update_decode(
+        mixed_qkv=inputs["mixed_qkv"],
+        A_log=inputs["A_log"],
+        a=inputs["a"],
+        dt_bias=inputs["dt_bias"],
+        b_gate=inputs["b"],
+        initial_state_source_template=ssm_state_swizzled_template,
+        initial_state_indices=inputs["ssm_state_indices"],
+        key_dim=key_dim,
+        value_dim=value_dim,
+        num_heads_qk=num_heads_qk,
+        num_heads_v=num_heads_v,
+        head_dim=head_dim,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        scale=scale,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
 
     return {
         "batch_size": batch_size,
@@ -416,7 +436,6 @@ dedup_cols = [
     "dtype",
     "use_qk_l2norm_in_kernel",
 ]
-df = df.drop_duplicates(subset=dedup_cols, keep="first").reset_index(drop=True)
 try:
     df_md = df.to_markdown(index=False)
 except ImportError:
