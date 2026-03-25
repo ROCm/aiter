@@ -356,7 +356,7 @@ def kernel_unified_attention_2d(
         )
 
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_SIZE_V_PADDED], dtype=tl.float32)
 
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
@@ -646,9 +646,9 @@ def kernel_unified_attention_2d(
         v_descale_ptr = (
             v_scale
             + kv_head_idx * stride_v_cache_scale_0
-            + offs_d * stride_v_cache_scale_1
+            + offs_dv * stride_v_cache_scale_1
         )
-        v_scale_loaded = tl.load(v_descale_ptr, mask=dim_mask, other=0.0)
+        v_scale_loaded = tl.load(v_descale_ptr, mask=dim_mask_v, other=0.0)
         acc *= v_scale_loaded[None, :]
     elif v_scale is not None:
         v_scale_loaded = tl.load(v_scale)
@@ -910,7 +910,7 @@ def kernel_unified_attention_3d(
         M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
 
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_SIZE_V_PADDED], dtype=tl.float32)
 
     # context length for this particular sequences
     context_len = seq_len - cur_batch_query_len
