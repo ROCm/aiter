@@ -431,8 +431,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                   torch::Tensor& reduce_final_map,
                                   torch::Tensor& reduce_partial_map)
 {
-    constexpr int32_t kPackedQoLenPerWg = 16;
-    const hipStream_t stream            = at::hip::getCurrentHIPStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
@@ -518,16 +517,29 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     params.fixed_over_head_num_blocks   = max(1, (16 + page_size - 1) / page_size);
     params.tail_done_threshold          = max_seqlen_qo;
 
-    // launch kernel
-    MLA_METADATA_DISPATCHER(
-        max_seqlen_qo * num_heads_per_head_k,
-        kPackedQoLenPerWg,
-        params.uni_seqlen_qo,
-        topk,
-        dispatch_mla_metadata_v1_2_device<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo, kIsSparse>(
-            params,
-            stream,
-            max_seqlen_qo,
-            dev_prop.warpSize,
-            dev_prop.maxSharedMemoryPerMultiProcessor));
+    auto launch = [&](auto kPackedQoLenPerWgConstant) {
+        constexpr int32_t = decltype(kPackedQoLenPerWgConstant)::value;
+        MLA_METADATA_DISPATCHER(max_seqlen_qo * num_heads_per_head_k,
+                                kPackedQoLenPerWg,
+                                params.uni_seqlen_qo,
+                                topk,
+                                dispatch_mla_metadata_v1_2_device<kPackedQoLenPerWg,
+                                                                  kQoSplits,
+                                                                  kUniSeqlenQo,
+                                                                  kIsSparse>(
+                                    params,
+                                    stream,
+                                    max_seqlen_qo,
+                                    dev_prop.warpSize,
+                                    dev_prop.maxSharedMemoryPerMultiProcessor));
+    };
+
+    if((num_heads == 8) && (max_seqlen_qo == 4) && q_is_fp8 && kv_is_fp8))
+    {
+        launch(std::integral_constant<int32_t, 16>{});
+    }
+    else
+    {
+        launch(std::integral_constant<int32_t, 128>{});
+    }
 }
