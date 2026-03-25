@@ -178,6 +178,7 @@ def kernel_unified_attention_2d(
     stride_v_cache_scale_0: tl.int64,  # int
     stride_v_cache_scale_1: tl.int64,  # int
     query_start_len_ptr,  # [num_seqs+1]
+    key_start_len_ptr,  # [num_seqs+1]
     BLOCK_Q: tl.constexpr,  # int
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
@@ -186,10 +187,10 @@ def kernel_unified_attention_2d(
     FP8_MAX: tl.constexpr = float8_info.max,
     ALL_DECODE: tl.constexpr = False,  # bool
     SAGE_MXFP4: tl.constexpr = False,  # bool
-    IS_PAGING: tl.constexpr = True,  # bool
+    KV_LAYOUT_IS_THD: tl.constexpr = True,  # bool
     PRELOAD_V: tl.constexpr = False,  # bool
-    HAS_ROPE: tl.constexpr = False,  # bool, not implemented yet
-    IS_CAUSAL: tl.constexpr = True,  # bool, not implemented yet
+    HAS_ROPE: tl.constexpr = False,  # bool
+    IS_CAUSAL: tl.constexpr = True,  # bool
 ):
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
@@ -246,13 +247,8 @@ def kernel_unified_attention_2d(
 
     query_offset_0 = cur_batch_in_all_start_index + query_pos
     query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
-    # query_offset = (
-    #     query_offset_0[:, None] * query_stride_0
-    #     + query_offset_1[:, None] * query_stride_1
-    #     + offs_d_qk[None, :]
-    # )
 
-    # TODO: should be actually possible to not do masked dim for head as HEAD_SIZE is always pow2
+    # TODO: should be actually possible to remove this as HEAD_SIZE is always pow2. the non pow2 part is dealt with rope
     if HEAD_SIZE_PADDED != HEAD_SIZE:
         dim_mask = offs_d < HEAD_SIZE
         if SAGE_MXFP4:
@@ -346,8 +342,6 @@ def kernel_unified_attention_2d(
                 "",
             )
 
-    block_table_offset = seq_idx * block_table_stride
-
     if not USE_SINKS:
         M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     else:
@@ -429,11 +423,13 @@ def kernel_unified_attention_2d(
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
     # iterate through tiles (now limited to the sliding window range)
 
-    if not IS_PAGING:
-        seq_offset = tile_start * TILE_SIZE + offs_t
-        physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+    
+    if KV_LAYOUT_IS_THD: # No need to page inside the loop as its a contiguous layout.
+        base_offset = tl.load(
+            key_start_len_ptr + seq_idx
         ).to(tl.int64)
+    else:
+        block_table_offset = seq_idx * block_table_stride
 
     for j in range(tile_start, tile_end):
         seq_offset = j * TILE_SIZE + offs_t
@@ -443,15 +439,15 @@ def kernel_unified_attention_2d(
         else:
             tile_mask = seq_offset < max_seq_prefix_len
 
-        if IS_PAGING:
-            physical_block_idx = tl.load(
+        if not KV_LAYOUT_IS_THD: # Need to page inside the loop as its not a contiguous layout.
+            base_offset = tl.load(
                 block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
             ).to(tl.int64)
 
         # K : (HEAD_SIZE, TILE_SIZE)
         K = kv_load(
             key_cache_ptr,
-            physical_block_idx[None, :],
+            base_offset[None, :],
             kv_head_idx,
             offs_d_qk[:, None],
             seq_offset[None, :],
@@ -471,7 +467,7 @@ def kernel_unified_attention_2d(
         if SAGE_MXFP4:
             k_scale_loaded = kv_load(
                 k_scale,
-                physical_block_idx[:, None],
+                base_offset[:, None],
                 kv_head_idx,
                 offs_d_scale[None, :],
                 seq_offset[:, None],
@@ -490,7 +486,7 @@ def kernel_unified_attention_2d(
         if HAS_ROPE:
             K_rope = kv_load(
                 key_cache_ptr,
-                physical_block_idx[None, :],
+                base_offset[None, :],
                 kv_head_idx,
                 offs_rope[:, None],
                 seq_offset[None, :],
@@ -507,7 +503,7 @@ def kernel_unified_attention_2d(
                 # Do not transpose rhs mxfp4 scale!
                 k_rope_scale_loaded = kv_load(
                     k_scale,
-                    physical_block_idx[:, None],
+                    base_offset[:, None],
                     kv_head_idx,
                     offs_rope_scale[None, :],
                     seq_offset[:, None],
@@ -536,7 +532,7 @@ def kernel_unified_attention_2d(
             # V : (TILE_SIZE, HEAD_SIZE)
             V = kv_load(
                 value_cache_ptr,
-                physical_block_idx[:, None],
+                base_offset[:, None],
                 kv_head_idx,
                 offs_dv[None, :],
                 seq_offset[:, None],
@@ -621,7 +617,7 @@ def kernel_unified_attention_2d(
             # V : (TILE_SIZE, HEAD_SIZE)
             V = kv_load(
                 value_cache_ptr,
-                physical_block_idx[:, None],
+                base_offset[:, None],
                 kv_head_idx,
                 offs_dv[None, :],
                 seq_offset[:, None],

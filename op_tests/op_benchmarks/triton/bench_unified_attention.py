@@ -222,6 +222,7 @@ def run_benchmark(custom, args):
         num_query_heads = HQ
         num_kv_heads = HK
         head_size = D_HEAD
+        head_size_v = D_HEAD_V
         assert num_query_heads % num_kv_heads == 0
         max_query_len = max(seqlens_q).item()
         max_kv_len = max(seqlens_k).item()
@@ -246,30 +247,42 @@ def run_benchmark(custom, args):
         )
         scale = D_HEAD**-0.5
 
-        query = torch.randn(
-            sum(seqlens_q), num_query_heads, head_size, dtype=dtype, device="cuda"
-        )
-        key_cache = torch.randn(
-            num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cuda"
-        )
-        if args.rope_size > 0:
-            value_cache = key_cache[:, :, :, :D_HEAD_V]
-        else:
-            value_cache = torch.randn_like(key_cache)
-        
-        
-        
         cu_seqlens_q = torch.zeros(len(seqlens_q) + 1, dtype=torch.int32, device="cuda")
         cu_seqlens_q[1:] = seqlens_q.cumsum(dim=0, dtype=torch.int32)
         cu_seqlens_k = torch.zeros(len(seqlens_k) + 1, dtype=torch.int32, device="cuda")
         cu_seqlens_k[1:] = seqlens_k.cumsum(dim=0, dtype=torch.int32)
-        block_tables = torch.randint(
-            0,
-            num_blocks,
-            (num_seqs, max_num_blocks_per_seq),
-            dtype=torch.int32,
-            device="cuda",
-        )
+        
+        if args.kv_layout == "cache":
+            query = torch.randn(
+                sum(seqlens_q), num_query_heads, head_size, dtype=dtype, device="cuda"
+            )
+            key_cache = torch.randn(
+                num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cuda"
+            )
+            value_cache = torch.randn(
+                num_blocks, block_size, num_kv_heads, head_size_v, dtype=dtype, device="cuda"
+            )
+            block_tables = torch.randint(
+                0,
+                num_blocks,
+                (num_seqs, max_num_blocks_per_seq),
+                dtype=torch.int32,
+                device="cuda",
+            )
+        else:
+            query = torch.randn(
+                sum(seqlens_q), num_query_heads, head_size, dtype=dtype, device="cuda"
+            )
+            key_cache = torch.randn(
+                sum(seqlens_k), num_kv_heads, head_size, dtype=dtype, device="cuda"
+            )
+            value_cache = torch.randn(
+                sum(seqlens_k), num_kv_heads, head_size_v, dtype=dtype, device="cuda"
+            )
+            block_tables = None
+
+
+        
         if args.use_sinks:
             sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
         else:
@@ -301,7 +314,7 @@ def run_benchmark(custom, args):
                 hadamard_rotation=True,
                 R=None,
                 BLOCK_R=128,
-                layout_k="cache",
+                layout_k=args.kv_layout,
                 v_descale=None,
             )
         elif args.fp8_full:
@@ -346,6 +359,9 @@ def run_benchmark(custom, args):
                 k_descale=k_descale,
                 v_descale=v_descale,
                 sinks=sinks,
+                sage_mxfp4=args.sagev2,
+                kv_layout=args.kv_layout,
+                cu_seqlens_k=cu_seqlens_k,
             )
 
         ms = triton.testing.do_bench(fn)
@@ -364,7 +380,8 @@ def run_benchmark(custom, args):
                 sliding_window=args.sliding_window,
                 soft_cap=soft_cap,
                 sinks=sinks,
-                causal=causal
+                causal=causal,
+                kv_layout=args.kv_layout
             )
             if args.sagev2:
                 atol, rtol = 3.5e-1, 2.5e-1
@@ -482,6 +499,14 @@ def parse_args():
         type=parse_int_or_list,
         default=0,
         help="Key sequence length - can be a single number or comma-separated list. Defaults to the same as sq if 0",
+    )
+
+    parser.add_argument(
+        "-kv_layout",
+        type=str,
+        choices=["cache", "thd"],
+        default="cache",
+        help="Layout for key-value tensors: 'cache' for paged cache layout or 'thd' for THD layout",
     )
 
     parser.add_argument(
