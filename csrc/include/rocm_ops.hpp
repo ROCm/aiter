@@ -23,6 +23,11 @@ namespace py = pybind11;
           "Activation function used in GELU.",          \
           py::arg("out"),                               \
           py::arg("input"));                            \
+    m.def("gelu_fast",                                  \
+          &aiter::gelu_fast,                            \
+          "Activation function used in GELU fast.",     \
+          py::arg("out"),                               \
+          py::arg("input"));                            \
     m.def("gelu_tanh_and_mul",                          \
           &aiter::gelu_tanh_and_mul,                    \
           "Activation function used in GELU tanh.",     \
@@ -446,15 +451,6 @@ namespace py = pybind11;
           py::arg("kernelName")  = std::nullopt, \
           py::arg("bpreshuffle") = false);
 
-#define FLATMM_A8W8_BLOCKSCALE_ASM_PYBIND \
-    m.def("flatmm_a8w8_blockscale_asm",   \
-          &flatmm_a8w8_blockscale_asm,    \
-          "flatmm_a8w8_blockscale_asm",   \
-          py::arg("XQ"),                  \
-          py::arg("WQ"),                  \
-          py::arg("x_scale"),             \
-          py::arg("w_scale"),             \
-          py::arg("Out"));
 
 #define GEMM_A4W4_BLOCKSCALE_PYBIND \
     m.def("gemm_a4w4_blockscale",   \
@@ -1430,6 +1426,16 @@ namespace py = pybind11;
 #define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                     \
     m.def("fused_qk_norm_rope_cache_quant_shuffle",              \
           &aiter::fused_qk_norm_rope_cache_quant_shuffle);       \
+    m.def("fused_qk_rmsnorm",                                    \
+            &aiter::fused_qk_rmsnorm,                            \
+            py::arg("q"),                                        \
+            py::arg("q_weight"),                                 \
+            py::arg("q_eps"),                                    \
+            py::arg("k"),                                        \
+            py::arg("k_weight"),                                 \
+            py::arg("k_eps"),                                    \
+            py::arg("q_out"),                                    \
+            py::arg("k_out"));                                   \
     m.def("fused_qk_norm_rope_cache_pts_quant_shuffle",          \
           &aiter::fused_qk_norm_rope_cache_pts_quant_shuffle,    \
           py::arg("qkv"),                                        \
