@@ -892,13 +892,12 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 
     if(out->dtype() == AITER_DTYPE_bf16 && inter_dim % 128 == 0 && fc_scale_blkn == 128 &&
        fc_scale_blkk == 128)
-	    {
-	bool xquant = (input->dtype() == AITER_DTYPE_bf16);
-        ActivationType act = static_cast<ActivationType>(activation);
-	if(act == ActivationType::Silu)
-		config_map = xquant ? &cfg_fmoe_bf16_blockscaleBf16_g1u1_silu : &cfg_fmoe_bf16_blockscaleFp8_g1u1_silu;
+    {
+        bool xquant = (input->dtype() == AITER_DTYPE_bf16);
+        if(act == ActivationType::Silu)
+            config_map = xquant ? &cfg_fmoe_bf16_blockscaleBf16_g1u1_silu : &cfg_fmoe_bf16_blockscaleFp8_g1u1_silu;
         else if(act == ActivationType::Gelu)
-		config_map = xquant ? &cfg_fmoe_bf16_blockscaleBf16_g1u1_gelu : &cfg_fmoe_bf16_blockscaleFp8_g1u1_gelu;
+            config_map = xquant ? &cfg_fmoe_bf16_blockscaleBf16_g1u1_gelu : &cfg_fmoe_bf16_blockscaleFp8_g1u1_gelu;
         else
             AITER_CHECK(
                 false, __func__, "Unsupported activation type for fmoe_fp8_blockscale_g1u1");

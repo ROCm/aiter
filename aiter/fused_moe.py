@@ -438,6 +438,8 @@ def fused_moe_1stage(
         else:
             quant_func = get_quant(quant_type)
             if hidden_states.dtype != q_dtype_a:
+                if quant_type == QuantType.per_1x128:
+                    quant_func = functools.partial(quant_func, transpose_scale=True)
                 a1, a1_scale = quant_func(
                     hidden_states,
                     scale=a1_scale,
