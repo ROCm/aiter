@@ -518,7 +518,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     params.tail_done_threshold          = max_seqlen_qo;
 
     auto launch = [&](auto kPackedQoLenPerWgConstant) {
-        constexpr int32_t = decltype(kPackedQoLenPerWgConstant)::value;
+        constexpr int32_t kPackedQoLenPerWg = decltype(kPackedQoLenPerWgConstant)::value;
         MLA_METADATA_DISPATCHER(max_seqlen_qo * num_heads_per_head_k,
                                 kPackedQoLenPerWg,
                                 params.uni_seqlen_qo,
@@ -534,7 +534,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                     dev_prop.maxSharedMemoryPerMultiProcessor));
     };
 
-    if((num_heads == 8) && (max_seqlen_qo == 4) && q_is_fp8 && kv_is_fp8))
+    if((num_heads == 8) && (max_seqlen_qo == 4) && q_is_fp8 && kv_is_fp8)
     {
         launch(std::integral_constant<int32_t, 16>{});
     }
