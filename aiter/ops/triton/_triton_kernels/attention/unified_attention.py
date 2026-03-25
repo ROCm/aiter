@@ -51,78 +51,66 @@ def find_seq_idx(
 
 
 @triton.jit
-def q_scale_process(
-    Q_Descale,
-    q_block_global_idx,
-    offs_d_scale,
-    query_offset_seq,
-    kv_head_idx,
-    query_offset_head,
-    seq_mask,
-    query_scale_stride_0: tl.int64,
-    query_scale_stride_1: tl.int64,
-    query_scale_stride_2: tl.int64,
-    SAGE_VERSION: tl.constexpr = None,
+def q_load(
+    query_ptr,
+    query_offset_0,
+    query_offset_1,
+    offs_d,
+    query_stride_0,
+    query_stride_1,
+    query_mask_0,
+    query_mask_1,
+    dim_mask,
+    Q_cache_modifier: tl.constexpr,
 ):
-    if SAGE_VERSION == 1:  # SAGE v1
-        q_descale_ptr = (
-            Q_Descale
-            + q_block_global_idx * query_scale_stride_0
-            + kv_head_idx * query_scale_stride_1
-        )
-        return tl.load(q_descale_ptr)
-    elif SAGE_VERSION == 2:  # SAGE mxfp4
-        q_descale_ptr = (
-            Q_Descale
-            + query_offset_seq[:, None] * query_scale_stride_0
-            + query_offset_head[:, None] * query_scale_stride_1
-            + offs_d_scale[None, :] * query_scale_stride_2
-        )
-
-        return tl.load(q_descale_ptr, mask=seq_mask, other=0.0)
-
+    query_offset = (
+        query_offset_0[:, None] * query_stride_0
+        + query_offset_1[:, None] * query_stride_1
+        + offs_d[None, :]
+    )
+    return tl.load(
+        query_ptr + query_offset,
+        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+        other=0.0,
+        cache_modifier=Q_cache_modifier,
+    )
 
 @triton.jit
-def k_scale_process(
-    K_Descale,
+def kv_load(
+    kv_cache_ptr,
     physical_block_idx,
-    seq_offset,
-    tile_idx,
-    BLOCK_SIZE,
-    TILE_SIZE,
     kv_head_idx,
-    offs_d_scale,
+    offs_d,
+    seq_offset,
+    stride_k_cache_0,
+    stride_k_cache_1,
+    stride_k_cache_2,
+    stride_k_cache_3,
+    dim_mask,
     tile_mask,
-    stride_k_cache_scale_0: tl.int64,  # int
-    stride_k_cache_scale_1: tl.int64,  # int
-    stride_k_cache_scale_2: tl.int64,  # int
-    stride_k_cache_scale_3: tl.int64,  # int
-    SAGE_VERSION: tl.constexpr = None,
+    BLOCK_SIZE: tl.constexpr,
+    KV_cache_modifier: tl.constexpr,
 ):
-    if SAGE_VERSION == 1:  # SAGE v1 Each block_size has its own scale
-        k_descale_ptr = (
-            K_Descale
-            + physical_block_idx * stride_k_cache_scale_0
-            + tile_idx % tl.cdiv(BLOCK_SIZE, TILE_SIZE) * stride_k_cache_scale_1
-            + kv_head_idx * stride_k_cache_scale_2
-        )
-        return tl.load(k_descale_ptr)
-    elif SAGE_VERSION == 2:  # SAGE mxfp4
-        k_descale_ptr = (
-            K_Descale
-            + physical_block_idx[:, None] * stride_k_cache_scale_0
-            + kv_head_idx * stride_k_cache_scale_2
-            + offs_d_scale[None, :] * stride_k_cache_scale_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * stride_k_cache_scale_1
-        )
-        return tl.load(k_descale_ptr, mask=tile_mask, other=0.0)
+    kv_offset = (
+        physical_block_idx * stride_k_cache_0
+        + kv_head_idx * stride_k_cache_2
+        + offs_d * stride_k_cache_3
+        + (seq_offset % BLOCK_SIZE) * stride_k_cache_1
+    )
+
+    return tl.load(
+        kv_cache_ptr + kv_offset,
+        mask=dim_mask & tile_mask,
+        other=0.0,
+        cache_modifier=KV_cache_modifier,
+    )
 
 
 @triton.jit
 def qk_dot(
     Q,
     K,
-    qk_scale,
+    qk_scale, # 
     q_descale,
     k_descale,
     SAGE_MXFP4: tl.constexpr = False,
@@ -131,25 +119,6 @@ def qk_dot(
         return tl.dot_scaled(Q, q_descale, "e2m1", K, k_descale, "e2m1", fast_math=True)
     else:
         return qk_scale * tl.dot(Q, K)
-
-
-@triton.jit
-def v_scale_process(
-    V_Descale,
-    kv_head_idx,
-    offs_d,
-    head_mask,
-    stride_v_cache_scale_0: tl.int64,  # int
-    stride_v_cache_scale_1: tl.int64,  # int
-    SAGE_VERSION: tl.constexpr = None,
-):
-    if SAGE_VERSION == 1 or SAGE_VERSION == 2:
-        v_descale_ptr = (
-            V_Descale
-            + kv_head_idx * stride_v_cache_scale_0
-            + offs_d * stride_v_cache_scale_1
-        )
-        return tl.load(v_descale_ptr, mask=head_mask, other=0.0)
 
 
 @triton.jit
@@ -272,11 +241,11 @@ def kernel_unified_attention_2d(
 
     query_offset_0 = cur_batch_in_all_start_index + query_pos
     query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
-    query_offset = (
-        query_offset_0[:, None] * query_stride_0
-        + query_offset_1[:, None] * query_stride_1
-        + offs_d_qk[None, :]
-    )
+    # query_offset = (
+    #     query_offset_0[:, None] * query_stride_0
+    #     + query_offset_1[:, None] * query_stride_1
+    #     + offs_d_qk[None, :]
+    # )
 
     if HEAD_SIZE_PADDED != HEAD_SIZE:
         dim_mask = offs_d < HEAD_SIZE
@@ -291,15 +260,7 @@ def kernel_unified_attention_2d(
         dim_mask_qk = dim_mask
         scale_dim_mask = dim_mask
 
-    if ROPE_SIZE_PADDED != ROPE_SIZE:
-        if SAGE_MXFP4:
-            rope_dim_mask = offs_rope < ((HEAD_SIZE + ROPE_SIZE) // 2)
-            rope_scale_dim_mask = offs_rope_scale < ((HEAD_SIZE + ROPE_SIZE) // 32)
-        else:
-            rope_dim_mask = offs_rope < (HEAD_SIZE + ROPE_SIZE)
-    else:
-        rope_dim_mask = tl.full((1,), 1, dtype=tl.int1)
-        rope_scale_dim_mask = tl.full((1,), 1, dtype=tl.int1)
+   
 
     query_mask_0 = query_pos < cur_batch_query_len
     query_mask_1 = query_offset_1 < num_query_heads
@@ -309,57 +270,73 @@ def kernel_unified_attention_2d(
     else:
         Q_cache_modifier: tl.constexpr = ""
 
-    if HAS_ROPE:
-        q_rope_offset = (
-            query_offset_0[:, None] * query_stride_0
-            + query_offset_1[:, None] * query_stride_1
-            + offs_rope[None, :]
-        )
-        Q_rope = tl.load(
-            query_ptr + q_rope_offset,
-            mask=rope_dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
-            other=0.0,
-            cache_modifier=Q_cache_modifier,
-        )
-
     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
-    Q = tl.load(
-        query_ptr + query_offset,
-        mask=dim_mask_qk[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
-        other=0.0,
-        cache_modifier=Q_cache_modifier,
-    )
+    Q = q_load(
+        query_ptr,
+        query_offset_0,
+        query_offset_1,
+        offs_d_qk,
+        query_stride_0,
+        query_stride_1,
+        query_mask_0,
+        query_mask_1,
+        dim_mask_qk,
+        Q_cache_modifier,)
+
 
     q_scale_loaded = None
     if SAGE_MXFP4:
-        q_descale_ptr = (
-            q_scale
-            + query_offset_0[:, None] * query_scale_stride_0
-            + query_offset_1[:, None] * query_scale_stride_1
-            + offs_d_scale[None, :] * query_scale_stride_2
+        q_scale_loaded = q_load(
+            q_scale,
+            query_offset_0,
+            query_offset_1,
+            offs_d_scale,
+            query_scale_stride_0,
+            query_scale_stride_1,
+            query_mask_0,
+            query_mask_1,
+            scale_dim_mask,
+            "",
         )
-        q_scale_loaded = tl.load(
-            q_descale_ptr,
-            mask=scale_dim_mask[None, :]
-            & query_mask_0[:, None]
-            & query_mask_1[:, None],
-            other=0.0,
+    
+    if HAS_ROPE:
+        if ROPE_SIZE_PADDED != ROPE_SIZE:
+            if SAGE_MXFP4:
+                rope_dim_mask = offs_rope < ((HEAD_SIZE + ROPE_SIZE) // 2)
+                rope_scale_dim_mask = offs_rope_scale < ((HEAD_SIZE + ROPE_SIZE) // 32)
+            else:
+                rope_dim_mask = offs_rope < (HEAD_SIZE + ROPE_SIZE)
+        else:
+            rope_dim_mask = tl.full((1,), 1, dtype=tl.int1)
+            rope_scale_dim_mask = tl.full((1,), 1, dtype=tl.int1)
+        
+        Q_rope = q_load(
+            query_ptr,
+            query_offset_0,
+            query_offset_1,
+            offs_rope,
+            query_stride_0,
+            query_stride_1,
+            query_mask_0,
+            query_mask_1,
+            rope_dim_mask,
+            "",
         )
-        if HAS_ROPE:
-            q_rope_scale_ptr = (
-                q_scale
-                + query_offset_0[:, None] * query_scale_stride_0
-                + query_offset_1[:, None] * query_scale_stride_1
-                + offs_rope_scale[None, :] * query_scale_stride_2
-            )
-            q_rope_scale_loaded = tl.load(
-                q_rope_scale_ptr,
-                mask=rope_scale_dim_mask[None, :]
-                & query_mask_0[:, None]
-                & query_mask_1[:, None],
-                other=0.0,
-            )
 
+        if SAGE_MXFP4:
+            q_rope_scale_loaded = q_load(
+                q_scale,
+                query_offset_0,
+                query_offset_1,
+                offs_rope_scale,
+                query_scale_stride_0,
+                query_scale_stride_1,
+                query_mask_0,
+                query_mask_1,
+                rope_scale_dim_mask,
+                "",
+            )
+    
     block_table_offset = seq_idx * block_table_stride
 
     if not USE_SINKS:
@@ -458,72 +435,80 @@ def kernel_unified_attention_2d(
                 block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
             ).to(tl.int64)
 
-        v_offset = (
-            physical_block_idx[:, None] * stride_v_cache_0
-            + kv_head_idx * stride_v_cache_2
-            + offs_d[None, :] * stride_v_cache_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-        )
-
-        k_offset = (
-            physical_block_idx[None, :] * stride_k_cache_0
-            + kv_head_idx * stride_k_cache_2
-            + offs_d_qk[:, None] * stride_k_cache_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-        )
-
-        S = tl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32)
+        
 
         # K : (HEAD_SIZE, TILE_SIZE)
-        K_load = tl.load(
-            key_cache_ptr + k_offset,
-            mask=dim_mask_qk[:, None] & tile_mask[None, :],
-            other=0.0,
-            cache_modifier=KV_cache_modifier,
+        K = kv_load(
+            key_cache_ptr,
+            physical_block_idx[None, :],
+            kv_head_idx,
+            offs_d_qk[:, None],
+            seq_offset[None, :],
+            stride_k_cache_0,
+            stride_k_cache_1,
+            stride_k_cache_2,
+            stride_k_cache_3,
+            dim_mask_qk[:, None],
+            tile_mask[None, :],
+            BLOCK_SIZE,
+            KV_cache_modifier,
         )
+
+    
+        S = tl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32)
 
         k_scale_loaded = None
         if SAGE_MXFP4:
-            K = K_load
-            k_descale_ptr = (
-                k_scale
-                + physical_block_idx[:, None] * stride_k_cache_scale_0
-                + kv_head_idx * stride_k_cache_scale_2
-                + offs_d_scale[None, :] * stride_k_cache_scale_3
-                + (seq_offset % BLOCK_SIZE)[:, None] * stride_k_cache_scale_1
+            k_scale_loaded = kv_load(
+                k_scale,
+                physical_block_idx[:, None],
+                kv_head_idx,
+                offs_d_scale[None, :],
+                seq_offset[:, None],
+                stride_k_cache_scale_0,
+                stride_k_cache_scale_1,
+                stride_k_cache_scale_2,
+                stride_k_cache_scale_3,
+                scale_dim_mask[None, :],
+                tile_mask[:, None],
+                BLOCK_SIZE,
+                "",
             )
 
-            k_scale_loaded = tl.load(k_descale_ptr, mask=tile_mask[:, None], other=0.0)
-
-        # TODO: check convert effect on perf
-        K = K_load.to(Q.dtype)
+        K = K.to(Q.dtype)
 
         if HAS_ROPE:
-            k_rope_ptrs = (
-                key_cache_ptr
-                + physical_block_idx[None, :] * stride_k_cache_0
-                + kv_head_idx * stride_k_cache_2
-                + offs_rope[:, None] * stride_k_cache_3
-                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-            )
-            K_rope = tl.load(
-                k_rope_ptrs,
-                mask=rope_dim_mask[:, None] & tile_mask[None, :],
-                other=0.0,
-                cache_modifier=KV_cache_modifier,
+            K_rope = kv_load(
+                key_cache_ptr,
+                physical_block_idx[None, :],
+                kv_head_idx,
+                offs_rope[:, None],
+                seq_offset[None, :],
+                stride_k_cache_0,
+                stride_k_cache_1,
+                stride_k_cache_2,
+                stride_k_cache_3,
+                rope_dim_mask[:, None],
+                tile_mask[None, :],
+                BLOCK_SIZE,
+                "",
             )
             if SAGE_MXFP4:
-                k_rope_scale_ptr = (
-                    k_scale
-                    + physical_block_idx[:, None] * stride_k_cache_scale_0
-                    + kv_head_idx * stride_k_cache_scale_2
-                    + offs_rope_scale[:, None] * stride_k_cache_scale_3
-                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_k_cache_scale_1
-                )
-                k_rope_scale_loaded = tl.load(
-                    k_rope_scale_ptr,
-                    mask=rope_scale_dim_mask[:, None] & tile_mask[:, None],
-                    other=0.0,
+                # Do not transpose rhs mxfp4 scale!
+                k_rope_scale_loaded = kv_load(
+                    k_scale,
+                    physical_block_idx[:, None],
+                    kv_head_idx,
+                    offs_rope_scale[None, :],
+                    seq_offset[:, None],
+                    stride_k_cache_scale_0,
+                    stride_k_cache_scale_1,
+                    stride_k_cache_scale_2,
+                    stride_k_cache_scale_3,
+                    rope_scale_dim_mask[None, :],
+                    tile_mask[:, None],
+                    BLOCK_SIZE,
+                    "",
                 )
                 S += tl.dot_scaled(
                     Q_rope,
@@ -539,14 +524,22 @@ def kernel_unified_attention_2d(
 
         if PRELOAD_V:
             # V : (TILE_SIZE, HEAD_SIZE)
-            V = tl.load(
-                value_cache_ptr + v_offset,
-                mask=dim_mask[None, :] & tile_mask[:, None],
-                other=0.0,
-                cache_modifier=KV_cache_modifier,
+            V = kv_load(
+                value_cache_ptr,
+                physical_block_idx[:, None],
+                kv_head_idx,
+                offs_d[None, :],
+                seq_offset[:, None],
+                stride_v_cache_0,
+                stride_v_cache_1,
+                stride_v_cache_2,
+                stride_v_cache_3,
+                dim_mask[None, :],
+                tile_mask[:, None],
+                BLOCK_SIZE,
+                KV_cache_modifier,
             )
-
-        # S : (BLOCK_M, TILE_SIZE)
+        
         S += qk_dot(
             Q,
             K,
@@ -612,11 +605,20 @@ def kernel_unified_attention_2d(
 
         if not PRELOAD_V:
             # V : (TILE_SIZE, HEAD_SIZE)
-            V = tl.load(
-                value_cache_ptr + v_offset,
-                mask=dim_mask[None, :] & tile_mask[:, None],
-                other=0.0,
-                cache_modifier=KV_cache_modifier,
+            V = kv_load(
+                value_cache_ptr,
+                physical_block_idx[:, None],
+                kv_head_idx,
+                offs_d[None, :],
+                seq_offset[:, None],
+                stride_v_cache_0,
+                stride_v_cache_1,
+                stride_v_cache_2,
+                stride_v_cache_3,
+                dim_mask[None, :],
+                tile_mask[:, None],
+                BLOCK_SIZE,
+                KV_cache_modifier,
             )
         # update constants
         L = L * alpha + l_j

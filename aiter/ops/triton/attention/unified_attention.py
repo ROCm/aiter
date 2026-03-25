@@ -12,65 +12,6 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 
-
-def get_config(
-    num_tokens,
-    num_seqs,
-    num_queries_per_kv,
-    num_kv_heads,
-    head_size,
-    window_size,
-    max_seqlen_q,
-    max_seqlen_k,
-    block_size,
-    q_element_size,
-):
-    SLIDING_WINDOW = 1 + window_size[0]
-    ALL_DECODE = max_seqlen_q == 1
-    cu_count = get_num_sms()
-
-    BLOCK_M = (
-        16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
-    )
-
-    BLOCK_Q = BLOCK_M // num_queries_per_kv
-
-    total_num_q_blocks = num_tokens // BLOCK_Q + num_seqs
-    target_num_prgms = cu_count * 4
-    num_2d_prgms = total_num_q_blocks * num_kv_heads
-    if use_2d_kernel(
-        head_size,
-        SLIDING_WINDOW,
-        ALL_DECODE,
-        max_seqlen_q,
-        max_seqlen_k,
-        target_num_prgms,
-        num_2d_prgms,
-    ):
-        return select_2d_config(
-            block_size,
-            head_size,
-            SLIDING_WINDOW,
-            ALL_DECODE,
-            max_seqlen_q,
-            max_seqlen_k,
-            num_queries_per_kv,
-            num_2d_prgms,
-        )
-    else:
-        attn_config, reduce_config = select_3d_config(
-            head_size,
-            block_size,
-            q_element_size,
-            max_seqlen_k,
-            target_num_prgms,
-            num_2d_prgms,
-        )
-        attn_config["BLOCK_M"] = BLOCK_M
-        attn_config["BLOCK_Q"] = BLOCK_Q
-        return attn_config
-
-
 def select_2d_config(
     block_size,
     head_size,
@@ -322,7 +263,7 @@ def unified_attention(
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
-    if HAS_ROPE or use_2d_kernel(
+    if True or use_2d_kernel(
         head_size,
         SLIDING_WINDOW,
         ALL_DECODE,
