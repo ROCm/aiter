@@ -1,17 +1,19 @@
 # Triton 3.6 GEMM Tuning — Learnings & Updated Per-Kernel Procedure
 
-**Date**: 2026-03-19
+**Date**: 2026-03-19 (updated 2026-03-24)
 **Status**: Active
-**Context**: Learnings from successfully tuning `gemm_a8w8` on Triton 3.6
+**Context**: Learnings from tuning `gemm_a8w8`, `gemm_a16w16`, `gemm_afp4wfp4` on Triton 3.6
 
-## Learnings from a8w8 Tuning
+## Learnings
 
-### 1. Baseline Collection
+### 1. Baseline & Validation Collection
 - Use `rocprof --stats` (deprecated but reliable), NOT `rocprofv3`
+- **MUST be sequential on a single GPU** — parallel runs cause `results.stats.csv` collisions and corrupt data
 - Command: `rocprof --stats python bench_gemm_<variant>.py --shape <M> <N> <K> --metric time --layout TN`
-- Parse `results.stats.csv`: the kernel row has `AverageNs` in the 4th column
+- Parse `results.stats.csv`: kernel row has `AverageNs` in 4th column
 - Filter by kernel name substring (e.g., `gemm_a8w8`) to find the right row
 - Must install `matplotlib` for bench scripts to work
+- **Kill all stray GPU processes** before collecting data — verify with `rocm-smi --showpidgpus`
 
 ### 2. Shape Selection
 - Primary shapes come from config files (`configs/gemm/gfx950-GEMM-*.json`) and `model_shapes.json`
@@ -34,154 +36,165 @@ The tuning search space MUST be tailored to M. Using the full default range wast
 
 | M Range | BLOCK_SIZE_M | BLOCK_SIZE_N | BLOCK_SIZE_K |
 |---------|-------------|-------------|-------------|
-| M <= 16 | 4, 8, 16 | 16, 32 | 128, 256 |
+| M <= 16 | 4, 8, 16 | 16, 32 | 64, 128, 256 |
 | M 32-64 | 16, 32, 64 | 32, 64 | 64, 128, 256 |
 | M 128-512 | 64, 128, 256 | 64, 128 | 64, 128 |
 | M >= 1024 | 128, 256, 512 | 128, 256 | **64**, 128 |
 
-**Critical learning from a16w16:** For large M with bf16, reducing BK from 128 to **64** halves LDS per tile, enabling BM=256 and BN=128/256 with num_stages=3. This is dramatically faster than BK=128 with BM=128 and num_stages=2. Example: `(256*64 + 128*64) * 2 * 3 = 147456 bytes` fits in 160KB LDS.
+**For fp4 kernels (packed uint8, BK >= 256):**
 
-The tuning script MUST include BK=64 in `--block-size-k-range` for bf16 kernels, especially for large M. Without it, the tuner is blind to the best configs.
+| M Range | BLOCK_SIZE_M | BLOCK_SIZE_N | BLOCK_SIZE_K |
+|---------|-------------|-------------|-------------|
+| M <= 16 | 4, 8, 16 | 16, 32, 64, 128, 256 | 256, 512, 1024 |
+| M 32-64 | 16, 32, 64 | 32, 64, 128 | 256, 512 |
+| M 128-512 | 64, 128, 256 | 64, 128, 256 | 256, 512 |
+| M >= 1024 | 128, 256 | 128, 256 | 256, 512 |
+
+**Critical learning from a16w16:** For large M with bf16, reducing BK from 128 to **64** halves LDS per tile, enabling BM=256 and BN=128/256 with num_stages=3. Example: `(256*64 + 128*64) * 2 * 3 = 147456 bytes` fits in 160KB LDS.
 
 ### 4. num_stages
-- `num_stages=3` is optimal for most shapes on Triton 3.6, even with smaller BK
+- `num_stages=3` is optimal for most shapes on Triton 3.6
 - `num_stages=2` is close second, sometimes wins for large M with large BK
-- Always sweep `--num-stages-range 2 3`
+- `num_stages=1` should also be swept — it occasionally wins for specific shapes
+- Always sweep `--num-stages-range 1 2 3`
 
-### 5. GPU Assignment
+### 5. matrix_instr_nonkdim
+- **nonkdim=16**: Default, works well for most shapes
+- **nonkdim=32**: Critical for fp4 kernels with large M and large N,K — can be dramatically faster
+- Always sweep `--matrix-instr-nonkdim-range 16 32` for fp4 kernels
+- For fp8/bf16 kernels, nonkdim=16 is usually sufficient
+
+### 6. GPU Assignment
 - Pass GPU ID directly to `screen.py` as the `G` positional argument
 - screen.py sets `HIP_VISIBLE_DEVICES` internally — do NOT set it at the parent level
 - Verify with `rocm-smi --showpidgpus` that processes are on different GPUs
 
-### 6. Validation
-- Run same `rocprof --stats python bench_gemm_<variant>.py` on both Triton versions
-- Compare `AverageNs` from `results.stats.csv`
-- This gives apples-to-apples comparison
+### 7. BLOCK_M Constraints
+- The tuner may pick BLOCK_M > M (e.g., BM=32 for M=16). This works via masking and is often faster.
+- **Do NOT blindly enforce BLOCK_M <= M** — it regresses many shapes (tested: 15 regressions from BM<=M, 25 from BM<=M + min BM)
+- Instead: after tuning, compare constrained vs unconstrained per-shape and selectively apply the constraint only where it improves performance
+- In our testing, only 2 out of 136 shapes benefited from the BM<=M constraint
+
+### 8. fp4 K Naming Convention
+- For afp4wfp4: `_get_config` does `K = 2 * K` internally where K is the tensor's K dimension (K/2 uint8 values for K fp4 elements)
+- The benchmark `--shape M N K` uses K = number of fp4 elements
+- The config filename K matches the benchmark K directly (NOT K*2)
+- **Do NOT rename config files with K*2** — this was a mistake that caused catastrophic regressions
+
+### 9. Parallel vs Sequential
+- **Tuning** (screen.py): Can run in parallel across GPUs — each GPU runs a different shape, no file conflicts
+- **Baseline/validation** (rocprof --stats): MUST be sequential on single GPU — parallel runs corrupt `results.stats.csv`
+- When running multiple N,K pairs on different GPUs for tuning, use separate subshells or `wait` between shapes on the same GPU
 
 ---
 
 ## Updated Per-Kernel Procedure
 
-For each kernel (e.g., `gemm_a8w8`, `gemm_a16w16`, etc.):
-
 ### Phase 1: Baseline (on Triton 3.4, aiter main branch)
 
 ```bash
-# 1. Switch to main branch, install Triton 3.4
+# 1. Kill stray processes, switch to main branch, install Triton 3.4
+pkill -9 -f "screen.py|rocprof|bench_gemm" 2>/dev/null
 git checkout main
 cd /app/triton_3_4 && pip install -e .
 
 # 2. Run UTs to confirm everything works
-HIP_VISIBLE_DEVICES=0 python -m pytest op_tests/triton_tests/gemm/basic/test_gemm_<variant>.py -q --tb=no -k "triton- and not gluon"
+HIP_VISIBLE_DEVICES=0 python -m pytest op_tests/triton_tests/gemm/basic/test_gemm_<variant>.py -q --tb=no
 
-# 3. Collect baseline with rocprof --stats
+# 3. Collect baseline SEQUENTIALLY with rocprof --stats
 for M in 8 16 32 64 128 256 512 8192; do
-    HIP_VISIBLE_DEVICES=0 rocprof --stats python op_tests/op_benchmarks/triton/bench_gemm_<variant>.py --shape $M 8192 8192 --metric time --layout TN 2>/dev/null 1>/dev/null
+    HIP_VISIBLE_DEVICES=0 rocprof --stats python op_tests/op_benchmarks/triton/bench_gemm_<variant>.py \
+        --shape $M <N> <K> --metric time --layout TN 2>/dev/null 1>/dev/null
     grep "gemm_<variant>" results.stats.csv | head -1
     rm -f results.csv results.stats.csv results.copy_stats.csv results.sysinfo.txt
 done
 ```
-
-Record the `AverageNs` values.
 
 ### Phase 2: Tune (on Triton 3.6, feature branch)
 
 ```bash
 # 1. Switch to feature branch, install Triton 3.6
-git checkout alizaidy/gfx950-kernel-fixes
+git checkout alizaidy/gfx950-kernel-fixes-cherry-picked
 cd /tmp/triton-latest && pip install -e .
 
-# 2. Run UTs to see what breaks (expect LDS OOR for bf16 kernels)
-HIP_VISIBLE_DEVICES=0 python -m pytest op_tests/triton_tests/gemm/basic/test_gemm_<variant>.py -q --tb=no -k "triton- and not gluon"
+# 2. Run UTs to see what breaks
+HIP_VISIBLE_DEVICES=0 python -m pytest op_tests/triton_tests/gemm/basic/test_gemm_<variant>.py -q --tb=no
 
-# 3. Tune each M value on a separate GPU with M-appropriate block sizes
+# 3. Tune — one shape per GPU, use M-appropriate block sizes
 cd aiter/ops/triton/utils/_triton/tunning/
 
-# Small M (8-64): use small blocks, one GPU each
-for i in 0 1 2 3; do
-    M_VALS=(8 16 32 64)
+# For each (N,K) pair, tune all M values:
+for i in 0 1 2 3 4 5 6 7; do
+    M_VALS=(8 16 32 64 128 256 512 8192)
     M=${M_VALS[$i]}
-    python screen.py $M 8192 8192 $i ut_<variant>_gemm.py \
-        --block-size-m-range 4 8 16 32 64 \
-        --block-size-n-range 16 32 64 \
-        --block-size-k-range 256 512 1024 \
-        --num-stages-range 2 3 > /dev/null 2>&1 &
+    # Select block ranges based on M and kernel dtype (see tables above)
+    python screen.py $M <N> <K> $i ut_<variant>_gemm.py \
+        --block-size-m-range <BM_RANGE> \
+        --block-size-n-range <BN_RANGE> \
+        --block-size-k-range <BK_RANGE> \
+        --matrix-instr-nonkdim-range 16 32 \
+        --num-stages-range 1 2 3 > /dev/null 2>&1 &
 done
-
-# Medium M (128-512): use medium blocks
-# For bf16: include BK=64 to enable larger BM/BN with num_stages=3
-for i in 4 5 6; do
-    M_VALS=(128 256 512)
-    M=${M_VALS[$((i-4))]}
-    python screen.py $M 8192 8192 $i ut_<variant>_gemm.py \
-        --block-size-m-range 64 128 256 \
-        --block-size-n-range 64 128 \
-        --block-size-k-range 64 128 256 \
-        --num-stages-range 2 3 > /dev/null 2>&1 &
-done
-
-# Large M (8192): use large blocks
-# For bf16: BK=64 is CRITICAL — enables BM=256, BN=128/256 with num_stages=3
-python screen.py 8192 8192 8192 7 ut_<variant>_gemm.py \
-    --block-size-m-range 128 256 512 \
-    --block-size-n-range 128 256 \
-    --block-size-k-range 64 128 256 \
-    --num-stages-range 2 3 > /dev/null 2>&1 &
-
-wait  # Wait for all GPUs to finish
+wait
 
 # 4. Generate config
-python view-screen.py ut_<variant>_gemm.py --n-list 8192 --k-list 8192
+python view-screen.py ut_<variant>_gemm.py --n-list <N> --k-list <K>
 
-# 5. Copy as default (unsuffixed) config
-cp gfx950-GEMM-<VARIANT>-N=8192-K=8192.json /app/aiter/aiter/ops/triton/configs/gemm/gfx950-GEMM-<VARIANT>.json
+# 5. Copy config (use correct K naming for the kernel type)
+cp gfx950-GEMM-<VARIANT>-N=<N>-K=<K>.json /app/aiter/aiter/ops/triton/configs/gemm/
 ```
 
 ### Phase 3: Validate (on Triton 3.6 with new config)
 
 ```bash
-# Same rocprof --stats as baseline
+# SEQUENTIAL on single GPU — same method as baseline
 cd /app/aiter
 for M in 8 16 32 64 128 256 512 8192; do
-    HIP_VISIBLE_DEVICES=0 rocprof --stats python op_tests/op_benchmarks/triton/bench_gemm_<variant>.py --shape $M 8192 8192 --metric time --layout TN 2>/dev/null 1>/dev/null
+    HIP_VISIBLE_DEVICES=0 rocprof --stats python op_tests/op_benchmarks/triton/bench_gemm_<variant>.py \
+        --shape $M <N> <K> --metric time --layout TN 2>/dev/null 1>/dev/null
     grep "gemm_<variant>" results.stats.csv | head -1
     rm -f results.csv results.stats.csv results.copy_stats.csv results.sysinfo.txt
 done
 ```
 
-Compare `AverageNs` against Phase 1 baseline. Acceptance: geomean >= 1.0, no shape >3% regression.
+### Phase 4: Post-tuning Optimization
+
+After initial tuning and validation:
+1. Identify regressions vs baseline
+2. For regressed shapes, try retuning with wider search (more BN values, all num_stages, both nonkdim)
+3. Compare constrained (BM<=M) vs unconstrained per-shape — selectively apply constraint only where it helps
+4. Re-validate any changes sequentially
 
 ---
 
-## Kernel-Specific Notes
+## Completed Kernel Results
 
-### Kernels that need LDS-constrained block sizes (bf16 = 2 bytes/element)
-- `gemm_a16w16`, `gemm_a16w16_gated`, `gemm_a16w16_atomic`
-- These will hit LDS OOR with existing configs on Triton 3.6
-- Must reduce block sizes: max ~BM=128, BN=128, BK=128 for num_stages=2
-
-### Kernels that work without LDS changes (fp8 = 1 byte/element)
-- `gemm_a8w8`, `gemm_a8w8_blockscale`, `gemm_a8w8_per_token_scale`
-- These pass all tests on Triton 3.6 but still benefit from retuning
-
-### Kernels with additional constraints
-- `a8w8_blockscale`: BK must be 128
-- `afp4wfp4`: BK must be >= 256
-- `a16w8_blockscale`: BK must be multiple of 128
-
----
-
-## a8w8 Results (Completed)
-
+### gemm_a8w8 — 2.70x geomean, 0 regressions
 | M | Triton 3.4 (us) | Triton 3.6 (us) | Delta |
 |---|-----------------|-----------------|-------|
-| 8 | 56.0 | 12.1 | -78.4% |
-| 16 | 55.9 | 12.2 | -78.3% |
-| 32 | 56.2 | 13.7 | -75.6% |
-| 64 | 56.9 | 16.1 | -71.7% |
-| 128 | 56.7 | 21.8 | -61.6% |
-| 256 | 57.9 | 30.0 | -48.2% |
-| 512 | 60.1 | 43.4 | -27.8% |
-| 8192 | 841.3 | 555.9 | -33.9% |
+| 8 | 55.4 | 12.3 | -77.7% |
+| 16 | 55.9 | 12.3 | -78.0% |
+| 32 | 55.9 | 13.8 | -75.3% |
+| 64 | 56.3 | 16.4 | -70.8% |
+| 128 | 56.4 | 21.7 | -61.5% |
+| 256 | 57.6 | 30.1 | -47.8% |
+| 512 | 56.9 | 43.7 | -23.2% |
+| 8192 | 841.7 | 550.6 | -34.6% |
 
-Config: `gfx950-GEMM-A8W8.json` (default, unsuffixed)
+### gemm_a16w16 — 2.58x geomean, 2 regressions (72 shapes)
+Regressions:
+- M=256 N=128 K=2880: 8.7 -> 10.1us (+15.8%)
+- M=512 N=128 K=2880: 9.2 -> 10.2us (+11.2%)
+
+### gemm_afp4wfp4 — 1.73x geomean, 7 regressions (56 shapes)
+Regressions:
+- M=8 N=1280 K=8192: 4.6 -> 4.9us (+5.3%)
+- M=8 N=2112 K=7168: 4.5 -> 4.8us (+6.1%)
+- M=16 N=2112 K=7168: 4.8 -> 7.3us (+52.1%)
+- M=64 N=7168 K=2048: 6.4 -> 6.8us (+6.1%)
+- M=8 N=8192 K=8192: 9.8 -> 10.8us (+10.8%)
+- M=8192 N=8192 K=28672: 1203.3 -> 1421.1us (+18.1%)
+- M=8 N=16384 K=16384: 24.2 -> 27.2us (+12.4%)
+
+### Overall — 2.20x geomean across 136 shapes
+- 121 improved, 9 regressed, 6 neutral
