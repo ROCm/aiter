@@ -1,0 +1,418 @@
+{
+  "128-2112-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_32_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_7_SPLITK_BLOCK_SIZE_1024_EVEN_K_1_GRID_MN_528_cache_modifier_NONE.kd",
+    "time_ns": 13905.0
+  },
+  "128-24576-1536": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_1536_EVEN_K_1_GRID_MN_6144_cache_modifier_NONE.kd",
+    "time_ns": 269433.0
+  },
+  "128-3072-1536": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_32_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_4_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_1536_EVEN_K_1_GRID_MN_768_cache_modifier_NONE.kd",
+    "time_ns": 7492.0
+  },
+  "128-32768-512": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_512_EVEN_K_1_GRID_MN_8192_cache_modifier_NONE.kd",
+    "time_ns": 121367.0
+  },
+  "128-36864-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_7168_EVEN_K_1_GRID_MN_9216_cache_modifier_NONE.kd",
+    "time_ns": 1873235.0
+  },
+  "128-4096-512": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_16_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_512_EVEN_K_1_GRID_MN_2048_cache_modifier_CG.kd",
+    "time_ns": 6130.0
+  },
+  "128-4096-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_7168_EVEN_K_1_GRID_MN_1024_cache_modifier_NONE.kd",
+    "time_ns": 216339.0
+  },
+  "128-4608-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_64_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_7_SPLITK_BLOCK_SIZE_1024_EVEN_K_1_GRID_MN_576_cache_modifier_NONE.kd",
+    "time_ns": 23226.0
+  },
+  "128-7168-16384": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_16384_EVEN_K_1_GRID_MN_1792_cache_modifier_NONE.kd",
+    "time_ns": 844725.0
+  },
+  "128-7168-18432": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_18432_EVEN_K_1_GRID_MN_1792_cache_modifier_NONE.kd",
+    "time_ns": 948422.0
+  },
+  "128-7168-2048": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_32_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_8_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_2048_EVEN_K_1_GRID_MN_1792_cache_modifier_NONE.kd",
+    "time_ns": 12884.0
+  },
+  "128-7168-2304": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_32_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_4_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_2304_EVEN_K_1_GRID_MN_1792_cache_modifier_NONE.kd",
+    "time_ns": 13121.0
+  },
+  "128-8192-8192": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_8192_EVEN_K_1_GRID_MN_2048_cache_modifier_NONE.kd",
+    "time_ns": 483275.0
+  },
+  "16-2112-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_16_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_14_SPLITK_BLOCK_SIZE_512_EVEN_K_1_GRID_MN_132_cache_modifier_CG.kd",
+    "time_ns": 6665.0
+  },
+  "16-24576-1536": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_1536_EVEN_K_1_GRID_MN_768_cache_modifier_NONE.kd",
+    "time_ns": 37177.0
+  },
+  "16-3072-1536": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_4_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_1536_EVEN_K_1_GRID_MN_384_cache_modifier_NONE.kd",
+    "time_ns": 7366.0
+  },
+  "16-32768-512": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_512_EVEN_K_1_GRID_MN_1024_cache_modifier_NONE.kd",
+    "time_ns": 18725.0
+  },
+  "16-36864-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_7168_EVEN_K_1_GRID_MN_1152_cache_modifier_NONE.kd",
+    "time_ns": 267308.0
+  },
+  "16-4096-512": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_4_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_512_EVEN_K_1_GRID_MN_512_cache_modifier_NONE.kd",
+    "time_ns": 4329.0
+  },
+  "16-4096-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_7168_EVEN_K_1_GRID_MN_128_cache_modifier_NONE.kd",
+    "time_ns": 65307.0
+  },
+  "16-4608-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_16_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_8_SPLITK_BLOCK_SIZE_896_EVEN_K_1_GRID_MN_288_cache_modifier_CG.kd",
+    "time_ns": 8863.0
+  },
+  "16-7168-16384": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_16384_EVEN_K_1_GRID_MN_224_cache_modifier_NONE.kd",
+    "time_ns": 150990.0
+  },
+  "16-7168-18432": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_18432_EVEN_K_1_GRID_MN_224_cache_modifier_NONE.kd",
+    "time_ns": 169437.0
+  },
+  "16-7168-2048": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_4_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_2048_EVEN_K_1_GRID_MN_896_cache_modifier_NONE.kd",
+    "time_ns": 8516.0
+  },
+  "16-7168-2304": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_4_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_2304_EVEN_K_1_GRID_MN_896_cache_modifier_NONE.kd",
+    "time_ns": 9672.0
+  },
+  "16-8192-8192": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_8192_EVEN_K_1_GRID_MN_256_cache_modifier_NONE.kd",
+    "time_ns": 77999.0
+  },
+  "256-2112-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_32_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_7168_EVEN_K_1_GRID_MN_1056_cache_modifier_NONE.kd",
+    "time_ns": 25268.0
+  },
+  "256-24576-1536": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_1536_EVEN_K_1_GRID_MN_12288_cache_modifier_NONE.kd",
+    "time_ns": 532664.0
+  },
+  "256-3072-1536": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_32_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_4_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_1536_EVEN_K_1_GRID_MN_1536_cache_modifier_NONE.kd",
+    "time_ns": 9423.0
+  },
+  "256-32768-512": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_512_EVEN_K_1_GRID_MN_16384_cache_modifier_NONE.kd",
+    "time_ns": 238179.0
+  },
+  "256-36864-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_7168_EVEN_K_1_GRID_MN_18432_cache_modifier_NONE.kd",
+    "time_ns": 3652016.0
+  },
+  "256-4096-512": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_32_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_4_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_512_EVEN_K_1_GRID_MN_2048_cache_modifier_NONE.kd",
+    "time_ns": 7042.0
+  },
+  "256-4096-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_7168_EVEN_K_1_GRID_MN_2048_cache_modifier_NONE.kd",
+    "time_ns": 420659.0
+  },
+  "256-4608-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_64_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_8_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_7168_EVEN_K_1_GRID_MN_1152_cache_modifier_NONE.kd",
+    "time_ns": 34823.0
+  },
+  "256-7168-16384": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_16384_EVEN_K_1_GRID_MN_3584_cache_modifier_NONE.kd",
+    "time_ns": 1686354.0
+  },
+  "256-7168-18432": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_18432_EVEN_K_1_GRID_MN_3584_cache_modifier_NONE.kd",
+    "time_ns": 1896370.0
+  },
+  "256-7168-2048": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_128_BLOCK_SIZE_N_32_BLOCK_SIZE_K_128_GROUP_SIZE_M_4_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_2048_EVEN_K_1_GRID_MN_448_cache_modifier_NONE.kd",
+    "time_ns": 28968.0
+  },
+  "256-7168-2304": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_64_BLOCK_SIZE_N_32_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_2304_EVEN_K_1_GRID_MN_896_cache_modifier_CG.kd",
+    "time_ns": 20126.0
+  },
+  "256-8192-8192": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_8192_EVEN_K_1_GRID_MN_4096_cache_modifier_NONE.kd",
+    "time_ns": 949977.0
+  },
+  "32-2112-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_16_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_7_SPLITK_BLOCK_SIZE_1024_EVEN_K_1_GRID_MN_264_cache_modifier_NONE.kd",
+    "time_ns": 7713.0
+  },
+  "32-24576-1536": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_1536_EVEN_K_1_GRID_MN_1536_cache_modifier_NONE.kd",
+    "time_ns": 70708.0
+  },
+  "32-3072-1536": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_16_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_4_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_1536_EVEN_K_1_GRID_MN_384_cache_modifier_NONE.kd",
+    "time_ns": 6578.0
+  },
+  "32-32768-512": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_512_EVEN_K_1_GRID_MN_2048_cache_modifier_NONE.kd",
+    "time_ns": 32454.0
+  },
+  "32-36864-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_7168_EVEN_K_1_GRID_MN_2304_cache_modifier_NONE.kd",
+    "time_ns": 474052.0
+  },
+  "32-4096-512": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_16_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_4_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_512_EVEN_K_1_GRID_MN_512_cache_modifier_NONE.kd",
+    "time_ns": 4829.0
+  },
+  "32-4096-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_7168_EVEN_K_1_GRID_MN_256_cache_modifier_NONE.kd",
+    "time_ns": 66388.0
+  },
+  "32-4608-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_32_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_8_SPLITK_BLOCK_SIZE_896_EVEN_K_1_GRID_MN_288_cache_modifier_CG.kd",
+    "time_ns": 10579.0
+  },
+  "32-7168-16384": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_16384_EVEN_K_1_GRID_MN_448_cache_modifier_NONE.kd",
+    "time_ns": 262504.0
+  },
+  "32-7168-18432": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_18432_EVEN_K_1_GRID_MN_448_cache_modifier_NONE.kd",
+    "time_ns": 294630.0
+  },
+  "32-7168-2048": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_16_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_8_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_2048_EVEN_K_1_GRID_MN_896_cache_modifier_NONE.kd",
+    "time_ns": 8431.0
+  },
+  "32-7168-2304": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_16_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_4_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_2304_EVEN_K_1_GRID_MN_896_cache_modifier_NONE.kd",
+    "time_ns": 8990.0
+  },
+  "32-8192-8192": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_8192_EVEN_K_1_GRID_MN_512_cache_modifier_NONE.kd",
+    "time_ns": 128634.0
+  },
+  "512-2112-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_128_BLOCK_SIZE_N_32_BLOCK_SIZE_K_128_GROUP_SIZE_M_8_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_7168_EVEN_K_1_GRID_MN_264_cache_modifier_NONE.kd",
+    "time_ns": 63157.0
+  },
+  "512-24576-1536": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_1536_EVEN_K_1_GRID_MN_24576_cache_modifier_NONE.kd",
+    "time_ns": 1095419.0
+  },
+  "512-3072-1536": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_128_BLOCK_SIZE_N_32_BLOCK_SIZE_K_128_GROUP_SIZE_M_8_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_1536_EVEN_K_1_GRID_MN_384_cache_modifier_NONE.kd",
+    "time_ns": 16951.0
+  },
+  "512-32768-512": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_512_EVEN_K_1_GRID_MN_32768_cache_modifier_NONE.kd",
+    "time_ns": 479074.0
+  },
+  "512-36864-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_7168_EVEN_K_1_GRID_MN_36864_cache_modifier_NONE.kd",
+    "time_ns": 7267782.0
+  },
+  "512-4096-512": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_64_BLOCK_SIZE_N_32_BLOCK_SIZE_K_128_GROUP_SIZE_M_8_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_512_EVEN_K_1_GRID_MN_1024_cache_modifier_NONE.kd",
+    "time_ns": 8488.0
+  },
+  "512-4096-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_7168_EVEN_K_1_GRID_MN_4096_cache_modifier_NONE.kd",
+    "time_ns": 914231.0
+  },
+  "512-4608-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_128_BLOCK_SIZE_N_32_BLOCK_SIZE_K_128_GROUP_SIZE_M_4_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_7168_EVEN_K_1_GRID_MN_576_cache_modifier_NONE.kd",
+    "time_ns": 71329.0
+  },
+  "512-7168-16384": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_16384_EVEN_K_1_GRID_MN_7168_cache_modifier_NONE.kd",
+    "time_ns": 3277555.0
+  },
+  "512-7168-18432": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_18432_EVEN_K_1_GRID_MN_7168_cache_modifier_NONE.kd",
+    "time_ns": 3681524.0
+  },
+  "512-7168-2048": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_128_BLOCK_SIZE_N_32_BLOCK_SIZE_K_128_GROUP_SIZE_M_8_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_2048_EVEN_K_1_GRID_MN_896_cache_modifier_NONE.kd",
+    "time_ns": 25635.0
+  },
+  "512-7168-2304": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_128_BLOCK_SIZE_N_32_BLOCK_SIZE_K_128_GROUP_SIZE_M_8_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_2304_EVEN_K_1_GRID_MN_896_cache_modifier_NONE.kd",
+    "time_ns": 28810.0
+  },
+  "512-8192-8192": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_8192_EVEN_K_1_GRID_MN_8192_cache_modifier_NONE.kd",
+    "time_ns": 1912163.0
+  },
+  "64-2112-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_32_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_7_SPLITK_BLOCK_SIZE_1024_EVEN_K_1_GRID_MN_264_cache_modifier_NONE.kd",
+    "time_ns": 8947.0
+  },
+  "64-24576-1536": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_1536_EVEN_K_1_GRID_MN_3072_cache_modifier_NONE.kd",
+    "time_ns": 136702.0
+  },
+  "64-3072-1536": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_16_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_8_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_1536_EVEN_K_1_GRID_MN_768_cache_modifier_NONE.kd",
+    "time_ns": 7240.0
+  },
+  "64-32768-512": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_512_EVEN_K_1_GRID_MN_4096_cache_modifier_NONE.kd",
+    "time_ns": 62158.0
+  },
+  "64-36864-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_7168_EVEN_K_1_GRID_MN_4608_cache_modifier_NONE.kd",
+    "time_ns": 939227.0
+  },
+  "64-4096-512": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_32_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_4_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_512_EVEN_K_1_GRID_MN_512_cache_modifier_NONE.kd",
+    "time_ns": 4829.0
+  },
+  "64-4096-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_7168_EVEN_K_1_GRID_MN_512_cache_modifier_NONE.kd",
+    "time_ns": 112877.0
+  },
+  "64-4608-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_64_BLOCK_SIZE_N_32_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_7_SPLITK_BLOCK_SIZE_1024_EVEN_K_1_GRID_MN_144_cache_modifier_CG.kd",
+    "time_ns": 14651.0
+  },
+  "64-7168-16384": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_16384_EVEN_K_1_GRID_MN_896_cache_modifier_NONE.kd",
+    "time_ns": 490756.0
+  },
+  "64-7168-18432": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_18432_EVEN_K_1_GRID_MN_896_cache_modifier_NONE.kd",
+    "time_ns": 551762.0
+  },
+  "64-7168-2048": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_32_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_4_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_2048_EVEN_K_1_GRID_MN_896_cache_modifier_NONE.kd",
+    "time_ns": 9611.0
+  },
+  "64-7168-2304": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_32_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_4_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_2304_EVEN_K_1_GRID_MN_896_cache_modifier_NONE.kd",
+    "time_ns": 10611.0
+  },
+  "64-8192-8192": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_8192_EVEN_K_1_GRID_MN_1024_cache_modifier_NONE.kd",
+    "time_ns": 247601.0
+  },
+  "8-2112-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_14_SPLITK_BLOCK_SIZE_512_EVEN_K_1_GRID_MN_132_cache_modifier_CG.kd",
+    "time_ns": 6335.0
+  },
+  "8-24576-1536": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_1536_EVEN_K_1_GRID_MN_384_cache_modifier_NONE.kd",
+    "time_ns": 25833.0
+  },
+  "8-3072-1536": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_4_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_4_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_1536_EVEN_K_1_GRID_MN_384_cache_modifier_NONE.kd",
+    "time_ns": 6710.0
+  },
+  "8-32768-512": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_512_EVEN_K_1_GRID_MN_512_cache_modifier_NONE.kd",
+    "time_ns": 10495.0
+  },
+  "8-36864-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_7168_EVEN_K_1_GRID_MN_576_cache_modifier_NONE.kd",
+    "time_ns": 162977.0
+  },
+  "8-4096-512": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_4_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_4_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_512_EVEN_K_1_GRID_MN_512_cache_modifier_NONE.kd",
+    "time_ns": 3950.0
+  },
+  "8-4096-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_7168_EVEN_K_1_GRID_MN_64_cache_modifier_NONE.kd",
+    "time_ns": 64962.0
+  },
+  "8-4608-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_8_SPLITK_BLOCK_SIZE_896_EVEN_K_1_GRID_MN_288_cache_modifier_CG.kd",
+    "time_ns": 8298.0
+  },
+  "8-7168-16384": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_16384_EVEN_K_1_GRID_MN_112_cache_modifier_NONE.kd",
+    "time_ns": 150297.0
+  },
+  "8-7168-18432": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_18432_EVEN_K_1_GRID_MN_112_cache_modifier_NONE.kd",
+    "time_ns": 177282.0
+  },
+  "8-7168-2048": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_4_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_4_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_2048_EVEN_K_1_GRID_MN_896_cache_modifier_NONE.kd",
+    "time_ns": 8920.0
+  },
+  "8-7168-2304": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_4_BLOCK_SIZE_N_16_BLOCK_SIZE_K_128_GROUP_SIZE_M_4_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_2304_EVEN_K_1_GRID_MN_896_cache_modifier_NONE.kd",
+    "time_ns": 9873.0
+  },
+  "8-8192-8192": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_8192_EVEN_K_1_GRID_MN_128_cache_modifier_NONE.kd",
+    "time_ns": 76525.0
+  },
+  "8192-2112-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_128_BLOCK_SIZE_N_32_BLOCK_SIZE_K_128_GROUP_SIZE_M_8_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_7168_EVEN_K_1_GRID_MN_4224_cache_modifier_NONE.kd",
+    "time_ns": 371478.0
+  },
+  "8192-24576-1536": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_1536_EVEN_K_1_GRID_MN_393216_cache_modifier_NONE.kd",
+    "time_ns": 16412147.0
+  },
+  "8192-3072-1536": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_128_BLOCK_SIZE_N_32_BLOCK_SIZE_K_128_GROUP_SIZE_M_8_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_1536_EVEN_K_1_GRID_MN_6144_cache_modifier_NONE.kd",
+    "time_ns": 120933.0
+  },
+  "8192-32768-512": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_512_EVEN_K_1_GRID_MN_524288_cache_modifier_NONE.kd",
+    "time_ns": 7317025.0
+  },
+  "8192-36864-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_7168_EVEN_K_1_GRID_MN_589824_cache_modifier_NONE.kd",
+    "time_ns": 116044632.0
+  },
+  "8192-4096-512": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_64_BLOCK_SIZE_N_32_BLOCK_SIZE_K_128_GROUP_SIZE_M_8_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_512_EVEN_K_1_GRID_MN_16384_cache_modifier_NONE.kd",
+    "time_ns": 62255.0
+  },
+  "8192-4096-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_7168_EVEN_K_1_GRID_MN_65536_cache_modifier_NONE.kd",
+    "time_ns": 13002193.0
+  },
+  "8192-4608-7168": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_128_BLOCK_SIZE_N_32_BLOCK_SIZE_K_128_GROUP_SIZE_M_4_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_7168_EVEN_K_1_GRID_MN_9216_cache_modifier_NONE.kd",
+    "time_ns": 734374.0
+  },
+  "8192-7168-16384": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_16384_EVEN_K_1_GRID_MN_114688_cache_modifier_NONE.kd",
+    "time_ns": 51136116.0
+  },
+  "8192-7168-18432": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_18432_EVEN_K_1_GRID_MN_114688_cache_modifier_NONE.kd",
+    "time_ns": 57989981.0
+  },
+  "8192-7168-2048": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_128_BLOCK_SIZE_N_32_BLOCK_SIZE_K_128_GROUP_SIZE_M_8_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_2048_EVEN_K_1_GRID_MN_14336_cache_modifier_NONE.kd",
+    "time_ns": 346881.0
+  },
+  "8192-7168-2304": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_128_BLOCK_SIZE_N_32_BLOCK_SIZE_K_128_GROUP_SIZE_M_8_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_2304_EVEN_K_1_GRID_MN_14336_cache_modifier_NONE.kd",
+    "time_ns": 399830.0
+  },
+  "8192-8192-8192": {
+    "kernel_name": "_gemm_a8w8_blockscale_preshuffle_kernel_GROUP_K_128_GROUP_N_128_BLOCK_SIZE_M_8_BLOCK_SIZE_N_64_BLOCK_SIZE_K_128_GROUP_SIZE_M_1_NUM_KSPLIT_1_SPLITK_BLOCK_SIZE_8192_EVEN_K_1_GRID_MN_131072_cache_modifier_NONE.kd",
+    "time_ns": 29184081.0
+  }
+}
