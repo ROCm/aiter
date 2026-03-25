@@ -56,7 +56,7 @@ struct __attribute__((packed)) KernelArgs
     p2 _p22;
 };
 
-static CFG *get_cfg(AiterTensor *inp, AiterTensor *out, AiterTensor *w1, QuantType quant_type, bool do_weight)
+static CFG *get_cfg(aiter_tensor_t *inp, aiter_tensor_t *out, aiter_tensor_t *w1, QuantType quant_type, bool do_weight)
 {
     if (inp->dtype() == AITER_DTYPE_fp8 &&
         w1->dtype() == AITER_DTYPE_fp8 &&
@@ -143,23 +143,23 @@ static std::string get_heuristic_kernel(int m_num, int N, int blockk_size, CFG *
     return selected;
 }
 
-extern "C" __attribute__((visibility("default"))) void moe_stage1_g1u1(
-    AiterTensor *input,             // [token_cnt, model_dim] M,K
-    AiterTensor *w1,                // [expert, inter_dim*2, model_dim] N,K
-    AiterTensor *w2,                // [expert, model_dim, inter_dim]
-    AiterTensor *sorted_token_ids,  // [max_num_tokens_padded]
-    AiterTensor *sorted_expert_ids, // [max_num_m_blocks]
-    AiterTensor *num_valid_ids,     // [1]
-    AiterTensor *out,               // [token_cnt, topk, inter_dim*2]
+AITER_C_ITFS void moe_stage1_g1u1(
+    aiter_tensor_t *input,             // [token_cnt, model_dim] M,K
+    aiter_tensor_t *w1,                // [expert, inter_dim*2, model_dim] N,K
+    aiter_tensor_t *w2,                // [expert, model_dim, inter_dim]
+    aiter_tensor_t *sorted_token_ids,  // [max_num_tokens_padded]
+    aiter_tensor_t *sorted_expert_ids, // [max_num_m_blocks]
+    aiter_tensor_t *num_valid_ids,     // [1]
+    aiter_tensor_t *out,               // [token_cnt, topk, inter_dim*2]
     int inter_dim,
     const char *kernelName,
     int block_m,
     int ksplit,
     int activation,
     int quant_type,
-    AiterTensor *a1_scale,       // [token_cnt, 1], token scale
-    AiterTensor *w1_scale,       // [expert, 1, inter_dim], gate(up) scale
-    AiterTensor *sorted_weights, // [max_num_tokens_padded], do_weight==true need
+    aiter_tensor_t *a1_scale,       // [token_cnt, 1], token scale
+    aiter_tensor_t *w1_scale,       // [expert, 1, inter_dim], gate(up) scale
+    aiter_tensor_t *sorted_weights, // [max_num_tokens_padded], do_weight==true need
     hipStream_t stream)
 {
     const HipDeviceGuard device_guard(input->device_id);

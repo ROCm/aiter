@@ -158,18 +158,18 @@ std::string get_heuristic_kernel(std::string q_type,
 }
 const float f_log2E = log2f(expf(1));
 
-extern "C" __attribute__((visibility("default")))
-void pa_fwd(AiterTensor* Q,              //   [num_seqs, num_heads, head_size]
-            AiterTensor* K,              //   [num_blocks, num_kv_heads, head_size/x, block_size, x]
-            AiterTensor* V,              //   [num_blocks, num_kv_heads, block_size/X, head_size, X]
-            AiterTensor* block_tables,   //   [num_seqs, max_num_blocks_per_seq]
-            AiterTensor* context_lens,   //   [num_seqs]
+AITER_C_ITFS
+void pa_fwd(aiter_tensor_t* Q,              //   [num_seqs, num_heads, head_size]
+            aiter_tensor_t* K,              //   [num_blocks, num_kv_heads, head_size/x, block_size, x]
+            aiter_tensor_t* V,              //   [num_blocks, num_kv_heads, block_size/X, head_size, X]
+            aiter_tensor_t* block_tables,   //   [num_seqs, max_num_blocks_per_seq]
+            aiter_tensor_t* context_lens,   //   [num_seqs]
             int block_tables_stride0,
             int max_qlen,
-            AiterTensor* K_QScale,       //   nullable
-            AiterTensor* V_QScale,       //   nullable
-            AiterTensor* out_,           //   output tensor (pre-allocated by caller)
-            AiterTensor* qo_indptr,      //   nullable
+            aiter_tensor_t* K_QScale,       //   nullable
+            aiter_tensor_t* V_QScale,       //   nullable
+            aiter_tensor_t* out_,           //   output tensor (pre-allocated by caller)
+            aiter_tensor_t* qo_indptr,      //   nullable
             int high_precision,
             const char* kernelName_,     //   nullable
             hipStream_t stream)
@@ -309,23 +309,23 @@ void pa_fwd(AiterTensor* Q,              //   [num_seqs, num_heads, head_size]
                              stream});
 }
 
-extern "C" __attribute__((visibility("default")))
-void pa_ps_fwd(AiterTensor* Q,            //   [num_seqs, num_heads, head_size]
-               AiterTensor* K,            //   [num_blocks, num_kv_heads, head_size/x, block_size, x]
-               AiterTensor* V,            //   [num_blocks, num_kv_heads, block_size/X, head_size, X]
-               AiterTensor* kv_indptr,    //   [batch_size+1], kvlen prefix sum
-               AiterTensor* kv_indices,   //   [sum_kvlen], packed kv ids
-               AiterTensor* context_lens, //   [batch_size]
+AITER_C_ITFS
+void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_size]
+               aiter_tensor_t* K,            //   [num_blocks, num_kv_heads, head_size/x, block_size, x]
+               aiter_tensor_t* V,            //   [num_blocks, num_kv_heads, block_size/X, head_size, X]
+               aiter_tensor_t* kv_indptr,    //   [batch_size+1], kvlen prefix sum
+               aiter_tensor_t* kv_indices,   //   [sum_kvlen], packed kv ids
+               aiter_tensor_t* context_lens, //   [batch_size]
                float softmax_scale,
                int max_qlen,
-               AiterTensor* K_QScale,     //   nullable
-               AiterTensor* V_QScale,     //   nullable
-               AiterTensor* out_,         //   output (pre-allocated by caller)
-               AiterTensor* qo_indptr,    //   nullable
-               AiterTensor* work_indptr,  //   nullable
-               AiterTensor* work_info,    //   nullable
-               AiterTensor* splitData,    //   nullable
-               AiterTensor* splitLse,     //   nullable
+               aiter_tensor_t* K_QScale,     //   nullable
+               aiter_tensor_t* V_QScale,     //   nullable
+               aiter_tensor_t* out_,         //   output (pre-allocated by caller)
+               aiter_tensor_t* qo_indptr,    //   nullable
+               aiter_tensor_t* work_indptr,  //   nullable
+               aiter_tensor_t* work_info,    //   nullable
+               aiter_tensor_t* splitData,    //   nullable
+               aiter_tensor_t* splitLse,     //   nullable
                int mask,
                int high_precision,
                const char* kernelName_,   //   nullable
