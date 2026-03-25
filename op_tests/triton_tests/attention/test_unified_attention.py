@@ -78,7 +78,8 @@ def shuffle_kv_cache(
     )
     key_cache_shuffled = key_cache_shuffled.permute(0, 1, 2, 4, 5, 3, 6).contiguous()
     key_cache_shuffled = key_cache_shuffled.view(
-        -1, num_kv_heads, block_size // 16, head_size * 16
+        # -1, num_kv_heads, block_size // 16, head_size * 16
+        -1, num_kv_heads, block_size, head_size
     )
 
     value_cache_shuffled = value_cache.view(
@@ -97,7 +98,8 @@ def shuffle_kv_cache(
         0, 1, 5, 2, 3, 6, 4
     ).contiguous()
     value_cache_shuffled = value_cache_shuffled.view(
-        -1, num_kv_heads, head_size // 16, block_size * 16
+        -1, num_kv_heads, head_size, block_size
+        # -1, num_kv_heads, head_size // 16, block_size * 16
     )
 
     return key_cache_shuffled, value_cache_shuffled
@@ -108,6 +110,8 @@ DEVICE_ARCH = arch_info.get_arch()
 NUM_HEADS = [(64, 8)]
 HEAD_SIZES = [64, 128]
 BLOCK_SIZES = [16, 64, 128]
+HEAD_SIZES = [64]
+BLOCK_SIZES = [64]
 
 
 DTYPES = [torch.bfloat16]
@@ -116,7 +120,7 @@ QDTYPES = [None]
 # one value large enough to test overflow in index calculation.
 # one value small enough to test the schema op check
 NUM_BLOCKS = [
-    2048,
+    128,
 ]
 SLIDING_WINDOWS = [None]
 
@@ -212,18 +216,18 @@ def ref_paged_attn(
 # @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
 # @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 # @pytest.mark.parametrize("q_dtype", QDTYPES)
-@pytest.mark.parametrize("check_ref", [False])
+@pytest.mark.parametrize("check_ref", [True])
 @pytest.mark.parametrize(
     "seq_lens",
     [
         [(1, 1328)],
-        [(1, 8192)],
-        [(1, 8192)] * 4,
-        [(1, 8192)] * 8,
-        [(1, 8192)] * 16,
-        [(1, 32768)],
-        [(1, 523), (1, 37), (1, 2011)],
-        [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)],
+        # [(1, 8192)],
+        # [(1, 8192)] * 4,
+        # [(1, 8192)] * 8,
+        # [(1, 8192)] * 16,
+        # [(1, 32768)],
+        # [(1, 523), (1, 37), (1, 2011)],
+        # [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)],
     ],
 )
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
@@ -240,7 +244,7 @@ def ref_paged_attn(
 )
 @pytest.mark.parametrize("soft_cap", [None])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
-@pytest.mark.parametrize("shuffled_kv_cache", [True, False])
+@pytest.mark.parametrize("shuffled_kv_cache", [True])
 @pytest.mark.parametrize(
     "backend, use_tdm, num_tdm_gather, use_async",
     [

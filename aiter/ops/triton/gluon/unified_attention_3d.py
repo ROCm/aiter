@@ -360,11 +360,11 @@ def select_3d_config(
     TILE_SIZE = block_size * num_tdm_gather
 
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
-    num_segments = math.ceil(target_num_prgms / num_2d_prgms)
+    num_segments = math.ceil(target_num_prgms / num_2d_prgms) * 2
     num_segments = min(num_segments, MAX_SEGMENTS)
     num_segments = triton.next_power_of_2(num_segments)
     num_segments = min(num_segments, 128)
-    MIN_SEGMENTS = 16 if TILE_SIZE <= 16 else 8
+    MIN_SEGMENTS = min(8, MAX_SEGMENTS)
     num_segments = max(num_segments, MIN_SEGMENTS)
 
     # TODO: needs a better way to determine num_segments for TDM gather pipelined
@@ -373,7 +373,7 @@ def select_3d_config(
 
     if num_segments == MIN_SEGMENTS:
         reduce_num_warps = 1
-
+    
     config_parms = (
         attn_warps,
         BLOCK_M,
@@ -419,8 +419,16 @@ def select_3d_config(
             )
         layout_configs["TILE_SIZE"] = TILE_SIZE
 
+    total_num_wg = num_2d_prgms * num_segments
     waves_per_eu = 2
     occ = waves_per_eu * 4 // attn_warps
+
+    if total_num_wg < occ * target_num_prgms:
+        # occ too high, increase attn_warps to relax occ
+        attn_warps = (waves_per_eu * 4) // max(1, triton.next_power_of_2(total_num_wg // target_num_prgms))
+        attn_warps = max(attn_warps, 1)
+        attn_warps = min(attn_warps, 4)
+
     if (
         2 * attn_stages * TILE_SIZE * head_size * kv_cache_dtype.itemsize * occ
         >= 327680
@@ -508,7 +516,7 @@ def unified_attention(
         # key_cache: num_blocks, num_kv_heads, block_size // 16, head_size * 16
         # value_cache: num_blocks, num_kv_heads, head_size // 16, block_size * 16
         num_blocks, num_kv_heads, block_size, _ = k.shape
-        block_size = block_size * 16
+        # block_size = block_size * 16
     else:
         if use_tdm and num_tdm_gather > 1:
             # key_cache and value_cache: num_blocks, num_kv_heads, block_size, head_size
@@ -534,13 +542,14 @@ def unified_attention(
     #    = \sum_i[floor(query_len[i] / BLOCK_Q)] + num_seqs
     #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
     #    = floor(num_tokens / BLOCK_Q) + num_seqs
-    cu_count = get_num_sms()
+    # cu_count = get_num_sms()
+    # target_num_prgms = cu_count * 4
+    target_num_prgms = 256
     ALL_DECODE = max_seqlen_q == 1
     if ALL_DECODE:
         total_num_q_blocks = num_seqs
     else:
         total_num_q_blocks = num_tokens // BLOCK_Q + num_seqs
-    target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     # if batch contains a prefill
     if use_2d_kernel(
@@ -608,7 +617,8 @@ def unified_attention(
             dtype=torch.float32,
             device=q.device,
         )
-
+        print()
+        print(attn_config)
         attn_impl[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,
