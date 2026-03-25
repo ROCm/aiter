@@ -187,7 +187,7 @@ def _rotate_mxfp_quantize_k_kernel(
     offs_t = pid * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
     mask = offs_t < num_tokens
 
-    offs_d = tl.arange(0, BLOCK_D)    
+    offs_d = tl.arange(0, BLOCK_D)
     offs_dq = tl.arange(0, BLOCK_D // 2)
     offs_ds = tl.arange(0, BLOCK_D // SCALE_GROUP_SIZE)
 
@@ -231,13 +231,13 @@ def _rotate_mxfp_quantize_k_kernel(
         qk_rot_tile, mask, tl.uint8
     )
 
-    tl.store(qk_descale_ptr, qk_descale, mask=mask & (offs_ds[None, :] < D // SCALE_GROUP_SIZE))
-
     tl.store(
-        qk_quant_ptr,
-        qk_quant_tile,
-        mask=mask & (offs_dq[None, :] < D // 2)
+        qk_descale_ptr,
+        qk_descale,
+        mask=mask & (offs_ds[None, :] < D // SCALE_GROUP_SIZE),
     )
+
+    tl.store(qk_quant_ptr, qk_quant_tile, mask=mask & (offs_dq[None, :] < D // 2))
 
 
 # @triton.jit

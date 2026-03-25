@@ -14,6 +14,7 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 
+
 def select_2d_config(
     block_size,
     head_size,
@@ -34,7 +35,7 @@ def select_2d_config(
     max_num_stages_2d = 4
     if head_size > 128:
         max_num_stages_2d = 2
-    if all_decode == False:
+    if not all_decode:
         num_stages_2d = 1
         num_warps = 2
     else:
@@ -218,11 +219,12 @@ def unified_attention(
 
     head_size = v.shape[-1]
     if sage_mxfp4:
+        # in mxfp4, two fp4 elements are packed into one byte for q and k tensors
         ROPE_SIZE = k.shape[-1] * 2 - v.shape[-1]
     else:
         ROPE_SIZE = k.shape[-1] - v.shape[-1]
     HAS_ROPE = ROPE_SIZE > 0
-    
+
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]

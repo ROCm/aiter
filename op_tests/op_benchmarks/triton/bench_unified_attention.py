@@ -274,7 +274,9 @@ def run_benchmark(custom, args):
         else:
             sinks = None
 
-        output = torch.empty(sum(seqlens_q), num_query_heads, D_HEAD_V, dtype=dtype, device="cuda")
+        output = torch.empty(
+            sum(seqlens_q), num_query_heads, D_HEAD_V, dtype=dtype, device="cuda"
+        )
         maybe_quantized_query = query
         maybe_quantized_key_cache = key_cache
         maybe_quantized_value_cache = value_cache
@@ -379,11 +381,7 @@ def run_benchmark(custom, args):
             tag = (
                 "fp8_full"
                 if args.fp8_full
-                else (
-                    "fp8"
-                    if args.fp8
-                    else "sagev2" if args.sagev2 else "default"
-                )
+                else ("fp8" if args.fp8 else "sagev2" if args.sagev2 else "default")
             )
             config_str = (
                 f"BATCH={BATCH}, HQ={HQ}, HK={HK}, "
@@ -537,7 +535,12 @@ def parse_args():
     )
     parser.add_argument("-softcap", type=float, default=0.0)
     parser.add_argument("-dv", type=int, default=0, help="optional V head size")
-    parser.add_argument("-rope_size", type=int, default=0, help="RoPE size for MLA workloads (0=disabled). When >0, V head dim = d - rope_size")
+    parser.add_argument(
+        "-rope_size",
+        type=int,
+        default=0,
+        help="RoPE size for MLA workloads (0=disabled). When >0, V head dim = d - rope_size",
+    )
     parser.add_argument(
         "-decode",
         nargs="?",  # 0 or 1 values

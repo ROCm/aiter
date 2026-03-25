@@ -75,6 +75,7 @@ def q_load(
         cache_modifier=Q_cache_modifier,
     )
 
+
 @triton.jit
 def kv_load(
     kv_cache_ptr,
@@ -110,7 +111,7 @@ def kv_load(
 def qk_dot(
     Q,
     K,
-    qk_scale, # 
+    qk_scale,  #
     q_descale,
     k_descale,
     SAGE_MXFP4: tl.constexpr = False,
@@ -260,8 +261,6 @@ def kernel_unified_attention_2d(
         dim_mask_qk = dim_mask
         scale_dim_mask = dim_mask
 
-   
-
     query_mask_0 = query_pos < cur_batch_query_len
     query_mask_1 = query_offset_1 < num_query_heads
 
@@ -281,8 +280,8 @@ def kernel_unified_attention_2d(
         query_mask_0,
         query_mask_1,
         dim_mask_qk,
-        Q_cache_modifier,)
-
+        Q_cache_modifier,
+    )
 
     q_scale_loaded = None
     if SAGE_MXFP4:
@@ -298,7 +297,7 @@ def kernel_unified_attention_2d(
             scale_dim_mask,
             "",
         )
-    
+
     if HAS_ROPE:
         if ROPE_SIZE_PADDED != ROPE_SIZE:
             if SAGE_MXFP4:
@@ -309,7 +308,7 @@ def kernel_unified_attention_2d(
         else:
             rope_dim_mask = tl.full((1,), 1, dtype=tl.int1)
             rope_scale_dim_mask = tl.full((1,), 1, dtype=tl.int1)
-        
+
         Q_rope = q_load(
             query_ptr,
             query_offset_0,
@@ -336,7 +335,7 @@ def kernel_unified_attention_2d(
                 rope_scale_dim_mask,
                 "",
             )
-    
+
     block_table_offset = seq_idx * block_table_stride
 
     if not USE_SINKS:
@@ -435,8 +434,6 @@ def kernel_unified_attention_2d(
                 block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
             ).to(tl.int64)
 
-        
-
         # K : (HEAD_SIZE, TILE_SIZE)
         K = kv_load(
             key_cache_ptr,
@@ -454,7 +451,6 @@ def kernel_unified_attention_2d(
             KV_cache_modifier,
         )
 
-    
         S = tl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32)
 
         k_scale_loaded = None
@@ -539,7 +535,7 @@ def kernel_unified_attention_2d(
                 BLOCK_SIZE,
                 KV_cache_modifier,
             )
-        
+
         S += qk_dot(
             Q,
             K,
@@ -773,8 +769,10 @@ def kernel_unified_attention_3d(
 
     if HAS_ROPE:
         if SAGE_MXFP4:
-            offs_rope = tl.arange(HEAD_SIZE//2, (HEAD_SIZE + ROPE_SIZE_PADDED)//2)
-            offs_rope_scale = tl.arange(HEAD_SIZE//32, (HEAD_SIZE + ROPE_SIZE_PADDED)//32)
+            offs_rope = tl.arange(HEAD_SIZE // 2, (HEAD_SIZE + ROPE_SIZE_PADDED) // 2)
+            offs_rope_scale = tl.arange(
+                HEAD_SIZE // 32, (HEAD_SIZE + ROPE_SIZE_PADDED) // 32
+            )
         else:
             offs_rope = tl.arange(HEAD_SIZE, HEAD_SIZE + ROPE_SIZE_PADDED)
             offs_rope_scale = None
@@ -812,8 +810,8 @@ def kernel_unified_attention_3d(
         query_mask_0,
         query_mask_1,
         dim_mask_qk,
-        "",)
-
+        "",
+    )
 
     q_scale_loaded = None
     if SAGE_MXFP4:
@@ -829,9 +827,7 @@ def kernel_unified_attention_3d(
             scale_dim_mask,
             "",
         )
-    
-    
-    
+
     if HAS_ROPE:
         if ROPE_SIZE_PADDED != ROPE_SIZE:
             if SAGE_MXFP4:
@@ -842,7 +838,7 @@ def kernel_unified_attention_3d(
         else:
             rope_dim_mask = tl.full((1,), 1, dtype=tl.int1)
             rope_scale_dim_mask = tl.full((1,), 1, dtype=tl.int1)
-        
+
         Q_rope = q_load(
             query_ptr,
             query_offset_0,
@@ -869,8 +865,7 @@ def kernel_unified_attention_3d(
                 rope_scale_dim_mask,
                 "",
             )
-    
-    
+
     block_table_offset = seq_idx * block_table_stride
 
     if USE_SINKS:
@@ -949,8 +944,7 @@ def kernel_unified_attention_3d(
             ).to(tl.int64)
 
         S = tl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32)
-        
-        
+
         # K : (HEAD_SIZE, TILE_SIZE)
         K = kv_load(
             key_cache_ptr,
@@ -1050,7 +1044,7 @@ def kernel_unified_attention_3d(
                 BLOCK_SIZE,
                 KV_cache_modifier,
             )
-        
+
         S += qk_dot(
             Q,
             K,
