@@ -154,6 +154,8 @@ def kernel_unified_attention_2d(
     TILE_SIZE: tl.constexpr,  # int must be power of 2
     HEAD_SIZE: tl.constexpr,  # int
     HEAD_SIZE_PADDED: tl.constexpr,  # int, must be power of 2
+    HEAD_SIZE_V: tl.constexpr,  # int
+    HEAD_SIZE_V_PADDED: tl.constexpr,  # int, must be power of 2
     ROPE_SIZE: tl.constexpr,  # int
     ROPE_SIZE_PADDED: tl.constexpr,  # int, must be power of 2
     USE_ALIBI_SLOPES: tl.constexpr,  # bool
@@ -220,6 +222,7 @@ def kernel_unified_attention_2d(
 
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+    offs_dv = tl.arange(0, HEAD_SIZE_V_PADDED)
     if SAGE_MXFP4:  # per token mxfp4
         offs_d_qk = tl.arange(0, HEAD_SIZE_PADDED // 2)
         offs_d_scale = tl.arange(0, HEAD_SIZE_PADDED // 32)
@@ -248,6 +251,7 @@ def kernel_unified_attention_2d(
     #     + offs_d_qk[None, :]
     # )
 
+    # TODO: should be actually possible to not do masked dim for head as HEAD_SIZE is always pow2
     if HEAD_SIZE_PADDED != HEAD_SIZE:
         dim_mask = offs_d < HEAD_SIZE
         if SAGE_MXFP4:
@@ -260,6 +264,11 @@ def kernel_unified_attention_2d(
         dim_mask = tl.full((1,), 1, dtype=tl.int1)
         dim_mask_qk = dim_mask
         scale_dim_mask = dim_mask
+
+    if HEAD_SIZE_V_PADDED != HEAD_SIZE_V:
+        dim_mask_v = offs_dv < HEAD_SIZE_V
+    else:
+        dim_mask_v = tl.full((1,), 1, dtype=tl.int1)
 
     query_mask_0 = query_pos < cur_batch_query_len
     query_mask_1 = query_offset_1 < num_query_heads
@@ -530,7 +539,7 @@ def kernel_unified_attention_2d(
                 stride_v_cache_1,
                 stride_v_cache_2,
                 stride_v_cache_3,
-                dim_mask[None, :],
+                dim_mask_v[None, :],
                 tile_mask[:, None],
                 BLOCK_SIZE,
                 KV_cache_modifier,
@@ -611,7 +620,7 @@ def kernel_unified_attention_2d(
                 stride_v_cache_1,
                 stride_v_cache_2,
                 stride_v_cache_3,
-                dim_mask[None, :],
+                dim_mask_v[None, :],
                 tile_mask[:, None],
                 BLOCK_SIZE,
                 KV_cache_modifier,

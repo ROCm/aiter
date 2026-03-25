@@ -189,8 +189,8 @@ def check_mxfp4_quant_args_get_strides(
 def unified_attention(
     q,  # t,h,d+r
     k,  # num_blks, blk_size, hk, d+r
-    v,  # num_blks, blk_size, hk, d
-    out,  # t,h,d
+    v,  # num_blks, blk_size, hk, dv
+    out,  # t,h,dv
     cu_seqlens_q,
     max_seqlen_q,
     seqused_k,
@@ -215,13 +215,20 @@ def unified_attention(
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
 
-    head_size = v.shape[-1]
+    head_size_v = v.shape[-1]
+    head_size_qk = k.shape[-1]
     if sage_mxfp4:
-        # in mxfp4, two fp4 elements are packed into one byte for q and k tensors
-        ROPE_SIZE = k.shape[-1] * 2 - v.shape[-1]
-    else:
-        ROPE_SIZE = k.shape[-1] - v.shape[-1]
-    HAS_ROPE = ROPE_SIZE > 0
+        head_size_qk *= 2
+    
+    is_head_size_pow2 = head_size_qk & (head_size_qk - 1) == 0
+    
+    rope_size = 0
+    if not is_head_size_pow2:
+        lora = triton.next_power_of_2(head_size_qk) // 2
+        rope_size = head_size_qk - lora
+        head_size_qk = lora
+
+    HAS_ROPE = rope_size > 0
 
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
@@ -280,7 +287,7 @@ def unified_attention(
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
     if use_2d_kernel(
-        head_size,
+        head_size_qk,
         SLIDING_WINDOW,
         ALL_DECODE,
         max_seqlen_q,
@@ -290,7 +297,7 @@ def unified_attention(
     ):
         config = select_2d_config(
             block_size,
-            head_size,
+            head_size_qk,
             SLIDING_WINDOW,
             ALL_DECODE,
             max_seqlen_q,
@@ -336,8 +343,10 @@ def unified_attention(
             output_stride_1=out.stride(1),
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
             BLOCK_SIZE=block_size,
-            HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+            HEAD_SIZE=head_size_qk,
+            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size_qk),
+            HEAD_SIZE_V=head_size_v,
+            HEAD_SIZE_V_PADDED=triton.next_power_of_2(head_size_v),
             USE_ALIBI_SLOPES=use_alibi_slopes,
             USE_QQ_BIAS=use_qq_bias,
             USE_SOFTCAP=(softcap > 0),
@@ -363,14 +372,14 @@ def unified_attention(
             ALL_DECODE=ALL_DECODE,
             SAGE_MXFP4=sage_mxfp4,
             HAS_ROPE=HAS_ROPE,
-            ROPE_SIZE=ROPE_SIZE,
-            ROPE_SIZE_PADDED=triton.next_power_of_2(ROPE_SIZE) if HAS_ROPE else 0,
+            ROPE_SIZE=rope_size,
+            ROPE_SIZE_PADDED=triton.next_power_of_2(rope_size),
             **config,
         )
 
     else:
         attn_config, reduce_config = select_3d_config(
-            head_size,
+            head_size_qk,
             block_size,
             q.element_size(),
             max_seqlen_k,
@@ -382,7 +391,7 @@ def unified_attention(
             q.shape[0],
             num_query_heads,
             NUM_SEGMENTS,
-            triton.next_power_of_2(head_size),
+            triton.next_power_of_2(head_size_qk),
             dtype=torch.float32,
             device=q.device,
         )
@@ -427,8 +436,8 @@ def unified_attention(
             query_scale_stride_2=query_scale_stride_2,
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
             BLOCK_SIZE=block_size,
-            HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+            HEAD_SIZE=head_size_qk,
+            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size_qk),
             USE_ALIBI_SLOPES=use_alibi_slopes,
             USE_QQ_BIAS=use_qq_bias,
             USE_SOFTCAP=(softcap > 0),
@@ -453,8 +462,8 @@ def unified_attention(
             ALL_DECODE=ALL_DECODE,
             SAGE_MXFP4=sage_mxfp4,
             HAS_ROPE=HAS_ROPE,
-            ROPE_SIZE=ROPE_SIZE,
-            ROPE_SIZE_PADDED=triton.next_power_of_2(ROPE_SIZE) if HAS_ROPE else 0,
+            ROPE_SIZE=rope_size,
+            ROPE_SIZE_PADDED=triton.next_power_of_2(rope_size),
             **attn_config,
         )
         reduce_segments[(q.shape[0], num_query_heads)](

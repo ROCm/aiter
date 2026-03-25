@@ -91,8 +91,6 @@ def create_benchmark_configs(custom, args):
     sk = args.sq if not args.sk else args.sk
     head_size = 128 if not args.d else args.d
     head_size_v = head_size if not args.dv else args.dv
-    if args.rope_size > 0:
-        head_size_v = head_size - args.rope_size
     decode_p = args.decode
     x_names = [
         "BATCH",
@@ -258,6 +256,9 @@ def run_benchmark(custom, args):
             value_cache = key_cache[:, :, :, :D_HEAD_V]
         else:
             value_cache = torch.randn_like(key_cache)
+        
+        
+        
         cu_seqlens_q = torch.zeros(len(seqlens_q) + 1, dtype=torch.int32, device="cuda")
         cu_seqlens_q[1:] = seqlens_q.cumsum(dim=0, dtype=torch.int32)
         cu_seqlens_k = torch.zeros(len(seqlens_k) + 1, dtype=torch.int32, device="cuda")
