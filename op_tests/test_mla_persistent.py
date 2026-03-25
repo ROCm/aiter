@@ -11,9 +11,70 @@ import itertools
 import argparse
 import pandas as pd
 import math
+import os
+from pathlib import Path
+from typing import Union
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
+
+
+def dump_mla_metadata_v1_txt(
+    filepath: Union[str, Path],
+    *,
+    batch: int,
+    q_seq_len: int,
+    max_num_blocks: int,
+    work_q: int,
+    work_kv: int,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    col_width: int = 5,
+) -> None:
+    """
+    Dump MLA v1 persistent metadata to a text file.
+
+    Per-TG columns use the first work item in that TG (work_indptr[tg]).
+    work_info_set columns: batch_idx, partial_index, q_start, q_end, kv_start, kv_end, ...
+    """
+    path = Path(filepath)
+    wi = work_indptr.detach().cpu().to(torch.int64).tolist()
+    wis = work_info_set.detach().cpu().to(torch.int32)
+    total_tgs = len(wi) - 1
+    w = col_width
+
+    def tg_first_work_row(tg: int):
+        if tg < 0 or tg >= total_tgs:
+            return None
+        w0 = int(wi[tg])
+        w1 = int(wi[tg + 1])
+        if w0 >= w1 or w0 >= wis.shape[0]:
+            return None
+        return wis[w0]
+
+    def line_for(name: str, pick) -> str:
+        parts = []
+        for tg in range(total_tgs):
+            row = tg_first_work_row(tg)
+            parts.append(pick(row) if row is not None else 0)
+        nums = " ".join(f"{v:>{w}}" for v in parts)
+        return f"{name}:\n    {nums}\n"
+
+    work_ind_line = " ".join(f"{int(v):>{w}}" for v in wi)
+
+    lines = [
+        f"batch:{batch}, q_seq_len:{q_seq_len}, max_num_blocks:{max_num_blocks}, "
+        f"work_q:{work_q}, work_kv:{work_kv}, total_tgs:{total_tgs}\n",
+        line_for("bs_indptr", lambda r: int(r[0].item())),
+        line_for("partial_indptr", lambda r: int(r[1].item())),
+        line_for("w_q_start", lambda r: int(r[2].item())),
+        line_for("w_q_end", lambda r: int(r[3].item())),
+        line_for("w_kv_start", lambda r: int(r[4].item())),
+        line_for("w_kv_end", lambda r: int(r[5].item())),
+        f"work_indptr:\n    {work_ind_line}\n",
+    ]
+    path.write_text("".join(lines), encoding="utf-8")
+
 
 # current supported case in ps decode MLA: mtp == 0, 1, 2, 3 (decode_qlen = 1, 2, 3, 4)
 # qdtype bf16, kdtype bf16: nhead16
@@ -393,6 +454,13 @@ def torch_mla_extend_split_kv(
         or (
             get_gfx() == "gfx950"
             and nheads == 32
+            and is_fp8_q
+            and is_fp8_kvc
+            and max_seqlen_q == 4
+        )
+        or (
+            get_gfx() == "gfx950"
+            and nheads == 8
             and is_fp8_q
             and is_fp8_kvc
             and max_seqlen_q == 4
@@ -1019,11 +1087,34 @@ def test_mla(
         dtype_kv=kvtype,
     )
 
+    if os.environ.get("DUMP_MLA_METADATA", ""):
+        kv_gran = max(page_size, 16)
+        max_num_blocks = max(
+            (int(seq_lens_kv[i].item()) + kv_gran - 1) // kv_gran
+            for i in range(batch_size)
+        )
+        num_works = int(work_indptr[-1].item())
+        if num_works > 0:
+            r0 = work_info_set[0, :6].detach().cpu()
+            hdr_work_q = int(r0[3].item() - r0[2].item())
+        else:
+            hdr_work_q = int(max_seqlen_qo)
+        dump_mla_metadata_v1_txt(
+            os.environ.get("MLA_METADATA_DUMP_PATH", "mla_metadata_dump.txt"),
+            batch=batch_size,
+            q_seq_len=int(max_seqlen_qo),
+            max_num_blocks=max_num_blocks,
+            work_q=hdr_work_q,
+            work_kv=kv_gran,
+            work_indptr=work_indptr,
+            work_info_set=work_info_set,
+        )
+
     # """ test code for decode_update_mla_metadata_v1 """
     # torch.set_printoptions(linewidth=200)
     # print(f"{kv_indptr=}")
     # print(f"{work_indptr=}")
-    # print(f"{work_info_set[:32]=}")
+    # print(f"{work_info_set[:work_indptr[-1].item()]=}")
     # print(f"{reduce_indptr=}")
     # print(f"{reduce_final_map=}")
     # print(f"{reduce_partial_map=}")
@@ -1287,7 +1378,7 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
-            return_lse=False,
+            return_lse=True,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -1300,7 +1391,14 @@ def test_mla(
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
+        import pdb
 
+        pdb.set_trace()
+        err = checkAllclose(
+            lse_ref,
+            attn_lse,
+            msg=f"mla_decode-absorb_fp8    [golden vs attn_lse]: {us_asm_decode:>8.2f} us......",
+        )
         err = checkAllclose(
             out_ref_fp8,
             out_asm,
