@@ -1,7 +1,5 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
-from enum import Enum
-
 import triton
 import torch
 from aiter.ops.triton.utils.device_info import get_num_sms
