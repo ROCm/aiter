@@ -244,7 +244,7 @@ jobs:
   triton-mi355:
     if: ${{ contains(github.event.pull_request.labels.*.name, 'ci:triton-355') }}
     name: Triton Tests (MI355) / Shard ${{ matrix.shard }}
-    runs-on: linux-aiter-mi355-1
+    runs-on: linux-aiter-mi350-1
     needs: [split_triton_tests, build-triton, check-signal]
     strategy:
       fail-fast: false
