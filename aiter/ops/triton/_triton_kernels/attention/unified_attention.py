@@ -189,6 +189,7 @@ def kernel_unified_attention_2d(
     IS_PAGING: tl.constexpr = True,  # bool
     PRELOAD_V: tl.constexpr = False,  # bool
     HAS_ROPE: tl.constexpr = False,  # bool, not implemented yet
+    IS_CAUSAL: tl.constexpr = True,  # bool, not implemented yet
 ):
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
@@ -381,18 +382,22 @@ def kernel_unified_attention_2d(
             qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
         )  # shape: [BLOCK_M]
 
-    # compute the length of the longest sequence prefix spanned by any
-    # query token in the current q_block (q_block_local_idx)
-    max_seq_prefix_len = (
-        context_len
-        + q_block_local_idx * BLOCK_Q
-        + (BLOCK_M - 1) // num_queries_per_kv
-        + 1
-    )
+    
+    if IS_CAUSAL:
+        # compute the length of the longest sequence prefix spanned by any
+        # query token in the current q_block (q_block_local_idx)
+        max_seq_prefix_len = (
+            context_len
+            + q_block_local_idx * BLOCK_Q
+            + (BLOCK_M - 1) // num_queries_per_kv
+            + 1
+        )
 
-    # adjust for potential padding in the last q_block by considering the
-    # actual sequence length
-    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+        # adjust for potential padding in the last q_block by considering the
+        # actual sequence length
+        max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    else:
+        max_seq_prefix_len = seq_len
 
     # calculate the number of tiles that need to be processed to
     # cover the longest sequence prefix (due to causal masking, tiles beyond
@@ -558,7 +563,11 @@ def kernel_unified_attention_2d(
             # softcap here uses exp2 and consumes RCP_LN2 conversion.
             # multiply by RCP_LN2 again to be used in later exp2
             S = apply_softcap(S, softcap) * RCP_LN2
-        seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+        
+        if IS_CAUSAL:
+            seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+        else:
+            seq_mask = seq_offset[None, :] < seq_len
 
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
@@ -727,6 +736,7 @@ def kernel_unified_attention_3d(
     HAS_ROPE: tl.constexpr = False,  # bool
     ROPE_SIZE: tl.constexpr = 0,  # int
     ROPE_SIZE_PADDED: tl.constexpr = 0,  # int, must be power of 2
+    IS_CAUSAL: tl.constexpr = True,  # bool
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -921,18 +931,21 @@ def kernel_unified_attention_3d(
             qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
         )  # shape: [BLOCK_M]
 
-    # compute the length of the longest sequence prefix spanned by any
-    # query token in the current q_block (q_block_local_idx)
-    max_seq_prefix_len = (
-        context_len
-        + q_block_local_idx * BLOCK_Q
-        + (BLOCK_M - 1) // num_queries_per_kv
-        + 1
-    )
+    if IS_CAUSAL:
+        # compute the length of the longest sequence prefix spanned by any
+        # query token in the current q_block (q_block_local_idx)
+        max_seq_prefix_len = (
+            context_len
+            + q_block_local_idx * BLOCK_Q
+            + (BLOCK_M - 1) // num_queries_per_kv
+            + 1
+        )
 
-    # adjust for potential padding in the last q_block by considering the
-    # actual sequence length
-    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+        # adjust for potential padding in the last q_block by considering the
+        # actual sequence length
+        max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    else:
+        max_seq_prefix_len = seq_len
 
     # calculate the number of tiles that need to be processed to
     # cover the longest sequence prefix (due to causal masking, tiles beyond
@@ -1077,7 +1090,11 @@ def kernel_unified_attention_3d(
             # softcap here uses exp2 and consumes RCP_LN2 conversion.
             # multiply by RCP_LN2 again to be used in later exp2
             S = apply_softcap(S, softcap) * RCP_LN2
-        seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+        
+        if IS_CAUSAL:
+            seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+        else:
+            seq_mask = seq_offset[None, :] < seq_len
 
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")

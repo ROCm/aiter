@@ -210,7 +210,7 @@ def unified_attention(
     sinks=None,
     sage_mxfp4=False,
 ):
-    assert causal, "Only causal attention is supported"
+    # assert causal, "Only causal attention is supported"
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -286,7 +286,7 @@ def unified_attention(
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
-    if use_2d_kernel(
+    if True or use_2d_kernel(
         head_size_qk,
         SLIDING_WINDOW,
         ALL_DECODE,
@@ -374,6 +374,7 @@ def unified_attention(
             HAS_ROPE=HAS_ROPE,
             ROPE_SIZE=rope_size,
             ROPE_SIZE_PADDED=triton.next_power_of_2(rope_size),
+            IS_CAUSAL=causal,
             **config,
         )
 
@@ -466,6 +467,7 @@ def unified_attention(
             HAS_ROPE=HAS_ROPE,
             ROPE_SIZE=rope_size,
             ROPE_SIZE_PADDED=triton.next_power_of_2(rope_size),
+            IS_CAUSAL=causal,
             **attn_config,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
