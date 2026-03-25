@@ -400,8 +400,7 @@
     },
     "module_gemm_a8w8_blockscale_asm": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_flatmm_a8w8_blockscale.cu'",
-            "f'{AITER_CSRC_DIR}/pybind/flatmm_a8w8_blockscale_asm_pybind.cu'"
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_flatmm_a8w8_blockscale.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
