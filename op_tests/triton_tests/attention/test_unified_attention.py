@@ -33,6 +33,7 @@ def ref_paged_attn(
     sliding_window: Optional[int] = None,
     soft_cap: Optional[float] = None,
     sinks: Optional[torch.Tensor] = None,
+    causal: bool = True,
 ) -> torch.Tensor:
     num_seqs = len(query_lens)
     block_tables = block_tables.cpu().numpy()
@@ -60,7 +61,10 @@ def ref_paged_attn(
             v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
         attn = torch.einsum("qhd,khd->hqk", q, k).float()
         empty_mask = torch.ones(query_len, kv_len, device=q.device)
-        mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
+        if causal:
+            mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
+        else: # no causal masking
+            mask = torch.zeros_like(empty_mask).bool()
         if sliding_window is not None:
             sliding_window_mask = (
                 torch.triu(

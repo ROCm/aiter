@@ -364,6 +364,7 @@ def run_benchmark(custom, args):
                 sliding_window=args.sliding_window,
                 soft_cap=soft_cap,
                 sinks=sinks,
+                causal=causal
             )
             if args.sagev2:
                 atol, rtol = 3.5e-1, 2.5e-1
@@ -505,6 +506,13 @@ def parse_args():
     )
 
     parser.add_argument(
+        "-causal",
+        action="store_true",
+        default=False,
+        help="apply causal masking",
+    )
+
+    parser.add_argument(
         "-equal_seqlens",
         action="store_true",
         default=False,
@@ -579,7 +587,6 @@ arg_to_torch_dtype = {
 def main():
     args = parse_args()
     args.layout = "thd"
-    args.causal = True
     if args.model:
         if args.causal is None:  # User didn't specify -causal
             args.causal = True
