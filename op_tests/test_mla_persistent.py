@@ -403,9 +403,20 @@ def torch_mla_extend_split_kv(
     elif nheads in range(32, 128 + 1, 16):
         # we use nhead=16 to simulate such cases by customized metadata
         # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
-        q_ratio = nheads // 16
-        total_s = total_q * q_ratio
+        fold_factor = nheads // 16
+        use_qseqlen_fold = (
+            get_gfx() == "gfx950"
+            and is_fp8_q
+            and is_fp8_kvc
+            and max_seqlen_q * fold_factor <= 4
+        )
+        total_s = total_q * fold_factor
         nheads = 16
+        if use_qseqlen_fold:
+            max_seqlen_q = max_seqlen_q * fold_factor
+            q_ratio = 1
+        else:
+            q_ratio = fold_factor
         q = q.view(total_s, nheads, -1)
         final_out = final_out.view(total_s, nheads, -1)
         final_lse = final_lse.view(total_s, nheads)

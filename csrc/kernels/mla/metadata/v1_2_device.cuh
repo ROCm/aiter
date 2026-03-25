@@ -461,11 +461,23 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                      kv_is_fp8 && (max_seqlen_qo == 4)) ||
                                     ((arch_id == "gfx942") && (num_heads == 128) && q_is_fp8 && kv_is_fp8);
 
+    const bool use_qseqlen_fold = !natively_supported && (arch_id == "gfx950") &&
+                                   q_is_fp8 && kv_is_fp8 && (num_heads > 16) &&
+                                   (uni_seqlen_qo * (num_heads / 16) <= 4);
+
     if((natively_supported == false) && (num_heads % 16 == 0))
     {
         qk_batch_ratio = num_heads / 16;
         num_heads      = 16;
-        num_batches *= qk_batch_ratio;
+        if(use_qseqlen_fold)
+        {
+            uni_seqlen_qo *= qk_batch_ratio;
+            qk_batch_ratio = 1;
+        }
+        else
+        {
+            num_batches *= qk_batch_ratio;
+        }
     }
 
     TORCH_CHECK((num_heads == 16) || (num_heads == 128) ||
