@@ -121,14 +121,14 @@ static std::tuple<std::string, int> get_heuristic_kernel(
     return std::make_tuple(selectedKernelName, selectedsplitK);
 }
 
-extern "C" __attribute__((visibility("default"))) void gemm_a8w8_asm(
-    AiterTensor* A,       // A:[M, K] i8
-    AiterTensor* B,       // B:[N, K] i8 -> shuffle layout(32,16)
-    AiterTensor* A_scale, // A_scale:[M, 1] f32
-    AiterTensor* B_scale, // B_scale:[1, N] f32
-    AiterTensor* out,     // Out:[M, N] bf16
+AITER_C_ITFS void gemm_a8w8_asm(
+    aiter_tensor_t* A,       // A:[M, K] i8
+    aiter_tensor_t* B,       // B:[N, K] i8 -> shuffle layout(32,16)
+    aiter_tensor_t* A_scale, // A_scale:[M, 1] f32
+    aiter_tensor_t* B_scale, // B_scale:[1, N] f32
+    aiter_tensor_t* out,     // Out:[M, N] bf16
     const char*  kernelName,
-    AiterTensor* bias,    // bias:[1, N] f32
+    aiter_tensor_t* bias,    // bias:[1, N] f32
     int          bpreshuffle,
     int          splitK,
     hipStream_t  stream)

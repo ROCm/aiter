@@ -93,29 +93,29 @@ std::string get_heuristic_kernel_mla(std::string q_type,
     return "";
 }
 
-extern "C" __attribute__((visibility("default")))
+AITER_C_ITFS
 void mla_decode_stage1_asm_fwd(
-    AiterTensor* Q,                    //   [num_seqs, num_heads, head_size]
-    AiterTensor* KV,                   //   [num_page, page_size, num_kv_heads, head_size] or [num_page, page_size*(nhead_kv*(kv_lora_rank+scale_dim+qk_rope_head_dim))]
-    AiterTensor* qo_indptr,            //   [batch_size+1]
-    AiterTensor* kv_indptr,            //   [batch_size+1]
-    AiterTensor* kv_page_indices,      //   [num_page_used]
-    AiterTensor* kv_last_page_lens,    //   [batch_size]
-    AiterTensor* num_kv_splits_indptr, //   metadata (nullable)
-    AiterTensor* work_meta_data,       //   metadata addr (nullable)
-    AiterTensor* work_indptr,          //   metadata (nullable)
-    AiterTensor* work_info_set,        //   [batch_size+1] (nullable)
+    aiter_tensor_t* Q,                    //   [num_seqs, num_heads, head_size]
+    aiter_tensor_t* KV,                   //   [num_page, page_size, num_kv_heads, head_size] or [num_page, page_size*(nhead_kv*(kv_lora_rank+scale_dim+qk_rope_head_dim))]
+    aiter_tensor_t* qo_indptr,            //   [batch_size+1]
+    aiter_tensor_t* kv_indptr,            //   [batch_size+1]
+    aiter_tensor_t* kv_page_indices,      //   [num_page_used]
+    aiter_tensor_t* kv_last_page_lens,    //   [batch_size]
+    aiter_tensor_t* num_kv_splits_indptr, //   metadata (nullable)
+    aiter_tensor_t* work_meta_data,       //   metadata addr (nullable)
+    aiter_tensor_t* work_indptr,          //   metadata (nullable)
+    aiter_tensor_t* work_info_set,        //   [batch_size+1] (nullable)
     int max_seqlen_q,
     int page_size,
     int nhead_kv,
     float softmax_scale,
     // following are output
-    AiterTensor* splitData,            //   [batch_size, num_kv_splits, num_heads, v_head_dim]
-    AiterTensor* splitLse,             //   [batch_size, num_kv_splits, num_heads,  1]
-    AiterTensor* output,               //   [batch_size, num_heads, v_head_dim]
-    AiterTensor* lse,                  //   [batch_size, num_heads] (nullable)
-    AiterTensor* q_scale,              //   [1] (nullable)
-    AiterTensor* kv_scale,             //   [1] (nullable)
+    aiter_tensor_t* splitData,            //   [batch_size, num_kv_splits, num_heads, v_head_dim]
+    aiter_tensor_t* splitLse,             //   [batch_size, num_kv_splits, num_heads,  1]
+    aiter_tensor_t* output,               //   [batch_size, num_heads, v_head_dim]
+    aiter_tensor_t* lse,                  //   [batch_size, num_heads] (nullable)
+    aiter_tensor_t* q_scale,              //   [1] (nullable)
+    aiter_tensor_t* kv_scale,             //   [1] (nullable)
     hipStream_t stream)
 {    
     int batch           = qo_indptr->size(0) - 1;
@@ -421,25 +421,25 @@ struct __attribute__((packed)) PsKernelArgs
 };
 
 
-extern "C" __attribute__((visibility("default")))
+AITER_C_ITFS
 void mla_prefill_ps_asm_fwd(
-    AiterTensor* Q,                    //  [num_seqs, num_q_heads, qk_hetad_size], fp8
-    AiterTensor* K,                    //   [num_page, num_kv_heads, qk_head_size], fp8
-    AiterTensor* V,                    //   [num_page, num_kv_heads, v_head_size], fp8
-    AiterTensor* qo_indptr,            //   [batch_size+1], int
-    AiterTensor* kv_indptr,            //   [batch_size+1], int
-    AiterTensor* kv_page_indices,      //   [num_page_used], int
-    AiterTensor* work_indptr,          //   [available_tgs+1], int (nullable)
-    AiterTensor* work_info_set,        //   [max_works], int (nullable)
+    aiter_tensor_t* Q,                    //  [num_seqs, num_q_heads, qk_hetad_size], fp8
+    aiter_tensor_t* K,                    //   [num_page, num_kv_heads, qk_head_size], fp8
+    aiter_tensor_t* V,                    //   [num_page, num_kv_heads, v_head_size], fp8
+    aiter_tensor_t* qo_indptr,            //   [batch_size+1], int
+    aiter_tensor_t* kv_indptr,            //   [batch_size+1], int
+    aiter_tensor_t* kv_page_indices,      //   [num_page_used], int
+    aiter_tensor_t* work_indptr,          //   [available_tgs+1], int (nullable)
+    aiter_tensor_t* work_info_set,        //   [max_works], int (nullable)
     int max_seqlen_q,
     float softmax_scale,
     int is_causal,
-    AiterTensor* splitData,            //   [num_q_heads, num_seqs, max_kv_split, v_head_dim], fp32
-    AiterTensor* splitLse,             //   [num_q_heads, num_seqs, max_kv_split,  1], fp32
-    AiterTensor* output,               //   [num_seqs, num_q_heads, v_head_dim], bf16
-    AiterTensor* q_scale,              //   fp32, scalar (nullable)
-    AiterTensor* k_scale,              //   fp32, scalar (nullable)
-    AiterTensor* v_scale,              //   fp32, scalar (nullable)
+    aiter_tensor_t* splitData,            //   [num_q_heads, num_seqs, max_kv_split, v_head_dim], fp32
+    aiter_tensor_t* splitLse,             //   [num_q_heads, num_seqs, max_kv_split,  1], fp32
+    aiter_tensor_t* output,               //   [num_seqs, num_q_heads, v_head_dim], bf16
+    aiter_tensor_t* q_scale,              //   fp32, scalar (nullable)
+    aiter_tensor_t* k_scale,              //   fp32, scalar (nullable)
+    aiter_tensor_t* v_scale,              //   fp32, scalar (nullable)
     hipStream_t stream)
 {
     int num_q_tokens  = Q->size(0);
@@ -541,18 +541,18 @@ void mla_prefill_ps_asm_fwd(
 }
 
 
-extern "C" __attribute__((visibility("default")))
+AITER_C_ITFS
 void mla_prefill_asm_fwd(
-    AiterTensor* Q,                    //   [num_seqs, num_heads, head_size]
-    AiterTensor* KV,                   //   [num_page, page_size, num_kv_heads, head_size]
-    AiterTensor* qo_indptr,            //   [batch_size+1]
-    AiterTensor* kv_indptr,            //   [batch_size+1]
-    AiterTensor* kv_page_indices,      //   [num_page_used]
-    AiterTensor* kv_last_page_lens,    //   [batch_size]
+    aiter_tensor_t* Q,                    //   [num_seqs, num_heads, head_size]
+    aiter_tensor_t* KV,                   //   [num_page, page_size, num_kv_heads, head_size]
+    aiter_tensor_t* qo_indptr,            //   [batch_size+1]
+    aiter_tensor_t* kv_indptr,            //   [batch_size+1]
+    aiter_tensor_t* kv_page_indices,      //   [num_page_used]
+    aiter_tensor_t* kv_last_page_lens,    //   [batch_size]
     int max_seqlen_q,
     float softmax_scale,
-    AiterTensor* splitData,            //   [batch_size, num_kv_splits, num_heads, v_head_dim]
-    AiterTensor* splitLse,             //   [batch_size, num_kv_splits, num_heads,  1]
+    aiter_tensor_t* splitData,            //   [batch_size, num_kv_splits, num_heads, v_head_dim]
+    aiter_tensor_t* splitLse,             //   [batch_size, num_kv_splits, num_heads,  1]
     hipStream_t stream)
 {
     int sub_Q           = 128;
