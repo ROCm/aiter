@@ -18,6 +18,7 @@ torch.set_default_device("cuda")
 # torch.set_printoptions(precision=3, linewidth=200, sci_mode=False)
 
 
+# copy from tilelang/examples/deepseek_mhc/example_mhc_pre.py
 def mhc_pre_tilelang(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -464,6 +465,149 @@ def test_mhc_pre(m, hidden_size, hc_mult):
     return ret
 
 
+# copy from tilelang/examples/deepseek_mhc/example_mhc_post.py
+def mhc_post_tilelang(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    import tilelang
+    import tilelang.language as T
+    import math
+
+    @tilelang.jit(
+        pass_configs={
+            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+            tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
+        },
+    )
+    def mhc_post_tilelang(
+        a, b, c, d, x, hc: int, hidden: int, n_thr: int = 128, h_blk: int = 1024
+    ) -> tilelang.JITKernel:
+        # rename for shorter code
+        n = T.dynamic("num_tokens")
+        h = hidden
+
+        h_blk = math.gcd(hidden, h_blk)
+        a: T.Tensor((n, hc, hc), T.float32)
+        b: T.Tensor((n, hc, h), T.bfloat16)
+        c: T.Tensor((n, hc), T.float32)
+        d: T.Tensor((n, h), T.bfloat16)
+        x: T.Tensor((n, hc, h), T.bfloat16)
+        with T.Kernel(n, threads=n_thr) as i_n:
+            x_shared = T.alloc_shared((hc, h_blk), T.bfloat16)
+            b_shared = T.alloc_shared((hc, h_blk), T.bfloat16)
+            d_shared = T.alloc_shared(h_blk, T.bfloat16)
+
+            x_local = T.alloc_fragment((hc, h_blk), T.float32)
+            b_local = T.alloc_fragment((hc, h_blk), T.float32)
+            d_local = T.alloc_fragment(h_blk, T.float32)
+
+            a_local = T.alloc_fragment((hc, hc), T.float32)
+            c_local = T.alloc_fragment(hc, T.float32)
+            T.copy(a[i_n, 0, 0], a_local)
+            T.copy(c[i_n, 0], c_local)
+
+            for i0_h in T.Pipelined(T.ceildiv(h, h_blk), num_stages=2):
+                T.copy(b[i_n, 0, i0_h * h_blk], b_shared)
+                T.copy(d[i_n, i0_h * h_blk], d_shared)
+
+                T.copy(b_shared, b_local)
+                T.copy(d_shared, d_local)
+                for i_hco, i1_h in T.Parallel(hc, h_blk):
+                    x_local[i_hco, i1_h] = c_local[i_hco] * d_local[i1_h]
+                    for i_hci in T.serial(hc):
+                        x_local[i_hco, i1_h] += (
+                            a_local[i_hci, i_hco] * b_local[i_hci, i1_h]
+                        )
+                T.copy(x_local, x_shared)
+
+                T.copy(x_shared, x[i_n, 0, i0_h * h_blk])
+
+    out = torch.empty_like(residual)
+    mhc_post_tilelang(
+        comb_res_mix,
+        residual,
+        post_layer_mix.squeeze(-1),
+        x,
+        out,
+        residual.shape[-2],
+        residual.shape[-1],
+    )
+    return out
+
+
+def mhc_post_hip(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    out = torch.empty_like(residual)
+    aiter.mhc_post(
+        out,
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+    )
+    return out
+
+
+# copy from tilelang/examples/deepseek_mhc/example_mhc_post.py
+def mhc_post_ref(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    term2 = torch.bmm(comb_res_mix.mT, residual.float())
+    return (x.float().unsqueeze(-2) * post_layer_mix + term2).bfloat16()
+
+
+@benchmark()
+def test_mhc_post(m, hidden_size, hc_mult):
+    x = torch.ones(m, hidden_size, dtype=dtypes.bf16) * 2
+    residual = torch.zeros(m, hc_mult, hidden_size, dtype=dtypes.bf16)
+    post_layer_mix = torch.ones(m, hc_mult, 1, dtype=dtypes.fp32)
+    comb_res_mix = torch.ones(m, hc_mult, hc_mult, dtype=dtypes.fp32)
+    out_ref = mhc_post_ref(x, residual, post_layer_mix, comb_res_mix)
+    out_hip, hip_us = run_perftest(
+        mhc_post_hip,
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+    )
+    hip_err = checkAllclose(out_ref, out_hip, msg="out")
+    ret = {}
+    ret["hip_err"] = hip_err
+    ret["hip_us"] = hip_us
+    ret["TB/s"] = (
+        (
+            out_ref.numel() * out_ref.dtype.itemsize
+            + x.numel() * x.dtype.itemsize
+            + residual.numel() * residual.dtype.itemsize
+            + post_layer_mix.numel() * post_layer_mix.dtype.itemsize
+            + comb_res_mix.numel() * comb_res_mix.dtype.itemsize
+        )
+        / 1e6
+        / hip_us
+    )
+    # try:
+    #     (out_tilelang), tilelang_us = run_perftest(mhc_post_tilelang, x, residual, post_layer_mix, comb_res_mix)
+    #     tilelang_err = checkAllclose(out_ref, out_tilelang, msg="out")
+    #     ret["tilelang_err"] = tilelang_err
+    #     ret["tilelang_us"] = tilelang_us
+    # except Exception as e:
+    #     tilelang_err = str(e)
+    #     print(f"tilelang error: {tilelang_err}")
+
+    return ret
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -492,8 +636,8 @@ parser.add_argument(
     "--hidden_size",
     type=int,
     nargs="*",
-    choices=[1280, 2560, 4096],
-    default=[1280, 2560, 4096],
+    choices=[1280, 2560, 4096, 7168],
+    default=[1280, 2560, 4096, 7168],
     help="""hidden_size.
     e.g.: -hidden_size 1024""",
 )
@@ -510,3 +654,14 @@ for dtype in args.dtype:
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("mhc_pre summary (markdown):\n%s", df_md)
+
+df = []
+for dtype in args.dtype:
+    for m in args.m:
+        for hidden_size in args.hidden_size:
+            for hc_mult in [4]:
+                ret = test_mhc_post(m=m, hidden_size=hidden_size, hc_mult=hc_mult)
+                df.append(ret)
+df = pd.DataFrame(df)
+df_md = df.to_markdown(index=False)
+aiter.logger.info("mhc_post summary (markdown):\n%s", df_md)
