@@ -55,17 +55,22 @@ for file in $files; do
 done
 
 # if clang-format exists, run it on C/C++ files
-if command -v clang-format >/dev/null; then
+CLANG_FORMAT=""
+if command -v clang-format-18 >/dev/null; then
+    CLANG_FORMAT="clang-format-18"
+fi
+
+if [[ -n "$CLANG_FORMAT" ]]; then
     for file in $files; do
     [[ -L $file ]] && continue
        if [[ -e $file ]] && echo $file | grep -Eq '\.c$|\.h$|\.cuh$|\.hpp$|\.cpp$|\.cl$|\.h\.in$|\.hpp\.in$|\.cpp\.in$'; then
-            echo "clang-format $file"
-            clang-format -i -style=file "$file"
+            echo "$CLANG_FORMAT $file"
+            $CLANG_FORMAT -i -style=file "$file"
             git add -u "$file"
         fi
     done
 else
-    echo "clang-format command not found, skipping file formatting."
+    echo "clang-format-18 not found, skipping file formatting."
 fi
 
 if command -v black >/dev/null; then
