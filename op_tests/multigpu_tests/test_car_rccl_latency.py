@@ -71,13 +71,13 @@ def bench_worker(rank_id, tp_size, distributed_init_method):
 
         x_aiter = torch.randn(shape, dtype=DTYPE, device=device)
         aiter_lats = _measure_per_iter_us(
-            lambda: tensor_model_parallel_all_reduce(x_aiter)
+            lambda: tensor_model_parallel_all_reduce(x_aiter)  # noqa: F821
         )
 
         dist.barrier(group=group)
 
         x_rccl = torch.randn(shape, dtype=DTYPE, device=device)
-        rccl_lats = _measure_per_iter_us(lambda: dist.all_reduce(x_rccl, group=group))
+        rccl_lats = _measure_per_iter_us(lambda: dist.all_reduce(x_rccl, group=group))  # noqa: F821
 
         dist.barrier(group=group)
 
