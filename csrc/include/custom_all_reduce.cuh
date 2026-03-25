@@ -432,7 +432,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
             A acc;
 #pragma unroll
             for(int j = 0; j < pack_size; ++j)
-                acc[j] = ck_tile::type_convert<float>(v0[j]);
+                acc[j] = upcast_s(v0[j]);
 
             // GPUs 1..(ngpus-1)
 #pragma unroll
@@ -441,14 +441,14 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
                 P vg = tmp_smem[buf][g * tnum_gpu + lane_id];
 #pragma unroll
                 for(int j = 0; j < pack_size; ++j)
-                    acc[j] += ck_tile::type_convert<float>(vg[j]);
+                    acc[j] += upcast_s(vg[j]);
             }
 
             // store result
             P out;
 #pragma unroll
             for(int j = 0; j < pack_size; ++j)
-                out[j] = ck_tile::type_convert<T>(acc[j]);
+                out[j] = downcast_s<T>(acc[j]);
 
             ((P*)result)[cur_idx] = out;
         }

@@ -17,7 +17,7 @@
 #include "custom_all_reduce.cuh"
 #include <cstring>
 
-using fp8_type = ck_tile::fp8_t;
+using fp8_type = opus::fp8_t;
 
 // fake pointer type, must match fptr_t type in custom_all_reduce.h
 using fptr_t = int64_t;

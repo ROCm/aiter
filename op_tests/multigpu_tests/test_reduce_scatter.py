@@ -205,7 +205,7 @@ def reduce_scatter_perftest(
 l_dtype = ["bf16"]
 l_shape = [
     # (4096, 2048)
-    (128, 8192)
+    (128, 8192), (32768, 8192)
     # (16, 512)
 ]
 
