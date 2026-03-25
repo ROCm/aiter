@@ -451,7 +451,6 @@ namespace py = pybind11;
           py::arg("kernelName")  = std::nullopt, \
           py::arg("bpreshuffle") = false);
 
-
 #define FLATMM_A8W8_BLOCKSCALE_ASM_PYBIND \
     m.def("flatmm_a8w8_blockscale_asm",   \
           &flatmm_a8w8_blockscale_asm,    \
@@ -461,7 +460,6 @@ namespace py = pybind11;
           py::arg("x_scale"),             \
           py::arg("w_scale"),             \
           py::arg("Out"));
-
 
 #define GEMM_A4W4_BLOCKSCALE_PYBIND \
     m.def("gemm_a4w4_blockscale",   \
@@ -1597,27 +1595,8 @@ namespace py = pybind11;
           py::arg("numRows"),           \
           py::arg("stride0"),           \
           py::arg("stride1"));          \
-    m.def("top_k_per_row_prefill_fast", \
-          &top_k_per_row_prefill_fast,  \
-          py::arg("logits"),            \
-          py::arg("rowStarts"),         \
-          py::arg("rowEnds"),           \
-          py::arg("indices"),           \
-          py::arg("values"),            \
-          py::arg("numRows"),           \
-          py::arg("stride0"),           \
-          py::arg("stride1"));          \
     m.def("top_k_per_row_decode",       \
           &top_k_per_row_decode,        \
-          py::arg("logits"),            \
-          py::arg("next_n"),            \
-          py::arg("seqLens"),           \
-          py::arg("indices"),           \
-          py::arg("numRows"),           \
-          py::arg("stride0"),           \
-          py::arg("stride1"));          \
-    m.def("top_k_per_row_decode_fast",  \
-          &top_k_per_row_decode_fast,   \
           py::arg("logits"),            \
           py::arg("next_n"),            \
           py::arg("seqLens"),           \
@@ -1799,6 +1778,28 @@ namespace py = pybind11;
           py::arg("cache_seqlens")      = torch::Tensor(),                     \
           py::arg("conv_state_indices") = torch::Tensor(),                     \
           py::arg("pad_slot_id")        = -1);
+
+#define FUSED_SPLIT_GDR_UPDATE_PYBIND                                            \
+    m.def("fused_split_gdr_update",                                               \
+          &aiter::fused_split_gdr_update,                                         \
+          "Fused split GDR decode update (HIP, ksplit4_db backend).",            \
+          py::arg("mixed_qkv"),                                                   \
+          py::arg("A_log"),                                                       \
+          py::arg("a"),                                                           \
+          py::arg("dt_bias"),                                                     \
+          py::arg("b_gate"),                                                      \
+          py::arg("initial_state_source"),                                        \
+          py::arg("initial_state_indices"),                                       \
+          py::arg("key_dim"),                                                     \
+          py::arg("value_dim"),                                                   \
+          py::arg("num_heads_qk"),                                                \
+          py::arg("num_heads_v"),                                                 \
+          py::arg("head_dim"),                                                    \
+          py::arg("softplus_beta")          = 1.0f,                               \
+          py::arg("softplus_threshold")     = 20.0f,                              \
+          py::arg("scale")                  = -1.0f,                              \
+          py::arg("use_qk_l2norm_in_kernel") = true,                              \
+          py::arg("output") = c10::nullopt);
 #define MLA_HK_PYBIND                   \
     m.def("hk_mla_decode_fwd",          \
           &hk_mla_decode_fwd,           \
