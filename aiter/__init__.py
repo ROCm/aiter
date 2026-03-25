@@ -40,6 +40,8 @@ def getLogger():
         console_handler.setLevel(log_level)
 
         logger.addHandler(console_handler)
+        logger.propagate = False
+
         if hasattr(torch._dynamo.config, "ignore_logger_methods"):
             torch._dynamo.config.ignore_logger_methods = (
                 logging.Logger.info,
@@ -91,6 +93,7 @@ from .ops.fused_qk_norm_rope_cache_quant import *  # noqa: F403,E402
 from .ops.groupnorm import *  # noqa: F403,E402
 from .ops.mhc import *  # noqa: F403,E402
 from .ops.causal_conv1d import *  # noqa: F403,E402
+from .ops.fused_split_gdr_update import *  # noqa: F403,E402
 from . import mla  # noqa: F403,F401,E402
 
 # Import Triton-based communication primitives from ops.triton.comms (optional, only if Iris is available)

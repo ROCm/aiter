@@ -400,8 +400,7 @@
     },
     "module_gemm_a8w8_blockscale_asm": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_flatmm_a8w8_blockscale.cu'",
-            "f'{AITER_CSRC_DIR}/pybind/flatmm_a8w8_blockscale_asm_pybind.cu'"
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_flatmm_a8w8_blockscale.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -439,8 +438,6 @@
             "f'{AITER_CSRC_DIR}/kernels/topk_softmax_kernels_group.cu'",
             "f'{AITER_CSRC_DIR}/kernels/moe_fused_gate.cu'",
             "f'{AITER_CSRC_DIR}/kernels/moe_align_block_size_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmoe.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_moe_2stage.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_topksoftmax.cu'"
         ],
         "flags_extra_cc": [],
@@ -451,9 +448,22 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{AITER_META_DIR}/hsa/codegen.py -m fmoe_2stages --output_dir {{}}'",
-            "f'{AITER_META_DIR}/hsa/codegen.py -m fmoe --output_dir {{}}'",
             "f'{AITER_META_DIR}/hsa/codegen.py -m topksoftmax --output_dir {{}}'"
+        ]
+    },
+    "module_moe_fmoe_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmoe.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_moe_2stage.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": [
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmoe_2stages --output_dir {{}}'",
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmoe --output_dir {{}}'"
         ]
     },
     "module_moe_ck2stages": {
@@ -1270,6 +1280,18 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/causal_conv1d_update_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/causal_conv1d_update.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_fused_split_gdr_update": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/fused_split_gdr_update_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/fused_split_gdr_update.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],

@@ -1,7 +1,7 @@
 name: PR Welcome Comment
 
 on:
-  pull_request:
+  pull_request_target:
     branches: [main]
     types: [opened, reopened]
 
@@ -30,6 +30,7 @@ jobs:
 
             | Label | Tests |
             |-------|-------|
+            | \`ci:triton-355\` | Run Triton tests on MI355 in addition to MI325 |
             | \`ci:sglang\` | SGLang integration tests |
             | \`ci:atom\` | ATOM benchmark (DeepSeek-R1 + GPT-OSS) |
             | \`ci:vllm\` | vLLM benchmark |
