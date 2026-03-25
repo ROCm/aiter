@@ -35,9 +35,10 @@ def ref_paged_attn(
     sinks: Optional[torch.Tensor] = None,
     causal: bool = True,
     kv_layout: str = "cache",
+
 ) -> torch.Tensor:
     num_seqs = len(query_lens)
-    block_tables = block_tables.cpu().numpy()
+    
     
     if kv_layout not in ("cache", "thd"):
         raise ValueError(f"Invalid kv_layout: {kv_layout}")
@@ -47,11 +48,13 @@ def ref_paged_attn(
     if kv_is_thd:
         _, num_kv_heads, head_size = key_cache.shape
     else:
+        block_tables = block_tables.cpu().numpy()
         _, block_size, num_kv_heads, head_size = key_cache.shape
     head_size_v = value_cache.shape[-1]
 
     outputs: list[torch.Tensor] = []
     start_idx = 0
+    kv_start_idx = 0
     for i in range(num_seqs):
         query_len = query_lens[i]
         kv_len = kv_lens[i]
@@ -59,17 +62,17 @@ def ref_paged_attn(
         q *= scale
 
         if kv_is_thd:
-            start_idx = block_tables[i][0]
-            end_idx = block_tables[i][0] + kv_len
-            block_indices = torch.arange(start_idx, end_idx, device=query.device)
+            kv_end_idx = kv_start_idx + kv_len
+            token_indices = torch.arange(kv_start_idx, kv_end_idx, device=query.device)
+            k = key_cache[token_indices].view(-1, num_kv_heads, head_size)
+            v = value_cache[token_indices].view(-1, num_kv_heads, head_size_v)
         else:
             num_kv_blocks = (kv_len + block_size - 1) // block_size
             block_indices = block_tables[i, :num_kv_blocks]
-
-        k = key_cache[block_indices].view(-1, num_kv_heads, head_size)
-        k = k[:kv_len]
-        v = value_cache[block_indices].view(-1, num_kv_heads, head_size_v)
-        v = v[:kv_len]
+            k = key_cache[block_indices].view(-1, num_kv_heads, head_size)
+            k = k[:kv_len]
+            v = value_cache[block_indices].view(-1, num_kv_heads, head_size_v)
+            v = v[:kv_len]
 
         if q.shape[1] != k.shape[1]:
             k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
