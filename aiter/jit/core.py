@@ -254,9 +254,9 @@ class AITER_CONFIG(object):
                     start, end = offset, offset + len(src_df)
                     offset = end
                     file_rows = merge_df.iloc[start:end]
-                    new_src_df = file_rows[file_rows.index.isin(best_row_index)].reset_index(
-                        drop=True
-                    )
+                    new_src_df = file_rows[
+                        file_rows.index.isin(best_row_index)
+                    ].reset_index(drop=True)
                     if len(new_src_df) < len(src_df):
                         new_src_df.to_csv(src_path, index=False)
                         saved_files.append(
