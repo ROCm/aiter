@@ -168,7 +168,9 @@ std::tuple<at::Tensor, at::Tensor> fused_qk_rmsnorm(at::Tensor& q,
                                                      double q_eps,
                                                      at::Tensor& k,
                                                      at::Tensor& k_weight,
-                                                     double k_eps)
+                                                     double k_eps,
+                                                     std::optional<at::Tensor> q_out_,
+                                                     std::optional<at::Tensor> k_out_)
 {
     TORCH_CHECK(q.dim() == 2, "q must be 2D: [M, N1]");
     TORCH_CHECK(k.dim() == 2, "k must be 2D: [M, N2]");
@@ -190,8 +192,10 @@ std::tuple<at::Tensor, at::Tensor> fused_qk_rmsnorm(at::Tensor& q,
     int q_in_stride  = q.stride(0);
     int k_in_stride  = k.stride(0);
 
-    auto q_out = torch::empty({m, q_n}, q.options());
-    auto k_out = torch::empty({m, k_n}, k.options());
+    at::Tensor q_out, k_out;
+    q_out = q_out_.has_value() ? q_out_.value() : torch::empty({m, q_n}, q.options());
+    k_out = k_out_.has_value() ? k_out_.value() : torch::empty({m, k_n}, k.options());
+
     int q_out_stride = q_out.stride(0);
     int k_out_stride = k_out.stride(0);
 

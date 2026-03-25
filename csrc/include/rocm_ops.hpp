@@ -1428,7 +1428,9 @@ namespace py = pybind11;
             py::arg("q_eps"),                                    \
             py::arg("k"),                                        \
             py::arg("k_weight"),                                 \
-            py::arg("k_eps"));                                   \
+            py::arg("k_eps"),                                    \
+            py::arg("q_out"),                                    \
+            py::arg("k_out"));                                   \
     m.def("fused_qk_norm_rope_cache_pts_quant_shuffle",          \
           &aiter::fused_qk_norm_rope_cache_pts_quant_shuffle,    \
           py::arg("qkv"),                                        \

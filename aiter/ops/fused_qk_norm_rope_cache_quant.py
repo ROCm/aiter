@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import torch
 from torch import Tensor
 from ..jit.core import compile_ops
 from typing import Optional
@@ -28,8 +29,27 @@ def fused_qk_norm_rope_cache_quant_shuffle(
 ) -> None: ...
 
 
+def gen_fused_qk_rmsnorm_fake_tensor(
+    q: Tensor,
+    q_weight: Tensor,
+    q_eps: float,
+    k: Tensor,
+    k_weight: Tensor,
+    k_eps: float,
+    q_out: Optional[Tensor],
+    k_out: Optional[Tensor],
+) -> tuple[Tensor, Tensor]:
+    if q_out is None:
+        q_out = torch.empty_like(q, dtype=q.dtype, device=q.device)
+    if k_out is None:
+        k_out = torch.empty_like(k, dtype=k.dtype, device=k.device)
+    return q_out, k_out
+
+
 @compile_ops(
-    "module_fused_qk_norm_rope_cache_quant_shuffle", fc_name="fused_qk_rmsnorm"
+    "module_fused_qk_norm_rope_cache_quant_shuffle",
+    fc_name="fused_qk_rmsnorm",
+    gen_fake=gen_fused_qk_rmsnorm_fake_tensor,
 )
 def _fused_qk_rmsnorm_kernel(
     q: Tensor,
@@ -38,6 +58,8 @@ def _fused_qk_rmsnorm_kernel(
     k: Tensor,
     k_weight: Tensor,
     k_eps: float,
+    q_out: Optional[Tensor],
+    k_out: Optional[Tensor],
 ) -> tuple[Tensor, Tensor]: ...
 
 
@@ -57,7 +79,10 @@ def fused_qk_rmsnorm(
         from .rmsnorm import rmsnorm2d_fwd
 
         return rmsnorm2d_fwd(q, q_weight, q_eps), rmsnorm2d_fwd(k, k_weight, k_eps)
-    return _fused_qk_rmsnorm_kernel(q, q_weight, q_eps, k, k_weight, k_eps)
+    else:
+        return _fused_qk_rmsnorm_kernel(
+            q, q_weight, q_eps, k, k_weight, k_eps, None, None
+        )
 
 
 @compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle")

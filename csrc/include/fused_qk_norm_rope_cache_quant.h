@@ -79,7 +79,9 @@ std::tuple<at::Tensor, at::Tensor> fused_qk_rmsnorm(at::Tensor& q,
                                                      double q_eps,
                                                      at::Tensor& k,
                                                      at::Tensor& k_weight,
-                                                     double k_eps);
+                                                     double k_eps,
+                                                     std::optional<at::Tensor> q_out,
+                                                     std::optional<at::Tensor> k_out);
 
 void fused_qk_norm_rope_cache_block_quant_shuffle(
     at::Tensor& qkv,                   // Combined QKV tensor [num_tokens,
