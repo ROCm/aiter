@@ -402,7 +402,8 @@ def torch_mla_extend(
         os.append(o)
         lses.append(lse)
     o = torch.concat(os)
-    lse = torch.concat(lses).transpose(0, 1)
+    # Each lse is (nheads, seq_q_i); concatenate query positions along dim=1, then (total_q, nheads).
+    lse = torch.concat(lses, dim=1).transpose(0, 1)
     return o, lse
 
 
@@ -914,6 +915,7 @@ def test_mla(
     non_persistent_mode,
     paged_layout,
     scale_dim,
+    return_lse,
 ):
     ret = {}
 
@@ -1281,11 +1283,6 @@ def test_mla(
             intra_batch_mode=non_persistent_mode,
         )
 
-        # print(f"{out_ref.view(total_q, -1)=}")
-        # print(f"{out_asm.view(total_q, -1)=}")
-        # checkAllclose(logits_ref, attn_logits,
-        #               msg=f'attn_logits [golden vs aiter_asm]')
-        # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
         err = checkAllclose(
             out_ref,
             out_asm,
@@ -1378,40 +1375,26 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
-            return_lse=True,
+            return_lse=return_lse,
         )
 
-        # print(f"{out_ref.view(total_q, -1)=}")
-        # print(f"{out_asm.view(total_q, -1)=}")
-        # checkAllclose(logits_ref, attn_logits,
-        #               msg=f'attn_logits [golden vs aiter_asm]')
-        # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
         err = checkAllclose(
             out_ref,
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
-        import pdb
 
-        pdb.set_trace()
-        err = checkAllclose(
-            lse_ref,
-            attn_lse,
-            msg=f"mla_decode-absorb_fp8    [golden vs attn_lse]: {us_asm_decode:>8.2f} us......",
-        )
+        if not non_persistent_mode and return_lse:
+            err = checkAllclose(
+                lse_ref,
+                attn_lse.reshape(total_q, nhead),
+                msg=f"mla_decode-absorb_fp8    [lse_ref vs attn_lse]: {us_asm_decode:>8.2f} us......",
+            )
         err = checkAllclose(
             out_ref_fp8,
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
-
-        # # Turn on this if kernel has lse output
-        # lse_ref_reshaped = lse_ref_fp8.reshape(decode_qlen, batch_size, nhead).permute(1, 0, 2).reshape(total_q, nhead)
-        # checkAllclose(
-        #     lse_ref_reshaped,
-        #     attn_lse,
-        #     msg=f"mla_decode-absorb_fp8 lse    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
-        # )
 
         if not non_persistent_mode:
             partial_out_ref, partial_lse_ref, split_out_ref, split_lse_ref = (
@@ -1733,6 +1716,13 @@ parser.add_argument(
     help="""scale dim.
     e.g.: -sd 4""",
 )
+parser.add_argument(
+    "-lse",
+    "--return_lse",
+    action="store_true",
+    help="""return lse. Default: False.
+    --lse # True""",
+)
 
 args = parser.parse_args()
 for nhead, decode_qlen in args.nhead:
@@ -1758,6 +1748,7 @@ for nhead, decode_qlen in args.nhead:
                 non_persistent_mode=args.non_persistent_mode,
                 paged_layout=args.paged_layout,
                 scale_dim=args.scale_dim,
+                return_lse=args.return_lse,
             )
             df.append(ret)
     df = pd.DataFrame(df)
