@@ -11,8 +11,8 @@ import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v2
 
-NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
-HEAD_SIZES = [192]
+NUM_HEADS = [(4, 4), (8, 2), (16, 1)]
+HEAD_SIZES = [128, 192]
 BLOCK_SIZES = [16, 64, 48]
 
 DTYPES = [torch.float16, torch.bfloat16]
