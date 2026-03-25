@@ -43,18 +43,20 @@ def _moe_sorting_impl(
 
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
     sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
-    sorted_weights = torch.empty(
-        max_num_tokens_padded, dtype=dtypes.fp32, device=device
-    )
-    if expert_mask is not None:
-        sorted_expert_ids = torch.zeros(max_num_m_blocks, dtype=dtypes.i32, device=device)
-    else:
-        sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
+    sorted_weights = torch.empty(max_num_tokens_padded, dtype=dtypes.fp32, device=device)
+    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+
     if expert_mask is not None:
-        moe_buf = torch.zeros((M, model_dim), dtype=moebuf_dtype, device=device)
-    else:
-        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        sorted_ids.fill_(topk << 24 | M)
+        sorted_expert_ids.zero_()
+        if expert_mask.dtype == torch.bool and expert_mask.numel() == num_experts:
+            E_local = int(expert_mask.sum().item())
+        else:
+            E_local = int(expert_mask.numel())
+        num_valid_ids = torch.zeros(max(2, E_local + 3), dtype=dtypes.i32, device=device)
+        moe_buf.zero_()
 
     fwd_fn = aiter.moe_sorting_opus_fwd if use_opus else aiter.moe_sorting_fwd
     fwd_fn(
@@ -71,6 +73,31 @@ def _moe_sorting_impl(
         num_local_tokens,
         dispatch_policy,
     )
+
+    if expert_mask is not None:
+        # Keep this path graph-capture safe by avoiding host sync (.item())
+        # and sanitizing potentially invalid outputs on-device.
+        if expert_mask.dtype == dtypes.i32:
+            local_expert_count_t = (expert_mask >= 0).sum().to(dtypes.i32)
+        else:
+            local_expert_count_t = torch.tensor(
+                int(E_local), dtype=dtypes.i32, device=device
+            )
+        local_expert_count_t = torch.clamp(local_expert_count_t, min=1)
+        valid_blocks_mask = (
+            (sorted_expert_ids >= 0) & (sorted_expert_ids < local_expert_count_t)
+        )
+        sorted_expert_ids.masked_fill_(~valid_blocks_mask, 0)
+
+        block_token_mask = valid_blocks_mask.repeat_interleave(int(block_size))[
+            :max_num_tokens_padded
+        ]
+        token_ids = sorted_ids & 0x00FFFFFF
+        topk_slots = (sorted_ids >> 24) & 0xFF
+        valid_token_mask = block_token_mask & (token_ids < M) & (topk_slots < topk)
+        sorted_ids.masked_fill_(~valid_token_mask, topk << 24 | M)
+        sorted_weights.masked_fill_(~valid_token_mask, 0.0)
+
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
 
