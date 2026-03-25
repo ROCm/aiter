@@ -671,6 +671,12 @@ def gemm_a8w8_blockscale_bpreshuffle(
             return gemm_a8w8_blockscale_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
         elif libtype == "ck":
             return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+        elif libtype == "asm":
+            splitK = config["splitK"]
+            kernelName = config["kernelName"]
+            return gemm_a8w8_blockscale_bpreshuffle_asm(
+                XQ, WQ, Y, x_scale, w_scale, splitK=splitK, kernelName=kernelName
+            )
     return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
 
