@@ -1306,7 +1306,7 @@ def test_fused_qk_norm_rope_qk_group_quant_concat_and_cache_mla(
             msg="fp8 q_scale (in q_out) compared with ref",
         )
         # Check Q pe (inplace RoPE)
-        err_q_pe = checkAllclose(
+        checkAllclose(
             q_pe_kernel.to(torch.float32),
             ref_q_pe.to(torch.float32),
             atol=0.01,
