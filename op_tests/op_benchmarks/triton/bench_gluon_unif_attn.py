@@ -12,8 +12,9 @@ from itertools import product
 #from aiter.ops.triton.attention.unified_attention import unified_attention
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
-from aiter.ops.triton.unified_attention import unified_attention
-
+from aiter.ops.triton.gluon.unified_attention_2d import (
+    unified_attention as gluon_unified_attention_2d,
+)
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 
@@ -262,7 +263,7 @@ def run_benchmark(configs):
             maybe_quantized_key_cache = maybe_quantized_key_cache.permute(0, 2, 1, 3)    
             maybe_quantized_value_cache = maybe_quantized_value_cache.permute(0, 2, 1, 3)
 
-        func = lambda:  unified_attention(
+        func = lambda:  gluon_unified_attention_2d(
                 q=maybe_quantized_query.cuda(),
                 k=maybe_quantized_key_cache.cuda(),
                 v=maybe_quantized_value_cache.cuda(),
