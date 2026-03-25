@@ -323,7 +323,7 @@ def mla_decode_fwd(
                 get_gfx() == "gfx950"
                 and q.dtype == dtypes.fp8
                 and kv_buffer.dtype == dtypes.fp8
-                and max_seqlen_q * fold_factor <= 4
+                and max_seqlen_q * fold_factor == 4
             )
 
             total_s = ori_total_s * fold_factor

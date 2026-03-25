@@ -408,7 +408,7 @@ def torch_mla_extend_split_kv(
             get_gfx() == "gfx950"
             and is_fp8_q
             and is_fp8_kvc
-            and max_seqlen_q * fold_factor <= 4
+            and max_seqlen_q * fold_factor == 4
         )
         total_s = total_q * fold_factor
         nheads = 16
