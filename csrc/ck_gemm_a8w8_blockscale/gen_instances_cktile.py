@@ -121,7 +121,8 @@ torch::Tensor
             {str(k.TransposeC).lower()},
             {str(k.UsePersistentKernel).lower()},
             ck_tile::GemmPipelineScheduler::{k.Scheduler},
-            {k.BlockPerCu}>;
+            {k.BlockPerCu},
+            {str(k.AQRowMajor).lower()}>;
 
         // Run kernel instance.
         return gemm_a8w8_blockscale_cktile_impl<DDataType, EDataType, TileGemmInstance>(XQ, WQ, x_scale, w_scale, Y, preshuffleB);
