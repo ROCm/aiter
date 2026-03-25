@@ -251,16 +251,26 @@ def run_benchmark(custom, args):
         cu_seqlens_q[1:] = seqlens_q.cumsum(dim=0, dtype=torch.int32)
         cu_seqlens_k = torch.zeros(len(seqlens_k) + 1, dtype=torch.int32, device="cuda")
         cu_seqlens_k[1:] = seqlens_k.cumsum(dim=0, dtype=torch.int32)
-        
+
         if args.kv_layout == "cache":
             query = torch.randn(
                 sum(seqlens_q), num_query_heads, head_size, dtype=dtype, device="cuda"
             )
             key_cache = torch.randn(
-                num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cuda"
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                head_size,
+                dtype=dtype,
+                device="cuda",
             )
             value_cache = torch.randn(
-                num_blocks, block_size, num_kv_heads, head_size_v, dtype=dtype, device="cuda"
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                head_size_v,
+                dtype=dtype,
+                device="cuda",
             )
             block_tables = torch.randint(
                 0,
@@ -281,8 +291,6 @@ def run_benchmark(custom, args):
             )
             block_tables = None
 
-
-        
         if args.use_sinks:
             sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
         else:
@@ -339,7 +347,6 @@ def run_benchmark(custom, args):
         else:
             q_descale, k_descale, v_descale = None, None, None
 
-
         def fn():
             return unified_attention(
                 q=maybe_quantized_query,
@@ -381,7 +388,7 @@ def run_benchmark(custom, args):
                 soft_cap=soft_cap,
                 sinks=sinks,
                 causal=causal,
-                kv_layout=args.kv_layout
+                kv_layout=args.kv_layout,
             )
             if args.sagev2:
                 atol, rtol = 3.5e-1, 2.5e-1

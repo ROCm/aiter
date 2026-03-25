@@ -28,21 +28,19 @@ def ref_paged_attn(
     value_cache: torch.Tensor,
     query_lens: list[int],
     kv_lens: list[int],
-    block_tables: torch.Tensor, # (num_seqs, max_num_blocks_per_seq) if kv_layout == "cache" or cu_seqlens_k[:-1] if kv_layout == "thd"
+    block_tables: torch.Tensor,  # (num_seqs, max_num_blocks_per_seq) if kv_layout == "cache" or cu_seqlens_k[:-1] if kv_layout == "thd"
     scale: float,
     sliding_window: Optional[int] = None,
     soft_cap: Optional[float] = None,
     sinks: Optional[torch.Tensor] = None,
     causal: bool = True,
     kv_layout: str = "cache",
-
 ) -> torch.Tensor:
     num_seqs = len(query_lens)
-    
-    
+
     if kv_layout not in ("cache", "thd"):
         raise ValueError(f"Invalid kv_layout: {kv_layout}")
-    
+
     kv_is_thd = kv_layout == "thd"
 
     if kv_is_thd:
@@ -81,7 +79,7 @@ def ref_paged_attn(
         empty_mask = torch.ones(query_len, kv_len, device=q.device)
         if causal:
             mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
-        else: # no causal masking
+        else:  # no causal masking
             mask = torch.zeros_like(empty_mask).bool()
         if sliding_window is not None:
             sliding_window_mask = (

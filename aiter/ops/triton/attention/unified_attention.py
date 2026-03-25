@@ -12,6 +12,7 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 
+
 def select_2d_config(
     block_size,
     head_size,
@@ -63,7 +64,7 @@ def select_2d_config(
         num_stages_2d, num_warps = 1, 4
 
     # BLOCK_M = 256
-    
+
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     num_stages_2d = min(max_num_stages_2d, num_stages_2d)
 
@@ -77,7 +78,6 @@ def select_2d_config(
         "num_stages": num_stages_2d,
         "waves_per_eu": waves_per_eu,
     }
-
 
 
 def select_3d_config(
@@ -202,7 +202,7 @@ def unified_attention(
     softmax_scale,
     causal,
     window_size,
-    block_table, # num_seqs, cdiv(max_seqlen_k, block_size) if kv_layout=="cache", cu_seqlens_k if kv_layout=="thd"
+    block_table,  # num_seqs, cdiv(max_seqlen_k, block_size) if kv_layout=="cache", cu_seqlens_k if kv_layout=="thd"
     softcap,
     q_descale,
     k_descale,
@@ -213,10 +213,10 @@ def unified_attention(
     # Optional tensor for sinks
     sinks=None,
     sage_mxfp4=False,
-    kv_layout="cache", # "cache" or "thd"
-    cu_seqlens_k=None, # required if kv_layout=="thd"
+    kv_layout="cache",  # "cache" or "thd"
+    cu_seqlens_k=None,  # required if kv_layout=="thd"
 ):
-    
+
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
 
@@ -224,9 +224,9 @@ def unified_attention(
     head_size_qk = k.shape[-1]
     if sage_mxfp4:
         head_size_qk *= 2
-    
+
     is_head_size_pow2 = head_size_qk & (head_size_qk - 1) == 0
-    
+
     rope_size = 0
     if not is_head_size_pow2:
         lora = triton.next_power_of_2(head_size_qk) // 2
@@ -239,17 +239,22 @@ def unified_attention(
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
 
-
     if kv_layout == "thd":
-        assert cu_seqlens_k is not None, "cu_seqlens_k is required when kv_layout is 'thd'"
+        assert (
+            cu_seqlens_k is not None
+        ), "cu_seqlens_k is required when kv_layout is 'thd'"
         # emulate cache layout which the kernel expects
         block_size = max_seqlen_k
-        k = k.unsqueeze(1) # thd into "num_blks, 1, blk_size, num_kv_heads, head_size"
-        v = v.unsqueeze(1) # thd into "num_blks, 1, blk_size, num_kv_heads, head_size"
-        k_descale = k_descale.unsqueeze(1) # thd into "num_blks, 1, blk_size, num_kv_heads, head_size // 32"
+        k = k.unsqueeze(1)  # thd into "num_blks, 1, blk_size, num_kv_heads, head_size"
+        v = v.unsqueeze(1)  # thd into "num_blks, 1, blk_size, num_kv_heads, head_size"
+        k_descale = k_descale.unsqueeze(
+            1
+        )  # thd into "num_blks, 1, blk_size, num_kv_heads, head_size // 32"
         block_table_stride_0 = 0
     elif kv_layout == "cache":
-        assert block_table is not None, "block_table is required when kv_layout is 'cache'"
+        assert (
+            block_table is not None
+        ), "block_table is required when kv_layout is 'cache'"
         block_size = v.shape[1]
         block_table_stride_0 = block_table.stride(0)
     else:

@@ -376,7 +376,6 @@ def kernel_unified_attention_2d(
             qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
         )  # shape: [BLOCK_M]
 
-    
     if IS_CAUSAL:
         # compute the length of the longest sequence prefix spanned by any
         # query token in the current q_block (q_block_local_idx)
@@ -423,11 +422,8 @@ def kernel_unified_attention_2d(
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
     # iterate through tiles (now limited to the sliding window range)
 
-    
-    if KV_LAYOUT_IS_THD: # No need to page inside the loop as its a contiguous layout.
-        base_offset = tl.load(
-            key_start_len_ptr + seq_idx
-        ).to(tl.int64)
+    if KV_LAYOUT_IS_THD:  # No need to page inside the loop as its a contiguous layout.
+        base_offset = tl.load(key_start_len_ptr + seq_idx).to(tl.int64)
     else:
         block_table_offset = seq_idx * block_table_stride
 
@@ -439,7 +435,9 @@ def kernel_unified_attention_2d(
         else:
             tile_mask = seq_offset < max_seq_prefix_len
 
-        if not KV_LAYOUT_IS_THD: # Need to page inside the loop as its not a contiguous layout.
+        if (
+            not KV_LAYOUT_IS_THD
+        ):  # Need to page inside the loop as its not a contiguous layout.
             base_offset = tl.load(
                 block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
             ).to(tl.int64)
@@ -559,7 +557,7 @@ def kernel_unified_attention_2d(
             # softcap here uses exp2 and consumes RCP_LN2 conversion.
             # multiply by RCP_LN2 again to be used in later exp2
             S = apply_softcap(S, softcap) * RCP_LN2
-        
+
         if IS_CAUSAL:
             seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
         else:
@@ -819,8 +817,7 @@ def kernel_unified_attention_3d(
         dim_mask_v = offs_dv < HEAD_SIZE_V
     else:
         dim_mask_v = tl.full((1,), 1, dtype=tl.int1)
-    
-    
+
     query_mask_0 = query_pos < cur_batch_query_len
     query_mask_1 = query_offset_1 < num_query_heads
 
@@ -1086,7 +1083,7 @@ def kernel_unified_attention_3d(
             # softcap here uses exp2 and consumes RCP_LN2 conversion.
             # multiply by RCP_LN2 again to be used in later exp2
             S = apply_softcap(S, softcap) * RCP_LN2
-        
+
         if IS_CAUSAL:
             seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
         else:
