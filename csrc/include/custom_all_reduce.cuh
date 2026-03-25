@@ -2280,7 +2280,7 @@ class CustomAllreduce
         }                                                                     \
     } while(0)
 
-#define dispatch(ngpus, name)                             \
+#define DISPATCH_REDUCE(ngpus, name)                      \
     do                                                    \
     {                                                     \
         if(bytes % (ngpus * 16) == 0 && world_size_ != 6) \
@@ -2308,7 +2308,7 @@ class CustomAllreduce
         }                                                \
         else if(call_2stage)                             \
         {                                                \
-            dispatch(ngpus, cross_device_reduce_2stage); \
+            DISPATCH_REDUCE(ngpus, cross_device_reduce_2stage); \
         }                                                \
         break;                                           \
     }
