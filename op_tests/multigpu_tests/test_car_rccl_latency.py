@@ -77,7 +77,9 @@ def bench_worker(rank_id, tp_size, distributed_init_method):
         dist.barrier(group=group)
 
         x_rccl = torch.randn(shape, dtype=DTYPE, device=device)
-        rccl_lats = _measure_per_iter_us(lambda: dist.all_reduce(x_rccl, group=group))  # noqa: F821
+        rccl_lats = _measure_per_iter_us(
+            lambda: dist.all_reduce(x_rccl, group=group)
+        )  # noqa: F821
 
         dist.barrier(group=group)
 
