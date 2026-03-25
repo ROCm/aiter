@@ -142,9 +142,8 @@ kernels_list_95x = {
      9:   TileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             1      ),
     10:   TileKernelInstance(   128,     128,      128,     2,        2,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             2      ),
     11:   TileKernelInstance(   192,     256,      128,     4,        2,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             1      ),
-    # 8-warp kernels with AQRowMajor=True: skip host-side x_scale transpose
-    12:   TileKernelInstance(   128,     128,      128,     2,        2,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             2,     AQRowMajor=True),
-    13:   TileKernelInstance(   192,     256,      128,     4,        2,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             1,     AQRowMajor=True),
+    # 8-warp kernel (4x2x1=8) with AQRowMajor=True: skip host-side x_scale transpose
+    12:   TileKernelInstance(   192,     256,      128,     4,        2,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             1,     AQRowMajor=True),
 }
 
 default_kernels_cktile_dict = {

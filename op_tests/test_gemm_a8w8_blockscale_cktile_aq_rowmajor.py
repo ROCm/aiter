@@ -72,10 +72,10 @@ def test_instance_names():
         candidate_kernels_cktile_dict,
     )
 
-    # Non-AQRowMajor name should NOT end with _aqrm
+    # Non-AQRowMajor name should NOT end with _aqrm (4x2x1 = 8 warps)
     inst_default = TileKernelInstance(
-        128, 128, 128, 2, 2, 1, 16, 16, 128,
-        "Intrawave", False, True, False, 2,
+        192, 256, 128, 4, 2, 1, 16, 16, 128,
+        "Intrawave", False, True, False, 1,
     )
     assert not inst_default.name.endswith("_aqrm"), (
         f"Default instance name should not have _aqrm suffix: {inst_default.name}"
@@ -83,8 +83,8 @@ def test_instance_names():
 
     # AQRowMajor=True name SHOULD end with _aqrm
     inst_rm = TileKernelInstance(
-        128, 128, 128, 2, 2, 1, 16, 16, 128,
-        "Intrawave", False, True, False, 2, AQRowMajor=True,
+        192, 256, 128, 4, 2, 1, 16, 16, 128,
+        "Intrawave", False, True, False, 1, AQRowMajor=True,
     )
     assert inst_rm.name.endswith("_aqrm"), (
         f"AQRowMajor instance name should have _aqrm suffix: {inst_rm.name}"
@@ -93,8 +93,8 @@ def test_instance_names():
     # Names must be distinct
     assert inst_default.name != inst_rm.name, "Names must differ"
 
-    # Verify is_eight_warp property
-    assert inst_rm.is_eight_warp, "2x2x1 with K_Warp_Tile=128 should be 8-warp"
+    # Verify is_eight_warp property (4x2x1 = 8 warps, K_Warp_Tile=128)
+    assert inst_rm.is_eight_warp, "4x2x1 with K_Warp_Tile=128 should be 8-warp"
 
     non_8w = TileKernelInstance(
         16, 128, 256, 1, 4, 1, 16, 16, 64,
@@ -113,10 +113,11 @@ def test_instance_names():
 
     for kid, k in aqrm_kernels.items():
         assert k.is_eight_warp, (
-            f"AQRowMajor kernel {kid} ({k.name}) should be 8-warp"
+            f"AQRowMajor kernel {kid} ({k.name}) should be 8-warp "
+            f"(warps={k.M_Warp}x{k.N_Warp}x{k.K_Warp}={k.M_Warp*k.N_Warp*k.K_Warp})"
         )
-        assert k.name.endswith("_aqrm"), (
-            f"AQRowMajor kernel {kid} should have _aqrm suffix: {k.name}"
+        assert "_aqrm" in k.name, (
+            f"AQRowMajor kernel {kid} should have _aqrm in name: {k.name}"
         )
 
     print("  PASSED: instance name encoding")
