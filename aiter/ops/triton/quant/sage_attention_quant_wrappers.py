@@ -107,7 +107,7 @@ def perchannel_quantize_fp8(
         )
 
     v_q = (v / v_descale).to(FP8_TYPE)
-    v_descale = v_descale.squeeze()
+    v_descale = v_descale.squeeze(dim=reduce_dims)
     return v_q, v_descale
 
 
