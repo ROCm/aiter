@@ -391,7 +391,7 @@ def unified_attention(
             q.shape[0],
             num_query_heads,
             NUM_SEGMENTS,
-            triton.next_power_of_2(head_size_qk),
+            triton.next_power_of_2(head_size_v),
             dtype=torch.float32,
             device=q.device,
         )
