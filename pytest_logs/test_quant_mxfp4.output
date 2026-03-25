@@ -1,0 +1,38 @@
+/usr/local/lib/python3.12/dist-packages/pylama/lint/__init__.py:10: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import iter_entry_points
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.0.2, pluggy-1.6.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+rootdir: /root/aiter
+configfile: pyproject.toml
+plugins: repeat-0.9.4, pylama-8.4.1, forked-1.6.0, xdist-3.8.0
+collecting ... [aiter] import [module_aiter_enum] under /root/aiter/aiter/jit/module_aiter_enum.so
+collected 25 items
+
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_dynamic_mxfp4_quant[dtype0-1-4] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_dynamic_mxfp4_quant[dtype0-1-68] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_dynamic_mxfp4_quant[dtype0-128-32] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_dynamic_mxfp4_quant[dtype0-256-32] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_dynamic_mxfp4_quant[dtype0-160-40] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_dynamic_mxfp4_quant[dtype0-1024-7168] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_dynamic_mxfp4_quant[dtype0-1024-8192] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_fp4_utils_dynamic_mxfp4_quant[dtype0-1-4] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_fp4_utils_dynamic_mxfp4_quant[dtype0-1-28] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_fp4_utils_dynamic_mxfp4_quant[dtype0-1-32] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_fp4_utils_dynamic_mxfp4_quant[dtype0-1-64] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_fp4_utils_dynamic_mxfp4_quant[dtype0-1-68] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_fp4_utils_dynamic_mxfp4_quant[dtype0-2-4] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_fp4_utils_dynamic_mxfp4_quant[dtype0-2-28] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_fp4_utils_dynamic_mxfp4_quant[dtype0-2-32] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_fp4_utils_dynamic_mxfp4_quant[dtype0-2-64] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_fp4_utils_dynamic_mxfp4_quant[dtype0-2-68] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_fp4_utils_dynamic_mxfp4_quant[dtype0-128-4] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_fp4_utils_dynamic_mxfp4_quant[dtype0-128-28] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_fp4_utils_dynamic_mxfp4_quant[dtype0-128-32] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_fp4_utils_dynamic_mxfp4_quant[dtype0-128-64] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_fp4_utils_dynamic_mxfp4_quant[dtype0-128-68] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_fp4_utils_dynamic_mxfp4_quant[dtype0-256-32] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_fp4_utils_dynamic_mxfp4_quant[dtype0-160-40] PASSED
+op_tests/triton_tests/quant/test_quant_mxfp4.py::test_fp4_utils_dynamic_mxfp4_quant[dtype0-280-20] PASSED
+
+============================== 25 passed in 8.54s ==============================

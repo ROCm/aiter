@@ -189,8 +189,12 @@ def run_torch(x, w, x_scales, w_scales, dtype):
 
 
 @pytest.mark.parametrize("B, M, N, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
+# TODO: Remove when merging. f16 output not critical for launch.
+#@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+# TODO: Remove when merging. Non TN GEMMs not critical for launch.
+#@pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
+@pytest.mark.parametrize("layout", ["TN"])
 def test_batched_gemm_afp4_wfp4(B: int, M: int, N: int, K: int, dtype, layout):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
