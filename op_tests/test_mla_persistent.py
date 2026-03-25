@@ -1239,7 +1239,7 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
-            return_lse=True,
+            return_lse=False,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")

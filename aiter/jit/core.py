@@ -385,7 +385,9 @@ def validate_and_update_archs():
         "gfx1153",
         "gfx1200",
         "gfx1201",
+        "gfx1250",
         "gfx950",
+        "gfx1250",
     ]
 
     # Validate if each element in archs is in allowed_archs
@@ -423,7 +425,7 @@ def check_LLVM_MAIN_REVISION():
     import subprocess
 
     cmd = """echo "#include <tuple>
-__host__ __device__ void func(){std::tuple<int, int> t = std::tuple(1, 1);}" | hipcc -x hip -P -c -Wno-unused-command-line-argument -"""
+__host__ __device__ void func(){std::tuple<int, int> t = std::tuple(1, 1);}" | hipcc -x hip -P -c -Wno-unused-command-line-argument -o /dev/null -"""
     try:
         subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.STDOUT)
     except subprocess.CalledProcessError:
@@ -747,6 +749,10 @@ def build_module(
             if hasattr(torch, "float4_e2m1fn_x2"):
                 flags_hip += ["-DTORCH_Float4_e2m1fn_x2"]
 
+        enable_ck = int(os.environ.get("ENABLE_CK", "1"))
+        if not any("ENABLE_CK" in f for f in flags_extra_cc):
+            flags_cc.append(f"-DENABLE_CK={enable_ck}")
+
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
@@ -1029,185 +1035,402 @@ def get_args_of_build(ops_name: str, exclude=[]):
             )
 
 
+def _is_union(origin):
+    """Check for both typing.Union (Optional[X]) and types.UnionType (X | None)."""
+    return origin is typing.Union or origin is types.UnionType
+
+
+def _ctypes_call(func, fc_name, md_name):
+    """Build a ctypes-based caller for a torch-free .so module.
+
+    Type-hint to C ABI mapping
+    -------------------------------------------------------
+    Python annotation     | ctypes type          | C type
+    ----------------------|----------------------|---------
+    Tensor                | POINTER(aiter_tensor_t) | aiter_tensor_t*
+    Optional[Tensor]      | POINTER(aiter_tensor_t) | aiter_tensor_t* (NULL if None)
+    int                   | c_int                | int
+    Optional[int]         | c_int                | int   (-1 if None)
+    str                   | c_char_p             | char* (.encode())
+    Optional[str]         | c_char_p             | char* (NULL if None)
+    bool                  | c_int                | int   (0 / 1)
+    float                 | c_float              | float
+    (other)               | c_void_p             | void*
+    (auto-appended)       | c_void_p             | hipStream_t
+    -------------------------------------------------------
+    """
+    import ctypes
+    import inspect
+
+    import torch
+
+    from ..utility.dtypes import aiter_tensor_t, torch_to_aiter
+
+    _cache = {}
+    _arg_checked = False
+
+    def _ensure_loaded():
+        if _cache:
+            return
+        so_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
+        if not os.path.exists(so_path):
+            d_args = get_args_of_build(md_name)
+            d_args["torch_exclude"] = True
+            build_module(
+                md_name,
+                d_args["srcs"],
+                d_args["flags_extra_cc"],
+                d_args["flags_extra_hip"],
+                d_args["blob_gen_cmd"],
+                d_args["extra_include"],
+                d_args["extra_ldflags"],
+                d_args["verbose"],
+                d_args["is_python_module"],
+                d_args["is_standalone"],
+                d_args["torch_exclude"],
+                d_args.get("third_party", []),
+            )
+        lib = ctypes.CDLL(so_path)
+        c_func = getattr(lib, fc_name)
+        c_func.restype = None
+
+        hints = typing.get_type_hints(func)
+        argtypes = []
+        for pname in inspect.signature(func).parameters:
+            hint = hints.get(pname)
+            origin = typing.get_origin(hint)
+            type_args = typing.get_args(hint)
+            if hint is torch.Tensor:
+                argtypes.append(ctypes.POINTER(aiter_tensor_t))
+            elif _is_union(origin) and torch.Tensor in type_args:
+                argtypes.append(ctypes.POINTER(aiter_tensor_t))
+            elif _is_union(origin) and int in type_args:
+                argtypes.append(ctypes.c_int)
+            elif _is_union(origin) and str in type_args:
+                argtypes.append(ctypes.c_char_p)
+            elif hint is str:
+                argtypes.append(ctypes.c_char_p)
+            elif hint is bool:
+                argtypes.append(ctypes.c_int)
+            elif hint is int:
+                argtypes.append(ctypes.c_int)
+            elif hint is float:
+                argtypes.append(ctypes.c_float)
+            else:
+                argtypes.append(ctypes.c_void_p)
+        argtypes.append(ctypes.c_void_p)  # hipStream_t
+        c_func.argtypes = argtypes
+
+        _cache["lib"] = lib
+        _cache["c_func"] = c_func
+
+    def _check_args_before_convert(bound_args, hints):
+        for pname, value in bound_args.items():
+            hint = hints.get(pname)
+            origin = typing.get_origin(hint)
+            type_args = typing.get_args(hint)
+
+            if hint is torch.Tensor:
+                if not isinstance(value, torch.Tensor):
+                    raise TypeError(
+                        f"{fc_name}: '{pname}' expects torch.Tensor, "
+                        f"got {type(value).__name__}"
+                    )
+            elif _is_union(origin) and torch.Tensor in type_args:
+                if value is not None and not isinstance(value, torch.Tensor):
+                    raise TypeError(
+                        f"{fc_name}: '{pname}' expects Optional[torch.Tensor], "
+                        f"got {type(value).__name__}"
+                    )
+            elif _is_union(origin) and int in type_args:
+                if value is not None and not isinstance(value, int):
+                    raise TypeError(
+                        f"{fc_name}: '{pname}' expects Optional[int], "
+                        f"got {type(value).__name__}"
+                    )
+            elif _is_union(origin) and str in type_args:
+                if value is not None and not isinstance(value, str):
+                    raise TypeError(
+                        f"{fc_name}: '{pname}' expects Optional[str], "
+                        f"got {type(value).__name__}"
+                    )
+            elif hint is str:
+                if not isinstance(value, str):
+                    raise TypeError(
+                        f"{fc_name}: '{pname}' expects str, "
+                        f"got {type(value).__name__}"
+                    )
+            elif hint is bool:
+                if not isinstance(value, (bool, int)):
+                    raise TypeError(
+                        f"{fc_name}: '{pname}' expects bool, "
+                        f"got {type(value).__name__}"
+                    )
+            elif hint is int:
+                if not isinstance(value, int):
+                    raise TypeError(
+                        f"{fc_name}: '{pname}' expects int, "
+                        f"got {type(value).__name__}"
+                    )
+            elif hint is float:
+                if not isinstance(value, (float, int)):
+                    raise TypeError(
+                        f"{fc_name}: '{pname}' expects float, "
+                        f"got {type(value).__name__}"
+                    )
+
+    def caller(*args, **kwargs):
+        nonlocal _arg_checked
+        _ensure_loaded()
+        c_func = _cache["c_func"]
+
+        sig = inspect.signature(func)
+        bound = sig.bind(*args, **kwargs)
+        bound.apply_defaults()
+        hints = typing.get_type_hints(func)
+
+        if not _arg_checked:
+            _check_args_before_convert(bound.arguments, hints)
+            _arg_checked = True
+
+        c_args = []
+        aiter_refs = []
+        tensor_device = None
+
+        for pname, value in bound.arguments.items():
+            hint = hints.get(pname)
+            origin = typing.get_origin(hint)
+            type_args = typing.get_args(hint)
+
+            if hint is torch.Tensor:
+                if tensor_device is None:
+                    tensor_device = value.device
+                at = torch_to_aiter(value)
+                aiter_refs.append(at)
+                c_args.append(ctypes.byref(at))
+            elif _is_union(origin) and torch.Tensor in type_args:
+                if value is not None:
+                    if tensor_device is None:
+                        tensor_device = value.device
+                    at = torch_to_aiter(value)
+                    aiter_refs.append(at)
+                    c_args.append(ctypes.byref(at))
+                else:
+                    c_args.append(ctypes.POINTER(aiter_tensor_t)())
+            elif _is_union(origin) and int in type_args:
+                c_args.append(value if value is not None else -1)
+            elif _is_union(origin) and str in type_args:
+                c_args.append(value.encode() if value is not None else None)
+            elif hint is str:
+                c_args.append(value.encode())
+            elif hint is bool:
+                c_args.append(1 if value else 0)
+            elif hint is int:
+                c_args.append(ctypes.c_int(value))
+            elif hint is float:
+                c_args.append(ctypes.c_float(value))
+            else:
+                c_args.append(value)
+
+        c_args.append(
+            ctypes.c_void_p(torch.cuda.current_stream(tensor_device).cuda_stream)
+        )
+        c_func(*c_args)
+
+    return caller
+
+
 def compile_ops(
     _md_name: str,
     fc_name: Optional[str] = None,
     gen_func: Optional[Callable[..., dict[str, Any]]] = None,
     gen_fake: Optional[Callable[..., Any]] = None,
+    ffi_type: str = "pybind",
 ):
     def decorator(func):
-        func.arg_checked = False
+        loadName = fc_name if fc_name is not None else func.__name__
 
-        @functools.wraps(func)
-        def wrapper(*args, custom_build_args={}, **kwargs):
+        if ffi_type == "ctypes":
+            ctypes_caller = _ctypes_call(func, loadName, _md_name)
 
-            loadName = fc_name
-            md_name = _md_name
-            if fc_name is None:
-                loadName = func.__name__
-            try:
-                module = None
-                if gen_func is not None:
-                    custom_build_args.update(gen_func(*args, **kwargs))
-                elif AITER_REBUILD and md_name not in rebuilded_list:
-                    rebuilded_list.append(md_name)
-                    raise ModuleNotFoundError("start rebuild")
-                if module is None:
-                    try:
-                        module = get_module(md_name)
-                    except Exception:
+            @functools.wraps(func)
+            def ctypes_wrapper(*args, **kwargs):
+                ctypes_caller(*args, **kwargs)
+
+            @torch_compile_guard(device="cuda", calling_func_=func)
+            def ctypes_custom_wrapper(*args, **kwargs):
+                return ctypes_wrapper(*args, **kwargs)
+
+            return ctypes_custom_wrapper
+
+        elif ffi_type == "pybind":
+            func.arg_checked = False
+
+            @functools.wraps(func)
+            def wrapper(*args, custom_build_args={}, **kwargs):
+
+                md_name = _md_name
+                try:
+                    module = None
+                    if gen_func is not None:
+                        custom_build_args.update(gen_func(*args, **kwargs))
+                    elif AITER_REBUILD and md_name not in rebuilded_list:
+                        rebuilded_list.append(md_name)
+                        raise ModuleNotFoundError("start rebuild")
+                    if module is None:
                         md = custom_build_args.get("md_name", md_name)
                         module = get_module(md)
-            except ModuleNotFoundError:
-                d_args = get_args_of_build(md_name)
-                d_args.update(custom_build_args)
+                except ModuleNotFoundError:
+                    d_args = get_args_of_build(md_name)
+                    d_args.update(custom_build_args)
 
-                # update module if we have coustom build
-                md_name = custom_build_args.get("md_name", md_name)
+                    md_name = custom_build_args.get("md_name", md_name)
 
-                srcs = d_args["srcs"]
-                flags_extra_cc = d_args["flags_extra_cc"]
-                flags_extra_hip = d_args["flags_extra_hip"]
-                blob_gen_cmd = d_args["blob_gen_cmd"]
-                extra_include = d_args["extra_include"]
-                extra_ldflags = d_args["extra_ldflags"]
-                verbose = d_args["verbose"]
-                is_python_module = d_args["is_python_module"]
-                is_standalone = d_args["is_standalone"]
-                torch_exclude = d_args["torch_exclude"]
-                hipify = d_args.get("hipify", False)
-                hip_clang_path = d_args.get("hip_clang_path", None)
-                third_party = d_args.get("third_party", [])
-                prev_hip_clang_path = None
-                if hip_clang_path is not None and os.path.exists(hip_clang_path):
-                    prev_hip_clang_path = os.environ.get("HIP_CLANG_PATH", None)
-                    os.environ["HIP_CLANG_PATH"] = hip_clang_path
+                    srcs = d_args["srcs"]
+                    flags_extra_cc = d_args["flags_extra_cc"]
+                    flags_extra_hip = d_args["flags_extra_hip"]
+                    blob_gen_cmd = d_args["blob_gen_cmd"]
+                    extra_include = d_args["extra_include"]
+                    extra_ldflags = d_args["extra_ldflags"]
+                    verbose = d_args["verbose"]
+                    is_python_module = d_args["is_python_module"]
+                    is_standalone = d_args["is_standalone"]
+                    torch_exclude = d_args["torch_exclude"]
+                    hipify = d_args.get("hipify", False)
+                    hip_clang_path = d_args.get("hip_clang_path", None)
+                    third_party = d_args.get("third_party", [])
+                    prev_hip_clang_path = None
+                    if hip_clang_path is not None and os.path.exists(hip_clang_path):
+                        prev_hip_clang_path = os.environ.get("HIP_CLANG_PATH", None)
+                        os.environ["HIP_CLANG_PATH"] = hip_clang_path
 
-                build_module(
-                    md_name,
-                    srcs,
-                    flags_extra_cc,
-                    flags_extra_hip,
-                    blob_gen_cmd,
-                    extra_include,
-                    extra_ldflags,
-                    verbose,
-                    is_python_module,
-                    is_standalone,
-                    torch_exclude,
-                    third_party,
-                    hipify,
-                )
-
-                if hip_clang_path is not None:
-                    if prev_hip_clang_path is not None:
-                        os.environ["HIP_CLANG_PATH"] = prev_hip_clang_path
-                    else:
-                        os.environ.pop("HIP_CLANG_PATH", None)
-
-                if is_python_module:
-                    module = get_module(md_name)
-                if md_name not in __mds:
-                    __mds[md_name] = module
-
-            if isinstance(module, types.ModuleType):
-                op = getattr(module, loadName)
-            else:
-                return None
-
-            def check_args():
-                get_asm_dir()
-                import inspect
-                import re
-
-                import torch
-
-                enum_types = ["ActivationType", "QuantType"]
-
-                if not op.__doc__.startswith("Members:"):
-                    doc_str = op.__doc__.split("\n")[0]
-                    doc_str = re.sub(r"<(.*?)\:.*?>", r"\g<1>", doc_str)
-                    doc_str = doc_str.replace("list[", "List[")
-                    doc_str = doc_str.replace("tuple[", "Tuple[")
-                    doc_str = doc_str.replace("collections.abc.Sequence[", "List[")
-                    doc_str = doc_str.replace("typing.SupportsInt", "int")
-                    doc_str = doc_str.replace("typing.SupportsFloat", "float")
-                    # A|None  -->  Optional[A]
-                    pattern = r"([\w\.]+(?:\[[^\]]+\])?)\s*\|\s*None"
-                    doc_str = re.sub(pattern, r"Optional[\1]", doc_str)
-                    for el in enum_types:
-                        doc_str = re.sub(f" (module_)?aiter.*{el} ", f" {el} ", doc_str)
-                    namespace = {
-                        "List": List,
-                        "Optional": Optional,
-                        "torch": torch,
-                        "typing": typing,
-                    }
-
-                    exec(
-                        f"from aiter import*\ndef {doc_str}: pass",
-                        namespace,
+                    build_module(
+                        md_name,
+                        srcs,
+                        flags_extra_cc,
+                        flags_extra_hip,
+                        blob_gen_cmd,
+                        extra_include,
+                        extra_ldflags,
+                        verbose,
+                        is_python_module,
+                        is_standalone,
+                        torch_exclude,
+                        third_party,
+                        hipify,
                     )
-                    foo = namespace[doc_str.split("(")[0]]
-                    sig = inspect.signature(foo)
-                    func.__signature__ = sig
-                    ann = {k: v.annotation for k, v in sig.parameters.items()}
-                    ann["return"] = sig.return_annotation
-                    callargs = inspect.getcallargs(func, *args, **kwargs)
-                    for el, arg in callargs.items():
-                        expected_type = ann[el]
-                        got_type = type(arg)
-                        origin = typing.get_origin(expected_type)
-                        sub_t = typing.get_args(expected_type)
 
-                        if origin is None:
-                            if not isinstance(arg, expected_type) and not (
-                                # aiter_enum can be int
-                                any(el in str(expected_type) for el in enum_types)
-                                and isinstance(arg, int)
-                            ):
-                                raise TypeError(
-                                    f"{loadName}: {el} needs to be {expected_type} but got {got_type}"
-                                )
-                        elif origin is list:
-                            if (
-                                not isinstance(arg, list)
-                                # or not all(isinstance(i, sub_t) for i in arg)
-                            ):
-                                raise TypeError(
-                                    f"{loadName}: {el} needs to be List[{sub_t}] but got {arg}"
-                                )
-                        elif origin is typing.Union or origin is types.UnionType:
-                            if arg is not None and not isinstance(arg, sub_t):
-                                raise TypeError(
-                                    f"{loadName}: {el} needs to be Optional[{sub_t}] but got {arg}"
-                                )
+                    if hip_clang_path is not None:
+                        if prev_hip_clang_path is not None:
+                            os.environ["HIP_CLANG_PATH"] = prev_hip_clang_path
                         else:
-                            raise TypeError(f"Unsupported type: {expected_type}")
+                            os.environ.pop("HIP_CLANG_PATH", None)
 
-                    func_hints = typing.get_type_hints(func)
-                    if ann["return"] is None:
-                        func_hints["return"] = None
-                    if ann != func_hints:
-                        logger.warning(
-                            f"type hints mismatch, override to --> {doc_str}"
+                    if is_python_module:
+                        module = get_module(md_name)
+                    if md_name not in __mds:
+                        __mds[md_name] = module
+
+                if isinstance(module, types.ModuleType):
+                    op = getattr(module, loadName)
+                else:
+                    return None
+
+                def check_args():
+                    get_asm_dir()
+                    import inspect
+                    import re
+
+                    import torch
+
+                    enum_types = ["ActivationType", "QuantType"]
+
+                    if not op.__doc__.startswith("Members:"):
+                        doc_str = op.__doc__.split("\n")[0]
+                        doc_str = re.sub(r"<(.*?)\:.*?>", r"\g<1>", doc_str)
+                        doc_str = doc_str.replace("list[", "List[")
+                        doc_str = doc_str.replace("tuple[", "Tuple[")
+                        doc_str = doc_str.replace("collections.abc.Sequence[", "List[")
+                        doc_str = doc_str.replace("typing.SupportsInt", "int")
+                        doc_str = doc_str.replace("typing.SupportsFloat", "float")
+                        pattern = r"([\w\.]+(?:\[[^\]]+\])?)\s*\|\s*None"
+                        doc_str = re.sub(pattern, r"Optional[\1]", doc_str)
+                        for el in enum_types:
+                            doc_str = re.sub(
+                                f" (module_)?aiter.*{el} ", f" {el} ", doc_str
+                            )
+                        namespace = {
+                            "List": List,
+                            "Optional": Optional,
+                            "torch": torch,
+                            "typing": typing,
+                        }
+
+                        exec(
+                            f"from aiter import*\ndef {doc_str}: pass",
+                            namespace,
                         )
-                return True
+                        foo = namespace[doc_str.split("(")[0]]
+                        sig = inspect.signature(foo)
+                        func.__signature__ = sig
+                        ann = {k: v.annotation for k, v in sig.parameters.items()}
+                        ann["return"] = sig.return_annotation
+                        callargs = inspect.getcallargs(func, *args, **kwargs)
+                        for el, arg in callargs.items():
+                            expected_type = ann[el]
+                            got_type = type(arg)
+                            origin = typing.get_origin(expected_type)
+                            sub_t = typing.get_args(expected_type)
 
-            if not func.arg_checked:
-                func.arg_checked = check_args()
+                            if origin is None:
+                                if not isinstance(arg, expected_type) and not (
+                                    any(el in str(expected_type) for el in enum_types)
+                                    and isinstance(arg, int)
+                                ):
+                                    raise TypeError(
+                                        f"{loadName}: {el} needs to be {expected_type} but got {got_type}"
+                                    )
+                            elif origin is list:
+                                if not isinstance(arg, list):
+                                    raise TypeError(
+                                        f"{loadName}: {el} needs to be List[{sub_t}] but got {arg}"
+                                    )
+                            elif origin is typing.Union or origin is types.UnionType:
+                                if arg is not None and not isinstance(arg, sub_t):
+                                    raise TypeError(
+                                        f"{loadName}: {el} needs to be Optional[{sub_t}] but got {arg}"
+                                    )
+                            else:
+                                raise TypeError(f"Unsupported type: {expected_type}")
 
-            if AITER_LOG_MORE == 2:
-                from ..test_common import log_args
+                        func_hints = typing.get_type_hints(func)
+                        if ann["return"] is None:
+                            func_hints["return"] = None
+                        if ann != func_hints:
+                            logger.warning(
+                                f"type hints mismatch, override to --> {doc_str}"
+                            )
+                    return True
 
-                log_args(func, *args, **kwargs)
+                if not func.arg_checked:
+                    func.arg_checked = check_args()
 
-            return op(*args, **kwargs)
+                if AITER_LOG_MORE == 2:
+                    from ..test_common import log_args
 
-        @torch_compile_guard(device="cuda", gen_fake=gen_fake, calling_func_=func)
-        def custom_wrapper(*args, **kwargs):
-            return wrapper(*args, **kwargs)
+                    log_args(func, *args, **kwargs)
 
-        return custom_wrapper
+                return op(*args, **kwargs)
+
+            @torch_compile_guard(device="cuda", gen_fake=gen_fake, calling_func_=func)
+            def custom_wrapper(*args, **kwargs):
+                return wrapper(*args, **kwargs)
+
+            return custom_wrapper
+
+        else:
+            raise ValueError(
+                f"Unknown ffi_type: {ffi_type!r}, expected 'ctypes' or 'pybind'"
+            )
 
     return decorator

@@ -17,7 +17,6 @@ _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr = 
         "GROUP_SIZE_M",
         "EVEN_K",
         "cache_modifier",
-        "GRID_MN",
     ],
 )
 
@@ -25,12 +24,11 @@ _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr = 
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(
-    repr=_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr
+    repr=_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr,
+    do_not_specialize=["M", "N"],
 )
 def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel(
     # Pointers to matrices
@@ -67,7 +65,6 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     GROUP_SIZE_M: tl.constexpr,
     EVEN_K: tl.constexpr,
     cache_modifier: tl.constexpr,
-    GRID_MN: tl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call batched_gemm_a8w8 function
