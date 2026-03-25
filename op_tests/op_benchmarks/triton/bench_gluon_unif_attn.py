@@ -268,6 +268,8 @@ def run_benchmark(configs):
         cu_query_lens = cu_query_lens.cuda()
         block_tables = block_tables.cuda()
         sinks = sinks.cuda()
+        output = output.cuda()
+        kv_lens = kv_lens.cuda()
         func = lambda:  gluon_unified_attention_2d(
                 q=maybe_quantized_query,
                 k=maybe_quantized_key_cache,
