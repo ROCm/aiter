@@ -16,7 +16,11 @@ from aiter import logger
 from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.flydsl.utils import is_flydsl_available
+try:
+    from aiter.ops.flydsl.utils import is_flydsl_available
+except ModuleNotFoundError:
+    def is_flydsl_available():
+        return False
 from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
 from aiter.utility import fp4_utils
 
@@ -42,21 +46,27 @@ def _moe_sorting_impl(
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
 
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
-    sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
-    sorted_weights = torch.empty(max_num_tokens_padded, dtype=dtypes.fp32, device=device)
-    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
-    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
-
     if expert_mask is not None:
-        sorted_ids.fill_(topk << 24 | M)
-        sorted_expert_ids.zero_()
-        if expert_mask.dtype == torch.bool and expert_mask.numel() == num_experts:
-            E_local = int(expert_mask.sum().item())
-        else:
-            E_local = int(expert_mask.numel())
-        num_valid_ids = torch.zeros(max(2, E_local + 3), dtype=dtypes.i32, device=device)
-        moe_buf.zero_()
+        sorted_ids = torch.full(
+            (max_num_tokens_padded,), topk << 24 | M, dtype=dtypes.i32, device=device
+        )
+    else:
+        sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
+    sorted_weights = torch.empty(
+        max_num_tokens_padded, dtype=dtypes.fp32, device=device
+    )
+    if expert_mask is not None:
+        sorted_expert_ids = torch.zeros(max_num_m_blocks, dtype=dtypes.i32, device=device)
+    else:
+        sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+    if expert_mask is not None:
+        # Keep EP metadata buffer large enough for per-expert accounting.
+        num_valid_ids = torch.zeros(max(2, int(expert_mask.numel()) + 3), dtype=dtypes.i32, device=device)
+    if expert_mask is not None:
+        moe_buf = torch.zeros((M, model_dim), dtype=moebuf_dtype, device=device)
+    else:
+        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
     fwd_fn = aiter.moe_sorting_opus_fwd if use_opus else aiter.moe_sorting_fwd
     fwd_fn(
@@ -73,31 +83,21 @@ def _moe_sorting_impl(
         num_local_tokens,
         dispatch_policy,
     )
-
     if expert_mask is not None:
-        # Keep this path graph-capture safe by avoiding host sync (.item())
-        # and sanitizing potentially invalid outputs on-device.
-        if expert_mask.dtype == dtypes.i32:
-            local_expert_count_t = (expert_mask >= 0).sum().to(dtypes.i32)
-        else:
-            local_expert_count_t = torch.tensor(
-                int(E_local), dtype=dtypes.i32, device=device
-            )
-        local_expert_count_t = torch.clamp(local_expert_count_t, min=1)
-        valid_blocks_mask = (
-            (sorted_expert_ids >= 0) & (sorted_expert_ids < local_expert_count_t)
+        local_expert_count_t = (expert_mask >= 0).sum().clamp_min(1)
+        valid_blocks_mask = (sorted_expert_ids >= 0) & (
+            sorted_expert_ids < local_expert_count_t
         )
         sorted_expert_ids.masked_fill_(~valid_blocks_mask, 0)
-
-        block_token_mask = valid_blocks_mask.repeat_interleave(int(block_size))[
-            :max_num_tokens_padded
-        ]
         token_ids = sorted_ids & 0x00FFFFFF
         topk_slots = (sorted_ids >> 24) & 0xFF
-        valid_token_mask = block_token_mask & (token_ids < M) & (topk_slots < topk)
+        valid_token_mask = (
+            valid_blocks_mask.repeat_interleave(int(block_size))[:max_num_tokens_padded]
+            & (token_ids < M)
+            & (topk_slots < topk)
+        )
         sorted_ids.masked_fill_(~valid_token_mask, topk << 24 | M)
         sorted_weights.masked_fill_(~valid_token_mask, 0.0)
-
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
 
