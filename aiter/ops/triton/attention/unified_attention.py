@@ -209,12 +209,8 @@ def unified_attention(
     qq_bias=None,
     # Optional tensor for sinks
     sinks=None,
-    sage_version=None,
     sage_mxfp4=False,
 ):
-    if sage_version is not None:
-        sage_mxfp4 = sage_version == SAGE_VERSION.SAGE_MXFP4
-
     assert causal, "Only causal attention is supported"
 
     if sinks is not None:
@@ -283,7 +279,7 @@ def unified_attention(
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
-    if True or use_2d_kernel(
+    if use_2d_kernel(
         head_size,
         SLIDING_WINDOW,
         ALL_DECODE,

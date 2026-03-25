@@ -69,6 +69,7 @@ def pertoken_rotate_quantize_mxfp4(
         hadamard_rotation=hadamard_rotation,
         BLOCK_M=BLOCK_SIZE_M,
         BLOCK_R=BLOCK_R,
+        BLOCK_D=triton.next_power_of_2(d),
         D=d,
         sm_scale=sm_scale,
         num_warps=4,

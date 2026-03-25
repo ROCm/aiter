@@ -175,7 +175,8 @@ def _rotate_mxfp_quantize_k_kernel(
     hadamard_rotation: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_R: tl.constexpr,  # rotation block size
-    D: tl.constexpr,  # D is 128
+    D: tl.constexpr,  # D
+    BLOCK_D: tl.constexpr,  # BLOCK_D
     sm_scale: tl.constexpr,
     SCALE_GROUP_SIZE: tl.constexpr = 32,
 ):
@@ -186,9 +187,9 @@ def _rotate_mxfp_quantize_k_kernel(
     offs_t = pid * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
     mask = offs_t < num_tokens
 
-    offs_d = tl.arange(0, D)
-    offs_dq = tl.arange(0, D // 2)
-    offs_ds = tl.arange(0, D // SCALE_GROUP_SIZE)
+    offs_d = tl.arange(0, BLOCK_D)    
+    offs_dq = tl.arange(0, BLOCK_D // 2)
+    offs_ds = tl.arange(0, BLOCK_D // SCALE_GROUP_SIZE)
 
     # set pointers to either Q or K tensor, descale, quantized output
     # Q block shape: [BLOCK_M, D]
@@ -215,11 +216,11 @@ def _rotate_mxfp_quantize_k_kernel(
         )
         r_mat = tl.load(r_ptr)  # BLOCK_R x BLOCK_R
 
-        shape0: tl.constexpr = BLOCK_M * D // BLOCK_R
+        shape0: tl.constexpr = BLOCK_M * BLOCK_D // BLOCK_R
 
         # Rotate: Q_rot = Q @ R
         qk_rot_tile = tl.dot(qk_tile.reshape((shape0, BLOCK_R)).to(r_mat.dtype), r_mat)
-        qk_rot_tile = qk_rot_tile.reshape((BLOCK_M, D))
+        qk_rot_tile = qk_rot_tile.reshape((BLOCK_M, BLOCK_D))
     else:
         qk_rot_tile = qk_tile.to(tl.float32)
 
@@ -230,12 +231,12 @@ def _rotate_mxfp_quantize_k_kernel(
         qk_rot_tile, mask, tl.uint8
     )
 
-    tl.store(qk_descale_ptr, qk_descale, mask=mask)
+    tl.store(qk_descale_ptr, qk_descale, mask=mask & (offs_ds[None, :] < D // SCALE_GROUP_SIZE))
 
     tl.store(
         qk_quant_ptr,
         qk_quant_tile,
-        mask=mask,
+        mask=mask & (offs_dq[None, :] < D // 2)
     )
 
 

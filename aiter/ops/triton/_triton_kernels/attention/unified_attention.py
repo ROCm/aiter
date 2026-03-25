@@ -784,11 +784,6 @@ def kernel_unified_attention_3d(
 
     query_offset_0 = cur_batch_in_all_start_index + query_pos
     query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
-    query_offset = (
-        query_offset_0[:, None] * query_stride_0
-        + query_offset_1[:, None] * query_stride_1
-        + offs_d_qk[None, :]
-    )
 
     if HEAD_SIZE_PADDED != HEAD_SIZE:
         dim_mask = offs_d < HEAD_SIZE
@@ -803,6 +798,40 @@ def kernel_unified_attention_3d(
         dim_mask_qk = dim_mask
         scale_dim_mask = dim_mask
 
+    query_mask_0 = query_pos < cur_batch_query_len
+    query_mask_1 = query_offset_1 < num_query_heads
+
+    # Q : (BLOCK_M, HEAD_SIZE_PADDED)
+    Q = q_load(
+        query_ptr,
+        query_offset_0,
+        query_offset_1,
+        offs_d_qk,
+        query_stride_0,
+        query_stride_1,
+        query_mask_0,
+        query_mask_1,
+        dim_mask_qk,
+        "",)
+
+
+    q_scale_loaded = None
+    if SAGE_MXFP4:
+        q_scale_loaded = q_load(
+            q_scale,
+            query_offset_0,
+            query_offset_1,
+            offs_d_scale,
+            query_scale_stride_0,
+            query_scale_stride_1,
+            query_mask_0,
+            query_mask_1,
+            scale_dim_mask,
+            "",
+        )
+    
+    
+    
     if HAS_ROPE:
         if ROPE_SIZE_PADDED != ROPE_SIZE:
             if SAGE_MXFP4:
@@ -810,54 +839,38 @@ def kernel_unified_attention_3d(
                 rope_scale_dim_mask = offs_rope_scale < ((HEAD_SIZE + ROPE_SIZE) // 32)
             else:
                 rope_dim_mask = offs_rope < (HEAD_SIZE + ROPE_SIZE)
-                rope_scale_dim_mask = tl.full((1,), 1, dtype=tl.int1)
         else:
             rope_dim_mask = tl.full((1,), 1, dtype=tl.int1)
             rope_scale_dim_mask = tl.full((1,), 1, dtype=tl.int1)
-
-    query_mask_0 = query_pos < cur_batch_query_len
-    query_mask_1 = query_offset_1 < num_query_heads
-
-    if HAS_ROPE:
-        q_rope_offset = (
-            query_offset_0[:, None] * query_stride_0
-            + query_offset_1[:, None] * query_stride_1
-            + offs_rope[None, :]
-        )
-        Q_rope = tl.load(
-            query_ptr + q_rope_offset,
-            mask=rope_dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
-            other=0.0,
+        
+        Q_rope = q_load(
+            query_ptr,
+            query_offset_0,
+            query_offset_1,
+            offs_rope,
+            query_stride_0,
+            query_stride_1,
+            query_mask_0,
+            query_mask_1,
+            rope_dim_mask,
+            "",
         )
 
-    # Q : (BLOCK_M, HEAD_SIZE_PADDED)
-    Q = tl.load(
-        query_ptr + query_offset,
-        mask=dim_mask_qk[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
-        other=0.0,
-    )
-    q_scale_loaded = None
-    if SAGE_MXFP4:
-        q_descale_ptr = (
-            q_scale
-            + query_offset_0[:, None] * query_scale_stride_0
-            + query_offset_1[:, None] * query_scale_stride_1
-            + offs_d_scale[None, :] * query_scale_stride_2
-        )
-        q_scale_loaded = tl.load(
-            q_descale_ptr, mask=scale_dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None], other=0.0
-        )
-        if HAS_ROPE:
-            q_rope_scale_ptr = (
-                q_scale
-                + query_offset_0[:, None] * query_scale_stride_0
-                + query_offset_1[:, None] * query_scale_stride_1
-                + offs_rope_scale[None, :] * query_scale_stride_2
+        if SAGE_MXFP4:
+            q_rope_scale_loaded = q_load(
+                q_scale,
+                query_offset_0,
+                query_offset_1,
+                offs_rope_scale,
+                query_scale_stride_0,
+                query_scale_stride_1,
+                query_mask_0,
+                query_mask_1,
+                rope_scale_dim_mask,
+                "",
             )
-            q_rope_scale_loaded = tl.load(
-                q_rope_scale_ptr, mask=rope_scale_dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None], other=0.0
-            )
-
+    
+    
     block_table_offset = seq_idx * block_table_stride
 
     if USE_SINKS:
@@ -935,55 +948,110 @@ def kernel_unified_attention_3d(
                 block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
             ).to(tl.int64)
 
-        v_offset = (
-            physical_block_idx[:, None] * stride_v_cache_0
-            + kv_head_idx * stride_v_cache_2
-            + offs_d[None, :] * stride_v_cache_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-        )
-
-        k_offset = (
-            physical_block_idx[None, :] * stride_k_cache_0
-            + kv_head_idx * stride_k_cache_2
-            + offs_d_qk[:, None] * stride_k_cache_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-        )
-
+        S = tl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32)
+        
+        
         # K : (HEAD_SIZE, TILE_SIZE)
-        K_load = tl.load(
-            key_cache_ptr + k_offset,
-            mask=dim_mask_qk[:, None] & tile_mask[None, :],
-            other=0.0,
-            cache_modifier=KV_cache_modifier,
+        K = kv_load(
+            key_cache_ptr,
+            physical_block_idx[None, :],
+            kv_head_idx,
+            offs_d_qk[:, None],
+            seq_offset[None, :],
+            stride_k_cache_0,
+            stride_k_cache_1,
+            stride_k_cache_2,
+            stride_k_cache_3,
+            dim_mask_qk[:, None],
+            tile_mask[None, :],
+            BLOCK_SIZE,
+            KV_cache_modifier,
         )
 
         k_scale_loaded = None
         if SAGE_MXFP4:
-            K = K_load
-            k_descale_ptr = (
-                k_scale
-                + physical_block_idx[:, None] * stride_k_cache_scale_0
-                + kv_head_idx * stride_k_cache_scale_2
-                + offs_d_scale[None, :] * stride_k_cache_scale_3
-                + (seq_offset % BLOCK_SIZE)[:, None] * stride_k_cache_scale_1
+            k_scale_loaded = kv_load(
+                k_scale,
+                physical_block_idx[:, None],
+                kv_head_idx,
+                offs_d_scale[None, :],
+                seq_offset[:, None],
+                stride_k_cache_scale_0,
+                stride_k_cache_scale_1,
+                stride_k_cache_scale_2,
+                stride_k_cache_scale_3,
+                scale_dim_mask[None, :],
+                tile_mask[:, None],
+                BLOCK_SIZE,
+                "",
             )
 
-            k_scale_loaded = tl.load(k_descale_ptr, mask=tile_mask[:, None], other=0.0)
+        K = K.to(Q.dtype)
 
-        if not SAGE_MXFP4:
-            K = K_load.to(Q.dtype)
+        if HAS_ROPE:
+            K_rope = kv_load(
+                key_cache_ptr,
+                physical_block_idx[None, :],
+                kv_head_idx,
+                offs_rope[:, None],
+                seq_offset[None, :],
+                stride_k_cache_0,
+                stride_k_cache_1,
+                stride_k_cache_2,
+                stride_k_cache_3,
+                rope_dim_mask[:, None],
+                tile_mask[None, :],
+                BLOCK_SIZE,
+                "",
+            )
+            if SAGE_MXFP4:
+                # Do not transpose rhs mxfp4 scale!
+                k_rope_scale_loaded = kv_load(
+                    k_scale,
+                    physical_block_idx[:, None],
+                    kv_head_idx,
+                    offs_rope_scale[None, :],
+                    seq_offset[:, None],
+                    stride_k_cache_scale_0,
+                    stride_k_cache_scale_1,
+                    stride_k_cache_scale_2,
+                    stride_k_cache_scale_3,
+                    rope_scale_dim_mask[None, :],
+                    tile_mask[:, None],
+                    BLOCK_SIZE,
+                    "",
+                )
+                S += tl.dot_scaled(
+                    Q_rope,
+                    q_rope_scale_loaded,
+                    "e2m1",
+                    K_rope,
+                    k_rope_scale_loaded,
+                    "e2m1",
+                    fast_math=True,
+                )
+            else:
+                S += qk_scale * tl.dot(Q_rope, K_rope)
 
         if PRELOAD_V:
             # V : (TILE_SIZE, HEAD_SIZE)
-            V = tl.load(
-                value_cache_ptr + v_offset,
-                mask=dim_mask[None, :] & tile_mask[:, None],
-                other=0.0,
-                cache_modifier=KV_cache_modifier,
+            V = kv_load(
+                value_cache_ptr,
+                physical_block_idx[:, None],
+                kv_head_idx,
+                offs_d[None, :],
+                seq_offset[:, None],
+                stride_v_cache_0,
+                stride_v_cache_1,
+                stride_v_cache_2,
+                stride_v_cache_3,
+                dim_mask[None, :],
+                tile_mask[:, None],
+                BLOCK_SIZE,
+                KV_cache_modifier,
             )
-
-        # S : (BLOCK_M, TILE_SIZE)
-        S = qk_dot(
+        
+        S += qk_dot(
             Q,
             K,
             qk_scale,
@@ -991,33 +1059,6 @@ def kernel_unified_attention_3d(
             k_scale_loaded,
             SAGE_MXFP4,
         )
-
-        if HAS_ROPE:
-            k_rope_ptrs = (
-                key_cache_ptr
-                + physical_block_idx[None, :] * stride_k_cache_0
-                + kv_head_idx * stride_k_cache_2
-                + offs_rope[:, None] * stride_k_cache_3
-                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-            )
-            K_rope = tl.load(
-                k_rope_ptrs,
-                mask=rope_dim_mask[:, None] & tile_mask[None, :],
-                other=0.0,
-                cache_modifier=KV_cache_modifier,
-            )
-            if SAGE_MXFP4:
-                k_rope_scale_ptr = (
-                    k_scale
-                    + physical_block_idx[:, None] * stride_k_cache_scale_0
-                    + kv_head_idx * stride_k_cache_scale_2
-                    + offs_rope_scale[None, :] * stride_k_cache_scale_3
-                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_k_cache_scale_1
-                )
-                k_rope_scale_loaded = tl.load(k_rope_scale_ptr, mask=rope_scale_dim_mask[None, :] & tile_mask[:, None], other=0.0)
-                S += tl.dot_scaled(Q_rope, q_rope_scale_loaded, "e2m1", K_rope, k_rope_scale_loaded, "e2m1", fast_math=True)
-            else:
-                S += qk_scale * tl.dot(Q_rope, K_rope)
 
         if USE_SOFTCAP:
             # softcap here uses exp2 and consumes RCP_LN2 conversion.
@@ -1075,11 +1116,20 @@ def kernel_unified_attention_3d(
 
         if not PRELOAD_V:
             # V : (TILE_SIZE, HEAD_SIZE)
-            V = tl.load(
-                value_cache_ptr + v_offset,
-                mask=dim_mask[None, :] & tile_mask[:, None],
-                other=0.0,
-                cache_modifier=KV_cache_modifier,
+            V = kv_load(
+                value_cache_ptr,
+                physical_block_idx[:, None],
+                kv_head_idx,
+                offs_d[None, :],
+                seq_offset[:, None],
+                stride_v_cache_0,
+                stride_v_cache_1,
+                stride_v_cache_2,
+                stride_v_cache_3,
+                dim_mask[None, :],
+                tile_mask[:, None],
+                BLOCK_SIZE,
+                KV_cache_modifier,
             )
         # update constants
         L = L * alpha + l_j

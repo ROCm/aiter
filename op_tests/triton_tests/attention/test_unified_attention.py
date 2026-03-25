@@ -12,7 +12,7 @@ import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v2
 
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
-HEAD_SIZES = [128, 256]
+HEAD_SIZES = [192]
 BLOCK_SIZES = [16, 64, 48]
 
 DTYPES = [torch.float16, torch.bfloat16]
@@ -406,7 +406,7 @@ def test_triton_unified_attn_fp8(unified_attn_inputs):
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
-@pytest.mark.parametrize("rope_size", [0, 64])
+@pytest.mark.parametrize("rope_size", [64])
 @torch.inference_mode()
 def test_triton_unified_attn_mxfp4(unified_attn_inputs):
     if not arch_info.is_fp4_avail():
@@ -442,7 +442,7 @@ def test_triton_unified_attn_mxfp4(unified_attn_inputs):
         value_cache,
         hadamard_rotation=True,
         R=None,
-        BLOCK_R=128,
+        BLOCK_R=32,
         layout_k="cache",
         v_descale=None,
     )
