@@ -1073,7 +1073,15 @@ def _ctypes_call(func, fc_name, md_name):
         so_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
         if not os.path.exists(so_path):
             d_args = get_args_of_build(md_name)
-            d_args["torch_exclude"] = True
+            # Do NOT force torch_exclude=True here: modules whose sources include pybind
+            # files (e.g. moe_op_pybind.cu) reference torch C++ vtable symbols at link
+            # time.  Building without torch linkage leaves those symbols undefined, and
+            # ctypes.CDLL() in spawned subprocesses cannot resolve them even when torch
+            # is already imported (torch libs are loaded with RTLD_LOCAL as transitive
+            # deps of torch._C, so they are not in the global symbol table).
+            # Using the per-module config value (default: torch_exclude=False) ensures
+            # the rebuilt .so lists torch libs in NEEDED, allowing the dynamic linker to
+            # satisfy all symbols automatically when ctypes loads the file.
             build_module(
                 md_name,
                 d_args["srcs"],
