@@ -13,8 +13,6 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     _rotate_quantize_q_kernel,
     _rotate_quantize_k_kernel,
     _compute_delta_s_kernel,
-    perblock_quantize_q_kernel,
-    perblock_quantize_kernel,
     _rotate_mxfp_quantize_k_kernel,
 )
 
