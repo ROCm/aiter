@@ -6,7 +6,7 @@ import itertools
 import torch
 import triton
 
-from aiter.ops.triton.attention.unified_attention import unified_attention, SAGE_VERSION
+from aiter.ops.triton.attention.unified_attention import unified_attention
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
@@ -325,10 +325,6 @@ def run_benchmark(custom, args):
         else:
             q_descale, k_descale, v_descale = None, None, None
 
-        if args.sagev2:
-            sage_version = SAGE_VERSION.SAGE_MXFP4
-        else:
-            sage_version = None
 
         def fn():
             return unified_attention(
@@ -349,7 +345,6 @@ def run_benchmark(custom, args):
                 k_descale=k_descale,
                 v_descale=v_descale,
                 sinks=sinks,
-                sage_version=sage_version,
             )
 
         ms = triton.testing.do_bench(fn)
