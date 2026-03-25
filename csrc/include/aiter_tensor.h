@@ -4,7 +4,7 @@
 #include "aiter_enum.h"
 #include <cstdint>
 
-struct AiterTensor
+struct aiter_tensor_t
 {
     void* ptr;          // data_ptr, pointer to GPU memory
     size_t numel_;      // total number of elements
