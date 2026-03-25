@@ -1,5 +1,7 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+from enum import Enum
+
 import triton
 import torch
 from aiter.ops.triton.utils.device_info import get_num_sms
@@ -27,6 +29,18 @@ def select_2d_config(
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
+    TILE_SIZE = 64
+    # in case head_size is large
+    max_num_stages_2d = 4
+    if head_size > 128:
+        max_num_stages_2d = 2
+    if all_decode == False:
+        num_stages_2d = 1
+        num_warps = 2
+    else:
+        num_stages_2d = 3
+        num_warps = 2
+        TILE_SIZE = max(32, min(64, triton.next_power_of_2(block_size)))
 
     TILE_SIZE = 32 if arch.name == "gfx1201" else 16 if arch.is_rdna else 64
     waves_per_eu = 8 if arch.name == "gfx1151" else 6 if arch.is_rdna else 2
@@ -39,7 +53,7 @@ def select_2d_config(
     # pure decode config
     else:
         # to not have masking when loading KV
-        TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+        TILE_SIZE = max(32, min(64, triton.next_power_of_2(block_size)))
         if arch.is_rdna:
             num_stages_2d, num_warps = 1, 4
         else:
@@ -68,7 +82,7 @@ def select_3d_config(
 ):
     reduce_num_warps = 2
     attn_warps = 2
-    TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+    TILE_SIZE = max(32, min(64, triton.next_power_of_2(block_size)))
     # MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     num_segments = math.ceil(target_num_prgms / num_2d_prgms)
     num_segments = triton.next_power_of_2(num_segments)
@@ -195,17 +209,24 @@ def unified_attention(
     qq_bias=None,
     # Optional tensor for sinks
     sinks=None,
+    sage_version=None,
     sage_mxfp4=False,
 ):
+    if sage_version is not None:
+        sage_mxfp4 = sage_version == SAGE_VERSION.SAGE_MXFP4
+
     assert causal, "Only causal attention is supported"
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
 
     head_size = v.shape[-1]
-    ROPE_SIZE = k.shape[-1] - v.shape[-1]
+    if sage_mxfp4:
+        ROPE_SIZE = k.shape[-1] * 2 - v.shape[-1]
+    else:
+        ROPE_SIZE = k.shape[-1] - v.shape[-1]
     HAS_ROPE = ROPE_SIZE > 0
-
+    
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
@@ -218,7 +239,6 @@ def unified_attention(
     num_queries_per_kv = num_query_heads // num_kv_heads
 
     if sage_mxfp4:
-        head_size *= 2
         (
             query_scale_stride_0,
             query_scale_stride_1,
@@ -348,7 +368,7 @@ def unified_attention(
             SAGE_MXFP4=sage_mxfp4,
             HAS_ROPE=HAS_ROPE,
             ROPE_SIZE=ROPE_SIZE,
-            ROPE_SIZE_PADDED=triton.next_power_of_2(ROPE_SIZE),
+            ROPE_SIZE_PADDED=triton.next_power_of_2(ROPE_SIZE) if HAS_ROPE else 0,
             **config,
         )
 
@@ -436,6 +456,9 @@ def unified_attention(
             BLOCK_M=BLOCK_M,
             ALL_DECODE=ALL_DECODE,
             SAGE_MXFP4=sage_mxfp4,
+            HAS_ROPE=HAS_ROPE,
+            ROPE_SIZE=ROPE_SIZE,
+            ROPE_SIZE_PADDED=triton.next_power_of_2(ROPE_SIZE) if HAS_ROPE else 0,
             **attn_config,
         )
         reduce_segments[(q.shape[0], num_query_heads)](

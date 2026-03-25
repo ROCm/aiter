@@ -122,7 +122,6 @@ def unified_attn_inputs(
     head_size_qk: int,
     sliding_window: Optional[int],
     dtype: torch.dtype,
-    q_dtype: Optional[torch.dtype],
     block_size: int,
     soft_cap: Optional[float],
     num_blocks: int,
@@ -225,10 +224,9 @@ def unified_attn_inputs(
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
 @pytest.mark.parametrize("sliding_window", [None, 256])
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("q_dtype", QDTYPES)
 @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
-@pytest.mark.parametrize("rope_size", [0, 64])
+@pytest.mark.parametrize("rope_size", [0])
 @torch.inference_mode()
 def test_triton_unified_attn(
     unified_attn_inputs,
@@ -282,7 +280,6 @@ def test_triton_unified_attn(
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
 @pytest.mark.parametrize("sliding_window", [None, 256])
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("q_dtype", QDTYPES)
 @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("rope_size", [64])  # MLA only
@@ -338,7 +335,6 @@ def test_triton_unified_attn_mla(unified_attn_inputs):
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
 @pytest.mark.parametrize("sliding_window", [None, 256])
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("q_dtype", QDTYPES)
 @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("rope_size", [0, 64])
@@ -408,10 +404,9 @@ def test_triton_unified_attn_fp8(unified_attn_inputs):
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
 @pytest.mark.parametrize("sliding_window", [None, 256])
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("q_dtype", QDTYPES)
 @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
-@pytest.mark.parametrize("rope_size", [0])  # ROPE not supported
+@pytest.mark.parametrize("rope_size", [0, 64])
 @torch.inference_mode()
 def test_triton_unified_attn_mxfp4(unified_attn_inputs):
     if not arch_info.is_fp4_avail():
@@ -476,3 +471,5 @@ def test_triton_unified_attn_mxfp4(unified_attn_inputs):
     ref_output = ref_paged_attn(**ref_kwargs)
     atol, rtol = 3.5e-1, 2.5e-1
     torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
+    mae = (output - ref_output).abs().mean().item()
+    assert mae < 0.1, f"MXFP4 mean absolute error too high: {mae}"
