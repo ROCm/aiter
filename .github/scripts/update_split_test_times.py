@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
-
 ALLOWED_CONCLUSIONS = {"success", "failure"}
 LOG_TIME_RE = re.compile(r"Time elapsed of\s+([^:]+):\s*([0-9]+(?:\.[0-9]+)?)")
 ASSIGN_RE = re.compile(r"^\s*FILE_TIMES\[(?P<key>[^\]]+)\]=(?P<value>\d+)\s*$")
@@ -76,7 +75,9 @@ def fetch_recent_run_ids(repo: str, workflow_file: str, runs_count: int) -> list
             f"?branch=main&status=completed&per_page={per_page}&page={page}"
         )
         payload = gh_json(["gh", "api", endpoint])
-        workflow_runs = payload.get("workflow_runs", []) if isinstance(payload, dict) else []
+        workflow_runs = (
+            payload.get("workflow_runs", []) if isinstance(payload, dict) else []
+        )
         if not workflow_runs:
             break
         for run in workflow_runs:
@@ -101,7 +102,9 @@ def list_artifacts(repo: str, run_id: int) -> list[dict]:
     return [a for a in artifacts if isinstance(a, dict)]
 
 
-def download_artifact(repo: str, run_id: int, artifact_name: str, out_dir: Path) -> None:
+def download_artifact(
+    repo: str, run_id: int, artifact_name: str, out_dir: Path
+) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     run_cmd(
         [
@@ -136,7 +139,11 @@ def list_test_files(repo_root: Path, test_type: str) -> list[str]:
         glob_pattern = "op_tests/test_*.py"
     else:
         glob_pattern = "op_tests/triton_tests/**/test_*.py"
-    files = sorted(str(p.relative_to(repo_root)) for p in repo_root.glob(glob_pattern) if p.is_file())
+    files = sorted(
+        str(p.relative_to(repo_root))
+        for p in repo_root.glob(glob_pattern)
+        if p.is_file()
+    )
     return files
 
 
@@ -208,8 +215,14 @@ def parse_existing_file_times(script_path: Path, test_type: str) -> dict[str, in
     lines = section.splitlines()
     state = "search"
     collected: dict[str, int] = {}
-    marker = 'if [[ "$TEST_TYPE" == "aiter" ]]; then' if test_type == "aiter" else 'elif [[ "$TEST_TYPE" == "triton" ]]; then'
-    end_marker = 'elif [[ "$TEST_TYPE" == "triton" ]]; then' if test_type == "aiter" else "fi"
+    marker = (
+        'if [[ "$TEST_TYPE" == "aiter" ]]; then'
+        if test_type == "aiter"
+        else 'elif [[ "$TEST_TYPE" == "triton" ]]; then'
+    )
+    end_marker = (
+        'elif [[ "$TEST_TYPE" == "triton" ]]; then' if test_type == "aiter" else "fi"
+    )
     for line in lines:
         if state == "search":
             if line.strip() == marker:
@@ -269,7 +282,9 @@ def compute_new_times(
     return ComputeResult(merged=merged, stats=stats, defaulted_files=defaulted_files)
 
 
-def build_file_times_block(aiter_times: dict[str, int], triton_times: dict[str, int]) -> str:
+def build_file_times_block(
+    aiter_times: dict[str, int], triton_times: dict[str, int]
+) -> str:
     def sorted_items(d: dict[str, int]) -> list[tuple[str, int]]:
         return sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))
 
@@ -366,14 +381,18 @@ def format_summary(
     )
 
 
-def collect_aiter_samples(repo: str, run_ids: list[int], scratch: Path) -> dict[str, list[int]]:
+def collect_aiter_samples(
+    repo: str, run_ids: list[int], scratch: Path
+) -> dict[str, list[int]]:
     samples: dict[str, list[int]] = defaultdict(list)
     found_artifact = False
     parsed_entries = 0
     for run_id in run_ids:
         artifacts = list_artifacts(repo, run_id)
         names = [a.get("name", "") for a in artifacts if isinstance(a.get("name"), str)]
-        target_names = [n for n in names if n.startswith("standard-test-log-") and "-shard-" in n]
+        target_names = [
+            n for n in names if n.startswith("standard-test-log-") and "-shard-" in n
+        ]
         if target_names:
             found_artifact = True
         for name in target_names:
@@ -439,7 +458,9 @@ def write_output_changed(changed: bool) -> None:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Update split_tests.sh FILE_TIMES using recent CI runs")
+    parser = argparse.ArgumentParser(
+        description="Update split_tests.sh FILE_TIMES using recent CI runs"
+    )
     parser.add_argument("--repo", default=os.getenv("GITHUB_REPOSITORY", "ROCm/aiter"))
     parser.add_argument("--runs-count", type=int, default=10)
     parser.add_argument("--aggregate", choices=["median", "mean"], default="median")
@@ -468,16 +489,24 @@ def main() -> int:
     triton_existing = parse_existing_file_times(script_path, "triton")
 
     aiter_run_ids = fetch_recent_run_ids(args.repo, "aiter-test.yaml", args.runs_count)
-    triton_run_ids = fetch_recent_run_ids(args.repo, "triton-test.yaml", args.runs_count)
+    triton_run_ids = fetch_recent_run_ids(
+        args.repo, "triton-test.yaml", args.runs_count
+    )
     if not aiter_run_ids:
-        raise RuntimeError("No eligible completed (success/failure) runs found for aiter-test.yaml")
+        raise RuntimeError(
+            "No eligible completed (success/failure) runs found for aiter-test.yaml"
+        )
     if not triton_run_ids:
-        raise RuntimeError("No eligible completed (success/failure) runs found for triton-test.yaml")
+        raise RuntimeError(
+            "No eligible completed (success/failure) runs found for triton-test.yaml"
+        )
 
     with tempfile.TemporaryDirectory(prefix="split-test-times-") as temp_dir:
         scratch = Path(temp_dir)
         aiter_samples = collect_aiter_samples(args.repo, aiter_run_ids, scratch)
-        triton_samples = collect_triton_samples(args.repo, triton_run_ids, scratch, set(triton_files))
+        triton_samples = collect_triton_samples(
+            args.repo, triton_run_ids, scratch, set(triton_files)
+        )
 
     aiter_result = compute_new_times(
         discovered_files=aiter_files,
