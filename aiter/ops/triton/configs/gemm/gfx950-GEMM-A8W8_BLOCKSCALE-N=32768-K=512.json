@@ -84,14 +84,14 @@
     "NUM_KSPLIT": 1
   },
   "any": {
-    "BLOCK_SIZE_M": 256,
+    "BLOCK_SIZE_M": 64,
     "BLOCK_SIZE_N": 128,
     "BLOCK_SIZE_K": 128,
-    "GROUP_SIZE_M": 8,
-    "num_warps": 4,
+    "GROUP_SIZE_M": 16,
+    "num_warps": 2,
     "num_stages": 2,
-    "waves_per_eu": 1,
-    "matrix_instr_nonkdim": 16,
+    "waves_per_eu": 2,
+    "matrix_instr_nonkdim": 32,
     "cache_modifier": null,
     "NUM_KSPLIT": 1
   }
