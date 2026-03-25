@@ -4,6 +4,44 @@
 import torch
 
 
+def shuffle_weight_gfx1250(w: torch.Tensor) -> torch.Tensor:
+    """
+    Preshuffle weights for gfx1250 WMMA.
+
+    For 2D input (N, K): view as (N//16, 16, K//32, 2, 16) ->
+        permute(0, 2, 3, 1, 4) -> reshape (N//16, K*16).
+    For 3D input (E, N, K) or (E, K, N): transpose to (E, N, K) first,
+        then apply the same pattern per-expert.
+
+    The result is reshaped to (N//16, K*16) for TDM-optimal loading.
+    """
+    x_type = w.dtype
+    if hasattr(torch, "float4_e2m1fn_x2") and x_type == torch.float4_e2m1fn_x2:
+        w = w.view(torch.uint8)
+
+    if w.ndim == 2:
+        N, K = w.shape
+        assert N % 16 == 0, f"N={N} must be divisible by 16"
+        assert K % 32 == 0, f"K={K} must be divisible by 32"
+        w = w.view(N // 16, 16, K // 32, 2, 16)
+        w = w.permute(0, 2, 3, 1, 4).contiguous()
+        w = w.view(N // 16, K * 16)
+    elif w.ndim == 3:
+        E, K, N = w.shape
+        assert K % 32 == 0, f"K={K} must be divisible by 32"
+        assert N % 16 == 0, f"N={N} must be divisible by 16"
+        w = w.transpose(-1, -2)  # (E, N, K)
+        w = w.view(E, N // 16, 16, K // 32, 2, 16)
+        w = w.permute(0, 1, 3, 4, 2, 5).contiguous()
+        w = w.view(E, N // 16, K * 16)
+        w = w.transpose(-1, -2)  # (E, K*16, N//16)
+    else:
+        raise ValueError(f"Expected 2D or 3D tensor, got {w.ndim}D")
+
+    w = w.view(x_type)
+    return w
+
+
 def shuffle_weight(x: torch.Tensor, layout=(16, 16), use_int4=False) -> torch.Tensor:
     # Hardcode BLOCK_K and BLOCK_N
     x_type = x.dtype

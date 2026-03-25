@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# from aiter.aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 import pytest
 import torch
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
@@ -9,29 +10,31 @@ from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
 from aiter.ops.triton.gluon.gemm_afp4wfp4 import gemm_afp4wfp4 as gluon_gemm_afp4wfp4_CDNA4
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.shuffle import shuffle_weight, shuffle_weight_gfx1250
 
 DEVICE_ARCH = arch_info.get_arch()
-
-
+    
 def shuffle_scales(scales: torch.Tensor):
-    scales_shuffled = scales.clone()
-    sm, sn = scales_shuffled.shape
-    scales_shuffled = scales_shuffled.view(sm // 32, 2, 16, sn // 8, 2, 4, 1)
-    scales_shuffled = scales_shuffled.permute(0, 3, 5, 2, 4, 1, 6).contiguous()
-    scales_shuffled = scales_shuffled.view(sm // 32, sn * 32)
-    return scales_shuffled
+    
+    return scales
+    # scales_shuffled = scales.clone()
+    # sm, sn = scales_shuffled.shape
+    # scales_shuffled = scales_shuffled.view(sm // 32, 2, 16, sn // 8, 2, 4, 1)
+    # scales_shuffled = scales_shuffled.permute(0, 3, 5, 2, 4, 1, 6).contiguous()
+    # scales_shuffled = scales_shuffled.view(sm // 32, sn * 32)
+    # return scales_shuffled
 
 
 def un_shuffle_scales(scales_shuffled: torch.Tensor):
-    scales = scales_shuffled.clone()
-    sm, sn = scales.shape
-    scales = scales.view(sm * 32, sn // 32)
-    sm, sn = scales.shape
-    scales = scales.view(sm // 32, sn // 8, 4, 16, 2, 2, 1)
-    scales = scales.permute(0, 5, 3, 1, 4, 2, 6).contiguous()
-    scales = scales.view(sm, sn)
-    return scales
+    return scales_shuffled
+    # scales = scales_shuffled.clone()
+    # sm, sn = scales.shape
+    # scales = scales.view(sm * 32, sn // 32)
+    # sm, sn = scales.shape
+    # scales = scales.view(sm // 32, sn // 8, 4, 16, 2, 2, 1)
+    # scales = scales.permute(0, 5, 3, 1, 4, 2, 6).contiguous()
+    # scales = scales.view(sm, sn)
+    # return scales
 
 
 # Note this is specified by the HW and cannot be changed.
@@ -48,10 +51,6 @@ def generate_gemm_afp4wfp4_inputs(
     shuffle_weight_fg=False,
     shuffle_scales_fg=False,
 ):
-    if shuffle_weight_fg:
-        assert (
-            shuffle_scales_fg
-        ), "weight shuffling is only supported with scale shuffling"
 
     torch.manual_seed(5)
     if isinstance(dtype, str):
@@ -86,8 +85,8 @@ def generate_gemm_afp4wfp4_inputs(
     w_scales = torch.randint(
         124, 128, (K // SCALE_GROUP_SIZE, N), dtype=torch.uint8, device="cuda"
     )
-    x_scales = x_scales.T
-    w_scales = w_scales.T
+    x_scales = x_scales.T.contiguous()
+    w_scales = w_scales.T.contiguous()
     if shuffle_scales_fg:
         if M >= 32:
             x_scales_shuffled = shuffle_scales(x_scales)
@@ -99,16 +98,20 @@ def generate_gemm_afp4wfp4_inputs(
         w_scales_shuffled = w_scales
 
     if shuffle_weight_fg:
-        use_int4 = False
-        weight_shuffle_layout = (16, 16)
-        w_shuffed = shuffle_weight(
-            w, layout=weight_shuffle_layout, use_int4=use_int4
-        ).reshape(
-            w.shape[0] // weight_shuffle_layout[0],
-            w.shape[1] * weight_shuffle_layout[0],
-        )
-    else:
-        w_shuffed = w
+        if DEVICE_ARCH == "gfx1250":
+            # gfx1250: simple reshape for TDM coalescing (no tile permutation)
+            w_shuffed = shuffle_weight_gfx1250(w)
+        # else:
+        #     use_int4 = False
+        #     weight_shuffle_layout = (16, 16)
+        #     w_shuffed = shuffle_weight(
+        #         w, layout=weight_shuffle_layout, use_int4=use_int4
+        #     ).reshape(
+        #         w.shape[0] // weight_shuffle_layout[0],
+        #         w.shape[1] * weight_shuffle_layout[0],
+            # )
+    # else:
+        # w_shuffed = w
 
     y = None
     if output:
@@ -405,7 +408,7 @@ def test_gemm_mxfp4_preshuffled_gfx1250(
         dtype,
         layout=layout,
         output=output,
-        shuffle_scales_fg=True,
+        shuffle_scales_fg=False,
         shuffle_weight_fg=True,
     )
 
