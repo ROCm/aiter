@@ -446,15 +446,6 @@ namespace py = pybind11;
           py::arg("kernelName")  = std::nullopt, \
           py::arg("bpreshuffle") = false);
 
-#define FLATMM_A8W8_BLOCKSCALE_ASM_PYBIND \
-    m.def("flatmm_a8w8_blockscale_asm",   \
-          &flatmm_a8w8_blockscale_asm,    \
-          "flatmm_a8w8_blockscale_asm",   \
-          py::arg("XQ"),                  \
-          py::arg("WQ"),                  \
-          py::arg("x_scale"),             \
-          py::arg("w_scale"),             \
-          py::arg("Out"));
 
 #define GEMM_A4W4_BLOCKSCALE_PYBIND \
     m.def("gemm_a4w4_blockscale",   \
