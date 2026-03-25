@@ -443,9 +443,9 @@ def test_triton_unified_attn(
 @pytest.mark.parametrize(
     "use_tdm, num_kv_blocks",
     [
-        #(False, 1),
+        (False, 1),
         (True, 1),
-        #(True, 4),
+        (True, 4),
     ],
 )
 
