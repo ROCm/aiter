@@ -49,7 +49,7 @@
   },
   "M_LEQ_128": {
     "BLOCK_SIZE_M": 64,
-    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_N": 32,
     "BLOCK_SIZE_K": 128,
     "GROUP_SIZE_M": 4,
     "num_warps": 4,
