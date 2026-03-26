@@ -187,7 +187,7 @@ def kernel_unified_attention_2d(
     FP8_MAX: tl.constexpr = float8_info.max,
     ALL_DECODE: tl.constexpr = False,  # bool
     SAGE_MXFP4: tl.constexpr = False,  # bool
-    KV_LAYOUT_IS_THD: tl.constexpr = True,  # bool
+    KV_LAYOUT_IS_THD: tl.constexpr = False,  # bool
     PRELOAD_V: tl.constexpr = False,  # bool
     HAS_ROPE: tl.constexpr = False,  # bool
     IS_CAUSAL: tl.constexpr = True,  # bool
@@ -731,7 +731,7 @@ def kernel_unified_attention_3d(
     ROPE_SIZE: tl.constexpr = 0,  # int
     ROPE_SIZE_PADDED: tl.constexpr = 0,  # int, must be power of 2
     IS_CAUSAL: tl.constexpr = True,  # bool
-    KV_LAYOUT_IS_THD: tl.constexpr = True,  # bool
+    KV_LAYOUT_IS_THD: tl.constexpr = False,  # bool
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
