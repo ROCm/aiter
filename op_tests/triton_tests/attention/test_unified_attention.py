@@ -197,7 +197,7 @@ def make_unified_attn_inputs(
     cu_query_lens = torch.tensor(
         [0] + query_lens, dtype=torch.int32, device="cuda"
     ).cumsum(dim=0, dtype=torch.int32)
-    
+
     kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32, device="cuda")
     query_lens = torch.tensor(query_lens, dtype=torch.int32, device="cuda")
 
