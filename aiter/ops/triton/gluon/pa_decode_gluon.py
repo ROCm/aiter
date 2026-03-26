@@ -1679,16 +1679,23 @@ def paged_attention_decode_sliding_window_head_1(
             value_tensor = gl.permute(value_tensor, [0, 1, 3, 2])
         else:
             # Load values from standard cache layout
-            kv_block_numbers_reshaped = gl.convert_layout(
-                kv_block_numbers,
-                layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_value_layout)),
-            )
-
-            value_block_offsets = (
-                kv_block_numbers_reshaped[:, None, None] * stride_value_block
-                + value_dim1_offsets[None, :, None] * stride_value_head_size
-                + (page_offset + value_dim2_offsets)[None, None, :]
-            )
+            if MAX_NUM_KV_BLOCKS_PER_COMPUTE == 1:
+                kv_block_numbers_reshaped = kv_block_numbers
+                value_block_offsets = (
+                    kv_block_numbers_reshaped * stride_value_block
+                    + value_dim1_offsets[None, :, None] * stride_value_head_size
+                    + (page_offset + value_dim2_offsets)[None, None, :]
+                )
+            else:
+                kv_block_numbers_reshaped = gl.convert_layout(
+                    kv_block_numbers,
+                    layout=gl.SliceLayout(1, gl.SliceLayout(2, blocked_value_layout)),
+                )
+                value_block_offsets = (
+                    kv_block_numbers_reshaped[:, None, None] * stride_value_block
+                    + value_dim1_offsets[None, :, None] * stride_value_head_size
+                    + (page_offset + value_dim2_offsets)[None, None, :]
+                )
 
             # Schedule: Start value VMEM load, then QK MFMA
             value_tensor = gl.load(value_cache_ptr + value_block_offsets)
