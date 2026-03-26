@@ -376,7 +376,7 @@ def kernel_unified_attention_2d(
             qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
         )  # shape: [BLOCK_M]
 
-    if IS_CAUSAL:
+    if IS_CAUSAL or SLIDING_WINDOW > 0:
         # compute the length of the longest sequence prefix spanned by any
         # query token in the current q_block (q_block_local_idx)
         max_seq_prefix_len = (
@@ -558,7 +558,7 @@ def kernel_unified_attention_2d(
             # multiply by RCP_LN2 again to be used in later exp2
             S = apply_softcap(S, softcap) * RCP_LN2
 
-        if IS_CAUSAL:
+        if IS_CAUSAL or SLIDING_WINDOW > 0:
             seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
         else:
             seq_mask = seq_offset[None, :] < seq_len
@@ -925,7 +925,7 @@ def kernel_unified_attention_3d(
             qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
         )  # shape: [BLOCK_M]
 
-    if IS_CAUSAL:
+    if IS_CAUSAL or SLIDING_WINDOW > 0:
         # compute the length of the longest sequence prefix spanned by any
         # query token in the current q_block (q_block_local_idx)
         max_seq_prefix_len = (
@@ -1086,7 +1086,7 @@ def kernel_unified_attention_3d(
             # multiply by RCP_LN2 again to be used in later exp2
             S = apply_softcap(S, softcap) * RCP_LN2
 
-        if IS_CAUSAL:
+        if IS_CAUSAL or SLIDING_WINDOW > 0:
             seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
         else:
             seq_mask = seq_offset[None, :] < seq_len
