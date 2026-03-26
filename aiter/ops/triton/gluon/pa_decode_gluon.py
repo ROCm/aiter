@@ -27,6 +27,7 @@ try:
         sched_barrier as _amd_iglp_sched_barrier,
         sched_group_barrier as _amd_iglp_sched_group_barrier,
         set_prio as _amd_set_prio,
+        iglp_opt as _amd_iglp_opt,
     )
 except ImportError:
     # ignore iglp hint
@@ -41,6 +42,10 @@ except ImportError:
     @gluon.jit
     def _amd_set_prio(value, prio):
         pass
+
+    @gluon.jit
+    def _amd_iglp_opt(tensor, value=0):
+        return tensor
 
 @lru_cache(maxsize=1)
 def get_cdna_version():
@@ -1055,9 +1060,9 @@ def paged_attention_decode_sliding_window_head_1(
         gl.static_assert(key_scale.dtype.element_ty == gl.float32)
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
 
-    # DS_WRITE: gl.constexpr = 0x200
+    DS_WRITE: gl.constexpr = 0x200
     DS_READ: gl.constexpr = 0x100
-    BUFFER_LOAD: gl.constexpr = 0x020
+    VMEM_LOAD: gl.constexpr = 0x020
     MFMA: gl.constexpr = 0x008
     # VALU: gl.constexpr = 0x002
 
