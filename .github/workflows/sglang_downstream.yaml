@@ -125,6 +125,10 @@ jobs:
           -w /sglang-checkout \
           --name sglang_aiter_test \
           sglang_aiter_test:ci
+
+          # The checkout is owned by the runner (non-root) but the container runs as
+          # root. Git >= 2.35.2 rejects cross-user repos, so mark the mount as safe.
+          docker exec -u root sglang_aiter_test git config --global --add safe.directory /sglang-checkout
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
