@@ -287,6 +287,8 @@ def compile_mixed_moe_gemm1(
     out_elem_bytes = 4 if out_is_f32 else 2
 
     _e_vec_s1 = min(tile_n // 32, 8)
+    if _need_quant:
+        _e_vec_s1 = max(2, _e_vec_s1)
     _num_threads_per_quant_blk_s1 = 32 // _e_vec_s1
     _shuffle_dists_s1 = []
     _sh_val = 1
@@ -1913,8 +1915,18 @@ def compile_mixed_moe_gemm1(
 
                         ptr_addr_idx = row_byte_base + col_g0 / arith.constant(2, index=True)
                         out_ptr_v = _idx_to_llvm_ptr(ptr_addr_idx)
-                        packed_raw = packed_i32._value if hasattr(packed_i32, "_value") else packed_i32
-                        llvm.StoreOp(packed_raw, out_ptr_v, alignment=4, nontemporal=True)
+                        _pack_bytes = _e_vec // 2
+                        if _pack_bytes == 1:
+                            store_val = arith.TruncIOp(T.i8, packed_i32)
+                            store_raw = store_val._value if hasattr(store_val, "_value") else store_val
+                            llvm.StoreOp(store_raw, out_ptr_v, alignment=1, nontemporal=True)
+                        elif _pack_bytes == 2:
+                            store_val = arith.TruncIOp(T.i16, packed_i32)
+                            store_raw = store_val._value if hasattr(store_val, "_value") else store_val
+                            llvm.StoreOp(store_raw, out_ptr_v, alignment=2, nontemporal=True)
+                        else:
+                            packed_raw = packed_i32._value if hasattr(packed_i32, "_value") else packed_i32
+                            llvm.StoreOp(packed_raw, out_ptr_v, alignment=4, nontemporal=True)
 
                         if _need_sort:
                             col_g0_i32 = arith.index_cast(T.i32, col_g0)

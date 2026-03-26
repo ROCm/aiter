@@ -638,6 +638,10 @@ def _flydsl_stage1_wrapper(
     w1_scale=None,
     a1_scale=None,
     sorted_weights=None,
+    fuse_fp4_quant=False,
+    fuse_sort_scale=False,
+    out_scale=None,
+    out_scale_sorted=None,
     **_kwargs,
 ):
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
@@ -662,6 +666,8 @@ def _flydsl_stage1_wrapper(
         w1_scale=w1_scale,
         a1_scale=a1_scale,
         sorted_weights=sorted_weights,
+        fuse_fp4_quant=fuse_fp4_quant,
+        fuse_sort_scale=fuse_sort_scale,
     )
 
 
@@ -911,6 +917,21 @@ def get_2stage_cfgs(
         kernelName1 = cfg["kernelName1"]
         kernelName2 = cfg["kernelName2"]
         run_1stage = cfg.get("run_1stage", False)
+
+    if (
+        q_type == QuantType.per_1x32
+        and q_dtype_a == dtypes.fp4x2
+        and q_dtype_w == dtypes.fp4x2
+        and is_flydsl_available()
+    ):
+        run_1stage = False
+        _out_str = "bf16" if dtype == dtypes.bf16 else "f16"
+        _valid_tiles = [32, 64, 128]
+        _bm = int(block_m) if block_m else 32
+        _bm = min((t for t in _valid_tiles if t >= _bm), default=128)
+        block_m = _bm
+        kernelName1 = f"flydsl_moe1_afp4_wfp4_{_out_str}_t{_bm}x128x256"
+        kernelName2 = f"flydsl_moe2_afp4_wfp4_{_out_str}_t{_bm}x256x256_atomic"
 
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
