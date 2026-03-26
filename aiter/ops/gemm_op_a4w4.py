@@ -102,26 +102,18 @@ def gemm_a4w4(
         raise RuntimeError(
             f"A4W4 GEMM kernel is not supported on gfx942, but got {gfx_arch}!"
         )
-    ck_config = get_GEMM_config(m, n, k)
+    tuned_config = get_GEMM_config(m, n, k)
     # splitK = None
     splitK = 0
     kernelName = ""
-    if ck_config is not None:
-        splitK = ck_config.get("splitK", None)
-        kernelName = ck_config["kernelName"]
-    if (
-        ENABLE_CK
-        and ck_config is not None
-        and kernelName.find("_ZN") == -1
-        # or bias is None
-    ):
+    if tuned_config is not None:
+        splitK = tuned_config.get("splitK", None)
+        kernelName = tuned_config["kernelName"]
+    if ENABLE_CK and tuned_config is not None and kernelName.find("_ZN") == -1:
         splitK = 0 if splitK is None else splitK
         return gemm_a4w4_blockscale(
             A.view(m, k // 2), B, A_scale, B_scale, out, splitK=splitK
         )[:m]
-    if not ENABLE_CK and kernelName.find("_ZN") == -1:
-        splitK = 0
-        kernelName = ""
     assert (
         out.shape[0] % 32 == 0
     ), "Dim0 of gemm_a4w4_asm output needs to be padded to multiples of 32!"

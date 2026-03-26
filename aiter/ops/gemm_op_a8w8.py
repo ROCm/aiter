@@ -679,13 +679,6 @@ def gemm_a8w8_blockscale(
         )
 
         if isBpreshuffled:
-            if (
-                get_gfx() in ["gfx950"]
-                and m >= 16
-                and k >= 512
-                and dtype == dtypes.bf16
-            ):
-                return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
 
             weight_shuffle_layout = (16, 16)
             assert (
@@ -765,11 +758,8 @@ def gemm_a8w8_blockscale_bpreshuffle(
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
     if not ENABLE_CK:
-        from aiter.jit.utils.chip_info import get_gfx
 
         k = XQ.shape[1]
-        if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:
-            return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
 
         from .triton.gemm.basic.gemm_a8w8_blockscale import (
             gemm_a8w8_blockscale_preshuffle as gemm_a8w8_blockscale_preshuffle_triton,
