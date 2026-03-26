@@ -1,7 +1,5 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
-from re import T
-import triton
 import triton.language as tl
 import torch
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -147,7 +145,6 @@ class AttentionConfig:
         self.USE_LOAD_BUFFER_OP = gl.constexpr(USE_LOAD_BUFFER_OP)
         self.USE_STORE_BUFFER_OP = gl.constexpr(USE_STORE_BUFFER_OP)
 
-        # gl.static_assert(NUM_WARPS == 2 or NUM_WARPS == 4, "NUM_WARPS must be 2 or 4")
         assert NUM_WARPS == 1 or NUM_WARPS == 2 or NUM_WARPS == 4
 
         if NUM_WARPS == 1:
