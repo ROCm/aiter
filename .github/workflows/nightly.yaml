@@ -2,8 +2,8 @@ name: Nightly Build
 
 on:
   schedule:
-    # Run daily at 2 AM UTC
-    - cron: '0 2 * * *'
+    # Run daily at 1 AM UTC
+    - cron: '0 1 * * *'
   pull_request:
     branches:
       - main
