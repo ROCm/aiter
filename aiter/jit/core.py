@@ -1091,8 +1091,33 @@ def _ctypes_call(func, fc_name, md_name):
                 d_args.get("third_party", []),
             )
         lib = ctypes.CDLL(so_path)
+        ctypes_status_mode = False
+        ctypes_abi_version = 1
+        err_getter = None
+        err_clear = None
+        try:
+            abi_ver_getter = getattr(lib, "aiter_ctypes_abi_version")
+            abi_ver_getter.argtypes = []
+            abi_ver_getter.restype = ctypes.c_int
+            ctypes_abi_version = abi_ver_getter()
+            ctypes_status_mode = ctypes_abi_version >= 2
+        except AttributeError:
+            ctypes_abi_version = 1
+            ctypes_status_mode = False
         c_func = getattr(lib, fc_name)
-        c_func.restype = None
+        c_func.restype = ctypes.c_int if ctypes_status_mode else None
+        try:
+            err_getter = getattr(lib, "aiter_get_last_error")
+            err_getter.argtypes = []
+            err_getter.restype = ctypes.c_char_p
+        except AttributeError:
+            err_getter = None
+        try:
+            err_clear = getattr(lib, "aiter_clear_last_error")
+            err_clear.argtypes = []
+            err_clear.restype = None
+        except AttributeError:
+            err_clear = None
 
         hints = typing.get_type_hints(func)
         argtypes = []
@@ -1123,6 +1148,10 @@ def _ctypes_call(func, fc_name, md_name):
 
         _cache["lib"] = lib
         _cache["c_func"] = c_func
+        _cache["err_getter"] = err_getter
+        _cache["err_clear"] = err_clear
+        _cache["ctypes_status_mode"] = ctypes_status_mode
+        _cache["ctypes_abi_version"] = ctypes_abi_version
 
     def _check_args_before_convert(bound_args, hints):
         for pname, value in bound_args.items():
@@ -1183,6 +1212,9 @@ def _ctypes_call(func, fc_name, md_name):
         nonlocal _arg_checked
         _ensure_loaded()
         c_func = _cache["c_func"]
+        err_getter = _cache.get("err_getter")
+        err_clear = _cache.get("err_clear")
+        ctypes_status_mode = _cache.get("ctypes_status_mode", False)
 
         sig = inspect.signature(func)
         bound = sig.bind(*args, **kwargs)
@@ -1235,7 +1267,25 @@ def _ctypes_call(func, fc_name, md_name):
         c_args.append(
             ctypes.c_void_p(torch.cuda.current_stream(tensor_device).cuda_stream)
         )
-        c_func(*c_args)
+        if err_clear is not None:
+            err_clear()
+        ret = c_func(*c_args)
+        if ctypes_status_mode and ret != 0:
+            msg = f"ctypes status={ret}"
+            if err_getter is not None:
+                err = err_getter()
+                if err:
+                    msg = err.decode(errors="replace")
+            if err_clear is not None:
+                err_clear()
+            raise RuntimeError(f"{fc_name} failed: {msg}")
+        elif not ctypes_status_mode and err_getter is not None:
+            err = err_getter()
+            if err:
+                msg = err.decode(errors="replace")
+                if err_clear is not None:
+                    err_clear()
+                raise RuntimeError(f"{fc_name} failed: {msg}")
 
     return caller
 

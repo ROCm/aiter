@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <memory>
+#include <string>
 #include "aiter_hip_common.h"
+#include "aiter_ctypes_error.h"
 #include "asm_fmoe_2stages_configs.hpp"
 
 struct __attribute__((packed)) KernelArgs
@@ -55,6 +57,8 @@ struct __attribute__((packed)) KernelArgs
     void *ptr_SW;
     p2 _p22;
 };
+
+AITER_CTYPES_ERROR_DEF
 
 static CFG *get_cfg(aiter_tensor_t *inp, aiter_tensor_t *out, aiter_tensor_t *w1, QuantType quant_type, bool do_weight)
 {
@@ -143,24 +147,28 @@ static std::string get_heuristic_kernel(int m_num, int N, int blockk_size, CFG *
     return selected;
 }
 
-AITER_C_ITFS void moe_stage1_g1u1(
-    aiter_tensor_t *input,             // [token_cnt, model_dim] M,K
-    aiter_tensor_t *w1,                // [expert, inter_dim*2, model_dim] N,K
-    aiter_tensor_t *w2,                // [expert, model_dim, inter_dim]
-    aiter_tensor_t *sorted_token_ids,  // [max_num_tokens_padded]
-    aiter_tensor_t *sorted_expert_ids, // [max_num_m_blocks]
-    aiter_tensor_t *num_valid_ids,     // [1]
-    aiter_tensor_t *out,               // [token_cnt, topk, inter_dim*2]
-    int inter_dim,
-    const char *kernelName,
-    int block_m,
-    int ksplit,
-    int activation,
-    int quant_type,
-    aiter_tensor_t *a1_scale,       // [token_cnt, 1], token scale
-    aiter_tensor_t *w1_scale,       // [expert, 1, inter_dim], gate(up) scale
-    aiter_tensor_t *sorted_weights, // [max_num_tokens_padded], do_weight==true need
-    hipStream_t stream)
+AITER_CTYPES_DEFINE_ENTRYPOINT(
+    moe_stage1_g1u1,
+    (aiter_tensor_t *input,             // [token_cnt, model_dim] M,K
+     aiter_tensor_t *w1,                // [expert, inter_dim*2, model_dim] N,K
+     aiter_tensor_t *w2,                // [expert, model_dim, inter_dim]
+     aiter_tensor_t *sorted_token_ids,  // [max_num_tokens_padded]
+     aiter_tensor_t *sorted_expert_ids, // [max_num_m_blocks]
+     aiter_tensor_t *num_valid_ids,     // [1]
+     aiter_tensor_t *out,               // [token_cnt, topk, inter_dim*2]
+     int inter_dim,
+     const char *kernelName,
+     int block_m,
+     int ksplit,
+     int activation,
+     int quant_type,
+     aiter_tensor_t *a1_scale,       // [token_cnt, 1], token scale
+     aiter_tensor_t *w1_scale,       // [expert, 1, inter_dim], gate(up) scale
+     aiter_tensor_t *sorted_weights, // [max_num_tokens_padded], do_weight==true need
+     hipStream_t stream),
+    (input, w1, w2, sorted_token_ids, sorted_expert_ids, num_valid_ids, out,
+     inter_dim, kernelName, block_m, ksplit, activation, quant_type, a1_scale,
+     w1_scale, sorted_weights, stream))
 {
     const HipDeviceGuard device_guard(input->device_id);
     ActivationType act = static_cast<ActivationType>(activation);
@@ -187,7 +195,8 @@ AITER_C_ITFS void moe_stage1_g1u1(
         const char *co_name = cfg.co_name.c_str();
 
         AITER_CHECK(inter_dim % cfg.tile_n == 0,
-                    "ASM kernel " + std::string(name) + " is not supported for inter_dim = " + std::to_string(inter_dim));
+            "ASM kernel ", name, " is not supported for inter_dim=",
+            inter_dim, " (tile_n=", cfg.tile_n, ", block_m=", block_m, ")");
 
         auto result = impl_ptr_map.emplace(name, nullptr);
         if (result.second)
@@ -197,7 +206,9 @@ AITER_C_ITFS void moe_stage1_g1u1(
         impl_ptr = result.first->second.get();
     }
     else
+    {
         AITER_CHECK(false, __func__, " not find kernel " + kernelNameStr);
+    }
 
     int token_cnt = input->size(0);
     int topk = out->size(1);
@@ -267,4 +278,5 @@ AITER_C_ITFS void moe_stage1_g1u1(
                              1,   // bdy
                              1,   // bdz
                              stream});
+    return 0;
 }

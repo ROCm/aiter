@@ -15,6 +15,8 @@
 #include <cstdint>
 #include <hip/hip_runtime.h>
 #include <iostream>
+#include <sstream>
+#include <stdexcept>
 #ifdef AITER_EMBEDDED_HSA_HEADER
 #include AITER_EMBEDDED_HSA_HEADER
 #endif
@@ -41,6 +43,17 @@ inline void check_print(std::ostream& os, Args&&... args)
 {
     (os << ... << std::forward<Args>(args));
 }
+
+template <typename... Args>
+[[noreturn]] inline void check_fail(const char* file, int line, Args&&... args)
+{
+    std::ostringstream oss;
+    oss << "[AITER] " << file << ":" << line << " ";
+    check_print(oss, std::forward<Args>(args)...);
+    std::string msg = oss.str();
+    std::cerr << msg << std::endl;
+    throw std::runtime_error(msg);
+}
 } // namespace aiter_detail
 
 #define AITER_CHECK(x, ...)                                                                        \
@@ -48,26 +61,23 @@ inline void check_print(std::ostream& os, Args&&... args)
     {                                                                                              \
         if(!(x))                                                                                   \
         {                                                                                          \
-            std::cerr << "[AITER] " << __FILE__ << ":" << __LINE__ << " ";                         \
-            aiter_detail::check_print(std::cerr, __VA_ARGS__);                                     \
-            std::cerr << std::endl;                                                                \
-            std::terminate();                                                                      \
+            aiter_detail::check_fail(__FILE__, __LINE__, __VA_ARGS__);                              \
         }                                                                                          \
     } while(0)
 
-#define HIP_CALL(call)                                                       \
-    do                                                                       \
-    {                                                                        \
-        hipError_t err = call;                                               \
-        if(err != hipSuccess)                                                \
-        {                                                                    \
-            printf("\n[AITER] %s:%d fail to call %s ---> [HIP error](%s)\n", \
-                   __FILE__,                                                 \
-                   __LINE__,                                                 \
-                   #call,                                                    \
-                   hipGetErrorString(err));                                  \
-            exit(0);                                                         \
-        }                                                                    \
+#define HIP_CALL(call)                                                          \
+    do                                                                          \
+    {                                                                           \
+        hipError_t err = call;                                                  \
+        if(err != hipSuccess)                                                   \
+        {                                                                       \
+            std::ostringstream _hip_oss;                                         \
+            _hip_oss << "[AITER] " << __FILE__ << ":" << __LINE__               \
+                     << " " #call " failed: " << hipGetErrorString(err);        \
+            std::string _hip_msg = _hip_oss.str();                              \
+            std::cerr << _hip_msg << std::endl;                                 \
+            throw std::runtime_error(_hip_msg);                                 \
+        }                                                                       \
     } while(0)
 
 struct p3
