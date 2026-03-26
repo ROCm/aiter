@@ -63,12 +63,8 @@ def select_2d_config(
         BLOCK_M = 64 if arch.is_rdna else 128
         num_stages_2d, num_warps = 1, 4
 
-    # BLOCK_M = 256
-
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     num_stages_2d = min(max_num_stages_2d, num_stages_2d)
-
-    # num_warps, num_stages_2d, waves_per_eu = 8, 3, 2
 
     return {
         "BLOCK_M": BLOCK_M,
@@ -247,9 +243,10 @@ def unified_attention(
         block_size = max_seqlen_k
         k = k.unsqueeze(1)  # thd into "num_blks, 1, blk_size, num_kv_heads, head_size"
         v = v.unsqueeze(1)  # thd into "num_blks, 1, blk_size, num_kv_heads, head_size"
-        k_descale = k_descale.unsqueeze(
-            1
-        )  # thd into "num_blks, 1, blk_size, num_kv_heads, head_size // 32"
+        if sage_mxfp4:
+            k_descale = k_descale.unsqueeze(
+                1
+            )  # thd into "num_blks, 1, blk_size, num_kv_heads, head_size // 32"
         block_table_stride_0 = 0
     elif kv_layout == "cache":
         assert (
@@ -311,7 +308,7 @@ def unified_attention(
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
-    if True or use_2d_kernel(
+    if use_2d_kernel(
         head_size_qk,
         SLIDING_WINDOW,
         ALL_DECODE,
@@ -486,6 +483,7 @@ def unified_attention(
             stride_k_cache_scale_2=stride_k_cache_scale_2,
             stride_k_cache_scale_3=stride_k_cache_scale_3,
             query_start_len_ptr=cu_seqlens_q,
+            key_start_len_ptr=cu_seqlens_k,
             BLOCK_Q=BLOCK_Q,
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
@@ -495,6 +493,7 @@ def unified_attention(
             ROPE_SIZE=rope_size,
             ROPE_SIZE_PADDED=triton.next_power_of_2(rope_size),
             IS_CAUSAL=causal,
+            KV_LAYOUT_IS_THD=(kv_layout == "thd"),
             **attn_config,
         )
         reduce_segments[(q.shape[0], num_query_heads)](

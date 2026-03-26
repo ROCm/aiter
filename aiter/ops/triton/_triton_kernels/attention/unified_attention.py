@@ -79,7 +79,7 @@ def q_load(
 @triton.jit
 def kv_load(
     kv_cache_ptr,
-    physical_block_idx,
+    base_offset,
     kv_head_idx,
     offs_d,
     seq_offset,
@@ -93,7 +93,7 @@ def kv_load(
     KV_cache_modifier: tl.constexpr,
 ):
     kv_offset = (
-        physical_block_idx * stride_k_cache_0
+        base_offset * stride_k_cache_0
         + kv_head_idx * stride_k_cache_2
         + offs_d * stride_k_cache_3
         + (seq_offset % BLOCK_SIZE) * stride_k_cache_1
@@ -719,18 +719,19 @@ def kernel_unified_attention_3d(
     stride_k_cache_scale_2: tl.int64,  # int
     stride_k_cache_scale_3: tl.int64,  # int
     query_start_len_ptr,  # [num_seqs+1]
+    key_start_len_ptr,  # [num_seqs+1]
     BLOCK_Q: tl.constexpr,  # int
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     ALL_DECODE: tl.constexpr = False,  # bool
     SAGE_MXFP4: tl.constexpr = False,  # bool
-    IS_PAGING: tl.constexpr = True,  # bool
     PRELOAD_V: tl.constexpr = True,  # bool
     HAS_ROPE: tl.constexpr = False,  # bool
     ROPE_SIZE: tl.constexpr = 0,  # int
     ROPE_SIZE_PADDED: tl.constexpr = 0,  # int, must be power of 2
     IS_CAUSAL: tl.constexpr = True,  # bool
+    KV_LAYOUT_IS_THD: tl.constexpr = True,  # bool
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -946,11 +947,10 @@ def kernel_unified_attention_3d(
     num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
-    if not IS_PAGING:
-        seq_offset = segm_idx * tiles_per_segment * TILE_SIZE + offs_t
-        physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-        ).to(tl.int64)
+    if KV_LAYOUT_IS_THD:  # No need to page inside the loop as its a contiguous layout.
+        base_offset = tl.load(key_start_len_ptr + seq_idx).to(tl.int64)
+    else:
+        block_table_offset = seq_idx * block_table_stride
 
     # iterate through tiles within current segment
     for j in range(
@@ -963,8 +963,10 @@ def kernel_unified_attention_3d(
         else:
             tile_mask = seq_offset < max_seq_prefix_len
 
-        if IS_PAGING:
-            physical_block_idx = tl.load(
+        if (
+            not KV_LAYOUT_IS_THD
+        ):  # Need to page inside the loop as its not a contiguous layout.
+            base_offset = tl.load(
                 block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
             ).to(tl.int64)
 
@@ -973,7 +975,7 @@ def kernel_unified_attention_3d(
         # K : (HEAD_SIZE, TILE_SIZE)
         K = kv_load(
             key_cache_ptr,
-            physical_block_idx[None, :],
+            base_offset[None, :],
             kv_head_idx,
             offs_d_qk[:, None],
             seq_offset[None, :],
@@ -991,7 +993,7 @@ def kernel_unified_attention_3d(
         if SAGE_MXFP4:
             k_scale_loaded = kv_load(
                 k_scale,
-                physical_block_idx[:, None],
+                base_offset[:, None],
                 kv_head_idx,
                 offs_d_scale[None, :],
                 seq_offset[:, None],
@@ -1010,7 +1012,7 @@ def kernel_unified_attention_3d(
         if HAS_ROPE:
             K_rope = kv_load(
                 key_cache_ptr,
-                physical_block_idx[None, :],
+                base_offset[None, :],
                 kv_head_idx,
                 offs_rope[:, None],
                 seq_offset[None, :],
@@ -1027,7 +1029,7 @@ def kernel_unified_attention_3d(
                 # Do not transpose rhs mxfp4 scale!
                 k_rope_scale_loaded = kv_load(
                     k_scale,
-                    physical_block_idx[:, None],
+                    base_offset[:, None],
                     kv_head_idx,
                     offs_rope_scale[None, :],
                     seq_offset[:, None],
@@ -1056,7 +1058,7 @@ def kernel_unified_attention_3d(
             # V : (TILE_SIZE, HEAD_SIZE)
             V = kv_load(
                 value_cache_ptr,
-                physical_block_idx[:, None],
+                base_offset[:, None],
                 kv_head_idx,
                 offs_dv[None, :],
                 seq_offset[:, None],
@@ -1141,7 +1143,7 @@ def kernel_unified_attention_3d(
             # V : (TILE_SIZE, HEAD_SIZE)
             V = kv_load(
                 value_cache_ptr,
-                physical_block_idx[:, None],
+                base_offset[:, None],
                 kv_head_idx,
                 offs_dv[None, :],
                 seq_offset[:, None],
