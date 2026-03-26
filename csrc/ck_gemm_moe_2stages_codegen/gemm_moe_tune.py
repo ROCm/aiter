@@ -284,6 +284,10 @@ class FmoeTuner(TunerCommon):
         q_type,
         act_type,
     ):
+        if kparams.get("mode", "atomic") == "atomic":
+            moe_buf.zero_()
+
+        sort_block_m = kparams.get("sort_block_m", 0)
         return flydsl_moe_stage2(
             inter_states=a2_qt,
             w2=w2_shuffled_flydsl,
@@ -302,6 +306,7 @@ class FmoeTuner(TunerCommon):
             w2_scale=w2_scale_shuffled_flydsl,
             a2_scale=a2_scale,
             sorted_weights=sorted_weights,
+            sort_block_m=sort_block_m,
         )
 
     @staticmethod
@@ -1885,11 +1890,17 @@ class FmoeTuner(TunerCommon):
                 )
 
             for kname, kparams in flydsl_s2_kernels.items():
-                if kparams["tile_m"] != blockM:
+                s2_tile_m = kparams["tile_m"]
+                if blockM % s2_tile_m != 0:
                     continue
+                # Only try matched (tile_m==blockM) and one smaller (blockM/2) to limit candidates
+                if s2_tile_m != blockM and s2_tile_m != blockM // 2:
+                    continue
+                s2_kparams = {**kparams, "sort_block_m": blockM}
+                s2_kname = kname if s2_tile_m == blockM else f"{kname}_sbm{blockM}"
                 tasks_flydsl.append(
                     (
-                        (info, "stage2", kname, blockM),
+                        (info, "stage2", s2_kname, blockM),
                         FmoeTuner.generate_data_2stages,
                         (
                             token,
@@ -1912,7 +1923,7 @@ class FmoeTuner(TunerCommon):
                             [0, 17, 5, 6, 7, 8, 19, 14, 9],
                             dtype,
                             topk,
-                            kparams,
+                            s2_kparams,
                             blockM,
                             q_type,
                             act_type,
@@ -1932,6 +1943,7 @@ class FmoeTuner(TunerCommon):
                         True,
                     )
                 )
+
         return tasks_flydsl
 
     def tune(

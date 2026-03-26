@@ -17,9 +17,15 @@ from .layout_utils import crd2idx, idx2crd, get as layout_get
 def swizzle_xor16(row, col, k_blocks16):
     """XOR-with-row swizzle on the K dimension at 16B granularity.
 
-    Computes: col XOR ((row % k_blocks16) * 16)
+    Computes: col XOR ((row & (k_blocks16 - 1)) * 16)
+
+    k_blocks16 is always a power of 2 (tile_k_bytes / 16), so use
+    bitwise AND instead of remui to save ~10 VALU cycles on CDNA.
     """
-    rem = row % k_blocks16
+    from flydsl.expr import arith as _swz_arith
+
+    mask = k_blocks16 - _swz_arith.index(1)
+    rem = _swz_arith.andi(row, mask)
     return col ^ (rem * 16)
 
 
@@ -27,14 +33,16 @@ def _buffer_load_vec(
     buffer_ops, vector, rsrc, idx, *, elem_type, vec_elems, elem_bytes, offset_in_bytes
 ):
     """Load vec_elems elements via buffer_load dwordx[1,2,4] + bitcast."""
+    from flydsl.expr import arith as _ld_arith
+
     elem_size = int(elem_bytes)
     load_bytes = int(vec_elems) * elem_size
     vec_width = load_bytes // 4
 
     if offset_in_bytes:
-        idx_i32 = idx // 4
+        idx_i32 = _ld_arith.shrui(idx, _ld_arith.index(2))
     elif elem_bytes == 2:
-        idx_i32 = (idx * 2) // 4
+        idx_i32 = _ld_arith.shrui(idx, _ld_arith.index(1))
     else:
         idx_i32 = idx
 
@@ -85,14 +93,16 @@ def make_preshuffle_scale_layout(
     Layout shape: ``(c_mn1, c_k1, 4, 16)`` where
     ``c_mn1 = c_mn / 16 / mn_pack`` and ``c_k1 = (c_k / scale_block_size) / 4 / k_pack``.
     """
+    from .layout_utils import _div_pow2
+
     c16 = arith.constant(16, index=True)
     c4 = arith.constant(4, index=True)
     c_mn_pack = arith.constant(mn_pack, index=True)
     c_k_pack = arith.constant(k_pack, index=True)
-    c_k_scale = c_k / scale_block_size
+    c_k_scale = _div_pow2(c_k, scale_block_size)
 
-    c_mn1 = c_mn / c16 / c_mn_pack
-    c_k1 = c_k_scale / c4 / c_k_pack
+    c_mn1 = _div_pow2(_div_pow2(c_mn, 16), mn_pack)
+    c_k1 = _div_pow2(_div_pow2(c_k_scale, 4), k_pack)
     if elem_bytes != mn_pack * k_pack:
         raise ValueError(
             f"elem_bytes of scale must be {mn_pack} * {k_pack}, got {elem_bytes!r}"
@@ -140,17 +150,15 @@ def make_preshuffle_b_layout(
     c4 = arith.constant(4, index=True)
     c_kpack = arith.constant(kpack_bytes, index=True)
 
+    from .layout_utils import _div_pow2
+
     if elem_bytes not in (1, 2):
         raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
     c_k_bytes = c_k * arith.constant(int(elem_bytes), index=True)
-    c_k0 = c_k_bytes // c64
-    n0 = c_n // c16
+    c_k0 = _div_pow2(c_k_bytes, 64)
+    n0 = _div_pow2(c_n, 16)
 
-    c_kpack_elems = (
-        c_kpack
-        if elem_bytes == 1
-        else (c_kpack // arith.constant(int(elem_bytes), index=True))
-    )
+    c_kpack_elems = c_kpack if elem_bytes == 1 else _div_pow2(c_kpack, int(elem_bytes))
 
     stride_nlane = c_kpack_elems
     stride_klane = c16 * stride_nlane

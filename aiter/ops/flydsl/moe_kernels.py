@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MOE kernel management: naming, compilation, and high-level API."""
+"""FlyDSL MOE kernel management: naming, compilation, and high-level API."""
 
 import functools
 from typing import Dict, Optional
@@ -21,7 +21,7 @@ def flydsl_kernel_name(
     tile_k: int,
     mode: str = "",
 ) -> str:
-    """Construct kernel name for the configured stage and tile shape."""
+    """Construct kernel name: flydsl_moe{stage}_a{a}_w{b}_{out}_t{M}x{N}x{K}[_{mode}]."""
     name = f"flydsl_moe{stage}_a{a_dtype}_w{b_dtype}_{out_dtype}_t{tile_m}x{tile_n}x{tile_k}"
     if mode:
         name += f"_{mode}"
@@ -40,8 +40,8 @@ def get_flydsl_stage1_kernels(
     kernels = {}
     is_fp4 = b_dtype == "fp4"
     tile_ns = [128, 256] if is_fp4 else [128]
-    tile_ks = [128, 256] if is_fp4 else [128]
-    tile_ms = [16, 32, 64, 128]
+    tile_ks = [256] if is_fp4 else [128]
+    tile_ms = [32, 64, 128]
 
     for tm in tile_ms:
         for tn in tile_ns:
@@ -67,8 +67,8 @@ def get_flydsl_stage2_kernels(
     kernels = {}
     is_fp4 = b_dtype == "fp4"
     tile_ns = [128, 256] if is_fp4 else [128]
-    tile_ks = [128, 256] if is_fp4 else [128]
-    tile_ms = [32, 64, 128]
+    tile_ks = [256] if is_fp4 else [128]
+    tile_ms = [16, 32, 64, 128] if is_fp4 else [32, 64, 128]
     modes = ["atomic", "reduce"]
 
     for tm in tile_ms:
@@ -117,7 +117,6 @@ def compile_flydsl_moe_stage1(
     b_dtype: str,
     out_dtype: str,
     act: str = "silu",
-    persist_m: int = 1,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -136,7 +135,6 @@ def compile_flydsl_moe_stage1(
             b_dtype=b_dtype,
             out_dtype=out_dtype,
             act=act,
-            persist_m=persist_m,
         )
     else:
         from .kernels.moe_gemm_2stage import compile_moe_gemm1
@@ -169,6 +167,7 @@ def compile_flydsl_moe_stage2(
     out_dtype: str,
     accumulate: bool = True,
     persist_m: int = 1,
+    sort_block_m: int = 0,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -187,6 +186,8 @@ def compile_flydsl_moe_stage2(
             b_dtype=b_dtype,
             out_dtype=out_dtype,
             accumulate=accumulate,
+            persist_m=persist_m,
+            sort_block_m=sort_block_m,
         )
     else:
         from .kernels.moe_gemm_2stage import compile_moe_gemm2
@@ -223,7 +224,6 @@ def _get_compiled_stage1(
     b_dtype: str,
     out_dtype: str,
     act: str,
-    persist_m: int = 1,
 ):
     """Compile and cache stage1 kernel, return a tensor_api closure."""
     exe = compile_flydsl_moe_stage1(
@@ -239,7 +239,6 @@ def _get_compiled_stage1(
         b_dtype=b_dtype,
         out_dtype=out_dtype,
         act=act,
-        persist_m=persist_m,
     )
     is_fp4 = b_dtype == "fp4"
     _n_in = inter_dim * 2 if is_fp4 else inter_dim
@@ -342,6 +341,7 @@ def _get_compiled_stage2(
     out_dtype: str,
     accumulate: bool = True,
     persist_m: int = 1,
+    sort_block_m: int = 0,
 ):
     """Compile and cache stage2 kernel, return a tensor_api closure."""
     exe = compile_flydsl_moe_stage2(
@@ -358,6 +358,7 @@ def _get_compiled_stage2(
         out_dtype=out_dtype,
         accumulate=accumulate,
         persist_m=persist_m,
+        sort_block_m=sort_block_m,
     )
     is_fp4 = b_dtype == "fp4"
     _n_in = model_dim
@@ -382,7 +383,7 @@ def _get_compiled_stage2(
             target = out
         else:
             target = torch.empty(
-                (out.numel() * topk,),
+                (token_num * topk * model_dim,),
                 device=out.device,
                 dtype=out.dtype,
             )
@@ -390,7 +391,6 @@ def _get_compiled_stage2(
         if is_fp4:
             empty_bias = torch.empty(0, device=a.device, dtype=torch.float32)
             stream = torch.cuda.current_stream()
-            # fp4/e8m0 dtypes are not supported by dlpack; cast to uint8
             _a = (
                 a.view(torch.uint8)
                 if a.dtype
@@ -454,11 +454,7 @@ def _get_compiled_stage2(
             )
 
         if not accumulate:
-            torch.sum(
-                target.view(*out.shape[:-1], _topk, out.shape[-1]),
-                dim=-2,
-                out=out,
-            )
+            torch.sum(target.view(token_num, _topk, model_dim), dim=1, out=out)
 
     return tensor_api
 
@@ -485,12 +481,11 @@ def flydsl_moe_stage1(
     w1_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     sorted_weights: Optional[torch.Tensor] = None,
-    persist_m: int = 0,
 ) -> torch.Tensor:
     """Fused gate+up GEMM (MOE stage1).
 
     a: (token_num, model_dim), w1: (E, 2*inter_dim, model_dim) pre-shuffled.
-    For fp4 stage1, `w1`/`w1_scale` must use the same preshuffle layout as `shuffle_weight(..., (16, 16))`
+    For fp4 stage1, `w1`/`w1_scale` must use the same CK preshuffle layout as `shuffle_weight(..., (16, 16))`
     and `e8m0_shuffle(...)`.
     Returns (token_num, topk, inter_dim).
     """
@@ -522,21 +517,7 @@ def flydsl_moe_stage1(
         else torch.empty(0, device=dev, dtype=torch.float32)
     )
 
-    # Grid Y = number of M-blocks to launch.
-    # Dense upper bound: min(tokens*topk*tile_m, len(sorted_ids)) // tile_m
-    # Works when dense (token*topk >= sorted_blocks). But moe_sorting spreads
-    # entries across per-expert blocks, so when sparse we need all blocks.
-    _all_blks = sorted_expert_ids.shape[0]
-    _dense_blks = min(token_num * topk * tile_m, sorted_token_ids.shape[0]) // tile_m
-    _grid_y = min(_dense_blks, _all_blks) if _dense_blks >= _all_blks else _all_blks
-
-    # persist_m controls how many M-blocks each WG processes sequentially.
-    # For stage1, persist_m=1 is generally optimal: the large K dimension (model_dim)
-    # means each WG is already latency-bound on VMEM, and reducing concurrent waves
-    # (via persist_m>1) hurts latency hiding more than it helps L2 reuse.
-    # persist_m>1 may help only when many M-blocks share the same expert (large batch
-    # with few experts), enabling weight tile reuse across consecutive M-blocks.
-    _persist_m = persist_m if persist_m > 0 else 1
+    m_blocks = min(sorted_expert_ids.shape[0], token_num * topk)
 
     tensor_api = _get_compiled_stage1(
         model_dim=model_dim,
@@ -551,9 +532,7 @@ def flydsl_moe_stage1(
         b_dtype=b_dtype,
         out_dtype=out_dtype,
         act=act,
-        persist_m=_persist_m,
     )
-
     tensor_api(
         out.view(-1),
         a.view(-1),
@@ -565,7 +544,7 @@ def flydsl_moe_stage1(
         sw,
         num_valid_ids,
         token_num,
-        _grid_y,
+        m_blocks,
     )
 
     return out
@@ -590,15 +569,16 @@ def flydsl_moe_stage2(
     w2_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     sorted_weights: Optional[torch.Tensor] = None,
-    valid_m_blocks: Optional[int] = None,
+    sort_block_m: int = 0,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
     a: (token_num, topk, inter_dim), w1: (E, model_dim, inter_dim) pre-shuffled.
     Returns (token_num, model_dim).
 
-    valid_m_blocks: pre-computed from moe_sorting's num_valid_ids, trims
-        per-expert tile_m padding without GPU sync at call time.
+    sort_block_m: block_size used by moe_sorting / stage1. When 0 (default),
+        assumed equal to tile_m. When set, stage2 can use a different tile_m
+        from sorting/stage1.
     """
 
     token_num = inter_states.shape[0]
@@ -630,13 +610,14 @@ def flydsl_moe_stage2(
         else torch.empty(sorted_token_ids.shape, dtype=torch.float32, device=dev)
     )
 
-    # Use pre-computed valid_m_blocks from moe_sorting (trims per-expert padding).
-    # Fallback: host-side upper bound (no GPU sync).
-    if valid_m_blocks is None:
-        padded_m_blocks = int(sorted_expert_ids.numel())
-        valid_m_blocks = min(token_num * topk, padded_m_blocks)
-
-    _persist_m = 4 if valid_m_blocks > 256 else 1
+    _sbm = sort_block_m if sort_block_m > 0 else tile_m
+    if _sbm == tile_m:
+        m_blocks = min(sorted_expert_ids.shape[0], token_num * topk)
+    else:
+        total_sorted = sorted_expert_ids.shape[0] * _sbm
+        m_blocks = (total_sorted + tile_m - 1) // tile_m
+    # Auto-select persistent M: PM=4 for large batches (>16 M blocks), PM=1 for small
+    _persist_m = 4 if m_blocks > 256 else 1
 
     tensor_api = _get_compiled_stage2(
         model_dim=model_dim,
@@ -652,6 +633,7 @@ def flydsl_moe_stage2(
         out_dtype=out_dtype,
         accumulate=accumulate,
         persist_m=_persist_m,
+        sort_block_m=sort_block_m,
     )
     tensor_api(
         out,
@@ -664,7 +646,7 @@ def flydsl_moe_stage2(
         sw,
         num_valid_ids,
         token_num,
-        valid_m_blocks,
+        m_blocks,
     )
 
     return out
