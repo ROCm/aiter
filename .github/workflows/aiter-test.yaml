@@ -90,8 +90,7 @@ jobs:
               fi \
            && pip install -r requirements.txt \
            && echo "Prebuilding kernels with GPU_ARCHS: ${{ env.GPU_ARCH_LIST }} and PREBUILD_KERNELS: 1" \
-           && PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" python setup.py bdist_wheel \
-           && pip install dist/*.whl \
+           && PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" pip install -e . --no-build-isolation \
            && echo "Prebuilding kernels completed"
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
