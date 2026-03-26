@@ -51,7 +51,9 @@ def ref_attn(
     if kv_is_thd:
         _, num_kv_heads, head_size = key_cache.shape
     else:
-        assert block_tables is not None, "block_tables must be provided for cache layout"
+        assert (
+            block_tables is not None
+        ), "block_tables must be provided for cache layout"
         block_tables = block_tables.cpu().numpy()
         _, block_size, num_kv_heads, head_size = key_cache.shape
     head_size_v = value_cache.shape[-1]
@@ -135,13 +137,13 @@ def make_unified_attn_inputs(
 
     max_query_len = max(query_lens)
     max_kv_len = max(kv_lens_list)
-    
+
     scale = head_size_qk**-0.5
 
     query = torch.randn(
         sum(query_lens), num_query_heads, head_size_qk, dtype=dtype, device="cuda"
     )
-    
+
     if kv_layout == "thd":
         key_cache = torch.randn(
             sum(kv_lens_list),
@@ -180,11 +182,11 @@ def make_unified_attn_inputs(
     cu_query_lens = torch.tensor(
         [0] + query_lens, dtype=torch.int32, device="cuda"
     ).cumsum(dim=0, dtype=torch.int32)
-    cu_key_lens = torch.tensor([0] + kv_lens_list, dtype=torch.int32, device="cuda"
+    cu_key_lens = torch.tensor(
+        [0] + kv_lens_list, dtype=torch.int32, device="cuda"
     ).cumsum(dim=0, dtype=torch.int32)
     kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32, device="cuda")
     query_lens = torch.tensor(query_lens, dtype=torch.int32, device="cuda")
-
 
     max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
     block_tables = torch.randint(
@@ -194,8 +196,6 @@ def make_unified_attn_inputs(
         dtype=torch.int32,
         device="cuda",
     )
-
-    
 
     output = torch.empty(
         sum(query_lens),
@@ -249,10 +249,10 @@ def test_triton_unified_attn(
     if quant_scheme == "sage_mxfp4":
         if not arch_info.is_fp4_avail():
             pytest.skip("FP4 dot product is not supported on this GPU")
-    
+
     head_size_qk = head_sizes[0]
     head_size_v = head_sizes[1]
-    
+
     (
         query,
         key_cache,
@@ -283,7 +283,7 @@ def test_triton_unified_attn(
 
     q_input, k_input, v_input = query, key_cache, value_cache
     q_descale = k_descale = v_descale = None
-    
+
     if quant_scheme == "fp8":
         FP8_TYPE = e4m3_dtype
         fp8_max = torch.finfo(FP8_TYPE).max
@@ -315,7 +315,7 @@ def test_triton_unified_attn(
             layout_k=kv_layout,
             v_descale=None,
         )
-    
+
     unified_attention(
         q=q_input,
         k=k_input,
@@ -339,8 +339,21 @@ def test_triton_unified_attn(
         cu_seqlens_k=cu_key_lens,
     )
 
-    ref_output = ref_attn(query, key_cache, value_cache, query_lens, kv_lens, block_tables, scale, sliding_window, soft_cap, sinks, causal=causal, kv_layout=kv_layout)
-    
+    ref_output = ref_attn(
+        query,
+        key_cache,
+        value_cache,
+        query_lens,
+        kv_lens,
+        block_tables,
+        scale,
+        sliding_window,
+        soft_cap,
+        sinks,
+        causal=causal,
+        kv_layout=kv_layout,
+    )
+
     if quant_scheme == "fp8":
         atol, rtol = 1.5e-1, 1.5e-1
     elif quant_scheme == "sage_mxfp4":

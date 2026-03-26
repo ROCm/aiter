@@ -14,8 +14,12 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
     get_caller_name_no_ext,
 )
-from op_tests.triton_tests.attention.test_unified_attention import ref_attn, make_unified_attn_inputs
+from op_tests.triton_tests.attention.test_unified_attention import (
+    ref_attn,
+    make_unified_attn_inputs,
+)
 from aiter.ops.triton.utils.types import e4m3_dtype
+
 
 def nonvarlen_benchmark_configs():
     batch_sizes = [1, 4, 16]
@@ -208,10 +212,10 @@ def run_benchmark(custom, args):
                 # choose which samples become decode samples
                 decode_idx = torch.randperm(BATCH, device=seqlens_q.device)[:num_decode]
                 seqlens_q[decode_idx] = 1
-        
+
         head_size_qk = D_HEAD
         head_size_v = D_HEAD_V
-        
+
         soft_cap = args.softcap if args.softcap is not None else 0.0
         block_size = args.block_size if args.block_size else 512
 
@@ -220,7 +224,7 @@ def run_benchmark(custom, args):
         num_blocks = (
             args.num_blocks if args.num_blocks else max(min_required_blocks * 4, 2048)
         )
-        
+
         (
             query,
             key_cache,
@@ -246,12 +250,20 @@ def run_benchmark(custom, args):
         )
 
         num_query_heads = HQ
-        window_size = (args.sliding_window - 1, 0) if args.sliding_window is not None else (-1, -1)
-        sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda") if args.use_sinks else None
+        window_size = (
+            (args.sliding_window - 1, 0)
+            if args.sliding_window is not None
+            else (-1, -1)
+        )
+        sinks = (
+            torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
+            if args.use_sinks
+            else None
+        )
 
         q_input, k_input, v_input = query, key_cache, value_cache
         q_descale = k_descale = v_descale = None
-        
+
         if args.fp8_full:
             FP8_TYPE = e4m3_dtype
             fp8_max = torch.finfo(FP8_TYPE).max
@@ -280,7 +292,7 @@ def run_benchmark(custom, args):
                 layout_k=args.kv_layout,
                 v_descale=None,
             )
-        
+
         fn = lambda: unified_attention(
             q=q_input,
             k=k_input,
@@ -304,8 +316,21 @@ def run_benchmark(custom, args):
             cu_seqlens_k=cu_key_lens,
         )
 
-        ref_output = ref_attn(query, key_cache, value_cache, query_lens, kv_lens, block_tables, scale, args.sliding_window, soft_cap, sinks, causal=causal, kv_layout=args.kv_layout)
-        
+        ref_output = ref_attn(
+            query,
+            key_cache,
+            value_cache,
+            query_lens,
+            kv_lens,
+            block_tables,
+            scale,
+            args.sliding_window,
+            soft_cap,
+            sinks,
+            causal=causal,
+            kv_layout=args.kv_layout,
+        )
+
         if args.fp8_full:
             atol, rtol = 1.5e-1, 1.5e-1
         elif args.sagev2:
@@ -316,13 +341,25 @@ def run_benchmark(custom, args):
             atol, rtol = 1.5e-2, 1e-2
         torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
 
-        
         ms = triton.testing.do_bench(fn)
 
         run_correctness = args.test
         if run_correctness:
             fn()
-            ref_output = ref_attn(query, key_cache, value_cache, query_lens, kv_lens, block_tables, scale, args.sliding_window, soft_cap, sinks, causal=causal, kv_layout=args.kv_layout)
+            ref_output = ref_attn(
+                query,
+                key_cache,
+                value_cache,
+                query_lens,
+                kv_lens,
+                block_tables,
+                scale,
+                args.sliding_window,
+                soft_cap,
+                sinks,
+                causal=causal,
+                kv_layout=args.kv_layout,
+            )
             if args.fp8_full:
                 atol, rtol = 1.5e-1, 1.5e-1
             elif args.sagev2:
