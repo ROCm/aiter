@@ -64,9 +64,7 @@ def run_cktile_tune(x, weight, x_scale, w_scale, kernel_id, dtype=dtypes.bf16):
 def test_instance_names():
     """Verify kernel name encoding includes 'aqrm' suffix for AQRowMajor."""
     this_dir = os.path.dirname(os.path.abspath(__file__))
-    sys.path.insert(
-        0, os.path.join(this_dir, "..", "csrc", "ck_gemm_a8w8_blockscale")
-    )
+    sys.path.insert(0, os.path.join(this_dir, "..", "csrc", "ck_gemm_a8w8_blockscale"))
     from gemm_a8w8_blockscale_cktile_instance import (
         TileKernelInstance,
         candidate_kernels_cktile_dict,
@@ -74,21 +72,46 @@ def test_instance_names():
 
     # Non-AQRowMajor name should NOT end with _aqrm (4x2x1 = 8 warps)
     inst_default = TileKernelInstance(
-        192, 256, 128, 4, 2, 1, 16, 16, 128,
-        "Intrawave", False, True, False, 1,
+        192,
+        256,
+        128,
+        4,
+        2,
+        1,
+        16,
+        16,
+        128,
+        "Intrawave",
+        False,
+        True,
+        False,
+        1,
     )
-    assert not inst_default.name.endswith("_aqrm"), (
-        f"Default instance name should not have _aqrm suffix: {inst_default.name}"
-    )
+    assert not inst_default.name.endswith(
+        "_aqrm"
+    ), f"Default instance name should not have _aqrm suffix: {inst_default.name}"
 
     # AQRowMajor=True name SHOULD end with _aqrm
     inst_rm = TileKernelInstance(
-        192, 256, 128, 4, 2, 1, 16, 16, 128,
-        "Intrawave", False, True, False, 1, AQRowMajor=True,
+        192,
+        256,
+        128,
+        4,
+        2,
+        1,
+        16,
+        16,
+        128,
+        "Intrawave",
+        False,
+        True,
+        False,
+        1,
+        AQRowMajor=True,
     )
-    assert inst_rm.name.endswith("_aqrm"), (
-        f"AQRowMajor instance name should have _aqrm suffix: {inst_rm.name}"
-    )
+    assert inst_rm.name.endswith(
+        "_aqrm"
+    ), f"AQRowMajor instance name should have _aqrm suffix: {inst_rm.name}"
 
     # Names must be distinct
     assert inst_default.name != inst_rm.name, "Names must differ"
@@ -97,8 +120,20 @@ def test_instance_names():
     assert inst_rm.is_eight_warp, "4x2x1 with K_Warp_Tile=128 should be 8-warp"
 
     non_8w = TileKernelInstance(
-        16, 128, 256, 1, 4, 1, 16, 16, 64,
-        "Intrawave", False, True, False, 1,
+        16,
+        128,
+        256,
+        1,
+        4,
+        1,
+        16,
+        16,
+        64,
+        "Intrawave",
+        False,
+        True,
+        False,
+        1,
     )
     assert not non_8w.is_eight_warp, "1x4x1 with K_Warp_Tile=64 is not 8-warp"
 
@@ -116,9 +151,9 @@ def test_instance_names():
             f"AQRowMajor kernel {kid} ({k.name}) should be 8-warp "
             f"(warps={k.M_Warp}x{k.N_Warp}x{k.K_Warp}={k.M_Warp*k.N_Warp*k.K_Warp})"
         )
-        assert "_aqrm" in k.name, (
-            f"AQRowMajor kernel {kid} should have _aqrm in name: {k.name}"
-        )
+        assert (
+            "_aqrm" in k.name
+        ), f"AQRowMajor kernel {kid} should have _aqrm in name: {k.name}"
 
     print("  PASSED: instance name encoding")
 
@@ -126,9 +161,7 @@ def test_instance_names():
 def test_accuracy(m, n, k, dtype=dtypes.bf16, err_threshold=0.05):
     """Test that both AQ layout variants match the PyTorch reference."""
     this_dir = os.path.dirname(os.path.abspath(__file__))
-    sys.path.insert(
-        0, os.path.join(this_dir, "..", "csrc", "ck_gemm_a8w8_blockscale")
-    )
+    sys.path.insert(0, os.path.join(this_dir, "..", "csrc", "ck_gemm_a8w8_blockscale"))
     from gemm_a8w8_blockscale_cktile_instance import candidate_kernels_cktile_dict
 
     block_n, block_k = BLOCK_SHAPE
@@ -176,19 +209,14 @@ def test_accuracy(m, n, k, dtype=dtypes.bf16, err_threshold=0.05):
     # Also check that both outputs are close to each other
     checkAllclose(out_cm, out_rm, msg="ColMajor vs RowMajor")
 
-    print(
-        f"  PASSED: shape ({m},{n},{k}) "
-        f"cm_err={err_cm:.4f} rm_err={err_rm:.4f}"
-    )
+    print(f"  PASSED: shape ({m},{n},{k}) " f"cm_err={err_cm:.4f} rm_err={err_rm:.4f}")
 
 
 def test_padded_weight_stride(m, n, k, dtype=dtypes.bf16):
     """Test that RowMajor variant works with padded (non-contiguous) weight tensors,
     similar to vLLM's _maybe_pad_fp8_weight."""
     this_dir = os.path.dirname(os.path.abspath(__file__))
-    sys.path.insert(
-        0, os.path.join(this_dir, "..", "csrc", "ck_gemm_a8w8_blockscale")
-    )
+    sys.path.insert(0, os.path.join(this_dir, "..", "csrc", "ck_gemm_a8w8_blockscale"))
     from gemm_a8w8_blockscale_cktile_instance import candidate_kernels_cktile_dict
 
     block_n, block_k = BLOCK_SHAPE
@@ -207,9 +235,9 @@ def test_padded_weight_stride(m, n, k, dtype=dtypes.bf16):
     num_pad = 256
     weight_padded = F.pad(weight_orig, (0, num_pad), "constant", 0)[..., :-num_pad]
     assert weight_padded.shape == weight_orig.shape
-    assert weight_padded.stride(0) == k + num_pad, (
-        f"Expected stride {k + num_pad}, got {weight_padded.stride(0)}"
-    )
+    assert (
+        weight_padded.stride(0) == k + num_pad
+    ), f"Expected stride {k + num_pad}, got {weight_padded.stride(0)}"
     assert weight_padded.stride(-1) == 1
 
     ref = torch_reference(x, weight_orig, x_scale, w_scale, dtype)
