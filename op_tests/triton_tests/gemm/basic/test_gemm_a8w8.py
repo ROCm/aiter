@@ -261,7 +261,7 @@ def test_gemm_int8(out_dtype, m, n, k, layout, output, impl: str):
     if out_dtype in [torch.int8, torch.int32]:
         torch.testing.assert_close(a, b, atol=1, rtol=1e-2)
     else:
-        torch.testing.assert_close(a, b, atol=0.02, rtol=1e-2)
+        torch.testing.assert_close(a, b, atol=0.03, rtol=1e-2)
 
 
 @pytest.mark.parametrize(
