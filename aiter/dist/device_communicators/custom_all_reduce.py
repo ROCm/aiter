@@ -28,7 +28,7 @@ from torch.distributed import ProcessGroup
 import aiter as ops
 from aiter.dist.parallel_state import in_the_same_node_as
 from aiter import logger
-from aiter.utility.dtypes import fp8
+from aiter.utility.dtypes import fp8, _torch_to_aiter_dtype
 
 try:
     ops.meta_size()
@@ -46,11 +46,31 @@ def is_weak_contiguous(inp: torch.Tensor):
     )
 
 
-_DTYPE_MAP = {
-    torch.float32: 0,
-    torch.float16: 1,
-    torch.bfloat16: 2,
-}
+_make_aiter_tensor = None
+
+
+def _torch_to_aiter(tensor: torch.Tensor):
+    """Convert torch.Tensor to pybind aiter_tensor_t for passing to C++ ops.
+
+    Note: dtypes.py provides a similar torch_to_aiter() that returns a ctypes
+    aiter_tensor_t struct.  This function constructs a *pybind11* aiter_tensor_t
+    instead, because custom_all_reduce is compiled as a pybind11 module.  The two
+    types are not interchangeable, so a separate conversion path is necessary.
+    """
+    global _make_aiter_tensor
+    if _make_aiter_tensor is None:
+        from aiter.jit.core import get_module
+
+        _make_aiter_tensor = get_module("module_custom_all_reduce").make_aiter_tensor
+    return _make_aiter_tensor(
+        tensor.data_ptr(),
+        tensor.numel(),
+        tensor.ndim,
+        list(tensor.shape),
+        list(tensor.stride()),
+        _torch_to_aiter_dtype[tensor.dtype],
+        tensor.device.index or 0,
+    )
 
 
 def _current_stream_ptr() -> int:
@@ -491,18 +511,14 @@ class CustomAllreduce:
             out = torch.empty_like(inp)
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
         stream = _current_stream_ptr()
-        inp_numel = inp.numel()
-        dtype_code = _DTYPE_MAP[inp.dtype]
         reg_inp = 0 if registered_input else self._pool["input"].data_ptr
         reg_inp_bytes = 0 if registered_input else self._pool["input"].max_size
         reg_out = 0 if registered_output else self._pool["output"].data_ptr
         reg_out_bytes = 0 if registered_output else self._pool["output"].max_size
         ops.all_reduce(
             self._ptr,
-            inp.data_ptr(),
-            out.data_ptr(),
-            inp_numel,
-            dtype_code,
+            _torch_to_aiter(inp),
+            _torch_to_aiter(out),
             use_new,
             open_fp8_quant,
             reg_inp,
@@ -554,15 +570,12 @@ class CustomAllreduce:
     ):
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
         stream = _current_stream_ptr()
-        dtype_code = _DTYPE_MAP[inp.dtype]
         reg = 0 if registered else self._pool["input"].data_ptr
         reg_bytes = 0 if registered else self._pool["input"].max_size
         ops.reduce_scatter(
             self._ptr,
-            inp.data_ptr(),
-            out.data_ptr(),
-            inp.numel(),
-            dtype_code,
+            _torch_to_aiter(inp),
+            _torch_to_aiter(out),
             reg,
             reg_bytes,
             stream,
@@ -600,14 +613,10 @@ class CustomAllreduce:
             )
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
         stream = _current_stream_ptr()
-        dtype_code = _DTYPE_MAP[inp.dtype]
         ops.all_gather_reg(
             self._ptr,
-            inp.data_ptr(),
-            out.data_ptr(),
-            inp.numel(),
-            dtype_code,
-            inp.shape[-1],
+            _torch_to_aiter(inp),
+            _torch_to_aiter(out),
             dim,
             stream,
         )
@@ -624,16 +633,12 @@ class CustomAllreduce:
             )
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
         stream = _current_stream_ptr()
-        dtype_code = _DTYPE_MAP[inp.dtype]
         ops.all_gather_unreg(
             self._ptr,
-            inp.data_ptr(),
+            _torch_to_aiter(inp),
             self._pool["input"].data_ptr,
-            out.data_ptr(),
-            inp.numel(),
-            dtype_code,
+            _torch_to_aiter(out),
             self._pool["input"].max_size,
-            inp.shape[-1],
             dim,
             stream,
         )
@@ -668,7 +673,6 @@ class CustomAllreduce:
         if res_out is None:
             res_out = torch.empty_like(inp)
         stream = _current_stream_ptr()
-        dtype_code = _DTYPE_MAP[inp.dtype]
         reg = 0 if registered else self._pool["input"].data_ptr
         reg_bytes = 0 if registered else self._pool["input"].max_size
         if not post_per_token_quant:
@@ -677,14 +681,11 @@ class CustomAllreduce:
             assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
             ops.fused_allreduce_rmsnorm(
                 self._ptr,
-                inp.data_ptr(),
-                res_inp.data_ptr(),
-                res_out.data_ptr(),
-                out.data_ptr(),
-                w.data_ptr(),
-                inp.numel(),
-                w.numel(),
-                dtype_code,
+                _torch_to_aiter(inp),
+                _torch_to_aiter(res_inp),
+                _torch_to_aiter(res_out),
+                _torch_to_aiter(out),
+                _torch_to_aiter(w),
                 eps,
                 reg,
                 reg_bytes,
@@ -702,15 +703,12 @@ class CustomAllreduce:
                 )
             ops.fused_allreduce_rmsnorm_quant(
                 self._ptr,
-                inp.data_ptr(),
-                res_inp.data_ptr(),
-                res_out.data_ptr(),
-                out.data_ptr(),
-                scale_out.data_ptr(),
-                w.data_ptr(),
-                inp.numel(),
-                w.numel(),
-                dtype_code,
+                _torch_to_aiter(inp),
+                _torch_to_aiter(res_inp),
+                _torch_to_aiter(res_out),
+                _torch_to_aiter(out),
+                _torch_to_aiter(scale_out),
+                _torch_to_aiter(w),
                 eps,
                 reg,
                 reg_bytes,

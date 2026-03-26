@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include "custom_all_reduce.cuh"
+#include "aiter_tensor.h"
 #include <cstring>
 
 using fp8_type = opus::fp8_t;
@@ -24,22 +25,6 @@ using fptr_t = int64_t;
 static_assert(sizeof(void*) == sizeof(fptr_t));
 
 namespace aiter {
-
-// Dtype codes – keep in sync with Python-side _DTYPE_MAP
-static constexpr int64_t DTYPE_FLOAT32  = 0;
-static constexpr int64_t DTYPE_FLOAT16  = 1;
-static constexpr int64_t DTYPE_BFLOAT16 = 2;
-
-inline int64_t dtype_element_size(int64_t dtype)
-{
-    switch(dtype)
-    {
-    case DTYPE_FLOAT32:  return 4;
-    case DTYPE_FLOAT16:  return 2;
-    case DTYPE_BFLOAT16: return 2;
-    default: throw std::runtime_error("unsupported dtype: " + std::to_string(dtype));
-    }
-}
 
 // ---- init / dispose / meta_size ----
 
@@ -86,20 +71,20 @@ int64_t meta_size() { return sizeof(aiter::Signal); }
 // ---- Internal dispatch helpers ----
 
 static void _all_reduce(fptr_t _fa, void* inp, void* out,
-                        int64_t numel, int64_t dtype, hipStream_t stream,
+                        int64_t numel, AiterDtype dtype, hipStream_t stream,
                         bool use_new, bool open_fp8_quant, bool is_broadcast_reg_outptr)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     switch(dtype)
     {
-    case DTYPE_FLOAT32: {
+    case AITER_DTYPE_fp32: {
         fa->allreduce<opus::fp32_t>(stream,
                              reinterpret_cast<opus::fp32_t*>(inp),
                              reinterpret_cast<opus::fp32_t*>(out),
                              numel, use_new, is_broadcast_reg_outptr);
         break;
     }
-    case DTYPE_FLOAT16: {
+    case AITER_DTYPE_fp16: {
         if(open_fp8_quant && numel >= 128 * 2048)
         {
             fa->runFp8QuantKernel<opus::fp16_t>(stream,
@@ -117,7 +102,7 @@ static void _all_reduce(fptr_t _fa, void* inp, void* out,
         break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
-    case DTYPE_BFLOAT16: {
+    case AITER_DTYPE_bf16: {
         fa->allreduce<opus::bf16_t>(stream,
                                       reinterpret_cast<opus::bf16_t*>(inp),
                                       reinterpret_cast<opus::bf16_t*>(out),
@@ -131,19 +116,19 @@ static void _all_reduce(fptr_t _fa, void* inp, void* out,
 }
 
 static void _reduce_scatter(fptr_t _fa, void* inp, void* out,
-                            int64_t size, int64_t dtype, hipStream_t stream)
+                            int64_t size, AiterDtype dtype, hipStream_t stream)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     switch(dtype)
     {
-    case DTYPE_FLOAT32: {
+    case AITER_DTYPE_fp32: {
         fa->dispatchReduceScatter<opus::fp32_t>(stream,
                                      reinterpret_cast<opus::fp32_t*>(inp),
                                      reinterpret_cast<opus::fp32_t*>(out),
                                      size);
         break;
     }
-    case DTYPE_FLOAT16: {
+    case AITER_DTYPE_fp16: {
         fa->dispatchReduceScatter<opus::fp16_t>(stream,
                                     reinterpret_cast<opus::fp16_t*>(inp),
                                     reinterpret_cast<opus::fp16_t*>(out),
@@ -151,7 +136,7 @@ static void _reduce_scatter(fptr_t _fa, void* inp, void* out,
         break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
-    case DTYPE_BFLOAT16: {
+    case AITER_DTYPE_bf16: {
         fa->dispatchReduceScatter<opus::bf16_t>(stream,
                                               reinterpret_cast<opus::bf16_t*>(inp),
                                               reinterpret_cast<opus::bf16_t*>(out),
@@ -165,21 +150,21 @@ static void _reduce_scatter(fptr_t _fa, void* inp, void* out,
 }
 
 static void _all_gather(fptr_t _fa, void* inp, void* out,
-                        int64_t size, int64_t dtype,
+                        int64_t size, AiterDtype dtype,
                         int64_t last_dim_size, int64_t gather_dim,
                         hipStream_t stream)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     switch(dtype)
     {
-    case DTYPE_FLOAT32: {
+    case AITER_DTYPE_fp32: {
         fa->dispatchAllGather<opus::fp32_t>(stream,
                                      reinterpret_cast<opus::fp32_t*>(inp),
                                      reinterpret_cast<opus::fp32_t*>(out),
                                      size, last_dim_size, gather_dim);
         break;
     }
-    case DTYPE_FLOAT16: {
+    case AITER_DTYPE_fp16: {
         fa->dispatchAllGather<opus::fp16_t>(stream,
                                     reinterpret_cast<opus::fp16_t*>(inp),
                                     reinterpret_cast<opus::fp16_t*>(out),
@@ -187,7 +172,7 @@ static void _all_gather(fptr_t _fa, void* inp, void* out,
         break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
-    case DTYPE_BFLOAT16: {
+    case AITER_DTYPE_bf16: {
         fa->dispatchAllGather<opus::bf16_t>(stream,
                                     reinterpret_cast<opus::bf16_t*>(inp),
                                     reinterpret_cast<opus::bf16_t*>(out),
@@ -204,7 +189,7 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
                                      void* inp, void* residual_inp,
                                      void* residual_out, void* out,
                                      void* scale_out, void* w,
-                                     int64_t dtype, float eps,
+                                     AiterDtype dtype, float eps,
                                      int m, int n,
                                      bool use_1stage,
                                      hipStream_t stream)
@@ -245,16 +230,16 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
 
     switch(dtype)
     {
-    case DTYPE_FLOAT32: {
+    case AITER_DTYPE_fp32: {
         DISPATCH_AR_FUSION(opus::fp32_t)
         break;
     }
-    case DTYPE_FLOAT16: {
+    case AITER_DTYPE_fp16: {
         DISPATCH_AR_FUSION(opus::fp16_t)
         break;
     }
 #if(__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
-    case DTYPE_BFLOAT16: {
+    case AITER_DTYPE_bf16: {
         DISPATCH_AR_FUSION(opus::bf16_t)
         break;
     }
@@ -264,178 +249,6 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
     }
 
 #undef DISPATCH_AR_FUSION
-}
-
-// ---- Public collective APIs ----
-
-void all_reduce(fptr_t _fa, int64_t inp, int64_t out,
-                int64_t numel, int64_t dtype,
-                bool use_new, bool open_fp8_quant,
-                int64_t reg_inp_ptr, int64_t reg_inp_bytes,
-                int64_t reg_out_ptr, int64_t reg_out_bytes,
-                int64_t stream_ptr)
-{
-    auto stream    = (hipStream_t)stream_ptr;
-    int64_t elem_sz    = dtype_element_size(dtype);
-    int64_t data_bytes = numel * elem_sz;
-
-    void* actual_inp = (void*)inp;
-    void* actual_out = (void*)out;
-
-    bool is_broadcast_reg_outptr = (reg_out_ptr == 0);
-
-    if(reg_inp_ptr == 0 && reg_out_ptr == 0)
-    {
-        _all_reduce(_fa, actual_inp, actual_out, numel, dtype, stream,
-                    use_new, open_fp8_quant, is_broadcast_reg_outptr);
-        return;
-    }
-
-    if(reg_inp_ptr != 0)
-    {
-        if(data_bytes > reg_inp_bytes)
-            throw std::runtime_error("registered buffer is too small to contain the input");
-        HIP_CALL(hipMemcpyAsync((void*)reg_inp_ptr, (void*)inp, data_bytes,
-                                hipMemcpyDeviceToDevice, stream));
-        actual_inp = (void*)reg_inp_ptr;
-    }
-
-    if(reg_out_ptr != 0 && is_broadcast_reg_outptr)
-    {
-        if(data_bytes > reg_out_bytes)
-            throw std::runtime_error("registered output buffer is too small to contain the output");
-        actual_out = (void*)reg_out_ptr;
-    }
-
-    _all_reduce(_fa, actual_inp, actual_out, numel, dtype, stream,
-                use_new, open_fp8_quant, is_broadcast_reg_outptr);
-
-    if(reg_out_ptr != 0 && is_broadcast_reg_outptr)
-    {
-        HIP_CALL(hipMemcpyAsync((void*)out, (void*)reg_out_ptr, data_bytes,
-                                hipMemcpyDeviceToDevice, stream));
-    }
-}
-
-void reduce_scatter(fptr_t _fa, int64_t inp, int64_t out,
-                    int64_t inp_numel, int64_t dtype,
-                    int64_t reg_ptr, int64_t reg_bytes,
-                    int64_t stream_ptr)
-{
-    auto stream    = (hipStream_t)stream_ptr;
-    int64_t elem_sz    = dtype_element_size(dtype);
-    int64_t data_bytes = inp_numel * elem_sz;
-
-    if(reg_ptr != 0)
-    {
-        if(data_bytes > reg_bytes)
-            throw std::runtime_error("registered buffer is too small to contain the input");
-        HIP_CALL(hipMemcpyAsync((void*)reg_ptr, (void*)inp, data_bytes,
-                                hipMemcpyDeviceToDevice, stream));
-        _reduce_scatter(_fa, (void*)reg_ptr, (void*)out, inp_numel, dtype, stream);
-    }
-    else
-    {
-        _reduce_scatter(_fa, (void*)inp, (void*)out, inp_numel, dtype, stream);
-    }
-}
-
-void all_gather_reg(fptr_t _fa, int64_t inp, int64_t out,
-                    int64_t inp_numel, int64_t dtype,
-                    int64_t last_dim_size, int64_t dim,
-                    int64_t stream_ptr)
-{
-    auto stream = (hipStream_t)stream_ptr;
-    _all_gather(_fa, (void*)inp, (void*)out, inp_numel, dtype,
-                last_dim_size, dim, stream);
-}
-
-void all_gather_unreg(fptr_t _fa, int64_t inp, int64_t reg_buffer,
-                      int64_t out, int64_t inp_numel, int64_t dtype,
-                      int64_t reg_bytes,
-                      int64_t last_dim_size, int64_t dim,
-                      int64_t stream_ptr)
-{
-    auto stream    = (hipStream_t)stream_ptr;
-    int64_t elem_sz    = dtype_element_size(dtype);
-    int64_t data_bytes = inp_numel * elem_sz;
-
-    if(data_bytes > reg_bytes)
-        throw std::runtime_error("registered buffer is too small to contain the input");
-    HIP_CALL(hipMemcpyAsync((void*)reg_buffer, (void*)inp, data_bytes,
-                            hipMemcpyDeviceToDevice, stream));
-    _all_gather(_fa, (void*)reg_buffer, (void*)out, inp_numel, dtype,
-                last_dim_size, dim, stream);
-}
-
-void fused_allreduce_rmsnorm(fptr_t _fa,
-                             int64_t inp, int64_t res_inp, int64_t res_out,
-                             int64_t out, int64_t w,
-                             int64_t numel, int64_t w_numel, int64_t dtype,
-                             double eps,
-                             int64_t reg_ptr, int64_t reg_bytes,
-                             bool use_1stage,
-                             int64_t stream_ptr)
-{
-    auto stream    = (hipStream_t)stream_ptr;
-    int64_t elem_sz    = dtype_element_size(dtype);
-    int64_t data_bytes = numel * elem_sz;
-    int n = (int)w_numel;
-    int m = (int)(numel / w_numel);
-
-    if(reg_ptr != 0)
-    {
-        if(data_bytes > reg_bytes)
-            throw std::runtime_error("registered buffer is too small to contain the input");
-        HIP_CALL(hipMemcpyAsync((void*)reg_ptr, (void*)inp, data_bytes,
-                                hipMemcpyDeviceToDevice, stream));
-        _fused_allreduce_rmsnorm(_fa,
-                                 (void*)reg_ptr, (void*)res_inp, (void*)res_out,
-                                 (void*)out, nullptr, (void*)w,
-                                 dtype, (float)eps, m, n, use_1stage, stream);
-    }
-    else
-    {
-        _fused_allreduce_rmsnorm(_fa,
-                                 (void*)inp, (void*)res_inp, (void*)res_out,
-                                 (void*)out, nullptr, (void*)w,
-                                 dtype, (float)eps, m, n, use_1stage, stream);
-    }
-}
-
-void fused_allreduce_rmsnorm_quant(fptr_t _fa,
-                                   int64_t inp, int64_t res_inp, int64_t res_out,
-                                   int64_t out, int64_t scale_out, int64_t w,
-                                   int64_t numel, int64_t w_numel, int64_t dtype,
-                                   double eps,
-                                   int64_t reg_ptr, int64_t reg_bytes,
-                                   bool use_1stage,
-                                   int64_t stream_ptr)
-{
-    auto stream    = (hipStream_t)stream_ptr;
-    int64_t elem_sz    = dtype_element_size(dtype);
-    int64_t data_bytes = numel * elem_sz;
-    int n = (int)w_numel;
-    int m = (int)(numel / w_numel);
-
-    if(reg_ptr != 0)
-    {
-        if(data_bytes > reg_bytes)
-            throw std::runtime_error("registered buffer is too small to contain the input");
-        HIP_CALL(hipMemcpyAsync((void*)reg_ptr, (void*)inp, data_bytes,
-                                hipMemcpyDeviceToDevice, stream));
-        _fused_allreduce_rmsnorm(_fa,
-                                 (void*)reg_ptr, (void*)res_inp, (void*)res_out,
-                                 (void*)out, (void*)scale_out, (void*)w,
-                                 dtype, (float)eps, m, n, use_1stage, stream);
-    }
-    else
-    {
-        _fused_allreduce_rmsnorm(_fa,
-                                 (void*)inp, (void*)res_inp, (void*)res_out,
-                                 (void*)out, (void*)scale_out, (void*)w,
-                                 dtype, (float)eps, m, n, use_1stage, stream);
-    }
 }
 
 // ---- Buffer registration ----
@@ -531,5 +344,192 @@ void get_meta_buffer_ipc_handle(int64_t inp_ptr, int64_t out_handle_ptr)
 }
 
 #endif
+
+// ---- Public collective APIs ----
+
+void all_reduce(fptr_t _fa,
+                const aiter_tensor_t& inp,
+                const aiter_tensor_t& out,
+                bool use_new, bool open_fp8_quant,
+                int64_t reg_inp_ptr, int64_t reg_inp_bytes,
+                int64_t reg_out_ptr, int64_t reg_out_bytes,
+                int64_t stream_ptr)
+{
+    auto stream    = (hipStream_t)stream_ptr;
+    auto dtype     = inp.dtype();
+    int64_t numel  = inp.numel();
+    int64_t data_bytes = numel * inp.element_size();
+
+    void* actual_inp = inp.data_ptr();
+    void* actual_out = out.data_ptr();
+
+    bool is_broadcast_reg_outptr = (reg_out_ptr == 0);
+
+    if(reg_inp_ptr == 0 && reg_out_ptr == 0)
+    {
+        _all_reduce(_fa, actual_inp, actual_out, numel, dtype, stream,
+                    use_new, open_fp8_quant, is_broadcast_reg_outptr);
+        return;
+    }
+
+    if(reg_inp_ptr != 0)
+    {
+        if(data_bytes > reg_inp_bytes)
+            throw std::runtime_error("registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync((void*)reg_inp_ptr, actual_inp, data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
+        actual_inp = (void*)reg_inp_ptr;
+    }
+
+    if(reg_out_ptr != 0 && is_broadcast_reg_outptr)
+    {
+        if(data_bytes > reg_out_bytes)
+            throw std::runtime_error("registered output buffer is too small to contain the output");
+        actual_out = (void*)reg_out_ptr;
+    }
+
+    _all_reduce(_fa, actual_inp, actual_out, numel, dtype, stream,
+                use_new, open_fp8_quant, is_broadcast_reg_outptr);
+
+    if(reg_out_ptr != 0 && is_broadcast_reg_outptr)
+    {
+        HIP_CALL(hipMemcpyAsync(out.data_ptr(), (void*)reg_out_ptr, data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
+    }
+}
+
+void reduce_scatter(fptr_t _fa,
+                    const aiter_tensor_t& inp,
+                    const aiter_tensor_t& out,
+                    int64_t reg_ptr, int64_t reg_bytes,
+                    int64_t stream_ptr)
+{
+    auto stream    = (hipStream_t)stream_ptr;
+    auto dtype     = inp.dtype();
+    int64_t inp_numel  = inp.numel();
+    int64_t data_bytes = inp_numel * inp.element_size();
+
+    if(reg_ptr != 0)
+    {
+        if(data_bytes > reg_bytes)
+            throw std::runtime_error("registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync((void*)reg_ptr, inp.data_ptr(), data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
+        _reduce_scatter(_fa, (void*)reg_ptr, out.data_ptr(), inp_numel, dtype, stream);
+    }
+    else
+    {
+        _reduce_scatter(_fa, inp.data_ptr(), out.data_ptr(), inp_numel, dtype, stream);
+    }
+}
+
+void all_gather_reg(fptr_t _fa,
+                    const aiter_tensor_t& inp,
+                    const aiter_tensor_t& out,
+                    int64_t dim,
+                    int64_t stream_ptr)
+{
+    auto stream = (hipStream_t)stream_ptr;
+    int64_t last_dim_size = inp.size(-1);
+    _all_gather(_fa, inp.data_ptr(), out.data_ptr(), inp.numel(), inp.dtype(),
+                last_dim_size, dim, stream);
+}
+
+void all_gather_unreg(fptr_t _fa,
+                      const aiter_tensor_t& inp,
+                      int64_t reg_buffer,
+                      const aiter_tensor_t& out,
+                      int64_t reg_bytes,
+                      int64_t dim,
+                      int64_t stream_ptr)
+{
+    auto stream    = (hipStream_t)stream_ptr;
+    int64_t data_bytes = inp.numel() * inp.element_size();
+    int64_t last_dim_size = inp.size(-1);
+
+    if(data_bytes > reg_bytes)
+        throw std::runtime_error("registered buffer is too small to contain the input");
+    HIP_CALL(hipMemcpyAsync((void*)reg_buffer, inp.data_ptr(), data_bytes,
+                            hipMemcpyDeviceToDevice, stream));
+    _all_gather(_fa, (void*)reg_buffer, out.data_ptr(), inp.numel(), inp.dtype(),
+                last_dim_size, dim, stream);
+}
+
+void fused_allreduce_rmsnorm(fptr_t _fa,
+                             const aiter_tensor_t& inp,
+                             const aiter_tensor_t& res_inp,
+                             const aiter_tensor_t& res_out,
+                             const aiter_tensor_t& out,
+                             const aiter_tensor_t& w,
+                             double eps,
+                             int64_t reg_ptr, int64_t reg_bytes,
+                             bool use_1stage,
+                             int64_t stream_ptr)
+{
+    auto stream    = (hipStream_t)stream_ptr;
+    auto dtype     = inp.dtype();
+    int64_t numel  = inp.numel();
+    int64_t data_bytes = numel * inp.element_size();
+    int n = (int)w.numel();
+    int m = (int)(numel / w.numel());
+
+    if(reg_ptr != 0)
+    {
+        if(data_bytes > reg_bytes)
+            throw std::runtime_error("registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync((void*)reg_ptr, inp.data_ptr(), data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
+        _fused_allreduce_rmsnorm(_fa,
+                                 (void*)reg_ptr, res_inp.data_ptr(), res_out.data_ptr(),
+                                 out.data_ptr(), nullptr, w.data_ptr(),
+                                 dtype, (float)eps, m, n, use_1stage, stream);
+    }
+    else
+    {
+        _fused_allreduce_rmsnorm(_fa,
+                                 inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
+                                 out.data_ptr(), nullptr, w.data_ptr(),
+                                 dtype, (float)eps, m, n, use_1stage, stream);
+    }
+}
+
+void fused_allreduce_rmsnorm_quant(fptr_t _fa,
+                                   const aiter_tensor_t& inp,
+                                   const aiter_tensor_t& res_inp,
+                                   const aiter_tensor_t& res_out,
+                                   const aiter_tensor_t& out,
+                                   const aiter_tensor_t& scale_out,
+                                   const aiter_tensor_t& w,
+                                   double eps,
+                                   int64_t reg_ptr, int64_t reg_bytes,
+                                   bool use_1stage,
+                                   int64_t stream_ptr)
+{
+    auto stream    = (hipStream_t)stream_ptr;
+    auto dtype     = inp.dtype();
+    int64_t numel  = inp.numel();
+    int64_t data_bytes = numel * inp.element_size();
+    int n = (int)w.numel();
+    int m = (int)(numel / w.numel());
+
+    if(reg_ptr != 0)
+    {
+        if(data_bytes > reg_bytes)
+            throw std::runtime_error("registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync((void*)reg_ptr, inp.data_ptr(), data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
+        _fused_allreduce_rmsnorm(_fa,
+                                 (void*)reg_ptr, res_inp.data_ptr(), res_out.data_ptr(),
+                                 out.data_ptr(), scale_out.data_ptr(), w.data_ptr(),
+                                 dtype, (float)eps, m, n, use_1stage, stream);
+    }
+    else
+    {
+        _fused_allreduce_rmsnorm(_fa,
+                                 inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
+                                 out.data_ptr(), scale_out.data_ptr(), w.data_ptr(),
+                                 dtype, (float)eps, m, n, use_1stage, stream);
+    }
+}
 
 } // namespace aiter

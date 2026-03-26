@@ -3,6 +3,8 @@
 #pragma once
 
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include "aiter_tensor.h"
 
 namespace py = pybind11;
 
@@ -334,13 +336,36 @@ namespace py = pybind11;
           py::arg("offsets"),                                                                  \
           py::arg("rank"),                                                                     \
           py::arg("fully_connected"));                                                         \
+    py::class_<aiter_tensor_t>(m, "aiter_tensor_t")                                             \
+        .def(py::init<>())                                                                     \
+        .def_readwrite("numel_", &aiter_tensor_t::numel_)                                      \
+        .def_readwrite("ndim", &aiter_tensor_t::ndim)                                          \
+        .def_readwrite("device_id", &aiter_tensor_t::device_id);                               \
+    m.def("make_aiter_tensor",                                                                 \
+          [](int64_t data_ptr, size_t numel, int ndim,                                         \
+             const std::vector<int64_t>& shape,                                                \
+             const std::vector<int64_t>& strides,                                              \
+             int dtype, int device_id) {                                                       \
+              aiter_tensor_t at{};                                                             \
+              at.ptr = (void*)data_ptr;                                                        \
+              at.numel_ = numel;                                                               \
+              at.ndim = ndim;                                                                  \
+              for(int i = 0; i < ndim && i < 8; i++) {                                         \
+                  at.shape[i] = shape[i];                                                      \
+                  at.strides[i] = strides[i];                                                  \
+              }                                                                                \
+              at.dtype_ = (AiterDtype)dtype;                                                   \
+              at.device_id = device_id;                                                        \
+              return at;                                                                       \
+          },                                                                                   \
+          py::arg("data_ptr"), py::arg("numel"), py::arg("ndim"),                              \
+          py::arg("shape"), py::arg("strides"),                                                \
+          py::arg("dtype"), py::arg("device_id"));                                             \
     m.def("all_reduce",                                                                        \
           &aiter::all_reduce,                                                                  \
           py::arg("_fa"),                                                                      \
           py::arg("inp"),                                                                      \
           py::arg("out"),                                                                      \
-          py::arg("numel"),                                                                    \
-          py::arg("dtype"),                                                                    \
           py::arg("use_new"),                                                                  \
           py::arg("open_fp8_quant"),                                                           \
           py::arg("reg_inp_ptr"),                                                              \
@@ -353,8 +378,6 @@ namespace py = pybind11;
           py::arg("_fa"),                                                                      \
           py::arg("inp"),                                                                      \
           py::arg("out"),                                                                      \
-          py::arg("inp_numel"),                                                                \
-          py::arg("dtype"),                                                                    \
           py::arg("reg_ptr"),                                                                  \
           py::arg("reg_bytes"),                                                                \
           py::arg("stream"));                                                                  \
@@ -363,9 +386,6 @@ namespace py = pybind11;
           py::arg("_fa"),                                                                      \
           py::arg("inp"),                                                                      \
           py::arg("out"),                                                                      \
-          py::arg("inp_numel"),                                                                \
-          py::arg("dtype"),                                                                    \
-          py::arg("last_dim_size"),                                                            \
           py::arg("dim"),                                                                      \
           py::arg("stream"));                                                                  \
     m.def("all_gather_unreg",                                                                  \
@@ -374,10 +394,7 @@ namespace py = pybind11;
           py::arg("inp"),                                                                      \
           py::arg("reg_buffer"),                                                               \
           py::arg("out"),                                                                      \
-          py::arg("inp_numel"),                                                                \
-          py::arg("dtype"),                                                                    \
           py::arg("reg_bytes"),                                                                \
-          py::arg("last_dim_size"),                                                            \
           py::arg("dim"),                                                                      \
           py::arg("stream"));                                                                  \
     m.def("fused_allreduce_rmsnorm",                                                           \
@@ -388,9 +405,6 @@ namespace py = pybind11;
           py::arg("res_out"),                                                                  \
           py::arg("out"),                                                                      \
           py::arg("w"),                                                                        \
-          py::arg("numel"),                                                                    \
-          py::arg("w_numel"),                                                                  \
-          py::arg("dtype"),                                                                    \
           py::arg("eps"),                                                                      \
           py::arg("reg_ptr"),                                                                  \
           py::arg("reg_bytes"),                                                                \
@@ -405,9 +419,6 @@ namespace py = pybind11;
           py::arg("out"),                                                                      \
           py::arg("scale_out"),                                                                \
           py::arg("w"),                                                                        \
-          py::arg("numel"),                                                                    \
-          py::arg("w_numel"),                                                                  \
-          py::arg("dtype"),                                                                    \
           py::arg("eps"),                                                                      \
           py::arg("reg_ptr"),                                                                  \
           py::arg("reg_bytes"),                                                                \

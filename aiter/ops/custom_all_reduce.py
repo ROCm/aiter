@@ -25,10 +25,8 @@ def init_custom_ar(
 @compile_ops("module_custom_all_reduce")
 def all_reduce(
     _fa: int,
-    inp: int,
-    out: int,
-    numel: int,
-    dtype: int,
+    inp,  # aiter_tensor_t
+    out,  # aiter_tensor_t
     use_new: bool,
     open_fp8_quant: bool,
     reg_inp_ptr: int,
@@ -42,10 +40,8 @@ def all_reduce(
 @compile_ops("module_custom_all_reduce")
 def reduce_scatter(
     _fa: int,
-    inp: int,
-    out: int,
-    inp_numel: int,
-    dtype: int,
+    inp,  # aiter_tensor_t
+    out,  # aiter_tensor_t
     reg_ptr: int,
     reg_bytes: int,
     stream: int,
@@ -55,11 +51,8 @@ def reduce_scatter(
 @compile_ops("module_custom_all_reduce")
 def all_gather_reg(
     _fa: int,
-    inp: int,
-    out: int,
-    inp_numel: int,
-    dtype: int,
-    last_dim_size: int,
+    inp,  # aiter_tensor_t
+    out,  # aiter_tensor_t
     dim: int,
     stream: int,
 ) -> None: ...
@@ -68,13 +61,10 @@ def all_gather_reg(
 @compile_ops("module_custom_all_reduce")
 def all_gather_unreg(
     _fa: int,
-    inp: int,
+    inp,  # aiter_tensor_t
     reg_buffer: int,
-    out: int,
-    inp_numel: int,
-    dtype: int,
+    out,  # aiter_tensor_t
     reg_bytes: int,
-    last_dim_size: int,
     dim: int,
     stream: int,
 ) -> None: ...
@@ -83,14 +73,11 @@ def all_gather_unreg(
 @compile_ops("module_custom_all_reduce")
 def fused_allreduce_rmsnorm(
     _fa: int,
-    inp: int,
-    res_inp: int,
-    res_out: int,
-    out: int,
-    w: int,
-    numel: int,
-    w_numel: int,
-    dtype: int,
+    inp,  # aiter_tensor_t
+    res_inp,  # aiter_tensor_t
+    res_out,  # aiter_tensor_t
+    out,  # aiter_tensor_t
+    w,  # aiter_tensor_t
     eps: float,
     reg_ptr: int,
     reg_bytes: int,
@@ -102,15 +89,12 @@ def fused_allreduce_rmsnorm(
 @compile_ops("module_custom_all_reduce")
 def fused_allreduce_rmsnorm_quant(
     _fa: int,
-    inp: int,
-    res_inp: int,
-    res_out: int,
-    out: int,
-    scale_out: int,
-    w: int,
-    numel: int,
-    w_numel: int,
-    dtype: int,
+    inp,  # aiter_tensor_t
+    res_inp,  # aiter_tensor_t
+    res_out,  # aiter_tensor_t
+    out,  # aiter_tensor_t
+    scale_out,  # aiter_tensor_t
+    w,  # aiter_tensor_t
     eps: float,
     reg_ptr: int,
     reg_bytes: int,
