@@ -87,7 +87,7 @@ def shuffle_kv_cache(
 
 DEVICE_ARCH = arch_info.get_arch()
 
-NUM_HEADS = [(64, 8)]
+NUM_HEADS = [(64, 8), [(8, 1)]]
 HEAD_SIZES = [64, 128]
 BLOCK_SIZES = [16, 64]
 
@@ -424,11 +424,11 @@ def test_triton_unified_attn(
 
 
 @pytest.mark.parametrize(
-    "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
+    "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)], [(1024, 1024)]]
 )
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
-@pytest.mark.parametrize("block_size", [64,])
+@pytest.mark.parametrize("block_size", [64, 16])
 @pytest.mark.parametrize("sliding_window", [None, 256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16,])
 @pytest.mark.parametrize(
