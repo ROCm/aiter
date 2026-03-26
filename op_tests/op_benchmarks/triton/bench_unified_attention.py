@@ -316,31 +316,6 @@ def run_benchmark(custom, args):
             cu_seqlens_k=cu_key_lens,
         )
 
-        ref_output = ref_attn(
-            query,
-            key_cache,
-            value_cache,
-            query_lens,
-            kv_lens,
-            block_tables,
-            scale,
-            args.sliding_window,
-            soft_cap,
-            sinks,
-            causal=causal,
-            kv_layout=args.kv_layout,
-        )
-
-        if args.fp8_full:
-            atol, rtol = 1.5e-1, 1.5e-1
-        elif args.sagev2:
-            atol, rtol = 3.5e-1, 2.5e-1
-            # mae = (output - ref_output).abs().mean().item()
-            # assert mae < 0.1, f"MXFP4 mean absolute error too high: {mae}"
-        else:
-            atol, rtol = 1.5e-2, 1e-2
-        torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
-
         ms = triton.testing.do_bench(fn)
 
         run_correctness = args.test
@@ -543,6 +518,12 @@ def parse_args():
         help="Full FP8 path: quantize Q, K, V to FP8 with q_descale, k_descale, v_descale",
     )
     parser.add_argument("-sagev2", action="store_true", default=False)
+    parser.add_argument(
+        "-BLOCK_R",
+        type=int,
+        default=0,
+        help="Hadamard rotation block size for SAGE quantization. If 0, defaults to head size d. Only used if -sagev2 is set.",
+    )
     parser.add_argument("-dtype", default="fp16")
     parser.add_argument("-print_vgpr", action="store_true", default=False)
 
