@@ -569,10 +569,10 @@ def mhc_post_ref(
 
 @benchmark()
 def test_mhc_post(m, hidden_size, hc_mult):
-    x = torch.ones(m, hidden_size, dtype=dtypes.bf16) * 2
-    residual = torch.zeros(m, hc_mult, hidden_size, dtype=dtypes.bf16)
-    post_layer_mix = torch.ones(m, hc_mult, 1, dtype=dtypes.fp32)
-    comb_res_mix = torch.ones(m, hc_mult, hc_mult, dtype=dtypes.fp32)
+    x = torch.randn(m, hidden_size, dtype=dtypes.bf16)
+    residual = torch.randn(m, hc_mult, hidden_size, dtype=dtypes.bf16)
+    post_layer_mix = torch.randn(m, hc_mult, 1, dtype=dtypes.fp32)
+    comb_res_mix = torch.randn(m, hc_mult, hc_mult, dtype=dtypes.fp32)
     out_ref = mhc_post_ref(x, residual, post_layer_mix, comb_res_mix)
     out_hip, hip_us = run_perftest(
         mhc_post_hip,
