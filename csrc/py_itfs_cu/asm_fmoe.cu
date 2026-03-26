@@ -7,6 +7,84 @@
 #include <memory>
 #include <tuple>
 
+#include <cstdio>
+#include <cstdint>
+#include <map>
+#include <string>
+#include <sys/stat.h>
+#include <unistd.h>
+
+namespace {
+
+static std::map<std::pair<std::string, int>, uint64_t> g_fmoe_batch_counts;
+static uint64_t g_fmoe_total_calls = 0;
+
+bool check_dump_trigger()
+{
+    FILE* f = fopen("/tmp/traces/dump", "r");
+    if(!f) return false;
+    int val = 0;
+    fscanf(f, "%d", &val);
+    fclose(f);
+    if(val == 1)
+    {
+        remove("/tmp/traces/dump");
+        return true;
+    }
+    return false;
+}
+
+void fmoe_batch_record(const char* kname, int tokens)
+{
+    if(check_dump_trigger() && g_fmoe_total_calls > 0)
+    {
+        mkdir("/tmp/traces", 0755);
+        char fname[256];
+        snprintf(fname, sizeof(fname), "/tmp/traces/asm_fmoe_batch_stats_pid%d_%lu.csv", (int)getpid(), (unsigned long)g_fmoe_total_calls);
+        FILE* f = fopen(fname, "w");
+        if(f)
+        {
+            fprintf(f, "kernel,tokens,count,pct\n");
+            for(auto& [k, cnt] : g_fmoe_batch_counts)
+            {
+                double pct = 100.0 * cnt / g_fmoe_total_calls;
+                fprintf(f, "%s,%d,%lu,%.1f\n", k.first.c_str(), k.second, (unsigned long)cnt, pct);
+            }
+            fclose(f);
+            printf("[aiter] asm_fmoe batch stats (%lu calls) -> %s\n", (unsigned long)g_fmoe_total_calls, fname);
+        }
+        g_fmoe_batch_counts.clear();
+        g_fmoe_total_calls = 0;
+    }
+    auto key = std::make_pair(std::string(kname ? kname : "unknown"), tokens);
+    g_fmoe_batch_counts[key]++;
+    g_fmoe_total_calls++;
+}
+
+struct FmoeBatchStatsAtExit {
+    ~FmoeBatchStatsAtExit() {
+        if(g_fmoe_total_calls == 0) return;
+        mkdir("/tmp/traces", 0755);
+        char fname[256];
+        snprintf(fname, sizeof(fname), "/tmp/traces/asm_fmoe_batch_stats_final_pid%d.csv", (int)getpid());
+        FILE* f = fopen(fname, "w");
+        if(f)
+        {
+            fprintf(f, "kernel,tokens,count,pct\n");
+            for(auto& [k, cnt] : g_fmoe_batch_counts)
+            {
+                double pct = 100.0 * cnt / g_fmoe_total_calls;
+                fprintf(f, "%s,%d,%lu,%.1f\n", k.first.c_str(), k.second, (unsigned long)cnt, pct);
+            }
+            fclose(f);
+        }
+        printf("[aiter] asm_fmoe final batch stats (%lu calls) -> %s\n", (unsigned long)g_fmoe_total_calls, fname);
+    }
+};
+static FmoeBatchStatsAtExit g_fmoe_atexit;
+
+} // anonymous namespace
+
 struct __attribute__((packed)) KernelArgs
 {
     void* ptr_O;
@@ -204,6 +282,8 @@ class FMoeKernel
             gdy = sub_X_cnt;
             gdz = 1;
         }
+
+	fmoe_batch_record(name, token_cnt);
 
         if constexpr(switchGxy)
         {

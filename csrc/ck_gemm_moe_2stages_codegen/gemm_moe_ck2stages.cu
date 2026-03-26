@@ -10,9 +10,91 @@
 #include "moe_ck.h"
 #include "aiter_logger.h"
 #include <cmath>
+#include <cstdio>
+#include <cstdint>
+#include <map>
+#include <string>
+#include <sys/stat.h>
+#include <unistd.h>
+
+namespace {
+
+static std::map<std::pair<std::string, int>, uint64_t> g_moe_batch_counts;
+static uint64_t g_moe_total_calls = 0;
+
+bool check_dump_trigger()
+{
+    FILE* f = fopen("/tmp/traces/dump", "r");
+    if(!f) return false;
+    int val = 0;
+    fscanf(f, "%d", &val);
+    fclose(f);
+    if(val == 1)
+    {
+        remove("/tmp/traces/dump");
+        return true;
+    }
+    return false;
+    if(val == 1)
+    {
+        remove("/tmp/traces/dump");
+        return true;
+    }
+    return false;
+}
+
+void moe_batch_record(const char* kname, int tokens)
+{
+    if(check_dump_trigger() && g_moe_total_calls > 0)
+    {
+        mkdir("/tmp/traces", 0755);
+        char fname[256];
+        snprintf(fname, sizeof(fname), "/tmp/traces/ck_moe_jit_batch_stats_pid%d_%lu.csv", (int)getpid(), (unsigned long)g_moe_total_calls);
+        FILE* f = fopen(fname, "w");
+        if(f)
+        {
+            fprintf(f, "kernel,tokens,count,pct\n");
+            for(auto& [k, cnt] : g_moe_batch_counts)
+            {
+                double pct = 100.0 * cnt / g_moe_total_calls;
+                fprintf(f, "%s,%d,%lu,%.1f\n", k.first.c_str(), k.second, (unsigned long)cnt, pct);
+            }
+            fclose(f);
+            printf("[aiter] ck_moe_jit batch stats (%lu calls) -> %s\n", (unsigned long)g_moe_total_calls, fname);
+        }
+        g_moe_batch_counts.clear();
+        g_moe_total_calls = 0;
+    }
+    auto key = std::make_pair(std::string(kname), tokens);
+    g_moe_batch_counts[key]++;
+    g_moe_total_calls++;
+}
+
+struct MoeBatchStatsAtExit {
+    ~MoeBatchStatsAtExit() {
+        if(g_moe_total_calls == 0) return;
+        mkdir("/tmp/traces", 0755);
+        char fname[256];
+        snprintf(fname, sizeof(fname), "/tmp/traces/ck_moe_jit_batch_stats_final_pid%d.csv", (int)getpid());
+        FILE* f = fopen(fname, "w");
+        if(f)
+        {
+            fprintf(f, "kernel,tokens,count,pct\n");
+            for(auto& [k, cnt] : g_moe_batch_counts)
+            {
+                double pct = 100.0 * cnt / g_moe_total_calls;
+                fprintf(f, "%s,%d,%lu,%.1f\n", k.first.c_str(), k.second, (unsigned long)cnt, pct);
+            }
+            fclose(f);
+        }
+        printf("[aiter] ck_moe_jit final batch stats (%lu calls) -> %s\n", (unsigned long)g_moe_total_calls, fname);
+    }
+};
+static MoeBatchStatsAtExit g_moe_atexit;
+
+} // anonymous namespace
 
 using MoeKernelMap = std::unordered_map<std::string, MoeKernel>;
-
 // API for user aiter.ck_moe_stage1(...)
 
 template <int stage = 1>
@@ -109,6 +191,7 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
     }
 
     activation = !activation;
+    moe_batch_record("ck_moe_2stage", tokens);
 
     auto kernel = moe_dispatch<1>(kernelName, MPerBlock, N, hidden_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled);
 
