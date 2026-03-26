@@ -1219,7 +1219,7 @@ def fused_moe_2stages(
     intermediate_pad=0,
     bias1=None,
     bias2=None,
-    accumulate: bool = False,
+    accumulate: bool = True,
 ):
     def _normalize_moe_output_shape(x: torch.Tensor) -> torch.Tensor:
         if x.ndim == 3 and x.shape[1] == 1:
@@ -1497,7 +1497,7 @@ def fused_moe_2stages(
         extra_stage2_args["intermediate"] = moe_out
         moe_out = torch.empty(token_num, model_dim, dtype=moe_out.dtype, device=device)
     if metadata.stage2.func == asm_stage2:
-        extra_stage2_args["asm_do_atomic"] = accumulate
+        extra_stage2_args["asm_do_atomic"] = not accumulate
 
     if accumulate and metadata.stage2.func == asm_stage2:
         if is_flydsl_available() and FLIR_PATH:
