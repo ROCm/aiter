@@ -22,27 +22,32 @@ def select_2d_config(
     max_seqlen_k,
     num_queries_per_kv,
     num_2d_prgms,
+    is_quantized=False,
 ):
     arch = get_arch()
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
-    TILE_SIZE = 64
-    # in case head_size is large
-    max_num_stages_2d = 4
-    if head_size > 128:
-        max_num_stages_2d = 2
-    if not all_decode:
-        num_stages_2d = 1
-        num_warps = 2
-    else:
-        num_stages_2d = 3
-        num_warps = 2
-        TILE_SIZE = max(32, min(64, triton.next_power_of_2(block_size)))
-
-    TILE_SIZE = 32 if arch.name == "gfx1201" else 16 if arch.is_rdna else 64
+    # TILE_SIZE >= 32 is required: TILE_SIZE=16 causes Triton compiler
+    # crashes for FP8/MXFP4 on gfx950 (unsupported 16x16 FP8 MFMA) and
+    # correctness failures for BF16 with BLOCK_M=16.
+    TILE_SIZE = 32 if arch.is_rdna else 64
+    # TILE_SIZE = 32 if arch.name == "gfx1201" else 16 if arch.is_rdna else 64
     waves_per_eu = 8 if arch.name == "gfx1151" else 6 if arch.is_rdna else 2
+
+    # TILE_SIZE = 64
+    # # in case head_size is large
+    # max_num_stages_2d = 4
+    # if head_size > 128:
+    #     max_num_stages_2d = 2
+    # if not all_decode:
+    #     num_stages_2d = 1
+    #     num_warps = 2
+    # else:
+    #     num_stages_2d = 3
+    #     num_warps = 2
+    #     TILE_SIZE = max(32, min(64, triton.next_power_of_2(block_size)))
 
     max_num_stages_2d = 2 if head_size > 128 else 4
 
@@ -61,6 +66,8 @@ def select_2d_config(
     # large prefill config
     if max_seqlen_q >= 256:
         BLOCK_M = 64 if arch.is_rdna else 128
+        if is_quantized and not arch.is_rdna:
+            TILE_SIZE = 128
         num_stages_2d, num_warps = 1, 4
 
     BLOCK_Q = BLOCK_M // num_queries_per_kv
@@ -86,7 +93,8 @@ def select_3d_config(
     num_segments = math.ceil(target_num_prgms / num_2d_prgms)
     num_segments = triton.next_power_of_2(num_segments)
     num_segments = min(num_segments, 128)
-    MIN_SEGMENTS = 16 if TILE_SIZE <= 16 else 8
+    # MIN_SEGMENTS = 16 if TILE_SIZE <= 16 else 8
+    MIN_SEGMENTS = 8
     num_segments = max(num_segments, MIN_SEGMENTS)
     if num_segments == MIN_SEGMENTS:
         reduce_num_warps = 1
@@ -308,6 +316,7 @@ def unified_attention(
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
+    is_quantized = sage_mxfp4 or q_descale is not None
     if use_2d_kernel(
         head_size_qk,
         SLIDING_WINDOW,
@@ -326,6 +335,7 @@ def unified_attention(
             max_seqlen_k,
             num_queries_per_kv,
             num_2d_prgms,
+            is_quantized=is_quantized,
         )
 
         BLOCK_M = config["BLOCK_M"]
