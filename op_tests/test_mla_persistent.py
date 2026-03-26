@@ -411,13 +411,28 @@ def torch_mla_extend_split_kv(
             and max_seqlen_q * fold_factor == 4
         )
         total_s = total_q * fold_factor
+        ori_nheads = nheads
         nheads = 16
         if use_qseqlen_fold:
             max_seqlen_q = max_seqlen_q * fold_factor
             q_ratio = 1
+            q = q.view(total_s, nheads, -1)
+        elif max_seqlen_q == 1:
+            q_ratio = fold_factor
+            q = q.view(total_s, nheads, -1)
         else:
             q_ratio = fold_factor
-        q = q.view(total_s, nheads, -1)
+            q = (
+                q.reshape(
+                    total_q // max_seqlen_q,
+                    max_seqlen_q,
+                    ori_nheads // nheads,
+                    nheads,
+                    -1,
+                )
+                .permute(0, 2, 1, 3, 4)
+                .reshape(total_s, nheads, -1)
+            )
         final_out = final_out.view(total_s, nheads, -1)
         final_lse = final_lse.view(total_s, nheads)
         io_transformed = True
@@ -712,11 +727,33 @@ def torch_mla_split_kv_and_reduce(
     )
 
     if io_transformed:
-        # import pdb; pdb.set_trace()
-        # partial_out = partial_out.reshape(-1, nhead, kv_lora_rank)
-        # partial_lse = partial_lse.reshape(-1, nhead)
-        split_out = split_out.reshape(total_q, nhead, kv_lora_rank)
-        split_lse = split_lse.reshape(total_q, nhead)
+        if max_seqlen_q == 1:
+            split_out = split_out.reshape(total_q, nhead, kv_lora_rank)
+            split_lse = split_lse.reshape(total_q, nhead)
+        else:
+            split_out = (
+                split_out.reshape(
+                    total_q // max_seqlen_q,
+                    nhead // 16,
+                    max_seqlen_q,
+                    16,
+                    -1,
+                )
+                .permute(0, 2, 1, 3, 4)
+                .reshape(total_q, nhead, kv_lora_rank)
+                .contiguous()
+            )
+            split_lse = (
+                split_lse.reshape(
+                    total_q // max_seqlen_q,
+                    nhead // 16,
+                    max_seqlen_q,
+                    16,
+                )
+                .permute(0, 2, 1, 3)
+                .reshape(total_q, nhead)
+                .contiguous()
+            )
 
     return partial_out, partial_lse, split_out, split_lse
 
