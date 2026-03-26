@@ -20,6 +20,7 @@ from aiter.test_common import run_perftest, checkAllclose
 from aiter.fused_moe import fused_topk, moe_sorting, torch_moe_stage1, cktile_moe_stage1, get_ksplit
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.fp4_utils import e8m0_shuffle, moe_mxfp4_sort
+from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
 from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1
 from aiter import ActivationType
 from aiter.ops.moe_op import ck_moe_stage1_fwd
@@ -32,7 +33,7 @@ TORCH_QUANT = aiter.get_torch_quant(Q_TYPE)
 
 CSV_PATH = os.path.join(
     os.path.dirname(__file__),
-    "aiter", "configs", "model_configs", "dsv3_fp4_tuned_flydsl.csv",
+    "aiter", "configs", "model_configs", "dsv3_fp4_tuned_fmoe.csv",
 )
 
 
@@ -162,6 +163,44 @@ def fn_stage1(a1_qt, w1_qt_shuf, sorted_ids, sorted_expert_ids,
         gate_only=gate_only,
     )
 
+def fn_quant_sort(inp, sorted_ids, num_valid_ids, token, sort_block_m):
+    """fused_dynamic_mxfp4_quant_moe_sort (same as fused_moe.py production)."""
+    return fused_dynamic_mxfp4_quant_moe_sort(
+        inp,
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=token,
+        topk=1,
+        block_size=sort_block_m,
+    )
+
+
+def fn_quant_sort_stage1(inp, w1_qt_shuf, sorted_ids, sorted_expert_ids,
+                         num_valid_ids, w1_scale_shuf,
+                         topk, block_m, token, sort_block_m,
+                         use_async, k_batch=1, tile_n=128,
+                         gate_only=False):
+    """Full pipeline: fused_quant_sort(bf16->fp4) + stage1 kernel."""
+    a1_qt, a1_scale_sort = fused_dynamic_mxfp4_quant_moe_sort(
+        inp,
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=token,
+        topk=1,
+        block_size=sort_block_m,
+    )
+    return flydsl_moe_stage1(
+        a=a1_qt, w1=w1_qt_shuf,
+        sorted_token_ids=sorted_ids, sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        topk=topk, tile_m=block_m, tile_n=tile_n, tile_k=256,
+        a_dtype="fp4", b_dtype="fp4", out_dtype="bf16",
+        w1_scale=w1_scale_shuf, a1_scale=a1_scale_sort,
+        use_async_copy=use_async,
+        k_batch=k_batch,
+        gate_only=gate_only,
+    )
+
 
 def call_ck_stage1(d, topk, block_m):
     token_num = d["a1_qt"].shape[0]
@@ -262,7 +301,6 @@ def main():
             SPLITK_VALUES = [1]
 
         block_m = c["block_m"]
-        block_m = 16
         # if token == 8192: 
         #     block_m = 64 
         topk = c["topk"]
@@ -425,54 +463,90 @@ def main():
                 us_go64 = 0.0
                 us_go32 = 0.0
 
-            # print("    ck perf...", end="", flush=True)
-            # _, us_ck= run_perftest(
-            #     fn_ck_stage1, *common,
-            #     num_iters=ni, num_warmup=nw,
-            # )
-            # print(f"  {us_ck:.2f} us")
+            # -- quant+sort timing --
+            sort_block_m = max(32, block_m)
+            print("    perf (quant+sort)...", end="", flush=True)
+            _, us_qs = run_perftest(
+                fn_quant_sort,
+                d["inp"], d["sorted_ids"], d["num_valid_ids"],
+                token, sort_block_m,
+                num_iters=ni, num_warmup=nw,
+            )
+            print(f"  {us_qs:.2f} us")
 
-            # cktile_ksplit = get_ksplit(token, topk, c["expert"],
-            #                           inter_dim_cfg, model_dim)
-            # cktile_block_m = 16 if token < 2048 else 32 if token < 16384 else 64
+            # -- quant+sort+stage1 pipeline timing (tn=128) --
+            qs_common = (
+                d["inp"], d["w1_qt_shuf"],
+                d["sorted_ids"], d["sorted_expert_ids"], d["num_valid_ids"],
+                d["w1_scale_shuf"],
+                topk, block_m, token, sort_block_m,
+            )
+            print("    perf (qs+s1 tn=128)...", end="", flush=True)
+            _, us_qs_s1 = run_perftest(
+                fn_quant_sort_stage1, *qs_common, True, kb,
+                num_iters=ni, num_warmup=nw,
+            )
+            print(f"  {us_qs_s1:.2f} us")
 
-            # if cktile_ksplit > 1:
-            #     if cktile_block_m != block_m:
-            #         ct_sorted_ids, _, ct_sorted_expert_ids, ct_num_valid_ids, _ = \
-            #             moe_sorting(d["topk_ids"], d["topk_weights"],
-            #                         c["expert"], model_dim, torch.bfloat16,
-            #                         cktile_block_m)
-            #         ct_needed = ct_sorted_expert_ids.shape[0] * cktile_block_m
-            #         if ct_sorted_ids.shape[0] < ct_needed:
-            #             ct_pad = torch.full(
-            #                 (ct_needed - ct_sorted_ids.shape[0],), token,
-            #                 dtype=ct_sorted_ids.dtype, device=ct_sorted_ids.device)
-            #             ct_sorted_ids = torch.cat([ct_sorted_ids, ct_pad])
-            #     else:
-            #         ct_sorted_ids = d["sorted_ids"]
-            #         ct_sorted_expert_ids = d["sorted_expert_ids"]
-            #         ct_num_valid_ids = d["num_valid_ids"]
+            # -- pipeline precision check --
+            qs_fly_out = fn_quant_sort_stage1(*qs_common, True, kb)
+            torch.cuda.synchronize()
+            err_qs_s1 = checkAllclose(
+                ref_out, qs_fly_out,
+                rtol=args.rtol, atol=args.atol,
+                msg=f"    [t={token},sk={kb},qs+s1] ",
+            )
+            prec_qs_s1 = "PASS" if err_qs_s1 == 0 else (
+                "WARN" if err_qs_s1 <= 0.05 else "FAIL")
 
-            #     common_a16w4 = (
-            #         d["inp"], d["w1_qt_shuf"],
-            #         ct_sorted_ids, ct_sorted_expert_ids, ct_num_valid_ids,
-            #         d["w1_scale_shuf"],
-            #         topk, cktile_block_m, cktile_ksplit,
-            #     )
+            print("    ck perf...", end="", flush=True)
+            _, us_ck = run_perftest(
+                fn_ck_stage1, *common,
+                num_iters=ni, num_warmup=nw,
+            )
+            print(f"  {us_ck:.2f} us")
 
-            #     print(f"    ck a16w4 perf (sk={cktile_ksplit}, bm={cktile_block_m})...",
-            #           end="", flush=True)
-            #     _, us_ck_a16w4 = run_perftest(
-            #         fn_ck_stage1_a16w4, *common_a16w4,
-            #         num_iters=ni, num_warmup=nw,
-            #     )
-            #     print(f"  {us_ck_a16w4:.2f} us")
-            # else:
-            #     us_ck_a16w4 = 0.0
-            #     print(f"    ck a16w4: skipped (ksplit=0, not enough CU pressure)")
+            cktile_ksplit = get_ksplit(token, topk, c["expert"],
+                                      inter_dim_cfg, model_dim)
+            cktile_block_m = 16 if token < 2048 else 32 if token < 16384 else 64
 
-            us_ck = 0.0
-            us_ck_a16w4 = 0.0
+            if cktile_ksplit > 1:
+                if cktile_block_m != block_m:
+                    ct_sorted_ids, _, ct_sorted_expert_ids, ct_num_valid_ids, _ = \
+                        moe_sorting(d["topk_ids"], d["topk_weights"],
+                                    c["expert"], model_dim, torch.bfloat16,
+                                    cktile_block_m)
+                    ct_needed = ct_sorted_expert_ids.shape[0] * cktile_block_m
+                    if ct_sorted_ids.shape[0] < ct_needed:
+                        ct_pad = torch.full(
+                            (ct_needed - ct_sorted_ids.shape[0],), token,
+                            dtype=ct_sorted_ids.dtype, device=ct_sorted_ids.device)
+                        ct_sorted_ids = torch.cat([ct_sorted_ids, ct_pad])
+                else:
+                    ct_sorted_ids = d["sorted_ids"]
+                    ct_sorted_expert_ids = d["sorted_expert_ids"]
+                    ct_num_valid_ids = d["num_valid_ids"]
+
+                common_a16w4 = (
+                    d["inp"], d["w1_qt_shuf"],
+                    ct_sorted_ids, ct_sorted_expert_ids, ct_num_valid_ids,
+                    d["w1_scale_shuf"],
+                    topk, cktile_block_m, cktile_ksplit,
+                )
+
+                print(f"    ck a16w4 perf (sk={cktile_ksplit}, bm={cktile_block_m})...",
+                      end="", flush=True)
+                _, us_ck_a16w4 = run_perftest(
+                    fn_ck_stage1_a16w4, *common_a16w4,
+                    num_iters=ni, num_warmup=nw,
+                )
+                print(f"  {us_ck_a16w4:.2f} us")
+            else:
+                us_ck_a16w4 = 0.0
+                print(f"    ck a16w4: skipped (ksplit=0, not enough CU pressure)")
+
+            # us_ck = 0.0
+            # us_ck_a16w4 = 0.0
 
             gx = inter_dim_cfg * 2 // 128
             _sort_bm = max(32, block_m)
@@ -489,6 +563,8 @@ def main():
                 ck_us=us_ck, us=us_val, us_tn64=us_tn64, us_tn32=us_tn32,
                 us_go=us_go, us_go64=us_go64, us_go32=us_go32,
                 ck_a16w4_us=us_ck_a16w4,
+                us_qs=us_qs, us_qs_s1=us_qs_s1,
+                err_qs_s1=err_qs_s1, prec_qs_s1=prec_qs_s1,
                 err_ratio=err_ratio, prec_ok=prec_ok,
                 err_ratio_tn64=err_ratio_tn64, prec_ok_tn64=prec_ok_tn64,
                 err_ratio_tn32=err_ratio_tn32, prec_ok_tn32=prec_ok_tn32,
@@ -506,14 +582,18 @@ def main():
            f"{'tn32':>9s}  {'p32':>4s}  "
            f"{'go128':>9s}  {'pgo':>4s}  "
            f"{'go64':>9s}  {'pg64':>4s}  "
-           f"{'go32':>9s}  {'pg32':>4s}")
+           f"{'go32':>9s}  {'pg32':>4s}  "
+           f"{'ck_a16w4':>9s}  "
+           f"{'qs_us':>9s}  {'qs+s1':>9s}  {'pqs':>4s}")
     print(hdr)
     print(f"  {'-'*5}  {'-'*3}  {'-'*4}  "
            f"{'-'*5}  {'-'*4}  {'-'*9}  {'-'*9}  {'-'*4}  "
            f"{'-'*9}  {'-'*4}  "
            f"{'-'*9}  {'-'*4}  "
            f"{'-'*9}  {'-'*4}  "
-           f"{'-'*9}  {'-'*4}")
+           f"{'-'*9}  {'-'*4}  "
+           f"{'-'*9}  "
+           f"{'-'*9}  {'-'*9}  {'-'*4}")
     for r in results:
         print(f"  {r['token']:>5d}  {r['k_batch']:>3d}  "
               f"{r['k_iters']:>4d}  "
@@ -522,7 +602,9 @@ def main():
               f"{r['us_tn32']:>9.2f}  {r['prec_ok_tn32']:>4s}  "
               f"{r['us_go']:>9.2f}  {r['prec_ok_go']:>4s}  "
               f"{r['us_go64']:>9.2f}  {r['prec_ok_go64']:>4s}  "
-              f"{r['us_go32']:>9.2f}  {r['prec_ok_go32']:>4s}")
+              f"{r['us_go32']:>9.2f}  {r['prec_ok_go32']:>4s}  "
+              f"{r['ck_a16w4_us']:>9.2f}  "
+              f"{r['us_qs']:>9.2f}  {r['us_qs_s1']:>9.2f}  {r['prec_qs_s1']:>4s}")
 
 
 if __name__ == "__main__":

@@ -3,22 +3,37 @@
 Reference path:  stage1(bf16) -> TORCH_QUANT -> fp4 + e8m0_scale
 Fused path:      stage1(fuse_fp4_quant=True) -> fp4 packed bytes
 
-Also re-runs the non-quant correctness check (same as bench_stage1_async.py)
-to confirm fuse_fp4_quant changes don't affect the normal code path.
+Part 3 benchmarks quant+sort+stage1 pipeline using tuned kernels from
+dsv3_fp4_tuned_fmoe.csv.  Quant timing uses fused_dynamic_mxfp4_quant_moe_sort
+(the same fused triton kernel as fused_moe.py production path).
 
 Usage:
     python bench_fuse_quant.py
+    python bench_fuse_quant.py --skip-precision       # Part 3 only
+    python bench_fuse_quant.py --num-iters 50
 """
 
 import argparse
+import os
 import torch
+import pandas as pd
 import aiter
 from aiter import dtypes, QuantType, ActivationType
-from aiter.test_common import checkAllclose
+from aiter.test_common import checkAllclose, run_perftest
 from aiter.fused_moe import fused_topk, moe_sorting, torch_moe_stage1
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.fp4_utils import e8m0_shuffle, moe_mxfp4_sort
-from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1
+from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
+from aiter.ops.flydsl.moe_kernels import (
+    flydsl_moe_stage1,
+    get_flydsl_kernel_params,
+)
+
+try:
+    from aiter import ck_moe_stage1_fwd
+    _HAS_CK = True
+except ImportError:
+    _HAS_CK = False
 
 torch.set_default_device("cuda")
 
