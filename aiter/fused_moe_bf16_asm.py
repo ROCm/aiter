@@ -6,14 +6,16 @@ import torch.nn.functional as F
 from typing import Optional
 import aiter
 from aiter import logger
-from aiter import pertoken_quant, get_hip_quant
+from aiter import pertoken_quant, get_hip_quant, os
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_moe
 from aiter.jit.core import ENABLE_CK
 
 BLOCK_SIZE_M = 32
 
-_USE_OPUS_MOE_SORTING = not ENABLE_CK
+_USE_OPUS_MOE_SORTING = (not ENABLE_CK) or (
+    os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
+)
 
 
 def moe_sorting_ck(
