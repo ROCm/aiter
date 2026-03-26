@@ -159,6 +159,10 @@ def make_unified_attn_inputs(
             dtype=dtype,
             device="cuda",
         )
+        block_tables = None
+        cu_key_lens = torch.tensor(
+            [0] + kv_lens_list, dtype=torch.int32, device="cuda"
+        ).cumsum(dim=0, dtype=torch.int32)
     elif kv_layout == "cache":
         key_cache = torch.randn(
             num_blocks,
@@ -176,26 +180,24 @@ def make_unified_attn_inputs(
             dtype=dtype,
             device="cuda",
         )
+        max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+        block_tables = torch.randint(
+            0,
+            num_blocks,
+            (num_seqs, max_num_blocks_per_seq),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        cu_key_lens = None
     else:
         raise ValueError(f"Invalid kv_layout: {kv_layout}")
 
     cu_query_lens = torch.tensor(
         [0] + query_lens, dtype=torch.int32, device="cuda"
     ).cumsum(dim=0, dtype=torch.int32)
-    cu_key_lens = torch.tensor(
-        [0] + kv_lens_list, dtype=torch.int32, device="cuda"
-    ).cumsum(dim=0, dtype=torch.int32)
+    
     kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32, device="cuda")
     query_lens = torch.tensor(query_lens, dtype=torch.int32, device="cuda")
-
-    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
-    block_tables = torch.randint(
-        0,
-        num_blocks,
-        (num_seqs, max_num_blocks_per_seq),
-        dtype=torch.int32,
-        device="cuda",
-    )
 
     output = torch.empty(
         sum(query_lens),
