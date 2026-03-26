@@ -42,6 +42,7 @@ jobs:
           # Install minimal dependencies for doc build
           # (ROCm not needed for documentation generation)
           pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install "setuptools_scm<9" vcs_versioning
           pip install -e . || true  # Continue even if full install fails
 
       - name: Build Sphinx documentation

@@ -10,6 +10,7 @@ echo
 echo "==== Install dependencies and aiter ===="
 pip install --upgrade pandas zmq einops numpy==1.26.2
 pip uninstall -y aiter || true
+pip install --upgrade "setuptools_scm<9" vcs_versioning
 pip install --upgrade "pybind11>=3.0.1"
 pip install --upgrade "ninja>=1.11.1"
 pip install tabulate
