@@ -13,7 +13,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
     get_caller_name_no_ext,
 )
-from op_tests.triton_tests.attention.test_unified_attention import ref_paged_attn
+from op_tests.triton_tests.attention.test_unified_attention import ref_attn
 
 
 def nonvarlen_benchmark_configs():
@@ -376,7 +376,7 @@ def run_benchmark(custom, args):
         run_correctness = args.test
         if run_correctness:
             fn()
-            ref_output = ref_paged_attn(
+            ref_output = ref_attn(
                 query=query,
                 key_cache=key_cache,
                 value_cache=value_cache,
