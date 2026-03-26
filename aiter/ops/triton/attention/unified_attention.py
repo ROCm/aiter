@@ -196,8 +196,8 @@ def check_mxfp4_quant_args_get_strides(
 
 def unified_attention(
     q,  # t,h,d+r
-    k,  # num_blks, blk_size, hk, d+r
-    v,  # num_blks, blk_size, hk, dv
+    k,  # num_blks, blk_size, hk, d+r if kv_layout=="cache", else t,hk,d+r
+    v,  # num_blks, blk_size, hk, dv if kv_layout=="cache", else t,hk,dv
     out,  # t,h,dv
     cu_seqlens_q,
     max_seqlen_q,
@@ -206,11 +206,11 @@ def unified_attention(
     softmax_scale,
     causal,
     window_size,
-    block_table,  # num_seqs, cdiv(max_seqlen_k, block_size) if kv_layout=="cache", cu_seqlens_k if kv_layout=="thd"
     softcap,
-    q_descale,
-    k_descale,
-    v_descale,
+    q_descale, # None (no quantization) or float32 scalar (fp8 per tensor) or (*q.shape[:-1], (d+r) // 32) (MXFP4)
+    k_descale, # None (no quantization) or float32 scalar (fp8 per tensor) or (*k.shape[:-1], (d+r) // 32) (MXFP4)
+    v_descale, # None (no quantization) or float32 scalar (fp8 per tensor) or (*k.shape[:-1], dv // 32) (MXFP4)
+    block_table=None,  # num_seqs, cdiv(max_seqlen_k, block_size), required if kv_layout=="cache"
     alibi_slopes=None,
     output_scale=None,
     qq_bias=None,
@@ -219,7 +219,100 @@ def unified_attention(
     sage_mxfp4=False,
     kv_layout="cache",  # "cache" or "thd"
     cu_seqlens_k=None,  # required if kv_layout=="thd"
+    rope_size=None, # if set, r part of the head dim is processed separately. Set to 0 if you want to disable the handling of the rope separately.
 ):
+    """
+    Compute unified multi-head attention with Triton kernels, supporting paged KV-cache and THD layouts,
+    optional quantization (FP8 / MXFP4), ALiBi, sliding-window attention, softcap, sinks, and split RoPE heads.
+    This function dispatches to either a 2D fused kernel or a 3D segmented kernel + reduction based on
+    problem size and hardware occupancy heuristics. Results are written in-place to ``out``.
+    Args:
+        q (torch.Tensor):
+            Query tensor of shape ``(Tq, Hq, Dqk_total)`` where ``Dqk_total = d + r``.
+        k (torch.Tensor):
+            Key tensor.
+            - If ``kv_layout="cache"``: shape ``(num_blks, blk_size, Hkv, Dqk_total)``
+            - If ``kv_layout="thd"``: shape ``(Tk, Hkv, Dqk_total)``
+        v (torch.Tensor):
+            Value tensor.
+            - If ``kv_layout="cache"``: shape ``(num_blks, blk_size, Hkv, Dv)``
+            - If ``kv_layout="thd"``: shape ``(Tk, Hkv, Dv)``
+        out (torch.Tensor):
+            Output tensor of shape ``(Tq, Hq, Dv)``. Filled in-place.
+        cu_seqlens_q (torch.Tensor):
+            Cumulative query sequence lengths, shape ``(num_seqs + 1,)``.
+        max_seqlen_q (int):
+            Maximum query sequence length in the batch.
+        seqused_k (torch.Tensor):
+            Per-sequence effective key lengths, shape ``(num_seqs,)``.
+        max_seqlen_k (int):
+            Maximum key sequence length in the batch.
+        softmax_scale (float | None):
+            Scale factor applied to attention logits. If ``None`` in 2D path, defaults to ``1.0``.
+        causal (bool):
+            Whether to apply causal masking.
+        window_size (tuple[int, int] | list[int]):
+            Sliding-window configuration. Effective left window uses ``1 + window_size[0]``.
+        softcap (float):
+            Optional logit soft-capping value; disabled when ``<= 0``.
+        q_descale (None | torch.Tensor | float):
+            Query dequant scale:
+            - ``None``: no quantization
+            - scalar float32: per-tensor FP8 scale
+            - tensor for MXFP4: shape ``(*q.shape[:-1], Dqk_total // 32)``
+        k_descale (None | torch.Tensor | float):
+            Key dequant scale:
+            - ``None``: no quantization
+            - scalar float32: per-tensor FP8 scale
+            - tensor for MXFP4: shape compatible with key layout, last dim ``Dqk_total // 32``
+        v_descale (None | torch.Tensor | float):
+            Value dequant scale:
+            - ``None``: no quantization
+            - scalar float32: per-tensor FP8 scale
+            - tensor for MXFP4: shape compatible with value layout, last dim ``Dv // 32``
+        block_table (torch.Tensor | None, optional):
+            Block mapping table of shape ``(num_seqs, ceil(max_seqlen_k / block_size))``.
+            Required when ``kv_layout="cache"``.
+        alibi_slopes (torch.Tensor | None, optional):
+            ALiBi slopes tensor. Enables ALiBi bias when provided.
+        output_scale (float | None, optional):
+            If provided, output is scaled by ``1 / output_scale`` (used for FP8 output path).
+        qq_bias (torch.Tensor | None, optional):
+            Optional per-query bias tensor used by kernel when provided.
+        sinks (torch.Tensor | None, optional):
+            Optional sink scores/tensor. First dimension must equal ``num_query_heads``.
+        sage_mxfp4 (bool, optional):
+            Enables SageAttention MXFP4-specific path and stride handling.
+        kv_layout (str, optional):
+            KV memory layout: ``"cache"`` (paged/cache layout) or ``"thd"`` (token-head-dim layout).
+        cu_seqlens_k (torch.Tensor | None, optional):
+            Cumulative key sequence lengths, required when ``kv_layout="thd"``.
+        rope_size (int | None, optional):
+            Size of RoPE portion within Q/K head dimension.
+            - ``None``: inferred split if head size is not power-of-two.
+            - ``0``: disable inferred split. Can lead to suboptimal masked loads and compute if head size is not power-of-two.
+            - ``r``: separate RoPE handling of size ``r`` within head dimension ``Dqk_total = d + r``, processed with dedicated logic in kernel.
+    Behavior:
+        - Validates required layout-dependent inputs.
+        - Derives head sizes, RoPE partition, and quantization strides.
+        - Chooses between:
+          1) single-pass 2D attention kernel, or
+          2) segmented 3D attention kernel followed by reduction.
+        - Supports grouped-query attention via ``num_queries_per_kv = Hq // Hkv``.
+    Returns:
+        None. The result is written into ``out``.
+    Raises:
+        AssertionError:
+            If required tensors/shapes are missing or inconsistent (e.g., missing ``block_table`` for cache layout,
+            missing ``cu_seqlens_k`` for THD, invalid sinks head count).
+        ValueError:
+            If ``kv_layout`` is not one of ``{"cache", "thd"}``.
+    Notes:
+        - ``Hq`` must be divisible by ``Hkv``.
+        - Internal kernel launch geometry is selected heuristically for occupancy/performance.
+        - In THD mode, K/V are temporarily reshaped to emulate cache-style kernel expectations.
+    """
+    
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -229,13 +322,15 @@ def unified_attention(
     if sage_mxfp4:
         head_size_qk *= 2
 
-    is_head_size_pow2 = head_size_qk & (head_size_qk - 1) == 0
-
-    rope_size = 0
-    if not is_head_size_pow2:
-        lora = triton.next_power_of_2(head_size_qk) // 2
-        rope_size = head_size_qk - lora
-        head_size_qk = lora
+    if rope_size is not None:
+        head_size_qk -= rope_size
+    else:    
+        rope_size = 0
+        is_head_size_pow2 = head_size_qk & (head_size_qk - 1) == 0
+        if not is_head_size_pow2:
+            lora = triton.next_power_of_2(head_size_qk) // 2
+            rope_size = head_size_qk - lora
+            head_size_qk = lora
 
     HAS_ROPE = rope_size > 0
 
