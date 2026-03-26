@@ -231,7 +231,7 @@ def make_unified_attn_inputs(
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("kv_layout", ["cache"])
 @pytest.mark.parametrize("causal", [True, False])
-@pytest.mark.parametrize("quant_scheme", ["sage_mxfp4"])
+@pytest.mark.parametrize("quant_scheme", [None, "fp8", "sage_mxfp4"])
 @torch.inference_mode()
 def test_triton_unified_attn(
     seq_lens,

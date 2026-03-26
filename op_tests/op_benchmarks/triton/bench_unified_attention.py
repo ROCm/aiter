@@ -247,7 +247,7 @@ def run_benchmark(custom, args):
 
         num_query_heads = HQ
         window_size = (args.sliding_window - 1, 0) if args.sliding_window is not None else (-1, -1)
-        sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
+        sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda") if args.use_sinks else None
 
         q_input, k_input, v_input = query, key_cache, value_cache
         q_descale = k_descale = v_descale = None
