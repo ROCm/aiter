@@ -101,7 +101,7 @@ jobs:
               cd /app/aiter-test && \\
               git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
               git submodule sync && git submodule update --init --recursive && \\
-              MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
+              MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 pip install -e .
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
           EOF
 
