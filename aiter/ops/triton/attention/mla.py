@@ -21,15 +21,12 @@ from aiter.ops.triton.gluon.mla import (
 from aiter.ops.triton.gluon.mla import (
     _mla_decode_fwd_kernel as gluon_mla_decode_fwd_kernel,
 )
-
-# from aiter.ops.triton.gluon.mla import _mla_decode_fwd_reduce_kernel as gluon_mla_decode_fwd_reduce_kernel
-
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils.types import e4m3_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
-from aiter.ops.triton.utils.types import e4m3_dtype
 
 
 def select_2d_config(
@@ -130,7 +127,7 @@ def mla_prefill_fwd(
     #    = \sum_i[floor(query_len[i] / BLOCK_Q)] + num_seqs
     #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
     #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
-    cu_count = get_num_sms()
+    # cu_count = get_num_sms()
     total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     # if batch contains a prefill
@@ -262,13 +259,16 @@ def mla_decode_fwd(
     #    = \sum_i[floor(query_len[i] / BLOCK_Q)] + num_seqs
     #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
     #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
-    cu_count = get_num_sms()
+    if IS_DEVICE_ARCH_GFX12:
+        target_num_prgms = 256
+    else:
+        cu_count = get_num_sms()
+        target_num_prgms = cu_count * 4
     ALL_DECODE = num_tokens_per_seq == 1
     if ALL_DECODE:
         total_num_q_blocks = num_seqs
     else:
         total_num_q_blocks = ((num_tokens_per_seq + BLOCK_Q - 1) // BLOCK_Q) * num_seqs
-    target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     # if batch contains a prefill
 

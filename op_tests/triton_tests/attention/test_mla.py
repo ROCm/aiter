@@ -5,18 +5,15 @@ import random
 import pytest
 import torch
 
-import aiter
 from aiter.ops.triton.attention.mla import mla_decode_fwd
 from aiter.ops.triton.attention.mla import mla_prefill_fwd
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-
-DEVICE_ARCH = arch_info.get_arch()
 from aiter.ops.triton.utils.types import e4m3_dtype
 from typing import Optional
 
-torch.set_default_device("cuda")
+DEVICE_ARCH = arch_info.get_arch()
 
-# current supported case in decode MLA: mtp == 0, 1, 2, 3 (decode_qlen = 1, 2, 3, 4)
+torch.set_default_device("cuda")
 
 
 def shuffle_kv_buffer(
@@ -154,13 +151,13 @@ def torch_mla_extend(
     return out.to(o_dtype)
 
 
-@pytest.mark.parametrize("batch_size", [1])
-@pytest.mark.parametrize("decode_qlen", [1, 2, 4])
-@pytest.mark.parametrize("ctx_lens", [1024])
+@pytest.mark.parametrize("batch_size", [1, 4, 8, 32])
+@pytest.mark.parametrize("decode_qlen", [1, 2, 3, 4])
+@pytest.mark.parametrize("ctx_lens", [200, 1024, 4371, 8192])
 @pytest.mark.parametrize("num_heads", [(16, 1)])
 @pytest.mark.parametrize("kv_lora_rank, qk_rope_head_dim", [(512, 64)])
 @pytest.mark.parametrize("block_size", [64])
-@pytest.mark.parametrize("num_blocks", [128])
+@pytest.mark.parametrize("num_blocks", [32768])
 @pytest.mark.parametrize("varlen", [True, False])
 @pytest.mark.parametrize(
     "q_dtype, kv_dtype, out_dtype, use_out_scale",
@@ -297,12 +294,12 @@ def test_mla_decode_fwd(
     ), f"{torch.max(torch.abs(out - out_ref))}"
 
 
-@pytest.mark.parametrize("batch_size", [1])
-@pytest.mark.parametrize("ctx_lens", [200])
+@pytest.mark.parametrize("batch_size", [1, 4, 8, 32])
+@pytest.mark.parametrize("ctx_lens", [200, 1024, 8192])
 @pytest.mark.parametrize("num_heads", [(16, 1)])
 @pytest.mark.parametrize("kv_lora_rank, qk_rope_head_dim", [(512, 64)])
 @pytest.mark.parametrize("block_size", [64])
-@pytest.mark.parametrize("num_blocks", [128])
+@pytest.mark.parametrize("num_blocks", [32768])
 @pytest.mark.parametrize("varlen", [True, False])
 @pytest.mark.parametrize(
     "q_dtype, kv_dtype, out_dtype, use_out_scale",

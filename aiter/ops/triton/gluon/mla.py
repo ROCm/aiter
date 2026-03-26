@@ -6,7 +6,6 @@ import torch
 from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
 from aiter.ops.triton.utils.types import e4m3_dtype
-import aiter.ops.triton.utils._triton.arch_info as arch_info
 from triton.language.core import _aggregate as aggregate
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -991,7 +990,7 @@ def _mla_decode_fwd_kernel(
     IS_Q_FP8: gl.constexpr = False,  # bool
     IS_KV_FP8: gl.constexpr = False,  # bool
 ):
-    assert SHUFFLED_KV_CACHE == True
+    assert SHUFFLED_KV_CACHE
     assert num_stages == 2
 
     cfg = MLAConfig(
@@ -1507,14 +1506,14 @@ def _mla_prefill_fwd_kernel_non_pipelined(
 
     offs_q_m_qk = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.QK_WMMA_LAYOUT))
     query_pos_qk = q_block_local_idx * BLOCK_Q + offs_q_m_qk // cfg.NUM_QUERIES_PER_KV
-    query_offset_0_qk = cur_batch_in_all_start_index + query_pos_qk
+    # query_offset_0_qk = cur_batch_in_all_start_index + query_pos_qk
     query_offset_1_qk = (
         kv_head_idx * cfg.NUM_QUERIES_PER_KV + offs_q_m_qk % cfg.NUM_QUERIES_PER_KV
     )
-    query_offset_qk = (
-        query_offset_0_qk[:, None] * query_stride_0
-        + query_offset_1_qk[:, None] * query_stride_1
-    )
+    # query_offset_qk = (
+    #     query_offset_0_qk[:, None] * query_stride_0
+    #     + query_offset_1_qk[:, None] * query_stride_1
+    # )
     query_mask_0_qk = query_pos_qk < cur_batch_query_len
     query_mask_1_qk = query_offset_1_qk < num_query_heads
     offs_seq_t = gl.arange(0, TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_LAYOUT))
@@ -1732,7 +1731,7 @@ def _mla_decode_fwd_kernel_non_pipelined(
     IS_Q_FP8: gl.constexpr = False,  # bool
     IS_KV_FP8: gl.constexpr = False,  # bool
 ):
-    assert SHUFFLED_KV_CACHE == False
+    assert not SHUFFLED_KV_CACHE
     cfg = MLAConfig(
         KV_LORA_RANK,
         QK_ROPE_HEAD_DIM,
