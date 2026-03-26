@@ -100,14 +100,6 @@ def select_3d_config(
             block_size >= 64
         ), "Only block_size >= 64 is supported for shuffled KV cache"
 
-        gluon_config = {
-            "NUM_BLOCKS_GATHER_PER_TILE": 1,
-            "IS_Q_FP8": (q_dtype == e4m3_dtype),
-            "IS_KV_FP8": (kv_cache_dtype == e4m3_dtype),
-        }
-    else:
-        gluon_config = {}
-
     TILE_SIZE = min(64, triton.next_power_of_2(block_size))
 
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
@@ -146,7 +138,6 @@ def select_3d_config(
         "num_warps": attn_warps,
         "num_stages": attn_stages,
         "waves_per_eu": waves_per_eu,
-        **gluon_config,
     }
 
     reduce_config = {
@@ -202,12 +193,8 @@ def unified_attention(
     skip_reduce: bool = False,
 ):
     assert causal, "Only causal attention is supported"
-    if shuffled_kv_cache:
-        assert (
-            IS_DEVICE_ARCH_GFX12
-        ), "Shuffled kv cache is only supported on gfx12 and gluon kernel is used"
-    else:
-        assert q_descale is None, "Q scales not supported"
+    if not IS_DEVICE_ARCH_GFX12:
+        assert q_descale is None, "Q scales not supported for Triton kernel on gfx950"
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -364,7 +351,7 @@ def unified_attention(
             device=q.device,
         )
 
-        if shuffled_kv_cache:
+        if IS_DEVICE_ARCH_GFX12:
             _unified_attention_gluon_kernel_3d[
                 (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
             ](
@@ -413,6 +400,9 @@ def unified_attention(
                 ALL_DECODE=ALL_DECODE,
                 SHUFFLED_KV_CACHE=shuffled_kv_cache,
                 WARP_SIZE=WARP_SIZE,
+                NUM_BLOCKS_GATHER_PER_TILE=1,
+                IS_Q_FP8=(q_dtype == e4m3_dtype),
+                IS_KV_FP8=(kv_cache_dtype == e4m3_dtype),
                 **attn_config,
             )
         else:

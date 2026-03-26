@@ -231,6 +231,7 @@ def test_triton_unified_attn_3d(
     o_dtype: torch.dtype,
     shuffled_kv_cache: bool,
 ) -> None:
+    torch.cuda.empty_cache()
     if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
         pytest.skip("block size must be at least 32 for fp8")
 
@@ -238,10 +239,9 @@ def test_triton_unified_attn_3d(
         "gfx950",
         "gfx1250",
     ):
+        # gfx1250 -> Gluon
+        # gfx950 -> Triton
         pytest.skip(f"skip {DEVICE_ARCH}")
-
-    # shuffled_kv_cache = False -> Triton
-    # shuffled_kv_cache = True -> Gluon
 
     if shuffled_kv_cache:
         if DEVICE_ARCH not in ("gfx1250",):
@@ -262,8 +262,6 @@ def test_triton_unified_attn_3d(
             pytest.skip(
                 f"Skipping test for KV cache LDS required memory = {kv_cache_shared_mem_size/1024} kB > 320 kB"
             )
-    elif q_dtype != torch.bfloat16:
-        pytest.skip("triton backend does not support a8w8 unified attention")
 
     # TODO: Uncomment after pytorch adds support for manual_seed
     # torch.manual_seed(0)

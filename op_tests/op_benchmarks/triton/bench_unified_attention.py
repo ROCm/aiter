@@ -277,8 +277,7 @@ def benchmark(args):
         if "ms" in provider:
             return ms
         else:  # BW TB/s
-            # return mem / ms * 1e-6
-            return mem
+            return mem / ms * 1e3
 
     bench_unified_attention.run(
         save_path="." if args.o else None, print_data=True, show_plots=False
