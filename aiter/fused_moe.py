@@ -42,13 +42,22 @@ def _moe_sorting_impl(
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
 
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
-    sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
-    sorted_weights = torch.empty(
-        max_num_tokens_padded, dtype=dtypes.fp32, device=device
-    )
-    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
-    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+    if expert_mask is not None:
+        sorted_ids = torch.full(
+            (max_num_tokens_padded,), topk << 24 | M, dtype=dtypes.i32, device=device
+        )
+        sorted_weights = torch.zeros(max_num_tokens_padded, dtype=dtypes.fp32, device=device)
+        sorted_expert_ids = torch.full((max_num_m_blocks,), -1, dtype=dtypes.i32, device=device)
+        # NSwizzle accesses num_valid_ids[1 + expert_id] for expert_id in [0, num_experts);
+        # minimum size = num_experts + 2, allocate +1 margin.
+        num_valid_ids = torch.zeros(expert_mask.numel() + 3, dtype=dtypes.i32, device=device)
+        moe_buf = torch.zeros((M, model_dim), dtype=moebuf_dtype, device=device)
+    else:
+        sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
+        sorted_weights = torch.empty(max_num_tokens_padded, dtype=dtypes.fp32, device=device)
+        sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
+        num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
     fwd_fn = aiter.moe_sorting_opus_fwd if use_opus else aiter.moe_sorting_fwd
     fwd_fn(
@@ -65,6 +74,21 @@ def _moe_sorting_impl(
         num_local_tokens,
         dispatch_policy,
     )
+    if expert_mask is not None:
+        local_expert_count_t = (expert_mask >= 0).sum()
+        valid_blocks_mask = (sorted_expert_ids >= 0) & (
+            sorted_expert_ids < local_expert_count_t
+        )
+        sorted_expert_ids.masked_fill_(~valid_blocks_mask, 0)
+        token_ids = sorted_ids & 0x00FFFFFF
+        topk_slots = (sorted_ids >> 24) & 0xFF
+        valid_token_mask = (
+            valid_blocks_mask.repeat_interleave(int(block_size))[:max_num_tokens_padded]
+            & (token_ids < M)
+            & (topk_slots < topk)
+        )
+        sorted_ids.masked_fill_(~valid_token_mask, topk << 24 | M)
+        sorted_weights.masked_fill_(~valid_token_mask, 0.0)
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
 
