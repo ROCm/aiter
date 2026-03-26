@@ -48,16 +48,21 @@ def select_2d_config(
     }
 
 
-def select_3d_config(block_size, max_seqlen_k, target_num_prgms, num_2d_prgms):
+def select_3d_config(
+    block_size, max_seqlen_k, target_num_prgms, num_2d_prgms, q_dtype, kv_dtype
+):
     reduce_num_warps = 2
     attn_warps = 8
+    if kv_dtype == torch.bfloat16:
+        attn_warps = 2
+
     TILE_SIZE = block_size
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
-    num_segments = math.ceil(target_num_prgms / num_2d_prgms)
+    num_segments = math.ceil(target_num_prgms / num_2d_prgms) * 2
     num_segments = min(num_segments, MAX_SEGMENTS)
     num_segments = triton.next_power_of_2(num_segments)
     num_segments = min(num_segments, 128)
-    MIN_SEGMENTS = 16 if TILE_SIZE <= 16 else 8
+    MIN_SEGMENTS = max(8, num_segments)
     num_segments = max(num_segments, MIN_SEGMENTS)
     if num_segments == MIN_SEGMENTS:
         reduce_num_warps = 1
@@ -65,15 +70,15 @@ def select_3d_config(block_size, max_seqlen_k, target_num_prgms, num_2d_prgms):
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": attn_warps,
-        "num_stages": 2,
         "waves_per_eu": 1,
+        "num_stages": 2,
     }
     reduce_config = {
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": reduce_num_warps,
-        "num_stages": 1,
         "waves_per_eu": 2,
+        "num_stages": 1,
     }
     return attn_config, reduce_config
 
@@ -232,7 +237,7 @@ def mla_decode_fwd(
     total_num_tokens, num_query_heads, qk_head_dim = q.shape
     if shuffled_kv_cache:
         num_blocks, num_kv_heads, block_size, _ = kv_buffer.shape
-        block_size = block_size * 16
+        # block_size = block_size * 16
     else:
         num_blocks, block_size, num_kv_heads, _ = kv_buffer.shape
     num_seqs = len(seqused_k)
@@ -277,6 +282,8 @@ def mla_decode_fwd(
         max_seqlen_kv,
         target_num_prgms,
         num_2d_prgms,
+        q_dtype,
+        kv_buffer_dtype,
     )
     NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
     segm_output = torch.empty(
@@ -328,7 +335,7 @@ def mla_decode_fwd(
             QK_ROPE_HEAD_DIM=qk_rope_head_dim,
             stride_kv_buffer_0=kv_buffer.stride(0),
             stride_kv_buffer_1=kv_buffer.stride(1),
-            stride_kv_buffer_2=kv_buffer.stride(2),
+            stride_kv_buffer_2=kv_buffer.stride(2) * (16 if shuffled_kv_cache else 1),
             stride_kv_buffer_3=kv_buffer.stride(3),
             query_start_len_ptr=cu_seqlens_q,
             num_tokens_per_seq=num_tokens_per_seq,

@@ -74,6 +74,9 @@ def shuffle_kv_buffer(
     kv_buffer_shuffled = torch.cat(
         [kv_buffer_shuffled_lora, kv_buffer_shuffled_rope], dim=-1
     ).contiguous()
+    kv_buffer_shuffled = kv_buffer_shuffled.view(
+        -1, num_kv_heads, block_size, head_size
+    )
 
     return kv_buffer_shuffled
 
