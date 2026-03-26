@@ -412,26 +412,13 @@ def roofline_mlp(
     )  # output path
 
 
-def parse_args(args: list[str] | None = None):
+def assert_gluon(args: list[str] | None = None):
     arch = get_arch()
     backend = getattr(args, "backend", None)
     if backend == "gluon":
-        assert arch == "gfx1250", (
-            f"--backend gluon requires gfx1250 but detected {arch}"
-        )
-        return True
-    if backend == "triton":
-        return False
-    return arch == "gfx1250"
-
-
-def parse_args(args: list[str] | None = None):
-    arch = get_arch()
-    backend = getattr(args, "backend", None)
-    if backend == "gluon":
-        assert arch == "gfx1250", (
-            f"--backend gluon requires gfx1250 but detected {arch}"
-        )
+        assert (
+            arch == "gfx1250"
+        ), f"--backend gluon requires gfx1250 but detected {arch}"
         return True
     if backend == "triton":
         return False
@@ -505,10 +492,9 @@ def parse_args(args: list[str] | None = None):
     return args
 
 
-if __name__ == "__main__":
+def main(args: list[str] | None = None) -> None:
     parsed_args = parse_args()
     use_gluon = assert_gluon(parsed_args)
-    backend = "gluon" if use_gluon else "triton"
 
     dim1, dim2 = parsed_args.shape
     total_experts, active_experts = parsed_args.experts

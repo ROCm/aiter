@@ -393,10 +393,17 @@ def consume_scaled_tile(
     offs_k_scale = (k_offset_start // BLOCKSCALE_K) + m * K_SUBTILES
     cur_a_scale, cur_b_scale = buffer_load_scales(
         offs_k_scale,
-        XBlockScale, stride_x_bs_k, b_scale_base, stride_w_bs_k,
-        a_scale_m_offs, b_scale_n_offs,
-        is_x_blockscale, is_w_blockscale,
-        BLOCK_M, BLOCK_N, WMMA_LAYOUT,
+        XBlockScale,
+        stride_x_bs_k,
+        b_scale_base,
+        stride_w_bs_k,
+        a_scale_m_offs,
+        b_scale_n_offs,
+        is_x_blockscale,
+        is_w_blockscale,
+        BLOCK_M,
+        BLOCK_N,
+        WMMA_LAYOUT,
     )
 
     for sub in gl.static_range(K_SUBTILES):
@@ -404,10 +411,17 @@ def consume_scaled_tile(
             offs_k_scale += 1
             next_a_scale, next_b_scale = buffer_load_scales(
                 offs_k_scale,
-                XBlockScale, stride_x_bs_k, b_scale_base, stride_w_bs_k,
-                a_scale_m_offs, b_scale_n_offs,
-                is_x_blockscale, is_w_blockscale,
-                BLOCK_M, BLOCK_N, WMMA_LAYOUT,
+                XBlockScale,
+                stride_x_bs_k,
+                b_scale_base,
+                stride_w_bs_k,
+                a_scale_m_offs,
+                b_scale_n_offs,
+                is_x_blockscale,
+                is_w_blockscale,
+                BLOCK_M,
+                BLOCK_N,
+                WMMA_LAYOUT,
             )
 
         sub_a_smem = a_tile.slice(sub * BLOCKSCALE_K, BLOCKSCALE_K, dim=1)
@@ -468,20 +482,21 @@ def create_descriptor(
         b_desc: Tensor descriptor for W
         gathered_m_idx: Row indices in blocked layout for async_gather
         gathered_m_scale: Row indices in WMMA layout for scale buffer_load
-
-    Notes:
-        For this kernel implementation, BLOCKSCALE_K must equal BLOCK_K.
     """
     # A descriptor
     in_m = grid_m * BLOCK_M
     if GatherIndx is None:
         # blocked layout for async_gather
-        gathered_m_idx = start_m + BLOCK_M * block_id + gl.arange(
-        0, BLOCK_M, layout=gl.SliceLayout(1, BLOCKED_MK)
+        gathered_m_idx = (
+            start_m
+            + BLOCK_M * block_id
+            + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, BLOCKED_MK))
         )
         # wmma layout for buffer_load
-        gathered_m_scale = start_m + BLOCK_M * block_id + gl.arange(
-            0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
+        gathered_m_scale = (
+            start_m
+            + BLOCK_M * block_id
+            + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT))
         )
         a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=X + start_m * stride_x_m,
@@ -506,11 +521,14 @@ def create_descriptor(
         wmma_idx_offs = BLOCK_M * block_id + gl.arange(
             0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
         )
-        gathered_m_scale = gl.amd.cdna4.buffer_load(
-            ptr=GatherIndx,
-            offsets=wmma_idx_offs,
-            cache=".cg",
-        ) // N_EXPTS_ACT
+        gathered_m_scale = (
+            gl.amd.cdna4.buffer_load(
+                ptr=GatherIndx,
+                offsets=wmma_idx_offs,
+                cache=".cg",
+            )
+            // N_EXPTS_ACT
+        )
 
         a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=X,
@@ -663,8 +681,12 @@ def _moe_gemm_a8w8_blockscale(
 
     # Create layouts
     num_warps: gl.constexpr = gl.num_warps()
-    threads_per_elem_mk: gl.constexpr = gl.cdiv(BLOCK_M * BLOCK_K // (num_warps * 32), 16)
-    threads_per_elem_kn: gl.constexpr = gl.cdiv(BLOCK_K * BLOCK_N // (num_warps * 32), 16)
+    threads_per_elem_mk: gl.constexpr = gl.cdiv(
+        BLOCK_M * BLOCK_K // (num_warps * 32), 16
+    )
+    threads_per_elem_kn: gl.constexpr = gl.cdiv(
+        BLOCK_K * BLOCK_N // (num_warps * 32), 16
+    )
     BLOCKED_MK: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[threads_per_elem_mk, 16],
         threads_per_warp=[4, 8],
