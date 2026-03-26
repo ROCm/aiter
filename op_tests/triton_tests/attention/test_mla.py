@@ -77,7 +77,6 @@ def shuffle_kv_buffer(
     kv_buffer_shuffled = torch.cat(
         [kv_buffer_shuffled_lora, kv_buffer_shuffled_rope], dim=-1
     ).contiguous()
-    # kv_buffer_shuffled = kv_buffer_shuffled.view(-1, num_kv_heads, block_size // 16, head_size * 16)
 
     return kv_buffer_shuffled
 
@@ -86,18 +85,33 @@ def ref_masked_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    scale: float,
+    q_descale: Optional[torch.Tensor] = None,
+    kv_descale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     query_len = q.shape[0]
     kv_len = k.shape[0]
     if q.shape[1] != k.shape[1]:
         k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
         v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
+    if q.dtype != torch.bfloat16:
+        q = q.to(torch.bfloat16)
+    k = k.to(q.dtype)
     attn = torch.einsum("qhd,khd->hqk", q, k).float()  # GEMM at q.dtype precision
+    attn *= scale
+    if q_descale is not None:
+        attn *= q_descale
+    if kv_descale is not None:
+        attn *= kv_descale
     empty_mask = torch.ones(query_len, kv_len, device=q.device)
     mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
     attn.masked_fill_(mask, float("-inf"))
-    attn = torch.softmax(attn, dim=-1).to(v.dtype)
+    attn = torch.softmax(attn, dim=-1)
+    attn = attn.to(q.dtype)
+    v = v.to(q.dtype)
     out = torch.einsum("hqk,khd->qhd", attn, v)  # GEMM at q.dtype precision
+    if kv_descale is not None:
+        out *= kv_descale
 
     return out
 
@@ -162,14 +176,6 @@ def torch_mla_extend(
     _, block_size, num_kv_heads, qk_head_dim = kv_buffer.shape
     num_seqs = cu_seqlens_q.shape[0] - 1
 
-    query = query.to(torch.float32)
-    kv_buffer = kv_buffer.to(torch.float32)
-    query = query * scale
-    if q_descale is not None:
-        query = query * q_descale
-    if kv_descale is not None:
-        kv_buffer = kv_buffer * kv_descale
-
     outputs: list[torch.Tensor] = []
     for i in range(num_seqs):
         q = query[cu_seqlens_q[i] : cu_seqlens_q[i + 1]]
@@ -182,7 +188,7 @@ def torch_mla_extend(
         k = k[:kv_len]
         v = k[..., :qk_lora_rank]
 
-        out = ref_masked_attention(q, k, v)
+        out = ref_masked_attention(q, k, v, scale, q_descale, kv_descale)
 
         outputs.append(out)
 
@@ -192,9 +198,9 @@ def torch_mla_extend(
     return out.to(o_dtype)
 
 
-@pytest.mark.parametrize("batch_size", [1])
-@pytest.mark.parametrize("decode_qlen", [1])
-@pytest.mark.parametrize("ctx_lens", [1024])
+@pytest.mark.parametrize("batch_size", [1, 4, 8, 32])
+@pytest.mark.parametrize("decode_qlen", [1, 2, 4])
+@pytest.mark.parametrize("ctx_lens", [1024, 8192])
 @pytest.mark.parametrize("num_heads", [(16, 1)])
 @pytest.mark.parametrize("kv_lora_rank, qk_rope_head_dim", [(512, 64)])
 @pytest.mark.parametrize("block_size", [64])
@@ -211,8 +217,9 @@ def torch_mla_extend(
 @pytest.mark.parametrize(
     "backend, shuffled_kv_cache",
     [
-        # ("triton", False),  # use triton
+        ("triton", False),
         ("gluon", True),
+        ("gluon", False),
     ],
 )
 # @torch.inference_mode()
@@ -371,9 +378,8 @@ def test_mla_decode_fwd(
 @pytest.mark.parametrize(
     "backend, shuffled_kv_cache",
     [
-        ("triton", False),  # use triton
+        ("triton", False),
         ("gluon", False),
-        # ("gluon", True),
     ],
 )
 # @torch.inference_mode()

@@ -178,13 +178,22 @@ class MLAConfig:
 
         assert NUM_BLOCKS_GATHER_PER_TILE == 1
 
-        self.Q_LORA_SHARED_LAYOUT = gl.constexpr(
-            gl.PaddedSharedLayout.with_identity_for(
-                interval_padding_pairs=[[KV_LORA_RANK // 2, 8]],
-                shape=[BLOCK_M, KV_LORA_RANK // 2],
-                order=[1, 0],
+        if self.SHUFFLED_KV_CACHE:
+            self.Q_LORA_SHARED_LAYOUT = gl.constexpr(
+                gl.PaddedSharedLayout.with_identity_for(
+                    interval_padding_pairs=[[KV_LORA_RANK // 2, 8]],
+                    shape=[BLOCK_M, KV_LORA_RANK // 2],
+                    order=[1, 0],
+                )
             )
-        )
+        else:
+            self.Q_LORA_SHARED_LAYOUT = gl.constexpr(
+                gl.PaddedSharedLayout.with_identity_for(
+                    interval_padding_pairs=[[KV_LORA_RANK, 8]],
+                    shape=[BLOCK_M, KV_LORA_RANK],
+                    order=[1, 0],
+                )
+            )
         self.Q_ROPE_SHARED_LAYOUT = gl.constexpr(
             gl.PaddedSharedLayout.with_identity_for(
                 interval_padding_pairs=[[QK_ROPE_HEAD_DIM, 8]],
@@ -1220,9 +1229,9 @@ def _mla_decode_fwd_kernel(
             j_hbm, block_tables_ptr_shifted
         )
 
-        kv_lora_0 = pgm.tdm_shared_load_kv_lora_0(3, buffer_id)
+        kv_lora_0 = pgm.tdm_shared_load_kv_lora_0(2, buffer_id)
         S = pgm.compute_qk_lora_0(kv_lora_0, S)
-        kv_lora_1 = pgm.tdm_shared_load_kv_lora_1(2, buffer_id)
+        kv_lora_1 = pgm.tdm_shared_load_kv_lora_1(1, buffer_id)
 
         next_buffer_id = pgm.get_next_buffer_id(buffer_id)
         row_offsets = pgm.get_kv_buffer_row_offsets(physical_block_idx)
