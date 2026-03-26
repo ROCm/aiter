@@ -125,6 +125,10 @@ jobs:
           -w /sglang-checkout \
           --name sglang_aiter_test \
           sglang_aiter_test:ci
+
+          # The checkout is owned by the runner (non-root) but the container runs as
+          # root. Git >= 2.35.2 rejects cross-user repos, so mark the mount as safe.
+          docker exec -u root sglang_aiter_test git config --global --add safe.directory /sglang-checkout
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -136,9 +140,6 @@ jobs:
       - name: Install dependencies
         run: |
           cd sglang
-          git config --global --add safe.directory "$PWD"
-          docker exec -u root sglang_aiter_test git config --global --add safe.directory /sglang-checkout
-          docker exec -u root sglang_aiter_test git config --global --add safe.directory /sglang-checkout/sglang
           git config user.name "aiter-ci" && git config user.email "aiter-ci@amd.com"
           git fetch origin 2c9b43b5135846f40f66c4e543589bf303c1c07c && git cherry-pick FETCH_HEAD # https://github.com/charlesHsuGG/sglang/commit/2c9b43b5135846f40f66c4e543589bf303c1c07c
           sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_install_dependency.sh
