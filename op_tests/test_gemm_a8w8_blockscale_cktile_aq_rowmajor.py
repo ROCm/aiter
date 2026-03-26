@@ -222,7 +222,7 @@ def test_padded_weight_stride(m, n, k, dtype=dtypes.bf16):
             break
 
     if rm_kid is None:
-        print(f"  SKIP: no RowMajor 8-warp kernel available")
+        print("  SKIP: no RowMajor 8-warp kernel available")
         return
 
     out = run_cktile_tune(x, weight_padded, x_scale, w_scale, rm_kid, dtype)
