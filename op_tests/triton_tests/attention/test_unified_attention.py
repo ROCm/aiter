@@ -229,7 +229,7 @@ def make_unified_attn_inputs(
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
-@pytest.mark.parametrize("kv_layout", ["cache"])
+@pytest.mark.parametrize("kv_layout", ["thd"])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("quant_scheme", [None, "fp8", "sage_mxfp4"])
 @torch.inference_mode()
