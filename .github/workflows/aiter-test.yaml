@@ -71,6 +71,7 @@ jobs:
           RUN pip install --upgrade pandas zmq einops numpy==1.26.2
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip install --upgrade "ninja>=1.11.1"
+          RUN pip install --upgrade "setuptools_scm<9"
           RUN pip install tabulate
           RUN pip list
 
@@ -90,7 +91,8 @@ jobs:
               fi \
            && pip install -r requirements.txt \
            && echo "Prebuilding kernels with GPU_ARCHS: ${{ env.GPU_ARCH_LIST }} and PREBUILD_KERNELS: 1" \
-           && PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" pip install -e . --no-build-isolation \
+           && PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" python setup.py bdist_wheel \
+           && pip install dist/*.whl \
            && echo "Prebuilding kernels completed"
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
