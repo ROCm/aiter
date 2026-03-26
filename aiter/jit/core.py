@@ -1061,8 +1061,10 @@ def _ctypes_call(func, fc_name, md_name):
     """
     import ctypes
     import inspect
+
     import torch
-    from ..utility.dtypes import torch_to_aiter, aiter_tensor_t
+
+    from ..utility.dtypes import aiter_tensor_t, torch_to_aiter
 
     _cache = {}
     _arg_checked = False
@@ -1276,11 +1278,8 @@ def compile_ops(
                         rebuilded_list.append(md_name)
                         raise ModuleNotFoundError("start rebuild")
                     if module is None:
-                        try:
-                            module = get_module(md_name)
-                        except Exception:
-                            md = custom_build_args.get("md_name", md_name)
-                            module = get_module(md)
+                        md = custom_build_args.get("md_name", md_name)
+                        module = get_module(md)
                 except ModuleNotFoundError:
                     d_args = get_args_of_build(md_name)
                     d_args.update(custom_build_args)
