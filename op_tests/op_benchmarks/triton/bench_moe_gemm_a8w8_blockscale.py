@@ -10,6 +10,7 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a8w8_blockscale import (
     moe_gemm_a8w8_blockscale,
+    preshuffle_weights,
 )
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16 import (
     _get_config,
@@ -101,9 +102,11 @@ def bench_mlp_single_weight_init(
     per_row_act_quant,
     TP,
     op_regex,
+    use_gluon=False,
 ):
     rank = 0
     dev = f"cuda:{rank}"
+    arch = get_arch()
 
     assert dim2 % TP == 0, f"{dim2=}, {TP=}, dim2 must be divisible by TP"
 
@@ -128,15 +131,19 @@ def bench_mlp_single_weight_init(
     b1 = torch.randn((n_expts_tot, dim2 // TP), dtype=torch.float32, device=dev)
     b2 = torch.randn((n_expts_tot, dim1), dtype=torch.float32, device=dev)
 
+    if use_gluon:
+        w1 = preshuffle_weights(w1)
+        w2 = preshuffle_weights(w2)
+
     # -- benchmark --
     x_dtype_str = x_dtype
     w_dtype_str = w_dtype
     x_dtype = torch.float8_e4m3fn
     w_dtype = torch.float8_e4m3fn
     # special treatment of fp8_e4m3 on AMD CDNA3 because it uses fp8_e4m3fnuz
-    if x_dtype == torch.float8_e4m3fn and get_arch() == "gfx942":
+    if x_dtype == torch.float8_e4m3fn and arch == "gfx942":
         x_dtype = torch.float8_e4m3fnuz
-    if w_dtype == torch.float8_e4m3fn and get_arch() == "gfx942":
+    if w_dtype == torch.float8_e4m3fn and arch == "gfx942":
         w_dtype = torch.float8_e4m3fnuz
 
     reps = 100
@@ -212,6 +219,7 @@ def bench_mlp_single_weight_init(
                 gather_indx=gather_indx,
                 out_dtype=x_dtype,
                 apply_swiglu=True,
+                use_gluon=use_gluon,
             )
             x = moe_gemm_a8w8_blockscale(
                 x,
@@ -225,6 +233,7 @@ def bench_mlp_single_weight_init(
                 rdata,
                 out_dtype=x_dtype,
                 scatter_indx=scatter_indx,
+                use_gluon=use_gluon,
             )
         elif x_dtype_str == "fp8" and w_dtype_str == "bs8":
             x = moe_gemm_a8w8_blockscale(
@@ -240,6 +249,7 @@ def bench_mlp_single_weight_init(
                 gather_indx=gather_indx,
                 out_dtype=x_dtype,
                 apply_swiglu=True,
+                use_gluon=use_gluon,
             )
             x = moe_gemm_a8w8_blockscale(
                 x,
@@ -253,6 +263,7 @@ def bench_mlp_single_weight_init(
                 rdata,
                 out_dtype=x_dtype,
                 scatter_indx=scatter_indx,
+                use_gluon=use_gluon,
             )
 
         elif x_dtype_str == "bs8" and w_dtype_str == "fp8":
@@ -269,6 +280,7 @@ def bench_mlp_single_weight_init(
                 gather_indx=gather_indx,
                 out_dtype=x_dtype,
                 apply_swiglu=True,
+                use_gluon=use_gluon,
             )
             x = moe_gemm_a8w8_blockscale(
                 x,
@@ -282,6 +294,7 @@ def bench_mlp_single_weight_init(
                 rdata,
                 out_dtype=x_dtype,
                 scatter_indx=scatter_indx,
+                use_gluon=use_gluon,
             )
         else:
             x = moe_gemm_a8w8_blockscale(
@@ -297,6 +310,7 @@ def bench_mlp_single_weight_init(
                 out_dtype=x_dtype,
                 gather_indx=gather_indx,
                 apply_swiglu=True,
+                use_gluon=use_gluon,
             )
             x = moe_gemm_a8w8_blockscale(
                 x,
@@ -310,6 +324,7 @@ def bench_mlp_single_weight_init(
                 rdata,
                 out_dtype=x_dtype,
                 scatter_indx=scatter_indx,
+                use_gluon=use_gluon,
             )
     proton.finalize()
     return parse_profile(
@@ -329,6 +344,7 @@ def bench_mlp(
     TP,
     op_regex,
     num_weight_inits=1,
+    use_gluon=False,
 ):
     all_results = []
     for i in range(num_weight_inits):
@@ -343,6 +359,7 @@ def bench_mlp(
             per_row_act_quant,
             TP,
             op_regex,
+            use_gluon=use_gluon,
         )
         all_results.append(result)
 
@@ -371,8 +388,10 @@ def roofline_mlp(
     op_regex,
     num_weight_inits=1,
     name="",
+    use_gluon=False,
 ):
-    out_path = Path(f"logs/{name}/{x_dtype}x-{w_dtype}w-TP{TP}/")
+    backend = "gluon" if use_gluon else "triton"
+    out_path = Path(f"logs/{name}/{x_dtype}x-{w_dtype}w-TP{TP}-{backend}/")
     out_path.mkdir(parents=True, exist_ok=True)
     compute_roofline(
         dim1,
@@ -389,7 +408,34 @@ def roofline_mlp(
         intensity_proxy_name="batch",  # intensity proxy name
         intensity_proxy_values=batch_sizes,  # intensity proxy values to sweep
         out_path=out_path.with_suffix(".csv"),
+        use_gluon=use_gluon,
     )  # output path
+
+
+def parse_args(args: list[str] | None = None):
+    arch = get_arch()
+    backend = getattr(args, "backend", None)
+    if backend == "gluon":
+        assert arch == "gfx1250", (
+            f"--backend gluon requires gfx1250 but detected {arch}"
+        )
+        return True
+    if backend == "triton":
+        return False
+    return arch == "gfx1250"
+
+
+def parse_args(args: list[str] | None = None):
+    arch = get_arch()
+    backend = getattr(args, "backend", None)
+    if backend == "gluon":
+        assert arch == "gfx1250", (
+            f"--backend gluon requires gfx1250 but detected {arch}"
+        )
+        return True
+    if backend == "triton":
+        return False
+    return arch == "gfx1250"
 
 
 def parse_args(args: list[str] | None = None):
@@ -448,12 +494,21 @@ def parse_args(args: list[str] | None = None):
         help="Number of different weight initializations to run for more stable results (default: 1). "
         "Each initialization runs 100 iterations. Use higher values (e.g., 10) for more stable benchmarks.",
     )
-    args = parser.parse_args(args=args)
+    parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["triton", "gluon"],
+        default=None,
+        help="Kernel backend: 'triton' or 'gluon'. Defaults to gluon on gfx1250, triton otherwise.",
+    )
+    args = parser.parse_args()
     return args
 
 
-def main(args: list[str] | None = None) -> None:
-    parsed_args = parse_args(args=args)
+if __name__ == "__main__":
+    parsed_args = parse_args()
+    use_gluon = assert_gluon(parsed_args)
+    backend = "gluon" if use_gluon else "triton"
 
     dim1, dim2 = parsed_args.shape
     total_experts, active_experts = parsed_args.experts
@@ -486,6 +541,7 @@ def main(args: list[str] | None = None) -> None:
         op_regex=parsed_args.op_regex,
         num_weight_inits=parsed_args.num_weight_inits,
         name="gpt-oss-x2",
+        use_gluon=use_gluon,
     )
 
 

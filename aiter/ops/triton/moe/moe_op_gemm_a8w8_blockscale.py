@@ -74,26 +74,30 @@ def get_kernel_config(m, n, k, routing_data, use_gluon=False):
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_stages = 2
-    num_buffers = 8
+    num_buffers = 6
 
     split_k = 1
     if block_m == 16:
-        block_n = 256
+        block_n = 32
         block_k = 512
         num_warps = 4
     else:
-        # for scale preshuffling
-        block_n = 256
-        block_k = 512
-        num_warps = 2
 
-    grid_m = routing_data.n_blocks(m, block_m)
-    grid_n = triton.cdiv(n, block_n)
-    grid = grid_m * grid_n * split_k
-    while block_n >= 64 and grid < 256:
-        block_n = block_n // 2
-        grid_n = triton.cdiv(n, block_n)
-        grid = grid_m * grid_n * split_k
+        num_warps = 4
+        if block_m < 128:
+            block_n = 32
+            block_k = 512
+        else:
+            block_n = 64
+            block_k = 256
+
+    # grid_m = routing_data.n_blocks(m, block_m)
+    # grid_n = triton.cdiv(n, block_n)
+    # grid = grid_m * grid_n * split_k
+    # while block_n >= 64 and grid < 256:
+    #     block_n = block_n // 2
+    #     grid_n = triton.cdiv(n, block_n)
+    #     grid = grid_m * grid_n * split_k
 
     if use_gluon and block_k % 32 != 0:
         # Gluon preshuffled weight layout assumes block K is a multiple of 32
@@ -269,13 +273,15 @@ def moe_gemm_a8w8_blockscale(
     unpadded_N=None,
     unpadded_K=None,
     per_row_x_scale=False,
+    use_gluon=None,
 ):
     """
     Y[:, :] = 0.
     for e in num_experts:
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
     """
-    use_gluon = (get_arch() == "gfx1250")
+    if use_gluon is None:
+        use_gluon = (get_arch() == "gfx1250")
     x_has_blockscale = x_block_scales is not None
     w_has_blockscale = w_block_scales is not None
 
@@ -582,8 +588,8 @@ def main():
 
     parser = argparse.ArgumentParser(description="Run MoE GEMM A8W8 BlockScale like unit tests")
     parser.add_argument("--M", type=int, default=32)
-    parser.add_argument("--N", type=int, default=1024)
-    parser.add_argument("--K", type=int, default=7168)
+    parser.add_argument("--N", type=int, default=512)
+    parser.add_argument("--K", type=int, default=512)
     parser.add_argument("--E", type=int, default=1, help="Total experts")
     parser.add_argument("--n_expts_act", type=int, default=1, help="Active experts per token")
     parser.add_argument(

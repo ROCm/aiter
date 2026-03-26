@@ -3,13 +3,10 @@
 # adapted from triton_kernels package
 
 import torch
-import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
-from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
 
 
@@ -310,7 +307,6 @@ def precompute_scale_offsets(
         )
 
     if is_w_blockscale:
-        b_scale_base = WBlockScale + expt_id * stride_w_bs_e
         offs_w_n = pid_n * BLOCK_N + gl.arange(
             0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
         )
@@ -320,17 +316,16 @@ def precompute_scale_offsets(
         )
         b_scale_n_offs = (offs_w_n // BLOCKSCALE_N) * stride_w_bs_n
     else:
-        b_scale_base = WBlockScale
         b_scale_n_offs = gl.zeros(
             (BLOCK_N,), dtype=gl.int32, layout=gl.SliceLayout(0, WMMA_LAYOUT)
         )
 
-    return a_scale_m_offs, b_scale_base, b_scale_n_offs
+    return a_scale_m_offs, b_scale_n_offs
 
 
 @gluon.jit
-def buffer_load_all_scales(
-    offs_k_scale_base,
+def buffer_load_scales(
+    offs_k_scale,
     XBlockScale,
     stride_x_bs_k,
     b_scale_base,
@@ -341,67 +336,43 @@ def buffer_load_all_scales(
     is_w_blockscale: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
-    BLOCK_K: gl.constexpr,
-    BLOCKSCALE_K: gl.constexpr,
     WMMA_LAYOUT: gl.constexpr,
 ):
-    """Issue buffer_load for ALL K_SUBTILES scales of a given k-tile.
-    offs_k_scale_base = k_scale_base + k * K_SUBTILES (first subtile offset).
-    Returns a flat tuple of (a_scale_0, b_scale_0, a_scale_1, b_scale_1, ...).
-    """
-    K_SUBTILES: gl.constexpr = gl.cdiv(BLOCK_K, BLOCKSCALE_K)
-    result = ()
-    for sub in gl.static_range(K_SUBTILES):
-        offs_k_scale = offs_k_scale_base + sub
-        if is_x_blockscale:
-            a_scale = gl.amd.cdna4.buffer_load(
-                ptr=XBlockScale,
-                offsets=a_scale_m_offs + offs_k_scale * stride_x_bs_k,
-                cache="",
-            )
-        else:
-            a_scale = gl.full(
-                (BLOCK_M,), 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, WMMA_LAYOUT)
-            )
-        if is_w_blockscale:
-            b_scale = gl.amd.cdna4.buffer_load(
-                ptr=b_scale_base,
-                offsets=offs_k_scale * stride_w_bs_k + b_scale_n_offs,
-                cache="",
-            )
-        else:
-            b_scale = gl.full(
-                (BLOCK_N,), 1.0, dtype=gl.float32, layout=gl.SliceLayout(0, WMMA_LAYOUT)
-            )
-        result = result + (a_scale, b_scale)
-    return result
-
-
-@gluon.jit
-def store_all_scales_to_lds(
-    all_scales,
-    buffer_idx,
-    a_scale_buffer,
-    b_scale_buffer,
-    BLOCK_K: gl.constexpr,
-    BLOCKSCALE_K: gl.constexpr,
-):
-    K_SUBTILES: gl.constexpr = gl.cdiv(BLOCK_K, BLOCKSCALE_K)
-    for sub in gl.static_range(K_SUBTILES):
-        a_scale = all_scales[sub * 2]
-        b_scale = all_scales[sub * 2 + 1]
-        scale_buffer_idx = buffer_idx * K_SUBTILES + sub
-        a_scale_buffer.index(scale_buffer_idx).store(a_scale)
-        b_scale_buffer.index(scale_buffer_idx).store(b_scale)
+    if is_x_blockscale:
+        a_scale = gl.amd.cdna4.buffer_load(
+            ptr=XBlockScale,
+            offsets=a_scale_m_offs + offs_k_scale * stride_x_bs_k,
+            cache="",
+        )
+    else:
+        a_scale = gl.full(
+            (BLOCK_M,), 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, WMMA_LAYOUT)
+        )
+    if is_w_blockscale:
+        b_scale = gl.amd.cdna4.buffer_load(
+            ptr=b_scale_base,
+            offsets=offs_k_scale * stride_w_bs_k + b_scale_n_offs,
+            cache="",
+        )
+    else:
+        b_scale = gl.full(
+            (BLOCK_N,), 1.0, dtype=gl.float32, layout=gl.SliceLayout(0, WMMA_LAYOUT)
+        )
+    return a_scale, b_scale
 
 
 @gluon.jit
 def consume_scaled_tile(
     a_buffer,
     b_buffer,
-    a_scale_buffer,
-    b_scale_buffer,
     m,
+    XBlockScale,
+    stride_x_bs_k,
+    stride_w_bs_k,
+    a_scale_m_offs,
+    b_scale_base,
+    b_scale_n_offs,
+    k_offset_start,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
@@ -410,18 +381,34 @@ def consume_scaled_tile(
     WMMA_LAYOUT: gl.constexpr,
     DOT_A_LAYOUT: gl.constexpr,
     DOT_B_LAYOUT: gl.constexpr,
+    is_x_blockscale: gl.constexpr,
+    is_w_blockscale: gl.constexpr,
 ):
     K_SUBTILES: gl.constexpr = gl.cdiv(BLOCK_K, BLOCKSCALE_K)
-    buffer_idx = m % NUM_BUFFERS
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
 
-    a_tile = a_buffer.index(buffer_idx)
-    b_shuffled_tile = b_buffer.index(buffer_idx)
+    a_tile = a_buffer.index(m % NUM_BUFFERS)
+    b_shuffled_tile = b_buffer.index(m % NUM_BUFFERS)
+
+    offs_k_scale = (k_offset_start // BLOCKSCALE_K) + m * K_SUBTILES
+    cur_a_scale, cur_b_scale = buffer_load_scales(
+        offs_k_scale,
+        XBlockScale, stride_x_bs_k, b_scale_base, stride_w_bs_k,
+        a_scale_m_offs, b_scale_n_offs,
+        is_x_blockscale, is_w_blockscale,
+        BLOCK_M, BLOCK_N, WMMA_LAYOUT,
+    )
 
     for sub in gl.static_range(K_SUBTILES):
-        scale_buffer_idx = buffer_idx * K_SUBTILES + sub
-        cur_a_scale = a_scale_buffer.index(scale_buffer_idx).load(layout=gl.SliceLayout(1, WMMA_LAYOUT))
-        cur_b_scale = b_scale_buffer.index(scale_buffer_idx).load(layout=gl.SliceLayout(0, WMMA_LAYOUT))
+        if sub < K_SUBTILES - 1:
+            offs_k_scale += 1
+            next_a_scale, next_b_scale = buffer_load_scales(
+                offs_k_scale,
+                XBlockScale, stride_x_bs_k, b_scale_base, stride_w_bs_k,
+                a_scale_m_offs, b_scale_n_offs,
+                is_x_blockscale, is_w_blockscale,
+                BLOCK_M, BLOCK_N, WMMA_LAYOUT,
+            )
 
         sub_a_smem = a_tile.slice(sub * BLOCKSCALE_K, BLOCKSCALE_K, dim=1)
         sub_a = sub_a_smem.load(layout=DOT_A_LAYOUT)
@@ -433,6 +420,10 @@ def consume_scaled_tile(
         zeros = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
         partial = gl.amd.gfx1250.wmma(sub_a, sub_b, zeros)
         acc += partial * cur_a_scale[:, None] * cur_b_scale[None, :]
+
+        if sub < K_SUBTILES - 1:
+            cur_a_scale = next_a_scale
+            cur_b_scale = next_b_scale
 
     return acc
 
@@ -477,6 +468,9 @@ def create_descriptor(
         b_desc: Tensor descriptor for W
         gathered_m_idx: Row indices in blocked layout for async_gather
         gathered_m_scale: Row indices in WMMA layout for scale buffer_load
+
+    Notes:
+        For this kernel implementation, BLOCKSCALE_K must equal BLOCK_K.
     """
     # A descriptor
     in_m = grid_m * BLOCK_M
@@ -698,12 +692,6 @@ def _moe_gemm_a8w8_blockscale(
     SHARED_B: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_K, 4]], [BLOCK_N // 16, BLOCK_K * 16], [1, 0]
     )
-    SHARED_A_SCALE: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=1, per_phase=1, max_phase=1, order=[0]
-    )
-    SHARED_B_SCALE: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=1, per_phase=1, max_phase=1, order=[0]
-    )
     DOT_A_LAYOUT: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=WMMA_LAYOUT, k_width=16
     )
@@ -753,13 +741,6 @@ def _moe_gemm_a8w8_blockscale(
         [NUM_BUFFERS] + b_desc.block_shape,
         layout=b_desc.layout,
     )
-    K_SUBTILES: gl.constexpr = gl.cdiv(BLOCK_K, BLOCKSCALE_K)
-    a_scale_buffer = gl.allocate_shared_memory(
-        gl.float32, [NUM_BUFFERS * K_SUBTILES, BLOCK_M], layout=SHARED_A_SCALE
-    )
-    b_scale_buffer = gl.allocate_shared_memory(
-        gl.float32, [NUM_BUFFERS * K_SUBTILES, BLOCK_N], layout=SHARED_B_SCALE
-    )
 
     k = 0
     m = 0
@@ -769,7 +750,7 @@ def _moe_gemm_a8w8_blockscale(
     k_offset_start = pid_k * splitk_block_size
 
     # Precompute scale offsets that are constant across K iterations
-    a_scale_m_offs, b_scale_base, b_scale_n_offs = precompute_scale_offsets(
+    a_scale_m_offs, b_scale_n_offs = precompute_scale_offsets(
         stride_x_bs_m,
         WBlockScale,
         stride_w_bs_e,
@@ -787,18 +768,13 @@ def _moe_gemm_a8w8_blockscale(
         is_x_blockscale,
         is_w_blockscale,
     )
-
-    k_scale_base = k_offset_start // BLOCKSCALE_K
+    if is_w_blockscale:
+        b_scale_base = WBlockScale + expt_id * stride_w_bs_e
+    else:
+        b_scale_base = WBlockScale
 
     # prologue
     for _ in gl.static_range(NUM_BUFFERS - 1):
-        all_scales = buffer_load_all_scales(
-            k_scale_base + k * K_SUBTILES,
-            XBlockScale, stride_x_bs_k, b_scale_base, stride_w_bs_k,
-            a_scale_m_offs, b_scale_n_offs,
-            is_x_blockscale, is_w_blockscale,
-            BLOCK_M, BLOCK_N, BLOCK_K, BLOCKSCALE_K, WMMA_LAYOUT,
-        )
         issue_async_tile_loads(
             a_desc,
             b_desc,
@@ -815,22 +791,10 @@ def _moe_gemm_a8w8_blockscale(
             BLOCK_K,
             NUM_BUFFERS,
         )
-        store_all_scales_to_lds(
-            all_scales, k % NUM_BUFFERS,
-            a_scale_buffer, b_scale_buffer,
-            BLOCK_K, BLOCKSCALE_K,
-        )
         k += 1
 
     # Main loop
     for _ in range(num_k_tiles - (NUM_BUFFERS - 1)):
-        all_scales = buffer_load_all_scales(
-            k_scale_base + (m + (NUM_BUFFERS - 1)) * K_SUBTILES,
-            XBlockScale, stride_x_bs_k, b_scale_base, stride_w_bs_k,
-            a_scale_m_offs, b_scale_n_offs,
-            is_x_blockscale, is_w_blockscale,
-            BLOCK_M, BLOCK_N, BLOCK_K, BLOCKSCALE_K, WMMA_LAYOUT,
-        )
         issue_async_tile_loads(
             a_desc,
             b_desc,
@@ -853,9 +817,14 @@ def _moe_gemm_a8w8_blockscale(
         acc += consume_scaled_tile(
             a_buffer,
             b_buffer,
-            a_scale_buffer,
-            b_scale_buffer,
             m,
+            XBlockScale,
+            stride_x_bs_k,
+            stride_w_bs_k,
+            a_scale_m_offs,
+            b_scale_base,
+            b_scale_n_offs,
+            k_offset_start,
             BLOCK_M,
             BLOCK_N,
             BLOCK_K,
@@ -864,14 +833,10 @@ def _moe_gemm_a8w8_blockscale(
             WMMA_LAYOUT,
             DOT_A_LAYOUT,
             DOT_B_LAYOUT,
+            is_x_blockscale,
+            is_w_blockscale,
         )
         m += 1
-
-        store_all_scales_to_lds(
-            all_scales, (m + (NUM_BUFFERS - 2)) % NUM_BUFFERS,
-            a_scale_buffer, b_scale_buffer,
-            BLOCK_K, BLOCKSCALE_K,
-        )
 
     # Epilogue
     for i in gl.static_range(NUM_BUFFERS - 1):
@@ -879,9 +844,14 @@ def _moe_gemm_a8w8_blockscale(
         acc += consume_scaled_tile(
             a_buffer,
             b_buffer,
-            a_scale_buffer,
-            b_scale_buffer,
             m,
+            XBlockScale,
+            stride_x_bs_k,
+            stride_w_bs_k,
+            a_scale_m_offs,
+            b_scale_base,
+            b_scale_n_offs,
+            k_offset_start,
             BLOCK_M,
             BLOCK_N,
             BLOCK_K,
@@ -890,6 +860,8 @@ def _moe_gemm_a8w8_blockscale(
             WMMA_LAYOUT,
             DOT_A_LAYOUT,
             DOT_B_LAYOUT,
+            is_x_blockscale,
+            is_w_blockscale,
         )
         m += 1
 
@@ -947,8 +919,7 @@ def _moe_gemm_a8w8_blockscale(
     # quant
     if Quant_static_scale is not None:
         out = _compute_static_fp8_quant(out, gl.load(Quant_static_scale))
-    else:
-        out = out.to(gl.bfloat16)
+    out = out.to(Y.dtype.element_ty)
     # write-back
     offs_c = stride_y_m * offs_cm[:, None] + stride_y_n * offs_cn[None, :]
     mask_c = mask_m[:, None] & mask_n[None, :]
