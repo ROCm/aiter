@@ -16,11 +16,7 @@ from aiter import logger
 from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
-try:
-    from aiter.ops.flydsl.utils import is_flydsl_available
-except ModuleNotFoundError:
-    def is_flydsl_available():
-        return False
+from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
 from aiter.utility import fp4_utils
 
@@ -50,22 +46,17 @@ def _moe_sorting_impl(
         sorted_ids = torch.full(
             (max_num_tokens_padded,), topk << 24 | M, dtype=dtypes.i32, device=device
         )
-    else:
-        sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
-    sorted_weights = torch.empty(
-        max_num_tokens_padded, dtype=dtypes.fp32, device=device
-    )
-    if expert_mask is not None:
-        sorted_expert_ids = torch.zeros(max_num_m_blocks, dtype=dtypes.i32, device=device)
-    else:
-        sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
-    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    if expert_mask is not None:
-        # Keep EP metadata buffer large enough for per-expert accounting.
-        num_valid_ids = torch.zeros(max(2, int(expert_mask.numel()) + 3), dtype=dtypes.i32, device=device)
-    if expert_mask is not None:
+        sorted_weights = torch.zeros(max_num_tokens_padded, dtype=dtypes.fp32, device=device)
+        sorted_expert_ids = torch.full((max_num_m_blocks,), -1, dtype=dtypes.i32, device=device)
+        # NSwizzle accesses num_valid_ids[1 + expert_id] for expert_id in [0, num_experts);
+        # minimum size = num_experts + 2, allocate +1 margin.
+        num_valid_ids = torch.zeros(expert_mask.numel() + 3, dtype=dtypes.i32, device=device)
         moe_buf = torch.zeros((M, model_dim), dtype=moebuf_dtype, device=device)
     else:
+        sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
+        sorted_weights = torch.empty(max_num_tokens_padded, dtype=dtypes.fp32, device=device)
+        sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
+        num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
         moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
     fwd_fn = aiter.moe_sorting_opus_fwd if use_opus else aiter.moe_sorting_fwd
@@ -84,7 +75,7 @@ def _moe_sorting_impl(
         dispatch_policy,
     )
     if expert_mask is not None:
-        local_expert_count_t = (expert_mask >= 0).sum().clamp_min(1)
+        local_expert_count_t = (expert_mask >= 0).sum()
         valid_blocks_mask = (sorted_expert_ids >= 0) & (
             sorted_expert_ids < local_expert_count_t
         )
