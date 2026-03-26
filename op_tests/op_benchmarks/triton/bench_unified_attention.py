@@ -7,14 +7,15 @@ import torch
 import triton
 
 from aiter.ops.triton.attention.unified_attention import unified_attention
+from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v2
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     print_vgpr,
     get_caller_name_no_ext,
 )
-from op_tests.triton_tests.attention.test_unified_attention import ref_attn
-
+from op_tests.triton_tests.attention.test_unified_attention import ref_attn, make_unified_attn_inputs
+from aiter.ops.triton.utils.types import e4m3_dtype
 
 def nonvarlen_benchmark_configs():
     batch_sizes = [1, 4, 16]
@@ -184,9 +185,7 @@ def run_benchmark(custom, args):
         provider,
         model=None,
     ):
-        assert args.layout == "thd"
         varlen = not args.equal_seqlens
-
         if not varlen:
             seqlens_q = torch.tensor(
                 [N_CTX_Q for _ in range(BATCH)], dtype=torch.int32, device="cuda"
@@ -209,224 +208,137 @@ def run_benchmark(custom, args):
                 # choose which samples become decode samples
                 decode_idx = torch.randperm(BATCH, device=seqlens_q.device)[:num_decode]
                 seqlens_q[decode_idx] = 1
-
-        if causal:
-            if (seqlens_k < seqlens_q).any():
-                print(
-                    f"Warning: clamping seqlens_k to be >= seqlens_q for config "
-                    f"(BATCH={BATCH}, HQ={HQ}, HK={HK}, N_CTX_Q={N_CTX_Q}, N_CTX_K={N_CTX_K})"
-                )
-            seqlens_k = torch.maximum(seqlens_k, seqlens_q)
-
-        num_seqs = BATCH
-        num_query_heads = HQ
-        num_kv_heads = HK
-        head_size = D_HEAD
+        
+        head_size_qk = D_HEAD
         head_size_v = D_HEAD_V
-        assert num_query_heads % num_kv_heads == 0
-        max_query_len = max(seqlens_q).item()
-        max_kv_len = max(seqlens_k).item()
-        soft_cap = args.softcap
+        
+        soft_cap = args.softcap if args.softcap is not None else 0.0
         block_size = args.block_size if args.block_size else 512
 
-        # round down block_size to the nearest power of 2 for v1/v2 quantization
-        if args.sagev2 and (block_size & (block_size - 1) != 0):
-            block_size = 1 << (block_size.bit_length() - 1)
-
-        max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+        max_num_blocks_per_seq = (seqlens_k.max().item() + block_size - 1) // block_size
         min_required_blocks = BATCH * max_num_blocks_per_seq
         num_blocks = (
             args.num_blocks if args.num_blocks else max(min_required_blocks * 4, 2048)
         )
-        num_blocks = max(num_blocks, min_required_blocks)
-
-        window_size = (
-            (args.sliding_window - 1, 0)
-            if args.sliding_window is not None
-            else (-1, -1)
+        
+        (
+            query,
+            key_cache,
+            value_cache,
+            cu_query_lens,
+            cu_key_lens,
+            query_lens,
+            kv_lens,
+            block_tables,
+            output,
+            max_query_len,
+            max_kv_len,
+            scale,
+        ) = make_unified_attn_inputs(
+            seq_lens=list(zip(seqlens_q.tolist(), seqlens_k.tolist())),
+            num_heads=(HQ, HK),
+            head_size_qk=head_size_qk,
+            head_size_v=head_size_v,
+            dtype=dtype,
+            block_size=block_size,
+            num_blocks=num_blocks,
+            kv_layout=args.kv_layout,
         )
-        scale = D_HEAD**-0.5
 
-        cu_seqlens_q = torch.zeros(len(seqlens_q) + 1, dtype=torch.int32, device="cuda")
-        cu_seqlens_q[1:] = seqlens_q.cumsum(dim=0, dtype=torch.int32)
-        cu_seqlens_k = torch.zeros(len(seqlens_k) + 1, dtype=torch.int32, device="cuda")
-        cu_seqlens_k[1:] = seqlens_k.cumsum(dim=0, dtype=torch.int32)
+        num_query_heads = HQ
+        window_size = (args.sliding_window - 1, 0) if args.sliding_window is not None else (-1, -1)
+        sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
 
-        if args.kv_layout == "cache":
-            query = torch.randn(
-                sum(seqlens_q), num_query_heads, head_size, dtype=dtype, device="cuda"
-            )
-            key_cache = torch.randn(
-                num_blocks,
-                block_size,
-                num_kv_heads,
-                head_size,
-                dtype=dtype,
-                device="cuda",
-            )
-            value_cache = torch.randn(
-                num_blocks,
-                block_size,
-                num_kv_heads,
-                head_size_v,
-                dtype=dtype,
-                device="cuda",
-            )
-            block_tables = torch.randint(
-                0,
-                num_blocks,
-                (num_seqs, max_num_blocks_per_seq),
-                dtype=torch.int32,
-                device="cuda",
-            )
-        else:
-            query = torch.randn(
-                sum(seqlens_q), num_query_heads, head_size, dtype=dtype, device="cuda"
-            )
-            key_cache = torch.randn(
-                sum(seqlens_k), num_kv_heads, head_size, dtype=dtype, device="cuda"
-            )
-            value_cache = torch.randn(
-                sum(seqlens_k), num_kv_heads, head_size_v, dtype=dtype, device="cuda"
-            )
-            block_tables = None
-
-        if args.use_sinks:
-            sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
-        else:
-            sinks = None
-
-        output = torch.empty(
-            sum(seqlens_q), num_query_heads, D_HEAD_V, dtype=dtype, device="cuda"
-        )
-        maybe_quantized_query = query
-        maybe_quantized_key_cache = key_cache
-        maybe_quantized_value_cache = value_cache
-
-        if args.sagev2:
-            from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
-                sage_quant_v2,
-            )
-
-            (
-                maybe_quantized_query,
-                q_descale,
-                maybe_quantized_key_cache,
-                k_descale,
-                maybe_quantized_value_cache,
-                v_descale,
-            ) = sage_quant_v2(
-                query,
-                key_cache,
-                value_cache,
-                hadamard_rotation=True,
-                R=None,
-                BLOCK_R=128,
-                layout_k=args.kv_layout,
-                v_descale=None,
-            )
-        elif args.fp8_full:
-            from aiter.ops.triton.utils.types import e4m3_dtype
-
+        q_input, k_input, v_input = query, key_cache, value_cache
+        q_descale = k_descale = v_descale = None
+        
+        if args.fp8_full:
             FP8_TYPE = e4m3_dtype
             fp8_max = torch.finfo(FP8_TYPE).max
 
             q_abs_max = query.abs().amax().clamp(min=1e-9)
             q_descale = (q_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
-            maybe_quantized_query = (query * (fp8_max / q_abs_max)).to(FP8_TYPE)
+            q_fp8 = (query * (fp8_max / q_abs_max)).to(FP8_TYPE)
 
             k_abs_max = key_cache.abs().amax().clamp(min=1e-9)
             k_descale = (k_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
-            maybe_quantized_key_cache = (key_cache * (fp8_max / k_abs_max)).to(FP8_TYPE)
+            k_fp8 = (key_cache * (fp8_max / k_abs_max)).to(FP8_TYPE)
 
             v_abs_max = value_cache.abs().amax().clamp(min=1e-9)
             v_descale = (v_abs_max / fp8_max).to(torch.float32).unsqueeze(0).cuda()
-            maybe_quantized_value_cache = (value_cache * (fp8_max / v_abs_max)).to(
-                FP8_TYPE
+            v_fp8 = (value_cache * (fp8_max / v_abs_max)).to(FP8_TYPE)
+
+            q_input, k_input, v_input = q_fp8, k_fp8, v_fp8
+        elif args.sagev2:
+            q_input, q_descale, k_input, k_descale, v_input, v_descale = sage_quant_v2(
+                query,
+                key_cache,
+                value_cache,
+                hadamard_rotation=True,
+                R=None,
+                BLOCK_R=args.BLOCK_R if args.BLOCK_R else D_HEAD,
+                layout_k=args.kv_layout,
+                v_descale=None,
             )
+        
+        fn = lambda: unified_attention(
+            q=q_input,
+            k=k_input,
+            v=v_input,
+            out=output,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=causal,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=soft_cap,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            sinks=sinks,
+            sage_mxfp4=args.sagev2,
+            kv_layout=args.kv_layout,
+            cu_seqlens_k=cu_key_lens,
+        )
+
+        ref_output = ref_attn(query, key_cache, value_cache, query_lens, kv_lens, block_tables, scale, args.sliding_window, soft_cap, sinks, causal=causal, kv_layout=args.kv_layout)
+        
+        if args.fp8_full:
+            atol, rtol = 1.5e-1, 1.5e-1
+        elif args.sagev2:
+            atol, rtol = 3.5e-1, 2.5e-1
+            # mae = (output - ref_output).abs().mean().item()
+            # assert mae < 0.1, f"MXFP4 mean absolute error too high: {mae}"
         else:
-            q_descale, k_descale, v_descale = None, None, None
+            atol, rtol = 1.5e-2, 1e-2
+        torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
 
-        def fn():
-            return unified_attention(
-                q=maybe_quantized_query,
-                k=maybe_quantized_key_cache,
-                v=maybe_quantized_value_cache,
-                out=output,
-                cu_seqlens_q=cu_seqlens_q,
-                seqused_k=seqlens_k,
-                max_seqlen_q=max_query_len,
-                max_seqlen_k=max_kv_len,
-                softmax_scale=scale,
-                causal=causal,
-                window_size=window_size,
-                block_table=block_tables,
-                softcap=soft_cap if soft_cap is not None else 0,
-                q_descale=q_descale,
-                k_descale=k_descale,
-                v_descale=v_descale,
-                sinks=sinks,
-                sage_mxfp4=args.sagev2,
-                kv_layout=args.kv_layout,
-                cu_seqlens_k=cu_seqlens_k,
-            )
-
+        
         ms = triton.testing.do_bench(fn)
 
         run_correctness = args.test
         if run_correctness:
             fn()
-            ref_output = ref_attn(
-                query=query,
-                key_cache=key_cache,
-                value_cache=value_cache,
-                query_lens=seqlens_q,
-                kv_lens=seqlens_k,
-                block_tables=block_tables,
-                scale=scale,
-                sliding_window=args.sliding_window,
-                soft_cap=soft_cap,
-                sinks=sinks,
-                causal=causal,
-                kv_layout=args.kv_layout,
-            )
-            if args.sagev2:
-                atol, rtol = 3.5e-1, 2.5e-1
-            elif args.fp8 or args.fp8_full:
+            ref_output = ref_attn(query, key_cache, value_cache, query_lens, kv_lens, block_tables, scale, args.sliding_window, soft_cap, sinks, causal=causal, kv_layout=args.kv_layout)
+            if args.fp8_full:
                 atol, rtol = 1.5e-1, 1.5e-1
+            elif args.sagev2:
+                atol, rtol = 3.5e-1, 2.5e-1
+                # mae = (output - ref_output).abs().mean().item()
+                # assert mae < 0.1, f"MXFP4 mean absolute error too high: {mae}"
             else:
                 atol, rtol = 1.5e-2, 1e-2
-            # print("output", output.flatten()[0:50])
-            # print("ref_output", ref_output.flatten()[0:50])
-            max_err = torch.max(torch.abs(output - ref_output)).item()
-            tag = (
-                "fp8_full"
-                if args.fp8_full
-                else ("fp8" if args.fp8 else "sagev2" if args.sagev2 else "default")
-            )
-            config_str = (
-                f"BATCH={BATCH}, HQ={HQ}, HK={HK}, "
-                f"N_CTX_Q={N_CTX_Q}, N_CTX_K={N_CTX_K}"
-            )
-            try:
-                torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
-                print(
-                    f"  [{tag}] PASS  max_err={max_err:.6f}  "
-                    f"atol={atol}  ({config_str})"
-                )
-            except AssertionError as e:
-                print(
-                    f"  [{tag}] FAIL  max_err={max_err:.6f}  "
-                    f"atol={atol}  ({config_str})"
-                )
-                print(e)
+            torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
 
         # calculate perf metrics
         total_flops = 0
-        num_contexts = len(cu_seqlens_q) - 1
+        num_contexts = len(cu_query_lens) - 1
         for i in range(num_contexts):
-            seqlen_q = (cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item()
-            seqlen_k = (cu_seqlens_k[i + 1] - cu_seqlens_k[i]).item()
+            seqlen_q = (cu_query_lens[i + 1] - cu_query_lens[i]).item()
+            seqlen_k = (cu_key_lens[i + 1] - cu_key_lens[i]).item()
             if causal:
                 valid_out_elements = (
                     ((seqlen_k**2 + seqlen_k) / 2)
@@ -437,8 +349,8 @@ def run_benchmark(custom, args):
             else:
                 total_flops += seqlen_q * seqlen_k * HQ * (D_HEAD + D_HEAD_V) * 2.0
 
-        total_num_tokens_q = cu_seqlens_q[-1].item()
-        total_num_tokens_k = cu_seqlens_k[-1].item()
+        total_num_tokens_q = cu_query_lens[-1].item()
+        total_num_tokens_k = cu_key_lens[-1].item()
 
         q_size = total_num_tokens_q * HQ * D_HEAD * query.element_size()
         k_size = total_num_tokens_k * HK * D_HEAD * key_cache.element_size()
