@@ -146,7 +146,7 @@ def _gemm_afp4wfp4_kernel(
 
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=[32, 32],
+        instr_shape=[32, 32, 64],
         transposed=True,
         warps_per_cta=[2, num_warps // 2],
     )
