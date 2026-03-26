@@ -91,9 +91,9 @@ def benchmark(args):
     line_vals = [args.metric]
     line_names = [
         (
-            "Gluon-TDM-shuffled"
+            "Gluon-TDM-shuffled "
             if shuffled_kv_cache
-            else "Triton-nonpipelined-unshuffled"
+            else "Triton-nonpipelined-unshuffled "
         )
         + args.metric
     ]
