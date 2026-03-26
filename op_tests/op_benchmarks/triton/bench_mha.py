@@ -2,6 +2,8 @@ import torch
 import warnings
 import argparse
 import itertools
+from dataclasses import dataclass
+from typing import Callable
 import triton
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
@@ -22,6 +24,122 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
     get_caller_name_no_ext,
 )
+
+
+@dataclass(frozen=True)
+class Provider:
+    label: str
+    make_fn: Callable[..., Callable]
+
+
+# Registry populated by create_benchmark_configs, looked up by bench_mha
+_PROVIDERS: dict[str, Provider] = {}
+
+
+def _make_bf16_fn(q, k, v, **kw):
+    mha_set_use_fused_bwd_kernel(False)
+    return lambda: flash_attn_func(
+        q,
+        k,
+        v,
+        dropout_p=kw["dropout"],
+        softmax_scale=kw["sm_scale"],
+        causal=kw["causal"],
+        return_lse=kw["return_lse"],
+        return_attn_probs=kw["return_attn_probs"],
+        sink=kw["sink"],
+    )
+
+
+def _make_bf16_varlen_fn(q, k, v, **kw):
+    mha_set_use_fused_bwd_kernel(False)
+    return lambda: flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        kw["cu_seqlens_q"],
+        kw["cu_seqlens_k"],
+        kw["max_seqlen_q"],
+        kw["max_seqlen_k"],
+        dropout_p=kw["dropout"],
+        softmax_scale=kw["sm_scale"],
+        causal=kw["causal"],
+        return_lse=kw["return_lse"],
+        return_attn_probs=kw["return_attn_probs"],
+        sink=kw["sink"],
+    )
+
+
+def _make_bf16_fused_fn(q, k, v, **kw):
+    if kw.get("has_pe") or kw.get("has_sink"):
+        warnings.warn("Skipping: PE or sink not supported for this provider.")
+        return None
+    mha_set_use_fused_bwd_kernel(True)
+    return lambda: flash_attn_func(
+        q,
+        k,
+        v,
+        dropout_p=kw["dropout"],
+        softmax_scale=kw["sm_scale"],
+        causal=kw["causal"],
+        return_lse=kw["return_lse"],
+        return_attn_probs=kw["return_attn_probs"],
+        sink=kw["sink"],
+    )
+
+
+def _make_bf16_fused_varlen_fn(q, k, v, **kw):
+    if kw.get("has_pe") or kw.get("has_sink"):
+        warnings.warn("Skipping: PE or sink not supported for this provider.")
+        return None
+    mha_set_use_fused_bwd_kernel(True)
+    return lambda: flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        kw["cu_seqlens_q"],
+        kw["cu_seqlens_k"],
+        kw["max_seqlen_q"],
+        kw["max_seqlen_k"],
+        dropout_p=kw["dropout"],
+        softmax_scale=kw["sm_scale"],
+        causal=kw["causal"],
+        return_lse=kw["return_lse"],
+        return_attn_probs=kw["return_attn_probs"],
+        sink=kw["sink"],
+    )
+
+
+def _make_fp8_fn(q, k, v, **kw):
+    if kw.get("has_pe") or kw.get("has_sink"):
+        warnings.warn("Skipping: PE or sink not supported for this provider.")
+        return None
+    mha_set_use_fused_bwd_kernel(False)
+    return lambda: flash_attn_fp8_func(
+        q,
+        k,
+        v,
+        softmax_scale=kw["sm_scale"],
+        causal=kw["causal"],
+    )
+
+
+def _make_fp8_varlen_fn(q, k, v, **kw):
+    if kw.get("has_pe") or kw.get("has_sink"):
+        warnings.warn("Skipping: PE or sink not supported for this provider.")
+        return None
+    mha_set_use_fused_bwd_kernel(False)
+    return lambda: flash_attn_varlen_fp8_func(
+        q,
+        k,
+        v,
+        kw["cu_seqlens_q"],
+        kw["cu_seqlens_k"],
+        kw["max_seqlen_q"],
+        kw["max_seqlen_k"],
+        softmax_scale=kw["sm_scale"],
+        causal=kw["causal"],
+    )
 
 
 def nonvarlen_benchmark_configs():
@@ -69,11 +187,20 @@ def model_benchmark_configs(args):
         if isinstance(N_CTX_Q, list):
             for seq_len in N_CTX_Q:
                 fa_configs.append(
-                    (model_name, batch_size, HQ, HK, seq_len, seq_len, HEAD_DIM)
+                    (
+                        model_name,
+                        batch_size,
+                        HQ,
+                        HK,
+                        seq_len,
+                        seq_len,
+                        HEAD_DIM,
+                        HEAD_DIM,
+                    )
                 )
         else:
             fa_configs.append(
-                (model_name, batch_size, HQ, HK, N_CTX_Q, N_CTX_K, HEAD_DIM)
+                (model_name, batch_size, HQ, HK, N_CTX_Q, N_CTX_K, HEAD_DIM, HEAD_DIM)
             )
 
     return fa_configs
@@ -111,7 +238,7 @@ def pad_rearrange_dropout_mask(
 
 
 def create_benchmark_configs(custom, args):
-    dtype = arg_to_torch_dtype[args.dtype]
+    dtype = arg_to_torch_dtype[args.tensor_dtype]
     hk = args.hq if not args.hk else args.hk
     sk = args.sq if not args.sk else args.sk
     head_size = 128 if not args.d else args.d
@@ -141,8 +268,17 @@ def create_benchmark_configs(custom, args):
 
         if args.model:
             x_vals_list = model_benchmark_configs(args)
-            x_names = ["model", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K", "D_HEAD"]
-            plot_name = f"fused-attention-{mode}-layout-{args.layout}-fp8-{args.fp8}-causal-{causal}"
+            x_names = [
+                "model",
+                "BATCH",
+                "HQ",
+                "HK",
+                "N_CTX_Q",
+                "N_CTX_K",
+                "D_HEAD",
+                "D_HEAD_V",
+            ]
+            plot_name = f"fused-attention-{mode}-layout-{args.layout}-dtype-{args.dtype}-causal-{causal}"
             extra_args = {"dtype": dtype, "causal": causal, "mode": mode}
 
     if args.metric == "time":
@@ -154,22 +290,36 @@ def create_benchmark_configs(custom, args):
     else:
         raise ValueError("Unknown metric: " + args.metric)
 
-    if mode == "bwd":
-        if args.fused_bwd:
-            line_vals = [f"fused-bwd({unit})"]
+    dtype_to_fn = {
+        "bf16": _make_bf16_varlen_fn if varlen else _make_bf16_fn,
+        "fp16": _make_bf16_varlen_fn if varlen else _make_bf16_fn,
+        "fp32": _make_bf16_varlen_fn if varlen else _make_bf16_fn,
+        "fp8": _make_fp8_varlen_fn if varlen else _make_fp8_fn,
+    }
+    bf16_fused_fn = _make_bf16_fused_varlen_fn if varlen else _make_bf16_fused_fn
+
+    providers = []
+    for d in args.dtypes:
+        label = d.upper()
+        if mode == "bwd":
+            if args.fused_bwd and d != "fp8":
+                providers.append(Provider(f"{label}-fused-bwd({unit})", bf16_fused_fn))
+            else:
+                providers.append(Provider(f"{label}-bwd({unit})", dtype_to_fn[d]))
         else:
-            line_vals = [f"onekernel-bwd({unit})"]
-    else:
-        line_vals = [f"fwd({unit})"]
+            providers.append(Provider(f"{label}-fwd({unit})", dtype_to_fn[d]))
 
     if args.bench_torch:
-        line_vals = [f"Triton({unit})", f"Torch({unit})"]
+        bf16_fn = dtype_to_fn["bf16"]
+        providers = [
+            Provider(f"Triton({unit})", bf16_fn),
+            Provider(f"Torch({unit})", bf16_fn),
+        ]
 
-    if args.test_mode:
-        if args.fused_bwd:
-            line_vals = [f"fused-bwd({unit})"]
-        else:
-            line_vals = [f"onekernel-bwd({unit})"]
+    _PROVIDERS.clear()
+    for p in providers:
+        _PROVIDERS[p.label] = p
+    line_vals = [p.label for p in providers]
 
     configs.append(
         triton.testing.Benchmark(
@@ -208,159 +358,17 @@ def run_benchmark(custom, args):
         sm_scale=None,
         device="cuda",
     ):
-        """
-        Benchmark or test function for multi-head attention backward pass.
-        In test_mode, verifies output matching with non-varlen inputs.
-        """
         assert dropout <= 0.0, "Dropout not supported in this benchmark."
-        requires_grad = mode == "bwd" or args.test_mode
+        requires_grad = mode == "bwd"
         return_lse = True
         return_attn_probs = False
         varlen = args.layout == "thd"
         has_pe = D_HEAD > D_HEAD_V
-        assert not (
-            args.fp8 and has_pe
-        ), "Positional Encoding (PE) doesn't support FP8 data type."
-        assert not (
-            has_pe and "fused-bwd" in provider
-        ), "'Fused' backward implementation doesn't support Positional Encoding (PE)."
-        assert not (
-            args.fp8 and args.sink
-        ), "Attention sink doesn't support FP8 data type."
-        assert not (
-            args.sink and "fused-bwd" in provider
-        ), "'Fused' backward implementation doesn't support Attention Sink."
-
-        global _USE_FUSED_BWD
-        fused_backward = "fused-bwd" in provider
-        mha_set_use_fused_bwd_kernel(fused_backward)
+        provider_obj = _PROVIDERS[provider]
 
         # Default softmax scale to match standard attention
         if sm_scale is None:
             sm_scale = 1.0 / (D_HEAD**0.5)
-
-        # Test mode: run tests from op_tests with specified shapes
-        if args.test_mode:
-            import op_tests.triton_tests.attention.test_mha as test_mha
-
-            print(
-                f"Testing kernel implementation <{provider}> against Torch with shape:"
-            )
-            print(
-                f"BATCH={BATCH}, HQ={HQ}, HK={HK}, N_CTX_Q={N_CTX_Q}, N_CTX_K={N_CTX_K}, D_HEAD={D_HEAD}, D_HEAD_V={D_HEAD_V}"
-            )
-            if not varlen:
-                if not has_pe:
-                    test_mha.test_mha(
-                        BATCH,
-                        N_CTX_Q,
-                        N_CTX_K,
-                        HQ,
-                        HK,
-                        D_HEAD,
-                        dropout,
-                        True,
-                        True,
-                        causal,
-                        args.fp8,
-                        dtype,
-                    )
-                else:
-                    test_mha.test_mha_with_pe(
-                        BATCH,
-                        N_CTX_Q,
-                        N_CTX_K,
-                        HQ,
-                        HK,
-                        D_HEAD,
-                        D_HEAD_V,
-                        dropout,
-                        causal,
-                    )
-                print("Forward test passed!")
-                if not has_pe:
-                    test_mha.test_mha_backward_varlen(
-                        BATCH,
-                        N_CTX_Q,
-                        N_CTX_K,
-                        HQ,
-                        HK,
-                        D_HEAD,
-                        dropout,
-                        causal,
-                        args.fp8,
-                        dtype,
-                    )
-                else:
-                    test_mha.test_mha_backward_with_pe(
-                        BATCH,
-                        N_CTX_Q,
-                        N_CTX_K,
-                        HQ,
-                        HK,
-                        D_HEAD,
-                        D_HEAD_V,
-                        dropout,
-                        causal,
-                    )
-                print("Backward test passed!")
-            else:
-                if not has_pe:
-                    test_mha.test_mha_varlen(
-                        BATCH,
-                        N_CTX_Q,
-                        N_CTX_K,
-                        HQ,
-                        HK,
-                        D_HEAD,
-                        dropout,
-                        True,
-                        True,
-                        causal,
-                        args.fp8,
-                        dtype,
-                    )
-                else:
-                    test_mha.test_mha_varlen_with_pe(
-                        BATCH,
-                        N_CTX_Q,
-                        N_CTX_K,
-                        HQ,
-                        HK,
-                        D_HEAD,
-                        D_HEAD_V,
-                        dropout,
-                        causal,
-                    )
-                print("Forward test passed!")
-                if not has_pe:
-                    test_mha.test_mha_backward(
-                        BATCH,
-                        N_CTX_Q,
-                        N_CTX_K,
-                        HQ,
-                        HK,
-                        D_HEAD,
-                        dropout,
-                        causal,
-                        args.fp8,
-                        dtype,
-                    )
-                else:
-                    test_mha.test_mha_backward_varlen_with_pe(
-                        BATCH,
-                        N_CTX_Q,
-                        N_CTX_K,
-                        HQ,
-                        HK,
-                        D_HEAD,
-                        D_HEAD_V,
-                        dropout,
-                        causal,
-                    )
-                print("Backward test passed!")
-
-            return 0
 
         # Generate base inputs
         q = torch.randn(
@@ -451,68 +459,27 @@ def run_benchmark(custom, args):
                     2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
                 )
 
-        # Benchmark mode
+        # Build fn from provider
+        fn_kwargs = dict(
+            sm_scale=sm_scale,
+            causal=causal,
+            dropout=dropout,
+            return_lse=return_lse,
+            return_attn_probs=return_attn_probs,
+            sink=sink,
+            has_pe=has_pe,
+            has_sink=args.sink,
+        )
         if varlen:
-            if args.fp8:
-
-                def fn():
-                    return flash_attn_varlen_fp8_func(
-                        q_input,
-                        k_input,
-                        v_input,
-                        cu_seqlens_q,
-                        cu_seqlens_k,
-                        max_seqlen_q,
-                        max_seqlen_k,
-                        softmax_scale=sm_scale,
-                        causal=causal,
-                    )
-
-            else:
-
-                def fn():
-                    return flash_attn_varlen_func(
-                        q_input,
-                        k_input,
-                        v_input,
-                        cu_seqlens_q,
-                        cu_seqlens_k,
-                        max_seqlen_q,
-                        max_seqlen_k,
-                        dropout_p=dropout,
-                        softmax_scale=sm_scale,
-                        causal=causal,
-                        return_lse=return_lse,
-                        return_attn_probs=return_attn_probs,
-                        sink=sink,
-                    )
-
-        else:
-            if args.fp8:
-
-                def fn():
-                    return flash_attn_fp8_func(
-                        q_input,
-                        k_input,
-                        v_input,
-                        softmax_scale=sm_scale,
-                        causal=causal,
-                    )
-
-            else:
-
-                def fn():
-                    return flash_attn_func(
-                        q_input,
-                        k_input,
-                        v_input,
-                        dropout_p=dropout,
-                        softmax_scale=sm_scale,
-                        causal=causal,
-                        return_lse=return_lse,
-                        return_attn_probs=return_attn_probs,
-                        sink=sink,
-                    )
+            fn_kwargs.update(
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+            )
+        fn = provider_obj.make_fn(q_input, k_input, v_input, **fn_kwargs)
+        if fn is None:
+            return 0
 
         if mode == "bwd":
             with torch.enable_grad():
@@ -602,7 +569,10 @@ def run_benchmark(custom, args):
         else:  # GB/s
             return mem / ms * 1e-6
 
-    bench_mha.run(save_path="." if args.o else None, print_data=True)
+    try:
+        bench_mha.run(save_path=args.o, print_data=True)
+    except Exception as e:
+        print(f"\n[WARN] {args.mode} benchmark failed: {e}", flush=True)
 
 
 def supported_layouts():
@@ -649,19 +619,15 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("-dv", type=int, default=0, help="optional V head size")
     parser.add_argument("-causal", type=str2bool, default=None)
-    parser.add_argument("-fp8", action="store_true", default=False)
     parser.add_argument("-quantize_p", action="store_true", default=False)
-    parser.add_argument("--dtype", default="fp16")
+    parser.add_argument(
+        "--dtype",
+        default="bf16",
+        help="Comma-separated compute types to benchmark: bf16, fp16, fp32, fp8 (e.g. --dtype bf16,fp8)",
+    )
     parser.add_argument("-bench_torch", action="store_true", default=False)
     parser.add_argument("-fused_bwd", action="store_true", default=False)
     parser.add_argument("-print_vgpr", action="store_true", default=False)
-    parser.add_argument(
-        "-test_mode",
-        action="store_true",
-        default=False,
-        help="Tests correctness of the Triton provider comparing the output to the Torch sdpa.",
-    )
-
     parser.add_argument("--layout", type=str, default=None, help=supported_layouts())
     parser.add_argument(
         "-metric",
@@ -680,7 +646,11 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         help="Enable persistent kernels. Use '-persistent dynamic' for dynamic scheduling of the tiles.",
     )
     parser.add_argument(
-        "-o", action="store_true", help="Write performance results to CSV file"
+        "-o",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help="Write performance results to CSV in DIR",
     )
     parser.add_argument(
         "--profile",
@@ -694,6 +664,8 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     )
     return parser.parse_args(args=args)
 
+
+VALID_DTYPES = {"fp16", "bf16", "fp32", "fp8"}
 
 arg_to_torch_dtype = {
     "fp16": torch.float16,
@@ -738,9 +710,13 @@ def post_process_args(args: argparse.Namespace) -> tuple[argparse.Namespace, boo
             args.hq or args.hk or args.d or args.dv
         ), "Specifying model fixes hq, hk and d already. Do not provide them!"
 
-    assert (
-        args.dtype in arg_to_torch_dtype
-    ), "Only fp16, bf16 and f32 types currently supported."
+    args.dtypes = [d.strip() for d in args.dtype.split(",")]
+    for d in args.dtypes:
+        assert (
+            d in VALID_DTYPES
+        ), f"Unknown dtype '{d}'. Supported: {sorted(VALID_DTYPES)}"
+    # Tensor dtype is the first non-fp8 dtype, or bf16 if only fp8
+    args.tensor_dtype = next((d for d in args.dtypes if d != "fp8"), "bf16")
 
     assert (
         args.layout in supported_layouts()
