@@ -1011,9 +1011,9 @@ class AttentionProgram:
             layout=self.cfg.qk_layout,
         )
         if self.cfg.ARCH_NAME == "gfx1250":
-            return gl.amd.gfx1250.wmma(self.q, k, S)# * self.QK_scale
+            return gl.amd.gfx1250.wmma(self.q, k, S) * self.QK_scale
         else:
-            return gl.amd.cdna4.mfma(self.q, k, S)# * self.QK_scale
+            return gl.amd.cdna4.mfma(self.q, k, S) * self.QK_scale
     @gluon.jit
     def apply_mask_qk(self, S, j):
         seq_offset = (
@@ -1032,24 +1032,24 @@ class AttentionProgram:
         S = gl.where(full_mask, S, float("-inf"))
         return S
 
-    # @gluon.jit
-    # def softmax_part0(self, S, M):
-    #     m_ij = gl.maximum(M, gl.max(S, axis=1))
-    #     # m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
-    #     p = gl.exp2(S - m_ij[:, None])
-    #     alpha = gl.exp2(M - m_ij)
-    #     return p, alpha, m_ij
-
     @gluon.jit
     def softmax_part0(self, S, M):
         m_ij = gl.maximum(M, gl.max(S, axis=1))
-        #m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
-        m_ij_scaled = m_ij * self.QK_scale
-        q_shifted = S * self.QK_scale - m_ij_scaled[:, None]
-        p = gl.exp2(q_shifted)
-        m_diff_scaled = M * self.QK_scale - m_ij_scaled
-        alpha = gl.exp2(m_diff_scaled)
+        m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
+        p = gl.exp2(S - m_ij[:, None])
+        alpha = gl.exp2(M - m_ij)
         return p, alpha, m_ij
+
+    # @gluon.jit
+    # def softmax_part0(self, S, M):
+    #     m_ij = gl.maximum(M, gl.max(S, axis=1))
+    #     m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
+    #     m_ij_scaled = m_ij * self.QK_scale
+    #     q_shifted = S * self.QK_scale - m_ij_scaled[:, None]
+    #     p = gl.exp2(q_shifted)
+    #     m_diff_scaled = M * self.QK_scale - m_ij_scaled
+    #     alpha = gl.exp2(m_diff_scaled)
+    #     return p, alpha, m_ij
 
     @gluon.jit
     def softmax_part1(self, p, L, acc, alpha, target_dtype=gl.bfloat16):
@@ -1346,7 +1346,7 @@ def kernel_unified_attention_2d(
                 sink_ptr + query_offset_1_pv,
                 mask=query_mask_1_pv,
                 other=float("-inf"),
-            ).to(dtype=gl.float32) / SCALE
+            ).to(dtype=gl.float32) * cfg.RCP_LN2
         )
 
     L = gl.full(
