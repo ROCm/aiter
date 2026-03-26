@@ -195,7 +195,7 @@ def _get_element_ptr(base_ptr, byte_offset=None, static_byte_offset=0, elem_type
     _GEP_DYN = -(2**31)
     raw_ptr = _raw(base_ptr) if not isinstance(base_ptr, ir.Value) else base_ptr
     if elem_type is None:
-        elem_type = ir.IntegerType.get_signless(8)
+        elem_type = T.i8
 
     if byte_offset is None:
         return llvm.GEPOp(
@@ -220,8 +220,7 @@ def _get_element_ptr(base_ptr, byte_offset=None, static_byte_offset=0, elem_type
             _raw(byte_offset) if not isinstance(byte_offset, ir.Value) else byte_offset
         )
         if isinstance(offset_val.type, ir.IndexType):
-            i64_type = ir.IntegerType.get_signless(64)
-            offset_val = _std_arith.IndexCastOp(i64_type, offset_val).result
+            offset_val = _std_arith.IndexCastOp(T.i64, offset_val).result
         if static_byte_offset != 0:
             static_attr = ir.IntegerAttr.get(offset_val.type, int(static_byte_offset))
             static_const = _std_arith.ConstantOp(offset_val.type, static_attr).result
@@ -236,15 +235,14 @@ def _get_element_ptr(base_ptr, byte_offset=None, static_byte_offset=0, elem_type
         ).result
 
 
-def _lds_load_prefer_agpr(byte_addr_index, vec_type, static_byte_offset=0):
-    """LDS load with AGPR allocation hint via nontemporal flag."""
+def _lds_load(byte_addr_index, vec_type, static_byte_offset=0):
+    """LDS load via raw llvm.LoadOp on an LDS pointer (addr space 3)."""
     raw_addr = (
         _raw(byte_addr_index)
         if not isinstance(byte_addr_index, ir.Value)
         else byte_addr_index
     )
-    i64_type = ir.IntegerType.get_signless(64)
-    addr_i64 = _std_arith.IndexCastOp(i64_type, raw_addr).result
+    addr_i64 = _std_arith.IndexCastOp(T.i64, raw_addr).result
     lds_ptr = _inttoptr_lds(addr_i64)
     if static_byte_offset != 0:
         lds_ptr = _get_element_ptr(lds_ptr, static_byte_offset=static_byte_offset)
@@ -254,15 +252,14 @@ def _lds_load_prefer_agpr(byte_addr_index, vec_type, static_byte_offset=0):
 def _index_cast_to_i32(value):
     """Cast index/ArithValue to i32.  No-op if already i32."""
     raw = _raw(value) if not isinstance(value, ir.Value) else value
-    i32_type = ir.IntegerType.get_signless(32)
-    if raw.type == i32_type:
+    if raw.type == T.i32:
         return raw
-    return _std_arith.IndexCastOp(i32_type, raw).result
+    return _std_arith.IndexCastOp(T.i32, raw).result
 
 
 def _fast_exp2(val):
     """Bare v_exp_f32 via rocdl.exp2 -- no range reduction."""
-    return rocdl.exp2(ir.F32Type.get(), _raw(val))
+    return rocdl.exp2(T.f32, _raw(val))
 
 
 def _to_mlir(val, index=False):
@@ -330,7 +327,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
     split_output: fx.Tensor,  # [num_partial_slots * num_heads, v_head_dim]  (f32)
     split_lse: fx.Tensor,  # [num_partial_slots * num_heads]  (f32)
     # --- parameters ---
-    softmax_scale: fx.Constexpr,
+    softmax_scale: fx.Float32,
 ):
     """MLA decode forward kernel (nhead=128, fp8/fp8 -> bf16).
 
@@ -342,16 +339,6 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         return
 
     # ---- Types ----
-    compute_type = T.f32
-    lds_elem_type = ir.IntegerType.get_signless(8)
-    i32_type = ir.IntegerType.get_signless(32)
-    i64_type = ir.IntegerType.get_signless(64)
-    v4f32_type = ir.VectorType.get([4], compute_type)
-    v2i64_type = ir.VectorType.get([2], i64_type)
-    v4i8_type = ir.VectorType.get([4], lds_elem_type)
-    v16i8_type = ir.VectorType.get([16], lds_elem_type)
-    v4i32_type = ir.VectorType.get([4], i32_type)
-    v1i32_type = ir.VectorType.get([1], i32_type)
     fm_fast = _std_arith.FastMathFlags.fast
 
     def _mfma_fp8(result_type, operands, **kw):
@@ -370,14 +357,14 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
     lds_base_idx = _memref.ExtractAlignedPointerAsIndexOp(lds_buffer).result
 
     # ---- V^T transpose perm constants ----
-    c_perm0 = arith.constant(0x05010400, type=i32_type)
-    c_perm1 = arith.constant(0x07030602, type=i32_type)
-    c_perm2 = arith.constant(0x05040100, type=i32_type)
-    c_perm3 = arith.constant(0x07060302, type=i32_type)
+    c_perm0 = arith.constant(0x05010400, type=T.i32)
+    c_perm1 = arith.constant(0x07030602, type=T.i32)
+    c_perm2 = arith.constant(0x05040100, type=T.i32)
+    c_perm3 = arith.constant(0x07060302, type=T.i32)
 
     def _vt_perm(src_hi, src_lo, sel):
         return llvm.call_intrinsic(
-            i32_type,
+            T.i32,
             "llvm.amdgcn.perm",
             [src_hi, src_lo, sel],
             [],
@@ -385,16 +372,15 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         )
 
     # ---- Constants ----
-    c_neg_inf_f32 = arith.constant(float("-inf"), type=compute_type)
-    c_zero_f32 = arith.constant(0.0, type=compute_type)
-    c_one_f32 = arith.constant(1.0, type=compute_type)
-    c_zero_i32 = arith.constant(0, type=i32_type)
-    c_zero_v4f32 = arith.constant_vector(0.0, v4f32_type)
-    c_sm_scale = arith.constant(softmax_scale, type=compute_type)
-    c_log2e = arith.constant(LOG2E, type=compute_type)
-    c_inv_log2e = arith.constant(1.0 / LOG2E, type=compute_type)
-    c_dword_sz = arith.constant(4, type=i32_type)
-    c_aux_zero = arith.constant(0, type=i32_type)
+    c_neg_inf_f32 = arith.constant(float("-inf"), type=T.f32)
+    c_zero_f32 = arith.constant(0.0, type=T.f32)
+    c_one_f32 = arith.constant(1.0, type=T.f32)
+    c_zero_i32 = arith.constant(0, type=T.i32)
+    c_zero_v4f32 = arith.constant_vector(0.0, T.f32x4)
+    c_log2e = arith.constant(LOG2E, type=T.f32)
+    c_inv_log2e = arith.constant(1.0 / LOG2E, type=T.f32)
+    c_dword_sz = arith.constant(4, type=T.i32)
+    c_aux_zero = arith.constant(0, type=T.i32)
 
     # ---- Buffer resources ----
     query_rsrc = buffer_ops.create_buffer_resource(query)
@@ -448,18 +434,18 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             _raw(kv_ld_row_base_i32), _raw(kv_tile_start_i32)
         ).result
         if check_boundary:
-            neg_one = _raw(arith.constant(-1, type=i32_type))
+            neg_one = _raw(arith.constant(-1, type=T.i32))
             if_op = scf.IfOp(
                 _std_arith.CmpIOp(
                     CmpIPredicate.slt, row_idx_i32, _raw(kv_tile_end_i32)
                 ).result,
-                [i32_type],
+                [T.i32],
                 has_else=True,
             )
             with ir.InsertionPoint(if_op.regions[0].blocks[0]):
                 # In-bounds: do the buffer_load
                 phys_row_ib = buffer_ops.buffer_load(
-                    kv_page_indices_rsrc, row_idx_i32, vec_width=1, dtype=i32_type
+                    kv_page_indices_rsrc, row_idx_i32, vec_width=1, dtype=T.i32
                 )
                 scf.YieldOp([_raw(phys_row_ib)])
             with ir.InsertionPoint(if_op.regions[1].blocks[0]):
@@ -468,7 +454,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             return if_op.results[0]
         else:
             phys_row = buffer_ops.buffer_load(
-                kv_page_indices_rsrc, row_idx_i32, vec_width=1, dtype=i32_type
+                kv_page_indices_rsrc, row_idx_i32, vec_width=1, dtype=T.i32
             )
             return _raw(phys_row)
 
@@ -487,33 +473,31 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             p_lds_kv_warp_i32,
             _raw(
                 arith.constant(
-                    lds_warp_offset - block_idx_const * KV_NUM_COLS, type=i32_type
+                    lds_warp_offset - block_idx_const * KV_NUM_COLS, type=T.i32
                 )
             ),
         ).result
 
         if check_boundary:
-            neg_one = _raw(arith.constant(-1, type=i32_type))
+            neg_one = _raw(arith.constant(-1, type=T.i32))
             is_oob = _std_arith.CmpIOp(CmpIPredicate.eq, _raw(row_i32), neg_one).result
             # For OOB: write zero to LDS
             if_op = scf.IfOp(is_oob, [], has_else=True)
             with ir.InsertionPoint(if_op.regions[0].blocks[0]):
                 # Write zero via ds_write_b32 at lane's position
-                zero_u32 = _raw(arith.constant(0, type=i32_type))
+                zero_u32 = _raw(arith.constant(0, type=T.i32))
                 lane_offset = _std_arith.MulIOp(
                     _raw(lane_idx_i32),
-                    _raw(arith.constant(4, type=i32_type)),
+                    _raw(arith.constant(4, type=T.i32)),
                 ).result
                 lds_addr_zero = _std_arith.AddIOp(
                     lds_base_i32,
                     _std_arith.AddIOp(
-                        _raw(
-                            arith.constant(block_idx_const * KV_NUM_COLS, type=i32_type)
-                        ),
+                        _raw(arith.constant(block_idx_const * KV_NUM_COLS, type=T.i32)),
                         lane_offset,
                     ).result,
                 ).result
-                lds_addr_i64 = _std_arith.ExtUIOp(i64_type, lds_addr_zero).result
+                lds_addr_i64 = _std_arith.ExtUIOp(T.i64, lds_addr_zero).result
                 lds_ptr = _inttoptr_lds(lds_addr_i64)
                 llvm.StoreOp(zero_u32, lds_ptr, alignment=4)
                 scf.YieldOp([])
@@ -522,12 +506,12 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 voff = _std_arith.AddIOp(
                     _std_arith.MulIOp(
                         _raw(row_i32),
-                        _raw(arith.constant(QK_HEAD_DIM, type=i32_type)),
+                        _raw(arith.constant(QK_HEAD_DIM, type=T.i32)),
                     ).result,
                     _raw(col_base_i32),
                 ).result
-                col_off = arith.constant(block_idx_const * KV_NUM_COLS, type=i32_type)
-                lds_ptr_i64 = _std_arith.ExtUIOp(i64_type, lds_base_i32).result
+                col_off = arith.constant(block_idx_const * KV_NUM_COLS, type=T.i32)
+                lds_ptr_i64 = _std_arith.ExtUIOp(T.i64, lds_base_i32).result
                 lds_ptr = _inttoptr_lds(lds_ptr_i64)
                 rocdl.raw_ptr_buffer_load_lds(
                     kv_rsrc,
@@ -543,12 +527,12 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             voff = _std_arith.AddIOp(
                 _std_arith.MulIOp(
                     _raw(row_i32),
-                    _raw(arith.constant(QK_HEAD_DIM, type=i32_type)),
+                    _raw(arith.constant(QK_HEAD_DIM, type=T.i32)),
                 ).result,
                 _raw(col_base_i32),
             ).result
-            col_off = arith.constant(block_idx_const * KV_NUM_COLS, type=i32_type)
-            lds_ptr_i64 = _std_arith.ExtUIOp(i64_type, lds_base_i32).result
+            col_off = arith.constant(block_idx_const * KV_NUM_COLS, type=T.i32)
+            lds_ptr_i64 = _std_arith.ExtUIOp(T.i64, lds_base_i32).result
             lds_ptr = _inttoptr_lds(lds_ptr_i64)
             rocdl.raw_ptr_buffer_load_lds(
                 kv_rsrc,
@@ -612,7 +596,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         lds_addr = p_lds_kv_base_idx + lds_lane_offset + arith.index(fixed_offset)
 
         # ds_read_b64 -> 8 bytes = 1 i64 for MFMA input
-        data = _lds_load_prefer_agpr(lds_addr, i64_type)
+        data = _lds_load(lds_addr, T.i64)
         return data
 
     # ---- Helper: load V from KV LDS (un-transposed) ----
@@ -658,9 +642,9 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 off = KV_SUB_BYTES
             else:
                 off = KV_SUB_BYTES + KV_BYTES_PER_ROW
-            data = _lds_load_prefer_agpr(
+            data = _lds_load(
                 lds_addr,
-                ir.VectorType.get([2], i32_type),
+                T.i32x2,
                 static_byte_offset=off,
             )
             v_vals.append(
@@ -724,12 +708,12 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         lds_vt_addr = vt_lds_base_idx + block_offset
 
         # ds_write_b128 x 2 (4 dwords each = 32 fp8)
-        lo_packed = vector.from_elements(v4i32_type, vt8[0:4])
-        lo_i8 = vector.bitcast(v16i8_type, lo_packed)
+        lo_packed = vector.from_elements(T.i32x4, vt8[0:4])
+        lo_i8 = vector.bitcast(T.i8x16, lo_packed)
         vector.store(lo_i8, lds_buffer, [_raw(lds_vt_addr)])
 
-        hi_packed = vector.from_elements(v4i32_type, vt8[4:8])
-        hi_i8 = vector.bitcast(v16i8_type, hi_packed)
+        hi_packed = vector.from_elements(T.i32x4, vt8[4:8])
+        hi_i8 = vector.bitcast(T.i8x16, hi_packed)
         vector.store(hi_i8, lds_buffer, [_raw(lds_vt_addr + arith.index(16))])
 
     # ---- Helper: load transposed V from Vt LDS ----
@@ -765,11 +749,9 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         lds_addr = vt_lds_base_idx + block_offset + inblock_offset
 
         # ds_read_b32 x 2
-        v0 = _lds_load_prefer_agpr(
-            lds_addr, i32_type, static_byte_offset=fixed_block_offset
-        )
-        v1 = _lds_load_prefer_agpr(
-            lds_addr, i32_type, static_byte_offset=fixed_block_offset + offset_tl_bl
+        v0 = _lds_load(lds_addr, T.i32, static_byte_offset=fixed_block_offset)
+        v1 = _lds_load(
+            lds_addr, T.i32, static_byte_offset=fixed_block_offset + offset_tl_bl
         )
         return v0, v1
 
@@ -777,13 +759,13 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
     def _shfl_xor_f32(val_f32, offset_i32, width_i32):
         """XOR shuffle for f32 via bitcast to i32 and back."""
         # Bitcast f32 -> i32
-        val_i32 = _std_arith.BitcastOp(i32_type, val_f32).result
+        val_i32 = _std_arith.BitcastOp(T.i32, val_f32).result
         # Shuffle as i32
         peer_i32 = _mlir_gpu.ShuffleOp(
             val_i32, offset_i32, width_i32, _mlir_gpu.ShuffleMode.XOR
         ).shuffleResult
         # Bitcast i32 -> f32
-        return _std_arith.BitcastOp(compute_type, peer_i32).result
+        return _std_arith.BitcastOp(T.f32, peer_i32).result
 
     def _warp_reduce_max_16(val):
         """Butterfly max reduce across MFMA column groups.
@@ -794,12 +776,10 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         """
         w = _to_mlir(val)
         width = _std_arith.ConstantOp(
-            i32_type, ir.IntegerAttr.get(i32_type, WARP_SIZE)
+            T.i32, ir.IntegerAttr.get(T.i32, WARP_SIZE)
         ).result
         for sh in [32, 16]:
-            offset = _std_arith.ConstantOp(
-                i32_type, ir.IntegerAttr.get(i32_type, sh)
-            ).result
+            offset = _std_arith.ConstantOp(T.i32, ir.IntegerAttr.get(T.i32, sh)).result
             peer = _shfl_xor_f32(w, offset, width)
             w = _std_arith.MaximumFOp(w, peer, fastmath=fm_fast).result
         return w
@@ -808,12 +788,10 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         """Butterfly sum reduce across MFMA column groups."""
         w = _to_mlir(val)
         width = _std_arith.ConstantOp(
-            i32_type, ir.IntegerAttr.get(i32_type, WARP_SIZE)
+            T.i32, ir.IntegerAttr.get(T.i32, WARP_SIZE)
         ).result
         for sh in [32, 16]:
-            offset = _std_arith.ConstantOp(
-                i32_type, ir.IntegerAttr.get(i32_type, sh)
-            ).result
+            offset = _std_arith.ConstantOp(T.i32, ir.IntegerAttr.get(T.i32, sh)).result
             peer = _shfl_xor_f32(w, offset, width)
             w = _std_arith.AddFOp(w, peer, fastmath=fm_fast).result
         return w
@@ -839,12 +817,12 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         # v_offset = (row * QK_HEAD_DIM + col) * sizeof(fp8)
         s_offset_i32 = _std_arith.MulIOp(
             _raw(warp_idx_i32),
-            _raw(arith.constant(16 * QK_HEAD_DIM, type=i32_type)),
+            _raw(arith.constant(16 * QK_HEAD_DIM, type=T.i32)),
         ).result
         # Add qo_start offset: qo_start * NUM_QO_HEADS * QK_HEAD_DIM
         q_base_offset = _std_arith.MulIOp(
             _raw(qo_start_i32),
-            _raw(arith.constant(NUM_QO_HEADS * QK_HEAD_DIM, type=i32_type)),
+            _raw(arith.constant(NUM_QO_HEADS * QK_HEAD_DIM, type=T.i32)),
         ).result
         s_offset_i32 = _std_arith.AddIOp(s_offset_i32, q_base_offset).result
 
@@ -878,7 +856,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
 
         for pass_idx in range_constexpr(9):
             col_chunk = pass_idx * Q_ELEM_PER_ROW  # 0, 64, 128, ..., 512
-            col_off_i32 = arith.constant(col_chunk, type=i32_type)
+            col_off_i32 = arith.constant(col_chunk, type=T.i32)
 
             # VRAM -> VGPR: buffer_load_dwordx4 (16 fp8 values per lane)
             # voff is in fp8 elements (= bytes); buffer_load auto-scales by
@@ -886,13 +864,13 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             voff_bytes = _std_arith.AddIOp(_raw(v_offset_i32), _raw(col_off_i32)).result
             voff_dw = _std_arith.DivSIOp(
                 voff_bytes,
-                _raw(arith.constant(4, type=i32_type)),
+                _raw(arith.constant(4, type=T.i32)),
             ).result
             q_vram_data = buffer_ops.buffer_load(
                 query_rsrc,
                 voff_dw,
                 vec_width=4,
-                dtype=i32_type,
+                dtype=T.i32,
                 soffset_bytes=s_offset_i32,
             )
 
@@ -909,8 +887,8 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             # LDS -> register: 2x ds_read_b64 (MFMA layout)
             # Sub-tile 0 at offset 0, sub-tile 1 at offset MFMA_K (32 bytes)
             lds_rd_addr = p_lds_q_warp + lds_ld_offset
-            q0 = _lds_load_prefer_agpr(lds_rd_addr, i64_type, static_byte_offset=0)
-            q1 = _lds_load_prefer_agpr(lds_rd_addr, i64_type, static_byte_offset=MFMA_K)
+            q0 = _lds_load(lds_rd_addr, T.i64, static_byte_offset=0)
+            q1 = _lds_load(lds_rd_addr, T.i64, static_byte_offset=MFMA_K)
             q_regs.append((q0, q1))
 
             rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
@@ -929,7 +907,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         result = [None] * 8
         for i in range_constexpr(8):
             result[i] = _std_arith.MulFOp(
-                _raw(p_vals[i]), _raw(c_sm_scale), fastmath=fm_fast
+                _raw(p_vals[i]), _raw(softmax_scale), fastmath=fm_fast
             ).result
 
         if check_boundary:
@@ -938,7 +916,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 sub_offset = (i // 4) * 16 + (i % 4)
                 pos_i32 = _std_arith.AddIOp(
                     _raw(col_0_start_i32),
-                    _raw(arith.constant(sub_offset, type=i32_type)),
+                    _raw(arith.constant(sub_offset, type=T.i32)),
                 ).result
                 is_oob = _std_arith.CmpIOp(
                     CmpIPredicate.sge, pos_i32, _raw(kv_end_i32)
@@ -1035,22 +1013,20 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
     def _pack_p_to_fp8(p_exp_vals):
         """Pack 8 f32 -> 2 i32 (4x cvt_pk_fp8_f32) -> 1 i64 for MFMA."""
         w0 = rocdl.cvt_pk_fp8_f32(
-            i32_type, _raw(p_exp_vals[0]), _raw(p_exp_vals[1]), c_zero_i32, 0
+            T.i32, _raw(p_exp_vals[0]), _raw(p_exp_vals[1]), c_zero_i32, 0
         )
         w0 = rocdl.cvt_pk_fp8_f32(
-            i32_type, _raw(p_exp_vals[2]), _raw(p_exp_vals[3]), w0, 1
+            T.i32, _raw(p_exp_vals[2]), _raw(p_exp_vals[3]), w0, 1
         )
         w1 = rocdl.cvt_pk_fp8_f32(
-            i32_type, _raw(p_exp_vals[4]), _raw(p_exp_vals[5]), c_zero_i32, 0
+            T.i32, _raw(p_exp_vals[4]), _raw(p_exp_vals[5]), c_zero_i32, 0
         )
         w1 = rocdl.cvt_pk_fp8_f32(
-            i32_type, _raw(p_exp_vals[6]), _raw(p_exp_vals[7]), w1, 1
+            T.i32, _raw(p_exp_vals[6]), _raw(p_exp_vals[7]), w1, 1
         )
-        w0_i64 = _std_arith.ExtUIOp(i64_type, w0).result
-        w1_i64 = _std_arith.ExtUIOp(i64_type, w1).result
-        c32_i64 = _std_arith.ConstantOp(
-            i64_type, ir.IntegerAttr.get(i64_type, 32)
-        ).result
+        w0_i64 = _std_arith.ExtUIOp(T.i64, w0).result
+        w1_i64 = _std_arith.ExtUIOp(T.i64, w1).result
+        c32_i64 = _std_arith.ConstantOp(T.i64, ir.IntegerAttr.get(T.i64, 32)).result
         w1_shifted = _std_arith.ShLIOp(w1_i64, c32_i64).result
         p_pack = _std_arith.OrIOp(w0_i64, w1_shifted).result
         return p_pack
@@ -1058,7 +1034,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
     # ---- Helper: rescale oaccu ----
     def _rescale_oaccu(oaccu, rescale):
         """Multiply all oaccu accumulators by rescale factor."""
-        rescale_vec = vector.broadcast(v4f32_type, rescale)
+        rescale_vec = vector.broadcast(T.f32x4, rescale)
         result = [None] * len(oaccu)
         for i in range_constexpr(len(oaccu)):
             result[i] = _std_arith.MulFOp(
@@ -1074,8 +1050,6 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         via buffer_store. MFMA layout: lane%16 = row (Q head),
         (lane/16)*4 + elem = col within sub-tile.
         """
-        bf16_type = ir.BF16Type.get()
-        v4bf16_type = ir.VectorType.get([4], bf16_type)
 
         # MFMA layout: row = lane%16, col_base = (lane/16)*4
         mfma_row = lane_idx % arith.index(16)
@@ -1092,7 +1066,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             col_offset = tile_idx * MFMA_N  # 0, 16, 32, ... 496
 
             # Convert v4f32 -> v4bf16
-            bf16_vals = _std_arith.TruncFOp(v4bf16_type, _raw(oaccu[tile_idx])).result
+            bf16_vals = _std_arith.TruncFOp(T.bf16x4, _raw(oaccu[tile_idx])).result
 
             # Bitcast v4bf16 (8 bytes) -> v2i32 for buffer_store_dwordx2
             # Actually v4bf16 -> i64 -> use i64 store directly
@@ -1100,8 +1074,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             # Simplest: store v4bf16 as-is using f16 buffer format
 
             # Cast v4bf16 -> v4i16 -> v2i32 for buffer_store
-            v4i16_type = ir.VectorType.get([4], ir.IntegerType.get_signless(16))
-            i16_vals = _std_arith.BitcastOp(v4i16_type, bf16_vals).result
+            i16_vals = _std_arith.BitcastOp(T.i16x4, bf16_vals).result
 
             # Shuffle i16 pairs into i32: [i16_0, i16_1] -> i32_0, [i16_2, i16_3] -> i32_1
             i16_0 = vector.extract(i16_vals, static_position=[0], dynamic_position=[])
@@ -1110,13 +1083,13 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             i16_3 = vector.extract(i16_vals, static_position=[3], dynamic_position=[])
 
             # Pack i16 pairs to i32
-            lo_0 = _std_arith.ExtUIOp(i32_type, i16_0).result
-            hi_0 = _std_arith.ExtUIOp(i32_type, i16_1).result
-            c16 = _raw(arith.constant(16, type=i32_type))
+            lo_0 = _std_arith.ExtUIOp(T.i32, i16_0).result
+            hi_0 = _std_arith.ExtUIOp(T.i32, i16_1).result
+            c16 = _raw(arith.constant(16, type=T.i32))
             dw0 = _std_arith.OrIOp(lo_0, _std_arith.ShLIOp(hi_0, c16).result).result
 
-            lo_1 = _std_arith.ExtUIOp(i32_type, i16_2).result
-            hi_1 = _std_arith.ExtUIOp(i32_type, i16_3).result
+            lo_1 = _std_arith.ExtUIOp(T.i32, i16_2).result
+            hi_1 = _std_arith.ExtUIOp(T.i32, i16_3).result
             dw1 = _std_arith.OrIOp(lo_1, _std_arith.ShLIOp(hi_1, c16).result).result
 
             # buffer_store_dwordx2 to final_output
@@ -1129,9 +1102,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 )
                 * arith.index(2)
             )
-            v2i32_vals = vector.from_elements(
-                ir.VectorType.get([2], i32_type), [dw0, dw1]
-            )
+            v2i32_vals = vector.from_elements(T.i32x2, [dw0, dw1])
             buffer_ops.buffer_store(
                 v2i32_vals,
                 final_output_rsrc,
@@ -1177,15 +1148,16 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
 
         # Write LSE: lse = row_max + ln(row_sum_e) / log2e
         # Only first 16 lanes per warp write (one per MFMA result row)
-        if arith.cmpi(
-            CmpIPredicate.ult, lane_idx_i32, arith.constant(16, type=i32_type)
-        ):
-            # HK uses __builtin_amdgcn_logf (= v_log_f32 = log2) * inv_log2e
-            # which equals ln(sum_e). Use math.log (= ln) directly.
-            log_sum = _math.LogOp(_raw(row_sum_e)).result
+        if arith.cmpi(CmpIPredicate.ult, lane_idx_i32, arith.constant(16, type=T.i32)):
+            # ln(sum_e) = log2(sum_e) * inv_log2e
+            # math.log2 lowers to a single v_log_f32 instruction on AMD.
+            log2_sum = _math.log2(_raw(row_sum_e))
+            ln_sum = _std_arith.MulFOp(
+                log2_sum, _raw(c_inv_log2e), fastmath=fm_fast
+            ).result
             lse = _std_arith.AddFOp(
                 _raw(row_max),
-                log_sum,
+                ln_sum,
                 fastmath=fm_fast,
             ).result
             row_idx_i32 = _std_arith.AddIOp(
@@ -1193,12 +1165,12 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                     _raw(lane_idx_i32),
                     _std_arith.MulIOp(
                         _raw(warp_idx_i32),
-                        _raw(arith.constant(16, type=i32_type)),
+                        _raw(arith.constant(16, type=T.i32)),
                     ).result,
                 ).result,
                 _std_arith.MulIOp(
                     _raw(partial_qo_loc_i32),
-                    _raw(arith.constant(NUM_QO_HEADS, type=i32_type)),
+                    _raw(arith.constant(NUM_QO_HEADS, type=T.i32)),
                 ).result,
             ).result
             buffer_ops.buffer_store(
@@ -1243,19 +1215,19 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
 
             if nope_pair == 0:
                 p_comp[0] = _mfma_fp8(
-                    v4f32_type, [k0_lo, q_0, _raw(c_zero_v4f32), 0, 0, 0]
+                    T.f32x4, [k0_lo, q_0, _raw(c_zero_v4f32), 0, 0, 0]
                 )
                 p_comp[1] = _mfma_fp8(
-                    v4f32_type, [k0_hi, q_0, _raw(c_zero_v4f32), 0, 0, 0]
+                    T.f32x4, [k0_hi, q_0, _raw(c_zero_v4f32), 0, 0, 0]
                 )
             else:
-                p_comp[0] = _mfma_fp8(v4f32_type, [k0_lo, q_0, p_comp[0], 0, 0, 0])
-                p_comp[1] = _mfma_fp8(v4f32_type, [k0_hi, q_0, p_comp[1], 0, 0, 0])
+                p_comp[0] = _mfma_fp8(T.f32x4, [k0_lo, q_0, p_comp[0], 0, 0, 0])
+                p_comp[1] = _mfma_fp8(T.f32x4, [k0_hi, q_0, p_comp[1], 0, 0, 0])
 
             rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
 
-            p_comp[0] = _mfma_fp8(v4f32_type, [k1_lo, q_1, p_comp[0], 0, 0, 0])
-            p_comp[1] = _mfma_fp8(v4f32_type, [k1_hi, q_1, p_comp[1], 0, 0, 0])
+            p_comp[0] = _mfma_fp8(T.f32x4, [k1_lo, q_1, p_comp[0], 0, 0, 0])
+            p_comp[1] = _mfma_fp8(T.f32x4, [k1_hi, q_1, p_comp[1], 0, 0, 0])
 
         for rope_pair in range_constexpr(NUM_ROPE_ITERS):
             tile_0 = rope_pair * 2
@@ -1268,21 +1240,13 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
 
             rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=2))
 
-            p_comp[0] = _mfma_fp8(
-                v4f32_type, [k0_lo, q_rope[tile_0], p_comp[0], 0, 0, 0]
-            )
-            p_comp[1] = _mfma_fp8(
-                v4f32_type, [k0_hi, q_rope[tile_0], p_comp[1], 0, 0, 0]
-            )
+            p_comp[0] = _mfma_fp8(T.f32x4, [k0_lo, q_rope[tile_0], p_comp[0], 0, 0, 0])
+            p_comp[1] = _mfma_fp8(T.f32x4, [k0_hi, q_rope[tile_0], p_comp[1], 0, 0, 0])
 
             rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
 
-            p_comp[0] = _mfma_fp8(
-                v4f32_type, [k1_lo, q_rope[tile_1], p_comp[0], 0, 0, 0]
-            )
-            p_comp[1] = _mfma_fp8(
-                v4f32_type, [k1_hi, q_rope[tile_1], p_comp[1], 0, 0, 0]
-            )
+            p_comp[0] = _mfma_fp8(T.f32x4, [k1_lo, q_rope[tile_1], p_comp[0], 0, 0, 0])
+            p_comp[1] = _mfma_fp8(T.f32x4, [k1_hi, q_rope[tile_1], p_comp[1], 0, 0, 0])
 
         # ---- Extract p_comp values for softmax ----
         p_vals = []
@@ -1327,9 +1291,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         rocdl.sched_barrier(0)
 
         # ---- GEMM2: PV accumulation ----
-        c32_i64_pv = _std_arith.ConstantOp(
-            i64_type, ir.IntegerAttr.get(i64_type, 32)
-        ).result
+        c32_i64_pv = _std_arith.ConstantOp(T.i64, ir.IntegerAttr.get(T.i64, 32)).result
         oaccu_out = list(oaccu_in)
         for pv_iter in range_constexpr(NUM_PV_ITERS):
             col_offset_0 = pv_iter * MFMA_N * 2
@@ -1340,24 +1302,24 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
 
             rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=2))
 
-            vt0_lo_i64 = _std_arith.ExtUIOp(i64_type, vt0_lo).result
-            vt0_hi_i64 = _std_arith.ExtUIOp(i64_type, vt0_hi).result
+            vt0_lo_i64 = _std_arith.ExtUIOp(T.i64, vt0_lo).result
+            vt0_hi_i64 = _std_arith.ExtUIOp(T.i64, vt0_hi).result
             vt0_hi_shifted = _std_arith.ShLIOp(vt0_hi_i64, c32_i64_pv).result
             kv_mfma_0 = _std_arith.OrIOp(vt0_lo_i64, vt0_hi_shifted).result
 
             oaccu_out[pv_iter * 2] = _mfma_fp8(
-                v4f32_type, [kv_mfma_0, p_pack, oaccu_out[pv_iter * 2], 0, 0, 0]
+                T.f32x4, [kv_mfma_0, p_pack, oaccu_out[pv_iter * 2], 0, 0, 0]
             )
 
             rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
 
-            vt1_lo_i64 = _std_arith.ExtUIOp(i64_type, vt1_lo).result
-            vt1_hi_i64 = _std_arith.ExtUIOp(i64_type, vt1_hi).result
+            vt1_lo_i64 = _std_arith.ExtUIOp(T.i64, vt1_lo).result
+            vt1_hi_i64 = _std_arith.ExtUIOp(T.i64, vt1_hi).result
             vt1_hi_shifted = _std_arith.ShLIOp(vt1_hi_i64, c32_i64_pv).result
             kv_mfma_1 = _std_arith.OrIOp(vt1_lo_i64, vt1_hi_shifted).result
 
             oaccu_out[pv_iter * 2 + 1] = _mfma_fp8(
-                v4f32_type, [kv_mfma_1, p_pack, oaccu_out[pv_iter * 2 + 1], 0, 0, 0]
+                T.f32x4, [kv_mfma_1, p_pack, oaccu_out[pv_iter * 2 + 1], 0, 0, 0]
             )
 
         return row_max_new, row_sum_e_new, oaccu_out
@@ -1370,13 +1332,13 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         wi_base_i32 = _index_cast_to_i32(work_idx * SIZE_MLA_WORK_INFO_IN_DW)
         wi_dw1_4 = buffer_ops.buffer_load(
             work_info_set_rsrc,
-            arith.addi(wi_base_i32, arith.constant(1, type=i32_type)),
+            arith.addi(wi_base_i32, arith.constant(1, type=T.i32)),
             vec_width=4,
             dtype=T.i32,
         )
         wi_dw5 = buffer_ops.buffer_load(
             work_info_set_rsrc,
-            arith.addi(wi_base_i32, arith.constant(5, type=i32_type)),
+            arith.addi(wi_base_i32, arith.constant(5, type=T.i32)),
             vec_width=1,
             dtype=T.i32,
         )
@@ -1397,7 +1359,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
 
         kv_warp_offset_i32 = _std_arith.MulIOp(
             _raw(warp_idx_i32),
-            _raw(arith.constant(KV_SUB_BYTES, type=i32_type)),
+            _raw(arith.constant(KV_SUB_BYTES, type=T.i32)),
         ).result
 
         p_lds_kv_0_warp_i32 = _std_arith.AddIOp(
@@ -1415,8 +1377,8 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         oaccu = [_raw(c_zero_v4f32)] * (NUM_PV_ITERS * 2)
 
         # Compute number of tiles
-        c_block_n = arith.constant(BLOCK_N, type=i32_type)
-        c_block_n_m1 = arith.constant(BLOCK_N - 1, type=i32_type)
+        c_block_n = arith.constant(BLOCK_N, type=T.i32)
+        c_block_n_m1 = arith.constant(BLOCK_N - 1, type=T.i32)
         num_tiles = arith.divui(arith.addi(kv_len, c_block_n_m1), c_block_n)
         num_tiles_idx = arith.index_cast(T.index, num_tiles)
 
@@ -1464,7 +1426,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         # Carried values: row_max, row_sum_e, oaccu[0..31]
         c_one_idx = arith.index(1)
         init_args = [row_max, row_sum_e] + oaccu
-        result_types = [compute_type, compute_type] + [v4f32_type] * (NUM_PV_ITERS * 2)
+        result_types = [T.f32, T.f32] + [T.f32x4] * (NUM_PV_ITERS * 2)
 
         for_op = scf.ForOp(
             _raw(c_one_idx),
@@ -1490,7 +1452,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             # Determine if this is the last tile (needs boundary check)
             is_last_tile_i32 = _std_arith.AddIOp(
                 tile_iv_i32,
-                _raw(arith.constant(1, type=i32_type)),
+                _raw(arith.constant(1, type=T.i32)),
             ).result
             last_cond = _std_arith.CmpIOp(
                 CmpIPredicate.sge,
@@ -1539,7 +1501,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         reci_sum = _std_arith.DivFOp(
             _raw(c_one_f32), row_sum_e, fastmath=fm_fast
         ).result
-        reci_vec = vector.broadcast(v4f32_type, reci_sum)
+        reci_vec = vector.broadcast(T.f32x4, reci_sum)
         for i in range_constexpr(len(oaccu)):
             oaccu[i] = _std_arith.MulFOp(
                 oaccu[i], _raw(reci_vec), fastmath=fm_fast
@@ -1548,9 +1510,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         # ---- Output dispatch ----
         p_lds_o = p_lds_kv_0_base
 
-        if arith.cmpi(
-            CmpIPredicate.slt, partial_qo_loc, arith.constant(0, type=i32_type)
-        ):
+        if arith.cmpi(CmpIPredicate.slt, partial_qo_loc, arith.constant(0, type=T.i32)):
             _write_output_bf16(oaccu, qo_start, p_lds_o)
         else:
             _write_output_split(oaccu, partial_qo_loc, row_max, row_sum_e, p_lds_o)
@@ -1569,7 +1529,7 @@ def launch_mla_fwd_decode_h128_fp8_fp8(
     final_output: fx.Tensor,
     split_output: fx.Tensor,
     split_lse: fx.Tensor,
-    softmax_scale: fx.Constexpr,
+    softmax_scale: fx.Float32,
     num_cus: fx.Constexpr,
     lds_size: fx.Constexpr,
     stream: fx.Stream = fx.Stream(None),
