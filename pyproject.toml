@@ -2,7 +2,7 @@
 requires = [
     "pybind11>=3.0.1",
     "setuptools>=45",
-    "setuptools_scm[toml]>=6.2",
+    "setuptools_scm[toml]<9",
     "wheel",
     "packaging",
     "psutil",
