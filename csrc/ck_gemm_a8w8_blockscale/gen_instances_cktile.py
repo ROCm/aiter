@@ -2,11 +2,21 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
 import os
+import sys
 import shutil
 from pathlib import Path
 
 import pandas as pd
 import torch
+
+this_dir = os.path.dirname(os.path.abspath(__file__))
+AITER_CORE_DIR = (
+    os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter/jit/utils")
+    if os.path.exists(os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter_meta"))
+    else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
+)
+sys.path.insert(0, AITER_CORE_DIR)
+from chip_info import get_build_targets
 
 from gemm_a8w8_blockscale_cktile_instance import (
     default_kernels_cktile_dict,
@@ -40,13 +50,14 @@ class gemm_a8w8_blockscale_codegen:
 
         if os.path.exists(tune_dict_csv):
             tune_df = pd.read_csv(tune_dict_csv)
-            if torch.cuda.is_available():
-                gpu = torch.cuda.current_device()
-                device_properties = torch.cuda.get_device_properties(gpu)
-                cu_num = device_properties.multi_processor_count
-                tune_df = tune_df[
-                    (tune_df["cu_num"] == cu_num) & (tune_df["libtype"] == "cktile")
-                ].reset_index()
+            # Build a row mask that is True for any (gfx, cu_num) build target.
+            # |= accumulates matches across all targets so multi-arch builds
+            # (e.g. GPU_ARCHS=gfx942;gfx950) include rows for every target.
+            targets = get_build_targets()
+            mask = pd.Series([False] * len(tune_df))
+            for gfx, cu_num in targets:
+                mask |= (tune_df["gfx"] == gfx) & (tune_df["cu_num"] == cu_num)
+            tune_df = tune_df[mask & (tune_df["libtype"] == "cktile")].reset_index(drop=True)
             # NOTE: Matching by kernelName (not kernelId). The kernelId column in tuned
             # CSVs is kept but it is NOT used for kernel selection anymore.
             # This allows instance lists to be reordered or expanded (e.g. changing

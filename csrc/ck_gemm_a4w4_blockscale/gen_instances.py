@@ -2,11 +2,22 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
 import os
+import sys
 import shutil
 from pathlib import Path
 
 import pandas as pd
 import torch
+
+this_dir = os.path.dirname(os.path.abspath(__file__))
+AITER_CORE_DIR = (
+    os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter/jit/utils")
+    if os.path.exists(os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter_meta"))
+    else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
+)
+sys.path.insert(0, AITER_CORE_DIR)
+from chip_info import get_build_targets
+
 from gemm_a4w4_blockscale_common import (
     default_kernels_dict,
     kernelInstance,
@@ -226,11 +237,14 @@ def get_tune_dict(tune_dict_csv):
     tune_dict = default_kernels_dict
     if os.path.exists(tune_dict_csv):
         tune_df = pd.read_csv(tune_dict_csv)
-        if torch.cuda.is_available():
-            gpu = torch.cuda.current_device()
-            device_properties = torch.cuda.get_device_properties(gpu)
-            cu_num = device_properties.multi_processor_count
-            tune_df = tune_df[tune_df["cu_num"] == cu_num].reset_index()
+        # Build a row mask that is True for any (gfx, cu_num) build target.
+        # |= accumulates matches across all targets so multi-arch builds
+        # (e.g. GPU_ARCHS=gfx942;gfx950) include rows for every target.
+        targets = get_build_targets()
+        mask = pd.Series([False] * len(tune_df))
+        for gfx, cu_num in targets:
+            mask |= (tune_df["gfx"] == gfx) & (tune_df["cu_num"] == cu_num)
+        tune_df = tune_df[mask].reset_index(drop=True)
         for i in range(len(tune_df)):
             M = tune_df.loc[i, "M"]
             N = tune_df.loc[i, "N"]
