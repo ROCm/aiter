@@ -149,7 +149,7 @@ __global__ void gated_rmsnorm_fp8_group_quant_kernel(
     }
 
     // Step 5: Compute scale for FP8 quantization
-    constexpr float FP8_MAX = 240.0f;  // E4M3FNUZ max
+    constexpr float FP8_MAX = static_cast<float>(opus::finfo<DTYPE_O>::max());
     float quant_scale = (local_max > 1e-10f) ? (local_max / FP8_MAX) : 1e-10f;
     float quant_scale_inv = 1.0f / quant_scale;
 
