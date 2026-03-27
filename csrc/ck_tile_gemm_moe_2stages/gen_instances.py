@@ -252,7 +252,7 @@ template torch::Tensor
                 )
             ).write_text(body)
 
-        if (k.QuantType == "1x32") and (a_type in ["bf16", "fp16", "fp8"]):
+        if (k.QuantType == "1x32") and (a_type in ["bf16", "fp16", "fp8", "pk_fp4"]):
             fill_template(k.name, self.a_dtype, "pk_fp4", self.acc_dtype, self.c_dtype)
         else:
             for CDtype in ["bf16", "fp16"]:
@@ -615,6 +615,7 @@ if __name__ == "__main__":
     a_types = ["bf16"]
     if get_gfx() == "gfx950":
         a_types.append("fp8")
+        a_types.append("pk_fp4")
     b_type = "fp4"
     quant_type = "1x32"
 
@@ -649,8 +650,8 @@ if __name__ == "__main__":
     ):
         has_bias = True if act_type == "swiglu" else False
 
-        # a8w8 do not support
-        if a_type in ["fp8", "bf8"] and is_split_k:
+        # a8w8/a4w4 do not support split_k
+        if a_type in ["fp8", "bf8", "pk_fp4"] and is_split_k:
             continue
         codegen = cktile_moe_2stage_gemm_codegen(
             args.working_path,

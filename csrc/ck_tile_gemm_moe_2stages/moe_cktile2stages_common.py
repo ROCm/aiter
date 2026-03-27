@@ -29,6 +29,7 @@ dtype_dict = {
     "bf16": "ck_tile::bf16_t",
     "float": "float",
     "fp4": "ck_tile::pk_fp4_t",
+    "pk_fp4": "ck_tile::pk_fp4_t",
 }
 
 
@@ -215,6 +216,22 @@ a8w4_gemm2_kernels_list_gfx950= {
     # 4: kernelInstance(       2,        256,      256,        128,       128,           16,         16,          32,          1,        4,),
 }
 
+
+# gemm1 out:bf16 AB:fp4/fp4 (MXFP4 quantized activations x MXFP4 weights)
+a4w4_gemm1_kernels_list_gfx950= {
+    #  kernel:           stage| BLOCK_SIZE|MPerBLOCK|  NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_TILE_K| WAVE_MAP_M| WAVE_MAP_N| BlockPerCU|
+    0: kernelInstance(       1,        256,       16,        128,       256,          16,         16,         128,          1,           4,          2,),
+    1: kernelInstance(       1,        256,       32,        256,       256,          16,         16,         128,          1,           4,          2,),
+    3: kernelInstance(       1,        256,       64,        256,       256,          16,         16,         128,          1,           4,          1,),
+}
+# gemm2 out:bf16 AB:fp4/fp4 (MXFP4 quantized activations x MXFP4 weights)
+a4w4_gemm2_kernels_list_gfx950= {
+    #  kernel:           stage| BLOCK_SIZE|MPerBLOCK|  NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_TILE_K| WAVE_MAP_M| WAVE_MAP_N| BlockPerCU|
+    0: kernelInstance(       2,        256,       16,        128,       256,          16,         16,         128,          1,        4,            2,),
+    1: kernelInstance(       2,        256,       32,        256,       256,          16,         16,         128,          1,        4,            2,),
+    3: kernelInstance(       2,        256,       64,        256,       256,          16,         16,         128,          1,        4,            1,),
+}
+
 # fmt: on
 gemm1_kernels_dict = {
     "a8w8_gfx950": a8w8_gemm1_kernels_list_gfx950,
@@ -222,6 +239,7 @@ gemm1_kernels_dict = {
     "a16w4_gfx950": a16w4_gemm1_kernels_list_gfx950,
     "a16w4": a16w4_gemm1_kernels_list,
     "a8w4_gfx950": a8w4_gemm1_kernels_list_gfx950,
+    "a4w4_gfx950": a4w4_gemm1_kernels_list_gfx950,
 }
 
 gemm2_kernels_dict = {
@@ -230,6 +248,7 @@ gemm2_kernels_dict = {
     "a16w4_gfx950": a16w4_gemm2_kernels_list_gfx950,
     "a16w4": a16w4_gemm2_kernels_list,
     "a8w4_gfx950": a8w4_gemm2_kernels_list_gfx950,
+    "a4w4_gfx950": a4w4_gemm2_kernels_list_gfx950,
 }
 
 
@@ -485,18 +504,82 @@ struct moe_gemm2_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_da
 }};
 """
 
+
+a4w4_gfx950_heuristic_dispatch = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+#include "moe_cktile2stages.h"
+#include "moe_cktile2stages_heuristic_dispatch_common.h"
+
+template <>
+struct moe_gemm1_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}, {(activation)}, {(has_bias)}, {(split_k)}>
+{{
+    static MoeKernel dispatch(int M, int N, int K, int block_m)
+    {{
+        // Apply shape heuristics to find a suitable kernel implementation.
+        if (block_m == 16)
+        {{
+            return {(1, 0)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+        }}
+        else if (block_m == 32)
+        {{
+            return {(1, 1)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+        }}
+        else if (block_m == 64)
+        {{
+            return {(1, 3)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+        }}
+        else
+        {{
+            TORCH_CHECK(
+                false,
+                "Unsupported block_m value for moe_gemm1 a4w4 heuristic dispatch: ",
+                block_m);
+        }}
+    }}
+}};
+
+template <>
+struct moe_gemm2_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}, {(activation)}, {(has_bias)}, {(split_k)}>
+{{
+    static MoeKernel dispatch(int M, int N, int K, int block_m)
+    {{
+        // Apply shape heuristics to find a suitable kernel implementation.
+        if (block_m == 16)
+        {{
+            return {(2, 0)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+        }}
+        else if (block_m == 32)
+        {{
+            return {(2, 1)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+        }}
+        else if (block_m == 64)
+        {{
+            return {(2, 3)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+        }}
+        else
+        {{
+            TORCH_CHECK(
+                false,
+                "Unsupported block_m value for moe_gemm2 a4w4 heuristic dispatch: ",
+                block_m);
+        }}
+    }}
+}};
+"""
 heuristic_dispatch_dict = {
     "a8w8_gfx950": a8w8_gfx950_heuristic_dispatch,
     # "a8w8": a8w8_gemm2_kernels_list,
     "a16w4_gfx950": a16w4_gfx950_heuristic_dispatch,
     "a16w4": a16w4_heuristic_dispatch,
     "a8w4_gfx950": a8w4_gfx950_heuristic_dispatch,
+    "a4w4_gfx950": a4w4_gfx950_heuristic_dispatch,
 }
 
 
 bit8_list = ["f8", "i8", "fp8"]
 bit16_list = ["b16", "f16", "bf16", "fp16"]
-bit4_list = ["i4", "fp4x2", "fp4"]
+bit4_list = ["i4", "fp4x2", "fp4", "pk_fp4"]
 QuantType_list = ["no", "per_tensor", "per_token", "per_1x128", "per_1x32"]
 
 
@@ -523,6 +606,13 @@ def get_gemm1_kernels_list(
     elif Adtype.lower() in bit8_list and Bdtype in bit4_list:
         if arch == "gfx950":
             tag = "a8w4_gfx950"
+        else:
+            raise ValueError(
+                f"Unsupported data type combination: {Adtype}, {Bdtype} on {arch}"
+            )
+    elif Adtype in bit4_list and Bdtype in bit4_list:
+        if arch == "gfx950":
+            tag = "a4w4_gfx950"
         else:
             raise ValueError(
                 f"Unsupported data type combination: {Adtype}, {Bdtype} on {arch}"
@@ -572,6 +662,13 @@ def get_gemm2_kernels_list(
     elif Adtype.lower() in bit8_list and Bdtype in bit4_list:
         if arch == "gfx950":
             tag = "a8w4_gfx950"
+        else:
+            raise ValueError(
+                f"Unsupported data type combination: {Adtype}, {Bdtype} on {arch}"
+            )
+    elif Adtype in bit4_list and Bdtype in bit4_list:
+        if arch == "gfx950":
+            tag = "a4w4_gfx950"
         else:
             raise ValueError(
                 f"Unsupported data type combination: {Adtype}, {Bdtype} on {arch}"

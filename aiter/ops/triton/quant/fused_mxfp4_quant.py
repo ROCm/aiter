@@ -605,7 +605,13 @@ def fused_dynamic_mxfp4_quant_moe_sort(
 
     M_i, N_i = M, scaleN
     M_o, N_o = sorted_ids.shape[0], N_i
-    assert (N_i // 2) % 2 == 0
+    # Pad N_o to next multiple of BLOCK_SIZE_N so blockscale elements are
+    # evenly divisible when viewed as (-1, N_o_padded).  The extra columns
+    # are stripped before returning.
+    N_o_padded = triton.cdiv(N_o, BLOCK_SIZE_N) * BLOCK_SIZE_N
+    # Note: the (N_i // 2) % 2 == 0 assertion was removed because the kernel
+    # handles non-aligned scaleN (e.g. scaleN=6 at TP=8) through load masking
+    # and output padding/slicing.  Only N % 4 == 0 is required (for fp4 packing).
     assert block_size % BLOCK_SIZE_M == 0
 
     blockscale_e8m0_sorted = torch.empty(
@@ -645,9 +651,12 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         TOPK=topk,
     )
 
+    scale_out = blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, N_o_padded)
+    if N_o_padded != N_o:
+        scale_out = scale_out[:, :N_o].contiguous()
     return (
         x_fp4.view(dtypes.fp4x2),
-        blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, N_o),
+        scale_out,
     )
 
 

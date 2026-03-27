@@ -538,7 +538,8 @@ def moe_mxfp4_sort(
         blockscale_e8m0 = blockscale_e8m0.view(-1, blockscale_e8m0.shape[-1])
     M_i, N_i = blockscale_e8m0.shape
     M_o, N_o = sorted_ids.shape[0], N_i
-    assert (N_i // 2) % 2 == 0
+    # (N_i // 2) % 2 == 0 assertion removed: the kernel handles non-aligned
+    # scaleN (e.g. N_i=6 at TP=8) through load masking and output slicing.
     assert block_size % BLOCK_SIZE_M == 0
 
     blockscale_e8m0_sorted = torch.empty(
