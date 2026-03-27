@@ -364,6 +364,8 @@ def kernel_unified_attention_2d(
     acc = acc * one_over_L
     if out_scale_ptr is not None:
         acc = acc / tl.load(out_scale_ptr)
+
+    if output_ptr.type.element_ty.is_fp8():
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
 
     output_offset = (
@@ -778,6 +780,8 @@ def reduce_segments(
 
     if out_scale_ptr is not None:
         acc = acc / tl.load(out_scale_ptr)
+
+    if output_ptr.type.element_ty.is_fp8():
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
 
     # write result
