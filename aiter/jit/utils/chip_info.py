@@ -30,6 +30,19 @@ GFX_MAP = {
     18: "gfx1250",
 }
 
+# Maps gfx arch to the default (SPX / full-GPU) CU count used when no live GPU is
+# present at build time (e.g. CI nodes with GPU_ARCHS set but no device visible).
+# For live GPU builds, get_cu_num() is used instead and correctly reflects the
+# actual visible CU count, including non-SPX partition modes (DPX / QPX / CPX)
+# and binned variants (e.g. MI308X is gfx942 but has fewer CUs than MI300X).
+# If building without a GPU for a binned or partitioned target, set CU_NUM
+# explicitly alongside GPU_ARCHS to override the default here.
+# Extend this table when adding support for new GPU targets.
+GFX_CU_NUM_MAP = {
+    "gfx942": 304,   # MI300X (SPX, full GPU); MI308X shares gfx942 — use CU_NUM override
+    "gfx950": 256,   # MI350
+}
+
 
 @functools.lru_cache(maxsize=1)
 def _detect_native() -> list[str]:
@@ -144,6 +157,43 @@ def get_cu_num_custom_op() -> int:
 def get_cu_num():
     cu_num = get_cu_num_custom_op()
     return cu_num
+
+
+def get_build_targets() -> list[tuple[str, int]]:
+    """Return (gfx, cu_num) pairs to compile kernels for.
+
+    Used by gen_instances.py in all CK GEMM modules to filter the tuning CSV
+    to exactly the right set of kernels for the target GPU(s).
+
+    Priority:
+      1. GPU_ARCHS env var set → use those targets with GFX_CU_NUM_MAP for
+         cu_num (intended for CI nodes without a live GPU). Set CU_NUM alongside
+         GPU_ARCHS to override the default cu_num for binned or partitioned GPUs.
+      2. Live GPU detected → use actual (gfx, cu_num) from rocminfo, which
+         correctly reflects partition mode and binned variants.
+      3. Neither → raise RuntimeError with a clear message.
+    """
+    gfx_env = os.getenv("GPU_ARCHS")
+    if gfx_env:
+        targets = []
+        for gfx in [g.strip() for g in gfx_env.split(";") if g.strip()]:
+            if gfx not in GFX_CU_NUM_MAP:
+                raise RuntimeError(
+                    f"Unknown gfx '{gfx}' in GPU_ARCHS — add it to "
+                    f"GFX_CU_NUM_MAP in chip_info.py. Known targets: "
+                    f"{list(GFX_CU_NUM_MAP.keys())}"
+                )
+            cu_num = int(os.getenv("CU_NUM", GFX_CU_NUM_MAP[gfx]))
+            targets.append((gfx, cu_num))
+        return targets
+
+    try:
+        return [(get_gfx(), get_cu_num())]
+    except Exception as e:
+        raise RuntimeError(
+            "No GPU detected and GPU_ARCHS is not set. "
+            "Set GPU_ARCHS=gfx942 (or similar) to build without a GPU."
+        ) from e
 
 
 def _get_pci_chip_id(device_id=0):
