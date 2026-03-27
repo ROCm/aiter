@@ -363,25 +363,26 @@ def run_benchmark(custom, args):
 
             q_input, k_input, v_input = q_fp8, k_fp8, v_fp8
 
-        fn = lambda: unified_attention(
-            q=q_input,
-            k=k_input,
-            v=v_input,
-            out=output,
-            cu_seqlens_q=cu_query_lens,
-            seqused_k=kv_lens,
-            max_seqlen_q=max_query_len,
-            max_seqlen_k=max_kv_len,
-            softmax_scale=scale,
-            causal=causal,
-            window_size=window_size,
-            block_table=block_tables,
-            softcap=soft_cap,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            sinks=sinks,
-        )
+        def fn():
+            return unified_attention(
+                q=q_input,
+                k=k_input,
+                v=v_input,
+                out=output,
+                cu_seqlens_q=cu_query_lens,
+                seqused_k=kv_lens,
+                max_seqlen_q=max_query_len,
+                max_seqlen_k=max_kv_len,
+                softmax_scale=scale,
+                causal=causal,
+                window_size=window_size,
+                block_table=block_tables,
+                softcap=soft_cap,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                sinks=sinks,
+            )
 
         ms = triton.testing.do_bench(fn)
 
