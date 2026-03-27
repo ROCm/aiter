@@ -320,7 +320,9 @@ def parse_vgpr_usage(file_path, table_start="result-table-name"):
     print("\n".join(vgpr_info))
     table = PrettyTable()
     raw_field_names = re.split(r" {1,}", table_lines[0].strip())
-    table.field_names = [t for t in raw_field_names if not (t.startswith("(") and t.endswith(")"))]
+    table.field_names = [
+        t for t in raw_field_names if not (t.startswith("(") and t.endswith(")"))
+    ]
     [table.add_row(line.split()[1:]) for line in table_lines[1:]]
     print(table)
 

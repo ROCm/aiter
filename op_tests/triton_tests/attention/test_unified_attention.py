@@ -105,7 +105,7 @@ def test_triton_unified_attn(
     block_size: int,
     soft_cap: Optional[float],
     num_blocks: int,
-    q_dtype: Optional[torch.dtype],
+    q_dtype: Optional[torch.dtype], # quant dtype
 ) -> None:
     if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
         pytest.skip("block size must be at least 32 for fp8")
@@ -152,15 +152,21 @@ def test_triton_unified_attn(
     k_descale = None
     v_descale = None
     if q_dtype is not None:
-        # QKV are drawn from N(0, 1): no need for a fp8 scaling factor
-        maybe_quantized_query = query.to(q_dtype)
-        maybe_quantized_key_cache = key_cache.to(q_dtype)
-        maybe_quantized_value_cache = value_cache.to(q_dtype)
+        q_dtype_max = torch.finfo(q_dtype).max
 
-        scale_shape = (num_seqs, num_kv_heads)
-        q_descale = None  # Not yet supported
-        k_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
-        v_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
+        q_abs_max = query.abs().amax().clamp(min=1e-9)
+        q_descale = (q_abs_max / q_dtype_max).to(torch.float32).unsqueeze(0).cuda()
+        q_q = (query * (q_dtype_max / q_abs_max)).to(q_dtype)
+
+        k_abs_max = key_cache.abs().amax().clamp(min=1e-9)
+        k_descale = (k_abs_max / q_dtype_max).to(torch.float32).unsqueeze(0).cuda()
+        k_q = (key_cache * (q_dtype_max / k_abs_max)).to(q_dtype)
+
+        v_abs_max = value_cache.abs().amax().clamp(min=1e-9)
+        v_descale = (v_abs_max / q_dtype_max).to(torch.float32).unsqueeze(0).cuda()
+        v_q = (value_cache * (q_dtype_max / v_abs_max)).to(q_dtype)
+
+        maybe_quantized_query, maybe_quantized_key_cache, maybe_quantized_value_cache = q_q, k_q, v_q
 
     unified_attention(
         q=maybe_quantized_query,
