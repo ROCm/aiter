@@ -56,7 +56,7 @@ def get_tuned_gemm_list(tuned_gemm_file):
         tunedf = pd.read_csv(tuned_gemm_file)
     else:
         tunedf = pd.DataFrame(
-            columns=["cu_num", "M", "N", "K", "kernelId", "splitK", "us", "kernelName"]
+            columns=["gfx", "cu_num", "M", "N", "K", "kernelId", "splitK", "us", "kernelName"]
         )
     return tunedf
 
@@ -124,6 +124,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
         shape_grouped = False
         errRatio = args.errRatio
         cu_num = self.get_cu_num()
+        gfx = self.get_gfx()
 
         task = []
         tasks_data = []
@@ -140,7 +141,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
 
             kernels_num = len(kernels_list)
             total_kernel_nums = 0
-            info_keys = (cu_num, M, N, K, q_dtype_w)
+            info_keys = (gfx, cu_num, M, N, K, q_dtype_w)
 
             for j in range(kernels_num):
                 kernel = kernels_list[j]
@@ -199,7 +200,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
 if __name__ == "__main__":
 
     ## use default key and resultList with q_dtype_w support
-    key = ["cu_num", "M", "N", "K", "q_dtype_w"]
+    key = ["gfx", "cu_num", "M", "N", "K", "q_dtype_w"]
     resultList = [
         "kernelId",
         "splitK",

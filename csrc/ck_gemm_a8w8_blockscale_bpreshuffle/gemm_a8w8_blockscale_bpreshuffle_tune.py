@@ -92,7 +92,7 @@ class Gemma8W8BlockScaleBPreShuffleTuner(GemmCommonTuner):
         return x, weight_shuffle, x_scale_t, w_scale, out, weight, x_scale
 
     def get_ck_tasks(self, info_keys, useSplitK, seed):
-        cu_num, M, N, K = info_keys
+        gfx, cu_num, M, N, K = info_keys
         kernels_num = len(kernels_list)
         gemm_a8w8_data_idx = [0, 1, 2, 3, 4]
         ref_data_idx = [0, 5, 6, 3]
@@ -113,7 +113,7 @@ class Gemma8W8BlockScaleBPreShuffleTuner(GemmCommonTuner):
                 else 0
             )
             for splitK in range(maxsplitK + 1):
-                info = ((cu_num, M, N, K), i, splitK, "")
+                info = (info_keys, i, splitK, "")
                 task.append(
                     (
                         info,
@@ -145,6 +145,7 @@ class Gemma8W8BlockScaleBPreShuffleTuner(GemmCommonTuner):
         shape_grouped = False
         mp_num = args.mp
         cu_num = self.get_cu_num()
+        gfx = self.get_gfx()
         task = []
         tasks_data = []
 

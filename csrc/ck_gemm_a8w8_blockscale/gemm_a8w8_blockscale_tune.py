@@ -201,7 +201,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         seed,
         preshuffleB,
     ):
-        cu_num, M, N, K = info_keys
+        gfx, cu_num, M, N, K = info_keys
         # kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
         kernel_list = {
             k: v
@@ -267,7 +267,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         seed,
         preshuffleB,
     ):
-        cu_num, M, N, K = info_keys
+        gfx, cu_num, M, N, K = info_keys
         kernel_list = (
             candidate_kernels_bpreshuffle_dict
             if preshuffleB
@@ -332,6 +332,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         shape_grouped = False
         errRatio = args.errRatio
         cu_num = self.get_cu_num()
+        gfx = self.get_gfx()
         task = []
         tasks_data = []  # [(kernel_nums, datas)]
         seed = 10000
@@ -342,7 +343,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             seed = seed + 1
             total_kernel_nums = 0
             # kernels_num = len(candidate_kernels_dict)
-            info_keys = (cu_num, M, N, K)
+            info_keys = (gfx, cu_num, M, N, K)
             if args.libtype == "ck" or args.libtype == "both":
                 task.extend(
                     self.get_gemm_a8w8_blockscale_tune_task(
@@ -422,7 +423,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
 
 
 if __name__ == "__main__":
-    key = ["cu_num", "M", "N", "K"]
+    key = ["gfx", "cu_num", "M", "N", "K"]
     resultList = [
         "libtype",
         "kernelId",
