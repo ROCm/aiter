@@ -571,7 +571,7 @@ def main():
 
     assert (
         args.dtype in arg_to_torch_dtype
-    ), "Only fp16, bf16 and f32 types currently supported."
+    ), "Only fp16, bf16 and fp32 types currently supported."
 
     assert (
         args.qlayout in supported_qlayouts()
