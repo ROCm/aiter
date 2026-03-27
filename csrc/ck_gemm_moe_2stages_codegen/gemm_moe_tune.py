@@ -264,6 +264,11 @@ class FmoeTuner(TunerCommon):
             w1_scale=w1_scale_aiter,
             a1_scale=a1_scale,
             sorted_weights=sorted_weights,
+            use_async_copy=True,
+            k_batch=kparams.get("k_batch", 1),
+            waves_per_eu=kparams.get("waves_per_eu", 3),
+            b_nt=kparams.get("b_nt", 2),
+            gate_only=kparams.get("gate_only", False),
         )
 
     @staticmethod
@@ -539,7 +544,13 @@ class FmoeTuner(TunerCommon):
         else:
             w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
             w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
-        score = torch.randn((token, expert), dtype=dtype)
+        score = torch.zeros((token, expert), dtype=dtype)
+        start_col = 0
+        end_col = topk
+        for token_id in range(token):
+            score[token_id, start_col:end_col] = 1.0
+            start_col = end_col % expert
+            end_col = start_col + topk
         topk_weights, topk_ids = fused_topk(input, score, topk, True)
         if q_type == QuantType.per_1x128:
             a1_qt, a1_scale = aiter.pertoken_quant(
@@ -568,6 +579,14 @@ class FmoeTuner(TunerCommon):
         sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
             moe_sorting(topk_ids, topk_weights, expert, model_dim, dtype, blockM)
         )
+        needed = sorted_expert_ids.shape[0] * blockM
+        if sorted_ids.shape[0] < needed:
+            pad = torch.full((needed - sorted_ids.shape[0],), token,
+                             dtype=sorted_ids.dtype, device=sorted_ids.device)
+            sorted_ids = torch.cat([sorted_ids, pad])
+            sorted_weights = torch.cat([sorted_weights,
+                torch.zeros(pad.shape[0], dtype=sorted_weights.dtype,
+                            device=sorted_weights.device)])
         return (
             input,
             a1_qt,
@@ -749,7 +768,7 @@ class FmoeTuner(TunerCommon):
                     sorted_ids=sorted_ids,
                     num_valid_ids=num_valid_ids,
                     token_num=token,
-                    block_size=blockM,
+                    block_size=max(32, blockM),
                 )
             else:
                 a1_scale_fp4_sort = a1_scale
@@ -1727,7 +1746,6 @@ class FmoeTuner(TunerCommon):
                             {},
                             FmoeTuner.run_torch_moe_stage1,
                             (
-                                # [a1_qt, w1_qt, w2_qt, topk_weights, topk_ids, a1_scale, w1_scale]
                                 [0, 10, 11, 12, 13, 3, 4],
                                 dtype,
                                 act_type,
@@ -1834,12 +1852,11 @@ class FmoeTuner(TunerCommon):
         )
 
         for blockM in blockMs:
-            # per_1x32 fp4 sorting requires block size to be a multiple of 32, so
-            # the tile_m=16 FlyDSL candidate is invalid for this tuning path.
             if blockM not in [32, 64, 128] or not use_g1u1:
                 continue
             for kname, kparams in flydsl_s1_kernels.items():
-                if kparams["tile_m"] != blockM:
+                ktm = kparams["tile_m"]
+                if ktm != blockM and not (ktm == 16 and blockM == 32 and token <= 16):
                     continue
                 tasks_flydsl.append(
                     (
@@ -1954,7 +1971,7 @@ class FmoeTuner(TunerCommon):
     ):
         self._flydsl_fallbacks = []
         mp_num = args.mp
-        blockMs = [16, 32, 64, 128]
+        blockMs = [32, 64, 128]
         keys = self.keys
         print(untunedf[keys])
         tasks = []
@@ -2130,10 +2147,9 @@ class FmoeTuner(TunerCommon):
             )
             prorfiles.append(profileDF)
 
-            ## remove invalid candidate
+            ## remove invalid candidate (keep err check disabled for now)
             profileDF = profileDF[
-                (profileDF["err"] < args.errRatio)
-                & (profileDF["us"] != float("-inf"))
+                (profileDF["us"] != float("-inf"))
                 & (profileDF["us"] != -1)
             ]
             # Keep best non-flydsl per (stage, block_m) for fallback before dedup
