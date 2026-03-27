@@ -708,6 +708,7 @@ def _flydsl_stage2_wrapper(
         w2_scale=w2_scale,
         a2_scale=a2_scale,
         sorted_weights=sorted_weights,
+        sort_block_m=parsed.get("sort_block_m", 0),
     )
 
 

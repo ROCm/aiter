@@ -2224,6 +2224,11 @@ def compile_mixed_moe_gemm2(
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
 
+    persist_m:
+      - > 0: legacy mode -- each CTA processes exactly persist_m consecutive M tiles.
+      - <= 0: **persistent mode** -- grid_y = cu_num (auto-detected), each CTA
+        round-robins over M tiles with stride cu_num.
+
     a_dtype:
       - "fp8": A2 is fp8
       - "fp16": A2 is fp16 (caller uses tile_k halved vs fp8 to match MFMA K halving)
@@ -2423,11 +2428,19 @@ def compile_mixed_moe_gemm2(
     # IMPORTANT: module name participates in the compiler cache key.
     # Dynamic-shape variant: safe to reuse across (tokens/sorted_size/size_expert_ids) at runtime.
     # Keep a distinct ABI tag so the compile cache never mixes with historical signatures.
+    _persistent = persist_m <= 0
+    if _persistent:
+        from aiter.jit.utils.chip_info import get_cu_num
+
+        _cu_num = get_cu_num()
+    else:
+        _cu_num = 0
     _sbm_tag = "" if _sort_block_m == tile_m else f"_sbm{_sort_block_m}"
+    _pm_tag = f"_persist_cu{_cu_num}" if _persistent else f"_pm{persist_m}"
     module_name = (
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"_vscale_fix3_pm{persist_m}{_sbm_tag}"
+        f"_vscale_fix3{_pm_tag}{_sbm_tag}"
     ).replace("-", "_")
     # -- LDS sizing (pure Python; no MLIR Context needed) ---------------------
     # Reuse a single allocation for both:
@@ -2716,26 +2729,47 @@ def compile_mixed_moe_gemm2(
                 else None
             )
 
-            # ---- persist_m loop (with incremental expert B-base) ----
-            _PERSIST_M = persist_m
+            # ---- persist loop ----
             _c0_p = arith.constant(0, index=True)
             _c1_p = arith.constant(1, index=True)
-            _c_pm = arith.constant(_PERSIST_M, index=True)
-            # iter_args: [prev_expert_i32, prev_expert_b_base]
-            _init_prev_expert = arith.constant(0, type=T.i32)
-            _init_prev_b_base = arith.constant(0, index=True)
-            _for_persist = scf.ForOp(
-                _c0_p,
-                _c_pm,
-                _c1_p,
-                [_init_prev_expert, _init_prev_b_base],
-            )
+
+            if _persistent:
+                # Persistent mode: round-robin over M tiles with stride cu_num.
+                # grid_y = cu_num, each CTA handles tiles:
+                #   bx_persist, bx_persist + cu_num, bx_persist + 2*cu_num, ...
+                # Upper bound = ceil(num_valid / tile_m / cu_num) iterations.
+                _c_cu = arith.constant(_cu_num, index=True)
+                _c_tm_p = arith.constant(tile_m, index=True)
+                _num_valid_idx = arith.index_cast(ir.IndexType.get(), num_valid_i32)
+                _total_m_tiles = (_num_valid_idx + _c_tm_p - _c1_p) / _c_tm_p
+                _iters_ub = (_total_m_tiles + _c_cu - _c1_p) / _c_cu
+                _i1 = ir.IntegerType.get_signless(1)
+                _init_active = arith.constant(1, type=_i1)
+                _for_persist = scf.ForOp(_c0_p, _iters_ub, _c1_p, [_init_active])
+            else:
+                # Legacy mode: fixed persist_m consecutive tiles.
+                _c_pm = arith.constant(persist_m, index=True)
+                _init_prev_expert = arith.constant(0, type=T.i32)
+                _init_prev_b_base = arith.constant(0, index=True)
+                _for_persist = scf.ForOp(
+                    _c0_p,
+                    _c_pm,
+                    _c1_p,
+                    [_init_prev_expert, _init_prev_b_base],
+                )
+
             _for_ip = ir.InsertionPoint(_for_persist.body)
             _for_ip.__enter__()
             _mi_p = _for_persist.induction_variable
-            _prev_expert_i32 = _for_persist.inner_iter_args[0]
-            _prev_expert_b_base = _for_persist.inner_iter_args[1]
-            bx = bx_persist * _c_pm + _mi_p
+
+            if _persistent:
+                _still_active = _for_persist.inner_iter_args[0]
+                bx = bx_persist + _mi_p * arith.constant(_cu_num, index=True)
+            else:
+                _prev_expert_i32 = _for_persist.inner_iter_args[0]
+                _prev_expert_b_base = _for_persist.inner_iter_args[1]
+                bx = bx_persist * arith.constant(persist_m, index=True) + _mi_p
+
             bx_m = bx * arith.constant(tile_m, index=True)
 
             # Early-exit guard: skip garbage expert blocks beyond `num_valid_ids`.
@@ -2751,11 +2785,19 @@ def compile_mixed_moe_gemm2(
                 CmpIPredicate.ult, expert_i32, arith.constant(experts, type=T.i32)
             )
 
-            # Incremental expert B-base: delta = (cur - prev) * stride
-            _delta_expert = arith.subi(expert_i32, _prev_expert_i32)
-            _delta_expert_idx = arith.index_cast(ir.IndexType.get(), _delta_expert)
-            _delta_b = _delta_expert_idx * arith.constant(_expert_b_stride, index=True)
-            _expert_b_base = _prev_expert_b_base + _delta_b
+            if _persistent:
+                # Absolute B-base: no cross-iteration state needed.
+                _expert_b_base = expert_idx * arith.constant(
+                    _expert_b_stride, index=True
+                )
+            else:
+                # Legacy incremental B-base: delta = (cur - prev) * stride
+                _delta_expert = arith.subi(expert_i32, _prev_expert_i32)
+                _delta_expert_idx = arith.index_cast(ir.IndexType.get(), _delta_expert)
+                _delta_b = _delta_expert_idx * arith.constant(
+                    _expert_b_stride, index=True
+                )
+                _expert_b_base = _prev_expert_b_base + _delta_b
 
             # Early-exit: if the first row of this tile is a sentinel (all-padding tile),
             # skip the entire GEMM.
@@ -3039,6 +3081,35 @@ def compile_mixed_moe_gemm2(
                         b_tile.append((packs0, packs1))
                     return b_tile
 
+                _b_split_enabled = k_unroll >= 2
+                _b_split_ku = k_unroll // 2 if _b_split_enabled else k_unroll
+
+                def load_b_tile_lo(base_k):
+                    """Load first half of B tile (ku < _b_split_ku)."""
+                    b_tile = []
+                    for ku in range_constexpr(_b_split_ku):
+                        packs0 = []
+                        packs1 = []
+                        for ni in range_constexpr(num_acc_n):
+                            b0, b1 = load_b_packs_k64(base_k, ku, ni)
+                            packs0.append(b0)
+                            packs1.append(b1)
+                        b_tile.append((packs0, packs1))
+                    return b_tile
+
+                def load_b_tile_hi(base_k):
+                    """Load second half of B tile (ku >= _b_split_ku)."""
+                    b_tile = []
+                    for ku in range_constexpr(_b_split_ku, k_unroll):
+                        packs0 = []
+                        packs1 = []
+                        for ni in range_constexpr(num_acc_n):
+                            b0, b1 = load_b_packs_k64(base_k, ku, ni)
+                            packs0.append(b0)
+                            packs1.append(b1)
+                        b_tile.append((packs0, packs1))
+                    return b_tile
+
                 def load_scale(arg_scale, rsrc, scale_info, ku, mni):
                     k_lane = lane_div_16
                     n_lane = lane_mod_16
@@ -3192,7 +3263,14 @@ def compile_mixed_moe_gemm2(
                     prefetch_epilogue: bool = False,
                     a0_prefetch=None,
                     a1_prefetch=None,
+                    b_hi_loader=None,
                 ):
+                    if b_hi_loader is not None:
+                        b_tile_full = [None] * k_unroll
+                        for i in range_constexpr(_b_split_ku):
+                            b_tile_full[i] = b_tile_in[i]
+                    else:
+                        b_tile_full = b_tile_in
                     acc_list = list(acc_in)
                     mfma_res_ty = vec4_i32 if is_int8 else vec4_f32
 
@@ -3242,8 +3320,25 @@ def compile_mixed_moe_gemm2(
                         v4 = vector.from_elements(vec4_i64, [x0, x1, x2, x3])
                         return vector.bitcast(vec8_i32, v4)
 
-                    # fp4 path
-                    for ku128 in range_constexpr(k_unroll_packed):
+                    # fp4 path -- single k_idx loop [0, k_unroll).
+                    # b_hi load is issued at the very start so all k_unroll
+                    # MFMAs can overlap the VMEM latency.
+                    _pack_K_shift = (pack_K - 1).bit_length()
+                    _pack_K_mask = pack_K - 1
+
+                    if b_hi_loader is not None:
+                        _b_hi = b_hi_loader()
+                        for _bhi_i in range_constexpr(len(_b_hi)):
+                            b_tile_full[_b_split_ku + _bhi_i] = _b_hi[_bhi_i]
+
+                    for k_idx in range_constexpr(k_unroll):
+                        ku128 = k_idx >> _pack_K_shift
+                        ikxdl = k_idx & _pack_K_mask
+
+                        b_packs0, b_packs1 = b_tile_full[k_idx]
+
+                        col_base = col_offset_base + (k_idx * 128) // a_elem_vec_pack
+
                         for mi in range_constexpr(m_repeat_packed):
                             a_scale_i32 = a_scale[ku128 * m_repeat_packed + mi]
                             a_scale_val = vector.extract(
@@ -3264,77 +3359,68 @@ def compile_mixed_moe_gemm2(
                                     b_scale_val = arith.shrui(
                                         b_scale_val, _n_scale_shift_i32
                                     )
-                                for ikxdl in range_constexpr(pack_K):
-                                    k_idx = ku128 * pack_K + ikxdl
 
-                                    b_packs0, b_packs1 = b_tile_in[k_idx]
+                                for imxdl in range_constexpr(pack_M):
+                                    col_base0 = col_base
+                                    mi_idx = mi * pack_M + imxdl
+                                    mi_val = arith.constant(mi_idx * 16, index=True)
+                                    curr_row_a_lds = row_a_lds + mi_val
 
-                                    col_base = (
-                                        col_offset_base
-                                        + (k_idx * 128) // a_elem_vec_pack
-                                    )
+                                    if (
+                                        (a0_prefetch is not None)
+                                        and (k_idx == 0)
+                                        and (mi_idx == 0)
+                                    ):
+                                        a0, a1 = a0_prefetch
+                                    elif (
+                                        (a1_prefetch is not None)
+                                        and (k_idx == 1)
+                                        and (mi_idx == 0)
+                                    ):
+                                        a0, a1 = a1_prefetch
+                                    else:
+                                        a0, a1 = lds_load_packs_k64(
+                                            curr_row_a_lds, col_base0, lds_base
+                                        )
 
-                                    for imxdl in range_constexpr(pack_M):
-                                        col_base0 = col_base
-                                        mi_idx = mi * pack_M + imxdl
-                                        mi_val = arith.constant(mi_idx * 16, index=True)
-                                        curr_row_a_lds = row_a_lds + mi_val
+                                    if is_f8_a:
+                                        col_base1 = col_base + 64
+                                        a2, a3 = lds_load_packs_k64(
+                                            curr_row_a_lds, col_base1, lds_base
+                                        )
+                                        a128 = pack_i64x4_to_i32x8(a0, a1, a2, a3)
+                                    else:
+                                        a128 = pack_i64x4_to_i32x8(
+                                            a0, a1, c0_i64, c0_i64
+                                        )
 
-                                        if (
-                                            (a0_prefetch is not None)
-                                            and (k_idx == 0)
-                                            and (mi_idx == 0)
-                                        ):
-                                            a0, a1 = a0_prefetch
-                                        elif (
-                                            (a1_prefetch is not None)
-                                            and (k_idx == 1)
-                                            and (mi_idx == 0)
-                                        ):
-                                            a0, a1 = a1_prefetch
-                                        else:
-                                            a0, a1 = lds_load_packs_k64(
-                                                curr_row_a_lds, col_base0, lds_base
+                                    for inxdl in range_constexpr(pack_N):
+                                        ni_idx = ni * pack_N + inxdl
+
+                                        b0 = b_packs0[ni_idx]
+                                        b1 = b_packs1[ni_idx]
+                                        b128 = pack_i64x4_to_i32x8(
+                                            b0, b1, c0_i64, c0_i64
+                                        )
+
+                                        acc_idx = mi_idx * num_acc_n + ni_idx
+                                        rocdl.sched_barrier(0)
+                                        acc_list[acc_idx] = (
+                                            rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                                                mfma_res_ty,
+                                                [
+                                                    a128,
+                                                    b128,
+                                                    acc_list[acc_idx],
+                                                    cbsz,
+                                                    blgp,
+                                                    ikxdl * _scale_pack_m + imxdl,
+                                                    a_scale_val,
+                                                    ikxdl * _scale_pack_n + inxdl,
+                                                    b_scale_val,
+                                                ],
                                             )
-
-                                        if is_f8_a:
-                                            col_base1 = col_base + 64
-                                            a2, a3 = lds_load_packs_k64(
-                                                curr_row_a_lds, col_base1, lds_base
-                                            )
-                                            a128 = pack_i64x4_to_i32x8(a0, a1, a2, a3)
-                                        else:
-                                            a128 = pack_i64x4_to_i32x8(
-                                                a0, a1, c0_i64, c0_i64
-                                            )
-
-                                        for inxdl in range_constexpr(pack_N):
-                                            ni_idx = ni * pack_N + inxdl
-
-                                            b0 = b_packs0[ni_idx]
-                                            b1 = b_packs1[ni_idx]
-                                            b128 = pack_i64x4_to_i32x8(
-                                                b0, b1, c0_i64, c0_i64
-                                            )
-
-                                            acc_idx = mi_idx * num_acc_n + ni_idx
-                                            rocdl.sched_barrier(0)
-                                            acc_list[acc_idx] = (
-                                                rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                                                    mfma_res_ty,
-                                                    [
-                                                        a128,
-                                                        b128,
-                                                        acc_list[acc_idx],
-                                                        cbsz,
-                                                        blgp,
-                                                        ikxdl * _scale_pack_m + imxdl,
-                                                        a_scale_val,
-                                                        ikxdl * _scale_pack_n + inxdl,
-                                                        b_scale_val,
-                                                    ],
-                                                )
-                                            )
+                                        )
 
                     return acc_list, epilogue_pf
 
@@ -3400,7 +3486,10 @@ def compile_mixed_moe_gemm2(
 
                 # Prologue -- B-first.
                 k0 = arith.index(0)
-                b_cur = load_b_tile(k0)
+                if _b_split_enabled:
+                    b_cur = load_b_tile_lo(k0)
+                else:
+                    b_cur = load_b_tile(k0)
                 a_scale_pong, b_scale_pong = prefetch_ab_scale_tile(
                     _k_base(0), _k_shift_bits(0)
                 )
@@ -3454,16 +3543,27 @@ def compile_mixed_moe_gemm2(
 
                 c2_tile_k = arith.constant(tile_k * 2, index=True)
                 b_pong = b_cur
+                k0_pong_bk = k0
+
                 # Only emit the scf.for when there are actually iterations to run.
                 # When k_main2_py == 0 the loop body is empty; emitting an scf.for
                 # would create a region whose internal SSA values cannot be used
                 # by the post-loop tail code.
+                def _make_b_hi_loader(base_k):
+                    """Create a b_hi_loader callable for a given base_k."""
+                    return lambda _bk=base_k: load_b_tile_hi(_bk)
+
                 if k_main2_py > 0:
                     for k_iv_py in range_constexpr(0, k_main2_py, tile_k * 2):
-                        k_iv = k_iv_py
+                        k_iv = arith.index(k_iv_py)
                         next_k1 = k_iv + tile_k
+                        next_k1_bk = next_k1 // 2
                         x_regs_ping = load_x_tile(next_k1)
-                        b_ping = load_b_tile(next_k1 // 2)
+                        b_ping_lo = (
+                            load_b_tile_lo(next_k1_bk)
+                            if _b_split_enabled
+                            else load_b_tile(next_k1_bk)
+                        )
                         a_scale_ping, b_scale_ping = prefetch_ab_scale_tile(
                             _k_base(next_k1), _k_shift_bits(next_k1)
                         )
@@ -3476,6 +3576,11 @@ def compile_mixed_moe_gemm2(
                             b_scale_pong,
                             a0_prefetch=a0_prefetch_pong,
                             a1_prefetch=a1_prefetch_pong,
+                            b_hi_loader=(
+                                _make_b_hi_loader(k0_pong_bk)
+                                if _b_split_enabled
+                                else None
+                            ),
                         )
                         store_x_tile_to_lds(x_regs_ping, lds_base_ping)
                         # hot_loop_scheduler()
@@ -3493,21 +3598,32 @@ def compile_mixed_moe_gemm2(
 
                         next_k2 = k_iv + c2_tile_k
                         next_k2_py = k_iv_py + tile_k * 2
+                        next_k2_bk = next_k2 // 2
                         x_regs_pong = load_x_tile(next_k2)
-                        b_pong = load_b_tile(next_k2 // 2)
+                        b_pong = (
+                            load_b_tile_lo(next_k2_bk)
+                            if _b_split_enabled
+                            else load_b_tile(next_k2_bk)
+                        )
                         a_scale_pong, b_scale_pong = prefetch_ab_scale_tile(
                             _k_base(next_k2_py), _k_shift_bits(next_k2_py)
                         )
 
                         acc, _ = compute_tile(
                             acc,
-                            b_ping,
+                            b_ping_lo,
                             lds_base_ping,
                             a_scale_ping,
                             b_scale_ping,
                             a0_prefetch=a0_prefetch_ping,
                             a1_prefetch=a1_prefetch_ping,
+                            b_hi_loader=(
+                                _make_b_hi_loader(next_k1_bk)
+                                if _b_split_enabled
+                                else None
+                            ),
                         )
+                        k0_pong_bk = next_k2_bk
                         store_x_tile_to_lds(x_regs_pong, lds_base_pong)
                         # hot_loop_scheduler()
                         gpu.barrier()
@@ -3533,6 +3649,9 @@ def compile_mixed_moe_gemm2(
                         a0_prefetch=a0_prefetch_pong,
                         a1_prefetch=a1_prefetch_pong,
                         prefetch_epilogue=True,
+                        b_hi_loader=(
+                            _make_b_hi_loader(k0_pong_bk) if _b_split_enabled else None
+                        ),
                     )
 
                 else:
@@ -3541,8 +3660,13 @@ def compile_mixed_moe_gemm2(
                     k_tail1_py = (
                         int(inter_dim) + tile_k - 1
                     ) // tile_k * tile_k - tile_k
+                    k_tail1_bk = k_tail1 // 2
                     x_regs_ping = load_x_tile(k_tail1)
-                    b_ping = load_b_tile(k_tail1 // 2)
+                    b_ping_lo = (
+                        load_b_tile_lo(k_tail1_bk)
+                        if _b_split_enabled
+                        else load_b_tile(k_tail1_bk)
+                    )
                     a_scale_ping, b_scale_ping = prefetch_ab_scale_tile(
                         _k_base(k_tail1_py), _k_shift_bits(k_tail1_py)
                     )
@@ -3555,6 +3679,9 @@ def compile_mixed_moe_gemm2(
                         b_scale_pong,
                         a0_prefetch=a0_prefetch_pong,
                         a1_prefetch=a1_prefetch_pong,
+                        b_hi_loader=(
+                            _make_b_hi_loader(k0_pong_bk) if _b_split_enabled else None
+                        ),
                     )
 
                     store_x_tile_to_lds(x_regs_ping, lds_base_ping)
@@ -3572,13 +3699,16 @@ def compile_mixed_moe_gemm2(
                     )
                     acc, epilogue_pf = compute_tile(
                         acc,
-                        b_ping,
+                        b_ping_lo,
                         lds_base_ping,
                         a_scale_ping,
                         b_scale_ping,
                         a0_prefetch=a0_prefetch_ping,
                         a1_prefetch=a1_prefetch_ping,
                         prefetch_epilogue=True,
+                        b_hi_loader=(
+                            _make_b_hi_loader(k_tail1_bk) if _b_split_enabled else None
+                        ),
                     )
 
                 # ---------------- Epilogue: LDS CShuffle + atomic half2 (x2) ----------------
@@ -3773,14 +3903,30 @@ def compile_mixed_moe_gemm2(
                 )
 
             _all_valid = arith.andi(blk_valid, arith.andi(exp_valid, tile_has_tokens))
-            _if_valid = scf.IfOp(_all_valid)
-            with ir.InsertionPoint(_if_valid.then_block):
-                _moe_gemm2_then_body()
-                scf.YieldOp([])
 
-            gpu.barrier()
-            # Yield updated expert state for next persist_m iteration.
-            scf.YieldOp([expert_i32, _expert_b_base])
+            if _persistent:
+                # Short-circuit: once bx_m >= num_valid_ids, all subsequent
+                # round-robin tiles are also invalid (monotonically increasing).
+                # Use _still_active iter_arg to skip the rest of the loop body.
+                _cur_active = arith.andi(_still_active, blk_valid)
+                _do_gemm = arith.andi(
+                    _cur_active, arith.andi(exp_valid, tile_has_tokens)
+                )
+                _if_valid = scf.IfOp(_do_gemm)
+                with ir.InsertionPoint(_if_valid.then_block):
+                    _moe_gemm2_then_body()
+                    scf.YieldOp([])
+
+                gpu.barrier()
+                scf.YieldOp([_cur_active])
+            else:
+                _if_valid = scf.IfOp(_all_valid)
+                with ir.InsertionPoint(_if_valid.then_block):
+                    _moe_gemm2_then_body()
+                    scf.YieldOp([])
+
+                gpu.barrier()
+                scf.YieldOp([expert_i32, _expert_b_base])
             _for_ip.__exit__(None, None, None)
 
     # -- Host launcher (flyc.jit + .launch) --------------------------------
@@ -3800,6 +3946,7 @@ def compile_mixed_moe_gemm2(
         use_cshuffle_epilog,
         persist_m,
         _sort_block_m,
+        _cu_num if _persistent else 0,
     )
 
     @flyc.jit
@@ -3828,12 +3975,15 @@ def compile_mixed_moe_gemm2(
 
         n_in = arith.index_cast(ir.IndexType.get(), i32_n_in.ir_value())
         gx = n_in / arith.constant(tile_n, index=True)
-        _c_pm_l = arith.constant(persist_m, index=True)
-        gy = (
-            arith.index_cast(ir.IndexType.get(), i32_size_expert_ids_in.ir_value())
-            + _c_pm_l
-            - arith.constant(1, index=True)
-        ) / _c_pm_l
+        if _persistent:
+            gy = arith.constant(_cu_num, index=True)
+        else:
+            _c_pm_l = arith.constant(persist_m, index=True)
+            gy = (
+                arith.index_cast(ir.IndexType.get(), i32_size_expert_ids_in.ir_value())
+                + _c_pm_l
+                - arith.constant(1, index=True)
+            ) / _c_pm_l
 
         moe_gemm2(
             arg_out,

@@ -4,6 +4,7 @@
 """FlyDSL MOE kernel management: naming, compilation, and high-level API."""
 
 import functools
+import re
 import os
 from typing import Dict, Optional
 from aiter.utility import dtypes
@@ -32,6 +33,8 @@ def _clear_stale_ir_context():
 
 _KERNEL_PARAMS: Dict[str, Dict] = {}
 
+_SBM_SUFFIX_RE = re.compile(r"_sbm(\d+)$")
+
 
 def flydsl_kernel_name(
     stage: int,
@@ -42,17 +45,29 @@ def flydsl_kernel_name(
     tile_n: int,
     tile_k: int,
     mode: str = "",
+    sort_block_m: int = 0,
 ) -> str:
-    """Construct kernel name: flydsl_moe{stage}_a{a}_w{b}_{out}_t{M}x{N}x{K}[_{mode}]."""
+    """Construct kernel name: flydsl_moe{stage}_a{a}_w{b}_{out}_t{M}x{N}x{K}[_{mode}][_sbm{S}]."""
     name = f"flydsl_moe{stage}_a{a_dtype}_w{b_dtype}_{out_dtype}_t{tile_m}x{tile_n}x{tile_k}"
     if mode:
         name += f"_{mode}"
+    if sort_block_m > 0 and sort_block_m != tile_m:
+        name += f"_sbm{sort_block_m}"
     return name
 
 
 def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
-    """Lookup kernel params by name (O(1))."""
-    return _KERNEL_PARAMS.get(name)
+    """Lookup kernel params by name (O(1)). Handles ``_sbm{N}`` suffix transparently."""
+    params = _KERNEL_PARAMS.get(name)
+    if params is not None:
+        return params
+    m = _SBM_SUFFIX_RE.search(name)
+    if m:
+        base_name = name[: m.start()]
+        params = _KERNEL_PARAMS.get(base_name)
+        if params is not None:
+            return {**params, "sort_block_m": int(m.group(1))}
+    return None
 
 
 def get_flydsl_stage1_kernels(
@@ -128,10 +143,10 @@ def get_flydsl_stage2_kernels(
         for tn in tile_ns:
             for tk in tile_ks:
                 for mode in modes:
-                    name = flydsl_kernel_name(
+                    base_name = flydsl_kernel_name(
                         2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
                     )
-                    kernels[name] = {
+                    base_params = {
                         "stage": 2,
                         "a_dtype": a_dtype,
                         "b_dtype": b_dtype,
@@ -141,6 +156,12 @@ def get_flydsl_stage2_kernels(
                         "tile_k": tk,
                         "mode": mode,
                         "MPerBlock": tm,
+                    }
+                    kernels[base_name] = base_params
+                    # Persistent variant: round-robin over M tiles, grid_y=cu_num.
+                    kernels[base_name + "_persist"] = {
+                        **base_params,
+                        "persist": True,
                     }
     return kernels
 
@@ -763,6 +784,7 @@ def flydsl_moe_stage2(
     a2_scale: Optional[torch.Tensor] = None,
     sorted_weights: Optional[torch.Tensor] = None,
     sort_block_m: int = 0,
+    persist: Optional[bool] = None,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -772,6 +794,8 @@ def flydsl_moe_stage2(
     sort_block_m: block_size used by moe_sorting / stage1. When 0 (default),
         assumed equal to tile_m. When set, stage2 can use a different tile_m
         from sorting/stage1.
+    persist: if True, use persistent round-robin mode (grid_y=cu_num);
+        if False, use legacy persist_m mode; if None, auto-select.
     """
 
     token_num = inter_states.shape[0]
@@ -810,8 +834,12 @@ def flydsl_moe_stage2(
     else:
         total_sorted = sorted_expert_ids.shape[0] * _sbm
         m_blocks = (total_sorted + tile_m - 1) // tile_m
-    # Auto-select persistent M: PM=4 for large batches (>16 M blocks), PM=1 for small
-    _persist_m = 4 if m_blocks > 256 else 1
+    if persist is True:
+        _persist_m = -1
+    elif persist is False:
+        _persist_m = 4 if m_blocks > 256 else 1
+    else:
+        _persist_m = -1 if m_blocks > 256 else 1
 
     tensor_api = _get_compiled_stage2(
         model_dim=model_dim,
