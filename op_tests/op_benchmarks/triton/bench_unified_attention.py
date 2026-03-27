@@ -9,7 +9,6 @@ import triton
 from aiter.ops.triton.attention.unified_attention import unified_attention
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_configs,
     print_vgpr,
     get_caller_name_no_ext,
 )
