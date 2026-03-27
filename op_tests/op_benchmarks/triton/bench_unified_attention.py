@@ -17,22 +17,7 @@ from op_tests.triton_tests.attention.test_unified_attention import ref_paged_att
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 
-def nonvarlen_benchmark_configs():
-    batch_sizes = [1, 4, 16]
-    N_HEADS = [16, 48]
-    seq_len_q = [1, 1024, 4096]
-    seq_len_k = [8192]
-    HEAD_DIM = 128
-    V_HEAD_DIM = HEAD_DIM
-    configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_q, seq_len_k))
-    configs = [
-        (batch_size, N_HEAD, N_HEAD, seq_len_q, seq_len_k, HEAD_DIM, V_HEAD_DIM)
-        for batch_size, N_HEAD, seq_len_q, seq_len_k in configs
-    ]
-    return configs
-
-
-def varlen_benchmark_configs():
+def default_benchmark_configs():
     batch_sizes = [1, 4, 8]
     N_HEADS = [16, 48]
     seq_len_q = [1, 1024, 4096]
@@ -45,45 +30,6 @@ def varlen_benchmark_configs():
         for batch_size, N_HEAD, seq_len_q, seq_len_k in configs
     ]
     return configs
-
-
-def model_benchmark_configs(args):
-    config_file = args.model_configs
-    configs = get_model_configs(config_path=config_file, models=args.model)
-    fa_configs = []
-    batch_size = args.b if args.b else 1
-
-    for model_name, config in configs.items():
-        HQ = config["num_attention_heads"]
-        HK = (
-            HQ
-            if config["num_key_value_heads"] is None
-            else config["num_key_value_heads"]
-        )
-        N_CTX_Q = args.sq if args.sq else [2**i for i in range(1, 14)]
-        N_CTX_K = args.sk if args.sk else N_CTX_Q
-        HEAD_DIM = config["hidden_size"] // HQ
-        V_HEAD_DIM = HEAD_DIM
-        if isinstance(N_CTX_Q, list):
-            for seq_len in N_CTX_Q:
-                fa_configs.append(
-                    (
-                        model_name,
-                        batch_size,
-                        HQ,
-                        HK,
-                        seq_len,
-                        seq_len,
-                        HEAD_DIM,
-                        V_HEAD_DIM,
-                    )
-                )
-        else:
-            fa_configs.append(
-                (model_name, batch_size, HQ, HK, N_CTX_Q, N_CTX_K, HEAD_DIM, V_HEAD_DIM)
-            )
-
-    return fa_configs
 
 
 def make_unified_attn_inputs(
@@ -190,7 +136,6 @@ def create_benchmark_configs(custom, args):
         "DECODE_P",
     ]
     causal = args.causal
-    varlen = args.layout == "thd"
 
     configs = []
     plot_name = get_caller_name_no_ext()
@@ -202,26 +147,7 @@ def create_benchmark_configs(custom, args):
     if custom:
         x_vals_list = [(args.b, args.hq, hk, args.sq, sk, head_size, head_size_v)]
     else:
-        if varlen:
-            x_vals_list = varlen_benchmark_configs()
-        else:
-            x_vals_list = nonvarlen_benchmark_configs()
-
-        if args.model:
-            x_vals_list = model_benchmark_configs(args)
-            x_names = [
-                "model",
-                "BATCH",
-                "HQ",
-                "HK",
-                "N_CTX_Q",
-                "N_CTX_K",
-                "D_HEAD",
-                "D_HEAD_V",
-                "DECODE_P",
-            ]
-            plot_name = f"fused-attention-layout-{args.layout}-sagev2-{args.sagev2}-causal-{causal}"
-            extra_args = {"dtype": dtype, "causal": causal}
+        x_vals_list = default_benchmark_configs()
 
     for i in range(len(x_vals_list)):
         x_vals_list[i] = (*x_vals_list[i], decode_p)
@@ -449,10 +375,13 @@ def run_benchmark(custom, args):
     bench_mha.run(None, print_data=True)
 
 
-def supported_layouts():
-    layouts = (
-        "thd: Q, K, V are individual tensors of [total_q/k, num_heads, head_size]. "
-    )
+def supported_qlayouts():
+    layouts = "thd: tensors of [total_q/k, num_heads, head_size]. "
+    return layouts
+
+
+def supported_kvlayouts():
+    layouts = "cache: tensors of [num_blocks, block_size, num_heads, head_size]. "
     return layouts
 
 
@@ -576,6 +505,27 @@ def parse_args():
         help="Metrics for the kernel benchmark.",
     )
 
+    parser.add_argument(
+        "-kvlayout",
+        type=str,
+        default="cache",
+        help=f"Memory layout for keys and values. Supported layouts: {supported_kvlayouts()}",
+    )
+    parser.add_argument(
+        "-qlayout",
+        type=str,
+        default="thd",
+        help=f"Memory layout for queries. Supported layouts: {supported_qlayouts()}",
+    )
+    parser.add_argument(
+        "-causal",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Whether to benchmark in causal mode. Defaults to True if -model is specified, otherwise False.",
+    )
+
     return parser.parse_args()
 
 
@@ -588,21 +538,10 @@ arg_to_torch_dtype = {
 
 def main():
     args = parse_args()
-    args.causal = True  # only causal mode supported for now
-    args.layout = "thd"
-    if args.model:
-        if args.causal is None:  # User didn't specify -causal
-            args.causal = True
-        print(
-            f"Note: using -model config defaults: causal={True}. This is the most common real life scenario, but can be overridden with -causal and -layout flags."
-        )
-    else:
-        # the defaults for causal and varlen when not using the -model
-        if args.causal is None:  # User didn't specify -causal
-            args.causal = False
-
+    assert (
+        args.causal
+    ), "Unified attention currently only supports causal attention. Please set -causal to True."
     custom_config = False
-
     if args.hq or args.hk or args.d or args.dv:
         custom_config = True
         if not args.dv:
@@ -613,18 +552,17 @@ def main():
                 all of batch, number of Q heads, Q sequence length \
                 and head size."
 
-    if args.model:
-        assert not (
-            args.hq or args.hk or args.d or args.dv
-        ), "Specifying model fixes hq, hk and d already. Do not provide them!"
-
     assert (
         args.dtype in arg_to_torch_dtype
     ), "Only fp16, bf16 and f32 types currently supported."
 
     assert (
-        args.layout in supported_layouts()
-    ), f"{args.layout} is not in supported layouts: {supported_layouts()}."
+        args.qlayout in supported_qlayouts()
+    ), f"{args.qlayout} is not in supported layouts: {supported_qlayouts()}."
+
+    assert (
+        args.kvlayout in supported_kvlayouts()
+    ), f"{args.kvlayout} is not in supported layouts: {supported_kvlayouts()}."
 
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
