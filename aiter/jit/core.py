@@ -183,29 +183,35 @@ class AITER_CONFIG(object):
         path_list = file_path.split(os.pathsep) if file_path else []
         if len(path_list) <= 1:
             return file_path
-        df_list = []
+        source_pairs = []
         ## merge config files
         ##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
         import pandas as pd
 
-        df_list.append(pd.read_csv(path_list[0]))
-        for i, path in enumerate(path_list[1:]):
-            if os.path.exists(path):
-                df = pd.read_csv(path)
-                base_cols = [c for c in df_list[0].columns if c != "_tag"]
-                new_cols = [c for c in df.columns if c != "_tag"]
-                assert (
-                    base_cols == new_cols
-                ), f"Column mismatch between {path_list[0]} and {path}, {base_cols}, {new_cols}"
-
-                df_list.append(df)
-            else:
+        for i, path in enumerate(path_list):
+            if not os.path.exists(path):
                 logger.info(f"path {i+1}: {path} (not exist)")
-        merge_df = (
-            pd.concat([df for df in df_list if not df.empty], ignore_index=True)
-            if df_list
-            else pd.DataFrame()
-        )
+                continue
+
+            df = pd.read_csv(path)
+            if source_pairs:
+                base_path, base_df = source_pairs[0]
+                base_cols = [c for c in base_df.columns if c != "_tag"]
+                new_cols = [c for c in df.columns if c != "_tag"]
+                if base_cols != new_cols:
+                    raise ValueError(
+                        f"Column mismatch between {base_path} and {path}, "
+                        f"{base_cols}, {new_cols}"
+                    )
+
+            source_pairs.append((path, df))
+
+        if not source_pairs:
+            raise FileNotFoundError(
+                f"No existing config files found in '{file_path}' when merging '{merge_name}'."
+            )
+
+        merge_df = pd.concat([df for _, df in source_pairs], ignore_index=True)
         has_tag = "_tag" in merge_df.columns
         if has_tag:
             merge_df["_tag"] = merge_df["_tag"].fillna("")
@@ -223,17 +229,49 @@ class AITER_CONFIG(object):
             if "cu_num" not in keys:
                 keys.append("cu_num")
             dedup_keys = keys + ["_tag"] if has_tag else keys
-            sorted_df = merge_df.sort_values("us")
-            duplicated_mask = sorted_df.duplicated(subset=dedup_keys, keep="first")
+            duplicated_mask = merge_df.duplicated(subset=dedup_keys, keep=False)
             if duplicated_mask.any():
-                dup_rows = sorted_df[duplicated_mask]
-                logger.warning(
-                    f"Dropping {len(dup_rows)} duplicate rows during merge of '{merge_name}':\n"
-                    f"{dup_rows.to_string(index=False)}"
+                dup_count = int(duplicated_mask.sum())
+                dup_rows = merge_df[duplicated_mask].sort_values(dedup_keys)
+                if "us" not in merge_df.columns:
+                    raise RuntimeError(
+                        f"Found {dup_count} duplicate shape entries during merge of '{merge_name}'. "
+                        f"No 'us' column to determine best performing entry. "
+                        f"Please remove duplicates manually.\n"
+                        f"Duplicate rows:\n{dup_rows.to_string(index=False)}"
+                    )
+
+                # Auto-dedup: globally determine best row (lowest 'us') per shape
+                best_row_index = set(
+                    merge_df.sort_values("us", kind="stable")
+                    .drop_duplicates(subset=dedup_keys, keep="first")
+                    .index
                 )
-            merge_df = sorted_df.drop_duplicates(
-                subset=dedup_keys, keep="first"
-            ).reset_index(drop=True)
+
+                saved_files = []
+                offset = 0
+                for src_path, src_df in source_pairs:
+                    start, end = offset, offset + len(src_df)
+                    offset = end
+                    file_rows = merge_df.iloc[start:end]
+                    new_src_df = file_rows[
+                        file_rows.index.isin(best_row_index)
+                    ].reset_index(drop=True)
+                    if len(new_src_df) < len(src_df):
+                        new_src_df.to_csv(src_path, index=False)
+                        saved_files.append(
+                            f"  {src_path}: {len(src_df)} -> {len(new_src_df)} rows"
+                        )
+                saved_info = (
+                    "\n".join(saved_files) if saved_files else "  (no files updated)"
+                )
+                raise RuntimeError(
+                    f"Found {dup_count} duplicate shape entries during merge of '{merge_name}'. "
+                    f"Auto-resolved by keeping best performing (lowest 'us') for each shape "
+                    f"and saved back to source config files. Please re-run.\n"
+                    f"Duplicate rows:\n{dup_rows.to_string(index=False)}\n"
+                    f"Updated files:\n{saved_info}"
+                )
         else:
             logger.warning(
                 f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
