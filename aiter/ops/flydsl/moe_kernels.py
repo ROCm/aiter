@@ -4,9 +4,30 @@
 """MOE kernel management: naming, compilation, and high-level API."""
 
 import functools
+import os
 from typing import Dict, Optional
 
 import torch
+
+
+def _clear_stale_ir_context():
+    """Clear stale MLIR IR context left over from a previous JIT compilation.
+
+    When a @flyc.jit function's compilation crashes or a worker process
+    reuses a context across tasks, ir.Context.current can remain non-None
+    without a matching CompilationContext.  The JIT __call__ then takes
+    its 'nested call' fast-path and the kernel body fails because
+    CompilationContext.get_current() is None.
+
+    Calling this before exe() ensures the normal compilation path is taken.
+    """
+    try:
+        from flydsl._mlir import ir
+
+        while ir.Context.current is not None:
+            ir.Context.current.__exit__(None, None, None)
+    except Exception:
+        pass
 
 _KERNEL_PARAMS: Dict[str, Dict] = {}
 
@@ -39,24 +60,53 @@ def get_flydsl_stage1_kernels(
     """Return {kernelName: params} for all supported stage1 configs."""
     kernels = {}
     is_fp4 = b_dtype == "fp4"
-    tile_ns = [128, 256] if is_fp4 else [128]
-    tile_ks = [128, 256] if is_fp4 else [128]
+    tile_ns = [32, 64, 128] if is_fp4 else [128]
+    tile_ks = [256]
     tile_ms = [16, 32, 64, 128]
-
+    waves_per_eus = [1, 2, 3, 4]
+    k_batches = [1, 2, 4, 7, 14]
+    b_nts = [0, 2]
     for tm in tile_ms:
+        if tm in [16, 32]:
+            tile_ns = [32, 64, 128]
+        else:
+            tile_ns = [64, 128]
         for tn in tile_ns:
             for tk in tile_ks:
-                name = flydsl_kernel_name(1, a_dtype, b_dtype, out_dtype, tm, tn, tk)
-                kernels[name] = {
-                    "stage": 1,
-                    "a_dtype": a_dtype,
-                    "b_dtype": b_dtype,
-                    "out_dtype": out_dtype,
-                    "tile_m": tm,
-                    "tile_n": tn,
-                    "tile_k": tk,
-                    "MPerBlock": tm,
-                }
+                for wpe in waves_per_eus:
+                    if tm in [16, 32]:
+                        k_batches = [1, 2, 4, 7]
+                    else:
+                        k_batches = [1]
+                    for kb in k_batches:
+                        gate_onlys = [False, True] if kb > 1 else [False]
+                        for bnt in b_nts:
+                            for go in gate_onlys:
+                                name = flydsl_kernel_name(
+                                    1, a_dtype, b_dtype, out_dtype, tm, tn, tk
+                                )
+                                if wpe != 1:
+                                    name += f"_w{wpe}"
+                                if kb != 1:
+                                    name += f"_kb{kb}"
+                                if bnt != 2:
+                                    name += f"_bnt{bnt}"
+                                if go:
+                                    name += "_go"
+                                kernels[name] = {
+                                    "stage": 1,
+                                    "a_dtype": a_dtype,
+                                    "b_dtype": b_dtype,
+                                    "out_dtype": out_dtype,
+                                    "tile_m": tm,
+                                    "tile_n": tn,
+                                    "tile_k": tk,
+                                    "MPerBlock": tm,
+                                    "waves_per_eu": wpe,
+                                    "k_batch": kb,
+                                    "b_nt": bnt,
+                                    "gate_only": go,
+                                }
     return kernels
 
 
@@ -67,7 +117,7 @@ def get_flydsl_stage2_kernels(
     kernels = {}
     is_fp4 = b_dtype == "fp4"
     tile_ns = [128, 256] if is_fp4 else [128]
-    tile_ks = [128, 256] if is_fp4 else [128]
+    tile_ks = [256] if is_fp4 else [128]
     tile_ms = [32, 64, 128]
     modes = ["atomic", "reduce"]
 
@@ -118,6 +168,13 @@ def compile_flydsl_moe_stage1(
     out_dtype: str,
     act: str = "silu",
     persist_m: int = 1,
+    fuse_fp4_quant: bool = False,
+    fuse_sort_scale: bool = False,
+    use_async_copy: bool = False,
+    k_batch: int = 1,
+    waves_per_eu: int = 3,
+    b_nt: int = 2,
+    gate_only: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -137,6 +194,13 @@ def compile_flydsl_moe_stage1(
             out_dtype=out_dtype,
             act=act,
             persist_m=persist_m,
+            fuse_fp4_quant=fuse_fp4_quant,
+            fuse_sort_scale=fuse_sort_scale,
+            use_async_copy=use_async_copy,
+            k_batch=k_batch,
+            waves_per_eu=waves_per_eu,
+            b_nt=b_nt,
+            gate_only=gate_only,
         )
     else:
         from .kernels.moe_gemm_2stage import compile_moe_gemm1
@@ -169,6 +233,10 @@ def compile_flydsl_moe_stage2(
     out_dtype: str,
     accumulate: bool = True,
     persist_m: int = 1,
+    swap_ab: bool = False,
+    waves_per_eu: int = 0,
+    use_async_copy: bool = False,
+    total_threads: int = 256,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -187,6 +255,10 @@ def compile_flydsl_moe_stage2(
             b_dtype=b_dtype,
             out_dtype=out_dtype,
             accumulate=accumulate,
+            swap_ab=swap_ab,
+            waves_per_eu=waves_per_eu,
+            use_async_copy=use_async_copy,
+            total_threads=total_threads,
         )
     else:
         from .kernels.moe_gemm_2stage import compile_moe_gemm2
@@ -224,6 +296,13 @@ def _get_compiled_stage1(
     out_dtype: str,
     act: str,
     persist_m: int = 1,
+    fuse_fp4_quant: bool = False,
+    fuse_sort_scale: bool = False,
+    use_async_copy: bool = False,
+    k_batch: int = 1,
+    waves_per_eu: int = 3,
+    b_nt: int = 0,
+    gate_only: bool = False,
 ):
     """Compile and cache stage1 kernel, return a tensor_api closure."""
     exe = compile_flydsl_moe_stage1(
@@ -240,6 +319,13 @@ def _get_compiled_stage1(
         out_dtype=out_dtype,
         act=act,
         persist_m=persist_m,
+        fuse_fp4_quant=fuse_fp4_quant,
+        fuse_sort_scale=fuse_sort_scale,
+        use_async_copy=use_async_copy,
+        k_batch=k_batch,
+        waves_per_eu=waves_per_eu,
+        b_nt=b_nt,
+        gate_only=gate_only,
     )
     is_fp4 = b_dtype == "fp4"
     _n_in = inter_dim * 2 if is_fp4 else inter_dim
@@ -257,11 +343,27 @@ def _get_compiled_stage1(
         num_valid_ids: torch.Tensor,
         token_num: int,
         size_expert_ids_in: int,
+        out_scale_sorted: Optional[torch.Tensor] = None,
     ) -> None:
+        if gate_only:
+            _gx = _n_in // tile_n
+        else:
+            _gx = _n_in // 2 // tile_n
+        _gy = (size_expert_ids_in + persist_m - 1) // persist_m
+        _total_wg = _gx * _gy * k_batch
+        if os.environ.get("FLYDSL_GRID_DEBUG"):
+            print(
+                f"[grid] gx={_gx} gy={_gy} gz={k_batch} total_workgroups={_total_wg}"
+                f" tile_m={tile_m} persist_m={persist_m}"
+                f" size_expert_ids={size_expert_ids_in} token_num={token_num}"
+                f" (256 CUs, waves={(_total_wg + 255) // 256})"
+            )
+        _clear_stale_ir_context()
+
         if is_fp4:
             empty_bias = torch.empty(0, device=a.device, dtype=torch.float32)
+            empty_scale = torch.empty(0, device=a.device, dtype=torch.float32)
             stream = torch.cuda.current_stream()
-            # fp4/e8m0 dtypes are not supported by dlpack; reinterpret as uint8.
             _a = (
                 a.view(torch.uint8)
                 if a.dtype
@@ -290,6 +392,7 @@ def _get_compiled_stage1(
                 not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
                 else w_scale
             )
+            _oss = out_scale_sorted if out_scale_sorted is not None else empty_scale
             exe(
                 out,
                 _a,
@@ -301,6 +404,7 @@ def _get_compiled_stage1(
                 topk_weights,
                 num_valid_ids,
                 empty_bias,
+                _oss,
                 token_num,
                 _n_in,
                 _k_in,
@@ -342,6 +446,10 @@ def _get_compiled_stage2(
     out_dtype: str,
     accumulate: bool = True,
     persist_m: int = 1,
+    swap_ab: bool = False,
+    waves_per_eu: int = 0,
+    use_async_copy: bool = False,
+    total_threads: int = 256,
 ):
     """Compile and cache stage2 kernel, return a tensor_api closure."""
     exe = compile_flydsl_moe_stage2(
@@ -358,6 +466,10 @@ def _get_compiled_stage2(
         out_dtype=out_dtype,
         accumulate=accumulate,
         persist_m=persist_m,
+        swap_ab=swap_ab,
+        waves_per_eu=waves_per_eu,
+        use_async_copy=use_async_copy,
+        total_threads=total_threads,
     )
     is_fp4 = b_dtype == "fp4"
     _n_in = model_dim
@@ -387,10 +499,11 @@ def _get_compiled_stage2(
                 dtype=out.dtype,
             )
 
+        _clear_stale_ir_context()
+
         if is_fp4:
             empty_bias = torch.empty(0, device=a.device, dtype=torch.float32)
             stream = torch.cuda.current_stream()
-            # fp4/e8m0 dtypes are not supported by dlpack; cast to uint8
             _a = (
                 a.view(torch.uint8)
                 if a.dtype
@@ -486,13 +599,33 @@ def flydsl_moe_stage1(
     a1_scale: Optional[torch.Tensor] = None,
     sorted_weights: Optional[torch.Tensor] = None,
     persist_m: int = 0,
-) -> torch.Tensor:
+    fuse_fp4_quant: bool = False,
+    fuse_sort_scale: bool = False,
+    use_async_copy: bool = False,
+    k_batch: int = 1,
+    waves_per_eu: int = 3,
+    b_nt: int = 2,
+    gate_only: bool = False,
+):
     """Fused gate+up GEMM (MOE stage1).
 
     a: (token_num, model_dim), w1: (E, 2*inter_dim, model_dim) pre-shuffled.
-    For fp4 stage1, `w1`/`w1_scale` must use the same preshuffle layout as `shuffle_weight(..., (16, 16))`
-    and `e8m0_shuffle(...)`.
-    Returns (token_num, topk, inter_dim).
+    For fp4 stage1, `w1`/`w1_scale` must use the same preshuffle layout as
+    `shuffle_weight(..., (16, 16))` and `e8m0_shuffle(...)`.
+
+    When fuse_sort_scale=True, the kernel writes e8m0 scales in sorted tiled
+    layout directly, avoiding a separate moe_mxfp4_sort call.
+
+    When k_batch>1 (split-K), the kernel outputs gate/up partials via atomic
+    add into a zeroed buffer, then silu_and_mul fuses activation + reduction.
+
+    When gate_only=True (requires k_batch>1), each workgroup computes only
+    one B-tile stream (no gate/up interleaving).  The grid X doubles so
+    that by_n naturally covers both gate and up regions.
+
+    Returns:
+        Basic:                      out
+        fuse_sort_scale:            (out, out_scale_sorted)
     """
     token_num = a.shape[0]
     E = w1.shape[0]
@@ -503,6 +636,7 @@ def flydsl_moe_stage1(
         model_dim = model_dim * 2
 
     torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
+    _is_splitk = k_batch > 1
 
     if out is None:
         out = torch.empty(
@@ -510,6 +644,14 @@ def flydsl_moe_stage1(
         )
 
     dev = a.device
+
+    if _is_splitk:
+        tmp_out = torch.zeros(
+            (token_num, topk, inter_dim * 2), dtype=torch_out_dtype, device=dev
+        )
+    else:
+        tmp_out = None
+
     flat_a_scale = (
         a1_scale.view(-1) if a1_scale is not None else torch.empty(0, device=dev)
     )
@@ -522,21 +664,26 @@ def flydsl_moe_stage1(
         else torch.empty(0, device=dev, dtype=torch.float32)
     )
 
-    # Grid Y = number of M-blocks to launch.
-    # Dense upper bound: min(tokens*topk*tile_m, len(sorted_ids)) // tile_m
-    # Works when dense (token*topk >= sorted_blocks). But moe_sorting spreads
-    # entries across per-expert blocks, so when sparse we need all blocks.
-    _all_blks = sorted_expert_ids.shape[0]
-    _dense_blks = min(token_num * topk * tile_m, sorted_token_ids.shape[0]) // tile_m
-    _grid_y = min(_dense_blks, _all_blks) if _dense_blks >= _all_blks else _all_blks
+    _need_quant = fuse_fp4_quant
+    _need_sort = _need_quant and fuse_sort_scale
 
-    # persist_m controls how many M-blocks each WG processes sequentially.
-    # For stage1, persist_m=1 is generally optimal: the large K dimension (model_dim)
-    # means each WG is already latency-bound on VMEM, and reducing concurrent waves
-    # (via persist_m>1) hurts latency hiding more than it helps L2 reuse.
-    # persist_m>1 may help only when many M-blocks share the same expert (large batch
-    # with few experts), enabling weight tile reuse across consecutive M-blocks.
+    _sort_block_m = max(32, tile_m)
+    _all_blks = sorted_expert_ids.shape[0]
+    _dense_blks = min(token_num * topk * _sort_block_m, sorted_token_ids.shape[0]) // _sort_block_m
+    _grid_y = min(_dense_blks, _all_blks)
+
     _persist_m = persist_m if persist_m > 0 else 1
+
+    # Allocate sorted-scale buffer with padding for tiled layout
+    scale_cols = inter_dim // 32
+    sorted_size = max(sorted_token_ids.shape[0],
+                      sorted_expert_ids.shape[0] * _sort_block_m)
+    padded_rows = (sorted_size + 255) // 256 * 256
+    padded_cols = (scale_cols + 7) // 8 * 8
+    out_scale_sorted_flat = (
+        torch.empty(padded_rows * padded_cols, dtype=torch.uint8, device=dev)
+        if _need_sort else torch.empty(0, dtype=torch.uint8, device=dev)
+    )
 
     tensor_api = _get_compiled_stage1(
         model_dim=model_dim,
@@ -552,10 +699,18 @@ def flydsl_moe_stage1(
         out_dtype=out_dtype,
         act=act,
         persist_m=_persist_m,
+        fuse_fp4_quant=fuse_fp4_quant,
+        fuse_sort_scale=fuse_sort_scale,
+        use_async_copy=use_async_copy,
+        k_batch=k_batch,
+        waves_per_eu=waves_per_eu,
+        b_nt=b_nt,
+        gate_only=gate_only,
     )
 
+    _kernel_out = tmp_out if _is_splitk else out
     tensor_api(
-        out.view(-1),
+        _kernel_out.view(-1),
         a.view(-1),
         w1.view(-1),
         flat_a_scale,
@@ -566,7 +721,19 @@ def flydsl_moe_stage1(
         num_valid_ids,
         token_num,
         _grid_y,
+        out_scale_sorted=out_scale_sorted_flat.view(-1),
     )
+
+    if _is_splitk:
+        from aiter.ops.activation import silu_and_mul
+        silu_and_mul(out.view(-1, inter_dim), tmp_out.view(-1, inter_dim * 2))
+
+    if _need_sort:
+        from aiter.utility.dtypes import fp8_e8m0
+        out_scale_sorted = out_scale_sorted_flat.view(fp8_e8m0).view(
+            padded_rows, padded_cols
+        )
+        return out, out_scale_sorted
 
     return out
 
@@ -591,6 +758,10 @@ def flydsl_moe_stage2(
     a2_scale: Optional[torch.Tensor] = None,
     sorted_weights: Optional[torch.Tensor] = None,
     valid_m_blocks: Optional[int] = None,
+    swap_ab: bool = False,
+    waves_per_eu: int = 0,
+    use_async_copy: bool = False,
+    total_threads: int = 256,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -599,6 +770,9 @@ def flydsl_moe_stage2(
 
     valid_m_blocks: pre-computed from moe_sorting's num_valid_ids, trims
         per-expert tile_m padding without GPU sync at call time.
+
+    swap_ab: if True, swap A/B operands in MFMA to get consecutive model_dim
+        elements per lane, enabling a direct epilog without CShuffle LDS.
     """
 
     token_num = inter_states.shape[0]
@@ -613,7 +787,8 @@ def flydsl_moe_stage2(
 
     torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
     if out is None:
-        out = torch.empty(
+        alloc_fn = torch.zeros if accumulate else torch.empty
+        out = alloc_fn(
             (token_num, model_dim), dtype=torch_out_dtype, device=inter_states.device
         )
 
@@ -631,12 +806,18 @@ def flydsl_moe_stage2(
     )
 
     # Use pre-computed valid_m_blocks from moe_sorting (trims per-expert padding).
-    # Fallback: host-side upper bound (no GPU sync).
+    # Fallback: host-side upper bound matching stage1's dense-block formula.
     if valid_m_blocks is None:
-        padded_m_blocks = int(sorted_expert_ids.numel())
-        valid_m_blocks = min(token_num * topk, padded_m_blocks)
+        _sort_block_m = max(32, tile_m)
+        _all_blks = int(sorted_expert_ids.numel())
+        _dense_blks = min(
+            token_num * topk * _sort_block_m, sorted_token_ids.shape[0]
+        ) // _sort_block_m
+        valid_m_blocks = min(_dense_blks, _all_blks)
 
-    _persist_m = 4 if valid_m_blocks > 256 else 1
+    # _persist_m = 4 if valid_m_blocks > 256 else 1
+    print(valid_m_blocks)
+    _persist_m = 1
 
     tensor_api = _get_compiled_stage2(
         model_dim=model_dim,
@@ -652,6 +833,10 @@ def flydsl_moe_stage2(
         out_dtype=out_dtype,
         accumulate=accumulate,
         persist_m=_persist_m,
+        swap_ab=swap_ab,
+        waves_per_eu=waves_per_eu,
+        use_async_copy=use_async_copy,
+        total_threads=total_threads,
     )
     tensor_api(
         out,
