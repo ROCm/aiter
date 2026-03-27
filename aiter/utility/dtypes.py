@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 from ..jit.utils.chip_info import get_gfx
+from ..jit.core import compile_ops
 from ..ops.enum import QuantType, ActivationType
 from .aiter_types import aiter_dtypes, aiter_tensor_t
 import argparse
@@ -40,7 +41,16 @@ globals().update({f"AITER_DTYPE_{name}": idx for name, idx in aiter_dtypes.items
 _torch_to_aiter_dtype = {globals()[name]: idx for name, idx in aiter_dtypes.items()}
 
 
-_make_aiter_tensor = None
+@compile_ops("module_aiter_tensor", "make_aiter_tensor")
+def _make_aiter_tensor(
+    data_ptr: int,
+    numel: int,
+    ndim: int,
+    shape: list,
+    strides: list,
+    dtype: int,
+    device_id: int,
+): ...
 
 
 def torch_to_aiter_pybind(tensor: torch.Tensor):
@@ -50,11 +60,6 @@ def torch_to_aiter_pybind(tensor: torch.Tensor):
     this function constructs a *pybind11* aiter_tensor_t via
     module_aiter_tensor.  The two types are not interchangeable.
     """
-    global _make_aiter_tensor
-    if _make_aiter_tensor is None:
-        from ..jit.core import get_module
-
-        _make_aiter_tensor = get_module("module_aiter_tensor").make_aiter_tensor
     return _make_aiter_tensor(
         tensor.data_ptr(),
         tensor.numel(),
