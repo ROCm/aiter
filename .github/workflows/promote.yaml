@@ -1,0 +1,73 @@
+name: Promote Wheels
+
+on:
+  workflow_call:
+    inputs:
+      release_type:
+        description: 'Release type used to derive the S3 bucket name'
+        type: string
+        required: true
+      wheel_names:
+        description: 'Space-separated list of wheel filenames to promote'
+        type: string
+        required: true
+
+jobs:
+  promote:
+    runs-on: build-only-aiter
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts/generate_summary.py
+          path: aiter
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: us-east-1
+          role-to-assume: arn:aws:iam::661452401056:role/framework-aiter-${{ inputs.release_type }}
+
+      - name: Install AWS CLI
+        run: |
+          if ! command -v aws &> /dev/null; then
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip -q awscliv2.zip
+            sudo ./aws/install
+            rm -rf awscliv2.zip aws
+          fi
+
+      - name: Download wheels from staging
+        run: |
+          STAGING="s3://framework-whls-${{ inputs.release_type }}/whl-staging/gfx942-gfx950"
+          mkdir -p /tmp/promote-wheels
+          echo "Downloading wheels from ${STAGING}"
+          for WHL in ${{ inputs.wheel_names }}; do
+            echo "Downloading ${WHL}..."
+            aws s3 cp "${STAGING}/${WHL}" "/tmp/promote-wheels/${WHL}"
+          done
+          echo "Downloaded wheels:"
+          ls -lh /tmp/promote-wheels/
+
+      - name: Upload wheels to ${{ inputs.release_type }}
+        run: |
+          RELEASE="s3://framework-whls-${{ inputs.release_type }}/whl/gfx942-gfx950"
+          echo "Uploading wheels to ${RELEASE}"
+          for WHL in ${{ inputs.wheel_names }}; do
+            echo "Uploading ${WHL}..."
+            aws s3 cp "/tmp/promote-wheels/${WHL}" "${RELEASE}/${WHL}"
+          done
+          echo "All wheels promoted successfully"
+
+      - name: Promote summary
+        if: always()
+        env:
+          SUMMARY_RELEASE_TYPE: ${{ inputs.release_type }}
+          SUMMARY_S3_SOURCE: "s3://framework-whls-${{ inputs.release_type }}/whl-staging/gfx942-gfx950"
+          SUMMARY_S3_DEST: "s3://framework-whls-${{ inputs.release_type }}/whl/gfx942-gfx950"
+          SUMMARY_WHEEL_NAMES: ${{ inputs.wheel_names }}
+        run: python3 aiter/scripts/generate_summary.py promote

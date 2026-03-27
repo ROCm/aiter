@@ -1,0 +1,210 @@
+name: Test Wheels
+
+on:
+  workflow_call:
+    inputs:
+      release_type:
+        description: 'Release type (nightlies/devreleases) for S3 bucket path'
+        type: string
+        required: true
+      wheel_names:
+        description: 'Space-separated list of wheel filenames to test'
+        type: string
+        required: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Python 3.12 tests
+          - runner: aiter-1gpu-runner
+            label: MI300-py312
+            python_version: "3.12"
+            docker_image: rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1
+          - runner: linux-aiter-mi355-1
+            label: MI355-py312
+            python_version: "3.12"
+            docker_image: rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1
+          # Python 3.10 tests
+          - runner: aiter-1gpu-runner
+            label: MI300-py310
+            python_version: "3.10"
+            docker_image: rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1
+          - runner: linux-aiter-mi355-1
+            label: MI355-py310
+            python_version: "3.10"
+            docker_image: rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: aiter-whl-packages-py*
+          path: dist
+          merge-multiple: true
+
+      - name: Validate inputs
+        run: |
+          # Validate release_type
+          if [[ ! "${{ inputs.release_type }}" =~ ^(nightlies|devreleases)$ ]]; then
+            echo "❌ ERROR: Invalid release_type: ${{ inputs.release_type }}"
+            echo "Must be 'nightlies' or 'devreleases'"
+            exit 1
+          fi
+
+          # Validate wheel_names
+          if [ -z "${{ inputs.wheel_names }}" ]; then
+            echo "❌ ERROR: wheel_names is empty"
+            exit 1
+          fi
+
+      - name: Determine wheel to test
+        run: |
+          # Convert Python version to wheel format (e.g., 3.12 -> cp312)
+          PYTHON_VERSION="${{ matrix.python_version }}"
+          CP_VERSION="cp${PYTHON_VERSION/./}"
+
+          echo "Looking for wheel matching: ${CP_VERSION}"
+          echo "Available wheels: ${{ inputs.wheel_names }}"
+
+          # Find the wheel matching this Python version
+          WHEEL_NAME=""
+          for WHL in ${{ inputs.wheel_names }}; do
+            if [[ "${WHL}" == *"${CP_VERSION}"* ]]; then
+              WHEEL_NAME="${WHL}"
+              echo "WHEEL_NAME=${WHL}" >> $GITHUB_ENV
+              echo "✅ Selected wheel for testing: ${WHL}"
+              break
+            fi
+          done
+
+          if [ -z "${WHEEL_NAME}" ]; then
+            echo "❌ ERROR: No wheel found matching Python version ${CP_VERSION}"
+            echo "Available wheels: ${{ inputs.wheel_names }}"
+            exit 1
+          fi
+
+      - name: Start GPU test container
+        run: |
+          docker ps -aq -f name=aiter_test | xargs -r docker stop | xargs -r docker rm || true
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          docker run -dt --network=host --user root --device=/dev/kfd $DEVICE_FLAG \
+            -v "${{ github.workspace }}:/workspace" \
+            --ipc=host --group-add video \
+            --shm-size 16g \
+            --cap-add=SYS_PTRACE \
+            --security-opt seccomp=unconfined \
+            -w /workspace \
+            --name aiter_test \
+            ${{ matrix.docker_image }}
+
+      - name: Verify GPU accessibility
+        run: |
+          echo "============================================"
+          echo "Verifying GPU accessibility"
+          echo "============================================"
+
+          if ! docker exec aiter_test bash -c "rocm-smi --showproductname"; then
+            echo "❌ ERROR: GPU not accessible via rocm-smi"
+            exit 1
+          fi
+
+          docker exec aiter_test bash -c 'python3 -c "import torch; print(\"GPU available:\", torch.cuda.is_available()); print(\"GPU count:\", torch.cuda.device_count())"'
+
+      - name: Install wheels
+        id: install
+        run: |
+          echo "============================================"
+          echo "Installing wheel"
+          echo "Wheel: ${WHEEL_NAME}"
+          echo "From: dist/${WHEEL_NAME}"
+          echo "Python: ${{ matrix.python_version }}"
+          echo "============================================"
+
+          # Copy wheel into container
+          docker cp dist/${WHEEL_NAME} aiter_test:/tmp/${WHEEL_NAME}
+
+          docker exec aiter_test bash -c "python3 -m pip install -U pip setuptools"
+          docker exec aiter_test bash -c "pip uninstall -y aiter amd-aiter || true"
+
+          # Install from local file in container
+          if ! docker exec aiter_test bash -c "python3 -m pip install /tmp/${WHEEL_NAME} -v"; then
+            echo "❌ Installation failed!"
+            echo "Debug info:"
+            echo "- Wheel: ${WHEEL_NAME}"
+            docker exec aiter_test bash -c "python3 --version"
+            docker exec aiter_test bash -c "pip --version"
+            exit 1
+          fi
+
+          echo "============================================"
+          echo "Verifying installation"
+          echo "============================================"
+          docker exec aiter_test bash -c "python3 -c 'import aiter; print(\"✅ Aiter imported successfully\")'"
+
+      - name: Run single-GPU tests
+        id: tests
+        run: |
+          echo "============================================================"
+          echo "Running SINGLE-GPU tests on ${{ matrix.label }}"
+          echo "============================================================"
+
+          # Basic test suite (5 tests)
+          TEST_FILES="op_tests/test_aiter_add.py op_tests/test_aiter_sigmoid.py op_tests/test_gemm_a16w16.py op_tests/test_activation.py op_tests/test_layernorm2d.py"
+
+          docker exec aiter_test bash -c "
+            set -e
+            testFailed=false
+            for file in $TEST_FILES; do
+              echo '============================================================'
+              echo 'Testing: \$file'
+              echo '============================================================'
+              if timeout 10m python3 \$file 2>&1 | tee -a test_output.log; then
+                echo '✅ Test passed: \$file'
+              else
+                echo '❌ Test failed: \$file'
+                testFailed=true
+              fi
+              echo ''
+            done
+            if [ \"\$testFailed\" = true ]; then
+              exit 1
+            fi
+          "
+
+      - name: Test summary
+        if: always()
+        run: |
+          echo "## Test Summary - ${{ matrix.label }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Runner**: ${{ matrix.runner }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Python**: ${{ matrix.python_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Wheel**: \`${WHEEL_NAME}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Source**: GitHub Actions artifact" >> $GITHUB_STEP_SUMMARY
+          echo "- **Install**: ${{ steps.install.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tests**: ${{ steps.tests.outcome }}" >> $GITHUB_STEP_SUMMARY
+
+          # Add GPU info if available
+          GPU_INFO=$(docker exec aiter_test bash -c "rocm-smi --showproductname 2>/dev/null" || echo "N/A")
+          if [ "$GPU_INFO" != "N/A" ]; then
+            echo "- **GPU**: ${GPU_INFO}" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Clean up
+        if: always()
+        run: |
+          docker stop aiter_test || true
+          docker rm aiter_test || true
