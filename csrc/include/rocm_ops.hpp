@@ -1612,27 +1612,6 @@ namespace py = pybind11;
     m.def("rocb_mm", &RocSolIdxBlas, "mm");                                        \
     m.def("rocb_findallsols", &RocFindAllSolIdxBlas, "rocblas_find_all_sols");
 
-#define AITER_ENUM_PYBIND                                \
-    pybind11::enum_<QuantType>(m, "QuantType")           \
-        .value("No", QuantType::No)                      \
-        .value("per_Tensor", QuantType::per_Tensor)      \
-        .value("per_Token", QuantType::per_Token)        \
-        .value("per_1x32", QuantType::per_1x32)          \
-        .value("per_1x128", QuantType::per_1x128)        \
-        .value("per_128x128", QuantType::per_128x128)    \
-        .value("per_256x128", QuantType::per_256x128)    \
-        .value("per_1024x128", QuantType::per_1024x128)  \
-        .export_values();                                \
-    pybind11::enum_<ActivationType>(m, "ActivationType") \
-        .value("No", ActivationType::No)                 \
-        .value("Silu", ActivationType::Silu)             \
-        .value("Gelu", ActivationType::Gelu)             \
-        .value("Swiglu", ActivationType::Swiglu)         \
-        .export_values();                                \
-    pybind11::implicitly_convertible<int, QuantType>();  \
-    pybind11::implicitly_convertible<int, ActivationType>();
-#define GEMM_COMMON_PYBIND \
-    m.def("get_padded_m", &getPaddedM, py::arg("M"), py::arg("N"), py::arg("K"), py::arg("gl"));
 
 #define TOP_K_PER_ROW_PYBIND            \
     m.def("top_k_per_row_prefill",      \
