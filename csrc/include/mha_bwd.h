@@ -287,27 +287,129 @@ struct __attribute__((packed)) fmha_bwd_post_kernel_args
     void* ptr_dq_acc;
     p2 _p0;
     void* ptr_dq;
-    p2 _p1;
-    unsigned int Hs_dq_acc;
-    p3 _p2;
-    unsigned int BAs_dq_acc;
-    p3 _p3;
-    unsigned int Seqs_dq_acc;
-    p3 _p4;
-    unsigned int Hs_dq;
-    p3 _p5;
-    unsigned int BAs_dq;
-    p3 _p6;
-    unsigned int Seqs_dq;
-    p3 _p7;
+    void* ptr_dk;
+    void* ptr_dv;
+    const void* ptr_q;
+    const void* ptr_k;
+    const void* ptr_v;
+    const void* ptr_do;
+    const void* ptr_lse;
+    const void* ptr_d;
+    float scalar;
+    p1 _p0;
+    float log2e;
+    p1 _p1;
+    unsigned int ratio;
+    p1 _p2;
     unsigned int seqlen_q;
-    p3 _p8;
+    p1 _p3;
+    unsigned int seqlen_k;
+    p1 _p4;
     unsigned int head_dim;
+    p1 _p5;
+    unsigned int nhead_q;
+    p1 _p6;
+    unsigned int Hs_q;
+    p1 _p7;
+    unsigned int BAs_q;
+    p1 _p8;
+    unsigned int Seqs_q;
+    p1 _p9;
+    unsigned int Hs_k;
+    p1 _p10;
+    unsigned int BAs_k;
+    p1 _p11;
+    unsigned int Seqs_k;
+    p1 _p12;
+    unsigned int Hs_v;
+    p1 _p13;
+    unsigned int BAs_v;
+    p1 _p14;
+    unsigned int Seqs_v;
+    p1 _p15;
+    unsigned int Hs_do;
+    p1 _p16;
+    unsigned int BAs_do;
+    p1 _p17;
+    unsigned int Seqs_do;
+    p1 _p18;
+    unsigned int Hs_dk;
+    p1 _p19;
+    unsigned int BAs_dk;
+    p1 _p20;
+    unsigned int Seqs_dk;
+    p1 _p21;
+    unsigned int Hs_dv;
+    p1 _p22;
+    unsigned int BAs_dv;
+    p1 _p23;
+    unsigned int Seqs_dv;
+    p1 _p24;
+    int mask_x;
+    p1 _p25;
+    int mask_y;
+    p1 _p26;
+};
+
+struct __attribute__((packed)) fmha_bwd_dq_shuffle_args
+{
+    void* ptr_dq_acc;
+    p2 _p0;
+    void* ptr_dq;
+    p2 _p1;
+    unsigned int Ts;
+    p3 _p2;
+    unsigned int Hs_dq_acc;
+    p3 _p3;
+    unsigned int BAs_dq_acc;
+    p3 _p4;
+    unsigned int Seqs_dq_acc;
+    p3 _p5;
+    unsigned int Hs_dq;
+    p3 _p6;
+    unsigned int BAs_dq;
+    p3 _p7;
+    unsigned int Seqs_dq;
+    p3 _p8;
+    unsigned int seqlen_q;
     p3 _p9;
-    const void* ptr_qseq;
-    p2 _p10;
-    const void* ptr_qseq_padded;
-    p2 _p11;
+    unsigned int head_dim;
+    p3 _p10;
+};
+
+struct fmha_bwd_v3_traits
+{
+    int b;
+    int h;
+    int sq;
+    int sk;
+    int d;
+
+    int mask;
+    int ts_qo;
+    int ts_kv;
+    int ts_dq = 64;
+};
+
+template <ck_tile::index_t HDim_,
+          typename DataType_,
+          int mask_type_,
+          bool kIsAtomic32_,
+          ck_tile::index_t BF16Cvt_,
+          bool kIsSEQPad_,
+          bool kIsHDPad_,
+          GPUArch GPUArch_,
+          bool kIsGroupMode_ = false>
+struct fmha_bwd_dq_dk_dv_v3_traits_
+{
+    static constexpr ck_tile::index_t HDim    = HDim_;
+    using DataType                            = ck_tile::remove_cvref_t<DataType_>;
+    static constexpr int mask_type            = mask_type_;
+    static constexpr bool kIsAtomic32         = kIsAtomic32_;
+    static constexpr ck_tile::index_t BF16Cvt = BF16Cvt_;
+    static constexpr bool kIsSEQPad           = kIsSEQPad_;
+    static constexpr bool kIsHDPad            = kIsHDPad_;
+    static constexpr bool kIsGroupMode        = kIsGroupMode_;
 };
 
 __attribute__((visibility("default"))) float mha_bwd(mha_bwd_args, const ck_tile::stream_config&);

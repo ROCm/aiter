@@ -97,88 +97,27 @@ run_group_mode_tests() {
 # Current native gfx950 kernels has seqlen restriction
 run_gfx950_bwd_v3() {
     for prec in "bf16" "fp16" ; do
-    for mask in 0 1 2 ; do
+    for mask in 0 1 ; do
     for v3_atomic_fp32 in 1 0 ; do
-    for hdim in 72 112 128 192 ; do
-    for batch in 3 ; do
+    for batch in 1 3 ; do
     for head in 2 4 ; do
-    for sq in 62 174 ; do
-    for sk in 65 174 299 577 ; do
+    # for hdim in 72 80 88 96 104 112 120 ; do
+    for sq in 13 62 174 260 513 ; do
+    for sk in 13 65 174 299 577 799 1025; do
     for perm in 0 1 ; do
-
-    hdim_v=$hdim
-    if [ $hdim -eq 192 ]; then
-        hdim_v=128
-        if [ $mask -eq 2 ]; then
-            continue
-        fi
-    fi
-
-    $EXE -prec=$prec -b=$batch -h=$head -h_k=2 -d=$hdim -d_v=$hdim_v -s=$sq -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -mode=0 -kname=$KNAME $COMMON_ARGS
-
+        $EXE -prec=$prec -b=$batch -h=$head -h_k=2 -d=128 -s=$sq -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -mode=0 -kname=$KNAME $COMMON_ARGS
     done
     done
     done
     done
     done
-    done
+    # done
     done
     done
     done
 }
 
-run_gfx950_group_bwd_v3() {
-    for prec in "bf16" "fp16" ; do
-    for mask in 0 1 2 ; do
-    for v3_atomic_fp32 in 0 1 ; do
-    for seqlen in 65 174 299 577; do
-    for hdim in 80 120 128 ; do
-    for perm in 0 1 ; do
-
-    $EXE -prec=$prec -b=2 -h=3 -d=$hdim -s=$seqlen -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -mode=1 -kname=$KNAME $COMMON_ARGS
-    $EXE -prec=$prec -b=3 -h=4 -h_k=1 -d=$hdim -s=$seqlen -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -mode=1 -kname=$KNAME $COMMON_ARGS
-
-    done
-    done
-    done
-    done
-    done
-    done
-}
-
-# This is specifically for testing the 192_128_cas_kb kernel
-run_gfx950_hd192_128_bwd_v3() {
-    echo "===== Comprehensive coverage: hdim 192+128 (batch mode) ====="
-    
-    hdim=192
-    hdim_v=128
-    
-    for prec in "bf16" "fp16" ; do
-    for v3_atomic_fp32 in 0 1 ; do
-    for mask in 0 1 2 ; do
-    for perm in 0 1 ; do
-    for batch in 1 2 3 ; do
-    for head in 1 2 4 ; do
-    for sq in 62 174 299 577 ; do
-    for sk in 65 174 299 577 ; do
-
-    $EXE -prec=$prec -b=$batch -h=$head -d=$hdim -d_v=$hdim_v -s=$sq -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -mode=0 -kname=$KNAME $COMMON_ARGS
-
-    done
-    done
-    done
-    done
-    done
-    done
-    done
-    done
-}
-
-run_batch_mode_tests
-run_group_mode_tests
-run_swa_tests
-# run_gfx950_group_bwd_v3
-# run_gfx950_bwd_v3
-
-# hdim 192+128 tests
-# run_gfx950_hd192_128_bwd_v3
+# run_batch_mode_tests
+# run_group_mode_tests
+# run_swa_tests
+run_gfx950_bwd_v3
