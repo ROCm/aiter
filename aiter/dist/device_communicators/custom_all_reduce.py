@@ -28,7 +28,7 @@ from torch.distributed import ProcessGroup
 import aiter as ops
 from aiter.dist.parallel_state import in_the_same_node_as
 from aiter import logger
-from aiter.utility.dtypes import fp8, _torch_to_aiter_dtype
+from aiter.utility.dtypes import fp8, _torch_to_aiter_dtype, torch_to_aiter_pybind
 
 try:
     ops.meta_size()
@@ -46,31 +46,7 @@ def is_weak_contiguous(inp: torch.Tensor):
     )
 
 
-_make_aiter_tensor = None
-
-
-def _torch_to_aiter(tensor: torch.Tensor):
-    """Convert torch.Tensor to pybind aiter_tensor_t for passing to C++ ops.
-
-    Note: dtypes.py provides a similar torch_to_aiter() that returns a ctypes
-    aiter_tensor_t struct.  This function constructs a *pybind11* aiter_tensor_t
-    instead, because custom_all_reduce is compiled as a pybind11 module.  The two
-    types are not interchangeable, so a separate conversion path is necessary.
-    """
-    global _make_aiter_tensor
-    if _make_aiter_tensor is None:
-        from aiter.jit.core import get_module
-
-        _make_aiter_tensor = get_module("module_custom_all_reduce").make_aiter_tensor
-    return _make_aiter_tensor(
-        tensor.data_ptr(),
-        tensor.numel(),
-        tensor.ndim,
-        list(tensor.shape),
-        list(tensor.stride()),
-        _torch_to_aiter_dtype[tensor.dtype],
-        tensor.device.index or 0,
-    )
+_torch_to_aiter = torch_to_aiter_pybind
 
 
 def _current_stream_ptr() -> int:

@@ -40,6 +40,32 @@ globals().update({f"AITER_DTYPE_{name}": idx for name, idx in aiter_dtypes.items
 _torch_to_aiter_dtype = {globals()[name]: idx for name, idx in aiter_dtypes.items()}
 
 
+_make_aiter_tensor = None
+
+
+def torch_to_aiter_pybind(tensor: torch.Tensor):
+    """Convert torch.Tensor to pybind aiter_tensor_t for passing to C++ ops.
+
+    Unlike torch_to_aiter() which returns a ctypes aiter_tensor_t struct,
+    this function constructs a *pybind11* aiter_tensor_t via
+    module_custom_all_reduce.  The two types are not interchangeable.
+    """
+    global _make_aiter_tensor
+    if _make_aiter_tensor is None:
+        from ..jit.core import get_module
+
+        _make_aiter_tensor = get_module("module_custom_all_reduce").make_aiter_tensor
+    return _make_aiter_tensor(
+        tensor.data_ptr(),
+        tensor.numel(),
+        tensor.ndim,
+        list(tensor.shape),
+        list(tensor.stride()),
+        _torch_to_aiter_dtype[tensor.dtype],
+        tensor.device.index or 0,
+    )
+
+
 def torch_to_aiter(tensor: torch.Tensor) -> aiter_tensor_t:
     """torch.Tensor -> aiter_tensor_t, zero-copy, points to the same GPU memory."""
     assert tensor.is_cuda, "aiter_tensor_t only supports CUDA tensors"
