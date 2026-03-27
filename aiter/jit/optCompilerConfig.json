@@ -197,7 +197,6 @@
     },
     "module_gemm_common": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/gemm_common_pybind.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/gemm_common.cu'"
         ],
         "flags_extra_cc": [],

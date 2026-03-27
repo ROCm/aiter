@@ -1092,18 +1092,29 @@ def _ctypes_call(func, fc_name, md_name):
             )
         lib = ctypes.CDLL(so_path)
         c_func = getattr(lib, fc_name)
-        c_func.restype = None
 
         hints = typing.get_type_hints(func)
+
+        ret_hint = hints.get("return")
+        if ret_hint is int:
+            c_func.restype = ctypes.c_int
+        elif ret_hint is float:
+            c_func.restype = ctypes.c_float
+        else:
+            c_func.restype = None
+
         argtypes = []
+        has_tensor = False
         for pname in inspect.signature(func).parameters:
             hint = hints.get(pname)
             origin = typing.get_origin(hint)
             type_args = typing.get_args(hint)
             if hint is torch.Tensor:
                 argtypes.append(ctypes.POINTER(aiter_tensor_t))
+                has_tensor = True
             elif _is_union(origin) and torch.Tensor in type_args:
                 argtypes.append(ctypes.POINTER(aiter_tensor_t))
+                has_tensor = True
             elif _is_union(origin) and int in type_args:
                 argtypes.append(ctypes.c_int64)
             elif _is_union(origin) and str in type_args:
@@ -1118,11 +1129,13 @@ def _ctypes_call(func, fc_name, md_name):
                 argtypes.append(ctypes.c_float)
             else:
                 argtypes.append(ctypes.c_void_p)
-        argtypes.append(ctypes.c_void_p)  # hipStream_t
+        if has_tensor:
+            argtypes.append(ctypes.c_void_p)  # hipStream_t
         c_func.argtypes = argtypes
 
         _cache["lib"] = lib
         _cache["c_func"] = c_func
+        _cache["has_tensor"] = has_tensor
 
     def _check_args_before_convert(bound_args, hints):
         for pname, value in bound_args.items():
@@ -1232,10 +1245,11 @@ def _ctypes_call(func, fc_name, md_name):
             else:
                 c_args.append(value)
 
-        c_args.append(
-            ctypes.c_void_p(torch.cuda.current_stream(tensor_device).cuda_stream)
-        )
-        c_func(*c_args)
+        if _cache.get("has_tensor"):
+            c_args.append(
+                ctypes.c_void_p(torch.cuda.current_stream(tensor_device).cuda_stream)
+            )
+        return c_func(*c_args)
 
     return caller
 
@@ -1255,7 +1269,7 @@ def compile_ops(
 
             @functools.wraps(func)
             def ctypes_wrapper(*args, **kwargs):
-                ctypes_caller(*args, **kwargs)
+                return ctypes_caller(*args, **kwargs)
 
             @torch_compile_guard(device="cuda", calling_func_=func)
             def ctypes_custom_wrapper(*args, **kwargs):
