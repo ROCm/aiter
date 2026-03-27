@@ -159,6 +159,24 @@ namespace py = pybind11;
           py::arg("quant_algo"),       \
           py::arg("out_") = std::nullopt);
 
+#define UNIFIED_ATTENTION_CK_PYBIND        \
+    m.def("unified_attention_fwd",         \
+          &unified_attention_fwd,          \
+          "unified_attention_fwd",         \
+          py::arg("output"),               \
+          py::arg("query"),                \
+          py::arg("key_cache"),            \
+          py::arg("value_cache"),          \
+          py::arg("block_tables"),         \
+          py::arg("seq_lens"),             \
+          py::arg("query_start_len"),      \
+          py::arg("mask_type"),            \
+          py::arg("scale_s"),              \
+          py::arg("scale"),                \
+          py::arg("scale_k"),              \
+          py::arg("scale_v"),              \
+          py::arg("scale_out"));
+
 #define ATTENTION_PYBIND                                          \
     m.def("paged_attention_rocm",                                 \
           &paged_attention,                                       \
