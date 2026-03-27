@@ -12,6 +12,7 @@ from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
     mxfp4_quant,
     moe_gemm_a4w4,
     swizzle_scales,
+    swizzle_scales_gfx1250,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 import tempfile
@@ -88,9 +89,12 @@ def compute_roofline(
 
 
 def check_and_swizzle_scales(scale, N, K):
-    if N % 32 == 0 and K % (32 * 8) == 0:
+    if get_arch() == "gfx950" and N % 32 == 0 and K % (32 * 8) == 0:
         scale = swizzle_scales(scale)
         return scale, "CDNA4_SCALE"
+    elif get_arch() == "gfx1250" and N % 128 == 0 and K % (32 * 4) == 0:
+        scale = swizzle_scales_gfx1250(scale)
+        return scale, "GFX1250_SCALE"
     else:
         return scale, None
 
@@ -172,7 +176,7 @@ def bench_mlp_single_weight_init(
             b1,
             rdata,
             gather_indx=gather_indx,
-            swizzle_mx_scale="CDNA4_SCALE",
+            swizzle_mx_scale=swizzle_mx_scale1,
             apply_swiglu=True,
         )
         x, x_scale = mxfp4_quant(x)
@@ -186,7 +190,7 @@ def bench_mlp_single_weight_init(
             b2,
             rdata,
             scatter_indx=scatter_indx,
-            swizzle_mx_scale="CDNA4_SCALE",
+            swizzle_mx_scale=swizzle_mx_scale2,
         )
     proton.finalize()
     return parse_profile(
