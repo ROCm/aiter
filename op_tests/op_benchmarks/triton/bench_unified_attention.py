@@ -324,7 +324,7 @@ def run_benchmark(custom, args):
                     query_start_len=cu_query_lens[:-1],
                     scale_s=scale,
                     scale=1.0, scale_k=1.0, scale_v=1.0, scale_out=1.0,
-                    mask_type=2
+                    mask_type=0
                 )
             else:
                 return unified_attention(
