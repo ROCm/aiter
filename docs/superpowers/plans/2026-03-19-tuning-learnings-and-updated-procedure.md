@@ -93,6 +93,12 @@ The tuning search space MUST be tailored to M. Using the full default range wast
 - **Baseline/validation** (rocprof --stats): MUST be sequential on single GPU — parallel runs corrupt `results.stats.csv`
 - When running multiple N,K pairs on different GPUs for tuning, use separate subshells or `wait` between shapes on the same GPU
 
+### 10. Verify Long Tasks Early
+- **Always check progress 1-2 minutes after launching any task that will run >10 minutes**
+- Verify screen logs are producing `screencase` entries (not just `Running case` lines with 0 results)
+- Common silent failures: missing SPLITK_BLOCK_SIZE in config, wrong kernel name in rprof.py filter, stale GPU contexts
+- A task running for 10+ minutes with 0 results is broken — kill and investigate immediately
+
 ---
 
 ## Updated Per-Kernel Procedure
