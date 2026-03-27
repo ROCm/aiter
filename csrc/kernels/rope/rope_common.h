@@ -271,7 +271,27 @@ __device__ __forceinline__ void store_payload(o_scalar_t* p_buffer,
     p_buffer[offset_1] = o_scalar_t(data_1);
 }
 
-template <typename scalar_t>
+#ifdef __HIP_DEVICE_COMPILE__
+// Map torch/c10 types to opus-compatible types for ext_vector_type
+template <typename T> struct opus_type_map { using type = T; };
+template <> struct opus_type_map<c10::Half>    { using type = opus::fp16_t; };
+template <> struct opus_type_map<c10::BFloat16>{ using type = opus::bf16_t; };
+template <typename T> using opus_type_t = typename opus_type_map<T>::type;
+
+// Helper to create opus gmem accessor with automatic pointer cast from c10 types to opus types
+template <typename T>
+__device__ __forceinline__ auto opus_gmem(const T* ptr)
+{
+    return opus::make_gmem<opus_type_t<T>>(reinterpret_cast<const opus_type_t<T>*>(ptr));
+}
+template <typename T>
+__device__ __forceinline__ auto opus_gmem(T* ptr)
+{
+    return opus::make_gmem<opus_type_t<T>>(reinterpret_cast<opus_type_t<T>*>(ptr));
+}
+#endif // __HIP_DEVICE_COMPILE__
+
+template <int32_t VecPairs = 1, typename scalar_t>
 __device__ __forceinline__ void elementwise_copy(scalar_t* __restrict__ p_output,
                                                  const scalar_t* __restrict__ p_input,
                                                  const int32_t hid_end,
@@ -288,18 +308,34 @@ __device__ __forceinline__ void elementwise_copy(scalar_t* __restrict__ p_output
     {
         for(int32_t hid = 0; hid < hid_end; hid++)
         {
-            const int32_t offset_i = hid * stride_i_h;
-            const int32_t offset_o = hid * stride_o_h;
-
-            for(int32_t did = did_start + my_did_offset; did < did_end; did += did_stride)
+#ifdef __HIP_DEVICE_COMPILE__
+            if constexpr(VecPairs > 1)
             {
-                p_output[offset_o + did * stride_o_d] = p_input[offset_i + did * stride_i_d];
+                auto g_i = opus_gmem(p_input + hid * stride_i_h);
+                auto g_o = opus_gmem(p_output + hid * stride_o_h);
+                for(int32_t did = did_start + my_did_offset * VecPairs;
+                    did + VecPairs <= did_end;
+                    did += did_stride * VecPairs)
+                {
+                    auto v = g_i.template load<VecPairs>(did);
+                    g_o.template store<VecPairs>(v, did);
+                }
+            }
+            else
+#endif
+            {
+                const int32_t offset_i = hid * stride_i_h;
+                const int32_t offset_o = hid * stride_o_h;
+                for(int32_t did = did_start + my_did_offset; did < did_end; did += did_stride)
+                {
+                    p_output[offset_o + did * stride_o_d] = p_input[offset_i + did * stride_i_d];
+                }
             }
         }
     }
 }
 
-template <typename scalar_t>
+template <int32_t VecPairs = 1, typename scalar_t>
 __device__ __forceinline__ void elementwise_copy_2c(scalar_t* __restrict__ p_output_x,
                                                     scalar_t* __restrict__ p_output_y,
                                                     const scalar_t* __restrict__ p_input_x,
@@ -325,41 +361,93 @@ __device__ __forceinline__ void elementwise_copy_2c(scalar_t* __restrict__ p_out
 
         for(int32_t hid = 0; hid < hid_min_end; hid++)
         {
-            const int32_t offset_ix = hid * stride_ix_h;
-            const int32_t offset_iy = hid * stride_iy_h;
-            const int32_t offset_ox = hid * stride_ox_h;
-            const int32_t offset_oy = hid * stride_oy_h;
-
-            for(int32_t did = did_start + my_did_offset; did < did_end; did += did_stride)
+#ifdef __HIP_DEVICE_COMPILE__
+            if constexpr(VecPairs > 1)
             {
-                p_output_x[offset_ox + did * stride_ox_d] =
-                    p_input_x[offset_ix + did * stride_ix_d];
-                p_output_y[offset_oy + did * stride_oy_d] =
-                    p_input_y[offset_iy + did * stride_iy_d];
+                auto g_ix = opus_gmem(p_input_x + hid * stride_ix_h);
+                auto g_iy = opus_gmem(p_input_y + hid * stride_iy_h);
+                auto g_ox = opus_gmem(p_output_x + hid * stride_ox_h);
+                auto g_oy = opus_gmem(p_output_y + hid * stride_oy_h);
+                for(int32_t did = did_start + my_did_offset * VecPairs;
+                    did + VecPairs <= did_end;
+                    did += did_stride * VecPairs)
+                {
+                    auto vx = g_ix.template load<VecPairs>(did);
+                    auto vy = g_iy.template load<VecPairs>(did);
+                    g_ox.template store<VecPairs>(vx, did);
+                    g_oy.template store<VecPairs>(vy, did);
+                }
+            }
+            else
+#endif
+            {
+                const int32_t offset_ix = hid * stride_ix_h;
+                const int32_t offset_iy = hid * stride_iy_h;
+                const int32_t offset_ox = hid * stride_ox_h;
+                const int32_t offset_oy = hid * stride_oy_h;
+                for(int32_t did = did_start + my_did_offset; did < did_end; did += did_stride)
+                {
+                    p_output_x[offset_ox + did * stride_ox_d] =
+                        p_input_x[offset_ix + did * stride_ix_d];
+                    p_output_y[offset_oy + did * stride_oy_d] =
+                        p_input_y[offset_iy + did * stride_iy_d];
+                }
             }
         }
 
         for(int32_t hid = hid_min_end; hid < hid_end_x; hid++)
         {
-            const int32_t offset_ix = hid * stride_ix_h;
-            const int32_t offset_ox = hid * stride_ox_h;
-
-            for(int32_t did = did_start + my_did_offset; did < did_end; did += did_stride)
+#ifdef __HIP_DEVICE_COMPILE__
+            if constexpr(VecPairs > 1)
             {
-                p_output_x[offset_ox + did * stride_ox_d] =
-                    p_input_x[offset_ix + did * stride_ix_d];
+                auto g_ix = opus_gmem(p_input_x + hid * stride_ix_h);
+                auto g_ox = opus_gmem(p_output_x + hid * stride_ox_h);
+                for(int32_t did = did_start + my_did_offset * VecPairs;
+                    did + VecPairs <= did_end;
+                    did += did_stride * VecPairs)
+                {
+                    auto v = g_ix.template load<VecPairs>(did);
+                    g_ox.template store<VecPairs>(v, did);
+                }
+            }
+            else
+#endif
+            {
+                const int32_t offset_ix = hid * stride_ix_h;
+                const int32_t offset_ox = hid * stride_ox_h;
+                for(int32_t did = did_start + my_did_offset; did < did_end; did += did_stride)
+                {
+                    p_output_x[offset_ox + did * stride_ox_d] =
+                        p_input_x[offset_ix + did * stride_ix_d];
+                }
             }
         }
 
         for(int32_t hid = hid_min_end; hid < hid_end_y; hid++)
         {
-            const int32_t offset_iy = hid * stride_iy_h;
-            const int32_t offset_oy = hid * stride_oy_h;
-
-            for(int32_t did = did_start + my_did_offset; did < did_end; did += did_stride)
+#ifdef __HIP_DEVICE_COMPILE__
+            if constexpr(VecPairs > 1)
             {
-                p_output_y[offset_oy + did * stride_oy_d] =
-                    p_input_y[offset_iy + did * stride_iy_d];
+                auto g_iy = opus_gmem(p_input_y + hid * stride_iy_h);
+                auto g_oy = opus_gmem(p_output_y + hid * stride_oy_h);
+                for(int32_t did = did_start + my_did_offset * VecPairs;
+                    did + VecPairs <= did_end;
+                    did += did_stride * VecPairs)
+                {
+                    auto v = g_iy.template load<VecPairs>(did);
+                    g_oy.template store<VecPairs>(v, did);
+                }
+            }
+            else
+#endif
+            {
+                const int32_t offset_iy = hid * stride_iy_h;
+                const int32_t offset_oy = hid * stride_oy_h;
+                for(int32_t did = did_start + my_did_offset; did < did_end; did += did_stride)
+                {
+                    p_output_y[offset_oy + did * stride_oy_d] =
+                        p_input_y[offset_iy + did * stride_iy_d];
+                }
             }
         }
     }
@@ -368,26 +456,6 @@ __device__ __forceinline__ void elementwise_copy_2c(scalar_t* __restrict__ p_out
 // =====================================================================================================================
 // Vectorized Helper Functions (using opus for buffer load/store)
 //
-
-#ifdef __HIP_DEVICE_COMPILE__
-// Map torch/c10 types to opus-compatible types for ext_vector_type
-template <typename T> struct opus_type_map { using type = T; };
-template <> struct opus_type_map<c10::Half>    { using type = opus::fp16_t; };
-template <> struct opus_type_map<c10::BFloat16>{ using type = opus::bf16_t; };
-template <typename T> using opus_type_t = typename opus_type_map<T>::type;
-
-// Helper to create opus gmem accessor with automatic pointer cast from c10 types to opus types
-template <typename T>
-__device__ __forceinline__ auto opus_gmem(const T* ptr)
-{
-    return opus::make_gmem<opus_type_t<T>>(reinterpret_cast<const opus_type_t<T>*>(ptr));
-}
-template <typename T>
-__device__ __forceinline__ auto opus_gmem(T* ptr)
-{
-    return opus::make_gmem<opus_type_t<T>>(reinterpret_cast<opus_type_t<T>*>(ptr));
-}
-#endif // __HIP_DEVICE_COMPILE__
 
 template <int32_t RotateStyle, int32_t VecPairs, bool IsForward, bool ReuseFreqsFrontPart, typename scalar_f_t>
 __device__ __forceinline__ void load_cos_sin_uncached_vec(float (&cos_0)[VecPairs],
@@ -721,7 +789,7 @@ struct OpUncachedFwd
         {
             const int32_t nope_start = NopeFirst ? 0 : size_r;
             const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
-            elementwise_copy(p_output,
+            elementwise_copy<VecPairs>(p_output,
                              p_input,
                              size_h,
                              nope_start,
@@ -831,7 +899,7 @@ struct OpUncachedFwd
         {
             const int32_t nope_start = NopeFirst ? 0 : size_r;
             const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
-            elementwise_copy_2c(p_output_x,
+            elementwise_copy_2c<VecPairs>(p_output_x,
                                 p_output_y,
                                 p_input_x,
                                 p_input_y,
@@ -911,7 +979,7 @@ struct OpUncachedBwd
         {
             const int32_t nope_start = NopeFirst ? 0 : size_r;
             const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
-            elementwise_copy(p_input_grads,
+            elementwise_copy<VecPairs>(p_input_grads,
                              p_output_grads,
                              size_h,
                              nope_start,
@@ -1021,7 +1089,7 @@ struct OpUncachedBwd
         {
             const int32_t nope_start = NopeFirst ? 0 : size_r;
             const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
-            elementwise_copy_2c(p_input_grads_x,
+            elementwise_copy_2c<VecPairs>(p_input_grads_x,
                                 p_input_grads_y,
                                 p_output_grads_x,
                                 p_output_grads_y,
@@ -1102,7 +1170,7 @@ struct OpCachedFwd
         {
             const int32_t nope_start = NopeFirst ? 0 : size_r;
             const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
-            elementwise_copy(p_output,
+            elementwise_copy<VecPairs>(p_output,
                              p_input,
                              size_h,
                              nope_start,
@@ -1213,7 +1281,7 @@ struct OpCachedFwd
         {
             const int32_t nope_start = NopeFirst ? 0 : size_r;
             const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
-            elementwise_copy_2c(p_output_x,
+            elementwise_copy_2c<VecPairs>(p_output_x,
                                 p_output_y,
                                 p_input_x,
                                 p_input_y,
@@ -1294,7 +1362,7 @@ struct OpCachedBwd
         {
             const int32_t nope_start = NopeFirst ? 0 : size_r;
             const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
-            elementwise_copy(p_input_grads,
+            elementwise_copy<VecPairs>(p_input_grads,
                              p_output_grads,
                              size_h,
                              nope_start,
@@ -1405,7 +1473,7 @@ struct OpCachedBwd
         {
             const int32_t nope_start = NopeFirst ? 0 : size_r;
             const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
-            elementwise_copy_2c(p_input_grads_x,
+            elementwise_copy_2c<VecPairs>(p_input_grads_x,
                                 p_input_grads_y,
                                 p_output_grads_x,
                                 p_output_grads_y,
