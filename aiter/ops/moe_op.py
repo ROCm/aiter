@@ -207,7 +207,34 @@ def moe_stage1_g1u1(
     quant_type: Optional[int] = QuantType.No.value,
     a1_scale: Optional[Tensor] = None,
     w1_scale: Optional[Tensor] = None,
+    w1_lqq_scale: Optional[Tensor] = None,
+    w1_lqq_zero: Optional[Tensor] = None,
+    fc2_smooth_scale: Optional[Tensor] = None,
+    fc2_scale: Optional[Tensor] = None,
     sorted_weights: Optional[Tensor] = None,
+) -> None: ...
+
+
+@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
+def moe_stage2_g1u1(
+    inter_states: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    out: Tensor,
+    topk: int,
+    kernelName: Optional[str],
+    block_m: int,
+    w2_scale: Optional[Tensor] = None,
+    a2_scale: Optional[Tensor] = None,
+    w2_lqq_scale: Optional[Tensor] = None,
+    w2_lqq_zero: Optional[Tensor] = None,
+    sorted_weights: Optional[Tensor] = None,
+    quant_type: Optional[int] = QuantType.No.value,
+    activation: Optional[int] = ActivationType.No.value,
+    splitk: int = 0,
 ) -> None: ...
 
 

@@ -58,9 +58,13 @@ if __name__ == "__main__":
             cfgname = os.path.basename(el).split(".")[0]
             csv_groups[cfgname].append({"file_path": el, "arch": arch})
 
-    ## deal with same name csv
+    ## Phase 1: Read all CSV groups and collect the union of all columns
     cfgs = []
-    have_get_header = False
+    required_columns_set = {"knl_name", "co_name", "arch"}
+    all_csv_data = []
+    other_columns = []
+    other_columns_seen = set()
+
     for cfgname, file_info_list in csv_groups.items():
         dfs = []
         for file_info in file_info_list:
@@ -85,21 +89,29 @@ if __name__ == "__main__":
             combine_df = (
                 pd.concat(dfs, ignore_index=True).fillna(0).infer_objects(copy=False)
             )
-            if not have_get_header:
-                headers_list = combine_df.columns.tolist()
-                required_columns = {"knl_name", "co_name", "arch"}
-                other_columns = [
-                    col for col in headers_list if col not in required_columns
-                ]
-                other_columns_comma = ", ".join(other_columns)
-                sample_row = combine_df.iloc[0]
-                other_columns_cpp_def = "\n".join(
-                    [
-                        f"    {'int' if isinstance(sample_row[col], (int, float, np.integer)) else 'std::string'} {col};"
-                        for col in other_columns
-                    ]
-                )
-                content += f"""
+            all_csv_data.append((cfgname, combine_df, relpath))
+            # Collect unique other_columns in order of first appearance
+            for col in combine_df.columns.tolist():
+                if col not in required_columns_set and col not in other_columns_seen:
+                    other_columns.append(col)
+                    other_columns_seen.add(col)
+
+    ## Phase 2: Generate header struct with union of all columns
+    if all_csv_data:
+        other_columns_comma = ", ".join(other_columns)
+        # Find a sample row from a group that has the most columns for type inference
+        sample_df = max((d for _, d, _ in all_csv_data), key=lambda d: len(d.columns))
+        for col in other_columns:
+            if col not in sample_df.columns:
+                sample_df[col] = 0
+        sample_row = sample_df.iloc[0]
+        other_columns_cpp_def = "\n".join(
+            [
+                f"    {'int' if isinstance(sample_row[col], (int, float, np.integer)) else 'std::string'} {col};"
+                for col in other_columns
+            ]
+        )
+        content += f"""
 #define ADD_CFG({other_columns_comma}, arch, path, knl_name, co_name)         \\
     {{                                         \\
         arch knl_name, {{ knl_name, path co_name, arch, {other_columns_comma} }}         \\
@@ -116,26 +128,32 @@ struct {args.module}Config
 using CFG = std::unordered_map<std::string, {args.module}Config>;
 
 """
-                have_get_header = True
-            cfg = [
-                "ADD_CFG("
-                + ", ".join(
-                    (
-                        f"{int(getattr(row, col)):>4}"
-                        if str(getattr(row, col)).replace(".", "", 1).isdigit()
-                        else f'"{getattr(row, col)}"'
-                    )
-                    for col in other_columns
-                )
-                + f', "{row.arch}", "{relpath}/", "{row.knl_name}", "{row.co_name}"),'
-                for row in combine_df.itertuples(index=False)
-                if row.arch in archs
-            ]
-            cfg_txt = "\n    ".join(cfg) + "\n"
 
-            txt = f"""static CFG cfg_{cfgname} = {{
+    ## Phase 3: Generate config entries for each CSV group
+    for cfgname, combine_df, relpath in all_csv_data:
+        # Ensure all other_columns exist (fill missing with 0)
+        for col in other_columns:
+            if col not in combine_df.columns:
+                combine_df[col] = 0
+        cfg = [
+            "ADD_CFG("
+            + ", ".join(
+                (
+                    f"{int(getattr(row, col)):>4}"
+                    if str(getattr(row, col)).replace(".", "", 1).isdigit()
+                    else f'"{getattr(row, col)}"'
+                )
+                for col in other_columns
+            )
+            + f', "{row.arch}", "{relpath}/", "{row.knl_name}", "{row.co_name}"),'
+            for row in combine_df.itertuples(index=False)
+            if row.arch in archs
+        ]
+        cfg_txt = "\n    ".join(cfg) + "\n"
+
+        txt = f"""static CFG cfg_{cfgname} = {{
     {cfg_txt}}};"""
-            cfgs.append(txt)
+        cfgs.append(txt)
 
     content += "\n".join(cfgs) + "\n"
 

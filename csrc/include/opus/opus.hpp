@@ -1564,12 +1564,12 @@ struct gmem {
 #else
         i32x4_t cached_rsrc_;
         __builtin_memcpy(&cached_rsrc_, &cached_rsrc, sizeof(i32x4_t));   // builtin memcpy, __builtin_bit_cast() can not use here due to __amdgpu_buffer_rsrc_t is non copyable
-        if      constexpr (sizeof(type) == 1)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  1, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 2)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  2, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 4)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  4, v_os, s_os, 0, aux); }
+        if      constexpr (sizeof(type) == 1)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(reinterpret_cast<unsigned long int>(dst)),  1, v_os, s_os, 0, aux); }
+        else if constexpr (sizeof(type) == 2)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(reinterpret_cast<unsigned long int>(dst)),  2, v_os, s_os, 0, aux); }
+        else if constexpr (sizeof(type) == 4)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(reinterpret_cast<unsigned long int>(dst)),  4, v_os, s_os, 0, aux); }
 #if  defined(__gfx950__)
-        else if constexpr (sizeof(type) == 12) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst), 12, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 16) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst), 16, v_os, s_os, 0, aux); }
+        else if constexpr (sizeof(type) == 12) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(reinterpret_cast<unsigned long int>(dst)), 12, v_os, s_os, 0, aux); }
+        else if constexpr (sizeof(type) == 16) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(reinterpret_cast<unsigned long int>(dst)), 16, v_os, s_os, 0, aux); }
 #endif
 #endif
     }
