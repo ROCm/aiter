@@ -4,7 +4,9 @@
 """
 Benchmark CK unified attention (via AITER JIT) vs Triton unified attention (2D & 3D)
 on realistic shapes replayed from a JSONL trace file.
+
 Deduplicates shapes, runs all three backends, writes CSV + prints summary.
+
 CK compile-time constraints:
   - head_size=128 NumQPerKV=1, or head_size=64 NumQPerKV=8
   - page block size >= 32 (kPageBlockSize = 32)
