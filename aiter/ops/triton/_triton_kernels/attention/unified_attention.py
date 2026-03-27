@@ -62,6 +62,7 @@ def kernel_unified_attention_2d(
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
     scale: tl.constexpr,  # float32
+    q_scale,  # float32
     k_scale,  # float32
     v_scale,  # float32
     out_scale,  # float32
@@ -95,7 +96,7 @@ def kernel_unified_attention_2d(
     BLOCK_Q: tl.constexpr,  # int
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
-    USE_FP8: tl.constexpr,  # bool
+    USE_FP8_OUTPUT: tl.constexpr,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
     ALL_DECODE: tl.constexpr = False,  # bool
@@ -105,7 +106,12 @@ def kernel_unified_attention_2d(
 
     # needed to use exp2 (exp2 -> exp conversion)
     RCP_LN2 = 1.4426950408889634
-    qk_scale = scale * RCP_LN2
+    
+    # handles both no quantization and per tensor quantization.
+    _q_ds = tl.load(q_scale) if q_scale is not None else 1.0
+    _k_ds = tl.load(k_scale) if k_scale is not None else 1.0
+    sm_scale = scale if scale is not None else 1.0
+    qk_scale = sm_scale * RCP_LN2 * _q_ds * _k_ds
 
     seq_idx = find_seq_idx(
         query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
@@ -260,36 +266,22 @@ def kernel_unified_attention_2d(
         )
 
         # K : (HEAD_SIZE, TILE_SIZE)
-        K_load = tl.load(
+        K = tl.load(
             key_cache_ptr + k_offset,
             mask=dim_mask[:, None] & tile_mask[None, :],
             other=0.0,
             cache_modifier=KV_cache_modifier,
         )
 
-        if K_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
-                K = K_load
-            else:
-                K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
-        else:
-            K = K_load
+        K = K.to(Q.dtype)
 
         # V : (TILE_SIZE, HEAD_SIZE)
-        V_load = tl.load(
+        V = tl.load(
             value_cache_ptr + v_offset,
             mask=dim_mask[None, :] & tile_mask[:, None],
             other=0.0,
             cache_modifier=KV_cache_modifier,
         )
-
-        if V_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
-                V = V_load
-            else:
-                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
-        else:
-            V = V_load
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
@@ -360,7 +352,12 @@ def kernel_unified_attention_2d(
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
     one_over_L = 1.0 / L[:, None]
     acc = acc * one_over_L
-    if USE_FP8:
+    
+    if v_scale is not None:
+        _v_ds = tl.load(v_scale)
+        acc *= _v_ds
+    
+    if USE_FP8_OUTPUT:
         acc = acc * tl.load(out_scale)
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
 
@@ -392,8 +389,9 @@ def kernel_unified_attention_3d(
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
     scale,  # float32
+    q_scale,  # float32
     k_scale,  # float32
-    v_scale,  # float32
+    # v_scale,  # float32. Taken outside to reduce
     softcap,  # float32
     num_query_heads: tl.constexpr,  # int
     num_queries_per_kv: tl.constexpr,  # int
@@ -428,10 +426,14 @@ def kernel_unified_attention_3d(
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
     segm_idx = tl.program_id(2)
-
+    
     # needed to use exp2 (exp2 -> exp conversion)
     RCP_LN2 = 1.4426950408889634
-    qk_scale = scale * RCP_LN2
+    # handles both no quantization and per tensor quantization.
+    _q_ds = tl.load(q_scale) if q_scale is not None else 1.0
+    _k_ds = tl.load(k_scale) if k_scale is not None else 1.0
+    sm_scale = scale if scale is not None else 1.0
+    qk_scale = sm_scale * RCP_LN2 * _q_ds * _k_ds
 
     seq_idx = find_seq_idx(
         query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
@@ -571,36 +573,22 @@ def kernel_unified_attention_3d(
         )
 
         # K : (HEAD_SIZE, TILE_SIZE)
-        K_load = tl.load(
+        K = tl.load(
             key_cache_ptr + k_offset,
             mask=dim_mask[:, None] & tile_mask[None, :],
             other=0.0,
             cache_modifier=KV_cache_modifier,
         )
-
-        if K_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
-                K = K_load
-            else:
-                K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
-        else:
-            K = K_load
+        
+        K = K.to(Q.dtype)
 
         # V : (TILE_SIZE, HEAD_SIZE)
-        V_load = tl.load(
+        V = tl.load(
             value_cache_ptr + v_offset,
             mask=dim_mask[None, :] & tile_mask[:, None],
             other=0.0,
             cache_modifier=KV_cache_modifier,
         )
-
-        if V_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
-                V = V_load
-            else:
-                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
-        else:
-            V = V_load
 
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
@@ -699,6 +687,7 @@ def reduce_segments(
     seq_lens_ptr,  # [num_seqs]
     num_seqs,  # int
     num_query_heads: tl.constexpr,  # int
+    v_scale,  # float32
     out_scale_inv,  # float32
     output_stride_0: tl.int64,  # int
     output_stride_1: tl.int64,  # int, should be equal to head_size
@@ -709,13 +698,15 @@ def reduce_segments(
     query_start_len_ptr,  # [num_seqs+1]
     BLOCK_Q: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
-    USE_FP8: tl.constexpr,  # bool
+    USE_FP8_OUTPUT: tl.constexpr,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
 
+    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+    
     seq_idx = find_seq_idx(
         query_start_len_ptr, query_token_idx, num_seqs, BLOCK_Q, False
     )
@@ -770,7 +761,10 @@ def reduce_segments(
     # safely divide by overall_expsum, returning 0.0 if overall_expsum is 0
     acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
 
-    if USE_FP8:
+    if v_scale is not None:
+        acc = acc * tl.load(v_scale)
+    
+    if USE_FP8_OUTPUT:
         acc = acc * tl.load(out_scale_inv)
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
 
