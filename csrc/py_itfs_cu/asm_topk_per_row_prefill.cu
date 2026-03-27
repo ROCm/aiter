@@ -15,12 +15,12 @@ struct __attribute__((packed)) TopKPrefillKernelArgs
     int32_t stride1;
 };
 
-extern "C" __attribute__((visibility("default"))) void top_k_per_row_prefill_fast(
-    AiterTensor* logits,
-    AiterTensor* rowStarts,
-    AiterTensor* rowEnds,
-    AiterTensor* indices,
-    AiterTensor* values,
+AITER_C_ITFS void top_k_per_row_prefill_fast(
+    aiter_tensor_t* logits,
+    aiter_tensor_t* rowStarts,
+    aiter_tensor_t* rowEnds,
+    aiter_tensor_t* indices,
+    aiter_tensor_t* values,
     int64_t numRows,
     int64_t stride0,
     int64_t stride1,

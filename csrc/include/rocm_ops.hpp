@@ -23,6 +23,11 @@ namespace py = pybind11;
           "Activation function used in GELU.",          \
           py::arg("out"),                               \
           py::arg("input"));                            \
+    m.def("gelu_fast",                                  \
+          &aiter::gelu_fast,                            \
+          "Activation function used in GELU fast.",     \
+          py::arg("out"),                               \
+          py::arg("input"));                            \
     m.def("gelu_tanh_and_mul",                          \
           &aiter::gelu_tanh_and_mul,                    \
           "Activation function used in GELU tanh.",     \
@@ -446,15 +451,6 @@ namespace py = pybind11;
           py::arg("kernelName")  = std::nullopt, \
           py::arg("bpreshuffle") = false);
 
-#define FLATMM_A8W8_BLOCKSCALE_ASM_PYBIND \
-    m.def("flatmm_a8w8_blockscale_asm",   \
-          &flatmm_a8w8_blockscale_asm,    \
-          "flatmm_a8w8_blockscale_asm",   \
-          py::arg("XQ"),                  \
-          py::arg("WQ"),                  \
-          py::arg("x_scale"),             \
-          py::arg("w_scale"),             \
-          py::arg("Out"));
 
 #define GEMM_A4W4_BLOCKSCALE_PYBIND \
     m.def("gemm_a4w4_blockscale",   \
@@ -1430,6 +1426,16 @@ namespace py = pybind11;
 #define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                     \
     m.def("fused_qk_norm_rope_cache_quant_shuffle",              \
           &aiter::fused_qk_norm_rope_cache_quant_shuffle);       \
+    m.def("fused_qk_rmsnorm",                                    \
+            &aiter::fused_qk_rmsnorm,                            \
+            py::arg("q"),                                        \
+            py::arg("q_weight"),                                 \
+            py::arg("q_eps"),                                    \
+            py::arg("k"),                                        \
+            py::arg("k_weight"),                                 \
+            py::arg("k_eps"),                                    \
+            py::arg("q_out"),                                    \
+            py::arg("k_out"));                                   \
     m.def("fused_qk_norm_rope_cache_pts_quant_shuffle",          \
           &aiter::fused_qk_norm_rope_cache_pts_quant_shuffle,    \
           py::arg("qkv"),                                        \
@@ -1773,6 +1779,28 @@ namespace py = pybind11;
           py::arg("cache_seqlens")      = torch::Tensor(),                     \
           py::arg("conv_state_indices") = torch::Tensor(),                     \
           py::arg("pad_slot_id")        = -1);
+
+#define FUSED_SPLIT_GDR_UPDATE_PYBIND                                            \
+    m.def("fused_split_gdr_update",                                               \
+          &aiter::fused_split_gdr_update,                                         \
+          "Fused split GDR decode update (HIP, ksplit4_db backend).",            \
+          py::arg("mixed_qkv"),                                                   \
+          py::arg("A_log"),                                                       \
+          py::arg("a"),                                                           \
+          py::arg("dt_bias"),                                                     \
+          py::arg("b_gate"),                                                      \
+          py::arg("initial_state_source"),                                        \
+          py::arg("initial_state_indices"),                                       \
+          py::arg("key_dim"),                                                     \
+          py::arg("value_dim"),                                                   \
+          py::arg("num_heads_qk"),                                                \
+          py::arg("num_heads_v"),                                                 \
+          py::arg("head_dim"),                                                    \
+          py::arg("softplus_beta")          = 1.0f,                               \
+          py::arg("softplus_threshold")     = 20.0f,                              \
+          py::arg("scale")                  = -1.0f,                              \
+          py::arg("use_qk_l2norm_in_kernel") = true,                              \
+          py::arg("output") = c10::nullopt);
 #define MLA_HK_PYBIND                   \
     m.def("hk_mla_decode_fwd",          \
           &hk_mla_decode_fwd,           \

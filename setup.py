@@ -13,6 +13,10 @@ PACKAGE_NAME = "amd-aiter"
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
+IS_WINDOWS = sys.platform == "win32"
+if IS_WINDOWS:
+    ENABLE_CK = False
+    PREBUILD_KERNELS = False
 
 
 def getMaxJobs():
@@ -63,7 +67,10 @@ def prepare_packaging():
         shutil.copytree("3rdparty", "aiter_meta/3rdparty")
     else:
         os.makedirs("aiter_meta/3rdparty", exist_ok=True)
-    shutil.copytree("hsa", "aiter_meta/hsa")
+    if not IS_WINDOWS:
+        shutil.copytree("hsa", "aiter_meta/hsa")
+    else:
+        os.makedirs("aiter_meta/hsa", exist_ok=True)
     shutil.copytree("gradlib", "aiter_meta/gradlib")
     shutil.copytree("csrc", "aiter_meta/csrc")
     open("aiter_meta/__init__.py", "w").close()
@@ -98,7 +105,7 @@ def _is_metadata_only():
 
 
 # Defer heavy imports until build time
-if not _is_metadata_only():
+if not _is_metadata_only() and not IS_WINDOWS:
     import json
     from concurrent.futures import ThreadPoolExecutor
 
@@ -306,6 +313,19 @@ class ForcePlatlibDistribution(Distribution):
         return True
 
 
+if IS_WINDOWS:
+    install_requires = ["einops", "packaging", "psutil"]
+else:
+    install_requires = [
+        "pybind11>=3.0.1",
+        "ninja",
+        "pandas",
+        "einops",
+        "psutil",
+        "packaging",
+        "flydsl==0.1.1.dev409",
+    ]
+
 setup(
     name=PACKAGE_NAME,
     use_scm_version=True,
@@ -321,15 +341,7 @@ setup(
     ],
     cmdclass={"build_ext": NinjaBuildExtension},
     python_requires=">=3.8",
-    install_requires=[
-        "pybind11>=3.0.1",
-        "ninja",
-        "pandas",
-        "einops",
-        "psutil",
-        "packaging",
-        "flydsl==0.1.1",
-    ],
+    install_requires=install_requires,
     extras_require={
         # Triton-based communication using Iris
         # Note: Iris is not available on PyPI and must be installed separately
