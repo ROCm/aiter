@@ -280,16 +280,18 @@ __device__ __forceinline__ void elementwise_copy(scalar_t* __restrict__ p_output
                                                  const int32_t stride_i_h,
                                                  const int32_t stride_i_d,
                                                  const int32_t stride_o_h,
-                                                 const int32_t stride_o_d)
+                                                 const int32_t stride_o_d,
+                                                 const int32_t my_did_offset,
+                                                 const int32_t did_stride)
 {
     if(did_end > did_start)
     {
-        for(int32_t hid = threadIdx.y; hid < hid_end; hid += blockDim.y)
+        for(int32_t hid = 0; hid < hid_end; hid++)
         {
             const int32_t offset_i = hid * stride_i_h;
             const int32_t offset_o = hid * stride_o_h;
 
-            for(int32_t did = threadIdx.x + did_start; did < did_end; did += blockDim.x)
+            for(int32_t did = did_start + my_did_offset; did < did_end; did += did_stride)
             {
                 p_output[offset_o + did * stride_o_d] = p_input[offset_i + did * stride_i_d];
             }
@@ -313,20 +315,22 @@ __device__ __forceinline__ void elementwise_copy_2c(scalar_t* __restrict__ p_out
                                                     const int32_t stride_ox_h,
                                                     const int32_t stride_ox_d,
                                                     const int32_t stride_oy_h,
-                                                    const int32_t stride_oy_d)
+                                                    const int32_t stride_oy_d,
+                                                    const int32_t my_did_offset,
+                                                    const int32_t did_stride)
 {
     if(did_end > did_start)
     {
         const int32_t hid_min_end = hid_end_x < hid_end_y ? hid_end_x : hid_end_y;
 
-        for(int32_t hid = threadIdx.y; hid < hid_min_end; hid += blockDim.y)
+        for(int32_t hid = 0; hid < hid_min_end; hid++)
         {
             const int32_t offset_ix = hid * stride_ix_h;
             const int32_t offset_iy = hid * stride_iy_h;
             const int32_t offset_ox = hid * stride_ox_h;
             const int32_t offset_oy = hid * stride_oy_h;
 
-            for(int32_t did = threadIdx.x + did_start; did < did_end; did += blockDim.x)
+            for(int32_t did = did_start + my_did_offset; did < did_end; did += did_stride)
             {
                 p_output_x[offset_ox + did * stride_ox_d] =
                     p_input_x[offset_ix + did * stride_ix_d];
@@ -335,24 +339,24 @@ __device__ __forceinline__ void elementwise_copy_2c(scalar_t* __restrict__ p_out
             }
         }
 
-        for(int32_t hid = threadIdx.y + hid_min_end; hid < hid_end_x; hid += blockDim.y)
+        for(int32_t hid = hid_min_end; hid < hid_end_x; hid++)
         {
             const int32_t offset_ix = hid * stride_ix_h;
             const int32_t offset_ox = hid * stride_ox_h;
 
-            for(int32_t did = threadIdx.x + did_start; did < did_end; did += blockDim.x)
+            for(int32_t did = did_start + my_did_offset; did < did_end; did += did_stride)
             {
                 p_output_x[offset_ox + did * stride_ox_d] =
                     p_input_x[offset_ix + did * stride_ix_d];
             }
         }
 
-        for(int32_t hid = threadIdx.y + hid_min_end; hid < hid_end_y; hid += blockDim.y)
+        for(int32_t hid = hid_min_end; hid < hid_end_y; hid++)
         {
             const int32_t offset_iy = hid * stride_iy_h;
             const int32_t offset_oy = hid * stride_oy_h;
 
-            for(int32_t did = threadIdx.x + did_start; did < did_end; did += blockDim.x)
+            for(int32_t did = did_start + my_did_offset; did < did_end; did += did_stride)
             {
                 p_output_y[offset_oy + did * stride_oy_d] =
                     p_input_y[offset_iy + did * stride_iy_d];
@@ -698,97 +702,55 @@ struct OpUncachedFwd
                                                     const int32_t stride_i_h,
                                                     const int32_t stride_i_d,
                                                     const int32_t stride_o_h,
-                                                    const int32_t stride_o_d)
+                                                    const int32_t stride_o_d,
+                                                    const int32_t d_chunk_idx,
+                                                    const int32_t threads_per_sb)
     {
         // rotate count
         const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
+        const int32_t did         = d_chunk_idx * VecPairs + did_start;
 
-        if constexpr(VecPairs > 1)
+        // Load cos/sin once for this thread's VecPairs pairs
+        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
+        load_cos_sin_uncached_vec<RotateStyle, VecPairs, true, ReuseFreqsFrontPart>(
+            cos_0, sin_0, cos_1, sin_1, p_freqs, did - did_start, size_half_r);
+
+        // Loop over ALL heads
+        for(int32_t hid = 0; hid < size_h; hid++)
         {
-            // Vectorized path: each thread handles VecPairs consecutive pairs
-            const int32_t did_end_vec = did_start + (((size_half_r - did_start) / VecPairs) * VecPairs);
-            for(int32_t did = threadIdx.x * VecPairs + did_start; did < did_end_vec; did += blockDim.x * VecPairs)
+            float input_0[VecPairs], input_1[VecPairs];
+            load_payload_vec<RotateStyle, VecPairs>(
+                input_0, input_1, p_input, did, hid, stride_i_h, size_half_r);
+
+            float output_0[VecPairs], output_1[VecPairs];
+            for(int32_t v = 0; v < VecPairs; v++)
             {
-                float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
-                load_cos_sin_uncached_vec<RotateStyle, VecPairs, true, ReuseFreqsFrontPart>(
-                    cos_0, sin_0, cos_1, sin_1, p_freqs, did - did_start, size_half_r);
-
-                for(int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
-                {
-                    float input_0[VecPairs], input_1[VecPairs];
-                    load_payload_vec<RotateStyle, VecPairs>(
-                        input_0, input_1, p_input, did, hid, stride_i_h, size_half_r);
-
-                    float output_0[VecPairs], output_1[VecPairs];
-                    for(int32_t v = 0; v < VecPairs; v++)
-                    {
-                        output_0[v] = input_0[v] * cos_0[v] - input_1[v] * sin_0[v];
-                        output_1[v] = input_1[v] * cos_1[v] + input_0[v] * sin_1[v];
-                    }
-
-                    store_payload_vec<RotateStyle, VecPairs>(
-                        p_output, output_0, output_1, did, hid, stride_o_h, size_half_r);
-                }
+                output_0[v] = input_0[v] * cos_0[v] - input_1[v] * sin_0[v];
+                output_1[v] = input_1[v] * cos_1[v] + input_0[v] * sin_1[v];
             }
-            // Tail: remaining pairs handled scalar
-            for(int32_t did = threadIdx.x + did_end_vec; did < size_half_r; did += blockDim.x)
-            {
-                float cos_0, sin_0, cos_1, sin_1;
-                load_cos_sin_uncached<RotateStyle, true, ReuseFreqsFrontPart>(
-                    &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did - did_start, size_half_r);
 
-                for(int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
-                {
-                    float input_0, input_1;
-                    load_payload<RotateStyle, StrideDInEq1>(
-                        &input_0, &input_1, p_input, did, hid, stride_i_d, stride_i_h, size_half_r);
-
-                    const float output_0 = input_0 * cos_0 - input_1 * sin_0;
-                    const float output_1 = input_1 * cos_1 + input_0 * sin_1;
-                    store_payload<RotateStyle, StrideDOutEq1>(
-                        p_output, output_0, output_1, did, hid, stride_o_d, stride_o_h, size_half_r);
-                }
-            }
-        }
-        else
-        {
-            // Original scalar path (VecPairs == 1)
-            for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
-            {
-                float cos_0, sin_0, cos_1, sin_1;
-                load_cos_sin_uncached<RotateStyle, true, ReuseFreqsFrontPart>(
-                    &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did - did_start, size_half_r);
-
-                for(int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
-                {
-                    float input_0, input_1;
-                    load_payload<RotateStyle, StrideDInEq1>(
-                        &input_0, &input_1, p_input, did, hid, stride_i_d, stride_i_h, size_half_r);
-
-                    const float output_0 = input_0 * cos_0 - input_1 * sin_0;
-                    const float output_1 = input_1 * cos_1 + input_0 * sin_1;
-                    store_payload<RotateStyle, StrideDOutEq1>(
-                        p_output, output_0, output_1, did, hid, stride_o_d, stride_o_h, size_half_r);
-                }
-            }
+            store_payload_vec<RotateStyle, VecPairs>(
+                p_output, output_0, output_1, did, hid, stride_o_h, size_half_r);
         }
 
-        // the rest are just forwarded
+        // the rest are just forwarded (nope copy, distributed round-robin)
         if constexpr(!Inplace)
         {
-            const int32_t did_start = NopeFirst ? 0 : size_r;
-            const int32_t did_end   = NopeFirst ? (size_d - size_r) : size_d;
+            const int32_t nope_start = NopeFirst ? 0 : size_r;
+            const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
             elementwise_copy(p_output,
                              p_input,
                              size_h,
-                             did_start,
-                             did_end,
+                             nope_start,
+                             nope_end,
                              stride_i_h,
                              stride_i_d,
                              stride_o_h,
-                             stride_o_d);
+                             stride_o_d,
+                             d_chunk_idx,
+                             threads_per_sb);
         }
     }
 
@@ -819,145 +781,83 @@ struct OpUncachedFwd
                                                     const int32_t stride_ox_h,
                                                     const int32_t stride_ox_d,
                                                     const int32_t stride_oy_h,
-                                                    const int32_t stride_oy_d)
+                                                    const int32_t stride_oy_d,
+                                                    const int32_t d_chunk_idx,
+                                                    const int32_t threads_per_sb)
     {
         // rotate count
         const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
         const int32_t size_min_h  = min(size_h_x, size_h_y);
+        const int32_t did         = d_chunk_idx * VecPairs + did_start;
 
-        if constexpr(VecPairs > 1)
+        // Load cos/sin once for this thread's VecPairs pairs
+        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
+        load_cos_sin_uncached_vec<RotateStyle, VecPairs, true, ReuseFreqsFrontPart>(
+            cos_0, sin_0, cos_1, sin_1, p_freqs, did - did_start, size_half_r);
+
+        // Loop over shared heads (both x and y)
+        for(int32_t hid = 0; hid < size_min_h; hid++)
         {
-            const int32_t did_end_vec = did_start + (((size_half_r - did_start) / VecPairs) * VecPairs);
-            for(int32_t did = threadIdx.x * VecPairs + did_start; did < did_end_vec; did += blockDim.x * VecPairs)
+            float ix0[VecPairs], ix1[VecPairs], iy0[VecPairs], iy1[VecPairs];
+            load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, p_input_x, did, hid, stride_ix_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, p_input_y, did, hid, stride_iy_h, size_half_r);
+
+            float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
+            for(int32_t v = 0; v < VecPairs; v++)
             {
-                float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
-                load_cos_sin_uncached_vec<RotateStyle, VecPairs, true, ReuseFreqsFrontPart>(
-                    cos_0, sin_0, cos_1, sin_1, p_freqs, did - did_start, size_half_r);
-
-                for(int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
-                {
-                    float ix0[VecPairs], ix1[VecPairs], iy0[VecPairs], iy1[VecPairs];
-                    load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, p_input_x, did, hid, stride_ix_h, size_half_r);
-                    load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, p_input_y, did, hid, stride_iy_h, size_half_r);
-
-                    float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
-                    for(int32_t v = 0; v < VecPairs; v++)
-                    {
-                        ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                        ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
-                        oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                        oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
-                    }
-
-                    store_payload_vec<RotateStyle, VecPairs>(p_output_x, ox0, ox1, did, hid, stride_ox_h, size_half_r);
-                    store_payload_vec<RotateStyle, VecPairs>(p_output_y, oy0, oy1, did, hid, stride_oy_h, size_half_r);
-                }
-
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_x; hid += blockDim.y)
-                {
-                    float ix0[VecPairs], ix1[VecPairs];
-                    load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, p_input_x, did, hid, stride_ix_h, size_half_r);
-                    float ox0[VecPairs], ox1[VecPairs];
-                    for(int32_t v = 0; v < VecPairs; v++)
-                    {
-                        ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                        ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
-                    }
-                    store_payload_vec<RotateStyle, VecPairs>(p_output_x, ox0, ox1, did, hid, stride_ox_h, size_half_r);
-                }
-
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_y; hid += blockDim.y)
-                {
-                    float iy0[VecPairs], iy1[VecPairs];
-                    load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, p_input_y, did, hid, stride_iy_h, size_half_r);
-                    float oy0[VecPairs], oy1[VecPairs];
-                    for(int32_t v = 0; v < VecPairs; v++)
-                    {
-                        oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                        oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
-                    }
-                    store_payload_vec<RotateStyle, VecPairs>(p_output_y, oy0, oy1, did, hid, stride_oy_h, size_half_r);
-                }
+                ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
+                ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
+                oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
             }
-            // Tail: scalar fallback
-            for(int32_t did = threadIdx.x + did_end_vec; did < size_half_r; did += blockDim.x)
-            {
-                float cos_0, sin_0, cos_1, sin_1;
-                load_cos_sin_uncached<RotateStyle, true, ReuseFreqsFrontPart>(
-                    &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did - did_start, size_half_r);
 
-                for(int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
-                {
-                    float ix0, ix1, iy0, iy1;
-                    load_payload<RotateStyle, StrideDInXEq1>(&ix0, &ix1, p_input_x, did, hid, stride_ix_d, stride_ix_h, size_half_r);
-                    load_payload<RotateStyle, StrideDInYEq1>(&iy0, &iy1, p_input_y, did, hid, stride_iy_d, stride_iy_h, size_half_r);
-                    store_payload<RotateStyle, StrideDOutXEq1>(p_output_x, ix0*cos_0-ix1*sin_0, ix1*cos_1+ix0*sin_1, did, hid, stride_ox_d, stride_ox_h, size_half_r);
-                    store_payload<RotateStyle, StrideDOutYEq1>(p_output_y, iy0*cos_0-iy1*sin_0, iy1*cos_1+iy0*sin_1, did, hid, stride_oy_d, stride_oy_h, size_half_r);
-                }
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_x; hid += blockDim.y)
-                {
-                    float ix0, ix1;
-                    load_payload<RotateStyle, StrideDInXEq1>(&ix0, &ix1, p_input_x, did, hid, stride_ix_d, stride_ix_h, size_half_r);
-                    store_payload<RotateStyle, StrideDOutXEq1>(p_output_x, ix0*cos_0-ix1*sin_0, ix1*cos_1+ix0*sin_1, did, hid, stride_ox_d, stride_ox_h, size_half_r);
-                }
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_y; hid += blockDim.y)
-                {
-                    float iy0, iy1;
-                    load_payload<RotateStyle, StrideDInYEq1>(&iy0, &iy1, p_input_y, did, hid, stride_iy_d, stride_iy_h, size_half_r);
-                    store_payload<RotateStyle, StrideDOutYEq1>(p_output_y, iy0*cos_0-iy1*sin_0, iy1*cos_1+iy0*sin_1, did, hid, stride_oy_d, stride_oy_h, size_half_r);
-                }
-            }
-        }
-        else
-        {
-            // Original scalar path (VecPairs == 1)
-            for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
-            {
-                float cos_0, sin_0, cos_1, sin_1;
-                load_cos_sin_uncached<RotateStyle, true, ReuseFreqsFrontPart>(
-                    &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did - did_start, size_half_r);
-
-                for(int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
-                {
-                    float input_x_0, input_x_1, input_y_0, input_y_1;
-                    load_payload<RotateStyle, StrideDInXEq1>(&input_x_0, &input_x_1, p_input_x, did, hid, stride_ix_d, stride_ix_h, size_half_r);
-                    load_payload<RotateStyle, StrideDInYEq1>(&input_y_0, &input_y_1, p_input_y, did, hid, stride_iy_d, stride_iy_h, size_half_r);
-
-                    store_payload<RotateStyle, StrideDOutXEq1>(p_output_x, input_x_0*cos_0-input_x_1*sin_0, input_x_1*cos_1+input_x_0*sin_1, did, hid, stride_ox_d, stride_ox_h, size_half_r);
-                    store_payload<RotateStyle, StrideDOutYEq1>(p_output_y, input_y_0*cos_0-input_y_1*sin_0, input_y_1*cos_1+input_y_0*sin_1, did, hid, stride_oy_d, stride_oy_h, size_half_r);
-                }
-
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_x; hid += blockDim.y)
-                {
-                    float input_x_0, input_x_1;
-                    load_payload<RotateStyle, StrideDInXEq1>(&input_x_0, &input_x_1, p_input_x, did, hid, stride_ix_d, stride_ix_h, size_half_r);
-                    store_payload<RotateStyle, StrideDOutXEq1>(p_output_x, input_x_0*cos_0-input_x_1*sin_0, input_x_1*cos_1+input_x_0*sin_1, did, hid, stride_ox_d, stride_ox_h, size_half_r);
-                }
-
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_y; hid += blockDim.y)
-                {
-                    float input_y_0, input_y_1;
-                    load_payload<RotateStyle, StrideDInYEq1>(&input_y_0, &input_y_1, p_input_y, did, hid, stride_iy_d, stride_iy_h, size_half_r);
-                    store_payload<RotateStyle, StrideDOutYEq1>(p_output_y, input_y_0*cos_0-input_y_1*sin_0, input_y_1*cos_1+input_y_0*sin_1, did, hid, stride_oy_d, stride_oy_h, size_half_r);
-                }
-            }
+            store_payload_vec<RotateStyle, VecPairs>(p_output_x, ox0, ox1, did, hid, stride_ox_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(p_output_y, oy0, oy1, did, hid, stride_oy_h, size_half_r);
         }
 
-        // the rest are just forwarded
+        // Remaining x-only heads
+        for(int32_t hid = size_min_h; hid < size_h_x; hid++)
+        {
+            float ix0[VecPairs], ix1[VecPairs];
+            load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, p_input_x, did, hid, stride_ix_h, size_half_r);
+            float ox0[VecPairs], ox1[VecPairs];
+            for(int32_t v = 0; v < VecPairs; v++)
+            {
+                ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
+                ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+            }
+            store_payload_vec<RotateStyle, VecPairs>(p_output_x, ox0, ox1, did, hid, stride_ox_h, size_half_r);
+        }
+
+        // Remaining y-only heads
+        for(int32_t hid = size_min_h; hid < size_h_y; hid++)
+        {
+            float iy0[VecPairs], iy1[VecPairs];
+            load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, p_input_y, did, hid, stride_iy_h, size_half_r);
+            float oy0[VecPairs], oy1[VecPairs];
+            for(int32_t v = 0; v < VecPairs; v++)
+            {
+                oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
+                oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+            }
+            store_payload_vec<RotateStyle, VecPairs>(p_output_y, oy0, oy1, did, hid, stride_oy_h, size_half_r);
+        }
+
+        // the rest are just forwarded (nope copy, distributed round-robin)
         if constexpr(!Inplace)
         {
-            const int32_t did_start = NopeFirst ? 0 : size_r;
-            const int32_t did_end   = NopeFirst ? (size_d - size_r) : size_d;
+            const int32_t nope_start = NopeFirst ? 0 : size_r;
+            const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
             elementwise_copy_2c(p_output_x,
                                 p_output_y,
                                 p_input_x,
                                 p_input_y,
                                 size_h_x,
                                 size_h_y,
-                                did_start,
-                                did_end,
+                                nope_start,
+                                nope_end,
                                 stride_ix_h,
                                 stride_ix_d,
                                 stride_iy_h,
@@ -965,7 +865,9 @@ struct OpUncachedFwd
                                 stride_ox_h,
                                 stride_ox_d,
                                 stride_oy_h,
-                                stride_oy_d);
+                                stride_oy_d,
+                                d_chunk_idx,
+                                threads_per_sb);
         }
     }
 };
@@ -990,120 +892,55 @@ struct OpUncachedBwd
                                                     const int32_t stride_o_h,
                                                     const int32_t stride_o_d,
                                                     const int32_t stride_i_h,
-                                                    const int32_t stride_i_d)
+                                                    const int32_t stride_i_d,
+                                                    const int32_t d_chunk_idx,
+                                                    const int32_t threads_per_sb)
     {
         // rotate count
         const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
+        const int32_t did         = d_chunk_idx * VecPairs + did_start;
 
-        if constexpr(VecPairs > 1)
+        // Load cos/sin once for this thread's VecPairs pairs
+        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
+        load_cos_sin_uncached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
+            cos_0, sin_0, cos_1, sin_1, p_freqs, did - did_start, size_half_r);
+
+        // Loop over ALL heads
+        for(int32_t hid = 0; hid < size_h; hid++)
         {
-            const int32_t did_end_vec = did_start + (((size_half_r - did_start) / VecPairs) * VecPairs);
-            for(int32_t did = threadIdx.x * VecPairs + did_start; did < did_end_vec; did += blockDim.x * VecPairs)
+            float og0[VecPairs], og1[VecPairs];
+            load_payload_vec<RotateStyle, VecPairs>(
+                og0, og1, p_output_grads, did, hid, stride_o_h, size_half_r);
+
+            float ig0[VecPairs], ig1[VecPairs];
+            for(int32_t v = 0; v < VecPairs; v++)
             {
-                float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
-                load_cos_sin_uncached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
-                    cos_0, sin_0, cos_1, sin_1, p_freqs, did - did_start, size_half_r);
-
-                for(int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
-                {
-                    float og0[VecPairs], og1[VecPairs];
-                    load_payload_vec<RotateStyle, VecPairs>(
-                        og0, og1, p_output_grads, did, hid, stride_o_h, size_half_r);
-
-                    float ig0[VecPairs], ig1[VecPairs];
-                    for(int32_t v = 0; v < VecPairs; v++)
-                    {
-                        ig0[v] = og0[v] * cos_0[v] + og1[v] * sin_0[v];
-                        ig1[v] = og1[v] * cos_1[v] - og0[v] * sin_1[v];
-                    }
-
-                    store_payload_vec<RotateStyle, VecPairs>(
-                        p_input_grads, ig0, ig1, did, hid, stride_i_h, size_half_r);
-                }
+                ig0[v] = og0[v] * cos_0[v] + og1[v] * sin_0[v];
+                ig1[v] = og1[v] * cos_1[v] - og0[v] * sin_1[v];
             }
-            // Tail: scalar fallback
-            for(int32_t did = threadIdx.x + did_end_vec; did < size_half_r; did += blockDim.x)
-            {
-                float cos_0, sin_0, cos_1, sin_1;
-                load_cos_sin_uncached<RotateStyle, false, ReuseFreqsFrontPart>(
-                    &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did - did_start, size_half_r);
 
-                for(int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
-                {
-                    float output_grad_0, output_grad_1;
-                    load_payload<RotateStyle, StrideDOutGradsEq1>(&output_grad_0,
-                                                                  &output_grad_1,
-                                                                  p_output_grads,
-                                                                  did,
-                                                                  hid,
-                                                                  stride_o_d,
-                                                                  stride_o_h,
-                                                                  size_half_r);
-
-                    const float input_grad_0 = output_grad_0 * cos_0 + output_grad_1 * sin_0;
-                    const float input_grad_1 = output_grad_1 * cos_1 - output_grad_0 * sin_1;
-                    store_payload<RotateStyle, StrideDInGradsEq1>(p_input_grads,
-                                                                  input_grad_0,
-                                                                  input_grad_1,
-                                                                  did,
-                                                                  hid,
-                                                                  stride_i_d,
-                                                                  stride_i_h,
-                                                                  size_half_r);
-                }
-            }
-        }
-        else
-        {
-            // Original scalar path (VecPairs == 1)
-            for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
-            {
-                float cos_0, sin_0, cos_1, sin_1;
-                load_cos_sin_uncached<RotateStyle, false, ReuseFreqsFrontPart>(
-                    &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did - did_start, size_half_r);
-
-                for(int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
-                {
-                    float output_grad_0, output_grad_1;
-                    load_payload<RotateStyle, StrideDOutGradsEq1>(&output_grad_0,
-                                                                  &output_grad_1,
-                                                                  p_output_grads,
-                                                                  did,
-                                                                  hid,
-                                                                  stride_o_d,
-                                                                  stride_o_h,
-                                                                  size_half_r);
-
-                    const float input_grad_0 = output_grad_0 * cos_0 + output_grad_1 * sin_0;
-                    const float input_grad_1 = output_grad_1 * cos_1 - output_grad_0 * sin_1;
-                    store_payload<RotateStyle, StrideDInGradsEq1>(p_input_grads,
-                                                                  input_grad_0,
-                                                                  input_grad_1,
-                                                                  did,
-                                                                  hid,
-                                                                  stride_i_d,
-                                                                  stride_i_h,
-                                                                  size_half_r);
-                }
-            }
+            store_payload_vec<RotateStyle, VecPairs>(
+                p_input_grads, ig0, ig1, did, hid, stride_i_h, size_half_r);
         }
 
-        // the rest are just forwarded
+        // the rest are just forwarded (nope copy, distributed round-robin)
         if constexpr(!Inplace)
         {
-            const int32_t did_start = NopeFirst ? 0 : size_r;
-            const int32_t did_end   = NopeFirst ? (size_d - size_r) : size_d;
+            const int32_t nope_start = NopeFirst ? 0 : size_r;
+            const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
             elementwise_copy(p_input_grads,
                              p_output_grads,
                              size_h,
-                             did_start,
-                             did_end,
+                             nope_start,
+                             nope_end,
                              stride_o_h,
                              stride_o_d,
                              stride_i_h,
-                             stride_i_d);
+                             stride_i_d,
+                             d_chunk_idx,
+                             threads_per_sb);
         }
     }
 
@@ -1134,211 +971,83 @@ struct OpUncachedBwd
                                                     const int32_t stride_ix_h,
                                                     const int32_t stride_ix_d,
                                                     const int32_t stride_iy_h,
-                                                    const int32_t stride_iy_d)
+                                                    const int32_t stride_iy_d,
+                                                    const int32_t d_chunk_idx,
+                                                    const int32_t threads_per_sb)
     {
         // rotate count
         const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
         const int32_t size_min_h  = min(size_h_x, size_h_y);
+        const int32_t did         = d_chunk_idx * VecPairs + did_start;
 
-        if constexpr(VecPairs > 1)
+        // Load cos/sin once for this thread's VecPairs pairs
+        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
+        load_cos_sin_uncached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
+            cos_0, sin_0, cos_1, sin_1, p_freqs, did - did_start, size_half_r);
+
+        // Loop over shared heads (both x and y)
+        for(int32_t hid = 0; hid < size_min_h; hid++)
         {
-            const int32_t did_end_vec = did_start + (((size_half_r - did_start) / VecPairs) * VecPairs);
-            for(int32_t did = threadIdx.x * VecPairs + did_start; did < did_end_vec; did += blockDim.x * VecPairs)
+            float ogx0[VecPairs], ogx1[VecPairs], ogy0[VecPairs], ogy1[VecPairs];
+            load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, p_output_grads_x, did, hid, stride_ox_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, p_output_grads_y, did, hid, stride_oy_h, size_half_r);
+
+            float igx0[VecPairs], igx1[VecPairs], igy0[VecPairs], igy1[VecPairs];
+            for(int32_t v = 0; v < VecPairs; v++)
             {
-                float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
-                load_cos_sin_uncached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
-                    cos_0, sin_0, cos_1, sin_1, p_freqs, did - did_start, size_half_r);
-
-                for(int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
-                {
-                    float ogx0[VecPairs], ogx1[VecPairs], ogy0[VecPairs], ogy1[VecPairs];
-                    load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, p_output_grads_x, did, hid, stride_ox_h, size_half_r);
-                    load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, p_output_grads_y, did, hid, stride_oy_h, size_half_r);
-
-                    float igx0[VecPairs], igx1[VecPairs], igy0[VecPairs], igy1[VecPairs];
-                    for(int32_t v = 0; v < VecPairs; v++)
-                    {
-                        igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
-                        igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
-                        igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
-                        igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
-                    }
-
-                    store_payload_vec<RotateStyle, VecPairs>(p_input_grads_x, igx0, igx1, did, hid, stride_ix_h, size_half_r);
-                    store_payload_vec<RotateStyle, VecPairs>(p_input_grads_y, igy0, igy1, did, hid, stride_iy_h, size_half_r);
-                }
-
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_x; hid += blockDim.y)
-                {
-                    float ogx0[VecPairs], ogx1[VecPairs];
-                    load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, p_output_grads_x, did, hid, stride_ox_h, size_half_r);
-                    float igx0[VecPairs], igx1[VecPairs];
-                    for(int32_t v = 0; v < VecPairs; v++)
-                    {
-                        igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
-                        igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
-                    }
-                    store_payload_vec<RotateStyle, VecPairs>(p_input_grads_x, igx0, igx1, did, hid, stride_ix_h, size_half_r);
-                }
-
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_y; hid += blockDim.y)
-                {
-                    float ogy0[VecPairs], ogy1[VecPairs];
-                    load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, p_output_grads_y, did, hid, stride_oy_h, size_half_r);
-                    float igy0[VecPairs], igy1[VecPairs];
-                    for(int32_t v = 0; v < VecPairs; v++)
-                    {
-                        igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
-                        igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
-                    }
-                    store_payload_vec<RotateStyle, VecPairs>(p_input_grads_y, igy0, igy1, did, hid, stride_iy_h, size_half_r);
-                }
+                igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
+                igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
+                igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
+                igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
             }
-            // Tail: scalar fallback
-            for(int32_t did = threadIdx.x + did_end_vec; did < size_half_r; did += blockDim.x)
-            {
-                float cos_0, sin_0, cos_1, sin_1;
-                load_cos_sin_uncached<RotateStyle, false, ReuseFreqsFrontPart>(
-                    &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did - did_start, size_half_r);
 
-                for(int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
-                {
-                    float ogx0, ogx1, ogy0, ogy1;
-                    load_payload<RotateStyle, StrideDOutGradsXEq1>(&ogx0, &ogx1, p_output_grads_x, did, hid, stride_ox_d, stride_ox_h, size_half_r);
-                    load_payload<RotateStyle, StrideDOutGradsYEq1>(&ogy0, &ogy1, p_output_grads_y, did, hid, stride_oy_d, stride_oy_h, size_half_r);
-                    store_payload<RotateStyle, StrideDInGradsXEq1>(p_input_grads_x, ogx0*cos_0+ogx1*sin_0, ogx1*cos_1-ogx0*sin_1, did, hid, stride_ix_d, stride_ix_h, size_half_r);
-                    store_payload<RotateStyle, StrideDInGradsYEq1>(p_input_grads_y, ogy0*cos_0+ogy1*sin_0, ogy1*cos_1-ogy0*sin_1, did, hid, stride_iy_d, stride_iy_h, size_half_r);
-                }
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_x; hid += blockDim.y)
-                {
-                    float ogx0, ogx1;
-                    load_payload<RotateStyle, StrideDOutGradsXEq1>(&ogx0, &ogx1, p_output_grads_x, did, hid, stride_ox_d, stride_ox_h, size_half_r);
-                    store_payload<RotateStyle, StrideDInGradsXEq1>(p_input_grads_x, ogx0*cos_0+ogx1*sin_0, ogx1*cos_1-ogx0*sin_1, did, hid, stride_ix_d, stride_ix_h, size_half_r);
-                }
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_y; hid += blockDim.y)
-                {
-                    float ogy0, ogy1;
-                    load_payload<RotateStyle, StrideDOutGradsYEq1>(&ogy0, &ogy1, p_output_grads_y, did, hid, stride_oy_d, stride_oy_h, size_half_r);
-                    store_payload<RotateStyle, StrideDInGradsYEq1>(p_input_grads_y, ogy0*cos_0+ogy1*sin_0, ogy1*cos_1-ogy0*sin_1, did, hid, stride_iy_d, stride_iy_h, size_half_r);
-                }
-            }
-        }
-        else
-        {
-            // Original scalar path (VecPairs == 1)
-            for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
-            {
-                float cos_0, sin_0, cos_1, sin_1;
-                load_cos_sin_uncached<RotateStyle, false, ReuseFreqsFrontPart>(
-                    &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did - did_start, size_half_r);
-
-                for(int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
-                {
-                    float output_grad_x_0, output_grad_x_1, output_grad_y_0, output_grad_y_1;
-                    load_payload<RotateStyle, StrideDOutGradsXEq1>(&output_grad_x_0,
-                                                                   &output_grad_x_1,
-                                                                   p_output_grads_x,
-                                                                   did,
-                                                                   hid,
-                                                                   stride_ox_d,
-                                                                   stride_ox_h,
-                                                                   size_half_r);
-                    load_payload<RotateStyle, StrideDOutGradsYEq1>(&output_grad_y_0,
-                                                                   &output_grad_y_1,
-                                                                   p_output_grads_y,
-                                                                   did,
-                                                                   hid,
-                                                                   stride_oy_d,
-                                                                   stride_oy_h,
-                                                                   size_half_r);
-
-                    const float input_grad_x_0 = output_grad_x_0 * cos_0 + output_grad_x_1 * sin_0;
-                    const float input_grad_x_1 = output_grad_x_1 * cos_1 - output_grad_x_0 * sin_1;
-                    const float input_grad_y_0 = output_grad_y_0 * cos_0 + output_grad_y_1 * sin_0;
-                    const float input_grad_y_1 = output_grad_y_1 * cos_1 - output_grad_y_0 * sin_1;
-                    store_payload<RotateStyle, StrideDInGradsXEq1>(p_input_grads_x,
-                                                                   input_grad_x_0,
-                                                                   input_grad_x_1,
-                                                                   did,
-                                                                   hid,
-                                                                   stride_ix_d,
-                                                                   stride_ix_h,
-                                                                   size_half_r);
-                    store_payload<RotateStyle, StrideDInGradsYEq1>(p_input_grads_y,
-                                                                   input_grad_y_0,
-                                                                   input_grad_y_1,
-                                                                   did,
-                                                                   hid,
-                                                                   stride_iy_d,
-                                                                   stride_iy_h,
-                                                                   size_half_r);
-                }
-
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_x; hid += blockDim.y)
-                {
-                    float output_grad_x_0, output_grad_x_1;
-                    load_payload<RotateStyle, StrideDOutGradsXEq1>(&output_grad_x_0,
-                                                                   &output_grad_x_1,
-                                                                   p_output_grads_x,
-                                                                   did,
-                                                                   hid,
-                                                                   stride_ox_d,
-                                                                   stride_ox_h,
-                                                                   size_half_r);
-
-                    const float input_grad_x_0 = output_grad_x_0 * cos_0 + output_grad_x_1 * sin_0;
-                    const float input_grad_x_1 = output_grad_x_1 * cos_1 - output_grad_x_0 * sin_1;
-                    store_payload<RotateStyle, StrideDInGradsXEq1>(p_input_grads_x,
-                                                                   input_grad_x_0,
-                                                                   input_grad_x_1,
-                                                                   did,
-                                                                   hid,
-                                                                   stride_ix_d,
-                                                                   stride_ix_h,
-                                                                   size_half_r);
-                }
-
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_y; hid += blockDim.y)
-                {
-                    float output_grad_y_0, output_grad_y_1;
-                    load_payload<RotateStyle, StrideDOutGradsYEq1>(&output_grad_y_0,
-                                                                   &output_grad_y_1,
-                                                                   p_output_grads_y,
-                                                                   did,
-                                                                   hid,
-                                                                   stride_oy_d,
-                                                                   stride_oy_h,
-                                                                   size_half_r);
-
-                    const float input_grad_y_0 = output_grad_y_0 * cos_0 + output_grad_y_1 * sin_0;
-                    const float input_grad_y_1 = output_grad_y_1 * cos_1 - output_grad_y_0 * sin_1;
-                    store_payload<RotateStyle, StrideDInGradsYEq1>(p_input_grads_y,
-                                                                   input_grad_y_0,
-                                                                   input_grad_y_1,
-                                                                   did,
-                                                                   hid,
-                                                                   stride_iy_d,
-                                                                   stride_iy_h,
-                                                                   size_half_r);
-                }
-            }
+            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_x, igx0, igx1, did, hid, stride_ix_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_y, igy0, igy1, did, hid, stride_iy_h, size_half_r);
         }
 
-        // the rest are just forwarded
+        // Remaining x-only heads
+        for(int32_t hid = size_min_h; hid < size_h_x; hid++)
+        {
+            float ogx0[VecPairs], ogx1[VecPairs];
+            load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, p_output_grads_x, did, hid, stride_ox_h, size_half_r);
+            float igx0[VecPairs], igx1[VecPairs];
+            for(int32_t v = 0; v < VecPairs; v++)
+            {
+                igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
+                igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
+            }
+            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_x, igx0, igx1, did, hid, stride_ix_h, size_half_r);
+        }
+
+        // Remaining y-only heads
+        for(int32_t hid = size_min_h; hid < size_h_y; hid++)
+        {
+            float ogy0[VecPairs], ogy1[VecPairs];
+            load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, p_output_grads_y, did, hid, stride_oy_h, size_half_r);
+            float igy0[VecPairs], igy1[VecPairs];
+            for(int32_t v = 0; v < VecPairs; v++)
+            {
+                igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
+                igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
+            }
+            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_y, igy0, igy1, did, hid, stride_iy_h, size_half_r);
+        }
+
+        // the rest are just forwarded (nope copy, distributed round-robin)
         if constexpr(!Inplace)
         {
-            const int32_t did_start = NopeFirst ? 0 : size_r;
-            const int32_t did_end   = NopeFirst ? (size_d - size_r) : size_d;
+            const int32_t nope_start = NopeFirst ? 0 : size_r;
+            const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
             elementwise_copy_2c(p_input_grads_x,
                                 p_input_grads_y,
                                 p_output_grads_x,
                                 p_output_grads_y,
                                 size_h_x,
                                 size_h_y,
-                                did_start,
-                                did_end,
+                                nope_start,
+                                nope_end,
                                 stride_ox_h,
                                 stride_ox_d,
                                 stride_oy_h,
@@ -1346,7 +1055,9 @@ struct OpUncachedBwd
                                 stride_ix_h,
                                 stride_ix_d,
                                 stride_iy_h,
-                                stride_iy_d);
+                                stride_iy_d,
+                                d_chunk_idx,
+                                threads_per_sb);
         }
     }
 };
@@ -1372,96 +1083,55 @@ struct OpCachedFwd
                                                     const int32_t stride_i_h,
                                                     const int32_t stride_i_d,
                                                     const int32_t stride_o_h,
-                                                    const int32_t stride_o_d)
+                                                    const int32_t stride_o_d,
+                                                    const int32_t d_chunk_idx,
+                                                    const int32_t threads_per_sb)
     {
         // rotate count
         const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
+        const int32_t did         = d_chunk_idx * VecPairs + did_start;
 
-        if constexpr(VecPairs > 1)
+        // Load cos/sin once for this thread's VecPairs pairs
+        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
+        load_cos_sin_cached_vec<RotateStyle, VecPairs, true, ReuseFreqsFrontPart>(
+            cos_0, sin_0, cos_1, sin_1, p_cos, p_sin, did - did_start, size_half_r);
+
+        // Loop over ALL heads
+        for(int32_t hid = 0; hid < size_h; hid++)
         {
-            const int32_t did_end_vec = did_start + (((size_half_r - did_start) / VecPairs) * VecPairs);
-            for(int32_t did = threadIdx.x * VecPairs + did_start; did < did_end_vec; did += blockDim.x * VecPairs)
+            float input_0[VecPairs], input_1[VecPairs];
+            load_payload_vec<RotateStyle, VecPairs>(
+                input_0, input_1, p_input, did, hid, stride_i_h, size_half_r);
+
+            float output_0[VecPairs], output_1[VecPairs];
+            for(int32_t v = 0; v < VecPairs; v++)
             {
-                float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
-                load_cos_sin_cached_vec<RotateStyle, VecPairs, true, ReuseFreqsFrontPart>(
-                    cos_0, sin_0, cos_1, sin_1, p_cos, p_sin, did - did_start, size_half_r);
-
-                for(int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
-                {
-                    float input_0[VecPairs], input_1[VecPairs];
-                    load_payload_vec<RotateStyle, VecPairs>(
-                        input_0, input_1, p_input, did, hid, stride_i_h, size_half_r);
-
-                    float output_0[VecPairs], output_1[VecPairs];
-                    for(int32_t v = 0; v < VecPairs; v++)
-                    {
-                        output_0[v] = input_0[v] * cos_0[v] - input_1[v] * sin_0[v];
-                        output_1[v] = input_1[v] * cos_1[v] + input_0[v] * sin_1[v];
-                    }
-
-                    store_payload_vec<RotateStyle, VecPairs>(
-                        p_output, output_0, output_1, did, hid, stride_o_h, size_half_r);
-                }
+                output_0[v] = input_0[v] * cos_0[v] - input_1[v] * sin_0[v];
+                output_1[v] = input_1[v] * cos_1[v] + input_0[v] * sin_1[v];
             }
-            // Tail: scalar fallback
-            for(int32_t did = threadIdx.x + did_end_vec; did < size_half_r; did += blockDim.x)
-            {
-                float cos_0, sin_0, cos_1, sin_1;
-                load_cos_sin_cached<RotateStyle, true, ReuseFreqsFrontPart>(
-                    &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did - did_start, size_half_r);
 
-                for(int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
-                {
-                    float input_0, input_1;
-                    load_payload<RotateStyle, StrideDInEq1>(
-                        &input_0, &input_1, p_input, did, hid, stride_i_d, stride_i_h, size_half_r);
-
-                    const float output_0 = input_0 * cos_0 - input_1 * sin_0;
-                    const float output_1 = input_1 * cos_1 + input_0 * sin_1;
-                    store_payload<RotateStyle, StrideDOutEq1>(
-                        p_output, output_0, output_1, did, hid, stride_o_d, stride_o_h, size_half_r);
-                }
-            }
-        }
-        else
-        {
-            // Original scalar path (VecPairs == 1)
-            for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
-            {
-                float cos_0, sin_0, cos_1, sin_1;
-                load_cos_sin_cached<RotateStyle, true, ReuseFreqsFrontPart>(
-                    &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did - did_start, size_half_r);
-
-                for(int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
-                {
-                    float input_0, input_1;
-                    load_payload<RotateStyle, StrideDInEq1>(
-                        &input_0, &input_1, p_input, did, hid, stride_i_d, stride_i_h, size_half_r);
-
-                    const float output_0 = input_0 * cos_0 - input_1 * sin_0;
-                    const float output_1 = input_1 * cos_1 + input_0 * sin_1;
-                    store_payload<RotateStyle, StrideDOutEq1>(
-                        p_output, output_0, output_1, did, hid, stride_o_d, stride_o_h, size_half_r);
-                }
-            }
+            store_payload_vec<RotateStyle, VecPairs>(
+                p_output, output_0, output_1, did, hid, stride_o_h, size_half_r);
         }
 
-        // the rest are just forwarded
+        // the rest are just forwarded (nope copy, distributed round-robin)
         if constexpr(!Inplace)
         {
-            const int32_t did_start = NopeFirst ? 0 : size_r;
-            const int32_t did_end   = NopeFirst ? (size_d - size_r) : size_d;
+            const int32_t nope_start = NopeFirst ? 0 : size_r;
+            const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
             elementwise_copy(p_output,
                              p_input,
                              size_h,
-                             did_start,
-                             did_end,
+                             nope_start,
+                             nope_end,
                              stride_i_h,
                              stride_i_d,
                              stride_o_h,
-                             stride_o_d);
+                             stride_o_d,
+                             d_chunk_idx,
+                             threads_per_sb);
         }
     }
 
@@ -1493,145 +1163,83 @@ struct OpCachedFwd
                                                     const int32_t stride_ox_h,
                                                     const int32_t stride_ox_d,
                                                     const int32_t stride_oy_h,
-                                                    const int32_t stride_oy_d)
+                                                    const int32_t stride_oy_d,
+                                                    const int32_t d_chunk_idx,
+                                                    const int32_t threads_per_sb)
     {
         // rotate count
         const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
         const int32_t size_min_h  = min(size_h_x, size_h_y);
+        const int32_t did         = d_chunk_idx * VecPairs + did_start;
 
-        if constexpr(VecPairs > 1)
+        // Load cos/sin once for this thread's VecPairs pairs
+        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
+        load_cos_sin_cached_vec<RotateStyle, VecPairs, true, ReuseFreqsFrontPart>(
+            cos_0, sin_0, cos_1, sin_1, p_cos, p_sin, did - did_start, size_half_r);
+
+        // Loop over shared heads (both x and y)
+        for(int32_t hid = 0; hid < size_min_h; hid++)
         {
-            const int32_t did_end_vec = did_start + (((size_half_r - did_start) / VecPairs) * VecPairs);
-            for(int32_t did = threadIdx.x * VecPairs + did_start; did < did_end_vec; did += blockDim.x * VecPairs)
+            float ix0[VecPairs], ix1[VecPairs], iy0[VecPairs], iy1[VecPairs];
+            load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, p_input_x, did, hid, stride_ix_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, p_input_y, did, hid, stride_iy_h, size_half_r);
+
+            float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
+            for(int32_t v = 0; v < VecPairs; v++)
             {
-                float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
-                load_cos_sin_cached_vec<RotateStyle, VecPairs, true, ReuseFreqsFrontPart>(
-                    cos_0, sin_0, cos_1, sin_1, p_cos, p_sin, did - did_start, size_half_r);
-
-                for(int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
-                {
-                    float ix0[VecPairs], ix1[VecPairs], iy0[VecPairs], iy1[VecPairs];
-                    load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, p_input_x, did, hid, stride_ix_h, size_half_r);
-                    load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, p_input_y, did, hid, stride_iy_h, size_half_r);
-
-                    float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
-                    for(int32_t v = 0; v < VecPairs; v++)
-                    {
-                        ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                        ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
-                        oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                        oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
-                    }
-
-                    store_payload_vec<RotateStyle, VecPairs>(p_output_x, ox0, ox1, did, hid, stride_ox_h, size_half_r);
-                    store_payload_vec<RotateStyle, VecPairs>(p_output_y, oy0, oy1, did, hid, stride_oy_h, size_half_r);
-                }
-
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_x; hid += blockDim.y)
-                {
-                    float ix0[VecPairs], ix1[VecPairs];
-                    load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, p_input_x, did, hid, stride_ix_h, size_half_r);
-                    float ox0[VecPairs], ox1[VecPairs];
-                    for(int32_t v = 0; v < VecPairs; v++)
-                    {
-                        ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                        ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
-                    }
-                    store_payload_vec<RotateStyle, VecPairs>(p_output_x, ox0, ox1, did, hid, stride_ox_h, size_half_r);
-                }
-
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_y; hid += blockDim.y)
-                {
-                    float iy0[VecPairs], iy1[VecPairs];
-                    load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, p_input_y, did, hid, stride_iy_h, size_half_r);
-                    float oy0[VecPairs], oy1[VecPairs];
-                    for(int32_t v = 0; v < VecPairs; v++)
-                    {
-                        oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                        oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
-                    }
-                    store_payload_vec<RotateStyle, VecPairs>(p_output_y, oy0, oy1, did, hid, stride_oy_h, size_half_r);
-                }
+                ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
+                ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
+                oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
             }
-            // Tail: scalar fallback
-            for(int32_t did = threadIdx.x + did_end_vec; did < size_half_r; did += blockDim.x)
-            {
-                float cos_0, sin_0, cos_1, sin_1;
-                load_cos_sin_cached<RotateStyle, true, ReuseFreqsFrontPart>(
-                    &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did - did_start, size_half_r);
 
-                for(int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
-                {
-                    float ix0, ix1, iy0, iy1;
-                    load_payload<RotateStyle, StrideDInXEq1>(&ix0, &ix1, p_input_x, did, hid, stride_ix_d, stride_ix_h, size_half_r);
-                    load_payload<RotateStyle, StrideDInYEq1>(&iy0, &iy1, p_input_y, did, hid, stride_iy_d, stride_iy_h, size_half_r);
-                    store_payload<RotateStyle, StrideDOutXEq1>(p_output_x, ix0*cos_0-ix1*sin_0, ix1*cos_1+ix0*sin_1, did, hid, stride_ox_d, stride_ox_h, size_half_r);
-                    store_payload<RotateStyle, StrideDOutYEq1>(p_output_y, iy0*cos_0-iy1*sin_0, iy1*cos_1+iy0*sin_1, did, hid, stride_oy_d, stride_oy_h, size_half_r);
-                }
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_x; hid += blockDim.y)
-                {
-                    float ix0, ix1;
-                    load_payload<RotateStyle, StrideDInXEq1>(&ix0, &ix1, p_input_x, did, hid, stride_ix_d, stride_ix_h, size_half_r);
-                    store_payload<RotateStyle, StrideDOutXEq1>(p_output_x, ix0*cos_0-ix1*sin_0, ix1*cos_1+ix0*sin_1, did, hid, stride_ox_d, stride_ox_h, size_half_r);
-                }
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_y; hid += blockDim.y)
-                {
-                    float iy0, iy1;
-                    load_payload<RotateStyle, StrideDInYEq1>(&iy0, &iy1, p_input_y, did, hid, stride_iy_d, stride_iy_h, size_half_r);
-                    store_payload<RotateStyle, StrideDOutYEq1>(p_output_y, iy0*cos_0-iy1*sin_0, iy1*cos_1+iy0*sin_1, did, hid, stride_oy_d, stride_oy_h, size_half_r);
-                }
-            }
-        }
-        else
-        {
-            // Original scalar path (VecPairs == 1)
-            for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
-            {
-                float cos_0, sin_0, cos_1, sin_1;
-                load_cos_sin_cached<RotateStyle, true, ReuseFreqsFrontPart>(
-                    &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did - did_start, size_half_r);
-
-                for(int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
-                {
-                    float input_x_0, input_x_1, input_y_0, input_y_1;
-                    load_payload<RotateStyle, StrideDInXEq1>(&input_x_0, &input_x_1, p_input_x, did, hid, stride_ix_d, stride_ix_h, size_half_r);
-                    load_payload<RotateStyle, StrideDInYEq1>(&input_y_0, &input_y_1, p_input_y, did, hid, stride_iy_d, stride_iy_h, size_half_r);
-
-                    store_payload<RotateStyle, StrideDOutXEq1>(p_output_x, input_x_0*cos_0-input_x_1*sin_0, input_x_1*cos_1+input_x_0*sin_1, did, hid, stride_ox_d, stride_ox_h, size_half_r);
-                    store_payload<RotateStyle, StrideDOutYEq1>(p_output_y, input_y_0*cos_0-input_y_1*sin_0, input_y_1*cos_1+input_y_0*sin_1, did, hid, stride_oy_d, stride_oy_h, size_half_r);
-                }
-
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_x; hid += blockDim.y)
-                {
-                    float input_x_0, input_x_1;
-                    load_payload<RotateStyle, StrideDInXEq1>(&input_x_0, &input_x_1, p_input_x, did, hid, stride_ix_d, stride_ix_h, size_half_r);
-                    store_payload<RotateStyle, StrideDOutXEq1>(p_output_x, input_x_0*cos_0-input_x_1*sin_0, input_x_1*cos_1+input_x_0*sin_1, did, hid, stride_ox_d, stride_ox_h, size_half_r);
-                }
-
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_y; hid += blockDim.y)
-                {
-                    float input_y_0, input_y_1;
-                    load_payload<RotateStyle, StrideDInYEq1>(&input_y_0, &input_y_1, p_input_y, did, hid, stride_iy_d, stride_iy_h, size_half_r);
-                    store_payload<RotateStyle, StrideDOutYEq1>(p_output_y, input_y_0*cos_0-input_y_1*sin_0, input_y_1*cos_1+input_y_0*sin_1, did, hid, stride_oy_d, stride_oy_h, size_half_r);
-                }
-            }
+            store_payload_vec<RotateStyle, VecPairs>(p_output_x, ox0, ox1, did, hid, stride_ox_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(p_output_y, oy0, oy1, did, hid, stride_oy_h, size_half_r);
         }
 
-        // the rest are just forwarded
+        // Remaining x-only heads
+        for(int32_t hid = size_min_h; hid < size_h_x; hid++)
+        {
+            float ix0[VecPairs], ix1[VecPairs];
+            load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, p_input_x, did, hid, stride_ix_h, size_half_r);
+            float ox0[VecPairs], ox1[VecPairs];
+            for(int32_t v = 0; v < VecPairs; v++)
+            {
+                ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
+                ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+            }
+            store_payload_vec<RotateStyle, VecPairs>(p_output_x, ox0, ox1, did, hid, stride_ox_h, size_half_r);
+        }
+
+        // Remaining y-only heads
+        for(int32_t hid = size_min_h; hid < size_h_y; hid++)
+        {
+            float iy0[VecPairs], iy1[VecPairs];
+            load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, p_input_y, did, hid, stride_iy_h, size_half_r);
+            float oy0[VecPairs], oy1[VecPairs];
+            for(int32_t v = 0; v < VecPairs; v++)
+            {
+                oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
+                oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+            }
+            store_payload_vec<RotateStyle, VecPairs>(p_output_y, oy0, oy1, did, hid, stride_oy_h, size_half_r);
+        }
+
+        // the rest are just forwarded (nope copy, distributed round-robin)
         if constexpr(!Inplace)
         {
-            const int32_t did_start = NopeFirst ? 0 : size_r;
-            const int32_t did_end   = NopeFirst ? (size_d - size_r) : size_d;
+            const int32_t nope_start = NopeFirst ? 0 : size_r;
+            const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
             elementwise_copy_2c(p_output_x,
                                 p_output_y,
                                 p_input_x,
                                 p_input_y,
                                 size_h_x,
                                 size_h_y,
-                                did_start,
-                                did_end,
+                                nope_start,
+                                nope_end,
                                 stride_ix_h,
                                 stride_ix_d,
                                 stride_iy_h,
@@ -1639,7 +1247,9 @@ struct OpCachedFwd
                                 stride_ox_h,
                                 stride_ox_d,
                                 stride_oy_h,
-                                stride_oy_d);
+                                stride_oy_d,
+                                d_chunk_idx,
+                                threads_per_sb);
         }
     }
 };
@@ -1665,120 +1275,55 @@ struct OpCachedBwd
                                                     const int32_t stride_o_h,
                                                     const int32_t stride_o_d,
                                                     const int32_t stride_i_h,
-                                                    const int32_t stride_i_d)
+                                                    const int32_t stride_i_d,
+                                                    const int32_t d_chunk_idx,
+                                                    const int32_t threads_per_sb)
     {
         // rotate count
         const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
+        const int32_t did         = d_chunk_idx * VecPairs + did_start;
 
-        if constexpr(VecPairs > 1)
+        // Load cos/sin once for this thread's VecPairs pairs
+        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
+        load_cos_sin_cached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
+            cos_0, sin_0, cos_1, sin_1, p_cos, p_sin, did - did_start, size_half_r);
+
+        // Loop over ALL heads
+        for(int32_t hid = 0; hid < size_h; hid++)
         {
-            const int32_t did_end_vec = did_start + (((size_half_r - did_start) / VecPairs) * VecPairs);
-            for(int32_t did = threadIdx.x * VecPairs + did_start; did < did_end_vec; did += blockDim.x * VecPairs)
+            float og0[VecPairs], og1[VecPairs];
+            load_payload_vec<RotateStyle, VecPairs>(
+                og0, og1, p_output_grads, did, hid, stride_o_h, size_half_r);
+
+            float ig0[VecPairs], ig1[VecPairs];
+            for(int32_t v = 0; v < VecPairs; v++)
             {
-                float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
-                load_cos_sin_cached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
-                    cos_0, sin_0, cos_1, sin_1, p_cos, p_sin, did - did_start, size_half_r);
-
-                for(int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
-                {
-                    float og0[VecPairs], og1[VecPairs];
-                    load_payload_vec<RotateStyle, VecPairs>(
-                        og0, og1, p_output_grads, did, hid, stride_o_h, size_half_r);
-
-                    float ig0[VecPairs], ig1[VecPairs];
-                    for(int32_t v = 0; v < VecPairs; v++)
-                    {
-                        ig0[v] = og0[v] * cos_0[v] + og1[v] * sin_0[v];
-                        ig1[v] = og1[v] * cos_1[v] - og0[v] * sin_1[v];
-                    }
-
-                    store_payload_vec<RotateStyle, VecPairs>(
-                        p_input_grads, ig0, ig1, did, hid, stride_i_h, size_half_r);
-                }
+                ig0[v] = og0[v] * cos_0[v] + og1[v] * sin_0[v];
+                ig1[v] = og1[v] * cos_1[v] - og0[v] * sin_1[v];
             }
-            // Tail: scalar fallback
-            for(int32_t did = threadIdx.x + did_end_vec; did < size_half_r; did += blockDim.x)
-            {
-                float cos_0, sin_0, cos_1, sin_1;
-                load_cos_sin_cached<RotateStyle, false, ReuseFreqsFrontPart>(
-                    &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did - did_start, size_half_r);
 
-                for(int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
-                {
-                    float output_grad_0, output_grad_1;
-                    load_payload<RotateStyle, StrideDOutGradsEq1>(&output_grad_0,
-                                                                  &output_grad_1,
-                                                                  p_output_grads,
-                                                                  did,
-                                                                  hid,
-                                                                  stride_o_d,
-                                                                  stride_o_h,
-                                                                  size_half_r);
-
-                    const float input_grad_0 = output_grad_0 * cos_0 + output_grad_1 * sin_0;
-                    const float input_grad_1 = output_grad_1 * cos_1 - output_grad_0 * sin_1;
-                    store_payload<RotateStyle, StrideDInGradsEq1>(p_input_grads,
-                                                                  input_grad_0,
-                                                                  input_grad_1,
-                                                                  did,
-                                                                  hid,
-                                                                  stride_i_d,
-                                                                  stride_i_h,
-                                                                  size_half_r);
-                }
-            }
-        }
-        else
-        {
-            // Original scalar path (VecPairs == 1)
-            for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
-            {
-                float cos_0, sin_0, cos_1, sin_1;
-                load_cos_sin_cached<RotateStyle, false, ReuseFreqsFrontPart>(
-                    &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did - did_start, size_half_r);
-
-                for(int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
-                {
-                    float output_grad_0, output_grad_1;
-                    load_payload<RotateStyle, StrideDOutGradsEq1>(&output_grad_0,
-                                                                  &output_grad_1,
-                                                                  p_output_grads,
-                                                                  did,
-                                                                  hid,
-                                                                  stride_o_d,
-                                                                  stride_o_h,
-                                                                  size_half_r);
-
-                    const float input_grad_0 = output_grad_0 * cos_0 + output_grad_1 * sin_0;
-                    const float input_grad_1 = output_grad_1 * cos_1 - output_grad_0 * sin_1;
-                    store_payload<RotateStyle, StrideDInGradsEq1>(p_input_grads,
-                                                                  input_grad_0,
-                                                                  input_grad_1,
-                                                                  did,
-                                                                  hid,
-                                                                  stride_i_d,
-                                                                  stride_i_h,
-                                                                  size_half_r);
-                }
-            }
+            store_payload_vec<RotateStyle, VecPairs>(
+                p_input_grads, ig0, ig1, did, hid, stride_i_h, size_half_r);
         }
 
-        // the rest are just forwarded
+        // the rest are just forwarded (nope copy, distributed round-robin)
         if constexpr(!Inplace)
         {
-            const int32_t did_start = NopeFirst ? 0 : size_r;
-            const int32_t did_end   = NopeFirst ? (size_d - size_r) : size_d;
+            const int32_t nope_start = NopeFirst ? 0 : size_r;
+            const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
             elementwise_copy(p_input_grads,
                              p_output_grads,
                              size_h,
-                             did_start,
-                             did_end,
+                             nope_start,
+                             nope_end,
                              stride_o_h,
                              stride_o_d,
                              stride_i_h,
-                             stride_i_d);
+                             stride_i_d,
+                             d_chunk_idx,
+                             threads_per_sb);
         }
     }
 
@@ -1810,211 +1355,83 @@ struct OpCachedBwd
                                                     const int32_t stride_ix_h,
                                                     const int32_t stride_ix_d,
                                                     const int32_t stride_iy_h,
-                                                    const int32_t stride_iy_d)
+                                                    const int32_t stride_iy_d,
+                                                    const int32_t d_chunk_idx,
+                                                    const int32_t threads_per_sb)
     {
         // rotate count
         const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
         const int32_t size_min_h  = min(size_h_x, size_h_y);
+        const int32_t did         = d_chunk_idx * VecPairs + did_start;
 
-        if constexpr(VecPairs > 1)
+        // Load cos/sin once for this thread's VecPairs pairs
+        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
+        load_cos_sin_cached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
+            cos_0, sin_0, cos_1, sin_1, p_cos, p_sin, did - did_start, size_half_r);
+
+        // Loop over shared heads (both x and y)
+        for(int32_t hid = 0; hid < size_min_h; hid++)
         {
-            const int32_t did_end_vec = did_start + (((size_half_r - did_start) / VecPairs) * VecPairs);
-            for(int32_t did = threadIdx.x * VecPairs + did_start; did < did_end_vec; did += blockDim.x * VecPairs)
+            float ogx0[VecPairs], ogx1[VecPairs], ogy0[VecPairs], ogy1[VecPairs];
+            load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, p_output_grads_x, did, hid, stride_ox_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, p_output_grads_y, did, hid, stride_oy_h, size_half_r);
+
+            float igx0[VecPairs], igx1[VecPairs], igy0[VecPairs], igy1[VecPairs];
+            for(int32_t v = 0; v < VecPairs; v++)
             {
-                float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
-                load_cos_sin_cached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
-                    cos_0, sin_0, cos_1, sin_1, p_cos, p_sin, did - did_start, size_half_r);
-
-                for(int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
-                {
-                    float ogx0[VecPairs], ogx1[VecPairs], ogy0[VecPairs], ogy1[VecPairs];
-                    load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, p_output_grads_x, did, hid, stride_ox_h, size_half_r);
-                    load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, p_output_grads_y, did, hid, stride_oy_h, size_half_r);
-
-                    float igx0[VecPairs], igx1[VecPairs], igy0[VecPairs], igy1[VecPairs];
-                    for(int32_t v = 0; v < VecPairs; v++)
-                    {
-                        igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
-                        igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
-                        igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
-                        igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
-                    }
-
-                    store_payload_vec<RotateStyle, VecPairs>(p_input_grads_x, igx0, igx1, did, hid, stride_ix_h, size_half_r);
-                    store_payload_vec<RotateStyle, VecPairs>(p_input_grads_y, igy0, igy1, did, hid, stride_iy_h, size_half_r);
-                }
-
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_x; hid += blockDim.y)
-                {
-                    float ogx0[VecPairs], ogx1[VecPairs];
-                    load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, p_output_grads_x, did, hid, stride_ox_h, size_half_r);
-                    float igx0[VecPairs], igx1[VecPairs];
-                    for(int32_t v = 0; v < VecPairs; v++)
-                    {
-                        igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
-                        igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
-                    }
-                    store_payload_vec<RotateStyle, VecPairs>(p_input_grads_x, igx0, igx1, did, hid, stride_ix_h, size_half_r);
-                }
-
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_y; hid += blockDim.y)
-                {
-                    float ogy0[VecPairs], ogy1[VecPairs];
-                    load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, p_output_grads_y, did, hid, stride_oy_h, size_half_r);
-                    float igy0[VecPairs], igy1[VecPairs];
-                    for(int32_t v = 0; v < VecPairs; v++)
-                    {
-                        igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
-                        igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
-                    }
-                    store_payload_vec<RotateStyle, VecPairs>(p_input_grads_y, igy0, igy1, did, hid, stride_iy_h, size_half_r);
-                }
+                igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
+                igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
+                igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
+                igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
             }
-            // Tail: scalar fallback
-            for(int32_t did = threadIdx.x + did_end_vec; did < size_half_r; did += blockDim.x)
-            {
-                float cos_0, sin_0, cos_1, sin_1;
-                load_cos_sin_cached<RotateStyle, false, ReuseFreqsFrontPart>(
-                    &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did - did_start, size_half_r);
 
-                for(int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
-                {
-                    float ogx0, ogx1, ogy0, ogy1;
-                    load_payload<RotateStyle, StrideDOutGradsXEq1>(&ogx0, &ogx1, p_output_grads_x, did, hid, stride_ox_d, stride_ox_h, size_half_r);
-                    load_payload<RotateStyle, StrideDOutGradsYEq1>(&ogy0, &ogy1, p_output_grads_y, did, hid, stride_oy_d, stride_oy_h, size_half_r);
-                    store_payload<RotateStyle, StrideDInGradsXEq1>(p_input_grads_x, ogx0*cos_0+ogx1*sin_0, ogx1*cos_1-ogx0*sin_1, did, hid, stride_ix_d, stride_ix_h, size_half_r);
-                    store_payload<RotateStyle, StrideDInGradsYEq1>(p_input_grads_y, ogy0*cos_0+ogy1*sin_0, ogy1*cos_1-ogy0*sin_1, did, hid, stride_iy_d, stride_iy_h, size_half_r);
-                }
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_x; hid += blockDim.y)
-                {
-                    float ogx0, ogx1;
-                    load_payload<RotateStyle, StrideDOutGradsXEq1>(&ogx0, &ogx1, p_output_grads_x, did, hid, stride_ox_d, stride_ox_h, size_half_r);
-                    store_payload<RotateStyle, StrideDInGradsXEq1>(p_input_grads_x, ogx0*cos_0+ogx1*sin_0, ogx1*cos_1-ogx0*sin_1, did, hid, stride_ix_d, stride_ix_h, size_half_r);
-                }
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_y; hid += blockDim.y)
-                {
-                    float ogy0, ogy1;
-                    load_payload<RotateStyle, StrideDOutGradsYEq1>(&ogy0, &ogy1, p_output_grads_y, did, hid, stride_oy_d, stride_oy_h, size_half_r);
-                    store_payload<RotateStyle, StrideDInGradsYEq1>(p_input_grads_y, ogy0*cos_0+ogy1*sin_0, ogy1*cos_1-ogy0*sin_1, did, hid, stride_iy_d, stride_iy_h, size_half_r);
-                }
-            }
-        }
-        else
-        {
-            // Original scalar path (VecPairs == 1)
-            for(int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
-            {
-                float cos_0, sin_0, cos_1, sin_1;
-                load_cos_sin_cached<RotateStyle, false, ReuseFreqsFrontPart>(
-                    &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did - did_start, size_half_r);
-
-                for(int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
-                {
-                    float output_grad_x_0, output_grad_x_1, output_grad_y_0, output_grad_y_1;
-                    load_payload<RotateStyle, StrideDOutGradsXEq1>(&output_grad_x_0,
-                                                                   &output_grad_x_1,
-                                                                   p_output_grads_x,
-                                                                   did,
-                                                                   hid,
-                                                                   stride_ox_d,
-                                                                   stride_ox_h,
-                                                                   size_half_r);
-                    load_payload<RotateStyle, StrideDOutGradsYEq1>(&output_grad_y_0,
-                                                                   &output_grad_y_1,
-                                                                   p_output_grads_y,
-                                                                   did,
-                                                                   hid,
-                                                                   stride_oy_d,
-                                                                   stride_oy_h,
-                                                                   size_half_r);
-
-                    const float input_grad_x_0 = output_grad_x_0 * cos_0 + output_grad_x_1 * sin_0;
-                    const float input_grad_x_1 = output_grad_x_1 * cos_1 - output_grad_x_0 * sin_1;
-                    const float input_grad_y_0 = output_grad_y_0 * cos_0 + output_grad_y_1 * sin_0;
-                    const float input_grad_y_1 = output_grad_y_1 * cos_1 - output_grad_y_0 * sin_1;
-                    store_payload<RotateStyle, StrideDInGradsXEq1>(p_input_grads_x,
-                                                                   input_grad_x_0,
-                                                                   input_grad_x_1,
-                                                                   did,
-                                                                   hid,
-                                                                   stride_ix_d,
-                                                                   stride_ix_h,
-                                                                   size_half_r);
-                    store_payload<RotateStyle, StrideDInGradsYEq1>(p_input_grads_y,
-                                                                   input_grad_y_0,
-                                                                   input_grad_y_1,
-                                                                   did,
-                                                                   hid,
-                                                                   stride_iy_d,
-                                                                   stride_iy_h,
-                                                                   size_half_r);
-                }
-
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_x; hid += blockDim.y)
-                {
-                    float output_grad_x_0, output_grad_x_1;
-                    load_payload<RotateStyle, StrideDOutGradsXEq1>(&output_grad_x_0,
-                                                                   &output_grad_x_1,
-                                                                   p_output_grads_x,
-                                                                   did,
-                                                                   hid,
-                                                                   stride_ox_d,
-                                                                   stride_ox_h,
-                                                                   size_half_r);
-
-                    const float input_grad_x_0 = output_grad_x_0 * cos_0 + output_grad_x_1 * sin_0;
-                    const float input_grad_x_1 = output_grad_x_1 * cos_1 - output_grad_x_0 * sin_1;
-                    store_payload<RotateStyle, StrideDInGradsXEq1>(p_input_grads_x,
-                                                                   input_grad_x_0,
-                                                                   input_grad_x_1,
-                                                                   did,
-                                                                   hid,
-                                                                   stride_ix_d,
-                                                                   stride_ix_h,
-                                                                   size_half_r);
-                }
-
-                for(int32_t hid = threadIdx.y + size_min_h; hid < size_h_y; hid += blockDim.y)
-                {
-                    float output_grad_y_0, output_grad_y_1;
-                    load_payload<RotateStyle, StrideDOutGradsYEq1>(&output_grad_y_0,
-                                                                   &output_grad_y_1,
-                                                                   p_output_grads_y,
-                                                                   did,
-                                                                   hid,
-                                                                   stride_oy_d,
-                                                                   stride_oy_h,
-                                                                   size_half_r);
-
-                    const float input_grad_y_0 = output_grad_y_0 * cos_0 + output_grad_y_1 * sin_0;
-                    const float input_grad_y_1 = output_grad_y_1 * cos_1 - output_grad_y_0 * sin_1;
-                    store_payload<RotateStyle, StrideDInGradsYEq1>(p_input_grads_y,
-                                                                   input_grad_y_0,
-                                                                   input_grad_y_1,
-                                                                   did,
-                                                                   hid,
-                                                                   stride_iy_d,
-                                                                   stride_iy_h,
-                                                                   size_half_r);
-                }
-            }
+            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_x, igx0, igx1, did, hid, stride_ix_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_y, igy0, igy1, did, hid, stride_iy_h, size_half_r);
         }
 
-        // the rest are just forwarded
+        // Remaining x-only heads
+        for(int32_t hid = size_min_h; hid < size_h_x; hid++)
+        {
+            float ogx0[VecPairs], ogx1[VecPairs];
+            load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, p_output_grads_x, did, hid, stride_ox_h, size_half_r);
+            float igx0[VecPairs], igx1[VecPairs];
+            for(int32_t v = 0; v < VecPairs; v++)
+            {
+                igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
+                igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
+            }
+            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_x, igx0, igx1, did, hid, stride_ix_h, size_half_r);
+        }
+
+        // Remaining y-only heads
+        for(int32_t hid = size_min_h; hid < size_h_y; hid++)
+        {
+            float ogy0[VecPairs], ogy1[VecPairs];
+            load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, p_output_grads_y, did, hid, stride_oy_h, size_half_r);
+            float igy0[VecPairs], igy1[VecPairs];
+            for(int32_t v = 0; v < VecPairs; v++)
+            {
+                igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
+                igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
+            }
+            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_y, igy0, igy1, did, hid, stride_iy_h, size_half_r);
+        }
+
+        // the rest are just forwarded (nope copy, distributed round-robin)
         if constexpr(!Inplace)
         {
-            const int32_t did_start = NopeFirst ? 0 : size_r;
-            const int32_t did_end   = NopeFirst ? (size_d - size_r) : size_d;
+            const int32_t nope_start = NopeFirst ? 0 : size_r;
+            const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
             elementwise_copy_2c(p_input_grads_x,
                                 p_input_grads_y,
                                 p_output_grads_x,
                                 p_output_grads_y,
                                 size_h_x,
                                 size_h_y,
-                                did_start,
-                                did_end,
+                                nope_start,
+                                nope_end,
                                 stride_ox_h,
                                 stride_ox_d,
                                 stride_oy_h,
@@ -2022,7 +1439,9 @@ struct OpCachedBwd
                                 stride_ix_h,
                                 stride_ix_d,
                                 stride_iy_h,
-                                stride_iy_d);
+                                stride_iy_d,
+                                d_chunk_idx,
+                                threads_per_sb);
         }
     }
 };
@@ -2054,10 +1473,18 @@ __launch_bounds__(256, 8) __global__
                                    const int32_t stride_o_s,
                                    const int32_t stride_o_b,
                                    const int32_t stride_o_h,
-                                   const int32_t stride_o_d)
+                                   const int32_t stride_o_d,
+                                   const int32_t size_s,
+                                   const int32_t threads_per_sb,
+                                   const int32_t total_sb)
 {
-    const uint64_t sid      = blockIdx.x;
-    const uint64_t bid      = blockIdx.y;
+    const int32_t global_tid   = blockIdx.x * 256 + threadIdx.x;
+    const int32_t sb_idx       = global_tid / threads_per_sb;
+    const int32_t d_chunk_idx  = global_tid % threads_per_sb;
+    if(sb_idx >= total_sb) return;
+    const int32_t sid = sb_idx % size_s;
+    const int32_t bid = sb_idx / size_s;
+
     const uint64_t offset_i = sid * stride_i_s + bid * stride_i_b;
     const uint64_t offset_o = sid * stride_o_s + bid * stride_o_b;
     const uint64_t offset_f = sid * size_f;
@@ -2077,7 +1504,9 @@ __launch_bounds__(256, 8) __global__
                                         stride_i_h,
                                         stride_i_d,
                                         stride_o_h,
-                                        stride_o_d);
+                                        stride_o_d,
+                                        d_chunk_idx,
+                                        threads_per_sb);
 }
 
 template <typename Op,
@@ -2097,10 +1526,18 @@ __launch_bounds__(256, 8) __global__
                                            const int32_t stride_s,
                                            const int32_t stride_b,
                                            const int32_t stride_h,
-                                           const int32_t stride_d)
+                                           const int32_t stride_d,
+                                           const int32_t size_s,
+                                           const int32_t threads_per_sb,
+                                           const int32_t total_sb)
 {
-    const uint64_t sid      = blockIdx.x;
-    const uint64_t bid      = blockIdx.y;
+    const int32_t global_tid   = blockIdx.x * 256 + threadIdx.x;
+    const int32_t sb_idx       = global_tid / threads_per_sb;
+    const int32_t d_chunk_idx  = global_tid % threads_per_sb;
+    if(sb_idx >= total_sb) return;
+    const int32_t sid = sb_idx % size_s;
+    const int32_t bid = sb_idx / size_s;
+
     const uint64_t offset   = sid * stride_s + bid * stride_b;
     const uint64_t offset_f = sid * size_f;
 
@@ -2119,7 +1556,9 @@ __launch_bounds__(256, 8) __global__
                                       stride_h,
                                       stride_d,
                                       stride_h,
-                                      stride_d);
+                                      stride_d,
+                                      d_chunk_idx,
+                                      threads_per_sb);
 }
 
 template <typename Op,
@@ -2158,10 +1597,18 @@ __launch_bounds__(256, 8) __global__
                                    const int32_t stride_oy_s,
                                    const int32_t stride_oy_b,
                                    const int32_t stride_oy_h,
-                                   const int32_t stride_oy_d)
+                                   const int32_t stride_oy_d,
+                                   const int32_t size_s,
+                                   const int32_t threads_per_sb,
+                                   const int32_t total_sb)
 {
-    const uint64_t sid       = blockIdx.x;
-    const uint64_t bid       = blockIdx.y;
+    const int32_t global_tid   = blockIdx.x * 256 + threadIdx.x;
+    const int32_t sb_idx       = global_tid / threads_per_sb;
+    const int32_t d_chunk_idx  = global_tid % threads_per_sb;
+    if(sb_idx >= total_sb) return;
+    const int32_t sid = sb_idx % size_s;
+    const int32_t bid = sb_idx / size_s;
+
     const uint64_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
     const uint64_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
     const uint64_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
@@ -2192,7 +1639,9 @@ __launch_bounds__(256, 8) __global__
                                          stride_ox_h,
                                          stride_ox_d,
                                          stride_oy_h,
-                                         stride_oy_d);
+                                         stride_oy_d,
+                                         d_chunk_idx,
+                                         threads_per_sb);
 }
 
 template <typename Op,
@@ -2219,10 +1668,18 @@ __launch_bounds__(256, 8) __global__
                                            const int32_t stride_y_s,
                                            const int32_t stride_y_b,
                                            const int32_t stride_y_h,
-                                           const int32_t stride_y_d)
+                                           const int32_t stride_y_d,
+                                           const int32_t size_s,
+                                           const int32_t threads_per_sb,
+                                           const int32_t total_sb)
 {
-    const uint64_t sid      = blockIdx.x;
-    const uint64_t bid      = blockIdx.y;
+    const int32_t global_tid   = blockIdx.x * 256 + threadIdx.x;
+    const int32_t sb_idx       = global_tid / threads_per_sb;
+    const int32_t d_chunk_idx  = global_tid % threads_per_sb;
+    if(sb_idx >= total_sb) return;
+    const int32_t sid = sb_idx % size_s;
+    const int32_t bid = sb_idx / size_s;
+
     const uint64_t offset_x = sid * stride_x_s + bid * stride_x_b;
     const uint64_t offset_y = sid * stride_y_s + bid * stride_y_b;
     const uint64_t offset_f = sid * size_f;
@@ -2251,7 +1708,9 @@ __launch_bounds__(256, 8) __global__
                                        stride_x_h,
                                        stride_x_d,
                                        stride_y_h,
-                                       stride_y_d);
+                                       stride_y_d,
+                                       d_chunk_idx,
+                                       threads_per_sb);
 }
 
 template <typename Op,
@@ -2278,10 +1737,18 @@ __launch_bounds__(256, 8) __global__
                                  const int32_t stride_o_s,
                                  const int32_t stride_o_b,
                                  const int32_t stride_o_h,
-                                 const int32_t stride_o_d)
+                                 const int32_t stride_o_d,
+                                 const int32_t size_s,
+                                 const int32_t threads_per_sb,
+                                 const int32_t total_sb)
 {
-    const uint64_t sid      = blockIdx.x;
-    const uint64_t bid      = blockIdx.y;
+    const int32_t global_tid   = blockIdx.x * 256 + threadIdx.x;
+    const int32_t sb_idx       = global_tid / threads_per_sb;
+    const int32_t d_chunk_idx  = global_tid % threads_per_sb;
+    if(sb_idx >= total_sb) return;
+    const int32_t sid = sb_idx % size_s;
+    const int32_t bid = sb_idx / size_s;
+
     const uint64_t offset_i = sid * stride_i_s + bid * stride_i_b;
     const uint64_t offset_o = sid * stride_o_s + bid * stride_o_b;
     const uint64_t offset_f = sid * size_f;
@@ -2302,7 +1769,9 @@ __launch_bounds__(256, 8) __global__
                                         stride_i_h,
                                         stride_i_d,
                                         stride_o_h,
-                                        stride_o_d);
+                                        stride_o_d,
+                                        d_chunk_idx,
+                                        threads_per_sb);
 }
 
 template <typename Op,
@@ -2323,10 +1792,18 @@ __launch_bounds__(256, 8) __global__
                                          const int32_t stride_s,
                                          const int32_t stride_b,
                                          const int32_t stride_h,
-                                         const int32_t stride_d)
+                                         const int32_t stride_d,
+                                         const int32_t size_s,
+                                         const int32_t threads_per_sb,
+                                         const int32_t total_sb)
 {
-    const uint64_t sid      = blockIdx.x;
-    const uint64_t bid      = blockIdx.y;
+    const int32_t global_tid   = blockIdx.x * 256 + threadIdx.x;
+    const int32_t sb_idx       = global_tid / threads_per_sb;
+    const int32_t d_chunk_idx  = global_tid % threads_per_sb;
+    if(sb_idx >= total_sb) return;
+    const int32_t sid = sb_idx % size_s;
+    const int32_t bid = sb_idx / size_s;
+
     const uint64_t offset   = sid * stride_s + bid * stride_b;
     const uint64_t offset_f = sid * size_f;
 
@@ -2346,7 +1823,9 @@ __launch_bounds__(256, 8) __global__
                                       stride_h,
                                       stride_d,
                                       stride_h,
-                                      stride_d);
+                                      stride_d,
+                                      d_chunk_idx,
+                                      threads_per_sb);
 }
 
 template <typename Op,
@@ -2386,10 +1865,18 @@ __launch_bounds__(256, 8) __global__
                                  const int32_t stride_oy_s,
                                  const int32_t stride_oy_b,
                                  const int32_t stride_oy_h,
-                                 const int32_t stride_oy_d)
+                                 const int32_t stride_oy_d,
+                                 const int32_t size_s,
+                                 const int32_t threads_per_sb,
+                                 const int32_t total_sb)
 {
-    const uint64_t sid       = blockIdx.x;
-    const uint64_t bid       = blockIdx.y;
+    const int32_t global_tid   = blockIdx.x * 256 + threadIdx.x;
+    const int32_t sb_idx       = global_tid / threads_per_sb;
+    const int32_t d_chunk_idx  = global_tid % threads_per_sb;
+    if(sb_idx >= total_sb) return;
+    const int32_t sid = sb_idx % size_s;
+    const int32_t bid = sb_idx / size_s;
+
     const uint64_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
     const uint64_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
     const uint64_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
@@ -2421,7 +1908,9 @@ __launch_bounds__(256, 8) __global__
                                          stride_ox_h,
                                          stride_ox_d,
                                          stride_oy_h,
-                                         stride_oy_d);
+                                         stride_oy_d,
+                                         d_chunk_idx,
+                                         threads_per_sb);
 }
 
 template <typename Op,
@@ -2449,10 +1938,18 @@ __launch_bounds__(256, 8) __global__
                                          const int32_t stride_y_s,
                                          const int32_t stride_y_b,
                                          const int32_t stride_y_h,
-                                         const int32_t stride_y_d)
+                                         const int32_t stride_y_d,
+                                         const int32_t size_s,
+                                         const int32_t threads_per_sb,
+                                         const int32_t total_sb)
 {
-    const uint64_t sid      = blockIdx.x;
-    const uint64_t bid      = blockIdx.y;
+    const int32_t global_tid   = blockIdx.x * 256 + threadIdx.x;
+    const int32_t sb_idx       = global_tid / threads_per_sb;
+    const int32_t d_chunk_idx  = global_tid % threads_per_sb;
+    if(sb_idx >= total_sb) return;
+    const int32_t sid = sb_idx % size_s;
+    const int32_t bid = sb_idx / size_s;
+
     const uint64_t offset_x = sid * stride_x_s + bid * stride_x_b;
     const uint64_t offset_y = sid * stride_y_s + bid * stride_y_b;
     const uint64_t offset_f = sid * size_f;
@@ -2482,7 +1979,9 @@ __launch_bounds__(256, 8) __global__
                                        stride_x_h,
                                        stride_x_d,
                                        stride_y_h,
-                                       stride_y_d);
+                                       stride_y_d,
+                                       d_chunk_idx,
+                                       threads_per_sb);
 }
 
 template <typename Op,
@@ -2511,11 +2010,19 @@ __launch_bounds__(256, 8) __global__
                                           const int32_t stride_o_s,
                                           const int32_t stride_o_b,
                                           const int32_t stride_o_h,
-                                          const int32_t stride_o_d)
+                                          const int32_t stride_o_d,
+                                          const int32_t size_s,
+                                          const int32_t threads_per_sb,
+                                          const int32_t total_sb)
 {
-    const uint64_t sid    = blockIdx.x;
-    const uint64_t bid    = blockIdx.y;
-    const uint64_t ib_idx = sid * gridDim.y + bid;
+    const int32_t global_tid   = blockIdx.x * 256 + threadIdx.x;
+    const int32_t sb_idx       = global_tid / threads_per_sb;
+    const int32_t d_chunk_idx  = global_tid % threads_per_sb;
+    if(sb_idx >= total_sb) return;
+    const int32_t sid = sb_idx % size_s;
+    const int32_t bid = sb_idx / size_s;
+
+    const uint64_t ib_idx = sid * (total_sb / size_s) + bid;
     const int64_t pos     = p_indirect_buffer[ib_idx];
 
     if((pos >= 0) && (pos < max_position))
@@ -2540,7 +2047,9 @@ __launch_bounds__(256, 8) __global__
                                             stride_i_h,
                                             stride_i_d,
                                             stride_o_h,
-                                            stride_o_d);
+                                            stride_o_d,
+                                            d_chunk_idx,
+                                            threads_per_sb);
     }
 }
 
@@ -2583,11 +2092,19 @@ __launch_bounds__(256, 8) __global__
                                           const int32_t stride_oy_s,
                                           const int32_t stride_oy_b,
                                           const int32_t stride_oy_h,
-                                          const int32_t stride_oy_d)
+                                          const int32_t stride_oy_d,
+                                          const int32_t size_s,
+                                          const int32_t threads_per_sb,
+                                          const int32_t total_sb)
 {
-    const uint64_t sid    = blockIdx.x;
-    const uint64_t bid    = blockIdx.y;
-    const uint64_t ib_idx = sid * gridDim.y + bid;
+    const int32_t global_tid   = blockIdx.x * 256 + threadIdx.x;
+    const int32_t sb_idx       = global_tid / threads_per_sb;
+    const int32_t d_chunk_idx  = global_tid % threads_per_sb;
+    if(sb_idx >= total_sb) return;
+    const int32_t sid = sb_idx % size_s;
+    const int32_t bid = sb_idx / size_s;
+
+    const uint64_t ib_idx = sid * (total_sb / size_s) + bid;
     const int64_t pos     = p_indirect_buffer[ib_idx];
 
     if((pos >= 0) && (pos < max_position))
@@ -2623,7 +2140,9 @@ __launch_bounds__(256, 8) __global__
                                              stride_ox_h,
                                              stride_ox_d,
                                              stride_oy_h,
-                                             stride_oy_d);
+                                             stride_oy_d,
+                                             d_chunk_idx,
+                                             threads_per_sb);
     }
 }
 
@@ -2647,11 +2166,19 @@ __launch_bounds__(256, 8) __global__ void kn_entry_1c_sbhd_cached_indirect_inpla
     const int32_t stride_s,
     const int32_t stride_b,
     const int32_t stride_h,
-    const int32_t stride_d)
+    const int32_t stride_d,
+    const int32_t size_s,
+    const int32_t threads_per_sb,
+    const int32_t total_sb)
 {
-    const uint64_t sid    = blockIdx.x;
-    const uint64_t bid    = blockIdx.y;
-    const uint64_t ib_idx = sid * gridDim.y + bid;
+    const int32_t global_tid   = blockIdx.x * 256 + threadIdx.x;
+    const int32_t sb_idx       = global_tid / threads_per_sb;
+    const int32_t d_chunk_idx  = global_tid % threads_per_sb;
+    if(sb_idx >= total_sb) return;
+    const int32_t sid = sb_idx % size_s;
+    const int32_t bid = sb_idx / size_s;
+
+    const uint64_t ib_idx = sid * (total_sb / size_s) + bid;
     const int64_t pos     = p_indirect_buffer[ib_idx];
 
     if((pos >= 0) && (pos < max_position))
@@ -2675,7 +2202,9 @@ __launch_bounds__(256, 8) __global__ void kn_entry_1c_sbhd_cached_indirect_inpla
                                           stride_h,
                                           stride_d,
                                           stride_h,
-                                          stride_d);
+                                          stride_d,
+                                          d_chunk_idx,
+                                          threads_per_sb);
     }
 }
 
@@ -2706,11 +2235,19 @@ __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect_inpla
     const int32_t stride_y_s,
     const int32_t stride_y_b,
     const int32_t stride_y_h,
-    const int32_t stride_y_d)
+    const int32_t stride_y_d,
+    const int32_t size_s,
+    const int32_t threads_per_sb,
+    const int32_t total_sb)
 {
-    const uint64_t sid    = blockIdx.x;
-    const uint64_t bid    = blockIdx.y;
-    const uint64_t ib_idx = sid * gridDim.y + bid;
+    const int32_t global_tid   = blockIdx.x * 256 + threadIdx.x;
+    const int32_t sb_idx       = global_tid / threads_per_sb;
+    const int32_t d_chunk_idx  = global_tid % threads_per_sb;
+    if(sb_idx >= total_sb) return;
+    const int32_t sid = sb_idx % size_s;
+    const int32_t bid = sb_idx / size_s;
+
+    const uint64_t ib_idx = sid * (total_sb / size_s) + bid;
     const int64_t pos     = p_indirect_buffer[ib_idx];
 
     if((pos >= 0) && (pos < max_position))
@@ -2744,7 +2281,9 @@ __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect_inpla
                                            stride_x_h,
                                            stride_x_d,
                                            stride_y_h,
-                                           stride_y_d);
+                                           stride_y_d,
+                                           d_chunk_idx,
+                                           threads_per_sb);
     }
 }
 
@@ -2775,11 +2314,19 @@ __launch_bounds__(256, 8) __global__
                                            const int32_t stride_o_s,
                                            const int32_t stride_o_b,
                                            const int32_t stride_o_h,
-                                           const int32_t stride_o_d)
+                                           const int32_t stride_o_d,
+                                           const int32_t size_s,
+                                           const int32_t threads_per_sb,
+                                           const int32_t total_sb)
 {
-    const uint64_t sid    = blockIdx.x;
-    const uint64_t bid    = blockIdx.y;
-    const uint64_t ib_idx = sid * gridDim.y + bid;
+    const int32_t global_tid   = blockIdx.x * 256 + threadIdx.x;
+    const int32_t sb_idx       = global_tid / threads_per_sb;
+    const int32_t d_chunk_idx  = global_tid % threads_per_sb;
+    if(sb_idx >= total_sb) return;
+    const int32_t sid = sb_idx % size_s;
+    const int32_t bid = sb_idx / size_s;
+
+    const uint64_t ib_idx = sid * (total_sb / size_s) + bid;
     const int64_t pos     = p_indirect_buffer_0[ib_idx] + p_indirect_buffer_1[ib_idx];
 
     if((pos >= 0) && (pos < max_position))
@@ -2804,7 +2351,9 @@ __launch_bounds__(256, 8) __global__
                                             stride_i_h,
                                             stride_i_d,
                                             stride_o_h,
-                                            stride_o_d);
+                                            stride_o_d,
+                                            d_chunk_idx,
+                                            threads_per_sb);
     }
 }
 
@@ -2848,11 +2397,19 @@ __launch_bounds__(256, 8) __global__
                                            const int32_t stride_oy_s,
                                            const int32_t stride_oy_b,
                                            const int32_t stride_oy_h,
-                                           const int32_t stride_oy_d)
+                                           const int32_t stride_oy_d,
+                                           const int32_t size_s,
+                                           const int32_t threads_per_sb,
+                                           const int32_t total_sb)
 {
-    const uint64_t sid    = blockIdx.x;
-    const uint64_t bid    = blockIdx.y;
-    const uint64_t ib_idx = sid * gridDim.y + bid;
+    const int32_t global_tid   = blockIdx.x * 256 + threadIdx.x;
+    const int32_t sb_idx       = global_tid / threads_per_sb;
+    const int32_t d_chunk_idx  = global_tid % threads_per_sb;
+    if(sb_idx >= total_sb) return;
+    const int32_t sid = sb_idx % size_s;
+    const int32_t bid = sb_idx / size_s;
+
+    const uint64_t ib_idx = sid * (total_sb / size_s) + bid;
     const int64_t pos     = p_indirect_buffer_0[ib_idx] + p_indirect_buffer_1[ib_idx];
 
     if((pos >= 0) && (pos < max_position))
@@ -2888,7 +2445,9 @@ __launch_bounds__(256, 8) __global__
                                              stride_ox_h,
                                              stride_ox_d,
                                              stride_oy_h,
-                                             stride_oy_d);
+                                             stride_oy_d,
+                                             d_chunk_idx,
+                                             threads_per_sb);
     }
 }
 
@@ -2913,11 +2472,19 @@ __launch_bounds__(256, 8) __global__ void kn_entry_1c_sbhd_cached_indirect2_inpl
     const int32_t stride_s,
     const int32_t stride_b,
     const int32_t stride_h,
-    const int32_t stride_d)
+    const int32_t stride_d,
+    const int32_t size_s,
+    const int32_t threads_per_sb,
+    const int32_t total_sb)
 {
-    const uint64_t sid    = blockIdx.x;
-    const uint64_t bid    = blockIdx.y;
-    const uint64_t ib_idx = sid * gridDim.y + bid;
+    const int32_t global_tid   = blockIdx.x * 256 + threadIdx.x;
+    const int32_t sb_idx       = global_tid / threads_per_sb;
+    const int32_t d_chunk_idx  = global_tid % threads_per_sb;
+    if(sb_idx >= total_sb) return;
+    const int32_t sid = sb_idx % size_s;
+    const int32_t bid = sb_idx / size_s;
+
+    const uint64_t ib_idx = sid * (total_sb / size_s) + bid;
     const int64_t pos     = p_indirect_buffer_0[ib_idx] + p_indirect_buffer_1[ib_idx];
 
     if((pos >= 0) && (pos < max_position))
@@ -2941,7 +2508,9 @@ __launch_bounds__(256, 8) __global__ void kn_entry_1c_sbhd_cached_indirect2_inpl
                                           stride_h,
                                           stride_d,
                                           stride_h,
-                                          stride_d);
+                                          stride_d,
+                                          d_chunk_idx,
+                                          threads_per_sb);
     }
 }
 
@@ -2973,11 +2542,19 @@ __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect2_inpl
     const int32_t stride_y_s,
     const int32_t stride_y_b,
     const int32_t stride_y_h,
-    const int32_t stride_y_d)
+    const int32_t stride_y_d,
+    const int32_t size_s,
+    const int32_t threads_per_sb,
+    const int32_t total_sb)
 {
-    const uint64_t sid    = blockIdx.x;
-    const uint64_t bid    = blockIdx.y;
-    const uint64_t ib_idx = sid * gridDim.y + bid;
+    const int32_t global_tid   = blockIdx.x * 256 + threadIdx.x;
+    const int32_t sb_idx       = global_tid / threads_per_sb;
+    const int32_t d_chunk_idx  = global_tid % threads_per_sb;
+    if(sb_idx >= total_sb) return;
+    const int32_t sid = sb_idx % size_s;
+    const int32_t bid = sb_idx / size_s;
+
+    const uint64_t ib_idx = sid * (total_sb / size_s) + bid;
     const int64_t pos     = p_indirect_buffer_0[ib_idx] + p_indirect_buffer_1[ib_idx];
 
     if((pos >= 0) && (pos < max_position))
@@ -3011,7 +2588,9 @@ __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect2_inpl
                                            stride_x_h,
                                            stride_x_d,
                                            stride_y_h,
-                                           stride_y_d);
+                                           stride_y_d,
+                                           d_chunk_idx,
+                                           threads_per_sb);
     }
 }
 
@@ -3037,35 +2616,42 @@ __launch_bounds__(256, 8) __global__
                                   const int32_t stride_i_d,
                                   const int32_t stride_o_t,
                                   const int32_t stride_o_h,
-                                  const int32_t stride_o_d)
+                                  const int32_t stride_o_d,
+                                  const int32_t size_s,
+                                  const int32_t threads_per_sb,
+                                  const int32_t total_sb)
 {
-    const uint64_t sid = blockIdx.x;
-    const uint64_t bid = blockIdx.y;
+    const int32_t global_tid   = blockIdx.x * 256 + threadIdx.x;
+    const int32_t sb_idx       = global_tid / threads_per_sb;
+    const int32_t d_chunk_idx  = global_tid % threads_per_sb;
+    if(sb_idx >= total_sb) return;
+    const int32_t sid = sb_idx % size_s;
+    const int32_t bid = sb_idx / size_s;
     const uint64_t tid = sid + p_cu_seqlens[bid];
+    if(tid >= p_cu_seqlens[bid + 1]) return;
 
-    if(tid < p_cu_seqlens[bid + 1])
-    {
-        const int32_t offset_i = tid * stride_i_t;
-        const int32_t offset_o = tid * stride_o_t;
-        const int32_t offset_f = sid * size_f;
+    const int32_t offset_i = tid * stride_i_t;
+    const int32_t offset_o = tid * stride_o_t;
+    const int32_t offset_f = sid * size_f;
 
-        Op::template apply_1c<RotateStyle,
-                              ReuseFreqsFrontPart,
-                              NopeFirst,
-                              false,
-                              StrideDOutEq1,
-                              StrideDInEq1,
-                              VecPairs>(p_output + offset_o,
-                                            p_input + offset_i,
-                                            p_freqs + offset_f,
-                                            size_h,
-                                            size_d,
-                                            size_f,
-                                            stride_i_h,
-                                            stride_i_d,
-                                            stride_o_h,
-                                            stride_o_d);
-    }
+    Op::template apply_1c<RotateStyle,
+                          ReuseFreqsFrontPart,
+                          NopeFirst,
+                          false,
+                          StrideDOutEq1,
+                          StrideDInEq1,
+                          VecPairs>(p_output + offset_o,
+                                        p_input + offset_i,
+                                        p_freqs + offset_f,
+                                        size_h,
+                                        size_d,
+                                        size_f,
+                                        stride_i_h,
+                                        stride_i_d,
+                                        stride_o_h,
+                                        stride_o_d,
+                                        d_chunk_idx,
+                                        threads_per_sb);
 }
 
 template <typename Op,
@@ -3085,34 +2671,41 @@ __launch_bounds__(256, 8) __global__
                                           const int32_t size_f, // size of last dimension of freqs.
                                           const int32_t stride_t,
                                           const int32_t stride_h,
-                                          const int32_t stride_d)
+                                          const int32_t stride_d,
+                                          const int32_t size_s,
+                                          const int32_t threads_per_sb,
+                                          const int32_t total_sb)
 {
-    const uint64_t sid = blockIdx.x;
-    const uint64_t bid = blockIdx.y;
+    const int32_t global_tid   = blockIdx.x * 256 + threadIdx.x;
+    const int32_t sb_idx       = global_tid / threads_per_sb;
+    const int32_t d_chunk_idx  = global_tid % threads_per_sb;
+    if(sb_idx >= total_sb) return;
+    const int32_t sid = sb_idx % size_s;
+    const int32_t bid = sb_idx / size_s;
     const uint64_t tid = sid + p_cu_seqlens[bid];
+    if(tid >= p_cu_seqlens[bid + 1]) return;
 
-    if(tid < p_cu_seqlens[bid + 1])
-    {
-        const int32_t offset   = tid * stride_t;
-        const int32_t offset_f = sid * size_f;
+    const int32_t offset   = tid * stride_t;
+    const int32_t offset_f = sid * size_f;
 
-        Op::template apply_1c<RotateStyle,
-                              ReuseFreqsFrontPart,
-                              NopeFirst,
-                              true,
-                              StrideDEq1,
-                              StrideDEq1,
-                              VecPairs>(p_inout + offset,
-                                          p_inout + offset,
-                                          p_freqs + offset_f,
-                                          size_h,
-                                          size_d,
-                                          size_f,
-                                          stride_h,
-                                          stride_d,
-                                          stride_h,
-                                          stride_d);
-    }
+    Op::template apply_1c<RotateStyle,
+                          ReuseFreqsFrontPart,
+                          NopeFirst,
+                          true,
+                          StrideDEq1,
+                          StrideDEq1,
+                          VecPairs>(p_inout + offset,
+                                      p_inout + offset,
+                                      p_freqs + offset_f,
+                                      size_h,
+                                      size_d,
+                                      size_f,
+                                      stride_h,
+                                      stride_d,
+                                      stride_h,
+                                      stride_d,
+                                      d_chunk_idx,
+                                      threads_per_sb);
 }
 
 template <typename Op,
@@ -3141,12 +2734,21 @@ __launch_bounds__(256, 8) __global__
                                const int32_t stride_o_b,
                                const int32_t stride_o_s,
                                const int32_t stride_o_h,
-                               const int32_t stride_o_d)
+                               const int32_t stride_o_d,
+                               const int32_t size_s_h,
+                               const int32_t threads_per_sb,
+                               const int32_t total_sb)
 {
-    const uint64_t Hid         = blockIdx.x;
-    const uint64_t Wid         = blockIdx.y;
-    const uint64_t sid         = Hid * img_width + Wid;
-    const uint64_t bid         = blockIdx.z;
+    const int32_t global_tid   = blockIdx.x * 256 + threadIdx.x;
+    const int32_t sb_idx       = global_tid / threads_per_sb;
+    const int32_t d_chunk_idx  = global_tid % threads_per_sb;
+    if(sb_idx >= total_sb) return;
+    const int32_t bid    = sb_idx / (size_s_h * img_width);
+    const int32_t hw_idx = sb_idx % (size_s_h * img_width);
+    const int32_t Hid    = hw_idx / img_width;
+    const int32_t Wid    = hw_idx % img_width;
+    const uint64_t sid   = Hid * img_width + Wid;
+
     const uint64_t size_half_d = size_d >> 1;
 
     const int offset_h_i = bid * stride_i_b + sid * stride_i_s;
@@ -3168,7 +2770,9 @@ __launch_bounds__(256, 8) __global__
                                         stride_i_h,
                                         stride_i_d,
                                         stride_o_h,
-                                        stride_o_d);
+                                        stride_o_d,
+                                        d_chunk_idx,
+                                        threads_per_sb);
 
     const int offset_w_i = offset_h_i + size_half_d * stride_i_d;
     const int offset_w_o = offset_h_o + size_half_d * stride_o_d;
@@ -3189,7 +2793,9 @@ __launch_bounds__(256, 8) __global__
                                         stride_i_h,
                                         stride_i_d,
                                         stride_o_h,
-                                        stride_o_d);
+                                        stride_o_d,
+                                        d_chunk_idx,
+                                        threads_per_sb);
 }
 
 template <typename Op,
@@ -3212,12 +2818,21 @@ __launch_bounds__(256, 8) __global__
                                        const int32_t stride_b,
                                        const int32_t stride_s,
                                        const int32_t stride_h,
-                                       const int32_t stride_d)
+                                       const int32_t stride_d,
+                                       const int32_t size_s_h,
+                                       const int32_t threads_per_sb,
+                                       const int32_t total_sb)
 {
-    const uint64_t Hid         = blockIdx.x;
-    const uint64_t Wid         = blockIdx.y;
-    const uint64_t sid         = Hid * img_width + Wid;
-    const uint64_t bid         = blockIdx.z;
+    const int32_t global_tid   = blockIdx.x * 256 + threadIdx.x;
+    const int32_t sb_idx       = global_tid / threads_per_sb;
+    const int32_t d_chunk_idx  = global_tid % threads_per_sb;
+    if(sb_idx >= total_sb) return;
+    const int32_t bid    = sb_idx / (size_s_h * img_width);
+    const int32_t hw_idx = sb_idx % (size_s_h * img_width);
+    const int32_t Hid    = hw_idx / img_width;
+    const int32_t Wid    = hw_idx % img_width;
+    const uint64_t sid   = Hid * img_width + Wid;
+
     const uint64_t size_half_d = size_d >> 1;
 
     const int offset_h   = bid * stride_b + sid * stride_s;
@@ -3238,7 +2853,9 @@ __launch_bounds__(256, 8) __global__
                                       stride_h,
                                       stride_d,
                                       stride_h,
-                                      stride_d);
+                                      stride_d,
+                                      d_chunk_idx,
+                                      threads_per_sb);
 
     const int offset_w   = offset_h + size_half_d * stride_d;
     const int offset_w_f = Wid * size_half_d;
@@ -3258,7 +2875,9 @@ __launch_bounds__(256, 8) __global__
                                       stride_h,
                                       stride_d,
                                       stride_h,
-                                      stride_d);
+                                      stride_d,
+                                      d_chunk_idx,
+                                      threads_per_sb);
 }
 
 // =====================================================================================================================
@@ -3466,55 +3085,35 @@ __launch_bounds__(256, 8) __global__
     }
 
 template <bool ReuseFreqsFrontPart, bool Is2D, typename scalar_t = ck_tile::fp16_t>
-std::tuple<dim3, dim3, int32_t> get_grid_config(const int32_t size_s_h,
-                                                const int32_t size_s_w,
-                                                const int32_t size_b,
-                                                const int32_t size_f,
-                                                const int32_t size_h     = 1,
-                                                const float   threshold  = 1.0f)
+std::tuple<dim3, dim3, int32_t, int32_t> get_grid_config(const int32_t size_s_h,
+                                                          const int32_t size_s_w,
+                                                          const int32_t size_b,
+                                                          const int32_t size_f,
+                                                          const float   threshold = 1.0f)
 {
-    constexpr int32_t num_warps        = 4;
-    constexpr int32_t num_threads      = num_warps * ck_tile::get_warp_size();
-    constexpr int32_t kernel_occupancy = 8; // __launch_bounds__(256, 8)
+    constexpr int32_t num_threads      = 256; // 4 warps x 64 threads/warp
+    constexpr int32_t kernel_occupancy = 8;   // __launch_bounds__(256, 8)
 
-    const int32_t size_r              = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
-    const int32_t size_half_r         = size_r >> 1;
-    const int32_t aligned_size_half_r = ck_tile::next_power_of_two(size_half_r);
+    const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
+    const int32_t size_half_r = size_r >> 1;
+    const int32_t total_sb    = size_s_h * size_s_w * size_b;
 
-    const int32_t block_dim_x = std::min(aligned_size_half_r, ck_tile::get_warp_size());
-    const int32_t block_dim_y = std::max(num_threads / block_dim_x, 1);
+    // Pick largest VecPairs in {1,2,4} that divides size_half_r
+    // and ensures enough work to saturate the GPU
+    int32_t vec_pairs = 4;
+    while(vec_pairs > 1 && (size_half_r % vec_pairs != 0))
+        vec_pairs >>= 1;
+    const int32_t gpu_capacity = static_cast<int32_t>(get_num_cu_func() * kernel_occupancy);
+    while(vec_pairs > 1 && total_sb < static_cast<int32_t>(gpu_capacity * vec_pairs * threshold))
+        vec_pairs >>= 1;
 
-    // --- VecPairs decision (max 4 for now) ---
-    constexpr int32_t max_vec_pairs_dtype = 4;
+    const int32_t threads_per_sb = size_half_r / vec_pairs;
+    const int32_t total_threads  = total_sb * threads_per_sb;
 
-    // VGPR pressure heuristic: more heads per thread -> reduce vectorization
-    int32_t max_vec_pairs = max_vec_pairs_dtype;
-    if(size_h > block_dim_y * 4) max_vec_pairs = std::min(max_vec_pairs, 4);
-    if(size_h > block_dim_y * 8) max_vec_pairs = std::min(max_vec_pairs, 2);
+    dim3 grid((total_threads + num_threads - 1) / num_threads);
+    dim3 block(num_threads);
 
-    // CU occupancy: only vectorize when GPU has enough blocks to stay busy
-    const int32_t total_blocks = Is2D ? (size_s_h * size_s_w * size_b) : (size_s_h * size_s_w * size_b);
-    const int32_t gpu_capacity = static_cast<int32_t>(get_num_cu_func() * kernel_occupancy * threshold);
-    int32_t vec_pairs = 1;
-    if(total_blocks >= gpu_capacity)
-    {
-        vec_pairs = max_vec_pairs;
-        // Need enough pairs per block to fill the vectorization
-        while(vec_pairs > 1 && size_half_r < block_dim_x * vec_pairs)
-            vec_pairs >>= 1;
-    }
-
-    dim3 grid, block(block_dim_x, block_dim_y);
-    if constexpr(Is2D)
-    {
-        grid = dim3(size_s_h, size_s_w, size_b);
-    }
-    else
-    {
-        grid = dim3(size_s_h * size_s_w, size_b);
-    }
-
-    return {grid, block, vec_pairs};
+    return {grid, block, vec_pairs, threads_per_sb};
 }
 
 #define LAUNCH_KERNEL_VEC_PAIRS(VEC_PAIRS, ...)              \
@@ -3566,7 +3165,8 @@ void dispatch_1c_sbhd_uncached(scalar_t* __restrict__ p_output,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    auto [grid, block, vec_pairs] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f, size_h);
+    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f);
+    const int32_t total_sb = size_s * size_b;
 
     LAUNCH_KERNEL_VEC_PAIRS(vec_pairs,
     if(p_output == p_input)
@@ -3592,7 +3192,10 @@ void dispatch_1c_sbhd_uncached(scalar_t* __restrict__ p_output,
                                                                                       stride_i_s,
                                                                                       stride_i_b,
                                                                                       stride_i_h,
-                                                                                      stride_i_d);
+                                                                                      stride_i_d,
+                                                                                      size_s,
+                                                                                      threads_per_sb,
+                                                                                      total_sb);
         }
         else
         {
@@ -3612,7 +3215,10 @@ void dispatch_1c_sbhd_uncached(scalar_t* __restrict__ p_output,
                                                                                       stride_i_s,
                                                                                       stride_i_b,
                                                                                       stride_i_h,
-                                                                                      stride_i_d););
+                                                                                      stride_i_d,
+                                                                                      size_s,
+                                                                                      threads_per_sb,
+                                                                                      total_sb););
         }
     }
     else
@@ -3641,7 +3247,10 @@ void dispatch_1c_sbhd_uncached(scalar_t* __restrict__ p_output,
                                          stride_o_s,
                                          stride_o_b,
                                          stride_o_h,
-                                         stride_o_d);
+                                         stride_o_d,
+                                         size_s,
+                                         threads_per_sb,
+                                         total_sb);
         }
         else
         {
@@ -3668,7 +3277,10 @@ void dispatch_1c_sbhd_uncached(scalar_t* __restrict__ p_output,
                                                                             stride_o_s,
                                                                             stride_o_b,
                                                                             stride_o_h,
-                                                                            stride_o_d););
+                                                                            stride_o_d,
+                                                                            size_s,
+                                                                            threads_per_sb,
+                                                                            total_sb););
         }
     }
     );
@@ -3711,7 +3323,8 @@ void dispatch_2c_sbhd_uncached(scalar_t* __restrict__ p_output_x,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    auto [grid, block, vec_pairs] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f, std::max(size_h_x, size_h_y));
+    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f);
+    const int32_t total_sb = size_s * size_b;
 
     LAUNCH_KERNEL_VEC_PAIRS(vec_pairs,
     if((p_output_x == p_input_x) && (p_output_y == p_input_y))
@@ -3750,7 +3363,10 @@ void dispatch_2c_sbhd_uncached(scalar_t* __restrict__ p_output_x,
                                          stride_iy_s,
                                          stride_iy_b,
                                          stride_iy_h,
-                                         stride_iy_d);
+                                         stride_iy_d,
+                                         size_s,
+                                         threads_per_sb,
+                                         total_sb);
         }
         else
         {
@@ -3779,7 +3395,10 @@ void dispatch_2c_sbhd_uncached(scalar_t* __restrict__ p_output_x,
                                          stride_iy_s,
                                          stride_iy_b,
                                          stride_iy_h,
-                                         stride_iy_d););
+                                         stride_iy_d,
+                                         size_s,
+                                         threads_per_sb,
+                                         total_sb););
         }
     }
     else
@@ -3823,7 +3442,10 @@ void dispatch_2c_sbhd_uncached(scalar_t* __restrict__ p_output_x,
                                          stride_oy_s,
                                          stride_oy_b,
                                          stride_oy_h,
-                                         stride_oy_d);
+                                         stride_oy_d,
+                                         size_s,
+                                         threads_per_sb,
+                                         total_sb);
         }
         else
         {
@@ -3865,7 +3487,10 @@ void dispatch_2c_sbhd_uncached(scalar_t* __restrict__ p_output_x,
                                                                             stride_oy_s,
                                                                             stride_oy_b,
                                                                             stride_oy_h,
-                                                                            stride_oy_d););
+                                                                            stride_oy_d,
+                                                                            size_s,
+                                                                            threads_per_sb,
+                                                                            total_sb););
         }
     }
     );
@@ -3898,7 +3523,8 @@ void dispatch_1c_sbhd_cached(scalar_t* __restrict__ p_output,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    auto [grid, block, vec_pairs] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f, size_h);
+    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f);
+    const int32_t total_sb = size_s * size_b;
 
     LAUNCH_KERNEL_VEC_PAIRS(vec_pairs,
     if(p_output == p_input)
@@ -3913,7 +3539,8 @@ void dispatch_1c_sbhd_cached(scalar_t* __restrict__ p_output,
             constexpr bool Stride0Eq1 = true;
             kn_entry_1c_sbhd_cached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, VP>
             <<<grid, block, 0, stream>>>(p_output, p_cos, p_sin, size_h, size_d, size_f,
-                                         stride_i_s, stride_i_b, stride_i_h, stride_i_d);
+                                         stride_i_s, stride_i_b, stride_i_h, stride_i_d,
+                                         size_s, threads_per_sb, total_sb);
         }
         else
         {
@@ -3934,7 +3561,10 @@ void dispatch_1c_sbhd_cached(scalar_t* __restrict__ p_output,
                                                                             stride_i_s,
                                                                             stride_i_b,
                                                                             stride_i_h,
-                                                                            stride_i_d););
+                                                                            stride_i_d,
+                                                                            size_s,
+                                                                            threads_per_sb,
+                                                                            total_sb););
         }
     }
     else
@@ -3946,7 +3576,8 @@ void dispatch_1c_sbhd_cached(scalar_t* __restrict__ p_output,
             kn_entry_1c_sbhd_cached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, Stride1Eq1, VP>
             <<<grid, block, 0, stream>>>(p_output, p_input, p_cos, p_sin, size_h, size_d, size_f,
                                          stride_i_s, stride_i_b, stride_i_h, stride_i_d,
-                                         stride_o_s, stride_o_b, stride_o_h, stride_o_d);
+                                         stride_o_s, stride_o_b, stride_o_h, stride_o_d,
+                                         size_s, threads_per_sb, total_sb);
         }
         else
         {
@@ -3974,7 +3605,10 @@ void dispatch_1c_sbhd_cached(scalar_t* __restrict__ p_output,
                                                                             stride_o_s,
                                                                             stride_o_b,
                                                                             stride_o_h,
-                                                                            stride_o_d););
+                                                                            stride_o_d,
+                                                                            size_s,
+                                                                            threads_per_sb,
+                                                                            total_sb););
         }
     }
     );
@@ -4018,7 +3652,8 @@ void dispatch_2c_sbhd_cached(scalar_t* __restrict__ p_output_x,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    auto [grid, block, vec_pairs] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f, std::max(size_h_x, size_h_y));
+    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f);
+    const int32_t total_sb = size_s * size_b;
 
     LAUNCH_KERNEL_VEC_PAIRS(vec_pairs,
     if((p_output_x == p_input_x) && (p_output_y == p_input_y))
@@ -4040,7 +3675,8 @@ void dispatch_2c_sbhd_cached(scalar_t* __restrict__ p_output_x,
             <<<grid, block, 0, stream>>>(p_output_x, p_output_y, p_cos, p_sin,
                                          size_h_x, size_h_y, size_d, size_f,
                                          stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-                                         stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
+                                         stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
+                                         size_s, threads_per_sb, total_sb);
         }
         else
         {
@@ -4069,7 +3705,10 @@ void dispatch_2c_sbhd_cached(scalar_t* __restrict__ p_output_x,
                                                                             stride_iy_s,
                                                                             stride_iy_b,
                                                                             stride_iy_h,
-                                                                            stride_iy_d););
+                                                                            stride_iy_d,
+                                                                            size_s,
+                                                                            threads_per_sb,
+                                                                            total_sb););
         }
     }
     else
@@ -4087,7 +3726,8 @@ void dispatch_2c_sbhd_cached(scalar_t* __restrict__ p_output_x,
                                          stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
                                          stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
                                          stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
-                                         stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+                                         stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d,
+                                         size_s, threads_per_sb, total_sb);
         }
         else
         {
@@ -4130,7 +3770,10 @@ void dispatch_2c_sbhd_cached(scalar_t* __restrict__ p_output_x,
                                                                             stride_oy_s,
                                                                             stride_oy_b,
                                                                             stride_oy_h,
-                                                                            stride_oy_d););
+                                                                            stride_oy_d,
+                                                                            size_s,
+                                                                            threads_per_sb,
+                                                                            total_sb););
         }
     }
     );
@@ -4164,7 +3807,8 @@ void dispatch_1c_sbhd_cached_indirect(scalar_t* __restrict__ p_output,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    auto [grid, block, vec_pairs] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f, size_h);
+    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f);
+    const int32_t total_sb = size_s * size_b;
 
     LAUNCH_KERNEL_VEC_PAIRS(vec_pairs,
     if(p_output == p_input)
@@ -4194,7 +3838,10 @@ void dispatch_1c_sbhd_cached_indirect(scalar_t* __restrict__ p_output,
                                          stride_i_s,
                                          stride_i_b,
                                          stride_i_h,
-                                         stride_i_d););
+                                         stride_i_d,
+                                         size_s,
+                                         threads_per_sb,
+                                         total_sb););
     }
     else
     {
@@ -4224,7 +3871,10 @@ void dispatch_1c_sbhd_cached_indirect(scalar_t* __restrict__ p_output,
                                                                             stride_o_s,
                                                                             stride_o_b,
                                                                             stride_o_h,
-                                                                            stride_o_d););
+                                                                            stride_o_d,
+                                                                            size_s,
+                                                                            threads_per_sb,
+                                                                            total_sb););
     }
     );
 }
@@ -4268,7 +3918,8 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    auto [grid, block, vec_pairs] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f, std::max(size_h_x, size_h_y));
+    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f);
+    const int32_t total_sb = size_s * size_b;
 
     LAUNCH_KERNEL_VEC_PAIRS(vec_pairs,
     if((p_output_x == p_input_x) && (p_output_y == p_input_y))
@@ -4310,7 +3961,10 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                          stride_iy_s,
                                          stride_iy_b,
                                          stride_iy_h,
-                                         stride_iy_d););
+                                         stride_iy_d,
+                                         size_s,
+                                         threads_per_sb,
+                                         total_sb););
     }
     else
     {
@@ -4355,7 +4009,10 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                                                             stride_oy_s,
                                                                             stride_oy_b,
                                                                             stride_oy_h,
-                                                                            stride_oy_d););
+                                                                            stride_oy_d,
+                                                                            size_s,
+                                                                            threads_per_sb,
+                                                                            total_sb););
     }
     );
 }
@@ -4389,7 +4046,8 @@ void dispatch_1c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    auto [grid, block, vec_pairs] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f, size_h);
+    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f);
+    const int32_t total_sb = size_s * size_b;
 
     LAUNCH_KERNEL_VEC_PAIRS(vec_pairs,
     if(p_output == p_input)
@@ -4420,7 +4078,10 @@ void dispatch_1c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output,
                                          stride_i_s,
                                          stride_i_b,
                                          stride_i_h,
-                                         stride_i_d););
+                                         stride_i_d,
+                                         size_s,
+                                         threads_per_sb,
+                                         total_sb););
     }
     else
     {
@@ -4452,7 +4113,10 @@ void dispatch_1c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output,
                                          stride_o_s,
                                          stride_o_b,
                                          stride_o_h,
-                                         stride_o_d););
+                                         stride_o_d,
+                                         size_s,
+                                         threads_per_sb,
+                                         total_sb););
     }
     );
 }
@@ -4497,7 +4161,8 @@ void dispatch_2c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    auto [grid, block, vec_pairs] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f, std::max(size_h_x, size_h_y));
+    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f);
+    const int32_t total_sb = size_s * size_b;
 
     LAUNCH_KERNEL_VEC_PAIRS(vec_pairs,
     if((p_output_x == p_input_x) && (p_output_y == p_input_y))
@@ -4540,7 +4205,10 @@ void dispatch_2c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
                                          stride_iy_s,
                                          stride_iy_b,
                                          stride_iy_h,
-                                         stride_iy_d););
+                                         stride_iy_d,
+                                         size_s,
+                                         threads_per_sb,
+                                         total_sb););
     }
     else
     {
@@ -4587,7 +4255,10 @@ void dispatch_2c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
                                          stride_oy_s,
                                          stride_oy_b,
                                          stride_oy_h,
-                                         stride_oy_d););
+                                         stride_oy_d,
+                                         size_s,
+                                         threads_per_sb,
+                                         total_sb););
     }
     );
 }
@@ -4617,7 +4288,8 @@ void dispatch_1c_thd_uncached(scalar_t* __restrict__ p_output,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    auto [grid, block, vec_pairs] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_max_s, 1, size_b, size_f, size_h);
+    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_max_s, 1, size_b, size_f);
+    const int32_t total_sb = size_max_s * size_b;
 
     LAUNCH_KERNEL_VEC_PAIRS(vec_pairs,
     if(p_output == p_input)
@@ -4632,7 +4304,8 @@ void dispatch_1c_thd_uncached(scalar_t* __restrict__ p_output,
             kn_entry_1c_thd_uncached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, VP>
             <<<grid, block, 0, stream>>>(p_output, p_cu_seqlens, p_freqs,
                                          size_h, size_d, size_f,
-                                         stride_i_t, stride_i_h, stride_i_d);
+                                         stride_i_t, stride_i_h, stride_i_d,
+                                         size_max_s, threads_per_sb, total_sb);
         }
         else
         {
@@ -4652,7 +4325,10 @@ void dispatch_1c_thd_uncached(scalar_t* __restrict__ p_output,
                                                                             size_f,
                                                                             stride_i_t,
                                                                             stride_i_h,
-                                                                            stride_i_d););
+                                                                            stride_i_d,
+                                                                            size_max_s,
+                                                                            threads_per_sb,
+                                                                            total_sb););
         }
     }
     else
@@ -4665,7 +4341,8 @@ void dispatch_1c_thd_uncached(scalar_t* __restrict__ p_output,
             <<<grid, block, 0, stream>>>(p_output, p_input, p_cu_seqlens, p_freqs,
                                          size_h, size_d, size_f,
                                          stride_i_t, stride_i_h, stride_i_d,
-                                         stride_o_t, stride_o_h, stride_o_d);
+                                         stride_o_t, stride_o_h, stride_o_d,
+                                         size_max_s, threads_per_sb, total_sb);
         }
         else
         {
@@ -4691,7 +4368,10 @@ void dispatch_1c_thd_uncached(scalar_t* __restrict__ p_output,
                                                                             stride_i_d,
                                                                             stride_o_t,
                                                                             stride_o_h,
-                                                                            stride_o_d););
+                                                                            stride_o_d,
+                                                                            size_max_s,
+                                                                            threads_per_sb,
+                                                                            total_sb););
         }
     }
     );
@@ -4726,8 +4406,9 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    auto [grid, block, vec_pairs] =
-        get_grid_config<ReuseFreqsFrontPart, true, scalar_t>(img_height, img_width, size_b, size_d >> 1, size_h);
+    auto [grid, block, vec_pairs, threads_per_sb] =
+        get_grid_config<ReuseFreqsFrontPart, true, scalar_t>(img_height, img_width, size_b, size_d >> 1);
+    const int32_t total_sb = img_height * img_width * size_b;
 
     LAUNCH_KERNEL_VEC_PAIRS(vec_pairs,
     if(p_output == p_input)
@@ -4743,7 +4424,8 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
             kn_entry_1c_2d_cached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, VP>
             <<<grid, block, 0, stream>>>(p_output, p_cos_h, p_sin_h, p_cos_w, p_sin_w,
                                          img_width, size_h, size_d,
-                                         stride_i_b, stride_i_s, stride_i_h, stride_i_d);
+                                         stride_i_b, stride_i_s, stride_i_h, stride_i_d,
+                                         img_height, threads_per_sb, total_sb);
         }
         else
         {
@@ -4766,7 +4448,10 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                                                                             stride_i_b,
                                                                             stride_i_s,
                                                                             stride_i_h,
-                                                                            stride_i_d););
+                                                                            stride_i_d,
+                                                                            img_height,
+                                                                            threads_per_sb,
+                                                                            total_sb););
         }
     }
     else
@@ -4779,7 +4464,8 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
             <<<grid, block, 0, stream>>>(p_output, p_input, p_cos_h, p_sin_h, p_cos_w, p_sin_w,
                                          img_width, size_h, size_d,
                                          stride_i_b, stride_i_s, stride_i_h, stride_i_d,
-                                         stride_o_b, stride_o_s, stride_o_h, stride_o_d);
+                                         stride_o_b, stride_o_s, stride_o_h, stride_o_d,
+                                         img_height, threads_per_sb, total_sb);
         }
         else
         {
@@ -4809,7 +4495,10 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                                                                             stride_o_b,
                                                                             stride_o_s,
                                                                             stride_o_h,
-                                                                            stride_o_d););
+                                                                            stride_o_d,
+                                                                            img_height,
+                                                                            threads_per_sb,
+                                                                            total_sb););
         }
     }
     );
