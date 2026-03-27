@@ -197,7 +197,6 @@ def test_gated_rmsnorm_fp8_group_quant(
     print("\nDequantized comparison:")
 
     # For reference: scales are [num_tokens, num_groups]
-    num_groups_total = ref_scales.shape[-1]
     ref_scales_expanded = ref_scales.unsqueeze(-1).expand(-1, -1, group_size)
     ref_scales_flat = ref_scales_expanded.reshape(num_tokens, -1)[
         :, : ref_quant.shape[1]
