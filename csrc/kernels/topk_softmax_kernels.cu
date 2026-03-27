@@ -36,6 +36,14 @@
 namespace vllm {
 namespace moe {
 
+// Enum for shared expert scoring functions
+enum class SharedExpertScoringFunc
+{
+    NONE = 0,
+    SIGMOID = 1,
+    // Future: SOFTMAX = 2, LINEAR = 3, etc.
+};
+
 /// Aligned array type
 template <typename T,
           /// Number of elements in the array
@@ -211,7 +219,9 @@ template <typename DTYPE,
           int NUM_EXPERTS,
           int WARPS_PER_CTA,
           int BYTES_PER_LDG,
-          bool need_renorm>
+          bool need_renorm,
+          int NUM_SHARED_EXPERTS = 0,
+          SharedExpertScoringFunc SCORING_FUNC = SharedExpertScoringFunc::NONE>
 __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
     void topkGatingSoftmax(const DTYPE* input,
                            const bool* finished,
@@ -309,6 +319,35 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
     {
         row_chunk_vec_ptr[ii] = ck_tile::vec_convert<float, DTYPE, ELTS_PER_LDG>(
             vec_thread_read_ptr[ii * THREADS_PER_ROW]);
+    }
+
+    // Process shared experts: use the thread subgroup working on this row
+    // to load shared experts at the row's end, compute sigmoid, and write to output
+    // All threads in THREADS_PER_ROW collaborate for maximum coalescing
+    if constexpr(NUM_SHARED_EXPERTS > 0 && SCORING_FUNC != SharedExpertScoringFunc::NONE)
+    {
+        // Each thread in the row subgroup processes one or more shared experts
+        // thread_group_idx ranges from 0 to THREADS_PER_ROW-1
+        // Shared experts are at thread_row_ptr[NUM_EXPERTS + shared_idx]
+
+#pragma unroll
+        for(int shared_idx = thread_group_idx; shared_idx < NUM_SHARED_EXPERTS; shared_idx += THREADS_PER_ROW)
+        {
+            // Load shared expert logit at row's end (perfectly coalesced across threads)
+            const float logit = static_cast<float>(thread_row_ptr[NUM_EXPERTS + shared_idx]);
+
+            // Apply scoring function using constexpr dispatch
+            float score;
+            if constexpr(SCORING_FUNC == SharedExpertScoringFunc::SIGMOID)
+            {
+                score = 1.0f / (1.0f + expf(-logit));
+            }
+            // Future scoring functions: else if constexpr(SCORING_FUNC == ...) { ... }
+
+            // Write directly to output buffer
+            const int out_idx = output_stride * thread_row + k + shared_idx;
+            output[out_idx] = score;
+        }
     }
 
     // First, do an in-thread max reduction to get the max value and its index.
@@ -474,7 +513,11 @@ struct TopkConstants
 };
 } // namespace detail
 
-template <typename DTYPE, int EXPERTS, int WARPS_PER_TB>
+template <typename DTYPE,
+          int EXPERTS,
+          int WARPS_PER_TB,
+          int NUM_SHARED_EXPERTS = 0,
+          SharedExpertScoringFunc SCORING_FUNC = SharedExpertScoringFunc::NONE>
 void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
                                      const bool* finished,
                                      float* output,
@@ -502,7 +545,7 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
     dim3 block_dim(WARP_SIZE, WARPS_PER_TB);
     if(need_renorm)
     {
-        topkGatingSoftmax<DTYPE, VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, true>
+        topkGatingSoftmax<DTYPE, VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, true, NUM_SHARED_EXPERTS, SCORING_FUNC>
             <<<num_blocks, block_dim, 0, stream>>>(input,
                                                    finished,
                                                    output,
@@ -518,7 +561,7 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
     }
     else
     {
-        topkGatingSoftmax<DTYPE, VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, false>
+        topkGatingSoftmax<DTYPE, VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, false, NUM_SHARED_EXPERTS, SCORING_FUNC>
             <<<num_blocks, block_dim, 0, stream>>>(input,
                                                    finished,
                                                    output,
@@ -534,8 +577,9 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
     }
 }
 
-#define LAUNCH_SOFTMAX(NUM_EXPERTS, WARPS_PER_TB)                                           \
-    topkGatingSoftmaxLauncherHelper<DTYPE, NUM_EXPERTS, WARPS_PER_TB>(gating_output,        \
+#define LAUNCH_SOFTMAX_WITH_SHARED(NUM_EXPERTS, WARPS_PER_TB, NUM_SHARED, SCORING)          \
+    topkGatingSoftmaxLauncherHelper<DTYPE, NUM_EXPERTS, WARPS_PER_TB, NUM_SHARED, SCORING>(\
+                                                                      gating_output,        \
                                                                       nullptr,              \
                                                                       topk_weights,         \
                                                                       topk_indicies,        \
@@ -550,6 +594,59 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
                                                                       need_renorm,          \
                                                                       stream);
 
+// Helper macro that dispatches based on num_shared_experts and scoring function
+#define LAUNCH_SOFTMAX(NUM_EXPERTS, WARPS_PER_TB)                                           \
+    do {                                                                                    \
+        if(num_shared_experts == 0) {                                                       \
+            LAUNCH_SOFTMAX_WITH_SHARED(NUM_EXPERTS, WARPS_PER_TB, 0,                       \
+                                      SharedExpertScoringFunc::NONE);                       \
+        } else if(scoring_func_enum == SharedExpertScoringFunc::SIGMOID) {                  \
+            switch(num_shared_experts) {                                                    \
+            case 1: LAUNCH_SOFTMAX_WITH_SHARED(NUM_EXPERTS, WARPS_PER_TB, 1,               \
+                                              SharedExpertScoringFunc::SIGMOID); break;     \
+            case 2: LAUNCH_SOFTMAX_WITH_SHARED(NUM_EXPERTS, WARPS_PER_TB, 2,               \
+                                              SharedExpertScoringFunc::SIGMOID); break;     \
+            case 4: LAUNCH_SOFTMAX_WITH_SHARED(NUM_EXPERTS, WARPS_PER_TB, 4,               \
+                                              SharedExpertScoringFunc::SIGMOID); break;     \
+            case 8: LAUNCH_SOFTMAX_WITH_SHARED(NUM_EXPERTS, WARPS_PER_TB, 8,               \
+                                              SharedExpertScoringFunc::SIGMOID); break;     \
+            default:                                                                        \
+                TORCH_CHECK(false, "Unsupported num_shared_experts: " +                    \
+                            std::to_string(num_shared_experts) +                            \
+                            ". Supported values: 1, 2, 4, 8");                              \
+            }                                                                               \
+        } else {                                                                            \
+            TORCH_CHECK(false, "Unsupported scoring function");                             \
+        }                                                                                   \
+    } while(0)
+
+// Kernel to apply sigmoid scoring to shared experts
+template <typename DTYPE, int TPB>
+__launch_bounds__(TPB) __global__
+    void applySharedExpertSigmoid(const DTYPE* shared_gating_input,
+                                  float* shared_weights,
+                                  const int num_tokens,
+                                  const int num_shared_experts,
+                                  const int input_stride,
+                                  const int output_stride,
+                                  const int shared_expert_start_idx)
+{
+    const int token_idx = blockIdx.x;
+    if(token_idx >= num_tokens)
+        return;
+
+    for(int expert_idx = threadIdx.x; expert_idx < num_shared_experts; expert_idx += TPB)
+    {
+        const int input_idx  = token_idx * input_stride + shared_expert_start_idx + expert_idx;
+        const int output_idx = token_idx * output_stride + expert_idx;
+
+        // Apply sigmoid: 1 / (1 + exp(-x))
+        const float x = static_cast<float>(shared_gating_input[input_idx]);
+        const float sigmoid_val = 1.0f / (1.0f + expf(-x));
+        shared_weights[output_idx] = sigmoid_val;
+    }
+}
+
 template <typename DTYPE>
 void topkGatingSoftmaxKernelLauncher(const DTYPE* gating_output,
                                      float* topk_weights,
@@ -558,6 +655,8 @@ void topkGatingSoftmaxKernelLauncher(const DTYPE* gating_output,
                                      float* softmax_workspace,
                                      const int num_tokens,
                                      const int num_experts,
+                                     const int num_shared_experts,
+                                     const std::string& shared_experts_scoring_func,
                                      const int topk,
                                      const int topk_weights_stride,
                                      const int topk_id_stride,
@@ -565,6 +664,22 @@ void topkGatingSoftmaxKernelLauncher(const DTYPE* gating_output,
                                      const bool need_renorm,
                                      hipStream_t stream)
 {
+    // Convert string to enum for template dispatch
+    SharedExpertScoringFunc scoring_func_enum = SharedExpertScoringFunc::NONE;
+    if(num_shared_experts > 0 && !shared_experts_scoring_func.empty())
+    {
+        if(shared_experts_scoring_func == "sigmoid")
+        {
+            scoring_func_enum = SharedExpertScoringFunc::SIGMOID;
+        }
+        else
+        {
+            TORCH_CHECK(false, "Unsupported shared expert scoring function: " + shared_experts_scoring_func);
+        }
+    }
+
+    // Note: num_experts here is the routing experts count (passed from wrapper)
+    // Shared experts are processed within the same kernel using template params
     static constexpr int WARPS_PER_TB = 8;
     switch(num_experts)
     {
@@ -595,6 +710,22 @@ void topkGatingSoftmaxKernelLauncher(const DTYPE* gating_output,
                                                      0,
                                                      num_experts,
                                                      need_renorm);
+
+        // Handle shared experts for non-power-of-2 case
+        if(num_shared_experts > 0 && !shared_experts_scoring_func.empty())
+        {
+            if(shared_experts_scoring_func == "sigmoid")
+            {
+                applySharedExpertSigmoid<DTYPE, TPB><<<num_tokens, TPB, 0, stream>>>(
+                    gating_output,
+                    topk_weights + topk,
+                    num_tokens,
+                    num_shared_experts,
+                    gating_token_stride,
+                    topk_weights_stride,
+                    num_experts);
+            }
+        }
     }
     }
 }
@@ -622,27 +753,42 @@ __global__ void moe_sum_kernel(scalar_t* __restrict__ out,         // [..., d]
 
 namespace aiter {
 
-void topk_softmax(torch::Tensor& topk_weights,         // [num_tokens, topk]
+void topk_softmax(torch::Tensor& topk_weights,         // [num_tokens, topk + num_shared_experts]
                   torch::Tensor& topk_indices,         // [num_tokens, topk]
                   torch::Tensor& token_expert_indices, // [num_tokens, topk]
-                  torch::Tensor& gating_output,        // [num_tokens, num_experts]
-                  bool need_renorm)
+                  torch::Tensor& gating_output,        // [num_tokens, num_experts + num_shared_experts]
+                  bool need_renorm,
+                  int num_shared_experts,
+                  const std::string& shared_expert_scoring_func)
 {
-    const int num_experts         = gating_output.size(-1);
-    const int num_tokens          = gating_output.numel() / num_experts;
-    const int topk                = topk_weights.size(-1);
+    const int num_experts_total   = gating_output.size(-1);
+    const int num_tokens          = gating_output.numel() / num_experts_total;
+    const int topk                = topk_indices.size(-1);  // Use indices size for topk
     const int topk_weights_stride = topk_weights.stride(0);
     const int topk_id_stride      = topk_indices.stride(0);
     const int gating_token_stride = gating_output.stride(0);
 
-    const bool is_pow_2          = (num_experts != 0) && ((num_experts & (num_experts - 1)) == 0);
-    const bool needs_workspace   = !is_pow_2 || num_experts > 256;
-    const int64_t workspace_size = needs_workspace ? num_tokens * num_experts : 0;
+    // Determine number of routing experts (experts for topk selection)
+    const int num_routing_experts = num_shared_experts > 0 ? num_experts_total - num_shared_experts : num_experts_total;
+
+    // Validate shared expert scoring function
+    if(num_shared_experts > 0 && !shared_expert_scoring_func.empty())
+    {
+        TORCH_CHECK(shared_expert_scoring_func == "sigmoid",
+                   "Only 'sigmoid' scoring function is supported for shared experts, got: " +
+                   shared_expert_scoring_func);
+    }
+
+    const bool is_pow_2          = (num_routing_experts != 0) && ((num_routing_experts & (num_routing_experts - 1)) == 0);
+    const bool needs_workspace   = !is_pow_2 || num_routing_experts > 256;
+    const int64_t workspace_size = needs_workspace ? num_tokens * num_routing_experts : 0;
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(gating_output));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     torch::Tensor softmax_workspace =
         torch::empty({workspace_size}, gating_output.options().dtype(torch::kFloat32));
+
+    // Process routing experts with softmax + topk, and shared experts with sigmoid in one kernel
     VLLM_DISPATCH_FLOATING_TYPES(gating_output.scalar_type(), "topk_softmax", [&] {
         using input_dtype = typename t2ck<scalar_t>::type;
         vllm::moe::topkGatingSoftmaxKernelLauncher(
@@ -652,7 +798,9 @@ void topk_softmax(torch::Tensor& topk_weights,         // [num_tokens, topk]
             token_expert_indices.data_ptr<int>(),
             softmax_workspace.data_ptr<float>(),
             num_tokens,
-            num_experts,
+            num_routing_experts,  // Only routing experts for softmax
+            num_shared_experts,   // Number of shared experts to process with sigmoid
+            shared_expert_scoring_func,
             topk,
             topk_weights_stride,
             topk_id_stride,

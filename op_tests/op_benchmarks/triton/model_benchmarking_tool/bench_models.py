@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from contextlib import redirect_stdout, redirect_stderr
-from typing import Callable, TypeAlias
+from typing import Callable, TypeAlias, Optional
 import io
 import logging
 import shlex
@@ -8,9 +8,10 @@ import os
 import pandas as pd
 import json
 import re
-import aiter.ops.triton.utils._triton.arch_info as arch_info
 import matplotlib.pyplot as plt
 import argparse
+from triton.runtime.errors import OutOfResources
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 from op_tests.op_benchmarks.triton.bench_gemm_a16w16 import (
     main as bench_gemm_a16w16_main,
@@ -30,6 +31,9 @@ from op_tests.op_benchmarks.triton.bench_batched_gemm_a8w8 import (
 from op_tests.op_benchmarks.triton.bench_batched_gemm_afp4wfp4 import (
     main as bench_batched_gemm_afp4wfp4_main,
 )
+from op_tests.op_benchmarks.triton.bench_batched_gemm_a16wfp4 import (
+    main as bench_batched_gemm_a16wfp4_main,
+)
 from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w8 import (
     main as bench_moe_gemm_a8w8_main,
 )
@@ -44,6 +48,8 @@ from op_tests.op_benchmarks.triton.bench_moe_gemm_a4w4 import (
 )
 from op_tests.op_benchmarks.triton.bench_rmsnorm import main as bench_rmsnorm_main
 from op_tests.op_benchmarks.triton.bench_rope import main as bench_rope_main
+from op_tests.op_benchmarks.triton.bench_mha import main as bench_mha_main
+from op_tests.op_benchmarks.triton.bench_mla_decode import main as bench_mla_main
 
 
 def disable_aiter_logs() -> None:
@@ -59,12 +65,15 @@ KERNEL_DICT: dict[str, Callable[[list[str]], None]] = {
     "gemm_afp4wfp4": bench_gemm_afp4wfp4_main,
     "batched_gemm_a8w8": bench_batched_gemm_a8w8_main,
     "batched_gemm_afp4wfp4": bench_batched_gemm_afp4wfp4_main,
+    "batched_gemm_a16wfp4": bench_batched_gemm_a16wfp4_main,
     "moe_op_gemm_a8w8": bench_moe_gemm_a8w8_main,
     "moe_op_gemm_a8w8_blockscale": bench_moe_gemm_a8w8_blockscale_main,
     "moe_op_gemm_a8w4": bench_moe_gemm_a8w4_main,
     "moe_op_gemm_a4w4": bench_moe_gemm_a4w4_main,
     "rmsnorm": bench_rmsnorm_main,
     "rope": bench_rope_main,
+    "mha": bench_mha_main,
+    "mla": bench_mla_main,
 }
 
 # Shape dicts from model_shapes.json (int, str values)
@@ -80,42 +89,82 @@ ROPE_METRIC_NOTE = (
     "through triton.testing.do_bench; use rocprof for accurate runtime."
 )
 
+MLA_METRIC_NOTE = "Note: MLA benchmark only reports time (ms)."
+
 
 class KernelHandler(ABC):
     """Base class for kernel-specific benchmark logic and result building."""
 
-    _model: str
-    _kernel: str
-    _metric: str
-    _layout: str
-    _shape: ShapeDict
-    _M: int
+    def __init__(self) -> None:
+        self._model: str | None = None
+        self._kernel: str | None = None
+        self._metric: str | None = None
+        self._gemm_layout: str | None = None
+        self._mha_layout: str | None = None
+        self._shape: ShapeDict | None = None
+        self._batch_size: int | None = None
+        self._seq_len: int | None = None
+        self._M: int | None = None  # batch_size * seq_len
+        self._tp: int | None = None
 
-    def set_run(self, model: str, kernel: str, metric: str, layout: str = "TN") -> None:
-        """Set run-level parameters (constant for all shapes/M for this kernel)."""
+    def set_run(
+        self,
+        model: str,
+        kernel: str,
+        metric: str,
+        gemm_layout: str,
+        mha_layout: str,
+        tp: int,
+    ) -> None:
+        """Set run-level parameters (constant for all shapes for this kernel)."""
         self._model = model
         self._kernel = kernel
         self._metric = metric
-        self._layout = layout
+        self._gemm_layout = gemm_layout
+        self._mha_layout = mha_layout
+        self._tp = tp
 
-    def set_iteration(self, shape: ShapeDict, M: int) -> None:
-        """Set iteration-level parameters (current shape and M)."""
+    def set_iteration(self, shape: ShapeDict, batch_size: int, seq_len: int) -> None:
+        """Set iteration-level parameters (current shape, batch_size, seq_len). M = batch_size * seq_len."""
         self._shape = shape
-        self._M = M
+        self._batch_size = batch_size
+        self._seq_len = seq_len
+        self._M = batch_size * seq_len
+
+    def to_str(self) -> str:
+        shape_str = (
+            ", ".join(f"{k}={v}" for k, v in sorted(self._shape.items()))
+            if self._shape is not None
+            else "None"
+        )
+
+        return (
+            f"model={self._model} | "
+            f"kernel={self._kernel} | "
+            f"batch_size={self._batch_size} seq_len={self._seq_len} M={self._M} | "
+            f"shape={{ {shape_str} }}"
+        )
+
+    def _shard(self, value: int) -> int:
+        return max(value // self._tp, 1)
+
+    def _shard_keys(self, s: dict, keys: list[str]) -> None:
+        for key in keys:
+            s[key] = self._shard(s[key])
 
     @abstractmethod
-    def get_tp_shapes(self, shapes: list[ShapeDict], TP: int) -> list[ShapeDict]:
+    def get_tp_shapes(self, shapes: list[ShapeDict]) -> list[ShapeDict]:
         """Return shapes adjusted for tensor parallelism."""
         ...
 
     @abstractmethod
     def build_args(self) -> str:
-        """Return args_str for the bench subprocess (uses current shape, M, metric, layout)."""
+        """Return args_str for the bench subprocess."""
         ...
 
     @abstractmethod
     def parse_stdout(self, stdout: str) -> float | str:
-        """Parse benchmark stdout and return the numeric result (uses current metric where needed)."""
+        """Parse benchmark stdout and return the numeric result."""
         ...
 
     @abstractmethod
@@ -125,13 +174,15 @@ class KernelHandler(ABC):
 
 
 class GemmKernelHandler(KernelHandler):
-    def get_tp_shapes(self, shapes: list[ShapeDict], TP: int) -> list[ShapeDict]:
+    """Handler for GEMM and batched GEMM benchmarks."""
+
+    def get_tp_shapes(self, shapes: list[ShapeDict]) -> list[ShapeDict]:
         result = []
         for shape in shapes:
             s = shape.copy()
             if s.get("TP_dim") in ("N", "K", "B"):
                 key = s["TP_dim"]
-                s[key] = max(s[key] // TP, 1)
+                s[key] = self._shard(s[key])
             result.append(s)
         return result
 
@@ -142,8 +193,10 @@ class GemmKernelHandler(KernelHandler):
         K = shape["K"]
         if "B" in shape:
             B = shape["B"]
-            return f"--shape {B} {M} {N} {K} --metric {self._metric} --layout {self._layout}"
-        return f"--shape {M} {N} {K} --metric {self._metric} --layout {self._layout}"
+            return f"--shape {B} {M} {N} {K} --metric {self._metric} --layout {self._gemm_layout}"
+        return (
+            f"--shape {M} {N} {K} --metric {self._metric} --layout {self._gemm_layout}"
+        )
 
     def parse_stdout(self, stdout: str) -> float:
         lines = [line for line in stdout.splitlines() if line.strip()]
@@ -158,18 +211,22 @@ class GemmKernelHandler(KernelHandler):
         return {
             "Model": self._model,
             "Kernel": self._kernel,
+            "batch_size": None,
+            "seq_len": None,
             "B": shape["B"] if "B" in shape else None,
-            "M/S": self._M,
+            "M": self._M,
             "N": shape["N"],
             "K": shape["K"],
-            "layout": self._layout,
+            "gemm_layout": self._gemm_layout,
             self._metric: bench_result,
         }
 
 
 class MoeKernelHandler(KernelHandler):
-    def get_tp_shapes(self, shapes: list[ShapeDict], TP: int) -> list[ShapeDict]:
-        return [{**s, "Dim2": max(s["Dim2"] // TP, 1)} for s in shapes]
+    """Handler for MoE benchmarks."""
+
+    def get_tp_shapes(self, shapes: list[ShapeDict]) -> list[ShapeDict]:
+        return [{**s, "Dim2": self._shard(s["Dim2"])} for s in shapes]
 
     def build_args(self) -> str:
         shape = self._shape
@@ -203,17 +260,21 @@ class MoeKernelHandler(KernelHandler):
         return {
             "Model": self._model,
             "Kernel": self._kernel,
-            "E": shape["E"],
-            "M/S": self._M,
-            "Dim1": shape["Dim1"],
-            "Dim2": shape["Dim2"],
-            "TopK": shape["TopK"],
+            "batch_size": None,
+            "seq_len": None,
+            "M": self._M,
+            "experts": shape["E"],
+            "moe_dim1": shape["Dim1"],
+            "moe_dim2": shape["Dim2"],
+            "topk": shape["TopK"],
             self._metric: bench_result,
         }
 
 
 class RmsnormKernelHandler(KernelHandler):
-    def get_tp_shapes(self, shapes: list[ShapeDict], TP: int) -> list[ShapeDict]:
+    """Handler for RMSNorm benchmarks."""
+
+    def get_tp_shapes(self, shapes: list[ShapeDict]) -> list[ShapeDict]:
         return shapes
 
     def build_args(self) -> str:
@@ -235,23 +296,27 @@ class RmsnormKernelHandler(KernelHandler):
         return {
             "Model": self._model,
             "Kernel": self._kernel,
-            "M/S": self._M,
+            "batch_size": None,
+            "seq_len": None,
+            "M": self._M,
             "N": shape["N"],
             self._metric: bench_result,
         }
 
 
 class RopeKernelHandler(KernelHandler):
-    def get_tp_shapes(self, shapes: list[ShapeDict], TP: int) -> list[ShapeDict]:
+    """Handler for RoPE benchmarks."""
+
+    def get_tp_shapes(self, shapes: list[ShapeDict]) -> list[ShapeDict]:
         result = []
         for shape in shapes:
             s = shape.copy()
-            s["num_heads"] = max(s["num_heads"] // TP, 1)
-            s["num_kv_heads"] = max(s["num_kv_heads"] // TP, 1)
+            self._shard_keys(s, ["num_heads", "num_kv_heads"])
             result.append(s)
         return result
 
     def build_args(self) -> str:
+        # There is no support for two_inputs + bshd layout, so we pass bs*sq as seq_len
         shape = self._shape
         M = self._M
         num_heads = int(shape["num_heads"])
@@ -284,24 +349,125 @@ class RopeKernelHandler(KernelHandler):
         return {
             "Model": self._model,
             "Kernel": self._kernel,
-            "M/S": self._M,
-            "Q": shape["num_heads"] // shape["num_kv_heads"],
-            "H": shape["num_kv_heads"],
-            "D": shape["head_dim"],
+            "batch_size": None,
+            "seq_len": self._M,
+            "hq": shape["num_heads"],
+            "hkv": shape["num_kv_heads"],
+            "dqk": None,
+            "dv": None,
+            "rotary_dim": shape["head_dim"],
             "rotate_style": shape["rotate_style"],
             "rope_total_flops": bench_result,
         }
 
 
+class MhaKernelHandler(KernelHandler):
+    """Handler for MHA forward benchmarks (bench_mha.py)."""
+
+    def get_tp_shapes(self, shapes: list[ShapeDict]) -> list[ShapeDict]:
+        result = []
+        for shape in shapes:
+            s = shape.copy()
+            self._shard_keys(s, ["hq", "hkv"])
+            result.append(s)
+        return result
+
+    def build_args(self) -> str:
+        shape = self._shape
+        return (
+            f"-mode fwd -causal true --layout {self._mha_layout} --dtype bf16 -b {self._batch_size} "
+            f"-hq {shape['hq']} -hk {shape['hkv']} -sq {self._seq_len} -sk {self._seq_len} "
+            f"-d {shape['dqk']} -dv {shape['dv']} -metric {self._metric}"
+        )
+
+    def parse_stdout(self, stdout: str) -> float:
+        lines = [line.split() for line in stdout.strip().splitlines() if line.strip()]
+        if len(lines) < 3:
+            raise ValueError(
+                f"Unexpected MHA bench output: expected at least 3 lines, got {len(lines)}"
+            )
+        if lines[0] != ["bench_mha:"]:
+            raise ValueError(f"Unexpected MHA bench output: first line {lines[0]!r}")
+        data = lines[2]
+        if len(data) < 7:
+            raise ValueError(f"Unexpected MHA bench data line: {data!r}")
+        return float(data[6])
+
+    def build_result_row(self, bench_result: float | str) -> ResultRow:
+        shape = self._shape
+        return {
+            "Model": self._model,
+            "Kernel": self._kernel,
+            "batch_size": self._batch_size,
+            "seq_len": self._seq_len,
+            "hq": shape["hq"],
+            "hkv": shape["hkv"],
+            "dqk": shape["dqk"],
+            "dv": shape["dv"],
+            "mha_layout": self._mha_layout,
+            self._metric: bench_result,
+        }
+
+
+class MlaKernelHandler(KernelHandler):
+    """Handler for MLA decode forward benchmarks (bench_mla_decode.py)."""
+
+    def get_tp_shapes(self, shapes: list[ShapeDict]) -> list[ShapeDict]:
+        result = []
+        for shape in shapes:
+            s = shape.copy()
+            self._shard_keys(s, ["hq", "hkv"])
+            result.append(s)
+        return result
+
+    def build_args(self) -> str:
+        return (
+            f"--model deepseek-V3 --dtype bf16 --tensor-parallelism {self._tp} "
+            f"-b {self._batch_size} --seqlen {self._seq_len} -equal_seqlens -causal"
+        )
+
+    def parse_stdout(self, stdout: str) -> float:
+        lines = [line.split() for line in stdout.strip().splitlines() if line.strip()]
+        if len(lines) < 3:
+            raise ValueError(
+                f"Unexpected MLA bench output: expected at least 3 lines, got {len(lines)}"
+            )
+        if lines[0] != ["bench_mla_decode:"]:
+            raise ValueError(f"Unexpected MLA bench output: first line {lines[0]!r}")
+        data = lines[2]
+        if len(data) < 10:
+            raise ValueError(f"Unexpected MLA bench data line: {data!r}")
+        return float(data[9])
+
+    def build_result_row(self, bench_result: float | str) -> ResultRow:
+        shape = self._shape
+        return {
+            "Model": self._model,
+            "Kernel": self._kernel,
+            "batch_size": self._batch_size,
+            "seq_len": self._seq_len,
+            "hq": shape["hq"],
+            "hkv": shape["hkv"],
+            "dqk": shape["dqk"],
+            "dv": shape["dv"],
+            self._metric: bench_result,
+        }
+
+
+_HANDLER_RULES: list[tuple[Callable[[str], bool], type[KernelHandler]]] = [
+    (lambda k: "moe" in k, MoeKernelHandler),
+    (lambda k: "gemm" in k and "moe" not in k, GemmKernelHandler),
+    (lambda k: k == "rmsnorm", RmsnormKernelHandler),
+    (lambda k: k == "rope", RopeKernelHandler),
+    (lambda k: k == "mha", MhaKernelHandler),
+    (lambda k: k == "mla", MlaKernelHandler),
+]
+
+
 def _get_handler(kernel: str) -> KernelHandler:
-    if "moe" in kernel:
-        return MoeKernelHandler()
-    if kernel == "rmsnorm":
-        return RmsnormKernelHandler()
-    if kernel == "rope":
-        return RopeKernelHandler()
-    if "gemm" in kernel and "moe" not in kernel:
-        return GemmKernelHandler()
+    for rule, handler in _HANDLER_RULES:
+        if rule(kernel):
+            return handler()
     raise ValueError(f"Kernel {kernel} not supported")
 
 
@@ -320,19 +486,52 @@ def read_json(json_path: str) -> ModelShapesData:
 
 
 def call_function(
-    bench_fn: Callable[[list[str]], None], args_str: str
-) -> tuple[str, str]:
+    bench_fn: Callable[[list[str]], None], handler: KernelHandler
+) -> Optional[str]:
     stdout = io.StringIO()
     stderr = io.StringIO()
-    with redirect_stdout(stdout), redirect_stderr(stderr):
-        try:
-            bench_fn(shlex.split(args_str))
-        except SystemExit as e:
-            print(f"SystemExit caught: {e}", file=stderr)
+    raw_result: Optional[str] = None
+
+    try:
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            bench_fn(shlex.split(handler.build_args()))
+        if stderr.getvalue():
+            print(f"Standard error stream isn't empty: [{stderr.getvalue()}]")
+        else:
+            raw_result = stdout.getvalue()
+    except OutOfResources as e:
+        # Parse the error message to extract required LDS and hardware limit.
+        # Expected format: "out of resource: shared memory, Required: XXXX, Hardware limit: XXXX..."
+        match = re.search(r"Required:\s*(\d+),\s*Hardware limit:\s*(\d+)", str(e))
+        if match:
+            required = int(match.group(1))
+            hw_limit = int(match.group(2))
+            ratio: float = required / hw_limit
+            print(
+                "Out of LDS on %s: %d / %d (%.1fx)"
+                % (
+                    handler.to_str(),
+                    required,
+                    hw_limit,
+                    ratio,
+                )
+            )
+        else:
+            print("Out of resources while benchmarking %s. %s" % (handler.to_str(), e))
+
+    except Exception as e:
+        print(
+            "Unexpected error while benchmarking %s. %s: %s"
+            % (
+                handler.to_str(),
+                type(e).__name__,
+                e,
+            )
+        )
 
     # Close matplotlib figures to silence errors and avoid memory leaks.
     plt.close("all")
-    return stdout.getvalue(), stderr.getvalue()
+    return raw_result
 
 
 def print_and_save_results(
@@ -340,14 +539,17 @@ def print_and_save_results(
 ) -> None:
     df = pd.DataFrame(results)
 
-    # Exclude metric and rope_total_flops from Int64 conversion
+    # Exclude metric columns and rope_total_flops from Int64 conversion
+    metric_cols = {"time", "throughput", "bandwidth"}
     cols = df.select_dtypes(include="number").columns.difference(
-        [metric, "rope_total_flops"]
+        metric_cols | {"rope_total_flops"}
     )
     df[cols] = df[cols].astype("Int64")
 
     unit = {"time": "ms", "throughput": "tflops", "bandwidth": "GBps"}
-    df[f"{metric}({unit[metric]})"] = df.pop(metric)
+    for m in metric_cols:
+        if m in df.columns:
+            df[f"{m}({unit[m]})"] = df.pop(m)
     if "rope_total_flops" in df.columns:
         df["total_flops(tflops)"] = df.pop("rope_total_flops")
 
@@ -365,6 +567,9 @@ def print_and_save_results(
     if (df["Kernel"] == "rope").any():
         print(f"\n{ROPE_METRIC_NOTE}")
 
+    if (df["Kernel"] == "mla").any():
+        print(f"\n{MLA_METRIC_NOTE}")
+
     # Save results to CSV file
     output_path = (
         f"{os.path.join(os.path.dirname(os.path.realpath(__file__)), output_file)}.csv"
@@ -375,9 +580,11 @@ def print_and_save_results(
 
 def run_benchmarks(
     data: ModelShapesData,
-    M_values: list[int],
+    batch_sizes: list[int],
+    seq_lens: list[int],
     TP: int,
-    layout: str,
+    gemm_layout: str,
+    mha_layout: str,
     metric: str,
 ) -> list[ResultRow]:
     results: list[ResultRow] = []
@@ -385,28 +592,44 @@ def run_benchmarks(
         print(f"Running benchmarks for {model}...")
         for kernel, shapes in kernels.items():
 
-            # Skip MHA and MLA kernels for now
-            if kernel in ["mha", "mla"]:
+            if (
+                any(s in kernel for s in ["fp4", "a4", "w4"])
+                and not arch_info.is_fp4_avail()
+            ):
+                print(f"FP4 is not supported on this device. Skipping {kernel}.")
                 continue
 
-            if "fp4" in kernel and not arch_info.is_fp4_avail():
+            if kernel == "moe_op_gemm_a8w8" and arch_info.get_arch() != "gfx950":
+                print(
+                    f"Float8 x MX is not supported on this device. Skipping {kernel}."
+                )
                 continue
 
             bench_fn = KERNEL_DICT[kernel]
             handler = _get_handler(kernel)
-            handler.set_run(model, kernel, metric, layout)
-            tp_shapes = handler.get_tp_shapes(shapes, TP)
+            # MLA only reports time (ms); use "time" metric for it
+            run_metric = "time" if kernel == "mla" else metric
+            handler.set_run(model, kernel, run_metric, gemm_layout, mha_layout, TP)
+            tp_shapes = handler.get_tp_shapes(shapes)
             for shape in tp_shapes:
-                for M in M_values:
-                    handler.set_iteration(shape, M)
-                    args_str = handler.build_args()
-                    stdout, _ = call_function(bench_fn, args_str)
-                    bench_result = handler.parse_stdout(stdout)
-                    results.append(handler.build_result_row(bench_result))
+                for batch_size in batch_sizes:
+                    for seq_len in seq_lens:
+                        handler.set_iteration(shape, batch_size, seq_len)
+                        stdout = call_function(bench_fn, handler)
+                        if stdout is not None:
+                            bench_result = handler.parse_stdout(stdout)
+                        else:
+                            bench_result = "N/A"
+                        results.append(handler.build_result_row(bench_result))
     return results
 
 
-def parse_M_values(raw_values: list[str], parser: argparse.ArgumentParser) -> list[int]:
+def parse_arg_list(
+    raw_values: list[str],
+    parser: argparse.ArgumentParser,
+    value_name: str = "Value",
+) -> list[int]:
+    """Parse a list of integers or start:stop:step ranges."""
     result = []
     for value in raw_values:
         if ":" in value:
@@ -433,7 +656,7 @@ def parse_M_values(raw_values: list[str], parser: argparse.ArgumentParser) -> li
                 parser.error(f"Invalid integer value '{value}'.")
 
             if val <= 0:
-                parser.error("Input size M must be positive.")
+                parser.error(f"{value_name} must be positive.")
             result.append(val)
 
     return sorted(set(result))  # Remove duplicates and sort
@@ -446,16 +669,31 @@ def parse_args(available_models: list[str]) -> argparse.Namespace:
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(
-        "--M",
+        "--batch_size",
+        type=str,
+        nargs="+",
+        default=["1"],
+        help=(
+            "Batch size(s) to sweep. Accepts:\n"
+            "  Single value:            --batch_size 1\n"
+            "  Multiple values:         --batch_size 1 2 4\n"
+            "  Range start:stop:step:   --batch_size 1:8:2\n"
+            "  Combinations of values and ranges are also accepted.\n"
+            "Default: 1."
+        ),
+    )
+    parser.add_argument(
+        "--seq_len",
         type=str,
         nargs="+",
         default=["4096"],
         help=(
-            "Input size M (seq_len for RoPE). Accepts:\n"
-            "  Single value:            --M 512\n"
-            "  Multiple values:         --M 256 512 1024\n"
-            "  Range start:stop:step:   --M 128:1024:128\n"
+            "Sequence length(s) to sweep. Accepts:\n"
+            "  Single value:            --seq_len 512\n"
+            "  Multiple values:         --seq_len 256 512 1024\n"
+            "  Range start:stop:step:   --seq_len 128:1024:128\n"
             "  Combinations of values and ranges are also accepted.\n"
+            "For non-attention kernels, M = batch_size x seq_len is passed as M.\n"
             "Default: 4096."
         ),
     )
@@ -474,6 +712,7 @@ def parse_args(available_models: list[str]) -> argparse.Namespace:
         help=(
             "Metric to report (throughput=TFLOPS, bandwidth=GB/s, time=ms). Default: throughput. "
             "RoPE reports total flops (total floating-point operations) in a separate column (see note in output)."
+            "MLA benchmark only reports time (ms)."
         ),
     )
     parser.add_argument(
@@ -488,11 +727,18 @@ def parse_args(available_models: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--layout",
+        "--gemm_layout",
         type=str,
         choices=["TN", "TT", "NN", "NT"],
         default="TN",
         help="GEMM layout. Default: TN.",
+    )
+    parser.add_argument(
+        "--mha_layout",
+        type=str,
+        choices=["bshd", "thd"],
+        default="thd",
+        help="Multi-head attention (MHA) layout (bshd or thd). Default: thd.",
     )
     parser.add_argument(
         "--output_file",
@@ -502,7 +748,8 @@ def parse_args(available_models: list[str]) -> argparse.Namespace:
     )
 
     args = parser.parse_args()
-    args.M = parse_M_values(args.M, parser)
+    args.batch_size = parse_arg_list(args.batch_size, parser, value_name="Batch size")
+    args.seq_len = parse_arg_list(args.seq_len, parser, value_name="Sequence length")
 
     return args
 
@@ -513,10 +760,12 @@ def main() -> None:
     args = parse_args(available_models)
 
     models = args.model
-    M_values = args.M
+    batch_sizes = args.batch_size
+    seq_lens = args.seq_len
     TP = args.TP
     metric = args.metric
-    layout = args.layout
+    gemm_layout = args.gemm_layout
+    mha_layout = args.mha_layout
     output_file = args.output_file
 
     if models is not None:
@@ -527,12 +776,11 @@ def main() -> None:
                 print("There are no models after filtering by model name.")
                 return
         except re.error:
-            print(
-                f"Invalid model filter regex: {models} - running all models.",
-                models,
-            )
+            print(f"Invalid model filter regex: {models!r} - running all models.")
 
-    results = run_benchmarks(data, M_values, TP, layout, metric)
+    results = run_benchmarks(
+        data, batch_sizes, seq_lens, TP, gemm_layout, mha_layout, metric
+    )
 
     print_and_save_results(results, metric, output_file)
 
