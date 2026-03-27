@@ -514,30 +514,49 @@ __device__ __forceinline__ void load_cos_sin_uncached_vec(float (&cos_0)[VecPair
         {
             // GPTJ non-reuse: freqs at did*2 and did*2+1, load 2*VecPairs contiguous
             auto g_f = opus_gmem(p_freqs);
-            auto v_lo = g_f.template load<VecPairs>(did * 2);
-            auto v_hi = g_f.template load<VecPairs>(did * 2 + VecPairs);
-            opus::static_for<VecPairs>([&](auto i) {
-                constexpr int idx0 = i.value * 2;
-                constexpr int idx1 = i.value * 2 + 1;
-                float f0, f1;
-                if constexpr(idx0 < VecPairs) {
-                    f0 = float(v_lo[idx0]);
-                    f1 = float(v_lo[idx1]);
-                } else {
-                    f0 = float(v_hi[idx0 - VecPairs]);
-                    f1 = float(v_hi[idx1 - VecPairs]);
-                }
+            if constexpr(VecPairs == 1)
+            {
+                auto v0 = g_f.template load<1>(did * 2);
+                auto v1 = g_f.template load<1>(did * 2 + 1);
+                float f0 = float(v0[0]), f1 = float(v1[0]);
                 if constexpr(IsForward)
                 {
-                    sincosf(f0, &sin_0[i.value], &cos_0[i.value]);
-                    sincosf(f1, &sin_1[i.value], &cos_1[i.value]);
+                    sincosf(f0, &sin_0[0], &cos_0[0]);
+                    sincosf(f1, &sin_1[0], &cos_1[0]);
                 }
                 else
                 {
-                    sincosf(f0, &sin_1[i.value], &cos_0[i.value]);
-                    sincosf(f1, &sin_0[i.value], &cos_1[i.value]);
+                    sincosf(f0, &sin_1[0], &cos_0[0]);
+                    sincosf(f1, &sin_0[0], &cos_1[0]);
                 }
-            });
+            }
+            else
+            {
+                auto v_lo = g_f.template load<VecPairs>(did * 2);
+                auto v_hi = g_f.template load<VecPairs>(did * 2 + VecPairs);
+                opus::static_for<VecPairs>([&](auto i) {
+                    constexpr int idx0 = i.value * 2;
+                    constexpr int idx1 = i.value * 2 + 1;
+                    float f0, f1;
+                    if constexpr(idx0 < VecPairs) {
+                        f0 = float(v_lo[idx0]);
+                        f1 = float(v_lo[idx1]);
+                    } else {
+                        f0 = float(v_hi[idx0 - VecPairs]);
+                        f1 = float(v_hi[idx1 - VecPairs]);
+                    }
+                    if constexpr(IsForward)
+                    {
+                        sincosf(f0, &sin_0[i.value], &cos_0[i.value]);
+                        sincosf(f1, &sin_1[i.value], &cos_1[i.value]);
+                    }
+                    else
+                    {
+                        sincosf(f0, &sin_1[i.value], &cos_0[i.value]);
+                        sincosf(f1, &sin_0[i.value], &cos_1[i.value]);
+                    }
+                });
+            }
         }
     }
 #endif
@@ -612,32 +631,54 @@ __device__ __forceinline__ void load_cos_sin_cached_vec(float (&cos_0)[VecPairs]
             // GPTJ non-reuse: cos/sin at did*2 and did*2+1
             auto g_c = opus_gmem(p_cos);
             auto g_s = opus_gmem(p_sin);
-            auto v_c_lo = g_c.template load<VecPairs>(did * 2);
-            auto v_c_hi = g_c.template load<VecPairs>(did * 2 + VecPairs);
-            auto v_s_lo = g_s.template load<VecPairs>(did * 2);
-            auto v_s_hi = g_s.template load<VecPairs>(did * 2 + VecPairs);
-            opus::static_for<VecPairs>([&](auto i) {
-                constexpr int idx0 = i.value * 2;
-                constexpr int idx1 = i.value * 2 + 1;
-                float c0, c1, s0, s1;
-                if constexpr(idx0 < VecPairs) {
-                    c0 = float(v_c_lo[idx0]); c1 = float(v_c_lo[idx1]);
-                    s0 = float(v_s_lo[idx0]); s1 = float(v_s_lo[idx1]);
-                } else {
-                    c0 = float(v_c_hi[idx0 - VecPairs]); c1 = float(v_c_hi[idx1 - VecPairs]);
-                    s0 = float(v_s_hi[idx0 - VecPairs]); s1 = float(v_s_hi[idx1 - VecPairs]);
-                }
+            if constexpr(VecPairs == 1)
+            {
+                auto v_c0 = g_c.template load<1>(did * 2);
+                auto v_c1 = g_c.template load<1>(did * 2 + 1);
+                auto v_s0 = g_s.template load<1>(did * 2);
+                auto v_s1 = g_s.template load<1>(did * 2 + 1);
+                float c0 = float(v_c0[0]), c1 = float(v_c1[0]);
+                float s0 = float(v_s0[0]), s1 = float(v_s1[0]);
                 if constexpr(IsForward)
                 {
-                    cos_0[i.value] = c0; sin_0[i.value] = s0;
-                    cos_1[i.value] = c1; sin_1[i.value] = s1;
+                    cos_0[0] = c0; sin_0[0] = s0;
+                    cos_1[0] = c1; sin_1[0] = s1;
                 }
                 else
                 {
-                    cos_0[i.value] = c0; sin_0[i.value] = s1;
-                    cos_1[i.value] = c1; sin_1[i.value] = s0;
+                    cos_0[0] = c0; sin_0[0] = s1;
+                    cos_1[0] = c1; sin_1[0] = s0;
                 }
-            });
+            }
+            else
+            {
+                auto v_c_lo = g_c.template load<VecPairs>(did * 2);
+                auto v_c_hi = g_c.template load<VecPairs>(did * 2 + VecPairs);
+                auto v_s_lo = g_s.template load<VecPairs>(did * 2);
+                auto v_s_hi = g_s.template load<VecPairs>(did * 2 + VecPairs);
+                opus::static_for<VecPairs>([&](auto i) {
+                    constexpr int idx0 = i.value * 2;
+                    constexpr int idx1 = i.value * 2 + 1;
+                    float c0, c1, s0, s1;
+                    if constexpr(idx0 < VecPairs) {
+                        c0 = float(v_c_lo[idx0]); c1 = float(v_c_lo[idx1]);
+                        s0 = float(v_s_lo[idx0]); s1 = float(v_s_lo[idx1]);
+                    } else {
+                        c0 = float(v_c_hi[idx0 - VecPairs]); c1 = float(v_c_hi[idx1 - VecPairs]);
+                        s0 = float(v_s_hi[idx0 - VecPairs]); s1 = float(v_s_hi[idx1 - VecPairs]);
+                    }
+                    if constexpr(IsForward)
+                    {
+                        cos_0[i.value] = c0; sin_0[i.value] = s0;
+                        cos_1[i.value] = c1; sin_1[i.value] = s1;
+                    }
+                    else
+                    {
+                        cos_0[i.value] = c0; sin_0[i.value] = s1;
+                        cos_1[i.value] = c1; sin_1[i.value] = s0;
+                    }
+                });
+            }
         }
     }
 #endif
@@ -647,7 +688,8 @@ template <int32_t RotateStyle, int32_t VecPairs, typename o_scalar_t, typename i
 __device__ __forceinline__ void load_payload_vec(o_scalar_t (&data_0)[VecPairs],
                                                  o_scalar_t (&data_1)[VecPairs],
                                                  const i_scalar_t* p_buffer,
-                                                 const int32_t did,
+                                                 const int32_t did_pair, // 0-based pair index into rotary portion
+                                                 const int32_t did_start, // physical start of rotary portion
                                                  const int32_t hid,
                                                  const int32_t stride_h,
                                                  const int32_t size_half_r)
@@ -656,6 +698,7 @@ __device__ __forceinline__ void load_payload_vec(o_scalar_t (&data_0)[VecPairs],
     const i_scalar_t* row = p_buffer + hid * stride_h;
     if constexpr(RotateStyle == ROTATE_STYLE_NEOX)
     {
+        const int32_t did = did_pair + did_start;
         auto g = opus_gmem(row);
         auto v0 = g.template load<VecPairs>(did);
         auto v1 = g.template load<VecPairs>(did + size_half_r);
@@ -666,20 +709,33 @@ __device__ __forceinline__ void load_payload_vec(o_scalar_t (&data_0)[VecPairs],
     }
     else if constexpr(RotateStyle == ROTATE_STYLE_GPTJ)
     {
+        // GPTJ layout: (even0, odd0, even1, odd1, ...) interleaved within rotary portion
+        // Physical position = did_start + 2 * did_pair
+        const int32_t phys = did_start + 2 * did_pair;
         auto g = opus_gmem(row);
-        auto v_lo = g.template load<VecPairs>(2 * did);
-        auto v_hi = g.template load<VecPairs>(2 * did + VecPairs);
-        opus::static_for<VecPairs>([&](auto i) {
-            constexpr int idx0 = i.value * 2;
-            constexpr int idx1 = i.value * 2 + 1;
-            if constexpr(idx0 < VecPairs) {
-                data_0[i.value] = o_scalar_t(v_lo[idx0]);
-                data_1[i.value] = o_scalar_t(v_lo[idx1]);
-            } else {
-                data_0[i.value] = o_scalar_t(v_hi[idx0 - VecPairs]);
-                data_1[i.value] = o_scalar_t(v_hi[idx1 - VecPairs]);
-            }
-        });
+        if constexpr(VecPairs == 1)
+        {
+            auto v0 = g.template load<1>(phys);
+            auto v1 = g.template load<1>(phys + 1);
+            data_0[0] = o_scalar_t(v0[0]);
+            data_1[0] = o_scalar_t(v1[0]);
+        }
+        else
+        {
+            auto v_lo = g.template load<VecPairs>(phys);
+            auto v_hi = g.template load<VecPairs>(phys + VecPairs);
+            opus::static_for<VecPairs>([&](auto i) {
+                constexpr int idx0 = i.value * 2;
+                constexpr int idx1 = i.value * 2 + 1;
+                if constexpr(idx0 < VecPairs) {
+                    data_0[i.value] = o_scalar_t(v_lo[idx0]);
+                    data_1[i.value] = o_scalar_t(v_lo[idx1]);
+                } else {
+                    data_0[i.value] = o_scalar_t(v_hi[idx0 - VecPairs]);
+                    data_1[i.value] = o_scalar_t(v_hi[idx1 - VecPairs]);
+                }
+            });
+        }
     }
 #endif
 }
@@ -688,7 +744,8 @@ template <int32_t RotateStyle, int32_t VecPairs, typename o_scalar_t, typename i
 __device__ __forceinline__ void store_payload_vec(o_scalar_t* p_buffer,
                                                   const i_scalar_t (&data_0)[VecPairs],
                                                   const i_scalar_t (&data_1)[VecPairs],
-                                                  const int32_t did,
+                                                  const int32_t did_pair, // 0-based pair index into rotary portion
+                                                  const int32_t did_start, // physical start of rotary portion
                                                   const int32_t hid,
                                                   const int32_t stride_h,
                                                   const int32_t size_half_r)
@@ -697,6 +754,7 @@ __device__ __forceinline__ void store_payload_vec(o_scalar_t* p_buffer,
     o_scalar_t* row = p_buffer + hid * stride_h;
     if constexpr(RotateStyle == ROTATE_STYLE_NEOX)
     {
+        const int32_t did = did_pair + did_start;
         opus::vector_t<opus_type_t<o_scalar_t>, VecPairs> v0, v1;
         opus::static_for<VecPairs>([&](auto i) {
             v0[i.value] = opus_type_t<o_scalar_t>(data_0[i.value]);
@@ -708,21 +766,33 @@ __device__ __forceinline__ void store_payload_vec(o_scalar_t* p_buffer,
     }
     else if constexpr(RotateStyle == ROTATE_STYLE_GPTJ)
     {
-        opus::vector_t<opus_type_t<o_scalar_t>, VecPairs> v_lo, v_hi;
-        opus::static_for<VecPairs>([&](auto i) {
-            constexpr int idx0 = i.value * 2;
-            constexpr int idx1 = i.value * 2 + 1;
-            if constexpr(idx0 < VecPairs) {
-                v_lo[idx0] = opus_type_t<o_scalar_t>(data_0[i.value]);
-                v_lo[idx1] = opus_type_t<o_scalar_t>(data_1[i.value]);
-            } else {
-                v_hi[idx0 - VecPairs] = opus_type_t<o_scalar_t>(data_0[i.value]);
-                v_hi[idx1 - VecPairs] = opus_type_t<o_scalar_t>(data_1[i.value]);
-            }
-        });
+        const int32_t phys = did_start + 2 * did_pair;
         auto g = opus_gmem(row);
-        g.template store<VecPairs>(v_lo, 2 * did);
-        g.template store<VecPairs>(v_hi, 2 * did + VecPairs);
+        if constexpr(VecPairs == 1)
+        {
+            opus::vector_t<opus_type_t<o_scalar_t>, 1> v_lo, v_hi;
+            v_lo[0] = opus_type_t<o_scalar_t>(data_0[0]);
+            v_hi[0] = opus_type_t<o_scalar_t>(data_1[0]);
+            g.template store<1>(v_lo, phys);
+            g.template store<1>(v_hi, phys + 1);
+        }
+        else
+        {
+            opus::vector_t<opus_type_t<o_scalar_t>, VecPairs> v_lo, v_hi;
+            opus::static_for<VecPairs>([&](auto i) {
+                constexpr int idx0 = i.value * 2;
+                constexpr int idx1 = i.value * 2 + 1;
+                if constexpr(idx0 < VecPairs) {
+                    v_lo[idx0] = opus_type_t<o_scalar_t>(data_0[i.value]);
+                    v_lo[idx1] = opus_type_t<o_scalar_t>(data_1[i.value]);
+                } else {
+                    v_hi[idx0 - VecPairs] = opus_type_t<o_scalar_t>(data_0[i.value]);
+                    v_hi[idx1 - VecPairs] = opus_type_t<o_scalar_t>(data_1[i.value]);
+                }
+            });
+            g.template store<VecPairs>(v_lo, phys);
+            g.template store<VecPairs>(v_hi, phys + VecPairs);
+        }
     }
 #endif
 }
@@ -759,7 +829,8 @@ struct OpUncachedFwd
         const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
-        const int32_t did         = d_chunk_idx * VecPairs + did_start;
+        const int32_t did_pair    = d_chunk_idx * VecPairs;
+        const int32_t did         = did_pair + did_start;
 
         // Load cos/sin once for this thread's VecPairs pairs
         float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
@@ -771,7 +842,7 @@ struct OpUncachedFwd
         {
             float input_0[VecPairs], input_1[VecPairs];
             load_payload_vec<RotateStyle, VecPairs>(
-                input_0, input_1, p_input, did, hid, stride_i_h, size_half_r);
+                input_0, input_1, p_input, did_pair, did_start, hid, stride_i_h, size_half_r);
 
             float output_0[VecPairs], output_1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
@@ -781,7 +852,7 @@ struct OpUncachedFwd
             }
 
             store_payload_vec<RotateStyle, VecPairs>(
-                p_output, output_0, output_1, did, hid, stride_o_h, size_half_r);
+                p_output, output_0, output_1, did_pair, did_start, hid, stride_o_h, size_half_r);
         }
 
         // the rest are just forwarded (nope copy, distributed round-robin)
@@ -839,7 +910,8 @@ struct OpUncachedFwd
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
         const int32_t size_min_h  = min(size_h_x, size_h_y);
-        const int32_t did         = d_chunk_idx * VecPairs + did_start;
+        const int32_t did_pair    = d_chunk_idx * VecPairs;
+        const int32_t did         = did_pair + did_start;
 
         // Load cos/sin once for this thread's VecPairs pairs
         float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
@@ -850,8 +922,8 @@ struct OpUncachedFwd
         for(int32_t hid = 0; hid < size_min_h; hid++)
         {
             float ix0[VecPairs], ix1[VecPairs], iy0[VecPairs], iy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, p_input_x, did, hid, stride_ix_h, size_half_r);
-            load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, p_input_y, did, hid, stride_iy_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, p_input_x, did_pair, did_start, hid, stride_ix_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, p_input_y, did_pair, did_start, hid, stride_iy_h, size_half_r);
 
             float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
@@ -862,36 +934,36 @@ struct OpUncachedFwd
                 oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
             }
 
-            store_payload_vec<RotateStyle, VecPairs>(p_output_x, ox0, ox1, did, hid, stride_ox_h, size_half_r);
-            store_payload_vec<RotateStyle, VecPairs>(p_output_y, oy0, oy1, did, hid, stride_oy_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(p_output_x, ox0, ox1, did_pair, did_start, hid, stride_ox_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(p_output_y, oy0, oy1, did_pair, did_start, hid, stride_oy_h, size_half_r);
         }
 
         // Remaining x-only heads
         for(int32_t hid = size_min_h; hid < size_h_x; hid++)
         {
             float ix0[VecPairs], ix1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, p_input_x, did, hid, stride_ix_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, p_input_x, did_pair, did_start, hid, stride_ix_h, size_half_r);
             float ox0[VecPairs], ox1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
             {
                 ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
                 ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
             }
-            store_payload_vec<RotateStyle, VecPairs>(p_output_x, ox0, ox1, did, hid, stride_ox_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(p_output_x, ox0, ox1, did_pair, did_start, hid, stride_ox_h, size_half_r);
         }
 
         // Remaining y-only heads
         for(int32_t hid = size_min_h; hid < size_h_y; hid++)
         {
             float iy0[VecPairs], iy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, p_input_y, did, hid, stride_iy_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, p_input_y, did_pair, did_start, hid, stride_iy_h, size_half_r);
             float oy0[VecPairs], oy1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
             {
                 oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
                 oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
             }
-            store_payload_vec<RotateStyle, VecPairs>(p_output_y, oy0, oy1, did, hid, stride_oy_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(p_output_y, oy0, oy1, did_pair, did_start, hid, stride_oy_h, size_half_r);
         }
 
         // the rest are just forwarded (nope copy, distributed round-robin)
@@ -949,7 +1021,8 @@ struct OpUncachedBwd
         const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
-        const int32_t did         = d_chunk_idx * VecPairs + did_start;
+        const int32_t did_pair    = d_chunk_idx * VecPairs;
+        const int32_t did         = did_pair + did_start;
 
         // Load cos/sin once for this thread's VecPairs pairs
         float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
@@ -961,7 +1034,7 @@ struct OpUncachedBwd
         {
             float og0[VecPairs], og1[VecPairs];
             load_payload_vec<RotateStyle, VecPairs>(
-                og0, og1, p_output_grads, did, hid, stride_o_h, size_half_r);
+                og0, og1, p_output_grads, did_pair, did_start, hid, stride_o_h, size_half_r);
 
             float ig0[VecPairs], ig1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
@@ -971,7 +1044,7 @@ struct OpUncachedBwd
             }
 
             store_payload_vec<RotateStyle, VecPairs>(
-                p_input_grads, ig0, ig1, did, hid, stride_i_h, size_half_r);
+                p_input_grads, ig0, ig1, did_pair, did_start, hid, stride_i_h, size_half_r);
         }
 
         // the rest are just forwarded (nope copy, distributed round-robin)
@@ -1029,7 +1102,8 @@ struct OpUncachedBwd
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
         const int32_t size_min_h  = min(size_h_x, size_h_y);
-        const int32_t did         = d_chunk_idx * VecPairs + did_start;
+        const int32_t did_pair    = d_chunk_idx * VecPairs;
+        const int32_t did         = did_pair + did_start;
 
         // Load cos/sin once for this thread's VecPairs pairs
         float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
@@ -1040,8 +1114,8 @@ struct OpUncachedBwd
         for(int32_t hid = 0; hid < size_min_h; hid++)
         {
             float ogx0[VecPairs], ogx1[VecPairs], ogy0[VecPairs], ogy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, p_output_grads_x, did, hid, stride_ox_h, size_half_r);
-            load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, p_output_grads_y, did, hid, stride_oy_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, p_output_grads_x, did_pair, did_start, hid, stride_ox_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, p_output_grads_y, did_pair, did_start, hid, stride_oy_h, size_half_r);
 
             float igx0[VecPairs], igx1[VecPairs], igy0[VecPairs], igy1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
@@ -1052,36 +1126,36 @@ struct OpUncachedBwd
                 igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
             }
 
-            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_x, igx0, igx1, did, hid, stride_ix_h, size_half_r);
-            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_y, igy0, igy1, did, hid, stride_iy_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_x, igx0, igx1, did_pair, did_start, hid, stride_ix_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_y, igy0, igy1, did_pair, did_start, hid, stride_iy_h, size_half_r);
         }
 
         // Remaining x-only heads
         for(int32_t hid = size_min_h; hid < size_h_x; hid++)
         {
             float ogx0[VecPairs], ogx1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, p_output_grads_x, did, hid, stride_ox_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, p_output_grads_x, did_pair, did_start, hid, stride_ox_h, size_half_r);
             float igx0[VecPairs], igx1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
             {
                 igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
                 igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
             }
-            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_x, igx0, igx1, did, hid, stride_ix_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_x, igx0, igx1, did_pair, did_start, hid, stride_ix_h, size_half_r);
         }
 
         // Remaining y-only heads
         for(int32_t hid = size_min_h; hid < size_h_y; hid++)
         {
             float ogy0[VecPairs], ogy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, p_output_grads_y, did, hid, stride_oy_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, p_output_grads_y, did_pair, did_start, hid, stride_oy_h, size_half_r);
             float igy0[VecPairs], igy1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
             {
                 igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
                 igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
             }
-            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_y, igy0, igy1, did, hid, stride_iy_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_y, igy0, igy1, did_pair, did_start, hid, stride_iy_h, size_half_r);
         }
 
         // the rest are just forwarded (nope copy, distributed round-robin)
@@ -1140,7 +1214,8 @@ struct OpCachedFwd
         const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
-        const int32_t did         = d_chunk_idx * VecPairs + did_start;
+        const int32_t did_pair    = d_chunk_idx * VecPairs;
+        const int32_t did         = did_pair + did_start;
 
         // Load cos/sin once for this thread's VecPairs pairs
         float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
@@ -1152,7 +1227,7 @@ struct OpCachedFwd
         {
             float input_0[VecPairs], input_1[VecPairs];
             load_payload_vec<RotateStyle, VecPairs>(
-                input_0, input_1, p_input, did, hid, stride_i_h, size_half_r);
+                input_0, input_1, p_input, did_pair, did_start, hid, stride_i_h, size_half_r);
 
             float output_0[VecPairs], output_1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
@@ -1162,7 +1237,7 @@ struct OpCachedFwd
             }
 
             store_payload_vec<RotateStyle, VecPairs>(
-                p_output, output_0, output_1, did, hid, stride_o_h, size_half_r);
+                p_output, output_0, output_1, did_pair, did_start, hid, stride_o_h, size_half_r);
         }
 
         // the rest are just forwarded (nope copy, distributed round-robin)
@@ -1221,7 +1296,8 @@ struct OpCachedFwd
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
         const int32_t size_min_h  = min(size_h_x, size_h_y);
-        const int32_t did         = d_chunk_idx * VecPairs + did_start;
+        const int32_t did_pair    = d_chunk_idx * VecPairs;
+        const int32_t did         = did_pair + did_start;
 
         // Load cos/sin once for this thread's VecPairs pairs
         float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
@@ -1232,8 +1308,8 @@ struct OpCachedFwd
         for(int32_t hid = 0; hid < size_min_h; hid++)
         {
             float ix0[VecPairs], ix1[VecPairs], iy0[VecPairs], iy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, p_input_x, did, hid, stride_ix_h, size_half_r);
-            load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, p_input_y, did, hid, stride_iy_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, p_input_x, did_pair, did_start, hid, stride_ix_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, p_input_y, did_pair, did_start, hid, stride_iy_h, size_half_r);
 
             float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
@@ -1244,36 +1320,36 @@ struct OpCachedFwd
                 oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
             }
 
-            store_payload_vec<RotateStyle, VecPairs>(p_output_x, ox0, ox1, did, hid, stride_ox_h, size_half_r);
-            store_payload_vec<RotateStyle, VecPairs>(p_output_y, oy0, oy1, did, hid, stride_oy_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(p_output_x, ox0, ox1, did_pair, did_start, hid, stride_ox_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(p_output_y, oy0, oy1, did_pair, did_start, hid, stride_oy_h, size_half_r);
         }
 
         // Remaining x-only heads
         for(int32_t hid = size_min_h; hid < size_h_x; hid++)
         {
             float ix0[VecPairs], ix1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, p_input_x, did, hid, stride_ix_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, p_input_x, did_pair, did_start, hid, stride_ix_h, size_half_r);
             float ox0[VecPairs], ox1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
             {
                 ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
                 ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
             }
-            store_payload_vec<RotateStyle, VecPairs>(p_output_x, ox0, ox1, did, hid, stride_ox_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(p_output_x, ox0, ox1, did_pair, did_start, hid, stride_ox_h, size_half_r);
         }
 
         // Remaining y-only heads
         for(int32_t hid = size_min_h; hid < size_h_y; hid++)
         {
             float iy0[VecPairs], iy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, p_input_y, did, hid, stride_iy_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, p_input_y, did_pair, did_start, hid, stride_iy_h, size_half_r);
             float oy0[VecPairs], oy1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
             {
                 oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
                 oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
             }
-            store_payload_vec<RotateStyle, VecPairs>(p_output_y, oy0, oy1, did, hid, stride_oy_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(p_output_y, oy0, oy1, did_pair, did_start, hid, stride_oy_h, size_half_r);
         }
 
         // the rest are just forwarded (nope copy, distributed round-robin)
@@ -1332,7 +1408,8 @@ struct OpCachedBwd
         const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
-        const int32_t did         = d_chunk_idx * VecPairs + did_start;
+        const int32_t did_pair    = d_chunk_idx * VecPairs;
+        const int32_t did         = did_pair + did_start;
 
         // Load cos/sin once for this thread's VecPairs pairs
         float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
@@ -1344,7 +1421,7 @@ struct OpCachedBwd
         {
             float og0[VecPairs], og1[VecPairs];
             load_payload_vec<RotateStyle, VecPairs>(
-                og0, og1, p_output_grads, did, hid, stride_o_h, size_half_r);
+                og0, og1, p_output_grads, did_pair, did_start, hid, stride_o_h, size_half_r);
 
             float ig0[VecPairs], ig1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
@@ -1354,7 +1431,7 @@ struct OpCachedBwd
             }
 
             store_payload_vec<RotateStyle, VecPairs>(
-                p_input_grads, ig0, ig1, did, hid, stride_i_h, size_half_r);
+                p_input_grads, ig0, ig1, did_pair, did_start, hid, stride_i_h, size_half_r);
         }
 
         // the rest are just forwarded (nope copy, distributed round-robin)
@@ -1413,7 +1490,8 @@ struct OpCachedBwd
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
         const int32_t size_min_h  = min(size_h_x, size_h_y);
-        const int32_t did         = d_chunk_idx * VecPairs + did_start;
+        const int32_t did_pair    = d_chunk_idx * VecPairs;
+        const int32_t did         = did_pair + did_start;
 
         // Load cos/sin once for this thread's VecPairs pairs
         float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
@@ -1424,8 +1502,8 @@ struct OpCachedBwd
         for(int32_t hid = 0; hid < size_min_h; hid++)
         {
             float ogx0[VecPairs], ogx1[VecPairs], ogy0[VecPairs], ogy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, p_output_grads_x, did, hid, stride_ox_h, size_half_r);
-            load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, p_output_grads_y, did, hid, stride_oy_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, p_output_grads_x, did_pair, did_start, hid, stride_ox_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, p_output_grads_y, did_pair, did_start, hid, stride_oy_h, size_half_r);
 
             float igx0[VecPairs], igx1[VecPairs], igy0[VecPairs], igy1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
@@ -1436,36 +1514,36 @@ struct OpCachedBwd
                 igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
             }
 
-            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_x, igx0, igx1, did, hid, stride_ix_h, size_half_r);
-            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_y, igy0, igy1, did, hid, stride_iy_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_x, igx0, igx1, did_pair, did_start, hid, stride_ix_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_y, igy0, igy1, did_pair, did_start, hid, stride_iy_h, size_half_r);
         }
 
         // Remaining x-only heads
         for(int32_t hid = size_min_h; hid < size_h_x; hid++)
         {
             float ogx0[VecPairs], ogx1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, p_output_grads_x, did, hid, stride_ox_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, p_output_grads_x, did_pair, did_start, hid, stride_ox_h, size_half_r);
             float igx0[VecPairs], igx1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
             {
                 igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
                 igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
             }
-            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_x, igx0, igx1, did, hid, stride_ix_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_x, igx0, igx1, did_pair, did_start, hid, stride_ix_h, size_half_r);
         }
 
         // Remaining y-only heads
         for(int32_t hid = size_min_h; hid < size_h_y; hid++)
         {
             float ogy0[VecPairs], ogy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, p_output_grads_y, did, hid, stride_oy_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, p_output_grads_y, did_pair, did_start, hid, stride_oy_h, size_half_r);
             float igy0[VecPairs], igy1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
             {
                 igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
                 igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
             }
-            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_y, igy0, igy1, did, hid, stride_iy_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_y, igy0, igy1, did_pair, did_start, hid, stride_iy_h, size_half_r);
         }
 
         // the rest are just forwarded (nope copy, distributed round-robin)
@@ -3138,7 +3216,7 @@ std::tuple<dim3, dim3, int32_t, int32_t> get_grid_config(const int32_t size_s_h,
                                                           const int32_t size_s_w,
                                                           const int32_t size_b,
                                                           const int32_t size_f,
-                                                          const float   threshold = 1.0f)
+                                                          const float   threshold = 4.0f)
 {
     constexpr int32_t num_threads      = 256; // 4 warps x 64 threads/warp
     constexpr int32_t kernel_occupancy = 8;   // __launch_bounds__(256, 8)
@@ -3148,13 +3226,21 @@ std::tuple<dim3, dim3, int32_t, int32_t> get_grid_config(const int32_t size_s_h,
     const int32_t total_sb    = size_s_h * size_s_w * size_b;
 
     // Pick largest VecPairs in {1,2,4} that divides size_half_r
-    // and ensures enough work to saturate the GPU
+    // and ensures enough total waves to saturate the GPU.
+    // total_waves = total_sb * (size_half_r / vec_pairs) / warp_size
+    // Must exceed gpu_capacity (num_cu * occupancy) by threshold factor.
     int32_t vec_pairs = 4;
     while(vec_pairs > 1 && (size_half_r % vec_pairs != 0))
         vec_pairs >>= 1;
     const int32_t gpu_capacity = static_cast<int32_t>(get_num_cu_func() * kernel_occupancy);
-    while(vec_pairs > 1 && total_sb < static_cast<int32_t>(gpu_capacity * vec_pairs * threshold))
+    constexpr int32_t warp_size = 64;
+    while(vec_pairs > 1)
+    {
+        const int32_t total_waves = total_sb * (size_half_r / vec_pairs) / warp_size;
+        if(total_waves >= static_cast<int32_t>(gpu_capacity * threshold))
+            break;
         vec_pairs >>= 1;
+    }
 
     const int32_t threads_per_sb = size_half_r / vec_pairs;
     const int32_t total_threads  = total_sb * threads_per_sb;
