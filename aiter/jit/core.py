@@ -1039,6 +1039,42 @@ def _is_union(origin):
     """Check for both typing.Union (Optional[X]) and types.UnionType (X | None)."""
     return origin is typing.Union or origin is types.UnionType
 
+MANUAL_SCHEMA_OPS = [
+    "register_graph_buffers",
+    "module_moe_ck2stages",
+    "mha_fwd",
+    "fmha_v3_fwd",
+    "mha_varlen_fwd",
+    "mha_bwd",
+    "fmha_v3_bwd",
+    "mha_varlen_bwd",
+    "fmha_v3_varlen_bwd",
+    "mha_batch_prefill",
+    "hipb_findallsols",
+    "rocb_findallsols",
+    "_ActivationType",
+    "_QuantType",
+    "init_custom_ar",
+]
+
+NONE_WRAPPED_OP = [
+    "hipb_create_extension",
+    "hipb_destroy_extension",
+    "getHipblasltKernelName",
+    "rocb_create_extension",
+    "rocb_destroy_extension",
+    "get_meta_buffer_ipc_handle",
+    "get_graph_buffer_ipc_meta",
+    "_ActivationType",
+    "_QuantType",
+    "allocate_meta_buffer",
+    "dispose",
+    "meta_size",
+    "get_padded_m",
+    "compile_mha_fwd",
+    "compile_mha_bwd",
+]
+
 
 def _ctypes_call(func, fc_name, md_name):
     """Build a ctypes-based caller for a torch-free .so module.
@@ -1276,6 +1312,30 @@ def compile_ops(
                 return ctypes_wrapper(*args, **kwargs)
 
             return ctypes_custom_wrapper
+#        func.arg_checked = False
+#
+#        @functools.wraps(func)
+#        def wrapper(*args, custom_build_args={}, **kwargs):
+#            loadName = fc_name
+#            md_name = _md_name
+#            if fc_name is None:
+#                loadName = func.__name__
+#            try:
+#                module = None
+#                if gen_func is not None:
+#                    custom_build_args.update(gen_func(*args, **kwargs))
+#                if PREBUILD_KERNELS:
+#                    if hasattr(aiter_, loadName):
+#                        module = aiter_
+#                elif AITER_REBUILD and md_name not in rebuilded_list:
+#                    rebuilded_list.append(md_name)
+#                    raise ModuleNotFoundError("")
+#                if module is None:
+#                    md = custom_build_args.get("md_name", md_name)
+#                    module = get_module(md)
+#            except ModuleNotFoundError:
+#                d_args = get_args_of_build(md_name)
+#                d_args.update(custom_build_args)
 
         elif ffi_type == "pybind":
             func.arg_checked = False
@@ -1350,6 +1410,7 @@ def compile_ops(
                 else:
                     return None
 
+<<<<<<< HEAD
                 def check_args():
                     get_asm_dir()
                     import inspect
