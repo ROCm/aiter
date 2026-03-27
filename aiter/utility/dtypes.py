@@ -67,7 +67,7 @@ def torch_to_aiter_pybind(tensor: torch.Tensor):
 
 
 def torch_to_aiter(tensor: torch.Tensor) -> aiter_tensor_t:
-    """ This is for ctypes binding.
+    """This is for ctypes binding.
     torch.Tensor -> aiter_tensor_t, zero-copy, points to the same GPU memory."""
     assert tensor.is_cuda, "aiter_tensor_t only supports CUDA tensors"
     assert (
