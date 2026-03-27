@@ -392,7 +392,9 @@ class _FlashAttnFunc(torch.autograd.Function):
                 USE_INT64_STRIDES=_USE_INT64_STRIDES,
                 sink=sink,
                 dsink=dsink,
-                sliding_window=int(ctx.window_size[0]) if int(ctx.window_size[0]) >= 0 else 0,
+                sliding_window=(
+                    int(ctx.window_size[0]) if int(ctx.window_size[0]) >= 0 else 0
+                ),
             )
 
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
@@ -653,7 +655,9 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
                 USE_INT64_STRIDES=_USE_INT64_STRIDES,
                 sink=sink,
                 dsink=dsink,
-                sliding_window=int(ctx.window_size[0]) if int(ctx.window_size[0]) >= 0 else 0,
+                sliding_window=(
+                    int(ctx.window_size[0]) if int(ctx.window_size[0]) >= 0 else 0
+                ),
             )
 
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension

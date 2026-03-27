@@ -264,7 +264,9 @@ def _bwd_dkdv_inner(
                     )
             pT = tl.where(mask, pT, 0.0)
         if SLIDING_WINDOW > 0:
-            window_mask = offs_n[:, None] >= (offs_m[None, :] - delta_qk - SLIDING_WINDOW)
+            window_mask = offs_n[:, None] >= (
+                offs_m[None, :] - delta_qk - SLIDING_WINDOW
+            )
             pT = tl.where(window_mask, pT, 0.0)
         do = tl.load(do_ptrs, mask=mask_do, other=0.0)
         # Compute dV.
@@ -470,7 +472,9 @@ def _bwd_dq_inner(
             mask = causal_mask & mask_mn
             p = tl.where(mask, p, 0.0)
         if SLIDING_WINDOW > 0:
-            window_mask = offs_n[None, :] >= (offs_m[:, None] - delta_qk - SLIDING_WINDOW)
+            window_mask = offs_n[None, :] >= (
+                offs_m[:, None] - delta_qk - SLIDING_WINDOW
+            )
             p = tl.where(window_mask, p, 0.0)
         # Compute dP and dS.
         if IS_FP8:

@@ -1777,13 +1777,9 @@ def test_mha_sliding_window_no_sink(
     do = torch.randn_like(q)
 
     mha_set_use_fused_bwd_kernel(False)
-    triton_dq, triton_dk, triton_dv = torch.autograd.grad(
-        triton_out, (q, k, v), do
-    )
+    triton_dq, triton_dk, triton_dv = torch.autograd.grad(triton_out, (q, k, v), do)
 
-    torch_dq, torch_dk, torch_dv = torch.autograd.grad(
-        torch_out, (q, k, v), do
-    )
+    torch_dq, torch_dk, torch_dv = torch.autograd.grad(torch_out, (q, k, v), do)
 
     bwd_atol = 1.5e-2
     bwd_rtol = 1.5e-2
