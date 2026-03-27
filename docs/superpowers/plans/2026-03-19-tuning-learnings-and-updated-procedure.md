@@ -57,12 +57,19 @@ The tuning search space MUST be tailored to M. Using the full default range wast
 - `num_stages=2` is close second, sometimes wins for large M with large BK
 - `num_stages=1` should also be swept — it occasionally wins for specific shapes
 - Always sweep `--num-stages-range 1 2 3`
+- **Critical: num_stages=3 + split-K can be dramatically better than num_stages=2 + split-K** (e.g., M=128 N=8192 K=32768 per_token_scale: 87us→63us just from stages 2→3)
 
-### 5. matrix_instr_nonkdim
+### 5. split-K (NUM_KSPLIT)
+- For medium/large M with large K, split-K can help significantly — do NOT restrict to SPK=1 for medium M
+- Always include split-K values in the sweep for shapes where K is large relative to N
+- Valid split-K values depend on K and BLOCK_SIZE_K: `SPLITK_BLOCK_SIZE = ceil(K/SPK)` must be >= BK
+- For per_token_scale kernel: split-K=4 with stages=3 was optimal for M=128 K=32768
+
+### 6. matrix_instr_nonkdim
 - **nonkdim=16**: Default, works well for most shapes
 - **nonkdim=32**: Critical for fp4 kernels with large M and large N,K — can be dramatically faster
-- Always sweep `--matrix-instr-nonkdim-range 16 32` for fp4 kernels
-- For fp8/bf16 kernels, nonkdim=16 is usually sufficient
+- Also helps fp8 kernels for medium-large M (M>=64): consistently chosen as best for per_token_scale M=64-512
+- Always sweep `--matrix-instr-nonkdim-range 16 32` for fp4 kernels and for fp8 kernels with M>=64
 
 ### 6. GPU Assignment
 - Pass GPU ID directly to `screen.py` as the `G` positional argument
