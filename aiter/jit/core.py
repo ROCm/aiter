@@ -527,7 +527,7 @@ def get_module(md_name):
     return __mds[md_name]
 
 
-rebuilded_list = ["module_aiter_enum"]
+rebuilded_list = ["module_aiter_enum", "module_aiter_tensor"]
 
 
 def clone_3rdparty(third_party: str) -> None:

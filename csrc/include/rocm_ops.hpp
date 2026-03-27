@@ -326,18 +326,9 @@ namespace py = pybind11;
           py::arg("is_neox"),                                                       \
           py::arg("is_nope_first"));
 
-#define CUSTOM_ALL_REDUCE_PYBIND                                                               \
-    m.def("init_custom_ar",                                                                    \
-          &aiter::init_custom_ar,                                                              \
-          py::arg("meta_ptr"),                                                                 \
-          py::arg("rank_data_ptr"),                                                            \
-          py::arg("rank_data_sz"),                                                             \
-          py::arg("ipc_handle_ptrs"),                                                          \
-          py::arg("offsets"),                                                                  \
-          py::arg("rank"),                                                                     \
-          py::arg("fully_connected"));                                                         \
-    py::class_<aiter_tensor_t>(m, "aiter_tensor_t")                                             \
-        .def(py::init<>())                                                                     \
+#define AITER_TENSOR_PYBIND                                                                    \
+    pybind11::class_<aiter_tensor_t>(m, "aiter_tensor_t")                                      \
+        .def(pybind11::init<>())                                                               \
         .def_readwrite("numel_", &aiter_tensor_t::numel_)                                      \
         .def_readwrite("ndim", &aiter_tensor_t::ndim)                                          \
         .def_readwrite("device_id", &aiter_tensor_t::device_id);                               \
@@ -358,9 +349,24 @@ namespace py = pybind11;
               at.device_id = device_id;                                                        \
               return at;                                                                       \
           },                                                                                   \
-          py::arg("data_ptr"), py::arg("numel"), py::arg("ndim"),                              \
-          py::arg("shape"), py::arg("strides"),                                                \
-          py::arg("dtype"), py::arg("device_id"));                                             \
+          pybind11::arg("data_ptr"),                                                           \
+          pybind11::arg("numel"),                                                              \
+          pybind11::arg("ndim"),                                                               \
+          pybind11::arg("shape"),                                                              \
+          pybind11::arg("strides"),                                                            \
+          pybind11::arg("dtype"),                                                              \
+          pybind11::arg("device_id"));
+
+#define CUSTOM_ALL_REDUCE_PYBIND                                                               \
+    m.def("init_custom_ar",                                                                    \
+          &aiter::init_custom_ar,                                                              \
+          py::arg("meta_ptr"),                                                                 \
+          py::arg("rank_data_ptr"),                                                            \
+          py::arg("rank_data_sz"),                                                             \
+          py::arg("ipc_handle_ptrs"),                                                          \
+          py::arg("offsets"),                                                                  \
+          py::arg("rank"),                                                                     \
+          py::arg("fully_connected"));                                                         \
     m.def("all_reduce",                                                                        \
           &aiter::all_reduce,                                                                  \
           py::arg("_fa"),                                                                      \

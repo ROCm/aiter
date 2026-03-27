@@ -165,10 +165,11 @@ def get_exclude_ops():
             ):
                 exclude_ops.append(module)
         elif PREBUILD_KERNELS == 3:
-            # Keep only module_fmha_v3* and module_aiter_enum
+            # Keep only module_fmha_v3* and module_aiter_enum/module_aiter_tensor
             if not (
                 module.startswith("module_fmha_v3")
                 or module == "module_aiter_enum"
+                or module == "module_aiter_tensor"
                 or module == "module_gemm_mi350_a8w8_blockscale_asm"
             ):
                 exclude_ops.append(module)

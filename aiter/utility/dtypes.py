@@ -48,13 +48,13 @@ def torch_to_aiter_pybind(tensor: torch.Tensor):
 
     Unlike torch_to_aiter() which returns a ctypes aiter_tensor_t struct,
     this function constructs a *pybind11* aiter_tensor_t via
-    module_custom_all_reduce.  The two types are not interchangeable.
+    module_aiter_tensor.  The two types are not interchangeable.
     """
     global _make_aiter_tensor
     if _make_aiter_tensor is None:
         from ..jit.core import get_module
 
-        _make_aiter_tensor = get_module("module_custom_all_reduce").make_aiter_tensor
+        _make_aiter_tensor = get_module("module_aiter_tensor").make_aiter_tensor
     return _make_aiter_tensor(
         tensor.data_ptr(),
         tensor.numel(),
@@ -67,7 +67,8 @@ def torch_to_aiter_pybind(tensor: torch.Tensor):
 
 
 def torch_to_aiter(tensor: torch.Tensor) -> aiter_tensor_t:
-    """torch.Tensor -> aiter_tensor_t, zero-copy, points to the same GPU memory."""
+    """ This is for ctypes binding.
+    torch.Tensor -> aiter_tensor_t, zero-copy, points to the same GPU memory."""
     assert tensor.is_cuda, "aiter_tensor_t only supports CUDA tensors"
     assert (
         tensor.ndim <= 8
