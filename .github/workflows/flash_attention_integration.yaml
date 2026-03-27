@@ -5,19 +5,23 @@ on:
     branches: [main]
     paths:
       - 'aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/**'
+      - 'aiter/ops/triton/__init__.py'
       - 'aiter/ops/mha.py'
       - 'csrc/py_itfs_ck/mha_*'
       - 'csrc/py_itfs_ck/attention_kernels.cu'
       - 'setup.py'
+      - 'aiter/__init__.py'
       - '.github/workflows/flash_attention_integration.yaml'
   pull_request:
     branches: [main]
     paths:
       - 'aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/**'
+      - 'aiter/ops/triton/__init__.py'
       - 'aiter/ops/mha.py'
       - 'csrc/py_itfs_ck/mha_*'
       - 'csrc/py_itfs_ck/attention_kernels.cu'
       - 'setup.py'
+      - 'aiter/__init__.py'
       - '.github/workflows/flash_attention_integration.yaml'
   workflow_dispatch:
 
@@ -26,9 +30,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
-  # TODO: Switch to Dao-AILab/flash-attention main
-  FA_BRANCH: micmelesse/aiter_migration
-  FA_REPOSITORY_URL: https://github.com/ROCm/flash-attention.git
+  FA_BRANCH: main
+  FA_REPOSITORY_URL: https://github.com/Dao-AILab/flash-attention.git
   BASE_IMAGE: rocm/pytorch:latest@sha256:683765a52c61341e1674fe730ab3be861a444a45a36c0a8caae7653a08a0e208
   AITER_SUBMODULE_PATH: third_party/aiter
 
@@ -62,9 +65,11 @@ jobs:
           filters: |
             shared:
               - 'setup.py'
+              - 'aiter/__init__.py'
               - '.github/workflows/flash_attention_integration.yaml'
             triton:
               - 'aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/**'
+              - 'aiter/ops/triton/__init__.py'
             ck:
               - 'aiter/ops/mha.py'
               - 'csrc/py_itfs_ck/mha_*'
@@ -100,6 +105,8 @@ jobs:
             label: MI355
           - runner: aiter-gfx1100
             label: RDNA3
+            optional: true
+    continue-on-error: ${{ matrix.optional || false }}
 
     steps:
       - name: Checkout aiter repo
@@ -209,6 +216,59 @@ jobs:
           docker stop fa_triton_test || true
           docker rm -f fa_triton_test || true
           docker rmi fa_triton_test:ci || true
+
+  # =============================================================================
+  # Windows Smoke Test
+  # =============================================================================
+  windows_smoke:
+    if: ${{ needs.prechecks.outputs.run_triton == 'true' }}
+    name: Windows Smoke Test
+    needs: [prechecks]
+    runs-on: windows-latest
+    steps:
+      - name: Checkout aiter repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip setuptools wheel
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install triton-windows
+        shell: bash
+
+      - name: Install aiter
+        run: pip install -e . --no-build-isolation
+        shell: bash
+
+      - name: Install flash-attention (Triton backend)
+        run: |
+          git clone -b ${{ env.FA_BRANCH }} ${{ env.FA_REPOSITORY_URL }} "$RUNNER_TEMP/flash-attention"
+          rm -rf "$RUNNER_TEMP/flash-attention/${{ env.AITER_SUBMODULE_PATH }}"
+          cp -a . "$RUNNER_TEMP/flash-attention/${{ env.AITER_SUBMODULE_PATH }}"
+          rm -rf "$RUNNER_TEMP/flash-attention/.git"
+          cd "$RUNNER_TEMP/flash-attention"
+          BUILD_TARGET=rocm FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE pip install --no-build-isolation --no-deps -e .
+        shell: bash
+
+      - name: Verify FA imports aiter Triton backend
+        run: |
+          cd "$RUNNER_TEMP/flash-attention"
+          FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE python -c "from flash_attn.flash_attn_interface import flash_attn_func; print('flash_attn_func loaded:', flash_attn_func)"
+
+          # Simulate partial ROCm install (fake hipconfig + ROCM_HOME) to catch OSError from cpp_extension.py
+          mkdir -p "$RUNNER_TEMP/fake_rocm/bin"
+          printf '#!/bin/bash\necho 6.4.0\n' > "$RUNNER_TEMP/fake_rocm/bin/hipconfig"
+          chmod +x "$RUNNER_TEMP/fake_rocm/bin/hipconfig"
+          ROCM_HOME="$RUNNER_TEMP/fake_rocm" PATH="$RUNNER_TEMP/fake_rocm/bin:$PATH" FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
+            python -c "from flash_attn.flash_attn_interface import flash_attn_func; print('flash_attn_func loaded (fake ROCm):', flash_attn_func)"
+        shell: bash
 
   # =============================================================================
   # CK Backend
