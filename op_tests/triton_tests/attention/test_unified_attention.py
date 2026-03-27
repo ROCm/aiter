@@ -13,8 +13,6 @@ NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
 HEAD_SIZES = [128, 256]
 BLOCK_SIZES = [16, 64, 48]
 
-DTYPES = [torch.float16, torch.bfloat16]
-QDTYPES = [None, e4m3_dtype]
 # one value large enough to test overflow in index calculation.
 # one value small enough to test the schema op check
 NUM_BLOCKS = [32768, 2048]
@@ -110,13 +108,13 @@ def ref_paged_attn(
 @pytest.mark.parametrize("soft_cap", [None, 50.0])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize(
-    "q_dtype, kv_dtype, use_kv_descale, use_out_scale, use_q_descale",
+    "q_dtype, kv_dtype, out_dtype, use_q_descale, use_kv_descale, use_out_scale",
     [
-        (torch.bfloat16, torch.bfloat16, False, False, False),
-        (e4m3_dtype, e4m3_dtype, True, True, True),
-        (e4m3_dtype, e4m3_dtype, True, False, True),
-        (torch.bfloat16, e4m3_dtype, True, False, False),
-        (torch.bfloat16, e4m3_dtype, True, False, False),
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16, False, False, False),
+        (e4m3_dtype, e4m3_dtype, e4m3_dtype, False, False, False),
+        (e4m3_dtype, e4m3_dtype, e4m3_dtype, True, True, True),
+        (torch.bfloat16, e4m3_dtype, torch.bfloat16, False, True, False),
+        (e4m3_dtype, e4m3_dtype, torch.bfloat16, True, True, False),
     ],
 )
 @torch.inference_mode()
@@ -130,12 +128,11 @@ def test_triton_unified_attn(
     num_blocks: int,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
+    out_dtype: torch.dtype,
     use_kv_descale: bool,
     use_out_scale: bool,
     use_q_descale: bool,
 ) -> None:
-    if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
-        pytest.skip("block size must be at least 32 for fp8")
 
     torch.manual_seed(0)
     num_seqs = len(seq_lens)
@@ -178,7 +175,7 @@ def test_triton_unified_attn(
         device="cuda",
     )
     sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
-    output = torch.empty_like(query)
+    output = torch.empty_like(query).to(out_dtype)
 
     maybe_quantized_query = query
     maybe_quantized_key_cache = key_cache
