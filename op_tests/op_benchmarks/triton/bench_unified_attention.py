@@ -95,7 +95,7 @@ def make_unified_attn_inputs(
     query_lens = torch.tensor(query_lens, dtype=torch.int32, device="cuda")
 
     output = torch.empty(
-        sum(query_lens),
+        cu_query_lens[-1].item(),
         num_query_heads,
         head_size_v,
         dtype=dtype,
@@ -144,8 +144,15 @@ def create_benchmark_configs(custom, args):
         "causal": causal,
     }
 
+    if isinstance(args.sq, list):
+        batch_size = len(args.sq)
+    elif isinstance(args.sk, list):
+        batch_size = len(args.sk)
+    else:
+        batch_size = args.b if args.b else 1
+
     if custom:
-        x_vals_list = [(args.b, args.hq, hk, args.sq, sk, head_size, head_size_v)]
+        x_vals_list = [(batch_size, args.hq, hk, args.sq, sk, head_size, head_size_v)]
     else:
         x_vals_list = default_benchmark_configs()
 
@@ -198,20 +205,30 @@ def run_benchmark(custom, args):
         model=None,
     ):
         varlen = not args.equal_seqlens
-        if not varlen:
-            seqlens_q = torch.tensor(
-                [N_CTX_Q for _ in range(BATCH)], dtype=torch.int32, device="cuda"
-            )
-            seqlens_k = torch.tensor(
-                [N_CTX_K for _ in range(BATCH)], dtype=torch.int32, device="cuda"
-            )
+        
+        if isinstance(N_CTX_Q, list):
+            seqlens_q = torch.tensor(N_CTX_Q, dtype=torch.int32, device="cuda")
         else:
-            seqlens_q = torch.randint(
-                1, N_CTX_Q + 1, (BATCH,), dtype=torch.int32, device="cuda"
-            )
-            seqlens_k = torch.randint(
-                N_CTX_Q, N_CTX_K + 1, (BATCH,), dtype=torch.int32, device="cuda"
-            )
+            if varlen:
+                seqlens_q = torch.randint(
+                    1, N_CTX_Q + 1, (BATCH,), dtype=torch.int32, device="cuda"
+                )
+            else:
+                seqlens_q = torch.tensor(
+                    [N_CTX_Q for _ in range(BATCH)], dtype=torch.int32, device="cuda"
+                    )
+                
+        if isinstance(N_CTX_K, list):
+            seqlens_k = torch.tensor(N_CTX_K, dtype=torch.int32, device="cuda")
+        else:
+            if varlen:
+                seqlens_k = torch.randint(
+                    N_CTX_Q, N_CTX_K + 1, (BATCH,), dtype=torch.int32, device="cuda"
+                )
+            else:
+                seqlens_k = torch.tensor(
+                    [N_CTX_K for _ in range(BATCH)], dtype=torch.int32, device="cuda"
+                )
 
         # turn DECODE_P of the samples to decode samples (seqlen_q == 1)
         if DECODE_P > 0.0:
