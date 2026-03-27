@@ -404,30 +404,14 @@ __device__ __forceinline__ void load_cos_sin_uncached_vec(float (&cos_0)[VecPair
         auto g_f = opus_gmem(p_freqs);
         auto v_f0 = g_f.template load<VecPairs>(did);
         opus::static_for<VecPairs>([&](auto i) {
-            if constexpr(IsForward)
-            {
-                sincosf(float(v_f0[i.value]), &sin_0[i.value], &cos_0[i.value]);
-            }
-            else
-            {
-                cos_0[i.value] = cosf(float(v_f0[i.value]));
-            }
+            sincosf(float(v_f0[i.value]), &sin_0[i.value], &cos_0[i.value]);
         });
 
         if constexpr(ReuseFreqsFrontPart)
         {
             opus::static_for<VecPairs>([&](auto i) {
-                if constexpr(IsForward)
-                {
-                    cos_1[i.value] = cos_0[i.value];
-                    sin_1[i.value] = sin_0[i.value];
-                }
-                else
-                {
-                    sin_0[i.value] = sinf(float(v_f0[i.value]));
-                    cos_1[i.value] = cos_0[i.value];
-                    sin_1[i.value] = sin_0[i.value];
-                }
+                cos_1[i.value] = cos_0[i.value];
+                sin_1[i.value] = sin_0[i.value];
             });
         }
         else
@@ -440,9 +424,8 @@ __device__ __forceinline__ void load_cos_sin_uncached_vec(float (&cos_0)[VecPair
                 }
                 else
                 {
-                    sin_0[i.value] = sinf(float(v_f1[i.value]));
-                    cos_1[i.value] = cosf(float(v_f1[i.value]));
-                    sin_1[i.value] = sinf(float(v_f0[i.value]));
+                    sin_1[i.value] = sin_0[i.value];  // save sin(f0) from first loop
+                    sincosf(float(v_f1[i.value]), &sin_0[i.value], &cos_1[i.value]);
                 }
             });
         }
@@ -483,10 +466,8 @@ __device__ __forceinline__ void load_cos_sin_uncached_vec(float (&cos_0)[VecPair
                 }
                 else
                 {
-                    cos_0[i.value] = cosf(f0);
-                    sin_0[i.value] = sinf(f1);
-                    cos_1[i.value] = cosf(f1);
-                    sin_1[i.value] = sinf(f0);
+                    sincosf(f0, &sin_1[i.value], &cos_0[i.value]);
+                    sincosf(f1, &sin_0[i.value], &cos_1[i.value]);
                 }
             });
         }
