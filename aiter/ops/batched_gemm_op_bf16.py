@@ -13,7 +13,7 @@ from ..jit.core import (
     AITER_LOG_TUNED_CONFIG,
 )
 from ..utility import dtypes
-from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.chip_info import get_cu_num, get_gfx
 from aiter import logger
 
 
@@ -58,13 +58,26 @@ def get_CKBatchedGEMM_config(
         ck_batched_gemm_dict = pd.read_csv(
             AITER_CONFIGS.AITER_CONFIG_BF16_BATCHED_GEMM_FILE
         ).drop_duplicates()
-        get_CKBatchedGEMM_config.ck_batched_gemm_dict = ck_batched_gemm_dict.set_index(
-            ["cu_num", "B", "M", "N", "K"]
-        ).to_dict("index")
+        # Use (gfx, cu_num, B, M, N, K) key when the CSV has a gfx column (new schema).
+        # Fall back to (cu_num, B, M, N, K) for old CSVs that pre-date the gfx column.
+        if "gfx" in ck_batched_gemm_dict.columns:
+            get_CKBatchedGEMM_config.ck_batched_gemm_dict = ck_batched_gemm_dict.set_index(
+                ["gfx", "cu_num", "B", "M", "N", "K"]
+            ).to_dict("index")
+            get_CKBatchedGEMM_config.has_gfx = True
+        else:
+            logger.warning(
+                f"{AITER_CONFIGS.AITER_CONFIG_BF16_BATCHED_GEMM_FILE} has no 'gfx' column — "
+                "falling back to cu_num-only key. Re-run the tuner or migrate the CSV."
+            )
+            get_CKBatchedGEMM_config.ck_batched_gemm_dict = ck_batched_gemm_dict.set_index(
+                ["cu_num", "B", "M", "N", "K"]
+            ).to_dict("index")
+            get_CKBatchedGEMM_config.has_gfx = False
+    gfx = get_gfx()
     cu_num = get_cu_num()
-    config = get_CKBatchedGEMM_config.ck_batched_gemm_dict.get(
-        (cu_num, B, M, N, K), None
-    )
+    key = (gfx, cu_num, B, M, N, K) if get_CKBatchedGEMM_config.has_gfx else (cu_num, B, M, N, K)
+    config = get_CKBatchedGEMM_config.ck_batched_gemm_dict.get(key, None)
     if config is not None:
         if AITER_LOG_TUNED_CONFIG:
             logger.info(
