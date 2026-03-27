@@ -39,7 +39,7 @@ namespace aiter {
  * - Loop unrolling with #pragma unroll
  * - Coalesced memory access
  */
-template <typename DTYPE_I, typename DTYPE_O, int GROUP_SIZE = 128, int THREAD_DATA_SIZE = 16, int BLOCK_SIZE = 256>
+template <typename DTYPE_I, typename DTYPE_O, int GROUP_SIZE = 128, int THREAD_DATA_SIZE = 16, int BLOCK_SIZE = 256, bool TRANSPOSE_SCALE = false>
 __global__ void gated_rmsnorm_fp8_group_quant_kernel(
     DTYPE_O* __restrict__ out,           // [num_tokens, num_heads * head_dim]
     float* __restrict__ scale,           // [num_heads, num_tokens] (transposed) or [num_tokens, num_heads]
@@ -49,8 +49,7 @@ __global__ void gated_rmsnorm_fp8_group_quant_kernel(
     double epsilon,
     int num_tokens,
     int num_heads,
-    int head_dim,
-    bool transpose_scale)
+    int head_dim)
 {
     // Compile-time validation
     static_assert(GROUP_SIZE == 128, "Only GROUP_SIZE=128 is supported");
@@ -169,7 +168,7 @@ __global__ void gated_rmsnorm_fp8_group_quant_kernel(
     // Step 7: Thread 0 of each group stores scale
     if (thread_in_group == 0) {
         int scale_idx;
-        if (transpose_scale) {
+        if constexpr (TRANSPOSE_SCALE) {
             scale_idx = head_id * num_tokens + token_id;
         } else {
             scale_idx = token_id * num_heads + head_id;
@@ -187,7 +186,7 @@ __global__ void gated_rmsnorm_fp8_group_quant_kernel(
  * - 128 threads (2 warps): Better occupancy, recommended for most cases
  * - 256 threads (4 warps): Maximum occupancy, best for large workloads
  */
-template <typename DTYPE_I, typename DTYPE_O, int THREAD_DATA_SIZE, int BLOCK_SIZE>
+template <typename DTYPE_I, typename DTYPE_O, int THREAD_DATA_SIZE, int BLOCK_SIZE, bool TRANSPOSE_SCALE>
 void gated_rmsnorm_fp8_group_quant_launcher_impl(
     torch::Tensor& out,
     torch::Tensor& scale,
@@ -197,8 +196,7 @@ void gated_rmsnorm_fp8_group_quant_launcher_impl(
     double epsilon,
     int num_tokens,
     int num_heads,
-    int head_dim,
-    bool transpose_scale)
+    int head_dim)
 {
     constexpr int GROUP_SIZE = 128;
     constexpr int WARP_SIZE = 64;
@@ -212,7 +210,7 @@ void gated_rmsnorm_fp8_group_quant_launcher_impl(
 
     hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
 
-    gated_rmsnorm_fp8_group_quant_kernel<DTYPE_I, DTYPE_O, GROUP_SIZE, THREAD_DATA_SIZE, BLOCK_SIZE>
+    gated_rmsnorm_fp8_group_quant_kernel<DTYPE_I, DTYPE_O, GROUP_SIZE, THREAD_DATA_SIZE, BLOCK_SIZE, TRANSPOSE_SCALE>
         <<<grid, block, 0, stream>>>(
             reinterpret_cast<DTYPE_O*>(out.data_ptr()),
             reinterpret_cast<float*>(scale.data_ptr()),
@@ -222,8 +220,7 @@ void gated_rmsnorm_fp8_group_quant_launcher_impl(
             epsilon,
             num_tokens,
             num_heads,
-            head_dim,
-            transpose_scale
+            head_dim
         );
 
     C10_HIP_KERNEL_LAUNCH_CHECK();
@@ -238,8 +235,7 @@ void gated_rmsnorm_fp8_group_quant_launcher(
     torch::Tensor const& weight,   // [head_dim] - RMSNorm weight
     double epsilon,
     int group_size,
-    bool transpose_scale,
-    int block_size = 128)  // Default to 128 threads (2 warps)
+    bool transpose_scale)
 {
     // Validate constraints
     TORCH_CHECK(x.dim() == 3, "Input x must be 3D: [num_tokens, num_heads, head_dim]");
@@ -254,51 +250,15 @@ void gated_rmsnorm_fp8_group_quant_launcher(
     TORCH_CHECK(group_size == 128, "ONLY group_size=128 is supported, got ", group_size);
     TORCH_CHECK(weight.size(0) == head_dim, "Weight size must match head_dim");
 
-    // Dispatch based on THREAD_DATA_SIZE and block size for optimal performance
-    const char* env_block_size = std::getenv("GATED_RMSNORM_BLOCK_SIZE");
-    if (env_block_size != nullptr) {
-        block_size = std::atoi(env_block_size);
-    }
 
-    // Use THREAD_DATA_SIZE=16 (8 groups/warp) like Sigmoid_Mul for best bandwidth
-    const char* env_tds = std::getenv("GATED_RMSNORM_THREAD_DATA_SIZE");
-    int thread_data_size = env_tds ? std::atoi(env_tds) : 16;
-
-    if (thread_data_size == 16) {
-        switch (block_size) {
-            case 64:
-                gated_rmsnorm_fp8_group_quant_launcher_impl<DTYPE_I, DTYPE_O, 16, 64>(
-                    out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim, transpose_scale);
-                break;
-            case 128:
-                gated_rmsnorm_fp8_group_quant_launcher_impl<DTYPE_I, DTYPE_O, 16, 128>(
-                    out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim, transpose_scale);
-                break;
-            case 256:
-                gated_rmsnorm_fp8_group_quant_launcher_impl<DTYPE_I, DTYPE_O, 16, 256>(
-                    out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim, transpose_scale);
-                break;
-            default:
-                TORCH_CHECK(false, "Unsupported block_size: ", block_size);
-        }
+    // Use THREAD_DATA_SIZE=16 (8 groups/warp) for best bandwidth
+    constexpr int thread_data_size = 16;
+    if (transpose_scale) {
+        gated_rmsnorm_fp8_group_quant_launcher_impl<DTYPE_I, DTYPE_O, thread_data_size, 256, true>(
+            out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim);
     } else {
-        // Fallback to THREAD_DATA_SIZE=2 (original)
-        switch (block_size) {
-            case 64:
-                gated_rmsnorm_fp8_group_quant_launcher_impl<DTYPE_I, DTYPE_O, 2, 64>(
-                    out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim, transpose_scale);
-                break;
-            case 128:
-                gated_rmsnorm_fp8_group_quant_launcher_impl<DTYPE_I, DTYPE_O, 2, 128>(
-                    out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim, transpose_scale);
-                break;
-            case 256:
-                gated_rmsnorm_fp8_group_quant_launcher_impl<DTYPE_I, DTYPE_O, 2, 256>(
-                    out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim, transpose_scale);
-                break;
-            default:
-                TORCH_CHECK(false, "Unsupported block_size: ", block_size);
-        }
+        gated_rmsnorm_fp8_group_quant_launcher_impl<DTYPE_I, DTYPE_O, thread_data_size, 256, false>(
+            out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim);
     }
 }
 
