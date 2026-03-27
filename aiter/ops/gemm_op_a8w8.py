@@ -210,28 +210,27 @@ def gemm_a8w8_blockscale_bpreshuffle_cktile(
 ) -> torch.Tensor: ...
 
 
-def gen_flatmm_a8w8_blockscale_asm_fake_tensors(
+@compile_ops(
+    "module_gemm_a8w8_blockscale_asm",
+    fc_name="flatmm_a8w8_blockscale_asm",
+    ffi_type="ctypes",
+)
+def _flatmm_a8w8_blockscale_asm(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
     out: Tensor,
-) -> Tensor:
-    return out
-
-
-@compile_ops(
-    "module_gemm_a8w8_blockscale_asm",
-    fc_name="flatmm_a8w8_blockscale_asm",
-    gen_fake=gen_flatmm_a8w8_blockscale_asm_fake_tensors,
-)
+) -> None: ...
 def flatmm_a8w8_blockscale_asm(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
     out: Tensor,
-) -> Tensor: ...
+) -> Tensor:
+    _flatmm_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, out)
+    return out
 
 
 @compile_ops(

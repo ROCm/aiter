@@ -54,12 +54,12 @@ struct __attribute__((packed)) KernelArgs
     p2 _p22;
 };
 
-extern "C" __attribute__((visibility("default"))) void mi350_a8w8_blockscale_asm(
-    AiterTensor *XQ,      // [M, K]
-    AiterTensor *WQ,      // [N, K] -> [N/128, K*128]
-    AiterTensor *x_scale, // [K/128, M]
-    AiterTensor *w_scale, // [K/128, N/128]
-    AiterTensor *out,     // Out:[M, N] bf16
+AITER_C_ITFS void mi350_a8w8_blockscale_asm(
+    aiter_tensor_t *XQ,      // [M, K]
+    aiter_tensor_t *WQ,      // [N, K] -> [N/128, K*128]
+    aiter_tensor_t *x_scale, // [K/128, M]
+    aiter_tensor_t *w_scale, // [K/128, N/128]
+    aiter_tensor_t *out,     // Out:[M, N] bf16
     hipStream_t  stream)
 {
     int TileM = 128;
