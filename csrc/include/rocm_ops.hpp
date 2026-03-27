@@ -1359,21 +1359,20 @@ namespace py = pybind11;
           py::arg("epsilon"),                                                                      \
           py::arg("use_model_sensitive_rmsnorm") = 0);
 
-#define ROPE_GENERAL_FWD_PYBIND                                 \
-    m.def("rope_fwd_impl", &rope_fwd_impl);                     \
-    m.def("rope_2c_fwd_impl", &rope_2c_fwd_impl);               \
-    m.def("rope_cached_fwd_impl", &rope_cached_fwd_impl);       \
-    m.def("rope_cached_2c_fwd_impl", &rope_cached_2c_fwd_impl); \
-    m.def("rope_thd_fwd_impl", &rope_thd_fwd_impl);             \
-    m.def("rope_2d_fwd_impl", &rope_2d_fwd_impl);
+#define ROPE_1C_UNCACHED_FWD_PYBIND  m.def("rope_fwd_impl", &rope_fwd_impl);
+#define ROPE_2C_UNCACHED_FWD_PYBIND  m.def("rope_2c_fwd_impl", &rope_2c_fwd_impl);
+#define ROPE_1C_CACHED_FWD_PYBIND    m.def("rope_cached_fwd_impl", &rope_cached_fwd_impl);
+#define ROPE_2C_CACHED_FWD_PYBIND    m.def("rope_cached_2c_fwd_impl", &rope_cached_2c_fwd_impl);
+#define ROPE_1C_THD_FWD_PYBIND       m.def("rope_thd_fwd_impl", &rope_thd_fwd_impl);
+#define ROPE_1C_2D_FWD_PYBIND        m.def("rope_2d_fwd_impl", &rope_2d_fwd_impl);
 
-#define ROPE_GENERAL_BWD_PYBIND                                 \
-    m.def("rope_bwd_impl", &rope_bwd_impl);                     \
-    m.def("rope_2c_bwd_impl", &rope_2c_bwd_impl);               \
-    m.def("rope_cached_bwd_impl", &rope_cached_bwd_impl);       \
-    m.def("rope_cached_2c_bwd_impl", &rope_cached_2c_bwd_impl); \
-    m.def("rope_thd_bwd_impl", &rope_thd_bwd_impl);             \
-    m.def("rope_2d_bwd_impl", &rope_2d_bwd_impl);
+#define ROPE_1C_UNCACHED_BWD_PYBIND  m.def("rope_bwd_impl", &rope_bwd_impl);
+#define ROPE_2C_UNCACHED_BWD_PYBIND  m.def("rope_2c_bwd_impl", &rope_2c_bwd_impl);
+#define ROPE_1C_CACHED_BWD_PYBIND    m.def("rope_cached_bwd_impl", &rope_cached_bwd_impl);
+#define ROPE_2C_CACHED_BWD_PYBIND    m.def("rope_cached_2c_bwd_impl", &rope_cached_2c_bwd_impl);
+#define ROPE_1C_THD_BWD_PYBIND       m.def("rope_thd_bwd_impl", &rope_thd_bwd_impl);
+#define ROPE_1C_2D_BWD_PYBIND        m.def("rope_2d_bwd_impl", &rope_2d_bwd_impl);
+
 
 #define ROPE_POS_FWD_PYBIND                                                                   \
     m.def("rope_cached_positions_fwd_impl", &rope_cached_positions_fwd_impl);                 \

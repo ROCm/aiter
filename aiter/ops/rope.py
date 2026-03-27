@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from torch import Tensor, empty, empty_like, autograd
 from typing import Tuple, Union
@@ -8,7 +8,7 @@ from ..jit.core import compile_ops
 MD_NAME = "module_rope"
 
 
-@compile_ops("module_rope_general_fwd")
+@compile_ops("module_rope_1c_uncached_fwd")
 def rope_fwd_impl(
     output: Tensor,
     input: Tensor,
@@ -28,7 +28,7 @@ def rope_fwd_impl(
     ...
 
 
-@compile_ops("module_rope_general_bwd")
+@compile_ops("module_rope_1c_uncached_bwd")
 def rope_bwd_impl(
     input_grads: Tensor,
     output_grads: Tensor,
@@ -48,7 +48,7 @@ def rope_bwd_impl(
     ...
 
 
-@compile_ops("module_rope_general_fwd")
+@compile_ops("module_rope_2c_uncached_fwd")
 def rope_2c_fwd_impl(
     output_x: Tensor,
     output_y: Tensor,
@@ -70,7 +70,7 @@ def rope_2c_fwd_impl(
     ...
 
 
-@compile_ops("module_rope_general_bwd")
+@compile_ops("module_rope_2c_uncached_bwd")
 def rope_2c_bwd_impl(
     input_grads_x: Tensor,
     input_grads_y: Tensor,
@@ -92,7 +92,7 @@ def rope_2c_bwd_impl(
     ...
 
 
-@compile_ops("module_rope_general_fwd")
+@compile_ops("module_rope_1c_cached_fwd")
 def rope_cached_fwd_impl(
     output: Tensor,
     input: Tensor,
@@ -113,7 +113,7 @@ def rope_cached_fwd_impl(
     ...
 
 
-@compile_ops("module_rope_general_bwd")
+@compile_ops("module_rope_1c_cached_bwd")
 def rope_cached_bwd_impl(
     input_grads: Tensor,
     output_grads: Tensor,
@@ -134,7 +134,7 @@ def rope_cached_bwd_impl(
     ...
 
 
-@compile_ops("module_rope_general_fwd")
+@compile_ops("module_rope_2c_cached_fwd")
 def rope_cached_2c_fwd_impl(
     output_x: Tensor,
     output_y: Tensor,
@@ -157,7 +157,7 @@ def rope_cached_2c_fwd_impl(
     ...
 
 
-@compile_ops("module_rope_general_bwd")
+@compile_ops("module_rope_2c_cached_bwd")
 def rope_cached_2c_bwd_impl(
     input_grads_x: Tensor,
     input_grads_y: Tensor,
@@ -278,7 +278,7 @@ def rope_cached_positions_offsets_2c_fwd_impl(
     ...
 
 
-@compile_ops("module_rope_general_fwd")
+@compile_ops("module_rope_1c_thd_fwd")
 def rope_thd_fwd_impl(
     output: Tensor,
     input: Tensor,
@@ -300,7 +300,7 @@ def rope_thd_fwd_impl(
     ...
 
 
-@compile_ops("module_rope_general_bwd")
+@compile_ops("module_rope_1c_thd_bwd")
 def rope_thd_bwd_impl(
     input_grads: Tensor,
     output_grads: Tensor,
@@ -322,7 +322,7 @@ def rope_thd_bwd_impl(
     ...
 
 
-@compile_ops("module_rope_general_fwd")
+@compile_ops("module_rope_1c_2d_fwd")
 def rope_2d_fwd_impl(
     output: Tensor,
     input: Tensor,
@@ -350,7 +350,7 @@ def rope_2d_fwd_impl(
     ...
 
 
-@compile_ops("module_rope_general_bwd")
+@compile_ops("module_rope_1c_2d_bwd")
 def rope_2d_bwd_impl(
     input_grads: Tensor,
     output_grads: Tensor,
