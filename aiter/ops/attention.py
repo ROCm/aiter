@@ -852,6 +852,60 @@ def get_ps_metadata_info_v1(
     )
 
 
+def get_mha_prefill_splitk_metadata_info_v1(
+    batch_size: int,
+    max_seqlen_qo: int,
+    max_seqlen_kv: int,
+    q_tile_size: int,
+    split_k_size: int,
+    is_causal: bool,
+    uni_seqlen_qo: int = -1,
+):
+    """
+    Returns:
+        1. Shape of work_metadata_ptrs followed by its scalar type.
+        2. Shape of work_indptr followed by its scalar type.
+        3. Shape of work_info_set followed by its scalar type.
+        4. Shape of reduce_indptr followed by its scalar type.
+        5. Shape of reduce_final_map followed by its scalar type.
+        6. Shape of reduce_partial_map followed by its scalar type.
+    """
+
+    assert batch_size > 0
+    assert max_seqlen_qo > 0
+    assert max_seqlen_kv > 0
+    assert q_tile_size > 0
+    assert split_k_size > 0
+
+    q_len = uni_seqlen_qo if uni_seqlen_qo > 0 else max_seqlen_qo
+    num_q_tiles_per_batch = math.ceil(q_len / q_tile_size)
+
+    if not is_causal:
+        num_kv_splits_per_q_tile = math.ceil(max_seqlen_kv / split_k_size)
+        max_work_per_batch = num_q_tiles_per_batch * num_kv_splits_per_q_tile
+    else:
+        max_work_per_batch = 0
+        for q_tile_idx in range(num_q_tiles_per_batch):
+            visible_kv_len = min(
+                (q_tile_idx + 1) * q_tile_size,
+                q_len,
+                max_seqlen_kv,
+            )
+            max_work_per_batch += math.ceil(visible_kv_len / split_k_size)
+
+    total_q_tiles = batch_size * num_q_tiles_per_batch
+    max_work = batch_size * max_work_per_batch
+
+    return (
+        (2, torch.uint64),  # work_metadata_ptrs
+        (2, torch.int32),  # work_indptr, simplified [0, num_work]
+        ((max_work, 8), torch.int32),  # work_info_set
+        (total_q_tiles + 1, torch.int32),  # reduce_indptr
+        ((total_q_tiles, 2), torch.int32),  # reduce_final_map
+        (max_work, torch.int32),  # reduce_partial_map
+    )
+
+
 @compile_ops("module_ps_metadata")
 def get_ps_metadata_v1(
     seqlens_qo_indptr: torch.Tensor,
@@ -870,6 +924,24 @@ def get_ps_metadata_v1(
     kvlen_granularity: int = 16,
     block_size: int = 16,
     is_causal: bool = True,
+) -> None: ...
+
+
+@compile_ops("module_mha_prefill_splitk_metadata")
+def get_mha_prefill_splitk_metadata_v1(
+    seqlens_qo_indptr: torch.Tensor,
+    seqlens_kv_indptr: torch.Tensor,
+    is_causal: bool,
+    q_tile_size: int,
+    split_k_size: int,
+    work_metadata_ptrs: torch.Tensor,
+    work_info_set: torch.Tensor,
+    work_indptr: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: torch.Tensor,
+    reduce_partial_map: torch.Tensor,
+    max_seqlen_qo: int = -1,
+    uni_seqlen_qo: int = -1,
 ) -> None: ...
 
 

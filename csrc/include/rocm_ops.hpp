@@ -1658,6 +1658,24 @@ namespace py = pybind11;
           py::arg("block_size")        = 1,   \
           py::arg("is_causal")         = true);
 
+#define MHA_PREFILL_SPLITK_METADATA_PYBIND       \
+    m.def("get_mha_prefill_splitk_metadata_v1",  \
+          &get_mha_prefill_splitk_metadata_v1,   \
+          "get_mha_prefill_splitk_metadata_v1",  \
+          py::arg("seqlens_qo_indptr"),          \
+          py::arg("seqlens_kv_indptr"),          \
+          py::arg("is_causal"),                  \
+          py::arg("q_tile_size"),                \
+          py::arg("split_k_size"),               \
+          py::arg("work_metadata_ptrs"),         \
+          py::arg("work_info_set"),              \
+          py::arg("work_indptr"),                \
+          py::arg("reduce_indptr"),              \
+          py::arg("reduce_final_map"),           \
+          py::arg("reduce_partial_map"),         \
+          py::arg("max_seqlen_qo") = -1,         \
+          py::arg("uni_seqlen_qo") = -1);
+
 #define MLA_REDUCE_PYBIND                \
     m.def("mla_reduce_v1",               \
           &mla_reduce_v1,                \
