@@ -18,6 +18,7 @@ _gemm_a16w16_repr = make_kernel_repr(
         "NUM_KSPLIT",
         "SPLITK_BLOCK_SIZE",
         "EVEN_K",
+        "EVEN_MN",
         "cache_modifier",
         "activation",
         "use_activation",
@@ -45,6 +46,8 @@ _gemm_a16w16_reduce_repr = make_kernel_repr(
     {
         "EVEN_K": lambda args: (args["K"] % (args["SPLITK_BLOCK_SIZE"]) == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0),
+        "EVEN_MN": lambda args: (args["M"] % args["BLOCK_SIZE_M"] == 0)
+        and (args["N"] % args["BLOCK_SIZE_N"] == 0),
     }
 )
 @triton.jit(
@@ -74,6 +77,7 @@ def _gemm_a16_w16_kernel(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
+    EVEN_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
     activation: tl.constexpr,
     use_activation: tl.constexpr,
@@ -117,8 +121,12 @@ def _gemm_a16_w16_kernel(
         # Create pointers for first block of A and B input matrices
         offs_k = tl.arange(0, BLOCK_SIZE_K)
         offs_k_split = split_k_start + offs_k
-        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        if EVEN_MN:
+            offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        else:
+            offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+            offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
 
         a_ptrs = a_ptr + (
             offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
@@ -177,8 +185,11 @@ def _gemm_a16_w16_kernel(
             + stride_cn * offs_cn[None, :]
             + pid_k * stride_ck
         )
-        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        tl.store(c_ptrs, c, mask=c_mask)
+        if EVEN_MN:
+            tl.store(c_ptrs, c)
+        else:
+            c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+            tl.store(c_ptrs, c, mask=c_mask)
 
 
 @triton.jit(repr=_gemm_a16w16_reduce_repr)

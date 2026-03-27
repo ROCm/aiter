@@ -195,6 +195,8 @@ def get_x_vals(dims: int, args=None):
             (4096, 1280, 8192),
             (8192, 1280, 8192),
             (16384, 1280, 8192),
+            (4096, 4096, 4096),
+            (4096, 4096, 4160),
         ]
     if dims == 4:
         if hasattr(args, "B") and args.B is not None:
