@@ -106,7 +106,7 @@ def kernel_unified_attention_2d(
 
     # needed to use exp2 (exp2 -> exp conversion)
     RCP_LN2 = 1.4426950408889634
-    
+
     # handles both no quantization and per tensor quantization.
     _q_ds = tl.load(q_scale) if q_scale is not None else 1.0
     _k_ds = tl.load(k_scale) if k_scale is not None else 1.0
@@ -352,11 +352,11 @@ def kernel_unified_attention_2d(
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
     one_over_L = 1.0 / L[:, None]
     acc = acc * one_over_L
-    
+
     if v_scale is not None:
         _v_ds = tl.load(v_scale)
         acc *= _v_ds
-    
+
     if USE_FP8_OUTPUT:
         acc = acc * tl.load(out_scale)
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
@@ -426,7 +426,7 @@ def kernel_unified_attention_3d(
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
     segm_idx = tl.program_id(2)
-    
+
     # needed to use exp2 (exp2 -> exp conversion)
     RCP_LN2 = 1.4426950408889634
     # handles both no quantization and per tensor quantization.
@@ -579,7 +579,7 @@ def kernel_unified_attention_3d(
             other=0.0,
             cache_modifier=KV_cache_modifier,
         )
-        
+
         K = K.to(Q.dtype)
 
         # V : (TILE_SIZE, HEAD_SIZE)
@@ -706,7 +706,7 @@ def reduce_segments(
     query_head_idx = tl.program_id(1)
 
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
-    
+
     seq_idx = find_seq_idx(
         query_start_len_ptr, query_token_idx, num_seqs, BLOCK_Q, False
     )
@@ -763,7 +763,7 @@ def reduce_segments(
 
     if v_scale is not None:
         acc = acc * tl.load(v_scale)
-    
+
     if USE_FP8_OUTPUT:
         acc = acc * tl.load(out_scale_inv)
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)

@@ -13,9 +13,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
     get_caller_name_no_ext,
 )
-from op_tests.triton_tests.attention.test_unified_attention import (
-    ref_paged_attn
-)
+from op_tests.triton_tests.attention.test_unified_attention import ref_paged_attn
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 
@@ -114,7 +112,7 @@ def make_unified_attn_inputs(
     query = torch.randn(
         sum(query_lens), num_query_heads, head_size_qk, dtype=dtype, device="cuda"
     )
- 
+
     key_cache = torch.randn(
         num_blocks,
         block_size,
@@ -172,7 +170,6 @@ def make_unified_attn_inputs(
         max_kv_len,
         scale,
     )
-
 
 
 def create_benchmark_configs(custom, args):
@@ -383,7 +380,7 @@ def run_benchmark(custom, args):
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
-            sinks=sinks
+            sinks=sinks,
         )
 
         ms = triton.testing.do_bench(fn)
@@ -590,7 +587,7 @@ arg_to_torch_dtype = {
 
 def main():
     args = parse_args()
-    args.causal = True # only causal mode supported for now
+    args.causal = True  # only causal mode supported for now
     args.layout = "thd"
     if args.model:
         if args.causal is None:  # User didn't specify -causal
