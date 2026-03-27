@@ -205,7 +205,7 @@ def run_benchmark(custom, args):
         model=None,
     ):
         varlen = not args.equal_seqlens
-        
+
         if isinstance(N_CTX_Q, list):
             seqlens_q = torch.tensor(N_CTX_Q, dtype=torch.int32, device="cuda")
         else:
@@ -216,8 +216,8 @@ def run_benchmark(custom, args):
             else:
                 seqlens_q = torch.tensor(
                     [N_CTX_Q for _ in range(BATCH)], dtype=torch.int32, device="cuda"
-                    )
-                
+                )
+
         if isinstance(N_CTX_K, list):
             seqlens_k = torch.tensor(N_CTX_K, dtype=torch.int32, device="cuda")
         else:

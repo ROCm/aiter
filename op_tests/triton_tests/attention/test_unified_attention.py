@@ -105,7 +105,7 @@ def test_triton_unified_attn(
     block_size: int,
     soft_cap: Optional[float],
     num_blocks: int,
-    q_dtype: Optional[torch.dtype], # quant dtype
+    q_dtype: Optional[torch.dtype],  # quant dtype
 ) -> None:
     if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
         pytest.skip("block size must be at least 32 for fp8")
@@ -166,7 +166,11 @@ def test_triton_unified_attn(
         v_descale = (v_abs_max / q_dtype_max).to(torch.float32).unsqueeze(0).cuda()
         v_q = (value_cache * (q_dtype_max / v_abs_max)).to(q_dtype)
 
-        maybe_quantized_query, maybe_quantized_key_cache, maybe_quantized_value_cache = q_q, k_q, v_q
+        (
+            maybe_quantized_query,
+            maybe_quantized_key_cache,
+            maybe_quantized_value_cache,
+        ) = (q_q, k_q, v_q)
 
     unified_attention(
         q=maybe_quantized_query,
