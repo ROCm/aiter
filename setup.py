@@ -315,7 +315,7 @@ else:
         "einops",
         "psutil",
         "packaging",
-        "flydsl==0.1.1.dev409",
+        #"flydsl==0.1.1.dev409",
     ]
 
 setup(

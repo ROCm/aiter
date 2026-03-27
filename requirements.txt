@@ -6,4 +6,8 @@ pyyaml
 einops
 pybind11>=3.0.1
 ninja
+<<<<<<< Updated upstream
 flydsl==0.1.1.dev409
+=======
+flydsl==0.1.1
+>>>>>>> Stashed changes

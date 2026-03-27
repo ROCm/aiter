@@ -739,7 +739,7 @@ def build_module(
                 "-mllvm -amdgpu-function-calls=false",
             ]
         if hip_version > Version("6.2.41133"):
-            flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
+            flags_hip += ["-mllvm"] # -amdgpu-coerce-illegal-types=1"]
         if get_gfx() == "gfx950" and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]
 
@@ -1410,7 +1410,6 @@ def compile_ops(
                 else:
                     return None
 
-<<<<<<< HEAD
                 def check_args():
                     get_asm_dir()
                     import inspect
