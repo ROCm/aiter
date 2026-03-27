@@ -99,6 +99,7 @@ NUM_BLOCKS = [
 ]
 SLIDING_WINDOWS = [None]
 
+
 def ref_paged_attn(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -422,13 +423,25 @@ def test_triton_unified_attn(
 
 
 @pytest.mark.parametrize(
-    "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)], [(1024, 1024),]]
+    "seq_lens",
+    [
+        [(1, 1328), (5, 18), (129, 463)],
+        [(1, 523), (1, 37), (1, 2011)],
+        [
+            (1024, 1024),
+        ],
+    ],
 )
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 @pytest.mark.parametrize("block_size", [64, 16])
 @pytest.mark.parametrize("sliding_window", [None, 256])
-@pytest.mark.parametrize("dtype", [torch.bfloat16,])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.bfloat16,
+    ],
+)
 @pytest.mark.parametrize(
     "soft_cap",
     [
@@ -436,7 +449,12 @@ def test_triton_unified_attn(
     ],
 )
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
-@pytest.mark.parametrize("q_dtype", [torch.bfloat16,])
+@pytest.mark.parametrize(
+    "q_dtype",
+    [
+        torch.bfloat16,
+    ],
+)
 @torch.inference_mode()
 @pytest.mark.parametrize(
     "use_tdm, num_kv_blocks",
@@ -446,10 +464,18 @@ def test_triton_unified_attn(
         (True, 4),
     ],
 )
-
-@pytest.mark.parametrize("shuffled_kv_cache", [False, ])
-@pytest.mark.parametrize("check_ref", [True,])
-
+@pytest.mark.parametrize(
+    "shuffled_kv_cache",
+    [
+        False,
+    ],
+)
+@pytest.mark.parametrize(
+    "check_ref",
+    [
+        True,
+    ],
+)
 @torch.inference_mode()
 def test_gluon_unified_attn_2d(
     seq_lens: list[tuple[int, int]],
@@ -479,7 +505,9 @@ def test_gluon_unified_attn_2d(
     if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
         pytest.skip("block size must be at least 32 for fp8")
     if shuffled_kv_cache and (not use_tdm or num_kv_blocks != 1):
-        pytest.skip("Shuffled KV cache is only supported with TDM and num_kv_blocks == 1")
+        pytest.skip(
+            "Shuffled KV cache is only supported with TDM and num_kv_blocks == 1"
+        )
     torch.manual_seed(0)
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]
@@ -535,11 +563,15 @@ def test_gluon_unified_attn_2d(
         q_descale = None  # Not yet supported
         k_descale = torch.rand(1, dtype=torch.float32, device="cpu")
         v_descale = torch.rand(1, dtype=torch.float32, device="cpu")
-    
+
     if num_kv_blocks > 1:
-        maybe_quantized_key_cache = maybe_quantized_key_cache.permute(0, 2, 1, 3).contiguous()
-        maybe_quantized_value_cache = maybe_quantized_value_cache.permute(0, 2, 1, 3).contiguous()
-    
+        maybe_quantized_key_cache = maybe_quantized_key_cache.permute(
+            0, 2, 1, 3
+        ).contiguous()
+        maybe_quantized_value_cache = maybe_quantized_value_cache.permute(
+            0, 2, 1, 3
+        ).contiguous()
+
     if shuffled_kv_cache:
         maybe_quantized_key_cache, maybe_quantized_value_cache = shuffle_kv_cache(
             maybe_quantized_key_cache,
