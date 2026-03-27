@@ -229,7 +229,9 @@ def run_benchmark(custom, args):
                     [N_CTX_K for _ in range(BATCH)], dtype=torch.int32, device="cuda"
                 )
 
-        seqlens_k = torch.maximum(seqlens_k, seqlens_q) # ensure kv sequence lengths are at least as long as q sequence lengths
+        seqlens_k = torch.maximum(
+            seqlens_k, seqlens_q
+        )  # ensure kv sequence lengths are at least as long as q sequence lengths
 
         # turn DECODE_P of the samples to decode samples (seqlen_q == 1)
         if DECODE_P > 0.0:
