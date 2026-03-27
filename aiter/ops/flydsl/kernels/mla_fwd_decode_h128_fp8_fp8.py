@@ -397,7 +397,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
     tid = gpu.thread_id("x")
     warp_idx = tid / arith.index(WARP_SIZE)
     lane_idx = tid % arith.index(WARP_SIZE)
-    warp_idx_i32 = _index_cast_to_i32(warp_idx)
+    warp_idx_i32 = rocdl.readfirstlane(T.i32, _raw(_index_cast_to_i32(warp_idx)))
     lane_idx_i32 = _index_cast_to_i32(lane_idx)
 
     # ---- Work range ----
@@ -405,8 +405,8 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
     work_range = buffer_ops.buffer_load(
         work_indptr_rsrc, worker_idx_i32, vec_width=2, dtype=T.i32
     )
-    work_start_i32 = vector.extract(work_range, [0])
-    work_end_i32 = vector.extract(work_range, [1])
+    work_start_i32 = rocdl.readfirstlane(T.i32, _raw(vector.extract(work_range, [0])))
+    work_end_i32 = rocdl.readfirstlane(T.i32, _raw(vector.extract(work_range, [1])))
     work_start_idx = arith.index_cast(T.index, work_start_i32)
     work_end_idx = arith.index_cast(T.index, work_end_i32)
 
@@ -854,44 +854,59 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
 
         q_regs = []  # Will hold 18 v2i64 = 16 nope + 2 rope
 
-        for pass_idx in range_constexpr(9):
-            col_chunk = pass_idx * Q_ELEM_PER_ROW  # 0, 64, 128, ..., 512
-            col_off_i32 = arith.constant(col_chunk, type=T.i32)
+        # voffset is constant across all 9 passes -- column chunk goes into ioffset.
+        # v_offset_i32 is in fp8 elements (= bytes); buffer_load auto-scales by
+        # element_bytes (i32 = 4), so divide by 4.
+        voff_dw = _std_arith.DivSIOp(
+            _raw(v_offset_i32),
+            _raw(arith.constant(4, type=T.i32)),
+        ).result
 
-            # VRAM -> VGPR: buffer_load_dwordx4 (16 fp8 values per lane)
-            # voff is in fp8 elements (= bytes); buffer_load auto-scales by
-            # element_bytes, so divide by 4 when loading as i32.
-            voff_bytes = _std_arith.AddIOp(_raw(v_offset_i32), _raw(col_off_i32)).result
-            voff_dw = _std_arith.DivSIOp(
-                voff_bytes,
-                _raw(arith.constant(4, type=T.i32)),
-            ).result
-            q_vram_data = buffer_ops.buffer_load(
+        # Pre-compute LDS pointers (constant across passes)
+        lds_st_addr = p_lds_q_warp + lds_st_offset
+        lds_st_i64 = arith.index_cast(T.i64, lds_st_addr)
+        lds_st_ptr = _inttoptr_lds(_raw(lds_st_i64))
+        lds_rd_addr = p_lds_q_warp + lds_ld_offset
+
+        def _q_buf_load(pass_idx):
+            return buffer_ops.buffer_load(
                 query_rsrc,
                 voff_dw,
                 vec_width=4,
                 dtype=T.i32,
-                soffset_bytes=s_offset_i32,
+                soffset=s_offset_i32,
+                ioffset=pass_idx * Q_ELEM_PER_ROW,
             )
 
-            rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
-
-            # VGPR -> LDS: ds_write_b128 at per-lane LDS address
-            lds_st_addr = p_lds_q_warp + lds_st_offset
-            lds_st_i64 = arith.index_cast(T.i64, lds_st_addr)
-            lds_st_ptr = _inttoptr_lds(_raw(lds_st_i64))
-            llvm.StoreOp(_raw(q_vram_data), lds_st_ptr, alignment=16)
-
+        def _shuffle_q_through_lds(q_vram_data):
+            """LDS write (ds_write_b128) + barrier + LDS read (2x ds_read_b64)."""
             rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
-
-            # LDS -> register: 2x ds_read_b64 (MFMA layout)
-            # Sub-tile 0 at offset 0, sub-tile 1 at offset MFMA_K (32 bytes)
-            lds_rd_addr = p_lds_q_warp + lds_ld_offset
+            llvm.StoreOp(_raw(q_vram_data), lds_st_ptr, alignment=16)
+            rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
             q0 = _lds_load(lds_rd_addr, T.i64, static_byte_offset=0)
             q1 = _lds_load(lds_rd_addr, T.i64, static_byte_offset=MFMA_K)
-            q_regs.append((q0, q1))
+            return (q0, q1)
 
-            rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+        # 3-deep pipeline: keep 2 buffer_loads in flight while shuffling
+        # the completed one through LDS (matches HK QManagerV3).
+        #   Before loop: issue passes 0, 1
+        #   Iteration i: wait(1), issue pass i+2, shuffle pass i
+        #   Last 2 iters: wait(0), shuffle (no new issue)
+        loads = [None, None, None]
+        loads[0] = _q_buf_load(0)
+        loads[1] = _q_buf_load(1)
+
+        for i in range_constexpr(9):
+            slot = i % 3
+            issue_pass = i + 2
+
+            if issue_pass < 9:
+                rocdl.s_waitcnt(_encode_waitcnt(vmcnt=1))
+                loads[issue_pass % 3] = _q_buf_load(issue_pass)
+            else:
+                rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
+
+            q_regs.append(_shuffle_q_through_lds(loads[slot]))
 
         # Split into nope (passes 0-7 -> 16 sub-tiles) and rope (pass 8 -> 2 sub-tiles)
         q_nope_packs = []
@@ -1342,11 +1357,11 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             vec_width=1,
             dtype=T.i32,
         )
-        partial_qo_loc = vector.extract(wi_dw1_4, [0])
-        qo_start = vector.extract(wi_dw1_4, [1])
-        qo_end = vector.extract(wi_dw1_4, [2])
-        kv_start = vector.extract(wi_dw1_4, [3])
-        kv_end = wi_dw5
+        partial_qo_loc = rocdl.readfirstlane(T.i32, _raw(vector.extract(wi_dw1_4, [0])))
+        qo_start = rocdl.readfirstlane(T.i32, _raw(vector.extract(wi_dw1_4, [1])))
+        qo_end = rocdl.readfirstlane(T.i32, _raw(vector.extract(wi_dw1_4, [2])))
+        kv_start = rocdl.readfirstlane(T.i32, _raw(vector.extract(wi_dw1_4, [3])))
+        kv_end = rocdl.readfirstlane(T.i32, _raw(wi_dw5))
         kv_len = arith.subi(kv_end, kv_start)
 
         # ---- Load Q from VRAM to registers ----
