@@ -167,7 +167,7 @@ def create_benchmark_configs(custom, args):
     else:
         raise ValueError("Unknown metric: " + args.metric)
 
-    line_vals = [f"fwd({unit})"]
+    line_vals = [f"fwd"]
 
     configs.append(
         triton.testing.Benchmark(
