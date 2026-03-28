@@ -32,7 +32,12 @@ x, w, x_scales, w_scales, _, _, y = generate_gemm_a8wfp4_inputs(
 )
 ############################################################
 
+import triton
+
 for config in config_list:
+    if config is not None:
+        config = config.copy()
+        config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
 
     def fn():
         ############################################################
