@@ -3817,7 +3817,7 @@ std::tuple<dim3, dim3, int32_t, int32_t> get_grid_config(const int32_t size_s_h,
     //   NEOX: VP=2 always wins (8-15% over VP=1, VP=4 always worst)
     //   GPTJ: VP=4 wins at saturated workloads, VP=1 is catastrophically slow (2-3x)
     // VP>1 requires contiguous d-dimension (stride_d==1) for vectorized buffer ops.
-    constexpr int32_t preferred_vp = (RotateStyle == 1) ? 1 : 2; // TEMP: force VP=1 for GPTJ debug
+    constexpr int32_t preferred_vp = (RotateStyle == 1) ? 4 : 2; // GPTJ=1 -> VP=4, NEOX=0 -> VP=2
     int32_t vec_pairs              = stride_d_eq_1 ? preferred_vp : 1;
 
     while(vec_pairs > 1 && (size_half_r % vec_pairs != 0))
@@ -4588,6 +4588,7 @@ template <typename Op,
           bool ReuseFreqsFrontPart,
           bool NopeFirst,
           bool AllStrideDEq1 = false,
+          bool AllStrideDEq1 = false,
           typename scalar_t,
           typename scalar_f_t>
 void dispatch_1c_sbhd_cached_indirect(scalar_t* __restrict__ p_output,
@@ -4625,7 +4626,6 @@ void dispatch_1c_sbhd_cached_indirect(scalar_t* __restrict__ p_output,
             assert(stride_i_b == stride_o_b);
             assert(stride_i_h == stride_o_h);
             assert(stride_i_d == stride_o_d);
-
             if constexpr(AllStrideDEq1)
             {
                 constexpr bool Stride0Eq1 = true;
@@ -4678,7 +4678,7 @@ void dispatch_1c_sbhd_cached_indirect(scalar_t* __restrict__ p_output,
                                                  threads_per_sb,
                                                  total_sb););
             }
-        } else {
+                                             total_sb);
             if constexpr(AllStrideDEq1)
             {
                 constexpr bool Stride0Eq1 = true;
@@ -4743,68 +4743,68 @@ void dispatch_1c_sbhd_cached_indirect(scalar_t* __restrict__ p_output,
                                                                                      threads_per_sb,
                                                                                      total_sb););
             }
-        });
-}
-
-template <typename Op,
-          int32_t RotateStyle,
-          bool ReuseFreqsFrontPart,
-          bool NopeFirst,
+            {
+                constexpr bool Stride0Eq1 = true;
+                constexpr bool Stride1Eq1 = true;
+                kn_entry_1c_sbhd_cached_indirect<Op,
+                                                 RotateStyle,
+                                                 ReuseFreqsFrontPart,
+                                                 NopeFirst,
           bool AllStrideDEq1 = false,
-          typename scalar_t,
-          typename scalar_f_t>
-void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
-                                      scalar_t* __restrict__ p_output_y,
-                                      const scalar_t* __restrict__ p_input_x,
-                                      const scalar_t* __restrict__ p_input_y,
-                                      const scalar_f_t* __restrict__ p_cos,
-                                      const scalar_f_t* __restrict__ p_sin,
-                                      const int64_t* __restrict__ p_indirect_buffer,
-                                      const int32_t max_position,
-                                      const int32_t size_s,
-                                      const int32_t size_b,
-                                      const int32_t size_h_x,
-                                      const int32_t size_h_y,
-                                      const int32_t size_d,
-                                      const int32_t size_f, // size of last dimension of freqs.
-                                      const int32_t stride_ix_s,
-                                      const int32_t stride_ix_b,
-                                      const int32_t stride_ix_h,
-                                      const int32_t stride_ix_d,
-                                      const int32_t stride_iy_s,
-                                      const int32_t stride_iy_b,
-                                      const int32_t stride_iy_h,
-                                      const int32_t stride_iy_d,
-                                      const int32_t stride_ox_s,
-                                      const int32_t stride_ox_b,
-                                      const int32_t stride_ox_h,
-                                      const int32_t stride_ox_d,
-                                      const int32_t stride_oy_s,
-                                      const int32_t stride_oy_b,
-                                      const int32_t stride_oy_h,
-                                      const int32_t stride_oy_d)
-{
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-
-    const bool all_stride_d_eq_1 =
-        (stride_ix_d == 1) && (stride_iy_d == 1) && (stride_ox_d == 1) && (stride_oy_d == 1);
-    auto [grid, block, vec_pairs, threads_per_sb] =
-        get_grid_config<RotateStyle, ReuseFreqsFrontPart, false, scalar_t>(
-            size_s, 1, size_b, size_f, all_stride_d_eq_1);
-    const int32_t total_sb = size_s * size_b;
-
-    LAUNCH_KERNEL_VEC_PAIRS(
-        vec_pairs,
-        if((p_output_x == p_input_x) && (p_output_y == p_input_y)) {
-            assert(stride_ix_s == stride_ox_s);
-            assert(stride_ix_b == stride_ox_b);
-            assert(stride_ix_h == stride_ox_h);
-            assert(stride_ix_d == stride_ox_d);
-            assert(stride_iy_s == stride_oy_s);
-            assert(stride_iy_b == stride_oy_b);
-            assert(stride_iy_h == stride_oy_h);
-            assert(stride_iy_d == stride_oy_d);
-
+                                                 Stride0Eq1,
+                                                 Stride1Eq1,
+                                                 VP><<<grid, block, 0, stream>>>(p_output,
+                                                                                 p_input,
+                                                                                 p_cos,
+                                                                                 p_sin,
+                                                                                 p_indirect_buffer,
+                                                                                 max_position,
+                                                                                 size_h,
+                                                                                 size_d,
+                                                                                 size_f,
+                                                                                 stride_i_s,
+                                                                                 stride_i_b,
+                                                                                 stride_i_h,
+                                                                                 stride_i_d,
+                                                                                 stride_o_s,
+                                                                                 stride_o_b,
+                                                                                 stride_o_h,
+                                                                                 stride_o_d,
+                                                                                 size_s,
+                                                                                 threads_per_sb,
+                                                                                 total_sb);
+            }
+            else
+            {
+                LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
+                    RotateStyle,
+                    stride_o_d,
+                    stride_i_d,
+                    kn_entry_1c_sbhd_cached_indirect<Op,
+                                                     RotateStyle,
+                                                     ReuseFreqsFrontPart,
+                                                     NopeFirst,
+                                                     Stride0Eq1,
+                                                     Stride1Eq1,
+                                                     VP><<<grid, block, 0, stream>>>(p_output,
+                                                                                     p_input,
+                                                                                     p_cos,
+                                                                                     p_sin,
+                                                                                     p_indirect_buffer,
+                                                                                     max_position,
+                                                                                     size_h,
+                                                                                     size_d,
+                                                                                     size_f,
+                                                                                     stride_i_s,
+                                                                                     stride_i_b,
+                                                                                     stride_i_h,
+                                                                                     stride_i_d,
+                                                                                     stride_o_s,
+                                                                                     stride_o_b,
+                                                                                     stride_o_h,
+                                                                                     stride_o_d,
+                                                                                     size_s,
+                                                                                     threads_per_sb,
             if constexpr(AllStrideDEq1)
             {
                 constexpr bool Stride0Eq1 = true;
@@ -4873,7 +4873,7 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                                  threads_per_sb,
                                                  total_sb););
             }
-        } else {
+                                      const int32_t stride_iy_h,
             if constexpr(AllStrideDEq1)
             {
                 constexpr bool Stride0Eq1 = true;
@@ -4968,53 +4968,53 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                                                                      threads_per_sb,
                                                                                      total_sb););
             }
-        });
-}
-
-template <typename Op,
-          int32_t RotateStyle,
-          bool ReuseFreqsFrontPart,
-          bool NopeFirst,
+                                             p_sin,
+                                             p_indirect_buffer,
+                                             max_position,
+                                             size_h_x,
+                                             size_h_y,
+                                             size_d,
+                                             size_f,
           bool AllStrideDEq1 = false,
-          typename scalar_t,
-          typename scalar_f_t>
-void dispatch_1c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output,
-                                       const scalar_t* __restrict__ p_input,
-                                       const scalar_f_t* __restrict__ p_cos,
-                                       const scalar_f_t* __restrict__ p_sin,
-                                       const int64_t* __restrict__ p_indirect_buffer_0,
-                                       const int64_t* __restrict__ p_indirect_buffer_1,
-                                       const int32_t max_position,
-                                       const int32_t size_s,
-                                       const int32_t size_b,
-                                       const int32_t size_h,
-                                       const int32_t size_d,
-                                       const int32_t size_f, // size of last dimension of freqs.
-                                       const int32_t stride_i_s,
-                                       const int32_t stride_i_b,
-                                       const int32_t stride_i_h,
-                                       const int32_t stride_i_d,
-                                       const int32_t stride_o_s,
-                                       const int32_t stride_o_b,
-                                       const int32_t stride_o_h,
-                                       const int32_t stride_o_d)
-{
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-
-    const bool all_stride_d_eq_1 = (stride_i_d == 1) && (stride_o_d == 1);
-    auto [grid, block, vec_pairs, threads_per_sb] =
-        get_grid_config<RotateStyle, ReuseFreqsFrontPart, false, scalar_t>(
-            size_s, 1, size_b, size_f, all_stride_d_eq_1);
-    const int32_t total_sb = size_s * size_b;
-
-    LAUNCH_KERNEL_VEC_PAIRS(
-        vec_pairs,
-        if(p_output == p_input) {
-            assert(stride_i_s == stride_o_s);
-            assert(stride_i_b == stride_o_b);
-            assert(stride_i_h == stride_o_h);
-            assert(stride_i_d == stride_o_d);
-
+                                             stride_ix_s,
+                                             stride_ix_b,
+                                             stride_ix_h,
+                                             stride_ix_d,
+                                             stride_iy_s,
+                                             stride_iy_b,
+                                             stride_iy_h,
+                                             stride_iy_d,
+                                             size_s,
+                                             threads_per_sb,
+                                             total_sb);
+            }
+            else
+            {
+                LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
+                    RotateStyle,
+                    stride_ix_d,
+                    stride_iy_d,
+                    kn_entry_2c_sbhd_cached_indirect_inplace<Op,
+                                                             RotateStyle,
+                                                             ReuseFreqsFrontPart,
+                                                             NopeFirst,
+                                                             Stride0Eq1,
+                                                             Stride1Eq1,
+                                                             VP>
+                    <<<grid, block, 0, stream>>>(p_output_x,
+                                                 p_output_y,
+                                                 p_cos,
+                                                 p_sin,
+                                                 p_indirect_buffer,
+                                                 max_position,
+                                                 size_h_x,
+                                                 size_h_y,
+                                                 size_d,
+                                                 size_f,
+                                                 stride_ix_s,
+                                                 stride_ix_b,
+                                                 stride_ix_h,
+                                                 stride_ix_d,
             if constexpr(AllStrideDEq1)
             {
                 constexpr bool Stride0Eq1 = true;
@@ -5066,6 +5066,310 @@ void dispatch_1c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output,
                                                  stride_i_h,
                                                  stride_i_d,
                                                  size_s,
+                                                 threads_per_sb,
+                                                 total_sb););
+            }
+                                                                                 p_input_x,
+            if constexpr(AllStrideDEq1)
+            {
+                constexpr bool Stride0Eq1 = true;
+                constexpr bool Stride1Eq1 = true;
+                kn_entry_1c_sbhd_cached_indirect2<Op,
+                                                  RotateStyle,
+                                                  ReuseFreqsFrontPart,
+                                                  NopeFirst,
+                                                  Stride0Eq1,
+                                                  Stride1Eq1,
+                                                  VP>
+                <<<grid, block, 0, stream>>>(p_output,
+                                             p_input,
+                                             p_cos,
+                                             p_sin,
+                                             p_indirect_buffer_0,
+                                             p_indirect_buffer_1,
+                                             max_position,
+                                             size_h,
+                                             size_d,
+                                             size_f,
+                                             stride_i_s,
+                                             stride_i_b,
+                                             stride_i_h,
+                                             stride_i_d,
+                                             stride_o_s,
+                                             stride_o_b,
+                                             stride_o_h,
+                                             stride_o_d,
+                                             size_s,
+                                             threads_per_sb,
+                                             total_sb);
+            }
+            else
+            {
+                LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
+                    RotateStyle,
+                    stride_o_d,
+                    stride_i_d,
+                    kn_entry_1c_sbhd_cached_indirect2<Op,
+                                                      RotateStyle,
+                                                      ReuseFreqsFrontPart,
+                                                      NopeFirst,
+                                                      Stride0Eq1,
+                                                      Stride1Eq1,
+                                                      VP>
+                    <<<grid, block, 0, stream>>>(p_output,
+                                                 p_input,
+                                                 p_cos,
+                                                 p_sin,
+                                                 p_indirect_buffer_0,
+                                                 p_indirect_buffer_1,
+                                                 max_position,
+                                                 size_h,
+                                                 size_d,
+                                                 size_f,
+                                                 stride_i_s,
+                                                 stride_i_b,
+                                                 stride_i_h,
+                                                 stride_i_d,
+                                                 stride_o_s,
+                                                 stride_o_b,
+                                                 stride_o_h,
+                                                 stride_o_d,
+                                                 size_s,
+                                                 threads_per_sb,
+                                                 total_sb););
+            }
+                    RotateStyle,
+                    stride_ox_d,
+                    stride_oy_d,
+                    stride_ix_d,
+                    stride_iy_d,
+                    kn_entry_2c_sbhd_cached_indirect<Op,
+                                                     RotateStyle,
+          bool AllStrideDEq1 = false,
+                                                     ReuseFreqsFrontPart,
+                                                     NopeFirst,
+                                                     Stride0Eq1,
+                                                     Stride1Eq1,
+                                                     Stride2Eq1,
+                                                     Stride3Eq1,
+                                                     VP><<<grid, block, 0, stream>>>(p_output_x,
+                                                                                     p_output_y,
+                                                                                     p_input_x,
+                                                                                     p_input_y,
+                                                                                     p_cos,
+                                                                                     p_sin,
+                                                                                     p_indirect_buffer,
+                                                                                     max_position,
+                                                                                     size_h_x,
+                                                                                     size_h_y,
+                                                                                     size_d,
+                                                                                     size_f,
+                                                                                     stride_ix_s,
+                                                                                     stride_ix_b,
+                                                                                     stride_ix_h,
+                                                                                     stride_ix_d,
+                                                                                     stride_iy_s,
+                                                                                     stride_iy_b,
+                                                                                     stride_iy_h,
+                                                                                     stride_iy_d,
+                                                                                     stride_ox_s,
+                                                                                     stride_ox_b,
+                                                                                     stride_ox_h,
+                                                                                     stride_ox_d,
+                                                                                     stride_oy_s,
+                                                                                     stride_oy_b,
+                                                                                     stride_oy_h,
+                                                                                     stride_oy_d,
+                                                                                     size_s,
+                                                                                     threads_per_sb,
+                                                                                     total_sb););
+            }
+        });
+}
+
+template <typename Op,
+          int32_t RotateStyle,
+          bool ReuseFreqsFrontPart,
+          bool NopeFirst,
+          bool AllStrideDEq1 = false,
+          typename scalar_t,
+          typename scalar_f_t>
+void dispatch_1c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output,
+                                       const scalar_t* __restrict__ p_input,
+                                       const scalar_f_t* __restrict__ p_cos,
+                                       const scalar_f_t* __restrict__ p_sin,
+                                       const int64_t* __restrict__ p_indirect_buffer_0,
+                                       const int64_t* __restrict__ p_indirect_buffer_1,
+                                       const int32_t max_position,
+            if constexpr(AllStrideDEq1)
+            {
+                constexpr bool Stride0Eq1 = true;
+                constexpr bool Stride1Eq1 = true;
+                kn_entry_2c_sbhd_cached_indirect2_inplace<Op,
+                                                          RotateStyle,
+                                                          ReuseFreqsFrontPart,
+                                                          NopeFirst,
+                                                          Stride0Eq1,
+                                                          Stride1Eq1,
+                                                          VP>
+                <<<grid, block, 0, stream>>>(p_output_x,
+                                             p_output_y,
+                                             p_cos,
+                                             p_sin,
+                                             p_indirect_buffer_0,
+                                             p_indirect_buffer_1,
+                                             max_position,
+                                             size_h_x,
+                                             size_h_y,
+                                             size_d,
+                                             size_f,
+                                             stride_ix_s,
+                                             stride_ix_b,
+                                             stride_ix_h,
+                                             stride_ix_d,
+                                             stride_iy_s,
+                                             stride_iy_b,
+                                             stride_iy_h,
+                                             stride_iy_d,
+                                             size_s,
+                                             threads_per_sb,
+                                             total_sb);
+            }
+            else
+            {
+                LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
+                    RotateStyle,
+                    stride_ix_d,
+                    stride_iy_d,
+                    kn_entry_2c_sbhd_cached_indirect2_inplace<Op,
+                                                              RotateStyle,
+                                                              ReuseFreqsFrontPart,
+                                                              NopeFirst,
+                                                              Stride0Eq1,
+                                                              Stride1Eq1,
+                                                              VP>
+                    <<<grid, block, 0, stream>>>(p_output_x,
+                                                 p_output_y,
+                                                 p_cos,
+                                                 p_sin,
+                                                 p_indirect_buffer_0,
+                                                 p_indirect_buffer_1,
+                                                 max_position,
+                                                 size_h_x,
+                                                 size_h_y,
+                                                 size_d,
+                                                 size_f,
+                                                 stride_ix_s,
+                                                 stride_ix_b,
+                                                 stride_ix_h,
+                                                 stride_ix_d,
+                                                 stride_iy_s,
+                                                 stride_iy_b,
+                                                 stride_iy_h,
+                                                 stride_iy_d,
+                                                 size_s,
+                                                 threads_per_sb,
+                                                 total_sb););
+            }
+                kn_entry_1c_sbhd_cached_indirect2_inplace<Op,
+            if constexpr(AllStrideDEq1)
+            {
+                constexpr bool Stride0Eq1 = true;
+                constexpr bool Stride1Eq1 = true;
+                constexpr bool Stride2Eq1 = true;
+                constexpr bool Stride3Eq1 = true;
+                kn_entry_2c_sbhd_cached_indirect2<Op,
+                                                  RotateStyle,
+                                                  ReuseFreqsFrontPart,
+                                                  NopeFirst,
+                                                  Stride0Eq1,
+                                                  Stride1Eq1,
+                                                  Stride2Eq1,
+                                                  Stride3Eq1,
+                                                  VP>
+                <<<grid, block, 0, stream>>>(p_output_x,
+                                             p_output_y,
+                                             p_input_x,
+                                             p_input_y,
+                                             p_cos,
+                                             p_sin,
+                                             p_indirect_buffer_0,
+                                             p_indirect_buffer_1,
+                                             max_position,
+                                             size_h_x,
+                                             size_h_y,
+                                             size_d,
+                                             size_f,
+                                             stride_ix_s,
+                                             stride_ix_b,
+                                             stride_ix_h,
+                                             stride_ix_d,
+                                             stride_iy_s,
+                                             stride_iy_b,
+                                             stride_iy_h,
+                                             stride_iy_d,
+                                             stride_ox_s,
+                                             stride_ox_b,
+                                             stride_ox_h,
+                                             stride_ox_d,
+                                             stride_oy_s,
+                                             stride_oy_b,
+                                             stride_oy_h,
+                                             stride_oy_d,
+                                             size_s,
+                                             threads_per_sb,
+                                             total_sb);
+            }
+            else
+            {
+                LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
+                    RotateStyle,
+                    stride_ox_d,
+                    stride_oy_d,
+                    stride_ix_d,
+                    stride_iy_d,
+                    kn_entry_2c_sbhd_cached_indirect2<Op,
+                                                      RotateStyle,
+                                                      ReuseFreqsFrontPart,
+                                                      NopeFirst,
+                                                      Stride0Eq1,
+                                                      Stride1Eq1,
+                                                      Stride2Eq1,
+                                                      Stride3Eq1,
+                                                      VP>
+                    <<<grid, block, 0, stream>>>(p_output_x,
+                                                 p_output_y,
+                                                 p_input_x,
+                                                 p_input_y,
+                                                 p_cos,
+                                                 p_sin,
+                                                 p_indirect_buffer_0,
+                                                 p_indirect_buffer_1,
+                                                 max_position,
+                                                 size_h_x,
+                                                 size_h_y,
+                                                 size_d,
+                                                 size_f,
+                                                 stride_ix_s,
+                                                 stride_ix_b,
+                                                 stride_ix_h,
+                                                 stride_ix_d,
+                                                 stride_iy_s,
+                                                 stride_iy_b,
+                                                 stride_iy_h,
+                                                 stride_iy_d,
+                                                 stride_ox_s,
+                                                 stride_ox_b,
+                                                 stride_ox_h,
+                                                 stride_ox_d,
+                                                 stride_oy_s,
+                                                 stride_oy_b,
+                                                 stride_oy_h,
+                                                 stride_oy_d,
+                                                 size_s,
+                                                 threads_per_sb,
+                                                 total_sb););
+            }
                                                  threads_per_sb,
                                                  total_sb););
             }
