@@ -10,11 +10,7 @@ Usage:
 
 import argparse
 import csv
-import json
 import os
-import sys
-import urllib.request
-from pathlib import Path
 
 
 def load_csv(path):
@@ -36,8 +32,21 @@ def extract_perf_key(row):
     """Create a unique key for matching results across runs."""
     # Use benchmark name + shape dimensions
     parts = [row.get("_benchmark", "")]
-    for dim in ["M", "N", "K", "E", "top_k", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K",
-                "model", "model_name", "layer"]:
+    for dim in [
+        "M",
+        "N",
+        "K",
+        "E",
+        "top_k",
+        "BATCH",
+        "HQ",
+        "HK",
+        "N_CTX_Q",
+        "N_CTX_K",
+        "model",
+        "model_name",
+        "layer",
+    ]:
         if dim in row and row[dim]:
             parts.append(f"{dim}={row[dim]}")
     return "|".join(parts)
@@ -46,7 +55,13 @@ def extract_perf_key(row):
 def extract_perf_value(row):
     """Extract the primary performance metric from a result row."""
     # Try TFLOPS first, then bandwidth, then time
-    for key in ["TFLOPS", "fwd(TFLOPS)", "fwd_Time_(ms)", "Time_(ms)", "Bandwidth_(GB/s)"]:
+    for key in [
+        "TFLOPS",
+        "fwd(TFLOPS)",
+        "fwd_Time_(ms)",
+        "Time_(ms)",
+        "Bandwidth_(GB/s)",
+    ]:
         if key in row and row[key]:
             try:
                 return float(row[key]), key
@@ -132,13 +147,17 @@ def format_markdown(comparisons, metadata=None):
     regressed = sum(1 for c in comparisons if c.get("regressed"))
 
     if has_baseline:
-        lines.append(f"**Summary**: {total} configs benchmarked | "
-                     f"{improved} improved | {regressed} regressed\n")
+        lines.append(
+            f"**Summary**: {total} configs benchmarked | "
+            f"{improved} improved | {regressed} regressed\n"
+        )
 
         if regressed > 0:
             lines.append("> **Warning**: Performance regressions detected!\n")
     else:
-        lines.append(f"**Summary**: {total} configs benchmarked (no baseline for comparison)\n")
+        lines.append(
+            f"**Summary**: {total} configs benchmarked (no baseline for comparison)\n"
+        )
 
     # Per-benchmark tables
     for bench, results in sorted(by_bench.items()):
@@ -168,9 +187,13 @@ def format_markdown(comparisons, metadata=None):
                         status = "🟢"
                     else:
                         status = "⚪"
-                    lines.append(f"| {display_key} | {c['current']:.2f} | {c['baseline']:.2f} | {sign}{change:.1f}% | {status} |")
+                    lines.append(
+                        f"| {display_key} | {c['current']:.2f} | {c['baseline']:.2f} | {sign}{change:.1f}% | {status} |"
+                    )
                 else:
-                    lines.append(f"| {display_key} | {c['current']:.2f} | {c['baseline']:.2f} | — | ⚪ |")
+                    lines.append(
+                        f"| {display_key} | {c['current']:.2f} | {c['baseline']:.2f} | — | ⚪ |"
+                    )
             else:
                 lines.append(f"| {display_key} | {c['current']:.2f} | {c['metric']} |")
 
@@ -184,7 +207,9 @@ def main():
     parser = argparse.ArgumentParser(description="Compare perf benchmark results")
     parser.add_argument("--current", required=True, help="Current run CSV")
     parser.add_argument("--baseline", default=None, help="Baseline CSV (optional)")
-    parser.add_argument("--output", default="comparison.md", help="Output markdown file")
+    parser.add_argument(
+        "--output", default="comparison.md", help="Output markdown file"
+    )
     args = parser.parse_args()
 
     current = load_csv(args.current)
