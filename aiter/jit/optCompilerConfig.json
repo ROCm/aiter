@@ -60,7 +60,11 @@
             "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_bf16_nmask_gqa8_decode_s.cpp'",
             "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_bf16_mask_gqa8_decode_s.cpp'",
             "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_fp16_nmask_gqa8_decode_s.cpp'",
-            "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_fp16_mask_gqa8_decode_s.cpp'"
+            "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_fp16_mask_gqa8_decode_s.cpp'",
+            "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_bf16_nmask_gqa8_decode_t.cpp'",
+            "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_bf16_mask_gqa8_decode_t.cpp'",
+            "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_fp16_nmask_gqa8_decode_t.cpp'",
+            "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_fp16_mask_gqa8_decode_t.cpp'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
