@@ -12,7 +12,7 @@ from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
     moe_gemm_a8w4,
     swizzle_scales_gfx950,
-    swizzle_scales_gfx1250
+    swizzle_scales_gfx1250,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 import tempfile

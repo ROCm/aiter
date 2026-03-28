@@ -67,6 +67,27 @@ def matmul_launch_metadata(grid, kernel, args):
 
 
 @gluon.jit
+def unswizzle_mx_scale_gfx1250(
+    scale_buffer_slice, BLOCK_N, MX_SCALE_BLOCK_K, PRESHUFFLE_FACTOR, SCALE_KWIDTH
+):
+    scale_buffer_slice = (
+        scale_buffer_slice.reshape(
+            (
+                BLOCK_N // PRESHUFFLE_FACTOR,
+                MX_SCALE_BLOCK_K // SCALE_KWIDTH,
+                PRESHUFFLE_FACTOR // 4,
+                4,
+                SCALE_KWIDTH,
+            )
+        )
+        .permute((0, 3, 2, 1, 4))
+        .reshape((BLOCK_N, MX_SCALE_BLOCK_K))
+    )
+
+    return scale_buffer_slice
+
+
+@gluon.jit
 def clip(x, limit, clip_lower: tl.constexpr):
     res = gl.minimum(x, limit)
     if clip_lower:
@@ -462,18 +483,12 @@ def _moe_gemm_a8w4(
         )
         w_scales_buffer_slice = w_scales_buffer.index(read_idx % NUM_BUFFERS)
         if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
-            w_scales_buffer_slice = (
-                w_scales_buffer_slice.reshape(
-                    (
-                        SCALE_BLOCK_N,
-                        MX_SCALE_BLOCK_K // SCALE_KWIDTH,
-                        PRESHUFFLE_FACTOR // 4,
-                        4,
-                        SCALE_KWIDTH,
-                    )
-                )
-                .permute((0, 3, 2, 1, 4))
-                .reshape((BLOCK_N, MX_SCALE_BLOCK_K))
+            w_scales_buffer_slice = unswizzle_mx_scale_gfx1250(
+                w_scales_buffer_slice,
+                BLOCK_N,
+                MX_SCALE_BLOCK_K,
+                PRESHUFFLE_FACTOR,
+                SCALE_KWIDTH,
             )
         w_scales = w_scales_buffer_slice.load(layout=DOT_LAYOUT_W_SCALES)
         read_idx += 1
@@ -491,18 +506,12 @@ def _moe_gemm_a8w4(
         )
         w_scales_buffer_slice = w_scales_buffer.index(read_idx % NUM_BUFFERS)
         if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
-            w_scales_buffer_slice = (
-                w_scales_buffer_slice.reshape(
-                    (
-                        SCALE_BLOCK_N,
-                        MX_SCALE_BLOCK_K // SCALE_KWIDTH,
-                        PRESHUFFLE_FACTOR // 4,
-                        4,
-                        SCALE_KWIDTH,
-                    )
-                )
-                .permute((0, 3, 2, 1, 4))
-                .reshape((BLOCK_N, MX_SCALE_BLOCK_K))
+            w_scales_buffer_slice = unswizzle_mx_scale_gfx1250(
+                w_scales_buffer_slice,
+                BLOCK_N,
+                MX_SCALE_BLOCK_K,
+                PRESHUFFLE_FACTOR,
+                SCALE_KWIDTH,
             )
         w_scales = w_scales_buffer_slice.load(layout=DOT_LAYOUT_W_SCALES)
 

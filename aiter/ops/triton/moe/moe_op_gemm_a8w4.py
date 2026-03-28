@@ -125,7 +125,7 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     if block_m == 16:
         block_n = 128
         num_warps = 4
-        
+
     elif block_m == 32:
         if n <= 1024:
             block_n = 128
