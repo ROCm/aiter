@@ -13,22 +13,28 @@
 #endif
 
 // =====================================================================================================================
-// Keyword interpretation
-// ----------------------------------------------------------------
-// 1c/2c:               The number of channels. 2c means two inputs and two outputs.
-// Cached, Uncached:    Whether cosine and sine are calculated in kernel. Cached means kernel can
-// read these value from
-//                      memory rather than calculate these value according to the given theta in
-//                      memory.
-// ReuseFreqsFrontPart: Normally, freqs/cos/sin tensors should be repeated before conduct the RoPE
-// operators. With
-//                      this value set as true, the repeat is no longer required. Kernel can
-//                      automatically relocate the desired element.
-// sbhd:                Shape of tensor: [sequence length, batch size, head count, hidden
-// dimension]. thd:                 Shape of tensor. 2d:                  2D image. NopeFirst: [0,
-// size_r(rotate dim)) is rotated and the rest is just copied if this value is false.
-//                      [size_d (size of d dim) - size_r, size_d) is rotated and the front part is
-//                      just copied if true.
+// Keyword Glossary
+// =====================================================================================================================
+//
+//   1c / 2c              Number of input-output tensor pairs.
+//                        1c = one input & one output;  2c = two inputs & two outputs.
+//
+//   Cached / Uncached    How cos/sin values are obtained.
+//                        Cached  -- read pre-computed cos/sin from memory.
+//                        Uncached -- compute cos/sin on the fly from theta (frequency) values.
+//
+//   ReuseFreqsFrontPart  When true, the kernel reuses the front portion of the freqs/cos/sin
+//                        tensor for the repeated part, so the caller does not need to expand
+//                        (repeat) the tensor beforehand.
+//
+//   sbhd / thd / 2d      Tensor layout conventions:
+//                          sbhd -- [seq_len, batch, num_heads, head_dim]
+//                          thd  -- [total_tokens, num_heads, head_dim]  (variable-length / packed)
+//                          2d   -- 2-D positional encoding (image height x width)
+//
+//   NopeFirst            Controls which slice of the head dimension is rotated.
+//                        false -- rotate [0, size_r), copy the remainder.
+//                        true  -- copy [0, size_d - size_r), rotate the tail.
 //
 
 #define ROTATE_STYLE_NEOX 0
