@@ -73,7 +73,7 @@ void rope_cached_positions_2c_fwd_impl(
         reuse_freqs_front_part,
         nope_first,
         "dispatch_2c_sbhd_cached_indirect<OpCachedFwd, ...>",
-        dispatch_2c_sbhd_cached_indirect<OpCachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
+        dispatch_2c_sbhd_cached_indirect<OpCachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
             output_x.data_ptr<scalar_t_0>(),
             output_y.data_ptr<scalar_t_0>(),
             input_x.data_ptr<scalar_t_0>(),
