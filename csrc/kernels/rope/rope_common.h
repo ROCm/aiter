@@ -327,7 +327,16 @@ __device__ __forceinline__ void elementwise_copy(gmem_i_t& g_input,
                 }
             }
             else
-#endif
+            {
+                const int32_t byte_off_i = (offset_i + hid * stride_i_h) * elem_bytes;
+                const int32_t byte_off_o = (offset_o + hid * stride_o_h) * elem_bytes;
+                for(int32_t did = did_start + my_did_offset; did < did_end; did += did_stride)
+                {
+                    auto v = g_input.template _load<1>(byte_off_i + did * stride_i_d * elem_bytes);
+                    g_output.template _store<1>(v, byte_off_o + did * stride_o_d * elem_bytes);
+                }
+            }
+#else
             {
                 const int32_t off_i = offset_i + hid * stride_i_h;
                 const int32_t off_o = offset_o + hid * stride_o_h;
@@ -336,6 +345,7 @@ __device__ __forceinline__ void elementwise_copy(gmem_i_t& g_input,
                     p_output[off_o + did * stride_o_d] = p_input[off_i + did * stride_i_d];
                 }
             }
+#endif
         }
     }
 }
@@ -395,7 +405,20 @@ __device__ __forceinline__ void elementwise_copy_2c(gmem_ix_t& g_ix,
                 }
             }
             else
-#endif
+            {
+                const int32_t bo_ix = (off_ix + hid * stride_ix_h) * elem_bytes;
+                const int32_t bo_iy = (off_iy + hid * stride_iy_h) * elem_bytes;
+                const int32_t bo_ox = (off_ox + hid * stride_ox_h) * elem_bytes;
+                const int32_t bo_oy = (off_oy + hid * stride_oy_h) * elem_bytes;
+                for(int32_t did = did_start + my_did_offset; did < did_end; did += did_stride)
+                {
+                    auto vx = g_ix.template _load<1>(bo_ix + did * stride_ix_d * elem_bytes);
+                    auto vy = g_iy.template _load<1>(bo_iy + did * stride_iy_d * elem_bytes);
+                    g_ox.template _store<1>(vx, bo_ox + did * stride_ox_d * elem_bytes);
+                    g_oy.template _store<1>(vy, bo_oy + did * stride_oy_d * elem_bytes);
+                }
+            }
+#else
             {
                 const int32_t offset_ix = off_ix + hid * stride_ix_h;
                 const int32_t offset_iy = off_iy + hid * stride_iy_h;
@@ -409,6 +432,7 @@ __device__ __forceinline__ void elementwise_copy_2c(gmem_ix_t& g_ix,
                         p_input_y[offset_iy + did * stride_iy_d];
                 }
             }
+#endif
         }
 
         for(int32_t hid = hid_min_end; hid < hid_end_x; hid++)
@@ -428,7 +452,16 @@ __device__ __forceinline__ void elementwise_copy_2c(gmem_ix_t& g_ix,
                 }
             }
             else
-#endif
+            {
+                const int32_t bo_ix = (off_ix + hid * stride_ix_h) * elem_bytes;
+                const int32_t bo_ox = (off_ox + hid * stride_ox_h) * elem_bytes;
+                for(int32_t did = did_start + my_did_offset; did < did_end; did += did_stride)
+                {
+                    auto v = g_ix.template _load<1>(bo_ix + did * stride_ix_d * elem_bytes);
+                    g_ox.template _store<1>(v, bo_ox + did * stride_ox_d * elem_bytes);
+                }
+            }
+#else
             {
                 const int32_t offset_ix = off_ix + hid * stride_ix_h;
                 const int32_t offset_ox = off_ox + hid * stride_ox_h;
@@ -438,6 +471,7 @@ __device__ __forceinline__ void elementwise_copy_2c(gmem_ix_t& g_ix,
                         p_input_x[offset_ix + did * stride_ix_d];
                 }
             }
+#endif
         }
 
         for(int32_t hid = hid_min_end; hid < hid_end_y; hid++)
@@ -457,7 +491,16 @@ __device__ __forceinline__ void elementwise_copy_2c(gmem_ix_t& g_ix,
                 }
             }
             else
-#endif
+            {
+                const int32_t bo_iy = (off_iy + hid * stride_iy_h) * elem_bytes;
+                const int32_t bo_oy = (off_oy + hid * stride_oy_h) * elem_bytes;
+                for(int32_t did = did_start + my_did_offset; did < did_end; did += did_stride)
+                {
+                    auto v = g_iy.template _load<1>(bo_iy + did * stride_iy_d * elem_bytes);
+                    g_oy.template _store<1>(v, bo_oy + did * stride_oy_d * elem_bytes);
+                }
+            }
+#else
             {
                 const int32_t offset_iy = off_iy + hid * stride_iy_h;
                 const int32_t offset_oy = off_oy + hid * stride_oy_h;
@@ -467,6 +510,7 @@ __device__ __forceinline__ void elementwise_copy_2c(gmem_ix_t& g_ix,
                         p_input_y[offset_iy + did * stride_iy_d];
                 }
             }
+#endif
         }
     }
 }
@@ -3098,6 +3142,7 @@ __launch_bounds__(256, 8) __global__
                                         (int32_t)offset_h_i,
                                         p_cos_h + offset_h_f,
                                         p_sin_h + offset_h_f,
+                                        0, // offset already baked into pointer
                                         size_h,
                                         size_half_d,
                                         size_half_d,
@@ -3123,6 +3168,7 @@ __launch_bounds__(256, 8) __global__
                                         (int32_t)offset_w_i,
                                         p_cos_w + offset_w_f,
                                         p_sin_w + offset_w_f,
+                                        0, // offset already baked into pointer
                                         size_h,
                                         size_half_d,
                                         size_half_d,
@@ -3185,6 +3231,7 @@ __launch_bounds__(256, 8) __global__
                                       (int32_t)offset_h,
                                       p_cos_h + offset_h_f,
                                       p_sin_h + offset_h_f,
+                                      0, // offset already baked into pointer
                                       size_h,
                                       size_half_d,
                                       size_half_d,
@@ -3209,6 +3256,7 @@ __launch_bounds__(256, 8) __global__
                                       (int32_t)offset_w,
                                       p_cos_w + offset_w_f,
                                       p_sin_w + offset_w_f,
+                                      0, // offset already baked into pointer
                                       size_h,
                                       size_half_d,
                                       size_half_d,
@@ -3405,63 +3453,40 @@ __launch_bounds__(256, 8) __global__
         }                                                      \
     }
 
-inline float get_rope_threshold()
-{
-    static float val = []() {
-        const char* env = std::getenv("AITER_ROPE_THRESHOLD");
-        return env ? std::atof(env) : 4.0f;
-    }();
-    return val;
-}
-
-inline int32_t get_rope_force_vp()
-{
-    static int32_t val = []() {
-        const char* env = std::getenv("AITER_ROPE_FORCE_VP");
-        return env ? std::atoi(env) : 0;
-    }();
-    return val;
-}
-
-template <bool ReuseFreqsFrontPart, bool Is2D, typename scalar_t = ck_tile::fp16_t>
+template <int32_t RotateStyle, bool ReuseFreqsFrontPart, bool Is2D, typename scalar_t = ck_tile::fp16_t>
 std::tuple<dim3, dim3, int32_t, int32_t> get_grid_config(const int32_t size_s_h,
                                                           const int32_t size_s_w,
                                                           const int32_t size_b,
                                                           const int32_t size_f,
-                                                          const float   threshold = -1.0f)
+                                                          const bool    stride_d_eq_1 = true)
 {
     constexpr int32_t num_threads      = 256; // 4 warps x 64 threads/warp
     constexpr int32_t kernel_occupancy = 8;   // __launch_bounds__(256, 8)
-
-    const float effective_threshold = (threshold < 0.0f) ? get_rope_threshold() : threshold;
+    constexpr float   threshold        = 4.0f;
 
     const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
     const int32_t size_half_r = size_r >> 1;
     const int32_t total_sb    = size_s_h * size_s_w * size_b;
 
-    // Pick largest VecPairs in {1,2,4} that divides size_half_r
-    // and ensures enough total waves to saturate the GPU.
-    // total_waves = total_sb * (size_half_r / vec_pairs) / warp_size
-    // Must exceed gpu_capacity (num_cu * occupancy) by threshold factor.
-    int32_t vec_pairs = 4;
-    const int32_t force_vp = get_rope_force_vp();
-    if(force_vp > 0 && (size_half_r % force_vp == 0))
+    // VP selection depends on rotate style (benchmarked on gfx942):
+    //   NEOX: VP=2 always wins (8-15% over VP=1, VP=4 always worst)
+    //   GPTJ: VP=4 wins at saturated workloads, VP=1 is catastrophically slow (2-3x)
+    // VP>1 requires contiguous d-dimension (stride_d==1) for vectorized buffer ops.
+    constexpr int32_t preferred_vp = (RotateStyle == 1) ? 4 : 2; // GPTJ=1 -> VP=4, NEOX=0 -> VP=2
+    int32_t vec_pairs = stride_d_eq_1 ? preferred_vp : 1;
+
+    while(vec_pairs > 1 && (size_half_r % vec_pairs != 0))
+        vec_pairs >>= 1;
+
+    // Fall back to smaller VP if not enough waves to saturate the GPU.
+    const int32_t gpu_capacity = static_cast<int32_t>(get_num_cu_func() * kernel_occupancy);
+    constexpr int32_t warp_size = 64;
+    while(vec_pairs > 1)
     {
-        vec_pairs = force_vp;
-    }
-    else
-    {
-        while(vec_pairs > 1 && (size_half_r % vec_pairs != 0))
-            vec_pairs >>= 1;
-        const int32_t gpu_capacity = static_cast<int32_t>(get_num_cu_func() * kernel_occupancy);
-        constexpr int32_t warp_size = 64;
-        while(vec_pairs > 1)
-        {
-            const int32_t total_waves = total_sb * (size_half_r / vec_pairs) / warp_size;
-            if(total_waves >= static_cast<int32_t>(gpu_capacity * effective_threshold))
-                break;
-            vec_pairs >>= 1;
-        }
+        const int32_t total_waves = total_sb * (size_half_r / vec_pairs) / warp_size;
+        if(total_waves >= static_cast<int32_t>(gpu_capacity * threshold))
+            break;
+        vec_pairs >>= 1;
     }
 
     const int32_t threads_per_sb = size_half_r / vec_pairs;
@@ -3522,7 +3547,8 @@ void dispatch_1c_sbhd_uncached(scalar_t* __restrict__ p_output,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f);
+    const bool all_stride_d_eq_1 = (stride_i_d == 1) && (stride_o_d == 1);
+    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<RotateStyle, ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f, all_stride_d_eq_1);
     const int32_t total_sb = size_s * size_b;
 
     LAUNCH_KERNEL_VEC_PAIRS(vec_pairs,
@@ -3680,7 +3706,8 @@ void dispatch_2c_sbhd_uncached(scalar_t* __restrict__ p_output_x,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f);
+    const bool all_stride_d_eq_1 = (stride_ix_d == 1) && (stride_iy_d == 1) && (stride_ox_d == 1) && (stride_oy_d == 1);
+    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<RotateStyle, ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f, all_stride_d_eq_1);
     const int32_t total_sb = size_s * size_b;
 
     LAUNCH_KERNEL_VEC_PAIRS(vec_pairs,
@@ -3880,7 +3907,8 @@ void dispatch_1c_sbhd_cached(scalar_t* __restrict__ p_output,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f);
+    const bool all_stride_d_eq_1 = (stride_i_d == 1) && (stride_o_d == 1);
+    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<RotateStyle, ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f, all_stride_d_eq_1);
     const int32_t total_sb = size_s * size_b;
 
     LAUNCH_KERNEL_VEC_PAIRS(vec_pairs,
@@ -4009,7 +4037,8 @@ void dispatch_2c_sbhd_cached(scalar_t* __restrict__ p_output_x,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f);
+    const bool all_stride_d_eq_1 = (stride_ix_d == 1) && (stride_iy_d == 1) && (stride_ox_d == 1) && (stride_oy_d == 1);
+    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<RotateStyle, ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f, all_stride_d_eq_1);
     const int32_t total_sb = size_s * size_b;
 
     LAUNCH_KERNEL_VEC_PAIRS(vec_pairs,
@@ -4164,7 +4193,8 @@ void dispatch_1c_sbhd_cached_indirect(scalar_t* __restrict__ p_output,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f);
+    const bool all_stride_d_eq_1 = (stride_i_d == 1) && (stride_o_d == 1);
+    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<RotateStyle, ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f, all_stride_d_eq_1);
     const int32_t total_sb = size_s * size_b;
 
     LAUNCH_KERNEL_VEC_PAIRS(vec_pairs,
@@ -4275,7 +4305,8 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f);
+    const bool all_stride_d_eq_1 = (stride_ix_d == 1) && (stride_iy_d == 1) && (stride_ox_d == 1) && (stride_oy_d == 1);
+    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<RotateStyle, ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f, all_stride_d_eq_1);
     const int32_t total_sb = size_s * size_b;
 
     LAUNCH_KERNEL_VEC_PAIRS(vec_pairs,
@@ -4403,7 +4434,8 @@ void dispatch_1c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f);
+    const bool all_stride_d_eq_1 = (stride_i_d == 1) && (stride_o_d == 1);
+    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<RotateStyle, ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f, all_stride_d_eq_1);
     const int32_t total_sb = size_s * size_b;
 
     LAUNCH_KERNEL_VEC_PAIRS(vec_pairs,
@@ -4518,7 +4550,8 @@ void dispatch_2c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f);
+    const bool all_stride_d_eq_1 = (stride_ix_d == 1) && (stride_iy_d == 1) && (stride_ox_d == 1) && (stride_oy_d == 1);
+    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<RotateStyle, ReuseFreqsFrontPart, false, scalar_t>(size_s, 1, size_b, size_f, all_stride_d_eq_1);
     const int32_t total_sb = size_s * size_b;
 
     LAUNCH_KERNEL_VEC_PAIRS(vec_pairs,
@@ -4645,7 +4678,8 @@ void dispatch_1c_thd_uncached(scalar_t* __restrict__ p_output,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<ReuseFreqsFrontPart, false, scalar_t>(size_max_s, 1, size_b, size_f);
+    const bool all_stride_d_eq_1 = (stride_i_d == 1) && (stride_o_d == 1);
+    auto [grid, block, vec_pairs, threads_per_sb] = get_grid_config<RotateStyle, ReuseFreqsFrontPart, false, scalar_t>(size_max_s, 1, size_b, size_f, all_stride_d_eq_1);
     const int32_t total_sb = size_max_s * size_b;
 
     LAUNCH_KERNEL_VEC_PAIRS(vec_pairs,
@@ -4763,8 +4797,9 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
+    const bool all_stride_d_eq_1 = (stride_i_d == 1) && (stride_o_d == 1);
     auto [grid, block, vec_pairs, threads_per_sb] =
-        get_grid_config<ReuseFreqsFrontPart, true, scalar_t>(img_height, img_width, size_b, size_d >> 1);
+        get_grid_config<RotateStyle, ReuseFreqsFrontPart, true, scalar_t>(img_height, img_width, size_b, size_d >> 1, all_stride_d_eq_1);
     const int32_t total_sb = img_height * img_width * size_b;
 
     LAUNCH_KERNEL_VEC_PAIRS(vec_pairs,
