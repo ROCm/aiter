@@ -475,20 +475,24 @@ __device__ __forceinline__ void elementwise_copy_2c(gmem_ix_t& g_ix,
 // Vectorized Helper Functions (using opus for buffer load/store)
 //
 
-template <int32_t RotateStyle, int32_t VecPairs, bool IsForward, bool ReuseFreqsFrontPart, typename scalar_f_t>
+// load_cos_sin_uncached_vec: loads freqs from pre-built gmem descriptor, computes sincos.
+// g_freqs must be created from UNIFORM (kernel-arg) base pointer to avoid waterfall loops.
+// byte_offset_f = offset_f * sizeof(scalar_f_t) -- the per-thread byte offset for this position.
+template <int32_t RotateStyle, int32_t VecPairs, bool IsForward, bool ReuseFreqsFrontPart, typename gmem_t>
 __device__ __forceinline__ void load_cos_sin_uncached_vec(float (&cos_0)[VecPairs],
                                                           float (&sin_0)[VecPairs],
                                                           float (&cos_1)[VecPairs],
                                                           float (&sin_1)[VecPairs],
-                                                          const scalar_f_t* __restrict__ p_freqs,
+                                                          gmem_t& g_freqs,
+                                                          const int32_t byte_offset_f,
                                                           const int32_t did,
                                                           const int32_t size_half_r)
 {
 #ifdef __HIP_DEVICE_COMPILE__
+    constexpr int32_t elem_bytes = sizeof(typename gmem_t::scalar_type);
     if constexpr(RotateStyle == ROTATE_STYLE_NEOX)
     {
-        auto g_f = opus_gmem(p_freqs);
-        auto v_f0 = g_f.template load<VecPairs>(did);
+        auto v_f0 = g_freqs.template _load<VecPairs>(byte_offset_f + did * elem_bytes);
         opus::static_for<VecPairs>([&](auto i) {
             sincosf(float(v_f0[i.value]), &sin_0[i.value], &cos_0[i.value]);
         });
@@ -502,7 +506,7 @@ __device__ __forceinline__ void load_cos_sin_uncached_vec(float (&cos_0)[VecPair
         }
         else
         {
-            auto v_f1 = g_f.template load<VecPairs>(did + size_half_r);
+            auto v_f1 = g_freqs.template _load<VecPairs>(byte_offset_f + (did + size_half_r) * elem_bytes);
             opus::static_for<VecPairs>([&](auto i) {
                 if constexpr(IsForward)
                 {
@@ -520,8 +524,7 @@ __device__ __forceinline__ void load_cos_sin_uncached_vec(float (&cos_0)[VecPair
     {
         if constexpr(ReuseFreqsFrontPart)
         {
-            auto g_f = opus_gmem(p_freqs);
-            auto v_f = g_f.template load<VecPairs>(did);
+            auto v_f = g_freqs.template _load<VecPairs>(byte_offset_f + did * elem_bytes);
             opus::static_for<VecPairs>([&](auto i) {
                 sincosf(float(v_f[i.value]), &sin_0[i.value], &cos_0[i.value]);
                 cos_1[i.value] = cos_0[i.value];
@@ -531,11 +534,10 @@ __device__ __forceinline__ void load_cos_sin_uncached_vec(float (&cos_0)[VecPair
         else
         {
             // GPTJ non-reuse: freqs at did*2 and did*2+1, load 2*VecPairs contiguous
-            auto g_f = opus_gmem(p_freqs);
             if constexpr(VecPairs == 1)
             {
-                auto v0 = g_f.template load<1>(did * 2);
-                auto v1 = g_f.template load<1>(did * 2 + 1);
+                auto v0 = g_freqs.template _load<1>(byte_offset_f + (did * 2) * elem_bytes);
+                auto v1 = g_freqs.template _load<1>(byte_offset_f + (did * 2 + 1) * elem_bytes);
                 float f0 = float(v0[0]), f1 = float(v1[0]);
                 if constexpr(IsForward)
                 {
@@ -550,8 +552,8 @@ __device__ __forceinline__ void load_cos_sin_uncached_vec(float (&cos_0)[VecPair
             }
             else
             {
-                auto v_lo = g_f.template load<VecPairs>(did * 2);
-                auto v_hi = g_f.template load<VecPairs>(did * 2 + VecPairs);
+                auto v_lo = g_freqs.template _load<VecPairs>(byte_offset_f + (did * 2) * elem_bytes);
+                auto v_hi = g_freqs.template _load<VecPairs>(byte_offset_f + (did * 2 + VecPairs) * elem_bytes);
                 opus::static_for<VecPairs>([&](auto i) {
                     constexpr int idx0 = i.value * 2;
                     constexpr int idx1 = i.value * 2 + 1;
@@ -580,23 +582,26 @@ __device__ __forceinline__ void load_cos_sin_uncached_vec(float (&cos_0)[VecPair
 #endif
 }
 
-template <int32_t RotateStyle, int32_t VecPairs, bool IsForward, bool ReuseFreqsFrontPart, typename scalar_f_t>
+// load_cos_sin_cached_vec: loads cos/sin from pre-built gmem descriptors.
+// g_cos/g_sin must be created from UNIFORM (kernel-arg) base pointers to avoid waterfall loops.
+// byte_offset_f = offset_f * sizeof(scalar_f_t) -- the per-thread byte offset for this position.
+template <int32_t RotateStyle, int32_t VecPairs, bool IsForward, bool ReuseFreqsFrontPart, typename gmem_t>
 __device__ __forceinline__ void load_cos_sin_cached_vec(float (&cos_0)[VecPairs],
                                                         float (&sin_0)[VecPairs],
                                                         float (&cos_1)[VecPairs],
                                                         float (&sin_1)[VecPairs],
-                                                        const scalar_f_t* __restrict__ p_cos,
-                                                        const scalar_f_t* __restrict__ p_sin,
+                                                        gmem_t& g_cos,
+                                                        gmem_t& g_sin,
+                                                        const int32_t byte_offset_f,
                                                         const int32_t did,
                                                         const int32_t size_half_r)
 {
 #ifdef __HIP_DEVICE_COMPILE__
+    constexpr int32_t elem_bytes = sizeof(typename gmem_t::scalar_type);
     if constexpr(RotateStyle == ROTATE_STYLE_NEOX)
     {
-        auto g_c = opus_gmem(p_cos);
-        auto g_s = opus_gmem(p_sin);
-        auto v_c0 = g_c.template load<VecPairs>(did);
-        auto v_s0 = g_s.template load<VecPairs>(did);
+        auto v_c0 = g_cos.template _load<VecPairs>(byte_offset_f + did * elem_bytes);
+        auto v_s0 = g_sin.template _load<VecPairs>(byte_offset_f + did * elem_bytes);
 
         if constexpr(ReuseFreqsFrontPart)
         {
@@ -609,8 +614,8 @@ __device__ __forceinline__ void load_cos_sin_cached_vec(float (&cos_0)[VecPairs]
         }
         else
         {
-            auto v_c1 = g_c.template load<VecPairs>(did + size_half_r);
-            auto v_s1 = g_s.template load<VecPairs>(did + size_half_r);
+            auto v_c1 = g_cos.template _load<VecPairs>(byte_offset_f + (did + size_half_r) * elem_bytes);
+            auto v_s1 = g_sin.template _load<VecPairs>(byte_offset_f + (did + size_half_r) * elem_bytes);
             opus::static_for<VecPairs>([&](auto i) {
                 if constexpr(IsForward)
                 {
@@ -633,10 +638,8 @@ __device__ __forceinline__ void load_cos_sin_cached_vec(float (&cos_0)[VecPairs]
     {
         if constexpr(ReuseFreqsFrontPart)
         {
-            auto g_c = opus_gmem(p_cos);
-            auto g_s = opus_gmem(p_sin);
-            auto v_c = g_c.template load<VecPairs>(did);
-            auto v_s = g_s.template load<VecPairs>(did);
+            auto v_c = g_cos.template _load<VecPairs>(byte_offset_f + did * elem_bytes);
+            auto v_s = g_sin.template _load<VecPairs>(byte_offset_f + did * elem_bytes);
             opus::static_for<VecPairs>([&](auto i) {
                 cos_0[i.value] = float(v_c[i.value]);
                 sin_0[i.value] = float(v_s[i.value]);
@@ -647,14 +650,12 @@ __device__ __forceinline__ void load_cos_sin_cached_vec(float (&cos_0)[VecPairs]
         else
         {
             // GPTJ non-reuse: cos/sin at did*2 and did*2+1
-            auto g_c = opus_gmem(p_cos);
-            auto g_s = opus_gmem(p_sin);
             if constexpr(VecPairs == 1)
             {
-                auto v_c0 = g_c.template load<1>(did * 2);
-                auto v_c1 = g_c.template load<1>(did * 2 + 1);
-                auto v_s0 = g_s.template load<1>(did * 2);
-                auto v_s1 = g_s.template load<1>(did * 2 + 1);
+                auto v_c0 = g_cos.template _load<1>(byte_offset_f + (did * 2) * elem_bytes);
+                auto v_c1 = g_cos.template _load<1>(byte_offset_f + (did * 2 + 1) * elem_bytes);
+                auto v_s0 = g_sin.template _load<1>(byte_offset_f + (did * 2) * elem_bytes);
+                auto v_s1 = g_sin.template _load<1>(byte_offset_f + (did * 2 + 1) * elem_bytes);
                 float c0 = float(v_c0[0]), c1 = float(v_c1[0]);
                 float s0 = float(v_s0[0]), s1 = float(v_s1[0]);
                 if constexpr(IsForward)
@@ -670,10 +671,10 @@ __device__ __forceinline__ void load_cos_sin_cached_vec(float (&cos_0)[VecPairs]
             }
             else
             {
-                auto v_c_lo = g_c.template load<VecPairs>(did * 2);
-                auto v_c_hi = g_c.template load<VecPairs>(did * 2 + VecPairs);
-                auto v_s_lo = g_s.template load<VecPairs>(did * 2);
-                auto v_s_hi = g_s.template load<VecPairs>(did * 2 + VecPairs);
+                auto v_c_lo = g_cos.template _load<VecPairs>(byte_offset_f + (did * 2) * elem_bytes);
+                auto v_c_hi = g_cos.template _load<VecPairs>(byte_offset_f + (did * 2 + VecPairs) * elem_bytes);
+                auto v_s_lo = g_sin.template _load<VecPairs>(byte_offset_f + (did * 2) * elem_bytes);
+                auto v_s_hi = g_sin.template _load<VecPairs>(byte_offset_f + (did * 2 + VecPairs) * elem_bytes);
                 opus::static_for<VecPairs>([&](auto i) {
                     constexpr int idx0 = i.value * 2;
                     constexpr int idx1 = i.value * 2 + 1;
@@ -835,7 +836,8 @@ struct OpUncachedFwd
                                                     const scalar_t* __restrict__ p_base_input,
                                                     const int32_t offset_o, // per-thread (s,b) offset in elements
                                                     const int32_t offset_i,
-                                                    const scalar_f_t* __restrict__ p_freqs,
+                                                    const scalar_f_t* __restrict__ p_base_freqs,
+                                                    const int32_t offset_f, // per-thread freq offset in elements
                                                     const int32_t size_h,
                                                     const int32_t size_d,
                                                     const int32_t size_f,
@@ -853,16 +855,18 @@ struct OpUncachedFwd
         const int32_t did_pair    = d_chunk_idx * VecPairs;
         const int32_t did         = did_pair + did_start;
 
-        // Load cos/sin once for this thread's VecPairs pairs
-        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
-        load_cos_sin_uncached_vec<RotateStyle, VecPairs, true, ReuseFreqsFrontPart>(
-            cos_0, sin_0, cos_1, sin_1, p_freqs, did - did_start, size_half_r);
-
 #ifdef __HIP_DEVICE_COMPILE__
         // Create gmem descriptors ONCE from uniform base pointers (no waterfall)
+        auto g_f = opus_gmem(p_base_freqs);
         auto g_i = opus_gmem(p_base_input);
         auto g_o = opus_gmem(p_base_output);
         constexpr int32_t elem_bytes = sizeof(scalar_t);
+        const int32_t byte_offset_f = offset_f * (int32_t)sizeof(scalar_f_t);
+
+        // Load cos/sin once for this thread's VecPairs pairs
+        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
+        load_cos_sin_uncached_vec<RotateStyle, VecPairs, true, ReuseFreqsFrontPart>(
+            cos_0, sin_0, cos_1, sin_1, g_f, byte_offset_f, did - did_start, size_half_r);
 
         // Loop over ALL heads
         for(int32_t hid = 0; hid < size_h; hid++)
@@ -922,7 +926,8 @@ struct OpUncachedFwd
                                                     const int32_t offset_oy,
                                                     const int32_t offset_ix,
                                                     const int32_t offset_iy,
-                                                    const scalar_f_t* __restrict__ p_freqs,
+                                                    const scalar_f_t* __restrict__ p_base_freqs,
+                                                    const int32_t offset_f, // per-thread freq offset in elements
                                                     const int32_t size_h_x,
                                                     const int32_t size_h_y,
                                                     const int32_t size_d,
@@ -946,16 +951,18 @@ struct OpUncachedFwd
         const int32_t did_pair    = d_chunk_idx * VecPairs;
         const int32_t did         = did_pair + did_start;
 
-        // Load cos/sin once for this thread's VecPairs pairs
-        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
-        load_cos_sin_uncached_vec<RotateStyle, VecPairs, true, ReuseFreqsFrontPart>(
-            cos_0, sin_0, cos_1, sin_1, p_freqs, did - did_start, size_half_r);
-
 #ifdef __HIP_DEVICE_COMPILE__
+        auto g_f = opus_gmem(p_base_freqs);
         auto g_ix = opus_gmem(p_base_input_x);
         auto g_iy = opus_gmem(p_base_input_y);
         auto g_ox = opus_gmem(p_base_output_x);
         auto g_oy = opus_gmem(p_base_output_y);
+        const int32_t byte_offset_f = offset_f * (int32_t)sizeof(scalar_f_t);
+
+        // Load cos/sin once for this thread's VecPairs pairs
+        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
+        load_cos_sin_uncached_vec<RotateStyle, VecPairs, true, ReuseFreqsFrontPart>(
+            cos_0, sin_0, cos_1, sin_1, g_f, byte_offset_f, did - did_start, size_half_r);
         constexpr int32_t elem_bytes = sizeof(scalar_t);
 
         // Loop over shared heads (both x and y)
@@ -1054,7 +1061,8 @@ struct OpUncachedBwd
                                                     const scalar_t* __restrict__ p_base_output_grads,
                                                     const int32_t offset_ig,
                                                     const int32_t offset_og,
-                                                    const scalar_f_t* __restrict__ p_freqs,
+                                                    const scalar_f_t* __restrict__ p_base_freqs,
+                                                    const int32_t offset_f, // per-thread freq offset in elements
                                                     const int32_t size_h,
                                                     const int32_t size_d,
                                                     const int32_t size_f,
@@ -1072,15 +1080,17 @@ struct OpUncachedBwd
         const int32_t did_pair    = d_chunk_idx * VecPairs;
         const int32_t did         = did_pair + did_start;
 
-        // Load cos/sin once for this thread's VecPairs pairs
-        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
-        load_cos_sin_uncached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
-            cos_0, sin_0, cos_1, sin_1, p_freqs, did - did_start, size_half_r);
-
 #ifdef __HIP_DEVICE_COMPILE__
+        auto g_f  = opus_gmem(p_base_freqs);
         auto g_og = opus_gmem(p_base_output_grads);
         auto g_ig = opus_gmem(p_base_input_grads);
         constexpr int32_t elem_bytes = sizeof(scalar_t);
+        const int32_t byte_offset_f = offset_f * (int32_t)sizeof(scalar_f_t);
+
+        // Load cos/sin once for this thread's VecPairs pairs
+        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
+        load_cos_sin_uncached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
+            cos_0, sin_0, cos_1, sin_1, g_f, byte_offset_f, did - did_start, size_half_r);
 
         // Loop over ALL heads
         for(int32_t hid = 0; hid < size_h; hid++)
@@ -1140,7 +1150,8 @@ struct OpUncachedBwd
                                                     const int32_t offset_igy,
                                                     const int32_t offset_ogx,
                                                     const int32_t offset_ogy,
-                                                    const scalar_f_t* __restrict__ p_freqs,
+                                                    const scalar_f_t* __restrict__ p_base_freqs,
+                                                    const int32_t offset_f, // per-thread freq offset in elements
                                                     const int32_t size_h_x,
                                                     const int32_t size_h_y,
                                                     const int32_t size_d,
@@ -1164,17 +1175,19 @@ struct OpUncachedBwd
         const int32_t did_pair    = d_chunk_idx * VecPairs;
         const int32_t did         = did_pair + did_start;
 
-        // Load cos/sin once for this thread's VecPairs pairs
-        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
-        load_cos_sin_uncached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
-            cos_0, sin_0, cos_1, sin_1, p_freqs, did - did_start, size_half_r);
-
 #ifdef __HIP_DEVICE_COMPILE__
+        auto g_f   = opus_gmem(p_base_freqs);
         auto g_ogx = opus_gmem(p_base_output_grads_x);
         auto g_ogy = opus_gmem(p_base_output_grads_y);
         auto g_igx = opus_gmem(p_base_input_grads_x);
         auto g_igy = opus_gmem(p_base_input_grads_y);
         constexpr int32_t elem_bytes = sizeof(scalar_t);
+        const int32_t byte_offset_f = offset_f * (int32_t)sizeof(scalar_f_t);
+
+        // Load cos/sin once for this thread's VecPairs pairs
+        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
+        load_cos_sin_uncached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
+            cos_0, sin_0, cos_1, sin_1, g_f, byte_offset_f, did - did_start, size_half_r);
 
         // Loop over shared heads (both x and y)
         for(int32_t hid = 0; hid < size_min_h; hid++)
@@ -1272,8 +1285,9 @@ struct OpCachedFwd
                                                     const scalar_t* __restrict__ p_base_input,
                                                     const int32_t offset_o,
                                                     const int32_t offset_i,
-                                                    const scalar_f_t* __restrict__ p_cos,
-                                                    const scalar_f_t* __restrict__ p_sin,
+                                                    const scalar_f_t* __restrict__ p_base_cos,
+                                                    const scalar_f_t* __restrict__ p_base_sin,
+                                                    const int32_t offset_f, // per-thread cos/sin offset in elements
                                                     const int32_t size_h,
                                                     const int32_t size_d,
                                                     const int32_t size_f,
@@ -1291,15 +1305,18 @@ struct OpCachedFwd
         const int32_t did_pair    = d_chunk_idx * VecPairs;
         const int32_t did         = did_pair + did_start;
 
-        // Load cos/sin once for this thread's VecPairs pairs
-        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
-        load_cos_sin_cached_vec<RotateStyle, VecPairs, true, ReuseFreqsFrontPart>(
-            cos_0, sin_0, cos_1, sin_1, p_cos, p_sin, did - did_start, size_half_r);
-
 #ifdef __HIP_DEVICE_COMPILE__
+        auto g_c = opus_gmem(p_base_cos);
+        auto g_s = opus_gmem(p_base_sin);
         auto g_i = opus_gmem(p_base_input);
         auto g_o = opus_gmem(p_base_output);
         constexpr int32_t elem_bytes = sizeof(scalar_t);
+        const int32_t byte_offset_f = offset_f * (int32_t)sizeof(scalar_f_t);
+
+        // Load cos/sin once for this thread's VecPairs pairs
+        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
+        load_cos_sin_cached_vec<RotateStyle, VecPairs, true, ReuseFreqsFrontPart>(
+            cos_0, sin_0, cos_1, sin_1, g_c, g_s, byte_offset_f, did - did_start, size_half_r);
 
         // Loop over ALL heads
         for(int32_t hid = 0; hid < size_h; hid++)
@@ -1359,8 +1376,9 @@ struct OpCachedFwd
                                                     const int32_t offset_oy,
                                                     const int32_t offset_ix,
                                                     const int32_t offset_iy,
-                                                    const scalar_f_t* __restrict__ p_cos,
-                                                    const scalar_f_t* __restrict__ p_sin,
+                                                    const scalar_f_t* __restrict__ p_base_cos,
+                                                    const scalar_f_t* __restrict__ p_base_sin,
+                                                    const int32_t offset_f, // per-thread cos/sin offset in elements
                                                     const int32_t size_h_x,
                                                     const int32_t size_h_y,
                                                     const int32_t size_d,
@@ -1384,17 +1402,20 @@ struct OpCachedFwd
         const int32_t did_pair    = d_chunk_idx * VecPairs;
         const int32_t did         = did_pair + did_start;
 
-        // Load cos/sin once for this thread's VecPairs pairs
-        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
-        load_cos_sin_cached_vec<RotateStyle, VecPairs, true, ReuseFreqsFrontPart>(
-            cos_0, sin_0, cos_1, sin_1, p_cos, p_sin, did - did_start, size_half_r);
-
 #ifdef __HIP_DEVICE_COMPILE__
+        auto g_c  = opus_gmem(p_base_cos);
+        auto g_s  = opus_gmem(p_base_sin);
         auto g_ix = opus_gmem(p_base_input_x);
         auto g_iy = opus_gmem(p_base_input_y);
         auto g_ox = opus_gmem(p_base_output_x);
         auto g_oy = opus_gmem(p_base_output_y);
         constexpr int32_t elem_bytes = sizeof(scalar_t);
+        const int32_t byte_offset_f = offset_f * (int32_t)sizeof(scalar_f_t);
+
+        // Load cos/sin once for this thread's VecPairs pairs
+        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
+        load_cos_sin_cached_vec<RotateStyle, VecPairs, true, ReuseFreqsFrontPart>(
+            cos_0, sin_0, cos_1, sin_1, g_c, g_s, byte_offset_f, did - did_start, size_half_r);
 
         // Loop over shared heads (both x and y)
         for(int32_t hid = 0; hid < size_min_h; hid++)
@@ -1492,8 +1513,9 @@ struct OpCachedBwd
                                                     const scalar_t* __restrict__ p_base_output_grads,
                                                     const int32_t offset_ig,
                                                     const int32_t offset_og,
-                                                    const scalar_f_t* __restrict__ p_cos,
-                                                    const scalar_f_t* __restrict__ p_sin,
+                                                    const scalar_f_t* __restrict__ p_base_cos,
+                                                    const scalar_f_t* __restrict__ p_base_sin,
+                                                    const int32_t offset_f, // per-thread cos/sin offset in elements
                                                     const int32_t size_h,
                                                     const int32_t size_d,
                                                     const int32_t size_f,
@@ -1511,15 +1533,18 @@ struct OpCachedBwd
         const int32_t did_pair    = d_chunk_idx * VecPairs;
         const int32_t did         = did_pair + did_start;
 
-        // Load cos/sin once for this thread's VecPairs pairs
-        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
-        load_cos_sin_cached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
-            cos_0, sin_0, cos_1, sin_1, p_cos, p_sin, did - did_start, size_half_r);
-
 #ifdef __HIP_DEVICE_COMPILE__
+        auto g_c  = opus_gmem(p_base_cos);
+        auto g_s  = opus_gmem(p_base_sin);
         auto g_og = opus_gmem(p_base_output_grads);
         auto g_ig = opus_gmem(p_base_input_grads);
         constexpr int32_t elem_bytes = sizeof(scalar_t);
+        const int32_t byte_offset_f = offset_f * (int32_t)sizeof(scalar_f_t);
+
+        // Load cos/sin once for this thread's VecPairs pairs
+        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
+        load_cos_sin_cached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
+            cos_0, sin_0, cos_1, sin_1, g_c, g_s, byte_offset_f, did - did_start, size_half_r);
 
         // Loop over ALL heads
         for(int32_t hid = 0; hid < size_h; hid++)
@@ -1579,8 +1604,9 @@ struct OpCachedBwd
                                                     const int32_t offset_igy,
                                                     const int32_t offset_ogx,
                                                     const int32_t offset_ogy,
-                                                    const scalar_f_t* __restrict__ p_cos,
-                                                    const scalar_f_t* __restrict__ p_sin,
+                                                    const scalar_f_t* __restrict__ p_base_cos,
+                                                    const scalar_f_t* __restrict__ p_base_sin,
+                                                    const int32_t offset_f, // per-thread cos/sin offset in elements
                                                     const int32_t size_h_x,
                                                     const int32_t size_h_y,
                                                     const int32_t size_d,
@@ -1604,17 +1630,20 @@ struct OpCachedBwd
         const int32_t did_pair    = d_chunk_idx * VecPairs;
         const int32_t did         = did_pair + did_start;
 
-        // Load cos/sin once for this thread's VecPairs pairs
-        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
-        load_cos_sin_cached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
-            cos_0, sin_0, cos_1, sin_1, p_cos, p_sin, did - did_start, size_half_r);
-
 #ifdef __HIP_DEVICE_COMPILE__
+        auto g_c   = opus_gmem(p_base_cos);
+        auto g_s   = opus_gmem(p_base_sin);
         auto g_ogx = opus_gmem(p_base_output_grads_x);
         auto g_ogy = opus_gmem(p_base_output_grads_y);
         auto g_igx = opus_gmem(p_base_input_grads_x);
         auto g_igy = opus_gmem(p_base_input_grads_y);
         constexpr int32_t elem_bytes = sizeof(scalar_t);
+        const int32_t byte_offset_f = offset_f * (int32_t)sizeof(scalar_f_t);
+
+        // Load cos/sin once for this thread's VecPairs pairs
+        float cos_0[VecPairs], sin_0[VecPairs], cos_1[VecPairs], sin_1[VecPairs];
+        load_cos_sin_cached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
+            cos_0, sin_0, cos_1, sin_1, g_c, g_s, byte_offset_f, did - did_start, size_half_r);
 
         // Loop over shared heads (both x and y)
         for(int32_t hid = 0; hid < size_min_h; hid++)
@@ -1750,7 +1779,7 @@ __launch_bounds__(256, 8) __global__
                                         p_input,
                                         offset_o,
                                         offset_i,
-                                        p_freqs + offset_f,
+                                        p_freqs, (int32_t)offset_f,
                                         size_h,
                                         size_d,
                                         size_f,
@@ -1804,7 +1833,7 @@ __launch_bounds__(256, 8) __global__
                                       p_inout,
                                       offset,
                                       offset,
-                                      p_freqs + offset_f,
+                                      p_freqs, (int32_t)offset_f,
                                       size_h,
                                       size_d,
                                       size_f,
@@ -1886,7 +1915,7 @@ __launch_bounds__(256, 8) __global__
                                          offset_oy,
                                          offset_ix,
                                          offset_iy,
-                                         p_freqs + offset_f,
+                                         p_freqs, (int32_t)offset_f,
                                          size_h_x,
                                          size_h_y,
                                          size_d,
@@ -1959,7 +1988,7 @@ __launch_bounds__(256, 8) __global__
                                        offset_y,
                                        offset_x,
                                        offset_y,
-                                       p_freqs + offset_f,
+                                       p_freqs, (int32_t)offset_f,
                                        size_h_x,
                                        size_h_y,
                                        size_d,
@@ -2026,8 +2055,8 @@ __launch_bounds__(256, 8) __global__
                                         p_input,
                                         (int32_t)offset_o,
                                         (int32_t)offset_i,
-                                        p_cos + offset_f,
-                                        p_sin + offset_f,
+                                        p_cos,
+                                        p_sin, (int32_t)offset_f,
                                         size_h,
                                         size_d,
                                         size_f,
@@ -2082,8 +2111,8 @@ __launch_bounds__(256, 8) __global__
                                       p_inout,
                                       (int32_t)offset,
                                       (int32_t)offset,
-                                      p_cos + offset_f,
-                                      p_sin + offset_f,
+                                      p_cos,
+                                      p_sin, (int32_t)offset_f,
                                       size_h,
                                       size_d,
                                       size_f,
@@ -2166,8 +2195,8 @@ __launch_bounds__(256, 8) __global__
                                          (int32_t)offset_oy,
                                          (int32_t)offset_ix,
                                          (int32_t)offset_iy,
-                                         p_cos + offset_f,
-                                         p_sin + offset_f,
+                                         p_cos,
+                                         p_sin, (int32_t)offset_f,
                                          size_h_x,
                                          size_h_y,
                                          size_d,
@@ -2241,8 +2270,8 @@ __launch_bounds__(256, 8) __global__
                                        (int32_t)offset_y,
                                        (int32_t)offset_x,
                                        (int32_t)offset_y,
-                                       p_cos + offset_f,
-                                       p_sin + offset_f,
+                                       p_cos,
+                                       p_sin, (int32_t)offset_f,
                                        size_h_x,
                                        size_h_y,
                                        size_d,
@@ -2316,8 +2345,8 @@ __launch_bounds__(256, 8) __global__
                                             p_input,
                                             (int32_t)offset_o,
                                             (int32_t)offset_i,
-                                            p_cos + offset_f,
-                                            p_sin + offset_f,
+                                            p_cos,
+                                            p_sin, (int32_t)offset_f,
                                             size_h,
                                             size_d,
                                             size_f,
@@ -2408,8 +2437,8 @@ __launch_bounds__(256, 8) __global__
                                              (int32_t)offset_oy,
                                              (int32_t)offset_ix,
                                              (int32_t)offset_iy,
-                                             p_cos + offset_f,
-                                             p_sin + offset_f,
+                                             p_cos,
+                                             p_sin, (int32_t)offset_f,
                                              size_h_x,
                                              size_h_y,
                                              size_d,
@@ -2477,8 +2506,8 @@ __launch_bounds__(256, 8) __global__ void kn_entry_1c_sbhd_cached_indirect_inpla
                                           p_inout,
                                           (int32_t)offset,
                                           (int32_t)offset,
-                                          p_cos + offset_f,
-                                          p_sin + offset_f,
+                                          p_cos,
+                                          p_sin, (int32_t)offset_f,
                                           size_h,
                                           size_d,
                                           size_f,
@@ -2555,8 +2584,8 @@ __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect_inpla
                                            (int32_t)offset_y,
                                            (int32_t)offset_x,
                                            (int32_t)offset_y,
-                                           p_cos + offset_f,
-                                           p_sin + offset_f,
+                                           p_cos,
+                                           p_sin, (int32_t)offset_f,
                                            size_h_x,
                                            size_h_y,
                                            size_d,
@@ -2632,8 +2661,8 @@ __launch_bounds__(256, 8) __global__
                                             p_input,
                                             (int32_t)offset_o,
                                             (int32_t)offset_i,
-                                            p_cos + offset_f,
-                                            p_sin + offset_f,
+                                            p_cos,
+                                            p_sin, (int32_t)offset_f,
                                             size_h,
                                             size_d,
                                             size_f,
@@ -2725,8 +2754,8 @@ __launch_bounds__(256, 8) __global__
                                              (int32_t)offset_oy,
                                              (int32_t)offset_ix,
                                              (int32_t)offset_iy,
-                                             p_cos + offset_f,
-                                             p_sin + offset_f,
+                                             p_cos,
+                                             p_sin, (int32_t)offset_f,
                                              size_h_x,
                                              size_h_y,
                                              size_d,
@@ -2795,8 +2824,8 @@ __launch_bounds__(256, 8) __global__ void kn_entry_1c_sbhd_cached_indirect2_inpl
                                           p_inout,
                                           (int32_t)offset,
                                           (int32_t)offset,
-                                          p_cos + offset_f,
-                                          p_sin + offset_f,
+                                          p_cos,
+                                          p_sin, (int32_t)offset_f,
                                           size_h,
                                           size_d,
                                           size_f,
@@ -2874,8 +2903,8 @@ __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect2_inpl
                                            (int32_t)offset_y,
                                            (int32_t)offset_x,
                                            (int32_t)offset_y,
-                                           p_cos + offset_f,
-                                           p_sin + offset_f,
+                                           p_cos,
+                                           p_sin, (int32_t)offset_f,
                                            size_h_x,
                                            size_h_y,
                                            size_d,
@@ -2943,7 +2972,7 @@ __launch_bounds__(256, 8) __global__
                                         p_input,
                                         (int32_t)offset_o,
                                         (int32_t)offset_i,
-                                        p_freqs + offset_f,
+                                        p_freqs, (int32_t)offset_f,
                                         size_h,
                                         size_d,
                                         size_f,
@@ -2999,7 +3028,7 @@ __launch_bounds__(256, 8) __global__
                                       p_inout,
                                       (int32_t)offset,
                                       (int32_t)offset,
-                                      p_freqs + offset_f,
+                                      p_freqs, (int32_t)offset_f,
                                       size_h,
                                       size_d,
                                       size_f,
