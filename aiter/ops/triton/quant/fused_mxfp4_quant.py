@@ -10,6 +10,7 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
     _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel,
     _fused_reduce_rms_mxfp4_quant_kernel,
     _fused_dynamic_mxfp4_quant_moe_sort_kernel,
+    _fused_silu_mxfp4_quant_moe_sort_kernel,
 )
 from aiter.ops.triton._triton_kernels.activation import (
     _get_activation_from_str,
@@ -647,6 +648,96 @@ def fused_dynamic_mxfp4_quant_moe_sort(
 
     return (
         x_fp4.view(dtypes.fp4x2),
+        blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, N_o),
+    )
+
+
+def fused_silu_mxfp4_quant_moe_sort(
+    x: torch.Tensor,
+    out: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    topk: int,
+    block_size: int = 32,
+):
+    """Fused silu(gate)*up + MXFP4 quantization + MOE block-scale sorting.
+
+    Same as fused_dynamic_mxfp4_quant_moe_sort but the input is gate+up
+    concatenated along the column dimension (M, 2*N) and silu activation
+    is computed inside the kernel.
+
+    Args:
+        x: (M, 2*N) tensor — first N columns = gate, last N = up.
+        sorted_ids: (M_o,) int32.
+        num_valid_ids: scalar or (1,) int tensor.
+        token_num: number of tokens before topk expansion.
+        topk: number of top-k expert selections.
+
+    Returns:
+        (x_fp4, blockscale_e8m0_sorted)
+    """
+    M, N2 = x.shape
+    N = N2 // 2
+
+    assert (N // 2) % 2 == 0
+
+    MXFP4_QUANT_BLOCK_SIZE = 32
+
+    if out is None:
+        out = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
+    scaleN_valid = triton.cdiv(N, MXFP4_QUANT_BLOCK_SIZE)
+    scaleN = scaleN_valid
+
+    BLOCK_SIZE_Mx = 128
+
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 32, 8
+    BLOCK_SIZE_M_u32, BLOCK_SIZE_N_u32 = 16, 4
+
+    M_i, N_i = M, scaleN
+    M_o, N_o = sorted_ids.shape[0], N_i
+    assert (N_i // 2) % 2 == 0
+    assert block_size % BLOCK_SIZE_M == 0
+
+    blockscale_e8m0_sorted = torch.empty(
+        (
+            triton.cdiv(M_o, BLOCK_SIZE_M),
+            triton.cdiv(N_o, BLOCK_SIZE_N),
+            BLOCK_SIZE_N_u32,
+            BLOCK_SIZE_M_u32,
+            4,
+        ),
+        dtype=torch.uint8,
+        device=x.device,
+    )
+
+    num_pid = triton.cdiv(M, BLOCK_SIZE_Mx) * scaleN + triton.cdiv(
+        M_o, BLOCK_SIZE_M
+    ) * triton.cdiv(N_i, BLOCK_SIZE_N)
+    _fused_silu_mxfp4_quant_moe_sort_kernel[(num_pid,)](
+        x,
+        out,
+        sorted_ids,
+        num_valid_ids,
+        blockscale_e8m0_sorted,
+        M,
+        N,
+        scaleN,
+        *x.stride(),
+        *out.stride(),
+        *blockscale_e8m0_sorted.stride(),
+        token_num=token_num,
+        M_i=M_i,
+        N_i=N_i,
+        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+        BLOCK_SIZE_Mx=BLOCK_SIZE_Mx,
+        BLOCK_SIZE_M=BLOCK_SIZE_M // 2,
+        BLOCK_SIZE_N=BLOCK_SIZE_N // 2,
+        TOPK=topk,
+    )
+
+    return (
+        out,
         blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, N_o),
     )
 

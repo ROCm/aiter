@@ -15,7 +15,9 @@ Usage:
 """
 
 import argparse
+import csv
 import os
+import re
 import sys
 
 os.environ.setdefault("HIP_VISIBLE_DEVICES", "0")
@@ -99,6 +101,62 @@ Q_TYPE = QuantType.per_1x32
 Q_DTYPE_A = dtypes.fp4x2
 TORCH_QUANT = aiter.get_torch_quant(Q_TYPE)
 
+# CSV_PATH = os.path.join(
+#     os.path.dirname(__file__),
+#     "..", "..", "configs", "model_configs", "dsv3_fp4_tuned_fmoe.csv",
+# )
+CSV_PATH = "/workspace/aiter/dsv3_fp4_tuned_fmoe.csv"
+
+
+def parse_stage1_kernel_name(name: str) -> dict:
+    """Extract tuning params from a flydsl stage1 kernel name.
+
+    e.g. 'flydsl_moe1_afp4_wfp4_bf16_t32x128x256_w3_kb4_bnt0_go'
+    """
+    params = dict(tile_n=128, tile_k=256, waves_per_eu=3, k_batch=1, b_nt=2, gate_only=False)
+    m = re.search(r"_t(\d+)x(\d+)x(\d+)", name)
+    if m:
+        params["tile_n"] = int(m.group(2))
+        params["tile_k"] = int(m.group(3))
+    m = re.search(r"_w(\d+)", name)
+    if m:
+        params["waves_per_eu"] = int(m.group(1))
+    m = re.search(r"_kb(\d+)", name)
+    if m:
+        params["k_batch"] = int(m.group(1))
+    m = re.search(r"_bnt(\d+)", name)
+    if m:
+        params["b_nt"] = int(m.group(1))
+    if "_go" in name:
+        params["gate_only"] = True
+    return params
+
+
+def load_cases(csv_path, token_filter=None):
+    cases = []
+    with open(csv_path) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            tag = row.get("_tag", "").strip()
+            if tag == "flydsl_fallback":
+                continue
+            token = int(row["token"])
+            if token_filter and token not in token_filter:
+                continue
+            kname = row.get("kernelName1", "").strip()
+            kparams = parse_stage1_kernel_name(kname)
+            cases.append(dict(
+                token=token,
+                model_dim=int(row["model_dim"]),
+                inter_dim=int(row["inter_dim"]),
+                expert=int(row["expert"]),
+                topk=int(row["topk"]),
+                block_m=int(row["block_m"]),
+                kernel_name=kname,
+                **kparams,
+            ))
+    return cases
+
 
 def setup_data(token, model_dim, inter_dim, E, topk, block_m, dtype=torch.bfloat16):
     """Prepare all tensors needed for benchmarking."""
@@ -160,18 +218,28 @@ def setup_data(token, model_dim, inter_dim, E, topk, block_m, dtype=torch.bfloat
 # Benchmark target functions (explicit tensor args for run_perftest)
 # ---------------------------------------------------------------------------
 
+def _s1_kw(kp):
+    """Build stage1-specific keyword args from parsed kernel params."""
+    return dict(
+        tile_n=kp["tile_n"], tile_k=kp["tile_k"],
+        waves_per_eu=kp["waves_per_eu"], k_batch=kp["k_batch"],
+        b_nt=kp["b_nt"], gate_only=kp["gate_only"],
+    )
+
+
 def fn_nonfused_stage1(
     a1_qt, w1_qt_shuf, sorted_ids, sorted_expert_ids, num_valid_ids,
     w1_scale_shuf, a1_scale_sort,
-    topk, block_m,
+    topk, block_m, kp,
 ):
     return flydsl_moe_stage1(
         a=a1_qt, w1=w1_qt_shuf,
         sorted_token_ids=sorted_ids, sorted_expert_ids=sorted_expert_ids,
         num_valid_ids=num_valid_ids,
-        topk=topk, tile_m=block_m, tile_n=128, tile_k=256,
+        topk=topk, tile_m=block_m,
         a_dtype="fp4", b_dtype="fp4", out_dtype="bf16",
         w1_scale=w1_scale_shuf, a1_scale=a1_scale_sort,
+        **_s1_kw(kp),
     )
 
 
@@ -179,32 +247,33 @@ def fn_fused_stage1(
     a1_qt, w1_qt_shuf, sorted_ids, sorted_expert_ids, num_valid_ids,
     w1_scale_shuf, a1_scale_sort,
     fused_out,
-    topk, block_m,
+    topk, block_m, kp,
 ):
     return flydsl_moe_stage1(
         a=a1_qt, w1=w1_qt_shuf,
         sorted_token_ids=sorted_ids, sorted_expert_ids=sorted_expert_ids,
         num_valid_ids=num_valid_ids,
-        out=fused_out, topk=topk,
-        tile_m=block_m, tile_n=128, tile_k=256,
+        out=fused_out, topk=topk, tile_m=block_m,
         a_dtype="fp4", b_dtype="fp4", out_dtype="bf16",
         w1_scale=w1_scale_shuf, a1_scale=a1_scale_sort,
         fuse_fp4_quant=True, fuse_sort_scale=True,
+        **_s1_kw(kp),
     )
 
 
 def fn_nonfused_stage1_plus_quant(
     a1_qt, w1_qt_shuf, sorted_ids, sorted_expert_ids, num_valid_ids,
     w1_scale_shuf, a1_scale_sort,
-    topk, block_m, token, inter_dim,
+    topk, block_m, token, inter_dim, kp,
 ):
     s1_out = flydsl_moe_stage1(
         a=a1_qt, w1=w1_qt_shuf,
         sorted_token_ids=sorted_ids, sorted_expert_ids=sorted_expert_ids,
         num_valid_ids=num_valid_ids,
-        topk=topk, tile_m=block_m, tile_n=128, tile_k=256,
+        topk=topk, tile_m=block_m,
         a_dtype="fp4", b_dtype="fp4", out_dtype="bf16",
         w1_scale=w1_scale_shuf, a1_scale=a1_scale_sort,
+        **_s1_kw(kp),
     )
     a2_qt, a2_scale_sort = fused_dynamic_mxfp4_quant_moe_sort(
         s1_out.view(-1, inter_dim),
@@ -218,17 +287,17 @@ def fn_fused_stage1_with_sort(
     a1_qt, w1_qt_shuf, sorted_ids, sorted_expert_ids, num_valid_ids,
     w1_scale_shuf, a1_scale_sort,
     fused_out,
-    topk, block_m,
+    topk, block_m, kp,
 ):
     return flydsl_moe_stage1(
         a=a1_qt, w1=w1_qt_shuf,
         sorted_token_ids=sorted_ids, sorted_expert_ids=sorted_expert_ids,
         num_valid_ids=num_valid_ids,
-        out=fused_out, topk=topk,
-        tile_m=block_m, tile_n=128, tile_k=256,
+        out=fused_out, topk=topk, tile_m=block_m,
         a_dtype="fp4", b_dtype="fp4", out_dtype="bf16",
         w1_scale=w1_scale_shuf, a1_scale=a1_scale_sort,
         fuse_fp4_quant=True, fuse_sort_scale=True,
+        **_s1_kw(kp),
     )
 
 
@@ -236,12 +305,12 @@ def fn_nonfused_e2e(
     a1_qt, w1_qt_shuf, sorted_ids, sorted_expert_ids, num_valid_ids,
     w1_scale_shuf, a1_scale_sort,
     w2_qt_shuf, w2_scale_shuf, sorted_weights,
-    topk, block_m, token, inter_dim,
+    topk, block_m, token, inter_dim, kp,
 ):
     a2_qt, a2_scale_sort = fn_nonfused_stage1_plus_quant(
         a1_qt, w1_qt_shuf, sorted_ids, sorted_expert_ids, num_valid_ids,
         w1_scale_shuf, a1_scale_sort,
-        topk, block_m, token, inter_dim,
+        topk, block_m, token, inter_dim, kp,
     )
     return flydsl_moe_stage2(
         inter_states=a2_qt, w2=w2_qt_shuf,
@@ -259,13 +328,13 @@ def fn_fused_e2e(
     w1_scale_shuf, a1_scale_sort,
     fused_out,
     w2_qt_shuf, w2_scale_shuf, sorted_weights,
-    topk, block_m, token,
+    topk, block_m, token, kp,
 ):
     result = fn_fused_stage1_with_sort(
         a1_qt, w1_qt_shuf, sorted_ids, sorted_expert_ids, num_valid_ids,
         w1_scale_shuf, a1_scale_sort,
         fused_out,
-        topk, block_m,
+        topk, block_m, kp,
     )
     fused_a2, fused_scale_sort = result
     return flydsl_moe_stage2(
@@ -286,12 +355,10 @@ def fn_fused_e2e(
 
 def main():
     parser = argparse.ArgumentParser(description="Fused vs Non-fused MoE A4W4 perf comparison")
-    parser.add_argument("-t", "--tokens", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192])
-    parser.add_argument("--model-dim", type=int, default=7168)
-    parser.add_argument("--inter-dim", type=int, default=256)
-    parser.add_argument("-E", "--experts", type=int, default=256)
-    parser.add_argument("-k", "--topk", type=int, default=8)
-    parser.add_argument("--block-m", type=int, default=32)
+    parser.add_argument("-t", "--tokens", type=int, nargs="+", default=None,
+                        help="Filter to specific token counts (default: all from CSV)")
+    parser.add_argument("--csv", type=str, default=CSV_PATH,
+                        help="Path to tuned CSV config")
     parser.add_argument("--num-iters", type=int, default=100)
     parser.add_argument("--num-warmup", type=int, default=50)
     parser.add_argument("--atol", type=float, default=0.01)
@@ -303,32 +370,42 @@ def main():
         print("[SKIP] FlyDSL not available.")
         sys.exit(0)
 
+    cases = load_cases(args.csv, token_filter=args.tokens)
     ni = args.num_iters
     nw = args.num_warmup
     results = []
 
-    for token in args.tokens:
-        torch.cuda.empty_cache()
-        print(f"\n{'='*80}")
-        print(f"  token={token}, model_dim={args.model_dim}, inter_dim={args.inter_dim}, "
-              f"E={args.experts}, topk={args.topk}, block_m={args.block_m}")
-        print(f"{'='*80}")
+    print(f"\nFused vs Non-fused MoE A4W4  (iters={ni}, warmup={nw})")
+    print(f"CSV: {args.csv}")
+    print("=" * 100)
 
-        d = setup_data(
-            token, args.model_dim, args.inter_dim,
-            args.experts, args.topk, args.block_m,
-        )
+    for c in cases:
+        token = c["token"]
+        model_dim = c["model_dim"]
+        inter_dim = c["inter_dim"]
+        E = c["expert"]
+        topk = c["topk"]
+        block_m = c["block_m"]
+        kp = {k: c[k] for k in ("tile_n", "tile_k", "waves_per_eu", "k_batch", "b_nt", "gate_only")}
+
+        torch.cuda.empty_cache()
+        print(f"\n{'='*90}")
+        print(f"  token={token}, model_dim={model_dim}, inter_dim={inter_dim}, "
+              f"E={E}, topk={topk}, block_m={block_m}")
+        print(f"  stage1 kernel: {c['kernel_name']}")
+        print(f"  params: tile_n={kp['tile_n']} waves_per_eu={kp['waves_per_eu']} "
+              f"k_batch={kp['k_batch']} b_nt={kp['b_nt']} gate_only={kp['gate_only']}")
+        print(f"{'='*90}")
+
+        d = setup_data(token, model_dim, inter_dim, E, topk, block_m)
 
         common_args = (
             d["a1_qt"], d["w1_qt_shuf"],
             d["sorted_ids"], d["sorted_expert_ids"], d["num_valid_ids"],
             d["w1_scale_shuf"], d["a1_scale_sort"],
         )
-        topk = d["topk"]
-        block_m = d["block_m"]
-        inter_dim = d["inter_dim"]
 
-        nr = 1  # num_rotate_args=1: no deep copies, kernel doesn't modify inputs
+        nr = 1
 
         # --- Bench 1: Stage1 kernel only ---
         print(f"\n  [1] Stage1 kernel only:", flush=True)
@@ -336,7 +413,7 @@ def main():
         _, us_nf_s1 = run_perftest(
             fn_nonfused_stage1,
             *common_args,
-            topk, block_m,
+            topk, block_m, kp,
             num_iters=ni, num_warmup=nw, num_rotate_args=nr,
         )
         print(f"      running fused stage1...", flush=True)
@@ -344,7 +421,7 @@ def main():
             fn_fused_stage1,
             *common_args,
             d["fused_out"],
-            topk, block_m,
+            topk, block_m, kp,
             num_iters=ni, num_warmup=nw, num_rotate_args=nr,
         )
         print(f"      non-fused stage1 (bf16 out):  {us_nf_s1:>8.1f} us")
@@ -358,7 +435,7 @@ def main():
         _, us_nf_sq = run_perftest(
             fn_nonfused_stage1_plus_quant,
             *common_args,
-            topk, block_m, token, inter_dim,
+            topk, block_m, token, inter_dim, kp,
             num_iters=ni, num_warmup=nw, num_rotate_args=nr,
         )
         print(f"      running fused stage1 (with sort)...", flush=True)
@@ -366,7 +443,7 @@ def main():
             fn_fused_stage1_with_sort,
             *common_args,
             d["fused_out"],
-            topk, block_m,
+            topk, block_m, kp,
             num_iters=ni, num_warmup=nw, num_rotate_args=nr,
         )
         print(f"      non-fused (stage1 + fused_quant_sort):   {us_nf_sq:>8.1f} us")
@@ -382,7 +459,7 @@ def main():
             fn_nonfused_e2e,
             *common_args,
             d["w2_qt_shuf"], d["w2_scale_shuf"], d["sorted_weights"],
-            topk, block_m, token, inter_dim,
+            topk, block_m, token, inter_dim, kp,
             num_iters=ni, num_warmup=nw, num_rotate_args=nr,
         )
         print(f"      running fused e2e...", flush=True)
@@ -391,7 +468,7 @@ def main():
             *common_args,
             d["fused_out"],
             d["w2_qt_shuf"], d["w2_scale_shuf"], d["sorted_weights"],
-            topk, block_m, token,
+            topk, block_m, token, kp,
             num_iters=ni, num_warmup=nw, num_rotate_args=nr,
         )
         print(f"      non-fused e2e: {us_nf_e2e:>8.1f} us")
@@ -400,22 +477,16 @@ def main():
         pct_e2e = saving_e2e / us_nf_e2e * 100 if us_nf_e2e > 0 else 0
         print(f"      saving: {saving_e2e:>8.1f} us  ({pct_e2e:.1f}%)")
 
-        tflops_op = token * args.model_dim * inter_dim * 3 * topk * 2
+        tflops_op = token * model_dim * inter_dim * 3 * topk * 2
         print(f"\n      TFLOPS (non-fused e2e): {tflops_op/us_nf_e2e/1e6:>.2f}")
         print(f"      TFLOPS (fused e2e):     {tflops_op/us_f_e2e/1e6:>.2f}")
 
         # ===================================================================
-        # Precision checks (use fresh fused_out to avoid stale buffer issues)
+        # Precision checks
         # ===================================================================
         print(f"\n  [Precision checks]", flush=True)
         prec_fused_out = torch.zeros_like(d["fused_out"])
-        prec_s1 = "N/A"
-        fp4_pct = 0.0
-        scale_pct = 0.0
-        prec_sq = "N/A"
 
-        # -- [P3] E2E: compute torch reference, compare nf & fused against it
-        # Torch reference: stage1
         ref_s1 = torch_moe_stage1(
             d["a1_qt"], d["w1_qt"], d["w2_qt"],
             d["topk_weights"], d["topk_ids"],
@@ -425,7 +496,6 @@ def main():
             a1_scale=d["a1_scale"],
             w1_scale=d["w1_scale"],
         )
-        # Torch reference: quant stage1 output → stage2
         ref_s1_flat = ref_s1.view(-1, inter_dim)
         ref_a2_qt, ref_a2_scale = TORCH_QUANT(ref_s1_flat, quant_dtype=Q_DTYPE_A)
         ref_e2e = torch_moe_stage2(
@@ -438,23 +508,20 @@ def main():
         )
         torch.cuda.synchronize()
 
-        # Non-fused e2e output
         nf_e2e_out = fn_nonfused_e2e(
             *common_args,
             d["w2_qt_shuf"], d["w2_scale_shuf"], d["sorted_weights"],
-            topk, block_m, token, inter_dim,
+            topk, block_m, token, inter_dim, kp,
         )
         torch.cuda.synchronize()
 
-        # Fused e2e output
         f_e2e_out = fn_fused_e2e(
             *common_args, prec_fused_out,
             d["w2_qt_shuf"], d["w2_scale_shuf"], d["sorted_weights"],
-            topk, block_m, token,
+            topk, block_m, token, kp,
         )
         torch.cuda.synchronize()
 
-        # Compare: non-fused vs torch
         err_nf_vs_torch = checkAllclose(
             ref_e2e, nf_e2e_out,
             rtol=args.rtol, atol=args.atol,
@@ -463,7 +530,6 @@ def main():
         prec_nf = "PASS" if err_nf_vs_torch == 0 else (
             "WARN" if err_nf_vs_torch <= 0.05 else "FAIL")
 
-        # Compare: fused vs torch
         err_f_vs_torch = checkAllclose(
             ref_e2e, f_e2e_out,
             rtol=args.rtol, atol=args.atol,
@@ -472,7 +538,6 @@ def main():
         prec_f = "PASS" if err_f_vs_torch == 0 else (
             "WARN" if err_f_vs_torch <= 0.05 else "FAIL")
 
-        # Compare: non-fused vs fused
         err_nf_vs_f = checkAllclose(
             nf_e2e_out, f_e2e_out,
             rtol=args.rtol, atol=args.atol,
@@ -482,7 +547,8 @@ def main():
             "WARN" if err_nf_vs_f <= 0.05 else "FAIL")
 
         results.append({
-            "token": token,
+            "token": token, "inter_dim": inter_dim,
+            "kernel_name": c["kernel_name"],
             "nf_s1_us": us_nf_s1, "f_s1_us": us_f_s1,
             "nf_sq_us": us_nf_sq, "f_sq_us": us_f_sq,
             "nf_e2e_us": us_nf_e2e, "f_e2e_us": us_f_e2e,
@@ -490,21 +556,22 @@ def main():
         })
 
     # --- Summary table ---
-    print(f"\n{'='*80}")
+    print(f"\n{'='*120}")
     print("SUMMARY")
-    print(f"{'='*80}")
-    print(f"  {'token':>6s}  {'nf_s1':>8s}  {'f_s1':>8s}  "
+    print(f"{'='*120}")
+    print(f"  {'token':>6s}  {'idim':>5s}  {'nf_s1':>8s}  {'f_s1':>8s}  "
           f"{'nf_s1+q':>8s}  {'f_s1+s':>8s}  "
           f"{'nf_e2e':>8s}  {'f_e2e':>8s}  {'save':>10s}  "
           f"{'nf/T':>4s}  {'f/T':>4s}  {'nf/f':>4s}")
-    print(f"  {'-'*6}  {'-'*8}  {'-'*8}  "
+    print(f"  {'-'*6}  {'-'*5}  {'-'*8}  {'-'*8}  "
           f"{'-'*8}  {'-'*8}  "
           f"{'-'*8}  {'-'*8}  {'-'*10}  "
           f"{'-'*4}  {'-'*4}  {'-'*4}")
     for r in results:
         save = r["nf_e2e_us"] - r["f_e2e_us"]
         pct = save / r["nf_e2e_us"] * 100 if r["nf_e2e_us"] > 0 else 0
-        print(f"  {r['token']:>6d}  {r['nf_s1_us']:>8.1f}  {r['f_s1_us']:>8.1f}  "
+        print(f"  {r['token']:>6d}  {r['inter_dim']:>5d}  "
+              f"{r['nf_s1_us']:>8.1f}  {r['f_s1_us']:>8.1f}  "
               f"{r['nf_sq_us']:>8.1f}  {r['f_sq_us']:>8.1f}  "
               f"{r['nf_e2e_us']:>8.1f}  {r['f_e2e_us']:>8.1f}  "
               f"{save:>+6.1f}/{pct:>+.1f}%  "

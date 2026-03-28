@@ -6,6 +6,7 @@
 import functools
 import os
 from typing import Dict, Optional
+from aiter.utility import dtypes
 
 import torch
 
@@ -622,7 +623,7 @@ def flydsl_moe_stage1(
     if a_dtype == "fp4":
         model_dim = model_dim * 2
 
-    torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
+    torch_out_dtype = dtypes.fp4x2 if fuse_fp4_quant else dtypes.bf16 if out_dtype == "bf16" else dtypes.fp16
     _is_splitk = k_batch > 1
 
     if out is None:
@@ -633,8 +634,9 @@ def flydsl_moe_stage1(
     dev = a.device
 
     if _is_splitk:
+        torch_tmp_out_dtype = dtypes.bf16 if out_dtype == "bf16" else dtypes.fp16
         tmp_out = torch.zeros(
-            (token_num, topk, inter_dim * 2), dtype=torch_out_dtype, device=dev
+            (token_num, topk, inter_dim * 2), dtype=torch_tmp_out_dtype, device=dev
         )
     else:
         tmp_out = None
@@ -712,10 +714,26 @@ def flydsl_moe_stage1(
     )
 
     if _is_splitk:
-        from aiter.ops.activation import silu_and_mul
-        silu_and_mul(out.view(-1, inter_dim), tmp_out.view(-1, inter_dim * 2))
+        if fuse_fp4_quant:
+            from aiter.ops.triton.quant.fused_mxfp4_quant import (
+                fused_silu_mxfp4_quant_moe_sort,
+            )
 
-    if _need_sort:
+            M_flat = token_num * topk
+            out, out_scale_sorted = fused_silu_mxfp4_quant_moe_sort(
+                tmp_out.view(M_flat, inter_dim * 2),
+                out.view(M_flat, inter_dim // 2).view(torch.uint8),
+                sorted_token_ids,
+                num_valid_ids,
+                token_num,
+                topk,
+            )
+            return out, out_scale_sorted
+        else:
+            from aiter.ops.activation import silu_and_mul
+            silu_and_mul(out.view(-1, inter_dim), tmp_out.view(-1, inter_dim * 2))
+
+    if fuse_fp4_quant:
         from aiter.utility.dtypes import fp8_e8m0
         out_scale_sorted = out_scale_sorted_flat.view(fp8_e8m0).view(
             padded_rows, padded_cols

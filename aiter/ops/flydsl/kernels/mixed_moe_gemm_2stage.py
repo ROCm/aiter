@@ -196,7 +196,8 @@ def compile_mixed_moe_gemm1(
         _k_per_batch = model_dim // k_batch
         assert model_dim % k_batch == 0, f"model_dim={model_dim} not divisible by k_batch={k_batch}"
         assert _k_per_batch % tile_k == 0, f"K_per_batch={_k_per_batch} not divisible by tile_k={tile_k}"
-        assert not fuse_fp4_quant, "split-K not supported with FP4 output quantization"
+
+        fuse_fp4_quant = False
     else:
         _k_per_batch = model_dim
     _k_dim = _k_per_batch
