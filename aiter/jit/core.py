@@ -973,7 +973,10 @@ def _get_ck_exclude_modules():
         "module_rope_1c_thd_bwd",
         "module_rope_1c_2d_fwd",
         "module_rope_1c_2d_bwd",
-        "module_rope_pos_fwd",
+        "module_rope_1c_cached_positions_fwd",
+        "module_rope_2c_cached_positions_fwd",
+        "module_rope_1c_cached_positions_offsets_fwd",
+        "module_rope_2c_cached_positions_offsets_fwd",
         "module_sample",
         "module_topk_plain",
     }

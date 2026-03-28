@@ -1374,8 +1374,8 @@ namespace py = pybind11;
 #define ROPE_1C_2D_BWD_PYBIND        m.def("rope_2d_bwd_impl", &rope_2d_bwd_impl);
 
 
-#define ROPE_POS_FWD_PYBIND                                                                   \
-    m.def("rope_cached_positions_fwd_impl", &rope_cached_positions_fwd_impl);                 \
+#define ROPE_1C_CACHED_POSITIONS_FWD_PYBIND          m.def("rope_cached_positions_fwd_impl", &rope_cached_positions_fwd_impl)
+#define ROPE_2C_CACHED_POSITIONS_FWD_PYBIND                                                   \
     m.def("rope_cached_positions_2c_fwd_impl",                                                \
           &rope_cached_positions_2c_fwd_impl,                                                 \
           py::arg("output_x"),                                                                \
@@ -1387,9 +1387,9 @@ namespace py = pybind11;
           py::arg("positions"),                                                               \
           py::arg("rotate_style"),                                                            \
           py::arg("reuse_freqs_front_part"),                                                  \
-          py::arg("nope_first"));                                                             \
-    m.def("rope_cached_positions_offsets_fwd_impl", &rope_cached_positions_offsets_fwd_impl); \
-    m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl);
+          py::arg("nope_first"))
+#define ROPE_1C_CACHED_POSITIONS_OFFSETS_FWD_PYBIND  m.def("rope_cached_positions_offsets_fwd_impl", &rope_cached_positions_offsets_fwd_impl)
+#define ROPE_2C_CACHED_POSITIONS_OFFSETS_FWD_PYBIND  m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl)
 
 #define FUSED_QKNORM_MROPE_CACHE_QUANT_PYBIND                                      \
     m.def("fused_qk_norm_mrope_3d_cache_pts_quant_shuffle",                        \

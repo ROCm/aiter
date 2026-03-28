@@ -180,7 +180,7 @@ def rope_cached_2c_bwd_impl(
     ...
 
 
-@compile_ops("module_rope_pos_fwd")
+@compile_ops("module_rope_1c_cached_positions_fwd")
 def rope_cached_positions_fwd_impl(
     output: Tensor,
     input: Tensor,
@@ -203,7 +203,7 @@ def rope_cached_positions_fwd_impl(
     ...
 
 
-@compile_ops("module_rope_pos_fwd")
+@compile_ops("module_rope_2c_cached_positions_fwd")
 def rope_cached_positions_2c_fwd_impl(
     output_x: Tensor,
     output_y: Tensor,
@@ -228,7 +228,7 @@ def rope_cached_positions_2c_fwd_impl(
     ...
 
 
-@compile_ops("module_rope_pos_fwd")
+@compile_ops("module_rope_1c_cached_positions_offsets_fwd")
 def rope_cached_positions_offsets_fwd_impl(
     output: Tensor,
     input: Tensor,
@@ -252,7 +252,7 @@ def rope_cached_positions_offsets_fwd_impl(
     ...
 
 
-@compile_ops("module_rope_pos_fwd")
+@compile_ops("module_rope_2c_cached_positions_offsets_fwd")
 def rope_cached_positions_offsets_2c_fwd_impl(
     output_x: Tensor,
     output_y: Tensor,
